@@ -52,9 +52,19 @@
 #     that is not a plain token all KEEP the session. After 2 consecutive failed
 #     lookups in one sweep the rest are kept WITHOUT a call (a consistently wedged Dolt
 #     costs 2 timeouts per sweep, not one per candidate).
-#   * Kill switch ADHOC_REAPER_ENABLED=0 → census/log only, no closes.
-# The ONLY mutation is `gc session close` on eligible adhoc sessions. No bd writes (the
-# worker-class lock only READS, via `bd query`), no rm of data, no Dolt surgery.
+#   * PARKED-BEAD EXCEPTION to the lock above (ga-v4l16y): if EVERY non-closed bead the
+#     lock finds, in EVERY store, is parked on an Athos decision (next-action:athos*,
+#     story:needs-approval, or metadata athos.acao set) — never just the first one found
+#     — the session is not babysitting a task, it is idling on a decision only Athos can
+#     make, which can take days. Each such bead is released (assignee cleared, reopened;
+#     every other field, including the park label/metadata itself, is left untouched —
+#     the decision is still pending, only the pool slot is freed) and the session is
+#     reaped instead of held forever. A MIX (some beads parked, some not) still KEEPS,
+#     unchanged from the behavior above.
+#   * Kill switch ADHOC_REAPER_ENABLED=0 → census/log only, no closes, no bead releases.
+# The two mutations are `gc session close` on eligible adhoc sessions, and — ONLY for the
+# parked-bead exception above — `bd update` to release a bead parked on an Athos decision.
+# No rm of data, no Dolt surgery.
 set -uo pipefail
 
 GT=/Users/athos/gt
@@ -291,17 +301,36 @@ for s in d["sessions"]:
 ' 2>/dev/null
 }
 
-# worker_bead_lock <id> <name> <alias> <session_name> → ONE line on stdout (ga-jn82py):
+# worker_bead_lock <id> <name> <alias> <session_name> → ONE line on stdout (ga-jn82py),
+# except the held_parked verdict below which is one line PER bead:
 #   clear <n>/<m>              every store that exists answered and NONE holds a non-closed
 #                              bead assigned to any identity of this session (n = stores
 #                              queried, m = routes; a route whose .beads is DEFINITIVELY
 #                              absent — ENOENT — is skipped, any other stat error is
 #                              unknown) → the reap may go on
 #   held <store>:<bead>(<type>)[,...][,+N]
-#                              a non-closed bead is assigned to it → KEEP (first store that
-#                              has one; at most 5 beads listed, +N = how many more)
+#                              a non-closed bead is assigned to it, and at least one such
+#                              bead is NOT parked on an Athos decision → KEEP (first store
+#                              that has one; at most 5 beads listed, +N = how many more)
+#   held_parked <n>
+#   <store_abs_path>\t<bead_id>\t<bead_assignee>   (repeated n times)
+#                              (ga-v4l16y) EVERY non-closed bead held by this session, in
+#                              EVERY store, is parked on an Athos decision — next-action:athos
+#                              (exact, or a next-action:athos-/next-action:athos: variant),
+#                              story:needs-approval, or metadata athos.acao set (non-empty).
+#                              The caller may release each listed bead (clear assignee,
+#                              reopen) and then reap the session. Full, untruncated list —
+#                              the caller needs exact ids here, unlike "held" above which is
+#                              log-only. Reaching this verdict costs MORE than "held": every
+#                              remaining store must be checked (an "all parked" claim is only
+#                              good once every store has answered) — but that extra cost is
+#                              paid ONLY when every store seen so far was fully parked; the
+#                              first NOT-parked held bead in any store still exits
+#                              immediately as plain "held", at the same cost as before this
+#                              exception existed.
 #   unknown <reason>           anything else → KEEP
-# The caller reaps ONLY on the exact prefix "clear " — empty or garbled output is unknown.
+# The caller reaps on "clear " directly, or on "held_parked " after releasing every listed
+# bead — "held " or anything else never reaps on its own.
 # One query per store: bd -C <store> query "(assignee=A OR assignee=B ...) AND NOT status=closed".
 # Equality on assignee is fast on every store, while a status-only scan of HQ's wisps table
 # times out under load (measured 2026-09-19), and `bd query` — unlike a plain `bd list` —
@@ -318,6 +347,25 @@ raw = sys.argv[5:]
 def out(line):
     print(line)
     sys.exit(0)
+
+def is_human_parked(b):
+    # ga-v4l16y: a bead deliberately parked on a decision only Athos can make.
+    # Deliberately narrower than bead_state.is_athos_page (no blocked-reason:decision,
+    # no refino:policy-gap) to match the acceptance criteria for this fix exactly:
+    # next-action:athos*, story:needs-approval, or metadata athos.acao set.
+    for l in (b.get("labels") or []):
+        if not isinstance(l, str):
+            continue
+        if l == "next-action:athos" or l.startswith("next-action:athos-") or l.startswith("next-action:athos:"):
+            return True
+        if l == "story:needs-approval":
+            return True
+    meta = b.get("metadata")
+    if isinstance(meta, dict):
+        v = meta.get("athos.acao")
+        if isinstance(v, str) and v.strip():
+            return True
+    return False
 
 ids = []
 for i in raw:
@@ -350,6 +398,9 @@ if not stores:
     out("unknown routes_empty")
 expr = "(" + " OR ".join("assignee=" + i for i in ids) + ") AND NOT status=closed"
 checked = 0
+held_accum = []   # (store_abs_path, bead) pairs — ONLY ever populated with beads already
+                   # confirmed human-parked; a not-parked held bead exits immediately below
+                   # instead of accumulating, same as pre-existing behavior.
 for st in stores:
     tag = os.path.basename(st)
     try:
@@ -378,14 +429,50 @@ for st in stores:
         out("unknown malformed_element:" + tag)
     checked += 1
     if d:
-        shown = ["%s(%s)" % (b["id"], b.get("issue_type") or "?") for b in d[:5]]
-        if len(d) > 5:
-            shown.append("+%d" % (len(d) - 5))
-        out("held " + tag + ":" + ",".join(shown))
+        not_parked = [b for b in d if not is_human_parked(b)]
+        if not_parked:
+            # same verdict, same cost as before this fix: exit at the first store that
+            # proves NOT every held bead is parked on an Athos decision.
+            shown = ["%s(%s)" % (b["id"], b.get("issue_type") or "?") for b in d[:5]]
+            if len(d) > 5:
+                shown.append("+%d" % (len(d) - 5))
+            out("held " + tag + ":" + ",".join(shown))
+        held_accum.extend((st, b) for b in d)
 if checked == 0:
     out("unknown no_store_checked")
+if held_accum:
+    # every non-empty store seen was fully parked — ALL of it, not just the first hit.
+    lines = ["held_parked %d" % len(held_accum)]
+    for hst, hb in held_accum:
+        lines.append("%s\t%s\t%s" % (hst, hb["id"], hb.get("assignee") or ""))
+    out("\n".join(lines))
 out("clear %d/%d" % (checked, len(stores)))
 ' "$BD_BIN" "$BD_TIMEOUT_SEC" "$ROUTES_FILE" "$CITY" "$@" </dev/null 2>/dev/null
+}
+
+# release_parked_beads <held_parked payload> → 0 if every listed bead was released, 1 if
+# any failed (ga-v4l16y). payload is worker_bead_lock's "held_parked <n>\n<path>\t<id>\t
+# <assignee>\n..." output. Clears assignee and reopens each bead — --if-assignee guards
+# against a bead that changed hands between the lock check and here (someone else already
+# claimed it), which is left untouched rather than clobbered; a stale guard, like any other
+# failure here, fails the WHOLE release (fail safe — the caller must not close the session
+# on a partial release). Every other field — labels (next-action:/story:needs-approval),
+# metadata (athos.acao), history — is left exactly as it was: only assignee/status move, so
+# the parked decision stays fully visible to whoever looks at the bead next.
+release_parked_beads() {
+  local payload="$1" store bead_id bead_assignee overall_rc=0 body
+  body="$(printf '%s\n' "$payload" | tail -n +2)"
+  while IFS=$'\t' read -r store bead_id bead_assignee; do
+    [ -z "$store" ] && continue
+    if [ -z "$bead_id" ] || [ -z "$bead_assignee" ]; then
+      overall_rc=1
+      continue
+    fi
+    if ! "$BD_BIN" -C "$store" update "$bead_id" -a "" -s open --if-assignee "$bead_assignee" -q; then
+      overall_rc=1
+    fi
+  done <<< "$body"
+  return "$overall_rc"
 }
 
 # Sourcing guard: the selftest sources this file to unit-test the pure helpers
@@ -395,6 +482,7 @@ out("clear %d/%d" % (checked, len(stores)))
 reaped=0; kept_young=0; kept_active=0; kept_alive_peek=0; kept_peek_inconclusive=0; skipped_other=0; would_reap=0; eligible=0
 kept_attached=0; kept_has_bead=0; kept_bead_lookup_failed=0   # ga-jn82py
 bead_lookup_failures=0                                        # consecutive failed worker-lock lookups (circuit breaker)
+released_parked_beads=0; kept_parked_release_failed=0         # ga-v4l16y
 
 RAW_JSON="$(list_sessions_raw)"; raw_status=$?
 if [ "$raw_status" -ne 0 ]; then
@@ -418,6 +506,7 @@ fi
 while IFS=$'\t' read -r id name state closed created last_active attached alias session_name title; do
   [ -n "$name" ] || continue
   decision_log=""   # a reap decision is announced only once the worker lock (below) has passed
+  pending_bead_release=""   # ga-v4l16y: set below when the worker lock says held_parked
   # eligibility: ephemeral adhoc + not a named/core crew
   if ! is_adhoc_eligible "$name"; then
     skipped_other=$((skipped_other+1)); continue
@@ -570,13 +659,21 @@ while IFS=$'\t' read -r id name state closed created last_active attached alias 
     else
       lock_verdict="$(worker_bead_lock "$id" "$name" "$alias" "$session_name")"
       case "$lock_verdict" in
-        "clear "*|"held "*) bead_lookup_failures=0 ;;
+        "clear "*|"held "*|"held_parked "*) bead_lookup_failures=0 ;;
         *) bead_lookup_failures=$((bead_lookup_failures+1)) ;;
       esac
     fi
     lock_detail="$(printf '%s' "${lock_verdict:-empty_output}" | tr -c 'A-Za-z0-9._:,/=()+ -' '_')"
     case "$lock_verdict" in
       "clear "*) : ;;
+      "held_parked "*)
+        # ga-v4l16y: every bead this session holds, in every store, is parked on an
+        # Athos decision — release each one below (assignee cleared, reopened; the
+        # park label/metadata stays untouched) and let the reap proceed, instead of
+        # keeping the slot wedged on a decision that can take days.
+        pending_bead_release="$lock_verdict"
+        decision_log="$(printf '{"ts":"%s","event":"reap_parked_bead","id":"%s","name":"%s","state":"%s","age_min":%s}' "$(ts)" "$id" "$name" "$state" "$age")"
+        ;;
       "held "*)
         kept_has_bead=$((kept_has_bead+1))
         log "$(printf '{"ts":"%s","event":"keep","reason":"has_assigned_bead","id":"%s","name":"%s","state":"%s","detail":"%s"}' "$(ts)" "$id" "$name" "$state" "$lock_detail")"
@@ -599,6 +696,21 @@ while IFS=$'\t' read -r id name state closed created last_active attached alias 
     continue
   fi
 
+  # ga-v4l16y: release every bead the held_parked verdict listed BEFORE closing the
+  # session — if any release fails (race: someone else claimed it since the lock check;
+  # a bd error), do NOT close the session this sweep. Fail safe, same posture as every
+  # other failure mode in this script: retry next sweep rather than close a session that
+  # may still be legitimately holding a bead we could not confirm was released.
+  if [ -n "$pending_bead_release" ]; then
+    if release_parked_beads "$pending_bead_release"; then
+      released_parked_beads=$((released_parked_beads + $(printf '%s\n' "$pending_bead_release" | head -1 | awk '{print $2}')))
+    else
+      kept_parked_release_failed=$((kept_parked_release_failed+1))
+      log "$(printf '{"ts":"%s","event":"keep","reason":"parked_release_failed","id":"%s","name":"%s","state":"%s"}' "$(ts)" "$id" "$name" "$state")"
+      continue
+    fi
+  fi
+
   # Canonical close: stops the runtime AND closes the session bead AND tears down the
   # tmux session — preferred over a raw `tmux kill-session` (which would orphan the
   # bead). Falls back to tmux kill only if close fails and the tmux session lingers.
@@ -616,6 +728,6 @@ done <<EOF
 $CENSUS
 EOF
 
-log "$(printf '{"ts":"%s","event":"sweep","enabled":"%s","min_age_min":%s,"idle_min":%s,"eligible":%s,"reaped":%s,"would_reap":%s,"kept_young":%s,"kept_active":%s,"kept_alive_peek":%s,"kept_peek_inconclusive":%s,"skipped_other":%s,"kept_attached":%s,"kept_has_bead":%s,"kept_bead_lookup_failed":%s}' \
-  "$(ts)" "$ENABLED" "$MIN_AGE_MIN" "$IDLE_MIN" "$eligible" "$reaped" "$would_reap" "$kept_young" "$kept_active" "$kept_alive_peek" "$kept_peek_inconclusive" "$skipped_other" "$kept_attached" "$kept_has_bead" "$kept_bead_lookup_failed")"
+log "$(printf '{"ts":"%s","event":"sweep","enabled":"%s","min_age_min":%s,"idle_min":%s,"eligible":%s,"reaped":%s,"would_reap":%s,"kept_young":%s,"kept_active":%s,"kept_alive_peek":%s,"kept_peek_inconclusive":%s,"skipped_other":%s,"kept_attached":%s,"kept_has_bead":%s,"kept_bead_lookup_failed":%s,"released_parked_beads":%s,"kept_parked_release_failed":%s}' \
+  "$(ts)" "$ENABLED" "$MIN_AGE_MIN" "$IDLE_MIN" "$eligible" "$reaped" "$would_reap" "$kept_young" "$kept_active" "$kept_alive_peek" "$kept_peek_inconclusive" "$skipped_other" "$kept_attached" "$kept_has_bead" "$kept_bead_lookup_failed" "$released_parked_beads" "$kept_parked_release_failed")"
 exit 0

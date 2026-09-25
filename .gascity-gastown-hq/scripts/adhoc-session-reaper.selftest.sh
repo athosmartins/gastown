@@ -428,11 +428,28 @@ BD_STUB="$STUBDIR/bd"
 cat > "$BD_STUB" <<'STUB'
 #!/usr/bin/env bash
 # stub of: bd -C <store> query "<expr>" --json --limit 0
-store=""; expr=""
-while [ $# -gt 0 ]; do
-  case "$1" in -C) store="$2"; shift 2 ;; query) expr="$2"; shift 2 ;; *) shift ;; esac
+#      and: bd -C <store> update <id> -a <assignee> -s <status> --if-assignee <val> -q (ga-v4l16y)
+store=""; expr=""; mode=""; upd_id=""; upd_assignee=""; upd_status=""; upd_if_assignee=""
+args=("$@"); i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  a="${args[$i]}"
+  case "$a" in
+    -C) store="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    query) mode="query"; expr="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    update) mode="update"; upd_id="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    -a|--assignee) upd_assignee="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    -s|--status) upd_status="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    --if-assignee) upd_if_assignee="${args[$((i+1))]}"; i=$((i+2)); continue ;;
+    *) i=$((i+1)) ;;
+  esac
 done
 name="$(basename "$store")"
+if [ "$mode" = "update" ]; then
+  printf '%s|%s|a=%s|s=%s|ifa=%s\n' "$name" "$upd_id" "$upd_assignee" "$upd_status" "$upd_if_assignee" >> "${AHR_BD_UPDATE_LOG:-/dev/null}"
+  case ",${AHR_BD_UPDATE_FAIL:-}," in *",$name,"*) exit 1 ;; esac
+  case ",${AHR_BD_UPDATE_STALE:-}," in *",$name:$upd_id,"*) exit 13 ;; esac
+  exit 0
+fi
 printf '%s|%s\n' "$name" "$expr" >> "${AHR_BD_LOG:-/dev/null}"
 # real `bd query` exits 1 AND prints a JSON *error object* on stdout when Dolt times out
 # ("search count wisps: invalid connection", observed live 2026-09-19) — valid JSON that
@@ -460,11 +477,14 @@ printf '{"prefix":"ga","path":"%s"}\n{"prefix":"wa","path":"%s"}\n{"prefix":"ps"
   "$STUBDIR/stores/city" "$STUBDIR/stores/wa" "$STUBDIR/stores/ps" > "$ROUTES_FIX"
 ROUTES_NOBEADS="$STUBDIR/routes-nobeads.jsonl"
 printf '{"prefix":"zz","path":"%s"}\n' "$STUBDIR/stores/nobeads" > "$ROUTES_NOBEADS"
-AHR_BD_FAIL=""; AHR_BD_NOTLIST=""; AHR_BD_JUNKLIST=""; AHR_BD_HANG=""
+AHR_BD_FAIL=""; AHR_BD_NOTLIST=""; AHR_BD_JUNKLIST=""; AHR_BD_HANG=""; AHR_BD_UPDATE_FAIL=""; AHR_BD_UPDATE_STALE=""
 export ADHOC_REAPER_BD="$BD_STUB" ADHOC_REAPER_ROUTES_FILE="$ROUTES_FIX" ADHOC_REAPER_BD_TIMEOUT_SEC=20
 export AHR_BD_LOG="$STUBDIR/bd.log" AHR_BD_FIXTURE_DIR="$STUBDIR/bdfx" AHR_BD_FAIL AHR_BD_NOTLIST AHR_BD_JUNKLIST AHR_BD_HANG
+export AHR_BD_UPDATE_LOG="$STUBDIR/bd-update.log" AHR_BD_UPDATE_FAIL AHR_BD_UPDATE_STALE
 
-bd_reset()  { rm -f "$STUBDIR"/bdfx/*.json; : > "$AHR_BD_LOG"; AHR_BD_FAIL=""; AHR_BD_NOTLIST=""; AHR_BD_JUNKLIST=""; AHR_BD_HANG=""; }
+bd_reset()  { rm -f "$STUBDIR"/bdfx/*.json; : > "$AHR_BD_LOG"; : > "$AHR_BD_UPDATE_LOG"; AHR_BD_FAIL=""; AHR_BD_NOTLIST=""; AHR_BD_JUNKLIST=""; AHR_BD_HANG=""; AHR_BD_UPDATE_FAIL=""; AHR_BD_UPDATE_STALE=""; }
+bd_update_calls() { awk 'NF{n++} END{print n+0}' "$AHR_BD_UPDATE_LOG" 2>/dev/null; }
+bd_update_has()   { grep -qF -- "$1" "$AHR_BD_UPDATE_LOG" 2>/dev/null; }
 bd_calls()  { awk 'NF{n++} END{print n+0}' "$AHR_BD_LOG" 2>/dev/null; }
 bdfx()      { printf '%s' "$2" > "$STUBDIR/bdfx/$1.json"; }     # $1=store basename $2=JSON list of beads
 # mk_sess id name state created last_active title [attached true|false; omitted = key absent]
@@ -804,6 +824,127 @@ if [ ! -s "$AHR_CLOSE_LOG" ] && [ "$(keep_reason_for auto-refiner-adhoc-ppp)" = 
   ok "(p) id absent → rejected as malformed_row_no_id, gc session close never called"
 else
   nope "(p) id-less row was not rejected as malformed: close-log='$(tr '\n' ' ' < "$AHR_CLOSE_LOG")' reason='$(keep_reason_for auto-refiner-adhoc-ppp)' log=$(grep -F ppp "$AHR_LOG" | head -1)"
+fi
+
+# ---- ga-v4l16y: parked-on-Athos bead release (the held_parked exception) ------------
+# A worker session that is idle/drained and holds ONLY beads parked on an Athos decision
+# (next-action:athos*, story:needs-approval, or metadata athos.acao) used to be kept
+# FOREVER by the plain has_assigned_bead lock above — Athos deciding can take days, and
+# meanwhile the session wedges a pool slot. These beads must be released (assignee
+# cleared, reopened) and the session reaped; a MIX with a non-parked bead must still KEEP,
+# unchanged from every (w*) scenario above.
+
+# (v1) THE BUG ITSELF: idle worker holding a single next-action:athos bead → REAPED, and
+#      the bead is released (assignee cleared via -a "", reopened via -s open, guarded by
+#      --if-assignee on the session's own name).
+bd_reset; AHR_FIXTURE="$STUBDIR/v1.json"
+bdfx wa '[{"id":"wa-u38ev","status":"in_progress","assignee":"wa-worker-adhoc-v1","issue_type":"task","labels":["next-action:athos"]}]'
+put_sessions "$(mk_sess ga-wisp-v1 wa-worker-adhoc-v1 asleep "$OLD" "$ZERO" "Pool top-up wa-u38ev" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v1" && [ "$(bd_update_calls)" = "1" ] \
+   && bd_update_has "wa|wa-u38ev|a=|s=open|ifa=wa-worker-adhoc-v1"; then
+  ok "(v1) ga-v4l16y: idle worker holding a next-action:athos bead → REAPED + bead released (unassigned, reopened)"
+else
+  nope "(v1) parked bead did not trigger release+reap: closed=$(closed_count) bd_update_calls=$(bd_update_calls) log=$(tail -1 "$AHR_BD_UPDATE_LOG")"
+fi
+
+# (v2) same, via the story:needs-approval signal instead of next-action:athos.
+bd_reset; AHR_FIXTURE="$STUBDIR/v2.json"
+bdfx wa '[{"id":"wa-v2bead","status":"open","assignee":"wa-worker-adhoc-v2","issue_type":"task","labels":["story:needs-approval"]}]'
+put_sessions "$(mk_sess ga-wisp-v2 wa-worker-adhoc-v2 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v2" && bd_update_has "wa|wa-v2bead|a=|s=open|ifa=wa-worker-adhoc-v2"; then
+  ok "(v2) story:needs-approval bead (no next-action label) → REAPED + released"
+else
+  nope "(v2) story:needs-approval did not trigger release: closed=$(closed_count) log=$(tail -1 "$AHR_BD_UPDATE_LOG")"
+fi
+
+# (v3) same, via metadata athos.acao (no park label at all).
+bd_reset; AHR_FIXTURE="$STUBDIR/v3.json"
+bdfx wa '[{"id":"wa-v3bead","status":"in_progress","assignee":"wa-worker-adhoc-v3","issue_type":"task","metadata":{"athos.acao":"Confirmar recebimento do PIX"}}]'
+put_sessions "$(mk_sess ga-wisp-v3 wa-worker-adhoc-v3 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v3" && bd_update_has "wa|wa-v3bead|a=|s=open|ifa=wa-worker-adhoc-v3"; then
+  ok "(v3) metadata athos.acao set, no park label → REAPED + released"
+else
+  nope "(v3) athos.acao metadata did not trigger release: closed=$(closed_count) log=$(tail -1 "$AHR_BD_UPDATE_LOG")"
+fi
+
+# (v4) REGRESSION GUARD (ga-jn82py): a MIX — one parked bead, one ordinary bead — must
+#      stay KEPT exactly like before this fix, and nothing gets released. "ALL beads
+#      parked" is required; one un-parked bead anywhere still wins.
+bd_reset; AHR_FIXTURE="$STUBDIR/v4.json"
+bdfx wa '[{"id":"wa-v4a","status":"in_progress","assignee":"wa-worker-adhoc-v4","issue_type":"task","labels":["next-action:athos"]},{"id":"wa-v4b","status":"open","assignee":"wa-worker-adhoc-v4","issue_type":"task"}]'
+put_sessions "$(mk_sess ga-wisp-v4 wa-worker-adhoc-v4 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(keep_reason_for wa-worker-adhoc-v4)" = "has_assigned_bead" ] && [ "$(bd_update_calls)" = "0" ]; then
+  ok "(v4) mix of parked+unparked held beads → KEPT, unchanged (regression guard, ga-jn82py)"
+else
+  nope "(v4) mixed-parked session mishandled: closed=$(closed_count) reason='$(keep_reason_for wa-worker-adhoc-v4)' bd_update_calls=$(bd_update_calls)"
+fi
+
+# (v5) the release itself fails (a race: bd update errors) → session stays KEPT, NOT
+#      closed — fail safe, never close on an unconfirmed release.
+bd_reset; AHR_FIXTURE="$STUBDIR/v5.json"; AHR_BD_UPDATE_FAIL="wa"
+bdfx wa '[{"id":"wa-v5bead","status":"in_progress","assignee":"wa-worker-adhoc-v5","issue_type":"task","labels":["next-action:athos"]}]'
+put_sessions "$(mk_sess ga-wisp-v5 wa-worker-adhoc-v5 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "0" ] && [ "$(keep_reason_for wa-worker-adhoc-v5)" = "parked_release_failed" ]; then
+  ok "(v5) bd update fails while releasing a parked bead → session KEPT, not closed (fail safe)"
+else
+  nope "(v5) failed release did not keep the session: closed=$(closed_count) reason='$(keep_reason_for wa-worker-adhoc-v5)'"
+fi
+
+# (v6) kill switch OFF: a parked bead is NOT released and the session is NOT closed —
+#      dry run must never mutate, same contract as the session-close mutation.
+bd_reset; AHR_FIXTURE="$STUBDIR/v6.json"
+bdfx wa '[{"id":"wa-v6bead","status":"in_progress","assignee":"wa-worker-adhoc-v6","issue_type":"task","labels":["next-action:athos"]}]'
+put_sessions "$(mk_sess ga-wisp-v6 wa-worker-adhoc-v6 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 0 dead
+if [ "$(closed_count)" = "0" ] && [ "$(bd_update_calls)" = "0" ] && log_has '"event":"would_reap","id":"ga-wisp-v6"'; then
+  ok "(v6) ENABLED=0 dry run: parked bead is NOT released, session NOT closed (would_reap logged only)"
+else
+  nope "(v6) dry run mutated a bead or closed a session: closed=$(closed_count) bd_update_calls=$(bd_update_calls)"
+fi
+
+# (v7) the idle-candidate (active, not drained/asleep) path also releases+reaps, and the
+#      next-action:athos-decide PREFIX variant (not just the bare label) is recognized.
+bd_reset; AHR_FIXTURE="$STUBDIR/v7.json"
+bdfx wa '[{"id":"wa-v7bead","status":"in_progress","assignee":"wa-worker-adhoc-v7","issue_type":"task","labels":["next-action:athos-decide"]}]'
+put_sessions "$(mk_sess ga-wisp-v7 wa-worker-adhoc-v7 active "$OLD" "$IDLE" "Pool top-up x" false)"
+run_reaper 1 alive
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v7" && bd_update_has "wa|wa-v7bead|a=|s=open|ifa=wa-worker-adhoc-v7"; then
+  ok "(v7) active+idle-stale worker holding a next-action:athos-decide bead → REAPED + released (prefix variant)"
+else
+  nope "(v7) active-idle parked worker not reaped/released: closed=$(closed_count) log=$(tail -1 "$AHR_BD_UPDATE_LOG")"
+fi
+
+# (v8) the parked bead lives in the LAST store — every store must still be checked before
+#      "all parked" can be claimed (mirrors (w4)'s cross-store coverage for plain held).
+bd_reset; AHR_FIXTURE="$STUBDIR/v8.json"
+bdfx ps '[{"id":"ps-v8bead","status":"in_progress","assignee":"wa-worker-adhoc-v8","issue_type":"task","labels":["next-action:athos"]}]'
+put_sessions "$(mk_sess ga-wisp-v8 wa-worker-adhoc-v8 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v8" && [ "$(bd_calls)" = "3" ] && bd_update_has "ps|ps-v8bead|a=|s=open|ifa=wa-worker-adhoc-v8"; then
+  ok "(v8) parked bead in the LAST store → all 3 stores scanned to confirm ALL-parked, then REAPED + released"
+else
+  nope "(v8) cross-store held_parked: closed=$(closed_count) bd_calls=$(bd_calls) log=$(tail -1 "$AHR_BD_UPDATE_LOG")"
+fi
+
+# (v9) two parked beads in TWO different stores → BOTH released, session REAPED, and the
+#      sweep summary counter reflects exactly 2 released beads.
+bd_reset; AHR_FIXTURE="$STUBDIR/v9.json"
+bdfx wa '[{"id":"wa-v9a","status":"in_progress","assignee":"wa-worker-adhoc-v9","issue_type":"task","labels":["next-action:athos"]}]'
+bdfx ps '[{"id":"ps-v9b","status":"open","assignee":"wa-worker-adhoc-v9","issue_type":"task","labels":["story:needs-approval"]}]'
+put_sessions "$(mk_sess ga-wisp-v9 wa-worker-adhoc-v9 asleep "$OLD" "$ZERO" "Pool top-up x" false)"
+run_reaper 1 dead
+if [ "$(closed_count)" = "1" ] && closed_has "ga-wisp-v9" && [ "$(bd_update_calls)" = "2" ] \
+   && bd_update_has "wa|wa-v9a|a=|s=open|ifa=wa-worker-adhoc-v9" \
+   && bd_update_has "ps|ps-v9b|a=|s=open|ifa=wa-worker-adhoc-v9" \
+   && log_has '"released_parked_beads":2'; then
+  ok "(v9) two parked beads across two stores → BOTH released, session REAPED, counter reflects 2"
+else
+  nope "(v9) multi-bead multi-store release: closed=$(closed_count) bd_update_calls=$(bd_update_calls) log_tail=$(tail -2 "$AHR_BD_UPDATE_LOG")"
 fi
 
 rm -rf "$STUBDIR" /tmp/_ahr_gc_stub_unit 2>/dev/null
