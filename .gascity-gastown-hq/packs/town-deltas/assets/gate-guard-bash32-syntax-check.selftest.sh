@@ -422,6 +422,41 @@ else
   esac
 fi
 
+# Branch G (gate-fix 3, the reviewer's SURVIVING MUTATION): an EXISTING daemon
+# script is edited IN PLACE into the bad construct — git status M, not A or R.
+# This is the exact ga-6aj348 shape (that merge MODIFIED quality-gate-
+# dispatcher.sh; it did not add a file). Every other refusal scenario in this
+# file is an ADD or a RENAME, so changing the live block's --diff-filter=AM to
+# =A left this whole selftest at 91/91 — the one shape the check exists for was
+# the one shape nothing pinned.
+git -C "$CLONE_DIR" checkout -q main
+git -C "$CLONE_DIR" checkout -q -b feat/modifiedbad
+printf '%s\n' "$BAD_BODY" >> "$CLONE_DIR/packs/town-deltas/assets/existing.sh"
+git -C "$CLONE_DIR" add -A
+git -C "$CLONE_DIR" commit -q -m "fix: edit an existing daemon script in place (adds a bash-3.2-incompatible construct)"
+git -C "$CLONE_DIR" push -q origin feat/modifiedbad
+_MOD_STATUS=$(git -C "$CLONE_DIR" diff --name-status main...feat/modifiedbad | cut -c1)
+eq "fixture sanity: git reports the in-place edit as M (so this scenario truly exercises a MODIFIED file, not an add)" "$_MOD_STATUS" "M"
+
+# Branch H (gate-fix 3, low finding): a path git DIFF lists but git SHOW cannot
+# extract — a gitlink (mode 160000, i.e. a submodule entry) named *.sh. The file
+# is counted as changed but can never be checked, so it must ALSO be counted as
+# unrun: the verdict (nao-consegui-medir, because checked != changed) was already
+# right, but the record used to read unrun=0.
+git -C "$CLONE_DIR" checkout -q main
+git -C "$CLONE_DIR" checkout -q -b feat/gitlinkfail
+git -C "$CLONE_DIR" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,scripts/vendored.sh
+git -C "$CLONE_DIR" commit -q -m "feat: a gitlink named vendored.sh (git show cannot extract it)"
+git -C "$CLONE_DIR" push -q origin feat/gitlinkfail
+_GL_LISTED=$(git -C "$CLONE_DIR" diff -z --name-only --no-renames --diff-filter=AM main...feat/gitlinkfail -- scripts | tr '\0' '\n')
+_GL_SHOW_RC=0; git -C "$CLONE_DIR" show "feat/gitlinkfail:scripts/vendored.sh" >/dev/null 2>&1 || _GL_SHOW_RC=$?
+if [ "$_GL_LISTED" = "scripts/vendored.sh" ] && [ "$_GL_SHOW_RC" -ne 0 ]; then
+  ok "fixture sanity: git diff LISTS scripts/vendored.sh but git show cannot extract it (rc=$_GL_SHOW_RC) — the extraction-failure scenario below is real"
+else
+  bad "FATAL fixture: gitlink scenario is vacuous (listed='$_GL_LISTED' show_rc=$_GL_SHOW_RC)"
+fi
+git -C "$CLONE_DIR" checkout -q main
+
 RIG_PATH="$TMPD/rig-registered-copy"
 git clone -q "$ORIGIN_DIR" "$RIG_PATH"
 git -C "$RIG_PATH" config user.email "test@gascity.local"
@@ -502,6 +537,22 @@ eq "live block: renamedbad (git mv + bad construct, reported as R by git) -> bas
 b32_run "$RIG_PATH" feat/unicodebad
 eq "live block: unicodebad (bad .sh in a non-ASCII path) -> bash32-fail, refused (was silently dropped by the quoted-path/\\.sh\$ filter)" "$R_VERDICT/$R_RC" "bash32-fail/1"
 
+# --- gate-fix 3: an existing script edited IN PLACE (status M) must be scanned ---
+b32_run "$RIG_PATH" feat/modifiedbad
+eq "live block: modifiedbad (existing .sh edited in place into the bad construct, git status M — the ga-6aj348 shape) -> bash32-fail, refused (--diff-filter=A would silently skip it)" "$R_VERDICT/$R_RC" "bash32-fail/1"
+case "$R_LOG" in
+  *"changed=1 checked=1 failed=1"*) ok "live block: the in-place edit is counted, checked and failed (changed=1 checked=1 failed=1)" ;;
+  *) bad "live block: modifiedbad record is not changed=1 checked=1 failed=1: '$R_LOG'" ;;
+esac
+
+# --- gate-fix 3: git show cannot extract a listed file -> counted as UNRUN, never a silent gap ---
+b32_run "$RIG_PATH" feat/gitlinkfail
+eq "live block: gitlinkfail (git diff lists scripts/vendored.sh, git show cannot extract it) -> nao-consegui-medir, proceeds (not bash32-ok, not sem-sh-alterado)" "$R_VERDICT/$R_RC/$R_STATUS_ERR" "nao-consegui-medir/0/0"
+case "$R_LOG" in
+  *"changed=1 checked=0"*"unrun=1"*"list_unread=0"*) ok "live block: the extraction failure is recorded as changed=1 checked=0 unrun=1 (the record says WHY it is unmeasured; it used to read unrun=0)" ;;
+  *) bad "live block: extraction failure is not recorded as unrun=1: '$R_LOG'" ;;
+esac
+
 # --- gate-fix 1: a FAILED git diff must be nao-consegui-medir, and logged ---
 b32_run "$RIG_PATH" feat/badsyntax "$TMPD/shim-diff-fails"
 eq "live block: git diff FAILS on a branch that contains a bad .sh -> nao-consegui-medir, NEVER sem-sh-alterado (the third-state defect)" "$R_VERDICT" "nao-consegui-medir"
@@ -520,6 +571,10 @@ eq "live block: mktemp -d fails (no place to extract to) on a branch with a bad 
 case "$R_LOG" in
   *"changed=1 checked=0"*"list_unread=0"*) ok "live block: the record shows the file was COUNTED as changed but never checked (changed=1 checked=0 list_unread=0)" ;;
   *) bad "live block: no-scratch-dir record is not 'changed=1 checked=0 list_unread=0': '$R_LOG'" ;;
+esac
+case "$R_LOG" in
+  *"unrun=1"*) ok "live block: the no-scratch-dir file is ALSO counted as unrun=1 (it used to read unrun=0 while checked < changed)" ;;
+  *) bad "live block: no-scratch-dir record does not say unrun=1: '$R_LOG'" ;;
 esac
 
 # --- no scratch file for the diff output: the list itself is unknown ---
@@ -671,6 +726,36 @@ if echo "$B32_BLOCK" | grep -F 'directly abuts' >/dev/null; then
   bad "guard.sh: a comment/text in the block still carries the wrong 'esac directly abuts the closing paren' root cause"
 else
   ok "guard.sh: no text in the block carries the wrong 'esac directly abuts the closing paren' root cause"
+fi
+
+# gate-fix 3 (the reviewer's BLOCKING finding): the scope comment claimed "Other
+# rigs' own scripts never live under these two paths ... costs one empty git diff
+# and nothing else" — false as measured (whatsapp_automation tracks 84 .sh under
+# scripts/, lexbh 5, property_scrapers 4, gascity 511), and it told the next reader
+# that a check that HARD-BLOCKS cannot touch other rigs. Prose is what a reader
+# trusts instead of re-measuring, so pin it: the false sentences must stay gone,
+# and the true scope must stay stated.
+for _false_claim in "never live under" "costs one empty git diff and nothing else" "gate/pilot/witness/deacon" "every com.gascity.* launchd"; do
+  if echo "$B32_BLOCK" | grep -F "$_false_claim" >/dev/null; then
+    bad "guard.sh: the bash32 block still says '$_false_claim' — a scope/interpreter claim measured to be false (or rig-specific in a rig-neutral refusal)"
+  else
+    ok "guard.sh: the bash32 block no longer says '$_false_claim'"
+  fi
+done
+if echo "$B32_BLOCK" | grep -F 'WHICHEVER rig' >/dev/null && echo "$B32_BLOCK" | grep -F 'whatsapp_automation' >/dev/null; then
+  ok "guard.sh: the scope comment states the check applies in WHICHEVER rig the marker belongs to and names whatsapp_automation (a rig that DOES track .sh under those paths)"
+else
+  bad "guard.sh: the scope comment no longer states that the check reaches other rigs (whatsapp_automation) — the ga-7dx2vw blocking finding would return"
+fi
+if echo "$B32_BLOCK" | grep -F '4 plists exec such a .sh' >/dev/null && echo "$B32_BLOCK" | grep -F 'DIRECTLY' >/dev/null; then
+  ok "guard.sh: the scope comment states the unverified case (plists that exec a .sh directly) instead of asserting /bin/bash for every job"
+else
+  bad "guard.sh: the scope comment does not state that some jobs exec a .sh directly (interpreter unverified)"
+fi
+if grep -F 'launchd-invoked with (com.gascity' "$GUARD" >/dev/null; then
+  bad "guard.sh: the gate_bash32_verdict doc still says the com.gascity.* plists hardcode /bin/bash for every script (measured: 70 of 93; the rest run python3/gc/launchctl)"
+else
+  ok "guard.sh: the gate_bash32_verdict doc no longer over-claims what the com.gascity.* plists run"
 fi
 
 RIGPATH_LINE=$(grep -n '\[ -d "\$RIG_PATH" \] || RIG_PATH=""' "$GUARD" | head -1 | cut -d: -f1)

@@ -2598,9 +2598,11 @@ gate_bash32_parse_class() {
 #                           incident: code that passed review AND whatever
 #                           ran under the PATH's Homebrew bash 5.3 but could
 #                           not parse under the real /bin/bash 3.2
-#                           interpreter these scripts are actually
-#                           launchd-invoked with (com.gascity.* plists
-#                           hardcode /bin/bash, never PATH bash).
+#                           interpreter launchd runs shell jobs through
+#                           (the com.gascity.* plists that run a shell script
+#                           invoke /bin/bash explicitly, never PATH bash —
+#                           measured 2026-09-25: 70 of 93 com.gascity.*
+#                           plists; the other 23 run python3/gc/launchctl).
 #   Any count that is empty or non-numeric is "don't know", never 0: a
 #   garbled <failed> must not read as "no failures" (-> bash32-ok).
 #   Pure (no IO) — the impure call site does all git/worktree/bash -n work
@@ -5646,10 +5648,11 @@ fi
 # city-infra scripts ──────────────────────────────────────────────────────────
 # 2026-09-25 incident: ga-6aj348 (00d526a76) passed reviewer verdicts and
 # whatever ran under the PATH's Homebrew bash 5.3, but broke quality-gate-
-# dispatcher.sh's own parse under /bin/bash 3.2 — the ACTUAL interpreter every
-# gate/pilot/witness/deacon daemon runs under (every com.gascity.* launchd
-# plist hardcodes /bin/bash in ProgramArguments; PATH bash on this machine is
-# Homebrew 5.3, which silently accepts syntax 3.2 rejects). The gate itself
+# dispatcher.sh's own parse under /bin/bash 3.2 — the interpreter launchd runs
+# the city's shell daemons through (measured 2026-09-25: 70 of the 93
+# com.gascity.* plists invoke /bin/bash explicitly in ProgramArguments; the
+# other 23 run python3/gc/launchctl and none execs a .sh directly. PATH bash on
+# this machine is Homebrew 5.3, which silently accepts syntax 3.2 rejects). The gate itself
 # WAS the broken component: no reviewer could be spawned for 3h (21 markers
 # queued, incl. a P0) until a human-triggered emergency revert (79392548f)
 # landed straight to main. shellcheck -s bash does NOT catch this — it is not
@@ -5666,14 +5669,25 @@ fi
 # Only the real /bin/bash 3.2 binary reproduces it.
 #
 # Scope: every .sh file added/changed on the branch under
-# packs/town-deltas/assets/ or scripts/ — the two trees every gate/pilot/
-# witness/deacon daemon in this city loads from, and (per those daemons' own
-# launchd plists) the trees that actually run under /bin/bash 3.2, never PATH
-# bash. Other rigs' own scripts never live under these two paths, so for a
-# bead whose branch doesn't touch gascity's own infra this check costs one
-# empty git diff and nothing else. NOT full coverage: only files named *.sh
-# are parsed — an extensionless or differently-named script launchd runs
-# from those trees is not seen by this check.
+# packs/town-deltas/assets/ or scripts/, in WHICHEVER rig the marker belongs to
+# (the git commands run with -C "$RIG_PATH" and the pathspecs are relative to
+# it). This is deliberately NOT gascity-only. Tracked .sh files under those two
+# paths at HEAD, measured 2026-09-25 (a snapshot, not an invariant): gascity
+# 511, whatsapp_automation 84, lexbh 5, property_scrapers 4, marketing 0,
+# gastown 0 — so a whatsapp_automation submission that changes scripts/*.sh IS
+# checked and CAN be refused here. Why the same 3.2 floor for rig scripts:
+# launchd runs them through /bin/bash too — measured 2026-09-25 over the plists
+# that run a .sh under a rig's scripts/ or the HQ scripts/ and packs/town-deltas/
+# assets/ trees: 96 invoke it via /bin/bash — and a script that parses under 3.2
+# parses under every newer bash, so 3.2 is the compatibility floor, not an
+# arbitrary choice. Caveat, stated rather than hidden: 4 plists exec such a .sh
+# DIRECTLY (interpreter = its shebang / launchd's PATH; one under
+# property_scrapers/scripts/, three under whatsapp_automation/scripts/), so for
+# those jobs the "runs under 3.2" premise is unverified and this check is
+# stricter than they strictly need. A submission that changes no .sh under those
+# paths costs one empty git diff.
+# NOT full coverage: only files named *.sh are parsed — an extensionless or
+# differently-named script launchd runs from those trees is not seen here.
 #
 # Renames: the diff runs with --no-renames, so a `git mv old.sh new.sh` plus
 # edits arrives as an ADD of the new path and is parsed like any other new
@@ -5746,7 +5760,10 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
             *) continue ;;
           esac
           _B32_CHANGED=$((_B32_CHANGED + 1))
-          [ -n "$_B32_WT" ] || continue   # no scratch dir: counted as changed, never checked -> nao-consegui-medir
+          # No scratch dir: counted as changed AND as unrun (never checked ->
+          # nao-consegui-medir). It used to be `|| continue`, which left the log
+          # reading unrun=0 while checked < changed.
+          [ -n "$_B32_WT" ] || { _B32_UNRUN=$((_B32_UNRUN + 1)); continue; }
           mkdir -p "$(dirname "$_B32_WT/$_b32_f")" 2>/dev/null
           if git -C "$RIG_PATH" show "${_B32_BRANCH_SHA}:$_b32_f" > "$_B32_WT/$_b32_f" 2>/dev/null; then
             # Exit status captured on its own (`|| rc=$?` keeps set -e out of
@@ -5773,6 +5790,12 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
             else
               _B32_UNRUN=$((_B32_UNRUN + 1))
             fi
+          else
+            # git show could not extract the file (e.g. a gitlink named *.sh, or a
+            # transient object-store failure): counted as changed, so it must ALSO
+            # be counted as unrun — otherwise the log reads unrun=0 while
+            # checked < changed (the verdict was right, the record was not).
+            _B32_UNRUN=$((_B32_UNRUN + 1))
           fi
         done < "$_B32_LIST"
       else
@@ -5790,10 +5813,10 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
   log "BASH32-CHECK bead=$BEAD_ID verdict=$_B32_VERDICT branch=$BRANCH changed=$_B32_CHANGED checked=$_B32_CHECKED failed=$_B32_FAILED unrun=$_B32_UNRUN list_unread=$_B32_UNMEASURED refs_resolved=$_B32_REFS"
   case "$_B32_VERDICT" in
     bash32-fail)
-      err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 (the real interpreter these scripts run under). Refusing at submission."
+      err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 (the macOS /bin/bash that launchd runs these scripts through). Refusing at submission."
       set_gate_status "$MARKER_ID" "error"
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: bash-3.2 syntax check (ga-7dx2vw).
-$_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 — the real interpreter every gate/pilot/witness/deacon daemon runs under (launchd hardcodes /bin/bash; Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
+$_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 — the macOS /bin/bash that launchd runs these scripts through, in whichever rig they live (Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
 $_B32_DETAIL
 Fix the syntax. Measured recurring cause on /bin/bash 3.2.57: a \`case\` with UNparenthesized patterns inside a \$( ... ) command substitution is rejected at its first \`;;\` — where \`esac\` and the closing \`)\` sit makes no difference (esac on its own line fails too). Either give every pattern a leading paren, e.g. \$(case \$x in (a) echo A;; (*) echo Z;; esac), or move the case out of the \$( ... ) (or use if/elif). Verify locally with:
   /bin/bash -n <file>
