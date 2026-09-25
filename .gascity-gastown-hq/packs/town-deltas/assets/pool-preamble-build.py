@@ -70,7 +70,7 @@ def overlay_for(m, role):
     for k in ("remoteControlAtStartup", "env"):
         if k in base:
             out[k] = base[k]
-    out["autoMemoryEnabled"] = bool(m["common"]["auto_memory"])
+    out["autoMemoryEnabled"] = bool(r.get("auto_memory", m["common"]["auto_memory"]))
     out["claudeMdExcludes"] = [_subst(p, m["paths"]) for p in m["common"]["claude_md_excludes"]]
     sk = r.get("skills")
     if sk:
@@ -237,8 +237,10 @@ def check_overlays(m):
                 errs.append(f"overlay '{role}': perdeu o deny do overlay base '{d}'")
         if cfg.get("remoteControlAtStartup") is not False:
             errs.append(f"overlay '{role}': remoteControlAtStartup tem que ser false (wa-cy6we)")
-        if cfg.get("autoMemoryEnabled") is not False:
-            errs.append(f"overlay '{role}': autoMemoryEnabled tem que ser false")
+        if r["td_role"] in m["common"].get("mayor_memory_roles", []) and cfg.get("autoMemoryEnabled") is not False:
+            errs.append(f"overlay '{role}': autoMemoryEnabled tem que ser false (o índice de memória desse papel é o do Mayor)")
+        if not isinstance(cfg.get("autoMemoryEnabled"), bool):
+            errs.append(f"overlay '{role}': autoMemoryEnabled tem que estar EXPLÍCITO (true/false) — a decisão fica visível no arquivo")
         ex = cfg.get("claudeMdExcludes", [])
         for need in ("/.claude/CLAUDE.md", "/CLAUDE.md", "/AGENTS.md"):
             if not any(e.endswith(need) for e in ex):

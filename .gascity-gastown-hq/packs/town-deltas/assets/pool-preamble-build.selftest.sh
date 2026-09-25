@@ -100,6 +100,13 @@ s=s.replace("**"+needle+".**","**Segredos.**",1).replace("{{ end -}}\n{{ if not 
 open(p,"w",encoding="utf-8").write(s)
 EOF
 expect_fail "sentinela de segredos migra para seção guardada (existe no arquivo, mas não é núcleo)" "NÚCLEO: sentinela 'segredos'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays" <<'EOF'
+import json, sys
+p = sys.argv[1] + "/pool-roles.json"; m = json.load(open(p)); m["roles"]["dog"]["auto_memory"] = True
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False)
+EOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "dog volta a carregar o índice de memória do Mayor (o corte que a bead manda)" "índice de memória desse papel é o do Mayor"
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p)); m["doctrine"]["guarded"]["claudemd-carryover"]["roles"].remove("wa-worker")

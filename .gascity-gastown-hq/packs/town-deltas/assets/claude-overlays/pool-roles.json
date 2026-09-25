@@ -41,6 +41,11 @@
    "{home}/.claude/CLAUDE.md",
    "{gt_root}/CLAUDE.md",
    "{gt_root}/AGENTS.md"
+  ],
+  "_why_memory": "autoMemoryEnabled carrega o MEMORY.md do PROJETO da sessão. Dog e revisores rodam sob a árvore do HQ, então o índice é o do Mayor (-Users-athos-gt, ~19k chars) — a bead manda cortar. wa-worker/ps-worker carregam o índice do PRÓPRIO rig (WA: 105 linhas, 216 arquivos de lições operacionais tipo 'worktree novo precisa de mkdir shared'): esse é conhecimento de trabalho e FICA (custa ~5k tokens; cortar arriscaria a taxa de aprovação do gate).",
+  "mayor_memory_roles": [
+   "dog",
+   "reviewer"
   ]
  },
  "skills_universe": [
@@ -204,7 +209,8 @@
      "whatsapp-system"
     ]
    },
-   "plugins_off": []
+   "plugins_off": [],
+   "auto_memory": true
   },
   "ps-worker": {
    "overlay": "pool-ps-worker",
@@ -231,7 +237,8 @@
      "recall"
     ]
    },
-   "plugins_off": []
+   "plugins_off": [],
+   "auto_memory": true
   },
   "reviewer": {
    "overlay": "pool-reviewer",

@@ -48,7 +48,9 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
 1. **Tools**: nome BARE em `permissions.deny` REMOVE o schema do contexto (medido; vale sob `--dangerously-skip-permissions`).
    Só entram tools com 0 chamada em 7 dias nas sessões de pool e 0 menção em prompt/fórmula/doutrina de pool. Revisor: só Bash/Read/Edit/Write/SendMessage.
 2. **CLAUDE.md**: `claudeMdExcludes` no overlay (projeto). Precisa incluir `AGENTS.md`: ao excluir o CLAUDE.md o Claude Code cai no AGENTS.md (24k chars).
-3. **Memória**: `autoMemoryEnabled:false` (some o MEMORY.md do Mayor, 19k chars).
+3. **Memória, por papel**: `autoMemoryEnabled` carrega o índice do PROJETO da sessão. Dog e revisores (árvore do HQ) carregam o índice do **Mayor** (19k chars) → `false`, como a bead manda.
+   wa-worker/ps-worker carregam o índice do **próprio rig** (WA: 105 linhas, 216 arquivos de lições operacionais) → **mantido** (`true` explícito): é conhecimento de trabalho, custa ~5k tokens
+   e cortá-lo arriscaria a taxa do gate. O selftest exige `false` nos papéis do Mayor (`common.mayor_memory_roles`). As sondas de worker desta doc foram com memória off: some ~5k.
 4. **Skills**: `skillOverrides` — `off` no dog; `name-only` nos workers (mantém o nome, some a descrição: não esconde ferramenta de domínio).
    Skills de PLUGIN (`superpowers:*`) NÃO respondem a `skillOverrides` em nenhuma grafia testada; só `enabledPlugins:false` (feito só no revisor).
 5. **Carry-over (achado do red-team antes de submeter)**: excluir CLAUDE.md/AGENTS.md tira regras que só viviam lá. Auditei 15 regras contra fragment, prompts dos pools
