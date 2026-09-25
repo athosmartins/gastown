@@ -458,25 +458,52 @@ SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HAR
   || bad "expected fresh_e3, got '$SEL' — attempt==ceiling should already be excluded"
 
 echo "── (E4) default: leaving GATE_EXILE_RETRY_CEILING unset resolves to 3 ──"
+# gate feedback (ga-r5dsgp attempt 1): the runaway must carry gate:exiled-tier5
+# (has_rebase_fail) AND an overdue gate:exiled-since, or exile_overdue is never
+# even evaluated and a fresh marker wins whatever the default is — the test was
+# vacuous (a scratch copy with the default changed to 99 still passed).
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh_e4    "$(ago 60)"  "gate-status:queued")" \
-  "$(mkb runaway_e4  "$(ago 300)" "gate-status:queued,gate:rebase-fail-count:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
+  "$(mkb runaway_e4  "$(ago 300)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
 SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
-[ "$SEL" = "fresh_e4" ] && ok "leaving GATE_EXILE_RETRY_CEILING unset defaults to 3 — attempt=9 (via legacy gate:rebase-fail-count label) is excluded without an explicit override" \
-  || bad "expected fresh_e4, got '$SEL' — default retry ceiling not wired (or legacy rebase-fail-count label not recognized)"
+[ "$SEL" = "fresh_e4" ] && ok "leaving GATE_EXILE_RETRY_CEILING unset defaults to 3 — attempt=9 is excluded from exile_overdue admission without an explicit override" \
+  || bad "expected fresh_e4, got '$SEL' — default retry ceiling not wired"
+# ...and the same fixture WITHOUT the ceiling must admit the runaway, otherwise
+# E4 above could pass because the runaway was never a tier-1 candidate at all.
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 99)
+[ "$SEL" = "runaway_e4" ] && ok "E4 control: with the ceiling raised to 99 the SAME runaway IS admitted to tier 1 — so E4's exclusion is the ceiling's doing, not an artifact of the fixture" \
+  || bad "E4 control: expected runaway_e4 with ceiling=99, got '$SEL' — the E4 fixture never reaches exile_overdue, so E4 proves nothing"
 
 echo "── (E5) gate-feedback-style regression: malformed GATE_EXILE_RETRY_CEILING must not crash the sweep ──"
-FIX5=$(printf '[%s,%s]' "$(mkb e5a "$(ago 600)" "gate-status:queued")" "$(mkb e5b "$(ago 60)" "gate-status:queued")")
+# The runaway (attempt=9, exile long overdue) is what makes this meaningful: a
+# fallback to the wrong default (or a crash) changes WHO is selected, where the
+# old fixture (no exile labels at all) selected the same marker regardless.
+FIX5=$(printf '[%s,%s]' "$(mkb e5a "$(ago 300)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")" "$(mkb e5b "$(ago 60)" "gate-status:queued")")
 SEL=$(MARKERS_JSON="$FIX5" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" \
   GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" GATE_MARKER_HARD_AGE_SECONDS="$HARD" \
   GATE_EXILE_OVERDUE_SECONDS="$HARD" GATE_EXILE_RETRY_CEILING="not-a-number" GATE_PRIORITY_AUTHORS="oracle" \
   bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
 STATUS=$?
 if [ "$STATUS" = "0" ] && [ "$SEL" = "e5b" ]; then
-  ok "malformed GATE_EXILE_RETRY_CEILING falls back to the default (3) instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+  ok "malformed GATE_EXILE_RETRY_CEILING falls back to the default (3): the attempt=9 runaway is excluded and the sweep does not crash (exit=$STATUS, selected=$SEL)"
 else
   bad "malformed GATE_EXILE_RETRY_CEILING broke selection (exit=$STATUS, selected='$SEL')"
 fi
+
+echo "── (E7) ceiling parsing: leading zeros are normalized, zero is NOT a silent off-switch ──"
+# "0"/"000" would make `attempt < 0` false for every marker (a silent disable —
+# jq 1.8.1 reads "000" as 0, measured); "03" is not valid JSON and is normalized
+# so the value does not depend on which jq is installed. All must behave as a
+# sane ceiling of 3.
+FIX7=$(printf '[%s,%s,%s]' \
+  "$(mkb fresh_e7   "$(ago 60)"  "gate-status:queued")" \
+  "$(mkb inside_e7  "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-999999))")" \
+  "$(mkb runaway_e7 "$(ago 400)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
+for CEIL in 03 0 000 ; do
+  SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX7" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" "$CEIL")
+  [ "$SEL" = "inside_e7" ] && ok "GATE_EXILE_RETRY_CEILING='$CEIL' behaves as a normal ceiling of 3: the attempt=2 marker is admitted, the attempt=9 runaway is not" \
+    || bad "GATE_EXILE_RETRY_CEILING='$CEIL' selected '$SEL', expected inside_e7 (zero silently disabled exile_overdue admission, or a leading zero was not normalized)"
+done
 
 echo "── (E6) drift-guard: exile_overdue now composes a retry-count cap ──"
 grep -q 'def rebase_attempt_count' "$DISPATCHER" \

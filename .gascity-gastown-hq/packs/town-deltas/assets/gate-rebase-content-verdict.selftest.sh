@@ -361,44 +361,54 @@ else
   bad "rebase_git_attributes_file nao materializou arquivo nenhum (esperava um so com a linha union)"
 fi
 
-# Teste 8 (ga-r5dsgp) — daemons/deploy_deps.json auto-verify special case.
+# Teste 8 (ga-r5dsgp) — daemons/deploy_deps.json sole-conflict special case.
 #
 # INCIDENTE: daemons/deploy_deps.json is registered with a CUSTOM merge
-# driver (merge=deploydeps) precisely so two branches that each regenerate
-# it independently never hard-conflict — but rebase_git_attributes_file()
-# (ga-stisew, Teste 7d above) deliberately excludes custom drivers from THIS
-# function's own ground-truth merge-tree computation, so that computation
-# conflicts on this file EVERY time the driver resolves it, forever, on every
-# rebase — turning a perfectly healthy push into a permanent
-# "unknown:merge-tree-conflict" that never becomes "yes". Root cause of
-# ga-r5dsgp's 2.5h/59-sweep head-of-line block. The fix: when the ONLY path
-# this function's ground truth conflicts on is daemons/deploy_deps.json,
-# verify the CONTENT ACTUALLY ABOUT TO BE PUSHED (on disk at $wt, i.e.
-# $new_tip) via the rig's own generator --check instead of the 3-way-tree
-# comparison, which is the wrong question for a driver-covered path.
+# driver (merge=deploydeps), and rebase_git_attributes_file() (ga-stisew,
+# Teste 7d above) deliberately excludes custom drivers from this function's
+# own ground-truth merge-tree — so that computation conflicts on this file
+# every time main and the branch both regenerated it, forever, turning a
+# healthy push into a permanent "unknown:merge-tree-conflict" (ga-r5dsgp: 59
+# sweeps on one marker, 2.5h head-of-line block).
+#
+# GATE FEEDBACK (attempt 1, root-class:error-vs-empty): the first version
+# returned "yes" after verifying ONLY deploy_deps.json, so a rebase that
+# ALSO dropped some other file — a file neither side conflicted on — still
+# had "one conflicting path" and got force-pushed. "yes" now additionally
+# requires the tip's tree to differ from the conflicted merge's own tree at
+# exactly that one path (8f), the generator that vouches for the file to be
+# main's own (8h), $wt to really be the tip (8g), and --check to be bounded
+# (8i). 8f and 8h are proven against an in-suite mutation of the shipped code
+# (8f-mut / 8h-mut), so they cannot pass by accident.
 #
 # $wt must be a REAL, non-bare checkout for this (unlike Teste 6's bare
-# .repo.git) — the fix reads $wt/scripts/gen_daemon_deps.py and runs it
-# against $wt's ON-DISK daemons/deploy_deps.json, exactly as the live
+# .repo.git): --check reads $wt's on-disk files, exactly as the live
 # dispatcher's $TMP_REBASE_WT already is post-commit, pre-push.
-mkrepo_ddj() {  # <dir> [with_other_conflict:0|1]
-  local R="$1" with_other="${2:-0}"
+mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|none]
+  local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" pre=''
   mkdir -p "$R/daemons" "$R/scripts"
   git -C "$R" init -q
   git -C "$R" config user.email t@t; git -C "$R" config user.name T
+  case "$gen_mode" in
+    slow)     pre='import time; time.sleep(30)' ;;
+    degraded) pre='sys.stderr.write("AVISO varredura degradada: 1 plist(s) nao parseiam agora\n")' ;;
+  esac
   # Fixture generator: --check passes iff the committed file's content is
   # exactly the one "canonical" string — a minimal stand-in for the real
   # rig's scripts/gen_daemon_deps.py (wa-9lxa7's "compara o build fresco
   # contra o commitado"); this test only needs pass/fail, not real closures.
-  cat > "$R/scripts/gen_daemon_deps.py" <<'PYEOF'
+  if [ "$gen_mode" != "none" ]; then   # none: a rig that never had a generator
+    cat > "$R/scripts/gen_daemon_deps.py" <<PYEOF
 #!/usr/bin/env python3
 import sys
 CANON = '{"n": 2}\n'
 if "--check" in sys.argv[1:]:
+    $pre
     with open("daemons/deploy_deps.json") as f:
         sys.exit(0 if f.read() == CANON else 1)
 sys.exit(0)
 PYEOF
+  fi
   printf '{"n": 0}\n' > "$R/daemons/deploy_deps.json"
   [ "$with_other" = "1" ] && printf 'base\n' > "$R/other.txt"
   git -C "$R" add -A; git -C "$R" commit -qm base
@@ -406,14 +416,30 @@ PYEOF
   git -C "$R" checkout -q -b ddjbranch
   printf '{"n": 1}\n' > "$R/daemons/deploy_deps.json"
   [ "$with_other" = "1" ] && printf 'branch-version\n' > "$R/other.txt"
+  # A file the branch ADDS and main never touches: it merges cleanly, so it is
+  # NOT among the conflicting paths — exactly the kind a sole-conflict check
+  # alone cannot see being dropped (8f).
+  [ "$with_feature" = "1" ] && printf 'the branch feature\n' > "$R/feature.txt"
+  # selfattest: the branch's OWN authored commit rewrites the generator to approve
+  # anything. It merges cleanly (main never touches the generator), so it sits in
+  # BOTH the ground-truth merge tree and the rebase tip — invisible to the tree
+  # comparison, which is exactly why 8h needs its own requirement.
+  [ "$gen_mode" = "selfattest" ] && printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$R/scripts/gen_daemon_deps.py"
   git -C "$R" add -A; git -C "$R" commit -qm "branch regenerates deploy_deps.json"
   git -C "$R" checkout -q ddjmain
   printf '{"n": 5}\n' > "$R/daemons/deploy_deps.json"
   [ "$with_other" = "1" ] && printf 'main-version\n' > "$R/other.txt"
   git -C "$R" add -A; git -C "$R" commit -qm "main regenerates deploy_deps.json differently"
 }
-RD="$TMP/repo-deploydeps"; mkrepo_ddj "$RD"
-DDJ_MAIN=$(git -C "$RD" rev-parse ddjmain); DDJ_BRANCH=$(git -C "$RD" rev-parse ddjbranch)
+# ddj_setup <dir> [with_other] [with_feature] [gen_mode] — builds the fixture
+# and sets DDJ_MAIN / DDJ_BRANCH, leaving $dir checked out detached at the
+# branch, ready for a "rebase result" commit on top.
+ddj_setup() {
+  mkrepo_ddj "$@"
+  DDJ_MAIN=$(git -C "$1" rev-parse ddjmain); DDJ_BRANCH=$(git -C "$1" rev-parse ddjbranch)
+  git -C "$1" checkout -q --detach "$DDJ_BRANCH"
+}
+RD="$TMP/repo-deploydeps"; ddj_setup "$RD" 0 1
 
 # Teste 8-premise — the two sides genuinely conflict under a plain merge-tree
 # (same single-line file, both sides changed it away from base) — without
@@ -423,15 +449,15 @@ git -C "$RD" merge-tree --write-tree "$DDJ_MAIN" "$DDJ_BRANCH" >/dev/null 2>&1
 [ "$?" -ne 0 ] && ok "premissa: main e branch regeneram deploy_deps.json de forma conflitante sob merge-tree puro" \
                || bad "premissa quebrada: o fixture deveria conflitar sem o driver, ground-truth deu rc=0"
 
-# Teste 8a — THE FIX: $wt on-disk (at new_tip) passes --check => "yes",
-# even though the ground-truth 3-way merge genuinely conflicts on this path.
-git -C "$RD" checkout -q --detach ddjbranch
+# Teste 8a — THE FIX: the rebase tip keeps EVERY other file (feature.txt too),
+# carries a canonical deploy_deps.json, and $wt passes --check => "yes", even
+# though the ground-truth 3-way merge genuinely conflicts on this path.
 printf '{"n": 2}\n' > "$RD/daemons/deploy_deps.json"
 git -C "$RD" commit -qam "gate auto-resolve: regenerated deploy_deps.json"
 DDJ_GOOD_TIP=$(git -C "$RD" rev-parse HEAD)
 V8A=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_GOOD_TIP")
-[ "$V8A" = "yes" ] && ok "sole conflict is daemons/deploy_deps.json AND \$wt's on-disk content passes --check => yes (the ga-r5dsgp fix)" \
-                   || bad "expected yes (driver-resolved, --check green), got '$V8A'"
+[ "$V8A" = "yes" ] && ok "sole conflict is deploy_deps.json AND every other path matches AND --check green => yes (the ga-r5dsgp fix)" \
+                   || bad "expected yes (driver-resolved, rest of tree intact, --check green), got '$V8A'"
 
 # Teste 8b — SAFETY: --check FAILS (drift — the committed content does NOT
 # match what regeneration would produce) => stays unknown, never upgraded.
@@ -439,37 +465,131 @@ printf '{"n": 999}\n' > "$RD/daemons/deploy_deps.json"
 git -C "$RD" commit -qam "corrupted: does not match the generator"
 DDJ_BAD_TIP=$(git -C "$RD" rev-parse HEAD)
 V8B=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_BAD_TIP")
-[ "$V8B" = "unknown:merge-tree-conflict" ] && ok "--check FAILS on drifted content => stays unknown:merge-tree-conflict (never silently upgraded to yes)" \
-                   || bad "expected unknown:merge-tree-conflict for drifted content, got '$V8B' (would silently push bad content)"
+[ "$V8B" = "unknown:deploy-deps-check-failed" ] && ok "--check FAILS on drifted content => unknown:deploy-deps-check-failed (never silently upgraded to yes)" \
+                   || bad "expected unknown:deploy-deps-check-failed for drifted content, got '$V8B' (would silently push bad content)"
 
-# Teste 8c — SAFETY: no generator present in \$wt => falls through unchanged,
-# no crash, never mistaken for a resolvable case.
-RD2="$TMP/repo-deploydeps-nogen"; mkrepo_ddj "$RD2"; rm -f "$RD2/scripts/gen_daemon_deps.py"
-DDJ2_MAIN=$(git -C "$RD2" rev-parse ddjmain); DDJ2_BRANCH=$(git -C "$RD2" rev-parse ddjbranch)
-git -C "$RD2" checkout -q --detach ddjbranch
+# Teste 8c — SAFETY: a rig whose main has NO generator at all => nothing to
+# vouch for the file, so it cannot be verified; falls through with its own
+# reason, no crash, never mistaken for a resolvable case. (A tip that DELETES a
+# generator main has is a different shape — the tree comparison catches it as
+# deploy-deps-tree-mismatch before this check is ever reached.)
+RD2="$TMP/repo-deploydeps-nogen"; ddj_setup "$RD2" 0 0 none; D2_MAIN="$DDJ_MAIN"; D2_BRANCH="$DDJ_BRANCH"
 printf '{"n": 2}\n' > "$RD2/daemons/deploy_deps.json"
 git -C "$RD2" commit -qam "no generator in this rig"
 DDJ2_TIP=$(git -C "$RD2" rev-parse HEAD)
-V8C=$(run_verdict_at "$RD2" "$DDJ2_MAIN" "$DDJ2_BRANCH" "$DDJ2_TIP")
-[ "$V8C" = "unknown:merge-tree-conflict" ] && ok "rig with no scripts/gen_daemon_deps.py: falls through to the existing unknown, no crash" \
-                   || bad "expected unknown:merge-tree-conflict when no generator exists, got '$V8C'"
+V8C=$(run_verdict_at "$RD2" "$D2_MAIN" "$D2_BRANCH" "$DDJ2_TIP")
+[ "$V8C" = "unknown:deploy-deps-generator-unverified" ] && ok "rig with no scripts/gen_daemon_deps.py on main => unknown:deploy-deps-generator-unverified, no crash" \
+                   || bad "expected unknown:deploy-deps-generator-unverified when no generator exists, got '$V8C'"
 
 # Teste 8d — SAFETY: a SECOND, unrelated conflicting path alongside
 # deploy_deps.json => not a SOLE conflict anymore, falls through unchanged
 # (this fix must never mask a real conflict in a DIFFERENT file).
-RD3="$TMP/repo-deploydeps-multi"; mkrepo_ddj "$RD3" 1
-DDJ3_MAIN=$(git -C "$RD3" rev-parse ddjmain); DDJ3_BRANCH=$(git -C "$RD3" rev-parse ddjbranch)
-git -C "$RD3" checkout -q --detach "$DDJ3_BRANCH"
+RD3="$TMP/repo-deploydeps-multi"; ddj_setup "$RD3" 1
+D3_MAIN="$DDJ_MAIN"; D3_BRANCH="$DDJ_BRANCH"
 printf '{"n": 2}\n' > "$RD3/daemons/deploy_deps.json"
 git -C "$RD3" commit -qam "gate auto-resolve attempt: only regenerated deploy_deps.json, other.txt still conflicts"
 DDJ3_TIP=$(git -C "$RD3" rev-parse HEAD)
-V8D=$(run_verdict_at "$RD3" "$DDJ3_MAIN" "$DDJ3_BRANCH" "$DDJ3_TIP")
+V8D=$(run_verdict_at "$RD3" "$D3_MAIN" "$D3_BRANCH" "$DDJ3_TIP")
 [ "$V8D" = "unknown:merge-tree-conflict" ] && ok "a SECOND conflicting file (other.txt) alongside deploy_deps.json => NOT treated as sole/resolvable, stays unknown (never masks a real conflict elsewhere)" \
                    || bad "expected unknown:merge-tree-conflict when more than one path conflicts, got '$V8D'"
 
+# Teste 8f — THE GATE-FEEDBACK CASE (attempt 1, blocking): deploy_deps.json is
+# the ONLY conflicting path, the tip's deploy_deps.json is canonical (--check
+# would pass), but the tip silently DROPPED feature.txt — a file that merges
+# cleanly, so no conflict ever named it. The old code said "yes" here and the
+# content-losing tip would have been force-pushed.
+RD4="$TMP/repo-deploydeps-lostfile"; ddj_setup "$RD4" 0 1
+D4_MAIN="$DDJ_MAIN"; D4_BRANCH="$DDJ_BRANCH"
+git -C "$RD4" rm -q feature.txt
+printf '{"n": 2}\n' > "$RD4/daemons/deploy_deps.json"
+git -C "$RD4" commit -qam "rebase tip: canonical deploy_deps.json but feature.txt silently dropped"
+DDJ4_TIP=$(git -C "$RD4" rev-parse HEAD)
+V8F=$(run_verdict_at "$RD4" "$D4_MAIN" "$D4_BRANCH" "$DDJ4_TIP")
+[ "$V8F" = "unknown:deploy-deps-tree-mismatch" ] && ok "sole conflict = deploy_deps.json + a NON-conflicting file dropped by the tip => unknown:deploy-deps-tree-mismatch, NOT yes (the attempt-1 blocking issue)" \
+                   || bad "expected unknown:deploy-deps-tree-mismatch for a tip that dropped feature.txt, got '$V8F' (a content-losing tip would be force-pushed)"
+
+# Teste 8f-mut — MUTATION: neutralize the tree-difference requirement and the
+# SAME fixture must flip to yes. Without this, 8f could pass for an unrelated
+# reason (say, --check failing) and prove nothing about the requirement.
+sed 's/if \[ "\$diffout" != "daemons\/deploy_deps.json" \]; then/if false; then/' \
+  "$TMP/block.sh" > "$TMP/block_mut8f.sh"
+if ! grep -q '^  if false; then$' "$TMP/block_mut8f.sh"; then
+  bad "8f-mut: mutacao nao aplicou — 8f nao esta provando nada"
+else
+  V8FM=$( . "$TMP/block_mut8f.sh"; rebase_content_verdict "$RD4" "$D4_MAIN" "$D4_BRANCH" "$DDJ4_TIP" )
+  [ "$V8FM" = "yes" ] && ok "8f-mut: with the tree-difference requirement neutralized the dropped-file tip becomes yes => that requirement is what catches it" \
+                      || bad "8f-mut: mutated code should say yes for the dropped-file tip (proving the requirement is what catches it), got '$V8FM'"
+fi
+
+# Teste 8g — $wt is NOT the tip (checked out elsewhere), or has a tracked
+# modification: --check would read files that are not what is about to be
+# pushed => unknown, never a verdict on unrelated on-disk content.
+RD5="$TMP/repo-deploydeps-wt"; ddj_setup "$RD5" 0 1
+D5_MAIN="$DDJ_MAIN"; D5_BRANCH="$DDJ_BRANCH"
+printf '{"n": 2}\n' > "$RD5/daemons/deploy_deps.json"
+git -C "$RD5" commit -qam "good tip"
+DDJ5_TIP=$(git -C "$RD5" rev-parse HEAD)
+git -C "$RD5" checkout -q --detach "$D5_BRANCH"     # wt now at the pre-resolution branch commit
+V8G1=$(run_verdict_at "$RD5" "$D5_MAIN" "$D5_BRANCH" "$DDJ5_TIP")
+git -C "$RD5" checkout -q --detach "$DDJ5_TIP"
+printf '{"n": 12345}\n' > "$RD5/daemons/deploy_deps.json"   # uncommitted edit on disk
+V8G2=$(run_verdict_at "$RD5" "$D5_MAIN" "$D5_BRANCH" "$DDJ5_TIP")
+git -C "$RD5" checkout -q -- daemons/deploy_deps.json
+[ "$V8G1" = "unknown:deploy-deps-wt-not-at-tip" ] && [ "$V8G2" = "unknown:deploy-deps-wt-not-at-tip" ] \
+  && ok "\$wt not at new_tip, or dirty => unknown:deploy-deps-wt-not-at-tip (--check never judges files that are not the pushed content)" \
+  || bad "expected unknown:deploy-deps-wt-not-at-tip for both a wrong-HEAD wt ('$V8G1') and a dirty wt ('$V8G2')"
+
+# Teste 8h — SELF-ATTESTING GENERATOR: the branch's own authored commit also
+# rewrote scripts/gen_daemon_deps.py to exit 0 unconditionally, and its
+# deploy_deps.json is WRONG. Running the branch's own generator would bless it; the generator
+# must be main's.
+RD6="$TMP/repo-deploydeps-selfattest"; ddj_setup "$RD6" 0 1 selfattest
+D6_MAIN="$DDJ_MAIN"; D6_BRANCH="$DDJ_BRANCH"
+printf '{"n": 999}\n' > "$RD6/daemons/deploy_deps.json"
+git -C "$RD6" commit -qam "rebase tip: the branch's own always-approving generator vouches for a WRONG deploy_deps.json"
+DDJ6_TIP=$(git -C "$RD6" rev-parse HEAD)
+V8H=$(run_verdict_at "$RD6" "$D6_MAIN" "$D6_BRANCH" "$DDJ6_TIP")
+[ "$V8H" = "unknown:deploy-deps-generator-unverified" ] && ok "generator at the tip differs from main's => unknown:deploy-deps-generator-unverified (a branch cannot attest its own output)" \
+                   || bad "expected unknown:deploy-deps-generator-unverified when the branch rewrote the generator, got '$V8H'"
+sed 's/ || \[ "\$main_gen" != "\$tip_gen" \]//' "$TMP/block.sh" > "$TMP/block_mut8h.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut8h.sh"; then
+  bad "8h-mut: mutacao nao aplicou — 8h nao esta provando nada"
+else
+  V8HM=$( . "$TMP/block_mut8h.sh"; rebase_content_verdict "$RD6" "$D6_MAIN" "$D6_BRANCH" "$DDJ6_TIP" )
+  [ "$V8HM" = "yes" ] && ok "8h-mut: with the generator-identity requirement neutralized the self-attesting branch becomes yes => that requirement is what catches it" \
+                      || bad "8h-mut: mutated code should say yes for the self-attesting branch, got '$V8HM'"
+fi
+
+# Teste 8i — a --check that outlives GATE_DEPLOY_DEPS_CHECK_TIMEOUT is cut off
+# and reported as its own reason; it must not block the sweep or read as green.
+RD7="$TMP/repo-deploydeps-slow"; ddj_setup "$RD7" 0 1 slow
+D7_MAIN="$DDJ_MAIN"; D7_BRANCH="$DDJ_BRANCH"
+printf '{"n": 2}\n' > "$RD7/daemons/deploy_deps.json"
+git -C "$RD7" commit -qam "good content, slow generator"
+DDJ7_TIP=$(git -C "$RD7" rev-parse HEAD)
+T0=$(date +%s)
+V8I=$( export GATE_DEPLOY_DEPS_CHECK_TIMEOUT=1; run_verdict_at "$RD7" "$D7_MAIN" "$D7_BRANCH" "$DDJ7_TIP" )
+T1=$(date +%s)
+{ [ "$V8I" = "unknown:deploy-deps-check-timeout" ] && [ $((T1 - T0)) -lt 20 ]; } \
+  && ok "--check past GATE_DEPLOY_DEPS_CHECK_TIMEOUT is cut off => unknown:deploy-deps-check-timeout in $((T1 - T0))s (bounded, not green)" \
+  || bad "expected unknown:deploy-deps-check-timeout within <20s for a 30s generator at timeout=1, got '$V8I' after $((T1 - T0))s"
+
+# Teste 8j — a --check that exits 0 but says its plist scan was DEGRADED is
+# accepted (same as the rig's own lint) — but never silently: the degraded
+# state must be visible on the caller's stderr, next to the run announcement.
+RD8="$TMP/repo-deploydeps-degraded"; ddj_setup "$RD8" 0 1 degraded
+D8_MAIN="$DDJ_MAIN"; D8_BRANCH="$DDJ_BRANCH"
+printf '{"n": 2}\n' > "$RD8/daemons/deploy_deps.json"
+git -C "$RD8" commit -qam "good content, degraded scan"
+DDJ8_TIP=$(git -C "$RD8" rev-parse HEAD)
+V8J=$( . "$TMP/block.sh"; log() { echo "[t] $*"; }; rebase_content_verdict "$RD8" "$D8_MAIN" "$D8_BRANCH" "$DDJ8_TIP" 2>"$TMP/8j.err" )
+{ [ "$V8J" = "yes" ] && grep -q 'DEGRADED plist scan' "$TMP/8j.err" && grep -q 'running gen_daemon_deps.py --check' "$TMP/8j.err"; } \
+  && ok "--check green with a degraded scan => yes, and the degraded state + the run announcement are on stderr (visible, not silent)" \
+  || bad "expected yes + a DEGRADED log line on stderr, got verdict '$V8J' / stderr: $(cat "$TMP/8j.err" 2>/dev/null | tr '\n' '|')"
+
 echo "── Teste 8e — drift-guard: shipped code still has the special-case wired ──"
-grep -q 'daemons/deploy_deps.json' "$DISPATCHER" \
-  && ok "dispatcher still names daemons/deploy_deps.json in rebase_content_verdict's special case" || bad "the ga-r5dsgp special case is gone from the dispatcher"
+grep -q 'rebase_deploy_deps_verdict "\$wt" "\$gd" "\$main_ref" "\$new_tip" "\$out"' "$DISPATCHER" \
+  && ok "rebase_content_verdict still delegates its conflicted-merge-tree branch to rebase_deploy_deps_verdict" || bad "the ga-r5dsgp delegation is gone from rebase_content_verdict"
 grep -q 'gen_daemon_deps.py --check' "$DISPATCHER" \
   && ok "dispatcher still invokes the generator's --check as the verification step" || bad "the --check invocation is gone from the dispatcher"
 

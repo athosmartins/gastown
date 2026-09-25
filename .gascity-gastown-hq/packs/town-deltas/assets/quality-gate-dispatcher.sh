@@ -4403,8 +4403,128 @@ rebase_git_attributes_file() {
   printf '%s' "$tmp"
 }
 
+# rebase_deploy_deps_verdict <wt> <gd> <main_ref> <new_tip> <mt_out>   (ga-r5dsgp)
+#
+# Called ONLY by rebase_content_verdict(), and ONLY when its ground-truth
+# merge-tree(main_ref, orig_tip) conflicted and printed a tree (<mt_out> is
+# that call's own stdout — reused, never recomputed, so it carries the SAME
+# core.attributesFile filtering the verdict call used, ga-stisew). Prints one
+# line: "yes" or "unknown:<reason>" — never "no": nothing here can PROVE a
+# rebase lost content, it can only fail to verify it.
+#
+# WHY this exists: daemons/deploy_deps.json (whatsapp_automation) is a
+# GENERATED file registered with a custom merge driver (merge=deploydeps), and
+# rebase_git_attributes_file() deliberately leaves custom drivers out of the
+# ground-truth merge-tree (ga-stisew — running a repo-supplied driver against
+# a bare git-dir was itself an incident). So whenever main and the branch both
+# regenerated that file, this guard's ground truth conflicts on it BY DESIGN,
+# the actual rebase (which does run the driver) succeeds, and the verdict came
+# back "unknown" every sweep: 59 sweeps on one marker, 2.5h head-of-line
+# block, P0 in the queue (ga-r5dsgp).
+#
+# WHAT "yes" MEANS here — all four must hold, each with its own unknown suffix
+# when it does not (a "could not verify" is never folded into "verified"):
+#   1. the ONLY conflicting path in <mt_out> is daemons/deploy_deps.json;
+#   2. new_tip's tree differs from the conflicted merge's own tree at EXACTLY
+#      that one path (git diff-tree) — so every OTHER path, including files
+#      neither side conflicted on, is byte-identical to the ground-truth merge.
+#      This is the part a sole-conflict check alone does not give: a rebase
+#      that silently dropped some other file still has "one conflicting path";
+#   3. the generator at new_tip is byte-identical (blob) to the one at
+#      main_ref, so the code that vouches for the file is main's, not
+#      something the branch under review brought along to attest itself;
+#   4. that generator's own --check (wa-9lxa7: fresh build vs committed file)
+#      exits 0 against $wt, a real checkout at new_tip with no tracked
+#      modifications, within GATE_DEPLOY_DEPS_CHECK_TIMEOUT seconds.
+# --check costs ~26s of CPU (measured 25/09) but minutes of wall time on a
+# loaded host (280s+ at load 77 on 10 cores, still unfinished), and it blocks
+# this single-threaded sweep while it runs — hence the bound (default 180s,
+# override GATE_DEPLOY_DEPS_CHECK_TIMEOUT) and the log line before it. On an
+# overloaded host it therefore times out with its own visible suffix rather
+# than stalling the sweep; the marker just keeps today's "not verified" state.
+rebase_deploy_deps_verdict() {
+  local wt="$1" gd="$2" main_ref="$3" new_tip="$4" mt_out="$5"
+  local paths expected actual diffout diff_rc tip_sha wt_head wt_dirty wt_rc
+  local main_gen tip_gen chk_err chk_rc chk_timeout
+  # 1. sole conflicting path. Lines after the tree oid, up to the blank line,
+  # are "<mode> <oid> <stage>\t<path>"; an unexpected shape survives `cut` as
+  # a non-matching "path", so it can only make this check fail, never pass.
+  paths=$(printf '%s\n' "$mt_out" | tail -n +2 | sed '/^$/q' | sed '/^$/d' | cut -f2- | sort -u)
+  if [ "$paths" != "daemons/deploy_deps.json" ]; then
+    echo "unknown:merge-tree-conflict"; return 0
+  fi
+  # 2. every other path identical to the ground-truth merge's tree.
+  expected=$(printf '%s\n' "$mt_out" | head -1)
+  case "$expected" in
+    *[!0-9a-f]*|"") echo "unknown:bad-expected-sha"; return 0 ;;
+  esac
+  if [ "${#expected}" -ne 40 ]; then echo "unknown:bad-expected-sha"; return 0; fi
+  actual=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}^{tree}" 2>/dev/null || echo "")
+  case "$actual" in
+    *[!0-9a-f]*|"") echo "unknown:bad-actual-sha"; return 0 ;;
+  esac
+  if [ "${#actual}" -ne 40 ]; then echo "unknown:bad-actual-sha"; return 0; fi
+  diffout=$(git --git-dir="$gd" diff-tree -r --no-renames --name-only "$expected" "$actual" 2>/dev/null); diff_rc=$?
+  if [ "$diff_rc" -ne 0 ]; then echo "unknown:deploy-deps-diff-error"; return 0; fi
+  if [ "$diffout" != "daemons/deploy_deps.json" ]; then
+    echo "unknown:deploy-deps-tree-mismatch"; return 0
+  fi
+  # 3. the generator is main's own. Both sides must resolve to a real blob:
+  # `rev-parse <ref:path>` on a missing path exits non-zero, and an empty
+  # answer on both sides must not compare equal.
+  main_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${main_ref}:scripts/gen_daemon_deps.py" 2>/dev/null || echo "")
+  tip_gen=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}:scripts/gen_daemon_deps.py" 2>/dev/null || echo "")
+  case "$main_gen$tip_gen" in
+    *[!0-9a-f]*|"") echo "unknown:deploy-deps-generator-unverified"; return 0 ;;
+  esac
+  if [ "${#main_gen}" -ne 40 ] || [ "$main_gen" != "$tip_gen" ]; then
+    echo "unknown:deploy-deps-generator-unverified"; return 0
+  fi
+  # 4a. $wt really is new_tip, with no tracked modifications: --check reads
+  # files from disk, so it must be exactly what is about to be pushed.
+  tip_sha=$(git --git-dir="$gd" rev-parse --verify --quiet "${new_tip}^{commit}" 2>/dev/null || echo "")
+  wt_head=$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null || echo "")
+  wt_dirty=$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null); wt_rc=$?
+  if [ -z "$tip_sha" ] || [ "$wt_head" != "$tip_sha" ] || [ "$wt_rc" -ne 0 ] || [ -n "$wt_dirty" ]; then
+    echo "unknown:deploy-deps-wt-not-at-tip"; return 0
+  fi
+  # 4b. the check itself, bounded. stderr is captured (stdout is the verdict
+  # channel of the caller's $(...), and --check prints nothing there that we
+  # need). Distinct exit codes get distinct suffixes.
+  chk_timeout="${GATE_DEPLOY_DEPS_CHECK_TIMEOUT:-180}"
+  case "$chk_timeout" in ''|*[!0-9]*) chk_timeout=180 ;; esac
+  if [ "$chk_timeout" -le 0 ]; then chk_timeout=180; fi
+  # `type -t`, not bare `type`: on macOS `log` is also /usr/bin/log (the system
+  # logging CLI), which a bare `type log` happily finds when the dispatcher's
+  # own log() function is not loaded — this must only ever call the function.
+  if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+    log "rebase_content_verdict: running gen_daemon_deps.py --check (timeout ${chk_timeout}s) — sole conflict is daemons/deploy_deps.json (ga-r5dsgp)" >&2
+  fi
+  chk_err=$( cd "$wt" && timeout "$chk_timeout" python3 scripts/gen_daemon_deps.py --check 2>&1 >/dev/null ); chk_rc=$?
+  case "$chk_rc" in
+    0) : ;;
+    124) echo "unknown:deploy-deps-check-timeout"; return 0 ;;
+    127) echo "unknown:deploy-deps-check-unavailable"; return 0 ;;
+    *) echo "unknown:deploy-deps-check-failed"; return 0 ;;
+  esac
+  # --check exits 0 even when its plist scan was degraded (it demotes the
+  # "extra:" findings it can no longer trust to a warning). That is WA's own
+  # lint policy and mirrored here, but it is a weaker "green" than a clean
+  # scan, so it is said out loud instead of passing silently.
+  case "$chk_err" in
+    *AVISO*)
+      if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+        log "rebase_content_verdict: gen_daemon_deps.py --check exited 0 with a DEGRADED plist scan (AVISO) — accepted as green, same as the rig's own lint (ga-r5dsgp)" >&2
+      fi ;;
+  esac
+  echo "yes"
+}
+
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
 #   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
+#                   (ga-r5dsgp: OU o merge-tree conflitou SO em
+#                   daemons/deploy_deps.json e rebase_deploy_deps_verdict()
+#                   provou o resto — ver la os 4 requisitos)
 #   no            — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
 #   unknown:*     — nao deu pra comparar. Terceiro estado explicito: quem chama
 #                   trata como "nao verificado", nunca como "verificado ok"
@@ -4446,6 +4566,23 @@ rebase_git_attributes_file() {
 #                     :bad-expected-sha    — merge-tree nao devolveu 40 hex
 #                     :bad-actual-sha      — new_tip nao resolveu pra um
 #                                             objeto arvore de 40 hex valido
+#                   (ga-r5dsgp) so quando o merge-tree conflitou APENAS em
+#                   daemons/deploy_deps.json — cada um e um requisito de
+#                   rebase_deploy_deps_verdict() que nao se cumpriu:
+#                     :deploy-deps-diff-error          — git diff-tree falhou
+#                     :deploy-deps-tree-mismatch       — o tip difere da arvore do
+#                                                         merge em ALEM (ou em vez)
+#                                                         desse unico path
+#                     :deploy-deps-generator-unverified — scripts/gen_daemon_deps.py
+#                                                         ausente, ou diferente do
+#                                                         de main_ref
+#                     :deploy-deps-wt-not-at-tip       — <worktree> nao esta em
+#                                                         new_tip, ou tem
+#                                                         modificacao rastreada
+#                     :deploy-deps-check-timeout       — --check estourou
+#                                                         GATE_DEPLOY_DEPS_CHECK_TIMEOUT
+#                     :deploy-deps-check-unavailable   — python3/timeout ausente (127)
+#                     :deploy-deps-check-failed        — --check saiu != 0
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   # ga-pgxs78: every "unknown" now carries WHICH of the could-not-verify
@@ -4492,51 +4629,11 @@ rebase_content_verdict() {
   # below for where the stderr this discards is instead captured.
   if [ "$rc" -ne 0 ]; then
     if [ -n "$out" ]; then
-      # ga-r5dsgp: before giving up as "unknown", check whether the ONLY
-      # path this ground-truth 3-way merge-tree conflicts on is a generated
-      # file this rig can independently verify — daemons/deploy_deps.json,
-      # via its own generator's --check (wa-9lxa7/wa-95ida). That file is
-      # registered with a CUSTOM merge driver (daemons/deploy_deps.json
-      # merge=deploydeps) precisely so two branches that regenerate it
-      # differently never hard-conflict — but rebase_git_attributes_file()
-      # (ga-stisew, above) deliberately EXCLUDES custom drivers from this
-      # function's own ground-truth merge-tree computation (executing an
-      # arbitrary driver script against a bare git-dir with no working tree
-      # was itself a prior incident). So this function's ground-truth
-      # comparison disagrees with the driver on this file BY DESIGN, on
-      # every single rebase that resolves it via the driver — not evidence
-      # content was lost, just evidence a 3-way-tree match is the wrong
-      # question to ask for a driver-covered path. Root cause of ga-r5dsgp
-      # (59 consecutive dispatcher sweeps re-selecting the same exiled
-      # marker on this exact conflict, 2.5h head-of-line block on 10+ other
-      # markers incl. a P0): the actual git-level rebase/merge succeeded via
-      # the driver every sweep, and this function refused to bless it every
-      # single time, so the marker never left the bounded-retry loop despite
-      # genuinely being fine each time.
-      #
-      # $wt is a REAL worktree (unlike the bare-git-dir-only comparison
-      # above) already checked out at $new_tip — its on-disk
-      # daemons/deploy_deps.json IS exactly the content about to be pushed.
-      # Verifying it via the SAME --check the generator's own pre-push lint
-      # uses (wa-9lxa7: "compara o build FRESCO contra o commitado ... falha
-      # se divergirem") is a STRONGER, more direct guarantee for this one
-      # path than a 3-way-tree match would ever be — it confirms the pushed
-      # content is byte-identical to what regenerating from source produces,
-      # not merely "agrees with a merge strategy nobody asked for". Fully
-      # conservative: any failure below (no generator, more than one
-      # conflicting path, --check itself fails) falls straight through to
-      # the existing "unknown" — this can only ever upgrade a verified-good
-      # result, never invent one.
-      local _rcv_conflict_paths
-      _rcv_conflict_paths=$(git --git-dir="$gd" merge-tree --write-tree --name-only "$main_ref" "$orig_tip" 2>/dev/null \
-        | tail -n +2 | sed '/^$/q' | sed '/^$/d' || true)
-      if [ "$_rcv_conflict_paths" = "daemons/deploy_deps.json" ] \
-         && [ -f "$wt/scripts/gen_daemon_deps.py" ] \
-         && ( cd "$wt" && python3 scripts/gen_daemon_deps.py --check ) >/dev/null 2>&1; then
-        echo "yes"
-        return 0
-      fi
-      echo "unknown:merge-tree-conflict"
+      # ga-r5dsgp: a conflict on the generated daemons/deploy_deps.json ALONE
+      # is not evidence content was lost — see rebase_deploy_deps_verdict()
+      # above for what it takes to earn a "yes" here (it prints exactly one
+      # verdict line, "yes" or a distinct "unknown:<reason>").
+      rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out"
     else
       echo "unknown:merge-tree-error"
     fi
@@ -10280,8 +10377,21 @@ case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS="$
 # already running every sweep, GATE_EXILE_ESCALATE_AFTER_SECONDS default 24h)
 # remains the existing backstop that eventually parks it at needs-rebase —
 # this fix's job is only to stop it DOMINATING every sweep in the meantime.
+#
+# Parsing is stricter than its GATE_EXILE_OVERDUE_SECONDS sibling on purpose
+# (gate feedback ga-r5dsgp, attempt 1): the value is spliced into jq with
+# --argjson, and "0" (or "000" — jq 1.8.1 reads it as 0, measured) would make
+# `attempt < 0` false for every marker: the admission switches off with no
+# signal, while an operator could equally read 0 as "no ceiling". Neither
+# reading is safe to guess, so a value that is not a plain positive integer
+# (empty, non-digit, zero, or implausibly long) falls back to the default 3.
+# Leading zeros are also normalized ("03" -> 3): JSON does not allow them, and
+# although this host's jq tolerates them, the value should not depend on which
+# jq happens to be installed.
 GATE_EXILE_RETRY_CEILING="${GATE_EXILE_RETRY_CEILING:-3}"
-case "$GATE_EXILE_RETRY_CEILING" in ''|*[!0-9]*) GATE_EXILE_RETRY_CEILING=3 ;; esac
+case "$GATE_EXILE_RETRY_CEILING" in ''|*[!0-9]*|??????????*) GATE_EXILE_RETRY_CEILING=3 ;; esac
+GATE_EXILE_RETRY_CEILING=$((10#$GATE_EXILE_RETRY_CEILING))
+if [ "$GATE_EXILE_RETRY_CEILING" -le 0 ]; then GATE_EXILE_RETRY_CEILING=3; fi
 # ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
 # Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
 # built outside and merely CONSUMED here) annotates each candidate with
