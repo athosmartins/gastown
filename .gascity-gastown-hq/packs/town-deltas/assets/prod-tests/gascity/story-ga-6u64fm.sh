@@ -23,12 +23,14 @@ CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 ASSETS="$CITY/packs/town-deltas/assets"
 DISPATCHER="$ASSETS/pilot-dispatcher.sh"
 SELFTEST="$ASSETS/pilot-dispatcher.dog-store-migrate.selftest.sh"
+SWEEP_SELFTEST="$ASSETS/pilot-dispatcher.sweep-event.selftest.sh"
 
 log()  { echo "[prod-test:gascity ga-6u64fm] $*"; }
 fail() { echo "[prod-test:gascity ga-6u64fm] FAIL: $*" >&2; exit 1; }
 
 [[ -f "$DISPATCHER" ]] || fail "missing: $DISPATCHER"
 [[ -f "$SELFTEST" ]]   || fail "missing: $SELFTEST"
+[[ -f "$SWEEP_SELFTEST" ]] || fail "missing: $SWEEP_SELFTEST"
 log "Deployed dispatcher + selftest found."
 
 # ── 1. Syntax: the deployed dispatcher must still parse cleanly ────────────────
@@ -42,6 +44,12 @@ grep -q '^_pilot_dog_store_blind_migrate_dest() {' "$DISPATCHER" \
   || fail "_pilot_dog_store_blind_migrate_dest() definition missing from the deployed dispatcher"
 grep -q '^_pilot_migrate_dog_store_blind_bead() {' "$DISPATCHER" \
   || fail "_pilot_migrate_dog_store_blind_bead() definition missing from the deployed dispatcher"
+# Gate-review ga-tguml6 hardening: the two helpers that keep the migration from ping-ponging
+# (path-token match; one-hop guard) must be deployed too, not just the two original functions.
+grep -q '^_pilot_text_names_rig_path() {' "$DISPATCHER" \
+  || fail "_pilot_text_names_rig_path() (anchored path-token match) missing from the deployed dispatcher"
+grep -q '^_pilot_story_already_migrated() {' "$DISPATCHER" \
+  || fail "_pilot_story_already_migrated() (one-hop guard) missing from the deployed dispatcher"
 log "  present ✓"
 
 # ── 3. Call-site wiring: attempt precedes the pre-existing park fallback ───────
@@ -69,12 +77,21 @@ log "  park fallback intact ✓"
 # ── 5. The dedicated selftest passes end-to-end against the deployed file ──────
 # This is the real proof, not a restatement — pilot-dispatcher.dog-store-
 # migrate.selftest.sh extracts the LIVE functions via awk and exercises them
-# against a PATH-stubbed fake bd across 11 scenarios (destination picking,
-# TOCTOU re-check abort, create/readback/close failure handling, and the
-# race-retraction recovery), plus drift-guards on the call-site wiring.
+# against a PATH-stubbed fake bd (destination picking incl. the readable-only
+# and path-anchoring rules, the one-hop guard, TOCTOU re-check abort,
+# create/readback/close failure handling, and the race-retraction recovery),
+# plus drift-guards on the call-site wiring.
 log "Running pilot-dispatcher.dog-store-migrate.selftest.sh against the deployed dispatcher..."
 bash "$SELFTEST" || fail "pilot-dispatcher.dog-store-migrate.selftest.sh reported failures"
 log "  selftest PASS ✓"
+
+# ── 6. The new DISPATCH_RESULT is classified, so a migration is not read as a Pilot fault ───────
+# Gate-review ga-tguml6 blocking issue 1: without this, every successful auto-migration was tallied
+# under failed_other in the pilot_sweep event (painel Pilot-health tiles) and the sweep-event
+# selftest's drift guard (B4) was red. That selftest is the proof — run it against the deployed file.
+log "Running pilot-dispatcher.sweep-event.selftest.sh against the deployed dispatcher..."
+bash "$SWEEP_SELFTEST" || fail "pilot-dispatcher.sweep-event.selftest.sh reported failures (rig_native_dog_store_migrated unclassified?)"
+log "  sweep-event selftest PASS ✓"
 
 log "PASS"
 exit 0
