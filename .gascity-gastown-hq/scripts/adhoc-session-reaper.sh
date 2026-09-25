@@ -62,11 +62,12 @@
 #     reaped instead of held forever. A MIX (some beads parked, some not) still KEEPS,
 #     unchanged from the behavior above.
 #     Metadata athos.acao is NOT a park signal, alone or otherwise: it is the painel
-#     card's render-only "O QUE VOCE FAZ" text and nothing ever clears it, so it outlives
-#     the decision (measured 25/09: 4 of 7 open WA beads carrying it had no park label —
-#     an approved story, a bead whose text reads "Nada a fazer agora"). Reading a stale
-#     leftover as "parked NOW" would release + kill a session that is legitimately
-#     mid-work. A bead with only athos.acao therefore keeps the session (has_assigned_bead).
+#     card's render-only "O QUE VOCE FAZ" text and no script or pack clears it after the
+#     decision, so it can outlive it (measured 25/09 09:1x, WA store: 3 of the 6 open beads
+#     carrying it had no park label — one of them, held by the mayor, reads "Nada a fazer
+#     agora"). Reading a stale leftover as "parked NOW" could release + kill a session that
+#     is legitimately mid-work. A bead with only athos.acao therefore keeps the session
+#     (has_assigned_bead).
 #   * Kill switch ADHOC_REAPER_ENABLED=0 → census/log only, no closes, no bead releases.
 # The two mutations are `gc session close` on eligible adhoc sessions, and — ONLY for the
 # parked-bead exception above — `bd update` to release a bead parked on an Athos decision.
