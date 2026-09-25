@@ -239,7 +239,9 @@
 # reaper) only. Notification is NEVER gated by this switch (imp07 CALL
 # INVARIANT: alerting is the lowest-blast-radius action here and the one furo
 # #2 just fixed for being wrongly suppressible — don't reintroduce that
-# failure mode one guard over).
+# failure mode one guard over). The ga-ond0fa disk-growth snapshot (see
+# above) is likewise never gated by this switch — same "a read is not a
+# reclaim action" precedent as NOTIFY/_vm_swap_gb/_top_mem_processes.
 #
 # TEST (no Dolt, no deletions, no real disk mutation, no mail/notify sent):
 #   bash scripts/dolt-disk-floor-guard.selftest.sh
@@ -408,6 +410,33 @@ RESEED_TRIGGER_TIMEOUT_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_TIMEOUT_SECS:-240}
 # wait for that.
 RESEED_TRIGGER_COOLDOWN_SECS="${DOLT_DISK_FLOOR_RESEED_TRIGGER_COOLDOWN_SECS:-1800}"
 STATE_RESEED_TRIGGER_DIR="$STATE_DIR/.dolt-disk-floor-guard.reseed-attempt"
+
+# ga-ond0fa: on the FIRST WARN/CRITICAL cycle of a disk-floor episode (never
+# every cycle of the same episode — see STATE_DISK_GROWTH_EPISODE_FILE below),
+# snapshot the size of this guard's known "usual suspect" directories and diff
+# them against the last snapshot taken while avail was confirmed NONE, so a
+# future dive like 2026-09-25's unattributed 01:30->02:16 (10GB->3GB, ~7GB,
+# self-recovered by 02:16 with no record of WHICH directory grew) leaves a
+# durable trail instead of only this guard's own "avail=" log lines. Purely
+# diagnostic — no deletion, no reclaim action of its own — this is an eighth
+# OBSERVABILITY lever alongside (not one of) the seven reclaim levers above.
+DISK_GROWTH_LOG_DIR="${DOLT_DISK_FLOOR_DISK_GROWTH_LOG_DIR:-$CITY/.gc/logs}"
+DISK_GROWTH_DU_TIMEOUT_SECS="${DOLT_DISK_FLOOR_DISK_GROWTH_DU_TIMEOUT_SECS:-20}"
+# Cost bounds, both measured (ga-ond0fa, 2026-09-25, load ~40): one full
+# 16-root sweep took ~9s here, against this guard's 300s StartInterval.
+#  - TOTAL_BUDGET_SECS caps the WHOLE sweep, not just each du: the report runs
+#    BEFORE the reclaim levers (so it sees the state that caused the breach),
+#    which means an unbounded sweep would delay the emergency reclaim by up to
+#    (roots x DU_TIMEOUT) = ~320s in the worst case — longer than the interval
+#    itself. 60s is ~6x the measured sweep.
+#  - BASELINE_MIN_AGE_SECS throttles the healthy-cycle baseline refresh: a
+#    fresh sweep every 5min forever is ~3% steady-state du I/O for a baseline
+#    that only needs to be "recent", not "current". 900s = the baseline is at
+#    most ~15min stale at breach time; the report diffs against it either way.
+DISK_GROWTH_TOTAL_BUDGET_SECS="${DOLT_DISK_FLOOR_DISK_GROWTH_TOTAL_BUDGET_SECS:-60}"
+DISK_GROWTH_BASELINE_MIN_AGE_SECS="${DOLT_DISK_FLOOR_DISK_GROWTH_BASELINE_MIN_AGE_SECS:-900}"
+STATE_DISK_GROWTH_LAST_OK_FILE="$STATE_DIR/.dolt-disk-floor-guard.disk-growth-last-ok.tsv"
+STATE_DISK_GROWTH_EPISODE_FILE="$STATE_DIR/.dolt-disk-floor-guard.disk-growth-episode-written"
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
@@ -1013,6 +1042,156 @@ _top_disk_consumers() {
   printf '%s' "$out" | sort -rn | head -n "$n"
 }
 
+# _disk_growth_candidate_roots → "label<TAB>path" lines, one per known
+# "usual suspect" this guard's own incident history (ga-ond0fa: 2026-09-25's
+# unattributed ~7GB overnight dive) points at: every live Dolt database
+# under $DOLTDIR (one label PER DATABASE, not one "dolt/" total — a single
+# runaway database is a materially different finding than "the whole tree
+# grew"), $CITY/.dolt-backup, $HOME/shared/data, every rig's own
+# .gc-worktrees ($HOME/gt/*/.gc-worktrees), $HOME/Library/Caches,
+# /private/tmp, and $HOME/.claude/projects — exactly the bead's own
+# candidate list. Only entries that currently exist are emitted, same
+# defensive existence check _top_disk_consumers' four roots already use — a
+# candidate absent on this host is silently skipped, never a fabricated
+# zero-size row (ga-p5q3). Kept as its own named function (mirroring the
+# four single-purpose root resolvers _top_disk_consumers calls) so the
+# selftest can override it wholesale against a synthetic fixture tree, same
+# technique _top_disk_consumers' own selftest block already uses.
+_disk_growth_candidate_roots() {
+  local out="" d db
+  if [ -d "$DOLTDIR" ]; then
+    for db in "$DOLTDIR"/*/; do
+      [ -d "$db" ] || continue
+      out="${out}dolt-db:$(basename "$db")"$'\t'"${db%/}"$'\n'
+    done
+  fi
+  [ -d "$CITY/.dolt-backup" ]     && out="${out}dolt-backup"$'\t'"$CITY/.dolt-backup"$'\n'
+  [ -d "$HOME/shared/data" ]      && out="${out}shared-data"$'\t'"$HOME/shared/data"$'\n'
+  for d in "$HOME"/gt/*/.gc-worktrees; do
+    [ -d "$d" ] || continue
+    out="${out}gc-worktrees:$(basename "$(dirname "$d")")"$'\t'"$d"$'\n'
+  done
+  [ -d "$HOME/Library/Caches" ]   && out="${out}library-caches"$'\t'"$HOME/Library/Caches"$'\n'
+  [ -d "/private/tmp" ]           && out="${out}private-tmp"$'\t'"/private/tmp"$'\n'
+  [ -d "$HOME/.claude/projects" ] && out="${out}claude-projects"$'\t'"$HOME/.claude/projects"$'\n'
+  printf '%s' "$out"
+}
+
+# _disk_growth_snapshot → "label<TAB>size_kb<TAB>path" lines, one per
+# candidate root _disk_growth_candidate_roots resolves, via ONE whole-tree
+# `du -sk` per root — unlike _top_disk_consumers' one-level per-entry
+# breakdown, this answers "did THIS root grow" (comparable across two points
+# in time), not "which single entry inside it is biggest right now". Each du
+# is bounded by DISK_GROWTH_DU_TIMEOUT_SECS so one huge/deep root
+# (Library/Caches, /private/tmp) can't stall the others — same
+# timeout-per-root discipline _top_disk_consumers already uses — and the WHOLE
+# sweep is bounded by DISK_GROWTH_TOTAL_BUDGET_SECS (each du's timeout is
+# clamped to the budget still left, so the sweep can't overshoot it by a
+# full DU_TIMEOUT). Roots not reached once the budget is spent are logged by
+# label and left OUT of the output — best-effort like a failed du: a root
+# whose du times out, fails, or is never reached is skipped, never fabricated
+# as a zero-size row (ga-p5q3 — same contract as _dir_size_mb/
+# _top_disk_consumers above). The local is `rpath`, not `path`: in zsh `path`
+# is tied to $PATH, so `local path` there empties the command search path.
+# This script runs under /bin/bash where that is harmless, but the functions
+# get sourced from interactive (zsh) shells while debugging.
+_disk_growth_snapshot() {
+  local roots out="" label rpath kb started elapsed remaining per_root skipped=""
+  roots="$(_disk_growth_candidate_roots)"
+  [ -z "$roots" ] && { echo ""; return; }
+  started=$(date +%s)
+  while IFS=$'\t' read -r label rpath; do
+    [ -z "$label" ] && continue
+    elapsed=$(( $(date +%s) - started ))
+    remaining=$(( DISK_GROWTH_TOTAL_BUDGET_SECS - elapsed ))
+    if [ "$remaining" -lt 1 ]; then skipped="${skipped} ${label}"; continue; fi
+    per_root="$DISK_GROWTH_DU_TIMEOUT_SECS"
+    [ "$remaining" -lt "$per_root" ] && per_root="$remaining"
+    kb="$(timeout "$per_root" du -sk "$rpath" 2>/dev/null | awk '{print $1}')"
+    case "$kb" in ''|*[!0-9]*) continue ;; esac
+    out="${out}${label}"$'\t'"${kb}"$'\t'"${rpath}"$'\n'
+  done <<< "$roots"
+  [ -n "$skipped" ] && log "disk-growth snapshot: ${DISK_GROWTH_TOTAL_BUDGET_SECS}s total budget spent — NOT measured this cycle:${skipped}"
+  printf '%s' "$out"
+}
+
+# _disk_growth_delta <old_snapshot_tsv> <new_snapshot_tsv> → "label<TAB>
+# delta_mb<TAB>old_mb<TAB>new_mb<TAB>path<TAB>state" lines, one per label
+# present in EITHER snapshot, sorted by delta_mb descending (biggest grower
+# first — the whole point of this lever: turn "avail dropped 7GB" into "THIS
+# directory is where it went"). `state` is one of:
+#   both     — the label was measured in BOTH snapshots; delta_mb is a real,
+#              trustworthy growth/shrink figure.
+#   new_only — missing from old_snapshot: either a genuinely new root, or one
+#              that simply wasn't measured at baseline time. delta_mb/old_mb
+#              are computed as if old=0 (so sort order still puts a big new
+#              consumer near the top), but the caller must render this
+#              distinctly from a real "grew from 0" reading — see below.
+#   old_only — missing from new_snapshot: either the root vanished, or THIS
+#              cycle's own du call failed/timed out. delta_mb/new_mb are
+#              computed as if new=0, but the caller must NOT present this as
+#              "shrank to zero" — that would be exactly the ga-p5q3 defect
+#              this file spends dozens of comments warning against
+#              (unmeasurable collapsed into a specific, false value): a
+#              du timeout and a genuinely emptied directory are NOT the same
+#              fact, and conflating them was a real bug caught in this
+#              bead's own pre-flight self-audit (a first draft's numeric-only
+#              output made "couldn't measure this cycle" indistinguishable
+#              from "confirmed gone").
+# `state` is what makes that distinction survive into the delta output
+# instead of disappearing into a bare 0 — the report writer (see
+# _write_disk_growth_report) renders each state's own honest sentence rather
+# than a number implying more certainty than the data supports. Pure text
+# processing, no I/O of its own — both arguments are plain
+# "label<TAB>size_kb<TAB>path" blobs already produced by _disk_growth_snapshot
+# (real, or hand-built synthetic ones for the selftest).
+#
+# Deliberately NOT the textbook `awk 'NR==FNR {...}' <(old) <(new)` two-file
+# idiom — that trick misfires when $old is the FIRST snapshot ever taken (a
+# real, common case: this guard's own first-ever WARN/CRITICAL episode).
+# With $old empty, the old-file process substitution yields zero records,
+# so NR never diverges from FNR before the new-file's own first record is
+# read — its FNR resets to 1 for the new file, and NR (having advanced 0
+# records through the empty old file) is ALSO 1 there, so NR==FNR is true
+# for that first new-file line and it gets silently misfiled as an OLD
+# entry (confirmed live building this bead's own selftest: a single-line
+# "new" snapshot against an empty "old" snapshot produced old=2/new=0
+# instead of old=0/new=2 — an exactly-backwards reading of growth as
+# shrinkage). Concatenating both snapshots into ONE stream with an
+# unambiguous sentinel line between them sidesteps the NR/FNR coincidence
+# entirely, at the cost of one extra `printf` — the sentinel string can
+# never collide with a real label (this file's own labels are fixed
+# identifiers like "dolt-db:x"; a du path never contains it either).
+_disk_growth_delta() {
+  local old="$1" new="$2" marker="___DFG_DELTA_SPLIT___"
+  { printf '%s\n' "$old"; printf '%s\n' "$marker"; printf '%s\n' "$new"; } | awk -F'\t' -v marker="$marker" '
+    $0 == marker { reading_new=1; next }
+    $1 == "" { next }
+    !reading_new {
+      okb[$1]=$2; opath[$1]=$3
+      if (!($1 in seen)) { seen[$1]=1; order[++n]=$1 }
+      next
+    }
+    {
+      nkb[$1]=$2; npath[$1]=$3
+      if (!($1 in seen)) { seen[$1]=1; order[++n]=$1 }
+    }
+    END {
+      for (i=1; i<=n; i++) {
+        l=order[i]
+        has_o=(l in okb); has_n=(l in nkb)
+        o=has_o?okb[l]:0
+        nn=has_n?nkb[l]:0
+        p=has_n?npath[l]:opath[l]
+        if (has_o && has_n) { state="both" }
+        else if (has_n)     { state="new_only" }
+        else                { state="old_only" }
+        printf "%s\t%d\t%d\t%d\t%s\t%s\n", l, int((nn-o)/1024), int(o/1024), int(nn/1024), p, state
+      }
+    }
+  ' | sort -t $'\t' -k2,2nr
+}
+
 # ════════════════════════════════════════════════════════════════════════════════
 # EXECUTION (side-effecting; NOT exercised by the selftest)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1107,6 +1286,211 @@ _maybe_mail_recovery() {
   _write_critical_episode_mailed 0
   _clear_last_mail_state
   log "CRITICAL episode recovered (avail=${avail}GB) — mailed Mayor recovery notice, cleared mail-debounce state"
+}
+
+# _read_disk_growth_last_ok / _write_disk_growth_last_ok (ga-ond0fa) — persist
+# the most recent _disk_growth_snapshot taken while avail was confirmed NONE,
+# the baseline _write_disk_growth_report diffs a WARN/CRITICAL-entry snapshot
+# against. Missing file (fresh install, or state lost) reads as empty — see
+# _write_disk_growth_report's own "NO PRIOR BASELINE" branch, never fabricated
+# as an all-zero snapshot (ga-p5q3).
+_read_disk_growth_last_ok() {
+  [ -f "$STATE_DISK_GROWTH_LAST_OK_FILE" ] && cat "$STATE_DISK_GROWTH_LAST_OK_FILE" 2>/dev/null
+  return 0
+}
+
+_write_disk_growth_last_ok() {
+  local snapshot="$1"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s' "$snapshot" > "$STATE_DISK_GROWTH_LAST_OK_FILE" 2>/dev/null || true
+}
+
+# _disk_growth_episode_written / _write_disk_growth_episode_marker /
+# _clear_disk_growth_episode_marker (ga-ond0fa) — the once-per-episode gate
+# _write_disk_growth_report checks before writing: a bare marker file (no
+# content, existence is the signal — same shape STATE_CRITICAL_EPISODE_MAILED_
+# FILE's presence conceptually tracks, but this one is presence-only since
+# there's no avail/epoch value worth persisting alongside it). Set the first
+# time a WARN/CRITICAL cycle writes a report; cleared the next time a cycle
+# confirms avail is back to NONE (_refresh_disk_growth_baseline below) so the
+# NEXT episode gets its own fresh report instead of staying silent forever
+# after the first one.
+_disk_growth_episode_written() {
+  [ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ]
+}
+
+_write_disk_growth_episode_marker() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  : > "$STATE_DISK_GROWTH_EPISODE_FILE" 2>/dev/null || true
+}
+
+_clear_disk_growth_episode_marker() {
+  rm -f "$STATE_DISK_GROWTH_EPISODE_FILE" 2>/dev/null || true
+}
+
+# _refresh_disk_growth_baseline (ga-ond0fa) — called from main() on the two
+# exits that confirm a NON-critical NONE: the pre-reclaim fast path, and the
+# post-reclaim "back above floor" exit (a WARN that reclaim recovered). A
+# cycle that was CRITICAL at any point does NOT reach either exit even if
+# reclaim recovers it (the was_critical latch keeps it on the notify path —
+# same latch that gates _maybe_mail_recovery), so its episode marker stays set
+# until the next genuinely healthy cycle clears it, one 5min cycle later.
+# Snapshots the candidate roots RIGHT NOW as
+# the new "last known-OK" baseline, and clears the once-per-episode marker so
+# the NEXT WARN/CRITICAL entry writes its own fresh report instead of staying
+# silent because a PREVIOUS episode already wrote one. Best-effort/non-fatal
+# like every other STATE_DIR write in this file (_write_state,
+# _write_critical_sustain, …) — a failed write here only costs the NEXT
+# episode's diff (falls back to _write_disk_growth_report's own "NO PRIOR
+# BASELINE" branch), never a guard crash.
+#
+# Two properties a first draft got wrong (ga-p5q3 / detector-cost):
+#  1. The marker is cleared FIRST and unconditionally — it is cheap, and must
+#     not depend on whether the (slow, fallible) sweep below ran or succeeded.
+#  2. The sweep is THROTTLED to once per DISK_GROWTH_BASELINE_MIN_AGE_SECS (by
+#     the baseline file's own mtime; unreadable mtime or clock skew both fall
+#     through to "refresh" — when in doubt, measure), and an EMPTY snapshot
+#     (no roots resolved, or every du failed/timed out/was over budget) is
+#     NEVER written over an existing baseline: "couldn't measure this cycle"
+#     must not erase "measured fine earlier" and read as "no baseline".
+_refresh_disk_growth_baseline() {
+  _clear_disk_growth_episode_marker
+
+  if [ -f "$STATE_DISK_GROWTH_LAST_OK_FILE" ]; then
+    local mtime age
+    mtime="$(stat -f %m "$STATE_DISK_GROWTH_LAST_OK_FILE" 2>/dev/null)"
+    case "$mtime" in
+      ''|*[!0-9]*) ;;
+      *)
+        age=$(( $(date +%s) - mtime ))
+        if [ "$age" -ge 0 ] && [ "$age" -lt "$DISK_GROWTH_BASELINE_MIN_AGE_SECS" ]; then
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  local snap; snap="$(_disk_growth_snapshot)"
+  if [ -z "$snap" ]; then
+    log "disk-growth baseline NOT refreshed: snapshot came back empty (no roots resolved, or every du failed/timed out/was over budget) — keeping the previous baseline, if any"
+    return 0
+  fi
+  _write_disk_growth_last_ok "$snap"
+}
+
+# _write_disk_growth_report <avail_gb> <class> <vm_gb> (ga-ond0fa) — on the
+# FIRST WARN/CRITICAL cycle since the last confirmed-NONE baseline (gated by
+# _disk_growth_episode_written — never re-fires every cycle of the same
+# episode, same once-per-episode shape as the CRITICAL-mail sustain gate
+# above), snapshot every known candidate root, diff it against the saved
+# last-OK baseline, and write the result — plus vm.swapusage, plus a
+# top-processes listing — to a durable, timestamped file under
+# DISK_GROWTH_LOG_DIR. This is what turns a future unattributed dive like
+# 2026-09-25's (10GB->3GB, ~7GB, self-recovered, no record of WHICH directory
+# grew) into something a human can read after the fact instead of only this
+# guard's own "avail=" log lines.
+#
+# Purely diagnostic: no reclaim action, no deletion, never gated by ENABLED
+# (see this file's own header — same "a read is not a reclaim action"
+# precedent as NOTIFY/_vm_swap_gb/_top_mem_processes). Best-effort throughout
+# — a failed du/sysctl/top call degrades only that section of the report
+# text, never aborts the write (ga-p5q3: a partial report is far better than
+# none). Called BEFORE the seven reclaim levers run (see main()) so the
+# snapshot reflects the state that actually caused the breach, not a
+# post-reclaim/post-deletion picture the reaper levers below would already
+# have altered.
+#
+# "top processes by recent write" (the bead's own ask): macOS exposes no
+# per-process disk-write BYTE count without root (fs_usage requires sudo,
+# which this guard must never trigger — an ask-gated `sudo` prompt would just
+# wedge an unattended pool session, the exact ga-gkap9p failure class this
+# city already hit for `rm -rf`). _top_mem_processes (physical-memory
+# footprint, already measured reliable by this file — see ga-xz5re) is the
+# closest available, HONESTLY LABELED proxy for "what's active right now",
+# not a silent mislabeling of memory as write I/O.
+_write_disk_growth_report() {
+  local avail="$1" class="$2" vm_gb="$3"
+  _disk_growth_episode_written && return 0
+
+  local baseline; baseline="$(_read_disk_growth_last_ok)"
+  local current; current="$(_disk_growth_snapshot)"
+  local swapusage; swapusage="$(sysctl vm.swapusage 2>/dev/null)"
+  local top_procs; top_procs="$(_top_mem_processes 10)"
+
+  # How old the baseline is matters for reading the delta below: the refresh
+  # is throttled (DISK_GROWTH_BASELINE_MIN_AGE_SECS), so "growth since
+  # baseline" spans that whole window, not just the breach itself.
+  local base_note="none"
+  if [ -n "$baseline" ] && [ -f "$STATE_DISK_GROWTH_LAST_OK_FILE" ]; then
+    local bmtime; bmtime="$(stat -f %m "$STATE_DISK_GROWTH_LAST_OK_FILE" 2>/dev/null)"
+    case "$bmtime" in
+      ''|*[!0-9]*) base_note="age unknown" ;;
+      *) base_note="taken $(( ($(date +%s) - bmtime) / 60 ))min before this snapshot" ;;
+    esac
+  fi
+  local vm_note="unmeasured"; [ -n "$vm_gb" ] && vm_note="${vm_gb}GB"
+
+  mkdir -p "$DISK_GROWTH_LOG_DIR" 2>/dev/null || true
+  local out_file="$DISK_GROWTH_LOG_DIR/disk-growth-$(date +%s).txt"
+
+  {
+    echo "dolt-disk-floor-guard disk-growth snapshot (ga-ond0fa)"
+    echo "generated: $(ts)"
+    echo "class=${class} avail=${avail}GB (warn=${FLOOR_WARN_GB}GB crit=${FLOOR_CRITICAL_GB}GB) vm_swap=${vm_note}"
+    echo
+    echo "--- vm.swapusage ---"
+    if [ -n "$swapusage" ]; then printf '%s\n' "$swapusage"; else echo "(unmeasured — sysctl vm.swapusage failed)"; fi
+    echo
+    echo "--- /System/Volumes/VM size (du -sk; ga-sfj3i.2) ---"
+    echo "${vm_note}"
+    echo
+    if [ -z "$baseline" ]; then
+      echo "--- candidate directories: NO PRIOR BASELINE (first snapshot ever, or state was lost) — raw sizes, not a delta ---"
+      if [ -n "$current" ]; then
+        printf '%s\n' "$current" | awk -F'\t' '{ printf "%-28s %6dMB  %s\n", $1, int($2/1024), $3 }'
+      else
+        echo "(unmeasured — no candidate roots resolved or all du calls failed/timed out)"
+      fi
+    else
+      echo "--- candidate directories: delta since last confirmed-OK baseline (${base_note}; label  delta  old->new  path; biggest grower first) ---"
+      local delta; delta="$(_disk_growth_delta "$baseline" "$current")"
+      if [ -n "$delta" ]; then
+        # ga-ond0fa self-audit: render each of _disk_growth_delta's three
+        # states with its OWN honest sentence — "state=old_only" (this
+        # cycle's du for a previously-measured root failed/timed out, OR the
+        # root is genuinely gone) must never print as "-> 0MB", which would
+        # read as a CONFIRMED "shrank to nothing" and be indistinguishable
+        # from that real outcome (ga-p5q3: don't collapse "couldn't measure"
+        # into a specific, false value).
+        printf '%s\n' "$delta" | awk -F'\t' '
+          $6 == "both"     { printf "%-28s %+6dMB  (%dMB -> %dMB)  %s\n", $1, $2, $3, $4, $5 }
+          $6 == "new_only" { printf "%-28s %+6dMB  (NOT in baseline: a new root, or its baseline du failed — delta counts the whole %dMB; do not read as \"grew from 0\")  %s\n", $1, $2, $4, $5 }
+          $6 == "old_only" { printf "%-28s  UNMSR  (last known %dMB — NOT measured this cycle: du timed out, or the root is gone; do not read as \"shrank to 0\")  %s\n", $1, $3, $5 }
+        '
+      else
+        echo "(unmeasured — no candidate roots resolved or all du calls failed/timed out)"
+      fi
+    fi
+    echo
+    echo "--- top processes by physical-memory footprint (PROXY — macOS exposes no per-process disk-write byte count without root; PID PPID MEM CMPRS LAUNCHD_LABEL COMMAND) ---"
+    if [ -n "$top_procs" ]; then printf '%s\n' "$top_procs"; else echo "(unmeasured — top produced no rows)"; fi
+  } 2>/dev/null > "$out_file"
+
+  # Verify the effect, not the attempt (ga-ond0fa self-audit): a group
+  # redirect that fails to open $out_file (dir missing/unwritable, or the disk
+  # so full even this few-KB file can't be created — plausible, since this
+  # guard exists for the ENOSPC floor) runs NOTHING and leaves no file, yet
+  # falls straight through to the lines below. Logging "written" and setting
+  # the once-per-episode marker anyway would (a) put a false line in the very
+  # log a future reader trusts, and (b) suppress every retry for the rest of
+  # the episode. On failure: say so, leave the marker UNSET so the next cycle
+  # retries.
+  if [ ! -s "$out_file" ]; then
+    log "WARN: disk-growth snapshot could NOT be written to $out_file (dir missing/unwritable, or disk too full) — once-per-episode marker left unset, will retry next cycle"
+    return 0
+  fi
+  log "disk-growth snapshot written: $out_file"
+  _write_disk_growth_episode_marker
 }
 
 # _safe_reclaim <before_avail_gb> → best-effort `gc dolt-cleanup --force` (orphan
@@ -2198,6 +2582,7 @@ main() {
     log "avail=${avail}GB > floor(warn=${FLOOR_WARN_GB}GB) — OK"
     _write_critical_sustain 0
     _maybe_mail_recovery "$avail" "$now"
+    _refresh_disk_growth_baseline
     return 0
   fi
 
@@ -2218,6 +2603,12 @@ main() {
   # so their combined effect can be measured (reclaimed_gb below) instead of
   # only inferred from the reclassified `class`.
   local avail_before="$avail"
+
+  # ga-ond0fa: write the growth-snapshot report (if this is the first
+  # WARN/CRITICAL cycle of the episode) BEFORE any reclaim lever runs, so
+  # the du sizes reflect what actually caused the breach, not a
+  # post-deletion picture the reapers below would already have altered.
+  _write_disk_growth_report "$avail" "$class" "${vm_gb:-}"
 
   _read_state
   _safe_reclaim "$avail"
@@ -2274,6 +2665,7 @@ main() {
   if [ "$class" = "NONE" ] && [ "$was_critical" = "0" ]; then
     log "avail=${avail}GB back above floor after reclaim — no notify needed"
     _write_state "$now" "$avail"
+    _refresh_disk_growth_baseline
     return 0
   fi
 

@@ -1028,6 +1028,345 @@ CITY="/nonexistent/path/$$/no-such-city"
 tdc_empty="$(_top_disk_consumers 5)"
 [ -z "$tdc_empty" ] && ok "_top_disk_consumers: no roots resolve → empty result, never a crash" || bad "_top_disk_consumers: expected empty result when no roots resolve, got: $tdc_empty"
 
+echo ""
+echo "=== _disk_growth_candidate_roots (ga-ond0fa): real fixture tree, exact candidate list ==="
+# WHY: proves the exact bead-specified candidate list (.beads/dolt per
+# database, .dolt-backup, ~/shared/data, ~/gt/*/.gc-worktrees,
+# ~/Library/Caches, /private/tmp, ~/.claude/projects) resolves correctly
+# against a real (fixture) filesystem, AND that a candidate that doesn't
+# exist on this host is silently skipped rather than fabricated (ga-p5q3).
+# CITY, DOLTDIR and HOME are plain globals (not readonly) — same technique
+# the _reap_dead_scratch block below already uses for CITY.
+DGCR_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgcr-city.XXXXXX)"
+DGCR_HOME="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgcr-home.XXXXXX)"
+mkdir -p "$DGCR_CITY/dolt/dbone" "$DGCR_CITY/dolt/dbtwo" "$DGCR_CITY/.dolt-backup" \
+         "$DGCR_HOME/shared/data" "$DGCR_HOME/gt/rigA/.gc-worktrees" \
+         "$DGCR_HOME/Library/Caches" "$DGCR_HOME/.claude/projects"
+# private-tmp is deliberately NOT redirectable (the real function always
+# checks the real /private/tmp) — /private/tmp exists on every macOS host
+# this guard runs on, so it's expected to always appear.
+
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_HOME="$HOME"
+CITY="$DGCR_CITY"; DOLTDIR="$DGCR_CITY/dolt"; HOME="$DGCR_HOME"
+dgcr_result="$(_disk_growth_candidate_roots)"
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; HOME="$REAL_HOME"
+
+case "$dgcr_result" in
+  *"dolt-db:dbone"*"$DGCR_CITY/dolt/dbone"*) ok "_disk_growth_candidate_roots: per-database Dolt label+path (dbone)" ;;
+  *) bad "_disk_growth_candidate_roots: missing dolt-db:dbone — got: $(printf '%s' "$dgcr_result" | tr '\n' ';')" ;;
+esac
+case "$dgcr_result" in
+  *"dolt-db:dbtwo"*"$DGCR_CITY/dolt/dbtwo"*) ok "_disk_growth_candidate_roots: per-database Dolt label+path (dbtwo)" ;;
+  *) bad "_disk_growth_candidate_roots: missing dolt-db:dbtwo" ;;
+esac
+case "$dgcr_result" in
+  *"dolt-backup"*"$DGCR_CITY/.dolt-backup"*) ok "_disk_growth_candidate_roots: .dolt-backup" ;;
+  *) bad "_disk_growth_candidate_roots: missing dolt-backup" ;;
+esac
+case "$dgcr_result" in
+  *"shared-data"*"$DGCR_HOME/shared/data"*) ok "_disk_growth_candidate_roots: ~/shared/data" ;;
+  *) bad "_disk_growth_candidate_roots: missing shared-data" ;;
+esac
+case "$dgcr_result" in
+  *"gc-worktrees:rigA"*"$DGCR_HOME/gt/rigA/.gc-worktrees"*) ok "_disk_growth_candidate_roots: ~/gt/<rig>/.gc-worktrees, labeled per rig" ;;
+  *) bad "_disk_growth_candidate_roots: missing gc-worktrees:rigA" ;;
+esac
+case "$dgcr_result" in
+  *"library-caches"*"$DGCR_HOME/Library/Caches"*) ok "_disk_growth_candidate_roots: ~/Library/Caches" ;;
+  *) bad "_disk_growth_candidate_roots: missing library-caches" ;;
+esac
+case "$dgcr_result" in
+  *"private-tmp"*"/private/tmp"*) ok "_disk_growth_candidate_roots: /private/tmp (real, always present)" ;;
+  *) bad "_disk_growth_candidate_roots: missing private-tmp" ;;
+esac
+case "$dgcr_result" in
+  *"claude-projects"*"$DGCR_HOME/.claude/projects"*) ok "_disk_growth_candidate_roots: ~/.claude/projects" ;;
+  *) bad "_disk_growth_candidate_roots: missing claude-projects" ;;
+esac
+rm -rf "$DGCR_CITY" "$DGCR_HOME"
+
+# ── _disk_growth_candidate_roots: a candidate that doesn't exist is
+#    silently skipped, never fabricated (ga-p5q3) ──────────────────────────
+DGCR_EMPTY_CITY="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgcr-empty.XXXXXX)"
+DGCR_EMPTY_HOME="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgcr-empty2.XXXXXX)"
+REAL_CITY="$CITY"; REAL_DOLTDIR="$DOLTDIR"; REAL_HOME="$HOME"
+CITY="$DGCR_EMPTY_CITY"; DOLTDIR="$DGCR_EMPTY_CITY/no-dolt-here"; HOME="$DGCR_EMPTY_HOME"
+dgcr_empty="$(_disk_growth_candidate_roots)"
+CITY="$REAL_CITY"; DOLTDIR="$REAL_DOLTDIR"; HOME="$REAL_HOME"
+case "$dgcr_empty" in
+  *"dolt-db:"*|*"dolt-backup"*|*"shared-data"*|*"gc-worktrees:"*|*"library-caches"*|*"claude-projects"*)
+    bad "_disk_growth_candidate_roots: fabricated a row for a nonexistent candidate — got: $(printf '%s' "$dgcr_empty" | tr '\n' ';')" ;;
+  *) ok "_disk_growth_candidate_roots: absent candidates skipped (only /private/tmp, which is always real, may appear)" ;;
+esac
+rm -rf "$DGCR_EMPTY_CITY" "$DGCR_EMPTY_HOME"
+
+echo ""
+echo "=== _disk_growth_snapshot + _disk_growth_delta (ga-ond0fa): synthetic directories, real du, showing the actual delta ==="
+# WHY (acceptance criterion): plant real synthetic directories with known
+# byte sizes, take a snapshot, grow one of them, take a second snapshot, and
+# prove _disk_growth_delta reports the correct growth — this is the exact
+# "who grew during the dive" capability the 2026-09-25 unattributed 7GB dip
+# was missing. _disk_growth_candidate_roots is overridden to point at the
+# fixture (never touches this host's real Dolt/Library/Caches/etc.).
+DGS_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgs.XXXXXX)"
+mkdir -p "$DGS_ROOT/steady" "$DGS_ROOT/grower" "$DGS_ROOT/vanishing"
+head -c 1048576 /dev/zero > "$DGS_ROOT/steady/f"     # 1MB, never changes
+head -c 1048576 /dev/zero > "$DGS_ROOT/grower/f1"    # 1MB baseline
+head -c 1048576 /dev/zero > "$DGS_ROOT/vanishing/f"  # 1MB, present at baseline only
+
+_disk_growth_candidate_roots() { printf 'steady\t%s\ngrower\t%s\nvanishing\t%s\n' "$DGS_ROOT/steady" "$DGS_ROOT/grower" "$DGS_ROOT/vanishing"; }
+dgs_baseline="$(_disk_growth_snapshot)"
+
+case "$dgs_baseline" in
+  *"steady"*) ok "_disk_growth_snapshot: real du -sk against a synthetic 1MB fixture surfaces it" ;;
+  *) bad "_disk_growth_snapshot: fixture missing from baseline snapshot — got: $(printf '%s' "$dgs_baseline" | tr '\n' ';')" ;;
+esac
+
+# grow "grower" by 5MB, remove "vanishing" entirely, leave "steady" untouched
+head -c 5242880 /dev/zero > "$DGS_ROOT/grower/f2"
+rm -rf "$DGS_ROOT/vanishing"
+dgs_current="$(_disk_growth_snapshot)"
+
+dgs_delta="$(_disk_growth_delta "$dgs_baseline" "$dgs_current")"
+dgs_first_line="$(printf '%s\n' "$dgs_delta" | head -1)"
+case "$dgs_first_line" in
+  "grower"*) ok "_disk_growth_delta: the grown directory (grower, +5MB) sorts FIRST (biggest-grower-first ordering)" ;;
+  *) bad "_disk_growth_delta: expected grower first, got: $dgs_first_line" ;;
+esac
+case "$dgs_first_line" in
+  "grower"$'\t'5$'\t'1$'\t'6$'\t'*$'\t'"both") ok "_disk_growth_delta: grower delta=+5MB old=1MB new=6MB state=both (exact values, measured on both sides)" ;;
+  *) bad "_disk_growth_delta: grower's exact delta/old/new/state wrong — got: $dgs_first_line" ;;
+esac
+case "$dgs_delta" in
+  *"steady"$'\t'0$'\t'1$'\t'1$'\t'*$'\t'"both"*) ok "_disk_growth_delta: unchanged directory (steady) reports delta=0, state=both" ;;
+  *) bad "_disk_growth_delta: steady should show delta=0 old=1 new=1 state=both — got: $(printf '%s' "$dgs_delta" | tr '\n' ';')" ;;
+esac
+# ── the ga-ond0fa self-audit fix: a root ABSENT from the new snapshot (du
+#    timed out this cycle, OR the root is genuinely gone) must carry
+#    state=old_only, NEVER state=both — collapsing "unmeasured" into a plain
+#    numeric new=0 would be indistinguishable from a CONFIRMED "shrank to
+#    nothing" reading (ga-p5q3). A first draft of this function did exactly
+#    that; caught in this bead's own gate-done pre-flight self-audit, not by
+#    a reviewer. ─────────────────────────────────────────────────────────
+case "$dgs_delta" in
+  *"vanishing"$'\t'"-1"$'\t'1$'\t'0$'\t'*$'\t'"old_only") ok "_disk_growth_delta: a root vanished/unmeasured this cycle carries state=old_only (never silently presented as state=both/new=0, which would read as CONFIRMED shrinkage — ga-p5q3)" ;;
+  *) bad "_disk_growth_delta: vanishing root not reported as delta=-1 old=1 new=0 state=old_only — got: $(printf '%s' "$dgs_delta" | tr '\n' ';')" ;;
+esac
+
+# ── _disk_growth_delta: a root with NO prior baseline (new since last
+#    snapshot) is treated as old=0, state=new_only — its full current size
+#    IS the growth, but the caller must render it as "new", not as a false
+#    "grew from a confirmed 0" reading ─────────────────────────────────────
+dgd_new_only="$(_disk_growth_delta "" "brandnew	2048	/fake/brandnew")"
+case "$dgd_new_only" in
+  "brandnew"$'\t'2$'\t'0$'\t'2$'\t'*$'\t'"new_only") ok "_disk_growth_delta: a label absent from the old snapshot is treated as old=0, state=new_only (new root, full size counts as growth, never presented as a confirmed grew-from-zero)" ;;
+  *) bad "_disk_growth_delta: new-only label wrong — got: $dgd_new_only" ;;
+esac
+rm -rf "$DGS_ROOT"
+
+echo ""
+echo "=== disk-growth report writer + once-per-episode gating (ga-ond0fa) ==="
+# WHY: proves the full EXECUTION-layer wiring — _refresh_disk_growth_baseline
+# (writes the last-OK snapshot + clears the episode marker),
+# _write_disk_growth_report (writes the durable report exactly once per
+# WARN/CRITICAL episode, gated by _disk_growth_episode_written), and the
+# NO-PRIOR-BASELINE degrade path — all against a disposable STATE_DIR/
+# DISK_GROWTH_LOG_DIR, never the real $CITY/.gc/logs. _top_mem_processes is
+# already stubbed earlier in this file (main()-scenario stub, still in
+# effect here); sysctl vm.swapusage is left real (cheap, no host dependency
+# in the assertions below).
+DGR_STATE="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgr-state.XXXXXX)"
+DGR_LOGS="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgr-logs.XXXXXX)"
+DGR_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgr-root.XXXXXX)"
+mkdir -p "$DGR_ROOT/candA"
+REAL_STATE_DIR="$STATE_DIR"; REAL_LAST_OK="$STATE_DISK_GROWTH_LAST_OK_FILE"
+REAL_EPISODE="$STATE_DISK_GROWTH_EPISODE_FILE"; REAL_LOG_DIR="$DISK_GROWTH_LOG_DIR"
+STATE_DIR="$DGR_STATE"
+STATE_DISK_GROWTH_LAST_OK_FILE="$DGR_STATE/last-ok.tsv"
+STATE_DISK_GROWTH_EPISODE_FILE="$DGR_STATE/episode-written"
+DISK_GROWTH_LOG_DIR="$DGR_LOGS"
+_disk_growth_candidate_roots() { printf 'candA\t%s\n' "$DGR_ROOT/candA"; }
+
+# no baseline yet — first-ever WARN cycle degrades to the raw-sizes branch,
+# never a fabricated delta
+head -c 1048576 /dev/zero > "$DGR_ROOT/candA/f"
+_write_disk_growth_report 5 WARN 0
+dgr_files1="$(find "$DGR_LOGS" -name 'disk-growth-*.txt' | wc -l | tr -d ' ')"
+[ "$dgr_files1" = "1" ] && ok "_write_disk_growth_report: writes exactly one report on the first WARN/CRITICAL cycle" || bad "_write_disk_growth_report: expected 1 report file, got $dgr_files1"
+dgr_report1="$(cat "$DGR_LOGS"/disk-growth-*.txt 2>/dev/null)"
+case "$dgr_report1" in
+  *"NO PRIOR BASELINE"*) ok "_write_disk_growth_report: no saved baseline yet → degrades to raw-sizes branch, never fabricates a delta" ;;
+  *) bad "_write_disk_growth_report: expected the NO PRIOR BASELINE branch on a fresh state dir — got: $dgr_report1" ;;
+esac
+[ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && ok "_write_disk_growth_report: sets the once-per-episode marker after writing" || bad "_write_disk_growth_report: episode marker not set after writing"
+
+# same episode, second WARN cycle — must NOT write a second report
+_write_disk_growth_report 5 WARN 0
+dgr_files2="$(find "$DGR_LOGS" -name 'disk-growth-*.txt' | wc -l | tr -d ' ')"
+[ "$dgr_files2" = "1" ] && ok "_write_disk_growth_report: a second WARN cycle in the SAME episode does not write a second report (once-per-episode gate)" || bad "_write_disk_growth_report: expected still 1 report file after a repeat call, got $dgr_files2"
+
+# recovery: _refresh_disk_growth_baseline clears the marker AND saves a
+# fresh baseline reflecting the grown directory
+_refresh_disk_growth_baseline
+[ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && bad "_refresh_disk_growth_baseline: episode marker should be cleared on recovery" || ok "_refresh_disk_growth_baseline: clears the once-per-episode marker on recovery"
+
+# a NEW episode: grow candA further, write again — must diff against the
+# baseline _refresh_disk_growth_baseline just saved (1MB), not "no baseline"
+sleep 1
+head -c 3145728 /dev/zero > "$DGR_ROOT/candA/f2"   # +3MB on top of the 1MB baseline
+_write_disk_growth_report 5 WARN 0
+dgr_files3="$(find "$DGR_LOGS" -name 'disk-growth-*.txt' | wc -l | tr -d ' ')"
+[ "$dgr_files3" = "2" ] && ok "_write_disk_growth_report: a genuinely NEW episode (after a confirmed recovery) writes its own fresh report" || bad "_write_disk_growth_report: expected 2 report files after a new episode, got $dgr_files3"
+dgr_latest="$(ls -t "$DGR_LOGS"/disk-growth-*.txt | head -1)"
+dgr_report2="$(cat "$dgr_latest")"
+case "$dgr_report2" in
+  *"candA"*"+3MB"*"1MB -> 4MB"*) ok "_write_disk_growth_report: second episode's report shows the correct delta against the saved baseline (+3MB, 1MB->4MB)" ;;
+  *) bad "_write_disk_growth_report: second episode's delta wrong — got: $dgr_report2" ;;
+esac
+
+STATE_DIR="$REAL_STATE_DIR"
+STATE_DISK_GROWTH_LAST_OK_FILE="$REAL_LAST_OK"
+STATE_DISK_GROWTH_EPISODE_FILE="$REAL_EPISODE"
+DISK_GROWTH_LOG_DIR="$REAL_LOG_DIR"
+rm -rf "$DGR_STATE" "$DGR_LOGS" "$DGR_ROOT"
+
+echo ""
+echo "=== disk-growth hardening (ga-ond0fa): total budget, refresh throttle, no-clobber, verified write, honest wording ==="
+# WHY: a self-audit of the first draft (see the comments on each function)
+# found five defects the pure-function tests above cannot see: an unbounded
+# sweep that delays the emergency reclaim it runs BEFORE; a full du sweep on
+# every healthy cycle; an empty snapshot overwriting a good baseline; a
+# "written" log line + episode marker set even when the write failed; and
+# "new since baseline" overstating what new_only means. Every check below is
+# against disposable dirs — never the real state dir, log dir or host roots.
+DGH_STATE="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgh-state.XXXXXX)"
+DGH_LOGS="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgh-logs.XXXXXX)"
+DGH_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgh-root.XXXXXX)"
+mkdir -p "$DGH_ROOT/r1" "$DGH_ROOT/r2" "$DGH_ROOT/r3" "$DGH_ROOT/r4"
+for dgh_n in 1 2 3 4; do head -c 1048576 /dev/zero > "$DGH_ROOT/r$dgh_n/f"; done
+DGH_REAL_STATE_DIR="$STATE_DIR"; DGH_REAL_LAST_OK="$STATE_DISK_GROWTH_LAST_OK_FILE"
+DGH_REAL_EPISODE="$STATE_DISK_GROWTH_EPISODE_FILE"; DGH_REAL_LOG_DIR="$DISK_GROWTH_LOG_DIR"
+DGH_REAL_LOG="$LOG"; DGH_REAL_BUDGET="$DISK_GROWTH_TOTAL_BUDGET_SECS"
+DGH_REAL_MIN_AGE="$DISK_GROWTH_BASELINE_MIN_AGE_SECS"
+STATE_DIR="$DGH_STATE"
+STATE_DISK_GROWTH_LAST_OK_FILE="$DGH_STATE/last-ok.tsv"
+STATE_DISK_GROWTH_EPISODE_FILE="$DGH_STATE/episode-written"
+DISK_GROWTH_LOG_DIR="$DGH_LOGS"
+LOG="$DGH_STATE/guard.log"; : > "$LOG"
+
+# ── total budget: budget=0 measures nothing and names every skipped root ──────
+_disk_growth_candidate_roots() { printf 'r1\t%s\nr2\t%s\nr3\t%s\nr4\t%s\n' "$DGH_ROOT/r1" "$DGH_ROOT/r2" "$DGH_ROOT/r3" "$DGH_ROOT/r4"; }
+DISK_GROWTH_TOTAL_BUDGET_SECS=0
+dgh_zero="$(_disk_growth_snapshot)"
+if [ -z "$dgh_zero" ] && grep -q 'NOT measured this cycle: r1 r2 r3 r4' "$LOG"; then
+  ok "_disk_growth_snapshot: a spent total budget skips the remaining roots, measures none, and NAMES them in the log (never a fabricated 0)"
+else
+  bad "_disk_growth_snapshot: budget=0 should yield an empty snapshot + a log line naming r1..r4 — got snapshot='$dgh_zero' log='$(tr '\n' ';' < "$LOG")'"
+fi
+
+# ── total budget: a slow du (each root costs ~2s via a shim) against a 3s
+#    budget measures the first root(s) and skips the rest — the sweep is
+#    bounded, and what it skipped is logged ─────────────────────────────────
+: > "$LOG"
+timeout() { sleep 2; command timeout "$@"; }
+DISK_GROWTH_TOTAL_BUDGET_SECS=3
+dgh_part="$(_disk_growth_snapshot)"
+unset -f timeout
+dgh_part_n="$(printf '%s' "$dgh_part" | grep -c .)"
+if [ "$dgh_part_n" -ge 1 ] && [ "$dgh_part_n" -lt 4 ] && grep -q 'NOT measured this cycle' "$LOG"; then
+  ok "_disk_growth_snapshot: a slow sweep is cut off by the total budget ($dgh_part_n of 4 roots measured, the rest logged as not measured)"
+else
+  bad "_disk_growth_snapshot: expected 1-3 of 4 roots measured + a 'NOT measured' log line under a 3s budget with a 2s/root shim — measured=$dgh_part_n log='$(tr '\n' ';' < "$LOG")'"
+fi
+DISK_GROWTH_TOTAL_BUDGET_SECS="$DGH_REAL_BUDGET"
+
+# ── baseline refresh: throttle, marker-always-cleared, no-clobber ───────────
+_disk_growth_candidate_roots() { printf 'r1\t%s\n' "$DGH_ROOT/r1"; }
+DISK_GROWTH_BASELINE_MIN_AGE_SECS=900
+rm -f "$STATE_DISK_GROWTH_LAST_OK_FILE" "$STATE_DISK_GROWTH_EPISODE_FILE"
+_refresh_disk_growth_baseline
+dgh_first="$(cat "$STATE_DISK_GROWTH_LAST_OK_FILE" 2>/dev/null)"
+[ -n "$dgh_first" ] && ok "_refresh_disk_growth_baseline: no baseline yet → the first healthy cycle writes one" || bad "_refresh_disk_growth_baseline: first call wrote no baseline"
+
+head -c 3145728 /dev/zero > "$DGH_ROOT/r1/f2"       # r1 grows by 3MB
+: > "$STATE_DISK_GROWTH_EPISODE_FILE"               # an episode is "open"
+_refresh_disk_growth_baseline
+[ "$(cat "$STATE_DISK_GROWTH_LAST_OK_FILE")" = "$dgh_first" ] \
+  && ok "_refresh_disk_growth_baseline: a baseline younger than the min age is NOT re-measured (throttle — no du sweep every 5min cycle)" \
+  || bad "_refresh_disk_growth_baseline: young baseline was re-measured despite the throttle"
+[ ! -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] \
+  && ok "_refresh_disk_growth_baseline: the episode marker is cleared even when the sweep is throttled" \
+  || bad "_refresh_disk_growth_baseline: marker not cleared on a throttled cycle (next episode would stay silent)"
+
+touch -t 202001010000 "$STATE_DISK_GROWTH_LAST_OK_FILE"   # age it far past the throttle
+_refresh_disk_growth_baseline
+[ "$(cat "$STATE_DISK_GROWTH_LAST_OK_FILE")" != "$dgh_first" ] \
+  && ok "_refresh_disk_growth_baseline: a baseline older than the min age IS re-measured (picks up the grown r1)" \
+  || bad "_refresh_disk_growth_baseline: stale baseline was not refreshed"
+
+dgh_good="$(cat "$STATE_DISK_GROWTH_LAST_OK_FILE")"
+touch -t 202001010000 "$STATE_DISK_GROWTH_LAST_OK_FILE"
+_disk_growth_candidate_roots() { :; }                     # nothing measurable this cycle
+: > "$LOG"
+_refresh_disk_growth_baseline
+if [ "$(cat "$STATE_DISK_GROWTH_LAST_OK_FILE")" = "$dgh_good" ] && grep -q 'baseline NOT refreshed' "$LOG"; then
+  ok "_refresh_disk_growth_baseline: an EMPTY snapshot never overwrites a good baseline (unmeasurable ≠ nothing there — ga-p5q3), and says so in the log"
+else
+  bad "_refresh_disk_growth_baseline: empty snapshot clobbered the good baseline or logged nothing — log='$(tr '\n' ';' < "$LOG")'"
+fi
+
+# ── report writer: a FAILED write is reported as failed, leaves the marker
+#    unset (so the next cycle retries), and a later good write recovers ───────
+_disk_growth_candidate_roots() { printf 'r1\t%s\n' "$DGH_ROOT/r1"; }
+rm -f "$STATE_DISK_GROWTH_EPISODE_FILE"; : > "$DGH_STATE/notadir"
+DISK_GROWTH_LOG_DIR="$DGH_STATE/notadir/sub"             # mkdir -p under a regular file cannot succeed
+: > "$LOG"
+_write_disk_growth_report 5 WARN 0
+if [ ! -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && grep -q 'could NOT be written' "$LOG" && ! grep -q 'disk-growth snapshot written' "$LOG"; then
+  ok "_write_disk_growth_report: an unwritable log dir is logged as a FAILURE (not 'written') and leaves the once-per-episode marker unset"
+else
+  bad "_write_disk_growth_report: failed write logged as success or marker set — marker=$([ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && echo set || echo unset) log='$(tr '\n' ';' < "$LOG")'"
+fi
+DISK_GROWTH_LOG_DIR="$DGH_LOGS"
+_write_disk_growth_report 5 WARN 0
+dgh_nfiles="$(find "$DGH_LOGS" -name 'disk-growth-*.txt' | wc -l | tr -d ' ')"
+[ "$dgh_nfiles" = "1" ] && [ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] \
+  && ok "_write_disk_growth_report: after the failed attempt the retry writes the report and sets the marker" \
+  || bad "_write_disk_growth_report: retry after a failed write did not produce exactly one report + marker (files=$dgh_nfiles)"
+
+# ── report text: baseline age shown; new_only worded honestly; a missing vm
+#    reading is 'unmeasured', never 'unmeasuredGB'/'unknownGB' ──────────────
+rm -f "$STATE_DISK_GROWTH_EPISODE_FILE" "$DGH_LOGS"/disk-growth-*.txt
+_write_disk_growth_last_ok "$(_disk_growth_snapshot)"      # baseline knows r1 only
+_disk_growth_candidate_roots() { printf 'r1\t%s\nr2\t%s\n' "$DGH_ROOT/r1" "$DGH_ROOT/r2"; }
+_write_disk_growth_report 5 WARN ""
+dgh_rep="$(cat "$DGH_LOGS"/disk-growth-*.txt 2>/dev/null)"
+case "$dgh_rep" in
+  *"r2"*"NOT in baseline"*"do not read as \"grew from 0\""*) ok "_write_disk_growth_report: a root missing from the baseline is worded 'NOT in baseline' (new root OR failed baseline du) — not 'new since baseline'" ;;
+  *) bad "_write_disk_growth_report: new_only wording wrong — got: $dgh_rep" ;;
+esac
+case "$dgh_rep" in
+  *"taken 0min before this snapshot"*) ok "_write_disk_growth_report: states how old the baseline is (the delta spans that window)" ;;
+  *) bad "_write_disk_growth_report: baseline age missing from the delta header — got: $dgh_rep" ;;
+esac
+case "$dgh_rep" in
+  *"vm_swap=unmeasured"*) ok "_write_disk_growth_report: a missing vm reading renders as 'unmeasured'" ;;
+  *) bad "_write_disk_growth_report: expected 'vm_swap=unmeasured' — got: $dgh_rep" ;;
+esac
+case "$dgh_rep" in
+  *"unmeasuredGB"*|*"unknownGB"*) bad "_write_disk_growth_report: a unit was glued onto a placeholder ('unmeasuredGB'/'unknownGB') — got: $dgh_rep" ;;
+  *) ok "_write_disk_growth_report: no unit glued onto a placeholder value" ;;
+esac
+
+STATE_DIR="$DGH_REAL_STATE_DIR"
+STATE_DISK_GROWTH_LAST_OK_FILE="$DGH_REAL_LAST_OK"
+STATE_DISK_GROWTH_EPISODE_FILE="$DGH_REAL_EPISODE"
+DISK_GROWTH_LOG_DIR="$DGH_REAL_LOG_DIR"
+LOG="$DGH_REAL_LOG"
+DISK_GROWTH_TOTAL_BUDGET_SECS="$DGH_REAL_BUDGET"
+DISK_GROWTH_BASELINE_MIN_AGE_SECS="$DGH_REAL_MIN_AGE"
+rm -rf "$DGH_STATE" "$DGH_LOGS" "$DGH_ROOT"
+
 # Restore the four resolvers + CITY to their real implementations — later
 # scenarios in THIS file don't call them directly again, but leaving a global
 # like CITY pointed at a deleted tmp dir is needless risk for any future
@@ -1771,6 +2110,22 @@ STATE_LAST_MAIL_EPOCH_FILE="$STATE_TMP/.last-mail-epoch"
 STATE_LAST_MAIL_AVAIL_FILE="$STATE_TMP/.last-mail-avail-gb"
 STATE_CRITICAL_EPISODE_MAILED_FILE="$STATE_TMP/.critical-episode-mailed"
 
+# ga-ond0fa: same MUST-redirect trap as the two comments immediately above —
+# both evaluated at SOURCE time against the real $STATE_DIR default. Caught
+# live building THIS bead's own tests: a first draft without this redirect
+# leaked THREE real disk-growth-<ts>.txt reports plus a real
+# .dolt-disk-floor-guard.disk-growth-last-ok.tsv into the real
+# $CITY/.gc/logs (found and removed by hand afterward) — and, worse than the
+# two prior leaks this file already warns about, the run also TIMED OUT: with
+# _disk_growth_candidate_roots NOT yet stubbed either (see below), every
+# main() scenario that reached the notify branch ran a REAL du -sk over this
+# host's actual Dolt databases, .dolt-backup, ~/shared/data, every rig's
+# .gc-worktrees, ~/Library/Caches, /private/tmp, and ~/.claude/projects —
+# ~15 roots at up to DISK_GROWTH_DU_TIMEOUT_SECS (20s) each.
+STATE_DISK_GROWTH_LAST_OK_FILE="$STATE_TMP/.disk-growth-last-ok.tsv"
+STATE_DISK_GROWTH_EPISODE_FILE="$STATE_TMP/.disk-growth-episode-written"
+DISK_GROWTH_LOG_DIR="$STATE_TMP"
+
 # Canned avail-GB readings: main() calls _avail_gb exactly twice per cycle
 # (pre-reclaim, then post-reclaim), both via `$(...)` command substitution —
 # which forks a SUBSHELL, so a shell-variable/array queue popped inside
@@ -1812,6 +2167,23 @@ _top_mem_processes() { printf '%s\n' "51664 1 1870M 302M com.gastown.dolt-server
 # that reaches the notify branch, same rationale as the _top_mem_processes
 # stub.
 _top_disk_consumers() { printf '%s\n' "3583 /private/tmp/claude-501/bash-edit-diff" "812 /var/folders/gj/T/pytest-of-athos"; }
+
+# _disk_growth_candidate_roots (ga-ond0fa) is real and hermetic in isolation
+# (proven with its own synthetic-fixture tests below), but STUBBED here to
+# return NOTHING — same reasoning as _top_disk_consumers immediately above,
+# except the cost here is worse: unstubbed, _disk_growth_snapshot (called
+# from _write_disk_growth_report on every WARN/CRITICAL main() scenario, and
+# from _refresh_disk_growth_baseline on every NONE scenario) would run a REAL
+# du -sk over every real Dolt database plus .dolt-backup, ~/shared/data,
+# every rig's .gc-worktrees, ~/Library/Caches, /private/tmp, and
+# ~/.claude/projects on THIS host — ~15 roots, each bounded by
+# DISK_GROWTH_DU_TIMEOUT_SECS (20s), so a worst case in the minutes, not
+# seconds, PER main() scenario. Returning empty makes _disk_growth_snapshot
+# a fast no-op ("" in, "" out) without disabling the wiring being tested
+# (_write_disk_growth_report/_refresh_disk_growth_baseline still run for
+# real against $STATE_TMP — see the redirected STATE_DISK_GROWTH_*/
+# DISK_GROWTH_LOG_DIR vars above).
+_disk_growth_candidate_roots() { :; }
 
 # _safe_reclaim's own mechanics (gc dolt-cleanup --force, health probe) are
 # EXECUTION code out of scope for this file (see section banner above) —
@@ -2553,6 +2925,89 @@ else
   bad "main(): UNKNOWN disk class should never trigger resurrection, got RESURRECT_CALLS=$RESURRECT_CALLS"
 fi
 RESURRECT_PROBE_RC=0   # restore safe default for any scenario added after this point
+
+echo ""
+echo "=== main(): disk-growth snapshot wiring — the CALL SITES (ga-ond0fa) ==="
+# WHY: the function-level tests above prove _write_disk_growth_report and
+# _refresh_disk_growth_baseline WORK; they do not prove main() CALLS them.
+# Delete either call from main() and every one of those still passes — a
+# feature that exists in the file and is inert in production (the same
+# "fix is alive but nobody calls it" class this city has hit before). These
+# scenarios drive the real main() and assert the observable effect of each of
+# the three call sites (healthy fast path, pre-reclaim report, post-reclaim
+# recovery path).
+DGM_ROOT="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-dgm.XXXXXX)"
+mkdir -p "$DGM_ROOT/candA"; head -c 1048576 /dev/zero > "$DGM_ROOT/candA/f"
+_disk_growth_candidate_roots() { printf 'candA\t%s\n' "$DGM_ROOT/candA"; }
+DGM_REAL_MIN_AGE="$DISK_GROWTH_BASELINE_MIN_AGE_SECS"; DISK_GROWTH_BASELINE_MIN_AGE_SECS=0
+dgm_clean()  { rm -f "$STATE_TMP"/disk-growth-*.txt "$STATE_DISK_GROWTH_LAST_OK_FILE" "$STATE_DISK_GROWTH_EPISODE_FILE"; }
+dgm_nfiles() { find "$STATE_TMP" -maxdepth 1 -name 'disk-growth-*.txt' | wc -l | tr -d ' '; }
+
+# (a) call site 1 — healthy (class=NONE) fast path: refreshes the baseline, writes NO report
+dgm_clean; reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 20
+main
+if [ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ] && [ "$(dgm_nfiles)" = "0" ]; then
+  ok "main(): a healthy (NONE) cycle refreshes the disk-growth baseline and writes no report"
+else
+  bad "main(): healthy cycle should leave a baseline and no report (baseline=$([ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ] && echo yes || echo NO) reports=$(dgm_nfiles))"
+fi
+
+# (b) call site 3 — a CRITICAL that persists: the report exists BEFORE the
+#     first reclaim lever runs (so it sees the state that caused the breach,
+#     not the post-deletion picture), and a second cycle of the SAME episode
+#     does not write another
+DGM_SAW=unset
+_safe_reclaim() { if [ "$(dgm_nfiles)" -ge 1 ]; then DGM_SAW=1; else DGM_SAW=0; fi; }
+dgm_clean; reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 2 2
+main
+if [ "$(dgm_nfiles)" = "1" ] && [ "$DGM_SAW" = "1" ] && [ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ]; then
+  ok "main(): the first CRITICAL cycle writes the disk-growth report BEFORE any reclaim lever runs, and sets the once-per-episode marker"
+else
+  bad "main(): first CRITICAL cycle — expected 1 report present when _safe_reclaim ran + marker set (reports=$(dgm_nfiles) saw_at_reclaim=$DGM_SAW marker=$([ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && echo set || echo unset))"
+fi
+reset_capture; seed_critical_sustain ""
+queue_avail 2 2
+main
+[ "$(dgm_nfiles)" = "1" ] \
+  && ok "main(): a second CRITICAL cycle in the same episode does not write a second report" \
+  || bad "main(): second cycle of the same episode wrote another report (reports=$(dgm_nfiles))"
+
+# (c) call site 2 — a WARN (6GB) that the reclaim recovers same-cycle (20GB),
+#     never CRITICAL: the post-reclaim "back above floor" exit clears the
+#     marker and refreshes the baseline, so the NEXT episode gets its own report
+dgm_clean; reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 6 20
+main
+if [ "$(dgm_nfiles)" = "1" ] && [ ! -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && [ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ]; then
+  ok "main(): WARN recovered by reclaim in the same cycle → report written, then marker cleared + baseline refreshed (next episode reports afresh)"
+else
+  bad "main(): post-reclaim recovery exit — expected 1 report, marker cleared, baseline saved (reports=$(dgm_nfiles) marker=$([ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && echo SET || echo cleared) baseline=$([ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ] && echo yes || echo NO))"
+fi
+
+# (d) a CRITICAL (2GB) that reclaim recovers same-cycle (20GB) stays on the
+#     notify path (was_critical latch), so the marker stays SET that cycle and
+#     the NEXT healthy cycle is what clears it and refreshes the baseline —
+#     pinned so a future edit can't silently change which exit owns recovery
+dgm_clean; reset_capture; seed_state "" ""; seed_critical_sustain ""
+queue_avail 2 20
+main
+dgm_crit_marker="$([ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && echo set || echo cleared)"
+reset_capture; seed_critical_sustain ""
+queue_avail 20
+main
+if [ "$(dgm_nfiles)" = "1" ] && [ "$dgm_crit_marker" = "set" ] && [ ! -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && [ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ]; then
+  ok "main(): CRITICAL recovered same-cycle keeps its marker that cycle; the next healthy cycle clears it and refreshes the baseline"
+else
+  bad "main(): CRITICAL-recovery marker lifecycle wrong (reports=$(dgm_nfiles) marker_after_crit_cycle=$dgm_crit_marker marker_after_healthy=$([ -f "$STATE_DISK_GROWTH_EPISODE_FILE" ] && echo SET || echo cleared) baseline=$([ -s "$STATE_DISK_GROWTH_LAST_OK_FILE" ] && echo yes || echo NO))"
+fi
+
+_safe_reclaim() { :; }
+_disk_growth_candidate_roots() { :; }
+DISK_GROWTH_BASELINE_MIN_AGE_SECS="$DGM_REAL_MIN_AGE"
+dgm_clean
+rm -rf "$DGM_ROOT"
 
 rm -rf "$STATE_TMP"
 
