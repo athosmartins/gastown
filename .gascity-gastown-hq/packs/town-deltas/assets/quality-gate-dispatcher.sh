@@ -7173,6 +7173,7 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
           # checks for exactly this label (same fix shape as its existing
           # is_delivery_partial guard, ga-f54ui) — the label alone does
           # nothing without that companion guard.
+          # SELFTEST-EXTRACT daemon-hold-block: BEGIN
           IS_DAEMON_HOLD=1
           log "Source bug/task $BEAD_ID merged but daemon verification $DAEMON_HOLD_VERDICT (ga-l7n3v) — holding, NOT closing."
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
@@ -7201,6 +7202,48 @@ Closed with delivery:daemon-stale-locked (not delivery:daemon-unverified — thi
               DAEMON_HOLD_ACTION="install the missing scheduled job(s) named in the Refresh detail below: copy the plist(s) into ~/Library/LaunchAgents and \`launchctl load\` (or \`launchctl bootstrap\`) them, then confirm \`launchctl list <label>\` succeeds. This verdict only proves the job is installed+loaded — NOT that a run has actually completed successfully (a job installed today may not reach its next scheduled window for hours) — so also wait for, or manually trigger via \`launchctl kickstart -k\`, one run and confirm a readable result lands in its log before closing this bead manually."
               ;;
           esac
+          # ga-wlhd07: this branch used to win the if/else, so the ga-rhzbii
+          # open-sibling check (the else branch below) never ran for a daemon-
+          # held bead. The hold DECISION is unchanged — the bead is already held,
+          # and IS_DAEMON_HOLD already exempts it from the POST-MERGE re-spawn
+          # check, so IS_SIBLING_HOLD is deliberately NOT set here. What was
+          # missing is what the operator is TOLD: DAEMON_HOLD_ACTION ends "close
+          # this bead manually once confirmed live", and a human following that
+          # closes a bead delivered as branches in two repos/rigs while the other
+          # repo's marker is still open. A CLOSED source bead matches no re-spawn
+          # selector, so that branch is never revisited — the same orphaning
+          # ga-rhzbii fixed for the automatic close, reached by the manual one.
+          # DAEMON_HOLD_ACTION is the one field the bead comment, the Mayor mail
+          # and the author nudge below all print, so the warning is appended
+          # there and reaches all three.
+          # Same three outcomes as the else branch, kept separate by
+          # SIBLING_HOLD_KIND: none = text unchanged; open = name the row(s);
+          # unverified = the query FAILED, siblings UNKNOWN — never worded as "a
+          # sibling is open". Keep the helper call free of any 2>/dev/null so its
+          # bd-failure ALERT reaches $LOG (ga-rhzbii). A row naming THIS run's own
+          # branch means this run's own marker/gate-run close failed, not a real
+          # sibling; holding is the safe direction. Nothing below promises an
+          # automatic retry or close — a held bead is not revisited.
+          gate_sibling_hold_check "$GC_CITY" "$BEAD_ID"
+          case "$SIBLING_HOLD_KIND" in
+            open)
+              log "  Daemon-hold bead $BEAD_ID ALSO has another gate marker/run still open (ga-wlhd07) — sibling warning added to the manual-close ACTION:
+$OPEN_SIBLINGS_FOR_CLOSE"
+              DAEMON_HOLD_ACTION="$DAEMON_HOLD_ACTION
+
+BEFORE closing it by hand (ga-wlhd07): at least one OTHER gate marker/run citing this bead via source-bead: is still open (not yet terminal):
+
+$OPEN_SIBLINGS_FOR_CLOSE
+
+A bead delivered as branches in more than one repo/rig has one marker per repo; closing this bead now would orphan the still-open one — a CLOSED source bead matches no re-spawn selector, so that branch would never be revisited. Run \`bd -C $GC_CITY list --label source-bead:$BEAD_ID --all\` (keep the -C: a bare bd from another directory reads a different store, and an empty list there is NOT \"every marker is closed\") and close this bead only once no marker/run listed there is still open."
+              ;;
+            unverified)
+              log "  Daemon-hold bead $BEAD_ID: the open-sibling check could NOT run (bd query failed — see the ALERT just above) — siblings UNKNOWN; warning added to the manual-close ACTION (ga-wlhd07)."
+              DAEMON_HOLD_ACTION="$DAEMON_HOLD_ACTION
+
+BEFORE closing it by hand (ga-wlhd07): the check for OTHER still-open gate markers/runs on this bead COULD NOT RUN (a bd query failed; the ALERT is in the dispatcher log), so whether a sibling exists is UNKNOWN — none is confirmed. Closing on a false \"no siblings\" would orphan another repo/rig branch that is still waiting to merge. Run \`bd -C $GC_CITY list --label source-bead:$BEAD_ID --all\` (keep the -C: a bare bd from another directory reads a different store, and an empty list there is NOT \"every marker is closed\") and close this bead only once every marker/run listed there is closed."
+              ;;
+          esac
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
 
 A long-lived daemon serving rig '$RIG' may still be running code older than this merge. Closure is WITHHELD until this is resolved — a dormant merge must never be marked done (ga-l7n3v). Labeled delivery:pending-restart; gate:passed (already set) keeps the Pilot from re-dispatching this bead.
@@ -7219,6 +7262,7 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
             "$(printf 'Your branch %s PASSED gate review and merged (sha %s), but the source bead %s was NOT closed.\n\nga-l7n3v: daemon verification %s — %s. Held as delivery:pending-restart.\n\nACTION: %s\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s)' \
               "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$DAEMON_HOLD_VERDICT" "$DAEMON_HOLD_REASON" "$DAEMON_HOLD_ACTION" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
             "daemon-hold on $BEAD_ID (ga-l7n3v)"
+          # SELFTEST-EXTRACT daemon-hold-block: END
         else
           # ga-rhzbii: before closing, check whether another gate marker/run
           # is STILL OPEN for this same source-bead. A bead delivered as
