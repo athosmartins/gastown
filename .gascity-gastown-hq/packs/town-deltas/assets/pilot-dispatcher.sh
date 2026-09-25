@@ -6574,6 +6574,177 @@ _pilot_dog_store_blind_guard() {
   return 1
 }
 
+# _pilot_dog_store_blind_migrate_dest <story_json> <src_rig> — ga-6u64fm: pick
+# the destination rig NAME for an auto-migration out of a dog-store-blind
+# situation (_pilot_dog_store_blind_guard above). Mirrors the judgment the
+# Mayor already made BY HAND twice (gt-c1x1j -> gascity/HQ, since its fix
+# lives in packs/town-deltas/assets; gt-1u1u2 -> whatsapp_automation, since
+# its fix lives in that rig's own scripts/): if the bead's own title+
+# description names exactly ONE other registered rig's directory as a
+# literal path token (e.g. "whatsapp_automation/scripts/..."), that rig
+# owns the code and is the destination. Zero or more-than-one match
+# defaults to "gascity" (HQ) — the one store every dog AND the Mayor can
+# read, so a wrong/ambiguous guess never strands the bead worse than
+# before; it just means a human may still need to re-route it further,
+# exactly as already happens today via the park path this replaces.
+_pilot_dog_store_blind_migrate_dest() {
+  local _story_json="$1" _src_rig="$2"
+  local _text
+  _text=$(printf '%s' "$_story_json" | jq -r '(.title // "") + "\n" + (.description // "")' 2>/dev/null || echo "")
+  [ -z "$PILOT_RIG_PATHS_JSON" ] && rig_root_path "gascity" >/dev/null 2>&1   # force memoization
+  local _names
+  _names=$(printf '%s' "$PILOT_RIG_PATHS_JSON" | jq -r '.rigs[]?.name' 2>/dev/null || echo "")
+  local _match="" _match_count=0 _n
+  # Heredoc-fed `while read`, not `for n in $_names` — keeps one rig name per
+  # iteration regardless of shell word-splitting settings (same idiom as the
+  # sibling-worktree-rig block in quality-gate-dispatcher.sh, ga-mxwg89).
+  while IFS= read -r _n; do
+    [ -z "$_n" ] && continue
+    [ "$_n" = "gascity" ] && continue
+    [ "$_n" = "$_src_rig" ] && continue
+    case "$_text" in
+      *"$_n"/*)
+        _match="$_n"
+        _match_count=$((_match_count + 1))
+        ;;
+    esac
+  done <<EOF_RIGNAMES
+$_names
+EOF_RIGNAMES
+  if [ "$_match_count" -eq 1 ]; then
+    printf '%s' "$_match"
+  else
+    printf 'gascity'
+  fi
+}
+
+# _pilot_migrate_dog_store_blind_bead <story_id> <story_json> <src_city>
+# <src_rig> <story_labels_csv> — ga-6u64fm: auto-migrate a rig-native bead
+# the dog pool can never see (per _pilot_dog_store_blind_guard) into a store
+# some REAL builder actually reads, instead of only parking + asking a human
+# to do it by hand (the pre-existing ga-cszxcf behavior, which remains the
+# fallback on any abort/failure below — this function can never leave a
+# bead worse off than that already-safe behavior).
+#
+# Destination: _pilot_dog_store_blind_migrate_dest above.
+#
+# Race safety (bead-migration-copy-races memory; a real 2026-09-15 incident
+# where a hand-migration created an orphan duplicate because a dog claimed
+# the original in the gap between read and copy): re-reads the ORIGINAL
+# bead's live status+assignee immediately before creating the copy and
+# aborts if either is no longer "open"+unassigned. The copy is still created
+# BEFORE the close (bd close's own identity check is the authoritative FINAL
+# gate — an unassigned bead closes freely, but a bead some OTHER actor
+# claimed in the remaining race window refuses with "assignee is X, actor is
+# Y") — so a close refusal AFTER the copy exists must retract it: label
+# pilot:no-auto-dispatch first (stop it being dispatched before cleanup
+# finishes) then close it as a duplicate, exactly the manual recovery the
+# memory documents. Never leave two live copies of the same story.
+#
+# Echoes the new bead id and returns 0 on success; returns 1 (nothing
+# echoed) on any abort — the caller falls through to the existing park
+# behavior unchanged.
+#
+# ga-6u64fm: every warn/log call below is redirected to stderr (>&2)
+# explicitly — this file's shared warn()/log() helpers write to plain
+# stdout (echo, no >&2 of their own), which is harmless everywhere else in
+# this dispatcher but would be a real bug HERE: the caller captures this
+# function's stdout via command substitution to get the new bead id
+# ($(...)), so an un-redirected warn on any abort path would land IN that
+# captured string — making a FAILED migration read as "succeeded" with a
+# bogus id (a warning sentence, not a real bead id). Caught live by this
+# function's own selftest before it ever shipped.
+_pilot_migrate_dog_store_blind_bead() {
+  local _story_id="$1" _story_json="$2" _src_city="$3" _src_rig="$4" _story_labels="${5:-}"
+
+  # Re-check FRESH — never trust the sweep-start snapshot for a write this
+  # consequential (same discipline as _pilot_routed_to_pool_guard above).
+  local _live_json _live_status _live_assignee
+  _live_json=$(bd -C "$_src_city" show "$_story_id" --json 2>/dev/null)
+  _live_status=$(printf '%s' "$_live_json" | jq -r 'if type=="array" then .[0] else . end | .status // empty' 2>/dev/null || echo "")
+  _live_assignee=$(printf '%s' "$_live_json" | jq -r 'if type=="array" then .[0] else . end | .assignee // empty' 2>/dev/null || echo "")
+  if [ "$_live_status" != "open" ] || { [ -n "$_live_assignee" ] && [ "$_live_assignee" != "null" ]; }; then
+    warn "ga-6u64fm: $_story_id changed since dispatch selection (status=${_live_status:-<unreadable>} assignee=${_live_assignee:-<none>}) — skipping auto-migration, falling back to park." >&2
+    return 1
+  fi
+
+  local _dest_rig _dest_city
+  _dest_rig=$(_pilot_dog_store_blind_migrate_dest "$_story_json" "$_src_rig")
+  _dest_city=$(rig_root_path "$_dest_rig")
+  if [ -z "$_dest_city" ] || [ ! -d "$_dest_city" ]; then
+    _dest_city="$GC_CITY"
+    _dest_rig="gascity"
+  fi
+  if [ "$_dest_city" = "$_src_city" ]; then
+    # Unreachable given the guard only fires for _is_rig_native=1 (src != HQ)
+    # and dest defaults to HQ — cheap to assert rather than trust silently.
+    warn "ga-6u64fm: computed destination for $_story_id resolved to its OWN store ($_dest_city) — refusing to self-migrate, falling back to park." >&2
+    return 1
+  fi
+
+  local _title _priority _itype _desc _new_desc
+  _title=$(printf '%s' "$_story_json" | jq -r '.title // "untitled"')
+  _priority=$(printf '%s' "$_story_json" | jq -r '.priority // 2')
+  _itype=$(printf '%s' "$_story_json" | jq -r '.issue_type // "task"')
+  _desc=$(printf '%s' "$_story_json" | jq -r '.description // ""')
+  _new_desc="Movida de $_story_id (store $_src_rig, que nenhum builder le -- ga-cszxcf, automatico). Thread antiga: bd -C $_src_city comments $_story_id.
+
+== Descricao original ==
+$_desc"
+
+  local _new_id
+  _new_id=$(bd -C "$_dest_city" create \
+    "$_title" \
+    -t "$_itype" \
+    -p "$_priority" \
+    -l ctx:ready -l exec:auto -l story:approved \
+    --metadata "{\"gc.migrated_from\":\"$_story_id\",\"gc.migrated_from_rig\":\"$_src_rig\"}" \
+    -d "$_new_desc" \
+    --json 2>/dev/null | jq -r '.id // empty')
+
+  if [ -z "$_new_id" ]; then
+    warn "ga-6u64fm: bd create failed while auto-migrating $_story_id to $_dest_rig ($_dest_city) — falling back to park." >&2
+    return 1
+  fi
+
+  # Verify readback before trusting the id (ga-ehbw5 discipline: a write
+  # succeeding is not the same fact as the write being READABLE).
+  if ! bd -C "$_dest_city" show "$_new_id" >/dev/null 2>&1; then
+    warn "ga-6u64fm: created $_new_id for migrated $_story_id but it did not read back — treating as failed, falling back to park (orphan may need manual cleanup: bd -C $_dest_city show $_new_id)." >&2
+    return 1
+  fi
+
+  # Best-effort: carry over a lane:* label if the original had one. A failed
+  # add never blocks the migration — the bead is still fully dispatchable
+  # without it, just untiered for lane-capacity accounting.
+  case ",$_story_labels," in
+    *,lane:small,*)  bd -C "$_dest_city" label add "$_new_id" "lane:small"  -q 2>/dev/null || true ;;
+    *,lane:medium,*) bd -C "$_dest_city" label add "$_new_id" "lane:medium" -q 2>/dev/null || true ;;
+    *,lane:large,*)  bd -C "$_dest_city" label add "$_new_id" "lane:large"  -q 2>/dev/null || true ;;
+  esac
+
+  if bd -C "$_src_city" close "$_story_id" --reason \
+      "Movida para $_new_id ($_dest_rig, $_dest_city) -- ga-cszxcf, automatico: $_src_city nao e lido pelo probe de nenhum builder." \
+      -q 2>/dev/null; then
+    bd -C "$_dest_city" update "$_new_id" --set-metadata "gc.migrated_to_confirmed=1" -q 2>/dev/null || true
+    log "  ga-6u64fm: auto-migrated $_story_id ($_src_rig) -> $_new_id ($_dest_rig) -- original closed." >&2
+    printf '%s' "$_new_id"
+    return 0
+  fi
+
+  # Close refused -- someone claimed the original in the race window (or a
+  # genuine bd failure). Retract the orphan copy immediately: park it first
+  # so a concurrent Pilot sweep can never dispatch it before cleanup
+  # finishes, then close it as a duplicate. Never leave two live copies of
+  # the same story (bead-migration-copy-races).
+  warn "ga-6u64fm: close of original $_story_id failed after creating copy $_new_id (likely raced with a concurrent claim) — retracting the copy as a duplicate (bead-migration-copy-races)." >&2
+  bd -C "$_dest_city" label add "$_new_id" "pilot:no-auto-dispatch" -q 2>/dev/null || true
+  bd -C "$_dest_city" close "$_new_id" --reason \
+    "Retracted: auto-migration of $_story_id raced with a concurrent claim on the original (close refused) -- duplicate, original stays authoritative." \
+    -q 2>/dev/null || warn "ga-6u64fm: FAILED to retract orphan copy $_new_id — needs manual cleanup (close + pilot:no-auto-dispatch already attempted)." >&2
+  return 1
+}
+
 # _ns_label_blocks_release <labels_csv> — exit 0 (BLOCK release / KEEP) iff any
 # gate:* label OTHER than the story-level history markers gate:needs-fix /
 # gate:fix-attempt:N is present in the comma-joined label list. gate:needs-fix
@@ -10290,6 +10461,25 @@ TASK
         # on the Mayor's own queue per bead_state.py PARK_PREFIXES) + a
         # comment naming both remedies.
         if [ "${PILOT_DOG_STORE_GUARD:-1}" = "1" ] && _pilot_dog_store_blind_guard "$_SLING_TARGET" "$_IS_RIG_NATIVE"; then
+          # ── ga-6u64fm: try auto-migration FIRST — moves the story to a store
+          # a real builder reads instead of only parking + asking a human to
+          # do it by hand (systemic, 3rd occurrence: gt-c1x1j, gt-1u1u2 were
+          # both migrated this exact way, manually, before this fix existed).
+          # Independent kill switch: PILOT_DOG_STORE_AUTOMIGRATE=0 disables
+          # just the migration attempt, falling straight through to the
+          # unchanged park behavior below (which itself stays gated only by
+          # PILOT_DOG_STORE_GUARD, untouched by this addition).
+          local _MIGRATED_ID=""
+          if [ "${PILOT_DOG_STORE_AUTOMIGRATE:-1}" = "1" ]; then
+            _MIGRATED_ID=$(_pilot_migrate_dog_store_blind_bead "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" "$STORY_RIG" "$STORY_LABELS" || echo "")
+          fi
+          if [ -n "$_MIGRATED_ID" ]; then
+            log "  ga-6u64fm: $STORY_ID auto-migrated to $_MIGRATED_ID — original closed, no park needed (set PILOT_DOG_STORE_AUTOMIGRATE=0 to disable)."
+            bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+            bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+            DISPATCH_RESULT="rig_native_dog_store_migrated"
+            return 1
+          fi
           warn "ga-cszxcf: REFUSING rig-native dispatch of $STORY_ID to $_SLING_TARGET — $STORY_BEAD_CITY is not \$GC_CITY (HQ) and gastown.dog's pool probes only ever read HQ (no BEADS_DIR/GC_RIG set). Parking with pilot:no-auto-dispatch + next-action:mayor instead of stranding an assignment the dog can never see (set PILOT_DOG_STORE_GUARD=0 to disable)."
           bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:no-auto-dispatch" -q 2>/dev/null || true
           bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "next-action:mayor" -q 2>/dev/null || true
