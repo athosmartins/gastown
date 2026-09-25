@@ -5102,9 +5102,9 @@ vb_status_action() {
 # dispatcher-created run sharing this marker_id — calling this on BOTH PASS and
 # FAIL terminal paths supersedes any such still-running duplicate immediately.
 #
-# Usage: supersede_sibling_runs <marker_id> <branch> <bead_id>
+# Usage: supersede_sibling_runs <marker_id> <branch> <bead_id> [rig]
 supersede_sibling_runs() {
-  local this_marker="$1" branch="$2" bead_id="$3"
+  local this_marker="$1" branch="$2" bead_id="$3" rig="${4:-}"
   [ -z "$this_marker" ] && return 0
 
   local running_json count
@@ -5118,16 +5118,32 @@ supersede_sibling_runs() {
   count=$(echo "$running_json" | jq 'length' 2>/dev/null || echo "0")
   [ "$count" = "0" ] && return 0
 
-  local i sibling sibling_id sibling_desc sibling_marker
+  local i sibling sibling_id sibling_desc sibling_marker sibling_rig
   for i in $(seq 0 $((count - 1))); do
     sibling=$(echo "$running_json" | jq ".[$i]")
     sibling_id=$(echo "$sibling" | jq -r '.id')
     sibling_desc=$(echo "$sibling" | jq -r '.description // ""')
     sibling_marker=$(parse_marker_id "$sibling_desc")
+    sibling_rig=$(printf '%s\n' "$sibling_desc" | sed -n 's/^rig:[[:space:]]*\(.*\)$/\1/p' | head -1)
 
+    # ga-rhzbii: a bare source_bead: match used to supersede ANY sibling
+    # gate-run for the same bead, including one in a DIFFERENT rig/repo. A
+    # bead delivered as two branches in two rigs (e.g. HQ + whatsapp_
+    # automation) had its WA-repo run killed the instant the HQ run passed,
+    # even though the WA branch's own review had already reached PASS on
+    # its own merits and was simply waiting to merge (measured: ga-g7x0si).
+    # This dedup exists for a re-queued marker spawning a second run for
+    # ITSELF (same marker_id, checked first below, unconditional — a
+    # mismatch there would be a data-integrity bug elsewhere, not a
+    # legitimate cross-rig case) or a duplicate run of the SAME branch
+    # created by a dead-dispatcher retry — neither of those crosses a rig
+    # boundary. Require the sibling's rig to match this run's rig before the
+    # bead_id-only match fires, so a branch in a different repo for the same
+    # source-bead is left alone and stays queued.
     if [ "$sibling_marker" = "$this_marker" ] || \
-       { [ -n "$bead_id" ] && echo "$sibling_desc" | grep "source_bead: $bead_id" >/dev/null; }; then
-      log "  Superseding sibling gate-run $sibling_id (marker=$sibling_marker, branch=$branch)"
+       { [ -n "$bead_id" ] && [ -n "$rig" ] && [ "$sibling_rig" = "$rig" ] && \
+         echo "$sibling_desc" | grep "source_bead: $bead_id" >/dev/null; }; then
+      log "  Superseding sibling gate-run $sibling_id (marker=$sibling_marker, branch=$branch, rig=$rig)"
       set_gate_status "$sibling_id" "superseded"
       bd -C "$GC_CITY" comment "$sibling_id" "Dispatcher: gate-run superseded proactively on terminal path (marker $this_marker reached terminal; branch $branch). No need to wait for 90m TTL fallback. (ga-tmug Vector B)" 2>/dev/null || true
       # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
@@ -6426,6 +6442,11 @@ fi
       # unconditionally, mirroring how IS_PARTIAL is declared before its own
       # computation block.
       IS_DAEMON_HOLD=0
+      # ga-rhzbii: set inside the BUG/TASK close branch below when another
+      # gate marker/run for this SAME source-bead is still open (a bead
+      # delivered as branches in more than one repo/rig) — declared here for
+      # the same reason as IS_DAEMON_HOLD above.
+      IS_SIBLING_HOLD=0
       if [ "$IS_STORY" != "1" ]; then
         if printf '%s' "$SRC_LABELS" | grep "scope_covered:all" >/dev/null; then
           IS_PARTIAL=0
@@ -6931,6 +6952,32 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
               "$BRANCH" "$MERGE_SHA" "$BEAD_ID" "$DAEMON_HOLD_VERDICT" "$DAEMON_HOLD_REASON" "$DAEMON_HOLD_ACTION" "$BEAD_ID" "$RIG" "$BRANCH" "$GATE_RUN_ID")" \
             "daemon-hold on $BEAD_ID (ga-l7n3v)"
         else
+          # ga-rhzbii: before closing, check whether another gate marker/run
+          # is STILL OPEN for this same source-bead. A bead delivered as
+          # branches in more than one repo/rig (e.g. HQ + whatsapp_
+          # automation) gets one marker per repo, both correlated by
+          # source-bead:$BEAD_ID. Closing the bead the instant the FIRST
+          # branch merges permanently orphans the other repo's already-
+          # PASSED-but-unmerged branch: gate:passed (set above) already
+          # blocks Pilot re-dispatch, and a CLOSED source bead matches no
+          # re-spawn selector, so nothing would ever revisit it (measured
+          # live: ga-g7x0si — the WA marker was left stuck in gate-status:
+          # dispatching forever once the HQ marker's PASS closed the shared
+          # source bead). Mirrors story-delivery.sh's OPEN_SIBLINGS hold
+          # (ga-0m6tgc) for story:approved beads; bug/task closes had no
+          # equivalent guard. By this point in the sweep THIS run's own
+          # marker (Step 6/gate-status:passed transition, earlier) and
+          # gate-run bead (closed above at the PASS terminal transition) are
+          # already closed, so a non-empty result here can only be a
+          # genuinely different, still-open sibling.
+          OPEN_SIBLINGS_FOR_CLOSE=$(gate_bead_sibling_status_lines "$GC_CITY" "$BEAD_ID" 2>/dev/null || echo "")
+          if [ -n "$OPEN_SIBLINGS_FOR_CLOSE" ]; then
+            IS_SIBLING_HOLD=1
+            log "Source bug/task $BEAD_ID PASSED+merged but another gate marker/run for this source-bead is still open (ga-rhzbii) — holding, NOT closing:
+$OPEN_SIBLINGS_FOR_CLOSE"
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing yet (ga-rhzbii): at least one OTHER gate marker/run citing this bead via source-bead: is still open (not yet terminal):\n\n%s\n\nA bead delivered as branches in more than one repo/rig can have more than one marker; closing on the first PASS would silently orphan the rest while it waits to merge. Re-checked every dispatcher sweep — this closes automatically once every marker/run for this bead reaches a terminal state.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OPEN_SIBLINGS_FOR_CLOSE")" 2>/dev/null || true
+          else
           # BUG/TASK, daemon-verified (or check skipped/not applicable/degraded)
           # → close it as before. bd list defaults to OPEN-only, so closing
           # removes the bead from EVERY open-work selector (Pilot Tier-1 bug &
@@ -6969,6 +7016,7 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
           else
             warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
           fi
+          fi
         fi
       fi
 
@@ -6998,7 +7046,11 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
       #      ga-l7n3v: a held-as-delivery:pending-restart bead is exempt for
       #      the identical reason — deliberately left open+unassigned pending
       #      daemon verification, same gate:passed protection.
-      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ]; then
+      #      ga-rhzbii: a held-for-open-sibling-marker bead is exempt for the
+      #      same reason — deliberately left open+unassigned pending another
+      #      repo/rig's still-open gate marker/run for this source-bead,
+      #      same gate:passed protection.
+      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ] && [ "$IS_SIBLING_HOLD" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
       fi
@@ -7101,7 +7153,7 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
       NOTIFY_FORCE_DIGEST=1 notify -k gate-pass -t "Quality Gate PASSED" -p 2 "Branch $BRANCH merged to $DEFAULT_BRANCH — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
       log "Gate PASSED: branch=$BRANCH tier=$TIER merge_sha=$MERGE_SHA elapsed=${ELAPSED_S}s"
     fi
-    supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
+    supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID" "$RIG"
 else
   # ── FAIL path ─────────────────────────────────────────────────────────────
   # ga-xxgej: now also reached when OVERALL_VERDICT became FAIL mid-merge
@@ -7662,7 +7714,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
 
   # wa-uthi: TERMINAL FAIL (review rejected, definitive) — this push is KEPT.
   notify -t "Quality Gate FAILED" -p 3 "Branch $BRANCH failed review — $TIER, ${ELAPSED_S}s" 2>/dev/null || true
-  supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID"
+  supersede_sibling_runs "$MARKER_ID" "$BRANCH" "$BEAD_ID" "$RIG"
 fi
 
 # ── Step 11: Log to quality-gate.jsonl ───────────────────────────────────────
