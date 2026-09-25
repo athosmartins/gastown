@@ -1946,6 +1946,58 @@ rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-mq7hd-b"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-mq7hd-b" "T82: escalation still fires — genuinely dead assignee, no over-suppression from the new fresh-lookup path"
 
+# ── T83: crew with a SCHEDULED session (peter-wa: 07:00/19:00 touchpoints, ──
+# wa-14p4c) and NO live session right now → not a stall (ga-dyf4fb, Mayor's
+# 25/09 comment: 'Agente travado: wa-23c5n — 38min sem progresso
+# (assignee=peter-wa)' was a false positive — between touchpoints there is
+# no session at all, so "bead in_progress without writes" is the normal
+# state of the whole night). Suppressed log-only, counted in RESUMO — but
+# ONLY while the bead is younger than SCHEDULED_CREW_MAX_GAP_SEC (a bead
+# that outlives a whole touchpoint cycle really is orphaned) and ONLY for an
+# EXACT assignee match against the declared list (fail-open: anything not
+# proven scheduled keeps escalating exactly as before).
+echo "T83a: scheduled-session crew (peter-wa), no live session, bead younger than the gap cap → suppressed, log-only (ga-dyf4fb)"
+echo '{"sessions":[]}' > "$SESSIONS_FIXTURE"
+printf '[%s]' "$(make_bead ga-sched01 peter-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched01"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T83a: no mail — peter-wa between touchpoints is not stuck"
+assert_absent "$ACTIONS" "notify" "T83a: no notify — same"
+log_contains "T83a" "touchpoint agendado: 07:00/19:00" "T83a: log names the declared schedule, not just 'suppressed'"
+log_contains "T83a" "RESUMO: 1 bead(s) de crew com sessao agendada" "T83a: RESUMO reports the count instead of silence"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched01" ] && ok "T83a: no escalation state written (suppression is log-only)" || bad "T83a: unexpected state file on suppression"
+
+echo "T83b: scheduled-session crew but the bead outlived the gap cap → escalates anyway (a real orphan must surface)"
+printf '[%s]' "$(make_bead ga-sched02 peter-wa 4000)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched02"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 SCHEDULED_CREW_MAX_GAP_SEC=3000 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-sched02" "T83b: escalation fires — bead older than SCHEDULED_CREW_MAX_GAP_SEC"
+
+echo "T83c: SCHEDULED_CREWS explicitly EMPTY → declaration honoured, peter-wa escalates as before (kill-switch works)"
+printf '[%s]' "$(make_bead ga-sched03 peter-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched03"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 SCHEDULED_CREWS="" run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-sched03" "T83c: empty SCHEDULED_CREWS disables the exemption (no silent fallback to the default list)"
+
+echo "T83d: assignee only PREFIXED like a scheduled crew (peter-wa-x9) → exact match required, still escalates"
+printf '[%s]' "$(make_bead ga-sched04 peter-wa-x9 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched04"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-sched04" "T83d: prefix-lookalike assignee is NOT exempt (no glob/prefix matching)"
+
+echo "T83e: caller-supplied SCHEDULED_CREWS REPLACES the default list (thies-wa exempt, peter-wa no longer) — same pass, different outcomes"
+printf '[%s,%s]' "$(make_bead ga-sched05 thies-wa 2200)" "$(make_bead ga-sched06 peter-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched05" "$WORK/city/.gc/state/agent-stuck-escalation/ga-sched06"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 SCHEDULED_CREWS="thies-wa=09:00/15:00" run_script > /dev/null
+assert_absent "$ACTIONS" "Agente travado: ga-sched05" "T83e: thies-wa exempt under the caller-supplied list"
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-sched06" "T83e: peter-wa NOT exempt once the caller's list omits it (override replaces, never merges)"
+log_contains "T83e" "touchpoint agendado: 09:00/15:00" "T83e: log shows the CALLER's schedule label"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

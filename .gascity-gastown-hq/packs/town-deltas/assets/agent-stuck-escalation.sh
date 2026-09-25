@@ -182,6 +182,19 @@ RESUME_GRACE_SEC="${RESUME_GRACE_SEC:-900}"  # ga-nrkh92: prazo após o nudge de
 RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-3}"  # ga-dyf4fb: teto de retomadas por episódio antes de escalar (redesenho Opus 5.5, ponto 2) — um registro de retomada LEGADO/externo (sem contagem, 2 linhas) é tratado como já-no-teto, preservando o comportamento de retomada única pré-existente para quem já tinha um estado gravado
 IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-5}"  # ga-nrkh92: intervalo entre as 2 amostras de TIME acumulado do pane (pane_truly_idle)
 CREW_ELSEWHERE_ACTIVE_SEC="${CREW_ELSEWHERE_ACTIVE_SEC:-$(( ${TRANSCRIPT_FRESH_SEC:-3600} * 2 ))}"  # ga-dyf4fb: janela (deliberadamente MAIOR que TRANSCRIPT_FRESH_SEC) pra detectar "crew tocou a sessão recentemente, só não neste bead" — ver session_weakly_active_elsewhere()
+# ga-dyf4fb (Mayor, 25/09): crews com sessão AGENDADA — nascem uma sessão nova por touchpoint e não
+# há sessão viva entre um e outro, então "bead in_progress sem escrita, sem sessão" é o estado
+# NORMAL da noite toda, não travamento. Lista DECLARADA de "assignee=rótulo-do-horário" separados
+# por espaço (rótulo sem espaços; só o nome antes do "=" é comparado, o resto vai literal pro log).
+# `-` e não `:-` de propósito: SCHEDULED_CREWS="" explícito DESLIGA a isenção em vez de cair
+# silenciosamente no padrão. Fonte de verdade do horário = os plists com.whatsapp.peter-morning/
+# peter-evening (07:00/19:00, Weekday 1-5) + wa-14p4c; esta cópia só alimenta o texto do log — se
+# divergir, o erro é cosmético (a supressão é limitada por SCHEDULED_CREW_MAX_GAP_SEC abaixo).
+SCHEDULED_CREWS="${SCHEDULED_CREWS-peter-wa=07:00/19:00(seg-sex)}"
+# Teto da isenção: um bead de crew agendada mais velho que isto sobreviveu a um ciclo INTEIRO de
+# touchpoints (o maior vão é sex 19:00 → seg 07:00 = 60h), então é órfão de verdade e volta a
+# escalar. 72h = o vão do fim de semana + folga.
+SCHEDULED_CREW_MAX_GAP_SEC="${SCHEDULED_CREW_MAX_GAP_SEC:-259200}"
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 # Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
@@ -1149,6 +1162,41 @@ is_human_assignee() {
     esac
 }
 
+# scheduled_crew_label (ga-dyf4fb, Mayor 25/09): is $1 a crew DECLARED (in
+# $SCHEDULED_CREWS) to get a fresh session per scheduled touchpoint, with no
+# session at all in between? If so, prints its schedule label and returns 0.
+# Concrete case: 'Agente travado: wa-23c5n — 38min sem progresso
+# (assignee=peter-wa)' — peter-wa is born fresh at 07:00/19:00 (wa-14p4c), so
+# the idle-resume nudge has nobody to receive it and the alert is noise.
+#
+# EXACT name match only (no prefix/glob): "peter-wa-x9" is not "peter-wa".
+# A declared list can't be "unreadable" the way a live query can, so this is
+# two-state (0 = declared, 1 = not) — anything not proven declared returns 1
+# and keeps escalating exactly as before. Callers must ALSO bound the
+# exemption by bead age (SCHEDULED_CREW_MAX_GAP_SEC), so a bead that outlived
+# a whole touchpoint cycle still surfaces.
+#
+# bash 3.2 (/bin/bash on this machine) under `set -u` aborts on expanding an
+# EMPTY array, and SCHEDULED_CREWS="" (the kill-switch) yields exactly that —
+# hence the ${arr[@]+"${arr[@]}"} guard below.
+scheduled_crew_label() {
+    local who="$1" entry name label
+    local -a entries
+    [ -n "$who" ] || return 1
+    IFS=' ' read -r -a entries <<< "$SCHEDULED_CREWS"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        case "$entry" in
+            *=*) name="${entry%%=*}"; label="${entry#*=}" ;;
+            *)   name="$entry"; label="" ;;
+        esac
+        if [ -n "$name" ] && [ "$name" = "$who" ]; then
+            printf '%s' "${label:-horário não declarado}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # now_outside_active_window (ga-nrkh92, critério f): um bead pode declarar,
 # via metadata "gc.active_window" = "HH:MM-HH:MM" (hora local da máquina,
 # tolera virada de meia-noite), a janela em que sua ociosidade é ESPERADA e
@@ -1593,6 +1641,10 @@ fi
 # loop below runs via `<<<` (a here-string), NOT a piped `| while` — so it
 # does NOT spawn a subshell, and increments inside the loop are visible here.
 human_turn_count=0
+# scheduled_crew_count (ga-dyf4fb): same contract as human_turn_count above —
+# beads exempted because their assignee is a scheduled-session crew with no
+# live session between touchpoints, reported in RESUMO, never silently dropped.
+scheduled_crew_count=0
 
 # ── Process each stuck bead ───────────────────────────────────────────────────
 while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
@@ -2010,6 +2062,24 @@ BODY
         continue
     fi
 
+    # ga-dyf4fb (Mayor 25/09): crew com sessão AGENDADA e NENHUMA sessão viva
+    # agora — entre touchpoints não existe sessão pra retomar nem pra estar
+    # "travada", então isto não é travamento. Só chega aqui com sessão
+    # confirmadamente ausente (todos os probes acima já falharam em achá-la),
+    # então uma sessão viva-e-congelada de peter-wa durante o touchpoint segue
+    # pelos ramos normais abaixo. Limitado por idade: um bead mais velho que
+    # SCHEDULED_CREW_MAX_GAP_SEC sobreviveu a um ciclo inteiro de touchpoints e
+    # volta a escalar. FAIL-OPEN: se $age_secs/o teto não forem numéricos o
+    # `[ -lt ]` falha (rc=2) e cai na escalação normal — nunca suprime por
+    # dado ilegível. Log-only + contador no RESUMO, sem mail/notify/estado.
+    if [ -z "$live_session_name" ] \
+        && sched_label="$(scheduled_crew_label "$assignee")" \
+        && [ "$age_secs" -lt "$SCHEDULED_CREW_MAX_GAP_SEC" ] 2>/dev/null; then
+        scheduled_crew_count=$((scheduled_crew_count + 1))
+        log "$bead_id: bead.updated_at parado ${age_min}min — assignee=$assignee é crew com sessão AGENDADA (touchpoint agendado: $sched_label) e não há sessão viva agora — SUPRIMINDO escalação (esperado entre touchpoints; teto ${SCHEDULED_CREW_MAX_GAP_SEC}s, ga-dyf4fb)"
+        continue
+    fi
+
     log "$bead_id: STUCK ${age_min}min — assignee=$assignee sess=$sess_status transcript=$transcript_note labels=$labels"
 
     # ga-nrkh92: sem sessão viva pra retomar (assignee confirmado
@@ -2243,6 +2313,9 @@ done <<< "$STUCK_ITEMS"
 # same shape as gate-orphaned-label-watchdog.sh's "PARK:" line (ga-cjk1j).
 if [ "$human_turn_count" -gt 0 ]; then
     log "RESUMO: ${human_turn_count} bead(s) na fila do humano (next-action:athos/story:needs-approval/story:refino-escalado/gate:needs-human:product) — nao contam para escalacao (ga-fkc1vx)."
+fi
+if [ "$scheduled_crew_count" -gt 0 ]; then
+    log "RESUMO: ${scheduled_crew_count} bead(s) de crew com sessao agendada sem sessao viva agora (SCHEDULED_CREWS=${SCHEDULED_CREWS}) — nao contam para escalacao enquanto < ${SCHEDULED_CREW_MAX_GAP_SEC}s (ga-dyf4fb)."
 fi
 
 log "=== pass complete ==="
