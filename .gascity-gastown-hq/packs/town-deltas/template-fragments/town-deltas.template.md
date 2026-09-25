@@ -356,19 +356,56 @@ de beads — NÃO se tocam na orquestração. (A doutrina antiga "WA fica no 330
 mail-bridge, nunca spawnar worker no WA" está OBSOLETA — o Overseer decidiu a
 migração COMPLETA de todos os rigs pro Gas City.)
 
-**Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: S3 presigned URL.**
-⚠️ O bucket é PÚBLICO (`PublicReadAccess` + ACLs desligadas) — `presign` é decorativo,
-não protege nem expira; a distro CloudFront (`dnroc49bwlbis.cloudfront.net`) também
-serve sem gate. Única barreira real = obscuridade da chave (wa-68jmm/wa-3o6wf).
-NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O Athos DECIDE VENDO no celular.
-Fluxo obrigatório:
-1. Chave de alta entropia: `python3 -c "import secrets; print(secrets.token_hex(8))"`
-2. `aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"`
-3. `aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800`
-4. Envie ao Athos o URL presigned.
+**Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: S3 presigned URL + 3-4
+direções em múltipla escolha antes de construir a versão final (ga-g7x0si).**
+⚠️ `mockups/*` (idem `backups/*`/`estudos/*`/`discador-mockups/*`/
+`pending_drafts.json`) tem Deny explícito de leitura anônima na policy do
+bucket (`DenyAnonymousReadOnBackupsDraftsAndMockups`) — verificado direto na
+policy viva, não só no relato: GET sem assinatura dá 403, GET presigned dá
+200, porque a assinatura carrega `aws:PrincipalAccount` e o Deny só bate
+quando essa conta DIFERE da dona (549710416969). Ou seja, hoje `presign`
+PROTEGE de verdade — a redação anterior aqui ("presign é decorativo") ficou
+stale e está corrigida. A distro CloudFront segue sem gate (não passa pela
+assinatura) — nunca linke por ela pra esses prefixos, só a URL presigned do
+S3. Continue gerando chave de alta entropia por arquivo: é defesa em
+profundidade, não a única barreira.
+
+NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O
+Athos DECIDE VENDO no celular — e decide em MÚLTIPLA ESCOLHA (Regra Nº 1),
+nunca escolhendo em prosa livre entre links soltos numa mensagem.
+
+**Mockup NOVO (1ª versão de uma tela/fluxo) → gere 3-4 DIREÇÕES visuais
+distintas antes da versão final, nunca construa direto uma só:**
+1. Rascunhe 3-4 direções para a MESMA tela variando paleta, tipografia e
+   densidade (não só cor de botão) — cada uma com 1 frase de tradeoff (o que
+   ganha / o que perde escolhendo aquela).
+2. Nomeie no PRÓPRIO prompt de geração os padrões de "visual padrão de IA" a
+   evitar em cada direção — não confie em lembrar sem listar: gradiente
+   roxo/azul genérico de hero, cards todos do mesmo tamanho em grade, emoji
+   como ícone, sombra difusa em tudo, tipografia default do framework sem
+   hierarquia. (Guia mais fundo, com o porquê de cada um: skill
+   `frontend-design`.)
+3. Publique as 3-4 direções, uma chave de alta entropia por arquivo:
+   ```bash
+   python3 -c "import secrets; print(secrets.token_hex(8))"   # uma por direção
+   aws s3 cp <dirN.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --content-type "text/html; charset=utf-8"
+   aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --expires-in 604800
+   ```
+4. Pergunte via **AskUserQuestion** qual direção seguir: uma opção por
+   direção (URL + o tradeoff da frase acima na descrição), 1ª opção = SUA
+   recomendação (Regra Nº 1). Nunca mande os 3-4 links soltos pedindo "qual
+   você prefere" em texto livre — a pergunta É a escolha entre as opções.
+5. Só depois de escolhida a direção, construa/refine a versão final nela.
+
+**Ajuste incremental num mockup JÁ aprovado** (mudar texto, corrigir bug
+visual, adicionar uma seção): não repita as 3-4 direções — publique só a
+versão atualizada pelo mesmo fluxo de chave+presign. Se o ajuste for decisão
+de produto (não visual), pergunta múltipla-escolha normal serve; não precisa
+reconstruir alternativas visuais pra isso.
 
 🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado
-que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+que identifique uma pessoa específica nesse bucket — o link é público pra
+quem tiver a URL, pra sempre.
 
 **Filesystem de rede / CloudStorage pode PENDURAR a sessão (ga-khuz1).** NUNCA
 rode `ls`/`find`/`stat`/`cat`/`grep` direto contra paths do Google Drive ou
