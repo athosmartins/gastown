@@ -97,8 +97,21 @@ DEATH_LOG_DIR="${DOLT_WATCHDOG_DEATH_LOG_DIR:-$CITY/.gc/logs}"
 
 # Read-only capture: everything here only READS system/log state and writes
 # ONE new file under DEATH_LOG_DIR. Never signals or restarts anything.
+#
+# Every section that embeds text we do not control is bounded per line (SNAP_LINE_MAX
+# / SNAP_PS_LINE_MAX) and, for ps, per count. Measured 2026-09-25: an unbounded
+# `ps -ef | grep -i dolt` matched every `claude` agent session — each one carries its
+# whole system prompt (which mentions "dolt") in argv, ~100 KB per line — and made a
+# single snapshot 1.1 MB, 90% of the file, all of it burying the dolt/supervisor rows
+# this file exists to show. Snapshots are never rotated and PID changes cluster (a
+# flapping night writes many), on a disk that has already run out of space once.
+SNAP_LINE_MAX=1000
+SNAP_PS_LINE_MAX=240
+SNAP_PS_MAX_LINES=120
+SNAP_LOG_MAX_LINES=1000
+SNAP_LOG_TIMEOUT="${DOLT_WATCHDOG_SNAP_LOG_TIMEOUT:-30}"
 capture_death_snapshot() {
-  local _old="$1" _new="$2" _ts _out
+  local _old="$1" _new="$2" _ts _out _lg _lg_rc _lg_n
   _ts="$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "$DEATH_LOG_DIR" 2>/dev/null || true
   _out="$DEATH_LOG_DIR/dolt-death-${_ts}.txt"
@@ -109,18 +122,36 @@ capture_death_snapshot() {
     echo "current_pid:  ${_new:-<none>}"
     echo
     echo "--- dolt-state.json (current supervisor record) ---"
-    cat "$CITY/.gc/runtime/packs/dolt/dolt-state.json" 2>/dev/null || echo "(not found)"
+    { cat "$CITY/.gc/runtime/packs/dolt/dolt-state.json" 2>/dev/null || echo "(not found)"; } \
+      | cut -c1-"$SNAP_LINE_MAX" | head -20
     echo
     echo "--- log show --last 3m: dolt / memorystatus / jetsam / tcp_close / signals ---"
-    timeout 30 log show --last 3m --predicate \
+    # Truncation and timeout are stated IN the file, never silent: under memory pressure
+    # (the incident's own condition) jetsam/memorystatus lines alone fill the cap, and
+    # `tail` keeps the NEWEST lines, so the oldest part of the window -- possibly the very
+    # moment of death -- is what drops. A reader must be able to tell "nothing happened
+    # before T" from "the file stopped looking before T".
+    _lg="$(timeout "$SNAP_LOG_TIMEOUT" log show --last 3m --predicate \
       'eventMessage contains "dolt" OR eventMessage contains "memorystatus" OR eventMessage contains "jetsam" OR eventMessage contains "tcp_close" OR eventMessage contains "SIGKILL" OR eventMessage contains "SIGQUIT" OR eventMessage contains "SIGTERM"' \
-      2>&1 | tail -1000
+      2>&1)"
+    _lg_rc=$?
+    _lg_n="$(printf '%s\n' "$_lg" | grep -c . || true)"
+    [ "$_lg_rc" -eq 124 ] && echo "(!! log show TIMED OUT after ${SNAP_LOG_TIMEOUT}s -- the lines below are PARTIAL, the window is NOT fully covered)"
+    [ "$_lg_n" -gt "$SNAP_LOG_MAX_LINES" ] && echo "(!! TRUNCATED: showing the newest ${SNAP_LOG_MAX_LINES} of ${_lg_n} matching lines -- the oldest $((_lg_n - SNAP_LOG_MAX_LINES)) were dropped)"
+    printf '%s\n' "$_lg" | tail -"$SNAP_LOG_MAX_LINES" | cut -c1-"$SNAP_LINE_MAX"
     echo
     echo "--- ps: supervisor + dolt process tree (snapshot at capture time) ---"
-    ps -ef 2>/dev/null | { head -1; grep -i dolt; } | grep -v ' grep -i dolt'
+    # Single-pass awk (header + rows mentioning dolt), NOT `{ head -1; grep; }`: on a pipe
+    # `head` reads a whole block rather than one line and the grep never sees what it
+    # swallowed -- measured 40/40 runs losing the dolt sql-server row against a fast writer,
+    # so whether the rows survived depended on how `ps` happened to chunk its output.
+    # `d[o]lt` keeps awk's own argv from matching itself in the process table.
+    ps -ef 2>/dev/null | awk 'NR == 1 || tolower($0) ~ /d[o]lt/' \
+      | cut -c1-"$SNAP_PS_LINE_MAX" | head -"$SNAP_PS_MAX_LINES"
     echo
     echo "--- last 50 lines of dolt.log ---"
-    tail -50 "$CITY/.gc/runtime/packs/dolt/dolt.log" 2>/dev/null || echo "(not found)"
+    { tail -50 "$CITY/.gc/runtime/packs/dolt/dolt.log" 2>/dev/null || echo "(not found)"; } \
+      | cut -c1-"$SNAP_LINE_MAX"
     echo
     echo "--- short-lived 'dolt' CLI process count in the last 60s (ga-oyw1tw burst lead) ---"
     timeout 20 log show --last 1m --predicate \

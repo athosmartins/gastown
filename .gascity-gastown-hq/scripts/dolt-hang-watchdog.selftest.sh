@@ -362,6 +362,95 @@ FAKE
     && ok "DRY-RUN reports the PID-change branch it would have taken (not silent)" \
     || bad "DRY-RUN did not report the simulated PID change"
 
+  # (6) The snapshot must be BOUNDED. Measured 2026-09-25: `ps -ef | grep -i dolt`
+  #     matched every `claude` agent session (its whole system prompt, which says
+  #     "dolt", sits in argv: ~100 KB per line) and one snapshot came out 1.1 MB,
+  #     90% of it that section, burying the dolt/supervisor rows. A fake `ps -ef`
+  #     reproduces that shape; any other `ps` call falls through to the real one so
+  #     the rest of the script is unaffected.
+  cat > "$_tmpd4/bin/ps" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-ef" ]; then
+  echo "  UID   PID  PPID   C STIME   TTY           TIME CMD"
+  echo "  501 63228     1   0  8:00AM ??         1:00.00 /opt/homebrew/bin/dolt sql-server --config /x/dolt-config.yaml"
+  for _i in 1 2 3; do
+    printf '  501 4110%s 25378   0  8:11AM ttys008    0:34.05 claude --append-system-prompt ' "$_i"
+    head -c 100000 /dev/zero | tr '\0' 'x'
+    echo " ... mentions dolt ..."
+  done
+  exit 0
+fi
+exec /bin/ps "$@"
+FAKE
+  chmod +x "$_tmpd4/bin/ps"
+  rm -f "$_deaths"/dolt-death-*.txt
+  echo 5555 > "$_lastpid"
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE=6666 bash "$SRC" >/dev/null 2>&1
+  _snap6="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+  if [ -n "$_snap6" ]; then
+    _ps6="$(awk '/^--- ps:/{f=1;next} /^--- /{f=0} f' "$_snap6")"
+    printf '%s' "$_ps6" | grep -q 'dolt sql-server --config /x/dolt-config.yaml' \
+      && ok "bounded ps section still shows the real dolt sql-server row" \
+      || bad "ga-xyhl9d: ps section lost the dolt sql-server row"
+    _psmax="$(printf '%s\n' "$_ps6" | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+    [ "$_psmax" -le 240 ] && ok "ps section lines are capped (longest ${_psmax} chars, 3 x 100 KB argv fed in)" \
+                          || bad "ga-xyhl9d regressao: ps section has a ${_psmax}-char line -- unbounded argv leaked into the snapshot"
+    _allmax="$(awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$_snap6")"
+    [ "$_allmax" -le 1000 ] && ok "no line anywhere in the snapshot exceeds 1000 chars (longest ${_allmax})" \
+                            || bad "ga-xyhl9d regressao: snapshot has a ${_allmax}-char line -- some section embeds unbounded external text"
+  else
+    bad "ga-xyhl9d: bounded-snapshot case produced no snapshot file at all"
+  fi
+
+  # (7) Truncation and timeout of the `log show` window must be STATED in the file,
+  #     not silent. Measured 2026-09-25: under memory pressure jetsam/memorystatus lines
+  #     alone filled the 1000-line cap and `tail` dropped the oldest ~47s of the 3-minute
+  #     window -- the part that would hold the moment of death -- with nothing in the file
+  #     saying so. A fake `log` answers only the forensic (--last 3m) window.
+  cat > "$_tmpd4/bin/log" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in *"--last 3m"*) ;; *) exit 0 ;; esac
+case "${FAKE_LOG_MODE:-}" in
+  many) i=0; while [ "$i" -lt 1500 ]; do echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: seq=$i;"; i=$((i+1)); done ;;
+  slow) echo "partial-line-before-timeout"; sleep 5 ;;
+  few)  echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: seq=0;" ;;
+esac
+FAKE
+  chmod +x "$_tmpd4/bin/log"
+  _run7() {  # $1 = FAKE_LOG_MODE, $2 = extra env (or empty); leaves the newest snapshot path in $_snap7
+    rm -f "$_deaths"/dolt-death-*.txt; echo 7000 > "$_lastpid"
+    env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" FAKE_LOG_MODE="$1" $2 \
+        DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+        DOLT_WATCHDOG_PID_OVERRIDE=7001 bash "$SRC" >/dev/null 2>&1
+    _snap7="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+  }
+
+  _run7 many ""
+  if [ -n "$_snap7" ]; then
+    grep -q 'TRUNCATED: showing the newest 1000 of 1500 matching lines -- the oldest 500 were dropped' "$_snap7" \
+      && ok "log window over the cap -> snapshot states the truncation (newest 1000 of 1500)" \
+      || bad "ga-xyhl9d: log window truncated 1500 -> 1000 with NO note in the snapshot (silent truncation)"
+    grep -q 'seq=1499;' "$_snap7" && ! grep -q 'seq=0;' "$_snap7" \
+      && ok "truncation keeps the newest lines and drops the oldest (seq=1499 kept, seq=0 dropped)" \
+      || bad "ga-xyhl9d: truncation did not keep newest/drop oldest as documented"
+  else bad "ga-xyhl9d: truncation case produced no snapshot file"; fi
+
+  _run7 few ""
+  if [ -n "$_snap7" ]; then
+    { ! grep -q 'TRUNCATED' "$_snap7" && ! grep -q 'TIMED OUT' "$_snap7"; } \
+      && ok "small window -> no truncation / timeout note (markers are not unconditional)" \
+      || bad "ga-xyhl9d: a 1-line window carried a TRUNCATED/TIMED OUT note -- the markers fire unconditionally"
+  else bad "ga-xyhl9d: control case produced no snapshot file"; fi
+
+  _run7 slow "DOLT_WATCHDOG_SNAP_LOG_TIMEOUT=1"
+  if [ -n "$_snap7" ]; then
+    grep -q 'log show TIMED OUT after 1s' "$_snap7" \
+      && ok "log show timeout -> snapshot says the window is PARTIAL (not silent)" \
+      || bad "ga-xyhl9d: log show timed out with NO note in the snapshot (silent partial window)"
+  else bad "ga-xyhl9d: timeout case produced no snapshot file"; fi
+
   rm -rf "$_tmpd4"
 else
   bad "nao achei o script ao lado — asserts de PID-change nao rodaram"
