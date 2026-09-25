@@ -1070,6 +1070,100 @@ n3="$(BACKUP_FAIL_STREAK_DIR="$BFS_STATE_DIR" _backup_fail_streak_note_failure "
 
 rm -rf "$BFS_STATE_DIR" 2>/dev/null || true
 
+# ── persistence failure is its OWN state, never "1" and never a fabricated
+# threshold hit (gate feedback ga-c3sqn1): the counter lives on the disk whose
+# exhaustion causes these failures, so "couldn't record it" is a likely state.
+# Before this fix `echo "$n" > "$f"` was unchecked — a failed write returned
+# the freshly-computed $n as if durable, the next night re-read nothing and
+# counted 1 again, and the 2+-nights escalation could never fire.
+echo "── _backup_fail_streak_note_failure: persistence failure ≠ success (gate ga-c3sqn1) ──"
+BFP_ROOT="$(mktemp -d)"
+_BFP_SAVE_LOG="$LOG"; LOG="$BFP_ROOT/log"   # never write test lines to the live backup log
+_bfp_run() {  # <dir> <db> → BFP_OUT (stdout), BFP_RC (status)
+  BFP_OUT="$(BACKUP_FAIL_STREAK_DIR="$1" _backup_fail_streak_note_failure "$2")"; BFP_RC=$?
+}
+_bfp_count() {  # <dir> [name-glob] → number of entries (dotfiles included) in <dir> whose name matches
+  local c=0 e pat="${2:-*}"
+  for e in "$1"/* "$1"/.[!.]*; do
+    [ -e "$e" ] || continue
+    # shellcheck disable=SC2254  # $pat is deliberately an unquoted glob pattern
+    case "${e##*/}" in $pat) c=$((c+1)) ;; esac
+  done
+  echo "$c"
+}
+
+# (a) state dir cannot be created (parent component is a regular file).
+: > "$BFP_ROOT/afile"
+_bfp_run "$BFP_ROOT/afile/sub" hq
+{ [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+  && ok "mkdir failure → rc=1 and NO count on stdout (not a fabricated threshold hit)" \
+  || bad "mkdir failure: expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+
+# (b) THE reviewer's scenario: dir exists (mkdir -p trivially succeeds) but the
+# write/rename fails. `mv` is shadowed by a function so this is deterministic
+# even as root; the previous night's count must survive the failed attempt.
+BFP_B="$BFP_ROOT/b"; mkdir -p "$BFP_B"
+_bfp_run "$BFP_B" hq
+{ [ "$BFP_RC" -eq 0 ] && [ "$BFP_OUT" = "1" ]; } && ok "baseline: 1st failure persisted (rc=0, count 1)" || bad "baseline failed: rc=$BFP_RC out='$BFP_OUT'"
+mv() { return 1; }
+_bfp_run "$BFP_B" hq
+unset -f mv
+{ [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+  && ok "write/rename failure on an EXISTING dir → rc=1, no count (was: returned the unpersisted \$n as if durable)" \
+  || bad "write failure on existing dir: expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+[ "$(cat "$BFP_B/hq" 2>/dev/null)" = "1" ] \
+  && ok "failed write did not destroy the previous night's count (still 1) — temp-file+rename, not truncate-in-place" \
+  || bad "previous count damaged by a failed write: '$(cat "$BFP_B/hq" 2>/dev/null)'"
+[ "$(_bfp_count "$BFP_B" '*.tmp.*')" = "0" ] && ok "failed write left no temp file behind" || bad "temp file leaked after failed write ($(_bfp_count "$BFP_B" '*.tmp.*') matching entries in $BFP_B)"
+
+# (c) write "succeeds" but the value on disk is not what we computed.
+BFP_C="$BFP_ROOT/c"; mkdir -p "$BFP_C"
+mv() { printf '99\n' > "$3"; }
+_bfp_run "$BFP_C" hq
+unset -f mv
+{ [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+  && ok "read-back mismatch → rc=1 (the effect is verified, not the exit code)" \
+  || bad "read-back mismatch: expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+
+# (d) an existing counter that cannot be READ is "unknown", not "no history".
+BFP_D="$BFP_ROOT/d"; mkdir -p "$BFP_D/hq"      # a directory sits where the counter file should be
+_bfp_run "$BFP_D" hq
+{ [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+  && ok "existing-but-unreadable counter → rc=1 (was: silently read as 0 and reset to 1)" \
+  || bad "unreadable existing counter: expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+
+# (e) a REAL filesystem refusal (read-only dir), when not root (root bypasses modes).
+if [ "$(id -u)" != "0" ]; then
+  BFP_E="$BFP_ROOT/e"; mkdir -p "$BFP_E"; chmod 555 "$BFP_E"
+  _bfp_run "$BFP_E" hq
+  chmod 755 "$BFP_E"
+  { [ "$BFP_RC" -eq 1 ] && [ -z "$BFP_OUT" ]; } \
+    && ok "real read-only state dir (chmod 555) → rc=1, no count" \
+    || bad "read-only state dir: expected rc=1 + empty stdout, got rc=$BFP_RC out='$BFP_OUT'"
+else
+  echo "  SKIP: real read-only dir case (running as root — modes are bypassed; (b) covers the same path)"
+fi
+
+# (f) the healthy path leaves exactly one file per db and no temp litter.
+BFP_F="$BFP_ROOT/f"; mkdir -p "$BFP_F"
+_bfp_run "$BFP_F" hq; _bfp_run "$BFP_F" hq
+{ [ "$BFP_OUT" = "2" ] && [ "$(_bfp_count "$BFP_F")" = "1" ]; } \
+  && ok "healthy path: count 2 after 2 failures, exactly one file, no temp litter" \
+  || bad "healthy path: out='$BFP_OUT' entries=$(_bfp_count "$BFP_F")"
+
+# _backup_fail_note routes an UNKNOWN streak to its own list — never into
+# ESCALATE_DBS (that would claim a confirmed streak nobody counted).
+BACKUP_FAIL_STREAK_DIR="$BFP_ROOT/afile/sub"; BACKUP_FAIL_ALARM_THRESHOLD=2
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+_backup_fail_note "hq"
+[ "$FAILED_DBS_STREAK" = " hq(?n)" ] && ok "unknown streak shown as hq(?n) in the summary, not a number" || bad "unexpected FAILED_DBS_STREAK for unknown streak: '$FAILED_DBS_STREAK'"
+[ -z "$ESCALATE_DBS" ] && ok "unknown streak is NOT recorded as a confirmed threshold hit (ESCALATE_DBS empty)" || bad "unknown streak leaked into ESCALATE_DBS='$ESCALATE_DBS'"
+[ "$UNKNOWN_STREAK_DBS" = " hq" ] && ok "unknown streak recorded in UNKNOWN_STREAK_DBS" || bad "UNKNOWN_STREAK_DBS='$UNKNOWN_STREAK_DBS'"
+grep -qF "hq: contador de noites seguidas ilegível" "$LOG" && ok "unknown streak is logged" || bad "unknown streak not logged in $LOG"
+unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD FAILED_DBS_STREAK ESCALATE_DBS UNKNOWN_STREAK_DBS
+LOG="$_BFP_SAVE_LOG"; unset _BFP_SAVE_LOG BFP_OUT BFP_RC
+rm -rf "$BFP_ROOT" 2>/dev/null || true
+
 # ── _backup_fail_note() — pure accumulation into FAILED_DBS_STREAK (the
 # per-store "quantos dias sem backup OK" the final summary line names) and
 # ESCALATE_DBS (only once a streak crosses BACKUP_FAIL_ALARM_THRESHOLD).
@@ -1164,8 +1258,82 @@ _backup_fail_note "hq"
 _backup_escalate_if_needed
 [ ! -s "$ESC_MAIL_CALLS" ] && ok "night 3 (after a success reset the streak): a lone new failure does NOT re-escalate" || bad "night 3: streak reset did not take effect — mail fired again on a single post-reset failure"
 
+# ── gate feedback ga-c3sqn1: the counter can't be written. THE reviewer's
+# scenario — the state dir EXISTS (so `mkdir -p` trivially succeeds) but the
+# write fails, on two nights running. Before the fix each night returned a
+# fresh "1", the streak never reached the threshold and the escalation was
+# silently defeated exactly when disk pressure was the cause. `mv` is shadowed
+# (function) so the failure is deterministic even as root.
+echo "── e2e: contador NÃO grava (dir existe, escrita falha) → escala como sequência DESCONHECIDA (gate ga-c3sqn1) ──"
+ESC_STATE_DIR_U="$(mktemp -d)"
+BACKUP_FAIL_STREAK_DIR="$ESC_STATE_DIR_U"
+mv() { return 1; }
+for night in 1 2; do
+  : > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+  FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+  _backup_fail_note "hq"
+  _backup_escalate_if_needed
+  [ -s "$ESC_MAIL_CALLS" ] && ok "unwritable counter, night $night: escalation FIRES (was: silently never)" || bad "unwritable counter, night $night: no mail — the escalation is silently defeated"
+  grep -qF "DESCONHECIDA" "$ESC_MAIL_CALLS" && ok "unwritable counter, night $night: mail says the streak is DESCONHECIDA" || bad "unwritable counter, night $night: mail does not admit the streak is unknown — got: $(cat "$ESC_MAIL_CALLS")"
+  grep -qF "por ${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas" "$ESC_MAIL_CALLS" && bad "unwritable counter, night $night: mail CLAIMS a confirmed ${BACKUP_FAIL_ALARM_THRESHOLD}+ night streak nobody counted" || ok "unwritable counter, night $night: mail does not claim a confirmed streak"
+  grep -qF "FORCE=1" "$ESC_NOTIFY_CALLS" && ok "unwritable counter, night $night: forced push fired" || bad "unwritable counter, night $night: no forced push — got: $(cat "$ESC_NOTIFY_CALLS")"
+done
+unset -f mv
+
+# Mixed run: hq has a CONFIRMED 2-night streak; whatsapp_automation's counter
+# can't be written (mv shadow fails only for that db). One mail, both stated,
+# the subject leads with the confirmed streak.
+echo "── e2e: hq confirmado (2n) + whatsapp_automation desconhecido → 1 mail nomeando os dois ──"
+# shellcheck disable=SC2034  # read by the sourced lib's _backup_fail_streak_note_* functions
+BACKUP_FAIL_STREAK_DIR="$ESC_STATE_DIR"
+_backup_fail_streak_note_success "hq"; _backup_fail_streak_note_success "whatsapp_automation"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+_backup_fail_note "hq"; _backup_fail_note "whatsapp_automation"     # night A: both 1, nothing escalates
+_backup_escalate_if_needed
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+mv() { case "$3" in */whatsapp_automation) return 1 ;; esac; command mv "$@"; }
+_backup_fail_note "hq"; _backup_fail_note "whatsapp_automation"     # night B: hq→2n, wa→unknown
+unset -f mv
+_backup_escalate_if_needed
+[ "$ESCALATE_DBS" = " hq(2n)" ] && ok "mixed: only hq is a confirmed streak (ESCALATE_DBS=' hq(2n)')" || bad "mixed: ESCALATE_DBS='$ESCALATE_DBS'"
+[ "$UNKNOWN_STREAK_DBS" = " whatsapp_automation" ] && ok "mixed: whatsapp_automation is the unknown one" || bad "mixed: UNKNOWN_STREAK_DBS='$UNKNOWN_STREAK_DBS'"
+case "$FAILED_DBS_STREAK" in *"hq(2n)"*"whatsapp_automation(?n)"*) ok "mixed: summary names hq(2n) and whatsapp_automation(?n)" ;; *) bad "mixed: FAILED_DBS_STREAK='$FAILED_DBS_STREAK'" ;; esac
+[ "$(wc -l < "$ESC_MAIL_CALLS" | tr -d ' ')" = "1" ] && ok "mixed: exactly ONE mail for the run (not one per db)" || bad "mixed: expected 1 mail, got: $(cat "$ESC_MAIL_CALLS")"
+{ grep -qF "SUBJECT=Dolt S3 backup: sem backup off-box há ${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas" "$ESC_MAIL_CALLS" \
+  && grep -qF "hq(2n)" "$ESC_MAIL_CALLS" && grep -qF "whatsapp_automation" "$ESC_MAIL_CALLS" && grep -qF "DESCONHECIDA" "$ESC_MAIL_CALLS"; } \
+  && ok "mixed: subject leads with the confirmed streak; body names hq(2n) AND the unknown whatsapp_automation" \
+  || bad "mixed: mail content wrong — got: $(cat "$ESC_MAIL_CALLS")"
+
+# The push must not claim a mail that did not go out (do_mail_mayor used to
+# end in `|| true`, so "mail enviado ao Mayor" was printed unconditionally).
+echo "── e2e: mail ao Mayor FALHA → o push não afirma que o mail foi enviado ──"
+cat > "$ESC_STUB_DIR/fake_mail_fail" <<'STUB'
+#!/bin/bash
+exit 1
+STUB
+chmod +x "$ESC_STUB_DIR/fake_mail_fail"
+_backup_fail_streak_note_success "hq"
+BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail_fail"
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+_backup_fail_note "hq"; FAILED_DBS_STREAK=""; ESCALATE_DBS=""
+_backup_fail_note "hq"            # 2nd consecutive → confirmed escalation, but the mail send FAILS
+_backup_escalate_if_needed
+grep -qF "FORCE=1" "$ESC_NOTIFY_CALLS" && ok "mail failed: the forced push still fired (it is the only channel left)" || bad "mail failed: no push — got: $(cat "$ESC_NOTIFY_CALLS")"
+grep -qF "mail enviado ao Mayor" "$ESC_NOTIFY_CALLS" && bad "mail failed: push STILL claims 'mail enviado ao Mayor' — a false report" || ok "mail failed: push does not claim the mail was sent"
+grep -qF "FALHOU" "$ESC_NOTIFY_CALLS" && ok "mail failed: push states the mail send FAILED" || bad "mail failed: push does not surface the failed mail — got: $(cat "$ESC_NOTIFY_CALLS")"
+grep -qF "do_mail_mayor FAILED" "$ESC_LOG" && ok "mail failed: logged" || bad "mail failed: not logged in $ESC_LOG"
+# shellcheck disable=SC2034  # read by the sourced lib's do_mail_mayor
+BACKUP_FAIL_FAKE_MAIL="$ESC_STUB_DIR/fake_mail"
+: > "$ESC_NOTIFY_CALLS"; : > "$ESC_MAIL_CALLS"
+FAILED_DBS_STREAK=""; ESCALATE_DBS=" hq(2n)"; UNKNOWN_STREAK_DBS=""
+_backup_escalate_if_needed
+grep -qF "mail enviado ao Mayor" "$ESC_NOTIFY_CALLS" && ok "mail OK: push says 'mail enviado ao Mayor' (claim matches reality)" || bad "mail OK: push lacks the sent-confirmation — got: $(cat "$ESC_NOTIFY_CALLS")"
+unset UNKNOWN_STREAK_DBS
+
 NOTIFY="$_ESC_SAVE_NOTIFY"; LOG="$_ESC_SAVE_LOG"
-rm -rf "$ESC_STUB_DIR" "$ESC_STATE_DIR" 2>/dev/null || true
+rm -rf "$ESC_STUB_DIR" "$ESC_STATE_DIR" "$ESC_STATE_DIR_U" 2>/dev/null || true
 rm -f "$ESC_NOTIFY_CALLS" "$ESC_MAIL_CALLS" "$ESC_LOG" 2>/dev/null || true
 unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD BACKUP_FAIL_FAKE_MAIL FAILED_DBS_STREAK ESCALATE_DBS ESC_NOTIFY_CALLS ESC_MAIL_CALLS
 
@@ -1204,10 +1372,10 @@ if grep -qF '_backup_escalate_if_needed' "$SCRIPT"; then
 else
   bad "_backup_escalate_if_needed is defined but never called in the live flow"
 fi
-if grep -qF 'total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""' "$SCRIPT"; then
-  ok "FAILED_DBS_STREAK/ESCALATE_DBS are initialized once per run, alongside FAILED_DBS (set -u safe)"
+if grep -qF 'total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""' "$SCRIPT"; then
+  ok "FAILED_DBS_STREAK/ESCALATE_DBS/UNKNOWN_STREAK_DBS are initialized once per run, alongside FAILED_DBS (set -u safe)"
 else
-  bad "FAILED_DBS_STREAK/ESCALATE_DBS initialization missing or changed shape — set -u would abort the run on first reference"
+  bad "FAILED_DBS_STREAK/ESCALATE_DBS/UNKNOWN_STREAK_DBS initialization missing or changed shape — set -u would abort the run on first reference"
 fi
 if grep -qF 'gc mail send mayor' "$SCRIPT"; then
   ok "do_mail_mayor's real (non-stubbed) path actually calls gc mail send mayor"

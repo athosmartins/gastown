@@ -244,25 +244,48 @@ _margin_refusal_reset() {
 # and escalates to a channel that can't be missed: gc mail send mayor
 # (durable, actionable — he can free disk / trigger a reseed) AND a forced
 # ntfy push (NOTIFY_FORCE_PUSH=1 — the routing allowlist wouldn't otherwise
-# match this title). Per-db, same fail-soft posture as
-# _margin_refusal_count_after_increment: a bookkeeping failure here must
-# never block the backup flow itself, only ever downgrade this escalation.
+# match this title). Per-db. A bookkeeping failure here must never block the
+# backup flow itself — and must never silently DISABLE this escalation either:
+# the streak counter lives on the very disk whose exhaustion is the leading
+# cause of these failures (2026-09-25 incident), so "could not record the
+# streak" is a real, likely state, not an edge case. When the counter can't be
+# persisted/read back, the streak is reported as UNKNOWN and escalated as
+# such (see _backup_fail_streak_note_failure) — which can fire the alarm
+# EARLIER than a confirmed streak would, never later, and never disguised as
+# a confirmed 2+ nights.
 BACKUP_FAIL_STREAK_DIR="${BACKUP_FAIL_STREAK_DIR:-$CITY/.gc/logs/.dolt-s3-backup-fail-streak}"
 BACKUP_FAIL_ALARM_THRESHOLD="${BACKUP_FAIL_ALARM_THRESHOLD:-2}"
 
 # _backup_fail_streak_note_failure <db> — increments (creating if absent) the
-# per-db consecutive-run-failure counter and echoes the NEW count.
+# per-db consecutive-run-failure counter. THREE outcomes, never collapsed:
+#   rc=0 + the NEW count on stdout — incremented AND read back from disk, so
+#     the value the caller escalates on is the value the next run will see;
+#   rc=1, nothing on stdout — the streak is UNKNOWN: state dir not creatable,
+#     an existing counter exists but is unreadable, the write failed, or the
+#     read-back doesn't match. Callers must NOT treat this as "1" (that would
+#     reset the streak forever under sustained disk pressure) nor as a
+#     confirmed threshold hit (that would claim a streak nobody counted).
+# The write goes to a temp file + rename so a failed write (ENOSPC truncates
+# a plain `> file` BEFORE writing) can't destroy the previous night's count.
 _backup_fail_streak_note_failure() {
-  local db="$1" f n
-  if ! mkdir -p "$BACKUP_FAIL_STREAK_DIR" 2>/dev/null; then
-    echo "$BACKUP_FAIL_ALARM_THRESHOLD"
-    return
-  fi
+  local db="$1" f tmp n back
+  mkdir -p "$BACKUP_FAIL_STREAK_DIR" 2>/dev/null || return 1
   f="$BACKUP_FAIL_STREAK_DIR/$db"
-  n="$(cat "$f" 2>/dev/null)"
+  n=""
+  if [ -e "$f" ]; then
+    n="$(cat "$f" 2>/dev/null)" || return 1
+  fi
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n+1))
-  echo "$n" > "$f" 2>/dev/null
+  tmp="$f.tmp.$$"
+  # brace group: a failed `> "$tmp"` open reports BEFORE a trailing 2>/dev/null
+  # on the command itself would take effect, so the suppression must wrap it.
+  if ! { printf '%s\n' "$n" > "$tmp"; } 2>/dev/null || ! mv -f "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  back="$(cat "$f" 2>/dev/null)" || return 1
+  [ "$back" = "$n" ] || return 1
   echo "$n"
 }
 
@@ -278,27 +301,41 @@ _backup_fail_streak_note_success() {
 # several failure exits hit. Records "<db>(<n>n)" into FAILED_DBS_STREAK —
 # the "quantos dias sem backup OK" the final summary line names per store —
 # and, once the streak reaches BACKUP_FAIL_ALARM_THRESHOLD, appends db to
-# ESCALATE_DBS so _backup_escalate_if_needed (below) fires afterward.
+# ESCALATE_DBS so _backup_escalate_if_needed (below) fires afterward. If the
+# streak could NOT be persisted (_backup_fail_streak_note_failure rc=1), the
+# db is recorded as "<db>(?n)" and appended to UNKNOWN_STREAK_DBS instead —
+# escalated separately, worded as "sequência desconhecida", never as a
+# confirmed streak.
 # Requires FAILED_DBS_STREAK/ESCALATE_DBS already initialized by the caller
-# (set -u is active; the live flow inits both alongside FAILED_DBS below).
+# (set -u is active; the live flow inits them alongside FAILED_DBS below).
+# UNKNOWN_STREAK_DBS is read with a :- default so a caller that predates it
+# can't abort under set -u.
 _backup_fail_note() {
   local db="$1" n
-  n="$(_backup_fail_streak_note_failure "$db")"
-  FAILED_DBS_STREAK="$FAILED_DBS_STREAK ${db}(${n}n)"
-  if [ "$n" -ge "$BACKUP_FAIL_ALARM_THRESHOLD" ]; then
-    ESCALATE_DBS="$ESCALATE_DBS ${db}(${n}n)"
+  if n="$(_backup_fail_streak_note_failure "$db")"; then
+    FAILED_DBS_STREAK="$FAILED_DBS_STREAK ${db}(${n}n)"
+    if [ "$n" -ge "$BACKUP_FAIL_ALARM_THRESHOLD" ]; then
+      ESCALATE_DBS="$ESCALATE_DBS ${db}(${n}n)"
+    fi
+  else
+    FAILED_DBS_STREAK="$FAILED_DBS_STREAK ${db}(?n)"
+    UNKNOWN_STREAK_DBS="${UNKNOWN_STREAK_DBS:-} ${db}"
+    log "$db: contador de noites seguidas ilegível/ingravável em $BACKUP_FAIL_STREAK_DIR — sequência DESCONHECIDA, escalando assim mesmo"
   fi
 }
 
 # do_mail_mayor <subject> <body> — stubbable in selftest via
 # BACKUP_FAIL_FAKE_MAIL (same idiom as funnel-flow-healer.sh's own
-# do_mail_mayor). Fail-soft: a mail-send error must never abort the backup.
+# do_mail_mayor). Returns the REAL send status (0 = sent, non-zero = not) so
+# the caller never claims a mail that didn't go out; callers must not let a
+# non-zero abort the backup (this script runs without set -e, and every call
+# site tests the status explicitly).
 do_mail_mayor() {
   local subj="$1" body="$2"
   if [ -n "${BACKUP_FAIL_FAKE_MAIL:-}" ]; then
     "$BACKUP_FAIL_FAKE_MAIL" "$subj" "$body"; return $?
   fi
-  ( cd "$CITY" && GC_CITY="$CITY" gc mail send mayor -s "$subj" -m "$body" >/dev/null 2>&1 ) || true
+  ( cd "$CITY" && GC_CITY="$CITY" gc mail send mayor -s "$subj" -m "$body" >/dev/null 2>&1 )
 }
 
 # notify_escalate <message> — like notify_fail, but forces a PUSH
@@ -310,14 +347,32 @@ notify_escalate() {
 }
 
 # _backup_escalate_if_needed — called once after the per-db loop. No-op
-# unless ESCALATE_DBS is non-empty (i.e. at least one db's streak crossed
-# BACKUP_FAIL_ALARM_THRESHOLD this run) — an isolated single-night failure
-# must never reach this.
+# unless at least one db either crossed BACKUP_FAIL_ALARM_THRESHOLD this run
+# (ESCALATE_DBS) or failed with an UNKNOWN streak (UNKNOWN_STREAK_DBS — the
+# counter itself couldn't be persisted, see _backup_fail_note). An isolated
+# single-night failure with a healthy counter must never reach this. The push
+# text says "mail enviado" only when do_mail_mayor actually reported success —
+# a failed send is stated as such, not papered over.
 _backup_escalate_if_needed() {
-  [ -n "$ESCALATE_DBS" ] || return 0
-  do_mail_mayor "Dolt S3 backup: sem backup off-box há 2+ noites seguidas" \
-    "backup off-box FALHOU por 2+ noites seguidas em:${ESCALATE_DBS}. Ação: libere disco / rode o reseed manual (dolt-backup-reseed.sh) / veja $LOG."
-  notify_escalate "backup off-box: 2+ noites seguidas sem backup OK em:${ESCALATE_DBS} — mail enviado ao Mayor. Ver $LOG."
+  local unknown="${UNKNOWN_STREAK_DBS:-}" subj="" body="" push="" mailnote
+  [ -n "$ESCALATE_DBS" ] || [ -n "$unknown" ] || return 0
+  if [ -n "$ESCALATE_DBS" ]; then
+    subj="Dolt S3 backup: sem backup off-box há ${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas"
+    body="backup off-box FALHOU por ${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas em:${ESCALATE_DBS}."
+    push="${BACKUP_FAIL_ALARM_THRESHOLD}+ noites seguidas sem backup OK em:${ESCALATE_DBS}"
+  fi
+  if [ -n "$unknown" ]; then
+    subj="${subj:-Dolt S3 backup: falhou e o contador de noites não pôde ser gravado}"
+    body="${body:+$body }backup off-box FALHOU em:${unknown} e o contador de noites seguidas NÃO pôde ser gravado/lido em ${BACKUP_FAIL_STREAK_DIR} — sequência DESCONHECIDA (pode ser a 1ª noite ou a 5ª); disco cheio / sem permissão é o suspeito nº 1."
+    push="${push:+$push; }falha off-box em:${unknown} com contador ilegível (sequência desconhecida)"
+  fi
+  if do_mail_mayor "$subj" "$body Ação: libere disco / rode o reseed manual (dolt-backup-reseed.sh) / veja $LOG."; then
+    mailnote="mail enviado ao Mayor"
+  else
+    mailnote="⚠️ mail ao Mayor FALHOU — aja por aqui"
+    log "escalation: do_mail_mayor FAILED — the push notification is the only channel that carried this alarm"
+  fi
+  notify_escalate "backup off-box: ${push} — ${mailnote}. Ver $LOG."
 }
 
 # ga-odtd3f: neither the initial CALL DOLT_BACKUP('sync', ...) attempt below
@@ -663,7 +718,7 @@ DBS="$(dsql -q "SHOW DATABASES" --result-format csv 2>/dev/null | tail -n +2 \
         | grep -vxE 'information_schema|mysql|dolt')"
 if [ -z "$DBS" ]; then log "FATAL: no databases discovered"; notify_fail "backup off-box: nenhum banco descoberto"; exit 0; fi
 
-total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""
+total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
 for db in $DBS; do
   total=$((total+1))
   dest="$BACKUP_ROOT/$db"
