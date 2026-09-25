@@ -53,8 +53,8 @@ Mayor, crews, witness, refinery, polecat — que recebem a doutrina INTEIRA, byt
    e cortá-lo arriscaria a taxa do gate. O selftest exige `false` nos papéis do Mayor (`common.mayor_memory_roles`). As sondas de worker desta doc foram com memória off: some ~5k.
 4. **Skills**: `skillOverrides` — `off` no dog; `name-only` nos workers (mantém o nome, some a descrição: não esconde ferramenta de domínio).
    Skills de PLUGIN (`superpowers:*`) NÃO respondem a `skillOverrides` em nenhuma grafia testada; só `enabledPlugins:false` (feito só no revisor).
-5. **Carry-over (achado do red-team antes de submeter)**: excluir CLAUDE.md/AGENTS.md tira regras que só viviam lá. Auditei 15 regras contra fragment, prompts dos pools
-   e o prime real do dog: **10 sem nenhuma outra entrega**. As relevantes viraram 2 seções guardadas, só para papéis de pool (`show_unset:false`: agente sem `TD_ROLE` ainda
+5. **Carry-over (achado do red-team antes de submeter)**: excluir CLAUDE.md/AGENTS.md tira regras que só viviam lá. Auditei 15 sondas de regra contra fragment, prompts dos pools
+   e o prime real do dog: **9 sem nenhuma outra entrega** (2 delas são a mesma regra de restart). As relevantes viraram 2 seções guardadas, só para papéis de pool (`show_unset:false`: agente sem `TD_ROLE` ainda
    carrega o CLAUDE.md — seria duplicata — e o fail-open segue byte-idêntico): `claudemd-carryover` (dog/workers: restart cosmético, dados pessoais do Athos, `gmail-totp`,
    nunca `bd reclaim` cru, solução canônica antes de script novo) e `dolt-cleanup-hazards` (dog: **o prompt nativo do dog recomenda `gc dolt cleanup --force`, que é o DROP
    DATABASE; o aviso contra isso só existia no gt/CLAUDE.md**, mais a contagem de órfãos que mente e o PID derivado do processo vivo). O selftest exige que todo papel que exclui o CLAUDE.md

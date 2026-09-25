@@ -121,6 +121,8 @@ def scan_session(path):
 
 
 def sessions(since_hours, roles=None):
+    if not PROJECTS.is_dir():
+        raise SystemExit(f"diretório de transcritos não encontrado: {PROJECTS} (defina PPM_PROJECTS) — sem ele não há como medir, e uma tabela vazia pareceria 'nenhuma sessão'")
     cut = time.time() - since_hours * 3600
     for p in glob.glob(str(PROJECTS / "*" / "*.jsonl")):
         if os.path.getmtime(p) < cut:
@@ -147,6 +149,9 @@ def cmd_first_turn(a):
             unknown_ts += 1
         else:
             by[s["role"]]["after" if s["start"] >= cutover else "before"].append(s["first"])
+    if not by:
+        print(f"SEM AMOSTRA: nenhuma sessão de pool com transcrito nas últimas {a.since_hours:g}h" + (f" (papéis: {a.roles})" if roles else "") + ". Isto NÃO é medição de zero — é ausência de dado.")
+        return 2
     out = {}
     for role, d in sorted(by.items()):
         out[role] = {k: {"n": len(v), "median": med(v), "p10": med(sorted(v)[: max(1, len(v) // 10)]) if v else None,
@@ -194,6 +199,9 @@ def cmd_denied(a):
             if tool in d:
                 hits[s["role"]][tool] += c
     print(f"sessões avaliadas (depois do corte): {dict(n_sessions) or 'nenhuma'}")
+    if not n_sessions:
+        print("SEM AMOSTRA: nenhuma sessão de papel de pool depois do corte — não dá pra dizer que 'não há tentativas'. Espere spawns novos.")
+        return 2
     if not hits:
         print("nenhuma tentativa de tool negada — os cortes não parecem estar fazendo falta.")
         return 0

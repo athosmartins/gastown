@@ -60,6 +60,14 @@ echo "$o" | grep -q 'gate-reviewer: tentou' && bad "sinalizou SendMessage do rev
 PPM_PROJECTS="$W/projects" python3 "$TOOL" denied-attempts --since-hours 100000 --cutover 2026-09-23T00:00:00Z --strict >/dev/null 2>&1; [ $? -eq 1 ] && ok "--strict sai 1 quando há tentativa" || bad "--strict deveria sair 1"
 PPM_PROJECTS="$W/projects" python3 "$TOOL" denied-attempts --since-hours 100000 --cutover 2026-09-27T00:00:00Z --strict >/dev/null 2>&1; [ $? -eq 0 ] && ok "sessões ANTERIORES ao corte não contam (sai 0)" || bad "sessão anterior ao corte contou"
 
+echo "== terceiro estado: ausência de dado NÃO pode virar 'tudo certo'"
+PPM_PROJECTS="$W/projects" python3 "$TOOL" denied-attempts --since-hours 100000 --cutover 2099-01-01T00:00:00Z >"$W/o1" 2>&1; rc=$?
+{ [ $rc -eq 2 ] && grep -q 'SEM AMOSTRA' "$W/o1" && ! grep -q 'nenhuma tentativa de tool negada' "$W/o1"; } && ok "denied-attempts sem NENHUMA sessão depois do corte -> SEM AMOSTRA (exit 2), não 'nenhuma tentativa'" || { bad "denied-attempts com zero sessões deveria ser SEM AMOSTRA (rc=$rc)"; sed 's/^/      /' "$W/o1"; }
+PPM_PROJECTS="$W/projects" python3 "$TOOL" first-turn --since-hours 100000 --roles nao-existe >"$W/o2" 2>&1; rc=$?
+{ [ $rc -eq 2 ] && grep -q 'SEM AMOSTRA' "$W/o2"; } && ok "first-turn sem sessão -> SEM AMOSTRA (exit 2), não tabela vazia" || { bad "first-turn vazio deveria ser SEM AMOSTRA (rc=$rc)"; sed 's/^/      /' "$W/o2"; }
+PPM_PROJECTS="$W/nao-existe" python3 "$TOOL" first-turn --since-hours 24 >"$W/o3" 2>&1; rc=$?
+{ [ $rc -ne 0 ] && grep -q 'não encontrado' "$W/o3"; } && ok "diretório de transcritos ausente falha ALTO" || { bad "diretório ausente deveria falhar alto (rc=$rc)"; sed 's/^/      /' "$W/o3"; }
+
 echo "== gate-rate: só 1ª execução do bead, dry_run/ilegível fora, histórico como controle"
 python3 - "$W/gate.jsonl" <<'EOF'
 import json, sys, datetime as dt
