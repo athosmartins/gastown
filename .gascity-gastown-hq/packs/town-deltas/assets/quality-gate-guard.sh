@@ -2547,7 +2547,23 @@ gate_base_test_outside_subtree() {
   return 0
 }
 
-# gate_bash32_verdict <changed> <checked> <failed>
+# gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'>
+#   ga-7dx2vw: what ONE `/bin/bash -n` run means. Measured on /bin/bash 3.2.57:
+#   a syntax error exits 2, a clean parse 0, an unreadable file 126, a missing
+#   one 127 (a killed parser would be 128+signal). Only 0 and 2 are verdicts
+#   about the FILE; any other status (or an empty/garbled one) means the parser
+#   did not reach a verdict — a parser killed under memory pressure must not
+#   read as "this file has a syntax error" any more than as "this file is
+#   clean". Prints ok | fail | unmeasured. Pure (no IO).
+gate_bash32_parse_class() {
+  case "$1" in
+    0) printf 'ok' ;;
+    2) printf 'fail' ;;
+    *) printf 'unmeasured' ;;
+  esac
+}
+
+# gate_bash32_verdict <changed> <checked> <failed> [<unmeasured>]
 #   ga-7dx2vw: collapses the bash-3.2 syntax check's raw counts (computed by
 #   the impure Step 5b-pre3 block below: how many .sh files under
 #   packs/town-deltas/assets/ or scripts/ were added/changed on the branch,
@@ -2556,47 +2572,67 @@ gate_base_test_outside_subtree() {
 #   of four named states — same third-state discipline as
 #   gate_base_test_verdict just above (never collapse "couldn't measure"
 #   into "measured and clean").
+#   <unmeasured> (gate-fix 1): the changed-file LIST itself could not be read
+#   (git diff failed, or its scratch file could not be created) — then
+#   `changed` is not "0 files", it is UNKNOWN, and must never reach
+#   sem-sh-alterado. Only the exact value 0 means "the list was read"; an
+#   omitted argument is the legacy 3-arg call (== 0), but an explicitly empty
+#   or non-zero one is treated as unmeasured.
 #     sem-sh-alterado    — changed=0 (confirmed): the branch touches no .sh
 #                           file under either protected tree. Never blocks.
-#     nao-consegui-medir — changed>0 but checked!=changed (worktree/git-show
-#                           extraction failed for at least one file, or
-#                           /bin/bash itself was unusable) — an INCOMPLETE
-#                           measurement is never treated as proof of either
-#                           outcome. Never blocks (fail-open on uncertainty,
-#                           same posture as every other submission-time
-#                           check in this file).
+#     nao-consegui-medir — the file list was unreadable, or changed>0 but
+#                           checked!=changed (worktree/git-show extraction
+#                           failed for at least one file, or /bin/bash itself
+#                           was unusable) — an INCOMPLETE measurement is never
+#                           treated as proof of either outcome. Never blocks
+#                           (fail-open on uncertainty, same posture as every
+#                           other submission-time check in this file) — but
+#                           the call site LOGS it, so it is never silent.
 #     bash32-ok          — changed>0, every file measured, ALL parse clean
 #                           under /bin/bash -n. Never blocks.
-#     bash32-fail        — changed>0, every file measured, AT LEAST ONE
-#                           fails to parse under /bin/bash -n. BLOCKS — this
-#                           is exactly the ga-6aj348 incident: code that
-#                           passed review AND whatever ran under the PATH's
-#                           Homebrew bash 5.3 but could not parse under the
-#                           real /bin/bash 3.2 interpreter these scripts are
-#                           actually launchd-invoked with (com.gascity.*
-#                           plists hardcode /bin/bash, never PATH bash).
+#     bash32-fail        — AT LEAST ONE file was measured and fails to parse
+#                           under /bin/bash -n. BLOCKS — a CONFIRMED failure
+#                           is proof by itself, even if some other file could
+#                           not be measured (that file is re-measured on the
+#                           resubmission). This is exactly the ga-6aj348
+#                           incident: code that passed review AND whatever
+#                           ran under the PATH's Homebrew bash 5.3 but could
+#                           not parse under the real /bin/bash 3.2
+#                           interpreter these scripts are actually
+#                           launchd-invoked with (com.gascity.* plists
+#                           hardcode /bin/bash, never PATH bash).
+#   Any count that is empty or non-numeric is "don't know", never 0: a
+#   garbled <failed> must not read as "no failures" (-> bash32-ok).
 #   Pure (no IO) — the impure call site does all git/worktree/bash -n work
-#   and passes in only these three counts.
+#   and passes in only these counts.
 gate_bash32_verdict() {
-  local changed="$1" checked="$2" failed="$3"
+  local changed="$1" checked="$2" failed="$3" unmeasured="${4-0}"
   case "$changed" in
     ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
   esac
+  case "$checked" in
+    ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
+  esac
+  case "$failed" in
+    ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
+  esac
+  if [ "$failed" -gt 0 ]; then
+    printf 'bash32-fail'
+    return 0
+  fi
+  if [ "$unmeasured" != "0" ]; then
+    printf 'nao-consegui-medir'
+    return 0
+  fi
   if [ "$changed" -eq 0 ]; then
     printf 'sem-sh-alterado'
     return 0
   fi
-  case "$checked" in ''|*[!0-9]*) checked=0 ;; esac
-  case "$failed" in ''|*[!0-9]*) failed=0 ;; esac
   if [ "$checked" -ne "$changed" ]; then
     printf 'nao-consegui-medir'
     return 0
   fi
-  if [ "$failed" -gt 0 ]; then
-    printf 'bash32-fail'
-  else
-    printf 'bash32-ok'
-  fi
+  printf 'bash32-ok'
 }
 
 # gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
@@ -5618,10 +5654,16 @@ fi
 # queued, incl. a P0) until a human-triggered emergency revert (79392548f)
 # landed straight to main. shellcheck -s bash does NOT catch this — it is not
 # a shellcheck-recognized construct at all, it is a raw bash-3.2 PARSER
-# limitation (measured root cause: a `case...esac` whose closing `esac`
-# directly abuts a `$(...)` command substitution's own closing `)` with no
-# separating newline — bash 3.2 misparses the `;;` immediately before it;
-# bash 4+ parses it fine). Only the real /bin/bash 3.2 binary reproduces it.
+# limitation. MEASURED root cause (re-measured on /bin/bash 3.2.57 in the
+# ga-7dx2vw gate-fix pass, replacing an earlier wrong description): a `case`
+# whose patterns are NOT parenthesized, sitting INSIDE a `$( ... )` command
+# substitution — bash 3.2 rejects the first `;;` ("syntax error near
+# unexpected token `;;'"). Where `esac` and the closing `)` fall is
+# irrelevant: `esac` on its own line, or `)` on the next line, are rejected
+# just the same. It parses when the patterns carry a LEADING paren —
+# `$(case $x in (a) ...;; (*) ...;; esac)` — or when the case is moved out of
+# the substitution (or replaced by if/elif). Bash 4+ parses all of them.
+# Only the real /bin/bash 3.2 binary reproduces it.
 #
 # Scope: every .sh file added/changed on the branch under
 # packs/town-deltas/assets/ or scripts/ — the two trees every gate/pilot/
@@ -5629,18 +5671,35 @@ fi
 # launchd plists) the trees that actually run under /bin/bash 3.2, never PATH
 # bash. Other rigs' own scripts never live under these two paths, so for a
 # bead whose branch doesn't touch gascity's own infra this check costs one
-# empty git diff and nothing else.
+# empty git diff and nothing else. NOT full coverage: only files named *.sh
+# are parsed — an extensionless or differently-named script launchd runs
+# from those trees is not seen by this check.
+#
+# Renames: the diff runs with --no-renames, so a `git mv old.sh new.sh` plus
+# edits arrives as an ADD of the new path and is parsed like any other new
+# file (with rename detection on, --diff-filter=AM skipped it entirely — a
+# silent bypass). The file list is NUL-delimited (-z), so a non-ASCII or
+# otherwise git-quoted path is read verbatim instead of being dropped.
 #
 # Deterministic and cheap (bash -n never executes anything, just parses) —
 # unlike the ga-rstae check just above, this is NOT an A/B experiment: it
 # always runs, every submission, both arms.
 #
 # Fail-OPEN only on genuine uncertainty (RIG_PATH/fetch/rev-parse/merge-base
-# failure, git-show extraction failure, or /bin/bash itself missing/non-
+# failure, `git diff` failure or no scratch file for its output, git-show
+# extraction failure or no scratch dir, or /bin/bash itself missing/non-
 # executable — never on this machine, but this guard can in principle run on
 # any host that owns the rig) — never on a CONFIRMED syntax failure, which is
-# exactly what this check exists to block. gate_bash32_verdict enforces the
-# third-state discipline (nao-consegui-medir != bash32-ok).
+# exactly what this check exists to block. Fail-open is never SILENT: every
+# verdict, this one included, writes a BASH32-CHECK log line and a
+# gate-bash32:<verdict> marker label. gate_bash32_verdict enforces the
+# third-state discipline (nao-consegui-medir != bash32-ok != sem-sh-alterado).
+#
+# The block between the SELFTEST-EXTRACT sentinels is executed VERBATIM, under
+# the real /bin/bash 3.2, by gate-guard-bash32-syntax-check.selftest.sh —
+# keep the sentinels in place, and keep the block self-contained (it may use
+# only log/err/set_gate_status/bd and the variables the selftest provides).
+# SELFTEST-EXTRACT bash32-check: BEGIN
 if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
   _B32_VERDICT="nao-consegui-medir"   # pessimistic default; only upgraded
                                        # below once merge-base actually
@@ -5652,39 +5711,83 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
                                        # the CONFIRMED-zero state
                                        # (sem-sh-alterado) instead of the
                                        # honest "couldn't tell" state.
-  _B32_CHANGED=0; _B32_CHECKED=0; _B32_FAILED=0; _B32_DETAIL=""; _B32_FILES=""
-  git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
+  _B32_CHANGED=0; _B32_CHECKED=0; _B32_FAILED=0; _B32_UNRUN=0; _B32_DETAIL=""
+  _B32_UNMEASURED=0  # 1 = the changed-file LIST is unknown (fetch failed, so the
+                      # refs may be stale; or `git diff` failed; or no scratch
+                      # file). gate-fix 1: an unreadable list used to be
+                      # `| grep || true` -> empty -> changed=0 -> sem-sh-alterado,
+                      # the CONFIRMED-zero state, silently. It is its own state now.
+  _B32_REFS=0         # 1 once merge-base resolved (log line only)
+  _B32_LIST=""; _B32_WT=""
+  # A failed fetch leaves origin/main and origin/$BRANCH at whatever an earlier
+  # sweep saw — measuring THAT would report on a commit that is not the one
+  # being submitted. Treat it as "could not measure", not as a clean bill.
+  if ! git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null; then
+    _B32_UNMEASURED=1
+  fi
   _B32_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
   _B32_BRANCH_SHA=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
-  if [ -n "$_B32_MAIN_SHA" ] && [ -n "$_B32_BRANCH_SHA" ] && [ -x /bin/bash ]; then
+  if [ "$_B32_UNMEASURED" -eq 0 ] && [ -n "$_B32_MAIN_SHA" ] && [ -n "$_B32_BRANCH_SHA" ] && [ -x /bin/bash ]; then
     _B32_BASE=$(git -C "$RIG_PATH" merge-base "$_B32_BRANCH_SHA" "$_B32_MAIN_SHA" 2>/dev/null || echo "")
     if [ -n "$_B32_BASE" ]; then
-      _B32_FILES=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${_B32_BASE}..${_B32_BRANCH_SHA}" -- 'packs/town-deltas/assets' 'scripts' 2>/dev/null | grep '\.sh$' || true)
-      if [ -n "$_B32_FILES" ]; then
-        _B32_CHANGED=$(printf '%s\n' "$_B32_FILES" | grep -c .)
-        _B32_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-b32-XXXXXX" 2>/dev/null || echo "")
-        if [ -n "$_B32_WT" ]; then
-          while IFS= read -r _b32_f; do
-            [ -z "$_b32_f" ] && continue
-            mkdir -p "$(dirname "$_B32_WT/$_b32_f")" 2>/dev/null
-            if git -C "$RIG_PATH" show "${_B32_BRANCH_SHA}:$_b32_f" > "$_B32_WT/$_b32_f" 2>/dev/null; then
+      _B32_REFS=1
+      _B32_LIST=$(mktemp "${TMPDIR:-/tmp}/gate-b32-list-XXXXXX" 2>/dev/null || echo "")
+      _B32_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-b32-XXXXXX" 2>/dev/null || echo "")
+      # The diff's OWN exit status decides whether the list was read — it is
+      # redirected to a file, never piped through grep or `|| true`. -z: NUL-
+      # delimited, so a non-ASCII / git-quoted path is read verbatim instead of
+      # being emitted quoted (and then dropped by a `\.sh$` filter).
+      # --no-renames: a renamed-and-edited file shows up as an ADD of its new
+      # path and gets parsed; with rename detection on, AM skipped it.
+      if [ -n "$_B32_LIST" ] && git -C "$RIG_PATH" diff -z --name-only --no-renames --diff-filter=AM "${_B32_BASE}..${_B32_BRANCH_SHA}" -- 'packs/town-deltas/assets' 'scripts' > "$_B32_LIST" 2>/dev/null; then
+        while IFS= read -r -d '' _b32_f; do
+          case "$_b32_f" in
+            *.sh) ;;
+            *) continue ;;
+          esac
+          _B32_CHANGED=$((_B32_CHANGED + 1))
+          [ -n "$_B32_WT" ] || continue   # no scratch dir: counted as changed, never checked -> nao-consegui-medir
+          mkdir -p "$(dirname "$_B32_WT/$_b32_f")" 2>/dev/null
+          if git -C "$RIG_PATH" show "${_B32_BRANCH_SHA}:$_b32_f" > "$_B32_WT/$_b32_f" 2>/dev/null; then
+            # Exit status captured on its own (`|| rc=$?` keeps set -e out of
+            # it) and classified: only status 2 is "does not parse". A parser
+            # that could not run (126/127, killed) is NOT a syntax failure —
+            # it is counted as unrun, so checked < changed -> nao-consegui-medir.
+            _b32_rc=0
+            _b32_err=$(/bin/bash -n "$_B32_WT/$_b32_f" 2>&1) || _b32_rc=$?
+            _b32_class=$(gate_bash32_parse_class "$_b32_rc")
+            if [ "$_b32_class" = "ok" ]; then
               _B32_CHECKED=$((_B32_CHECKED + 1))
-              _b32_err=$(/bin/bash -n "$_B32_WT/$_b32_f" 2>&1) || {
-                _B32_FAILED=$((_B32_FAILED + 1))
-                _b32_err="${_b32_err//$_B32_WT\//}"
-                _B32_DETAIL="${_B32_DETAIL}${_B32_DETAIL:+
-}$_b32_f: $_b32_err"
-              }
+            elif [ "$_b32_class" = "fail" ]; then
+              _B32_CHECKED=$((_B32_CHECKED + 1))
+              _B32_FAILED=$((_B32_FAILED + 1))
+              _b32_err="${_b32_err//$_B32_WT\//}"
+              # bash -n already prefixes its message with the file name; only
+              # add ours when it did not (avoids "path: path: line N: ...").
+              case "$_b32_err" in
+                "$_b32_f"*) _b32_line="$_b32_err" ;;
+                *) _b32_line="$_b32_f: $_b32_err" ;;
+              esac
+              _B32_DETAIL="${_B32_DETAIL}${_B32_DETAIL:+
+}$_b32_line"
+            else
+              _B32_UNRUN=$((_B32_UNRUN + 1))
             fi
-          done <<B32_FILES_EOF
-$_B32_FILES
-B32_FILES_EOF
-          rm -rf "$_B32_WT" 2>/dev/null
-        fi
+          fi
+        done < "$_B32_LIST"
+      else
+        _B32_UNMEASURED=1
       fi
-      _B32_VERDICT=$(gate_bash32_verdict "$_B32_CHANGED" "$_B32_CHECKED" "$_B32_FAILED")
+      rm -f "$_B32_LIST" 2>/dev/null
+      if [ -n "$_B32_WT" ]; then rm -rf "$_B32_WT" 2>/dev/null; fi
+      _B32_VERDICT=$(gate_bash32_verdict "$_B32_CHANGED" "$_B32_CHECKED" "$_B32_FAILED" "$_B32_UNMEASURED")
     fi
   fi
+  # Every verdict is recorded — on the marker (queryable after the fact) and in
+  # the log — so the check's coverage can be audited; mirrors ga-rstae's
+  # gate-ab-basetest:<verdict> label. sem-sh-alterado used to leave no trace.
+  bd -C "$GC_CITY" label add "$MARKER_ID" "gate-bash32:$_B32_VERDICT" -q 2>/dev/null || true
+  log "BASH32-CHECK bead=$BEAD_ID verdict=$_B32_VERDICT branch=$BRANCH changed=$_B32_CHANGED checked=$_B32_CHECKED failed=$_B32_FAILED unrun=$_B32_UNRUN list_unread=$_B32_UNMEASURED refs_resolved=$_B32_REFS"
   case "$_B32_VERDICT" in
     bash32-fail)
       err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 (the real interpreter these scripts run under). Refusing at submission."
@@ -5692,7 +5795,7 @@ B32_FILES_EOF
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: bash-3.2 syntax check (ga-7dx2vw).
 $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 — the real interpreter every gate/pilot/witness/deacon daemon runs under (launchd hardcodes /bin/bash; Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
 $_B32_DETAIL
-Fix the syntax (a measured recurring cause: a case...esac whose closing \`)\` directly abuts a \$(...) command substitution's own closing \`)\` with no newline between them — bash 3.2 misparses that), verify locally with:
+Fix the syntax. Measured recurring cause on /bin/bash 3.2.57: a \`case\` with UNparenthesized patterns inside a \$( ... ) command substitution is rejected at its first \`;;\` — where \`esac\` and the closing \`)\` sit makes no difference (esac on its own line fails too). Either give every pattern a leading paren, e.g. \$(case \$x in (a) echo A;; (*) echo Z;; esac), or move the case out of the \$( ... ) (or use if/elif). Verify locally with:
   /bin/bash -n <file>
 then push again:
   git push origin $BRANCH
@@ -5704,11 +5807,14 @@ Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittabl
       log "  bash32-syntax-check (ga-7dx2vw): $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ all parse cleanly under /bin/bash 3.2."
       ;;
     nao-consegui-medir)
-      log "  bash32-syntax-check (ga-7dx2vw): could not fully measure (changed=$_B32_CHANGED checked=$_B32_CHECKED) — fail-open, not blocking."
+      log "  bash32-syntax-check (ga-7dx2vw): could not fully measure (changed=$_B32_CHANGED checked=$_B32_CHECKED unrun=$_B32_UNRUN list_unread=$_B32_UNMEASURED refs_resolved=$_B32_REFS) — fail-open, not blocking."
       ;;
-    sem-sh-alterado) : ;;
+    sem-sh-alterado)
+      log "  bash32-syntax-check (ga-7dx2vw): no .sh file added/changed under packs/town-deltas/assets/ or scripts/ — nothing to parse."
+      ;;
   esac
 fi
+# SELFTEST-EXTRACT bash32-check: END
 
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
 # Why HERE (after Step 5), not before it: Step 5 derives the self-review-exclusion
