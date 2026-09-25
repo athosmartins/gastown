@@ -5629,7 +5629,12 @@ GATE_NEEDS_REBASE_NOT_FIX="0"
 # branch (the "else" beside the dead-reviewer requeue, above the caller of
 # this function) ALSO pre-sets OVERALL_VERDICT="FAIL" despite no reviewer
 # ever answering. GATE_FAIL_NO_EVAL (plain script-global, same relay idiom
-# as QUOTA_REQUEUE/REQUEUE_REASON above) is that branch's signal. Captured
+# as QUOTA_REQUEUE/REQUEUE_REASON above) is that branch's signal.
+# ga-w7pm55: gate_collect_verdicts() raises the same signal when every FAIL in
+# the run is "verdict bead closed with no verdict" (the reviewer died before
+# judging) — a second producer of one meaning: "FAIL, but no reviewer judged
+# the code". The drift guard for the producers lives in
+# gate-no-verdict-infra-not-code-fail.selftest.sh. Captured
 # into a function-local, and the script-global zeroed immediately, so a
 # stale 1 can never leak into a LATER bead finalized later in this same
 # sweep — identical staleness concern to QUOTA_REQUEUE/REQUEUE_REASON.
@@ -7784,14 +7789,15 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
       # SELFTEST-EXTRACT finalize-fixattempt-bump: BEGIN
       if [ "$GATE_FAIL_NO_EVAL_RUN" = "1" ]; then
-        # ga-mcapdq: a reviewer timeout never evaluated this code (no
-        # verdict from anyone) — leave gate:fix-attempt:* exactly as-is.
+        # ga-mcapdq / ga-w7pm55: a reviewer timeout, or a reviewer that died
+        # and left its verdict bead closed with no verdict, never evaluated
+        # this code (no verdict from anyone) — leave gate:fix-attempt:* exactly as-is.
         # Bumping it here would burn one of the author's GATE_FIX_CAP
         # auto-retries on a run that never actually judged their content
         # (same family as ga-39l9z2/ga-l7mvtw: the counter must register
         # rejection, not administrative/infra noise).
         NEW_ATTEMPT="$PREV_ATTEMPT"
-        log "Marking $BEAD_ID gate:needs-fix (reviewer timeout, ga-mcapdq) — fix-attempt left at $PREV_ATTEMPT, no evaluation occurred."
+        log "Marking $BEAD_ID gate:needs-fix (no verdict delivered — reviewer timeout or death, ga-mcapdq/ga-w7pm55) — fix-attempt left at $PREV_ATTEMPT, no evaluation occurred."
       else
         NEW_ATTEMPT=$((PREV_ATTEMPT + 1))
         log "Marking $BEAD_ID gate:needs-fix (attempt $NEW_ATTEMPT/$GATE_FIX_CAP) for autonomous Pilot re-dispatch."
@@ -8893,6 +8899,15 @@ gate_collect_verdicts() {
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
   FAIL_REASONS=""
+  # ga-w7pm55: a reviewer that died before judging leaves a verdict bead closed
+  # with no verdict — that is ANY_FAIL (PASS is the only acceptable verdict) but
+  # NOT a code rejection. Count the two kinds apart so the run's FAIL can be
+  # classed correctly (see the relay after the loop). GATE_FAIL_NO_EVAL is
+  # recomputed from scratch on EVERY call: a stale 1 left by a run that was
+  # collected but not finalized must not survive into the next bead's collect
+  # (same leak concern as QUOTA_REQUEUE/REQUEUE_REASON at the call sites).
+  GATE_FAIL_NO_EVAL=0
+  local _judged_fails=0 _noverdict_fails=0
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
     # ga-art5: `|| echo "[]"` used to mask a failed `bd show` as an empty
@@ -8950,6 +8965,7 @@ gate_collect_verdicts() {
         : # explicit PASS — continue
       elif echo "$VB_LABELS" | grep "verdict:FAIL" >/dev/null; then
         ANY_FAIL=1
+        _judged_fails=$((_judged_fails + 1))  # ga-w7pm55: an explicit verdict:FAIL is a judgment, even with an empty reason
         # Collect the fail reason from the reviewer's verdict comment.
         # NOTE (ga-kf0v): the beads "bd comments --json" schema uses .text
         # (keys: author, created_at, id, issue_id, text) — there is NO .body
@@ -8994,7 +9010,14 @@ gate_collect_verdicts() {
         # anything else still FAILs, so the fail-safe (PASS is the ONLY acceptable
         # verdict) is fully preserved. A jq glitch leaves PASS_COMMENT empty →
         # falls through to the existing FAIL path (no regression).
-        VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null || echo "[]")
+        # ga-w7pm55: same read as before, but a FAILED read is remembered
+        # (VB_COMMENTS_READ_OK) instead of collapsing into "[]" — the branch
+        # below must tell "no FAIL comment" from "could not read the comments".
+        VB_COMMENTS_READ_OK=1
+        if ! VB_COMMENTS_JSON=$(bd -C "$GC_CITY" comments "$VB" --json 2>/dev/null); then
+          VB_COMMENTS_JSON="[]"
+          VB_COMMENTS_READ_OK=0
+        fi
         PASS_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
             [ .[]? | (.text // .body // "") ]
             | map(select(test("^\\s*VERDICT:\\s*PASS\\b"; "i")))
@@ -9008,14 +9031,59 @@ gate_collect_verdicts() {
           # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
           # PASS is the ONLY acceptable verdict; anything else blocks the merge.
           ANY_FAIL=1
-          VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
-          FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment).\n"
+          # ga-w7pm55: "blocks the merge" is not the same as "the code was
+          # rejected". Symmetric to the PASS rescue above: a reviewer whose
+          # label add lost the race but whose anchored "VERDICT: FAIL" comment
+          # landed DID judge — that is a real rejection (class code, and its
+          # reason must reach the builder). Anything else here is a verdict
+          # bead closed with NO verdict (pending / no label / TIMEOUT / ABORTED
+          # with no FAIL text): the reviewer died, nobody looked at the code.
+          # THREE states, not two (root-class:error-vs-empty): FAIL text found /
+          # comments read fine and hold none / comments could not be read (bd
+          # or jq failed). Only the middle one may relax the stamp to "hold";
+          # an unreadable read cannot rule out a real reviewer FAIL, so it stays
+          # class code — the blocking, pre-ga-w7pm55 behavior — never the
+          # permissive one.
+          FAIL_COMMENT_UNREADABLE=0
+          [ "$VB_COMMENTS_READ_OK" = "1" ] || FAIL_COMMENT_UNREADABLE=1
+          if ! FAIL_COMMENT=$(printf '%s' "$VB_COMMENTS_JSON" | jq -r '
+              [ .[]? | (.text // .body // "") ]
+              | map(select(test("^\\s*VERDICT:\\s*FAIL\\b"; "i")))
+              | last // ""
+            ' 2>/dev/null); then
+            FAIL_COMMENT=""
+            FAIL_COMMENT_UNREADABLE=1
+          fi
+          if [ -n "$FAIL_COMMENT" ]; then
+            _judged_fails=$((_judged_fails + 1))
+            log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:FAIL label but its verdict COMMENT is an explicit FAIL — counting as a real reviewer rejection (ga-w7pm55, mirror of the ga-86l90a8 PASS rescue). comment=$(printf '%s' "$FAIL_COMMENT" | tr '\n' ' ' | cut -c1-200)"
+            FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+          elif [ "$FAIL_COMMENT_UNREADABLE" = "1" ]; then
+            _judged_fails=$((_judged_fails + 1))
+            warn "Reviewer $((j+1)) (bead $VB) closed with no verdict label and its comments could not be read (bd/jq failed) — cannot rule out a real reviewer FAIL, so counting it as a code-class FAIL (fail-safe, ga-w7pm55)."
+            VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
+            FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment); its comments could not be read this sweep, so a reviewer FAIL cannot be ruled out (ga-w7pm55 fail-safe).\n"
+          else
+            _noverdict_fails=$((_noverdict_fails + 1))
+            VERDICT_LABEL=$(echo "$VB_LABELS" | tr ' ' '\n' | grep "^verdict:" | head -1 || echo "no-verdict-label")
+            FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) ${VERDICT_LABEL}: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment). No reviewer judgment was recorded — the reviewer died or drained before delivering a verdict, so this is an infrastructure failure, not a code rejection: re-submit the SAME commit with /gate-done, no code change needed (ga-w7pm55).\n"
+          fi
         fi
       fi
     fi
     # ga-eqjo: NOT closed (still pending) -> not counted this check; see the
     # scope-reduction note in this function's header comment above.
   done
+  # ga-w7pm55: relay to gate_finalize_run() (same script-global idiom as the
+  # ga-mcapdq genuine-timeout branch, which raises the same signal). When the
+  # run's FAILs are ALL "no verdict was delivered" — no reviewer judged the
+  # code — the commit must not be stamped gate-sha-failed:<sha>:code (that
+  # blocks a re-review of a commit nobody rejected) nor burn a
+  # gate:fix-attempt. A single judged FAIL anywhere in the run keeps class
+  # code: it is a real rejection, whatever the other reviewers did.
+  if [ "$ANY_FAIL" = "1" ] && [ "$_judged_fails" -eq 0 ] && [ "$_noverdict_fails" -gt 0 ]; then
+    GATE_FAIL_NO_EVAL=1
+  fi
 }
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: END
 
