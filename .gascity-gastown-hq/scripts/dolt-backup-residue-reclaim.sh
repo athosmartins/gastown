@@ -217,6 +217,18 @@ _should_release_residue() {
 # whenever the per-db one is absent (every fingerprint published before this
 # change, and every sibling db an ad hoc reseed didn't touch), so untouched
 # entries parse EXACTLY as before — fully backward compatible.
+#
+# ga-gjfe78: an entry that carries an explicit "status" other than "ok" is NOT
+# PROVEN — this returns EMPTY for it, whatever other keys sit next to it.
+# dolt-s3-backup.sh now publishes a db that failed tonight as {"status":
+# "failed", ...} instead of silently dropping it (a dropped db and a never-
+# existed db were indistinguishable). Its last good backup is kept only under
+# "last_ok" (informational, never read here), but this guard does not rely on
+# that layout: a failed entry that ALSO carries run_utc/backup_size/head — say a
+# future writer adds them for display — must still never read as fresh proof,
+# and an unrecognized or non-string status fails closed too. "status" ABSENT is
+# a legacy entry and means ok, so every fingerprint published before this
+# change parses exactly as it did.
 _parse_fingerprint_to_file() {
   local json_file="$1" db="$2" out_file="$3"
   "$PY" - "$json_file" "$db" > "$out_file" 2>/dev/null <<'PY'
@@ -232,6 +244,9 @@ except Exception:
 
 entry = (data.get("databases") or {}).get(db)
 if not isinstance(entry, dict):
+    sys.exit(0)
+
+if "status" in entry and entry["status"] != "ok":
     sys.exit(0)
 
 run_utc = entry.get("run_utc")
@@ -257,6 +272,67 @@ size_bytes = int(n * mult)
 
 head = entry.get("head") or ""
 sys.stdout.write(str(run_epoch) + "\t" + str(size_bytes) + "\t" + str(head) + "\n")
+PY
+}
+
+# _fingerprint_db_state <json_file> <db> — ga-gjfe78: prints ONE line,
+# "<state>\t<detail>", saying WHY _parse_fingerprint_to_file has (or has not)
+# got proof for <db>. States:
+#   ok            entry present, no status or status "ok"         detail: empty
+#   failed        the writer marked the db failed                 detail: date of
+#                 the last good backup | "none" (provably never had one) |
+#                 "unknown" (could not be determined) — never conflated
+#   absent        readable file, no entry for the db              detail: empty
+#   unrecognized  entry not an object, or a status this code does not know
+#   unreadable    file missing / not JSON / not the expected shape
+# Diagnostic ONLY: no decision may branch on this. Whether a db is proven is
+# decided by _parse_fingerprint_to_file alone, fail-closed. This exists so a log
+# line can say "the fingerprint marks hq FAILED, last ok <date>" instead of
+# showing empty fields that read the same as "never existed" (ga-p5q3: error
+# and empty must not collapse into one value). The caller supplies "unfetched"
+# itself when the fetch never produced a file.
+_fingerprint_db_state() {
+  local json_file="$1" db="$2"
+  "$PY" - "$json_file" "$db" 2>/dev/null <<'PY' || printf 'unreadable\t\n'
+import sys, json
+
+path, db = sys.argv[1], sys.argv[2]
+
+
+def out(state, detail=""):
+    sys.stdout.write(state + "\t" + detail + "\n")
+
+
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    out("unreadable")
+    sys.exit(0)
+if not isinstance(data, dict) or not isinstance(data.get("databases"), dict):
+    out("unreadable")
+    sys.exit(0)
+if db not in data["databases"]:
+    out("absent")
+    sys.exit(0)
+entry = data["databases"][db]
+if not isinstance(entry, dict):
+    out("unrecognized")
+    sys.exit(0)
+if "status" not in entry or entry["status"] == "ok":
+    out("ok")
+    sys.exit(0)
+if entry["status"] != "failed":
+    out("unrecognized")
+    sys.exit(0)
+
+ts = entry.get("last_ok_run_utc")
+if entry.get("last_ok_known") is True and entry.get("last_ok") is None and ts is None:
+    out("failed", "none")
+elif isinstance(ts, str) and ts:
+    out("failed", ts)
+else:
+    out("failed", "unknown")
 PY
 }
 
@@ -289,8 +365,11 @@ _reclaim_one_residue() {
   fp_file="$(mktemp "${TMPDIR:-/tmp}/dolt-residue-fp.XXXXXX" 2>/dev/null)" || { log "residue-reclaim: ${base} — SPARED (could not create temp file for S3 fetch)"; return; }
   parsed_file="$(mktemp "${TMPDIR:-/tmp}/dolt-residue-parsed.XXXXXX" 2>/dev/null)" || { rm -f "$fp_file"; log "residue-reclaim: ${base} — SPARED (could not create temp file for parse output)"; return; }
 
+  local fp_state
+  fp_state="$(printf 'unfetched\t')"
   if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" "$fp_file" >/dev/null 2>&1; then
     _parse_fingerprint_to_file "$fp_file" "$db" "$parsed_file"
+    fp_state="$(_fingerprint_db_state "$fp_file" "$db")"
   fi
 
   local run_epoch="" size_bytes="" head=""
@@ -298,6 +377,16 @@ _reclaim_one_residue() {
     IFS="$(printf '\t')" read -r run_epoch size_bytes head < "$parsed_file"
   fi
   rm -f "$fp_file" "$parsed_file" 2>/dev/null
+
+  # ga-gjfe78: WHY there may be no proof, for the log/alert only — never a
+  # decision input (that stays with _parse_fingerprint_to_file, fail-closed).
+  local fp_kind="" fp_detail="" fp_desc fp_note=""
+  IFS="$(printf '\t')" read -r fp_kind fp_detail <<< "$fp_state"
+  fp_desc="fingerprint_state=${fp_kind:-unknown}"
+  if [ "$fp_kind" = "failed" ]; then
+    fp_desc="$fp_desc last_ok=${fp_detail:-unknown}"
+    fp_note=" O fingerprint S3 marca ${db} como FALHO (último backup OK: ${fp_detail:-unknown})."
+  fi
 
   local manifest_ok=0
   if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3api head-object --bucket "$BUCKET" --key "$db/manifest" >/dev/null 2>&1; then
@@ -341,8 +430,8 @@ _reclaim_one_residue() {
   else
     local age=$(( now - old_mtime ))
     if [ "$manifest_ok" != "1" ] || [ "$size_ok" != "1" ]; then
-      log "residue-reclaim: ${base} (~${old_mb:-?}MB, age=${age}s) — SPARED (manifest_ok=${manifest_ok} size_ok=${size_ok} fingerprint_size=${size_bytes:-?}B live_size=${local_bytes:-?}B) — real verification gap, escalating"
-      notify_fail "backup residue reclaim: ${db}.old não liberado — verificação S3 falhou (manifest_ok=${manifest_ok} size_ok=${size_ok}, db=${db}). Ver $LOG."
+      log "residue-reclaim: ${base} (~${old_mb:-?}MB, age=${age}s) — SPARED (manifest_ok=${manifest_ok} size_ok=${size_ok} fingerprint_size=${size_bytes:-?}B live_size=${local_bytes:-?}B ${fp_desc}) — real verification gap, escalating"
+      notify_fail "backup residue reclaim: ${db}.old não liberado — verificação S3 falhou (manifest_ok=${manifest_ok} size_ok=${size_ok}, db=${db}).${fp_note} Ver $LOG."
     else
       log "residue-reclaim: ${base} (~${old_mb:-?}MB, age=${age}s) — SPARED (settle window or fingerprint not yet fresher than residue: run_epoch=${run_epoch:-none} old_mtime=${old_mtime} settle=${SETTLE_SECS}s) — expected, self-healing next cycle"
     fi
