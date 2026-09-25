@@ -50,21 +50,61 @@ grep -q '^_session_is_alive_for_worktree() {' "$REAPER" \
   || fail "_session_is_alive_for_worktree() missing from the deployed reaper"
 grep -q '^_reap_or_log_unparseable_lock() {' "$REAPER" \
   || fail "_reap_or_log_unparseable_lock() missing from the deployed reaper"
-grep -qF '"event":"kept_locked_unparseable"' "$REAPER" \
+grep -q 'kept_locked_unparseable' "$REAPER" \
   || fail "kept_locked_unparseable distinct event missing"
-grep -qF '"event":"reaped_locked_unparseable_safe"' "$REAPER" \
+grep -q 'reaped_locked_unparseable_safe' "$REAPER" \
   || fail "reaped_locked_unparseable_safe distinct event missing"
+# gate ga-wpdmj6: the THIRD state. An unavailable `gc session list` must have its own
+# fetch function, its own distinct kept event, and its own counter — not be folded into
+# kept_locked_unparseable (the error-vs-empty collapse that let a gc timeout read as "no
+# session is alive" and reap a possibly-live session's worktree).
+grep -q '^_session_list_ensure() {' "$REAPER" \
+  || fail "_session_list_ensure() missing — the session-list fetch/three-state memo is gone"
+grep -qF 'kept_locked_session_list_unavailable' "$REAPER" \
+  || fail "kept_locked_session_list_unavailable (the could-not-know event) missing"
+grep -qF '"session_list_unavailable"' "$REAPER" \
+  || fail "session_list_unavailable (the fetch-failure event carrying rc/why) missing"
+grep -qF 'kept_session_list_unavailable' "$REAPER" \
+  || fail "kept_session_list_unavailable counter missing from the sweep summary"
 log "  present ✓"
 
 # ── 3. classify_lock's call sites pass the worktree path through ───────────────
 # Without this, the session-name recognition and the work_dir cross-check
-# (the pool-slot-reuse guard) silently never fire.
-log "Checking classify_lock is called with the worktree path..."
-grep -qF 'classify_lock "$reason" "$wt"' "$REAPER" \
+# (the pool-slot-reuse guard) silently never fire. Each function's body is
+# extracted and checked on its OWN — a whole-file grep for the same string
+# passes as long as ONE of the two call sites still has it, so dropping "$wt"
+# from the other would go unnoticed.
+log "Checking classify_lock is called with the worktree path (per function)..."
+_body() { sed -n "/^$1() {/,/^}/p" "$REAPER"; }
+_body reap_zombie_locked | grep -qF 'classify_lock "$reason" "$wt"' \
   || fail "reap_zombie_locked no longer passes \$wt to classify_lock"
-grep -qF 'classify_lock "$reason" "$wt"' "$REAPER" \
+_body _reap_or_log_unparseable_lock | grep -qF 'classify_lock "$reason" "$wt"' \
   || fail "_reap_or_log_unparseable_lock no longer passes \$wt to classify_lock"
 log "  wired ✓"
+
+# ── 3b. The session list is fetched ONCE per sweep, in the MAIN shell ─────────
+# classify_lock always runs as `$(classify_lock ...)` — a subshell — so a fetch (and
+# its memo) made INSIDE it is lost, and every locked worktree paid for two gc calls.
+# The callers must fetch before opening that subshell, and hand the verdict on
+# instead of recomputing it.
+log "Checking the fetch happens before the classify subshell, and the verdict is handed on..."
+_body reap_zombie_locked | grep -qF '_session_list_ensure' \
+  || fail "reap_zombie_locked does not call _session_list_ensure in the main shell (memo would die in the subshell)"
+_body reap_zombie_locked | grep -qF '_ZL_VERDICT="$verdict"' \
+  || fail "reap_zombie_locked no longer hands its verdict to the caller via _ZL_VERDICT"
+[[ "$(grep -cF '"$_ZL_VERDICT"' "$REAPER")" -ge 2 ]] \
+  || fail "the call sites no longer pass \$_ZL_VERDICT into _reap_or_log_unparseable_lock (lock classified twice again)"
+log "  main-shell fetch + verdict hand-off ✓"
+
+# ── 3c. Free text in the log goes through the escaper ─────────────────────────
+# A lock reason with a quote or backslash used to write invalid JSON into the log.
+log "Checking lock events are built by the escaping helper (no raw printf of the reason)..."
+grep -q '^_json_esc() {' "$REAPER" || fail "_json_esc() missing"
+grep -q '^_log_lock_event() {' "$REAPER" || fail "_log_lock_event() missing"
+if _body _reap_or_log_unparseable_lock | grep -q 'printf .*event'; then
+  fail "_reap_or_log_unparseable_lock builds a log line with a raw printf — free text (the lock reason) must go through _log_lock_event"
+fi
+log "  escaped ✓"
 
 # ── 4. Both call sites (reap_pool_worktrees AND the legacy path-glob loop)
 # route their zrc=2 case through the new helper — the actual measured bug
@@ -78,12 +118,16 @@ log "  both call sites wired ($_CALL_COUNT occurrences) ✓"
 
 # ── 5. The dedicated (now-extended) selftest passes end-to-end against the
 # deployed file. This is the real proof, not a restatement — it extracts the
-# LIVE functions and exercises them against a hermetic fake session list and
-# fake process table across the full existing suite (78 assertions: every
-# pre-existing zombie-lock/dirty-preserve/merged-fast-path/multi-root
-# scenario, plus 12 new ga-vs6shu-specific ones covering the actual measured
-# bug, the pool-slot-reuse subtlety, and both call sites).
-log "Running worktree-reaper.selftest.sh against the deployed reaper (this builds several temp git repos, can take ~30-60s)..."
+# LIVE functions and exercises them against a hermetic fake session list, a
+# fake `gc` on PATH (counting calls; healthy / failing / hanging / garbage),
+# and a fake process table across the full existing suite: every pre-existing
+# zombie-lock/dirty-preserve/merged-fast-path/multi-root scenario, plus the
+# ga-vs6shu ones (the measured bug, the pool-slot-reuse subtlety, both call
+# sites, the unavailable-session-list third state, one fetch per sweep, JSON
+# log escaping, bare locks). The selftest pins disk-pressure OFF itself
+# (WORKTREE_REAPER_PRESSURE_FREE_GB=0), so this step no longer goes red merely
+# because the box is short of disk — the state this reaper exists for.
+log "Running worktree-reaper.selftest.sh against the deployed reaper (this builds many temp git repos, can take a few minutes under load)..."
 bash "$SELFTEST" || fail "worktree-reaper.selftest.sh reported failures"
 log "  selftest PASS ✓"
 

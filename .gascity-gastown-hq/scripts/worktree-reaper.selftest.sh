@@ -37,6 +37,18 @@ EMPTY_SESSIONS="$TMP/empty_sessions.json"
 printf '{"sessions":[]}' > "$EMPTY_SESSIONS"
 export WORKTREE_REAPER_FAKE_SESSION_LIST="$EMPTY_SESSIONS"
 
+# ga-vs6shu gate-feedback (ga-wpdmj6, blocking issue 4): the same hermeticity, for DISK
+# PRESSURE. The reaper drops nothing under pressure — it RAISES the age gate from
+# STALE_HOURS to PRESSURE_HOURS (12h) whenever `df` shows < PRESSURE_FREE_GB (8) free on /,
+# so on a box that is short of disk every scenario that ages a worktree 3h stops being
+# reapable and its assertion fails (measured: 11 pre-existing + 7 ga-vs6shu assertions red at
+# 7 GiB free) — the suite went red exactly when the reaper is needed, and the prod test
+# (story-ga-vs6shu.sh step 5) runs this suite behind the deploy gate. Pin it OFF, the same
+# way the session list is pinned, and UNCONDITIONALLY: an operator's exported value must not
+# make the suite depend on the machine either. A scenario that wants pressure mode sets the
+# variable on its own `bash "$REAPER"` call, which overrides this per call.
+export WORKTREE_REAPER_PRESSURE_FREE_GB=0
+
 # ── build a temp "town" ($TMP) containing one rig repo with an origin/main ───────
 TOWN="$TMP/town"; mkdir -p "$TOWN"
 REMOTE="$TMP/remote.git"; git init -q --bare "$REMOTE"
@@ -486,6 +498,180 @@ WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
 git -C "$L1TOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gc-worktrees/l1-safeunparse\$" >/dev/null \
   && bad "ga-vs6shu: loop-1 unparseable+safe lock NOT reaped (call-site wiring drifted from loop 2)" \
   || ok "ga-vs6shu: loop-1 (legacy path-glob) also reaps an unparseable+safe lock via the same safety net"
+
+# ══ ga-vs6shu GATE FEEDBACK (ga-wpdmj6): the third state, the memo, the log, the bare lock ══
+# Everything above drives the reaper through WORKTREE_REAPER_FAKE_SESSION_LIST, which can only
+# ever say "the list was fetched". The gate's blocking issues 1+2 live in the REAL fetch path
+# (gc missing / failing / timing out / printing garbage, and how many times it is called), so
+# these scenarios put a FAKE `gc` on PATH instead — same code path as production, counting calls.
+FAKEBIN="$TMP/fakebin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/gc" <<'FAKEGC'
+#!/bin/sh
+echo "$*" >> "${FAKE_GC_LOG:-/dev/null}"
+case "${FAKE_GC_MODE:-ok}" in
+  ok)    printf '{"ok":true,"sessions":[]}' ;;
+  notok) printf '{"ok":false,"sessions":[]}' ;;
+  fail)  exit 1 ;;
+  hang)  exec sleep 30 ;;   # exec: the shell must BE the sleep, or `timeout` kills the shell and the orphan holds the pipe
+  empty) exit 0 ;;
+  brace) printf '{}' ;;
+esac
+FAKEGC
+chmod +x "$FAKEBIN/gc"
+
+# mk_locked_rig <name> <n> <reason-template> — a town $TMP/<name> holding one rig with
+# crew/worker-1..n, each on a branch already MERGED into origin/main, CLEAN, aged 3h, and
+# LOCKED with <reason-template> (@N@ = the worker number; the literal @BARE@ = a lock with
+# no --reason at all). Every one is exactly the shape ga-vs6shu is allowed to reap.
+mk_locked_rig() {
+  local name="$1" n="$2" tmpl="$3" root i
+  root="$TMP/$name"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"
+  git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo x > x.txt; git add x.txt; git commit -qm base
+    git push -q origin main; git fetch -q origin
+    git remote set-head origin main 2>/dev/null || true
+    mkdir -p crew
+    for i in $(seq 1 "$n"); do
+      git branch "crew/$name/b$i" main
+      git worktree add -q "crew/worker-$i" "crew/$name/b$i"
+      if [ "$tmpl" = "@BARE@" ]; then git worktree lock "crew/worker-$i"
+      else git worktree lock --reason "${tmpl//@N@/$i}" "crew/worker-$i"; fi
+    done
+  ) >/dev/null 2>&1
+  for i in $(seq 1 "$n"); do
+    touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$root/rig/crew/worker-$i" 2>/dev/null || true
+  done
+}
+# count_wt <name> — how many crew/worker-* worktrees the rig still has registered.
+count_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -c '/crew/worker-'; }
+# run_fakegc <name> <mode> [ENV=val ...] — run the reaper on town <name> with the fake gc in
+# <mode>; the real seam is unset so the REAL fetch path runs. Log → $TMP/<name>.jsonl,
+# gc call log → $TMP/<name>.gc.
+run_fakegc() {
+  local name="$1" mode="$2"; shift 2
+  : > "$TMP/$name.gc"
+  env -u WORKTREE_REAPER_FAKE_SESSION_LIST PATH="$FAKEBIN:$PATH" \
+    FAKE_GC_LOG="$TMP/$name.gc" FAKE_GC_MODE="$mode" \
+    WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" \
+    WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_SESSION_LIST_TIMEOUT=2 \
+    "$@" bash "$REAPER" >/dev/null 2>&1
+}
+gc_calls() { wc -l < "$TMP/$1.gc" | tr -d ' '; }
+events()   { local n; n="$(grep -c "\"event\":\"$2\"" "$TMP/$1.jsonl" 2>/dev/null)"; echo "${n:-0}"; }
+
+# ── issue 2 (memo) + happy path: 3 locked worktrees, gc healthy → ONE gc call, all reaped.
+# Pre-fix, `classify_lock` ran in a subshell so its "memo" died with it: each locked worktree
+# paid TWO fetches (reap_zombie_locked, then _reap_or_log_unparseable_lock) = 6 calls here.
+echo "── ga-vs6shu gate-feedback: ONE session-list fetch per sweep, not per lock ──"
+mk_locked_rig memo 3 'wa-x build (wa-worker-adhoc-gone@N@)'
+run_fakegc memo ok
+[ "$(count_wt memo)" = "0" ] && ok "3 locked+merged+clean+aged worktrees reaped when gc answers (unparseable-safe path still works)" \
+                             || bad "healthy-gc sweep left $(count_wt memo) of 3 locked worktrees"
+[ "$(gc_calls memo)" = "1" ] && ok "issue 2: 3 locked worktrees → exactly 1 'gc session list' call (memo shared across the classify subshell)" \
+                             || bad "issue 2: expected 1 gc call for 3 locked worktrees, saw $(gc_calls memo) — memo lost in the classify_lock subshell"
+[ "$(events memo session_list_unavailable)" = "0" ] && grep -q '"session_list":"ok"' "$TMP/memo.jsonl" \
+  && ok "healthy fetch is reported: sweep line says session_list=ok, no session_list_unavailable event" \
+  || bad "healthy fetch not reported as session_list=ok / spurious session_list_unavailable event"
+
+# ── issue 1 (third state): every way the fetch can fail must KEEP the worktree, log a distinct
+# counted event, and never take the destructive safety-net path. The worktrees are IDENTICAL
+# to the ones reaped above — merged, clean, aged, no process — so the ONLY thing that differs
+# is whether we could find out about live sessions. Pre-fix: `{}` == "nobody alive" → REAPED.
+echo "── ga-vs6shu gate-feedback: session list UNAVAILABLE ≠ 'no session alive' (KEEP + distinct event) ──"
+for spec in fail:gc_failed hang:timeout empty:invalid_output brace:invalid_output notok:invalid_output; do
+  mode="${spec%%:*}"; why="${spec##*:}"
+  mk_locked_rig "un_$mode" 2 'wa-x build (wa-worker-adhoc-held@N@)'
+  run_fakegc "un_$mode" "$mode" WORKTREE_REAPER_SESSION_LIST_TIMEOUT=1
+  [ "$(count_wt "un_$mode")" = "2" ] && ok "gc mode '$mode': both locked worktrees KEPT (could-not-know is not 'nobody alive')" \
+                                     || bad "gc mode '$mode': $((2 - $(count_wt "un_$mode"))) locked worktree(s) REAPED on an unavailable session list — DESTROYS A POSSIBLY-LIVE SESSION'S TREE"
+  [ "$(events "un_$mode" reaped_locked_unparseable_safe)" = "0" ] \
+    || bad "gc mode '$mode': safety-net reap event logged although the list was unavailable"
+  [ "$(events "un_$mode" kept_locked_session_list_unavailable)" = "2" ] && ok "gc mode '$mode': 2× kept_locked_session_list_unavailable (distinct from kept_locked_unparseable / kept_locked_live)" \
+                                                                        || bad "gc mode '$mode': expected 2 kept_locked_session_list_unavailable events, saw $(events "un_$mode" kept_locked_session_list_unavailable)"
+  grep -q "\"event\":\"session_list_unavailable\",\"rc\":[0-9]*,\"why\":\"$why\"" "$TMP/un_$mode.jsonl" \
+    && ok "gc mode '$mode': one session_list_unavailable event carries the cause (why=$why)" \
+    || bad "gc mode '$mode': no session_list_unavailable event with why=$why"
+  grep -q '"session_list":"unavailable","kept_session_list_unavailable":2' "$TMP/un_$mode.jsonl" \
+    && ok "gc mode '$mode': sweep line COUNTS it (session_list=unavailable, kept_session_list_unavailable=2)" \
+    || bad "gc mode '$mode': sweep line does not count the unavailable-list keeps"
+  [ "$(gc_calls "un_$mode")" = "1" ] || bad "gc mode '$mode': a failed fetch was retried per lock ($(gc_calls "un_$mode") calls) instead of memoized"
+done
+# …and "kept" is not "kept forever": the next sweep, with gc healthy again, reaps them.
+run_fakegc un_fail ok
+[ "$(count_wt un_fail)" = "0" ] && ok "next sweep with gc healthy again reaps what the unavailable sweep kept (nothing stuck)" \
+                                || bad "worktrees kept during a gc outage are not reaped once gc recovers"
+
+# ── a bare lock (no --reason at all) is "(no reason)" in BOTH loops, and reaped when safe.
+echo "── ga-vs6shu gate-feedback: bare lock (no reason) — pool loop AND legacy loop-1 ──"
+mk_locked_rig bare 1 '@BARE@'
+run_fakegc bare ok
+[ "$(count_wt bare)" = "0" ] && ok "pool loop: bare lock reaped via the safety net" || bad "pool loop: bare lock (no reason) NOT reaped"
+L1BTOWN="$TMP/l1btown"; mkdir -p "$L1BTOWN/.gc-worktrees"
+git init -q --bare "$TMP/l1bremote.git"; git init -q -b main "$L1BTOWN"
+( cd "$L1BTOWN"
+  git remote add origin "$TMP/l1bremote.git"
+  echo b > b.txt; git add b.txt; git commit -qm b
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git branch w/l1bare main
+  git worktree add -q "$L1BTOWN/.gc-worktrees/l1-bare" w/l1bare
+  git worktree lock "$L1BTOWN/.gc-worktrees/l1-bare"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$L1BTOWN/.gc-worktrees/l1-bare" 2>/dev/null || true
+WORKTREE_REAPER_GT="$L1BTOWN" WORKTREE_REAPER_LOG="$TMP/l1b.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 bash "$REAPER" >/dev/null 2>&1
+git -C "$L1BTOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gc-worktrees/l1-bare\$" >/dev/null \
+  && bad "loop-1: a BARE lock is silently skipped (lock_reason='' failed the -n test) while the pool loop reaps the same shape" \
+  || ok "loop-1 (legacy path-glob): bare lock reaped too — both loops now agree on '(no reason)'"
+
+# ── issue 3 (log escaping): a lock reason with quotes + a backslash arrives from
+# `git worktree list --porcelain` C-quoted; every event that carries it must stay valid JSON.
+# Worker-1 is merged+clean → reaped_locked_unparseable_safe; worker-2 has real unmerged work →
+# kept_locked_unparseable (the event emitted for every kept lock on every sweep).
+echo "── ga-vs6shu gate-feedback: free-text lock reason cannot break the JSON log ──"
+mk_locked_rig esc 2 'fix "quoted" thing \ back @N@'
+( cd "$TMP/esc/rig/crew/worker-2" && echo real > real.txt && git add real.txt && git commit -qm "real unmerged work" ) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$TMP/esc/rig/crew/worker-2" 2>/dev/null || true
+run_fakegc esc ok
+jq -e . "$TMP/esc.jsonl" >/dev/null 2>&1 \
+  && ok "issue 3: EVERY line of the log parses as JSON with a quote+backslash lock reason (jq -e . over the file)" \
+  || bad "issue 3: the log is not valid JSON — a lock reason with quotes/backslash poisoned it (jq: $(jq -e . "$TMP/esc.jsonl" 2>&1 >/dev/null | head -1))"
+[ "$(events esc reaped_locked_unparseable_safe)" = "1" ] && [ "$(events esc kept_locked_unparseable)" = "1" ] \
+  && ok "both free-text events were emitted (1 reaped_locked_unparseable_safe, 1 kept_locked_unparseable)" \
+  || bad "expected 1 reaped_locked_unparseable_safe + 1 kept_locked_unparseable, saw $(events esc reaped_locked_unparseable_safe)/$(events esc kept_locked_unparseable)"
+jq -r 'select(.event=="kept_locked_unparseable") | .reason' "$TMP/esc.jsonl" 2>/dev/null | grep -q 'quoted' \
+  && ok "the logged reason round-trips (still readable, still mentions the original text)" \
+  || bad "the logged reason did not round-trip through JSON"
+
+# ── low finding: `for tok in $(…)` glob-expanded a token like `*` against the reaper's cwd.
+# A reason of `*`, a cwd holding a file NAMED like a live session for this worktree: glob
+# expansion would turn `*` into that session name → "confirmed live" → kept forever. Literal
+# `*` names no session, so the (merged+clean+aged) worktree is reaped.
+echo "── ga-vs6shu gate-feedback: a '*' token in a lock reason is not glob-expanded ──"
+mk_locked_rig glob 1 '*'
+GLOBCWD="$TMP/globcwd"; mkdir -p "$GLOBCWD"; : > "$GLOBCWD/wa-worker-adhoc-globbed"
+GLOB_WT="$(cd "$TMP/glob/rig/crew/worker-1" && pwd -P)"
+GLOB_SESSIONS="$TMP/glob_sessions.json"
+jq -n --arg name "wa-worker-adhoc-globbed" --arg wd "$GLOB_WT" \
+  '{"sessions":[{"name":$name,"session_name":$name,"work_dir":$wd,"closed":false}]}' > "$GLOB_SESSIONS"
+( cd "$GLOBCWD" && WORKTREE_REAPER_GT="$TMP/glob" WORKTREE_REAPER_LOG="$TMP/glob.jsonl" \
+  WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_FAKE_SESSION_LIST="$GLOB_SESSIONS" \
+  bash "$REAPER" >/dev/null 2>&1 )
+[ "$(count_wt glob)" = "0" ] && ok "'*' in a lock reason stays a literal token (not expanded to the cwd's filenames)" \
+                             || bad "'*' in a lock reason was glob-expanded against the cwd → matched a live session name it never contained"
+
+# ── low finding: the safety-net reap must not `worktree unlock` before `remove -f -f`. With no
+# unlock, a remove that fails cannot leave the worktree stripped of a lock whose holder was never
+# identified. (Source-level: a forced remove FAILURE cannot be staged hermetically — git
+# deregisters the worktree even when the on-disk delete only half-succeeds.)
+if sed -n '/^_reap_or_log_unparseable_lock() {/,/^}/p' "$REAPER" | grep -v '^[[:space:]]*#' | grep -q 'worktree unlock'; then
+  bad "_reap_or_log_unparseable_lock unlocks BEFORE remove -f -f — a failed remove leaves an unidentified holder's worktree unlocked"
+else
+  ok "_reap_or_log_unparseable_lock removes with -f -f and never unlocks first (a failed remove leaves the lock as found)"
+fi
 
 # ── zombie SIGTERM guard: kill a crew claude agent, NEVER a supervisor/pilot ──────
 echo "── zombie kill guard (guarded when ON) ──"

@@ -62,7 +62,38 @@ ZOMBIE_MAX_CPU="${WORKTREE_REAPER_ZOMBIE_MAX_CPU:-5}"            # 'idle' = rece
 ZOMBIE_MAX_CPU_X10="$(printf '%s' "$ZOMBIE_MAX_CPU" | awk '{gsub(/,/,"."); printf "%d", ($1*10)+0.5}')"
 case "$ZOMBIE_MAX_CPU_X10" in ''|*[!0-9]*) ZOMBIE_MAX_CPU_X10=50 ;; esac
 KILL_ZOMBIE="${WORKTREE_REAPER_KILL_ZOMBIE:-0}"                  # SIGTERM the confirmed zombie pid (guarded; default OFF)
+# ga-vs6shu: bound (seconds) on the ONE `gc session list` fetch per sweep. It is fetched once,
+# not per lock, so the bound can afford to be generous — a wedged gc/Dolt costs one bounded
+# wait per sweep and the locks are KEPT (see _session_list_ensure), never reaped on a guess.
+# Measured 25/09 at load ~54: the call took ~10s and timed out 2 of 3 times at a 10s bound.
+SESSION_LIST_TIMEOUT="${WORKTREE_REAPER_SESSION_LIST_TIMEOUT:-60}"
+case "$SESSION_LIST_TIMEOUT" in ''|*[!0-9]*) SESSION_LIST_TIMEOUT=60 ;; esac
+[ "$SESSION_LIST_TIMEOUT" -ge 1 ] || SESSION_LIST_TIMEOUT=60      # timeout(1) treats 0 as "no bound at all"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# _json_esc <text> — make free text safe to interpolate into a hand-built JSON log line
+# (escape \ and ", flatten control bytes). ga-vs6shu (gate ga-wpdmj6): a lock REASON is free
+# text, and `git worktree list --porcelain` hands it back C-quoted — a reason holding a quote
+# or a backslash arrives as `"fix \"x\" \\ y"`. Interpolated raw, that wrote
+# `"reason":""fix \"x\" \\ y""` — invalid JSON that made `jq -s` die on that line. The
+# kept_locked_unparseable event fires for EVERY kept lock on EVERY sweep, so one such reason
+# poisoned the whole file for every later reader. Byte-wise (LC_ALL=C) so a stray non-UTF-8
+# byte cannot make tr/sed themselves fail.
+_json_esc() {
+  printf '%s' "$1" | LC_ALL=C tr '\000-\037' ' ' | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# _log_lock_event <event> <repo> <wt> <br> <age_h> <label> [<verdict> [<reason>]] — one JSON
+# line for a locked-worktree outcome. EVERY free-text field goes through _json_esc; add new
+# fields here, never as a raw printf, so the escaping cannot be forgotten at one call site.
+_log_lock_event() {
+  local ev="$1" repo="$2" wt="$3" br="$4" age="$5" label="$6" verdict="${7-}" reason="${8-}" line
+  case "$age" in ''|*[!0-9-]*) age=null ;; esac
+  line="{\"ts\":\"$(ts)\",\"event\":\"$ev\",\"repo\":\"$(_json_esc "$(basename "$repo")")\",\"wt\":\"$(_json_esc "$(basename "$wt")")\",\"branch\":\"$(_json_esc "$br")\",\"age_h\":$age"
+  [ -n "$verdict" ] && line="$line,\"verdict\":\"$(_json_esc "$verdict")\""
+  [ -n "$reason" ]  && line="$line,\"reason\":\"$(_json_esc "$reason")\""
+  printf '%s,"label":"%s"}\n' "$line" "$(_json_esc "$label")" >> "$LOG" 2>/dev/null
+}
 
 free_gb=$(df -g / 2>/dev/null | awk 'NR==2{print $4}')
 [ -z "$free_gb" ] && free_gb=99
@@ -71,6 +102,8 @@ mode="normal"
 if [ "$free_gb" -lt "$PRESSURE_FREE_GB" ] 2>/dev/null; then gate_hours="$PRESSURE_HOURS"; mode="pressure"; fi
 
 reaped=0; skipped_dirty=0; kept=0; branches_deleted=0; pool_reaped=0; zombie_reaped=0; preserved_dirty=0
+kept_session_list_unavailable=0   # ga-vs6shu: locks KEPT only because the session list could not be fetched
+_ZL_VERDICT=""                    # ga-vs6shu: reap_zombie_locked's verdict, handed to its caller (never recomputed)
 # ga-pdrij: the rig-worktree backlog is LARGE (704 observed — the legacy loop used
 # `git -C $GT` and could never remove rig-owned worktrees, so they piled up). Bound the
 # per-sweep pool reaping so a single run is never a massive destructive operation; the
@@ -314,55 +347,93 @@ _pid_cmdline() {
 # 51 worktrees (2.3G) sat locked forever this way, aged 72h to 1384h (57 days),
 # ALL already 100% merged, until a human removed them by hand.
 #
-# _session_list_json — memoized ONE `gc session list` fetch per sweep (never
-# per-lock — this can be called once for every locked worktree in a sweep, and
-# a live re-fetch each time would be needless load on the same gc/Dolt backend
-# this city's own doctrine repeatedly warns against hammering). Seam:
-# WORKTREE_REAPER_FAKE_SESSION_LIST=<file> — a literal JSON blob (the same
-# shape `gc session list --json` returns) for the hermetic selftest.
+# THREE states, never two (gate ga-wpdmj6, blocking issues 1+2). "The session list says
+# nobody is alive" and "I could not fetch the session list" are DIFFERENT facts, and on a
+# destructive path the second must never be read as the first. The first version collapsed
+# both — a gc that was missing / failed / timed out / printed nothing became `{}`, i.e. "no
+# session is alive" — so at load ~54 (where `gc session list` timed out 2 of 3 times) the
+# live-session protection was a coin flip and an alive session's merged+clean worktree was
+# reaped. Now: the fetch records ok | unavailable, and unavailable makes classify_lock say
+# "unknown", which the reaper answers with KEEP + a distinct, counted log event.
+#
+# _session_list_ensure — fetch `gc session list` ONCE per sweep, in the MAIN shell, and
+# memoize the outcome (ok OR unavailable — a failure is not retried per lock: that is how
+# 3 locked worktrees cost 6 calls and how two calls about the SAME worktree could disagree).
+# It must run in the main shell: classify_lock is always invoked as `$(classify_lock ...)`,
+# a subshell, and an assignment made there dies with it — so the first version's
+# "memoized" cache was never shared and every locked worktree paid for TWO fetches
+# (reap_zombie_locked, then _reap_or_log_unparseable_lock). reap_zombie_locked calls this
+# BEFORE it opens that subshell (and hands its verdict on via $_ZL_VERDICT, so the second
+# classification no longer happens at all); _reap_or_log_unparseable_lock calls it too, but
+# only when its caller has no verdict to pass. The subshell inherits the populated globals. Seam: WORKTREE_REAPER_FAKE_SESSION_LIST=<path to a
+# file> holding the JSON `gc session list --json` would print, for the hermetic selftest.
+_WT_REAPER_SESSION_STATE=""        # "" = not fetched yet | ok | unavailable
 _WT_REAPER_SESSION_LIST_JSON=""
-_session_list_json() {
-  [ -n "$_WT_REAPER_SESSION_LIST_JSON" ] && return
+_session_list_ensure() {
+  [ -n "$_WT_REAPER_SESSION_STATE" ] && return 0
+  local raw="" rc=0 why=""
   if [ -n "${WORKTREE_REAPER_FAKE_SESSION_LIST:-}" ]; then
     if [ -f "$WORKTREE_REAPER_FAKE_SESSION_LIST" ]; then
-      _WT_REAPER_SESSION_LIST_JSON="$(cat "$WORKTREE_REAPER_FAKE_SESSION_LIST" 2>/dev/null)"
+      raw="$(cat "$WORKTREE_REAPER_FAKE_SESSION_LIST" 2>/dev/null)"; rc=$?
+    else
+      rc=66; why="fake_list_missing"
     fi
-    [ -n "$_WT_REAPER_SESSION_LIST_JSON" ] || _WT_REAPER_SESSION_LIST_JSON="{}"
-    return
+  elif ! command -v gc >/dev/null 2>&1; then
+    rc=127; why="gc_missing"
+  elif ! command -v timeout >/dev/null 2>&1; then
+    rc=127; why="timeout_missing"
+  else
+    # Bounded: a wedged gc/Dolt must never hang the whole sweep over one lookup.
+    raw="$(timeout "$SESSION_LIST_TIMEOUT" gc --city "${WORKTREE_REAPER_GC_CITY:-$GT/.gascity-gastown-hq}" session list --json --state all 2>/dev/null)"; rc=$?
   fi
-  command -v gc >/dev/null 2>&1 || { _WT_REAPER_SESSION_LIST_JSON="{}"; return; }
-  # Bounded: a wedged gc/Dolt must never hang the whole sweep over one lookup.
-  _WT_REAPER_SESSION_LIST_JSON="$(timeout 10 gc --city "${WORKTREE_REAPER_GC_CITY:-$GT/.gascity-gastown-hq}" session list --json --state all 2>/dev/null)"
-  [ -n "$_WT_REAPER_SESSION_LIST_JSON" ] || _WT_REAPER_SESSION_LIST_JSON="{}"
+  if [ "$rc" -eq 0 ] && ! command -v jq >/dev/null 2>&1; then rc=127; why="jq_missing"; fi
+  if [ "$rc" -eq 0 ]; then
+    # Accept only the documented shape (`.sessions` an array, `.ok` not false): empty
+    # output, `{}`, or a half-written blob is "could not fetch", NOT "zero sessions".
+    if printf '%s' "$raw" | jq -e '(.sessions | type) == "array" and (.ok != false)' >/dev/null 2>&1; then
+      _WT_REAPER_SESSION_STATE="ok"; _WT_REAPER_SESSION_LIST_JSON="$raw"
+      return 0
+    fi
+    why="invalid_output"
+  fi
+  [ -n "$why" ] || { [ "$rc" -eq 124 ] && why="timeout" || why="gc_failed"; }
+  _WT_REAPER_SESSION_STATE="unavailable"; _WT_REAPER_SESSION_LIST_JSON=""
+  printf '{"ts":"%s","event":"session_list_unavailable","rc":%s,"why":"%s","timeout_s":%s}\n' \
+    "$(ts)" "$rc" "$why" "$SESSION_LIST_TIMEOUT" >> "$LOG" 2>/dev/null
 }
 
-# _session_is_alive_for_worktree <name> <wt> — true iff a session named
-# <name> is currently alive AND its OWN reported work_dir is <wt> or a
-# subdirectory of it. Matching the NAME alone is not enough for a persistent
-# POOL-SLOT identity (gastown.dog-1, wa-worker-1): the slot name persists
-# across many unrelated bead assignments over its lifetime, so "a session
-# named gastown.dog-1 is alive right now" does not prove THIS lock's work is
-# still what that slot is doing — it may have long since moved on to a
-# different bead, leaving this old lock stale. Without the work_dir check, a
-# busy-but-unrelated pool slot would permanently block the merged-fast-path
-# safety net below for a worktree that is actually free. Mirrors
-# _worktree_in_use's own path-containment check, applied to a session's
-# work_dir instead of a live process's cwd. Fails closed (not alive) on any
-# gc/Dolt failure — never claims "confirmed live" from a value we don't have.
+# _session_is_alive_for_worktree <name> <wt> — is a session named <name> alive AND does its
+# OWN reported work_dir equal <wt> or sit under it?  0 = yes | 1 = the list was fetched and
+# holds no such session | 2 = the list is unavailable, cannot know (caller must not treat 2
+# as 1). Matching the NAME alone is not enough for a persistent POOL-SLOT identity
+# (gastown.dog-1, wa-worker-1): the slot name persists across many unrelated bead
+# assignments, so "a session named gastown.dog-1 is alive right now" does not prove THIS
+# lock's work is still what that slot is doing — it may have long since moved on, leaving
+# this old lock stale. Without the work_dir check a busy-but-unrelated pool slot would
+# permanently block the safety net below for a worktree that is actually free. Mirrors
+# _worktree_in_use's path-containment check, applied to a session's work_dir instead of a
+# live process's cwd. jq's own failure (exit >= 2) is "cannot know" too, never "not alive".
 _session_is_alive_for_worktree() {
-  local name="$1" wt="$2"
-  [ -n "$name" ] && [ -n "$wt" ] || return 1
-  _session_list_json
+  local name="$1" wt="$2" rc
+  [ -n "$name" ] || return 1
+  [ -n "$wt" ] || return 2
+  [ "$_WT_REAPER_SESSION_STATE" = "ok" ] || return 2
   printf '%s' "$_WT_REAPER_SESSION_LIST_JSON" | jq -e --arg n "$name" --arg wt "$wt" '
     (.sessions // []) | any(
       (.name == $n or .session_name == $n) and ((.closed // false) | not) and
       ((.work_dir // "") as $d | $d == $wt or ($d | startswith($wt + "/")))
     )
-  ' >/dev/null 2>&1
+  ' >/dev/null 2>&1; rc=$?
+  case "$rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
+# _lock_reason_pid <lock-reason> — the "pid N" number in a lock reason, or empty.
+_lock_reason_pid() {
+  printf '%s' "$1" | sed -n 's/.*pid[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p'
 }
 
 # classify_lock <lock-reason> [<wt>] → "zombie <pid> <why>" | "live <pid> ..." |
-# "live_session <name>" | "unparseable"
+# "live_session <name>" | "unparseable" | "unknown <cause>"
 # ZOMBIE iff: pid is DEAD, OR pid is alive but elapsed > ZOMBIE_HOURS AND recent %cpu is
 # negligible (idle). The elapsed gate alone is already strong — a live agent working one
 # worktree continuously for >2 days is implausible here (sessions cycle); wa-8y45 was 4d7h.
@@ -376,13 +447,17 @@ _session_is_alive_for_worktree() {
 # arbiter: a token that merely LOOKS session-shaped but isn't real (or is real
 # but working somewhere else now) just fails the check, no harm done — this
 # can only ever ADD a "confirmed live" verdict on top of the existing pid path,
-# never a new way to declare zombie. Still fail-safe: no pid AND no confirmed
-# live session → "unparseable" (its caller decides what "unparseable" means
-# now — see _reap_or_log_unparseable_lock below — never classify_lock itself
-# guessing zombie from silence).
+# never a new way to declare zombie.
+#
+# Four non-zombie outcomes, deliberately distinct: "live"/"live_session" (a holder is
+# CONFIRMED alive here), "unparseable" (the session list WAS fetched, and no session it
+# names is alive in this worktree), and "unknown <cause>" (we COULD NOT find out — the
+# session list is unavailable). The last is never folded into "unparseable": that is the
+# error-vs-empty collapse that let a gc timeout read as "nobody is alive" (gate
+# ga-wpdmj6). Its callers must KEEP. classify_lock never guesses zombie from silence.
 classify_lock() {
   local reason="$1" wt="${2:-}" pid probe alive esecs cpu thr tok
-  pid="$(printf '%s' "$reason" | sed -n 's/.*pid[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p')"
+  pid="$(_lock_reason_pid "$reason")"
   if [ -n "$pid" ]; then
     probe="$(_pid_probe "$pid")"
     alive="$(printf '%s\n' "$probe" | awk '{print $1}')"
@@ -397,14 +472,25 @@ classify_lock() {
     fi
     return
   fi
-  if [ -n "$wt" ]; then
-    for tok in $(printf '%s' "$reason" | tr '()/' '   '); do
-      if _session_is_alive_for_worktree "$tok" "$wt"; then
-        echo "live_session $tok"
-        return
-      fi
-    done
-  fi
+  # No worktree path → the work_dir cross-check cannot run → cannot know (both real callers
+  # pass it; this is the honest answer for a future caller that does not).
+  [ -n "$wt" ] || { echo "unknown no_worktree_path"; return; }
+  # Normally already fetched by the caller in the main shell (see _session_list_ensure); this
+  # call is a no-op then, and a correct — if uncached — fetch for any caller that skipped it.
+  _session_list_ensure
+  [ "$_WT_REAPER_SESSION_STATE" = "ok" ] || { echo "unknown session_list_unavailable"; return; }
+  # `while read` over a process substitution, NOT `for tok in $(...)`: an unquoted expansion
+  # glob-expands each word against the reaper's cwd, so a reason token like `*` would turn
+  # into a directory listing of whatever cwd the launchd job happens to have.
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    _session_is_alive_for_worktree "$tok" "$wt"
+    case $? in
+      0) echo "live_session $tok"; return ;;
+      1) : ;;
+      *) echo "unknown session_list_unavailable"; return ;;
+    esac
+  done < <(printf '%s' "$reason" | tr '()/"' '    ' | tr -s ' \t' '\n\n')
   echo "unparseable"
 }
 
@@ -434,7 +520,15 @@ _maybe_kill_zombie() {
 # branch cleanup (never deletes unmerged local work) + optional guarded process kill.
 reap_zombie_locked() {
   local repo="$1" wt="$2" br="$3" reason="$4" age="$5" label="$6" verdict pid why
+  # ga-vs6shu: a reason with no "pid N" is classified by session lookup — fetch that list
+  # HERE, in the main shell, BEFORE the `$(classify_lock ...)` subshell below, so the memo
+  # survives (see _session_list_ensure). Then hand the verdict to the caller via
+  # $_ZL_VERDICT: on return 2 it goes straight into _reap_or_log_unparseable_lock instead
+  # of being recomputed (a second, independent classification of the same lock could
+  # disagree with the first).
+  [ -n "$(_lock_reason_pid "$reason")" ] || _session_list_ensure
   verdict="$(classify_lock "$reason" "$wt")"
+  _ZL_VERDICT="$verdict"
   case "$verdict" in zombie\ *) : ;; *) return 2 ;; esac
   pid="$(printf '%s' "$verdict" | awk '{print $2}')"
   why="$(printf '%s' "$verdict" | cut -d' ' -f3-)"
@@ -453,36 +547,56 @@ reap_zombie_locked() {
   return 3
 }
 
-# _reap_or_log_unparseable_lock <repo> <wt> <br> <reason> <age_h> <label> —
+# _reap_or_log_unparseable_lock <repo> <wt> <br> <reason> <age_h> <label> [<verdict>] —
 # ga-vs6shu: called when reap_zombie_locked returned 2 (holder is not a
 # pid-confirmed zombie). Splits what used to be a SINGLE collapsed
 # "kept_locked_live" verdict — covering both "confirmed alive" and "I have no
-# idea" under the identical event/counter — into three distinct, honestly
+# idea" under the identical event/counter — into distinct, honestly
 # labeled outcomes:
 #   0 = reaped: classify_lock could not confirm the holder is alive (no pid,
-#       no matching live session), but the worktree independently proves SAFE
-#       to remove anyway — content already 100% merged into main, no
-#       uncommitted changes, no live process has it as a cwd, and it is older
-#       than the stale-hours gate. There is nothing left for the lock to be
-#       protecting, regardless of what its text says or whether it could be
-#       parsed at all. This is the actual measured bug: 51 real worktrees
-#       (2.3G) sat locked forever this way, ALL already in this exact state.
-#   1 = kept, CONFIRMED live (verdict live/live_session): a session names in
+#       and the session list was FETCHED and names no live session in this
+#       worktree), but the worktree independently proves SAFE to remove anyway
+#       — content already 100% merged into main, no uncommitted changes, no
+#       live process has it as a cwd, and it is older than the stale-hours
+#       gate. There is nothing left for the lock to be protecting, regardless
+#       of what its text says or whether it could be parsed at all. This is
+#       the actual measured bug: 51 real worktrees (2.3G) sat locked forever
+#       this way, ALL already in this exact state.
+#   1 = kept, CONFIRMED live (verdict live/live_session): a session named in
 #       the reason is genuinely alive AND working in this exact worktree.
-#   1 = kept, genuinely unparseable: could not confirm live, and did not
-#       independently qualify as safe (unmerged, dirty, in-use, or too young)
-#       — the correct, conservative "I don't know, so I don't touch it"
-#       outcome, but now logged as what it actually is instead of masquerading
-#       as a confirmed-live holder.
+#   1 = kept, UNKNOWN (verdict "unknown <cause>"): the session list could not
+#       be fetched, so whether a live session holds this worktree is not
+#       knowable. The safe default on a destructive path is "assume alive":
+#       KEEP, log kept_locked_session_list_unavailable, and count it — never
+#       fall through to the safety net below on a value we do not have.
+#   1 = kept, genuinely unparseable: the list was fetched, could not confirm
+#       live, and the worktree did not independently qualify as safe
+#       (unmerged, dirty, in-use, or too young) — the correct, conservative
+#       "I don't touch it" outcome, logged as what it actually is instead of
+#       masquerading as a confirmed-live holder.
+# <verdict> is reap_zombie_locked's own classification ($_ZL_VERDICT), passed
+# through so the lock is classified ONCE; only a caller that has none makes
+# this classify (after fetching in the main shell — see _session_list_ensure).
 # Always logs, every branch — the whole point of this fix is a distinct,
 # honest event per outcome instead of one collapsed label.
 _reap_or_log_unparseable_lock() {
-  local repo="$1" wt="$2" br="$3" reason="$4" age="$5" label="$6" verdict
-  verdict="$(classify_lock "$reason" "$wt")"
+  local repo="$1" wt="$2" br="$3" reason="$4" age="$5" label="$6" verdict="${7-}"
+  if [ -z "$verdict" ]; then
+    _session_list_ensure
+    verdict="$(classify_lock "$reason" "$wt")"
+  fi
   case "$verdict" in
     live\ *|live_session\ *)
-      printf '{"ts":"%s","event":"kept_locked_live","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"verdict":"%s","label":"%s"}\n' \
-        "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$verdict" "$label" >> "$LOG" 2>/dev/null
+      _log_lock_event kept_locked_live "$repo" "$wt" "$br" "$age" "$label" "$verdict"
+      return 1
+      ;;
+    unknown\ session_list_unavailable)
+      kept_session_list_unavailable=$((kept_session_list_unavailable+1))
+      _log_lock_event kept_locked_session_list_unavailable "$repo" "$wt" "$br" "$age" "$label" "$verdict" "$reason"
+      return 1
+      ;;
+    unknown\ *)
+      _log_lock_event kept_locked_unknown "$repo" "$wt" "$br" "$age" "$label" "$verdict" "$reason"
       return 1
       ;;
   esac
@@ -499,23 +613,23 @@ _reap_or_log_unparseable_lock() {
      && [ "$_status_rc" -eq 0 ] && [ -z "$_status_out" ] \
      && ! _worktree_in_use "$wt"; then
     if [ "$ENABLED" = "1" ]; then
-      git -C "$repo" worktree unlock "$wt" 2>/dev/null || true
+      # No `worktree unlock` first — `remove -f -f` is git's own way to remove a LOCKED
+      # worktree, and skipping the unlock means a remove that fails cannot leave the
+      # worktree stripped of a lock whose holder we never identified (there would be
+      # nothing to restore it FROM; reap_zombie_locked's unlock is different: there the
+      # holder is confirmed dead).
       if git -C "$repo" worktree remove -f -f "$wt" 2>/dev/null; then
-        printf '{"ts":"%s","event":"reaped_locked_unparseable_safe","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"reason":"%s","label":"%s"}\n' \
-          "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$reason" "$label" >> "$LOG" 2>/dev/null
+        _log_lock_event reaped_locked_unparseable_safe "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
         delete_merged_local_branch "$repo" "$br"
         return 0
       fi
-      printf '{"ts":"%s","event":"unparseable_safe_reap_failed","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"label":"%s"}\n' \
-        "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$label" >> "$LOG" 2>/dev/null
+      _log_lock_event unparseable_safe_reap_failed "$repo" "$wt" "$br" "$age" "$label"
       return 1
     fi
-    printf '{"ts":"%s","event":"would_reap_locked_unparseable_safe","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"reason":"%s","label":"%s"}\n' \
-      "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$reason" "$label" >> "$LOG" 2>/dev/null
+    _log_lock_event would_reap_locked_unparseable_safe "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
     return 1
   fi
-  printf '{"ts":"%s","event":"kept_locked_unparseable","repo":"%s","wt":"%s","branch":"%s","age_h":%s,"reason":"%s","label":"%s"}\n' \
-    "$(ts)" "$(basename "$repo")" "$(basename "$wt")" "$br" "$age" "$reason" "$label" >> "$LOG" 2>/dev/null
+  _log_lock_event kept_locked_unparseable "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
   return 1
 }
 
@@ -594,7 +708,7 @@ reap_pool_worktrees() {
                  # safety net fired), 1 = kept (either confirmed-live or
                  # genuinely-unparseable-and-unsafe) — both already logged
                  # distinctly inside it; this only tallies the right counter.
-                 if _reap_or_log_unparseable_lock "$repo" "$wt" "$br" "$lock" "$age" "pool"; then
+                 if _reap_or_log_unparseable_lock "$repo" "$wt" "$br" "$lock" "$age" "pool" "$_ZL_VERDICT"; then
                    pool_reaped=$((pool_reaped+1))
                  else
                    kept=$((kept+1))
@@ -668,8 +782,13 @@ for WT_DIR in $WT_DIRS; do
       reaped=$((reaped+1))
       printf '{"ts":"%s","event":"reaped","wt":"%s","age_h":%s,"mode":"%s","merged":%s}\n' "$(ts)" "$(basename "$d")" "$age" "$mode" "$merged" >> "$LOG" 2>/dev/null
     elif [ "$ZOMBIE_LOCK_ENABLED" = "1" ] && \
-         lock_reason="$(git -C "$GT" worktree list --porcelain 2>/dev/null | awk -v p="$d" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); print; exit } }')" && \
+         lock_reason="$(git -C "$GT" worktree list --porcelain 2>/dev/null | awk -v p="$d" '$1=="worktree"{c=$2} $1=="locked"{ if(c==p){ $1=""; sub(/^ /,""); if ($0=="") $0="(no reason)"; print; exit } }')" && \
          [ -n "$lock_reason" ]; then
+      # ga-vs6shu: a BARE lock (`git worktree lock` with no --reason) prints as a lone
+      # `locked` line, so the awk above used to yield "" and `[ -n ]` failed — this loop
+      # silently skipped it (skipped_dirty, no event) while the pool loop maps the same
+      # shape to "(no reason)" and reaps it. Same word here, so both loops agree; an empty
+      # lock_reason now means only "not locked" (or git itself failed → stays kept).
       # plain remove was refused by a LOCK — reap ONLY if the holder is a zombie, else keep.
       reap_zombie_locked "$GT" "$d" "" "$lock_reason" "$age" "town"; zrc1=$?
       case "$zrc1" in
@@ -678,7 +797,7 @@ for WT_DIR in $WT_DIRS; do
           # ga-vs6shu: same split as the pool-worktree loop above — give an
           # unparseable (not pid-confirmed-zombie) lock one independent
           # safety-net chance before parking it forever; 0=reaped, 1=kept.
-          if _reap_or_log_unparseable_lock "$GT" "$d" "" "$lock_reason" "$age" "town"; then
+          if _reap_or_log_unparseable_lock "$GT" "$d" "" "$lock_reason" "$age" "town" "$_ZL_VERDICT"; then
             reaped=$((reaped+1))
           else
             skipped_dirty=$((skipped_dirty+1))
@@ -730,6 +849,6 @@ for _repo in "$GT"/*/; do
   fi
 done
 
-printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s}\n' \
-  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" >> "$LOG" 2>/dev/null
+printf '{"ts":"%s","event":"sweep","mode":"%s","free_gb":%s,"gate_hours":%s,"reaped":%s,"pool_reaped":%s,"zombie_reaped":%s,"preserved_dirty":%s,"branches_deleted":%s,"skipped_dirty":%s,"kept":%s,"session_list":"%s","kept_session_list_unavailable":%s}\n' \
+  "$(ts)" "$mode" "$free_gb" "$gate_hours" "$reaped" "$pool_reaped" "$zombie_reaped" "$preserved_dirty" "$branches_deleted" "$skipped_dirty" "$kept" "${_WT_REAPER_SESSION_STATE:-unused}" "$kept_session_list_unavailable" >> "$LOG" 2>/dev/null
 exit 0
