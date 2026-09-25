@@ -91,22 +91,56 @@ VERDICT_TIMEOUT_MAX_MINUTES=10
 eq "MAX=10 < base=22 → base"              "$(gate_scaled_verdict_timeout 22 5 300)"    "22"
 VERDICT_TIMEOUT_MAX_MINUTES=50
 
+# lib_var NAME [ENV=VAL ...] — value of NAME after sourcing the dispatcher in
+# lib-only mode inside a FRESH child (ENV=VAL are that child's hostile env), or the
+# literal "<unreadable>" if the child could not report it. Sections 6 and 7 use it
+# instead of `( … bash -c 'source …; echo "$X"' ) | { read -r v; eq … "$v"; }`,
+# which had two defects (ga-5hw36b, both measured 2026-09-25):
+#   1. `read` takes the FIRST stdout line, but sourcing the dispatcher runs
+#      git-lock-hygiene.sh's top level (before its lib-only return), and when
+#      `gc rig list` fails or times out under host load that branch calls notify,
+#      whose "Logged for digest (…): Git-lock hygiene" goes to STDOUT. It arrived
+#      before the value in 50 of 120 stress runs; `read -r ttl maxm` then put
+#      those words in maxm and `$((maxm + 20))` died under `set -u` ("digest:
+#      unbound variable"), exit 1 — or 141 (SIGPIPE) depending on the race.
+#   2. A pipeline's right side is a SUBSHELL, so eq()'s PASS/FAIL bumps were lost:
+#      with the TTL margin broken (20→5) the suite printed the ✗ line and still
+#      ended "34 passed, 0 failed", exit 0.
+# So: drop the child's stdout while it sources, emit the value on ONE tagged line,
+# keep only tagged lines, and hand the value back by command substitution so eq()
+# runs in THIS shell and its counters count. The knobs these sections assert on are
+# scrubbed from the inherited env first (an exported override would make section 7
+# read the override instead of the derivation); callers re-add what they need.
+# "$BASH" (not PATH `bash`) so /bin/bash 3.2 and bash 5 each test their own child.
+lib_var() {
+  local name="$1" out; shift
+  out="$(env -u VERDICT_TIMEOUT_MINUTES -u VERDICT_TIMEOUT_MAX_MINUTES \
+            -u VERDICT_TIMEOUT_PER_FILE_MINUTES -u VERDICT_TIMEOUT_PER_100_LINES_MINUTES \
+            -u REVIEWER_SESSION_TTL_MINUTES \
+            GATE_DISPATCHER_LIB_ONLY=1 "$@" "${BASH:-bash}" -c '
+              source "$1" >/dev/null 2>&1 || exit 97
+              printf "@@LIBVAR@@%s\n" "${!2}"
+            ' _ "$DISPATCHER" "$name" 2>/dev/null | grep '^@@LIBVAR@@' | tail -n 1)" || true
+  if [ -n "$out" ]; then printf '%s' "${out#@@LIBVAR@@}"; else printf '<unreadable>'; fi
+}
+
 # ── 6. config defaults + sanitization (re-source with hostile env) ────────────
 echo "── 6. config block sanitization ──"
-( VERDICT_TIMEOUT_MAX_MINUTES="garbage" GATE_DISPATCHER_LIB_ONLY=1 \
-    bash -c 'source "'"$DISPATCHER"'"; echo "$VERDICT_TIMEOUT_MAX_MINUTES"' 2>/dev/null ) \
-  | { read -r v; eq "garbage MAX → default 50" "$v" "50"; }
-( VERDICT_TIMEOUT_MAX_MINUTES="5" GATE_DISPATCHER_LIB_ONLY=1 \
-    bash -c 'source "'"$DISPATCHER"'"; echo "$VERDICT_TIMEOUT_MAX_MINUTES"' 2>/dev/null ) \
-  | { read -r v; eq "MAX below base floored to base (15 floor)" "$v" "22"; }
-( VERDICT_TIMEOUT_PER_FILE_MINUTES="nope" GATE_DISPATCHER_LIB_ONLY=1 \
-    bash -c 'source "'"$DISPATCHER"'"; echo "$VERDICT_TIMEOUT_PER_FILE_MINUTES"' 2>/dev/null ) \
-  | { read -r v; eq "garbage PER_FILE → default 1" "$v" "1"; }
+eq "garbage MAX → default 50" \
+   "$(lib_var VERDICT_TIMEOUT_MAX_MINUTES VERDICT_TIMEOUT_MAX_MINUTES=garbage)" "50"
+eq "MAX below base floored to base (15 floor)" \
+   "$(lib_var VERDICT_TIMEOUT_MAX_MINUTES VERDICT_TIMEOUT_MAX_MINUTES=5)" "22"
+eq "garbage PER_FILE → default 1" \
+   "$(lib_var VERDICT_TIMEOUT_PER_FILE_MINUTES VERDICT_TIMEOUT_PER_FILE_MINUTES=nope)" "1"
 
 # ── 7. REVIEWER_SESSION_TTL derives from the MAX cap (reaper-safety) ───────────
 echo "── 7. reviewer-session TTL tracks the scaled ceiling ──"
-( GATE_DISPATCHER_LIB_ONLY=1 bash -c 'source "'"$DISPATCHER"'"; echo "$REVIEWER_SESSION_TTL_MINUTES $VERDICT_TIMEOUT_MAX_MINUTES" ' 2>/dev/null ) \
-  | { read -r ttl maxm; eq "TTL = MAX + 20 margin" "$ttl" "$((maxm + 20))"; }
+_ttl="$(lib_var REVIEWER_SESSION_TTL_MINUTES)"
+_maxm="$(lib_var VERDICT_TIMEOUT_MAX_MINUTES)"
+case "$_maxm" in
+  ''|*[!0-9]*) bad "TTL = MAX + 20 margin: could not read the ceiling (got [$_maxm]) — cannot derive the expected TTL" ;;
+  *)           eq  "TTL = MAX + 20 margin" "$_ttl" "$((_maxm + 20))" ;;
+esac
 
 # ── 8. DRIFT-GUARD: live script must wire the scaling into the sweep ──────────
 echo "── 8. drift-guard: wiring present in live dispatcher ──"
