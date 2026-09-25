@@ -2547,6 +2547,58 @@ gate_base_test_outside_subtree() {
   return 0
 }
 
+# gate_bash32_verdict <changed> <checked> <failed>
+#   ga-7dx2vw: collapses the bash-3.2 syntax check's raw counts (computed by
+#   the impure Step 5b-pre3 block below: how many .sh files under
+#   packs/town-deltas/assets/ or scripts/ were added/changed on the branch,
+#   how many of those were successfully extracted and run through
+#   `/bin/bash -n`, and how many of THOSE failed to parse) into exactly ONE
+#   of four named states — same third-state discipline as
+#   gate_base_test_verdict just above (never collapse "couldn't measure"
+#   into "measured and clean").
+#     sem-sh-alterado    — changed=0 (confirmed): the branch touches no .sh
+#                           file under either protected tree. Never blocks.
+#     nao-consegui-medir — changed>0 but checked!=changed (worktree/git-show
+#                           extraction failed for at least one file, or
+#                           /bin/bash itself was unusable) — an INCOMPLETE
+#                           measurement is never treated as proof of either
+#                           outcome. Never blocks (fail-open on uncertainty,
+#                           same posture as every other submission-time
+#                           check in this file).
+#     bash32-ok          — changed>0, every file measured, ALL parse clean
+#                           under /bin/bash -n. Never blocks.
+#     bash32-fail        — changed>0, every file measured, AT LEAST ONE
+#                           fails to parse under /bin/bash -n. BLOCKS — this
+#                           is exactly the ga-6aj348 incident: code that
+#                           passed review AND whatever ran under the PATH's
+#                           Homebrew bash 5.3 but could not parse under the
+#                           real /bin/bash 3.2 interpreter these scripts are
+#                           actually launchd-invoked with (com.gascity.*
+#                           plists hardcode /bin/bash, never PATH bash).
+#   Pure (no IO) — the impure call site does all git/worktree/bash -n work
+#   and passes in only these three counts.
+gate_bash32_verdict() {
+  local changed="$1" checked="$2" failed="$3"
+  case "$changed" in
+    ''|*[!0-9]*) printf 'nao-consegui-medir'; return 0 ;;
+  esac
+  if [ "$changed" -eq 0 ]; then
+    printf 'sem-sh-alterado'
+    return 0
+  fi
+  case "$checked" in ''|*[!0-9]*) checked=0 ;; esac
+  case "$failed" in ''|*[!0-9]*) failed=0 ;; esac
+  if [ "$checked" -ne "$changed" ]; then
+    printf 'nao-consegui-medir'
+    return 0
+  fi
+  if [ "$failed" -gt 0 ]; then
+    printf 'bash32-fail'
+  else
+    printf 'bash32-ok'
+  fi
+}
+
 # gate_bead_sibling_status_lines <gc_city> <bead_id> — bd-backed. Builds the
 # "<branch><TAB><gate-status-value><TAB><rig>" lines for every marker/gate-run
 # tied to $bead_id (source-bead:$bead_id label), skipping closed markers
@@ -5552,6 +5604,110 @@ else
   _ABT_SKIP_ARM="<UNKNOWN>"
   if [ -n "$BEAD_ID" ]; then _ABT_SKIP_ARM=$(gate_ab_arm_for_bead "$BEAD_ID"); fi
   log "AB-SKIP bead=${BEAD_ID:-<EMPTY>} arm=$_ABT_SKIP_ARM marker=$MARKER_ID branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} reason=inputs-unresolved"
+fi
+
+# ── Step 5b-pre3 (ga-7dx2vw): submission-time /bin/bash-3.2 syntax check for
+# city-infra scripts ──────────────────────────────────────────────────────────
+# 2026-09-25 incident: ga-6aj348 (00d526a76) passed reviewer verdicts and
+# whatever ran under the PATH's Homebrew bash 5.3, but broke quality-gate-
+# dispatcher.sh's own parse under /bin/bash 3.2 — the ACTUAL interpreter every
+# gate/pilot/witness/deacon daemon runs under (every com.gascity.* launchd
+# plist hardcodes /bin/bash in ProgramArguments; PATH bash on this machine is
+# Homebrew 5.3, which silently accepts syntax 3.2 rejects). The gate itself
+# WAS the broken component: no reviewer could be spawned for 3h (21 markers
+# queued, incl. a P0) until a human-triggered emergency revert (79392548f)
+# landed straight to main. shellcheck -s bash does NOT catch this — it is not
+# a shellcheck-recognized construct at all, it is a raw bash-3.2 PARSER
+# limitation (measured root cause: a `case...esac` whose closing `esac`
+# directly abuts a `$(...)` command substitution's own closing `)` with no
+# separating newline — bash 3.2 misparses the `;;` immediately before it;
+# bash 4+ parses it fine). Only the real /bin/bash 3.2 binary reproduces it.
+#
+# Scope: every .sh file added/changed on the branch under
+# packs/town-deltas/assets/ or scripts/ — the two trees every gate/pilot/
+# witness/deacon daemon in this city loads from, and (per those daemons' own
+# launchd plists) the trees that actually run under /bin/bash 3.2, never PATH
+# bash. Other rigs' own scripts never live under these two paths, so for a
+# bead whose branch doesn't touch gascity's own infra this check costs one
+# empty git diff and nothing else.
+#
+# Deterministic and cheap (bash -n never executes anything, just parses) —
+# unlike the ga-rstae check just above, this is NOT an A/B experiment: it
+# always runs, every submission, both arms.
+#
+# Fail-OPEN only on genuine uncertainty (RIG_PATH/fetch/rev-parse/merge-base
+# failure, git-show extraction failure, or /bin/bash itself missing/non-
+# executable — never on this machine, but this guard can in principle run on
+# any host that owns the rig) — never on a CONFIRMED syntax failure, which is
+# exactly what this check exists to block. gate_bash32_verdict enforces the
+# third-state discipline (nao-consegui-medir != bash32-ok).
+if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
+  _B32_VERDICT="nao-consegui-medir"   # pessimistic default; only upgraded
+                                       # below once merge-base actually
+                                       # resolves — mirrors _ABT_VERDICT's own
+                                       # convention just above (ga-rstae):
+                                       # a total git-resolution failure must
+                                       # never compute gate_bash32_verdict on
+                                       # changed=0, which would misreport as
+                                       # the CONFIRMED-zero state
+                                       # (sem-sh-alterado) instead of the
+                                       # honest "couldn't tell" state.
+  _B32_CHANGED=0; _B32_CHECKED=0; _B32_FAILED=0; _B32_DETAIL=""; _B32_FILES=""
+  git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
+  _B32_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
+  _B32_BRANCH_SHA=$(git -C "$RIG_PATH" rev-parse "origin/$BRANCH" 2>/dev/null || echo "")
+  if [ -n "$_B32_MAIN_SHA" ] && [ -n "$_B32_BRANCH_SHA" ] && [ -x /bin/bash ]; then
+    _B32_BASE=$(git -C "$RIG_PATH" merge-base "$_B32_BRANCH_SHA" "$_B32_MAIN_SHA" 2>/dev/null || echo "")
+    if [ -n "$_B32_BASE" ]; then
+      _B32_FILES=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${_B32_BASE}..${_B32_BRANCH_SHA}" -- 'packs/town-deltas/assets' 'scripts' 2>/dev/null | grep '\.sh$' || true)
+      if [ -n "$_B32_FILES" ]; then
+        _B32_CHANGED=$(printf '%s\n' "$_B32_FILES" | grep -c .)
+        _B32_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-b32-XXXXXX" 2>/dev/null || echo "")
+        if [ -n "$_B32_WT" ]; then
+          while IFS= read -r _b32_f; do
+            [ -z "$_b32_f" ] && continue
+            mkdir -p "$(dirname "$_B32_WT/$_b32_f")" 2>/dev/null
+            if git -C "$RIG_PATH" show "${_B32_BRANCH_SHA}:$_b32_f" > "$_B32_WT/$_b32_f" 2>/dev/null; then
+              _B32_CHECKED=$((_B32_CHECKED + 1))
+              _b32_err=$(/bin/bash -n "$_B32_WT/$_b32_f" 2>&1) || {
+                _B32_FAILED=$((_B32_FAILED + 1))
+                _b32_err="${_b32_err//$_B32_WT\//}"
+                _B32_DETAIL="${_B32_DETAIL}${_B32_DETAIL:+
+}$_b32_f: $_b32_err"
+              }
+            fi
+          done <<B32_FILES_EOF
+$_B32_FILES
+B32_FILES_EOF
+          rm -rf "$_B32_WT" 2>/dev/null
+        fi
+      fi
+      _B32_VERDICT=$(gate_bash32_verdict "$_B32_CHANGED" "$_B32_CHECKED" "$_B32_FAILED")
+    fi
+  fi
+  case "$_B32_VERDICT" in
+    bash32-fail)
+      err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 (the real interpreter these scripts run under). Refusing at submission."
+      set_gate_status "$MARKER_ID" "error"
+      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: bash-3.2 syntax check (ga-7dx2vw).
+$_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 — the real interpreter every gate/pilot/witness/deacon daemon runs under (launchd hardcodes /bin/bash; Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
+$_B32_DETAIL
+Fix the syntax (a measured recurring cause: a case...esac whose closing \`)\` directly abuts a \$(...) command substitution's own closing \`)\` with no newline between them — bash 3.2 misparses that), verify locally with:
+  /bin/bash -n <file>
+then push again:
+  git push origin $BRANCH
+Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): bash32-syntax-check failed for $MARKER_ID (gate-status:error)."
+      exit 1
+      ;;
+    bash32-ok)
+      log "  bash32-syntax-check (ga-7dx2vw): $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ all parse cleanly under /bin/bash 3.2."
+      ;;
+    nao-consegui-medir)
+      log "  bash32-syntax-check (ga-7dx2vw): could not fully measure (changed=$_B32_CHANGED checked=$_B32_CHECKED) — fail-open, not blocking."
+      ;;
+    sem-sh-alterado) : ;;
+  esac
 fi
 
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
