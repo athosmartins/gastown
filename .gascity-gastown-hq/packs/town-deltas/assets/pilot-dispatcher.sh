@@ -1948,6 +1948,15 @@ _pilot_ram_pressure_unreadable() {
 # a peak-swap guard, not a safety invariant, so a probe hiccup must never
 # itself block dispatch.
 #
+# ga-oa004t: that reasoning is SUPERSEDED for this script's spawn gates and no
+# longer describes them. A probe hiccup is load-correlated (`gc session list`
+# takes 7–10s at load 55+), so failing open switched the cap off exactly when
+# it mattered (wa-worker at 5 active vs a cap of 2). Pilot's gates now call
+# _pilot_variable_session_count below, which is fail-CLOSED. This function is
+# kept only as the byte-identical twin of quality-gate-dispatcher.sh's copy
+# (variable-session-cap.selftest.sh pins the two bodies); its own fail-open
+# read is the gate dispatcher's open follow-up, not a Pilot behavior.
+#
 # Deliberately a FRESH query every call, never the sweep-level $_SESSIONS_JSON
 # snapshot (fetched once, early, at "gc session list" below) — dispatch_one()
 # runs once per candidate within a single sweep, and a session spawned for an
@@ -1967,6 +1976,87 @@ gc_variable_session_count() {
   timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
     | jq '[.sessions[]? | select((.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer") and (.state=="active" or .state=="creating"))] | length' 2>/dev/null \
     || echo "0"
+}
+
+# ── ga-oa004t: fail-CLOSED live-session count for every SPAWN gate ────────────
+# gc_variable_session_count above (and the per-pool probes it was copied from)
+# read `timeout 10 gc session list | jq … || echo "0"`: a probe that fails or
+# times out is indistinguishable from "no sessions", so the cap reads as free
+# capacity and the dispatcher SPAWNS. Measured 2026-09-25: `gc session list
+# --json` takes 7–10s under load 55+ against that 10s budget, so the guard
+# turned itself off exactly when the box was most loaded (wa-worker pool
+# reached 5 active with PILOT_WA_WORKER_MAX=2 → swap 9 GB → disk 4.4 GB).
+# ga-in9ebr's pre-claim probe already treats "unreadable" as a THIRD state and
+# named dispatch_one()'s fresh re-check as the safety net — but that re-check
+# was this same fail-open read, so the net had a hole.
+#
+# _pilot_live_session_count <template>... — sets _PLSC_N to the LIVE count for
+# the union of the given templates and returns 0; returns 1 with _PLSC_N empty
+# when the count cannot be READ (probe failed / timed out / malformed / error
+# envelope / no .sessions array). A caller that is about to spawn MUST treat
+# rc=1 as "do not spawn": the INERT default under doubt (a skipped spawn
+# retries next sweep — a wrongly opened session is memory the machine may not
+# have).
+#
+# NEVER call via $(...): like _pilot_pool_live_count it reports through an
+# out-param, because it also sets the STICKY per-sweep flag _PLSC_UNREADABLE —
+# an assignment inside a command substitution dies with the subshell. Once one
+# probe has failed this sweep every later gate fails FAST instead of paying its
+# own full timeout: with `session list` hung, top-up (x2 pools) plus one probe
+# per dispatch_one() candidate would otherwise stretch a sweep past 10 minutes
+# and stall the rest of the Pilot. The next sweep is a fresh process, so the
+# flag resets on its own — the cost of a transient blip is one skipped-spawn
+# sweep, never a wedge.
+#
+# "Live" = active + creating + start-pending. start-pending is a session the
+# controller has accepted but not yet started (seen live on a gate-reviewer):
+# it WILL become a process, so it counts; over-counting only delays a spawn.
+# The budget is PILOT_SESSION_LIST_TIMEOUT_SECS (default 30s, above the
+# measured 7–10s) — fail-closed makes a too-tight budget costly (a skipped
+# spawn), where it used to be silently free (a spawn past the cap).
+_PLSC_N=""            # out-param of _pilot_live_session_count / _pilot_variable_session_count
+_PLSC_UNREADABLE=""   # sticky per sweep: set by the first failed probe
+_pilot_live_session_count() {
+  local _plsc_json _plsc_tpl
+  _PLSC_N=""
+  [ -z "${_PLSC_UNREADABLE:-}" ] || return 1
+  if ! _plsc_tpl=$(printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null) \
+     || [ -z "$_plsc_tpl" ] || [ "$_plsc_tpl" = "[]" ]; then
+    _PLSC_UNREADABLE=1
+    return 1
+  fi
+  if ! _plsc_json=$(gc_json_or_unknown timeout "${PILOT_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json); then
+    _PLSC_UNREADABLE=1
+    return 1
+  fi
+  if ! _PLSC_N=$(printf '%s' "$_plsc_json" | jq -r --argjson t "$_plsc_tpl" \
+    'if (.sessions | type) == "array"
+     then ([.sessions[] | select((.template // "") as $x | $t | index($x))
+            | select(.state=="active" or .state=="creating" or .state=="start-pending")] | length)
+     else empty end' 2>/dev/null); then
+    _PLSC_N=""
+    _PLSC_UNREADABLE=1
+    return 1
+  fi
+  case "$_PLSC_N" in
+    ''|*[!0-9]*) _PLSC_N=""; _PLSC_UNREADABLE=1; return 1 ;;
+  esac
+  return 0
+}
+
+# _pilot_variable_session_count — the ga-jezvn GLOBAL count (wa-worker +
+# ps-worker + gate-reviewer) with _pilot_live_session_count's contract (out-param
+# _PLSC_N, NEVER via $(...)). Honors GC_VARIABLE_SESSION_COUNT_OVERRIDE like the
+# function above. Pilot's own spawn gates call THIS, not gc_variable_session_count:
+# that one stays untouched because its body is pinned byte-identical to the gate
+# dispatcher's copy (variable-session-cap.selftest.sh), whose own fail-open read
+# is a separate delivery (see ga-oa004t's follow-up).
+_pilot_variable_session_count() {
+  if [ -n "${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}" ]; then
+    _PLSC_N="$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
+    return 0
+  fi
+  _pilot_live_session_count wa-worker ps-worker gate-reviewer
 }
 
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
@@ -7348,6 +7438,19 @@ _pilot_topup_spawn() {
   if [ "$_rc" -eq 0 ]; then
     return 0
   fi
+  # ga-oa004t: exit 124 is `timeout` killing the CLI, NOT "the session was not
+  # created" — the outcome is UNKNOWN. `gc session new` takes ~50s under load
+  # (against this 60s budget) and creates the session bead BEFORE it finishes:
+  # measured 2026-09-25, the session bead landed 2s (12:54:02) and 6s (14:59:49)
+  # before the kill — and the blind retry below then opens a SECOND session for
+  # the same bead. A timeout collapsed to "failed" is the same error-vs-empty
+  # collapse as the live-count probe: under doubt the INERT state wins, so give
+  # up for this sweep with no retry. If a session did land it is counted by the
+  # next sweep's live probe; if none did, the next sweep's top-up retries anyway.
+  if [ "$_rc" -eq 124 ]; then
+    warn "ga-oa004t: pool top-up spawn for $_pool ($_pending) TIMED OUT after ${PILOT_SPAWN_TIMEOUT_SECS:-60}s (exit=124): ${_err:-<no stderr captured>} — outcome UNKNOWN (the session may already exist) — NOT retrying this sweep; the next sweep's live count decides."
+    return 1
+  fi
   warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 1/2 (exit=$_rc): ${_err:-<no stderr captured>} — retrying once this sweep"
   # ga-kmm6rb: a brief pause before retrying, not an instant back-to-back
   # call. The corroborating evidence (Mayor's manual reproduction) was a
@@ -7363,7 +7466,11 @@ _pilot_topup_spawn() {
     log "  ga-kmm6rb: pool top-up spawn for $_pool ($_pending) succeeded on retry (attempt 1 had failed, see prior warn line)."
     return 0
   fi
-  warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 2/2 -- retry also failed (exit=$_rc): ${_err:-<no stderr captured>} — giving up this sweep, will retry next sweep."
+  local _to_hint=""
+  if [ "$_rc" -eq 124 ]; then
+    _to_hint=" (exit 124 = timed out: the session may still have been created — the next sweep's live count decides, ga-oa004t)"
+  fi
+  warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 2/2 -- retry also failed (exit=$_rc): ${_err:-<no stderr captured>} — giving up this sweep, will retry next sweep.${_to_hint}"
   return 1
 }
 
@@ -7390,20 +7497,28 @@ _pilot_pool_topup() {
   elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
     _live="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
   else
-    # `|| echo "0"` mirrors every sibling live-count probe in this file (e.g.
-    # gc_variable_session_count, the ga-mfeip cap-check above): without it, a
-    # missing `timeout` binary (127, "command not found" — genuinely absent
-    # from PATH in some harnesses/environments, not merely a bd/gc failure)
-    # leaves the substitution both EMPTY and non-zero-exit with nothing to
-    # consume that status, which — confirmed by direct bisection, bash
-    # 5.3.15 — aborts the whole script despite `set -e` being OFF. The
-    # trailing `case` below is defense in depth (handles a non-numeric but
-    # non-empty result), not a substitute for this.
-    _live=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
-      | jq --arg t "$_pool" '[.sessions[]? | select(.template==$t and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+    # ga-oa004t: an UNREADABLE count is not "0 live" — it used to be (`|| echo
+    # "0"`), so a `gc session list` that timed out under load (7–10s measured,
+    # against a 10s budget) read as a free pool and this step spawned past the
+    # cap. Now three states: a count, or "cannot read" → spawn nothing this
+    # sweep (INERT; the next sweep re-probes). `_pilot_live_session_count`
+    # also returns 1 when `timeout` itself is missing (127), so that old
+    # failure mode is covered by the same branch — no `set -e` abort either,
+    # since the assignment sits in an `if !`.
+    if ! _pilot_live_session_count "$_pool"; then
+      # (Worded "top-up gate", not "pool top-up": existing scenarios read the bare substring "pool top-up"
+      # as "a top-up spawn was ATTEMPTED"; this line reports the opposite — that none was.)
+      log "  ga-oa004t: top-up gate — cannot read the $_pool live session count (session list unreadable/timed out) — NOT spawning this sweep (fail-closed; the next sweep re-probes)."
+      return 0
+    fi
+    _live="$_PLSC_N"
   fi
   case "$_live" in ''|*[!0-9]*) _live=0 ;; esac
-  _global=$(gc_variable_session_count)
+  if ! _pilot_variable_session_count; then
+    log "  ga-oa004t: top-up gate — cannot read the global variable-session count (session list unreadable/timed out) — NOT spawning $_pool this sweep (fail-closed; the next sweep re-probes)."
+    return 0
+  fi
+  _global="$_PLSC_N"
   case "$_global" in ''|*[!0-9]*) _global=0 ;; esac
 
   while [ "$_live" -lt "$_max" ] && [ "$_global" -lt "$GC_VARIABLE_SESSION_MAX" ]; do
@@ -7458,7 +7573,7 @@ _pilot_pool_topup() {
     fi
     log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
     if _pilot_topup_spawn "$_pool" "$_pending"; then
-      log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending."
+      log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending. [ga-oa004t path=pool-topup pool_live=$((_live + 1))/$_max global=$((_global + 1))/$GC_VARIABLE_SESSION_MAX]"
       _live=$((_live + 1))
       _global=$((_global + 1))
     else
@@ -8368,8 +8483,11 @@ fi
 #   2. _pilot_pool_cap_full_for — dispatch_lane()'s PRE-claim skip for a bead ALREADY
 #      committed (gc.routed_to) to a pool that is positively at cap: zero writes.
 # Only a positive "pool is full" reading skips. Every "cannot tell" path (probe failed,
-# non-numeric, unknown pool, kill switch) returns 1 = proceed, so an unreadable session
-# list never suppresses a dispatch; dispatch_one() re-checks fresh regardless. The per-sweep
+# non-numeric, unknown pool, kill switch) returns 1 = proceed to the claim, so an unreadable
+# session list never makes THIS pre-claim skip fire on a guess. That is all this function
+# decides: dispatch_one() then re-probes fresh and, if it cannot read the count either, spawns
+# NOTHING and releases the claim (ga-oa004t, fail-closed) — this pre-claim step being
+# permissive is not what lets a worker past the cap. The per-sweep
 # count cache can be stale (sweeps run ~5min apart and it is only ever bumped UP after this
 # script's own spawns), which can defer a bead by at most one sweep — never strand it.
 _PCAP_LIVE_WA=""   # per-sweep cache of the live wa-worker count ("" = not probed yet)
@@ -8385,7 +8503,7 @@ _PCAP_WARNED_PS=""
 # _pilot_pool_live_count <wa-worker|ps-worker> — sets _PCAP_N, returns 0 iff the count is
 # a real integer. NEVER call via $(...): the per-sweep cache lives in the caller's shell.
 _pilot_pool_live_count() {
-  local _pool="$1" _n="" _sl=""
+  local _pool="$1" _n=""
   case "$_pool" in
     wa-worker)
       _n="${_PCAP_LIVE_WA:-}"
@@ -8400,13 +8518,14 @@ _pilot_pool_live_count() {
     *) return 1 ;;
   esac
   if [ -z "$_n" ]; then
+    # ga-oa004t: the ONE shared probe — _pilot_live_session_count is what dispatch_one() and
+    # _pilot_pool_topup call too, so all four spawn gates agree on what "live" means
+    # (active+creating+start-pending) and on what an UNREADABLE count is. It builds on
     # gc_json_or_unknown (ga-07509), not `… || echo ""`: a failing gc still prints an error envelope
     # (e.g. {"ok":false,…}) that parses as valid JSON and would count as "0 sessions" — a KNOWN zero,
     # indistinguishable from a genuinely empty pool. It yields data or FAILURE, and a reply with no
-    # .sessions array is unknown too. Same active+creating count as dispatch_one() and _pilot_pool_topup.
-    if _sl=$(gc_json_or_unknown timeout 10 gc --city "$GC_CITY" session list --json); then
-      _n=$(printf '%s' "$_sl" | jq -r --arg t "$_pool" 'if (.sessions | type) == "array" then ([.sessions[] | select(.template==$t and (.state=="active" or .state=="creating"))] | length) else empty end' 2>/dev/null || echo "")
-    fi
+    # .sessions array is unknown too. (Out-param, so this runs in the caller's shell — see there.)
+    if _pilot_live_session_count "$_pool"; then _n="$_PLSC_N"; fi
   fi
   case "$_n" in
     ''|*[!0-9]*)
@@ -8418,12 +8537,12 @@ _pilot_pool_live_count() {
         wa-worker)
           if [ -z "${_PCAP_WARNED_WA:-}" ]; then
             _PCAP_WARNED_WA=1
-            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for wa-worker this sweep; dispatch_one() re-checks fresh."
+            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for wa-worker this sweep; dispatch_one() re-checks fresh and, if it cannot read the count either, spawns NOTHING (ga-oa004t fail-closed)."
           fi ;;
         ps-worker)
           if [ -z "${_PCAP_WARNED_PS:-}" ]; then
             _PCAP_WARNED_PS=1
-            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for ps-worker this sweep; dispatch_one() re-checks fresh."
+            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for ps-worker this sweep; dispatch_one() re-checks fresh and, if it cannot read the count either, spawns NOTHING (ga-oa004t fail-closed)."
           fi ;;
       esac
       return 1 ;;
@@ -8501,6 +8620,23 @@ _pilot_release_pool_cap_queued() {
   bd -C "$_city" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
   bd -C "$_city" update "$_bid" --unset-metadata "pilot.sling_bead" -q 2>/dev/null || true
   _pilot_capacity_queued "$_bid" "${3:-}"
+  return 0
+}
+
+# _pilot_release_count_unreadable <bead_id> <bead_city> [<builder>] — ga-oa004t: dispatch_one()'s
+# fail-CLOSED exit when the live session count (per-pool or global) could not be READ. Same release as
+# _pilot_release_pool_cap_queued (claim label + stamp + stale sling fingerprint gone, gc.routed_to left
+# SET so the pool top-up and worker self-serve still see the bead, virtual builder slot given back) — but
+# deliberately NOT _pilot_capacity_queued: that feeds POOL_CAP_QUEUED, i.e. the "POOL-SATURATED sweep —
+# backpressure, not a stall" marker, and a dead `session list` is not a busy pool. Left un-flagged, the
+# sweep counts it in NONQUEUE_FAILS, so the Step 5 stall gate still sees a sweep that dispatched nothing
+# because it could not tell whether it MAY (and the pilot_sweep event files it under failed_other).
+_pilot_release_count_unreadable() {
+  local _bid="$1" _city="$2"
+  bd -C "$_city" label remove "$_bid" "pilot:dispatching" -q 2>/dev/null || true
+  bd -C "$_city" update "$_bid" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+  bd -C "$_city" update "$_bid" --unset-metadata "pilot.sling_bead" -q 2>/dev/null || true
+  if [ -n "${3:-}" ]; then unmark_pool_builder "$3"; fi
   return 0
 }
 
@@ -10233,7 +10369,15 @@ TASK
           # per-pool cap below. See the GC_VARIABLE_SESSION_MAX header (top of
           # file) for why this releases the claim instead of falling through
           # to the supervisor hand-off the per-pool cap uses.
-          _gc_variable_count=$(gc_variable_session_count)
+          # ga-oa004t: an UNREADABLE global count is not "0 live" (see
+          # _pilot_live_session_count) — fail CLOSED: release the claim, spawn nothing.
+          if ! _pilot_variable_session_count; then
+            log "  ga-oa004t: cannot read the global variable-session count (session list unreadable/timed out) — NOT spawning wa-worker for $STORY_ID (fail-closed: claim released, story:approved + gc.routed_to=wa-worker kept; the next sweep re-probes)."
+            _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_count_unreadable"
+            return 1
+          fi
+          _gc_variable_count="$_PLSC_N"
           if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
             log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -10247,12 +10391,14 @@ TASK
           # Each sweep dispatches a bead then spawns a session. Without a cap check,
           # rapid re-sweeps (or slow session startup) spawn N sessions for M beads
           # where N >> M (the prior 39-session runaway). Count active + creating
-          # sessions; skip the spawn if at cap (gc.routed_to=wa-worker set —
+          # (+ start-pending, ga-oa004t) sessions; skip the spawn if at cap (gc.routed_to=wa-worker set —
           # ga-93yxc: this script's OWN pool top-up step, Step 2d earlier in
           # this sweep (before the fresh-candidates scan), retries on a later
           # sweep once a slot frees — NOT the supervisor scale_check, which
           # does not auto-spawn wa-worker (agent.toml opts out; measured live,
-          # see Step 2d's header comment). Fail-open on probe error.
+          # see Step 2d's header comment). Fail-CLOSED on probe error
+          # (ga-oa004t: this used to say "fail-open", and a timed-out probe
+          # read as 0 live — the spawn the cap exists to prevent).
           #
           # ga-in9ebr: at cap the bead is QUEUED — claim released, return 1 —
           # and NOT allowed to fall through to the story:in-flight +
@@ -10264,9 +10410,14 @@ TASK
           # that stops the claim→cap→release churn on later sweeps.
           if [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then
             _live_wa_count="$PILOT_TEST_WA_WORKER_LIVE_COUNT"
+          elif _pilot_live_session_count wa-worker; then
+            _live_wa_count="$_PLSC_N"
           else
-            _live_wa_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
-              | jq '[.sessions[]? | select(.template=="wa-worker" and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+            # ga-oa004t: unreadable ≠ 0 live — fail CLOSED (see _pilot_live_session_count).
+            log "  ga-oa004t: cannot read the wa-worker live session count (session list unreadable/timed out) — NOT spawning wa-worker for $STORY_ID (fail-closed: claim released, story:approved + gc.routed_to=wa-worker kept; the next sweep re-probes)."
+            _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_count_unreadable"
+            return 1
           fi
           _live_wa_count="${_live_wa_count:-0}"
           if [ "${_live_wa_count:-0}" -ge "${PILOT_WA_WORKER_MAX:-4}" ] 2>/dev/null; then
@@ -10282,7 +10433,7 @@ TASK
             if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new wa-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
-              log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET)."
+              log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET). [ga-oa004t path=dispatch_one pool_live_before=$_live_wa_count max=${PILOT_WA_WORKER_MAX:-4}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi
             else
@@ -10317,7 +10468,14 @@ TASK
         if [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ]; then
           # ── ga-jezvn: GLOBAL variable-session cap — mirrors the wa-worker
           # branch above; see the GC_VARIABLE_SESSION_MAX header (top of file).
-          _gc_variable_count=$(gc_variable_session_count)
+          # ga-oa004t: unreadable global count → fail CLOSED (mirrors the wa-worker branch).
+          if ! _pilot_variable_session_count; then
+            log "  ga-oa004t: cannot read the global variable-session count (session list unreadable/timed out) — NOT spawning ps-worker for $STORY_ID (fail-closed: claim released, story:approved + gc.routed_to=ps-worker kept; the next sweep re-probes)."
+            _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_count_unreadable"
+            return 1
+          fi
+          _gc_variable_count="$_PLSC_N"
           if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
             log "  ga-jezvn: GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED for $STORY_ID (claim released, story:approved retained; this script's own next sweep re-checks fresh)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
@@ -10329,9 +10487,14 @@ TASK
           fi
           if [ -n "${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}" ]; then
             _live_ps_count="$PILOT_TEST_PS_WORKER_LIVE_COUNT"
+          elif _pilot_live_session_count ps-worker; then
+            _live_ps_count="$_PLSC_N"
           else
-            _live_ps_count=$(timeout 10 gc --city "$GC_CITY" session list --json 2>/dev/null \
-              | jq '[.sessions[]? | select(.template=="ps-worker" and (.state=="active" or .state=="creating"))] | length' 2>/dev/null || echo "0")
+            # ga-oa004t: unreadable ≠ 0 live — fail CLOSED (mirrors the wa-worker branch above).
+            log "  ga-oa004t: cannot read the ps-worker live session count (session list unreadable/timed out) — NOT spawning ps-worker for $STORY_ID (fail-closed: claim released, story:approved + gc.routed_to=ps-worker kept; the next sweep re-probes)."
+            _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+            DISPATCH_RESULT="rig_native_pool_count_unreadable"
+            return 1
           fi
           _live_ps_count="${_live_ps_count:-0}"
           if [ "${_live_ps_count:-0}" -ge "${PILOT_PS_WORKER_MAX:-2}" ] 2>/dev/null; then
@@ -10346,7 +10509,7 @@ TASK
             if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new ps-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
                 >/dev/null 2>&1; then
-              log "  ga-mfeip: ps-worker session spawned for $STORY_ID."
+              log "  ga-mfeip: ps-worker session spawned for $STORY_ID. [ga-oa004t path=dispatch_one pool_live_before=$_live_ps_count max=${PILOT_PS_WORKER_MAX:-2}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi
             else
@@ -10860,7 +11023,9 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #   queued_global_cap   left queued behind the combined ga-jezvn session cap — a different cause, kept apart
 #   spawn_failed        the worker session could not be spawned
 #   refused_by_guard    {<DISPATCH_RESULT of the guard>: n} — a deliberate refusal, not a fault
-#   failed_other        any other NAMED failure (assign / sling / in-flight) and any name not classified here
+#   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
+#                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t) and
+#                       any name not classified here
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it

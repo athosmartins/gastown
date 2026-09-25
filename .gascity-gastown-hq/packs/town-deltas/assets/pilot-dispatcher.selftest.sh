@@ -6784,7 +6784,7 @@ echo "$LOG_CQI" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null \
   && bad "CAPQ-I: a bead was skipped on an UNREADABLE count — a blind probe must never suppress a dispatch" \
   || ok "CAPQ-I: no skip on an unreadable count"
 [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] \
-  && ok "CAPQ-I: the bead fell through to dispatch_one (claimed) — today's fail-open path is preserved" \
+  && ok "CAPQ-I: the bead fell through to dispatch_one (claimed) — the PRE-claim probe still only skips on positive evidence (dispatch_one itself now fails CLOSED on an unreadable count: see CAPQ-P)" \
   || bad "CAPQ-I: the bead never reached dispatch_one although the count was unreadable"
 
 echo "Scenario CAPQ-I2 (ga-in9ebr): an UNREADABLE live count is probed ONCE per pool per sweep — each routed candidate must not pay another failing probe"
@@ -6799,14 +6799,28 @@ run_capq_dispatch "$CAPQ_NC1" "" "" "session-list-is-not-json" 0 1 >/dev/null; _
 _nc_log3="$(run_capq_dispatch "$CAPQ_NC3" "" "" "session-list-is-not-json" 0 1)"; _nc_on3=$(capq_sl_calls)
 run_capq_dispatch "$CAPQ_NC1" "" "" "session-list-is-not-json" 0 0 >/dev/null; _nc_off1=$(capq_sl_calls)
 run_capq_dispatch "$CAPQ_NC3" "" "" "session-list-is-not-json" 0 0 >/dev/null; _nc_off3=$(capq_sl_calls)
-if [ "$_nc_on1" -gt 0 ] 2>/dev/null && [ "$((_nc_off3 - _nc_off1))" -gt 0 ] 2>/dev/null; then
-  ok "CAPQ-I2: harness counted real 'gc session list' calls (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — not a vacuous pass"
+# ga-oa004t: the budget is now STRONGER than "once per pool". A sticky per-sweep flag (_PLSC_UNREADABLE) makes
+# every gate fail FAST once ONE probe has failed, so the number of `gc session list` calls no longer grows with
+# the candidate count AT ALL, with the pre-claim skip on or off. (It used to grow +1 per candidate through
+# dispatch_one()'s own fail-open re-probe — the very probe that read a timeout as "0 live" and spawned.) A flat
+# count could also mean the candidates never reached dispatch_one(), so "not vacuous" is proven twice: the
+# counter read real calls, AND all 3 candidates were claimed (reached dispatch_one and were refused there) in the
+# run whose count stayed flat ($STATE still holds that last run's bd calls).
+if [ "$_nc_on1" -gt 0 ] 2>/dev/null && [ "$_nc_off1" -gt 0 ] 2>/dev/null; then
+  ok "CAPQ-I2: harness counted real 'gc session list' calls (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — the counter is live"
 else
   bad "CAPQ-I2: the session-list call counter read nothing (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — the comparison below proves nothing"
 fi
-[ "$((_nc_on3 - _nc_on1))" = "$((_nc_off3 - _nc_off1))" ] \
-  && ok "CAPQ-I2: with the pre-claim skip ON, extra routed candidates add NO probe beyond dispatch_one's own (a failed probe is not retried per candidate)" \
-  || bad "CAPQ-I2: probe count grew faster with the pre-claim skip ON ($((_nc_on3 - _nc_on1)) vs $((_nc_off3 - _nc_off1)) for 2 extra candidates) — a failing probe is retried per routed candidate"
+_nc_claimed=0
+for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
+  [ "$(capq_n "label add $_nc_id pilot:dispatching")" -ge 1 ] && _nc_claimed=$((_nc_claimed + 1))
+done
+[ "$_nc_claimed" = "3" ] \
+  && ok "CAPQ-I2: all 3 candidates reached dispatch_one() (claimed) — a flat probe count is not because they were never tried" \
+  || bad "CAPQ-I2: only $_nc_claimed of 3 candidates reached dispatch_one() — the flat-count check below would be vacuous"
+[ "$_nc_on3" = "$_nc_on1" ] && [ "$_nc_off3" = "$_nc_off1" ] \
+  && ok "CAPQ-I2: extra routed candidates add NO 'session list' probe at all (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — after one unreadable probe every later gate fails fast" \
+  || bad "CAPQ-I2: probe count grew with the candidate count (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — a failing probe is re-paid per candidate, so a hung list stalls the sweep"
 _nc_warns=$(printf '%s\n' "$_nc_log3" | grep -c 'ga-in9ebr: cannot read the wa-worker live session count') || _nc_warns=0
 [ "$_nc_warns" = "1" ] \
   && ok "CAPQ-I2: with 3 routed candidates the unreadable-count warning is still announced exactly ONCE per sweep (the dedupe holds)" \
@@ -6835,6 +6849,66 @@ _cqi3_w=$(printf '%s\n' "$LOG_CQI3" | grep -c 'ga-in9ebr: cannot read the wa-wor
 [ "$_cqi3_w" = "1" ] \
   && ok "CAPQ-I3: an error envelope is announced as an unreadable count (was: silently read as a KNOWN 0)" \
   || bad "CAPQ-I3: expected exactly ONE unreadable-count warning for an error envelope, saw $_cqi3_w — it was read as a known zero"
+
+# ── Scenario CAPQ-P/Q (ga-oa004t): the dispatch_one() spawn gate is FAIL-CLOSED ─────────────────────────
+# CAPQ-I/I3 above prove the PRE-claim probe announces an unreadable count and does not skip. Their comments
+# lean on "dispatch_one() re-checks fresh" as the safety net — but that fresh re-check was itself
+# `timeout 10 gc session list | jq … || echo "0"`: a probe that timed out (7–10s measured under load 55+)
+# read as "0 live" and the bead was SPAWNED past the cap (2026-09-25: wa-worker at 5 active, cap 2 →
+# swap 9 GB → disk 4.4 GB). Unreadable must mean "do not spawn", and must read as a FAULT, not as a busy pool.
+echo "Scenario CAPQ-P (ga-oa004t): an UNREADABLE live count at dispatch_one() spawns NOTHING — claim released, bead NOT in-flight, and the sweep is a FAULT (failed_other), not 'pool saturation'"
+LOG_CQP="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" "" "" "session-list-is-not-json")"
+if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ]; then
+  ok "CAPQ-P: harness reached dispatch_one (the bead was claimed) — not a vacuous pass"
+else
+  bad "CAPQ-P: the bead was never claimed — dispatch_one() was not reached, the assertions below prove nothing"
+fi
+[ ! -s "$STATE/session_new.log" ] \
+  && ok "CAPQ-P: NO 'gc session new' was issued on an unreadable count (was: read as 0 live → spawned)" \
+  || bad "CAPQ-P: a worker session was SPAWNED although the live count could not be read (fail-open) — $(tr '\n' '|' < "$STATE/session_new.log")"
+echo "$LOG_CQP" | grep -E 'ga-oa004t: cannot read the (global variable-session|wa-worker live session) count' >/dev/null \
+  && ok "CAPQ-P: the refusal is announced in the log (ga-oa004t), not silent" \
+  || bad "CAPQ-P: no 'ga-oa004t: cannot read the … count' line — an unreadable probe would be invisible"
+[ "$(capq_n 'label add wa-capq2 story:in-flight')" = "0" ] && [ "$(capq_n 'label add wa-capq2 pilot:dispatched')" = "0" ] \
+  && ok "CAPQ-P: the bead is NOT marked in-flight/dispatched (no worker was assigned)" \
+  || bad "CAPQ-P: the bead was marked in-flight/dispatched with no worker behind it (false 'em execução')"
+[ ! -f "$STATE/wa-capq2.dispatching" ] && grep -q 'released wa-capq2' "$STATE/releases.log" 2>/dev/null \
+  && ok "CAPQ-P: the claim (pilot:dispatching) was RELEASED" \
+  || bad "CAPQ-P: the claim was NOT released — the bead would sit claimed until the TTL recovery"
+[ "$(capq_n 'set-metadata gc.routed_to=wa-worker')" -ge 1 ] && [ "$(capq_n 'unset-metadata gc.routed_to')" = "0" ] \
+  && ok "CAPQ-P: gc.routed_to=wa-worker stays SET (the pool top-up / worker self-serve still see the bead)" \
+  || bad "CAPQ-P: gc.routed_to was not kept — the bead would drop out of the pool queue"
+if echo "$LOG_CQP" | grep "POOL-SATURATED sweep" >/dev/null; then
+  bad "CAPQ-P: a sweep that could not READ the count was reported as POOL-SATURATED ('backpressure, not a stall') — a dead session list would hide from the stall gate"
+else
+  ok "CAPQ-P: NOT reported as pool saturation (a dead probe is not a busy pool)"
+fi
+_cqp_ev=$(grep '"event":"pilot_sweep"' "$FIXCITY/.gc/pilot-dispatcher.jsonl" 2>/dev/null | tail -1)
+if [ -n "$_cqp_ev" ] && [ "$(printf '%s' "$_cqp_ev" | jq -r '.failed_other')" -ge 1 ] 2>/dev/null && [ "$(printf '%s' "$_cqp_ev" | jq -r '.queued_pool_cap + .queued_global_cap')" = "0" ] 2>/dev/null; then
+  ok "CAPQ-P: the pilot_sweep event files it under failed_other and NOT under a *_queued bucket"
+else
+  bad "CAPQ-P: the pilot_sweep event does not classify the unreadable-count outcome as failed_other (event: ${_cqp_ev:-<none>})"
+fi
+
+echo "Scenario CAPQ-P2 (control, ga-oa004t): a READABLE empty list through the SAME real probe path still spawns — the fail-closed gate does not over-block"
+LOG_CQP2="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" "" "" '{"sessions":[]}')"
+if grep -q 'session new wa-worker' "$STATE/session_new.log" 2>/dev/null && [ "$(capq_n 'label add wa-capq2 story:in-flight')" -ge 1 ]; then
+  ok "CAPQ-P2: readable empty pool (real gc-session-list probe, no seam) → the worker IS spawned and the bead goes in-flight"
+else
+  bad "CAPQ-P2: a readable empty pool did NOT spawn — the fail-closed change over-blocks (log: $(echo "$LOG_CQP2" | grep -E 'ga-oa004t|ga-mfeip' | head -3 | tr '\n' '|'))"
+fi
+echo "$LOG_CQP2" | grep 'ga-oa004t path=dispatch_one' >/dev/null \
+  && ok "CAPQ-P2: the spawn log line names the path that opened the session (path=dispatch_one)" \
+  || bad "CAPQ-P2: the spawn is not attributed to a path — 'which path opened this session' stays unanswerable"
+
+echo "Scenario CAPQ-Q (ga-oa004t): a start-pending session is LIVE — 3 active + 1 start-pending at max=4 is a FULL pool, so the candidate is QUEUED, not spawned"
+CAPQ_SL_START_PENDING='{"sessions":[{"id":"s1","alias":"wa-worker-1","template":"wa-worker","state":"active","closed":false},{"id":"s2","alias":"wa-worker-2","template":"wa-worker","state":"active","closed":false},{"id":"s3","alias":"wa-worker-3","template":"wa-worker","state":"active","closed":false},{"id":"s4","alias":"wa-worker-4","template":"wa-worker","state":"start-pending","closed":false}]}'
+LOG_CQQ="$(run_capq_dispatch "$CAPQ_WA_FX" "" "" "$CAPQ_SL_START_PENDING")"
+if echo "$LOG_CQQ" | grep -E 'wa-worker pool at session cap \(4 active/creating >= 4 max\)' >/dev/null && [ ! -s "$STATE/session_new.log" ]; then
+  ok "CAPQ-Q: 3 active + 1 start-pending counts as 4/4 → QUEUED at the cap, no 'gc session new' (was: 3 < 4 → spawned a 5th)"
+else
+  bad "CAPQ-Q: start-pending was not counted as live — a pool with 4 live sessions still spawned (log: $(echo "$LOG_CQQ" | grep -E 'session cap|spawning wa-worker' | head -2 | tr '\n' '|'))"
+fi
 
 echo "Scenario CAPQ-L (ga-in9ebr): PILOT_POOL_CAP_PRECLAIM_SKIP=0 disables ONLY the pre-claim skip — the bead is still QUEUED honestly (claim → cap → release), never in-flight"
 LOG_CQL="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" 4 0 "" 0 0)"

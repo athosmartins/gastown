@@ -261,16 +261,23 @@ echo "── Drift-guards: wiring actually present, in the right place/order ─
 # 1. Both pilot spawn sites call the new check BEFORE their existing per-pool
 #    cap comment, and release the claim (return 1) rather than falling
 #    through to the existing pool-cap's supervisor hand-off.
-PILOT_WA_CALL_LINE=$(grep -n '_gc_variable_count=\$(gc_variable_session_count)' "$PILOT" | sed -n '1p' | cut -d: -f1)
+# ga-oa004t: Pilot's spawn gates read the global count through the fail-CLOSED
+# _pilot_variable_session_count (out-param _PLSC_N; unreadable → queue nothing),
+# no longer through gc_variable_session_count itself — that function stays
+# byte-identical to the gate's copy (checked above) but its `|| echo "0"`
+# fail-open read must not sit in a Pilot spawn gate.
+PILOT_WA_CALL_LINE=$(grep -n '_gc_variable_count="\$_PLSC_N"' "$PILOT" | sed -n '1p' | cut -d: -f1)
 PILOT_WA_POOLCAP_LINE=$(grep -n 'ga-v3o6i: max-cap guard' "$PILOT" | sed -n '1p' | cut -d: -f1)
 if [ -n "${PILOT_WA_CALL_LINE:-}" ] && [ -n "${PILOT_WA_POOLCAP_LINE:-}" ] && [ "$PILOT_WA_CALL_LINE" -lt "$PILOT_WA_POOLCAP_LINE" ]; then
   ok "pilot wa-worker branch: global-cap check (L$PILOT_WA_CALL_LINE) precedes the per-pool cap (L$PILOT_WA_POOLCAP_LINE)"
 else
   bad "pilot wa-worker branch: global-cap check is missing or not before the per-pool cap"
 fi
-PILOT_CALL_COUNT=$(grep -c '_gc_variable_count=\$(gc_variable_session_count)' "$PILOT" 2>/dev/null)
+PILOT_CALL_COUNT=$(grep -c '_gc_variable_count="\$_PLSC_N"' "$PILOT" 2>/dev/null)
 PILOT_CALL_COUNT="${PILOT_CALL_COUNT:-0}"
 eq "$PILOT_CALL_COUNT" "2" "pilot: exactly 2 call sites (wa-worker branch + ps-worker branch)"
+PILOT_FAILOPEN_CALLS=$(grep -c '_gc_variable_count=\$(gc_variable_session_count)' "$PILOT" 2>/dev/null)
+eq "${PILOT_FAILOPEN_CALLS:-0}" "0" "pilot: NO dispatch gate still reads the global count through the fail-open gc_variable_session_count (ga-oa004t)"
 PILOT_RETURN1_AFTER_CAP=$(awk '/GLOBAL variable-session cap hit/{f=1} f&&/return 1/{c++} f&&/^          fi$/{f=0} END{print c+0}' "$PILOT")
 eq "$PILOT_RETURN1_AFTER_CAP" "2" "pilot: both cap-hit branches release the claim via 'return 1' (not fall-through)"
 
