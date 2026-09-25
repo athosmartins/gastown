@@ -9698,6 +9698,33 @@ LIVESEC
     YOUR_JOB_LINE="Fix this completely. This work targets the beads CLI's own repo — see DOCTRINE below for the real path (upstream PR, human review required, NOT /gate-done)."
   fi
 
+  # ── ga-c8jimk: claim TTL / lane-budget awareness (Opus 5.1 multiagent guide) ──
+  # Computed once, shared by both heredocs below — tier-independent (the reclaim
+  # TTL and lane caps apply the same regardless of bug vs story). Origin ga-ttwzqd:
+  # an agent given no sense of its time budget either stops too early or runs
+  # forever. The real mechanism here is NOT a deadline — it's inflight-reclaim-
+  # guard.py's RECLAIM_TTL (1500s = 25min, scripts/inflight-reclaim-guard.py),
+  # which only fires when BOTH has_recent_branch AND has_live_session are false
+  # continuously (reclaim_decision(); confirmed by reading that function, not
+  # assumed) — so staying active is on its own enough, and a builder should never
+  # feel rushed. Lane (MAX_SMALL/MAX_BIG, ~L87-89) is a concurrency slot, not a
+  # time limit.
+  local CLAIM_AWARENESS_BLOCK
+  CLAIM_AWARENESS_BLOCK="## Time & claim awareness (read before you go quiet)
+- The $LANE lane is a concurrency slot (small: up to $MAX_SMALL running at once;
+  big: dedicated slower lane, up to $MAX_BIG), not a deadline — neither lane
+  imposes a fixed time limit on your work.
+- What DOES end your claim: an automated guard reclaims (or escalates) an
+  in-flight bead after ~25 continuous minutes with BOTH no live session AND no
+  recent commit on your branch. Either one alone — staying active, or pushing a
+  commit — resets that clock, so you do not need to rush.
+- About to go quiet for a while (long step, external wait, or stopping short of
+  done)? Commit + push your WIP FIRST, then comment on the bead with what's done
+  and what's next: bd -C \"$STORY_BEAD_CITY\" comment \"$STORY_ID\" \"<status + next step>\".
+  A silent gap with nothing on the branch is what gets reclaimed — a WIP commit
+  plus a comment is not.
+- Stuck, not done: say so in a comment. Never just stop without a trace."
+
   # ── Build task prompt ────────────────────────────────────────────────────────
   local DISPATCH_TASK
   if [ "$DISPATCH_TIER" = "bug" ]; then
@@ -9739,6 +9766,8 @@ $DISPATCH_STEP5
 ## Claim your work (do this first)
 bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\${BEADS_ACTOR:-\$GC_ALIAS}"
 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --status in_progress -q
+
+$CLAIM_AWARENESS_BLOCK
 
 Start now. Do not wait for permission.
 TASK
@@ -9782,6 +9811,8 @@ $DISPATCH_STEP5
 ## Claim your work (do this first)
 bd -C "$STORY_BEAD_CITY" assign "$STORY_ID" "\${BEADS_ACTOR:-\$GC_ALIAS}"
 bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --status in_progress -q
+
+$CLAIM_AWARENESS_BLOCK
 
 Start now. Do not wait for permission.
 TASK
