@@ -5,17 +5,29 @@ description: Use this when you (a crew worker in whatsapp_automation — batista
 
 # wa-worker session protocol — mockups + session end
 
-## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+## Mockups para Athos — S3 presigned URL + 3-4 direções (OBRIGATÓRIO)
 
 ⚠️ `mockups/` NÃO é mais anônimo-legível, e o `presign` é hoje o que TE DÁ acesso — a redação anterior aqui dizia o oposto ("presign é decorativo, não protege nem expira"), verdadeira em 25/07 e FALSA desde 31/07. A policy do bucket tem o Sid `DenyAnonymousReadOnBackupsDraftsAndMockups`, um Deny de `s3:GetObject` para `Principal:*` em `mockups/*` (idem `backups/*`, `estudos/*`, `discador-mockups/*`, `pending_drafts.json`), cuja Condition exclui `aws:PrincipalAccount: 549710416969`. Como a URL presigned assina COM a conta, o Deny não se aplica a ela — medido: sem assinatura 403, presigned 200 (wa-hvh10 + wa-ge8bs; verificação de thies-wa em 08/08, conferida contra a policy viva). ⚠️ O resto do bucket segue público por `PublicReadAccess`, e a distro CloudFront não passa pela assinatura — então isto vale para os prefixos negados acima, não para o bucket inteiro. Continue usando chave de alta entropia: ela não é mais a única barreira, mas ainda é uma.
 
 NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
 
+**Mockup NOVO (1ª versão): gere 3-4 direções visuais distintas antes de
+construir a definitiva** — paleta/tipografia/densidade diferentes, cada uma
+com 1 frase de tradeoff, nomeando no prompt de geração os padrões de "visual
+padrão de IA" a evitar (gradiente genérico, cards idênticos em grade, emoji
+como ícone — guia mais fundo: skill `frontend-design`). Publique as 3-4,
+uma chave por arquivo, e apresente via **AskUserQuestion** (1ª opção = sua
+recomendação, nunca links soltos pedindo escolha em texto livre). Protocolo
+completo, com o passo a passo numerado: `whatsapp_automation/CLAUDE.md` →
+"Mockups de UI/UX — protocolo obrigatório" (ga-g7x0si). Ajuste incremental
+num mockup já aprovado NÃO repete as 3-4 direções — publique só a versão
+atualizada.
+
 ```bash
-python3 -c "import secrets; print(secrets.token_hex(8))"  # chave de alta entropia
-aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800
-# → envie esse URL ao Athos
+python3 -c "import secrets; print(secrets.token_hex(8))"  # uma chave por direção
+aws s3 cp <dirN.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --content-type "text/html; charset=utf-8"
+aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --expires-in 604800
+# → uma opção por direção no AskUserQuestion, não um envio solto
 ```
 
 🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
