@@ -37,6 +37,18 @@
 #   migrated" read as a Pilot fault — is classified in
 #   pilot-dispatcher.sweep-event.selftest.sh (B4 + A2).
 #
+# Gate-review ga-pvdwtc (error-vs-empty; covered by Part C and by the faithful fake_bd):
+#   - the migration's stdout IS the new bead id, and the call site decided "migrated?" on
+#     "captured stdout is non-empty" while acting on the exit status. The real `bd label add|
+#     update|close ... -q` still print "✓ ..." on stdout, so a FAILED migration (a retraction
+#     path) read as a success: the park was skipped and the dispatching marks were stripped off
+#     an original that was still open. Now: every bd write is silenced, the decision is made by
+#     _pilot_dog_store_try_migrate on the exit status + the id's shape, and fake_bd emits the real
+#     confirmation lines (before, it answered label/update/close silently and hid exactly this).
+#   - same class, three writes that can report failure yet have landed: a non-zero bd close is
+#     resolved by re-reading the original (ours / closed by someone else / live / unreadable), a
+#     bd create with no usable id by searching the destination for gc.migrated_from=<story>.
+#
 # Falsifiable: neither function exists before this fix, so the awk
 # extraction below fails hard (FATAL, exit 2) against pre-fix HEAD.
 #
@@ -81,6 +93,11 @@ MIGRATED_FN="$(extract_fn '_pilot_story_already_migrated')"
 GUARD_FN="$(extract_fn '_pilot_dog_store_blind_guard')"
 BUILDERS_FN="$(extract_fn 'rig_to_builders')"
 BUILDER_FN="$(extract_fn 'rig_to_builder')"
+ISID_FN="$(extract_fn '_pilot_is_bead_id')"
+RETRACT_FN="$(extract_fn '_pilot_migration_copy_retract')"
+ORPHAN_FN="$(extract_fn '_pilot_retract_orphan_migration_copies')"
+ORIGSTATE_FN="$(extract_fn '_pilot_migration_original_state')"
+TRY_FN="$(extract_fn '_pilot_dog_store_try_migrate')"
 if [ -z "$DEST_FN" ]; then
   echo "FATAL: _pilot_dog_store_blind_migrate_dest() not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
   exit 2
@@ -93,7 +110,7 @@ if [ -z "$RIGPATH_FN" ]; then
   echo "FATAL: rig_root_path() not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
   exit 2
 fi
-for _fn_var in PATHTOK_FN MIGRATED_FN GUARD_FN BUILDERS_FN BUILDER_FN; do
+for _fn_var in PATHTOK_FN MIGRATED_FN GUARD_FN BUILDERS_FN BUILDER_FN ISID_FN RETRACT_FN ORPHAN_FN ORIGSTATE_FN TRY_FN; do
   if [ -z "${!_fn_var}" ]; then
     echo "FATAL: helper for $_fn_var not found in $DISPATCHER (pre-fix HEAD, or extraction pattern drifted)" >&2
     exit 2
@@ -117,8 +134,13 @@ $MIGRATED_FN
 $GUARD_FN
 $BUILDERS_FN
 $BUILDER_FN
+$ISID_FN
+$RETRACT_FN
+$ORPHAN_FN
+$ORIGSTATE_FN
 $DEST_FN
-$MIGRATE_FN"
+$MIGRATE_FN
+$TRY_FN"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-dog-store-migrate-selftest.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
@@ -258,6 +280,10 @@ fake_bd() {
   _dir="$(mktemp -d "$WORK/bin.XXXXXX")"
   _calllog="$(calllog_for "$_scenario")"
   : > "$_calllog"
+  # The stateful scenarios (close_lands_errors / close_other_closed / close_unreadable) keep their state in files
+  # next to the call log; a scenario run twice must start from a clean slate, or its TOCTOU re-check would see the
+  # PREVIOUS run's "already closed" original and abort before doing anything.
+  rm -f "$_calllog.origclosed" "$_calllog.closeattempted"
   cat > "$_dir/bd" <<EOF
 #!/usr/bin/env bash
 SCEN="$_scenario"
@@ -277,6 +303,18 @@ echo "$verb|$city|$id|$*" >> "$CALLLOG"
 case "$verb" in
   show)
     if [ "$id" = "ORIG-1" ]; then
+      # close_lands_errors: the close reported failure but really landed -> the original now reads closed,
+      # with the reason the migration passed.
+      if [ -f "$CALLLOG.origclosed" ]; then
+        jq -cn --arg r "$(cat "$CALLLOG.origclosed")" '[{id:"ORIG-1",status:"closed",assignee:null,close_reason:$r}]'
+        exit 0
+      fi
+      if [ -f "$CALLLOG.closeattempted" ]; then
+        case "$SCEN" in
+          close_other_closed) printf '[{"id":"ORIG-1","status":"closed","assignee":null,"close_reason":"Duplicate of ga-zzzzzz -- closed by a human"}]'; exit 0 ;;
+          close_unreadable)   exit 1 ;;
+        esac
+      fi
       case "$SCEN" in
         happy|close_fails)        printf '[{"id":"ORIG-1","status":"open","assignee":null}]'; exit 0 ;;
         raced_status)             printf '[{"id":"ORIG-1","status":"closed","assignee":null}]'; exit 0 ;;
@@ -294,20 +332,52 @@ case "$verb" in
     ;;
   create)
     case "$SCEN" in
-      create_fails) exit 1 ;;
-      *)            printf '{"id":"NEW-1"}'; exit 0 ;;
+      # create_fails: nothing happened. create_lost: it exited non-zero and printed nothing, but the copy
+      # LANDED (a timeout after the Dolt commit) -- see the list arm. create_rc_with_id: non-zero exit, id printed.
+      create_fails|create_lost*)  exit 1 ;;
+      create_rc_with_id)          printf '{"id":"NEW-1"}'; exit 1 ;;
+      create_noid)                printf '{"id":""}'; exit 0 ;;   # the shape `bd create --dry-run --json` prints
+      *)                          printf '{"id":"NEW-1"}'; exit 0 ;;
+    esac
+    ;;
+  list)
+    # The orphan search: bd list --metadata-field gc.migrated_from=<id> ... --json
+    case "$SCEN" in
+      create_lost|create_rc_with_id) printf '[{"id":"NEW-1"}]'; exit 0 ;;
+      create_lost_junk_id)           printf '[{"id":"not an id"}]'; exit 0 ;;
+      create_lost_search_fails)      exit 1 ;;
+      create_lost_search_html)       printf '<html>502 bad gateway</html>'; exit 0 ;;
+      *)                             printf '[]'; exit 0 ;;
     esac
     ;;
   close)
     if [ "$id" = "ORIG-1" ]; then
+      reason=""; prev=""
+      for a in "$@"; do [ "$prev" = "--reason" ] && reason="$a"; prev="$a"; done
       case "$SCEN" in
-        close_fails) echo 'assignee is "someone-else", actor is "pilot"' >&2; exit 1 ;;
-        *)           exit 0 ;;
+        close_fails)           echo 'assignee is "someone-else", actor is "pilot"' >&2; exit 1 ;;
+        close_lands_errors)    printf '%s' "$reason" > "$CALLLOG.origclosed"; echo 'context deadline exceeded' >&2; exit 1 ;;
+        close_other_closed|close_unreadable) : > "$CALLLOG.closeattempted"; echo 'context deadline exceeded' >&2; exit 1 ;;
+        *)                     echo "✓ Closed ORIG-1: $reason"; exit 0 ;;
       esac
     fi
-    exit 0   # close of NEW-1 (retraction path) always succeeds in these scenarios
+    echo "✓ Closed $id: $*"   # close of NEW-1 (retraction path) always succeeds in these scenarios
+    exit 0
     ;;
-  label|update)
+  # The REAL bd prints these confirmations on STDOUT even with -q (measured 2026-09-25 on the live bd:
+  # `bd label add <id> <label> -q` -> 41 bytes on stdout, 0 on stderr; the binary's format strings show
+  # "Closed %s: %s" and "Updated issue: %s" the same way). A fake that answers these silently deletes
+  # exactly the channel a `$(...)` caller decides success on (gate-review ga-pvdwtc).
+  label)
+    echo "✓ Added label '${3:-?}' to ${2:-?}"
+    exit 0
+    ;;
+  update)
+    echo "✓ Updated issue: ${id:-?}"
+    exit 0
+    ;;
+  comment)
+    echo "✓ Comment added to ${id:-?}"
     exit 0
     ;;
   *)
@@ -555,16 +625,231 @@ N_GCLIST=$(wc -l < "$GCLIST_COUNT" | tr -d ' ')
 [ "$N_GCLIST" = "1" ] && ok "cold rig-list memo: exactly ONE 'gc rig list' for the whole migration (was two: the picker's subshell memo was thrown away)" \
                       || bad "cold rig-list memo: expected exactly 1 'gc rig list', got $N_GCLIST"
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# gate-review ga-pvdwtc — the migration's STDOUT *is* the new bead id, so it must be only that
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Root class: error-vs-empty. The dispatch call site decided "migrated?" on "captured stdout is
+# non-empty" while the value it ACTED on was the exit status, and the real `bd label add|close -q`
+# still print "✓ ..." on stdout — so a FAILED migration read as a success (the park was skipped and
+# the dispatching marks were stripped off an original that was still open). Every fake_bd write above
+# now emits those lines, so Part B already fails on any leak; Part C pins the decision itself.
+echo ""
+echo "=== Part C: gate-review ga-pvdwtc — the stdout contract, the exit-status decision, ambiguous writes ==="
+
+# C1 — _pilot_is_bead_id: an id is one token in an id's alphabet, never a confirmation line.
+is_id() { bash -c "$DISPATCHER_OPTS
+$ISID_FN"'
+_pilot_is_bead_id "$1"' _ "$1"; }
+for _v in NEW-1 ORIG-1 ga-6u64fm wa-2txhl ga-wisp-2ld24xp gt-c1x1j; do
+  if is_id "$_v"; then ok "bead-id predicate accepts '$_v'"; else bad "bead-id predicate must accept '$_v'"; fi
+done
+for _v in "" "✓ Added label 'lane:small' to NEW-1" $'✓ Added label \'x\' to NEW-1\nNEW-1' $'NEW-1\n' "NEW-1 " " NEW-1" \
+          "-NEW-1" "NEWONE" "ga abc-1" "ga-abc:def" "ga-'x'" '{"id":"NEW-1"}'; do
+  _shown=$(printf '%s' "$_v" | tr '\n' '|')
+  if is_id "$_v"; then bad "bead-id predicate must REJECT '${_shown}'"; else ok "bead-id predicate rejects '${_shown}'"; fi
+done
+
+# C2 — the wrapper in isolation, against a stub migrator: it decides on the EXIT STATUS. Each case is a
+# state the old `[ -n "$_MIGRATED_ID" ]` test got wrong or could not tell apart.
+try_stub() { # try_stub <stub body> -> "rc=<n> out=<stdout>"; stderr kept in $WORK/try.err
+  local _o _rc
+  _o=$(STUB="$1" bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
+$ISID_FN
+$TRY_FN"'
+_pilot_migrate_dog_store_blind_bead() { eval "$STUB"; }
+_pilot_dog_store_try_migrate a b c d e' 2>"$WORK/try.err"); _rc=$?
+  printf 'rc=%s out=%s' "$_rc" "$_o"
+}
+R=$(try_stub "echo \"✓ Added label 'pilot:no-auto-dispatch' to NEW-1\"; return 1")
+[ "$R" = "rc=1 out=" ] && ok "wrapper: migration FAILED (rc 1) but printed a bd confirmation line -> not migrated, prints nothing (the reviewer's repro)" \
+                       || bad "wrapper: a failed migration that leaked a confirmation line must not read as a success — got '$R'"
+R=$(try_stub 'printf NEW-9; return 3')
+[ "$R" = "rc=1 out=" ] && ok "wrapper: an id-shaped stdout with a NON-ZERO exit is still not a migration (the exit status is what decides)" \
+                       || bad "wrapper: id on stdout + rc 3 must be 'not migrated' — got '$R'"
+R=$(try_stub 'printf NEW-9; return 0')
+[ "$R" = "rc=0 out=NEW-9" ] && ok "wrapper: exit 0 + a real id -> migrated, echoes exactly the id" \
+                            || bad "wrapper: exit 0 + id -> expected 'rc=0 out=NEW-9', got '$R'"
+R=$(try_stub "echo \"✓ Added label 'x' to NEW-1\"; printf NEW-9; return 0")
+[ "$R" = "rc=1 out=" ] && grep -q 'contract violation' "$WORK/try.err" \
+  && ok "wrapper: exit 0 but stdout is not a bare id -> NOT reported as migrated, and it says why (contract violation)" \
+  || bad "wrapper: exit 0 + junk stdout must be refused with a warning — got '$R' / stderr: $(cat "$WORK/try.err")"
+R=$(try_stub 'return 0')
+[ "$R" = "rc=1 out=" ] && ok "wrapper: exit 0 and NOTHING printed -> not migrated (an empty id is not an id)" \
+                       || bad "wrapper: exit 0 + empty stdout must not read as migrated — got '$R'"
+
+# C3 — the DEPLOYED call-site expression itself, run under the dispatcher's own set -euo pipefail against the
+# real function chain and the faithful fake. The `if ... ; then` text is extracted from pilot-dispatcher.sh by
+# awk, so a call site that goes back to deciding on captured stdout is what this exercises — not a copy of it.
+CALLSITE=$(awk '/if \[ "\$\{PILOT_DOG_STORE_AUTOMIGRATE:-1\}" = "1" \] \\$/{f=1} f{print} f&&/; then$/{exit}' "$DISPATCHER")
+if [ -z "$CALLSITE" ]; then
+  bad "call site: could not extract the PILOT_DOG_STORE_AUTOMIGRATE 'if ... ; then' from the dispatcher (drifted?)"
+elif ! printf '%s' "$CALLSITE" | grep -qF '_pilot_dog_store_try_migrate "$STORY_ID"'; then
+  bad "call site: the migration is not invoked through _pilot_dog_store_try_migrate (exit-status decision) — got: $CALLSITE"
+else
+  ok "call site: extracted from the dispatcher and invoked through _pilot_dog_store_try_migrate inside the if-condition"
+  CALLSITE_SCRIPT="$WORK/callsite.sh"
+  {
+    echo "$DISPATCHER_OPTS"
+    cat <<'EOS_HEAD'
+warn() { echo "WARN: $*" >&2; }
+log()  { echo "LOG: $*"; }
+EOS_HEAD
+    echo "$FN_PRELUDE"
+    cat <<'EOS_OPEN'
+t() {
+  local _MIGRATED_ID=""
+EOS_OPEN
+    echo "$CALLSITE"
+    cat <<'EOS_TAIL'
+    echo "MIGRATED:$_MIGRATED_ID"
+  else
+    echo "PARKED"
+  fi
+}
+t
+EOS_TAIL
+  } > "$CALLSITE_SCRIPT"
+  run_callsite() { # run_callsite <scenario> -> MIGRATED:<id> | PARKED (stdout only; the WARN/LOG chatter is not the result)
+    local _bin
+    _bin=$(fake_bd "$1")
+    PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+      STORY_ID=ORIG-1 STORY="$STORY_JSON" STORY_BEAD_CITY="$WORK/gastown" STORY_RIG=gastown STORY_LABELS=lane:small \
+      /bin/bash "$CALLSITE_SCRIPT" 2>/dev/null | grep -E '^(MIGRATED:|PARKED$)'
+  }
+  R=$(run_callsite happy)
+  [ "$R" = "MIGRATED:NEW-1" ] && ok "call site, happy path (with a lane:* label, i.e. with a bd confirmation line) -> MIGRATED:NEW-1, a clean id" \
+                              || bad "call site, happy path -> expected 'MIGRATED:NEW-1', got '$R'"
+  for _sc in close_fails readback_fails create_fails raced_status close_other_closed close_unreadable create_lost create_lost_search_fails; do
+    R=$(run_callsite "$_sc")
+    [ "$R" = "PARKED" ] && ok "call site, scenario $_sc -> PARKED (falls through to the park; never reads a leaked '✓ ...' line as a migration)" \
+                        || bad "call site, scenario $_sc -> expected PARKED, got '$R' (the reviewer's repro: a failed migration taken as a success)"
+  done
+  R=$(run_callsite close_lands_errors)
+  [ "$R" = "MIGRATED:NEW-1" ] && ok "call site, close reported failure but landed -> MIGRATED:NEW-1 (the copy IS the story; no park)" \
+                              || bad "call site, close-landed-with-error -> expected 'MIGRATED:NEW-1', got '$R'"
+fi
+
+# C4 — the three AMBIGUOUS writes. A write that reports failure may have landed, and one that reports success may
+# not be readable: each is resolved by READING STATE BACK. calls_of prints the fake's call log for a scenario.
+calls_of() { tr '\n' '|' < "$(calllog_for "$1")"; }
+# "close" of a given id / "label add <id> pilot:no-auto-dispatch" as the fake logged them (the label id sits in $*).
+closed_id()  { grep -qE "^close\\|[^|]*\\|$2\\|" "$(calllog_for "$1")"; }
+vetoed_id()  { grep -qE "^label\\|.*add $2 pilot:no-auto-dispatch" "$(calllog_for "$1")"; }
+order_ok()   { # order_ok <scenario> <id>: veto of <id> logged BEFORE its close
+  local _l _c
+  _l=$(grep -nE "^label\\|.*add $2 pilot:no-auto-dispatch" "$(calllog_for "$1")" | head -1 | cut -d: -f1)
+  _c=$(grep -nE "^close\\|[^|]*\\|$2\\|" "$(calllog_for "$1")" | head -1 | cut -d: -f1)
+  [ -n "$_l" ] && [ -n "$_c" ] && [ "$_l" -lt "$_c" ]
+}
+
+# C4a — close returned non-zero but LANDED: the copy is the story. Retracting it would leave both closed.
+OUT=$(run_migrate close_lands_errors 2>/dev/null); RC=$?
+[ "$RC" = "0" ] && [ "$OUT" = "NEW-1" ] \
+  && ok "close returned non-zero but the original reads closed WITH our reason -> success: echoes NEW-1, returns 0" \
+  || bad "close landed-with-error -> expected rc=0 out=NEW-1, got rc=$RC out='$OUT'"
+if closed_id close_lands_errors NEW-1 || vetoed_id close_lands_errors NEW-1; then
+  bad "close landed-with-error -> REGRESSION: retracted the copy although the original IS closed (the story would vanish): $(calls_of close_lands_errors)"
+else
+  ok "close landed-with-error -> the copy is NOT vetoed or closed (both beads closed = the story lost)"
+fi
+
+# C4b — close returned non-zero and the original was closed by SOMEONE ELSE: the copy must not resurrect it.
+OUT=$(run_migrate close_other_closed 2>/dev/null); RC=$?
+[ "$RC" = "1" ] && [ -z "$OUT" ] && ok "original closed by another actor in the race window -> not migrated (rc 1, nothing on stdout)" \
+                                  || bad "original closed by someone else -> expected rc=1 empty, got rc=$RC out='$OUT'"
+order_ok close_other_closed NEW-1 && ok "original closed by another actor -> the copy is retracted: veto BEFORE close (does not resurrect a story someone closed)" \
+                                  || bad "original closed by another actor -> expected veto-then-close on NEW-1, got: $(calls_of close_other_closed)"
+
+# C4c — close returned non-zero and the original cannot be read: veto, never close, leave a trail.
+OUT=$(run_migrate close_unreadable 2>/dev/null); RC=$?
+[ "$RC" = "1" ] && [ -z "$OUT" ] && ok "close returned non-zero and the original is unreadable -> not migrated (rc 1, nothing on stdout)" \
+                                  || bad "close-unreadable -> expected rc=1 empty, got rc=$RC out='$OUT'"
+if vetoed_id close_unreadable NEW-1 && ! closed_id close_unreadable NEW-1; then
+  ok "close-unreadable -> the copy is VETOED but NOT closed (closing it could leave both beads closed)"
+else
+  bad "close-unreadable -> expected veto without close on NEW-1, got: $(calls_of close_unreadable)"
+fi
+if grep -qE '^comment\|[^|]*\|NEW-1\|' "$(calllog_for close_unreadable)" && grep -qE '^comment\|[^|]*\|ORIG-1\|' "$(calllog_for close_unreadable)"; then
+  ok "close-unreadable -> a comment on BOTH beads says a human must close one of the two"
+else
+  bad "close-unreadable -> expected a comment on NEW-1 and on ORIG-1, got: $(calls_of close_unreadable)"
+fi
+
+# C4d — bd create failed but the copy LANDED (output lost): found by gc.migrated_from and retracted.
+for _sc in create_lost create_rc_with_id; do
+  OUT=$(run_migrate "$_sc" 2>/dev/null); RC=$?
+  [ "$RC" = "1" ] && [ -z "$OUT" ] && ok "scenario $_sc: create reported failure -> not migrated (rc 1, nothing on stdout)" \
+                                    || bad "scenario $_sc -> expected rc=1 empty, got rc=$RC out='$OUT'"
+  if grep -qE '^list\|' "$(calllog_for "$_sc")" && grep -qF 'gc.migrated_from=ORIG-1' "$(calllog_for "$_sc")"; then
+    ok "scenario $_sc: searched the destination for a live copy by gc.migrated_from=<the story>"
+  else
+    bad "scenario $_sc -> expected a bd list --metadata-field gc.migrated_from=ORIG-1 search, got: $(calls_of "$_sc")"
+  fi
+  order_ok "$_sc" NEW-1 && ok "scenario $_sc: the copy that landed is retracted (veto BEFORE close)" \
+                        || bad "scenario $_sc -> expected veto-then-close on NEW-1, got: $(calls_of "$_sc")"
+  closed_id "$_sc" ORIG-1 && bad "scenario $_sc -> REGRESSION: closed the original although the copy was never confirmed" \
+                          || ok "scenario $_sc: the original is NOT closed"
+done
+# ... and when nothing landed (create_fails) the search runs, finds nothing, and writes nothing.
+OUT=$(run_migrate create_fails 2>/dev/null); RC=$?
+if [ "$RC" = "1" ] && [ -z "$OUT" ] && grep -qE '^list\|' "$(calllog_for create_fails)" \
+   && ! grep -qE '^(close|label|update|comment)\|' "$(calllog_for create_fails)"; then
+  ok "create failed and nothing landed -> the search finds nothing and NOTHING is written (no close/label/update/comment)"
+else
+  bad "create_fails -> expected rc=1, a list search, and no writes; got rc=$RC out='$OUT' calls: $(calls_of create_fails)"
+fi
+# The search itself can fail: that is a THIRD state (could not tell), announced, never folded into 'found none'.
+for _sc in create_lost_search_fails create_lost_search_html; do
+  ERR=$(run_migrate "$_sc" 2>&1 >/dev/null); OUT=$(run_migrate "$_sc" 2>/dev/null); RC=$?
+  case "$ERR" in
+    *"could not search"*"check by hand"*) ok "scenario $_sc: the failed/unusable search is ANNOUNCED with the command to run by hand (not silent)" ;;
+    *) bad "scenario $_sc -> expected a 'could not search ... check by hand' warning, got: $ERR" ;;
+  esac
+  [ "$RC" = "1" ] && [ -z "$OUT" ] && ! grep -qE '^(close|label)\|' "$(calllog_for "$_sc")" \
+    && ok "scenario $_sc: not migrated, and it writes nothing it cannot justify" \
+    || bad "scenario $_sc -> expected rc=1 empty and no close/label, got rc=$RC out='$OUT' calls: $(calls_of "$_sc")"
+done
+# A search hit whose id is not an id is not touched.
+OUT=$(run_migrate create_lost_junk_id 2>/dev/null); RC=$?
+if [ "$RC" = "1" ] && [ -z "$OUT" ] && ! grep -qE '^(close|label)\|' "$(calllog_for create_lost_junk_id)"; then
+  ok "the search returned an unusable id -> not touched (a garbled id is never handed to bd close/label)"
+else
+  bad "create_lost_junk_id -> expected rc=1 empty and no close/label, got rc=$RC out='$OUT' calls: $(calls_of create_lost_junk_id)"
+fi
+# create exiting 0 with an EMPTY id (the shape `bd create --dry-run --json` prints) is a failure too.
+OUT=$(run_migrate create_noid 2>/dev/null); RC=$?
+if [ "$RC" = "1" ] && [ -z "$OUT" ] && ! closed_id create_noid ORIG-1 && grep -qE '^list\|' "$(calllog_for create_noid)"; then
+  ok "create exit 0 but no usable id -> failed: searches for a landed copy, never closes the original"
+else
+  bad "create_noid -> expected rc=1 empty, a search, original not closed; got rc=$RC out='$OUT' calls: $(calls_of create_noid)"
+fi
+
+# C5 — a title that starts with '-' is passed as --title=<t>: the positional form is parsed as a flag by bd
+# ("Error: title required", verified with `bd create --dry-run`), which fell back to park for no good reason.
+DASH_STORY='{"id":"ORIG-1","title":"-starts with a dash","priority":2,"issue_type":"bug","description":"d","labels":[]}'
+OUT=$(run_migrate happy "$DASH_STORY" 2>/dev/null); RC=$?
+if [ "$RC" = "0" ] && [ "$OUT" = "NEW-1" ] && grep -qF -- '--title=-starts with a dash' "$(calllog_for happy)"; then
+  ok "a title starting with '-' is passed as --title=<title> (not a positional bd would parse as a flag) and still migrates"
+else
+  bad "dash-title -> expected rc=0 out=NEW-1 with --title=-starts with a dash, got rc=$RC out='$OUT' calls: $(calls_of happy)"
+fi
+
 echo ""
 echo "=== Drift-guards: call-site wiring in dispatch_one()'s crew arm ==="
 has 'PILOT_DOG_STORE_AUTOMIGRATE:-1'                                     "call site respects PILOT_DOG_STORE_AUTOMIGRATE kill switch (default on), independent of PILOT_DOG_STORE_GUARD"
-has '_pilot_migrate_dog_store_blind_bead "\$STORY_ID" "\$STORY" "\$STORY_BEAD_CITY" "\$STORY_RIG" "\$STORY_LABELS"' "call site invokes the migrator with STORY_ID/STORY/STORY_BEAD_CITY/STORY_RIG/STORY_LABELS"
+has '_pilot_dog_store_try_migrate "\$STORY_ID" "\$STORY" "\$STORY_BEAD_CITY" "\$STORY_RIG" "\$STORY_LABELS"' "call site invokes the migration through _pilot_dog_store_try_migrate with STORY_ID/STORY/STORY_BEAD_CITY/STORY_RIG/STORY_LABELS"
+if grep -qF '_pilot_migrate_dog_store_blind_bead "$STORY_ID"' "$DISPATCHER"; then
+  bad "REGRESSION: the call site calls the raw migrator again (decides on captured stdout) instead of _pilot_dog_store_try_migrate"
+else
+  ok "the call site no longer calls the raw migrator directly (the decision lives in _pilot_dog_store_try_migrate)"
+fi
 has 'DISPATCH_RESULT="rig_native_dog_store_migrated"'                    "a successful migration is attributed to its own distinct DISPATCH_RESULT"
 # Ordering: the migration attempt must run BEFORE the park (refuse) logic,
 # so a successful migration short-circuits the park path entirely (return 1
 # fires right after a successful migration, never reaching the warn/park
 # block below it).
-if awk '/_pilot_migrate_dog_store_blind_bead "\$STORY_ID"/{m=NR} /ga-cszxcf: REFUSING rig-native dispatch/{p=NR} END{exit !(m && p && m<p)}' "$DISPATCHER"; then
+if awk '/_pilot_dog_store_try_migrate "\$STORY_ID"/{m=NR} /ga-cszxcf: REFUSING rig-native dispatch/{p=NR} END{exit !(m && p && m<p)}' "$DISPATCHER"; then
   ok "migration attempt precedes the park (refuse) logic — a successful migration short-circuits parking entirely"
 else
   bad "REGRESSION: migration attempt does not precede the park logic — ordering may have drifted"

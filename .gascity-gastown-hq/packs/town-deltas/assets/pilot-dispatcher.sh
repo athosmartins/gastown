@@ -6724,21 +6724,125 @@ _pilot_story_already_migrated() {
   esac
 }
 
+# _pilot_is_bead_id <str> — ga-6u64fm (gate-review ga-pvdwtc): exit 0 iff <str> is ONE bead-id-shaped
+# token ("ga-6u64fm", "wa-2txhl", "ga-wisp-2ld24xp"): a run of [A-Za-z0-9._-] that starts with an
+# alphanumeric and holds a "-" (bead ids are "<prefix>-<hash>"). Exit 1 for anything else — empty,
+# several lines, spaces, quotes, colons, a "✓ Added label 'x' to y" confirmation line.
+#
+# Why it exists: the migration hands its new id back on STDOUT and its caller captures that with
+# $(...). The real `bd label add|update|close ... -q` still print their "✓ ..." confirmation on
+# stdout (measured 2026-09-25: 41 bytes on stdout, 0 on stderr), so any write that leaks there lands
+# IN the captured "id" — and a caller that decides "stdout is non-empty" reads it as a successful
+# migration. This is the check that an id IS an id, applied where the id is born (bd create's
+# output) and where it is consumed (_pilot_dog_store_try_migrate, the dispatch call site).
+_pilot_is_bead_id() {
+  local _id="${1:-}"
+  [ -n "$_id" ] || return 1
+  case "$_id" in
+    *[!A-Za-z0-9._-]*) return 1 ;;   # a byte outside an id's alphabet: space, newline, ✓, quote, colon...
+    [!A-Za-z0-9]*)     return 1 ;;   # must start alphanumeric
+    *-*)               return 0 ;;   # "<prefix>-<hash>"
+  esac
+  return 1
+}
+
+# _pilot_migration_copy_retract <dest_city> <copy_id> <reason> — best-effort: VETO the copy first
+# (pilot:no-auto-dispatch — a concurrent Pilot sweep can no longer dispatch it while cleanup runs),
+# then CLOSE it as a duplicate. Both writes are always attempted. Returns 0 iff both exited 0, else
+# 1; the caller must say so loudly, because a live dispatchable copy is what a failure leaves behind.
+#
+# Writes NOTHING to stdout: every bd write is silenced on both streams, since the migration's
+# caller captures stdout as the new bead id (see _pilot_is_bead_id).
+_pilot_migration_copy_retract() {
+  local _dest_city="$1" _copy_id="$2" _reason="$3" _rc=0
+  bd -C "$_dest_city" label add "$_copy_id" "pilot:no-auto-dispatch" -q >/dev/null 2>&1 || _rc=1
+  bd -C "$_dest_city" close "$_copy_id" --reason "$_reason" -q >/dev/null 2>&1 || _rc=1
+  return "$_rc"
+}
+
+# _pilot_retract_orphan_migration_copies <dest_city> <story_id> — ga-6u64fm (gate-review ga-pvdwtc,
+# non-blocking finding): `bd create` failed, or returned something that is not a bead id, and a create
+# can still have LANDED (a timeout after the Dolt commit; the output lost). Every copy carries
+# gc.migrated_from=<story_id>, so search the destination for a still-live copy of THIS story and
+# retract it, rather than leave a live ctx:ready/exec:auto/story:approved duplicate next to the
+# original the caller is about to park.
+# Returns 0 when the search ran and every copy it found was retracted (or there was none), 1 when it
+# could not search or could not retract one — the warn says which, with the command to run by hand.
+# "Searched and found nothing" and "could not search" are different facts and stay different.
+_pilot_retract_orphan_migration_copies() {
+  local _dest_city="$1" _story_id="$2" _json="" _rc=0 _ids="" _id _bad=0
+  _json=$(bd -C "$_dest_city" list --metadata-field "gc.migrated_from=$_story_id" \
+            --status open,in_progress,blocked,deferred --limit 0 --json 2>/dev/null) || _rc=$?
+  if [ "$_rc" -ne 0 ] || ! printf '%s' "$_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    warn "ga-6u64fm: could not search $_dest_city for a live copy of $_story_id (bd list rc=$_rc, or not a JSON array) — if the create landed, a live duplicate exists; check by hand: bd -C $_dest_city list --metadata-field gc.migrated_from=$_story_id" >&2
+    return 1
+  fi
+  _ids=$(printf '%s' "$_json" | jq -r '.[]? | .id // empty' 2>/dev/null) || _ids=""
+  while IFS= read -r _id; do
+    [ -n "$_id" ] || continue
+    if ! _pilot_is_bead_id "$_id"; then
+      warn "ga-6u64fm: the search for copies of $_story_id returned an unusable id ('$_id') — not touching it; check by hand: bd -C $_dest_city list --metadata-field gc.migrated_from=$_story_id" >&2
+      _bad=1
+      continue
+    fi
+    warn "ga-6u64fm: found a live copy $_id of $_story_id after a create that reported failure — retracting it." >&2
+    _pilot_migration_copy_retract "$_dest_city" "$_id" \
+      "Retracted: bd create for $_story_id reported failure but the copy had landed; the original stays authoritative (parked by the caller)." \
+      || { warn "ga-6u64fm: FAILED to fully retract copy $_id of $_story_id (label/close) — a live dispatchable duplicate may remain; needs manual cleanup: bd -C $_dest_city show $_id" >&2; _bad=1; }
+  done <<EOF_ORPHANS
+$_ids
+EOF_ORPHANS
+  return "$_bad"
+}
+
+# _pilot_migration_original_state <src_city> <story_id> <copy_id> — ga-6u64fm (gate-review ga-pvdwtc,
+# non-blocking finding): a NON-ZERO exit from `bd close` does not prove the close had no effect (a
+# Dolt timeout after the commit, a dropped connection). Re-read the ORIGINAL and say which of four
+# things is true. Echoes exactly one token and writes nothing:
+#   ours          closed, and its close_reason is the one THIS migration wrote ("Movida para <copy_id> (")
+#                 -> the close landed; the copy IS the story now (retracting it would lose the story)
+#   closed-other  closed, with somebody else's reason -> someone closed the story on purpose in the race
+#                 window; the copy must not resurrect it
+#   live          readable and not closed -> the close really did not happen (claimed elsewhere, ...)
+#   unknown       could not read it / no status -> cannot tell; a THIRD state, never folded into "live"
+_pilot_migration_original_state() {
+  local _src_city="$1" _story_id="$2" _copy_id="$3" _json="" _rc=0 _status="" _reason=""
+  _json=$(bd -C "$_src_city" show "$_story_id" --json 2>/dev/null) || _rc=$?
+  _status=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | if type=="object" then (.status // "") else "" end' 2>/dev/null) || _status=""
+  if [ "$_rc" -ne 0 ] || [ -z "$_status" ]; then
+    echo unknown
+    return 0
+  fi
+  if [ "$_status" != "closed" ]; then
+    echo live
+    return 0
+  fi
+  _reason=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .close_reason // ""' 2>/dev/null) || _reason=""
+  case "$_reason" in
+    "Movida para $_copy_id ("*) echo ours ;;
+    *)                         echo closed-other ;;
+  esac
+  return 0
+}
+
 # _pilot_migrate_dog_store_blind_bead <story_id> <story_json> <src_city>
 # <src_rig> <story_labels_csv> — ga-6u64fm: auto-migrate a rig-native bead
 # the dog pool can never see (per _pilot_dog_store_blind_guard) into a store
 # some REAL builder actually reads, instead of only parking + asking a human
 # to do it by hand (the pre-existing ga-cszxcf behavior, which remains the
-# fallback on any abort/failure below — this function can never leave a
-# bead worse off than that already-safe behavior).
+# fallback on any abort/failure below: every `return 1` leaves the caller to
+# park the original, exactly as before this function existed).
 #
 # Destination: _pilot_dog_store_blind_migrate_dest above (only ever a store some
 # builder can read: HQ, or a rig whose own builder is not the dog).
 #
-# The copy is a plain new bead: it does NOT inherit the original's parent/epic
-# link or dependency edges, and closing the original counts as a closed child
-# of any parent epic it had (same as the two manual moves this automates:
-# gt-c1x1j, gt-1u1u2). One hop only — see _pilot_story_already_migrated.
+# The copy is a plain new bead carrying title, type, priority, description and
+# the lane:* label. It does NOT inherit the original's parent/epic link or
+# dependency edges, nor its acceptance_criteria/design/notes or story.*/
+# athos.acao metadata (measured 09-25: 0 of 2624 gastown beads carry acceptance
+# criteria), and closing the original counts as a closed child of any parent
+# epic it had (same as the two manual moves this automates: gt-c1x1j,
+# gt-1u1u2). One hop only — see _pilot_story_already_migrated.
 #
 # Race safety (bead-migration-copy-races memory; a real 2026-09-15 incident
 # where a hand-migration created an orphan duplicate because a dog claimed
@@ -6748,24 +6852,34 @@ _pilot_story_already_migrated() {
 # BEFORE the close (bd close's own identity check is the authoritative FINAL
 # gate — an unassigned bead closes freely, but a bead some OTHER actor
 # claimed in the remaining race window refuses with "assignee is X, actor is
-# Y") — so a close refusal AFTER the copy exists must retract it: label
-# pilot:no-auto-dispatch first (stop it being dispatched before cleanup
-# finishes) then close it as a duplicate, exactly the manual recovery the
-# memory documents. Never leave two live copies of the same story.
+# Y").
 #
-# Echoes the new bead id and returns 0 on success; returns 1 (nothing
-# echoed) on any abort — the caller falls through to the existing park
-# behavior unchanged.
+# Three writes can be AMBIGUOUS — they report failure yet may have landed —
+# and each is resolved by reading the state back, never by trusting the exit
+# code (a write succeeding is not the write being readable, and the reverse):
+#   - bd create failed / gave no usable id -> search the destination for a live
+#     copy (gc.migrated_from) and retract it (_pilot_retract_orphan_migration_copies);
+#   - the copy does not read back           -> veto + close it (best-effort);
+#   - bd close of the original returned non-zero -> re-read the original
+#     (_pilot_migration_original_state): closed by us = the copy IS the story
+#     (success); live or closed by someone else = retract the copy; unreadable =
+#     VETO the copy but do NOT close it (closing it could leave both beads
+#     closed and the story lost).
+# Retraction is best-effort: when it also fails the warn names the copy and the
+# command to run by hand — a live dispatchable duplicate is possible then, and
+# the only signal is that warn in the log.
 #
-# ga-6u64fm: every warn/log call below is redirected to stderr (>&2)
-# explicitly — this file's shared warn()/log() helpers write to plain
-# stdout (echo, no >&2 of their own), which is harmless everywhere else in
-# this dispatcher but would be a real bug HERE: the caller captures this
-# function's stdout via command substitution to get the new bead id
-# ($(...)), so an un-redirected warn on any abort path would land IN that
-# captured string — making a FAILED migration read as "succeeded" with a
-# bogus id (a warning sentence, not a real bead id). Caught live by this
-# function's own selftest before it ever shipped.
+# Echoes the new bead id and returns 0 on success; returns 1 (nothing echoed)
+# on any abort — the caller falls through to the existing park behavior.
+#
+# STDOUT CONTRACT (gate-review ga-pvdwtc): the caller captures this function's
+# stdout via command substitution as the new bead id, so NOTHING else may reach
+# stdout. warn()/log() write to plain stdout in this file (echo, no >&2 of their
+# own), so every call below is redirected to stderr; and every bd WRITE is
+# silenced on both streams, because the real bd prints its "✓ Added label ..."
+# / "✓ Closed ..." confirmation on stdout even with -q. The caller does not
+# depend on this alone: _pilot_dog_store_try_migrate decides on the exit status
+# and validates the id's shape.
 _pilot_migrate_dog_store_blind_bead() {
   local _story_id="$1" _story_json="$2" _src_city="$3" _src_rig="$4" _story_labels="${5:-}"
 
@@ -6827,37 +6941,38 @@ _pilot_migrate_dog_store_blind_bead() {
 == Descricao original ==
 $_desc"
 
-  local _new_id
-  _new_id=$(bd -C "$_dest_city" create \
-    "$_title" \
+  # --title=<t>, not a positional title: a title that starts with "-" is parsed
+  # as a flag by the positional form ("Error: title required", verified with
+  # `bd create --dry-run`) and would fall back to park for no good reason.
+  local _new_id="" _create_out="" _create_rc=0
+  _create_out=$(bd -C "$_dest_city" create \
+    --title="$_title" \
     -t "$_itype" \
     -p "$_priority" \
     -l ctx:ready -l exec:auto -l story:approved \
     --metadata "{\"gc.migrated_from\":\"$_story_id\",\"gc.migrated_from_rig\":\"$_src_rig\"}" \
     -d "$_new_desc" \
-    --json 2>/dev/null | jq -r '.id // empty')
+    --json 2>/dev/null) || _create_rc=$?
+  _new_id=$(printf '%s' "$_create_out" | jq -r '.id // empty' 2>/dev/null) || _new_id=""
 
-  if [ -z "$_new_id" ]; then
-    warn "ga-6u64fm: bd create failed while auto-migrating $_story_id to $_dest_rig ($_dest_city) — falling back to park." >&2
+  # Judged on the exit status AND on the id being an id — a non-zero create can still have landed.
+  if [ "$_create_rc" -ne 0 ] || ! _pilot_is_bead_id "$_new_id"; then
+    warn "ga-6u64fm: bd create failed or returned no usable bead id while auto-migrating $_story_id to $_dest_rig ($_dest_city) (rc=$_create_rc) — looking for a copy that landed anyway, then falling back to park." >&2
+    _pilot_retract_orphan_migration_copies "$_dest_city" "$_story_id" || true
     return 1
   fi
 
   # Verify readback before trusting the id (ga-ehbw5 discipline: a write
   # succeeding is not the same fact as the write being READABLE). We fall
   # back to parking the ORIGINAL either way, but the create call may have
-  # actually landed and only the readback lagged — same ambiguity the
-  # close_fails race below resolves by retracting the copy rather than
-  # trusting it's safely gone. Apply the identical best-effort retraction
-  # here: label pilot:no-auto-dispatch (stop it being dispatched) then close
-  # it as unconfirmed, so a create that DID land is never left live with
-  # ctx:ready/exec:auto/story:approved and no blocking label (bead-
-  # migration-copy-races: never leave two live copies of the same story).
+  # actually landed and only the readback lagged — retract the copy (veto,
+  # then close) so a create that DID land is never left live with
+  # ctx:ready/exec:auto/story:approved and no blocking label.
   if ! bd -C "$_dest_city" show "$_new_id" >/dev/null 2>&1; then
     warn "ga-6u64fm: created $_new_id for migrated $_story_id but it did not read back — treating as failed, falling back to park. Attempting best-effort retraction in case the create actually landed." >&2
-    bd -C "$_dest_city" label add "$_new_id" "pilot:no-auto-dispatch" -q 2>/dev/null || true
-    bd -C "$_dest_city" close "$_new_id" --reason \
+    _pilot_migration_copy_retract "$_dest_city" "$_new_id" \
       "Retracted: create for $_story_id did not read back immediately after — treating as failed and parking the original; closing in case the write actually landed (ga-ehbw5 discipline)." \
-      -q 2>/dev/null || warn "ga-6u64fm: best-effort retraction of possibly-orphaned $_new_id also failed (label/close) — needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
+      || warn "ga-6u64fm: best-effort retraction of possibly-orphaned $_new_id also failed (label/close) — a live dispatchable copy may remain; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
     return 1
   fi
 
@@ -6865,30 +6980,72 @@ $_desc"
   # add never blocks the migration — the bead is still fully dispatchable
   # without it, just untiered for lane-capacity accounting.
   case ",$_story_labels," in
-    *,lane:small,*)  bd -C "$_dest_city" label add "$_new_id" "lane:small"  -q 2>/dev/null || true ;;
-    *,lane:medium,*) bd -C "$_dest_city" label add "$_new_id" "lane:medium" -q 2>/dev/null || true ;;
-    *,lane:large,*)  bd -C "$_dest_city" label add "$_new_id" "lane:large"  -q 2>/dev/null || true ;;
+    *,lane:small,*)  bd -C "$_dest_city" label add "$_new_id" "lane:small"  -q >/dev/null 2>&1 || true ;;
+    *,lane:medium,*) bd -C "$_dest_city" label add "$_new_id" "lane:medium" -q >/dev/null 2>&1 || true ;;
+    *,lane:large,*)  bd -C "$_dest_city" label add "$_new_id" "lane:large"  -q >/dev/null 2>&1 || true ;;
   esac
 
-  if bd -C "$_src_city" close "$_story_id" --reason \
+  local _close_rc=0 _orig_state="ours"
+  bd -C "$_src_city" close "$_story_id" --reason \
       "Movida para $_new_id ($_dest_rig, $_dest_city) -- ga-cszxcf, automatico: $_src_city nao e lido pelo probe de nenhum builder." \
-      -q 2>/dev/null; then
-    bd -C "$_dest_city" update "$_new_id" --set-metadata "gc.migrated_to_confirmed=1" -q 2>/dev/null || true
-    log "  ga-6u64fm: auto-migrated $_story_id ($_src_rig) -> $_new_id ($_dest_rig) -- original closed." >&2
-    printf '%s' "$_new_id"
-    return 0
+      -q >/dev/null 2>&1 || _close_rc=$?
+  if [ "$_close_rc" -ne 0 ]; then
+    # A non-zero exit does not prove the close had no effect: re-read the original (three states + closed-by-us).
+    _orig_state=$(_pilot_migration_original_state "$_src_city" "$_story_id" "$_new_id")
+    warn "ga-6u64fm: close of original $_story_id returned rc=$_close_rc after copy $_new_id was created — re-read the original: state=$_orig_state (bead-migration-copy-races)." >&2
   fi
 
-  # Close refused -- someone claimed the original in the race window (or a
-  # genuine bd failure). Retract the orphan copy immediately: park it first
-  # so a concurrent Pilot sweep can never dispatch it before cleanup
-  # finishes, then close it as a duplicate. Never leave two live copies of
-  # the same story (bead-migration-copy-races).
-  warn "ga-6u64fm: close of original $_story_id failed after creating copy $_new_id (likely raced with a concurrent claim) — retracting the copy as a duplicate (bead-migration-copy-races)." >&2
-  bd -C "$_dest_city" label add "$_new_id" "pilot:no-auto-dispatch" -q 2>/dev/null || true
-  bd -C "$_dest_city" close "$_new_id" --reason \
-    "Retracted: auto-migration of $_story_id raced with a concurrent claim on the original (close refused) -- duplicate, original stays authoritative." \
-    -q 2>/dev/null || warn "ga-6u64fm: FAILED to retract orphan copy $_new_id — needs manual cleanup (close + pilot:no-auto-dispatch already attempted)." >&2
+  case "$_orig_state" in
+    ours)
+      bd -C "$_dest_city" update "$_new_id" --set-metadata "gc.migrated_to_confirmed=1" -q >/dev/null 2>&1 || true
+      log "  ga-6u64fm: auto-migrated $_story_id ($_src_rig) -> $_new_id ($_dest_rig) -- original closed." >&2
+      printf '%s' "$_new_id"
+      return 0
+      ;;
+    unknown)
+      # Cannot tell whether the original is closed. Closing the copy could leave BOTH closed (the
+      # story lost); leaving it live could leave TWO live. Neither is safe, so VETO only — never
+      # close — and leave a trail on both beads for a human. The caller then parks the original.
+      warn "ga-6u64fm: cannot tell whether the original $_story_id was closed after its close returned rc=$_close_rc — vetoing copy $_new_id (pilot:no-auto-dispatch) but NOT closing it; a human must close ONE of the two: bd -C $_src_city show $_story_id ; bd -C $_dest_city show $_new_id" >&2
+      bd -C "$_dest_city" label add "$_new_id" "pilot:no-auto-dispatch" -q >/dev/null 2>&1 \
+        || warn "ga-6u64fm: FAILED to veto copy $_new_id — it is live and dispatchable; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
+      bd -C "$_dest_city" comment "$_new_id" "ga-6u64fm: copia de $_story_id ($_src_rig). Nao foi possivel confirmar se o original foi fechado; esta copia ficou VETADA (pilot:no-auto-dispatch), nao fechada. Conferir: bd -C $_src_city show $_story_id — se o original estiver fechado, remova o veto daqui; se estiver aberto, feche esta copia." >/dev/null 2>&1 || true
+      bd -C "$_src_city" comment "$_story_id" "ga-6u64fm: uma copia ($_new_id, $_dest_rig) foi criada mas nao foi possivel confirmar se este bead foi fechado; a copia esta VETADA (pilot:no-auto-dispatch), nao fechada. Fechar UM dos dois." >/dev/null 2>&1 || true
+      return 1
+      ;;
+    *)
+      # live | closed-other: the copy must not stay live next to an original that is still open, or
+      # resurrect a story somebody closed on purpose. Park first (a concurrent Pilot sweep can never
+      # dispatch it mid-cleanup), then close it as a duplicate (bead-migration-copy-races).
+      warn "ga-6u64fm: auto-migration of $_story_id did not complete (original state: $_orig_state) — retracting the copy $_new_id as a duplicate (bead-migration-copy-races)." >&2
+      _pilot_migration_copy_retract "$_dest_city" "$_new_id" \
+        "Retracted: auto-migration of $_story_id did not complete (original state: $_orig_state) -- duplicate, the original stays authoritative." \
+        || warn "ga-6u64fm: FAILED to retract copy $_new_id — a live dispatchable duplicate may remain; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
+      return 1
+      ;;
+  esac
+}
+
+# _pilot_dog_store_try_migrate <story_id> <story_json> <src_city> <src_rig> <story_labels_csv> —
+# ga-6u64fm (gate-review ga-pvdwtc): the dispatch call site's ONE decision point. Exit 0 with the new
+# bead id on stdout iff the story was really migrated; exit 1 with NOTHING on stdout otherwise.
+#
+# Decided on the migration's EXIT STATUS — the thing it actually reports — and then on the id being an
+# id (_pilot_is_bead_id). The call site used to decide on "captured stdout is non-empty", which is not
+# the same fact: a leaked "✓ Added label ..." line made a FAILED migration read as a success (skipping
+# the park, stripping the dispatching marks off an original that was still open). Exit 0 with a
+# non-id on stdout is a contract violation and is NOT reported as a migration: the caller parks, which
+# is inert (the original is closed by then, so parking only annotates it).
+_pilot_dog_store_try_migrate() {
+  local _out="" _rc=0
+  _out=$(_pilot_migrate_dog_store_blind_bead "$@") || _rc=$?
+  if [ "$_rc" -eq 0 ] && _pilot_is_bead_id "$_out"; then
+    printf '%s' "$_out"
+    return 0
+  fi
+  if [ "$_rc" -eq 0 ]; then
+    warn "ga-6u64fm: migration of ${1:-?} exited 0 but printed no usable bead id ('$_out') — contract violation; NOT reporting it as migrated." >&2
+  fi
   return 1
 }
 
@@ -10616,11 +10773,12 @@ TASK
           # just the migration attempt, falling straight through to the
           # unchanged park behavior below (which itself stays gated only by
           # PILOT_DOG_STORE_GUARD, untouched by this addition).
+          # Decided on the migration's EXIT STATUS (and the id being an id), never on "captured stdout is
+          # non-empty": a leaked bd "✓ Added label ..." line is non-empty too, and used to make a FAILED
+          # migration skip the park below (gate-review ga-pvdwtc). See _pilot_dog_store_try_migrate.
           local _MIGRATED_ID=""
-          if [ "${PILOT_DOG_STORE_AUTOMIGRATE:-1}" = "1" ]; then
-            _MIGRATED_ID=$(_pilot_migrate_dog_store_blind_bead "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" "$STORY_RIG" "$STORY_LABELS" || echo "")
-          fi
-          if [ -n "$_MIGRATED_ID" ]; then
+          if [ "${PILOT_DOG_STORE_AUTOMIGRATE:-1}" = "1" ] \
+             && _MIGRATED_ID=$(_pilot_dog_store_try_migrate "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" "$STORY_RIG" "$STORY_LABELS"); then
             log "  ga-6u64fm: $STORY_ID auto-migrated to $_MIGRATED_ID — original closed, no park needed (set PILOT_DOG_STORE_AUTOMIGRATE=0 to disable)."
             bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
             bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
