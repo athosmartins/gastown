@@ -1235,6 +1235,54 @@ case "$part_out" in
 esac
 rm -f "$STUBBIN/du"
 
+# ── _growth_scan_root: a root `find` could not LIST is PARTIAL — never an empty OK
+#    (gate ga-voklw8). When find fails, xargs gets EMPTY stdin, never runs du and
+#    exits 0, so unless find's OWN status is read an unlistable root is byte-for-byte
+#    an empty one. A stub find (rc 1, no output) is deterministic on any uid; the
+#    chmod-000 case is the reviewer's real repro. ─────────────────────────────────
+STUBFIND="$GROW_TMP/stubfind"; mkdir -p "$STUBFIND"
+printf '#!/bin/bash\nexit 1\n' > "$STUBFIND/find"; chmod +x "$STUBFIND/find"
+GU="$GROW_TMP/rootunlist"; mkdir -p "$GU"; echo x > "$GU/child"
+unl_out="$(PATH="$STUBFIND:$PATH" _growth_scan_root "$GU" 10)"
+[ "$unl_out" = "ROOT${TAB}PARTIAL${TAB}$GU" ] \
+  && ok "_growth_scan_root: a root find could not list is PARTIAL with zero ENT rows — not an empty OK" \
+  || bad "_growth_scan_root: unlistable root must read PARTIAL, got: $(printf '%s' "$unl_out" | tr '\n' '|')"
+GC0="$GROW_TMP/rootchmod0"; mkdir -p "$GC0/child"; echo x > "$GC0/child/f"; chmod 000 "$GC0"
+if find "$GC0" -maxdepth 1 -mindepth 1 -print0 >/dev/null 2>&1; then
+  chmod 755 "$GC0"
+  echo "  SKIP: chmod 000 does not stop find here (running as root?) — the stub-find case above covers the logic"
+else
+  chmod0_out="$(_growth_scan_root "$GC0" 10)"; chmod 755 "$GC0"
+  [ "$chmod0_out" = "ROOT${TAB}PARTIAL${TAB}$GC0" ] \
+    && ok "_growth_scan_root: a real chmod-000 root (the gate reviewer's repro) is PARTIAL, not 'ROOT OK' with zero rows" \
+    || bad "_growth_scan_root: chmod-000 root must read PARTIAL, got: $(printf '%s' "$chmod0_out" | tr '\n' '|')"
+fi
+chmod 755 "$GC0" 2>/dev/null
+# the guard against over-demotion: an EMPTY but perfectly listable root stays OK (find rc 0)
+GEM="$GROW_TMP/rootempty"; mkdir -p "$GEM"
+[ "$(_growth_scan_root "$GEM" 10)" = "ROOT${TAB}OK${TAB}$GEM" ] \
+  && ok "_growth_scan_root: an EMPTY listable root is still ROOT OK with no rows — reading find's status must not demote the routine case" \
+  || bad "_growth_scan_root: empty listable root should be OK, got: $(_growth_scan_root "$GEM" 10 | tr '\n' '|')"
+
+# ── end to end, through the REAL photo + delta: a root that could not be listed can
+#    never read as "did not grow" (readable then, unlistable now) nor as "everything
+#    is new" (unlistable then, readable now) ─────────────────────────────────────────
+GEE="$GROW_TMP/rootee"; mkdir -p "$GEE/a"; head -c 6291456 /dev/zero > "$GEE/a/f"
+printf '%s\n' "$GEE" | _disk_growth_photo "$GROW_TMP/ee-ok.txt"
+printf '%s\n' "$GEE" | PATH="$STUBFIND:$PATH" _disk_growth_photo "$GROW_TMP/ee-unl.txt"
+ee1="$(_growth_delta "$GROW_TMP/ee-ok.txt" "$GROW_TMP/ee-unl.txt" 8 1)"
+ee2="$(_growth_delta "$GROW_TMP/ee-unl.txt" "$GROW_TMP/ee-ok.txt" 8 1)"
+if printf '%s\n' "$ee1" | grep -q "^U${TAB}$GEE${TAB}baseline=OK now=PARTIAL\$" && ! printf '%s\n' "$ee1" | grep -q '^G'; then
+  ok "_growth_delta: a root readable in the baseline but unlistable NOW is reported NOT FULLY COMPARED (U), not silently 'no growth'"
+else
+  bad "_growth_delta: readable-then/unlistable-now should emit a U line, got: $(printf '%s' "$ee1" | tr '\n' '|')"
+fi
+if printf '%s\n' "$ee2" | grep -q "^U${TAB}$GEE${TAB}baseline=PARTIAL now=OK\$" && ! printf '%s\n' "$ee2" | grep -q '^G'; then
+  ok "_growth_delta: a root unlistable in the baseline never makes every entry 'new' — no G line, and a U line instead"
+else
+  bad "_growth_delta: unlistable-then/readable-now must not claim 'new' growth, got: $(printf '%s' "$ee2" | tr '\n' '|')"
+fi
+
 # ── _disk_growth_photo: format, atomicity, budget, unwritable ──────────────────
 PH="$GROW_TMP/photo1.txt"
 printf '%s\n%s\n' "$GR" "$GROW_TMP/nope" | _disk_growth_photo "$PH"; ph_rc=$?
@@ -1262,6 +1310,48 @@ printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/no-such-dir/photo.txt" 2>/de
 [ "$bad_rc" = "1" ] && [ ! -e "$GROW_TMP/no-such-dir" ] \
   && ok "_disk_growth_photo: an unwritable output returns 1 (the caller can retry) and creates nothing" \
   || bad "_disk_growth_photo: unwritable output should return 1, got $bad_rc"
+
+# ── _disk_growth_photo "writers": the THREE writer states must stay apart (gate
+#    ga-voklw8). lsof measured fine but NOTHING >= min is open for write is rc 0 with
+#    NO rows — a complete, clean answer. A bare `[ -n "$rows" ] && printf …` as the
+#    last command of the photo's brace group returned 1 on exactly that state, and
+#    the `|| { rm -f; return 1; }` after it threw the whole photo away, so a clean
+#    measurement read as "photo could not be written". Stand-ins for the lsof wrapper
+#    are swapped in for these three calls only and restored right after. ─────────────
+eval "$(declare -f _top_open_write_files | sed '1s/^_top_open_write_files/_photo_orig_top_open_write_files/')"
+_top_open_write_files() { return 0; }
+printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/photo-w0.txt" writers 30; w0_rc=$?
+_top_open_write_files() { printf '2158\t417\tfileproviderd\t/x/db\n'; return 0; }
+printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/photo-w1.txt" writers 30; w1_rc=$?
+_top_open_write_files() { return 2; }
+printf '%s\n' "$GR" | _disk_growth_photo "$GROW_TMP/photo-w2.txt" writers 30; w2_rc=$?
+eval "$(declare -f _photo_orig_top_open_write_files | sed '1s/^_photo_orig_top_open_write_files/_top_open_write_files/')"
+unset -f _photo_orig_top_open_write_files
+if [ "$w0_rc" = "0" ] && [ -s "$GROW_TMP/photo-w0.txt" ] && grep -q "^WRITERS${TAB}ok\$" "$GROW_TMP/photo-w0.txt" \
+   && [ "$(grep -c "^WRITER${TAB}" "$GROW_TMP/photo-w0.txt")" = "0" ] && grep -q "^ROOT${TAB}OK${TAB}$GR" "$GROW_TMP/photo-w0.txt"; then
+  ok "_disk_growth_photo writers: measured-EMPTY (rc 0, no rows) writes the WHOLE photo — WRITERS ok, zero WRITER rows, roots intact, rc 0"
+else
+  bad "_disk_growth_photo writers: measured-empty photo wrong (rc=$w0_rc exists=$([ -e "$GROW_TMP/photo-w0.txt" ] && echo yes || echo NO) content=$(head -c 300 "$GROW_TMP/photo-w0.txt" 2>/dev/null | tr '\n' '|'))"
+fi
+[ -z "$(ls "$GROW_TMP"/photo-w0.txt.tmp.* 2>/dev/null)" ] && ok "_disk_growth_photo writers: measured-empty leaves no .tmp file behind" || bad "_disk_growth_photo writers: measured-empty left a tmp file"
+case "$(_growth_writers_text "$GROW_TMP/photo-w0.txt")" in
+  *"(none >= ${GROWTH_WRITER_MIN_MB}MB)"*) ok "_growth_writers_text: the measured-empty photo reads '(none >= ${GROWTH_WRITER_MIN_MB}MB)' — the branch that was unreachable" ;;
+  *) bad "_growth_writers_text: measured-empty photo did not read '(none >= …MB)': $(_growth_writers_text "$GROW_TMP/photo-w0.txt" | tail -2 | tr '\n' '|')" ;;
+esac
+if [ "$w1_rc" = "0" ] && grep -q "^WRITERS${TAB}ok\$" "$GROW_TMP/photo-w1.txt" && [ "$(grep -c "^WRITER${TAB}" "$GROW_TMP/photo-w1.txt")" = "1" ]; then
+  ok "_disk_growth_photo writers: measured-with-rows records WRITERS ok and one WRITER row"
+else
+  bad "_disk_growth_photo writers: measured-with-rows wrong (rc=$w1_rc): $(grep -e '^WRITER' "$GROW_TMP/photo-w1.txt" 2>/dev/null | tr '\n' '|')"
+fi
+if [ "$w2_rc" = "0" ] && grep -q "^WRITERS${TAB}unmeasured\$" "$GROW_TMP/photo-w2.txt" && [ "$(grep -c "^WRITER${TAB}" "$GROW_TMP/photo-w2.txt")" = "0" ]; then
+  ok "_disk_growth_photo writers: UNMEASURED (rc 2) is its own state — the photo still lands, marked 'unmeasured', never 'ok'"
+else
+  bad "_disk_growth_photo writers: unmeasured wrong (rc=$w2_rc): $(grep -e '^WRITERS' "$GROW_TMP/photo-w2.txt" 2>/dev/null | tr '\n' '|')"
+fi
+case "$(_growth_writers_text "$GROW_TMP/photo-w2.txt")" in
+  *"(unmeasured"*) ok "_growth_writers_text: an unmeasured photo says so (distinct from '(none >= …)')" ;;
+  *) bad "_growth_writers_text: unmeasured photo not labelled unmeasured" ;;
+esac
 
 # ── _lsof_writers_parse: canned `lsof -F pcaftsn` output ───────────────────────
 # journal (pid 100) is held on TWO fds (one 'w', one 'u') = ONE row; readonly is
@@ -1464,10 +1554,19 @@ eval "$(declare -f _top_open_write_files | sed '1s/^_top_open_write_files/_real_
 eval "$(declare -f _growth_roots | sed '1s/^_growth_roots/_real_growth_roots/')"
 eval "$(declare -f _disk_growth_photo | sed '1s/^_disk_growth_photo/_real_disk_growth_photo/')"
 WRITERS_STUB_RC=0
-_top_open_write_files() { [ "$WRITERS_STUB_RC" = "0" ] && printf '2158\t417\tfileproviderd\t/x/db\n'; return "$WRITERS_STUB_RC"; }
+# WRITERS_STUB_ROWS=0 with RC=0 is the real tool's "lsof measured fine, nothing >= min is open for
+# write" — rc 0 and NO output. The stand-in used to print a row on every rc 0, so that state was
+# never run and a bug that dropped the whole photo on it stayed green (gate ga-voklw8).
+WRITERS_STUB_ROWS=1
+_top_open_write_files() { [ "$WRITERS_STUB_RC" = "0" ] && [ "$WRITERS_STUB_ROWS" = "1" ] && printf '2158\t417\tfileproviderd\t/x/db\n'; return "$WRITERS_STUB_RC"; }
 _growth_roots() { printf '%s\n%s\n' "$RA" "$RB"; }
 GROWTH_MIN_DELTA_MB=1
-EP_NOW="$(date +%s)"
+# EP_NOW is the "now" handed to the baseline logic, and it is set 120s AHEAD of the wall clock on
+# purpose. A real photo stamps TS only after its VM-volume du (measured 1s+ at load 70), so with
+# EP_NOW = the wall clock the baseline's own TS could land AFTER it, _growth_baseline_due would
+# read that as a clock step ("TS in the future" -> due, by design) and the rate-limit test below
+# failed intermittently (seen 1 run in 3 at load 70) — a flake that says nothing about the guard.
+EP_NOW="$(( $(date +%s) + 120 ))"
 : > "$LOG"
 
 # baseline: taken when due, then rate-limited, then refreshed when old, and off when disabled
@@ -1557,6 +1656,32 @@ else
   bad "_growth_episode_photo: failed photo must not be recorded (episode file exists=$([ -e "$EPF" ] && echo yes || echo no))"
 fi
 eval "$(declare -f _real_disk_growth_photo | sed '1s/^_real_disk_growth_photo/_disk_growth_photo/')"
+
+# measured-EMPTY writers (lsof fine, nothing >= min open for write: rc 0, no rows) is a normal
+# healthy cycle, so it must still produce the baseline AND the episode photo. Before the fix the
+# photo was dropped on exactly this state and both logged "could not be written" (gate ga-voklw8).
+WRITERS_STUB_ROWS=0
+_growth_clear_episode; rm -f "$BASEF" "$STATE_DIR"/disk-growth-*.txt
+: > "$LOG"
+_growth_baseline_refresh "$EP_NOW"
+if [ -s "$BASEF" ] && grep -q "^WRITERS${TAB}ok\$" "$BASEF" && grep -q "growth baseline photo refreshed" "$LOG" && ! grep -q "could not be written" "$LOG"; then
+  ok "_growth_baseline_refresh: writers measured-EMPTY (rc 0, no rows) still writes the baseline — not 'could not be written'"
+else
+  bad "_growth_baseline_refresh: measured-empty writers lost the baseline: exists=$([ -s "$BASEF" ] && echo yes || echo no) log=$(tr '\n' '|' < "$LOG" | head -c 300)"
+fi
+sleep 1
+: > "$LOG"
+_growth_episode_photo WARN 6
+EMPTY_PHOTO="$(ls -1 "$STATE_DIR"/disk-growth-*.txt 2>/dev/null)"
+if [ "$(printf '%s\n' "$EMPTY_PHOTO" | grep -c .)" = "1" ] && [ "$(sed -n 1p "$EPF" 2>/dev/null)" = "WARN" ] \
+   && grep -q "^WRITERS${TAB}ok\$" "$EMPTY_PHOTO" && grep -q "(none >= ${GROWTH_WRITER_MIN_MB}MB)" "$EMPTY_PHOTO" \
+   && ! grep -q "could not be written" "$LOG"; then
+  ok "_growth_episode_photo: writers measured-EMPTY still lands the episode photo, marks the episode, and says '(none >= ${GROWTH_WRITER_MIN_MB}MB)'"
+else
+  bad "_growth_episode_photo: measured-empty writers dropped the episode photo (photos='$EMPTY_PHOTO' episode=$(tr '\n' '|' < "$EPF" 2>/dev/null) log=$(tr '\n' '|' < "$LOG" | head -c 300))"
+fi
+WRITERS_STUB_ROWS=1
+_growth_clear_episode
 
 # retention: only the newest N of OUR files go; foreign files are never touched
 GROWTH_KEEP_PHOTOS_ORIG="$GROWTH_KEEP_PHOTOS"; GROWTH_KEEP_PHOTOS=2
