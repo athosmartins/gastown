@@ -114,6 +114,20 @@ HEADOFLINE_NONREPAIR_LOG_EVERY_SEC = int(os.environ.get("GRW_HOL_NONREPAIR_LOG_E
 ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
 ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
 ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned before we call it skipped (rules out a just-created marker)
+# ga-b1iulk: orphaned_queued_marker() was BLIND from 15/09 (strict UTF-8 read of the dispatcher log), so its
+# proof was never exercised against today's dispatcher. The first live read after the reader fix flagged
+# ga-b9pz7q (age 3.5h) as orphaned; the dispatcher claimed that very marker ~3min later, in a strict
+# created_at order. The proof — "the head's branch is unmentioned while a NEWER marker's branch is" — assumes
+# the dispatcher works the queue oldest-first one marker per sweep. It does not: it is tiered (quality-gate-
+# dispatcher.sh marker-select: overdue oldest-first → ONE freshest 'reserve' marker → priority authors
+# [aged, then smallest-diff-first] → everyone else [aged, then smallest-diff-first] → rebase-fail), and the
+# branch-name substring also matches an EARLIER attempt of the same branch. On a
+# deep queue every head marker would trip it, and each false positive would hold the single repair-dog slot
+# (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs. So the repair path is OFF unless explicitly enabled;
+# the signal is still logged (once per marker per ORPHAN_LOGONLY_EVERY_SEC). Re-enable only once the proof
+# is marker-id + tier aware (follow-up bead).
+GRW_ORPHAN_REPAIR_ENABLED = os.environ.get("GRW_ORPHAN_REPAIR_ENABLED", "0") == "1"
+ORPHAN_LOGONLY_EVERY_SEC = int(os.environ.get("GRW_ORPHAN_LOGONLY_EVERY_SEC", "1800"))
 WAKE_COOLDOWN_SEC = int(os.environ.get("WAKE_COOLDOWN_SEC", "1200"))   # base: don't dispatch a new repair for the SAME condition more than once per 20min
 ESCALATE_AFTER_WAKES = int(os.environ.get("ESCALATE_AFTER_WAKES", "2"))  # after N unresolved repair-cycles for one condition, page Athos 🚨
 
@@ -484,8 +498,7 @@ def secs_since_avail(now):
 def recent_timeouts():
     """count of 'Gate FAILED: TIMEOUT' in dispatcher log within TIMEOUT_WINDOW_SEC."""
     try:
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-4000:]
+        lines = _read_log_last_lines(DISPATCH_LOG, 4000)   # ga-b1iulk: tolerant of non-UTF-8 bytes
     except Exception:
         return 0, None
     now = time.time()
@@ -500,8 +513,7 @@ def recent_timeouts():
 
 def last_pass_epoch():
     try:
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-4000:]
+        lines = _read_log_last_lines(DISPATCH_LOG, 4000)   # ga-b1iulk: strict read returned 0 with 13 PASSED in this very window
     except Exception:
         return 0
     for l in reversed(lines):
@@ -547,8 +559,7 @@ def stuck_dispatching():
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
             return False  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-15:]
+        lines = _read_log_last_lines(DISPATCH_LOG, 15)      # ga-b1iulk: tolerant of non-UTF-8 bytes
     except Exception:
         return False
     vm = None
@@ -587,8 +598,7 @@ def gate_infra_throttled():
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 180:
             return False  # stale log → not actively throttling; let other detectors judge
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-25:]
+        lines = _read_log_last_lines(DISPATCH_LOG, 25)      # ga-b1iulk: tolerant of non-UTF-8 bytes
     except Exception:
         return False
     for l in reversed(lines):
@@ -665,6 +675,41 @@ def _read_log_tail_lines(path, max_bytes):
     if size > max_bytes and lines:
         lines = lines[1:]
     return lines
+
+
+# Smallest byte window _read_log_last_lines() starts from, and the bytes-per-line it budgets for. The
+# dispatcher log averages ~120 bytes/line (25MB / 208k lines, 25/09) but its 'FAIL forensics' lines run
+# to ~2KB, so the window GROWS until it really holds N lines rather than trusting the average.
+LAST_LINES_MIN_BYTES = 64 * 1024
+LAST_LINES_BYTES_PER_LINE = 256
+
+
+def _read_log_last_lines(path, n_lines):
+    """The last `n_lines` lines of `path` (fewer if the file is shorter), decoded TOLERANTLY.
+
+    Drop-in for `open(path).readlines()[-n_lines:]` at the sites that count LINES (ga-b1iulk): the
+    window stays N lines — it is NOT widened to N bytes, and each detector keeps the window it was
+    sized for — but the read no longer decodes strictly and no longer reads the whole file to slice
+    it. One byte that is not valid UTF-8 ANYWHERE in the 25MB dispatcher log (11 such lines, first
+    on 15/09) used to raise UnicodeDecodeError out of readlines(), which each caller's
+    `except Exception` turned into its neutral answer: last_pass_epoch() == 0 ('never passed', with
+    13 'Gate PASSED' inside the 4000 lines it reads — 769 in the file, 25/09), recent_timeouts() == (0, None), stuck_dispatching()/gate_infra_throttled()
+    == False, _dispatcher_log_state() == ([], "", False) ('log not fresh').
+
+    Built on _read_log_tail_lines(), which drops the partial first line of a tail read; the byte
+    window is grown x4 until it yields >= n_lines whole lines or covers the whole file. Lines come
+    back WITHOUT their trailing newline (readlines() kept it), so a caller that re-joins them must
+    supply the separator. A missing/unreadable file still raises OSError — callers keep their
+    existing `except Exception`, which is now reached only for a real I/O failure, not for an odd byte."""
+    if n_lines <= 0:
+        return []
+    size = os.path.getsize(path)
+    budget = max(LAST_LINES_MIN_BYTES, n_lines * LAST_LINES_BYTES_PER_LINE)
+    while True:
+        lines = _read_log_tail_lines(path, budget)
+        if len(lines) >= n_lines or budget >= size:
+            return lines[-n_lines:]
+        budget *= 4
 
 
 def headofline_scan():
@@ -882,8 +927,7 @@ def _dispatcher_log_state(tail=3000):
     log_fresh: the log file was written within ORPHAN_LOG_FRESH_SEC (process alive)."""
     try:
         fresh = time.time() - os.path.getmtime(DISPATCH_LOG) <= ORPHAN_LOG_FRESH_SEC
-        with open(DISPATCH_LOG) as f:
-            lines = f.readlines()[-tail:]
+        lines = _read_log_last_lines(DISPATCH_LOG, tail)    # ga-b1iulk: strict read gave ([], "", False) on a live log
     except Exception:
         return ([], "", False)
     epochs = []
@@ -892,7 +936,9 @@ def _dispatcher_log_state(tail=3000):
             e = log_ts_epoch(l)
             if e:
                 epochs.append(e)
-    return (epochs, "".join(lines), fresh)
+    # _read_log_last_lines() strips each line's newline; put it back so two adjacent lines can
+    # never fuse into one substring (a branch name straddling the join would be a false 'mentioned').
+    return (epochs, "".join(l + "\n" for l in lines), fresh)
 
 
 def _detect_orphan_markers(markers, sweep_epochs, log_text, now):
@@ -992,20 +1038,16 @@ def dolt_instability():
     under-counting real signal. Same error-vs-empty collapse this function
     exists to eliminate, just inverted.)"""
     try:
-        with open(SUPERVISOR_LOG) as f:
-            try:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 200000))
-            except Exception:
-                pass
-            tail = f.read()
+        # ga-b1iulk: was a TEXT-mode seek to an arbitrary byte offset + strict read — either an odd
+        # byte in the 200KB tail or a seek landing mid-character raised UnicodeDecodeError, which the
+        # except below turned into 0 = "no Dolt instability". Bytes + errors='replace' cannot raise.
+        tail_lines = _read_log_tail_lines(SUPERVISOR_LOG, 200000)
     except Exception:
         return 0
     cutoff = time.time() - DOLT_INSTABILITY_WINDOW_SEC
     hits = 0
     next_ts = time.time()  # nothing later seen yet → bound trailing lines by "now"
-    for line in reversed(tail.splitlines()):
+    for line in reversed(tail_lines):
         ts = _sup_log_ts_epoch(line)
         if ts is not None:
             next_ts = ts
@@ -1145,8 +1187,10 @@ def pilot_jammed():
     if pilot_stall_verdict(now - mtime, secs_since_avail(now), PILOT_STALL_SEC, GRW_WAKE_GRACE):
         return (True, "Pilot parou de varrer (log silencioso >%dmin) — pode estar morto" % (PILOT_STALL_SEC // 60))
     try:
-        with open(PILOT_LOG) as f:
-            lines = f.readlines()[-80:]
+        # ga-b1iulk: latent twin of the dispatcher-log bug — the pilot log carries bead titles
+        # (accented text), so a truncated multibyte char is possible; strict readlines() would
+        # turn it into (False, "") = "Pilot fine". Clean today (0 invalid lines, 25/09).
+        lines = _read_log_last_lines(PILOT_LOG, 80)
     except Exception:
         return (False, "")
     aborts = 0
@@ -4240,6 +4284,7 @@ def main():
   last_loop_spawn = 0
   last_orphan_spawn = 0
   hol_nonrepair_logged = {}  # ga-mlzqg4: branch -> epoch of the last log-only HOL line (rate limit)
+  orphan_logged = {}         # ga-b1iulk: marker id -> epoch of the last log-only orphan line (rate limit)
 
   print("[watchdog] gate+pilot watchdog started — governed repair-agent spawner "
         "(dedup + cap=%d + per-condition back-off + self-limit=%d; enabled=%s dry_run=%s) "
@@ -4419,7 +4464,15 @@ def main():
             print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
             notify("Marker órfão resolvido — gate voltou a passar (gt-mqkwj).", 3)
             gov.reset_prefix("gate-orphan:"); saw_orphan = False
-        if orphan_id and not infra:
+        if orphan_id and not infra and not GRW_ORPHAN_REPAIR_ENABLED:
+            # ga-b1iulk: LOG ONLY (see GRW_ORPHAN_REPAIR_ENABLED). No snapshot, no repair dog, no push.
+            if now - orphan_logged.get(orphan_id, 0) >= ORPHAN_LOGONLY_EVERY_SEC:
+                print("[watchdog] orphaned-marker candidate (log-only, NO repair dog spawned): %s branch %s "
+                      "queued %dmin, branch unmentioned in the dispatcher log tail while a newer marker's is — "
+                      "NOT proof of a drop: the dispatcher is tiered, not oldest-first (ga-b1iulk)"
+                      % (orphan_id, orphan_branch, orphan_age // 60), flush=True)
+                orphan_logged[orphan_id] = now
+        elif orphan_id and not infra:
             odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho)"
                              % (orphan_id, orphan_branch, orphan_age // 60), 0)
             # reason=branch (title), marker id carried for the runbook + dedup key
@@ -4428,6 +4481,10 @@ def main():
                                   marker_id=orphan_id, branch=orphan_branch)
             if ohow is not None:
                 last_orphan_spawn = now; saw_orphan = True
+        if not orphan_id:
+            # nothing flagged this sweep → the next candidate logs immediately. orphaned_queued_marker() also
+            # answers (None, None, 0) for an unreadable log; the worst that costs here is one repeated log line.
+            orphan_logged.clear()
     except Exception as e:
         print("[watchdog] loop error (continuing): %r" % e, flush=True)
     time.sleep(POLL_SEC)
