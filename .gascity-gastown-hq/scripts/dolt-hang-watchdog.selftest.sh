@@ -262,13 +262,109 @@ else
   bad "nao achei o script ao lado — asserts do ramo de recuperacao nao rodaram"
 fi
 
-# (b) checagem estatica de cobertura: os 4 pontos de mutacao conhecidos (recuperacao
-# saudavel, saturacao, escrita de strike, veto/restart) tem de estar TODOS atras do
-# mesmo helper — nao 3 de 4, que foi exatamente o estado que passou pelo attempt 1.
+# (b) checagem estatica de cobertura: os 5 pontos de mutacao conhecidos (recuperacao
+# saudavel, saturacao, escrita de strike, veto/restart, ga-xyhl9d PID-change forensic
+# capture) tem de estar TODOS atras do mesmo helper — nao 4 de 5, que foi exatamente
+# o estado que passou pelo attempt 1 quando era 3 de 4.
 if [ -f "$SRC" ]; then
   _gate_count=$(grep -cE '^[[:space:]]*if is_dry_run' "$SRC")
-  [ "$_gate_count" -eq 4 ] && ok "4/4 pontos de mutacao conhecidos usam is_dry_run (nenhum novo ficou de fora)" \
-                            || bad "ga-153cq regressao: esperava 4 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
+  [ "$_gate_count" -eq 5 ] && ok "5/5 pontos de mutacao conhecidos usam is_dry_run (nenhum novo ficou de fora)" \
+                            || bad "regressao: esperava 5 call-sites de 'if is_dry_run', achei ${_gate_count} — algum ramo de mutacao ficou sem gate"
+fi
+
+# ── ga-xyhl9d (sling ga-oyw1tw): PID-change/death forensic snapshot.
+#
+# The 2026-09-25 00:26:43 Dolt death left this file with NOTHING to show for
+# it: the separate process-keeper respawned Dolt in ~14s, well inside this
+# watchdog's own ~60-90s cadence, so probe_ok() only ever saw a healthy (if
+# different) server and cleared state as normal. Mayor's decision on ga-xyhl9d
+# (2026-09-25 04:01, option b): track the last-seen PID across invocations and
+# capture a read-only forensic snapshot the instant it changes or disappears.
+#
+# Tested with DOLT_WATCHDOG_PID_OVERRIDE (same seam as DOLT_WATCHDOG_CPU_PID
+# above) so a PID change can be simulated across invocations without a real
+# Dolt process, entirely isolated (scratch LASTPID_FILE + DEATH_LOG_DIR), and
+# a fake `gc` on PATH so probe_ok() resolves deterministically and the run
+# exits via the ordinary healthy path right after check_pid_change(). ──
+echo
+echo "ga-xyhl9d: PID-change forensic snapshot (check_pid_change / capture_death_snapshot)"
+if [ -f "$SRC" ]; then
+  _tmpd4=$(mktemp -d)
+  mkdir -p "$_tmpd4/bin" "$_tmpd4/deathlogs"
+  cat > "$_tmpd4/bin/gc" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${1:-}" = "dolt" ] && [ "${2:-}" = "health" ]; then
+  echo '{"server":{"reachable":true}}'
+  exit 0
+fi
+exit 1
+FAKE
+  chmod +x "$_tmpd4/bin/gc"
+  _lastpid="$_tmpd4/lastpid"
+  _deaths="$_tmpd4/deathlogs"
+  _count_deaths() { find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | wc -l | tr -d ' '; }
+
+  # (1) First-ever observation: no baseline on disk -> no snapshot, baseline established.
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE=1111 bash "$SRC" >/dev/null 2>&1
+  [ "$(_count_deaths)" = "0" ] && ok "first observation (no baseline) -> no snapshot fired" \
+                               || bad "first observation should not fire a snapshot -- $(_count_deaths) file(s) found"
+  [ "$(cat "$_lastpid" 2>/dev/null)" = "1111" ] && ok "first observation establishes baseline (lastpid=1111)" \
+                               || bad "baseline not established after first observation: $(cat "$_lastpid" 2>/dev/null)"
+
+  # (2) Same PID observed again -> still no snapshot, baseline unchanged.
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE=1111 bash "$SRC" >/dev/null 2>&1
+  [ "$(_count_deaths)" = "0" ] && ok "unchanged PID (1111 -> 1111) -> no snapshot fired" \
+                               || bad "unchanged PID should not fire a snapshot -- $(_count_deaths) file(s) found"
+
+  # (3) PID CHANGES (1111 -> 2222) -> exactly one snapshot, baseline advances.
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE=2222 bash "$SRC" >/dev/null 2>&1
+  [ "$(_count_deaths)" = "1" ] && ok "PID changed (1111 -> 2222) -> exactly one snapshot fired" \
+                               || bad "PID change should fire exactly one snapshot -- found $(_count_deaths)"
+  [ "$(cat "$_lastpid" 2>/dev/null)" = "2222" ] && ok "baseline advanced to new PID (2222)" \
+                               || bad "baseline did not advance: $(cat "$_lastpid" 2>/dev/null)"
+  _snap1="$(find "$_deaths" -maxdepth 1 -name 'dolt-death-*.txt' 2>/dev/null | head -1)"
+  if [ -n "$_snap1" ] && grep -q 'previous_pid: 1111' "$_snap1" && grep -q 'current_pid:  2222' "$_snap1"; then
+    ok "snapshot file records old and new PID correctly"
+  else
+    bad "snapshot file missing or does not record previous/current PID as expected: ${_snap1:-<none>}"
+  fi
+  grep -q 'Dolt PID CHANGED (1111 -> 2222)' "$_tmpd4/l" 2>/dev/null \
+    && ok "watchdog log records the PID-change event" \
+    || bad "watchdog log missing the PID-change event line"
+
+  # (4) PID DISAPPEARS (2222 -> <none>) -> a second snapshot, baseline cleared.
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE= bash "$SRC" >/dev/null 2>&1
+  [ "$(_count_deaths)" = "2" ] && ok "PID disappeared (2222 -> none) -> a second snapshot fired" \
+                               || bad "PID disappearance should fire a snapshot -- found $(_count_deaths), expected 2"
+  [ -f "$_lastpid" ] && bad "lastpid file should be removed once the PID disappears, but it still exists" \
+                     || ok "lastpid file removed once the PID disappears"
+
+  # (5) DRY_RUN must not create a snapshot file or advance the real baseline,
+  #     but must still report what it WOULD have done (same promise as every
+  #     other mutation site in this file).
+  echo 3333 > "$_lastpid"
+  env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
+      DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+      DOLT_WATCHDOG_PID_OVERRIDE=4444 DOLT_WATCHDOG_DRY_RUN=1 bash "$SRC" >/dev/null 2>&1
+  [ "$(_count_deaths)" = "2" ] && ok "DRY-RUN PID change -> no new snapshot written (still 2)" \
+                               || bad "DRY-RUN should not write a snapshot -- found $(_count_deaths), expected 2"
+  [ "$(cat "$_lastpid" 2>/dev/null)" = "3333" ] && ok "DRY-RUN does not advance the real lastpid baseline (still 3333)" \
+                               || bad "ga-xyhl9d regressao: DRY-RUN mutated the real lastpid file ($(cat "$_lastpid" 2>/dev/null))"
+  grep -q 'DRY-RUN: Dolt PID changed (3333 -> 4444)' "$_tmpd4/l" 2>/dev/null \
+    && ok "DRY-RUN reports the PID-change branch it would have taken (not silent)" \
+    || bad "DRY-RUN did not report the simulated PID change"
+
+  rm -rf "$_tmpd4"
+else
+  bad "nao achei o script ao lado — asserts de PID-change nao rodaram"
 fi
 
 # ── ga-wxwao (case 2): the post-restart "still unhealthy" branch must call the

@@ -72,10 +72,90 @@ CPU_PID_OVERRIDE="${DOLT_WATCHDOG_CPU_PID:-}"
 # EVERY mutation, not just the destructive one, or the promise is only as
 # true as whichever branch was last audited. One variable, one helper, one
 # call-site pattern (`if is_dry_run`) used at every write below — grep for it
-# to audit coverage; there are exactly 4 (probe_ok recovery, saturation
-# recovery, strike write, veto/restart) and the selftest asserts that count.
+# to audit coverage; there are exactly 5 (probe_ok recovery, saturation
+# recovery, strike write, veto/restart, PID-change forensic capture) and the
+# selftest asserts that count.
 DRY_RUN="${DOLT_WATCHDOG_DRY_RUN:-0}"
 is_dry_run() { [ "$DRY_RUN" = "1" ]; }
+
+# ga-xyhl9d (sling ga-oyw1tw): PID-change/death forensic snapshot.
+#
+# WHY: the 2026-09-25 00:26:43 Dolt death left NO trace anywhere (no Go panic
+# in dolt.log, no jetsam/highwater kill, no watchdog strike) because the
+# separate process-keeper already respawned it in ~14s — well inside this
+# watchdog's ~60-90s launchd cadence, so the very next probe here just saw a
+# HEALTHY (if different) server and cleared state normally. A hang-focused
+# probe only ever answers "healthy now" or "hung now"; it has no memory of
+# which PID it last saw, so a fast death+respawn is invisible to it BY
+# CONSTRUCTION, not bad luck. Mayor's decision (ga-xyhl9d comment, 2026-09-25
+# 04:01, option (b)): track the last-seen PID across invocations and capture
+# a read-only forensic snapshot the INSTANT it changes or disappears — turns
+# the next death into proof instead of a postmortem hypothesis. This adds NO
+# new restart/kill path; it only reads and writes a plain log file.
+LASTPID_FILE="${DOLT_WATCHDOG_LASTPID_FILE:-/tmp/dolt-hang-watchdog.lastpid}"
+DEATH_LOG_DIR="${DOLT_WATCHDOG_DEATH_LOG_DIR:-$CITY/.gc/logs}"
+
+# Read-only capture: everything here only READS system/log state and writes
+# ONE new file under DEATH_LOG_DIR. Never signals or restarts anything.
+capture_death_snapshot() {
+  local _old="$1" _new="$2" _ts _out
+  _ts="$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "$DEATH_LOG_DIR" 2>/dev/null || true
+  _out="$DEATH_LOG_DIR/dolt-death-${_ts}.txt"
+  {
+    echo "=== dolt-hang-watchdog PID-change forensic snapshot ==="
+    echo "captured_at:  $(ts)"
+    echo "previous_pid: ${_old:-<none>}"
+    echo "current_pid:  ${_new:-<none>}"
+    echo
+    echo "--- dolt-state.json (current supervisor record) ---"
+    cat "$CITY/.gc/runtime/packs/dolt/dolt-state.json" 2>/dev/null || echo "(not found)"
+    echo
+    echo "--- log show --last 3m: dolt / memorystatus / jetsam / tcp_close / signals ---"
+    timeout 30 log show --last 3m --predicate \
+      'eventMessage contains "dolt" OR eventMessage contains "memorystatus" OR eventMessage contains "jetsam" OR eventMessage contains "tcp_close" OR eventMessage contains "SIGKILL" OR eventMessage contains "SIGQUIT" OR eventMessage contains "SIGTERM"' \
+      2>&1 | tail -1000
+    echo
+    echo "--- ps: supervisor + dolt process tree (snapshot at capture time) ---"
+    ps -ef 2>/dev/null | { head -1; grep -i dolt; } | grep -v ' grep -i dolt'
+    echo
+    echo "--- last 50 lines of dolt.log ---"
+    tail -50 "$CITY/.gc/runtime/packs/dolt/dolt.log" 2>/dev/null || echo "(not found)"
+    echo
+    echo "--- short-lived 'dolt' CLI process count in the last 60s (ga-oyw1tw burst lead) ---"
+    timeout 20 log show --last 1m --predicate \
+      'eventMessage contains "Retrieve User by ID" AND processImagePath contains "dolt"' \
+      2>&1 | grep -c . || true
+    echo
+    echo "--- exit status/signal of the previous PID, if the supervisor recorded one ---"
+    echo "(no such record is currently exposed by the supervisor; dolt-state.json above only has the CURRENT pid/started_at)"
+  } > "$_out" 2>&1
+  printf '%s' "$_out"
+}
+
+# Compares the PID this run observes against the PID the LAST run recorded.
+# A change (including a disappearance) fires capture_death_snapshot(); the
+# baseline is then advanced to the current observation either way. First-ever
+# observation (no baseline on disk) never fires — there's nothing to diff.
+check_pid_change() {
+  local _cur _prev _changed=0
+  _cur="${DOLT_WATCHDOG_PID_OVERRIDE-$(dolt_server_pid || true)}"
+  _prev="$(cat "$LASTPID_FILE" 2>/dev/null || true)"
+  [ -n "$_prev" ] && [ "$_prev" != "$_cur" ] && _changed=1
+
+  if is_dry_run; then
+    if [ "$_changed" -eq 1 ]; then
+      log "DRY-RUN: Dolt PID changed (${_prev} -> ${_cur:-<none>}) -- would capture forensic snapshot in ${DEATH_LOG_DIR}. Not written; lastpid left at ${_prev} on disk."
+    fi
+  else
+    if [ "$_changed" -eq 1 ]; then
+      local _snap
+      _snap="$(capture_death_snapshot "$_prev" "$_cur")"
+      log "Dolt PID CHANGED (${_prev} -> ${_cur:-<none>}) -- forensic snapshot captured: ${_snap}"
+    fi
+    if [ -n "$_cur" ]; then printf '%s' "$_cur" > "$LASTPID_FILE"; else rm -f "$LASTPID_FILE" 2>/dev/null || true; fi
+  fi
+}
 
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null; }
@@ -131,6 +211,12 @@ dolt_cpu_pct() {
   [ -z "$_cpu" ] && { printf ''; return; }
   printf '%s' "${_cpu%%.*}"
 }
+
+# Runs UNCONDITIONALLY, before any health decision: a death+respawn can
+# complete well inside this watchdog's own polling interval, so probe_ok()
+# below may see a healthy server on every single run and never know a death
+# happened in between. This is the only place in the file that would notice.
+check_pid_change
 
 if probe_ok; then
   # ga-153cq: the veto counter must reset on recovery too. It counts CONSECUTIVE
