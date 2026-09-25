@@ -50,6 +50,13 @@ grep -q '^_pilot_text_names_rig_path() {' "$DISPATCHER" \
   || fail "_pilot_text_names_rig_path() (anchored path-token match) missing from the deployed dispatcher"
 grep -q '^_pilot_story_already_migrated() {' "$DISPATCHER" \
   || fail "_pilot_story_already_migrated() (one-hop guard) missing from the deployed dispatcher"
+# Gate-review ga-pvdwtc hardening: the call site decides on the migration's EXIT STATUS through
+# _pilot_dog_store_try_migrate (+ the id's shape), and the ambiguous writes are resolved by readback.
+for _fn in _pilot_is_bead_id _pilot_dog_store_try_migrate _pilot_migration_copy_retract \
+           _pilot_retract_orphan_migration_copies _pilot_migration_original_state; do
+  grep -q "^${_fn}() {" "$DISPATCHER" \
+    || fail "${_fn}() missing from the deployed dispatcher (gate-review ga-pvdwtc hardening)"
+done
 log "  present ✓"
 
 # ── 3. Call-site wiring: attempt precedes the pre-existing park fallback ───────
@@ -58,7 +65,10 @@ grep -qE 'PILOT_DOG_STORE_AUTOMIGRATE:-1' "$DISPATCHER" \
   || fail "PILOT_DOG_STORE_AUTOMIGRATE kill switch missing from the deployed dispatcher"
 grep -qF 'DISPATCH_RESULT="rig_native_dog_store_migrated"' "$DISPATCHER" \
   || fail "rig_native_dog_store_migrated DISPATCH_RESULT missing from the deployed dispatcher"
-MIGRATE_LINE=$(grep -n '_pilot_migrate_dog_store_blind_bead "\$STORY_ID"' "$DISPATCHER" | head -1 | cut -d: -f1)
+# The call site goes through the wrapper (decides on exit status), never the raw migrator.
+grep -qF '_pilot_migrate_dog_store_blind_bead "$STORY_ID"' "$DISPATCHER" \
+  && fail "the call site calls the raw migrator again (decides on captured stdout) instead of _pilot_dog_store_try_migrate"
+MIGRATE_LINE=$(grep -nF '_pilot_dog_store_try_migrate "$STORY_ID"' "$DISPATCHER" | head -1 | cut -d: -f1)
 PARK_LINE=$(grep -n 'ga-cszxcf: REFUSING rig-native dispatch' "$DISPATCHER" | head -1 | cut -d: -f1)
 [[ -n "$MIGRATE_LINE" && -n "$PARK_LINE" ]] || fail "could not locate both ordering anchors (migrate call site, park warn)"
 [[ "$MIGRATE_LINE" -lt "$PARK_LINE" ]] \
@@ -79,8 +89,10 @@ log "  park fallback intact ✓"
 # migrate.selftest.sh extracts the LIVE functions via awk and exercises them
 # against a PATH-stubbed fake bd (destination picking incl. the readable-only
 # and path-anchoring rules, the one-hop guard, TOCTOU re-check abort,
-# create/readback/close failure handling, and the race-retraction recovery),
-# plus drift-guards on the call-site wiring.
+# create/readback/close failure handling, the race-retraction recovery, the
+# stdout contract against a fake bd that prints the real "✓ ..." confirmations,
+# and the DEPLOYED call-site expression run under set -euo pipefail), plus
+# drift-guards on the call-site wiring.
 log "Running pilot-dispatcher.dog-store-migrate.selftest.sh against the deployed dispatcher..."
 bash "$SELFTEST" || fail "pilot-dispatcher.dog-store-migrate.selftest.sh reported failures"
 log "  selftest PASS ✓"

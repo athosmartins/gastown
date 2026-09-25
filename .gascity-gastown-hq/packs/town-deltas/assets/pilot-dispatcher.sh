@@ -7002,7 +7002,20 @@ $_desc"
       printf '%s' "$_new_id"
       return 0
       ;;
-    unknown)
+    live|closed-other)
+      # live | closed-other: the copy must not stay live next to an original that is still open, or
+      # resurrect a story somebody closed on purpose. Park first (a concurrent Pilot sweep can never
+      # dispatch it mid-cleanup), then close it as a duplicate (bead-migration-copy-races).
+      warn "ga-6u64fm: auto-migration of $_story_id did not complete (original state: $_orig_state) — retracting the copy $_new_id as a duplicate (bead-migration-copy-races)." >&2
+      _pilot_migration_copy_retract "$_dest_city" "$_new_id" \
+        "Retracted: auto-migration of $_story_id did not complete (original state: $_orig_state) -- duplicate, the original stays authoritative." \
+        || warn "ga-6u64fm: FAILED to retract copy $_new_id — a live dispatchable duplicate may remain; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
+      return 1
+      ;;
+    *)
+      # unknown — AND any token this case does not name (the helper prints only
+      # ours|closed-other|live|unknown; an unexpected value is "cannot tell", never "live"):
+      # the DEFAULT under doubt is the inert state, not the destructive one.
       # Cannot tell whether the original is closed. Closing the copy could leave BOTH closed (the
       # story lost); leaving it live could leave TWO live. Neither is safe, so VETO only — never
       # close — and leave a trail on both beads for a human. The caller then parks the original.
@@ -7011,16 +7024,6 @@ $_desc"
         || warn "ga-6u64fm: FAILED to veto copy $_new_id — it is live and dispatchable; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
       bd -C "$_dest_city" comment "$_new_id" "ga-6u64fm: copia de $_story_id ($_src_rig). Nao foi possivel confirmar se o original foi fechado; esta copia ficou VETADA (pilot:no-auto-dispatch), nao fechada. Conferir: bd -C $_src_city show $_story_id — se o original estiver fechado, remova o veto daqui; se estiver aberto, feche esta copia." >/dev/null 2>&1 || true
       bd -C "$_src_city" comment "$_story_id" "ga-6u64fm: uma copia ($_new_id, $_dest_rig) foi criada mas nao foi possivel confirmar se este bead foi fechado; a copia esta VETADA (pilot:no-auto-dispatch), nao fechada. Fechar UM dos dois." >/dev/null 2>&1 || true
-      return 1
-      ;;
-    *)
-      # live | closed-other: the copy must not stay live next to an original that is still open, or
-      # resurrect a story somebody closed on purpose. Park first (a concurrent Pilot sweep can never
-      # dispatch it mid-cleanup), then close it as a duplicate (bead-migration-copy-races).
-      warn "ga-6u64fm: auto-migration of $_story_id did not complete (original state: $_orig_state) — retracting the copy $_new_id as a duplicate (bead-migration-copy-races)." >&2
-      _pilot_migration_copy_retract "$_dest_city" "$_new_id" \
-        "Retracted: auto-migration of $_story_id did not complete (original state: $_orig_state) -- duplicate, the original stays authoritative." \
-        || warn "ga-6u64fm: FAILED to retract copy $_new_id — a live dispatchable duplicate may remain; needs manual cleanup: bd -C $_dest_city show $_new_id" >&2
       return 1
       ;;
   esac

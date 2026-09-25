@@ -776,6 +776,38 @@ else
   bad "close-unreadable -> expected a comment on NEW-1 and on ORIG-1, got: $(calls_of close_unreadable)"
 fi
 
+# C4c2 — the DEFAULT arm is the inert one. The state helper is meant to print only ours|closed-other|live|unknown;
+# a token the case does not name (output noise, a future edit of the helper) is "cannot tell" — and under doubt the
+# copy is VETOED, never closed (closing it could leave both beads closed: the story lost).
+run_migrate_state_stub() { # run_migrate_state_stub <token> — scenario close_fails, state helper stubbed to print <token>
+  local _bin
+  _bin=$(fake_bd close_fails)
+  STATE_TOKEN="$1" PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+    bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
+log()  { echo \"LOG: \$*\"; }
+$FN_PRELUDE"'
+_pilot_migration_original_state() { printf "%s" "$STATE_TOKEN"; }
+_pilot_migrate_dog_store_blind_bead ORIG-1 "$1" "$2" gastown lane:small' _ "$STORY_JSON" "$WORK/gastown"
+}
+for _tok in garbage "" "LIVE" "✓ Closed ORIG-1: x"; do
+  OUT=$(run_migrate_state_stub "$_tok" 2>/dev/null); RC=$?
+  if [ "$RC" = "1" ] && [ -z "$OUT" ] && vetoed_id close_fails NEW-1 && ! closed_id close_fails NEW-1; then
+    ok "unrecognised original-state token '$_tok' -> the DEFAULT arm is inert: copy vetoed, NOT closed, nothing on stdout"
+  else
+    bad "unrecognised original-state token '$_tok' -> expected rc=1 empty, veto without close on NEW-1; got rc=$RC out='$OUT' calls: $(calls_of close_fails)"
+  fi
+done
+# ... and the two states the case DOES name still retract (so the default arm did not swallow them).
+for _tok in live closed-other; do
+  OUT=$(run_migrate_state_stub "$_tok" 2>/dev/null); RC=$?
+  if [ "$RC" = "1" ] && [ -z "$OUT" ] && order_ok close_fails NEW-1; then
+    ok "original-state '$_tok' -> retracts the copy (veto BEFORE close): the named states are not swallowed by the inert default"
+  else
+    bad "original-state '$_tok' -> expected veto-then-close on NEW-1, got rc=$RC out='$OUT' calls: $(calls_of close_fails)"
+  fi
+done
+
 # C4d — bd create failed but the copy LANDED (output lost): found by gc.migrated_from and retracted.
 for _sc in create_lost create_rc_with_id; do
   OUT=$(run_migrate "$_sc" 2>/dev/null); RC=$?
