@@ -1051,10 +1051,29 @@ type _mirror_staging_after_disk_refusal >/dev/null 2>&1 \
 MR_DIR="$(mktemp -d)"; MR_LOG="$(mktemp)"; MR_CALLS="$(mktemp)"
 _s3proof_repair_then_prove() { echo "prove $1 $2" >> "$MR_CALLS"; return "${MR_STUB_RC:-0}"; }
 
-: > "$MR_CALLS"
-LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
-[ "$rc" -eq 0 ] && ok "no staging dir → returns 0 (nothing to mirror)" || bad "no staging dir returned $rc"
-[ ! -s "$MR_CALLS" ] && ok "…and the proof/mirror is NOT attempted for a missing dir" || bad "proof attempted for a missing dir"
+# No staging to mirror is NOT "S3 is fine": with the staging gone (released for the dolt_gc
+# window) the alert must still report S3's real state, so S3's own closure is read (read-only).
+MR_CLOSURE="$(mktemp)"
+_s3proof_s3_closure_ok() { echo "closure $1" >> "$MR_CLOSURE"; return "${MR_S3_RC:-0}"; }
+
+: > "$MR_CALLS"; : > "$MR_CLOSURE"; : > "$MR_LOG"
+MR_S3_RC=0 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
+[ "$rc" -eq 0 ] && ok "no staging + S3 closure proven → returns 0 (S3 restorable)" || bad "no staging + closure OK returned $rc"
+[ "$(cat "$MR_CLOSURE")" = "closure hq" ] && ok "…by reading S3's closure for exactly this db (not assuming)" || bad "closure not checked for the missing-staging case: '$(cat "$MR_CLOSURE")'"
+[ ! -s "$MR_CALLS" ] && ok "…and the upload/repair proof is NOT attempted for a missing dir (nothing to mirror)" || bad "repair attempted for a missing dir"
+
+: > "$MR_CALLS"; : > "$MR_CLOSURE"; : > "$MR_LOG"
+MR_S3_RC=1 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
+[ "$rc" -eq 1 ] && ok "no staging + S3 closure NOT proven → returns 1 (alert says disco+s3, never a blind 'disco')" || bad "no staging + closure failing returned $rc (unverified S3 reported as fine)"
+grep -q 'NOT proven restorable' "$MR_LOG" && ok "…and the log says S3 is NOT proven restorable" || bad "missing-staging failure not logged: $(cat "$MR_LOG")"
+[ ! -s "$MR_CALLS" ] && ok "…without attempting an upload from a dir that does not exist" || bad "repair attempted for a missing dir"
+
+# the closure probe must NOT be consulted when a staging exists — the strong proof covers it
+mkdir -p "$MR_DIR/hq"; : > "$MR_CLOSURE"; : > "$MR_CALLS"
+MR_S3_RC=1 MR_STUB_RC=0 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/hq" >/dev/null; rc=$?
+[ "$rc" -eq 0 ] && [ ! -s "$MR_CLOSURE" ] && ok "with a staging present the decision comes from the repair-then-prove lib alone" || bad "staging present: rc=$rc closure_calls='$(cat "$MR_CLOSURE")'"
+rmdir "$MR_DIR/hq"
+unset -f _s3proof_s3_closure_ok; rm -f "$MR_CLOSURE"
 
 mkdir -p "$MR_DIR/hq"; : > "$MR_CALLS"
 MR_STUB_RC=0 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/hq"; rc=$?

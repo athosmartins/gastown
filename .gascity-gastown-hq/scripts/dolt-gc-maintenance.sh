@@ -147,6 +147,32 @@ PRUNE_REQUIRE_BACKUP="${PRUNE_REQUIRE_BACKUP:-1}"   # 1 = require a same-day bac
 PRUNE_BACKUP_MAX_AGE_H="${PRUNE_BACKUP_MAX_AGE_H:-26}"
 BACKUP_STAGING="${BACKUP_STAGING:-$CITY/.dolt-backup}"
 
+# ── ga-btnq6h: release hq's LOCAL backup staging to make room for dolt_gc ───────────
+# hq's dolt_gc() needs ~2x hq's own size free (measured worst case, ga-3euoj) — ~15.5 GB
+# at 7.7 GB — while free space peaks near 14 GB and swings 3–14 GB. The one large,
+# REDUNDANT block on that disk is hq's local backup staging (.dolt-backup/hq, ~8.8 GB):
+# S3 mirrors it, and a separate 6-hourly job (mol-dog-backup) rebuilds it by incremental
+# sync. MEASURED 2026-09-25: 53 consecutive headroom skips (~106 h); hq grew 3.9 → 7.7 GB
+# since the last real GC (08-20), which raises the bar each cycle — a vicious circle no
+# amount of waiting resolves. So, when the skip is CHRONIC and S3 is PROVEN to hold an
+# identical, restorable copy, free the staging for the GC window (see
+# _gc_maybe_release_staging below). Every guard is fail-closed; the release is the only act in
+# this file that deletes BACKUP data (prune/flatten act on live beads, behind their own gates),
+# and it is never taken on a guess.
+GC_RELEASE_STAGING_ENABLED="${GC_RELEASE_STAGING_ENABLED:-1}"   # 0 = never release (kill switch)
+GC_RELEASE_STAGING_DRYRUN="${GC_RELEASE_STAGING_DRYRUN:-0}"     # 1 = decide + log WOULD RELEASE, delete nothing
+GC_RELEASE_MIN_STREAK="${GC_RELEASE_MIN_STREAK:-6}"     # consecutive headroom-skip cycles (2h each ≈ 12h): chronic, not a blip
+GC_RELEASE_SLACK_MB="${GC_RELEASE_SLACK_MB:-2048}"      # headroom must clear the gate by this much AFTER the release
+GC_RELEASE_COOLDOWN_H="${GC_RELEASE_COOLDOWN_H:-168}"   # at most one release per week (a no-effect GC must not loop delete→rebuild)
+GC_RELEASE_STATE="${GC_RELEASE_STATE:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-staging-release.state}"
+GC_RELEASE_BACKUP_LOCKDIR="${GC_RELEASE_BACKUP_LOCKDIR:-$CITY/.gc/logs/.dolt-s3-backup.lock.d}"   # dolt-s3-backup.sh's single-instance lock
+# A process that writes to the staging RIGHT NOW: the backup scripts (as a script token),
+# or a dolt backup sync/restore. Matched against `ps -axo command=`; on doubt → busy.
+GC_RELEASE_WRITER_RE="${GC_RELEASE_WRITER_RE:-(^|[ /])(mol-dog-backup|dolt-s3-backup|dolt-backup-reseed|dolt-backup-swap-repair|dolt-backup-residue-reclaim|dolt-compact-routine|dolt-offline-backup-sync)\\.sh( |\$)|dolt( .*)? backup (sync|restore)|DOLT_BACKUP}"
+AWS="${AWS:-$(command -v aws 2>/dev/null || echo /opt/homebrew/bin/aws)}"     # read by dolt-backup-s3-proof.sh
+BUCKET="${BUCKET:-urblink-dolt-backups}"                                        # read by dolt-backup-s3-proof.sh
+S3PROOF_LOG="${S3PROOF_LOG:-$LOG}"                                              # upload output of the proof lib goes to the same log
+
 # ── weekly FLATTEN knobs (deep on-disk reclaim; IRREVERSIBLE history loss) ───────
 FLATTEN_ENABLED="${FLATTEN_ENABLED:-0}"
 FLATTEN_STORES="${FLATTEN_STORES:-$CITY:hq}"        # "bd_dir:db" pairs (see PRUNE_STORES)
@@ -166,6 +192,12 @@ log() { echo "[$(ts)] $*" >> "$LOG" 2>/dev/null || true; }
 _PROBE="$CITY/scripts/gc-dolt-probe.sh"
 # shellcheck disable=SC1090
 [ -f "$_PROBE" ] && . "$_PROBE" 2>/dev/null || true
+
+# ga-btnq6h: manifest-closure S3 proof + additive mirror (shared with dolt-s3-backup.sh).
+# A missing/unloadable lib leaves _s3proof_* undefined; every use below treats that as
+# "NOT proven" (command-not-found is non-zero), so the release stays inert.
+# shellcheck source=dolt-backup-s3-proof.sh
+source "$(dirname "${BASH_SOURCE[0]:-$0}")/dolt-backup-s3-proof.sh" 2>/dev/null || true
 
 # ════════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTIONS — unit-tested by dolt-gc-maintenance.selftest.sh.
@@ -506,6 +538,171 @@ repeat until the streak clears (an attempted dolt_gc) and later re-crosses the t
   log "ALERT: dolt_gc skip streak reached ${GC_SKIP_ALERT_THRESHOLD}+ — notified mayor (notify + mail)"
 }
 
+# ── ga-btnq6h: guarded release of hq's local backup staging for the dolt_gc window ─────
+#
+# WHEN: only inside the headroom-skip branch of main(), after the streak was counted, and
+# only when the skip is CHRONIC (GC_RELEASE_MIN_STREAK cycles) — a one-off tight moment is
+# never enough. WHAT: remove $BACKUP_STAGING/$DB (hq's LOCAL backup copy) so the GC has room.
+# WHY THAT IS SAFE ONLY UNDER PROOF: the copy is redundant iff S3 holds an identical AND
+# restorable one. _s3proof_repair_then_prove establishes exactly that (manifest closure on
+# both sides + nothing left to upload), repairing S3 first from the staging when it lags.
+# "The manifest object exists" is NOT that proof — on 2026-09-25 hq's S3 manifest existed and
+# named a table the bucket lacked (see dolt-backup-s3-proof.sh).
+#
+# AFTER: mol-dog-backup (6-hourly order) rebuilds the staging by incremental sync, and the
+# nightly job mirrors it; both work on a missing dir (dolt-s3-backup.sh already wipes and
+# rebuilds it on a stale manifest). Meanwhile S3 + the live store hold the data, and the
+# staging comes back SMALLER once the GC has shrunk hq.
+
+# _gc_now_epoch — testable clock (override with GC_NOW_EPOCH).
+_gc_now_epoch() { if [ -n "${GC_NOW_EPOCH:-}" ]; then printf '%s' "$GC_NOW_EPOCH"; else date +%s; fi; }
+
+# _gc_release_decision <streak> <avail_mb> <staging_mb> <required_mb> <min_streak> <slack_mb>
+# → echoes "RELEASE" or "REFUSE <reason>". PURE arithmetic; any non-numeric input (an
+# unmeasurable number) REFUSES — a failed read must never look like "plenty of room".
+# RELEASE needs: a real staging to free, a chronic streak, and — the point of doing it at all
+# — that freeing it actually clears the GC gate (avail + staging >= required + slack).
+_gc_release_decision() {
+  local streak="$1" avail="$2" staging="$3" required="$4" min_streak="$5" slack="$6" v
+  for v in "$streak" "$avail" "$staging" "$required" "$min_streak" "$slack"; do
+    case "$v" in ''|*[!0-9]*) echo "REFUSE unmeasurable-input"; return 0 ;; esac
+  done
+  [ "$staging" -gt 0 ] || { echo "REFUSE no-staging"; return 0; }
+  [ "$streak" -ge "$min_streak" ] || { echo "REFUSE streak-too-short"; return 0; }
+  [ $(( avail + staging )) -ge $(( required + slack )) ] || { echo "REFUSE would-not-unblock-gc"; return 0; }
+  echo "RELEASE"
+}
+
+# _gc_release_cooldown_ok <state_file> <cooldown_h> <now_epoch> → 0 iff no release inside the
+# cooldown. Never released (no state file) → ok. A state file that exists but cannot be read
+# as an epoch, or a clock that ran backwards → NOT ok (cannot tell; an operator can delete it).
+_gc_release_cooldown_ok() {
+  local f="$1" hrs="$2" now="$3" last
+  case "$hrs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ -e "$f" ] || return 0
+  last="$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  case "$last" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( now - last )) -ge $(( hrs * 3600 )) ]
+}
+
+# _gc_release_writer_active — 0 iff a process that writes the staging is running or we cannot
+# tell (no ps output, grep error): only a clean "no such process" (grep rc 1) is "not active".
+_gc_release_writer_active() {
+  local procs rc
+  procs="$(ps -axo command= 2>/dev/null)"; rc=$?
+  { [ "$rc" -eq 0 ] && [ -n "$procs" ]; } || return 0
+  printf '%s\n' "$procs" | grep -Eq "$GC_RELEASE_WRITER_RE"; rc=$?
+  [ "$rc" -eq 1 ] && return 1
+  return 0
+}
+
+# _gc_release_busy <target> — echoes why the staging must not be touched right now and returns
+# 0; returns 1 (echoes nothing) when nothing else is using it. A held nightly-backup lock, a
+# reseed's .new/.old residue, or a running backup writer all mean "someone is mid-operation".
+_gc_release_busy() {
+  local target="$1"
+  if [ -e "$GC_RELEASE_BACKUP_LOCKDIR" ]; then echo "nightly-backup-lock-held"; return 0; fi
+  if [ -e "$target.new" ] || [ -e "$target.old" ]; then echo "reseed-residue-present"; return 0; fi
+  if _gc_release_writer_active; then echo "backup-writer-running"; return 0; fi
+  return 1
+}
+
+# _gc_release_target <staging_root> <db> — echoes the directory that may be released, or returns
+# 1. Path-safety: an absolute root literally named .dolt-backup, a plain identifier as db (no
+# '/', '.', spaces), a real directory (never a symlink) whose parent is exactly that root, and
+# one that holds a manifest (something that IS a backup copy).
+_gc_release_target() {
+  local root="$1" db="$2" t
+  case "$db" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  case "$root" in /*) ;; *) return 1 ;; esac
+  [ "$(basename "$root")" = ".dolt-backup" ] || return 1
+  t="$root/$db"
+  [ -d "$t" ] && [ ! -L "$t" ] || return 1
+  [ "$(cd "$root" 2>/dev/null && pwd -P)" = "$(cd "$(dirname "$t")" 2>/dev/null && pwd -P)" ] || return 1
+  [ -s "$t/manifest" ] || return 1
+  echo "$t"
+}
+
+# _gc_maybe_release_staging <size_mb> <avail_mb> <required_mb> — returns 0 iff it RELEASED the
+# staging (the caller then re-measures headroom and re-checks the gate); 1 otherwise. Logs one
+# line per decision. Order: cheap decisions first, the S3 proof (the slow, aws-touching part)
+# only when everything else already says yes, and the state that could have moved during that
+# proof is re-checked immediately before the delete.
+_gc_maybe_release_staging() {
+  local size_mb="$1" avail_mb="$2" required_mb="$3"
+  [ "$GC_RELEASE_STAGING_ENABLED" = "1" ] || return 1
+  local streak target staging_mb decision now busy fp_before fp_after
+  streak="$(_read_skip_streak "$GC_SKIP_STREAK_STATE")"; streak="${streak%% *}"
+  target="$(_gc_release_target "$BACKUP_STAGING" "$DB")" || {
+    log "staging-release: no releasable local staging at $BACKUP_STAGING/$DB (absent, not a real dir, or no manifest) — not releasing"
+    return 1
+  }
+  staging_mb="$(du -sm "$target" 2>/dev/null | awk '{print $1}')"
+  decision="$(_gc_release_decision "$streak" "$avail_mb" "$staging_mb" "$required_mb" "$GC_RELEASE_MIN_STREAK" "$GC_RELEASE_SLACK_MB")"
+  if [ "$decision" != "RELEASE" ]; then
+    log "staging-release: not releasing — ${decision#REFUSE } (streak=${streak:-?}/${GC_RELEASE_MIN_STREAK} avail=${avail_mb:-?}MB staging=${staging_mb:-?}MB required=${required_mb:-?}MB slack=${GC_RELEASE_SLACK_MB}MB)"
+    return 1
+  fi
+  now="$(_gc_now_epoch)"
+  if ! _gc_release_cooldown_ok "$GC_RELEASE_STATE" "$GC_RELEASE_COOLDOWN_H" "$now"; then
+    log "staging-release: not releasing — cooldown (${GC_RELEASE_COOLDOWN_H}h) not elapsed since the last release, or its state is unreadable ($GC_RELEASE_STATE)"
+    return 1
+  fi
+  if busy="$(_gc_release_busy "$target")"; then
+    log "staging-release: not releasing — staging is in use: $busy"
+    return 1
+  fi
+  # Fail CLOSED on the probe too: one that never loaded is "cannot tell", not "healthy". (The prune
+  # path above tolerates a missing probe; deleting backup data must not — the staging is the one
+  # local copy sitting next to a Dolt we could not confirm is well.)
+  if ! declare -f gc_dolt_probe >/dev/null 2>&1; then
+    log "staging-release: not releasing — the Dolt health probe is not loaded, cannot confirm Dolt is healthy"
+    return 1
+  fi
+  if ! gc_dolt_probe; then
+    log "staging-release: not releasing — Dolt not confirmed healthy"
+    return 1
+  fi
+  if ! declare -f _s3proof_repair_then_prove >/dev/null 2>&1; then
+    log "staging-release: not releasing — the S3 proof library is not loaded (dolt-backup-s3-proof.sh)"
+    return 1
+  fi
+  fp_before="$(cksum < "$target/manifest" 2>/dev/null)"
+  log "staging-release: chronic headroom skip (streak=${streak}) and freeing ${staging_mb}MB would clear the gate — proving S3 holds an identical, restorable copy first"
+  if ! _s3proof_repair_then_prove "$target" "$DB"; then
+    log "staging-release: REFUSED — S3 is not proven restorable and identical to the local staging; NOTHING deleted (see the proof lines above)"
+    return 1
+  fi
+  # The proof can take minutes (it may upload). Anything that changed the staging or started
+  # writing to it in the meantime makes that proof stale — re-check right before the delete.
+  fp_after="$(cksum < "$target/manifest" 2>/dev/null)"
+  if [ -z "$fp_before" ] || [ "$fp_before" != "$fp_after" ]; then
+    log "staging-release: REFUSED — the staging's manifest changed while proving S3 (a writer touched it); the proof is stale, NOTHING deleted"
+    return 1
+  fi
+  if busy="$(_gc_release_busy "$target")"; then
+    log "staging-release: REFUSED — staging became busy while proving S3: $busy; NOTHING deleted"
+    return 1
+  fi
+  if [ "$GC_RELEASE_STAGING_DRYRUN" = "1" ]; then
+    log "staging-release: DRYRUN — WOULD RELEASE ${staging_mb}MB at $target (S3 proven identical+restorable); nothing deleted"
+    return 1
+  fi
+  log "staging-release: S3 proven identical + restorable — RELEASING local staging $target (${staging_mb}MB) so dolt_gc can run"
+  rm -rf -- "$target"
+  if [ -e "$target" ]; then
+    log "staging-release: rm of $target did not complete — staging left partially removed; S3 holds the full copy (mol-dog-backup will rebuild it)"
+    return 1
+  fi
+  mkdir -p "$(dirname "$GC_RELEASE_STATE")" 2>/dev/null || true
+  printf '%s\n' "$now" > "$GC_RELEASE_STATE" 2>/dev/null || log "staging-release: WARN could not write the cooldown state $GC_RELEASE_STATE"
+  log "staging-release: released ${staging_mb}MB — hq staging is gone until mol-dog-backup rebuilds it (≤6h); S3 has the proven copy"
+  _dolt_gc_notify "Dolt GC" 3 "hq: staging local (${staging_mb}MB) liberado p/ o dolt_gc — S3 provado idêntico+restaurável; mol-dog-backup recria em ≤6h"
+  _dolt_gc_mail_mayor "Dolt GC: staging local do hq liberado para o dolt_gc" "dolt-gc-maintenance (ga-btnq6h): o dolt_gc do hq estava pulando por falta de espaço há ${streak} ciclos seguidos (size=${size_mb:-?}MB avail=${avail_mb:-?}MB required=${required_mb:-?}MB). Liberei o staging LOCAL .dolt-backup/${DB} (${staging_mb}MB) para abrir espaço, SOMENTE após provar que o S3 tem uma cópia idêntica e restaurável (fecho do manifest + nada a subir). O mol-dog-backup (a cada 6h) recria o staging; o dolt_gc roda neste mesmo ciclo. Cooldown de ${GC_RELEASE_COOLDOWN_H}h. Kill switch: GC_RELEASE_STAGING_ENABLED=0."
+  return 0
+}
+
 # ── main flow ────────────────────────────────────────────────────────────────────
 main() {
   # ga-3euoj: resolve GC_MIN_FREE_PCT now that PRUNE_ENABLED + any operator pin (env
@@ -570,7 +767,19 @@ main() {
   if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
     log "hq size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB — insufficient free space (or unmeasurable) for dolt_gc — skip this cycle, will retry in 2h"
     _handle_gc_skip_streak "$size_mb" "$avail_mb" "$required_mb"
-    return 0
+    # ga-btnq6h: a CHRONIC skip is a vicious circle (the GC that would shrink hq is the thing
+    # that cannot run) — when S3 is proven to hold an identical, restorable copy, free the
+    # redundant local staging and re-check the SAME gate with a fresh measurement. Never
+    # lowers the gate (the 2x bound is measured, ga-3euoj); it only makes room to meet it.
+    if ! _gc_maybe_release_staging "$size_mb" "$avail_mb" "$required_mb"; then
+      return 0
+    fi
+    avail_mb="$(_avail_mb "$DOLTDIR")"
+    log "hq staging released — re-checking the same headroom gate with a fresh measurement: avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB"
+    if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
+      log "hq still short of the gate after releasing the staging (avail=${avail_mb:-<unmeasured>}MB) — skip this cycle; the gate is NOT lowered"
+      return 0
+    fi
   fi
 
   local pre; pre="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"

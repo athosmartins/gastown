@@ -182,5 +182,221 @@ _handle_gc_skip_streak 6000 1000 12000
 rm -f "$GC_SKIP_STREAK_STATE"
 unset -f _dolt_gc_notify _dolt_gc_mail_mayor
 
+# ═══ ga-btnq6h: guarded release of hq's LOCAL backup staging for the dolt_gc window ═══
+# The release is the only destructive act in dolt-gc-maintenance.sh, so the tests below
+# pin the property that matters: EVERY refusal leaves the staging directory on disk.
+# Hermetic — a throwaway tree stands in for $CITY/.dolt-backup; the S3 proof, the Dolt
+# probe, notify/mail, `ps` and `du` are stubbed; the real aws/dolt/S3 are never touched.
+
+# ── _gc_release_decision: pure arithmetic, fail-closed on anything unmeasurable ──────
+d() { _gc_release_decision "$@"; }
+[ "$(d 53 9000 8800 15400 6 2048)" = "RELEASE" ] && ok "release-decision: chronic streak + freeing staging clears the gate → RELEASE" || bad "release-decision happy got: '$(d 53 9000 8800 15400 6 2048)'"
+[ "$(d 6 9000 8800 15400 6 2048)" = "RELEASE" ] && ok "release-decision: streak exactly at the minimum is enough (boundary)" || bad "release-decision streak==min got: '$(d 6 9000 8800 15400 6 2048)'"
+[ "$(d 5 9000 8800 15400 6 2048)" = "REFUSE streak-too-short" ] && ok "release-decision: one cycle short of chronic → REFUSE streak-too-short" || bad "release-decision short-streak got: '$(d 5 9000 8800 15400 6 2048)'"
+[ "$(d 53 6000 8800 15400 6 2048)" = "REFUSE would-not-unblock-gc" ] && ok "release-decision: freeing the staging would NOT clear the gate → REFUSE (never delete for nothing)" || bad "release-decision no-unblock got: '$(d 53 6000 8800 15400 6 2048)'"
+# exact edge of avail+staging >= required+slack (15400+2048 = 17448)
+[ "$(d 53 8648 8800 15400 6 2048)" = "RELEASE" ] && [ "$(d 53 8647 8800 15400 6 2048)" = "REFUSE would-not-unblock-gc" ] && ok "release-decision: avail+staging vs required+slack is exact to the MB" || bad "release-decision edge: '$(d 53 8648 8800 15400 6 2048)' / '$(d 53 8647 8800 15400 6 2048)'"
+[ "$(d 53 9000 0 15400 6 2048)" = "REFUSE no-staging" ] && ok "release-decision: zero-size staging → REFUSE no-staging" || bad "release-decision zero-staging got: '$(d 53 9000 0 15400 6 2048)'"
+_dec_with() {   # _dec_with <1-based arg position> <value> — happy-path args with ONE input replaced
+  local a=(53 9000 8800 15400 6 2048)
+  a[$(( $1 - 1 ))]="$2"
+  _gc_release_decision "${a[@]}"
+}
+_bad_all=1
+for _pos in 1 2 3 4 5 6; do
+  for _val in "" "abc" "-1" "1.5" "12MB"; do
+    [ "$(_dec_with "$_pos" "$_val")" = "REFUSE unmeasurable-input" ] || { _bad_all=0; echo "    (arg $_pos='$_val' was not refused as unmeasurable)"; }
+  done
+done
+unset -f _dec_with
+[ "$_bad_all" = "1" ] && ok "release-decision: every input blank/non-numeric/negative/decimal → REFUSE unmeasurable-input (a failed read never looks like 'plenty of room')" || bad "release-decision: some unmeasurable input was not refused"
+unset _pos _val _bad_all
+
+# ── _gc_release_cooldown_ok: state file is the only memory; anything odd → not ok ─────
+CT="$(mktemp -d "${TMPDIR:-/tmp}/dolt-gc-release-selftest.XXXXXX")"
+[ -n "$CT" ] && [ -d "$CT" ] || { bad "release: mktemp failed — remaining release tests skipped"; CT=""; }
+if [ -n "$CT" ]; then
+  _gc_release_cooldown_ok "$CT/none.state" 168 1000000 && ok "cooldown: never released (no state file) → ok" || bad "cooldown: absent state should be ok"
+  printf '%s\n' 1000000 > "$CT/s.state"
+  _gc_release_cooldown_ok "$CT/s.state" 168 $((1000000 + 3600)) && bad "cooldown: 1h after a release must NOT be ok" || ok "cooldown: 1h after a release → not ok"
+  _gc_release_cooldown_ok "$CT/s.state" 168 $((1000000 + 168*3600)) && ok "cooldown: exactly the cooldown later → ok (boundary)" || bad "cooldown: boundary should be ok"
+  _gc_release_cooldown_ok "$CT/s.state" 168 $((1000000 + 168*3600 - 1)) && bad "cooldown: 1s early must NOT be ok" || ok "cooldown: 1s before the boundary → not ok"
+  _gc_release_cooldown_ok "$CT/s.state" 168 999000 && bad "cooldown: clock ran backwards must NOT be ok" || ok "cooldown: clock behind the recorded release → not ok (cannot tell)"
+  printf 'garbage\n' > "$CT/g.state"
+  _gc_release_cooldown_ok "$CT/g.state" 168 9999999999 && bad "cooldown: unreadable state must NOT be ok" || ok "cooldown: state exists but is not an epoch → not ok (fail closed)"
+  : > "$CT/e.state"
+  _gc_release_cooldown_ok "$CT/e.state" 168 9999999999 && bad "cooldown: empty state file must NOT be ok" || ok "cooldown: empty state file → not ok (fail closed)"
+  _gc_release_cooldown_ok "$CT/s.state" "" 9999999999 && bad "cooldown: blank hours must NOT be ok" || ok "cooldown: non-numeric hours → not ok"
+  _gc_release_cooldown_ok "$CT/s.state" 168 "" && bad "cooldown: blank clock must NOT be ok" || ok "cooldown: non-numeric now → not ok"
+fi
+
+# ── _gc_release_writer_active: real function, `ps` stubbed. Only a clean "no such
+#    process" is "not active"; a match OR an unreadable process table is "active". ──
+_ps_out=""; _ps_rc=0
+ps() { printf '%s' "$_ps_out"; return "$_ps_rc"; }
+_wa() { _gc_release_writer_active && echo active || echo idle; }
+_ps_out=$'/sbin/launchd\n/bin/bash /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-gc-maintenance.sh\n/usr/bin/python3 -m pytest\n'; _ps_rc=0
+[ "$(_wa)" = "idle" ] && ok "writer-active: benign process table (incl. dolt-gc-maintenance.sh itself) → idle" || bad "writer-active: false positive on a benign table"
+_ps_out=$'/bin/bash /x/packs/town-deltas/assets/scripts/mol-dog-backup.sh\n'
+[ "$(_wa)" = "active" ] && ok "writer-active: mol-dog-backup.sh running → active" || bad "writer-active: missed mol-dog-backup.sh"
+_ps_out=$'/bin/bash /Users/athos/gt/.gascity-gastown-hq/scripts/dolt-s3-backup.sh\n'
+[ "$(_wa)" = "active" ] && ok "writer-active: nightly dolt-s3-backup.sh running → active" || bad "writer-active: missed dolt-s3-backup.sh"
+_ps_out=$'dolt backup sync hq-backup\n'
+[ "$(_wa)" = "active" ] && ok "writer-active: bare 'dolt backup sync' CLI → active" || bad "writer-active: missed the dolt backup sync CLI"
+_ps_out=$'dolt --host 127.0.0.1 --user root --no-tls sql -q USE `hq`; CALL DOLT_BACKUP(\'sync\', \'hq-backup\');\n'
+[ "$(_wa)" = "active" ] && ok "writer-active: server-mediated CALL DOLT_BACKUP('sync') → active" || bad "writer-active: missed the server-mediated backup sync"
+_ps_out=$'/bin/bash /x/scripts/dolt-backup-reseed.sh\n'
+[ "$(_wa)" = "active" ] && ok "writer-active: reseed running → active" || bad "writer-active: missed dolt-backup-reseed.sh"
+_ps_out=$'/bin/bash /x/scripts/dolt-s3-backup.selftest.sh\n/bin/bash /x/scripts/dolt-backup-reseed.selftest.sh\n'
+[ "$(_wa)" = "idle" ] && ok "writer-active: a *.selftest.sh of a backup script is NOT a writer (no false block)" || bad "writer-active: selftest wrongly counted as a writer"
+_ps_out=""; _ps_rc=0
+[ "$(_wa)" = "active" ] && ok "writer-active: EMPTY process table → active (cannot tell = busy)" || bad "writer-active: empty ps must fail closed"
+_ps_out=$'/sbin/launchd\n'; _ps_rc=1
+[ "$(_wa)" = "active" ] && ok "writer-active: ps itself failing → active (cannot tell = busy)" || bad "writer-active: ps failure must fail closed"
+unset -f ps _wa; unset _ps_out _ps_rc
+
+if [ -n "$CT" ]; then
+  # ── _gc_release_target: path-safety — only a real hq copy under a root named .dolt-backup ──
+  mkstage() {  # mkstage <root> <db> [nomanifest]
+    mkdir -p "$1/$2"; [ "${3:-}" = "nomanifest" ] || printf '5:__DOLT__:lock:root:gcgen\n' > "$1/$2/manifest"
+    dd if=/dev/zero of="$1/$2/tablefile" bs=1024 count=64 2>/dev/null
+  }
+  R="$CT/city/.dolt-backup"; mkstage "$R" hq
+  [ "$(_gc_release_target "$R" hq)" = "$R/hq" ] && ok "target: a real hq copy with a manifest under .dolt-backup → releasable" || bad "target: happy path got '$(_gc_release_target "$R" hq)'"
+  mkstage "$CT/city2/.dolt-backup" hq nomanifest
+  _gc_release_target "$CT/city2/.dolt-backup" hq >/dev/null && bad "target: a dir with no manifest must NOT be releasable" || ok "target: no manifest (not a backup copy) → refused"
+  mkstage "$CT/city3/backups" hq
+  _gc_release_target "$CT/city3/backups" hq >/dev/null && bad "target: root not named .dolt-backup must be refused" || ok "target: root not literally named .dolt-backup → refused"
+  _gc_release_target ".dolt-backup" hq >/dev/null && bad "target: relative root must be refused" || ok "target: relative root → refused (never resolved against CWD)"
+  for _db in "" "../x" "hq/.." "a b" "hq.new" "h/q" ".."; do
+    _gc_release_target "$R" "$_db" >/dev/null && bad "target: db '$_db' must be refused" || ok "target: db name '$_db' (not a plain identifier) → refused"
+  done
+  unset _db
+  mkdir -p "$CT/city4/.dolt-backup" "$CT/elsewhere/hq"; printf 'm\n' > "$CT/elsewhere/hq/manifest"
+  ln -s "$CT/elsewhere/hq" "$CT/city4/.dolt-backup/hq"
+  _gc_release_target "$CT/city4/.dolt-backup" hq >/dev/null && bad "target: a SYMLINKED hq must be refused" || ok "target: hq is a symlink → refused (would delete outside the staging root)"
+  _gc_release_target "$R" nosuchdb >/dev/null && bad "target: absent db must be refused" || ok "target: absent dir → refused"
+
+  # ── _gc_release_busy: lock / reseed residue / running writer each veto ──────────────────
+  BUSYSTAGE="$CT/busy/.dolt-backup"; mkstage "$BUSYSTAGE" hq
+  GC_RELEASE_BACKUP_LOCKDIR="$CT/busy/nightly.lock.d"
+  _gc_release_writer_active() { return 1; }   # nothing running
+  _gc_release_busy "$BUSYSTAGE/hq" >/dev/null && bad "busy: nothing in use should be NOT busy" || ok "busy: lock absent, no residue, no writer → free"
+  mkdir "$GC_RELEASE_BACKUP_LOCKDIR"
+  [ "$(_gc_release_busy "$BUSYSTAGE/hq")" = "nightly-backup-lock-held" ] && ok "busy: nightly backup lock held → busy" || bad "busy: lock not detected"
+  rmdir "$GC_RELEASE_BACKUP_LOCKDIR"
+  mkdir "$BUSYSTAGE/hq.new"
+  [ "$(_gc_release_busy "$BUSYSTAGE/hq")" = "reseed-residue-present" ] && ok "busy: hq.new reseed residue present → busy" || bad "busy: .new residue not detected"
+  rmdir "$BUSYSTAGE/hq.new"; mkdir "$BUSYSTAGE/hq.old"
+  [ "$(_gc_release_busy "$BUSYSTAGE/hq")" = "reseed-residue-present" ] && ok "busy: hq.old reseed residue present → busy" || bad "busy: .old residue not detected"
+  rmdir "$BUSYSTAGE/hq.old"
+  _gc_release_writer_active() { return 0; }
+  [ "$(_gc_release_busy "$BUSYSTAGE/hq")" = "backup-writer-running" ] && ok "busy: a backup writer is running → busy" || bad "busy: running writer not detected"
+
+  # ── _gc_maybe_release_staging end to end: the S3 proof, probe, notify/mail, du, clock are
+  #    stubs; the filesystem, state file, streak file, logging and ordering are REAL. ──────
+  PROOF_CALLS=0; PROOF_RC=0; PROOF_SIDE=""
+  _s3proof_repair_then_prove() { PROOF_CALLS=$((PROOF_CALLS+1)); [ -n "$PROOF_SIDE" ] && eval "$PROOF_SIDE"; return "$PROOF_RC"; }
+  PROBE_RC=0; gc_dolt_probe() { return "$PROBE_RC"; }
+  NOTIFY_N=0; MAIL_N=0
+  _dolt_gc_notify() { NOTIFY_N=$((NOTIFY_N+1)); }
+  _dolt_gc_mail_mayor() { MAIL_N=$((MAIL_N+1)); }
+  FAKE_STAGING_MB=8800
+  du() { if [ "${1:-}" = "-sm" ]; then printf '%s\t%s\n' "$FAKE_STAGING_MB" "${2:-}"; else command du "$@"; fi; }
+  _gc_release_writer_active() { return 1; }
+
+  GC_NOW_EPOCH=2000000000
+  reset_release() {   # fresh staging + clean state for each scenario
+    rm -rf "$CT/rel"; mkdir -p "$CT/rel"
+    mkstage "$CT/rel/.dolt-backup" hq
+    BACKUP_STAGING="$CT/rel/.dolt-backup"; DB="hq"
+    GC_RELEASE_STATE="$CT/rel/release.state"; GC_RELEASE_BACKUP_LOCKDIR="$CT/rel/nightly.lock.d"
+    GC_SKIP_STREAK_STATE="$CT/rel/streak.state"; printf '53 1\n' > "$GC_SKIP_STREAK_STATE"
+    GC_RELEASE_STAGING_ENABLED=1; GC_RELEASE_STAGING_DRYRUN=0
+    GC_RELEASE_MIN_STREAK=6; GC_RELEASE_SLACK_MB=2048; GC_RELEASE_COOLDOWN_H=168
+    PROOF_CALLS=0; PROOF_RC=0; PROOF_SIDE=""; PROBE_RC=0; NOTIFY_N=0; MAIL_N=0
+    _gc_release_writer_active() { return 1; }
+  }
+  STAGE_DIR() { echo "$CT/rel/.dolt-backup/hq"; }
+  MAYBE() { _gc_maybe_release_staging 7900 9000 15400 >/dev/null 2>&1; }   # size avail required
+
+  reset_release
+  if MAYBE && [ ! -e "$(STAGE_DIR)" ]; then ok "release: chronic skip + S3 proven + nothing busy → staging REMOVED, returns 0"; else bad "release: happy path did not release"; fi
+  [ "$PROOF_CALLS" -eq 1 ] && ok "release: the S3 proof ran exactly once" || bad "release: proof calls=$PROOF_CALLS"
+  [ "$(cat "$GC_RELEASE_STATE" 2>/dev/null)" = "2000000000" ] && ok "release: cooldown state stamped with the release time" || bad "release: state got '$(cat "$GC_RELEASE_STATE" 2>/dev/null)'"
+  [ "$NOTIFY_N" -eq 1 ] && [ "$MAIL_N" -eq 1 ] && ok "release: exactly one notify + one mail to the Mayor" || bad "release: notify=$NOTIFY_N mail=$MAIL_N"
+  [ -d "$CT/rel/.dolt-backup" ] && ok "release: only hq was removed — the .dolt-backup root itself is untouched" || bad "release: the staging ROOT was removed"
+  # a second release right after is blocked by the cooldown and never reaches the proof
+  mkstage "$CT/rel/.dolt-backup" hq; PROOF_CALLS=0
+  if ! MAYBE && [ -d "$(STAGE_DIR)" ] && [ "$PROOF_CALLS" -eq 0 ]; then ok "release: a second attempt inside the cooldown is refused BEFORE the (slow, aws) proof and deletes nothing"; else bad "release: cooldown did not stop the second release (calls=$PROOF_CALLS)"; fi
+
+  refuse_case() {  # refuse_case <label> <expected-proof-calls>  (caller sets the scenario)
+    local label="$1" want_calls="$2"
+    if ! MAYBE && [ -d "$(STAGE_DIR)" ] && [ -s "$(STAGE_DIR)/manifest" ] && [ "$PROOF_CALLS" -eq "$want_calls" ] && [ "$NOTIFY_N" -eq 0 ]; then
+      ok "refuse: $label → staging INTACT, proof calls=$want_calls, no notification"
+    else
+      bad "refuse: $label (staging_exists=$([ -d "$(STAGE_DIR)" ] && echo y || echo N) proof_calls=$PROOF_CALLS want=$want_calls notify=$NOTIFY_N)"
+    fi
+  }
+  reset_release; GC_RELEASE_STAGING_ENABLED=0;             refuse_case "kill switch GC_RELEASE_STAGING_ENABLED=0" 0
+  reset_release; printf '5 0\n' > "$GC_SKIP_STREAK_STATE"; refuse_case "streak below the minimum (not chronic)" 0
+  reset_release; rm -f "$GC_SKIP_STREAK_STATE";            refuse_case "no streak state at all (unreadable = not chronic)" 0
+  reset_release; printf 'junk\n' > "$GC_SKIP_STREAK_STATE"; refuse_case "garbled streak state" 0
+  reset_release; FAKE_STAGING_MB=100;                       refuse_case "freeing it would not clear the gate" 0; FAKE_STAGING_MB=8800
+  reset_release; printf '%s\n' 1999999999 > "$GC_RELEASE_STATE"; refuse_case "inside the cooldown" 0
+  reset_release; printf 'x\n' > "$GC_RELEASE_STATE";         refuse_case "cooldown state unreadable" 0
+  reset_release; mkdir "$GC_RELEASE_BACKUP_LOCKDIR";        refuse_case "nightly backup lock held" 0; rmdir "$GC_RELEASE_BACKUP_LOCKDIR"
+  reset_release; mkdir "$CT/rel/.dolt-backup/hq.new";       refuse_case "reseed residue hq.new present" 0
+  reset_release; _gc_release_writer_active() { return 0; }; refuse_case "a backup writer is running" 0
+  reset_release; PROBE_RC=1;                                refuse_case "Dolt not confirmed healthy" 0
+  # A probe that never LOADED is "cannot tell", not "healthy" — deleting backup data fails closed on it.
+  reset_release; unset -f gc_dolt_probe;                    refuse_case "the Dolt health probe is not loaded (cannot tell = not healthy)" 0
+  grep -q 'health probe is not loaded' "$DOLT_GC_MAINT_LOG" && ok "refuse: a missing probe is logged as such (not confused with an unhealthy Dolt)" || bad "refuse: missing probe not named in the log"
+  gc_dolt_probe() { return "$PROBE_RC"; }
+  reset_release; PROOF_RC=1;                                refuse_case "S3 is NOT proven identical+restorable (proof returns 1)" 1
+  reset_release; unset -f _s3proof_repair_then_prove;       refuse_case "the S3 proof library is not loaded" 0
+  # The refusal itself would happen anyway (an undefined function is command-not-found → non-zero);
+  # the explicit veto exists so the LOG says why. Pin that, so the reason cannot silently regress
+  # into a confusing "S3 is not proven" line (or a bare "command not found" on stderr).
+  grep -q 'S3 proof library is not loaded' "$DOLT_GC_MAINT_LOG" && ok "refuse: a missing proof lib is logged as such (operator sees WHY, not a generic proof failure)" || bad "refuse: missing proof lib not named in the log"
+  _s3proof_repair_then_prove() { PROOF_CALLS=$((PROOF_CALLS+1)); [ -n "$PROOF_SIDE" ] && eval "$PROOF_SIDE"; return "$PROOF_RC"; }
+  reset_release; rm -rf "$CT/rel/.dolt-backup/hq"
+  if ! MAYBE && [ "$PROOF_CALLS" -eq 0 ]; then ok "refuse: no local staging at all → nothing to release, proof never run"; else bad "refuse: absent staging reached the proof"; fi
+  reset_release; rm -rf "$CT/rel/.dolt-backup/hq"; mkdir -p "$CT/rel/.dolt-backup/hq"
+  if ! MAYBE && [ -d "$(STAGE_DIR)" ] && [ "$PROOF_CALLS" -eq 0 ]; then ok "refuse: an EMPTY hq dir (no manifest) is not a backup copy → untouched, proof never run"; else bad "refuse: empty hq dir was treated as releasable"; fi
+
+  # The proof can take minutes; state that moved DURING it must veto the delete.
+  reset_release; PROOF_SIDE='printf "6:__DOLT__:lock:CHANGED:gcgen\n" > "$(STAGE_DIR)/manifest"'
+  refuse_case "the staging manifest CHANGED while proving S3 (a writer touched it)" 1
+  reset_release; PROOF_SIDE='mkdir "$CT/rel/.dolt-backup/hq.new"'
+  refuse_case "reseed residue APPEARED while proving S3" 1
+  reset_release; PROOF_SIDE='mkdir "$GC_RELEASE_BACKUP_LOCKDIR"'
+  refuse_case "the nightly backup lock was taken while proving S3" 1
+  reset_release; PROOF_SIDE=""
+
+  # DRYRUN decides + proves but must not delete, notify or stamp the cooldown.
+  reset_release; GC_RELEASE_STAGING_DRYRUN=1
+  if ! MAYBE && [ -d "$(STAGE_DIR)" ] && [ "$PROOF_CALLS" -eq 1 ] && [ ! -e "$GC_RELEASE_STATE" ] && [ "$NOTIFY_N" -eq 0 ]; then
+    ok "dryrun: proves S3, logs WOULD RELEASE, deletes nothing, no cooldown stamp, no notification"
+  else bad "dryrun: staging_exists=$([ -d "$(STAGE_DIR)" ] && echo y || echo N) calls=$PROOF_CALLS state=$([ -e "$GC_RELEASE_STATE" ] && echo y || echo n) notify=$NOTIFY_N"; fi
+  grep -q 'DRYRUN — WOULD RELEASE' "$DOLT_GC_MAINT_LOG" && ok "dryrun: the WOULD RELEASE line is in the log" || bad "dryrun: no WOULD RELEASE log line"
+
+  # The delete must be confined to hq: a sibling database staging survives a release.
+  reset_release; mkstage "$CT/rel/.dolt-backup" whatsapp_automation
+  MAYBE
+  if [ ! -e "$(STAGE_DIR)" ] && [ -s "$CT/rel/.dolt-backup/whatsapp_automation/manifest" ]; then ok "release: a sibling db's staging (whatsapp_automation) is untouched — the delete is confined to hq"; else bad "release: sibling staging was affected"; fi
+
+  # mutation guard: if the proof gate were skipped the 'proof fails' scenario would delete —
+  # prove the test above can actually fail by running it against a proof that lies "0".
+  reset_release; PROOF_RC=0
+  MAYBE
+  [ ! -e "$(STAGE_DIR)" ] && ok "mutation-check: with a proof that says 0 the SAME scenario deletes — so the 'proof=1 → intact' assertion is a real discriminator" || bad "mutation-check: proof=0 did not delete; the refuse test proves nothing"
+
+  unset -f du gc_dolt_probe _s3proof_repair_then_prove _gc_release_writer_active mkstage reset_release STAGE_DIR MAYBE refuse_case
+  unset -f _dolt_gc_notify _dolt_gc_mail_mayor
+  # only ever remove the mktemp dir this block created
+  case "$CT" in "${TMPDIR:-/tmp}"/dolt-gc-release-selftest.*) rm -rf "$CT" ;; esac
+fi
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
