@@ -22,7 +22,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
 echo "=== dolt-backup-residue-reclaim.selftest.sh ==="
 
-for fn in _prod_sentinel_active _size_coherent _should_release_residue _parse_fingerprint_to_file _reclaim_one_residue _reap_backup_residue; do
+for fn in _prod_sentinel_active _size_coherent _should_release_residue _parse_fingerprint_to_file _fingerprint_db_state _reclaim_one_residue _reap_backup_residue; do
   type "$fn" >/dev/null 2>&1 \
     && ok "$fn defined by lib-mode source" \
     || { bad "$fn NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
@@ -162,6 +162,92 @@ fi
 rm -f "$FIX_JSON" "$FIX_OUT"
 
 echo ""
+echo "── _parse_fingerprint_to_file() — an entry the writer marked FAILED is NEVER proof (ga-gjfe78) ──"
+# dolt-s3-backup.sh used to drop a failing db from _meta/latest.json entirely; it
+# now publishes it as {"status":"failed", ...}. A consumer that only knew the old
+# shape must not read that entry as fresh, and a future writer that "helpfully"
+# adds run_utc/backup_size/head to a failed entry (for display) must not turn it
+# into proof either. Rule under test: an explicit status other than "ok" means
+# NOT PROVEN, whatever other keys sit next to it. No status = legacy ok entry.
+FIX_JSON="$(mktemp)"; FIX_OUT="$(mktemp)"
+cat > "$FIX_JSON" <<'JSON'
+{
+  "run_utc": "2026-09-16T07:08:53Z",
+  "databases": {
+    "okexplicit": {"status": "ok", "issues": 1, "head": "h1", "backup_size": "1M"},
+    "legacy": {"issues": 1, "head": "h2", "backup_size": "2M"},
+    "failednew": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
+    "failedproofkeys": {"status": "failed", "run_utc": "2026-09-16T07:08:53Z", "issues": 9, "head": "old", "backup_size": "1M"},
+    "failedsizeonly": {"status": "failed", "backup_size": "1M"},
+    "statusnull": {"status": null, "backup_size": "1M"},
+    "statusweird": {"status": "partial", "backup_size": "1M"},
+    "statusnumber": {"status": 1, "backup_size": "1M"},
+    "statusempty": {"status": "", "backup_size": "1M"}
+  }
+}
+JSON
+
+: > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "okexplicit" "$FIX_OUT"
+[ "$(cat "$FIX_OUT")" = "$(printf '1789542533\t1048576\th1')" ] && ok "explicit status=ok entry still parses as proof" || bad "explicit status=ok entry should parse: got '$(cat "$FIX_OUT")'"
+
+: > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "legacy" "$FIX_OUT"
+[ "$(cat "$FIX_OUT")" = "$(printf '1789542533\t2097152\th2')" ] && ok "legacy entry (no status key) still parses as proof — every fingerprint published before ga-gjfe78 keeps working" || bad "legacy entry should parse: got '$(cat "$FIX_OUT")'"
+
+for pair in \
+  "failednew|new-format failed entry (no proof keys)" \
+  "failedproofkeys|failed entry that ALSO carries run_utc/head/backup_size" \
+  "failedsizeonly|failed entry carrying only a backup_size" \
+  "statusnull|status:null" \
+  "statusweird|unrecognized status string" \
+  "statusnumber|non-string status" \
+  "statusempty|empty-string status"; do
+  key="${pair%%|*}"; label="${pair#*|}"
+  : > "$FIX_OUT"; _parse_fingerprint_to_file "$FIX_JSON" "$key" "$FIX_OUT"
+  [ -s "$FIX_OUT" ] && bad "$label must produce EMPTY output (not proven), got '$(cat "$FIX_OUT")'" || ok "$label → empty output (NOT proven; fails closed)"
+done
+rm -f "$FIX_JSON" "$FIX_OUT"
+echo ""
+
+echo "── _fingerprint_db_state() — three answers, not two (ga-gjfe78) ──"
+# has proof / provably no proof / could not tell. Diagnostic only: decisions
+# stay with _parse_fingerprint_to_file; this exists so a log line can say WHY
+# there is no proof instead of just showing empty fields.
+FIX_JSON="$(mktemp)"
+cat > "$FIX_JSON" <<'JSON'
+{
+  "run_utc": "2026-09-16T07:08:53Z",
+  "databases": {
+    "good": {"issues": 1, "head": "h", "backup_size": "1M"},
+    "goodexplicit": {"status": "ok", "backup_size": "1M"},
+    "failedwithdate": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
+    "failednone": {"status": "failed", "reason": "s3", "last_ok_run_utc": null, "last_ok_known": true, "last_ok": null},
+    "failedunknown": {"status": "failed", "reason": "sync", "last_ok_run_utc": null, "last_ok_known": false, "last_ok": null},
+    "failedbare": {"status": "failed"},
+    "weird": {"status": "partial"},
+    "notadict": "oops"
+  }
+}
+JSON
+_st() { _fingerprint_db_state "$FIX_JSON" "$1"; }
+[ "$(_st good)" = "$(printf 'ok\t')" ] && ok "legacy entry → ok" || bad "legacy entry state wrong: '$(_st good)'"
+[ "$(_st goodexplicit)" = "$(printf 'ok\t')" ] && ok "explicit status=ok → ok" || bad "explicit ok state wrong: '$(_st goodexplicit)'"
+[ "$(_st failedwithdate)" = "$(printf 'failed\t2026-09-10T07:00:00Z')" ] && ok "failed entry → failed + the date of the last ok" || bad "failed+date state wrong: '$(_st failedwithdate)'"
+[ "$(_st failednone)" = "$(printf 'failed\tnone')" ] && ok "failed, provably never ok before → detail 'none'" || bad "failed+none state wrong: '$(_st failednone)'"
+[ "$(_st failedunknown)" = "$(printf 'failed\tunknown')" ] && ok "failed, last ok could not be determined → detail 'unknown' (never conflated with 'none')" || bad "failed+unknown state wrong: '$(_st failedunknown)'"
+[ "$(_st failedbare)" = "$(printf 'failed\tunknown')" ] && ok "failed with no last_ok fields at all → 'unknown' (missing is not the same as none)" || bad "failed bare state wrong: '$(_st failedbare)'"
+[ "$(_st weird)" = "$(printf 'unrecognized\t')" ] && ok "unrecognized status → unrecognized" || bad "unrecognized status state wrong: '$(_st weird)'"
+[ "$(_st notadict)" = "$(printf 'unrecognized\t')" ] && ok "entry that is not an object → unrecognized" || bad "non-object entry state wrong: '$(_st notadict)'"
+[ "$(_st nosuchdb)" = "$(printf 'absent\t')" ] && ok "readable file, no entry for the db → absent" || bad "absent state wrong: '$(_st nosuchdb)'"
+[ "$(_fingerprint_db_state /nonexistent/fp.json good)" = "$(printf 'unreadable\t')" ] && ok "unreadable file → unreadable (not 'absent')" || bad "unreadable-file state wrong"
+echo '{ not json' > "$FIX_JSON"
+[ "$(_st good)" = "$(printf 'unreadable\t')" ] && ok "malformed JSON → unreadable (not 'absent')" || bad "malformed-JSON state wrong: '$(_st good)'"
+echo '["a list"]' > "$FIX_JSON"
+[ "$(_st good)" = "$(printf 'unreadable\t')" ] && ok "top-level JSON that is not an object → unreadable" || bad "non-object top-level state wrong: '$(_st good)'"
+echo '{"run_utc":"2026-09-16T07:08:53Z","databases":"x"}' > "$FIX_JSON"
+[ "$(_st good)" = "$(printf 'unreadable\t')" ] && ok "databases that is not an object → unreadable" || bad "non-object databases state wrong: '$(_st good)'"
+rm -f "$FIX_JSON"
+echo ""
+
 echo "── _reclaim_one_residue() — stubbed aws/notify, real rm against a throwaway fixture ──"
 echo "   (dolt-s3-backup.sh's own _reseed_staging_if_enabled test uses this exact shape:"
 echo "    fake binaries + a real function call, never the real AWS/notify.)"
@@ -196,6 +282,21 @@ JSON
         ;;
       fail) exit 1 ;;
       empty) : > "$dest"; exit 0 ;;
+      failed)
+        # what dolt-s3-backup.sh publishes for a db that failed tonight (ga-gjfe78)
+        cat > "$dest" <<JSON
+{"run_utc": "2026-09-16T07:08:53Z", "databases": {"testdb": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "stubhead1", "backup_size": "1M"}}}}
+JSON
+        exit 0
+        ;;
+      failed-proofkeys)
+        # hazardous variant: marked failed BUT still carrying every key a
+        # pre-ga-gjfe78 reader treats as proof. Must still be NOT proof.
+        cat > "$dest" <<JSON
+{"run_utc": "2026-09-16T07:08:53Z", "databases": {"testdb": {"status": "failed", "run_utc": "2026-09-16T07:08:53Z", "head": "stubhead1", "backup_size": "1M"}}}
+JSON
+        exit 0
+        ;;
     esac
     ;;
   "s3api head-object")
@@ -342,6 +443,29 @@ AWS_STUB_FETCH_MODE=ok AWS_STUB_HEAD_MODE=ok \
   _reclaim_one_residue "$FIXTURE_ROOT/testdb.old"
 [ ! -e "$FIXTURE_ROOT/testdb.old" ] && ok "scenario J (PROD=1 opt-in at real-default root): residue DELETED" || bad "scenario J: PROD=1 opt-in should have authorized deletion"
 
+# Scenario K (ga-gjfe78): the published fingerprint marks THIS db as FAILED
+# (the shape dolt-s3-backup.sh now writes). Manifest present, size fine, settle
+# window cleared — everything except the fingerprint would allow deletion. A
+# failed db has no proof that the S3 copy is current, so the residue must stay,
+# it must alarm (a real gap, not a settle miss), and the log must say WHY.
+_mk_fixture
+: > "$NOTIFY_CALLS_FILE"; : > "$TEST_LOG"
+AWS_STUB_FETCH_MODE=failed AWS_STUB_HEAD_MODE=ok _run_reclaim
+[ -e "$FIXTURE_ROOT/testdb.old" ] && ok "scenario K (fingerprint marks the db FAILED): residue STILL PRESENT — a failed entry is not proof" || bad "scenario K: FAIL-CLOSED VIOLATED — residue deleted on the strength of a FAILED fingerprint entry"
+grep -qF "fingerprint_state=failed" "$TEST_LOG" && ok "scenario K: log names the reason (fingerprint_state=failed)" || bad "scenario K: log does not say the fingerprint marks the db failed"
+grep -qF "last_ok=2026-09-10T07:00:00Z" "$TEST_LOG" && ok "scenario K: log carries the date of the last good backup" || bad "scenario K: log does not carry the last-ok date"
+[ -s "$NOTIFY_CALLS_FILE" ] && ok "scenario K: notify_fail fired (real gap, not an expected settle miss)" || bad "scenario K: notify_fail should have fired for a failed fingerprint entry"
+grep -qF "expected, self-healing" "$TEST_LOG" && bad "scenario K: a FAILED entry must not be logged as an expected/self-healing settle miss" || ok "scenario K: not mislabeled as expected/self-healing"
+
+# Scenario L (ga-gjfe78): the hazardous variant — status:failed but with
+# run_utc, head and backup_size still present (exactly what an old reader takes
+# as a fresh, coherent proof). Before the fix this deleted the residue.
+_mk_fixture
+: > "$NOTIFY_CALLS_FILE"; : > "$TEST_LOG"
+AWS_STUB_FETCH_MODE=failed-proofkeys AWS_STUB_HEAD_MODE=ok _run_reclaim
+[ -e "$FIXTURE_ROOT/testdb.old" ] && ok "scenario L (failed entry that still carries proof-looking keys): residue STILL PRESENT" || bad "scenario L: FAIL-CLOSED VIOLATED — a status:failed entry with run_utc/backup_size was read as fresh proof and the residue was deleted"
+[ -s "$NOTIFY_CALLS_FILE" ] && ok "scenario L: notify_fail fired" || bad "scenario L: notify_fail should have fired"
+
 rm -f "$NOTIFY_CALLS_FILE" "$TEST_LOG" 2>/dev/null || true
 unset NOTIFY_CALLS_FILE
 
@@ -377,6 +501,11 @@ if grep -qF '_should_release_residue "$old_mtime" "$now" "$SETTLE_SECS"' "$SCRIP
   ok "_reclaim_one_residue actually calls _should_release_residue (wiring is live, not dead code)"
 else
   bad "_should_release_residue wiring missing from _reclaim_one_residue"
+fi
+if grep -qF '_fingerprint_db_state "$fp_file" "$db"' "$SCRIPT"; then
+  ok "_reclaim_one_residue asks _fingerprint_db_state why there is no proof (ga-gjfe78 wiring is live, not dead code)"
+else
+  bad "_fingerprint_db_state is not wired into _reclaim_one_residue — the failed-entry reason never reaches the log"
 fi
 if grep -qF '"$BACKUP_ROOT"/*.old)' "$SCRIPT"; then
   ok "the real rm -rf is guarded by a \$BACKUP_ROOT/*.old path-safety case"
