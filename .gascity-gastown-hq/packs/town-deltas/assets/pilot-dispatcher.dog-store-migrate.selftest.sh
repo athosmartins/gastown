@@ -649,6 +649,48 @@ for _v in "" "✓ Added label 'lane:small' to NEW-1" $'✓ Added label \'x\' to 
   if is_id "$_v"; then bad "bead-id predicate must REJECT '${_shown}'"; else ok "bead-id predicate rejects '${_shown}'"; fi
 done
 
+# ... and the answer must not depend on the caller's LANG, NOR on which bash runs the dispatcher (its shebang is
+# `#!/usr/bin/env bash`, so launchd's PATH decides): macOS /bin/bash 3.2 expands a [A-Za-z] RANGE by collation order in a
+# UTF-8 locale and matches accented letters ("ação-1"), while Homebrew bash 5 defaults to ASCII ranges and hides the same
+# bug. So run the table under EVERY (shell, locale) pair that exists here. A locale that is not installed makes bash fall
+# back to C silently, which would test nothing — so only locales `locale -a` really lists are used.
+is_id_in() { LC_ALL="$2" "$1" -c "$DISPATCHER_OPTS
+$ISID_FN"'
+_pilot_is_bead_id "$1"' _ "$3"; }
+# Membership test WITHOUT a pipe: `locale -a | grep -q X` under this file's `set -o pipefail` is racy — grep -q exits at
+# the first match, `locale -a` can die of SIGPIPE, and the pipeline then reads as "locale not installed" (it silently
+# skipped pairs that exist here, which is how this check first passed vacuously).
+_INSTALLED_LOCALES=$(locale -a 2>/dev/null || true)
+has_locale() { case "
+$_INSTALLED_LOCALES
+" in *"
+$1
+"*) return 0 ;; esac; return 1; }
+_shells="/bin/bash"; _pathbash=$(command -v bash); [ -n "$_pathbash" ] && [ "$_pathbash" != "/bin/bash" ] && _shells="$_shells $_pathbash"
+PAIRS_TESTED=0; UTF8_PAIRS=0
+for _sh in $_shells; do
+  [ -x "$_sh" ] || continue
+  for _loc in C en_US.UTF-8 pt_BR.UTF-8; do
+    has_locale "$_loc" || continue
+    PAIRS_TESTED=$((PAIRS_TESTED + 1))
+    case "$_loc" in *UTF-8) UTF8_PAIRS=$((UTF8_PAIRS + 1)) ;; esac
+    _pair_bad=0
+    for _v in NEW-1 ga-6u64fm ga-wisp-2ld24xp; do is_id_in "$_sh" "$_loc" "$_v" || { _pair_bad=1; echo "    [$_sh $_loc] must accept '$_v'"; }; done
+    for _v in "ação-1" "ga-é1" "ga-ç" "ga abc-1" "✓ Added label 'x' to NEW-1" "NEWONE"; do
+      is_id_in "$_sh" "$_loc" "$_v" && { _pair_bad=1; echo "    [$_sh $_loc] must REJECT '$_v'"; }
+    done
+    if [ "$_pair_bad" = "0" ]; then ok "bead-id predicate: same answers under $($_sh --version | head -1 | sed 's/version \([0-9.]*\).*/\1/; s/GNU //') / LC_ALL=$_loc (accented letters are never an id)"
+    else bad "bead-id predicate is shell/locale-dependent under $_sh / LC_ALL=$_loc"; fi
+  done
+done
+_expected_utf8=0
+for _sh in $_shells; do [ -x "$_sh" ] || continue; for _loc in en_US.UTF-8 pt_BR.UTF-8; do has_locale "$_loc" && _expected_utf8=$((_expected_utf8 + 1)); done; done
+if [ "$UTF8_PAIRS" -eq "$_expected_utf8" ]; then
+  ok "bead-id predicate locale check is not vacuous: every installed UTF-8 locale was exercised under every shell ($UTF8_PAIRS UTF-8 pairs, $PAIRS_TESTED total)"
+else
+  bad "bead-id predicate locale check skipped pairs that exist here: ran $UTF8_PAIRS UTF-8 pairs, expected $_expected_utf8 (a vacuous pass)"
+fi
+
 # C2 — the wrapper in isolation, against a stub migrator: it decides on the EXIT STATUS. Each case is a
 # state the old `[ -n "$_MIGRATED_ID" ]` test got wrong or could not tell apart.
 try_stub() { # try_stub <stub body> -> "rc=<n> out=<stdout>"; stderr kept in $WORK/try.err

@@ -6725,9 +6725,10 @@ _pilot_story_already_migrated() {
 }
 
 # _pilot_is_bead_id <str> — ga-6u64fm (gate-review ga-pvdwtc): exit 0 iff <str> is ONE bead-id-shaped
-# token ("ga-6u64fm", "wa-2txhl", "ga-wisp-2ld24xp"): a run of [A-Za-z0-9._-] that starts with an
-# alphanumeric and holds a "-" (bead ids are "<prefix>-<hash>"). Exit 1 for anything else — empty,
-# several lines, spaces, quotes, colons, a "✓ Added label 'x' to y" confirmation line.
+# token ("ga-6u64fm", "wa-2txhl", "ga-wisp-2ld24xp"): a run of ASCII letters, digits, ".", "_" and "-"
+# that starts with an alphanumeric and holds a "-" (bead ids are "<prefix>-<hash>"). Exit 1 for anything
+# else — empty, several lines, spaces, quotes, colons, accented letters (in every locale), a
+# "✓ Added label 'x' to y" confirmation line.
 #
 # Why it exists: the migration hands its new id back on STDOUT and its caller captures that with
 # $(...). The real `bd label add|update|close ... -q` still print their "✓ ..." confirmation on
@@ -6738,10 +6739,13 @@ _pilot_story_already_migrated() {
 _pilot_is_bead_id() {
   local _id="${1:-}"
   [ -n "$_id" ] || return 1
+  # Explicit character LISTS, not ranges: in a UTF-8 locale (en_US, pt_BR) bash 3.2 expands [A-Za-z] by
+  # collation order and matches accented letters ("ação-1", "ga-é1"), so a range would make the answer
+  # depend on the LANG of whoever runs the dispatcher (launchd's differs from an interactive shell's).
   case "$_id" in
-    *[!A-Za-z0-9._-]*) return 1 ;;   # a byte outside an id's alphabet: space, newline, ✓, quote, colon...
-    [!A-Za-z0-9]*)     return 1 ;;   # must start alphanumeric
-    *-*)               return 0 ;;   # "<prefix>-<hash>"
+    *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) return 1 ;;   # a byte outside an id's alphabet: space, newline, ✓, quote, colon, accents...
+    [!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*)     return 1 ;;   # must start alphanumeric
+    *-*)                                                                     return 0 ;;   # "<prefix>-<hash>"
   esac
   return 1
 }
