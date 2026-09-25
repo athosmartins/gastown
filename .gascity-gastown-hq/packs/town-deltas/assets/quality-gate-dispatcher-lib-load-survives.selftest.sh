@@ -54,9 +54,13 @@
 # Three-state outcome for the live rig list, because it is load-dependent
 # (`gc rig list` can take 8-17s under Dolt load, ga-eu2x, and git-lock-hygiene.sh
 # degrades to a static fallback list when it fails or times out):
-#   - live list resolved and a gitlink rig kept  -> PASS
+#   - live list resolved and lexbh kept          -> PASS (lexbh is absent from the
+#     static fallback, so it alone is positive proof of the live gitlink branch)
 #   - live list resolved but no gitlink rig      -> FAIL (topology changed: update
 #     this test; deterministic, not load-dependent)
+#   - only property_scrapers kept                -> SKIP: it is in the fallback too,
+#     so the live path is unproven, and the degraded-event log swallows write
+#     failures, so its silence is not proof
 #   - degraded to the static fallback            -> SKIP, stated out loud. The
 #     errexit-prone branch did not run against the live shape this time; survival
 #     above is still asserted, and T23-T25 in git-lock-hygiene.sh --selftest
@@ -176,12 +180,15 @@ if [ "$_survived" -ne 1 ]; then
 elif [ -s "$GLH_LOG" ] && grep -q '"event":"degraded"' "$GLH_LOG" 2>/dev/null; then
   skip "git-lock-hygiene.sh degraded to its static rig-root fallback (gc rig list failed/timed out/empty — load-dependent), so the live gitlink branch did not run this time; survival is still asserted above and git-lock-hygiene.sh --selftest T23-T25 remain the primary coverage"
 else
+  # Only lexbh is POSITIVE proof: property_scrapers is also in the static
+  # fallback, so seeing it alone cannot tell the live path from the fallback —
+  # and "no degraded event above" is weak evidence, because the lib's _log_json
+  # swallows write failures (an unwritable log would read as "not degraded").
+  # An unprovable run is a SKIP, never a PASS.
   case ":$_roots:" in
-    *lexbh*|*property_scrapers*)
-      case ":$_roots:" in
-        *lexbh*) ok "live rig list resolved and the gitlink rig lexbh was kept (roots: $_roots)" ;;
-        *)       ok "live rig list resolved and the gitlink rig property_scrapers was kept (roots: $_roots)" ;;
-      esac ;;
+    *lexbh*) ok "live rig list resolved and the gitlink rig lexbh was kept (roots: $_roots)" ;;
+    *property_scrapers*)
+      skip "only property_scrapers is among the scan roots ($_roots), and it is also in git-lock-hygiene.sh's static fallback — without lexbh this run cannot prove the live gitlink branch ran (the degraded-event log swallows write failures, so its silence is not proof)" ;;
     *) bad "live rig list resolved but neither lexbh nor property_scrapers is among the scan roots ($_roots) — rig topology changed, update this test (or a gitlink rig was dropped: the ga-92iqox class)" ;;
   esac
 fi
