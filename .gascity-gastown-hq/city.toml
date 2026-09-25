@@ -68,6 +68,10 @@ skip = ["wisp-compact"]
 [[rigs]]
 name = "property_scrapers"
 prefix = "ps"
+# ga-68cijh: without this, `gc sling <bead-id>` (1-arg form, no explicit pool
+# target) errors "rig has no default_sling_target" instead of routing to this
+# rig's own dedicated pool — the gap the bug's own reporter suspected.
+default_sling_target = "ps-worker"
 [rigs.imports]
 
 # gt-kfr7m: pilot fix — rigs[].imports (V2 map field, NOT the bare `pack=`
@@ -123,6 +127,10 @@ source = ".gc/system/packs/gastown"
 name = "whatsapp_automation"
 prefix = "wa"
 default_branch = "main"
+# ga-68cijh: without this, `gc sling <bead-id>` (1-arg form, no explicit pool
+# target) errors "rig has no default_sling_target" instead of routing to this
+# rig's own dedicated pool — the gap the bug's own reporter suspected.
+default_sling_target = "wa-worker"
 [rigs.imports]
 
 # gt-kfr7m: same fix as property_scrapers above (see that block's comment for
