@@ -191,7 +191,11 @@ def parse_iso_epoch(s):
 
 def tail_lines(path, n):
     try:
-        with open(path) as f:
+        # ga-b1iulk: errors="replace" — the dispatcher log holds lines cut mid-multibyte-character
+        # (11 since 2026-09-15); a strict read raised UnicodeDecodeError, and the [] below made
+        # merge_stall() answer None = "no stall" for every poll. Same idiom as the sibling
+        # watchdogs' _tail() (throughput-stall-watchdog.py, gate_queue_backlog.py).
+        with open(path, errors="replace") as f:
             return f.readlines()[-n:]
     except Exception:
         return []

@@ -220,7 +220,10 @@ def parse_iso_epoch(s):
 
 def tail_lines(path, n):
     try:
-        with open(path) as f:
+        # ga-b1iulk: errors="replace" — the dispatcher log holds lines cut mid-multibyte-character
+        # (11 since 2026-09-15); a strict read raised UnicodeDecodeError, and the [] below made
+        # gate_merge_stall() and durable_landing_fail() answer None = "all fine" for every poll.
+        with open(path, errors="replace") as f:
             return f.readlines()[-n:]
     except Exception:
         return []

@@ -360,7 +360,10 @@ def _count_async_start_races(window_sec=RACE_WINDOW_SEC):
     `window_sec` seconds. Returns 0 on any error (fail-open: log absent or
     unreadable → no alert, never false-alarm)."""
     try:
-        with open(DISPATCH_LOG) as f:
+        # ga-b1iulk: errors="replace" — one line cut mid-multibyte-character anywhere in the
+        # 25MB log (11 since 2026-09-15) made the strict read raise, and the `return 0` below
+        # then reported "no race spike" instead of "could not read".
+        with open(DISPATCH_LOG, errors="replace") as f:
             lines = f.readlines()[-4000:]
     except Exception:
         return 0
