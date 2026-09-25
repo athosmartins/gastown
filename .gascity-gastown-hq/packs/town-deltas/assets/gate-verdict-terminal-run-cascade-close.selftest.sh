@@ -45,8 +45,11 @@
 #
 # NON-VACUOUSNESS: instead of a synthetic mutation, the wiring assertions run
 # against BOTH the current file and the actual pre-fix commit (`git show
-# main:...`) and assert the counts differ exactly as expected — the real
-# prior HEAD is the mutant, not a guess at one.
+# <fix-commit>~1:...`) and assert the counts differ exactly as expected — the
+# real prior HEAD is the mutant, not a guess at one. The reference is the fix
+# commit's PARENT, pinned by SHA, never `main` (ga-97tqu7): once the fix merged,
+# `main` became the fixed guard, so a proof that read it could only ever report
+# "already fixed" and this test went permanently red.
 #
 # Exit 0 iff every assertion holds.
 
@@ -54,6 +57,10 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="$SELF_DIR/quality-gate-guard.sh"
+# The ga-hgsqg fix commit. Its parent is the immutable "guard before the fix"
+# used by section 9. Full SHA: an abbreviation can turn ambiguous as the
+# object database grows.
+FIX_COMMIT="398556a1319ba2cd90cb96e1ac332261fcbae1a0"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -234,6 +241,10 @@ for fn in reconcile_dead_reviewer_verdict_action reconcile_orphaned_verdict_acti
 done
 
 echo "── 9. NON-VACUOUSNESS: the wiring assertions actually distinguish pre-fix HEAD from the fix ──"
+# ga-97tqu7: the reference is the fix commit's PARENT, pinned by SHA — not
+# `main`. The fix is an ancestor of main, so `git show main:` returns the FIXED
+# guard (9 occurrences) and this section could only ever fail. The parent is
+# immutable, so "0 occurrences there" stays true for any branch, any time.
 # ga-hgsqg self-audit: `git show ... || true` on a FAILED read (bad ref, not a
 # git repo, detached this file from history) leaves grep reading EMPTY stdin,
 # which prints "0" and exits 1 — caught by the same `|| true` and therefore
@@ -241,17 +252,19 @@ echo "── 9. NON-VACUOUSNESS: the wiring assertions actually distinguish pre-
 # Both collapse to PRE_FIX_COUNT=0, and a false "0" would report this
 # non-vacuousness proof as PASSING when it never actually read anything —
 # exactly the error-vs-empty defect class this whole self-audit step exists
-# to catch. Capture git's own exit code before anything can discard it.
-if PRE_FIX_CONTENT=$(git -C "$SELF_DIR" show main:.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-guard.sh 2>/dev/null) \
+# to catch. Capture git's own exit code before anything can discard it. The
+# same applies to a clone that does not have the fix commit (shallow or pinned
+# checkout): that is UNVERIFIED, reported as a failure, never as a pass.
+if PRE_FIX_CONTENT=$(git -C "$SELF_DIR" show "${FIX_COMMIT}~1:.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-guard.sh" 2>/dev/null) \
     && [ -n "$PRE_FIX_CONTENT" ]; then
   PRE_FIX_COUNT=$(printf '%s\n' "$PRE_FIX_CONTENT" | grep -c 'close_pending_verdicts_for_run' || true)
   if [ "$PRE_FIX_COUNT" = "0" ]; then
-    ok "pre-fix HEAD (main) has ZERO occurrences of close_pending_verdicts_for_run — proves assertion #5 (count=3) would have FAILED there, not vacuous"
+    ok "pre-fix guard (${FIX_COMMIT:0:9}~1) has ZERO occurrences of close_pending_verdicts_for_run — proves assertion #5 (count=3) would have FAILED there, not vacuous"
   else
-    bad "pre-fix HEAD already contains close_pending_verdicts_for_run ($PRE_FIX_COUNT×) — wiring test would not discriminate, INVESTIGATE (branch may be stale vs main)"
+    bad "pre-fix guard (${FIX_COMMIT:0:9}~1) already contains close_pending_verdicts_for_run ($PRE_FIX_COUNT×) — wiring test would not discriminate, INVESTIGATE (is FIX_COMMIT still the fix commit?)"
   fi
 else
-  bad "could not read main:.../quality-gate-guard.sh via git show — cannot verify non-vacuousness (this is a query failure, NOT confirmed-zero; treat as FAIL rather than silently passing)"
+  bad "could not read ${FIX_COMMIT:0:9}~1:.../quality-gate-guard.sh via git show — UNVERIFIED, cannot prove non-vacuousness (is this a shallow/pinned clone without the fix commit? this is a query failure, NOT confirmed-zero; treat as FAIL rather than silently passing)"
 fi
 
 echo ""
