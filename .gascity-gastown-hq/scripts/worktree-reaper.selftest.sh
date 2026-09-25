@@ -24,6 +24,19 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
+# ga-vs6shu: every scenario below now potentially reaches classify_lock's new
+# session-name path when a lock reason has no "pid N" phrase — without a fake
+# seam it falls through to a REAL (if bounded) `gc session list` call, which
+# is both slow (this whole suite would time out) and non-hermetic (depends on
+# this machine's live city). Export an EMPTY fake session list as the default
+# for every invocation below; a prefixed env var on any one `bash "$REAPER"`
+# call overrides this for just that call (ordinary shell semantics), which is
+# exactly how the dedicated live_session scenarios further down opt in to a
+# non-empty fake list.
+EMPTY_SESSIONS="$TMP/empty_sessions.json"
+printf '{"sessions":[]}' > "$EMPTY_SESSIONS"
+export WORKTREE_REAPER_FAKE_SESSION_LIST="$EMPTY_SESSIONS"
+
 # ── build a temp "town" ($TMP) containing one rig repo with an origin/main ───────
 TOWN="$TMP/town"; mkdir -p "$TOWN"
 REMOTE="$TMP/remote.git"; git init -q --bare "$REMOTE"
@@ -197,8 +210,15 @@ ZRIG="$TOWNZ/zrig"; git init -q -b main "$ZRIG"
   # (e) gate-review tree under .gc-worktrees, DEAD holder, detached → reap (path coverage)
   git worktree add -q --detach "$ZRIG/.gc-worktrees/zb-mainbase" main
   git worktree lock --reason "claude agent agent-gate pid 1005 start x" "$ZRIG/.gc-worktrees/zb-mainbase"
-  # (f) UNPARSEABLE lock (no pid in reason) → KEEP (fail-safe)
+  # (f) UNPARSEABLE lock (no pid in reason) on a worktree with REAL unmerged
+  # work → KEEP (fail-safe). ga-vs6shu's new safety net below must NEVER
+  # reap a locked worktree that still has genuine, un-landed work just
+  # because its lock text couldn't be understood — this is the important
+  # negative case that fix must not break. (A branch left at main's tip with
+  # zero commits would be trivially "merged" and WOULD now qualify for the
+  # safety net — see scenario (j) further down for that case instead.)
   git worktree add -q "$ZRIG/.claude/worktrees/agent-noreason" -b crew/z/noreason main
+  ( cd "$ZRIG/.claude/worktrees/agent-noreason"; echo real-work > real-work.txt; git add real-work.txt; git commit -qm "real unmerged work" )
   git worktree lock --reason "manual hold by human" "$ZRIG/.claude/worktrees/agent-noreason"
   # (g) UNLOCKED stale+clean under .claude/worktrees, crew merged → normal reap + branch del
   git branch crew/z/unlocked main
@@ -249,7 +269,10 @@ zbr wa-ancient-sortfix                 && ok "ancient's NON-crew branch KEPT (no
 zwt ".claude/worktrees/agent-young"    && ok "YOUNG/ACTIVE-locked worktree KEPT (never reap live agent)" || bad "YOUNG/ACTIVE worktree wrongly reaped — DESTROYS LIVE WORK!"
 zwt ".claude/worktrees/agent-busy"     && ok "ANCIENT-but-BUSY-locked worktree KEPT (not idle)" || bad "busy worktree wrongly reaped"
 zwt ".gc-worktrees/zb-mainbase"        && bad "gate-review DEAD-locked tree NOT reaped"         || ok "gate-review DEAD-locked tree reaped (.gc-worktrees coverage)"
-zwt ".claude/worktrees/agent-noreason" && ok "UNPARSEABLE lock KEPT (fail-safe)"                || bad "unparseable lock wrongly reaped"
+zwt ".claude/worktrees/agent-noreason" && ok "UNPARSEABLE lock w/ real unmerged work KEPT (fail-safe)" || bad "unparseable lock wrongly reaped — DESTROYS UNMERGED WORK!"
+grep -q '"event":"kept_locked_unparseable".*agent-noreason' "$TMP/reaperZ.jsonl" 2>/dev/null \
+  && ok "ga-vs6shu: agent-noreason logged as kept_locked_unparseable — DISTINCT from a confirmed-live holder" \
+  || bad "ga-vs6shu: agent-noreason not logged with the new distinct unparseable event (still collapsed into kept_locked_live?)"
 zwt ".claude/worktrees/agent-unlocked" && bad "unlocked stale+clean .claude tree NOT reaped"    || ok "unlocked stale+clean .claude/worktrees tree reaped (path coverage)"
 zbr crew/z/unlocked                    && bad "unlocked's merged crew branch NOT deleted"       || ok "unlocked's merged crew branch deleted"
 
@@ -278,6 +301,191 @@ git -C "$ZREMOTE" for-each-ref "refs/reclaimed/agent-collide/" --format='%(objec
   || bad "ga-xv78c: collision WIP LOST — refs/reclaimed/ fallback path broken"
 grep -q '"event":"reaped_zombie_lock"' "$TMP/reaperZ.jsonl" 2>/dev/null && ok "reaped_zombie_lock logged" || bad "reaped_zombie_lock NOT logged"
 grep -q '"event":"kept_locked_live"'   "$TMP/reaperZ.jsonl" 2>/dev/null && ok "kept_locked_live logged (live holder)" || bad "kept_locked_live NOT logged"
+
+# ══ ga-vs6shu: the ACTUAL measured bug — unparseable lock + independently-safe
+# worktree → reaped via the new safety net instead of kept forever ═══════════
+# Real incident (25/09, ga-ormexj disk crisis): the reaper's classify_lock only
+# ever understood a "pid N" phrase. The REAL reasons pool workers write name a
+# SESSION instead ("wa-ho1ol build (wa-worker-adhoc-...)", "(no reason)", ...)
+# — none matched, so EVERY one fell to "unparseable", which the call site then
+# collapsed into the SAME kept_locked_live verdict as a genuinely-confirmed-
+# alive holder. 51 real worktrees (2.3G) sat locked forever this way — ALL of
+# them already 100% merged into main, clean, with no process anywhere near
+# them, aged 72h to 1384h (57 days) — until a human removed them by hand to
+# make room for the nightly backup. Proves: an unparseable-locked worktree
+# that independently proves merged+clean+not-in-use+aged IS now reaped, its
+# merged branch is cleaned up too, and the event is distinctly logged.
+echo "── ga-vs6shu: unparseable lock + independently-safe worktree → reaped ──"
+STOWN="$TMP/stown"; mkdir -p "$STOWN"
+SREMOTE="$TMP/sremote.git"; git init -q --bare "$SREMOTE"
+SRIG="$STOWN/srig"; git init -q -b main "$SRIG"
+( cd "$SRIG"
+  git remote add origin "$SREMOTE"
+  echo s > s.txt; git add s.txt; git commit -qm sbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  mkdir -p "$SRIG/crew"
+  # branch sits at main's tip (trivially merged, nothing has diverged) — the
+  # exact shape of the 51 real stuck worktrees: locked, but with nothing left
+  # to protect.
+  git branch crew/s/safeunparse main
+  git worktree add -q "$SRIG/crew/worker-safeunparse" crew/s/safeunparse
+  # a REALISTIC reason, matching the empirically-observed live format (session
+  # name in parens) — but that session does NOT exist in the (empty, by the
+  # suite-wide default) fake session list, so it correctly resolves unparseable.
+  git worktree lock --reason "wa-something build (wa-worker-adhoc-longgoneabc)" "$SRIG/crew/worker-safeunparse"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$SRIG/crew/worker-safeunparse" 2>/dev/null || true
+
+WORKTREE_REAPER_GT="$STOWN" WORKTREE_REAPER_LOG="$TMP/reaperS.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+swt() { git -C "$SRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-safeunparse\$" >/dev/null; }
+swt && bad "ga-vs6shu: unparseable+merged+clean+aged lock NOT reaped (the actual measured bug NOT fixed)" \
+     || ok "ga-vs6shu: unparseable+merged+clean+aged lock REAPED via the new safety net (the 51-worktree leak, fixed)"
+git -C "$SRIG" rev-parse --verify -q "refs/heads/crew/s/safeunparse" >/dev/null 2>&1 \
+  && bad "ga-vs6shu: merged orphan branch NOT deleted after safety-net reap" \
+  || ok "ga-vs6shu: merged orphan branch deleted after safety-net reap (unblocks re-dispatch too)"
+grep -q '"event":"reaped_locked_unparseable_safe"' "$TMP/reaperS.jsonl" 2>/dev/null \
+  && ok "ga-vs6shu: reaped_locked_unparseable_safe logged (distinguishable from a routine zombie reap or a routine unlocked reap)" \
+  || bad "ga-vs6shu: safety-net reap not distinctly logged"
+
+# ── same shape, but genuinely UNMERGED (real work ahead of main) → must stay
+# KEPT even though the lock is just as unparseable. Proves the safety net
+# checks REAL safety, not just "the lock text was unparseable" alone — the
+# critical negative case (never lose real work because a lock's prose
+# happened to be unreadable).
+echo "── ga-vs6shu: unparseable lock + genuinely UNMERGED work → still kept ──"
+UPTOWN="$TMP/uptown"; mkdir -p "$UPTOWN"
+UPREMOTE="$TMP/upremote.git"; git init -q --bare "$UPREMOTE"
+UPRIG="$UPTOWN/uprig"; git init -q -b main "$UPRIG"
+( cd "$UPRIG"
+  git remote add origin "$UPREMOTE"
+  echo up > up.txt; git add up.txt; git commit -qm upbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  mkdir -p "$UPRIG/crew"
+  git worktree add -q "$UPRIG/crew/worker-unparseunmerged" -b crew/up/unmerged main
+  ( cd "$UPRIG/crew/worker-unparseunmerged"; echo real > real.txt; git add real.txt; git commit -qm "real unmerged work" )
+  git worktree lock --reason "wa-other build (wa-worker-adhoc-stillgone99)" "$UPRIG/crew/worker-unparseunmerged"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$UPRIG/crew/worker-unparseunmerged" 2>/dev/null || true
+
+WORKTREE_REAPER_GT="$UPTOWN" WORKTREE_REAPER_LOG="$TMP/reaperUP.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+upwt() { git -C "$UPRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-unparseunmerged\$" >/dev/null; }
+upwt && ok "ga-vs6shu: unparseable+UNMERGED lock KEPT (never lose real work over an unreadable lock reason)" \
+      || bad "ga-vs6shu: unparseable+unmerged worktree wrongly reaped — DATA LOSS!"
+git -C "$UPRIG" rev-parse --verify -q "refs/heads/crew/up/unmerged" >/dev/null 2>&1 \
+  && ok "ga-vs6shu: unmerged branch still present (nothing was ever removed)" \
+  || bad "ga-vs6shu: unmerged branch is gone — should be impossible if the worktree itself was kept"
+
+# ── live_session positive detection: a lock names a session that IS alive
+# AND whose own work_dir is exactly this worktree → CONFIRMED live, kept, and
+# logged with the live_session verdict (better diagnostics than falling all
+# the way to "unparseable" for a genuinely still-building worktree).
+echo "── ga-vs6shu: live_session positive detection (session alive, work_dir matches) ──"
+LSTOWN="$TMP/lstown"; mkdir -p "$LSTOWN"
+LSREMOTE="$TMP/lsremote.git"; git init -q --bare "$LSREMOTE"
+LSRIG="$LSTOWN/lsrig"; git init -q -b main "$LSRIG"
+( cd "$LSRIG"
+  git remote add origin "$LSREMOTE"
+  echo ls > ls.txt; git add ls.txt; git commit -qm lsbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  mkdir -p "$LSRIG/crew"
+  git branch crew/ls/live main
+  git worktree add -q "$LSRIG/crew/worker-livesession" crew/ls/live
+  git worktree lock --reason "wa-live build (wa-worker-adhoc-imalivehere)" "$LSRIG/crew/worker-livesession"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$LSRIG/crew/worker-livesession" 2>/dev/null || true
+LS_WT_PATH="$(cd "$LSRIG/crew/worker-livesession" && pwd -P)"
+LS_SESSIONS="$TMP/ls_sessions.json"
+jq -n --arg name "wa-worker-adhoc-imalivehere" --arg wd "$LS_WT_PATH" \
+  '{"sessions":[{"name":$name,"session_name":$name,"work_dir":$wd,"closed":false}]}' > "$LS_SESSIONS"
+
+WORKTREE_REAPER_GT="$LSTOWN" WORKTREE_REAPER_LOG="$TMP/reaperLS.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_SESSION_LIST="$LS_SESSIONS" \
+  bash "$REAPER" >/dev/null 2>&1
+
+lswt() { git -C "$LSRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-livesession\$" >/dev/null; }
+lswt && ok "ga-vs6shu: live_session-confirmed worktree KEPT" || bad "ga-vs6shu: a session CONFIRMED alive and working here was wrongly reaped!"
+grep -q '"event":"kept_locked_live".*live_session wa-worker-adhoc-imalivehere' "$TMP/reaperLS.jsonl" 2>/dev/null \
+  && ok "ga-vs6shu: kept_locked_live logged with a live_session verdict (real diagnostic signal, not a guess)" \
+  || bad "ga-vs6shu: live_session verdict not reflected in the log"
+
+# ── pool-slot-reuse guard: the lock names a session that IS in the fake list
+# and IS alive, but its work_dir points somewhere ELSE (the slot has since
+# moved on to different work) → must NOT be trusted as "live for THIS lock" —
+# falls through to unparseable, still correctly gated by the safety net.
+# Without the work_dir check, a busy-but-unrelated persistent pool slot
+# (gastown.dog-1, wa-worker-1, ...) would permanently block every stale lock
+# it ever left behind, forever, just because the slot itself stays busy with
+# newer, unrelated work.
+echo "── ga-vs6shu: pool-slot-reuse guard (session alive elsewhere, not here) ──"
+PSTOWN="$TMP/pstown"; mkdir -p "$PSTOWN"
+PSREMOTE="$TMP/psremote.git"; git init -q --bare "$PSREMOTE"
+PSRIG="$PSTOWN/psrig"; git init -q -b main "$PSRIG"
+( cd "$PSRIG"
+  git remote add origin "$PSREMOTE"
+  echo ps > ps.txt; git add ps.txt; git commit -qm psbase
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  mkdir -p "$PSRIG/crew"
+  git branch crew/ps/stale main
+  git worktree add -q "$PSRIG/crew/worker-staleslot" crew/ps/stale
+  git worktree lock --reason "gastown.dog-1/ga-someoldbead active fix 99999" "$PSRIG/crew/worker-staleslot"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$PSRIG/crew/worker-staleslot" 2>/dev/null || true
+PS_SESSIONS="$TMP/ps_sessions.json"
+# gastown.dog-1 IS alive — but working in a COMPLETELY different directory,
+# simulating the slot having moved on to unrelated newer work.
+jq -n --arg name "gastown.dog-1" --arg wd "$TMP/some/other/unrelated/dir" \
+  '{"sessions":[{"name":$name,"session_name":$name,"work_dir":$wd,"closed":false}]}' > "$PS_SESSIONS"
+
+WORKTREE_REAPER_GT="$PSTOWN" WORKTREE_REAPER_LOG="$TMP/reaperPS.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+WORKTREE_REAPER_FAKE_SESSION_LIST="$PS_SESSIONS" \
+  bash "$REAPER" >/dev/null 2>&1
+
+pswt() { git -C "$PSRIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-staleslot\$" >/dev/null; }
+pswt && bad "ga-vs6shu: stale lock from a slot busy ELSEWHERE not reaped (pool-slot-reuse guard broken — permanently blocked)" \
+      || ok "ga-vs6shu: stale lock from a slot busy elsewhere correctly reaped (name-alive alone is not enough — work_dir must match)"
+grep -q '"event":"reaped_locked_unparseable_safe"' "$TMP/reaperPS.jsonl" 2>/dev/null \
+  && ok "ga-vs6shu: pool-slot-reuse case went through the SAFE unparseable path, not a false live_session match" \
+  || bad "ga-vs6shu: pool-slot-reuse case did not take the expected safety-net path"
+
+# ── loop-1 (legacy path-glob) coverage: the same safety net must fire for a
+# LOCKED worktree found by the flat/nested .gc-worktrees scan too, not only
+# via reap_pool_worktrees's `git worktree list` enumeration — the two loops
+# share _reap_or_log_unparseable_lock, but each has its OWN call-site wiring
+# that could independently drift.
+echo "── ga-vs6shu: loop-1 (legacy path-glob) unparseable-safe reap coverage ──"
+L1TOWN="$TMP/l1town"; mkdir -p "$L1TOWN/.gc-worktrees"
+L1REMOTE="$TMP/l1remote.git"; git init -q --bare "$L1REMOTE"
+git init -q -b main "$L1TOWN"
+( cd "$L1TOWN"
+  git remote add origin "$L1REMOTE"
+  echo l1 > l1.txt; git add l1.txt; git commit -qm l1base
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git branch w/l1safe main
+  git worktree add -q "$L1TOWN/.gc-worktrees/l1-safeunparse" w/l1safe
+  git worktree lock --reason "wa-l1 build (wa-worker-adhoc-l1longgone)" "$L1TOWN/.gc-worktrees/l1-safeunparse"
+) >/dev/null 2>&1
+touch -t "$(date -v-3H +%Y%m%d%H%M 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M)" "$L1TOWN/.gc-worktrees/l1-safeunparse" 2>/dev/null || true
+
+WORKTREE_REAPER_GT="$L1TOWN" WORKTREE_REAPER_LOG="$TMP/reaperL1.jsonl" \
+WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
+  bash "$REAPER" >/dev/null 2>&1
+
+git -C "$L1TOWN" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/\.gc-worktrees/l1-safeunparse\$" >/dev/null \
+  && bad "ga-vs6shu: loop-1 unparseable+safe lock NOT reaped (call-site wiring drifted from loop 2)" \
+  || ok "ga-vs6shu: loop-1 (legacy path-glob) also reaps an unparseable+safe lock via the same safety net"
 
 # ── zombie SIGTERM guard: kill a crew claude agent, NEVER a supervisor/pilot ──────
 echo "── zombie kill guard (guarded when ON) ──"
