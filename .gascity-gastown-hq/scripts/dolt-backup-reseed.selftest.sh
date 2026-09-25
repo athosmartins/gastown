@@ -48,6 +48,21 @@ case "$*" in
   *"s3 cp"*"_meta/latest.json"*)
     [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
     dest="${@: -1}"
+    # ga-gjfe78: FAKE_FP_SHAPE selects how the db is published when it FAILED.
+    #   failed           = what dolt-s3-backup.sh writes (last good values only under last_ok)
+    #   failed-proofkeys = hazardous: status:failed but run_utc/backup_size/head still present
+    case "${FAKE_FP_SHAPE:-}" in
+      failed)
+        printf '{"run_utc": "%s", "databases": {"%s": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok": {"issues": 9, "head": "abc123", "backup_size": "%s"}}}}' \
+          "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-10M}" > "$dest"
+        exit 0
+        ;;
+      failed-proofkeys)
+        printf '{"run_utc": "%s", "databases": {"%s": {"status": "failed", "run_utc": "%s", "backup_size": "%s", "head": "abc123"}}}' \
+          "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_SIZE:-10M}" > "$dest"
+        exit 0
+        ;;
+    esac
     printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
       "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-10M}" > "$dest"
     exit 0
@@ -108,6 +123,22 @@ PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 F
   _s3_current_backup_verified hq "$LOCALDIR" \
   && bad "fingerprint describes a DIFFERENT db → should NOT have verified true" \
   || ok "fingerprint describes a different db (lexbh, not hq) → correctly refused (never guess across dbs)"
+
+# ga-gjfe78: dolt-s3-backup.sh now publishes a db that failed tonight as
+# status:"failed" instead of dropping it. This proof gates DELETING the local
+# backup in low-disk mode, so a failed entry must never verify — not even the
+# hazardous shape that still carries run_utc/backup_size/head, which a reader
+# that predates the change takes as a fresh, coherent proof of an S3 copy the
+# nightly run said it could not make.
+PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=10M FAKE_FP_SHAPE=failed \
+  _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "fingerprint marks hq FAILED → should NOT have verified true" \
+  || ok "fingerprint marks hq FAILED (manifest present, size otherwise fine) → correctly refused (a failed entry is not proof)"
+
+PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=10M FAKE_FP_SHAPE=failed-proofkeys \
+  _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "status:failed entry that still carries run_utc/backup_size/head was read as PROOF — low-disk mode would delete the local backup on it" \
+  || ok "status:failed entry that still carries proof-looking keys → correctly refused (status wins over every other key)"
 
 rm -rf "$LIB_SCRATCH" 2>/dev/null
 
@@ -510,6 +541,65 @@ done < "$ROOT9/merge-check.log"
 cat "$ROOT9/gate-check.log"
 grep -q "^  PASS:" "$ROOT9/gate-check.log" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 rm -rf "$ROOT9" 2>/dev/null
+
+# ── Scenario 9b (ga-gjfe78): the published fingerprint MARKS hq (and a sibling)
+#    as FAILED — what dolt-s3-backup.sh writes now instead of dropping the db.
+#    An ad hoc reseed that re-proves hq must merge a fresh, proper entry OVER
+#    hq's failed mark (_publish_db_fingerprint replaces the whole
+#    databases.<db> entry — the failed-mark design depends on that), while the
+#    sibling's failed mark and an untouched good entry pass through byte-for-
+#    byte: one db recovering never clears, or fakes, another db's status.
+ROOT9B="/tmp/reseed-selftest-s9b.$$"
+setup_scenario "$ROOT9B" 5 5 200
+cat > "$ROOT9B/seed-meta.json" <<'JSON'
+{
+  "run_utc": "2026-09-25T07:04:02Z",
+  "databases": {
+    "hq": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-20T07:00:00Z", "last_ok": {"issues": 7242, "head": "old", "backup_size": "13G"}},
+    "otherdb": {"status": "failed", "reason": "s3", "last_ok_run_utc": null, "last_ok": null},
+    "gooddb": {"issues": 3, "head": "g", "backup_size": "5M"}
+  }
+}
+JSON
+run_scenario "$ROOT9B" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_S3_META_SEED_FILE="$ROOT9B/seed-meta.json"
+if [ "$RC" -eq 0 ]; then ok "scenario 9b (ad hoc reseed over a FAILED-marked hq): exits 0"; else bad "scenario 9b: expected exit 0, got $RC — $(tail -5 "$ROOT9B/out.log")"; fi
+if [ -f "$ROOT9B/s3-meta-uploaded.json" ]; then ok "scenario 9b: a merged _meta/latest.json was uploaded"; else bad "scenario 9b: no fingerprint was uploaded"; fi
+python3 - "$ROOT9B/seed-meta.json" "$ROOT9B/s3-meta-uploaded.json" > "$ROOT9B/merge-check.log" 2>&1 <<'PYCHECK'
+import json, sys
+seed = json.load(open(sys.argv[1]))
+up = json.load(open(sys.argv[2]))
+dbs = up.get("databases", {})
+hq = dbs.get("hq")
+if not isinstance(hq, dict) or hq.get("status", "ok") != "ok" or not hq.get("run_utc") or not hq.get("backup_size"):
+    print("FAIL: hq still carries the failed mark (or lost its proof) after a successful re-prove:", hq)
+else:
+    print("PASS: hq's failed mark was replaced by a fresh proper entry (no failed status, run_utc + backup_size present)")
+if dbs.get("otherdb") != seed["databases"]["otherdb"]:
+    print("FAIL: the sibling's FAILED mark was not preserved byte-for-byte:", dbs.get("otherdb"))
+else:
+    print("PASS: the sibling db's FAILED mark passed through untouched (one db recovering never clears another)")
+if dbs.get("gooddb") != seed["databases"]["gooddb"]:
+    print("FAIL: an untouched good entry changed:", dbs.get("gooddb"))
+else:
+    print("PASS: an untouched good entry passed through byte-for-byte")
+PYCHECK
+cat "$ROOT9B/merge-check.log"
+while read -r line; do
+  case "$line" in "PASS:"*) PASS=$((PASS+1)) ;; "FAIL:"*) FAIL=$((FAIL+1)) ;; esac
+done < "$ROOT9B/merge-check.log"
+( DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1 . "$HERE/dolt-backup-residue-reclaim.sh"
+  P_OUT="$(mktemp)"
+  : > "$P_OUT"; _parse_fingerprint_to_file "$ROOT9B/s3-meta-uploaded.json" "hq" "$P_OUT"
+  [ -s "$P_OUT" ] && echo "  PASS: scenario 9b: after the merge the real parser reads hq as PROOF (the reseed re-proved it)" || echo "  FAIL: scenario 9b: hq should parse as proof after the reseed re-proved it"
+  : > "$P_OUT"; _parse_fingerprint_to_file "$ROOT9B/s3-meta-uploaded.json" "otherdb" "$P_OUT"
+  [ -s "$P_OUT" ] && echo "  FAIL: scenario 9b: the sibling's FAILED entry parsed as proof" || echo "  PASS: scenario 9b: the real parser still reads the sibling's FAILED entry as NO proof"
+  rm -f "$P_OUT"
+) > "$ROOT9B/parse-check.log" 2>&1
+cat "$ROOT9B/parse-check.log"
+while read -r line; do
+  case "$line" in *"PASS:"*) PASS=$((PASS+1)) ;; *"FAIL:"*) FAIL=$((FAIL+1)) ;; esac
+done < "$ROOT9B/parse-check.log"
+rm -rf "$ROOT9B" 2>/dev/null
 
 # ── Scenario 10 (ga-6xo4r0): the NEW post-swap S3 sync fails — must NEVER
 #    unwind or fail the already-verified LOCAL swap (this bead's own

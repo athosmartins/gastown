@@ -176,7 +176,7 @@ cat > "$FIX_JSON" <<'JSON'
   "databases": {
     "okexplicit": {"status": "ok", "issues": 1, "head": "h1", "backup_size": "1M"},
     "legacy": {"issues": 1, "head": "h2", "backup_size": "2M"},
-    "failednew": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
+    "failednew": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
     "failedproofkeys": {"status": "failed", "run_utc": "2026-09-16T07:08:53Z", "issues": 9, "head": "old", "backup_size": "1M"},
     "failedsizeonly": {"status": "failed", "backup_size": "1M"},
     "statusnull": {"status": null, "backup_size": "1M"},
@@ -219,9 +219,8 @@ cat > "$FIX_JSON" <<'JSON'
   "databases": {
     "good": {"issues": 1, "head": "h", "backup_size": "1M"},
     "goodexplicit": {"status": "ok", "backup_size": "1M"},
-    "failedwithdate": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
-    "failednone": {"status": "failed", "reason": "s3", "last_ok_run_utc": null, "last_ok_known": true, "last_ok": null},
-    "failedunknown": {"status": "failed", "reason": "sync", "last_ok_run_utc": null, "last_ok_known": false, "last_ok": null},
+    "failedwithdate": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok": {"issues": 9, "head": "old", "backup_size": "1M"}},
+    "failednull": {"status": "failed", "reason": "s3", "last_ok_run_utc": null, "last_ok": null},
     "failedbare": {"status": "failed"},
     "weird": {"status": "partial"},
     "notadict": "oops"
@@ -232,9 +231,8 @@ _st() { _fingerprint_db_state "$FIX_JSON" "$1"; }
 [ "$(_st good)" = "$(printf 'ok\t')" ] && ok "legacy entry → ok" || bad "legacy entry state wrong: '$(_st good)'"
 [ "$(_st goodexplicit)" = "$(printf 'ok\t')" ] && ok "explicit status=ok → ok" || bad "explicit ok state wrong: '$(_st goodexplicit)'"
 [ "$(_st failedwithdate)" = "$(printf 'failed\t2026-09-10T07:00:00Z')" ] && ok "failed entry → failed + the date of the last ok" || bad "failed+date state wrong: '$(_st failedwithdate)'"
-[ "$(_st failednone)" = "$(printf 'failed\tnone')" ] && ok "failed, provably never ok before → detail 'none'" || bad "failed+none state wrong: '$(_st failednone)'"
-[ "$(_st failedunknown)" = "$(printf 'failed\tunknown')" ] && ok "failed, last ok could not be determined → detail 'unknown' (never conflated with 'none')" || bad "failed+unknown state wrong: '$(_st failedunknown)'"
-[ "$(_st failedbare)" = "$(printf 'failed\tunknown')" ] && ok "failed with no last_ok fields at all → 'unknown' (missing is not the same as none)" || bad "failed bare state wrong: '$(_st failedbare)'"
+[ "$(_st failednull)" = "$(printf 'failed\tunknown')" ] && ok "failed with last_ok_run_utc null → detail 'unknown' (null is NOT KNOWN — the writer never claims a db never had a good backup)" || bad "failed+null state wrong: '$(_st failednull)'"
+[ "$(_st failedbare)" = "$(printf 'failed\tunknown')" ] && ok "failed with no last_ok fields at all → 'unknown'" || bad "failed bare state wrong: '$(_st failedbare)'"
 [ "$(_st weird)" = "$(printf 'unrecognized\t')" ] && ok "unrecognized status → unrecognized" || bad "unrecognized status state wrong: '$(_st weird)'"
 [ "$(_st notadict)" = "$(printf 'unrecognized\t')" ] && ok "entry that is not an object → unrecognized" || bad "non-object entry state wrong: '$(_st notadict)'"
 [ "$(_st nosuchdb)" = "$(printf 'absent\t')" ] && ok "readable file, no entry for the db → absent" || bad "absent state wrong: '$(_st nosuchdb)'"
@@ -285,7 +283,7 @@ JSON
       failed)
         # what dolt-s3-backup.sh publishes for a db that failed tonight (ga-gjfe78)
         cat > "$dest" <<JSON
-{"run_utc": "2026-09-16T07:08:53Z", "databases": {"testdb": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok_known": true, "last_ok": {"issues": 9, "head": "stubhead1", "backup_size": "1M"}}}}
+{"run_utc": "2026-09-16T07:08:53Z", "databases": {"testdb": {"status": "failed", "reason": "sync", "last_ok_run_utc": "2026-09-10T07:00:00Z", "last_ok": {"issues": 9, "head": "stubhead1", "backup_size": "1M"}}}}
 JSON
         exit 0
         ;;

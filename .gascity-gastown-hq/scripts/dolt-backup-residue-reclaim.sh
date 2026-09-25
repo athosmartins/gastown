@@ -280,8 +280,9 @@ PY
 # got proof for <db>. States:
 #   ok            entry present, no status or status "ok"         detail: empty
 #   failed        the writer marked the db failed                 detail: date of
-#                 the last good backup | "none" (provably never had one) |
-#                 "unknown" (could not be determined) — never conflated
+#                 the last good backup, or "unknown" when the writer could not
+#                 find it out. Never "none": the writer cannot prove a db never
+#                 had a good backup, so it does not claim it.
 #   absent        readable file, no entry for the db              detail: empty
 #   unrecognized  entry not an object, or a status this code does not know
 #   unreadable    file missing / not JSON / not the expected shape
@@ -327,9 +328,7 @@ if entry["status"] != "failed":
     sys.exit(0)
 
 ts = entry.get("last_ok_run_utc")
-if entry.get("last_ok_known") is True and entry.get("last_ok") is None and ts is None:
-    out("failed", "none")
-elif isinstance(ts, str) and ts:
+if isinstance(ts, str) and ts:
     out("failed", ts)
 else:
     out("failed", "unknown")

@@ -498,6 +498,126 @@ jsonl_offsite_sync() {
   return 0
 }
 
+# _build_run_fingerprint <raw_file> <run_utc> <port> <ok> <failed> <total>
+#   <discovered_dbs> <failed_dbs_text> <prev_fingerprint_file>
+# Prints the run fingerprint (the body of _meta/latest.json) on stdout.
+#
+# ga-gjfe78: this used to rebuild the file from scratch out of the dbs that
+# SUCCEEDED, so a db that failed (hq, every night since 2026-09-21) simply
+# vanished from it — no entry, no failed mark, no last good date — which is
+# indistinguishable from a db that never existed. Every consumer reads "no
+# entry" as "not proven", so nothing unsafe happened, but only by accident, and
+# the one place that says whether S3 is fresh never said that hq was failing.
+#
+# Now EVERY discovered db has an entry. A db with a row in <raw_file> succeeded
+# and its entry is exactly the shape it always had (no new key — byte-identical
+# on a good night, so existing readers see nothing). A db without one is
+# published as
+#   {"status":"failed","reason":<disco|sync|s3|unknown>,
+#    "last_ok_run_utc":<ts|null>,"last_ok":{issues,head,backup_size}|null}
+# and deliberately carries NO run_utc/issues/head/backup_size at its own top
+# level: those are the keys a reader that predates this change takes as proof,
+# so their absence keeps such a reader inert by construction. The last good
+# values live only under "last_ok", which nothing reads as proof.
+#
+# WHO failed is the complement (discovered minus succeeded), not a parse of the
+# failure text — text only supplies the reason, and an unparseable token costs
+# "unknown", never a missing db (ga-p5q3). last_ok comes from <prev_fingerprint_
+# file> (the previous night's file, fetched by the caller). null means NOT KNOWN
+# and never "there was none": a db that is absent from the previous file could
+# have never existed OR have been dropped from it by the very bug this fixes
+# (the writer before ga-gjfe78 omitted failed dbs — hq's real last-ok is older
+# than the file that stopped listing it), and an unreadable/malformed previous
+# file, or an entry that cannot be trusted, is likewise "could not find out".
+# A db that fails twice in a row carries its ORIGINAL last-ok forward; it is
+# never reset to the previous failed night.
+#
+# An entry with no "status" is a legacy ok entry. The consumers
+# (_parse_fingerprint_to_file in dolt-backup-residue-reclaim.sh, which
+# dolt-backup-reseed.sh also sources) treat any status other than "ok" as NOT
+# proven. dolt-backup-reseed.sh's per-db merge replaces the whole entry, so an
+# ad hoc reseed that re-proves a failed db overwrites the failed mark.
+_build_run_fingerprint() {
+  python3 - "$@" <<'PY'
+import json, re, sys
+
+args = sys.argv[1:10]
+args += [""] * (9 - len(args))
+raw, run_utc, port, ok, failed, total, discovered, failed_text, prev_path = args
+
+dbs = {}
+try:
+    with open(raw) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 4:
+                dbs[p[0]] = {"issues": int(p[1]), "head": p[2], "backup_size": p[3]}
+except FileNotFoundError:
+    pass
+
+reasons = {}
+for tok in failed_text.split():
+    m = re.match(r"^(.+)\(([A-Za-z0-9_-]+)\)$", tok)
+    if m:
+        reasons[m.group(1)] = m.group(2)
+
+order = [d for d in discovered.split() if d]
+seen = set(order)
+for d in list(dbs) + list(reasons):
+    if d not in seen:
+        order.append(d)
+        seen.add(d)
+
+prev_dbs = None
+prev_run = None
+try:
+    with open(prev_path) as f:
+        prev = json.load(f)
+    if isinstance(prev, dict) and isinstance(prev.get("databases"), dict):
+        prev_dbs = prev["databases"]
+        if isinstance(prev.get("run_utc"), str):
+            prev_run = prev["run_utc"]
+except Exception:
+    pass
+
+
+def last_ok_of(db):
+    """(last_ok_run_utc, last_ok) for a db that failed this run; None = not known."""
+    if prev_dbs is None or db not in prev_dbs:
+        return (None, None)
+    e = prev_dbs[db]
+    if not isinstance(e, dict):
+        return (None, None)
+    if "status" not in e or e["status"] == "ok":
+        ts = e["run_utc"] if isinstance(e.get("run_utc"), str) else prev_run
+        return (ts, {"issues": e.get("issues"), "head": e.get("head"),
+                     "backup_size": e.get("backup_size")})
+    if e["status"] == "failed":
+        ts = e.get("last_ok_run_utc")
+        last_ok = e.get("last_ok")
+        if (ts is None or isinstance(ts, str)) and (last_ok is None or isinstance(last_ok, dict)):
+            return (ts, last_ok)
+    return (None, None)
+
+
+databases = {}
+for db in order:
+    if db in dbs:
+        databases[db] = dbs[db]
+        continue
+    try:
+        ts, last_ok = last_ok_of(db)
+    except Exception:
+        ts, last_ok = (None, None)
+    databases[db] = {"status": "failed", "reason": reasons.get(db, "unknown"),
+                     "last_ok_run_utc": ts, "last_ok": last_ok}
+
+json.dump({"run_utc": run_utc, "port": int(port), "bucket": "urblink-dolt-backups",
+           "ok": int(ok), "failed": int(failed), "total": int(total),
+           "databases": databases}, sys.stdout, indent=2)
+PY
+}
+
 # Library mode: `DOLT_S3_BACKUP_LIB=1 source dolt-s3-backup.sh` defines the pure
 # functions above without running the live backup flow (lock/PORT/DOLT_BACKUP/S3).
 if [ "${DOLT_S3_BACKUP_LIB:-0}" = "1" ]; then
@@ -666,24 +786,34 @@ fi
 # --- publish a run fingerprint to S3 (small; latest + dated) ---
 RUN_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if "$AWS" --version >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-  python3 - "$RAW" "$RUN_UTC" "$PORT" "$ok" "$failed" "$total" > "$META" <<'PY'
-import json, sys
-raw, run_utc, port, ok, failed, total = sys.argv[1:7]
-dbs = {}
-try:
-    with open(raw) as f:
-        for line in f:
-            p = line.rstrip("\n").split("\t")
-            if len(p) >= 4:
-                dbs[p[0]] = {"issues": int(p[1]), "head": p[2], "backup_size": p[3]}
-except FileNotFoundError:
-    pass
-json.dump({"run_utc": run_utc, "port": int(port), "bucket": "urblink-dolt-backups",
-           "ok": int(ok), "failed": int(failed), "total": int(total),
-           "databases": dbs}, sys.stdout, indent=2)
-PY
-  "$AWS" s3 cp "$META" "$S3/_meta/latest.json" --only-show-errors >> "$LOG" 2>&1 || true
-  "$AWS" s3 cp "$META" "$S3/_meta/$(date -u +%Y%m%d-%H%M%S).json" --only-show-errors >> "$LOG" 2>&1 || true
+  # ga-gjfe78: a db that failed tonight must stay in the file, marked failed and
+  # with the date of its last good backup — see _build_run_fingerprint. The last
+  # good values come from the PREVIOUS night's file, so fetch it, but only when
+  # something failed: a clean night never reads it, and its output is
+  # byte-identical to what it always was. A fetch that fails leaves an empty
+  # file, which the builder reads as "could not find out" (last_ok stays null),
+  # never as "there was none".
+  PREV_META=""
+  if [ "$failed" -gt 0 ]; then
+    PREV_META="$(mktemp)"
+    if ! timeout "${META_FETCH_TIMEOUT:-60}" "$AWS" s3 cp "$S3/_meta/latest.json" "$PREV_META" --only-show-errors >> "$LOG" 2>&1; then
+      log "fingerprint: could not fetch the previous _meta/latest.json — failed dbs are published with last_ok=null (not known)"
+      : > "$PREV_META"
+    fi
+  fi
+  # Never publish a fingerprint that did not build: an empty/invalid file here
+  # would REPLACE the last good one (a missing entry is safe for consumers, a
+  # corrupt file is not). Left alone, the old file keeps its older run_utc, which
+  # keeps every consumer's freshness check inert.
+  if _build_run_fingerprint "$RAW" "$RUN_UTC" "$PORT" "$ok" "$failed" "$total" "$DBS" "$FAILED_DBS" "$PREV_META" > "$META" 2>> "$LOG" \
+     && python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(open(sys.argv[1])), dict) else 1)' "$META" 2>> "$LOG"; then
+    "$AWS" s3 cp "$META" "$S3/_meta/latest.json" --only-show-errors >> "$LOG" 2>&1 || true
+    "$AWS" s3 cp "$META" "$S3/_meta/$(date -u +%Y%m%d-%H%M%S).json" --only-show-errors >> "$LOG" 2>&1 || true
+  else
+    log "fingerprint: could not build a valid run fingerprint — NOT publishing (the last good _meta/latest.json stays)"
+    notify_fail "backup off-box: fingerprint _meta/latest.json não foi gerado — NÃO publicado (fica o último bom); ver $LOG"
+  fi
+  [ -z "$PREV_META" ] || rm -f "$PREV_META"
 fi
 
 log "=== run complete: ok=$ok failed=$failed total=$total jsonl_offsite=$JSONL_OFFSITE_STATUS ==="
