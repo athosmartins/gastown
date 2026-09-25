@@ -147,8 +147,10 @@
 #                             no author: the guard logged only "avail=", the reclaim
 #                             levers found nothing, ~7GB stayed anonymous. Now, on
 #                             the FIRST WARN cycle and again on the first CRITICAL
-#                             cycle of an episode — before any reclaim lever runs,
-#                             since they delete the very things that grew — it
+#                             cycle of an episode — before THAT cycle's reclaim
+#                             levers run, since they delete the very things that grew
+#                             (a CRITICAL photo still comes after the levers of the
+#                             earlier WARN cycles, which run at WARN too) — it
 #                             photographs one-level `du -sk` under a fixed set of
 #                             roots (the dolt data-dir per database, .dolt-backup,
 #                             ~/shared/data, /private/tmp, DARWIN_USER_TEMP_DIR,
@@ -160,9 +162,12 @@
 #                             .gc/logs/disk-growth-<ts>.txt, the top growers in this
 #                             log, and a WHAT GREW paragraph in the Mayor CRITICAL
 #                             mail. A root that timed out says PARTIAL, one the scan
-#                             budget never reached says SKIPPED — and the diff never
-#                             calls anything "new" or "grown" from a root that was
-#                             not completely measured on both sides. macOS has no
+#                             budget never reached says SKIPPED — the diff never
+#                             calls an entry "new" unless the baseline scan of its
+#                             root was complete, an entry measured on both sides is
+#                             still compared inside a PARTIAL root (each du row is a
+#                             whole result), and every root that was not complete on
+#                             both sides also gets a NOT FULLY COMPARED line. macOS has no
 #                             per-process write counter without root, so "who wrote"
 #                             is approximated by "which held-open file grew and which
 #                             pid holds it" (labelled as a proxy everywhere it is
@@ -1108,9 +1113,12 @@ _top_disk_consumers() {
 #   WRITERS <ok|unmeasured>     WRITER <mb> <pid> <command> <path>
 # "Unmeasured" is always a STATUS or an absent line, never a 0: a root that timed
 # out keeps the rows that finished and says PARTIAL; one the budget never reached
-# says SKIPPED; the diff refuses to call an entry "new" or "grown" on the strength
-# of a root that was not completely measured on both sides (ga-p5q3: "could not
-# measure" must never read as "did not grow").
+# says SKIPPED; the diff refuses to call an entry "new" when the baseline scan of
+# its root was not complete, and lists every root that was not complete on both
+# sides as not fully compared (ga-p5q3: "could not measure" must never read as
+# "did not grow"). An entry with a row in BOTH photos is compared even inside such
+# a root — a du row is a whole result for that entry — so "grown" is claimed there,
+# next to that root's not-fully-compared line.
 
 # _growth_baseline_file / _growth_episode_file → state paths, resolved from
 # $STATE_DIR at call time (see the config block for why).
@@ -1155,27 +1163,48 @@ _growth_roots() {
 # (512B on macOS) so two parallel dus cannot interleave mid-line. Symlinked roots
 # are never descended (a symlink into CloudStorage/FUSE could hang the scan).
 _growth_scan_root() {
-  local root="$1" tmo="$2" tmpf xrc frc status
+  local root="$1" tmo="$2" tmpf markf xrc frc status
   local -a pst
+  # One du chunk, run by xargs (see below for why it is not `du -sk` directly).
+  # $1 = the marker path, the rest = the chunk's paths. du's own status is visible
+  # HERE and nowhere later: 0 = clean, 1 = a routine miss (an unreadable subdir or a
+  # child that vanished mid-scan — the rows du printed are still whole), anything
+  # above 1 (128+n = killed by a signal, 126/127, 255) = this chunk's rows may be
+  # missing, so a marker is left for the caller. Whatever du did, the chunk exits 0,
+  # so a chunk that died does not stop xargs from measuring the chunks after it. The
+  # one exception: if the marker cannot be written, exit 255 makes xargs abort with a
+  # nonzero status, which the caller also reads as PARTIAL — a failure to record a
+  # failure must not read as success.
+  local du_chunk='m=$1; shift; du -sk "$@"; rc=$?; if [ "$rc" -gt 1 ]; then : > "$m" || exit 255; fi; exit 0'
   if [ -L "$root" ]; then printf 'ROOT\tSYMLINK\t%s\n' "$root"; return 0; fi
   if [ ! -d "$root" ]; then printf 'ROOT\tMISSING\t%s\n' "$root"; return 0; fi
   tmpf="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-growth.XXXXXX" 2>/dev/null)" \
     || { printf 'ROOT\tPARTIAL\t%s\n' "$root"; return 0; }
+  markf="${tmpf}.abort"
+  rm -f "$markf" 2>/dev/null
   find "$root" -maxdepth 1 -mindepth 1 -print0 2>/dev/null \
-    | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 du -sk > "$tmpf" 2>/dev/null
+    | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 /bin/sh -c "$du_chunk" sh "$markf" > "$tmpf" 2>/dev/null
   # Both statuses in ONE statement: every later assignment overwrites PIPESTATUS.
   pst=("${PIPESTATUS[@]}")
   frc="${pst[0]}"; xrc="${pst[1]}"
-  # A du chunk that hit a permission error or a vanished child exits nonzero — the
-  # routine case here (TCC-protected subdirs under ~/Library/Caches, entries
-  # deleted mid-scan under /private/tmp) — and the rows it printed are still
-  # valid. What xargs reports for that depends on WHICH xargs: macOS's BSD xargs
-  # exits 1 (MEASURED 2026-09-25: 1 for T, /private/tmp and ~/shared/data; a first
-  # draft treated only GNU's 123 as routine and marked nearly every root PARTIAL,
-  # which would have suppressed every "new" claim in the diff), GNU xargs 123. 124
-  # is timeout's own "bound hit"; anything else (126/127 cannot exec, 137/143
-  # killed) means rows may be missing. Those are PARTIAL — never OK.
-  case "$xrc" in 0|1|123) status="OK" ;; *) status="PARTIAL" ;; esac
+  # Why du runs inside a wrapper instead of being xargs's direct child: macOS's BSD
+  # xargs exits 1 for BOTH "a du chunk exited 1" (routine — TCC-protected subdirs
+  # under ~/Library/Caches, entries deleted mid-scan under /private/tmp) AND "a du
+  # chunk was killed by a signal or exited 255" (xargs stops there and never runs the
+  # chunks after it; MEASURED 2026-09-25 with real BSD xargs: rc=1 with all 12 rows
+  # in the first case, rc=1 with 8 of 12 in the second — the only difference is a
+  # message on stderr, which this code does not parse). GNU xargs uses 123/124/125
+  # for the same cases. Reading xargs's status alone therefore cannot separate a
+  # complete scan from a truncated one (gate ga-67s6d2), so the wrapper reports du's
+  # status itself and exits 0 whatever du did — except when it cannot write its marker
+  # (255). A nonzero xargs status is therefore only xargs/timeout/exec failing (124 =
+  # timeout's own bound; 126/127 cannot exec; 137/143 killed) or that marker-write
+  # abort, all of which mean rows may be missing.
+  case "$xrc" in 0) status="OK" ;; *) status="PARTIAL" ;; esac
+  # A du chunk that died left a marker (see du_chunk). An if, not `[ -e … ] && …`: an
+  # and-list whose test is false returns 1, the shape that dropped a whole photo
+  # before (gate ga-voklw8).
+  if [ -e "$markf" ]; then status="PARTIAL"; fi
   # find's own status is the OTHER half of "did we see the whole root": if it could
   # not list the root (e.g. chmod 000) xargs gets EMPTY input, never runs du, and
   # exits 0 — an empty scan indistinguishable from an empty directory (gate
@@ -1188,7 +1217,7 @@ _growth_scan_root() {
   # Only well-formed "<kb><TAB>/abs/path" rows survive; anything else (a
   # truncated line, a path with a newline) is dropped rather than guessed at.
   awk -F'\t' '$1 ~ /^[0-9]+$/ && substr($2,1,1) == "/" { printf "ENT\t%s\t%s\n", $1, $2 }' "$tmpf"
-  rm -f "$tmpf" 2>/dev/null
+  rm -f "$tmpf" "$markf" 2>/dev/null
   return 0
 }
 
@@ -1237,9 +1266,12 @@ _top_open_write_files() {
   rc=$?
   # A live machine always has open files, so an EMPTY capture means lsof failed
   # (or was killed at the 30s bound, rc 124) — never "nothing is open". A
-  # non-empty capture from an lsof that exited nonzero is still valid rows (it
-  # skips what it cannot stat).
-  if [ "$rc" -eq 124 ] || [ ! -s "$raw" ]; then
+  # non-empty capture from an lsof that exited 0 or 1 is still valid rows (it
+  # skips what it cannot stat). rc >= 124 is different even with rows in the
+  # capture: 124 = timeout's bound, 125-127 = timeout/exec failure, 128+n = lsof
+  # killed by a signal — the capture is then a truncated prefix of the real list,
+  # and a writer missing from it must read "unmeasured", not "not open".
+  if [ "$rc" -ge 124 ] || [ ! -s "$raw" ]; then
     rm -f "$raw" 2>/dev/null
     return 2
   fi
@@ -2984,8 +3016,10 @@ ga-ofi307 — catches a new large consumer, the way bash-edit-diff's 3.5GB cache
 bead, before a human has to find it by hand):
 ${top_disk:-  (unmeasured — no known roots present or du failed)}
 
-WHAT GREW (ga-ond0fa) — this episode's disk-growth photo, taken before any reclaim lever ran and
-diffed against the last OK photo:
+WHAT GREW (ga-ond0fa) — this episode's disk-growth photo: taken in one cycle of the episode (its
+class and time are in the photo file's report header), before THAT cycle's reclaim levers ran.
+Levers of earlier cycles of the same episode (e.g. at WARN) may already have removed some of what
+grew. Diffed against the last OK photo:
 ${growth_txt}"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
         _write_last_mail_state "$now" "$avail"
