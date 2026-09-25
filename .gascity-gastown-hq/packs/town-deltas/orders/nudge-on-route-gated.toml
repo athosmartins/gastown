@@ -1,0 +1,20 @@
+# ga-aijm2v.5 (Camada 1 da portaria, regra 1): replaces the maintenance pack's
+# `nudge-on-route`, which city.toml now switches off with `[orders] skip`.
+#
+# Why a NEW name + skip, and not a same-name override in this pack: a same-name
+# override only shadows the CITY-scoped instance. The maintenance pack also
+# registers `nudge-on-route` once PER RIG (`gc order list` shows 6 instances:
+# city + gastown, lexbh, marketing, property_scrapers, whatsapp_automation), and
+# those would keep running the builtin script. Same trap ga-5mu653 hit with
+# wisp-compact (see the comment above `[orders]` in city.toml).
+#
+# One city-scoped instance is enough: `gc events` is the city-wide stream (it
+# carries ga-, wa- and gh- beads), and the script resolves each bead's own store
+# from its prefix. Same trigger as the builtin. The script's wall-clock budget
+# (GNR_BUDGET_S=200s) stays under the controller's ~5 min exec-order timeout
+# that killed the builtin mid-run (order.failed 5m02s after order.fired).
+[order]
+description = "Wake an IDLE pool worker when a bead becomes ready+unassigned and routed to its pool (ga-aijm2v.5 — replaces nudge-on-route)"
+trigger = "event"
+on = "bead.updated"
+exec = "$PACK_DIR/assets/scripts/nudge-on-route-gated.sh"

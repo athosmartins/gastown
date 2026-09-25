@@ -62,8 +62,18 @@ source = "packs/town-deltas"
 # name at every scope (measured 2026-09-19 with `gc order list --json` on the live city and
 # on a throwaway city that has a rig).
 # Do not remove this line before a replacement retention design exists.
+#
+# ga-aijm2v.5: the maintenance pack's `nudge-on-route` is switched OFF the same way, for the
+# same reason (6 instances: city + 5 rigs, so a same-name town-deltas override would leave 5
+# of them running the builtin). It is REPLACED by `nudge-on-route-gated` (packs/town-deltas/
+# orders/nudge-on-route-gated.toml), a differently-named, city-scoped order — `skip` matches
+# by name, so it does not touch the replacement. The builtin nudged every pool member for every
+# routed bead (busy ones, in_progress beads, closed beads) and was killed by the exec timeout
+# before it ever persisted its dedup state, so it re-nudged the same pairs on every run.
+# Do not remove "nudge-on-route" from this list unless nudge-on-route-gated is also removed —
+# running both would nudge twice. Rollback = drop the name from `skip` AND delete the new order.
 [orders]
-skip = ["wisp-compact"]
+skip = ["wisp-compact", "nudge-on-route"]
 
 [[rigs]]
 name = "property_scrapers"
