@@ -364,6 +364,7 @@ run_live_basetest_check() {
   local verdict="nao-consegui-medir"
   local detected=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0
   local base="" test_files=""
+  local outside="unknown"   # ga-x4mkk2: "never measured" is NOT 0
 
   git -C "$RIG_PATH" fetch origin main "$branch" --quiet 2>/dev/null || true
   local main_sha branch_sha
@@ -374,6 +375,10 @@ run_live_basetest_check() {
   fi
 
   if [ -n "$base" ]; then
+    # ga-x4mkk2: the REAL guard function, not a copy. Count only — `outside` is never
+    # an input to the verdict below. It reaches the caller through a FILE because this
+    # function runs inside $(...), where a variable assignment would die with the subshell.
+    outside=$(gate_base_test_outside_subtree "$RIG_PATH" "$base" "$branch_sha")
     test_files=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${base}..${branch_sha}" -- '*.selftest.sh' 2>/dev/null || echo "")
     [ -n "$test_files" ] && detected=$(printf '%s\n' "$test_files" | grep -c .)
 
@@ -417,7 +422,18 @@ TESTFILESEOF
       verdict=$(gate_base_test_verdict "$detected" "$copy_ok" "$ran" "$failed" "$repaired" "$unclassified")
     fi
   fi
+  if [ -n "${ABT_OUTSIDE_FILE:-}" ]; then printf '%s' "$outside" > "$ABT_OUTSIDE_FILE"; fi
   printf '%s' "$verdict"
+}
+
+# ga-x4mkk2: run the mirror and report BOTH what the guard decides and what it counts, from
+# the SAME run — "the verdict is unchanged" is only a claim if it is read next to the count.
+run_live_check_full() {
+  local of v
+  of=$(mktemp "${TMPDIR:-/tmp}/gate-xk-outside.XXXXXX")
+  v=$(ABT_OUTSIDE_FILE="$of" run_live_basetest_check "$1")
+  printf '%s outside-subtree=%s' "$v" "$(cat "$of")"
+  rm -f "$of"
 }
 
 eq "real-git+origin: badtest (passes unmodified on base) -> passou-na-base (WOULD be refused today)" \
@@ -434,6 +450,16 @@ eq "real-git+origin: toomanytests (16 files, exceeds cap) -> nao-consegui-medir 
 
 eq "real-git+origin: nonexistent branch (fetch/rev-parse fails) -> nao-consegui-medir, fails open, never crashes" \
   "$(run_live_basetest_check feat/does-not-exist)" "nao-consegui-medir"
+
+# ga-x4mkk2: when the rig IS the repo toplevel there is no "outside" — the count is a MEASURED 0
+# (real selftests changed, all of them inside), never a blank; and when no base could be
+# resolved it is `unknown`, which must not read as that same 0.
+eq "toplevel rig: badtest (a selftest changed, all inside) -> verdict unchanged, outside-subtree=0" \
+  "$(run_live_check_full feat/badtest)" "passou-na-base outside-subtree=0"
+eq "toplevel rig: notest -> verdict unchanged, outside-subtree=0 (measured zero)" \
+  "$(run_live_check_full feat/notest)" "sem-teste-novo outside-subtree=0"
+eq "toplevel rig: nonexistent branch (no base) -> nao-consegui-medir, outside-subtree=unknown, NOT 0" \
+  "$(run_live_check_full feat/does-not-exist)" "nao-consegui-medir outside-subtree=unknown"
 
 # ── ga-yl1k3w: a selftest REPAIR is satisfiable, a no-op edit is still refused ──
 eq "real-git+origin: repair (old form RED on base, new form green) -> consertou-teste-vermelho (non-blocking; before ga-yl1k3w this was passou-na-base = refused)" \
@@ -500,6 +526,13 @@ cat > "$SUB_SEED/sub/lib/sigkill.selftest.sh" <<'SIGKILLEOF'
 #!/usr/bin/env bash
 kill -9 $$
 SIGKILLEOF
+# ga-x4mkk2: selftests that live OUTSIDE the rig subtree (sub/) — the shape of the 4
+# selftests (of 304) in the real repo that the arm-B detection, scoped to the -C
+# directory, cannot see. sub-other/ shares the "sub" NAME prefix on purpose: a subtree
+# test that forgets the trailing slash would file it as inside.
+mkdir -p "$SUB_SEED/top/lib" "$SUB_SEED/sub-other/lib"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_SEED/top/lib/outside.selftest.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_SEED/sub-other/lib/sibling.selftest.sh"
 git -C "$SUB_SEED" add -A
 git -C "$SUB_SEED" commit -q -m base
 git -C "$SUB_SEED" remote add origin "$SUB_ORIGIN"
@@ -526,6 +559,44 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_CLONE/sub/lib/brand-new.selftest.
 git -C "$SUB_CLONE" add -A
 git -C "$SUB_CLONE" commit -q -m "test: add a new always-green selftest"
 git -C "$SUB_CLONE" push -q origin feat/added-sub
+
+# ga-x4mkk2 branches: changed selftests OUTSIDE sub/ (the arm-B detection is blind to them).
+# feat/outside-only-sub: the ONLY changed selftest is outside the subtree.
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/outside-only-sub
+printf '# cosmetic edit\n' >> "$SUB_CLONE/top/lib/outside.selftest.sh"
+git -C "$SUB_CLONE" commit -q -am "chore: touch a selftest outside the rig subtree"
+git -C "$SUB_CLONE" push -q origin feat/outside-only-sub
+# feat/outside-two-sub: TWO outside — one modified, one ADDED four levels deep (proves the
+# wildcard crosses directory separators).
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/outside-two-sub
+printf '# cosmetic edit\n' >> "$SUB_CLONE/top/lib/outside.selftest.sh"
+mkdir -p "$SUB_CLONE/top/a/b/c"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_CLONE/top/a/b/c/deep.selftest.sh"
+git -C "$SUB_CLONE" add -A
+git -C "$SUB_CLONE" commit -q -m "test: two selftests outside the rig subtree"
+git -C "$SUB_CLONE" push -q origin feat/outside-two-sub
+# feat/outside-and-inside-sub: a REPAIR inside the subtree + an edit outside it.
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/outside-and-inside-sub
+git -C "$SUB_CLONE" show main:sub/lib/green.selftest.sh > "$SUB_CLONE/sub/lib/red.selftest.sh"
+printf '# cosmetic edit\n' >> "$SUB_CLONE/top/lib/outside.selftest.sh"
+git -C "$SUB_CLONE" commit -q -am "fix: repair a selftest inside the subtree, touch one outside"
+git -C "$SUB_CLONE" push -q origin feat/outside-and-inside-sub
+# feat/sibling-prefix-sub: sub-other/ is OUTSIDE sub/ even though its name starts with "sub".
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/sibling-prefix-sub
+printf '# cosmetic edit\n' >> "$SUB_CLONE/sub-other/lib/sibling.selftest.sh"
+git -C "$SUB_CLONE" commit -q -am "chore: touch a selftest in a sibling dir sharing the sub prefix"
+git -C "$SUB_CLONE" push -q origin feat/sibling-prefix-sub
+# feat/outside-deleted-sub: an outside selftest is DELETED. The detection filters AM, so the
+# count must too — otherwise the two numbers stop being comparable.
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/outside-deleted-sub
+git -C "$SUB_CLONE" rm -q "top/lib/outside.selftest.sh"
+git -C "$SUB_CLONE" commit -q -m "chore: delete a selftest outside the rig subtree"
+git -C "$SUB_CLONE" push -q origin feat/outside-deleted-sub
 git -C "$SUB_CLONE" checkout -q main
 
 # Fixture preconditions — without these the block below could pass vacuously.
@@ -569,6 +640,60 @@ eq "old_state: old form killed by SIGKILL (exit 137) -> unknown, NOT old-fails" 
 git -C "$SUB_RIG" worktree remove --force "$_SS_WT" 2>/dev/null || rm -rf "$_SS_WT" 2>/dev/null
 _SS_LEFTOVER=$(git -C "$SUB_RIG" worktree list 2>/dev/null | grep -c -E "gate-rstae-selftest-(wt|subold)" || true)
 eq "subdir rig: no leftover linked worktrees after the subdir-topology runs" "${_SS_LEFTOVER:-0}" "0"
+
+# ── ga-x4mkk2: a changed selftest OUTSIDE the rig subtree is counted, never silent ──
+# The detection above is scoped to the -C directory (a subdirectory of the repo), so a
+# submission whose only changed selftest lives elsewhere reads as sem-teste-novo — the
+# same look as "no test at all". Each line below reads the VERDICT and the COUNT from one
+# run: the verdict must be exactly what it was before this bead (option 1: detection
+# only, the arm-B experiment is untouched) while the count makes the blind spot visible.
+eq "subdir rig: ONLY selftest changed is outside sub/ -> verdict unchanged (sem-teste-novo), outside-subtree=1" \
+  "$(run_live_check_full feat/outside-only-sub)" "sem-teste-novo outside-subtree=1"
+eq "subdir rig: two outside (one modified, one ADDED 4 levels deep) -> outside-subtree=2 (the wildcard crosses directory separators)" \
+  "$(run_live_check_full feat/outside-two-sub)" "sem-teste-novo outside-subtree=2"
+eq "subdir rig: REPAIR inside + edit outside -> verdict unchanged (consertou-teste-vermelho), outside-subtree=1" \
+  "$(run_live_check_full feat/outside-and-inside-sub)" "consertou-teste-vermelho outside-subtree=1"
+eq "subdir rig: sub-other/ (name starts with 'sub') is OUTSIDE sub/ -> outside-subtree=1 (subtree test needs the trailing slash)" \
+  "$(run_live_check_full feat/sibling-prefix-sub)" "sem-teste-novo outside-subtree=1"
+eq "subdir rig: a DELETED outside selftest is not counted (same AM filter as the detection) -> outside-subtree=0" \
+  "$(run_live_check_full feat/outside-deleted-sub)" "sem-teste-novo outside-subtree=0"
+eq "subdir rig: repair, everything inside -> verdict unchanged, outside-subtree=0 (measured zero, not blank)" \
+  "$(run_live_check_full feat/repair-sub)" "consertou-teste-vermelho outside-subtree=0"
+eq "subdir rig: no-op edit inside -> still refusable (passou-na-base), outside-subtree=0" \
+  "$(run_live_check_full feat/noop-sub)" "passou-na-base outside-subtree=0"
+eq "subdir rig: ADDED selftest inside -> still refusable (passou-na-base), outside-subtree=0" \
+  "$(run_live_check_full feat/added-sub)" "passou-na-base outside-subtree=0"
+eq "subdir rig: nonexistent branch (no base) -> nao-consegui-medir, outside-subtree=unknown, NOT 0" \
+  "$(run_live_check_full feat/does-not-exist)" "nao-consegui-medir outside-subtree=unknown"
+
+# Direct three-state tests of the helper itself. `unknown` (could not ask git) must never
+# collapse into `0` (asked, and the answer was none) — that is the family-#2 defect this
+# whole check exists downstream of, and a blind-spot counter that reads 0 on error would
+# hide the blind spot exactly when it is widest.
+git -C "$SUB_RIG" fetch -q origin main feat/outside-two-sub 2>/dev/null
+_XK_BASE=$(git -C "$SUB_RIG" rev-parse origin/main)
+_XK_HEAD=$(git -C "$SUB_RIG" rev-parse origin/feat/outside-two-sub)
+_XK_ZERO="0000000000000000000000000000000000000000"
+eq "outside_subtree: two outside selftests between base and head -> 2" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_BASE" "$_XK_HEAD")" "2"
+eq "outside_subtree: empty range (base..base) is a MEASURED zero -> 0" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_BASE" "$_XK_BASE")" "0"
+eq "outside_subtree: unresolvable head sha (diff ERRORS) -> unknown, NOT 0" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_BASE" "$_XK_ZERO")" "unknown"
+eq "outside_subtree: unresolvable base sha (diff ERRORS) -> unknown, NOT 0" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_ZERO" "$_XK_HEAD")" "unknown"
+eq "outside_subtree: empty rig -> unknown" \
+  "$(gate_base_test_outside_subtree "" "$_XK_BASE" "$_XK_HEAD")" "unknown"
+eq "outside_subtree: empty base -> unknown" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "" "$_XK_HEAD")" "unknown"
+eq "outside_subtree: empty head -> unknown" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_BASE" "")" "unknown"
+_XK_NOTREPO=$(mktemp -d "${TMPDIR:-/tmp}/gate-xk-notrepo.XXXXXX")
+eq "outside_subtree: rig is not a git repo -> unknown (an empty diff there must not read as 0)" \
+  "$(gate_base_test_outside_subtree "$_XK_NOTREPO" "$_XK_BASE" "$_XK_HEAD")" "unknown"
+rmdir "$_XK_NOTREPO" 2>/dev/null
+eq "outside_subtree: always exits 0 (safe under the guard's set -e even on 'unknown')" \
+  "$(gate_base_test_outside_subtree "" "" "" >/dev/null; echo $?)" "0"
 RIG_PATH="$_SAVED_RIG_PATH"
 
 # The call site's own third state: gate_base_test_old_state is documented to print
@@ -621,6 +746,13 @@ if [ -n "$VERDICT_DEF_LINE" ] && [ -n "$CUTOFF_LINE" ] && [ "$VERDICT_DEF_LINE" 
   ok "guard.sh: gate_base_test_verdict (L$VERDICT_DEF_LINE) defined BEFORE the GATE_GUARD_LIB_ONLY cutoff (L$CUTOFF_LINE)"
 else
   bad "REGRESSION (ga-zdkn1-class): gate_base_test_verdict def=${VERDICT_DEF_LINE:-missing} cutoff=${CUTOFF_LINE:-missing}"
+fi
+
+OUTSIDE_DEF_LINE=$(grep -n '^gate_base_test_outside_subtree() {' "$GUARD" | head -1 | cut -d: -f1)
+if [ -n "$OUTSIDE_DEF_LINE" ] && [ -n "$CUTOFF_LINE" ] && [ "$OUTSIDE_DEF_LINE" -lt "$CUTOFF_LINE" ]; then
+  ok "guard.sh: gate_base_test_outside_subtree (L$OUTSIDE_DEF_LINE) defined BEFORE the GATE_GUARD_LIB_ONLY cutoff (L$CUTOFF_LINE) (ga-x4mkk2)"
+else
+  bad "REGRESSION (ga-zdkn1-class): gate_base_test_outside_subtree def=${OUTSIDE_DEF_LINE:-missing} cutoff=${CUTOFF_LINE:-missing}"
 fi
 
 OLDSTATE_DEF_LINE=$(grep -n '^gate_base_test_old_state() {' "$GUARD" | head -1 | cut -d: -f1)
@@ -701,6 +833,28 @@ echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*repaired=\$_ABT_REPAIRED unclassif
   && ok "guard.sh: AB-BASE-TEST log line carries repaired=/unclassified= (appended, existing fields untouched)" \
   || bad "guard.sh: AB-BASE-TEST log line lacks repaired=/unclassified="
 
+# ga-x4mkk2: the outside-subtree count is arm-B-only, starts as `unknown` (never measured is
+# not 0), is measured with the REAL helper against the same base/head the detection uses, is
+# logged as the LAST field (existing fields untouched), and is NOT an input to any verdict or
+# refusal — option 1 of the bead is detection only.
+OUTSIDE_CALL_LINE=$(echo "$ABT_BLOCK" | grep -n 'gate_base_test_outside_subtree "\$RIG_PATH" "\$_ABT_BASE" "\$_ABT_BRANCH_SHA"' | head -1 | cut -d: -f1)
+if [ -n "$ARM_GATE_LINE" ] && [ -n "$OUTSIDE_CALL_LINE" ] && [ "$ARM_GATE_LINE" -lt "$OUTSIDE_CALL_LINE" ]; then
+  ok "guard.sh: gate_base_test_outside_subtree is called only after the arm-B gate (block-relative L$OUTSIDE_CALL_LINE > L$ARM_GATE_LINE) with RIG_PATH/base/branch sha — arm A never runs it"
+else
+  bad "REGRESSION: outside-subtree call line=${OUTSIDE_CALL_LINE:-missing} arm gate=${ARM_GATE_LINE:-missing} — arm A might run it, or it is not wired to the same base/head as the detection"
+fi
+
+echo "$ABT_BLOCK" | grep -E '^[[:space:]]*_ABT_OUTSIDE="unknown"' >/dev/null \
+  && ok "guard.sh: _ABT_OUTSIDE starts as \"unknown\" (a count that was never measured cannot read as 0)" \
+  || bad "guard.sh: _ABT_OUTSIDE is not initialised to \"unknown\" — an unmeasured submission could log a blank or a 0"
+
+echo "$ABT_BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
+  && ok "guard.sh: AB-BASE-TEST log line ends with outside-subtree=\$_ABT_OUTSIDE (appended last, existing fields untouched)" \
+  || bad "guard.sh: AB-BASE-TEST log line does not end with outside-subtree=\$_ABT_OUTSIDE"
+
+_XK_LEAK=$(echo "$ABT_BLOCK" | grep -E 'gate_base_test_verdict|"\$_ABT_VERDICT" = ' | grep -c '_ABT_OUTSIDE')
+eq "guard.sh: _ABT_OUTSIDE appears on NO verdict-computing or refusal line (count is logged, never decided on)" "${_XK_LEAK:-0}" "0"
+
 # The tally: "counted separately" only means something if scripts/gate-ab-apuracao.sh
 # really aggregates by verdict. That section was silent for two independent reasons
 # (it read the DISPATCHER log, which never gets AB-BASE-TEST lines, and used \S in a
@@ -713,10 +867,10 @@ else
   _APU_PIPE=$(awk "/^  grep -oE 'AB-BASE-TEST/,/head -10/" "$_APU")
   _APU_LOG=$(mktemp "${TMPDIR:-/tmp}/gate-rstae-apu.XXXXXX")
   {
-    echo "[2026-09-25 09:21:37] [quality-gate-guard] AB-BASE-TEST bead=ga-a arm=B verdict=passou-na-base branch=fix/ga-a base=aaa detected=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0"
+    echo "[2026-09-25 09:21:37] [quality-gate-guard] AB-BASE-TEST bead=ga-a arm=B verdict=passou-na-base branch=fix/ga-a base=aaa detected=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 outside-subtree=1"
     echo "[2026-09-25 09:22:37] [quality-gate-guard] AB-BASE-TEST bead=ga-b arm=B verdict=passou-na-base branch=fix/ga-b base=bbb detected=1 copy_ok=1 ran=1 failed=0"
-    echo "[2026-09-25 09:23:37] [quality-gate-guard] AB-BASE-TEST bead=ga-c arm=B verdict=consertou-teste-vermelho branch=fix/ga-c base=ccc detected=1 copy_ok=1 ran=1 failed=0 repaired=1 unclassified=0"
-    echo "[2026-09-25 09:24:37] [quality-gate-guard] AB-BASE-TEST bead=ga-d arm=B verdict=reprovou-na-base branch=fix/ga-d base=ddd detected=1 copy_ok=1 ran=1 failed=1 repaired=0 unclassified=0"
+    echo "[2026-09-25 09:23:37] [quality-gate-guard] AB-BASE-TEST bead=ga-c arm=B verdict=consertou-teste-vermelho branch=fix/ga-c base=ccc detected=1 copy_ok=1 ran=1 failed=0 repaired=1 unclassified=0 outside-subtree=0"
+    echo "[2026-09-25 09:24:37] [quality-gate-guard] AB-BASE-TEST bead=ga-d arm=B verdict=reprovou-na-base branch=fix/ga-d base=ddd detected=1 copy_ok=1 ran=1 failed=1 repaired=0 unclassified=0 outside-subtree=unknown"
   } > "$_APU_LOG"
   _APU_OUT=$(GUARD_LOG="$_APU_LOG" eval "$_APU_PIPE" 2>/dev/null | sed -E 's/^ +//; s/ +/ /g')
   rm -f "$_APU_LOG"
