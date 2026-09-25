@@ -1,0 +1,21 @@
+# ga-aijm2v.5 (Camada 1 da portaria, regra 2): keep the engine's nudge queue free of
+# duplicate / orphaned WARNINGS ("check for assigned work") without an engine patch.
+#
+# Measured 2026-09-25: 173 items pending, 79 of them that warning (22 for dog-2 alone),
+# each injected as a "deferred reminder" into its target's next turn and each costing a
+# turn re-reading the whole context. TTL is 24 h, so they piled up for a day.
+# Rule 1 (nudge-on-route-gated) stops the main producer; this order clears what any
+# producer leaves behind and is the backstop if a producer regresses.
+#
+# It takes the engine's own queue flock, moves items pending -> dead as `superseded`
+# (the engine's terminal classification, so the backing bead is repaired by the engine)
+# and never touches work items (reviewer tasks, the Pilot's DISPATCH_TASK). See
+# nudge-queue-hygiene.py's header for the full safety argument.
+#
+# 30m: the queue only needs to be tidy relative to a 24 h TTL, and a run is one 8 MB
+# JSON read + (only when something moves) one atomic rewrite under the lock.
+[order]
+description = "Dead-letter duplicate and orphaned 'check for assigned work' nudges in the engine queue (ga-aijm2v.5)"
+trigger = "cooldown"
+interval = "30m"
+exec = "$PACK_DIR/assets/scripts/nudge-queue-hygiene.sh"
