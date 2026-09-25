@@ -38,6 +38,7 @@ How it mutates the queue safely (no engine patch, mirrors nudgequeue.WithState):
 Default is a DRY RUN; the order passes --apply.
 """
 import argparse
+import contextlib
 import datetime
 import fcntl
 import json
@@ -160,10 +161,10 @@ def atomic_write(path, text):
         os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
-        try:
+        # Error path: the ORIGINAL error is re-raised below; a temp file we could not remove
+        # is only litter and must not mask it.
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
-        except OSError:
-            pass
         raise
 
 
@@ -241,8 +242,9 @@ def run(args):
             os.makedirs(os.path.dirname(args.log), exist_ok=True)
             with open(args.log, "a") as fh:
                 fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            # The run log is the before/after record: a failure to append must be seen, not swallowed.
+            print("nudge-queue-hygiene: could not append to %s: %s" % (args.log, exc), file=sys.stderr)
     return 0
 
 

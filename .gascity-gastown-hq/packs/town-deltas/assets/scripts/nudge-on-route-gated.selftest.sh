@@ -210,6 +210,39 @@ if [ "$LEGACY" = "0" ]; then
   eq "sessions_skipped_busy"                              "$(echo "$LINE" | jq -r '.sessions_skipped_busy')" "1"
   eq "suppressed.not_open"                                "$(echo "$LINE" | jq -r '.suppressed.not_open')" "2"
 
+  echo "== 12. a run that could not look says so: 'could not look' is never the same line as 'nothing to do'"
+  new_case c12
+  : > "$FX/events.fail"
+  run_script
+  eq "events unreadable => logged as not_run" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null | jq -r '.not_run')" "events_unreadable"
+  new_case c12b        # no events at all is a legitimate quiet run: no not_run line
+  run_script
+  _nr="$(grep -c not_run "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)"
+  eq "an empty event stream is NOT reported as a failure (no not_run line)" "${_nr:-0}" "0"
+
+  echo "== 13. a corrupt dedup state does not stop the run, and is counted (may re-nudge once)"
+  new_case c13
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  echo 'not json {' > "$STATE/nudge-on-route-gated-state.json"
+  run_script
+  eq "still wakes the idle member" "$(nudged)" "gastown.dog-1"
+  eq "state_reset counted in the run line" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" | jq -r '.degraded.state_reset')" "1"
+
+  echo "== 14. a live lock held by another run: skipped, and logged as such"
+  new_case c14
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  sleep 30 & HOLDER=$!
+  mkdir "$STATE/nudge-on-route-gated.lock.d"; echo "$HOLDER" > "$STATE/nudge-on-route-gated.lock.d/pid"
+  run_script
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  eq "nothing nudged while another run holds the lock" "$(count_nudges)" "0"
+  eq "and the skip is logged" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null | jq -r '.not_run')" "lock_held"
+  new_case c14b        # stale lock (dead pid) is reclaimed
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  mkdir "$STATE/nudge-on-route-gated.lock.d"; echo 999999 > "$STATE/nudge-on-route-gated.lock.d/pid"
+  run_script
+  eq "a lock whose owner is dead is reclaimed and the run proceeds" "$(nudged)" "gastown.dog-1"
+
   echo "== 11. store map resolves prefixes from local files (no gc rig list)"
   # shellcheck disable=SC1090
   GC_CITY="$SBX/mapcity" source "$NEW_SCRIPT" --lib

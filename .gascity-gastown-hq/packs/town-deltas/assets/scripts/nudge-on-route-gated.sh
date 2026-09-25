@@ -19,8 +19,8 @@
 #      one per pair plus one `gc session nudge` per member, sequentially, so a
 #      run blew the order timeout (order.failed 5m02s after order.fired). Its
 #      dedup state is written ONCE at the very end, so a killed run persisted
-#      nothing and the next run re-nudged the same pairs — 77 duplicate "check
-#      for assigned work" items were sitting in the queue for dog-1..6 alone.
+#      nothing and the next run re-nudged the same pairs — 79 "check for assigned
+#      work" items were pending in the queue (66 of them for dog-1..6).
 #
 # What this order does instead, in order of cost (cheapest filter first):
 #   a. Reduce the recent stream to the LAST event per bead and classify it from
@@ -218,13 +218,33 @@ gnr_fetch_ready() {
 }
 
 # ── dedup state, persisted incrementally ─────────────────────────────────────
+GNR_N_STATE_RESET=0; GNR_N_STATE_WRITE_FAILED=0
 gnr_state_load() {
   GNR_STATE="$(cat "$GNR_STATE_FILE" 2>/dev/null || true)"
-  printf '%s' "$GNR_STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || GNR_STATE='{}'
+  if ! printf '%s' "$GNR_STATE" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    # Missing is normal on the first run; an EXISTING file that does not parse is not —
+    # starting empty may re-nudge each pair once, so say so and count it.
+    if [ -s "$GNR_STATE_FILE" ]; then
+      GNR_N_STATE_RESET=$((GNR_N_STATE_RESET + 1))
+      gnr_log "state file $GNR_STATE_FILE is unreadable — starting empty (each pair may be nudged once more)"
+    fi
+    GNR_STATE='{}'
+  fi
 }
 gnr_state_write() {
-  _tmp="$(mktemp "$GNR_STATE_DIR/.nudge-on-route-gated-state.XXXXXX")" || return 1
-  printf '%s\n' "$GNR_STATE" > "$_tmp" && mv -f "$_tmp" "$GNR_STATE_FILE"
+  _tmp="$(mktemp "$GNR_STATE_DIR/.nudge-on-route-gated-state.XXXXXX")" || { GNR_N_STATE_WRITE_FAILED=$((GNR_N_STATE_WRITE_FAILED + 1)); return 1; }
+  if printf '%s\n' "$GNR_STATE" > "$_tmp" && mv -f "$_tmp" "$GNR_STATE_FILE"; then return 0; fi
+  # A state that could not be saved means the NEXT run re-nudges: never silent.
+  GNR_N_STATE_WRITE_FAILED=$((GNR_N_STATE_WRITE_FAILED + 1))
+  gnr_log "could not persist the dedup state to $GNR_STATE_FILE"
+  rm -f "$_tmp" 2>/dev/null || true
+  return 1
+}
+
+# A run that could not do its job leaves ONE line in the run log saying why, so
+# "quiet" in the log always means "nothing to do" and never "could not look".
+gnr_runlog_event() {
+  jq -cn --arg ts "$(gnr_iso)" --arg what "$1" '{ts:$ts, not_run:$what}' >> "$GNR_RUNLOG" 2>/dev/null || true
 }
 # Record <key>=now and flush NOW — a run killed one nudge later must not forget it.
 gnr_state_put() {
@@ -320,18 +340,29 @@ gnr_main() {
     echo "nudge-on-route-gated: jq is required but not found in PATH" >&2
     exit 1
   fi
-  if ! gnr_lock; then gnr_log "another run holds the lock — skipping (events stay inside the ${GNR_LOOKBACK} lookback)"; exit 0; fi
+  if ! gnr_lock; then
+    gnr_log "another run holds the lock — skipping (events stay inside the ${GNR_LOOKBACK} lookback)"
+    gnr_runlog_event lock_held
+    exit 0
+  fi
   GNR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/nudge-on-route-gated.XXXXXX")" || { gnr_unlock; exit 0; }
   trap 'rm -rf "$GNR_RUN"; gnr_unlock' EXIT
   _t0="$(gnr_now)"
 
   # Best-effort: an unreadable stream (API down) must not crash the order loop.
-  _events="$(gnr_run gc --city "$CITY" events --type bead.updated --since "$GNR_LOOKBACK" 2>/dev/null)" || exit 0
+  if ! _events="$(gnr_run gc --city "$CITY" events --type bead.updated --since "$GNR_LOOKBACK" 2>/dev/null)"; then
+    gnr_runlog_event events_unreadable     # could not look — distinct from "no events"
+    exit 0
+  fi
   [ -n "$_events" ] || exit 0
 
   gnr_state_load
   GNR_STORE_MAP="$(gnr_store_map)"
-  _rows="$(printf '%s\n' "$_events" | gnr_classify "$GNR_STATE" "$(gnr_now)")" || _rows=""
+  if ! _rows="$(printf '%s\n' "$_events" | gnr_classify "$GNR_STATE" "$(gnr_now)")"; then
+    gnr_log "could not classify the event stream (jq failed) — nothing nudged this run"
+    gnr_runlog_event classify_failed
+    exit 0
+  fi
 
   GNR_N_NUDGED=0; GNR_N_SKIPPED_BUSY=0; GNR_N_MEMBERS_FAILED=0; GNR_N_HOLDERS_UNKNOWN=0
   _c_routed=0; _c_not_open=0; _c_assigned=0; _c_not_ready=0; _c_already=0
@@ -408,12 +439,14 @@ EOF
     --argjson none_ok "$_c_none_ok" --argjson members_failed "$GNR_N_MEMBERS_FAILED" \
     --argjson holders_unknown "$GNR_N_HOLDERS_UNKNOWN" --argjson ready_unknown "$_c_ready_unknown" \
     --argjson deferred "$_c_deferred" --argjson budget_hit "$_budget_hit" \
+    --argjson state_reset "$GNR_N_STATE_RESET" --argjson state_write_failed "$GNR_N_STATE_WRITE_FAILED" \
     '{ts:$ts, dur_s:$dur, routed_beads:$routed, legacy_pairs:$legacy, gated_pairs:$actionable,
       nudged_pairs:$nudged_pairs, sessions_nudged:$sessions_nudged, sessions_skipped_busy:$sessions_skipped_busy,
       suppressed:{not_open:$not_open, assigned:$assigned, not_ready_label:$not_ready, already_nudged:$already,
                   not_ready_deps:$not_ready_deps, all_busy:$all_busy},
       degraded:{none_ok:$none_ok, members_lookup_failed:$members_failed, holders_unknown:$holders_unknown,
-                ready_unknown:$ready_unknown, deferred_over_budget:$deferred, budget_hit:$budget_hit}}' >> "$GNR_RUNLOG" 2>/dev/null || true
+                ready_unknown:$ready_unknown, deferred_over_budget:$deferred, budget_hit:$budget_hit,
+                state_reset:$state_reset, state_write_failed:$state_write_failed}}' >> "$GNR_RUNLOG" 2>/dev/null || true
   # Keep the run log bounded.
   if [ "$(wc -l < "$GNR_RUNLOG" 2>/dev/null || echo 0)" -gt "$GNR_RUNLOG_MAX_LINES" ]; then
     tail -n "$(( GNR_RUNLOG_MAX_LINES / 2 ))" "$GNR_RUNLOG" > "$GNR_RUNLOG.tmp" 2>/dev/null && mv -f "$GNR_RUNLOG.tmp" "$GNR_RUNLOG"
