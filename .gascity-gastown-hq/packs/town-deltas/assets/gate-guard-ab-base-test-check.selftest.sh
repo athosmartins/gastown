@@ -395,8 +395,9 @@ run_live_basetest_check() {
               # ga-yl1k3w: the new form passed on base; ask the REAL guard function
               # (not a copy of it) what base's own copy of this file does on base.
               case "$(gate_base_test_old_state "$RIG_PATH" "$base" "$wt" "$f")" in
-                old-fails) repaired=$((repaired + 1)) ;;
-                unknown)   unclassified=$((unclassified + 1)) ;;
+                old-fails)         repaired=$((repaired + 1)) ;;
+                added|old-passes)  : ;;
+                *)                 unclassified=$((unclassified + 1)) ;;
               esac
             else
               rc=$?
@@ -468,6 +469,126 @@ eq "old_state: empty file arg -> unknown" \
 eq "old_state: always exits 0 (safe under the guard's set -e even on 'unknown')" \
   "$(gate_base_test_old_state "$RIG_PATH" "" "$_OS_WT" x >/dev/null; echo $?)" "0"
 git -C "$RIG_PATH" worktree remove --force "$_OS_WT" 2>/dev/null || rm -rf "$_OS_WT" 2>/dev/null
+
+# ── ga-yl1k3w gate feedback 1/3 (gate ga-ql6pdl): the PRODUCTION topology ────
+# Every fixture above clones origin as a TOP-LEVEL repo, so RIG_PATH == the repo
+# toplevel and a path relative to the -C dir equals a path relative to the root.
+# The gascity rig is not shaped like that: its RIG_PATH is a SUBDIRECTORY of the
+# repo (/Users/athos/gt/.gascity-gastown-hq inside /Users/athos/gt), while the
+# selftest paths the guard feeds gate_base_test_old_state come from
+# `git diff --name-only` — ROOT-relative. A plain `git ls-tree` resolves its
+# path against the -C dir, exits 0 with EMPTY output for a file that exists on
+# base, and the function called a real repair `added` (=> refused). 74/74 stayed
+# green with that bug present because no fixture had this shape. This one does.
+SUB_ORIGIN="$TMPD/sub-origin.git"
+SUB_SEED="$TMPD/sub-seed"
+SUB_CLONE="$TMPD/sub-rig-clone"    # the repo TOPLEVEL
+SUB_RIG="$SUB_CLONE/sub"           # what the guard is handed as RIG_PATH
+git init -q --bare "$SUB_ORIGIN"
+git -C "$SUB_ORIGIN" symbolic-ref HEAD refs/heads/main
+git init -q -b main "$SUB_SEED"
+git -C "$SUB_SEED" config user.email "test@gascity.local"
+git -C "$SUB_SEED" config user.name "Test"
+mkdir -p "$SUB_SEED/sub/lib"
+cp "$TMPD/seed/lib/add.sh" "$TMPD/seed/lib/red.selftest.sh" "$TMPD/seed/lib/green.selftest.sh" "$SUB_SEED/sub/lib/"
+# Exit-status boundary fixtures (old-fails must only be claimed for a test that
+# RAN and went red; 126/127/signal are "could not tell", not "was red").
+printf '#!/usr/bin/env bash\nexit 125\n' > "$SUB_SEED/sub/lib/exit125.selftest.sh"
+printf '#!/usr/bin/env bash\nexit 126\n' > "$SUB_SEED/sub/lib/exit126.selftest.sh"
+printf '#!/usr/bin/env bash\nexit 127\n' > "$SUB_SEED/sub/lib/exit127.selftest.sh"
+cat > "$SUB_SEED/sub/lib/sigkill.selftest.sh" <<'SIGKILLEOF'
+#!/usr/bin/env bash
+kill -9 $$
+SIGKILLEOF
+git -C "$SUB_SEED" add -A
+git -C "$SUB_SEED" commit -q -m base
+git -C "$SUB_SEED" remote add origin "$SUB_ORIGIN"
+git -C "$SUB_SEED" push -q origin main
+git clone -q "$SUB_ORIGIN" "$SUB_CLONE"
+git -C "$SUB_CLONE" config user.email "test@gascity.local"
+git -C "$SUB_CLONE" config user.name "Test"
+
+# feat/repair-sub: the old red form is fixed to go green (the ga-97tqu7 shape).
+git -C "$SUB_CLONE" checkout -q -b feat/repair-sub
+git -C "$SUB_CLONE" show main:sub/lib/green.selftest.sh > "$SUB_CLONE/sub/lib/red.selftest.sh"
+git -C "$SUB_CLONE" commit -q -am "fix: repair the wrongly-red selftest"
+git -C "$SUB_CLONE" push -q origin feat/repair-sub
+# feat/noop-sub: an already-green selftest is edited but stays green in BOTH forms.
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/noop-sub
+printf '# cosmetic edit\n' >> "$SUB_CLONE/sub/lib/green.selftest.sh"
+git -C "$SUB_CLONE" commit -q -am "chore: touch an already-green selftest"
+git -C "$SUB_CLONE" push -q origin feat/noop-sub
+# feat/added-sub: a brand-new always-green selftest (there is no old form).
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/added-sub
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_CLONE/sub/lib/brand-new.selftest.sh"
+git -C "$SUB_CLONE" add -A
+git -C "$SUB_CLONE" commit -q -m "test: add a new always-green selftest"
+git -C "$SUB_CLONE" push -q origin feat/added-sub
+git -C "$SUB_CLONE" checkout -q main
+
+# Fixture preconditions — without these the block below could pass vacuously.
+eq "subdir-topology fixture: RIG_PATH really is a SUBDIRECTORY of the repo toplevel" \
+  "$(git -C "$SUB_RIG" rev-parse --show-prefix)" "sub/"
+_SS_BASE=$(git -C "$SUB_RIG" rev-parse origin/main)
+eq "subdir-topology fixture: a plain ls-tree on the ROOT-relative path is EMPTY from the subdir rig (the failure mode this block guards)" \
+  "$(git -C "$SUB_RIG" ls-tree "$_SS_BASE" -- sub/lib/red.selftest.sh)" ""
+[ -n "$(git -C "$SUB_RIG" ls-tree --full-tree "$_SS_BASE" -- sub/lib/red.selftest.sh)" ] \
+  && ok "subdir-topology fixture: ls-tree --full-tree finds that same path" \
+  || bad "subdir-topology fixture: ls-tree --full-tree did not find sub/lib/red.selftest.sh"
+
+_SAVED_RIG_PATH="$RIG_PATH"
+RIG_PATH="$SUB_RIG"
+eq "subdir rig, real-git+origin: repair (old red, new green) -> consertou-teste-vermelho (was passou-na-base = REFUSED before this fix)" \
+  "$(run_live_basetest_check feat/repair-sub)" "consertou-teste-vermelho"
+eq "subdir rig, real-git+origin: no-op edit (green in BOTH forms) -> passou-na-base (still refused in arm B)" \
+  "$(run_live_basetest_check feat/noop-sub)" "passou-na-base"
+eq "subdir rig, real-git+origin: ADDED selftest (no old form) -> passou-na-base (still refused in arm B)" \
+  "$(run_live_basetest_check feat/added-sub)" "passou-na-base"
+
+_SS_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-selftest-subold.XXXXXX")
+git -C "$SUB_RIG" worktree add --detach --quiet "$_SS_WT" "$_SS_BASE" 2>/dev/null
+eq "subdir rig, old_state: base copy red on base (root-relative path) -> old-fails, NOT added" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/red.selftest.sh)" "old-fails"
+eq "subdir rig, old_state: base copy green on base -> old-passes" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/green.selftest.sh)" "old-passes"
+eq "subdir rig, old_state: path genuinely absent on base -> added (--full-tree must not turn absence into an error)" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/brand-new.selftest.sh)" "added"
+eq "subdir rig, old_state: unresolvable base sha -> unknown (ls-tree error, not 'added')" \
+  "$(gate_base_test_old_state "$SUB_RIG" "0000000000000000000000000000000000000000" "$_SS_WT" sub/lib/red.selftest.sh)" "unknown"
+# old-fails is a positive claim ("the old test was red"): only an ordinary failure status may make it.
+eq "old_state: old form exits 125 (top of the ordinary-failure range) -> old-fails" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/exit125.selftest.sh)" "old-fails"
+eq "old_state: old form exits 126 (could not execute) -> unknown, NOT old-fails" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/exit126.selftest.sh)" "unknown"
+eq "old_state: old form exits 127 (command not found in the bare worktree) -> unknown, NOT old-fails" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/exit127.selftest.sh)" "unknown"
+eq "old_state: old form killed by SIGKILL (exit 137) -> unknown, NOT old-fails" \
+  "$(gate_base_test_old_state "$SUB_RIG" "$_SS_BASE" "$_SS_WT" sub/lib/sigkill.selftest.sh)" "unknown"
+git -C "$SUB_RIG" worktree remove --force "$_SS_WT" 2>/dev/null || rm -rf "$_SS_WT" 2>/dev/null
+_SS_LEFTOVER=$(git -C "$SUB_RIG" worktree list 2>/dev/null | grep -c -E "gate-rstae-selftest-(wt|subold)" || true)
+eq "subdir rig: no leftover linked worktrees after the subdir-topology runs" "${_SS_LEFTOVER:-0}" "0"
+RIG_PATH="$_SAVED_RIG_PATH"
+
+# The call site's own third state: gate_base_test_old_state is documented to print
+# exactly one word, but if it ever printed NOTHING (killed substitution) or an
+# unrecognised word, a `case` with only old-fails/unknown arms would count nothing,
+# the file would read "ran, passed, no repair, no doubt", and the verdict would be
+# passou-na-base = a REFUSED builder made from "I don't know". noopmod is the
+# fixture that is honestly refusable (green in both forms): with a healthy
+# function it stays passou-na-base (asserted above); with a function that cannot
+# answer it must degrade to nao-consegui-medir.
+_REAL_OLDSTATE_DEF=$(declare -f gate_base_test_old_state)
+gate_base_test_old_state() { printf ''; return 0; }
+eq "call site: old_state prints NOTHING -> nao-consegui-medir, NOT a refusal (don't-know must not become passou-na-base)" \
+  "$(run_live_basetest_check feat/noopmod)" "nao-consegui-medir"
+gate_base_test_old_state() { printf 'garbage'; return 0; }
+eq "call site: old_state prints an UNRECOGNISED word -> nao-consegui-medir, NOT a refusal" \
+  "$(run_live_basetest_check feat/noopmod)" "nao-consegui-medir"
+eval "$_REAL_OLDSTATE_DEF"
+eq "call site: real old_state restored after the stubs (noopmod is refusable again)" \
+  "$(run_live_basetest_check feat/noopmod)" "passou-na-base"
 
 # Worktree hygiene: after all the runs above, the RIG_PATH clone must have
 # no leftover linked worktrees and no stray temp directories — a leaked
@@ -570,6 +691,11 @@ fi
 echo "$ABT_BLOCK" | grep '_ABT_VERDICT=\$(gate_base_test_verdict "\$_ABT_DETECTED" "\$_ABT_COPY_OK" "\$_ABT_RAN" "\$_ABT_FAILED" "\$_ABT_REPAIRED" "\$_ABT_UNCLASSIFIED")' >/dev/null \
   && ok "guard.sh: verdict call passes repaired AND unclassified (6 args)" \
   || bad "guard.sh: verdict call does not pass both new counts — repairs would be re-refused"
+
+echo "$ABT_BLOCK" | grep -E '^[[:space:]]*added\|old-passes\)[[:space:]]+:[[:space:]]*;;' >/dev/null \
+  && echo "$ABT_BLOCK" | grep -E '^[[:space:]]*\*\)[[:space:]]+_ABT_UNCLASSIFIED=\$\(\(_ABT_UNCLASSIFIED \+ 1\)\) ;;' >/dev/null \
+  && ok "guard.sh: the old_state case names added|old-passes as the ONLY no-count answers and sends everything else (empty/garbage/unknown) to unclassified" \
+  || bad "guard.sh: the old_state case lacks the added|old-passes / *) unclassified arms — an empty or unrecognised answer would read as a refusal"
 
 echo "$ABT_BLOCK" | grep 'AB-BASE-TEST bead=.*repaired=\$_ABT_REPAIRED unclassified=\$_ABT_UNCLASSIFIED' >/dev/null \
   && ok "guard.sh: AB-BASE-TEST log line carries repaired=/unclassified= (appended, existing fields untouched)" \
