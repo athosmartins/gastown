@@ -132,11 +132,19 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # for this source-bead, so it clears gate:reviewing too (tagged wa-qq33j,
 # same convention) — 13 wa-qq33j-tagged (9 pre-existing + 1 ga-k2wjn + 1
 # ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii) + 2 ga-n2cpe-tagged = 15.
+# ga-hwzzou (2026-09-25) added a 16th site: the own-hold branch (IS_OWN_HOLD),
+# the mirror of ga-rhzbii's — a PASSing branch finds the source bead ALREADY
+# held (delivery:pending-restart / delivery:partial) by an EARLIER delivery, or
+# cannot read its labels, and holds instead of closing. The gate PASSED and
+# reviewing is over, just the CLOSE is deferred, so it clears gate:reviewing
+# too (tagged wa-qq33j, same convention) — 14 wa-qq33j-tagged (9 pre-existing
+# + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou) + 2
+# ga-n2cpe-tagged = 16.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "15" ]; then
-  ok "total gate:reviewing clear call sites = 15 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "16" ]; then
+  ok "total gate:reviewing clear call sites = 16 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 15 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 16 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"

@@ -5607,6 +5607,79 @@ gate_sibling_hold_check() {
 }
 # SELFTEST-EXTRACT sibling-hold-check-fn: END
 
+# ── ga-hwzzou: does the source bead ALREADY wear a hold from an earlier PASS? ─
+# gate_own_hold_check <bead_city> <bead_id>
+#
+# The mirror of ga-wlhd07, in the opposite order. gate_sibling_hold_check above
+# looks at OTHER markers/gate-runs; it cannot see a hold the bead is already
+# wearing. Branch A (say, HQ) merges and its daemon verification says
+# NEEDS_GUARDED_RESTART: the daemon-hold branch labels the bead
+# delivery:pending-restart and leaves it open, and A's own marker closes as
+# gate-status:passed. When branch B (another repo) later PASSes with a clean
+# daemon verdict, every marker is closed, the sibling check finds nothing, and
+# the plain close ran — dropping A's hold with no trace. merged-bead-janitor.sh
+# already refuses to close a bead on that label; the dispatcher's own close did
+# not read it.
+#
+# Held labels:
+#   delivery:pending-restart  always. No override label exists; it is released by
+#                             hand once the daemon is confirmed live.
+#   delivery:partial          unless scope_covered:all is ALSO on the bead. That is
+#                             the documented override — the IS_PARTIAL branch above
+#                             skips its hold for it, and merged-bead-janitor.sh's
+#                             is_delivery_partial note says "if a human/Mayor adds it
+#                             and the bead is re-gated, the dispatcher's PASS path
+#                             closes it directly". Nothing ever strips delivery:partial,
+#                             so honouring it unconditionally here would leave that
+#                             recovery path unable to close anything.
+#
+# THREE outcomes, on their own global so the caller never infers one from another:
+#   ""            the read succeeded and neither hold label applies  → close
+#   "held"        the read succeeded and a hold label applies        → hold
+#   "unverified"  the read FAILED or came back unusable              → hold
+# "unverified" is the collapse this exists to prevent. SRC_LABELS (read at the top
+# of the PASS block through bd-list-cached.sh, `2>/dev/null || echo ""`) turns a
+# failed bd call into "no labels", which here would mean "no hold — close". And
+# exit status alone is not enough either: a failed `bd show --json` exits non-zero
+# but ALSO prints a JSON error object on stdout ({"error": ..., "schema_version":
+# 1}) with no .labels — read on its own, that is "no hold labels" too. So the read
+# must exit 0 AND yield an object whose .id is this bead; jq -e + select(.id == $id)
+# turns anything else (error object, [], null, another bead) into a non-zero jq exit.
+#
+# Read live, not through the 5s read cache: this is the verify-before-an-
+# irreversible-close read, same reasoning as _still_listed below. Do NOT add
+# 2>/dev/null to the bd or the jq call — a failure's own message must reach $LOG
+# (the dispatcher runs under `exec >> "$LOG" 2>&1`), the same contract as
+# gate_sibling_hold_check above.
+# Sets OWN_HOLD_KIND and OWN_HOLD_LABELS (space-joined). Always returns 0.
+# SELFTEST-EXTRACT own-hold-check-fn: BEGIN
+gate_own_hold_check() {
+  local bead_city="$1" bead_id="$2" _json="" _rc=0 _jrc=0
+  OWN_HOLD_KIND=""
+  OWN_HOLD_LABELS=""
+  _json=$(bd -C "$bead_city" show "$bead_id" --json) || _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    OWN_HOLD_LABELS=$(printf '%s' "$_json" | jq -er --arg id "$bead_id" '
+      (if type == "array" then .[0] else . end)
+      | select(type == "object" and .id == $id)
+      | (.labels // []) as $l
+      | [ $l[] | select(. == "delivery:pending-restart"
+                        or (. == "delivery:partial" and ($l | index("scope_covered:all") | not))) ]
+      | join(" ")') || _jrc=$?
+  fi
+  if [ "$_rc" -ne 0 ] || [ "$_jrc" -ne 0 ]; then
+    OWN_HOLD_KIND="unverified"
+    OWN_HOLD_LABELS=""
+    warn "ALERT: gate_own_hold_check could not read the labels of $bead_id (bd show rc=$_rc, jq rc=$_jrc) — hold labels UNKNOWN, holding instead of closing (ga-hwzzou)."
+    return 0
+  fi
+  if [ -n "$OWN_HOLD_LABELS" ]; then
+    OWN_HOLD_KIND="held"
+  fi
+  return 0
+}
+# SELFTEST-EXTRACT own-hold-check-fn: END
+
 # ── ga-eqjo: Steps 9-11 wrapped as a callable function ───────────────────────
 # No logic below changed from its historical inline form — pure relocation +
 # function-wrap so it is callable from TWO places: (a) the same-sweep fast
@@ -6907,6 +6980,11 @@ fi
       # delivered as branches in more than one repo/rig) — declared here for
       # the same reason as IS_DAEMON_HOLD above.
       IS_SIBLING_HOLD=0
+      # ga-hwzzou: set inside the BUG/TASK close branch below when the source
+      # bead ALREADY wears delivery:pending-restart / delivery:partial from an
+      # EARLIER delivery (or that read could not be verified) — declared here
+      # for the same reason as the two flags above.
+      IS_OWN_HOLD=0
       if [ "$IS_STORY" != "1" ]; then
         if printf '%s' "$SRC_LABELS" | grep "scope_covered:all" >/dev/null; then
           IS_PARTIAL=0
@@ -7493,6 +7571,11 @@ $DAEMON_HOLD_DETAIL" 2>/dev/null || true
           # story:approved, so it does not close this one. The bead comments
           # below say exactly that, including the manual action — they must
           # not promise a retry that does not exist.
+          # SELFTEST-EXTRACT pass-close-decision: BEGIN
+          # (ga-hwzzou: wraps the WHOLE close decision — sibling hold, own hold, and
+          # the close itself — so a selftest can run the real thing end to end and
+          # observe whether the bead is actually closed. The nested markers below
+          # are unaffected: they are only comments when this region is evaluated.)
           # SELFTEST-EXTRACT sibling-hold-block: BEGIN
           gate_sibling_hold_check "$GC_CITY" "$BEAD_ID"
           if [ -n "$SIBLING_HOLD_KIND" ]; then
@@ -7508,7 +7591,36 @@ $OPEN_SIBLINGS_FOR_CLOSE"
             fi
           fi
           # SELFTEST-EXTRACT sibling-hold-block: END
+          # ga-hwzzou: the bead can ALREADY be held by an EARLIER branch of the same
+          # delivery. This branch's own clean daemon verdict (DAEMON_HOLD_VERDICT
+          # empty — which is how the else branch was reached) says nothing about
+          # THAT branch's daemon or scope, and by now that branch's marker is closed,
+          # so the sibling check above cannot see it. Read the bead's own hold labels
+          # right before the close (gate_own_hold_check keeps error / none / present
+          # apart) and hold instead of closing when one applies. Skipped when a
+          # sibling hold already applies — no second bd read for a bead held anyway.
+          # Like the sibling hold it is NOT re-checked by a later sweep: the bead is
+          # released by hand, and the comment below says so rather than promising a
+          # retry. gate:passed (set above) keeps the Pilot from re-dispatching it, and
+          # IS_OWN_HOLD exempts it from the POST-MERGE re-spawn check below, mirroring
+          # IS_SIBLING_HOLD. Keep gate_own_hold_check free of any 2>/dev/null.
+          # SELFTEST-EXTRACT own-hold-block: BEGIN
           if [ "$IS_SIBLING_HOLD" != "1" ]; then
+            gate_own_hold_check "$BEAD_CITY" "$BEAD_ID"
+            if [ -n "$OWN_HOLD_KIND" ]; then
+              IS_OWN_HOLD=1
+              bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+              if [ "$OWN_HOLD_KIND" = "unverified" ]; then
+                log "Source bug/task $BEAD_ID PASSED+merged but its own hold labels could NOT be read (bd show failed or returned a payload that is not this bead — see the ALERT just above) — holding, NOT closing (ga-hwzzou). Hold labels are UNKNOWN, not confirmed present."
+                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): reading this bead own labels FAILED or came back unusable (a bd or jq call failed, or the payload was not this bead; the ALERT is in the dispatcher log), so whether an earlier delivery left it a hold (delivery:pending-restart / delivery:partial) is UNKNOWN — none is confirmed. Held instead of closed because closing on a false "no hold" would silently drop a daemon-verification or scope hold.\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: run `bd -C %s show %s` (keep the -C: a bare bd from another directory reads a different store, and a missing bead there is NOT "no hold labels") and check its labels; if neither delivery:pending-restart nor delivery:partial is present, close this bead by hand; otherwise resolve that hold first.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$BEAD_CITY" "$BEAD_ID")" 2>/dev/null || true
+              else
+                log "Source bug/task $BEAD_ID PASSED+merged but already carries a hold from an EARLIER delivery ($OWN_HOLD_LABELS) — holding, NOT closing (ga-hwzzou)."
+                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): this bead already carries a hold from an EARLIER delivery: %s.\n\ndelivery:pending-restart means an earlier merge left a daemon unverified or needing a guarded restart. delivery:partial means the bead body looked like it enumerates more deliverables than the one diff the gate reviewed (and scope_covered:all is not set). This branch clean PASS clears neither, and nothing here re-verifies them, so closing now would silently drop the hold. The bead stays open (gate:passed keeps the Pilot from re-dispatching it).\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: read the earlier PASS comment on this bead for what is still outstanding, resolve it, then close this bead by hand. If the earlier hold is already resolved and only the label was left behind, close it by hand now.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OWN_HOLD_LABELS")" 2>/dev/null || true
+              fi
+            fi
+          fi
+          # SELFTEST-EXTRACT own-hold-block: END
+          if [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ]; then
           # BUG/TASK, daemon-verified (or check skipped/not applicable/degraded)
           # → close it as before. bd list defaults to OPEN-only, so closing
           # removes the bead from EVERY open-work selector (Pilot Tier-1 bug &
@@ -7548,6 +7660,7 @@ $OPEN_SIBLINGS_FOR_CLOSE"
             warn "Could not close source bead $BEAD_ID even after lease-aware reclaim — re-pick vector remains, see post-merge verification below (ga-v5acl)"
           fi
           fi
+          # SELFTEST-EXTRACT pass-close-decision: END
         fi
       fi
 
@@ -7581,7 +7694,11 @@ $OPEN_SIBLINGS_FOR_CLOSE"
       #      same reason — deliberately left open+unassigned pending another
       #      repo/rig's still-open gate marker/run for this source-bead,
       #      same gate:passed protection.
-      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ] && [ "$IS_SIBLING_HOLD" != "1" ]; then
+      #      ga-hwzzou: a bead that ALREADY wears delivery:pending-restart /
+      #      delivery:partial from an earlier delivery (or whose labels could not
+      #      be read) is exempt for the same reason — deliberately left open
+      #      instead of closed over that hold, same gate:passed protection.
+      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ] && [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
       fi
