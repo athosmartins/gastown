@@ -25,16 +25,39 @@
 #      exceto gate:needs-fix (ali um fixer DEVE estar trabalhando; travado é
 #      stall de verdade). Ver gate_label_present()/bead_has_open_gate_marker().
 #   4. EXCETO se o transcript CONGELADO é porque o último turno do assignee
-#      terminou AGUARDANDO HUMANO, não travado (wa-y0620): transcript parado
-#      é o MESMO sinal que um agente saudável produz depois de perguntar algo
-#      e ceder o turno por design — Mayor confirmou 2 falsos-positivos reais
-#      assim no mesmo dia (2026-07-20: oracle-wa parado em "Sigo parado
-#      aguardando o mockup.", texto puro sem tool call; batista-wa parado
-#      numa pergunta aberta). Ação destrutiva (kill/shutdown-dance) nesse
-#      caso é dano puro numa sessão sã. Generaliza para o caso de texto puro
-#      o sinal que inflight-reclaim-guard.py's session_awaiting_human_input()
-#      (ga-nlaa) já usa só para AskUserQuestion. Ver
+#      é uma AskUserQuestion PENDENTE (wa-y0620, NARROWED por ga-dyf4fb):
+#      esse é o único caso que o transcript prova estruturalmente como
+#      "aguardando humano" — o mesmo sinal que inflight-reclaim-guard.py's
+#      session_awaiting_human_input() (ga-nlaa) já usa. Ação destrutiva
+#      (kill/shutdown-dance) nesse caso é dano puro numa sessão sã. Ver
 #      session_awaiting_human_input() abaixo.
+#
+#      Até ga-dyf4fb, end_turn-com-texto-puro (sem tool_use nenhum) TAMBÉM
+#      caía neste item — "Sigo parado aguardando o mockup." (oracle-wa,
+#      2026-07-20), texto puro sem tool call, era tratado como o MESMO
+#      sinal saudável de "perguntou e cedeu o turno". ga-dyf4fb (guia
+#      oficial Opus 5.5, redesenho pedido pelo Mayor) achou que essa MESMA
+#      forma — end_turn + texto, nada mais — é estruturalmente IDÊNTICA ao
+#      que o guia chama de parada indevida (resumo que anuncia o próximo
+#      passo sem executar; "sigo com X a não ser que prefira outra coisa";
+#      lista de decisões que não bloqueiam nada; parar porque o turno
+#      ficou longo ou um marco fechou) — não dá pra distinguir uma da
+#      outra só pelo transcript. Esse ramo foi REMOVIDO daqui; ver item 4b
+#      abaixo pro que substitui.
+#   4b. (ga-dyf4fb) end_turn-com-texto-puro agora passa por
+#      classify_frozen_turn() (abaixo) em vez de ser lido como
+#      "aguardando humano" por si só:
+#        - stop_reason=="refusal" → alerta PRÓPRIO (não é ociosidade nem
+#          espera legítima — é problema de PROMPT; nunca manda "continue"
+#          por cima). Ver classify_frozen_turn()/o bloco REFUSAL no loop.
+#        - texto puro + session_weakly_active_elsewhere() confirma a
+#          sessão tocada recentemente NOUTRO front (mesmo transcript, janela
+#          mais larga que TRANSCRIPT_FRESH_SEC) → sinal FRACO, log-only,
+#          sem resume-nudge nem mail (crew persistente ativo noutra frente,
+#          achado original deste bead).
+#        - texto puro sem nenhum sinal corroborante → cai na MESMA ladder
+#          de retomada que qualquer outro travamento (abaixo, item 8) —
+#          nunca mais suprime silenciosamente por conta própria.
 #   5. EXCETO se o assignee é uma identidade HUMANA, não um agente (ga-tiwmm):
 #      "sessão ausente" é o estado PERMANENTE e ESPERADO pra um humano
 #      trabalhando manualmente (e.g. athosmartins@gmail.com) — não é sinal de
@@ -113,6 +136,18 @@
 #      ter todo o conteúdo em main por outro commit/fatia (medido ao vivo no
 #      próprio dia deste bead, wa-x92yd). Ver has_unique_work() (critério e).
 #
+#      (ga-dyf4fb, redesign ponto 2 — "TETO de 2-3 retomadas por episódio;
+#      estourou => escala pro Mayor com o último texto do agente"): antes
+#      deste bead a ladder acima era SEMPRE uma única tentativa (grace
+#      esgotado sem resposta → escala direto). Agora manda até
+#      RESUME_MAX_ATTEMPTS (padrão 3) retomadas — cada uma com sua própria
+#      janela RESUME_GRACE_SEC — antes de escalar; a escalação final cita
+#      quantas tentativas e o último texto do agente (quando disponível).
+#      Contagem gravada na 3ª linha de RESUMEDIR/<bead-id> (um arquivo de
+#      2 linhas pré-existente — legado ou reatribuição — é tratado como já
+#      no teto, preservando o comportamento de retomada única de quem já
+#      tinha esse estado).
+#
 # ANTI-SPAM: uma escalação por bead por janela COOLDOWN_SEC (padrão 3h).
 #   Per-bead state: .gc/state/agent-stuck-escalation/<bead-id>
 #   Per-bead resume state (ga-nrkh92): .gc/state/agent-idle-resume/<bead-id>
@@ -144,7 +179,9 @@ STUCK_AGENT_SEC="${STUCK_AGENT_SEC:-3600}"   # 60min sem update → travado (ga-
 COOLDOWN_SEC="${COOLDOWN_SEC:-10800}"        # 3h antes de re-escalar o mesmo bead
 TRANSCRIPT_FRESH_SEC="${TRANSCRIPT_FRESH_SEC:-$STUCK_AGENT_SEC}"  # ga-hehi: transcript escrito há menos disso = avançando
 RESUME_GRACE_SEC="${RESUME_GRACE_SEC:-900}"  # ga-nrkh92: prazo após o nudge de retomada, antes de escalar por falta de resposta (~3 ciclos de StartInterval)
+RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-3}"  # ga-dyf4fb: teto de retomadas por episódio antes de escalar (redesenho Opus 5.5, ponto 2) — um registro de retomada LEGADO/externo (sem contagem, 2 linhas) é tratado como já-no-teto, preservando o comportamento de retomada única pré-existente para quem já tinha um estado gravado
 IDLE_CPU_SAMPLE_SEC="${IDLE_CPU_SAMPLE_SEC:-5}"  # ga-nrkh92: intervalo entre as 2 amostras de TIME acumulado do pane (pane_truly_idle)
+CREW_ELSEWHERE_ACTIVE_SEC="${CREW_ELSEWHERE_ACTIVE_SEC:-$(( ${TRANSCRIPT_FRESH_SEC:-3600} * 2 ))}"  # ga-dyf4fb: janela (deliberadamente MAIOR que TRANSCRIPT_FRESH_SEC) pra detectar "crew tocou a sessão recentemente, só não neste bead" — ver session_weakly_active_elsewhere()
 MAYOR_ADDR="${MAYOR_ADDR:-mayor}"
 DRY_RUN="${DRY_RUN:-0}"
 # Bead stores to scan (space-separated paths; HQ must be .gascity-gastown-hq, NOT the gt root)
@@ -279,52 +316,47 @@ except Exception:
     [ "$ok" = "true" ]
 }
 
-# session_awaiting_human_input (wa-y0620): distinguishes case (a) WEDGED
-# real (transcript frozen, agent mid-tool-call or genuinely dead) from case
-# (b) AGUARDANDO-HUMANO (transcript frozen because the agent correctly
-# ceded its turn and is waiting for the next human/orchestrator message).
-# Both produce an IDENTICAL frozen-transcript signal — Mayor confirmed 2
-# real false positives the same day were exactly this (2026-07-20:
-# oracle-wa's last line was literally "Sigo parado aguardando o mockup." —
-# plain text, no tool call; batista-wa's was an open question). Destructive
-# action (kill/shutdown-dance) is only correct for (a); killing a healthy
-# session mid-wait is pure damage.
+# session_awaiting_human_input (wa-y0620; NARROWED by ga-dyf4fb): distinguishes
+# case (a) WEDGED real (transcript frozen, agent mid-tool-call or genuinely
+# dead) from case (b) AGUARDANDO-HUMANO (transcript frozen because the agent
+# correctly ceded its turn and is waiting for the next human/orchestrator
+# message). Both produce an IDENTICAL frozen-transcript signal.
 #
-# Generalizes the sibling primitive of the same name in
-# inflight-reclaim-guard.py (ga-nlaa), which detects ONLY the sub-case where
-# the agent explicitly invoked the blocking AskUserQuestion tool (via `gc
-# session peek` + substring match on rendered pane output). That alone does
-# not cover this bug's own primary example — a plain-text status update with
-# no tool call at all. (A naive ends-in-"?" check, the bug's own suggested
-# fallback, would ALSO miss it: "Sigo parado..." is a declarative sentence,
-# not a question.) The structurally correct signal for "turn ended cleanly,
-# nothing owed" is the Claude message `stop_reason`, already available from
-# the SAME `gc session logs --json` call transcript_is_advancing() above
-# makes — no second shell-out needed:
+# ga-dyf4fb narrowed this function's "yes" verdict to ONLY the
+# unambiguous-by-construction shape: the trailing block IS the
+# AskUserQuestion tool_use (same ga-nlaa signal inflight-reclaim-guard.py
+# detects via pane-text match, read here structurally instead — can't
+# false-match on the string "AskUserQuestion" in unrelated prose, can't
+# false-miss on terminal rendering).
 #
-#   end_turn, no trailing tool_use  → turn ended on final text BY DESIGN;
-#                                      nothing pending, waits for next input.
-#   tool_use, trailing block IS the
-#   AskUserQuestion tool             → same ga-nlaa signal, read structurally
-#                                      instead of via rendered-text substring
-#                                      match (more precise: can't false-match
-#                                      on the string "AskUserQuestion"
-#                                      appearing in unrelated prose, can't
-#                                      false-miss on terminal rendering).
-#   tool_use, any OTHER tool         → mid-flight, environment owes it a
-#                                      tool_result that never arrived — this
-#                                      IS the real hang transcript_is_
-#                                      advancing already flags; unchanged.
+# Before ga-dyf4fb, plain end_turn-with-text (no tool_use at all — Mayor's
+# own example: oracle-wa's last line was literally "Sigo parado aguardando
+# o mockup.", a declarative sentence, no tool call) ALSO returned "yes"
+# here. That branch is gone: it is the SAME transcript shape the Opus 5.5
+# guide names as improper early-stopping (a summary that announces the
+# next step without executing it; "I'll proceed with X unless you'd rather
+# something else"; a list of decisions that don't actually block anything;
+# stopping because the turn got long or a milestone closed) — collapsing
+# both into one "awaiting human" verdict silently suppressed exactly the
+# cases this bead exists to catch. The transcript alone cannot tell a
+# legitimate cede-the-turn apart from an improper early stop — both are
+# `end_turn` + trailing text, full stop — so this function no longer
+# guesses at that distinction. See classify_frozen_turn() below for how
+# the main loop now resolves plain end_turn-with-text instead: via honest
+# OUTSIDE signals (a bead label declaring next-action:*, already checked
+# earlier in the loop; session_weakly_active_elsewhere()), never via
+# keyword/question-mark matching on the text itself.
 #
-# FAIL-OPEN toward escalating (return 1/not-awaiting), same direction as
-# bead_has_open_gate_marker: this check only carves out a suppression
-# exception, so any read/parse failure must fall through to the existing
-# frozen-transcript escalation rather than silently grow into a new blanket
-# suppression whenever `gc session logs` flakes.
+# FAIL-OPEN toward escalating (return 1/not-awaiting), unchanged: this
+# check only carves out a suppression exception, so any read/parse failure
+# must fall through to the existing frozen-transcript escalation rather
+# than silently grow into a new blanket suppression whenever `gc session
+# logs` flakes.
 #
-#   0 = AWAITING-HUMAN — confirmed via one of the two signals above.
-#   1 = NOT CONFIRMED  — mid-tool-call (other tool), last entry is a
-#       user/tool_result, unparseable, or the query failed outright.
+#   0 = AWAITING-HUMAN — trailing block is the AskUserQuestion tool_use.
+#   1 = NOT CONFIRMED  — anything else: mid-tool-call (other tool), plain
+#       end_turn text (now handled by classify_frozen_turn(), not here),
+#       last entry is a user/tool_result, unparseable, or the query failed.
 session_awaiting_human_input() {
     local sess="$1" logs_json verdict
     logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 5 --json 2>/dev/null || true)"
@@ -345,9 +377,7 @@ try:
     blocks = last.get("blocks") or []
     lb = blocks[-1] if blocks else {}
     lb_type = lb.get("type")
-    if stop_reason == "end_turn" and lb_type != "tool_use":
-        print("yes")
-    elif stop_reason == "tool_use" and lb_type == "tool_use" and lb.get("name") == "AskUserQuestion":
+    if stop_reason == "tool_use" and lb_type == "tool_use" and lb.get("name") == "AskUserQuestion":
         print("yes")
     else:
         print("no")
@@ -355,6 +385,139 @@ except Exception:
     print("no")
 ' 2>/dev/null)"
     [ "$verdict" = "yes" ] && return 0
+    return 1
+}
+
+# classify_frozen_turn (ga-dyf4fb): fills the gap session_awaiting_human_input()
+# left when its end_turn-with-text branch was removed above. Prints one line
+# "KIND|CATEGORY|TEXT" (pipe-delimited; CATEGORY/TEXT are sanitized so they
+# can't contain a stray "|" or newline and break the split):
+#
+#   KIND=REFUSAL — stop_reason=="refusal": the model's own classifier
+#     declined to continue (see town-deltas.template.md's Opus 5.5 guidance:
+#     "trate stop_reason == 'refusal'"). This is a PROMPT problem, not an
+#     idle agent — the main loop below gives it its own alert, never a
+#     resume-nudge (retrying the exact same request just repeats the
+#     refusal) and never a generic "ocioso" escalation.
+#   KIND=TEXT    — end_turn, trailing block is plain text (or no blocks):
+#     the ambiguous shape this bead is about. Structurally IDENTICAL
+#     whether the agent legitimately ceded the turn (wa-y0620's own
+#     example) or stopped early without real cause (the 4 patterns from
+#     the guide) — nothing in stop_reason/blocks distinguishes them. The
+#     main loop resolves the ambiguity via signals OUTSIDE the transcript
+#     text (a bead's next-action:* label, already checked earlier in the
+#     loop via human_turn_label_present(); session_weakly_active_elsewhere()
+#     below), never by matching words in TEXT.
+#   KIND=OTHER   — anything else (mid a non-Ask tool_use, last entry is a
+#     tool_result, unparseable, or the query failed outright): the
+#     pre-existing "not awaiting human" shape, unchanged — falls straight
+#     into the existing resume-then-escalate ladder exactly as before this
+#     bead.
+#
+# CATEGORY (REFUSAL only, best-effort): this repo has no confirmed live
+# sample of a refusal transcript's exact JSON shape at the time of writing
+# — checks a couple of plausible field names (stop_reason_detail.category,
+# refusal_category) and prints "desconhecida" if neither matches, rather
+# than guessing wrong or crashing. A missing/wrong category never blocks
+# the alert itself (see the main loop) — only the label inside it.
+#
+# TEXT (TEXT/REFUSAL only): the last assistant text block(s), concatenated,
+# truncated to 400 chars.
+#
+# Fails toward KIND=OTHER on any parse/query failure — same fail-open
+# direction as session_awaiting_human_input(): never invent a suppression
+# or a refusal alert out of an unproven state.
+classify_frozen_turn() {
+    local sess="$1" logs_json
+    logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 5 --json 2>/dev/null || true)"
+    [ -z "$logs_json" ] && { printf 'OTHER||'; return 0; }
+    printf '%s' "$logs_json" | python3 -c '
+import json, sys
+
+def clean(s, limit=400):
+    s = (s or "").replace("|", "_").replace("\n", " ").strip()
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
+
+try:
+    d = json.load(sys.stdin)
+    if not d.get("ok"):
+        print("OTHER||"); sys.exit(0)
+    entries = [e for e in (d.get("entries") or []) if e.get("type") in ("assistant", "user")]
+    if not entries:
+        print("OTHER||"); sys.exit(0)
+    last = entries[-1]
+    if last.get("type") != "assistant":
+        print("OTHER||"); sys.exit(0)
+    msg = last.get("message") or {}
+    stop_reason = msg.get("stop_reason")
+    blocks = last.get("blocks") or []
+    lb = blocks[-1] if blocks else {}
+    lb_type = lb.get("type")
+    text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+    if stop_reason == "refusal":
+        detail = msg.get("stop_reason_detail") or {}
+        category = detail.get("category") or msg.get("refusal_category") or "desconhecida"
+        print("REFUSAL|%s|%s" % (clean(category, 80), clean(text)))
+    elif stop_reason == "end_turn" and lb_type != "tool_use":
+        print("TEXT||%s" % clean(text))
+    else:
+        print("OTHER||")
+except Exception:
+    print("OTHER||")
+' 2>/dev/null || printf 'OTHER||'
+}
+
+# session_weakly_active_elsewhere (ga-dyf4fb, redesign point 5 — "crews
+# persistentes: rebaixar 'agente ocioso' pra 'bead sem progresso, assignee
+# ativo noutra frente' quando a sessão tem atividade recente"): a crew
+# session is ONE continuous transcript across every bead it touches, so a
+# write about a DIFFERENT bead still bumps the SAME file's mtime
+# transcript_is_advancing() already resolved. This deliberately re-checks
+# that same mtime against a WIDER, separately-configurable window
+# (CREW_ELSEWHERE_ACTIVE_SEC, default 2x TRANSCRIPT_FRESH_SEC) — a caller
+# only reaches this once transcript_is_advancing() already returned frozen
+# against the NARROWER TRANSCRIPT_FRESH_SEC window, so
+# CREW_ELSEWHERE_ACTIVE_SEC must be strictly larger for this to ever fire;
+# it cannot ever contradict transcript_is_advancing(), only add a weaker,
+# longer-range reading on top of an already-frozen verdict.
+#
+# A positive here DOWNGRADES the response to a log-only weak signal in the
+# main loop — no resume nudge (would interrupt whatever the crew is
+# actually doing on the other front), no mail (per the redesign: "sinal
+# bem mais fraco, talvez nem precise de ação do Mayor").
+#
+#   0 = weakly active elsewhere (mtime age within CREW_ELSEWHERE_ACTIVE_SEC)
+#   1 = not confirmed (no session, query failed, or genuinely stale too)
+session_weakly_active_elsewhere() {
+    local sess="$1" logs_json ok tpath mtime age
+    logs_json="$(timeout 15 "$GC" session logs "$sess" --tail 1 --json 2>/dev/null || true)"
+    [ -z "$logs_json" ] && return 1
+    ok="$(printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print("true" if d.get("ok") else "false")
+except Exception:
+    print("false")
+' 2>/dev/null)"
+    [ "$ok" = "true" ] || return 1
+    tpath="$(printf '%s' "$logs_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("transcript_path") or "")
+except Exception:
+    print("")
+' 2>/dev/null)"
+    [ -z "$tpath" ] && return 1
+    [ -f "$tpath" ] || return 1
+    mtime="$(stat -f %m "$tpath" 2>/dev/null || stat -c %Y "$tpath" 2>/dev/null || echo "")"
+    [ -z "$mtime" ] && return 1
+    age=$(( now - mtime ))
+    [ "$age" -lt "$CREW_ELSEWHERE_ACTIVE_SEC" ] && return 0
     return 1
 }
 
@@ -795,6 +958,13 @@ send_escalation() {
         if [ "$permission_prompt_detected" = "1" ]; then
             "$NOTIFY" -t "Agente bloqueado em prompt" -p 5 \
                 "$bead_id (${assignee_for_notify:-?}) BLOQUEADO em prompt de permissão — 1 tecla resolve → ${_esc_target}" \
+                >/dev/null 2>&1 || true
+        elif [ "$permission_prompt_detected" = "2" ]; then
+            # ga-dyf4fb: recusa do modelo (stop_reason=refusal) — remédio é
+            # revisar o prompt, não destravar/retomar, então merece seu
+            # próprio texto de notify em vez do genérico "Agente travado".
+            "$NOTIFY" -t "Agente recusou" -p 4 \
+                "$bead_id (${assignee_for_notify:-?}) RECUSOU o turno (stop_reason=refusal) — revise o prompt → ${_esc_target}" \
                 >/dev/null 2>&1 || true
         else
             "$NOTIFY" -t "Agente travado" -p 4 \
@@ -1714,13 +1884,67 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
         continue
     fi
 
-    # wa-y0620: transcript CONFIRMED frozen + session alive is still not
-    # proof of a hang — it is the SAME signal a correctly-blocked agent
-    # produces after asking something and ceding the turn by design. See
-    # session_awaiting_human_input() above for the full rationale (Mayor
-    # confirmed 2 real false positives from exactly this the same day).
+    # wa-y0620 (narrowed by ga-dyf4fb): only a PENDING AskUserQuestion is a
+    # structurally-provable "awaiting human" shape now — see
+    # session_awaiting_human_input() above for what changed and why.
     if [ "$transcript_state" = "frozen" ] && session_awaiting_human_input "$live_session_name"; then
-        log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas último turno terminou AGUARDANDO HUMANO (end_turn sem tool_use pendente, ou AskUserQuestion) — SUPRIMINDO escalação (fail-safe wa-y0620: aguardando-humano ≠ travado)"
+        log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO mas último turno terminou AGUARDANDO HUMANO (AskUserQuestion pendente) — SUPRIMINDO escalação (fail-safe wa-y0620: aguardando-humano ≠ travado)"
+        continue
+    fi
+
+    # ga-dyf4fb (redesign pelo guia Opus 5.5): classifica a FORMA do turno
+    # congelado uma vez — recusa e end_turn-com-texto-puro agora têm
+    # tratamento próprio em vez de caírem no ramo genérico removido acima.
+    # Só avaliado com transcript já confirmado congelado (mesmo portão do
+    # check logo acima). Ver classify_frozen_turn() no topo do arquivo.
+    frozen_turn_kind="" frozen_turn_category="" frozen_turn_text=""
+    if [ "$transcript_state" = "frozen" ] && [ -n "$live_session_name" ]; then
+        IFS='|' read -r frozen_turn_kind frozen_turn_category frozen_turn_text <<< "$(classify_frozen_turn "$live_session_name")"
+    fi
+
+    if [ "$frozen_turn_kind" = "REFUSAL" ]; then
+        # ga-dyf4fb ponto 4: recusa é problema de PROMPT, não ociosidade —
+        # nunca "continue" por cima dela (pede pro modelo repetir
+        # exatamente o que ele já recusou), e nunca vira escalação genérica
+        # de ocioso (o conserto fica no prompt/formula, não no agente).
+        # Alerta próprio, mesmo cooldown por bead ($sf) que as demais.
+        refusal_body="$(cat <<BODY
+CAMADA 2 — AGENTE RECUSOU (não é ociosidade): o último turno de
+$live_session_name terminou em stop_reason=refusal, categoria:
+${frozen_turn_category:-desconhecida}.
+
+Bead:      $bead_id — $title
+Assignee:  $assignee
+Sessão:    $live_session_name
+Categoria: ${frozen_turn_category:-desconhecida}
+Último texto do agente: ${frozen_turn_text:-(vazio)}
+
+Isto NÃO é um agente travado — é o classificador do modelo recusando
+continuar. Retomar ("continue") sobre uma recusa só repete a mesma recusa.
+O conserto fica no PROMPT/formula deste agente, não no agente em si (ex.:
+categoria reasoning_extraction = o prompt pediu o raciocínio interno —
+use display summarized e leia os blocos de thinking, não peça o texto
+bruto do raciocínio).
+
+AÇÃO SUGERIDA:
+1. gc session peek $live_session_name --lines 40 — confirme a recusa
+2. Releia o prompt/formula que gerou este turno e ajuste o pedido
+3. Reatribua ou reinicie o bead SOMENTE depois de corrigir o prompt
+
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · categoria de recusa: ga-dyf4fb)
+BODY
+)"
+        log "$bead_id: RECUSA (stop_reason=refusal, categoria=${frozen_turn_category:-desconhecida}) de $live_session_name — escalando (revisão de prompt, não retomada) (ga-dyf4fb)"
+        send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "2" "Agente RECUSOU (revise o prompt)" "$refusal_body" "$sf"
+        continue
+    fi
+
+    if [ "$frozen_turn_kind" = "TEXT" ] && session_weakly_active_elsewhere "$live_session_name"; then
+        # ga-dyf4fb ponto 5: crew persistente ativo NOUTRA frente (sessão
+        # tocada recentemente, só não neste bead) — sinal FRACO, log-only.
+        # NÃO manda resume-nudge (interromperia trabalho real noutro
+        # assunto) nem mail (Mayor provavelmente nem precisa agir).
+        log "$bead_id: bead.updated_at parado ${age_min}min — transcript de $live_session_name CONGELADO neste bead mas sessão ATIVA NOUTRA FRENTE (escrita < ${CREW_ELSEWHERE_ACTIVE_SEC}s) — sinal FRACO, sem resume/escalação (ga-dyf4fb)"
         continue
     fi
 
@@ -1854,9 +2078,23 @@ BODY
     rf="$RESUMEDIR/$bead_id"
     nudged_at=""
     nudged_session=""
+    nudge_count=0   # ga-dyf4fb: default for a FRESH episode (no $rf yet at all) — first nudge below is correctly attempt 1, not "already at cap"
     if [ -f "$rf" ]; then
         nudged_at="$(sed -n '1p' "$rf" 2>/dev/null || echo "")"
         nudged_session="$(sed -n '2p' "$rf" 2>/dev/null || echo "")"
+        nudge_count="$(sed -n '3p' "$rf" 2>/dev/null || echo "")"
+        # ga-dyf4fb (redesign ponto 2 — teto de retomadas por episódio): um
+        # $rf EXISTENTE de só 2 linhas (gravado antes desta mudança, ou por
+        # seed_resume_state em teste) não tem como saber quantas tentativas
+        # já ocorreram — trata como JÁ NO TETO em vez de assumir zero,
+        # preservando o comportamento pré-teto (uma retomada, depois
+        # escala) pra qualquer estado legado/externo, em vez de
+        # silenciosamente estender a espera de quem já esperava por uma
+        # única tentativa. Só se aplica quando o ARQUIVO existe — a
+        # ausência total de arquivo (acima) é um episódio novo, não legado.
+        case "$nudge_count" in
+            ''|*[!0-9]*) nudge_count="$RESUME_MAX_ATTEMPTS" ;;
+        esac
     fi
 
     # ga-nrkh92 gate-fix (blocking issue 1): $rf is keyed only by bead_id —
@@ -1876,13 +2114,15 @@ BODY
     if [ -n "$nudged_at" ] && [ -n "$nudged_session" ] && [ "$nudged_session" != "$live_session_name" ]; then
         log "$bead_id: retomada anterior registrada p/ sessao '$nudged_session', atual e '$live_session_name' — bead foi reatribuido; tratando como primeira retomada pra esta sessao (ga-nrkh92 gate-fix, issue 1)"
         nudged_at=""
+        nudge_count=0   # ga-dyf4fb: nova sessão, novo episódio de retomadas — zera o teto também
     fi
 
     if [ -z "$nudged_at" ]; then
         # Primeira vez vendo este bead ocioso nesta janela (ou reatribuído
         # p/ nova sessão, acima) — tenta acordar pelo canal interativo,
         # ainda NÃO escala.
-        resume_msg="[AUTO-RESUME] Ocioso ha ${age_min}min com bead ${bead_id} in_progress. ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
+        resume_attempt=$(( nudge_count + 1 ))
+        resume_msg="[AUTO-RESUME ${resume_attempt}/${RESUME_MAX_ATTEMPTS}] Ocioso ha ${age_min}min com bead ${bead_id} in_progress. ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
         # ga-nrkh92: cada ramo loga só o que REALMENTE aconteceu nele — um
         # log incondicional de "RETOMADA enviada" depois do if/else afirmaria
         # envio real mesmo em DRY_RUN, onde send_idle_resume nunca roda
@@ -1902,27 +2142,45 @@ BODY
         # nenhuma retomada real foi enviada. Grava $rf só no ramo que
         # realmente tentou (else), como o log já fazia.
         if [ "$DRY_RUN" = "1" ]; then
-            log "$bead_id: [DRY_RUN] retomada NÃO enviada de verdade — teria chamado gc session nudge + tmux send-keys pra $live_session_name (ga-nrkh92)"
+            log "$bead_id: [DRY_RUN] retomada ${resume_attempt}/${RESUME_MAX_ATTEMPTS} NÃO enviada de verdade — teria chamado gc session nudge + tmux send-keys pra $live_session_name (ga-nrkh92)"
         else
             send_idle_resume "$live_session_name" "$resume_msg"
-            log "$bead_id: RETOMADA enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92)"
-            printf '%s\n%s\n' "$now" "$live_session_name" > "$rf"
+            log "$bead_id: RETOMADA ${resume_attempt}/${RESUME_MAX_ATTEMPTS} enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-nrkh92; teto ga-dyf4fb)"
+            printf '%s\n%s\n%s\n' "$now" "$live_session_name" "$resume_attempt" > "$rf"
         fi
         continue
     fi
 
     elapsed_since_nudge=$(( now - nudged_at ))
     if [ "$elapsed_since_nudge" -lt "$RESUME_GRACE_SEC" ]; then
-        log "$bead_id: retomada enviada há ${elapsed_since_nudge}s — aguardando resposta (prazo ${RESUME_GRACE_SEC}s, ga-nrkh92)"
+        log "$bead_id: retomada ${nudge_count}/${RESUME_MAX_ATTEMPTS} enviada há ${elapsed_since_nudge}s — aguardando resposta (prazo ${RESUME_GRACE_SEC}s, ga-nrkh92)"
         continue
     fi
 
-    # Prazo esgotado e o transcript CONTINUA congelado (senão o bloco
-    # transcript_state=="advancing" acima já teria suprimido antes de
-    # chegar aqui, e limpo este mesmo $rf) — a retomada não funcionou.
-    # Escala UMA vez: send_escalation grava $sf, e o cooldown no TOPO do
-    # loop (linhas ~979-988) impede reescalar nos próximos ciclos até
-    # COOLDOWN_SEC — não precisa de um segundo flag "escalated" aqui.
+    # ga-dyf4fb (redesign ponto 2 — teto de retomadas por episódio): prazo
+    # esgotado e AINDA sob o teto — manda MAIS uma retomada em vez de
+    # escalar direto. Só quando o teto (RESUME_MAX_ATTEMPTS) é atingido é
+    # que cai pro bloco de escalação abaixo, inalterado.
+    if [ "$nudge_count" -lt "$RESUME_MAX_ATTEMPTS" ]; then
+        resume_attempt=$(( nudge_count + 1 ))
+        resume_msg="[AUTO-RESUME ${resume_attempt}/${RESUME_MAX_ATTEMPTS}] Ocioso ha ${age_min}min com bead ${bead_id} in_progress, sem resposta a retomada(s) anterior(es). ANTES de agir: rode 'bd show ${bead_id}', releia seus ultimos comentarios e o git log/estado da branch, e reporte em 1-2 linhas onde parou e o que falta — nao refaca se ja estiver completo (aguardando gate/merge conta como completo)."
+        if [ "$DRY_RUN" = "1" ]; then
+            log "$bead_id: [DRY_RUN] retomada ${resume_attempt}/${RESUME_MAX_ATTEMPTS} NÃO enviada de verdade (ga-dyf4fb)"
+        else
+            send_idle_resume "$live_session_name" "$resume_msg"
+            log "$bead_id: RETOMADA ${resume_attempt}/${RESUME_MAX_ATTEMPTS} enviada a $live_session_name (nudge + tmux send-keys) — aguardando resposta até ${RESUME_GRACE_SEC}s (ga-dyf4fb: teto ainda não atingido)"
+            printf '%s\n%s\n%s\n' "$now" "$live_session_name" "$resume_attempt" > "$rf"
+        fi
+        continue
+    fi
+
+    # Teto de retomadas atingido (${RESUME_MAX_ATTEMPTS}) e o transcript
+    # CONTINUA congelado (senão o bloco transcript_state=="advancing" acima
+    # já teria suprimido antes de chegar aqui, e limpo este mesmo $rf) — a
+    # retomada não funcionou. Escala UMA vez: send_escalation grava $sf, e
+    # o cooldown no TOPO do loop (linhas ~979-988) impede reescalar nos
+    # próximos ciclos até COOLDOWN_SEC — não precisa de um segundo flag
+    # "escalated" aqui.
     unique_note="não determinado (sem acesso ao worktree da sessão)"
     _wd="$(session_work_dir "$live_session_name" 2>/dev/null || true)"
     if [ -n "$_wd" ]; then
@@ -1935,28 +2193,29 @@ BODY
     fi
     body="$(cat <<BODY
 CAMADA 2 — ESCALAÇÃO AUTOMÁTICA: agente ocioso não respondeu à retomada
-automática (ga-nrkh92).
+automática após ${RESUME_MAX_ATTEMPTS} tentativa(s) (ga-nrkh92; teto ga-dyf4fb).
 
 Bead:      $bead_id — $title
 Assignee:  $assignee
 Sessão:    $live_session_name
 Ocioso há: ${age_min} minutos
-Retomada enviada há: $(( elapsed_since_nudge / 60 )) minutos (gc session nudge + tmux send-keys, sem resposta)
+Retomadas enviadas: ${nudge_count}/${RESUME_MAX_ATTEMPTS} (última há $(( elapsed_since_nudge / 60 )) minutos, gc session nudge + tmux send-keys, sem resposta)
+Último texto do agente: ${frozen_turn_text:-(nenhum — turno não terminou em texto puro; ver estado mid-tool-call abaixo)}
 Trabalho não mergeado: $unique_note
 Marcadores de falha: $failure_markers
 
 O daemon já tentou acordar esta sessão sozinho (canal interativo — nudge +
-tecla direta no pane) e ela não reagiu no prazo. Isto é DIFERENTE de um
-alerta genérico: já foi dada a chance de responder antes de qualquer
-sugestão destrutiva.
+tecla direta no pane), ${RESUME_MAX_ATTEMPTS} vez(es), e ela não reagiu no
+prazo em nenhuma delas. Isto é DIFERENTE de um alerta genérico: já foi dada
+a chance de responder antes de qualquer sugestão destrutiva.
 
 AÇÃO SUGERIDA:
 1. gc session peek $live_session_name --lines 60 — confira o estado atual do pane
 2. Se ainda ocioso: shutdown-dance (3 nudges via dog pool) ou kill+re-despache
 3. Se working mas devagar (turno realmente longo que escapou das camadas de supressão): bd comment $bead_id pra reduzir ruído futuro
 
-Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s) · retomada: RESUME_GRACE_SEC (atual: ${RESUME_GRACE_SEC}s).
-(Daemon: agent-stuck-escalation · ga-qw3p.2 · retomada automática: ga-nrkh92)
+Limiar configurável via STUCK_AGENT_SEC (atual: ${STUCK_AGENT_SEC}s) · retomada: RESUME_GRACE_SEC (atual: ${RESUME_GRACE_SEC}s) · teto: RESUME_MAX_ATTEMPTS (atual: ${RESUME_MAX_ATTEMPTS}).
+(Daemon: agent-stuck-escalation · ga-qw3p.2 · retomada automática: ga-nrkh92 · teto de retomadas: ga-dyf4fb)
 BODY
 )"
     send_escalation "$bead_id" "$title" "$labels" "$age_min" "$assignee" "0" "Agente ocioso nao respondeu a retomada" "$body" "$sf"

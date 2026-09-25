@@ -695,23 +695,94 @@ STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
 assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test14" "T28: no mail — transcript advancing (regression, ga-hehi intact)"
 rm -f "$LOGS_FIXTURE_DIR/mila-wa.json"
 
-# ── T29: session alive, transcript frozen, last turn ended cleanly on text ───
-# (plain end_turn, no tool call) → suppressed (wa-y0620 core fix). Mirrors
-# the bug's own primary example verbatim: oracle-wa's last line was "Sigo
-# parado aguardando o mockup." — a declarative sentence, NOT a question, so
-# this also proves the fix does NOT rely on question-mark/keyword matching.
-echo "T29: session alive, transcript frozen, last turn end_turn/no-tool → suppressed (wa-y0620)"
+# ── T29 (REDESIGNED by ga-dyf4fb): session alive, transcript frozen, last ───
+# turn ended cleanly on plain text (no tool call), with NO corroborating
+# signal → now RESUMES instead of silently suppressing. Mirrors the bug's
+# own primary example verbatim: oracle-wa's last line was "Sigo parado
+# aguardando o mockup." — a declarative sentence, NOT a question.
+#
+# Pre-ga-dyf4fb this was suppressed outright (wa-y0620's original fix,
+# T29's old assertion). ga-dyf4fb found that exact signature — end_turn +
+# plain text, nothing else — is STRUCTURALLY IDENTICAL to what Anthropic's
+# Opus 5.5 guide calls improper early-stopping (a summary announcing the
+# next step without doing it; "I'll proceed with X unless you'd rather
+# something else"; a list of decisions that don't actually block anything;
+# stopping because the turn got long or a milestone closed) — nothing in
+# stop_reason/blocks tells them apart, and a keyword/question-mark check
+# on the text (the bug's own rejected fallback) would also miss this exact
+# sentence. So bare end_turn-with-text no longer suppresses BY ITSELF —
+# only a genuine, checkable signal does (AskUserQuestion: T31 below;
+# next-action:* bead label: human_turn_label_present(), tested elsewhere,
+# runs BEFORE this code path even executes; recent activity on another
+# front: T29b right below). Absent any of those, the daemon now does
+# exactly what it already does for any other idle session: attempts a
+# gentle resume nudge (which just asks the agent to report where it
+# stands — see resume_msg — not to blindly redo work) before ever
+# escalating.
+echo "T29: session alive, transcript frozen, last turn end_turn/no-tool, NO corroborating signal → resumes, does not suppress (ga-dyf4fb)"
 echo '{"sessions":[{"name":"oracle-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
 make_transcript_fixture oracle-wa 3600 '[{"type":"assistant","message":{"stop_reason":"end_turn"},"blocks":[{"type":"text","text":"Sigo parado aguardando o mockup."}]}]'
 printf '[%s]' "$(make_bead ga-test15 oracle-wa 2200)" > "$BEADS_FIXTURE"
-rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15" "$WORK/city/.gc/state/agent-idle-resume/ga-test15"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 CREW_ELSEWHERE_ACTIVE_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T29: no escalation yet — resume is tried first, same as any other idle session (ga-dyf4fb)"
+assert_contains "$ACTIONS" "nudge:oracle-wa|" "T29: resume nudge IS sent — bare end_turn/text alone no longer suppresses (ga-dyf4fb)"
+log_contains "T29" "RETOMADA 1/3 enviada a oracle-wa" "T29: log records the resume attempt, not an awaiting-human suppression"
+rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json" "$WORK/city/.gc/state/agent-idle-resume/ga-test15"
+
+# ── T29b (NEW, ga-dyf4fb redesign point 5): same bare end_turn/text shape ───
+# as T29, but the session's transcript was touched more recently than
+# CREW_ELSEWHERE_ACTIVE_SEC (even though still beyond the narrower
+# TRANSCRIPT_FRESH_SEC gate that already proved it "frozen" for THIS bead)
+# — evidence the crew is alive and working a DIFFERENT front, not silent.
+# Downgrades to a weak, log-only signal: no resume nudge (would interrupt
+# real work elsewhere), no escalation.
+echo "T29b: session alive, transcript frozen for THIS bead but touched recently (elsewhere) → weak signal, no resume/escalation (ga-dyf4fb)"
+echo '{"sessions":[{"name":"oracle-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture oracle-wa 2000 '[{"type":"assistant","message":{"stop_reason":"end_turn"},"blocks":[{"type":"text","text":"Sigo parado aguardando o mockup."}]}]'
+printf '[%s]' "$(make_bead ga-test15b oracle-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15b" "$WORK/city/.gc/state/agent-idle-resume/ga-test15b"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 CREW_ELSEWHERE_ACTIVE_SEC=3600 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T29b: no escalation — weak signal only"
+assert_absent "$ACTIONS" "nudge:oracle-wa|" "T29b: no resume nudge either — would interrupt work on the other front"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-test15b" ] && ok "T29b: no resume state written" || bad "T29b: unexpected resume state written"
+log_contains "T29b" "ATIVA NOUTRA FRENTE" "T29b: log notes the weak-signal downgrade"
+rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json"
+
+# ── T29c (NEW, ga-dyf4fb redesign point 4): last turn's stop_reason is ──────
+# "refusal" — a model-classifier decline, not idleness. Must NOT be
+# resumed ("continue" over a refusal just repeats it) and must NOT read as
+# generic "ocioso" — its own alert, citing the category.
+echo "T29c: session alive, transcript frozen, last turn stop_reason=refusal → own alert, no resume nudge (ga-dyf4fb)"
+echo '{"sessions":[{"name":"peter-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture peter-wa 3600 '[{"type":"assistant","message":{"stop_reason":"refusal","stop_reason_detail":{"category":"reasoning_extraction"}},"blocks":[{"type":"text","text":"I can'"'"'t share my internal reasoning verbatim."}]}]'
+printf '[%s]' "$(make_bead ga-test15c peter-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15c" "$WORK/city/.gc/state/agent-idle-resume/ga-test15c"
 : > "$ACTIONS"
 STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
-assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-test15" "T29: no mail — last turn ended cleanly awaiting human (wa-y0620)"
-assert_absent "$ACTIONS" "notify" "T29: no notify — awaiting-human suppresses"
-[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15" ] && ok "T29: no escalation state written (suppression is log-only)" || bad "T29: unexpected state file written on suppression"
-log_contains "T29" "AGUARDANDO HUMANO" "T29: log notes awaiting-human suppression"
-rm -f "$LOGS_FIXTURE_DIR/oracle-wa.json"
+assert_contains "$ACTIONS" "mail:mayor|Agente RECUSOU (revise o prompt): ga-test15c" "T29c: distinct refusal escalation fires"
+assert_contains "$ACTIONS" "notify" "T29c: notify fires"
+assert_absent "$ACTIONS" "nudge:peter-wa|" "T29c: NO resume nudge sent — retrying a refusal just repeats it"
+assert_contains "$WORK/last_mail_body.txt" "reasoning_extraction" "T29c: mail body cites the refusal category"
+assert_contains "$WORK/last_mail_body.txt" "conserto fica no PROMPT" "T29c: mail body points at the prompt, not the agent"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-test15c" ] && ok "T29c: no resume state written for a refusal" || bad "T29c: unexpected resume state written"
+rm -f "$LOGS_FIXTURE_DIR/peter-wa.json"
+
+# ── T29d (NEW, ga-dyf4fb): refusal with NO parseable category field → ───────
+# still escalates, category degrades honestly to "desconhecida" instead of
+# crashing or fabricating a label.
+echo "T29d: refusal with no category field in the transcript → still escalates, category reads as 'desconhecida' (ga-dyf4fb)"
+echo '{"sessions":[{"name":"batista-wa","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture batista-wa 3600 '[{"type":"assistant","message":{"stop_reason":"refusal"},"blocks":[{"type":"text","text":"I won'"'"'t do that."}]}]'
+printf '[%s]' "$(make_bead ga-test15d batista-wa 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-test15d" "$WORK/city/.gc/state/agent-idle-resume/ga-test15d"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 TRANSCRIPT_FRESH_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente RECUSOU (revise o prompt): ga-test15d" "T29d: escalation still fires without a category field"
+assert_contains "$WORK/last_mail_body.txt" "desconhecida" "T29d: category degrades honestly instead of guessing"
+rm -f "$LOGS_FIXTURE_DIR/batista-wa.json"
 
 # ── T30: session alive, transcript frozen, last turn mid OTHER tool_use ──────
 # (e.g. a Bash call with no result yet) → escalation STILL fires (no
@@ -1218,10 +1289,10 @@ seed_tmux_pane dog-idle53 999999999
 RESUME_GRACE_SEC=99999 run_script > /dev/null
 assert_absent  "$ACTIONS" "mail:mayor" "T53: no escalation on first idle pass — resume is attempted first"
 assert_contains "$ACTIONS" "nudge:dog-idle53|" "T53: gc session nudge sent to the idle session"
-assert_contains "$ACTIONS" "tmux-send-keys:dog-idle53|[AUTO-RESUME]" "T53: tmux send-keys injects the resume message text"
+assert_contains "$ACTIONS" "tmux-send-keys:dog-idle53|[AUTO-RESUME 1/3]" "T53: tmux send-keys injects the resume message text (ga-dyf4fb: attempt/cap prefix)"
 assert_contains "$ACTIONS" "tmux-send-keys:dog-idle53|Enter" "T53: tmux send-keys presses Enter as a SEPARATE call (send-keys without Enter only types, never submits)"
 [ -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle53" ] && ok "T53: resume state file recorded" || bad "T53: missing resume state file"
-log_contains "T53" "RETOMADA enviada a dog-idle53" "T53: log records the resume attempt for audit (ga-nrkh92 critério d)"
+log_contains "T53" "RETOMADA 1/3 enviada a dog-idle53" "T53: log records the resume attempt for audit (ga-nrkh92 critério d; ga-dyf4fb attempt/cap prefix)"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle53.json"
 
 echo "T54: second pass within RESUME_GRACE_SEC → still waiting, no re-nudge, no escalation"
@@ -1263,6 +1334,63 @@ assert_absent "$ACTIONS" "mail:mayor" "T56: no escalation — agent recovered"
 [ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idle56" ] && ok "T56: resume state cleared on recovery" || bad "T56: stale resume state left behind after recovery"
 log_contains "T56" "RESOLVIDO" "T56: log notes the recovery"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle56.json"
+
+# ── T56b-T56c (NEW, ga-dyf4fb redesign point 2 — "TETO de 2-3 retomadas ────
+# por episódio; estourou => escala"): the ladder used to be exactly ONE
+# nudge, then escalate on the next unanswered grace expiry (T53-T55 above).
+# This proves it now takes RESUME_MAX_ATTEMPTS nudges before escalating,
+# and that the final escalation cites the full attempt count. Can't reuse
+# seed_resume_state for the intermediate passes — it always writes a fresh
+# 2-line (no-count) file, which this fix's own backward-compat rule reads
+# as "already at cap" (see the comment above nudge_count in the script)
+# and would short-circuit straight to escalation, defeating the point of
+# this test. Instead each pass rewrites line 1 (nudged_at) of the file the
+# CODE ITSELF wrote, to simulate grace having expired, while preserving
+# lines 2-3 (session + real attempt count) verbatim.
+_rewind_nudge() {
+    local bid="$1"
+    local f="$WORK/city/.gc/state/agent-idle-resume/$bid"
+    local sess cnt
+    sess="$(sed -n '2p' "$f")"
+    cnt="$(sed -n '3p' "$f")"
+    printf '%s\n%s\n%s\n' "$(( $(date +%s) - 999999 ))" "$sess" "$cnt" > "$f"
+}
+
+echo "T56b: resume ladder pass 1 → nudge 1/3; pass 2 (grace expired, still under cap) → nudge 2/3, NOT an escalation (ga-dyf4fb teto de retomadas)"
+echo '{"sessions":[{"name":"dog-idlecap","state":"active"}]}' > "$SESSIONS_FIXTURE"
+make_transcript_fixture dog-idlecap 3600
+printf '[%s]' "$(make_bead ga-idlecap dog-idlecap 2200)" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-idlecap" "$WORK/city/.gc/state/agent-idle-resume/ga-idlecap"
+: > "$ACTIONS"
+RESUME_MAX_ATTEMPTS=3 RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 1: first nudge
+assert_contains "$ACTIONS" "nudge:dog-idlecap|" "T56b: pass 1 sends the first nudge"
+[ "$(sed -n '3p' "$WORK/city/.gc/state/agent-idle-resume/ga-idlecap")" = "1" ] && ok "T56b: state records attempt count 1" || bad "T56b: attempt count not recorded as 1"
+_rewind_nudge ga-idlecap
+: > "$ACTIONS"
+make_transcript_fixture dog-idlecap 3600   # still frozen
+RESUME_MAX_ATTEMPTS=3 RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 2: 1<3 → second nudge, not escalation
+assert_absent "$ACTIONS" "mail:mayor" "T56b: pass 2 — still under the cap (1<3), no escalation yet"
+assert_contains "$ACTIONS" "nudge:dog-idlecap|" "T56b: pass 2 sends a SECOND nudge instead of escalating"
+log_contains "T56b" "RETOMADA 2/3 enviada a dog-idlecap" "T56b: log records attempt 2/3"
+[ "$(sed -n '3p' "$WORK/city/.gc/state/agent-idle-resume/ga-idlecap")" = "2" ] && ok "T56b: state now records attempt count 2" || bad "T56b: attempt count not advanced to 2"
+rm -f "$LOGS_FIXTURE_DIR/dog-idlecap.json"
+
+echo "T56c: resume ladder pass 3 → nudge 3/3; pass 4 (cap reached) → escalates, citing all attempts (ga-dyf4fb)"
+_rewind_nudge ga-idlecap
+: > "$ACTIONS"
+make_transcript_fixture dog-idlecap 3600
+RESUME_MAX_ATTEMPTS=3 RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 3: 2<3 → third nudge
+assert_absent "$ACTIONS" "mail:mayor" "T56c: pass 3 — still under the cap (2<3), no escalation yet"
+log_contains "T56c" "RETOMADA 3/3 enviada a dog-idlecap" "T56c: log records attempt 3/3"
+[ "$(sed -n '3p' "$WORK/city/.gc/state/agent-idle-resume/ga-idlecap")" = "3" ] && ok "T56c: state now records attempt count 3" || bad "T56c: attempt count not advanced to 3"
+_rewind_nudge ga-idlecap
+: > "$ACTIONS"
+make_transcript_fixture dog-idlecap 3600
+RESUME_MAX_ATTEMPTS=3 RESUME_GRACE_SEC=99999 run_script > /dev/null   # pass 4: 3>=3 → cap reached, escalates
+assert_contains "$ACTIONS" "mail:mayor|Agente ocioso nao respondeu a retomada: ga-idlecap" "T56c: pass 4 — cap reached (3/3), escalation finally fires"
+assert_contains "$WORK/last_mail_body.txt" "Retomadas enviadas: 3/3" "T56c: mail body cites the full attempt count, not just the last one"
+[ ! -f "$WORK/city/.gc/state/agent-idle-resume/ga-idlecap" ] && ok "T56c: resume state cleared after escalation" || bad "T56c: resume state left behind after escalation"
+rm -f "$LOGS_FIXTURE_DIR/dog-idlecap.json"
 
 # ── T57-T58: gc.active_window metadata (ga-nrkh92 critério f) ───────────────
 echo "T57: bead declares gc.active_window and NOW is OUTSIDE it → no nudge, no escalation (ga-nrkh92 critério f)"
@@ -1424,7 +1552,7 @@ seed_tmux_pane dog-idle63 999999998
 RESUME_GRACE_SEC=99999 run_script > /dev/null
 assert_absent  "$ACTIONS" "mail:mayor" "T63: no escalation — the CURRENT session was never actually nudged, despite the stale record for the old session"
 assert_contains "$ACTIONS" "nudge:dog-idle63|" "T63: fresh nudge sent to the CURRENT session"
-assert_contains "$ACTIONS" "tmux-send-keys:dog-idle63|[AUTO-RESUME]" "T63: tmux send-keys also injects into the current session"
+assert_contains "$ACTIONS" "tmux-send-keys:dog-idle63|[AUTO-RESUME 1/3]" "T63: tmux send-keys also injects into the current session (ga-dyf4fb: attempt/cap prefix)"
 [ "$(sed -n '2p' "$WORK/city/.gc/state/agent-idle-resume/ga-idle63")" = "dog-idle63" ] && ok "T63: resume state now records the CURRENT session" || bad "T63: resume state still references the stale session"
 log_contains "T63" "bead foi reatribuido" "T63: log notes the reassignment detection"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle63.json"
@@ -1446,7 +1574,7 @@ seed_tmux_pane dog-idle64 999999997
 RESUME_GRACE_SEC=99999 run_script > /dev/null
 assert_contains "$ACTIONS" "nudge:dog-idle64|" "T64: nudge still fires — an out-of-range hour must fail OPEN like any other malformed window (pre-fix: [0-2][0-9] accepted hours 20-29 and this window would ALWAYS read as outside, permanently suppressing)"
 assert_absent "$WORK/city/.gc/logs/agent-stuck-escalation.log" "XXXNEVERMATCHXXX" "T64: sanity — log file itself is readable (guards against a silently-empty log masking a false pass above)"
-log_contains "T64" "RETOMADA enviada a dog-idle64" "T64: log confirms the resume path actually ran (window did not suppress it)"
+log_contains "T64" "RETOMADA 1/3 enviada a dog-idle64" "T64: log confirms the resume path actually ran (window did not suppress it)"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle64.json"
 
 # T65 = gate-fix attempt 3: now_outside_active_window's <= branch requires
@@ -1464,7 +1592,7 @@ seed_tmux_pane dog-idle65 999999996
 : > "$ACTIONS"
 RESUME_GRACE_SEC=99999 run_script > /dev/null
 assert_contains "$ACTIONS" "nudge:dog-idle65|" "T65: nudge still fires — a zero-width window (start==end) must fail OPEN like any other degenerate window (pre-fix: start_min==end_min made the <= branch's cur_min<end_min test unsatisfiable for any cur_min, ALWAYS outside, permanently suppressing)"
-log_contains "T65" "RETOMADA enviada a dog-idle65" "T65: log confirms the resume path actually ran (window did not suppress it)"
+log_contains "T65" "RETOMADA 1/3 enviada a dog-idle65" "T65: log confirms the resume path actually ran (window did not suppress it)"
 rm -f "$LOGS_FIXTURE_DIR/dog-idle65.json"
 
 # T66 = CONTROL for T65: proves the start_min == end_min guard is an EXACT
