@@ -194,18 +194,34 @@ build_json_new() { # with diff_lines
   echo "$out]"
 }
 
+# ga-55szfj: this file used to keep id -> value maps as `local -A` associative
+# arrays, which bash 3.2 (/bin/bash — the shell the gate and launchd actually run)
+# does not have: `local -A` is rejected, the later `ago_of["s1"]=...` degrades to an
+# ARITHMETIC subscript (`s1: unbound variable`), both functions echoed nothing, and
+# the assertion compared two empty strings — a red test that pointed at the code
+# under test instead of at the shell. IDS / AGO_SECS / SIZES are already
+# index-aligned parallel arrays, so a value is looked up through its id's index.
+# A miss is a bug in THIS file's fixture, so it fails loud (stderr) instead of
+# yielding an empty value that the arithmetic below would silently swallow.
+idx_of() {
+  local i
+  for i in "${!IDS[@]}"; do
+    if [ "${IDS[$i]}" = "$1" ]; then echo "$i"; return 0; fi
+  done
+  echo "idx_of: id '$1' is not in IDS — fixture bug" >&2
+  return 1
+}
+
 mean_small_position_old() {
   local pool remaining_ids pos=0 sel total=0 count=0
   remaining_ids=("${IDS[@]}")
-  local -A ago_of size_of
-  for i in "${!IDS[@]}"; do ago_of["${IDS[$i]}"]="${AGO_SECS[$i]}"; done
   while [ "${#remaining_ids[@]}" -gt 0 ]; do
     pos=$((pos+1))
     local json="[" first=1 id
     for id in "${remaining_ids[@]}"; do
       [ "$first" -eq 0 ] && json="$json,"
       first=0
-      json="$json$(mk "$id" "$(ago "${ago_of[$id]}")" "")"
+      json="$json$(mk "$id" "$(ago "${AGO_SECS[$(idx_of "$id")]}")" "")"
     done
     json="$json]"
     sel=$(select_marker "$json" "$NOW_EPOCH" "$THRESH" "" 999999999)
@@ -213,7 +229,10 @@ mean_small_position_old() {
     case "$sel" in L1|L2) : ;; *) total=$((total+pos)); count=$((count+1));; esac
     local newremaining=()
     for id in "${remaining_ids[@]}"; do [ "$id" != "$sel" ] && newremaining+=("$id"); done
-    remaining_ids=("${newremaining[@]}")
+    # ga-55szfj: `${arr[@]+"${arr[@]}"}`, not `"${arr[@]}"` — under `set -u` bash < 4.4
+    # (3.2 is what /bin/bash is) treats expanding an EMPTY array as "unbound variable",
+    # and the final drain step leaves this list empty.
+    remaining_ids=(${newremaining[@]+"${newremaining[@]}"})
   done
   [ "$count" -gt 0 ] && echo "$((total * 100 / count))" || echo "0"   # x100 fixed-point avg
 }
@@ -221,15 +240,13 @@ mean_small_position_old() {
 mean_small_position_new() {
   local pos=0 sel total=0 count=0
   local remaining_ids=("${IDS[@]}")
-  local -A ago_of size_of
-  for i in "${!IDS[@]}"; do ago_of["${IDS[$i]}"]="${AGO_SECS[$i]}"; size_of["${IDS[$i]}"]="${SIZES[$i]}"; done
   while [ "${#remaining_ids[@]}" -gt 0 ]; do
     pos=$((pos+1))
     local json="[" first=1 id
     for id in "${remaining_ids[@]}"; do
       [ "$first" -eq 0 ] && json="$json,"
       first=0
-      json="$json$(mk "$id" "$(ago "${ago_of[$id]}")" "${size_of[$id]}")"
+      json="$json$(mk "$id" "$(ago "${AGO_SECS[$(idx_of "$id")]}")" "${SIZES[$(idx_of "$id")]}")"
     done
     json="$json]"
     sel=$(select_marker "$json" "$NOW_EPOCH" "$THRESH" "" 999999999)
@@ -237,7 +254,10 @@ mean_small_position_new() {
     case "$sel" in L1|L2) : ;; *) total=$((total+pos)); count=$((count+1));; esac
     local newremaining=()
     for id in "${remaining_ids[@]}"; do [ "$id" != "$sel" ] && newremaining+=("$id"); done
-    remaining_ids=("${newremaining[@]}")
+    # ga-55szfj: `${arr[@]+"${arr[@]}"}`, not `"${arr[@]}"` — under `set -u` bash < 4.4
+    # (3.2 is what /bin/bash is) treats expanding an EMPTY array as "unbound variable",
+    # and the final drain step leaves this list empty.
+    remaining_ids=(${newremaining[@]+"${newremaining[@]}"})
   done
   [ "$count" -gt 0 ] && echo "$((total * 100 / count))" || echo "0"
 }
