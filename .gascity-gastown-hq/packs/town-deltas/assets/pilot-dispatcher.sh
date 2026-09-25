@@ -6654,7 +6654,9 @@ _pilot_dog_store_blind_migrate_dest() {
   local _story_json="$1" _src_rig="$2"
   local _text
   _text=$(printf '%s' "$_story_json" | jq -r '(.title // "") + "\n" + (.description // "")' 2>/dev/null || echo "")
-  [ -z "$PILOT_RIG_PATHS_JSON" ] && rig_root_path "gascity" >/dev/null 2>&1   # force memoization
+  if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
+    rig_root_path "gascity" >/dev/null 2>&1 || true   # force memoization; failure is handled just below
+  fi
   if [ -z "$PILOT_RIG_PATHS_JSON" ]; then
     # Not silent: "could not list rigs" must not read, in the log, as "no other
     # rig was named" — both end at HQ, for different reasons.
@@ -6690,8 +6692,9 @@ EOF_RIGNAMES
 # _pilot_story_already_migrated <bead_json> — ga-6u64fm: exit 0 (REFUSE a
 # further migration) iff the bead already carries the gc.migrated_from marker
 # the migration itself stamps on every copy, OR that can't be told (input not
-# JSON, metadata present but not an object). Exit 1 (proceed) only for a
-# readable bead that positively lacks the marker (absent/empty metadata).
+# JSON, an empty/null result — nothing was actually read —, or metadata present
+# but not an object). Exit 1 (proceed) only for a readable bead OBJECT that
+# positively lacks the marker (absent/empty/null metadata).
 # Accepts either a bare object or the one-element array `bd show --json` prints.
 #
 # One hop only: a copy that lands somewhere it still cannot be served must be
@@ -6702,13 +6705,17 @@ EOF_RIGNAMES
 # regression could hop one new bead per sweep indefinitely. Three states, not
 # a boolean: unreadable is treated like present (inert: park), never like absent.
 _pilot_story_already_migrated() {
-  local _rc
+  # `|| _rc=$?`, not a bare pipeline + `_rc=$?`: this file runs under `set -euo pipefail`, and jq -e
+  # exits 1 for "no marker" and >=2 for "unreadable" — a bare pipeline would abort the shell on
+  # exactly the states this predicate exists to answer, whenever the caller is not an `if`.
+  local _rc=0
   printf '%s' "${1:-}" | jq -e '
     (if type == "array" then .[0] else . end)
-    | (.metadata // {})
-    | if type == "object" then has("gc.migrated_from") else error("metadata is not an object") end
-  ' >/dev/null 2>&1
-  _rc=$?
+    | if type != "object" then error("bead is not an object")
+      else (.metadata // {})
+           | if type == "object" then has("gc.migrated_from") else error("metadata is not an object") end
+      end
+  ' >/dev/null 2>&1 || _rc=$?
   case "$_rc" in
     1) return 1 ;;   # jq -e: false — readable, no marker
     *) return 0 ;;   # true (marker present) or >=2 (error / not JSON): refuse
@@ -6790,7 +6797,9 @@ _pilot_migrate_dog_store_blind_bead() {
   # global, and a `$(...)` call site runs in a subshell that throws the memo
   # away — so the destination picker and the rig_root_path call below would each
   # pay their own `gc rig list` (8-17s under Dolt load) on the dispatch path.
-  [ -z "${PILOT_RIG_PATHS_JSON:-}" ] && rig_root_path "gascity" >/dev/null 2>&1
+  if [ -z "${PILOT_RIG_PATHS_JSON:-}" ]; then
+    rig_root_path "gascity" >/dev/null 2>&1 || true
+  fi
 
   local _dest_rig _dest_city
   _dest_rig=$(_pilot_dog_store_blind_migrate_dest "$_story_json" "$_src_rig")

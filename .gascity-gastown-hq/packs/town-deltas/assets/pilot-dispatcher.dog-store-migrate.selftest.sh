@@ -99,6 +99,16 @@ for _fn_var in PATHTOK_FN MIGRATED_FN GUARD_FN BUILDERS_FN BUILDER_FN; do
     exit 2
   fi
 done
+# The dispatcher runs under `set -euo pipefail` (pilot-dispatcher.sh, top). A bare `bash -c` would NOT,
+# and code that is fine without errexit/nounset can abort under them (a `jq -e` "false" is exit 1; a
+# `[ .. ] && cmd` whose cmd fails is the LAST command of the list) — so every sandbox below starts with
+# the dispatcher's own options, or the test would prove a shell the production code never runs in.
+DISPATCHER_OPTS="$(grep -m1 -E '^set -[euo]+ ?[a-z]*' "$DISPATCHER" | tr -d '\r')"
+case "$DISPATCHER_OPTS" in
+  "set -euo pipefail") : ;;
+  *) echo "FATAL: expected the dispatcher to run under 'set -euo pipefail', found '$DISPATCHER_OPTS' — update this selftest's sandbox to match" >&2; exit 2 ;;
+esac
+
 # Everything the two functions under test call, defined together so a sandbox can never
 # silently lack one (a missing helper would degrade to the HQ default and pass by accident).
 FN_PRELUDE="$RIGPATH_FN
@@ -123,7 +133,8 @@ echo ""
 echo "=== Part A: _pilot_dog_store_blind_migrate_dest (pure, no bd calls) ==="
 
 run_dest() { # run_dest <story_json> <src_rig>
-  PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" bash -c "warn() { echo \"WARN: \$*\" >&2; }
+  PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
 $FN_PRELUDE"'
 _pilot_dog_store_blind_migrate_dest "$1" "$2"' _ "$1" "$2"
 }
@@ -196,7 +207,8 @@ expect_dest whatsapp_automation gastown 'ver "whatsapp_automation/scripts/x.py",
   "quotes/parens/commas delimit the token -> whatsapp_automation"
 
 # gc rig list failing must be ANNOUNCED, not silently read as "no other rig was named".
-RIGFAIL_OUT=$(PILOT_RIG_PATHS_JSON="" bash -c "warn() { echo \"WARN: \$*\" >&2; }
+RIGFAIL_OUT=$(PILOT_RIG_PATHS_JSON="" bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
 gc_json_or_unknown() { return 1; }
 GC_CITY=/nonexistent
 $FN_PRELUDE"'
@@ -297,7 +309,7 @@ run_migrate() { # run_migrate <scenario> [<story_json>]
   local _scenario="$1" _story="${2:-$STORY_JSON}" _bin
   _bin=$(fake_bd "$_scenario")
   PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
-    bash -c "
+    bash -c "$DISPATCHER_OPTS
 warn() { echo \"WARN: \$*\" >&2; }
 log()  { echo \"LOG: \$*\"; }
 $FN_PRELUDE
@@ -313,7 +325,7 @@ run_migrate_cold() {
   _bin=$(fake_bd "$_scenario")
   : > "$GCLIST_COUNT"
   PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="" GC_CITY="$WORK/gascity" FAKE_RIGS_JSON="$FAKE_RIGS_JSON" GCLIST_COUNT="$GCLIST_COUNT" \
-    bash -c "
+    bash -c "$DISPATCHER_OPTS
 warn() { echo \"WARN: \$*\" >&2; }
 log()  { echo \"LOG: \$*\"; }
 gc_json_or_unknown() { echo x >> \"\$GCLIST_COUNT\"; printf '%s' \"\$FAKE_RIGS_JSON\"; }
@@ -467,6 +479,32 @@ OUT=$(run_migrate "happy" "$BAD_META_STORY" 2>/dev/null); RC=$?
   && ok "metadata present but not an object (can't tell) -> refuses (inert), never treated as 'no marker'" \
   || bad "unreadable metadata -> expected refusal, got rc=$RC out='$OUT'"
 
+# Scenario 9b: the predicate answers the same way whether or not its caller is an `if`. Under the
+# dispatcher's `set -euo pipefail`, a bare `jq -e` that says "unreadable" (rc>=2) or "no marker" (rc 1)
+# would abort the shell INSIDE the function instead of returning — masked today only because every call
+# site happens to be an `if` condition. Called here as a plain statement, where errexit is live.
+for _in in '{"metadata":"oops"}' 'not json at all' '[]' 'null' '' '"a string"' ; do
+  _o=$(bash -c "$DISPATCHER_OPTS
+$MIGRATED_FN"'
+_pilot_story_already_migrated "$1"
+echo survived' _ "$_in" 2>&1)
+  [ "$_o" = "survived" ] \
+    && ok "predicate as a bare statement under set -euo pipefail: '$_in' -> returns 0 (refuse) and the shell carries on" \
+    || bad "predicate as a bare statement under set -euo pipefail: '$_in' -> the shell ABORTED inside the helper (got '${_o:-<nothing>}')"
+done
+# ... and the destination picker survives an unparseable rig list (jq exits 2, rig_root_path returns 2 under
+# pipefail) as a bare statement — falls to the HQ default instead of dying in the memo warm-up.
+_o=$(PILOT_RIG_PATHS_JSON="" bash -c "$DISPATCHER_OPTS
+warn() { echo \"WARN: \$*\" >&2; }
+gc_json_or_unknown() { printf '%s' '<html>502 bad gateway</html>'; }
+GC_CITY=/nonexistent
+$FN_PRELUDE"'
+_pilot_dog_store_blind_migrate_dest "{\"title\":\"x\",\"description\":\"whatsapp_automation/scripts/x.py\"}" gastown >/dev/null 2>&1
+echo survived' 2>&1)
+[ "$_o" = "survived" ] \
+  && ok "destination picker as a bare statement under set -euo pipefail with an UNPARSEABLE rig list -> survives (HQ default), does not die in the memo warm-up" \
+  || bad "destination picker died under set -euo pipefail with an unparseable rig list (got '${_o:-<nothing>}')"
+
 # Scenario 10: refusing must not be over-broad — empty/unrelated metadata still migrates.
 for _m in '{}' 'null' '{"pilot.dispatched_at":"1"}'; do
   _st=$(jq -cn --argjson m "$_m" '{id:"ORIG-1",title:"daemon gap bug",priority:2,issue_type:"bug",description:"gap",labels:[],metadata:$m}')
@@ -482,7 +520,8 @@ run_migrate "happy" >/dev/null 2>&1; CALLLOG="$(calllog_for happy)"
 WRITTEN_META=$(grep -E '^create\|' "$CALLLOG" | head -1 | sed -n 's/.*--metadata \({[^ ]*}\).*/\1/p')
 if [ -n "$WRITTEN_META" ] && printf '%s' "$WRITTEN_META" | jq -e 'has("gc.migrated_from")' >/dev/null 2>&1; then
   COPY_JSON=$(jq -cn --argjson m "$WRITTEN_META" '{id:"NEW-1",title:"t",metadata:$m}')
-  if bash -c "$MIGRATED_FN"'
+  if bash -c "$DISPATCHER_OPTS
+$MIGRATED_FN"'
 _pilot_story_already_migrated "$1"' _ "$COPY_JSON"; then
     ok "round trip: the metadata the migration stamps on a copy IS refused by _pilot_story_already_migrated"
   else
