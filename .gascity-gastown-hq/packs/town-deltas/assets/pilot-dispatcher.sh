@@ -6344,10 +6344,29 @@ _ownership_guard_should_refuse() {
     case "$_cur_status" in
       blocked|closed|deferred) printf 'status:%s' "$_cur_status"; return 0 ;;
     esac
-    # Actively being built by a REAL external crew (not a pool worker / dog / self).
+    # Actively being built by a REAL external crew, OR by a live pool identity
+    # that claimed THIS bead directly (self, dead/orphaned pool claims still
+    # fall through unchanged).
     if [ "$_cur_status" = "in_progress" ] && [ -n "$_asg" ] && [ "$_asg" != "null" ]; then
       case "$_asg" in
-        gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*) : ;;
+        gastown.dog|gastown.dog-*|wa-worker|wa-worker-*|ps-worker|ps-worker-*)
+          # ga-uirg32 (4th recurrence): an ephemeral-pool assignee here is NOT
+          # proof by itself of "no real owner" — Gas Town's routed-pool
+          # self-serve probe (Step 1c: `gc bd update <id> --claim`) can claim
+          # a target bead DIRECTLY, with no sling wrapper involved at all,
+          # whenever gc.routed_to=<pool> lands on it (e.g. via
+          # pilot-missing-route-watchdog). A blanket no-op here let Pilot
+          # mint a second sling onto a bead gastown.dog-2 had already claimed
+          # in_progress 2m44s earlier. Only a CONFIRMED-LIVE instance is a
+          # real competing claim; a dead/orphaned one must still fall through
+          # to the existing reclaim paths (ga-e5yw2/ga-v3z4z), unchanged.
+          # Same fail-open discipline as signal (b) below: an untrustworthy
+          # roster (_DEADWORKER_OK!=1) never blocks a dispatch it can't verify.
+          if [ "${_DEADWORKER_OK:-0}" = "1" ] && _session_is_active_owner "$_asg"; then
+            printf 'external-claim:%s@in_progress' "$_asg"
+            return 0
+          fi
+          ;;
         "$SELF_BEAD_ID") : ;;
         *) printf 'external-claim:%s@in_progress' "$_asg"; return 0 ;;
       esac
