@@ -949,7 +949,18 @@ else
   bad "ga-pgxs78: fallthrough destination missing or out of order (intercept=$_TZ0OP_LN dead-transient-retry=$_DEAD_TRANSIENT_LN) — excluding transient here would strand it instead of routing it somewhere better"
 fi
 if [ -n "$_DEAD_TRANSIENT_LN" ]; then
-  _FALLTHROUGH_EXCERPT=$(sed -n "${_DEAD_TRANSIENT_LN},$((_DEAD_TRANSIENT_LN + 40))p" "$DISPATCHER")
+  # ga-a6etc2 (gate round 1): the excerpt used to be a fixed 40 lines below the marker.
+  # That window was already 1 line from being too small (the requeue sat 39 lines down),
+  # so ANY comment or guard added inside the branch — the stuck-counter flag, the rc
+  # capture — pushed the call out of it and this guard failed for a reason unrelated to
+  # what it protects. Bound the excerpt by the branch itself instead: it ends where the
+  # NEXT branch (the ga-acb retry_dead circuit-break) begins. Independent of comment
+  # length, and stricter in the other direction (it can never match a `queued` write
+  # that belongs to an unrelated later branch). If that anchor is ever renamed the
+  # excerpt falls back to a generous fixed window rather than silently going empty.
+  _ACB_LN=$(awk -v m="$_DEAD_TRANSIENT_LN" 'NR > m && /ga-acb: retry_dead circuit-break/ { print NR; exit }' "$DISPATCHER")
+  [ -n "$_ACB_LN" ] || _ACB_LN=$((_DEAD_TRANSIENT_LN + 120))
+  _FALLTHROUGH_EXCERPT=$(sed -n "${_DEAD_TRANSIENT_LN},${_ACB_LN}p" "$DISPATCHER")
   # ga-a6etc2: the requeue is now written as gate_requeue_respecting_external
   # (compare-before-write; it calls set_gate_status ... queued itself unless an
   # external transition landed mid-sweep). Same wiring, same payoff — accept the
@@ -958,7 +969,7 @@ if [ -n "$_DEAD_TRANSIENT_LN" ]; then
   if printf '%s\n' "$_FALLTHROUGH_EXCERPT" | grep -E 'set_gate_status "\$MARKER_ID" "queued"|gate_requeue_respecting_external "\$MARKER_ID" "queued"' >/dev/null; then
     ok "ga-pgxs78: the fallthrough destination retries via gate-status:queued (the dispatcher's OWN fast Step 0b selection), not a slower cross-daemon path"
   else
-    bad "ga-pgxs78: expected gate-status:queued retry wiring not found within 40 lines of the fallthrough destination — the payoff (faster retry) may have moved or disappeared"
+    bad "ga-pgxs78: expected gate-status:queued retry wiring not found inside the dead-author transient-retry branch (marker line $_DEAD_TRANSIENT_LN .. $_ACB_LN) — the payoff (faster retry) may have moved or disappeared"
   fi
 fi
 

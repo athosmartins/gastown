@@ -5203,22 +5203,54 @@ case "$GATE_CLEAN_RETRY_HARD_CAP" in ''|*[!0-9]*) GATE_CLEAN_RETRY_HARD_CAP=7 ;;
 # for the next sweep, which is SAFE (the attempt count still advances toward
 # GATE_CLEAN_RETRY_HARD_CAP, so the retry stays bounded) but is exactly the
 # head-of-line exposure this function exists to prevent, so it must be visible.
+# RETURN CODE = what actually happened, so a caller can word its audit trail from
+# the outcome instead of from the intent (ga-a6etc2 gate-fix 1, "comment promises
+# more than the code"): 0 = stamped, 1 = the label write FAILED (nothing stamped),
+# 2 = nothing to do (cooldown disabled, or empty marker id). Callers run under
+# `set -e`: capture with `|| _CD_RC=$?`, never as a bare statement.
 gate_retry_cooldown_stamp() {
   local _id="$1" _now="${2:-}" _until _cur _lbl
-  [ -z "$_id" ] && return 0
-  [ "${GATE_RETRY_COOLDOWN_SECONDS:-0}" -gt 0 ] 2>/dev/null || return 0
+  [ -z "$_id" ] && return 2
+  [ "${GATE_RETRY_COOLDOWN_SECONDS:-0}" -gt 0 ] 2>/dev/null || return 2
   [ -n "$_now" ] || _now=$(date +%s)
   _until=$(( _now + GATE_RETRY_COOLDOWN_SECONDS ))
   _cur=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]? | select(test("^gate:retry-cooldown-until:[0-9]+$"))' 2>/dev/null || true)
   if ! bd -C "$GC_CITY" label add "$_id" "gate:retry-cooldown-until:$_until" -q 2>/dev/null; then
     warn "Marker $_id: FAILED to write gate:retry-cooldown-until:$_until — it stays eligible next sweep (retry remains capped at GATE_CLEAN_RETRY_HARD_CAP, but head-of-line protection is off for this attempt) (ga-a6etc2)."
-    return 0
+    return 1
   fi
   for _lbl in $_cur; do
     [ "$_lbl" = "gate:retry-cooldown-until:$_until" ] && continue
     bd -C "$GC_CITY" label remove "$_id" "$_lbl" -q 2>/dev/null || true
   done
+  return 0
+}
+
+# gate_retry_cooldown_clear <marker_id>
+# Removes every gate:retry-cooldown-until:* label it can see. Used when the sweep
+# stamped a cooldown and THEN found the requeue was not ours to do (another actor
+# moved the marker): the just-stamped deadline would otherwise ride along on a
+# marker the Mayor parked, and when the Mayor later re-queues it by hand the
+# selection would silently hold it out for up to GATE_RETRY_COOLDOWN_SECONDS.
+# Best effort by design (the label only ever delays a marker, and expires on its
+# own); a read or remove failure is logged, never fatal.
+gate_retry_cooldown_clear() {
+  local _id="$1" _json _cur _lbl
+  [ -z "$_id" ] && return 0
+  # Three states, not two: "read fine, no cooldown label" and "could not read the marker at
+  # all" must not look alike — the second is logged, not folded into an empty label list.
+  _json=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null || true)
+  if [ -z "$_json" ] || ! _cur=$(printf '%s' "$_json" \
+      | jq -r 'if type=="array" then .[0] else . end | (.labels // [])[]? | select(test("^gate:retry-cooldown-until:[0-9]+$"))' 2>/dev/null); then
+    warn "Marker $_id: could not read it to clear the cooldown stamped a moment ago — it expires by itself after GATE_RETRY_COOLDOWN_SECONDS (ga-a6etc2)."
+    return 0
+  fi
+  for _lbl in $_cur; do
+    bd -C "$GC_CITY" label remove "$_id" "$_lbl" -q 2>/dev/null \
+      || warn "Marker $_id: could not remove $_lbl after respecting an external transition — it expires by itself (ga-a6etc2)."
+  done
+  return 0
 }
 
 # gate_requeue_respecting_external <marker_id> <new_status> [expected_status]
@@ -5226,8 +5258,24 @@ gate_retry_cooldown_stamp() {
 # (default dispatching) and puts it back at <new_status>. Unlike a bare
 # set_gate_status it first READS the marker: if the marker is closed, or carries
 # a gate-status:* other than the two this sweep owns, someone else (Mayor, a
-# watchdog) moved it while the sweep ran — that transition wins; this sweep only
-# drops its own transient label and does not write <new_status>.
+# watchdog) moved it while the sweep ran — that transition wins and nothing is
+# written for <new_status>.
+# NOT ATOMIC: the read and the write are two bd calls, so a transition landing in
+# the gap between them (a few seconds, not the ~25s a sweep holds the marker) is
+# still overwritten. This narrows the window; it does not close it.
+# RETURN CODE says which of two very different things happened — callers must NOT
+# narrate a requeue the code did not perform (ga-a6etc2 gate-fix 1):
+#   0                         wrote gate-status:<new_status> (a normal requeue, or
+#                             the legacy overwrite when the marker was UNREADABLE)
+#   GATE_REQUEUE_RESPECTED_RC an external transition was respected; NOTHING was
+#                             requeued. A CLOSED marker is left completely
+#                             untouched (closed markers are invisible to every
+#                             phase, and stripping its only gate-status label
+#                             made gate_marker_status_ensure "repair" it with a
+#                             gate-status:error and a false Mayor alarm); a marker
+#                             at a foreign gate-status only drops the transient
+#                             <expected_status> label this sweep itself placed.
+# The dispatcher runs under `set -e`: capture the rc with `|| _RQ_RC=$?`.
 # Three-state read (error != empty, ga-p5q3 class): the marker is either READ
 # (decide from what it says), or UNREADABLE — bd failed, printed nothing, printed
 # non-JSON, or printed an error envelope with no .id. UNREADABLE takes the legacy
@@ -5236,6 +5284,7 @@ gate_retry_cooldown_stamp() {
 # TTL, a worse default than the rare lost transition) — but it is never SILENT:
 # every unreadable read is logged, so "could not verify" is countable in the log
 # and never indistinguishable from "verified, nothing external happened".
+GATE_REQUEUE_RESPECTED_RC=10
 gate_requeue_respecting_external() {
   local _id="$1" _new="$2" _expect="${3:-dispatching}" _json _mid _mstatus _foreign
   [ -z "$_id" ] && return 0
@@ -5248,13 +5297,39 @@ gate_requeue_respecting_external() {
     _mstatus=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null || true)
     _foreign=$(printf '%s' "$_json" | jq -r --arg e "gate-status:$_expect" --arg n "gate-status:$_new" \
       'if type=="array" then .[0] else . end | (.labels // [])[]? | select(startswith("gate-status:")) | select(. != $e and . != $n)' 2>/dev/null || true)
-    if [ "$_mstatus" = "closed" ] || [ -n "$_foreign" ]; then
-      warn "Marker $_id: an external transition landed while this sweep held it (status='${_mstatus:-?}', foreign gate-status: ${_foreign:-none}) — respecting it, NOT overwriting with gate-status:$_new (ga-a6etc2)."
+    if [ "$_mstatus" = "closed" ]; then
+      warn "Marker $_id: it was CLOSED while this sweep held it — leaving it exactly as it is, nothing requeued, no label touched (ga-a6etc2)."
+      return "$GATE_REQUEUE_RESPECTED_RC"
+    fi
+    if [ -n "$_foreign" ]; then
+      warn "Marker $_id: an external transition landed while this sweep held it (foreign gate-status: $_foreign) — respecting it, NOT overwriting with gate-status:$_new (ga-a6etc2)."
       bd -C "$GC_CITY" label remove "$_id" "gate-status:$_expect" -q 2>/dev/null || true
-      return 0
+      return "$GATE_REQUEUE_RESPECTED_RC"
     fi
   fi
   set_gate_status "$_id" "$_new"
+}
+
+# gate_requeue_note_skipped <rc>
+# Called by a rebase-retry site when gate_requeue_respecting_external returned
+# non-zero: records WHAT the sweep did (nothing) in the same three variables the
+# site would have filled with its "requeued" story, so QG_LOG and the "Dispatcher
+# sweep complete" line the throughput watchdog reads never say QUEUED for a marker
+# that was not requeued. Sets _REQUEUE_RESPECTED=1 only for the "respected an
+# external transition" outcome — the closing gate_marker_status_ensure is skipped
+# then, because the marker's status is no longer this sweep's to judge.
+# Any other non-zero rc is a failed write: the marker's label is UNVERIFIED and
+# the closing self-heal must still run, so _REQUEUE_RESPECTED stays unset.
+gate_requeue_note_skipped() {
+  local _rc="${1:-1}"
+  if [ "$_rc" = "$GATE_REQUEUE_RESPECTED_RC" ]; then
+    _REQUEUE_RESPECTED=1
+    REBASE_EVENT="dispatcher_requeue_respected_external"
+    REBASE_VERDICT="REQUEUE-SKIPPED (another actor moved or closed the marker while this sweep held it — that transition stands, nothing was requeued; ga-a6etc2)"
+  else
+    REBASE_EVENT="dispatcher_requeue_write_failed"
+    REBASE_VERDICT="REQUEUE-FAILED (the gate-status write returned rc=$_rc — the marker's label is unverified and the closing self-heal decides; ga-a6etc2)"
+  fi
 }
 
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
@@ -13282,30 +13357,40 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           _TIER5_NOTE=""
         fi
         # ga-a6etc2: compare-before-write — see gate_requeue_respecting_external.
-        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
-        # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
-        # above — REBASE_AUTHOR is this branch's own verified-alive identity.
-        # ga-kyxih (AC4): a branch carrying an internal merge commit reaching
-        # THIS retry path means the auto-merge attempt above
-        # (branch_has_merge_in_range(), ga-sg1axd) itself hit trouble — no
-        # longer the common self-healing plumbing blip the default "no
-        # action needed" wording assumes. Don't leave the author waiting:
-        # tell them the deterministic fallback now, not only after retries
-        # are exhausted. Branches with no internal merge (the overwhelming
-        # majority of transient retries) keep the original, correct "no
-        # action needed" wording unchanged.
-        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
-          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-            "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): auto-merge hit a transient failure (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. Your branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih), so if this keeps failing after $MAX_REBASE_ATTEMPTS attempts, don't wait: run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH yourself and push." \
-            --delivery wait-idle 2>/dev/null || true
+        # SELFTEST-EXTRACT ga-a6etc2-live-requeue: BEGIN
+        _RQ_RC=0
+        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?  # ga-7fwt1
+        if [ "$_RQ_RC" = "0" ]; then
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS (gt-4tk5m): branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) — $_PUSH_DIAG. Re-queued for next sweep; no /gate-done re-run needed.${_TIER5_NOTE}" 2>/dev/null || true
+          # ga-6dp9 (gate-fix-2): same notify-identity fix as the bounce branches
+          # above — REBASE_AUTHOR is this branch's own verified-alive identity.
+          # ga-kyxih (AC4): a branch carrying an internal merge commit reaching
+          # THIS retry path means the auto-merge attempt above
+          # (branch_has_merge_in_range(), ga-sg1axd) itself hit trouble — no
+          # longer the common self-healing plumbing blip the default "no
+          # action needed" wording assumes. Don't leave the author waiting:
+          # tell them the deterministic fallback now, not only after retries
+          # are exhausted. Branches with no internal merge (the overwhelming
+          # majority of transient retries) keep the original, correct "no
+          # action needed" wording unchanged.
+          if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+            gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+              "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): auto-merge hit a transient failure (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. Your branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih), so if this keeps failing after $MAX_REBASE_ATTEMPTS attempts, don't wait: run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH yourself and push." \
+              --delivery wait-idle 2>/dev/null || true
+          else
+            gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+              "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): transient rebase push race detected (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. No action needed unless this keeps retrying." \
+              --delivery wait-idle 2>/dev/null || true
+          fi
+          REBASE_EVENT="dispatcher_autorebase_retry_alive"
+          REBASE_VERDICT="QUEUED (transient rebase race, author $REBASE_AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
         else
-          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-            "Gate auto-retry for branch $BRANCH (${BEAD_ID:-unknown}): transient rebase push race detected (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS) — re-queued for next sweep. No action needed unless this keeps retrying." \
-            --delivery wait-idle 2>/dev/null || true
+          # ga-a6etc2 gate-fix 1: nothing was requeued (an external transition was
+          # respected, or the write failed) — no "Re-queued" comment, no nudge telling a
+          # live author nothing is needed, and no QUEUED verdict for the watchdog log.
+          gate_requeue_note_skipped "$_RQ_RC"
         fi
-        REBASE_EVENT="dispatcher_autorebase_retry_alive"
-        REBASE_VERDICT="QUEUED (transient rebase race, author $REBASE_AUTHOR live, retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS)"
+        # SELFTEST-EXTRACT ga-a6etc2-live-requeue: END
       else
         err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $REBASE_AUTHOR — escalating."
         set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
@@ -13385,10 +13470,21 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
       # matching comment at the live-author call site above) — a stuck counter
       # here would otherwise replay "attempt 1/3, dead author" forever instead
       # of ever reaching the retry_dead circuit-break below.
+      # ga-a6etc2 gate-fix 1: forcing NEXT_ATTEMPT=MAX_REBASE_ATTEMPTS (3) is NOT
+      # enough to escalate a proven-clean marker any more — the bounded-retry guard
+      # below compares NEXT_ATTEMPT to GATE_CLEAN_RETRY_HARD_CAP (7), so a counter
+      # whose label write keeps failing would sit at 3 < 7 forever and requeue
+      # forever (the original incident's shape again, and the same bd label add is
+      # what the cooldown stamp uses, so the same fault plausibly disables it too).
+      # _COUNTER_STUCK carries the "counter cannot advance" fact to that guard.
+      # SELFTEST-EXTRACT ga-a6etc2-dead-stuck-check: BEGIN
+      _COUNTER_STUCK=0
       if [ "$(gate_rebase_attempt_advanced "$NEXT_ATTEMPT" "$(read_rebase_attempt "$MARKER_ID")")" = "stuck" ]; then
         warn "Branch $BRANCH: gate:rebase-fail-count label write did not take effect (intended $NEXT_ATTEMPT) — forcing escalation to avoid an infinite attempt-1/3 loop."
         NEXT_ATTEMPT="$MAX_REBASE_ATTEMPTS"
+        _COUNTER_STUCK=1
       fi
+      # SELFTEST-EXTRACT ga-a6etc2-dead-stuck-check: END
       if [ "$NEXT_ATTEMPT" -lt "$MAX_REBASE_ATTEMPTS" ]; then
         if [ "$_EXILE_THIS_ATTEMPT" = "1" ]; then
           warn "Branch $BRANCH: transient auto-rebase-fail, author dead/empty (attempt $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, exiled to tier5) — gate-status:queued for server-side retry."
@@ -13398,10 +13494,20 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           _TIER5_NOTE=""
         fi
         # ga-a6etc2: compare-before-write — see gate_requeue_respecting_external.
-        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author).${_TIER5_NOTE}" 2>/dev/null || true
-        REBASE_EVENT="dispatcher_autorebase_retry"
-        REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
+        # SELFTEST-EXTRACT ga-a6etc2-dead-requeue: BEGIN
+        _RQ_RC=0
+        gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?  # ga-7fwt1
+        if [ "$_RQ_RC" = "0" ]; then
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS: branch $BRANCH hit a transient auto-rebase failure (${CONFLICT_FILES:-plumbing}) and the author session is gone. Queued for server-side retry on next sweep (NOT stranded on a dead author).${_TIER5_NOTE}" 2>/dev/null || true
+          REBASE_EVENT="dispatcher_autorebase_retry"
+          REBASE_VERDICT="QUEUED (retry $NEXT_ATTEMPT/$MAX_REBASE_ATTEMPTS, dead author)"
+        else
+          # ga-a6etc2 gate-fix 1: nothing was requeued (an external transition was
+          # respected, or the write failed) — no "Queued for server-side retry" comment
+          # and no QUEUED verdict for the watchdog log.
+          gate_requeue_note_skipped "$_RQ_RC"
+        fi
+        # SELFTEST-EXTRACT ga-a6etc2-dead-requeue: END
       else
         # ga-acb: retry_dead circuit-break — retries exhausted + dead author.
         # Previously this set gate-status:needs-rebase, which the guard's Vector A
@@ -13449,12 +13555,18 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           fi
           REBASE_EVENT="dispatcher_circuit_break_retry_dead"
           REBASE_VERDICT="CIRCUIT-BREAK (retry_dead: ${MAX_REBASE_ATTEMPTS} attempts exhausted, dead author, needs-human armed=$_NH_STATUS)"
-        elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ] && [ "$NEXT_ATTEMPT" -lt "$GATE_CLEAN_RETRY_HARD_CAP" ]; then
+        elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ] && [ "${_COUNTER_STUCK:-0}" != "1" ] && [ "$NEXT_ATTEMPT" -lt "$GATE_CLEAN_RETRY_HARD_CAP" ]; then
           # ga-a6etc2: the `&& NEXT_ATTEMPT < GATE_CLEAN_RETRY_HARD_CAP` half is
           # the bound ga-y5c29l removed — without it this branch kept the marker
           # queued forever (fail-count 32, 82 min of head-of-line blocking). At
           # the cap control falls to the else below: the legacy needs-rebase
           # escalation, which parks the marker durably.
+          # ga-a6etc2 gate-fix 1: `_COUNTER_STUCK != 1` is the OTHER half of the
+          # bound. NEXT_ATTEMPT is only meaningful when the counter label write
+          # took effect; when it did not, the stuck check above forced NEXT_ATTEMPT
+          # to 3, which is < the cap, so counting alone would never reach 7. A stuck
+          # counter means "cannot bound this retry by counting" — escalate now, as
+          # gate_rebase_attempt_advanced's contract says.
           # ga-y5c29l: merge-tree already proved this branch merges into main
           # with ZERO conflicts this sweep — gate_circuit_break_check()'s own
           # ga-agtqm exemption is why _ACB_RETRY="ok" above. Retries being
@@ -13472,14 +13584,32 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           # attempts a gate:retry-cooldown-until label (stamped below) keeps the
           # marker out of every selection tier, so one failing marker can no
           # longer win every sweep while healthy markers wait.
-          warn "Branch $BRANCH: transient auto-rebase failure persists after $NEXT_ATTEMPT attempts (proven-clean retry cap $GATE_CLEAN_RETRY_HARD_CAP), dead author, but merge-tree already proved $BRANCH merges clean (ga-y5c29l) — staying in the bounded retry queue instead of circuit-breaking; next attempt not before ${GATE_RETRY_COOLDOWN_SECONDS}s from now (ga-a6etc2)."
           # Cooldown FIRST, requeue second: the marker is never `queued` without
           # its cooldown label, so no sweep can pick it up in the gap.
-          gate_retry_cooldown_stamp "$MARKER_ID"
-          gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching"  # ga-7fwt1 + ga-a6etc2
-          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry (ga-y5c29l): branch $BRANCH hit $NEXT_ATTEMPT transient auto-rebase failures (${CONFLICT_FILES:-plumbing}) and the author session is gone, but merge-tree already proved this branch merges into $DEFAULT_BRANCH with zero conflicts — not evidence of an unmergeable branch, so NOT circuit-broken. Remains queued behind a ${GATE_RETRY_COOLDOWN_SECONDS}s cooldown (ga-a6etc2) so it cannot monopolize the sweeps, and the retry is bounded: at $GATE_CLEAN_RETRY_HARD_CAP failed attempts the marker parks at gate-status:needs-rebase and the Mayor is mailed." 2>/dev/null || true
-          REBASE_EVENT="dispatcher_autorebase_retry_clean_exhausted"
-          REBASE_VERDICT="QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l)"
+          # Everything this branch SAYS is worded from what the two writes below
+          # actually returned (ga-a6etc2 gate-fix 1): a failed label write must not be
+          # narrated as a cooldown, and a requeue that was not ours to do must not be
+          # narrated as a requeue.
+          _CD_RC=0
+          gate_retry_cooldown_stamp "$MARKER_ID" || _CD_RC=$?
+          case "$_CD_RC" in
+            0) _CD_NOTE="behind a ${GATE_RETRY_COOLDOWN_SECONDS}s cooldown, so it cannot monopolize the sweeps" ;;
+            2) _CD_NOTE="with NO cooldown (GATE_RETRY_COOLDOWN_SECONDS=0 disables it)" ;;
+            *) _CD_NOTE="WITHOUT a cooldown (the gate:retry-cooldown-until label write FAILED, so it may be picked again on the very next sweep)" ;;
+          esac
+          _RQ_RC=0
+          gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?  # ga-7fwt1 + ga-a6etc2
+          if [ "$_RQ_RC" = "0" ]; then
+            warn "Branch $BRANCH: transient auto-rebase failure persists after $NEXT_ATTEMPT attempts (proven-clean retry cap $GATE_CLEAN_RETRY_HARD_CAP), dead author, but merge-tree already proved $BRANCH merges clean (ga-y5c29l) — staying in the bounded retry queue instead of circuit-breaking, ${_CD_NOTE} (ga-a6etc2)."
+            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate auto-retry (ga-y5c29l): branch $BRANCH hit $NEXT_ATTEMPT transient auto-rebase failures (${CONFLICT_FILES:-plumbing}) and the author session is gone, but merge-tree already proved this branch merges into $DEFAULT_BRANCH with zero conflicts — not evidence of an unmergeable branch, so NOT circuit-broken. Remains queued ${_CD_NOTE} (ga-a6etc2), and the retry is bounded: at $GATE_CLEAN_RETRY_HARD_CAP failed attempts the marker parks at gate-status:needs-rebase and the Mayor is mailed." 2>/dev/null || true
+            REBASE_EVENT="dispatcher_autorebase_retry_clean_exhausted"
+            REBASE_VERDICT="QUEUED (merge-tree proven clean, transient failures repeat, staying in bounded retry — ga-y5c29l)"
+          else
+            # Not requeued: drop the cooldown this branch just stamped, or it would ride
+            # along on a marker the Mayor parked and hold it out after a manual requeue.
+            [ "$_CD_RC" = "0" ] && gate_retry_cooldown_clear "$MARKER_ID"
+            gate_requeue_note_skipped "$_RQ_RC"
+          fi
         else
           # Reached by (a) GATE_AUTO_CIRCUIT_BREAK=0 with a branch never proven
           # clean — the original legacy needs-rebase escalation — or, since
@@ -13489,7 +13619,15 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
           _CAP_NOTE=""
           REBASE_EVENT="dispatcher_needs_rebase_escalated"
           _ESC_SUBJ="Gate escalation: $BRANCH stranded conflict (no live author)"
-          if [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ]; then
+          if [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ] && [ "${_COUNTER_STUCK:-0}" = "1" ]; then
+            # ga-a6etc2 gate-fix 1: reached NOT because the cap was hit but because the
+            # attempt counter cannot advance (its label write keeps failing), so the retry
+            # cannot be bounded by counting. Say exactly that — "reached the cap" would be
+            # false, and the real fault (a bd label-write problem) is what the Mayor must fix.
+            _CAP_NOTE=" (ga-a6etc2: merge-tree proved this branch clean, but the gate:rebase-fail-count label write did not take effect, so the attempt count cannot advance and the retry cannot be bounded by counting — escalating at once instead of retrying without limit; this points at a label-write fault, not a merge conflict)"
+            REBASE_EVENT="dispatcher_needs_rebase_clean_counter_stuck"
+            _ESC_SUBJ="Gate escalation: $BRANCH attempt counter stuck (merge-tree clean, no live author)"
+          elif [ "$REBASE_MERGE_TREE_PROVEN_CLEAN" = "1" ]; then
             _CAP_NOTE=" (ga-a6etc2: merge-tree proved this branch clean, but $NEXT_ATTEMPT failed attempts reached GATE_CLEAN_RETRY_HARD_CAP=$GATE_CLEAN_RETRY_HARD_CAP — the bounded retry is spent, so this is a repeated push/rebase failure, not a merge conflict)"
             REBASE_EVENT="dispatcher_needs_rebase_clean_retry_cap"
             _ESC_SUBJ="Gate escalation: $BRANCH bounded retry spent (merge-tree clean, no live author)"
@@ -13527,9 +13665,18 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
       '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
       >> "$QG_LOG" 2>/dev/null || true
 
-    if [ "$(gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)")" = "repaired" ]; then
+    # SELFTEST-EXTRACT ga-a6etc2-ensure-guard: BEGIN
+    if [ "${_REQUEUE_RESPECTED:-0}" = "1" ]; then
+      # ga-a6etc2 gate-fix 1: this sweep deliberately did NOT write the marker's status
+      # (another actor moved or closed it, and that transition stands). The marker's
+      # status is no longer this sweep's to judge, and gate_marker_status_ensure never
+      # looks at .status — it would "repair" a closed marker that carries no gate-status
+      # label by writing gate-status:error onto it and mailing the Mayor a false alarm.
+      log "  ga-kgtiw self-heal skipped for marker $MARKER_ID: this sweep respected an external transition on it and wrote no status."
+    elif [ "$(gate_marker_status_ensure "$MARKER_ID" "the auto-rebase decision (merge-conflict/transient-retry/circuit-break)")" = "repaired" ]; then
       warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the auto-rebase decision — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
     fi
+    # SELFTEST-EXTRACT ga-a6etc2-ensure-guard: END
     log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
     exit 0
   fi

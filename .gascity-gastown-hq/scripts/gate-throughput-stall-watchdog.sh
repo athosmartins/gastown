@@ -308,6 +308,23 @@ _gtsw_hol_repeat_check() {
   fi
 
   local subject="Watchdog: GATE HEAD-OF-LINE — $branch ganhou $cnt varreduras seguidas com $others marker(s) esperando"
+  # The commands in the mail name the REAL marker id(s) when the branch label was found
+  # (ga-a6etc2 gate round 1: they used a literal <marker> although hol_ids was known);
+  # only the "not found" case falls back to the placeholder. One pair per marker when
+  # the branch carries several.
+  local hol_first hol_cmds="" _hid
+  case "$hol_ids" in
+    unknown*) hol_first="<marker>"
+              hol_cmds="  bd -C $HQ label add <marker> gate-status:needs-rebase
+  bd -C $HQ label remove <marker> gate-status:queued
+" ;;
+    *)        hol_first="${hol_ids%%,*}"
+              for _hid in $(printf '%s' "$hol_ids" | tr ',' ' '); do
+                hol_cmds="${hol_cmds}  bd -C $HQ label add $_hid gate-status:needs-rebase
+  bd -C $HQ label remove $_hid gate-status:queued
+"
+              done ;;
+  esac
   local body
   body="$(cat <<BODY
 GATE HEAD-OF-LINE detectado pelo gate-throughput-stall-watchdog (ga-a6etc2).
@@ -329,23 +346,37 @@ gate:retry-cooldown-until entre tentativas e estaciona em needs-rebase no teto) 
 está lendo isto COM o fix no ar, é uma REGRESSÃO ou um caminho de retry que o fix não cobre.
 
 CONFIRA:
-  bd -C $HQ show <marker> --json | jq '.[0].labels'
+  bd -C $HQ show $hol_first --json | jq '.[0].labels'
   grep 'Dispatcher sweep complete' $DISPATCH_LOG | tail -8
 
 PARA DESTRAVAR AGORA (a branch precisa de rebuild sobre a main atual):
-  bd -C $HQ label add <marker> gate-status:needs-rebase
-  bd -C $HQ label remove <marker> gate-status:queued
-
+${hol_cmds}
 Nenhum kickstart foi feito: reiniciar o dispatcher não muda a seleção. Próximo aviso para
 esta branch só depois de $(( GATE_HOL_COOLDOWN_S / 60 ))min.
 BODY
 )"
 
+  # The dedup stamp below means "the Mayor was told" — the "HOL PERSISTS ... Mayor already
+  # mailed" line reads it that way. So it is written ONLY after a delivered mail; a failed
+  # send (gc missing, mail error) leaves no stamp and the next sweep tries again, instead of
+  # suppressing for GATE_HOL_COOLDOWN_S an alert nobody received (ga-a6etc2 gate round 1).
+  # GTSW_TEST_MAIL_RC is a test-only seam that simulates a failing send.
+  local mail_rc=0
   if [ -n "${GTSW_TEST_MAILED+x}" ]; then
-    echo "mail:gate-hol:$subject" >> "${GTSW_TEST_MAILED}" 2>/dev/null || true
+    if [ -n "${GTSW_TEST_MAIL_RC:-}" ] && [ "$GTSW_TEST_MAIL_RC" != "0" ]; then
+      mail_rc="$GTSW_TEST_MAIL_RC"
+    else
+      echo "mail:gate-hol:$subject" >> "${GTSW_TEST_MAILED}" 2>/dev/null || true
+      printf '%s\n' "$body" >> "${GTSW_TEST_MAILED}.body" 2>/dev/null || true
+    fi
+  elif command -v "$GC_BIN" >/dev/null 2>&1; then
+    "$GC_BIN" mail send mayor -s "$subject" -m "$body" 2>/dev/null || mail_rc=$?
   else
-    command -v "$GC_BIN" >/dev/null 2>&1 && \
-      "$GC_BIN" mail send mayor -s "$subject" -m "$body" 2>/dev/null || true
+    mail_rc=127
+  fi
+  if [ "$mail_rc" != "0" ]; then
+    log "WARN: HOL mail to the Mayor FAILED (rc=$mail_rc) for $branch — dedup NOT stamped, the next sweep retries"
+    return 0
   fi
   mkdir -p "${GTSW_STATE_DIR}" 2>/dev/null || true
   echo "$now" > "$state" 2>/dev/null || true
@@ -1601,7 +1632,7 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   # hol_run <log-text> <markers-json> [now]  → runs the detector; resets the mail sink first.
   HOLB="crew/wa-worker/wa-wqn2v"; HOL_NOW="$(date +%s)"
   HOL_MAIL="$TMP/hol-mail"; HOL_NOTIF="$TMP/hol-notif"; HOL_KICK="$TMP/hol-kick"
-  hol_reset() { : > "$HOL_MAIL"; : > "$HOL_NOTIF"; : > "$HOL_KICK"; rm -f "$TMP"/gate-hol-alert-* 2>/dev/null || true; }
+  hol_reset() { : > "$HOL_MAIL"; : > "$HOL_NOTIF"; : > "$HOL_KICK"; rm -f "$HOL_MAIL.body" "$TMP"/gate-hol-alert-* 2>/dev/null || true; }
   hol_run() {
     GTSW_TEST_MAILED="$HOL_MAIL"; GTSW_TEST_NOTIFIED="$HOL_NOTIF"; GTSW_TEST_KICKSTARTS="$HOL_KICK"
     _gtsw_hol_repeat_check "$1" "$2" "${3:-$HOL_NOW}"
@@ -1704,6 +1735,37 @@ if [ "${1:-}" = "--selftest" ] || [ "${GTSW_SELFTEST:-0}" = "1" ]; then
   [ "$(hol_mails)" = "1" ] && ok "HOL-12: …and the HOL mail still goes out from inside run_sweep (the jam is invisible to the PASS clock)" \
                            || bad "HOL-12: run_sweep did not invoke the detector (mails=$(hol_mails))"
   unset GTSW_TEST_NOW
+  hol_reset
+
+  echo "Scenario HOL-13 (gate round 1): a FAILED mail is not a delivered alert — no dedup stamp, the next sweep retries"
+  hol_reset; : > "$LOG"
+  GTSW_TEST_MAIL_RC=1 hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "0" ] && ! ls "$TMP"/gate-hol-alert-* >/dev/null 2>&1 \
+    && ok "HOL-13: send failed → no mail recorded and NO dedup state (nothing claims the Mayor was told)" \
+    || bad "HOL-13: a failed send still stamped the dedup file or counted as sent"
+  grep -q 'HOL mail to the Mayor FAILED (rc=1)' "$LOG" 2>/dev/null \
+    && ok "HOL-13: the failure is logged with its rc (a lost alert is visible, not silent)" || bad "HOL-13: mail failure not logged"
+  grep -q 'Mayor already mailed' "$LOG" 2>/dev/null \
+    && bad "HOL-13: the log claims the Mayor was already mailed when the send failed" || ok "HOL-13: no false 'Mayor already mailed' line"
+  hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)"
+  [ "$(hol_mails)" = "1" ] && ls "$TMP"/gate-hol-alert-* >/dev/null 2>&1 \
+    && ok "HOL-13: the very next sweep re-sends and only THEN stamps (retry, not a silent hour of suppression)" \
+    || bad "HOL-13: no retry after a failed send (mails=$(hol_mails))"
+
+  echo "Scenario HOL-14 (gate round 1): the unblock commands name the real marker id"
+  hol_reset; hol_run "$(six_same "$HOLB")" "$(hol_markers "$HOLB" 3)"
+  if grep -q 'label add hol-m gate-status:needs-rebase' "$HOL_MAIL.body" 2>/dev/null \
+     && grep -q 'label remove hol-m gate-status:queued' "$HOL_MAIL.body" 2>/dev/null \
+     && grep -q "show hol-m --json" "$HOL_MAIL.body" 2>/dev/null \
+     && ! grep -q '<marker>' "$HOL_MAIL.body" 2>/dev/null; then
+    ok "HOL-14: mail body carries copy-paste commands for hol-m (no literal <marker> placeholder)"
+  else
+    bad "HOL-14: unblock commands not concrete: $(cat "$HOL_MAIL.body" 2>/dev/null | grep -n 'marker\|hol-m' | head -6)"
+  fi
+  hol_reset; hol_run "$(six_same "$HOLB")" "$(hol_markers "crew/other/branch" 3)"
+  grep -q '<marker>' "$HOL_MAIL.body" 2>/dev/null \
+    && ok "HOL-14: branch label not found on any active marker → the placeholder is kept (honest fallback, not an invented id)" \
+    || bad "HOL-14: unknown-marker fallback lost"
   hol_reset
 
   # ── CLEANUP / SUMMARY ─────────────────────────────────────────────────────
