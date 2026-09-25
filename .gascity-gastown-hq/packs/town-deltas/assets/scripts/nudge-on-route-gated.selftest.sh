@@ -243,12 +243,27 @@ if [ "$LEGACY" = "0" ]; then
   run_script
   eq "a lock whose owner is dead is reclaimed and the run proceeds" "$(nudged)" "gastown.dog-1"
 
+  echo "== 15. one malformed event must not take the window down with it (no poison pill), and is counted"
+  new_case c15
+  {
+    printf '%s\n' '{"seq":1,"type":"bead.updated","payload":"this-should-be-an-object"}'
+    printf '%s\n' '{"seq":2,"type":"bead.updated","payload":{"bead":{"id":"ga-bad","status":"open","metadata":"not-an-object"}}}'
+    printf '%s\n' 'this line is not json at all'
+    ev 3 ga-good open - gastown.dog '[]'
+  } > "$FX/events.jsonl"
+  ready_ids ga-good
+  run_script
+  eq "the valid actionable bead is still woken for" "$(nudged)" "gastown.dog-1"
+  eq "the two unusable events are counted, not swallowed (non-json lines are just skipped)" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" | jq -r '.degraded.malformed_events')" "2"
+  eq "and did not inflate the routed count" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" | jq -r '.routed_beads')" "1"
+
   echo "== 11. store map resolves prefixes from local files (no gc rig list)"
   # shellcheck disable=SC1090
   GC_CITY="$SBX/mapcity" source "$NEW_SCRIPT" --lib
   mkdir -p "$SBX/mapcity/.gc"
   printf '[[rigs]]\nname = "whatsapp_automation"\nprefix = "wa"\n[rigs.imports]\n[[rigs]]\nname = "lexbh"\nprefix = "lx"\n' > "$SBX/mapcity/city.toml"
-  printf '[[rigs]]\nname = "whatsapp_automation"\npath = "/x/wa"\n[[rigs]]\nname = "lexbh"\npath = "/x/lx"\n' > "$SBX/mapcity/.gc/site.toml"
+  # the REAL shapes: city.toml declares [[rigs]] (name+prefix); .gc/site.toml declares [[rig]] (name+path), singular
+  printf '[[rig]]\nname = "whatsapp_automation"\npath = "/x/wa"\n\n[[rig]]\nname = "lexbh"\npath = "/x/lx"\n' > "$SBX/mapcity/.gc/site.toml"
   CITY="$SBX/mapcity"; MAP="$(gnr_store_map)"; GNR_STORE_MAP="$MAP"
   gnr_store_for_bead wa-abc123 && eq "wa- prefix -> rig path" "$GNR_STORE" "/x/wa" || bad "wa- prefix not resolved"
   gnr_store_for_bead ga-zzz    && eq "ga- prefix -> HQ (city path)" "$GNR_STORE" "$SBX/mapcity" || bad "ga- prefix not resolved"

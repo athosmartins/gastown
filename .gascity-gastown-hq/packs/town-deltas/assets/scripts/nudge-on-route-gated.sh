@@ -103,9 +103,13 @@ gnr_run() {
 # gnr_classify <state_json> <now_epoch>   (stdin: `gc events` output, one json per line)
 # Pure function of its inputs — no gc/bd. Prints one TSV row per routed bead:
 #   <class> <bead_id> <routed_to>
-# class: not_open | assigned | not_ready | already_nudged | actionable
+# class: not_open | assigned | not_ready | already_nudged | actionable | malformed
 # The LAST event per bead wins (highest seq): an early "open" event must not
 # resurrect a bead that a later event shows as in_progress.
+# One malformed event (payload/metadata of the wrong type, ...) must not take the
+# whole window down with it — a single jq program aborts on the first error, so
+# each event is isolated with `try` and reported as its own "malformed" row
+# (counted in the run log), never silently dropped and never a poison pill.
 gnr_classify() {
   jq -Rrn --argjson state "$1" --argjson now "$2" --argjson nr "$GNR_NOT_READY_LABELS" '
     def held($now):
@@ -121,21 +125,26 @@ gnr_classify() {
       (.labels // []) as $l
       | any($l[]; . as $x | ($nr | index($x)) != null or ($x | startswith("pool:refused")))
         or held($now);
-    [ inputs | fromjson? | select(type == "object")
-      | select((.payload.bead // null) != null and ((.payload.bead.id // "") != "")) ]
-    | to_entries | map(.value + {_i: .key})
-    | group_by(.payload.bead.id)
-    | map(max_by([(.seq // 0), ._i]))
-    | .[]
-    | .payload.bead as $b
-    | (($b.metadata // {})["gc.routed_to"] // "") as $t
-    | select($t != "")
-    | (if ($b.status // "") != "open" then "not_open"
-       elif (($b.assignee // "") != "") then "assigned"
-       elif ($b | not_ready($now)) then "not_ready"
-       elif ($state | has($b.id + "|" + $t)) then "already_nudged"
-       else "actionable" end) as $c
-    | [$c, $b.id, $t] | @tsv'
+    [ inputs | fromjson? | select(type == "object") ]
+    | map( try { ev: ., ok: (((.payload.bead // null) != null) and ((.payload.bead.id // "") != "")) }
+           catch { bad: true } ) as $x
+    | ( $x[] | select(.bad == true) | ["malformed", "-", "-"] | @tsv ),
+      ( [ $x[] | select(.ok == true) | .ev ]
+        | to_entries | map(.value + {_i: .key})
+        | group_by(.payload.bead.id)
+        | map(max_by([(.seq // 0), ._i]))
+        | .[]
+        | try (
+            .payload.bead as $b
+            | (($b.metadata // {})["gc.routed_to"] // "") as $t
+            | select($t != "")
+            | (if ($b.status // "") != "open" then "not_open"
+               elif (($b.assignee // "") != "") then "assigned"
+               elif ($b | not_ready($now)) then "not_ready"
+               elif ($state | has($b.id + "|" + $t)) then "already_nudged"
+               else "actionable" end) as $c
+            | [$c, $b.id, $t] | @tsv
+          ) catch (["malformed", "-", "-"] | @tsv) )'
 }
 
 # ── rig store resolution (local files only; `gc rig list` costs 8-17 s) ───────
@@ -366,13 +375,14 @@ gnr_main() {
 
   GNR_N_NUDGED=0; GNR_N_SKIPPED_BUSY=0; GNR_N_MEMBERS_FAILED=0; GNR_N_HOLDERS_UNKNOWN=0
   _c_routed=0; _c_not_open=0; _c_assigned=0; _c_not_ready=0; _c_already=0
-  _c_actionable=0; _c_ready_unknown=0; _c_not_ready_deps=0; _c_all_busy=0
+  _c_actionable=0; _c_ready_unknown=0; _c_not_ready_deps=0; _c_all_busy=0; _c_malformed=0
   _c_nudged_pairs=0; _c_none_ok=0; _c_deferred=0; _budget_hit=0
 
   # Pass 1: count + refresh already-nudged keys so a still-active routing is not
   # pruned and re-nudged while it keeps re-emitting bead.updated.
   while IFS="$(printf '\t')" read -r _class _bead _target; do
     [ -n "$_class" ] || continue
+    if [ "$_class" = "malformed" ]; then _c_malformed=$((_c_malformed + 1)); continue; fi
     _c_routed=$((_c_routed + 1))
     case "$_class" in
       not_open)       _c_not_open=$((_c_not_open + 1)) ;;
@@ -440,13 +450,14 @@ EOF
     --argjson holders_unknown "$GNR_N_HOLDERS_UNKNOWN" --argjson ready_unknown "$_c_ready_unknown" \
     --argjson deferred "$_c_deferred" --argjson budget_hit "$_budget_hit" \
     --argjson state_reset "$GNR_N_STATE_RESET" --argjson state_write_failed "$GNR_N_STATE_WRITE_FAILED" \
+    --argjson malformed "$_c_malformed" \
     '{ts:$ts, dur_s:$dur, routed_beads:$routed, legacy_pairs:$legacy, gated_pairs:$actionable,
       nudged_pairs:$nudged_pairs, sessions_nudged:$sessions_nudged, sessions_skipped_busy:$sessions_skipped_busy,
       suppressed:{not_open:$not_open, assigned:$assigned, not_ready_label:$not_ready, already_nudged:$already,
                   not_ready_deps:$not_ready_deps, all_busy:$all_busy},
       degraded:{none_ok:$none_ok, members_lookup_failed:$members_failed, holders_unknown:$holders_unknown,
                 ready_unknown:$ready_unknown, deferred_over_budget:$deferred, budget_hit:$budget_hit,
-                state_reset:$state_reset, state_write_failed:$state_write_failed}}' >> "$GNR_RUNLOG" 2>/dev/null || true
+                state_reset:$state_reset, state_write_failed:$state_write_failed, malformed_events:$malformed}}' >> "$GNR_RUNLOG" 2>/dev/null || true
   # Keep the run log bounded.
   if [ "$(wc -l < "$GNR_RUNLOG" 2>/dev/null || echo 0)" -gt "$GNR_RUNLOG_MAX_LINES" ]; then
     tail -n "$(( GNR_RUNLOG_MAX_LINES / 2 ))" "$GNR_RUNLOG" > "$GNR_RUNLOG.tmp" 2>/dev/null && mv -f "$GNR_RUNLOG.tmp" "$GNR_RUNLOG"
