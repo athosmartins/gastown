@@ -32,32 +32,140 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 echo "=== dolt-backup-reseed.selftest.sh ==="
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Part 1: _s3_current_backup_verified() — LIB-mode unit tests, stubbed aws
+# Shared helpers (ga-gsnee8): a fake `aws` that emulates the BUCKET as a
+# directory, and builders for realistic Dolt backup dirs (manifest + tables).
+# The previous stub only answered head-object + _meta/latest.json — enough for
+# the old "manifest object exists + size ratio" proof, and exactly why that
+# proof could not tell a restorable S3 copy from an unrestorable one.
 # ═══════════════════════════════════════════════════════════════════════════
-echo "── _s3_current_backup_verified() (ga-i99qsp) ──"
 
-LIB_SCRATCH="/tmp/reseed-selftest-lib.$$"
-mkdir -p "$LIB_SCRATCH/bin"
+# Table ids are 32 chars of Dolt's base32 charset; the manifest is colon-
+# separated: <ver>:<storage>:<lock>:<root>:<gcgen>:<table-id>:<chunks>:...
+tid() { printf '%032d' "$1"; }
+LOCKH="0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; ROOTH="0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; GCG="00000000000000000000000000000000"
+mkmanifest() { # <file> <n_tables>
+  local f="$1" n="$2" i s="5:__DOLT__:$LOCKH:$ROOTH:$GCG"
+  for i in $(seq 1 "$n"); do s="$s:$(tid "$i"):$((i*7))"; done
+  printf '%s' "$s" > "$f"
+}
+mk_backup_tables() { # <dir> <n_tables> — tables 1..n, odd ones raw, even ones .darc (both are normal)
+  local d="$1" n="$2" i
+  mkdir -p "$d"; mkmanifest "$d/manifest" "$n"
+  for i in $(seq 1 "$n"); do
+    if [ $((i%2)) -eq 1 ]; then printf 'data%s' "$i" > "$d/$(tid "$i")"; else printf 'darc%s' "$i" > "$d/$(tid "$i").darc"; fi
+  done
+}
+s3_drop_table() { # <bucket-root> <db> <n> — the table object vanishes from the bucket; the manifest still names it
+  rm -f "$1/$2/$(tid "$3")" "$1/$2/$(tid "$3").darc"
+}
 
-cat > "$LIB_SCRATCH/bin/aws" <<'FAKEAWS'
+# write_fake_aws <path> — bucket = a directory ($FAKE_BUCKET_DIR, default ./bucket)
+# laid out <bucket>/<db>/<object>. Every call is appended to $FAKE_AWS_CALLS
+# (default ./aws-calls.log). Knobs: FAKE_S3_LIST_FAIL, FAKE_S3_DRYRUN_FAIL,
+# FAKE_S3_UP_FAIL (uploads fail), FAKE_S3_UP_NOOP (uploads "succeed" but never
+# land), FAKE_S3_SYNC_FAIL (the post-swap publish sync fails), and the older
+# FAKE_AWS_MANIFEST_OK / FAKE_AWS_FINGERPRINT_OK / FAKE_FP_* /
+# FAKE_S3_META_SEED_FILE for head-object and _meta/latest.json (still served so
+# the incident is replicable against the PREVIOUS proof too: manifest object
+# present + fingerprint entry present + size coherent).
+write_fake_aws() {
+  cat > "$1" <<'AWSEOF'
 #!/bin/bash
+FB="${FAKE_BUCKET_DIR:-./bucket}"
+echo "aws $*" >> "${FAKE_AWS_CALLS:-./aws-calls.log}"
 case "$*" in
   *"s3api head-object"*)
     [ "${FAKE_AWS_MANIFEST_OK:-1}" = "1" ] && exit 0 || exit 254
     ;;
-  *"s3 cp"*"_meta/latest.json"*)
-    [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
-    dest="${@: -1}"
-    printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
-      "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-10M}" > "$dest"
+  *"s3api list-objects-v2"*)
+    [ "${FAKE_S3_LIST_FAIL:-0}" = "1" ] && exit 255
+    prefix=""; while [ $# -gt 0 ]; do [ "$1" = "--prefix" ] && prefix="$2"; shift; done
+    d="$FB/${prefix%/}"
+    if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then echo "None"; exit 0; fi
+    out=""; for f in "$d"/*; do out="${out:+$out	}${prefix}$(basename "$f")"; done
+    echo "$out"; exit 0
+    ;;
+  *"s3 sync"*"--dryrun"*)
+    # identity check: $3=<dir>/ $4=s3://B/<db>/ — list what a real sync WOULD upload
+    [ "${FAKE_S3_DRYRUN_FAIL:-0}" = "1" ] && exit 2
+    dir="${3%/}"; key="${4#s3://*/}"; key="${key%/}"
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue; n="$(basename "$f")"; [ "$n" = "LOCK" ] && continue
+      if [ ! -f "$FB/$key/$n" ] || [ "$(wc -c < "$f")" != "$(wc -c < "$FB/$key/$n")" ]; then
+        echo "(dryrun) upload: $f to $4$n"
+      fi
+    done
     exit 0
+    ;;
+  *"s3 sync"*"--exclude manifest"*)
+    # the proof's ADDITIVE repair upload (tables first; the manifest goes last, via s3 cp)
+    [ "${FAKE_S3_UP_FAIL:-0}" = "1" ] && exit 1
+    [ "${FAKE_S3_UP_NOOP:-0}" = "1" ] && exit 0
+    dir="${3%/}"; key="${4#s3://*/}"; key="${key%/}"; mkdir -p "$FB/$key"
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue; n="$(basename "$f")"
+      case "$n" in manifest|LOCK) continue ;; esac
+      if [ ! -f "$FB/$key/$n" ] || [ "$(wc -c < "$f")" != "$(wc -c < "$FB/$key/$n")" ]; then cp "$f" "$FB/$key/$n"; fi
+    done
+    exit 0
+    ;;
+  *"s3 sync"*)
+    # the post-swap PUBLISH sync (ga-6xo4r0): logged where Part 3 expects it
+    echo "$*" >> ./s3-sync.log
+    printf '%s\n' "${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}" >> ./s3-sync-checksum-env.log
+    [ "${FAKE_S3_SYNC_FAIL:-0}" = "1" ] && exit 1 || exit 0
+    ;;
+  *"s3 cp"*"/manifest"*)
+    case "$3" in
+      s3://*)   # download: aws s3 cp s3://B/<db>/manifest <dest>
+        key="${3#s3://*/}"; [ -f "$FB/$key" ] || exit 1; cp "$FB/$key" "$4"; exit 0 ;;
+      *)        # upload: aws s3 cp <dir>/manifest s3://B/<db>/manifest
+        [ "${FAKE_S3_UP_FAIL:-0}" = "1" ] && exit 1
+        [ "${FAKE_S3_UP_NOOP:-0}" = "1" ] && exit 0
+        key="${4#s3://*/}"; mkdir -p "$FB/$(dirname "$key")"; cp "$3" "$FB/$key"; exit 0 ;;
+    esac
+    ;;
+  *"s3 cp"*"_meta/latest.json"*)
+    case "$3" in
+      s3://*)
+        # DOWNLOAD: aws s3 cp s3://.../_meta/latest.json <local-dest>
+        dest="$4"
+        if [ -n "${FAKE_S3_META_SEED_FILE:-}" ] && [ -f "${FAKE_S3_META_SEED_FILE:-}" ]; then
+          cp "$FAKE_S3_META_SEED_FILE" "$dest"
+          exit 0
+        fi
+        [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
+        printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
+          "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-20M}" > "$dest"
+        exit 0
+        ;;
+      *)
+        # UPLOAD: aws s3 cp <local-src> s3://.../_meta/latest.json [flags]
+        cp "$3" ./s3-meta-uploaded.json
+        exit 0
+        ;;
+    esac
     ;;
   *) exit 0 ;;
 esac
-FAKEAWS
-chmod +x "$LIB_SCRATCH/bin/aws"
+AWSEOF
+  chmod +x "$1"
+}
 
-PATH="$LIB_SCRATCH/bin:$PATH" DOLT_BACKUP_RESEED_LIB=1 . "$SCRIPT"
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1: _s3_current_backup_verified() — LIB-mode unit tests, fake bucket
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── _s3_current_backup_verified() (ga-i99qsp / ga-gsnee8) ──"
+
+LIB_SCRATCH="/tmp/reseed-selftest-lib.$$"
+mkdir -p "$LIB_SCRATCH/bin"
+write_fake_aws "$LIB_SCRATCH/bin/aws"
+export FAKE_BUCKET_DIR="$LIB_SCRATCH/bucket" FAKE_AWS_CALLS="$LIB_SCRATCH/aws-calls.log"
+FB="$FAKE_BUCKET_DIR"; mkdir -p "$FB"; : > "$FAKE_AWS_CALLS"
+
+# RESEED_LOG points at scratch: log() tees to $LOG, which would otherwise be the
+# REAL city reseed log — a hermetic test must not write test lines into it.
+RESEED_LOG="$LIB_SCRATCH/reseed.log" PATH="$LIB_SCRATCH/bin:$PATH" DOLT_BACKUP_RESEED_LIB=1 . "$SCRIPT"
 
 if type _s3_current_backup_verified >/dev/null 2>&1; then
   ok "_s3_current_backup_verified defined by lib-mode source"
@@ -80,36 +188,89 @@ else
   bad "AWS_REQUEST_CHECKSUM_CALCULATION not 'when_required' after lib-mode source (got '${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}') — this script's NEW S3 upload call sites are UNPROTECTED against the ga-tyaozh AwsChunkedWrapper defect when invoked ad hoc (i.e. NOT as a dolt-s3-backup.sh child)"
 fi
 
-LOCALDIR="$LIB_SCRATCH/local-backup-hq"
-mkdir -p "$LOCALDIR"
-dd if=/dev/zero of="$LOCALDIR/data.bin" bs=1M count=10 >/dev/null 2>&1
+# ga-gsnee8: the proof's repair upload runs inside the callers' ~1800s budget and (in
+# Passo 1.5) with NEW_DIR already built — a timeout mid-proof strands .new, which
+# Preflight 3 then refuses forever. So the reseed bounds it below the lib defaults
+# (2 rounds x 1500s) and routes the upload output into its own log.
+if [ "${S3PROOF_REPAIR_ROUNDS:-}" = "1" ] && [ "${S3PROOF_UP_TIMEOUT:-}" = "600" ] && [ "${S3PROOF_TIMEOUT:-}" = "120" ]; then
+  ok "reseed bounds the proof (1 repair round, 600s upload, 120s read-only calls) — below the lib defaults, inside the callers' budget"
+else
+  bad "reseed left the proof's budget at rounds='${S3PROOF_REPAIR_ROUNDS:-}' upload_timeout='${S3PROOF_UP_TIMEOUT:-}' read_timeout='${S3PROOF_TIMEOUT:-}' (want 1 / 600 / 120)"
+fi
+if [ "${S3PROOF_LOG:-}" = "$LOG" ]; then ok "the proof's upload output goes to the reseed log"; else bad "S3PROOF_LOG='${S3PROOF_LOG:-}' is not the reseed log '$LOG'"; fi
 
-PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=10M \
-  _s3_current_backup_verified hq "$LOCALDIR" \
-  && ok "manifest present + size coherent → verified true" \
-  || bad "manifest present + size coherent → should have verified true"
+LOCALDIR="$LIB_SCRATCH/local-hq"
+reset_lib_case() {   # a closed LOCAL backup + an identical, closed copy already in the fake bucket
+  rm -rf "$FB" "$LOCALDIR"; mkdir -p "$FB"; : > "$FAKE_AWS_CALLS"
+  mk_backup_tables "$LOCALDIR" 6
+  dd if=/dev/zero of="$LOCALDIR/data.bin" bs=1M count=2 >/dev/null 2>&1
+  cp -R "$LOCALDIR" "$FB/hq"
+  unset FAKE_S3_LIST_FAIL FAKE_S3_DRYRUN_FAIL FAKE_S3_UP_FAIL FAKE_S3_UP_NOOP FAKE_AWS_FINGERPRINT_OK FAKE_FP_DB FAKE_FP_SIZE
+}
+n_uploads() { grep -c -- '--exclude manifest' "$FAKE_AWS_CALLS"; }
 
-PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=0 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=10M \
-  _s3_current_backup_verified hq "$LOCALDIR" \
-  && bad "manifest missing → should NOT have verified true" \
-  || ok "manifest missing → correctly refused (fail closed)"
+reset_lib_case
+_s3_current_backup_verified hq "$LOCALDIR" \
+  && ok "closed local + closed identical S3 → verified true" \
+  || bad "closed local + closed identical S3 → should have verified true"
+[ "$(n_uploads)" -eq 0 ] && ok "…and nothing was uploaded (nothing to repair)" || bad "uploaded although S3 was already proven"
 
-PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=0 \
+# INCIDENT REPLICA (hq, 2026-09-25): the manifest OBJECT exists in S3, the fingerprint
+# has an entry for the db with a coherent size, but a table the manifest names is NOT
+# in the bucket — and the upload path is broken (ga-tyaozh), so it cannot be repaired.
+# The previous proof (head-object + size ratio) called this good.
+reset_lib_case; s3_drop_table "$FB" hq 3
+[ -f "$FB/hq/manifest" ] && ok "setup: the manifest OBJECT exists in S3 (all the previous proof checked)" || bad "setup: manifest object missing"
+FAKE_S3_UP_FAIL=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=2M \
   _s3_current_backup_verified hq "$LOCALDIR" \
-  && bad "fingerprint unreadable → should NOT have verified true" \
-  || ok "fingerprint unreadable (aws s3 cp fails) → correctly refused (fail closed)"
+  && bad "INCIDENT: manifest object present + fingerprint entry + size coherent + a named table MISSING from S3 was VERIFIED (the hq 2026-09-25 defect)" \
+  || ok "INCIDENT replica: manifest object exists, fingerprint coherent, but a manifest table is missing from S3 and cannot be repaired → REFUSED"
 
-PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=1M \
-  _s3_current_backup_verified hq "$LOCALDIR" \
-  && bad "grossly incoherent size (fp=1M local=10M) → should NOT have verified true" \
-  || ok "grossly incoherent size (fp=1M local=10M) → correctly refused (fail closed)"
+# Same replica, upload works: the proof REPAIRS S3 (tables first, manifest last), then proves.
+reset_lib_case; s3_drop_table "$FB" hq 3; rm -f "$FB/hq/data.bin"
+_s3_current_backup_verified hq "$LOCALDIR" \
+  && ok "same replica, repairable: repaired S3, then proven → verified true" \
+  || bad "repairable replica did not converge to a proof"
+[ -f "$FB/hq/$(tid 3)" ] && [ -f "$FB/hq/data.bin" ] && ok "…S3 now holds the missing table and the never-uploaded file (it RESTORES)" || bad "S3 still lacks the table/file after the repair"
+[ "$(n_uploads)" -eq 1 ] && ok "…with exactly one repair round (the reseed's bounded budget)" || bad "expected 1 repair upload, saw $(n_uploads)"
+grep -- '--exclude manifest' "$FAKE_AWS_CALLS" | grep -q -- '--delete' && bad "the repair upload used --delete" || ok "…and the repair is ADDITIVE (never --delete)"
 
-PATH="$LIB_SCRATCH/bin:$PATH" FAKE_AWS_MANIFEST_OK=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=lexbh FAKE_FP_SIZE=10M \
-  _s3_current_backup_verified hq "$LOCALDIR" \
-  && bad "fingerprint describes a DIFFERENT db → should NOT have verified true" \
-  || ok "fingerprint describes a different db (lexbh, not hq) → correctly refused (never guess across dbs)"
+# An upload that "succeeds" but never lands cannot loop or pass.
+reset_lib_case; s3_drop_table "$FB" hq 3
+FAKE_S3_UP_NOOP=1 _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "an upload that never lands was reported as proven" \
+  || ok "upload that never lands → NOT proven (bounded, no false pass)"
+
+reset_lib_case; rm -f "$FB/hq/manifest"
+FAKE_S3_UP_FAIL=1 _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "S3 without a manifest, unrepairable, was verified" \
+  || ok "no manifest in S3 and the repair cannot upload → REFUSED"
+
+reset_lib_case
+FAKE_S3_LIST_FAIL=1 _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "a listing failure was verified" \
+  || ok "listing the bucket fails → REFUSED (unknown ≠ fine)"
+
+reset_lib_case
+FAKE_S3_DRYRUN_FAIL=1 _s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "an identity-check failure was verified" \
+  || ok "the identity check itself fails → REFUSED (unknown ≠ identical)"
+
+# A broken LOCAL dir is never mirrored up over S3, and never authorizes a deletion.
+reset_lib_case; rm -f "$LOCALDIR/$(tid 5)"; s3_drop_table "$FB" hq 2
+_s3_current_backup_verified hq "$LOCALDIR" \
+  && bad "a LOCAL dir missing a manifest table was verified" \
+  || ok "local backup is not a closed backup → REFUSED"
+[ "$(n_uploads)" -eq 0 ] && ok "…and nothing from the broken local dir was uploaded" || bad "the broken local dir was uploaded"
+
+# The fingerprint is no longer the authority: the proof does not need it.
+reset_lib_case
+FAKE_AWS_FINGERPRINT_OK=0 _s3_current_backup_verified hq "$LOCALDIR" \
+  && ok "fingerprint unreadable but S3 closed + identical → verified (identity is proven per file, not by a size ratio)" \
+  || bad "an unreadable fingerprint vetoed a proven mirror"
 
 rm -rf "$LIB_SCRATCH" 2>/dev/null
+unset FAKE_BUCKET_DIR FAKE_AWS_CALLS
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 2: full low-disk flow — real subprocess, stubbed dolt/gc/aws/df
@@ -192,55 +353,18 @@ esac
 DOLTEOF
   chmod +x "$root/bin/dolt"
 
-  # fake aws: same contract as Part 1's stub above, PLUS (ga-6xo4r0):
-  #  - "s3 sync" (the new post-swap off-box mirror in _publish_db_fingerprint)
-  #    records its invocation to ./s3-sync.log (relative to $root, since
-  #    run_scenario always `cd`s there first) and succeeds by default, or
-  #    fails when FAKE_S3_SYNC_FAIL=1.
-  #  - "s3 cp ... _meta/latest.json" DOWNLOAD (arg $3 is the s3:// URI):
-  #    unchanged canned single-db-doc behavior UNLESS FAKE_S3_META_SEED_FILE
-  #    points at a file, in which case THAT file's content is served instead
-  #    — lets a scenario seed a multi-db doc to prove the merge-publish
-  #    preserves sibling entries.
-  #  - "s3 cp ... _meta/latest.json" UPLOAD (arg $4 is the s3:// URI — the
-  #    NEW direction _publish_db_fingerprint needs, to write the merged doc
-  #    back): captures the uploaded content to ./s3-meta-uploaded.json.
-  cat > "$root/bin/aws" <<'AWSEOF'
-#!/bin/bash
-case "$*" in
-  *"s3api head-object"*)
-    [ "${FAKE_AWS_MANIFEST_OK:-1}" = "1" ] && exit 0 || exit 254
-    ;;
-  *"s3 sync"*)
-    echo "$*" >> ./s3-sync.log
-    printf '%s\n' "${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>}" >> ./s3-sync-checksum-env.log
-    [ "${FAKE_S3_SYNC_FAIL:-0}" = "1" ] && exit 1 || exit 0
-    ;;
-  *"s3 cp"*"_meta/latest.json"*)
-    case "$3" in
-      s3://*)
-        # DOWNLOAD: aws s3 cp s3://.../_meta/latest.json <local-dest>
-        dest="$4"
-        if [ -n "${FAKE_S3_META_SEED_FILE:-}" ] && [ -f "${FAKE_S3_META_SEED_FILE:-}" ]; then
-          cp "$FAKE_S3_META_SEED_FILE" "$dest"
-          exit 0
-        fi
-        [ "${FAKE_AWS_FINGERPRINT_OK:-1}" = "1" ] || exit 1
-        printf '{"run_utc": "%s", "databases": {"%s": {"backup_size": "%s", "head": "abc123"}}}' \
-          "${FAKE_FP_RUN_UTC:-2026-09-17T04:00:00Z}" "${FAKE_FP_DB:-hq}" "${FAKE_FP_SIZE:-20M}" > "$dest"
-        exit 0
-        ;;
-      *)
-        # UPLOAD: aws s3 cp <local-src> s3://.../_meta/latest.json [flags]
-        cp "$3" ./s3-meta-uploaded.json
-        exit 0
-        ;;
-    esac
-    ;;
-  *) exit 0 ;;
-esac
-AWSEOF
-  chmod +x "$root/bin/aws"
+  # fake aws: the bucket-as-a-directory stub (write_fake_aws, defined above). Run
+  # from $root (run_scenario cds there), so its ./bucket, ./aws-calls.log,
+  # ./s3-sync.log and ./s3-meta-uploaded.json all land under $root.
+  write_fake_aws "$root/bin/aws"
+
+  # ga-gsnee8: the OLD backup dir is a realistic Dolt backup (a manifest naming 6
+  # tables, all present) and the fake bucket already holds an identical copy — i.e.
+  # by default S3 is HEALTHY (the pre-existing scenarios' "S3 proof passes"). A
+  # scenario that wants a broken S3 damages $root/bucket/hq AFTER this returns.
+  mk_backup_tables "$root/city/.dolt-backup/hq" 6
+  mkdir -p "$root/bucket"
+  cp -R "$root/city/.dolt-backup/hq" "$root/bucket/hq"
 }
 
 # run_scenario <root> [extra env assignments...] — invokes the real script as
@@ -289,12 +413,18 @@ rm -rf "$ROOT1" 2>/dev/null
 ROOT2="/tmp/reseed-selftest-s2.$$"
 setup_scenario "$ROOT2" 10 20 50
 OLD_KB_BEFORE=$(du -sk "$ROOT2/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
-run_scenario "$ROOT2" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=0 FAKE_AWS_FINGERPRINT_OK=1
+# ga-gsnee8: the exact hq 2026-09-25 incident, not a missing manifest object: the manifest
+# object EXISTS, the fingerprint has an entry for hq with a coherent size (20M vs the 20M old
+# backup) — everything the previous proof looked at says "fine" — but a table the manifest
+# names is gone from S3, and the upload path is broken so the proof cannot repair it.
+s3_drop_table "$ROOT2/bucket" hq 3
+run_scenario "$ROOT2" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_S3_UP_FAIL=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M
 if [ "$RC" -ne 0 ]; then ok "scenario 2 (low-disk, S3 proof fails): exits non-zero"; else bad "scenario 2: expected non-zero exit, got 0"; fi
 OLD_KB_AFTER=$(du -sk "$ROOT2/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
 if [ "$OLD_KB_BEFORE" = "$OLD_KB_AFTER" ]; then ok "scenario 2: old backup UNCHANGED (${OLD_KB_AFTER}KB) — nothing deleted"; else bad "scenario 2: old backup should be unchanged, was ${OLD_KB_BEFORE}KB now ${OLD_KB_AFTER}KB"; fi
 if [ -e "$ROOT2/city/.dolt-backup/hq.new" ]; then bad "scenario 2: .new leftover should have been cleaned up on proof failure"; else ok "scenario 2: .new correctly cleaned up on proof failure"; fi
 if grep -q "prova do S3 FALHOU" "$ROOT2/out.log" 2>/dev/null; then ok "scenario 2: distinctive 'prova do S3 FALHOU' message present"; else bad "scenario 2: missing the distinctive proof-failed message"; fi
+if grep -q "are MISSING from the bucket" "$ROOT2/out.log" 2>/dev/null; then ok "scenario 2: the log names WHY — a manifest table is missing from S3 (the copy does not restore)"; else bad "scenario 2: the log does not say the S3 copy is missing a manifest table"; fi
 ( PATH="$ROOT2/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT"
   if is_low_disk_proof_failed_refusal "$(cat "$ROOT2/out.log")"; then
     echo "  PASS: scenario 2: dolt-s3-backup.sh's is_low_disk_proof_failed_refusal classifies this as a REAL alarm (not the silent margin-refusal case)"
@@ -376,12 +506,16 @@ rm -rf "$ROOT6" 2>/dev/null
 ROOT7="/tmp/reseed-selftest-s7.$$"
 setup_scenario "$ROOT7" 10 20 35
 OLD_KB_BEFORE=$(du -sk "$ROOT7/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
-run_scenario "$ROOT7" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_MANIFEST_OK=0 FAKE_AWS_FINGERPRINT_OK=1
+# ga-gsnee8: same incident replica as scenario 2 (manifest object + coherent fingerprint
+# entry present, a manifest table missing from S3, upload path broken).
+s3_drop_table "$ROOT7/bucket" hq 3
+run_scenario "$ROOT7" FAKE_LIVE_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_S3_UP_FAIL=1 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M
 if [ "$RC" -ne 0 ]; then ok "scenario 7 (ultra-low-disk, S3 proof fails): exits non-zero"; else bad "scenario 7: expected non-zero exit, got 0"; fi
 OLD_KB_AFTER=$(du -sk "$ROOT7/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
 if [ "$OLD_KB_BEFORE" = "$OLD_KB_AFTER" ]; then ok "scenario 7: old backup UNCHANGED (${OLD_KB_AFTER}KB) — nothing deleted"; else bad "scenario 7: old backup should be unchanged, was ${OLD_KB_BEFORE}KB now ${OLD_KB_AFTER}KB"; fi
 if [ -e "$ROOT7/city/.dolt-backup/hq.new" ]; then bad "scenario 7: .new should never have been created — the proof runs before Passo 1"; else ok "scenario 7: .new correctly never created (proof-before-write ordering)"; fi
 if grep -q "modo ULTRA de baixo disco: prova do S3 FALHOU" "$ROOT7/out.log" 2>/dev/null; then ok "scenario 7: distinctive ultra-mode 'prova do S3 FALHOU' message present"; else bad "scenario 7: missing the distinctive proof-failed message"; fi
+if grep -q "are MISSING from the bucket" "$ROOT7/out.log" 2>/dev/null; then ok "scenario 7: the log names WHY — a manifest table is missing from S3 (the copy does not restore)"; else bad "scenario 7: the log does not say the S3 copy is missing a manifest table"; fi
 if grep -q "disco insuficiente" "$ROOT7/out.log" 2>/dev/null; then bad "scenario 7: message must NOT also match is_disk_margin_refusal's pattern (would misclassify as silent/expected)"; else ok "scenario 7: message does not collide with the disk-margin-refusal pattern"; fi
 ( PATH="$ROOT7/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT"
   if is_low_disk_proof_failed_refusal "$(cat "$ROOT7/out.log")"; then
@@ -415,6 +549,60 @@ if [ "$RC" -ne 0 ]; then ok "scenario 5 (low-disk disabled via RESEED_ALLOW_LOW_
 if grep -q "modo de baixo disco desabilitado" "$ROOT5/out.log" 2>/dev/null; then ok "scenario 5: escape hatch correctly disables the new path"; else bad "scenario 5: escape hatch message missing"; fi
 if [ -e "$ROOT5/city/.dolt-backup/hq.new" ] || [ -e "$ROOT5/city/.dolt-backup/hq.old" ]; then bad "scenario 5: nothing should have been touched with the escape hatch on"; else ok "scenario 5: nothing touched with the escape hatch on"; fi
 rm -rf "$ROOT5" 2>/dev/null
+
+# ── Scenario 13 (ga-gsnee8): the SAME incident replica as scenario 7 (ultra mode; a
+#    manifest table missing from S3 AND a file never uploaded) but the upload path
+#    WORKS → the proof REPAIRS S3 (tables first, manifest last, additive), proves the
+#    result, and only THEN frees the old. Freeing is safe at that point: S3 restores. ──
+ROOT13="/tmp/reseed-selftest-s13.$$"
+setup_scenario "$ROOT13" 10 20 35
+s3_drop_table "$ROOT13/bucket" hq 3; rm -f "$ROOT13/bucket/hq/old-bloat.bin"
+run_scenario "$ROOT13" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=20M
+if [ "$RC" -eq 0 ]; then ok "scenario 13 (ultra, S3 repairable): exits 0"; else bad "scenario 13: expected exit 0, got $RC — $(tail -5 "$ROOT13/out.log")"; fi
+if grep -q "repair/prove: round 1" "$ROOT13/out.log" 2>/dev/null; then ok "scenario 13: S3 was REPAIRED before the deletion (the proof did not just trust the manifest object)"; else bad "scenario 13: no repair round in the log — the broken S3 was not repaired"; fi
+if [ -f "$ROOT13/bucket/hq/$(tid 3)" ] && [ -f "$ROOT13/bucket/hq/old-bloat.bin" ]; then ok "scenario 13: S3 now holds the missing table and the never-uploaded file (it restores)"; else bad "scenario 13: S3 still lacks the table/file"; fi
+if grep -- '--exclude manifest' "$ROOT13/aws-calls.log" 2>/dev/null | grep -q -- '--delete'; then bad "scenario 13: the proof's repair upload used --delete (must be additive)"; else ok "scenario 13: the repair upload is additive (never --delete)"; fi
+if grep -q "prova do S3 OK" "$ROOT13/out.log" 2>/dev/null; then ok "scenario 13: log has the S3-proof-OK line"; else bad "scenario 13: missing the S3-proof-OK line"; fi
+if [ -e "$ROOT13/city/.dolt-backup/hq.old" ]; then bad "scenario 13: ultra path should not leave a .old"; else ok "scenario 13: old freed after the repaired proof, no .old residue"; fi
+rm -rf "$ROOT13" 2>/dev/null
+
+# ── Scenario 14 (ga-gsnee8): the ULTRA arithmetic counts the RESTORE copy. live=10M,
+#    old=14M, free≈5M: freeing the old projects to ≈19M — above the ONE-copy bar the
+#    mode used to require (1.2 x live = 12M) but below the TWO-copy bar (12M new copy +
+#    10M restore copy = 22M). It used to prove S3, DELETE the old, then run the disk out
+#    mid-restore (the ga-odtd3f class). Must refuse at Preflight 2: nothing deleted,
+#    nothing built, S3 never even contacted. ──
+ROOT14="/tmp/reseed-selftest-s14.$$"
+setup_scenario "$ROOT14" 10 14 29
+OLD_KB_BEFORE=$(du -sk "$ROOT14/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+run_scenario "$ROOT14" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=14M
+if [ "$RC" -ne 0 ]; then ok "scenario 14 (ultra, freeing does not cover TWO copies): exits non-zero"; else bad "scenario 14: expected a refusal, got exit 0 — the mode proceeded with room for only one copy"; fi
+OLD_KB_AFTER=$(du -sk "$ROOT14/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+if [ "$OLD_KB_BEFORE" = "$OLD_KB_AFTER" ]; then ok "scenario 14: old backup UNCHANGED (${OLD_KB_AFTER}KB) — nothing deleted"; else bad "scenario 14: old backup changed, was ${OLD_KB_BEFORE}KB now ${OLD_KB_AFTER}KB — it was freed for room that could not fit the restore"; fi
+if [ -e "$ROOT14/city/.dolt-backup/hq.new" ]; then bad "scenario 14: .new should never have been created"; else ok "scenario 14: .new never created"; fi
+if grep -q "insuficiente até liberando o backup antigo" "$ROOT14/out.log" 2>/dev/null && grep -q "cópia da restauração" "$ROOT14/out.log" 2>/dev/null; then ok "scenario 14: refusal explains the two-copy arithmetic (new copy + restore copy)"; else bad "scenario 14: missing the two-copy refusal message"; fi
+if [ -s "$ROOT14/aws-calls.log" ]; then bad "scenario 14: S3 was contacted although the arithmetic already refused (proof must come after)"; else ok "scenario 14: S3 never contacted — refusal happens before any proof or write"; fi
+if ( PATH="$ROOT14/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT" >/dev/null 2>&1; is_disk_margin_refusal "$(cat "$ROOT14/out.log")" ); then ok "scenario 14: still classified as the (streak-tracked) disk-margin refusal"; else bad "scenario 14: not classified as a disk-margin refusal — the streak counter would not see it"; fi
+rm -rf "$ROOT14" 2>/dev/null
+
+# ── Scenario 15 (ga-gsnee8): the SAME class in the NORMAL low-disk mode (Passo 1.5).
+#    live=10M, old=5M, free≈13M → low-disk mode (>= 12M, < 25M). After the new copy is
+#    built ≈3M is free; the restore needs 12M; freeing the old (5M) only reaches ≈8M.
+#    Deleting the old would not make room AND would leave the db with no local backup.
+#    It used to prove S3 and delete anyway. Must refuse: old intact, new discarded. ──
+ROOT15="/tmp/reseed-selftest-s15.$$"
+setup_scenario "$ROOT15" 10 5 28
+OLD_KB_BEFORE=$(du -sk "$ROOT15/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+run_scenario "$ROOT15" FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_NEW_BACKUP_MB=10 FAKE_AWS_FINGERPRINT_OK=1 FAKE_FP_DB=hq FAKE_FP_SIZE=5M
+if [ "$RC" -ne 0 ]; then ok "scenario 15 (low-disk, freeing the old would not make room for the restore): exits non-zero"; else bad "scenario 15: expected a refusal, got exit 0 — the old was freed for room that could not fit the restore"; fi
+if grep -q "modo de baixo disco ativado" "$ROOT15/out.log" 2>/dev/null; then ok "scenario 15: entered the NORMAL low-disk mode (not ultra)"; else bad "scenario 15: setup did not enter the normal low-disk mode — the scenario does not test Passo 1.5"; fi
+OLD_KB_AFTER=$(du -sk "$ROOT15/city/.dolt-backup/hq" 2>/dev/null | awk '{print $1}')
+if [ "$OLD_KB_BEFORE" = "$OLD_KB_AFTER" ]; then ok "scenario 15: old backup UNCHANGED (${OLD_KB_AFTER}KB) — nothing deleted"; else bad "scenario 15: old backup changed, was ${OLD_KB_BEFORE}KB now ${OLD_KB_AFTER}KB"; fi
+if [ -e "$ROOT15/city/.dolt-backup/hq.new" ]; then bad "scenario 15: the unverified .new should have been discarded"; else ok "scenario 15: .new (unverified) discarded"; fi
+if grep -q "disco insuficiente para a verificação mesmo liberando o backup antigo" "$ROOT15/out.log" 2>/dev/null; then ok "scenario 15: distinctive 'even freeing the old' refusal message present"; else bad "scenario 15: missing the refusal message"; fi
+if [ -s "$ROOT15/aws-calls.log" ]; then bad "scenario 15: S3 was contacted — the sufficiency check must come before the proof (no point proving S3 for a deletion that cannot help)"; else ok "scenario 15: S3 never contacted — refused before the proof"; fi
+if ( PATH="$ROOT15/bin:$PATH" DOLT_S3_BACKUP_LIB=1 . "$S3_BACKUP_SCRIPT" >/dev/null 2>&1; is_disk_margin_refusal "$(cat "$ROOT15/out.log")" ); then ok "scenario 15: classified as the (streak-tracked) disk-margin refusal"; else bad "scenario 15: not classified as a disk-margin refusal"; fi
+rm -rf "$ROOT15" 2>/dev/null
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 3 (ga-6xo4r0): post-swap S3 sync + per-db fingerprint publish — the
@@ -602,6 +790,25 @@ if grep -qF '_margin_refusal_reset "$db"' "$S3_BACKUP_SCRIPT"; then
   ok "margin-refusal streak resets on reseed success"
 else
   bad "margin-refusal streak never resets on success — would alarm on unrelated future streaks"
+fi
+
+
+# ── drift-guard: every path that DELETES the old local backup goes through the
+#    manifest-closure proof (ga-gsnee8) ──
+echo "── drift-guard: reseed's early deletion of the old backup is authorized only by the manifest-closure proof (ga-gsnee8) ──"
+if grep -qF '_s3proof_repair_then_prove "$local_dir" "$db"' "$SCRIPT"; then
+  ok "_s3_current_backup_verified delegates to _s3proof_repair_then_prove (the lib is executed, not reimplemented)"
+else
+  bad "_s3_current_backup_verified no longer calls _s3proof_repair_then_prove"
+fi
+if grep -qE '^\. .*dolt-backup-s3-proof\.sh"' "$SCRIPT"; then ok "reseed sources dolt-backup-s3-proof.sh"; else bad "reseed does not source dolt-backup-s3-proof.sh — _s3proof_repair_then_prove would be undefined"; fi
+if grep -qF 's3api head-object' "$SCRIPT"; then bad "the weak head-object proof is back in reseed (an object's existence says nothing about restoring)"; else ok "no head-object proof in reseed"; fi
+N_VERIFY=$(grep -c '_s3_current_backup_verified "\$DB" "\$BACKUP_DIR"' "$SCRIPT")
+N_RM=$(grep -c 'rm -rf "\$BACKUP_DIR"' "$SCRIPT")
+if [ "$N_VERIFY" = "2" ] && [ "$N_RM" = "$N_VERIFY" ]; then
+  ok "exactly $N_RM place(s) delete the old backup and exactly as many proof call sites guard them (Passo 0.5 + Passo 1.5)"
+else
+  bad "deletion sites ($N_RM) and proof call sites ($N_VERIFY) diverge (want 2 and 2) — a deletion path may have lost its proof"
 fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
