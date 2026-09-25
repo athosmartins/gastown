@@ -109,16 +109,134 @@ SNAP_LINE_MAX=1000
 SNAP_PS_LINE_MAX=240
 SNAP_PS_MAX_LINES=120
 SNAP_LOG_MAX_LINES=1000
+# ga-fctr6g: TOTAL budget (seconds) for the whole forensic `log show` window, shared by its
+# chunks -- NOT a per-query cap. Kept at 30 so the snapshot's share of the launchd tick
+# (StartInterval=60) is exactly what ga-xyhl9d shipped; the fix reorders the work inside
+# that budget instead of growing it.
 SNAP_LOG_TIMEOUT="${DOLT_WATCHDOG_SNAP_LOG_TIMEOUT:-30}"
+# Window = these chunk lengths in seconds, NEWEST FIRST (default 30+30+60+60 = the same 3m).
+SNAP_LOG_CHUNKS_DEFAULT="30 30 60 60"
+SNAP_LOG_CHUNKS="${DOLT_WATCHDOG_SNAP_LOG_CHUNKS:-$SNAP_LOG_CHUNKS_DEFAULT}"
+SNAP_LOG_PREDICATE='eventMessage contains "dolt" OR eventMessage contains "memorystatus" OR eventMessage contains "jetsam" OR eventMessage contains "tcp_close" OR eventMessage contains "SIGKILL" OR eventMessage contains "SIGQUIT" OR eventMessage contains "SIGTERM"'
 SNAP_BURST_TIMEOUT="${DOLT_WATCHDOG_SNAP_BURST_TIMEOUT:-20}"
 SNAP_END_MARK="=== end of snapshot ==="
+
+# `log show --start/--end` read local time; %z pins the instant (no DST/timezone ambiguity).
+_snap_fmt() { date -r "$1" '+%Y-%m-%d %H:%M:%S%z'; }
+
+# ga-fctr6g: the forensic `log show` window, asked for as NEWEST-FIRST chunks under ONE total
+# budget (SNAP_LOG_TIMEOUT), with a coverage statement per chunk and one for the whole window.
+#
+# WHY: a single `log show --last 3m` with SNAP_LOG_PREDICATE took 39s cold / 33s warm at the
+# load that goes WITH a Dolt death (load 65-80 on 10 cores, measured 2026-09-25) -- over a 30s
+# cap -- while 1m took 9s and 30s took ~4s. And `log show` prints OLDEST-FIRST: a timeout keeps
+# the start of the window and loses the END (a 3s cap on `--last 3m` returned events only up to
+# ~10s into the 180s window). The end of the window is the newest time -- the part nearest the
+# death -- so the old single query failed worst exactly where the evidence is. Chunked and
+# newest-first, the last minute is secured before the older minutes are touched, and a chunk
+# that does not finish says how far it got instead of an undifferentiated "PARTIAL".
+# (Adjacent --start/--end chunks were checked to partition a window exactly: 904 events in
+# three 60s chunks == 904 in one 180s query, 0 missing, 0 duplicated.)
+#
+# The newest chunk omits --end: an --end at the second-truncated anchor would drop the events
+# of the current second. Older chunks end exactly where the next-newer one starts.
+# Output (to stdout): a chunk table, a `coverage:` line, then the events oldest-chunk-first.
+capture_log_window() {
+  local -a _clen=() _cwin=() _cstat=() _cbody=()
+  local _spec="$SNAP_LOG_CHUNKS" _tok _bad=0 _n=0 _tot=0 _i _cum=0 _anchor _t0 _tc _remain _len
+  local _s _e _elabel _out _rc _body _cnt _last _msg _cov=0 _open=1 _lg _lg_n _budget="$SNAP_LOG_TIMEOUT"
+
+  # Under `set -u` a non-numeric budget would abort inside $(( )) and kill the snapshot half-written.
+  case "$_budget" in
+    ''|*[!0-9]*) echo "(!! DOLT_WATCHDOG_SNAP_LOG_TIMEOUT='${SNAP_LOG_TIMEOUT}' is not whole seconds -- using 30)"; _budget=30 ;;
+  esac
+  _budget=$((10#$_budget))   # 10# : a leading zero (08) must not be read as octal
+  for _tok in $_spec; do
+    case "$_tok" in ''|*[!0-9]*|0*) _bad=1 ;; esac   # 0* also rejects 030 (octal inside $(( )))
+    _n=$((_n + 1))
+  done
+  if [ "$_bad" -eq 1 ] || [ "$_n" -eq 0 ]; then
+    echo "(!! DOLT_WATCHDOG_SNAP_LOG_CHUNKS='${SNAP_LOG_CHUNKS}' is not a list of positive whole seconds -- using the default '${SNAP_LOG_CHUNKS_DEFAULT}')"
+    _spec="$SNAP_LOG_CHUNKS_DEFAULT"
+  fi
+  _n=0
+  for _tok in $_spec; do _clen[$_n]="$_tok"; _tot=$((_tot + _tok)); _n=$((_n + 1)); done
+
+  _anchor="$(date +%s)"; _t0="$_anchor"
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    _len="${_clen[$_i]}"
+    _s=$((_anchor - _cum - _len)); _e=$((_anchor - _cum)); _cum=$((_cum + _len))
+    if [ "$_i" -eq 0 ]; then _elabel="now"; else _elabel="$(date -r "$_e" '+%H:%M:%S')"; fi
+    _cwin[$_i]="$(date -r "$_s" '+%H:%M:%S') .. ${_elabel}"
+    _remain=$((_budget - ($(date +%s) - _t0)))
+    if [ "$_remain" -lt 1 ]; then    # `timeout 0` would mean NO limit, so never pass it
+      _open=0; _cstat[$_i]="NOT ATTEMPTED -- the ${_budget}s total budget was already spent on newer chunks"; _cbody[$_i]=""
+      _i=$((_i + 1)); continue
+    fi
+    _tc="$(date +%s)"
+    if [ "$_i" -eq 0 ]; then
+      _out="$(timeout "$_remain" log show --start "$(_snap_fmt "$_s")" --predicate "$SNAP_LOG_PREDICATE" 2>&1)"; _rc=$?
+    else
+      _out="$(timeout "$_remain" log show --start "$(_snap_fmt "$_s")" --end "$(_snap_fmt "$_e")" --predicate "$SNAP_LOG_PREDICATE" 2>&1)"; _rc=$?
+    fi
+    # Drop only the constant preamble; events can span several lines, so everything else stays.
+    _body="$(printf '%s\n' "$_out" | grep -v -E '^$|^Filtering the log data using|^Timestamp +Thread +Type' || true)"
+    _cnt="$(printf '%s\n' "$_body" | grep -c . || true)"
+    if [ "$_rc" -eq 0 ]; then
+      _cstat[$_i]="COMPLETE (${_cnt} lines, $(($(date +%s) - _tc))s)"; _cbody[$_i]="$_body"
+      [ "$_open" -eq 1 ] && _cov=$((_cov + _len))
+    elif [ "$_rc" -eq 124 ]; then
+      _open=0
+      _last="$(printf '%s\n' "$_out" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' | tail -1 | cut -c1-23)"
+      if [ -n "$_last" ]; then
+        _cstat[$_i]="PARTIAL -- log show TIMED OUT after ${_remain}s; events seen only up to ${_last} (${_cnt} lines), everything from there to ${_elabel} is NOT covered (log show prints oldest-first: a timeout loses the NEWEST end)"
+      else
+        _cstat[$_i]="PARTIAL -- log show TIMED OUT after ${_remain}s with NO events out; how far it got is UNKNOWN, the whole chunk is NOT covered"
+      fi
+      _cbody[$_i]="$_body"
+    else
+      _open=0
+      _msg="$(printf '%s\n' "$_out" | head -1 | cut -c1-200)"
+      _cstat[$_i]="FAILED (log show FAILED rc=${_rc}: ${_msg}) -- these lines are an ERROR, not events; the chunk is NOT covered"
+      _cbody[$_i]=""
+    fi
+    _i=$((_i + 1))
+  done
+
+  echo "window: $(_snap_fmt $((_anchor - _tot))) .. now (anchored $(_snap_fmt "$_anchor")); ${_tot}s in ${_n} chunks, newest first, ${_budget}s total budget"
+  _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    echo "  chunk $((_i + 1)) [${_clen[$_i]}s] ${_cwin[$_i]}: ${_cstat[$_i]}"
+    _i=$((_i + 1))
+  done
+  if [ "$_cov" -eq "$_tot" ]; then
+    echo "coverage: all ${_tot}s COMPLETE"
+  elif [ "$_cov" -gt 0 ]; then
+    echo "coverage: newest ${_cov}s COMPLETE; the older $((_tot - _cov))s is NOT fully covered (see the chunks above)"
+  else
+    echo "coverage: NONE -- not even the newest chunk is COMPLETE (see the chunks above)"
+  fi
+
+  # Events oldest chunk first (chunks are disjoint in time, so this is chronological). The cap
+  # keeps the NEWEST lines and says so, exactly as before ga-fctr6g.
+  _lg=""; _i=$((_n - 1))
+  while [ "$_i" -ge 0 ]; do
+    [ -n "${_cbody[$_i]:-}" ] && _lg="${_lg}${_cbody[$_i]}"$'\n'
+    _i=$((_i - 1))
+  done
+  _lg_n="$(printf '%s' "$_lg" | grep -c . || true)"
+  [ "$_lg_n" -gt "$SNAP_LOG_MAX_LINES" ] && echo "(!! TRUNCATED: showing the newest ${SNAP_LOG_MAX_LINES} of ${_lg_n} matching lines -- the oldest $((_lg_n - SNAP_LOG_MAX_LINES)) were dropped)"
+  printf '%s' "$_lg" | tail -"$SNAP_LOG_MAX_LINES" | cut -c1-"$SNAP_LINE_MAX"
+}
 # Every `log show` section below must tell the reader when its output is NOT a valid window:
-# exit 124 = timeout (partial output), any other nonzero = the command itself failed (what it
-# printed is an error message, not log events). A section that handles only one of the two --
-# or none -- prints a failure in the same shape as "nothing happened", and this file exists
-# to be believed about exactly that.
+# exit 124 = timeout (partial output; `log show` prints oldest-first so it is the NEWEST end
+# that is missing), any other nonzero = the command itself failed (what it printed is an error
+# message, not log events). A section that handles only one of the two -- or none -- prints a
+# failure in the same shape as "nothing happened", and this file exists to be believed about
+# exactly that.
 capture_death_snapshot() {
-  local _old="$1" _new="$2" _ts _out _lg _lg_rc _lg_n _ps _ps_n _bs _bs_rc _wrc
+  local _old="$1" _new="$2" _ts _out _ps _ps_n _bs _bs_rc _wrc
   _ts="$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "$DEATH_LOG_DIR" 2>/dev/null || true
   # ${_ts} has 1-second resolution and `>` truncates: two captures in the same second
@@ -135,21 +253,13 @@ capture_death_snapshot() {
     { cat "$CITY/.gc/runtime/packs/dolt/dolt-state.json" 2>/dev/null || echo "(not found)"; } \
       | cut -c1-"$SNAP_LINE_MAX" | head -20
     echo
-    echo "--- log show --last 3m: dolt / memorystatus / jetsam / tcp_close / signals ---"
-    # Truncation and timeout are stated IN the file, never silent: under memory pressure
-    # (the incident's own condition) jetsam/memorystatus lines alone fill the cap, and
-    # `tail` keeps the NEWEST lines, so the oldest part of the window -- possibly the very
-    # moment of death -- is what drops. A reader must be able to tell "nothing happened
-    # before T" from "the file stopped looking before T".
-    _lg="$(timeout "$SNAP_LOG_TIMEOUT" log show --last 3m --predicate \
-      'eventMessage contains "dolt" OR eventMessage contains "memorystatus" OR eventMessage contains "jetsam" OR eventMessage contains "tcp_close" OR eventMessage contains "SIGKILL" OR eventMessage contains "SIGQUIT" OR eventMessage contains "SIGTERM"' \
-      2>&1)"
-    _lg_rc=$?
-    _lg_n="$(printf '%s\n' "$_lg" | grep -c . || true)"
-    [ "$_lg_rc" -eq 124 ] && echo "(!! log show TIMED OUT after ${SNAP_LOG_TIMEOUT}s -- the lines below are PARTIAL, the window is NOT fully covered)"
-    [ "$_lg_rc" -ne 0 ] && [ "$_lg_rc" -ne 124 ] && echo "(!! log show FAILED rc=${_lg_rc} -- the lines below are its ERROR OUTPUT, not log events; the window is NOT covered)"
-    [ "$_lg_n" -gt "$SNAP_LOG_MAX_LINES" ] && echo "(!! TRUNCATED: showing the newest ${SNAP_LOG_MAX_LINES} of ${_lg_n} matching lines -- the oldest $((_lg_n - SNAP_LOG_MAX_LINES)) were dropped)"
-    printf '%s\n' "$_lg" | tail -"$SNAP_LOG_MAX_LINES" | cut -c1-"$SNAP_LINE_MAX"
+    echo "--- log show, newest-first chunks: dolt / memorystatus / jetsam / tcp_close / signals ---"
+    # Truncation, timeout and failure are stated IN the file, never silent -- per chunk and
+    # for the window as a whole (see capture_log_window). Under memory pressure (the
+    # incident's own condition) jetsam/memorystatus lines alone fill the line cap and the
+    # oldest are what drops; a reader must be able to tell "nothing happened before T" from
+    # "the file stopped looking before T".
+    capture_log_window
     echo
     echo "--- ps: supervisor + dolt process tree (snapshot at capture time) ---"
     # Single-pass awk (header + rows mentioning dolt), NOT `{ head -1; grep; }`: on a pipe

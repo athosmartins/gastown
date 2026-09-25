@@ -315,21 +315,44 @@ exit 1
 FAKE
   chmod +x "$_tmpd4/bin/gc"
 
-  # Fake `log`: answers the two windows the snapshot asks for. FAKE_LOG_MODE drives the
-  # forensic window (--last 3m), FAKE_BURST_MODE the burst-count window (--last 1m).
+  # Fake `log`: answers the windows the snapshot asks for. FAKE_LOG_MODE drives the
+  # forensic window, FAKE_BURST_MODE the burst-count window (--last 1m).
   # Default (both unset) is a quiet host: no events, exit 0. The `_hdr` line is the
   # column header the REAL `log show` prints even for a zero-event window (measured).
+  #
+  # ga-fctr6g: the forensic window is asked for as `--start S [--end E]` CHUNKS, newest first
+  # (the newest chunk has no --end). The fake numbers those calls in $FAKE_LOG_CALLS (reset by
+  # _run7) and records each call's START/END in $FAKE_LOG_CALLS.args. The `--last 3m` branch
+  # is the pre-ga-fctr6g single query, kept so this file can also be run against that code.
+  # Mode `cost` models the measured problem: a call takes FAKE_COST seconds per 60s of window
+  # it is asked to scan, so one big window blows a small budget while small chunks fit.
   cat > "$_tmpd4/bin/log" <<'FAKE'
 #!/usr/bin/env bash
 _ev()  { echo "2026-09-25 00:26:43.000000-0300 0x1 Default 0x0 1 0 kernel: $1;"; }
 _hdr() { echo "Timestamp                       Thread     Type        Activity             PID    TTL  "; }
+_secs() { date -j -f '%Y-%m-%d %H:%M:%S%z' "$1" +%s; }
+_cost() { sleep "$(awk -v w="$1" -v c="${FAKE_COST:-1}" 'BEGIN{printf "%.3f", w/60*c}')"; }
 case "$*" in
+  *"--start "*)
+    n=$(( $(cat "$FAKE_LOG_CALLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_LOG_CALLS"
+    _s=""; _e=""; while [ $# -gt 0 ]; do case "$1" in --start) _s="$2"; shift ;; --end) _e="$2"; shift ;; esac; shift; done
+    echo "START=$_s END=$_e" >> "$FAKE_LOG_CALLS.args"
+    case "${FAKE_LOG_MODE:-}" in
+      many)  if [ "$n" -le 3 ]; then i=0; while [ "$i" -lt 500 ]; do _ev "seq=$(( (3 - n) * 500 + i ))"; i=$((i+1)); done; fi ;;
+      slow)  echo "partial-line-before-timeout"; exec sleep 5 ;;
+      few)   [ "$n" -eq 1 ] && _ev "seq=0" ;;
+      fail3) echo "log: Bad predicate (Unable to parse the format string \"x\"): x" >&2; exit 64 ;;
+      slow2) if [ "$n" -eq 1 ]; then _ev "chunk1-event"
+             else echo "2026-09-25 00:25:50.123456-0300 0x1 Default 0x0 1 0 kernel: chunk${n}-event-before-timeout;"; exec sleep 5; fi ;;
+      cost)  _w=$(( $( [ -n "$_e" ] && _secs "$_e" || date +%s ) - $(_secs "$_s") )); _cost "$_w"; _ev "cost-call=$n" ;;
+    esac ;;
   *"--last 3m"*)
     case "${FAKE_LOG_MODE:-}" in
       many)  i=0; while [ "$i" -lt 1500 ]; do _ev "seq=$i"; i=$((i+1)); done ;;
       slow)  echo "partial-line-before-timeout"; exec sleep 5 ;;
       few)   _ev "seq=0" ;;
       fail3) echo "log: Bad predicate (Unable to parse the format string \"x\"): x" >&2; exit 64 ;;
+      cost)  _cost 180; _ev "cost-call=old-single-query" ;;
     esac ;;
   *"--last 1m"*)
     case "${FAKE_BURST_MODE:-}" in
@@ -352,6 +375,7 @@ FAKE
     env PATH="$_tmpd4/bin:$PATH" DOLT_WATCHDOG_LOG="$_tmpd4/l" \
         DOLT_WATCHDOG_STRIKES_FILE="$_tmpd4/s" DOLT_WATCHDOG_CPU_VETO_FILE="$_tmpd4/v" \
         DOLT_WATCHDOG_LASTPID_FILE="$_lastpid" DOLT_WATCHDOG_DEATH_LOG_DIR="$_deaths" \
+        FAKE_LOG_CALLS="$_tmpd4/logcalls" \
         "$@" bash "$SRC" >/dev/null 2>&1
   }
 
@@ -530,7 +554,7 @@ FAKE
   #     window -- the part that would hold the moment of death -- with nothing in the file
   #     saying so.
   _run7() {  # $1 = FAKE_LOG_MODE, $2 = extra env words (or empty); leaves the newest snapshot path in $_snap7
-    rm -f "$_deaths"/dolt-death-*.txt; echo 7000 > "$_lastpid"
+    rm -f "$_deaths"/dolt-death-*.txt "$_tmpd4/logcalls" "$_tmpd4/logcalls.args"; echo 7000 > "$_lastpid"
     _wd FAKE_LOG_MODE="$1" $2 DOLT_WATCHDOG_PID_OVERRIDE=7001
     _snap7="$(_newest_snap)"
   }
@@ -550,6 +574,9 @@ FAKE
     { ! grep -q 'TRUNCATED' "$_snap7" && ! grep -q 'TIMED OUT' "$_snap7" && ! grep -q 'FAILED rc=' "$_snap7" && ! grep -q 'UNAVAILABLE' "$_snap7"; } \
       && ok "small window -> no truncation / timeout / failure / unavailable note (markers are not unconditional)" \
       || bad "ga-xyhl9d: a healthy 1-line window carried a TRUNCATED/TIMED OUT/FAILED/UNAVAILABLE note -- the markers fire unconditionally"
+    grep -q '^coverage: all 180s COMPLETE' "$_snap7" \
+      && ok "ga-fctr6g: healthy window -> coverage says all 180s COMPLETE (the summary is stated, not only implied by silence)" \
+      || bad "ga-fctr6g: a healthy window did not state 'coverage: all 180s COMPLETE' -- got: $(grep -m1 '^coverage:' "$_snap7")"
   else bad "ga-xyhl9d: control case produced no snapshot file"; fi
 
   _run7 slow "DOLT_WATCHDOG_SNAP_LOG_TIMEOUT=1"
@@ -557,7 +584,89 @@ FAKE
     grep -q 'log show TIMED OUT after 1s' "$_snap7" \
       && ok "log show timeout -> snapshot says the window is PARTIAL (not silent)" \
       || bad "ga-xyhl9d: log show timed out with NO note in the snapshot (silent partial window)"
+    { grep -q 'NOT ATTEMPTED' "$_snap7" && grep -q '^coverage: NONE' "$_snap7"; } \
+      && ok "ga-fctr6g: budget spent on a timed-out newest chunk -> older chunks say NOT ATTEMPTED and coverage says NONE" \
+      || bad "ga-fctr6g: a timed-out newest chunk left no NOT ATTEMPTED / 'coverage: NONE' -- got: $(grep -m1 '^coverage:' "$_snap7")"
   else bad "ga-xyhl9d: timeout case produced no snapshot file"; fi
+
+  # (7c) ga-fctr6g -- THE regression. The cost of `log show` grows with the window it scans; the
+  #      budget does not. Measured 2026-09-25 at the load that goes WITH a Dolt death: one
+  #      `--last 3m` = 33-39s against a 30s cap (1m = 9s, 30s = ~4s), and a timed-out `log show`
+  #      loses the NEWEST end of its window (it prints oldest-first) -- the moment of death.
+  #      Model: 4s of "scan" per 60s of window against an 8s budget. The single 180s query needs
+  #      12s and times out with nothing; newest-first 30s chunks (2s each) must land the last
+  #      MINUTE complete, and the 300s third chunk is deliberately far beyond the budget.
+  DOLT_WATCHDOG_SNAP_LOG_CHUNKS="30 30 300" _run7 cost "FAKE_COST=4 DOLT_WATCHDOG_SNAP_LOG_TIMEOUT=8"
+  if [ -n "$_snap7" ]; then
+    { grep -q 'cost-call=1;' "$_snap7" && grep -q 'cost-call=2;' "$_snap7" && ! grep -q 'cost-call=old-single-query' "$_snap7"; } \
+      && ok "ga-fctr6g: window costlier than the budget -> the newest 60s of events landed (chunks 1 and 2)" \
+      || bad "ga-fctr6g: the newest minute's events are missing from a budget-limited snapshot"
+    grep -q '^coverage: newest 60s COMPLETE' "$_snap7" \
+      && ok "ga-fctr6g: coverage line states exactly how much is covered (newest 60s COMPLETE)" \
+      || bad "ga-fctr6g: no 'coverage: newest 60s COMPLETE' -- got: $(grep -m1 '^coverage:' "$_snap7")"
+    { grep -qE '^  chunk 3 .*(TIMED OUT|NOT ATTEMPTED)' "$_snap7" && ! grep -q '^  chunk 3 .*COMPLETE' "$_snap7"; } \
+      && ok "ga-fctr6g: the chunk that did not fit says TIMED OUT / NOT ATTEMPTED (never reads as covered)" \
+      || bad "ga-fctr6g: the over-budget chunk is not marked as uncovered"
+  else bad "ga-fctr6g: budget-limited case produced no snapshot file"; fi
+
+  # (7d) A chunk that times out AFTER emitting events must say how far it got (the last event's
+  #      timestamp) -- that bounds the hole, where the old note only said "PARTIAL".
+  _run7 slow2 "DOLT_WATCHDOG_SNAP_LOG_TIMEOUT=3"
+  if [ -n "$_snap7" ]; then
+    grep -q '^  chunk 1 .*COMPLETE' "$_snap7" \
+      && ok "ga-fctr6g: chunk that finished before the timeout is COMPLETE" \
+      || bad "ga-fctr6g: chunk 1 (finished instantly) is not COMPLETE"
+    grep -q '^  chunk 2 .*PARTIAL -- log show TIMED OUT after [0-9]*s; events seen only up to 2026-09-25 00:25:50\.123' "$_snap7" \
+      && ok "ga-fctr6g: timed-out chunk reports the last event it saw (bounds the uncovered part)" \
+      || bad "ga-fctr6g: timed-out chunk did not report how far it got -- got: $(grep -m1 '^  chunk 2' "$_snap7")"
+    grep -q '^coverage: newest 30s COMPLETE' "$_snap7" \
+      && ok "ga-fctr6g: coverage stops at the first chunk that is not COMPLETE (newest 30s)" \
+      || bad "ga-fctr6g: coverage did not stop at the timed-out chunk -- got: $(grep -m1 '^coverage:' "$_snap7")"
+  else bad "ga-fctr6g: partial-progress case produced no snapshot file"; fi
+
+  # (7e) A malformed chunk list must be SAID, not silently replaced (and `030` is rejected:
+  #      it is octal inside $(( ))).
+  for _spec7 in "30 abc" "030 30"; do
+    DOLT_WATCHDOG_SNAP_LOG_CHUNKS="$_spec7" _run7 few ""
+    if [ -n "$_snap7" ]; then
+      { grep -q "is not a list of positive whole seconds" "$_snap7" && grep -q '^  chunk 4 ' "$_snap7"; } \
+        && ok "ga-fctr6g: malformed DOLT_WATCHDOG_SNAP_LOG_CHUNKS='$_spec7' -> stated in the file, default 4 chunks used" \
+        || bad "ga-fctr6g: malformed chunk list '$_spec7' was not stated / default not used"
+    else bad "ga-fctr6g: malformed-chunk-list case produced no snapshot file"; fi
+  done
+  # Same for the total budget: under `set -u` a non-numeric value used to be a hard abort
+  # inside $(( )) -- the snapshot half-written -- instead of a stated fallback.
+  for _bud7 in abc -5 08; do
+    DOLT_WATCHDOG_SNAP_LOG_TIMEOUT="$_bud7" _run7 few ""
+    if [ -n "$_snap7" ]; then
+      case "$_bud7" in
+        08) grep -q '^coverage: all 180s COMPLETE' "$_snap7" && ! grep -q 'is not whole seconds' "$_snap7" && grep -q 'in 4 chunks, newest first, 8s total budget' "$_snap7" \
+              && ok "ga-fctr6g: budget '08' read as decimal 8 (no octal abort), window completes" \
+              || bad "ga-fctr6g: budget '08' was not read as decimal 8" ;;
+        *)  { grep -q "is not whole seconds -- using 30" "$_snap7" && grep -q '^coverage: all 180s COMPLETE' "$_snap7" && grep -q '^=== end of snapshot ===' "$_snap7"; } \
+              && ok "ga-fctr6g: malformed DOLT_WATCHDOG_SNAP_LOG_TIMEOUT='$_bud7' -> stated fallback to 30, snapshot still whole" \
+              || bad "ga-fctr6g: malformed budget '$_bud7' aborted or was not stated" ;;
+      esac
+    else bad "ga-fctr6g: budget case '$_bud7' produced no snapshot file"; fi
+  done
+
+  # (7f) The chunks must TILE the window: newest has no --end, and every older chunk ends exactly
+  #      where the next-newer one starts (a gap loses events, an overlap duplicates them), with
+  #      the configured lengths. Checked on the arguments the fake `log` actually received.
+  _run7 few ""
+  _ok7f=1; _lens7f=""; _k7f=0; _prev7f=""
+  while IFS='|' read -r _cs7 _ce7; do
+    _k7f=$((_k7f + 1))
+    if [ "$_k7f" -eq 1 ]; then [ -z "$_ce7" ] || _ok7f=0
+    else
+      [ "$_ce7" = "$_prev7f" ] || _ok7f=0
+      _lens7f="$_lens7f $(( $(date -j -f '%Y-%m-%d %H:%M:%S%z' "$_ce7" +%s) - $(date -j -f '%Y-%m-%d %H:%M:%S%z' "$_cs7" +%s) ))"
+    fi
+    _prev7f="$_cs7"
+  done < <(sed -E 's/^START=(.*) END=(.*)$/\1|\2/' "$_tmpd4/logcalls.args" 2>/dev/null)
+  { [ "$_k7f" -eq 4 ] && [ "$_ok7f" -eq 1 ] && [ "$_lens7f" = " 30 60 60" ]; } \
+    && ok "ga-fctr6g: 4 chunks tile the window (newest open-ended; each older one ends where the newer starts; 30/60/60s)" \
+    || bad "ga-fctr6g: chunks do not tile the window (calls=$_k7f contiguous=$_ok7f older lengths='$_lens7f')"
 
   # (7b) A `log show` that FAILS (not times out) prints an error message; without a note it
   #      sat in the window section looking like log events (gate ga-u9utfa: instance fixed
