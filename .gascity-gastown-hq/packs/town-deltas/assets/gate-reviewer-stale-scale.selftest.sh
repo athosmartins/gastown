@@ -91,14 +91,41 @@ REVIEWER_STALE_MAX_SECS=100
 eq "MAX=100 < base=300 → base"            "$(gate_scaled_reviewer_stale 300 5 300)"    "300"
 REVIEWER_STALE_MAX_SECS=900
 
+# lib_var NAME [ENV=VAL ...] — value of NAME after sourcing the dispatcher in
+# lib-only mode inside a FRESH child (ENV=VAL are that child's hostile env), or the
+# literal "<unreadable>" if the child could not report it. Section 7 uses it instead
+# of `( … bash -c 'source …; echo "$X"' ) | { read -r v; eq … "$v"; }`, which had
+# two defects (same class as ga-5hw36b, fixed in gate-verdict-timeout-scale.selftest.sh):
+#   1. A pipeline's right side is a SUBSHELL, so eq()'s PASS/FAIL bumps were lost
+#      (measured ga-xc4u1n, 2026-09-25: with the dispatcher's garbage-PER_FILE
+#      fallback mutated 20→21 the suite printed the ✗ line and still ended
+#      "19 passed, 0 failed", exit 0 — on /bin/bash 3.2 and bash 5 alike).
+#   2. `read` takes the FIRST stdout line, and sourcing the dispatcher can print a
+#      notify "Logged for digest" line to stdout before the value (mechanism measured
+#      in ga-5hw36b; not separately reproduced against this file).
+# So: drop the child's stdout while it sources, emit the value on ONE tagged line,
+# keep only tagged lines, and return it by command substitution so eq() runs in THIS
+# shell and its counters count. The knobs section 7 reads (or that its expected
+# values derive from — MAX is floored at STALE_SECS) are scrubbed from the inherited
+# env first; callers re-add what they need. "$BASH" (not PATH `bash`) so /bin/bash 3.2
+# and bash 5 each test their own child.
+lib_var() {
+  local name="$1" out; shift
+  out="$(env -u REVIEWER_STALE_SECS -u REVIEWER_STALE_PER_FILE_SECS \
+            -u REVIEWER_STALE_PER_100_LINES_SECS -u REVIEWER_STALE_MAX_SECS \
+            GATE_DISPATCHER_LIB_ONLY=1 "$@" "${BASH:-bash}" -c '
+              source "$1" >/dev/null 2>&1 || exit 97
+              printf "@@LIBVAR@@%s\n" "${!2}"
+            ' _ "$DISPATCHER" "$name" 2>/dev/null | grep '^@@LIBVAR@@' | tail -n 1)" || true
+  if [ -n "$out" ]; then printf '%s' "${out#@@LIBVAR@@}"; else printf '<unreadable>'; fi
+}
+
 # ── 7. config defaults + sanitization (re-source with hostile env) ────────────
 echo "── 7. config block sanitization ──"
-( REVIEWER_STALE_PER_FILE_SECS="garbage" GATE_DISPATCHER_LIB_ONLY=1 \
-    bash -c 'source "'"$DISPATCHER"'"; echo "$REVIEWER_STALE_PER_FILE_SECS"' 2>/dev/null ) \
-  | { read -r v; eq "garbage PER_FILE → default 20" "$v" "20"; }
-( REVIEWER_STALE_MAX_SECS="nope" GATE_DISPATCHER_LIB_ONLY=1 \
-    bash -c 'source "'"$DISPATCHER"'"; echo "$REVIEWER_STALE_MAX_SECS"' 2>/dev/null ) \
-  | { read -r v; eq "garbage MAX → default 900" "$v" "900"; }
+eq "garbage PER_FILE → default 20" \
+   "$(lib_var REVIEWER_STALE_PER_FILE_SECS REVIEWER_STALE_PER_FILE_SECS=garbage)" "20"
+eq "garbage MAX → default 900" \
+   "$(lib_var REVIEWER_STALE_MAX_SECS REVIEWER_STALE_MAX_SECS=nope)" "900"
 
 # ── 8. DRIFT-GUARD: live script must wire the scaling into the sweep ──────────
 echo "── 8. drift-guard: wiring present in live dispatcher ──"
