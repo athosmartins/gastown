@@ -1208,5 +1208,95 @@ else
   bad "no guard against publishing an empty/invalid fingerprint over the last good one"
 fi
 
+# ── _publish_run_fingerprint() (ga-dgnpyj) ─────────────────────────────────────
+# The two uploads at the end of the run used to end in `|| true`. _meta/latest.json
+# is the ONLY "S3 is fresh" proof its consumers have (dolt-backup-residue-reclaim.sh,
+# dolt-backup-reseed.sh); when its upload failed, the previous night's file stayed,
+# its older run_utc kept those consumers inert, and residue-reclaim files that under
+# "SPARED ... expected, self-healing" — which never notifies. A permanent upload
+# failure therefore alarmed nobody. Same family as ga-gjfe78: a failed write and
+# "nothing to do" read as the same value.
+echo ""
+echo "── _publish_run_fingerprint() — a failed latest.json upload is never swallowed (ga-dgnpyj) ──"
+
+type _publish_run_fingerprint >/dev/null 2>&1 \
+  && ok "_publish_run_fingerprint defined by lib-mode source" \
+  || bad "_publish_run_fingerprint NOT defined — the uploads are still inline with '|| true'"
+
+PUB_DIR="$(mktemp -d)"
+PUB_CALLS="$PUB_DIR/aws-calls"; PUB_NOTIFY="$PUB_DIR/notify-calls"; PUB_LOG="$PUB_DIR/log"
+printf '{"run_utc":"2026-09-25T07:00:00Z"}\n' > "$PUB_DIR/meta.json"
+cat > "$PUB_DIR/aws" <<'STUB'
+#!/bin/bash
+# fake aws: records every call; FAKE_UP_FAIL_LATEST / FAKE_UP_FAIL_DATED make the
+# matching s3 cp destination fail (rc 1) — latest.json vs the dated <ts>.json copy.
+printf '%s\n' "$*" >> "$PUB_CALLS"
+if [ "$1 $2" = "s3 cp" ]; then
+  case "$4" in
+    */_meta/latest.json) exit "${FAKE_UP_FAIL_LATEST:-0}" ;;
+    */_meta/2*.json)     exit "${FAKE_UP_FAIL_DATED:-0}" ;;
+  esac
+fi
+echo "unhandled aws stub invocation: $*" >&2; exit 1
+STUB
+chmod +x "$PUB_DIR/aws"
+cat > "$PUB_DIR/notify" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$PUB_NOTIFY"
+STUB
+chmod +x "$PUB_DIR/notify"
+export PUB_CALLS PUB_NOTIFY
+
+# _run_publish <latest-fail 0|1> <dated-fail 0|1> [aws-binary] → rc of the function
+_run_publish() {
+  : > "$PUB_CALLS"; : > "$PUB_NOTIFY"; : > "$PUB_LOG"
+  AWS="${3:-$PUB_DIR/aws}" META="$PUB_DIR/meta.json" S3="s3://testbucket" LOG="$PUB_LOG" \
+    NOTIFY="$PUB_DIR/notify" FAKE_UP_FAIL_LATEST="$1" FAKE_UP_FAIL_DATED="$2" \
+    _publish_run_fingerprint
+}
+_upload_count() { grep -c '^s3 cp ' "$PUB_CALLS"; }
+_notify_count() { grep -c . "$PUB_NOTIFY"; }
+
+# Scenario A: both uploads work → success, silent, and the log SAYS it published.
+_run_publish 0 0 && ok "scenario A (both uploads ok): returns success" || bad "scenario A: should return success"
+[ "$(_upload_count)" = "2" ] && ok "scenario A: both latest.json and the dated copy were uploaded" || bad "scenario A: expected 2 uploads, got $(_upload_count)"
+[ "$(_notify_count)" = "0" ] && ok "scenario A: no notification on success" || bad "scenario A: notified on success: $(cat "$PUB_NOTIFY")"
+grep -qF "published _meta/latest.json" "$PUB_LOG" && ok "scenario A: log positively records the publish" || bad "scenario A: no positive 'published' line in the log"
+
+# Scenario B: latest.json upload FAILS (dated ok) → must fail, notify once, log FAILED,
+# and must NOT log the success line (the run does not report the fingerprint as published).
+_run_publish 1 0 && bad "scenario B (latest.json upload fails): returned success — the failure was swallowed" || ok "scenario B (latest.json upload fails): returns failure"
+[ "$(_notify_count)" = "1" ] && ok "scenario B: notify_fail fired exactly once" || bad "scenario B: expected 1 notification, got $(_notify_count)"
+grep -qF "latest.json" "$PUB_NOTIFY" && ok "scenario B: the notification names _meta/latest.json (actionable)" || bad "scenario B: notification does not name latest.json: $(cat "$PUB_NOTIFY")"
+grep -qF "FAILED" "$PUB_LOG" && ok "scenario B: log records the failed upload" || bad "scenario B: nothing logged about the failed upload"
+grep -qF "published _meta/latest.json" "$PUB_LOG" && bad "scenario B: log claims the fingerprint was published although its upload failed" || ok "scenario B: no 'published' line when latest.json did not upload"
+[ "$(_upload_count)" = "2" ] && ok "scenario B: the dated copy is still attempted (independent of latest.json)" || bad "scenario B: expected the dated upload to still be attempted (2 uploads), got $(_upload_count)"
+
+# Scenario C: only the dated (audit-only) copy fails → the freshness proof IS current,
+# so success and NO alarm — but the failure is still logged, not silently dropped.
+_run_publish 0 1 && ok "scenario C (only the dated copy fails): returns success — the proof is current" || bad "scenario C: latest.json uploaded, should be success"
+[ "$(_notify_count)" = "0" ] && ok "scenario C: no notification for an audit-only copy" || bad "scenario C: notified for the dated copy: $(cat "$PUB_NOTIFY")"
+grep -qF "dated" "$PUB_LOG" && ok "scenario C: the dated-copy failure is logged" || bad "scenario C: dated-copy failure vanished from the log"
+
+# Scenario D: BOTH fail → still exactly ONE notification per run (not one per upload).
+_run_publish 1 1 && bad "scenario D (both fail): returned success" || ok "scenario D (both fail): returns failure"
+[ "$(_notify_count)" = "1" ] && ok "scenario D: one notification per run, not one per failed upload" || bad "scenario D: expected 1 notification, got $(_notify_count)"
+
+# Scenario E: the aws binary itself is missing (rc 127) — "could not run" is a failure
+# too, not a silent pass.
+_run_publish 0 0 "$PUB_DIR/no-such-aws" 2>/dev/null && bad "scenario E (aws missing): returned success" || ok "scenario E (aws missing): returns failure"
+[ "$(_notify_count)" = "1" ] && ok "scenario E: a missing aws binary still notifies" || bad "scenario E: expected 1 notification, got $(_notify_count)"
+
+# drift-guard: the live flow calls it exactly once (one alarm per night) and no
+# latest.json upload line is left swallowed by '|| true'.
+CALLS=$(grep -c '^ *_publish_run_fingerprint *\(#.*\)\?$' "$SCRIPT")
+[ "$CALLS" = "1" ] && ok "drift-guard: the live flow calls _publish_run_fingerprint exactly once" || bad "drift-guard: expected exactly 1 call site of _publish_run_fingerprint, got $CALLS"
+if grep -F '_meta/latest.json' "$SCRIPT" | grep -F 's3 cp' | grep -qF '|| true'; then
+  bad "drift-guard: an 's3 cp ... _meta/latest.json' line still ends in '|| true' — the upload result is swallowed again"
+else
+  ok "drift-guard: no s3 cp of _meta/latest.json ends in '|| true'"
+fi
+rm -f "$PUB_DIR"/aws "$PUB_DIR"/notify "$PUB_DIR"/meta.json "$PUB_CALLS" "$PUB_NOTIFY" "$PUB_LOG" 2>/dev/null || true
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

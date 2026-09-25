@@ -618,6 +618,41 @@ json.dump({"run_utc": run_utc, "port": int(port), "bucket": "urblink-dolt-backup
 PY
 }
 
+# _publish_run_fingerprint — uploads $META as _meta/latest.json and as a dated
+# _meta/<ts>.json copy. Returns 0 iff latest.json was uploaded.
+#
+# ga-dgnpyj: both uploads used to end in `|| true`, so a failed latest.json
+# upload logged nothing and alarmed nobody. latest.json is the ONLY "S3 is fresh"
+# proof the consumers have (dolt-backup-residue-reclaim.sh, dolt-backup-reseed.sh):
+# when it stays at the previous night's file its older run_utc keeps them inert
+# (safe), but residue-reclaim files that under "SPARED ... expected, self-healing",
+# which never notifies — so a PERMANENT upload failure looked like a healthy
+# quiet night. A failed write and "nothing to do" were the same value.
+#
+# Now: a failed latest.json upload is logged and notify_fail'd, and the
+# "published" line is logged ONLY when it really was — so the run never reports
+# a fingerprint it did not publish. The dated copy is audit-only (nothing reads it
+# as proof), so its failure is logged but does not alarm and does not change the
+# result. Both uploads are always attempted (independent), and one call = at most
+# ONE notification, so one nightly run = one alarm.
+#
+# The upload lines below keep their literal shape: the selftest's drift-guard
+# greps them to prove they come after `export AWS_REQUEST_CHECKSUM_CALCULATION`.
+_publish_run_fingerprint() {
+  local rc=0
+  if "$AWS" s3 cp "$META" "$S3/_meta/latest.json" --only-show-errors >> "$LOG" 2>&1; then
+    log "fingerprint: published _meta/latest.json (the S3 freshness proof is current)"
+  else
+    rc=1
+    log "fingerprint: upload of _meta/latest.json FAILED — S3 keeps the previous run's fingerprint (older run_utc), so its freshness consumers stay inert with no signal of their own"
+    notify_fail "backup off-box: upload do _meta/latest.json FALHOU — a prova de S3 fresco fica com a data da rodada anterior e os consumidores (residue-reclaim/reseed) seguem inertes sem alarme próprio; ver $LOG"
+  fi
+  if ! "$AWS" s3 cp "$META" "$S3/_meta/$(date -u +%Y%m%d-%H%M%S).json" --only-show-errors >> "$LOG" 2>&1; then
+    log "fingerprint: upload of the dated _meta/<ts>.json copy failed (audit-only copy; latest.json result unaffected)"
+  fi
+  return "$rc"
+}
+
 # Library mode: `DOLT_S3_BACKUP_LIB=1 source dolt-s3-backup.sh` defines the pure
 # functions above without running the live backup flow (lock/PORT/DOLT_BACKUP/S3).
 if [ "${DOLT_S3_BACKUP_LIB:-0}" = "1" ]; then
@@ -807,8 +842,9 @@ if "$AWS" --version >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   # keeps every consumer's freshness check inert.
   if _build_run_fingerprint "$RAW" "$RUN_UTC" "$PORT" "$ok" "$failed" "$total" "$DBS" "$FAILED_DBS" "$PREV_META" > "$META" 2>> "$LOG" \
      && python3 -c 'import json,sys; sys.exit(0 if isinstance(json.load(open(sys.argv[1])), dict) else 1)' "$META" 2>> "$LOG"; then
-    "$AWS" s3 cp "$META" "$S3/_meta/latest.json" --only-show-errors >> "$LOG" 2>&1 || true
-    "$AWS" s3 cp "$META" "$S3/_meta/$(date -u +%Y%m%d-%H%M%S).json" --only-show-errors >> "$LOG" 2>&1 || true
+    # ga-dgnpyj: a failed upload is logged + notify_fail'd inside; this script has
+    # no `set -e`, and a failed upload must not abort the rest of the run.
+    _publish_run_fingerprint
   else
     log "fingerprint: could not build a valid run fingerprint — NOT publishing (the last good _meta/latest.json stays)"
     notify_fail "backup off-box: fingerprint _meta/latest.json não foi gerado — NÃO publicado (fica o último bom); ver $LOG"
