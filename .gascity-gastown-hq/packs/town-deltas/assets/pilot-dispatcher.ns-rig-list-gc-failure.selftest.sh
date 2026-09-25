@@ -88,9 +88,52 @@ done
 warn() { :; }   # stub — pilot-dispatcher.sh's own logger, not under test here
 log()  { :; }
 
-GC_CITY="$(mktemp -d)"
+# wa-x02jx / ga-bdebb0: TOWNROOT is dirname($GC_CITY) on purpose (pilot-dispatcher.sh
+# builds its repo list from `dirname "$GC_CITY"`), so GC_CITY must live under a
+# PRIVATE parent. It used to be a bare `mktemp -d`, whose dirname is the shared OS
+# temp root: the `git init` below then turned $TMPDIR ITSELF into a repository,
+# and the WA pytest guard (tests/conftest.py, wa-cfjod) refused to run for every
+# agent on the machine. Pinned by
+# pilot-dispatcher.ns-rig-list-gc-failure.tmpdir-pollution.selftest.sh.
+
+# _refuse_if_townroot_is_os_tmp <path> — fail-closed tripwire, called BEFORE any git
+# op on TOWNROOT. Returns non-zero if <path> is empty, cannot be resolved (can't-tell
+# is not "safe"), or resolves to an OS temp root ($TMPDIR, /tmp, /var/tmp, or the
+# per-user Darwin temp dir); compared by physical path so a trailing slash or a
+# /tmp -> /private/tmp symlink can't defeat it.
+_refuse_if_townroot_is_os_tmp() {
+  local root="${1:-}" root_p cand cand_p
+  if [ -z "$root" ]; then
+    echo "FATAL: TOWNROOT is empty — refusing to run git against it" >&2
+    return 2
+  fi
+  root_p="$(cd "$root" 2>/dev/null && pwd -P)"
+  if [ -z "$root_p" ]; then
+    echo "FATAL: cannot resolve TOWNROOT '$root' — refusing to run git against it" >&2
+    return 2
+  fi
+  for cand in "${TMPDIR:-}" /tmp /var/tmp "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"; do
+    [ -n "$cand" ] || continue
+    cand_p="$(cd "$cand" 2>/dev/null && pwd -P)" || continue
+    [ -n "$cand_p" ] || continue
+    if [ "$root_p" = "$cand_p" ]; then
+      echo "FATAL: TOWNROOT '$root' IS the OS temp root ('$cand_p') — a git init here would poison every process that uses it (wa-x02jx)" >&2
+      return 2
+    fi
+  done
+  return 0
+}
+
+TOWN_SANDBOX="$(mktemp -d)"
+if [ -z "$TOWN_SANDBOX" ] || [ ! -d "$TOWN_SANDBOX" ]; then
+  echo "FATAL: could not create the fixture sandbox dir" >&2
+  exit 2
+fi
+trap 'rm -rf "$TOWN_SANDBOX"' EXIT
+GC_CITY="$TOWN_SANDBOX/city"
+mkdir -p "$GC_CITY" || { echo "FATAL: could not create $GC_CITY" >&2; exit 2; }
 TOWNROOT="$(dirname "$GC_CITY")"
-trap 'rm -rf "$GC_CITY"' EXIT
+_refuse_if_townroot_is_os_tmp "$TOWNROOT" || exit 2
 
 # A real git repo at the town root, with one commit (a branch ref needs at
 # least one commit to exist), and ZERO refs matching our test bead id — proves
