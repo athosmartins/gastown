@@ -93,6 +93,7 @@ select_marker() {
   GATE_MARKER_AGE_PROMOTE_SECONDS=999999999 \
   GATE_MARKER_HARD_AGE_SECONDS=999999999 \
   GATE_EXILE_OVERDUE_SECONDS=5400 \
+  GATE_EXILE_RETRY_CEILING=3 \
   bash -c 'log() { echo "LOG:$*"; }; warn() { echo "WARN:$*"; }; '"$SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null
 }
 # mk <id> <age-seconds> <extra-labels-csv>  — a queued marker created <age> ago.
@@ -105,13 +106,35 @@ mk() {
 }
 
 # The incident's shape: A is the oldest, exiled 6000s ago (> the 5400s ceiling, so
-# tier 1 admits it), fail-count 5. B and C are healthy and newer.
-A_EXILE="gate:exiled-tier5:5,gate:rebase-fail-count:5,gate:exiled-since:$((NOW - 6000))"
+# tier 1 admits it). B and C are healthy and newer.
+# ga-r5dsgp (merged to main after this test was first written) added
+# GATE_EXILE_RETRY_CEILING: tier 1 only re-admits an overdue-exile marker whose attempt
+# count is still BELOW it (default 3). So A carries count 2 — inside its own retry budget,
+# i.e. exactly the population the cooldown has to cover; a marker already past the ceiling
+# never reaches tier 1 at all (asserted separately, "layered defences" below).
+A_EXILE="gate:exiled-tier5:2,gate:rebase-fail-count:2,gate:exiled-since:$((NOW - 6000))"
 FIX="[$(mk A 20000 "$A_EXILE"),$(mk B 600),$(mk C 300)]"
 SEL="$(select_marker "$FIX")"
 [ "$SEL" = "A" ] \
   && ok "baseline (no cooldown): overdue-exile A still wins tier 1 — the ga-0ye7ar 'an exiled marker must eventually get an attempt' guarantee is intact" \
   || bad "baseline: expected A (tier-1 exile promotion), got '$SEL'"
+
+# Layered defences (ga-r5dsgp + ga-a6etc2). Each one alone is enough for its own population:
+#   count >= ceiling            -> ga-r5dsgp keeps it OUT of tier 1 (the incident's own fail-count 30)
+#   count <  ceiling + cooldown -> this bead keeps it out of EVERY tier between attempts
+# and NEITHER may hide a marker that is inside its budget with no cooldown.
+FIX="[$(mk A 20000 "gate:exiled-tier5:30,gate:rebase-fail-count:30,gate:exiled-since:$((NOW - 6000))"),$(mk B 600),$(mk C 300)]"
+SEL="$(select_marker "$FIX")"
+case "$SEL" in
+  B|C) ok "layered: the incident's own marker (fail-count 30, exile overdue, NO cooldown) is kept out of tier 1 by the ga-r5dsgp retry ceiling — a healthy marker ($SEL) wins" ;;
+  *)   bad "fail-count 30 marker won the sweep ('$SEL') — the ga-r5dsgp ceiling is not in effect" ;;
+esac
+FIX="[$(mk A 20000 "gate:exiled-tier5:2,gate:rebase-fail-count:2,gate:exiled-since:$((NOW - 6000)),gate:retry-cooldown-until:$((NOW + 600))"),$(mk B 600),$(mk C 300)]"
+SEL="$(select_marker "$FIX")"
+case "$SEL" in
+  B|C) ok "layered: a marker still INSIDE the ceiling (count 2) but in cooldown is kept out by the cooldown — the case the ceiling alone does not cover" ;;
+  *)   bad "in-budget marker inside its cooldown won the sweep ('$SEL')" ;;
+esac
 
 FIX="[$(mk A 20000 "$A_EXILE,gate:retry-cooldown-until:$((NOW + 600))"),$(mk B 600),$(mk C 300)]"
 SEL="$(select_marker "$FIX")"
