@@ -459,7 +459,9 @@ GROWTH_BASELINE_INTERVAL_SECS="${DOLT_DISK_FLOOR_GROWTH_BASELINE_INTERVAL_SECS:-
 # rows that finished (PARTIAL); once the budget is spent the remaining roots are
 # recorded SKIPPED — an explicit "not measured", never a silent zero (ga-p5q3).
 # The episode photo runs BEFORE the reclaim levers (they delete the very things
-# that grew), so the budget is also the most this photo can delay them.
+# that grew), so the budget bounds the ROOT SCAN's share of any delay to them. It
+# is not the whole delay: the /System/Volumes/VM du (<=20s) and the writers lsof
+# (<=30s) sit outside it, so the worst case is budget + ~50s (see _disk_growth_photo).
 GROWTH_ROOT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_ROOT_TIMEOUT_SECS:-60}"
 GROWTH_TOTAL_BUDGET_SECS="${DOLT_DISK_FLOOR_GROWTH_TOTAL_BUDGET_SECS:-150}"
 # Tighter budget for the photo taken on a CRITICAL cycle: it runs before the
@@ -1153,14 +1155,17 @@ _growth_roots() {
 # (512B on macOS) so two parallel dus cannot interleave mid-line. Symlinked roots
 # are never descended (a symlink into CloudStorage/FUSE could hang the scan).
 _growth_scan_root() {
-  local root="$1" tmo="$2" tmpf xrc status
+  local root="$1" tmo="$2" tmpf xrc frc status
+  local -a pst
   if [ -L "$root" ]; then printf 'ROOT\tSYMLINK\t%s\n' "$root"; return 0; fi
   if [ ! -d "$root" ]; then printf 'ROOT\tMISSING\t%s\n' "$root"; return 0; fi
   tmpf="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-growth.XXXXXX" 2>/dev/null)" \
     || { printf 'ROOT\tPARTIAL\t%s\n' "$root"; return 0; }
   find "$root" -maxdepth 1 -mindepth 1 -print0 2>/dev/null \
     | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 du -sk > "$tmpf" 2>/dev/null
-  xrc="${PIPESTATUS[1]}"
+  # Both statuses in ONE statement: every later assignment overwrites PIPESTATUS.
+  pst=("${PIPESTATUS[@]}")
+  frc="${pst[0]}"; xrc="${pst[1]}"
   # A du chunk that hit a permission error or a vanished child exits nonzero — the
   # routine case here (TCC-protected subdirs under ~/Library/Caches, entries
   # deleted mid-scan under /private/tmp) — and the rows it printed are still
@@ -1171,6 +1176,14 @@ _growth_scan_root() {
   # is timeout's own "bound hit"; anything else (126/127 cannot exec, 137/143
   # killed) means rows may be missing. Those are PARTIAL — never OK.
   case "$xrc" in 0|1|123) status="OK" ;; *) status="PARTIAL" ;; esac
+  # find's own status is the OTHER half of "did we see the whole root": if it could
+  # not list the root (e.g. chmod 000) xargs gets EMPTY input, never runs du, and
+  # exits 0 — an empty scan indistinguishable from an empty directory (gate
+  # ga-voklw8). With -maxdepth 1 a nonzero find means it could not read (all of) the
+  # listing, so rows may be missing — which is exactly what PARTIAL says. Measured
+  # 2026-09-25: rc 0 on every real root this scans, rc 1 on an unlistable one, so
+  # this demotes nothing that is routine today.
+  [ "$frc" = "0" ] || status="PARTIAL"
   printf 'ROOT\t%s\t%s\n' "$status" "$root"
   # Only well-formed "<kb><TAB>/abs/path" rows survive; anything else (a
   # truncated line, a path with a newline) is dropped rather than guessed at.
@@ -1273,7 +1286,14 @@ _disk_growth_photo() {
       rows="$(_top_open_write_files 10 "$GROWTH_WRITER_MIN_MB")"; wrc=$?
       if [ "$wrc" -eq 0 ]; then
         printf 'WRITERS\tok\n'
-        [ -n "$rows" ] && printf '%s\n' "$rows" | awk -F'\t' '{ printf "WRITER\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
+        # An if, NOT `[ -n "$rows" ] && printf …`: rc 0 with NO rows is the measured
+        # "nothing >= GROWTH_WRITER_MIN_MB is open for write", and an and-list whose
+        # test is false returns 1 — which, as the last command of this group, made
+        # the `|| { rm -f "$tmp"; return 1; }` below drop the whole photo and read
+        # a clean measurement as "photo could not be written" (gate ga-voklw8).
+        if [ -n "$rows" ]; then
+          printf '%s\n' "$rows" | awk -F'\t' '{ printf "WRITER\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
+        fi
       else
         printf 'WRITERS\tunmeasured\n'
       fi
