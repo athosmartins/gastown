@@ -1200,6 +1200,73 @@ routine_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GR" 30)"
   && ok "_growth_scan_root: du chunks exiting nonzero (permission errors — routine) still yield STATUS OK, rows kept" \
   || bad "_growth_scan_root: a nonzero du exit must not demote the root — got: $(printf '%s' "$routine_out" | head -1)"
 
+# ── _growth_scan_root: a du chunk that DIED is PARTIAL, never OK (gate ga-67s6d2).
+#    BSD xargs exits 1 for "a du chunk exited 1" (the routine case just above) AND
+#    for "a du chunk was killed by a signal / exited 255", so xargs's own status
+#    cannot tell a complete scan from a truncated one. 40 entries = 10 chunks of 4
+#    at -P 3, so chunks are still queued behind the dead one: a dead chunk must cost
+#    exactly its own 4 rows, not the chunks after it. The stub du gives every OTHER
+#    chunk the routine "printed all rows, exit 1" status, so this also proves the
+#    two statuses are told apart inside ONE root. ────────────────────────────────
+GK="$GROW_TMP/rootdead"; mkdir -p "$GK"
+for i in $(seq 1 40); do mkdir -p "$GK/ent$i"; done
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+# the chunk holding ent5 dies BEFORE printing (SIGKILL, like an OOM kill); the others
+# print every row and exit 1 (routine)
+for a in "$@"; do case "$a" in */ent5) kill -9 $$ ;; esac; done
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+exit 1
+STUBEOF
+chmod +x "$STUBBIN/du"
+# a private TMPDIR: the leftover check below must not see a live guard's own scan file
+SCAN_TMP="$GROW_TMP/scantmp"; mkdir -p "$SCAN_TMP"
+dead_out="$(TMPDIR="$SCAN_TMP" PATH="$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
+[ "$(printf '%s\n' "$dead_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+  && ok "_growth_scan_root: a du chunk killed by a signal makes the root PARTIAL — not 'ROOT OK' with a truncated scan" \
+  || bad "_growth_scan_root: a killed du chunk must read PARTIAL, got: $(printf '%s' "$dead_out" | head -1)"
+dead_rows="$(printf '%s\n' "$dead_out" | grep -c '^ENT')"
+[ "$dead_rows" = "36" ] \
+  && ok "_growth_scan_root: the dead chunk costs exactly its own 4 rows — the chunks queued behind it were still measured (36 of 40)" \
+  || bad "_growth_scan_root: expected 36 of 40 rows after one dead chunk, got $dead_rows"
+case "$dead_out" in
+  *"${TAB}$GK/ent5"*) bad "_growth_scan_root: the dead chunk's entry must not appear as a measured row" ;;
+  *) ok "_growth_scan_root: the dead chunk's entry is absent — unmeasured, not fabricated" ;;
+esac
+# the other abort path xargs reports identically: a chunk that exits 255
+sed -i.bak 's#kill -9 \$\$#exit 255#' "$STUBBIN/du"; rm -f "$STUBBIN/du.bak"
+dead255_out="$(TMPDIR="$SCAN_TMP" PATH="$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
+[ "$(printf '%s\n' "$dead255_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+  && ok "_growth_scan_root: a du chunk exiting 255 (xargs 'exited with status 255; aborting') makes the root PARTIAL" \
+  || bad "_growth_scan_root: a 255 du chunk must read PARTIAL, got: $(printf '%s' "$dead255_out" | head -1)"
+# nothing left behind: the scan's temp file and its marker are both removed (after
+# BOTH dead-chunk runs above, in a TMPDIR only this test wrote to)
+[ -z "$(ls -A "$SCAN_TMP" 2>/dev/null)" ] \
+  && ok "_growth_scan_root: no scan temp file or abort marker is left behind after a dead chunk" \
+  || bad "_growth_scan_root: leftover scan temp files: $(ls -A "$SCAN_TMP" | tr '\n' ' ')"
+# a failure to RECORD the failure must not read as success: if the marker cannot be
+# written the chunk exits 255, xargs aborts nonzero, and the root is still PARTIAL.
+# The stub mktemp puts the scan file in a directory it then makes read-only, so the
+# existing file stays writable but a NEW file (the marker) cannot be created.
+sed -i.bak 's#exit 255#kill -9 $$#' "$STUBBIN/du"; rm -f "$STUBBIN/du.bak"
+MKDIR="$GROW_TMP/markdir"; MKBIN="$GROW_TMP/mkbin"; mkdir -p "$MKDIR/probe" "$MKBIN"
+chmod 555 "$MKDIR/probe"
+if ( : > "$MKDIR/probe/x" ) 2>/dev/null; then
+  echo "  SKIP: a read-only directory does not stop file creation here (running as root?) — the dead-chunk cases above cover the marker path"
+else
+  cat > "$MKBIN/mktemp" <<'STUBEOF'
+#!/bin/bash
+f="$MARKDIR/growth.tmp"; : > "$f"; chmod 555 "$MARKDIR"; printf '%s\n' "$f"
+STUBEOF
+  chmod +x "$MKBIN/mktemp"
+  nomark_out="$(MARKDIR="$MKDIR" PATH="$MKBIN:$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
+  chmod 755 "$MKDIR" "$MKDIR/probe"; rm -f "$MKDIR/growth.tmp" "$MKDIR/growth.tmp.abort"
+  [ "$(printf '%s\n' "$nomark_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+    && ok "_growth_scan_root: a dead chunk whose marker cannot be written still reads PARTIAL (the chunk exits 255 and xargs aborts)" \
+    || bad "_growth_scan_root: an unrecordable dead chunk must read PARTIAL, got: $(printf '%s' "$nomark_out" | head -1)"
+fi
+chmod 755 "$MKDIR/probe" "$MKDIR" 2>/dev/null
+
 # ── _growth_scan_root: missing root and symlinked root ─────────────────────────
 [ "$(_growth_scan_root "$GROW_TMP/nope" 5)" = "ROOT${TAB}MISSING${TAB}$GROW_TMP/nope" ] \
   && ok "_growth_scan_root: a missing root is reported MISSING (not an error, not an empty OK)" \
@@ -1219,7 +1286,8 @@ cat > "$STUBBIN/du" <<'STUBEOF'
 for a in "$@"; do case "$a" in *slow*) sleep 30 ;; esac; done
 for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
 STUBEOF
-GP="$GROW_TMP/rootpart"; mkdir -p "$GP/slow1"      # NOT named *slow*: the fake du hangs on any path matching it
+chmod +x "$STUBBIN/du"    # own exec bit: a non-executable stub is skipped by PATH lookup and the REAL du would run
+GP="$GROW_TMP/rootpart"; mkdir -p "$GP/slow1"      # the one entry whose name matches *slow*: the fake du hangs on any chunk holding it
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do mkdir -p "$GP/fast$i"; done
 part_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GP" 3)"
 [ "$(printf '%s\n' "$part_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GP" ] \
@@ -1399,6 +1467,14 @@ tw3_out="$(PATH="$STUB2:$PATH" _top_open_write_files 10 1)"; tw3_rc=$?
 { [ "$tw3_rc" = "0" ] && printf '%s\n' "$tw3_out" | grep -q "/q/kept"; } \
   && ok "_top_open_write_files: a nonzero lsof exit with valid output still returns its rows" \
   || bad "_top_open_write_files: valid rows from a nonzero-exit lsof were dropped (rc=$tw3_rc out=$tw3_out)"
+# ...but an lsof KILLED by a signal mid-listing leaves a truncated capture (rows in it,
+# timeout's status 137): that is unmeasured, not a shorter list of writers — the same
+# "child aborted, status reads OK" shape as a dead du chunk (gate ga-67s6d2 class sweep).
+printf '#!/bin/bash\nprintf "p1\\ncx\\nf1\\naw\\ntREG\\ns5242880\\nn/q/kept\\n"\nkill -9 $$\n' > "$STUB2/lsof"
+tw4_out="$(PATH="$STUB2:$PATH" _top_open_write_files 10 1 2>/dev/null)"; tw4_rc=$?
+{ [ "$tw4_rc" = "2" ] && [ -z "$tw4_out" ]; } \
+  && ok "_top_open_write_files: an lsof killed by a signal after printing rows is UNMEASURED (rc 2, no rows) — a truncated list is not a complete one" \
+  || bad "_top_open_write_files: a signalled lsof with a partial capture must be rc 2 with no rows (rc=$tw4_rc out=$tw4_out)"
 
 # ── _growth_delta: handcrafted photos covering every comparison rule ───────────
 GB_BASE="$GROW_TMP/delta-base.txt"; GB_NOW="$GROW_TMP/delta-now.txt"
@@ -3294,6 +3370,17 @@ case "$GC_MAIL_LAST_BODY" in
   *"WHAT GREW (ga-ond0fa)"*"Photo file: $CANNED_PHOTO"*"+7000MB  /private/tmp/claude-501/CANNED-CULPRIT"*)
     ok "main(): the Mayor CRITICAL mail names the episode's growth photo and its top grower (WHAT GREW section)" ;;
   *) bad "main(): mail body missing the growth section/photo path/culprit: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 500)" ;;
+esac
+# gate ga-67s6d2: the mail cites the episode's LATEST photo, which after WARN -> CRITICAL
+# is taken AFTER the earlier WARN cycles' reclaim levers (they run at WARN too) — the
+# 2026-09-25 incident itself went 10 -> 5GB (WARN) before 3GB (CRITICAL). So the text
+# must not promise that the photo predates ANY reclaim lever; it may only promise
+# "before THAT cycle's levers" and say earlier cycles' levers may already have run.
+case "$GC_MAIL_LAST_BODY" in
+  *"before any reclaim lever"*) bad "main(): the mail claims the photo predates ANY reclaim lever — false after WARN -> CRITICAL, earlier cycles' levers already ran" ;;
+  *"before THAT cycle's reclaim levers"*"Levers of earlier cycles"*"may already have removed"*)
+    ok "main(): the mail promises only 'before THAT cycle's levers' and says earlier cycles' levers may already have removed some of what grew" ;;
+  *) bad "main(): mail body lacks the qualified 'before THAT cycle's levers / earlier cycles may already have removed' wording: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 700)" ;;
 esac
 
 # Scenario W — same mail with NO photo this episode: says so, never silent, never
