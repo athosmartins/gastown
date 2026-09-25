@@ -45,6 +45,14 @@
 #   AC8 (Mayor)  with swap healthy AND Dolt calm, admission scales to the full
 #                ceiling exactly as before — the resource brake is a floor, not
 #                a permanent throttle.
+#
+# ga-q4fkxa (25/09 incident: gate deferred 'swap-low' at ceiling=0 for 11 min):
+#   AC9  `vm.swapusage free` is slack inside the swapfiles that ALREADY exist —
+#        macOS grows swap on demand — so LOW FREE SWAP ALONE must not defer. It
+#        defers only when swap is low AND cannot grow (free disk < floor).
+#   AC10 the kernel's own memory-pressure level 4 (critical) defers ('mem-critical');
+#        levels 1 and 2 never block on their own.
+#   AC11 every new signal is fail-open: unreadable → never blocks.
 
 set -uo pipefail
 
@@ -91,6 +99,12 @@ HD() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 "${5:-1}" "${
 # Dolt/quota thresholds as HD(), fail-open forced on, but exercises the ga-92azu
 # resource brake explicitly instead of leaving swap args empty.
 HDSW() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 1 "$5" "$6"; }
+
+# HDMEM <cpu> <lat> <qlim> <inflight> <swap_free_mb> <swap_floor_mb> <mem_pressure>
+#   <disk_free_mb> <disk_min_mb> — same fixed Dolt/quota thresholds, fail-open on,
+# exercising the ga-q4fkxa memory brake in full (kernel pressure level + whether
+# swap can still grow, i.e. free disk on the swap volume vs the floor).
+HDMEM() { gate_headroom_decision "$1" "$2" "$3" "$4" 180 100 2500 6 3 1 "$5" "$6" "$7" "$8" "$9"; }
 
 # _derived_perrun_for <GATE_CODE_REVIEWERS, "" = unset> [<GATE_REVIEWERS_PER_RUN
 # override, "" = unset>] → what GATE_REVIEWERS_PER_RUN resolves to when the
@@ -415,13 +429,16 @@ eq "7th would exceed the ceiling → defer (cap still respected)" "$(gate_headro
 
 echo "── 28. ga-92azu AC7 (Mayor's amendment, bead's acceptance criterion 5, verbatim): logical ceiling 6 + Dolt calm + swap BELOW floor → NO new run, reason is NOT confusable with an empty queue ──"
 eq "calm Dolt, idle, swap critically low → defer (independent of Dolt state)" \
-  "$(HDSW 50 120 0 0 800 1024)" "defer 0 swap-low"
+  "$(HDMEM 50 120 0 0 800 1024 1 2000 4096)" "defer 0 swap-low"
 eq "calm Dolt, runs already live, swap low → still defer (never revokes in-flight, never admits new)" \
-  "$(HDSW 50 120 0 3 800 1024)" "defer 0 swap-low"
+  "$(HDMEM 50 120 0 3 800 1024 1 2000 4096)" "defer 0 swap-low"
 eq "swap-low overrides even the dolt-hot-floor idle carve-out (§ 2b does not apply — different mechanism)" \
-  "$(gate_headroom_decision 220 120 0 0 180 100 2500 6 3 1 800 1024)" "defer 0 swap-low"
+  "$(gate_headroom_decision 220 120 0 0 180 100 2500 6 3 1 800 1024 1 2000 4096)" "defer 0 swap-low"
 eq "reason string is 'swap-low' — distinct from 'no queued markers' (a totally separate early-exit path) and from every other defer reason" \
-  "$(HDSW 50 120 0 0 800 1024 | cut -d' ' -f3)" "swap-low"
+  "$(HDMEM 50 120 0 0 800 1024 1 2000 4096 | cut -d' ' -f3)" "swap-low"
+# ga-q4fkxa: the ga-92azu brake now needs BOTH halves — swap low AND swap unable to
+# grow. The cases above keep proving the brake bites (disk tight = 2000 < 4096); § 28b
+# proves it no longer bites on low swap alone.
 
 echo "── 29. ga-92azu AC8 (Mayor's amendment, bead's acceptance criterion 6, verbatim): swap HEALTHY + Dolt calm → scales to the full ceiling exactly as before (the brake is a floor, not a permanent throttle) ──"
 eq "ample free swap + calm Dolt, idle → admits at the full ceiling"      "$(HDSW 50 120 0 0 4096 1024)" "admit 6 dolt-calm"
@@ -432,7 +449,7 @@ eq "ample free swap + calm Dolt, 3 live (last run that still fits) → admits"  
 
 echo "── 30. ga-92azu: swap-floor boundary is strict (< not ≤) — exactly-at-floor is safe, matching § 5's cpu boundary convention ──"
 eq "swap == floor exactly → NOT low"      "$(HDSW 50 120 0 0 1024 1024)" "admit 6 dolt-calm"
-eq "swap == floor-1 → low"                "$(HDSW 50 120 0 0 1023 1024)" "defer 0 swap-low"
+eq "swap == floor-1 → low (disk tight, so it cannot grow)" "$(HDMEM 50 120 0 0 1023 1024 1 2000 4096)" "defer 0 swap-low"
 
 echo "── 31. ga-92azu: swap check is fail-OPEN — a missing/partial reading never blocks (same contract as every other probe here) ──"
 eq "no swap args at all (HD default) → unaffected, normal calm admit" "$(HD 50 120 0 0)" "admit 6 dolt-calm"
@@ -473,6 +490,94 @@ else
   bad "ordering wrong: swap probe=L${SWAP_CALL_LN:-?} decision=L${DECISION_CALL_LN:-?} (decision could consume a stale/empty swap reading)"
 fi
 has "$DISPATCHER" '"\${HR_SWAP_FREE:-}" "\$GATE_SWAP_FREE_FLOOR_MB"' "decision call passes the live swap reading + floor through"
+
+echo "── 34b. ga-q4fkxa AC9: the 25/09 11:08-11:19 incident — swap LOW but the OS can still grow it → ADMIT (was: deferred at ceiling=0 for 11 min) ──"
+# Readings from the incident: quality-gate-dispatcher.log has 11:17:16 swap_free=337MB
+# (< 512 floor), 0 runs in flight, Dolt cpu=40%; the Mayor's notes on ga-a6etc2 add
+# kernel pressure level 2 (41% free) — not logged, so relayed, not verified here. Disk:
+# this machine's own live reading class (~7GB free on the swap volume, 25/09) — well
+# above the 4096 floor.
+eq "INCIDENT: swap 337 < floor 512, pressure 2 (warn), disk 7262 free, idle → admit" \
+  "$(HDMEM 50 120 0 0 337 512 2 7262 4096)" "admit 6 dolt-calm"
+eq "swap 290 (the incident's low), pressure 2, disk 7262, 1 run live → admit" \
+  "$(HDMEM 50 120 0 3 290 512 2 7262 4096)" "admit 6 dolt-calm"
+eq "bead acceptance: pressure=1 (normal) + swap free low → admit" \
+  "$(HDMEM 50 120 0 0 100 512 1 20000 4096)" "admit 6 dolt-calm"
+eq "old-shape call (12 args, NO pressure/disk signal) + swap low → admit: an unread disk never blocks" \
+  "$(HDSW 50 120 0 0 100 512)" "admit 6 dolt-calm"
+eq "swap low + disk EXACTLY at the floor → NOT tight (strict <, same boundary convention as § 30)" \
+  "$(HDMEM 50 120 0 0 100 512 1 4096 4096)" "admit 6 dolt-calm"
+
+echo "── 34c. ga-q4fkxa: swap low AND cannot grow (disk tight) still defers — the brake survives, it just needs the real condition ──"
+eq "swap 100 < 512 and disk 4095 < 4096 → defer 'swap-low'" \
+  "$(HDMEM 50 120 0 0 100 512 1 4095 4096)" "defer 0 swap-low"
+eq "…and pressure 2 makes no difference to that (disk is what decides)" \
+  "$(HDMEM 50 120 0 0 100 512 2 4095 4096)" "defer 0 swap-low"
+eq "swap HEALTHY + disk tight → admit (tight disk alone is the city disk-halt's job, not this brake)" \
+  "$(HDMEM 50 120 0 0 4096 512 1 500 4096)" "admit 6 dolt-calm"
+eq "swap low + disk unreadable ('') → admit (fail-open)" \
+  "$(HDMEM 50 120 0 0 100 512 1 '' 4096)" "admit 6 dolt-calm"
+eq "swap low + disk floor unset ('') → admit (both halves required)" \
+  "$(HDMEM 50 120 0 0 100 512 1 2000 '')" "admit 6 dolt-calm"
+
+echo "── 34d. ga-q4fkxa AC10: kernel memory pressure ──"
+eq "pressure 4 (critical), swap AND disk healthy, Dolt calm, idle → defer 'mem-critical'" \
+  "$(HDMEM 50 120 0 0 4096 512 4 20000 4096)" "defer 0 mem-critical"
+eq "pressure 4, runs already live → defer (never admits new under critical)" \
+  "$(HDMEM 50 120 0 3 4096 512 4 20000 4096)" "defer 0 mem-critical"
+eq "pressure 4 with NO swap/disk args at all → still defer (the kernel signal stands alone)" \
+  "$(gate_headroom_decision 50 120 0 0 180 100 2500 6 3 1 '' '' 4)" "defer 0 mem-critical"
+eq "pressure 4 overrides the dolt-hot idle floor carve-out too" \
+  "$(gate_headroom_decision 220 120 0 0 180 100 2500 6 3 1 '' '' 4)" "defer 0 mem-critical"
+eq "pressure 2 (warn) alone → admit (it was level 2 during the incident)" \
+  "$(HDMEM 50 120 0 0 4096 512 2 20000 4096)" "admit 6 dolt-calm"
+eq "pressure 1 (normal) → admit" \
+  "$(HDMEM 50 120 0 0 4096 512 1 20000 4096)" "admit 6 dolt-calm"
+eq "reason 'mem-critical' is distinct from every other defer reason" \
+  "$(HDMEM 50 120 0 0 4096 512 4 20000 4096 | cut -d' ' -f3)" "mem-critical"
+eq "quota-limited still wins over a pressure signal (§ 1 precedes § 1b)" \
+  "$(HDMEM 50 120 1 0 4096 512 4 20000 4096)" "defer 0 quota-limited"
+
+echo "── 34e. ga-q4fkxa AC11: an unreadable / out-of-range pressure never blocks ──"
+eq "pressure '' → no signal" "$(HDMEM 50 120 0 0 4096 512 '' 20000 4096)" "admit 6 dolt-calm"
+eq "pressure 3 (not a kernel level) → ignored" "$(HDMEM 50 120 0 0 4096 512 3 20000 4096)" "admit 6 dolt-calm"
+eq "pressure 'critical' (non-numeric) → ignored" "$(HDMEM 50 120 0 0 4096 512 critical 20000 4096)" "admit 6 dolt-calm"
+eq "pressure 44 (4 embedded in garbage) → ignored, NOT read as 4" "$(HDMEM 50 120 0 0 4096 512 44 20000 4096)" "admit 6 dolt-calm"
+
+echo "── 34f. ga-q4fkxa: new probes — override seams + live sysctl/df shape ──"
+type gate_mem_pressure_level >/dev/null 2>&1 && ok "gate_mem_pressure_level defined" || bad "gate_mem_pressure_level not defined"
+type gate_disk_free_mb       >/dev/null 2>&1 && ok "gate_disk_free_mb defined"       || bad "gate_disk_free_mb not defined"
+eq "mem-pressure override seam"  "$(GATE_MEM_PRESSURE_OVERRIDE=4 gate_mem_pressure_level 2>/dev/null)" "4"
+eq "disk-free override seam"     "$(GATE_DISK_FREE_OVERRIDE_MB=1234 gate_disk_free_mb 2>/dev/null)" "1234"
+LIVE_MP=$(gate_mem_pressure_level 2>/dev/null)
+case "$LIVE_MP" in
+  1|2|4) ok "live gate_mem_pressure_level returned a valid kernel level ($LIVE_MP)" ;;
+  *)     bad "live gate_mem_pressure_level returned [$LIVE_MP] — expected 1, 2 or 4 (does this host expose kern.memorystatus_vm_pressure_level?)" ;;
+esac
+LIVE_DK=$(gate_disk_free_mb 2>/dev/null)
+case "$LIVE_DK" in
+  ''|*[!0-9]*) bad "live gate_disk_free_mb did not return a plain integer (got [$LIVE_DK])" ;;
+  *)           ok "live gate_disk_free_mb returned a plain integer ($LIVE_DK MB)" ;;
+esac
+eq "default swap-grow disk floor is 4096MB" "$GATE_SWAP_GROW_DISK_MIN_MB" "4096"
+
+echo "── 34g. ga-q4fkxa drift-guards: live wiring passes the NEW signals into the decision ──"
+has "$DISPATCHER" 'HR_MEM_PRESSURE=\$\(gate_mem_pressure_level\)' "mem-pressure probe called from the live sweep"
+has "$DISPATCHER" 'HR_DISK_FREE=\$\(gate_disk_free_mb\)'          "disk-free probe called from the live sweep"
+has "$DISPATCHER" '"\$\{HR_MEM_PRESSURE:-\}" "\$\{HR_DISK_FREE:-\}" "\$GATE_SWAP_GROW_DISK_MIN_MB"' "decision call passes pressure + disk + disk floor"
+has "$DISPATCHER" 'mem_pressure=\$\{HR_MEM_PRESSURE:-\?\} disk_free=\$\{HR_DISK_FREE:-\?\}MB' "both log lines surface the new readings"
+MP_CALL_LN=$(grep -n 'HR_MEM_PRESSURE=\$(gate_mem_pressure_level)' "$DISPATCHER" | head -1 | cut -d: -f1)
+DK_CALL_LN=$(grep -n 'HR_DISK_FREE=\$(gate_disk_free_mb)' "$DISPATCHER" | head -1 | cut -d: -f1)
+if [ -n "$MP_CALL_LN" ] && [ -n "$DK_CALL_LN" ] && [ -n "$DECISION_CALL_LN" ] \
+   && [ "$MP_CALL_LN" -lt "$DECISION_CALL_LN" ] && [ "$DK_CALL_LN" -lt "$DECISION_CALL_LN" ]; then
+  ok "pressure (L$MP_CALL_LN) and disk (L$DK_CALL_LN) probes precede the decision call (L$DECISION_CALL_LN)"
+else
+  bad "ordering wrong: pressure=L${MP_CALL_LN:-?} disk=L${DK_CALL_LN:-?} decision=L${DECISION_CALL_LN:-?}"
+fi
+# Consumers of the log line key on the PREFIX only (pipeline-throughput-heartbeat.sh,
+# ga-r1u20) — keep the prefixes byte-identical so extending the fields breaks nothing.
+has "$DISPATCHER" 'log "Headroom DEFER: gate em ' "'Headroom DEFER:' prefix preserved (heartbeat suppression keys on it)"
+has "$DISPATCHER" 'log "Headroom OK: gate em '    "'Headroom OK:' prefix preserved (heartbeat recovery keys on it)"
 
 # ── ga-309v3: multi-admit rounds (re-exec continuation) ───────────────────────
 # The gate admitted exactly ONE marker per sweep, so with runs lasting 11-17min

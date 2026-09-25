@@ -478,13 +478,24 @@ GATE_DOLT_CPU_WARM="${GATE_DOLT_CPU_WARM:-100}"        # cpu% above which only O
 GATE_DOLT_LATENCY_HOT_MS="${GATE_DOLT_LATENCY_HOT_MS:-2500}"  # server latency ceiling (matches Pilot)
 GATE_MAX_REVIEWERS="${GATE_MAX_REVIEWERS:-6}"          # full ceiling when calm (= template max_active_sessions)
 GATE_CODE_REVIEWERS="${GATE_CODE_REVIEWERS:-2}"        # real reviewer count for a CODE-tier run (mirrors the Step 6 tier dispatch below)
-GATE_SWAP_FREE_FLOOR_MB="${GATE_SWAP_FREE_FLOOR_MB:-512}"  # below this free swap, admit NO new run (ga-92azu resource brake)
+GATE_SWAP_FREE_FLOOR_MB="${GATE_SWAP_FREE_FLOOR_MB:-512}"  # free swap below this AND swap unable to grow (see next line) → admit NO new run (ga-92azu resource brake, reworked ga-q4fkxa)
+# ga-q4fkxa: macOS swap is NOT a fixed pool — the OS creates a new swapfile (up to
+# ~1GB) on demand, so `vm.swapusage free` is only the slack inside the swapfiles
+# that ALREADY exist, and a low reading is normal right before it grows. Low free
+# swap therefore only means "no room" when the swap also CANNOT grow, i.e. the boot
+# volume has less than this much free disk. Deliberately conservative (~4 swapfiles
+# of headroom) and BELOW the city's own disk-halt line (dpm_halt_imminent, 97% used
+# ≈ 7GB free on the 233GB Data volume, debris-janitor.sh): raise it above that line
+# and a swap-low reading on an already-full disk would re-stall the gate exactly as
+# 25/09 11:08-11:19 did, since that incident cleared only because swap COULD grow.
+GATE_SWAP_GROW_DISK_MIN_MB="${GATE_SWAP_GROW_DISK_MIN_MB:-4096}"
 case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
 case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
 case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
 case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
+case "$GATE_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) GATE_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
 # ga-92azu: admission must reserve what a run ACTUALLY consumes, not a stale
 # worst-case. GATE_CODE_REVIEWERS (just above, validated) is that worst case
 # across BOTH tiers — NON-CODE is a fixed 1 reviewer, always <= it (see the
@@ -1638,6 +1649,36 @@ gate_swap_free_mb() {
   return 0
 }
 
+# gate_mem_pressure_level → "1" (normal) | "2" (warn) | "4" (critical), or ""
+# when unreadable (ga-q4fkxa). This is the kernel's OWN verdict on memory stress
+# (`kern.memorystatus_vm_pressure_level`), which is what gate_swap_free_mb above
+# cannot be: free-swap only measures slack inside swapfiles that already exist.
+# Anything outside {1,2,4} is treated as unreadable → "" (no signal, never blocks),
+# the same fail-open contract as every other probe here. Honors
+# GATE_MEM_PRESSURE_OVERRIDE (selftest seam). Guarded with `|| _raw=""` because
+# this file runs under `set -euo pipefail` and a failed sysctl inside a bare
+# assignment would kill the whole dispatcher.
+gate_mem_pressure_level() {
+  if [ -n "${GATE_MEM_PRESSURE_OVERRIDE:-}" ]; then printf '%s' "$GATE_MEM_PRESSURE_OVERRIDE"; return 0; fi
+  local _raw=""
+  _raw=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || _raw=""
+  case "$_raw" in 1|2|4) printf '%s' "$_raw" ;; *) printf '' ;; esac
+  return 0
+}
+
+# gate_disk_free_mb → integer MB free on the volume that holds the swapfiles
+# (/private/var/vm), or "" if unreadable (ga-q4fkxa). This is the ceiling on how
+# far swap can still grow: macOS makes a new swapfile on demand, but only while
+# the disk has room for it. `df -Pm` column 4 = Available (POSIX format, stable
+# across macOS versions). Honors GATE_DISK_FREE_OVERRIDE_MB (selftest seam).
+gate_disk_free_mb() {
+  if [ -n "${GATE_DISK_FREE_OVERRIDE_MB:-}" ]; then printf '%s' "$GATE_DISK_FREE_OVERRIDE_MB"; return 0; fi
+  local _raw=""
+  _raw=$(df -Pm /private/var/vm 2>/dev/null | awk 'NR==2 {print $4}') || _raw=""
+  case "$_raw" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$_raw" ;; esac
+  return 0
+}
+
 # ── ga-x3nmz: quota-aware verdict resolution ──────────────────────────────────
 # gate_quota_stop_verdict <quota_limited 0|1> → "requeue" | "proceed"
 # PURE (no IO, set -e safe). A reviewer that stalls or times out with NO
@@ -1671,14 +1712,18 @@ quota_reset_eta() {
 
 # gate_headroom_decision <cpu> <lat_ms> <quota_limited 0|1> <inflight_reviewers> \
 #   <cpu_hot> <cpu_warm> <lat_hot_ms> <max_reviewers> <reviewers_per_run> <failopen 0|1> \
-#   [<swap_free_mb> <swap_floor_mb>]
+#   [<swap_free_mb> <swap_floor_mb> [<mem_pressure> <disk_free_mb> <disk_min_mb>]]
 # → echoes "<verdict> <ceiling> <reason>"  (verdict ∈ admit|defer).
 # PURE; no I/O; set -e safe. Computes a DYNAMIC ceiling on concurrent reviewer
 # sessions from Dolt health + quota + machine resource headroom, then admits a
 # NEW run iff it fits under it:
 #   quota-limited              → ceiling 0   (defer; never burn into a hard limit)
-#   swap < floor (ga-92azu)    → ceiling 0   (defer; the MACHINE has no room for
-#                                             one more live session — see § 1b)
+#   mem pressure = 4 (q4fkxa)  → ceiling 0   (defer 'mem-critical'; the kernel itself
+#                                             says memory is critical — see § 1b)
+#   swap < floor AND disk <    → ceiling 0   (defer 'swap-low'; swap is low AND cannot
+#     min (ga-92azu/q4fkxa)                    grow, so the MACHINE has no room for one
+#                                             more live session — see § 1b). Low swap
+#                                             alone does NOT defer: macOS grows it.
 #   Dolt hot (cpu>hot|lat>hot) → ceiling 0   (defer; open NO run on a hot plane → AC1/AC3)
 #   no signal + failopen=0     → ceiling 0   (defer; conservative)
 #   no signal + failopen=1     → ceiling max (proceed; a wedged probe must never deadlock the gate)
@@ -1692,6 +1737,7 @@ gate_headroom_decision() {
   local cpu="$1" lat="$2" qlim="$3" inflight="$4"
   local cpu_hot="$5" cpu_warm="$6" lat_hot="$7" maxr="$8" perrun="$9" failopen="${10}"
   local swap_free="${11:-}" swap_floor="${12:-}"
+  local mem_pressure="${13:-}" disk_free="${14:-}" disk_min="${15:-}"
   case "$cpu"      in ''|*[!0-9]*) cpu="" ;; esac
   case "$lat"      in ''|*[!0-9]*) lat="" ;; esac
   case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
@@ -1702,6 +1748,9 @@ gate_headroom_decision() {
   case "$perrun"   in ''|*[!0-9]*) perrun=3 ;; esac
   case "$swap_free"  in ''|*[!0-9]*) swap_free="" ;; esac
   case "$swap_floor" in ''|*[!0-9]*) swap_floor="" ;; esac
+  case "$mem_pressure" in 1|2|4) ;; *) mem_pressure="" ;; esac
+  case "$disk_free"  in ''|*[!0-9]*) disk_free="" ;; esac
+  case "$disk_min"   in ''|*[!0-9]*) disk_min="" ;; esac
 
   # 1. Quota hard-stop — independent of Dolt.
   if [ "$qlim" = "1" ]; then echo "defer 0 quota-limited"; return 0; fi
@@ -1734,8 +1783,33 @@ gate_headroom_decision() {
   # hits it (each admitted run consumes real RSS, so the ratchet in § 3 below
   # self-limits as swap actually drains — it does not require this floor to be
   # high to be protective).
+  #
+  # ga-q4fkxa — the floor above was compared against the WRONG signal. On macOS
+  # `vm.swapusage free` is only the slack inside the swapfiles that ALREADY exist;
+  # the OS creates the next one (up to ~1GB) on demand. 25/09 ~11:08-11:19: the gate
+  # deferred 'swap-low' at ceiling=0 with nothing in flight — the last such line in
+  # quality-gate-dispatcher.log is 11:17:16, swap_free=337MB < the 512 floor, 0 runs,
+  # 24 markers queued — until the OS created the next swapfile (free → 1201MB, per
+  # the Mayor's notes on ga-a6etc2, which also put kernel pressure at level 2, 41%
+  # free, during it; the pressure level is not logged). Low free swap is the state
+  # RIGHT BEFORE the OS grows swap, so it cannot by itself mean "no room". Two signals
+  # that actually do:
+  #   (i)  the kernel's own verdict: pressure level 4 (critical) → defer, always.
+  #        Levels 1 (normal) and 2 (warn) never block on their own — level 2 was
+  #        the state during the very incident above.
+  #   (ii) swap is low AND cannot grow: free disk on the swap volume is under
+  #        disk_min. Growth is what a low reading normally precedes, so it only
+  #        becomes a brake when the disk cannot supply it. (This is also the chain
+  #        behind the 22/09 disk crisis: swap growth consumes the same disk.)
+  # Fail-open like every probe here: a missing/unreadable pressure, disk or swap
+  # reading NEVER blocks — only a POSITIVELY-measured bad state does.
+  if [ "$mem_pressure" = "4" ]; then
+    echo "defer 0 mem-critical"; return 0
+  fi
   if [ -n "$swap_free" ] && [ -n "$swap_floor" ] \
-     && [ "$swap_free" -lt "$swap_floor" ] 2>/dev/null; then
+     && [ "$swap_free" -lt "$swap_floor" ] 2>/dev/null \
+     && [ -n "$disk_free" ] && [ -n "$disk_min" ] \
+     && [ "$disk_free" -lt "$disk_min" ] 2>/dev/null; then
     echo "defer 0 swap-low"; return 0
   fi
 
@@ -8097,6 +8171,135 @@ rig_content_merged() {
   [ "$n" = "0" ]
 }
 
+# SELFTEST-EXTRACT gate-full-suite-check: BEGIN
+# ── ga-q4fkxa: full-suite check — advisory skip, stale-worktree reaper, logging ──
+# 25/09, one whatsapp_automation PASS (gate_run ga-oz5f4n), quality-gate-dispatcher.log:
+# "Phase C: … complete — overall=PASS. Finalizing." 11:59:24 → "Gate run complete" 12:17:07,
+# i.e. 17m43s of FINALIZE (the rest of the 3097s "elapsed" is reviewer wait), with the
+# other sweeps meanwhile logging "Live gate sweep already running … yielding
+# (single-instance guard)". That fits gate_full_suite_check: it runs INSIDE the citywide
+# single-instance gate lock (per wa-f1hz5/wa-t6eoz, who read this file: no lock release
+# between gate_finalize_run and this call), for up to GATE_FULL_SUITE_TIMEOUT_SECS per
+# run and up to two runs (2 × 600s = 20min), and logged nothing that says a full-suite
+# run is in progress — so the gate looked dead for the whole wait. (The 17m43s is
+# consistent with two timed-out runs, not proof of it: nothing was logged.)
+# Three fixes live here; the call site is unchanged.
+
+# gate_full_suite_is_advisory <default_branch_ref> → rc0 + sets GATE_FS_ADV_SRC to
+# the SOURCE ("env" | "file") iff this rig's full-suite check is declared ADVISORY,
+# else rc1 with GATE_FS_ADV_SRC="". The result goes through a global on purpose, like
+# GATE_FS_VERDICT below: `log` writes to STDOUT in this file, so a caller capturing
+# this function with $(...) would swallow its own diagnostics AND be one stray log
+# line away from reading "advisory" out of an error message.
+# Advisory = the check is not allowed to hold the citywide lock, because it cannot
+# change the outcome: gate_full_suite_verdict only returns "regression" (the one
+# verdict that blocks a merge) when the baseline run on the default branch is GREEN,
+# and a rig whose suite never finishes inside the budget never produces that. For
+# whatsapp_automation that is the documented, deliberately-accepted state (wa-t6eoz:
+# ~45-60min serial, 1435s even under xdist -n auto, vs a 600s budget → both runs
+# time out → always preexisting-debt).
+#   - "env":  GATE_FULL_SUITE_ADVISORY_RIGS (space/comma-separated rig names) — the
+#             lever the operator can pull without waiting on a rig-repo change.
+#   - "file": a `.gate-full-suite.advisory` file at the ROOT OF THE DEFAULT BRANCH.
+#             Read from $default_branch_ref, NEVER from the branch under review: the
+#             branch already controls .gate-full-suite.sh (the script it would run),
+#             and letting it also declare itself exempt would let any submission
+#             switch the net off. The rig owns the file, next to the script.
+# A read that FAILS (bad ref, git error) is "unknown", and unknown → rc1 (run the
+# check, exactly as before): only a positively-read declaration skips the safety net.
+gate_full_suite_is_advisory() {
+  local default_ref="$1" rig_name="${RIG:-}" _list _out _rc=0
+  GATE_FS_ADV_SRC=""
+  if [ -n "$rig_name" ]; then
+    _list=",${GATE_FULL_SUITE_ADVISORY_RIGS:-},"
+    _list="${_list// /,}"
+    case "$_list" in
+      *",${rig_name},"*) GATE_FS_ADV_SRC="env"; return 0 ;;
+    esac
+  fi
+  _out=$(git_rig ls-tree "$default_ref" -- .gate-full-suite.advisory 2>/dev/null) || _rc=$?
+  if [ "$_rc" != "0" ]; then
+    log "ga-q4fkxa: could not read .gate-full-suite.advisory on $default_ref (git rc=$_rc) — treating as NOT advisory and running the check as before."
+    return 1
+  fi
+  [ -n "$_out" ] || return 1
+  GATE_FS_ADV_SRC="file"; return 0
+}
+
+# gate_full_suite_reap_stale — remove full-suite worktrees left behind by an
+# INTERRUPTED sweep (ga-q4fkxa: measured 25/09 — 38 gc-gate-fs-* worktrees registered
+# in the WA .repo.git, every one under /private/tmp). The function below cleans on every return path,
+# but a SIGKILL/launchd stop mid-suite cannot run any cleanup — and the EXIT trap is
+# replaced twice in this file (ga-zl277), so composing a handler into it would be
+# fragile. Reaping at the NEXT run covers every leak path, including SIGKILL.
+# Only registered worktrees named  <tmp>/gc-gate-fs-{branch,main}-<pid>  are touched;
+# stale = the owning dispatcher <pid> is gone, or the dir is older than
+# GATE_FS_STALE_MAX_AGE_SECS (default 3h — PID-reuse guard; a sweep never runs that
+# long). A worktree whose owner is alive is never touched. `git worktree remove
+# --force` (not rm -rf) — it also drops the registration. Best-effort: never fails.
+gate_full_suite_reap_stale() {
+  local tmp="${GATE_FS_TMPDIR:-/tmp}" max_age="${GATE_FS_STALE_MAX_AGE_SECS:-10800}"
+  local tmp_phys now wt pid mt age stale reaped=0
+  case "$max_age" in ''|*[!0-9]*) max_age=10800 ;; esac
+  # `git worktree list` prints the PHYSICAL path: on macOS /tmp and /var are symlinks
+  # into /private/, so a worktree created at /tmp/gc-gate-fs-branch-N is registered as
+  # /private/tmp/gc-gate-fs-branch-N. Matching only "$tmp" would match NOTHING here and
+  # the reaper would ship as a silent no-op (measured on the live WA repo: 38 leaked
+  # gc-gate-fs worktrees, every one registered under /private/tmp). Accept both spellings.
+  tmp_phys=$(cd "$tmp" 2>/dev/null && pwd -P) || tmp_phys="$tmp"
+  now=$(date +%s)
+  # "could not list" must not look like "nothing to reap": capture rc first, and say so.
+  local _wt_list _wt_rc=0
+  _wt_list=$(git_rig worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'; exit "${PIPESTATUS[0]}") || _wt_rc=$?
+  if [ "$_wt_rc" != "0" ]; then
+    log "ga-q4fkxa: could not list worktrees (git rc=$_wt_rc) — stale full-suite worktree reap SKIPPED this run (unverified, nothing removed)."
+    return 0
+  fi
+  while IFS= read -r wt; do
+    case "$wt" in
+      "$tmp"/gc-gate-fs-branch-*|"$tmp"/gc-gate-fs-main-*) ;;
+      "$tmp_phys"/gc-gate-fs-branch-*|"$tmp_phys"/gc-gate-fs-main-*) ;;
+      *) continue ;;
+    esac
+    pid="${wt##*-}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    stale=0
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      stale=1
+    else
+      mt=$(stat -f %m "$wt" 2>/dev/null || echo "")
+      if [ -n "$mt" ]; then
+        age=$(( now - mt ))
+        if [ "$age" -gt "$max_age" ]; then stale=1; fi
+      fi
+    fi
+    if [ "$stale" = "1" ]; then
+      if git_rig worktree remove --force "$wt" >/dev/null 2>&1; then
+        reaped=$(( reaped + 1 ))
+      else
+        log "ga-q4fkxa: could not remove stale full-suite worktree $wt (owner pid $pid) — left in place."
+      fi
+    fi
+  done <<< "$_wt_list"
+  # mktemp'd suite logs leaked by the same interrupted sweeps
+  find "$tmp" -maxdepth 1 -type f -name 'gc-gate-fs-*-log-*' -mmin +180 -delete 2>/dev/null || true
+  if [ "$reaped" -gt 0 ]; then
+    log "ga-q4fkxa: reaped $reaped stale full-suite worktree(s) from interrupted sweeps."
+  fi
+  return 0
+}
+
+# gate_full_suite_log_end <t0_epoch> <verdict> <branch_rc> <main_rc|-> <timeout_secs>
+# One closing line for every measured run: duration + verdict + both exit codes, with
+# rc 124/137 called out as a timeout so "red" is never confused with "ran out of time".
+gate_full_suite_log_end() {
+  local t0="$1" verdict="$2" brc="$3" mrc="$4" tmo="$5" dur note=""
+  dur=$(( $(date +%s) - t0 ))
+  case "$brc" in 124|137) note=" [branch run TIMED OUT after ${tmo}s — not a test failure]" ;; esac
+  case "$mrc" in 124|137) note="$note [main baseline TIMED OUT after ${tmo}s]" ;; esac
+  log "ga-q4fkxa: full-suite END rig=${RIG:-?} verdict=$verdict branch_rc=$brc main_rc=$mrc duration=${dur}s${note}"
+}
+
 # gate_full_suite_check <branch_sha> <default_branch_ref> [timeout_secs] —
 # ga-3wgx8: opt-in full-suite regression check. Sets GATE_FS_VERDICT
 # (pass|regression|preexisting-debt|unmeasured|skipped) and GATE_FS_DETAIL in
@@ -8133,12 +8336,39 @@ gate_full_suite_check() {
   script_mode=$(git_rig ls-tree "$branch_sha" -- .gate-full-suite.sh 2>/dev/null | awk '{print $1}' || echo "")
   [ "$script_mode" = "100755" ] || return 0
 
-  local branch_wt="/tmp/gc-gate-fs-branch-$$"
+  local _fs_tmp="${GATE_FS_TMPDIR:-/tmp}"
+
+  # ga-q4fkxa (c): reap worktrees leaked by interrupted sweeps BEFORE making new
+  # ones. After the opt-in check on purpose (the 6+ rigs that never opted in pay
+  # nothing), but BEFORE the advisory skip below: an advisory rig never creates new
+  # worktrees, so it must still clean up the ones it leaked before it was advisory.
+  gate_full_suite_reap_stale || true
+
+  # ga-q4fkxa (a): an advisory rig does not hold the citywide lock for a check that
+  # cannot change the outcome. GATE_FULL_SUITE_SKIP_ADVISORY=0 restores the exact
+  # pre-ga-q4fkxa behavior (always run).
+  GATE_FS_ADV_SRC=""
+  if [ "${GATE_FULL_SUITE_SKIP_ADVISORY:-1}" = "1" ]; then
+    gate_full_suite_is_advisory "$default_branch_ref" || true
+  fi
+  if [ -n "$GATE_FS_ADV_SRC" ]; then
+    GATE_FS_DETAIL="ga-q4fkxa: full-suite check SKIPPED for rig=${RIG:-?} — declared advisory (source=$GATE_FS_ADV_SRC): the suite cannot produce a blocking verdict here, so it does not hold the citywide gate lock."
+    log "$GATE_FS_DETAIL"
+    return 0
+  fi
+
+  # ga-q4fkxa (b): say so when the lock is about to be held, and for how long.
+  local _fs_t0
+  _fs_t0=$(date +%s)
+  log "ga-q4fkxa: full-suite START rig=${RIG:-?} sha=${branch_sha:0:12} timeout=${timeout_secs}s per run (main baseline runs only if the branch is red) — holds the citywide gate lock until END."
+
+  local branch_wt="$_fs_tmp/gc-gate-fs-branch-$$"
   local branch_log
-  branch_log=$(mktemp /tmp/gc-gate-fs-branch-log-XXXXXX 2>/dev/null) || return 0
+  branch_log=$(mktemp "$_fs_tmp/gc-gate-fs-branch-log-XXXXXX" 2>/dev/null) || return 0
   if ! git_rig worktree add --detach "$branch_wt" "$branch_sha" >/dev/null 2>&1; then
     GATE_FS_DETAIL="ga-3wgx8: could not create worktree for $branch_sha — skipping full-suite check (fail-open)."
     rm -f "$branch_log" 2>/dev/null || true
+    gate_full_suite_log_end "$_fs_t0" "skipped" "-" "-" "$timeout_secs"
     return 0
   fi
 
@@ -8149,6 +8379,7 @@ gate_full_suite_check() {
     GATE_FS_VERDICT="pass"
     git_rig worktree remove --force "$branch_wt" 2>/dev/null || true
     rm -f "$branch_log" 2>/dev/null || true
+    gate_full_suite_log_end "$_fs_t0" "pass" "0" "-" "$timeout_secs"
     return 0
   fi
 
@@ -8156,8 +8387,8 @@ gate_full_suite_check() {
   # ALSO red on its own .gate-full-suite.sh (pre-existing debt vs. a real
   # regression this branch introduced).
   local main_measured=0 main_rc=0 main_log=""
-  local main_wt="/tmp/gc-gate-fs-main-$$"
-  main_log=$(mktemp /tmp/gc-gate-fs-main-log-XXXXXX 2>/dev/null) || main_log="/dev/null"
+  local main_wt="$_fs_tmp/gc-gate-fs-main-$$"
+  main_log=$(mktemp "$_fs_tmp/gc-gate-fs-main-log-XXXXXX" 2>/dev/null) || main_log="/dev/null"
   if git_rig worktree add --detach "$main_wt" "$default_branch_ref" >/dev/null 2>&1; then
     if [ -x "$main_wt/.gate-full-suite.sh" ]; then
       ( cd "$main_wt" && timeout "$timeout_secs" ./.gate-full-suite.sh ) > "$main_log" 2>&1 || main_rc=$?
@@ -8182,8 +8413,10 @@ $(tail -60 "$branch_log" 2>/dev/null)"
 
   git_rig worktree remove --force "$branch_wt" 2>/dev/null || true
   rm -f "$branch_log" "$main_log" 2>/dev/null || true
+  gate_full_suite_log_end "$_fs_t0" "$GATE_FS_VERDICT" "$branch_rc" "$( [ "$main_measured" = "1" ] && echo "$main_rc" || echo "-" )" "$timeout_secs"
   return 0
 }
+# SELFTEST-EXTRACT gate-full-suite-check: END
 
 # SELFTEST-EXTRACT gate-mergedriver-precheck: BEGIN
 # ── ga-78n2z: union-aware conflict pre-check ──────────────────────────────────
@@ -10007,12 +10240,18 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   # 2b. Free swap (ga-92azu resource brake) — independent of Dolt/quota; see
   #     gate_headroom_decision § 1b for why this cannot piggyback on either.
   HR_SWAP_FREE=$(gate_swap_free_mb)
+  # 2c. Kernel memory-pressure level + free disk on the swap volume (ga-q4fkxa).
+  #     Free swap alone is not a valid "no room" signal on macOS (swapfiles are
+  #     created on demand) — these two are what make it one; see § 1b.
+  HR_MEM_PRESSURE=$(gate_mem_pressure_level)
+  HR_DISK_FREE=$(gate_disk_free_mb)
   # 3. Pure dynamic-concurrency decision.
   HR_DECISION=$(gate_headroom_decision \
     "${HR_CPU:-}" "${HR_LAT:-}" "$HR_QLIM" "$LIVE_REVIEWERS" \
     "$GATE_DOLT_CPU_HOT" "$GATE_DOLT_CPU_WARM" "$GATE_DOLT_LATENCY_HOT_MS" \
     "$GATE_MAX_REVIEWERS" "$GATE_REVIEWERS_PER_RUN" "${GATE_HEADROOM_FAILOPEN:-1}" \
-    "${HR_SWAP_FREE:-}" "$GATE_SWAP_FREE_FLOOR_MB")
+    "${HR_SWAP_FREE:-}" "$GATE_SWAP_FREE_FLOOR_MB" \
+    "${HR_MEM_PRESSURE:-}" "${HR_DISK_FREE:-}" "$GATE_SWAP_GROW_DISK_MIN_MB")
   HR_VERDICT=$(printf '%s' "$HR_DECISION" | awk '{print $1}')
   HR_CEILING=$(printf '%s' "$HR_DECISION" | awk '{print $2}')
   HR_REASON=$(printf '%s' "$HR_DECISION" | cut -d' ' -f3-)
@@ -10020,10 +10259,10 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
   if [ "$HR_QLIM" = "1" ]; then HR_COTA="LIMITED"; else HR_COTA="ok"; fi
   if [ "$HR_VERDICT" = "defer" ]; then
-    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
+    log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB mem_pressure=${HR_MEM_PRESSURE:-?} disk_free=${HR_DISK_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
     exit 0
   fi
-  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
+  log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB mem_pressure=${HR_MEM_PRESSURE:-?} disk_free=${HR_DISK_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
 fi
 
 # QUEUE ORDER: newest-first tiebreak (4cae0a2c49, 2026-06-24 — Athos: gate>
