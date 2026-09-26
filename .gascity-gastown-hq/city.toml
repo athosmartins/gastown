@@ -111,15 +111,29 @@ skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl"]
 # on the config instead:
 # `rig = "*"` matches the city instance and every rig instance (also a rig added later), so the
 # first block switches the name off everywhere and the second one (no rig = city scope) switches the
-# city instance back on. Order matters: overrides apply in file order. An override that matches no
-# order is a config-load error, which keeps this from rotting quietly if the city order goes away.
-# prod-tests/gascity/story-ga-e6ottw.sh asserts the resulting live order set.
+# city instance back on. Order matters: overrides apply in file order.
+# An override that matches no order is NOT a config-load error, so nothing here fails loudly on its
+# own if upstream renames or drops one of the three orders. Measured with the live gc (26/09, a
+# scratch copy of this city; same result for a name that no longer exists and for a rig that no
+# longer exists): `gc config show --validate` still says "Config valid." Only the order-scan
+# commands fail (`gc order list/show/run`: `order "<name>" not found (rig "*" matches no
+# instances)`). Per the gate review of ga-e6ottw, and NOT re-measured by me: `gc doctor` shows
+# order-firing-current as failed, and the running controller does not refuse the load either (read
+# from cmd/gc/order_dispatch.go) — it only logs `order overrides: ...` and goes on, while
+# ApplyOverrides stops at the FIRST unmatched override. So if the orphan-sweep pair
+# went unmatched, the mol-dog-reaper and order-tracking-sweep blocks after it would not apply and
+# 10 rig instances would come back silently, the builtin orphan-sweep (one-snapshot claim reset)
+# among them.
+# The detector is prod-tests/gascity/story-ga-e6ottw.sh, which asserts the resulting live order
+# set — but story-delivery.sh runs it ONCE, at delivery, and nothing re-runs it. Run it by hand
+# after every gc upgrade and every change to the maintenance pack's orders.
 # gate-sweep is deliberately NOT switched off: `bd gate check` acts on the store of the scope that
 # fired it, so each rig instance polls a different store and is needed. Its only difference from
 # the override is cadence (30s vs 60s; the _bd_trace guard is moot from the pack dir, where the
-# file exists). An interval override per rig was rejected: it makes removing a rig a config-load
-# error, and eval-window-concurrency-guard.sh would not widen it anyway.
-# Rollback = delete the six blocks below.
+# file exists). An interval override per rig was rejected: removing a rig would leave a dangling
+# override that breaks `gc order list/show/run` (config validate stays green, same as above), and
+# eval-window-concurrency-guard.sh would not widen it anyway.
+# Rollback = delete the six blocks below (and story-ga-e6ottw.sh, which would then fail).
 [[orders.overrides]]
 name = "orphan-sweep"
 rig = "*"

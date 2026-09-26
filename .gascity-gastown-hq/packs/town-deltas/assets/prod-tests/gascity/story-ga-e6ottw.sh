@@ -24,6 +24,12 @@
 # also require ok:true and that well-known control orders are still listed (a broken city.toml
 # would otherwise look like a clean removal).
 #
+# What it catches that `gc config show --validate` does not: that command says "Config valid."
+# for an [[orders.overrides]] block that matches no order (measured 26/09); only `gc order
+# list/show/run` fail. story-delivery.sh runs this once, at delivery (via run.sh with STORY_ID);
+# nothing re-runs it, so run it by hand after every gc upgrade and every change to the
+# maintenance pack's orders.
+#
 # GC_CITY overrides the city dir (lets this test run against a scratch city).
 
 set -euo pipefail
@@ -40,16 +46,30 @@ order-tracking-sweep|order sweep-tracking"
 
 # ── 1. The live order set ────────────────────────────────────────────────────
 LIST=""
+LIST_ERR=""
+ERRF=$(mktemp "${TMPDIR:-/tmp}/story-ga-e6ottw.XXXXXX")
+trap 'rm -f "$ERRF"' EXIT
 for attempt in 1 2 3; do
-    if LIST=$(gc --city "$CITY" order list --json 2>/dev/null) \
+    if LIST=$(gc --city "$CITY" order list --json 2>"$ERRF") \
        && printf '%s' "$LIST" | jq -e '.ok == true and (.orders | type == "array")' >/dev/null 2>&1; then
         break
     fi
     LIST=""
+    LIST_ERR=$(grep -v '^warning: builtin' "$ERRF" | head -c 600 || true)
+    case "$LIST_ERR" in *orders.overrides*) break ;; esac   # deterministic config error: a retry changes nothing
+    [ "$attempt" -lt 3 ] || break
     log "gc order list attempt $attempt failed; retrying"
     sleep 5
 done
-[ -n "$LIST" ] || fail "could not list orders after 3 attempts — cannot tell, NOT treating it as zero instances"
+if [ -z "$LIST" ]; then
+    # gc's own reason is kept: a config error is deterministic and says exactly what is wrong
+    # (`orders.overrides[N]: order "<name>" not found ...` = a [[orders.overrides]] block in
+    # city.toml matches no order, which `gc config show --validate` does NOT flag).
+    case "$LIST_ERR" in
+        *orders.overrides*) fail "gc order list rejects city.toml [[orders.overrides]] — a block matches no order (upstream renamed/dropped one, or a rig was removed); the overrides after the first unmatched one may not be applied by the controller. gc said: $LIST_ERR" ;;
+    esac
+    fail "could not list orders after 3 attempts — cannot count instances, NOT treating it as zero. gc said: ${LIST_ERR:-<nothing on stderr>}"
+fi
 
 while IFS='|' read -r NAME EXECRE; do
     [ -n "$NAME" ] || continue
@@ -115,6 +135,10 @@ python3 - "$CITY/city.toml" <<'PY' || fail "city.toml [[orders.overrides]] does 
 import sys
 try:
     import tomllib
+except ImportError:         # python3 < 3.11: say so, not "cannot parse city.toml"
+    print(f"python3 {sys.version.split()[0]} has no tomllib (needs >= 3.11): cannot replay {sys.argv[1]}", file=sys.stderr)
+    sys.exit(2)
+try:
     with open(sys.argv[1], "rb") as f:
         cfg = tomllib.load(f)
 except Exception as e:      # cannot tell must fail, not pass
