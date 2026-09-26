@@ -437,6 +437,27 @@ canônica do dado (DB/API) a varrer a árvore do Drive; (2) envolva SEMPRE em
 Rede de segurança: o `crew-hang-detector` detecta sessões de crew com heartbeat
 congelado e dispara o shutdown-dance (kill+restart com devido processo).
 
+{{/* td:core:home-scan-tcc */ -}}
+**Varrer ou medir o `$HOME` dispara o prompt de permissão do macOS — proibido com QUALQUER ferramenta, não só `find` (ga-6cyp1l).**
+O aviso "gc quer acessar Desktop/Documentos/Downloads/Fotos/iCloud Drive" é o TCC do macOS, e ele culpa o **gc** por
+tudo que roda numa sessão de agente (o supervisor é o "responsible" do tmux e de todos os filhos). Não há ninguém na
+frente da tela pra responder: o pedido bloqueia a sessão ou é negado em silêncio, e quem vê o pop-up é o Athos. Caso que
+produziu esta regra (26/09, medido ao vivo pela vigia do ga-6cyp1l): uma sessão de crew rodou
+`cd /Users/athos && for d in $(ls -A); do timeout 60 du -xsk "$d"; done | sort -rn` pra achar o que comia disco — quatro
+`du` bateram em Desktop, Documents, Downloads e Photos Library num segundo. A regra "nada de wide traversals" citava só
+`find`, e um `du` em loop sobre `ls -A` não casava com nenhum dos exemplos: o texto nomeava a ferramenta, não a classe.
+
+A CLASSE proibida: enumerar, medir ou ler recursivamente o `$HOME` (`~`, `/Users/athos`, `~/*`, `$(ls ~)`) ou qualquer
+pasta protegida dele — Desktop, Documents, Downloads, Pictures (Photos Library), Movies, Music, `~/Library/Mobile
+Documents`, `~/Library/CloudStorage` e `/Volumes` — seja com `du`, `find`, `ls -R`/`ls -A` em loop, `tree`, `ncdu`, `fd`,
+`rg`/`grep -r`, `mdfind`, `rsync`, `tar`/`zip` ou glob. Ler UM arquivo que o Athos te apontou é ok; varrer não.
+
+Quer saber "pra onde foi meu disco"? Não varra o home. `df -h /` dá o total; a última foto do dolt-disk-floor-guard diz
+quem CRESCEU, por raiz fixa (`ls -t $GC_CITY_PATH/.gc/logs/disk-growth-*.txt | head -1`); e `du -xsk` só numa LISTA
+explícita de raízes da cidade (`~/gt`, `~/.gastown`, `/private/tmp/claude-501`, `~/Library/Caches/go-build`), nunca num
+loop sobre o conteúdo do home. Isto é prosa: a guarda mecânica (PreToolUse) está na ga-02cqk4 — até ela estar viva, a
+regra depende de você.
+
 {{ if or (not .TD_ROLE) (eq .TD_ROLE "dog") (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:graph-v2-formulas */ -}}
 **Formulas graph.v2 multi-step — feche E reclame CADA step, não só o
 primeiro (ga-z1k7).** A seção nativa "Following Your Formula" diz "Steps
