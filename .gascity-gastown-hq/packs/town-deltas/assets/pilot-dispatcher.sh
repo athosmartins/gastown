@@ -3175,6 +3175,8 @@ _filter_candidates() {
   # pilot:held-until:<epoch> label exists AND the epoch is in the past (expired hold).
   # The janitor R6 removes expired labels on its next sweep; this filter lets the
   # Pilot bypass the hold without waiting for the janitor when the expiry is clear.
+  # ga-0eib9f: a FUTURE (or unreadable) pilot:held-until stamp is ALSO a hold with no
+  # pilot:held beside it — same meaning as pool_held in scripts/pool-probe-vetoes.sh.
   local _now_ts; _now_ts=$(date +%s)
   # ga-w8btn: defer_until is a bd-native field (_pilot_defer_extend writes it
   # so bd-ready-based self-serve pool probes respect a hold) but until now no
@@ -3283,17 +3285,32 @@ _filter_candidates() {
         # already taught this function twice.
         and ((.metadata["pilot.sling_for"] // "") | test("\\S") | not)
         and (
-          (((.labels // []) | index("pilot:held")) | not)
-          or
+          # ga-0eib9f: a FUTURE pilot:held-until:<epoch> is a hold BY ITSELF. This
+          # clause used to read "no pilot:held OR expired stamp", so a bead stamped
+          # with only the timed label (no pilot:held) took the first branch and the
+          # stamp was never consulted — ga-w6tfb5 was dispatched 21 min after being
+          # parked for 60h. The pool probes (pool_held in scripts/pool-probe-vetoes.sh)
+          # and bead_state.py already treat the stamp alone as a hold; this makes the
+          # Pilot agree (pilot-dispatcher.held-until-alone.selftest.sh pins the two
+          # together). Keep this clause and its reason-trace mirror (search
+          # "held-until(future" below) in sync — same lesson ga-3lsy1 taught this
+          # function.
           # ga-4aree: use the MAX (latest) held-until epoch, NOT .[0]. held-until labels
           # ACCUMULATE (the stamp adds one per hold without pruning), so .[0] was the
           # OLDEST/expired stamp → the filter judged an actively-held bead "expired" →
           # re-selected it every sweep → refused → re-stamped → the clog loop. The bead is
           # still held iff its LATEST hold is in the future.
-          ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber) |
-            if length > 0
-            then (max < $now_ts)
-            else false end)
+          # Three states, not two: a held-until label that is present but unreadable
+          # (no valid epoch) is "cannot tell", and the answer under doubt is INERT —
+          # same as pilot:held with no stamp, which has always stayed held.
+          # pilot:held-count:<slug>:<n> is a different prefix and never matches here.
+          ((.labels // []) as $L
+            | ($L | map(select(startswith("pilot:held-until:")))) as $hu_raw
+            | ($hu_raw | map(ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber)) as $hu
+            | if ($hu | length) > 0 and ($hu | max) >= $now_ts then false
+              elif ($L | index("pilot:held")) != null then (($hu | length) > 0)
+              elif ($hu_raw | length) > 0 and ($hu | length) == 0 then false
+              else true end)
         )
         and (
           # ga-am6h: pilot:reclaim-count is STICKY, independent of pilot:held. Once
@@ -3670,6 +3687,17 @@ _filter_candidates() {
                 and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber)) |
                      if length > 0 then (max >= $now_ts) else true end) )
            then "pilot:held(not-expired)" else empty end),
+          # ga-0eib9f: mirrors the held-until-alone clause in the select above —
+          # keep these two in sync. Only fires when pilot:held is ABSENT (with
+          # pilot:held present the line above already names the exclusion).
+          (if ( (($L | index("pilot:held")) == null)
+                and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")) | tonumber)) |
+                     length > 0 and (max >= $now_ts)) )
+           then "pilot:held-until(future,no-pilot:held)" else empty end),
+          (if ( (($L | index("pilot:held")) == null)
+                and (($L | map(select(startswith("pilot:held-until:")))) | length) > 0
+                and (($L | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | select(test("^[0-9]+\\z")))) | length) == 0 )
+           then "pilot:held-until(unreadable,no-pilot:held)" else empty end),
           (if ( ($L | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) |
                 if length > 0 then (max >= $reclaim_cap) else false end )
            then "pilot:reclaim-count>=cap(\($reclaim_cap))" else empty end),
