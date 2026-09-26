@@ -376,17 +376,23 @@ def fingerprints(res: dict) -> dict:
             k = f"shared|{f['workdir']}|{','.join(f['agents'])}"
             out[k] = (f"config:workdir-compartilhado -- overlays divergentes em {f['workdir']}",
                       f"Agentes {', '.join(f['agents'])} dividem o work_dir {f['workdir']} com overlays diferentes; o merge acumula e nunca remove (ga-swnkfm).")
+    # dedup por KIND (um alarme por tipo de cegueira, sem tempestade), mas o corpo lista TODOS os detalhes do kind: antes so o ultimo aparecia e
+    # dois arquivos/agentes ilegiveis do mesmo kind pareciam um so (gate ga-3d1wno r1).
+    by_kind: dict = {}
     for u in res["unknowns"]:
-        k = f"unknown|{u['kind']}"
-        out[k] = (f"config:overlay-guard-cego -- nao consegui verificar ({u['kind']})",
-                  f"overlay-root-leak-guard nao conseguiu verificar se algum overlay por papel vazou pra raiz: {u['detail']}. "
+        by_kind.setdefault(u["kind"], []).append(u["detail"])
+    for kind, details in by_kind.items():
+        k = f"unknown|{kind}"
+        out[k] = (f"config:overlay-guard-cego -- nao consegui verificar ({kind})",
+                  f"overlay-root-leak-guard nao conseguiu verificar se algum overlay por papel vazou pra raiz: {' | '.join(details)}. "
                   f"Isto e DESCONHECIDO, nao 'limpo' (ga-swnkfm).")
     return out
 
 
 def alarm(res: dict, state_dir: Path, router: Path | None, escalate_after_s: int, city: Path) -> int:
-    """Cooldown por fingerprint; entrega falha NAO grava (retry no proximo tick); chave que sumiu e esquecida
-    (recorrencia depois de limpo alarma na hora). -> numero de entregas que falharam."""
+    """Cooldown por fingerprint; entrega falha NAO grava (retry no proximo tick); chave que sumiu num tick COMPLETO (sem
+    desconhecidos) e esquecida (recorrencia depois de limpo alarma na hora); num tick com desconhecido nada e esquecido.
+    -> numero de entregas que falharam."""
     now = int(time.time())
     seen_file = state_dir / "overlay-root-leak-guard-seen.json"
     try:
@@ -397,7 +403,10 @@ def alarm(res: dict, state_dir: Path, router: Path | None, escalate_after_s: int
     except (OSError, ValueError):
         seen = {}
     fps = fingerprints(res)
-    new_seen = {k: v for k, v in seen.items() if k in fps}
+    # Tick com DESCONHECIDO (ex.: `gc config show` falhou): o que nao apareceu nao esta "limpo", so nao foi visto. Esquecer aqui faria o achado de
+    # topologia re-alarmar no tick seguinte sem respeitar o cooldown (config show intermitente; gate ga-3d1wno r1). So um tick sem desconhecido esquece.
+    incomplete = bool(res["unknowns"])
+    new_seen = {k: v for k, v in seen.items() if k in fps or incomplete}
     failed = 0
     for k, (subject, body) in fps.items():
         last = seen.get(k, 0)
@@ -455,8 +464,14 @@ def main(argv=None) -> int:
             lock_fh = open(lock_path, "w")
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"overlay-root-leak-guard: outra instancia ja rodando (lock {lock_path}) — saindo")
-            return RC_OK
+            if a.order:
+                # o order roda de 10 em 10 min: a instancia que segura o lock cobre esta rodada, sair 0 e certo.
+                print(f"overlay-root-leak-guard: outra instancia ja rodando (lock {lock_path}) — saindo")
+                return RC_OK
+            # CLI manual (o runbook de docs/pool-preamble-per-role.md le `rc=$?` sozinho): 0 aqui seria "limpo" sem check nenhum rodado — o mesmo
+            # erro-vira-vazio que este guard existe pra evitar (gate ga-3d1wno r1). rc 2 = nao rodei, repita.
+            print(f"overlay-root-leak-guard: outra instancia ja rodando (lock {lock_path}) — NAO rodei (rc 2 = desconhecido, nao 'limpo'); repita", file=sys.stderr)
+            return RC_UNKNOWN
         except OSError as e:
             # nao rodar sem garantia de instancia unica e correto (ga-y0g5x), mas sair 0 seria um guard CEGO que parece saudavel
             print(f"overlay-root-leak-guard: nao consegui abrir o lock ({e}) — NAO rodei (rc 2 = desconhecido, nao 'limpo')", file=sys.stderr)

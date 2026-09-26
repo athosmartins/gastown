@@ -336,6 +336,38 @@ spawn(c, c, "pool-reviewer"); n0 = ncalls(); alarmed(c, st2); check(ncalls() - n
 c2 = new_city(); (c2 / ".gc/settings.json").write_text("nao json"); n0 = ncalls(); rc, j, r = alarmed(c2, W / "state3")
 check(rc == 2 and ncalls() - n0 >= 1 and "overlay-guard-cego" in calls.read_text(), "DESCONHECIDO (rc 2) tambem alarma — guard cego nao fica quieto", f"rc={rc}")
 
+# gate ga-3d1wno r1 — `gc config show` intermitente: o tick cego (config-unavailable) nao traz os achados de TOPOLOGIA. Esquecer a chave ali fazia o achado
+# re-alarmar no tick seguinte SEM respeitar o cooldown (um alarme por flap). Cego != limpo: so um tick COMPLETO (sem desconhecido) esquece.
+topo = cfg_file("flap_topo", [A("gate-reviewer", "pool-reviewer")] + CLEAN_AGENTS[1:]); nocfg = W / "nao_existe.toml"
+def alarmed_cfg(city, state, cfg):
+    return run(city, cfg, env={"OVLG_ROUTER": str(router), "OVLG_STATE_DIR": str(state), "OVLG_ESCALATE_AFTER_S": "3600"}, alarm=True)
+cf = new_city(); stf = W / "state_flap"; n0 = ncalls()
+rc, j, r = alarmed_cfg(cf, stf, topo)
+check(rc == 1 and kinds(j) == ["root-resident-role-overlay"] and ncalls() - n0 == 1, "flap 1/4: achado de topologia alarma 1x", f"rc={rc} {kinds(j)} calls={ncalls()-n0}")
+n0 = ncalls(); rc, j, r = alarmed_cfg(cf, stf, nocfg)
+check(rc == 2 and [u["kind"] for u in (j or {}).get("unknowns", [])] == ["config-unavailable"] and ncalls() - n0 == 1, "flap 2/4: tick CEGO (config sumiu) alarma como DESCONHECIDO, nao como limpo", f"rc={rc} calls={ncalls()-n0}")
+n0 = ncalls(); rc, j, r = alarmed_cfg(cf, stf, topo)
+check(rc == 1 and ncalls() == n0, "flap 3/4: config volta => o achado NAO re-alarma (o tick cego nao esqueceu a chave; cooldown vale)", f"rc={rc} calls={ncalls()-n0}")
+alarmed_cfg(cf, stf, CFG_CLEAN); n0 = ncalls(); alarmed_cfg(cf, stf, topo)
+check(ncalls() - n0 == 1, "flap 4/4 (controle): um tick COMPLETO e limpo ainda esquece => recorrencia alarma na hora", f"calls={ncalls()-n0}")
+
+# unknown|<kind>: 1 alarme por TIPO de cegueira (sem tempestade), mas o corpo lista TODOS os detalhes do kind — antes so o ultimo aparecia e dois
+# arquivos ilegiveis pareciam um so.
+fp = ovlg.fingerprints({"findings": [], "unknowns": [{"kind": "artifact-unreadable", "file": "a", "detail": "DETALHE-UM"},
+                                                     {"kind": "artifact-unreadable", "file": "b", "detail": "DETALHE-DOIS"},
+                                                     {"kind": "config-unavailable", "detail": "OUTRO-KIND"}]})
+check(sorted(fp) == ["unknown|artifact-unreadable", "unknown|config-unavailable"], "unknown: dedup por KIND (1 chave por tipo de cegueira)", str(sorted(fp)))
+b1 = fp["unknown|artifact-unreadable"][1]
+check("DETALHE-UM" in b1 and "DETALHE-DOIS" in b1 and "OUTRO-KIND" not in b1 and "OUTRO-KIND" in fp["unknown|config-unavailable"][1],
+      "unknown: o corpo do kind lista TODOS os seus detalhes (nao so o ultimo) e nao mistura kinds", b1[:200])
+brouter = W / "router_body.sh"; bcalls = W / "router_body.calls"
+brouter.write_text(f'#!/bin/sh\necho "CALL" >> "{bcalls}"\necho "$4" >> "{bcalls}"\nexit 0\n'); brouter.chmod(0o755)
+c3 = new_city(); (c3 / ".claude/settings.json").write_text("nao json"); (c3 / ".gc/settings.json").write_text("{")
+rc, j, r = run(c3, CFG_CLEAN, env={"OVLG_ROUTER": str(brouter), "OVLG_STATE_DIR": str(W / "state_body"), "OVLG_ESCALATE_AFTER_S": "3600"}, alarm=True)
+ds = [u["detail"] for u in (j or {}).get("unknowns", []) if u["kind"] == "artifact-unreadable"]; mail = bcalls.read_text() if bcalls.exists() else ""
+check(rc == 2 and len(ds) == 2 and ds[0] != ds[1] and mail.splitlines().count("CALL") == 1 and all(d in mail for d in ds),
+      "e2e: 2 artefatos ilegiveis => UM alarme cujo corpo (o mail real) traz os DOIS detalhes", f"rc={rc} n={len(ds)} calls={mail.splitlines().count('CALL')}")
+
 section("H2. --order (o modo do `gc order`): o alarme e o canal; exit != 0 so se a ENTREGA falhou")
 def order_run(city, state, router_rc):
     rcfile.write_text(str(router_rc))
@@ -354,8 +386,12 @@ rc, j, r = run(c, CFG_CLEAN); check(rc == 1, "CLI sem --order continua 0/1/2 (va
 section("I. lock: instancia unica")
 c = new_city(); lockp = c / ".gc/runtime/overlay-root-leak-guard.lock"
 fh = open(lockp, "w"); fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-r = subprocess.run([GUARD, "--city", str(c), "--overlays-dir", str(OVERLAYS), "--config-toml", str(CFG_CLEAN), "--no-alarm"], capture_output=True, text=True, timeout=60)
-check(r.returncode == 0 and "outra instancia" in r.stdout and "═══" not in r.stdout, "lock ocupado => sai 0 sem rodar (nao empilha, ga-y0g5x)", f"rc={r.returncode} {r.stdout[:200]}")
+LOCKED = [GUARD, "--city", str(c), "--overlays-dir", str(OVERLAYS), "--config-toml", str(CFG_CLEAN), "--no-alarm"]
+r = subprocess.run(LOCKED + ["--order"], capture_output=True, text=True, timeout=60)
+check(r.returncode == 0 and "outra instancia" in r.stdout and "═══" not in r.stdout, "--order + lock ocupado => sai 0 sem rodar (nao empilha, ga-y0g5x; a instancia que segura cobre a rodada)", f"rc={r.returncode} {r.stdout[:200]}")
+# gate ga-3d1wno r1: o runbook le `rc=$?` do CLI manual sozinho — um 0 aqui e "limpo" sem check nenhum rodado (erro vira vazio).
+r = subprocess.run(LOCKED, capture_output=True, text=True, timeout=60)
+check(r.returncode == 2 and "NAO rodei" in r.stderr and "═══" not in r.stdout, "CLI manual + lock ocupado => rc 2 'NAO rodei' (0 seria 'limpo' sem check rodado)", f"rc={r.returncode} err={r.stderr[:160]}")
 fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
 r = subprocess.run([GUARD, "--city", str(c), "--overlays-dir", str(OVERLAYS), "--config-toml", str(CFG_CLEAN), "--no-alarm"], capture_output=True, text=True, timeout=60)
 check(r.returncode == 0 and "═══" in r.stdout, "lock livre => roda normalmente", f"rc={r.returncode}")
