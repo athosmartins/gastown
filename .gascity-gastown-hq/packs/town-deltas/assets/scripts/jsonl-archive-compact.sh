@@ -31,7 +31,12 @@
 #      "fast": growing on a run where nothing was packed would start the first run after the cause
 #      cleared at ~200 objects (~1GiB loose), which this host cannot pack inside a batch timeout. A batch
 #      cut by the RUN DEADLINE (the budget ending, not the batch being too big) ends the run as
-#      `deferred` and leaves the size alone. Measured on 41MB blobs (9 versions, same output
+#      `deferred` and leaves the size alone — and so does the `prune-packed` after it (idempotent; its
+#      own cap running out is a failure, the run's budget ending is not). A batch made progress when the
+#      loose COUNT fell, or a new pack appeared whose loose copies are all gone (prune-packable 0): the
+#      exporter adds ~9 loose objects per commit while a batch runs, which at the minimum batch of 5 can
+#      leave the count level. A new pack alone is not enough — a prune-packed that removes nothing would
+#      make every batch re-pack the same objects — so that run ends `stalled`. Measured on 41MB blobs (9 versions, same output
 #      5.8MiB every time): 177s at nice 19 + background QoS, 69-101s at nice 10, 52s at nice 0,
 #      under load 35-63 — this host is always loaded, so a fixed batch size could time out
 #      forever and never make progress. Bounded batches matter: a run killed by its timeout still
@@ -42,7 +47,11 @@
 #      carries its own first full copy of every big file (batches cannot delta against earlier
 #      packs); the gc re-deltas those against the whole history and merges the packs. The alarm judges
 #      the END state, so a gc that succeeds clears a failed tier 1 (it packs the loose objects too); a gc
-#      that did NOTHING (busy, deferred) never launders one.
+#      that did NOTHING (busy, or killed) never launders one: only a status that is not a failure on its own
+#      (bad_status: failed / stalled / timeout / unmeasured / skipped-low-disk) can be replaced by `busy` or
+#      `deferred`. The gc gets the same budget rule as a batch: a kill at its OWN cap (600s) is `timeout`
+#      (the repo is too big for one gc), a kill at the end of the RUN's budget is `deferred` — the run that
+#      crosses the pack limit is by construction one whose tier 1 just spent part of the budget.
 # Nothing here ever shortens history: no prune of reachable objects, no shallow, no squash.
 # `git gc` keeps its own 2-week expiry for unreachable objects. The S3 mirror
 # (dolt-s3-backup.sh) copies only the working tree (`--exclude ".git/*"`), so the git history
@@ -53,16 +62,19 @@
 # makes git walk UP and act on the enclosing repo (these archives live inside the city's own
 # git tree — a plain `git -C` there would have gc'd the town monorepo).
 #
-# ALARM: a run is BAD when the repo ends >= JAC_LOOSE_ALARM_KIB loose WITHOUT the run having shrunk
-# it (a backlog that is visibly draining is not news), or >= JAC_PACKS_ALARM packs, or the run
+# ALARM: a run is BAD when the repo ends >= JAC_LOOSE_ALARM_KIB loose WITHOUT the run having really
+# shrunk it — smaller than at the run's start AND smaller than where the PREVIOUS run left it (state
+# loose_kib; unknown = the run's own before/after alone), because a backlog emptied more slowly than
+# it refills shrinks a little every run and still grows — or >= JAC_PACKS_ALARM packs, or the run
 # failed / could not measure / was skipped for low disk / stalled / timed out at the minimum
-# batch size. After
+# batch size or at gc's own cap. After
 # JAC_ALERT_AFTER (3) consecutive BAD runs one mail goes to the mayor, at most once per
 # JAC_ALERT_EVERY_S (6h); an undelivered mail is retried next run (delivered != attempted) and the
 # log says WHY it failed. Exit 1 whenever any repo is BAD, so the order runner shows the failure too --
 # and also when the STATE cannot be updated: the streak is what reaches the alarm, so a run that cannot
 # record it is blind, and must not look green. The state file must be a JSON OBJECT (a valid-JSON
-# `[]`, `5` or `"x"`, or an entry that is not an object, is repaired and LOGGED, never silently kept).
+# `[]`, `5` or `"x"`, an entry that is not an object, or an empty file, is repaired and LOGGED, never silently kept).
+# With no `timeout`/`gtimeout` on PATH nothing is time-bounded and batch sizing cannot adapt: every run says so.
 #
 # MODES:  (none)        compact + state + alarm
 #         --check       read-only: measure, print, exit 1 if BAD (no lock, state, mail, git writes)
@@ -85,7 +97,7 @@ RUNTIME="${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}"
 # at least one exists.
 REPOS="${JAC_REPOS:-$RUNTIME/packs/maintenance/jsonl-archive $RUNTIME/packs/town-deltas/jsonl-archive}"
 LOOSE_LIMIT_KIB="${JAC_LOOSE_LIMIT_KIB:-262144}"     # 256MiB of loose objects triggers a batch pack
-LOOSE_ALARM_KIB="${JAC_LOOSE_ALARM_KIB:-1048576}"    # 1GiB still loose after a run = BAD, unless the run shrank it (a backlog draining)
+LOOSE_ALARM_KIB="${JAC_LOOSE_ALARM_KIB:-1048576}"    # 1GiB still loose after a run = BAD, unless the run really shrank it (a backlog draining, see ALARM)
 PACKS_LIMIT="${JAC_PACKS_LIMIT:-8}"                  # this many packs triggers the consolidating gc
 PACKS_ALARM="${JAC_PACKS_ALARM:-20}"                 # this many after a run = BAD (git's own autoPackLimit is 50)
 BATCH_OBJECTS="${JAC_BATCH_OBJECTS:-60}"             # starting batch (~7 commits, ~300MiB loose); adapts, see header
@@ -97,6 +109,8 @@ GC_TIMEOUT_S="${JAC_GC_TIMEOUT_S:-600}"              # per consolidating gc
 DEADLINE_S="${JAC_DEADLINE_S:-780}"                  # whole run; the order's timeout is 900s
 MIN_BATCH_S="${JAC_MIN_BATCH_S:-30}"                 # do not START a batch with less than this left
 MIN_GC_BUDGET_S="${JAC_MIN_GC_BUDGET_S:-240}"        # do not START a gc with less than this left
+PRUNE_TIMEOUT_S="${JAC_PRUNE_TIMEOUT_S:-120}"        # per prune-packed after a batch
+PRUNE_MIN_S="${JAC_PRUNE_MIN_S:-15}"                 # prune-packed always gets at least this, so a batch that ends at the deadline can still prune
 HEADROOM_KIB="${JAC_HEADROOM_KIB:-524288}"           # free space that must remain after the estimate
 ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
 ALERT_EVERY_S="${JAC_ALERT_EVERY_S:-21600}"
@@ -121,7 +135,7 @@ if [ "$MODE" = print ]; then
 repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
-git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
+git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
@@ -150,7 +164,7 @@ remaining() { echo $(( DEADLINE_S - ( $(date +%s) - START ) )); }
 # order's own 900s kill is the bound).
 _pre=(nice -n 10)
 _timeout_bin=""
-for _t in timeout gtimeout; do command -v "$_t" >/dev/null 2>&1 && { _timeout_bin="$_t"; break; }; done
+for _t in ${JAC_TIMEOUT_CMDS:-timeout gtimeout}; do command -v "$_t" >/dev/null 2>&1 && { _timeout_bin="$_t"; break; }; done
 _bounded() {  # _bounded <seconds> <cmd...>
   local t="$1"; shift
   if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$t" "${_pre[@]}" "$@"; else "${_pre[@]}" "$@"; fi
@@ -167,15 +181,30 @@ git_arch() {  # git_arch <seconds> <git args...>   — uses $R_GITDIR and the re
 }
 
 is_uint() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# bad_status <status> — a status that is a failure on its own. A step that did NOTHING (gc busy, a step cut by the run
+# deadline) may only replace a status that is NOT one of these: the failure it carries is still true.
+bad_status() { case "$1" in failed|unmeasured|skipped-low-disk|stalled|timeout) return 0 ;; esac; return 1; }
+# budget_for <cap_s> [floor_s] — sets t_left (what to give a step: its own cap, or what is left of the RUN when that is
+# smaller; lifted to the floor, default 1 — `timeout 0` means "no limit" — but NEVER above the step's own cap) and
+# by_deadline (1 = the RUN's budget, not the step's own cap, is the limit). A kill at t_left with by_deadline=1 is the budget
+# ending: evidence of nothing about the step. (remaining == cap counts as the step's own cap.) Sets the CALLER's t_left /
+# by_deadline (bash dynamic scope).
+budget_for() {
+  t_left="$(remaining)"; by_deadline=0
+  [ "$t_left" -lt "$1" ] && by_deadline=1
+  [ "$t_left" -ge "${2:-1}" ] || t_left="${2:-1}"
+  [ "$t_left" -le "$1" ] || t_left="$1"
+}
 mib() { echo $(( $1 / 1024 )); }
 # fmt <kib> — "<n>MiB", or "?" when git could not say (an unknown must never read as 0)
 fmt() { if is_uint "${1:-}"; then echo "$(( $1 / 1024 ))MiB"; else echo "?"; fi; }
 
 # measure — fills M_LOOSE_COUNT M_LOOSE_KIB M_PACKS M_PACK_KIB M_GARBAGE_KIB, or returns 1 when
-# git cannot say (never a quiet zero).
+# git cannot say (never a quiet zero). M_PRUNABLE (loose objects that are ALSO in a pack) is filled when git reports it and
+# is deliberately not required: only the batch-progress rule reads it, and there "unknown" means "not proven".
 measure() {
   local out k v
-  M_LOOSE_COUNT=""; M_LOOSE_KIB=""; M_PACKS=""; M_PACK_KIB=""; M_GARBAGE_KIB=""
+  M_LOOSE_COUNT=""; M_LOOSE_KIB=""; M_PACKS=""; M_PACK_KIB=""; M_GARBAGE_KIB=""; M_PRUNABLE=""
   out="$(git --git-dir="$R_GITDIR" count-objects -v 2>/dev/null)" || return 1
   while IFS=': ' read -r k v; do
     case "$k" in
@@ -184,6 +213,7 @@ measure() {
       packs) M_PACKS="$v" ;;
       size-pack) M_PACK_KIB="$v" ;;
       size-garbage) M_GARBAGE_KIB="$v" ;;
+      prune-packable) M_PRUNABLE="$v" ;;
     esac
   done <<EOF
 $out
@@ -214,7 +244,8 @@ state_json() {
   if [ -f "$STATE" ] && jq -e 'type == "object"' "$STATE" >/dev/null 2>&1; then cat "$STATE"; else echo '{}'; fi
 }
 state_problem() {  # prints why the state file is unusable and returns 0; returns 1 when it is fine (or there is none yet)
-  [ -s "$STATE" ] || return 1
+  [ -e "$STATE" ] || return 1
+  [ -s "$STATE" ] || { echo "it is empty (0 bytes)"; return 0; }
   if ! jq empty "$STATE" >/dev/null 2>&1; then echo "it is not valid JSON"; return 0; fi
   jq -e 'type == "object"' "$STATE" >/dev/null 2>&1 && return 1
   echo "it is valid JSON but not a JSON object"; return 0
@@ -234,29 +265,32 @@ load_state() {
     STATE_JSON="$(jq --arg r "$1" '.[$r] = {}' <<<"$STATE_JSON")"
   fi
   # ...and the numeric fields in it must be non-negative whole numbers: `is_uint || 0` read anything else as 0 with no trace
-  # (a corrupted bad_streak restarted the count; a corrupted last_alert_epoch meant "never alerted", so the mail repeated)
+  # (a corrupted bad_streak restarted the count; a corrupted last_alert_epoch meant "never alerted", so the mail repeated; a
+  # corrupted loose_kib — the previous run's end size, which the "draining" judgement compares against — fell back to the run's own
+  # before/after, the rule that suppresses the alarm). loose_kib may also be null: a run that could not measure records that.
   local bad_fields
-  bad_fields="$(jq -r --arg r "$1" '(.[$r] // {}) | to_entries
-      | map(select((.key | IN("bad_streak","last_alert_epoch","batch_objects"))
-                   and ((.value | type) != "number" or .value < 0 or .value != (.value | floor))))
-      | map(.key) | join(",")' <<<"$STATE_JSON" 2>/dev/null)" || bad_fields="?"
+  bad_fields="$(jq -r --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
+      def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+      (.[$r] // {}) | to_entries | map(select(bad)) | map(.key) | join(",")' <<<"$STATE_JSON" 2>/dev/null)" || bad_fields="?"
   if [ -n "$bad_fields" ]; then
     case "$ENTRY_LOGGED" in
       *" $1:f "*) ;;
       *) ENTRY_LOGGED="$ENTRY_LOGGED$1:f "
          log "  state entry for $1: field(s) $bad_fields are not non-negative whole numbers (or could not be checked) — dropped, read as unset" ;;
     esac
-    STATE_JSON="$(jq --arg r "$1" '.[$r] |= with_entries(select(((.key | IN("bad_streak","last_alert_epoch","batch_objects")) | not)
-        or ((.value | type) == "number" and .value >= 0 and .value == (.value | floor))))' <<<"$STATE_JSON" 2>/dev/null)" \
+    STATE_JSON="$(jq --arg r "$1" 'def badnum: (.value | type) != "number" or .value < 0 or .value != (.value | floor);
+        def bad: ((.key | IN("bad_streak","last_alert_epoch","batch_objects")) and badnum) or (.key == "loose_kib" and .value != null and badnum);
+        .[$r] |= with_entries(select(bad | not))' <<<"$STATE_JSON" 2>/dev/null)" \
       || STATE_JSON="$(jq --arg r "$1" '.[$r] = {}' <<<"$(state_json)")"
   fi
 }
 
 # is_bad <status> — the alarm rule, over the repo's END state ($M_* already re-measured).
-# Over the loose alarm size is BAD only when this run did not shrink it: a backlog that is visibly
-# draining (R_PROGRESS=1) must not page the mayor for a state they already know about.
+# Over the loose alarm size is BAD only when this run did not really SHRINK the backlog (R_PROGRESS=1: it ended smaller
+# than it started AND smaller than where the previous run left it — a backlog drained slower than it refills shrinks a
+# little every run and still grows): a backlog that is visibly draining must not page the mayor for a state they know.
 is_bad() {
-  case "$1" in failed|unmeasured|skipped-low-disk|stalled|timeout) return 0 ;; esac
+  bad_status "$1" && return 0
   [ "$M_LOOSE_KIB" -ge "$LOOSE_ALARM_KIB" ] 2>/dev/null && [ "${R_PROGRESS:-0}" != 1 ] && return 0
   [ "$M_PACKS" -ge "$PACKS_ALARM" ] 2>/dev/null && return 0
   return 1
@@ -275,7 +309,7 @@ log:     $LOG
 state:   $STATE
 Why it matters: without compaction this repo grows ~5GiB/day of loose hq.jsonl copies (ga-a3ar7h).
 Nothing was deleted. Check: bash $0 --check ; then the last lines of the log.
-If the status is timeout on a consolidating gc, the repo is too big for one order run (780s): run it by
+If the log says gc timed out at its OWN cap (${GC_TIMEOUT_S}s), the repo is too big for one gc: run it by
 hand, without a timeout, at low priority:  nice -n 10 git --git-dir=$1/.git gc   (26/09: 36 min for a 6GB backlog)."
   out="$("$GCBIN" mail send mayor/ -s "ESCALATION: jsonl-archive compaction failing [HIGH]" -m "$body" 2>&1)"; rc=$?
   ALARM_ERR="$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ' | cut -c1-200)"
@@ -320,13 +354,16 @@ BAD_ANY=0
 EXISTING=0
 
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
-  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count need out rc t_left b0 took timeouts=0 fast=0 saved by_deadline
+  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed
   R_GITDIR="$repo/.git"
   STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""
   t0="$(date +%s)"
   load_state "$repo"
   saved="$(jq -r --arg r "$repo" '.[$r].batch_objects // empty' <<<"$STATE_JSON" 2>/dev/null)"
   if is_uint "$saved" && [ "$saved" -ge "$BATCH_MIN" ] && [ "$saved" -le "$BATCH_MAX" ]; then R_BATCH="$saved"; else R_BATCH="$BATCH_OBJECTS"; fi
+  # where the PREVIOUS run left this repo's loose bytes (its recorded end state); "" = not known (first run, that run could not
+  # measure, or the state was reset) — the run's own before/after then decides alone
+  prev_loose="$(jq -r --arg r "$repo" '.[$r].loose_kib // empty' <<<"$STATE_JSON" 2>/dev/null)"; is_uint "$prev_loose" || prev_loose=""
 
   if ! measure; then
     STATUS="unmeasured"
@@ -351,11 +388,10 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       while [ "$M_LOOSE_COUNT" -gt 0 ]; do
         if [ "$(remaining)" -lt "$MIN_BATCH_S" ]; then STATUS="deferred"; break; fi
         if [ "$MAX_BATCHES" -gt 0 ] && [ "$batches" -ge "$MAX_BATCHES" ]; then STATUS="deferred"; break; fi
-        prev_count="$M_LOOSE_COUNT"
+        prev_count="$M_LOOSE_COUNT"; prev_packs="$M_PACKS"
         # t_left is the smaller of the per-batch timeout and what is left of the RUN: a kill at the first is a batch that was too
         # big, a kill at the second is the budget ending (equal = the batch's own cap)
-        t_left="$(remaining)"; by_deadline=0
-        if [ "$t_left" -gt "$GIT_TIMEOUT_S" ]; then t_left="$GIT_TIMEOUT_S"; elif [ "$t_left" -lt "$GIT_TIMEOUT_S" ]; then by_deadline=1; fi
+        budget_for "$GIT_TIMEOUT_S"; batch_left="$t_left"     # t_left is reused for the prune below; "fast" is judged against THIS
         b0="$(date +%s)"
         out="$(git_arch "$t_left" maintenance run --task=loose-objects --quiet 2>&1)"; rc=$?
         took=$(( $(date +%s) - b0 ))
@@ -377,13 +413,38 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
         # first and packs the next one after, so this batch's own loose copies are still on disk
         # (measured: count 6 -> pack written -> count still 6 -> prune-packed -> 3). Prune them
         # now, or every batch reads as "no progress" and the loop gives up after one.
-        out="$(git_arch 120 prune-packed --quiet 2>&1)"; rc=$?
-        if [ "$rc" -ne 0 ]; then STATUS="failed"; log "  prune-packed after batch $batches failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; break; fi
+        # ...with the same budget rule as the batch: its own cap, or what is left of the RUN (a floor keeps a batch that ended at the
+        # deadline able to prune; the overrun is bounded by PRUNE_MIN_S, well inside the order's timeout). A kill by the budget is
+        # not a failure of prune-packed — it is idempotent, and the loose copies it did not remove stay on disk (counted as loose,
+        # so bounded by the loose limit) until a later batch or a consolidating gc prunes them; only its OWN cap running out is one.
+        budget_for "$PRUNE_TIMEOUT_S" "$PRUNE_MIN_S"
+        out="$(git_arch "$t_left" prune-packed --quiet 2>&1)"; rc=$?
+        if [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
+          STATUS="deferred"; fast=0
+          log "  prune-packed after batch $batches was cut by the run deadline after ${t_left}s — the budget ended, not a failure of prune-packed (the loose copies of what the batch packed stay on disk until a later batch or gc prunes them; nothing is lost)"
+          break
+        fi
+        if [ "$rc" -ne 0 ]; then
+          STATUS="failed"
+          log "  prune-packed after batch $batches failed rc=$rc$([ "$rc" -eq 124 ] && echo " (timed out after ${t_left}s, its own cap)"): $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
+          break
+        fi
         if ! measure; then STATUS="unmeasured"; break; fi
-        if [ "$M_LOOSE_COUNT" -ge "$prev_count" ]; then STATUS="stalled"; log "  batch $batches made no progress (loose objects $prev_count -> $M_LOOSE_COUNT)"; break; fi
+        # progress = fewer loose objects, OR a new pack whose loose copies are all gone (prune-packable 0): the exporter commits ~9
+        # new loose objects while a batch runs, which at the minimum batch size (5) can leave the count level though the batch
+        # packed 5 of them. A new pack alone is NOT proof: if prune-packed silently removes nothing (read-only remount, permissions)
+        # every batch re-packs the same objects — the pack count rises, prune-packable stays > 0, and the run must stop as stalled.
+        progressed=0
+        if [ "$M_LOOSE_COUNT" -lt "$prev_count" ]; then progressed=1
+        elif [ "$M_PACKS" -gt "$prev_packs" ] && is_uint "$M_PRUNABLE" && [ "$M_PRUNABLE" -eq 0 ]; then progressed=1; fi
+        if [ "$progressed" -eq 0 ]; then
+          STATUS="stalled"
+          log "  batch $batches made no progress (loose objects $prev_count -> $M_LOOSE_COUNT, packs $prev_packs -> $M_PACKS, prune-packable ${M_PRUNABLE:-?})"
+          break
+        fi
         # "fast" is judged only for a batch that PACKED something: a batch that died at once or did nothing is the quickest one
         # there is, and crediting it doubled the remembered size on runs where nothing succeeded
-        [ "$((took * 4))" -lt "$t_left" ] && fast=1 || fast=0
+        [ "$((took * 4))" -lt "$batch_left" ] && fast=1 || fast=0
       done
       [ "$STATUS" = ok ] && STATUS="packed-loose"
       # grow the remembered batch once, and only after a run that was still making progress (packed everything, or ran out of
@@ -399,26 +460,40 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
   if [ "$STATUS" != unmeasured ] && [ "$M_PACKS" -ge "$PACKS_LIMIT" ]; then
     need=$(( M_PACK_KIB + HEADROOM_KIB ))
     if [ "$(remaining)" -lt "$MIN_GC_BUDGET_S" ]; then
-      case "$STATUS" in ok|packed-loose) STATUS="deferred" ;; esac
+      bad_status "$STATUS" || STATUS="deferred"
       log "repo=$repo packs=$M_PACKS >= $PACKS_LIMIT but only $(remaining)s of budget left — gc deferred to the next run"
     elif disk_low "$repo" "$need"; then
       STATUS="skipped-low-disk"
       log "repo=$repo status=skipped-low-disk (gc) free=$(fmt "$(free_kib "$repo")") need~$(fmt "$need") packs=$M_PACKS"
     else
-      t_left="$(remaining)"; [ "$t_left" -gt "$GC_TIMEOUT_S" ] && t_left="$GC_TIMEOUT_S"
+      # the same rule as a batch: a kill at gc's OWN cap says the repo is too big for one gc; a kill at the end of the RUN's budget
+      # says nothing about gc (the run that crosses PACKS_LIMIT is one whose tier 1 just spent part of the budget)
+      budget_for "$GC_TIMEOUT_S"
       out="$(git_arch "$t_left" -c gc.autoDetach=false gc --quiet 2>&1)"; rc=$?
       if [ "$rc" -eq 0 ]; then STATUS="consolidated"
-      elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s"
+      elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
+        # it did NOTHING useful (a killed gc keeps no work): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
+        bad_status "$STATUS" || STATUS="deferred"
+        log "  gc was cut by the run deadline after ${t_left}s — the budget ended, not evidence the repo is too big for one gc (retried next run)"
+      elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap)"
       elif printf '%s' "$out" | grep -q 'already running'; then
-        # it did NOTHING: it cannot turn a failed / stalled / timed-out tier 1 into a green "busy"
-        case "$STATUS" in failed|stalled|timeout|unmeasured) ;; *) STATUS="busy" ;; esac
+        # it did NOTHING: it cannot turn a failed / stalled / timed-out / unmeasured / skipped tier 1 into a green "busy"
+        bad_status "$STATUS" || STATUS="busy"
         log "  gc already running elsewhere — leaving it to finish"
       else STATUS="failed"; log "  gc failed rc=$rc: $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
     fi
   fi
 
   measure || STATUS="unmeasured"
-  is_uint "$M_LOOSE_KIB" && [ "$M_LOOSE_KIB" -lt "$before_loose" ] && R_PROGRESS=1
+  if is_uint "$M_LOOSE_KIB" && [ "$M_LOOSE_KIB" -lt "$before_loose" ]; then
+    R_PROGRESS=1
+    # ...but smaller than this run's START is not yet "draining": a backlog emptied more slowly than it refills shrinks a little
+    # every run and still grows, so it must also be smaller than where the PREVIOUS run left it
+    if [ -n "$prev_loose" ] && [ "$M_LOOSE_KIB" -ge "$prev_loose" ]; then
+      R_PROGRESS=0
+      log "  loose shrank this run ($(fmt "$before_loose") -> $(fmt "$M_LOOSE_KIB")) but is not below where the previous run left it ($(fmt "$prev_loose")) — the backlog is not draining, only refilling as fast as it is emptied"
+    fi
+  fi
   G_KIB="$(gitdir_kib)"
   log "repo=$repo status=$STATUS loose=$(fmt "$before_loose")->$(fmt "$M_LOOSE_KIB") packs=${before_packs}->${M_PACKS:-?} packed=$(fmt "$before_kib")->$(fmt "$M_PACK_KIB") .git=$(fmt "$G_KIB") batches=$batches batch=${R_BATCH} elapsed=$(( $(date +%s) - t0 ))s"
 }
@@ -447,6 +522,9 @@ if [ "$MODE" = run ]; then
   trap lock_release EXIT
 fi
 
+if [ "$MODE" = run ] && [ -z "$_timeout_bin" ]; then
+  log "WARNING: no timeout/gtimeout on PATH — batches, prune and gc are NOT time-bounded (only the order's own kill limits a run), and batch sizing cannot adapt (it reacts to timeouts)"
+fi
 if [ "$MODE" = run ] && why="$(state_problem)"; then
   log "state file $STATE is unreadable — starting fresh: $why (bad-run streaks and remembered batch sizes reset)"
 fi

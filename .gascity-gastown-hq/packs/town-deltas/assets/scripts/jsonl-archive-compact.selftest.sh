@@ -17,6 +17,7 @@ ORDER="$PACK/orders/jsonl-archive-compact.toml"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+skip() { echo "  SKIP: $1"; }     # not counted: the host was too loaded for a timing-based fixture to run at all
 
 WORK="$(mktemp -d /tmp/jsonl-archive-compact-selftest.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -86,10 +87,34 @@ chmod +x "$WORK/git-failmaint"
 cat > "$WORK/git-slow" <<EOF
 #!/bin/bash
 n=""; for a in "\$@"; do case "\$a" in maintenance.loose-objects.batchSize=*) n="\${a#*=}" ;; esac; done
-case " \$* " in *" maintenance run "*) echo "\${n:-none}" >> "$WORK/git-batches"; if [ -n "\$n" ] && [ "\$n" -gt "\${SLOW_ABOVE:-999999}" ]; then sleep 8; fi ;; esac
+case " \$* " in *" maintenance run "*) echo "\${n:-none}" >> "$WORK/git-batches"; if [ -n "\$n" ] && [ "\$n" -gt "\${SLOW_ABOVE:-999999}" ]; then sleep "\${SLOW_SLEEP:-8}"; fi ;; esac
 exec git "\$@"
 EOF
 chmod +x "$WORK/git-slow"
+# git-fx: fault injection for the steps AFTER a batch, plain git for everything else. Env controls (all optional):
+#   FM_RC=<n>      every `maintenance run` exits <n> at once and does nothing (a failed batch)
+#   SLOW_GC=1      `gc` sleeps $SLOW_SLEEP seconds (default 8) before running
+#   SLOW_PRUNE=1   `prune-packed` sleeps $SLOW_SLEEP seconds before running
+#   NOOP_PRUNE=1   `prune-packed` exits 0 and removes nothing (a read-only remount, permissions: it "succeeds" without pruning)
+#   INFLOW_N=<n>   after every real `maintenance run`, <n> NEW loose objects land (an exporter commit during a batch)
+# It sleeps in the foreground, so `timeout` (which signals its whole process group) kills it like a real slow git.
+cat > "$WORK/git-fx" <<'EOF'
+#!/bin/bash
+gd=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#*=}" ;; esac; done
+case " $* " in
+  *" maintenance run "*) [ -n "${FM_RC:-}" ] && exit "$FM_RC" ;;
+  *" gc "*)              [ -n "${SLOW_GC:-}" ] && sleep "${SLOW_SLEEP:-8}" ;;
+  *" prune-packed "*)    [ -n "${SLOW_PRUNE:-}" ] && sleep "${SLOW_SLEEP:-8}"; [ -n "${NOOP_PRUNE:-}" ] && exit 0 ;;
+esac
+git "$@"; rc=$?
+case " $* " in
+  *" maintenance run "*) if [ -n "${INFLOW_N:-}" ] && [ -n "$gd" ]; then
+                           for _i in $(seq 1 "$INFLOW_N"); do head -c 3000 /dev/urandom | git --git-dir="$gd" hash-object -w --stdin >/dev/null; done
+                         fi ;;
+esac
+exit $rc
+EOF
+chmod +x "$WORK/git-fx"
 
 # run_jac <repo...> [-- --check]: the script under test, sealed off from the real world.
 run_jac() {
@@ -99,8 +124,9 @@ run_jac() {
   JAC_PACKS_LIMIT="${T_PACKS:-8}" JAC_PACKS_ALARM="${T_PACKS_ALARM:-20}" JAC_FREE_KIB="${T_FREE:-90000000}" \
   JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
-  JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" \
-  bash "$SCRIPT" "$@" 2>&1
+  JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
+  JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" \
+  "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
 state_field() { jq -r --arg r "$1" ".[\$r].$2" "$WORK/state.json" 2>/dev/null; }
@@ -108,7 +134,9 @@ mail_calls()  { [ -f "$WORK/gc-calls" ] && wc -l < "$WORK/gc-calls" | tr -d ' ' 
 
 echo "=== jsonl-archive-compact.selftest.sh ==="
 [ -x "$SCRIPT" ] && ok "script exists and is executable" || { bad "script missing or not executable: $SCRIPT"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
-bash -n "$SCRIPT" && ok "script parses" || bad "script has a syntax error"
+bash -n "$SCRIPT" && ok "script parses (PATH bash)" || bad "script has a syntax error"
+[ "$(head -n 1 "$SCRIPT")" = "#!/bin/bash" ] && ok "shebang is #!/bin/bash — the tests below execute the script through it" || bad "unexpected shebang: $(head -n 1 "$SCRIPT")"
+/bin/bash -n "$SCRIPT" && ok "script parses under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION'), the shebang interpreter)" || bad "script does not parse under /bin/bash"
 
 echo ""
 echo "=== S0: the incident — git's own auto-gc is blind to big blobs, this script is not ==="
@@ -275,7 +303,7 @@ out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 T_GIT_TIMEOUT=2 T_BATCH=8 run_jac "$M
 [ "$(state_field "$M" bad_streak)" = 1 ] && ok "state: bad_streak 1" || bad "bad_streak=$(state_field "$M" bad_streak)"
 
 echo ""
-echo "=== S14: over the alarm size is BAD only when the run did not shrink it ==="
+echo "=== S14: over the alarm size is BAD only when the run did not shrink it (S21: and shrinking is not draining if it refills faster) ==="
 N="$WORK/n"; mkrepo "$N" 20; rm -f "$WORK/state.json"
 out="$(T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 run_jac "$N")"; rc=$?
 if [ "$(loose_kib "$N")" -ge 1024 ] && [ "$(loose_count "$N")" -lt 60 ] && [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(state_field "$N" bad_streak)" = 0 ]; then
@@ -338,7 +366,7 @@ for shape in array number string true null entry-number entry-array; do
 done
 # the entry IS an object but a numeric field in it is not a non-negative whole number: is_uint || 0 read it as 0 with no
 # trace, so a corrupted bad_streak restarted the count and a corrupted last_alert_epoch meant "never alerted" (mail again)
-for fld in '"bad_streak":"x"' '"bad_streak":-2' '"bad_streak":[3]' '"bad_streak":2.5' '"last_alert_epoch":"soon"' '"batch_objects":"big"'; do
+for fld in '"bad_streak":"x"' '"bad_streak":-2' '"bad_streak":[3]' '"bad_streak":2.5' '"last_alert_epoch":"soon"' '"batch_objects":"big"' '"loose_kib":"big"' '"loose_kib":-7' '"loose_kib":[1]'; do
   rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log"
   jq -n --arg r "$G2" --argjson f "{$fld}" '{($r): $f}' > "$WORK/state.json"
   T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null
@@ -351,10 +379,10 @@ for fld in '"bad_streak":"x"' '"bad_streak":-2' '"bad_streak":[3]' '"bad_streak"
 done
 # a well-formed entry is left exactly as it is (the sanitising must not eat a healthy state)
 rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log"
-jq -n --arg r "$G2" '{($r): {bad_streak: 1, last_alert_epoch: 0, batch_objects: 20}}' > "$WORK/state.json"
+jq -n --arg r "$G2" '{($r): {bad_streak: 1, last_alert_epoch: 0, batch_objects: 20, loose_kib: null}}' > "$WORK/state.json"
 T_FREE=1 run_jac "$G2" >/dev/null
 [ "$(state_field "$G2" bad_streak)" = 2 ] && [ "$(state_field "$G2" batch_objects)" = 20 ] && ! grep -q 'state entry' "$WORK/log" \
-  && ok "a healthy entry is kept (bad_streak 1 -> 2, batch_objects 20 untouched) and nothing is logged about it" \
+  && ok "a healthy entry is kept (bad_streak 1 -> 2, batch_objects 20 untouched; loose_kib null — what a run that could not measure records — is legal) and nothing is logged about it" \
   || bad "a healthy entry was disturbed (bad_streak=$(state_field "$G2" bad_streak) batch_objects=$(state_field "$G2" batch_objects))"
 # and when the state STILL cannot be rewritten (jq itself fails), that is loud and fails the run — not a quiet skip
 mkdir -p "$WORK/jqshim"; REAL_JQ="$(command -v jq)"
@@ -376,16 +404,16 @@ echo "=== S17: a batch cut by the RUN DEADLINE is deferred — it is not evidenc
 # size was halved and remembered (in a big drain every run ends with a cut batch, so it ratcheted down), and at
 # the minimum size the same kill was STATUS=timeout — BAD from the budget alone.
 V="$WORK/v"; mkrepo "$V" 20; rm -f "$WORK/state.json" "$WORK/git-batches"
-out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 T_GIT_TIMEOUT=300 T_DEADLINE=6 T_MIN_BATCH=1 T_BATCH=25 run_jac "$V")"; rc=$?
-if [ ! -s "$WORK/git-batches" ]; then bad "no batch started (host too slow for this test's 6s budget): $out"; else
+out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 SLOW_SLEEP=60 T_GIT_TIMEOUT=300 T_DEADLINE=8 T_MIN_BATCH=1 T_BATCH=25 run_jac "$V")"; rc=$?
+if [ ! -s "$WORK/git-batches" ]; then skip "no batch started inside this test's 8s budget (host too loaded): $out"; else
   { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ]; } && ok "deadline cut at a normal size → status deferred, exit 0" || bad "deadline cut judged wrong (rc=$rc status=$(last_status)): $out"
   [ "$(state_field "$V" batch_objects)" = 25 ] && ok "the remembered batch size is kept (25) — the budget ended, not the batch" || bad "remembered batch size was changed to $(state_field "$V" batch_objects) by a deadline cut"
   printf '%s' "$out" | grep -q 'retrying with' && bad "a deadline cut was logged as 'retrying with a smaller batch': $out" || ok "no 'retrying with' — the size was not halved"
   printf '%s' "$out" | grep -q 'run deadline' && ok "the log says the RUN DEADLINE cut it" || bad "log does not name the deadline: $out"
 fi
 rm -f "$WORK/state.json" "$WORK/git-batches"
-out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 T_GIT_TIMEOUT=300 T_DEADLINE=6 T_MIN_BATCH=1 T_BATCH=5 run_jac "$V")"; rc=$?
-if [ ! -s "$WORK/git-batches" ]; then bad "no batch started at the minimum size (host too slow): $out"; else
+out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 SLOW_SLEEP=60 T_GIT_TIMEOUT=300 T_DEADLINE=8 T_MIN_BATCH=1 T_BATCH=5 run_jac "$V")"; rc=$?
+if [ ! -s "$WORK/git-batches" ]; then skip "no batch started at the minimum size inside this test's 8s budget (host too loaded): $out"; else
   { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ]; } && ok "deadline cut at the MINIMUM size → deferred, exit 0 (not the 'timeout' failure)" || bad "min-size deadline cut judged wrong (rc=$rc status=$(last_status)): $out"
 fi
 
@@ -406,10 +434,134 @@ out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_PACKS=3 run_jac "$W2")"; rc=$?
   && ok "batches failed, gc was busy (did nothing) → status stays failed, exit 1 (busy does not launder a failure)" \
   || bad "failed tier 1 + busy gc judged wrong (rc=$rc status=$(last_status)): $out"
 rm -f "$W2/.git/gc.pid"
+# no-op-must-not-launder, the skipped-low-disk sibling: tier 1 was skipped for LOW DISK, packs are over the limit, and the
+# gc that would have consolidated is busy. `busy` used to replace anything but failed/stalled/timeout/unmeasured, so a
+# skipped-low-disk backlog went green. The free space is set BETWEEN the two needs (tier 1 needs loose/4, the gc needs the pack
+# size), computed from the fixture rather than guessed.
+W3="$WORK/w3"; mkrepo "$W3" 1; for i in 2 3 4 5; do addpack "$W3" "$i"; done; addcommits "$W3" 60
+rm -f "$WORK/state.json"; echo "$$ $(hostname)" > "$W3/.git/gc.pid"
+need1=$(( $(loose_kib "$W3") / 4 )); need2="$(git --git-dir="$W3/.git" count-objects -v | awk '/^size-pack:/{print $2}')"; free3=$(( (need1 + need2) / 2 ))
+if [ "$need2" -lt "$free3" ] && [ "$free3" -lt "$need1" ]; then
+  out="$(T_FREE="$free3" T_PACKS=3 run_jac "$W3")"; rc=$?
+  { [ "$rc" -eq 1 ] && [ "$(last_status)" = "skipped-low-disk" ] && printf '%s' "$out" | grep -q 'already running'; } \
+    && ok "tier 1 skipped for low disk, gc busy (did nothing) → status stays skipped-low-disk, exit 1 (busy does not launder it either)" \
+    || bad "skipped-low-disk + busy gc judged wrong (rc=$rc status=$(last_status)): $out"
+else
+  bad "fixture arithmetic: need tier2=${need2}KiB < free=${free3}KiB < need tier1=${need1}KiB"
+fi
+rm -f "$W3/.git/gc.pid"
+
+echo ""
+echo "=== S19: a consolidating gc cut by the RUN DEADLINE is deferred — only gc's OWN cap running out is a timeout ==="
+# Tier 2 clamped t_left = min(remaining, GC_TIMEOUT_S) and reported ANY rc 124 as STATUS=timeout (BAD, exit 1, streak+1, and an alarm
+# mail claiming "the repo is too big for one order run"). The run that crosses the pack limit is by construction one whose tier 1 just
+# spent part of the budget, so a gc starting with less than its cap left is normal — and a killed gc keeps no work, so the next run
+# starts it again from a fresh budget. The batch tier already told the two kills apart; this is its sibling.
+mkpacks() { local d="$1"; mkrepo "$d" 1; for i in 2 3 4 5 6; do addpack "$d" "$i"; done; }
+X="$WORK/x"; mkpacks "$X"; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_GIT="$WORK/git-fx" SLOW_GC=1 SLOW_SLEEP=60 T_PACKS=4 T_DEADLINE=12 T_MIN_GC=2 run_jac "$X")"; rc=$?
+if ! printf '%s' "$out" | grep -q 'gc was cut by the run deadline'; then
+  if printf '%s' "$out" | grep -q 'gc deferred to the next run'; then skip "gc never started inside this test's 12s budget (host too loaded)"
+  else bad "gc cut by the deadline: no 'cut by the run deadline' line (rc=$rc status=$(last_status)): $out"; fi
+else
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(state_field "$X" bad_streak)" = 0 ]; } \
+    && ok "gc killed by the run deadline → status deferred, exit 0, bad_streak 0 (the budget ended; nothing was shown about the repo)" \
+    || bad "deadline-cut gc judged wrong (rc=$rc status=$(last_status) streak=$(state_field "$X" bad_streak)): $out"
+  printf '%s' "$out" | grep -q 'gc timed out' && bad "a deadline-cut gc was logged as 'gc timed out': $out" || ok "no 'gc timed out' line for a deadline cut"
+fi
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_GIT="$WORK/git-fx" SLOW_GC=1 SLOW_SLEEP=20 T_PACKS=4 T_GC_TIMEOUT=2 run_jac "$X")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "timeout" ] && printf '%s' "$out" | grep -q 'gc timed out after 2s (its own cap)'; } \
+  && ok "gc that runs out its OWN cap (2s of a 780s budget) → status timeout, exit 1: the repo really is too big for one gc" \
+  || bad "own-cap gc timeout judged wrong (rc=$rc status=$(last_status)): $out"
+# a gc that was cut must not turn a FAILED tier 1 green either (the batches fail at once; the gc never finishes)
+W4="$WORK/w4"; mkrepo "$W4" 1; for i in 2 3 4 5; do addpack "$W4" "$i"; done; addcommits "$W4" 20; rm -f "$WORK/state.json" "$WORK/log"
+out="$(FM_RC=1 SLOW_GC=1 SLOW_SLEEP=60 T_GIT="$WORK/git-fx" T_PACKS=3 T_DEADLINE=12 T_MIN_BATCH=1 T_MIN_GC=2 run_jac "$W4")"; rc=$?
+if printf '%s' "$out" | grep -q 'gc deferred to the next run'; then skip "gc never started inside this test's 12s budget (host too loaded)"
+else
+  { [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'batch 1 failed rc=1' && printf '%s' "$out" | grep -q 'gc was cut by the run deadline'; } \
+    && ok "batches failed, gc cut by the deadline (did nothing) → status stays failed, exit 1 (a cut gc does not launder a failure)" \
+    || bad "failed tier 1 + deadline-cut gc judged wrong (rc=$rc status=$(last_status)): $out"
+fi
+
+echo ""
+echo "=== S20: prune-packed obeys the run budget too — cut by the deadline is deferred, its OWN cap running out is a failure ==="
+# prune-packed had a fixed 120s cap regardless of what was left of the run: a batch ending at the deadline plus a slow prune could
+# run to the order's own 900s kill before the outcome was logged. Clamped to the budget, a kill by the budget must not read as a failure.
+Y="$WORK/y"; mkrepo "$Y" 20; rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_GIT="$WORK/git-fx" SLOW_PRUNE=1 SLOW_SLEEP=60 T_DEADLINE=10 T_MIN_BATCH=1 T_PRUNE_MIN=1 T_BATCH=25 run_jac "$Y")"; rc=$?
+if printf '%s' "$out" | grep -qE 'batch 1 \([0-9]+ objects\) was cut by the run deadline'; then skip "the batch itself was cut before prune-packed inside this test's 10s budget (host too loaded)"
+else
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(state_field "$Y" batch_objects)" = 25 ] && printf '%s' "$out" | grep -q 'prune-packed after batch 1 was cut by the run deadline'; } \
+    && ok "prune-packed killed by the run deadline → status deferred, exit 0, remembered batch size kept (25); it was NOT capped at a fixed 120s" \
+    || bad "deadline-cut prune judged wrong (rc=$rc status=$(last_status) batch_objects=$(state_field "$Y" batch_objects)): $out"
+fi
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(T_GIT="$WORK/git-fx" SLOW_PRUNE=1 SLOW_SLEEP=20 T_PRUNE_TIMEOUT=2 T_BATCH=25 run_jac "$Y")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'timed out after 2s, its own cap'; } \
+  && ok "prune-packed that runs out its OWN cap → status failed, exit 1, and the log says it timed out at its own cap" \
+  || bad "own-cap prune timeout judged wrong (rc=$rc status=$(last_status)): $out"
+
+echo ""
+echo "=== S21: 'draining' means smaller than where the PREVIOUS run left it — not just smaller than this run's start ==="
+# The exemption was judged per run (end < this run's start), so a backlog emptied more slowly than it refills shrank a little every run,
+# grew overall, and never paged at any size.
+Z="$WORK/z"; mkrepo "$Z" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/gc-calls"
+T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 run_jac "$Z" >/dev/null; rc=$?
+K1="$(state_field "$Z" loose_kib)"
+{ [ "$rc" -eq 0 ] && [ "${K1:-0}" -ge 1024 ]; } && ok "run 1 (no earlier state): shrank the backlog, still over the alarm size (${K1}KiB) → exit 0 — a first run is judged on its own before/after" || bad "run 1 judged wrong (rc=$rc loose_kib=$K1)"
+addcommits "$Z" 25      # refills by MORE than the next run empties (25 commits = ~75 objects vs a batch of 10)
+out="$(T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 run_jac "$Z")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(state_field "$Z" bad_streak)" = 1 ] && printf '%s' "$out" | grep -q 'not draining'; } \
+  && ok "run 2: the batch shrank the backlog but it ended ABOVE where run 1 left it (${K1}KiB → $(state_field "$Z" loose_kib)KiB) → BAD, bad_streak 1, and the log says 'not draining'" \
+  || bad "refilling backlog judged wrong (rc=$rc streak=$(state_field "$Z" bad_streak) prev=${K1} now=$(state_field "$Z" loose_kib)): $out"
+rm -f "$WORK/log"
+out="$(T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 run_jac "$Z")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(state_field "$Z" bad_streak)" = 0 ] && ! printf '%s' "$out" | grep -q 'not draining'; } \
+  && ok "run 3: emptied faster than it refills (ended below run 2's end) → exit 0, bad_streak back to 0, no 'not draining'" \
+  || bad "genuinely draining backlog judged wrong (rc=$rc streak=$(state_field "$Z" bad_streak)): $out"
+
+echo ""
+echo "=== S22: an exporter commit landing DURING a batch does not read as 'stalled' when the batch did pack ==="
+# 'stalled' was judged on the loose COUNT alone. The exporter adds ~9 loose objects per commit; at the minimum batch (5 objects) a commit
+# landing mid-batch leaves the count higher even though the batch packed 5 — false stalled, BAD, and the drain stopped for that run.
+Q="$WORK/q"; mkrepo "$Q" 20; rm -f "$WORK/state.json" "$WORK/log"; PQ0="$(pack_count "$Q")"
+out="$(INFLOW_N=9 T_GIT="$WORK/git-fx" T_BATCH=5 T_MAX_BATCHES=3 run_jac "$Q")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ] && [ "$(pack_count "$Q")" -ge $((PQ0 + 3)) ] && ! printf '%s' "$out" | grep -q 'no progress'; } \
+  && ok "5-object batches with 9 new loose objects landing after each: 3 batches ran (packs $PQ0 -> $(pack_count "$Q")), status deferred, exit 0 — a new pack IS progress" \
+  || bad "batch masked by inflow judged wrong (rc=$rc status=$(last_status) packs $PQ0->$(pack_count "$Q")): $out"
+# ...but "a new pack" alone is not proof: a prune-packed that succeeds while removing NOTHING leaves every packed object's loose copy
+# behind (prune-packable > 0), so the next batch would re-pack the same objects — a run that mints packs until the deadline.
+Q2="$WORK/q2"; mkrepo "$Q2" 20; rm -f "$WORK/state.json" "$WORK/log"; PQ2="$(pack_count "$Q2")"
+out="$(NOOP_PRUNE=1 T_GIT="$WORK/git-fx" T_BATCH=5 T_MAX_BATCHES=5 run_jac "$Q2")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "stalled" ] && [ "$(pack_count "$Q2")" = $((PQ2 + 1)) ] && printf '%s' "$out" | grep -q 'prune-packable [1-9]'; } \
+  && ok "prune-packed that removes nothing: the run stops STALLED after ONE batch (packs $PQ2 -> $(pack_count "$Q2"), prune-packable > 0 in the log) instead of re-packing the same objects" \
+  || bad "no-op prune judged wrong (rc=$rc status=$(last_status) packs $PQ2->$(pack_count "$Q2")): $out"
+
+echo ""
+echo "=== S23: no timeout/gtimeout on the host → every run says so ==="
+NT="$WORK/nt"; mkrepo "$NT" 20; rm -f "$WORK/state.json" "$WORK/log"
+out="$(JAC_TIMEOUT_CMDS=no-such-timeout-cmd-xyz run_jac "$NT")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(loose_count "$NT")" = 0 ] && printf '%s' "$out" | grep -q 'WARNING: no timeout/gtimeout on PATH'; } \
+  && ok "without a timeout binary the run still drains the repo (unbounded fallback) and logs a WARNING that nothing is time-bounded" \
+  || bad "missing-timeout fallback wrong (rc=$rc loose=$(loose_count "$NT")): $out"
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  rm -f "$WORK/log"; out="$(run_jac "$NT")"
+  printf '%s' "$out" | grep -q 'WARNING: no timeout' && bad "the timeout warning fires although this host has a timeout binary" || ok "with a timeout binary present the warning stays quiet"
+fi
+
+echo ""
+echo "=== S24: an EMPTY state file is a reset that is logged, not a silent 'no state yet' ==="
+E0="$WORK/e0"; mkrepo "$E0" 2; : > "$WORK/state.json"; rm -f "$WORK/log"
+out="$(run_jac "$E0")"; rc=$?
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'unreadable — starting fresh: it is empty' && [ -s "$WORK/state.json" ] && jq -e 'type == "object"' "$WORK/state.json" >/dev/null 2>&1; } \
+  && ok "0-byte state file → logged as empty, replaced by a valid object" || bad "empty state file handled wrong (rc=$rc): $out"
+rm -f "$WORK/state.json"; out="$(run_jac "$E0")"
+printf '%s' "$out" | grep -q 'unreadable' && bad "an ABSENT state file (first run) was logged as a problem: $out" || ok "an absent state file (a first run) is not a problem and logs nothing about it"
 
 echo ""
 echo "=== S11: what actually runs in production ==="
-cfg="$(bash "$SCRIPT" --print-config)"
+cfg="$("$SCRIPT" --print-config)"
 printf '%s' "$cfg" | grep -q 'packs/maintenance/jsonl-archive' && printf '%s' "$cfg" | grep -q 'packs/town-deltas/jsonl-archive' \
   && ok "default repos: BOTH archives (maintenance + town-deltas)" || bad "default repos wrong: $cfg"
 S3SCRIPT="$CITY_ROOT/scripts/dolt-s3-backup.sh"
