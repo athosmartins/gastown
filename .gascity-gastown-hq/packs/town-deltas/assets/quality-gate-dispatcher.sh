@@ -2805,7 +2805,7 @@ gate_fail_settle_deferred_mayor_wake() {
   elif [ -n "${GATE_FAIL_POOL_VETO_REASONS:-}" ]; then
     _why="the source bead carries something the pool probe REFUSES (${GATE_FAIL_POOL_VETO_REASONS}), so no pool worker will pick it up by itself"
   else
-    _why="the source bead's return to the pool could not be verified by a read taken after the FAIL's writes (route not restored, assignee not cleared, status not reopened, gate:queued / gate:reviewing not removed, a label the pool probe refuses, the read failed, or no fix-attempt path ran)"
+    _why="the source bead's return to the pool could not be verified by a read taken after the FAIL's writes (route not restored, assignee not cleared, status not reopened, gate:queued / gate:reviewing not removed, a label the pool probe refuses, the veto list could not be loaded, the read failed, or no fix-attempt path ran)"
   fi
   warn "Ephemeral-author FAIL for $_bid: $_why — paging the Mayor after all (ga-aijm2v.5)"
   if gc --city "$GC_CITY" mail send mayor \
@@ -8796,8 +8796,9 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         # write above is what tells us the source bead really returns to the pool by itself. The
         # first read (route + assignee) was taken BEFORE `--status open` and `label remove
         # gate:queued`, so it structurally cannot see either — and the pool probe needs both, plus
-        # no gate:reviewing. One more `bd show` closes that: it feeds the VERIFIED decision (all five
-        # probe facts, on a resolved route, on an evaluated fail) AND replaces the two observations
+        # no gate:reviewing. One more `bd show` closes that: it feeds the VERIFIED decision (every fact
+        # the probe applies — the five write-able ones AND the veto labels it refuses — on a resolved
+        # route, on an evaluated fail) AND replaces the two observations
         # that used to be asserted by intent ("status=open", "gate:queued=removed") with what was
         # read. Only when this read comes back clean may the settle step keep the Mayor asleep for
         # an ephemeral author; unread / did-not-stick / guessed route / reviewer-timeout run => 0.

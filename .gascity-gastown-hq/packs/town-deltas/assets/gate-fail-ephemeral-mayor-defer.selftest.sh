@@ -296,6 +296,12 @@ eq "the live load block, with the lib PRESENT, survives set -euo pipefail and pr
 FACTS_BODY="$(extract_fn "$DISPATCHER" gate_fail_pool_read_facts)"; VER_BODY="$(extract_fn "$DISPATCHER" gate_fail_redispatch_verified)"
 OUT="$(bash -c 'eval "$1"; eval "$2"; printf "%s|%s" "$(gate_fail_pool_read_facts "$3" wa-worker)" "$(gate_fail_redispatch_verified "$3" wa-worker 0 0)"' _ "$FACTS_BODY" "$VER_BODY" "$REAL" 2>&1)"
 eq "lib absent: even a perfectly clean bead is 'unread' and NOT verified" "$OUT" "unread|0"
+# ...and the page it produces says the veto list was the unknown (not just "the read failed")
+SETTLE_BODY="$(extract_fn "$DISPATCHER" gate_fail_settle_deferred_mayor_wake)"
+OUT="$(bash -c 'log(){ :; }; warn(){ :; }; gc(){ shift 2; printf "%s" "$*"; }; bd(){ :; }
+  eval "$1"; GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX=ctx; BEAD_ID=wa-x1; GC_CITY=c
+  gate_fail_settle_deferred_mayor_wake' _ "$SETTLE_BODY" 2>&1)"
+case "$OUT" in *"veto list could not be loaded"*) ok "the generic page reason names the unloadable veto list among the unknowns" ;; *) bad "the generic page reason does not mention the veto list: [$OUT]" ;; esac
 rmdir "$NOLIB_DIR" 2>/dev/null || true
 
 echo "== 8. settle: the Mayor is paged at the END of the FAIL path unless the re-dispatch is verified"
