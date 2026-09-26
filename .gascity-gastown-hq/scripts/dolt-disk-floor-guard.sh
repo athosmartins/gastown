@@ -150,13 +150,18 @@
 #                             cycle of an episode — before THAT cycle's reclaim
 #                             levers run, since they delete the very things that grew
 #                             (a CRITICAL photo still comes after the levers of the
-#                             earlier WARN cycles, which run at WARN too) — it
+#                             earlier WARN cycles, which run at WARN too; and
+#                             _reap_growing_logs, which runs at the top of main() on
+#                             EVERY cycle before the photo is taken, can already have
+#                             trimmed a growing capped log under /private/tmp) — it
 #                             photographs one-level `du -sk` under a fixed set of
 #                             roots (the dolt data-dir per database, .dolt-backup,
 #                             ~/shared/data, /private/tmp, DARWIN_USER_TEMP_DIR,
 #                             ~/.claude/projects, every .gc-worktrees, ~/Library/
 #                             Caches) plus vm.swapusage and /System/Volumes/VM plus
-#                             the biggest files currently held open for WRITE, and
+#                             the biggest files currently held open for WRITE (by
+#                             this user's processes only — lsof cannot see a
+#                             root-owned process's files without root), and
 #                             diffs it against a "last OK" baseline photo refreshed
 #                             (rate-limited, nice'd) on class=NONE cycles. Output:
 #                             .gc/logs/disk-growth-<ts>.txt, the top growers in this
@@ -164,14 +169,19 @@
 #                             mail. A root that timed out says PARTIAL, one the scan
 #                             budget never reached says SKIPPED — the diff never
 #                             calls an entry "new" unless the baseline scan of its
-#                             root was complete, an entry measured on both sides is
-#                             still compared inside a PARTIAL root (each du row is a
-#                             whole result), and every root that was not complete on
-#                             both sides also gets a NOT FULLY COMPARED line. macOS has no
-#                             per-process write counter without root, so "who wrote"
-#                             is approximated by "which held-open file grew and which
-#                             pid holds it" (labelled as a proxy everywhere it is
-#                             shown). Own switch: DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED
+#                             root was complete AND du could read all of it, an
+#                             entry measured on both sides is still compared inside a
+#                             PARTIAL root, every root that was not complete on both
+#                             sides also gets a NOT FULLY COMPARED line, and every OK
+#                             root in which du could not read part of the tree (an
+#                             unreadable subdirectory — sizes may undercount, and
+#                             growth inside it is invisible) gets a DU ERRORS line.
+#                             A comparison that could not be made (writers or the VM
+#                             size unmeasured on either side) says so too. macOS has
+#                             no per-process write counter without root, so "who
+#                             wrote" is approximated by "which held-open file grew
+#                             and which pid holds it" (labelled as a proxy everywhere
+#                             it is shown). Own switch: DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED
 #                             (NOT DOLT_DISK_FLOOR_GUARD_ENABLED — nothing here
 #                             deletes or stops anything).
 #
@@ -463,8 +473,10 @@ GROWTH_BASELINE_INTERVAL_SECS="${DOLT_DISK_FLOOR_GROWTH_BASELINE_INTERVAL_SECS:-
 # Per-root bound, and a whole-scan budget. A root that hits its bound keeps the
 # rows that finished (PARTIAL); once the budget is spent the remaining roots are
 # recorded SKIPPED — an explicit "not measured", never a silent zero (ga-p5q3).
-# The episode photo runs BEFORE the reclaim levers (they delete the very things
-# that grew), so the budget bounds the ROOT SCAN's share of any delay to them. It
+# The episode photo runs BEFORE the floor-triggered reclaim levers (they delete the
+# very things that grew), so the budget bounds the ROOT SCAN's share of any delay to
+# them. (_reap_growing_logs is not one of them: it runs every cycle at the top of
+# main(), before the photo.) It
 # is not the whole delay: the /System/Volumes/VM du (<=20s) and the writers lsof
 # (<=30s) sit outside it, so the worst case is budget + ~50s (see _disk_growth_photo).
 GROWTH_ROOT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_ROOT_TIMEOUT_SECS:-60}"
@@ -1100,25 +1112,38 @@ _top_disk_consumers() {
 # HOW: a photo is one-level `du -sk` under a fixed set of roots (_growth_roots).
 # A BASELINE photo is refreshed (rate-limited) on class=NONE cycles — the "last
 # OK" one; the first WARN cycle and the first CRITICAL cycle of an episode each
-# take a fresh photo BEFORE the reclaim levers run and diff it against that
-# baseline. The result lands in $STATE_DIR/disk-growth-<ts>.txt, its top growers
+# take a fresh photo BEFORE the floor-triggered reclaim levers run and diff it
+# against that baseline. The result lands in $STATE_DIR/disk-growth-<ts>.txt, its top growers
 # in the log and in the Mayor CRITICAL mail. Read-only throughout: nothing is
 # deleted or stopped, and only this guard's own state dir is written.
 #
 # PHOTO FILE FORMAT (tab-separated; '#' lines are commentary and ignored by the
 # parser, which is what lets the human report be appended to the same file):
 #   TS <epoch>   AVAIL_GB <n>   VM_SWAP <sysctl text>   VM_DIR_KB <n|unknown>
-#   ROOT <STATUS> <root>        — STATUS: OK | PARTIAL | MISSING | SYMLINK | SKIPPED
+#   ROOT <STATUS> <root> [<N>]  — STATUS: OK | PARTIAL | MISSING | SYMLINK | SKIPPED.
+#                                 N (only when a scan ran) = how many du chunks exited 1,
+#                                 i.e. du could not read part of the tree (an unreadable
+#                                 subdirectory, an entry that vanished mid-scan); "?" =
+#                                 could not be counted. N > 0 leaves STATUS OK — it is
+#                                 routine on /private/tmp and ~/shared/data — but the root's
+#                                 sizes may UNDERCOUNT (du leaves an unreadable subtree out
+#                                 of its parent's row, and prints no row for an unreadable
+#                                 child), so it is reported as DU ERRORS and its baseline no
+#                                 longer supports a "new" claim. An OK root with N absent
+#                                 or garbled is unknown, never a measured 0.
 #   ENT <kb> <path>             — immediate child of the ROOT line above it
 #   WRITERS <ok|unmeasured>     WRITER <mb> <pid> <command> <path>
-# "Unmeasured" is always a STATUS or an absent line, never a 0: a root that timed
-# out keeps the rows that finished and says PARTIAL; one the budget never reached
-# says SKIPPED; the diff refuses to call an entry "new" when the baseline scan of
-# its root was not complete, and lists every root that was not complete on both
-# sides as not fully compared (ga-p5q3: "could not measure" must never read as
-# "did not grow"). An entry with a row in BOTH photos is compared even inside such
-# a root — a du row is a whole result for that entry — so "grown" is claimed there,
-# next to that root's not-fully-compared line.
+# "Unmeasured" is always a STATUS, a count that is not 0, or an absent line, never a
+# 0: a root that timed out keeps the rows that finished and says PARTIAL; one the
+# budget never reached says SKIPPED; the diff refuses to call an entry "new" when
+# the baseline scan of its root was not complete or had du errors ("unmeasured"
+# instead: present now, maybe unreadable then), lists every root that was not
+# complete on both sides as not fully compared, and every OK root with du errors as
+# DU ERRORS (ga-p5q3: "could not measure" must never read as "did not grow"). An
+# entry with a row in BOTH photos is compared even inside a PARTIAL root — a du
+# row is a whole result for that entry — but NOT a guaranteed complete one when du
+# reported errors in that root: growth inside what du could not read is invisible,
+# which is exactly what the DU ERRORS line for that root says.
 
 # _growth_baseline_file / _growth_episode_file → state paths, resolved from
 # $STATE_DIR at call time (see the config block for why).
@@ -1154,36 +1179,53 @@ _growth_roots() {
   } | awk 'NF && !seen[$0]++'
 }
 
-# _growth_scan_root <root> <timeout_secs> → "ROOT<TAB>STATUS<TAB>root" then one
-# "ENT<TAB>kb<TAB>path" per immediate child. Chunked + parallel (`xargs -n 4 -P 3`),
-# NOT one big `du -sk`: du block-buffers its stdout to a pipe, so a timeout-killed
-# single du yields ZERO rows (measured 2026-09-25: ~/Library/Caches hit a 90s
-# bound and returned nothing), whereas chunks that already finished have already
-# flushed and survive the kill. Chunks of 4 keep each du's output under PIPE_BUF
-# (512B on macOS) so two parallel dus cannot interleave mid-line. Symlinked roots
-# are never descended (a symlink into CloudStorage/FUSE could hang the scan).
+# _growth_scan_root <root> <timeout_secs> → "ROOT<TAB>STATUS<TAB>root<TAB>N" then one
+# "ENT<TAB>kb<TAB>path" per immediate child. N = how many du chunks exited 1: du's
+# own "I could not read part of this" (an unreadable subtree, an entry that vanished
+# mid-scan). Such a chunk's rows may EXCLUDE what du could not read — an unreadable
+# subtree is left out of its parent's row, and an unreadable child prints no row at
+# all — so a root with N > 0 is not a complete measurement. It stays STATUS OK
+# anyway, because it is routine (measured 2026-09-25 with this very xargs shape: 1
+# of 46 chunks on /private/tmp, 2 of 115 on ~/shared/data) and demoting it to PARTIAL
+# would forbid every "new" claim on those roots for good; instead the count travels
+# with the root, and _growth_delta / _growth_report show it (DU ERRORS) and stop
+# calling an entry "new" on a baseline that had any. N is absent when no scan ran
+# (MISSING / SYMLINK / SKIPPED / no scratch file). Chunked + parallel
+# (`xargs -n 4 -P 3`), NOT one big `du -sk`: du block-buffers its stdout to a pipe,
+# so a timeout-killed single du yields ZERO rows (measured 2026-09-25: ~/Library/
+# Caches hit a 90s bound and returned nothing), whereas chunks that already finished
+# have already flushed and survive the kill. Chunks of 4 keep a du's whole output
+# inside one stdio buffer (4KB) for any ordinary path length, so it is flushed to the
+# shared scratch file in a single write() and two parallel dus do not split a row
+# between them (the scratch file is a regular file, not a pipe — PIPE_BUF is not the
+# reason). Whatever does not parse as "<kb><TAB>/abs/path" is not guessed at: it is
+# dropped AND counted, and a dropped line makes the root PARTIAL (see below).
+# Symlinked roots are never descended (a symlink into CloudStorage/FUSE could hang
+# the scan).
 _growth_scan_root() {
-  local root="$1" tmo="$2" tmpf markf xrc frc status
+  local root="$1" tmo="$2" tmpf markf errf xrc frc status nerr junk ents
   local -a pst
   # One du chunk, run by xargs (see below for why it is not `du -sk` directly).
-  # $1 = the marker path, the rest = the chunk's paths. du's own status is visible
-  # HERE and nowhere later: 0 = clean, 1 = a routine miss (an unreadable subdir or a
-  # child that vanished mid-scan — the rows du printed are still whole), anything
-  # above 1 (128+n = killed by a signal, 126/127, 255) = this chunk's rows may be
-  # missing, so a marker is left for the caller. Whatever du did, the chunk exits 0,
-  # so a chunk that died does not stop xargs from measuring the chunks after it. The
-  # one exception: if the marker cannot be written, exit 255 makes xargs abort with a
-  # nonzero status, which the caller also reads as PARTIAL — a failure to record a
-  # failure must not read as success.
-  local du_chunk='m=$1; shift; du -sk "$@"; rc=$?; if [ "$rc" -gt 1 ]; then : > "$m" || exit 255; fi; exit 0'
+  # $1 = the marker path, $2 = the error-count path, the rest = the chunk's paths.
+  # du's own status is visible HERE and nowhere later: 0 = clean; 1 = du could not
+  # read part of it — one line is appended to $2 so the caller can COUNT it (the
+  # rows du printed exist, but may leave out what it could not read); anything above
+  # 1 (128+n = killed by a signal, 126/127, 255) = this chunk's rows may be missing
+  # outright, so a marker is left for the caller. Whatever du did, the chunk exits
+  # 0, so a chunk that died does not stop xargs from measuring the chunks after it.
+  # The one exception: if the marker (or the count line) cannot be written, exit 255
+  # makes xargs abort with a nonzero status, which the caller also reads as PARTIAL —
+  # a failure to record a failure must not read as success.
+  local du_chunk='m=$1; e=$2; shift 2; du -sk "$@"; rc=$?; if [ "$rc" -gt 1 ]; then : > "$m" || exit 255; elif [ "$rc" -eq 1 ]; then echo 1 >> "$e" || exit 255; fi; exit 0'
   if [ -L "$root" ]; then printf 'ROOT\tSYMLINK\t%s\n' "$root"; return 0; fi
   if [ ! -d "$root" ]; then printf 'ROOT\tMISSING\t%s\n' "$root"; return 0; fi
   tmpf="$(mktemp "${TMPDIR:-/tmp}/dolt-disk-floor-guard-growth.XXXXXX" 2>/dev/null)" \
     || { printf 'ROOT\tPARTIAL\t%s\n' "$root"; return 0; }
   markf="${tmpf}.abort"
-  rm -f "$markf" 2>/dev/null
+  errf="${tmpf}.err"
+  rm -f "$markf" "$errf" 2>/dev/null
   find "$root" -maxdepth 1 -mindepth 1 -print0 2>/dev/null \
-    | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 /bin/sh -c "$du_chunk" sh "$markf" > "$tmpf" 2>/dev/null
+    | timeout "$tmo" nice -n 10 xargs -0 -n 4 -P 3 /bin/sh -c "$du_chunk" sh "$markf" "$errf" > "$tmpf" 2>/dev/null
   # Both statuses in ONE statement: every later assignment overwrites PIPESTATUS.
   pst=("${PIPESTATUS[@]}")
   frc="${pst[0]}"; xrc="${pst[1]}"
@@ -1197,9 +1239,9 @@ _growth_scan_root() {
   # for the same cases. Reading xargs's status alone therefore cannot separate a
   # complete scan from a truncated one (gate ga-67s6d2), so the wrapper reports du's
   # status itself and exits 0 whatever du did — except when it cannot write its marker
-  # (255). A nonzero xargs status is therefore only xargs/timeout/exec failing (124 =
-  # timeout's own bound; 126/127 cannot exec; 137/143 killed) or that marker-write
-  # abort, all of which mean rows may be missing.
+  # or its count line (255). A nonzero xargs status is therefore only xargs/timeout/
+  # exec failing (124 = timeout's own bound; 126/127 cannot exec; 137/143 killed) or
+  # that record-write abort, all of which mean rows may be missing.
   case "$xrc" in 0) status="OK" ;; *) status="PARTIAL" ;; esac
   # A du chunk that died left a marker (see du_chunk). An if, not `[ -e … ] && …`: an
   # and-list whose test is false returns 1, the shape that dropped a whole photo
@@ -1213,11 +1255,24 @@ _growth_scan_root() {
   # 2026-09-25: rc 0 on every real root this scans, rc 1 on an unlistable one, so
   # this demotes nothing that is routine today.
   [ "$frc" = "0" ] || status="PARTIAL"
-  printf 'ROOT\t%s\t%s\n' "$status" "$root"
-  # Only well-formed "<kb><TAB>/abs/path" rows survive; anything else (a
-  # truncated line, a path with a newline) is dropped rather than guessed at.
-  awk -F'\t' '$1 ~ /^[0-9]+$/ && substr($2,1,1) == "/" { printf "ENT\t%s\t%s\n", $1, $2 }' "$tmpf"
-  rm -f "$tmpf" "$markf" 2>/dev/null
+  # du's "could not read part of it" (exit 1) chunks, counted (see du_chunk). No file
+  # = the wrapper never hit one = a measured 0. A file that exists but cannot be
+  # counted is NOT 0: the count is "?" and the root cannot be called complete.
+  nerr=0
+  if [ -e "$errf" ]; then
+    nerr="$(awk 'END { print NR + 0 }' "$errf" 2>/dev/null)"
+    case "$nerr" in ''|*[!0-9]*) nerr="?"; status="PARTIAL" ;; esac
+  fi
+  # Only well-formed "<kb><TAB>/abs/path" rows survive; anything else (a truncated
+  # line, a path with a newline) is dropped rather than guessed at — but a dropped
+  # line is a row that is missing, so it is COUNTED, and any drop makes the root
+  # PARTIAL (a check that cannot run reads the same as a drop: never as "0 dropped").
+  junk="$(awk -F'\t' '!($1 ~ /^[0-9]+$/ && substr($2, 1, 1) == "/") { n++ } END { print n + 0 }' "$tmpf" 2>/dev/null)"
+  case "$junk" in 0) ;; *) status="PARTIAL" ;; esac
+  ents="$(awk -F'\t' '$1 ~ /^[0-9]+$/ && substr($2, 1, 1) == "/" { printf "ENT\t%s\t%s\n", $1, $2 }' "$tmpf" 2>/dev/null)"
+  printf 'ROOT\t%s\t%s\t%s\n' "$status" "$root" "$nerr"
+  if [ -n "$ents" ]; then printf '%s\n' "$ents"; fi
+  rm -f "$tmpf" "$markf" "$errf" 2>/dev/null
   return 0
 }
 
@@ -1257,7 +1312,11 @@ _lsof_writers_parse() {
 # bytes-written counter without root (powermetrics/fs_usage need it), so this
 # shows who is HOLDING the biggest files open for write right now — it caught a
 # 2.1GB fileproviderd database no scan root covers — not who wrote the most
-# recently. Label it as such wherever it is shown. ~3s measured at load 47.
+# recently. It also sees ONLY this user's processes: lsof run as a non-root uid lists
+# no file held by a root-owned process (measured 2026-09-26 as uid 501: 571 of 756
+# processes visible, 0 of the 115 root-owned), so "nothing >= min is open" means
+# "among this user's processes". Label it as such wherever it is shown. ~3s measured
+# at load 47.
 _top_open_write_files() {
   local n="${1:-10}" min_mb="${2:-$GROWTH_WRITER_MIN_MB}" raw rc
   command -v lsof >/dev/null 2>&1 || return 2
@@ -1337,7 +1396,21 @@ _disk_growth_photo() {
 
 # _growth_delta <baseline> <now> [n] [min_mb] → what GREW between two photos.
 # Output, tab-separated, one record per line:
-#   G <delta_mb> <now_mb> <was_mb|new> <path>   — grew by >= min_mb, largest first, top n
+#   G <delta_mb> <now_mb> <was_mb|new|unmeasured> <path>
+#                                               — grew by >= min_mb, largest first, top n. "new" =
+#                                                 absent from a baseline root that was scanned
+#                                                 completely AND without du errors. "unmeasured" =
+#                                                 absent from a baseline whose scan of that root had
+#                                                 du errors (or an unknown error count): du may simply
+#                                                 not have been able to read it then, so delta_mb is
+#                                                 an UPPER bound, not a measured growth. This is
+#                                                 deliberately over-cautious: a root that ROUTINELY has
+#                                                 du errors (a permission-denied directory under
+#                                                 /private/tmp) reports its new entries this way too,
+#                                                 because the scan does not learn WHICH entry an error
+#                                                 hit (that would mean parsing du's stderr), and a wrong
+#                                                 "new" is exactly the silent failure this rule exists
+#                                                 to prevent. The entry still shows, with its size.
 #   W <delta_mb> <now_mb> <was_mb|absent> <pid> <command> <path>
 #                                               — a file held open for WRITE that grew by >= min_mb
 #                                                 (or was not in the baseline's list), top n; only
@@ -1346,19 +1419,33 @@ _disk_growth_photo() {
 #                                                 it": the growing file plus who holds it open.
 #   V <delta_mb> <now_mb> <was_mb>              — /System/Volumes/VM residency, when both known
 #   U <root> <reason>                           — a root that could NOT be fully compared
+#   E <root> <base_errs> <now_errs>             — a root whose scan was STATUS OK but in which du
+#                                                 could not read part of the tree (the ROOT line's
+#                                                 error count): its sizes may UNDERCOUNT, and growth
+#                                                 inside what du could not read cannot show up in G.
+#                                                 A side is a count, "?" (count unknown), or "n/a"
+#                                                 (that photo's scan was not OK — the U line says why).
 # Only entries present in BOTH photos are compared, plus "new" entries — and
-# "new" is claimed only when the baseline scan of that root was OK (complete): an
-# entry absent from a PARTIAL/SKIPPED baseline root is "not measured then", not
-# "did not exist". A root that is not OK on either side is reported as U (with
-# the reason) so a dive hiding in it reads as "unmeasured", never as "nothing
-# grew". Empty output means no growth >= min_mb AND nothing uncomparable.
-# Reads two files, writes nothing.
+# "new" is claimed only when the baseline scan of that root was OK (complete) and
+# had no du errors: an entry absent from a PARTIAL/SKIPPED baseline root, or from
+# one du could not fully read, is "not measured then", not "did not exist". A root
+# that is not OK on either side is reported as U (with the reason), and one that
+# is OK but had du errors as E, so a dive hiding in it reads as "unmeasured",
+# never as "nothing grew". Empty output means no growth >= min_mb AND nothing
+# uncomparable. Reads two files, writes nothing.
 _growth_delta() {
   local base="$1" now="$2" n="${3:-8}" min_mb="${4:-$GROWTH_MIN_DELTA_MB}" rows
   [ -s "$base" ] && [ -s "$now" ] || return 0
   rows="$(awk -F'\t' -v min_kb="$(( min_mb * 1024 ))" -v min_mb="$min_mb" '
     FNR == 1 { fileno++ }
-    $1 == "ROOT" { root = $3; st[fileno SUBSEP root] = $2; if (!(root in roots)) { roots[root] = 1; order[++nr] = root }; next }
+    $1 == "ROOT" {
+      root = $3; st[fileno SUBSEP root] = $2
+      # du-error count (field 4): a number, or "?" when the field is absent/garbled — a
+      # scan that did not record it is unknown, never a measured 0
+      er[fileno SUBSEP root] = ($4 ~ /^[0-9]+$/ ? $4 : "?")
+      if (!(root in roots)) { roots[root] = 1; order[++nr] = root }
+      next
+    }
     $1 == "ENT"  { kb[fileno SUBSEP root SUBSEP $3] = $2; if (fileno == 2) { nowkeys[++nn] = root SUBSEP $3 }; next }
     $1 == "VM_DIR_KB" { vm[fileno] = $2; next }
     $1 == "WRITERS" { wst[fileno] = $2; next }
@@ -1373,7 +1460,7 @@ _growth_delta() {
         if (st[1 SUBSEP r] == "" || st[2 SUBSEP r] == "") continue        # root not in both photos
         cur = kb[2 SUBSEP key]
         if ((1 SUBSEP key) in kb) { was = kb[1 SUBSEP key]; wtxt = int(was / 1024) }
-        else if (st[1 SUBSEP r] == "OK") { was = 0; wtxt = "new" }
+        else if (st[1 SUBSEP r] == "OK") { was = 0; wtxt = (er[1 SUBSEP r] == "0" ? "new" : "unmeasured") }
         else continue                                                      # absent from an incomplete baseline
         d = cur - was
         if (d > 0 && d >= min_kb) printf "G\t%d\t%d\t%s\t%s\n", int(d / 1024), int(cur / 1024), wtxt, p
@@ -1382,6 +1469,8 @@ _growth_delta() {
         r = order[i]; b = st[1 SUBSEP r]; c = st[2 SUBSEP r]
         if (b == "" && c == "") continue
         if (b != "OK" || c != "OK") printf "U\t%s\tbaseline=%s now=%s\n", r, (b == "" ? "absent" : b), (c == "" ? "absent" : c)
+        be = (b == "OK" ? er[1 SUBSEP r] : "n/a"); ce = (c == "OK" ? er[2 SUBSEP r] : "n/a")
+        if ((b == "OK" && be != "0") || (c == "OK" && ce != "0")) printf "E\t%s\t%s\t%s\n", r, be, ce
       }
       if (wst[1] == "ok" && wst[2] == "ok") {
         for (i = 1; i <= wn; i++) {
@@ -1399,7 +1488,7 @@ _growth_delta() {
   [ -z "$rows" ] && return 0
   printf '%s\n' "$rows" | awk -F'\t' '$1 == "G"' | sort -t"$(printf '\t')" -k2,2nr | head -n "$n"
   printf '%s\n' "$rows" | awk -F'\t' '$1 == "W"' | sort -t"$(printf '\t')" -k2,2nr | head -n "$n"
-  printf '%s\n' "$rows" | awk -F'\t' '$1 == "V" || $1 == "U"'
+  printf '%s\n' "$rows" | awk -F'\t' '$1 == "V" || $1 == "U" || $1 == "E"'
 }
 
 # _growth_report <baseline> <now> → the human text for a finished photo. With a
@@ -1408,12 +1497,22 @@ _growth_delta() {
 # (the guard has not yet seen an OK cycle): says so and falls back to the biggest
 # entries by absolute size, which is still more than "avail=" ever gave.
 _growth_report() {
-  local base="$1" now="$2" delta bts nts age g w v u
+  local base="$1" now="$2" delta bts nts age g w v u e bw nw bv nv miss
+  # A photo that is missing or empty measured nothing: say that, never "no growth".
+  if [ ! -s "$now" ]; then
+    echo "The photo file is missing or empty — nothing was measured, so no growth can be reported."
+    return 0
+  fi
   nts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$now" 2>/dev/null)"
   if [ ! -s "$base" ]; then
     echo "No baseline photo yet (this guard has not completed an OK cycle since the baseline was introduced) — cannot compute growth."
     echo "Largest entries by absolute size in this photo (MB path):"
     awk -F'\t' '$1 == "ENT" { printf "%d\t%s\n", $2 / 1024, $3 }' "$now" | sort -t"$(printf '\t')" -k1,1nr | head -n "$GROWTH_TOP_N" | awk -F'\t' '{ printf "  %s %s\n", $1, $2 }'
+    u="$(_growth_photo_caveats "$now")"
+    if [ -n "$u" ]; then
+      echo "That list is INCOMPLETE — this photo did not measure everything:"
+      printf '%s\n' "$u"
+    fi
     return 0
   fi
   bts="$(awk -F'\t' '$1 == "TS" { print $2; exit }' "$base" 2>/dev/null)"
@@ -1423,18 +1522,64 @@ _growth_report() {
   esac
   echo "Growth since the last OK photo (${age}; entries that grew >= ${GROWTH_MIN_DELTA_MB}MB, MB path):"
   delta="$(_growth_delta "$base" "$now" "$GROWTH_TOP_N" "$GROWTH_MIN_DELTA_MB")"
-  g="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "G" { printf "  +%sMB  %s  (now %sMB, was %s%s)\n", $2, $5, $3, $4, ($4 == "new" ? "" : "MB") }')"
-  if [ -n "$g" ]; then printf '%s\n' "$g"; else echo "  (none in the roots that could be compared — the growth is outside them, in VM, or in an unmeasured root below)"; fi
+  g="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "G" {
+    if ($4 == "unmeasured") printf "  up to +%sMB  %s  (now %sMB; not in the baseline, whose scan of this root could not read everything — it may not be new)\n", $2, $5, $3
+    else printf "  +%sMB  %s  (now %sMB, was %s%s)\n", $2, $5, $3, $4, ($4 == "new" ? "" : "MB")
+  }')"
+  u="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "U" { printf "  NOT FULLY COMPARED: %s (%s)\n", $2, $3 }')"
+  e="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "E" { printf "  DU ERRORS: %s — du could not read part of it (du chunks affected: baseline=%s now=%s), so its sizes may UNDERCOUNT and growth inside what du could not read cannot show up above\n", $2, $3, $4 }')"
+  if [ -n "$g" ]; then
+    printf '%s\n' "$g"
+  elif [ -n "$u" ] || [ -n "$e" ]; then
+    echo "  (none in what could be measured — the growth may be inside the roots listed below as NOT FULLY COMPARED or with DU ERRORS)"
+  else
+    echo "  (none in the roots that could be compared — the growth is outside them, e.g. in VM or in a directory no root covers)"
+  fi
   w="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "W" { printf "  +%sMB  pid=%s %s  %s  (now %sMB, was %s)\n", $2, $5, $6, $7, $3, ($4 == "absent" ? "not in the baseline open-for-write list" : $4 "MB") }')"
   if [ -n "$w" ]; then
     echo "Files held open for WRITE that grew (or appeared) since the baseline — the process holding one is the prime suspect:"
     printf '%s\n' "$w"
   fi
   v="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "V" { printf "  /System/Volumes/VM: %sMB now, %+dMB vs baseline (%sMB)\n", $3, $2, $4 }')"
-  [ -n "$v" ] && printf '%s\n' "$v"
-  u="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "U" { printf "  NOT FULLY COMPARED: %s (%s)\n", $2, $3 }')"
-  [ -n "$u" ] && printf '%s\n' "$u"
+  if [ -n "$v" ]; then printf '%s\n' "$v"; fi
+  # A comparison that could not be made says so: its ABSENCE from this report must
+  # never read as "that did not grow". The delta stays silent on both (it only emits
+  # what it could compare), so they are read straight from the two photos here.
+  bw="$(awk -F'\t' '$1 == "WRITERS" { print $2; exit }' "$base" 2>/dev/null)"
+  nw="$(awk -F'\t' '$1 == "WRITERS" { print $2; exit }' "$now" 2>/dev/null)"
+  miss=""
+  if [ "$bw" != "ok" ]; then miss="the baseline"; fi
+  if [ "$nw" != "ok" ]; then miss="${miss:+$miss and }this photo"; fi
+  if [ -n "$miss" ]; then
+    echo "  (open-for-write comparison NOT made: writers were not measured in ${miss} — a growing held-open file cannot be named here)"
+  fi
+  bv="$(awk -F'\t' '$1 == "VM_DIR_KB" { print $2; exit }' "$base" 2>/dev/null)"
+  nv="$(awk -F'\t' '$1 == "VM_DIR_KB" { print $2; exit }' "$now" 2>/dev/null)"
+  miss=""
+  case "$bv" in ''|*[!0-9]*) miss="the baseline" ;; esac
+  case "$nv" in ''|*[!0-9]*) miss="${miss:+$miss and }this photo" ;; esac
+  if [ -n "$miss" ]; then
+    echo "  (VM size comparison NOT made: the size of /System/Volumes/VM was unknown in ${miss})"
+  fi
+  if [ -n "$u" ]; then printf '%s\n' "$u"; fi
+  if [ -n "$e" ]; then printf '%s\n' "$e"; fi
   return 0
+}
+
+# _growth_photo_caveats <photo> → report lines for every root of ONE photo that the
+# scan did not measure completely: a status other than OK (PARTIAL / SKIPPED /
+# MISSING / SYMLINK), or an OK scan in which du could not read part of the tree (the
+# ROOT line's error count; absent or garbled = unknown, which is not 0). Used where
+# there is no baseline to diff against — a list of "largest entries" that said
+# nothing about what it could not see would read as the whole picture. Prints
+# nothing only when every root was measured completely.
+_growth_photo_caveats() {
+  awk -F'\t' '
+    $1 == "ROOT" && $2 != "OK" { printf "  NOT FULLY MEASURED: %s (%s)\n", $3, $2 }
+    $1 == "ROOT" && $2 == "OK" && $4 != "0" {
+      printf "  DU ERRORS: %s (%s)\n", $3, ($4 ~ /^[0-9]+$/ ? $4 " du chunk(s) could not read part of it — sizes may undercount" : "du error count unknown — sizes may undercount")
+    }
+  ' "$1" 2>/dev/null
 }
 
 # _growth_baseline_due <baseline_file> <now> <interval_secs> → 0 when a baseline
@@ -1601,15 +1746,15 @@ _growth_prune_photos() {
 _growth_writers_text() {
   local f="$1" st
   st="$(awk -F'\t' '$1 == "WRITERS" { print $2; exit }' "$f" 2>/dev/null)"
-  echo "Largest files held open for WRITE right now (proxy — macOS gives no per-process write counter without root; this is who HOLDS big files open, not who wrote most recently):"
+  echo "Largest files held open for WRITE right now by THIS user's processes (proxy — macOS gives no per-process write counter without root, and lsof run as this user lists NO file held by a root-owned process, so a root-owned writer would not appear here; this is who HOLDS big files open among the processes it can see, not who wrote most recently):"
   case "$st" in
     ok)
       if awk -F'\t' '$1 == "WRITER" { found = 1 } END { exit !found }' "$f" 2>/dev/null; then
         awk -F'\t' '$1 == "WRITER" { printf "  %sMB  pid=%s %s  %s\n", $2, $3, $4, $5 }' "$f"
       else
-        echo "  (none >= ${GROWTH_WRITER_MIN_MB}MB)"
+        echo "  (none >= ${GROWTH_WRITER_MIN_MB}MB among this user's processes; root-owned ones are not visible)"
       fi ;;
-    *) echo "  (unmeasured — lsof failed or timed out)" ;;
+    *) echo "  (unmeasured — lsof failed or timed out, or the writers were not requested for this photo)" ;;
   esac
 }
 
@@ -1625,7 +1770,15 @@ _growth_baseline_refresh() {
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   t0=$SECONDS
   if _growth_roots | _disk_growth_photo "$f" writers; then
-    notok="$(awk -F'\t' '$1 == "ROOT" && $2 != "OK" && $2 != "MISSING" { printf "%s(%s) ", $3, $2 }' "$f" 2>/dev/null)"
+    # Every root that was not measured completely — INCLUDING a MISSING one and an OK
+    # one in which du could not read part of the tree — so this line says what the
+    # report will later say about the same photo (a MISSING root is listed by the
+    # report's NOT FULLY COMPARED, and by the no-baseline report's NOT FULLY MEASURED,
+    # so hiding it here would make the log the one place that calls it benign).
+    notok="$(awk -F'\t' '
+      $1 == "ROOT" && $2 != "OK" { printf "%s(%s) ", $3, $2 }
+      $1 == "ROOT" && $2 == "OK" && $4 != "0" { printf "%s(OK, du errors: %s) ", $3, ($4 ~ /^[0-9]+$/ ? $4 : "unknown") }
+    ' "$f" 2>/dev/null)"
     log "growth baseline photo refreshed ($(( SECONDS - t0 ))s; roots not fully measured: ${notok:-none}) (ga-ond0fa)"
   else
     log "WARN: growth baseline photo could not be written to ${f} — keeping the previous baseline (ga-ond0fa)"
@@ -1636,9 +1789,11 @@ _growth_baseline_refresh() {
 # _growth_episode_photo <class> <avail> → on the first WARN cycle and again
 # on the first CRITICAL cycle of an episode (_growth_should_photo), photograph the
 # growth roots and write $STATE_DIR/disk-growth-<stamp>.txt with the diff against
-# the baseline. MUST be called BEFORE the reclaim levers: they delete scratch,
-# caches and orphans, which are exactly the things a growth photo should still be
-# able to see. The top growers are also logged. The episode is only marked as
+# the baseline. MUST be called BEFORE the floor-triggered reclaim levers (_safe_reclaim
+# and everything after it in main()): they delete scratch, caches and orphans, which
+# are exactly the things a growth photo should still be able to see. The one
+# exception is _reap_growing_logs, which runs every cycle at the top of main() and so
+# has already run — a capped log that grew under /private/tmp may already be trimmed. The top growers are also logged. The episode is only marked as
 # photographed once the file actually landed, so a failed write is retried.
 _growth_episode_photo() {
   local class="$1" avail="$2" level stamp file base report t0 l budget
@@ -1651,7 +1806,7 @@ _growth_episode_photo() {
   base="$(_growth_baseline_file)"
   budget="$GROWTH_TOTAL_BUDGET_SECS"
   [ "$class" = "CRITICAL" ] && budget="$GROWTH_CRITICAL_BUDGET_SECS"
-  log "disk-growth photo (ga-ond0fa): class=${class} avail=${avail}GB — photographing the growth roots BEFORE the reclaim levers run (scan budget ${budget}s)"
+  log "disk-growth photo (ga-ond0fa): class=${class} avail=${avail}GB — photographing the growth roots BEFORE the floor-triggered reclaim levers run (scan budget ${budget}s)"
   t0=$SECONDS
   if ! _growth_roots | _disk_growth_photo "$file" writers "$budget"; then
     log "WARN: disk-growth photo could not be written to ${file} — will retry next cycle (ga-ond0fa)"

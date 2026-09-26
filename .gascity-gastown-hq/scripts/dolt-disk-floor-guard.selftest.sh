@@ -1172,9 +1172,9 @@ GROWTH_MIN_DELTA_MB_ORIG="$GROWTH_MIN_DELTA_MB"
 GR="$GROW_TMP/root1"; mkdir -p "$GR/big" "$GR/small1" "$GR/small2"
 head -c 5242880 /dev/zero > "$GR/big/payload"; echo x > "$GR/small1/f"; echo x > "$GR/small2/f"
 scan_out="$(_growth_scan_root "$GR" 30)"
-[ "$(printf '%s\n' "$scan_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR" ] \
-  && ok "_growth_scan_root: a fully scanned root is STATUS OK" \
-  || bad "_growth_scan_root: expected 'ROOT OK $GR' first, got: $(printf '%s' "$scan_out" | head -1)"
+[ "$(printf '%s\n' "$scan_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR${TAB}0" ] \
+  && ok "_growth_scan_root: a fully scanned root is STATUS OK with a MEASURED du-error count of 0 (the 4th field is always present after a scan)" \
+  || bad "_growth_scan_root: expected 'ROOT OK $GR 0' first, got: $(printf '%s' "$scan_out" | head -1)"
 big_kb="$(printf '%s\n' "$scan_out" | awk -F'\t' -v p="$GR/big" '$1 == "ENT" && $3 == p { print $2 }')"
 case "$big_kb" in
   ''|*[!0-9]*) bad "_growth_scan_root: no ENT row for the 5MB child (got '$big_kb')" ;;
@@ -1184,9 +1184,15 @@ esac
   && ok "_growth_scan_root: exactly the 3 immediate children, one ENT each" \
   || bad "_growth_scan_root: expected 3 ENT rows, got $(printf '%s\n' "$scan_out" | grep -c '^ENT')"
 
-# ── _growth_scan_root: BSD xargs exits 1 when ANY du chunk errors (measured
-#    live) — that routine case must stay OK, not PARTIAL. A fake du that fails
-#    on one argument reproduces it without needing an unreadable directory. ─────
+# ── _growth_scan_root: a du chunk that exits 1 ("could not read part of it") stays
+#    STATUS OK — that is routine on /private/tmp and ~/shared/data (BSD xargs exits 1
+#    for it), and demoting it to PARTIAL would forbid every "new" claim there for good
+#    — but it is COUNTED on the ROOT line. It used to be thrown away on the theory that
+#    "the rows du printed are still whole". They are not: du leaves an unreadable
+#    subtree out of its parent's row and prints no row for an unreadable child, so a
+#    root du could not fully read read as a complete measurement (gate ga-7sxd8n). A
+#    fake du that fails every chunk reproduces the STATUS without needing an unreadable
+#    directory; the REAL-du cases are further down. ────────────────────────────────────
 STUBBIN="$GROW_TMP/stubbin"; mkdir -p "$STUBBIN"
 cat > "$STUBBIN/du" <<'STUBEOF'
 #!/bin/bash
@@ -1196,9 +1202,33 @@ exit 1
 STUBEOF
 chmod +x "$STUBBIN/du"
 routine_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GR" 30)"
-[ "$(printf '%s\n' "$routine_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR" ] \
-  && ok "_growth_scan_root: du chunks exiting nonzero (permission errors — routine) still yield STATUS OK, rows kept" \
-  || bad "_growth_scan_root: a nonzero du exit must not demote the root — got: $(printf '%s' "$routine_out" | head -1)"
+[ "$(printf '%s\n' "$routine_out" | head -1)" = "ROOT${TAB}OK${TAB}$GR${TAB}1" ] \
+  && ok "_growth_scan_root: a du chunk exiting 1 (unreadable/vanished entries — routine) keeps STATUS OK but is COUNTED (3 entries = 1 chunk -> 1), not silently 'complete'" \
+  || bad "_growth_scan_root: a du chunk exiting 1 must read 'ROOT OK $GR 1' — got: $(printf '%s' "$routine_out" | head -1)"
+[ "$(printf '%s\n' "$routine_out" | grep -c '^ENT')" = "3" ] \
+  && ok "_growth_scan_root: the rows a du-error chunk did print are kept" \
+  || bad "_growth_scan_root: a du-error chunk's rows were dropped ($(printf '%s\n' "$routine_out" | grep -c '^ENT') of 3)"
+# counted PER CHUNK: 12 entries = 3 chunks of 4, and every one exits 1
+GKC="$GROW_TMP/rootcount"; mkdir -p "$GKC"
+for i in $(seq 1 12); do mkdir -p "$GKC/e$i"; done
+cnt3_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GKC" 30)"
+[ "$(printf '%s\n' "$cnt3_out" | head -1)" = "ROOT${TAB}OK${TAB}$GKC${TAB}3" ] \
+  && ok "_growth_scan_root: the du-error count is per chunk (12 entries = 3 chunks, all exit 1 -> 3)" \
+  || bad "_growth_scan_root: expected 'ROOT OK $GKC 3', got: $(printf '%s' "$cnt3_out" | head -1)"
+# only the chunk that hit an error is counted: this du exits 1 only for a chunk holding e5
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+rc=0
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; case "$a" in */e5) rc=1 ;; esac; done
+exit $rc
+STUBEOF
+chmod +x "$STUBBIN/du"
+cnt1_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GKC" 30)"
+if [ "$(printf '%s\n' "$cnt1_out" | head -1)" = "ROOT${TAB}OK${TAB}$GKC${TAB}1" ] && [ "$(printf '%s\n' "$cnt1_out" | grep -c '^ENT')" = "12" ]; then
+  ok "_growth_scan_root: clean chunks are not counted — exactly the one chunk that hit an error is (1 of 3), and all 12 rows are kept"
+else
+  bad "_growth_scan_root: expected 'ROOT OK $GKC 1' with 12 rows, got: $(printf '%s' "$cnt1_out" | head -1) / $(printf '%s\n' "$cnt1_out" | grep -c '^ENT') rows"
+fi
 
 # ── _growth_scan_root: a du chunk that DIED is PARTIAL, never OK (gate ga-67s6d2).
 #    BSD xargs exits 1 for "a du chunk exited 1" (the routine case just above) AND
@@ -1222,9 +1252,13 @@ chmod +x "$STUBBIN/du"
 # a private TMPDIR: the leftover check below must not see a live guard's own scan file
 SCAN_TMP="$GROW_TMP/scantmp"; mkdir -p "$SCAN_TMP"
 dead_out="$(TMPDIR="$SCAN_TMP" PATH="$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
-[ "$(printf '%s\n' "$dead_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+[ "$(printf '%s\n' "$dead_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
   && ok "_growth_scan_root: a du chunk killed by a signal makes the root PARTIAL — not 'ROOT OK' with a truncated scan" \
   || bad "_growth_scan_root: a killed du chunk must read PARTIAL, got: $(printf '%s' "$dead_out" | head -1)"
+# the routine chunks around the dead one are still counted: 10 chunks, 1 dead -> 9 exited 1
+[ "$(printf '%s\n' "$dead_out" | head -1 | cut -f4)" = "9" ] \
+  && ok "_growth_scan_root: a PARTIAL root still carries its du-error count (9 of 10 chunks exited 1, 1 died)" \
+  || bad "_growth_scan_root: a PARTIAL root lost its du-error count, got field 4 = '$(printf '%s\n' "$dead_out" | head -1 | cut -f4)'"
 dead_rows="$(printf '%s\n' "$dead_out" | grep -c '^ENT')"
 [ "$dead_rows" = "36" ] \
   && ok "_growth_scan_root: the dead chunk costs exactly its own 4 rows — the chunks queued behind it were still measured (36 of 40)" \
@@ -1236,7 +1270,7 @@ esac
 # the other abort path xargs reports identically: a chunk that exits 255
 sed -i.bak 's#kill -9 \$\$#exit 255#' "$STUBBIN/du"; rm -f "$STUBBIN/du.bak"
 dead255_out="$(TMPDIR="$SCAN_TMP" PATH="$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
-[ "$(printf '%s\n' "$dead255_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+[ "$(printf '%s\n' "$dead255_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
   && ok "_growth_scan_root: a du chunk exiting 255 (xargs 'exited with status 255; aborting') makes the root PARTIAL" \
   || bad "_growth_scan_root: a 255 du chunk must read PARTIAL, got: $(printf '%s' "$dead255_out" | head -1)"
 # nothing left behind: the scan's temp file and its marker are both removed (after
@@ -1260,10 +1294,24 @@ f="$MARKDIR/growth.tmp"; : > "$f"; chmod 555 "$MARKDIR"; printf '%s\n' "$f"
 STUBEOF
   chmod +x "$MKBIN/mktemp"
   nomark_out="$(MARKDIR="$MKDIR" PATH="$MKBIN:$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
-  chmod 755 "$MKDIR" "$MKDIR/probe"; rm -f "$MKDIR/growth.tmp" "$MKDIR/growth.tmp.abort"
-  [ "$(printf '%s\n' "$nomark_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+  chmod 755 "$MKDIR" "$MKDIR/probe"; rm -f "$MKDIR/growth.tmp" "$MKDIR/growth.tmp.abort" "$MKDIR/growth.tmp.err"
+  [ "$(printf '%s\n' "$nomark_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
     && ok "_growth_scan_root: a dead chunk whose marker cannot be written still reads PARTIAL (the chunk exits 255 and xargs aborts)" \
     || bad "_growth_scan_root: an unrecordable dead chunk must read PARTIAL, got: $(printf '%s' "$nomark_out" | head -1)"
+  # ...and the same for the ROUTINE status: a du that exits 1 leaves a count line, and if THAT
+  # cannot be written the chunk exits 255 -> PARTIAL, not a silent "0 du errors" (a failure to
+  # record a failure must not read as success, for the routine failure too)
+  cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+exit 1
+STUBEOF
+  chmod +x "$STUBBIN/du"
+  nocount_out="$(MARKDIR="$MKDIR" PATH="$MKBIN:$STUBBIN:$PATH" _growth_scan_root "$GK" 30)"
+  chmod 755 "$MKDIR" "$MKDIR/probe"; rm -f "$MKDIR/growth.tmp" "$MKDIR/growth.tmp.abort" "$MKDIR/growth.tmp.err"
+  [ "$(printf '%s\n' "$nocount_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GK" ] \
+    && ok "_growth_scan_root: a du-error chunk whose count line cannot be written reads PARTIAL — never 'ROOT OK ... 0'" \
+    || bad "_growth_scan_root: an unrecordable du-error count must read PARTIAL, got: $(printf '%s' "$nocount_out" | head -1)"
 fi
 chmod 755 "$MKDIR/probe" "$MKDIR" 2>/dev/null
 
@@ -1290,7 +1338,7 @@ chmod +x "$STUBBIN/du"    # own exec bit: a non-executable stub is skipped by PA
 GP="$GROW_TMP/rootpart"; mkdir -p "$GP/slow1"      # the one entry whose name matches *slow*: the fake du hangs on any chunk holding it
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do mkdir -p "$GP/fast$i"; done
 part_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GP" 3)"
-[ "$(printf '%s\n' "$part_out" | head -1)" = "ROOT${TAB}PARTIAL${TAB}$GP" ] \
+[ "$(printf '%s\n' "$part_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GP" ] \
   && ok "_growth_scan_root: a root that hits its timeout is PARTIAL, never OK" \
   || bad "_growth_scan_root: timed-out root should be PARTIAL, got: $(printf '%s' "$part_out" | head -1)"
 part_rows="$(printf '%s\n' "$part_out" | grep -c '^ENT')"
@@ -1312,7 +1360,7 @@ STUBFIND="$GROW_TMP/stubfind"; mkdir -p "$STUBFIND"
 printf '#!/bin/bash\nexit 1\n' > "$STUBFIND/find"; chmod +x "$STUBFIND/find"
 GU="$GROW_TMP/rootunlist"; mkdir -p "$GU"; echo x > "$GU/child"
 unl_out="$(PATH="$STUBFIND:$PATH" _growth_scan_root "$GU" 10)"
-[ "$unl_out" = "ROOT${TAB}PARTIAL${TAB}$GU" ] \
+[ "$unl_out" = "ROOT${TAB}PARTIAL${TAB}$GU${TAB}0" ] \
   && ok "_growth_scan_root: a root find could not list is PARTIAL with zero ENT rows — not an empty OK" \
   || bad "_growth_scan_root: unlistable root must read PARTIAL, got: $(printf '%s' "$unl_out" | tr '\n' '|')"
 GC0="$GROW_TMP/rootchmod0"; mkdir -p "$GC0/child"; echo x > "$GC0/child/f"; chmod 000 "$GC0"
@@ -1321,16 +1369,129 @@ if find "$GC0" -maxdepth 1 -mindepth 1 -print0 >/dev/null 2>&1; then
   echo "  SKIP: chmod 000 does not stop find here (running as root?) — the stub-find case above covers the logic"
 else
   chmod0_out="$(_growth_scan_root "$GC0" 10)"; chmod 755 "$GC0"
-  [ "$chmod0_out" = "ROOT${TAB}PARTIAL${TAB}$GC0" ] \
+  [ "$chmod0_out" = "ROOT${TAB}PARTIAL${TAB}$GC0${TAB}0" ] \
     && ok "_growth_scan_root: a real chmod-000 root (the gate reviewer's repro) is PARTIAL, not 'ROOT OK' with zero rows" \
     || bad "_growth_scan_root: chmod-000 root must read PARTIAL, got: $(printf '%s' "$chmod0_out" | tr '\n' '|')"
 fi
 chmod 755 "$GC0" 2>/dev/null
 # the guard against over-demotion: an EMPTY but perfectly listable root stays OK (find rc 0)
 GEM="$GROW_TMP/rootempty"; mkdir -p "$GEM"
-[ "$(_growth_scan_root "$GEM" 10)" = "ROOT${TAB}OK${TAB}$GEM" ] \
+[ "$(_growth_scan_root "$GEM" 10)" = "ROOT${TAB}OK${TAB}$GEM${TAB}0" ] \
   && ok "_growth_scan_root: an EMPTY listable root is still ROOT OK with no rows — reading find's status must not demote the routine case" \
   || bad "_growth_scan_root: empty listable root should be OK, got: $(_growth_scan_root "$GEM" 10 | tr '\n' '|')"
+
+# ── _growth_scan_root: a du line that does not parse is a row that is MISSING — it is
+#    dropped AND it makes the root PARTIAL. It used to be dropped silently with the root
+#    still OK ("dropped rather than guessed at" — but nobody was told). ────────────────
+GJ="$GROW_TMP/rootjunk"; mkdir -p "$GJ/a" "$GJ/b" "$GJ/c"
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+printf 'not-a-du-row\n'
+STUBEOF
+chmod +x "$STUBBIN/du"
+junk_out="$(PATH="$STUBBIN:$PATH" _growth_scan_root "$GJ" 30)"
+if [ "$(printf '%s\n' "$junk_out" | head -1 | cut -f1-3)" = "ROOT${TAB}PARTIAL${TAB}$GJ" ]; then
+  ok "_growth_scan_root: du output that does not parse as a row makes the root PARTIAL — a dropped row is not 'ROOT OK'"
+else
+  bad "_growth_scan_root: an unparseable du line must make the root PARTIAL, got: $(printf '%s' "$junk_out" | head -1)"
+fi
+if [ "$(printf '%s\n' "$junk_out" | grep -c '^ENT')" = "3" ] && ! printf '%s\n' "$junk_out" | grep -q 'not-a-du-row'; then
+  ok "_growth_scan_root: the parseable rows survive and the garbage is not turned into an entry"
+else
+  bad "_growth_scan_root: junk handling wrong: $(printf '%s' "$junk_out" | tr '\n' '|')"
+fi
+rm -f "$STUBBIN/du"
+
+# ── _growth_scan_root on REAL du with an unreadable subtree — the gate reviewer's repro
+#    (ga-7sxd8n). du leaves the unreadable subtree OUT of its parent's row (1MB visible +
+#    8MB in a chmod-000 subdir -> a 1024KB row) and exits 1; that read 'ROOT OK' with
+#    nothing to say the row undercounts. ───────────────────────────────────────────────
+GU2="$GROW_TMP/rootunread"; mkdir -p "$GU2/vis/locked" "$GU2/other"
+head -c 1048576 /dev/zero > "$GU2/vis/visible.bin"; head -c 8388608 /dev/zero > "$GU2/vis/locked/hidden.bin"; echo x > "$GU2/other/f"
+chmod 000 "$GU2/vis/locked"
+if du -sk "$GU2/vis" >/dev/null 2>&1; then
+  chmod 700 "$GU2/vis/locked"
+  echo "  SKIP: chmod 000 does not stop du here (running as root?) — the stub-du cases above cover the counting logic"
+else
+  unr_out="$(_growth_scan_root "$GU2" 30)"
+  if [ "$(printf '%s\n' "$unr_out" | head -1)" = "ROOT${TAB}OK${TAB}$GU2${TAB}1" ]; then
+    ok "_growth_scan_root: REAL du with an unreadable subtree stays STATUS OK but carries a du-error count of 1"
+  else
+    bad "_growth_scan_root: real du + an unreadable subtree should read 'ROOT OK $GU2 1', got: $(printf '%s' "$unr_out" | head -1)"
+  fi
+  vis_kb="$(printf '%s\n' "$unr_out" | awk -F'\t' -v p="$GU2/vis" '$1 == "ENT" && $3 == p { print $2 }')"
+  case "$vis_kb" in
+    ''|*[!0-9]*) bad "_growth_scan_root: no row for vis (got '$vis_kb')" ;;
+    *) if [ "$vis_kb" -lt 4096 ]; then ok "_growth_scan_root: the vis row (${vis_kb}KB) EXCLUDES the 8MB in the unreadable subtree — the undercount the count exists to flag"; else bad "_growth_scan_root: expected vis to exclude the unreadable 8MB, got ${vis_kb}KB"; fi ;;
+  esac
+  chmod 700 "$GU2/vis/locked"
+fi
+chmod 700 "$GU2/vis/locked" 2>/dev/null
+
+# ── end to end, the reviewer's repro through the REAL photo + delta + report: 60MB is
+#    written INSIDE an unreadable subtree of a scanned root. Both photos read the same
+#    row for it (du cannot see in), so nothing "grew" — and the report must not answer
+#    "the growth is outside the roots". It must name the root as DU ERRORS. ─────────────
+GE2="$GROW_TMP/roothidden"; mkdir -p "$GE2/vis/locked" "$GE2/other"
+head -c 1048576 /dev/zero > "$GE2/vis/visible.bin"; head -c 8388608 /dev/zero > "$GE2/vis/locked/hidden.bin"; echo x > "$GE2/other/f"
+chmod 000 "$GE2/vis/locked"
+if du -sk "$GE2/vis" >/dev/null 2>&1; then
+  chmod 700 "$GE2/vis/locked"
+  echo "  SKIP: chmod 000 does not stop du here (running as root?) — the handcrafted-photo cases below cover the delta/report logic"
+else
+  printf '%s\n' "$GE2" | _disk_growth_photo "$GROW_TMP/hid-base.txt"
+  chmod 700 "$GE2/vis/locked"; head -c 62914560 /dev/zero > "$GE2/vis/locked/grown.bin"; chmod 000 "$GE2/vis/locked"
+  printf '%s\n' "$GE2" | _disk_growth_photo "$GROW_TMP/hid-now.txt"
+  hid_delta="$(_growth_delta "$GROW_TMP/hid-base.txt" "$GROW_TMP/hid-now.txt" 8 1)"
+  if printf '%s\n' "$hid_delta" | grep -q "^E${TAB}$GE2${TAB}1${TAB}1\$" && ! printf '%s\n' "$hid_delta" | grep -q '^G'; then
+    ok "_growth_delta: 60MB written inside an unreadable subtree is invisible to G — and the root is reported E (du errors baseline=1 now=1), not left silent"
+  else
+    bad "_growth_delta: the hidden-growth root must be reported as E with no G line, got: $(printf '%s' "$hid_delta" | tr '\n' '|')"
+  fi
+  GROWTH_MIN_DELTA_MB=1
+  hid_rep="$(_growth_report "$GROW_TMP/hid-base.txt" "$GROW_TMP/hid-now.txt")"
+  GROWTH_MIN_DELTA_MB="$GROWTH_MIN_DELTA_MB_ORIG"
+  case "$hid_rep" in
+    *"none in the roots that could be compared"*) bad "_growth_report: with du errors in the only root it must NOT say the growth is outside the roots: $(printf '%s' "$hid_rep" | head -c 400)" ;;
+    *"DU ERRORS: $GE2"*"UNDERCOUNT"*) ok "_growth_report: names the root as DU ERRORS (sizes may undercount) instead of pointing the reader away from it" ;;
+    *) bad "_growth_report: the du-error root was not reported: $(printf '%s' "$hid_rep" | head -c 400)" ;;
+  esac
+  chmod 700 "$GE2/vis/locked"
+fi
+chmod 700 "$GE2/vis/locked" 2>/dev/null
+
+# ── an entry a baseline scan could not READ must not later be called "new". A directly
+#    unreadable child prints NO row, so once it becomes readable it is "present now,
+#    absent then" — indistinguishable from a brand-new directory except by the baseline
+#    root's du-error count. It is reported as "up to +NMB", not "new". ─────────────────
+GE3="$GROW_TMP/rootlocked0"; mkdir -p "$GE3/open" "$GE3/child"
+echo x > "$GE3/open/f"; head -c 31457280 /dev/zero > "$GE3/child/big.bin"
+chmod 000 "$GE3/child"
+if du -sk "$GE3/child" >/dev/null 2>&1; then
+  chmod 755 "$GE3/child"
+  echo "  SKIP: chmod 000 does not stop du here (running as root?) — the handcrafted-photo cases below cover the 'unmeasured' rule"
+else
+  printf '%s\n' "$GE3" | _disk_growth_photo "$GROW_TMP/l0-base.txt"
+  chmod 755 "$GE3/child"
+  printf '%s\n' "$GE3" | _disk_growth_photo "$GROW_TMP/l0-now.txt"
+  l0_delta="$(_growth_delta "$GROW_TMP/l0-base.txt" "$GROW_TMP/l0-now.txt" 8 1)"
+  if printf '%s\n' "$l0_delta" | awk -F'\t' -v p="$GE3/child" '$1 == "G" && $5 == p && $4 == "unmeasured" { f = 1 } END { exit !f }' \
+     && ! printf '%s\n' "$l0_delta" | awk -F'\t' '$1 == "G" && $4 == "new" { f = 1 } END { exit !f }'; then
+    ok "_growth_delta: a child the BASELINE could not read is 'unmeasured' when it appears — never 'new' (REAL du: unreadable then, 30MB now)"
+  else
+    bad "_growth_delta: an entry absent from a du-error baseline must be 'unmeasured', got: $(printf '%s' "$l0_delta" | tr '\n' '|')"
+  fi
+  GROWTH_MIN_DELTA_MB=1
+  l0_rep="$(_growth_report "$GROW_TMP/l0-base.txt" "$GROW_TMP/l0-now.txt")"
+  GROWTH_MIN_DELTA_MB="$GROWTH_MIN_DELTA_MB_ORIG"
+  case "$l0_rep" in
+    *"was new"*) bad "_growth_report: an entry the baseline could not read must not read 'was new': $(printf '%s' "$l0_rep" | head -c 400)" ;;
+    *"up to +30MB  $GE3/child"*"may not be new"*) ok "_growth_report: says 'up to +30MB ... may not be new' for an entry the baseline could not read" ;;
+    *) bad "_growth_report: unmeasured-in-baseline entry misreported: $(printf '%s' "$l0_rep" | head -c 400)" ;;
+  esac
+fi
+chmod 755 "$GE3/child" 2>/dev/null
 
 # ── end to end, through the REAL photo + delta: a root that could not be listed can
 #    never read as "did not grow" (readable then, unlistable now) nor as "everything
@@ -1403,8 +1564,18 @@ else
 fi
 [ -z "$(ls "$GROW_TMP"/photo-w0.txt.tmp.* 2>/dev/null)" ] && ok "_disk_growth_photo writers: measured-empty leaves no .tmp file behind" || bad "_disk_growth_photo writers: measured-empty left a tmp file"
 case "$(_growth_writers_text "$GROW_TMP/photo-w0.txt")" in
-  *"(none >= ${GROWTH_WRITER_MIN_MB}MB)"*) ok "_growth_writers_text: the measured-empty photo reads '(none >= ${GROWTH_WRITER_MIN_MB}MB)' — the branch that was unreachable" ;;
-  *) bad "_growth_writers_text: measured-empty photo did not read '(none >= …MB)': $(_growth_writers_text "$GROW_TMP/photo-w0.txt" | tail -2 | tr '\n' '|')" ;;
+  *"(none >= ${GROWTH_WRITER_MIN_MB}MB among this user's processes; root-owned ones are not visible)"*) ok "_growth_writers_text: the measured-empty photo reads '(none >= ${GROWTH_WRITER_MIN_MB}MB among this user's processes ...)' — the branch that was unreachable, and it no longer reads machine-wide" ;;
+  *) bad "_growth_writers_text: measured-empty photo did not read '(none >= …MB among this user's processes ...)': $(_growth_writers_text "$GROW_TMP/photo-w0.txt" | tail -2 | tr '\n' '|')" ;;
+esac
+# lsof run as this uid lists no root-owned process's files (measured: 571 of 756 processes visible,
+# 0 of the 115 root-owned), so the header must not read as a machine-wide list
+case "$(_growth_writers_text "$GROW_TMP/photo-w1.txt")" in
+  *"by THIS user's processes"*"lsof run as this user lists NO file held by a root-owned process"*"fileproviderd"*) ok "_growth_writers_text: the header says the list is THIS user's processes only (a root-owned writer would not appear), rows intact" ;;
+  *) bad "_growth_writers_text: header does not state the uid-only visibility: $(_growth_writers_text "$GROW_TMP/photo-w1.txt" | head -c 500)" ;;
+esac
+case "$(_growth_writers_text "$GROW_TMP/photo-w2.txt")" in
+  *"(unmeasured — lsof failed or timed out, or the writers were not requested for this photo)"*) ok "_growth_writers_text: an unmeasured photo says why it can be unmeasured, incl. 'not requested'" ;;
+  *) bad "_growth_writers_text: unmeasured wording wrong: $(_growth_writers_text "$GROW_TMP/photo-w2.txt" | tail -1)" ;;
 esac
 if [ "$w1_rc" = "0" ] && grep -q "^WRITERS${TAB}ok\$" "$GROW_TMP/photo-w1.txt" && [ "$(grep -c "^WRITER${TAB}" "$GROW_TMP/photo-w1.txt")" = "1" ]; then
   ok "_disk_growth_photo writers: measured-with-rows records WRITERS ok and one WRITER row"
@@ -1480,20 +1651,20 @@ tw4_out="$(PATH="$STUB2:$PATH" _top_open_write_files 10 1 2>/dev/null)"; tw4_rc=
 GB_BASE="$GROW_TMP/delta-base.txt"; GB_NOW="$GROW_TMP/delta-now.txt"
 printf '%s\n' \
   "TS${TAB}1000" "VM_DIR_KB${TAB}1048576" \
-  "ROOT${TAB}OK${TAB}/r1" \
+  "ROOT${TAB}OK${TAB}/r1${TAB}0" \
   "ENT${TAB}1048576${TAB}/r1/grown" "ENT${TAB}2048${TAB}/r1/same" "ENT${TAB}8192${TAB}/r1/shrunk" "ENT${TAB}1024${TAB}/r1/small-growth" \
-  "ROOT${TAB}OK${TAB}/r2" "ENT${TAB}4096${TAB}/r2/a" \
+  "ROOT${TAB}OK${TAB}/r2${TAB}0" "ENT${TAB}4096${TAB}/r2/a" \
   "ROOT${TAB}PARTIAL${TAB}/r3" "ENT${TAB}100${TAB}/r3/x" \
-  "ROOT${TAB}OK${TAB}/r4" "ENT${TAB}100${TAB}/r4/x" \
+  "ROOT${TAB}OK${TAB}/r4${TAB}0" "ENT${TAB}100${TAB}/r4/x" \
   "WRITERS${TAB}ok" "WRITER${TAB}400${TAB}77${TAB}dolt${TAB}/w/journal" "WRITER${TAB}150${TAB}88${TAB}py${TAB}/w/steady.db" > "$GB_BASE"
 printf '%s\n' \
   "TS${TAB}2200" "VM_DIR_KB${TAB}3145728" \
-  "ROOT${TAB}OK${TAB}/r1" \
+  "ROOT${TAB}OK${TAB}/r1${TAB}0" \
   "ENT${TAB}6291456${TAB}/r1/grown" "ENT${TAB}2048${TAB}/r1/same" "ENT${TAB}1024${TAB}/r1/shrunk" "ENT${TAB}21504${TAB}/r1/small-growth" "ENT${TAB}307200${TAB}/r1/brandnew" \
-  "ROOT${TAB}OK${TAB}/r2" "ENT${TAB}4096${TAB}/r2/a" \
-  "ROOT${TAB}OK${TAB}/r3" "ENT${TAB}100${TAB}/r3/x" "ENT${TAB}900000${TAB}/r3/y" \
+  "ROOT${TAB}OK${TAB}/r2${TAB}0" "ENT${TAB}4096${TAB}/r2/a" \
+  "ROOT${TAB}OK${TAB}/r3${TAB}0" "ENT${TAB}100${TAB}/r3/x" "ENT${TAB}900000${TAB}/r3/y" \
   "ROOT${TAB}SKIPPED${TAB}/r4" \
-  "ROOT${TAB}OK${TAB}/r5" "ENT${TAB}500000${TAB}/r5/z" \
+  "ROOT${TAB}OK${TAB}/r5${TAB}0" "ENT${TAB}500000${TAB}/r5/z" \
   "WRITERS${TAB}ok" "WRITER${TAB}2500${TAB}77${TAB}dolt${TAB}/w/journal" "WRITER${TAB}3000${TAB}99${TAB}build${TAB}/w/newtemp.bin" "WRITER${TAB}150${TAB}88${TAB}py${TAB}/w/steady.db" > "$GB_NOW"
 gd="$(_growth_delta "$GB_BASE" "$GB_NOW" 8 50)"
 gd_g() { printf '%s\n' "$gd" | awk -F'\t' '$1 == "G"'; }
@@ -1605,6 +1776,115 @@ case "$rep_hand" in
   *) bad "_growth_report: writer-growth section missing: $(printf '%s' "$rep_hand" | head -c 700)" ;;
 esac
 
+# ── _growth_delta: du errors on HANDCRAFTED photos — every state of the count ─────────
+#    e1 clean baseline (0)  e2 baseline+now had errors (2)  e3 baseline count ABSENT (a
+#    scan that did not record it is unknown, never 0)  e4 errors only NOW  e6 baseline
+#    errors, now GARBLED  e7 baseline PARTIAL, errors now  e8 SKIPPED now ──────────────
+EB="$GROW_TMP/e-base.txt"; EN="$GROW_TMP/e-now.txt"
+printf '%s\n' \
+  "TS${TAB}1000" \
+  "ROOT${TAB}OK${TAB}/e1${TAB}0" "ENT${TAB}1024${TAB}/e1/a" \
+  "ROOT${TAB}OK${TAB}/e2${TAB}2" "ENT${TAB}1024${TAB}/e2/b" \
+  "ROOT${TAB}OK${TAB}/e3" "ENT${TAB}1024${TAB}/e3/c" \
+  "ROOT${TAB}OK${TAB}/e4${TAB}0" "ENT${TAB}1024${TAB}/e4/d" \
+  "ROOT${TAB}OK${TAB}/e6${TAB}5" "ENT${TAB}1024${TAB}/e6/f" \
+  "ROOT${TAB}PARTIAL${TAB}/e7${TAB}0" "ENT${TAB}1024${TAB}/e7/g" > "$EB"
+printf '%s\n' \
+  "TS${TAB}2000" \
+  "ROOT${TAB}OK${TAB}/e1${TAB}0" "ENT${TAB}1024${TAB}/e1/a" "ENT${TAB}204800${TAB}/e1/fresh" \
+  "ROOT${TAB}OK${TAB}/e2${TAB}2" "ENT${TAB}1024${TAB}/e2/b" "ENT${TAB}204800${TAB}/e2/fresh" \
+  "ROOT${TAB}OK${TAB}/e3${TAB}0" "ENT${TAB}1024${TAB}/e3/c" "ENT${TAB}204800${TAB}/e3/fresh" \
+  "ROOT${TAB}OK${TAB}/e4${TAB}3" "ENT${TAB}1024${TAB}/e4/d" \
+  "ROOT${TAB}OK${TAB}/e6${TAB}x" "ENT${TAB}1024${TAB}/e6/f" \
+  "ROOT${TAB}OK${TAB}/e7${TAB}4" "ENT${TAB}1024${TAB}/e7/g" \
+  "ROOT${TAB}SKIPPED${TAB}/e8" > "$EN"
+ed="$(_growth_delta "$EB" "$EN" 8 50)"
+ed_g4() { printf '%s\n' "$ed" | awk -F'\t' -v p="$1" '$1 == "G" && $5 == p { print $4 }'; }
+[ "$(ed_g4 /e1/fresh)" = "new" ] \
+  && ok "_growth_delta: an entry absent from a baseline root that was OK with 0 du errors is 'new'" \
+  || bad "_growth_delta: e1/fresh should be 'new', got '$(ed_g4 /e1/fresh)'"
+[ "$(ed_g4 /e2/fresh)" = "unmeasured" ] \
+  && ok "_growth_delta: absent from a baseline root with du errors (count 2) -> 'unmeasured', not 'new'" \
+  || bad "_growth_delta: e2/fresh should be 'unmeasured', got '$(ed_g4 /e2/fresh)'"
+[ "$(ed_g4 /e3/fresh)" = "unmeasured" ] \
+  && ok "_growth_delta: a baseline ROOT line with NO count field is unknown, not 0 -> 'unmeasured', not 'new'" \
+  || bad "_growth_delta: e3/fresh (baseline count absent) should be 'unmeasured', got '$(ed_g4 /e3/fresh)'"
+ed_e() { printf '%s\n' "$ed" | awk -F'\t' -v r="$1" '$1 == "E" && $2 == r { print $3 "/" $4 }'; }
+{ [ "$(ed_e /e2)" = "2/2" ] && [ "$(ed_e /e3)" = "?/0" ] && [ "$(ed_e /e4)" = "0/3" ] && [ "$(ed_e /e6)" = "5/?" ] && [ "$(ed_e /e7)" = "n/a/4" ]; } \
+  && ok "_growth_delta: E lines carry each side's count — a number, '?' for absent/garbled, 'n/a' for a side whose scan was not OK" \
+  || bad "_growth_delta: E lines wrong: e2='$(ed_e /e2)' e3='$(ed_e /e3)' e4='$(ed_e /e4)' e6='$(ed_e /e6)' e7='$(ed_e /e7)'"
+[ -z "$(ed_e /e1)" ] \
+  && ok "_growth_delta: a root with a measured 0 on both sides emits no E line (the routine clean case stays quiet)" \
+  || bad "_growth_delta: e1 (0 and 0) must not emit E, got '$(ed_e /e1)'"
+printf '%s\n' "$ed" | grep -q "^U${TAB}/e7${TAB}baseline=PARTIAL now=OK\$" && printf '%s\n' "$ed" | grep -q "^U${TAB}/e8${TAB}baseline=absent now=SKIPPED\$" \
+  && ok "_growth_delta: E does not replace U — the PARTIAL and SKIPPED roots are still NOT FULLY COMPARED" \
+  || bad "_growth_delta: U lines missing next to E: $(printf '%s\n' "$ed" | grep '^U' | tr '\n' ';')"
+[ -z "$(ed_e /e8)" ] && ok "_growth_delta: a SKIPPED root is U only — no E line (nothing was scanned, so there is no du-error count)" || bad "_growth_delta: SKIPPED root must not emit E"
+
+# ── _growth_report on those photos: DU ERRORS, 'up to', and the three "none" wordings ──
+GROWTH_MIN_DELTA_MB=50
+rep_e="$(_growth_report "$EB" "$EN")"
+GROWTH_MIN_DELTA_MB="$GROWTH_MIN_DELTA_MB_ORIG"
+case "$rep_e" in
+  *"+200MB  /e1/fresh  (now 200MB, was new)"*) ok "_growth_report: a clean-baseline entry reads 'was new'" ;;
+  *) bad "_growth_report: e1/fresh line wrong: $(printf '%s' "$rep_e" | head -c 500)" ;;
+esac
+case "$rep_e" in
+  *"up to +200MB  /e2/fresh  (now 200MB; not in the baseline, whose scan of this root could not read everything — it may not be new)"*) ok "_growth_report: an unmeasured-baseline entry reads 'up to +200MB ... may not be new', never 'was new'" ;;
+  *) bad "_growth_report: e2/fresh 'up to' line wrong: $(printf '%s' "$rep_e" | head -c 500)" ;;
+esac
+case "$rep_e" in
+  *"DU ERRORS: /e2 "*"baseline=2 now=2"*"DU ERRORS: /e3 "*"baseline=? now=0"*"DU ERRORS: /e4 "*"baseline=0 now=3"*) ok "_growth_report: every root with du errors gets a DU ERRORS line with both counts ('?' = unknown)" ;;
+  *) bad "_growth_report: DU ERRORS lines missing/wrong: $(printf '%s' "$rep_e" | head -c 700)" ;;
+esac
+# "none grew": three wordings that must stay apart — growth listed / roots that could hide it / a clean answer
+case "$(_growth_report "$GROW_TMP/ee-ok.txt" "$GROW_TMP/ee-unl.txt")" in
+  *"none in what could be measured"*"NOT FULLY COMPARED: $GEE"*) ok "_growth_report: nothing listed + a root that could not be compared -> 'none in what could be measured' with the root named, never a clean 'none'" ;;
+  *) bad "_growth_report: an uncomparable root must change the 'none' wording: $(_growth_report "$GROW_TMP/ee-ok.txt" "$GROW_TMP/ee-unl.txt" | head -c 400)" ;;
+esac
+case "$(_growth_report "$GROW_TMP/syn-now.txt" "$GROW_TMP/syn-now.txt")" in
+  *"NOT FULLY COMPARED"*|*"DU ERRORS"*) bad "_growth_report: two complete, error-free photos must not raise a caveat" ;;
+  *"none in the roots that could be compared"*) ok "_growth_report: two complete, error-free photos keep the plain 'none in the roots that could be compared' wording" ;;
+  *) bad "_growth_report: clean 'none' wording missing" ;;
+esac
+
+# no baseline: the "largest entries" list must say what it could not measure
+rep_nb2="$(_growth_report "$GROW_TMP/does-not-exist" "$EN")"
+case "$rep_nb2" in
+  *"INCOMPLETE"*"DU ERRORS: /e2 (2 du chunk(s)"*"DU ERRORS: /e4 (3 du chunk(s)"*"DU ERRORS: /e6 (du error count unknown"*"NOT FULLY MEASURED: /e8 (SKIPPED)"*) ok "_growth_report: with no baseline the absolute-size list is marked INCOMPLETE and names every du-error / unmeasured root" ;;
+  *) bad "_growth_report: no-baseline caveats missing: $(printf '%s' "$rep_nb2" | head -c 700)" ;;
+esac
+case "$rep_nb" in
+  *"INCOMPLETE"*) bad "_growth_report: a complete, error-free photo must not be marked INCOMPLETE: $(printf '%s' "$rep_nb" | head -c 300)" ;;
+  *) ok "_growth_report: a complete no-baseline photo is not marked INCOMPLETE (the caveat is not noise)" ;;
+esac
+# a missing or empty photo measured nothing — never 'none grew'
+: > "$GROW_TMP/empty-photo.txt"
+for ep in "$GROW_TMP/empty-photo.txt" "$GROW_TMP/no-such-photo.txt"; do
+  case "$(_growth_report "$GB_BASE" "$ep")" in
+    *"missing or empty — nothing was measured"*) ok "_growth_report: a photo that is $([ -e "$ep" ] && echo empty || echo missing) says nothing was measured — not 'none grew'" ;;
+    *) bad "_growth_report: an empty/missing photo must say so, got: $(_growth_report "$GB_BASE" "$ep" | head -c 300)" ;;
+  esac
+done
+# a comparison that could not be made says so (its absence must not read as "did not grow")
+case "$(_growth_report "$GB_BASE" "$GROW_TMP/delta-now-unm.txt")" in
+  *"open-for-write comparison NOT made: writers were not measured in this photo"*) ok "_growth_report: writers unmeasured in one photo -> 'open-for-write comparison NOT made', naming which photo" ;;
+  *) bad "_growth_report: a skipped writers comparison is silent: $(_growth_report "$GB_BASE" "$GROW_TMP/delta-now-unm.txt" | head -c 500)" ;;
+esac
+case "$(_growth_report "$GROW_TMP/syn-base.txt" "$GROW_TMP/syn-now.txt")" in
+  *"writers were not measured in the baseline and this photo"*) ok "_growth_report: photos taken without writers say so for BOTH sides" ;;
+  *) bad "_growth_report: both-sides-unmeasured writers not stated" ;;
+esac
+case "$rep_hand" in
+  *"comparison NOT made"*) bad "_growth_report: both photos measured writers and VM — no 'NOT made' line should appear: $(printf '%s' "$rep_hand" | head -c 500)" ;;
+  *) ok "_growth_report: when writers and VM were measured on both sides there is no 'NOT made' noise" ;;
+esac
+sed "s/^VM_DIR_KB${TAB}.*/VM_DIR_KB${TAB}unknown/" "$GB_NOW" > "$GROW_TMP/vm-unk-now.txt"
+case "$(_growth_report "$GB_BASE" "$GROW_TMP/vm-unk-now.txt")" in
+  *"VM size comparison NOT made: the size of /System/Volumes/VM was unknown in this photo"*) ok "_growth_report: an unknown VM size on one side -> 'VM size comparison NOT made' (not a silent missing V line)" ;;
+  *) bad "_growth_report: a skipped VM comparison is silent" ;;
+esac
+
 # ── _growth_baseline_due ───────────────────────────────────────────────────────
 BD_F="$GROW_TMP/bd-baseline.txt"; BD_NOW=100000
 rm -f "$BD_F"; _growth_baseline_due "$BD_F" "$BD_NOW" 1800 && ok "_growth_baseline_due: no baseline file -> due" || bad "_growth_baseline_due: missing file should be due"
@@ -1683,7 +1963,7 @@ if [ "$(printf '%s\n' "$PHOTOS" | grep -c .)" = "1" ] && [ "$(sed -n 1p "$EPF")"
 else
   bad "_growth_episode_photo: first WARN photo/episode state wrong (photos=$PHOTOS episode=$(tr '\n' '|' < "$EPF" 2>/dev/null))"
 fi
-if grep -q "BEFORE the reclaim levers run" "$LOG" && grep -q "disk-growth photo written" "$LOG" && grep -q "db1" "$LOG"; then
+if grep -q "BEFORE the floor-triggered reclaim levers run" "$LOG" && grep -q "disk-growth photo written" "$LOG" && grep -q "db1" "$LOG"; then
   ok "_growth_episode_photo: logs that it ran before the reclaim levers, where the file is, and the top growers (db1)"
 else
   bad "_growth_episode_photo: log missing lines: $(tr '\n' '|' < "$LOG" | head -c 400)"
@@ -1750,14 +2030,35 @@ sleep 1
 _growth_episode_photo WARN 6
 EMPTY_PHOTO="$(ls -1 "$STATE_DIR"/disk-growth-*.txt 2>/dev/null)"
 if [ "$(printf '%s\n' "$EMPTY_PHOTO" | grep -c .)" = "1" ] && [ "$(sed -n 1p "$EPF" 2>/dev/null)" = "WARN" ] \
-   && grep -q "^WRITERS${TAB}ok\$" "$EMPTY_PHOTO" && grep -q "(none >= ${GROWTH_WRITER_MIN_MB}MB)" "$EMPTY_PHOTO" \
+   && grep -q "^WRITERS${TAB}ok\$" "$EMPTY_PHOTO" && grep -q "(none >= ${GROWTH_WRITER_MIN_MB}MB among this user's processes" "$EMPTY_PHOTO" \
    && ! grep -q "could not be written" "$LOG"; then
-  ok "_growth_episode_photo: writers measured-EMPTY still lands the episode photo, marks the episode, and says '(none >= ${GROWTH_WRITER_MIN_MB}MB)'"
+  ok "_growth_episode_photo: writers measured-EMPTY still lands the episode photo, marks the episode, and says '(none >= ${GROWTH_WRITER_MIN_MB}MB among this user's processes ...)'"
 else
   bad "_growth_episode_photo: measured-empty writers dropped the episode photo (photos='$EMPTY_PHOTO' episode=$(tr '\n' '|' < "$EPF" 2>/dev/null) log=$(tr '\n' '|' < "$LOG" | head -c 300))"
 fi
 WRITERS_STUB_ROWS=1
 _growth_clear_episode
+
+# the baseline refresh log names EVERYTHING not measured completely — a MISSING root and an OK
+# root in which du reported errors included — so it says what the report will later say about the
+# same photo (it used to call MISSING benign and never mention du errors)
+_growth_roots() { printf '%s\n%s\n' "$RA" "$GROW_TMP/nope"; }
+cat > "$STUBBIN/du" <<'STUBEOF'
+#!/bin/bash
+for a in "$@"; do [ "$a" = "-sk" ] && continue; printf '100\t%s\n' "$a"; done
+exit 1
+STUBEOF
+chmod +x "$STUBBIN/du"
+rm -f "$BASEF"; : > "$LOG"
+PATH="$STUBBIN:$PATH" _growth_baseline_refresh "$EP_NOW"
+if grep -qF "$GROW_TMP/nope(MISSING)" "$LOG" && grep -qF "$RA(OK, du errors: 1)" "$LOG"; then
+  ok "_growth_baseline_refresh: the log lists a MISSING root and an OK root with du errors as 'not fully measured' — not 'none'"
+else
+  bad "_growth_baseline_refresh: log omits MISSING / du-error roots: $(grep 'baseline photo refreshed' "$LOG" | head -c 400)"
+fi
+rm -f "$STUBBIN/du"
+_growth_roots() { printf '%s\n%s\n' "$RA" "$RB"; }
+rm -f "$BASEF"
 
 # retention: only the newest N of OUR files go; foreign files are never touched
 GROWTH_KEEP_PHOTOS_ORIG="$GROWTH_KEEP_PHOTOS"; GROWTH_KEEP_PHOTOS=2

@@ -38,7 +38,7 @@ log "Checking the deployed guard parses under /bin/bash (what launchd runs)..."
 /bin/bash -n "$GUARD" || fail "$GUARD does not parse under /bin/bash (3.2)"
 log "  parses ✓"
 
-log "Checking main() wiring: episode photo BEFORE the reclaim levers, baseline refresh on the healthy path..."
+log "Checking main() wiring: episode photo BEFORE the floor-triggered reclaim levers, baseline refresh on the healthy path..."
 awk '
   /^main\(\) \{/ { in_main = 1 }
   in_main && /^  _growth_episode_photo "\$class" "\$avail"/ { photo = NR }
@@ -46,8 +46,8 @@ awk '
   in_main && /^    _growth_clear_episode/ { clear_ = NR }
   in_main && /^    _growth_baseline_refresh "\$now"/ { base = NR }
   END { exit !(photo && reclaim && photo < reclaim && clear_ && base && clear_ < base) }
-' "$GUARD" || fail "main() does not call _growth_episode_photo before _safe_reclaim (or lacks the healthy-path clear+baseline refresh) — the photo would see a post-reclaim disk"
-log "  photo precedes the first reclaim lever; healthy path clears the episode then refreshes the baseline ✓"
+' "$GUARD" || fail "main() does not call _growth_episode_photo before _safe_reclaim (or lacks the healthy-path clear+baseline refresh) — the photo would see a disk the floor-triggered levers had already cleaned"
+log "  photo precedes _safe_reclaim (the first floor-triggered lever; _reap_growing_logs runs every cycle before it, by design); healthy path clears the episode then refreshes the baseline ✓"
 
 log "Running a real baseline -> growth -> episode-photo round trip on synthetic directories (state in a throwaway dir)..."
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/story-ga-ond0fa.XXXXXX")" || fail "cannot create a scratch dir"
@@ -73,6 +73,10 @@ BASEF="$(_growth_baseline_file)"
 _growth_baseline_refresh "$(date +%s)"
 [ -s "$BASEF" ] && grep -q "^TS${TAB}[0-9]" "$BASEF" || f "no baseline photo written"
 grep -q "^ROOT${TAB}OK${TAB}$RA" "$BASEF" || f "baseline did not record the synthetic root as OK"
+# the ROOT line also carries how many du chunks could not read part of the tree: a MEASURED 0 here,
+# never an absent field (absent = unknown, which the diff refuses to treat as "nothing was unreadable")
+awk -F'\t' -v r="$RA" '$1 == "ROOT" && $2 == "OK" && $3 == r && $4 == "0" { ok = 1 } END { exit !ok }' "$BASEF" \
+  || f "baseline ROOT line has no measured du-error count: $(grep '^ROOT' "$BASEF" | head -2 | tr '\t' ' ')"
 SUM_BEFORE="$(cksum < "$BASEF")"
 
 head -c 6291456 /dev/zero > "$RA/db2/growth.bin"        # db2 grows by 6MB
@@ -93,6 +97,28 @@ case "$MAILTXT" in
   *"Photo file: $PHOTO"*) ;;
   *) f "the Mayor-mail paragraph does not cite the episode photo: $(printf '%s' "$MAILTXT" | head -c 200)" ;;
 esac
+
+# A root in which du cannot read part of the tree must be REPORTED as such — not read as complete, and
+# not answered with "the growth is outside the roots" (gate ga-7sxd8n: du leaves an unreadable subtree
+# out of its parent's row). 60MB lands inside a chmod-000 subtree between the two photos.
+RC="$WORK/rootC"; mkdir -p "$RC/vis/locked"
+head -c 1048576 /dev/zero > "$RC/vis/visible.bin"; head -c 8388608 /dev/zero > "$RC/vis/locked/hidden.bin"
+trap 'chmod 700 "$RC/vis/locked" 2>/dev/null' EXIT
+chmod 000 "$RC/vis/locked"
+if du -sk "$RC/vis" >/dev/null 2>&1; then
+  echo "roundtrip: (skipped the du-error case — chmod 000 does not stop du here, e.g. running as root)"
+else
+  printf '%s\n' "$RC" | _disk_growth_photo "$WORK/c-base.txt" || f "could not photograph the du-error root"
+  chmod 700 "$RC/vis/locked"; head -c 62914560 /dev/zero > "$RC/vis/locked/grown.bin"; chmod 000 "$RC/vis/locked"
+  printf '%s\n' "$RC" | _disk_growth_photo "$WORK/c-now.txt" || f "could not photograph the du-error root (now)"
+  CREP="$(_growth_report "$WORK/c-base.txt" "$WORK/c-now.txt")"
+  case "$CREP" in
+    *"none in the roots that could be compared"*) f "a root with du errors read as 'the growth is outside the roots': $(printf '%s' "$CREP" | head -c 300)" ;;
+    *"DU ERRORS: $RC"*) ;;
+    *) f "the report does not flag the root du could not fully read: $(printf '%s' "$CREP" | head -c 300)" ;;
+  esac
+  chmod 700 "$RC/vis/locked"
+fi
 echo "roundtrip OK: photo=$(basename "$PHOTO")"
 RTEOF
 if ! WORK="$WORK" GUARD="$GUARD" /bin/bash "$WORK/roundtrip.sh" >"$WORK/roundtrip.out" 2>&1; then
