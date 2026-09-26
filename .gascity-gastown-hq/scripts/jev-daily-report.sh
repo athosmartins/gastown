@@ -91,12 +91,17 @@ fi
 
 # The recomecar block rides on the same ntfy: the day, then ONE line of the 7-day rollup (the phase-2
 # decision rests on the rolling number; a single day is noisy at this volume).
-if ! REC_DAY=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" resumo-pt --date "$DAY" 2>/dev/null); then
+if ! REC_DAY=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" resumo-pt --date "$DAY" 2>/dev/null) || [ -z "$REC_DAY" ]; then
   REC_DAY="$REC_FAIL_NOTE"
 fi
+# The rollup is the number the phase-2 decision rests on, so it gets the same rule as the day line: a
+# failed, hung OR empty answer is a visible "unavailable" line, never a silently missing one (the real
+# section script always prints a line on success -- an empty window says "nada a medir" -- so empty
+# output is a failure, same as the quem-pensa block below).
+REC_7D_FAIL_NOTE="Recomeçar, acumulado 7 dias até $DAY: indisponível (falhou ou passou de ${REC_TIMEOUT}s) — NÃO é 'sem dados'; detalhe em $OUT_DIR/$DAY.txt."
 REC_7D=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" resumo-pt --date "$DAY" --days 7 --curto 2>/dev/null) || REC_7D=""
-RESUMO="$RESUMO"$'\n\n'"$REC_DAY"
-[ -n "$REC_7D" ] && RESUMO="$RESUMO"$'\n'"$REC_7D"
+[ -n "$REC_7D" ] || REC_7D="$REC_7D_FAIL_NOTE"
+RESUMO="$RESUMO"$'\n\n'"$REC_DAY"$'\n'"$REC_7D"
 # ga-aijm2v.9: the quem-pensa (which-model) calibration table, cumulative to date. Its records
 # come from the hourly jev-quem-pensa order, not from this script, so there is nothing to run
 # first -- only to read. Best-effort like the join above: its own failure must never block the

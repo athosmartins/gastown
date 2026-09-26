@@ -22,7 +22,8 @@
 #   T14-T17 (ga-aijm2v.8) the "recomecar" section rides on the same report + ntfy: rows
 #      that share the log must NOT leak into the suppression numbers (T14), a day with
 #      none still says so (T15), and a FAILING or HUNG section is fail-open AND visible
-#      -- it never blocks the day's report and never reads as "no data" (T16/T17).
+#      -- it never blocks the day's report and never reads as "no data" (T16/T17); the 7-day
+#      rollup failing ALONE is just as visible in the ntfy (T18).
 #   T9 (ga-aijm2v.3/F5) the gate-verdict join step runs before the report AND is
 #      fail-open: a join failure is logged to gate-verdict-join.log but never
 #      blocks or changes the report/ntfy outcome (same rc/calls as T1). T9c covers
@@ -156,6 +157,26 @@ cat >"$T/rec-hang.py" <<'EOF'
 import time
 time.sleep(5)
 print("recomecar-hang: should never get here (ga-aijm2v.8 T17)")
+EOF
+# T18 stubs: the DAY call works, only the 7-day rollup (--days) breaks -- a failure or a silent empty
+# answer. A stub that fails both calls (rec-fail.py) cannot tell "the rollup line is visible when it
+# fails" apart from "the day line's note happens to cover it".
+cat >"$T/rec-7d-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+if "--days" in sys.argv:
+    print("jev_recomecar_experiment: simulated 7-day-only failure (ga-aijm2v.8 T18)", file=sys.stderr)
+    sys.exit(1)
+print("REC-DAY-STUB-OK")
+EOF
+cat >"$T/rec-7d-empty.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+if "--days" not in sys.argv:
+    print("REC-DAY-STUB-OK")
+EOF
+cat >"$T/rec-empty.py" <<'EOF'
+#!/usr/bin/env python3
 EOF
 
 run() {  # run [date-arg...] with the sandboxed env; sets RC
@@ -359,6 +380,23 @@ grep -q 'section TIMED OUT after 1s' "$T/out/2026-09-20.txt" && ok "T17 the hang
 case "$N" in *"seção indisponível hoje (falhou ou passou de 1s)"*) ok "T17 the ntfy says unavailable, with the bound" ;; *) nok "T17 ntfy" "$N" ;; esac
 grep -q 'should never get here' "$T/out/2026-09-20.txt" "$T/notify.log" 2>/dev/null \
   && nok "T17 process actually killed" "the hung stub's post-sleep line ran" || ok "T17 the hung process was killed before finishing its sleep"
+
+# T18: ONLY the 7-day rollup fails (the day section is fine). The rollup is the number the phase-2
+# decision rests on, so its absence must read as "unavailable", never as a phone summary that simply
+# has no rollup line. The real section script always prints a line on success (an empty window says
+# "nada a medir"), so an EMPTY answer is a failure too -- same rule as the quem-pensa block above.
+RUN_REC="$T/rec-7d-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T18 a failing 7-day rollup still yields exit 0, exactly one ntfy (fail-open)"; else nok "T18 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"REC-DAY-STUB-OK"*) ok "T18 positive control: the day section still reached the ntfy" ;; *) nok "T18 day section" "$N" ;; esac
+case "$N" in *"acumulado 7 dias até 2026-09-20: indisponível"*) ok "T18 the failed 7-day rollup is a VISIBLE line in the ntfy, not a silent absence" ;; *) nok "T18 rollup visible" "$N" ;; esac
+RUN_REC="$T/rec-7d-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"acumulado 7 dias até 2026-09-20: indisponível"*) ok "T18 an EMPTY 7-day answer is a visible failure too, not 'nothing to report'" ;; *) nok "T18 empty rollup visible" "$N" ;; esac
+# ...and an empty DAY answer (exit 0, no output) gets the day line's own unavailable note, not a blank line.
+RUN_REC="$T/rec-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"seção indisponível hoje"*"NÃO é 'sem dados'"*) ok "T18 an EMPTY day answer is a visible failure, not a blank line" ;; *) nok "T18 empty day visible" "$N" ;; esac
 
 # T11 (ga-aijm2v.7): the preambulo block. Same contract as T10: the generic numbers stay exactly T1's
 # whatever happens to the block, and the block never fails SILENTLY.
