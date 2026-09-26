@@ -41,87 +41,97 @@ NOW = 1_000_000.0   # fixed synthetic "now" (epoch seconds)
 MIN_AGE = m.ORPHAN_MIN_AGE_SEC
 DRAIN = m.ORPHAN_DRAIN_FRESH_SEC
 
-def mk(mid, branch, age_sec):
-    """marker tuple created `age_sec` ago."""
-    return (mid, branch, NOW - age_sec)
+# ── shared fixtures for the ga-yprwyk (marker-id + tier-aware) proof ──────────────────────────────────────
+# The skip proof is over the dispatcher's OVERDUE tier: tier 1 is priority-blind, oldest-first over every
+# overdue healthy marker, so a marker created AFTER the head cannot be claimed while the head is eligible.
+# HARD is the dispatcher's default ceiling (3 x GATE_MARKER_AGE_PROMOTE_SECONDS=1800). The real code DERIVES it
+# from the dispatcher (see gate-recovery-watchdog.orphan-proof-tiered.selftest.sh); here it is passed in, exactly
+# as orphaned_queued_marker() passes it to the pure core.
+HARD = 5400
+OVERDUE = HARD + m.ORPHAN_PROOF_MARGIN_SEC     # a head must be older than this before ANY claim order can prove a skip
+REACH = NOW - 8 * 3600                         # the dispatcher-log read reaches 8h back (before every head below was created)
+
+def mk(mid, branch, age_sec, labels=()):
+    """queued-marker tuple (id, branch, created, labels) created `age_sec` ago."""
+    return (mid, branch, NOW - age_sec, tuple(labels))
+
+def claim(ago_sec, mid):
+    """a dispatcher 'Attempting to claim marker <mid> ...' line `ago_sec` ago."""
+    return (NOW - ago_sec, mid)
+
+def detect(markers, sweeps, claims, created=None, hard=HARD, reach=REACH):
+    """the pure core; `created` maps an already-claimed marker id to its created epoch (what a bd lookup returns)."""
+    created = created or {}
+    return m._detect_orphan_markers(markers, sweeps, claims, reach, hard, lambda x: created.get(x), NOW)
 
 # A fresh drain: a completed sweep 60s ago (within DRAIN window).
 FRESH_SWEEPS = [NOW - 60]
 # A stale drain: newest completed sweep is older than the DRAIN window.
 STALE_SWEEPS = [NOW - (DRAIN + 600)]
 
-# ── Scenario 1: TRUE orphan (leapfrog) is detected ───────────────────────────
-print("Scenario 1: leapfrogged orphan detected (old+unmentioned, newer marker IS dispatched)")
-markers = [
-    mk("ga-wisp-orphan", "crew/wa/wa-uzai", MIN_AGE + 3600),   # old, will be unmentioned
-    mk("ga-wisp-newer",  "crew/wa/wa-newer", MIN_AGE - 600),   # newer, IS mentioned
-]
-log = "[..] claimed branch=crew/wa/wa-newer for dispatching\nVerdicts: 1/3\n"
-res = m._detect_orphan_markers(markers, FRESH_SWEEPS, log, NOW)
+# ── Scenario 1: a TRUE skip is detected (overdue head, never claimed, a NEWER marker claimed past the ceiling) ──
+print("Scenario 1: genuine skip detected (overdue head never claimed; a marker created AFTER it was claimed while it was overdue)")
+head_age = OVERDUE + 3600
+markers = [mk("ga-wisp-orphan", "crew/wa/wa-uzai", head_age)]
+res = detect(markers, FRESH_SWEEPS, [claim(600, "ga-wisp-newer")],
+             created={"ga-wisp-newer": NOW - (head_age - 1800)})      # newer than the head (created 30min after it)
 ids = [r[0] for r in res]
 if ids == ["ga-wisp-orphan"]:
-    ok("the old unmentioned marker is flagged; the newer (mentioned) one is not")
+    ok("the overdue, never-claimed head is flagged: tier 1 would have picked it before any newer marker")
 else:
     bad("expected ['ga-wisp-orphan'], got %r" % (ids,))
 
-# ── Scenario 2: NO false fire on a normal FIFO backlog (nothing leapfrogged) ──
-print("Scenario 2: normal backlog — old unmentioned markers but NOTHING is leapfrogged → silent")
-markers = [
-    mk("ga-wisp-a", "crew/wa/wa-a", MIN_AGE + 3600),
-    mk("ga-wisp-b", "crew/wa/wa-b", MIN_AGE + 1800),
-]
-log = "[..] sweep complete: branch=crew/other/done verdict=PASS\n"  # neither queued branch mentioned
-res = m._detect_orphan_markers(markers, FRESH_SWEEPS, log, NOW)
+# ── Scenario 2: NO false fire on a deep, HEALTHY queue drained in strict created_at order ──────────────────
+print("Scenario 2: deep healthy backlog — head overdue and unclaimed, but every marker the dispatcher claimed is OLDER → silent")
+# The 25/09 incident shape (ga-b9pz7q): the head was 3.5h old and 'unmentioned' while the dispatcher worked strictly
+# oldest-first; the head was claimed 3min later. Every claim past its ceiling is of an OLDER marker.
+head_age = OVERDUE + 3600
+markers = [mk("ga-wisp-a", "crew/wa/wa-a", head_age), mk("ga-wisp-b", "crew/wa/wa-b", head_age - 1800)]
+older = {"ga-c1": NOW - (head_age + 3000), "ga-c2": NOW - (head_age + 2000), "ga-c3": NOW - (head_age + 900)}
+res = detect(markers, FRESH_SWEEPS, [claim(900, "ga-c1"), claim(600, "ga-c2"), claim(200, "ga-c3")], created=older)
 if res == []:
-    ok("no newer queued marker is being dispatched → no leapfrog → no orphan (no false positive)")
+    ok("claims that only ever go to OLDER markers are FIFO draining, not a skip (the ga-b9pz7q false positive)")
 else:
-    bad("expected [] (backlog, not orphan), got %r" % (res,))
+    bad("expected [] (healthy deep queue), got %r" % (res,))
 
 # ── Scenario 3: dispatcher WEDGED on current run (not draining) → silent ──────
 print("Scenario 3: dispatcher not draining (newest sweep-complete is stale) → silent")
-markers = [
-    mk("ga-wisp-orphan", "crew/wa/wa-uzai", MIN_AGE + 3600),
-    mk("ga-wisp-newer",  "crew/wa/wa-newer", MIN_AGE - 600),
-]
-log = "[..] claimed branch=crew/wa/wa-newer for dispatching\n"
-res = m._detect_orphan_markers(markers, STALE_SWEEPS, log, NOW)
+head_age = OVERDUE + 3600
+res = detect([mk("ga-wisp-orphan", "crew/wa/wa-uzai", head_age)], STALE_SWEEPS, [claim(600, "ga-wisp-newer")],
+             created={"ga-wisp-newer": NOW - (head_age - 1800)})
 if res == []:
     ok("stale newest-sweep → dispatcher wedged on its current run, a different failure mode → silent")
 else:
     bad("expected [] (not draining), got %r" % (res,))
 
-# ── Scenario 4: a mentioned marker is never flagged (it IS being dispatched) ──
-print("Scenario 4: the orphan candidate's branch IS mentioned → excluded")
-markers = [
-    mk("ga-wisp-cur", "crew/wa/wa-cur", MIN_AGE + 3600),       # old but currently dispatched
-    mk("ga-wisp-newer", "crew/wa/wa-newer", MIN_AGE - 600),
-]
-log = "[..] claimed branch=crew/wa/wa-cur for dispatching\nVerdicts: 0/3\nclaimed branch=crew/wa/wa-newer\n"
-res = m._detect_orphan_markers(markers, FRESH_SWEEPS, log, NOW)
+# ── Scenario 4: a head the dispatcher already claimed is never flagged (BY MARKER ID) ──
+print("Scenario 4: the head's own id appears in a claim line → excluded, even with a newer claim after it")
+head_age = OVERDUE + 3600
+res = detect([mk("ga-wisp-cur", "crew/wa/wa-cur", head_age)], FRESH_SWEEPS,
+             [claim(3000, "ga-wisp-cur"), claim(600, "ga-wisp-newer")],
+             created={"ga-wisp-newer": NOW - (head_age - 1800)})
 if res == []:
-    ok("a marker mentioned in the log is being/already dispatched, not orphaned")
+    ok("a marker with a claim line was attempted (and may have been re-queued) — not an orphan")
 else:
-    bad("expected [] (mentioned → not orphan), got %r" % (res,))
+    bad("expected [] (claimed → not orphan), got %r" % (res,))
 
-# ── Scenario 5: a just-created marker (under MIN_AGE) is never flagged ────────
-print("Scenario 5: too-fresh marker (age < ORPHAN_MIN_AGE_SEC) → not yet 'skipped'")
-markers = [
-    mk("ga-wisp-fresh", "crew/wa/wa-fresh", MIN_AGE - 60),     # just created
-    mk("ga-wisp-newer", "crew/wa/wa-newer", MIN_AGE - 600),
-]
-log = "[..] claimed branch=crew/wa/wa-newer for dispatching\n"
-res = m._detect_orphan_markers(markers, FRESH_SWEEPS, log, NOW)
+# ── Scenario 5: a head under the overdue ceiling is never flagged — a newer marker legitimately goes first ──
+print("Scenario 5: young head (below the overdue ceiling) → no claim order can prove a skip")
+# Below the ceiling the dispatcher serves priority / smallest-diff / the one freshest 'reserve' marker ahead of an
+# older one BY DESIGN (ga-vm428, ga-r8u92). This is exactly the shape the old proof mistook for an orphan.
+head_age = OVERDUE - 600
+res = detect([mk("ga-wisp-young", "crew/wa/wa-young", head_age)], FRESH_SWEEPS, [claim(100, "ga-wisp-newer")],
+             created={"ga-wisp-newer": NOW - (head_age - 1800)})
 if res == []:
-    ok("a marker younger than the min-age floor is not called an orphan")
+    ok("a head still under the ceiling is never called skipped, even with a newer marker claimed")
 else:
-    bad("expected [] (too fresh), got %r" % (res,))
+    bad("expected [] (young head), got %r" % (res,))
 
 # ── Scenario 6: no completed sweeps at all → silent (can't prove draining) ────
 print("Scenario 6: no 'sweep complete' epochs → silent")
-markers = [mk("ga-wisp-orphan", "crew/wa/wa-uzai", MIN_AGE + 3600),
-           mk("ga-wisp-newer", "crew/wa/wa-newer", MIN_AGE - 600)]
-log = "[..] claimed branch=crew/wa/wa-newer for dispatching\n"
-res = m._detect_orphan_markers(markers, [], log, NOW)
+head_age = OVERDUE + 3600
+res = detect([mk("ga-wisp-orphan", "crew/wa/wa-uzai", head_age)], [], [claim(600, "ga-wisp-newer")],
+             created={"ga-wisp-newer": NOW - (head_age - 1800)})
 if res == []:
     ok("no sweep evidence → cannot establish draining → no fire")
 else:
@@ -145,40 +155,41 @@ else:
     bad("expected None for malformed/empty created_at")
 
 # ── Scenario 8: REPLAY the live 2026-06-12 incident shape → must stay SILENT ──
-print("Scenario 8: live-incident replay — 12 markers older than a STALE newest-sweep, oldest IS mentioned")
+print("Scenario 8: live-incident replay — 12 markers older than a STALE newest-sweep, oldest IS claimed")
 # Real shape: dispatcher recovered with ONE sweep at 19:45 then wedged on the
-# current run (ga-v3z4z, which HAS mentions). Newest completed sweep is ~33min
+# current run (ga-v3z4z, which HAS a claim). Newest completed sweep is ~33min
 # stale → not draining. None of the backlog should be flagged.
-markers = [mk("ga-wisp-v3z4z", "fix/ga-v3z4z-pilot-neverstarted-recovery", MIN_AGE + 2400)]
-markers += [mk("ga-wisp-b%d" % i, "crew/wa/wa-b%d" % i, MIN_AGE + 600 + i*120) for i in range(11)]
-incident_log = "[2026-06-12 20:13:40] Re-convening dead reviewer slot 0 ... branch=fix/ga-v3z4z-pilot-neverstarted-recovery\n" * 9
-res = m._detect_orphan_markers(markers, STALE_SWEEPS, incident_log, NOW)
+markers = [mk("ga-wisp-v3z4z", "fix/ga-v3z4z-pilot-neverstarted-recovery", OVERDUE + 2400)]
+markers += [mk("ga-wisp-b%d" % i, "crew/wa/wa-b%d" % i, OVERDUE + 600 + i*120) for i in range(11)]
+incident_claims = [claim(1500, "ga-wisp-v3z4z")]
+witness = {"ga-wisp-v3z4z": NOW - (OVERDUE + 2400)}
+res = detect(markers, STALE_SWEEPS, incident_claims, created=witness)
 if res == []:
     ok("a normal backlog stuck behind a wedged current run does NOT false-fire (the literal AC would have flagged 12)")
 else:
     bad("REGRESSION: live-incident backlog falsely flagged as orphan: %r" % (res,))
-# And even if we PRETEND the dispatcher is draining, the oldest (ga-v3z4z) is
-# mentioned so it is excluded, and the rest have no newer-mentioned sibling.
-res2 = m._detect_orphan_markers(markers, FRESH_SWEEPS, incident_log, NOW)
-if all(r[0] != "ga-wisp-v3z4z" for r in res2):
-    ok("the current (mentioned) run is never flagged even when draining")
+# And even if we PRETEND the dispatcher is draining, the oldest (ga-v3z4z) has a claim
+# so it is excluded — and only the head is ever evaluated.
+res2 = detect(markers, FRESH_SWEEPS, incident_claims, created=witness)
+if res2 == []:
+    ok("the current (claimed) run is never flagged even when draining")
 else:
-    bad("REGRESSION: the actively-worked run ga-v3z4z was flagged as orphan")
+    bad("REGRESSION: the actively-worked run ga-v3z4z was flagged as orphan: %r" % (res2,))
 
-# ── Scenario 9: oldest-first ordering when multiple orphans exist ─────────────
-print("Scenario 9: multiple orphans → oldest returned first")
+# ── Scenario 9: only the FIFO head is ever a candidate ─────────────────────────
+print("Scenario 9: head-only — a sunk head (rebase-fail) is silent, and the unclaimed marker behind it is NOT reported")
+# Everything newer than the head is FIFO-blocked behind it, not skipped (wa-68su / ga-te7es). A head that carries a
+# rebase-fail label is legitimately at the back of the dispatcher's tier order, so it is not an orphan either.
+head_age = OVERDUE + 7200
 markers = [
-    mk("ga-wisp-old",  "crew/wa/wa-old",  MIN_AGE + 7200),
-    mk("ga-wisp-mid",  "crew/wa/wa-mid",  MIN_AGE + 3600),
-    mk("ga-wisp-newer","crew/wa/wa-newer", MIN_AGE - 600),    # mentioned → the leapfrogger
+    mk("ga-wisp-old", "crew/wa/wa-old", head_age, labels=["gate:exiled-tier5:2"]),
+    mk("ga-wisp-mid", "crew/wa/wa-mid", head_age - 3600),
 ]
-log = "[..] claimed branch=crew/wa/wa-newer for dispatching\n"
-res = m._detect_orphan_markers(markers, FRESH_SWEEPS, log, NOW)
-res.sort(key=lambda o: o[2], reverse=True)  # mirror orphaned_queued_marker()
-if res and res[0][0] == "ga-wisp-old":
-    ok("oldest orphan (ga-wisp-old) is first; %d orphans found" % len(res))
+res = detect(markers, FRESH_SWEEPS, [claim(600, "ga-wisp-newer")], created={"ga-wisp-newer": NOW - (head_age - 5000)})
+if res == []:
+    ok("sunk head → silent, and the unclaimed marker behind it is not reported (head-only)")
 else:
-    bad("expected oldest-first ['ga-wisp-old', ...], got %r" % ([r[0] for r in res],))
+    bad("expected [] (head-only), got %r" % (res,))
 
 # ── Scenario 9b: _queued_markers() excludes a closed marker with a stale label ──
 # (ga-huke4: a marker closed via the ad-hoc withdrawal path — e.g. "WITHDRAWN as
@@ -203,12 +214,19 @@ m.sh = _fake_sh_rows([
      "labels": ["type:quality-gate-marker", "gate-status:queued", "branch:crew/wa/wa-withdrawn"],
      "created_at": "2026-06-30T00:48:57Z"},
 ])
-qm_ids = [q[0] for q in m._queued_markers()]
+qm = m._queued_markers()
+qm_ids = [q[0] for q in qm]
 m.sh = _real_sh_qm
 if qm_ids == ["ga-wisp-open"]:
     ok("closed marker excluded even though it still carries the gate-status:queued label")
 else:
     bad("expected only ['ga-wisp-open'], got %r — closed/withdrawn marker leaked through" % (qm_ids,))
+# ga-yprwyk: the labels ride along — the proof must see a rebase-fail / exile / cooldown label to know a marker is
+# legitimately sunk. A tuple that dropped them would make every sunk head look like a healthy skipped one.
+if qm and len(qm[0]) == 4 and "gate-status:queued" in qm[0][3] and "branch:crew/wa/wa-open" in qm[0][3]:
+    ok("_queued_markers() returns (id, branch, created, labels) with the marker's real labels")
+else:
+    bad("expected a 4-tuple carrying the labels, got %r" % (qm,))
 
 # ── Drift guard: the live script actually wires the detector in ──────────────
 print("Scenario 10: drift-guard — detector defined and wired into main()")

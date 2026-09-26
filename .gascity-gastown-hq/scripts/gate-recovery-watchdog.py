@@ -55,13 +55,28 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     not 'dispatching' (stuck_dispatching blind), no TIMEOUT (recent_timeouts
     blind), and not head-of-line (the queue drains for OTHER branches, so
     headofline_stall sees verdicts advancing for those).
-  Signature (orphaned_queued_marker): a queued marker that is (a) older than
-    ORPHAN_MIN_AGE_SEC, (b) NEVER mentioned in the recent dispatcher log, while
-    (c) the dispatcher is actively draining (newest 'sweep complete' is fresh)
-    and (d) a strictly-NEWER queued marker's branch IS mentioned — proof the
-    dispatcher leapfrogged the older one. The leapfrog proof (d) is what keeps a
-    normal FIFO backlog behind a slow run — many markers older than the newest
-    completed sweep, but none actually skipped — from false-firing.
+  Signature (orphaned_queued_marker, ga-yprwyk — keyed on the MARKER ID and on the
+    dispatcher's own tier order, NOT on branch-name mentions): the FIFO-head queued
+    marker H is an orphan only when ALL of these hold:
+      (a) H is past the dispatcher's overdue ceiling (GATE_MARKER_HARD_AGE_SECONDS —
+          READ from the dispatcher source + its launchd env, never a copied number);
+      (b) the dispatcher log, read back to BEFORE H was created, holds no
+          'Attempting to claim marker <H>' line (zero dispatch attempts, ever);
+      (c) the dispatcher DID claim a marker created AFTER H, at an instant when H was
+          already past the ceiling — the witness;
+      (d) H carries no gate:rebase-* / gate:exiled-* label and no live
+          gate:retry-cooldown-until label — the states that legitimately sink a
+          marker to the back of the queue;
+      (e) the dispatcher is actively draining (newest 'sweep complete' is fresh).
+    Why (c) is a PROOF and not a guess: tier 1 of the dispatcher's marker-select is
+    priority-blind, oldest-first over every overdue healthy marker, so a newer marker
+    cannot be selected while an older healthy overdue one is queued and visible. A
+    YOUNG head is never an orphan — below the ceiling the dispatcher legitimately
+    serves a newer marker first (priority / smallest-diff / one freshest 'reserve'
+    marker), so no claim order can prove a skip. The pre-ga-yprwyk proof ("H's branch
+    is unmentioned while a newer marker's branch IS") assumed one marker per sweep,
+    oldest-first; it flagged ga-b9pz7q 3min before the dispatcher claimed it, and a
+    branch substring also matches an EARLIER attempt of the same branch.
 
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
@@ -113,7 +128,7 @@ HEADOFLINE_NONREPAIR_MIN_SWEEPS = int(os.environ.get("GRW_HOL_NONREPAIR_MIN_SWEE
 HEADOFLINE_NONREPAIR_LOG_EVERY_SEC = int(os.environ.get("GRW_HOL_NONREPAIR_LOG_EVERY_SEC", "1800"))
 ORPHAN_LOG_FRESH_SEC = 600     # dispatcher log must be live (process still writing) — else ENGINE-STALL's job
 ORPHAN_DRAIN_FRESH_SEC = 1200  # newest COMPLETED sweep within 20min = dispatcher actively draining (not wedged on one run)
-ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned before we call it skipped (rules out a just-created marker)
+ORPHAN_MIN_AGE_SEC = 1800      # cheap pre-filter ONLY (ga-yprwyk): a head younger than this skips the wide log read. NOT the bar for calling a marker skipped — the proof needs age > the dispatcher's overdue ceiling + ORPHAN_PROOF_MARGIN_SEC (~92min by default; see _orphan_verdict)
 # ga-b1iulk: orphaned_queued_marker() was BLIND from 15/09 (strict UTF-8 read of the dispatcher log), so its
 # proof was never exercised against today's dispatcher. The first live read after the reader fix flagged
 # ga-b9pz7q (age 3.5h) as orphaned; the dispatcher claimed that very marker ~3min later, in a strict
@@ -124,10 +139,21 @@ ORPHAN_MIN_AGE_SEC = 1800      # a queued marker must sit >=30min unmentioned be
 # branch-name substring also matches an EARLIER attempt of the same branch. On a
 # deep queue every head marker would trip it, and each false positive would hold the single repair-dog slot
 # (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs. So the repair path is OFF unless explicitly enabled;
-# the signal is still logged (once per marker per ORPHAN_LOGONLY_EVERY_SEC). Re-enable only once the proof
-# is marker-id + tier aware (follow-up bead).
+# the signal is still logged (once per marker per ORPHAN_LOGONLY_EVERY_SEC).
+# ga-yprwyk: the proof is now marker-id + tier aware (see the module docstring), but the default STAYS 0.
+# The acceptance bar for flipping it is an observation, not a unit test: run this detector against the LIVE
+# log through >= 1 complete drain of a deep queue and see ZERO false positives, then flip the default.
 GRW_ORPHAN_REPAIR_ENABLED = os.environ.get("GRW_ORPHAN_REPAIR_ENABLED", "0") == "1"
 ORPHAN_LOGONLY_EVERY_SEC = int(os.environ.get("GRW_ORPHAN_LOGONLY_EVERY_SEC", "1800"))
+# ga-yprwyk knobs. All are safety margins / read windows for the proof, never a copy of a dispatcher number
+# (the overdue ceiling itself comes from _dispatcher_hard_age()).
+ORPHAN_PROOF_MARGIN_SEC = 120      # a witness claim must land this far PAST the ceiling: the claim line is stamped a hair after the dispatcher's own 'now', at 1s resolution
+ORPHAN_CLAIM_TAIL_LINES = int(os.environ.get("GRW_ORPHAN_CLAIM_TAIL_LINES", "40000"))  # how far back the claim history is read (~1 day at 25/09's ~1.4k lines/h; the 3000-line tail covered only ~1.7h — a 3.5h-old head was never covered)
+ORPHAN_WITNESS_LOOKUPS = 25        # max `bd show` calls per poll to learn a claimed marker's created_at (results are cached: a marker's created_at never changes)
+ORPHAN_TUNABLES_TTL_SEC = 300      # re-derive the dispatcher's overdue ceiling this often
+ORPHAN_NOTE_EVERY_SEC = 3600       # a "cannot prove" note (proof unavailable) is printed at most this often per reason
+DISPATCHER_SRC = os.path.join(CITY, "packs/town-deltas/assets/quality-gate-dispatcher.sh")   # the file launchd runs (`ps` shows this exact path)
+DISPATCHER_LAUNCHD_LABEL = "com.gascity.quality-gate-dispatcher"
 WAKE_COOLDOWN_SEC = int(os.environ.get("WAKE_COOLDOWN_SEC", "1200"))   # base: don't dispatch a new repair for the SAME condition more than once per 20min
 ESCALATE_AFTER_WAKES = int(os.environ.get("ESCALATE_AFTER_WAKES", "2"))  # after N unresolved repair-cycles for one condition, page Athos 🚨
 
@@ -879,8 +905,8 @@ def frozen_reviewer_run_verdict(pending_names, killed_identities):
 
 
 def _queued_markers():
-    """[(id, branch, created_epoch), ...] for every OPEN gate-status:queued
-    marker. --all is required to surface the normally-hidden gate-marker type,
+    """[(id, branch, created_epoch, labels), ...] for every OPEN gate-status:queued
+    marker (labels: a tuple of the marker's label strings, ga-yprwyk). --all is required to surface the normally-hidden gate-marker type,
     but it also lifts bd's default closed-issue hiding — so a marker closed via
     the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
     gate-status:queued label would otherwise be indistinguishable from a
@@ -914,7 +940,9 @@ def _queued_markers():
             if m:
                 branch = m.group(1)
                 break
-        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at"))))
+        # ga-yprwyk: the labels ride along — the orphan proof must know whether a rebase-fail / exile /
+        # retry-cooldown label legitimately sinks this marker in the dispatcher's tier order.
+        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ())))
     return out
 
 
@@ -941,70 +969,290 @@ def _dispatcher_log_state(tail=3000):
     return (epochs, "".join(l + "\n" for l in lines), fresh)
 
 
-def _detect_orphan_markers(markers, sweep_epochs, log_text, now):
-    """Pure core of orphaned_queued_marker() (separated for the selftest).
+# ---- ga-yprwyk: orphan proof keyed on the MARKER ID and on the dispatcher's tier order -----------------------
+# quality-gate-dispatcher.sh logs exactly one 'Attempting to claim marker <id> ...' line per selection, right
+# after its marker-select block. The id is unique per marker (a fresh /gate-done mints a NEW id), so — unlike the
+# branch-name substring the ga-b1iulk detector used — it cannot match an EARLIER attempt of the same branch.
+DISPATCH_CLAIM_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[quality-gate-dispatcher\] Attempting to claim marker (\S+) \.\.\.\s*$")
+DISPATCH_LINE_TS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[")
+# Labels that legitimately sink a marker in the dispatcher's tier order. Broader than the dispatcher's own
+# has_rebase_fail regex on purpose (rebase-attempt | exiled-tier5, plus their companions rebase-fail-count /
+# exiled-since): on doubt, a marker that looks explained is NOT called an orphan.
+ORPHAN_SINK_LABEL_RE = re.compile(r"^gate:(rebase-|exiled-)")
+ORPHAN_COOLDOWN_LABEL_RE = re.compile(r"^gate:retry-cooldown-until:(\d+)$")
+# The two lines of the dispatcher's marker-select preamble the overdue ceiling is derived from.
+_DISPATCHER_PROMOTE_RE = re.compile(
+    r'^GATE_MARKER_AGE_PROMOTE_SECONDS="\$\{GATE_MARKER_AGE_PROMOTE_SECONDS:-(\d+)\}"', re.M)
+_DISPATCHER_HARD_MULT_RE = re.compile(
+    r'^GATE_MARKER_HARD_AGE_SECONDS="\$\{GATE_MARKER_HARD_AGE_SECONDS:-\$\(\(GATE_MARKER_AGE_PROMOTE_SECONDS \* (\d+)\)\)\}"', re.M)
+_LAUNCHD_TUNABLE_RE = re.compile(
+    r"^\s*(GATE_MARKER_AGE_PROMOTE_SECONDS|GATE_MARKER_HARD_AGE_SECONDS) => (.*?)\s*$", re.M)
 
-    Returns the orphaned queued markers as [(id, branch, age_sec), ...], oldest
-    first. A marker is an orphan when ALL hold:
-      (drain) the dispatcher is actively draining — the newest 'sweep complete'
-              is within ORPHAN_DRAIN_FRESH_SEC. If the last completed sweep is
-              stale, the dispatcher is wedged on its CURRENT run (a different
-              failure mode: timeout / drained-reviewer / engine-stall), not
-              leapfrogging — so we stay silent.
-      (a)     the marker has sat queued >= ORPHAN_MIN_AGE_SEC (not just created).
-      (b)     its branch is NEVER mentioned in the recent dispatcher log (zero
-              dispatch attempts — its gate_run was dropped during the outage).
-      (d)     a strictly-NEWER queued marker's branch IS mentioned — PROOF the
-              dispatcher leapfrogged this older one. This is the guard that
-              distinguishes a true orphan from a normal FIFO backlog stuck behind
-              a slow run: in a healthy backlog the OLDEST unmentioned marker is
-              simply next-up and no newer marker is being worked ahead of it.
-      (head)  ONLY the FIFO-oldest queued marker is eligible. A non-head marker is
-              by definition FIFO-blocked behind an older one (the dispatcher takes
-              one marker per sweep, oldest-first) — NOT orphaned. This is the guard
-              that kills the recurring false positive (wa-68su / ga-te7es: a #2
-              marker flagged 'orphan' while the OLDER head was being actively gated
-              or yielding to a live sibling run; refs
-              [[gate-orphan-watchdog-false-positive-headofline-block]],
-              [[ga-te7es-gate-orphan-falsepos-sibling-headofline]]). A true
-              gt-mqkwj orphan (its gate_run dropped in an outage) is always the
-              oldest still-queued marker, so this loses no real detection."""
+_HARD_AGE_CACHE = {"at": 0.0, "value": None}
+_MARKER_CREATED_CACHE = {}    # marker id -> created epoch; a marker's created_at never changes, so this never goes stale
+_ORPHAN_NOTED = {}            # reason -> last time its "cannot prove" note was printed
+_ORPHAN_EVIDENCE = {}         # marker id -> why the last detection called it an orphan (read by main()'s log line)
+
+
+def _dispatcher_claims(lines):
+    """Every dispatcher claim in `lines` as [(epoch, marker_id), ...], in log order.
+
+    Anchored to the dispatcher's own '[timestamp] [quality-gate-dispatcher]' prefix: the log also carries
+    multi-line reviewer output, and a quoted 'Attempting to claim marker ...' inside it is not a claim."""
+    out = []
+    for l in lines:
+        mm = DISPATCH_CLAIM_RE.match(l)
+        if not mm:
+            continue
+        e = log_ts_epoch(l)
+        if e:
+            out.append((e, mm.group(2)))
+    return out
+
+
+def _log_first_epoch(lines):
+    """Epoch of the first well-formed dispatcher-log line in `lines` — how far back the read really reaches
+    (None when no line carries a timestamp: the reach is then UNKNOWN, never assumed)."""
+    for l in lines:
+        if DISPATCH_LINE_TS_RE.match(l):
+            e = log_ts_epoch(l)
+            if e:
+                return e
+    return None
+
+
+def _dispatcher_hard_age_from(src_text, launchd_text):
+    """The dispatcher's overdue ceiling in seconds, from its source + its launchd environment; None if either
+    cannot be read or the source no longer has the shape this parses (an UNKNOWN ceiling must never become a guess).
+
+    Mirrors the preamble of quality-gate-dispatcher.sh's marker-select block:
+      GATE_MARKER_AGE_PROMOTE_SECONDS=${...:-1800}      (non-numeric / empty  -> the default)
+      GATE_MARKER_HARD_AGE_SECONDS=${...:-PROMOTE * 3}  (non-numeric / empty  -> PROMOTE * 3)
+    `launchctl print` lists inherited, default and job environment in that order, so the LAST occurrence of a
+    key is the one the job runs with."""
+    if not src_text or launchd_text is None:
+        return None
+    pm = _DISPATCHER_PROMOTE_RE.search(src_text)
+    hm = _DISPATCHER_HARD_MULT_RE.search(src_text)
+    if not pm or not hm:
+        return None
+    promote, mult = int(pm.group(1)), int(hm.group(1))
+    env = {}
+    for key, val in _LAUNCHD_TUNABLE_RE.findall(launchd_text):
+        env[key] = val
+    def _numeric(v):
+        return v is not None and re.fullmatch(r"[0-9]+", v) is not None
+    if _numeric(env.get("GATE_MARKER_AGE_PROMOTE_SECONDS")):
+        promote = int(env["GATE_MARKER_AGE_PROMOTE_SECONDS"])
+    if _numeric(env.get("GATE_MARKER_HARD_AGE_SECONDS")):
+        return int(env["GATE_MARKER_HARD_AGE_SECONDS"])
+    return promote * mult
+
+
+def _dispatcher_hard_age(now=None):
+    """Cached _dispatcher_hard_age_from() over the live dispatcher source + `launchctl print` of its job."""
+    now = time.time() if now is None else now
+    if _HARD_AGE_CACHE["value"] is not None and now - _HARD_AGE_CACHE["at"] < ORPHAN_TUNABLES_TTL_SEC:
+        return _HARD_AGE_CACHE["value"]
+    try:
+        with open(DISPATCHER_SRC, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except Exception:
+        src = ""
+    r = sh(["launchctl", "print", "gui/%d/%s" % (os.getuid(), DISPATCHER_LAUNCHD_LABEL)], timeout=10)
+    launchd = r.stdout if (r is not None and r.returncode == 0) else None
+    val = _dispatcher_hard_age_from(src, launchd)
+    if val is not None:
+        _HARD_AGE_CACHE["at"], _HARD_AGE_CACHE["value"] = now, val
+    return val
+
+
+def _marker_created_epoch(mid):
+    """created_at epoch of marker `mid` (any status, closed included) via the cached bd read shim, or None when it
+    cannot be learned. Only successes are cached: a failed read is retried on the next poll."""
+    if mid in _MARKER_CREATED_CACHE:
+        return _MARKER_CREATED_CACHE[mid]
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "show", mid, "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout)
+    except Exception:
+        return None
+    row = rows[0] if isinstance(rows, list) and rows else (rows if isinstance(rows, dict) else None)
+    if not isinstance(row, dict) or row.get("id") != mid:
+        return None
+    e = _iso_epoch(row.get("created_at"))
+    if e is not None:
+        if len(_MARKER_CREATED_CACHE) >= 4096:
+            _MARKER_CREATED_CACHE.clear()
+        _MARKER_CREATED_CACHE[mid] = e
+    return e
+
+
+def _orphan_note(reason, msg, now=None):
+    """Print a 'the proof is unavailable' note, at most once per ORPHAN_NOTE_EVERY_SEC per reason. A detector
+    that goes quiet because it CANNOT decide must say so — silence would read as 'no orphan' (ga-b1iulk)."""
+    now = time.time() if now is None else now
+    if now - _ORPHAN_NOTED.get(reason, 0) >= ORPHAN_NOTE_EVERY_SEC:
+        print("[watchdog] orphan-proof unavailable (%s): %s" % (reason, msg), flush=True)
+        _ORPHAN_NOTED[reason] = now
+
+
+def _marker_fields(m):
+    """(id, branch, created_epoch, labels) from a queued-marker tuple; labels is None when the tuple carries none
+    (an old-shape 3-tuple) — the proof then cannot rule the sink labels out, so it stays silent."""
+    labels = tuple(m[3]) if len(m) > 3 and m[3] is not None else None
+    return (m[0], m[1], m[2], labels)
+
+
+def _orphan_head(markers, sweep_epochs, now, min_age):
+    """The FIFO-oldest queued marker, iff the dispatcher is actively draining and that marker is at least `min_age`
+    old — else None. Only the head is ever a candidate: everything newer is FIFO-blocked behind it, not skipped
+    (wa-68su / ga-te7es: the recurring 'a #2 marker flagged while the older head was being gated' false positive)."""
     if not sweep_epochs:
-        return []
+        return None
     if now - max(sweep_epochs) > ORPHAN_DRAIN_FRESH_SEC:
-        return []  # dispatcher not actively draining → not this failure mode
-    valid = [(mid, b, c) for (mid, b, c) in markers if mid and b and c]
-    valid.sort(key=lambda m: m[2])  # oldest first
+        return None  # newest completed sweep is stale: the dispatcher is wedged on its CURRENT run — a different failure mode
+    valid = []
+    for m in markers:
+        mid, branch, created, labels = _marker_fields(m)
+        if mid and branch and created:
+            valid.append((mid, branch, created, labels))
     if not valid:
+        return None
+    valid.sort(key=lambda x: x[2])  # oldest first
+    head = valid[0]
+    if now - head[2] < min_age:
+        return None
+    return head
+
+
+def _cooldown_covers(labels, t):
+    """True iff a gate:retry-cooldown-until:<epoch> label with epoch > t is present — the dispatcher excludes a marker
+    from EVERY tier while `$now < retry_cooldown_until` (its `in_retry_cooldown`), so a claim at t proves nothing."""
+    for lb in labels:
+        mm = ORPHAN_COOLDOWN_LABEL_RE.match(lb)
+        if mm and int(mm.group(1)) > t:
+            return True
+    return False
+
+
+def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now):
+    """Decide whether the FIFO-head queued marker was SKIPPED by the dispatcher. Returns (orphan, reason, evidence):
+    orphan is (id, branch, age_sec) or None; reason is a short code for the outcome (the caller notes only the
+    'cannot prove' ones); evidence says WHY it is an orphan.
+
+    A skip is provable only for an OVERDUE head, because tier 1 of the dispatcher's marker-select — priority-blind,
+    oldest-first over every overdue healthy marker — guarantees it would be picked before any newer marker. See the
+    module docstring for the full signature and for why a young head can never be proven skipped.
+
+      claims          [(epoch, marker_id), ...] every dispatcher claim in the log read (any order)
+      log_first_epoch how far back that read reaches — the proof needs the head's WHOLE life, so it must reach
+                      back to before the head was created (else an earlier claim could sit outside the window:
+                      a marker claimed, then re-queued, is not an orphan)
+      hard_age        the dispatcher's overdue ceiling in seconds (None = unknown -> no proof)
+      created_of      marker_id -> created epoch or None (a claimed marker is usually no longer queued)"""
+    if hard_age is None:
+        return (None, "tunables", "")
+    head = _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC)
+    if head is None:
+        return (None, "no-candidate", "")
+    mid, branch, created, labels = head
+    threshold = created + hard_age + ORPHAN_PROOF_MARGIN_SEC
+    if now <= threshold:
+        return (None, "young", "")
+    if labels is None:
+        return (None, "labels-unknown", "")
+    if any(ORPHAN_SINK_LABEL_RE.match(lb) for lb in labels):
+        return (None, "sunk-by-label", "")
+    if log_first_epoch is None or log_first_epoch > created:
+        return (None, "log-coverage", "")
+    if any(xid == mid for (_t, xid) in claims):
+        return (None, "claimed", "")
+    for (t, xid) in sorted(claims, reverse=True):     # newest first: a real orphan is skipped on EVERY sweep
+        if t <= threshold:
+            break                                      # older claims cannot witness: the head was not yet provably overdue
+        if xid == mid or _cooldown_covers(labels, t):
+            continue
+        xc = created_of(xid)
+        if xc is not None and xc > created:
+            evidence = ("never claimed in the dispatcher log since it was created (log read back to %s); at %s the "
+                        "dispatcher claimed %s (created %s) — AFTER this marker — while it was already past the %ds "
+                        "overdue ceiling (tier 1 is oldest-first over every overdue healthy marker, so a newer one "
+                        "cannot win while an older one is eligible)"
+                        % (time.strftime("%m-%d %H:%M", time.localtime(log_first_epoch)),
+                           time.strftime("%m-%d %H:%M:%S", time.localtime(t)), xid,
+                           time.strftime("%m-%d %H:%M:%S", time.localtime(xc)), hard_age))
+            return ((mid, branch, int(now - created)), "orphan", evidence)
+    return (None, "no-witness", "")
+
+
+def _detect_orphan_markers(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, evidence=None):
+    """Pure core of orphaned_queued_marker() (separated for the selftest): [(id, branch, age_sec)] — the FIFO-head
+    marker when the dispatcher provably skipped it, else []. If `evidence` is a dict it receives {id: why}.
+    See _orphan_verdict() for the proof and the module docstring for the signature."""
+    orphan, _reason, why = _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now)
+    if orphan is None:
         return []
-    # (head) only the FIFO-oldest queued marker can be an orphan; everything newer
-    # is FIFO-blocked behind it, not skipped. Evaluating only valid[0] is what
-    # suppresses the head-of-line false positive that drove the 6x-same-marker loop.
-    mid, branch, created = valid[0]
-    if now - created < ORPHAN_MIN_AGE_SEC:
-        return []
-    if branch in log_text:
-        return []  # head mentioned → being / already dispatched (or actively gated), not orphaned
-    leapfrogged = any(c2 > created and b2 != branch and b2 in log_text
-                      for (_m2, b2, c2) in valid)
-    if not leapfrogged:
-        return []
-    return [(mid, branch, int(now - created))]
+    if evidence is not None:
+        evidence[orphan[0]] = why
+    return [orphan]
 
 
 def orphaned_queued_marker():
-    """Detect a gate-status:queued marker whose gate_run was dropped during a
-    dispatcher outage and is now being leapfrogged (gt-mqkwj). Returns
-    (marker_id, branch, age_sec) for the OLDEST orphan, else (None, None, 0).
-    Fail-safe: any gather error returns no orphan (never wakes spuriously)."""
-    sweep_epochs, log_text, log_fresh = _dispatcher_log_state()
+    """Detect the FIFO-head gate-status:queued marker the dispatcher provably SKIPPED (gt-mqkwj; proof rebuilt in
+    ga-yprwyk). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for a hit is left in
+    _ORPHAN_EVIDENCE[marker_id]. Fail-safe: any gather error, or any input that cannot be established, returns no
+    orphan (never wakes spuriously) — and the 'cannot prove' cases that would otherwise be invisible are noted."""
+    sweep_epochs, _log_text, log_fresh = _dispatcher_log_state()
     if not log_fresh or not sweep_epochs:
         return (None, None, 0)  # log not live → dead engine, ENGINE-STALL's job
-    orphans = _detect_orphan_markers(_queued_markers(), sweep_epochs, log_text, time.time())
-    if not orphans:
+    now = time.time()
+    markers = _queued_markers()
+    # Cheap gates first: the wide log read and the launchctl/source read below happen only for a REAL candidate.
+    if _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC) is None:
         return (None, None, 0)
-    orphans.sort(key=lambda o: o[2], reverse=True)  # oldest (largest age) first
-    return orphans[0]
+    hard_age = _dispatcher_hard_age(now)
+    try:
+        lines = _read_log_last_lines(DISPATCH_LOG, ORPHAN_CLAIM_TAIL_LINES)
+    except Exception as e:
+        _orphan_note("log-read", "cannot read the dispatcher log for the claim history: %r" % (e,), now)
+        return (None, None, 0)
+    known = dict((m[0], m[2]) for m in markers if m[0] and m[2])
+    budget = [ORPHAN_WITNESS_LOOKUPS]
+    failed = [0]     # `bd show` lookups that returned nothing: 'could not learn' must not read as 'not newer'
+
+    def created_of(xid):
+        if xid in known:
+            return known[xid]
+        if xid in _MARKER_CREATED_CACHE:
+            return _MARKER_CREATED_CACHE[xid]
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        e = _marker_created_epoch(xid)
+        if e is None:
+            failed[0] += 1
+        return e
+
+    orphan, reason, why = _orphan_verdict(markers, sweep_epochs, _dispatcher_claims(lines), _log_first_epoch(lines),
+                                          hard_age, created_of, now)
+    if reason == "tunables":
+        _orphan_note("tunables", "cannot derive the dispatcher's overdue ceiling from %s + `launchctl print %s` — "
+                     "no marker can be proven skipped until that is readable" % (DISPATCHER_SRC, DISPATCHER_LAUNCHD_LABEL), now)
+    elif reason == "no-witness" and failed[0]:
+        _orphan_note("witness-lookup", "could not learn created_at of %d claimed marker(s) via `bd show` — a skip witnessed only "
+                     "by those markers cannot be seen while that keeps failing" % failed[0], now)
+    elif reason == "log-coverage":
+        _orphan_note("log-coverage", "the dispatcher-log read (last %d lines) does not reach back to when the queue "
+                     "head was created, so 'never claimed' cannot be established" % ORPHAN_CLAIM_TAIL_LINES, now)
+    if orphan is None:
+        return (None, None, 0)
+    _ORPHAN_EVIDENCE.clear()
+    _ORPHAN_EVIDENCE[orphan[0]] = why
+    return orphan
 
 
 def _sup_log_ts_epoch(line):
@@ -1326,27 +1574,32 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
             "DIAGNÓSTICO (confirme que É órfão antes de agir):\n"
             "1. Veja o marker: `bd -C . show %s --json | jq '.[0]|{id,status,created_at,labels}'` "
             "(deve estar gate-status:queued, antigo, com source-bead:<X>).\n"
-            "2. Confirme ZERO menções do branch no log: "
-            "`grep -c '%s' .gc/logs/quality-gate-dispatcher.log` → se 0, o dispatcher nunca tentou despachá-lo.\n"
+            "2. Confirme ZERO tentativas de claim DESTE marker no log (pelo ID do marker — o branch também casa "
+            "uma tentativa ANTERIOR do mesmo branch, e isso já enganou este detector): "
+            "`grep -c 'Attempting to claim marker %s ' .gc/logs/quality-gate-dispatcher.log` → se 0, o dispatcher "
+            "nunca tentou despachá-lo. (O watchdog já provou que um marker MAIS NOVO foi claimado com este já "
+            "vencido — veja a linha 'orphan' no diagnóstico; o dispatcher escolhe overdue mais velho primeiro.)\n"
             "3. Confirme que o dispatcher está DRENANDO outros branches (há 'sweep complete' recente p/ branches "
             "DIFERENTES) — senão NÃO é órfão, é o run atual travado (outro modo de falha; não mexa).\n\n"
             "CONSERTO — DECIDA pelo estado do branch:\n"
-            "  (a) Branch AINDA quer mergear (código não landou): RE-QUEUE o MESMO marker p/ o dispatcher "
-            "redespachá-lo com um run fresco — remova e re-adicione gate-status:queued "
-            "(`bd -C . update %s --remove-label gate-status:queued && bd -C . update %s --add-label gate-status:queued`) "
-            "pra refrescar o created_at e tirá-lo da cabeça órfã da fila. NÃO duplique o marker. "
-            "Confirme no próximo sweep que o branch aparece sendo despachado.\n"
+            "  (a) Branch AINDA quer mergear (código não landou): FECHE este marker e MINTE um novo (clone da descrição, "
+            "docs/gate-marker-recipe.md) — o created_at é IMUTÁVEL: remover e re-adicionar gate-status:queued "
+            "(`bd -C . update %s --remove-label gate-status:queued` + `--add-label`) NÃO o refresca e NÃO muda a posição "
+            "dele na fila (o próprio dispatcher documenta isso; um repair dog já gastou um ciclo inteiro nesse truque, "
+            "ga-gsh1e). Antes de re-mintar, descubra POR QUE o dispatcher o pulou (labels do marker, created_at fora do "
+            "formato ...Z, leitura de fila truncada) — senão o marker novo pode ser pulado igual. Confirme no próximo "
+            "sweep que o novo aparece em 'Attempting to claim marker'.\n"
             "  (b) Branch JÁ mergeou / é zumbi (código já está em origin/main): SUPERSEDE — feche o marker "
             "(`bd -C . close %s --reason 'orphan run dropped; work already landed (gt-mqkwj)'`) E feche o "
             "source-bead in_progress (veja o label source-bead:<X> do marker; `bd -C . close <X> --reason "
             "'merged; orphan marker superseded (gt-mqkwj)'`) pra PARAR o reconciler de re-spawnar worker.\n"
-            "3. O objetivo é tirar o marker órfão do limbo: ou ele roda (re-queue) ou some (supersede+close) — "
+            "3. O objetivo é tirar o marker órfão do limbo: ou ele roda (re-mint) ou some (supersede+close) — "
             "em ambos os casos o bead de origem deixa de ficar preso in_progress.\n\n"
             "Diagnóstico salvo em: %s\n"
             "Se resolver, avise (notify -p 3). Só acione o Athos (notify -p 5) se NÃO conseguir.\n"
             "(Fix permanente seria o dispatcher detectar markers sem gate_run e re-criar o run — esta detecção+reparo "
             "é a ponte até lá.)"
-        ) % (reason, dolt_hits, dolt_hits, reason, dolt_hits, dolt_hits, dolt_hits, diag_path)
+        ) % (reason, dolt_hits, dolt_hits, dolt_hits, dolt_hits, dolt_hits, diag_path)
     if dolt_hits >= DOLT_INSTABILITY_MIN_HITS:
         return (
             "O gate parou de produzir vereditos. Motivo detectado: %s. "
@@ -4457,8 +4710,9 @@ def main():
         # --- ORPHANED queued marker (closes the gt-mqkwj blind spot: a marker
         #     whose gate_run was dropped in an outage is leapfrogged forever →
         #     bead stuck in_progress → reconciler re-spawns a worker ~6x). The
-        #     leapfrog proof + FIFO-head guard keep a normal backlog / head-of-line
-        #     block from false-firing (the 6x-same-marker driver). ---
+        #     tier-aware skip proof (module docstring, ga-yprwyk) + FIFO-head guard
+        #     keep a normal backlog / head-of-line block / deep healthy queue from
+        #     false-firing (the 6x-same-marker driver). ---
         orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()
         if saw_orphan and lp and lp > last_orphan_spawn:
             print("[watchdog] orphaned marker cleared (Gate PASSED after repair dispatch) — resetting", flush=True)
@@ -4468,13 +4722,14 @@ def main():
             # ga-b1iulk: LOG ONLY (see GRW_ORPHAN_REPAIR_ENABLED). No snapshot, no repair dog, no push.
             if now - orphan_logged.get(orphan_id, 0) >= ORPHAN_LOGONLY_EVERY_SEC:
                 print("[watchdog] orphaned-marker candidate (log-only, NO repair dog spawned): %s branch %s "
-                      "queued %dmin, branch unmentioned in the dispatcher log tail while a newer marker's is — "
-                      "NOT proof of a drop: the dispatcher is tiered, not oldest-first (ga-b1iulk)"
-                      % (orphan_id, orphan_branch, orphan_age // 60), flush=True)
+                      "queued %dmin — %s. Repair stays off until a live full-drain run shows zero false positives "
+                      "(GRW_ORPHAN_REPAIR_ENABLED, ga-yprwyk)"
+                      % (orphan_id, orphan_branch, orphan_age // 60, _ORPHAN_EVIDENCE.get(orphan_id, "no evidence recorded")),
+                      flush=True)
                 orphan_logged[orphan_id] = now
         elif orphan_id and not infra:
-            odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho)"
-                             % (orphan_id, orphan_branch, orphan_age // 60), 0)
+            odiag = snapshot("orphaned queued marker %s (branch %s, %dmin sem despacho) — %s"
+                             % (orphan_id, orphan_branch, orphan_age // 60, _ORPHAN_EVIDENCE.get(orphan_id, "no evidence recorded")), 0)
             # reason=branch (title), marker id carried for the runbook + dedup key
             ohow = governed_spawn(gov, sessions, now, "gate-orphan", orphan_branch, odiag, orphan_id,
                                   "Marker órfão (run derrubado num outage)",

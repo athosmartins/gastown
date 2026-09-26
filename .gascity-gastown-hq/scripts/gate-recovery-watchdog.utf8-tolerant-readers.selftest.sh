@@ -24,8 +24,9 @@
 #
 # Also pinned: the helper keeps every site's window at N LINES (never widened to N bytes) and equals the
 # old readlines()[-N:] on a clean log; and orphaned_queued_marker()'s repair path is OFF by default
-# (see GRW_ORPHAN_REPAIR_ENABLED — the detector's leapfrog proof is contradicted by the dispatcher's own
-# tiered selection, found by running the fixed reader against the live queue).
+# (see GRW_ORPHAN_REPAIR_ENABLED — the detector's leapfrog proof was contradicted by the dispatcher's own
+# tiered selection, found by running the fixed reader against the live queue). ga-yprwyk rebuilt the proof on the
+# marker id + the dispatcher's tier order; the end-to-end case below now drives THAT proof through the tolerant reader.
 #
 # Run: bash scripts/gate-recovery-watchdog.utf8-tolerant-readers.selftest.sh
 #      WD_OVERRIDE=<other copy of the watchdog> bash ...   (prove it fails on older code)
@@ -147,12 +148,34 @@ with Patch(DISPATCH_LOG=p):
 check(len(epochs) == 2 and fresh is True and BR in text,
       "_dispatcher_log_state() returns both sweeps, fresh=True and the tail text (got %d epochs, fresh=%r; strict read gave ([], '', False))" % (len(epochs), fresh))
 
-# End to end: the orphan detector is fed by _dispatcher_log_state, so a blind reader also blinds it.
-p = mklog("d-orphan.log", real_shape([dl(NOW - 100, "=== Dispatcher sweep complete: branch=%s verdict=QUEUED (retry 1/3, dead author) ===" % BR)]))
-with Patch(DISPATCH_LOG=p, _queued_markers=lambda: [("ga-head", "crew/x/head", NOW - 7200), ("ga-new", BR, NOW - 3600)]):
-    orphan = m.orphaned_queued_marker()
-check(orphan[0] == "ga-head" and orphan[1] == "crew/x/head",
-      "orphaned_queued_marker() gets a live log (got %r; strict read gave (None, None, 0) for every input)" % (orphan,))
+# End to end: the orphan detector is fed by the same tolerant reader (twice: the 3000-line state for the sweep epochs,
+# and — since ga-yprwyk — a WIDE read for the claim history), so a blind reader also blinds it. Both variants below use a
+# log with invalid UTF-8 inside the window, and a head far past the dispatcher's overdue ceiling (patched to the default
+# 5400s here: deriving it from the live launchd job is covered by gate-recovery-watchdog.orphan-proof-tiered.selftest.sh).
+HARD = 5400
+HEAD_CREATED = NOW - (HARD + m.ORPHAN_PROOF_MARGIN_SEC + 7200)
+def orphan_log(name, claimed_marker):
+    # an early well-formed line so the read provably reaches back to before the head was created, then the real shape
+    return mklog(name, [dl(NOW - 30000, "Found 20 queued marker(s)")] + real_shape(
+        [dl(NOW - 600, "Attempting to claim marker %s ..." % claimed_marker),
+         dl(NOW - 100, "=== Dispatcher sweep complete: branch=%s verdict=QUEUED (retry 1/3, dead author) ===" % BR)]))
+def run_orphan(p, created):
+    try:
+        with Patch(DISPATCH_LOG=p, _dispatcher_hard_age=lambda now=None: HARD,
+                   _marker_created_epoch=lambda mid: created.get(mid),
+                   _queued_markers=lambda: [("ga-head", "crew/x/head", HEAD_CREATED, ("gate-status:queued",))]):
+            return m.orphaned_queued_marker()
+    except Exception as e:                # an older watchdog copy (WD_OVERRIDE) has a different shape: report, don't crash
+        return ("EXC", repr(e), 0)
+
+# (1) the dispatcher claimed a marker created AFTER the head, while the head was overdue → the head was skipped
+orphan = run_orphan(orphan_log("d-orphan.log", "ga-new"), {"ga-new": HEAD_CREATED + 1800})
+check(orphan[0] == "ga-head" and orphan[1] == "crew/x/head" and "ga-new" in m._ORPHAN_EVIDENCE.get("ga-head", ""),
+      "orphaned_queued_marker() gets a live log and proves the skip from the claim history (got %r; strict read gave (None, None, 0) for every input)" % (orphan,))
+# (2) the same log, but the claim is of an OLDER marker: the queue is draining oldest-first, nothing was skipped
+orphan = run_orphan(orphan_log("d-fifo.log", "ga-older"), {"ga-older": HEAD_CREATED - 1800})
+check(orphan == (None, None, 0),
+      "a deep healthy queue (claims only of OLDER markers) is NOT flagged — the ga-b9pz7q false positive (got %r)" % (orphan,))
 
 # ── 2. Latent twins: pilot log + supervisor log ─────────────────────────────
 print("Scenario 2: the same strict read on the pilot log and the supervisor log")
