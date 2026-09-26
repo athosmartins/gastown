@@ -1,0 +1,32 @@
+# ga-a3ar7h: keep the jsonl-archive git repos compacted, by BYTES.
+#
+# mol-dog-jsonl commits a fresh 41MB hq.jsonl (+ 10-20MB whatsapp_automation.jsonl) many times a
+# day; measured 2026-09-26, that is 45MiB of loose objects per commit (~243MiB/h), against
+# 67-189KB per commit once packed. Git's own post-commit auto-maintenance decides by sampling ONE
+# directory (objects/17) of the loose-object COUNT, so it stayed silent while
+# packs/maintenance/jsonl-archive/.git grew to 5.3GiB of loose objects (0.5GiB packed for the
+# same 11k commits) and pushed the boot disk to its 2GB floor. The town's
+# git-maintenance-runner does not list these repos and skips below 10GB free.
+#
+# This order packs loose objects in bounded batches once they pass 256MiB, and runs one
+# consolidating gc when packs pile up (>= 8). It never shortens history — the S3 mirror copies
+# only the working tree, so the git history has no offsite copy. Full rationale, the alarm rule
+# and the failure states: header of assets/scripts/jsonl-archive-compact.sh.
+#
+# interval 30m: at ~243MiB/h of new loose blobs the 256MiB limit is crossed about hourly; 30m
+# bounds how long a crossing goes unnoticed. timeout 900s > the script's own 780s deadline so it
+# can log its outcome; interval > timeout and the script's single-flight lock keep runs from
+# stacking. selftest S11 fails if any of these drift apart, or if the interval passes 1h.
+#
+# Only ONE instance exists (this pack's orders register for the city scope); the script is
+# single-flight anyway.
+#
+# Verify after a reload:  gc order show jsonl-archive-compact   -> Source: .../town-deltas/...
+#                         bash $GC_CITY_PATH/packs/town-deltas/assets/scripts/jsonl-archive-compact.sh --check
+#                         tail -3 $GC_CITY_PATH/.gc/logs/jsonl-archive-compact.log
+[order]
+description = "Compact the jsonl-archive git repos by bytes — git's auto-gc counts objects and never fires on multi-MB blobs (5GiB/day of loose hq.jsonl copies)"
+trigger = "cooldown"
+interval = "30m"
+timeout = "900s"
+exec = "$PACK_DIR/assets/scripts/jsonl-archive-compact.sh"
