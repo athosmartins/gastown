@@ -461,12 +461,19 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
 #   ANY of the 41 active projects.
 # Every overlay below also drops sqlite, sequential-thinking and the playwright plugin; what differs is
 # what the role keeps:
-#   longlived                mayor, mila-wa, digo-wa   playwright-cdp + puppeteer + firecrawl-code-mode
-#                            (mila/digo had no session in the window: no evidence, so only the cut that
-#                            is zero-use everywhere)
+#   longlived                mayor                     playwright-cdp + puppeteer (its work dir and every parent
+#                                                      have no .mcp.json, so no code-mode server at all; the
+#                                                      live Mayor runs zero firecrawl, measured 2026-09-26)
+#                            mila-wa, digo-wa          the same + firecrawl-code-mode (their .mcp.json declares
+#                            it). mila/digo had no session in the window: no evidence, so only the cut that
+#                            is zero-use everywhere
 #   longlived-cdp-firecrawl  peter-wa                  playwright-cdp + firecrawl-code-mode
 #   longlived-cdp            batista-wa                playwright-cdp
-#   longlived-bare           thies-wa, oracle-wa       no local MCP server
+#   longlived-bare           thies-wa, oracle-wa       none of playwright-cdp, puppeteer or the code-mode servers
+# "Keeps" and "none" describe what was measured running on 2026-09-26, not a guarantee: these overlays are a
+# DENYLIST (they name what to switch off). discord, sentry and browserless are user-scope servers that showed
+# pending/failed with 0 MB on the live sessions and are deliberately NOT denied here, and any user-scope server
+# added later comes back in EVERY role, longlived-bare included, until it is added to that role's deny list.
 # claude.ai connectors (Docs) are remote — no local process — and are untouched.
 # Mechanism: the overlay merges into <workdir>/.claude/settings.json (project scope). enabledPlugins,
 # deniedMcpServers and disabledMcpjsonServers there switch off the plugin, the user-scope (~/.claude.json)

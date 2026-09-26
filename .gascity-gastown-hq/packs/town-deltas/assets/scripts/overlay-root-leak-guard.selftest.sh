@@ -16,7 +16,7 @@
 #   A. CONTROLE +  — revisor na raiz com o overlay base `pool`: limpo (rc 0), e uma edicao legitima da raiz nao da falso alarme.
 #   B. REPLAY      — o incidente: revisor na raiz com pool-reviewer => os DOIS arquivos contaminados => rc 1 nos dois.
 #   C. RESIDUO     — reverter o overlay NAO limpa (merge so adiciona) => segue vermelho; limpar => verde.
-#   D. CLASSE      — TODO overlay por papel (dog, workers, revisor, longlived) na raiz => vermelho; work_dir proprio => verde.
+#   D. CLASSE      — TODO overlay por papel (dog, workers, revisor, as 4 variantes longlived) na raiz => vermelho; work_dir proprio => verde.
 #   E. TOPOLOGIA   — a causa, ANTES de qualquer spawn: agente na raiz com overlay de papel; work_dir compartilhado.
 #   F. ERRO != VAZIO — ilegivel/ausente/config que nao carrega => rc 2, nunca 0.
 #   G. DENTES      — o proprio teste reprova um guard que sempre diz "limpo" e um que sempre diz "vazou".
@@ -149,7 +149,8 @@ section("U. unidade: folhas e delta dos overlays REAIS")
 check(ovlg.leaves({"a": {"b": [1, 2]}, "c": True}) == {(("a", "b", "[]"), "1"), (("a", "b", "[]"), "2"), (("c",), "true")}, "leaves(): dict recursa, lista vira uma folha por elemento, escalar e folha")
 check((("s",), "{}") in ovlg.leaves({"s": {}}), "leaves(): container vazio conta (senao 'skillOverrides: {}' ficaria invisivel)")
 ovs, errs = ovlg.load_overlays(OVERLAYS)
-check(not errs and {"pool", "pool-reviewer", "pool-dog", "longlived"} <= set(ovs), "overlays reais carregam (pool, pool-reviewer, pool-dog, longlived)", str(errs))
+LONGLIVED = ("longlived", "longlived-cdp-firecrawl", "longlived-cdp", "longlived-bare")
+check(not errs and {"pool", "pool-reviewer", "pool-dog", *LONGLIVED} <= set(ovs), "overlays reais carregam (pool, pool-reviewer, pool-dog e as 4 variantes longlived)", str(errs))
 base, _bw = ovlg.base_overlay_name(OVERLAYS, None)
 check(base == "pool", "overlay base vem do manifesto (pool-roles.json base_overlay)", base)
 D = ovlg.role_deltas(ovs, base)
@@ -157,7 +158,25 @@ rev = {ovlg.fmt_leaf(l) for l in D.get("pool-reviewer", set())}
 check('skillOverrides.gate-done="off"' in rev and 'autoMemoryEnabled=false' in rev and any(x.startswith("claudeMdExcludes.[]=") for x in rev) and 'permissions.deny.[]="Agent"' in rev,
       "delta do pool-reviewer contem as 4 chaves do incidente (gate-done off, memoria off, claudeMdExcludes, deny Agent)")
 check('permissions.deny.[]="Bash(sudo:*)"' not in rev and 'remoteControlAtStartup=false' not in rev, "delta NAO inclui o que ja e do base (sudo/rm -rf deny, RC off)")
-check("pool" not in D and {ovlg.fmt_leaf(l) for l in D.get("longlived", set())} == {"autoCompactWindow=900000"}, "base nao tem delta; longlived = so autoCompactWindow")
+check("pool" not in D, "base nao tem delta")
+# ga-e87w1f: as 4 variantes longlived cortam MCP por papel. Cada uma seta as MESMAS 3 chaves (enabledPlugins, deniedMcpServers,
+# disabledMcpjsonServers) porque o merge de overlay so ADICIONA: reverter um papel = apontar pra um overlay de valores vazios, nao
+# apagar linha (contrato escrito no comentario do city.toml). O delta esperado e montado da tabela papel x MCP, entao um servidor
+# a mais ou a menos numa variante, ou uma das 3 chaves faltando, reprova aqui com o diff no detalhe.
+CODE_MODE = ("pipedrive-code-mode", "github-code-mode", "firecrawl-code-mode", "hex-code-mode", "google-maps-code-mode",
+             "motherduck-code-mode", "aws-s3-code-mode", "google-sheets-code-mode", "google-drive-code-mode")
+def longlived_delta(deny, keep):  # deny = negados alem de sqlite/sequential-thinking; keep = code-mode que o papel MANTEM
+    return ({"autoCompactWindow=900000", "enabledPlugins.playwright@claude-plugins-official=false"}
+            | {'deniedMcpServers.[]={"serverName":"%s"}' % s for s in ("sqlite", "sequential-thinking", *deny)}
+            | {'disabledMcpjsonServers.[]="%s"' % s for s in CODE_MODE if s not in keep})
+EXPECT_LONGLIVED = {"longlived": longlived_delta((), {"firecrawl-code-mode"}),                                   # mayor, mila, digo
+                    "longlived-cdp-firecrawl": longlived_delta(("puppeteer",), {"firecrawl-code-mode"}),         # peter
+                    "longlived-cdp": longlived_delta(("puppeteer",), set()),                                     # batista
+                    "longlived-bare": longlived_delta(("puppeteer", "playwright-cdp"), set())}                   # thies, oracle
+for name in LONGLIVED:
+    got = {ovlg.fmt_leaf(l) for l in D.get(name, set())}
+    check(got == EXPECT_LONGLIVED[name], f"delta de '{name}' == o que a tabela papel x MCP manda (3 chaves, servidores exatos)",
+          f"faltando={sorted(EXPECT_LONGLIVED[name] - got)} a-mais={sorted(got - EXPECT_LONGLIVED[name])}")
 rev_json = jread(OVERLAYS / "pool-reviewer/.claude/settings.json")
 check(len(rev_json["skillOverrides"]) == 94, "modelo bate com o incidente: pool-reviewer tem 94 skillOverrides (o numero que o Mayor mediu no arquivo vazado)", str(len(rev_json["skillOverrides"])))
 
@@ -207,7 +226,7 @@ check(rc == 0, "guard: depois de limpar (raiz == base, .gc re-derivado) volta a 
 
 # ================================================================== D. classe
 section("D. classe: TODO overlay por papel na raiz vaza; work_dir proprio nao")
-for name in ("pool-dog", "pool-wa-worker", "pool-ps-worker", "pool-reviewer", "longlived"):
+for name in ("pool-dog", "pool-wa-worker", "pool-ps-worker", "pool-reviewer", *LONGLIVED):
     c = new_city(); spawn(c, c, name)
     rc, j, r = run(c, CFG_CLEAN)
     srcs = sorted({s for f in (j or {"findings": []})["findings"] for s in f.get("sources", [])})
