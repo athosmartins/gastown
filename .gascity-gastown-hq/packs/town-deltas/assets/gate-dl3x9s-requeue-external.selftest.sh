@@ -451,6 +451,39 @@ else
   fi
 fi
 
+# ── 3b. gate_requeue_narrate on its own: only the literal "0" is a requeue ───────
+echo "── 3b. gate_requeue_narrate: an rc it cannot read is never narrated as a requeue ──"
+narr() { # narr [rc...] -> "SKIPPED=<n> NOTE=<..> WHY=<..> RC=<returned>" under set -e, note preset
+  ( set -e; _RQ_NOTE="re-queued for a fresh attempt"; gate_requeue_narrate "$@"; echo "SKIPPED=$_RQ_SKIPPED NOTE=$_RQ_NOTE WHY=$_RQ_WHY RC=0" ) 2>&1
+}
+N0="$(narr 0)"; N10="$(narr 10)"; N1="$(narr 1)"; N255="$(narr 255)"; NEMPTY="$(narr "")"; NNONE="$(narr)"
+if has "$N0" "SKIPPED=0 NOTE=re-queued for a fresh attempt WHY= RC=0"; then
+  ok "narrate 0: requeued — the caller's own note is kept, no reason clause"
+else
+  bad "narrate 0 wrong: [$N0]"
+fi
+if has "$N10" "SKIPPED=1" && has "$N10" "another actor" && ! has "$N10" "write failed"; then
+  ok "narrate 10 (GATE_REQUEUE_RESPECTED_RC): NOT requeued, blamed on the external transition, not on a failed write"
+else
+  bad "narrate 10 wrong: [$N10]"
+fi
+for pair in "1|$N1" "255|$N255"; do
+  rc="${pair%%|*}"; out="${pair#*|}"
+  if has "$out" "SKIPPED=1" && has "$out" "write failed, rc=$rc" && has "$out" "write itself failed (rc=$rc)" && ! has "$out" "another actor"; then
+    ok "narrate $rc: NOT requeued, named as a failed write, never as 'another actor moved it'"
+  else
+    bad "narrate $rc wrong: [$out]"
+  fi
+done
+for pair in "empty|$NEMPTY" "missing|$NNONE"; do
+  lbl="${pair%%|*}"; out="${pair#*|}"
+  if has "$out" "SKIPPED=1" && has "$out" "rc=unknown" && has "$out" "RC=0" && ! has "$out" "SKIPPED=0" && ! has "$out" "another actor"; then
+    ok "narrate with a $lbl rc: could-not-tell takes the inert side — NOT requeued, rc=unknown, returns 0 under set -e (fails on a '\${1:-0}' default, which reads it as success)"
+  else
+    bad "narrate with a $lbl rc must not read as a requeue: [$out]"
+  fi
+done
+
 # ── 4. drift-guards on the literals the behaviour depends on ─────────────────
 echo "── 4. source drift-guards ──"
 # The hazard the bead names: a WRONG expected_status makes the helper read this

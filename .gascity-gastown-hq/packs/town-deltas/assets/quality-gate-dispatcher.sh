@@ -5188,8 +5188,11 @@ gate_full_suite_verdict() {
 #     ga-dl3x9s routes them through it too, each with the expected_status that
 #     site really holds (all three: `dispatching` — the marker is claimed
 #     queued->dispatching and stays there until a terminal status, Phase B/C
-#     included). gate-dl3x9s-requeue-external.selftest.sh locks the class: no
-#     raw `set_gate_status ... "queued"` may come back without a waiver.
+#     included). gate-dl3x9s-requeue-external.selftest.sh locks the class of raw
+#     `set_gate_status ... "queued"` writers (none may come back without a
+#     waiver). It does NOT cover the 7 `set_gate_status ... "needs-rebase"` PARK
+#     writers in the rebase decision block, which share the blind overwrite and
+#     need per-site side-effect handling — tracked in ga-8dehbc.
 GATE_RETRY_COOLDOWN_SECONDS="${GATE_RETRY_COOLDOWN_SECONDS:-900}"
 case "$GATE_RETRY_COOLDOWN_SECONDS" in ''|*[!0-9]*) GATE_RETRY_COOLDOWN_SECONDS=900 ;; esac
 GATE_CLEAN_RETRY_HARD_CAP="${GATE_CLEAN_RETRY_HARD_CAP:-7}"
@@ -5349,9 +5352,13 @@ gate_requeue_note_skipped() {
 # rc 10 (GATE_REQUEUE_RESPECTED_RC) and any other non-zero are different facts —
 # "someone else moved it, that stands" vs "the write itself failed, label unverified"
 # — and are never folded into one sentence (error != empty, ga-p5q3 class).
+# Only the literal "0" means requeued. A MISSING or empty rc is "could not tell", and
+# takes the inert side (NOT re-queued, rc=unknown) — never the success wording, so a
+# caller that lost its rc cannot make a message claim a requeue nobody confirmed. (The
+# sibling gate_requeue_note_skipped defaults the same way.)
 # Always returns 0: the callers run under `set -e`.
 gate_requeue_narrate() {
-  local _rc="${1:-0}"
+  local _rc="${1:-unknown}"
   _RQ_SKIPPED=0
   _RQ_WHY=""
   if [ "$_rc" != "0" ]; then
