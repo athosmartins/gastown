@@ -90,6 +90,9 @@ def write(name, rows, gz=True):
     body = "".join(json.dumps(r) + "\n" for r in rows).encode()
     p = root + "/.gc/" + name
     (gzip.open(p, "wb") if gz else open(p, "wb")).write(body)
+def archive(stamp, rows):
+    seqs = [r["seq"] for r in rows]
+    write("events.jsonl.archive-%s-seq-%d-%d.gz" % (stamp, min(seqs), max(seqs)), rows)
 def rot(t): return row("events.rotated", t)
 
 # unneeded, corrupt archive older than SINCE: proves it is never read
@@ -97,7 +100,7 @@ open(root + "/.gc/events.jsonl.archive-20260920T091533Z-seq-1-2.gz", "wb").write
 # A: rotation stamp 9/24 04:13Z < SINCE -> never needed
 A = [rot(T(2026, 9, 23, 3, 0, 0))] + spread("session.woke", T(2026, 9, 23, 4), 40, 60) + spread("session.stopped", T(2026, 9, 23, 5), 30, 60)
 A += spread("session.crashed", T(2026, 9, 23, 6), 1, 60)                      # before window
-write("events.jsonl.archive-20260924T041351Z-seq-1001-1100.gz", A)
+archive("20260924T041351Z", A)
 # B: 9/24 04:13Z .. 9/25 17:54Z (straddles SINCE)
 B = [rot(T(2026, 9, 24, 4, 13, 51))]
 B += spread("session.woke", T(2026, 9, 24, 10), 20, 60)                       # before window
@@ -108,7 +111,7 @@ B += spread("session.woke", T(2026, 9, 25, 3, 0), 5, 60, "Z") + spread("session.
 B += spread("session.stopped", T(2026, 9, 24, 12), 10, 60) + spread("session.stopped", T(2026, 9, 25, 1), 200, 30)
 B += spread("bead.closed", T(2026, 9, 25, 2), 50, 60)                          # noise
 B += spread("session.crashed", T(2026, 9, 25, 4), 2, 60)
-write("events.jsonl.archive-20260925T175422Z-seq-1101-1900.gz", B)
+archive("20260925T175422Z", B)
 # C: 9/25 17:54Z .. 9/26 13:11Z (straddles UNTIL)
 C = [rot(T(2026, 9, 25, 17, 54, 22))]
 C += spread("session.woke", T(2026, 9, 25, 18), 300, 60)
@@ -119,7 +122,7 @@ C += [row("session.woke", dt.datetime(2026, 9, 25, 22, 30, 0, tzinfo=BRT))]   # 
 C += spread("session.woke", T(2026, 9, 26, 1), 15, 60)
 C += spread("session.stopped", T(2026, 9, 25, 18), 200, 60) + [dup]
 C += spread("session.crashed", T(2026, 9, 25, 19), 1, 60) + spread("session.crashed", T(2026, 9, 26, 2), 1, 60)
-write("events.jsonl.archive-20260926T131152Z-seq-1901-2900.gz", C)
+archive("20260926T131152Z", C)
 # live: after UNTIL, plus a rotation-race duplicate of an in-window row
 L = [rot(T(2026, 9, 26, 13, 11, 52))] + spread("session.woke", T(2026, 9, 26, 13, 12), 8, 60)
 L += [dup] + spread("bead.closed", T(2026, 9, 26, 13, 13), 5, 10)
@@ -174,17 +177,45 @@ else
   got=$(run_block bash "$CITY" "2026-09-21T00:00:00Z" "2026-09-22T00:00:00Z")
   [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "window older than the oldest kept segment -> N/A" || bad "pruned coverage: got '$got'"
 
-  echo "-- a covered but quiet window is a real 0"
+    # Hole tests. The 9/24-9/25 window selects A, B, C and live, and A reaches back
+  # to SINCE, so coverage passes and ONLY the seq chain can notice a missing segment.
+  H0=2026-09-24T00:00:00Z; H1=2026-09-25T00:00:00Z
+  rm_seg() { rm -f "$1"/.gc/events.jsonl.archive-"$2"-seq-*.gz; }
+  cp -R "$CITY" "$TMP/city-hole-mid"; rm_seg "$TMP/city-hole-mid" 20260925T175422Z
+  got=$(run_block bash "$TMP/city-hole-mid" "$H0" "$H1")
+  [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "missing MIDDLE archive -> N/A" || bad "middle hole: got '$got'"
+  cp -R "$CITY" "$TMP/city-hole-tail"; rm_seg "$TMP/city-hole-tail" 20260926T131152Z
+  got=$(run_block bash "$TMP/city-hole-tail" "$W0" "$W1")
+  [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "archive missing before the live file (rotation race) -> N/A" || bad "tail hole: got '$got'"
+  # ...but an OVERLAP is not a hole: real archives share rows (measured live, 2026-08-20
+  # boundary: 3 seqs in two archives) and seq is what the count dedupes on.
+  cp -R "$CITY" "$TMP/city-overlap"
+  ovf=$(ls "$TMP/city-overlap"/.gc/events.jsonl.archive-20260926T131152Z-seq-*.gz); ovn=${ovf##*-seq-}; ovlo=${ovn%%-*}; ovhi=${ovn#*-}
+  mv "$ovf" "$TMP/city-overlap/.gc/events.jsonl.archive-20260926T131152Z-seq-$((ovlo - 2))-$ovhi"
+  got=$(run_block bash "$TMP/city-overlap" "$W0" "$W1")
+  [ "$got" = "session.woke=$EXP_W session.stopped=$EXP_S session.crashed=$EXP_C" ] && ok "overlapping seq ranges are not a hole" || bad "overlap: got '$got'"
+  # an unparseable window must not slide through as a number
+  # (asserts the guard's own message: without it jq choking on the empty epoch would also print N/A)
+  err=$(PATH="$TMP/bin:$PATH" GC_CITY_PATH="$CITY" SINCE="not-a-date" UNTIL="$W1" bash "$BLOCK" 2>&1 >/dev/null)
+  got=$(run_block bash "$CITY" "not-a-date" "$W1")
+  case "$err" in
+    *'cannot parse SINCE/UNTIL'*)
+      [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "unparseable SINCE -> N/A, refused by name" || bad "bad SINCE: got '$got'" ;;
+    *) bad "bad SINCE: not refused by name; stderr: '$err'" ;;
+  esac
+
+echo "-- a covered but quiet window is a real 0"
   got=$(run_block bash "$CITY" "2026-09-26T13:30:00Z" "2026-09-26T13:40:00Z")
   [ "$got" = "session.woke=0 session.stopped=0 session.crashed=0" ] && ok "quiet window -> 0" || bad "quiet window: got '$got'"
 fi
 
 # the capped CLI call must be gone from the session-lifecycle step text
-if extract fence collect-data 'session.woke' | grep -q 'gc events --since'; then
-  bad "collect-data still pipes 'gc events --since' (500-row cap) for session events"
-else
-  ok "no capped 'gc events --since' call for session events"
-fi
+# (captured then matched with case: `writer | grep -q` under pipefail can report a MATCH as no-match)
+LIFECYCLE_TEXT=$(extract fence collect-data 'session.woke')
+case "$LIFECYCLE_TEXT" in
+  *'gc events --since'*) bad "collect-data still pipes 'gc events --since' (500-row cap) for session events" ;;
+  *) ok "no capped 'gc events --since' call for session events" ;;
+esac
 
 # ---- defect 2: --metadata must be valid JSON as delivered ---------------------
 echo "-- step 3 archive command, as delivered"

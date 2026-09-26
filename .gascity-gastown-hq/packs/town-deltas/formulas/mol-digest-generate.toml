@@ -116,7 +116,10 @@
 # now counts from the event-log segments (live file + archives stamped at or
 # after SINCE, dedupe on seq), now also counts session.crashed (the old note
 # calling that type non-existent was a capped-CLI artifact), and prints N/A —
-# never 0 — when it cannot list, read or fully cover the window. (2) Step 3's `--metadata` JSON was typed with
+# never 0 — when it cannot list or read a segment, cannot reach back to SINCE,
+# or finds a hole in the chain of segment seq ranges (a deleted middle archive
+# or a rotation between listing and reading would otherwise undercount with
+# full confidence). (2) Step 3's `--metadata` JSON was typed with
 # backslash-escaped quotes; this file's TOML string consumed that escape level,
 # so the agent received invalid JSON (the 2026-09-25 archive bead only stored
 # correctly because the dog re-escaped by hand). The JSON is now built with
@@ -549,8 +552,11 @@ row cap, no port and no API timeout.
 What the block below is built on (verified live, ga-hnlog4 / ga-swvjo):
 - An archive only holds events from BEFORE its own rotation stamp (UTC, in the
   file name), so a window needs the live file plus every archive stamped at or
-  after SINCE. A rotation can land between listing and reading, which shows the
-  same row in two segments — the block counts each `seq` once.
+  after SINCE. Segments can overlap (measured live: two archives share 3 rows,
+  and a rotation landing between listing and reading can show a row twice) —
+  the block counts each `seq` once. A segment that is MISSING (deleted, or
+  rotated out between listing and reading) shows as a hole in the chain of seq
+  ranges, and the block then reports N/A instead of a low number.
 - macOS `zcat` appends `.Z` to the name and fails on a `.gz` file — use
   `gzip -dc`.
 - `ts` is LOCAL time (e.g. `-03:00`) while $SINCE/$UNTIL are UTC, so the
@@ -602,6 +608,9 @@ lifecycle_segments() (
 # Prints {"woke":N,"stopped":M,"crashed":K}; returns 1 (reason on stderr) when the count cannot be known.
 session_lifecycle_counts() (
   set -o pipefail
+  for E in "$SINCE_EPOCH" "$UNTIL_EPOCH"; do
+    case "$E" in ''|*[!0-9]*) echo "cannot parse SINCE/UNTIL ($SINCE / $UNTIL) into epoch seconds" >&2; return 1 ;; esac
+  done
   SEGMENTS=$(lifecycle_segments) || { echo "cannot list event-log segments under $GC_CITY_PATH/.gc" >&2; return 1; }
   # The oldest segment read must reach back to SINCE, else a pruned archive hides part of the window.
   OLDEST=$(echo "$SEGMENTS" | head -n 1)
@@ -610,6 +619,25 @@ session_lifecycle_counts() (
     echo "event log does not reach back to $SINCE (oldest segment $OLDEST, first event epoch '${FIRST_EPOCH:-unreadable}')" >&2
     return 1
   fi
+  # A deleted MIDDLE segment, or a rotation landing between listing and reading, would undercount
+  # silently while the coverage check above still passes. Each archive's name carries its seq range
+  # and the live file starts where the last archive ends, so a segment that starts past the previous
+  # one's end + 1 is a hole. An overlap is fine (seen live: two archives share 3 rows; the dedupe
+  # below counts each seq once).
+  echo "$SEGMENTS" | {
+    PREV_LAST=""
+    while IFS= read -r f; do
+      case "$f" in
+        *.gz) R=${f##*-seq-}; FIRST=${R%%-*}; LAST=${R#*-}; LAST=${LAST%.gz} ;;
+        *) FIRST=$(head -n 1 -- "$f" | jq -r '.seq // empty' 2>/dev/null); LAST="" ;;
+      esac
+      case "$FIRST" in ''|*[!0-9]*) echo "cannot read the seq range of $f" >&2; exit 1 ;; esac
+      if [ -n "$PREV_LAST" ] && [ "$FIRST" -gt $((PREV_LAST + 1)) ]; then
+        echo "event log has a hole: $f starts at seq $FIRST, the previous segment ends at $PREV_LAST" >&2; exit 1
+      fi
+      PREV_LAST=$LAST
+    done
+  } || return 1
   echo "$SEGMENTS" | while IFS= read -r f; do
     case "$f" in *.gz) gzip -dc -- "$f" ;; *) cat -- "$f" ;; esac |
       jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER" || exit 1
@@ -627,11 +655,13 @@ echo "session.woke=$WOKE_N session.stopped=$STOPPED_N session.crashed=$CRASHED_N
 Report the three numbers exactly as printed. **`N/A` means "could not
 measure" and the digest must say N/A — never 0**: the block prints N/A (reason
 on stderr) when it cannot list or read a segment, when a segment is corrupt,
-or when the oldest segment on disk starts after SINCE (an archive was pruned,
-so part of the window is out of reach). A `0` is printed only for a window the
-log actually covers. On N/A, run the block once more before writing N/A into
-the digest — a torn read of the live file's last line under load is the one
-transient cause.
+when the oldest segment on disk starts after SINCE (an archive was pruned, so
+part of the window is out of reach), or when the seq ranges have a hole. A `0`
+is printed only when every segment was read intact, the chain of seq ranges is
+unbroken, and the oldest segment reaches back to SINCE. On N/A, run the block
+once more before writing N/A into the digest — two causes are transient: a torn
+read of the live file's last line under load, and a rotation landing between
+listing and reading (it shows up as a hole until the next listing).
 
 b) **Escalations** — no universal `escalation` bead label exists in this city (0
 hits, confirmed across 3+ independent runs, including a `--label-pattern
