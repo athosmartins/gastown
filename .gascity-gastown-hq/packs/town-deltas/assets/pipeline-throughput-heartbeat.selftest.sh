@@ -20,6 +20,10 @@
 #   REGRESSION:
 #     9. spawn-route failure → no tracking, no cycle increment (retry next tick)
 #    10. detect() still returns the four kinds unchanged (pure, side-effect free)
+#   IMP14 FLOW-AUTHORITY DEFER (ga-h5pmxz — hermetic; the marker path is pinned to a private dir):
+#    13. the module reads the PINNED marker path, never the live runtime file
+#    14. live marker → gate-merge spawn deferred, durable (PTH-unique) still spawns
+#    15. expired marker → gate-merge spawns (the defer keys on expires_at, not on the file existing)
 #
 # ga-ohz0x: the former "WIDENED REVIEW GUARD" cases here (a fresh Verdicts poll beyond a
 # 40-line tail; a partial verdict with large elapsed) exercised ONLY the VERDICTS_RE branch
@@ -44,6 +48,20 @@ if [[ ! -f "$HB_SCRIPT" ]]; then
   exit 1
 fi
 
+# ga-h5pmxz: the heartbeat's imp14 defer reads a flow-authority marker whose path defaults to the
+# LIVE $CITY/.gc/runtime/flow-authority.json (PTH_FLOW_AUTHORITY_FILE overrides it) and defers
+# pilot/gate-merge spawns while the marker's expires_at > now. The cases below drive run_tick with
+# synthetic clocks near 1970 (1000.0, 1400.0), so ANY live marker carrying a real expires_at read as
+# "TSW is the flow authority" and swallowed the spawns cases 2 and 8 expect — they failed on a clean
+# main whenever the live file existed, whatever the code did. Pin the path (and the defer knob) inside
+# a private temp dir BEFORE any python runs, overriding whatever the caller exported; the file stays
+# ABSENT unless a case writes it. Same shape as funnel-flow-healer.selftest.sh (ga-nixb58).
+FA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pth-selftest-fa.XXXXXX")"
+[[ -n "$FA_DIR" && -d "$FA_DIR" ]] || { echo "FAIL: could not create the private flow-authority dir"; exit 1; }
+trap 'rm -rf "${FA_DIR:?}"' EXIT
+export PTH_FLOW_AUTHORITY_FILE="$FA_DIR/flow-authority.json"
+export PTH_FLOW_AUTHORITY_DEFER=1
+
 PASS=0
 FAIL=0
 
@@ -52,6 +70,7 @@ run_test() {
   local code="$2"
   local expected="$3"   # exact substring expected in output
   local result
+  rm -f -- "${PTH_FLOW_AUTHORITY_FILE:?}"   # ga-h5pmxz: every case starts with the pinned marker ABSENT, whatever ran before it
   result=$(HB_SCRIPT="$HB_SCRIPT" python3 -c "$code" 2>&1) || true
   if echo "$result" | grep -F "$expected" >/dev/null; then
     echo "PASS: $name"
@@ -317,6 +336,69 @@ print('STALL=%r' % r)
 assert r is not None, 'after recovery to Headroom OK, a real no-merge stall must still be detected'
 print('OK_RECOVERED_STILL_FIRES')
 " "OK_RECOVERED_STILL_FIRES"
+
+# ---------------------------------------------------------------------------
+# 13. HERMETIC PIN (ga-h5pmxz): the module must read the marker path this selftest pinned, not the
+#     live runtime file. Without this, a renamed env knob would silently put every case above back on
+#     the live file — the exact failure this bead fixed — and nothing would say so.
+# ---------------------------------------------------------------------------
+run_test "flow-authority marker path is the pinned private one, never the live runtime file" "
+$HARNESS
+pinned = os.environ['PTH_FLOW_AUTHORITY_FILE']
+live = os.path.join(m.CITY, '.gc/runtime/flow-authority.json')
+print('PATH=%s' % m._FLOW_AUTHORITY_FILE)
+assert m._FLOW_AUTHORITY_FILE == pinned, 'module is not reading the pinned marker path'
+assert os.path.abspath(m._FLOW_AUTHORITY_FILE) != os.path.abspath(live), 'pinned path collides with the live marker'
+assert not os.path.exists(pinned), 'the pinned marker must start ABSENT (defer inactive) unless a case writes it'
+assert m._tsw_flow_authority_active(1000.0) is False, 'an absent marker must not read as an active flow authority'
+print('OK_PINNED_ABSENT_INACTIVE')
+" "OK_PINNED_ABSENT_INACTIVE"
+
+# ---------------------------------------------------------------------------
+# 14. imp14 (the behaviour cases 2/8 used to trip over by accident): while a live TSW marker is in
+#     force, a confirmed gate-merge stall is DEFERRED — but durable is PTH-unique and still spawns.
+# ---------------------------------------------------------------------------
+run_test "imp14: live marker defers a confirmed gate-merge spawn; durable still spawns" "
+$HARNESS
+import json
+json.dump({'escalated_at': 900.0, 'authority': 'approved-state-reconciler', 'expires_at': 5000.0},
+          open(os.environ['PTH_FLOW_AUTHORITY_FILE'], 'w'))
+assert m._tsw_flow_authority_active(1400.0) is True, 'fixture precondition: the marker is live at t=1400'
+st = m.new_state(); tracked = set()
+m._FINDINGS = [('gate-merge', 'fila não drena')]
+lgs = m.run_tick(1000.0, st, 0.0, tracked)
+lgs = m.run_tick(1400.0, st, lgs, tracked)        # confirmed (2/2) — would spawn without the marker
+print('GATE_MERGE_SPAWNS=%d' % len(m.SPAWNS))
+assert len(m.SPAWNS) == 0, 'gate-merge must be deferred while the marker is live'
+m.SPAWNS.clear()
+st2 = m.new_state(); tracked2 = set()
+m._FINDINGS = [('durable', 'pouso durável falhou')]
+lgs = m.run_tick(1000.0, st2, 0.0, tracked2)
+lgs = m.run_tick(1400.0, st2, lgs, tracked2)
+print('DURABLE_SPAWNS=%d' % len(m.SPAWNS))
+assert [k for k, _ in m.SPAWNS] == ['durable'], 'durable is never suppressed by the flow authority'
+print('OK_IMP14_DEFERS_GATE_MERGE_ONLY')
+" "OK_IMP14_DEFERS_GATE_MERGE_ONLY"
+
+# ---------------------------------------------------------------------------
+# 15. NEGATIVE CONTROL for 14: an EXPIRED marker (expires_at already behind now) is not a flow
+#     authority — the same confirmed gate-merge stall must spawn. The defer keys on expires_at, not on
+#     the file merely existing (a leftover marker must never silence the heartbeat).
+# ---------------------------------------------------------------------------
+run_test "imp14: an expired marker does not defer — the confirmed gate-merge stall spawns" "
+$HARNESS
+import json
+json.dump({'escalated_at': 100.0, 'authority': 'approved-state-reconciler', 'expires_at': 500.0},
+          open(os.environ['PTH_FLOW_AUTHORITY_FILE'], 'w'))
+assert m._tsw_flow_authority_active(1400.0) is False, 'fixture precondition: the marker is expired at t=1400'
+st = m.new_state(); tracked = set()
+m._FINDINGS = [('gate-merge', 'fila não drena')]
+lgs = m.run_tick(1000.0, st, 0.0, tracked)
+lgs = m.run_tick(1400.0, st, lgs, tracked)
+print('SPAWNS=%d' % len(m.SPAWNS))
+assert [k for k, _ in m.SPAWNS] == ['gate-merge'], 'an expired marker must not suppress the spawn'
+print('OK_EXPIRED_DOES_NOT_DEFER')
+" "OK_EXPIRED_DOES_NOT_DEFER"
 
 # ---------------------------------------------------------------------------
 echo "----------------------------------------"

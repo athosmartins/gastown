@@ -66,8 +66,11 @@ fi
 log "selftest source clean of 'Verdicts:' references ✓"
 
 # ── 5. Comprehensive selftest runs to completion, no stale reference ───────────
-# NOTE: this suite carries a known, PRE-EXISTING, UNRELATED failure pair (2 tests gated on
-# an "imp14 TSW flow-authority" hysteresis behavior this bead does not touch) — so this
+# NOTE (ga-h5pmxz): when this step was written the suite carried a known, PRE-EXISTING, UNRELATED
+# failure pair (2 tests that read the LIVE imp14 TSW flow-authority marker instead of a private one).
+# ga-h5pmxz pinned that marker path inside the selftest, so the suite now passes in full; this step
+# deliberately stays a completion check (no exact pass/fail count) — this prod test records what
+# ga-ohz0x delivered and is not the place to tighten it. The reasoning below is the original: this
 # step checks the harness completes and produces a summary line (proves the module still
 # imports and the removed test code didn't leave a dangling reference), not a zero-failure
 # count. Asserting an exact pass/fail count here would make this prod test a permanent
