@@ -16,7 +16,7 @@ provider = "claude-headless"
 # Monitor/TaskStop/ScheduleWakeup/Skill/Web*/AskUserQuestion/PushNotification/SendMessage FICAM (ele as usa: pool-roles.json, roles.reviewer._why).
 # Skills enxutas (refino, browser-control, core.gc-*); plugins superpowers/frontend-design e CLAUDE.md/memória do Mayor OFF.
 # Reverter: volte para .../pool e apague a linha env. Fonte: assets/claude-overlays/pool-roles.json.
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-reviewer"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"  # REVERTIDO 26/09 (Mayor): o revisor roda na RAIZ da cidade, e o overlay pool-reviewer vazava pro .claude/settings.json da raiz e pro .gc/settings.json (gate-done off, CLAUDE.md excluido e memoria off pra TODAS as sessoes). Refazer so com workdir proprio do revisor.
 env = { TD_ROLE = "reviewer" }
 scope = "city"
 wake_mode = "fresh"
