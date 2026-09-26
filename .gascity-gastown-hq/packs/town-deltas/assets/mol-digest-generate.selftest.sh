@@ -194,6 +194,20 @@ else
   mv "$ovf" "$TMP/city-overlap/.gc/events.jsonl.archive-20260926T131152Z-seq-$((ovlo - 2))-$ovhi"
   got=$(run_block bash "$TMP/city-overlap" "$W0" "$W1")
   [ "$got" = "session.woke=$EXP_W session.stopped=$EXP_S session.crashed=$EXP_C" ] && ok "overlapping seq ranges are not a hole" || bad "overlap: got '$got'"
+  # An archive whose name has no readable LAST seq must not switch the hole check off for every
+  # segment after it (the chain would carry an empty end and skip the comparison): "cannot read the
+  # range" is a don't-know, so N/A. The archive's content is untouched, so a number here is a lie.
+  cp -R "$CITY" "$TMP/city-badname"
+  bnf=$(ls "$TMP/city-badname"/.gc/events.jsonl.archive-20260925T175422Z-seq-*.gz); bnn=${bnf##*-seq-}; bnlo=${bnn%%-*}
+  mv "$bnf" "$TMP/city-badname/.gc/events.jsonl.archive-20260925T175422Z-seq-$bnlo-.gz"
+  got=$(run_block bash "$TMP/city-badname" "$W0" "$W1")
+  [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "archive name with an unreadable seq range -> N/A" || bad "unreadable seq range: got '$got'"
+  # A lifecycle row with no seq: dedupe on seq would fold every such row into ONE key and print a
+  # low number as if measured. Live-only window (the 9/26 archive is stamped 13:11:52, before SINCE).
+  cp -R "$CITY" "$TMP/city-noseq"
+  printf '%s\n%s\n' '{"type":"session.woke","ts":"2026-09-26T13:25:00Z"}' '{"type":"session.stopped","ts":"2026-09-26T13:26:00Z"}' >> "$TMP/city-noseq/.gc/events.jsonl"
+  got=$(run_block bash "$TMP/city-noseq" "2026-09-26T13:12:00Z" "2026-09-26T13:30:00Z")
+  [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "lifecycle row without a seq -> N/A" || bad "row without seq: got '$got'"
   # an unparseable window must not slide through as a number
   # (asserts the guard's own message: without it jq choking on the empty epoch would also print N/A)
   err=$(PATH="$TMP/bin:$PATH" GC_CITY_PATH="$CITY" SINCE="not-a-date" UNTIL="$W1" bash "$BLOCK" 2>&1 >/dev/null)

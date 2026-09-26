@@ -623,7 +623,8 @@ session_lifecycle_counts() (
   # silently while the coverage check above still passes. Each archive's name carries its seq range
   # and the live file starts where the last archive ends, so a segment that starts past the previous
   # one's end + 1 is a hole. An overlap is fine (seen live: two archives share 3 rows; the dedupe
-  # below counts each seq once).
+  # below counts each seq once). A name whose seq range cannot be read is refused: an empty end
+  # would leave the next comparison with nothing to compare against and skip it.
   echo "$SEGMENTS" | {
     PREV_LAST=""
     while IFS= read -r f; do
@@ -632,6 +633,7 @@ session_lifecycle_counts() (
         *) FIRST=$(head -n 1 -- "$f" | jq -r '.seq // empty' 2>/dev/null); LAST="" ;;
       esac
       case "$FIRST" in ''|*[!0-9]*) echo "cannot read the seq range of $f" >&2; exit 1 ;; esac
+      case "$f" in *.gz) case "$LAST" in ''|*[!0-9]*) echo "cannot read the seq range of $f" >&2; exit 1 ;; esac ;; esac
       if [ -n "$PREV_LAST" ] && [ "$FIRST" -gt $((PREV_LAST + 1)) ]; then
         echo "event log has a hole: $f starts at seq $FIRST, the previous segment ends at $PREV_LAST" >&2; exit 1
       fi
@@ -641,7 +643,7 @@ session_lifecycle_counts() (
   echo "$SEGMENTS" | while IFS= read -r f; do
     case "$f" in *.gz) gzip -dc -- "$f" ;; *) cat -- "$f" ;; esac |
       jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER" || exit 1
-  done | jq -s 'unique_by(.seq) | {woke: (map(select(.type == "session.woke")) | length), stopped: (map(select(.type == "session.stopped")) | length), crashed: (map(select(.type == "session.crashed")) | length)}'
+  done | jq -s 'if any(.[]; (.seq | type) != "number") then error("a session-lifecycle row has no numeric seq") else unique_by(.seq) | {woke: (map(select(.type == "session.woke")) | length), stopped: (map(select(.type == "session.stopped")) | length), crashed: (map(select(.type == "session.crashed")) | length)} end'
 )
 
 WOKE_N=N/A; STOPPED_N=N/A; CRASHED_N=N/A
@@ -656,8 +658,10 @@ Report the three numbers exactly as printed. **`N/A` means "could not
 measure" and the digest must say N/A — never 0**: the block prints N/A (reason
 on stderr) when it cannot list or read a segment, when a segment is corrupt,
 when the oldest segment on disk starts after SINCE (an archive was pruned, so
-part of the window is out of reach), or when the seq ranges have a hole. A `0`
-is printed only when every segment was read intact, the chain of seq ranges is
+part of the window is out of reach), when the seq ranges have a hole or an
+archive name's range cannot be read, or when a session row carries no numeric
+`seq` (the dedupe key — such rows would otherwise collapse into one). A `0` is
+printed only when every segment was read intact, the chain of seq ranges is
 unbroken, and the oldest segment reaches back to SINCE. On N/A, run the block
 once more before writing N/A into the digest — two causes are transient: a torn
 read of the live file's last line under load, and a rotation landing between
