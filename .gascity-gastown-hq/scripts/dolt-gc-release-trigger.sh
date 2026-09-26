@@ -295,7 +295,11 @@ _trg_state_readable() {
   [ -f "$1" ] || return 1
   nl="$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')"
   case "$nl" in ''|*[!0-9]*|0) return 1 ;; esac
-  head -1 "$1" 2>/dev/null | grep -Eq '^poll=[0-9]+ decision=.+ attempts=[0-9]+ next_allowed=[0-9]+( direct_attempts=[0-9]+ direct_next_allowed=[0-9]+)?$'
+  # Numbers are canonical: "0" or no leading zero. A padded one ("attempts=08") can only be a hand edit — the
+  # trigger writes its numbers from arithmetic — and read back through $(( )) it is OCTAL: 08/09 abort the poll
+  # before it records anything (no run, no heartbeat), 007 is silently 7. Unreadable is the designed answer to
+  # a hand edit: inert once, said out loud, a clean record rewritten (as _trg_streak_read does for its file).
+  head -1 "$1" 2>/dev/null | grep -Eq '^poll=(0|[1-9][0-9]*) decision=.+ attempts=(0|[1-9][0-9]*) next_allowed=(0|[1-9][0-9]*)( direct_attempts=(0|[1-9][0-9]*) direct_next_allowed=(0|[1-9][0-9]*))?$'
 }
 
 # _trg_state_decision <file> → the last recorded decision text, "" if none.

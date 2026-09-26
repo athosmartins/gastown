@@ -718,6 +718,18 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   sk_reset; sk_hold $((9*3600)); GC_MAINT_LOCK_STUCK_H=08; ( _dgm_lock_stuck_check "$SKL" sleep x ) >/dev/null 2>&1
   grep -q '(limit 8h)' "$LOG" && ok "stuck: the ALERT for limit 08 says '(limit 8h)' — the number that was decided, in decimal" || bad "stuck: alert text for limit 08: '$(grep ALERT "$LOG")'"
   unset _sk_pad_ok _row _k _r _hh _want
+  # the effective limit comes out of a command substitution, and a failed one (fork pressure — this machine
+  # runs at load 56-64) hands back BLANK. Blank is "don't know", not a number: it must fall back to 3h, never
+  # reach `$(( * 3600 ))` (a syntax error that aborts the check — the very shape this round is about).
+  _sk_bl_ok=1
+  for _row in "_dgm_stuck_limit_h() { :; }" "_dgm_stuck_limit_h() { echo abc; }" "_dgm_stuck_limit_h() { echo 0; }"; do
+    sk_reset; sk_hold $((4*3600)); ( eval "$_row"; _dgm_lock_stuck_check "$SKL" sleep x ) 2>"$SK/err"; rc=$?
+    { [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && [ ! -s "$SK/err" ]; } || { _sk_bl_ok=0; echo "    ('$_row', a 4h holder: rc=$rc notify=$(skn) stderr='$(head -c 120 "$SK/err")' — did not fall back to 3h)"; }
+    sk_reset; sk_hold $((2*3600)); ( eval "$_row"; _dgm_lock_stuck_check "$SKL" sleep x ) 2>"$SK/err"; rc=$?
+    { [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && [ ! -s "$SK/err" ]; } || { _sk_bl_ok=0; echo "    ('$_row', a 2h holder: rc=$rc notify=$(skn) — called stuck, or aborted)"; }
+  done
+  [ "$_sk_bl_ok" = "1" ] && ok "stuck: a blank / garbled / zero limit coming back from the helper (a failed \$(...)) falls back to 3h — no arithmetic abort, no alert-on-everything" || bad "stuck: a failed limit lookup changed the behaviour (see lines above)"
+  unset _sk_bl_ok _row
   # who counts as a holder
   sk_reset; _DEAD=999999; while kill -0 "$_DEAD" 2>/dev/null; do _DEAD=$((_DEAD+1)); done; sk_hold $((9*3600)) "$_DEAD"
   _dgm_lock_stuck_check "$SKL" sleep x; rc=$?

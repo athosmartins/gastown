@@ -591,6 +591,22 @@ for _row in 08:8 09:9 0300:300 07200:7200; do
     || bad "clamp with cap '$_k': state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' stderr='$(head -c 200 "$T/poll.err")' (want next_allowed=$((NOW+_want)))"
 done
 unset _row _k _want
+# The same class through the STATE FILE: a record whose numbers are all digits but carry a leading zero
+# ("attempts=08" — a hand edit; the trigger writes them from arithmetic, never padded) used to read as a
+# complete record, and then `att=$(( att + 1 ))` aborted the poll in octal before a run could be recorded — no
+# run, no heartbeat, no message. A non-canonical record is now UNREADABLE, which is the designed answer to a hand
+# edit (inert once, says so, rewrites a clean one) — as _trg_streak_read already does for the skip-streak file.
+for _row in "attempts=08 next_allowed=0" "attempts=2 next_allowed=007" "attempts=2 next_allowed=0 direct_attempts=09 direct_next_allowed=0" "attempts=2 next_allowed=0 direct_attempts=0 direct_next_allowed=00"; do
+  reset_main; AVAIL=12486
+  printf 'poll=%s decision=WAIT backoff %s\n' "$((NOW-10))" "$_row" > "$GC_TRIGGER_STATE"
+  ( trigger_main ) >/dev/null 2>"$T/poll.err"
+  { [ "$(sdec)" = "WAIT state-unreadable" ] && [ "$(sget poll)" = "$NOW" ] && [ "$(sget attempts)" = "0" ] && [ ! -s "$T/poll.err" ] && grep -q "is unreadable" "$DOLT_GC_MAINT_LOG"; } \
+    && ok "state: a record with a zero-padded number ('${_row%% *}…') is unreadable → one inert poll, said out loud, a clean record rewritten (no octal abort)" \
+    || bad "state padded '$_row': dec='$(sdec)' state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' stderr='$(head -c 160 "$T/poll.err")'"
+done
+reset_main; printf 'poll=%s decision=WAIT backoff attempts=0 next_allowed=0 direct_attempts=0 direct_next_allowed=0\n' "$((NOW-10))" > "$GC_TRIGGER_STATE"
+_trg_state_readable "$GC_TRIGGER_STATE" && ok "state: a plain 0 is still a complete record (only a LEADING zero is refused)" || bad "state: attempts=0 must stay readable"
+unset _row
 
 # (7) The kill switch is a pause, not a reset: the recorded backoff survives GC_TRIGGER_ENABLED=0.
 reset_main; AVAIL=12486

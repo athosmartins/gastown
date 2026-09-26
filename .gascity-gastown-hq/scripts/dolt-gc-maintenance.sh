@@ -898,6 +898,9 @@ _dgm_lock_stuck_check() {
     return 1 ;;
   esac
   limit="$(_dgm_stuck_limit_h)"
+  # A failed $(...) (fork pressure) hands back blank: that is "don't know", not a number — a blank limit
+  # reaching the arithmetic below reads as 0 and would call EVERY holder stuck. Fall back like a garbled knob.
+  case "$limit" in ''|*[!0-9]*|0) limit=3 ;; esac
   [ "$age" -ge $(( limit * 3600 )) ] || return 1
   key="${pid}:${mtime}"
   if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
