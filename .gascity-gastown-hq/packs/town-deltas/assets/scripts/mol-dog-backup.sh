@@ -28,11 +28,33 @@
 # falls back to the same server-free sync (ga-o3nqy2) the 04:00 off-box job
 # uses, gated on disk headroom (dolt-disk-floor-guard's own WARN floor) —
 # see sync_db_with_fallback below.
+#
+# ga-ypxbxm: two holes left in that fallback. (1) dolt-gc-maintenance releases
+# the hq staging (ga-btnq6h) on the promise that this job rebuilds it, but the
+# managed server keeps a cached view of the emptied directory (ga-yct7r1): the
+# sync writes ~4GB of tables, dies with "table file not found" and leaves NO
+# manifest — an error the fallback did not recognise, so it reported FAILED and
+# left the garbage until the next round. "table file not found" now falls back
+# too, but only when nothing is committed at the staging (no manifest); with a
+# manifest it is the stale-manifest class (ga-b5h83) and stays FAILED.
+# (2) The fallback checked only the WARN floor (8GB free), not the size of the
+# db: an offline hq sync writes ~8GB, which with 8-10GB free lands next to the
+# CRITICAL floor (the ga-odtd3f outage class). It now also needs the same 150%
+# of the live size that dolt-s3-backup.sh's _sync_disk_preflight demands. A
+# failed server sync against a file:// staging also reports what it left there
+# (a non-file remote has no staging to look at, so its line carries no residue).
 set -euo pipefail
 
 SMALL_DB_BOUND_SECS=120
 LARGE_DB_BOUND_SECS=600
 LARGE_DB_THRESHOLD_KB=512000   # 500MB (du -sk units)
+
+# ga-ypxbxm: headroom the offline fallback needs — same rule and defaults as
+# dolt-s3-backup.sh's _sync_disk_preflight (SYNC_DISK_MARGIN_PCT/_FLOOR_GB), on
+# this script's OWN env vars: one script's safety margin must never silently
+# change another's.
+OFFLINE_DISK_MARGIN_PCT="${MOL_DOG_BACKUP_DISK_MARGIN_PCT:-150}"   # % of the live db size
+OFFLINE_DISK_FLOOR_GB="${MOL_DOG_BACKUP_DISK_FLOOR_GB:-3}"         # absolute backstop for small dbs
 
 # ── PURE classification/sizing logic — unit-tested by mol-dog-backup.selftest.sh ──
 # ga-gquc1: run_bounded's exit 124 (coreutils timeout convention) and a genuine
@@ -68,7 +90,136 @@ classify_sync_failure() {
     fi
 }
 
-# is_fallback_eligible_failure <rc> <output> — PURE. True (0) only for the
+# fmt_kb <kb> — PURE. du-style KB → "512KB" / "37MB" / "4.4GB"; "?" when the
+# input is not a number, so an unmeasured size never reads as "0KB".
+fmt_kb() {
+    local kb="$1" tenths
+    case "$kb" in
+        ''|*[!0-9]*) printf '?'; return ;;
+    esac
+    kb=$((10#$kb))
+    if [ "$kb" -ge 1048576 ]; then
+        tenths=$(( kb * 10 / 1048576 ))
+        printf '%d.%dGB' $((tenths / 10)) $((tenths % 10))
+    elif [ "$kb" -ge 1024 ]; then
+        printf '%dMB' $((kb / 1024))
+    else
+        printf '%dKB' "$kb"
+    fi
+}
+
+# staging_manifest_state <dest> — what is COMMITTED at a file:// backup staging.
+# Read-only. Prints exactly one of four words that must never collapse:
+#   no-dir        the directory does not exist (e.g. released by dolt-gc-maintenance)
+#   no-manifest   it exists but holds no `manifest` — nothing is committed; whatever
+#                 tables are in there are residue of an aborted sync
+#   has-manifest  a readable manifest exists — a backup is committed there
+#   unknown       could not tell (empty arg, not a dir, a path we may not search or
+#                 read). Never guessed into one of the others: "cannot see" is not
+#                 "does not exist" and not "no manifest".
+staging_manifest_state() {
+    local dest="$1" parent
+    if [ -z "$dest" ]; then
+        printf 'unknown'
+        return
+    fi
+    if [ ! -e "$dest" ]; then
+        # "does not exist" is only believable if we could have seen it: a parent
+        # we may not search makes every child look absent.
+        parent="$(dirname "$dest")"
+        if [ -d "$parent" ] && [ -r "$parent" ] && [ -x "$parent" ]; then
+            printf 'no-dir'
+        else
+            printf 'unknown'
+        fi
+        return
+    fi
+    if [ ! -d "$dest" ] || [ ! -r "$dest" ] || [ ! -x "$dest" ]; then
+        printf 'unknown'
+        return
+    fi
+    if [ -e "$dest/manifest" ]; then
+        if [ -r "$dest/manifest" ]; then
+            printf 'has-manifest'
+        else
+            printf 'unknown'
+        fi
+    else
+        printf 'no-manifest'
+    fi
+}
+
+# dir_size_kb <dir> — `du -sk` of <dir>, or EMPTY when it could not be measured.
+dir_size_kb() {
+    local kb
+    kb="$(du -sk "$1" 2>/dev/null | awk '{print $1}')" || kb=""
+    case "$kb" in
+        ''|*[!0-9]*) printf '' ;;
+        *) printf '%s' "$kb" ;;
+    esac
+}
+
+# staging_size_kb <dest> — size of a staging dir in KB: 0 when the dir is
+# verifiably absent, EMPTY (unknown) when it could not be measured.
+staging_size_kb() {
+    if [ "$(staging_manifest_state "$1")" = "no-dir" ]; then
+        printf '0'
+        return
+    fi
+    dir_size_kb "$1"
+}
+
+# staging_residue_note <pre_kb> <post_kb> <post_state> — PURE. The one-line report of what a
+# failed server-mediated sync left in the staging (ga-ypxbxm: "cannot fail without
+# saying how much garbage it left" — the aborted hq sync left 4.4GB with no manifest).
+staging_residue_note() {
+    printf 'staging residue: %s now (was %s), manifest=%s' \
+        "$(fmt_kb "$2")" "$(fmt_kb "$1")" "${3:-unknown}"
+}
+
+# _avail_kb <path> — free KB on the volume that holds <path>, measured at its nearest
+# existing ancestor (a released staging dir does not exist). EMPTY when it could not
+# be read. Its own function so a selftest can say exactly how much room there is.
+_avail_kb() {
+    local p="$1" kb
+    while [ -n "$p" ] && [ ! -d "$p" ]; do
+        if [ "$p" = "/" ]; then
+            break
+        fi
+        p="$(dirname "$p")"
+    done
+    kb="$(df -k "$p" 2>/dev/null | awk 'NR==2 {print $4}')" || kb=""
+    case "$kb" in
+        ''|*[!0-9]*) printf '' ;;
+        *) printf '%s' "$kb" ;;
+    esac
+}
+
+# offline_fallback_disk_check <live_kb> <avail_kb> <margin_pct> <floor_gb> — PURE.
+# Does the volume have room for an offline sync to write ~the whole live db? Needs
+# margin_pct% of the live size, floored at floor_gb (same rule as dolt-s3-backup.sh's
+# _sync_disk_preflight). Prints the KB needed when it can be computed. Returns:
+#   0  enough room (avail >= need, inclusive)
+#   1  SHORT — measured, and there is not enough
+#   2  UNKNOWN — an input is not a non-negative integer. Fail-closed and distinct from
+#      SHORT: the caller must be able to say "could not measure" rather than "no room".
+offline_fallback_disk_check() {
+    local live_kb="$1" avail_kb="$2" margin_pct="$3" floor_gb="$4" v need_kb floor_kb
+    for v in "$live_kb" "$avail_kb" "$margin_pct" "$floor_gb"; do
+        case "$v" in
+            ''|*[!0-9]*) return 2 ;;
+        esac
+    done
+    need_kb=$(( 10#$live_kb * 10#$margin_pct / 100 ))
+    floor_kb=$(( 10#$floor_gb * 1024 * 1024 ))
+    if [ "$need_kb" -lt "$floor_kb" ]; then
+        need_kb="$floor_kb"
+    fi
+    printf '%s' "$need_kb"
+    [ $((10#$avail_kb)) -ge "$need_kb" ]
+}
+
+# is_fallback_eligible_failure <rc> <output> [<staging_state>] — PURE. True (0) only for the
 # SPECIFIC failure class ga-bz7war targets: a run_bounded timeout (rc=124) or
 # the managed server's listener.read_timeout_millis cutting the connection
 # mid-sync (ga-o3nqy2: hq has failed every night since 2026-09-11 this way —
@@ -82,14 +233,31 @@ classify_sync_failure() {
 # remote, corrupt staging, a real disk error) must return 1 here — falling
 # back would just reproduce the same failure over a slower path and
 # misreport a real problem as transient.
+#
+# ga-ypxbxm: "table file not found" is the one signature whose class depends on
+# the STAGING (<staging_state> = staging_manifest_state, measured AFTER the
+# failed sync). With nothing committed there (no-dir / no-manifest) it is the
+# released-staging case — the server's cached view of a directory that was
+# emptied under it (ga-yct7r1) — and a fresh server-free sync rebuilds it from
+# scratch. With a manifest present (or a state we could not read) it is the
+# stale-manifest class (ga-b5h83): the manifest itself names a table that is
+# gone, the offline path would read the same manifest, so it must stay FAILED.
+# The state alone is never a trigger, and an omitted <staging_state> is "cannot
+# tell" — not eligible.
 is_fallback_eligible_failure() {
-    local rc="$1" output="$2"
+    local rc="$1" output="$2" staging_state="${3:-}"
     if [ "$rc" -eq 124 ]; then
         return 0
     fi
     case "$output" in
         *"context canceled"*) return 0 ;;
         *"connection was closed"*) return 0 ;;
+        *"table file not found"*)
+            case "$staging_state" in
+                no-dir|no-manifest) return 0 ;;
+                *) return 1 ;;
+            esac
+            ;;
         *) return 1 ;;
     esac
 }
@@ -140,6 +308,25 @@ sync_db_with_fallback() {
     local db="$1" db_dir="$2" bound="$3"
     local sync_rc=0 sync_output
 
+    # ga-ypxbxm: resolve the file:// staging BEFORE the sync (a local, read-only
+    # listing) so its size can be measured on both sides of the attempt — the
+    # difference is what a failed server sync leaves behind, and that is reported.
+    local backup_url dest="" pre_kb=""
+    # Guarded with `|| backup_url=""`: under pipefail, `dolt backup -v`
+    # itself failing (rare — a local, read-only listing) would otherwise
+    # abort the whole script via set -e even though awk succeeds. An empty
+    # backup_url leaves dest empty, which the non-file branch below treats
+    # as "no offline fallback possible" and reports the original failure —
+    # the correct, safe behavior when the URL can't be determined at all.
+    backup_url=$(cd "$db_dir" && dolt backup -v 2>/dev/null | awk -v n="${db}-backup" '$1==n {print $2; exit}') \
+        || backup_url=""
+    case "$backup_url" in
+        file://*)
+            dest="${backup_url#file://}"
+            pre_kb="$(staging_size_kb "$dest")"
+            ;;
+    esac
+
     sync_output=$(cd "$db_dir" && run_bounded "$bound" dolt backup sync "${db}-backup" 2>&1) || sync_rc=$?
 
     if [ "$sync_rc" -eq 0 ]; then
@@ -147,8 +334,19 @@ sync_db_with_fallback() {
         return
     fi
 
-    if ! is_fallback_eligible_failure "$sync_rc" "$sync_output"; then
-        printf 'FAILED %s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")"
+    # What the failed server sync left behind. dest_state stays empty for a
+    # non-file remote (no staging to look at) — which is_fallback_eligible_failure
+    # reads as "cannot tell", never as "nothing committed".
+    local dest_state="" residue="" note
+    if [ -n "$dest" ]; then
+        dest_state="$(staging_manifest_state "$dest")"
+        note="$(staging_residue_note "$pre_kb" "$(staging_size_kb "$dest")" "$dest_state")"
+        residue=" [$note]"
+        echo "backup: $db: server-mediated sync failed (rc=$sync_rc) — $note" >&2
+    fi
+
+    if ! is_fallback_eligible_failure "$sync_rc" "$sync_output" "$dest_state"; then
+        printf 'FAILED %s%s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")" "$residue"
         return
     fi
 
@@ -156,40 +354,64 @@ sync_db_with_fallback() {
     avail="$(_avail_gb "$DOLT_DATA_DIR")"
     avail_class="$(_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB")"
     if [ "$avail_class" != "NONE" ]; then
-        printf 'SKIP %s(disk floor %s: avail=%sGB warn=%sGB)\n' \
-            "$db" "$avail_class" "${avail:-?}" "$FLOOR_WARN_GB"
+        printf 'SKIP %s(disk floor %s: avail=%sGB warn=%sGB)%s\n' \
+            "$db" "$avail_class" "${avail:-?}" "$FLOOR_WARN_GB" "$residue"
         return
     fi
 
-    local backup_url dest
-    # Guarded with `|| backup_url=""`: under pipefail, `dolt backup -v`
-    # itself failing (rare — a local, read-only listing) would otherwise
-    # abort the whole script via set -e even though awk succeeds. An empty
-    # backup_url falls through to the non-file `*)` branch below, which
-    # reports the original failure — the correct, safe behavior when the
-    # URL can't be determined at all.
-    backup_url=$(cd "$db_dir" && dolt backup -v 2>/dev/null | awk -v n="${db}-backup" '$1==n {print $2; exit}') \
-        || backup_url=""
-    case "$backup_url" in
-        file://*)
-            dest="${backup_url#file://}"
-            if OFFLINE_SYNC_TIMEOUT="$bound" _offline_backup_sync "$db" "$dest"; then
-                printf 'OK %s\n' "$db"
-            elif [ "$sync_rc" -eq 124 ]; then
-                printf 'FAILED %s(offline fallback also failed — server sync timeout after %ss)\n' "$db" "$bound"
-            else
-                printf 'FAILED %s(offline fallback also failed — server connection closed mid-sync)\n' "$db"
-            fi
+    if [ -z "$dest" ]; then
+        # Offline fallback only ever applies to a file:// backup target
+        # (it clones the live db dir and syncs the clone straight to a
+        # local path — see dolt-offline-backup-sync.sh's header). A
+        # non-file remote (S3, a future scheme) can't use it; report the
+        # original failure unchanged.
+        printf 'FAILED %s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")"
+        return
+    fi
+
+    # ga-ypxbxm: the WARN floor above only says "the disk is not already in
+    # trouble". An offline sync writes ~the whole live db into the staging, so
+    # it also needs room in proportion to THAT (150% of the live size, same rule
+    # as dolt-s3-backup.sh's _sync_disk_preflight) — otherwise 8-10GB free and an
+    # 8GB hq lands next to the CRITICAL floor (the ga-odtd3f outage class). Below
+    # it, or when either number cannot be measured, nothing is written: SKIP with
+    # the reason, and the two cases stay distinguishable in the message.
+    local live_kb avail_kb need_kb check_rc=0
+    live_kb="$(dir_size_kb "$db_dir")"
+    avail_kb="$(_avail_kb "$dest")"
+    need_kb="$(offline_fallback_disk_check "$live_kb" "$avail_kb" "$OFFLINE_DISK_MARGIN_PCT" "$OFFLINE_DISK_FLOOR_GB")" \
+        || check_rc=$?
+    case "$check_rc" in
+        0) ;;
+        1)
+            printf 'SKIP %s(disk preflight: offline fallback needs %s free (%s%% of %s live, floor %sGB), %s available — not attempted, nothing written)%s\n' \
+                "$db" "$(fmt_kb "$need_kb")" "$OFFLINE_DISK_MARGIN_PCT" "$(fmt_kb "$live_kb")" \
+                "$OFFLINE_DISK_FLOOR_GB" "$(fmt_kb "$avail_kb")" "$residue"
+            return
             ;;
         *)
-            # Offline fallback only ever applies to a file:// backup target
-            # (it clones the live db dir and syncs the clone straight to a
-            # local path — see dolt-offline-backup-sync.sh's header). A
-            # non-file remote (S3, a future scheme) can't use it; report the
-            # original failure unchanged.
-            printf 'FAILED %s\n' "$(classify_sync_failure "$db" "$sync_rc" "$bound" "$sync_output")"
+            printf 'SKIP %s(disk preflight: could not measure live size (%s) or free space (%s) — not attempted, nothing written)%s\n' \
+                "$db" "$(fmt_kb "$live_kb")" "$(fmt_kb "$avail_kb")" "$residue"
+            return
             ;;
     esac
+
+    if OFFLINE_SYNC_TIMEOUT="$bound" _offline_backup_sync "$db" "$dest"; then
+        printf 'OK %s\n' "$db"
+        return
+    fi
+    # The offline attempt may have changed the staging too — report it as it is now.
+    residue=" [$(staging_residue_note "$pre_kb" "$(staging_size_kb "$dest")" "$(staging_manifest_state "$dest")")]"
+    local why
+    if [ "$sync_rc" -eq 124 ]; then
+        why="server sync timeout after ${bound}s"
+    else
+        case "$sync_output" in
+            *"table file not found"*) why="server sync could not find a table file in the emptied staging" ;;
+            *) why="server connection closed mid-sync" ;;
+        esac
+    fi
+    printf 'FAILED %s(offline fallback also failed — %s)%s\n' "$db" "$why" "$residue"
 }
 
 # Library mode: `MOL_DOG_BACKUP_LIB=1 source mol-dog-backup.sh` defines the pure

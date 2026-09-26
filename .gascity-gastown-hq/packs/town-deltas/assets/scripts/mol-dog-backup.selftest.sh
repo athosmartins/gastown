@@ -303,6 +303,123 @@ else
   ok "a bare nonzero exit with no matching signature is correctly NOT fallback-eligible"
 fi
 
+# ── ga-ypxbxm: "table file not found" is fallback-eligible ONLY when nothing is ──
+# ── committed at the staging (no manifest) — the released-staging class ──────────
+# dolt-gc-maintenance (ga-btnq6h) empties the hq staging; the managed server keeps
+# a cached view of it (ga-yct7r1), so the next server-mediated sync writes ~4GB of
+# tables and dies with "table file not found", leaving NO manifest. A fresh
+# server-free sync rebuilds that from scratch. The SAME error with a manifest
+# present is the ga-b5h83 stale-manifest class: the manifest itself names a table
+# that is gone, so the offline path would trip over the same manifest — that must
+# stay a FAILED, not a fallback.
+echo "── is_fallback_eligible_failure: released-staging class (ga-ypxbxm) ──"
+TFNF="error on line 1 for query CALL DOLT_BACKUP('sync', 'hq-backup'): Error 1105 (HY000): addTableFiles, openChunkSources: table file not found: .dolt-backup/hq/44e8qfo1ou41980oiorjov6fp7cu5brt"
+
+for st in no-dir no-manifest; do
+  if lib_call is_fallback_eligible_failure 1 "$TFNF" "$st"; then
+    ok "'table file not found' + staging state '$st' (nothing committed) is fallback-eligible"
+  else
+    bad "'table file not found' + staging state '$st' is NOT fallback-eligible — the ga-ypxbxm released-staging bug"
+  fi
+done
+for st in has-manifest unknown ""; do
+  if lib_call is_fallback_eligible_failure 1 "$TFNF" "$st"; then
+    bad "'table file not found' + staging state '${st:-<empty>}' is fallback-eligible — a manifest that exists (or a state we could not read) must NOT fall back"
+  else
+    ok "'table file not found' + staging state '${st:-<empty>}' is correctly NOT fallback-eligible"
+  fi
+done
+# The staging state alone is never a trigger: a different error over an
+# uncommitted staging is a genuine failure and must not fall back.
+if lib_call is_fallback_eligible_failure 1 "Error 1105 (HY000): permission denied" "no-manifest"; then
+  bad "an unrelated error over a manifest-less staging is fallback-eligible — the staging state must not be a trigger by itself"
+else
+  ok "an unrelated error over a manifest-less staging is correctly NOT fallback-eligible"
+fi
+# The pre-existing classes do not depend on the staging state.
+if lib_call is_fallback_eligible_failure 1 "context canceled" "has-manifest" && lib_call is_fallback_eligible_failure 124 "" "has-manifest"; then
+  ok "'context canceled' / rc=124 stay fallback-eligible whatever the staging state"
+else
+  bad "the pre-existing fallback classes now depend on the staging state — regression"
+fi
+
+# ── staging_manifest_state: three states that must never collapse ────────────────
+echo "── staging_manifest_state (ga-ypxbxm) ──"
+UT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mol-dog-backup-state-selftest.XXXXXX")"
+mkdir -p "$UT_DIR/empty" "$UT_DIR/junk" "$UT_DIR/committed" "$UT_DIR/locked"
+: > "$UT_DIR/junk/44e8qfo1ou41980oiorjov6fp7cu5brt"
+: > "$UT_DIR/committed/manifest"
+: > "$UT_DIR/plainfile"
+chmod 000 "$UT_DIR/locked"
+check_state() {  # <label> <path> <want>
+  local got; got="$(lib_call staging_manifest_state "$2")"
+  [ "$got" = "$3" ] && ok "staging_manifest_state($1) → $3" || bad "staging_manifest_state($1) → got '$got', want '$3'"
+}
+check_state "path that does not exist" "$UT_DIR/nope"        "no-dir"
+check_state "empty dir"                "$UT_DIR/empty"       "no-manifest"
+check_state "dir with tables, no manifest (the aborted-sync residue)" "$UT_DIR/junk" "no-manifest"
+check_state "dir with a manifest"      "$UT_DIR/committed"   "has-manifest"
+check_state "a regular file, not a dir" "$UT_DIR/plainfile"  "unknown"
+check_state "empty argument"           ""                    "unknown"
+if [ "$(id -u)" -ne 0 ]; then
+  # An unreadable dir must read as "cannot tell", never as "no manifest".
+  check_state "dir we may not enter"   "$UT_DIR/locked"      "unknown"
+  check_state "path below a dir we may not enter" "$UT_DIR/locked/x" "unknown"
+fi
+chmod 755 "$UT_DIR/locked"
+rm -rf "$UT_DIR" 2>/dev/null
+
+# ── offline_fallback_disk_check: proportional preflight (ga-ypxbxm) ──────────────
+# The fallback used to check only the WARN floor (8GB free). An offline sync writes
+# ~the whole db into the staging, so with 8-10GB free and an 8GB hq that lands next
+# to the CRITICAL floor (3GB) — the class of the ga-odtd3f outage. Same rule as
+# dolt-s3-backup.sh's _sync_disk_preflight: 150% of the live size, floored at 3GB.
+echo "── offline_fallback_disk_check (ga-ypxbxm) ──"
+HQ_LIVE_KB=8598324   # ~8.2GB, the hq measured in ga-5x6xpv
+check_disk() {  # <label> <want_rc> <want_need_or_-> <live> <avail> <margin> <floor>
+  local out rc
+  out=$(lib_call offline_fallback_disk_check "$4" "$5" "$6" "$7"); rc=$?
+  if [ "$rc" = "$2" ] && { [ "$3" = "-" ] || [ "$out" = "$3" ]; }; then
+    ok "offline_fallback_disk_check: $1 → rc=$rc need='${out}'"
+  else
+    bad "offline_fallback_disk_check: $1 → got rc=$rc need='$out', want rc=$2 need='$3'"
+  fi
+}
+check_disk "hq (8.2GB live) with 7.4GB free is SHORT of 150%"        1 12897486 "$HQ_LIVE_KB" 7759462  150 3
+check_disk "hq (8.2GB live) with 16GB free is enough"                0 12897486 "$HQ_LIVE_KB" 16777216 150 3
+check_disk "boundary: avail == need proceeds (inclusive)"            0 12897486 "$HQ_LIVE_KB" 12897486 150 3
+check_disk "boundary: avail == need-1 refuses"                       1 12897486 "$HQ_LIVE_KB" 12897485 150 3
+check_disk "a small db is held to the 3GB absolute floor"            1 3145728  1000 3145727 150 3
+check_disk "a small db with exactly the 3GB floor free proceeds"     0 3145728  1000 3145728 150 3
+check_disk "floor 0 lets a tiny db be judged by the margin alone"    0 -        1000 1500    150 0
+check_disk "floor 0, avail below the margin → SHORT"                 1 -        1000 1499    150 0
+# Fail-closed: an unmeasurable input is UNKNOWN (rc=2), never "enough" and never
+# collapsed into SHORT — the caller must be able to tell "no room" from "could not look".
+check_disk "empty live size → UNKNOWN"                               2 -        ""   16777216 150 3
+check_disk "empty avail → UNKNOWN"                                   2 -        1000 ""       150 3
+check_disk "non-numeric avail → UNKNOWN"                             2 -        1000 "n/a"    150 3
+check_disk "negative avail → UNKNOWN"                                2 -        1000 "-5"     150 3
+check_disk "empty margin → UNKNOWN"                                  2 -        1000 16777216 ""  3
+check_disk "leading zeros are decimal, not octal (live=08)"          0 -        "08" 16777216 150 3
+
+# ── residue reporting: formatter + note (ga-ypxbxm) ──────────────────────────────
+echo "── staging_residue_note / fmt_kb (ga-ypxbxm) ──"
+check_fmt() {  # <kb> <want>
+  local got; got="$(lib_call fmt_kb "$1")"
+  [ "$got" = "$2" ] && ok "fmt_kb '$1' → $2" || bad "fmt_kb '$1' → got '$got', want '$2'"
+}
+check_fmt 0 "0KB";       check_fmt 512 "512KB";   check_fmt 1023 "1023KB"; check_fmt 1024 "1MB"
+check_fmt 2048 "2MB";    check_fmt 1048576 "1.0GB"; check_fmt 4613735 "4.4GB"
+check_fmt "" "?";        check_fmt "abc" "?"
+note="$(lib_call staging_residue_note 0 4613735 no-manifest)"
+[ "$note" = "staging residue: 4.4GB now (was 0KB), manifest=no-manifest" ] \
+  && ok "staging_residue_note reports size now, size before, and manifest state" \
+  || bad "staging_residue_note → got '$note'"
+note="$(lib_call staging_residue_note "" "" unknown)"
+[ "$note" = "staging residue: ? now (was ?), manifest=unknown" ] \
+  && ok "staging_residue_note shows '?' (not 0) when the size could not be measured" \
+  || bad "staging_residue_note (unmeasured) → got '$note'"
+
 # ── drift-guard: sync_db_with_fallback defined AND wired into the main loop ──────
 echo "── drift-guard: fallback wiring present in live script (ga-bz7war) ──"
 
@@ -334,6 +451,25 @@ if grep -qF '_floor_class "$avail" "$FLOOR_WARN_GB" "$FLOOR_CRITICAL_GB"' "$SCRI
   ok "sync_db_with_fallback checks disk floor via _floor_class before falling back (AC3)"
 else
   bad "sync_db_with_fallback never checks disk floor — AC3 (disk-floor guard) not wired"
+fi
+
+# ga-ypxbxm: the two new checks must be wired into the function, not merely defined.
+if grep -qF 'is_fallback_eligible_failure "$sync_rc" "$sync_output" "$dest_state"' "$SCRIPT"; then
+  ok "sync_db_with_fallback hands the measured staging state to is_fallback_eligible_failure (ga-ypxbxm)"
+else
+  bad "sync_db_with_fallback does not pass the staging state to is_fallback_eligible_failure — 'table file not found' can never fall back"
+fi
+PREFLIGHT_LINE=$(grep -nF 'offline_fallback_disk_check "$live_kb"' "$SCRIPT" | head -1 | cut -d: -f1)
+OFFLINE_CALL_LINE=$(grep -nF '_offline_backup_sync "$db" "$dest"' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$PREFLIGHT_LINE" ] && [ -n "$OFFLINE_CALL_LINE" ] && [ "$PREFLIGHT_LINE" -lt "$OFFLINE_CALL_LINE" ]; then
+  ok "the proportional disk preflight runs BEFORE the offline sync (line $PREFLIGHT_LINE < $OFFLINE_CALL_LINE) — nothing is written first (ga-ypxbxm)"
+else
+  bad "the proportional disk preflight is missing or sits after the offline sync call (preflight=${PREFLIGHT_LINE:-none} offline=${OFFLINE_CALL_LINE:-none})"
+fi
+if grep -qF 'staging_residue_note "$pre_kb"' "$SCRIPT"; then
+  ok "sync_db_with_fallback reports the staging residue of a failed server sync (ga-ypxbxm)"
+else
+  bad "no staging residue report in sync_db_with_fallback — a failed server sync would leave garbage unreported"
 fi
 
 if grep -qF '. "$GC_CITY_PATH/scripts/dolt-offline-backup-sync.sh"' "$SCRIPT"; then
@@ -417,10 +553,18 @@ EOF2
   REAL_DOLT="$(command -v dolt)"
   FB_BIN="$FB_WORK/bin"
   mkdir -p "$FB_BIN"
+  # ga-ypxbxm: the failure text is overridable (FB_FAKE_ERR) and the fake can
+  # leave a partial table file behind (FB_FAKE_RESIDUE_FILE) the way the real
+  # aborted server sync did (33 tables, 4.4GB, no manifest). With neither set it
+  # behaves exactly as before: "context canceled", nothing written.
   cat > "$FB_BIN/dolt" <<EOF2
 #!/bin/bash
 if [ "\$1" = "backup" ] && [ "\$2" = "sync" ] && [ "\$#" -eq 3 ]; then
-  echo "error on line 1 for query CALL DOLT_BACKUP('sync', '\$3'): Error 1105 (HY000): context canceled" >&2
+  if [ -n "\${FB_FAKE_RESIDUE_FILE:-}" ]; then
+    mkdir -p "\$(dirname "\$FB_FAKE_RESIDUE_FILE")"
+    head -c 20480 /dev/zero > "\$FB_FAKE_RESIDUE_FILE"
+  fi
+  echo "\${FB_FAKE_ERR:-error on line 1 for query CALL DOLT_BACKUP('sync', '\$3'): Error 1105 (HY000): context canceled}" >&2
   exit 1
 fi
 exec "$REAL_DOLT" "\$@"
@@ -440,6 +584,11 @@ EOF2
       export DOLT_DISK_FLOOR_GUARD_LIB=1
       . "$FLOOR_LIB"
       run_bounded() { shift; "$@"; }
+      # ga-ypxbxm: the proportional preflight reads free space through
+      # _avail_kb. Stubbed on demand so a scenario can say exactly how much
+      # room there is, instead of depending on this host's real free disk.
+      if [ -n "${FB_AVAIL_KB:-}" ]; then _avail_kb() { printf '%s' "$FB_AVAIL_KB"; }; fi
+      if [ -n "${FB_AVAIL_UNKNOWN:-}" ]; then _avail_kb() { printf ''; }; fi
       "$@"
     )
   }
@@ -454,6 +603,7 @@ EOF2
   FB1_OUT=$(PATH="$FB_BIN:$PATH" \
     OFFLINE_SYNC_DOLT_CFG="$FB_CFG" OFFLINE_SYNC_TMP_ROOT="$FB_WORK" \
     DOLT_DATA_DIR="$FB_DATA_DIR" DOLT_DISK_FLOOR_WARN_GB=0 DOLT_DISK_FLOOR_CRITICAL_GB=0 \
+    MOL_DOG_BACKUP_DISK_FLOOR_GB=0 \
     fallback_call sync_db_with_fallback testdb "$FB_DATA_DIR/testdb" 120 2>"$FB_WORK/scenario1.stderr")
   FB1_RC=$?
   if [ "$FB1_RC" -eq 0 ] && [ "$FB1_OUT" = "OK testdb" ]; then
@@ -483,6 +633,128 @@ EOF2
   else
     bad "simulated failure + breached disk floor did not SKIP — got: '$FB2_OUT' (expected a 'SKIP testdb(...)' line)"
   fi
+
+  # ── ga-ypxbxm scenarios ───────────────────────────────────────────────────────
+  # Each one gets its own throwaway db + file:// remote, so nothing carries over
+  # between them. fb_run takes its per-scenario knobs from the caller's env:
+  #   FB_FAKE_ERR / FB_FAKE_RESIDUE_FILE  what the fake server-mediated sync does
+  #   FB_AVAIL_KB / FB_AVAIL_UNKNOWN      how much free space _avail_kb reports
+  fb_new_db() {  # <name>
+    mkdir -p "$FB_DATA_DIR/$1" "$FB_WORK/backup/$1" \
+      && ( cd "$FB_DATA_DIR/$1" && dolt init >/dev/null 2>&1 && dolt backup add "$1-backup" "file://$FB_WORK/backup/$1" >/dev/null 2>&1 )
+  }
+  fb_live_kb() { du -sk "$FB_DATA_DIR/$1" 2>/dev/null | awk '{print $1}'; }
+  fb_files() { find "$1" -type f 2>/dev/null | wc -l | tr -d ' '; }
+  fb_run() {  # <db>
+    PATH="$FB_BIN:$PATH" OFFLINE_SYNC_DOLT_CFG="$FB_CFG" OFFLINE_SYNC_TMP_ROOT="$FB_WORK" \
+      OFFLINE_SYNC_LOG="$FB_WORK/offline-$1.log" DOLT_DATA_DIR="$FB_DATA_DIR" \
+      DOLT_DISK_FLOOR_WARN_GB=0 DOLT_DISK_FLOOR_CRITICAL_GB=0 MOL_DOG_BACKUP_DISK_FLOOR_GB=0 \
+      fallback_call sync_db_with_fallback "$1" "$FB_DATA_DIR/$1" 120 2>"$FB_WORK/stderr-$1.txt"
+  }
+  RESIDUE_NAME="0123456789abcdefghijklmnopqrstuv"   # a table-file-shaped name, as the aborted sync wrote
+
+  # The released-staging bug, end to end: dolt-gc-maintenance (ga-btnq6h) emptied
+  # the hq staging; the server-mediated sync then writes partial tables and dies
+  # with "table file not found" — no manifest. HEAD reported FAILED and stopped.
+  echo "── released staging: 'table file not found', nothing committed (ga-ypxbxm) ──"
+
+  # (a) room to spare → the real server-free sync rebuilds it.
+  fb_new_db relstg; RS_DEST="$FB_WORK/backup/relstg"; rmdir "$RS_DEST"   # "released": the dir is gone
+  RS_LIVE="$(fb_live_kb relstg)"
+  RS_OUT=$(FB_FAKE_ERR="$TFNF" FB_FAKE_RESIDUE_FILE="$RS_DEST/$RESIDUE_NAME" FB_AVAIL_KB=$((RS_LIVE * 4)) fb_run relstg)
+  if [ "$RS_OUT" = "OK relstg" ]; then
+    ok "'table file not found' over a manifest-less staging + room → real offline fallback → OK (the ga-ypxbxm fix, end to end)"
+  else
+    bad "'table file not found' over a manifest-less staging did not recover — got '$RS_OUT' (stderr: $(cat "$FB_WORK/stderr-relstg.txt" 2>/dev/null))"
+  fi
+  [ -e "$RS_DEST/manifest" ] \
+    && ok "the rebuilt staging now has a manifest — the backup is committed, not just reported OK" \
+    || bad "OK was reported but $RS_DEST has no manifest — success was not real"
+  [ -e "$RS_DEST/$RESIDUE_NAME" ] \
+    && ok "the leftover file from the aborted sync was not deleted (the fallback never removes staging content)" \
+    || bad "the leftover file from the aborted sync is gone — the fallback deleted staging content"
+  grep -q 'offline-sync: OK' "$FB_WORK/offline-relstg.log" 2>/dev/null \
+    && ok "the offline fallback itself ran and logged OK" \
+    || bad "no 'offline-sync: OK' in the offline log — the fallback did not actually run"
+
+  # (b) not enough room for the proportional margin → SKIP, and nothing is written.
+  # avail == live is 100% of the db: it clears the WARN floor (forced to 0 here) yet
+  # sits below the 150% the write needs — exactly the 8-10GB-free / 8GB-hq case.
+  fb_new_db shortdisk; SD_DEST="$FB_WORK/backup/shortdisk"; rmdir "$SD_DEST"
+  SD_LIVE="$(fb_live_kb shortdisk)"
+  SD_OUT=$(FB_FAKE_ERR="$TFNF" FB_FAKE_RESIDUE_FILE="$SD_DEST/$RESIDUE_NAME" FB_AVAIL_KB="$SD_LIVE" fb_run shortdisk)
+  case "$SD_OUT" in
+    "SKIP shortdisk("*"preflight"*) ok "released staging + free space below 150% of the live db → SKIP naming the preflight: $SD_OUT" ;;
+    *) bad "released staging + short disk did not SKIP with a preflight reason — got '$SD_OUT'" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-shortdisk.log" ] \
+    && ok "SKIP wrote nothing: the offline sync was never invoked (its log is empty)" \
+    || bad "the offline sync ran despite the short-disk SKIP — log: $(cat "$FB_WORK/offline-shortdisk.log")"
+  if [ "$(fb_files "$SD_DEST")" = "1" ] && [ ! -e "$SD_DEST/manifest" ]; then
+    ok "the staging holds exactly what the failed server sync left (1 file, no manifest) — SKIP added nothing"
+  else
+    bad "the staging changed under a SKIP: $(find "$SD_DEST" -type f 2>/dev/null | tr '\n' ' ')"
+  fi
+  [ -z "$(ls -d "$FB_WORK"/offline-sync-shortdisk.* 2>/dev/null)" ] \
+    && ok "no offline-sync clone dir was created under a SKIP" \
+    || bad "an offline-sync clone dir exists after a SKIP"
+  case "$SD_OUT" in
+    *"staging residue: "*"manifest=no-manifest"*) ok "the SKIP line reports the residue the failed server sync left (size + manifest state)" ;;
+    *) bad "the SKIP line does not report the staging residue — got '$SD_OUT'" ;;
+  esac
+
+  # (c) the SAME error with a manifest present is the ga-b5h83 stale-manifest class:
+  # the offline path would trip over that manifest too → FAILED, no fallback.
+  fb_new_db stalemf; SM_DEST="$FB_WORK/backup/stalemf"; printf 'x' > "$SM_DEST/manifest"
+  SM_LIVE="$(fb_live_kb stalemf)"
+  SM_OUT=$(FB_FAKE_ERR="$TFNF" FB_AVAIL_KB=$((SM_LIVE * 4)) fb_run stalemf)
+  case "$SM_OUT" in
+    "FAILED stalemf("*) ok "'table file not found' over a COMMITTED manifest stays FAILED (stale-manifest class, ga-b5h83)" ;;
+    *) bad "'table file not found' over a committed manifest did not FAIL — got '$SM_OUT'" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-stalemf.log" ] \
+    && ok "no offline fallback was attempted over a committed manifest" \
+    || bad "the offline fallback ran over a committed manifest"
+  case "$SM_OUT" in
+    *"manifest=has-manifest"*) ok "the FAILED line reports the manifest state (has-manifest)" ;;
+    *) bad "the FAILED line does not report the manifest state — got '$SM_OUT'" ;;
+  esac
+
+  # (d) a manifest-less staging is not a trigger on its own: a different error is a
+  # genuine failure, reported with the residue, never fallen back from.
+  fb_new_db otherr; OE_DEST="$FB_WORK/backup/otherr"
+  OE_LIVE="$(fb_live_kb otherr)"
+  OE_OUT=$(FB_FAKE_ERR="Error 1105 (HY000): remote refused the write" FB_FAKE_RESIDUE_FILE="$OE_DEST/$RESIDUE_NAME" FB_AVAIL_KB=$((OE_LIVE * 4)) fb_run otherr)
+  case "$OE_OUT" in
+    "FAILED otherr("*"remote refused the write"*"staging residue: "*"manifest=no-manifest"*) ok "an unrelated error is FAILED with the failure text AND the residue report" ;;
+    *) bad "an unrelated error over a manifest-less staging: unexpected result '$OE_OUT'" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-otherr.log" ] \
+    && ok "no fallback for an unrelated error, even over a manifest-less staging" \
+    || bad "the offline fallback ran for an unrelated error"
+
+  # (e) the proportional preflight guards the PRE-EXISTING fallback classes too — the
+  # whole fallback used to check only the WARN floor, not the size of the db.
+  echo "── proportional preflight on the existing fallback classes (ga-ypxbxm) ──"
+  fb_new_db ctxshort
+  CS_LIVE="$(fb_live_kb ctxshort)"
+  CS_OUT=$(FB_AVAIL_KB="$CS_LIVE" fb_run ctxshort)     # default fake error: "context canceled"
+  case "$CS_OUT" in
+    "SKIP ctxshort("*"preflight"*) ok "'context canceled' + free space below 150% of the live db → SKIP (was: fell back and wrote)" ;;
+    *) bad "'context canceled' + short disk did not SKIP with a preflight reason — got '$CS_OUT'" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-ctxshort.log" ] \
+    && ok "the offline sync was not invoked" || bad "the offline sync ran despite the short-disk SKIP"
+
+  # (f) free space that cannot be measured is UNKNOWN, and UNKNOWN never writes.
+  fb_new_db noavail
+  NA_OUT=$(FB_AVAIL_UNKNOWN=1 fb_run noavail)
+  case "$NA_OUT" in
+    "SKIP noavail("*"could not measure"*) ok "unmeasurable free space → SKIP saying it could not measure (fail-closed, not 'no room')" ;;
+    *) bad "unmeasurable free space did not SKIP with 'could not measure' — got '$NA_OUT'" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-noavail.log" ] \
+    && ok "the offline sync was not invoked" || bad "the offline sync ran with unmeasurable free space"
 
   rm -rf "$FB_WORK" 2>/dev/null
 fi
