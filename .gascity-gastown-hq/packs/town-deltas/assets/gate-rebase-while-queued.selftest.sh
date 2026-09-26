@@ -110,9 +110,13 @@ echo "── 4. drift-guard: needs-rebase still applied to genuine conflicts ─
 # this block used to leave open across all ~400 lines of it). Accept either
 # shape so this drift-guard still recognizes the (behaviorally unchanged)
 # needs-rebase outcome.
+# ga-8dehbc: the 7 park writes of that block now go through
+# gate_requeue_respecting_external (compare-before-write, so an external
+# transition on the marker survives) — the same outcome, a third accepted shape.
+# The per-site behaviour is locked by gate-8dehbc-park-external.selftest.sh.
 has "$DISPATCHER" \
-  '"gate-status:needs-rebase"|set_gate_status "\$MARKER_ID" "needs-rebase"' \
-  "gate-status:needs-rebase label is still set in at least one path (literal or via set_gate_status, ga-7fwt1)"
+  '"gate-status:needs-rebase"|set_gate_status "\$MARKER_ID" "needs-rebase"|gate_requeue_respecting_external "\$MARKER_ID" "needs-rebase" "dispatching"' \
+  "gate-status:needs-rebase label is still set in at least one path (literal, via set_gate_status ga-7fwt1, or via gate_requeue_respecting_external ga-8dehbc)"
 
 # 4b. The ga-q3ig2 dead-author + genuine-conflict path must be preserved.
 has "$DISPATCHER" \

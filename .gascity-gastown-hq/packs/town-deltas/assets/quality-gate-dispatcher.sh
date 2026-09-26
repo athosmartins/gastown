@@ -3744,7 +3744,8 @@ gate_exile_watchdog_sweep() {
         -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
         bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
         bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
-        set_gate_status "$marker_id" "needs-rebase"
+        # park-raw-ok: this parks a QUEUED marker from a once-per-sweep snapshot (expected_status would be `queued`, not `dispatching`), and the Mayor mail above already says "Parked" — a skipped write would make it false. Needs its own ordering decision, tracked in ga-w5jq3d.
+        set_gate_status "$marker_id" "needs-rebase"  # park-raw-ok: see the line above (ga-w5jq3d)
       else
         warn "Could not mail Mayor for exile-watchdog escalation on $marker_id — leaving gate:exile-escalated unset and gate-status:queued untouched so this marker is retried on a later sweep instead of permanently dropped."
       fi
@@ -5246,9 +5247,18 @@ gate_full_suite_verdict() {
 #     queued->dispatching and stays there until a terminal status, Phase B/C
 #     included). gate-dl3x9s-requeue-external.selftest.sh locks the class of raw
 #     `set_gate_status ... "queued"` writers (none may come back without a
-#     waiver). It does NOT cover the 7 `set_gate_status ... "needs-rebase"` PARK
-#     writers in the rebase decision block, which share the blind overwrite and
-#     need per-site side-effect handling — tracked in ga-8dehbc.
+#     waiver). ga-8dehbc routes the 7 `needs-rebase` PARK writers of the rebase
+#     decision block through it as well (expected_status `dispatching` at all
+#     seven — the marker is still at the claim's label there). A park is not a
+#     requeue: on a respected/failed write the site skips its marker comment,
+#     source-bead label/re-route, nudge and Mayor mail and words the verdict via
+#     gate_park_note_skipped; the 3 sites that exit 0 themselves guard their
+#     closing ga-kgtiw self-heal on _REQUEUE_RESPECTED inline (like the shared
+#     tail). A needs-rebase ALREADY on the marker is not "foreign"
+#     (the helper excludes its own target), so the park still runs in full.
+#     gate-8dehbc-park-external.selftest.sh locks the class of raw needs-rebase
+#     writers (waive with `# park-raw-ok: why`). The one waived writer is the
+#     exile watchdog's park (gate_exile_watchdog_sweep), tracked in ga-w5jq3d.
 GATE_RETRY_COOLDOWN_SECONDS="${GATE_RETRY_COOLDOWN_SECONDS:-900}"
 case "$GATE_RETRY_COOLDOWN_SECONDS" in ''|*[!0-9]*) GATE_RETRY_COOLDOWN_SECONDS=900 ;; esac
 GATE_CLEAN_RETRY_HARD_CAP="${GATE_CLEAN_RETRY_HARD_CAP:-7}"
@@ -5426,6 +5436,39 @@ gate_requeue_narrate() {
       _RQ_NOTE="NOT re-queued (the gate-status write failed, rc=$_rc; the marker's label is unverified, ga-dl3x9s)"
       _RQ_WHY="the gate-status write itself failed (rc=$_rc), so the marker's label is unverified and this sweep did not re-queue it"
     fi
+  fi
+  return 0
+}
+
+# gate_park_note_skipped <rc>   (ga-8dehbc)
+# The sibling of gate_requeue_note_skipped for the 7 PARK writers of the rebase decision
+# block (`gate_requeue_respecting_external <id> needs-rebase dispatching`). Called when
+# that write returned non-zero: the marker was NOT parked, so the words the site would
+# have used ("Gate BLOCKED", "NEEDS_REBASE ...") must not be written. A park is not a
+# requeue — after the write each site comments on the marker, labels / unassigns /
+# re-routes the SOURCE bead and nudges the author or mails the Mayor — so the caller
+# skips ALL of that and only records what the sweep did, in the same two variables the
+# "Dispatcher sweep complete" line and QG_LOG read:
+#   rc GATE_REQUEUE_RESPECTED_RC  an external transition was respected (the marker was moved
+#                                 or closed while the sweep held it). Sets
+#                                 _REQUEUE_RESPECTED=1 so the closing gate_marker_status_
+#                                 ensure is skipped: the marker's status is no longer this
+#                                 sweep's to judge, and ensure would "repair" a closed
+#                                 marker with a gate-status:error and a false Mayor alarm.
+#   any other rc                  the write itself failed; the marker's label is UNVERIFIED,
+#                                 so _REQUEUE_RESPECTED stays unset and the closing
+#                                 self-heal still runs. Never worded as "another actor".
+# A MISSING or empty rc is "could not tell" and takes the second, inert side (rc=unknown).
+# Always returns 0: the callers run under `set -e`.
+gate_park_note_skipped() {
+  local _rc="${1:-unknown}"
+  if [ "$_rc" = "$GATE_REQUEUE_RESPECTED_RC" ]; then
+    _REQUEUE_RESPECTED=1
+    REBASE_EVENT="dispatcher_park_respected_external"
+    REBASE_VERDICT="PARK-SKIPPED (another actor moved or closed the marker while this sweep held it — that transition stands, the marker was NOT parked at needs-rebase, and no source-bead label, re-route, nudge or Mayor mail was sent; ga-8dehbc)"
+  else
+    REBASE_EVENT="dispatcher_park_write_failed"
+    REBASE_VERDICT="PARK-FAILED (the gate-status:needs-rebase write returned rc=$_rc — the marker is not known to be parked, so no source-bead label, re-route, nudge or Mayor mail was sent; the closing self-heal decides its label; ga-8dehbc)"
   fi
   return 0
 }
@@ -13377,92 +13420,107 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         log "  ga-u679x2: could not reverse-resolve bead_city='$BEAD_CITY' to any registered rig — falling back to gastown.dog (safe default), NOT guessing from code rig '${RIG:-}'."
       fi
       warn "Branch $BRANCH: rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (ga-tz0op) — no fixed instance to wait for or nudge. Returning source bead to the $_TZ0OP_ROUTE pool for a fresh worker instead of circuit-breaking or bouncing to a dead identity."
-      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
-      if [ -n "$BEAD_ID" ]; then
-        bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase"  -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"    -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                   -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" update       "$BEAD_ID" --set-metadata "gc.routed_to=$_TZ0OP_ROUTE" -q 2>/dev/null || true
-        # ga-p5q3 discipline: verify the write actually stuck rather than
-        # assuming it (same pattern as the ga-f54ui FAIL-path pool-return
-        # above) — a post-write read failure is its own third state, never
-        # collapsed into "restore failed".
-        _TZ0OP_VERIFY_JSON=""
-        _TZ0OP_VERIFY_READ_OK=1
-        _TZ0OP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_VERIFY_READ_OK=0
-        [ -n "$_TZ0OP_VERIFY_JSON" ] || _TZ0OP_VERIFY_READ_OK=0
-        # ga-i19942: the pool probe (`bd ready ... --exclude-label gate:queued`)
-        # and the Pilot's candidate query (pilot-dispatcher.sh, same
-        # --exclude-label) both HIDE a bead wearing gate:queued, so a bead
-        # returned to the pool with a stale gate:queued is invisible to every
-        # worker — measured 25/09 on wa-gqkpz (71min) and wa-wqn2v (43min):
-        # `bd ready --metadata-field gc.routed_to=wa-worker --unassigned` listed
-        # both, the same query with the probe's --exclude-label listed neither.
-        # The two sibling pool-returns (ga-39l9z2 needs-rebase arm and the FAIL
-        # arm, ga-f54ui) already drop it; this one never did. The marker stays
-        # OPEN (needs-rebase), and gate-recovery-watchdog's FIX8 only clears a
-        # phantom gate:queued when NO marker references the bead, so nothing
-        # else cleans this up. Same conservative rule as ga-39l9z2: only drop it
-        # once the read-back CONFIRMS nobody holds the bead — dropping a label
-        # on a bead a different actor just claimed would fabricate state. The
-        # marker itself is untouched here (still needs-rebase; the Step 0a-4
-        # reaper, ga-88sl7, closes it once the branch has landed).
-        _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed)"
-        _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
-        if [ "$_TZ0OP_VERIFY_READ_OK" = "0" ]; then
-          _TZ0OP_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
-        else
-          _TZ0OP_ROUTE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
-          if [ "$_TZ0OP_ROUTE_OBSERVED" = "$_TZ0OP_ROUTE" ]; then
-            _TZ0OP_ROUTE_OBS="gc.routed_to=$_TZ0OP_ROUTE (restored)"
+      # SELFTEST-EXTRACT ga-8dehbc-park-pool-author: BEGIN
+      # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+      if [ "$_RQ_RC" = "0" ]; then
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity (virtual slot label, bare template, or a recycled pool instance) — structurally never a fixed session to wait for or notify (NOT the same as a dead named author; NOT the same as a live one to bounce to). Source bead $BEAD_ID returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add    "$BEAD_ID" "gate:needs-rebase"  -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"    -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                   -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" update       "$BEAD_ID" --set-metadata "gc.routed_to=$_TZ0OP_ROUTE" -q 2>/dev/null || true
+          # ga-p5q3 discipline: verify the write actually stuck rather than
+          # assuming it (same pattern as the ga-f54ui FAIL-path pool-return
+          # above) — a post-write read failure is its own third state, never
+          # collapsed into "restore failed".
+          _TZ0OP_VERIFY_JSON=""
+          _TZ0OP_VERIFY_READ_OK=1
+          _TZ0OP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_VERIFY_READ_OK=0
+          [ -n "$_TZ0OP_VERIFY_JSON" ] || _TZ0OP_VERIFY_READ_OK=0
+          # ga-i19942: the pool probe (`bd ready ... --exclude-label gate:queued`)
+          # and the Pilot's candidate query (pilot-dispatcher.sh, same
+          # --exclude-label) both HIDE a bead wearing gate:queued, so a bead
+          # returned to the pool with a stale gate:queued is invisible to every
+          # worker — measured 25/09 on wa-gqkpz (71min) and wa-wqn2v (43min):
+          # `bd ready --metadata-field gc.routed_to=wa-worker --unassigned` listed
+          # both, the same query with the probe's --exclude-label listed neither.
+          # The two sibling pool-returns (ga-39l9z2 needs-rebase arm and the FAIL
+          # arm, ga-f54ui) already drop it; this one never did. The marker stays
+          # OPEN (needs-rebase), and gate-recovery-watchdog's FIX8 only clears a
+          # phantom gate:queued when NO marker references the bead, so nothing
+          # else cleans this up. Same conservative rule as ga-39l9z2: only drop it
+          # once the read-back CONFIRMS nobody holds the bead — dropping a label
+          # on a bead a different actor just claimed would fabricate state. The
+          # marker itself is untouched here (still needs-rebase; the Step 0a-4
+          # reaper, ga-88sl7, closes it once the branch has landed).
+          _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed)"
+          _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
+          if [ "$_TZ0OP_VERIFY_READ_OK" = "0" ]; then
+            _TZ0OP_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
           else
-            _TZ0OP_ROUTE_OBS="gc.routed_to='${_TZ0OP_ROUTE_OBSERVED}' NOT $_TZ0OP_ROUTE — restore did not stick, needs investigation"
-          fi
-          # Three states for each read, never collapsed: a jq failure yields "?"
-          # (unknown), which must not read as "assignee empty" or "label absent".
-          _TZ0OP_ASSIGNEE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "?")
-          _TZ0OP_QUEUED_PRESENT=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
-          if [ "$_TZ0OP_ASSIGNEE_OBSERVED" = "?" ] || [ "$_TZ0OP_QUEUED_PRESENT" = "?" ]; then
-            _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write JSON unreadable)"
-            _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write JSON unreadable — left untouched)"
-          elif [ -n "$_TZ0OP_ASSIGNEE_OBSERVED" ]; then
-            _TZ0OP_ASSIGNEE_OBS="assignee='${_TZ0OP_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation"
-            _TZ0OP_QUEUED_OBS="gate:queued=left untouched (assignee still held, so the bead is not pool-visible either way)"
-          else
-            _TZ0OP_ASSIGNEE_OBS="assignee=cleared"
-            if [ "$_TZ0OP_QUEUED_PRESENT" = "no" ]; then
-              _TZ0OP_QUEUED_OBS="gate:queued=absent (nothing to remove)"
+            _TZ0OP_ROUTE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+            if [ "$_TZ0OP_ROUTE_OBSERVED" = "$_TZ0OP_ROUTE" ]; then
+              _TZ0OP_ROUTE_OBS="gc.routed_to=$_TZ0OP_ROUTE (restored)"
             else
-              bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
-              # Re-read: the remove above is fire-and-forget (-q, errors dropped),
-              # so "removed" is only claimed from what the bead now shows.
-              _TZ0OP_RECHECK_JSON=""
-              _TZ0OP_RECHECK_OK=1
-              _TZ0OP_RECHECK_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_RECHECK_OK=0
-              [ -n "$_TZ0OP_RECHECK_JSON" ] || _TZ0OP_RECHECK_OK=0
-              if [ "$_TZ0OP_RECHECK_OK" = "0" ]; then
-                _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal failed — state unknown, NOT a claim the removal failed)"
+              _TZ0OP_ROUTE_OBS="gc.routed_to='${_TZ0OP_ROUTE_OBSERVED}' NOT $_TZ0OP_ROUTE — restore did not stick, needs investigation"
+            fi
+            # Three states for each read, never collapsed: a jq failure yields "?"
+            # (unknown), which must not read as "assignee empty" or "label absent".
+            _TZ0OP_ASSIGNEE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "?")
+            _TZ0OP_QUEUED_PRESENT=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+            if [ "$_TZ0OP_ASSIGNEE_OBSERVED" = "?" ] || [ "$_TZ0OP_QUEUED_PRESENT" = "?" ]; then
+              _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write JSON unreadable)"
+              _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write JSON unreadable — left untouched)"
+            elif [ -n "$_TZ0OP_ASSIGNEE_OBSERVED" ]; then
+              _TZ0OP_ASSIGNEE_OBS="assignee='${_TZ0OP_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation"
+              _TZ0OP_QUEUED_OBS="gate:queued=left untouched (assignee still held, so the bead is not pool-visible either way)"
+            else
+              _TZ0OP_ASSIGNEE_OBS="assignee=cleared"
+              if [ "$_TZ0OP_QUEUED_PRESENT" = "no" ]; then
+                _TZ0OP_QUEUED_OBS="gate:queued=absent (nothing to remove)"
               else
-                _TZ0OP_QUEUED_AFTER=$(printf '%s' "$_TZ0OP_RECHECK_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
-                case "$_TZ0OP_QUEUED_AFTER" in
-                  no)  _TZ0OP_QUEUED_OBS="gate:queued=removed" ;;
-                  yes) _TZ0OP_QUEUED_OBS="gate:queued=STILL PRESENT — removal did not stick, the pool probe cannot see this bead (needs investigation)" ;;
-                  *)   _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal unreadable)" ;;
-                esac
+                bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
+                # Re-read: the remove above is fire-and-forget (-q, errors dropped),
+                # so "removed" is only claimed from what the bead now shows.
+                _TZ0OP_RECHECK_JSON=""
+                _TZ0OP_RECHECK_OK=1
+                _TZ0OP_RECHECK_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_RECHECK_OK=0
+                [ -n "$_TZ0OP_RECHECK_JSON" ] || _TZ0OP_RECHECK_OK=0
+                if [ "$_TZ0OP_RECHECK_OK" = "0" ]; then
+                  _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal failed — state unknown, NOT a claim the removal failed)"
+                else
+                  _TZ0OP_QUEUED_AFTER=$(printf '%s' "$_TZ0OP_RECHECK_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+                  case "$_TZ0OP_QUEUED_AFTER" in
+                    no)  _TZ0OP_QUEUED_OBS="gate:queued=removed" ;;
+                    yes) _TZ0OP_QUEUED_OBS="gate:queued=STILL PRESENT — removal did not stick, the pool probe cannot see this bead (needs investigation)" ;;
+                    *)   _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal unreadable)" ;;
+                  esac
+                fi
               fi
             fi
           fi
+          _TZ0OP_ROUTE_UNKNOWN_NOTE=""
+          [ "$_TZ0OP_ROUTE_UNKNOWN" = "1" ] && _TZ0OP_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS; $_TZ0OP_ASSIGNEE_OBS; $_TZ0OP_QUEUED_OBS (ga-i19942).$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
         fi
-        _TZ0OP_ROUTE_UNKNOWN_NOTE=""
-        [ "$_TZ0OP_ROUTE_UNKNOWN" = "1" ] && _TZ0OP_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS; $_TZ0OP_ASSIGNEE_OBS; $_TZ0OP_QUEUED_OBS (ga-i19942).$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
+        REBASE_EVENT="dispatcher_needs_rebase_pool_author"
+        REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
+      else
+        # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+        gate_park_note_skipped "$_RQ_RC"
       fi
-      REBASE_EVENT="dispatcher_needs_rebase_pool_author"
-      REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
-      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the pool-author rebase return")" = "repaired" ]; then
+      # SELFTEST-EXTRACT ga-8dehbc-park-pool-author: END
+      # SELFTEST-EXTRACT ga-8dehbc-heal-pool-author: BEGIN
+      if [ "${_REQUEUE_RESPECTED:-0}" = "1" ]; then
+        # ga-8dehbc: an external transition was respected and NO status was written — same rule as the shared tail below:
+        # gate_marker_status_ensure never looks at .status, so it would "repair" a closed marker with a false gate-status:error + Mayor alarm.
+        log "  ga-kgtiw self-heal skipped for marker $MARKER_ID: this sweep respected an external transition on it and wrote no status (ga-8dehbc)."
+      elif [ "$(gate_marker_status_ensure "$MARKER_ID" "the pool-author rebase return")" = "repaired" ]; then
         warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the pool-author rebase return — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
+      # SELFTEST-EXTRACT ga-8dehbc-heal-pool-author: END
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -13641,27 +13699,42 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       exit 0
     elif [ "$_BEHIND_ACTION" = "bounce" ]; then
       warn "Branch $BRANCH: main is ${REBASE_BEHIND:-?} commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}); author $REBASE_AUTHOR is live — bouncing for manual/assisted rebase instead of auto-retrying a permanent condition."
-      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
-      if [ -n "$BEAD_ID" ]; then
-        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+      # SELFTEST-EXTRACT ga-8dehbc-park-behind-bounce: BEGIN
+      # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+      if [ "$_RQ_RC" = "0" ]; then
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. Action required: manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+        fi
+        # ga-6dp9 (gate-fix-2): notify the identity actually verified alive for
+        # THIS decision (REBASE_AUTHOR — resolve_rebase_author() never falls
+        # through to a bead-assignee/owner value, so it stays reliable here),
+        # not $AUTHOR, which can be a stale bead-owner. Gate review on gate-fix-1
+        # (gate_run=ga-wisp-bkb9q6) caught that this bounce decides "someone can
+        # fix this" via REBASE_AUTHOR_ALIVE but then nudged the separate,
+        # possibly-dead $AUTHOR — leaving no one actually notified.
+        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+          "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Manually rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done. Bead: $BEAD_ID" \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
+        REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
+      else
+        # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+        gate_park_note_skipped "$_RQ_RC"
       fi
-      # ga-6dp9 (gate-fix-2): notify the identity actually verified alive for
-      # THIS decision (REBASE_AUTHOR — resolve_rebase_author() never falls
-      # through to a bead-assignee/owner value, so it stays reliable here),
-      # not $AUTHOR, which can be a stale bead-owner. Gate review on gate-fix-1
-      # (gate_run=ga-wisp-bkb9q6) caught that this bounce decides "someone can
-      # fix this" via REBASE_AUTHOR_ALIVE but then nudged the separate,
-      # possibly-dead $AUTHOR — leaving no one actually notified.
-      gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-        "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Manually rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done. Bead: $BEAD_ID" \
-        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
-      REBASE_EVENT="dispatcher_needs_rebase_behind_envelope"
-      REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, author live, bounced)"
-      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce")" = "repaired" ]; then
+      # SELFTEST-EXTRACT ga-8dehbc-park-behind-bounce: END
+      # SELFTEST-EXTRACT ga-8dehbc-heal-behind-bounce: BEGIN
+      if [ "${_REQUEUE_RESPECTED:-0}" = "1" ]; then
+        # ga-8dehbc: an external transition was respected and NO status was written — same rule as the shared tail below:
+        # gate_marker_status_ensure never looks at .status, so it would "repair" a closed marker with a false gate-status:error + Mayor alarm.
+        log "  ga-kgtiw self-heal skipped for marker $MARKER_ID: this sweep respected an external transition on it and wrote no status (ga-8dehbc)."
+      elif [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope bounce")" = "repaired" ]; then
         warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the behind-envelope bounce — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
+      # SELFTEST-EXTRACT ga-8dehbc-heal-behind-bounce: END
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -13675,23 +13748,38 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       exit 0
     elif [ "$_BEHIND_ACTION" = "bounce_owner" ]; then
       warn "Branch $BRANCH: main is ${REBASE_BEHIND:-?} commits ahead of branch base (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}); rebase author $REBASE_AUTHOR is dead, but bead owner $OWNER is live — bouncing to owner instead of circuit-breaking (ga-ivzbuz)."
-      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. The branch's own rebase author ($REBASE_AUTHOR) has no live session — that is EXPECTED for an ad-hoc pool worker that already submitted and exited normally (ga-ivzbuz DEFEITO 2), not evidence of abandoned work. Bead owner $OWNER is live and has been nudged to re-anchor. Action required: rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
-      if [ -n "$BEAD_ID" ]; then
-        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Rebase author $REBASE_AUTHOR has no live session (expected for an ad-hoc worker that already submitted normally) — bead owner $OWNER is live and was nudged instead of parking this on gate:needs-human. Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+      # SELFTEST-EXTRACT ga-8dehbc-park-behind-owner: BEGIN
+      # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+      if [ "$_RQ_RC" = "0" ]; then
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind current main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). This is a permanent condition (main only moves forward) — auto-retry cannot help. The branch's own rebase author ($REBASE_AUTHOR) has no live session — that is EXPECTED for an ad-hoc pool worker that already submitted and exited normally (ga-ivzbuz DEFEITO 2), not evidence of abandoned work. Bead owner $OWNER is live and has been nudged to re-anchor. Action required: rebase $BRANCH onto current origin/$DEFAULT_BRANCH and re-run /gate-done." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked (ga-ivzbuz, extends ga-6dp9): branch $BRANCH's base is ${REBASE_BEHIND:-?} commits behind main (> GATE_REBASE_BEHIND_MAX=${GATE_REBASE_BEHIND_MAX}). Rebase author $REBASE_AUTHOR has no live session (expected for an ad-hoc worker that already submitted normally) — bead owner $OWNER is live and was nudged instead of parking this on gate:needs-human. Manual rebase required — re-run /gate-done after rebasing." 2>/dev/null || true
+        fi
+        # ga-ivzbuz: nudge the identity actually verified alive for THIS
+        # decision (OWNER), not REBASE_AUTHOR (confirmed dead in this branch) —
+        # same signal/target-matching discipline as ga-6dp9 gate-fix-2 above.
+        gc --city "$GC_CITY" session nudge "$OWNER" \
+          "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Rebase author $REBASE_AUTHOR has no live session (likely already submitted and exited normally). You're the bead owner and live — please rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done, or reassign. Bead: $BEAD_ID" \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge owner $OWNER for rebase"
+        REBASE_EVENT="dispatcher_needs_rebase_behind_envelope_owner_fallback"
+        REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, rebase author dead, owner $OWNER live, bounced — ga-ivzbuz)"
+      else
+        # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+        gate_park_note_skipped "$_RQ_RC"
       fi
-      # ga-ivzbuz: nudge the identity actually verified alive for THIS
-      # decision (OWNER), not REBASE_AUTHOR (confirmed dead in this branch) —
-      # same signal/target-matching discipline as ga-6dp9 gate-fix-2 above.
-      gc --city "$GC_CITY" session nudge "$OWNER" \
-        "GATE BLOCKED for branch $BRANCH: base is ${REBASE_BEHIND:-?} commits behind main (> ${GATE_REBASE_BEHIND_MAX} max) — this is permanent, not a transient race. Rebase author $REBASE_AUTHOR has no live session (likely already submitted and exited normally). You're the bead owner and live — please rebase onto origin/$DEFAULT_BRANCH and re-run /gate-done, or reassign. Bead: $BEAD_ID" \
-        --delivery wait-idle 2>/dev/null || warn "Could not nudge owner $OWNER for rebase"
-      REBASE_EVENT="dispatcher_needs_rebase_behind_envelope_owner_fallback"
-      REBASE_VERDICT="NEEDS_REBASE (main delta > envelope, rebase author dead, owner $OWNER live, bounced — ga-ivzbuz)"
-      if [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope owner-fallback bounce")" = "repaired" ]; then
+      # SELFTEST-EXTRACT ga-8dehbc-park-behind-owner: END
+      # SELFTEST-EXTRACT ga-8dehbc-heal-behind-owner: BEGIN
+      if [ "${_REQUEUE_RESPECTED:-0}" = "1" ]; then
+        # ga-8dehbc: an external transition was respected and NO status was written — same rule as the shared tail below:
+        # gate_marker_status_ensure never looks at .status, so it would "repair" a closed marker with a false gate-status:error + Mayor alarm.
+        log "  ga-kgtiw self-heal skipped for marker $MARKER_ID: this sweep respected an external transition on it and wrote no status (ga-8dehbc)."
+      elif [ "$(gate_marker_status_ensure "$MARKER_ID" "the behind-envelope owner-fallback bounce")" = "repaired" ]; then
         warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the behind-envelope owner-fallback bounce — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
       fi
+      # SELFTEST-EXTRACT ga-8dehbc-heal-behind-owner: END
       log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
       mkdir -p "$(dirname "$QG_LOG")"
       jq -c -n \
@@ -13715,33 +13803,42 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
       # them to rebase again). Re-queue instead (same logic as dead-author transient
       # path) so the next sweep re-reads the author's rebased tip and proceeds.
       warn "Branch $BRANCH: genuine merge conflict (${CONFLICT_FILES:-conflicts}); author $REBASE_AUTHOR is live — bouncing for manual rebase."
-      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      # ga-kyxih (AC2/AC4): when this branch already carries a merge commit
-      # not yet on $DEFAULT_BRANCH, a manual "rebase" is not the applicable
-      # fix either (see branch_has_merge_in_range() above; ga-sg1axd — the
-      # same reason auto-rebase itself is skipped for this class) — tell the
-      # author to MERGE, not rebase, instead of the generic instruction that
-      # doesn't match their branch's history shape.
-      if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
-        _REBASE_ACTION_ADVICE="this branch already contains a merge commit not yet on $DEFAULT_BRANCH, so rebase is not the applicable fix (ga-kyxih) — run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, resolve the conflict, and push"
-      else
-        _REBASE_ACTION_ADVICE="manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done"
-      fi
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has a genuine merge conflict that auto-rebase cannot resolve.
+      # SELFTEST-EXTRACT ga-8dehbc-park-live-conflict: BEGIN
+      # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+      if [ "$_RQ_RC" = "0" ]; then
+        # ga-kyxih (AC2/AC4): when this branch already carries a merge commit
+        # not yet on $DEFAULT_BRANCH, a manual "rebase" is not the applicable
+        # fix either (see branch_has_merge_in_range() above; ga-sg1axd — the
+        # same reason auto-rebase itself is skipped for this class) — tell the
+        # author to MERGE, not rebase, instead of the generic instruction that
+        # doesn't match their branch's history shape.
+        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+          _REBASE_ACTION_ADVICE="this branch already contains a merge commit not yet on $DEFAULT_BRANCH, so rebase is not the applicable fix (ga-kyxih) — run 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, resolve the conflict, and push"
+        else
+          _REBASE_ACTION_ADVICE="manually rebase $BRANCH onto current origin/$DEFAULT_BRANCH, resolve conflicts, and re-run /gate-done"
+        fi
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate BLOCKED: branch $BRANCH is stale and has a genuine merge conflict that auto-rebase cannot resolve.
 main HEAD is $MAIN_HEAD_SHA. Conflicting regions: ${CONFLICT_FILES:-unknown}.
 Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
-      if [ -n "$BEAD_ID" ]; then
-        bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has a genuine merge conflict with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add  "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate blocked: branch $BRANCH has a genuine merge conflict with current main ($MAIN_HEAD_SHA). Auto-rebase failed (${CONFLICT_FILES:-conflicts}). Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
+        fi
+        # ga-6dp9 (gate-fix-2): see the matching comment at the behind-envelope
+        # bounce above — notify REBASE_AUTHOR (verified alive by this branch's
+        # own gate), not the possibly-stale/dead $AUTHOR.
+        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+          "GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Action required: ${_REBASE_ACTION_ADVICE}. Bead: $BEAD_ID" \
+          --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
+        REBASE_EVENT="dispatcher_needs_rebase"
+        REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
+      else
+        # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+        gate_park_note_skipped "$_RQ_RC"
       fi
-      # ga-6dp9 (gate-fix-2): see the matching comment at the behind-envelope
-      # bounce above — notify REBASE_AUTHOR (verified alive by this branch's
-      # own gate), not the possibly-stale/dead $AUTHOR.
-      gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-        "GATE BLOCKED for branch $BRANCH: stale with merge conflicts — auto-rebase cannot resolve. Conflicts: ${CONFLICT_FILES:-unknown}. Action required: ${_REBASE_ACTION_ADVICE}. Bead: $BEAD_ID" \
-        --delivery wait-idle 2>/dev/null || warn "Could not nudge author $REBASE_AUTHOR for rebase"
-      REBASE_EVENT="dispatcher_needs_rebase"
-      REBASE_VERDICT="NEEDS_REBASE (genuine merge conflict, author live, bounced)"
+      # SELFTEST-EXTRACT ga-8dehbc-park-live-conflict: END
     elif [ "$REBASE_AUTHOR_ALIVE" = "1" ] && [ "$CONFLICT_KIND" = "transient" ]; then
       # gt-4tk5m fix: author is live but failure is TRANSIENT (worktree/push plumbing
       # race — e.g. author force-pushed a rebase while marker was queued and our
@@ -13839,24 +13936,33 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
         # SELFTEST-EXTRACT ga-a6etc2-live-requeue: END
       else
         err "Branch $BRANCH: transient auto-rebase failure persists after $MAX_REBASE_ATTEMPTS attempts even with live author $REBASE_AUTHOR — escalating."
-        set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Last attempt: $_PUSH_DIAG. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
-        # ga-g0v96 (AC5): the retry saga is now terminal (bounced) — drop the
-        # informational label from the source bead so it doesn't linger.
-        [ -n "$BEAD_ID" ] && bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT" -q 2>/dev/null || true
-        if [ -n "$BEAD_ID" ]; then
-          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        # SELFTEST-EXTRACT ga-8dehbc-park-live-exhausted: BEGIN
+        # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+        _RQ_RC=0
+        gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+        if [ "$_RQ_RC" = "0" ]; then
+          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED (gt-4tk5m): branch $BRANCH hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) despite live author $REBASE_AUTHOR. Last attempt: $_PUSH_DIAG. Parked at needs-rebase for human/Mayor resolution." 2>/dev/null || true
+          # ga-g0v96 (AC5): the retry saga is now terminal (bounced) — drop the
+          # informational label from the source bead so it doesn't linger.
+          [ -n "$BEAD_ID" ] && bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:rebase-retry:$NEXT_ATTEMPT" -q 2>/dev/null || true
+          if [ -n "$BEAD_ID" ]; then
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          fi
+          # ga-6dp9 (gate-fix-2): same notify-identity fix — REBASE_AUTHOR, not $AUTHOR.
+          gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
+            "GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor." \
+            --delivery wait-idle 2>/dev/null || true
+          gc --city "$GC_CITY" mail send mayor \
+            -s "Gate escalation: $BRANCH transient rebase race (live author, $MAX_REBASE_ATTEMPTS attempts)" \
+            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $REBASE_AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \
+            || warn "Could not mail Mayor for gate escalation on $BRANCH"
+          REBASE_EVENT="dispatcher_needs_rebase_transient_escalated"
+          REBASE_VERDICT="NEEDS_REBASE (persistent transient race, escalated after $MAX_REBASE_ATTEMPTS attempts)"
+        else
+          # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+          gate_park_note_skipped "$_RQ_RC"
         fi
-        # ga-6dp9 (gate-fix-2): same notify-identity fix — REBASE_AUTHOR, not $AUTHOR.
-        gc --city "$GC_CITY" session nudge "$REBASE_AUTHOR" \
-          "GATE ESCALATED for branch $BRANCH (${BEAD_ID:-unknown}): persistent transient auto-rebase failures after $MAX_REBASE_ATTEMPTS retries. Please check your branch and re-run /gate-done, or contact Mayor." \
-          --delivery wait-idle 2>/dev/null || true
-        gc --city "$GC_CITY" mail send mayor \
-          -s "Gate escalation: $BRANCH transient rebase race (live author, $MAX_REBASE_ATTEMPTS attempts)" \
-          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) hit persistent transient auto-rebase failures ($MAX_REBASE_ATTEMPTS attempts) even with live author $REBASE_AUTHOR. ${CONFLICT_FILES:-unknown}. Possible stuck push race or corrupt ref. Parked at needs-rebase. (gt-4tk5m)" 2>/dev/null \
-          || warn "Could not mail Mayor for gate escalation on $BRANCH"
-        REBASE_EVENT="dispatcher_needs_rebase_transient_escalated"
-        REBASE_VERDICT="NEEDS_REBASE (persistent transient race, escalated after $MAX_REBASE_ATTEMPTS attempts)"
+        # SELFTEST-EXTRACT ga-8dehbc-park-live-exhausted: END
       fi
     elif [ "$CONFLICT_KIND" = "merge" ]; then
       # ga-q3ig2 IDEAL SKIP: a GENUINE merge conflict vs current main is
@@ -13868,27 +13974,36 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
       # so the marker leaves the active queue on its FIRST determination and the
       # gate-health-monitor / a fresh re-dispatch can re-anchor or rebuild it.
       err "Branch $BRANCH: genuine merge conflict vs $DEFAULT_BRANCH, author dead/empty — immediate needs-rebase (no retry; conflict is deterministic)."
-      set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-      # ga-kyxih (AC2): name the has-merge-in-range cause distinctly when it
-      # applies (see branch_has_merge_in_range() above; ga-sg1axd). No live
-      # author to notify here (AC4 targets the live-author paths above) —
-      # this only sharpens the marker's own diagnostic text for whoever
-      # triages it.
-      if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
-        _REBASE_REANCHOR_ADVICE="This branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih) — re-anchoring means 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, not a rebase."
+      # SELFTEST-EXTRACT ga-8dehbc-park-dead-conflict: BEGIN
+      # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+      if [ "$_RQ_RC" = "0" ]; then
+        # ga-kyxih (AC2): name the has-merge-in-range cause distinctly when it
+        # applies (see branch_has_merge_in_range() above; ga-sg1axd). No live
+        # author to notify here (AC4 targets the live-author paths above) —
+        # this only sharpens the marker's own diagnostic text for whoever
+        # triages it.
+        if [ "$BRANCH_HAS_MERGE_IN_RANGE" = "1" ]; then
+          _REBASE_REANCHOR_ADVICE="This branch already contains a merge commit not yet on $DEFAULT_BRANCH (ga-kyxih) — re-anchoring means 'git merge origin/$DEFAULT_BRANCH' into $BRANCH, not a rebase."
+        else
+          _REBASE_REANCHOR_ADVICE="Needs re-anchor/rebuild or a Mayor decision."
+        fi
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists (ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}). A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. $_REBASE_REANCHOR_ADVICE" 2>/dev/null || true
+        if [ -n "$BEAD_ID" ]; then
+          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+        fi
+        gc --city "$GC_CITY" mail send mayor \
+          -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
+          -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). Needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
+          || warn "Could not mail Mayor for gate escalation on $BRANCH"
+        REBASE_EVENT="dispatcher_needs_rebase_immediate"
+        REBASE_VERDICT="NEEDS_REBASE (genuine conflict, dead author — immediate skip)"
       else
-        _REBASE_REANCHOR_ADVICE="Needs re-anchor/rebuild or a Mayor decision."
+        # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+        gate_park_note_skipped "$_RQ_RC"
       fi
-      bd -C "$GC_CITY" comment "$MARKER_ID" "Gate SKIPPED + ESCALATED (ga-q3ig2): branch $BRANCH has a genuine, deterministic merge conflict (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) and no live author session exists (ga-it1of liveness check: ${REBASE_LIVENESS_TRACE:-none}). A server-side rebase retry would fail identically, so the marker is parked at needs-rebase immediately (NOT re-queued) — it no longer blocks the queue. $_REBASE_REANCHOR_ADVICE" 2>/dev/null || true
-      if [ -n "$BEAD_ID" ]; then
-        bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
-      fi
-      gc --city "$GC_CITY" mail send mayor \
-        -s "Gate escalation: $BRANCH genuine conflict (no live author)" \
-        -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) has a genuine, deterministic conflict vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). Conflicting: ${CONFLICT_FILES:-unknown}. Author session is gone — gate cannot self-heal, and a rebase retry would fail identically. Liveness candidates checked (ga-it1of): ${REBASE_LIVENESS_TRACE:-none}. Parked at needs-rebase (not blocking the queue). Needs a manual re-anchor/rebuild or a decision." 2>/dev/null \
-        || warn "Could not mail Mayor for gate escalation on $BRANCH"
-      REBASE_EVENT="dispatcher_needs_rebase_immediate"
-      REBASE_VERDICT="NEEDS_REBASE (genuine conflict, dead author — immediate skip)"
+      # SELFTEST-EXTRACT ga-8dehbc-park-dead-conflict: END
     else
       # Dead/empty author + TRANSIENT auto-rebase failure (worktree/push plumbing).
       # main may settle on a later sweep, so a bounded server-side retry is worth
@@ -14079,16 +14194,25 @@ Action required: ${_REBASE_ACTION_ADVICE}." 2>/dev/null || true
             _ESC_SUBJ="Gate escalation: $BRANCH bounded retry spent (merge-tree clean, no live author)"
           fi
           err "Branch $BRANCH: transient auto-rebase failure persists after $NEXT_ATTEMPT server-side attempts, author dead/empty — escalating to Mayor.${_CAP_NOTE}"
-          set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
-          bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $NEXT_ATTEMPT attempts, and no live author session exists.${_CAP_NOTE} Parked at gate-status:needs-rebase; escalated to Mayor for resolution (rebuild on current main, or close)." 2>/dev/null || true
-          if [ -n "$BEAD_ID" ]; then
-            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+          # SELFTEST-EXTRACT ga-8dehbc-park-dead-exhausted: BEGIN
+          # ga-8dehbc: compare-before-write — see gate_requeue_respecting_external / gate_park_note_skipped.
+          _RQ_RC=0
+          gate_requeue_respecting_external "$MARKER_ID" "needs-rebase" "dispatching" || _RQ_RC=$?  # ga-8dehbc park
+          if [ "$_RQ_RC" = "0" ]; then
+            bd -C "$GC_CITY" comment "$MARKER_ID" "Gate ESCALATED: branch $BRANCH could not auto-rebase (${CONFLICT_FILES:-unknown}) vs main ($MAIN_HEAD_SHA) after $NEXT_ATTEMPT attempts, and no live author session exists.${_CAP_NOTE} Parked at gate-status:needs-rebase; escalated to Mayor for resolution (rebuild on current main, or close)." 2>/dev/null || true
+            if [ -n "$BEAD_ID" ]; then
+              bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-rebase" -q 2>/dev/null || true
+            fi
+            gc --city "$GC_CITY" mail send mayor \
+              -s "$_ESC_SUBJ" \
+              -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $NEXT_ATTEMPT times and the author session is gone — gate cannot self-heal.${_CAP_NOTE} Needs a manual rebase, a rebuild on current main, or a decision." 2>/dev/null \
+              || warn "Could not mail Mayor for gate escalation on $BRANCH"
+            REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $NEXT_ATTEMPT attempts)"
+          else
+            # ga-8dehbc: NOT parked (external transition respected, or the write failed) — no marker comment, source-bead label/re-route, nudge or Mayor mail.
+            gate_park_note_skipped "$_RQ_RC"
           fi
-          gc --city "$GC_CITY" mail send mayor \
-            -s "$_ESC_SUBJ" \
-            -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) could not auto-rebase vs origin/$DEFAULT_BRANCH ($MAIN_HEAD_SHA). ${CONFLICT_FILES:-unknown}. Auto-rebase failed $NEXT_ATTEMPT times and the author session is gone — gate cannot self-heal.${_CAP_NOTE} Needs a manual rebase, a rebuild on current main, or a decision." 2>/dev/null \
-            || warn "Could not mail Mayor for gate escalation on $BRANCH"
-          REBASE_VERDICT="NEEDS_REBASE (escalated to Mayor after $NEXT_ATTEMPT attempts)"
+          # SELFTEST-EXTRACT ga-8dehbc-park-dead-exhausted: END
         fi
         # SELFTEST-EXTRACT ga-y5c29l-retry-dead-decision: END
       fi
