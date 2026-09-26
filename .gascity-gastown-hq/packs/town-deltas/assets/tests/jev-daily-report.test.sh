@@ -186,6 +186,9 @@ EOF
 # below would report on the LIVE consumer of whatever machine runs this suite, so a Portaria that happens to be down
 # would change every ntfy here. The default is a healthy consumer (a fresh rc=0 line, written by run() so it never
 # ages); RUN_PLOG points a test at another log, RUN_PDISABLED=1 drops the off-switch file.
+# NOTE: this pins PORTARIA_STATE_FILE, so writer and reader share one directory here BY CONSTRUCTION -- launchd gives the real job
+# neither that variable nor GC_PACK_STATE_DIR. That the report finds the order's state without them is tested in
+# scripts/portaria-shadow.selftest.py section 14b, which runs the report CLI in an HOME+PATH-only environment.
 mkdir -p "$T/pack-state"
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"

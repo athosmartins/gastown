@@ -442,29 +442,45 @@ def _pending_line_en(pending) -> str:
 
 # ── is the Portaria consumer alive? (ga-aijm2v.12) ─────────────────────────────────────────
 HEALTH_OMIT = "omit"  # the caller did not ask for the consumer line (old callers, synthetic tests)
-# "Parado" = no run for this long. The order runs every 5 min; measured on 26/09 over 41 runs the gap between two
-# runs was p50 8.5 min, max 23 min. An hour is 2.6x that worst gap, and it is the outcome window: past it, the
+# "Parado" = no run for this long. The order has a 5 min cooldown (it is not a 5 min clock); measured on 26/09 over 41
+# runs the gap between two runs was p50 8.5 min, max 23 min. An hour is 2.6x that worst gap, and it is the outcome window: past it, the
 # deliveries waiting for their 60-minute outcome can no longer be measured on time.
 PORTARIA_STALE_S = 3600
 _PORTARIA_HEALTH_TEXT = {
     "ok": ("Portaria consumer: last run {d} — OK", "Portaria (consumidor): última rodada {d} — OK."),
     "failed": ("⚠️ Portaria consumer: the LAST RUN FAILED ({d}) — stretches of the Portaria numbers may be missing; this is NOT 'a quiet day'",
                "⚠️ Portaria: a ÚLTIMA RODADA FALHOU ({d}) — pode faltar trecho dos números; isto NÃO é 'dia parado'."),
-    "stale": ("⚠️ Portaria consumer: no run since {d} (the order runs every 5 min) — the Portaria numbers stop there; this is NOT 'a quiet day'",
-              "⚠️ Portaria: sem rodada desde {d} (o ritmo é 5 min) — os números da Portaria param aí; isto NÃO é 'dia parado'."),
+    "stale": ("⚠️ Portaria consumer: no run since {d} (the order normally runs every 5-25 min) — the Portaria numbers stop there; this is NOT 'a quiet day'",
+              "⚠️ Portaria: sem rodada desde {d} (o normal é uma rodada a cada 5-25 min) — os números da Portaria param aí; isto NÃO é 'dia parado'."),
     "disabled": ("⚠️ Portaria consumer: switched OFF ({d}) — no delivery is being observed",
                  "⚠️ Portaria: DESLIGADA ({d}) — nenhuma entrega está sendo observada."),
-    "unknown": ("⚠️ Portaria consumer: cannot tell whether the order ever ran ({d}) — this is NOT 'a quiet day'",
-                "⚠️ Portaria: não dá para saber se a ordem já rodou ({d}) — isto NÃO é 'dia parado'."),
+    "unknown": ("⚠️ Portaria consumer: cannot tell whether it is running ({d}) — this is NOT 'a quiet day'",
+                "⚠️ Portaria: não dá para saber se o consumidor está rodando ({d}) — isto NÃO é 'dia parado'."),
 }
 
 
 def load_portaria_health(now: datetime | None = None) -> tuple:
     """(state, detail): ok | failed | stale | disabled | unknown, for the Portaria consumer. The off-switch file is
-    checked first (it is the state of the world NOW; the log only says what the last run saw), then the order
-    wrapper's run log through jev_recomecar_experiment.consumer_health() -- the same reader the "recomecar" report
-    uses, so the logic lives once. Anything that cannot be read is "unknown", never "ok" and never a crash: an
-    auxiliary line must not take the daily report down, and must not say the consumer is fine when it cannot tell."""
+    checked first (it is the state of the world at the moment the report runs; the log only says what the last run
+    saw), then the order wrapper's run log through jev_recomecar_experiment.consumer_health() -- the same reader the
+    "recomecar" report uses, so the logic lives once. Anything that cannot be read is "unknown", never "ok" and never
+    a crash: an auxiliary line must not take the daily report down, and must not say the consumer is fine when it
+    cannot tell.
+
+    Where the switch file is looked up: the report runs from launchd (HOME and PATH only), not from the engine, so
+    there is no GC_PACK_STATE_DIR and the directory comes from portaria_shadow.config_from_env()'s default -- the same
+    directory the order writes to. If that directory does not exist the switch file cannot be checked at all. The log
+    still speaks for itself (a failed, stopped or "disabled via PORTARIA_ENABLED" run is reported as such, that switch
+    leaves no file), but an "ok" from the log is downgraded to "unknown", naming the directory: a consumer that just ran
+    while the directory the reader is looking in does not exist means the reader is looking in the wrong place, and
+    "no switch file found" there must not pass for "not switched off".
+
+    Two limits, stated so the line is not over-read. It describes the consumer at the moment the report runs, while the
+    report covers the UTC day that just closed (launchd fires at 00:07 UTC): a consumer dead all day and restarted just
+    before the report reads ok next to "nothing to measure" -- the line prints the last run's time so that is visible.
+    And a run that only skipped (lock held, events unreadable) does not refresh it: freshness is judged by the last
+    run that really ran, so a consumer that starts skipping every pass keeps reading ok (the full report names the
+    skips) until that run is an hour old and it turns "parado"."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import jev_recomecar_experiment as _jr
@@ -472,13 +488,17 @@ def load_portaria_health(now: datetime | None = None) -> tuple:
         cfg = _ps.config_from_env()
         flag = _ps.disabled_file(cfg)
         try:
+            state_dir_ok = flag.parent.is_dir()
             off = flag.exists()
         except OSError as e:
             return "unknown", f"cannot check {flag.name}: {e}"
         if off:
             return "disabled", f"{flag.name} is present"
-        return _jr.consumer_health(cfg.wrapper_log, now or datetime.now(timezone.utc),
-                                   stale_s=PORTARIA_STALE_S, disabled_markers=(_ps.DISABLED_LINE,))
+        health = _jr.consumer_health(cfg.wrapper_log, now or datetime.now(timezone.utc),
+                                     stale_s=PORTARIA_STALE_S, disabled_markers=(_ps.DISABLED_LINE,))
+        if health[0] == "ok" and not state_dir_ok:
+            return "unknown", f"the order's state directory {flag.parent} does not exist, so {flag.name} cannot be checked (log says: {health[1]})"
+        return health
     except Exception as e:  # noqa: BLE001 — see the docstring: unknown, not ok, not a crash
         return "unknown", f"could not tell ({type(e).__name__}: {e})"
 
@@ -779,7 +799,8 @@ def main() -> int:
     pending = load_portaria_pending() if portaria_summary else PENDING_OMIT
     # The consumer's state belongs to a report about the Portaria (or about everything); a report filtered to
     # some other front does not say anything about it.
-    health = load_portaria_health() if (args.experiment is None or args.experiment.startswith("portaria")) else HEALTH_OMIT
+    # `not args.experiment` (None or ""): load_events reads both as "no filter", so both are a report about everything.
+    health = load_portaria_health() if (not args.experiment or args.experiment.startswith("portaria")) else HEALTH_OMIT
 
     if args.json:
         print(json.dumps({"suppression": summary, "shadow": shadow_summary, "portaria": portaria_summary,

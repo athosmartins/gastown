@@ -1612,5 +1612,67 @@ with tempfile.TemporaryDirectory() as td:
     ok("the wrapper's own 'TIMEOUT after 1s' line reads as failed", health_of(wl) == "failed", str(health_of(wl)))
     ok("a log path that is a directory (unreadable as a file) is unknown, and the report still runs", health_of(tdp) == "unknown", str(health_of(tdp)))
 
+# ---------------------------------------------------------------------------------------------
+print("-- 14b. the report reads the order's state where the ORDER keeps it, in the environment launchd gives it (ga-aijm2v.12) --")
+# Catches: everything above points writer and reader at the same directory by setting GC_PACK_STATE_DIR, an environment production does
+# not have. The engine gives the ORDER that variable; the report runs from launchd with HOME and PATH only, so its reader falls back to a
+# default -- and the default named the wrong pack, so the off-switch file and the state file were looked up in a directory the order never
+# writes. "No switch found" there is the same answer as "no switch" (a third state collapsed), and the fresh rc=0 line hid it.
+# The sandbox is laid out from where the repo SHIPS the order, not from a string this test invents: the engine's state dir for an order
+# is <runtime>/packs/<the pack that ships it> (measured live 26/09: .gc/runtime/packs/town-deltas/portaria-shadow-state.json).
+SHIPPED = sorted(p.parent.parent.name for p in (HERE.parent / "packs").glob("*/orders/portaria-shadow.toml"))
+ok("the Portaria order is shipped by exactly one pack (the sandbox below is laid out from it)", len(SHIPPED) == 1, str(SHIPPED))
+PACK = SHIPPED[0] if len(SHIPPED) == 1 else "?"
+
+
+def launchd_report_cli(*flags, wrapper=None, disabled=False, rows=(), pack_dir=True, state=None):
+    """The report CLI as the launchd job runs it: HOME and PATH, and NOTHING that says where the order keeps its state (no
+    GC_PACK_STATE_DIR, no PORTARIA_STATE_FILE, no PORTARIA_LOG_FILE) -- the state dir and the wrapper log are derived by the code from
+    the city layout. GC_CITY_PATH is set only to keep the sandbox off the live city (the real job derives the same layout from the
+    hard-coded default city); the experiment log is pinned for the same reason."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        pack = tdp / ".gc" / "runtime" / "packs" / PACK
+        if pack_dir:
+            pack.mkdir(parents=True)
+        (tdp / ".gc" / "logs").mkdir(parents=True)
+        (tdp / "jev-experiment.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        if wrapper is not None:
+            (tdp / ".gc" / "logs" / "portaria-shadow.log").write_text("".join(line + "\n" for line in wrapper))
+        if disabled:
+            (pack / "portaria-shadow.disabled").write_text("")
+        if state is not None:
+            (pack / "portaria-shadow-state.json").write_text(json.dumps(state))
+        r = subprocess.run([sys.executable, str(REPORT_PY), "--date", DAY, *flags], capture_output=True, text=True, timeout=90,
+                           env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "GC_CITY_PATH": str(tdp),
+                                "JEV_EXPERIMENT_LOG": str(tdp / "jev-experiment.jsonl")})
+        return r.returncode, r.stdout + r.stderr
+
+
+rc_, pt = launchd_report_cli("--resumo-pt", wrapper=[wline(6)], disabled=True)
+ok("launchd env: the switch file in the order's own state dir + a fresh rc=0 log line -> DESLIGADA (only the FILE can say so)",
+   "DESLIGADA" in pt and "nada a medir" not in pt, pt)
+rc_, pt = launchd_report_cli("--resumo-pt", wrapper=[wline(6)])
+ok("launchd env, control: the same layout without the switch file is the plain quiet day (nothing invented)",
+   pt.strip() == f"Dia {DAY}: nenhum alerta candidato registrado — nada a medir.", pt)
+rc_, en = launchd_report_cli(rows=[prow()], wrapper=[wline(6)], state={"pending": {"a": {}, "b": {}}})
+ok("launchd env: the pending count comes from the order's state file, not 'n/d' (same directory, same defect)",
+   "Observed but not yet measured: 2 " in en and "Observed but not yet measured: n/d" not in en, en)
+rc_, js = launchd_report_cli("--json", wrapper=[wline(6)], pack_dir=False)
+det = (json.loads(js).get("portaria_consumer") or {}) if js.lstrip().startswith("{") else {}
+ok("launchd env, the order's state dir does not exist while its log says it just ran: UNKNOWN naming the directory -- the reader cannot check "
+   "the off switch there, and must not answer 'not switched off'", det.get("state") == "unknown" and PACK in det.get("detail", ""), js)
+for label, line, want in (
+        ("a FAILED run", wline(6, rc=3, rest="boom"), "failed"),
+        ("'disabled via PORTARIA_ENABLED' (that switch leaves no file at all)",
+         wline(6, rest="portaria-shadow: disabled via PORTARIA_ENABLED -- skipping"), "disabled")):
+    rc_, js = launchd_report_cli("--json", wrapper=[line], pack_dir=False)
+    det = (json.loads(js).get("portaria_consumer") or {}) if js.lstrip().startswith("{") else {}
+    ok(f"launchd env, state dir missing: {label} keeps its own verdict ({want}) -- only an 'ok' is downgraded to unknown",
+       det.get("state") == want, js)
+# --experiment "" is 'no filter' to the event loader; the health line must follow the same reading
+rc_, pt = report_cli("--experiment", "", "--resumo-pt", wrapper=[wline(6, rc=3, rest="boom")])
+ok("--experiment '' reports everything, so it carries the Portaria health line like no filter at all", "FALHOU" in pt, pt)
+
 print(f"\nportaria-shadow selftest: PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

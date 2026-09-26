@@ -258,10 +258,19 @@ def rig_for_entity(entity: str, rig_paths: dict):
     return rig_paths.get(entity.split("-", 1)[0])
 
 
+# The pack that ships orders/portaria-shadow.toml. The engine runs the order with GC_PACK_STATE_DIR=<runtime>/packs/<this pack>
+# (measured live 26/09: .gc/runtime/packs/town-deltas/portaria-shadow-state.json). A process the engine did NOT start -- the
+# launchd daily report, which reads the state file and the off-switch file, or a run by hand -- has no such variable and falls
+# back to the default below; it has to land in the SAME directory or it reads a place the order never writes, and "not found
+# there" would answer "not switched off" (ga-aijm2v.12). The selftest lays its sandbox out from where the repo ships the order,
+# so this name cannot drift from the pack without a failing test.
+PACK_NAME = "town-deltas"
+
+
 def config_from_env() -> Config:
     e = os.environ.get
     city = Path(e("GC_CITY_PATH") or DEFAULT_CITY)
-    state_dir = Path(e("GC_PACK_STATE_DIR") or (Path(e("GC_CITY_RUNTIME_DIR") or city / ".gc" / "runtime") / "packs" / "maintenance"))
+    state_dir = Path(e("GC_PACK_STATE_DIR") or (Path(e("GC_CITY_RUNTIME_DIR") or city / ".gc" / "runtime") / "packs" / PACK_NAME))
     return Config(
         city=city,
         events_file=Path(e("PORTARIA_EVENTS_FILE") or city / ".gc" / "events.jsonl"),
@@ -286,7 +295,9 @@ DISABLED_LINE = "portaria-shadow: disabled via"
 
 def disabled_file(cfg: Config) -> Path:
     """The off-switch file. main() refuses to run while it exists; the daily report reads the same path to say the
-    Portaria is OFF (ga-aijm2v.12) -- one definition, so the switch and its report cannot drift apart."""
+    Portaria is OFF (ga-aijm2v.12). They share this function AND the directory it lands in: the order gets that
+    directory from the engine as GC_PACK_STATE_DIR, and the report -- which the engine does not start, so it has no
+    such variable -- gets the same one from config_from_env()'s default (PACK_NAME)."""
     return cfg.state_file.parent / "portaria-shadow.disabled"
 
 
