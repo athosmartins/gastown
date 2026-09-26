@@ -815,6 +815,9 @@ HALT_DB=""
 HALT_PREV_COUNT=0
 HALT_CURRENT_COUNT=0
 HALT_DELTA=0
+# Set by should_halt_for_jsonl_spike when it decides a drop is a short export;
+# the caller reports it next to the export's own count.
+SHORT_EXPORT_SOURCE_COUNT=""
 
 valid_database_identifier() {
     local name="$1"
@@ -845,6 +848,10 @@ read_source_issue_count() {
     printf '%s\n' "$count"
 }
 
+# Returns 0 to halt (growth spike, source unreadable, or a drop the source
+# confirms) and 1 when the drop is the EXPORT coming up short while the source
+# did not shrink. Return 1 does not mean the new file is a good snapshot — the
+# caller must keep the previous one (ga-fxrrav).
 should_halt_for_jsonl_spike() {
     local db="$1"
     local prev_count="$2"
@@ -866,12 +873,14 @@ should_halt_for_jsonl_spike() {
 
     if [ "$source_count" -ge "$prev_count" ]; then
         echo "jsonl-export: suppressing JSONL drop spike for $db; source count $source_count >= previous $prev_count" >&2
+        SHORT_EXPORT_SOURCE_COUNT="$source_count"
         return 1
     fi
 
     source_drop=$(( (prev_count - source_count) * 100 / prev_count ))
     if [ "$source_drop" -le "$threshold" ]; then
         echo "jsonl-export: suppressing JSONL drop spike for $db; source drop ${source_drop}% <= ${threshold}%" >&2
+        SHORT_EXPORT_SOURCE_COUNT="$source_count"
         return 1
     fi
 
@@ -977,9 +986,6 @@ while IFS= read -r DB; do
     # validation) so commit messages and DOG_DONE summaries reflect what was
     # actually archived, not the pre-scrub raw export.
     CURRENT_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
-    TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
-
-    STAGE_PATHS+=("$DB" "$DB.jsonl")
 
     # Step 3: Spike detection — compare record counts against previous commit.
     PREV_COUNT=0
@@ -998,16 +1004,34 @@ while IFS= read -r DB; do
         if [ "$DELTA" -lt 0 ]; then
             DELTA=$(( -DELTA ))
         fi
-        if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ] && should_halt_for_jsonl_spike "$DB" "$PREV_COUNT" "$FILTERED_COUNT" "$SPIKE_THRESHOLD"; then
-            HALTED=1
-            HALT_DB="$DB"
-            HALT_PREV_COUNT="$PREV_COUNT"
-            HALT_CURRENT_COUNT="$FILTERED_COUNT"
-            HALT_DELTA="$DELTA"
-            echo "jsonl-export: HALTED — spike in $DB (${DELTA}% > ${SPIKE_THRESHOLD}%)"
-            break
+        if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
+            if should_halt_for_jsonl_spike "$DB" "$PREV_COUNT" "$FILTERED_COUNT" "$SPIKE_THRESHOLD"; then
+                TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
+                STAGE_PATHS+=("$DB" "$DB.jsonl")
+                HALTED=1
+                HALT_DB="$DB"
+                HALT_PREV_COUNT="$PREV_COUNT"
+                HALT_CURRENT_COUNT="$FILTERED_COUNT"
+                HALT_DELTA="$DELTA"
+                echo "jsonl-export: HALTED — spike in $DB (${DELTA}% > ${SPIKE_THRESHOLD}%)"
+                break
+            fi
+            # The export fell by much more than the source did: this file is
+            # an incomplete export, not a snapshot. Put the previous snapshot
+            # back so it is not committed (or pushed offsite), and report the
+            # DB as not exported this run. Committing it would also make the
+            # next complete export read as a growth spike (ga-fxrrav).
+            echo "jsonl-export: export curto de $DB: $CURRENT_COUNT vs fonte $SHORT_EXPORT_SOURCE_COUNT, mantido o snapshot anterior" >&2
+            discard_failed_db_outputs "$DB"
+            FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+            FAILED_DBS="${FAILED_DBS}$DB
+"
+            continue
         fi
     fi
+
+    TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
+    STAGE_PATHS+=("$DB" "$DB.jsonl")
 done <<EOF
 $DATABASES
 EOF
