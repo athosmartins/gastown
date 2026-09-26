@@ -664,6 +664,11 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   sk_reset; sk_hold $((-3600))
   _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
   [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: a lock 'taken in the future' (a clock that ran backwards) has an UNKNOWABLE age → no alert, never 'age 0'" || bad "stuck skew: rc=$rc notify=$(skn)"
+  grep -q "WARN: the x lock $SKL is held by LIVE pid $SKH but its age cannot be determined" "$LOG" && ok "stuck: ...and it is NOT silent: one WARN says the age cannot be determined (fail-open, but visible)" || bad "stuck skew: no WARN — '$(cat "$LOG" 2>/dev/null)'"
+  _dgm_lock_stuck_check "$SKL" sleep x; _dgm_lock_stuck_check "$SKL" sleep x
+  [ "$(grep -c 'age cannot be determined' "$LOG")" = "1" ] && ok "stuck: ...once per holder, not on every call" || bad "stuck skew WARN repeats: $(grep -c 'age cannot be determined' "$LOG")"
+  GC_NOW_EPOCH=$((SKNOW + 5*3600 + 3600)); _dgm_lock_stuck_check "$SKL" sleep x; rc=$?; GC_NOW_EPOCH=$SKNOW
+  [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && ok "stuck: ...and once the age IS readable and over the limit that holder still alerts (the WARN did not consume the alert's dedupe)" || bad "stuck: the WARN swallowed the later alert rc=$rc notify=$(skn)"
   # dedupe is per HOLDER: a new pid, or the same pid taking the lock again later, is a new incident
   sk_reset; sk_hold $((5*3600)); _dgm_lock_stuck_check "$SKL" sleep x
   sleep 300 & SKH2=$!; sk_hold $((6*3600)) "$SKH2"; _dgm_lock_stuck_check "$SKL" sleep x

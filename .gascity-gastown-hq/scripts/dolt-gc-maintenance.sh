@@ -830,7 +830,8 @@ _dgm_fmt_age() {
 
 # _dgm_lock_stuck_check <lockdir> <cmd_re> <label> [scope] → 0 iff the lock is held by a LIVE, matching
 # holder that has held it longer than GC_MAINT_LOCK_STUCK_H hours (whether or not this call is the one that
-# alerted); 1 in every other case (free, dead holder, young holder, age unknowable). Side effect, at most
+# alerted); 1 in every other case (free, dead holder, young holder, or age unknowable — which logs one WARN
+# per holder instead of passing for "young"). Side effect, at most
 # once per holder: an ALERT line in the log and one $NOTIFY push. It never touches the lock.
 # <scope> says what that lock blocks, because the alert must not claim more than is true: "maintenance"
 # (default — the job's lock: every maintenance run AND the release trigger stand down) or "trigger" (the
@@ -854,13 +855,23 @@ _dgm_lock_stuck_check() {
   pid="$(head -1 "$d/pid" 2>/dev/null | tr -d '[:space:]')"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac      # "held" only because the dir is young and its pid not written yet
   now="$(_gc_now_epoch)"
+  mtime="$(_dgm_mtime "$d/pid")"
+  marker="${d}.stuck-alerted"
   age="$(_dgm_lock_age_s "$d" "$now")"
-  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  case "$age" in ''|*[!0-9]*)
+    # A live holder whose age cannot be read (the clock is behind the lock's own timestamp, or the stamp
+    # is unreadable) is NOT "young": it is "don't know". Not stuck — no push on a guess — but not silent
+    # either: one WARN per holder (same marker, its own key, so a later readable age still alerts).
+    key="${pid}:${mtime}:age-unknown"
+    if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
+      printf '%s\n' "$key" > "$marker" 2>/dev/null
+      log "WARN: the ${label} lock $d is held by LIVE pid ${pid} but its age cannot be determined (clock ${now:-<blank>} vs lock stamp ${mtime:-<unreadable>}) — cannot tell whether it is stuck; no alert on a guess"
+    fi
+    return 1 ;;
+  esac
   limit="$GC_MAINT_LOCK_STUCK_H"; _dgm_pos_int "$limit" || limit=3
   [ "$age" -ge $(( limit * 3600 )) ] || return 1
-  mtime="$(_dgm_mtime "$d/pid")"
   key="${pid}:${mtime}"
-  marker="${d}.stuck-alerted"
   if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
     if printf '%s\n' "$key" > "$marker" 2>/dev/null; then
       log "ALERT: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) — ${blocks_en}. The lock is NOT reclaimed (a live pid is never stolen from). Notified once for this holder. Inspect: ps -p ${pid} -o etime=,command="
