@@ -400,8 +400,8 @@ touch -t "$OLD_TS" "$OLD_ORPHAN"
 
 OLD_INUSE="$GBT_ROOT/go-build222222"
 mkdir -p "$OLD_INUSE"
-touch -t "$OLD_TS" "$OLD_INUSE"
 exec 8>"$OLD_INUSE/held-open"   # real open fd — real lsof will see this
+touch -t "$OLD_TS" "$OLD_INUSE"   # AFTER the fd's file exists — creating a file inside a dir bumps the dir's OWN mtime back to "now", which would let the grace window (not the open fd) spare it and make this check pass for the wrong reason (ga-mv896u)
 
 NEW_ORPHAN="$GBT_ROOT/go-build333333"
 mkdir -p "$NEW_ORPHAN"
@@ -466,6 +466,48 @@ ok "_reap_go_build_orphans: nonexistent root skips cleanly (no crash — this li
 
 echo ""
 echo "=== _code_sign_clone_root / _code_sign_clone_dir_in_use / _should_reap_code_sign_clone_dir (ga-nkqook) ==="
+# ── hermetic lsof shim for the code_sign_clone checks below (ga-mv896u) ────
+# `_code_sign_clone_dir_in_use` and `_reap_code_sign_clone_orphans` run
+# `timeout 10 lsof -Fn` — a WHOLE-SYSTEM dump. The 10s ceiling is right for
+# production (rc=124 → "unknown", fail-closed, never "orphaned"), but the
+# dump walks every process on the host, so its cost tracks host load, not the
+# fixture: measured on this host at load ~60, `lsof -Fn` took 34–72s while
+# `lsof -Fn -p <one pid>` took 0.03–0.11s. Run against the real lsof, the four
+# checks below read "unknown" exactly when the machine is busiest and failed
+# (false-red: PASS=220 FAIL=4 on a clean origin/main, ga-mv896u) — and the
+# "old + in-use dir SPARED" checks passed for the WRONG reason (spared because
+# the liveness read timed out, not because the open fd was seen).
+#
+# What these checks exist to prove is that the guard parses REAL lsof output
+# against a REAL open fd — and the only fds they ever open are this shell's
+# own (`exec 8>…`). So the shim runs the same real lsof binary, AND-scoped to
+# this PID (`-a -p $$`): identical -F output format, the same real held-open
+# fd, cost independent of host load. Shims that fake lsof outright (below) are
+# prepended in front of this one and keep winning.
+#
+# If the shim cannot be installed (no lsof on PATH, mktemp/write failure) the
+# section would silently fall back to the host's real, load-dependent lsof and
+# flake again — so that is reported as a FAIL, never skipped quietly.
+HERM_LSOF_REAL="$(command -v lsof || true)"
+HERM_LSOF_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-hermlsof.XXXXXX 2>/dev/null || true)"
+HERM_LSOF_OK=0
+if [ -n "$HERM_LSOF_REAL" ] && [ -d "$HERM_LSOF_DIR" ]; then
+  cat > "$HERM_LSOF_DIR/lsof" 2>/dev/null <<EOF
+#!/bin/bash
+exec "$HERM_LSOF_REAL" -a -p "$$" "\$@"
+EOF
+  # Judge the shim by what is on disk, not by the exit codes above: it must be
+  # a non-empty, executable file before PATH is pointed at it.
+  chmod +x "$HERM_LSOF_DIR/lsof" 2>/dev/null && [ -s "$HERM_LSOF_DIR/lsof" ] && [ -x "$HERM_LSOF_DIR/lsof" ] && HERM_LSOF_OK=1
+fi
+if [ "$HERM_LSOF_OK" -eq 1 ]; then
+  PATH="$HERM_LSOF_DIR:$PATH"
+else
+  bad "hermetic lsof shim NOT installed (lsof='${HERM_LSOF_REAL:-missing}', dir='${HERM_LSOF_DIR:-unset}') — the code_sign_clone checks below would run against the host's load-dependent lsof"
+  [ -d "$HERM_LSOF_DIR" ] && rm -rf "$HERM_LSOF_DIR"
+  HERM_LSOF_DIR=""   # nothing installed: the teardown below must not touch PATH or remove anything
+fi
+
 # ── _code_sign_clone_root: real getconf-derived path — NOT stubbed, same
 #    rationale as _go_build_tmp_root above. Only asserts it resolves to a
 #    non-empty path under the real DARWIN_USER_TEMP_DIR's parent — the actual
@@ -527,8 +569,8 @@ touch -t "$OLD_TS" "$CSC_OLD_ORPHAN"
 
 CSC_OLD_INUSE="$CSC_ROOT/code_sign_clone.BBBBBB"
 mkdir -p "$CSC_OLD_INUSE"
-touch -t "$OLD_TS" "$CSC_OLD_INUSE"
 exec 8>"$CSC_OLD_INUSE/held-open"   # real open fd — real lsof will see this
+touch -t "$OLD_TS" "$CSC_OLD_INUSE"   # AFTER the fd's file exists — see go-build222222 above: touching first left the dir "new", so the grace window spared it and this check never exercised the in-use path (ga-mv896u)
 
 CSC_NEW_ORPHAN="$CSC_ROOT/code_sign_clone.CCCCCC"
 mkdir -p "$CSC_NEW_ORPHAN"
@@ -652,6 +694,63 @@ else
   bad "_reap_code_sign_clone_orphans: code_sign_clone.ABC has a REAL open fd but was deleted — a shorter sibling's prefix pattern cross-matched it (missing prefix boundary)"
 fi
 rm -rf "$CSC_ROOT4"
+
+echo ""
+echo "=== _code_sign_clone_dir_in_use / _reap_code_sign_clone_orphans (ga-mv896u): lsof outran the 10s ceiling (rc=124) → unknown, nothing deleted ==="
+# The fail-closed contract for a timed-out whole-system lsof, proven WITHOUT
+# depending on how slow this host happens to be: shadow `timeout` itself (the
+# guard reaches it through PATH) with a stub that behaves like `timeout` did
+# when it killed lsof mid-write — a PARTIAL, NON-EMPTY capture, exit 124. The
+# capture must be non-empty on purpose: an empty one also trips the reaper's
+# separate empty-snapshot gate (ga-hxki9f) and would let a deleted rc=124 check
+# hide behind it. The partial capture names none of the fixture dirs, so a
+# guard that trusted it would read every old dir as "confirmed orphaned" (and
+# reap the in-use one) and the standalone check would answer rc=1 instead of 2.
+CSC_TO_DIR="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-to124.XXXXXX)"
+cat > "$CSC_TO_DIR/timeout" <<'EOF'
+#!/bin/bash
+printf 'p1\nn/partial/capture/naming/no/fixture/dir\n'
+exit 124
+EOF
+chmod +x "$CSC_TO_DIR/timeout"
+
+CSC_ROOT5="$(mktemp -d /tmp/dolt-disk-floor-guard-selftest-csc5.XXXXXX)"
+CSC_TO_ORPHAN="$CSC_ROOT5/code_sign_clone.FFFFFF"
+mkdir -p "$CSC_TO_ORPHAN"
+echo "orphan payload" > "$CSC_TO_ORPHAN/payload"
+touch -t "$OLD_TS" "$CSC_TO_ORPHAN"
+CSC_TO_INUSE="$CSC_ROOT5/code_sign_clone.GGGGGG"
+mkdir -p "$CSC_TO_INUSE"
+exec 8>"$CSC_TO_INUSE/held-open"   # real open fd — the right answer WITHOUT the timeout is "in use"
+touch -t "$OLD_TS" "$CSC_TO_INUSE"
+
+REAL_PATH="$PATH"
+PATH="$CSC_TO_DIR:$PATH"
+_code_sign_clone_dir_in_use "$CSC_TO_INUSE"; csciu_rc=$?
+# shellcheck disable=SC2034  # read by _reap_code_sign_clone_orphans in the sourced script
+CODE_SIGN_CLONE_ORPHAN_GRACE_SECS=1800
+_reap_code_sign_clone_orphans "$CSC_ROOT5"
+PATH="$REAL_PATH"
+exec 8>&-
+
+if [ "$csciu_rc" -eq 2 ]; then
+  ok "_code_sign_clone_dir_in_use: lsof timed out (rc=124, partial capture) → rc=2 unknown, never rc=1 confirmed-clear"
+else
+  bad "_code_sign_clone_dir_in_use: timed-out lsof (rc=124) expected rc=2 (unknown), got rc=$csciu_rc — a partial capture was trusted"
+fi
+if [ -d "$CSC_TO_ORPHAN" ] && [ -d "$CSC_TO_INUSE" ]; then
+  ok "_reap_code_sign_clone_orphans: lsof timed out (rc=124, partial capture) → NOTHING deleted, old orphan and in-use dir both SPARED"
+else
+  bad "_reap_code_sign_clone_orphans: timed-out lsof (rc=124) must skip the whole lever — a dir was deleted off a partial snapshot"
+fi
+rm -rf "$CSC_ROOT5" "$CSC_TO_DIR"
+
+# Teardown of the hermetic lsof shim installed above — the sections that
+# follow (and every later one) see the host's untouched PATH again.
+if [ -n "$HERM_LSOF_DIR" ]; then
+  PATH="${PATH#"$HERM_LSOF_DIR":}"
+  rm -rf "$HERM_LSOF_DIR"
+fi
 
 # ── _reap_code_sign_clone_orphans: nonexistent root → SKIP cleanly ──────────
 _reap_code_sign_clone_orphans "/nonexistent/path/$$/code-sign-clone-does-not-exist"
