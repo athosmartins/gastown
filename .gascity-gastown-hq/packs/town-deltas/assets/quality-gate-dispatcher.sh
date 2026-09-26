@@ -1050,7 +1050,9 @@ live_sibling_run_for_branch() {
   # Left live deliberately; see ga-h199q comment on the other 3 call sites for
   # why THIS EXACT query is still cached elsewhere (verified byte-identical
   # results; here it just could not be, given the test's mocking strategy).
-  run_json=$(bd -C "$GC_CITY" list --json --include-infra \
+  # ga-jnajhn: --limit 0 — this loop walks EVERY running run; bd's default of 50
+  # (newest-first) would silently drop the oldest ones from a bigger set.
+  run_json=$(bd -C "$GC_CITY" list --json --include-infra --limit 0 \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -5860,7 +5862,9 @@ supersede_sibling_runs() {
   # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch
   # above — identical query, same-sweep dedup). Superseding is idempotent and a
   # briefly-stale miss just delays cleanup to the next sweep, not a correctness issue.
-  running_json=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
+  # ga-jnajhn: --limit 0 (the shim keys its cache on the full argv, so this is
+  # its own slot) — the loop below supersedes EVERY sibling, not just the 50 newest.
+  running_json=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
     -l type:quality-gate-run \
     -l gate-status:running \
     2>/dev/null || echo "[]")
@@ -10141,7 +10145,9 @@ fi
 if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
   # ga-h199q: routed through the read-cache shim (see live_sibling_run_for_branch's
   # header comment — identical query, same-sweep dedup across 4 call sites).
-  PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
+  # ga-jnajhn: --limit 0 — Phase C finalizes/times out EVERY in-flight run; a
+  # default-50 cut would leave the oldest (most likely hung) ones un-swept.
+  PHASE_C_RUNNING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-run -l gate-status:running 2>/dev/null || echo "[]")
   PHASE_C_COUNT=$(printf '%s' "$PHASE_C_RUNNING_JSON" | jq 'length' 2>/dev/null || echo "0")
   case "$PHASE_C_COUNT" in ''|*[!0-9]*) PHASE_C_COUNT=0 ;; esac
   if [ "$PHASE_C_COUNT" -gt 0 ]; then
@@ -10273,7 +10279,9 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # Mirrors the sibling `vb_status_action` unknown-branch (ga-art5), which
       # already skips-and-retries on an unreadable `bd show` instead of guessing.
       VB_SENTINEL="__VB_QUERY_FAILED__"
-      VB_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "$VB_SENTINEL")
+      # ga-jnajhn: --limit 0 — a label filter, not a single-id lookup; the count
+      # below decides "died before Step 7", so it must never be a truncated one.
+      VB_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra --limit 0 -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID" 2>/dev/null || echo "$VB_SENTINEL")
       if [ "$VB_JSON" = "$VB_SENTINEL" ]; then
         log "  Phase C: verdict-bead query for gate-run $GATE_RUN_ID failed this sweep (transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty). NOT treating as died-before-Step-7."
         continue
@@ -10571,7 +10579,9 @@ DISPATCHING_TTL_MINUTES=30
 # ≤5s-stale miss here is inconsequential against the 30-minute reclaim threshold
 # this feeds (~360x the cache TTL) — a run that started in the last 5s is never
 # the same marker that's been dispatching for 30 minutes.
-LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
+# ga-jnajhn: --limit 0 — a marker whose live run fell outside a default-50 cut
+# would look run-less and get reclaimed while its Phase B is still in progress.
+LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-run \
   -l gate-status:running \
   2>/dev/null || echo "[]")
@@ -10579,7 +10589,9 @@ LIVE_RUN_MARKER_IDS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CIT
 # ga-h199q: routed through the read-cache shim — feeds the same 30-minute TTL
 # reclaim check as LIVE_RUN_MARKER_IDS_JSON just above; a ≤5s-stale read is
 # inconsequential against that threshold.
-DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
+# ga-jnajhn: --limit 0 — the TTL reclaim walks every dispatching marker; the
+# oldest are exactly the ones that have overstayed, and a default-50 cut drops them first.
+DISPATCHING_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-marker \
   -l gate-status:dispatching \
   2>/dev/null || echo "[]")
@@ -10852,7 +10864,9 @@ fi
 # push/nudge), and scoped ONLY to "is it merged now?" — a genuinely-still-
 # diverged branch is untouched and stays in needs-rebase exactly as before
 # this fix (AC4 non-regression).
-NEEDS_REBASE_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra --status open \
+# ga-jnajhn: --limit 0 — this is the periodic re-check of EVERY parked marker;
+# markers stranded longest are the oldest, which a default-50 cut drops first.
+NEEDS_REBASE_JSON=$(bd -C "$GC_CITY" list --json --all --include-infra --status open --limit 0 \
   -l type:quality-gate-marker \
   -l gate-status:needs-rebase \
   2>/dev/null || echo "[]")
@@ -11029,10 +11043,19 @@ fi
 # here just defers newly-queued work to the next 180s sweep (this script has no
 # internal loop; launchd re-execs it), the same bounded delay the TTL-recovery
 # checks above already tolerate.
-MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra \
+# ga-jnajhn: --limit 0 keeps this sweep off bd's DOCUMENTED default. `bd list
+# --help` says "default 50" and the order is NEWEST-first, so a build that honours
+# that on a queue > 50 would cut the OLDEST markers — exactly the overdue ones the
+# aging/hard-ceiling tiers exist to protect — and the log below would only say
+# "Found 50". (Measured 26/09 on the live bd 1.1.0: the default did NOT cap; that is
+# undocumented behaviour, not something to lean on.) Guarded by
+# gate-marker-fetch-limit.selftest.sh.
+# SELFTEST-EXTRACT marker-fetch: BEGIN
+MARKERS_JSON=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --include-infra --limit 0 \
   -l type:quality-gate-marker \
   -l gate-status:queued \
   2>/dev/null || echo "[]")
+# SELFTEST-EXTRACT marker-fetch: END
 
 COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq 'length' 2>/dev/null || echo "0")
 log "Found $COUNT queued marker(s)"

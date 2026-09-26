@@ -135,15 +135,16 @@ with open(path) as f:
 # inserted --include-infra right after --all (so infra-type verdict beads
 # aren't dropped either) — the anchor tracks that addition too, since this
 # mutation test cares only about --all specifically, not about being the
-# single byte-for-byte string that has ever existed on this line.
-anchor = 'bd -C "$GC_CITY" list --json --all --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
+# single byte-for-byte string that has ever existed on this line. Likewise
+# --limit 0 (ga-jnajhn): a sweep must not lean on bd's default of 50.
+anchor = 'bd -C "$GC_CITY" list --json --all --include-infra --limit 0 -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
 n = c.count(anchor)
 if n != 1:
     print("ANCHOR_NOT_UNIQUE count=%d" % n, file=sys.stderr)
     sys.exit(1)
 # Strip --all ONLY to reproduce the pre-fix (broken) query — --include-infra
 # stays, since that flag is not what this test is proving.
-mutant = 'bd -C "$GC_CITY" list --json --include-infra -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
+mutant = 'bd -C "$GC_CITY" list --json --include-infra --limit 0 -l type:quality-gate-verdict -l "gate-run:$GATE_RUN_ID"'
 c2 = c.replace(anchor, mutant, 1)
 if c2 == c:
     print("SWAP_NO_OP", file=sys.stderr)
