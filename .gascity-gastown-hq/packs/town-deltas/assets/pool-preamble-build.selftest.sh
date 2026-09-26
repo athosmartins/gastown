@@ -161,7 +161,9 @@ for role, r in man["roles"].items():
     for ag in r["agents"]:
         bare = ag.split(".")[-1]; claimed.add(bare)
         ov, env = effective(bare if bare != "dog" else "dog")
-        if ov != base + r["overlay"]: errs.append(f"{ag}: overlay_dir={ov!r}, esperado {base + r['overlay']!r}")
+        # wired_overlay: papel cujo overlay próprio foi DESLIGADO de propósito (ex.: revisor, ga-swnkfm) — a fiação tem que bater com ele.
+        want = base + r.get("wired_overlay", r["overlay"])
+        if ov != want: errs.append(f"{ag}: overlay_dir={ov!r}, esperado {want!r}")
         # overlay_dir que NÃO existe é NO-OP SILENCIOSO no engine (internal/overlay: "se srcDir não existe, retorna nil"): a sessão nasce
         # SEM overlay — sem o deny de `rm -rf` (ga-q640n), sem RC off (wa-cy6we) e sem nenhum corte. Sem erro. Por isso o arquivo tem que existir.
         if ov and not (hq / ov / ".claude" / "settings.json").is_file(): errs.append(f"{ag}: overlay_dir aponta pra {ov!r} mas {ov}/.claude/settings.json NÃO existe (no-op silencioso: sessão sem overlay nenhum)")

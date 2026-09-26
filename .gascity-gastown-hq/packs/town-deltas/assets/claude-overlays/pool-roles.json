@@ -251,6 +251,8 @@
   },
   "reviewer": {
    "overlay": "pool-reviewer",
+   "wired_overlay": "pool",
+   "_wired_overlay_why": "REVERTIDO 26/09 (Mayor, ga-swnkfm): o revisor roda na RAIZ da cidade e o overlay_dir faz merge no .claude/settings.json da raiz, que vira o .gc/settings.json de TODAS as sessões (gate-done off, CLAUDE.md fora, memória off pra cidade inteira). Os agent.toml dos revisores apontam pro `pool` até o revisor ter workdir próprio; o overlay pool-reviewer continua gerado e versionado, só não está ligado. Tirar este campo quando religar.",
    "td_role": "reviewer",
    "agents": [
     "gate-reviewer",
