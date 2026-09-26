@@ -132,6 +132,17 @@ GC_SKIP_STREAK_STATE="${GC_SKIP_STREAK_STATE:-$CITY/.gc/runtime/packs/maintenanc
 # command line must match for its pid to count (guards against pid reuse after a crash).
 GC_MAINT_LOCKDIR="${GC_MAINT_LOCKDIR:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-maintenance.lock.d}"
 GC_MAINT_LOCK_RE="${GC_MAINT_LOCK_RE:-dolt-gc-maintenance}"
+# ga-11vdhe: a lock is "held" for as long as its pid is alive — with no ceiling, one hung run (a Dolt
+# that stopped answering `bd purge`, which has no timeout) silently makes EVERY later run exit on the
+# lock: purge, prune and the GC all skipped, and nothing says the holder is hours old. A live pid is
+# never stolen from; instead, once its lock is older than this many hours, the first run/poll that
+# sees it says so loudly and notifies ONCE for that holder (see _dgm_lock_stuck_check). 3h is more
+# than one 2h cycle (a run that is merely slow is not flagged) and well under "a day of skipped GC".
+# A garbled or zero value falls back to 3 — never to "no alert".
+GC_MAINT_LOCK_STUCK_H="${GC_MAINT_LOCK_STUCK_H:-3}"
+# ga-11vdhe: what a TRIGGERED run reports back (see _gc_record_outcome). One short file, overwritten
+# by each triggered run; the trigger reads it only when the token it handed the run matches.
+GC_RUN_OUTCOME_STATE="${GC_RUN_OUTCOME_STATE:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-run-outcome.state}"
 LOG="${DOLT_GC_MAINT_LOG:-$CITY/.gc/logs/dolt-gc-maintenance.log}"
 NOTIFY="/Users/athos/.local/bin/notify"
 DOLTDIR="$CITY/.beads/dolt/$DB"
@@ -779,6 +790,88 @@ _dgm_lock_release() {
   return 0
 }
 
+# ── ga-11vdhe: a LIVE holder that has held the lock for hours ─────────────────────────────
+# _dgm_lock_held answers "is the holder alive?" and has no notion of HOW LONG. A hung run is alive
+# too, and it blocks every later run for as long as it hangs. We must not take the lock from a live
+# pid (it may be mid-dolt_gc; two runs overlapping is what the lock exists to prevent) — but silence
+# is the bug: the only trace was one "another run holds ..." line per cycle, with no age on it.
+
+# _dgm_pos_int <v> → 0 iff <v> is a whole number >= 1 (0 and garbage are not a usable ceiling).
+_dgm_pos_int() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ]
+}
+
+# _dgm_mtime <file> → epoch mtime, blank (never 0) when it cannot be read. BSD stat first (macOS),
+# GNU second; anything non-numeric is "unknown".
+_dgm_mtime() {
+  local m; m="$(stat -f %m "$1" 2>/dev/null)"
+  case "$m" in ''|*[!0-9]*) m="$(stat -c %Y "$1" 2>/dev/null)" ;; esac
+  case "$m" in ''|*[!0-9]*) echo "" ;; *) echo "$m" ;; esac
+}
+
+# _dgm_lock_age_s <lockdir> <now_epoch> → seconds since the holder took the lock, blank when unknowable.
+# The pid file is written once, at acquisition, so its mtime IS the acquisition time (the lock dir's own
+# mtime is not: it moves whenever an entry is added or removed). A clock that ran backwards is unknowable,
+# not "0 seconds".
+_dgm_lock_age_s() {
+  local d="$1" now="$2" m
+  case "$now" in ''|*[!0-9]*) echo ""; return ;; esac
+  m="$(_dgm_mtime "$d/pid")"
+  [ -n "$m" ] && [ "$now" -ge "$m" ] || { echo ""; return; }
+  echo $(( now - m ))
+}
+
+# _dgm_fmt_age <seconds> → "5h12m" (or "37m").
+_dgm_fmt_age() {
+  local s="$1"
+  if [ "$s" -ge 3600 ]; then echo "$(( s / 3600 ))h$(( (s % 3600) / 60 ))m"; else echo "$(( s / 60 ))m"; fi
+}
+
+# _dgm_lock_stuck_check <lockdir> <cmd_re> <label> [scope] → 0 iff the lock is held by a LIVE, matching
+# holder that has held it longer than GC_MAINT_LOCK_STUCK_H hours (whether or not this call is the one that
+# alerted); 1 in every other case (free, dead holder, young holder, age unknowable). Side effect, at most
+# once per holder: an ALERT line in the log and one $NOTIFY push. It never touches the lock.
+# <scope> says what that lock blocks, because the alert must not claim more than is true: "maintenance"
+# (default — the job's lock: every maintenance run AND the release trigger stand down) or "trigger" (the
+# trigger's own lock: only the trigger's polls stand down; the 2h job is unaffected).
+#
+# "Once per holder" is a marker file beside the lock dir holding "<pid>:<pid-file mtime>" — the mtime is
+# what tells a NEW holder that reused the pid from the one already reported. The marker is written BEFORE
+# the push, and if it cannot be written there is NO push: a notification that cannot be deduped would
+# repeat on every poll (288/day from the trigger). A missing alert is logged (WARN), never silent — but
+# unlike the alert it can recur every call; it needs the state directory to have become unwritable while a
+# holder is alive in that very directory, which is not a shape worth more machinery.
+_dgm_lock_stuck_check() {
+  local d="$1" re="$2" label="$3" scope="${4:-maintenance}" pid now age limit key marker mtime blocks_en blocks_pt
+  case "$scope" in
+    trigger) blocks_en="every poll of the release trigger stands down while it holds it (the 2h maintenance job is NOT affected)"
+             blocks_pt="o gatilho de 5 min do dolt_gc está parado até ele terminar (a manutenção de 2h segue normal)" ;;
+    *)       blocks_en="every maintenance run (purge/prune/GC) and the release trigger stand down while it holds it"
+             blocks_pt="TODA a manutenção do hq (purge/prune/GC) está sendo pulada até ele terminar" ;;
+  esac
+  _dgm_lock_held "$d" "$re" || return 1
+  pid="$(head -1 "$d/pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac      # "held" only because the dir is young and its pid not written yet
+  now="$(_gc_now_epoch)"
+  age="$(_dgm_lock_age_s "$d" "$now")"
+  case "$age" in ''|*[!0-9]*) return 1 ;; esac
+  limit="$GC_MAINT_LOCK_STUCK_H"; _dgm_pos_int "$limit" || limit=3
+  [ "$age" -ge $(( limit * 3600 )) ] || return 1
+  mtime="$(_dgm_mtime "$d/pid")"
+  key="${pid}:${mtime}"
+  marker="${d}.stuck-alerted"
+  if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
+    if printf '%s\n' "$key" > "$marker" 2>/dev/null; then
+      log "ALERT: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) — ${blocks_en}. The lock is NOT reclaimed (a live pid is never stolen from). Notified once for this holder. Inspect: ps -p ${pid} -o etime=,command="
+      _dolt_gc_notify "Dolt GC" 4 "🚨 ${label}: o run pid ${pid} segura o lock há $(_dgm_fmt_age "$age") (limite ${limit}h) — ${blocks_pt}. NÃO foi morto. Ver: ps -p ${pid} -o etime=,command="
+    else
+      log "WARN: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) but the alert marker $marker cannot be written — NOT notifying (an alert that cannot be deduped would repeat on every poll)"
+    fi
+  fi
+  return 0
+}
+
 # ── main flow ────────────────────────────────────────────────────────────────────
 main() {
   # ga-3euoj: resolve GC_MIN_FREE_PCT now that PRUNE_ENABLED + any operator pin (env
@@ -826,9 +919,35 @@ main() {
   return 0
 }
 
+# _gc_record_outcome <outcome> — ga-11vdhe: the run's explicit RESULT, for the trigger that started it.
+# The job always exits 0 once it is running, so until now the trigger could only infer "did it work?" from
+# the skip-streak file (cleared = probably yes). This is the real signal: one line, `token=<t> outcome=<x>`,
+# written ONLY for a triggered run (the trigger hands it GC_RUN_TOKEN; a normal 2h cycle has none and writes
+# nothing — that path is unchanged). The trigger accepts it only when the token is the one it handed out, so
+# a leftover from an earlier run can never be mistaken for this one; a write that fails leaves no matching
+# record, which the trigger reads as "cannot tell" (= not cleared), never as success.
+# Outcome words: below-threshold · skip-headroom · release-not-taken · released-still-short · gc-ok ·
+# gc-failed · unknown (the step returned without saying — a path added later that forgot to set one).
+_gc_record_outcome() {
+  case "${GC_RUN_TOKEN:-}" in ''|*[!0-9.]*) return 0 ;; esac
+  { mkdir -p "$(dirname "$GC_RUN_OUTCOME_STATE")" 2>/dev/null \
+      && printf 'token=%s outcome=%s\n' "$GC_RUN_TOKEN" "$1" > "$GC_RUN_OUTCOME_STATE" 2>/dev/null; } \
+    || log "WARN: could not record the run outcome '$1' in $GC_RUN_OUTCOME_STATE (the trigger will read this run's result as unknown)"
+  return 0
+}
+
 # 4) ONLINE size-gated dolt_gc — step 4 of main() above, and (ga-mb57np) the ONLY step a
 # triggered run performs. Always leaves via `return 0`; every outcome is logged.
+# ga-11vdhe: the ONE place the outcome is recorded — the step body below sets _RUN_OUTCOME at each of its
+# exits, and anything that leaves without setting it is recorded as "unknown" rather than as nothing.
 _run_size_gc() {
+  _RUN_OUTCOME="unknown"
+  _run_size_gc_step
+  _gc_record_outcome "$_RUN_OUTCOME"
+  return 0
+}
+
+_run_size_gc_step() {
   # ONLINE size-gated dolt_gc (always). size_mb replaces the old bare
   # `du -sg` read (same truncated-whole-GB value via integer division, so
   # the THRESHOLD_G comparison below is unchanged) — MB precision is what
@@ -841,6 +960,7 @@ _run_size_gc() {
   if [ "$size_g" -lt "$THRESHOLD_G" ]; then
     log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"
     _clear_skip_streak "$GC_SKIP_STREAK_STATE" "hq below ${THRESHOLD_G}G threshold"
+    _RUN_OUTCOME="below-threshold"
     return 0
   fi
 
@@ -868,17 +988,30 @@ _run_size_gc() {
     else
       _handle_gc_skip_streak "$size_mb" "$avail_mb" "$required_mb"
     fi
+    # ga-11vdhe: a triggered run may reach the release ONLY if the trigger started it as a "release" run.
+    # The trigger backs off per kind (a refused release run is aws traffic; a direct run is not), and that
+    # accounting is only true if a run started as "direct" can never turn into a release attempt — which it
+    # did whenever the gate failed at this run's own sample (a peak that fell in the second between the
+    # trigger's measurement and ours). Under any doubt about the kind (unset, garbled) a triggered run stays
+    # inert here, as it does when the lock cannot be created; a missed release costs one poll.
+    if [ "${GC_TRIGGERED_RUN:-0}" = "1" ] && [ "${GC_TRIGGERED_KIND:-}" != "release" ]; then
+      log "triggered run (kind='${GC_TRIGGERED_KIND:-<none>}'): the gate is not met at this run's own sample — NOT attempting the staging release (only a run the trigger started as 'release' may); the next poll decides again"
+      _RUN_OUTCOME="skip-headroom"
+      return 0
+    fi
     # ga-btnq6h: a CHRONIC skip is a vicious circle (the GC that would shrink hq is the thing
     # that cannot run) — when S3 is proven to hold an identical, restorable copy, free the
     # redundant local staging and re-check the SAME gate with a fresh measurement. Never
     # lowers the gate (the 2x bound is measured, ga-3euoj); it only makes room to meet it.
     if ! _gc_maybe_release_staging "$size_mb" "$avail_mb" "$required_mb"; then
+      _RUN_OUTCOME="release-not-taken"
       return 0
     fi
     avail_mb="$(_avail_mb "$DOLTDIR")"
     log "hq staging released — re-checking the same headroom gate with a fresh measurement: avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB"
     if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
       log "hq still short of the gate after releasing the staging (avail=${avail_mb:-<unmeasured>}MB) — skip this cycle; the gate is NOT lowered"
+      _RUN_OUTCOME="released-still-short"
       return 0
     fi
   fi
@@ -896,6 +1029,7 @@ _run_size_gc() {
     post_mb="$(du -sm "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
     case "$post_mb" in ''|*[!0-9]*) post_mb="" ;; esac
     log "dolt_gc OK — hq ${pre} -> ${post}"
+    _RUN_OUTCOME="gc-ok"
     # ga-azzfw requirement 4: dolt_gc() succeeded (rc=0) but reclaimed nothing. size_mb
     # is reused as "pre" here — it's the exact same pre-gc measurement the headroom
     # decision above was based on, not a fresh re-read that could drift from it.
@@ -912,6 +1046,7 @@ back down toward its live-data floor."
   else
     local rc=$?
     log "dolt_gc FAILED (rc=$rc)"
+    _RUN_OUTCOME="gc-failed"
     "$NOTIFY" -t "Dolt gc" -p 4 "🚨 Manutenção dolt gc FALHOU (rc=$rc) — store em ${pre}, verificar antes de re-inchar" 2>/dev/null || true
   fi
   return 0
@@ -922,7 +1057,10 @@ if [ "${DOLT_GC_MAINT_LIB:-0}" != "1" ]; then
   _dgm_lock_acquire "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE"
   case "$?" in
     0) trap '_dgm_lock_release "$GC_MAINT_LOCKDIR"' EXIT ;;
-    1) log "another dolt-gc-maintenance run holds $GC_MAINT_LOCKDIR (pid $(head -1 "$GC_MAINT_LOCKDIR/pid" 2>/dev/null)) — exiting; nothing done in this invocation"
+    1) _held_age="$(_dgm_lock_age_s "$GC_MAINT_LOCKDIR" "$(_gc_now_epoch)")"
+       log "another dolt-gc-maintenance run holds $GC_MAINT_LOCKDIR (pid $(head -1 "$GC_MAINT_LOCKDIR/pid" 2>/dev/null)${_held_age:+, held for $(_dgm_fmt_age "$_held_age")}) — exiting; nothing done in this invocation"
+       # ga-11vdhe: a holder that is hours old is a hung run, not a busy one — say so, once (never steals the lock)
+       _dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance" || true
        exit 0 ;;
     # Cannot create the lock at all (fs trouble). The 2h cycle runs anyway, as this job always has —
     # refusing would silently stop ALL maintenance over a bookkeeping failure — but says so. A

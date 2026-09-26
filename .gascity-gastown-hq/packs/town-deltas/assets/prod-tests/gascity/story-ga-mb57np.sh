@@ -28,6 +28,7 @@ SCRIPTS="$CITY/scripts"
 LABEL="com.gascity.dolt-gc-release-trigger"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 STATE="$CITY/.gc/runtime/packs/maintenance/dolt-gc-release-trigger.state"
+TRIGGER_LOCKD="$CITY/.gc/runtime/packs/maintenance/dolt-gc-release-trigger.lock.d"
 LOG="$CITY/.gc/logs/dolt-gc-maintenance.log"
 
 log()  { echo "[prod-test:gascity ga-mb57np] $*"; }
@@ -53,6 +54,16 @@ grep -q 'dolt-gc-maintenance.sh' "$TRG" \
   || fail "deployed trigger never references dolt-gc-maintenance.sh — it could not start the job"
 grep -q 'GC_TRIGGERED_RUN=1 _trg_run_maintenance' "$TRG" \
   || fail "deployed trigger does not mark the run it starts as triggered (GC_TRIGGERED_RUN=1)"
+# ga-11vdhe: the hand-off that makes per-kind backoff TRUE (a run started as "direct" must not be able to
+# release the staging) and lets the trigger read the run's own outcome — both ends must be deployed
+grep -qF 'GC_TRIGGERED_KIND="$kind" GC_RUN_TOKEN="$token" GC_TRIGGERED_RUN=1 _trg_run_maintenance' "$TRG" \
+  || fail "deployed trigger does not hand the job its kind and run token (GC_TRIGGERED_KIND / GC_RUN_TOKEN) — per-kind backoff and outcome reading would be dormant"
+grep -qF '"${GC_TRIGGERED_KIND:-}" != "release"' "$GCM" \
+  || fail "deployed dolt-gc-maintenance.sh does not bar a non-release triggered run from the staging release — a direct run could still start an S3 proof"
+grep -qF '_gc_record_outcome "$_RUN_OUTCOME"' "$GCM" \
+  || fail "deployed dolt-gc-maintenance.sh does not record the run outcome the trigger waits for"
+grep -qF '_dgm_lock_stuck_check "$GC_MAINT_LOCKDIR"' "$GCM" && grep -q '_dgm_lock_stuck_check' "$TRG" \
+  || fail "the stuck-holder alert is not wired at both ends (job entry point + trigger) — a hung holder would stay silent"
 grep -q '_gc_release_decision' "$TRG" \
   || fail "deployed trigger does not decide with _gc_release_decision — it would carry its own copy of the gate"
 grep -q '_gc_required_parts "\$size_mb" "\$GC_MIN_FREE_PCT" "\$GC_MIN_FREE_ABS_MB"' "$GCM" \
@@ -90,25 +101,32 @@ launchctl list 2>/dev/null | grep -q "$LABEL" \
   || fail "$LABEL is NOT registered with launchd — the poll never runs, so the release stays a 2h lottery"
 log "$LABEL is installed, lints, points at the deployed script and is registered with launchd"
 
-# ── 5. The poll is ALIVE: its state file was rewritten recently ──────────────────────
-# Every poll rewrites the state (healthy or not), so a stale/missing state means launchd is not
-# running it. RunAtLoad makes the first poll immediate; wait a little in case it is just loading.
-state_age() {  # seconds since the last poll, empty when unknowable
-  local p now; p="$(head -1 "$STATE" 2>/dev/null | tr ' ' '\n' | sed -n 's/^poll=\([0-9][0-9]*\)$/\1/p' | head -1)"
-  [[ -n "$p" ]] || return 1
-  now="$(date +%s)"; echo $(( now - p ))
+# ── 5. The poll is ALIVE ────────────────────────────────────────────────────────────
+# Every poll rewrites the state (healthy or not), so a stale/missing state means launchd is not running
+# it. RunAtLoad makes the first poll immediate; wait a little in case it is just loading.
+#
+# "Stale" alone is NOT enough (ga-mb57np gate round 2 INFO, fixed in ga-11vdhe): a poll that starts the job
+# blocks for the whole run and the state keeps the epoch it had when the run began, so a healthy triggered
+# run that outlasts 15 minutes (S3 proof + dolt_gc of an ~8 GB hq) made this test FAIL while nothing was
+# wrong. The deployed trigger answers it itself (_trg_liveness): alive = rewritten within 900s; alive-running
+# = older, but its decision ends "(running)" AND the trigger lock is held by a live matching pid AND the run
+# began < 4h ago (past that it is a hung run — the stuck-holder alert reports it — not "alive").
+poll_verdict() {  # → alive | alive-running | stale | absent | unreadable (empty if the deployed trigger cannot even be loaded)
+  DOLT_GC_TRIGGER_LIB=1 DOLT_GC_MAINT_LOG=/dev/null "$BASH32" -c \
+    '. "$1" && _trg_liveness "$2" "$3" "$4" "$(date +%s)" 900 14400' _ "$TRG" "$STATE" "$TRIGGER_LOCKD" dolt-gc-release-trigger 2>/dev/null
 }
-age=""; waited=0
+verdict=""; waited=0
 while :; do
-  age="$(state_age)" && [[ "$age" -le 900 ]] && break
+  verdict="$(poll_verdict)"
+  case "$verdict" in alive|alive-running) break ;; esac
   [[ "$waited" -ge 120 ]] && break
   sleep 10; waited=$(( waited + 10 ))
 done
-if [[ -n "$age" && "$age" -le 900 ]]; then
-  log "poll is alive: last poll ${age}s ago — $(head -1 "$STATE")"
-else
-  fail "the poll is not running: state file ${STATE} is $([[ -f "$STATE" ]] && echo "stale (last poll ${age:-unreadable}s ago; expected <= 900s)" || echo "absent") — check ~/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-release-trigger-launchd.err"
-fi
+case "$verdict" in
+  alive)         log "poll is alive: $(head -1 "$STATE")" ;;
+  alive-running) log "poll is alive: a triggered run is in flight (its state is older than 15 min, which is normal for one) — $(head -1 "$STATE")" ;;
+  *)             fail "the poll is not running (verdict: ${verdict:-could-not-evaluate}): state file ${STATE} is $([[ -f "$STATE" ]] && echo "stale or unreadable: $(head -1 "$STATE" | cut -c1-160)" || echo "absent") — check ~/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-release-trigger-launchd.err" ;;
+esac
 
 # ── informational, never failing ────────────────────────────────────────────────────
 STREAK="$CITY/.gc/runtime/packs/maintenance/dolt-gc-skip-streak.state"

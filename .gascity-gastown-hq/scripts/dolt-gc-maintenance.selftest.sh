@@ -493,14 +493,16 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   PRUNE_ENABLED=0; FLATTEN_ENABLED=0
   GC_MIN_FREE_PCT=200; GC_MIN_FREE_ABS_MB=3072; GC_MIN_FREE_PCT_BASE=200; GC_MIN_FREE_PCT_WITH_PRUNE=280
   FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0
+  GC_RUN_OUTCOME_STATE="$XT/outcome.state"; RELEASE_RC=1; DOLT_RC=0
   du() { case "${1:-}" in -sm) printf '%s\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; -sh) printf '%sM\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; *) command du "$@" ;; esac; }
   _avail_mb() { printf '%s' "$FAKE_AVAIL"; }
   timeout() { shift; "$@"; }
-  dolt() { DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return 0; }
-  _gc_maybe_release_staging() { RELEASE_CALLS=$((RELEASE_CALLS+1)); return 1; }
+  dolt() { DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return "$DOLT_RC"; }
+  # RELEASE_RC=1: the release was not taken; RELEASE_RC=0: it "released" (and RELEASE_AVAIL is what free space is afterwards)
+  _gc_maybe_release_staging() { RELEASE_CALLS=$((RELEASE_CALLS+1)); [ "$RELEASE_RC" -eq 0 ] && FAKE_AVAIL="${RELEASE_AVAIL:-$FAKE_AVAIL}"; return "$RELEASE_RC"; }
   _dolt_gc_notify() { NOTIFY_N=$((NOTIFY_N+1)); }
   _dolt_gc_mail_mayor() { MAIL_N=$((MAIL_N+1)); }
-  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; unset GC_TRIGGERED_RUN; }
+  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; RELEASE_RC=1; RELEASE_AVAIL=""; DOLT_RC=0; rm -f "$GC_RUN_OUTCOME_STATE"; unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN; }
 
   # a NORMAL 2h cycle that skips advances the streak (unchanged behavior) and still tries the release
   xreset; main
@@ -509,9 +511,9 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   grep -q 'purge' "$BD_LOG" && ok "cycle: a normal run still does the ephemeral purge (step 1 untouched)" || bad "cycle: the purge did not run"
 
   # a TRIGGERED run that skips does NOT advance the streak, does the GC-only path, still consults the release
-  xreset; GC_TRIGGERED_RUN=1 main
+  xreset; GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
   [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "62 1" ] && ok "triggered: a skip does NOT advance the 2h-cycle streak (62 stays 62)" || bad "triggered streak got '$(_read_skip_streak "$GC_SKIP_STREAK_STATE")'"
-  [ "$RELEASE_CALLS" -eq 1 ] && ok "triggered: a skip still goes through the (unchanged) guarded staging release" || bad "triggered: release not consulted ($RELEASE_CALLS)"
+  [ "$RELEASE_CALLS" -eq 1 ] && ok "triggered: a skip of a run the trigger started as kind=release still goes through the (unchanged) guarded staging release" || bad "triggered: release not consulted ($RELEASE_CALLS)"
   [ ! -s "$BD_LOG" ] && ok "triggered: purge/prune/flatten are NOT run at poll cadence (bd never called)" || bad "triggered: bd was called: $(cat "$BD_LOG")"
   grep -q 'triggered run' "$LOG" && ok "triggered: the log says it was a triggered run" || bad "triggered: no log marker"
 
@@ -530,9 +532,161 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   xreset; GC_TRIGGERED_RUN=yes main
   [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "63 1" ] && ok "triggered: any value other than the literal 1 is a normal cycle" || bad "GC_TRIGGERED_RUN=yes treated as triggered"
 
+  # ── ga-11vdhe (1): only a run the trigger started as kind=release may reach the staging release ──────
+  # The trigger backs off per kind on the premise that a DIRECT run has no aws traffic. That was false: on a
+  # gate failure at the run's OWN sample (a peak that fell in the second after the trigger measured) the job
+  # went on to the release — an S3 proof — whatever it was started as.
+  for _k in direct "" Release "release " release2 garbage; do
+    xreset; GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND="$_k" main
+    if [ "$RELEASE_CALLS" -ne 0 ] || [ "$DOLT_CALLS" -ne 0 ] || ! grep -q 'NOT attempting the staging release' "$LOG"; then _kind_ok=0; echo "    (triggered kind='$_k' reached the release: release=$RELEASE_CALLS dolt=$DOLT_CALLS log='$(tail -2 "$LOG")')"; fi
+  done
+  [ "${_kind_ok:-1}" = "1" ] && ok "kind gate: a triggered run whose kind is direct / blank / garbled / differently-cased never reaches the staging release (inert under doubt), and says so" || bad "kind gate: a non-release triggered run reached the release"
+  unset _k _kind_ok
+  xreset; GC_TRIGGERED_RUN=1 main
+  [ "$RELEASE_CALLS" -eq 0 ] && ok "kind gate: a triggered run with NO kind at all (GC_TRIGGERED_KIND unset) is inert too" || bad "kind gate: unset kind reached the release"
+  xreset; FAKE_AVAIL=20000; GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$DOLT_CALLS" -eq 1 ] && [ "$RELEASE_CALLS" -eq 0 ] && ok "kind gate: a direct run whose gate passes still runs dolt_gc (the kind only closes the release door)" || bad "kind gate: direct pass dolt=$DOLT_CALLS release=$RELEASE_CALLS"
+  xreset; main
+  [ "$RELEASE_CALLS" -eq 1 ] && ok "kind gate: a normal 2h cycle (not triggered) is unchanged — it still consults the release" || bad "kind gate: the 2h cycle lost the release ($RELEASE_CALLS)"
+  xreset; GC_TRIGGERED_RUN=0 GC_TRIGGERED_KIND=direct main
+  [ "$RELEASE_CALLS" -eq 1 ] && ok "kind gate: a kind on a NON-triggered run means nothing (only GC_TRIGGERED_RUN=1 selects triggered mode)" || bad "kind gate: kind applied to a normal run ($RELEASE_CALLS)"
+
+  # ── ga-11vdhe (2): the run's explicit OUTCOME, for the trigger that started it ──────────────────────
+  # One record per triggered run, `token=<t> outcome=<word>`, from ONE write site (the wrapper), whatever path
+  # the step took. Without a token (a normal 2h cycle) nothing is written.
+  oc() { head -1 "$GC_RUN_OUTCOME_STATE" 2>/dev/null; }
+  xreset; FAKE_HQ_MB=500; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=below-threshold" ] && ok "outcome: hq under the threshold → below-threshold" || bad "outcome below-threshold: '$(oc)'"
+  xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=skip-headroom" ] && ok "outcome: a direct run that loses the gate at its own sample → skip-headroom (and the release was not touched)" || bad "outcome skip-headroom: '$(oc)'"
+  xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(oc)" = "token=100.7 outcome=release-not-taken" ] && [ "$RELEASE_CALLS" -eq 1 ] && ok "outcome: a release run whose release was not taken (refused / busy / cooldown / S3 not proven) → release-not-taken" || bad "outcome release-not-taken: '$(oc)' calls=$RELEASE_CALLS"
+  xreset; RELEASE_RC=0; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(oc)" = "token=100.7 outcome=released-still-short" ] && [ "$DOLT_CALLS" -eq 0 ] && ok "outcome: the release happened but the gate is still not met (nothing collected, the gate is NOT lowered) → released-still-short" || bad "outcome released-still-short: '$(oc)' dolt=$DOLT_CALLS"
+  xreset; RELEASE_RC=0; RELEASE_AVAIL=20000; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(oc)" = "token=100.7 outcome=gc-ok" ] && [ "$DOLT_CALLS" -eq 1 ] && ok "outcome: release → gate met → dolt_gc runs → gc-ok" || bad "outcome release then gc-ok: '$(oc)' dolt=$DOLT_CALLS"
+  xreset; FAKE_AVAIL=20000; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=gc-ok" ] && ok "outcome: a direct run that passes the gate and runs dolt_gc → gc-ok" || bad "outcome direct gc-ok: '$(oc)'"
+  xreset; FAKE_AVAIL=20000; DOLT_RC=1; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=gc-failed" ] && ok "outcome: dolt_gc exits non-zero → gc-failed" || bad "outcome gc-failed: '$(oc)'"
+  # a normal cycle has no token: the file is not written (that path is unchanged)
+  xreset; FAKE_AVAIL=20000; main
+  [ ! -e "$GC_RUN_OUTCOME_STATE" ] && ok "outcome: a normal 2h cycle (no GC_RUN_TOKEN) writes no outcome record" || bad "outcome: a 2h cycle wrote '$(oc)'"
+  for _t in abc "" "1.2x" "-5"; do
+    xreset; FAKE_AVAIL=20000; GC_RUN_TOKEN="$_t" GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+    [ ! -e "$GC_RUN_OUTCOME_STATE" ] || _tok_ok=0
+  done
+  [ "${_tok_ok:-1}" = "1" ] && ok "outcome: a token that is not digits-and-dots (blank, letters, sign) is never written — the trigger only mints numeric ones" || bad "outcome: a garbled token was written"
+  unset _t _tok_ok
+  # the safety net: a step that returns without naming an outcome is recorded as "unknown", not as nothing
+  _SAVED_STEP="$(declare -f _run_size_gc_step)"
+  _run_size_gc_step() { :; }
+  xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=unknown" ] && ok "outcome: a path that leaves the step without setting an outcome is recorded as 'unknown' (the trigger reads that as not-cleared)" || bad "outcome unknown: '$(oc)'"
+  eval "$_SAVED_STEP"; unset _SAVED_STEP
+  # a stale record from the previous run is overwritten, never appended to
+  xreset; printf 'token=1.1 outcome=gc-ok\n' > "$GC_RUN_OUTCOME_STATE"; GC_RUN_TOKEN=100.8 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(wc -l < "$GC_RUN_OUTCOME_STATE" | tr -d '[:space:]')" = "1" ] && [ "$(oc)" = "token=100.8 outcome=skip-headroom" ] && ok "outcome: the record is overwritten by each triggered run (one line, this run's token)" || bad "outcome overwrite: '$(cat "$GC_RUN_OUTCOME_STATE")'"
+  # a record that cannot be written is logged and the run is unaffected
+  xreset; FAKE_AVAIL=20000; printf x > "$XT/afile"; _SAVED_OS="$GC_RUN_OUTCOME_STATE"; GC_RUN_OUTCOME_STATE="$XT/afile/o.state"
+  GC_RUN_TOKEN=100.9 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$DOLT_CALLS" -eq 1 ] && grep -q 'could not record the run outcome' "$LOG" && ok "outcome: an unwritable outcome path → a WARN in the log; the run itself is unaffected (dolt_gc ran)" || bad "outcome unwritable: dolt=$DOLT_CALLS log='$(tail -2 "$LOG")'"
+  GC_RUN_OUTCOME_STATE="$_SAVED_OS"; unset _SAVED_OS; rm -f "$XT/afile"
+  # the single write site: exactly one CALL of _gc_record_outcome outside its definition
+  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c '_gc_record_outcome "')" = "1" ] && ok "static: the outcome is recorded from exactly one call site (the wrapper) — no exit path can be forgotten by adding a second writer" || bad "static: _gc_record_outcome is called from $(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c '_gc_record_outcome "') places"
+  unset -f oc
+
   unset -f du _avail_mb timeout dolt _gc_maybe_release_staging _dolt_gc_notify _dolt_gc_mail_mayor xreset
-  unset GC_TRIGGERED_RUN
+  unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN
   case "$XT" in "${TMPDIR:-/tmp}"/dolt-gc-triggered-selftest.*) rm -rf "$XT" ;; esac
+fi
+
+# ═══ ga-11vdhe: a LIVE holder that has held the lock for hours ═══════════════════════════════════
+# `_dgm_lock_held` says "is the holder alive?", never "for how long". A hung run (a Dolt that stopped
+# answering `bd purge`, which has no timeout) is alive too, and made every later run exit on the lock —
+# purge, prune and GC all skipped — with nothing saying the holder was hours old. A live pid is never
+# stolen from; the fix is that it is REPORTED, once per holder.
+_mtime_set() {  # _mtime_set <file> <epoch> — the mtime a holder that took the lock at <epoch> leaves on its pid file
+  local ts; ts="$(date -r "$2" +%Y%m%d%H%M.%S 2>/dev/null)"
+  [ -n "$ts" ] || ts="$(date -d "@$2" +%Y%m%d%H%M.%S 2>/dev/null)"
+  touch -t "$ts" "$1"
+}
+SK="$(mktemp -d "${TMPDIR:-/tmp}/dolt-gc-stuck-selftest.XXXXXX")"
+if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-holder tests skipped"; else
+  _SK_LOG_SAVED="$LOG"; LOG="$SK/stuck.log"
+  SKN="$SK/notify.calls"
+  _dolt_gc_notify() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$SKN"; }
+  skn() { if [ -f "$SKN" ]; then wc -l < "$SKN" | tr -d '[:space:]'; else echo 0; fi; }
+  SKL="$SK/l.lock.d"; SKNOW=2000001600
+  sk_reset() { rm -f "$LOG" "$SKN" "$SKL/pid" "$SKL.stuck-alerted"; rmdir "$SKL" 2>/dev/null; rmdir "$SKL.stuck-alerted" 2>/dev/null; GC_NOW_EPOCH=$SKNOW; GC_MAINT_LOCK_STUCK_H=3; }
+  sleep 300 & SKH=$!
+  sk_hold() { mkdir -p "$SKL"; printf '%s\n' "${2:-$SKH}" > "$SKL/pid"; _mtime_set "$SKL/pid" "$(( SKNOW - $1 ))"; }   # sk_hold <age_seconds> [pid]
+
+  sk_reset
+  _dgm_lock_stuck_check "$SKL" sleep "test-label"; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: no lock at all → not stuck, silent" || bad "stuck no lock: rc=$rc notify=$(skn)"
+  sk_reset; sk_hold $((5*3600))
+  _dgm_lock_stuck_check "$SKL" sleep "test-label"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && ok "stuck: a live holder that took the lock 5h ago (limit 3h) → stuck (rc 0), ONE notification" || bad "stuck 5h: rc=$rc notify=$(skn)"
+  grep -q "ALERT: the test-label lock $SKL has been held by LIVE pid $SKH for 5h0m (limit 3h)" "$LOG" && ok "stuck: the ALERT names the label, the lock, the pid, the age (5h0m) and the limit" || bad "stuck alert text: '$(cat "$LOG")'"
+  grep -q 'NOT reclaimed' "$LOG" && ok "stuck: ...and says outright that the lock is NOT reclaimed" || bad "stuck: no 'NOT reclaimed' in the alert"
+  case "$(cat "$SKN")" in "Dolt GC|4|"*"o run pid $SKH segura o lock há 5h0m (limite 3h)"*) ok "stuck: the push is priority 4 and carries the pid and age" ;; *) bad "stuck notify text: '$(cat "$SKN")'" ;; esac
+  [ "$(cat "$SKL.stuck-alerted")" = "$SKH:$(stat -f %m "$SKL/pid" 2>/dev/null || stat -c %Y "$SKL/pid")" ] && ok "stuck: the dedupe marker holds '<pid>:<pid-file mtime>'" || bad "stuck marker: '$(cat "$SKL.stuck-alerted" 2>/dev/null)'"
+  _dgm_lock_stuck_check "$SKL" sleep "test-label"; rc=$?; _dgm_lock_stuck_check "$SKL" sleep "test-label"
+  [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && [ "$(grep -c 'ALERT: the ' "$LOG")" = "1" ] && ok "stuck: the same holder checked again (and again) → still stuck (rc 0), but no second push and no second ALERT line" || bad "stuck repeats: rc=$rc notify=$(skn) alerts=$(grep -c 'ALERT: the ' "$LOG")"
+  [ "$(cat "$SKL/pid")" = "$SKH" ] && kill -0 "$SKH" 2>/dev/null && ok "stuck: the check never touches the lock or the holder" || bad "stuck: lock/holder disturbed"
+  # the boundary and the knob
+  sk_reset; sk_hold $((3*3600)); _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 0 ] && ok "stuck: exactly at the limit (3h) counts" || bad "stuck at limit rc=$rc"
+  sk_reset; sk_hold $((3*3600-1)); _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: 1s under the limit → a run in flight, silent" || bad "stuck under limit rc=$rc notify=$(skn)"
+  sk_reset; sk_hold $((4*3600)); GC_MAINT_LOCK_STUCK_H=6; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 1 ] && ok "stuck: GC_MAINT_LOCK_STUCK_H=6 → a 4h holder is still in flight" || bad "stuck knob rc=$rc"
+  _sk_lim_ok=1
+  for _lim in abc 0 "" -1 3.5 " 3"; do
+    sk_reset; sk_hold $((4*3600)); GC_MAINT_LOCK_STUCK_H="$_lim"; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+    [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] || { _sk_lim_ok=0; echo "    (limit '$_lim': rc=$rc notify=$(skn) — did not fall back to 3h)"; }
+    sk_reset; sk_hold $((2*3600)); GC_MAINT_LOCK_STUCK_H="$_lim"; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+    [ "$rc" -eq 1 ] || { _sk_lim_ok=0; echo "    (limit '$_lim': a 2h holder was called stuck)"; }
+  done
+  [ "$_sk_lim_ok" = "1" ] && ok "stuck: a garbled/zero/negative/decimal/padded limit falls back to 3h — never to 'no alert', never to 'alert on everything'" || bad "stuck: a bad limit changed the behaviour (see lines above)"
+  unset _sk_lim_ok _lim
+  # who counts as a holder
+  sk_reset; _DEAD=999999; while kill -0 "$_DEAD" 2>/dev/null; do _DEAD=$((_DEAD+1)); done; sk_hold $((9*3600)) "$_DEAD"
+  _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: a DEAD holder's old lock is not a stuck holder (it is reclaimable) — no alert" || bad "stuck dead: rc=$rc notify=$(skn)"
+  sk_reset; sk_hold $((9*3600))
+  _dgm_lock_stuck_check "$SKL" "no-such-command-name" x; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: a live pid whose command does not match is a REUSED pid, not the holder → no alert" || bad "stuck reused pid: rc=$rc notify=$(skn)"
+  sk_reset; mkdir -p "$SKL"; _mtime_set "$SKL" $((SKNOW - 9*3600))
+  _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: an old lock dir with no pid file is a crash leftover, not a live holder → no alert" || bad "stuck no pid: rc=$rc notify=$(skn)"
+  sk_reset; sk_hold $((-3600))
+  _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(skn)" = "0" ] && ok "stuck: a lock 'taken in the future' (a clock that ran backwards) has an UNKNOWABLE age → no alert, never 'age 0'" || bad "stuck skew: rc=$rc notify=$(skn)"
+  # dedupe is per HOLDER: a new pid, or the same pid taking the lock again later, is a new incident
+  sk_reset; sk_hold $((5*3600)); _dgm_lock_stuck_check "$SKL" sleep x
+  sleep 300 & SKH2=$!; sk_hold $((6*3600)) "$SKH2"; _dgm_lock_stuck_check "$SKL" sleep x
+  [ "$(skn)" = "2" ] && ok "stuck: a different holder is a new incident → a second push" || bad "stuck new holder notify=$(skn)"
+  sk_hold $((7*3600)) "$SKH2"; _dgm_lock_stuck_check "$SKL" sleep x
+  [ "$(skn)" = "3" ] && ok "stuck: the SAME pid taking the lock again (different pid-file mtime — pid reuse) is a new incident too" || bad "stuck reused pid new lock notify=$(skn)"
+  kill "$SKH2" 2>/dev/null; wait "$SKH2" 2>/dev/null
+  # an alert that cannot be deduped must not be sent
+  if [ "$(id -u)" != "0" ]; then
+    sk_reset; sk_hold $((5*3600)); mkdir -p "$SKL.stuck-alerted"
+    _dgm_lock_stuck_check "$SKL" sleep test-label; rc=$?
+    [ "$rc" -eq 0 ] && [ "$(skn)" = "0" ] && grep -q 'cannot be written — NOT notifying' "$LOG" && ok "stuck: a marker that cannot be written → NO push (it would repeat on every poll), a WARN in the log, and the holder is still reported stuck (rc 0)" || bad "stuck undedupable: rc=$rc notify=$(skn) log='$(cat "$LOG")'"
+    rmdir "$SKL.stuck-alerted"
+  fi
+  # helpers
+  [ "$(_dgm_fmt_age 59)" = "0m" ] && [ "$(_dgm_fmt_age 60)" = "1m" ] && [ "$(_dgm_fmt_age 3599)" = "59m" ] && [ "$(_dgm_fmt_age 3600)" = "1h0m" ] && [ "$(_dgm_fmt_age 18720)" = "5h12m" ] && ok "stuck: _dgm_fmt_age renders 59s→0m, 1h→1h0m, 18720s→5h12m" || bad "_dgm_fmt_age: '$(_dgm_fmt_age 59)' '$(_dgm_fmt_age 3600)' '$(_dgm_fmt_age 18720)'"
+  sk_reset; sk_hold 100
+  [ "$(_dgm_lock_age_s "$SKL" "$SKNOW")" = "100" ] && [ -z "$(_dgm_lock_age_s "$SKL" "")" ] && [ -z "$(_dgm_lock_age_s "$SKL" abc)" ] && [ -z "$(_dgm_lock_age_s "$SKL" $((SKNOW-1000)))" ] && [ -z "$(_dgm_lock_age_s "$SK/none.lock.d" "$SKNOW")" ] && ok "stuck: _dgm_lock_age_s is the seconds since the pid file was written, and BLANK (never 0) for a blank/garbled clock, a clock before the lock, or no pid file" || bad "_dgm_lock_age_s: '$(_dgm_lock_age_s "$SKL" "$SKNOW")'"
+  [ -n "$(_dgm_mtime "$SKL/pid")" ] && [ -z "$(_dgm_mtime "$SK/none")" ] && ok "stuck: _dgm_mtime reads an mtime, and is blank (never 0) for a missing file" || bad "_dgm_mtime"
+  _dgm_pos_int 3 && _dgm_pos_int 12 && ! _dgm_pos_int 0 && ! _dgm_pos_int "" && ! _dgm_pos_int -1 && ! _dgm_pos_int 1.5 && ! _dgm_pos_int abc && ok "stuck: _dgm_pos_int accepts whole numbers >= 1 only" || bad "_dgm_pos_int"
+  kill "$SKH" 2>/dev/null; wait "$SKH" 2>/dev/null
+  unset GC_NOW_EPOCH; unset -f _dolt_gc_notify skn sk_reset sk_hold; LOG="$_SK_LOG_SAVED"; unset _SK_LOG_SAVED SKN SKL SKNOW SKH SKH2 _DEAD
+  case "$SK" in "${TMPDIR:-/tmp}"/dolt-gc-stuck-selftest.*) rm -rf "$SK" ;; esac
 fi
 
 # ── the REAL entry point (gate round 2, ga-mb57np) ──────────────────────────────────────
@@ -553,7 +707,7 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   printf '#!/bin/sh\nprintf "10\\t%%s\\n" "$2"\n' > "$EP/bin/du"
   chmod +x "$EP/bin/bd" "$EP/bin/dolt" "$EP/bin/notify" "$EP/bin/du"
   printf 'DOLTDIR="%s"\nNOTIFY="%s"\n' "$EP/hq" "$EP/bin/notify" > "$EP/conf.env"
-  entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
+  entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log" "$EP/run.lock.d.stuck-alerted"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
   # run the job exactly as launchd does (script, not library) but with DOLT_GC_MAINT_LIB forced off — this
   # selftest exports it as 1 for its own library loads, which would make the child do nothing at all.
   run_entry() { env PATH="$EP/bin:$PATH" DOLT_GC_MAINT_LIB=0 DOLT_MAINT_CONF="$EP/conf.env" DOLT_GC_MAINT_LOG="$EP/job.log" \
@@ -575,6 +729,32 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && ok "entry: ...and left the skip streak alone" || bad "entry held: streak changed to '$(cat "$EP/streak.state" 2>/dev/null)'"
   grep -q 'another dolt-gc-maintenance run holds' "$EP/job.log" && ok "entry: ...and said so in the log (nothing done in this invocation)" || bad "entry held: no log line"
   [ "$(cat "$EP/run.lock.d/pid" 2>/dev/null)" = "$HOLDER" ] && ok "entry: the live holder's lock is intact after the refused run (not stolen, not removed by the loser's exit trap)" || bad "entry held: lock pid now '$(cat "$EP/run.lock.d/pid" 2>/dev/null)' (holder $HOLDER)"
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+  # (b2) ga-11vdhe — THE acceptance scenario: a live holder whose lock is HOURS old. The second run still
+  #      stands down without stealing anything (unchanged) — but now says how old the holder is, pushes ONE
+  #      notification, and the NEXT cycle does not repeat it. Real script, real notify stub, real pids.
+  entry_reset; sleep 300 & HOLDER=$!
+  mkdir "$EP/run.lock.d"; printf '%s\n' "$HOLDER" > "$EP/run.lock.d/pid"; _mtime_set "$EP/run.lock.d/pid" "$(( $(date +%s) - 5*3600 ))"
+  run_entry GC_MAINT_LOCK_RE=sleep; rc=$?
+  [ "$rc" -eq 0 ] && [ ! -e "$EP/bd.calls" ] && [ ! -e "$EP/dolt.calls" ] && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && ok "entry/stuck: against a live holder 5h old the run still stands down (exit 0, nothing done, streak untouched)" || bad "entry stuck standdown: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' streak='$(cat "$EP/streak.state" 2>/dev/null)'"
+  grep -Eq "another dolt-gc-maintenance run holds .* \(pid $HOLDER, held for 5h[0-9]+m\)" "$EP/job.log" && ok "entry/stuck: the per-cycle 'another run holds' line now carries the holder's age" || bad "entry stuck age in line: '$(head -3 "$EP/job.log")'"
+  [ "$(grep -c 'ALERT: the dolt-gc-maintenance lock' "$EP/job.log")" = "1" ] && [ "$(wc -l < "$EP/notify.calls" 2>/dev/null | tr -d '[:space:]')" = "1" ] && ok "entry/stuck: exactly ONE ALERT line and ONE push for that holder" || bad "entry stuck alert: alerts=$(grep -c 'ALERT: the ' "$EP/job.log") pushes=$(wc -l < "$EP/notify.calls" 2>/dev/null)"
+  run_entry GC_MAINT_LOCK_RE=sleep; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(grep -c 'ALERT: the dolt-gc-maintenance lock' "$EP/job.log")" = "1" ] && [ "$(wc -l < "$EP/notify.calls" 2>/dev/null | tr -d '[:space:]')" = "1" ] && grep -c 'another dolt-gc-maintenance run holds' "$EP/job.log" | grep -qx 2 && ok "entry/stuck: the NEXT cycle (same holder) stands down again, logs its usual line, and does NOT push again" || bad "entry stuck repeat: alerts=$(grep -c 'ALERT: the ' "$EP/job.log") pushes=$(wc -l < "$EP/notify.calls" 2>/dev/null) holds=$(grep -c 'another dolt-gc-maintenance run holds' "$EP/job.log")"
+  [ "$(cat "$EP/run.lock.d/pid" 2>/dev/null)" = "$HOLDER" ] && kill -0 "$HOLDER" 2>/dev/null && ok "entry/stuck: the hung holder is untouched and keeps its lock — the alert never steals (that is the operator's call)" || bad "entry stuck: lock/holder disturbed"
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  # a healthy holder (started minutes ago) is silent
+  entry_reset; sleep 300 & HOLDER=$!
+  mkdir "$EP/run.lock.d"; printf '%s\n' "$HOLDER" > "$EP/run.lock.d/pid"
+  run_entry GC_MAINT_LOCK_RE=sleep; rc=$?
+  [ "$rc" -eq 0 ] && ! grep -q 'ALERT' "$EP/job.log" && [ ! -e "$EP/notify.calls" ] && ok "entry/stuck: a holder that took the lock moments ago is a run in flight — no ALERT, no push" || bad "entry stuck young: alerts=$(grep -c ALERT "$EP/job.log") pushes=$(wc -l < "$EP/notify.calls" 2>/dev/null)"
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  # ...and the limit is a knob of the real job
+  entry_reset; sleep 300 & HOLDER=$!
+  mkdir "$EP/run.lock.d"; printf '%s\n' "$HOLDER" > "$EP/run.lock.d/pid"; _mtime_set "$EP/run.lock.d/pid" "$(( $(date +%s) - 2*3600 ))"
+  run_entry GC_MAINT_LOCK_RE=sleep GC_MAINT_LOCK_STUCK_H=1; rc=$?
+  [ "$rc" -eq 0 ] && grep -q 'ALERT: the dolt-gc-maintenance lock .* for 2h' "$EP/job.log" && grep -q '(limit 1h)' "$EP/job.log" && ok "entry/stuck: GC_MAINT_LOCK_STUCK_H=1 → a 2h holder alerts (the knob reaches the real script)" || bad "entry stuck knob: '$(cat "$EP/job.log")'"
   kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
   # (c) a CRASHED holder (dead pid) must not wedge the job: the next run reclaims the lock and runs
