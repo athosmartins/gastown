@@ -42,6 +42,22 @@ to count. So the outcome uses only what IS attributable, with three honest state
             as "no events"); the events file does not yet cover the window (then the delivery
             simply stays pending).
 
+A CITED BEAD THAT bd SAYS DOES NOT EXIST (ga-aijm2v.11): not an entity of the delivery, and not an
+unreadable channel either. Every gate-review nudge carries the boilerplate id "ga-p5q3" — a bead that
+no longer exists — so treating "no issue found" like a failed read made the whole delivery nao_sei
+(measured 26/09: 62 of 171 real rows; re-measured on 254 nudges: 219 of 254 = 86% "comentarios
+ilegiveis" before, 4 after). BdReader now returns NOT_FOUND for bd's explicit "no issue found" and None
+for everything that is merely a failed read (rc!=0, timeout, locked, garbled, unknown rig, wisp). The
+outcome is drawn over the LIVE ids only; the log line keeps what was cited (`entidades`) and which of
+those bd declared gone (`entidades_inexistentes`). Two limits keep this from becoming a way to lose
+information: (1) if no cited id is left, the outcome stays nao_sei — a dead bead is nothing to
+measure, never "nobody acted"; (2) POSITIVE evidence still counts through a dead id (a mail the recipient
+sent citing it is still an "agiu"), because a missed action is the error that hides real alarms.
+KNOWN LIMIT: "gone" is the answer of the store the id's PREFIX maps to (rig_for_entity); a bead that lives
+in another store under a foreign prefix would read as gone. Measured 26/09: of 142 ids gone by that rule
+(254 real nudges), each re-asked in every other registered store — 0 exist elsewhere; the rig map has
+no colliding prefix today. Revisit if a prefix ever maps to a store that does not own its beads.
+
 WHY A COMMENT BY SOMEONE ELSE IS nao_sei, NOT "the recipient did not act" (gate ga-aijm2v.4 #1):
 comment authors are NOT reliable identities. Measured 25/09 over 156 beads: 'Test' (bd's git-user
 fallback when BD_ACTOR is unset — agents' comments land there too) ~1140 of ~1800, 'automation'
@@ -515,6 +531,7 @@ def default_bd_runner(rig_path: str, args: list, timeout: int = 20):
 
 NOT_FOUND_RE = re.compile(r"\bno issues? found\b", re.I)  # both spellings bd uses for a missing bead
 DEFERRED = object()  # a read that was NOT attempted (call budget / failure breaker) — retry next run, do not conclude anything
+NOT_FOUND = object()  # bd ANSWERED "no issue found": the bead does not exist. An answer, not a failed read — never None
 
 
 class BdReader:
@@ -523,6 +540,9 @@ class BdReader:
     exist is data, not an infra failure, and never trips the breaker — bd words it two ways, and
     matching only one made a missing bead an infra failure (measured live 26/09): `bd show` prints
     "no issues found matching the provided IDs", `bd comments` "... no issue found matching ...".
+    It is also not "could not read": a read that fails says nothing about the bead, one that says
+    "no issue found" says the bead is gone — so the two come back as different values (NOT_FOUND vs
+    None), because collapsing them made every delivery citing one deleted id unmeasurable (ga-aijm2v.11).
     Ephemeral wisps (`*-wisp-*`, the bead_id of most nudges) have no comment channel worth a call."""
 
     def __init__(self, cfg: Config, bd_fn):
@@ -533,7 +553,8 @@ class BdReader:
         self._comments: dict = {}
 
     def _run(self, entity: str, args: list):
-        """parsed JSON | None (unavailable: unknown rig, wisp, not found, failed) | DEFERRED (not attempted)."""
+        """parsed JSON | NOT_FOUND (bd said the bead does not exist) | None (could not read: unknown rig,
+        wisp, failed) | DEFERRED (not attempted)."""
         rig = rig_for_entity(entity, self.cfg.rig_paths)
         if rig is None or "-wisp-" in entity:
             return None
@@ -553,7 +574,7 @@ class BdReader:
         if isinstance(data, dict) and "error" in data:
             if NOT_FOUND_RE.search(str(data["error"])):
                 self.fail_streak = 0
-                return None
+                return NOT_FOUND
             self.fail_streak += 1
             return None
         if rc != 0:
@@ -568,6 +589,8 @@ class BdReader:
         data = self._run(entity, ["show", entity, "--json"])
         if data is DEFERRED:
             return None  # facts are context for Jev, not a conclusion: go on without them, do not memoize
+        if data is NOT_FOUND:
+            data = None  # a bead that is gone has no facts to give
         b = data[0] if isinstance(data, list) and data else data
         facts = None
         if isinstance(b, dict):
@@ -578,14 +601,15 @@ class BdReader:
         return facts
 
     def comments(self, entity: str):
-        """list of comment dicts | None = could not read (NEVER [] — an unreadable channel is not an
-        empty one) | DEFERRED = not attempted this run."""
+        """list of comment dicts | NOT_FOUND = bd said the bead does not exist (there is no channel to
+        read; nothing to conclude from it either way) | None = could not read (NEVER [] — an
+        unreadable channel is not an empty one) | DEFERRED = not attempted this run."""
         if entity in self._comments:
             return self._comments[entity]
         data = self._run(entity, ["comments", entity, "--json"])
         if data is DEFERRED:
             return DEFERRED
-        result = data if isinstance(data, list) else None
+        result = NOT_FOUND if data is NOT_FOUND else (data if isinstance(data, list) else None)
         self._comments[entity] = result
         return result
 
@@ -674,16 +698,26 @@ def _actor_key(name) -> str:
     return str(name or "").strip().lower().replace("__", ".")
 
 
+def gone_entities(ents: list, comments: dict) -> list:
+    """The cited ids bd itself declared nonexistent (NOT_FOUND) — only bd's explicit answer, never a
+    failed, timed-out or missing read (those are None / absent and stay 'could not read')."""
+    return [x for x in ents if comments.get(x) is NOT_FOUND]
+
+
 def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, comments: dict,
                     events_complete: bool = True):
     """('agiu'|'nao_agiu'|'nao_sei', motivo). `window_events` are the mail.sent / bead.* events
-    already inside [t0, t1]; `comments` maps entity -> list | None (unreadable); `events_complete`
+    already inside [t0, t1]; `comments` maps entity -> list | None (unreadable) | NOT_FOUND (bd says
+    the bead does not exist: it is not an entity of this delivery — see gone_entities — so it can
+    neither make the outcome unreadable nor stand for "nobody touched it"); `events_complete`
     is False when the events file could not be read whole for this window (a truncated archive):
     positive evidence still counts, but "nobody touched it" can no longer be concluded. See the
     module docstring for what each state means and why bead.* events and comment authors cannot
     say who acted."""
     aliases = {_actor_key(a) for a in rec.get("aliases") or [rec["destinatario"]]}
     ents = rec.get("entidades") or []
+    gone = gone_entities(ents, comments)
+    live = [x for x in ents if x not in gone]  # the entities that exist: every NEGATIVE conclusion is drawn over these
     own_seq = rec.get("seq")
 
     for e in window_events:
@@ -695,12 +729,14 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
         # whole-id match through the SAME tokenizer that produced `ents`: a substring test credited
         # ga-abc for a mention of ga-abcdef (or ga-x for its child ga-x.4)
         mentioned = set(extract_entities((msg.get("subject") or "") + "\n" + (msg.get("body") or "")))
+        # `ents`, not `live`: positive evidence still counts when the id it cites is gone — under doubt this
+        # module leans to "agiu" (a missed action understates the grave-error count), never the reverse
         hit = [x for x in ents if x in mentioned]
         if hit:
             return "agiu", f"mail enviado pelo destinatario citando {hit[0]}"
 
     stray = []  # comments in the window that cannot be attributed to the recipient: (entity, author, why)
-    for ent in ents:
+    for ent in live:
         for c in comments.get(ent) or []:
             if not isinstance(c, dict):
                 stray.append((ent, "?", "comentario ilegivel"))
@@ -718,11 +754,14 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
 
     if not ents:
         return "nao_sei", "entidade nao identificavel (sem bead citado)"
-    unreadable = [x for x in ents if comments.get(x) is None]
+    if not live:
+        return "nao_sei", (f"todos os beads citados ({', '.join(gone)}) nao existem mais no bd (bd: no issue found) — "
+                           "sem entidade viva nao ha o que observar")
+    unreadable = [x for x in live if comments.get(x) is None]
     if unreadable:
         return "nao_sei", (f"comentarios ilegiveis/indisponiveis em {unreadable[0]} (bd falhou, wisp ou rig desconhecido) "
                            "— ausencia de evidencia nao e nao-acao")
-    changed = [x for x in ents if any(str(e.get("type", "")).startswith("bead.") and e.get("subject") == x for e in window_events)]
+    changed = [x for x in live if any(str(e.get("type", "")).startswith("bead.") and e.get("subject") == x for e in window_events)]
     if changed:
         return "nao_sei", f"{changed[0]} mudou na janela mas o evento nao diz quem (bead.* vem como cache-reconcile) — sem autor atribuivel"
     if stray:
@@ -1011,7 +1050,7 @@ def _run_locked(cfg: Config, jev_fn, bd_fn, now: datetime) -> dict:
             out = {
                 "ts": rec["ts"], "mode": "portaria", "experiment": f"portaria-{rec['classe']}", "classe": rec["classe"],
                 "canal": rec["canal"], "delivery_id": did, "destinatario": rec["destinatario"], "entidades": rec["entidades"],
-                "fatos": rec.get("fatos"), "camada1": rec["camada1"], "camada1_regra": rec["camada1_regra"], "camada2": rec["camada2"],
+                "entidades_inexistentes": gone_entities(rec["entidades"], comments), "fatos": rec.get("fatos"), "camada1": rec["camada1"], "camada1_regra": rec["camada1_regra"], "camada2": rec["camada2"],
                 "camada2_noul": rec["camada2_noul"], "camada2_extras": rec["camada2_extras"], "camada3": rec["camada3"],
                 "cascata": rec["cascata"], "jev_ok": rec["jev_ok"], "jev_noul": rec["jev_noul"], "jev_error": rec["jev_error"],
                 "jev_tokens_in": rec["jev_tokens_in"], "jev_tokens_out": rec["jev_tokens_out"],

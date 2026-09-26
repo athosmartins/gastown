@@ -83,6 +83,8 @@ class Env:
         self.jev_ok = True
         self.comments: dict = {}       # entity -> list of comment dicts, or None = bd failed
         self.show: dict = {}           # entity -> bead dict for `bd show`
+        self.gone: set = set()         # entities bd answers "no issue found" for (deleted/never existed) — NOT a failure
+        self.raw: dict = {}            # entity -> (rc, stdout) served verbatim for any read (bd's own error shapes)
 
     def write_events(self, evs, path=None):
         (path or self.events).write_text("".join(json.dumps(e) + "\n" for e in evs), encoding="utf-8")
@@ -106,6 +108,12 @@ class Env:
     def bd_fn(self, rig_path, args):
         self.bd_calls.append(list(args))
         sub, ent = args[0], args[1]
+        if ent in self.raw:
+            return self.raw[ent]
+        if ent in self.gone:  # the two wordings bd really uses (verified live 26/09)
+            msg = ("no issues found matching the provided IDs" if sub == "show"
+                   else f'resolving {ent}: no issue found matching "{ent}"')
+            return 1, json.dumps({"error": msg, "schema_version": 1})
         if sub == "comments":
             c = self.comments.get(ent)
             return (1, "") if c is None else (0, json.dumps(c))
@@ -812,7 +820,7 @@ def t_record_shape(e: Env):
     e.jev_answers = {"precisa_agir": 0.05, "duplicata": 0.6, "resolve_sozinho": 0.7}
     recs = outcome_scenario(e, comments=[])
     r = recs[0]
-    need = ["ts", "mode", "experiment", "classe", "canal", "delivery_id", "destinatario", "entidades", "fatos", "camada1", "camada1_regra",
+    need = ["ts", "mode", "experiment", "classe", "canal", "delivery_id", "destinatario", "entidades", "entidades_inexistentes", "fatos", "camada1", "camada1_regra",
             "camada2", "camada2_noul", "camada2_extras", "camada3", "cascata", "jev_ok", "jev_noul", "jev_error",
             "jev_tokens_in", "jev_tokens_out", "desfecho", "desfecho_motivo", "janela_min", "resolved_at"]
     ok("every field of the record is present", all(k in r for k in need), str([k for k in need if k not in r]))
@@ -1020,7 +1028,8 @@ def t_bd_not_found(e: Env):
         rd.comments(f"ga-gone{i}b")
     ok("...nor via `bd comments` (the singular wording)", rd.fail_streak == 0, f"streak={rd.fail_streak}")
     ok("so the next read is still attempted (not DEFERRED)", rd.comments("ga-live1") is not ps.DEFERRED)
-    ok("a missing bead's comments are 'unavailable' (None), never an empty list", rd.comments("ga-gone0b") is None)
+    ok("a missing bead's comments are NOT_FOUND (an answer) — never an empty list, never None (a failed read), see 9c",
+       rd.comments("ga-gone0b") is ps.NOT_FOUND)
     boom = ps.BdReader(e.cfg(), lambda rig, args: (1, ""))
     for i in range(3):
         boom.comments(f"ga-down{i}a")
@@ -1028,6 +1037,212 @@ def t_bd_not_found(e: Env):
 
 
 with_env(t_bd_not_found)
+
+# ---------------------------------------------------------------------------------------------
+print("-- 9c. a bead bd says does not exist is not a cited entity (ga-aijm2v.11) --")
+# The real trigger (measured 26/09): every "QUALITY GATE REVIEW" nudge carries the boilerplate "ga-p5q3", a
+# bead that no longer exists, next to the branch's real bead. `bd comments ga-p5q3` -> "no issue found", which
+# the reader returned as None — the SAME value as "bd is down" — so the whole delivery came out nao_sei
+# ("comentarios ilegiveis") and 62 of 171 real rows were never measurable.
+REVIEW_MSG = ("QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: fix/ga-bbb22\nAuthor (EXCLUDED): dog-x\n"
+              "(The ga-p5q3 third-state check now lives in the reviewer prompt template.)")
+DEAD = "ga-p5q3"
+
+
+def nudge_scenario(e: Env, message: str = REVIEW_MSG, *, extra_events=(), recipient="gastown.reviewer-1"):
+    """One nudge observed at T0+1, resolved after its 60-min window; returns the log records."""
+    e.write_events([ev_fill(1, T0)])
+    e.write_nudges([nudge("nudge-r1", recipient, message, "ga-wisp-rev1", iso_z(T0 + timedelta(minutes=1)))], [])
+    e.run(T0 + timedelta(minutes=5))
+    e.write_events([ev_fill(1, T0), *extra_events, ev_fill(900, T0 + timedelta(minutes=70))])
+    e.write_nudges([], [])
+    e.run(T0 + timedelta(minutes=75))
+    return e.portaria_records()
+
+
+def t_dead_entity_dropped(e: Env):
+    """Catches: one dead id in the delivery poisons the whole outcome. A dead id + a live id nobody
+    touched must be nao_agiu — 'no action seen on the entities that exist' — not nao_sei."""
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = []
+    recs = nudge_scenario(e)
+    ok("nudge citing a dead id + a live id with no action -> nao_agiu (was nao_sei: 'comentarios ilegiveis')",
+       len(recs) == 1 and recs[0]["desfecho"] == "nao_agiu", str(recs))
+    ok("the record keeps what the delivery CITED, and says which of those bd declared gone",
+       recs[0]["entidades"] == ["ga-bbb22", DEAD] and recs[0]["entidades_inexistentes"] == [DEAD], str(recs[0]))
+
+
+with_env(t_dead_entity_dropped)
+
+
+def t_dead_only(e: Env):
+    """Catches: dropping dead ids until nothing is left and then concluding 'nobody acted'. No entity
+    left is nothing to measure -> nao_sei, and the motive says why (not 'comentarios ilegiveis')."""
+    e.gone = {DEAD}
+    recs = nudge_scenario(e, "QUALITY GATE REVIEW — (the ga-p5q3 check lives in the template)")
+    ok("every cited id is dead -> nao_sei, never nao_agiu", recs[0]["desfecho"] == "nao_sei", str(recs))
+    ok("the motive says the cited beads no longer exist (not that bd failed)",
+       "nao existe" in recs[0]["desfecho_motivo"] and "ilegiv" not in recs[0]["desfecho_motivo"], recs[0]["desfecho_motivo"])
+    ok("...and names the dropped id", DEAD in recs[0]["desfecho_motivo"], recs[0]["desfecho_motivo"])
+
+
+with_env(t_dead_only)
+
+
+def t_dead_plus_infra_failure(e: Env):
+    """Catches: 'a dead id was dropped' leaking into 'so unreadable ones can be dropped too'. The live id
+    cannot be read (bd/Dolt down) -> still nao_sei. Infra failure never becomes 'nothing to see'."""
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = None  # bd failed on the live one
+    recs = nudge_scenario(e)
+    ok("dead id + a live id bd could not read -> nao_sei", recs[0]["desfecho"] == "nao_sei", str(recs))
+    ok("the motive blames the unreadable id, not the dead one", "ilegiv" in recs[0]["desfecho_motivo"] and "ga-bbb22" in recs[0]["desfecho_motivo"], recs[0]["desfecho_motivo"])
+
+
+with_env(t_dead_plus_infra_failure)
+
+
+def t_infra_failure_is_not_dead():
+    """Catches (the acceptance test's second half): the SAME nudge with bd failing must stay nao_sei.
+    Only bd's explicit 'no issue found' means gone: rc=1 with no output, a locked/refused server and a
+    non-JSON blurb are all 'could not read'. The dropped-id rule must not swallow them."""
+    for label, raw in (("rc=1, empty stdout", (1, "")),
+                       ("json error that is not a not-found", (1, json.dumps({"error": "database is locked", "schema_version": 1}))),
+                       ("connection refused, plain text", (1, "dial tcp 127.0.0.1: connection refused")),
+                       ("timeout (124)", (124, ""))):
+        def one(env: Env, label=label, raw=raw):
+            env.raw = {DEAD: raw}
+            env.comments["ga-bbb22"] = []
+            recs = nudge_scenario(env)
+            ok(f"the boilerplate id fails with [{label}] -> nao_sei, not dropped", recs[0]["desfecho"] == "nao_sei", str(recs))
+            ok(f"...and it is NOT reported as nonexistent [{label}]", recs[0]["entidades_inexistentes"] == [], str(recs[0]))
+        with_env(one)
+
+
+t_infra_failure_is_not_dead()
+
+
+def t_dead_keeps_the_rest_of_the_rules(e: Env):
+    """Catches: the dead-id drop short-circuiting the rules that still apply to the LIVE ids."""
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = [{"id": "c1", "author": "gastown.reviewer-1", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "x"}]
+    ok("a comment by the recipient on the live id -> agiu", nudge_scenario(e)[0]["desfecho"] == "agiu")
+
+
+with_env(t_dead_keeps_the_rest_of_the_rules)
+
+
+def t_dead_stranger_comment(e: Env):
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = [{"id": "c1", "author": "automation", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "x"}]
+    r = nudge_scenario(e)[0]
+    ok("a comment by someone who is not provably the recipient on the live id -> still nao_sei (attribution rule intact)",
+       r["desfecho"] == "nao_sei" and "atribuivel" in r["desfecho_motivo"], str(r))
+
+
+with_env(t_dead_stranger_comment)
+
+
+def t_dead_events_do_not_count(e: Env):
+    """Catches: a bead.* event on the DEAD id (e.g. its deletion) read as 'the entity changed but nobody
+    says who' -> nao_sei. The dead id is not an entity of the delivery, so its events are not evidence."""
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = []
+    r = nudge_scenario(e, extra_events=[ev_bead(2, T0 + timedelta(minutes=30), DEAD)])[0]
+    ok("a bead.* event on the dead id alone does not turn the outcome into nao_sei", r["desfecho"] == "nao_agiu", str(r))
+
+
+with_env(t_dead_events_do_not_count)
+
+
+def t_dead_events_on_live_still_count(e: Env):
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = []
+    r = nudge_scenario(e, extra_events=[ev_bead(2, T0 + timedelta(minutes=30), "ga-bbb22")])[0]
+    ok("...but the same event on the LIVE id still does (unattributable change -> nao_sei)", r["desfecho"] == "nao_sei", str(r))
+
+
+with_env(t_dead_events_on_live_still_count)
+
+
+def t_dead_mail_still_positive(e: Env):
+    """Catches: throwing away POSITIVE evidence because the id it cites is dead. This module leans
+    towards 'agiu' under doubt (a missed action understates the grave-error count in the report Athos
+    decides suppression from): a mail the recipient sent citing a cited id still counts."""
+    e.gone = {DEAD}
+    e.comments["ga-bbb22"] = []
+    reply = ev_mail(2, T0 + timedelta(minutes=30), "r1", "human", "Re: revisao", f"revisei, ver {DEAD}", frm="gastown.reviewer-1", thread="t-r")
+    r = nudge_scenario(e, extra_events=[reply])[0]
+    ok("a mail by the recipient citing the dead id is still evidence -> agiu", r["desfecho"] == "agiu", str(r))
+
+
+with_env(t_dead_mail_still_positive)
+
+
+def t_dead_mail_delivery(e: Env):
+    """Catches: the fix living only on the nudge path. A mail whose subject names a deleted bead."""
+    e.gone = {"ga-gone9"}
+    r = outcome_scenario(e, entity="ga-gone9")[0]
+    ok("mail about a bead that is gone -> nao_sei (nothing left to measure), motive says it no longer exists",
+       r["desfecho"] == "nao_sei" and "nao existe" in r["desfecho_motivo"], str(r))
+    ok("and the record lists it as nonexistent", r["entidades_inexistentes"] == ["ga-gone9"], str(r))
+
+
+with_env(t_dead_mail_delivery)
+
+
+def t_dead_list_mail(e: Env):
+    """Catches: a watchdog list (several beads) where ONE is gone: the live ones decide."""
+    e.gone = {"wa-aaa11"}
+    e.comments["wa-bbb22"] = []
+    e.write_events([ev_mail(1, T0, "o1", "gastown.mayor", ORPHAN_SUBJ, ORPHAN_BODY), ev_fill(900, T0 + timedelta(minutes=65))])
+    e.run(T0 + timedelta(minutes=5))
+    e.run(T0 + timedelta(minutes=70))
+    r = e.portaria_records()[0]
+    ok("orphan-label list with one deleted bead + one untouched live bead -> nao_agiu", r["desfecho"] == "nao_agiu", str(r))
+    ok("entidades keeps both, entidades_inexistentes the gone one", r["entidades"] == ["wa-aaa11", "wa-bbb22"] and r["entidades_inexistentes"] == ["wa-aaa11"], str(r))
+
+
+with_env(t_dead_list_mail)
+
+
+def t_dead_compute_outcome_direct(e: Env):
+    """Catches: compute_outcome iterating a NOT_FOUND marker as if it were a comment list (a crash that
+    would take the whole run down) — exercised directly with the marker in the comments map."""
+    rec = {"destinatario": "gastown.mayor", "aliases": ["gastown.mayor"], "entidades": ["ga-x1a", "ga-y2b"], "seq": 1, "thread_id": ""}
+    got = ps.compute_outcome(rec, T0, T0 + timedelta(minutes=60), [], {"ga-x1a": ps.NOT_FOUND, "ga-y2b": []})
+    ok("marker + empty list -> nao_agiu", got[0] == "nao_agiu", str(got))
+    got = ps.compute_outcome(rec, T0, T0 + timedelta(minutes=60), [], {"ga-x1a": ps.NOT_FOUND, "ga-y2b": None})
+    ok("marker + unreadable -> nao_sei", got[0] == "nao_sei", str(got))
+    got = ps.compute_outcome(rec, T0, T0 + timedelta(minutes=60), [], {"ga-x1a": ps.NOT_FOUND, "ga-y2b": ps.NOT_FOUND})
+    ok("marker + marker -> nao_sei", got[0] == "nao_sei" and "nao existe" in got[1], str(got))
+
+
+with_env(t_dead_compute_outcome_direct)
+
+
+def t_reader_not_found(e: Env):
+    """Catches: the reader still returning None for a missing bead — the collapse itself."""
+    calls: list = []
+
+    def fn(rig, args):
+        calls.append(args)
+        if args[1] == "ga-gone1":
+            return 1, json.dumps({"error": 'resolving ga-gone1: no issue found matching "ga-gone1"', "schema_version": 1})
+        return 1, ""  # anything else: an infra failure
+    rd = ps.BdReader(e.cfg(), fn)
+    ok("a bead bd says does not exist -> the NOT_FOUND marker, distinct from None (unreadable) and from []",
+       rd.comments("ga-gone1") is ps.NOT_FOUND and ps.NOT_FOUND is not None, str(rd.comments("ga-gone1")))
+    n = len(calls)
+    rd.comments("ga-gone1"); rd.comments("ga-gone1")
+    ok("...memoized: asking again does not spend another bd call", len(calls) == n, f"{n} -> {len(calls)}")
+    ok("a real failure is still None (unreadable), not the marker", rd.comments("ga-down1") is None)
+    ok("an unknown rig and an ephemeral wisp are still None (unavailable), not the marker",
+       rd.comments("zz-abc12") is None and rd.comments("ga-wisp-abc123") is None)
+    ok("`bd show` of a missing bead gives no facts (None), and does not raise", rd.facts("ga-gone1") is None)
+
+
+with_env(t_reader_not_found)
 
 print("-- 10. rig routing for `bd -C` --")
 with tempfile.TemporaryDirectory() as td:
