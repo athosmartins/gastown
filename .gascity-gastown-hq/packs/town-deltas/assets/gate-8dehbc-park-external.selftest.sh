@@ -34,7 +34,9 @@
 #     actor, does not abort the block under `set -e`, and the closing self-heal STILL runs
 #   * marker unreadable -> legacy write, loudly (UNVERIFIED)
 # and the class lock: no raw needs-rebase writer may come back without a waiver
-# (`# park-raw-ok: <why>`), with a detector that is itself tested.
+# (`# park-raw-ok: <why>`), with a detector that is itself tested. ga-w5jq3d closed the one
+# waived writer (the exile watchdog's park), so the lock now also asserts ZERO waived writers;
+# that path's own behaviour is locked in gate-exile-watchdog.selftest.sh (cases 14-23).
 #
 # Exit 0 iff every assertion holds. Runs under /bin/bash 3.2 (launchd's bash).
 set -uo pipefail
@@ -69,9 +71,15 @@ extract_block() {
 echo "── 1. no raw needs-rebase PARK writer in the dispatcher ──"
 # raw_park_writers < file : prints "<line>:<text>" for every non-comment line that writes
 # gate-status:needs-rebase without going through gate_requeue_respecting_external.
+PARK_RAW_RE='set_gate_status[[:space:]]+"[^"]*"[[:space:]]+"needs-rebase"|label[[:space:]]+add[[:space:]]+[^#]*gate-status:needs-rebase'
 raw_park_writers() {
-  grep -nE 'set_gate_status[[:space:]]+"[^"]*"[[:space:]]+"needs-rebase"|label[[:space:]]+add[[:space:]]+[^#]*gate-status:needs-rebase' \
-    | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'park-raw-ok'
+  grep -nE "$PARK_RAW_RE" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v 'park-raw-ok'
+}
+# waived_park_writers < file : the raw writers raw_park_writers skips ONLY because they carry a
+# `# park-raw-ok` waiver. Counts real writers, never the word in a comment (the dispatcher's own
+# header explains the mechanism and so mentions it).
+waived_park_writers() {
+  grep -nE "$PARK_RAW_RE" | grep -vE '^[0-9]+:[[:space:]]*#' | grep 'park-raw-ok'
 }
 # A detector nobody tests is a detector that silently stops detecting.
 DET_FIXTURE='    set_gate_status "$MARKER_ID" "needs-rebase"  # ga-7fwt1
@@ -88,11 +96,27 @@ if [ "$DET_N" = "3" ] && has "$DET_OUT" '1:' && has "$DET_OUT" '2:' && has "$DET
 else
   bad "detector self-test: expected exactly fixture lines 1,2,3 flagged, got [$DET_OUT]"
 fi
+DET_WAIVED="$(printf '%s\n' "$DET_FIXTURE" | waived_park_writers)"
+if [ "$(printf '%s\n' "$DET_WAIVED" | grep -c .)" = "1" ] && has "$DET_WAIVED" '5:'; then
+  ok "waiver detector self-test: finds exactly the one waived writer (fixture line 5), not the comment or the helper call"
+else
+  bad "waiver detector self-test: expected exactly fixture line 5, got [$DET_WAIVED]"
+fi
 LIVE_RAW="$(raw_park_writers < "$DISPATCHER" || true)"
 if [ -z "$LIVE_RAW" ]; then
   ok "THE CLASS: the dispatcher has zero unwaived raw needs-rebase writers (was 8: the 7 rebase-decision parks + the exile watchdog)"
 else
   bad "raw needs-rebase writer(s) — route through gate_requeue_respecting_external <id> needs-rebase dispatching, or waive with '# park-raw-ok: <why>': $LIVE_RAW"
+fi
+# ga-w5jq3d closed the LAST waived writer: the exile watchdog's park goes through the helper too
+# (expected_status `queued` — it holds a marker from a gate-status:queued snapshot, not a
+# `dispatching` claim). A waiver is visible debt, so none may come back unnoticed: adding one
+# means editing this assertion on purpose.
+LIVE_WAIVED="$(waived_park_writers < "$DISPATCHER" || true)"
+if [ -z "$LIVE_WAIVED" ]; then
+  ok "THE CLASS, fully closed: zero WAIVED raw needs-rebase writers either — the exile watchdog's park no longer needs its waiver (ga-w5jq3d)"
+else
+  bad "a waived raw needs-rebase writer is back (ga-w5jq3d removed the last one) — route it through gate_requeue_respecting_external, or justify the waiver by updating this assertion: $LIVE_WAIVED"
 fi
 
 # ── 2. the helpers, on their own ────────────────────────────────────────────────
@@ -418,14 +442,27 @@ done
 echo "── 4. source drift-guards ──"
 # The hazard bead ga-dl3x9s names: a WRONG expected_status makes the helper read this
 # sweep's own label as foreign and strand the marker. Every park call must pass the label
-# the marker really holds while the rebase decision runs.
+# the marker really holds where it parks: `dispatching` for the 7 rebase-decision sites (the
+# marker was claimed queued->dispatching), and `queued` for the ONE exile-watchdog park
+# (ga-w5jq3d: it holds a marker read from a gate-status:queued snapshot, never a claim).
 PARK_CALLS="$(grep -nE 'gate_requeue_respecting_external[[:space:]]+"[^"]*"[[:space:]]+"needs-rebase"' "$DISPATCHER" | grep -vE '^[0-9]+:[[:space:]]*#')"
-N_PARK="$(printf '%s\n' "$PARK_CALLS" | grep -c .)"
-WRONG_EXPECT="$(printf '%s\n' "$PARK_CALLS" | grep -v '"needs-rebase" "dispatching"' || true)"
+QUEUED_PARKS="$(printf '%s\n' "$PARK_CALLS" | grep '"needs-rebase" "queued"' || true)"
+REBASE_PARKS="$(printf '%s\n' "$PARK_CALLS" | grep -v '"needs-rebase" "queued"' || true)"
+N_PARK="$(printf '%s\n' "$REBASE_PARKS" | grep -c .)"
+WRONG_EXPECT="$(printf '%s\n' "$REBASE_PARKS" | grep -v '"needs-rebase" "dispatching"' || true)"
 [ "$N_PARK" = "7" ] && ok "exactly 7 park writes go through gate_requeue_respecting_external" \
   || bad "expected 7 park writes through the helper, found $N_PARK — a site lost (or gained) its compare-before-write"
-[ -z "$WRONG_EXPECT" ] && ok "every park call passes expected_status=dispatching" \
+[ -z "$WRONG_EXPECT" ] && ok "every rebase-decision park call passes expected_status=dispatching" \
   || bad "a park call passes a different expected_status — it would strand the marker: $WRONG_EXPECT"
+WD_SRC="$(extract_block "$DISPATCHER" "gate-exile-watchdog")"
+WD_CALLS="$(printf '%s\n' "$WD_SRC" | grep -E 'gate_requeue_respecting_external[[:space:]]+"[^"]*"[[:space:]]+"needs-rebase"' | grep -vE '^[[:space:]]*#' || true)"
+N_WD="$(printf '%s\n' "$WD_CALLS" | grep -c .)"
+N_QUEUED="$(printf '%s\n' "$QUEUED_PARKS" | grep -c .)"
+if [ "$N_WD" = "1" ] && has "$WD_CALLS" '"needs-rebase" "queued"' && [ "$N_QUEUED" = "1" ]; then
+  ok "the exile watchdog's ONE park goes through the helper with expected_status=queued, and no other site uses queued (ga-w5jq3d)"
+else
+  bad "watchdog park wrong: $N_WD helper park call(s) in its block (want 1, expected_status queued), $N_QUEUED queued-expecting park call(s) in the file (want 1) — expected_status=dispatching there would make its own queued label 'foreign' and it would never park: [$WD_CALLS]"
+fi
 for S in $SITES; do
   SRC="$(extract_block "$DISPATCHER" "ga-8dehbc-park-$S")"
   C="$(printf '%s\n' "$SRC" | grep -cE 'gate_requeue_respecting_external "\$MARKER_ID" "needs-rebase" "dispatching"')"

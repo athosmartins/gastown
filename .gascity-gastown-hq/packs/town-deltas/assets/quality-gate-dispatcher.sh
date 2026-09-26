@@ -3862,9 +3862,12 @@ read_rebase_attempt() {
 # dedup) after it has sat exiled for longer than $escalate_after_seconds.
 #
 # Deliberately marker-scoped only — it mails Mayor with the marker id and
-# parks the marker at gate-status:needs-rebase via the same set_gate_status()
-# the attempt-based escalation paths use (so it gets identical dashboard
-# visibility and stops occupying the unreachable tier-6 slot), but does NOT
+# parks the marker at gate-status:needs-rebase through
+# gate_requeue_respecting_external (expected_status `queued`) — the same
+# compare-before-write the dispatcher's other park/requeue writers use
+# (ga-8dehbc, ga-w5jq3d), so a transition another actor made after the
+# snapshot is respected, not overwritten. A parked marker gets identical
+# dashboard visibility and stops occupying the unreachable tier-6 slot. It does NOT
 # also mirror a label onto the source bead the way Step 4c does — that
 # mirroring needs BEAD_ID/BEAD_CITY resolution which only runs post-claim
 # (Step 2+), and keeping this watchdog independent of claim state is exactly
@@ -3874,7 +3877,7 @@ read_rebase_attempt() {
 gate_exile_watchdog_sweep() {
   local markers_json="$1" escalate_after="${2:-86400}" now="${3:-}"
   case "$now" in ''|*[!0-9]*) now=$(date -u +%s) ;; esac
-  local ids marker_id since_epoch elapsed
+  local ids marker_id since_epoch elapsed _RQ_RC
   ids=$(printf '%s\n' "$markers_json" | jq -r '
     .[] | select(
       ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0
@@ -3945,11 +3948,41 @@ gate_exile_watchdog_sweep() {
       # puts all three writes on the identical success condition.
       if gc --city "$GC_CITY" mail send mayor \
         -s "Gate: exiled marker $marker_id starved ${elapsed}s behind a non-emptying queue (ga-faw5o)" \
-        -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. Parked at gate-status:needs-rebase. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
-        bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalating to Mayor now and parking at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
-        bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
-        # park-raw-ok: this parks a QUEUED marker from a once-per-sweep snapshot (expected_status would be `queued`, not `dispatching`), and the Mayor mail above already says "Parked" — a skipped write would make it false. Needs its own ordering decision, tracked in ga-w5jq3d.
-        set_gate_status "$marker_id" "needs-rebase"  # park-raw-ok: see the line above (ga-w5jq3d)
+        -m "Marker $marker_id has carried a rebase-fail exile label for $((elapsed/3600))h without ever being re-selected — the normal attempt-based escalation (Step 4c) never ran because tier 6 is only reached when every healthy tier is empty, which this queue never does. This is DEFEITO 3 from ga-faw5o. The dispatcher now tries to park it at gate-status:needs-rebase; that park is skipped if another actor moved or closed the marker first, so the marker's own gate-status label — not this mail — says where it is. bd show $marker_id for branch/bead details; needs a human look (rebase by hand, or remove the exile label to re-anchor)." 2>/dev/null; then
+        # ga-w5jq3d (a follow-up bead of ga-8dehbc, not one of the gate rounds above — the 25/09 incident class):
+        # the park used to be a raw set_gate_status, which strips EVERY gate-status:* and writes
+        # the target, so a transition another actor (the Mayor, a watchdog) made after the
+        # once-per-sweep $markers_json snapshot was erased by this very write. It now goes
+        # through gate_requeue_respecting_external <id> needs-rebase queued: it reads the marker
+        # back and, if the marker is closed or carries a gate-status:* that is neither `queued`
+        # (this sweep's own) nor `needs-rebase` (the target), it writes NOTHING. Decided here:
+        #  * the park stays AFTER the mail (round 2 above). The mail cannot know whether the park
+        #    will happen, so it no longer says "Parked": it says the park is attempted and that
+        #    the marker's gate-status label is the truth.
+        #  * the comment and the dedup label come AFTER the write and only when it returned 0. A
+        #    marker that was not parked gets neither: "Parked at ..." would be false on it, and
+        #    gate:exile-escalated on it would exclude it from this watchdog for good although
+        #    nobody parked it. A needs-rebase ALREADY on the marker (the Mayor got there first)
+        #    is not foreign — the helper excludes its own target — so that is a normal,
+        #    idempotent park: the marker IS at needs-rebase, and the comment and label are true.
+        #  * respected (rc GATE_REQUEUE_RESPECTED_RC) or failed write: warn only, no dedup label.
+        #    If the marker comes back to queued still carrying the exile labels (a hand requeue) a
+        #    later sweep escalates it again, once per return. A failed write (unreachable with the
+        #    real set_gate_status, which swallows bd errors — kept as the inert branch) leaves it
+        #    queued, so every sweep retries it and re-mails until a write lands.
+        #  * the rc constant is read as ${GATE_REQUEUE_RESPECTED_RC:-} below, not by its bare name:
+        #    it is defined far below this function, and under `set -u` an unbound name would abort
+        #    the WHOLE sweep. "Cannot tell respected from failed" takes the inert FAILED branch.
+        _RQ_RC=0
+        gate_requeue_respecting_external "$marker_id" "needs-rebase" "queued" || _RQ_RC=$?
+        if [ "$_RQ_RC" = "0" ]; then
+          bd -C "$GC_CITY" comment "$marker_id" "Gate WATCHDOG (ga-faw5o defeito 3): this marker has carried a rebase-fail exile label for $((elapsed/3600))h — past the ${escalate_after}s escalation threshold — without its retry counter ever advancing, because the queue never emptied down to tier 6 (the only tier a has_rebase_fail marker is reachable from). Escalated to Mayor and PARKED at gate-status:needs-rebase instead of waiting indefinitely on a selection that may never come. Remove the gate:exiled-tier5:N label to force a re-anchor into the healthy queue if the underlying branch is actually fine." 2>/dev/null || true
+          bd -C "$GC_CITY" label add "$marker_id" "gate:exile-escalated" -q 2>/dev/null || true
+        elif [ "$_RQ_RC" = "${GATE_REQUEUE_RESPECTED_RC:-}" ]; then
+          warn "Marker $marker_id: exile-watchdog did NOT park it — another actor moved or closed the marker after this sweep read it, and that transition stands (ga-w5jq3d). No marker comment and no gate:exile-escalated: nothing was parked, so a later sweep re-evaluates it if it returns to gate-status:queued. The Mayor mail already went out (it precedes the write) and says the park is only attempted."
+        else
+          warn "Marker $marker_id: exile-watchdog park write FAILED (rc=$_RQ_RC) — the marker is not known to be parked, so no marker comment and no gate:exile-escalated; it is retried on a later sweep (ga-w5jq3d)."
+        fi
       else
         warn "Could not mail Mayor for exile-watchdog escalation on $marker_id — leaving gate:exile-escalated unset and gate-status:queued untouched so this marker is retried on a later sweep instead of permanently dropped."
       fi
@@ -5461,8 +5494,13 @@ gate_full_suite_verdict() {
 #     tail). A needs-rebase ALREADY on the marker is not "foreign"
 #     (the helper excludes its own target), so the park still runs in full.
 #     gate-8dehbc-park-external.selftest.sh locks the class of raw needs-rebase
-#     writers (waive with `# park-raw-ok: why`). The one waived writer is the
-#     exile watchdog's park (gate_exile_watchdog_sweep), tracked in ga-w5jq3d.
+#     writers (waive with `# park-raw-ok: why`). ga-w5jq3d closed the one waived
+#     writer, the exile watchdog's park (gate_exile_watchdog_sweep): it goes
+#     through the helper too, with expected_status `queued` (it holds a marker
+#     read from a gate-status:queued snapshot, not a `dispatching` claim), and
+#     no waiver is left. Its comment and gate:exile-escalated label are written
+#     only after a park that returned 0, and its Mayor mail (sent before the
+#     write) no longer says "Parked". gate-exile-watchdog.selftest.sh locks it.
 GATE_RETRY_COOLDOWN_SECONDS="${GATE_RETRY_COOLDOWN_SECONDS:-900}"
 case "$GATE_RETRY_COOLDOWN_SECONDS" in ''|*[!0-9]*) GATE_RETRY_COOLDOWN_SECONDS=900 ;; esac
 GATE_CLEAN_RETRY_HARD_CAP="${GATE_CLEAN_RETRY_HARD_CAP:-7}"
