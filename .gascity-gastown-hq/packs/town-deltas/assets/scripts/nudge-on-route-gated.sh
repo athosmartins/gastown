@@ -44,8 +44,12 @@
 # store (gnr_store_map) skips the readiness and holder checks entirely
 # (degraded.store_unknown); and a `gc session list` failure falls back to nudging
 # the target by name (degraded.members_lookup_failed). Lines of the event stream
-# that are not JSON are skipped WITHOUT a count (selftest 15 pins that); an event
-# that is JSON but unusable is counted (degraded.malformed_events).
+# that are not JSON are skipped WITHOUT a count (selftest 15 pins that). An event that
+# is JSON but throws while it is read (a payload/metadata of the wrong type) is counted
+# in degraded.malformed_events; one that simply carries no payload.bead is not a bead
+# event and is skipped uncounted. A veto lib (pool-probe-vetoes.sh) that cannot be
+# loaded means "what do the pools refuse?" is unknown: nothing is suppressed on that
+# guess (the legacy wake happens) and degraded.veto_lib_unavailable counts it.
 #
 # Measurement: every run appends ONE json line to
 # $GNR_STATE_DIR/nudge-on-route-gated.jsonl with the routed pairs the legacy
@@ -76,13 +80,20 @@ GNR_RUNLOG="$GNR_STATE_DIR/nudge-on-route-gated.jsonl"
 GNR_LOCK_DIR="$GNR_STATE_DIR/nudge-on-route-gated.lock.d"
 GNR_RUNLOG_MAX_LINES="${GNR_RUNLOG_MAX_LINES:-3000}"
 
-# Labels that mean "a pool worker will NOT pick this bead up". Deliberately the
-# INTERSECTION of the dog, wa-worker and ps-worker routed-pool probes (verified
-# against agents/wa-worker + agents/ps-worker prompt.template.md and the dog
-# probe in the gastown.dog prompt on 2026-09-25) — a label only one pool
-# excludes would suppress a wake another pool would have acted on. Prefix
-# families (pool:refused*, pilot:held*) are handled in gnr_classify.
-GNR_NOT_READY_LABELS='["auto-refino:escalated","auto-refino:refining","ctx:thin","exec:manual","gate:queued","gate:reviewing","needs-human","needs-human-decision","needs:engine-window","on-device","phone-proxy","pilot:no-auto-dispatch","refino:info-gap","refino:policy-gap","story:blocked","story:epic","story:needs-approval","story:needs-device","story:needs-human","story:refinement-in-progress","story:refino-escalado","story:refino-review","story:unrefined"]'
+# What a pool worker's probe REFUSES (labels, prefix families, epics, an unexpired hold) lives in ONE
+# lib shared with quality-gate-dispatcher.sh: pool-probe-vetoes.sh (ga-aijm2v.5, gate round 3 —
+# the gate's Mayor-page decision used to keep its own, smaller idea of it). Here it is used in
+# `all` mode: the INTERSECTION of the dog, wa-worker and ps-worker probes, because a label only
+# ONE pool refuses must not silence a wake another pool would have acted on. (The gate uses the
+# union: the safe error there is the opposite one.) The lib is read from beside this script; if it
+# cannot be loaded, gnr_classify suppresses NOTHING on that guess and counts it
+# (degraded.veto_lib_unavailable) — a redundant wake only costs tokens, a wrong suppression could
+# starve a bead.
+GNR_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$GNR_SELF_DIR/pool-probe-vetoes.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$GNR_SELF_DIR/pool-probe-vetoes.sh"
+fi
 
 gnr_log() { printf 'nudge-on-route-gated: %s\n' "$*" >&2; }
 gnr_now() { printf '%s' "${GNR_NOW:-$(date +%s)}"; }
@@ -118,24 +129,22 @@ gnr_run() {
 # each event is isolated with `try` and reported as its own "malformed" row
 # (counted in the run log), never silently dropped and never a poison pill.
 gnr_classify() {
-  jq -Rrn --argjson state "$1" --argjson now "$2" --argjson nr "$GNR_NOT_READY_LABELS" '
-    def held($now):
-      ((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:")))) as $h
-      | if ($h | length) == 0 then false
-        else ([ $h[] | select(startswith("pilot:held-until:"))
-                | ltrimstr("pilot:held-until:") | (tonumber? // empty) ]) as $until
-             # An expired held-until (max < now) releases the hold; a bare
-             # pilot:held, or a hold with no parseable deadline, is a hold.
-             | if ($until | length) > 0 then (($until | max) >= $now) else true end
-        end;
-    def not_ready($now):
-      (.labels // []) as $l
-      | any($l[]; . as $x | ($nr | index($x)) != null or ($x | startswith("pool:refused")))
-        or held($now);
+  local _cfg _defs _unavail=0
+  _cfg="$(pool_veto_cfg all 2>/dev/null)" || _cfg=""
+  _defs="${POOL_VETO_JQ_DEFS:-}"
+  if [ -z "$_cfg" ] || [ -z "$_defs" ]; then
+    # Cannot say what the pools refuse: classify with NO refusals (= wake, as the legacy order did) and
+    # say so with one "veto_unavailable" row that gnr_main counts. Never suppress a wake on a guess.
+    _cfg='{"exact":[],"prefix":[],"next_action":false}'
+    _defs='def pool_veto_reasons($now; $cfg): [];'
+    _unavail=1
+  fi
+  jq -Rrn --argjson state "$1" --argjson now "$2" --argjson cfg "$_cfg" --argjson unavail "$_unavail" "$_defs"'
     [ inputs | fromjson? | select(type == "object") ]
     | map( try { ev: ., ok: (((.payload.bead // null) != null) and ((.payload.bead.id // "") != "")) }
            catch { bad: true } ) as $x
-    | ( $x[] | select(.bad == true) | ["malformed", "-", "-"] | @tsv ),
+    | ( if $unavail == 1 then (["veto_unavailable", "-", "-"] | @tsv) else empty end ),
+      ( $x[] | select(.bad == true) | ["malformed", "-", "-"] | @tsv ),
       ( [ $x[] | select(.ok == true) | .ev ]
         | to_entries | map(.value + {_i: .key})
         | group_by(.payload.bead.id)
@@ -147,7 +156,7 @@ gnr_classify() {
             | select($t != "")
             | (if ($b.status // "") != "open" then "not_open"
                elif (($b.assignee // "") != "") then "assigned"
-               elif ($b | not_ready($now)) then "not_ready"
+               elif (($b | pool_veto_reasons($now; $cfg)) | length) > 0 then "not_ready"
                elif ($state | has($b.id + "|" + $t)) then "already_nudged"
                else "actionable" end) as $c
             | [$c, $b.id, $t] | @tsv
@@ -318,7 +327,12 @@ gnr_lock() {
   rmdir "$_gate" 2>/dev/null || true
   return "$_rc"
 }
-gnr_unlock() { rm -rf "$GNR_LOCK_DIR" 2>/dev/null || true; }
+# Only OUR lock is removed. A run slow enough to have its lock reclaimed as stale (gnr_lock_is_stale)
+# would otherwise delete its SUCCESSOR's lock at exit and let a third run start beside a live one.
+gnr_unlock() {
+  if [ "$(cat "$GNR_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then rm -rf "$GNR_LOCK_DIR" 2>/dev/null || true; fi
+  return 0
+}
 
 # Does <holders_json> mention any identity of a member? (member ids as json array)
 gnr_member_busy() {
@@ -427,7 +441,7 @@ gnr_main() {
 
   GNR_N_NUDGED=0; GNR_N_SKIPPED_BUSY=0; GNR_N_MEMBERS_FAILED=0; GNR_N_HOLDERS_UNKNOWN=0
   _c_routed=0; _c_not_open=0; _c_assigned=0; _c_not_ready=0; _c_already=0
-  _c_actionable=0; _c_ready_unknown=0; _c_not_ready_deps=0; _c_all_busy=0; _c_malformed=0
+  _c_actionable=0; _c_ready_unknown=0; _c_not_ready_deps=0; _c_all_busy=0; _c_malformed=0; _c_veto_unavail=0
   _c_nudged_pairs=0; _c_none_ok=0; _c_deferred=0; _budget_hit=0; _c_store_unknown=0
 
   # Pass 1: count + refresh already-nudged keys so a still-active routing is not
@@ -435,6 +449,7 @@ gnr_main() {
   while IFS="$(printf '\t')" read -r _class _bead _target; do
     [ -n "$_class" ] || continue
     if [ "$_class" = "malformed" ]; then _c_malformed=$((_c_malformed + 1)); continue; fi
+    if [ "$_class" = "veto_unavailable" ]; then _c_veto_unavail=$((_c_veto_unavail + 1)); continue; fi
     _c_routed=$((_c_routed + 1))
     case "$_class" in
       not_open)       _c_not_open=$((_c_not_open + 1)) ;;
@@ -505,6 +520,7 @@ EOF
     --argjson deferred "$_c_deferred" --argjson budget_hit "$_budget_hit" \
     --argjson state_reset "$GNR_N_STATE_RESET" --argjson state_write_failed "$GNR_N_STATE_WRITE_FAILED" \
     --argjson malformed "$_c_malformed" --argjson store_unknown "$_c_store_unknown" \
+    --argjson veto_unavail "$_c_veto_unavail" \
     '{ts:$ts, dur_s:$dur, routed_beads:$routed, legacy_pairs:$legacy, gated_pairs:$actionable,
       nudged_pairs:$nudged_pairs, sessions_nudged:$sessions_nudged, sessions_skipped_busy:$sessions_skipped_busy,
       suppressed:{not_open:$not_open, assigned:$assigned, not_ready_label:$not_ready, already_nudged:$already,
@@ -512,7 +528,7 @@ EOF
       degraded:{none_ok:$none_ok, members_lookup_failed:$members_failed, holders_unknown:$holders_unknown,
                 ready_unknown:$ready_unknown, deferred_over_budget:$deferred, budget_hit:$budget_hit,
                 state_reset:$state_reset, state_write_failed:$state_write_failed, malformed_events:$malformed,
-                store_unknown:$store_unknown}}' >> "$GNR_RUNLOG" 2>/dev/null || true
+                store_unknown:$store_unknown, veto_lib_unavailable:$veto_unavail}}' >> "$GNR_RUNLOG" 2>/dev/null || true
   # Keep the run log bounded.
   if [ "$(wc -l < "$GNR_RUNLOG" 2>/dev/null || echo 0)" -gt "$GNR_RUNLOG_MAX_LINES" ]; then
     tail -n "$(( GNR_RUNLOG_MAX_LINES / 2 ))" "$GNR_RUNLOG" > "$GNR_RUNLOG.tmp" 2>/dev/null && mv -f "$GNR_RUNLOG.tmp" "$GNR_RUNLOG"

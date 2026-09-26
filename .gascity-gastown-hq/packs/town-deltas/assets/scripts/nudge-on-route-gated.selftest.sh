@@ -363,6 +363,48 @@ if [ "$LEGACY" = "0" ]; then
   gnr_lock; _rc=$?
   eq "a lock held by a LIVE run is left alone (rc 1)" "$_rc:$(cat "$GNR_LOCK_DIR/pid")" "1:$LIVE"
   kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+
+  echo "== 19. the not-ready families come from the SHARED lib (pool-probe-vetoes.sh), intersection of the pools (gate round 3, blocking 2)"
+  new_case c19
+  {
+    ev 1 ga-ok        open - gastown.dog '[]'
+    ev 2 ga-blocked   open - gastown.dog '["blocked:dependency"]'
+    ev 3 ga-gnh       open - gastown.dog '["gate:needs-human:technical"]'
+    ev 4 ga-refreason open - gastown.dog '["pilot:refused-reason:scope"]'
+    ev 5 ga-textveto  open - gastown.dog '["pilot:text-veto:engine"]'
+    jq -cn '{seq:6,type:"bead.updated",payload:{bead:{id:"ga-epic-type",status:"open",issue_type:"epic",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
+    jq -cn '{seq:7,type:"bead.updated",payload:{bead:{id:"ga-epic-title",status:"open",title:"ÉPICO: migrar tudo",labels:[],metadata:{"gc.routed_to":"gastown.dog"}}}}'
+    ev 8 ga-onepool   open - gastown.dog '["delivery:pending-restart"]'
+  } > "$FX/events.jsonl"
+  ready_ids ga-ok ga-onepool
+  run_script
+  LINE="$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)"
+  eq "refused by EVERY pool (blocked:, gate:needs-human*, pilot:refused-reason:, pilot:text-veto:, epic type, EPIC title) => not_ready_label; the plain bead and the ONE-pool label stay actionable" "$(echo "$LINE" | jq -r '.suppressed.not_ready_label'):$(echo "$LINE" | jq -r '.gated_pairs')" "6:2"
+  eq "the lib loaded => nothing reported as unavailable" "$(echo "$LINE" | jq -r '.degraded.veto_lib_unavailable')" "0"
+
+  echo "== 19b. the veto lib cannot be loaded: NOTHING is suppressed on that guess (legacy wake), and it is COUNTED"
+  new_case c19b
+  mkdir -p "$SBX/nolib"; cp "$NEW_SCRIPT" "$SBX/nolib/nudge-on-route-gated.sh"
+  { ev 1 ga-ok open - gastown.dog '[]'; ev 2 ga-vetoed open - gastown.dog '["pilot:no-auto-dispatch"]'; } > "$FX/events.jsonl"
+  ready_ids ga-ok ga-vetoed
+  _SAVED_SCRIPT="$SCRIPT"; SCRIPT="$SBX/nolib/nudge-on-route-gated.sh"; run_script; SCRIPT="$_SAVED_SCRIPT"
+  LINE="$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)"
+  eq "lib absent: both beads are treated as actionable (the veto is unknown, not 'none refused' and not 'all refused')" "$(echo "$LINE" | jq -r '.gated_pairs'):$(echo "$LINE" | jq -r '.suppressed.not_ready_label')" "2:0"
+  eq "lib absent: counted in the run line" "$(echo "$LINE" | jq -r '.degraded.veto_lib_unavailable')" "1"
+  eq "lib absent: the run still woke the idle member (once per actionable bead)" "$(nudged)" "gastown.dog-1 gastown.dog-1"
+
+  echo "== 20. unlocking removes only OUR lock (gate round 3, low: a run whose lock was reclaimed must not delete its successor's)"
+  mkdir -p "$SBX/unlock-state"
+  GC_CITY="$SBX/mapcity" GNR_STATE_DIR="$SBX/unlock-state" source "$NEW_SCRIPT" --lib
+  rm -rf "$GNR_LOCK_DIR"; mkdir "$GNR_LOCK_DIR"; echo 999998 > "$GNR_LOCK_DIR/pid"
+  gnr_unlock
+  eq "a lock that now belongs to ANOTHER run survives our unlock" "$([ -d "$GNR_LOCK_DIR" ] && cat "$GNR_LOCK_DIR/pid" || echo gone)" "999998"
+  echo $$ > "$GNR_LOCK_DIR/pid"
+  gnr_unlock
+  eq "our own lock is removed" "$([ -d "$GNR_LOCK_DIR" ] && echo present || echo gone)" "gone"
+  gnr_unlock; eq "unlocking when there is no lock is harmless (rc 0)" "$?" "0"
+  rm -rf "$GNR_LOCK_DIR"; gnr_lock; gnr_unlock
+  eq "lock -> unlock round trip leaves nothing behind" "$([ -d "$GNR_LOCK_DIR" ] && echo present || echo gone)" "gone"
 fi
 
 echo
