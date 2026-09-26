@@ -39,8 +39,15 @@ How it mutates the queue safely (no engine patch, mirrors nudgequeue.WithState):
     created_at cannot be read, is left alone and counted in "kept_undecided". Likewise an
     item whose created_at cannot be read is never ranked in the dedupe (it is neither the
     survivor nor a casualty);
-  * a queue DIR that exists but has no state.json is an empty queue (summary "queue":
-    "absent", rc 0); a missing DIR is a wrong path (rc 2), and it is never created here.
+  * three states are never collapsed into two. EMPTY queue (rc 0, nothing written): a queue DIR
+    with no state.json (summary "queue": "absent"), a state.json of exactly 0 bytes ("queue":
+    "zero-length" — nudgequeue.LoadState agrees on both), and a document whose pending key is
+    absent or null (the engine tags pending/in_flight/dead `omitempty`, so a drained queue is
+    written as {} or {"dead":[...]}). CANNOT TELL (rc 2, nothing written): a missing DIR (a wrong
+    path — never created here), unparseable JSON (a whitespace-only file included), a top level
+    that is not an object, or a pending/dead key that is PRESENT but not a list.
+  * every run — a failed one too — appends its summary to --log, so the before/after record has no
+    holes where the errors are.
 
 Default is a DRY RUN; the order passes --apply.
 """
@@ -58,6 +65,9 @@ import tempfile
 # the stripped message start. Keep this list to pure notices: anything that carries
 # a task or feedback must never be added here.
 WARNING_PREFIXES = ("check for assigned work",)
+
+ABSENT = object()            # read_state(): queue dir exists, no state.json yet (an empty queue)
+ZERO_LENGTH = object()       # read_state(): state.json exists with 0 bytes (an empty queue; LoadState agrees)
 
 DEAD_REASON = "superseded"   # engine terminal state for a queued nudge made moot
 MAX_MOVES_DEFAULT = 1000     # a queue this size is not a normal cleanup — stop and say so
@@ -215,7 +225,13 @@ def run(args):
     def evaluate(state):
         if not isinstance(state, dict):
             raise ValueError("unrecognised queue shape (top level is not an object)")
+        # The engine's State tags pending/in_flight/dead `omitempty` (nudgequeue/state.go), so a queue with
+        # nothing pending is written as {} or {"dead":[...]}: the key is ABSENT (or, for Go's tolerant
+        # decoder, null). Absent/null is an EMPTY list — not an error. A key that is PRESENT with anything
+        # but a list of id-bearing items is a shape we cannot vouch for: that one stays an error.
         pending = state.get("pending")
+        if pending is None:
+            pending = []
         if not isinstance(pending, list) or not all(isinstance(i, dict) and i.get("id") for i in pending):
             raise ValueError("unrecognised queue shape (pending is not a list of items with ids)")
         move, undecided = plan(pending, live, snapshot_started)
@@ -229,23 +245,47 @@ def run(args):
         return move
 
     def read_state():
-        """The queue state, or None when the queue DIR exists but holds no state.json yet (an empty
-        queue, reported as such: summary["queue"] = "absent"). A missing DIR is a wrong path — an
-        error, never 'empty'."""
+        """The queue state. Three different things must never collapse into one value:
+          * ABSENT      — the queue DIR exists but holds no state.json yet: an empty queue;
+          * ZERO_LENGTH — a state.json of exactly 0 bytes: an empty queue too (nudgequeue.LoadState
+                          returns State{} for a missing file and for len(data)==0; a whitespace-only
+                          file is a parse error THERE as well, so it is one here);
+          * the parsed document otherwise (a JSON null decodes to an empty State in Go: {}).
+        A missing DIR is a wrong path — an error, never 'empty'; unparseable JSON is an error."""
         try:
             with open(state_path) as fh:
-                return json.load(fh)
+                raw = fh.read()
         except FileNotFoundError:
             if os.path.isdir(qdir):
-                return None
+                return ABSENT
             raise
+        if len(raw) == 0:
+            return ZERO_LENGTH
+        doc = json.loads(raw)     # a bad document raises ValueError (JSONDecodeError) -> rc 2 below
+        return {} if doc is None else doc
 
     def evaluate_or_empty(state):
-        if state is None:
-            summary.update(queue="absent", pending_before=0, warnings_before=0,
-                           moved_dup=0, moved_gone=0, kept_undecided=0)
+        if state is ABSENT or state is ZERO_LENGTH:
+            summary.update(queue="absent" if state is ABSENT else "zero-length", pending_before=0,
+                           warnings_before=0, moved_dup=0, moved_gone=0, kept_undecided=0)
             return {}
         return evaluate(state)
+
+    def emit(code):
+        """Print the summary and append it to the run log. A FAILED run is logged too: the log is the
+        before/after record, and a record that only exists for the runs that worked has its holes
+        exactly where the failures are."""
+        line = json.dumps(summary, ensure_ascii=False)
+        print(line)
+        if args.log:
+            try:
+                os.makedirs(os.path.dirname(args.log), exist_ok=True)
+                with open(args.log, "a") as fh:
+                    fh.write(line + "\n")
+            except OSError as exc:
+                # A failure to append must be seen, not swallowed — and must not change the run's own rc.
+                print("nudge-queue-hygiene: could not append to %s: %s" % (args.log, exc), file=sys.stderr)
+        return code
 
     try:
         if not args.apply:
@@ -266,9 +306,12 @@ def run(args):
                         raise ValueError("refusing to move %d items (> --max-moves %d)" % (len(move), args.max_moves))
                     if move:
                         stamp = now_go_ts()
-                        keep, dead = [], state.setdefault("dead", [])
+                        dead = state.get("dead")
+                        if dead is None:      # absent or null = empty (omitempty); we are about to fill it
+                            dead = state["dead"] = []
                         if not isinstance(dead, list):
                             raise ValueError("unrecognised queue shape (dead is not a list)")
+                        keep = []
                         for it in state["pending"]:
                             if it["id"] in move:
                                 it["dead_at"] = stamp
@@ -283,19 +326,9 @@ def run(args):
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     except (OSError, ValueError) as exc:
         summary["error"] = str(exc)
-        print(json.dumps(summary, ensure_ascii=False))
-        return 2
+        return emit(2)
 
-    print(json.dumps(summary, ensure_ascii=False))
-    if args.log:
-        try:
-            os.makedirs(os.path.dirname(args.log), exist_ok=True)
-            with open(args.log, "a") as fh:
-                fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            # The run log is the before/after record: a failure to append must be seen, not swallowed.
-            print("nudge-queue-hygiene: could not append to %s: %s" % (args.log, exc), file=sys.stderr)
-    return 0
+    return emit(0)
 
 
 def main(argv=None):

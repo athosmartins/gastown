@@ -228,6 +228,79 @@ eq "and this script never creates the engine's directory" "$([ -e "$SBX/no-such-
 python3 "$HYG" --queue-dir "$SBX/no-such-dir/nudges" --sessions-file "$SF" --city "$SBX" >/dev/null; rc=$?
 eq "and in dry-run mode" "$rc" "2"
 
+echo "== 14. an EMPTY queue is not an error, in every shape the engine can write it (gate round 3, blocking 1)"
+# nudgequeue.State (internal/nudgequeue/state.go:52-56) tags pending / in_flight / dead ALL `omitempty`, so a
+# queue with nothing pending is serialised as {} or {"dead":[...]} — the key is ABSENT, not []. And LoadState
+# (state.go:125-141) returns an empty State for a missing file AND for len(data)==0 (exactly zero bytes; a
+# whitespace-only file is a JSON parse error there too). Rounds 1-2 built every fixture with jq '{pending: .}',
+# which always writes a pending array, so the shape the engine produces the moment the queue drains — the state
+# these rules exist to produce — never reached the code. (Fixtures below follow those tags; the real Go marshal
+# was not run.)
+shape_case() { # <name> <raw file content, '' = zero-byte file> <expected .queue label, '-' = none>
+  new_case "$1"; sessions gastown.dog-1 > "$SF"
+  printf '%s' "$2" > "$Q/state.json"
+  local before="$(cksum < "$Q/state.json") $(stat -f %z "$Q/state.json")" mode out rc
+  for mode in apply dry; do
+    if [ "$mode" = apply ]; then out="$(hyg --apply 2>"$SBX/$1.err")"; rc=$?; else out="$(hyg 2>"$SBX/$1.err")"; rc=$?; fi
+    eq "$1 [$mode]: rc 0 (an empty queue is not an error)" "$rc" "0"
+    eq "$1 [$mode]: nothing pending, said out loud" "$(echo "$out" | jq -r '.pending_before // "missing"')" "0"
+    eq "$1 [$mode]: queue label" "$(echo "$out" | jq -r '.queue // "-"')" "$3"
+    eq "$1 [$mode]: no traceback" "$(grep -c Traceback "$SBX/$1.err")" "0"
+    eq "$1 [$mode]: file byte-identical (nothing to move => no rewrite)" "$(cksum < "$Q/state.json") $(stat -f %z "$Q/state.json")" "$before"
+  done
+}
+shape_case c14a '{}' "-"
+shape_case c14b '{"dead":[{"id":"d1"}]}' "-"
+shape_case c14c '{"in_flight":[{"id":"f1"}]}' "-"
+shape_case c14d '{"pending":null,"dead":[]}' "-"
+shape_case c14e 'null' "-"
+shape_case c14f '' "zero-length"
+# ...but a queue we cannot vouch for is STILL an error, and the file is left alone (three states, not two)
+bad_shape() { # <name> <raw content> <substring the error must name>
+  new_case "$1"; sessions gastown.dog-1 > "$SF"
+  printf '%s' "$2" > "$Q/state.json"
+  local before; before="$(cksum < "$Q/state.json")"
+  local out rc; out="$(hyg --apply 2>"$SBX/$1.err")"; rc=$?
+  eq "$1: still rc 2" "$rc" "2"
+  case "$(echo "$out" | jq -r '.error // ""')" in *"$3"*) ok "$1: error names it ($3)" ;; *) bad "$1: error does not name [$3]: [$out]" ;; esac
+  eq "$1: no traceback" "$(grep -c Traceback "$SBX/$1.err")" "0"
+  eq "$1: file untouched" "$(cksum < "$Q/state.json")" "$before"
+}
+bad_shape c14g '
+' "Expecting value"                                       # whitespace-only: LoadState only forgives len(data)==0
+bad_shape c14h '{"pending":"x"}' "pending is not a list"
+bad_shape c14i '{"pending":5}' "pending is not a list"
+bad_shape c14j '{"pending":[{"no":"id"}]}' "pending is not a list"
+new_case c14k
+sessions gastown.dog-1 > "$SF"
+{ item a gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z; item b gastown.dog-1 s1 "$WARN" 2026-09-25T11:00:00Z; } | put_state '{"dead":"x"}'
+hyg --apply >/dev/null 2>&1; rc=$?
+eq "c14k: a dead that is present but not a list is an error when a move needs it (rc 2)" "$rc" "2"
+eq "c14k: and nothing moved" "$(pids '.pending[].id')" "a b"
+new_case c14l
+sessions gastown.dog-1 > "$SF"
+{ item a gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z; item b gastown.dog-1 s1 "$WARN" 2026-09-25T11:00:00Z; } | put_state '{"dead":null}'
+hyg --apply >/dev/null 2>&1; rc=$?
+eq "c14l: dead:null is an empty dead list (Go accepts null for a slice): rc 0" "$rc" "0"
+eq "c14l: the duplicate went to dead" "$(pids '.dead[].id')" "a"
+
+echo "== 15. a FAILED run leaves a record in the jsonl too (the before/after measurement must not have holes where the errors are)"
+new_case c15
+sessions gastown.dog-1 > "$SF"
+LOG="$SBX/c15/run.jsonl"
+echo '[1,2,3]' > "$Q/state.json"
+hyg --apply --log "$LOG" >/dev/null 2>&1; rc=$?
+eq "error run: rc 2" "$rc" "2"
+eq "error run: one jsonl line, carrying the error" "$(wc -l < "$LOG" | tr -d ' '):$(tail -1 "$LOG" | jq -r '.error | length > 0')" "1:true"
+{ item a gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z; } | put_state
+hyg --apply --log "$LOG" >/dev/null 2>&1; rc=$?
+eq "ok run: rc 0" "$rc" "0"
+eq "ok run appends a second line without an error" "$(wc -l < "$LOG" | tr -d ' '):$(tail -1 "$LOG" | jq -r '.error // "none"')" "2:none"
+echo '[1,2,3]' > "$Q/state.json"
+hyg --apply --log /dev/null/cannot/run.jsonl >/dev/null 2>"$SBX/c15.err"; rc=$?
+eq "an unwritable log does not mask the run's own rc 2" "$rc" "2"
+case "$(cat "$SBX/c15.err")" in *"could not append"*) ok "and says so on stderr" ;; *) bad "unwritable log not reported on stderr: [$(cat "$SBX/c15.err")]" ;; esac
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
