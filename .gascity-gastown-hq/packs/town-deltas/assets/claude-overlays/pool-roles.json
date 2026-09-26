@@ -153,6 +153,8 @@
  "roles": {
   "dog": {
    "overlay": "pool-dog",
+   "workdir": "own",
+   "_workdir_why": "work_dir por SESSAO (.gc/agents/dogs/<sessao>), fora da raiz. Nenhum arquivo do repo o declara (agents/dog nao existe; o city.toml so poe overlay_dir/env), entao o selftest (C) marca 'residencia NAO verificada aqui' e quem cobre e o overlay-root-leak-guard.py (le `gc config show`). O rotulo `workdir` e OBRIGATORIO em todo papel com overlay != base (gate ga-3d1wno r1).",
    "td_role": "dog",
    "agents": [
     "gastown.dog"
@@ -184,6 +186,8 @@
   },
   "wa-worker": {
    "overlay": "pool-wa-worker",
+   "workdir": "own",
+   "_workdir_why": "work_dir declarado em agents/wa-worker/agent.toml (clone do rig, nao a raiz); o selftest (C) confere o rotulo CONTRA essa config. `workdir` e OBRIGATORIO em todo papel com overlay != base (gate ga-3d1wno r1).",
    "td_role": "wa-worker",
    "agents": [
     "wa-worker"
@@ -219,6 +223,8 @@
   },
   "ps-worker": {
    "overlay": "pool-ps-worker",
+   "workdir": "own",
+   "_workdir_why": "work_dir declarado em agents/ps-worker/agent.toml (clone do rig, nao a raiz); o selftest (C) confere o rotulo CONTRA essa config. `workdir` e OBRIGATORIO em todo papel com overlay != base (gate ga-3d1wno r1).",
    "td_role": "ps-worker",
    "agents": [
     "ps-worker"

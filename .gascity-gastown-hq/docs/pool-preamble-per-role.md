@@ -121,7 +121,7 @@ Estado (ga-3d1wno): cada revisor tem `work_dir` **FIXO e próprio** — `.gc/age
 (a sonda mediu ≈ -58k tokens no 1º turno do revisor, ver o topo). O merge do overlay agora cai só no `.claude/settings.json` desses dirs, não na raiz. **Nunca `{{.AgentBase}}` no `work_dir` do revisor:** o engine resolve por SESSÃO,
 um diretório por sessão de revisor (~700/semana; o dir de dog já tem 507). Vale só no repo: **fica vivo depois do gate mergear, do reload da config (Mayor agenda) e da prova de spawn real abaixo.** Até lá os revisores seguem no `pool`, na raiz.
 O manifesto declara isso (`roles.reviewer.workdir = "own"` diz ONDE roda; `wired_overlay` só existe quando o overlay fiado difere do do papel, ex. `"pool"` enquanto `workdir = "city-root"`) e três coisas enforçam:
-1. `pool-preamble-build.selftest.sh` (C/C3): papel `city-root` só pode ter o overlay base e nenhum `work_dir`; `own` exige `work_dir` declarado E fixo (sem `{{`). As mutações partem do estado real e cobrem o incidente, o meio-revert, o template e o caminho legítimo de desligar.
+1. `pool-preamble-build.selftest.sh` (C/C3): a residência sai da config EFETIVA (`agent.toml` + patches do `city.toml`), nunca do rótulo — agente sem `work_dir`, ou com `work_dir` que resolve pra raiz (`.`, caminho absoluto, `agents/..`), só pode ter o overlay base. O rótulo `workdir` (`own`|`city-root`) é OBRIGATÓRIO em todo papel com overlay ≠ base e é conferido CONTRA a config: ausente, com typo ou em meio-revert reprova (o gate ga-3d1wno r1 mostrou que decidir pelo rótulo deixava o incidente passar com manifesto calado). `own` exige `work_dir` FIXO (sem `{{`). `work_dir` que nenhum arquivo do repo declara (hoje o dog) é um 3º estado — sai como NOTA, e quem cobre é o guard vivo. As mutações partem do estado real e cobrem o incidente verbatim, o rótulo calado e com typo, a raiz escrita de três jeitos, o canal patch do `city.toml`, o meio-revert, o template e o caminho legítimo de desligar.
 2. `scripts/overlay-root-leak-guard.py` (+ `.selftest.sh`, order `overlay-root-leak-guard` a cada 10 min): lê `gc config show` E os dois arquivos vivos; vermelho se agente na raiz tem overlay de papel, se dois agentes com overlays diferentes dividem um `work_dir`, ou se raiz/`.gc` já contêm chave de papel. `rc 2` = não consegui saber (nunca "limpo").
 3. Um crash do guard sai `rc 2`, não `rc 1`: erro não se passa por achado.
 
@@ -131,12 +131,13 @@ Com o gate ocioso (≤ 1 dos 3 revisores ativos), UM revisor de teste pelo mesmo
 ```bash
 CITY=/Users/athos/gt/.gascity-gastown-hq; G=$CITY/packs/town-deltas/assets/scripts/overlay-root-leak-guard.py; SHA="${TMPDIR:-/tmp}/ovl-root-before.sha"
 gc session list --json | jq -r '.sessions[] | select(.template=="gate-reviewer") | [.session_name,.state,.work_dir] | @tsv'  # 0. o reload pegou? sessões NOVAS: work_dir = $CITY/.gc/agents/gate-reviewer
-python3 $G --no-alarm; echo "guard rc=$?"                                    # 1. baseline: 0. Se não for 0, PARE (raiz já suja: ver ga-swnkfm)
+python3 $G --no-alarm; echo "guard rc=$?"                                    # 1. baseline: 0. Se não for 0 (rc 2 = lock ocupado ou não consegui saber: repita), PARE (raiz já suja: ver ga-swnkfm)
 shasum -a 256 $CITY/.claude/settings.json $CITY/.gc/settings.json > "$SHA"
-gc --city $CITY session new gate-reviewer --no-attach --title "prova ga-3d1wno" --json   # 2. anote .session_name (sem tarefa: nada o aciona)
+S=$(gc --city $CITY session new gate-reviewer --no-attach --title "prova ga-3d1wno" --json | jq -r .session_name); echo "session=$S"   # 2. sem tarefa: nada o aciona
+for i in $(seq 1 60); do st=$(gc --city $CITY session list --json | jq -r --arg s "$S" '.sessions[] | select(.session_name==$s) | .state'); [ "$st" = active ] && [ -s $CITY/.gc/agents/gate-reviewer/.claude/settings.json ] && break; sleep 5; done; echo "state=$st"   # 2b. ESPERE: `--no-attach` volta em state=creating (até ~210s, ga-flfo) e o overlay só cai no work_dir quando o runtime sobe. Sem esta espera 3a/3b passam NO VÁCUO. Se não chegou a active + arquivo: PARE, `gc session kill "$S"`, nada foi provado
 jq -e '.permissions.deny | contains(["Agent"])' $CITY/.gc/agents/gate-reviewer/.claude/settings.json  # 3a. true = pool-reviewer caiu NO work_dir novo (o base `pool` dá false)
-shasum -a 256 -c "$SHA"; python3 $G --no-alarm; echo "guard rc=$?"           # 3b. 2x OK e rc 0 = a raiz e o .gc/settings.json ficaram byte-idênticos
-gc session kill <session_name>                                               # 4. mate o revisor de teste
+shasum -a 256 -c "$SHA"; python3 $G --no-alarm; echo "guard rc=$?"           # 3b. 2x OK e rc 0 = a raiz e o .gc/settings.json ficaram byte-idênticos. rc 2 = lock ocupado/desconhecido: REPITA, não é "limpo"
+gc session kill "$S"                                                         # 4. mate o revisor de teste
 ```
 Vazou (3b falhou, ou o guard deu rc 1)? Reverta TUDO junto (abaixo) e limpe os dois arquivos da raiz: o merge nunca remove chave (ver o histórico no comentário do Mayor em ga-swnkfm). Nos primeiros 10 min do reload, olhe `gate-rate` e o `session-reconciler-trace`.
 A economia medida em sessão viva e a taxa de aprovação do braço novo saem dos mesmos comandos de "Verificar (depois do deploy)" abaixo, com `CUT` = o UTC do 1º revisor spawnado depois do reload.

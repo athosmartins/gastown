@@ -13,10 +13,13 @@
 #   C. FIAÇÃO    — city.toml/agent.toml: cada papel aponta pro SEU overlay e tem o TD_ROLE certo; ninguém fora do
 #                  manifesto ganhou TD_ROLE (Mayor/crews/witness seguem recebendo a doutrina inteira — fail-open); os
 #                  agentes sem dado de uso (boot/deacon/auto-refiner/context-check) seguem no overlay `pool`.
-#                  ga-swnkfm: papel com `workdir: city-root` no manifesto (sem work_dir: roda na RAIZ) só pode ter o overlay BASE
-#                  fiado — o do papel vaza pro .claude/settings.json da raiz e daí pro .gc/settings.json de TODA sessão;
-#                  `workdir: own` (hoje os revisores, ga-3d1wno) exige work_dir declarado e FIXO (sem `{{...}}`: template = um
-#                  dir por sessão). C3 são as mutações da fiação, a partir do estado real (o teste antigo EXIGIA o pool-reviewer).
+#                  ga-swnkfm: agente que RODA NA RAIZ (sem work_dir, ou work_dir que resolve pra raiz) só pode ter o overlay BASE
+#                  fiado — o do papel vaza pro .claude/settings.json da raiz e daí pro .gc/settings.json de TODA sessão. A residência
+#                  vem da config EFETIVA (agent.toml + patches do city.toml), nunca do rótulo `workdir` do manifesto (gate ga-3d1wno r1:
+#                  o rótulo calado/errado pulava o incidente); o rótulo é OBRIGATÓRIO em todo papel com overlay != base (own|city-root)
+#                  e é conferido CONTRA a config. `own` (revisores, ga-3d1wno) exige work_dir FIXO (sem `{{...}}`: template = um dir por
+#                  sessão) e não-raiz. Work_dir que nenhum arquivo do repo declara (dog) é um 3º estado: sai como NOTA, coberto pelo guard
+#                  vivo. C3 são as mutações da fiação, a partir do estado real (o teste antigo EXIGIA o pool-reviewer).
 #   D. MOTOR REAL — `gc prime --strict` (o binário VIVO) em uma cidade descartável, com um agente sintético por papel:
 #                  o texto renderizado é EXATAMENTE o que o manifesto promete; agente SEM TD_ROLE recebe o fragment
 #                  inteiro, byte a byte igual ao fragment sem guardas; toda sentinela do núcleo aparece em TODO papel;
@@ -149,7 +152,8 @@ hq, man = Path(sys.argv[1]), json.load(open(sys.argv[2]))
 city = tomllib.load(open(hq / "city.toml", "rb"))
 patches = [p for p in city.get("patches", {}).get("agent", [])]
 def effective(name):
-    """overlay_dir (último vence), env (merge aditivo) e work_dir de um agente: patches do city.toml + o próprio agent.toml."""
+    """overlay_dir (último vence), env (merge aditivo) e work_dir de um agente: patches do city.toml + o próprio agent.toml.
+    work_dir None = nenhuma fonte visível AQUI o declarou (≠ "" declarado vazio)."""
     ov, env, wd = None, {}, None
     at = hq / "agents" / name / "agent.toml"
     if at.exists():
@@ -158,7 +162,19 @@ def effective(name):
         if p.get("name") in (name, "gastown." + name) and p.get("dir", "") == "":
             ov = p.get("overlay_dir", ov); env.update(p.get("env", {})); wd = p.get("work_dir", wd)
     return ov, env, wd
-errs = []
+def residency(name, wd):
+    """ONDE o agente roda, derivado da config EFETIVA (mesma lei de overlay-root-leak-guard.resolve_workdir), nunca do rótulo do manifesto (gate ga-3d1wno r1: o
+    rótulo decidia o que a engine não lê — manifesto calado/errado pulava todo ramo do incidente e o teste passava como se soubesse).
+    'root' (sem work_dir, ou work_dir que resolve pra raiz) | 'instance' (template {{...}}: um dir por sessão) | 'own' (dir fixo, não-raiz)
+    | 'unseen' (nenhum agent.toml/patch do repo declara o work_dir — ex.: dog; o guard vivo lê `gc config show`) | 'unresolvable'."""
+    if wd is None and not (hq / "agents" / name / "agent.toml").exists(): return "unseen"
+    wd = (wd or "").strip()
+    if not wd: return "root"
+    if "{{" in wd: return "instance"
+    p = Path(wd); p = p if p.is_absolute() else hq / p
+    try: return "root" if p.resolve() == hq.resolve() else "own"
+    except (OSError, RuntimeError): return "unresolvable"
+errs, notes = [], []
 base = "packs/town-deltas/assets/claude-overlays/"
 claimed = set()
 for role, r in man["roles"].items():
@@ -170,20 +186,30 @@ for role, r in man["roles"].items():
         want = base + want_name
         # ga-swnkfm (26/09): overlay_dir faz JSON-merge em <workdir>/.claude/settings.json e o .gc/settings.json de TODAS as sessões é derivado do
         # <cidade>/.claude/settings.json. Agente SEM work_dir roda na RAIZ da cidade => só o overlay BASE é seguro ali (o pool-reviewer vazou: gate-done
-        # off + CLAUDE.md fora + memória off pra cidade inteira). O manifesto declara onde o papel roda (`workdir`); o overlay fiado tem que combinar.
-        at_root = r.get("workdir") == "city-root"
+        # off + CLAUDE.md fora + memória off pra cidade inteira). Gate ga-3d1wno r1: a residência vem da config EFETIVA (residency()), não do rótulo;
+        # o rótulo `workdir` é OBRIGATÓRIO em todo papel com overlay != base e é conferido CONTRA a config (ausente/typo/meio-revert reprovam).
+        declared, base_ov = r.get("workdir"), man["base_overlay"]
+        wired_non_base = want_name != base_ov
+        res = residency(bare, wd)
         if ov != want:
-            why = f" — papel workdir=city-root: na raiz só o overlay base `{man['base_overlay']}` é seguro (ga-swnkfm; ver overlay-root-leak-guard.py)" if at_root else ""
+            why = f" — o agente roda na RAIZ: lá só o overlay base `{base_ov}` é seguro (ga-swnkfm; ver overlay-root-leak-guard.py)" if res == "root" else ""
             errs.append(f"{ag}: overlay_dir={ov!r}, esperado {want!r}{why}")
-        if at_root and want_name != man["base_overlay"]:
-            errs.append(f"{ag}: manifesto diz workdir=city-root mas ESPERA o overlay {want_name!r} fiado — na raiz só o base `{man['base_overlay']}` é seguro (foi o incidente do ga-swnkfm, com manifesto e agent.toml concordando no vazamento); troque workdir para \"own\" (com work_dir) ou use wired_overlay = base")
-        if at_root and wd:
+        if declared not in ("own", "city-root") and (wired_non_base or declared is not None):
+            errs.append(f"{ag}: manifesto tem workdir={declared!r} (ausente = None) mas o papel fia o overlay {want_name!r}; tem que ser \"own\" ou \"city-root\" — sem o rótulo o teste não sabe onde o papel roda (foi a lacuna que deixava o incidente passar)")
+        if res == "root" and wired_non_base:
+            errs.append(f"{ag}: roda na RAIZ da cidade ({'sem work_dir' if not (wd or '').strip() else f'work_dir={wd!r} resolve pra raiz'}; lido da config efetiva, não do manifesto) e fia o overlay {want_name!r} — na raiz só o base `{base_ov}` é seguro (foi o incidente do ga-swnkfm); dê work_dir próprio e FIXO ao agente ou fie o base")
+        if declared == "own" and res == "root":
+            errs.append(f"{ag}: manifesto diz workdir=own mas o agente " + ("NÃO declara work_dir" if not (wd or "").strip() else f"tem work_dir={wd!r}, que resolve pra RAIZ da cidade") + " — ele roda na RAIZ e o overlay do papel vaza pra cidade inteira (ga-swnkfm)")
+        if declared == "city-root" and res in ("own", "instance"):
             errs.append(f"{ag}: manifesto diz workdir=city-root mas o agente tem work_dir={wd!r} — troque o manifesto para \"own\" (e religue o overlay do papel) ou tire o work_dir")
-        if r.get("workdir") == "own" and (hq / "agents" / bare / "agent.toml").exists() and not wd:
-            errs.append(f"{ag}: manifesto diz workdir=own mas o agente NÃO declara work_dir — ele roda na RAIZ e o overlay do papel vaza pra cidade inteira (ga-swnkfm)")
         # work_dir com template (`{{.AgentBase}}` etc.) o engine resolve POR SESSÃO: um diretório por sessão de revisor (~700/semana; o dir de dog já tem 507). Fixo.
-        if r.get("workdir") == "own" and wd and "{{" in wd:
+        if declared == "own" and res == "instance":
             errs.append(ag + f": work_dir={wd!r} tem template — o engine resolve `{{{{.AgentBase}}}}` por SESSÃO (um diretório por sessão de revisor, ~700/semana); use um work_dir FIXO")
+        if res == "unresolvable":
+            errs.append(f"{ag}: não consegui resolver work_dir={wd!r} — desconhecido não é 'não-raiz'")
+        # 3º estado, dito em voz alta: nenhum agent.toml/patch do repo declara o work_dir (dog). Não é 'seguro' nem 'raiz' — quem cobre é o guard vivo.
+        if res == "unseen":
+            notes.append(f"{ag}: nenhum agent.toml/patch do repo declara o work_dir — residência NÃO verificada aqui; coberta por overlay-root-leak-guard.py (lê `gc config show`)")
         # overlay_dir que NÃO existe é NO-OP SILENCIOSO no engine (internal/overlay: "se srcDir não existe, retorna nil"): a sessão nasce
         # SEM overlay — sem o deny de `rm -rf` (ga-q640n), sem RC off (wa-cy6we) e sem nenhum corte. Sem erro. Por isso o arquivo tem que existir.
         if ov and not (hq / ov / ".claude" / "settings.json").is_file(): errs.append(f"{ag}: overlay_dir aponta pra {ov!r} mas {ov}/.claude/settings.json NÃO existe (no-op silencioso: sessão sem overlay nenhum)")
@@ -202,6 +228,7 @@ for at in sorted((hq / "agents").glob("*/agent.toml")):
 for name in ("boot", "deacon", "auto-refiner", "context-check-reviewer"):
     ov, _, _ = effective(name)
     if ov != base + "pool": errs.append(f"{name}: overlay_dir={ov!r}; esperado o `pool` original (sem dado de uso para trocar)")
+for n in notes: print("      ~", n)
 for e in errs: print("      ✗", e)
 sys.exit(1 if errs else 0)
 EOF
@@ -246,10 +273,24 @@ if mode == "disabled": r["wired_overlay"] = "pool"; r["_wired_overlay_why"] = "t
 json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 EOF
 }
+man_set() { # $1=papel $2=chave $3=valor JSON | __DEL__ — muta UMA chave do manifesto (apagar chave que não existe falha: mutação que não mutou nada seria controle falso)
+  python3 - "$H/man.json" "$1" "$2" "$3" <<'EOF'
+import json, sys
+p, role, key, val = sys.argv[1:5]
+m = json.load(open(p, encoding="utf-8")); r = m["roles"][role]
+if val == "__DEL__":
+    if key not in r: sys.exit(f"man_set: {role} não tem a chave {key}")
+    del r[key]
+else:
+    r[key] = json.loads(val)
+json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+EOF
+}
 REVS="gate-reviewer refino-gate-reviewer"
-expect_wiring_fail() { # $1=descrição $2=trecho esperado
-  local o rc; o="$(wiring_check "$H" "$H/man.json" 2>&1)"; rc=$?
-  if [ $rc -ne 0 ] && echo "$o" | grep -q -F -- "$2"; then ok "reprova: $1"; else bad "fiação NÃO reprovou (rc=$rc): $1 — esperava '$2'"; echo "$o" | sed 's/^/      /' | head -5; fi
+expect_wiring_fail() { # $1=descrição $2...=trechos esperados (TODOS têm que aparecer: cada um é uma trava diferente)
+  local d="$1" o rc n miss=""; shift; o="$(wiring_check "$H" "$H/man.json" 2>&1)"; rc=$?
+  for n in "$@"; do echo "$o" | grep -q -F -- "$n" || miss="$miss '$n'"; done
+  if [ $rc -ne 0 ] && [ -z "$miss" ]; then ok "reprova: $d"; else bad "fiação NÃO reprovou (rc=$rc): $d — faltou:${miss:- (rc=0)}"; echo "$o" | sed 's/^/      /' | head -5; fi
 }
 reset_hq; if o="$(wiring_check "$H" "$H/man.json" 2>&1)"; then ok "controle positivo: cópia intacta da fiação REAL (revisor com work_dir próprio + pool-reviewer) passa"; else bad "cópia intacta da fiação deveria passar"; echo "$o" | sed 's/^/      /' | head -5; fi
 reset_hq; for r in $REVS; do dropline "$H/agents/$r/agent.toml" 'work_dir'; done
@@ -262,6 +303,26 @@ reset_hq; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/p
 expect_wiring_fail "meio-revert: agent.toml voltou ao pool e sem work_dir, mas o manifesto ainda diz own + pool-reviewer" "overlay_dir="
 reset_hq; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'work_dir = ".gc/agents/'"$r"'"' 'work_dir = ".gc/agents/{{.AgentBase}}"'; done
 expect_wiring_fail "work_dir com template {{.AgentBase}} (um diretório por SESSÃO de revisor, ~700/semana)" "tem template"
+# Gate ga-3d1wno r1 (4 estados reproduzidos pelo revisor): a residência vinha do RÓTULO do manifesto, mas a engine age sobre o work_dir REAL. Manifesto calado,
+# com typo ou errado pulava todo ramo do incidente e a fiação PASSAVA — o mesmo resultado de "sei que é seguro". Agora a residência sai da config efetiva.
+reset_hq; man_set reviewer workdir __DEL__; for r in $REVS; do dropline "$H/agents/$r/agent.toml" 'work_dir'; done
+expect_wiring_fail "INCIDENTE VERBATIM (eb4ef5b6b): manifesto SEM a chave workdir + revisor sem work_dir + pool-reviewer — o rótulo calado não pode esconder a raiz" "roda na RAIZ" "workdir=None"
+reset_hq; man_set reviewer workdir '"city_root"'; for r in $REVS; do dropline "$H/agents/$r/agent.toml" 'work_dir'; done
+expect_wiring_fail "typo no rótulo (city_root) + sem work_dir + pool-reviewer" "roda na RAIZ" "workdir='city_root'"
+reset_hq; man_set reviewer workdir __DEL__
+expect_wiring_fail "config SEGURA (work_dir próprio) mas rótulo ausente: papel novo sem workdir não passa calado" "workdir=None"
+reset_hq; man_set dog workdir __DEL__
+expect_wiring_fail "mesmo rótulo obrigatório no papel cujo work_dir o repo não enxerga (dog)" "gastown.dog: manifesto tem workdir=None"
+for wd_root in . "$H" agents/..; do
+  reset_hq; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'work_dir = ".gc/agents/'"$r"'"' 'work_dir = "'"$wd_root"'"'; done
+  expect_wiring_fail "workdir=own com work_dir='$wd_root' (= a raiz da cidade, escrito de outro jeito)" "roda na RAIZ" "resolve pra RAIZ"
+done
+reset_hq; dropline "$H/agents/wa-worker/agent.toml" 'work_dir'
+expect_wiring_fail "a regra vale pra TODO papel, não só o revisor: wa-worker sem work_dir com overlay pool-wa-worker" "wa-worker: roda na RAIZ"
+reset_hq; printf '\n[[patches.agent]]\nname = "gastown.dog"\ndir = ""\nwork_dir = "."\n' >> "$H/city.toml"
+expect_wiring_fail "canal patch do city.toml: dog ganha work_dir='.' (raiz) — antes nenhum teste olhava esse canal" "gastown.dog: roda na RAIZ"
+reset_hq; o="$(wiring_check "$H" "$H/man.json" 2>&1)"
+if echo "$o" | grep -q -F "gastown.dog: nenhum agent.toml/patch do repo declara o work_dir"; then ok "3º estado dito em voz alta: work_dir do dog invisível ao repo sai como NOTA (não passa em silêncio)"; else bad "o 3º estado (dog sem work_dir visível) não foi reportado"; echo "$o" | sed 's/^/      /' | head -3; fi
 reset_hq; man_edit disabled; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/pool-reviewer"' 'claude-overlays/pool"'; dropline "$H/agents/$r/agent.toml" 'work_dir'; done
 if o="$(wiring_check "$H" "$H/man.json" 2>&1)"; then ok "caminho legítimo de DESLIGAR passa: workdir=city-root + wired_overlay=pool + overlay pool + sem work_dir"; else bad "o caminho legítimo de desligar o pool-reviewer deveria passar"; echo "$o" | sed 's/^/      /' | head -5; fi
 
