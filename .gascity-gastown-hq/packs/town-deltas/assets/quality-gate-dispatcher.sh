@@ -378,7 +378,12 @@ notify_author_with_fallback() {
     -s "Gate: author unreachable for $_bead_id" \
     -m "$_fail_context — could not mail ANY author candidate ($_candidates); the author was never notified. Please relay." \
     2>/dev/null || true
-  bd -C "$GC_CITY" comment "$_bead_id" \
+  # ga-aijm2v.5 gate-fix: the comment is ABOUT $_bead_id, so it goes to the store that owns that
+  # bead (BEAD_CITY, resolved per bead by resolve_bead_city) — NOT the HQ store: for a wa-/ps-/lx-
+  # bead `bd -C <HQ> comment` answers "no issue found", and `2>/dev/null || true` turned that into
+  # a trace that silently never landed while this comment promised one. HQ (GC_CITY) is only the
+  # fallback for a caller that runs before BEAD_CITY is resolved. `gc mail` stays city-level.
+  bd -C "${BEAD_CITY:-$GC_CITY}" comment "$_bead_id" \
     "Author-notify FAILED for every candidate ($_candidates) for: $_fail_context — escalated to mayor by mail instead so this failure stays visible (ga-fe5at)." \
     2>/dev/null || true
   return 1
@@ -437,9 +442,11 @@ nudge_author_with_fallback() {
   if [ "$_defer" = "1" ]; then
     # Filter the WHOLE list, not just $_author: when the branch is not crew/<name>/*, the caller
     # sets NOTIFY_AUTHOR="$AUTHOR", so the rewritten "mayor" sentinel is then the FIRST candidate.
+    # And the WHOLE sentinel family: for a non-ga bead the cascade above also builds the
+    # rig-qualified "mayor-<prefix>" (e.g. mayor-wa), which is the same routing sentinel.
     local _kept="" _c
     for _c in $_candidates; do
-      case "$_c" in mayor|gastown.mayor|gastown__mayor) ;; *) _kept="$_kept $_c" ;; esac
+      case "$_c" in mayor|mayor-*|gastown.mayor|gastown__mayor) ;; *) _kept="$_kept $_c" ;; esac
     done
     _candidates="${_kept# }"
   fi
@@ -455,8 +462,10 @@ nudge_author_with_fallback() {
     GATE_FAIL_MAYOR_DEFER_CTX="$_fail_context"
     GATE_FAIL_MAYOR_DEFER_CANDIDATES="$_candidates"
     # Still leave the durable trace (ga-fe5at: "not notified" must never read as "notified") —
-    # worded for what actually happened: the Mayor was NOT paged (yet).
-    bd -C "$GC_CITY" comment "$_bead_id" \
+    # worded for what actually happened: the Mayor was NOT paged (yet). In the deferred branch
+    # this comment is the ONLY bead-level record (the Mayor mail it replaces is gone), so it must
+    # reach the bead's own store (BEAD_CITY), not HQ — see the twin in notify_author_with_fallback.
+    bd -C "${BEAD_CITY:-$GC_CITY}" comment "$_bead_id" \
       "Author-nudge FAILED for every candidate ($_candidates) for: $_fail_context — the author is an ephemeral pool session, so this is expected; the Mayor was NOT paged. The FAIL path pages it only if the source bead's return to the pool cannot be verified (ga-aijm2v.5)." \
       2>/dev/null || true
     return 1
@@ -466,7 +475,7 @@ nudge_author_with_fallback() {
     -s "Gate: author unreachable for $_bead_id" \
     -m "$_fail_context — could not nudge ANY author candidate ($_candidates); the author was never notified. Please relay." \
     2>/dev/null || true
-  bd -C "$GC_CITY" comment "$_bead_id" \
+  bd -C "${BEAD_CITY:-$GC_CITY}" comment "$_bead_id" \
     "Author-nudge FAILED for every candidate ($_candidates) for: $_fail_context — escalated to mayor by mail instead so this failure stays visible (ga-o2caab)." \
     2>/dev/null || true
   return 1
@@ -2662,19 +2671,50 @@ gate_fail_author_is_ephemeral() {
   [ "$(gate_fail_assignee_action "$author" 1)" = "clear" ]
 }
 
-# gate_fail_redispatch_verified <route_obs> <route> <assignee_obs> <route_unknown> — pure;
-# echoes 1 or 0. ga-aijm2v.5 (rule 3): 1 ONLY when the FAIL path's own post-write READ-BACK
-# (not its intent) shows both facts that make "the source bead returns to the pool by itself"
-# true: gc.routed_to is the restored pool AND the assignee is cleared. Every other state —
-# read failed (UNVERIFIED), restore did not stick, assignee still held, or the route was a
-# GUESS because the home store did not resolve to a rig — is 0. An unknown must never read as
-# "fine" (ga-p5q3): a 1 here is what keeps the Mayor asleep. The strings compared are exactly
-# the ones the return-to-pool arm sets on success.
+# gate_fail_pool_read_facts <bead_json> <route> — pure; selftest-sourceable.
+# ga-aijm2v.5 gate-fix (round 1, blocking 2a). Reads ONE `bd show --json` and says which of the
+# five facts the pool worker's self-serve probe needs are NOT true in it. The probe is
+# `bd ready --metadata-field gc.routed_to=<pool> --unassigned --exclude-label gate:queued
+# --exclude-label gate:reviewing ...` (status open is implied by bd ready), so a source bead is
+# only invisible-to-nobody when ALL of these hold:
+#   route      gc.routed_to == <route>          assignee   empty
+#   status     open                             queued     no gate:queued label
+#   reviewing  no gate:reviewing label
+# Echoes:  "ok"       every fact holds;
+#          "unread"   empty / unparseable / not a bead record — the state is UNKNOWN, never "ok";
+#          otherwise  the space-separated NAMES of the facts that do not hold (e.g. "status queued").
+# The caller must feed it a read taken AFTER the last write it wants to judge: a read taken before
+# `--status open` / `label remove gate:queued` cannot see either (that was the round-1 defect).
+gate_fail_pool_read_facts() {
+  local json="${1:-}" route="${2:-}" out=""
+  { [ -n "$json" ] && [ -n "$route" ]; } || { printf 'unread'; return 0; }
+  out=$(printf '%s' "$json" | jq -r --arg route "$route" '
+    (if type == "array" then .[0] else . end) as $b
+    | if ($b | type) != "object" or (($b.id // "") == "" and ($b.status // "") == "") then "unread"
+      else ( [ (if (($b.metadata // {})["gc.routed_to"] // "") != $route then "route" else empty end),
+               (if (($b.assignee // "") != "") then "assignee" else empty end),
+               (if (($b.status // "") != "open") then "status" else empty end),
+               (if ((($b.labels // []) | index("gate:queued")) != null) then "queued" else empty end),
+               (if ((($b.labels // []) | index("gate:reviewing")) != null) then "reviewing" else empty end) ]
+             | if length == 0 then "ok" else join(" ") end )
+      end' 2>/dev/null) || out=""
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf 'unread'; fi
+}
+
+# gate_fail_redispatch_verified <bead_json> <route> <route_unknown> <no_eval> — pure; echoes 1 or 0.
+# ga-aijm2v.5 (rule 3): 1 ONLY when a READ taken after the FAIL path's last return-to-pool write
+# (<bead_json>, not the write's intent) shows every fact the pool probe needs
+# (gate_fail_pool_read_facts == ok), the route was RESOLVED rather than guessed
+# (<route_unknown> == 0), and the run was an EVALUATED FAIL (<no_eval> == 0). Everything else is 0:
+# unreadable, a fact that did not stick, a guessed route, or a reviewer-TIMEOUT run. The last one
+# matters: a no-eval run leaves gate:fix-attempt where it was (GATE_FAIL_NO_EVAL -> NEW_ATTEMPT =
+# PREV_ATTEMPT), so the fix-attempt cap never bounds that loop and nothing else would ever
+# surface it. An unknown must never read as "fine" (ga-p5q3): a 1 here is what keeps the Mayor
+# asleep, so <route_unknown> and <no_eval> default to the values that give 0.
 gate_fail_redispatch_verified() {
-  local route_obs="${1:-}" route="${2:-}" assignee_obs="${3:-}" route_unknown="${4:-1}"
-  if [ -n "$route" ] && [ "$route_unknown" = "0" ] \
-     && [ "$route_obs" = "gc.routed_to=${route} (restored)" ] \
-     && [ "$assignee_obs" = "assignee=cleared" ]; then
+  local json="${1:-}" route="${2:-}" route_unknown="${3:-1}" no_eval="${4:-1}"
+  if [ -n "$route" ] && [ "$route_unknown" = "0" ] && [ "$no_eval" = "0" ] \
+     && [ "$(gate_fail_pool_read_facts "$json" "$route")" = "ok" ]; then
     printf '1'
   else
     printf '0'
@@ -2685,33 +2725,51 @@ gate_fail_redispatch_verified() {
 # gate-FAIL path, and decides the Mayor page that nudge_author_with_fallback deferred for an
 # ephemeral pool author. It cannot be decided at nudge time: gc.routed_to is restored — and read
 # back — only AFTER that nudge, so "the bead is routed" is unknowable there.
-#   - fix-attempt cap escalation already paged the Mayor  -> do not page twice;
-#   - re-dispatch VERIFIED (route restored + assignee cleared, read back) -> the bead comes back
-#     to the pool by itself (gate:needs-fix, up to GATE_FIX_CAP attempts): no page;
-#   - anything else (stale-SHA arm, dry run, no bead, failed/UNVERIFIED read-back, route guessed)
-#     -> page exactly as before, same subject, plus a bead comment saying so.
+#   - the Mayor was ALREADY paged by the fix-attempt cap branch (GATE_FAIL_CAP_ESCALATED=1, set
+#     only after that mail actually went out, or when gate:needs-human proves an earlier cycle
+#     paged) -> do not page twice;
+#   - re-dispatch VERIFIED: a read taken AFTER the return-to-pool writes shows the source bead
+#     routed to its pool, unassigned, open, without gate:queued / gate:reviewing
+#     (gate_fail_pool_read_facts == ok), on an EVALUATED fail (gate:fix-attempt advanced, so
+#     GATE_FIX_CAP bounds the retries) -> the bead comes back to the pool by itself: no page;
+#   - anything else (stale-SHA arm, dry run, no bead, unread / did-not-stick state, guessed
+#     route, or a reviewer-TIMEOUT run, whose fix-attempt counter never advances so the cap
+#     would never bound the loop) -> page exactly as before, same subject, plus a bead comment
+#     saying so — and saying so TRUTHFULLY: if the mail itself fails, the comment says nobody
+#     was woken instead of claiming a page that never went out.
 # One-shot: clears the deferral, so a second call never pages twice. No-op when nothing deferred.
+# Known limit (accepted): this runs at the END of a `set -euo pipefail` path, so an unguarded
+# failure between the nudge and here drops the deferred page — the same abort already kills the
+# whole dispatcher sweep, which is the louder alarm.
 gate_fail_settle_deferred_mayor_wake() {
   [ "${GATE_FAIL_MAYOR_DEFERRED:-0}" = "1" ] || return 0
   local _ctx="${GATE_FAIL_MAYOR_DEFER_CTX:-gate FAIL nudge}" _cands="${GATE_FAIL_MAYOR_DEFER_CANDIDATES:-}"
-  local _bid="${BEAD_ID:-unknown}"
+  local _bid="${BEAD_ID:-unknown}" _why _outcome
   GATE_FAIL_MAYOR_DEFERRED=0
   if [ "${GATE_FAIL_CAP_ESCALATED:-0}" = "1" ]; then
-    log "  ga-aijm2v.5: Mayor NOT paged separately for $_bid — the fix-attempt cap escalation already paged it."
+    log "  ga-aijm2v.5: Mayor NOT paged separately for $_bid — the fix-attempt cap escalation already paged it (its own mail went out, or gate:needs-human shows an earlier cycle did)."
     return 0
   fi
   if [ "${GATE_FAIL_REDISPATCH_VERIFIED:-0}" = "1" ]; then
-    log "  ga-aijm2v.5: Mayor NOT paged for $_bid — an unreachable ephemeral author is expected; the source bead's return to the pool was verified post-write (route restored, assignee cleared)."
+    log "  ga-aijm2v.5: Mayor NOT paged for $_bid — an unreachable ephemeral author is expected; a re-read AFTER the return-to-pool writes shows the source bead routed to its pool, unassigned, open, without gate:queued / gate:reviewing."
     return 0
   fi
-  warn "Ephemeral-author FAIL for $_bid: the return to the pool could not be verified — paging the Mayor after all (ga-aijm2v.5)"
-  gc --city "$GC_CITY" mail send mayor \
+  if [ "${GATE_FAIL_NO_EVAL_RUN:-0}" = "1" ]; then
+    _why="this FAIL is a reviewer TIMEOUT (no evaluation): gate:fix-attempt does not advance, so the retry cap does not bound the loop and nothing else would ever surface it"
+  else
+    _why="the source bead's return to the pool could not be verified by a read taken after the FAIL's writes (route not restored, assignee not cleared, status not reopened, gate:queued / gate:reviewing not removed, the read failed, or no fix-attempt path ran)"
+  fi
+  warn "Ephemeral-author FAIL for $_bid: $_why — paging the Mayor after all (ga-aijm2v.5)"
+  if gc --city "$GC_CITY" mail send mayor \
     -s "Gate: author unreachable for $_bid" \
-    -m "$_ctx — could not nudge ANY author candidate (${_cands:-none}); the author was never notified, AND the source bead's return to the pool could not be verified after the FAIL (route not restored or not read back, assignee not cleared, or no fix-attempt path ran). Please look at $_bid." \
-    2>/dev/null || warn "Could not mail Mayor for $_bid (deferred ephemeral-author FAIL)"
-  bd -C "$GC_CITY" comment "$_bid" \
-    "Mayor PAGED (ga-aijm2v.5): the author nudge failed (ephemeral session) and the source bead's return to the pool could not be verified after this FAIL." \
-    2>/dev/null || true
+    -m "$_ctx — could not nudge ANY author candidate (${_cands:-none}); the author was never notified, AND $_why. Please look at $_bid." \
+    2>/dev/null; then
+    _outcome="Mayor PAGED (ga-aijm2v.5): the author nudge failed (ephemeral session) and $_why."
+  else
+    warn "Could not mail Mayor for $_bid (deferred ephemeral-author FAIL)"
+    _outcome="Mayor page FAILED (ga-aijm2v.5): the author nudge failed (ephemeral session) and $_why — but the mail to the Mayor could NOT be sent, so nobody was woken. Look at this bead."
+  fi
+  bd -C "${BEAD_CITY:-$GC_CITY}" comment "$_bid" "$_outcome" 2>/dev/null || true
   return 0
 }
 
@@ -8409,17 +8467,26 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         gc_ledger_append "human-touch" "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"source_daemon\":\"quality-gate-dispatcher\",\"stage\":\"executa\",\"kind\":\"technical\",\"bead_id\":\"${BEAD_ID}\",\"reason\":\"Gate fix-cap exhausted (${GATE_FIX_CAP} attempts) — circuit-breaker park (armed=$_NH_STATUS)\"}"; } 2>/dev/null || true
       # ga-aijm2v.5 wiring[cap-covered]: at exhaustion THIS branch owns the Mayor page — its own
       # once-only mail below, or the gate:needs-human label proving it was already paged on an
-      # earlier cycle. Tell the deferred-page settle (rule 3) not to add a second wake.
-      GATE_FAIL_CAP_ESCALATED=1
+      # earlier cycle. Tell the deferred-page settle (rule 3) not to add a second wake — but ONLY
+      # once one of those is TRUE: GATE_FAIL_CAP_ESCALATED is set after the mail returned success
+      # (or in the else arm, where SRC_LABELS — read before this cycle applied anything — already
+      # carried gate:needs-human), never before the mail is attempted. Setting it up front (the
+      # round-1 defect) meant a failed `gc mail send` left the settle believing the Mayor was
+      # paged, and nobody was.
       # Escalate EXACTLY once: only mail if gate:needs-human was not already set.
+      # SELFTEST-EXTRACT cap-escalation-mail: BEGIN
       if ! printf '%s' "$SRC_LABELS" | grep "gate:needs-human" >/dev/null; then
         _NH_MAIL_SUBJ="Gate needs-human: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts"
         [ "$_NH_STATUS" != "armed" ] && _NH_MAIL_SUBJ="CIRCUIT-BREAKER FAILED TO ARM: $BEAD_ID exhausted $GATE_FIX_CAP fix attempts, NOT protected"
-        gc --city "$GC_CITY" mail send mayor \
+        if gc --city "$GC_CITY" mail send mayor \
           -s "$_NH_MAIL_SUBJ" \
           -m "$(printf 'Source bead %s failed the quality gate %s times. %s\n\nBranch: %s\nRig: %s\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene.' \
             "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$BRANCH" "$RIG" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
-          2>/dev/null || warn "Could not mail Mayor escalation for $BEAD_ID"
+          2>/dev/null; then
+          GATE_FAIL_CAP_ESCALATED=1
+        else
+          warn "Could not mail Mayor escalation for $BEAD_ID — the deferred ephemeral-author page (if any) is NOT suppressed (ga-aijm2v.5)"
+        fi
         notify -t "Gate needs-human" -p 4 "$BEAD_ID exhausted $GATE_FIX_CAP gate fix attempts — Mayor escalated (armed=$_NH_STATUS)" 2>/dev/null || true
         # ga-u4yi: durable mail to the AUTHOR too — a bd comment alone left
         # thies-wa's branch rotting 20h in silence because nothing durable told
@@ -8431,7 +8498,12 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
           "$(printf 'Your branch %s (bead %s) failed the quality gate %s times. %s\n\nGate run: %s\n\nLast blocking reasons:\n%s\n\nA human or the Mayor must intervene before this can proceed.' \
             "$BRANCH" "$BEAD_ID" "$((GATE_FIX_CAP + 1))" "$(gate_needs_human_clause "$_NH_STATUS")" "$GATE_RUN_ID" "$(echo -e "$FAIL_REASONS")")" \
           "gate-fix-cap escalation on $BEAD_ID (armed=$_NH_STATUS)"
+      else
+        # gate:needs-human was already on the source bead when this FAIL began: an earlier cycle
+        # armed it AND (by the "escalate exactly once" rule above) mailed the Mayor.
+        GATE_FAIL_CAP_ESCALATED=1
       fi
+      # SELFTEST-EXTRACT cap-escalation-mail: END
       # ga-5w0hr: a needs-human bead has NO active worker — the gate just gave up
       # auto-retry. Mirror the needs-fix-branch cleanup so the bead is honestly
       # represented as "awaiting human" rather than masquerading as in-flight.
@@ -8670,11 +8742,37 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         fi
         _GFAIL_ROUTE_UNKNOWN_NOTE=""
         [ "$_GFAIL_ROUTE_UNKNOWN" = "1" ] && _GFAIL_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
-        # ga-aijm2v.5 wiring[verified] (rule 3): the READ-BACK above (not the write) is what tells
-        # us the source bead really returns to the pool by itself — route restored AND assignee
-        # cleared, on a route that was resolved rather than guessed. Only then may the settle step
-        # keep the Mayor asleep for an ephemeral author; UNVERIFIED / did-not-stick / guessed => 0.
-        GATE_FAIL_REDISPATCH_VERIFIED=$(gate_fail_redispatch_verified "${_GFAIL_ROUTE_OBS:-}" "$_GFAIL_ROUTE" "${_GFAIL_ASSIGNEE_OBS:-}" "$_GFAIL_ROUTE_UNKNOWN")
+        # ga-aijm2v.5 wiring[verified] (rule 3; gate round 1, blocking 2a): a READ taken AFTER every
+        # write above is what tells us the source bead really returns to the pool by itself. The
+        # first read (route + assignee) was taken BEFORE `--status open` and `label remove
+        # gate:queued`, so it structurally cannot see either — and the pool probe needs both, plus
+        # no gate:reviewing. One more `bd show` closes that: it feeds the VERIFIED decision (all five
+        # probe facts, on a resolved route, on an evaluated fail) AND replaces the two observations
+        # that used to be asserted by intent ("status=open", "gate:queued=removed") with what was
+        # read. Only when this read comes back clean may the settle step keep the Mayor asleep for
+        # an ephemeral author; unread / did-not-stick / guessed route / reviewer-timeout run => 0.
+        # SELFTEST-EXTRACT gate-fail-final-reread: BEGIN
+        _GFAIL_FINAL_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _GFAIL_FINAL_JSON=""
+        _GFAIL_FACTS=$(gate_fail_pool_read_facts "$_GFAIL_FINAL_JSON" "$_GFAIL_ROUTE")
+        if [ "${_GFAIL_ASSIGNEE_OBS:-}" = "assignee=cleared" ]; then
+          # the arm that issued the reopen + gate:queued removal: report what the re-read shows.
+          case "$_GFAIL_FACTS" in
+            unread)
+              _GFAIL_STATUS_OBS="status=UNVERIFIED (final re-read failed — the reopen write's outcome is unknown)"
+              _GFAIL_QUEUED_OBS="gate:queued=UNVERIFIED (final re-read failed — the removal's outcome is unknown)" ;;
+            *)
+              case " $_GFAIL_FACTS " in
+                *" status "*) _GFAIL_STATUS_OBS="status NOT open per the post-write re-read — reopen did not stick, needs investigation" ;;
+                *)            _GFAIL_STATUS_OBS="status=open" ;;
+              esac
+              case " $_GFAIL_FACTS " in
+                *" queued "*) _GFAIL_QUEUED_OBS="gate:queued=STILL PRESENT per the post-write re-read — removal did not stick, needs investigation" ;;
+                *)            _GFAIL_QUEUED_OBS="gate:queued=removed" ;;
+              esac ;;
+          esac
+        fi
+        GATE_FAIL_REDISPATCH_VERIFIED=$(gate_fail_redispatch_verified "$_GFAIL_FINAL_JSON" "$_GFAIL_ROUTE" "$_GFAIL_ROUTE_UNKNOWN" "${GATE_FAIL_NO_EVAL_RUN:-1}")
+        # SELFTEST-EXTRACT gate-fail-final-reread: END
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate FAILED (attempt ${NEW_ATTEMPT}/${GATE_FIX_CAP}) — labeled gate:needs-fix; story:in-flight + gate:reviewing (wa-qq33j) cleared. gc.routed_to restored to $_GFAIL_ROUTE (from the bead's own home store, ga-u679x2) so pool workers can self-serve this bead (ga-f54ui) — verified post-write, not assumed: $_GFAIL_ROUTE_OBS; $_GFAIL_ASSIGNEE_OBS; $_GFAIL_STATUS_OBS; $_GFAIL_QUEUED_OBS (ga-39l9z2).$_GFAIL_ROUTE_UNKNOWN_NOTE The Pilot will also re-dispatch a builder with the GATE-FEEDBACK above." 2>/dev/null || true
       fi
     fi

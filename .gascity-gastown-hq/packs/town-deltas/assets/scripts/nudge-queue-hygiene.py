@@ -33,7 +33,14 @@ How it mutates the queue safely (no engine patch, mirrors nudgequeue.WithState):
     backing bead;
   * writes NOTHING when there is nothing to move (no needless rewrite of 7 MB);
   * "cannot tell" is never "gone": if the live-session lookup fails or comes back
-    empty, only the dedupe rule runs.
+    empty, only the dedupe rule runs. The lookup is read BEFORE the lock (it can take
+    up to 90 s and the engine's lock must not be held that long), so a warning is judged
+    "gone" only if it was created BEFORE that snapshot began; a newer one, or one whose
+    created_at cannot be read, is left alone and counted in "kept_undecided". Likewise an
+    item whose created_at cannot be read is never ranked in the dedupe (it is neither the
+    survivor nor a casualty);
+  * a queue DIR that exists but has no state.json is an empty queue (summary "queue":
+    "absent", rc 0); a missing DIR is a wrong path (rc 2), and it is never created here.
 
 Default is a DRY RUN; the order passes --apply.
 """
@@ -107,32 +114,50 @@ def live_identities(sessions_doc):
     return ids or None
 
 
-def plan(pending, live):
-    """Return (to_move, reasons) where to_move maps item id -> 'dup' | 'gone'."""
-    move = {}
+def plan(pending, live, snapshot_started):
+    """Return (move, undecided).
+
+    move maps item id -> 'dup' | 'gone'. undecided is the set of ids of warnings the sessions
+    snapshot cannot vouch for, which are therefore left alone (never called 'gone').
+
+    Destructive decisions are made only on data that can support them:
+      * 'gone' needs a snapshot that was taken AFTER the warning existed. The snapshot is read
+        (up to 90 s) BEFORE the queue lock is taken, so a session created — and warned — during
+        that window is absent from it although it is alive. Only a warning with a parseable
+        created_at strictly BEFORE snapshot_started can be judged gone; a newer one, or one whose
+        created_at cannot be read, is 'undecided' (cannot tell != gone).
+      * 'dup' needs an ordering. Only items with a parseable created_at are ranked; one that
+        cannot be ordered is neither the survivor nor a casualty (it used to sort as the epoch,
+        i.e. always the OLDEST, so an unparseable stamp could lose to an older item)."""
+    move, undecided = {}, set()
     candidates = [it for it in pending if is_warning(it) and not is_claimed(it)]
 
     if live is not None:
         for it in candidates:
             agent, sid = str(it.get("agent") or ""), str(it.get("session_id") or "")
             known = (agent in live) or (sid != "" and sid in live)
-            if not known:
-                move[it["id"]] = "gone"
+            if known:
+                continue
+            created = parse_ts(it.get("created_at"))
+            if created is None or created >= snapshot_started:
+                undecided.add(it["id"])
+                continue
+            move[it["id"]] = "gone"
 
     groups = {}
     for it in candidates:
         if it["id"] in move:
             continue
         groups.setdefault((str(it.get("agent") or ""), str(it.get("session_id") or "")), []).append(it)
-    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
     for items in groups.values():
-        if len(items) < 2:
+        ranked = [it for it in items if parse_ts(it.get("created_at")) is not None]
+        if len(ranked) < 2:
             continue
         # newest wins; ties broken by id so the choice is deterministic
-        items.sort(key=lambda it: (parse_ts(it.get("created_at")) or epoch, str(it.get("id"))))
-        for it in items[:-1]:
+        ranked.sort(key=lambda it: (parse_ts(it.get("created_at")), str(it.get("id"))))
+        for it in ranked[:-1]:
             move[it["id"]] = "dup"
-    return move
+    return move, undecided
 
 
 def load_sessions(city, sessions_file):
@@ -180,38 +205,63 @@ def run(args):
     state_path = os.path.join(qdir, "state.json")
     lock_path = os.path.join(qdir, "state.lock")
 
+    # The sessions snapshot is taken BEFORE the queue lock (it can take up to 90 s; holding the
+    # engine's lock that long would stall the engine), so plan() must not call a warning "gone" on
+    # the strength of a snapshot that predates it. Stamp the moment the snapshot BEGINS.
+    snapshot_started = datetime.datetime.now(datetime.timezone.utc)
     live = live_identities(load_sessions(city, args.sessions_file))
     summary = {"ts": now_go_ts(), "apply": bool(args.apply), "live_lookup": "ok" if live is not None else "unknown"}
 
     def evaluate(state):
+        if not isinstance(state, dict):
+            raise ValueError("unrecognised queue shape (top level is not an object)")
         pending = state.get("pending")
         if not isinstance(pending, list) or not all(isinstance(i, dict) and i.get("id") for i in pending):
             raise ValueError("unrecognised queue shape (pending is not a list of items with ids)")
-        move = plan(pending, live)
+        move, undecided = plan(pending, live, snapshot_started)
         summary.update(
             pending_before=len(pending),
             warnings_before=sum(1 for i in pending if is_warning(i)),
             moved_dup=sum(1 for v in move.values() if v == "dup"),
             moved_gone=sum(1 for v in move.values() if v == "gone"),
+            kept_undecided=len(undecided),
         )
         return move
 
     def read_state():
-        with open(state_path) as fh:
-            return json.load(fh)
+        """The queue state, or None when the queue DIR exists but holds no state.json yet (an empty
+        queue, reported as such: summary["queue"] = "absent"). A missing DIR is a wrong path — an
+        error, never 'empty'."""
+        try:
+            with open(state_path) as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            if os.path.isdir(qdir):
+                return None
+            raise
+
+    def evaluate_or_empty(state):
+        if state is None:
+            summary.update(queue="absent", pending_before=0, warnings_before=0,
+                           moved_dup=0, moved_gone=0, kept_undecided=0)
+            return {}
+        return evaluate(state)
 
     try:
         if not args.apply:
             state = read_state()
-            move = evaluate(state)
+            move = evaluate_or_empty(state)
             summary["pending_after"] = summary["pending_before"] - len(move)
         else:
-            os.makedirs(qdir, exist_ok=True)
+            # The engine owns this directory. A missing one is a wrong --city/--queue-dir: fail closed
+            # (rc 2) instead of creating it and then reading an "empty" queue out of thin air.
+            if not os.path.isdir(qdir):
+                raise OSError("queue dir %s does not exist" % qdir)
             with open(lock_path, "a+") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 try:
                     state = read_state()      # fresh, UNDER the lock
-                    move = evaluate(state)
+                    move = evaluate_or_empty(state)
                     if len(move) > args.max_moves:
                         raise ValueError("refusing to move %d items (> --max-moves %d)" % (len(move), args.max_moves))
                     if move:

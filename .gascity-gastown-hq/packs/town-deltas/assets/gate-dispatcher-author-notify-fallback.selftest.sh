@@ -129,6 +129,28 @@ else
   bad "total-failure escalation incomplete — rc=$_rc mail_log='$MAIL_LOG' bd_log='$BD_COMMENT_LOG' warn_log='$WARN_LOG'"
 fi
 
+# ga-aijm2v.5 gate round 1 (blocking 1, pre-existing twin): the durable comment is ABOUT the bead, so it goes to the
+# store that OWNS the bead (BEAD_CITY, resolved per bead), not to HQ — `bd -C <HQ> comment wa-...` answers "no issue
+# found" and `2>/dev/null || true` turned that into a trace that never landed. This stub logs the -C target verbatim.
+echo "S4b: the durable comment targets the bead's OWN store (BEAD_CITY); HQ only as the fallback"
+reset_stubs
+BEAD_CITY="/rig/whatsapp_automation"
+FAIL_RECIPIENTS="oracle oracle-wa some-author"
+notify_author_with_fallback "wa-166gf" "oracle" "some-author" "subj" "body" "sibling-branch race on wa-166gf (ga-lxz5w)" >/dev/null
+case "$BD_COMMENT_LOG" in
+  *"-C /rig/whatsapp_automation comment wa-166gf"*) ok "BEAD_CITY set => the comment goes to the bead's rig store" ;;
+  *) bad "comment did not target BEAD_CITY: bd_log='$BD_COMMENT_LOG'" ;;
+esac
+case "$BD_COMMENT_LOG" in *"-C test-city"*) bad "comment ALSO/instead went to the HQ store: bd_log='$BD_COMMENT_LOG'" ;; *) ok "and none went to the HQ store" ;; esac
+reset_stubs
+unset BEAD_CITY
+FAIL_RECIPIENTS="oracle oracle-wa some-author"
+notify_author_with_fallback "wa-166gf" "oracle" "some-author" "subj" "body" "sibling-branch race on wa-166gf (ga-lxz5w)" >/dev/null
+case "$BD_COMMENT_LOG" in
+  *"-C test-city comment wa-166gf"*) ok "BEAD_CITY unresolved (a caller before resolution) => falls back to HQ, no set -u trip" ;;
+  *) bad "no HQ fallback: bd_log='$BD_COMMENT_LOG'" ;;
+esac
+
 echo "S5: empty NOTIFY_AUTHOR — returns 1 immediately, NO escalation (matches pre-existing silent-skip, not a new failure)"
 reset_stubs
 notify_author_with_fallback "wa-166gf" "" "some-author" "subj" "body" "ctx"

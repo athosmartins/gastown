@@ -35,10 +35,17 @@
 #   d. Persist the dedup key after EACH successful nudge (not once at the end),
 #      and stop starting new work once the wall-clock budget is spent.
 #
-# Three states are never collapsed: a lookup that FAILS is not "nobody is busy"
-# and not "nothing is ready". When the readiness or holder lookup fails we fall
-# back to the legacy behaviour (nudge) and count it, because suppressing a wake
-# on a guess could starve a real bead, while a redundant wake only costs tokens.
+# Where a lookup exists, three states are kept apart: a lookup that FAILS is not
+# "nobody is busy" and not "nothing is ready". When the readiness or holder lookup
+# fails we fall back to the legacy behaviour (nudge) and count it, because
+# suppressing a wake on a guess could starve a real bead, while a redundant wake
+# only costs tokens. Two paths have NO lookup and take the legacy behaviour too,
+# and both are counted, never silent: a bead whose id prefix does not resolve to a
+# store (gnr_store_map) skips the readiness and holder checks entirely
+# (degraded.store_unknown); and a `gc session list` failure falls back to nudging
+# the target by name (degraded.members_lookup_failed). Lines of the event stream
+# that are not JSON are skipped WITHOUT a count (selftest 15 pins that); an event
+# that is JSON but unusable is counted (degraded.malformed_events).
 #
 # Measurement: every run appends ONE json line to
 # $GNR_STATE_DIR/nudge-on-route-gated.jsonl with the routed pairs the legacy
@@ -250,9 +257,23 @@ gnr_state_write() {
   return 1
 }
 
-# A run that could not do its job leaves ONE line in the run log saying why, so
-# "quiet" in the log always means "nothing to do" and never "could not look".
+# A run that could not do its job leaves ONE line in the run log saying why, so a
+# quiet log does not have to mean "could not look". Where that is NOT possible the
+# reason goes to stderr instead (gnr_log) — e.g. when the state dir itself cannot be
+# created there is no run log to write to. An empty event stream is a legitimate quiet
+# run and leaves no line.
+# lock_held is rate-limited (one line per GNR_LOCK_HELD_LOG_EVERY_S): every bead.updated
+# fires this order, so a long-running holder would otherwise write one line per event and
+# push the before/after measurement lines out of the bounded run log (rotation keeps half).
 gnr_runlog_event() {
+  if [ "$1" = "lock_held" ]; then
+    _every="${GNR_LOCK_HELD_LOG_EVERY_S:-60}"
+    _mark="$GNR_STATE_DIR/.lock_held.last"
+    if [ -f "$_mark" ] && [ $(( $(gnr_now) - $(stat -f %m "$_mark" 2>/dev/null || echo 0) )) -lt "$_every" ]; then
+      return 0
+    fi
+    : > "$_mark" 2>/dev/null || true
+  fi
   jq -cn --arg ts "$(gnr_iso)" --arg what "$1" '{ts:$ts, not_run:$what}' >> "$GNR_RUNLOG" 2>/dev/null || true
 }
 # Record <key>=now and flush NOW — a run killed one nudge later must not forget it.
@@ -268,15 +289,34 @@ gnr_state_prune() {
 }
 
 # ── single-instance lock (mkdir is atomic; a stale lock is reclaimed) ─────────
-gnr_lock() {
-  if mkdir "$GNR_LOCK_DIR" 2>/dev/null; then echo $$ > "$GNR_LOCK_DIR/pid"; return 0; fi
+# Is the lock held by nobody alive? Dead owner pid, or older than any run can legitimately take.
+# A lock with no pid file yet (its owner is between mkdir and `echo $$`) is young, so not stale.
+gnr_lock_is_stale() {
   _pid="$(cat "$GNR_LOCK_DIR/pid" 2>/dev/null || true)"
   _age=$(( $(gnr_now) - $(stat -f %m "$GNR_LOCK_DIR" 2>/dev/null || echo 0) ))
-  if { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; } || [ "$_age" -gt $(( GNR_BUDGET_S + 120 )) ]; then
-    rm -rf "$GNR_LOCK_DIR"
-    if mkdir "$GNR_LOCK_DIR" 2>/dev/null; then echo $$ > "$GNR_LOCK_DIR/pid"; return 0; fi
+  { [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; } || [ "$_age" -gt $(( GNR_BUDGET_S + 120 )) ]
+}
+# Reclaiming a stale lock is serialised by a second mkdir-gate and RE-CHECKED under it. Without
+# that, two runs that both saw the same stale lock could both rm -rf it: the slower one deletes
+# the FIRST one's fresh lock and mkdirs its own, and both then run at once. A run that cannot get
+# the gate just skips (the next event or order tick retries; events stay inside the lookback).
+# A gate is held for milliseconds, so one older than 60 s belongs to a dead reclaimer and is removed
+# (that last step is not itself race-free; it needs a dead reclaimer AND two simultaneous runs).
+gnr_lock() {
+  if mkdir "$GNR_LOCK_DIR" 2>/dev/null; then echo $$ > "$GNR_LOCK_DIR/pid"; return 0; fi
+  gnr_lock_is_stale || return 1
+  _gate="$GNR_LOCK_DIR.reclaim"
+  if [ -d "$_gate" ] && [ $(( $(gnr_now) - $(stat -f %m "$_gate" 2>/dev/null || echo 0) )) -gt 60 ]; then
+    rmdir "$_gate" 2>/dev/null || true
   fi
-  return 1
+  mkdir "$_gate" 2>/dev/null || return 1
+  _rc=1
+  if gnr_lock_is_stale; then       # the lock may have been replaced by a live one since the first look
+    rm -rf "$GNR_LOCK_DIR"
+    if mkdir "$GNR_LOCK_DIR" 2>/dev/null; then echo $$ > "$GNR_LOCK_DIR/pid"; _rc=0; fi
+  fi
+  rmdir "$_gate" 2>/dev/null || true
+  return "$_rc"
 }
 gnr_unlock() { rm -rf "$GNR_LOCK_DIR" 2>/dev/null || true; }
 
@@ -289,6 +329,12 @@ gnr_member_busy() {
 # Nudges the IDLE members of the target pool (or the target itself when it has
 # no members). Sets GNR_LAST_OUTCOME: nudged | all_busy | none_ok | lookup_failed.
 # Counts land in GNR_N_* globals.
+# Known limit (accepted): ONE bead still wakes EVERY idle member of its pool, although only one
+# of them can claim it — the other wakes find the bead gone and cost a turn each. Narrowing to a
+# single member would risk waking one that cannot start (its own session may be draining), so this
+# trades a bounded number of redundant wakes for never stranding a bead. What the gating removes is
+# the much larger set of wakes for beads nobody can act on and for members that are already busy;
+# sessions_nudged vs nudged_pairs in the run log show how many redundant wakes remain.
 gnr_nudge_target() {
   _bead="$1"; _target="$2"; _store="$3"
   _holders='[]'; _holders_ok=0
@@ -344,7 +390,9 @@ EOF
 }
 
 gnr_main() {
-  mkdir -p "$GNR_STATE_DIR" || exit 0
+  # No state dir means no run log and no dedup state either: say so on stderr (the order's output)
+  # rather than exit silently, and still exit 0 so a broken path cannot crash the order loop.
+  mkdir -p "$GNR_STATE_DIR" || { gnr_log "cannot create the state dir $GNR_STATE_DIR — nothing done this run"; exit 0; }
   if ! command -v jq >/dev/null 2>&1; then
     echo "nudge-on-route-gated: jq is required but not found in PATH" >&2
     exit 1
@@ -354,7 +402,11 @@ gnr_main() {
     gnr_runlog_event lock_held
     exit 0
   fi
-  GNR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/nudge-on-route-gated.XXXXXX")" || { gnr_unlock; exit 0; }
+  GNR_RUN="$(mktemp -d "${TMPDIR:-/tmp}/nudge-on-route-gated.XXXXXX")" || {
+    gnr_log "cannot create a work dir (mktemp -d failed) — nothing done this run"
+    gnr_runlog_event workdir_failed
+    gnr_unlock; exit 0
+  }
   trap 'rm -rf "$GNR_RUN"; gnr_unlock' EXIT
   _t0="$(gnr_now)"
 
@@ -376,7 +428,7 @@ gnr_main() {
   GNR_N_NUDGED=0; GNR_N_SKIPPED_BUSY=0; GNR_N_MEMBERS_FAILED=0; GNR_N_HOLDERS_UNKNOWN=0
   _c_routed=0; _c_not_open=0; _c_assigned=0; _c_not_ready=0; _c_already=0
   _c_actionable=0; _c_ready_unknown=0; _c_not_ready_deps=0; _c_all_busy=0; _c_malformed=0
-  _c_nudged_pairs=0; _c_none_ok=0; _c_deferred=0; _budget_hit=0
+  _c_nudged_pairs=0; _c_none_ok=0; _c_deferred=0; _budget_hit=0; _c_store_unknown=0
 
   # Pass 1: count + refresh already-nudged keys so a still-active routing is not
   # pruned and re-nudged while it keeps re-emitting bead.updated.
@@ -404,7 +456,9 @@ EOF
       _budget_hit=1; _c_deferred=$((_c_deferred + 1)); continue
     fi
     _store=""
-    if gnr_store_for_bead "$_bead"; then _store="$GNR_STORE"; fi
+    if gnr_store_for_bead "$_bead"; then _store="$GNR_STORE"
+    else _c_store_unknown=$((_c_store_unknown + 1))    # no readiness/holder lookup is possible: legacy path, counted
+    fi
 
     # Readiness (dependencies, a claim that landed after the event). A FAILED
     # lookup is unknown, not "not ready": nudge as the legacy order would.
@@ -450,14 +504,15 @@ EOF
     --argjson holders_unknown "$GNR_N_HOLDERS_UNKNOWN" --argjson ready_unknown "$_c_ready_unknown" \
     --argjson deferred "$_c_deferred" --argjson budget_hit "$_budget_hit" \
     --argjson state_reset "$GNR_N_STATE_RESET" --argjson state_write_failed "$GNR_N_STATE_WRITE_FAILED" \
-    --argjson malformed "$_c_malformed" \
+    --argjson malformed "$_c_malformed" --argjson store_unknown "$_c_store_unknown" \
     '{ts:$ts, dur_s:$dur, routed_beads:$routed, legacy_pairs:$legacy, gated_pairs:$actionable,
       nudged_pairs:$nudged_pairs, sessions_nudged:$sessions_nudged, sessions_skipped_busy:$sessions_skipped_busy,
       suppressed:{not_open:$not_open, assigned:$assigned, not_ready_label:$not_ready, already_nudged:$already,
                   not_ready_deps:$not_ready_deps, all_busy:$all_busy},
       degraded:{none_ok:$none_ok, members_lookup_failed:$members_failed, holders_unknown:$holders_unknown,
                 ready_unknown:$ready_unknown, deferred_over_budget:$deferred, budget_hit:$budget_hit,
-                state_reset:$state_reset, state_write_failed:$state_write_failed, malformed_events:$malformed}}' >> "$GNR_RUNLOG" 2>/dev/null || true
+                state_reset:$state_reset, state_write_failed:$state_write_failed, malformed_events:$malformed,
+                store_unknown:$store_unknown}}' >> "$GNR_RUNLOG" 2>/dev/null || true
   # Keep the run log bounded.
   if [ "$(wc -l < "$GNR_RUNLOG" 2>/dev/null || echo 0)" -gt "$GNR_RUNLOG_MAX_LINES" ]; then
     tail -n "$(( GNR_RUNLOG_MAX_LINES / 2 ))" "$GNR_RUNLOG" > "$GNR_RUNLOG.tmp" 2>/dev/null && mv -f "$GNR_RUNLOG.tmp" "$GNR_RUNLOG"

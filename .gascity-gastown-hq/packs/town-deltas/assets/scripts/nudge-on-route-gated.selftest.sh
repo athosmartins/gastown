@@ -209,6 +209,7 @@ if [ "$LEGACY" = "0" ]; then
   eq "sessions_nudged"                                    "$(echo "$LINE" | jq -r '.sessions_nudged')" "1"
   eq "sessions_skipped_busy"                              "$(echo "$LINE" | jq -r '.sessions_skipped_busy')" "1"
   eq "suppressed.not_open"                                "$(echo "$LINE" | jq -r '.suppressed.not_open')" "2"
+  eq "degraded.store_unknown is 0 when every bead's prefix resolves" "$(echo "$LINE" | jq -r '.degraded.store_unknown')" "0"
 
   echo "== 12. a run that could not look says so: 'could not look' is never the same line as 'nothing to do'"
   new_case c12
@@ -242,6 +243,17 @@ if [ "$LEGACY" = "0" ]; then
   mkdir "$STATE/nudge-on-route-gated.lock.d"; echo 999999 > "$STATE/nudge-on-route-gated.lock.d/pid"
   run_script
   eq "a lock whose owner is dead is reclaimed and the run proceeds" "$(nudged)" "gastown.dog-1"
+  new_case c14d        # every bead.updated fires the order: a burst of skips must not flood the measurement log
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  sleep 30 & HOLDER=$!
+  mkdir "$STATE/nudge-on-route-gated.lock.d"; echo "$HOLDER" > "$STATE/nudge-on-route-gated.lock.d/pid"
+  run_script; run_script; run_script
+  eq "three overlapping skips in one burst leave ONE lock_held line" "$(grep -c lock_held "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)" "1"
+  touch -t 202001010000 "$STATE/.lock_held.last"        # age the rate-limit marker past the interval
+  run_script
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+  eq "a skip after the interval is logged again" "$(grep -c lock_held "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null)" "2"
+  eq "and none of those skips nudged anyone" "$(count_nudges)" "0"
 
   echo "== 15. one malformed event must not take the window down with it (no poison pill), and is counted"
   new_case c15
@@ -268,6 +280,89 @@ if [ "$LEGACY" = "0" ]; then
   gnr_store_for_bead wa-abc123 && eq "wa- prefix -> rig path" "$GNR_STORE" "/x/wa" || bad "wa- prefix not resolved"
   gnr_store_for_bead ga-zzz    && eq "ga- prefix -> HQ (city path)" "$GNR_STORE" "$SBX/mapcity" || bad "ga- prefix not resolved"
   gnr_store_for_bead qq-1      && bad "unknown prefix resolved to something" || ok "unknown prefix is unknown, not guessed"
+
+  echo "== 16. a bead whose prefix maps to NO store has no readiness/holder lookup: legacy path, and it is COUNTED"
+  new_case c16
+  ev 1 zz-orphan open - gastown.dog '[]' > "$FX/events.jsonl"
+  run_script
+  eq "legacy path: with no holder info both members are woken" "$(nudged)" "gastown.dog-1 gastown.dog-2"
+  eq "and the run line counts it under degraded.store_unknown" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" | jq -r '.degraded.store_unknown')" "1"
+
+  echo "== 17. exits that used to be silent now say why"
+  new_case c17
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  GNR_STATE_DIR="/dev/null/no-such-dir" run_script
+  case "$(cat "$FX/stderr.log" 2>/dev/null)" in *"cannot create the state dir"*) ok "an uncreatable state dir is reported on stderr" ;; *) bad "no stderr line for an uncreatable state dir: [$(cat "$FX/stderr.log")]" ;; esac
+  eq "and nothing was nudged" "$(count_nudges)" "0"
+  new_case c17b
+  ev 1 ga-a open - gastown.dog '[]' > "$FX/events.jsonl"; ready_ids ga-a
+  TMPDIR="$SBX/no-such-tmp" run_script
+  eq "an uncreatable work dir is a not_run line in the run log" "$(tail -1 "$STATE/nudge-on-route-gated.jsonl" 2>/dev/null | jq -r '.not_run')" "workdir_failed"
+  case "$(cat "$FX/stderr.log" 2>/dev/null)" in *"cannot create a work dir"*) ok "and on stderr" ;; *) bad "no stderr line for the work dir failure" ;; esac
+  eq "and the lock is not left behind" "$([ -d "$STATE/nudge-on-route-gated.lock.d" ] && echo left || echo free)" "free"
+  eq "and nothing was nudged" "$(count_nudges)" "0"
+
+  echo "== 18. dedup-state retention (gnr_state_prune): fresh kept; stale and unreadable dropped; a failed prune never wipes the state"
+  _iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+  GNR_NOW=1790000000; GNR_RETENTION=1h
+  GNR_STATE="$(jq -cn --arg a "$(_iso $((GNR_NOW - 600)))" --arg b "$(_iso $((GNR_NOW - 3480)))" --arg c "$(_iso $((GNR_NOW - 7200)))" \
+    '{"fresh|t":$a, "edge|t":$b, "old|t":$c, "junk|t":"not-a-date"}')"
+  gnr_state_prune
+  eq "kept: 10 min and 58 min old; dropped: 2 h old and the unparseable stamp" "$(printf '%s' "$GNR_STATE" | jq -r 'keys | join(",")')" "edge|t,fresh|t"
+  GNR_STATE='not json'; gnr_state_prune
+  eq "a prune that cannot parse the state leaves it exactly as it was" "$GNR_STATE" "not json"
+  unset GNR_NOW
+
+  echo "== 19. stale-lock reclaim is serialised by a gate and RE-CHECKED under it (two runs must not both hold the lock)"
+  # shellcheck disable=SC1090
+  GC_CITY="$SBX/mapcity" source "$NEW_SCRIPT" --lib       # fresh function definitions (section 18 left globals behind)
+  mkdir -p "$SBX/locktest"; GNR_LOCK_DIR="$SBX/locktest/lock.d"; GNR_BUDGET_S=60; GNR_NOW=""; unset GNR_NOW
+  rm -rf "$GNR_LOCK_DIR" "$GNR_LOCK_DIR.reclaim"
+  mkdir "$GNR_LOCK_DIR"; echo 999999 > "$GNR_LOCK_DIR/pid"           # a lock whose owner is dead
+  gnr_lock; _rc=$?
+  eq "an uncontended stale lock is reclaimed (rc 0)" "$_rc" "0"
+  eq "and now belongs to this process" "$(cat "$GNR_LOCK_DIR/pid")" "$$"
+  eq "and the gate is released" "$([ -d "$GNR_LOCK_DIR.reclaim" ] && echo held || echo free)" "free"
+  # Deterministic race: the FIRST look says 'stale'; before the SECOND look another run reclaims and holds a LIVE lock.
+  rm -rf "$GNR_LOCK_DIR" "$GNR_LOCK_DIR.reclaim"
+  mkdir "$GNR_LOCK_DIR"; echo 999999 > "$GNR_LOCK_DIR/pid"
+  sleep 30 & LIVE=$!
+  eval "$(declare -f gnr_lock_is_stale | sed '1s/gnr_lock_is_stale/_real_lock_is_stale/')"
+  STALE_LOOKS=0
+  gnr_lock_is_stale() {
+    STALE_LOOKS=$((STALE_LOOKS + 1))
+    if [ "$STALE_LOOKS" = "1" ]; then
+      _real_lock_is_stale; _r=$?
+      rm -rf "$GNR_LOCK_DIR"; mkdir "$GNR_LOCK_DIR"; echo "$LIVE" > "$GNR_LOCK_DIR/pid"   # the concurrent run wins
+      return "$_r"
+    fi
+    _real_lock_is_stale
+  }
+  gnr_lock; _rc=$?
+  eq "the lock was replaced by a live one between the two looks => this run backs off (rc 1)" "$_rc" "1"
+  eq "and the live run's lock is INTACT (a single check would have rm -rf'd it)" "$(cat "$GNR_LOCK_DIR/pid")" "$LIVE"
+  eq "and the gate is released" "$([ -d "$GNR_LOCK_DIR.reclaim" ] && echo held || echo free)" "free"
+  eq "the staleness was looked at twice: before and under the gate" "$STALE_LOOKS" "2"
+  kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+  GC_CITY="$SBX/mapcity" source "$NEW_SCRIPT" --lib       # restore the real gnr_lock_is_stale
+  GNR_LOCK_DIR="$SBX/locktest/lock.d"; GNR_BUDGET_S=60
+  # A gate held right now means another run is mid-reclaim: back off without touching the stale lock.
+  rm -rf "$GNR_LOCK_DIR" "$GNR_LOCK_DIR.reclaim"
+  mkdir "$GNR_LOCK_DIR"; echo 999999 > "$GNR_LOCK_DIR/pid"; mkdir "$GNR_LOCK_DIR.reclaim"
+  gnr_lock; _rc=$?
+  eq "a fresh gate (another run is mid-reclaim) => back off (rc 1)" "$_rc" "1"
+  eq "and the stale lock is left for that run" "$(cat "$GNR_LOCK_DIR/pid")" "999999"
+  touch -t 202001010000 "$GNR_LOCK_DIR.reclaim"              # a gate older than 60 s belongs to a dead reclaimer
+  gnr_lock; _rc=$?
+  eq "a gate left by a dead reclaimer is cleared and the reclaim proceeds (rc 0)" "$_rc" "0"
+  eq "and the lock is ours" "$(cat "$GNR_LOCK_DIR/pid")" "$$"
+  # A live lock is never reclaimed, gate or no gate.
+  rm -rf "$GNR_LOCK_DIR" "$GNR_LOCK_DIR.reclaim"
+  sleep 30 & LIVE=$!
+  mkdir "$GNR_LOCK_DIR"; echo "$LIVE" > "$GNR_LOCK_DIR/pid"
+  gnr_lock; _rc=$?
+  eq "a lock held by a LIVE run is left alone (rc 1)" "$_rc:$(cat "$GNR_LOCK_DIR/pid")" "1:$LIVE"
+  kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
 fi
 
 echo

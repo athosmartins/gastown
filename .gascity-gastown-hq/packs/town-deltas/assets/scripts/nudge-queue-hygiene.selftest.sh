@@ -169,6 +169,65 @@ hyg --apply --max-moves 1 >/dev/null; rc=$?
 eq "--max-moves guard exits 2" "$rc" "2"
 eq "and moved nothing" "$(pids '.pending[].id')" "a b c"
 
+echo "== 10. the sessions snapshot is read BEFORE the lock: only a warning OLDER than the snapshot can be 'gone'"
+# A session created — and warned — while the (up to 90 s) lookup was running is absent from the snapshot although
+# it is alive. created_at 2099 stands for "created after the snapshot began".
+new_case c10
+sessions gastown.dog-1 > "$SF"
+{ item fresh brand-new-session sN "$WARN" 2099-01-01T00:00:00Z
+  item old   wa-worker-adhoc-dead sX "$WARN" 2026-09-25T10:00:00Z; } | put_state
+OUT="$(hyg --apply)"
+eq "the orphan that predates the snapshot is dead-lettered, as before" "$(pids '.dead[].id')" "old"
+eq "the warning newer than the snapshot is left pending" "$(pids '.pending[].id')" "fresh"
+eq "and is reported as undecided, not silently kept" "$(echo "$OUT" | jq -r '.kept_undecided')" "1"
+new_case c10b
+sessions gastown.dog-1 > "$SF"
+{ item nostamp ghost sG "$WARN" "not-a-date"
+  item empty   ghost2 sH "$WARN" ""; } | put_state
+OUT="$(hyg --apply)"
+eq "a warning whose created_at cannot be read is never judged gone" "$(pids '.pending[].id')" "empty nostamp"
+eq "both counted as undecided" "$(echo "$OUT" | jq -r '.kept_undecided')" "2"
+
+echo "== 11. an unreadable created_at is never ranked in the dedupe (it used to sort as the epoch = always the OLDEST)"
+new_case c11
+sessions gastown.dog-1 > "$SF"
+{ item a   gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z
+  item bad gastown.dog-1 s1 "$WARN" "not-a-date"
+  item b   gastown.dog-1 s1 "$WARN" 2026-09-25T11:00:00Z; } | put_state
+hyg --apply >/dev/null
+eq "the readable pair is deduped (b wins); the unreadable one is neither survivor nor casualty" "$(pids '.pending[].id')" "b bad"
+new_case c11b
+sessions gastown.dog-1 > "$SF"
+{ item a   gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z
+  item bad gastown.dog-1 s1 "$WARN" "not-a-date"; } | put_state
+hyg --apply >/dev/null
+eq "one readable + one unreadable: nothing can be ranked, nothing moves" "$(pids '.pending[].id')" "a bad"
+
+echo "== 12. a state.json whose top level is not an object is 'unrecognised shape' (rc 2), not a traceback (rc 1)"
+new_case c12
+sessions gastown.dog-1 > "$SF"
+echo '[1,2,3]' > "$Q/state.json"
+OUT="$(hyg --apply 2>"$SBX/c12.err")"; rc=$?
+eq "exit code 2" "$rc" "2"
+eq "no Python traceback on stderr" "$(grep -c Traceback "$SBX/c12.err")" "0"
+case "$(echo "$OUT" | jq -r '.error')" in *"top level is not an object"*) ok "the summary names the shape problem" ;; *) bad "summary does not name it: [$OUT]" ;; esac
+eq "and the file is untouched" "$(jq -c . "$Q/state.json")" "[1,2,3]"
+
+echo "== 13. an existing queue dir with NO state.json is an empty queue (said out loud); a missing DIR is a wrong path"
+new_case c13
+sessions gastown.dog-1 > "$SF"
+OUT="$(hyg --apply)"; rc=$?
+eq "apply: rc 0" "$rc" "0"
+eq "apply: reported as an absent queue" "$(echo "$OUT" | jq -r '.queue // "-"')" "absent"
+eq "apply: no state.json is invented" "$([ -e "$Q/state.json" ] && echo yes || echo no)" "no"
+OUT="$(hyg)"; rc=$?
+eq "dry run: rc 0 and reported the same way" "$rc:$(echo "$OUT" | jq -r '.queue // "-"')" "0:absent"
+python3 "$HYG" --queue-dir "$SBX/no-such-dir/nudges" --sessions-file "$SF" --city "$SBX" --apply >/dev/null; rc=$?
+eq "a MISSING queue dir (wrong --city) is an error, rc 2, in apply mode" "$rc" "2"
+eq "and this script never creates the engine's directory" "$([ -e "$SBX/no-such-dir" ] && echo yes || echo no)" "no"
+python3 "$HYG" --queue-dir "$SBX/no-such-dir/nudges" --sessions-file "$SF" --city "$SBX" >/dev/null; rc=$?
+eq "and in dry-run mode" "$rc" "2"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
