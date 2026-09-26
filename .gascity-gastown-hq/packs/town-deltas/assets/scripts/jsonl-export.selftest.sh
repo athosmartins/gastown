@@ -229,6 +229,19 @@ case "$OUT" in
   *HALTED*) ok "unreadable source: HALT preserved" ;;
   *) bad "unreadable source: expected HALT, got: $OUT" ;;
 esac
+# ga-7sxdmb: the HALT is not the only trace of the don't-know — the export was also
+# never checked against the source, and every place that reports the run says so.
+case "$OUT" in
+  *"source count unavailable for wa"*"NOT verified against source"*)
+    ok "unreadable source (HALT path): logs that the export was NOT verified against the source" ;;
+  *) bad "unreadable source (HALT path): no 'NOT verified against source' log line. Output: $OUT" ;;
+esac
+grep -q 'DOG_DONE:.*HALTED.*unverified: wa' "$E2E/gc.log" \
+  && ok "unreadable source (HALT path): the DOG_DONE nudge names 'unverified: wa'" \
+  || bad "unreadable source (HALT path): DOG_DONE nudge lacks 'unverified: wa'. gc log: $(cat "$E2E/gc.log")"
+git -C "$ARCH" log -1 --format=%s | grep -q 'unverified=wa' \
+  && ok "unreadable source (HALT path): the HALT commit message records unverified=wa" \
+  || bad "unreadable source (HALT path): HALT commit message lacks unverified=wa: $(git -C "$ARCH" log -1 --format=%s)"
 
 # ── ga-7sxdmb: a partial export must never become the baseline, at ANY size ──
 # ga-fxrrav discards a short export only when its drop trips the spike check
@@ -349,6 +362,84 @@ fi
 [ ! -e "$TD_STATE/jsonl-archive" ] \
   && ok "default archive: no second archive under the owning pack's state dir" \
   || bad "default archive: a forked archive appeared at $TD_STATE/jsonl-archive"
+
+# ── ga-7sxdmb gate round 2: the THIRD STATE of the partial-export gate ───────────
+# The gate compares the export with the source's COUNT(*). When that count cannot be
+# read the gate cannot tell a partial export from a complete one. It used to answer
+# "not short" and commit the export with NO trace: byte-for-byte the output of a
+# verified-complete export. A failing count query is likeliest exactly when Dolt is
+# loaded — the truncation the gate exists for. The don't-know must be NAMED wherever
+# the run is reported: the log, the DOG_DONE summary, the archive commit message.
+# (Whether an unverifiable export still becomes the snapshot is deliberate — see the
+# comment on the gate in jsonl-export.sh; these cases pin that behaviour too.)
+unverified_seen() {  # unverified_seen <label> — the run's outputs all name the don't-know
+  case "$OUT" in
+    *"source count unavailable for wa"*"NOT verified against source"*)
+      ok "$1: logs 'source count unavailable for wa; export NOT verified against source'" ;;
+    *) bad "$1: no 'NOT verified against source' log line — a don't-know that looks like success. Output: $OUT" ;;
+  esac
+  case "$OUT" in
+    *"unverified: wa"*) ok "$1: the run summary names 'unverified: wa'" ;;
+    *) bad "$1: run summary lacks 'unverified: wa'. Output: $OUT" ;;
+  esac
+  grep -q 'DOG_DONE:.*unverified: wa' "$E2E/gc.log" \
+    && ok "$1: the DOG_DONE nudge names 'unverified: wa'" \
+    || bad "$1: DOG_DONE nudge lacks 'unverified: wa'. gc log: $(cat "$E2E/gc.log")"
+}
+
+# Case 12 — the reviewer's repro: 850 of 1000 rows, source count unreadable.
+fresh_archive unknown-partial
+run_export 1000 1000
+case "$OUT$(cat "$E2E/gc.log")" in
+  *unverified*|*"NOT verified"*) bad "verified export: must not carry the unverified marker (it would be always-on noise): $OUT" ;;
+  *) ok "verified export: no unverified marker anywhere (the signal is not always-on)" ;;
+esac
+BASE_COMMITS=$(commits)
+run_export 850 ERR
+[ "$RC" = "0" ] \
+  && ok "unverified partial (850, source ERR): exits 0" \
+  || bad "unverified partial: rc=$RC, want 0"
+unverified_seen "unverified partial (850, source ERR)"
+[ "$(head_rows)" = "850" ] && [ "$(commits)" = "$((BASE_COMMITS + 1))" ] \
+  && ok "unverified partial: archived as the snapshot, as documented (HEAD 850, +1 commit)" \
+  || bad "unverified partial: HEAD holds $(head_rows) rows, commits $BASE_COMMITS -> $(commits) — documented behaviour is 'archived, flagged'"
+git -C "$ARCH" log -1 --format=%s | grep -q 'unverified=wa' \
+  && ok "unverified partial: the archive commit message records unverified=wa" \
+  || bad "unverified partial: commit message lacks unverified=wa: $(git -C "$ARCH" log -1 --format=%s)"
+
+# Case 13 — first run (no previous snapshot, so no spike check at all), source unreadable.
+fresh_archive unknown-first
+run_export 200 ERR
+unverified_seen "unverified first run (200, source ERR)"
+[ "$(head_rows)" = "200" ] \
+  && ok "unverified first run: the export is archived (HEAD 200)" \
+  || bad "unverified first run: HEAD holds $(head_rows) rows, want 200"
+
+# Cases 14/15 — the run ends WITHOUT a new commit (identical export): the signal must
+# still reach the report. Two exits, so two cases: with an archive push still pending,
+# and with none pending.
+fresh_archive unknown-nochange
+run_export 300 300
+run_export 300 ERR
+unverified_seen "unverified, nothing new to commit (300, source ERR)"
+[ "$RC" = "0" ] \
+  && ok "unverified, nothing new to commit: exits 0" \
+  || bad "unverified, nothing new to commit: rc=$RC, want 0"
+
+fresh_archive unknown-nopending
+run_export 300 300
+# Clear the pending-push marker (the archive has no origin, so nothing is "local-only"
+# either) and the next run takes the plain "no changes" exit.
+STATE_JSON="$E2E_STATE/jsonl-export-state.json"
+if [ "$(jq -r '.pending_archive_push // false' "$STATE_JSON" 2>/dev/null)" != "true" ]; then
+  bad "test setup invalid: no pending_archive_push in $STATE_JSON after the baseline commit"
+fi
+jq 'del(.pending_archive_push)' "$STATE_JSON" > "$STATE_JSON.tmp" && mv -f "$STATE_JSON.tmp" "$STATE_JSON"
+run_export 300 ERR
+case "$OUT" in
+  *"push:"*) bad "test setup invalid: the run did not take the plain no-changes exit (it reported a push status): $OUT" ;;
+esac
+unverified_seen "unverified, plain no-changes exit (300, source ERR)"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

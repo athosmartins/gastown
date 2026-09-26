@@ -65,6 +65,8 @@ MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 # the previous snapshot and of SPIKE_THRESHOLD. An export more than the slack
 # below the source is a partial export and never becomes the snapshot. The slack
 # absorbs rows deleted while the export ran: max(MIN rows, PCT% of the source).
+# When the source count cannot be read there is nothing to compare with: that
+# export is archived but reported as "unverified" (see the gate in the DB loop).
 SHORT_EXPORT_SLACK_PCT="${GC_JSONL_SHORT_EXPORT_SLACK_PCT:-1}"
 SHORT_EXPORT_MIN_SLACK="${GC_JSONL_SHORT_EXPORT_MIN_SLACK:-5}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
@@ -862,26 +864,66 @@ read_source_issue_count() {
     printf '%s\n' "$count"
 }
 
-# Is this export a partial one? (ga-7sxdmb) Returns 0 (short) ONLY on positive
-# evidence: the source count is readable AND the export is more than the slack
-# below it. An unreadable source is "don't know", not "short": it returns 1 here
-# and the spike check keeps its own unreadable-source rule (ga-fxrrav). The
-# caller passes the RAW export count — same SQL filter as the source count —
-# never the post-scrub one: rows only the jq scrub removes would otherwise read
-# as missing rows on every run and stall the archive.
-export_is_short_vs_source() {
+# How does this export compare with the source? (ga-7sxdmb) Prints ONE of:
+#   short     the source count is readable AND the export is more than the slack
+#             below it — positive evidence of a partial export;
+#   complete  the source count is readable AND the export is within the slack;
+#   unknown   the source count (or the export's own count) could not be read.
+# Three answers on purpose. This was a yes/no return code and an unreadable source
+# came out as "no" — the answer a verified-complete export gets — so the export was
+# committed with nothing in the log, the summary or the commit to say that nobody
+# had checked it. A caller must send anything but "complete" and "short" down the
+# unknown path. The caller passes the RAW export count — same SQL filter as the
+# source count — never the post-scrub one: rows only the jq scrub removes would
+# otherwise read as missing rows on every run and stall the archive.
+export_vs_source_verdict() {
     local raw_count="$1"
     local source_count="$2"
     local slack
 
-    case "$raw_count" in ''|*[!0-9]*) return 1 ;; esac
-    case "$source_count" in ''|*[!0-9]*) return 1 ;; esac
+    case "$raw_count" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
+    case "$source_count" in ''|*[!0-9]*) echo unknown; return 0 ;; esac
 
     slack=$(( source_count * SHORT_EXPORT_SLACK_PCT / 100 ))
     if [ "$slack" -lt "$SHORT_EXPORT_MIN_SLACK" ]; then
         slack="$SHORT_EXPORT_MIN_SLACK"
     fi
-    [ $(( raw_count + slack )) -lt "$source_count" ]
+    if [ $(( raw_count + slack )) -lt "$source_count" ]; then
+        echo short
+    else
+        echo complete
+    fi
+}
+
+# DBs whose export went into the archive WITHOUT being checked against the source
+# (its COUNT(*) could not be read), one name per line like FAILED_DBS. Filled by
+# record_unverified_db; every closing summary and commit message reads it.
+UNVERIFIED_DBS=""
+DB_UNVERIFIED=0
+
+# Called where a DB's export is staged, so a DB discarded later in the loop is
+# reported as failed and never as "unverified".
+record_unverified_db() {
+    if [ "$DB_UNVERIFIED" -eq 1 ]; then
+        UNVERIFIED_DBS="${UNVERIFIED_DBS}$DB
+"
+    fi
+}
+
+# ", unverified: wa " for a run summary / DOG_DONE nudge; empty when every export
+# was checked. Called from every exit that reports the run.
+unverified_note() {
+    if [ -n "$UNVERIFIED_DBS" ]; then
+        printf ', unverified: %s' "$(printf '%s' "$UNVERIFIED_DBS" | tr '\n' ' ')"
+    fi
+}
+
+# " unverified=wa,hq" for an archive commit message (durable: the snapshot itself
+# says it was never checked); empty when every export was checked.
+unverified_commit_note() {
+    if [ -n "$UNVERIFIED_DBS" ]; then
+        printf ' unverified=%s' "$(printf '%s' "$UNVERIFIED_DBS" | paste -sd, -)"
+    fi
 }
 
 # Returns 0 to halt (growth spike, source unreadable, or a drop the source
@@ -926,6 +968,7 @@ should_halt_for_jsonl_spike() {
 while IFS= read -r DB; do
     [ -z "$DB" ] && continue
     TOTAL_DBS=$((TOTAL_DBS + 1))
+    DB_UNVERIFIED=0
     if ! valid_database_identifier "$DB"; then
         FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
         FAILED_DBS="${FAILED_DBS}$DB
@@ -945,7 +988,8 @@ while IFS= read -r DB; do
     mkdir -p "$DB_DIR"
 
     # The source's own row count, read BEFORE the export with the export's own
-    # SQL filter (ga-7sxdmb). Empty means unreadable — "don't know", never 0.
+    # SQL filter (ga-7sxdmb). Empty means unreadable — "don't know", never 0; the
+    # partial-export gate below reports it.
     SOURCE_BEFORE=$(read_source_issue_count "$DB" || true)
 
     # Step 1: Export issues table.
@@ -1032,16 +1076,40 @@ while IFS= read -r DB; do
     # the baseline that makes the next COMPLETE export read as a growth spike (a
     # false HIGH escalation). The spike check below only sees a drop bigger than
     # SPIKE_THRESHOLD against the previous snapshot; this gate compares with the
-    # source at ANY size. Only positive evidence discards: an unreadable source
-    # count falls through to the spike check's own rule.
-    if export_is_short_vs_source "$RAW_EXPORT_COUNT" "$SOURCE_BEFORE"; then
-        echo "jsonl-export: export curto de $DB: $RAW_EXPORT_COUNT vs fonte $SOURCE_BEFORE, mantido o snapshot anterior" >&2
-        discard_failed_db_outputs "$DB"
-        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
-        FAILED_DBS="${FAILED_DBS}$DB
+    # source at ANY size. Three outcomes:
+    #   short    -> positive evidence of a partial export: discarded, the previous
+    #               snapshot stays, the DB is reported as failed.
+    #   complete -> goes on to the spike check.
+    #   unknown  -> the source count could not be read, so nobody knows whether this
+    #               export is partial. It is NOT discarded: freezing the archive of a
+    #               store whose count query is down would be an outage of its own.
+    #               It is never silent, though: logged here, listed as
+    #               "unverified: <db>" in the run summary and the DOG_DONE nudge,
+    #               and recorded in the commit message. What ELSE happens to it is
+    #               the spike check's business, and that check only runs when the
+    #               previous snapshot has >= MIN_PREV_FOR_SPIKE_CHECK rows AND the
+    #               count moved by more than SPIKE_THRESHOLD — then an unreadable
+    #               source means HALT + mail (ga-fxrrav). Any other unverified
+    #               export (a smaller change, a first run, a small store) is
+    #               committed with the flag as its only trace, and a truncated one
+    #               can make the next complete export read as growth — a false
+    #               alarm, the price ga-fxrrav already accepted for its HALT path.
+    case "$(export_vs_source_verdict "$RAW_EXPORT_COUNT" "$SOURCE_BEFORE")" in
+        complete)
+            ;;
+        short)
+            echo "jsonl-export: export curto de $DB: $RAW_EXPORT_COUNT vs fonte $SOURCE_BEFORE, mantido o snapshot anterior" >&2
+            discard_failed_db_outputs "$DB"
+            FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+            FAILED_DBS="${FAILED_DBS}$DB
 "
-        continue
-    fi
+            continue
+            ;;
+        *)
+            echo "jsonl-export: source count unavailable for $DB; export NOT verified against source (raw export: ${RAW_EXPORT_COUNT:-?} rows)" >&2
+            DB_UNVERIFIED=1
+            ;;
+    esac
 
     # Count records from the final persisted payload (post-scrub / post-
     # validation) so commit messages and DOG_DONE summaries reflect what was
@@ -1069,6 +1137,7 @@ while IFS= read -r DB; do
             if should_halt_for_jsonl_spike "$DB" "$PREV_COUNT" "$FILTERED_COUNT" "$SPIKE_THRESHOLD"; then
                 TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
                 STAGE_PATHS+=("$DB" "$DB.jsonl")
+                record_unverified_db
                 HALTED=1
                 HALT_DB="$DB"
                 HALT_PREV_COUNT="$PREV_COUNT"
@@ -1093,6 +1162,7 @@ while IFS= read -r DB; do
 
     TOTAL_EXPORTED=$((TOTAL_EXPORTED + CURRENT_COUNT))
     STAGE_PATHS+=("$DB" "$DB.jsonl")
+    record_unverified_db
 done <<EOF
 $DATABASES
 EOF
@@ -1114,7 +1184,7 @@ if [ "$HALTED" -eq 1 ]; then
     if ! git diff --cached --quiet 2>/dev/null; then
         EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
         commit_archive_snapshot \
-            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED (spike detected; push skipped)" \
+            "[HALT] backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note) (spike detected; push skipped)" \
             "HALT baseline" || {
             discard_staged_archive_outputs
             exit 1
@@ -1127,7 +1197,7 @@ if [ "$HALTED" -eq 1 ]; then
     else
         echo "jsonl-export: spike alert delivery failed; will retry from state" >&2
     fi
-    gc session nudge deacon/ "DOG_DONE: jsonl — HALTED on spike detection" 2>/dev/null || true
+    gc session nudge deacon/ "DOG_DONE: jsonl — HALTED on spike detection$(unverified_note)" 2>/dev/null || true
     exit 0
 fi
 
@@ -1147,25 +1217,31 @@ if git diff --cached --quiet 2>/dev/null; then
         else
             SUMMARY="jsonl — no changes, push: $PUSH_STATUS"
         fi
+        SUMMARY="$SUMMARY$(unverified_note)"
         gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
         echo "jsonl-export: $SUMMARY"
         exit 0
     fi
     if [ -n "$FAILED_DBS" ]; then
         EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
-        SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, push: skipped, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')"
+        SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, push: skipped, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')$(unverified_note)"
         gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
         echo "jsonl-export: $SUMMARY"
         exit 0
     fi
-    # No changes.
-    gc session nudge deacon/ "DOG_DONE: jsonl — no changes" 2>/dev/null || true
+    # No changes. This exit prints nothing on a clean run; an unverified one still
+    # says so on stdout, next to the nudge.
+    SUMMARY="jsonl — no changes$(unverified_note)"
+    gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
+    if [ -n "$UNVERIFIED_DBS" ]; then
+        echo "jsonl-export: $SUMMARY"
+    fi
     exit 0
 fi
 
 EXPORTED_DBS=$((TOTAL_DBS - FAILED_DB_COUNT))
 commit_archive_snapshot \
-    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED" \
+    "backup $(date -u +%Y-%m-%dT%H:%M:%SZ): exported=$EXPORTED_DBS/$TOTAL_DBS records=$TOTAL_EXPORTED$(unverified_commit_note)" \
     "archive snapshot" || {
     discard_staged_archive_outputs
     exit 1
@@ -1185,6 +1261,7 @@ SUMMARY="jsonl — exported $EXPORTED_DBS/$TOTAL_DBS, records: $TOTAL_EXPORTED, 
 if [ -n "$FAILED_DBS" ]; then
     SUMMARY="$SUMMARY, failed: $(printf '%s' "$FAILED_DBS" | tr '\n' ' ')"
 fi
+SUMMARY="$SUMMARY$(unverified_note)"
 
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
 echo "jsonl-export: $SUMMARY"
