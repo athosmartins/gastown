@@ -107,6 +107,23 @@
 # day back regardless of period) — required by the same change: an
 # unanchored weekly cold start would otherwise always compute a
 # not-yet-elapsed candidate, always defer, and never send a first digest.
+#
+# Follow-up (ga-hnlog4, 2026-09-26): two recipe defects found running the
+# 2026-09-25 digest, both measured. (1) Step 3a read session lifecycle through
+# `gc events`, which returns only the newest 500 rows (warning on stderr only,
+# no paging flag): 81 woke / 161 stopped reported against 539 / 404 real, and
+# through `| jq` a failed call ("context deadline exceeded") read as "0". 3a
+# now counts from the event-log segments (live file + archives stamped at or
+# after SINCE, dedupe on seq), now also counts session.crashed (the old note
+# calling that type non-existent was a capped-CLI artifact), and prints N/A —
+# never 0 — when it cannot list, read or fully cover the window. (2) Step 3's `--metadata` JSON was typed with
+# backslash-escaped quotes; this file's TOML string consumed that escape level,
+# so the agent received invalid JSON (the 2026-09-25 archive bead only stored
+# correctly because the dog re-escaped by hand). The JSON is now built with
+# `jq --arg`, so no escape level matters. The recipe text is what the agent is
+# delivered, so assets/mol-digest-generate.selftest.sh tests the TOML-parsed
+# text, not this source. Known sibling NOT fixed here: step 2's
+# `gc events --since=5m --type=mail.sent | tail -5` also masks gc's exit status.
 description = """
 Generate activity digest for the mayor.
 
@@ -514,33 +531,46 @@ on a busy day.
 
 **3. Collect town-level data:**
 
-a) **Session lifecycle events** — three live CLI mismatches to know before
-writing this query (verified live, ga-swvjo):
-- `gc events --since` takes a DURATION ("1h", "30m"), never an absolute
-  timestamp — passing $SINCE directly errors ("invalid --since ...: unknown
-  unit").
-- `--type` does NOT support comma-separated values as an OR-filter —
-  `--type=a,b` silently matches ZERO events even though `a` and `b` each
-  match individually when queried alone. Query one type per call.
-- `session.crashed` is not a real event type in this city's current
-  taxonomy (zero matches, even completely unfiltered) — omit it; a
-  crashed-session count cannot be measured this way today.
+a) **Session lifecycle events** — read the event-log files directly, NOT
+through `gc events` (ga-hnlog4). Every `gc events` query returns only the
+NEWEST 500 matching rows and says so on stderr alone ("showing the newest 500
+matching events; more history exists beyond this page" — a deliberate limit,
+ga-dzshu, with no paging flag and no `--limit`). A normal day has ~1000
+session events, so through the CLI the counts are a fraction of the truth:
+on 2026-09-25 (ga-hnlog4) the CLI gave 81 woke / 161 stopped against 539 / 404
+real — the real figures confirmed by two independent reads of the log files. Worse, `gc events ... | jq`
+returns jq's exit status, so a failed call — the API's "context deadline
+exceeded" under load — read as an empty result, i.e. "0 woke / 0 stopped",
+indistinguishable from a quiet day. The log files
+(`$GC_CITY_PATH/.gc/events.jsonl` plus the rotated
+`events.jsonl.archive-<UTC stamp>-seq-<first>-<last>.gz` segments) have no
+row cap, no port and no API timeout.
 
-Compute a duration that overshoots UNTIL (elapsed time since SINCE, rounded
-up to the next hour), then filter the result down to the exact [SINCE,
-UNTIL) window client-side — **in epoch seconds, never by comparing the raw
-ts strings**: `gc events`' `ts` field is LOCAL time (e.g. `-03:00`) while
-$SINCE/$UNTIL are UTC, and a string compare near a UTC day boundary
-misclassifies events (one already past UNTIL in UTC can still sort as
-"before UNTIL" going purely by local wall-clock digits):
+What the block below is built on (verified live, ga-hnlog4 / ga-swvjo):
+- An archive only holds events from BEFORE its own rotation stamp (UTC, in the
+  file name), so a window needs the live file plus every archive stamped at or
+  after SINCE. A rotation can land between listing and reading, which shows the
+  same row in two segments — the block counts each `seq` once.
+- macOS `zcat` appends `.Z` to the name and fails on a `.gz` file — use
+  `gzip -dc`.
+- `ts` is LOCAL time (e.g. `-03:00`) while $SINCE/$UNTIL are UTC, so the
+  window is applied **in epoch seconds, never by comparing the raw ts
+  strings**: an event already past UNTIL in UTC can still sort as "before
+  UNTIL" going purely by local wall-clock digits.
+- `session.crashed` IS a real event type — rare (5 rows in the ~3 months of
+  archives on disk, one of them 2026-09-26). An earlier version of this recipe
+  called it non-existent, judging from a capped, current-segment-only
+  `gc events` view — the same blind spot as the 500-row cap. The block counts
+  it, so the digest's `crashed` figure is measured and a 0 there is a real 0.
 
 ```bash
+# BEGIN session-lifecycle-counts
 SINCE_EPOCH=$(date -u -d "$SINCE" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$SINCE" +%s)
 UNTIL_EPOCH=$(date -u -d "$UNTIL" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$UNTIL" +%s)
-NOW_EPOCH=$(date -u +%s)
-ELAPSED_H=$(( (NOW_EPOCH - SINCE_EPOCH + 3599) / 3600 ))
+SINCE_STAMP=$(printf '%s' "$SINCE" | tr -cd '0-9')      # 20260925000000, UTC, fixed width
+[ "${#SINCE_STAMP}" -eq 14 ] || SINCE_STAMP=0            # unparseable: read every archive
 
-JQ_WINDOW_FILTER='
+JQ_EPOCH='
   def iso_offset_to_epoch:
     .[0:19] as $base
     | (if endswith("Z") then 0
@@ -552,34 +582,56 @@ JQ_WINDOW_FILTER='
          | (if $sign == "-" then -$mag else $mag end)
        end) as $offset_signed
     | ($base + "Z" | fromdateiso8601) - $offset_signed;
-  select((.ts | iso_offset_to_epoch) >= $since_epoch and (.ts | iso_offset_to_epoch) < $until_epoch)
+'
+JQ_WINDOW_FILTER="$JQ_EPOCH"'
+  select((.type == "session.woke" or .type == "session.stopped" or .type == "session.crashed")
+         and (.ts | iso_offset_to_epoch) >= $since_epoch and (.ts | iso_offset_to_epoch) < $until_epoch)
 '
 
-gc events --since="${ELAPSED_H}h" --type=session.woke | jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER"
-gc events --since="${ELAPSED_H}h" --type=session.stopped | jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER"
+# Segments that can hold [SINCE, UNTIL): archives stamped at/after SINCE (oldest
+# first), then the live file. A name whose stamp cannot be parsed is read anyway
+# — extra reading is harmless, the window filter is per row.
+lifecycle_segments() (
+  set -o pipefail
+  find "$GC_CITY_PATH/.gc" -maxdepth 1 -name 'events.jsonl.archive-*.gz' | sort | while IFS= read -r f; do
+    stamp=${f##*archive-}; stamp=$(printf '%s' "${stamp%%-seq-*}" | tr -cd '0-9')
+    if [ "${#stamp}" -ne 14 ] || [ "$stamp" -ge "$SINCE_STAMP" ]; then echo "$f"; fi
+  done && echo "$GC_CITY_PATH/.gc/events.jsonl"
+)
+
+# Prints {"woke":N,"stopped":M,"crashed":K}; returns 1 (reason on stderr) when the count cannot be known.
+session_lifecycle_counts() (
+  set -o pipefail
+  SEGMENTS=$(lifecycle_segments) || { echo "cannot list event-log segments under $GC_CITY_PATH/.gc" >&2; return 1; }
+  # The oldest segment read must reach back to SINCE, else a pruned archive hides part of the window.
+  OLDEST=$(echo "$SEGMENTS" | head -n 1)
+  FIRST_EPOCH=$(case "$OLDEST" in *.gz) gzip -dc -- "$OLDEST" ;; *) cat -- "$OLDEST" ;; esac 2>/dev/null | head -n 1 | jq -r "$JQ_EPOCH"' .ts | iso_offset_to_epoch' 2>/dev/null)
+  if [ -z "$FIRST_EPOCH" ] || [ "$FIRST_EPOCH" -gt "$SINCE_EPOCH" ]; then
+    echo "event log does not reach back to $SINCE (oldest segment $OLDEST, first event epoch '${FIRST_EPOCH:-unreadable}')" >&2
+    return 1
+  fi
+  echo "$SEGMENTS" | while IFS= read -r f; do
+    case "$f" in *.gz) gzip -dc -- "$f" ;; *) cat -- "$f" ;; esac |
+      jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER" || exit 1
+  done | jq -s 'unique_by(.seq) | {woke: (map(select(.type == "session.woke")) | length), stopped: (map(select(.type == "session.stopped")) | length), crashed: (map(select(.type == "session.crashed")) | length)}'
+)
+
+WOKE_N=N/A; STOPPED_N=N/A; CRASHED_N=N/A
+if COUNTS=$(session_lifecycle_counts); then
+  WOKE_N=$(echo "$COUNTS" | jq -r .woke); STOPPED_N=$(echo "$COUNTS" | jq -r .stopped); CRASHED_N=$(echo "$COUNTS" | jq -r .crashed)
+fi
+echo "session.woke=$WOKE_N session.stopped=$STOPPED_N session.crashed=$CRASHED_N"
+# END session-lifecycle-counts
 ```
 
-Note: `gc events` caps at 500 rows with no truncation signal in its JSONL
-output — an unfiltered 2h window alone hit that cap in a live check
-(ga-swvjo). Querying one type per call (as above) keeps volume well under
-it on a normal day; if a result ever lands at exactly 500, treat it as
-possibly truncated, not as a true count.
-
-**Separate, deeper caveat (not fixable from this recipe — flag it, don't
-hide it):** `--since` can only see the CURRENT event-log segment; the log
-rotates every few days into `.gc/events.jsonl.archive-*.gz`, and once
-rotated, that history is gone from every `--since` query regardless of how
-large a duration you request (verified live: `--since=24h`, `48h`, and
-`72h` returned the IDENTICAL row count and earliest timestamp for
-session.woke — the query wasn't reaching further back, it had run out of
-live-segment data). A rotation can land inside any digest's [SINCE, UNTIL)
-window, silently truncating the session-lifecycle section for however much
-of the window preceded it. Before trusting a low/zero count here, compare
-the EARLIEST timestamp actually returned against $SINCE — if the earliest
-is later than $SINCE, the window is truncated by rotation, not genuinely
-quiet, and the digest should say so explicitly rather than report a count
-that reads as complete. Tracked separately as a `gc events` capability gap,
-not a recipe bug — see the formula's own bug history for the follow-up.
+Report the three numbers exactly as printed. **`N/A` means "could not
+measure" and the digest must say N/A — never 0**: the block prints N/A (reason
+on stderr) when it cannot list or read a segment, when a segment is corrupt,
+or when the oldest segment on disk starts after SINCE (an archive was pruned,
+so part of the window is out of reach). A `0` is printed only for a window the
+log actually covers. On N/A, run the block once more before writing N/A into
+the digest — a torn read of the live file's last line under load is the one
+transient cause.
 
 b) **Escalations** — no universal `escalation` bead label exists in this city (0
 hits, confirmed across 3+ independent runs, including a `--label-pattern
@@ -803,11 +855,19 @@ SINCE without ever touching wall-clock time. Without this, a future
 change to the title format would silently break that lookup with no
 error, just a quiet fall-back to the old skip/duplicate-prone behavior.
 
+The JSON is built by `jq --arg`, not typed with backslash-escaped quotes
+(ga-hnlog4): this text is a TOML string, which consumes one level of backslash
+before the agent ever reads it, so a hand-escaped `--metadata` argument reached
+the agent with bare quotes inside quotes — the shell stripped them and
+`--metadata` received `{digest.since:2026-...,digest.until:2026-...}`, which is
+not JSON. Nothing here depends on how many escape layers sit between the source
+and the agent, and a value can never break the quoting.
 ```bash
+DIGEST_META=$(jq -cn --arg since "$SINCE" --arg until "$UNTIL" '{"digest.since":$since,"digest.until":$until}')
 DIGEST_ID=$(gc bd create --type=message \
   --title="Digest: $DATE" \
   --label=digest,{{period}} \
-  --metadata "{\"digest.since\":\"$SINCE\",\"digest.until\":\"$UNTIL\"}" \
+  --metadata "$DIGEST_META" \
   --silent)
 gc bd close "$DIGEST_ID" --reason "Daily digest archived — informational artifact, no action pending"
 ```
