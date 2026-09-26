@@ -5,7 +5,8 @@
   },
   "deniedMcpServers": [
     { "serverName": "sqlite" },
-    { "serverName": "sequential-thinking" }
+    { "serverName": "sequential-thinking" },
+    { "serverName": "puppeteer" }
   ],
   "disabledMcpjsonServers": [
     "pipedrive-code-mode",

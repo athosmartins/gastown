@@ -445,10 +445,43 @@ dir = ""
 name = "gastown.mayor"
 overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
 
+# ga-e87w1f: MCP servers of the named sessions, cut per role from what each role actually CALLED.
+# Measured 2026-09-26 on the 5 live named sessions (Mayor + 4 WA crews): 120 MCP processes hold
+# 6,087 MB of footprint (top MEM == footprint(1); 5,794 MB of it compressed) while ps RSS shows only
+# 559 MB — measure with top MEM or footprint, never RSS; CMPRS is a subset of MEM, not an addition —
+# on a 16 GB box at 11,369 of 12,288 MB swap. Projected after these overlays, from the same per-kind
+# measurements: 694 MB in 10 processes (-5,393 MB, 89%). Pool roles were already at zero
+# (claude-headless, ga-rpejh); this block covers the roles that provider deliberately leaves alone.
+# Evidence = mcp__* tool_use blocks in ~/.claude/projects/*.jsonl, last 7 days (retained transcripts
+# start 2026-09-18, so ~8 days):
+#   mayor    playwright-cdp 98, puppeteer 1          peter   playwright-cdp 80, firecrawl-code-mode 8
+#   batista  playwright-cdp 18 (+ claude.ai Docs)    thies   claude.ai Docs only (remote, no process)
+#   oracle   none
+#   sqlite, sequential-thinking, the playwright PLUGIN and the other 8 code-mode servers: zero calls in
+#   ANY of the 41 active projects.
+# Every overlay below also drops sqlite, sequential-thinking and the playwright plugin; what differs is
+# what the role keeps:
+#   longlived                mayor, mila-wa, digo-wa   playwright-cdp + puppeteer + firecrawl-code-mode
+#                            (mila/digo had no session in the window: no evidence, so only the cut that
+#                            is zero-use everywhere)
+#   longlived-cdp-firecrawl  peter-wa                  playwright-cdp + firecrawl-code-mode
+#   longlived-cdp            batista-wa                playwright-cdp
+#   longlived-bare           thies-wa, oracle-wa       no local MCP server
+# claude.ai connectors (Docs) are remote — no local process — and are untouched.
+# Mechanism: the overlay merges into <workdir>/.claude/settings.json (project scope). enabledPlugins,
+# deniedMcpServers and disabledMcpjsonServers there switch off the plugin, the user-scope (~/.claude.json)
+# and the .mcp.json servers respectively (verified on claude 2.1.283); an empty disabledMcpjsonServers in
+# a crew's settings.local.json (peter has one) does not undo it — arrays merge across scopes.
+# The overlay merge only ADDS (internal/overlay/merge.go), so deleting an overlay never undoes it: every
+# variant sets ALL THREE keys, and reverting a role means pointing it at an overlay whose values are
+# empty (enabledPlugins {}, deniedMcpServers [], disabledMcpjsonServers []), not deleting lines.
+# Takes effect on each session's NEXT launch; running sessions are not touched. A role that needs a
+# browser back: move it to longlived-cdp, or use the browser-control skill's CDP script. The -ps/-lx/-ma
+# crews have no overlay_dir at all and are not covered here.
 [[patches.agent]]
 dir = ""
 name = "oracle-wa"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-bare"
 
 [[patches.agent]]
 dir = ""
@@ -458,7 +491,7 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
 [[patches.agent]]
 dir = ""
 name = "batista-wa"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp"
 
 [[patches.agent]]
 dir = ""
@@ -468,12 +501,12 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
 [[patches.agent]]
 dir = ""
 name = "thies-wa"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-bare"
 
 [[patches.agent]]
 dir = ""
 name = "peter-wa"
-overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived"
+overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp-firecrawl"
 
 # ga-ttwzqd: explicit --effort per role. Without an option_defaults.effort the
 # builtin:claude provider launches with `--effort max` — measured on the live

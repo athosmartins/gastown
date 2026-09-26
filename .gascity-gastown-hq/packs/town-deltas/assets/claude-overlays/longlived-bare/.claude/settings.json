@@ -5,11 +5,14 @@
   },
   "deniedMcpServers": [
     { "serverName": "sqlite" },
-    { "serverName": "sequential-thinking" }
+    { "serverName": "sequential-thinking" },
+    { "serverName": "puppeteer" },
+    { "serverName": "playwright-cdp" }
   ],
   "disabledMcpjsonServers": [
     "pipedrive-code-mode",
     "github-code-mode",
+    "firecrawl-code-mode",
     "hex-code-mode",
     "google-maps-code-mode",
     "motherduck-code-mode",
