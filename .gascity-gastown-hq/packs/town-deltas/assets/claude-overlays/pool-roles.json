@@ -14,13 +14,12 @@
  },
  "base_overlay": "pool",
  "common": {
-  "_why_deny_tools": "Nome BARE em permissions.deny REMOVE o schema da tool do contexto (medido 25/09: -23.8k tokens só isto, e vale sob --dangerously-skip-permissions). Só entram tools com ZERO chamada em 7 dias nas sessões de pool e sem menção em prompt/formula/doutrina de pool.",
+  "_why_deny_tools": "Nome BARE em permissions.deny REMOVE o schema da tool do contexto (medido 25/09: -23.8k tokens só isto, e vale sob --dangerously-skip-permissions). REGRA: uma tool só entra em deny se tiver ZERO chamada NO PRÓPRIO papel nos transcritos retidos (~8 dias, 18-26/09, ANTES do overlay existir), contando tool_use por BLOCO (pool-preamble-measure.py scan_session). Em `common` só vão as com zero em TODOS os papéis medidos (dog 208 sessões, wa-worker 69, gate-reviewer 825, refino-gate-reviewer 38). Usadas por algum papel ficam FORA de `common` e são negadas só nos papéis que mediram zero: CronDelete (dog 1), PushNotification (gate-reviewer 1). EnterWorktree/ExitWorktree: o veredito do gate ga-0g70nl citou dog 1/2 chamadas; NÃO se sustenta — dois métodos independentes (scan_session por bloco e grep exato do registro tool_use em TODOS os transcritos retidos, Mayor e crews inclusos) dão 0/0 (um grep frouxo por 'name:EnterWorktree' também casa schemas de tool citados em sessões do Mayor). Prova reproduzível: `pool-preamble-measure.py denied-attempts --since-hours 240 --strict` SEM --cutover sobre os transcritos de antes do deploy tem que sair 0. ps-worker: 0 sessões nos transcritos (SEM DADO, não 'zero uso') — herda a lista do wa-worker (mesma família de prompt) e o denied-attempts pós-deploy é o que a valida.",
   "deny_tools": [
    "Artifact",
    "ArtifactComments",
    "ArtifactData",
    "CronCreate",
-   "CronDelete",
    "CronList",
    "DesignSync",
    "EndConversation",
@@ -29,7 +28,6 @@
    "ExitPlanMode",
    "ExitWorktree",
    "NotebookEdit",
-   "PushNotification",
    "RemoteTrigger",
    "ReportFindings",
    "SendFeedback",
@@ -159,7 +157,10 @@
    "agents": [
     "gastown.dog"
    ],
-   "deny_tools_extra": [],
+   "_why_deny": "dog mediu 0 de PushNotification. USA CronDelete (1), Monitor (20), TaskStop (22), Skill (77), Agent (8), ScheduleWakeup (3), ListAgents (2), WebFetch (3), WebSearch (1) — nada disso é negado.",
+   "deny_tools_extra": [
+    "PushNotification"
+   ],
    "skills": {
     "mode": "off",
     "keep": [
@@ -187,7 +188,11 @@
    "agents": [
     "wa-worker"
    ],
-   "deny_tools_extra": [],
+   "_why_deny": "wa-worker mediu 0 (69 sessões) de CronDelete/PushNotification. USA Agent (15), Monitor (10), TaskStop (21), Skill (50), ScheduleWakeup (1), WebFetch (1) — nada disso é negado.",
+   "deny_tools_extra": [
+    "CronDelete",
+    "PushNotification"
+   ],
    "skills": {
     "mode": "name-only",
     "keep": [
@@ -218,7 +223,11 @@
    "agents": [
     "ps-worker"
    ],
-   "deny_tools_extra": [],
+   "_why_deny": "ps-worker: 0 sessões nos transcritos retidos (SEM DADO). Herda a lista do wa-worker, que roda o mesmo prompt de worker; validar com denied-attempts depois do deploy (ele agora lista o papel sem sessão como SEM DADO, não como 'sem tentativas').",
+   "deny_tools_extra": [
+    "CronDelete",
+    "PushNotification"
+   ],
    "skills": {
     "mode": "name-only",
     "keep": [
@@ -247,19 +256,25 @@
     "gate-reviewer",
     "refino-gate-reviewer"
    ],
-   "_why": "776+35 sessões/7d usando SÓ Bash/Read (Edit 5, Write 3): 0 skill, 0 Agent, 0 Monitor. Sem tool Skill não há listagem de skills; superpowers off remove o hook que manda 'invoque skill'. SendMessage FICA: 1 uso real em 24/09 (um revisor achou um gate-run órfão correlacionado com o branch errado e avisou o Mayor) — canal de escalonamento raro mas valioso; custa ~2.6k tokens.",
+   "_why": "MEDIDO (8 dias de transcritos, tool_use por bloco; 825 sessões gate-reviewer + 38 refino-gate-reviewer, 21.618 tool_use): Bash 18.242, Read 2.930, Write 355 — mas TAMBÉM Monitor 13 (10 sessões: a forma sancionada de esperar suíte longa, foreground sleep é bloqueado), TaskStop 23 (15 sessões), ScheduleWakeup 3, Skill 6 (refino x3 no refino-gate-reviewer; verification-before-completion x2 e browser-control x1 no gate-reviewer), WebFetch 1, WebSearch 1, AskUserQuestion 1, PushNotification 1, SendMessage 1 (achou um gate-run órfão e avisou o Mayor). A 1ª versão negava tudo isso por uma premissa ERRADA ('0 uso') que um contador que só via 1 de cada ~9 tool_use produziu — veredito do gate ga-0g70nl. Só Agent e ListAgents mediram zero e ficam negadas (+ CronDelete, que o revisor nunca usou). Skill volta MAS a listagem continua enxuta: skills off exceto refino (o refino-gate-reviewer o invoca), browser-control (1 uso) e core.gc-* (o rodapé do prompt manda usá-las). Plugins superpowers/frontend-design seguem OFF: verification-before-completion (2 usos em 825 sessões) deixa de existir de propósito — o hook do plugin que manda 'invoque skill' custa turnos, e a taxa de aprovação do gate (gate-rate) é a rede de segurança.",
    "deny_tools_extra": [
     "Agent",
-    "AskUserQuestion",
-    "ListAgents",
-    "Monitor",
-    "ScheduleWakeup",
-    "Skill",
-    "TaskStop",
-    "WebFetch",
-    "WebSearch"
+    "CronDelete",
+    "ListAgents"
    ],
-   "skills": null,
+   "skills": {
+    "mode": "off",
+    "keep": [
+     "browser-control",
+     "core.gc-agents",
+     "core.gc-city",
+     "core.gc-dispatch",
+     "core.gc-mail",
+     "core.gc-rigs",
+     "core.gc-work",
+     "refino"
+    ]
+   },
    "plugins_off": [
     "superpowers@claude-plugins-official",
     "frontend-design@claude-plugins-official"

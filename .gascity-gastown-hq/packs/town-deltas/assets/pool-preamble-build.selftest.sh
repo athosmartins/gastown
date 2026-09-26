@@ -74,6 +74,18 @@ p=sys.argv[1]+"/pool-roles.json"; m=json.load(open(p)); m["roles"]["dog"]["deny_
 EOF
 PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
 expect_fail "construtor (dog) passa a negar Agent" "construtor nega tool que usa"
+# gate ga-0g70nl: a 1ª versão negava ao REVISOR Monitor/TaskStop/ScheduleWakeup/Skill por uma premissa de "0 uso" que um contador cego produziu; medido
+# de verdade, o gate-reviewer usa Monitor (13), TaskStop (22), ScheduleWakeup (3), Skill (3) e o refino-gate-reviewer usa Skill (3). O `check` tem que
+# recusar a regressão — antes, `if td_role != "reviewer"` deixava o revisor negar qualquer coisa.
+for t in Monitor TaskStop ScheduleWakeup Skill; do
+  reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays" "$t" <<'EOF'
+import json, sys
+p = sys.argv[1] + "/pool-roles.json"; m = json.load(open(p)); m["roles"]["reviewer"]["deny_tools_extra"].append(sys.argv[2])
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False)
+EOF
+  PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+  expect_fail "revisor passa a negar $t (o gate-reviewer/refino-gate-reviewer a usa de verdade)" "nega tool essencial"
+done
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays" <<'EOF'
 import json,sys
 p=sys.argv[1]+"/pool-roles.json"; m=json.load(open(p)); m["common"]["claude_md_excludes"]=[x for x in m["common"]["claude_md_excludes"] if not x.endswith("AGENTS.md")]; json.dump(m,open(p,"w"),indent=1,ensure_ascii=False)

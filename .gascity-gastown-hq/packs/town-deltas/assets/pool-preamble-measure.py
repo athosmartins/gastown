@@ -47,6 +47,11 @@ ROLE_RES = [  # ordem importa: refino-gate-reviewer antes de gate-reviewer
     (re.compile(r"^gastown\.mayor"), "mayor"),
 ]
 BEACON = re.compile(r"^\[gascity\]\s+(\S+)")
+VANISHED = [0]   # transcritos que sumiram durante a varredura: descartados, mas CONTADOS e mostrados (nunca "sem sessão" calado)
+
+
+def vanished_note():
+    return f"  (transcritos que sumiram durante a varredura e ficaram de fora: {VANISHED[0]})" if VANISHED[0] else ""
 
 
 def parse_ts(s):
@@ -76,12 +81,20 @@ def first_text(rec):
 
 
 def scan_session(path):
-    """-> dict(role, start, first, turns, tool_uses Counter) ou None. Ignora sidechain (subagentes)."""
+    """-> dict(role, start, first, turns, tools Counter) ou None. Ignora sidechain (subagentes).
+
+    O Claude Code grava UM registro JSONL por bloco de conteúdo (thinking / text / tool_use) e todos levam o MESMO message.id
+    (medido nos 1.354 transcritos retidos em 26/09: o dedup por message.id antes de contar via 3.858 dos 35.781 tool_use dos papéis
+    de pool, ~11%). Por isso são DUAS contagens com chaves diferentes:
+      * tokens / turnos  -> dedup por message.id (o uso se repete em cada registro da mesma mensagem: somar duplicaria)
+      * tool_use         -> dedup por id do BLOCO (toolu_...), contado em TODO registro — nunca atrás do dedup de mensagem,
+                            senão "nenhuma tentativa de tool negada" passa a significar "não consegui ver as tentativas"."""
     alias = start = first = None
-    turns, seen, tools = 0, set(), Counter()
+    turns, seen, seen_tools, tools = 0, set(), set(), Counter()
     try:
         fh = open(path, errors="replace")
     except OSError:
+        VANISHED[0] += 1
         return None
     with fh:
         for line in fh:
@@ -102,6 +115,12 @@ def scan_session(path):
                 alias = m.group(1) if m else ""
             elif t == "assistant":
                 msg = r.get("message") or {}
+                for i, b in enumerate(msg.get("content") or []):    # tool_use: por BLOCO, antes de qualquer dedup de mensagem
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        key = b.get("id") or (msg.get("id"), i, b.get("name"))
+                        if key not in seen_tools:
+                            seen_tools.add(key)
+                            tools[b.get("name")] += 1
                 if msg.get("id") in seen:
                     continue
                 seen.add(msg.get("id"))
@@ -112,9 +131,6 @@ def scan_session(path):
                 if first is None:
                     first = total
                 turns += 1
-                for b in msg.get("content") or []:
-                    if isinstance(b, dict) and b.get("type") == "tool_use":
-                        tools[b.get("name")] += 1
     if first is None:
         return None
     return dict(role=role_of(alias), alias=alias, start=start, first=first, turns=turns, tools=tools, path=str(path))
@@ -125,7 +141,11 @@ def sessions(since_hours, roles=None):
         raise SystemExit(f"diretório de transcritos não encontrado: {PROJECTS} (defina PPM_PROJECTS) — sem ele não há como medir, e uma tabela vazia pareceria 'nenhuma sessão'")
     cut = time.time() - since_hours * 3600
     for p in glob.glob(str(PROJECTS / "*" / "*.jsonl")):
-        if os.path.getmtime(p) < cut:
+        try:
+            if os.path.getmtime(p) < cut:
+                continue
+        except OSError:                       # transcrito apagado entre o glob e o stat (a limpeza de sessões de pool roda em paralelo)
+            VANISHED[0] += 1
             continue
         s = scan_session(p)
         if s and (not roles or s["role"] in roles):
@@ -150,29 +170,33 @@ def cmd_first_turn(a):
         else:
             by[s["role"]]["after" if s["start"] >= cutover else "before"].append(s["first"])
     if not by:
-        print(f"SEM AMOSTRA: nenhuma sessão de pool com transcrito nas últimas {a.since_hours:g}h" + (f" (papéis: {a.roles})" if roles else "") + ". Isto NÃO é medição de zero — é ausência de dado.")
+        why = (f"{unknown_ts} sessão(ões) de pool existem mas têm timestamp ilegível e não dá pra separar antes/depois do corte" if unknown_ts
+               else f"nenhuma sessão de pool com transcrito nas últimas {a.since_hours:g}h" + (f" (papéis: {a.roles})" if roles else ""))
+        print(f"SEM AMOSTRA: {why}. Isto NÃO é medição de zero — é ausência de dado." + vanished_note())
         return 2
     out = {}
     for role, d in sorted(by.items()):
         out[role] = {k: {"n": len(v), "median": med(v), "p10": med(sorted(v)[: max(1, len(v) // 10)]) if v else None,
-                          "p90": sorted(v)[(len(v) * 9) // 10] if v else None} for k, v in d.items()}
+                          "p90": sorted(v)[min(len(v) - 1, math.ceil(len(v) * 0.9) - 1)] if v else None} for k, v in d.items()}
     if a.json:
-        json.dump({"cutover": a.cutover, "unknown_ts": unknown_ts, "roles": out}, sys.stdout, indent=2, ensure_ascii=False)
+        json.dump({"cutover": a.cutover, "unknown_ts": unknown_ts, "vanished": VANISHED[0], "roles": out}, sys.stdout, indent=2, ensure_ascii=False)
         print()
         return 0
     if cutover is None:
+        print(vanished_note().strip() or "(nenhum transcrito sumiu durante a varredura)")
         print(f"{'papel':24s} {'n':>5s} {'mediana 1º turno':>17s} {'p10':>9s} {'p90':>9s}")
         for role, d in out.items():
             x = d["after"]
             print(f"{role:24s} {x['n']:5d} {x['median']:17,d} {x['p10']:9,d} {x['p90']:9,d}")
         return 0
     print(f"corte = {a.cutover}   (sessões sem timestamp legível: {unknown_ts})")
+    print(vanished_note().strip() or "(nenhum transcrito sumiu durante a varredura)")
     print(f"{'papel':24s} {'ANTES n':>8s} {'mediana':>10s} {'DEPOIS n':>9s} {'mediana':>10s} {'delta':>10s} {'%':>6s}")
     for role, d in out.items():
         b, f = d["before"], d["after"]
         if b["n"] and f["n"]:
             delta = f["median"] - b["median"]
-            print(f"{role:24s} {b['n']:8d} {b['median']:10,d} {f['n']:9d} {f['median']:10,d} {delta:+10,d} {delta * 100 // b['median']:5d}%")
+            print(f"{role:24s} {b['n']:8d} {b['median']:10,d} {f['n']:9d} {f['median']:10,d} {delta:+10,d} {round(delta * 100 / b['median']):5d}%")
         else:
             print(f"{role:24s} {b['n']:8d} {b['median'] or 0:10,d} {f['n']:9d} {f['median'] or 0:10,d} {'(falta amostra de um dos lados)':>28s}")
     return 0
@@ -198,12 +222,15 @@ def cmd_denied(a):
         for tool, c in s["tools"].items():
             if tool in d:
                 hits[s["role"]][tool] += c
-    print(f"sessões avaliadas (depois do corte): {dict(n_sessions) or 'nenhuma'}")
+    print(f"sessões avaliadas (depois do corte): {dict(n_sessions) or 'nenhuma'}" + vanished_note())
     if not n_sessions:
         print("SEM AMOSTRA: nenhuma sessão de papel de pool depois do corte — não dá pra dizer que 'não há tentativas'. Espere spawns novos.")
         return 2
+    no_data = sorted(r for r in deny if not n_sessions[r])
+    if no_data:
+        print(f"SEM DADO (nenhuma sessão na amostra — NÃO é 'sem tentativas'; a lista de deny desse papel não foi testada): {', '.join(no_data)}")
     if not hits:
-        print("nenhuma tentativa de tool negada — os cortes não parecem estar fazendo falta.")
+        print("nenhuma tentativa de tool negada nos papéis com sessão — os cortes não parecem estar fazendo falta." + (" (papéis SEM DADO acima não foram avaliados)" if no_data else ""))
         return 0
     for role, c in hits.items():
         print(f"  ⚠ {role}: tentou tool NEGADA: {dict(c)}  -> reavaliar se essa tool deve sair de deny_tools no manifesto")
@@ -297,6 +324,9 @@ def cmd_gate_rate(a):
     if p_drop < 0.10 and below_hist:
         print(f"VEREDITO: ALERTA — queda significativa (p={p_drop:.2f}) E abaixo de TODAS as janelas históricas.{small}\n  Reverta a seção cortada que explica (doctrine.guarded em claude-overlays/pool-roles.json) ou o overlay do papel suspeito, e rode de novo.")
         return 1
+    if p_drop < 0.10 and not hist:
+        print(f"VEREDITO: SEM CONTROLE HISTÓRICO — queda significativa (p={p_drop:.2f}) mas nenhuma janela histórica com n>=20 pra separar queda real de variação do gate.{small}\n  Não dá pra concluir (não é 'ok', é 'não sei'): aumente --history-windows / --window-hours e meça de novo.")
+        return 2
     why = "abaixo do ANTES mas dentro da faixa histórica (o gate varia sozinho)" if hist and not below_hist else "abaixo do ANTES mas sem significância"
     print(f"VEREDITO: {why} (p={p_drop:.2f}).{small}\n  Não reverta ainda: estenda --window-hours e meça de novo; com ~110 beads por janela o ruído é ~±4 pontos.")
     return 0

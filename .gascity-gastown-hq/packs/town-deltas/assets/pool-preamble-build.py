@@ -20,8 +20,11 @@ mais uma coisa que pode ficar velha. As guardas moram no fragment; aqui só se P
 Garantias que `check` defende (cada uma nasceu de uma medição, ver docs/pool-preamble-per-role.md):
   * agente SEM `TD_ROLE` (Mayor, crews, witness, deacon, boot...) continua recebendo o fragment inteiro;
   * toda seção do fragment está no manifesto exatamente uma vez, e a condição da guarda é a gerada;
-  * nenhum overlay nega uma tool que o papel usa (Bash/Read/Edit/Write/ToolSearch nunca; Agent/Skill/Monitor/
-    TaskStop só o reviewer, que mediu 0 uso), e todo overlay mantém os deny/RC do overlay `pool` base.
+  * nenhum overlay nega uma tool que o papel usa (NEVER_DENY_ALL: Bash/Read/Edit/Write/Grep/Glob/ToolSearch e as que dog, wa-worker
+    E gate-reviewer mediram em uso — Monitor/TaskStop/ScheduleWakeup/Skill; NEVER_DENY_BUILDERS: Agent, só o reviewer pode perdê-la),
+    e todo overlay mantém os deny/RC do overlay `pool` base. Quais tools cada papel usa vem de MEDIÇÃO (docs/pool-preamble-per-role.md,
+    `pool-preamble-measure.py denied-attempts` sem --cutover), nunca de premissa — a 1ª versão negava Monitor/TaskStop/Skill ao revisor
+    por "0 uso" produzido por um contador que só via ~1 de cada 9 tool_use (gate ga-0g70nl).
 
 Só stdlib. Somente leitura, exceto `build`.
 """
@@ -37,10 +40,13 @@ OVERLAYS = ASSETS / "claude-overlays"
 MANIFEST = Path(os.environ.get("PP_MANIFEST") or OVERLAYS / "pool-roles.json")
 FRAGMENT = Path(os.environ.get("PP_FRAGMENT") or ASSETS.parent / "template-fragments" / "town-deltas.template.md")
 
-# tools que NENHUM papel de pool pode perder (usadas em 100% das sessões medidas)
-NEVER_DENY_ALL = {"Bash", "Read", "Edit", "Write", "Grep", "Glob", "ToolSearch"}
-# tools que os construtores (dog/wa-worker/ps-worker) usam de fato — só o reviewer (0 uso medido) pode perdê-las
-NEVER_DENY_BUILDERS = {"Agent", "Skill", "Monitor", "TaskStop"}
+# tools que NENHUM papel de pool pode perder. Medido em 18-26/09 (~8 dias de transcritos, tool_use contado por BLOCO):
+#   Bash/Read/Edit/Write/Grep/ToolSearch: em praticamente toda sessão;
+#   Monitor (dog 20, wa-worker 10, gate-reviewer 13), TaskStop (22/21/23), ScheduleWakeup (3/1/3), Skill (77/50/6): TODOS os papéis medidos
+#   usam. Monitor é a forma sancionada de esperar uma suíte longa (foreground `sleep` é bloqueado); TaskStop encerra o que o Monitor/bg deixou.
+NEVER_DENY_ALL = {"Bash", "Read", "Edit", "Write", "Grep", "Glob", "ToolSearch", "Monitor", "TaskStop", "ScheduleWakeup", "Skill"}
+# tools que só os construtores (dog/wa-worker/ps-worker) usam — dog 8 chamadas, wa-worker 15; o revisor mediu 0, então só ele pode perdê-las
+NEVER_DENY_BUILDERS = {"Agent"}
 
 RE_CORE = re.compile(r"^\{\{/\* td:core:(?P<id>[a-z0-9-]+) \*/ -\}\}$")
 RE_BEGIN = re.compile(r"^\{\{ if (?P<cond>.+?) -\}\}\{\{/\* td:(?P<id>[a-z0-9-]+) \*/ -\}\}$")

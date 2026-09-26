@@ -8,7 +8,9 @@ provider = "claude-headless"
 # flags) — see agents/gate-reviewer/agent.toml for the full rationale. overlay_dir
 # writes the override into this session's own .claude/settings.json instead,
 # which Claude Code's docs explicitly guarantee wins.
-# ga-aijm2v.6: overlay próprio do revisor (só Bash/Read/Edit/Write; sem skills/plugins/CLAUDE.md do Mayor) + TD_ROLE.
+# ga-aijm2v.6: overlay próprio do revisor + TD_ROLE. Nega só as tools que o revisor MEDIU zero (Agent, ListAgents, CronDelete + o common);
+# Monitor/TaskStop/ScheduleWakeup/Skill/Web*/AskUserQuestion/PushNotification/SendMessage FICAM (ele as usa: pool-roles.json, roles.reviewer._why).
+# Skills enxutas (refino, browser-control, core.gc-*); plugins superpowers/frontend-design e CLAUDE.md/memória do Mayor OFF.
 # Reverter: volte para .../pool e apague a linha env. Fonte: assets/claude-overlays/pool-roles.json.
 overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-reviewer"
 env = { TD_ROLE = "reviewer" }
