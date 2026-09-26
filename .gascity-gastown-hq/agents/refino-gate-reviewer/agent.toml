@@ -8,11 +8,13 @@ provider = "claude-headless"
 # flags) — see agents/gate-reviewer/agent.toml for the full rationale. overlay_dir
 # writes the override into this session's own .claude/settings.json instead,
 # which Claude Code's docs explicitly guarantee wins.
-# ga-aijm2v.6: overlay próprio do revisor + TD_ROLE. Nega só as tools que o revisor MEDIU zero (Agent, ListAgents, CronDelete + o common);
-# Monitor/TaskStop/ScheduleWakeup/Skill/Web*/AskUserQuestion/PushNotification/SendMessage FICAM (ele as usa: pool-roles.json, roles.reviewer._why).
-# Skills enxutas (refino, browser-control, core.gc-*); plugins superpowers/frontend-design e CLAUDE.md/memória do Mayor OFF.
-# Reverter: volte para .../pool e apague a linha env. Fonte: assets/claude-overlays/pool-roles.json.
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"  # REVERTIDO 26/09 (Mayor): o revisor roda na RAIZ da cidade, e o overlay pool-reviewer vazava pro .claude/settings.json da raiz e pro .gc/settings.json (gate-done off, CLAUDE.md excluido e memoria off pra TODAS as sessoes). Refazer so com workdir proprio do revisor.
+# ga-aijm2v.6 + ga-swnkfm: o overlay POR PAPEL do revisor (`pool-reviewer`) existe e é gerado do manifesto, mas NÃO está fiado: este agente NÃO tem
+# work_dir, então roda na RAIZ da cidade, e overlay_dir faz JSON-merge no <workdir>/.claude/settings.json — na raiz isso vira o .claude/settings.json da
+# cidade e daí o .gc/settings.json de TODAS as sessões (gate-done off, CLAUDE.md fora, memória off; incidente de 26/09). O merge só ADICIONA chave:
+# reverter o overlay_dir NÃO limpa o que já vazou. Por isso aqui fica o overlay BASE (`pool`). TD_ROLE (abaixo) é env, não overlay: segue valendo.
+# Religar o pool-reviewer: passos em claude-overlays/pool-roles.json (roles.reviewer._workdir_why). Enforçado por pool-preamble-build.selftest.sh (C) e
+# por scripts/overlay-root-leak-guard.py (order de 10 min: lê a config E os dois arquivos vivos).
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
 env = { TD_ROLE = "reviewer" }
 scope = "city"
 wake_mode = "fresh"

@@ -41,7 +41,7 @@ o selftest reprova se o commitado divergir.
 | dog | `pool-dog` | dog | ≈ 23.215 † | -6,4k chars (esconde 10,3k, devolve 3,9k de carry-over) |
 | wa-worker | `pool-wa-worker` | wa-worker | 24.235 | -4,3k (esconde 6,6k, devolve 2,3k) |
 | ps-worker | `pool-ps-worker` | ps-worker | 23.937 | -4,3k |
-| gate-reviewer, refino-gate-reviewer | `pool-reviewer` | reviewer | ≈ 18.660 † | -27,0k |
+| gate-reviewer, refino-gate-reviewer | `pool-reviewer` — **NÃO fiado** (ver "Revisores" abaixo); hoje `pool` | reviewer | ≈ 18.660 † **(só com o overlay religado)** | -27,0k (vale: `TD_ROLE` é env, não overlay) |
 
 † rodada 1 (23.058 e 8.228) + o delta medido na rodada 2 (+157 e +10.432). wa-worker e ps-worker têm overlay idêntico ao da rodada 1.
 
@@ -109,6 +109,22 @@ e `AskUserQuestion` num pool sem humano só penduraria a sessão); negá-las é 
 - **O mount do Google Drive está quebrado** (bead gt-xu3c5): um hook do usuário bloqueou até um comando meu que só CONTINHA o caminho. O carry-over manda ler o Drive pela API (`lib/gdrive_reader.py`), não pelo caminho que o CLAUDE.md original citava.
 - `name-only` mantém a skill invocável (medido: o Skill tool devolveu "Launching skill" e o modelo concluiu a tarefa) — por isso é o modo dos workers.
 - Um revisor usou `SendMessage` 1 vez (avisou o Mayor de um gate-run órfão): por isso ele FICA para revisores (custa ~2,1k tokens).
+
+## Revisores: o overlay `pool-reviewer` NÃO está fiado (ga-swnkfm, 26/09)
+
+Os revisores (gate-reviewer, refino-gate-reviewer) **não têm `work_dir`: rodam na RAIZ da cidade**. `overlay_dir` faz JSON-merge em `<workdir>/.claude/settings.json`,
+e o `<cidade>/.gc/settings.json` — o `--settings` de TODAS as sessões — é derivado desse arquivo (engine: `installClaude` = defaults embutidos + `<cidade>/.claude/settings.json`).
+O `pool-reviewer` fiado na raiz virou a config da cidade inteira: `gate-done` OFF (builder não conseguia submeter ao gate), CLAUDE.md do Athos/gt fora, memória off, deny de `Agent`/`EnterWorktree`.
+O merge (`internal/overlay/merge.go`) **só adiciona chave**, então reverter o `overlay_dir` não limpou: a sobra voltou (2ª ocorrência) e só saiu limpando os DOIS arquivos à mão.
+
+Estado hoje: os 2 revisores usam o overlay base `pool`; a economia de -27k chars de doutrina do revisor continua valendo (é `TD_ROLE`, env); a de tools/skills/CLAUDE.md (a sonda mediu ≈ -58k tokens no 1º turno do revisor, ver o topo) **não**.
+O manifesto declara isso (`roles.reviewer.workdir = "city-root"` diz ONDE roda; `wired_overlay = "pool"` diz o que está fiado) e três coisas enforçam:
+1. `pool-preamble-build.selftest.sh` (C/C3): papel `city-root` só pode ter o overlay base; `own` exige `work_dir`; com mutações (o teste antigo EXIGIA o `pool-reviewer`).
+2. `scripts/overlay-root-leak-guard.py` (+ `.selftest.sh`, order `overlay-root-leak-guard` a cada 10 min): lê `gc config show` E os dois arquivos vivos; vermelho se agente na raiz tem overlay de papel, se dois agentes com overlays diferentes dividem um `work_dir`, ou se raiz/`.gc` já contêm chave de papel. `rc 2` = não consegui saber (nunca "limpo").
+3. Um crash do guard sai `rc 2`, não `rc 1`: erro não se passa por achado.
+
+Religar o `pool-reviewer` (só com prova de spawn real): dê aos 2 revisores um `work_dir` FIXO e próprio (não use `{{.AgentBase}}`: é um diretório por sessão, ~800/semana), troque `roles.reviewer.workdir` para `"own"` e REMOVA `wired_overlay`/`_wired_overlay_why` (o campo do Mayor, 49cd6f040, que registra o overlay desligado),
+aponte o `overlay_dir` dos 2 `agent.toml` para `.../pool-reviewer`, rode o selftest (C) e o guard, e confira com um spawn real que `<cidade>/.claude/settings.json` e `<cidade>/.gc/settings.json` ficaram intactos (guard `rc 0`). **Mayor agenda o reload.**
 
 ## Deploy e reversão
 

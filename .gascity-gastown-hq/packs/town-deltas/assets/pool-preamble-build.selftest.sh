@@ -13,6 +13,9 @@
 #   C. FIAÇÃO    — city.toml/agent.toml: cada papel aponta pro SEU overlay e tem o TD_ROLE certo; ninguém fora do
 #                  manifesto ganhou TD_ROLE (Mayor/crews/witness seguem recebendo a doutrina inteira — fail-open); os
 #                  agentes sem dado de uso (boot/deacon/auto-refiner/context-check) seguem no overlay `pool`.
+#                  ga-swnkfm: papel com `workdir: city-root` no manifesto (os revisores: sem work_dir, rodam na RAIZ) só pode ter o
+#                  overlay BASE fiado — o do papel vaza pro .claude/settings.json da raiz e daí pro .gc/settings.json de TODA sessão;
+#                  `workdir: own` exige work_dir declarado. C3 são as mutações da fiação (o teste antigo EXIGIA o pool-reviewer).
 #   D. MOTOR REAL — `gc prime --strict` (o binário VIVO) em uma cidade descartável, com um agente sintético por papel:
 #                  o texto renderizado é EXATAMENTE o que o manifesto promete; agente SEM TD_ROLE recebe o fragment
 #                  inteiro, byte a byte igual ao fragment sem guardas; toda sentinela do núcleo aparece em TODO papel;
@@ -138,32 +141,45 @@ EOF
 expect_fail "guarda sem {{ end -}} (template quebraria o prompt de TODOS os agentes)" "fragment"
 
 echo "== C. fiação: overlay_dir + TD_ROLE por papel (city.toml patches + agent.toml)"
-python3 - "$HQ" "$SELF_DIR/claude-overlays/pool-roles.json" <<'EOF' && ok "fiação bate com o manifesto" || bad "fiação diverge do manifesto (ver acima)"
+wiring_check() { python3 - "$1" "$2" <<'EOF'
 import json, sys, tomllib
 from pathlib import Path
 hq, man = Path(sys.argv[1]), json.load(open(sys.argv[2]))
 city = tomllib.load(open(hq / "city.toml", "rb"))
 patches = [p for p in city.get("patches", {}).get("agent", [])]
 def effective(name):
-    """overlay_dir (último vence) e env (merge aditivo) de um agente: patches do city.toml + o próprio agent.toml."""
-    ov, env = None, {}
+    """overlay_dir (último vence), env (merge aditivo) e work_dir de um agente: patches do city.toml + o próprio agent.toml."""
+    ov, env, wd = None, {}, None
     at = hq / "agents" / name / "agent.toml"
     if at.exists():
-        a = tomllib.load(open(at, "rb")); ov = a.get("overlay_dir", ov); env.update(a.get("env", {}))
+        a = tomllib.load(open(at, "rb")); ov = a.get("overlay_dir", ov); env.update(a.get("env", {})); wd = a.get("work_dir", wd)
     for p in patches:
         if p.get("name") in (name, "gastown." + name) and p.get("dir", "") == "":
-            ov = p.get("overlay_dir", ov); env.update(p.get("env", {}))
-    return ov, env
+            ov = p.get("overlay_dir", ov); env.update(p.get("env", {})); wd = p.get("work_dir", wd)
+    return ov, env, wd
 errs = []
 base = "packs/town-deltas/assets/claude-overlays/"
 claimed = set()
 for role, r in man["roles"].items():
     for ag in r["agents"]:
         bare = ag.split(".")[-1]; claimed.add(bare)
-        ov, env = effective(bare if bare != "dog" else "dog")
-        # wired_overlay: papel cujo overlay próprio foi DESLIGADO de propósito (ex.: revisor, ga-swnkfm) — a fiação tem que bater com ele.
-        want = base + r.get("wired_overlay", r["overlay"])
-        if ov != want: errs.append(f"{ag}: overlay_dir={ov!r}, esperado {want!r}")
+        ov, env, wd = effective(bare if bare != "dog" else "dog")
+        # wired_overlay (Mayor, 49cd6f040): papel cujo overlay próprio foi DESLIGADO de propósito (ex.: revisor, ga-swnkfm) — a fiação tem que bater com ele.
+        want_name = r.get("wired_overlay", r["overlay"])
+        want = base + want_name
+        # ga-swnkfm (26/09): overlay_dir faz JSON-merge em <workdir>/.claude/settings.json e o .gc/settings.json de TODAS as sessões é derivado do
+        # <cidade>/.claude/settings.json. Agente SEM work_dir roda na RAIZ da cidade => só o overlay BASE é seguro ali (o pool-reviewer vazou: gate-done
+        # off + CLAUDE.md fora + memória off pra cidade inteira). O manifesto declara onde o papel roda (`workdir`); o overlay fiado tem que combinar.
+        at_root = r.get("workdir") == "city-root"
+        if ov != want:
+            why = f" — papel workdir=city-root: na raiz só o overlay base `{man['base_overlay']}` é seguro (ga-swnkfm; ver overlay-root-leak-guard.py)" if at_root else ""
+            errs.append(f"{ag}: overlay_dir={ov!r}, esperado {want!r}{why}")
+        if at_root and want_name != man["base_overlay"]:
+            errs.append(f"{ag}: manifesto diz workdir=city-root mas ESPERA o overlay {want_name!r} fiado — na raiz só o base `{man['base_overlay']}` é seguro (foi o incidente do ga-swnkfm, com manifesto e agent.toml concordando no vazamento); troque workdir para \"own\" (com work_dir) ou use wired_overlay = base")
+        if at_root and wd:
+            errs.append(f"{ag}: manifesto diz workdir=city-root mas o agente tem work_dir={wd!r} — troque o manifesto para \"own\" (e religue o overlay do papel) ou tire o work_dir")
+        if r.get("workdir") == "own" and (hq / "agents" / bare / "agent.toml").exists() and not wd:
+            errs.append(f"{ag}: manifesto diz workdir=own mas o agente NÃO declara work_dir — ele roda na RAIZ e o overlay do papel vaza pra cidade inteira (ga-swnkfm)")
         # overlay_dir que NÃO existe é NO-OP SILENCIOSO no engine (internal/overlay: "se srcDir não existe, retorna nil"): a sessão nasce
         # SEM overlay — sem o deny de `rm -rf` (ga-q640n), sem RC off (wa-cy6we) e sem nenhum corte. Sem erro. Por isso o arquivo tem que existir.
         if ov and not (hq / ov / ".claude" / "settings.json").is_file(): errs.append(f"{ag}: overlay_dir aponta pra {ov!r} mas {ov}/.claude/settings.json NÃO existe (no-op silencioso: sessão sem overlay nenhum)")
@@ -180,11 +196,58 @@ for at in sorted((hq / "agents").glob("*/agent.toml")):
     if has and name not in claimed: errs.append(f"agents/{name}: tem TD_ROLE mas não está no manifesto (perderia doutrina em silêncio)")
 # sem dado de uso -> seguem no overlay `pool` (a promessa do manifesto: 'papéis que NÃO estão aqui seguem como antes')
 for name in ("boot", "deacon", "auto-refiner", "context-check-reviewer"):
-    ov, _ = effective(name)
+    ov, _, _ = effective(name)
     if ov != base + "pool": errs.append(f"{name}: overlay_dir={ov!r}; esperado o `pool` original (sem dado de uso para trocar)")
 for e in errs: print("      ✗", e)
 sys.exit(1 if errs else 0)
 EOF
+}
+wiring_check "$HQ" "$SELF_DIR/claude-overlays/pool-roles.json" && ok "fiação bate com o manifesto" || bad "fiação diverge do manifesto (ver acima)"
+
+# C3. controles negativos da fiação — o incidente ga-swnkfm (26/09) passou por um teste de fiação que só conferia "o agente aponta pro overlay do
+#     manifesto": ele EXIGIA o pool-reviewer e o pool-reviewer é justamente o que vaza quando o agente roda na raiz. HQ descartável, mesmas leis.
+H="$W/hq"; mkdir -p "$H/packs/town-deltas/assets" "$H/agents"
+ln -s "$SELF_DIR/claude-overlays" "$H/packs/town-deltas/assets/claude-overlays"
+reset_hq() {
+  cp "$HQ/city.toml" "$H/city.toml"; cp "$SELF_DIR/claude-overlays/pool-roles.json" "$H/man.json"
+  for d in "$HQ"/agents/*/; do n="$(basename "$d")"; mkdir -p "$H/agents/$n"; [ -f "$d/agent.toml" ] && cp "$d/agent.toml" "$H/agents/$n/agent.toml"; done
+  return 0
+}
+pyedit() { python3 - "$@" <<'EOF'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p, encoding="utf-8").read()
+if old not in s: sys.exit(f"pyedit: '{old}' não está em {p}")
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+EOF
+}
+prepend() { printf '%s\n%s' "$2" "$(cat "$1")" > "$1"; }
+man_edit() { # $1=own|nowire — own: workdir=own E tira o wired_overlay (religar); nowire: só tira o wired_overlay (manifesto passa a ESPERAR o overlay do papel)
+  python3 - "$H/man.json" "$1" <<'EOF'
+import json, sys
+p, mode = sys.argv[1], sys.argv[2]
+m = json.load(open(p, encoding="utf-8")); r = m["roles"]["reviewer"]
+if mode == "own": r["workdir"] = "own"
+r.pop("wired_overlay", None); r.pop("_wired_overlay_why", None)
+json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+EOF
+}
+REVS="gate-reviewer refino-gate-reviewer"
+expect_wiring_fail() { # $1=descrição $2=trecho esperado
+  local o rc; o="$(wiring_check "$H" "$H/man.json" 2>&1)"; rc=$?
+  if [ $rc -ne 0 ] && echo "$o" | grep -q -F -- "$2"; then ok "reprova: $1"; else bad "fiação NÃO reprovou (rc=$rc): $1 — esperava '$2'"; echo "$o" | sed 's/^/      /' | head -5; fi
+}
+reset_hq; if o="$(wiring_check "$H" "$H/man.json" 2>&1)"; then ok "controle positivo: cópia intacta da fiação passa"; else bad "cópia intacta da fiação deveria passar"; echo "$o" | sed 's/^/      /' | head -5; fi
+reset_hq; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/pool"' 'claude-overlays/pool-reviewer"'; done
+expect_wiring_fail "INCIDENTE: revisor SEM work_dir fiado ao pool-reviewer (o overlay vaza da raiz pra cidade inteira)" "workdir=city-root"
+reset_hq; man_edit nowire; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/pool"' 'claude-overlays/pool-reviewer"'; done
+expect_wiring_fail "INCIDENTE com manifesto E agent.toml concordando no vazamento (era o estado do commit eb4ef5b6b: o teste antigo o EXIGIA)" "na raiz só o base"
+reset_hq; for r in $REVS; do prepend "$H/agents/$r/agent.toml" 'work_dir = ".gc/agents/gate-reviewer"'; done
+expect_wiring_fail "manifesto diz city-root mas o revisor JÁ tem work_dir (manifesto velho: o overlay do papel ficaria desligado à toa)" "tem work_dir"
+reset_hq; pyedit "$H/man.json" '"workdir": "city-root"' '"workdir": "own"'; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/pool"' 'claude-overlays/pool-reviewer"'; done
+expect_wiring_fail "manifesto diz own + pool-reviewer fiado, mas o revisor NÃO declara work_dir (religar sem dar work_dir = o incidente de novo)" "NÃO declara work_dir"
+reset_hq; man_edit own; for r in $REVS; do pyedit "$H/agents/$r/agent.toml" 'claude-overlays/pool"' 'claude-overlays/pool-reviewer"'; prepend "$H/agents/$r/agent.toml" 'work_dir = ".gc/agents/gate-reviewer"'; done
+if o="$(wiring_check "$H" "$H/man.json" 2>&1)"; then ok "caminho legítimo de religar passa: workdir=own + work_dir próprio + overlay pool-reviewer + wired_overlay removido"; else bad "o caminho legítimo de religar o pool-reviewer deveria passar"; echo "$o" | sed 's/^/      /' | head -5; fi
 
 # C2. os overlays TÊM que estar versionados: .gitignore ignora `.claude/` — um overlay novo fica de fora do commit em silêncio e o
 #     deploy leva o city.toml apontando pra um diretório que não existe (achado na hora de commitar; use `git add -f`).

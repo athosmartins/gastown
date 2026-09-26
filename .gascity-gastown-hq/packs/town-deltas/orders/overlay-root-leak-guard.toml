@@ -1,0 +1,23 @@
+# ga-swnkfm: recurring detector for the "role overlay leaked into the city's shared settings" class.
+# Incident 26/09: the reviewers have no work_dir (they run at the city ROOT), so the per-role overlay_dir
+# (pool-reviewer, ga-aijm2v.6) was JSON-merged into <city>/.claude/settings.json, and the engine derives
+# <city>/.gc/settings.json — the --settings of EVERY session — from that file (internal/hooks/hooks.go
+# installClaude). Result: gate-done OFF (builders could not submit to the gate), the doctrine CLAUDE.md
+# excluded, memory off, for the whole city. The overlay merge only ADDS keys, so reverting overlay_dir did
+# not clean it: the leak came back (2nd occurrence) from a supervisor holding the old config.
+# Detection-only (never writes either file — cleaning is a decision for whoever has the context). Each tick
+# reads BOTH live files AND `gc config show`: red if a root-resident agent carries a role overlay, if two
+# agents with different overlays share a work_dir, or if either file already holds role-overlay keys.
+# rc 2 = could not verify (never "clean"); alarms via escalation-router.sh (topic infra -> mayor), deduped
+# per finding, cooldown 4h, re-alarms at once if a cleaned finding comes back. --order: like the other
+# guards the alarm IS the channel, so the exec exits 0 once the finding is alarmed/deduped and exits 2 only
+# if the alarm DELIVERY failed (the order runner records any non-zero exit as a failed run).
+# Cadence: measured ~6s wall for one full run at load ~50 (the `gc config show` dominates; 0.6s idle) — the
+# incident recurred within ~30 min, so 10m (a ~100x margin over the run) instead of the 1h of the
+# not-urgent config guards. Deliberately a gc order (fresh exec each tick), never a raw plist, and it
+# also self-locks (fcntl.flock) — same reasoning as engine-window-backlog-guard (ga-y0g5x).
+[order]
+description = "Detect per-role overlay keys leaking into <city>/.claude/settings.json or .gc/settings.json (both files + gc config show); alarm the mayor, never write"
+trigger = "cooldown"
+interval = "10m"
+exec = "$PACK_DIR/assets/scripts/overlay-root-leak-guard.py --order"

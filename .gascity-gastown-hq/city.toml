@@ -282,6 +282,9 @@ min_active_sessions = 1
 # REVERTER UM PAPEL: volte overlay_dir para .../pool e apague a linha env — agente sem TD_ROLE recebe a doutrina
 # inteira, byte-idêntico ao de antes (provado pelo selftest contra o `gc prime` real). Racional/medição:
 # docs/pool-preamble-per-role.md. boot/deacon/auto-refiner/context-check-reviewer seguem no `pool` (sem dados de uso).
+# gate-reviewer/refino-gate-reviewer TAMBÉM seguem no `pool`: rodam na RAIZ da cidade (sem work_dir), e overlay de papel aplicado na raiz vaza pro
+# .claude/settings.json da cidade e pro .gc/settings.json de TODAS as sessões (ga-swnkfm, 26/09) — ver pool-roles.json roles.reviewer._workdir_why.
+# overlay-root-leak-guard.py (order de 10 min, só detecta) alarma o Mayor se um agente na raiz ganhar overlay de papel; dog/wa-worker/ps-worker têm work_dir próprio.
 [[patches.agent]]
 dir = ""
 name = "gastown.dog"
