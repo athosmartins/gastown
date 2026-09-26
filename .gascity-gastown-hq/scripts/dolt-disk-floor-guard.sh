@@ -476,9 +476,9 @@ GROWTH_BASELINE_INTERVAL_SECS="${DOLT_DISK_FLOOR_GROWTH_BASELINE_INTERVAL_SECS:-
 # The episode photo runs BEFORE the floor-triggered reclaim levers (they delete the
 # very things that grew), so the budget bounds the ROOT SCAN's share of any delay to
 # them. (_reap_growing_logs is not one of them: it runs every cycle at the top of
-# main(), before the photo.) It
-# is not the whole delay: the /System/Volumes/VM du (<=20s) and the writers lsof
-# (<=30s) sit outside it, so the worst case is budget + ~50s (see _disk_growth_photo).
+# main(), before the photo.) It is not the whole delay: the /System/Volumes/VM du
+# (<=20s) and the writers lsof (<=30s) sit outside it, so the worst case is budget +
+# ~50s (see _disk_growth_photo).
 GROWTH_ROOT_TIMEOUT_SECS="${DOLT_DISK_FLOOR_GROWTH_ROOT_TIMEOUT_SECS:-60}"
 GROWTH_TOTAL_BUDGET_SECS="${DOLT_DISK_FLOOR_GROWTH_TOTAL_BUDGET_SECS:-150}"
 # Tighter budget for the photo taken on a CRITICAL cycle: it runs before the
@@ -1185,9 +1185,10 @@ _growth_roots() {
 # mid-scan). Such a chunk's rows may EXCLUDE what du could not read — an unreadable
 # subtree is left out of its parent's row, and an unreadable child prints no row at
 # all — so a root with N > 0 is not a complete measurement. It stays STATUS OK
-# anyway, because it is routine (measured 2026-09-25 with this very xargs shape: 1
-# of 46 chunks on /private/tmp, 2 of 115 on ~/shared/data) and demoting it to PARTIAL
-# would forbid every "new" claim on those roots for good; instead the count travels
+# anyway, because it is routine (measured 2026-09-26 with this very scan on this
+# host: 1 du-error chunk of ~54 on /private/tmp, 6 of ~114 on ~/shared/data) and
+# demoting it to PARTIAL would forbid every "new" claim on those roots for good;
+# instead the count travels
 # with the root, and _growth_delta / _growth_report show it (DU ERRORS) and stop
 # calling an entry "new" on a baseline that had any. N is absent when no scan ran
 # (MISSING / SYMLINK / SKIPPED / no scratch file). Chunked + parallel
@@ -1523,7 +1524,7 @@ _growth_report() {
   echo "Growth since the last OK photo (${age}; entries that grew >= ${GROWTH_MIN_DELTA_MB}MB, MB path):"
   delta="$(_growth_delta "$base" "$now" "$GROWTH_TOP_N" "$GROWTH_MIN_DELTA_MB")"
   g="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "G" {
-    if ($4 == "unmeasured") printf "  up to +%sMB  %s  (now %sMB; not in the baseline, whose scan of this root could not read everything — it may not be new)\n", $2, $5, $3
+    if ($4 == "unmeasured") printf "  up to +%sMB  %s  (now %sMB; not in the baseline, whose scan of this root cannot vouch that it read everything — it may not be new)\n", $2, $5, $3
     else printf "  +%sMB  %s  (now %sMB, was %s%s)\n", $2, $5, $3, $4, ($4 == "new" ? "" : "MB")
   }')"
   u="$(printf '%s\n' "$delta" | awk -F'\t' '$1 == "U" { printf "  NOT FULLY COMPARED: %s (%s)\n", $2, $3 }')"
@@ -1793,8 +1794,9 @@ _growth_baseline_refresh() {
 # and everything after it in main()): they delete scratch, caches and orphans, which
 # are exactly the things a growth photo should still be able to see. The one
 # exception is _reap_growing_logs, which runs every cycle at the top of main() and so
-# has already run — a capped log that grew under /private/tmp may already be trimmed. The top growers are also logged. The episode is only marked as
-# photographed once the file actually landed, so a failed write is retried.
+# has already run — a capped log that grew under /private/tmp may already be trimmed.
+# The top growers are also logged. The episode is only marked as photographed once
+# the file actually landed, so a failed write is retried.
 _growth_episode_photo() {
   local class="$1" avail="$2" level stamp file base report t0 l budget
   [ "$GROWTH_PHOTO_ENABLED" = "1" ] || return 0
@@ -1829,13 +1831,21 @@ _growth_episode_photo() {
 # photo THIS EPISODE took (which may be from an earlier cycle than the mail), or
 # an explicit statement that there is none — never silence.
 _growth_mail_text() {
-  local pf; pf="$(_growth_read_episode_photo)"
+  local pf txt; pf="$(_growth_read_episode_photo)"
   if [ -z "$pf" ] || [ ! -s "$pf" ]; then
     echo "  (no disk-growth photo recorded for this episode — DOLT_DISK_FLOOR_GROWTH_PHOTO_ENABLED=0, or the scan could not write its file; see ga-ond0fa)"
     return 0
   fi
   echo "  Photo file: ${pf}"
-  awk '/^# ==== disk-growth report/ { on = 1; next } on && /^# / { sub(/^# /, "  "); print }' "$pf"
+  # The report is APPENDED to the photo after it was written (_growth_episode_photo), and
+  # that append is best-effort: if it failed, the file holds raw ROOT/ENT lines and no
+  # report. Citing the file and then printing nothing would read as "nothing to report".
+  txt="$(awk '/^# ==== disk-growth report/ { on = 1; next } on && /^# / { sub(/^# /, "  "); print }' "$pf" 2>/dev/null)"
+  if [ -n "$txt" ]; then
+    printf '%s\n' "$txt"
+  else
+    echo "  (the photo file has no report section — its human-readable report could not be appended; the raw ROOT/ENT lines in it are all there is)"
+  fi
 }
 
 # _safe_reclaim <before_avail_gb> → best-effort `gc dolt-cleanup --force` (orphan
@@ -3173,8 +3183,8 @@ ${top_disk:-  (unmeasured — no known roots present or du failed)}
 
 WHAT GREW (ga-ond0fa) — this episode's disk-growth photo: taken in one cycle of the episode (its
 class and time are in the photo file's report header), before THAT cycle's reclaim levers ran.
-Levers of earlier cycles of the same episode (e.g. at WARN) may already have removed some of what
-grew. Diffed against the last OK photo:
+Levers of earlier cycles of the same episode (e.g. at WARN), and the log-cap lever that runs first on
+EVERY cycle, may already have removed or trimmed some of what grew. Diffed against the last OK photo:
 ${growth_txt}"
         "$GC" mail send mayor -s "Dolt disk-floor CRITICAL: avail=${avail}GB" -m "$mail_body" 2>/dev/null || log "WARN: gc mail send mayor failed"
         _write_last_mail_state "$now" "$avail"

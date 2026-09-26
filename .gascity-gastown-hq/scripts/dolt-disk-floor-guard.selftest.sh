@@ -1830,7 +1830,7 @@ case "$rep_e" in
   *) bad "_growth_report: e1/fresh line wrong: $(printf '%s' "$rep_e" | head -c 500)" ;;
 esac
 case "$rep_e" in
-  *"up to +200MB  /e2/fresh  (now 200MB; not in the baseline, whose scan of this root could not read everything — it may not be new)"*) ok "_growth_report: an unmeasured-baseline entry reads 'up to +200MB ... may not be new', never 'was new'" ;;
+  *"up to +200MB  /e2/fresh  (now 200MB; not in the baseline, whose scan of this root cannot vouch that it read everything — it may not be new)"*) ok "_growth_report: an unmeasured-baseline entry reads 'up to +200MB ... may not be new', never 'was new'" ;;
   *) bad "_growth_report: e2/fresh 'up to' line wrong: $(printf '%s' "$rep_e" | head -c 500)" ;;
 esac
 case "$rep_e" in
@@ -1990,6 +1990,20 @@ case "$mt" in
   *"Photo file: $(sed -n 2p "$EPF")"*"db1"*) ok "_growth_mail_text: cites the episode's photo path and its growers" ;;
   *) bad "_growth_mail_text: wrong: $(printf '%s' "$mt" | head -c 300)" ;;
 esac
+
+# a photo whose report section could not be appended (the append is best-effort) must not be cited
+# in silence: the mail says the report is missing instead of printing nothing after "Photo file:"
+NR_PHOTO="$GROW_TMP/state/disk-growth-99990101-000000.txt"
+NR_EP1="$(sed -n 1p "$EPF")"; NR_EP2="$(sed -n 2p "$EPF")"     # this episode's real pointer, restored below
+printf '%s\n' "TS${TAB}1" "ROOT${TAB}OK${TAB}/x${TAB}0" "ENT${TAB}10${TAB}/x/a" > "$NR_PHOTO"
+_growth_write_episode WARN "$NR_PHOTO"
+nr_mt="$(_growth_mail_text)"
+case "$nr_mt" in
+  *"Photo file: $NR_PHOTO"*"has no report section"*) ok "_growth_mail_text: a photo with no report section says so instead of citing the file and printing nothing" ;;
+  *) bad "_growth_mail_text: a report-less photo must be called out, got: $(printf '%s' "$nr_mt" | head -c 300)" ;;
+esac
+rm -f "$NR_PHOTO"
+_growth_write_episode "$NR_EP1" "$NR_EP2"
 
 # an episode ends when the disk recovers: fresh photo next time, and the mail text says there is none
 _growth_clear_episode
@@ -3679,7 +3693,7 @@ esac
 # "before THAT cycle's levers" and say earlier cycles' levers may already have run.
 case "$GC_MAIL_LAST_BODY" in
   *"before any reclaim lever"*) bad "main(): the mail claims the photo predates ANY reclaim lever — false after WARN -> CRITICAL, earlier cycles' levers already ran" ;;
-  *"before THAT cycle's reclaim levers"*"Levers of earlier cycles"*"may already have removed"*)
+  *"before THAT cycle's reclaim levers"*"Levers of earlier cycles"*"log-cap lever that runs first on"*"may already have removed or trimmed"*)
     ok "main(): the mail promises only 'before THAT cycle's levers' and says earlier cycles' levers may already have removed some of what grew" ;;
   *) bad "main(): mail body lacks the qualified 'before THAT cycle's levers / earlier cycles may already have removed' wording: $(printf '%s' "$GC_MAIL_LAST_BODY" | tail -c 700)" ;;
 esac
