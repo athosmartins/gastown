@@ -41,8 +41,13 @@
 #      file outside the protected trees, missing branch, a RENAMED-and-edited
 #      bad file (refused), a non-ASCII path (refused), `git diff` failing (must
 #      be nao-consegui-medir, never sem-sh-alterado), a failed fetch with stale
-#      refs (must not measure the stale commit), and that every verdict leaves
-#      a log line + marker label so coverage can be audited afterwards.
+#      refs (must not measure the stale commit), an UNSET RIG_PATH / BEAD_ID /
+#      BRANCH (must fail open AND be recorded — it used to skip the whole check
+#      with no log line and no label), an extraction sub-directory that cannot
+#      be created (unrun, never an aborted sweep), and that every verdict leaves
+#      a log line + marker label so coverage can be audited afterwards. Every
+#      scenario runs with a PRIVATE TMPDIR, so the clean-up assertion does not
+#      depend on what else is in /tmp.
 #   3. Drift guards on the live script — placement, wiring, ordering.
 #
 # Exit 0 iff every assertion holds.
@@ -252,6 +257,15 @@ echo "── 2. live Step 5b-pre3 block (extracted from the guard) under /bin/ba
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/gate-b32-selftest.XXXXXX")"
 trap 'rm -rf "$TMPD"' EXIT
 
+# The live block's scratch list/worktree dirs go in THIS private directory, never
+# in the shared TMPDIR: the "cleans up after itself" assertion below counts what
+# is left here, so a stray production-shaped dir in /tmp (a killed guard run
+# leaves one forever) or a real guard sweep running concurrently cannot turn a
+# correct run red (gate round 4, medium finding: the verdict depended on ambient
+# state).
+SCRATCH="$TMPD/scratch"
+mkdir -p "$SCRATCH"
+
 LIVE_BLOCK="$TMPD/live-block.sh"
 sed -n '/^# SELFTEST-EXTRACT bash32-check: BEGIN$/,/^# SELFTEST-EXTRACT bash32-check: END$/p' "$GUARD" | sed '1d;$d' > "$LIVE_BLOCK"
 if [ -s "$LIVE_BLOCK" ] && /bin/bash -n "$LIVE_BLOCK" 2>/dev/null; then
@@ -309,6 +323,16 @@ echo "mktemp: simulated failure" >&2
 exit 1
 SHIMEOF
 chmod +x "$TMPD/shim-mktemp-fails/mktemp"
+
+# ...and one that makes `mkdir` fail (the scratch dir exists, but a sub-directory
+# for an extracted file cannot be created — disk full, permissions).
+mkdir -p "$TMPD/shim-mkdir-fails"
+cat > "$TMPD/shim-mkdir-fails/mkdir" <<'SHIMEOF'
+#!/bin/sh
+echo "mkdir: simulated failure" >&2
+exit 1
+SHIMEOF
+chmod +x "$TMPD/shim-mkdir-fails/mkdir"
 
 ORIGIN_DIR="$TMPD/origin.git"
 CLONE_DIR="$TMPD/rig-clone"
@@ -462,16 +486,19 @@ git clone -q "$ORIGIN_DIR" "$RIG_PATH"
 git -C "$RIG_PATH" config user.email "test@gascity.local"
 git -C "$RIG_PATH" config user.name "Test"
 
-# b32_run <rig_path> <branch> [<path_shim_dir>] — executes the live block via
-# the driver under /bin/bash 3.2; sets R_* result variables.
+# b32_run <rig_path> <branch> [<path_shim_dir> [<bead_id>]] — executes the live
+# block via the driver under /bin/bash 3.2; sets R_* result variables. An EMPTY
+# argument is passed through empty (that is how the unset-input scenarios below
+# reproduce RIG_PATH / BEAD_ID / BRANCH not having been resolved upstream); the
+# bead id only defaults when the 4th argument is omitted altogether.
 R_RC=""; R_VERDICT=""; R_STATUS_ERR=""; R_FELL=""; R_LOGN=""; R_LOG=""; R_CALLS=""
 b32_run() {
-  local rig="$1" branch="$2" shim="${3:-}"
+  local rig="$1" branch="$2" shim="${3:-}" bead="${4-ga-selftest}"
   local calls="$TMPD/calls.$RANDOM.$RANDOM"
   : > "$calls"
   local pathv="$PATH"
   [ -n "$shim" ] && pathv="$shim:$PATH"
-  env PATH="$pathv" RIG_PATH="$rig" BEAD_ID="ga-selftest" BRANCH="$branch" \
+  env PATH="$pathv" TMPDIR="$SCRATCH" RIG_PATH="$rig" BEAD_ID="$bead" BRANCH="$branch" \
       MARKER_ID="ga-marker-selftest" GC_CITY="/nonexistent-city" \
       GUARD="$GUARD" BLOCK="$LIVE_BLOCK" CALLS="$calls" \
       /bin/bash "$TMPD/driver.sh" >/dev/null 2>"$calls.stderr"
@@ -636,10 +663,57 @@ eq "live block, RIG_PATH=<toplevel>/.gascity-gastown-hq: a bad .sh under the rig
 b32_run "$TOPO_RIG" topo/outside
 eq "live block, subdir topology: a bad .sh in the toplevel but OUTSIDE the rig subdir -> sem-sh-alterado (the pathspec is relative to the rig path)" "$R_VERDICT/$R_RC" "sem-sh-alterado/0"
 
+# --- gate round 4 (BLOCKING): an UNSET input must be RECORDED, never skipped in silence ---
+# The whole check used to sit inside `if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] &&
+# [ -n "$BRANCH" ]; then ... fi` with no else, while its header said fail-open "is
+# never SILENT" and listed RIG_PATH as a covered cause. RIG_PATH is empty exactly
+# when `gc rig list --json` failed or timed out upstream (the Dolt-load condition
+# the repo's own doctrine records at 8-17s), so the likeliest real-world failure
+# left NO log line and NO label — indistinguishable from "the check never ran", and
+# "N submissions went unchecked" could not be counted. The branch below carries a
+# bad .sh on purpose: the check must still fail OPEN (not refuse on inputs it does
+# not have), but it must say so.
+assert_unset_input_recorded() {   # <what was unset> <the <EMPTY> field the log must show>
+  eq "live block: $1 on a branch with a bad .sh -> nao-consegui-medir, FAILS OPEN (exit 0, falls through, no refusal)" "$R_VERDICT/$R_RC/$R_FELL/$R_STATUS_ERR" "nao-consegui-medir/0/1/0"
+  eq "live block: $1 still leaves exactly ONE BASH32-CHECK audit line (it used to leave none)" "$R_LOGN" "1"
+  case "$R_LOG" in
+    *"$2"*"list_unread=1"*"inputs_ok=0"*) ok "live block: $1 is recorded as '$2 ... list_unread=1 ... inputs_ok=0' (the record says WHICH input was missing and that the list was never read)" ;;
+    *) bad "live block: $1 record is not '$2 ... list_unread=1 ... inputs_ok=0': '$R_LOG'" ;;
+  esac
+  grep -q 'could not fully measure' "$R_CALLS" \
+    && ok "live block: $1 emits the human-readable 'could not fully measure' line" \
+    || bad "live block: $1 emits no 'could not fully measure' line"
+  grep -Eq '^BD -C [^ ]+ label add ga-marker-selftest gate-bash32:nao-consegui-medir( |$)' "$R_CALLS" \
+    && ok "live block: $1 labels the marker gate-bash32:nao-consegui-medir (queryable after the fact)" \
+    || bad "live block: $1 leaves no gate-bash32:nao-consegui-medir marker label"
+}
+b32_run "" feat/badsyntax
+assert_unset_input_recorded "RIG_PATH empty (rig list failed/timed out upstream)" "rig_path=<EMPTY>"
+b32_run "$RIG_PATH" feat/badsyntax "" ""
+assert_unset_input_recorded "BEAD_ID empty" "bead=<EMPTY>"
+b32_run "$RIG_PATH" ""
+assert_unset_input_recorded "BRANCH empty" "branch=<EMPTY>"
+b32_run "$TMPD/no-such-rig-dir" feat/badsyntax
+eq "live block: RIG_PATH set but not a repo (git cannot even fetch) -> nao-consegui-medir, recorded, fails open" "$R_VERDICT/$R_RC/$R_LOGN" "nao-consegui-medir/0/1"
+
+# --- a scratch sub-directory that cannot be created is UNRUN, not an aborted sweep ---
+# The guard runs under `set -euo pipefail`; a bare `mkdir -p ... 2>/dev/null` that
+# fails would kill the whole sweep before the verdict is recorded (no log line, no
+# label, no fail-open).
+b32_run "$RIG_PATH" feat/badsyntax "$TMPD/shim-mkdir-fails"
+eq "live block: mkdir of the extraction dir fails on a branch with a bad .sh -> nao-consegui-medir, fails open, does NOT abort the sweep" "$R_VERDICT/$R_RC/$R_FELL/$R_STATUS_ERR" "nao-consegui-medir/0/1/0"
+case "$R_LOG" in
+  *"changed=1 checked=0"*"unrun=1"*) ok "live block: the mkdir failure is recorded as changed=1 checked=0 unrun=1" ;;
+  *) bad "live block: mkdir failure is not recorded as unrun=1: '$R_LOG'" ;;
+esac
+
 _WT_COUNT=$(git -C "$RIG_PATH" worktree list 2>/dev/null | wc -l | tr -d ' ')
 eq "the check creates no linked worktrees in the rig repo (only the main worktree is listed)" "$_WT_COUNT" "1"
-_TMP_LEFTOVER=$(ls -d "${TMPDIR:-/tmp}"/gate-b32-list-* "${TMPDIR:-/tmp}"/gate-b32-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9] 2>/dev/null | wc -l | tr -d ' ')
-eq "the check cleans up its own scratch list/worktree dirs" "$_TMP_LEFTOVER" "0"
+# Counted in the PRIVATE $SCRATCH every b32_run pointed TMPDIR at — never in the
+# shared /tmp, whose ambient contents (a stray dir from a killed run, a concurrent
+# real guard sweep) are not this test's to judge.
+_TMP_LEFTOVER=$(ls -A "$SCRATCH" 2>/dev/null | wc -l | tr -d ' ')
+eq "the check cleans up its own scratch list/worktree dirs (private TMPDIR: nothing left over across every scenario above)" "$_TMP_LEFTOVER" "0"
 
 rm -rf "$TMPD"
 trap - EXIT
@@ -663,7 +737,10 @@ BEGIN_COUNT=$(grep -c '^# SELFTEST-EXTRACT bash32-check: BEGIN$' "$GUARD")
 END_COUNT=$(grep -c '^# SELFTEST-EXTRACT bash32-check: END$' "$GUARD")
 eq "guard.sh: SELFTEST-EXTRACT bash32-check sentinels present exactly once each (section 2 depends on them)" "$BEGIN_COUNT/$END_COUNT" "1/1"
 
-B32_BLOCK=$(awk '/Step 5b-pre3 \(ga-7dx2vw\)/,/^fi$/' "$GUARD")
+# Header comment + block, up to the END sentinel. (This range used to end at the
+# first column-0 `fi`, which was the end of the block only while the whole check
+# sat inside ONE outer `if`; the record is written after the measurement `if` now.)
+B32_BLOCK=$(awk '/Step 5b-pre3 \(ga-7dx2vw\)/,/^# SELFTEST-EXTRACT bash32-check: END$/' "$GUARD")
 B32_CODE=$(sed -n '/^# SELFTEST-EXTRACT bash32-check: BEGIN$/,/^# SELFTEST-EXTRACT bash32-check: END$/p' "$GUARD" | grep -v '^[[:space:]]*#')
 
 echo "$B32_BLOCK" | grep 'gate_bash32_verdict "\$_B32_CHANGED" "\$_B32_CHECKED" "\$_B32_FAILED" "\$_B32_UNMEASURED"' >/dev/null \
@@ -756,6 +833,51 @@ if grep -F 'launchd-invoked with (com.gascity' "$GUARD" >/dev/null; then
   bad "guard.sh: the gate_bash32_verdict doc still says the com.gascity.* plists hardcode /bin/bash for every script (measured: 70 of 93; the rest run python3/gc/launchctl)"
 else
   ok "guard.sh: the gate_bash32_verdict doc no longer over-claims what the com.gascity.* plists run"
+fi
+
+# Gate round 4 (BLOCKING): the header said fail-open "is never SILENT" and that
+# every verdict "writes a BASH32-CHECK log line and a gate-bash32:<verdict> marker
+# label", while the whole check was skipped — with no record — whenever
+# RIG_PATH/BEAD_ID/BRANCH was empty. The behavior is pinned by the live-block
+# scenarios above; these pin the prose and the structure so the claim cannot drift
+# away from the code again.
+if echo "$B32_BLOCK" | grep -F 'this one included, writes' >/dev/null; then
+  bad "guard.sh: the header again says every verdict 'this one included, writes' a log line AND a marker label — the label write is best-effort (|| true), only the log line is unconditional"
+else
+  ok "guard.sh: the header no longer over-claims that the marker label is always written"
+fi
+if echo "$B32_BLOCK" | grep -F 'the log line is what to count' >/dev/null \
+   && echo "$B32_BLOCK" | grep -F 'an unset RIG_PATH/BEAD_ID/BRANCH' >/dev/null \
+   && echo "$B32_BLOCK" | grep -F 'inputs_ok=0' >/dev/null; then
+  ok "guard.sh: the header names the unset-input skip as a fail-open cause, says the log line is the durable record, and states how it is logged (inputs_ok=0)"
+else
+  bad "guard.sh: the header does not state that an unset RIG_PATH/BEAD_ID/BRANCH is a recorded (inputs_ok=0) fail-open cause with the log line as the durable record"
+fi
+# Structure: the record (label + log line + verdict case) must not sit inside the
+# `if [ -n "$RIG_PATH" ] ...` that gates the measurement. In the extracted code
+# the input gate is the only top-level `if`, its `else` is present, and its `fi`
+# comes BEFORE the label/log/case lines — a skip path can then not be silent.
+_GATE_IF=$(echo "$B32_CODE" | grep -n '^if \[ -n "\$RIG_PATH" \] && \[ -n "\$BEAD_ID" \] && \[ -n "\$BRANCH" \]; then$' | head -1 | cut -d: -f1)
+_GATE_ELSE=$(echo "$B32_CODE" | grep -n '^else$' | head -1 | cut -d: -f1)
+_GATE_FI=$(echo "$B32_CODE" | grep -n '^fi$' | head -1 | cut -d: -f1)
+_REC_LABEL=$(echo "$B32_CODE" | grep -n '^bd -C "\$GC_CITY" label add "\$MARKER_ID" "gate-bash32:\$_B32_VERDICT"' | head -1 | cut -d: -f1)
+_REC_LOG=$(echo "$B32_CODE" | grep -n '^log "BASH32-CHECK ' | head -1 | cut -d: -f1)
+if [ -n "$_GATE_IF" ] && [ -n "$_GATE_ELSE" ] && [ -n "$_GATE_FI" ] && [ -n "$_REC_LABEL" ] && [ -n "$_REC_LOG" ] \
+   && [ "$_GATE_IF" -lt "$_GATE_ELSE" ] && [ "$_GATE_ELSE" -lt "$_GATE_FI" ] \
+   && [ "$_GATE_FI" -lt "$_REC_LABEL" ] && [ "$_REC_LABEL" -lt "$_REC_LOG" ]; then
+  ok "guard.sh: the input gate has an else, and the marker label + BASH32-CHECK log line sit AFTER its fi (a skip path cannot leave no record)"
+else
+  bad "guard.sh: structure drifted — gate if=${_GATE_IF:-missing} else=${_GATE_ELSE:-missing} fi=${_GATE_FI:-missing} label=${_REC_LABEL:-missing} log=${_REC_LOG:-missing}; the record must come after the input gate's fi"
+fi
+if echo "$B32_CODE" | grep -E '^[[:space:]]*mkdir -p [^|]*2>/dev/null[[:space:]]*$' >/dev/null; then
+  bad "REGRESSION (set -e): a bare 'mkdir -p ... 2>/dev/null' in the block aborts the whole sweep, with no record, when it fails"
+else
+  ok "guard.sh: no bare mkdir in the block (a failure is counted as unrun, not an aborted sweep)"
+fi
+if echo "$B32_CODE" | grep -E '^[[:space:]]*(rm -f|if .*; then rm -rf) [^|]*2>/dev/null[[:space:]]*(; fi)?[[:space:]]*$' >/dev/null; then
+  bad "REGRESSION (set -e): a bare rm clean-up in the block aborts the sweep, before the verdict is recorded, when it fails"
+else
+  ok "guard.sh: the block's scratch clean-up is '|| true' (it cannot stop the verdict from being recorded)"
 fi
 
 RIGPATH_LINE=$(grep -n '\[ -d "\$RIG_PATH" \] || RIG_PATH=""' "$GUARD" | head -1 | cut -d: -f1)
