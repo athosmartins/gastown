@@ -283,6 +283,9 @@ R="$(gate_fail_pool_veto_reasons "$(bj wa-worker "" open '["gate:needs-fix","pil
 eq "veto reasons (wording only) name the labels" "$R" "label:pilot:no-auto-dispatch,prefix:pool:refused:x"
 eq "veto reasons: nothing for a clean bead / unreadable input (empty, never a claim)" "$(gate_fail_pool_veto_reasons "$REAL")|$(gate_fail_pool_veto_reasons '')|$(gate_fail_pool_veto_reasons 'not json')" "||"
 
+grep -qE '^_GATE_VETO_LIB_DIR="\$\(cd .*\)/scripts" \|\| true$' "$DISPATCHER" \
+  && ok "the lib-dir assignment cannot errexit the daemon (|| true; the [ -r ] guard then reads it as 'no lib')" \
+  || bad "the _GATE_VETO_LIB_DIR assignment is not guarded with || true — a failed cd would kill the set -e dispatcher"
 echo "== 7c. the veto lib cannot be loaded => 'unread' (=> the Mayor is paged), never 'no vetoes' (ga-q4sadt: a bare source of a missing file kills the daemon)"
 NOLIB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gate-defer-nolib.XXXXXX")"
 OUT="$(bash -c 'set -euo pipefail; _GATE_VETO_LIB_DIR="$1"; eval "$2"; echo REACHED' _ "$NOLIB_DIR" "$POOL_VETO_LOAD_BODY" 2>&1)"

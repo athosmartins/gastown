@@ -279,7 +279,9 @@ def run(args):
         print(line)
         if args.log:
             try:
-                os.makedirs(os.path.dirname(args.log), exist_ok=True)
+                log_dir = os.path.dirname(args.log)
+                if log_dir:     # a bare file name has no dir part; makedirs("") would raise and the log would never be written
+                    os.makedirs(log_dir, exist_ok=True)
                 with open(args.log, "a") as fh:
                     fh.write(line + "\n")
             except OSError as exc:

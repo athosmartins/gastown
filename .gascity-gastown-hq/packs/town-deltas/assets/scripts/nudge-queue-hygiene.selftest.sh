@@ -301,6 +301,11 @@ hyg --apply --log /dev/null/cannot/run.jsonl >/dev/null 2>"$SBX/c15.err"; rc=$?
 eq "an unwritable log does not mask the run's own rc 2" "$rc" "2"
 case "$(cat "$SBX/c15.err")" in *"could not append"*) ok "and says so on stderr" ;; *) bad "unwritable log not reported on stderr: [$(cat "$SBX/c15.err")]" ;; esac
 
+{ item a gastown.dog-1 s1 "$WARN" 2026-09-25T10:00:00Z; } | put_state     # a VALID queue again (the state.json above was left malformed on purpose)
+( cd "$SBX/c15" && python3 "$HYG" --queue-dir "$Q" --sessions-file "$SF" --city "$SBX" --apply --log bare-name.jsonl >/dev/null 2>"$SBX/c15b.err" ); rc=$?
+eq "a --log with a BARE file name (no dir part) is written, not a silent never-logged" "$rc:$(wc -l < "$SBX/c15/bare-name.jsonl" 2>/dev/null | tr -d ' ')" "0:1"
+eq "and says nothing on stderr" "$(cat "$SBX/c15b.err")" ""
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

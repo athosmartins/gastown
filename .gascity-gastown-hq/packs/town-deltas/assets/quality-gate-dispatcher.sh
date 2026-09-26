@@ -2682,7 +2682,9 @@ gate_fail_author_is_ephemeral() {
 # before any log line exists, so the lib is loaded only when `[ -r ]`. If it is absent the
 # predicate below answers "unread" (=> the Mayor is paged, the pre-story behaviour) — a missing
 # veto list must never read as "no vetoes".
-_GATE_VETO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts"
+# `|| true`: a failed `cd` inside the substitution is a live errexit trigger for this daemon; with it the
+# variable is just "/scripts", which the [ -r ] guard below reads as "no lib" (=> predicate answers "unread").
+_GATE_VETO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts" || true
 # SELFTEST-EXTRACT pool-veto-lib-load: BEGIN
 if [ -r "$_GATE_VETO_LIB_DIR/pool-probe-vetoes.sh" ]; then
   source "$_GATE_VETO_LIB_DIR/pool-probe-vetoes.sh"
@@ -8809,7 +8811,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
         GATE_FAIL_POOL_VETO_REASONS=$(gate_fail_pool_veto_reasons "$_GFAIL_FINAL_JSON")
         _GFAIL_VETO_NOTE=""
         if [ -n "$GATE_FAIL_POOL_VETO_REASONS" ]; then
-          _GFAIL_VETO_NOTE=" NOTE: the pool probe REFUSES this bead (${GATE_FAIL_POOL_VETO_REASONS}) — no pool worker will pick it up on its own; that is what its labels say, not a write that failed."
+          _GFAIL_VETO_NOTE=" NOTE: the pool probe REFUSES this bead (${GATE_FAIL_POOL_VETO_REASONS}) — no pool worker will pick it up on its own, and the Pilot re-dispatch promised above rests on the same vetoes; that is what its labels say, not a write that failed."
         fi
         if [ "${_GFAIL_ASSIGNEE_OBS:-}" = "assignee=cleared" ]; then
           # the arm that issued the reopen + gate:queued removal: report what the re-read shows.
