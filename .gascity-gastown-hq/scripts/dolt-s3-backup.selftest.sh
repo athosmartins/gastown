@@ -1502,10 +1502,16 @@ N_LN="$(printf '%s\n' "$BLOCK" | grep -nF '_backup_fail_note "$db"' | head -1 | 
 [ -n "$N_LN" ] && [ -n "$M_LN" ] && [ "$N_LN" -lt "$M_LN" ] \
   && ok "…and the failure streak is noted (ga-rt7ljo) BEFORE the mirror runs" \
   || bad "refusal branch: streak note missing or after the mirror (note@${N_LN:-?} mirror@${M_LN:-?})"
+# The UNGUARDED mirror is only safe where no sync attempt ran before the refusal. Since ga-ua269q
+# it has exactly TWO callers: the step-1 refusal above, and _mirror_staging_after_aborted_sync
+# (which gates it on the manifest fingerprint). Any third caller — e.g. pasted into a post-attempt
+# preflight — would mirror a possibly half-applied staging with no gate at all.
 N_CALLS="$(grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"' "$SCRIPT")"
-[ "$N_CALLS" -eq 1 ] \
-  && ok "the mirror has exactly ONE call site — not wired into the post-sync-attempt preflights (a half-written staging must never be mirrored)" \
-  || bad "expected exactly 1 call site of the mirror, found $N_CALLS"
+[ "$N_CALLS" -eq 2 ] \
+  && ok "the unguarded mirror has exactly TWO call sites (step-1 refusal + the fingerprint-gated helper) — none in a post-attempt preflight" \
+  || bad "expected exactly 2 call sites of the unguarded mirror (step-1 refusal + _mirror_staging_after_aborted_sync), found $N_CALLS"
+H_CALL="$(awk '/^_mirror_staging_after_aborted_sync\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT" | grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"')"
+[ "$H_CALL" -eq 1 ] && ok "…and one of the two is inside _mirror_staging_after_aborted_sync, after its fingerprint checks" || bad "the gated helper does not call the mirror exactly once (found $H_CALL)"
 FBODY="$(awk '/^_mirror_staging_after_disk_refusal\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
 printf '%s' "$FBODY" | grep -qF -- '--delete' \
   && bad "the refusal mirror uses --delete (must be additive on a night with no fresh sync)" \
@@ -1514,6 +1520,108 @@ printf '%s' "$FBODY" | grep -qF '_s3proof_repair_then_prove' \
   && ok "the refusal mirror goes through the shared proof lib (closure-guarded, manifest-last)" \
   || bad "the refusal mirror bypasses the shared proof lib"
 grep -qF 'dolt-backup-s3-proof.sh' "$SCRIPT" && ok "the proof lib is sourced by the script" || bad "proof lib not sourced"
+
+# ── ga-ua269q: _staging_manifest_fp + _mirror_staging_after_aborted_sync (unit level) ──────
+# The end-to-end block at the bottom proves the whole chain; these pin each decision of the
+# gate on its own, including the doubtful inputs (no baseline, unreadable, staging vanished).
+echo "── _staging_manifest_fp + _mirror_staging_after_aborted_sync (ga-ua269q) ──"
+type _staging_manifest_fp >/dev/null 2>&1 && type _mirror_staging_after_aborted_sync >/dev/null 2>&1 \
+  && ok "both helpers defined by lib-mode source" \
+  || bad "ga-ua269q helpers NOT defined"
+
+FP_DIR="$(mktemp -d)"
+mkdir -p "$FP_DIR/a"; printf 'manifest-v1' > "$FP_DIR/a/manifest"
+fp1="$(_staging_manifest_fp "$FP_DIR/a")"
+case "$fp1" in [0-9]*-[0-9]*) ok "a readable manifest fingerprints as <crc>-<size> ($fp1)" ;; *) bad "unexpected fingerprint '$fp1'" ;; esac
+[ "$(_staging_manifest_fp "$FP_DIR/a")" = "$fp1" ] && ok "…the same bytes give the same fingerprint" || bad "fingerprint is not stable"
+printf 'manifest-v2' > "$FP_DIR/a/manifest"          # same length, different bytes
+[ "$(_staging_manifest_fp "$FP_DIR/a")" != "$fp1" ] && ok "…different bytes (even at the same size) give a different one" || bad "a changed manifest kept its fingerprint"
+[ "$(_staging_manifest_fp "$FP_DIR/none")" = absent ] && ok "no manifest / no dir → 'absent' (never a fingerprint)" || bad "a missing manifest was not reported absent"
+mkdir -p "$FP_DIR/d/manifest"                        # exists but cannot be read as a file
+[ "$(_staging_manifest_fp "$FP_DIR/d" 2>/dev/null)" = unreadable ] \
+  && ok "a manifest that cannot be read → 'unreadable' (a third state: not absent, not a fingerprint)" \
+  || bad "unreadable manifest mis-reported: '$(_staging_manifest_fp "$FP_DIR/d" 2>/dev/null)'"
+
+GA_CALLS="$(mktemp)"; GA_LOG="$(mktemp)"
+_GA_REAL_MIRROR="$(declare -f _mirror_staging_after_disk_refusal)"
+_mirror_staging_after_disk_refusal() { echo "mirror $1 $2" >> "$GA_CALLS"; return "${GA_MIRROR_RC:-0}"; }
+_s3proof_s3_closure_ok() { echo "closure $1" >> "$GA_CALLS"; return "${GA_S3_RC:-0}"; }
+printf 'manifest-v1' > "$FP_DIR/a/manifest"; PRE="$(_staging_manifest_fp "$FP_DIR/a")"
+
+# unchanged manifest → the mirror decides, and only the mirror (S3 is not read separately)
+for mrc in 0 1; do
+  : > "$GA_CALLS"; : > "$GA_LOG"
+  GA_MIRROR_RC=$mrc LOG="$GA_LOG" _mirror_staging_after_aborted_sync hq "$FP_DIR/a" "$PRE"; rc=$?
+  [ "$rc" -eq "$mrc" ] && [ "$(cat "$GA_CALLS")" = "mirror hq $FP_DIR/a" ] \
+    && ok "manifest unchanged → hands the staging to the mirror and returns ITS verdict ($mrc), nothing else consulted" \
+    || bad "unchanged manifest, mirror rc=$mrc: got rc=$rc calls='$(cat "$GA_CALLS")'"
+done
+grep -q "manifest unchanged by the attempt ($PRE)" "$GA_LOG" && ok "…and the log says why it went ahead" || bad "no reason logged for going ahead: $(cat "$GA_LOG")"
+
+# changed manifest → INERT: no mirror, S3's own state is read instead and reported honestly
+printf 'manifest-v2' > "$FP_DIR/a/manifest"
+for src in 0 1; do
+  : > "$GA_CALLS"; : > "$GA_LOG"
+  GA_S3_RC=$src LOG="$GA_LOG" _mirror_staging_after_aborted_sync hq "$FP_DIR/a" "$PRE"; rc=$?
+  [ "$rc" -eq "$src" ] && [ "$(cat "$GA_CALLS")" = "closure hq" ] \
+    && ok "manifest CHANGED → not mirrored; S3's own closure is read and returned ($src)" \
+    || bad "changed manifest, S3 rc=$src: got rc=$rc calls='$(cat "$GA_CALLS")'"
+done
+grep -q "staging manifest CHANGED during the attempt (before=$PRE after=" "$GA_LOG" && grep -q 'NOT mirroring' "$GA_LOG" \
+  && ok "…and the log names the before/after fingerprints and says it did NOT mirror" \
+  || bad "changed-manifest reason missing from the log: $(cat "$GA_LOG")"
+
+# no usable baseline → INERT, whatever the staging looks like now ('absent' twice must NOT read as 'unchanged')
+rm -f "$FP_DIR/a/manifest"
+for nofp in "" absent unreadable; do
+  : > "$GA_CALLS"; : > "$GA_LOG"
+  GA_S3_RC=1 LOG="$GA_LOG" _mirror_staging_after_aborted_sync hq "$FP_DIR/a" "$nofp"; rc=$?
+  [ "$rc" -eq 1 ] && [ "$(cat "$GA_CALLS")" = "closure hq" ] && grep -q 'no usable fingerprint' "$GA_LOG" \
+    && ok "baseline '${nofp:-<empty>}' → not mirrored, says so, S3's own state is what gets reported" \
+    || bad "baseline '${nofp:-<empty>}': rc=$rc calls='$(cat "$GA_CALLS")' log='$(cat "$GA_LOG")'"
+done
+# a real baseline but the manifest is GONE now (wiped / released by another job) → changed, inert
+: > "$GA_CALLS"; : > "$GA_LOG"
+GA_S3_RC=0 LOG="$GA_LOG" _mirror_staging_after_aborted_sync hq "$FP_DIR/a" "$PRE"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$GA_CALLS")" = "closure hq" ] && grep -q 'after=absent' "$GA_LOG" \
+  && ok "a real baseline but the manifest is gone now → treated as CHANGED (after=absent), inert" \
+  || bad "vanished manifest was not treated as a change: rc=$rc calls='$(cat "$GA_CALLS")'"
+
+unset -f _mirror_staging_after_disk_refusal _s3proof_s3_closure_ok
+eval "$_GA_REAL_MIRROR"
+rm -rf "$FP_DIR" "$GA_CALLS" "$GA_LOG"
+
+# drift-guards: the wiring in the main loop (lib mode never runs it)
+echo "── drift-guard: the aborted-sync mirror is wired where the measured chain lands (ga-ua269q) ──"
+LOOP_LN="$(grep -n '^for db in \$DBS; do' "$SCRIPT" | head -1 | cut -d: -f1)"
+FIRST_PF_LN="$(awk -v s="$LOOP_LN" 'NR>s && /if ! _sync_disk_preflight "\$db"; then/{print NR; exit}' "$SCRIPT")"
+PREFP_LN="$(grep -nF 'pre_fp="$(_staging_manifest_fp "$dest")"' "$SCRIPT" | head -1 | cut -d: -f1)"
+[ -n "$LOOP_LN" ] && [ -n "$PREFP_LN" ] && [ -n "$FIRST_PF_LN" ] && [ "$PREFP_LN" -gt "$LOOP_LN" ] && [ "$PREFP_LN" -lt "$FIRST_PF_LN" ] \
+  && ok "the baseline fingerprint is taken inside the per-db loop, BEFORE the first preflight/sync attempt" \
+  || bad "baseline fingerprint not taken before the first attempt (loop@${LOOP_LN:-?} pre_fp@${PREFP_LN:-?} first-preflight@${FIRST_PF_LN:-?})"
+FB_BLOCK="$(awk '/connection-timeout retries exhausted — falling back/{f=1} f{print} /_offline_backup_sync "\$db" "\$dest"; then/{if(f) exit}' "$SCRIPT")"
+printf '%s' "$FB_BLOCK" | grep -qF '_mirror_staging_after_aborted_sync "$db" "$dest" "$pre_fp"' \
+  && ok "the offline-fallback refusal (where the hq chain ends) calls the fingerprint-gated mirror with the baseline" \
+  || bad "the offline-fallback refusal does not call _mirror_staging_after_aborted_sync with \$pre_fp — S3 stays unrepaired on this path"
+printf '%s' "$FB_BLOCK" | grep -qF '_mirror_staging_after_disk_refusal' \
+  && bad "the post-attempt refusal calls the UNGUARDED mirror directly — the fingerprint gate is bypassed" \
+  || ok "…and it never calls the unguarded mirror directly"
+FA_LN="$(printf '%s\n' "$FB_BLOCK" | grep -nF 'failed=$((failed+1))' | head -1 | cut -d: -f1)"
+FN_LN="$(printf '%s\n' "$FB_BLOCK" | grep -nF '_backup_fail_note "$db"' | head -1 | cut -d: -f1)"
+FM_LN="$(printf '%s\n' "$FB_BLOCK" | grep -nF '_mirror_staging_after_aborted_sync' | head -1 | cut -d: -f1)"
+[ -n "$FA_LN" ] && [ -n "$FN_LN" ] && [ -n "$FM_LN" ] && [ "$FA_LN" -lt "$FN_LN" ] && [ "$FN_LN" -lt "$FM_LN" ] \
+  && ok "…it still counts the db failed and notes the streak (ga-rt7ljo) BEFORE the slow mirror" \
+  || bad "fallback refusal order wrong (failed@${FA_LN:-?} streak-note@${FN_LN:-?} mirror@${FM_LN:-?})"
+printf '%s' "$FB_BLOCK" | grep -qF '(disco+s3)' && printf '%s' "$FB_BLOCK" | grep -qF '(disco)' \
+  && ok "…and its alert distinguishes disco (S3 sound) from disco+s3 (S3 NOT proven)" \
+  || bad "fallback refusal no longer distinguishes S3 state in the alert"
+SM_BODY="$(awk '/^_sync_with_stale_manifest_recovery\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
+printf '%s' "$SM_BODY" | grep -qF '_mirror_staging_after' \
+  && bad "_sync_with_stale_manifest_recovery mirrors — but it wipes the staging first, so there is nothing valid to mirror" \
+  || ok "the stale-manifest recovery (which wipes the staging) stays out of the mirror, by design"
+GA_BODY="$(awk '/^_mirror_staging_after_aborted_sync\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
+printf '%s' "$GA_BODY" | grep -qF -- '--delete' && bad "the gated mirror mentions --delete (must stay additive)" || ok "the gated mirror never uses --delete"
+printf '%s' "$GA_BODY" | grep -qF '_staging_manifest_fp "$dest"' && ok "…and it re-reads the manifest fingerprint itself (does not trust the caller's word)" || bad "the gated mirror does not re-read the staging manifest"
 
 echo "── _build_run_fingerprint() — a db that FAILED stays in _meta/latest.json (ga-gjfe78) ──"
 # The nightly fingerprint used to be rebuilt from scratch from the dbs that
@@ -1779,6 +1887,225 @@ else
   ok "drift-guard: no s3 cp of _meta/latest.json ends in '|| true'"
 fi
 rm -f "$PUB_DIR"/aws "$PUB_DIR"/notify "$PUB_DIR"/meta.json "$PUB_CALLS" "$PUB_NOTIFY" "$PUB_LOG" 2>/dev/null || true
+
+# ── ga-ua269q: the nightly's REAL failure sequence, end to end ──────────────────────────
+# Measured 2026-09-26 04:01:13 → 04:02:05 (hq): the disk preflight passes by a thin margin,
+# the server-mediated sync starts, the connection is cut ("connection was closed") after the
+# aborted sync already wrote ~2.1GB into the staging, and then BOTH the retry's preflight and
+# the offline fallback's preflight refuse. The mirror added for the FIRST refusal site
+# (ga-btnq6h) never ran on that path, so S3 stayed at an old manifest — 5 nights in a row.
+# The unit tests above stub the helpers; the wiring that was missing lives in the main loop,
+# which lib mode never runs. So this runs the WHOLE script (/bin/bash, like launchd) as a
+# subprocess against a throwaway city, with stub dolt/df/aws/notify/gc/sleep first on PATH.
+# Nothing real is touched: the city, the bucket, the notifier and the mailer are all fakes.
+echo "── end-to-end: disk refusal AFTER an aborted sync (ga-ua269q) — real subprocess, stubbed dolt/df/aws ──"
+E2E_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/s3backup-e2e.XXXXXX")"
+trap '[ -n "${E2E_KEEP:-}" ] || rm -rf "$E2E_ROOT"' EXIT   # E2E_KEEP=1 keeps the throwaway cities for debugging
+
+e2e_tid() { printf '%032d' "$1"; }                       # 32 chars of [0-9] = a valid table id
+_E_LOCKH="0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; _E_ROOTH="0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; _E_GCG="00000000000000000000000000000000"
+e2e_mkmanifest() { # <file> <n_tables> — names tables 1..n; no trailing newline, like Dolt's
+  local f="$1" n="$2" i s="5:__DOLT__:$_E_LOCKH:$_E_ROOTH:$_E_GCG"
+  for i in $(seq 1 "$n"); do s="$s:$(e2e_tid "$i"):$((i*7))"; done
+  printf '%s' "$s" > "$f"
+}
+e2e_mkbackup() { # <dir> <n_tables> — a CLOSED backup dir (every named table present)
+  local d="$1" n="$2" i; mkdir -p "$d"; e2e_mkmanifest "$d/manifest" "$n"
+  for i in $(seq 1 "$n"); do printf 'table%s' "$i" > "$d/$(e2e_tid "$i").darc"; done
+}
+
+e2e_write_stubs() { # <bin dir>
+  local b="$1"; mkdir -p "$b"
+  cat > "$b/dolt" <<'STUB'
+#!/bin/bash
+# fake dolt: answers only the queries dolt-s3-backup.sh makes. E2E_SYNC_MODE:
+#   ok                      — sync succeeds, touches nothing
+#   abort                   — writes an EXTRA table into the staging, leaves the manifest
+#                             alone, eats the disk headroom, then the connection is cut
+#   abort_changes_manifest  — same, but the manifest is also replaced (a half-applied sync)
+q=""; while [ $# -gt 0 ]; do [ "$1" = "-q" ] && q="$2"; shift; done
+echo "dolt: $q" >> "$E2E_CALLS"
+case "$q" in
+  "SHOW DATABASES") printf 'Database\nhq\ninformation_schema\n' ;;
+  "SELECT 1") echo 1 ;;
+  *"CALL DOLT_BACKUP('add'"*) : ;;
+  *"dolt_log ORDER BY date"*) printf 'commit_hash\nabc123\n' ;;
+  *"SELECT COUNT(*)"*) printf 'COUNT(*)\n5\n' ;;
+  *"CALL DOLT_BACKUP('sync'"*)
+    case "${E2E_SYNC_MODE:-ok}" in
+      abort|abort_changes_manifest)
+        printf 'partial-table-bytes' > "$E2E_STAGING/$(printf '%032d' 99).darc"
+        [ "$E2E_SYNC_MODE" = abort_changes_manifest ] && cp "$E2E_STATE/new_manifest" "$E2E_STAGING/manifest"
+        : > "$E2E_STATE/disk_full"
+        echo "error on line 1 for query CALL DOLT_BACKUP('sync', 'hq-backup'): Error 1105 (HY000): connection was closed"
+        exit 1 ;;
+    esac ;;
+esac
+exit 0
+STUB
+  cat > "$b/df" <<'STUB'
+#!/bin/bash
+# fake df: plenty of room until the aborted sync flips $E2E_STATE/disk_full
+if [ -e "$E2E_STATE/disk_full" ]; then avail=1000000; else avail=5000000; fi
+printf 'Filesystem 1024-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/fake 9999999 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "$avail"
+STUB
+  printf '#!/bin/bash\nexit 0\n' > "$b/sleep"
+  printf '#!/bin/bash\necho "$*" >> "$E2E_NOTIFY_CALLS"\n' > "$b/notify"
+  printf '#!/bin/bash\necho "gc $*" >> "$E2E_CALLS"\nexit 0\n' > "$b/gc"
+  printf '#!/bin/bash\necho "mail $*" >> "$E2E_CALLS"\n' > "$b/fake_mail"
+  # fake aws: the bucket is a directory ($FB/<db>/<object>) — same shape as the proof lib's own selftest
+  cat > "$b/aws" <<'STUB'
+#!/bin/bash
+echo "aws $*" >> "$CALLS"
+[ "$1" = "--version" ] && { echo "aws-cli/fake"; exit 0; }
+sub="$1"; shift
+case "$sub" in
+  s3api)
+    prefix=""; while [ $# -gt 0 ]; do [ "$1" = "--prefix" ] && prefix="$2"; shift; done
+    d="$FB/${prefix%/}"
+    if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then echo "None"; exit 0; fi
+    out=""; for f in "$d"/*; do out="${out:+$out	}${prefix}$(basename "$f")"; done
+    echo "$out"; exit 0 ;;
+  s3)
+    op="$1"; shift
+    case "$op" in
+      cp)
+        src="$1"; dst="$2"
+        case "$src" in
+          s3://*) key="${src#s3://*/}"; [ -f "$FB/$key" ] || exit 1; cp "$FB/$key" "$dst"; exit 0 ;;
+          *)      key="${dst#s3://*/}"; mkdir -p "$FB/$(dirname "$key")"; cp "$src" "$FB/$key"; exit 0 ;;
+        esac ;;
+      sync)
+        dir="${1%/}"; dst="$2"; shift 2
+        dry=0; excl=""
+        while [ $# -gt 0 ]; do
+          case "$1" in --dryrun) dry=1 ;; --exclude) excl="$excl $2"; shift ;; esac; shift
+        done
+        key="${dst#s3://*/}"; key="${key%/}"; mkdir -p "$FB/$key"
+        for f in "$dir"/*; do
+          [ -f "$f" ] || continue; n="$(basename "$f")"
+          skip=0; for e in $excl; do [ "$e" = "$n" ] && skip=1; done; [ $skip = 1 ] && continue
+          if [ ! -f "$FB/$key/$n" ] || [ "$(wc -c < "$f")" != "$(wc -c < "$FB/$key/$n")" ]; then
+            if [ "$dry" = 1 ]; then echo "(dryrun) upload: $f to $dst$n"; else cp "$f" "$FB/$key/$n"; fi
+          fi
+        done
+        exit 0 ;;
+    esac ;;
+esac
+exit 99
+STUB
+  chmod +x "$b"/*
+}
+
+# e2e_case <name> <staging: closed|broken> <sync mode> <disk at start: ok|full>
+# Leaves the run's paths in E2E_DIR / E2E_LOG and the script's exit code in E2E_RC.
+e2e_case() {
+  local name="$1" staging="$2" mode="$3" disk0="$4" E
+  E="$E2E_ROOT/$name"; E2E_DIR="$E"
+  # Fail-safe: this runs the script for real. A script WITHOUT the CITY/NOTIFY overrides (e.g. the
+  # gate's base-commit check re-running this selftest against code from before the seam existed)
+  # would use its hardcoded real city — the real log, the real failure-streak counter, a real push.
+  # Refuse to run it at all; the assertions below then fail cleanly against a run that never happened.
+  if ! grep -qF 'CITY="${DOLT_S3_BACKUP_CITY:-' "$SCRIPT" || ! grep -qF 'NOTIFY="${DOLT_S3_BACKUP_NOTIFY:-' "$SCRIPT"; then
+    mkdir -p "$E"; E2E_LOG="$E/never-ran.log"; E2E_RC=99
+    bad "e2e $name: the script under test has no DOLT_S3_BACKUP_CITY/NOTIFY override — running it would touch the REAL city (log, streak counter, push); NOT run"
+    return 0
+  fi
+  mkdir -p "$E/state" "$E/tmp" "$E/home" "$E/city/.gc/logs" "$E/city/.gc/runtime/packs/dolt" "$E/city/.beads/dolt/hq" "$E/bucket"
+  e2e_write_stubs "$E/bin"
+  printf 'listener:\n  port: 43210\ndata_dir: "%s"\n' "$E/city/.beads/dolt" > "$E/city/.gc/runtime/packs/dolt/dolt-config.yaml"
+  echo live > "$E/city/.beads/dolt/hq/blob"
+  e2e_mkbackup "$E/city/.dolt-backup/hq" 4                 # local staging: 4 tables, closed
+  [ "$staging" = broken ] && rm -f "$E/city/.dolt-backup/hq/$(e2e_tid 3).darc"
+  e2e_mkbackup "$E/bucket/hq" 2                            # S3: the older copy from the last repair (closed)
+  e2e_mkmanifest "$E/state/new_manifest" 3                 # what a half-applied sync leaves (tables 1-3, all present)
+  [ "$disk0" = full ] && : > "$E/state/disk_full"
+  E2E_LOG="$E/city/.gc/logs/dolt-s3-backup.log"
+  env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOLT_S3_BACKUP_CITY="$E/city" DOLT_S3_BACKUP_NOTIFY="$E/bin/notify" BACKUP_FAIL_FAKE_MAIL="$E/bin/fake_mail" \
+    RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" \
+    E2E_STAGING="$E/city/.dolt-backup/hq" E2E_STATE="$E/state" E2E_CALLS="$E/dolt.calls" \
+    E2E_NOTIFY_CALLS="$E/notify.calls" E2E_SYNC_MODE="$mode" \
+    timeout 120 /bin/bash "$SCRIPT" > "$E/run.out" 2>&1
+  E2E_RC=$?
+  : >> "$E/notify.calls"; : >> "$E/aws.calls"; : >> "$E/dolt.calls"
+}
+e2e_same() { cmp -s "$1" "$2"; }                            # byte-identical files
+
+# ── A: the measured sequence — preflight OK, sync cut, retry refused, fallback refused ──
+e2e_case case-a closed abort ok
+if [ "$E2E_RC" -eq 0 ] && [ "$(grep -c 'hq: sync preflight OK' "$E2E_LOG")" = 1 ] \
+   && [ "$(grep -c 'hq: sync preflight REFUSED' "$E2E_LOG")" = 2 ] \
+   && grep -q 'connection-timeout on sync — retrying' "$E2E_LOG" \
+   && [ "$(grep -c "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" = 1 ]; then
+  ok "e2e A: the harness reproduces the measured chain (preflight OK → sync cut → retry refused → fallback refused)"
+else
+  bad "e2e A: harness did not reproduce the 04:01:13→04:02:05 chain (rc=$E2E_RC) — $(tail -5 "$E2E_LOG" | tr '\n' '|')"
+fi
+grep -q 'existing staging mirrored to S3 anyway' "$E2E_LOG" \
+  && ok "e2e A: the log says the existing staging was mirrored to S3 anyway (the bead's acceptance line)" \
+  || bad "e2e A: no 'existing staging mirrored to S3 anyway' line — S3 was left at the old copy (the ga-ua269q bug)"
+e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_DIR/city/.dolt-backup/hq/manifest" \
+  && ok "e2e A: the S3 manifest advanced to the staging's manifest" \
+  || bad "e2e A: the S3 manifest did NOT advance — still the old 2-table copy"
+missing=""; for i in 1 2 3 4 99; do [ -f "$E2E_DIR/bucket/hq/$(e2e_tid "$i").darc" ] || missing="$missing $i"; done
+[ -z "$missing" ] && ok "e2e A: every table the new manifest names is in the bucket" || bad "e2e A: tables missing from the bucket:$missing"
+grep -q 'hq(disco)' "$E2E_DIR/notify.calls" && ! grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls" \
+  && ok "e2e A: the alert says (disco) — the disk refusal, with S3 proven sound (not disco+s3)" \
+  || bad "e2e A: alert tag wrong: $(cat "$E2E_DIR/notify.calls")"
+grep -q -- '--delete' "$E2E_DIR/aws.calls" \
+  && bad "e2e A: an aws call used --delete — the mirror on a failed night must be additive" \
+  || ok "e2e A: no aws call used --delete (additive mirror only)"
+
+# ── B: a half-applied sync CHANGED the manifest — the fingerprint gate must keep it inert ──
+# Its new manifest is CLOSED (tables 1-3 exist), so the closure proof alone would let it
+# through: only the before/after fingerprint stops it.
+e2e_case case-b closed abort_changes_manifest ok
+e2e_mkmanifest "$E2E_ROOT/old-s3-manifest" 2                # what S3 held BEFORE the run, rebuilt independently
+if ! grep -q 'mirrored to S3 anyway' "$E2E_LOG" && e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_ROOT/old-s3-manifest" \
+   && ! e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_DIR/city/.dolt-backup/hq/manifest" \
+   && [ ! -f "$E2E_DIR/bucket/hq/$(e2e_tid 99).darc" ]; then
+  ok "e2e B: manifest changed by the aborted sync → NOTHING mirrored (S3 untouched, extra table not uploaded)"
+else
+  bad "e2e B: a staging whose manifest the aborted sync changed was mirrored to S3 anyway"
+fi
+grep -q '\] hq: disk refusal after an aborted sync — staging manifest CHANGED' "$E2E_LOG" \
+  && ok "e2e B: the log says WHY it is inert (manifest changed during the attempt)" \
+  || bad "e2e B: inert but silent — the log gives no reason: $(grep -i 'hq:' "$E2E_LOG" | tail -3 | tr '\n' '|')"
+grep -q 'hq(disco' "$E2E_DIR/notify.calls" \
+  && ok "e2e B: the failure is still reported (hq(disco…) in the alert)" \
+  || bad "e2e B: alert lost the hq failure: $(cat "$E2E_DIR/notify.calls")"
+
+# ── C: manifest untouched but the staging is NOT closed — the closure proof must refuse ──
+e2e_case case-c broken abort ok
+if ! grep -q 'mirrored to S3 anyway' "$E2E_LOG" && [ "$(ls "$E2E_DIR/bucket/hq" | wc -l | tr -d ' ')" = 3 ] \
+   && e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_ROOT/old-s3-manifest"; then
+  ok "e2e C: staging whose manifest names a missing table → nothing uploaded (S3 keeps its 2 tables + old manifest)"
+else
+  bad "e2e C: a non-closed staging was mirrored: $(ls "$E2E_DIR/bucket/hq" | tr '\n' ' ')"
+fi
+grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls" \
+  && ok "e2e C: the alert says (disco+s3) — S3 was not brought up to date and that is not hidden" \
+  || bad "e2e C: alert tag wrong: $(cat "$E2E_DIR/notify.calls")"
+
+# ── F: the FIRST refusal site (ga-btnq6h) is unchanged: refused before any sync is attempted ──
+e2e_case case-f closed ok full
+if grep -q 'existing staging mirrored to S3 anyway' "$E2E_LOG" \
+   && e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_DIR/city/.dolt-backup/hq/manifest" \
+   && [ "$(grep -c "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" = 0 ]; then
+  ok "e2e F: first-site refusal (no sync attempted) still mirrors the staging — ga-btnq6h behaviour intact"
+else
+  bad "e2e F: first-site refusal regressed: $(grep 'hq:' "$E2E_LOG" | tail -3 | tr '\n' '|')"
+fi
+
+# ── H: a healthy night — the harness itself is sound, and no mirror-after-refusal noise ──
+e2e_case case-h closed ok ok
+if [ "$E2E_RC" -eq 0 ] && grep -q 'hq: OK (issues=5' "$E2E_LOG" && [ ! -s "$E2E_DIR/notify.calls" ] \
+   && ! grep -q 'disk refusal' "$E2E_LOG" && e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_DIR/city/.dolt-backup/hq/manifest"; then
+  ok "e2e H: a healthy night is untouched (hq OK, no alert, no refusal lines, S3 in step with staging)"
+else
+  bad "e2e H: healthy night misbehaved (rc=$E2E_RC): $(tail -6 "$E2E_LOG" | tr '\n' '|')"
+fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -39,7 +39,10 @@ set -uo pipefail
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
 
-CITY="/Users/athos/gt/.gascity-gastown-hq"
+# ga-ua269q: DOLT_S3_BACKUP_CITY / DOLT_S3_BACKUP_NOTIFY exist so the selftest can run this
+# whole script as a subprocess against a throwaway city with stub binaries (the nightly's
+# real failure sequence cannot be reproduced any other way). launchd never sets them.
+CITY="${DOLT_S3_BACKUP_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
 BACKUP_ROOT="$CITY/.dolt-backup"          # local staging (incremental; gc-doctor expects it)
 # ga-7gfd34: mol-dog-jsonl's archive — a LOCAL-only git repo (no push remote
@@ -51,7 +54,7 @@ JSONL_ARCHIVE_VERIFY_FILE="hq.jsonl"      # post-sync verify target
 BUCKET="urblink-dolt-backups"
 S3="s3://$BUCKET"
 LOG="$CITY/.gc/logs/dolt-s3-backup.log"
-NOTIFY="/Users/athos/.local/bin/notify"
+NOTIFY="${DOLT_S3_BACKUP_NOTIFY:-/Users/athos/.local/bin/notify}"
 AWS="$(command -v aws || echo /opt/homebrew/bin/aws)"
 # ga-tyaozh: aws-cli/botocore (>= ~2.33; confirmed empirically here on 2.34.48)
 # defaults request_checksum_calculation to "when_supported", which wraps every
@@ -483,9 +486,13 @@ _sync_disk_preflight() {
 # broken copy over S3). It ends by re-proving the S3 copy is restorable and matches the
 # staging, so the caller learns the true S3 state rather than assuming it.
 #
-# Deliberately NOT applied to the OTHER _sync_disk_preflight failure sites below: those
-# fire after a sync attempt may have half-written the staging, and a half-written
-# staging must never be mirrored.
+# This unguarded form is only for a refusal BEFORE any sync was attempted (nothing ran that
+# could have touched the staging). A refusal AFTER an attempted sync goes through
+# _mirror_staging_after_aborted_sync below, which adds the manifest-fingerprint gate
+# (ga-ua269q). The retry/fallback sites used to be excluded outright, on the theory that a
+# half-written staging must never be mirrored — but the sequence that actually happens to
+# hq (preflight passes by a thin margin, the sync is cut, the retry's preflight now refuses)
+# is exactly that one, and it left S3 unrepaired for 5 nights.
 #
 # Returns 0 iff S3 is PROVEN restorable (and, when a staging exists, identical to it);
 # 1 otherwise — including when it could not be found out. "No staging to mirror" does NOT
@@ -509,6 +516,82 @@ _mirror_staging_after_disk_refusal() {
   fi
   log "$db: disk refusal — S3 copy of $db is NOT proven restorable/identical to the staging after the mirror attempt (see lines above)"
   return 1
+}
+
+# _staging_manifest_fp <dest> — ga-ua269q's baseline: what the staging's `manifest` is right
+# now, as ONE word, in three states that must never collapse into each other:
+#   <crc>-<size>  the manifest exists and was read (cksum of its bytes);
+#   absent        there is no manifest file (never synced, or wiped);
+#   unreadable    it exists but could not be read.
+# Only two identical <crc>-<size> values mean "unchanged" — absent==absent or an unreadable
+# side proves nothing, so callers treat everything but a real, equal fingerprint as doubt.
+_staging_manifest_fp() {
+  local f="$1/manifest" out
+  [ -e "$f" ] || { echo absent; return 0; }
+  # brace group: a failed `< "$f"` open reports BEFORE a trailing 2>/dev/null would take effect
+  out="$({ cksum < "$f"; } 2>/dev/null | tr ' ' '-')"
+  case "$out" in
+    [0-9]*-[0-9]*) echo "$out" ;;
+    *) echo unreadable ;;
+  esac
+}
+
+# _report_s3_state_only <db> — read-only: is S3's OWN copy of <db> restorable (manifest
+# closure)? Same honesty as the no-staging branch above: says nothing about whether S3 is
+# up to date, only whether it restores. 0 iff proven.
+_report_s3_state_only() {
+  local db="$1"
+  if _s3proof_s3_closure_ok "$db"; then
+    log "$db: the S3 copy of $db is proven restorable (manifest closure), but it was NOT refreshed tonight"
+    return 0
+  fi
+  log "$db: the S3 copy of $db is NOT proven restorable (see line above), and it was NOT refreshed tonight"
+  return 1
+}
+
+# _mirror_staging_after_aborted_sync <db> <dest> <pre_fp> — ga-ua269q. The disk refusal that
+# comes AFTER a sync attempt already ran (the connection-timeout chain: attempt cut → retry's
+# preflight refuses → the offline fallback's preflight refuses). MEASURED 2026-09-26 04:01:13
+# → 04:02:05, hq: preflight OK by 515MB, `DOLT_BACKUP sync` cut after ~32s having already
+# written ~2.1GB into the staging, then the retry refused for disk. The mirror in
+# _mirror_staging_after_disk_refusal never ran on this path, so S3 stayed stale 5 nights.
+#
+# Why mirroring here is safe — and MEASURED, not assumed (dolt 2.3.1, a real `dolt backup
+# sync-url file://…` SIGKILLed mid-write, ga-ua269q): an aborted sync leaves NEW table files
+# in the staging but the `manifest` byte-identical (consistent with Dolt writing tables first
+# and swapping the manifest at the end — the outcome was observed, the mechanism was not read
+# from Dolt's source), so the staging is still the pre-sync copy and still closed; the next
+# sync completed cleanly.
+# The gate below does not trust that in general — it checks it, every night:
+#   1. <pre_fp> (from _staging_manifest_fp, taken BEFORE the first sync attempt) must be a
+#      real fingerprint, and the manifest NOW must have the same one. Changed, absent or
+#      unreadable → the attempt half-applied something, or another writer (mol-dog-backup
+#      syncs this same staging) got in: INERT, and the log line says which.
+#   2. Unchanged → _mirror_staging_after_disk_refusal, whose repair-then-prove lib refuses
+#      unless the staging's OWN manifest closes (every named table present), uploads
+#      additively (never --delete, tables first, manifest last) and re-proves S3 after.
+# The extra table files the cut sync left ride along to S3: harmless (nothing names them,
+# and the next completed sync makes them part of the manifest or leaves them as orphans).
+#
+# Deliberately NOT used after _sync_with_stale_manifest_recovery's refusals: that path wipes
+# the staging (rm -rf) before retrying, so there is no valid staging left to mirror.
+#
+# Same return contract as _mirror_staging_after_disk_refusal: 0 iff S3 is proven restorable
+# (and, when the staging was mirrored, identical to it). Never touches the ok/failed counters.
+_mirror_staging_after_aborted_sync() {
+  local db="$1" dest="$2" pre_fp="${3:-}" post_fp
+  case "$pre_fp" in
+    ''|absent|unreadable)
+      log "$db: disk refusal after an aborted sync — no usable fingerprint of the staging manifest from BEFORE the attempt (${pre_fp:-none}), cannot tell whether the attempt changed it — NOT mirroring"
+      _report_s3_state_only "$db"; return $? ;;
+  esac
+  post_fp="$(_staging_manifest_fp "$dest")"
+  if [ "$post_fp" != "$pre_fp" ]; then
+    log "$db: disk refusal after an aborted sync — staging manifest CHANGED during the attempt (before=$pre_fp after=$post_fp): a half-applied sync or another writer — NOT mirroring"
+    _report_s3_state_only "$db"; return $?
+  fi
+  log "$db: disk refusal after an aborted sync — staging manifest unchanged by the attempt ($pre_fp); handing it to the closure proof + additive mirror"
+  _mirror_staging_after_disk_refusal "$db" "$dest"
 }
 
 # _sync_once <db> — one CALL DOLT_BACKUP('sync', ...) attempt for <db>; raw
@@ -967,6 +1050,10 @@ for db in $DBS; do
   # the sync instead would race a hot store (e.g. hq) and record a commit newer than
   # the backup actually contains.
   head="$(dsql -q "SELECT commit_hash FROM \`$db\`.dolt_log ORDER BY date DESC LIMIT 1" --result-format csv 2>/dev/null | tail -1)"
+  # ga-ua269q: what the staging's manifest is BEFORE any sync attempt touches it — the
+  # baseline _mirror_staging_after_aborted_sync compares against if a later disk refusal
+  # follows an attempt that was cut. Taken per db, right before the first attempt.
+  pre_fp="$(_staging_manifest_fp "$dest")"
   # 1) native consistent backup -> local staging (incremental)
   if ! _sync_disk_preflight "$db"; then
     failed=$((failed+1))
@@ -1008,8 +1095,19 @@ for db in $DBS; do
         # the server-free path before giving up on this db.
         log "$db: connection-timeout retries exhausted — falling back to offline sync (no server involved)"
         if ! _sync_disk_preflight "$db"; then
-          failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(disco)"
-          _backup_fail_note "$db"; continue
+          failed=$((failed+1))
+          # ga-rt7ljo: streak note first — cheap bookkeeping, taken before the slow mirror.
+          _backup_fail_note "$db"
+          # ga-ua269q: this is where the measured hq chain lands (2026-09-26 04:01:13 → 04:02:05:
+          # sync cut, retry's preflight refused, this one refused too). The retry loop's own
+          # refusal falls through to here, so this one site covers both. The staging is mirrored
+          # to S3 only if the aborted attempt left its manifest untouched — see the helper.
+          if _mirror_staging_after_aborted_sync "$db" "$dest" "$pre_fp"; then
+            FAILED_DBS="$FAILED_DBS ${db}(disco)"
+          else
+            FAILED_DBS="$FAILED_DBS ${db}(disco+s3)"
+          fi
+          continue
         fi
         if ! _offline_backup_sync "$db" "$dest"; then
           failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
