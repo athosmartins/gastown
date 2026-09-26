@@ -72,8 +72,20 @@ source = "packs/town-deltas"
 # before it ever persisted its dedup state, so it re-nudged the same pairs on every run.
 # Do not remove "nudge-on-route" from this list unless nudge-on-route-gated is also removed —
 # running both would nudge twice. Rollback = drop the name from `skip` AND delete the new order.
+#
+# ga-7sxdmb: the maintenance pack's `mol-dog-jsonl` is switched OFF the same way (6 instances:
+# city + 5 rigs). The same-name town-deltas override (ga-gtrc8n, ga-fxrrav) only shadowed the
+# city instance, so the five rig instances kept running the builtin script WITHOUT the
+# ga-fxrrav guard and committed truncated exports as the snapshot into the archive that is
+# mirrored offsite (26/09: WA 5423 -> 505, false "JSONL spike detected [HIGH]" mails). It is
+# REPLACED by `jsonl-export` (packs/town-deltas/orders/jsonl-export.toml), a differently-named,
+# city-scoped order — `skip` matches by name, so it does not touch the replacement. The archive
+# stays at packs/maintenance/jsonl-archive (the offsite mirror's path), set in the script itself.
+# Do not remove "mol-dog-jsonl" from this list unless the rig instances are also known to run a
+# guarded script — prod-tests/gascity/story-ga-7sxdmb.sh asserts exactly one jsonl-export.sh
+# order in the live set. Rollback = drop the name from `skip` AND restore the same-name override.
 [orders]
-skip = ["wisp-compact", "nudge-on-route"]
+skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl"]
 
 [[rigs]]
 name = "property_scrapers"

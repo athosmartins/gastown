@@ -1,0 +1,39 @@
+# ga-7sxdmb: replaces the maintenance pack's `mol-dog-jsonl`, which city.toml now switches off
+# with `[orders] skip`. Same trigger and interval as the builtin.
+#
+# Why a NEW name + skip, and not the same-name override this pack used to carry
+# (ga-gtrc8n, ga-fxrrav): a same-name override only shadows the CITY-scoped instance. The
+# maintenance pack also registers `mol-dog-jsonl` once PER RIG (`gc order list` showed 6
+# instances: city + gastown, lexbh, marketing, property_scrapers, whatsapp_automation), and
+# those five kept running the builtin script — the one WITHOUT the ga-fxrrav guard — into the
+# shared packs/maintenance/jsonl-archive. On 2026-09-26 that committed truncated exports as
+# the snapshot (WA 5423 -> 505 rows, hq 14821 -> 10880), the next complete export read as
+# growth, and the Mayor got "JSONL spike detected [HIGH]" mails (WA 3430 -> 505 -> 5425).
+# That archive is what the nightly scripts/dolt-s3-backup.sh (~04:00) mirrors to S3, so a
+# truncated snapshot sitting there at sync time would go offsite.
+# Same trap ga-5mu653 hit with wisp-compact and ga-aijm2v.5 with nudge-on-route (see the
+# comment above `[orders]` in city.toml).
+#
+# One city-scoped instance is enough: the script exports EVERY user database found by
+# SHOW DATABASES, whichever rig's order fired it (nothing in it reads GC_RIG), so the five
+# rig instances were the same export five more times — concurrent full exports of ~60 MB
+# into one working tree, extra load on a Dolt that hands back truncated results under load
+# (ga-fxrrav).
+#
+# Script vendored into town-deltas/assets so $PACK_DIR resolves here (the embedded
+# maintenance copy is gitignored/ephemeral). It carries ensure_archive_pack_config()
+# (ga-gtrc8n: bounds git-maintenance's pack-objects memory/CPU on the archive repo —
+# measured 3.2GB RSS unbounded vs. 514MB bounded), the short-export guard (ga-fxrrav) and the
+# source-count partial-export gate (ga-7sxdmb). dolt-target.sh is vendored unchanged alongside
+# it so $SCRIPT_DIR-relative sourcing keeps resolving from this location.
+#
+# The archive stays at packs/maintenance/jsonl-archive — the path scripts/dolt-s3-backup.sh
+# mirrors offsite and scripts/dolt-gc-maintenance.sh archives pruned rows into (when
+# enabled) — via the script's own
+# default, NOT via GC_PACK_STATE_DIR (which gc points at packs/town-deltas for this order).
+# The old packs/town-deltas/jsonl-archive is no longer written; it is left in place.
+[order]
+description = "Export Dolt databases to JSONL git archive (ga-7sxdmb — replaces mol-dog-jsonl)"
+exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"
+trigger = "cooldown"
+interval = "15m"

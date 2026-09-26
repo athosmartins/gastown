@@ -60,11 +60,25 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 # every cycle; raising the floor to 100 keeps the check meaningful on real
 # data while suppressing stand-up flares. Set to 0 to disable.
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
+# Partial-export gate (ga-7sxdmb): each DB's export is compared with the source's
+# own COUNT(*) (read just before the export, same SQL filter), independently of
+# the previous snapshot and of SPIKE_THRESHOLD. An export more than the slack
+# below the source is a partial export and never becomes the snapshot. The slack
+# absorbs rows deleted while the export ran: max(MIN rows, PCT% of the source).
+SHORT_EXPORT_SLACK_PCT="${GC_JSONL_SHORT_EXPORT_SLACK_PCT:-1}"
+SHORT_EXPORT_MIN_SLACK="${GC_JSONL_SHORT_EXPORT_MIN_SLACK:-5}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
-ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-$PACK_STATE_DIR/jsonl-archive}"
+# The archive lives under packs/maintenance whichever pack's copy of this script
+# runs (ga-7sxdmb). gc sets GC_PACK_STATE_DIR to the state dir of the pack that
+# OWNS the order, so for this vendored copy PACK_STATE_DIR is packs/town-deltas;
+# a default derived from it (as this line used to be) forks the archive away from
+# the one scripts/dolt-s3-backup.sh mirrors offsite (JSONL_ARCHIVE_DIR) and
+# scripts/dolt-gc-maintenance.sh archives pruned rows into (when enabled). The
+# state file stays per pack.
+ARCHIVE_REPO="${GC_JSONL_ARCHIVE_REPO:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance/jsonl-archive}"
 # Re-log the archive mode at least this often (seconds) even without a mode
 # transition, so operators who missed the first line still see the current
 # configuration. Default one week.
@@ -578,7 +592,7 @@ push_archive_main() {
                 stderr_display="(no stderr captured)"
             fi
             body=$(cat <<ESCALATION
-Order: mol-dog-jsonl
+Order: jsonl-export
 Archive: $ARCHIVE_REPO
 Consecutive failures: $consecutive (threshold: $MAX_PUSH_FAILURES)
 
@@ -848,6 +862,28 @@ read_source_issue_count() {
     printf '%s\n' "$count"
 }
 
+# Is this export a partial one? (ga-7sxdmb) Returns 0 (short) ONLY on positive
+# evidence: the source count is readable AND the export is more than the slack
+# below it. An unreadable source is "don't know", not "short": it returns 1 here
+# and the spike check keeps its own unreadable-source rule (ga-fxrrav). The
+# caller passes the RAW export count — same SQL filter as the source count —
+# never the post-scrub one: rows only the jq scrub removes would otherwise read
+# as missing rows on every run and stall the archive.
+export_is_short_vs_source() {
+    local raw_count="$1"
+    local source_count="$2"
+    local slack
+
+    case "$raw_count" in ''|*[!0-9]*) return 1 ;; esac
+    case "$source_count" in ''|*[!0-9]*) return 1 ;; esac
+
+    slack=$(( source_count * SHORT_EXPORT_SLACK_PCT / 100 ))
+    if [ "$slack" -lt "$SHORT_EXPORT_MIN_SLACK" ]; then
+        slack="$SHORT_EXPORT_MIN_SLACK"
+    fi
+    [ $(( raw_count + slack )) -lt "$source_count" ]
+}
+
 # Returns 0 to halt (growth spike, source unreadable, or a drop the source
 # confirms) and 1 when the drop is the EXPORT coming up short while the source
 # did not shrink. Return 1 does not mean the new file is a good snapshot — the
@@ -908,6 +944,10 @@ while IFS= read -r DB; do
     DB_DIR="$ARCHIVE_REPO/$DB"
     mkdir -p "$DB_DIR"
 
+    # The source's own row count, read BEFORE the export with the export's own
+    # SQL filter (ga-7sxdmb). Empty means unreadable — "don't know", never 0.
+    SOURCE_BEFORE=$(read_source_issue_count "$DB" || true)
+
     # Step 1: Export issues table.
     ISSUE_EXPORT_TMP=$(mktemp "$DB_DIR/issues.jsonl.tmp.XXXXXX")
     if ! dolt_sql -r json -q "SELECT * FROM \`$DB\`.issues $SCRUB_FILTER" > "$ISSUE_EXPORT_TMP" 2>/dev/null; then
@@ -926,6 +966,10 @@ while IFS= read -r DB; do
 "
         continue
     fi
+
+    # Rows in the RAW export — before the jq scrub below rewrites the file — so it
+    # is comparable with SOURCE_BEFORE (same SQL filter).
+    RAW_EXPORT_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
 
     # Export supplemental tables (best-effort).
     for TABLE in comments config dependencies labels metadata; do
@@ -975,6 +1019,23 @@ while IFS= read -r DB; do
     # Legacy flat file mirrors the scrubbed per-db export. Keep the two output
     # shapes in sync so any downstream reader sees the same filtered payload.
     if ! cp -f "$DB_DIR/issues.jsonl" "$ARCHIVE_REPO/$DB.jsonl" 2>/dev/null; then
+        discard_failed_db_outputs "$DB"
+        FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
+        FAILED_DBS="${FAILED_DBS}$DB
+"
+        continue
+    fi
+
+    # Partial-export gate (ga-7sxdmb). Under load Dolt can hand back a truncated
+    # result set that is still a well-formed document, so validation above cannot
+    # tell. A partial export must not become the snapshot — nor, one cycle later,
+    # the baseline that makes the next COMPLETE export read as a growth spike (a
+    # false HIGH escalation). The spike check below only sees a drop bigger than
+    # SPIKE_THRESHOLD against the previous snapshot; this gate compares with the
+    # source at ANY size. Only positive evidence discards: an unreadable source
+    # count falls through to the spike check's own rule.
+    if export_is_short_vs_source "$RAW_EXPORT_COUNT" "$SOURCE_BEFORE"; then
+        echo "jsonl-export: export curto de $DB: $RAW_EXPORT_COUNT vs fonte $SOURCE_BEFORE, mantido o snapshot anterior" >&2
         discard_failed_db_outputs "$DB"
         FAILED_DB_COUNT=$((FAILED_DB_COUNT + 1))
         FAILED_DBS="${FAILED_DBS}$DB
