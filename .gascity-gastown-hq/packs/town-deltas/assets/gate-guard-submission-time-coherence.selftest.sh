@@ -256,7 +256,13 @@ grep -q '_CBC_VERDICT=\$(branch_bead_commit_verdict' "$GUARD" \
   && ok "guard.sh: the new block actually calls branch_bead_commit_verdict" \
   || bad "guard.sh: new block does not call branch_bead_commit_verdict"
 
-CBC_BLOCK=$(awk '/Step 5b-pre \(ga-pj5va\)/,/^fi$/' "$GUARD")
+# ga-8yinlg: the block is extracted by its SELFTEST-EXTRACT sentinels, not up to
+# the first column-0 `fi` as before — the refusal now sits AFTER the measurement
+# `if` (so the COHERENCE-CHECK record can never be skipped), and the old range
+# would have ended before it. The four assertions below are unchanged.
+# gate-guard-silent-skip-record.selftest.sh runs this same block for real.
+CBC_BLOCK=$(sed -n '/# SELFTEST-EXTRACT coherence-check: BEGIN/,/# SELFTEST-EXTRACT coherence-check: END/p' "$GUARD")
+[ -n "$CBC_BLOCK" ] || bad "guard.sh: coherence-check SELFTEST-EXTRACT sentinels not found — the four assertions below cannot be trusted"
 echo "$CBC_BLOCK" | grep '"\$_CBC_VERDICT" = "no"' >/dev/null \
   && ok "guard.sh: refusal is gated on verdict = no (not != yes — skip must NOT refuse)" \
   || bad "guard.sh: refusal condition missing or too broad (would refuse on skip too)"

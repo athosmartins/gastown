@@ -5288,6 +5288,35 @@ fi
 # marker's own declared base_commit field (a self-declared value in an
 # agent-authored marker) — same non-trusting posture as every other
 # security/coherence-relevant read in this file.
+#
+# ga-8yinlg: NEVER SILENT WHEN IT DOES NOT MEASURE. The measurement below runs
+# only when RIG_PATH, BEAD_ID and BRANCH are all non-empty, and with any of them
+# empty — or with fetch/rev-parse/merge-base failing inside it — this block used
+# to do nothing, write nothing and log nothing: indistinguishable from "the check
+# never ran", so "how many submissions went in unverified" could not be counted.
+# (What that costs when it matters: a marker whose commits never cite its bead
+# passes here and only breaks hours later at merge time, as gate:needs-human.)
+# Same shape as the bash-3.2 check of ga-7dx2vw: a pessimistic default verdict,
+# upgraded only when the measurement actually produces one, and ONE record
+# written AFTER the measurement `if` rather than inside it — so a skip path added
+# later records itself exactly like one that ran. Still fail-OPEN: an unmeasured
+# submission is recorded, never refused.
+# Which input can be empty: BRANCH and BEAD_ID were validated non-empty at Step 4
+# (an empty one is rejected there), so in practice it is RIG_PATH. It is "" when
+# `gc rig list --json` fails, prints nothing/unparseable output or says ok:false
+# (RIG_LIST_JSON stays ""), when neither the marker's rig nor the bead-id prefix
+# names a registered rig, or when the resolved path is not a directory. The log
+# line shows an empty input as <EMPTY>, so the cause is read rather than guessed.
+# unique_commits=<EMPTY> (the count never arrived) is deliberately not the same
+# as unique_commits=0 (measured: nothing unique on the branch) — the pure verdict
+# function answers "skip" for both, so the log is where the difference survives.
+# The block between the SELFTEST-EXTRACT sentinels is run VERBATIM by
+# gate-guard-silent-skip-record.selftest.sh — keep the sentinels, and keep the
+# block self-contained (log/err/set_gate_status/bd and the variables above it).
+# SELFTEST-EXTRACT coherence-check: BEGIN
+_CBC_VERDICT="nao-consegui-medir"   # pessimistic default; upgraded only once
+                                     # branch_bead_commit_verdict actually answers
+_CBC_COUNT=""
 if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
   git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
   _CBC_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
@@ -5298,21 +5327,25 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
       _CBC_COUNT=$(git -C "$RIG_PATH" rev-list --count "${_CBC_BASE}..${_CBC_BRANCH_SHA}" 2>/dev/null || echo "")
       _CBC_MSGS=$(git -C "$RIG_PATH" log --format='%B' "${_CBC_BASE}..${_CBC_BRANCH_SHA}" 2>/dev/null || echo "")
       _CBC_VERDICT=$(branch_bead_commit_verdict "$_CBC_COUNT" "$_CBC_MSGS" "$BEAD_ID")
-      if [ "$_CBC_VERDICT" = "no" ]; then
-        err "  branch-content-coherence (ga-pj5va): $_CBC_COUNT unique commit(s) on $BRANCH vs origin/main never mention bead $BEAD_ID. Refusing at submission."
-        set_gate_status "$MARKER_ID" "error"
-        bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: branch-content-coherence check (ga-pj5va).
+    fi
+  fi
+fi
+# Every outcome is recorded here — OUTSIDE the measurement `if` on purpose (see
+# the ga-8yinlg note above). Log only, no label: this line is the durable record.
+log "COHERENCE-CHECK bead=${BEAD_ID:-<EMPTY>} verdict=$_CBC_VERDICT branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} unique_commits=${_CBC_COUNT:-<EMPTY>} marker=$MARKER_ID"
+if [ "$_CBC_VERDICT" = "no" ]; then
+  err "  branch-content-coherence (ga-pj5va): $_CBC_COUNT unique commit(s) on $BRANCH vs origin/main never mention bead $BEAD_ID. Refusing at submission."
+  set_gate_status "$MARKER_ID" "error"
+  bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: branch-content-coherence check (ga-pj5va).
 None of the $_CBC_COUNT commit(s) unique to $BRANCH (vs origin/main) mention bead $BEAD_ID.
 If $BEAD_ID is a slice of a parent epic, citing the parent is fine — ADD a commit that also cites $BEAD_ID itself, don't cite only the parent:
   git commit --allow-empty -m \"chore($BEAD_ID): registra o vinculo\"
   git push origin $BRANCH
 Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
-        log "SUPPRESSED PUSH (wa-uthi non-terminal): branch-content-coherence pre-check failed for $MARKER_ID (gate-status:error)."
-        exit 1
-      fi
-    fi
-  fi
+  log "SUPPRESSED PUSH (wa-uthi non-terminal): branch-content-coherence pre-check failed for $MARKER_ID (gate-status:error)."
+  exit 1
 fi
+# SELFTEST-EXTRACT coherence-check: END
 
 # ── Step 5b-pre2 (ga-rstae): A/B — refuse when a new/changed selftest passes
 # unmodified against the pre-fix base commit ────────────────────────────────
@@ -5499,6 +5532,26 @@ Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittabl
       exit 1
     fi
   fi
+else
+  # ga-8yinlg: an input this check needs was never resolved (in practice RIG_PATH
+  # — see the note on the coherence check above), so nothing was measured and no
+  # verdict exists. This path used to be silent: the submission simply vanished
+  # from every count of this experiment, with not even the AB-ARM line above.
+  # Fail-OPEN, as everywhere in this block: it is recorded, never refused.
+  # Deliberately NOT written like the records the apuracao reads. Read from
+  # scripts/gate-ab-apuracao.sh (not assumed): its primary metric (1st-attempt
+  # pass rate) comes from the dispatcher log plus a re-run of gate_ab_arm_for_bead,
+  # never from guard labels or AB-ARM lines; its verdict section greps only
+  # `AB-BASE-TEST ... arm=[AB]`. So this line has its own token (AB-SKIP) and
+  # there is NO gate-ab:* label — an unmeasured submission must not enter either
+  # arm's measured population, and a label write is one more bd write on a path
+  # that can be reached BECAUSE rig list already failed.
+  # The arm is logged only when BEAD_ID exists to compute it from: with an empty
+  # id the function's own default is 'A', which would file an UNKNOWN submission
+  # under the control arm.
+  _ABT_SKIP_ARM="<UNKNOWN>"
+  if [ -n "$BEAD_ID" ]; then _ABT_SKIP_ARM=$(gate_ab_arm_for_bead "$BEAD_ID"); fi
+  log "AB-SKIP bead=${BEAD_ID:-<EMPTY>} arm=$_ABT_SKIP_ARM marker=$MARKER_ID branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} reason=inputs-unresolved"
 fi
 
 # ── Step 5b (ga-e7zk7): detach source bead from the dog pool — gate owns it now ──
