@@ -322,7 +322,7 @@ reset_main; AVAIL=12000; GC_RELEASE_STAGING_ENABLED=0; poll
 reset_main; AVAIL=20000; GC_TRIGGER_ENABLED=0; poll
 [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "DISABLED" ] && ok "kill switch: GC_TRIGGER_ENABLED=0 → no run, state says DISABLED" || bad "trigger kill switch: kicks=$KICKS dec='$(sdec)'"
 
-# single instance: a live maintenance run, and a live sibling poll, both stand it down
+# single instance: a live maintenance run, and a second live invocation, both stand it down
 reset_main; AVAIL=20000
 _hold "$GC_MAINT_LOCKDIR" "$$" "$((NOW-60))"; GC_MAINT_LOCK_RE="selftest"
 poll
@@ -331,7 +331,7 @@ GC_MAINT_LOCK_RE='dolt-gc-maintenance'
 reset_main; AVAIL=20000
 mkdir -p "$GC_TRIGGER_LOCKDIR"; printf '%s\n' "$$" > "$GC_TRIGGER_LOCKDIR/pid"; GC_TRIGGER_LOCK_RE="selftest"
 poll
-[ "$KICKS" -eq 0 ] && [ ! -e "$GC_TRIGGER_STATE" ] && ok "lock: a live sibling poll holds the trigger lock → this poll does nothing (state untouched)" || bad "trigger lock: kicks=$KICKS state_exists=$([ -e "$GC_TRIGGER_STATE" ] && echo y || echo n)"
+[ "$KICKS" -eq 0 ] && [ ! -e "$GC_TRIGGER_STATE" ] && ok "lock: another live invocation holds the trigger lock → this one does nothing (state untouched)" || bad "trigger lock: kicks=$KICKS state_exists=$([ -e "$GC_TRIGGER_STATE" ] && echo y || echo n)"
 GC_TRIGGER_LOCK_RE='dolt-gc-release-trigger'
 reset_main; AVAIL=20000; poll
 [ ! -e "$GC_TRIGGER_LOCKDIR" ] && ok "lock: the trigger lock is released when the poll ends" || bad "trigger lock leaked after a poll"
@@ -788,8 +788,10 @@ _vm fail none             no  "the job's outcome for this run is 'absent'"
 _vm fail skip-headroom    no  "the job refused (its own outcome: skip-headroom"
 _vm fail release-not-taken no "the job refused (its own outcome: release-not-taken"
 _vm fail released-still-short no "the job refused (its own outcome: released-still-short"
+_vm fail size-unmeasurable no "the job refused (its own outcome: size-unmeasurable"   # the job could not measure hq: decided nothing, cleared nothing
+_vm ok   size-unmeasurable no "the job's outcome for this run is 'size-unmeasurable'"  # a cleared streak next to it contradicts it — never success
 _vm zeroone gc-ok         no  "cannot tell whether the job cleared it"           # an unreadable streak never counts, whatever the job says
-[ "$_vm_ok" = "1" ] && ok "verdict: success needs the streak cleared AND an outcome that reached the step's end (gc-ok / gc-failed / below-threshold); missing, stale, skipped, unknown-word or contradicting signals are all NOT cleared" || bad "verdict matrix (see lines above)"
+[ "$_vm_ok" = "1" ] && ok "verdict: success needs the streak cleared AND an outcome that reached the step's end (gc-ok / gc-failed / below-threshold); missing, stale, skipped, size-unmeasurable, unknown-word or contradicting signals are all NOT cleared" || bad "verdict matrix (see lines above)"
 unset -f _vm; unset _vm_ok
 
 # (3) A HUNG holder. A live pid is never stolen from, but silence is the bug: the state file, the log and
@@ -863,27 +865,31 @@ fi
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW+3600))"; poll
 [ "$(nnotify)" = "0" ] && [ "$(sdec)" = "WAIT maintenance-running" ] && ok "stuck: a lock 'taken in the future' (clock skew) has an unknowable age → no alert" || bad "stuck skew: notify=$(nnotify) dec='$(sdec)'"
 
-# (3b) A hung TRIGGERED run: every later poll finds the trigger's own lock held and stands down silently.
-#      They must run the same check, on the job's lock first (that one blocks all maintenance) and on the
-#      trigger's own lock only if the job's is not stuck — one hang, one alert.
+# (3b) A hung TRIGGERED run seen by a SECOND INVOCATION of the trigger. Under launchd this topology does not
+#      exist (a label never overlaps and the poll that started the run is blocked inside it), so these cases
+#      prove the check works for the invocation that CAN happen — an operator running the script by hand while a
+#      run is in flight — and nothing about how fast production notices. Production's report of a hung triggered
+#      run is the 2h job's entry point (dolt-gc-maintenance.selftest.sh, the "entry/stuck" cases).
+#      The second invocation checks the job's lock first (that one blocks all maintenance) and the trigger's
+#      own lock only if the job's is not stuck — one hang, one alert.
 sleep 300 & _T=$!
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_TRIGGER_LOCK_RE="sleep"
 _hold "$GC_TRIGGER_LOCKDIR" "$_T" "$((NOW-5*3600))"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"
 poll
-[ "$KICKS" -eq 0 ] && [ "$(nnotify)" = "1" ] && grep -q 'ALERT: the dolt-gc-maintenance lock' "$DOLT_GC_MAINT_LOG" && grep -q 'every maintenance run (purge/prune/GC) and the release trigger stand down' "$DOLT_GC_MAINT_LOG" && grep -q 'TODA a manuten' "$T/notify.calls" && ! grep -q 'ALERT: the dolt-gc-release-trigger lock' "$DOLT_GC_MAINT_LOG" && [ ! -e "$GC_TRIGGER_STATE" ] && ok "sweep: a sibling poll behind a hung triggered run (both locks 5h old) → ONE alert, about the job's lock; the poll does nothing else" || bad "sweep both: kicks=$KICKS notify=$(nnotify) log='$(grep ALERT "$DOLT_GC_MAINT_LOG")'"
+[ "$KICKS" -eq 0 ] && [ "$(nnotify)" = "1" ] && grep -q 'ALERT: the dolt-gc-maintenance lock' "$DOLT_GC_MAINT_LOG" && grep -q 'every maintenance run (purge/prune/GC) and the release trigger stand down' "$DOLT_GC_MAINT_LOG" && grep -q 'TODA a manuten' "$T/notify.calls" && ! grep -q 'ALERT: the dolt-gc-release-trigger lock' "$DOLT_GC_MAINT_LOG" && [ ! -e "$GC_TRIGGER_STATE" ] && ok "second invocation: behind a hung triggered run (both locks 5h old) → ONE alert, about the job's lock; it does nothing else" || bad "second invocation, both locks: kicks=$KICKS notify=$(nnotify) log='$(grep ALERT "$DOLT_GC_MAINT_LOG")'"
 GC_NOW_EPOCH=$((NOW+300)); poll
-[ "$(nnotify)" = "1" ] && ok "sweep: ...and the next sibling poll does not repeat it" || bad "sweep repeats: notify=$(nnotify)"
+[ "$(nnotify)" = "1" ] && ok "second invocation: ...and the next one does not repeat the alert" || bad "second invocation repeats: notify=$(nnotify)"
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_TRIGGER_LOCK_RE="sleep"
 _hold "$GC_TRIGGER_LOCKDIR" "$_T" "$((NOW-5*3600))"                     # only the trigger's own lock is old (no job lock)
 poll
-[ "$(nnotify)" = "1" ] && grep -q 'ALERT: the dolt-gc-release-trigger lock' "$DOLT_GC_MAINT_LOG" && grep -q 'the 2h maintenance job is NOT affected' "$DOLT_GC_MAINT_LOG" && ! grep -q 'TODA a manuten' "$T/notify.calls" && grep -q 'a manutenção de 2h segue normal' "$T/notify.calls" && ok "sweep: a hung trigger poll with no job running → alerts about the TRIGGER lock, and says only what it blocks (the trigger; NOT the 2h job) in the log and in the push" || bad "sweep trigger lock: notify=$(nnotify) log='$(grep ALERT "$DOLT_GC_MAINT_LOG")'"
+[ "$(nnotify)" = "1" ] && grep -q 'ALERT: the dolt-gc-release-trigger lock' "$DOLT_GC_MAINT_LOG" && grep -q 'the 2h maintenance job is NOT affected' "$DOLT_GC_MAINT_LOG" && ! grep -q 'TODA a manuten' "$T/notify.calls" && grep -q 'a manutenção de 2h segue normal' "$T/notify.calls" && ok "second invocation: a hung trigger lock with no job running → alerts about the TRIGGER lock, and says only what it blocks (the trigger; NOT the 2h job) in the log and in the push" || bad "second invocation, trigger lock: notify=$(nnotify) log='$(grep ALERT "$DOLT_GC_MAINT_LOG")'"
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_TRIGGER_LOCK_RE="sleep"
 _hold "$GC_TRIGGER_LOCKDIR" "$_T" "$((NOW-600))"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-600))"    # a healthy run in flight (10 min)
 poll
-[ "$(nnotify)" = "0" ] && [ "$KICKS" -eq 0 ] && ok "sweep: a sibling poll behind a healthy 10-minute run stays silent" || bad "sweep healthy: notify=$(nnotify)"
+[ "$(nnotify)" = "0" ] && [ "$KICKS" -eq 0 ] && ok "second invocation: behind a healthy 10-minute run stays silent" || bad "second invocation healthy: notify=$(nnotify)"
 # the trigger's own kill switch is "this trigger only": while paused it does not sweep (the 2h job still alerts on its own lock)
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; GC_TRIGGER_ENABLED=0; poll
-[ "$(nnotify)" = "0" ] && [ "$(sdec)" = "DISABLED" ] && ok "sweep: a paused trigger (GC_TRIGGER_ENABLED=0) does not sweep or alert" || bad "sweep paused: notify=$(nnotify) dec='$(sdec)'"
+[ "$(nnotify)" = "0" ] && [ "$(sdec)" = "DISABLED" ] && ok "second invocation: a paused trigger (GC_TRIGGER_ENABLED=0) does not sweep or alert" || bad "second invocation paused: notify=$(nnotify) dec='$(sdec)'"
 kill "$_H" "$_T" 2>/dev/null; wait "$_H" "$_T" 2>/dev/null; unset _H _T _H2 _DEAD
 
 # (4) Liveness of the poll, for the prod-test. The state keeps the epoch of the poll that STARTED the job

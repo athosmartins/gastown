@@ -41,7 +41,8 @@
 #     cooldown) wait without counting as attempts.
 #   - It does not take a run's word for success from ONE file. The job's outcome record (token-matched to
 #     THIS run) and its skip-streak file must AGREE: streak "0 0" AND an outcome that says the step reached
-#     its end (gc-ok, gc-failed — the job alerts on that itself — or below-threshold). A missing, stale,
+#     its end (gc-ok, gc-failed — the job alerts on that itself — or below-threshold: hq MEASURED under the
+#     threshold; a size the job could not measure is size-unmeasurable, which is not one). A missing, stale,
 #     skipped, unknown-word or contradicting signal is "cannot tell" and is treated like "still standing":
 #     attempt counted, backoff armed, the log says which signal said what. Until ga-11vdhe success was
 #     inferred from the streak file alone ("cleared" = probably worked); the job always exits 0, so its
@@ -52,8 +53,8 @@
 #
 # FAIL-CLOSED: an unreadable number → no run ("WAIT unmeasurable-input"); an unreadable clock → no
 # run; a decision that is not exactly "KICK direct" / "KICK release" → no run ("WAIT unknown-decision");
-# a state file that cannot be written (so the backoff could not be recorded) → no run; a live sibling
-# poll or a live maintenance run → no run. A state file that exists but is not ONE COMPLETE record
+# a state file that cannot be written (so the backoff could not be recorded) → no run; a second live
+# invocation or a live maintenance run → no run. A state file that exists but is not ONE COMPLETE record
 # (garbled, empty, cut mid-write, missing attempts/next_allowed, cut between the two direct_ fields) is
 # "don't know" (its backoff may be lost): that poll stays inert, logs it, rewrites a clean state, and
 # the next poll proceeds. The job's
@@ -68,10 +69,19 @@
 # from (it may be mid-dolt_gc), but once its lock is older than GC_MAINT_LOCK_STUCK_H (default 3h) this
 # poll says so: decision `WAIT maintenance-stuck` (not the reassuring `maintenance-running`), one ALERT
 # line and ONE notification per holder (dedupe marker beside the lock; if it cannot be written there is
-# no push, so a stuck holder can never mean 288 pushes/day). Sibling polls that find the trigger's own
-# lock held run the same check (_trg_stuck_sweep: the job's lock first, the trigger's own only if that is
-# not stuck — one hang, one alert), so a hung TRIGGERED run is reported within a poll, not at the 2h
-# job's next tick. The job's own entry point reports the same holder on its cycle.
+# no push, so a stuck holder can never mean 288 pushes/day).
+#
+# WHO REPORTS A HUNG TRIGGERED RUN, AND WHEN — in production it is the 2h JOB, not a poll. The poll that
+# starts a run blocks in it (_trg_run_maintenance), launchd never overlaps a label, and this script is
+# started by nothing but that plist — so while a triggered run hangs there is NO later poll to notice:
+# the poll that could is the one stuck inside the run. The report comes from the job's own entry point
+# (dolt-gc-maintenance.sh, "another run holds ..."): the run's child holds the job's lock, the next 2h
+# cycle finds it, and once that holder is GC_MAINT_LOCK_STUCK_H old it alerts. That is at the first 2h
+# tick after the holder turns 3h old — 3-5h into the hang at the nominal cadence, longer when the cycle
+# runs late (it has run every 2-3.5h), and never "within a poll". Tested through the real job script
+# (dolt-gc-maintenance.selftest.sh, the "entry/stuck" cases).
+# _trg_stuck_sweep covers only what can really reach it: a SECOND invocation of this script while a run is
+# in flight — an operator running it by hand to see why the release is quiet. That one reports at once.
 #
 # WHY THE TRIGGER DECIDES ON ONE SAMPLE, NOT "N POLLS IN A ROW" (ga-11vdhe item 2 — decided on data,
 # 2026-09-26; do not add a persistence rule without re-running the measurement). The worry: 288 polls/day
@@ -547,15 +557,17 @@ _trg_poll() {
   #    - the job's skip-streak file, "cleared" being exactly the record it writes when its size-gated step
   #      does NOT skip (it attempted dolt_gc, or found hq under the threshold).
   #    "Success" needs the streak cleared AND an outcome that says the step reached its end (gc-ok,
-  #    gc-failed — the job already alerted — or below-threshold). Anything else — a standing or unreadable
-  #    streak, no outcome for this run (crashed / exited on its lock / could not write it), an outcome
-  #    that says it skipped, or a word this trigger does not know — is NOT success: "could not tell" is
-  #    treated like "still standing" (attempt counted, backoff armed), never like "it worked".
+  #    gc-failed — the job already alerted — or below-threshold, which the job records only for an hq it
+  #    MEASURED under the threshold). Anything else — a standing or unreadable streak, no outcome for this
+  #    run (crashed / exited on its lock / could not write it), an outcome that says it skipped (including
+  #    size-unmeasurable: the job could not measure hq and decided nothing), or a word this trigger does
+  #    not know — is NOT success: "could not tell" is treated like "still standing" (attempt counted,
+  #    backoff armed), never like "it worked".
   sk="$(_trg_streak_read "$GC_SKIP_STREAK_STATE")"
   oc="$(_trg_outcome_read "$GC_RUN_OUTCOME_STATE" "$token")"
   case "$oc" in
     gc-ok|gc-failed|below-threshold)                        ocls=terminal ;;
-    skip-headroom|release-not-taken|released-still-short)   ocls=skipped ;;
+    skip-headroom|release-not-taken|released-still-short|size-unmeasurable)   ocls=skipped ;;
     absent|stale|unreadable)                                ocls=none ;;
     *)                                                      ocls=unknown ;;
   esac
@@ -584,11 +596,14 @@ _trg_poll() {
   return 0
 }
 
-# _trg_stuck_sweep — a sibling poll that finds the trigger lock held (a run in flight) is silent and cheap by
-# design, which is also how a HUNG run stays invisible: every later poll stands down here, and the 2h cycle
-# only reaches its own alert at its next tick. Check the two locks a hung triggered run holds — the job's
-# first (that is the one that blocks all maintenance), the trigger's own only if the job's is not stuck, so
-# one hang is one alert. Alerts at most once per holder (see _dgm_lock_stuck_check); never touches a lock.
+# _trg_stuck_sweep — a second invocation that finds the trigger lock held (a run in flight) is silent and
+# cheap by design, which is also how a HUNG run stays invisible to it. Under launchd that invocation does not
+# exist (a label never overlaps, and the poll that started the run is blocked inside it), so a hung
+# TRIGGERED run is reported in production by the 2h job's entry point instead (see the header). This is for
+# the invocation that CAN happen: someone running the script by hand while a run is in flight. Check the two
+# locks a hung triggered run holds — the job's first (that is the one that blocks all maintenance), the
+# trigger's own only if the job's is not stuck, so one hang is one alert. Alerts at most once per holder
+# (see _dgm_lock_stuck_check); never touches a lock.
 _trg_stuck_sweep() {
   _dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance" \
     || _dgm_lock_stuck_check "$GC_TRIGGER_LOCKDIR" "$GC_TRIGGER_LOCK_RE" "dolt-gc-release-trigger" trigger \
@@ -613,9 +628,10 @@ trigger_main() {
     return 0
   fi
   _dgm_lock_acquire "$GC_TRIGGER_LOCKDIR" "$GC_TRIGGER_LOCK_RE"; lrc=$?
-  # 1 = a sibling poll (or the run it started) is live — normal, and silent unless it has been live for
-  # hours (_trg_stuck_sweep). 2 = the lock dir cannot be created — inert but NOT silent. Either way this
-  # trigger is optional; the 2h cycle is untouched.
+  # 1 = another invocation (or the run it started) holds the lock — under launchd this is not reachable
+  # (one poll at a time; the running poll is blocked in its run), so it is a manual second run; silent
+  # unless the holder has been live for hours (_trg_stuck_sweep). 2 = the lock dir cannot be created —
+  # inert but NOT silent. Either way this trigger is optional; the 2h cycle is untouched.
   if [ "$lrc" -eq 2 ]; then
     log "trigger: WARN cannot create the trigger lock $GC_TRIGGER_LOCKDIR — staying inert this poll (no run can start without single-instance protection)"
     return 0

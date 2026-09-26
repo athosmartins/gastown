@@ -534,7 +534,8 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   GC_MIN_FREE_PCT=200; GC_MIN_FREE_ABS_MB=3072; GC_MIN_FREE_PCT_BASE=200; GC_MIN_FREE_PCT_WITH_PRUNE=280
   FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0
   GC_RUN_OUTCOME_STATE="$XT/outcome.state"; RELEASE_RC=1; DOLT_RC=0
-  du() { case "${1:-}" in -sm) printf '%s\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; -sh) printf '%sM\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; *) command du "$@" ;; esac; }
+  FAKE_DU_FAIL=0
+  du() { case "${1:-}" in -sm) [ "$FAKE_DU_FAIL" = "1" ] && return 1; printf '%s\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; -sh) printf '%sM\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; *) command du "$@" ;; esac; }
   _avail_mb() { printf '%s' "$FAKE_AVAIL"; }
   timeout() { shift; "$@"; }
   dolt() { DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return "$DOLT_RC"; }
@@ -542,7 +543,7 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   _gc_maybe_release_staging() { RELEASE_CALLS=$((RELEASE_CALLS+1)); [ "$RELEASE_RC" -eq 0 ] && FAKE_AVAIL="${RELEASE_AVAIL:-$FAKE_AVAIL}"; return "$RELEASE_RC"; }
   _dolt_gc_notify() { NOTIFY_N=$((NOTIFY_N+1)); }
   _dolt_gc_mail_mayor() { MAIL_N=$((MAIL_N+1)); }
-  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; RELEASE_RC=1; RELEASE_AVAIL=""; DOLT_RC=0; rm -f "$GC_RUN_OUTCOME_STATE"; unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN; }
+  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_DU_FAIL=0; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; RELEASE_RC=1; RELEASE_AVAIL=""; DOLT_RC=0; rm -f "$GC_RUN_OUTCOME_STATE"; unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN; }
 
   # a NORMAL 2h cycle that skips advances the streak (unchanged behavior) and still tries the release
   xreset; main
@@ -597,6 +598,32 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   oc() { head -1 "$GC_RUN_OUTCOME_STATE" 2>/dev/null; }
   xreset; FAKE_HQ_MB=500; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
   [ "$(oc)" = "token=100.7 outcome=below-threshold" ] && ok "outcome: hq under the threshold → below-threshold" || bad "outcome below-threshold: '$(oc)'"
+  # ga-11vdhe gate round 3 — a size that CANNOT be measured is not a small size. `du` fails or garbles under
+  # load here (load 55+: a failed $(...) is a documented event); that used to read as 0G → "below the
+  # threshold" → the streak cleared AND the outcome recorded as a real result. The trigger then believed the
+  # run had worked, zeroed its backoff, and the chronic streak that arms the release (62 here) was wiped by
+  # one hiccup. Three states: measured-small / measured-big / could-not-measure — the third clears nothing.
+  xreset; FAKE_HQ_MB=500; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "0 0" ] && grep -q 'hq=0G < 1G threshold' "$LOG" && ok "size unmeasurable: (control) a MEASURED small hq (500MB) still clears the streak — that is a real answer" || bad "size control: streak='$(_read_skip_streak "$GC_SKIP_STREAK_STATE")' log='$(tail -2 "$LOG")'"
+  _um_ok=1
+  for _mode in dufail garbled empty; do
+    for _kind in release direct; do
+      xreset
+      case "$_mode" in dufail) FAKE_DU_FAIL=1 ;; garbled) FAKE_HQ_MB=abc ;; empty) FAKE_HQ_MB="" ;; esac
+      GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND="$_kind" main
+      if [ "$(oc)" != "token=100.7 outcome=size-unmeasurable" ] \
+         || [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" != "62 1" ] \
+         || [ "$DOLT_CALLS" -ne 0 ] || [ "$RELEASE_CALLS" -ne 0 ] \
+         || grep -q 'threshold — skip gc' "$LOG" || ! grep -q 'unmeasurable' "$LOG"; then
+        _um_ok=0; echo "    (du $_mode, triggered $_kind: outcome='$(oc)' streak='$(_read_skip_streak "$GC_SKIP_STREAK_STATE")' dolt=$DOLT_CALLS release=$RELEASE_CALLS log='$(tail -2 "$LOG")')"
+      fi
+    done
+  done
+  [ "$_um_ok" = "1" ] && ok "size unmeasurable: du failing / garbled / empty → outcome 'size-unmeasurable' (NOT below-threshold), the skip streak untouched, no dolt_gc, no release, and the log does not claim 'below threshold'" || bad "size unmeasurable (see lines above)"
+  unset _um_ok _mode _kind
+  # the normal 2h cycle has the same conflation (it cleared the streak on a failed du); it must not advance it either
+  xreset; FAKE_DU_FAIL=1; main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "62 1" ] && [ "$DOLT_CALLS" -eq 0 ] && [ "$RELEASE_CALLS" -eq 0 ] && [ ! -e "$GC_RUN_OUTCOME_STATE" ] && grep -q 'unmeasurable' "$LOG" && ok "size unmeasurable: a normal 2h cycle that cannot measure hq leaves the streak exactly as it was (neither cleared nor advanced), does nothing, and says why" || bad "size unmeasurable 2h cycle: streak='$(_read_skip_streak "$GC_SKIP_STREAK_STATE")' dolt=$DOLT_CALLS release=$RELEASE_CALLS log='$(tail -2 "$LOG")'"
   xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
   [ "$(oc)" = "token=100.7 outcome=skip-headroom" ] && ok "outcome: a direct run that loses the gate at its own sample → skip-headroom (and the release was not touched)" || bad "outcome skip-headroom: '$(oc)'"
   xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main

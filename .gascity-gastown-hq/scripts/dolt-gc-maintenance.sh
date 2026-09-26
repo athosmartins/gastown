@@ -968,8 +968,9 @@ main() {
 # nothing — that path is unchanged). The trigger accepts it only when the token is the one it handed out, so
 # a leftover from an earlier run can never be mistaken for this one; a write that fails leaves no matching
 # record, which the trigger reads as "cannot tell" (= not cleared), never as success.
-# Outcome words: below-threshold · skip-headroom · release-not-taken · released-still-short · gc-ok ·
-# gc-failed · unknown (the step returned without saying — a path added later that forgot to set one).
+# Outcome words: below-threshold (hq MEASURED under the threshold) · size-unmeasurable (hq could not be
+# measured — decided nothing, cleared nothing) · skip-headroom · release-not-taken · released-still-short ·
+# gc-ok · gc-failed · unknown (the step returned without saying — a path added later that forgot to set one).
 _gc_record_outcome() {
   case "${GC_RUN_TOKEN:-}" in ''|*[!0-9.]*) return 0 ;; esac
   { mkdir -p "$(dirname "$GC_RUN_OUTCOME_STATE")" 2>/dev/null \
@@ -998,7 +999,19 @@ _run_size_gc_step() {
   # multiplier computation.
   local size_mb; size_mb="$(du -sm "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
   case "$size_mb" in ''|*[!0-9]*) size_mb="" ;; esac
-  local size_g=$(( ${size_mb:-0} / 1024 ))
+  # ga-11vdhe (gate round 3): three answers, not two — hq is small / hq is big / hq could not be measured.
+  # This used to read a failed `du` as 0G, i.e. "below the threshold": it logged that, CLEARED the skip streak
+  # and (for a triggered run) recorded a real result — so one `du` hiccup (load 55+ here, where a failed $(...)
+  # is a documented event) wiped the chronic streak that arms the staging release, and the trigger, which only
+  # starts a run after ITS OWN measurement put hq over the threshold, read "below-threshold" as success and
+  # zeroed both backoffs. Unmeasured is "don't know": nothing is decided, nothing is cleared (a normal 2h
+  # cycle too — the streak is neither cleared nor advanced), and the outcome says so.
+  if [ -z "$size_mb" ]; then
+    log "hq size unmeasurable (du failed or returned nothing) — skip gc; NOT treated as below the ${THRESHOLD_G}G threshold: the skip streak is left as it is"
+    _RUN_OUTCOME="size-unmeasurable"
+    return 0
+  fi
+  local size_g=$(( size_mb / 1024 ))
   if [ "$size_g" -lt "$THRESHOLD_G" ]; then
     log "hq=${size_g}G < ${THRESHOLD_G}G threshold — skip gc"
     _clear_skip_streak "$GC_SKIP_STREAK_STATE" "hq below ${THRESHOLD_G}G threshold"
