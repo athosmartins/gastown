@@ -111,8 +111,9 @@ case "$home" in /*/*) ;; *) note UNGUARDED "no usable home (HOME_SCAN_GUARD_HOME
 home_esc="${home//./\\.}"
 after='($|[^[:alnum:]_./~-]|/($|[[:space:];|&)]|[*?[{$"'"'"'`/]|\.($|[[:space:]"'"'"'/;|&)])|\.\.|\.\*|\.\[|\.[Tt]rash|[DdPpMmLl]))'
 # the token before a path is a boundary -- or an option cluster the path is ATTACHED to (tar -C/Users/athos, -xzC$HOME),
-# which is a value the classifier reads and the old boundary (a non-alphanumeric) hid
-hot_re="(^|[^[:alnum:]_./~-]|-[[:alpha:]]+)(~|\\\$HOME|\\\$\\{HOME|${home_esc})${after}"
+# which is a value the classifier reads and the old boundary (a non-alphanumeric) hid. `~` may carry a name: ~athos/Desktop is
+# $HOME/Desktop, ~+ / ~- are $PWD / $OLDPWD (a superset: `~foo` reaches the classifier too, which is free to say no)
+hot_re="(^|[^[:alnum:]_./~-]|-[[:alpha:]]+)(~[[:alnum:]_.+-]*|\\\$HOME|\\\$\\{HOME|${home_esc})${after}"
 vol_re='/Volumes'
 dots_re='\.\.'                                       # /Users/athos/gt/../Downloads
 bare_cd_re='(^|[;&|({[:space:]])(cd|pushd)[[:space:]]*($|[;&|)`])'   # cd with no operand = $HOME
@@ -130,8 +131,11 @@ elif [[ $cmd_n =~ $back_cd_re ]];  then hot=1
 elif [[ $cmd_n =~ $anc_re ]];      then hot=1
 elif [[ $cmd_n =~ $anc_glob_re ]]; then hot=1
 else
+  # An empty cwd is "don't know", not "not hot": a relative scan (`for d in $(ls -A); do du -sk "$d"; done`) cannot be judged
+  # here, so it goes to the classifier, which counts it (UNKNOWN-CWD). Claude Code always sends a cwd; this is the payload that
+  # does not, and it must not be the one that walks past the guard unlogged.
   case "$cwd" in
-    "$home"|"$home"/[DdPpMmLl.]*|/Volumes|/Volumes/*|/|/Users) hot=1 ;;
+    ""|"$home"|"$home"/[DdPpMmLl.]*|/Volumes|/Volumes/*|/|/Users) hot=1 ;;
   esac
 fi
 [ "$hot" -eq 1 ] || exit 0

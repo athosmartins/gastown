@@ -26,10 +26,20 @@ WHAT THIS IS NOT: a sandbox. It is a LEXICAL heuristic over the command text, on
     computed at run time from something the text does not show, and a glob that the SHELL
     expands under a protected folder for a command that is not a scanner
     (`cat ~/Downloads/*.csv`, `for f in ~/Downloads/*; do ...`) -- reading files the operator
-    pointed at is the legitimate use of Downloads, so that stays out of scope. Two more, both measured
+    pointed at is the legitimate use of Downloads, so that stays out of scope. More, all measured
     (not assumed): a scanner launched BY another command (`find ~/gt -exec du -sk ~ \\;` -- only find's
-    own paths are checked), and conditional flow (the walk is linear, so a `cd` in an `if` / `case` arm
-    or after `||` is taken to have run).
+    own paths are checked), conditional flow (the walk is linear, so a `cd` in an `if` / `case` arm
+    or after `||` is taken to have run), a listing of $HOME saved to a FILE and read back later
+    (`ls ~ > l; ...; done < l` -- only a pipe, `< <(...)`, `<<<` and a heredoc carry the listing), and a
+    command that GAVE UP: nesting deeper than MAX_DEPTH ends the walk of the whole command, so a scan after
+    that point is not looked at (logged as GAVE-UP -- counted, never silent).
+  * NO FIXED CAP ENDS IN AN ALLOW. A brace expansion past MAX_BRACE_ALTERNATIVES, a `{a..z}` sequence and
+    a brace expression that will not expand become DYN -- a value the text does not reveal, exactly what
+    `~/$UNSET` is -- and the classifier decides on what it COULD be (`~/{...70 names..., Desktop}` is
+    hot; the same list under `~/gt` is not). The number of stacked wrappers (`env env env ... du`) and of
+    brace rounds has no cap that matters: each pass provably shrinks its input, so both end by themselves,
+    and the stop each loop keeps for the day that stops being true is loud (GAVE-UP, or DYN), never an allow.
+    "Too big to analyse" used to collapse into "not hot", the verdict of a command that is safe.
   * The shell grammar it understands is a working subset (quotes, escapes, heredocs, $(...),
     backticks, pipelines, &&/||/;, for/while/if bodies, subshells and braces, redirections,
     wrappers such as timeout/nice/env/xargs, bash -c / eval), enough that text which merely
@@ -42,8 +52,16 @@ variables -- loop or `read` variables that iterate over the entries of $HOME (`f
 with cwd=$HOME, `ls ~ | while read d`). A cd or assignment inside `( ... )`, on either side of a pipe or
 before `&` belongs to a subshell and does not outlive it. A scanner whose operand is (or lies under)
 $HOME, a protected folder, /Volumes, or a tainted variable, or whose implicit operand (the cwd) is one
-of those, is a finding. The cwd has a THIRD state, unknown (a `cd -` / `popd` with no history): that is
-not "safe", and a relative scan under it is allowed (fail-open) but logged as UNKNOWN-CWD.
+of those, is a finding. The cwd has a THIRD state, unknown (a `cd -` / `popd` with no history, or a hook
+payload with no cwd): that is not "safe", and a relative scan under it is allowed (fail-open) but logged as
+UNKNOWN-CWD.
+
+A LISTING CAN ALSO ARRIVE ON STDIN: `while read -r d; do du -sk "$d"; done < <(ls ~)`, `xargs du -sk < <(ls ~)`,
+`mapfile -t a < <(ls ~)`. The reader comes BEFORE the redirect that feeds it in the text, so one left-to-right
+walk cannot know `d` is an entry of $HOME. analyze_script notes such a redirect on the first walk and, if it
+saw one, walks the script again knowing that every `read` / `mapfile` / `readarray` / `xargs` in it is fed by
+a listing of $HOME (an over-approximation, in a script that lists $HOME through a redirect -- the exact shape
+this guard exists for).
 """
 import json
 import os
@@ -108,8 +126,8 @@ TRAVERSAL_DEPTH = {
     "eza":  (("L",), ("--level", "--depth")),
 }
 
-MAX_DEPTH = 8
-MAX_BRACE_ALTERNATIVES = 64
+MAX_DEPTH = 8                 # nesting of $( ) / bash -c / eval: past it the command is not read (GAVE-UP, logged)
+MAX_BRACE_ALTERNATIVES = 64   # a bound on WORK, not on what is understood: past it the brace expression is DYN (unknown), see expand_braces
 
 # ----------------------------------------------------------------------------- markers
 DYN = "\ue000"     # a value the text does not reveal
@@ -537,11 +555,29 @@ def render(w):
 
 
 _BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_BRACE_SEQ = re.compile(r"\{[^{},]*\.\.[^{},]*\}")       # {a..c} / {1..9..2}: a sequence, not a list
+
+
+def _brace_unknown(s):
+    """Every brace expression left in `s` becomes DYN: a value the text does not reveal, the same third state as `$UNSET`.
+    That is what `~/$UNSET` already is to the classifier, so it decides on what the value COULD be -- `~/{...70 names...,
+    Desktop}` may be ~/Desktop -- instead of reading the unexpanded text as one static, unprotected component. (Returning
+    the text unchanged, as this used to, gave "too big to expand" the SAME verdict as "safe": silent, no log line.)"""
+    while True:
+        t = _BRACE_SEQ.sub(DYN, _BRACE.sub(DYN, s))
+        if t == s:
+            return t
+        s = t
 
 
 def expand_braces(s):
+    """The words bash would make of `s`. What it will not expand -- a sequence ({D..D}esktop), more than
+    MAX_BRACE_ALTERNATIVES results -- comes back as DYN (unknown), never as literal text. The loop needs no round budget:
+    every round removes one `{` from every item that still has a group, so it ends by itself (a fixed number of rounds
+    used to leave `{,}` behind on the 7th group, unexpanded and read as a literal)."""
+    s = _BRACE_SEQ.sub(DYN, s)
     out = [s]
-    for _ in range(6):
+    for _ in range(s.count("{") + 1):
         nxt = []
         changed = False
         for item in out:
@@ -552,12 +588,34 @@ def expand_braces(s):
             changed = True
             for alt in m.group(1).split(","):
                 nxt.append(item[:m.start()] + alt + item[m.end():])
-        out = nxt
+        out = [_BRACE_SEQ.sub(DYN, item) for item in nxt]
         if len(out) > MAX_BRACE_ALTERNATIVES:
-            return [s]
+            return [_brace_unknown(s)]
         if not changed:
-            break
-    return out
+            return out
+    return [_brace_unknown(s)]      # not reachable while every round removes a `{`; if that ever breaks: unknown, not literal
+
+
+_TILDE = re.compile(r"~([A-Za-z0-9_.+-]*)(?=/|$)")
+
+
+def _tilde(t, st):
+    """The tilde prefix of a word's first text: `~` / `~/x` is $HOME, `~athos/x` is /Users/athos/x (the classifier compares
+    against every spelling of $HOME -- `~user` used to be left as text, a relative path that is never hot), `~+` / `~-` are
+    $PWD / $OLDPWD (unknown -> DYN, not a guess). Anything that is not a tilde prefix is left as it was."""
+    m = _TILDE.match(t)
+    if not m:
+        return t
+    user = m.group(1)
+    if user == "":
+        base = st.home
+    elif user == "+":
+        base = st.cwd if st.cwd is not None else DYN
+    elif user == "-":
+        base = st.oldpwd if st.oldpwd is not None else DYN
+    else:
+        base = "/Users/" + user
+    return base + t[m.end():]
 
 
 def resolve(word, st, in_assignment=False):
@@ -570,8 +628,8 @@ def resolve(word, st, in_assignment=False):
             t = sg.text
             if sg.quoted:
                 t = quote_map(t)
-            elif idx == 0 and t.startswith("~") and (len(t) == 1 or t[1] == "/"):
-                t = st.home + t[1:]
+            elif idx == 0 and t.startswith("~"):
+                t = _tilde(t, st)
             out.append(t)
         elif sg.kind == "var":
             name = sg.text
@@ -922,7 +980,7 @@ def command_lists_home(name, args, st):
 
 def script_lists_home(script, st, depth=0):
     if depth > MAX_DEPTH:
-        return False
+        raise Abort("nesting too deep")     # not `return False`: "too deep to tell" is not "does not list $HOME"
     st = st.fork()
     for seg in script:
         words = list(seg.words)
@@ -936,10 +994,7 @@ def script_lists_home(script, st, depth=0):
             for sg in w.segs:
                 if sg.kind == "sub" and script_lists_home(sg.script, st, depth + 1):
                     return True
-        try:
-            unwrapped = unwrap(words, st)
-        except Abort:
-            continue
+        unwrapped = unwrap(words, st)       # an Abort from here is logged (GAVE-UP) by main(), not swallowed as "no listing"
         if unwrapped is None:
             continue
         name, args, _implicit = unwrapped
@@ -980,12 +1035,24 @@ def unwrap(words, st):
     name is not a literal we can reason about."""
     implicit = False
     words = list(words)
-    for _ in range(8):
+    # How many wrappers are stacked is NOT capped: every pass below strips at least the wrapper's own word, so the loop ends by
+    # itself (a fixed cap of 8 ran out on `env` x 8 and fell to `return None` -- "not a command I can reason about" -- so the scan
+    # behind it was allowed in silence). `budget` is just that bound spelled out: one pass per word, plus the words a brace
+    # expansion adds. Running out of it can only mean the invariant broke, and a stop is logged (Abort -> GAVE-UP), not allowed.
+    budget = len(words) + 1
+    while budget > 0:
+        budget -= 1
         if not words:
             return None
         t = lit_text(words[0])
         if t is None:
             return None
+        if "{" in t:                     # `{du,ls} ~/Desktop` is `du ls ~/Desktop`: the command word is brace-expanded too
+            parts = expand_braces(t)
+            if parts != [t]:
+                words = [Word([Seg("lit", part, False)]) for part in parts] + words[1:]
+                budget += len(parts)
+                t = parts[0]
         name = posixpath.basename(t)
         name = TOOL_ALIASES.get(name, name)
         rest = words[1:]
@@ -1009,7 +1076,7 @@ def unwrap(words, st):
             implicit = True
         else:
             return name, rest, implicit
-    return None
+    raise Abort("command wrappers did not unwrap (more passes than words)")
 
 
 def _apply_cd(args, st, is_pushd=False):
@@ -1038,8 +1105,10 @@ def _apply_popd(st):
 
 # ----------------------------------------------------------------------------- scanners
 class Ctx:
-    def __init__(self):
-        self.pipe_home = False
+    def __init__(self, fed=False):
+        self.pipe_home = fed         # the previous command of the pipeline printed entries of $HOME
+        self.fed = fed               # (second pass) stdin of EVERY reader in this script is fed by a listing of $HOME
+        self.stdin_fed = False       # (first pass) a redirect in this script feeds a listing of $HOME to some stdin
 
 
 def _block(reason):
@@ -1225,10 +1294,28 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
 
 
 # ----------------------------------------------------------------------------- statement walker
+def _redirect_lists_home(seg, st):
+    """A redirect of this command whose source is a listing of $HOME: `< <(ls ~)`, `<<< "$(ls -A ~)"`, an unquoted heredoc
+    with `$(ls ~)` in it."""
+    return any(sg.kind == "sub" and script_lists_home(sg.script, st) for w in seg.extra for sg in w.segs)
+
+
 def analyze_script(script, st, depth=0):
     if depth > MAX_DEPTH:
         raise Abort("nesting too deep")
+    entry = st.fork()                    # where this script starts, for the second pass below
     ctx = Ctx()
+    _walk_script(script, st, ctx, depth)
+    if ctx.stdin_fed:
+        # `while read -r d; do du -sk "$d"; done < <(ls ~)`: the reader comes BEFORE the redirect that feeds it in the text, so
+        # a single left-to-right walk cannot know `d` is an entry of $HOME. Walk again, knowing that every reader of stdin
+        # (read / mapfile / xargs) in this script is fed by that listing. Over-approximate on purpose: it only happens in a
+        # script that lists $HOME through a redirect, which is exactly the shape the guard exists for.
+        entry.notes = []                 # the first pass already counted what there was to count
+        _walk_script(script, entry, Ctx(fed=True), depth)
+
+
+def _walk_script(script, st, ctx, depth):
     scopes = []          # the state at each "(" that is still open: a subshell's cd / assignments do not outlive it
     for idx, seg in enumerate(script):
         # a command on either side of a pipe, or followed by `&`, runs in a subshell of its own: a cd there does not move us
@@ -1239,8 +1326,10 @@ def analyze_script(script, st, depth=0):
                 scopes.append(st.snapshot())
             elif scopes:            # a stray ")" (a `case` pattern, `f()`) with nothing open is ignored
                 st.restore(scopes.pop())
-        if seg.op_before not in ("|", "|&"):
+        if seg.op_before not in ("|", "|&") and not ctx.fed:
             ctx.pipe_home = False
+        if not ctx.fed and _redirect_lists_home(seg, st):
+            ctx.stdin_fed = True
         stdin_is_pipe = seg.op_before in ("|", "|&")
         for w in list(seg.words) + list(seg.extra):
             for sg in w.segs:
@@ -1269,11 +1358,16 @@ def analyze_script(script, st, depth=0):
         if not words:
             _record_assignments(assigns, st)
             continue
-        if head == "read" or lit_text(words[0]) == "read":
-            if ctx.pipe_home and seg.op_before in ("|", "|&"):
-                flags, ops, _ = parse_args(words[1:], valued_short=("d", "n", "N", "p", "t", "u"))
-                for w in ops:
-                    t = lit_text(w)
+        reader = lit_text(words[0])      # after the assignments: `IFS= read -r d` reads
+        if reader in ("read", "mapfile", "readarray"):
+            if ctx.pipe_home and (ctx.fed or seg.op_before in ("|", "|&")):
+                if reader == "read":
+                    flags, ops, _ = parse_args(words[1:], valued_short=("d", "n", "N", "p", "t", "u"))
+                    default = "REPLY"
+                else:            # mapfile's -t is a switch (strip newlines); -d -n -O -s -u -C -c take a value
+                    flags, ops, _ = parse_args(words[1:], valued_short=("d", "n", "O", "s", "u", "C", "c"))
+                    default = "MAPFILE"
+                for t in [lit_text(w) for w in ops] or [default]:
                     if t:
                         st.tainted.add(t)
             continue

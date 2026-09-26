@@ -340,6 +340,153 @@ expect_block "tar -C/Users/*/Desktop ."               'tar czf /tmp/x.tgz -C/Use
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
+echo "-- gate round 2 (ga-02cqk4 attempt 2/3): a fixed cap must never turn 'too big to analyse' into 'not hot' --"
+# ─────────────────────────────────────────────────────────────────────────
+# The classifier had fixed caps (brace alternatives, brace rounds, stacked wrappers) and each ended in the SAME silent exit 0
+# that a genuinely safe command gets: no block, no log line. "Couldn't know" must not look like "knew it was fine". Now the
+# unexpandable becomes an unknown VALUE (the way `~/$UNSET` already is, and unknown-under-~ is hot), and nothing is capped that
+# does not have to be. The helper below asserts the LOG as well as the rc: Abort is exit 0, so an rc-only test cannot tell
+# "blocked" from "gave up quietly".
+ONE="$SCRATCH/one.log"
+blocked_and_logged() {  # name command [cwd]
+  : > "$ONE"
+  hook_json "$2" "${3-}" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; local rc=$?
+  if [ "$rc" -eq 2 ] && [ "$(grep -c 'result=BLOCKED' "$ONE")" = 1 ] && ! grep -qE 'result=(GAVE-UP|ENGINE-ERROR|UNGUARDED)' "$ONE"; then
+    ok "BLOCK+LOG  $1"
+  else
+    bad "BLOCK+LOG  $1 -- rc=$rc, log=[$(cut -c1-200 "$ONE" | tr '\n' '|')] cmd=[${2:0:120}]"
+  fi
+}
+ALT70="$(printf 'a%s,' $(seq 0 69))Desktop"
+blocked_and_logged "brace: 125 words, 25 of them ~/Desktop (the reviewer's repro; the cap was 64)" 'du -sk ~/{Desktop,x,y,z,w}{,,,,}{,,,,}'
+blocked_and_logged "brace: 71 alternatives, the last one ~/Desktop (the reviewer's second repro)"  "du -sk ~/{$ALT70}"
+blocked_and_logged "wrappers: env x8 (the reviewer's repro; the budget was 8)"                  'env env env env env env env env du -sk ~/Desktop'
+blocked_and_logged "wrappers: nice x9"                                                          'nice nice nice nice nice nice nice nice nice du -sk ~/Desktop'
+# the SAME class one site over: the brace loop had a 6-round budget, and the 7th group was left unexpanded ("desktop{,}" is
+# not a protected name). 7 two-way groups is exactly 64 items after round 6 -- under the alternatives cap, over the round cap.
+blocked_and_logged "brace: 7 chained groups (the round budget, not the alternatives cap)"       'du -sk ~/{Desktop,x}{,}{,}{,}{,}{,}{,}'
+blocked_and_logged "brace: 7 nested groups"                                                     'du -sk ~/{x,{x,{x,{x,{x,{x,{x,Desktop}}}}}}}'
+blocked_and_logged "brace: a sequence expression ({D..D}esktop is Desktop)"                      'du -sk ~/{D..D}esktop'
+expect_block "brace: {D..E}esktop"                          'du -sk ~/{D..E}esktop'
+expect_block "brace (control): a sequence with a step, then .. still normalises" 'du -sk ~/{1..9..2}/../Desktop'
+expect_block "brace: over the cap under ~/Library"          "du -sk ~/Library/{$ALT70,CloudStorage}"
+expect_block "brace: over the cap, /Users/*-style ancestor" "du -sk /Users/{$ALT70}"
+# ...and the cap must not become a blanket block: unknown under a SAFE parent is not hot
+expect_allow "brace: 71 alternatives under ~/gt"            "du -sk ~/gt/{$ALT70}"
+expect_allow "brace: 7 chained groups under ~/gt"           'du -sk ~/gt/{a,b}{,}{,}{,}{,}{,}{,}'
+expect_allow "brace: a sequence under ~/gt"                 'du -sk ~/gt/{1..3}'
+expect_allow "brace: a numeric sequence in a harmless command" 'echo {1..3}'
+# stacking: no cap on how many wrappers sit in front of the scanner
+expect_block "wrappers: 40 x env"                  "$(printf 'env %.0s' $(seq 1 40))du -sk ~/Desktop"
+expect_block "wrappers: a mix of eight kinds"      'command exec nohup setsid time timeout 5 nice sudo du -sk ~/Desktop'
+expect_block "wrappers: wrappers, then xargs"      'env env env env env env env env env xargs du -sk ~/Downloads'
+expect_allow "wrappers: 40 x env before a SAFE scan" "$(printf 'env %.0s' $(seq 1 40))du -sk ~/gt"
+# the command WORD is brace-expanded by the shell too: {du,ls} ~/Desktop runs `du ls ~/Desktop`
+expect_block "command word: {du,ls} ~/Desktop"     '{du,ls} ~/Desktop'
+expect_block "command word: du{,} ~/Desktop"       'du{,} ~/Desktop'
+expect_block "command word: a wrapper inside the braces" '{env,du} -sk ~/Desktop'
+expect_block "command word: 8 wrappers inside the braces" '{env,env,env,env,env,env,env,env,du} -sk ~/Desktop'
+expect_allow "command word: {ls,-la} ~/gt"         '{ls,-la} ~/gt'
+expect_allow "command word: {echo,hi}"             '{echo,hi}'
+# tilde prefixes: ~athos is $HOME (the prefilter in the wrapper skipped it too), ~+ / ~- are $PWD / $OLDPWD
+expect_block "tilde: ~athos/Desktop"               'du -sk ~athos/Desktop'
+expect_block "tilde: ~athos (bare)"                'du -sk ~athos'
+expect_block "tilde: find ~athos"                  'find ~athos -name x'
+expect_block "tilde: ls ~athos/Downloads"          'ls ~athos/Downloads'
+expect_block "tilde: ~+ is \$PWD (cwd ~/gt, one .. up is \$HOME)" 'du -sk ~+/../Desktop' /Users/athos/gt
+expect_block "tilde (control): ~+ with cwd=Downloads"       'du -sk ~+' /Users/athos/Downloads
+expect_allow "tilde: another user's home"          'du -sk ~someone/Desktop'
+expect_allow "tilde: ~athos/gt"                    'du -sk ~athos/gt'
+expect_allow "tilde: ~+ with cwd=~/gt"             'du -sk ~+' /Users/athos/gt
+# stdin fed by a listing of $HOME: the incident (list $HOME, measure each entry) in the other standard spelling
+G=/Users/athos/gt
+expect_block "stdin: xargs du < <(ls ~)"           'xargs du -sk < <(ls ~)' $G
+expect_block "stdin: xargs du <<< \"\$(ls ~)\""    'xargs du -sk <<< "$(ls ~)"' $G
+expect_block "stdin: while read ...; done < <(ls ~)" 'while read -r d; do du -sk "$d"; done < <(ls ~)' $G
+expect_block "stdin: IFS= read -r, ls -A"          'while IFS= read -r d; do du -sk "$d"; done < <(ls -A ~)' $G
+expect_block "stdin (control): a bare ls with cwd=\$HOME"    'while read -r d; do du -sk "$d"; done < <(ls -A)' /Users/athos
+expect_block "stdin: the listing is made after a cd" 'while read -r d; do du -sk "$d"; done < <(cd ~ && ls)' $G
+expect_block "stdin: read ONE entry, then measure it" 'read -r d < <(ls ~); du -sk "$d"' $G
+expect_block "stdin: read with no name (REPLY)"    'read -r < <(ls ~); du -sk "$REPLY"' $G
+expect_block "stdin: mapfile, loop over the array" 'mapfile -t a < <(ls ~); for d in "${a[@]}"; do du -sk "$d"; done' $G
+expect_block "stdin: readarray, measure the array" 'readarray -t a < <(ls ~); du -sk "${a[@]}"' $G
+expect_block "stdin: mapfile with no name (MAPFILE)" 'mapfile -t < <(ls ~); du -sk "${MAPFILE[@]}"' $G
+expect_block "stdin: a heredoc carrying the listing" $'xargs du -sk <<EOF\n$(ls ~)\nEOF' $G
+INNER_LOOP='while read -r d; do du -sk "$d"; done < <(ls ~)'
+expect_block "stdin: the same loop inside bash -c" "bash -c '$INNER_LOOP'" $G
+expect_allow "stdin: the same loop over ~/gt"       'while read -r d; do du -sk "$d"; done < <(ls ~/gt)' $G
+expect_allow "stdin: xargs du over ~/gt"            'xargs du -sk < <(ls ~/gt)' $G
+expect_allow "stdin: mapfile of ~/gt"               'mapfile -t a < <(ls ~/gt); du -sk "${a[@]}"' $G
+expect_allow "stdin: a loop fed by git"             'while read -r l; do du -sk "$l"; done < <(git ls-files)' $G
+expect_allow "stdin: a listing of \$HOME read but no entry scanned" 'while read -r d; do echo "$d"; done < <(ls ~)' $G
+# a hook payload with NO cwd: a relative scan cannot be judged, so it goes to the classifier, which COUNTS it
+: > "$ONE"
+hook_json 'for d in $(ls -A); do du -sk "$d"; done' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q 'result=UNKNOWN-CWD' "$ONE" && ok "no cwd in the payload + a relative scan -> allowed but COUNTED (UNKNOWN-CWD), not silent" \
+  || bad "no-cwd payload: rc=$RC log=[$(cat "$ONE")]"
+: > "$ONE"
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"for d in $(ls -A); do du -sk \"$d\"; done"},"cwd":null}' \
+  | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q 'result=UNKNOWN-CWD' "$ONE" && ok "cwd:null in the payload is the same: counted" || bad "cwd:null payload: rc=$RC log=[$(cat "$ONE")]"
+
+# The class, in-process: for EVERY size of every construct that used to have a cap, a hot value hidden in it is still a block,
+# and the same construct over a safe target is still an allow (a cap that became a blanket block would be its own bug).
+if [ -f "$HERE/home-scan-guard.py" ]; then
+  CAPS_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" python3 -I -S - <<'PY' 2>&1
+import importlib.util, os
+spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+def verdict(cmd, cwd="/Users/athos/gt"):
+    try:
+        m.analyze(cmd, cwd, ["/Users/athos"])
+    except m.Block:
+        return "block"
+    except m.Abort:
+        return "gave-up"
+    return "allow"
+
+cases = []          # (cmd, must)
+for n in range(2, 91):                                  # a brace list of n alternatives, the hot one first / middle / last
+    names = ["a%d" % i for i in range(n - 1)]
+    for pos in (0, (n - 1) // 2, n - 1):
+        hot = names[:pos] + ["Desktop"] + names[pos:]
+        cases.append(("du -sk ~/{%s}" % ",".join(hot), "block"))
+    cases.append(("du -sk ~/gt/{%s}" % ",".join(names + ["docs"]), "allow"))
+for k in range(1, 13):                                  # k chained two-way groups
+    cases.append(("du -sk ~/{Desktop,x}" + "{,}" * (k - 1), "block"))
+    cases.append(("du -sk ~/gt/{a,b}" + "{,}" * (k - 1), "allow"))
+    cases.append(("du -sk ~/{Desktop,x}" + "{,,}" * (k // 3), "block"))          # three-way groups of nothing: still ~/Desktop
+for k in range(1, 13):                                  # k nested groups
+    cases.append(("du -sk ~/" + "{x," * (k - 1) + "{x,Desktop}" + "}" * (k - 1), "block"))
+    cases.append(("du -sk ~/gt/" + "{x," * (k - 1) + "{x,docs}" + "}" * (k - 1), "allow"))
+for tail in ("~/{D..D}esktop", "~/{D..E}esktop", "~/{1..9..2}/../Desktop", "~/{a..z}ownloads"):
+    cases.append(("du -sk " + tail, "block"))
+for tail in ("~/gt/{1..3}", "~/gt/{a..z}", "~/gt/f{01..12}.txt"):
+    cases.append(("du -sk " + tail, "allow"))
+wrappers = ["env", "nice", "command", "exec", "nohup", "setsid", "time", "sudo", "caffeinate", "arch", "timeout 5",
+            "stdbuf -o0", "ionice -c 3", "env FOO=1", "nice -n 5", "command --"]
+for w in wrappers:                                      # 1..60 stacked wrappers
+    for depth in list(range(1, 25)) + [40, 60]:
+        cases.append(((w + " ") * depth + "du -sk ~/Desktop", "block"))
+        cases.append(((w + " ") * depth + "du -sk ~/gt", "allow"))
+for depth in (1, 5, 9, 20):                             # the same behind the shell own word splitting (brace expansion of the command word)
+    cases.append(("{" + "env," * depth + "du} -sk ~/Desktop", "block"))
+
+wrong = [(c, must, verdict(c)) for c, must in cases if verdict(c) != must]
+print("CAPS total=%d wrong=%d" % (len(cases), len(wrong)))
+for c, must, got in wrong[:12]:
+    print("  WRONG (want %s, got %s): %s" % (must, got, c[:110]))
+PY
+)"
+  case "$CAPS_OUT" in
+    "CAPS total="*" wrong=0"*) ok "class: no size of a brace list / chain / nest / wrapper stack hides a hot value, and none blocks a safe one (${CAPS_OUT%%$'\n'*})" ;;
+    *) bad "class: a cap collapsed 'too big' into 'not hot' (or into a false block) -- $CAPS_OUT" ;;
+  esac
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
 echo "-- must ALLOW: the bead's explicit list, and everything an agent does all day --"
 # ─────────────────────────────────────────────────────────────────────────
 # the bead's DEVE PERMITIR
@@ -592,6 +739,11 @@ for c in 'git status --short' 'bd list --status open --limit 0 --json' 'gc sessi
 done
 spawned 'du -sk ~' /Users/athos/gt && ok "python IS spawned when a scan meets \$HOME" || bad "prefilter missed 'du -sk ~'"
 spawned 'find . -name x' /Users/athos && ok "python IS spawned when the cwd itself is \$HOME" || bad "prefilter missed cwd=\$HOME"
+# no cwd in the payload is "don't know", not "not hot": a scan goes to the classifier (which counts it); a command with no scan tool
+# still takes the fast path
+spawned 'du -sk *' && ok "python IS spawned for a scan when the payload has no cwd" || bad "prefilter dropped a scan with no cwd"
+spawned 'git status --short' && bad "python spawned for git status with no cwd" || ok "fast path with no cwd: a command with no scan tool"
+spawned 'du -sk ~athos/Desktop' /Users/athos/gt && ok "python IS spawned for ~athos/Desktop (the prefilter reads ~name)" || bad "prefilter missed ~athos"
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
