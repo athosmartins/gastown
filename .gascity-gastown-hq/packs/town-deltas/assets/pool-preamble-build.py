@@ -12,6 +12,7 @@ Subcomandos:
     build       reescreve os overlays a partir do manifesto (determinístico)
     check       sai 1 se overlay commitado != gerado, ou se guarda/manifesto/fragment divergem
     sections    lista as seções da doutrina entregues por papel (com tamanho em chars)
+    per-task    (ga-aijm2v.7) por papel: quais seções o Jev pode dispensar por tarefa e o teto de economia
     new-skills  ADVISORY: skills que existem no disco mas o manifesto não conhece (nunca falha)
 
 Por que NÃO gerar o fragment: o engine lê o fragment direto do git; um passo de geração no deploy seria
@@ -259,16 +260,140 @@ def check_overlays(m):
     return errs
 
 
+# ----------------------------------------------------------------------------- por tarefa (ga-aijm2v.7)
+def eligible_for_role(m, blocks, role):
+    """Ids das seções que o Jev PODE dispensar para `role`, na ordem do fragment: elegíveis por tarefa E entregues a esse papel.
+    Só esta lista é perguntada ao Jev e só ela pode ser cortada; o resto (núcleo, never_cut, seção não classificada) entra sempre."""
+    guarded = m["doctrine"]["guarded"]
+    eligible = (m["doctrine"].get("per_task") or {}).get("eligible", {})
+    return [b["id"] for b in blocks if b["id"] in eligible and b["id"] in guarded and receives(guarded[b["id"]], role)]
+
+
+def _is_num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _compiles(pattern):
+    try:
+        re.compile(pattern, re.I)
+        return True
+    except (re.error, TypeError):
+        return False
+
+
+def check_per_task(m, blocks):
+    """-> (erros, avisos). Erro = o manifesto por tarefa é incoerente e o corte poderia atingir o que não devia. Aviso = seção guardada
+    que ninguém classificou (o que é seguro: não classificada = NÃO elegível = entra sempre)."""
+    pt = m["doctrine"].get("per_task")
+    if not isinstance(pt, dict):
+        return ["manifesto: doctrine.per_task ausente ou inválido (o preâmbulo por tarefa não tem política)"], []
+    errs, adv = [], []
+    guarded, core = m["doctrine"]["guarded"], set(m["doctrine"]["core"])
+    pool = {r["td_role"] for r in m["roles"].values()}
+    if not (isinstance(pt.get("experiment"), str) and pt["experiment"].strip()):
+        errs.append("per_task.experiment: string não vazia")
+    thr = pt.get("threshold")
+    if not (_is_num(thr) and 0 < thr < 1):
+        errs.append(f"per_task.threshold={thr!r}: precisa estar em (0,1) — 0 nunca corta, 1 corta tudo que o Jev não jura ser necessário")
+    if not (isinstance(pt.get("max_questions_per_call"), int) and not isinstance(pt["max_questions_per_call"], bool) and pt["max_questions_per_call"] >= 1):
+        errs.append("per_task.max_questions_per_call: inteiro >= 1")
+    if not (_is_num(pt.get("chars_per_token")) and pt["chars_per_token"] > 0):
+        errs.append("per_task.chars_per_token: número > 0")
+    eligible, never = pt.get("eligible"), pt.get("never_cut")
+    if not isinstance(eligible, dict) or not eligible:
+        errs.append("per_task.eligible: dict não vazio")
+        eligible = {}
+    if not isinstance(never, dict):
+        errs.append("per_task.never_cut: dict (id -> motivo)")
+        never = {}
+    for sid, e in eligible.items():
+        if sid not in guarded:
+            errs.append(f"per_task.eligible '{sid}': não é seção GUARDADA (o núcleo e ids inexistentes nunca são elegíveis)")
+            continue
+        if sid in core:
+            errs.append(f"per_task.eligible '{sid}': está no núcleo")
+        if sid in never:
+            errs.append(f"per_task.eligible '{sid}': também está em never_cut (ou é elegível ou nunca corta)")
+        if not any(r in pool for r in guarded[sid]["roles"]):
+            errs.append(f"per_task.eligible '{sid}': nenhum papel de pool a recebe — a pergunta nunca seria feita")
+        for k in ("instructions", "true", "false"):
+            if not (isinstance(e.get(k), str) and e[k].strip()):
+                errs.append(f"per_task.eligible '{sid}'.{k}: string não vazia (é a pergunta feita ao Jev)")
+        terms = e.get("cite_terms")
+        if not (isinstance(terms, list) and terms and all(isinstance(t, str) and t.strip() for t in terms)):
+            errs.append(f"per_task.eligible '{sid}'.cite_terms: lista não vazia de strings (detecta reprovação que cita a seção cortada)")
+    for sid, why in never.items():
+        if sid not in guarded:
+            errs.append(f"per_task.never_cut '{sid}': não é seção guardada")
+        if not (isinstance(why, str) and why.strip()):
+            errs.append(f"per_task.never_cut '{sid}': precisa de um motivo escrito")
+    for sid, rule in (pt.get("must_include") or {}).items():
+        if sid == "_doc":
+            continue
+        if sid not in eligible:
+            errs.append(f"per_task.must_include '{sid}': não é elegível (piso estrutural de seção que nunca é cortada é inútil)")
+            continue
+        if not isinstance(rule, dict) or not (set(rule) & {"issue_types", "metadata_keys", "labels", "text_regex"}):
+            errs.append(f"per_task.must_include '{sid}': regra vazia")
+            continue
+        for k in ("issue_types", "metadata_keys", "labels"):
+            if k in rule and not (isinstance(rule[k], list) and all(isinstance(x, str) and x for x in rule[k])):
+                errs.append(f"per_task.must_include '{sid}'.{k}: lista de strings")
+        if "text_regex" in rule and not (isinstance(rule["text_regex"], str) and _compiles(rule["text_regex"])):
+            errs.append(f"per_task.must_include '{sid}'.text_regex: regex inválida")
+    markers = pt.get("injection_markers")
+    if not (isinstance(markers, list) and markers):
+        errs.append("per_task.injection_markers: lista não vazia (texto de tarefa é conteúdo de fora e pode ser hostil)")
+    else:
+        for i, pat in enumerate(markers):
+            if not (isinstance(pat, str) and _compiles(pat)):
+                errs.append(f"per_task.injection_markers[{i}]: regex inválida")
+    for b in blocks:
+        if b["cond"] is None or b["id"] in eligible or b["id"] in never:
+            continue
+        if any(receives(guarded[b["id"]], r) for r in pool):
+            adv.append(f"seção guardada '{b['id']}' não está em per_task.eligible nem never_cut — fica FORA do corte por tarefa (entra sempre); classifique-a")
+    return errs, adv
+
+
+def cmd_per_task(m):
+    """Por papel: o que o Jev pode dispensar e o teto de economia (se ele dispensasse TUDO que pode)."""
+    errs, blocks = check_fragment(m)
+    if not blocks:
+        print("fragment ilegível:", *errs, sep="\n  ")
+        return 1
+    pt = m["doctrine"]["per_task"]
+    size = {b["id"]: len("\n".join(b["lines"])) + 1 for b in blocks}
+    cpt = pt["chars_per_token"]
+    print(f"limiar P(precisa) < {pt['threshold']} => dispensa; qualquer dúvida => a seção entra\n")
+    for r in m["roles"].values():
+        role = r["td_role"]
+        ids = eligible_for_role(m, blocks, role)
+        got = sum(size[b["id"]] for b in blocks if b["cond"] is None or receives(m["doctrine"]["guarded"][b["id"]], role))
+        top = sum(size[i] for i in ids)
+        print(f"== {role}: {len(ids)} elegíveis — teto {top:,} chars ≈ {int(top / cpt):,} tokens de {got:,} chars entregues ({top * 100 // max(got, 1)}%)")
+        for i in ids:
+            print(f"   {i:26s} {size[i]:>6,} chars ≈ {int(size[i] / cpt):>5,} tok")
+    print("\nnunca corta (guardadas):", ", ".join(sorted(pt["never_cut"])))
+    return 0
+
+
 def cmd_check(m):
     errs = check_overlays(m)
-    ferrs, _ = check_fragment(m)
+    ferrs, blocks = check_fragment(m)
     errs += ferrs
+    adv = []
+    if blocks:
+        perrs, adv = check_per_task(m, blocks)
+        errs += perrs
     if errs:
         print("pool-preamble-build check: FALHOU")
         for e in errs:
             print("  ✗", e)
         return 1
-    print("pool-preamble-build check: OK (overlays == manifesto; guardas == manifesto; núcleo presente)")
+    print("pool-preamble-build check: OK (overlays == manifesto; guardas == manifesto; núcleo presente; política por tarefa coerente)")
+    for a in adv:
+        print("  aviso:", a)
     return 0
 
 
@@ -314,10 +439,10 @@ def cmd_new_skills(m):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["build", "check", "sections", "new-skills"])
+    ap.add_argument("cmd", choices=["build", "check", "sections", "per-task", "new-skills"])
     a = ap.parse_args(argv)
     m = load_manifest()
-    return {"build": cmd_build, "check": cmd_check, "sections": cmd_sections, "new-skills": cmd_new_skills}[a.cmd](m)
+    return {"build": cmd_build, "check": cmd_check, "sections": cmd_sections, "per-task": cmd_per_task, "new-skills": cmd_new_skills}[a.cmd](m)
 
 
 if __name__ == "__main__":

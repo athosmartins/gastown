@@ -95,6 +95,33 @@ time.sleep(30)
 print("QP-HANG-SHOULD-NEVER-BE-PRINTED")
 EOF
 
+# ga-aijm2v.7: the preambulo report step. Hermetic for the same reason as the quem-pensa one (the real
+# jev_preambulo_report.py reads the LIVE gate log and bd). It is called ONCE with --full-to PATH: the
+# stub writes the full text there and prints the short Portuguese block on stdout, like the real one.
+cat >"$T/pb-ok.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+a = sys.argv
+if "--full-to" in a:
+    open(a[a.index("--full-to") + 1], "w").write("PREAMBULO FULL REPORT STUB\n")
+print("Preambulo por tarefa (so observacao): PB-RESUMO-STUB")
+EOF
+cat >"$T/pb-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_preambulo_report: simulated failure (ga-aijm2v.7 T11b)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/pb-empty.py" <<'EOF'
+#!/usr/bin/env python3
+EOF
+cat >"$T/pb-hang.py" <<'EOF'
+#!/usr/bin/env python3
+import time
+time.sleep(30)
+print("PB-HANG-SHOULD-NEVER-BE-PRINTED")
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -112,6 +139,7 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
       JEV_GATE_VERDICT_JOIN_TIMEOUT="${RUN_JOIN_TIMEOUT:-600}" \
       JEV_QUEM_PENSA_REPORT="${RUN_QP:-$T/qp-ok.py}" JEV_QUEM_PENSA_REPORT_TIMEOUT="${RUN_QP_TIMEOUT:-120}" \
+      JEV_PREAMBULO_REPORT="${RUN_PB:-$T/pb-ok.py}" JEV_PREAMBULO_REPORT_TIMEOUT="${RUN_PB_TIMEOUT:-300}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -263,6 +291,51 @@ case "$N" in *"controle 2 alerta(s); experimento 2"*) ok "T10e positive control:
 case "$N" in *"quem-pensa-nova"*) nok "T10e leak (ntfy)" "a quem-pensa record became its own suppression-experiment block: $N" ;; *) ok "T10e the ntfy has no quem-pensa-nova suppression block" ;; esac
 case "$F" in *"## quem-pensa-nova"*) nok "T10e leak (report file)" "a quem-pensa record became a '## quem-pensa-nova' section" ;; *) ok "T10e the full report has no '## quem-pensa-nova' section" ;; esac
 case "$N" in *"400 + 45 tokens"*) nok "T10e token leak" "the record's Jev tokens were counted: $N" ;; *) ok "T10e the record's Jev tokens are not counted as suppression cost" ;; esac
+
+# T11 (ga-aijm2v.7): the preambulo block. Same contract as T10: the generic numbers stay exactly T1's
+# whatever happens to the block, and the block never fails SILENTLY.
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T11a exit 0, exactly one ntfy with the preambulo step on"; else nok "T11a rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'PREAMBULO FULL REPORT STUB' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T11a the preambulo report is appended to the day's full report file" || nok "T11a report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"PB-RESUMO-STUB"*) ok "T11a the ntfy carries the preambulo Portuguese block" ;; *) nok "T11a ntfy block" "$N" ;; esac
+case "$N" in *"QP-RESUMO-STUB"*) ok "T11a the quem-pensa block is still there (the two blocks coexist)" ;; *) nok "T11a coexist" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T11a the generic numbers are untouched by the extra block" ;; *) nok "T11a generic numbers" "$N" ;; esac
+RUN_PB="$T/pb-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T11b failing preambulo report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T11b rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Preâmbulo: relatório falhou"*) ok "T11b the failure is VISIBLE in the ntfy, not a silent absence" ;; *) nok "T11b visible failure" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T11b generic numbers still reported" ;; *) nok "T11b generic numbers" "$N" ;; esac
+case "$N" in *"QP-RESUMO-STUB"*) ok "T11b the quem-pensa block survives a preambulo failure" ;; *) nok "T11b qp survives" "$N" ;; esac
+grep -q 'simulated failure' "$T/out/preambulo-report.log" 2>/dev/null \
+  && ok "T11b the failure's stderr is kept in preambulo-report.log" || nok "T11b stderr kept" "$(cat "$T/out/preambulo-report.log" 2>&1)"
+RUN_PB="$T/pb-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"Preâmbulo: relatório falhou"*) ok "T11c an empty preambulo report is a visible failure, not silence" ;; *) nok "T11c empty" "$N" ;; esac
+grep -q 'Preâmbulo: relatório falhou' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T11c ...and the day's file says so too" || nok "T11c file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+T0=$SECONDS
+RUN_PB="$T/pb-hang.py" RUN_PB_TIMEOUT=1 run 2026-09-20
+ELAPSED=$((SECONDS - T0))
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T11d hung preambulo report still yields exit 0 and exactly one ntfy"; else nok "T11d rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Preâmbulo: relatório falhou"*) ok "T11d the hang is a visible failure" ;; *) nok "T11d hang visible" "$N" ;; esac
+if [ "$ELAPSED" -lt 20 ]; then ok "T11d the hung call was cut by the bound (${ELAPSED}s, not the stub's 30s sleep)"; else nok "T11d killed" "took ${ELAPSED}s: the hung process was not terminated"; fi
+case "$N" in *"PB-HANG-SHOULD-NEVER-BE-PRINTED"*) nok "T11d marker" "the hung process finished its sleep" ;; *) ok "T11d the hung process never printed past its sleep" ;; esac
+# T11e a preambulo record in the experiment log must NOT reach the generic report (same leak as T10e:
+# summarize() files any mode it does not know under the suppression experiment's "experiment arm").
+cp "$T/log.jsonl" "$T/log-pb.jsonl"
+cat >>"$T/log-pb.jsonl" <<'EOF'
+{"ts": "2026-09-20T05:00:00Z", "mode": "preambulo", "experiment": "preambulo", "entity_id": "ga-x", "bead": "ga-x", "arm": "experiment", "jev_status": "ok", "jev_ok": true, "aplicado": false, "cortadas": ["engine-window-patch"], "jev_tokens_in": 400, "jev_tokens_out": 45}
+EOF
+RUN_LOG="$T/log-pb.jsonl" run 2026-09-20
+N="$(cat "$T/notify.log")"
+F="$(cat "$T/out/2026-09-20.txt" 2>/dev/null)"
+case "$N" in *"controle 2 alerta(s); experimento 2"*) ok "T11e positive control: the real experiment's block is in the ntfy (the fixture was read)" ;; *) nok "T11e control" "$N" ;; esac
+case "$N" in *"experimento 3"*) nok "T11e leak (ntfy)" "a preambulo record was counted as a fired alert: $N" ;; *) ok "T11e the preambulo record is not counted as a suppression alert" ;; esac
+case "$F" in *"## preambulo"*) nok "T11e leak (report file)" "a preambulo record became a '## preambulo' section" ;; *) ok "T11e the full report has no '## preambulo' section" ;; esac
+case "$N" in *"400 + 45 tokens"*) nok "T11e token leak" "the record's Jev tokens were counted: $N" ;; *) ok "T11e the record's Jev tokens are not counted as suppression cost" ;; esac
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

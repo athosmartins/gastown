@@ -1,0 +1,18 @@
+# ga-aijm2v.7 (Jev): "preambulo por tarefa" in SHADOW mode. For every task the dispatcher handed to a pool
+# (gc.routed_to = gastown.dog / wa-worker / ps-worker) that a session picked up, it records which OPTIONAL
+# doctrine sections Jev would leave out of that session's start (mockup rulebook for a shell fix, engine-rebuild
+# procedure for a docs edit...) next to what the quality gate later said -- so the Athos sees, with numbers, the
+# size of the prize and the risk BEFORE any session loses a line. It NEVER changes what a session receives:
+# every pool session still gets the full doctrine (`aplicado: false` in every record).
+# Reads bd (`bd list` per rig store, read-only), the doctrine manifest/fragment and quality-gate.jsonl (in the
+# report); writes only jev-experiment.jsonl (mode "preambulo"). The daily Jev ntfy (jev-daily-report.sh, 21:07)
+# carries the table.
+# 1h cadence: the outcome is a gate verdict that lands minutes-to-days after the decision, so latency is
+# irrelevant; new tasks arrive at ~80/day. A run costs ~4 s per new task (ONE Jev call carries every section's
+# question; measured live 26/09: 4 tasks = 17 s including discovery) and is bounded by --limit and the wrapper's
+# timeout, and is single-instance (flock), so the cadence cannot stack.
+[order]
+description = "Preâmbulo por tarefa do Jev (sombra): records which optional doctrine sections Jev would drop for each task a pool session picked up, and what the gate then said; never changes what a session receives (ga-aijm2v.7)"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/jev-preambulo.sh"

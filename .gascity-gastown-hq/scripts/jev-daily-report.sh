@@ -81,6 +81,25 @@ QP_PT=$(timeout "$QP_TIMEOUT" python3 "$QP_REPORT" --resumo-pt 2>>"$QP_LOG") || 
 { echo; echo "$QP_TXT"; } >>"$OUT_DIR/$DAY.txt"
 RESUMO="$RESUMO"$'\n'"$QP_PT"
 
+# ga-aijm2v.7: the preambulo (per-task doctrine diet, SHADOW) table, cumulative to date. Its records
+# come from the hourly jev-preambulo order, so there is nothing to run first -- only to read. ONE
+# invocation writes the full text to a file and prints the short Portuguese block (its rejection-
+# reason lookups read bd, so they must not run twice). Best-effort like the blocks above and just
+# as VISIBLE when it fails: the real report always prints at least one line, so empty output counts
+# as a failure -- a missing block would read exactly like "no data".
+PB_REPORT="${JEV_PREAMBULO_REPORT:-$HQ/scripts/jev_preambulo_report.py}"
+PB_TIMEOUT="${JEV_PREAMBULO_REPORT_TIMEOUT:-300}"
+PB_LOG="$OUT_DIR/preambulo-report.log"
+PB_FULL="$OUT_DIR/preambulo-full.txt"
+PB_FAIL="Preâmbulo: relatório falhou — ver $PB_LOG"
+rm -f "$PB_FULL"
+PB_PT=$(timeout "$PB_TIMEOUT" python3 "$PB_REPORT" --resumo-pt --full-to "$PB_FULL" 2>>"$PB_LOG") || PB_PT=""
+PB_TXT=$(cat "$PB_FULL" 2>/dev/null) || PB_TXT=""
+[ -n "$PB_TXT" ] || PB_TXT="$PB_FAIL"
+[ -n "$PB_PT" ] || PB_PT="$PB_FAIL"
+{ echo; echo "$PB_TXT"; } >>"$OUT_DIR/$DAY.txt"
+RESUMO="$RESUMO"$'\n'"$PB_PT"
+
 # Last command: a failed ntfy makes the job's exit status non-zero (visible in
 # `launchctl list`), instead of a report that silently never reached the phone.
 notify -t "Jev — fim do dia $DAY (UTC)" "$RESUMO"

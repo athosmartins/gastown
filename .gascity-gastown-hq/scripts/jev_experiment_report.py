@@ -102,8 +102,9 @@ def load_events(date: str | None, experiment: str | None) -> list[dict]:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue  # a corrupt line is data-quality noise, not a reason to crash the report
-            if ev.get("mode") == "quem-pensa":
-                # ga-aijm2v.9: these have their own calibration table (jev_quem_pensa_report.py).
+            if ev.get("mode") in ("quem-pensa", "preambulo"):
+                # ga-aijm2v.9 / ga-aijm2v.7 ("preambulo", jev_preambulo_report.py): these have their own tables
+                # (jev_quem_pensa_report.py, jev_preambulo_report.py).
                 # summarize() below treats any mode it does not know as a suppression-experiment
                 # "experiment arm" event, so letting them through would count every one as a
                 # fired alert. Skipped here, not in summarize(), so the mode list there stays
