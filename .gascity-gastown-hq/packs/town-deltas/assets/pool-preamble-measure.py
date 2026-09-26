@@ -48,10 +48,16 @@ ROLE_RES = [  # ordem importa: refino-gate-reviewer antes de gate-reviewer
 ]
 BEACON = re.compile(r"^\[gascity\]\s+(\S+)")
 VANISHED = [0]   # transcritos que sumiram durante a varredura: descartados, mas CONTADOS e mostrados (nunca "sem sessão" calado)
+NOID = [0]       # tool_use SEM id de bloco: contadas por posição (pode subcontar numa colisão) — o residual fica visível, não calado
 
 
-def vanished_note():
-    return f"  (transcritos que sumiram durante a varredura e ficaram de fora: {VANISHED[0]})" if VANISHED[0] else ""
+def scan_notes():
+    n = ""
+    if VANISHED[0]:
+        n += f"  (transcritos que sumiram durante a varredura e ficaram de fora: {VANISHED[0]})"
+    if NOID[0]:
+        n += f"  ({NOID[0]} tool_use sem id de bloco: contadas por posição, podem estar subcontadas)"
+    return n
 
 
 def parse_ts(s):
@@ -117,7 +123,10 @@ def scan_session(path):
                 msg = r.get("message") or {}
                 for i, b in enumerate(msg.get("content") or []):    # tool_use: por BLOCO, antes de qualquer dedup de mensagem
                     if isinstance(b, dict) and b.get("type") == "tool_use":
-                        key = b.get("id") or (msg.get("id"), i, b.get("name"))
+                        key = b.get("id")
+                        if not key:                       # o bloco real sempre traz id (toolu_...); sem ele só resta a posição
+                            NOID[0] += 1
+                            key = (msg.get("id"), i, b.get("name"))
                         if key not in seen_tools:
                             seen_tools.add(key)
                             tools[b.get("name")] += 1
@@ -144,7 +153,7 @@ def sessions(since_hours, roles=None):
         try:
             if os.path.getmtime(p) < cut:
                 continue
-        except OSError:                       # transcrito apagado entre o glob e o stat (a limpeza de sessões de pool roda em paralelo)
+        except OSError:                       # transcrito apagado entre o glob e o stat (visto ao vivo em 26/09, em transcritos de dog)
             VANISHED[0] += 1
             continue
         s = scan_session(p)
@@ -172,25 +181,25 @@ def cmd_first_turn(a):
     if not by:
         why = (f"{unknown_ts} sessão(ões) de pool existem mas têm timestamp ilegível e não dá pra separar antes/depois do corte" if unknown_ts
                else f"nenhuma sessão de pool com transcrito nas últimas {a.since_hours:g}h" + (f" (papéis: {a.roles})" if roles else ""))
-        print(f"SEM AMOSTRA: {why}. Isto NÃO é medição de zero — é ausência de dado." + vanished_note())
+        print(f"SEM AMOSTRA: {why}. Isto NÃO é medição de zero — é ausência de dado." + scan_notes())
         return 2
     out = {}
     for role, d in sorted(by.items()):
         out[role] = {k: {"n": len(v), "median": med(v), "p10": med(sorted(v)[: max(1, len(v) // 10)]) if v else None,
                           "p90": sorted(v)[min(len(v) - 1, math.ceil(len(v) * 0.9) - 1)] if v else None} for k, v in d.items()}
     if a.json:
-        json.dump({"cutover": a.cutover, "unknown_ts": unknown_ts, "vanished": VANISHED[0], "roles": out}, sys.stdout, indent=2, ensure_ascii=False)
+        json.dump({"cutover": a.cutover, "unknown_ts": unknown_ts, "vanished": VANISHED[0], "tool_use_sem_id": NOID[0], "roles": out}, sys.stdout, indent=2, ensure_ascii=False)
         print()
         return 0
     if cutover is None:
-        print(vanished_note().strip() or "(nenhum transcrito sumiu durante a varredura)")
+        print(scan_notes().strip() or "(varredura completa: nenhum transcrito sumiu; toda tool_use tinha id)")
         print(f"{'papel':24s} {'n':>5s} {'mediana 1º turno':>17s} {'p10':>9s} {'p90':>9s}")
         for role, d in out.items():
             x = d["after"]
             print(f"{role:24s} {x['n']:5d} {x['median']:17,d} {x['p10']:9,d} {x['p90']:9,d}")
         return 0
     print(f"corte = {a.cutover}   (sessões sem timestamp legível: {unknown_ts})")
-    print(vanished_note().strip() or "(nenhum transcrito sumiu durante a varredura)")
+    print(scan_notes().strip() or "(varredura completa: nenhum transcrito sumiu; toda tool_use tinha id)")
     print(f"{'papel':24s} {'ANTES n':>8s} {'mediana':>10s} {'DEPOIS n':>9s} {'mediana':>10s} {'delta':>10s} {'%':>6s}")
     for role, d in out.items():
         b, f = d["before"], d["after"]
@@ -222,7 +231,7 @@ def cmd_denied(a):
         for tool, c in s["tools"].items():
             if tool in d:
                 hits[s["role"]][tool] += c
-    print(f"sessões avaliadas (depois do corte): {dict(n_sessions) or 'nenhuma'}" + vanished_note())
+    print(f"sessões avaliadas (depois do corte): {dict(n_sessions) or 'nenhuma'}" + scan_notes())
     if not n_sessions:
         print("SEM AMOSTRA: nenhuma sessão de papel de pool depois do corte — não dá pra dizer que 'não há tentativas'. Espere spawns novos.")
         return 2

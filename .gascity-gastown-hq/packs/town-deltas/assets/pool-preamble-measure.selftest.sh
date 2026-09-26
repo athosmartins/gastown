@@ -134,6 +134,8 @@ rows = [{"type": "user", "timestamp": "2026-09-26T10:00:00Z", "message": {"conte
         rec("m21", [{"type": "tool_use", "id": "toolu_b1", "name": "Bash", "input": {}}]),
         # 2 tool_use no MESMO registro
         rec("m22", [{"type": "tool_use", "id": "toolu_r1", "name": "Read", "input": {}}, {"type": "tool_use", "id": "toolu_r2", "name": "Read", "input": {}}]),
+        # bloco SEM id (o real sempre traz; sem ele só resta a posição): conta 1 E o residual é declarado, não calado
+        rec("m23", [{"type": "tool_use", "name": "Glob", "input": {}}]),
         # subagente: fora
         dict(rec("s1", [{"type": "tool_use", "id": "toolu_s1", "name": "Artifact", "input": {}}]), isSidechain=True)]
 open(d + "/u.jsonl", "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
@@ -150,8 +152,11 @@ chk(t.get("Workflow") == 1, f"Workflow no 3º registro do message.id: esperado 1
 chk(t.get("Bash") == 2, f"2 Bash de ids diferentes em registros do mesmo message.id + 1 registro repetido: esperado 2, veio {t.get('Bash')}")
 chk(t.get("Read") == 2, f"2 tool_use no mesmo registro: esperado 2, veio {t.get('Read')}")
 chk("Artifact" not in t, "tool_use de subagente (isSidechain) foi contada")
+chk(t.get("Glob") == 1, f"tool_use sem id: esperado 1 (por posição), veio {t.get('Glob')}")
+chk(ppm.NOID[0] == 1, f"tool_use sem id tem que ser CONTADA como residual (NOID), veio {ppm.NOID[0]}")
+chk("sem id de bloco" in ppm.scan_notes(), "scan_notes não declara o residual de tool_use sem id")
 # tokens/turnos continuam por message.id: 4 ids distintos com uso, 1º turno = 151
-chk(s and s["turns"] == 3, f"turnos: 1 por message.id (m20, m21, m22): esperado 3, veio {s and s['turns']}")
+chk(s and s["turns"] == 4, f"turnos: 1 por message.id (m20, m21, m22, m23): esperado 4, veio {s and s['turns']}")
 chk(s and s["first"] == 151, f"1º turno: esperado 151, veio {s and s['first']}")
 print("\n".join("      ✗ " + e for e in errs)); sys.exit(1 if errs else 0)
 EOF
