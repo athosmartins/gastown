@@ -20,7 +20,7 @@ Onde está cada coisa:
 | consumidor (Jev → decisão → log) | `scripts/jev_preambulo_experiment.py` (`run`, `explain`) |
 | relatório (junta o log do gate na hora de ler) | `scripts/jev_preambulo_report.py` |
 | order + wrapper (cooldown 1h, `timeout`, `nice`, flock) | `packs/town-deltas/orders/jev-preambulo.toml`, `assets/scripts/jev-preambulo.sh` |
-| testes | `scripts/jev-preambulo.selftest.sh` (207 checagens), `assets/tests/jev-daily-report.test.sh` (bloco T11) |
+| testes | `scripts/jev-preambulo.selftest.sh` (247 checagens), `assets/tests/jev-daily-report.test.sh` (bloco T11) |
 
 ## Regras de corte (todas declaradas no manifesto, todas provadas por `pool-preamble-build.py check`)
 
@@ -30,10 +30,10 @@ Uma seção só é **cortada** (na sombra: só registrada como cortável) quando
 2. o Jev respondeu **a pergunta daquela seção**, com resposta válida (`noul` em [0,1], finito);
 3. P(precisa) **< limiar** (0,3 — inicial, ajustável pela medição). Exatamente 0,3 fica;
 4. nenhum **piso estrutural** (`must_include`: `issue_type`, chave de metadata, label ou regex no texto) disparou — ex.: bead de molecule mantém `graph-v2-formulas`, texto que fala em "mockup/UI/HTML/tela" mantém `mockup-s3`, "engine rebuild/binary swap/engine window" mantém `engine-window-patch`;
-5. o texto da tarefa não tem **marcador de injeção** (`per_task.injection_markers`) — com marcador, o Jev nem é chamado e tudo fica.
+5. o texto da tarefa não tem **marcador de injeção** (`per_task.injection_markers`) — com marcador, o Jev nem é chamado e tudo fica. A varredura lê título, descrição e critérios **cada um com o seu próprio limite** (20 mil chars, após tirar espaços das pontas — do mesmo jeito que o estado do Jev é montado), então um campo longo não empurra outro pra fora da varredura.
 
 **Terceiro estado, sempre:** Jev fora, lento, sem credencial, resposta malformada ou parcial ⇒ aquela seção **fica** (`motivo: jev_indisponivel`), nunca é cortada.
-Uma resposta ruim estraga só a *sua* seção. Três falhas seguidas do Jev param a passada (circuit breaker); uma bead que falha 3x fica com a decisão "tudo fica" e não é reperguntada.
+Uma resposta ruim estraga só a *sua* seção. Três falhas seguidas do Jev param a passada (circuit breaker): a sequência conta **chamadas** ao Jev — só uma resposta válida zera, só uma falha soma, e uma bead com marcador de injeção (que não chamou o Jev) deixa a sequência como estava. Uma bead que falha 3x fica com a decisão "tudo fica" e não é reperguntada.
 
 Elegíveis hoje (`pool-preamble-build.py per-task`; tokens **estimados**, 2,2 chars/token):
 
@@ -81,15 +81,16 @@ Marcador de injeção ⇒ nenhuma pergunta e nenhuma seção cortada. Falso posi
 ## Operação
 
 ```bash
-python3 packs/town-deltas/assets/pool-preamble-build.py check     # política coerente? (a order recusa rodar se não)
+python3 packs/town-deltas/assets/pool-preamble-build.py check     # política coerente? (a order só reverifica a parte per_task — ver "Política inválida")
 python3 packs/town-deltas/assets/pool-preamble-build.py per-task  # o que cada papel pode dispensar + teto
 python3 scripts/jev_preambulo_experiment.py explain --store <rig> --bead <id>   # papel, elegíveis, pisos, injeção — sem Jev, sem escrita
 python3 scripts/jev_preambulo_experiment.py run --dry-run --limit 5              # pergunta ao Jev de verdade, não grava
 python3 scripts/jev_preambulo_report.py --resumo-pt                              # o bloco do relatório diário
-bash scripts/jev-preambulo.selftest.sh                                           # 207 checagens, sem rede
+bash scripts/jev-preambulo.selftest.sh                                           # 247 checagens, sem rede
 ```
 
 - **Desligar:** `JEV_PREAMBULO_ENABLED=0` ou criar `.gc/logs/jev-preambulo.disabled` (uma cópia da regra, dentro do script). A order deixa de gravar; nada mais muda, porque nada aplica.
-- **Política inválida:** o script sai 2 com o motivo e **não** roda (nem pergunta, nem grava) — o motivo cai no `.gc/logs/jev-preambulo.log`.
+- **Política inválida:** ao começar, o script roda só a parte `per_task` do `check` (`check_per_task`: manifesto × fragmento); se ela falha, sai 2 com o motivo e **não** roda (nem pergunta, nem grava) — o motivo cai no `.gc/logs/jev-preambulo.log`. O resto do `check` (overlays por papel, ids repetidos e guardas do fragmento, sentinelas do núcleo) **não** é reverificado a cada passada; quem o roda por inteiro é o `jev-preambulo.selftest.sh` e o comando acima.
+- **Cobertura parcial:** se o `gc rig list` falha (erro, timeout, JSON ruim, formato inesperado, `ok:false`, rig sem path), só o store do HQ é lido — e a passada **diz isso**: `rig_list_error` traz o motivo e `unreadable_stores` inclui `"rig-list"` no JSON de contadores da linha do `.gc/logs/jev-preambulo.log`. Uma lista que respondeu "nenhum rig" é vazia de verdade e não gera aviso. A passada seguinte (janela de 4 dias) recupera o que ficou de fora.
 - **Custo:** ~4 s por tarefa nova (uma chamada por tarefa), limite `--limit` 60 por passada, `timeout` 900 s, `nice 10`, lock de instância única.
 - **Reverter:** remover `orders/jev-preambulo.toml` (ou manter o `.disabled`). Não há efeito em sessão a desfazer; os registros já gravados ficam no `jev-experiment.jsonl`, inertes (`aplicado: false`), e o relatório genérico os ignora (`mode: "preambulo"`).

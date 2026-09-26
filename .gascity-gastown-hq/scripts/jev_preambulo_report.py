@@ -116,13 +116,16 @@ def summarize(records: list[dict], first_reviews: dict[str, dict] | None, policy
     roles: dict[str, dict] = {}
     sections: dict[str, dict] = defaultdict(_section_row)
     for r in usable:
-        role = roles.setdefault(r.get("pool", "?"), {"n": 0, "cuts_something": 0, "tokens": 0, "chars": 0, "chars_doutrina": 0, "ceiling_tokens": 0})
+        role = roles.setdefault(r.get("pool", "?"), {"n": 0, "cuts_something": 0, "tokens": 0, "chars": 0, "chars_doutrina": 0, "ceiling_tokens": 0, "ceiling_unknown": 0})
         role["n"] += 1
         role["cuts_something"] += 1 if r.get("cortadas") else 0
         role["tokens"] += int(r.get("tokens_estimados_poupados") or 0)
         role["chars_doutrina"] += int(r.get("chars_doutrina_papel") or 0)
         if policy:
             role["ceiling_tokens"] += int(round(sum(policy["sizes"].get(s, 0) for s in r.get("elegiveis", [])) / policy["pt"]["chars_per_token"]))
+            # a section id the current fragment does not know (renamed/removed since the record was written) adds 0 above:
+            # counted here so the report can say the ceiling is understated instead of printing it as if complete
+            role["ceiling_unknown"] += sum(1 for s in r.get("elegiveis", []) if s not in policy["sizes"])
         for sid in r.get("elegiveis", []):
             row = sections[sid]
             p = (r.get("prob") or {}).get(sid)
@@ -254,6 +257,10 @@ def format_report(s: dict) -> str:
         share = (f" = {100 * r['tokens'] / max(1.0, r['chars_doutrina'] / s['chars_per_token']):.0f}% of its doctrine"
                  if r["chars_doutrina"] and s["chars_per_token"] else "")
         lines.append(f"   {role:<10} {r['n']:>4} tasks: Jev would cut >=1 section in {_pct(r['cuts_something'], r['n'])}; mean {r['tokens'] / r['n']:.0f} tokens/task{ceil}{share}")
+    ceiling_unknown = sum(r.get("ceiling_unknown", 0) for r in s["roles"].values())
+    if ceiling_unknown:
+        lines.append(f"   ! {ceiling_unknown} eligible-section id(s) in the records are unknown to the current fragment (renamed/removed since): "
+                     "counted as 0 chars, so the ceilings above are UNDERSTATED")
 
     thr = "?" if s["limiar"] is None else s["limiar"]
     lines += ["", f"── per section (asked = Jev gave an answer; a section is cut only if P(needed) < {thr}) ──",

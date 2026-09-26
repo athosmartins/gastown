@@ -79,7 +79,8 @@ CIRCUIT_BREAK_FAILS = 3
 DEFAULT_SINCE_DAYS = 4.0
 DEFAULT_LIMIT = 60
 HTTP_TIMEOUT_S = max(je.HTTP_TIMEOUT_S, 15)
-TEXT_SCAN_BUDGET = 20000  # chars of task text the structural/injection regexes look at
+TEXT_SCAN_BUDGET = 20000  # chars of EACH task-text field (title, description, acceptance) the structural/injection regexes look at
+RIG_LIST_TIMEOUT_S = 90  # `gc rig list` takes many seconds under Dolt load (ga-eu2x); a batch job, not latency-sensitive
 
 DEFAULT_LOG_DIR = Path(os.environ.get("JEV_PREAMBULO_DIR", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs"))
 LOCK_PATH = DEFAULT_LOG_DIR / "jev-preambulo.lock"
@@ -91,7 +92,11 @@ _ROLE_BY_ROUTE = (
     (re.compile(r"(^|[./])wa-worker$"), "wa-worker"),
     (re.compile(r"(^|[./])ps-worker$"), "ps-worker"),
 )
-_DELIMITER_RE = re.compile(r"</?\s*conteudo_externo\s*>", re.I)
+# The fence's opening sequence in any spelling a tag parser or a model reads as the same tag: whitespace after `<` or
+# `/`, attributes, no closing `>`, any case. Only the opener is matched: what follows it is left as plain text, and
+# with the opener gone no `>` left behind can close or open anything. (Look-alike glyphs are not neutralized; they are
+# not our tag to a parser either, and Jev returns numbers only, so this is defense in depth.)
+_DELIMITER_RE = re.compile(r"<\s*/?\s*conteudo_externo", re.I)
 
 
 class PolicyError(Exception):
@@ -146,7 +151,14 @@ def pool_role(routed_to: str | None) -> str | None:
 
 # ── what Jev is (not) allowed to see, and structural floors ──────────────────────────
 def task_text(bead: dict) -> str:
-    return "\n".join(str(bead.get(k) or "") for k in ("title", "description", "acceptance_criteria"))[:TEXT_SCAN_BUDGET]
+    """What the injection markers and structural floors read. Each field is stripped and capped SEPARATELY, the way
+    qp.build_state_nova prepares what Jev is shown (`_cap` strips, then cuts description at 6000 and acceptance at
+    3000): a cap on the joined text would let a long description push the acceptance criteria out of the scan while
+    Jev still receives them, and leading whitespace would eat the window. TEXT_SCAN_BUDGET per field is above the
+    caps Jev's description (6000) and acceptance (3000) get, so the scan covers at least what Jev sees of them; total
+    work stays bounded. The title is the one field Jev's state does not cap: a title past the budget would have an
+    unscanned tail (not a real case: the longest title in the HQ store, 26/09, is 336 chars)."""
+    return "\n".join(str(bead.get(k) or "").strip()[:TEXT_SCAN_BUDGET] for k in ("title", "description", "acceptance_criteria"))
 
 
 def build_state(bead: dict) -> str:
@@ -334,6 +346,37 @@ def _bd_list(store: str, extra: list[str]) -> list[dict] | None:
     return [b for b in data if isinstance(b, dict)] if isinstance(data, list) else None
 
 
+def rig_store_paths() -> tuple[dict[str, str], str | None]:
+    """(rig name -> path, error). Three states, never two: `error` is None ONLY when `gc rig list` answered and said
+    which rigs exist (an empty map then really means "no rig"); otherwise the map is what could be read and `error`
+    says why it is not the whole answer. gv._rig_paths() returns {} for a failed call too, so a caller cannot tell
+    "no other rigs" from "could not ask" — and this job would then scan the HQ store alone while reporting full
+    coverage (whatsapp_automation holds most of the pool-routed beads)."""
+    r = gv._run(["gc", "rig", "list", "--json"], timeout=RIG_LIST_TIMEOUT_S)
+    if r is None:
+        return {}, "rig_list_unavailable"
+    if r.returncode != 0:
+        return {}, f"rig_list_rc_{r.returncode}"
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}, "rig_list_bad_json"
+    rigs = data.get("rigs") if isinstance(data, dict) else None
+    if not isinstance(rigs, list):
+        return {}, "rig_list_bad_shape"
+    if data.get("ok") is False:
+        return {}, "rig_list_not_ok"
+    out: dict[str, str] = {}
+    unusable = 0
+    for rig in rigs:
+        name, path = (rig.get("name"), rig.get("path")) if isinstance(rig, dict) else (None, None)
+        if name and path:
+            out[name] = path
+        else:
+            unusable += 1
+    return out, (f"rig_list_{unusable}_rig_without_path" if unusable else None)
+
+
 def discover(stores: list[str], since_days: float, now: datetime | None = None) -> tuple[list[dict], list[str]]:
     """(entities, unreadable stores). Per store: beads CREATED in the window plus beads currently in progress whatever
     their age (an old bead dispatched today is still a task handed to a pool). One entity per bead id; oldest first.
@@ -447,15 +490,18 @@ def run(gc_city: str | None = None, dry_run: bool = False, limit: int = DEFAULT_
     """One pass. Returns counters (also printed by main). Raises PolicyError when the policy is unusable."""
     gc_city = gc_city or gv.DEFAULT_GC_CITY
     policy = policy or load_policy()
+    rig_list_error = None
     if stores is None:
-        rigs = gv._rig_paths()
+        rigs, rig_list_error = rig_store_paths()
         stores = [gc_city] + [p for p in rigs.values() if os.path.realpath(p) != os.path.realpath(gc_city)]
     entities, unreadable = discover(stores, since_days, now=now)
+    if rig_list_error:
+        unreadable.append("rig-list")  # the other rigs' stores were never even attempted: partial coverage, said so
     done = load_done(log_path or je.JEV_LOG)
     todo = [e for e in entities if e["entity_id"] not in done]
     counts: dict = {"entities": len(entities), "new": len(todo), "processed": 0, "logged": 0, "jev_failed": 0,
-                    "circuit_break": False, "unreadable_stores": unreadable, "statuses": defaultdict(int),
-                    "would_cut": 0, "tokens_estimados_poupados": 0}
+                    "circuit_break": False, "unreadable_stores": unreadable, "rig_list_error": rig_list_error,
+                    "statuses": defaultdict(int), "would_cut": 0, "tokens_estimados_poupados": 0}
     consecutive_fails = 0
     for ent in todo:
         if counts["processed"] >= limit:
@@ -471,9 +517,11 @@ def run(gc_city: str | None = None, dry_run: bool = False, limit: int = DEFAULT_
         counts["statuses"]["jev_" + detail["jev_status"]] += 1
         counts["would_cut"] += 1 if detail["cortadas"] else 0
         counts["tokens_estimados_poupados"] += detail["tokens_estimados_poupados"]
-        if detail["jev_status"] not in ("falhou", "parcial"):
+        # The streak counts consecutive Jev CALLS. Only an answered call clears it and only a failed one extends it;
+        # "nao_chamado_injecao" made no call, so it says nothing about Jev and leaves the streak as it was.
+        if detail["jev_status"] == "ok":
             consecutive_fails = 0
-        else:
+        elif detail["jev_status"] in ("falhou", "parcial"):
             counts["jev_failed"] += 1
             consecutive_fails += 1
             if consecutive_fails >= CIRCUIT_BREAK_FAILS:
