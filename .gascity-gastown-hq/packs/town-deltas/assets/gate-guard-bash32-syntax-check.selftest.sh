@@ -735,7 +735,7 @@ fi
 # that a check that HARD-BLOCKS cannot touch other rigs. Prose is what a reader
 # trusts instead of re-measuring, so pin it: the false sentences must stay gone,
 # and the true scope must stay stated.
-for _false_claim in "never live under" "costs one empty git diff and nothing else" "gate/pilot/witness/deacon" "every com.gascity.* launchd"; do
+for _false_claim in "never live under" "costs one empty git diff" "gate/pilot/witness/deacon" "every com.gascity.* launchd"; do
   if echo "$B32_BLOCK" | grep -F "$_false_claim" >/dev/null; then
     bad "guard.sh: the bash32 block still says '$_false_claim' — a scope/interpreter claim measured to be false (or rig-specific in a rig-neutral refusal)"
   else

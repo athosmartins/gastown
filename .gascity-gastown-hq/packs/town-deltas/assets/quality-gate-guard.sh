@@ -5685,7 +5685,8 @@ fi
 # property_scrapers/scripts/, three under whatsapp_automation/scripts/), so for
 # those jobs the "runs under 3.2" premise is unverified and this check is
 # stricter than they strictly need. A submission that changes no .sh under those
-# paths costs one empty git diff.
+# paths still pays for a fetch, a merge-base, one empty git diff, a marker label
+# and a log line — nothing is parsed, but it is not free.
 # NOT full coverage: only files named *.sh are parsed — an extensionless or
 # differently-named script launchd runs from those trees is not seen here.
 #
