@@ -30,13 +30,27 @@ to count. So the outcome uses only what IS attributable, with three honest state
             a bead comment AUTHORED by the recipient on a cited entity (bd comments), a mail
             SENT by the recipient (events actor) citing an entity, or a reply by the recipient
             on the same mail thread.
-  nao_agiu  no such evidence AND every cited entity had ZERO change events (bead.*) in the
-            window AND the comments channel was readable — nobody touched it, so the recipient
-            certainly did not.
+  nao_agiu  no such evidence AND nobody touched any cited entity in the window: ZERO bead.*
+            events, ZERO comments (by anyone), the comments channel and the events read whole.
+            It claims exactly that — no action SEEN on the cited entity(ies). It is NOT a proof
+            the recipient did nothing: nudging a crew, acting on another bead or editing code
+            leaves no trace here.
   nao_sei   everything else: no identifiable entity; comments unreadable (bd/Dolt down — never
             read as "no comments"); the entity changed but no event names who (automation and
-            agents look identical); the events file does not yet cover the window (then the
-            delivery simply stays pending).
+            agents look identical); a comment by an author that is not the recipient (see
+            below); events unreadable in the window (a truncated/corrupt archive — never read
+            as "no events"); the events file does not yet cover the window (then the delivery
+            simply stays pending).
+
+WHY A COMMENT BY SOMEONE ELSE IS nao_sei, NOT "the recipient did not act" (gate ga-aijm2v.4 #1):
+comment authors are NOT reliable identities. Measured 25/09 over 156 beads: 'Test' (bd's git-user
+fallback when BD_ACTOR is unset — agents' comments land there too) ~1140 of ~1800, 'automation'
+248, and the Mayor under TWO spellings ('gastown.mayor' 207, 'gastown__mayor' 50; 170 of 178 real
+nudge recipients match no observed author at all). A comment inside the window whose author is not
+positively the recipient may be the recipient. Comments emit no bead.* event, so nothing else
+catches it. The same distrust does NOT apply to mail: measured over 43 archives + the live file
+(~8.6k mail.sent), agents send mail under their OWN name (gastown.mayor 318, the dogs, every crew),
+and `human`/`controller` are daemons — so a mail from another named actor is attributable.
 
 mail.read / mail.archived by the recipient is deliberately NOT an action: it proves the wake
 happened, not that the message needed it (the Mayor archives ~everything it reads).
@@ -75,6 +89,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -181,6 +196,10 @@ class Config:
     max_bd_calls: int = 80
     state_text_max: int = 3000
     bd_timeout_s: int = 20
+    # events unreadable while measuring a window (a truncated archive, a rotation racing the read):
+    # keep the delivery pending this long past its window closing — the next run usually reads it
+    # whole — then settle it as nao_sei (never nao_agiu) so a permanently bad archive cannot wedge it
+    unreadable_retry_min: int = 120
 
 
 def load_rig_paths(city: Path) -> dict:
@@ -228,6 +247,7 @@ def config_from_env() -> Config:
         max_per_run=int(e("PORTARIA_MAX_PER_RUN", "30")),
         dup_window_min=int(e("PORTARIA_DUP_WINDOW_MIN", "120")),
         bootstrap=e("PORTARIA_BOOTSTRAP", "tail"),
+        unreadable_retry_min=int(e("PORTARIA_UNREADABLE_RETRY_MIN", "120")),
         rig_paths=load_rig_paths(city),
     )
 
@@ -271,7 +291,10 @@ def extract_entities(text: str) -> list:
     return seen
 
 
-_LIST_ID_RE = re.compile(r"^[ \t]{2,}(" + ENTITY_RE.pattern + r")(?=\s)", re.M)
+# `(?=\s|$)`: the block is "\n".join(lines) with NO trailing newline, so an id that ends the block
+# (the last line of the section is just "  wa-zzz99") has no whitespace after it — `(?=\s)` alone
+# silently dropped exactly that id (gate ga-aijm2v.4, low)
+_LIST_ID_RE = re.compile(r"^[ \t]{2,}(" + ENTITY_RE.pattern + r")(?=\s|$)", re.M)
 
 
 def entities_from(entity_from: str, subject: str, body: str) -> list:
@@ -349,6 +372,11 @@ def _list_archives(events_file: Path) -> list:
 
 
 def _iter_lines(path: Path, gz: bool, stats):
+    """Parsed events of one file. A file that cannot be read to its end is COUNTED in
+    stats["unreadable_files"] (the events already yielded stay valid). Callers must not read that as
+    "the rest of the file had nothing": _run_locked reports the count on the run line and refuses
+    to conclude "nobody touched it" from a window it read only in part. zlib.error is the corrupt-
+    deflate case — it is not an OSError, and uncaught it crashed the whole run on every later run."""
     opener = gzip.open if gz else open
     try:
         with opener(path, "rt", encoding="utf-8", errors="replace") as f:
@@ -364,7 +392,7 @@ def _iter_lines(path: Path, gz: bool, stats):
                     continue
                 if isinstance(ev, dict):
                     yield ev
-    except (OSError, EOFError):
+    except (OSError, EOFError, zlib.error):
         if stats is not None:
             stats["unreadable_files"] = stats.get("unreadable_files", 0) + 1
 
@@ -485,14 +513,17 @@ def default_bd_runner(rig_path: str, args: list, timeout: int = 20):
     return p.returncode, p.stdout
 
 
+NOT_FOUND_RE = re.compile(r"\bno issues? found\b", re.I)  # both spellings bd uses for a missing bead
 DEFERRED = object()  # a read that was NOT attempted (call budget / failure breaker) — retry next run, do not conclude anything
 
 
 class BdReader:
     """bd reads with a per-run memo, a call budget and a failure breaker (Dolt is fragile: after
     `bd_fail_limit` consecutive INFRA failures this run stops asking). A bead that simply does not
-    exist ("no issue found") is data, not an infra failure, and never trips the breaker. Ephemeral
-    wisps (`*-wisp-*`, the bead_id of most nudges) have no comment channel worth a call."""
+    exist is data, not an infra failure, and never trips the breaker — bd words it two ways, and
+    matching only one made a missing bead an infra failure (measured live 26/09): `bd show` prints
+    "no issues found matching the provided IDs", `bd comments` "... no issue found matching ...".
+    Ephemeral wisps (`*-wisp-*`, the bead_id of most nudges) have no comment channel worth a call."""
 
     def __init__(self, cfg: Config, bd_fn):
         self.cfg, self.bd_fn = cfg, bd_fn
@@ -520,7 +551,7 @@ class BdReader:
         except json.JSONDecodeError:
             data = None
         if isinstance(data, dict) and "error" in data:
-            if "no issue found" in str(data["error"]):
+            if NOT_FOUND_RE.search(str(data["error"])):
                 self.fail_streak = 0
                 return None
             self.fail_streak += 1
@@ -634,30 +665,56 @@ def layer2(d: dict, facts, cfg: Config, jev_fn, run: dict) -> dict:
 
 
 # ── outcome ────────────────────────────────────────────────────────────────────────────────
-def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, comments: dict):
+def _actor_key(name) -> str:
+    """Comparable form of an actor/author string. The same agent shows up spelled two ways in bd
+    comments ('gastown.mayor' 207x, 'gastown__mayor' 50x, measured 25/09), so equality is taken after
+    folding the `__` spelling into the `.` one. Only EQUALITY of the folded forms ever means "the
+    recipient": a different-looking string is never proof of a different actor (see the module
+    docstring — that is why every other comment in the window is nao_sei, not "did not act")."""
+    return str(name or "").strip().lower().replace("__", ".")
+
+
+def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, comments: dict,
+                    events_complete: bool = True):
     """('agiu'|'nao_agiu'|'nao_sei', motivo). `window_events` are the mail.sent / bead.* events
-    already inside [t0, t1]; `comments` maps entity -> list | None (unreadable). See the module
-    docstring for what each state means and why bead.* events cannot say who acted."""
-    aliases = {a.lower() for a in rec.get("aliases") or [rec["destinatario"]]}
+    already inside [t0, t1]; `comments` maps entity -> list | None (unreadable); `events_complete`
+    is False when the events file could not be read whole for this window (a truncated archive):
+    positive evidence still counts, but "nobody touched it" can no longer be concluded. See the
+    module docstring for what each state means and why bead.* events and comment authors cannot
+    say who acted."""
+    aliases = {_actor_key(a) for a in rec.get("aliases") or [rec["destinatario"]]}
     ents = rec.get("entidades") or []
     own_seq = rec.get("seq")
 
     for e in window_events:
-        if e.get("type") != "mail.sent" or (e.get("actor") or "").lower() not in aliases or e.get("seq") == own_seq:
+        if e.get("type") != "mail.sent" or _actor_key(e.get("actor")) not in aliases or e.get("seq") == own_seq:
             continue
         msg = (e.get("payload") or {}).get("message") or {}
         if rec.get("thread_id") and msg.get("thread_id") == rec["thread_id"]:
             return "agiu", "resposta do destinatario na mesma thread do mail"
-        text = (msg.get("subject") or "") + "\n" + (msg.get("body") or "")
-        hit = [x for x in ents if x in text]
+        # whole-id match through the SAME tokenizer that produced `ents`: a substring test credited
+        # ga-abc for a mention of ga-abcdef (or ga-x for its child ga-x.4)
+        mentioned = set(extract_entities((msg.get("subject") or "") + "\n" + (msg.get("body") or "")))
+        hit = [x for x in ents if x in mentioned]
         if hit:
             return "agiu", f"mail enviado pelo destinatario citando {hit[0]}"
 
+    stray = []  # comments in the window that cannot be attributed to the recipient: (entity, author, why)
     for ent in ents:
         for c in comments.get(ent) or []:
+            if not isinstance(c, dict):
+                stray.append((ent, "?", "comentario ilegivel"))
+                continue
+            author = c.get("author") or "?"
             ct = parse_ts(c.get("created_at"))
-            if ct is not None and t0 <= ct <= t1 and (c.get("author") or "").lower() in aliases:
+            if ct is None:  # cannot be placed in or out of the window: not "outside"
+                stray.append((ent, author, "comentario sem data legivel"))
+                continue
+            if not t0 <= ct <= t1:
+                continue
+            if _actor_key(c.get("author")) in aliases:
                 return "agiu", f"comentario do destinatario em {ent}"
+            stray.append((ent, author, "comentario na janela"))
 
     if not ents:
         return "nao_sei", "entidade nao identificavel (sem bead citado)"
@@ -668,7 +725,14 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
     changed = [x for x in ents if any(str(e.get("type", "")).startswith("bead.") and e.get("subject") == x for e in window_events)]
     if changed:
         return "nao_sei", f"{changed[0]} mudou na janela mas o evento nao diz quem (bead.* vem como cache-reconcile) — sem autor atribuivel"
-    return "nao_agiu", "nenhum comentario/mail do destinatario e nenhuma entidade citada mudou na janela"
+    if stray:
+        ent, author, why = stray[0]
+        return "nao_sei", (f"{ent} teve {why} de '{author}' e esse autor nao e atribuivel ao destinatario "
+                           "(bd grava 'Test'/'automation'/outra grafia do mesmo agente) — sem autor atribuivel")
+    if not events_complete:
+        return "nao_sei", ("eventos ilegiveis na janela (arquivo truncado/corrompido): nao da pra afirmar que "
+                           "a entidade nao mudou — ausencia de evidencia nao e nao-acao")
+    return "nao_agiu", "nenhuma acao vista na entidade citada: sem comentario/mail do destinatario e nada mudou nela na janela"
 
 
 # ── state, lock ────────────────────────────────────────────────────────────────────────────
@@ -915,10 +979,16 @@ def _run_locked(cfg: Config, jev_fn, bd_fn, now: datetime) -> dict:
         lo = due[0][0]
         hi = max(t0 for t0, _, _ in due) + janela
         wevents = []
+        unreadable_before = stats.get("unreadable_files", 0)
         for e in iter_events(cfg.events_file, since_ts=lo, stats=stats):
             et = parse_ts(e.get("ts"))
             if et is not None and lo <= et <= hi and (e.get("type") == "mail.sent" or str(e.get("type", "")).startswith("bead.")):
                 wevents.append((et, e))
+        # a file that could not be read to its end means events of the window may be MISSING here —
+        # that is "cannot tell", never "nothing happened" (gate ga-aijm2v.4 #2: the count was kept
+        # and never read, so a truncated archive resolved every delivery it hid as nao_agiu)
+        window_unreadable = stats.get("unreadable_files", 0) - unreadable_before
+        retry = timedelta(minutes=cfg.unreadable_retry_min)
         ids_pending = {it.get("id") for it in nudge_pending or [] if isinstance(it, dict)}
         ids_dead = {it.get("id") for it in nudge_dead or [] if isinstance(it, dict)}
         for t0, did, rec in due:
@@ -928,11 +998,16 @@ def _run_locked(cfg: Config, jev_fn, bd_fn, now: datetime) -> dict:
                 _save_state(cfg, st)
                 continue
             t1 = t0 + janela
+            if window_unreadable and now < t1 + retry:
+                # the next run usually reads it whole (rotation race, transient I/O): keep it pending,
+                # and past the retry limit fall through to compute_outcome(events_complete=False)
+                summary["deferred_unreadable"] = summary.get("deferred_unreadable", 0) + 1
+                continue
             comments = {ent: bd.comments(ent) for ent in rec["entidades"]}
             if any(v is DEFERRED for v in comments.values()):
                 continue  # bd budget/breaker this run: try again next run, conclude nothing
             in_window = [e for et, e in wevents if t0 <= et <= t1]
-            desfecho, motivo = compute_outcome(rec, t0, t1, in_window, comments)
+            desfecho, motivo = compute_outcome(rec, t0, t1, in_window, comments, events_complete=not window_unreadable)
             out = {
                 "ts": rec["ts"], "mode": "portaria", "experiment": f"portaria-{rec['classe']}", "classe": rec["classe"],
                 "canal": rec["canal"], "delivery_id": did, "destinatario": rec["destinatario"], "entidades": rec["entidades"],
@@ -955,6 +1030,10 @@ def _run_locked(cfg: Config, jev_fn, bd_fn, now: datetime) -> dict:
     _save_state(cfg, st)
 
     summary["unparseable"] = stats.get("unparseable", 0)
+    if stats.get("unreadable_files"):
+        # events lost to a truncated/corrupt/vanished file: on the run line so it is never silent
+        # (a mail in a cut archive is a delivery this run never saw — the cursor moves on regardless)
+        summary["unreadable_files"] = stats["unreadable_files"]
     summary["pending"] = len(st["pending"])
     summary["jev_calls"] = run["jev_calls"]
     summary["bd_calls"] = bd.calls

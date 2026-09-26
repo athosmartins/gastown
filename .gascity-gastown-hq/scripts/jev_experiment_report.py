@@ -42,6 +42,14 @@ silently pollute the suppression-experiment counts) and get their OWN report sec
       caller's OWN real token count when it supplied one (decisao_atual_tokens), else
       the same PROVISIONAL baseline used for the suppression experiment above.
 
+PORTARIA (ga-aijm2v.4): rows (mode=="portaria") are filed under the day their OUTCOME WAS MEASURED
+(`resolved_at`), not the day of delivery. The outcome needs a window that closes ~60 min after the
+delivery (+ grace), so a delivery stamped ~23:00Z-24:00Z is resolved AFTER the 00:07Z daily report
+has already run — dated by delivery it would sit in no daily report at all (it belongs to a day that
+has been reported, and is not in the next day's). Filed by measurement, every row appears in exactly
+one daily report. The report also says how many observed deliveries are still waiting for their
+outcome.
+
 Usage: python3 jev_experiment_report.py [--date YYYY-MM-DD] [--experiment NAME] [--json | --resumo-pt]
 Without --date it reports over ALL logged data; --date filters to one UTC day. --resumo-pt
 prints the short Portuguese block that jev-daily-report.sh sends as the end-of-day ntfy.
@@ -72,6 +80,15 @@ JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-ga
 BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL = 4000
 
 
+def _filing_ts(ev: dict) -> str:
+    """The timestamp `--date` files a row under: `resolved_at` for Portaria rows (see the module
+    docstring for why), the row's own `ts` for everything else."""
+    if ev.get("mode") == "portaria" and isinstance(ev.get("resolved_at"), str) and ev["resolved_at"]:
+        return ev["resolved_at"]
+    ts = ev.get("ts", "")
+    return ts if isinstance(ts, str) else ""
+
+
 def load_events(date: str | None, experiment: str | None) -> list[dict]:
     if not JEV_LOG.exists():
         return []
@@ -92,7 +109,7 @@ def load_events(date: str | None, experiment: str | None) -> list[dict]:
                 # fired alert. Skipped here, not in summarize(), so the mode list there stays
                 # exactly what each front owns.
                 continue
-            if date and not ev.get("ts", "").startswith(date):
+            if date and not _filing_ts(ev).startswith(date):
                 continue
             if experiment and ev.get("experiment") != experiment:
                 continue
@@ -226,7 +243,7 @@ def summarize_portaria(events: list[dict]) -> dict:
     by_cls: dict[str, dict] = defaultdict(
         lambda: {
             "volume": 0, "regra_pularia": 0, "jev_pularia": 0, "cascata_pularia": 0,
-            "pularia_seguro": 0,      # cascade would skip AND the recipient certainly did not act (nao_agiu)
+            "pularia_seguro": 0,      # cascade would skip AND no action was SEEN on the cited entity (nao_agiu — not proof the recipient did nothing)
             "erro_grave": 0,          # cascade would skip BUT the recipient acted (agiu) -- a real alarm silenced
             "erro_grave_regra": 0, "erro_grave_jev": 0,
             "pularia_incerto": 0,     # cascade would skip, outcome nao_sei -- never folded into safe or grave
@@ -360,7 +377,7 @@ def _format_portaria_block(name: str, s: dict, m: dict) -> list[str]:
     )
     lines.append(
         f"  What the recipient then did, over the {s['cascata_pularia']} the cascade would skip: "
-        f"safe (did NOT act) {s['pularia_seguro']}, GRAVE — erro grave (a real alarm silenced: the recipient ACTED) {s['erro_grave']}, "
+        f"safe (no action SEEN on the cited entity) {s['pularia_seguro']}, GRAVE — erro grave (a real alarm silenced: the recipient ACTED) {s['erro_grave']}, "
         f"uncertain (outcome nao_sei) {s['pularia_incerto']}"
     )
     lines.append(
@@ -384,7 +401,31 @@ def _format_portaria_block(name: str, s: dict, m: dict) -> list[str]:
     return lines
 
 
-def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | None) -> str:
+PENDING_OMIT = "omit"  # the caller did not ask for the pending line (old callers, synthetic tests)
+
+
+def load_portaria_pending():
+    """Deliveries the Portaria observed whose outcome is not measured yet (`pending` in its state
+    file): an int, or None = CANNOT TELL (state file missing/unreadable/odd — never read as 0). Read-only:
+    it must not go through portaria_shadow._load_state, which sets a corrupt file aside."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import portaria_shadow as _ps
+        st = json.loads(Path(_ps.config_from_env().state_file).read_text(encoding="utf-8"))
+        pend = st.get("pending") if isinstance(st, dict) else None
+        return len(pend) if isinstance(pend, dict) else None
+    except Exception:  # noqa: BLE001 — an auxiliary line must never crash the daily report; None shows as n/d
+        return None
+
+
+def _pending_line_en(pending) -> str:
+    if pending is None:
+        return "  Observed but not yet measured: n/d (the Portaria state file could not be read)"
+    return (f"  Observed but not yet measured: {pending} (the outcome needs a ~60 min window; each one is filed under "
+            f"the day its outcome is measured, so it appears in a later daily report)")
+
+
+def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | None, portaria_pending=PENDING_OMIT) -> str:
     def pct(x):
         return "n/d" if x is None else _pct_pt(x)
     tot = defaultdict(int)
@@ -394,7 +435,7 @@ def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | 
     linhas = [
         f"Portaria (sombra, nada muda na entrega): {tot['volume']} mensagem(ns) em {len(portaria_summary)} classe(s). "
         f"Pularia: regra fixa {tot['regra_pularia']}, Jev (>=85%) {tot['jev_pularia']}, cascata {tot['cascata_pularia']}.",
-        f"Dos {tot['cascata_pularia']} que a cascata pularia: {tot['pularia_seguro']} seguros (destinatario nao agiu), "
+        f"Dos {tot['cascata_pularia']} que a cascata pularia: {tot['pularia_seguro']} seguros (nenhuma acao vista na entidade citada), "
         f"{tot['erro_grave']} ERRO GRAVE (alarme real calado: ele agiu), {tot['pularia_incerto']} incertos (sem como atribuir). "
         f"Erro grave e piso: so conta acao atribuivel. Desfecho mensuravel em {tot['desfecho_conclusivo']} de {tot['volume']}.",
     ]
@@ -408,11 +449,14 @@ def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | 
             f"- {name}: {s['volume']} msg; pularia {s['cascata_pularia']} ({pct(m['cascata_pct'])}), "
             f"seguros {s['pularia_seguro']}, erro grave {s['erro_grave']}, incertos {s['pularia_incerto']}; tokens (estimativa) {tok}."
         )
+    if portaria_pending != PENDING_OMIT:
+        linhas.append("Ainda sem desfecho: n/d (estado da Portaria ilegivel)." if portaria_pending is None else
+                      f"Ainda sem desfecho: {portaria_pending} (entram no relatorio do dia em que forem medidas).")
     return "\n".join(linhas)
 
 
 def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
-                  cache_read_by_recipient: dict | None = None) -> str:
+                  cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT) -> str:
     portaria_summary = portaria_summary or {}
     if not summary and not shadow_summary and not portaria_summary:
         return f"Jev experiment report ({date_label}): no candidate escalations logged for this window."
@@ -463,6 +507,8 @@ def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria
         lines.append("")
     for name, s in sorted(portaria_summary.items()):
         lines.extend(_format_portaria_block(name, s, _portaria_metrics(s, cache_read_by_recipient)))
+    if portaria_summary and portaria_pending != PENDING_OMIT:
+        lines.append(_pending_line_en(portaria_pending))
     return "\n".join(lines)
 
 
@@ -471,7 +517,7 @@ def _pct_pt(x: float) -> str:
 
 
 def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
-                    cache_read_by_recipient: dict | None = None) -> str:
+                    cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT) -> str:
     """wa-dln9g — the end-of-day phone notification the Athos asked for ("a % of saved
     tokens for each end of day"). Same numbers as format_report() (both read _metrics()/
     _shadow_metrics()), in Portuguese and short. Keeps the MEDIDO / ESTIMATIVA split, and
@@ -530,7 +576,7 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, porta
         linhas.append(f"Custo do Jev (medido): {s['jev_tokens_in']} + {s['jev_tokens_out']} tokens.")
         blocos.append("\n".join(linhas))
     if portaria_summary:
-        blocos.append(_portaria_resumo_pt(portaria_summary, cache_read_by_recipient))
+        blocos.append(_portaria_resumo_pt(portaria_summary, cache_read_by_recipient, portaria_pending))
     return "\n\n".join(blocos)
 
 
@@ -638,14 +684,16 @@ def main() -> int:
     portaria_summary = summarize_portaria(events)
     # transcripts are read (read-only) only for recipients that actually have safe skips to price
     cache_read = measure_cache_read({r for s in portaria_summary.values() for r in s["seguro_por_destinatario"]}) if portaria_summary else {}
+    pending = load_portaria_pending() if portaria_summary else PENDING_OMIT
 
     if args.json:
         print(json.dumps({"suppression": summary, "shadow": shadow_summary, "portaria": portaria_summary,
+                          "portaria_pending": None if pending == PENDING_OMIT else pending,
                           "cache_read_per_call": cache_read}, ensure_ascii=False, indent=2))
     elif args.resumo_pt:
-        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período", portaria_summary, cache_read))
+        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período", portaria_summary, cache_read, pending))
     else:
-        print(format_report(summary, shadow_summary, args.date or "all-time", portaria_summary, cache_read))
+        print(format_report(summary, shadow_summary, args.date or "all-time", portaria_summary, cache_read, pending))
     return 0
 
 

@@ -171,6 +171,13 @@ ok("'Beads sem rota': the flagged beads, not the 'Ver ...' references",
 ok("subject: the FIRST id only (the parenthesised one is the mechanism)",
    ps.entities_from("subject", "Gate held for daemon verification: wa-vxpv4 (ga-l7n3v)", "") == ["wa-vxpv4"])
 ok("duplicates collapse, first-seen order kept", ps.extract_entities("wa-aaa11 wa-bbb22 wa-aaa11") == ["wa-aaa11", "wa-bbb22"])
+# Catches (gate ga-aijm2v.4, low): the NEW/DUE block is "\n".join(lines) with NO trailing newline, so the
+# id on the LAST line has no whitespace after it — a `(?=\s)` lookahead silently dropped exactly that id.
+ok("the id on the LAST line of the NEW/DUE block (no trailing newline, no trailing text) is kept",
+   ps.entities_from("list", "x", "NEW/DUE (2) — why\n  wa-aaa11  age=3min\n  wa-zzz99") == ["wa-aaa11", "wa-zzz99"],
+   str(ps.entities_from("list", "x", "NEW/DUE (2) — why\n  wa-aaa11  age=3min\n  wa-zzz99")))
+ok("...and when the body ends right after a blank line the section still stops there",
+   ps.entities_from("list", "x", "NEW/DUE (1) — why\n  wa-aaa11\n\nRESOLVED (1)\n  wa-old99") == ["wa-aaa11"])
 
 # ---------------------------------------------------------------------------------------------
 print("-- 3. delivery observation: each mail once, across runs, incl. rotation --")
@@ -479,11 +486,92 @@ with_env(t_out_comment)
 
 
 def t_out_comment_other(e: Env):
+    """Catches (gate ga-aijm2v.4, blocking #1): comment authors are NOT reliable identities — bd
+    writes 'Test' (git-user fallback, agents' comments land there too) and 'automation', and the
+    Mayor appears under two spellings. A comment in the window by an author that is not positively
+    the recipient may BE the recipient, so reading it as "the recipient did not act" inflates
+    pularia_seguro and under-counts erro_grave in the very report Athos uses to decide whether to
+    enable suppression. It is the third state, exactly like an anonymous bead.* event."""
     recs = outcome_scenario(e, comments=[{"id": "c1", "author": "automation", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "x"}])
-    ok("a comment by SOMEONE ELSE is not the recipient acting (no entity change -> nao_agiu)", recs[0]["desfecho"] == "nao_agiu", str(recs))
+    ok("a comment by an author that is not the recipient -> nao_sei (never nao_agiu)", recs[0]["desfecho"] == "nao_sei", str(recs))
+    ok("the motive names the author and says it is not attributable", "automation" in recs[0]["desfecho_motivo"] and "atribuivel" in recs[0]["desfecho_motivo"], recs[0]["desfecho_motivo"])
 
 
 with_env(t_out_comment_other)
+
+
+def t_out_comment_git_fallback_author(e: Env):
+    """Catches: the reviewer's exact repro — a comment by 'Test' (1140 of ~1800 measured comments)
+    inside the window was silently dropped and the delivery came out nao_agiu."""
+    recs = outcome_scenario(e, comments=[{"id": "c1", "author": "Test", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "fixed it"}])
+    ok("a comment by 'Test' (bd's git-user fallback) inside the window -> nao_sei", recs[0]["desfecho"] == "nao_sei", str(recs))
+
+
+with_env(t_out_comment_git_fallback_author)
+
+
+def t_out_comment_stray_outside_window(e: Env):
+    """Catches the over-correction: if EVERY foreign comment on the entity turned the outcome nao_sei
+    regardless of when it was written, old chatter on the bead would make nothing measurable and the
+    report would say nothing. Only comments INSIDE the window are ambiguous."""
+    recs = outcome_scenario(e, comments=[{"id": "c0", "author": "Test", "created_at": iso_z(T0 - timedelta(minutes=30)), "text": "before"},
+                                         {"id": "c9", "author": "automation", "created_at": iso_z(T0 + timedelta(minutes=95)), "text": "after"}])
+    ok("foreign comments BEFORE the delivery / AFTER the window leave the outcome nao_agiu", recs[0]["desfecho"] == "nao_agiu", str(recs))
+
+
+with_env(t_out_comment_stray_outside_window)
+
+
+def t_out_stray_comment_plus_recipient_comment(e: Env):
+    recs = outcome_scenario(e, comments=[{"id": "c1", "author": "Test", "created_at": iso_z(T0 + timedelta(minutes=10)), "text": "x"},
+                                         {"id": "c2", "author": "gastown.mayor", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "done"}])
+    ok("attributable comment wins over an unattributable one -> agiu", recs[0]["desfecho"] == "agiu", str(recs))
+
+
+with_env(t_out_stray_comment_plus_recipient_comment)
+
+
+def t_out_spelling_variants(e: Env):
+    """Catches: the Mayor writes comments as 'gastown.mayor' (207) AND 'gastown__mayor' (50). Equality
+    on the raw string credited only one spelling, so the same action counted as agiu or nao_sei
+    depending on how bd spelled the author."""
+    recs = outcome_scenario(e, comments=[{"id": "c1", "author": "gastown__mayor", "created_at": iso_z(T0 + timedelta(minutes=20)), "text": "ok"}])
+    ok("the '__' spelling of the recipient's own name is the recipient -> agiu", recs[0]["desfecho"] == "agiu", str(recs))
+
+
+with_env(t_out_spelling_variants)
+
+
+def t_out_mail_spelling_variant(e: Env):
+    recs = outcome_scenario(e, extra_events=[ev_mail(60, T0 + timedelta(minutes=10), "reply9", "athos", "Re", "resolvi ga-bbb22", frm="Gastown__Mayor")])
+    ok("a mail sent under the other spelling / case of the recipient's name -> agiu", recs[0]["desfecho"] == "agiu", str(recs))
+
+
+with_env(t_out_mail_spelling_variant)
+
+
+def t_out_comment_unparseable(e: Env):
+    """Catches: a comment whose date cannot be parsed, or that is not even an object, was skipped as
+    'outside the window' — an error read as empty. It cannot be placed, so it is nao_sei."""
+    recs = outcome_scenario(e, comments=[{"id": "c1", "author": "Test", "created_at": "not-a-date", "text": "x"}])
+    ok("a comment with an unreadable date -> nao_sei, not 'outside the window'", recs[0]["desfecho"] == "nao_sei", str(recs))
+    with_env(lambda e2: ok("a comment entry that is not an object -> nao_sei", outcome_scenario(e2, comments=["garbage"])[0]["desfecho"] == "nao_sei"))
+
+
+with_env(t_out_comment_unparseable)
+
+
+def t_out_mail_mention_is_whole_id(e: Env):
+    """Catches: `x in text` substring matching credited 'ga-bbb22' for a mention of 'ga-bbb22x' or
+    for its child 'ga-bbb22.4' — a different bead — as the recipient acting (false agiu)."""
+    recs = outcome_scenario(e, extra_events=[ev_mail(60, T0 + timedelta(minutes=10), "m1", "athos", "Re", "vi ga-bbb22x e tambem ga-bbb22.4", frm="gastown.mayor", thread="thread-other")])
+    ok("a mail by the recipient citing a DIFFERENT id that merely contains the entity is not 'acted on it'",
+       recs[0]["desfecho"] == "nao_agiu", str(recs))
+    with_env(lambda e2: ok("...but the exact id in a longer sentence still counts",
+                           outcome_scenario(e2, extra_events=[ev_mail(60, T0 + timedelta(minutes=10), "m2", "athos", "Re", "resolvi ga-bbb22, ok?", frm="gastown.mayor", thread="thread-other")])[0]["desfecho"] == "agiu"))
+
+
+with_env(t_out_mail_mention_is_whole_id)
 
 
 def t_out_comment_outside(e: Env):
@@ -598,6 +686,123 @@ def t_out_multi_entity(e: Env):
 
 
 with_env(t_out_multi_entity)
+
+# ---------------------------------------------------------------------------------------------
+print("-- 6b. events that cannot be read are 'cannot tell', never 'nothing happened' (gate blocking #2) --")
+import io  # noqa: E402
+
+ARCH_NAME = "events.jsonl.archive-20260925T181500Z-seq-1-202.gz"
+
+
+def observe_then_rotate(e: Env, *, cut: int = 12) -> bytes:
+    """The real sequence: delivery o1 is observed from the LIVE file; then events.jsonl rotates. The
+    archive holds o1 (seq 1), 200 unrelated events and — as its LAST line — the bead.updated of the
+    entity o1 cites (seq 202); the new live file only proves the window closed. The archive is cut
+    mid-stream: reading it raises EOFError after seq 201, so the entity's change is LOST (the
+    reviewer's repro: 'rotated archive truncated mid-stream, the entity's bead.updated is its last
+    line'). Returns the intact archive bytes."""
+    e.write_events([ev_mail(1, T0, "o1", "gastown.mayor", "Gate: author unreachable for ga-bbb22")])
+    e.comments["ga-bbb22"] = []
+    s1 = e.run(T0 + timedelta(minutes=5))
+    assert "mail:o1" in json.loads(e.state.read_text())["pending"], s1
+    lines = [ev_mail(1, T0, "o1", "gastown.mayor", "Gate: author unreachable for ga-bbb22")]
+    lines += [ev_fill(i, T0 + timedelta(minutes=1, seconds=i % 50)) for i in range(2, 202)]
+    lines.append(ev_bead(202, T0 + timedelta(minutes=12), "ga-bbb22"))
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb") as g:
+        g.write("".join(json.dumps(x) + "\n" for x in lines).encode())
+    whole = raw.getvalue()
+    (e.root / ".gc" / ARCH_NAME).write_bytes(whole[:-cut] if cut else whole)
+    e.write_events([ev_fill(203, T0 + timedelta(minutes=65))])
+    return whole
+
+
+def t_unreadable_defers(e: Env):
+    """Catches (blocking #2): stats["unreadable_files"] was counted and never read, so a truncated
+    archive resolved the delivery whose evidence it hid as nao_agiu ('nothing changed') — an error
+    read as empty. Within the retry window the delivery must stay PENDING (the next run usually reads
+    the file whole) and the run line must SAY the file was unreadable."""
+    observe_then_rotate(e)
+    s2 = e.run(T0 + timedelta(minutes=70))
+    ok("window closed but its events were read only in part -> NOT resolved (no log line)", e.portaria_records() == [], str(e.portaria_records()))
+    ok("...it stays pending", "mail:o1" in json.loads(e.state.read_text())["pending"], str(s2))
+    ok("...and the run line says it was deferred for that reason", s2.get("deferred_unreadable") == 1, str(s2))
+    ok("the run line reports the unreadable file (never silent)", s2.get("unreadable_files", 0) >= 1, str(s2))
+
+
+with_env(t_unreadable_defers)
+
+
+def t_unreadable_repaired(e: Env):
+    whole = observe_then_rotate(e)
+    e.run(T0 + timedelta(minutes=70))
+    (e.root / ".gc" / ARCH_NAME).write_bytes(whole)  # the rotation race / transient I/O is gone
+    s = e.run(T0 + timedelta(minutes=75))
+    recs = e.portaria_records()
+    ok("once the file reads whole the delivery resolves — with the change it had hidden -> nao_sei",
+       len(recs) == 1 and recs[0]["desfecho"] == "nao_sei" and "mudou na janela" in recs[0]["desfecho_motivo"], str(recs))
+    ok("...and the deferral counter is gone from the run line", "deferred_unreadable" not in s, str(s))
+
+
+with_env(t_unreadable_repaired)
+
+
+def t_unreadable_permanent(e: Env):
+    """Catches: keeping a delivery pending forever behind a permanently bad archive (wedge), OR
+    settling it as nao_agiu once the retry runs out. Past the retry it becomes nao_sei."""
+    observe_then_rotate(e)
+    e.run(T0 + timedelta(minutes=70))
+    ok("inside the retry window it is still pending", e.portaria_records() == [])
+    e.run(T0 + timedelta(minutes=60 + 120 + 5), unreadable_retry_min=120)
+    recs = e.portaria_records()
+    ok("permanently unreadable: settled as nao_sei after the retry (never wedged, never nao_agiu)",
+       len(recs) == 1 and recs[0]["desfecho"] == "nao_sei", str(recs))
+    ok("the motive says the events were unreadable", bool(recs) and "eventos ilegiveis" in recs[0]["desfecho_motivo"], str(recs))
+    ok("nothing stays pending afterwards", json.loads(e.state.read_text())["pending"] == {})
+
+
+with_env(t_unreadable_permanent)
+
+
+def t_unreadable_positive_evidence_still_counts(e: Env):
+    """Missing events can only HIDE a change, never un-see the recipient's own comment — positive,
+    attributable evidence is still agiu even when the events could not be read whole."""
+    rec = {"destinatario": "gastown.mayor", "entidades": ["ga-bbb22"], "seq": 1}
+    t0, t1 = T0, T0 + timedelta(minutes=60)
+    cs = {"ga-bbb22": [{"id": "c1", "author": "gastown.mayor", "created_at": iso_z(T0 + timedelta(minutes=9)), "text": "x"}]}
+    ok("recipient's own comment + incomplete events -> agiu", ps.compute_outcome(rec, t0, t1, [], cs, events_complete=False)[0] == "agiu")
+    ok("no evidence + incomplete events -> nao_sei", ps.compute_outcome(rec, t0, t1, [], {"ga-bbb22": []}, events_complete=False)[0] == "nao_sei")
+    ok("no evidence + complete events -> nao_agiu (the incomplete flag is the only difference)", ps.compute_outcome(rec, t0, t1, [], {"ga-bbb22": []}, events_complete=True)[0] == "nao_agiu")
+
+
+with_env(t_unreadable_positive_evidence_still_counts)
+
+
+def t_corrupt_deflate(e: Env):
+    """Catches: a corrupt deflate stream raises zlib.error — NOT an OSError/EOFError — so the whole run
+    crashed and, since the cursor never advanced past the bad archive, EVERY later run crashed too
+    (wedged for good). It must be counted as unreadable and the run must go on."""
+    (e.root / ".gc" / "events.jsonl.archive-20260925T181500Z-seq-1-3.gz").write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03" + b"\xff" * 40)
+    e.write_events([ev_mail(4, T0, "live1", "gastown.mayor", "Beads sem rota", "1 em andamento sem gc.routed_to: wa-lch7d.")])
+    e.state.parent.mkdir(parents=True, exist_ok=True)  # cursor before the archive: the run must read it
+    e.state.write_text(json.dumps({"cursor_seq": 0, "nudges_seen": {}, "pending": {}, "resolved_ids": {}, "dup_ledger": {}, "jev_fail_streak": 0}))
+    try:
+        s = e.run(T0 + timedelta(minutes=5))
+        crashed = None
+    except Exception as ex:  # noqa: BLE001
+        s, crashed = {}, f"{type(ex).__name__}: {ex}"
+    ok("a corrupt archive does not crash the run", crashed is None, str(crashed))
+    ok("it is counted as unreadable on the run line", s.get("unreadable_files", 0) >= 1, str(s))
+    ok("the good delivery in the live file is still observed", s.get("new") == 1, str(s))
+    try:
+        e.run(T0 + timedelta(minutes=6))
+        again = True
+    except Exception:  # noqa: BLE001
+        again = False
+    ok("...and the NEXT run works too (not wedged behind the bad archive)", again)
+
+
+with_env(t_corrupt_deflate)
 
 # ---------------------------------------------------------------------------------------------
 print("-- 7. the log record --")
@@ -796,6 +1001,34 @@ def t_junk_events(e: Env):
 with_env(t_junk_events)
 
 # ---------------------------------------------------------------------------------------------
+print("-- 9b. bd reads: a missing bead is data, an infra failure trips the breaker --")
+
+
+def t_bd_not_found(e: Env):
+    """Catches (gate ga-aijm2v.4, low): the reader matched only "no issue found", but the real
+    `bd show <missing> --json` prints {"error": "no issues found matching the provided IDs"}
+    (verified live 26/09; `bd comments` says "no issue found matching ..."). A missing bead was
+    counted as an INFRA failure, and three in a row (deleted/merged beads are routine) tripped the
+    breaker so the rest of the run read nothing — every later delivery came out 'deferred'."""
+    real = {"show": '{"error": "no issues found matching the provided IDs", "schema_version": 1}',
+            "comments": '{"error": "resolving ga-x: no issue found matching \\"ga-x\\"", "schema_version": 1}'}
+    rd = ps.BdReader(e.cfg(), lambda rig, args: (1, real[args[0]]))
+    for i in range(4):
+        rd.facts(f"ga-gone{i}a")
+    ok("four missing beads via `bd show` (the plural wording) do not trip the breaker", rd.fail_streak == 0, f"streak={rd.fail_streak}")
+    for i in range(4):
+        rd.comments(f"ga-gone{i}b")
+    ok("...nor via `bd comments` (the singular wording)", rd.fail_streak == 0, f"streak={rd.fail_streak}")
+    ok("so the next read is still attempted (not DEFERRED)", rd.comments("ga-live1") is not ps.DEFERRED)
+    ok("a missing bead's comments are 'unavailable' (None), never an empty list", rd.comments("ga-gone0b") is None)
+    boom = ps.BdReader(e.cfg(), lambda rig, args: (1, ""))
+    for i in range(3):
+        boom.comments(f"ga-down{i}a")
+    ok("CONTROL: three real failures (rc=1, no output) DO trip it", boom.comments("ga-down9z") is ps.DEFERRED)
+
+
+with_env(t_bd_not_found)
+
 print("-- 10. rig routing for `bd -C` --")
 with tempfile.TemporaryDirectory() as td:
     tdp = Path(td)
@@ -878,6 +1111,66 @@ with tempfile.TemporaryDirectory() as td:
     ok("mean cache-read per API call: (100000+300000)/2, request counted once, old request excluded", got["gastown.mayor"] == 200000, str(got))
     ok("a recipient whose transcripts cannot be located is None (never a made-up number)", got["someone-unmapped"] is None, str(got))
     ok("a mapped recipient with no transcript dir is None", rep.measure_cache_read({"gastown.dog-9"}, projects_dir=proj)["gastown.dog-9"] is None)
+
+# --- gate low-medium: a Portaria row is filed under the day its outcome was MEASURED ---------------
+# Catches: jev-daily-report.sh reports `--date <yesterday>` at 00:07Z, filtering by the row's `ts`
+# (the DELIVERY time). A delivery stamped 23:05Z-24:00Z is resolved >= 62 min later — after that report
+# already ran — so it belonged to a day that had been reported and was in no later day's report either.
+with tempfile.TemporaryDirectory() as td:
+    logp = Path(td) / "jev.jsonl"
+    late = dict(prec("gate-held", "seguir", "seguir", "seguir", "nao_agiu"), ts="2026-09-25T23:30:00Z", resolved_at="2026-09-26T00:35:00Z")
+    early = dict(prec("gate-held", "seguir", "seguir", "seguir", "agiu"), ts="2026-09-25T10:00:00Z", resolved_at="2026-09-25T11:05:00Z")
+    other = {"ts": "2026-09-25T23:50:00Z", "experiment": "mayor-inbox", "arm": "control", "suppress": False, "jev_ok": False}
+    nodate = dict(prec("gate-held", "seguir", "seguir", "seguir", "agiu"), ts="2026-09-25T09:00:00Z")  # no resolved_at: falls back to ts
+    logp.write_text("".join(json.dumps(r) + "\n" for r in (late, early, other, nodate)), encoding="utf-8")
+    old_log = rep.JEV_LOG
+    rep.JEV_LOG = logp
+    try:
+        d25 = rep.load_events("2026-09-25", None)
+        d26 = rep.load_events("2026-09-26", None)
+    finally:
+        rep.JEV_LOG = old_log
+    ok("a delivery at 23:30Z resolved at 00:35Z the next day is in the NEXT day's report...",
+       [r for r in d26 if r.get("mode") == "portaria"] == [late], str(d26))
+    ok("...and NOT in the day of its delivery (it is in exactly one daily report)", late not in d25, str(d25))
+    ok("a portaria row that has no resolved_at falls back to its own ts", nodate in d25)
+    ok("non-portaria rows are still filed by their own ts (suppression experiment untouched)", other in d25 and other not in d26)
+
+# --- the pending line: "N observed, outcome not measured yet" ---------------------------------------
+ptxt = rep.format_report(sup, {}, "t", portaria_summary={"gate-held": pt}, cache_read_by_recipient={}, portaria_pending=3)
+ok("the report says how many observed deliveries still wait for their outcome", "not yet measured: 3" in ptxt, ptxt[-300:])
+ok("a state file that cannot be read shows n/d, never 0",
+   "not yet measured: n/d" in rep.format_report(sup, {}, "t", portaria_summary={"gate-held": pt}, cache_read_by_recipient={}, portaria_pending=None))
+ok("a caller that did not ask for it gets no pending line", "not yet measured" not in rep.format_report(sup, {}, "t", portaria_summary={"gate-held": pt}, cache_read_by_recipient={}))
+ok("the ntfy (pt) carries it too", "Ainda sem desfecho: 3" in rep.format_resumo_pt(sup, {}, "t", portaria_summary={"gate-held": pt}, cache_read_by_recipient={}, portaria_pending=3))
+ok("...and n/d when unreadable", "Ainda sem desfecho: n/d" in rep.format_resumo_pt(sup, {}, "t", portaria_summary={"gate-held": pt}, cache_read_by_recipient={}, portaria_pending=None))
+with tempfile.TemporaryDirectory() as td:
+    sf = Path(td) / "state.json"
+    os.environ["PORTARIA_STATE_FILE"] = str(sf)
+    try:
+        ok("no state file -> None (cannot tell), never 0", rep.load_portaria_pending() is None)
+        sf.write_text(json.dumps({"pending": {"mail:a": {}, "mail:b": {}}}))
+        ok("the count is the size of the state's pending map", rep.load_portaria_pending() == 2)
+        sf.write_text(json.dumps({"pending": {}}))
+        ok("an empty pending map is a real 0", rep.load_portaria_pending() == 0)
+        # Catches: valid JSON of the WRONG SHAPE is the "odd" state the docstring promises is never a 0 —
+        # the corrupt-file case below goes through the except branch, so only these reach the `else None`.
+        sf.write_text(json.dumps({"cursor_seq": 3}))
+        ok("valid JSON with no pending map (odd state) -> None, never 0", rep.load_portaria_pending() is None)
+        sf.write_text(json.dumps({"pending": []}))
+        ok("a pending of the wrong type -> None, never 0", rep.load_portaria_pending() is None)
+        sf.write_text(json.dumps([1, 2]))
+        ok("valid JSON that is not even an object -> None", rep.load_portaria_pending() is None)
+        sf.write_text("{ not json")
+        ok("a corrupt state file -> None", rep.load_portaria_pending() is None)
+        ok("...and reading it does not set the file aside (the report is read-only)", sf.exists() and sf.read_text() == "{ not json"
+           and not list(Path(td).glob("state.json.*")), str(list(Path(td).iterdir())))
+    finally:
+        os.environ.pop("PORTARIA_STATE_FILE", None)
+
+# --- the label must not claim more than the outcome measures ----------------------------------------
+ok("the safe-skip label says 'no action SEEN', not that the recipient certainly did nothing",
+   "did NOT act" not in ptxt and "no action SEEN" in ptxt and "destinatario nao agiu" not in pt_txt, ptxt[-500:])
 
 # ---------------------------------------------------------------------------------------------
 print("-- 12. wiring: order present, F1 order gone, exec script exists --")
