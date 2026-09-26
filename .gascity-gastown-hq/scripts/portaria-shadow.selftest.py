@@ -1143,16 +1143,65 @@ def t_dead_stranger_comment(e: Env):
 with_env(t_dead_stranger_comment)
 
 
-def t_dead_events_do_not_count(e: Env):
-    """Catches: a bead.* event on the DEAD id (e.g. its deletion) read as 'the entity changed but nobody
-    says who' -> nao_sei. The dead id is not an entity of the delivery, so its events are not evidence."""
+def t_dead_events_still_count(e: Env):
+    """Catches (gate ga-fuf92r, round 1): a bead.* event on a cited id thrown away because bd says that id
+    is gone. 'Gone' is read at RESOLUTION time, so it covers three facts: deleted long before the delivery
+    (the boilerplate ga-p5q3: no events in any window), never existed, and TOUCHED IN THE WINDOW AND THEN
+    REMOVED — possibly by the recipient, as its action. Only the events tell the third from the first two, so
+    they must stay: deleting a bead has to ADD evidence of activity, never erase it. (The live events file has
+    only bead.created/updated/closed — no bead.deleted — so an in-window event on a gone id IS that third case.)"""
     e.gone = {DEAD}
     e.comments["ga-bbb22"] = []
     r = nudge_scenario(e, extra_events=[ev_bead(2, T0 + timedelta(minutes=30), DEAD)])[0]
-    ok("a bead.* event on the dead id alone does not turn the outcome into nao_sei", r["desfecho"] == "nao_agiu", str(r))
+    ok("a bead.* event on the dead id inside the window -> nao_sei (touched, then gone), never nao_agiu",
+       r["desfecho"] == "nao_sei" and "mudou na janela" in r["desfecho_motivo"] and DEAD in r["desfecho_motivo"], str(r))
+    ok("the motive says the id no longer exists, so nobody goes looking for it", "inexistente" in r["desfecho_motivo"], r["desfecho_motivo"])
 
 
-with_env(t_dead_events_do_not_count)
+with_env(t_dead_events_still_count)
+
+
+def t_dead_deletion_does_not_erase_activity(e: Env):
+    """Catches (gate ga-fuf92r, round 1): the outcome depending on WHEN bd is asked. The same delivery, the same
+    in-window event: the outcome must be identical whether the touched bead is still readable or was deleted
+    afterwards. Compared directly on compute_outcome so the only difference between the two runs is NOT_FOUND."""
+    rec = {"destinatario": "gastown.mayor", "aliases": ["gastown.mayor"], "entidades": ["ga-live1", "ga-x2b"], "seq": 1, "thread_id": ""}
+    t1 = T0 + timedelta(minutes=60)
+    touched = [ev_bead(2, T0 + timedelta(minutes=10), "ga-x2b", typ="bead.closed")]
+    still_readable = ps.compute_outcome(rec, T0, t1, touched, {"ga-live1": [], "ga-x2b": []})
+    deleted_after = ps.compute_outcome(rec, T0, t1, touched, {"ga-live1": [], "ga-x2b": ps.NOT_FOUND})
+    ok("touched in the window: readable -> nao_sei", still_readable[0] == "nao_sei", str(still_readable))
+    ok("touched in the window, deleted afterwards -> the SAME outcome (was nao_agiu: deletion erased the event)",
+       deleted_after[0] == still_readable[0], f"{deleted_after} vs {still_readable}")
+    quiet_readable = ps.compute_outcome(rec, T0, t1, [], {"ga-live1": [], "ga-x2b": []})
+    quiet_gone = ps.compute_outcome(rec, T0, t1, [], {"ga-live1": [], "ga-x2b": ps.NOT_FOUND})
+    ok("control, nothing touched anywhere: readable and gone are both nao_agiu (the reported bug stays fixed)",
+       quiet_readable[0] == "nao_agiu" and quiet_gone[0] == "nao_agiu", f"{quiet_readable} / {quiet_gone}")
+    ok("...and the nao_agiu motive names the ids left out of the count, so the reason string alone is honest",
+       "ga-x2b" in quiet_gone[1] and "ga-x2b" not in quiet_readable[1], f"{quiet_gone[1]} | {quiet_readable[1]}")
+    late = ps.compute_outcome(rec, T0, t1, [ev_bead(3, T0 + timedelta(minutes=10), "ga-live1")], {"ga-live1": [], "ga-x2b": ps.NOT_FOUND})
+    ok("an event on the LIVE id still decides (nao_sei), gone sibling or not", late[0] == "nao_sei" and "ga-live1" in late[1], str(late))
+
+
+with_env(t_dead_deletion_does_not_erase_activity)
+
+
+def t_dead_first_id_facts_from_live(e: Env):
+    """Catches (gate ga-fuf92r, round 1, low): the facts for layers 1/2 taken from the FIRST cited id that maps
+    to a rig even when bd says that id is gone — an unprotected delivery whose first id is dead lost its live
+    context (fatos=False) although the second id is perfectly readable."""
+    e.gone = {"wa-aaa11"}
+    e.show["wa-bbb22"] = {"id": "wa-bbb22", "status": "open", "assignee": "", "labels": ["gate:needs-fix"], "metadata": {}}
+    e.comments["wa-bbb22"] = []
+    e.write_events([ev_mail(1, T0, "o1", "gastown.mayor", ORPHAN_SUBJ, ORPHAN_BODY), ev_fill(900, T0 + timedelta(minutes=65))])
+    e.run(T0 + timedelta(minutes=5))
+    e.run(T0 + timedelta(minutes=70))
+    r = e.portaria_records()[0]
+    ok("first cited id gone + second readable -> the record has live facts", r["fatos"] is True, str(r))
+    ok("...and the gone id is still reported as such", r["entidades_inexistentes"] == ["wa-aaa11"], str(r))
+
+
+with_env(t_dead_first_id_facts_from_live)
 
 
 def t_dead_events_on_live_still_count(e: Env):

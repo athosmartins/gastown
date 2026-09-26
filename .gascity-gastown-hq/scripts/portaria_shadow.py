@@ -31,7 +31,9 @@ to count. So the outcome uses only what IS attributable, with three honest state
             SENT by the recipient (events actor) citing an entity, or a reply by the recipient
             on the same mail thread.
   nao_agiu  no such evidence AND nobody touched any cited entity in the window: ZERO bead.*
-            events, ZERO comments (by anyone), the comments channel and the events read whole.
+            events on ANY cited id (one bd now says is gone included — its events are still in
+            the file), ZERO comments (by anyone) on the ids that exist (a gone bead has no
+            comment channel to read), the comments channel and the events read whole.
             It claims exactly that — no action SEEN on the cited entity(ies). It is NOT a proof
             the recipient did nothing: nudging a crew, acting on another bead or editing code
             leaves no trace here.
@@ -48,11 +50,16 @@ no longer exists — so treating "no issue found" like a failed read made the wh
 (measured 26/09: 62 of 171 real rows; re-measured on 254 nudges: 219 of 254 = 86% "comentarios
 ilegiveis" before, 4 after). BdReader now returns NOT_FOUND for bd's explicit "no issue found" and None
 for everything that is merely a failed read (rc!=0, timeout, locked, garbled, unknown rig, wisp). The
-outcome is drawn over the LIVE ids only; the log line keeps what was cited (`entidades`) and which of
-those bd declared gone (`entidades_inexistentes`). Two limits keep this from becoming a way to lose
-information: (1) if no cited id is left, the outcome stays nao_sei — a dead bead is nothing to
-measure, never "nobody acted"; (2) POSITIVE evidence still counts through a dead id (a mail the recipient
-sent citing it is still an "agiu"), because a missed action is the error that hides real alarms.
+COMMENT channel is read over the LIVE ids only (a gone bead has none, and a failed read of a live one is
+still nao_sei); the log line keeps what was cited (`entidades`) and which of those bd declared gone
+(`entidades_inexistentes`). Three limits keep this from becoming a way to lose information: (1) if no
+cited id is left, the outcome stays nao_sei — a dead bead is nothing to measure, never "nobody acted";
+(2) POSITIVE evidence still counts through a dead id (a mail the recipient sent citing it is still an
+"agiu"), because a missed action is the error that hides real alarms; (3) so do the bead.* events of a
+dead id: "gone" is read when the outcome is computed, so it also covers a bead touched in the window and
+removed afterwards (possibly by the recipient) — an in-window event on a gone id blocks nao_agiu exactly as
+the same event on a live id does. Only a gone id with NO event in the window is left out, and only of the
+comment reading (ga-p5q3: deleted long before, no events in any window).
 KNOWN LIMIT: "gone" is the answer of the store the id's PREFIX maps to (rig_for_entity); a bead that lives
 in another store under a foreign prefix would read as gone. Measured 26/09: of 142 ids gone by that rule
 (254 real nudges), each re-asked in every other registered store — 0 exist elsewhere; the rig map has
@@ -601,8 +608,8 @@ class BdReader:
         return facts
 
     def comments(self, entity: str):
-        """list of comment dicts | NOT_FOUND = bd said the bead does not exist (there is no channel to
-        read; nothing to conclude from it either way) | None = could not read (NEVER [] — an
+        """list of comment dicts | NOT_FOUND = bd said the bead does not exist (there is no comment channel
+        to read: neither "no comments" nor "unreadable") | None = could not read (NEVER [] — an
         unreadable channel is not an empty one) | DEFERRED = not attempted this run."""
         if entity in self._comments:
             return self._comments[entity]
@@ -708,8 +715,10 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
                     events_complete: bool = True):
     """('agiu'|'nao_agiu'|'nao_sei', motivo). `window_events` are the mail.sent / bead.* events
     already inside [t0, t1]; `comments` maps entity -> list | None (unreadable) | NOT_FOUND (bd says
-    the bead does not exist: it is not an entity of this delivery — see gone_entities — so it can
-    neither make the outcome unreadable nor stand for "nobody touched it"); `events_complete`
+    the bead does not exist — see gone_entities: it has no comment channel, so it can neither make the
+    outcome unreadable nor be counted as "no comments"; but its bead.* events in the window still count
+    as a change, because "gone" also covers a bead touched in the window and removed afterwards);
+    `events_complete`
     is False when the events file could not be read whole for this window (a truncated archive):
     positive evidence still counts, but "nobody touched it" can no longer be concluded. See the
     module docstring for what each state means and why bead.* events and comment authors cannot
@@ -717,7 +726,7 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
     aliases = {_actor_key(a) for a in rec.get("aliases") or [rec["destinatario"]]}
     ents = rec.get("entidades") or []
     gone = gone_entities(ents, comments)
-    live = [x for x in ents if x not in gone]  # the entities that exist: every NEGATIVE conclusion is drawn over these
+    live = [x for x in ents if x not in gone]  # the ids that have a comment channel: comments are read (and can be unreadable) over these; bead.* events and mail evidence are matched over EVERY cited id
     own_seq = rec.get("seq")
 
     for e in window_events:
@@ -761,9 +770,14 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
     if unreadable:
         return "nao_sei", (f"comentarios ilegiveis/indisponiveis em {unreadable[0]} (bd falhou, wisp ou rig desconhecido) "
                            "— ausencia de evidencia nao e nao-acao")
-    changed = [x for x in live if any(str(e.get("type", "")).startswith("bead.") and e.get("subject") == x for e in window_events)]
+    # `ents`, not `live`: "gone" is read at RESOLUTION time, so it also covers "touched in the window, then
+    # removed" (possibly by the recipient, as its action). An in-window bead.* event on a cited id is the only
+    # thing that tells that case from a bead deleted long before the delivery (ga-p5q3: no events anywhere) — so
+    # deleting a bead must add evidence of activity, never erase it (gate ga-fuf92r, round 1).
+    changed = [x for x in ents if any(str(e.get("type", "")).startswith("bead.") and e.get("subject") == x for e in window_events)]
     if changed:
-        return "nao_sei", f"{changed[0]} mudou na janela mas o evento nao diz quem (bead.* vem como cache-reconcile) — sem autor atribuivel"
+        now_gone = " (hoje inexistente no bd: tocado na janela e removido depois)" if changed[0] in gone else ""
+        return "nao_sei", f"{changed[0]} mudou na janela{now_gone} mas o evento nao diz quem (bead.* vem como cache-reconcile) — sem autor atribuivel"
     if stray:
         ent, author, why = stray[0]
         return "nao_sei", (f"{ent} teve {why} de '{author}' e esse autor nao e atribuivel ao destinatario "
@@ -771,7 +785,9 @@ def compute_outcome(rec: dict, t0: datetime, t1: datetime, window_events: list, 
     if not events_complete:
         return "nao_sei", ("eventos ilegiveis na janela (arquivo truncado/corrompido): nao da pra afirmar que "
                            "a entidade nao mudou — ausencia de evidencia nao e nao-acao")
-    return "nao_agiu", "nenhuma acao vista na entidade citada: sem comentario/mail do destinatario e nada mudou nela na janela"
+    left_out = f" (fora da conta de comentarios, inexistentes no bd: {', '.join(gone)})" if gone else ""
+    return "nao_agiu", ("nenhuma acao vista na entidade citada: sem comentario/mail do destinatario e nada mudou nela na janela"
+                        + left_out)
 
 
 # ── state, lock ────────────────────────────────────────────────────────────────────────────
@@ -944,8 +960,11 @@ def _run_locked(cfg: Config, jev_fn, bd_fn, now: datetime) -> dict:
     def add_pending(d: dict) -> None:
         facts = None
         if not d["protegida"]:
-            ent0 = next((x for x in d["entidades"] if rig_for_entity(x, cfg.rig_paths)), None)
-            facts = bd.facts(ent0) if ent0 else None
+            for x in d["entidades"]:  # the first cited id bd can describe: a gone or unreadable one has no facts to give
+                if rig_for_entity(x, cfg.rig_paths):
+                    facts = bd.facts(x)
+                    if facts:
+                        break
         c1, regra = layer1(d, st["dup_ledger"], facts, cfg)
         d["fatos"] = bool(facts)
         d["camada1"], d["camada1_regra"] = c1, regra
