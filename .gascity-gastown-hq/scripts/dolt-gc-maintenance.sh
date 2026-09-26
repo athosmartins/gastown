@@ -126,6 +126,12 @@ GC_SKIP_ALERT_THRESHOLD="${GC_SKIP_ALERT_THRESHOLD:-3}"  # ga-azzfw: consecutive
                            # One alert per STREAK, not one per cycle past the
                            # threshold — see _skip_streak_next.
 GC_SKIP_STREAK_STATE="${GC_SKIP_STREAK_STATE:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-skip-streak.state}"
+# ga-mb57np: single-instance lock. launchd only serializes runs of its OWN label; a manual run,
+# or the run dolt-gc-release-trigger.sh starts, is invisible to it — and two overlapping runs
+# could both reach dolt_gc() / the staging release. GC_MAINT_LOCK_RE is what a live holder's
+# command line must match for its pid to count (guards against pid reuse after a crash).
+GC_MAINT_LOCKDIR="${GC_MAINT_LOCKDIR:-$CITY/.gc/runtime/packs/maintenance/dolt-gc-maintenance.lock.d}"
+GC_MAINT_LOCK_RE="${GC_MAINT_LOCK_RE:-dolt-gc-maintenance}"
 LOG="${DOLT_GC_MAINT_LOG:-$CITY/.gc/logs/dolt-gc-maintenance.log}"
 NOTIFY="/Users/athos/.local/bin/notify"
 DOLTDIR="$CITY/.beads/dolt/$DB"
@@ -278,6 +284,22 @@ _gc_floor_ok() {
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   case "$floor" in ''|*[!0-9]*) return 1 ;; esac
   [ "$avail" -ge $(( size + floor )) ]
+}
+
+# _gc_required_parts <size_mb> <pct> <floor_mb> → echoes "PCT_MB FLOOR_MB REQUIRED_MB" (REQUIRED
+# is the larger of the two: the free space _gc_headroom_ok AND _gc_floor_ok jointly demand), or
+# prints nothing and returns 1 when any input is unmeasurable. ga-mb57np: the ONE place this is
+# computed — main() uses it for the gate and the log, and dolt-gc-release-trigger.sh uses it to
+# decide when to start a run, so the trigger can never drift from the gate it is waiting for.
+_gc_required_parts() {
+  local size="$1" pct="$2" floor="$3" by_pct by_floor req
+  case "$size" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pct" in ''|*[!0-9]*) return 1 ;; esac
+  case "$floor" in ''|*[!0-9]*) return 1 ;; esac
+  by_pct=$(( size * pct / 100 ))
+  by_floor=$(( size + floor ))
+  req=$by_pct; [ "$by_floor" -gt "$req" ] && req=$by_floor
+  echo "$by_pct $by_floor $req"
 }
 
 # _resolve_gc_min_free_pct <pinned> <prune_enabled> <base> <with_prune> → echoes the
@@ -703,6 +725,60 @@ _gc_maybe_release_staging() {
   return 0
 }
 
+# ── ga-mb57np: single-instance lock (mkdir; no flock on macOS) ──────────────────────────
+# Why here: the release trigger starts this job outside the 2h cadence, and launchd only
+# serializes runs of its own label — a manual run, or the trigger's child, is invisible to it.
+# Two overlapping runs could both reach dolt_gc() or the staging release.
+#
+# A lock is "held" only while the pid in <dir>/pid is ALIVE and its command line matches <re>:
+# a crashed run (SIGKILL, power loss) leaves a dir behind that must not wedge the job forever,
+# and a recycled pid must not be mistaken for the holder. A dir with no readable pid is held
+# only while young (its creator is between mkdir and writing the pid); an old one is a crash
+# leftover. Reclaiming a stale lock uses the same rmdir-then-mkdir idiom as dolt-s3-backup.sh:
+# two processes reclaiming the SAME stale lock in the same instant can, in theory, both win —
+# the window is microseconds and needs two starts at once after a crash; not worth a second lock.
+
+# _dgm_lock_held <lockdir> <cmd_re> → 0 iff held (see above); 1 otherwise. Read-only.
+_dgm_lock_held() {
+  local d="$1" re="$2" pid cmd
+  [ -d "$d" ] || return 1
+  pid="$(head -1 "$d/pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$pid" in
+    ''|*[!0-9]*)
+      [ -n "$(find "$d" -maxdepth 0 -mmin -2 2>/dev/null)" ] && return 0
+      return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
+  [ -n "$cmd" ] || return 0      # alive but its command cannot be read → cannot tell → held
+  printf '%s' "$cmd" | grep -Eq "$re"
+}
+
+# _dgm_lock_acquire <lockdir> <cmd_re> → 0 acquired · 1 held by a live run · 2 cannot lock at all
+# (the lock directory cannot be created — a third state, deliberately not "held" and not "ok").
+_dgm_lock_acquire() {
+  local d="$1" re="$2"
+  mkdir -p "$(dirname "$d")" 2>/dev/null || return 2
+  if ! mkdir "$d" 2>/dev/null; then
+    [ -d "$d" ] || return 2
+    _dgm_lock_held "$d" "$re" && return 1
+    rm -f "$d/pid" 2>/dev/null
+    { rmdir "$d" 2>/dev/null && mkdir "$d" 2>/dev/null; } || return 1
+  fi
+  printf '%s\n' "$$" > "$d/pid" 2>/dev/null || { rmdir "$d" 2>/dev/null; return 2; }
+  return 0
+}
+
+# _dgm_lock_release <lockdir> — removes the lock only if THIS process owns it.
+_dgm_lock_release() {
+  local d="$1" pid
+  pid="$(head -1 "$d/pid" 2>/dev/null | tr -d '[:space:]')"
+  [ "$pid" = "$$" ] || return 0
+  rm -f "$d/pid" 2>/dev/null
+  rmdir "$d" 2>/dev/null
+  return 0
+}
+
 # ── main flow ────────────────────────────────────────────────────────────────────
 main() {
   # ga-3euoj: resolve GC_MIN_FREE_PCT now that PRUNE_ENABLED + any operator pin (env
@@ -711,6 +787,16 @@ main() {
   # exercise _resolve_gc_min_free_pct directly with whatever inputs each test wants,
   # rather than being stuck with one value baked in at source-time.
   GC_MIN_FREE_PCT="$(_resolve_gc_min_free_pct "${GC_MIN_FREE_PCT:-}" "$PRUNE_ENABLED" "$GC_MIN_FREE_PCT_BASE" "$GC_MIN_FREE_PCT_WITH_PRUNE")"
+
+  # ga-mb57np: a run started by dolt-gc-release-trigger.sh (GC_TRIGGERED_RUN=1 — only the
+  # literal 1) does ONLY the size-gated dolt_gc step below. Purge/prune/flatten stay on the 2h
+  # cadence: they have no reason to run every few minutes, and a prune batch would also change
+  # which headroom percentage applies (_resolve_gc_min_free_pct) mid-decision.
+  if [ "${GC_TRIGGERED_RUN:-0}" = "1" ]; then
+    log "triggered run (ga-mb57np: headroom poll saw the gate reachable) — running ONLY the size-gated dolt_gc step; purge/prune/flatten stay on the 2h cadence"
+    _run_size_gc
+    return 0
+  fi
 
   # 1) EPHEMERAL PURGE (always) — unchanged behavior.
   if [ -x "$BD" ]; then
@@ -735,7 +821,14 @@ main() {
     return 0
   fi
 
-  # 4) ONLINE size-gated dolt_gc (always). size_mb replaces the old bare
+  _run_size_gc
+  return 0
+}
+
+# 4) ONLINE size-gated dolt_gc — step 4 of main() above, and (ga-mb57np) the ONLY step a
+# triggered run performs. Always leaves via `return 0`; every outcome is logged.
+_run_size_gc() {
+  # ONLINE size-gated dolt_gc (always). size_mb replaces the old bare
   # `du -sg` read (same truncated-whole-GB value via integer division, so
   # the THRESHOLD_G comparison below is unchanged) — MB precision is what
   # the new headroom check below needs; see _largest_db_mb's own comment in
@@ -758,15 +851,22 @@ main() {
   local avail_mb; avail_mb="$(_avail_mb "$DOLTDIR")"
   local required_pct_mb="" required_floor_mb="" required_mb=""
   if [ -n "$size_mb" ]; then
-    required_pct_mb=$(( size_mb * GC_MIN_FREE_PCT / 100 ))
-    required_floor_mb=$(( size_mb + GC_MIN_FREE_ABS_MB ))
-    required_mb=$required_pct_mb
-    [ "$required_floor_mb" -gt "$required_mb" ] && required_mb=$required_floor_mb
+    # ga-mb57np: computed by _gc_required_parts (shared with the release trigger); a blank
+    # result (unmeasurable pin/floor) leaves all three empty → the gate below fails closed.
+    read -r required_pct_mb required_floor_mb required_mb <<< "$(_gc_required_parts "$size_mb" "$GC_MIN_FREE_PCT" "$GC_MIN_FREE_ABS_MB")"
   fi
   log "hq disk headroom check: size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB (max of ${GC_MIN_FREE_PCT}% size=${required_pct_mb:-<unmeasured>}MB, size+${GC_MIN_FREE_ABS_MB}MB floor=${required_floor_mb:-<unmeasured>}MB)"
   if ! _gc_headroom_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_PCT" || ! _gc_floor_ok "$avail_mb" "$size_mb" "$GC_MIN_FREE_ABS_MB"; then
     log "hq size=${size_mb:-<unmeasured>}MB avail=${avail_mb:-<unmeasured>}MB required=${required_mb:-<unmeasured>}MB — insufficient free space (or unmeasurable) for dolt_gc — skip this cycle, will retry in 2h"
-    _handle_gc_skip_streak "$size_mb" "$avail_mb" "$required_mb"
+    if [ "${GC_TRIGGERED_RUN:-0}" = "1" ]; then
+      # ga-mb57np: the streak counts 2h launchd CYCLES (its alert text and the release's
+      # "chronic" test both read it that way). A run started between cycles by the headroom
+      # poll is not one, so it must not advance it — else a refused trigger would inflate
+      # "~Nh of skips" by minutes-apart attempts.
+      log "triggered run: this skip is not a 2h cycle — the skip streak is NOT advanced"
+    else
+      _handle_gc_skip_streak "$size_mb" "$avail_mb" "$required_mb"
+    fi
     # ga-btnq6h: a CHRONIC skip is a vicious circle (the GC that would shrink hq is the thing
     # that cannot run) — when S3 is proven to hold an identical, restorable copy, free the
     # redundant local staging and re-check the SAME gate with a fresh measurement. Never
@@ -818,6 +918,15 @@ back down toward its live-data floor."
 
 # ── run unless sourced as a library (selftest sources with DOLT_GC_MAINT_LIB=1) ──
 if [ "${DOLT_GC_MAINT_LIB:-0}" != "1" ]; then
+  _dgm_lock_acquire "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE"
+  case "$?" in
+    0) trap '_dgm_lock_release "$GC_MAINT_LOCKDIR"' EXIT ;;
+    1) log "another dolt-gc-maintenance run holds $GC_MAINT_LOCKDIR (pid $(head -1 "$GC_MAINT_LOCKDIR/pid" 2>/dev/null)) — exiting; nothing done in this invocation"
+       exit 0 ;;
+    # Cannot create the lock at all (fs trouble): run anyway, as this job always has — refusing
+    # would silently stop ALL maintenance over a bookkeeping failure — but say so.
+    *) log "WARN: cannot create the single-instance lock $GC_MAINT_LOCKDIR — running WITHOUT overlap protection" ;;
+  esac
   main
   exit 0
 fi

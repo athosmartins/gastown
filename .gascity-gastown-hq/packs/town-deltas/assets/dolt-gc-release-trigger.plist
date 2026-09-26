@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.dolt-gc-release-trigger</string>
+
+  <!-- ga-mb57np: evaluates hq's dolt_gc gate (and the ga-btnq6h staging release that unblocks
+       it) every 5 minutes instead of once per 2h cycle. On this machine "free disk" swings
+       ±9 GB with swap, so one sample per 2h is a lottery: the job saw ONE real chance in ~124h
+       of skipping. A healthy poll is ~0.08 s CPU; when the SAME gate the 2h job enforces is
+       reachable, it starts that job (GC_TRIGGERED_RUN=1). It never deletes anything itself —
+       see the script header. Kill switch: GC_TRIGGER_ENABLED=0 in
+       .gc/config/dolt-maintenance.env (this trigger only; the 2h job is unaffected).
+       StartInterval 300 ≫ one poll (measured, script header); a run it starts blocks further
+       polls until it ends (launchd never overlaps a label; the script also holds a lock). -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/dolt-gc-release-trigger.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>StartInterval</key><integer>300</integer>
+  <!-- First poll at load: proves the job is alive immediately (state file heartbeat). -->
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-release-trigger-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/dolt-gc-release-trigger-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>

@@ -398,5 +398,146 @@ if [ -n "$CT" ]; then
   case "$CT" in "${TMPDIR:-/tmp}"/dolt-gc-release-selftest.*) rm -rf "$CT" ;; esac
 fi
 
+# ═══ ga-mb57np: what the headroom-poll trigger (dolt-gc-release-trigger.sh) relies on ═══
+# The trigger starts THIS job outside the 2h cadence, so three properties matter here:
+#   1. one place computes the gate's `required` (the trigger must not carry its own copy);
+#   2. two runs can never overlap (launchd only serializes its OWN label — a manual run or the
+#      trigger's child is invisible to it), and a crashed run's lock must not wedge the job;
+#   3. a triggered run does only the size-gated GC step, and its skips are not 2h "cycles".
+
+# ── _gc_required_parts: the one place `required` is computed ─────────────────────────────
+r="$(_gc_required_parts 8247 200 3072)"; [ "$r" = "16494 11319 16494" ] && ok "required: hq 8247MB @200% → pct=16494 floor=11319 required=16494 (max of the two)" || bad "required big-hq got: '$r'"
+r="$(_gc_required_parts 1000 200 3072)"; [ "$r" = "2000 4072 4072" ] && ok "required: a small hq is governed by the absolute floor (size+3072), not the percentage" || bad "required small-hq got: '$r'"
+r="$(_gc_required_parts 8247 280 3072)"; [ "$r" = "23091 11319 23091" ] && ok "required: the with-prune percentage (280) flows through" || bad "required prune got: '$r'"
+for _bad in "" "abc" "-1" "1.5"; do
+  r="$(_gc_required_parts "$_bad" 200 3072)"; _gc_required_parts "$_bad" 200 3072 >/dev/null 2>&1; rc=$?
+  if [ -z "$r" ] && [ "$rc" -ne 0 ]; then ok "required: unmeasurable size '$_bad' → nothing printed, rc!=0 (never a fabricated number)"; else bad "required: size '$_bad' gave out='$r' rc=$rc"; fi
+done
+r="$(_gc_required_parts 8247 "" 3072)"; _gc_required_parts 8247 "" 3072 >/dev/null 2>&1; rc=$?
+if [ -z "$r" ] && [ "$rc" -ne 0 ]; then ok "required: blank pct → nothing printed, rc!=0"; else bad "required blank pct got: out='$r' rc=$rc"; fi
+r="$(_gc_required_parts 8247 200 "")"; _gc_required_parts 8247 200 "" >/dev/null 2>&1; rc=$?
+if [ -z "$r" ] && [ "$rc" -ne 0 ]; then ok "required: blank floor → nothing printed, rc!=0"; else bad "required blank floor got: out='$r' rc=$rc"; fi
+unset _bad rc
+
+# ── single-instance lock (real filesystem, real processes) ──────────────────────────────
+LT="$(mktemp -d "${TMPDIR:-/tmp}/dolt-gc-lock-selftest.XXXXXX")"
+if [ -z "$LT" ] || [ ! -d "$LT" ]; then bad "lock: mktemp failed — lock tests skipped"; else
+  LD="$LT/run.lock.d"; RE="selftest"        # this very process is the live holder (its command line has 'selftest')
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$LD/pid" 2>/dev/null)" = "$$" ] && ok "lock: a free lock is acquired and stamped with our pid" || bad "lock acquire rc=$rc pid='$(cat "$LD/pid" 2>/dev/null)'"
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 1 ] && ok "lock: a second acquire while the holder is alive → 1 (held) — two runs never overlap" || bad "lock second acquire rc=$rc (want 1)"
+  _dgm_lock_release "$LD"
+  [ ! -e "$LD" ] && ok "lock: release by the owner removes the lock" || bad "lock not released"
+  _dgm_lock_acquire "$LD" "$RE" && ok "lock: re-acquirable after a release" || bad "lock not re-acquirable"
+  _dgm_lock_release "$LD"
+
+  # stale: holder died (crash / SIGKILL) → next run reclaims instead of wedging the job forever
+  mkdir "$LD"; sleep 0 & _dead=$!; wait "$_dead" 2>/dev/null; printf '%s\n' "$_dead" > "$LD/pid"
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$LD/pid" 2>/dev/null)" = "$$" ] && ok "lock: a dead holder's lock is reclaimed (a crashed run cannot wedge the job)" || bad "stale lock not reclaimed rc=$rc pid='$(cat "$LD/pid" 2>/dev/null)'"
+  _dgm_lock_release "$LD"
+
+  # pid reuse: the recorded pid is ALIVE but is some other program → not our holder → stale
+  mkdir "$LD"; sleep 30 & _other=$!; printf '%s\n' "$_other" > "$LD/pid"
+  _dgm_lock_acquire "$LD" "dolt-gc-maintenance-only-this-name"; rc=$?
+  [ "$rc" -eq 0 ] && ok "lock: recorded pid alive but running something else (pid reuse) → treated as stale and reclaimed" || bad "pid-reuse lock not reclaimed rc=$rc"
+  _dgm_lock_release "$LD"
+  mkdir "$LD"; printf '%s\n' "$_other" > "$LD/pid"
+  _dgm_lock_acquire "$LD" "sleep"; rc=$?
+  [ "$rc" -eq 1 ] && ok "lock: the same live pid WITH a matching command is a real holder → held" || bad "matching live holder not honored rc=$rc"
+  kill "$_other" 2>/dev/null; wait "$_other" 2>/dev/null; rmdir "$LD" 2>/dev/null; rm -f "$LD/pid"; rmdir "$LD" 2>/dev/null
+
+  # no readable pid: fresh = the holder is between mkdir and writing its pid (held); old = crash leftover (stale)
+  mkdir "$LD"
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 1 ] && ok "lock: a FRESH lock dir with no pid yet → held (its creator is mid-acquire)" || bad "fresh pid-less lock rc=$rc (want 1)"
+  touch -t 202001010000 "$LD"
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 0 ] && ok "lock: an OLD pid-less lock dir (crash between mkdir and pid write) → reclaimed" || bad "old pid-less lock rc=$rc (want 0)"
+  _dgm_lock_release "$LD"
+  mkdir "$LD"; printf 'garbage\n' > "$LD/pid"; touch -t 202001010000 "$LD"
+  _dgm_lock_acquire "$LD" "$RE"; rc=$?
+  [ "$rc" -eq 0 ] && ok "lock: an old lock whose pid file is garbage → reclaimed" || bad "garbage-pid lock rc=$rc"
+  _dgm_lock_release "$LD"
+
+  # release only by the owner
+  mkdir "$LD"; printf '%s\n' 99999999 > "$LD/pid"
+  _dgm_lock_release "$LD"
+  [ -d "$LD" ] && ok "lock: release by a NON-owner leaves the lock alone" || bad "non-owner release removed someone else's lock"
+  rm -f "$LD/pid"; rmdir "$LD" 2>/dev/null
+
+  # a lock dir that cannot be created is a third state (2), not 'held' and not 'acquired'
+  printf 'x' > "$LT/afile"
+  _dgm_lock_acquire "$LT/afile/child.lock.d" "$RE"; rc=$?
+  [ "$rc" -eq 2 ] && ok "lock: an uncreatable lock dir → 2 (cannot lock) — distinct from held(1) and acquired(0)" || bad "uncreatable lock rc=$rc (want 2)"
+
+  # _dgm_lock_held (read-only; what the trigger asks)
+  _dgm_lock_held "$LT/nothing.lock.d" "$RE" && bad "held: an absent lock must not read as held" || ok "held: no lock dir → not held"
+  mkdir "$LD"; printf '%s\n' "$$" > "$LD/pid"
+  _dgm_lock_held "$LD" "$RE" && ok "held: live matching holder → held" || bad "held: live holder not seen"
+  _dgm_lock_held "$LD" "no-such-command-name" && bad "held: live pid with a non-matching command must not read as held" || ok "held: live pid, different program (reuse) → not held"
+  rm -f "$LD/pid"; rmdir "$LD" 2>/dev/null
+  case "$LT" in "${TMPDIR:-/tmp}"/dolt-gc-lock-selftest.*) rm -rf "$LT" ;; esac
+fi
+
+# ── triggered run: main() runs ONLY the size-gated GC; skips are not 2h cycles ───────────
+XT="$(mktemp -d "${TMPDIR:-/tmp}/dolt-gc-triggered-selftest.XXXXXX")"
+if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests skipped"; else
+  BD_LOG="$XT/bd.calls"; : > "$BD_LOG"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$BD_LOG" > "$XT/bd-stub"; chmod +x "$XT/bd-stub"
+  BD="$XT/bd-stub"
+  LOG="$XT/x.log"; DOLT_GC_MAINT_LOG="$LOG"
+  GC_SKIP_STREAK_STATE="$XT/streak.state"
+  DOLTDIR="$XT/hq"; mkdir -p "$DOLTDIR"; DB="hq"; PORT=1; THRESHOLD_G=1
+  PRUNE_ENABLED=0; FLATTEN_ENABLED=0
+  GC_MIN_FREE_PCT=200; GC_MIN_FREE_ABS_MB=3072; GC_MIN_FREE_PCT_BASE=200; GC_MIN_FREE_PCT_WITH_PRUNE=280
+  FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0
+  du() { case "${1:-}" in -sm) printf '%s\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; -sh) printf '%sM\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; *) command du "$@" ;; esac; }
+  _avail_mb() { printf '%s' "$FAKE_AVAIL"; }
+  timeout() { shift; "$@"; }
+  dolt() { DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return 0; }
+  _gc_maybe_release_staging() { RELEASE_CALLS=$((RELEASE_CALLS+1)); return 1; }
+  _dolt_gc_notify() { NOTIFY_N=$((NOTIFY_N+1)); }
+  _dolt_gc_mail_mayor() { MAIL_N=$((MAIL_N+1)); }
+  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; unset GC_TRIGGERED_RUN; }
+
+  # a NORMAL 2h cycle that skips advances the streak (unchanged behavior) and still tries the release
+  xreset; main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "63 1" ] && ok "cycle: a normal 2h run that skips advances the streak 62→63" || bad "cycle streak got '$(_read_skip_streak "$GC_SKIP_STREAK_STATE")'"
+  [ "$RELEASE_CALLS" -eq 1 ] && [ "$DOLT_CALLS" -eq 0 ] && ok "cycle: the skip still consults the staging release, and dolt_gc is not called" || bad "cycle skip flow: release=$RELEASE_CALLS dolt=$DOLT_CALLS"
+  grep -q 'purge' "$BD_LOG" && ok "cycle: a normal run still does the ephemeral purge (step 1 untouched)" || bad "cycle: the purge did not run"
+
+  # a TRIGGERED run that skips does NOT advance the streak, does the GC-only path, still consults the release
+  xreset; GC_TRIGGERED_RUN=1 main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "62 1" ] && ok "triggered: a skip does NOT advance the 2h-cycle streak (62 stays 62)" || bad "triggered streak got '$(_read_skip_streak "$GC_SKIP_STREAK_STATE")'"
+  [ "$RELEASE_CALLS" -eq 1 ] && ok "triggered: a skip still goes through the (unchanged) guarded staging release" || bad "triggered: release not consulted ($RELEASE_CALLS)"
+  [ ! -s "$BD_LOG" ] && ok "triggered: purge/prune/flatten are NOT run at poll cadence (bd never called)" || bad "triggered: bd was called: $(cat "$BD_LOG")"
+  grep -q 'triggered run' "$LOG" && ok "triggered: the log says it was a triggered run" || bad "triggered: no log marker"
+
+  # a triggered run whose gate PASSES runs dolt_gc and clears the streak
+  xreset; FAKE_AVAIL=20000; GC_TRIGGERED_RUN=1 main
+  [ "$DOLT_CALLS" -eq 1 ] && [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "0 0" ] && ok "triggered: gate passes → dolt_gc runs once and the skip streak is cleared" || bad "triggered pass: dolt=$DOLT_CALLS streak='$(_read_skip_streak "$GC_SKIP_STREAK_STATE")'"
+  grep -q 'dolt_gc OK' "$LOG" && ok "triggered: the run logs 'dolt_gc OK — hq X -> Y' (acceptance item 2)" || bad "triggered: no dolt_gc OK line"
+  # a triggered run does not lower the gate: 1MB under → skip
+  xreset; FAKE_AVAIL=16493; GC_TRIGGERED_RUN=1 main
+  [ "$DOLT_CALLS" -eq 0 ] && ok "triggered: 1MB under the SAME gate → no dolt_gc (the gate is not loosened for triggered runs)" || bad "triggered: ran dolt_gc under the gate"
+  xreset; FAKE_AVAIL=16494; GC_TRIGGERED_RUN=1 main
+  [ "$DOLT_CALLS" -eq 1 ] && ok "triggered: exactly at the gate → dolt_gc runs (boundary matches a normal cycle)" || bad "triggered: not at gate boundary"
+  # only the literal 1 selects triggered mode
+  xreset; GC_TRIGGERED_RUN=0 main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "63 1" ] && grep -q purge "$BD_LOG" && ok "triggered: GC_TRIGGERED_RUN=0 is a normal cycle" || bad "GC_TRIGGERED_RUN=0 treated as triggered"
+  xreset; GC_TRIGGERED_RUN=yes main
+  [ "$(_read_skip_streak "$GC_SKIP_STREAK_STATE")" = "63 1" ] && ok "triggered: any value other than the literal 1 is a normal cycle" || bad "GC_TRIGGERED_RUN=yes treated as triggered"
+
+  unset -f du _avail_mb timeout dolt _gc_maybe_release_staging _dolt_gc_notify _dolt_gc_mail_mayor xreset
+  unset GC_TRIGGERED_RUN
+  case "$XT" in "${TMPDIR:-/tmp}"/dolt-gc-triggered-selftest.*) rm -rf "$XT" ;; esac
+fi
+
+# ── static: the lock wraps the real entry point, and only there ────────────────────────
+grep -Eq '_dgm_lock_acquire "\$GC_MAINT_LOCKDIR"' "$SCRIPT" && ok "static: the non-library entry point takes the single-instance lock" || bad "static: main is not wrapped by the lock"
+/bin/bash -n "$SCRIPT" 2>/dev/null && ok "static: parses under /bin/bash (3.2) — the interpreter launchd runs it with" || bad "static: does not parse under /bin/bash 3.2"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
