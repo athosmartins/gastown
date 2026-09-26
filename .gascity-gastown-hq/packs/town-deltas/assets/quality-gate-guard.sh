@@ -2547,18 +2547,48 @@ gate_base_test_outside_subtree() {
   return 0
 }
 
-# gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'>
-#   ga-7dx2vw: what ONE `/bin/bash -n` run means. Measured on /bin/bash 3.2.57:
-#   a syntax error exits 2, a clean parse 0, an unreadable file 126, a missing
-#   one 127 (a killed parser would be 128+signal). Only 0 and 2 are verdicts
-#   about the FILE; any other status (or an empty/garbled one) means the parser
-#   did not reach a verdict — a parser killed under memory pressure must not
-#   read as "this file has a syntax error" any more than as "this file is
-#   clean". Prints ok | fail | unmeasured. Pure (no IO).
+# gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'> <its-diagnostic>
+#   ga-7dx2vw: what ONE `/bin/bash -n` run means. The parser gives TWO signals —
+#   an exit status and a diagnostic (stderr) — and the verdict has to come from
+#   both, because the exit status alone is not a complete account. Measured on
+#   /bin/bash 3.2.57:
+#     - most syntax errors exit 2 and print a diagnostic (a case with
+#       unparenthesized patterns inside $( ), a missing fi/done, an unterminated
+#       quote) — the ga-6aj348 shape;
+#     - an UNTERMINATED ARRAY LITERAL prints a diagnostic but exits 0: `x=(a b`
+#       at EOF, `declare -a x=(a b`, `local x=(a b`, `x=(a (b)` all give
+#       "unexpected EOF while looking for matching `)'" (or "syntax error near
+#       unexpected token `('") with status 0, and the same file then fails at
+#       runtime (rc=1). This is the reason the second argument exists: taking
+#       the verdict from the status alone recorded such a file as measured-clean;
+#     - a clean file exits 0 and prints nothing; an unreadable file exits 126, a
+#       missing one 127, a killed parser 128+signal.
+#   Rules (the diagnostic is the parser's own report, so it wins over a 0):
+#     2                       -> fail       (whatever it printed)
+#     0 + empty diagnostic    -> ok
+#     0 + a diagnostic        -> fail       (the parser reported a syntax
+#                                            problem; never ok)
+#     any other / empty / garbled status -> unmeasured: the parser did not reach
+#       a verdict — one killed under memory pressure must not read as "this file
+#       has a syntax error" any more than as "this file is clean".
+#   A call that does not pass the diagnostic AT ALL (fewer than two arguments) is
+#   unmeasured even on status 0: an omitted signal is "don't know", not "empty" —
+#   an explicit empty second argument is the way to say "it printed nothing".
+#   The corpus of constructs this was measured on lives in
+#   gate-guard-bash32-syntax-check.selftest.sh. Prints ok | fail | unmeasured.
+#   Pure (no IO).
 gate_bash32_parse_class() {
   case "$1" in
-    0) printf 'ok' ;;
     2) printf 'fail' ;;
+    0)
+      if [ "$#" -lt 2 ]; then
+        printf 'unmeasured'
+      elif [ -n "$2" ]; then
+        printf 'fail'
+      else
+        printf 'ok'
+      fi
+      ;;
     *) printf 'unmeasured' ;;
   esac
 }
@@ -5668,6 +5698,19 @@ fi
 # the substitution (or replaced by if/elif). Bash 4+ parses all of them.
 # Only the real /bin/bash 3.2 binary reproduces it.
 #
+# A SECOND way for a file to fail (gate_run ga-aejgdn, measured on 3.2.57): an
+# unterminated array literal — `x=(a b` at EOF, `declare -a x=(a b`,
+# `local x=(a b`, `x=(a (b)` — makes `/bin/bash -n` PRINT the parse error and
+# still EXIT 0; the same file then fails at runtime (rc=1). So `bash -n`'s exit
+# status is not the whole verdict: it is classified TOGETHER with its diagnostic
+# (gate_bash32_parse_class — status 2, or status 0 with anything printed, is a
+# failure), and the status alone used to record such a file as measured-clean.
+# Measured before adopting the rule (a snapshot, not an invariant): 0 of 648
+# tracked .sh files in scope (555 under HQ scripts/ + packs/town-deltas/assets/,
+# 93 across the other rigs, 2026-09-26) print anything under /bin/bash -n, so
+# the rule refuses no file that exists today. A future file that makes the
+# parser print something while exiting 0 IS refused — that is the rule.
+#
 # Scope: every .sh file added/changed on the branch under
 # packs/town-deltas/assets/ or scripts/, in WHICHEVER rig the marker belongs to
 # (the git commands run with -C "$RIG_PATH" and the pathspecs are relative to
@@ -5798,13 +5841,18 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
           # is written (measured: rc=1, no verdict, no log line).
           mkdir -p "$(dirname "$_B32_WT/$_b32_f")" 2>/dev/null || { _B32_UNRUN=$((_B32_UNRUN + 1)); continue; }
           if git -C "$RIG_PATH" show "${_B32_BRANCH_SHA}:$_b32_f" > "$_B32_WT/$_b32_f" 2>/dev/null; then
-            # Exit status captured on its own (`|| rc=$?` keeps set -e out of
-            # it) and classified: only status 2 is "does not parse". A parser
-            # that could not run (126/127, killed) is NOT a syntax failure —
-            # it is counted as unrun, so checked < changed -> nao-consegui-medir.
+            # The parser's exit status (captured on its own — `|| rc=$?` keeps
+            # set -e out of it) AND its diagnostic are BOTH handed to the
+            # classifier: the verdict is taken from what the parser reported, not
+            # from the status alone. Status 2 is a syntax error; status 0 with an
+            # EMPTY diagnostic is a clean parse; status 0 WITH a diagnostic is a
+            # syntax error too (an unterminated array literal — `x=(a b` at EOF —
+            # prints its error and still exits 0); a parser that could not run
+            # (126/127, killed) is neither — it is counted as unrun, so
+            # checked < changed -> nao-consegui-medir.
             _b32_rc=0
             _b32_err=$(/bin/bash -n "$_B32_WT/$_b32_f" 2>&1) || _b32_rc=$?
-            _b32_class=$(gate_bash32_parse_class "$_b32_rc")
+            _b32_class=$(gate_bash32_parse_class "$_b32_rc" "$_b32_err")
             if [ "$_b32_class" = "ok" ]; then
               _B32_CHECKED=$((_B32_CHECKED + 1))
             elif [ "$_b32_class" = "fail" ]; then
@@ -5854,12 +5902,12 @@ bd -C "$GC_CITY" label add "$MARKER_ID" "gate-bash32:$_B32_VERDICT" -q 2>/dev/nu
 log "BASH32-CHECK bead=${BEAD_ID:-<EMPTY>} verdict=$_B32_VERDICT branch=${BRANCH:-<EMPTY>} rig_path=${RIG_PATH:-<EMPTY>} changed=$_B32_CHANGED checked=$_B32_CHECKED failed=$_B32_FAILED unrun=$_B32_UNRUN list_unread=$_B32_UNMEASURED refs_resolved=$_B32_REFS inputs_ok=$_B32_INPUTS_OK"
 case "$_B32_VERDICT" in
   bash32-fail)
-    err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 (the macOS /bin/bash that launchd runs these scripts through). Refusing at submission."
+    err "  bash32-syntax-check (ga-7dx2vw): $_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ fail to parse under /bin/bash 3.2 — bash -n exited 2, or exited 0 but printed a syntax error (the macOS /bin/bash that launchd runs these scripts through). Refusing at submission."
     set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: bash-3.2 syntax check (ga-7dx2vw).
-$_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 — the macOS /bin/bash that launchd runs these scripts through, in whichever rig they live (Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
+$_B32_FAILED of $_B32_CHECKED changed .sh file(s) under packs/town-deltas/assets/ or scripts/ do not parse under /bin/bash 3.2 (\`bash -n\` exits 2, or exits 0 but prints a syntax error) — the macOS /bin/bash that launchd runs these scripts through, in whichever rig they live (Homebrew bash 5.3 on PATH is more permissive and will NOT catch this, neither will shellcheck -s bash).
 $_B32_DETAIL
-Fix the syntax. Measured recurring cause on /bin/bash 3.2.57: a \`case\` with UNparenthesized patterns inside a \$( ... ) command substitution is rejected at its first \`;;\` — where \`esac\` and the closing \`)\` sit makes no difference (esac on its own line fails too). Either give every pattern a leading paren, e.g. \$(case \$x in (a) echo A;; (*) echo Z;; esac), or move the case out of the \$( ... ) (or use if/elif). Verify locally with:
+Fix the syntax. Measured recurring cause on /bin/bash 3.2.57: a \`case\` with UNparenthesized patterns inside a \$( ... ) command substitution is rejected at its first \`;;\` — where \`esac\` and the closing \`)\` sit makes no difference (esac on its own line fails too). Either give every pattern a leading paren, e.g. \$(case \$x in (a) echo A;; (*) echo Z;; esac), or move the case out of the \$( ... ) (or use if/elif). The other measured cause is an unterminated array literal — \`x=(a b\` with no closing \`)\`, also \`declare -a x=(a b\` and \`local x=(a b\`: \`bash -n\` prints \"unexpected EOF\" but exits 0, and the file fails at runtime. Verify locally with (a non-empty output IS a failure, whatever the exit status):
   /bin/bash -n <file>
 then push again:
   git push origin $BRANCH

@@ -23,15 +23,28 @@
 # them. shellcheck -s bash does not catch it either — it is a raw bash-3.2
 # PARSER limitation, not a shellcheck-recognized anti-pattern.
 #
-# Four layers, matching this codebase's own established convention (see
+# A SECOND way to fail, found by the gate round 5 review (gate_run ga-aejgdn):
+# an unterminated array literal (`x=(a b` at EOF, `declare -a x=(a b`,
+# `local x=(a b`, `x=(a (b)`) makes `/bin/bash -n` PRINT the parse error and
+# still EXIT 0 — the file fails at runtime. The check took its verdict from the
+# exit status alone, so it recorded such a file as measured-clean (bash32-ok).
+# The classifier now takes the status AND the diagnostic (status 2, or status 0
+# with anything printed, is a failure); layers 1, 1b and 2 pin that.
+#
+# Layers, matching this codebase's own established convention (see
 # gate-guard-ab-base-test-check.selftest.sh, the sibling this file copies
 # its shape from):
 #   0. Confirms the fixtures actually reproduce the divergence on THIS
 #      machine's real /bin/bash vs the PATH bash — and that the remedy the
 #      refusal text recommends really does parse — without this, the rest of
 #      the test would be exercising fixtures that prove nothing.
-#   1. Pure-function unit tests of gate_bash32_verdict, run under the real
+#   1. Pure-function unit tests of gate_bash32_verdict and of
+#      gate_bash32_parse_class (status x diagnostic), run under the real
 #      /bin/bash 3.2 (the interpreter the guard actually runs under).
+#   1b. A corpus: the REAL /bin/bash -n on each construct (the exit-0-with-a-
+#      printed-error shapes, the exit-2 shapes, and well-formed controls),
+#      its actual (status, diagnostic) fed to the classifier — the class is
+#      tested against the parser, not against a description of it.
 #   2. The LIVE Step 5b-pre3 block — extracted verbatim from the guard between
 #      its SELFTEST-EXTRACT sentinels and executed under /bin/bash 3.2 against
 #      a real git repo with an origin remote (only log/err/set_gate_status/bd
@@ -39,7 +52,9 @@
 #      block here, which is why it passed while the live code had defects.
 #      Covers: bad add (refused), clean add (proceeds), no .sh touched, bad
 #      file outside the protected trees, missing branch, a RENAMED-and-edited
-#      bad file (refused), a non-ASCII path (refused), `git diff` failing (must
+#      bad file (refused), a non-ASCII path (refused), four unterminated array
+#      literals (bash -n exits 0 but prints the error — refused; well-formed
+#      arrays proceed), `git diff` failing (must
 #      be nao-consegui-medir, never sem-sh-alterado), a failed fetch with stale
 #      refs (must not measure the stale commit), an UNSET RIG_PATH / BEAD_ID /
 #      BRANCH (must fail open AND be recorded — it used to skip the whole check
@@ -233,23 +248,101 @@ else
     "$(verdict 0 abc 0)" "nao-consegui-medir"
 fi
 
-# gate_bash32_parse_class: what ONE `/bin/bash -n` exit status means. Measured
-# on this machine's real 3.2.57 (2 = syntax error, 0 = clean, 126 = unreadable,
-# 127 = missing); only 0 and 2 are verdicts about the FILE.
+# gate_bash32_parse_class <status> <diagnostic>: what ONE `/bin/bash -n` run
+# means. The parser gives TWO signals and the verdict comes from both. Measured
+# on this machine's real 3.2.57: 2 = syntax error, 126 = unreadable, 127 =
+# missing, 0 + nothing printed = clean — and 0 + a printed parse error for an
+# unterminated array literal (gate_run ga-aejgdn: the status alone read that as
+# measured-clean). Status 2, or status 0 with ANY diagnostic, is a failure.
 parse_class() {
   /bin/bash -c 'GATE_GUARD_LIB_ONLY=1 . "$1"; shift; gate_bash32_parse_class "$@"' _ "$GUARD" "$@" 2>/dev/null
 }
 _PC_SYN=$(printf 'x=$(case $1 in a) echo A;; *) echo Z;; esac)\n' > "${TMPDIR:-/tmp}/gate-b32-pc.$$.sh"; /bin/bash -n "${TMPDIR:-/tmp}/gate-b32-pc.$$.sh" >/dev/null 2>&1; echo $?)
 rm -f "${TMPDIR:-/tmp}/gate-b32-pc.$$.sh"
 eq "sanity: the real /bin/bash -n exits 2 on a syntax error (the status the classifier keys on)" "$_PC_SYN" "2"
-eq "parse_class 0 (clean parse) -> ok"                              "$(parse_class 0)"   "ok"
-eq "parse_class 2 (syntax error) -> fail"                           "$(parse_class 2)"   "fail"
-eq "parse_class 126 (file unreadable / not executable) -> unmeasured, NOT fail" "$(parse_class 126)" "unmeasured"
-eq "parse_class 127 (file missing) -> unmeasured, NOT fail"         "$(parse_class 127)" "unmeasured"
-eq "parse_class 137 (parser killed, e.g. under memory pressure) -> unmeasured, NOT fail" "$(parse_class 137)" "unmeasured"
-eq "parse_class 1 (any other non-zero) -> unmeasured"               "$(parse_class 1)"   "unmeasured"
-eq "parse_class '' (no status at all) -> unmeasured, NOT ok"        "$(parse_class "")"  "unmeasured"
-eq "parse_class garbled -> unmeasured"                              "$(parse_class abc)" "unmeasured"
+_PC_DIAG="x.sh: line 2: unexpected EOF while looking for matching \`)'"
+eq "parse_class 0 + empty diagnostic (clean parse) -> ok"                      "$(parse_class 0 "")"            "ok"
+eq "parse_class 0 + a diagnostic (parse error printed, exit 0) -> fail, NOT ok" "$(parse_class 0 "$_PC_DIAG")"   "fail"
+_PC_DIAG2=$(printf '%s\n%s' "$_PC_DIAG" "$_PC_DIAG")
+eq "parse_class 0 + a multi-line diagnostic -> fail"                           "$(parse_class 0 "$_PC_DIAG2")"  "fail"
+eq "parse_class 0 with NO diagnostic argument at all -> unmeasured (an omitted signal is 'don't know', not 'nothing printed'), NOT ok" "$(parse_class 0)" "unmeasured"
+eq "parse_class 2 + empty diagnostic (syntax error) -> fail"                   "$(parse_class 2 "")"            "fail"
+eq "parse_class 2 + a diagnostic -> fail"                                      "$(parse_class 2 "$_PC_DIAG")"   "fail"
+eq "parse_class 2 with no diagnostic argument -> fail (the status alone still convicts)" "$(parse_class 2)"      "fail"
+eq "parse_class 126 (file unreadable / not executable) -> unmeasured, NOT fail" "$(parse_class 126 "")"          "unmeasured"
+eq "parse_class 126 + a diagnostic ('cannot execute') -> unmeasured, NOT fail — a parser that did not run is not a verdict on the file" "$(parse_class 126 "bash: cannot execute")" "unmeasured"
+eq "parse_class 127 (file missing) -> unmeasured, NOT fail"                    "$(parse_class 127 "")"          "unmeasured"
+eq "parse_class 137 (parser killed, e.g. under memory pressure) -> unmeasured, NOT fail" "$(parse_class 137 "")"  "unmeasured"
+eq "parse_class 1 (any other non-zero) -> unmeasured"                          "$(parse_class 1 "")"            "unmeasured"
+eq "parse_class '' (no status at all) -> unmeasured, NOT ok"                   "$(parse_class "" "")"           "unmeasured"
+eq "parse_class '' + a diagnostic -> unmeasured (no status: the parser did not reach a verdict)" "$(parse_class "" "$_PC_DIAG")" "unmeasured"
+eq "parse_class garbled -> unmeasured"                                         "$(parse_class abc "")"          "unmeasured"
+
+# ── 1b. Corpus: the REAL /bin/bash -n on each construct -> the classifier ─────
+# Gate round 5 (gate_run ga-aejgdn, BLOCKING): the verdict came from `bash -n`'s
+# exit status alone, and bash 3.2 prints a parse error for an UNTERMINATED ARRAY
+# LITERAL yet exits 0 — the file was recorded as measured-clean while the parser
+# itself said it did not parse (and it fails at runtime). The unit tests above
+# only feed the classifier hand-made (status, diagnostic) pairs; this section
+# feeds it what the real parser actually produced, one construct at a time, so the
+# claim "every way a file fails to parse is refused" is tested against the parser
+# and not against our description of it. Three kinds:
+#   third  — exit 0 + a printed error (the third state; a runtime failure too)
+#   exit2  — the shape the check was built for (exit 2 + a printed error)
+#   clean  — well-formed code that must NEVER be refused (no new false red)
+echo "── 1b. corpus: the real /bin/bash -n on each construct -> classifier verdict ──"
+CORPUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gate-b32-corpus.XXXXXX")"
+CORPUS_FILES=""
+corpus() {   # <name> <want: ok|fail> <kind: third|exit2|clean> <file body>
+  local name="$1" want="$2" kind="$3" body="$4" f rc=0 rrc=0 diag got
+  f="$CORPUS_DIR/$name.sh"
+  CORPUS_FILES="$CORPUS_FILES $f"
+  printf '%s\n' "$body" > "$f"
+  diag=$(/bin/bash -n "$f" 2>&1) || rc=$?
+  got=$(parse_class "$rc" "$diag")
+  eq "corpus $name ($kind): the real bash -n output is classified $want" "$got" "$want"
+  case "$kind" in
+    third)
+      if [ "$rc" -eq 0 ] && [ -n "$diag" ]; then
+        ok "corpus $name: reproduces on THIS /bin/bash — bash -n exits 0 AND prints a parse error (the third state; the exit status alone reads it as clean)"
+      else
+        bad "corpus $name: fixture assumption broken — bash -n rc=$rc diagnostic='$diag' (expected rc=0 + a printed error); the third-state fixtures below prove nothing on this machine"
+      fi
+      /bin/bash "$f" >/dev/null 2>&1 || rrc=$?
+      [ "$rrc" -ne 0 ] \
+        && ok "corpus $name: the same file FAILS at runtime under /bin/bash 3.2 (rc=$rrc) — refusing it is right, not over-strict" \
+        || bad "corpus $name: the file RUNS fine under /bin/bash 3.2 (rc=0) — then rc=0 + a diagnostic might not be a real failure; re-check the rule" ;;
+    exit2)
+      [ "$rc" -eq 2 ] && [ -n "$diag" ] \
+        && ok "corpus $name: bash -n exits 2 and prints a diagnostic (the shape the status alone already caught)" \
+        || bad "corpus $name: expected bash -n rc=2 + a diagnostic, got rc=$rc diagnostic='$diag'" ;;
+    clean)
+      [ "$rc" -eq 0 ] && [ -z "$diag" ] \
+        && ok "corpus $name: bash -n exits 0 and prints nothing (a genuinely clean file)" \
+        || bad "corpus $name: expected a clean parse, got rc=$rc diagnostic='$diag' — the control is not clean, the 'no false red' claim is void" ;;
+  esac
+}
+# third-state shapes (exit 0 + a printed error) — the reviewer's four, plus the
+# reviewer's own end-to-end repro body (servers=(alpha beta / echo "starting").
+corpus arr-eof-echo       fail third $'#!/usr/bin/env bash\nservers=(alpha beta\necho "starting"'
+corpus arr-eof            fail third $'#!/usr/bin/env bash\nx=(a b'
+corpus arr-declare        fail third $'#!/usr/bin/env bash\ndeclare -a x=(a b'
+corpus arr-local          fail third $'#!/usr/bin/env bash\nf() {\n  local x=(a b\n}'
+corpus arr-nested-paren   fail third $'#!/usr/bin/env bash\nx=(a (b)'
+# exit-2 shapes (the check's original target and the ordinary ways to break a file)
+corpus case-in-subst      fail exit2 $'#!/usr/bin/env bash\nx=a\nresult=$(case "$x" in\n  a) echo A;;\n  *) echo Z;; esac)\necho "$result"'
+corpus missing-fi         fail exit2 $'#!/usr/bin/env bash\nif true; then\n  echo hi'
+corpus unterminated-quote fail exit2 $'#!/usr/bin/env bash\necho "hi'
+corpus stray-paren        fail exit2 $'#!/usr/bin/env bash\necho a )'
+# clean controls: well-formed arrays (the exact constructs the fix must not refuse)
+corpus arr-clean          ok   clean $'#!/usr/bin/env bash\nx=(a b)\necho "${x[@]}"'
+corpus arr-declare-clean  ok   clean $'#!/usr/bin/env bash\ndeclare -a x=(a b)\necho "${x[@]}"'
+corpus arr-local-clean    ok   clean $'#!/usr/bin/env bash\nf() {\n  local x=(a b)\n  echo "${x[@]}"\n}\nf'
+corpus arr-multiline-clean ok  clean $'#!/usr/bin/env bash\nx=(\n  a\n  b\n)\necho "${x[@]}"'
+corpus empty-file         ok   clean ''
+# shellcheck disable=SC2086
+rm -f $CORPUS_FILES
+rmdir "$CORPUS_DIR" 2>/dev/null || true
 
 # ── 2. The LIVE block, extracted verbatim, against a real git repo ────────────
 echo "── 2. live Step 5b-pre3 block (extracted from the guard) under /bin/bash 3.2 + real git/origin ──"
@@ -479,6 +572,32 @@ if [ "$_GL_LISTED" = "scripts/vendored.sh" ] && [ "$_GL_SHOW_RC" -ne 0 ]; then
 else
   bad "FATAL fixture: gitlink scenario is vacuous (listed='$_GL_LISTED' show_rc=$_GL_SHOW_RC)"
 fi
+
+# Branch I (gate round 5, BLOCKING): four new scripts, each an UNTERMINATED ARRAY
+# LITERAL — the constructs for which /bin/bash 3.2's `bash -n` prints the parse
+# error and still EXITS 0. The check used to take its verdict from the exit status
+# alone, so this branch was recorded as bash32-ok ("all parse cleanly") while the
+# parser itself said otherwise and every one of the files fails at runtime.
+git -C "$CLONE_DIR" checkout -q main
+git -C "$CLONE_DIR" checkout -q -b feat/arrayeof
+mkdir -p "$CLONE_DIR/scripts"
+printf '#!/usr/bin/env bash\nservers=(alpha beta\necho "starting"\n' > "$CLONE_DIR/scripts/arr-eof.sh"
+printf '#!/usr/bin/env bash\ndeclare -a x=(a b\n'                    > "$CLONE_DIR/scripts/arr-declare.sh"
+printf '#!/usr/bin/env bash\nf() {\n  local x=(a b\n}\n'             > "$CLONE_DIR/scripts/arr-local.sh"
+printf '#!/usr/bin/env bash\nx=(a (b)\n'                              > "$CLONE_DIR/scripts/arr-nested.sh"
+git -C "$CLONE_DIR" add -A
+git -C "$CLONE_DIR" commit -q -m "feat: four scripts with an unterminated array literal (bash -n prints the error, exits 0)"
+git -C "$CLONE_DIR" push -q origin feat/arrayeof
+
+# Branch J (control): well-formed array literals, including a multi-line one. The
+# diagnostic rule must not turn valid code into a refusal.
+git -C "$CLONE_DIR" checkout -q main
+git -C "$CLONE_DIR" checkout -q -b feat/arrayclean
+mkdir -p "$CLONE_DIR/scripts"
+printf '#!/usr/bin/env bash\nx=(a b)\ndeclare -a y=(c d)\nf() {\n  local z=(e f)\n  echo "${z[@]}"\n}\nw=(\n  g\n  h\n)\necho "${x[@]}" "${y[@]}" "${w[@]}"\nf\n' > "$CLONE_DIR/scripts/arrays-ok.sh"
+git -C "$CLONE_DIR" add -A
+git -C "$CLONE_DIR" commit -q -m "feat: a script with well-formed array literals"
+git -C "$CLONE_DIR" push -q origin feat/arrayclean
 git -C "$CLONE_DIR" checkout -q main
 
 RIG_PATH="$TMPD/rig-registered-copy"
@@ -572,6 +691,25 @@ case "$R_LOG" in
   *) bad "live block: modifiedbad record is not changed=1 checked=1 failed=1: '$R_LOG'" ;;
 esac
 
+# --- gate round 5 (BLOCKING): bash -n exits 0 but PRINTS a parse error -> refused ---
+b32_run "$RIG_PATH" feat/arrayeof
+eq "live block: arrayeof (4 new scripts, each an unterminated array literal: bash -n prints the error but EXITS 0) -> bash32-fail, refused (the exit status alone recorded these as bash32-ok)" "$R_VERDICT/$R_RC/$R_FELL" "bash32-fail/1/0"
+case "$R_LOG" in
+  *"changed=4 checked=4 failed=4"*"unrun=0"*) ok "live block: arrayeof is counted changed=4 checked=4 failed=4 unrun=0 (every file measured AND every file failed — not unmeasured)" ;;
+  *) bad "live block: arrayeof record is not changed=4 checked=4 failed=4 unrun=0: '$R_LOG'" ;;
+esac
+eq "live block: arrayeof marks the marker gate-status:error exactly once" "$R_STATUS_ERR" "1"
+for _af in arr-eof arr-declare arr-local arr-nested; do
+  grep -q "scripts/$_af.sh: line" "$R_CALLS" \
+    && ok "live block: arrayeof refusal detail names scripts/$_af.sh with bash -n's own message" \
+    || bad "live block: arrayeof refusal detail does not name scripts/$_af.sh"
+done
+grep -q 'exits 0 but prints a syntax error' "$R_CALLS" \
+  && ok "live block: the refusal text tells the submitter that bash -n can print a syntax error and still exit 0 (a non-empty output IS a failure)" \
+  || bad "live block: the refusal text does not mention the exit-0-with-a-printed-error shape"
+b32_run "$RIG_PATH" feat/arrayclean
+eq "live block: arrayclean (well-formed array literals, one multi-line) -> bash32-ok, proceeds (the diagnostic rule adds no false refusal)" "$R_VERDICT/$R_RC/$R_FELL/$R_STATUS_ERR" "bash32-ok/0/1/0"
+
 # --- gate-fix 3: git show cannot extract a listed file -> counted as UNRUN, never a silent gap ---
 b32_run "$RIG_PATH" feat/gitlinkfail
 eq "live block: gitlinkfail (git diff lists scripts/vendored.sh, git show cannot extract it) -> nao-consegui-medir, proceeds (not bash32-ok, not sem-sh-alterado)" "$R_VERDICT/$R_RC/$R_STATUS_ERR" "nao-consegui-medir/0/0"
@@ -656,12 +794,23 @@ printf '%s\n' "$BAD_BODY" > "$TMPD/topo-clone/docs/tools/x.sh"
 git -C "$TMPD/topo-clone" add -A
 git -C "$TMPD/topo-clone" commit -q -m "feat: bad .sh in the toplevel but OUTSIDE the rig subdir"
 git -C "$TMPD/topo-clone" push -q origin topo/outside
+# The reviewer's end-to-end repro for gate round 5: a script under the rig
+# subdir's scripts/ whose array literal never closes (bash -n: error printed, rc 0).
+git -C "$TMPD/topo-clone" checkout -q main
+git -C "$TMPD/topo-clone" checkout -q -b topo/arraybad
+mkdir -p "$TMPD/topo-clone/.gascity-gastown-hq/scripts"
+printf '#!/usr/bin/env bash\nservers=(alpha beta\necho "starting"\n' > "$TMPD/topo-clone/.gascity-gastown-hq/scripts/deploy.sh"
+git -C "$TMPD/topo-clone" add -A
+git -C "$TMPD/topo-clone" commit -q -m "feat: deploy.sh with an unterminated array literal under the rig subdir"
+git -C "$TMPD/topo-clone" push -q origin topo/arraybad
 TOPO_RIG="$TMPD/topo-clone/.gascity-gastown-hq"
 
 b32_run "$TOPO_RIG" topo/bad
 eq "live block, RIG_PATH=<toplevel>/.gascity-gastown-hq: a bad .sh under the rig's packs/town-deltas/assets -> bash32-fail, refused (root-relative paths from git diff + git show work from a subdir)" "$R_VERDICT/$R_RC" "bash32-fail/1"
 b32_run "$TOPO_RIG" topo/outside
 eq "live block, subdir topology: a bad .sh in the toplevel but OUTSIDE the rig subdir -> sem-sh-alterado (the pathspec is relative to the rig path)" "$R_VERDICT/$R_RC" "sem-sh-alterado/0"
+b32_run "$TOPO_RIG" topo/arraybad
+eq "live block, subdir topology: scripts/deploy.sh with an unterminated array literal (bash -n prints the error, exits 0) -> bash32-fail, refused (recorded as bash32-ok when the verdict came from the status alone)" "$R_VERDICT/$R_RC" "bash32-fail/1"
 
 # --- gate round 4 (BLOCKING): an UNSET input must be RECORDED, never skipped in silence ---
 # The whole check used to sit inside `if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] &&
@@ -769,9 +918,42 @@ else
   ok "guard.sh: no code line pipes the git diff through grep (its exit status decides the list-unread state)"
 fi
 
-echo "$B32_CODE" | grep 'gate_bash32_parse_class "\$_b32_rc"' >/dev/null \
-  && ok "guard.sh: the block classifies bash -n's exit status through gate_bash32_parse_class (only status 2 counts as a syntax failure)" \
-  || bad "guard.sh: the block does not route bash -n's exit status through gate_bash32_parse_class"
+echo "$B32_CODE" | grep -F 'gate_bash32_parse_class "$_b32_rc" "$_b32_err"' >/dev/null \
+  && ok "guard.sh: the block classifies bash -n's exit status AND its diagnostic together through gate_bash32_parse_class (the variable the verdict is decided on is the one that is acted on)" \
+  || bad "guard.sh: the block does not hand BOTH \$_b32_rc and \$_b32_err to gate_bash32_parse_class — a verdict from the status alone records an unterminated array literal (rc 0 + a printed error) as clean"
+# The call that DROPS the diagnostic: any gate_bash32_parse_class call on a code
+# line whose argument list ends after the status. (Comment lines are excluded from
+# B32_CODE, so prose about the old call shape cannot trip this.)
+if echo "$B32_CODE" | grep -E 'gate_bash32_parse_class "\$_b32_rc"[[:space:]]*\)' >/dev/null; then
+  bad "REGRESSION (third state): gate_bash32_parse_class is called with the exit status ONLY — bash -n's own diagnostic is discarded again, so rc 0 + a printed parse error reads as ok"
+else
+  ok "guard.sh: no code line calls gate_bash32_parse_class with the exit status only"
+fi
+# The classifier itself must still read the diagnostic (a caller passing it is
+# not enough if the function ignores it): the 0-arm has to branch on \$2.
+PC_DEF=$(awk '/^gate_bash32_parse_class\(\) \{/,/^}/' "$GUARD")
+if echo "$PC_DEF" | grep -F '"$2"' >/dev/null && echo "$PC_DEF" | grep -F '"$#"' >/dev/null; then
+  ok "guard.sh: gate_bash32_parse_class reads its second argument (the diagnostic) and checks how many arguments it got"
+else
+  bad "guard.sh: gate_bash32_parse_class does not read \$2 / \$# — the diagnostic would be ignored, or an omitted one read as 'nothing printed'"
+fi
+# Prose: the header used to state, as absolutes, that a syntax error exits 2 and a
+# clean parse exits 0 and that "only 0 and 2 are verdicts about the FILE" — both
+# false as measured (an unterminated array literal exits 0 with a printed error),
+# and that comment is what told the next reader an exit-status-only classification
+# was complete. The false sentences must stay gone and the measured shape stated.
+for _false_prose in "a syntax error exits 2, a clean parse 0" "Only 0 and 2 are verdicts" "only status 2 is \"does not parse\""; do
+  if grep -F "$_false_prose" "$GUARD" >/dev/null; then
+    bad "guard.sh: still says '$_false_prose' — an exit-status absolute measured to be false (bash -n exits 0 for an unterminated array literal)"
+  else
+    ok "guard.sh: no longer says '$_false_prose'"
+  fi
+done
+if grep -F 'prints a diagnostic but exits 0' "$GUARD" >/dev/null; then
+  ok "guard.sh: the classifier's doc states the measured exit-0-with-a-diagnostic shape"
+else
+  bad "guard.sh: the classifier's doc does not state that bash -n can print a parse error and still exit 0"
+fi
 
 if echo "$B32_CODE" | grep -E '/bin/bash -n .*\|\|[[:space:]]*\{' >/dev/null; then
   bad "REGRESSION (third state): any non-zero exit of bash -n is counted as a syntax failure again (a killed/unrunnable parser would read as 'does not parse')"
