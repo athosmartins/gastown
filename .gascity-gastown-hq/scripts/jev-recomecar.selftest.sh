@@ -5,7 +5,7 @@
 # Dolt / the supervisor for CPU.
 # Also runs the harness (jev_experiment.py) and the generic report selftest, since the "recomecar"
 # rows share their log and the report's mode guard was generalised for them, and the daily-report
-# wrapper suite, which now carries the recomecar section (T10-T13).
+# wrapper suite, which now carries the recomecar section (T14-T18).
 # Exit: 0 = all pass, non-zero = any failure.
 set -uo pipefail
 renice -n 15 $$ >/dev/null 2>&1 || true

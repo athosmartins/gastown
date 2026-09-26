@@ -18,6 +18,7 @@ BOUNDARY (a task switch inside one session) — defined from the fields the tran
   nudge    a gc nudge / deferred reminder / mail alert was typed into the pane
   sistema  a peer-session message or a scheduled prompt
   bead     the agent claimed a NEW bead (`bd update <id> --claim`) in a session already ≥20 turns deep
+           (beads claimed by ONE assistant turn -- one command, or parallel calls -- are ONE boundary)
 NOT a boundary: the session's first prompt (nothing to restart from), task-notifications (a
 background job finishing = same work), `[Request interrupted]`, slash-commands that only steer the
 CLI (/login, /clear, ...), isMeta expansions (skill text), tool results, and the controller's
@@ -35,13 +36,15 @@ data) + the context size. PII is scrubbed before the text leaves the machine; ro
 
 GROUND TRUTH WITHOUT A JUDGE ("reusou"): in the next 12 assistant turns, did a tool_use cite a bead
 id or absolute FILE path (a directory is a landmark every session already knows — its scratchpad,
-the logs dir — so it never counts; a file the agent wrote inside one does) that (a) was mentioned
-only BEFORE the boundary, (b) is not in the new
-task, (c) was not surfaced again by a tool result / the agent's own text after the boundary, and
-(d) is not in the session's startup preamble (a clean restart re-injects that anyway)? Yes →
-`reusou` (a restart would have cost rediscovery). No, and ≥4 turns were observed → `nao_reusou`.
-Otherwise `nao_sei` (the session ended too soon to say). It is an operational PROXY, and the
-report says so.
+the logs dir — so it never counts; a file the agent wrote inside one does) that (a) the old context
+knew only from BEFORE the boundary -- typed by someone, cited by the agent, or shown by a tool
+result (grep / ls / `bd show` output is the commonest way a path or a bead id is learned), (b) is not
+in the new task, (c) was not surfaced again by a tool result / the agent's own text after the
+boundary, and (d) is not in the session's startup preamble (a clean restart re-injects that anyway)?
+Yes → `reusou` (a restart would have cost rediscovery). No, and ≥4 turns were observed →
+`nao_reusou`. Otherwise `nao_sei` (the session ended too soon to say). It is an operational PROXY,
+and a FLOOR: an agent leaning on old context that leaves no id or path (a decision, a number) reads
+as `nao_reusou`. The report says so.
 
 THIRD STATE, everywhere: Jev down / slow / garbled → jev_recomecaria=None ("nao_sei"), never
 "recomecar". A window too short to judge → "nao_sei". A role with no clean-start sample → no
@@ -58,7 +61,9 @@ be computed is unknown (None, counted apart in the report), never 0.
 
 IDEMPOTENT: a row is keyed (session:uuid, phase). The consumer re-reads the log for keys it already
 wrote, so running twice — or losing the state file — cannot duplicate a line. The state file is
-only a performance cache (skip transcripts that did not change).
+only a performance cache (skip transcripts that did not change). Every boundary of a transcript has
+a key of its own; if two ever shared one, the second is dropped AND counted (`chave_repetida` in the
+run summary), never written twice.
 
 CLI:
   run [--dry-run] [--max-eval N] [--lookback-h H]   one consumer pass, prints ONE JSON line
@@ -461,13 +466,31 @@ def parse_transcript(path: Path):
 
 
 # ── boundaries, verdicts, state text ───────────────────────────────────────────────────────
-def find_boundaries(T: dict, cfg: Config) -> list:
-    """Every task boundary of a parsed transcript, in order, each with what verdict() needs."""
+def _claim_title(head: str, cid: str) -> str:
+    """The title a `bd update <cid> --claim` result printed for THAT bead. One command can claim several beads and its
+    result then carries one line each: take the line that names `cid`; with a single line, take it (the id may be
+    spelled differently there); with several and none naming `cid`, say nothing rather than guess."""
+    found = [(mm.group(1), mm.group(2).strip()) for mm in CLAIM_TITLE_RE.finditer(head)]
+    for bid, title in found:
+        if bid == cid:
+            return title
+    return found[0][1] if len(found) == 1 else ""
+
+
+def _first_seen(seg: dict, ref: str):
+    """Where in the transcript the segment's context first came to KNOW `ref`: the earlier of what someone said (a prompt,
+    a tool input, the agent's own text: first_idx) and what a tool result showed (first_res). None = it never did."""
+    at = [d[ref] for d in (seg["first_idx"], seg["first_res"]) if ref in d]
+    return min(at) if at else None
+
+
+def find_boundaries(T: dict, cfg: Config) -> tuple:
+    """(boundaries, preamble_refs): every task boundary of a parsed transcript, in order, each with what verdict() needs."""
     ev = T["ev"]
     segs = []
 
     def new_seg(start):
-        s = {"start": start, "end": None, "turns": 0, "first_idx": {}, "first_tool": {}, "claimed": set()}
+        s = {"start": start, "end": None, "turns": 0, "first_idx": {}, "first_res": {}, "first_tool": {}, "claimed": set()}
         segs.append(s)
         return s
 
@@ -498,27 +521,49 @@ def find_boundaries(T: dict, cfg: Config) -> list:
                     prev["text"] = (prev["text"] + " || " + x["text"])[:4000]
                     prev["task_refs"] = prev["task_refs"] | x["refs"]
                 else:
-                    out.append({"idx": i, "kind": x["bkind"], "uuid": x["uuid"], "ts": x["ts"], "ctx": last_ctx,
+                    # A record with no uuid still needs a key of its own: "<session>:None" for two of them was one row.
+                    out.append({"idx": i, "kind": x["bkind"], "uuid": x["uuid"] or f"u{i}", "ts": x["ts"], "ctx": last_ctx,
                                 "seg": cur, "text": x["text"], "task_refs": x["refs"], "claim_id": None,
                                 "turns_at": cur["turns"]})
             if not is_preamble:
                 for r in x["refs"]:
                     cur["first_idx"].setdefault(r, i)
+        elif k == "R":
+            # What a tool result SHOWED the agent is part of what its context knows -- and grep / ls / `bd show` /
+            # `bd list` output is the commonest way an agent learns a path or a bead id. It is kept apart from
+            # first_idx on purpose: first_idx also decides whether a claim is a NEW task ("was this bead already
+            # part of what we were doing?"), and a bead that a `bd ready` listing showed is still a new task when the
+            # agent claims it. Only verdict() reads first_res, together with first_idx (see _first_seen).
+            for r in x["refs"]:
+                cur["first_res"].setdefault(r, i)
+                if x["tool_id"]:  # the result that first showed it is what a restart would have to fetch again
+                    cur["first_tool"].setdefault(r, x["tool_id"])
         elif k == "A":
+            fresh: list = []  # (bead, tool_use id): first claimed by THIS turn, deep enough into the session to be a switch
             for n, cid in enumerate(x["claims"]):
                 if cid not in cur["claimed"] and cid not in cur["first_idx"] and cur["turns"] >= cfg.claim_min_prior_turns:
-                    tool_id = x["claim_tools"][n]
+                    fresh.append((cid, x["claim_tools"][n]))
+                cur["claimed"].add(cid)
+            if fresh:
+                # Beads claimed by ONE assistant turn (`bd update a --claim && bd update b --claim`: one tool_use; or
+                # parallel calls) are ONE task switch -- the agent decided once, like a burst of queued prompts. One
+                # boundary, one key (the first claim's tool_use id is unique per turn), one Jev call. Two boundaries
+                # here would share a key (rows written twice) and sit at the same place in the transcript (the span
+                # between them is then negative, and the first restart loses its number). Gate ga-5hjh44.
+                titles = []
+                for cid, tool_id in fresh:
                     title = ""
                     for y in ev[i + 1:i + 6]:
                         if y["k"] == "R" and y["tool_id"] == tool_id:
-                            m = CLAIM_TITLE_RE.search(y["head"])
-                            title = m.group(2).strip() if m else ""
+                            title = _claim_title(y["head"], cid)
                             break
-                    out.append({"idx": i, "kind": "bead", "uuid": tool_id or f"{i}", "ts": x["ts"], "ctx": x["ctx"],
-                                "seg": cur, "text": f"Reivindicou o bead {cid}: {title}".strip(),
-                                "task_refs": extract_refs(f"{cid} {title}", T["cwd"]), "claim_id": cid,
-                                "turns_at": cur["turns"]})
-                cur["claimed"].add(cid)
+                    titles.append(title)
+                refs: set = set()
+                for (cid, _tid), title in zip(fresh, titles):
+                    refs |= extract_refs(f"{cid} {title}", T["cwd"])
+                out.append({"idx": i, "kind": "bead", "uuid": fresh[0][1] or f"{i}", "ts": x["ts"], "ctx": x["ctx"],
+                            "seg": cur, "text": " || ".join(f"Reivindicou o bead {cid}: {title}".strip() for (cid, _tid), title in zip(fresh, titles)),
+                            "task_refs": refs, "claim_id": fresh[0][0], "turns_at": cur["turns"]})
             cur["turns"] += 1
             last_ctx = x["ctx"] or last_ctx
             for r in x["refs"] | x["text_refs"]:
@@ -554,7 +599,7 @@ def verdict(T: dict, bs: list, n: int, preamble_refs: frozenset, cfg: Config, no
         elif x["k"] == "A":
             turns += 1
             for r in x["refs"] - seen_after:
-                fi = seg["first_idx"].get(r)
+                fi = _first_seen(seg, r)
                 if fi is not None and fi < b["idx"] and r not in preamble_refs and r not in reused:
                     reused.append(r)
             seen_after |= x["refs"] | x["text_refs"]
@@ -850,7 +895,8 @@ def clean_start_by_role(state: dict) -> dict:
 # ── the consumer ───────────────────────────────────────────────────────────────────────────
 def scan_file(path: Path, cfg: Config, now: datetime, logged: dict, cutoff: datetime, stats: dict | None = None):
     """Parse one transcript. Returns (parsed T|None, candidates, fecho_rows, complete). `stats` (optional) collects
-    `sem_timestamp`: new boundaries skipped because their timestamp could not be read."""
+    `sem_timestamp`: new boundaries skipped because their timestamp could not be read, and `chave_repetida`: boundaries
+    skipped because an earlier one in the same transcript already has their key (one key is one row)."""
     T = parse_transcript(path)
     if T is None:
         return None, [], [], True
@@ -862,9 +908,18 @@ def scan_file(path: Path, cfg: Config, now: datetime, logged: dict, cutoff: date
     cands: list = []
     fechos: list = []
     complete = True
+    seen_keys: set = set()
     for n, b in enumerate(bs):
         bt = parse_ts(b["ts"])
         key = f"{T['sid']}:{b['uuid']}"
+        if key in seen_keys:
+            # find_boundaries makes keys unique; this is the seatbelt for whatever it gets wrong next. `logged` is only
+            # read at scan time, so without it two candidates with one key would both be written this run. Dropped AND
+            # counted: a silent drop would read like "nothing there".
+            if stats is not None:
+                stats["chave_repetida"] = stats.get("chave_repetida", 0) + 1
+            continue
+        seen_keys.add(key)
         fr = logged.get((key, "fronteira"))
         if fr is None and (bt is None or bt < cutoff):
             if bt is None and stats is not None:  # "unreadable" is not "older than the lookback": say so, never just drop it
@@ -928,8 +983,8 @@ def _run_locked(cfg: Config, jev_fn, now: datetime, dry_run: bool, max_eval) -> 
     cutoff = now - timedelta(hours=cfg.lookback_h)
     run = {"jev_calls": 0, "jev_failures": 0, "fail_streak": 0}
     summ = {"files_scanned": 0, "files_skipped": 0, "candidates": 0, "rows": 0, "fecho_rows": 0,
-            "deferred": 0, "sem_timestamp": 0, "stopped_by_budget": False, "by_role": {}}
-    scan_stats = {"sem_timestamp": 0}
+            "deferred": 0, "sem_timestamp": 0, "chave_repetida": 0, "stopped_by_budget": False, "by_role": {}}
+    scan_stats = {"sem_timestamp": 0, "chave_repetida": 0}
     cands: list = []
     fechos: list = []
     file_cands: dict = {}
@@ -1005,6 +1060,7 @@ def _run_locked(cfg: Config, jev_fn, now: datetime, dry_run: bool, max_eval) -> 
         _atomic_write(cfg.state_file, json.dumps(st, ensure_ascii=False))
     summ["deferred"] = sum(1 for c in cands if c["key"] not in done_keys) if not dry_run else 0
     summ["sem_timestamp"] = scan_stats["sem_timestamp"]  # per run, over the files scanned in it
+    summ["chave_repetida"] = scan_stats["chave_repetida"]
     summ.update({"jev_calls": run["jev_calls"], "jev_failures": run["jev_failures"],
                  "clean_start": {r: v[0] for r, v in clean.items()}, "seconds": round(time.time() - t0, 1)})
     return summ
@@ -1219,7 +1275,7 @@ def format_section(rows: list, label: str) -> str:
         L.append(f"  above the context threshold: {s['alta']}; Jev answered {s['jev_ok']}, unavailable/unusable {s['jev_nao_sei']} (counted apart, never as 'restart')"
                  + (f"; {s['sem_ctx']} with NO measured context (unknown, not small — left out of the threshold count)" if s["sem_ctx"] else ""))
         L.append(f"  Jev would restart (MEASURED): {s['recomecaria']} = {_fmt_pct(_pct(s['recomecaria'], s['jev_ok']))} of the answered")
-        L.append(f"  of those, agent reused the old context (Jev error, MEASURED proxy): {s['reusou']} of {judged} judged = "
+        L.append(f"  of those, agent reused the old context (Jev error, MEASURED proxy, a floor): {s['reusou']} of {judged} judged = "
                  f"{_fmt_pct(_pct(s['reusou'], judged))}; unjudged (session ended too soon): {s['veredito_nao_sei']}")
         if s["recomecaria"] == 0:
             L.append(f"  savings (ESTIMATED): none — Jev would not restart anything here (Jev's own cost: {s['jev_tokens']:,} tokens, MEASURED)")
@@ -1249,8 +1305,12 @@ def format_section(rows: list, label: str) -> str:
         for r in top:
             L.append(f"  {r['papel']}/{r['tipo']} {r['sessao']} ctx={r['contexto_tokens']:,} left={r['turnos_restantes']} "
                      f"P(dep)={r['p_depende']:.2f} P(done)={r['p_terminou']:.2f} P(cont)={r['p_continuacao']:.2f} → {r['veredito']} gross={_gross(r):,}")
-    L.append("Definitions: 'reused' = a tool call in the next 12 turns cited a bead id/file path seen only before the boundary "
-             "(not in the new task, not resurfaced by new output, not in the startup preamble) — an operational proxy, not a judge.")
+    L.append("Definitions: 'reused' = a tool call in the next 12 turns cited a bead id/file path that the old context knew only from "
+             "before the boundary (typed, cited by the agent, or shown by a tool result; not in the new task, not resurfaced by new "
+             "output, not in the startup preamble) — an operational proxy, not a judge, and a FLOOR: an agent leaning on old context "
+             "that leaves no id or path (a decision, a number) reads as 'did not reuse'.")
+    L.append("Provisional: a boundary's row is written once its 12-turn window has closed, and filed under the day of the boundary "
+             "itself, so the latest day's figures can still grow.")
     return "\n".join(L)
 
 
@@ -1266,10 +1326,10 @@ def format_resumo_pt(rows: list, label: str, curto: bool = False) -> str:
         est = "estimativa" + (f"; piso, {t['sem_base']} recomeço(s) sem número" if t["sem_base"] else "")
         return (f"Recomeçar, acumulado {label}: {t['trocas']} trocas, Jev recomeçaria em {t['recomecaria']} "
                 f"({_fmt_pct(_pct(t['recomecaria'], t['jev_ok']), True)}), erro {_fmt_pct(_pct(t['reusou'], judged), True)} "
-                f"({t['reusou']}/{judged}), economia {eco} ({est}).")
+                f"({t['reusou']}/{judged}, piso), economia {eco} ({est}).")
     L = [f"Recomeçar (sombra, {label}): {t['trocas']} trocas de tarefa; {t['alta']} com contexto acima do limiar; "
          f"Jev recomeçaria em {t['recomecaria']} ({_fmt_pct(_pct(t['recomecaria'], t['jev_ok']), True)} das respondidas)."]
-    L.append(f"Erro do Jev (medido, proxy): o agente reusou o contexto antigo em {t['reusou']} de {judged} julgadas "
+    L.append(f"Erro do Jev (medido, proxy, piso): o agente reusou o contexto antigo em {t['reusou']} de {judged} julgadas "
              f"({_fmt_pct(_pct(t['reusou'], judged), True)}); {t['veredito_nao_sei']} sem veredito (sessão acabou logo).")
     if t["recomecaria"] == 0:
         L.append(f"Economia (estimativa): nenhuma — o Jev não recomeçaria nada (custo do próprio Jev: {_n_pt(t['jev_tokens'])} tokens, medido).")
@@ -1292,6 +1352,7 @@ def format_resumo_pt(rows: list, label: str, curto: bool = False) -> str:
         L.append(f"Nota: {t['aberto']} segmento(s) ainda abertos — a economia deles é um piso.")
     if t["sem_base"]:
         L.append(f"Nota: {t['sem_base']} recomeço(s) sem número calculável (sem amostra de começo limpo ou sem contagem de turnos) — ficaram fora da economia, que é um piso.")
+    L.append("Nota: os números do dia são provisórios — a troca só entra depois que a janela de 12 turnos fecha, então o fim do dia ainda pode crescer.")
     return "\n".join(L)
 
 
@@ -1328,12 +1389,21 @@ def consumer_health(log, now: datetime) -> tuple:
     except OSError:
         return "unknown", f"{log} missing or unreadable"
     last = None
+    skipped = 0  # runs AFTER `last` that only found the lock taken
     for line in tail.splitlines():
         m = _RUNLINE_RE.match(line)
-        if m:
-            last = m
+        if not m:
+            continue
+        if m.group(2) == "0" and '"skipped":' in m.group(3):
+            # A run that found the lock held did not run the consumer. Its line is rc=0 and fresh, so taking it for
+            # "the last run" made a lock pinned by an unrelated live pid read "OK" for as long as it stayed pinned.
+            # Freshness is judged by the last run that really ran; the skips after it are said out loud.
+            skipped += 1
+            continue
+        last, skipped = m, 0
+    note = f"; {skipped} later run(s) skipped (lock held)" if skipped else ""
     if last is None:
-        return "unknown", f"{log} has no run line yet"
+        return "unknown", (f"{log} has only skipped runs (lock held) so far" if skipped else f"{log} has no run line yet")
     ts, rc, rest = parse_ts(last.group(1)), int(last.group(2)), last.group(3)
     if ts is None:
         return "unknown", f"unparseable run timestamp {last.group(1)!r}"
@@ -1344,8 +1414,8 @@ def consumer_health(log, now: datetime) -> tuple:
     if '"disabled": true' in rest:
         return "disabled", when
     if age > HEALTH_STALE_S:
-        return "stale", f"{last.group(1)}, {age / 3600:.1f}h ago"
-    return "ok", f"{last.group(1)}, {int(max(age, 0) // 60)} min ago"
+        return "stale", f"{last.group(1)}, {age / 3600:.1f}h ago{note}"
+    return "ok", f"{last.group(1)}, {int(max(age, 0) // 60)} min ago{note}"
 
 
 def health_line(state: str, detail: str, pt: bool) -> str:

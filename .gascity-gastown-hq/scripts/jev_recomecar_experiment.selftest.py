@@ -404,6 +404,59 @@ def selftest() -> int:
     bs_, vs_ = scenario("epath", edit_path)
     ok("verdict: the FILE PATH of an Edit is a citation of old context", vs_[0]["veredito"] == "reusou" and vs_[0]["evidencias"] == ["/Users/athos/gt/work/old_module.py"])
 
+    # ── what the old context learned ONLY from a tool result is old context too (gate ga-5hjh44, blocking 2) ─────
+    # A path or a bead id is most often learned from grep / ls / `bd show` / `bd list` OUTPUT, never typed by anyone.
+    # Not seeing that made "the agent could not have known this" and "the code did not see where it learned it" the
+    # same answer (nao_reusou) -- and the wrong one, in the direction that makes a restart look safer than it is.
+    HID = "/Users/athos/gt/work/hidden_mod.py"
+
+    def learned_from_result(t):      # the only mention before the boundary is a tool RESULT (a 4000-char grep output)
+        t.turn(335_000, [bash("grep -rn needle /Users/athos/gt/work", "x" * 4000 + f"\n{HID}:12: needle ga-hid01")])
+
+    def cite_hidden(t):
+        t.turn(340_000, [rd(HID)])
+        for _ in range(4):
+            t.turn(341_000, [bash("ls")])
+    bs_, vs_ = scenario("resonly", cite_hidden, before_extra=learned_from_result)
+    ok("verdict: a path the old context saw ONLY in a tool result, cited after the boundary -> reusou (was nao_reusou)",
+       vs_[0]["veredito"] == "reusou" and vs_[0]["evidencias"] == [HID])
+    ok("verdict: ...and its rediscovery is MEASURED from that very result (4000+ chars // 4), not left unmeasured",
+       vs_[0]["redescoberta_tokens"] is not None and 1000 <= vs_[0]["redescoberta_tokens"] <= 1020 and vs_[0]["redescoberta_sem_medida"] == 0)
+
+    def cite_hidden_bead(t):
+        t.turn(340_000, [bash("bd show ga-hid01")])
+        for _ in range(4):
+            t.turn(341_000, [bash("ls")])
+    bs_, vs_ = scenario("resonly_bead", cite_hidden_bead, before_extra=learned_from_result)
+    ok("verdict: same for a bead id that only a tool result showed", vs_[0]["veredito"] == "reusou" and vs_[0]["evidencias"] == ["ga-hid01"])
+
+    def cite_typed_before(t):        # control: the very same path typed into a pre-boundary Bash INPUT was always reuse
+        t.turn(335_000, [bash(f"cat {HID}", "ok")])
+    bs_, vs_ = scenario("typed_ctl", cite_hidden, before_extra=cite_typed_before)
+    ok("verdict: control -- the same path typed into a pre-boundary tool input is reuse, as before", vs_[0]["veredito"] == "reusou")
+
+    def rediscover_hidden(t):        # the agent is SHOWN the path again after the boundary, then cites it: not reuse
+        t.turn(340_000, [bash("ls /Users/athos/gt/work", f"{HID}")])
+        for _ in range(4):
+            t.turn(341_000, [rd(HID)])
+    bs_, vs_ = scenario("resonly_redisc", rediscover_hidden, before_extra=learned_from_result)
+    ok("verdict: a result-only path that a NEW tool result shows again after the boundary is rediscovered, not reused", vs_[0]["veredito"] == "nao_reusou")
+
+    def learned_then_compact(t):
+        learned_from_result(t)
+        t.compact()
+        t.turn(150_000, [bash("ls")])
+    bs_, vs_ = scenario("resonly_compact", cite_hidden, before_extra=learned_then_compact)
+    ok("verdict: a result-only path from BEFORE a compact is not old context of the segment after it", vs_[0]["veredito"] == "nao_reusou")
+
+    def learned_from_preamble_result(t):
+        t.turn(335_000, [bash("cat /Users/athos/gt/pre/preamble-doc.md", "ga-pre11")])
+    def cite_pre(t):
+        for _ in range(5):
+            t.turn(340_000, [bash("cat /Users/athos/gt/pre/preamble-doc.md; bd show ga-pre11")])
+    bs_, vs_ = scenario("resonly_pre", cite_pre, before_extra=learned_from_preamble_result)
+    ok("verdict: a result that shows a preamble ref changes nothing (a clean restart re-injects the preamble)", vs_[0]["veredito"] == "nao_reusou")
+
     # finality
     def few(t):
         t.turn(340_000, [bash("ls")])
@@ -438,6 +491,90 @@ def selftest() -> int:
     ok("claim boundary: only the NEW bead claimed in a session already 20+ turns deep", len(bs5) == 1 and bs5[0]["kind"] == "bead" and bs5[0]["claim_id"] == "ga-second")
     ok("claim boundary: the bead title comes from the claim's own tool result", "Segunda tarefa do dog" in bs5[0]["text"])
     ok("claim boundary: role worker", T5["role"] == "worker")
+
+    # ── beads claimed by ONE assistant turn are ONE task switch, with ONE key (gate ga-5hjh44, blocking 1) ──────
+    # `bd update a --claim && bd update b --claim` is one Bash tool_use, so both claims carry the same tool id -- which
+    # was the boundary's key: two boundaries, one key. The consumer wrote two rows with the identical (key, phase), asked
+    # Jev twice, and the report's span between them came out -1 (both sit at the same place), so the first restart lost
+    # its number. The agent decided ONCE; that is one boundary, exactly as a burst of queued prompts already is.
+    DOG = "/Users/athos/gt/.gascity-gastown-hq/.gc/agents/dogs/gastown.dog-9"
+
+    def claim_session(path: Path, claim_tools, before=None, idle_s=100 * 3600):
+        tx = TX(path, DOG)
+        tx.user(PRE)
+        for i in range(24):
+            tx.turn(200_000 + i * 1000, [bash(f"echo {i}")])
+        if before:
+            before(tx)
+        tx.turn(450_000, claim_tools)
+        for _ in range(14):
+            tx.turn(450_000, [bash("ls")])
+        return tx.write(idle_s=idle_s)
+
+    ONE_CMD = [bash("gc bd update ga-aaa11 --claim && gc bd update ga-bbb22 --claim",
+                    "✓ Updated issue: ga-aaa11 — Primeira tarefa\n✓ Updated issue: ga-bbb22 — Segunda tarefa")]
+    PARALLEL = [bash("gc bd update ga-aaa11 --claim", "✓ Updated issue: ga-aaa11 — Primeira tarefa"),
+                bash("gc bd update ga-bbb22 --claim", "✓ Updated issue: ga-bbb22 — Segunda tarefa")]
+    for label, tools in (("one command", ONE_CMD), ("two parallel calls", PARALLEL)):
+        pc = claim_session(tmp / "projects" / "wproj" / f"claims-{label.replace(' ', '-')}.jsonl", tools)
+        _, bsc, _, vsc = analyze(pc, cfg)
+        ok(f"claims, {label}: two beads claimed by one assistant turn are ONE boundary", len(bsc) == 1 and bsc[0]["kind"] == "bead")
+        ok(f"claims, {label}: it names both beads, each with ITS OWN title (the tool result carries both lines)",
+           "Reivindicou o bead ga-aaa11: Primeira tarefa" in bsc[0]["text"] and "Reivindicou o bead ga-bbb22: Segunda tarefa" in bsc[0]["text"]
+           and {"ga-aaa11", "ga-bbb22"} <= bsc[0]["task_refs"])
+        ok(f"claims, {label}: the boundary's claim_id is the first bead claimed", bsc[0]["claim_id"] == "ga-aaa11")
+
+    cfgC = mkcfg(Path(tempfile.mkdtemp(prefix="jev-recomecar-claims-")))
+    claim_session(cfgC.transcripts / "px" / "claims.jsonl", ONE_CMD, idle_s=30)
+    jev_calls: list = []
+    sC = m.run_once(cfgC, jev_fn=fake_jev(0.02, 0.97, 0.03, log=jev_calls), now=NOW)
+    rowsC = log_rows(cfgC)
+    ok("claims, end to end: ONE row and ONE Jev call for the two beads (was 2 rows with the identical (key, phase) and 2x the Jev tokens)",
+       sC["rows"] == 1 and len(jev_calls) == 1 and len(rowsC) == 1 and len({(r["key"], r["phase"]) for r in rowsC}) == len(rowsC))
+    mC = m.merge_rows(rowsC)
+    ok("claims, end to end: the restart keeps its number -- all 14 turns after the claim are credited (was 'no computable number')",
+       len(mC) == 1 and mC[0]["jev_recomecaria"] is True and mC[0]["credito_jev"] == 14)
+
+    # A boundary with no uuid of its own (a record the writer left without one) must not share a key with the next one:
+    # both used to be "<session>:None".
+    pn = tmp / "projects" / "crewproj" / "nouuid.jsonl"
+    t = TX(pn, cwd_crew)
+    t.user(PRE)
+    t.turn(200_000, [bash("a")])
+    t.user("first task", uuid=None)
+    t.turn(210_000, [bash("b")])
+    t.user("second task", uuid=None)
+    t.turn(220_000, [bash("c")])
+    t.write(idle_s=100 * 3600)
+    _, bsn, _, _ = analyze(pn, cfg)
+    ok("keys: two boundaries whose records carry no uuid still get two different keys (was '<session>:None' twice)",
+       len(bsn) == 2 and all(b["uuid"] for b in bsn) and bsn[0]["uuid"] != bsn[1]["uuid"])
+
+    # Defence in depth: whatever a future boundary kind does, one key is one row. A duplicate is DROPPED AND COUNTED --
+    # a silent drop would read like "nothing there".
+    real_find = m.find_boundaries
+
+    def find_dup(T, c):
+        bs_, pre_ = real_find(T, c)
+        return bs_ + [dict(bs_[0])], pre_
+    cfgD = mkcfg(Path(tempfile.mkdtemp(prefix="jev-recomecar-dup-")))
+    claim_session(cfgD.transcripts / "px" / "dup.jsonl", ONE_CMD, idle_s=30)
+    dup_calls: list = []
+    with mock.patch.object(m, "find_boundaries", find_dup):
+        sD = m.run_once(cfgD, jev_fn=fake_jev(log=dup_calls), now=NOW)
+    ok("dedupe: a boundary key that shows up twice in one run is written ONCE, asked to Jev ONCE, and COUNTED in the run summary",
+       sD["rows"] == 1 and len(dup_calls) == 1 and len(log_rows(cfgD)) == 1 and sD.get("chave_repetida") == 1)
+    ok("dedupe: a clean run reports zero repeated keys (the field is always there, so absence never means 'none')", sC.get("chave_repetida") == 0)
+
+    # Regression guard for the fix of blocking 2: a bead that an earlier `bd ready` RESULT listed is still a NEW task when
+    # the agent claims it. Only what the agent or the user SAID marks a bead as "already part of this task".
+    def listed_first(tx):
+        tx.turn(230_000, [bash("bd ready", "ga-ready1  open  Bead vindo de uma lista")])
+    pr = claim_session(tmp / "projects" / "wproj" / "claim-after-list.jsonl",
+                       [bash("gc bd update ga-ready1 --claim", "✓ Updated issue: ga-ready1 — Bead vindo de uma lista")], before=listed_first)
+    _, bsr, _, _ = analyze(pr, cfg)
+    ok("claims: claiming a bead that a tool result had LISTED is still a boundary (the ordinary way beads are picked up)",
+       len(bsr) == 1 and bsr[0]["claim_id"] == "ga-ready1")
 
     # ── state text (what Jev is shown) ─────────────────────────────────────────────────────
     p6 = tmp / "projects" / "crewproj" / "s6.jsonl"
@@ -1011,6 +1148,19 @@ def selftest() -> int:
     ok("rediscovery: nothing to say when every reuse was measured", "NO measurable" not in m.format_section(rows, "x")
        and "sem tamanho de redescoberta" not in m.format_resumo_pt(rows, "x"))
 
+    # The reuse rate only sees an id or a path that was CITED: an agent leaning on old context that leaves neither (a
+    # decision, a number) reads as "did not reuse". So the figure is a floor of the true dependence -- say so where the
+    # phase-2 decision is read (gate ga-5hjh44). And a day is filed by the boundary's own time but its row is written only
+    # once the 12-turn window closes, so the latest day is provisional.
+    sec_f, pt_f, pt_c = m.format_section(rows, "x"), m.format_resumo_pt(rows, "x"), m.format_resumo_pt(rows, "x", curto=True)
+    ok("floor: the reuse rate is labelled a floor in the full report (with why), the phone summary and the one-line rollup",
+       "a FLOOR" in sec_f and "leaves no id or path" in sec_f and "Erro do Jev (medido, proxy, piso)" in pt_f and "piso)" in pt_c)
+    ok("provisional: the latest day's figures are said to be provisional in the full report and the phone summary",
+       "Provisional:" in sec_f and "provisórios" in pt_f)
+    ok("floor/provisional: the one-line rolling summary is still ONE line", "\n" not in pt_c.strip())
+    ok("floor/provisional: a day with nothing measured has nothing to qualify -- no floor or provisional talk",
+       "piso" not in m.format_resumo_pt([], "x") and "provisórios" not in m.format_resumo_pt([], "x"))
+
     # ── is the consumer alive? An empty report must not read like a quiet day ───────────────────────────────
     def wlog(name, *lines):
         p = tmp / name
@@ -1029,6 +1179,19 @@ def selftest() -> int:
     ok("health: a last run older than 2h -> stale (the order stopped)", m.consumer_health(wlog("w-stale.log", "2026-09-21T06:00:00Z rc=0 {}"), NOW)[0] == "stale")
     ok("health: the off switch is its own state, not 'ok'", m.consumer_health(wlog("w-off.log", '2026-09-21T11:55:00Z rc=0 {"disabled": true}'), NOW)[0] == "disabled")
     ok("health: a torn/garbled last line is not a run", m.consumer_health(wlog("w-torn.log", okline, "2026-09-21T11:5"), NOW)[0] == "ok")
+    # A run that only found the lock taken did NOT run the consumer (gate ga-5hjh44, low): its line is rc=0 and recent, so
+    # judging by "the last line" made a lock pinned by an unrelated live pid read "consumer: OK" forever.
+    skipline = '2026-09-21T11:55:00Z rc=0 {"skipped": "lock held by a live run"}'
+    ok("health: one skipped run after a fresh good one is still ok -- and says a run was skipped",
+       m.consumer_health(wlog("w-skip1.log", okline, skipline), NOW)[0] == "ok"
+       and "1 later run(s) skipped" in m.consumer_health(wlog("w-skip1b.log", okline, skipline), NOW)[1])
+    pin = m.consumer_health(wlog("w-pinned.log", "2026-09-21T06:00:00Z rc=0 {\"rows\": 1}", '2026-09-21T11:40:00Z rc=0 {"skipped": "lock held by a live run"}', skipline), NOW)
+    ok("health: a lock that pins every run for 2h+ is STALE, judged by the last run that really ran (was 'ok' off the skip line)",
+       pin[0] == "stale" and "2026-09-21T06:00:00Z" in pin[1] and "2 later run(s) skipped" in pin[1])
+    ok("health: a tail of nothing but skipped runs is unknown (it cannot say the consumer ever ran), not ok",
+       m.consumer_health(wlog("w-onlyskip.log", skipline), NOW)[0] == "unknown" and "skipped" in m.consumer_health(wlog("w-onlyskip2.log", skipline), NOW)[1])
+    ok("health: a skipped run does not hide the failure before it",
+       m.consumer_health(wlog("w-failskip.log", "2026-09-21T11:30:00Z rc=124 TIMEOUT after 270s", skipline), NOW)[0] == "failed")
     states = ("ok", "failed", "stale", "disabled", "unknown")
     ok("health: every state has an English and a Portuguese line", all(m.health_line(s, "d", False) and m.health_line(s, "d", True) for s in states))
     ok("health: the states that make an empty report look like a quiet day say it is NOT one, in both languages",

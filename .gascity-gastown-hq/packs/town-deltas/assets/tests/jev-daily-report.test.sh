@@ -354,7 +354,7 @@ case "$N" in *"Recomeçar, acumulado 7 dias até 2026-09-20: 2 trocas"*) ok "T14
 case "$N" in *"controle 2 alerta(s); experimento 2, dos quais 1 silenciado(s) pelo Jev."*"Redução de alertas (medida): 50,0%."*"~3680 = 46,0%."*) ok "T14 the suppression numbers are EXACTLY T1's — recomecar rows did not leak into them" ;; *) nok "T14 pollution" "$N" ;; esac
 case "$N" in *"recomecar: controle"*|*"recomecar (sombra)"*) nok "T14 pollution" "an experiment named recomecar was summarized as a suppression/shadow experiment: $N" ;; *) ok "T14 no suppression/shadow line for the recomecar experiment" ;; esac
 GEN="$(awk '/^== recomecar/{exit} {print}' "$F")"
-case "$GEN" in *recomecar*|*recomecar*) nok "T14 pollution in the full report" "the generic part of the file mentions recomecar: $GEN" ;; *) ok "T14 the generic part of the full report does not mention recomecar at all" ;; esac
+case "$GEN" in *recomecar*|*Recomecar*|*recomeçar*|*Recomeçar*) nok "T14 pollution in the full report" "the generic part of the file mentions recomecar: $GEN" ;; *) ok "T14 the generic part of the full report does not mention recomecar at all" ;; esac
 
 # T15: a day with NO recomecar rows still says so (silence would look like "the job never ran").
 run 2026-09-25

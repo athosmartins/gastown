@@ -103,12 +103,12 @@ def load_events(date: str | None, experiment: str | None) -> list[dict]:
             except json.JSONDecodeError:
                 continue  # a corrupt line is data-quality noise, not a reason to crash the report
             if ev.get("mode") in ("quem-pensa", "preambulo"):
-                # ga-aijm2v.9 / ga-aijm2v.7 ("preambulo", jev_preambulo_report.py): these have their own tables
-                # (jev_quem_pensa_report.py, jev_preambulo_report.py).
-                # summarize() below treats any mode it does not know as a suppression-experiment
-                # "experiment arm" event, so letting them through would count every one as a
-                # fired alert. Skipped here, not in summarize(), so the mode list there stays
-                # exactly what each front owns.
+                # ga-aijm2v.9 / ga-aijm2v.7: these have their own tables (jev_quem_pensa_report.py,
+                # jev_preambulo_report.py), so they are dropped at the source and no summarizer here
+                # ever sees them. summarize() below skips EVERY event that names a mode (ga-aijm2v.8),
+                # so this line is no longer what keeps them out of the suppression counts; it stays
+                # because load_events() feeds all the summarizers and the quem-pensa and preambulo
+                # selftests pin it.
                 continue
             if date and not _filing_ts(ev).startswith(date):
                 continue
