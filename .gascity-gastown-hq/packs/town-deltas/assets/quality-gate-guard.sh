@@ -792,12 +792,18 @@ set_gate_status() {
 # two into one outcome would either strand real work or never free a
 # genuinely-abandoned slot — see caller for the "no branch found" evidence
 # this depends on.
+# ga-8upzkk: has_live_assignee is THREE-valued — 1 (owner session live), 0
+# (owner confirmed gone) or "unknown" (could not read the owner). "unknown"
+# is skip:indeterminate whatever the branch says: a strip acts on "no owner",
+# and "could not read the owner" must never be read as that. Existing callers
+# only ever pass 0/1, so for them nothing changes.
 # Returns: strip:merged | strip:no-branch | skip:already-handled | skip:live-builder | skip:not-merged | skip:indeterminate
 classify_inflight_gap1() {
   local status="$1" has_gate_passed="$2" has_live_assignee="$3" branch_merged="$4"
   [ "$status" = "closed" ]       && { echo "skip:already-handled"; return; }
   [ "$has_gate_passed" = "1" ]   && { echo "skip:already-handled"; return; }
   [ "$has_live_assignee" = "1" ] && { echo "skip:live-builder"; return; }
+  [ "$has_live_assignee" = "unknown" ] && { echo "skip:indeterminate"; return; }
   case "$branch_merged" in
     1)    echo "strip:merged" ;;
     0)    echo "skip:not-merged" ;;
@@ -1868,6 +1874,80 @@ reviewer_session_alive() {
   fi
 }
 # SELFTEST-EXTRACT reviewer-session-alive-fn: END
+
+# bead_owner_session_state <bead_show_json> <sessions_json>
+# Pure, THREE-state read of "does this bead's assignee still own it through a
+# session?" — echoes exactly one of:
+#   live    — the assignee matches a non-closed session that is not in a hard-
+#             dead state. "asleep" counts as live (see below).
+#   gone    — the bead was read fine and it has no assignee, OR the session
+#             list was read fine (a non-empty array) and holds no such session
+#             for the assignee.
+#   unknown — could not tell: the bead JSON is unreadable, or the session list
+#             is unparseable, has no sessions array, or is empty. An empty
+#             list is treated as "the read gave nothing", not as "no session
+#             exists": a running city always has sessions (this one included),
+#             and the GAP-1 callers fall back to "{}" when the session-list
+#             read fails, so empty and failed are the same observation.
+#
+# ga-8upzkk: the GAP-1 never-branched release (strip story:in-flight from a bead
+# that never got a branch) asked session_matches_author "is the assignee
+# alive?" — but that predicate counts `asleep` as DEAD, which is right for a
+# branch AUTHOR at the gate and wrong for the owner of a bead that is a
+# persistent crew: a sleeping crew is still the owner and wakes on its own.
+# Measured 25-26/09 on wa-qbwxm (an Athos P0, batista-wa): the crew slept
+# before it had pushed a branch, the sweep read "no live assignee", stripped
+# the label, and the card fell into Travadas while its owner was merely asleep;
+# the Mayor re-added the label by hand twice. The hard-dead set here is the
+# same one reviewer_session_alive uses (the other predicate that keeps `asleep`
+# alive, for the same reason) — a session in drained/closed/archived/
+# quarantined/failed-create no longer owns anything, so those still strip.
+# session_matches_author is deliberately NOT changed: it is shared with the
+# merged-branch path, GAP-2 and the dispatcher's author_is_alive, and ga-625z4
+# made asleep read dead there on purpose — widening it would change those
+# callers too, which this fix has not audited.
+bead_owner_session_state() {
+  local show_json="${1:-}" sessions_json="${2:-}" assignee state
+  if ! printf '%s' "$show_json" | jq -e \
+       'if type=="array" then .[0] else . end | type=="object" and ((.id // "") != "")' >/dev/null 2>&1; then
+    echo unknown; return 0
+  fi
+  assignee=$(printf '%s' "$show_json" | jq -r \
+       'if type=="array" then .[0] else . end | (.assignee // "")' 2>/dev/null) || { echo unknown; return 0; }
+  [ "$assignee" = "null" ] && assignee=""
+  [ -z "$assignee" ] && { echo gone; return 0; }
+  state=$(printf '%s' "$sessions_json" | jq -r --arg a "$assignee" \
+       'def owner_dead_states: ["drained","closed","archived","quarantined","failed-create"];
+        (if type=="array" then . else (.sessions // null) end) as $rows
+        | if ($rows | type) != "array" or ($rows | length) == 0 then "unknown"
+          else
+            ([$rows[] | select(type=="object")
+              | select(.closed != true)
+              | select((.state // "") as $s | ($s == "" or (owner_dead_states | index($s)) == null))
+              | (.session_name, .name, .alias, .id, .agent_name)]
+             | map(select(. != null and . != ""))
+             | index($a)) as $hit
+            | if $hit != null then "live" else "gone" end
+          end' 2>/dev/null) || state=""
+  case "$state" in
+    live|gone|unknown) echo "$state" ;;
+    *)                 echo unknown ;;   # jq failed or printed something unexpected: not a verdict
+  esac
+}
+
+# gap1_never_branched_action <bead_show_json> <sessions_json>
+# The one decision both GAP-1 never-branched call sites (HQ sweep and the
+# rig-DB sweep) act on, so they cannot drift apart: what to do with an open
+# story:in-flight bead for which NO branch was found. Owner live (incl. asleep)
+# → skip:live-builder; owner gone → strip:no-branch; owner unreadable →
+# skip:indeterminate (the inert state — never strip on a read that failed).
+gap1_never_branched_action() {
+  case "$(bead_owner_session_state "${1:-}" "${2:-}")" in
+    live) classify_inflight_gap1 open 0 1 none ;;
+    gone) classify_inflight_gap1 open 0 0 none ;;
+    *)    classify_inflight_gap1 open 0 unknown none ;;
+  esac
+}
 
 # _gate_delivery_header_class <line> — ga-1yxyt: classifies a single candidate
 # section-header line as "scope" (a SCOPE/WORK header: FIX PEDIDO,
@@ -3961,6 +4041,7 @@ for RIGSCAN_CITY in $RIGSCAN_PATHS; do
         RIGSCAN_OI_ASSIGNEE=$(echo "$RIGSCAN_OI_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
 
         RIGSCAN_HAS_LIVE_ASSIGNEE=0
+        RIGSCAN_SESSION_JSON=""
         if [ -n "$RIGSCAN_OI_ASSIGNEE" ] && [ "$RIGSCAN_OI_ASSIGNEE" != "null" ]; then
           RIGSCAN_SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
           [ "$(session_matches_author "$RIGSCAN_OI_ASSIGNEE" "$RIGSCAN_SESSION_JSON")" = "1" ] && RIGSCAN_HAS_LIVE_ASSIGNEE=1
@@ -3999,8 +4080,18 @@ for RIGSCAN_CITY in $RIGSCAN_PATHS; do
           continue
         fi
 
-        RIGSCAN_ACTION=$(classify_inflight_gap1 "open" "0" "$RIGSCAN_HAS_LIVE_ASSIGNEE" "none")
+        # ga-8upzkk: the strict HAS_LIVE_ASSIGNEE above (asleep = dead) stays for
+        # the early skip; the never-branched strip decides on the 3-state owner
+        # read instead — a sleeping persistent crew still owns its bead, and an
+        # unreadable bead/session list must skip, not strip.
+        RIGSCAN_ACTION=$(gap1_never_branched_action "$RIGSCAN_OI_SHOW" "$RIGSCAN_SESSION_JSON")
         case "$RIGSCAN_ACTION" in
+          skip:live-builder)
+            log "GAP-1: $RIGSCAN_OI_ID has no branch yet, but its assignee ($RIGSCAN_OI_ASSIGNEE) still owns it through a non-closed session (asleep counts: a persistent crew wakes on its own) — safe-skip, keeping story:in-flight (rig=$RIGSCAN_CITY, ga-8upzkk)"
+            ;;
+          skip:indeterminate)
+            log "GAP-1: $RIGSCAN_OI_ID has no branch, but its owner could not be read (bd show or the session list came back unreadable/empty) — safe-skip, never strip on an unread owner (rig=$RIGSCAN_CITY, ga-8upzkk)"
+            ;;
           strip:no-branch)
             warn "GAP-1: $RIGSCAN_OI_ID has no branch matching fix/$RIGSCAN_OI_ID*, feat/$RIGSCAN_OI_ID*, feature/$RIGSCAN_OI_ID*, refactor/$RIGSCAN_OI_ID*, docs/$RIGSCAN_OI_ID*, chore/$RIGSCAN_OI_ID*, test/$RIGSCAN_OI_ID*, or crew/*/$RIGSCAN_OI_ID*, no live assignee, no gate:passed, no pilot:dispatched (rig=$RIGSCAN_CITY) — never actually started, stripping story:in-flight (ga-bz4nsi)"
             bd -C "$RIGSCAN_CITY" comment "$RIGSCAN_OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true
@@ -4092,6 +4183,7 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
       OI_ASSIGNEE=$(echo "$OI_SHOW" | jq -r '.assignee // ""' 2>/dev/null || echo "")
 
       HAS_LIVE_ASSIGNEE=0
+      SESSION_JSON=""
       if [ -n "$OI_ASSIGNEE" ] && [ "$OI_ASSIGNEE" != "null" ]; then
         SESSION_JSON=$(bash "$GC_CITY/scripts/gc-session-list-cached.sh" 2>/dev/null || echo "{}")
         [ "$(session_matches_author "$OI_ASSIGNEE" "$SESSION_JSON")" = "1" ] && HAS_LIVE_ASSIGNEE=1
@@ -4133,8 +4225,15 @@ if [ "$INFLIGHT_COUNT" -gt 0 ]; then
           log "GAP-1: $OI_ID — no branch matching fix/$OI_ID*, feat/$OI_ID*, feature/$OI_ID*, refactor/$OI_ID*, docs/$OI_ID*, chore/$OI_ID*, test/$OI_ID*, or crew/*/$OI_ID*, but git is not usable for this city (no work tree or no origin remote) — cannot trust the empty result, safe-skip (ga-bz4nsi)"
           continue
         fi
-        ACTION=$(classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "none")
+        # ga-8upzkk: see the RIGSCAN twin above — same 3-state owner decision.
+        ACTION=$(gap1_never_branched_action "$OI_SHOW" "$SESSION_JSON")
         case "$ACTION" in
+          skip:live-builder)
+            log "GAP-1: $OI_ID has no branch yet, but its assignee ($OI_ASSIGNEE) still owns it through a non-closed session (asleep counts: a persistent crew wakes on its own) — safe-skip, keeping story:in-flight (ga-8upzkk)"
+            ;;
+          skip:indeterminate)
+            log "GAP-1: $OI_ID has no branch, but its owner could not be read (bd show or the session list came back unreadable/empty) — safe-skip, never strip on an unread owner (ga-8upzkk)"
+            ;;
           strip:no-branch)
             warn "GAP-1: $OI_ID has no branch matching fix/$OI_ID*, feat/$OI_ID*, feature/$OI_ID*, refactor/$OI_ID*, docs/$OI_ID*, chore/$OI_ID*, test/$OI_ID*, or crew/*/$OI_ID*, no live assignee, no gate:passed, no pilot:dispatched — never actually started, stripping story:in-flight (ga-bz4nsi)"
             bd -C "$GC_CITY" comment "$OI_ID" "ga-bz4nsi GAP-1 reconciler: stripped orphaned story:in-flight — no fix/feat/feature/refactor/docs/chore/test/crew branch was ever found for this bead, no live assignee, no gate:passed, no pilot:dispatched. This is the never-started shape (not merged-and-forgotten): the lane slot was leaked before any build began. Self-healed." 2>/dev/null || true

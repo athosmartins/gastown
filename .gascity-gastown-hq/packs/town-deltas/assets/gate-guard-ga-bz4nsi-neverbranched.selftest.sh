@@ -195,8 +195,14 @@ printf '%s\n' $_MOCK_LABEL_ADD_LOG | grep -x "story:approved" >/dev/null \
 unset -f bd
 
 echo "── 3. drift-guard: GAP-1 loop actually wires the new case in, not a bare skip ──"
-if grep -Fq 'continue' "$GUARD" && grep -Fq 'classify_inflight_gap1 "open" "0" "$HAS_LIVE_ASSIGNEE" "none"' "$GUARD"; then
-  ok "GAP-1's 'no branch found' path calls classify_inflight_gap1 with branch_merged=none"
+# ga-8upzkk: the call sites no longer name classify_inflight_gap1 directly —
+# they decide through gap1_never_branched_action, which feeds the classifier
+# branch_merged=none (the never-branched input) in each of its owner outcomes.
+# Assert BOTH halves so the wiring cannot be cut at either joint.
+if grep -Fq 'continue' "$GUARD" \
+   && grep -Fq 'gap1_never_branched_action "$OI_SHOW" "$SESSION_JSON"' "$GUARD" \
+   && grep -Fq 'classify_inflight_gap1 open 0 0 none' "$GUARD"; then
+  ok "GAP-1's 'no branch found' path calls classify_inflight_gap1 with branch_merged=none (via gap1_never_branched_action, ga-8upzkk)"
 else
   bad "GAP-1's 'no branch found' path does NOT call classify_inflight_gap1(...,\"none\") — regression to the old unconditional safe-skip (ga-bz4nsi)"
 fi

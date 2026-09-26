@@ -524,6 +524,12 @@ eq "'none' is NOT the same outcome as not-merged (0)" "$(classify_inflight_gap1 
 [ "$(classify_inflight_gap1 open 0 0 0)" != "$(classify_inflight_gap1 open 0 0 none)" ] \
   && ok "skip:not-merged and strip:no-branch are distinct outcomes (a real building branch is never released)" \
   || bad "REGRESSION: 'not merged yet' and 'never branched' collapsed to the same outcome — would abandon real in-progress work"
+# ga-8upzkk: has_live_assignee is three-valued. "unknown" (owner unreadable) must
+# skip whatever the branch says — "could not read the owner" is never "no owner".
+eq "unknown owner + 'none' → skip:indeterminate (never strip on an unread owner)" "$(classify_inflight_gap1 open   0 unknown none)" "skip:indeterminate"
+eq "unknown owner + merged → skip:indeterminate"                                  "$(classify_inflight_gap1 open   0 unknown 1)"    "skip:indeterminate"
+eq "closed still wins over an unknown owner"                                      "$(classify_inflight_gap1 closed 0 unknown none)" "skip:already-handled"
+eq "live owner still wins over an unknown-shaped branch"                          "$(classify_inflight_gap1 open   0 1 unknown)"    "skip:live-builder"
 
 # ── 6. classify_parent_gap2 (ga-pa36 GAP-2: parent-story stranding) ──────────
 # Signature: classify_parent_gap2 <has_pilot_dispatched> <has_live_assignee> <sling_found> <sling_needs_fix> <sling_closed> [sling_refused]
