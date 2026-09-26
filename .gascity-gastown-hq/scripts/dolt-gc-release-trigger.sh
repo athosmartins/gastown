@@ -236,6 +236,9 @@ _trg_backoff_s() {
   local n="$1" s="$GC_TRIGGER_BACKOFF_BASE_S" max="$GC_TRIGGER_BACKOFF_MAX_S" i=1
   case "$max" in ''|*[!0-9]*) max=7200 ;; esac
   case "$s" in ''|*[!0-9]*) s=300 ;; esac
+  # Operator knobs: "0300" is 300, not octal 192, and "0900" must not abort (see _gc_headroom_ok). Normalized
+  # BEFORE the early return below, which echoes $max into the caller's $(( now + backoff )).
+  max=$(( 10#$max )); s=$(( 10#$s ))
   case "$n" in ''|*[!0-9]*) echo "$max"; return ;; esac
   while [ "$i" -lt "$n" ] && [ "$s" -lt "$max" ]; do s=$(( s * 2 )); i=$(( i + 1 )); done
   [ "$s" -gt "$max" ] && s="$max"
@@ -343,8 +346,11 @@ _trg_outcome_read() {
 #                  for the whole run (an S3 proof + dolt_gc of an ~8 GB hq can outlast any idle limit), and the
 #                  state keeps the epoch it had when the run began — so "old state" alone is a false alarm
 #                  during a healthy long run (ga-mb57np gate round 2, INFO).
-#   stale          none of the above: not running, or running for longer than any healthy run takes (the
-#                  stuck-holder alert reports that; calling it "alive" would hide it)
+#   stale          none of the above: not running, or running for <max_run_s> or longer (the stuck-holder alert
+#                  reports that; calling it "alive" would hide it). <max_run_s> is the SAME number as the alert's
+#                  limit — pass $(( $(_dgm_stuck_limit_h) * 3600 )) — and the boundary is the alert's too (at
+#                  exactly the limit the alert fires, so the run is no longer "alive-running"): two thresholds for
+#                  "a run that is too long" would have a healthy 3-4h run read as hung AND alive at once.
 #   absent / unreadable   no state file / not one complete record
 # Read-only; used by the ga-mb57np prod-test (which cannot use a fixed idle limit) and unit-tested here.
 _trg_liveness() {
@@ -361,7 +367,7 @@ _trg_liveness() {
   dec="$(_trg_state_decision "$f")"
   case "$dec" in
     *" (running)")
-      if [ "$age" -le "$maxrun" ] && _dgm_lock_held "$lockdir" "$re"; then echo alive-running; return 0; fi ;;
+      if [ "$age" -lt "$maxrun" ] && _dgm_lock_held "$lockdir" "$re"; then echo alive-running; return 0; fi ;;
   esac
   echo stale
 }
@@ -438,6 +444,7 @@ _trg_poll() {
   # A backoff never reaches further ahead than its own cap: one written under a clock that ran fast
   # (or by a hand edit) must not hold the trigger inert for days. Both kinds.
   max_s="$GC_TRIGGER_BACKOFF_MAX_S"; case "$max_s" in ''|*[!0-9]*) max_s=7200 ;; esac
+  max_s=$(( 10#$max_s ))   # an operator knob: "08" must not abort the poll, "0300" is 300 (see _gc_headroom_ok)
   [ "$_TRG_NEXT" -gt $(( now + max_s )) ] && _TRG_NEXT=$(( now + max_s ))
   [ "$_TRG_DNEXT" -gt $(( now + max_s )) ] && _TRG_DNEXT=$(( now + max_s ))
 
@@ -465,7 +472,7 @@ _trg_poll() {
   #    once-per-holder alert. It is never stolen from.
   if _dgm_lock_held "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE"; then
     if _dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance"; then
-      _TRG_NOTE="its holder has had the lock for over ${GC_MAINT_LOCK_STUCK_H}h — see the ALERT line above"
+      _TRG_NOTE="its holder has had the lock for over $(_dgm_stuck_limit_h)h — see the ALERT line above"
       _trg_record "$now" "WAIT maintenance-stuck"; return 0
     fi
     _trg_record "$now" "WAIT maintenance-running"; return 0

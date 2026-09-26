@@ -159,6 +159,16 @@ GC_TRIGGER_BACKOFF_BASE_S=300; GC_TRIGGER_BACKOFF_MAX_S=7200
 [ "$(_trg_backoff_s 1)" = "300" ] && [ "$(_trg_backoff_s 2)" = "600" ] && [ "$(_trg_backoff_s 3)" = "1200" ] && [ "$(_trg_backoff_s 5)" = "4800" ] && ok "backoff: 1→300s, 2→600s, 3→1200s, 5→4800s (doubles)" || bad "backoff series: $(_trg_backoff_s 1) $(_trg_backoff_s 2) $(_trg_backoff_s 3) $(_trg_backoff_s 5)"
 [ "$(_trg_backoff_s 6)" = "7200" ] && [ "$(_trg_backoff_s 40)" = "7200" ] && [ "$(_trg_backoff_s 400)" = "7200" ] && ok "backoff: capped at 7200s (and no overflow for a huge attempt count)" || bad "backoff cap: $(_trg_backoff_s 6) $(_trg_backoff_s 40) $(_trg_backoff_s 400)"
 [ "$(_trg_backoff_s abc)" = "7200" ] && [ "$(_trg_backoff_s "")" = "7200" ] && ok "backoff: a non-numeric attempt count backs off to the cap (never to 0)" || bad "backoff garbage: '$(_trg_backoff_s abc)' '$(_trg_backoff_s "")'"
+# ga-11vdhe gate round 1: an operator knob is a whole number even when zero-padded. "0300" used to be octal 192
+# (a silently wrong backoff), "08"/"09" aborted the shell ("value too great for base"), and the bad-attempt-count
+# path echoed the RAW cap ("07200") into the caller's $(( now + backoff )).
+_bo() { ( GC_TRIGGER_BACKOFF_BASE_S="$1"; GC_TRIGGER_BACKOFF_MAX_S="$2"; _trg_backoff_s "$3" ) 2>>"$T/bo.err"; }
+rm -f "$T/bo.err"; _bo_a="$(_bo 0300 07200 1) $(_bo 0300 07200 2) $(_bo 0300 07200 3) $(_bo 0300 07200 6) $(_bo 0300 07200 abc)"
+[ "$_bo_a" = "300 600 1200 7200 7200" ] && ok "backoff: a zero-padded base/cap (0300 / 07200) is 300 / 7200 — not octal, and the bad-count path echoes a plain 7200" || bad "backoff padded 0300/07200: got '$_bo_a'"
+_bo_b="$(_bo 08 0100 1) $(_bo 08 0100 2) $(_bo 08 0100 4) $(_bo 08 0100 5) $(_bo 09 09 1)"
+[ "$_bo_b" = "8 16 64 100 9" ] && ok "backoff: base 08 / cap 0100 → 8, 16, 64, capped at 100 (08 and 09 do not abort)" || bad "backoff padded 08/09: got '$_bo_b'"
+[ ! -s "$T/bo.err" ] && ok "backoff: ...and none of the padded cases wrote to stderr" || bad "backoff padded stderr: '$(head -c 200 "$T/bo.err")'"
+unset -f _bo; unset _bo_a _bo_b
 
 # ═══ trigger_main end to end ═════════════════════════════════════════════════════════════
 # Real: state file, streak file, own lock, log, clock arithmetic, decision order.
@@ -568,6 +578,19 @@ poll
 [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && [ "$(sget next_allowed)" = "$((NOW+7200))" ] && ok "backoff: a next_allowed 10 days ahead is clamped to now+cap (7200s)" || bad "clamp: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
 GC_NOW_EPOCH=$((NOW+7200)); poll
 [ "$KICKS" -eq 1 ] && ok "backoff: ...and the trigger resumes when the CAP elapses, not when the skewed timestamp does" || bad "clamp: still inert at now+cap (kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)')"
+# the cap is an operator knob too (ga-11vdhe gate round 1): "08" used to abort the poll before it decided anything
+# (rc 1, no heartbeat), and "0300" was octal 192. Each poll runs in a subshell so an abort fails the assertion
+# instead of the selftest; stderr must stay empty.
+for _row in 08:8 09:9 0300:300 07200:7200; do
+  _k="${_row%%:*}"; _want="${_row#*:}"
+  reset_main; AVAIL=12486; GC_TRIGGER_BACKOFF_MAX_S="$_k"
+  printf 'poll=%s decision=WAIT backoff attempts=2 next_allowed=%s\n' "$((NOW-10))" "$((NOW+864000))" > "$GC_TRIGGER_STATE"
+  ( trigger_main ) >/dev/null 2>"$T/poll.err"
+  { [ "$(sget poll)" = "$NOW" ] && [ "$(sdec)" = "WAIT backoff" ] && [ "$(sget next_allowed)" = "$((NOW+_want))" ] && [ ! -s "$T/poll.err" ]; } \
+    && ok "backoff: a cap written '$_k' is $_want — the poll runs (heartbeat rewritten), clamps next_allowed to now+$_want, stderr empty" \
+    || bad "clamp with cap '$_k': state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' stderr='$(head -c 200 "$T/poll.err")' (want next_allowed=$((NOW+_want)))"
+done
+unset _row _k _want
 
 # (7) The kill switch is a pause, not a reset: the recorded backoff survives GC_TRIGGER_ENABLED=0.
 reset_main; AVAIL=12486
@@ -778,6 +801,31 @@ done
 unset _lim _lim_ok
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_MAINT_LOCK_STUCK_H=6; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-4*3600))"; poll
 [ "$(sdec)" = "WAIT maintenance-running" ] && [ "$(nnotify)" = "0" ] && ok "stuck: the limit is a knob — 4h with GC_MAINT_LOCK_STUCK_H=6 is still in flight" || bad "stuck knob: dec='$(sdec)' notify=$(nnotify)"
+# a ZERO-PADDED limit is that number (ga-11vdhe gate round 1). It used to pass the digits-only check and then
+# abort the poll in $(( )) — octal: "08"/"09" → "value too great for base", rc 1, NO state rewrite (no heartbeat),
+# no alert, and with a healthy 1-minute-old holder too — while "010" silently meant 8. Each poll runs in a
+# subshell so an abort fails the assertion instead of the selftest; the heartbeat and stderr are checked.
+_pad_ok=1
+for _row in 08:7:maintenance-running 08:9:maintenance-stuck 09:8:maintenance-running 09:10:maintenance-stuck 010:9:maintenance-running 010:11:maintenance-stuck 0003:2:maintenance-running 0003:3:maintenance-stuck; do
+  _k="${_row%%:*}"; _r="${_row#*:}"; _hh="${_r%%:*}"; _want="${_r#*:}"
+  reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_MAINT_LOCK_STUCK_H="$_k"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-_hh*3600))"
+  ( trigger_main ) >/dev/null 2>"$T/poll.err"
+  _wn=0; [ "$_want" = "maintenance-stuck" ] && _wn=1
+  { [ "$(sdec)" = "WAIT $_want" ] && [ "$(sget poll)" = "$NOW" ] && [ "$(nnotify)" = "$_wn" ] && [ ! -s "$T/poll.err" ]; } \
+    || { _pad_ok=0; echo "    (limit '$_k', a ${_hh}h holder: dec='$(sdec)' want 'WAIT $_want', heartbeat='$(sget poll)', notify=$(nnotify) want $_wn, stderr='$(head -c 120 "$T/poll.err")')"; }
+done
+[ "$_pad_ok" = "1" ] && ok "stuck: a zero-padded limit (08, 09, 010, 0003) is read as that whole number — decided right at the boundary, the poll always writes its heartbeat, nothing on stderr" || bad "stuck: a zero-padded limit changed the behaviour (see lines above)"
+unset _pad_ok _row _k _r _hh _want _wn
+# the state note must name the limit the alert USED, not the raw knob: a garbled knob alerted at 3h and the note
+# said "over abch" (decided-on variable != reported variable)
+for _row in abc:3 08:8 0:3; do
+  _k="${_row%%:*}"; _want="${_row#*:}"
+  reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_MAINT_LOCK_STUCK_H="$_k"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-11*3600))"; poll
+  grep -q "its holder has had the lock for over ${_want}h" "$DOLT_GC_MAINT_LOG" && grep -q "(limit ${_want}h)" "$DOLT_GC_MAINT_LOG" \
+    && ok "stuck: with GC_MAINT_LOCK_STUCK_H='$_k' the state note and the ALERT line both say ${_want}h (the limit that was decided)" \
+    || bad "stuck note with knob '$_k': want 'over ${_want}h' + '(limit ${_want}h)' in: $(grep -h 'over \|limit' "$DOLT_GC_MAINT_LOG" | head -3)"
+done
+unset _row _k _want
 # a NEW holder (different pid) is a new incident; a dead holder is not "stuck" (its lock is reclaimable)
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; poll
 sleep 300 & _H2=$!
@@ -837,6 +885,29 @@ _hold "$GC_TRIGGER_LOCKDIR" "$_L" "$((NOW-2000))"
 _lvw "$((NOW-2000))" "KICK release (running)"; [ "$(_lv)" = "alive-running" ] && ok "liveness: state 33 min old but its decision is '(running)' and the trigger lock is held by a live matching pid → alive-running (the healthy long run)" || bad "liveness running: '$(_lv)'"
 _lvw "$((NOW-2000))" "KICK direct (running)"; [ "$(_lv)" = "alive-running" ] && ok "liveness: ...for a direct run too" || bad "liveness running direct: '$(_lv)'"
 _lvw "$((NOW-20000))" "KICK release (running)"; [ "$(_lv)" = "stale" ] && ok "liveness: a '(running)' state older than the run ceiling (4h) is stale — a hung run must not read as alive (the stuck alert reports it)" || bad "liveness running too long: '$(_lv)'"
+# the ceiling's boundary is the stuck alert's (>=): at exactly the ceiling a run is no longer "alive-running"
+_hold "$GC_TRIGGER_LOCKDIR" "$_L" "$((NOW-14400))"
+_lvw "$((NOW-14400))" "KICK release (running)"; [ "$(_lv)" = "stale" ] && ok "liveness: a '(running)' run exactly AT the ceiling is stale — the alert's own boundary (>=)" || bad "liveness at ceiling: '$(_lv)'"
+_lvw "$((NOW-14399))" "KICK release (running)"; [ "$(_lv)" = "alive-running" ] && ok "liveness: ...and one second under the ceiling is still alive-running" || bad "liveness under ceiling: '$(_lv)'"
+# ga-11vdhe gate round 1 (info): two thresholds for "a run that is too long" would read a healthy 3-4h run as hung
+# (the alert, at 3h) AND alive (the prod-test's old hard-coded 4h) at once. The prod-test now passes the alert's own
+# effective limit as the ceiling; this asserts the property that makes that enough: for every limit and for ages
+# just under / at / just over it, the alert says "stuck" exactly when liveness says "not alive-running".
+_al_ok=1
+for _k in 3 08 010 abc; do
+  GC_MAINT_LOCK_STUCK_H="$_k"; _lim="$(_dgm_stuck_limit_h)"
+  for _d in -1 0 1; do
+    _age=$(( _lim * 3600 + _d ))
+    rm -f "$GC_TRIGGER_LOCKDIR.stuck-alerted"; _hold "$GC_TRIGGER_LOCKDIR" "$_L" "$((NOW-_age))"; _lvw "$((NOW-_age))" "KICK release (running)"
+    _v="$(_lv 900 "$(( _lim * 3600 ))")"
+    _dgm_lock_stuck_check "$GC_TRIGGER_LOCKDIR" sleep x trigger >/dev/null 2>&1; _s=$?
+    { { [ "$_s" -eq 0 ] && [ "$_v" = "stale" ]; } || { [ "$_s" -eq 1 ] && [ "$_v" = "alive-running" ]; }; } \
+      || { _al_ok=0; echo "    (knob '$_k' = ${_lim}h, age ${_age}s: alert rc=$_s but liveness='$_v')"; }
+  done
+done
+[ "$_al_ok" = "1" ] && ok "liveness: at every age around the limit (3h, 8h, 10h, and a garbled knob → 3h) the alert says 'stuck' exactly when liveness says 'not alive-running' — one threshold, not two" || bad "liveness/alert disagree (see lines above)"
+unset _al_ok _k _lim _d _age _v _s; GC_MAINT_LOCK_STUCK_H=3
+_hold "$GC_TRIGGER_LOCKDIR" "$_L" "$((NOW-2000))"; rm -f "$GC_TRIGGER_LOCKDIR.stuck-alerted"
 _lvw "$((NOW-2000))" "KICK release (running)"; kill "$_L" 2>/dev/null; wait "$_L" 2>/dev/null
 [ "$(_lv)" = "stale" ] && ok "liveness: '(running)' but the lock's holder is gone (a crashed run left the state behind) → stale" || bad "liveness crashed run: '$(_lv)'"
 rm -rf "$GC_TRIGGER_LOCKDIR"

@@ -138,7 +138,8 @@ GC_MAINT_LOCK_RE="${GC_MAINT_LOCK_RE:-dolt-gc-maintenance}"
 # never stolen from; instead, once its lock is older than this many hours, the first run/poll that
 # sees it says so loudly and notifies ONCE for that holder (see _dgm_lock_stuck_check). 3h is more
 # than one 2h cycle (a run that is merely slow is not flagged) and well under "a day of skipped GC".
-# A garbled or zero value falls back to 3 — never to "no alert".
+# A garbled or zero value falls back to 3 — never to "no alert". A zero-padded whole number ("08") is
+# that number (8), see _dgm_stuck_limit_h.
 GC_MAINT_LOCK_STUCK_H="${GC_MAINT_LOCK_STUCK_H:-3}"
 # ga-11vdhe: what a TRIGGERED run reports back (see _gc_record_outcome). One short file, overwritten
 # by each triggered run; the trigger reads it only when the token it handed the run matches.
@@ -273,12 +274,22 @@ _avail_mb() {
 # pre-gc size. ga-3euoj: GC_MIN_FREE_PCT is no longer a flat 250 — see
 # GC_MIN_FREE_PCT_BASE / _WITH_PRUNE above and _resolve_gc_min_free_pct below
 # for the measured, prune-conditional replacement.
+#
+# ga-11vdhe: the numbers an operator supplies to the headroom/floor gate, the staging release (slack), the
+# release cooldown, the trigger's backoff and the stuck-holder limit are put through `10#` before they meet
+# $(( )) — here, in the functions below, and in dolt-gc-release-trigger.sh. A digits-only check accepts "08"
+# and "0250", and in $(( )) a leading 0 means OCTAL: "08"/"09" abort the shell ("value too great for base";
+# under /bin/bash 3.2 the enclosing command is discarded), and "0250" is silently 168 — for this gate
+# that would quietly lower the free space it demands. (`[ -ge ]` reads decimal and needs no help.)
+# Measured numbers (du, df, the clock) never carry a leading zero and are left alone. NOT covered:
+# PRUNE_KEEP_DAYS and PRUNE_BACKUP_MAX_AGE_H (_prune_plan, _backup_fresh) reach $(( )) with no digits-only
+# check at all — a different fault, in a path that is staged off (PRUNE_ENABLED=0).
 _gc_headroom_ok() {
   local avail="$1" size="$2" pct="$3"
   case "$avail" in ''|*[!0-9]*) return 1 ;; esac
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   case "$pct" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$avail" -ge $(( size * pct / 100 )) ]
+  [ "$avail" -ge $(( size * 10#$pct / 100 )) ]
 }
 
 # _gc_floor_ok <avail_mb> <size_mb> <abs_floor_mb> → 0 = the CRITICAL floor (ga-vs55:
@@ -294,7 +305,7 @@ _gc_floor_ok() {
   case "$avail" in ''|*[!0-9]*) return 1 ;; esac
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   case "$floor" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$avail" -ge $(( size + floor )) ]
+  [ "$avail" -ge $(( size + 10#$floor )) ]
 }
 
 # _gc_required_parts <size_mb> <pct> <floor_mb> → echoes "PCT_MB FLOOR_MB REQUIRED_MB" (REQUIRED
@@ -307,8 +318,8 @@ _gc_required_parts() {
   case "$size" in ''|*[!0-9]*) return 1 ;; esac
   case "$pct" in ''|*[!0-9]*) return 1 ;; esac
   case "$floor" in ''|*[!0-9]*) return 1 ;; esac
-  by_pct=$(( size * pct / 100 ))
-  by_floor=$(( size + floor ))
+  by_pct=$(( size * 10#$pct / 100 ))
+  by_floor=$(( size + 10#$floor ))
   req=$by_pct; [ "$by_floor" -gt "$req" ] && req=$by_floor
   echo "$by_pct $by_floor $req"
 }
@@ -602,7 +613,7 @@ _gc_release_decision() {
   done
   [ "$staging" -gt 0 ] || { echo "REFUSE no-staging"; return 0; }
   [ "$streak" -ge "$min_streak" ] || { echo "REFUSE streak-too-short"; return 0; }
-  [ $(( avail + staging )) -ge $(( required + slack )) ] || { echo "REFUSE would-not-unblock-gc"; return 0; }
+  [ $(( avail + staging )) -ge $(( required + 10#$slack )) ] || { echo "REFUSE would-not-unblock-gc"; return 0; }
   echo "RELEASE"
 }
 
@@ -616,7 +627,7 @@ _gc_release_cooldown_ok() {
   [ -e "$f" ] || return 0
   last="$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')"
   case "$last" in ''|*[!0-9]*) return 1 ;; esac
-  [ $(( now - last )) -ge $(( hrs * 3600 )) ]
+  [ $(( now - last )) -ge $(( 10#$hrs * 3600 )) ]
 }
 
 # _gc_release_writer_active — 0 iff a process that writes the staging is running or we cannot
@@ -802,6 +813,23 @@ _dgm_pos_int() {
   [ "$1" -ge 1 ]
 }
 
+# _dgm_stuck_limit_h → the EFFECTIVE stuck-holder limit in hours, always a plain decimal >= 1: the knob when
+# it is a whole number >= 1, else 3 (garbled, blank, 0, negative, decimal, or too long to multiply safely).
+# It is decided HERE and nowhere else: the alert, the trigger's state note and the prod-test's "a run this old
+# is not alive" ceiling all read it, so what is reported can never differ from what was decided (the state
+# note once printed the raw knob — "over abch" — while the alert had used 3). A zero-padded number is a whole
+# number: "08" is 8. It goes through 10# because in $(( )) a leading 0 is octal — 08/09 abort the shell and
+# 010 would silently mean 8. More than 9 digits is refused before multiplying by 3600 (a wrapped product can
+# come out negative, and a negative limit alerts on every holder).
+_dgm_stuck_limit_h() {
+  # (length first: `[ -ge ]` on a 20-digit string is an error message, not just "false")
+  if [ "${#GC_MAINT_LOCK_STUCK_H}" -le 9 ] && _dgm_pos_int "$GC_MAINT_LOCK_STUCK_H"; then
+    echo $(( 10#$GC_MAINT_LOCK_STUCK_H ))
+  else
+    echo 3
+  fi
+}
+
 # _dgm_mtime <file> → epoch mtime, blank (never 0) when it cannot be read. BSD stat first (macOS),
 # GNU second; anything non-numeric is "unknown".
 _dgm_mtime() {
@@ -869,7 +897,7 @@ _dgm_lock_stuck_check() {
     fi
     return 1 ;;
   esac
-  limit="$GC_MAINT_LOCK_STUCK_H"; _dgm_pos_int "$limit" || limit=3
+  limit="$(_dgm_stuck_limit_h)"
   [ "$age" -ge $(( limit * 3600 )) ] || return 1
   key="${pid}:${mtime}"
   if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then

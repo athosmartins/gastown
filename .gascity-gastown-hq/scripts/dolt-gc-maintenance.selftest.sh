@@ -228,6 +228,46 @@ if [ -n "$CT" ]; then
   _gc_release_cooldown_ok "$CT/e.state" 168 9999999999 && bad "cooldown: empty state file must NOT be ok" || ok "cooldown: empty state file → not ok (fail closed)"
   _gc_release_cooldown_ok "$CT/s.state" "" 9999999999 && bad "cooldown: blank hours must NOT be ok" || ok "cooldown: non-numeric hours → not ok"
   _gc_release_cooldown_ok "$CT/s.state" 168 "" && bad "cooldown: blank clock must NOT be ok" || ok "cooldown: non-numeric now → not ok"
+
+  # ── zero-padded OPERATOR knobs (ga-11vdhe, gate round 1) ──────────────────────────────
+  # A knob written "08" or "0250" passes every digits-only check above, and in $(( )) a leading 0 is OCTAL:
+  # "08"/"09" abort the shell ("value too great for base") and "0250" is silently 168 — for the disk-headroom
+  # gate that would quietly lower the free space it demands. Every assertion runs in a SUBSHELL with stderr
+  # captured: an abort fails that one assertion (and shows the message) instead of taking the selftest down,
+  # and stderr must be empty on the passing path. The values are chosen so octal and decimal DISAGREE at the
+  # boundary — a test that only used "08" would pass on a build that merely stopped aborting.
+  _t()   { if "$@"; then echo yes; else echo no; fi; }
+  _pad() {   # _pad <label> <want> <cmd...> — <cmd> must print <want>, exit 0, and write nothing to stderr
+    local label="$1" want="$2" out rc; shift 2
+    out="$( "$@" 2>"$CT/pad.err" )"; rc=$?
+    if [ "$rc" -eq 0 ] && [ "$out" = "$want" ] && [ ! -s "$CT/pad.err" ]; then ok "padded: $label"
+    else bad "padded: $label — rc=$rc out='$out' (want '$want') stderr='$(head -c 160 "$CT/pad.err")'"; fi
+  }
+  # headroom: pct 0250 = 250 → 200MB needs 500 free; octal 168 would need 336
+  _pad "headroom pct 0250 (=250): exactly the 500 needed passes"                        yes _t _gc_headroom_ok 500 200 0250
+  _pad "headroom pct 0250 (=250): 499 is NOT enough (octal 168 would let it through)"  no  _t _gc_headroom_ok 499 200 0250
+  _pad "headroom pct 08: 200MB needs 16 free, 16 passes"                                yes _t _gc_headroom_ok 16 200 08
+  _pad "headroom pct 08: 15 is not enough"                                              no  _t _gc_headroom_ok 15 200 08
+  _pad "headroom pct 09: 200MB needs 18 free, 17 is not enough"                         no  _t _gc_headroom_ok 17 200 09
+  # floor: 03072 = 3072 → hq 6228 needs 9300; octal 1594 would need 7822
+  _pad "floor 03072 (=3072): exactly the 9300 needed passes"                            yes _t _gc_floor_ok 9300 6228 03072
+  _pad "floor 03072 (=3072): 9299 is NOT enough (octal 1594 would let it through)"      no  _t _gc_floor_ok 9299 6228 03072
+  _pad "floor 08: hq 100 needs 108, 108 passes"                                         yes _t _gc_floor_ok 108 100 08
+  _pad "floor 08: 107 is not enough"                                                    no  _t _gc_floor_ok 107 100 08
+  # the shared gate computation the trigger and the job both use
+  _pad "required_parts pct 0250 / floor 03072 read as 250 / 3072 (octal: 10463 7822 10463)" "15570 9300 15570" _gc_required_parts 6228 0250 03072
+  _pad "required_parts pct 08 / floor 08"                                               "8 108 108"        _gc_required_parts 100 08 08
+  # release decision: slack 0500 = 500 → 3000+3399 free after release is 1 MB short of 6000+500 (octal 320 would RELEASE)
+  _pad "release slack 0500 (=500): 1 MB short of required+slack → REFUSE"               "REFUSE would-not-unblock-gc" _gc_release_decision 53 3399 3000 6000 6 0500
+  _pad "release slack 0500 (=500): exactly required+slack → RELEASE"                    "RELEASE"                     _gc_release_decision 53 3500 3000 6000 6 0500
+  _pad "release slack 08: exactly required+8 → RELEASE"                                 "RELEASE"                     _gc_release_decision 53 3008 3000 6000 6 08
+  _pad "release slack 08: 1 MB short → REFUSE"                                          "REFUSE would-not-unblock-gc" _gc_release_decision 53 3007 3000 6000 6 08
+  # cooldown: 0024 = 24h = 86400s (octal 20h = 72000s would call 80000s enough)
+  _pad "cooldown hours 0024 (=24): 80000s after a release is NOT enough"                no  _t _gc_release_cooldown_ok "$CT/s.state" 0024 $((1000000 + 80000))
+  _pad "cooldown hours 0024 (=24): exactly 86400s is enough"                            yes _t _gc_release_cooldown_ok "$CT/s.state" 0024 $((1000000 + 86400))
+  _pad "cooldown hours 08 (=8): exactly 28800s is enough"                               yes _t _gc_release_cooldown_ok "$CT/s.state" 08   $((1000000 + 28800))
+  _pad "cooldown hours 08 (=8): 28799s is not"                                          no  _t _gc_release_cooldown_ok "$CT/s.state" 08   $((1000000 + 28799))
+  unset -f _pad _t
 fi
 
 # ── _gc_release_writer_active: real function, `ps` stubbed. Only a clean "no such
@@ -643,7 +683,9 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   sk_reset; sk_hold $((4*3600)); GC_MAINT_LOCK_STUCK_H=6; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
   [ "$rc" -eq 1 ] && ok "stuck: GC_MAINT_LOCK_STUCK_H=6 → a 4h holder is still in flight" || bad "stuck knob rc=$rc"
   _sk_lim_ok=1
-  for _lim in abc 0 "" -1 3.5 " 3"; do
+  # (1234567890 is refused as "too long to multiply by 3600 safely"; 9999999999999999 is the 16-digit case whose
+  # product WRAPS NEGATIVE in 64-bit arithmetic — a negative limit would call every holder stuck)
+  for _lim in abc 0 00 "" -1 3.5 " 3" 1234567890 9999999999999999 99999999999999999999; do
     sk_reset; sk_hold $((4*3600)); GC_MAINT_LOCK_STUCK_H="$_lim"; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
     [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] || { _sk_lim_ok=0; echo "    (limit '$_lim': rc=$rc notify=$(skn) — did not fall back to 3h)"; }
     sk_reset; sk_hold $((2*3600)); GC_MAINT_LOCK_STUCK_H="$_lim"; _dgm_lock_stuck_check "$SKL" sleep x; rc=$?
@@ -651,6 +693,31 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   done
   [ "$_sk_lim_ok" = "1" ] && ok "stuck: a garbled/zero/negative/decimal/padded limit falls back to 3h — never to 'no alert', never to 'alert on everything'" || bad "stuck: a bad limit changed the behaviour (see lines above)"
   unset _sk_lim_ok _lim
+  # The EFFECTIVE limit is decided in one place (_dgm_stuck_limit_h) and the alert, the trigger's state note and
+  # the prod-test's ceiling all read it. A zero-padded whole number is that number: in $(( )) a leading 0 is
+  # octal, so "08"/"09" used to abort the check (no alert, exit 1) and "010" silently meant 8 (ga-11vdhe gate round 1).
+  _sk_tbl_ok=1
+  for _row in 3:3 12:12 08:8 09:9 010:10 0003:3 999999999:999999999 0:3 00:3 000:3 :3 abc:3 -1:3 3.5:3 " 3:3" 1234567890:3 9999999999999999:3 99999999999999999999:3; do
+    _k="${_row%:*}"; _want="${_row##*:}"
+    _got="$( GC_MAINT_LOCK_STUCK_H="$_k"; _dgm_stuck_limit_h 2>&1 )"
+    [ "$_got" = "$_want" ] || { _sk_tbl_ok=0; echo "    (knob '$_k': _dgm_stuck_limit_h → '$_got', want '$_want')"; }
+  done
+  [ "$_sk_tbl_ok" = "1" ] && ok "stuck: _dgm_stuck_limit_h → the knob as a plain decimal when it is a whole number 1..999999999 (08→8, 010→10), else 3; nothing on stderr" || bad "stuck: _dgm_stuck_limit_h table (see lines above)"
+  unset _sk_tbl_ok _row _k _want _got
+  # ...and the check itself, at the boundary of each padded limit, in a subshell (an abort fails the assertion, not
+  # the selftest). "010" with a 9h holder is the discriminating case: decimal 10 → in flight; octal 8 → "stuck".
+  _sk_pad_ok=1
+  for _row in 08:7:1 08:8:0 09:8:1 09:9:0 010:9:1 010:10:0 0003:2:1 0003:3:0; do
+    _k="${_row%%:*}"; _r="${_row#*:}"; _hh="${_r%%:*}"; _want="${_r#*:}"     # knob : holder age in hours : expected rc (0 = stuck)
+    sk_reset; sk_hold $((_hh*3600)); GC_MAINT_LOCK_STUCK_H="$_k"
+    ( _dgm_lock_stuck_check "$SKL" sleep x ) 2>"$SK/err"; rc=$?
+    { [ "$rc" -eq "$_want" ] && [ "$(skn)" = "$((1-_want))" ] && [ ! -s "$SK/err" ]; } \
+      || { _sk_pad_ok=0; echo "    (limit '$_k', a ${_hh}h holder: rc=$rc want $_want, notify=$(skn) want $((1-_want)), stderr='$(head -c 120 "$SK/err")')"; }
+  done
+  [ "$_sk_pad_ok" = "1" ] && ok "stuck: a zero-padded limit (08, 09, 010, 0003) decides right at its boundary — no abort, exactly one push when stuck, nothing on stderr" || bad "stuck: a zero-padded limit changed the behaviour (see lines above)"
+  sk_reset; sk_hold $((9*3600)); GC_MAINT_LOCK_STUCK_H=08; ( _dgm_lock_stuck_check "$SKL" sleep x ) >/dev/null 2>&1
+  grep -q '(limit 8h)' "$LOG" && ok "stuck: the ALERT for limit 08 says '(limit 8h)' — the number that was decided, in decimal" || bad "stuck: alert text for limit 08: '$(grep ALERT "$LOG")'"
+  unset _sk_pad_ok _row _k _r _hh _want
   # who counts as a holder
   sk_reset; _DEAD=999999; while kill -0 "$_DEAD" 2>/dev/null; do _DEAD=$((_DEAD+1)); done; sk_hold $((9*3600)) "$_DEAD"
   _dgm_lock_stuck_check "$SKL" sleep x; rc=$?

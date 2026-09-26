@@ -110,10 +110,13 @@ log "$LABEL is installed, lints, points at the deployed script and is registered
 # run that outlasts 15 minutes (S3 proof + dolt_gc of an ~8 GB hq) made this test FAIL while nothing was
 # wrong. The deployed trigger answers it itself (_trg_liveness): alive = rewritten within 900s; alive-running
 # = older, but its decision ends "(running)" AND the trigger lock is held by a live matching pid AND the run
-# began < 4h ago (past that it is a hung run — the stuck-holder alert reports it — not "alive").
+# began less than the STUCK-HOLDER LIMIT ago — the alert's own number (GC_MAINT_LOCK_STUCK_H, default 3h,
+# read from the deployed script so a knob set in the conf file applies here too). Past it the run is hung —
+# the stuck-holder alert reports it — not "alive"; one number for both, so a run can never be reported as
+# hung by the alert and as alive by this test.
 poll_verdict() {  # → alive | alive-running | stale | absent | unreadable (empty if the deployed trigger cannot even be loaded)
   DOLT_GC_TRIGGER_LIB=1 DOLT_GC_MAINT_LOG=/dev/null "$BASH32" -c \
-    '. "$1" && _trg_liveness "$2" "$3" "$4" "$(date +%s)" 900 14400' _ "$TRG" "$STATE" "$TRIGGER_LOCKD" dolt-gc-release-trigger 2>/dev/null
+    '. "$1" && _trg_liveness "$2" "$3" "$4" "$(date +%s)" 900 "$(( $(_dgm_stuck_limit_h) * 3600 ))"' _ "$TRG" "$STATE" "$TRIGGER_LOCKD" dolt-gc-release-trigger 2>/dev/null
 }
 verdict=""; waited=0
 while :; do
