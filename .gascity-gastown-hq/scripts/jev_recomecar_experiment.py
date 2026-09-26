@@ -50,7 +50,11 @@ savings number (None), not a guess.
 SAVINGS (ESTIMATED): (context at boundary − clean-start context of the role) × assistant turns left
 until the next compact / end of session, minus the MEASURED rediscovery proxy (size of the tool
 results that first surfaced the reused refs) when the agent did reuse, minus Jev's own tokens.
-Turns left are a FLOOR while the segment is still open; a later "fecho" row completes it.
+Turns left are a FLOOR while the segment is still open; a later "fecho" row completes it. Each turn is
+credited ONCE, to the restart in force: from a restart until the next one (or the segment's end). The span
+between two boundaries is derived by the report from where they sit in the transcript (turno_antes /
+turno_depois) — never stored in the row, which is written before the next boundary exists. A span that cannot
+be computed is unknown (None, counted apart in the report), never 0.
 
 IDEMPOTENT: a row is keyed (session:uuid, phase). The consumer re-reads the log for keys it already
 wrote, so running twice — or losing the state file — cannot duplicate a line. The state file is
@@ -569,11 +573,14 @@ def verdict(T: dict, bs: list, n: int, preamble_refs: frozenset, cfg: Config, no
     seg_end = seg["end"] if seg["end"] is not None else len(ev)
     segment_closed = (seg_end < len(ev)) or ended  # a compact came after it, or the session went quiet
     turns_left = turn_prefix[seg_end] - turn_prefix[min(b["idx"] + 1, seg_end)]
-    nxt = bs[n + 1] if n + 1 < len(bs) and bs[n + 1]["seg"] is seg else None
-    # Turns until the next boundary OF THE SAME SEGMENT (None for the last one: it runs to the segment's end,
-    # `turns_left`). The report credits a restart only until the next restart — without this a session with 20
-    # boundaries counted the same turns 20 times (measured: a "blind" total of 8.9 BILLION tokens for two days).
-    turns_to_next = (turn_prefix[nxt["idx"]] - turn_prefix[min(b["idx"] + 1, nxt["idx"])]) if nxt is not None else None
+    # WHERE the boundary sits, as a count of assistant turns from the top of the transcript: before its own event
+    # and after it (a claim boundary is itself an assistant turn). These are facts about the transcript that never
+    # change once the boundary exists, so a row can carry them the moment it is written. The turns BETWEEN two
+    # boundaries are derived from them by the report (_credit_turns), never stored: at write time the next boundary
+    # often does not exist yet, and a stored "turns to the next boundary" cannot tell "there is none" from "not seen
+    # yet" -- reading the second as the first credited the successor's turns twice (gate ga-uv2cgn).
+    pos_before = turn_prefix[b["idx"]]
+    pos_after = turn_prefix[min(b["idx"] + 1, seg_end)]
     redisc = 0
     unmeasured = 0
     if reused:
@@ -587,7 +594,7 @@ def verdict(T: dict, bs: list, n: int, preamble_refs: frozenset, cfg: Config, no
                 seen_tools.add(tid)
                 redisc += min(sizes[tid] // 4, cfg.rediscovery_cap_tokens)
     return {"final": final, "veredito": v, "janela_turnos": turns, "evidencias": reused[:3], "n_evidencias": len(reused),
-            "turnos_restantes": turns_left, "turnos_ate_proxima": turns_to_next, "segmento": seg["start"],
+            "turnos_restantes": turns_left, "turno_antes": pos_before, "turno_depois": pos_after, "segmento": seg["start"],
             "segmento_fechado": segment_closed,
             "redescoberta_tokens": redisc if reused else None, "redescoberta_sem_medida": unmeasured}
 
@@ -841,8 +848,9 @@ def clean_start_by_role(state: dict) -> dict:
 
 
 # ── the consumer ───────────────────────────────────────────────────────────────────────────
-def scan_file(path: Path, cfg: Config, now: datetime, logged: dict, cutoff: datetime):
-    """Parse one transcript. Returns (parsed T|None, candidates, fecho_rows, complete)."""
+def scan_file(path: Path, cfg: Config, now: datetime, logged: dict, cutoff: datetime, stats: dict | None = None):
+    """Parse one transcript. Returns (parsed T|None, candidates, fecho_rows, complete). `stats` (optional) collects
+    `sem_timestamp`: new boundaries skipped because their timestamp could not be read."""
     T = parse_transcript(path)
     if T is None:
         return None, [], [], True
@@ -859,6 +867,8 @@ def scan_file(path: Path, cfg: Config, now: datetime, logged: dict, cutoff: date
         key = f"{T['sid']}:{b['uuid']}"
         fr = logged.get((key, "fronteira"))
         if fr is None and (bt is None or bt < cutoff):
+            if bt is None and stats is not None:  # "unreadable" is not "older than the lookback": say so, never just drop it
+                stats["sem_timestamp"] = stats.get("sem_timestamp", 0) + 1
             continue
         v = verdict(T, bs, n, preamble_refs, cfg, now, turn_prefix)
         if fr is None:
@@ -896,7 +906,7 @@ def _row(c: dict, jev: dict, cfg: Config, clean: dict, now: datetime) -> dict:
         "veredito": v["veredito"], "janela_turnos": v["janela_turnos"], "evidencias": v["evidencias"],
         "n_evidencias": v["n_evidencias"], "redescoberta_tokens": v["redescoberta_tokens"],
         "redescoberta_sem_medida": v["redescoberta_sem_medida"], "turnos_restantes": v["turnos_restantes"],
-        "turnos_ate_proxima": v["turnos_ate_proxima"], "segmento": v["segmento"], "segmento_fechado": v["segmento_fechado"],
+        "turno_antes": v["turno_antes"], "turno_depois": v["turno_depois"], "segmento": v["segmento"], "segmento_fechado": v["segmento_fechado"],
     }
 
 
@@ -918,7 +928,8 @@ def _run_locked(cfg: Config, jev_fn, now: datetime, dry_run: bool, max_eval) -> 
     cutoff = now - timedelta(hours=cfg.lookback_h)
     run = {"jev_calls": 0, "jev_failures": 0, "fail_streak": 0}
     summ = {"files_scanned": 0, "files_skipped": 0, "candidates": 0, "rows": 0, "fecho_rows": 0,
-            "deferred": 0, "stopped_by_budget": False, "by_role": {}}
+            "deferred": 0, "sem_timestamp": 0, "stopped_by_budget": False, "by_role": {}}
+    scan_stats = {"sem_timestamp": 0}
     cands: list = []
     fechos: list = []
     file_cands: dict = {}
@@ -944,7 +955,7 @@ def _run_locked(cfg: Config, jev_fn, now: datetime, dry_run: bool, max_eval) -> 
         if fs and fs.get("size") == s.st_size and fs.get("mtime_ns") == s.st_mtime_ns and fs.get("complete"):
             summ["files_skipped"] += 1
             continue
-        T, fc, fe, complete = scan_file(path, cfg, now, logged, cutoff)
+        T, fc, fe, complete = scan_file(path, cfg, now, logged, cutoff, scan_stats)
         summ["files_scanned"] += 1
         if T is not None:
             if T["first_ctx"] and str(path) not in st["first_ctx"]:
@@ -993,6 +1004,7 @@ def _run_locked(cfg: Config, jev_fn, now: datetime, dry_run: bool, max_eval) -> 
                 st["files"][pth]["complete"] = False
         _atomic_write(cfg.state_file, json.dumps(st, ensure_ascii=False))
     summ["deferred"] = sum(1 for c in cands if c["key"] not in done_keys) if not dry_run else 0
+    summ["sem_timestamp"] = scan_stats["sem_timestamp"]  # per run, over the files scanned in it
     summ.update({"jev_calls": run["jev_calls"], "jev_failures": run["jev_failures"],
                  "clean_start": {r: v[0] for r, v in clean.items()}, "seconds": round(time.time() - t0, 1)})
     return summ
@@ -1021,25 +1033,46 @@ def _credit_turns(rows: list) -> None:
     threshold that Jev answered) on each row: the assistant turns a restart there would have saved, counted from
     it until the NEXT restart of the same segment (or the segment's end). A boundary that is not restarted just
     lets the previous restart's saving run on — the agent is still in the clean session. Without this the same
-    turns were credited once per boundary. Done on the full log: a day filter must not cut a chain in half."""
+    turns were credited once per boundary. Done on the full log: a day filter must not cut a chain in half.
+    A credit whose turns cannot be computed is None (unknown), never 0 — _gross() then reports it as such."""
     groups: dict = {}
     for r in rows:
         groups.setdefault((r.get("sessao"), r.get("segmento")), []).append(r)
     for g in groups.values():
-        g.sort(key=lambda r: r.get("fronteira_ts") or "")
+        g.sort(key=lambda r: (r.get("fronteira_ts") or "", r["turno_antes"] if _is_count(r.get("turno_antes")) else 0))
+        spans = _spans(g)
         for field, picked in (("credito_jev", lambda r: r.get("jev_recomecaria") is True),
                               ("credito_cego", lambda r: bool(r.get("jev_ok")) and (r.get("contexto_tokens") or 0) > (r.get("limiar_contexto") or 0))):
             cur = None
-            for r in g:
+            for r, t in zip(g, spans):
                 r[field] = 0
-                t = r.get("turnos_ate_proxima")
-                if t is None:
-                    t = r.get("turnos_restantes") or 0
                 if picked(r):
                     cur = r
                     r[field] = t
                 elif cur is not None:
-                    cur[field] += t
+                    cur[field] = None if cur[field] is None or t is None else cur[field] + t
+
+
+def _is_count(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool) and x >= 0
+
+
+def _spans(g: list) -> list:
+    """For each row of one (session, segment) group, already in boundary order: the assistant turns from its
+    boundary until the NEXT ROW's boundary — or, for the last row, until the segment's end (`turnos_restantes`,
+    a floor while the segment is open). Derived from where the boundaries sit in the transcript (turno_antes /
+    turno_depois), not from a number stored when the row was written: that row is written the moment its
+    12-turn window closes, usually before the next boundary exists (see verdict()). None = cannot be computed
+    (a row without positions, positions that run backwards, no turns-left on the last row): the third state."""
+    out = []
+    for i, r in enumerate(g):
+        if i + 1 == len(g):
+            t = r.get("turnos_restantes")
+        else:
+            a, b = r.get("turno_depois"), g[i + 1].get("turno_antes")
+            t = b - a if _is_count(a) and _is_count(b) else None
+        out.append(t if _is_count(t) else None)
+    return out
 
 
 def select_rows(rows, date: str | None, days: int | None, now: datetime) -> list:
@@ -1062,7 +1095,8 @@ def select_rows(rows, date: str | None, days: int | None, now: datetime) -> list
 
 def _gross(r, field: str = "credito_jev") -> int | None:
     """(context at the boundary - clean start of the role) x the turns CREDITED to this restart (see
-    _credit_turns). None = cannot be computed (no clean-start sample, or rows not run through merge_rows)."""
+    _credit_turns). None = cannot be computed (no clean-start sample, a turn count that could not be derived, or
+    rows not run through merge_rows)."""
     p, c, t = r.get("preambulo_limpo_tokens"), r.get("contexto_tokens"), r.get(field)
     if p is None or c is None or t is None:
         return None
@@ -1140,7 +1174,10 @@ def calibration(rows: list) -> dict:
     out = {"answered": len(hi), "judged": len(judged), "reused": len(reused),
            "base_rate": _pct(len(reused), len(judged)),
            "auc": _auc([r["p_depende"] for r in reused], [r["p_depende"] for r in judged if r["veredito"] != "reusou"]),
-           "blind_gross": sum(g for g in (_gross(r, "credito_cego") for r in hi) if g is not None), "sweep": []}
+           "blind_gross": sum(g for g in (_gross(r, "credito_cego") for r in hi) if g is not None),
+           # a blind restart whose number cannot be computed adds nothing above -- the same 0 as "saved nothing" --
+           # so it is counted apart and the report says the total is a floor
+           "blind_sem_base": sum(1 for r in hi if _gross(r, "credito_cego") is None), "sweep": []}
     for bar in SWEEP_BARS:
         sel = [r for r in hi if r["p_depende"] <= bar and r["p_terminou"] >= 1 - bar and r["p_continuacao"] <= bar]
         j = [r for r in sel if r.get("veredito") in ("reusou", "nao_reusou")]
@@ -1190,7 +1227,7 @@ def format_section(rows: list, label: str) -> str:
             L.append(f"  savings (ESTIMATED): gross {s['bruta']:,} − rediscovery {s['redescoberta']:,} (MEASURED proxy) − Jev {s['jev_tokens']:,} = {_liquida(s):,} tokens"
                      + (f"; {s['redesc_sem_medida']} reused item(s) with NO measurable rediscovery size count as 0 here (savings is a ceiling for them)" if s["redesc_sem_medida"] else "")
                      + (f"; {s['aberto']} still-open segment(s) count only turns seen so far (a floor)" if s["aberto"] else "")
-                     + (f"; {s['sem_base']} without a clean-start sample (no number, not a guess)" if s["sem_base"] else ""))
+                     + (f"; {s['sem_base']} without a clean-start sample or a computable turn count (no number, not a guess)" if s["sem_base"] else ""))
     cal = calibration(rows)
     if cal["answered"]:
         L.append("calibration (MEASURED, boundaries above the threshold that Jev answered):")
@@ -1204,7 +1241,8 @@ def format_section(rows: list, label: str) -> str:
             L.append(f"    bar {sw['bar']:.2f}: {sw['restarts']:>4} / {sw['judged']:>4} / {sw['reused']:>4}"
                      + (f"  ({_fmt_pct(_pct(sw['reused'], sw['judged']))} reused)" if sw["judged"] else ""))
         L.append(f"  a BLIND restart at every one of these boundaries (each credited only until the next restart) would have counted a gross "
-                 f"{cal['blind_gross']:,} tokens (ESTIMATED upper bound, no Jev involved — and {_fmt_pct(cal['base_rate'])} of them lost something the agent then used)")
+                 f"{cal['blind_gross']:,} tokens (ESTIMATED upper bound, no Jev involved — and {_fmt_pct(cal['base_rate'])} of them lost something the agent then used)"
+                 + (f"; {cal['blind_sem_base']} of them have no computable number and are left out, so this total is a floor" if cal["blind_sem_base"] else ""))
     top = sorted((r for r in rows if r.get("jev_recomecaria") is True and _gross(r) is not None), key=_gross, reverse=True)[:10]
     if top:
         L.append("top restart candidates (ctx, turns left, verdict):")
@@ -1224,9 +1262,11 @@ def format_resumo_pt(rows: list, label: str, curto: bool = False) -> str:
     judged = t["reusou"] + t["nao_reusou"]
     if curto:  # one line for the phone: the rolling window is what the phase-2 decision rests on
         eco = "nenhuma" if t["recomecaria"] == 0 else f"~{_n_pt(_liquida(t))} tokens"
+        # a restart with no computable number adds nothing to the total: say so on the line, it is a floor
+        est = "estimativa" + (f"; piso, {t['sem_base']} recomeço(s) sem número" if t["sem_base"] else "")
         return (f"Recomeçar, acumulado {label}: {t['trocas']} trocas, Jev recomeçaria em {t['recomecaria']} "
                 f"({_fmt_pct(_pct(t['recomecaria'], t['jev_ok']), True)}), erro {_fmt_pct(_pct(t['reusou'], judged), True)} "
-                f"({t['reusou']}/{judged}), economia {eco} (estimativa).")
+                f"({t['reusou']}/{judged}), economia {eco} ({est}).")
     L = [f"Recomeçar (sombra, {label}): {t['trocas']} trocas de tarefa; {t['alta']} com contexto acima do limiar; "
          f"Jev recomeçaria em {t['recomecaria']} ({_fmt_pct(_pct(t['recomecaria'], t['jev_ok']), True)} das respondidas)."]
     L.append(f"Erro do Jev (medido, proxy): o agente reusou o contexto antigo em {t['reusou']} de {judged} julgadas "
@@ -1250,6 +1290,8 @@ def format_resumo_pt(rows: list, label: str, curto: bool = False) -> str:
         L.append(f"Nota: {t['redesc_sem_medida']} item(ns) reusado(s) sem tamanho de redescoberta medido — contados como 0, então a economia é um teto para eles.")
     if t["aberto"]:
         L.append(f"Nota: {t['aberto']} segmento(s) ainda abertos — a economia deles é um piso.")
+    if t["sem_base"]:
+        L.append(f"Nota: {t['sem_base']} recomeço(s) sem número calculável (sem amostra de começo limpo ou sem contagem de turnos) — ficaram fora da economia, que é um piso.")
     return "\n".join(L)
 
 
@@ -1326,7 +1368,7 @@ def _cmd_boundaries(path: str, cfg: Config) -> int:
     for n, b in enumerate(bs):
         v = verdict(T, bs, n, pre, cfg, now, tp)
         print(f"{b['ts']} {b['kind']:8s} ctx={b['ctx']:>8,} final={v['final']!s:5} {v['veredito']:10s} turns={v['janela_turnos']:>2} "
-              f"left={v['turnos_restantes']:>4} next={v['turnos_ate_proxima']!s:>4} ev={v['evidencias'][:1]} | {clean_text(b['text'], 90)}")
+              f"left={v['turnos_restantes']:>4} at={v['turno_antes']:>4} ev={v['evidencias'][:1]} | {clean_text(b['text'], 90)}")
     return 0
 
 

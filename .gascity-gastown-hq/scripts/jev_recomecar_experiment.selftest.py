@@ -456,11 +456,14 @@ def selftest() -> int:
     ok("state text: the new task is truncated", len(st) <= cfg.state_text_max and st.count("y") < 2000)
 
     # ── calibration: does Jev's answer tell reuse from no-reuse? ─────────────────────────────
+    crow_at = [0]   # where the next boundary sits in the transcript: each is followed by 10 turns before the next one (the last: turnos_restantes)
+
     def crow(dep, done, cont, verd, ctx=500_000, jok=True):
+        pos, crow_at[0] = crow_at[0], crow_at[0] + 10
         r = {"phase": "fronteira", "key": f"c{dep}{done}{cont}{verd}{ctx}{jok}", "fronteira_ts": "2026-09-20T10:00:00Z", "papel": "mayor",
              "tipo": "humano", "contexto_tokens": ctx, "limiar_contexto": 300_000, "preambulo_limpo_tokens": 150_000, "jev_ok": jok,
              "p_depende": dep, "p_terminou": done, "p_continuacao": cont, "veredito": verd, "turnos_restantes": 10,
-             "turnos_ate_proxima": 10,  # each boundary is followed by 10 turns before the next one (the last: turnos_restantes)
+             "turno_antes": pos, "turno_depois": pos,   # a human boundary is no assistant turn: before == after
              "segmento_fechado": True, "jev_tokens_in": 0, "jev_tokens_out": 0}
         return r
     sep = [crow(.9, .1, .9, "reusou"), crow(.8, .1, .9, "reusou"), crow(.2, .9, .1, "nao_reusou"), crow(.1, .9, .1, "nao_reusou")]
@@ -743,19 +746,21 @@ def selftest() -> int:
 
     # ── report ─────────────────────────────────────────────────────────────────────────────
     def row(role="mayor", tipo="humano", ctx=500_000, rec=True, verd="nao_reusou", clean=150_000, left=100, closed=True, red=None,
-            jok=True, day="2026-09-20", tin=1000, tout=20, nxt=None, sess="abc12345"):
-        # nxt = turns until the NEXT boundary of the segment (None for the last one: it runs to the end, `left`).
+            jok=True, day="2026-09-20", tin=1000, tout=20, pos=None, sess="abc12345"):
+        # pos = where the boundary sits in the transcript, in assistant turns from its top (None: a boundary alone in its
+        # session/segment, which needs no position -- its span is `left`, the turns to the segment's end).
         return {"phase": "fronteira", "key": f"k{role}{tipo}{ctx}{rec}{verd}{left}{day}{jok}", "fronteira_ts": f"{day}T10:00:00Z", "papel": role, "tipo": tipo,
                 "contexto_tokens": ctx, "limiar_contexto": 300_000, "preambulo_limpo_tokens": clean, "jev_ok": jok,
                 "jev_recomecaria": rec if jok else None, "veredito": verd, "turnos_restantes": left, "segmento_fechado": closed,
-                "redescoberta_tokens": red, "jev_tokens_in": tin, "jev_tokens_out": tout, "sessao": sess, "turnos_ate_proxima": nxt,
+                "redescoberta_tokens": red, "jev_tokens_in": tin, "jev_tokens_out": tout, "sessao": sess,
+                "turno_antes": pos, "turno_depois": pos,
                 "p_depende": .05, "p_terminou": .95, "p_continuacao": .05}
     # The mayor's session, in log order (all one segment): r1 restart -100 turns-> r2 restart -20-> r3 no -15-> r4 below the
     # threshold -10-> r5 Jev unavailable -5-> r6 restart, the last one (its 10 turns run to the segment's end).
     # Crew and worker are their own sessions: a chain never crosses sessions.
-    rows = [row(nxt=100), row(verd="reusou", red=5000, left=50, nxt=20),        # mayor: 2 restarts, 1 reused
-            row(rec=False, nxt=15), row(ctx=250_000, rec=False, nxt=10),        # a "no" and a below-threshold
-            row(jok=False, rec=None, nxt=5), row(verd="nao_sei", left=10, closed=False),
+    rows = [row(pos=0), row(verd="reusou", red=5000, left=50, pos=100),          # mayor: 2 restarts, 1 reused
+            row(rec=False, pos=120), row(ctx=250_000, rec=False, pos=135),       # a "no" and a below-threshold
+            row(jok=False, rec=None, pos=145), row(verd="nao_sei", left=10, closed=False, pos=150),
             row(role="crew", clean=None, sess="crew0001"), row(role="worker", ctx=200_000, rec=False, sess="wrk00001")]
     rows = m.merge_rows(rows)   # what the report always does first: it is what credits each restart its turns
     by = m.summarize_rows(rows)
@@ -801,15 +806,16 @@ def selftest() -> int:
     # that is not restarted lets the previous restart's saving run on. Crediting every restart its whole
     # `turnos_restantes` counted the same turns once per boundary: measured on the live log, a "blind" total of
     # 8.9 BILLION tokens for two days. These tests pin the once-only rule directly, not just through a report total.
-    def crd(n, rec, nxt, left, sess="s1", seg=0, jok=True, ctx=500_000, day="2026-09-20"):
+    def crd(n, rec, pos, left, sess="s1", seg=0, jok=True, ctx=500_000, day="2026-09-20"):
+        # pos = where the boundary sits in the transcript (assistant turns from its top); left = turns to the segment's end
         return {"phase": "fronteira", "mode": "recomecar", "experiment": "recomecar", "key": f"cr-{sess}-{seg}-{n}",
                 "fronteira_ts": f"{day}T10:{n:02d}:00Z", "sessao": sess, "segmento": seg, "papel": "mayor", "tipo": "humano",
                 "contexto_tokens": ctx, "limiar_contexto": 300_000, "preambulo_limpo_tokens": 150_000, "jev_ok": jok,
-                "jev_recomecaria": rec if jok else None, "turnos_ate_proxima": nxt, "turnos_restantes": left,
+                "jev_recomecaria": rec if jok else None, "turno_antes": pos, "turno_depois": pos, "turnos_restantes": left,
                 "veredito": "nao_reusou", "segmento_fechado": True, "p_depende": .05, "p_terminou": .95, "p_continuacao": .05,
                 "jev_tokens_in": 0, "jev_tokens_out": 0}
-    # One segment of 100 turns: b1 -10-> b2 -20-> b3 -30-> b4 -40-> end. Jev restarts at b1 and b3 only.
-    seg1 = [crd(1, True, 10, 100), crd(2, False, 20, 90), crd(3, True, 30, 70), crd(4, False, None, 40)]
+    # One segment of 100 turns: b1 at 0 -10-> b2 at 10 -20-> b3 at 30 -30-> b4 at 60 -40-> end. Jev restarts at b1 and b3 only.
+    seg1 = [crd(1, True, 0, 100), crd(2, False, 10, 90), crd(3, True, 30, 70), crd(4, False, 60, 40)]
     c1 = m.merge_rows(seg1)
     ok("credit: a restart is credited the turns until the NEXT restart (b1: 10+20, b3: 30+40), the others nothing",
        [r["credito_jev"] for r in c1] == [30, 0, 70, 0])
@@ -822,21 +828,26 @@ def selftest() -> int:
        m.summarize_rows(c1)["mayor"]["bruta"] == 350_000 * 100)
     ok("credit: input order does not matter (sorted by the boundary's own timestamp)",
        [r["credito_jev"] for r in sorted(m.merge_rows([seg1[3], seg1[1], seg1[0], seg1[2]]), key=lambda r: r["fronteira_ts"])] == [30, 0, 70, 0])
-    early = m.merge_rows([crd(1, None, 5, 105, jok=False), crd(2, True, None, 100)])
+    early = m.merge_rows([crd(1, None, 0, 105, jok=False), crd(2, True, 5, 100)])
     ok("credit: a boundary BEFORE the first restart earns nothing (those turns ran in the old context) and neither does an unanswered one",
        [r["credito_jev"] for r in early] == [0, 100] and [r["credito_cego"] for r in early] == [0, 100])
-    iso = m.merge_rows([crd(1, True, 10, 30, sess="A", seg=0), crd(2, False, 20, 20, sess="A", seg=0),
-                        crd(3, False, None, 7, sess="A", seg=1), crd(4, True, None, 15, sess="B", seg=0)])
+    iso = m.merge_rows([crd(1, True, 0, 30, sess="A", seg=0), crd(2, False, 10, 20, sess="A", seg=0),
+                        crd(3, False, 0, 7, sess="A", seg=1), crd(4, True, 0, 15, sess="B", seg=0)])
     ok("credit: a chain never crosses a segment or a session (A/0: 10+20, A/1: nothing, B/0: its own 15)",
        [r["credito_jev"] for r in iso] == [30, 0, 0, 15])
     ok("credit: a row that never went through merge_rows has no credit, so _gross() is None ('cannot be computed'), never a made-up 0",
        m._gross({"preambulo_limpo_tokens": 150_000, "contexto_tokens": 500_000, "turnos_restantes": 100}) is None
        and m._gross({"preambulo_limpo_tokens": None, "contexto_tokens": 500_000, "credito_jev": 10}) is None)
     # The day filter runs AFTER the credit, on the whole log: a chain that crosses midnight must not be cut in half.
-    two_days = [crd(1, True, 10, 30, day="2026-09-20"), crd(2, False, None, 20, day="2026-09-21")]
-    ok("credit: crediting first and filtering the day after keeps the whole chain (30 turns); filtering first would cut it to 10",
-       m.select_rows(m.merge_rows(two_days), "2026-09-20", None, NOW)[0]["credito_jev"] == 30
-       and m.merge_rows(m.select_rows(two_days, "2026-09-20", None, NOW))[0]["credito_jev"] == 10)
+    two_days = [crd(1, True, 0, 30, day="2026-09-20"), crd(2, False, 10, 20, day="2026-09-21")]
+    ok("credit: a chain that crosses midnight is credited whole (b1: 10 + 20 = 30 turns) when the credit runs before the day filter",
+       m.select_rows(m.merge_rows(two_days), "2026-09-20", None, NOW)[0]["credito_jev"] == 30)
+    # b2 is restarted too, the next day: b1 owns only the 10 turns until it. Filtering the day FIRST would show b1 alone
+    # with its whole tail (30) and credit b2's 20 again the next day -- the same turns counted on two days.
+    two_restarts = [crd(1, True, 0, 30, day="2026-09-20"), crd(2, True, 10, 20, day="2026-09-21")]
+    ok("credit: credit-then-filter gives b1 its own 10 turns; filter-then-credit would hand it all 30 and count b2's 20 again the next day",
+       m.select_rows(m.merge_rows(two_restarts), "2026-09-20", None, NOW)[0]["credito_jev"] == 10
+       and m.merge_rows(m.select_rows(two_restarts, "2026-09-20", None, NOW))[0]["credito_jev"] == 30)
     midnight_log = tmp / "midnight.jsonl"
     midnight_log.write_text("".join(json.dumps(r) + "\n" for r in two_days))
     out = io.StringIO()
@@ -848,10 +859,150 @@ def selftest() -> int:
     ok("credit: the report command itself credits before it filters (savings gross 350k x 30 = 10,500,000 for the 09-20 boundary, not 3,500,000)",
        rc == 0 and "savings (ESTIMATED): gross 10,500,000 " in out.getvalue() and "savings (ESTIMATED): gross 3,500,000 " not in out.getvalue())
 
+    # ── the credit, end to end: a row is written BEFORE its successor boundary exists ───────────────────────
+    # A boundary's row is written as soon as its 12-turn window closes, while the segment is still open -- for a task
+    # longer than 12 turns that is before the NEXT boundary exists. Nothing stored in that row can therefore say "the
+    # next boundary is N turns away": at write time "there is none" and "not seen yet" look the same, and reading the
+    # second as the first credited the successor's turns twice (gate ga-uv2cgn). The hand-made rows above cannot catch
+    # it -- they arrive with the successor already known. These run the consumer TWICE over one growing transcript.
+    YES, NO = (0.02, 0.97, 0.03), (0.9, 0.1, 0.9)
+
+    def seq_jev(*answers):        # answers by call order: the Nth Jev call gets the Nth (dep, done, cont)
+        it = iter(answers)
+        return lambda state, questions: fake_jev(*next(it))(state, questions)
+
+    def two_boundary_session(prefix, between, idle_after):
+        """B1 ("task one", 14 turns), run 1, then `between` more turns of task one, B2 ("task two", 14 turns), run 2.
+        Jev restarts at B1 and not at B2. Returns (cfg, merged rows by boundary time, run-1 summary, run-2 summary)."""
+        cfg_ = mkcfg(Path(tempfile.mkdtemp(prefix=prefix)))
+        tx = TX(cfg_.transcripts / "px" / "growing.jsonl", cwd_crew)
+        tx.user(PRE)
+        tx.turn(150_000, [bash("ls")])              # the session's first turn: its context is the role's "clean start"
+        for _ in range(2):
+            tx.turn(450_000, [bash("ls")])
+        tx.user("task one")
+        for _ in range(14):
+            tx.turn(450_000, [bash("ls")])
+        tx.write(idle_s=30)
+        jev_ = seq_jev(YES, NO)
+        s1 = m.run_once(cfg_, jev_fn=jev_, now=NOW)
+        for _ in range(between):
+            tx.turn(450_000, [bash("ls")])
+        tx.user("task two")
+        for _ in range(14):
+            tx.turn(450_000, [bash("ls")])
+        tx.write(idle_s=idle_after)
+        s2 = m.run_once(cfg_, jev_fn=jev_, now=NOW)
+        return cfg_, sorted(m.merge_rows(log_rows(cfg_)), key=lambda r: r["fronteira_ts"]), s1, s2
+
+    # (a) the reviewer's case: the session goes quiet after B2, so the segment closes and both rows are final.
+    cfgS, mS, s1S, s2S = two_boundary_session("jev-recomecar-succ-", between=0, idle_after=4 * 3600)
+    ok("successor: the fixture is what it claims -- run 1 wrote B1 alone (segment open), run 2 wrote B2 and closed the segment",
+       s1S["rows"] == 1 and s2S["rows"] == 1 and s2S["fecho_rows"] == 1 and len(mS) == 2
+       and [r["veredito"] for r in mS] == ["nao_reusou", "nao_reusou"] and all(r["jev_ok"] for r in mS)
+       and [r["jev_recomecaria"] for r in mS] == [True, False])
+    ok("successor: only 28 turns exist after B1 (14 of task one + 14 of task two)", [r["turnos_restantes"] for r in mS] == [28, 14])
+    ok("successor: B1's restart is credited the 28 turns that exist, once -- B2 was not restarted, so its 14 run on inside B1's credit",
+       [r["credito_jev"] for r in mS] == [28, 0])
+    ok("successor: the blind restart credits each turn once too (B1 until B2 = 14, B2 = 14; 28 in all, not 42)",
+       [r["credito_cego"] for r in mS] == [14, 14] and m.calibration(mS)["blind_gross"] == 300_000 * 28)
+    ok("successor: the money follows -- (450k - 150k clean start) x the 28 credited turns, in the report's own total",
+       [r["preambulo_limpo_tokens"] for r in mS] == [150_000, 150_000] and m.summarize_rows(mS)["crew"]["bruta"] == 300_000 * 28)
+    # (b) the session is still running after B2: no fecho yet, B1's row is a snapshot from run 1. Its span to B2 is
+    # a fact about the transcript (20 turns), not something the row could have known when it was written.
+    cfgO, mO, s1O, s2O = two_boundary_session("jev-recomecar-open-", between=6, idle_after=30)
+    ok("successor, open segment: the fixture is what it claims -- two rows, no fecho, B1's row still says 14 turns left (run 1's snapshot)",
+       s2O["rows"] == 1 and s2O["fecho_rows"] == 0 and len(mO) == 2 and mO[0]["turnos_restantes"] == 14
+       and all(r["segmento_fechado"] is False for r in mO))
+    ok("successor, open segment: B1's credit is its REAL 20 turns to B2 + B2's 14 seen so far = 34 (a floor) -- not run 1's stale 14 + 14",
+       [r["credito_jev"] for r in mO] == [34, 0] and [r["credito_cego"] for r in mO] == [20, 14])
+
+    tie = m.merge_rows([dict(crd(2, True, 10, 90), fronteira_ts="2026-09-20T10:00:00Z"), dict(crd(1, True, 0, 100), fronteira_ts="2026-09-20T10:00:00Z")])
+    ok("credit: two boundaries with the very same timestamp are ordered by their position in the transcript, not by the order they were logged",
+       [r["credito_jev"] for r in tie] == [90, 10])
+
+    # ── a span that cannot be computed is UNKNOWN, never 0 ─────────────────────────────────────────────────────
+    # Three states: the turns are N / there are none / they cannot be known. The last one used to collapse into a number
+    # (`or 0`, or the segment's whole tail) and then read as a measurement.
+    def nopos(r, *fields):        # the same row without some of its position fields
+        return {k: (None if k in fields else v) for k, v in r.items()}
+    legacy = dict(nopos(crd(1, True, 0, 100), "turno_antes", "turno_depois"), turnos_ate_proxima=10)   # an old-shape row: only the stored span
+    cases = {
+        "a restart row without positions, followed by a successor": [nopos(crd(1, True, 0, 100), "turno_antes", "turno_depois"), crd(2, False, 10, 90)],
+        "a stored turnos_ate_proxima is NOT trusted in place of positions": [legacy, crd(2, False, 10, 90)],
+        "a successor without a position": [crd(1, True, 0, 100), nopos(crd(2, False, 10, 90), "turno_antes")],
+        "positions that run backwards": [crd(1, True, 50, 100), crd(2, False, 10, 90)],
+        "a last row with no turns-left": [nopos(crd(1, True, 0, 100), "turnos_restantes")],
+        "an unknown span later in the chain poisons the restart that owns it": [crd(1, True, 0, 100), crd(2, False, 10, 90), nopos(crd(3, False, 30, 70), "turno_antes")],
+    }
+    for what, rs in cases.items():
+        got = m.merge_rows(rs)
+        ok(f"unknown: {what} -> credit is None (cannot be computed), not 0 and not a made-up number", got[0]["credito_jev"] is None and m._gross(got[0]) is None)
+    seq_ok = m.merge_rows([crd(1, True, 0, 100), crd(2, False, 10, 90), nopos(crd(3, False, 30, 70), "turno_antes")])
+    ok("unknown: in the blind credit every row owns its own span, so an unknown one poisons only its owner (b2), not its neighbours",
+       [r["credito_cego"] for r in seq_ok] == [10, None, 70])
+    ok("unknown: a row before the first restart owes nothing to a restart -- its own unknown span costs the later restart nothing",
+       m.merge_rows([nopos(crd(1, None, 0, 5, jok=False), "turno_antes"), crd(2, True, 5, 100)])[1]["credito_jev"] == 100)
+    rep_rows = m.merge_rows([nopos(crd(1, True, 0, 100), "turno_antes", "turno_depois"), crd(2, False, 10, 90), crd(3, True, 0, 40, sess="s2")])
+    mm_ = m.summarize_rows(rep_rows)["mayor"]
+    ok("unknown: the restart with no number is counted apart (sem_base), and the other restart still gets its own", mm_["sem_base"] == 1 and mm_["bruta"] == 350_000 * 40)
+    ok("unknown: the English report says a restart has no computable turn count",
+       "1 without a clean-start sample or a computable turn count" in m.format_section(rep_rows, "x"))
+    ok("unknown: the phone summary says it too (a floor), and so does the one-line rolling summary",
+       "1 recomeço(s) sem número calculável" in m.format_resumo_pt(rep_rows, "x") and "piso, 1 recomeço(s) sem número" in m.format_resumo_pt(rep_rows, "x", curto=True))
+    ok("unknown: nothing to say when every restart has its number",
+       "sem número calculável" not in m.format_resumo_pt(c1, "x") and "sem número" not in m.format_resumo_pt(c1, "x", curto=True) and "computable turn count" not in m.format_section(c1, "x"))
+    blind_rows = m.merge_rows([nopos(crd(1, True, 0, 100), "turno_antes", "turno_depois"), crd(2, False, 10, 90)])
+    cal_ = m.calibration(blind_rows)     # b1's blind span is unknown; b2 (the last row) runs to the segment's end: 90 turns
+    ok("unknown: a blind restart with no number is counted apart instead of vanishing from the total, and the line says the total is a floor",
+       cal_["blind_sem_base"] == 1 and cal_["blind_gross"] == 350_000 * 90 and "1 of them have no computable number" in m.format_section(blind_rows, "x")
+       and m.calibration(c1)["blind_sem_base"] == 0 and "no computable number" not in m.format_section(c1, "x"))
+    # verdict() records WHERE each boundary sits: a claim boundary is itself an assistant turn, a typed one is not
+    pv = TX(tmp / "projects" / "pos" / "pos.jsonl", cwd_crew)
+    pv.user(PRE)
+    for _ in range(3):
+        pv.turn(450_000, [bash("ls")])
+    pv.user("typed task")                                             # boundary 1: after 3 turns
+    for _ in range(25):
+        pv.turn(450_000, [bash("ls")])
+    pv.turn(450_000, [bash("gc bd update ga-newone --claim", "✓ Updated issue: ga-newone — A new bead")])   # boundary 2: itself turn 29
+    for _ in range(13):
+        pv.turn(450_000, [bash("ls")])
+    _, bs_p, _, vs_p = analyze(pv.write(idle_s=30), cfg)
+    ok("position: the fixture has a typed boundary and a claim boundary", [b["kind"] for b in bs_p] == ["humano", "bead"])
+    ok("position: a typed boundary sits between turns (before == after); a claim boundary is a turn itself (28 before, 29 after)",
+       vs_p[0]["turno_antes"] == vs_p[0]["turno_depois"] == 3 and (vs_p[1]["turno_antes"], vs_p[1]["turno_depois"]) == (28, 29))
+    ok("position: the turns between them come out as the turns strictly after the first and before the second (25), the claim turn belongs to no span",
+       vs_p[1]["turno_antes"] - vs_p[0]["turno_depois"] == 25)
+    # a boundary whose timestamp cannot be read is skipped -- and now said, not confused with "older than the lookback"
+    cfgT = mkcfg(Path(tempfile.mkdtemp(prefix="jev-recomecar-badts-")))
+    bt_ = TX(cfgT.transcripts / "px" / "badts.jsonl", cwd_crew)
+    bt_.user(PRE)
+    for _ in range(3):
+        bt_.turn(450_000, [bash("ls")])
+    bt_.user("task with a broken clock", timestamp="not-a-time")
+    for _ in range(13):
+        bt_.turn(450_000, [bash("ls")])
+    bt_.write(idle_s=30)
+    sT = m.run_once(cfgT, jev_fn=fake_jev(), now=NOW)
+    ok("timestamp: a boundary with an unreadable timestamp writes no row, but is COUNTED in the run summary", sT["rows"] == 0 and sT["sem_timestamp"] == 1)
+    cfgL = mkcfg(Path(tempfile.mkdtemp(prefix="jev-recomecar-old-")), lookback_h=1.0)
+    ol = TX(cfgL.transcripts / "px" / "old.jsonl", cwd_crew)          # a LIVE file (passes the file filter) whose boundary is a day old
+    ol.user(PRE)
+    for _ in range(3):
+        ol.turn(450_000, [bash("ls")])
+    ol.user("an old task")
+    for _ in range(13):
+        ol.turn(450_000, [bash("ls")])
+    ol.write(idle_s=30)
+    sL = m.run_once(cfgL, jev_fn=fake_jev(), now=NOW)
+    ok("timestamp: a boundary merely older than the lookback is NOT counted as unreadable (files were scanned, nothing was written, count stays 0)",
+       sL["files_scanned"] == 1 and sL["rows"] == 0 and sL["sem_timestamp"] == 0)
+
     # ── a reuse whose rediscovery size could not be measured must not read as "cheap to rediscover" ──────────
-    unm = row(verd="reusou", red=5000, nxt=None, sess="unm00001")
+    unm = row(verd="reusou", red=5000, sess="unm00001")
     unm["redescoberta_sem_medida"] = 2
-    unm_rows = m.merge_rows([unm, row(verd="reusou", red=7000, nxt=None, sess="unm00002", left=51)])   # second one fully measured
+    unm_rows = m.merge_rows([unm, row(verd="reusou", red=7000, sess="unm00002", left=51)])   # second one fully measured
     ok("rediscovery: reused items with no measurable size are counted apart (2 here), not folded into the 0 they add",
        m.summarize_rows(unm_rows)["mayor"]["redesc_sem_medida"] == 2 and m.summarize_rows(unm_rows)["mayor"]["redescoberta"] == 12000)
     ok("rediscovery: both renderings say the savings is a ceiling for them",
