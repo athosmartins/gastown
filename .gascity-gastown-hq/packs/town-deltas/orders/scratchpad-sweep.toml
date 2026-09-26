@@ -1,0 +1,23 @@
+# ga-hynohs: always-on collector for the scratchpads of DEAD Claude sessions.
+#
+# Gate reviewers copy the branch under review into their scratchpad (130-830MB per
+# session); nothing collected those copies until the disk was already CRITICAL — on
+# 2026-09-26 /private/tmp/claude-501 went 27MB -> 3.5GB in 3h, 2.4GB of it in sessions dead
+# for 30+ minutes. scratchpad-reaper.sh only ran inside dolt-disk-floor-guard, behind a 24h
+# age gate. This order runs it on a cadence: a scratchpad is reaped when its session is
+# dead (absent from `gc session list` AND from every running claude process) and it has
+# been idle for 30 minutes. Safety and the why of each guard: header of scripts/scratchpad-reaper.sh.
+#
+# interval 10m / timeout 300s: one run measured at load ~60 took 1m50s (12-37s of it in
+# `gc session list`). The timeout is declared, not left to the engine default (300s), so
+# selftest T-order can fail if the interval ever drops under it. The reaper holds its own
+# single-instance lock, so even a run the timeout cuts short cannot stack with the next.
+#
+# Verify after a reload:  gc order show scratchpad-sweep   -> Source: .../town-deltas/...
+#                         tail -3 $GC_CITY_PATH/.gc/logs/scratchpad-reaper.log   (elapsed= per cycle)
+[order]
+description = "Reap scratchpads of dead Claude sessions idle for 30+ min (gate-reviewer branch copies, 130-830MB each) — always, not only once the disk is already CRITICAL"
+trigger = "cooldown"
+interval = "10m"
+timeout = "300s"
+exec = "$PACK_DIR/assets/scripts/scratchpad-sweep.sh"

@@ -28,6 +28,24 @@ export SCRATCHPAD_REAPER_LOG="/tmp/scratchpad-reaper-selftest-$$.log"
 # after this file's main() scenarios run would hit that landmine under `set -u`.
 PRODUCTION_REAL_DEFAULT_ROOT="$SCRATCH_REAL_DEFAULT_ROOT"
 
+# ga-hynohs: main() also takes a single-instance lock, cross-checks liveness
+# against running `claude` processes, and deletes through safe-clean. Every
+# main() scenario below has to stay hermetic, so:
+#   - LOCK_DIR is a throwaway path — never the production lock (a real sweep
+#     holding it would make main() skip and fail these tests at random);
+#   - the process scan is a no-op (real `ps` would inject the live town's ids);
+#   - removal is an rm -rf stand-in — safe-clean refuses fixture roots under
+#     /tmp BY DESIGN, so a stub is the only way to test main()'s decisions.
+# The two real functions are saved here and get their own sections further
+# down. On a script that predates ga-hynohs the saves are empty and the stubs
+# are never called, so this block is a no-op there.
+LOCK_PARENT="$(mktemp -d /tmp/scratchpad-reaper-selftest-lock.XXXXXX)"
+LOCK_DIR="$LOCK_PARENT/lock.d"
+REAL_PROC_FN="$(declare -f _fetch_proc_liveness)"
+REAL_REMOVE_FN="$(declare -f _remove_scratchpad)"
+_fetch_proc_liveness() { return 0; }
+_remove_scratchpad() { rm -rf "$1"; }
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -37,7 +55,7 @@ echo "=== scratchpad-reaper.selftest.sh ==="
 # ── fixture: a live-keys file with two known session ids ────────────────────
 KEYFILE="$(mktemp /tmp/scratchpad-reaper-selftest-keys.XXXXXX)"
 printf 'alive-session-1\nalive-session-2\n' > "$KEYFILE"
-trap 'rm -f "$KEYFILE"' EXIT
+trap 'rm -f "$KEYFILE"; rm -rf "$LOCK_PARENT"' EXIT
 
 # ── _session_is_live: exact-line membership, not substring/prefix ───────────
 _session_is_live "alive-session-1" "$KEYFILE" && ok "session_is_live: exact match in keyfile → true" || bad "should be live"
@@ -309,6 +327,253 @@ else
   bad "cycle-summary: empty root did not report 'nada encontrado' distinctly — got: $(cat "$SKIP_LOG")"
 fi
 rm -rf "$EMPTY_ROOT" "$PRESSURE_ROOT" "$SKIP_LOG"
+
+# ════════════════════════════════════════════════════════════════════════════
+# ga-hynohs — ALWAYS-ON SWEEP. Incident (Mayor, 2026-09-26): gate reviewers'
+# scratchpads (git-archive copies of a branch, 130-830MB each) piled up to
+# 2.4GB in 3h because the ONLY age gate was 24h and the ONLY early exit was
+# CRITICAL pressure + a single dir >= 2GB — a reviewer copy never qualifies
+# for either. The sweep adds a third path: dead AND idle >= MIN_IDLE_MINUTES,
+# with no pressure signal at all. Everything that keeps a session's scratch
+# safe (self, gc liveness, process liveness, project protection, fail-closed
+# on any unknowable input) must hold on that path exactly as on the others.
+# ════════════════════════════════════════════════════════════════════════════
+age_ts() { date -v-"$1"M +%Y%m%d%H%M.%S; }   # age_ts <minutes> → touch -t stamp
+
+echo ""
+echo "=== ga-hynohs: _is_idle_minutes ==="
+NOW=1000000
+_is_idle_minutes $(( NOW - 31*60 )) "$NOW" 30 && ok "is_idle_minutes: 31min idle, min 30 → idle"                         || bad "31min should be idle at min=30"
+_is_idle_minutes $(( NOW - 30*60 )) "$NOW" 30 && ok "is_idle_minutes: exactly 30min → idle (boundary inclusive)"          || bad "30min boundary should be inclusive"
+_is_idle_minutes $(( NOW - 29*60 )) "$NOW" 30 && bad "is_idle_minutes: 29min must NOT be idle yet"                        || ok "is_idle_minutes: 29min → not idle"
+_is_idle_minutes $(( NOW - 999*60 )) "$NOW" 0  && bad "is_idle_minutes: min=0 must DISABLE the gate, not mean 'always idle'" || ok "is_idle_minutes: min=0 → disabled (legacy callers unaffected)"
+_is_idle_minutes $(( NOW - 999*60 )) "$NOW" "" && bad "is_idle_minutes: empty min must disable the gate"                   || ok "is_idle_minutes: empty min → disabled"
+_is_idle_minutes $(( NOW - 999*60 )) "$NOW" abc && bad "is_idle_minutes: non-numeric min must disable the gate"             || ok "is_idle_minutes: non-numeric min → disabled"
+_is_idle_minutes "" "$NOW" 30                   && bad "is_idle_minutes: unreadable mtime must NEVER authorize deletion"    || ok "is_idle_minutes: empty mtime → false (fail toward keep)"
+_is_idle_minutes abc "$NOW" 30                  && bad "is_idle_minutes: non-numeric mtime must NEVER authorize deletion"   || ok "is_idle_minutes: non-numeric mtime → false"
+
+echo ""
+echo "=== ga-hynohs: session-id extraction + project-dir encoding ==="
+U1="0a1b2c3d-1111-4222-8333-444455556666"
+U2="9f8e7d6c-aaaa-4bbb-8ccc-ddddeeeeffff"
+got="$(printf '%s' "claude --dangerously-skip-permissions --session-id $U1 -r $U2" | _extract_uuids | sort | tr '\n' ' ')"
+[ "$got" = "$U1 $U2 " ] && ok "extract_uuids: --session-id and -r values both found" || bad "extract_uuids: got '$got'"
+got="$(printf '%s' "claude --session-id=$U1 --resume $U2" | _extract_uuids | sort | tr '\n' ' ')"
+[ "$got" = "$U1 $U2 " ] && ok "extract_uuids: --flag=value form and --resume found (flag-agnostic)" || bad "extract_uuids (=form): got '$got'"
+got="$(printf '%s' "claude --dangerously-skip-permissions --model opus" | _extract_uuids)"
+[ -z "$got" ] && ok "extract_uuids: a command line with no uuid yields nothing" || bad "extract_uuids: invented '$got'"
+got="$(printf '%s' "claude --session-id 0A1B2C3D-1111-4222-8333-444455556666" | _extract_uuids)"
+[ "$got" = "$U1" ] && ok "extract_uuids: upper-case uuid normalised to the lower-case form the scratchpad dirs use" || bad "extract_uuids case: got '$got'"
+got="$(_encode_project_dir "/Users/athos/gt/.gascity-gastown-hq")"
+[ "$got" = "-Users-athos-gt--gascity-gastown-hq" ] && ok "encode_project_dir: '/' and '.' both become '-' (matches the real project dir name)" || bad "encode_project_dir: got '$got'"
+got="$(_encode_project_dir "/Users/athos/gt/whatsapp_automation/crew/batista")"
+[ "$got" = "-Users-athos-gt-whatsapp-automation-crew-batista" ] && ok "encode_project_dir: '_' becomes '-' too" || bad "encode_project_dir underscore: got '$got'"
+
+echo ""
+echo "=== ga-hynohs: _ps_claude_lines (fake ps on PATH) ==="
+FAKEBIN="$(mktemp -d /tmp/scratchpad-reaper-selftest-bin.XXXXXX)"
+cat > "$FAKEBIN/ps" <<'PSEOF'
+#!/bin/bash
+case "${FAKE_PS_MODE:-ok}" in
+  fail)  exit 1 ;;
+  empty) exit 0 ;;
+esac
+cat <<'OUT'
+    1 /sbin/launchd
+  101 claude --dangerously-skip-permissions --session-id 0a1b2c3d-1111-4222-8333-444455556666
+  102 /Users/athos/.local/bin/claude --settings {"a":"*"} --resume 9f8e7d6c-aaaa-4bbb-8ccc-ddddeeeeffff
+  103 /bin/zsh -c source /Users/athos/.claude/shell-snapshots/snapshot.sh && eval claude
+  104 bash /Users/athos/gt/x/claude-lowprio.sh --session-id 77777777-7777-4777-8777-777777777777
+  105 grep claude
+OUT
+PSEOF
+chmod +x "$FAKEBIN/ps"
+got="$(PATH="$FAKEBIN:$PATH" _ps_claude_lines | awk '{print $1}' | tr '\n' ' ')"
+[ "$got" = "101 102 " ] && ok "ps_claude_lines: keeps only processes whose EXECUTABLE is claude (not zsh/bash/grep that merely mention it)" || bad "ps_claude_lines: got pids '$got'"
+FAKE_PS_MODE=fail PATH="$FAKEBIN:$PATH" _ps_claude_lines >/dev/null && bad "ps_claude_lines: a failing ps must be an ERROR, not an empty list" || ok "ps_claude_lines: ps failure → nonzero (never 'no claude running')"
+FAKE_PS_MODE=empty PATH="$FAKEBIN:$PATH" _ps_claude_lines >/dev/null && bad "ps_claude_lines: ps that prints nothing at all must be an ERROR (a live machine always has processes)" || ok "ps_claude_lines: totally empty ps output → nonzero"
+
+echo ""
+echo "=== ga-hynohs: _fetch_proc_liveness (three states: ids / unknown / nobody) ==="
+eval "$REAL_PROC_FN"
+PL_KEYS="$(mktemp /tmp/scratchpad-reaper-selftest-plk.XXXXXX)"
+PL_PROJS="$(mktemp /tmp/scratchpad-reaper-selftest-plp.XXXXXX)"
+LOG="$(mktemp /tmp/scratchpad-reaper-selftest-pllog.XXXXXX)"
+_pid_cwd() { echo "/must/not/be/asked"; }
+_ps_claude_lines() { printf '%s\n' "  101 claude --dangerously-skip-permissions --session-id $U1" "  102 claude --settings {} -r $U2"; }
+: > "$PL_KEYS"; : > "$PL_PROJS"
+_fetch_proc_liveness "$PL_KEYS" "$PL_PROJS"; rc=$?
+[ "$rc" -eq 0 ] && grep -qxF "$U1" "$PL_KEYS" && grep -qxF "$U2" "$PL_KEYS" && ok "proc_liveness: --session-id and -r ids of running claude processes land in the live set" || bad "proc_liveness: ids missing (rc=$rc keys=$(cat "$PL_KEYS"))"
+[ ! -s "$PL_PROJS" ] && ok "proc_liveness: identified processes protect no project dir (their id already protects them)" || bad "proc_liveness: identified process leaked a project protection"
+
+_ps_claude_lines() { echo "  103 claude"; }
+_pid_cwd() { echo "/Users/athos/gt/.gascity-gastown-hq"; }
+: > "$PL_KEYS"; : > "$PL_PROJS"
+_fetch_proc_liveness "$PL_KEYS" "$PL_PROJS"; rc=$?
+[ "$rc" -eq 0 ] && grep -qxF -- "-Users-athos-gt--gascity-gastown-hq" "$PL_PROJS" && ok "proc_liveness: a claude with NO session id (interactive/--continue) protects the project dir of its cwd" || bad "proc_liveness: unidentified claude did not protect its project (rc=$rc projs=$(cat "$PL_PROJS"))"
+
+_pid_cwd() { return 1; }
+: > "$PL_KEYS"; : > "$PL_PROJS"
+_fetch_proc_liveness "$PL_KEYS" "$PL_PROJS" && bad "proc_liveness: an unidentified claude whose cwd is unreadable must ABORT (we cannot tell what it owns)" || ok "proc_liveness: unidentified claude + unreadable cwd → nonzero (cycle aborts, nothing reaped)"
+
+_ps_claude_lines() { return 1; }
+_fetch_proc_liveness "$PL_KEYS" "$PL_PROJS" && bad "proc_liveness: ps failure must ABORT — 'could not look' is not 'nobody is running'" || ok "proc_liveness: ps failure → nonzero"
+
+_ps_claude_lines() { return 0; }
+: > "$PL_KEYS"; : > "$PL_PROJS"
+_fetch_proc_liveness "$PL_KEYS" "$PL_PROJS"; rc=$?
+[ "$rc" -eq 0 ] && [ ! -s "$PL_KEYS" ] && ok "proc_liveness: ps fine and genuinely no claude running → success with an empty set (quiet town is not an error)" || bad "proc_liveness: quiet town mis-handled (rc=$rc)"
+rm -f "$PL_KEYS" "$PL_PROJS"
+
+echo ""
+echo "=== ga-hynohs: main() — always-on idle sweep ==="
+IDLE_ROOT="$(mktemp -d /tmp/scratchpad-reaper-selftest-idle.XXXXXX)"
+IDLE_LOG="$(mktemp /tmp/scratchpad-reaper-selftest-idlelog.XXXXXX)"
+# shellcheck disable=SC2034  # all read by main() in the sourced script
+{
+  SCRATCH_REAL_DEFAULT_ROOT="/private/tmp/claude-nonexistent-marker-ga-hynohs-$$"
+  SCRATCH_ROOT="$IDLE_ROOT"; LOG="$IDLE_LOG"
+  MIN_AGE_HOURS=24; MIN_IDLE_MINUTES=30; PRESSURE=""
+  ENABLED=1; DRY_RUN=0; PROD=0; SELF_SESSION_ID=""
+  FAKE_LIVE_SID=""; FAKE_SIZE_KB=$(( 210 * 1024 ))   # one reviewer tree copy, ~210MB
+}
+FAKE_PROC_KEYS=""; FAKE_PROC_PROJS=""; FAKE_PROC_RC=0
+_fetch_proc_liveness() {
+  [ "$FAKE_PROC_RC" -eq 0 ] || return 1
+  [ -z "$FAKE_PROC_KEYS" ]  || printf '%s\n' "$FAKE_PROC_KEYS"  >> "$1"
+  [ -z "$FAKE_PROC_PROJS" ] || printf '%s\n' "$FAKE_PROC_PROJS" >> "$2"
+  return 0
+}
+_remove_scratchpad() { rm -rf "$1"; }
+make_idle_fixture() {  # make_idle_fixture <proj> <sid> <age_minutes>
+  rm -rf "$IDLE_ROOT/$1/$2"
+  mkdir -p "$IDLE_ROOT/$1/$2/scratchpad/tree"
+  : > "$IDLE_ROOT/$1/$2/scratchpad/tree/copy.txt"
+  touch -t "$(age_ts "$3")" "$IDLE_ROOT/$1/$2/scratchpad"
+}
+fx() { echo "$IDLE_ROOT/$1/$2/scratchpad"; }
+
+# THE INCIDENT, and its guard rails, in one cycle. Nothing here is under
+# pressure and nothing is >= 2GB: exactly the shape the old gates ignore.
+make_idle_fixture gate dead-idle-45m 45
+make_idle_fixture gate dead-fresh-10m 10
+make_idle_fixture gate live-gc-45m 45
+make_idle_fixture gate live-proc-45m 45
+make_idle_fixture gate self-45m 45
+make_idle_fixture protproj dead-in-protected-project-45m 45
+make_idle_fixture otherproj dead-idle-45m 45
+FAKE_LIVE_SID="live-gc-45m"; FAKE_PROC_KEYS="live-proc-45m"; FAKE_PROC_PROJS="protproj"; SELF_SESSION_ID="self-45m"
+: > "$IDLE_LOG"
+main
+SELF_SESSION_ID=""
+[ -d "$(fx gate dead-idle-45m)" ] && bad "SWEEP: a DEAD scratchpad idle for 45min (no pressure, well under 2GB) must be reaped — it survived, exactly the ga-hynohs leak" || ok "SWEEP: dead + idle 45min (>= 30) → reaped with no pressure signal at all"
+[ -d "$(fx otherproj dead-idle-45m)" ] && bad "SWEEP: same-shape dir in an UNPROTECTED project must be reaped too (project protection must not be global)" || ok "SWEEP: an unrelated project's dead idle scratchpad is reaped (project protection is scoped)"
+[ -d "$(fx gate dead-fresh-10m)" ] && ok "SWEEP: dead but only 10min idle → kept (grace for a session that just died)" || bad "SWEEP: REGRESSION — reaped a 10min-old dead scratchpad"
+[ -d "$(fx gate live-gc-45m)" ] && ok "SWEEP: session in gc session list → kept (liveness never loosened by the idle path)" || bad "SWEEP: REGRESSION — reaped a gc-live session's scratchpad"
+[ -d "$(fx gate live-proc-45m)" ] && ok "SWEEP: session live only as a running claude process → kept (process liveness respected)" || bad "SWEEP: REGRESSION — reaped a scratchpad whose claude process is running"
+[ -d "$(fx gate self-45m)" ] && ok "SWEEP: the caller's own session → kept (self-protection never loosened)" || bad "SWEEP: REGRESSION — reaped the caller's OWN scratchpad"
+[ -d "$(fx protproj dead-in-protected-project-45m)" ] && ok "SWEEP: dead dir inside a project owned by an unidentified running claude → kept" || bad "SWEEP: REGRESSION — reaped inside a project protected by a session-id-less claude"
+[ -d "$IDLE_ROOT/gate/dead-idle-45m" ] && ok "SWEEP: only the scratchpad LEAF goes — the session dir itself stays" || bad "SWEEP: session dir was removed along with the leaf"
+grep -q "reaped (idle)" "$IDLE_LOG" && ok "SWEEP: log names the reason 'idle'" || bad "SWEEP: log missing 'reaped (idle)' — got: $(cat "$IDLE_LOG")"
+grep -q "elapsed=" "$IDLE_LOG" && ok "SWEEP: cycle summary carries elapsed= (run duration is measurable from the log alone)" || bad "SWEEP: no elapsed= in the summary — got: $(cat "$IDLE_LOG")"
+grep -q "live_ids=2 protected_projects=1" "$IDLE_LOG" && ok "SWEEP: summary reports the liveness-set size (2 live ids, 1 protected project) — a project silenced by an id-less claude is visible" || bad "SWEEP: summary lacks live_ids/protected_projects — got: $(cat "$IDLE_LOG")"
+
+# FAIL-CLOSED: a process scan that cannot be trusted aborts the WHOLE cycle —
+# including the legacy 24h path, which shares the same liveness set.
+make_idle_fixture gate dead-idle-45m 45
+make_idle_fixture gate dead-old-48h $(( 48*60 ))
+FAKE_LIVE_SID=""; FAKE_PROC_KEYS=""; FAKE_PROC_PROJS=""; FAKE_PROC_RC=1
+: > "$IDLE_LOG"
+main; rc=$?
+FAKE_PROC_RC=0
+{ [ -d "$(fx gate dead-idle-45m)" ] && [ -d "$(fx gate dead-old-48h)" ]; } && ok "FAIL-CLOSED: process scan failed → NOTHING reaped (idle nor 24h path)" || bad "FAIL-CLOSED: a failed process scan still let a reap through"
+[ "$rc" -ne 0 ] && grep -q "skipping reap cycle entirely" "$IDLE_LOG" && ok "FAIL-CLOSED: aborted cycle exits nonzero and says so in the log" || bad "FAIL-CLOSED: silent abort (rc=$rc) — got: $(cat "$IDLE_LOG")"
+
+# LEGACY UNCHANGED: with the idle gate off (default), 45min stays — the
+# disk-floor guard's own call path behaves exactly as before ga-hynohs.
+MIN_IDLE_MINUTES=0
+make_idle_fixture gate dead-idle-45m 45
+make_idle_fixture gate dead-old-48h $(( 48*60 ))
+main
+[ -d "$(fx gate dead-idle-45m)" ] && ok "LEGACY: MIN_IDLE_MINUTES=0 → a 45min dead scratchpad is still kept (guard path unchanged)" || bad "LEGACY: REGRESSION — idle path fired while disabled"
+[ -d "$(fx gate dead-old-48h)" ] && bad "LEGACY: the 24h age path must still reap a 48h dead dir" || ok "LEGACY: 24h age path still reaps a 48h dead dir"
+MIN_IDLE_MINUTES=30
+
+# DRY-RUN: decides, logs, deletes nothing.
+make_idle_fixture gate dead-idle-45m 45
+DRY_RUN=1; : > "$IDLE_LOG"
+main
+DRY_RUN=0
+[ -d "$(fx gate dead-idle-45m)" ] && grep -q "DRY-RUN would reap (idle)" "$IDLE_LOG" && ok "DRY-RUN: idle candidate is logged as would-reap and left in place" || bad "DRY-RUN: wrong behaviour — got: $(cat "$IDLE_LOG")"
+
+# A removal that FAILS is a failed cycle, not a quiet success: with a missing
+# safe-clean every single reap fails, and a sweep that exits 0 there would
+# look healthy while freeing nothing.
+make_idle_fixture gate dead-idle-45m 45
+_remove_scratchpad() { return 1; }
+: > "$IDLE_LOG"
+main; rc=$?
+_remove_scratchpad() { rm -rf "$1"; }
+{ [ -d "$(fx gate dead-idle-45m)" ] && [ "$rc" -ne 0 ] && grep -q "FAILED to reap" "$IDLE_LOG"; } && ok "REMOVAL FAILURE: dir kept, 'FAILED to reap' logged, cycle exits nonzero" || bad "REMOVAL FAILURE: rc=$rc log=$(cat "$IDLE_LOG")"
+
+echo ""
+echo "=== ga-hynohs: single-instance lock ==="
+make_idle_fixture gate dead-idle-45m 45
+rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"; echo "$$" > "$LOCK_DIR/pid"        # a LIVE holder (this shell)
+: > "$IDLE_LOG"
+main; rc=$?
+{ [ -d "$(fx gate dead-idle-45m)" ] && [ "$rc" -eq 0 ] && grep -q "holds" "$IDLE_LOG"; } && ok "LOCK: fresh lock held by a live pid → cycle skipped, logged, exit 0 (busy is not failure)" || bad "LOCK: live holder not respected (rc=$rc log=$(cat "$IDLE_LOG"))"
+[ -d "$LOCK_DIR" ] && ok "LOCK: a skipped run does NOT remove the other run's lock" || bad "LOCK: skipped run deleted a lock it does not own"
+
+rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"                                          # holder pid not yet written (µs window)
+main
+[ -d "$(fx gate dead-idle-45m)" ] && ok "LOCK: lock dir with no pid yet → treated as LIVE, skipped (never steal a lock mid-birth)" || bad "LOCK: stole a lock whose holder had not written its pid"
+
+sleep 0.1 & DEAD_PID=$!; wait "$DEAD_PID" 2>/dev/null
+rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"; echo "$DEAD_PID" > "$LOCK_DIR/pid"   # a run killed by `timeout 60` leaves exactly this
+main
+[ -d "$(fx gate dead-idle-45m)" ] && bad "LOCK: lock left by a DEAD holder must be reclaimed, and the sweep must run" || ok "LOCK: dead holder's lock reclaimed → sweep ran and reaped"
+[ ! -d "$LOCK_DIR" ] && ok "LOCK: lock released at the end of a run" || bad "LOCK: lock dir still present after a completed run"
+
+# PID reuse: a killed run's pid can be handed to an unrelated long-lived
+# process, which would make the lock look 'live' forever and silently switch
+# the sweep off. A real run is bounded by its callers' timeouts (order 300s,
+# guard 60s), so a lock far older than that is stale whatever its pid says.
+make_idle_fixture gate dead-idle-45m 45
+rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR"; echo "$$" > "$LOCK_DIR/pid"
+touch -t "$(age_ts 120)" "$LOCK_DIR"
+main
+[ -d "$(fx gate dead-idle-45m)" ] && bad "LOCK: a 2h-old lock whose pid is 'alive' (pid reuse) must be reclaimed" || ok "LOCK: 2h-old lock with a live-looking pid → reclaimed (PID reuse cannot disable the sweep)"
+
+# Cannot create the lock at all = cannot know whether another run is going →
+# inert, and loud.
+make_idle_fixture gate dead-idle-45m 45
+SAVED_LOCK_DIR="$LOCK_DIR"; LOCK_DIR="/nonexistent-root-$$/x/lock.d"
+: > "$IDLE_LOG"
+main; rc=$?
+LOCK_DIR="$SAVED_LOCK_DIR"
+{ [ -d "$(fx gate dead-idle-45m)" ] && [ "$rc" -ne 0 ] && grep -q "ABORT" "$IDLE_LOG"; } && ok "LOCK: cannot create the lock → nothing reaped, ABORT logged, nonzero exit" || bad "LOCK: uncreatable lock mishandled (rc=$rc log=$(cat "$IDLE_LOG"))"
+
+echo ""
+echo "=== ga-hynohs: _remove_scratchpad goes through the REAL safe-clean ==="
+eval "$REAL_REMOVE_FN"
+SAFE_CLEAN="$HERE/../packs/town-deltas/assets/scripts/safe-clean.py"
+LOG="$IDLE_LOG"
+# A fixture that safe-clean's allowlist recognises (/private/tmp/claude-*/*/*/**).
+SC_ROOT="/private/tmp/claude-selftest-hynohs-$$"
+mkdir -p "$SC_ROOT/proj/sid/scratchpad/tree"; : > "$SC_ROOT/proj/sid/scratchpad/tree/f"
+_remove_scratchpad "$SC_ROOT/proj/sid/scratchpad"; rc=$?
+{ [ "$rc" -eq 0 ] && [ ! -d "$SC_ROOT/proj/sid/scratchpad" ] && [ -d "$SC_ROOT/proj/sid" ]; } && ok "safe-clean: allowlisted scratchpad leaf removed, session dir left alone" || bad "safe-clean: allowlisted removal wrong (rc=$rc)"
+# A path safe-clean does NOT recognise must be REFUSED, never force-deleted.
+mkdir -p "$LOCK_PARENT/proj/sid/scratchpad"
+_remove_scratchpad "$LOCK_PARENT/proj/sid/scratchpad"; rc=$?
+{ [ "$rc" -ne 0 ] && [ -d "$LOCK_PARENT/proj/sid/scratchpad" ]; } && ok "safe-clean: a path outside its allowlist is refused (nonzero) and left intact — no rm -rf fallback" || bad "safe-clean: outside-allowlist path was deleted or reported ok (rc=$rc)"
+# A missing safe-clean is a refusal, not a licence to fall back to rm -rf.
+mkdir -p "$SC_ROOT/proj/sid2/scratchpad"
+SAFE_CLEAN="/nonexistent/safe-clean-$$"
+_remove_scratchpad "$SC_ROOT/proj/sid2/scratchpad"; rc=$?
+{ [ "$rc" -ne 0 ] && [ -d "$SC_ROOT/proj/sid2/scratchpad" ]; } && ok "safe-clean: binary missing → fail-closed (nonzero, nothing deleted)" || bad "safe-clean: missing binary did not fail closed (rc=$rc)"
+rm -rf "$SC_ROOT" "$FAKEBIN" "$IDLE_ROOT" "$IDLE_LOG"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
