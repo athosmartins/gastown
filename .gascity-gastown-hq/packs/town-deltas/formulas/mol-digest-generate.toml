@@ -119,14 +119,18 @@
 # never 0 — when it cannot list or read a segment, cannot reach back to SINCE,
 # or finds a hole in the chain of segment seq ranges (a deleted middle archive
 # or a rotation between listing and reading would otherwise undercount with
-# full confidence). (2) Step 3's `--metadata` JSON was typed with
+# full confidence). The chain check only vouches for the moment it ran, and the
+# count reads for seconds after it, so the count is re-verified once taken: a
+# changed segment list or live-file first seq (a rotation landed in between)
+# voids it (gate round 2). (2) Step 3's `--metadata` JSON was typed with
 # backslash-escaped quotes; this file's TOML string consumed that escape level,
 # so the agent received invalid JSON (the 2026-09-25 archive bead only stored
 # correctly because the dog re-escaped by hand). The JSON is now built with
 # `jq --arg`, so no escape level matters. The recipe text is what the agent is
 # delivered, so assets/mol-digest-generate.selftest.sh tests the TOML-parsed
-# text, not this source. Known sibling NOT fixed here: step 2's
-# `gc events --since=5m --type=mail.sent | tail -5` also masks gc's exit status.
+# text, not this source. Not part of this change: step 2's
+# `gc events --since=5m --type=mail.sent | tail -5` had the same masked exit
+# status; that one is ga-ghxr1h's, handled separately.
 description = """
 Generate activity digest for the mayor.
 
@@ -554,9 +558,12 @@ What the block below is built on (verified live, ga-hnlog4 / ga-swvjo):
   file name), so a window needs the live file plus every archive stamped at or
   after SINCE. Segments can overlap (measured live: two archives share 3 rows,
   and a rotation landing between listing and reading can show a row twice) —
-  the block counts each `seq` once. A segment that is MISSING (deleted, or
-  rotated out between listing and reading) shows as a hole in the chain of seq
-  ranges, and the block then reports N/A instead of a low number.
+  the block counts each `seq` once. A segment that is MISSING (deleted, or a
+  rotation that landed before the chain check ran) shows as a hole in the chain
+  of seq ranges. A rotation that lands AFTER that check — the count reads for
+  seconds — is caught by re-listing the segments and re-reading the live file's
+  first seq once the count is taken: if either changed, the count is void. In
+  both cases the block reports N/A instead of a low number.
 - macOS `zcat` appends `.Z` to the name and fails on a `.gz` file — use
   `gzip -dc`.
 - `ts` is LOCAL time (e.g. `-03:00`) while $SINCE/$UNTIL are UTC, so the
@@ -575,6 +582,7 @@ SINCE_EPOCH=$(date -u -d "$SINCE" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:
 UNTIL_EPOCH=$(date -u -d "$UNTIL" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$UNTIL" +%s)
 SINCE_STAMP=$(printf '%s' "$SINCE" | tr -cd '0-9')      # 20260925000000, UTC, fixed width
 [ "${#SINCE_STAMP}" -eq 14 ] || SINCE_STAMP=0            # unparseable: read every archive
+LIVE_LOG="$GC_CITY_PATH/.gc/events.jsonl"
 
 JQ_EPOCH='
   def iso_offset_to_epoch:
@@ -602,8 +610,12 @@ lifecycle_segments() (
   find "$GC_CITY_PATH/.gc" -maxdepth 1 -name 'events.jsonl.archive-*.gz' | sort | while IFS= read -r f; do
     stamp=${f##*archive-}; stamp=$(printf '%s' "${stamp%%-seq-*}" | tr -cd '0-9')
     if [ "${#stamp}" -ne 14 ] || [ "$stamp" -ge "$SINCE_STAMP" ]; then echo "$f"; fi
-  done && echo "$GC_CITY_PATH/.gc/events.jsonl"
+  done && echo "$LIVE_LOG"
 )
+
+# The live file's first seq (nothing when it cannot be read). Rotation replaces the live file, so this
+# changes whenever one lands: the chain check uses it, and the count is re-verified against it.
+live_first_seq() { head -n 1 -- "$LIVE_LOG" 2>/dev/null | jq -r '.seq // empty' 2>/dev/null; }
 
 # Prints {"woke":N,"stopped":M,"crashed":K}; returns 1 (reason on stderr) when the count cannot be known.
 session_lifecycle_counts() (
@@ -612,6 +624,10 @@ session_lifecycle_counts() (
     case "$E" in ''|*[!0-9]*) echo "cannot parse SINCE/UNTIL ($SINCE / $UNTIL) into epoch seconds" >&2; return 1 ;; esac
   done
   SEGMENTS=$(lifecycle_segments) || { echo "cannot list event-log segments under $GC_CITY_PATH/.gc" >&2; return 1; }
+  # One observation of the live file, taken right after the listing: the chain check below uses it, and
+  # the count is re-verified against it. A rotation between the listing and this read moves the live
+  # file's first seq past the last listed archive, which the chain check reports as a hole.
+  LIVE_FIRST=$(live_first_seq)
   # The oldest segment read must reach back to SINCE, else a pruned archive hides part of the window.
   OLDEST=$(echo "$SEGMENTS" | head -n 1)
   FIRST_EPOCH=$(case "$OLDEST" in *.gz) gzip -dc -- "$OLDEST" ;; *) cat -- "$OLDEST" ;; esac 2>/dev/null | head -n 1 | jq -r "$JQ_EPOCH"' .ts | iso_offset_to_epoch' 2>/dev/null)
@@ -624,13 +640,14 @@ session_lifecycle_counts() (
   # and the live file starts where the last archive ends, so a segment that starts past the previous
   # one's end + 1 is a hole. An overlap is fine (seen live: two archives share 3 rows; the dedupe
   # below counts each seq once). A name whose seq range cannot be read is refused: an empty end
-  # would leave the next comparison with nothing to compare against and skip it.
+  # would leave the next comparison with nothing to compare against and skip it. (An archive's range
+  # comes from its file NAME, which gc's rotation writes; a hand-renamed archive would fool this.)
   echo "$SEGMENTS" | {
     PREV_LAST=""
     while IFS= read -r f; do
       case "$f" in
         *.gz) R=${f##*-seq-}; FIRST=${R%%-*}; LAST=${R#*-}; LAST=${LAST%.gz} ;;
-        *) FIRST=$(head -n 1 -- "$f" | jq -r '.seq // empty' 2>/dev/null); LAST="" ;;
+        *) FIRST=$LIVE_FIRST; LAST="" ;;
       esac
       case "$FIRST" in ''|*[!0-9]*) echo "cannot read the seq range of $f" >&2; exit 1 ;; esac
       case "$f" in *.gz) case "$LAST" in ''|*[!0-9]*) echo "cannot read the seq range of $f" >&2; exit 1 ;; esac ;; esac
@@ -640,15 +657,29 @@ session_lifecycle_counts() (
       PREV_LAST=$LAST
     done
   } || return 1
-  echo "$SEGMENTS" | while IFS= read -r f; do
+  COUNT=$(echo "$SEGMENTS" | while IFS= read -r f; do
     case "$f" in *.gz) gzip -dc -- "$f" ;; *) cat -- "$f" ;; esac |
       jq -c --argjson since_epoch "$SINCE_EPOCH" --argjson until_epoch "$UNTIL_EPOCH" "$JQ_WINDOW_FILTER" || exit 1
-  done | jq -s 'if any(.[]; (.seq | type) != "number") then error("a session-lifecycle row has no numeric seq") else unique_by(.seq) | {woke: (map(select(.type == "session.woke")) | length), stopped: (map(select(.type == "session.stopped")) | length), crashed: (map(select(.type == "session.crashed")) | length)} end'
+  done | jq -s 'if any(.[]; (.seq | type) != "number") then error("a session-lifecycle row has no numeric seq") else unique_by(.seq) | {woke: (map(select(.type == "session.woke")) | length), stopped: (map(select(.type == "session.stopped")) | length), crashed: (map(select(.type == "session.crashed")) | length)} end') || return 1
+  # The count above takes seconds (every archive is gunzipped before the live file is read), and the
+  # chain check only vouches for the moment it ran. A rotation landing in between leaves the just-rotated
+  # archive out of SEGMENTS and the count reading the fresh, short live file — a plain number for a log
+  # that was not fully read. A rotation adds an archive and starts a fresh live file (that is how every
+  # archive on disk came about), so if the listing or the live file's first seq differ from what the
+  # checks approved, the count is void. This may void a count whose live read happened to finish first —
+  # a false N/A that a rerun clears, which is the safe direction.
+  if [ "$(lifecycle_segments)" != "$SEGMENTS" ] || [ "$(live_first_seq)" != "$LIVE_FIRST" ]; then
+    echo "event log rotated while it was being counted (segment list or live file changed since the seq-chain check)" >&2
+    return 1
+  fi
+  printf '%s\n' "$COUNT"
 )
 
 WOKE_N=N/A; STOPPED_N=N/A; CRASHED_N=N/A
 if COUNTS=$(session_lifecycle_counts); then
-  WOKE_N=$(echo "$COUNTS" | jq -r .woke); STOPPED_N=$(echo "$COUNTS" | jq -r .stopped); CRASHED_N=$(echo "$COUNTS" | jq -r .crashed)
+  # all three or none: a failed jq must leave N/A, never an empty string
+  W_TMP=$(echo "$COUNTS" | jq -er .woke) && S_TMP=$(echo "$COUNTS" | jq -er .stopped) && C_TMP=$(echo "$COUNTS" | jq -er .crashed) &&
+    { WOKE_N=$W_TMP; STOPPED_N=$S_TMP; CRASHED_N=$C_TMP; }
 fi
 echo "session.woke=$WOKE_N session.stopped=$STOPPED_N session.crashed=$CRASHED_N"
 # END session-lifecycle-counts
@@ -659,13 +690,16 @@ measure" and the digest must say N/A — never 0**: the block prints N/A (reason
 on stderr) when it cannot list or read a segment, when a segment is corrupt,
 when the oldest segment on disk starts after SINCE (an archive was pruned, so
 part of the window is out of reach), when the seq ranges have a hole or an
-archive name's range cannot be read, or when a session row carries no numeric
-`seq` (the dedupe key — such rows would otherwise collapse into one). A `0` is
-printed only when every segment was read intact, the chain of seq ranges is
-unbroken, and the oldest segment reaches back to SINCE. On N/A, run the block
-once more before writing N/A into the digest — two causes are transient: a torn
-read of the live file's last line under load, and a rotation landing between
-listing and reading (it shows up as a hole until the next listing).
+archive name's range cannot be read, when the log rotated while it was being
+counted, or when a session row carries no numeric `seq` (the dedupe key — such
+rows would otherwise collapse into one). A `0` is printed only when every
+segment was read intact, the chain of seq ranges is unbroken, the oldest
+segment reaches back to SINCE, and the segment list and the live file's first
+seq are the same after the count as before it. On N/A, run the block once more
+before writing N/A into the digest — two causes are transient: a torn read of
+the live file's last line under load, and a rotation landing while the block
+runs (before the chain check it shows as a hole, after it as a changed segment
+list; the next run lists the new archive).
 
 b) **Escalations** — no universal `escalation` bead label exists in this city (0
 hits, confirmed across 3+ independent runs, including a `--label-pattern
@@ -784,7 +818,8 @@ Transform data into a formatted digest and deliver it.
 - Incidents (if any)
 
 ## Agent Health
-- Agents started/stopped/crashed: N/N/N
+- Agents started/stopped/crashed: N/N/N — the woke/stopped/crashed figures step 3a
+  printed; if it printed N/A, write "N/A — <reason from stderr>" here, never 0
 - Warrants filed: N (pardoned: X, executed: Y)
 
 ## Disk — macOS virtual memory (ga-sfj3i.2)

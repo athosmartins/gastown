@@ -30,6 +30,9 @@ bad(){ echo "  BAD: $*"; F=$((F+1)); }
 echo "== mol-digest-generate.selftest (ga-hnlog4) =="
 [ -f "$FORMULA" ] || { echo "FATAL: $FORMULA not found"; exit 1; }
 command -v python3 >/dev/null && command -v jq >/dev/null || { echo "FATAL: python3 and jq required"; exit 1; }
+# extract() parses the formula with tomllib (Python >= 3.11); on an older python3 every assertion
+# below would fail on a traceback that hides the real cause
+python3 -c 'import tomllib' 2>/dev/null || { echo "FATAL: python3 >= 3.11 (tomllib) required; found: $(python3 --version 2>&1)"; exit 1; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -76,6 +79,10 @@ UTC = dt.timezone.utc; BRT = dt.timezone(dt.timedelta(hours=-3))
 S = dt.datetime(2026, 9, 25, tzinfo=UTC); U = dt.datetime(2026, 9, 26, tzinfo=UTC)
 def T(*a): return dt.datetime(*a, tzinfo=UTC)
 seq = [1000]; truth = {"session.woke": set(), "session.stopped": set(), "session.crashed": set()}
+# A second window that reaches into the live file (archives B and C plus live): the rotation-race
+# test needs in-window rows that exist ONLY in the live file, so losing it shows up in the count.
+S2 = dt.datetime(2026, 9, 25, 12, tzinfo=UTC); U2 = dt.datetime(2026, 9, 26, 14, tzinfo=UTC)
+truth2 = {"session.woke": set(), "session.stopped": set(), "session.crashed": set()}
 def ts(t, style):
     if style == "Z": return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     if style == "utc0": return t.astimezone(UTC).isoformat()
@@ -83,6 +90,7 @@ def ts(t, style):
 def row(typ, t, style="brt", seq_=None):
     if seq_ is None: seq[0] += 1; seq_ = seq[0]
     if typ in truth and S <= t < U: truth[typ].add(seq_)
+    if typ in truth2 and S2 <= t < U2: truth2[typ].add(seq_)
     return {"seq": seq_, "type": typ, "ts": ts(t, style), "actor": "gc", "subject": "x"}
 def spread(typ, t0, n, step_s, style="brt"):
     return [row(typ, t0 + dt.timedelta(seconds=step_s * i), style) for i in range(n)]
@@ -128,6 +136,19 @@ L = [rot(T(2026, 9, 26, 13, 11, 52))] + spread("session.woke", T(2026, 9, 26, 13
 L += [dup] + spread("bead.closed", T(2026, 9, 26, 13, 13), 5, 10)
 write("events.jsonl", L, gz=False)
 json.dump({"woke": len(truth["session.woke"]), "stopped": len(truth["session.stopped"]), "crashed": len(truth["session.crashed"])}, open(root + "/expected.json", "w"))
+json.dump({"woke": len(truth2["session.woke"]), "stopped": len(truth2["session.stopped"]), "crashed": len(truth2["session.crashed"])}, open(root + "/expected-race.json", "w"))
+PY
+
+# What a real rotation does to the live file: its rows move into a new archive (name = rotation
+# stamp + first/last seq) and a fresh live file starts with an events.rotated row.
+cat > "$TMP/rotate.py" <<'PY'
+import gzip, json, sys
+root = sys.argv[1]
+live = root + "/.gc/events.jsonl"
+rows = [json.loads(l) for l in open(live) if l.strip()]
+seqs = [r["seq"] for r in rows]
+gzip.open(root + "/.gc/events.jsonl.archive-20260926T140500Z-seq-%d-%d.gz" % (min(seqs), max(seqs)), "wb").write(open(live, "rb").read())
+open(live, "w").write(json.dumps({"seq": max(seqs) + 1, "type": "events.rotated", "ts": "2026-09-26T14:05:00Z", "actor": "gc", "subject": "x"}) + "\n")
 PY
 CITY="$TMP/city"; python3 "$TMP/gen.py" "$CITY" || { echo "FATAL: fixture generation failed"; exit 1; }
 EXP_W=$(jq -r .woke "$CITY/expected.json"); EXP_S=$(jq -r .stopped "$CITY/expected.json"); EXP_C=$(jq -r .crashed "$CITY/expected.json")
@@ -218,6 +239,54 @@ else
     *) bad "bad SINCE: not refused by name; stderr: '$err'" ;;
   esac
 
+  # A rotation landing AFTER the seq-chain check (gate round 2, ga-hnlog4). The chain check passes on
+  # the listing it took; the count then reads the live file seconds later, after gunzipping every
+  # archive. If events.jsonl rotates in that gap, the fresh short live file is what gets counted, the
+  # just-rotated archive is not in the list, and a plain number is printed for a log that was not
+  # fully read. The hook rotates the city the first time the block reads the NEWEST archive: the
+  # coverage check reads only the oldest one and the chain check reads no archive at all, so that
+  # first read is the count phase. Window R0..R1 selects archives B and C plus the live file, whose
+  # in-window rows exist nowhere else.
+  echo "-- a rotation between the chain check and the count is N/A, never a number"
+  R0=2026-09-25T12:00:00Z; R1=2026-09-26T14:00:00Z
+  RW=$(jq -r .woke "$CITY/expected-race.json"); RS=$(jq -r .stopped "$CITY/expected-race.json"); RC=$(jq -r .crashed "$CITY/expected-race.json")
+  RGZ=$(command -v gzip)
+  cat > "$TMP/bin/gzip" <<STUB
+#!/usr/bin/env bash
+# real gzip, except: on an armed city, rotate its live log the first time the newest archive is read
+case "\$*" in
+  *archive-20260926T131152Z*)
+    if [ -e "\$GC_CITY_PATH/rotate.armed" ] && [ ! -e "\$GC_CITY_PATH/rotate.done" ]; then
+      touch "\$GC_CITY_PATH/rotate.done"; python3 "$TMP/rotate.py" "\$GC_CITY_PATH"
+    fi ;;
+esac
+exec "$RGZ" "\$@"
+STUB
+  chmod +x "$TMP/bin/gzip"
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null || { echo "  (skip $sh: not installed)"; continue; }
+    # control: hook installed, city NOT armed -> the exact truth, so the hook itself changes nothing
+    cp -R "$CITY" "$TMP/city-race-ctl-$sh"
+    got=$(run_block "$sh" "$TMP/city-race-ctl-$sh" "$R0" "$R1")
+    want="session.woke=$RW session.stopped=$RS session.crashed=$RC"
+    [ "$got" = "$want" ] && ok "$sh: race window, no rotation: $got" || bad "$sh: race window control: got '$got', want '$want'"
+    # armed: the rotation happens between the chain check and the live-file read
+    cp -R "$CITY" "$TMP/city-race-$sh"; touch "$TMP/city-race-$sh/rotate.armed"
+    got=$(PATH="$TMP/bin:$PATH" GC_CITY_PATH="$TMP/city-race-$sh" SINCE="$R0" UNTIL="$R1" "$sh" "$BLOCK" 2>"$TMP/race.err" | tail -n 1)
+    err=$(cat "$TMP/race.err")
+    if [ ! -e "$TMP/city-race-$sh/rotate.done" ]; then
+      bad "$sh: rotation hook never fired (the block no longer reads the newest archive in the count phase?) — this test proves nothing"
+    elif [ "$got" != "session.woke=N/A session.stopped=N/A session.crashed=N/A" ]; then
+      bad "$sh: rotation after the chain check: printed '$got' for a log it did not fully read (truth in window: $want)"
+    else
+      case "$err" in
+        *rotated*) ok "$sh: rotation after the chain check -> N/A, refused by name" ;;
+        *) bad "$sh: rotation after the chain check -> N/A but not by name (stderr: '$err')" ;;
+      esac
+    fi
+  done
+  rm -f "$TMP/bin/gzip"
+
 echo "-- a covered but quiet window is a real 0"
   got=$(run_block bash "$CITY" "2026-09-26T13:30:00Z" "2026-09-26T13:40:00Z")
   [ "$got" = "session.woke=0 session.stopped=0 session.crashed=0" ] && ok "quiet window -> 0" || bad "quiet window: got '$got'"
@@ -226,10 +295,15 @@ fi
 # the capped CLI call must be gone from the session-lifecycle step text
 # (captured then matched with case: `writer | grep -q` under pipefail can report a MATCH as no-match)
 LIFECYCLE_TEXT=$(extract fence collect-data 'session.woke')
-case "$LIFECYCLE_TEXT" in
-  *'gc events --since'*) bad "collect-data still pipes 'gc events --since' (500-row cap) for session events" ;;
-  *) ok "no capped 'gc events --since' call for session events" ;;
-esac
+if [ -z "$LIFECYCLE_TEXT" ]; then
+  # an empty extract would fall into the no-match arm below and pass without having looked at anything
+  bad "no delivered code block mentioning session.woke in collect-data — cannot check the capped call is gone"
+else
+  case "$LIFECYCLE_TEXT" in
+    *'gc events --since'*) bad "collect-data still pipes 'gc events --since' (500-row cap) for session events" ;;
+    *) ok "no capped 'gc events --since' call for session events" ;;
+  esac
+fi
 
 # ---- defect 2: --metadata must be valid JSON as delivered ---------------------
 echo "-- step 3 archive command, as delivered"
