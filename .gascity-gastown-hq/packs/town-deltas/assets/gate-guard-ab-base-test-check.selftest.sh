@@ -597,6 +597,17 @@ git -C "$SUB_CLONE" checkout -q -b feat/outside-deleted-sub
 git -C "$SUB_CLONE" rm -q "top/lib/outside.selftest.sh"
 git -C "$SUB_CLONE" commit -q -m "chore: delete a selftest outside the rig subtree"
 git -C "$SUB_CLONE" push -q origin feat/outside-deleted-sub
+# feat/nonascii-inside-sub (gate ga-m9ezwi feedback): a selftest INSIDE sub/ whose name is
+# non-ASCII, plus one real edit outside. With git's default core.quotePath, `diff --name-only`
+# prints the inside path as "sub/lib/caf\303\251.selftest.sh" — quoted, so it no longer starts
+# with the "sub/" prefix and would be counted OUTSIDE (2, truth 1).
+git -C "$SUB_CLONE" checkout -q main
+git -C "$SUB_CLONE" checkout -q -b feat/nonascii-inside-sub
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SUB_CLONE/sub/lib/$(printf 'caf\303\251').selftest.sh"
+printf '# cosmetic edit\n' >> "$SUB_CLONE/top/lib/outside.selftest.sh"
+git -C "$SUB_CLONE" add -A
+git -C "$SUB_CLONE" commit -q -m "test: a non-ASCII selftest inside the subtree, one edit outside it"
+git -C "$SUB_CLONE" push -q origin feat/nonascii-inside-sub
 git -C "$SUB_CLONE" checkout -q main
 
 # Fixture preconditions — without these the block below could pass vacuously.
@@ -694,6 +705,49 @@ eq "outside_subtree: rig is not a git repo -> unknown (an empty diff there must 
 rmdir "$_XK_NOTREPO" 2>/dev/null
 eq "outside_subtree: always exits 0 (safe under the guard's set -e even on 'unknown')" \
   "$(gate_base_test_outside_subtree "" "" "" >/dev/null; echo $?)" "0"
+
+# Gate ga-m9ezwi feedback (blocking): a starved temp file must not read as a measured zero.
+# The live guard is launched as /bin/bash (bash 3.2 on the mini), where a here-document is a
+# temp FILE. When that file cannot be written (ENOSPC/quota — this city has had >=96% disk),
+# bash prints "cannot create temp file for here document", skips the whole loop, and the old
+# helper fell through to `printf 0`: an error reading as a measured zero. `ulimit -f 0` with
+# SIGXFSZ ignored reproduces the starvation without touching the disk. The selftest itself
+# runs under env bash (5.x, pipe-backed here-documents), which never reaches that path — hence
+# the explicit /bin/bash child. The answer must be the TRUE count or `unknown`, never a 0.
+_XK_HD_PROG='while IFS= read -r l; do echo "read:$l"; done <<E
+x
+E'
+_XK_HD_PROBE=$( ( ulimit -f 0; trap '' XFSZ; /bin/bash -c "$_XK_HD_PROG" ) 2>/dev/null )
+_XK_CHILD='GATE_GUARD_LIB_ONLY=1 . "$1"; gate_base_test_outside_subtree "$2" "$3" "$4"'
+if [ -z "$_XK_HD_PROBE" ]; then
+  _XK_STARVED=$( ( ulimit -f 0; trap '' XFSZ; /bin/bash -c "$_XK_CHILD" _ "$GUARD" "$SUB_RIG" "$_XK_BASE" "$_XK_HEAD" ) 2>/dev/null )
+  case "$_XK_STARVED" in
+    2|unknown) ok "outside_subtree: /bin/bash with here-document temp files starved -> '$_XK_STARVED' (true count or unknown), never a silent 0" ;;
+    *) bad "outside_subtree: /bin/bash with here-document temp files starved -> got '$_XK_STARVED', want the true count 2 or unknown (an error read as a measured value)" ;;
+  esac
+else
+  echo "  skip outside_subtree starved-temp-file case: /bin/bash here-documents are pipe-backed on this host, so the path cannot be exercised here (NOT counted as a pass)"
+fi
+eq "outside_subtree: same count under /bin/bash (3.2 on the mini) — the counting form parses and runs there" \
+  "$(/bin/bash -c "$_XK_CHILD" _ "$GUARD" "$SUB_RIG" "$_XK_BASE" "$_XK_HEAD" 2>/dev/null)" "2"
+# The two defensive exits of the counting pipeline cannot be reached with a real git, so shadow
+# printf in the child to force them: (1) the pipeline emits something that is not an integer,
+# (2) the pipeline itself fails. Either way the answer must be `unknown`, never a number.
+_XK_CHILD_GARBAGE='GATE_GUARD_LIB_ONLY=1 . "$1"; printf() { case "$*" in "%s "[0-9]*) builtin printf "%s" "not-a-count" ;; *) builtin printf "$@" ;; esac; }; gate_base_test_outside_subtree "$2" "$3" "$4"'
+_XK_CHILD_PIPEFAIL='GATE_GUARD_LIB_ONLY=1 . "$1"; printf() { case "$*" in "%s "[0-9]*) builtin printf "%s" "$2"; return 1 ;; *) builtin printf "$@" ;; esac; }; gate_base_test_outside_subtree "$2" "$3" "$4"'
+eq "outside_subtree: the counter emits a non-integer -> unknown, NOT a number (integer-or-unknown is self-enforcing)" \
+  "$(/bin/bash -c "$_XK_CHILD_GARBAGE" _ "$GUARD" "$SUB_RIG" "$_XK_BASE" "$_XK_HEAD" 2>/dev/null)" "unknown"
+eq "outside_subtree: the counting pipeline itself fails -> unknown, NOT the count it had reached" \
+  "$(/bin/bash -c "$_XK_CHILD_PIPEFAIL" _ "$GUARD" "$SUB_RIG" "$_XK_BASE" "$_XK_HEAD" 2>/dev/null)" "unknown"
+
+# Gate ga-m9ezwi feedback (medium): with git's default core.quotePath a non-ASCII path is printed
+# quoted, so the "sub/" prefix match fails and an INSIDE selftest is counted OUTSIDE.
+git -C "$SUB_RIG" fetch -q origin feat/nonascii-inside-sub 2>/dev/null
+_XK_NA=$(git -C "$SUB_RIG" rev-parse origin/feat/nonascii-inside-sub)
+eq "nonascii fixture: default git output DOES quote the inside path (the failure mode this block guards)" \
+  "$(git -C "$SUB_RIG" -c core.quotePath=true diff --name-only --diff-filter=AM "${_XK_BASE}..${_XK_NA}" -- ':(top)sub/lib/*.selftest.sh' | grep -c '^"')" "1"
+eq "outside_subtree: a non-ASCII selftest INSIDE sub/ is not counted outside (1 real outside edit) -> 1" \
+  "$(gate_base_test_outside_subtree "$SUB_RIG" "$_XK_BASE" "$_XK_NA")" "1"
 RIG_PATH="$_SAVED_RIG_PATH"
 
 # The call site's own third state: gate_base_test_old_state is documented to print

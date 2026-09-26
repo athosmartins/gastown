@@ -2502,6 +2502,9 @@ gate_base_test_old_state() {
 #   Inside/outside is decided by the prefix git reports for <rig> (`--show-prefix`: "sub/"
 #   for a subdirectory rig, empty at the toplevel), trailing slash included, so "sub-other/x"
 #   — whose name starts with "sub" — is correctly outside "sub/".
+#   Known limit, same as the detection it mirrors: --diff-filter=AM leaves out a selftest that
+#   was RENAMED (status R), so a moved selftest outside the rig is not counted — the number is
+#   a floor for outside changes, not a census. Weigh that before acting on it.
 gate_base_test_outside_subtree() {
   local rig="$1" base="$2" tip="$3" prefix="" all="" f="" n=0
   if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then
@@ -2512,18 +2515,34 @@ gate_base_test_outside_subtree() {
   fi
   # :(top) makes the pathspec ROOT-relative, so the diff sees the whole repo whatever
   # directory -C names (the output of `diff --name-only` is root-relative either way).
-  if ! all=$(git -C "$rig" diff --name-only --diff-filter=AM "${base}..${tip}" -- ':(top)*.selftest.sh' 2>/dev/null); then
+  # core.quotePath=false: by default git prints a non-ASCII path quoted with octal escapes
+  # ("sub/lib/caf\303\251.x"), the leading quote defeats the prefix match below, and a selftest
+  # INSIDE the rig would be counted outside. (Paths git still quotes — a tab, newline, quote or
+  # backslash in the name — are not handled; no selftest has one.)
+  if ! all=$(git -C "$rig" -c core.quotePath=false diff --name-only --diff-filter=AM "${base}..${tip}" -- ':(top)*.selftest.sh' 2>/dev/null); then
     printf 'unknown'; return 0
   fi
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    case "$f" in
-      "$prefix"*) ;;                # inside the rig directory (an empty prefix matches all)
-      *) n=$((n + 1)) ;;
-    esac
-  done <<OUTSIDE_SUBTREE_EOF
-$all
-OUTSIDE_SUBTREE_EOF
+  # Counted through a PIPE, never a here-document: on bash 3.2 (what /bin/bash is, and the shell
+  # the launchd plist runs) a here-document is a temp file, and when it cannot be written (ENOSPC,
+  # quota) bash prints "cannot create temp file for here document", SKIPS the whole loop, and the
+  # count falls through as 0 — an error reading as a measured zero. A pipe has no file behind it.
+  # The case patterns are parenthesised on purpose: an unparenthesised `pat)` inside $( ) is a
+  # syntax error on bash 3.2 (measured, /bin/bash 3.2.57).
+  n=$(printf '%s\n' "$all" | {
+    c=0
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      case "$f" in
+        ("$prefix"*) ;;
+        (*) c=$((c + 1)) ;;
+      esac
+    done
+    printf '%s' "$c"
+  }) || { printf 'unknown'; return 0; }
+  # Self-enforcing "integer or unknown": whatever else came out of the pipeline is not a count.
+  case "$n" in
+    ''|*[!0-9]*) printf 'unknown'; return 0 ;;
+  esac
   printf '%s' "$n"
   return 0
 }
