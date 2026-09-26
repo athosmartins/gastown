@@ -790,8 +790,9 @@ main() {
 
   # ga-mb57np: a run started by dolt-gc-release-trigger.sh (GC_TRIGGERED_RUN=1 — only the
   # literal 1) does ONLY the size-gated dolt_gc step below. Purge/prune/flatten stay on the 2h
-  # cadence: they have no reason to run every few minutes, and a prune batch would also change
-  # which headroom percentage applies (_resolve_gc_min_free_pct) mid-decision.
+  # cadence: they have no reason to run every few minutes. (The headroom percentage does not depend
+  # on which steps ran: it was resolved just above from PRUNE_ENABLED as configured, and the trigger
+  # resolves it the same way — so a triggered run and the trigger's own decision use the same gate.)
   if [ "${GC_TRIGGERED_RUN:-0}" = "1" ]; then
     log "triggered run (ga-mb57np: headroom poll saw the gate reachable) — running ONLY the size-gated dolt_gc step; purge/prune/flatten stay on the 2h cadence"
     _run_size_gc
@@ -923,9 +924,15 @@ if [ "${DOLT_GC_MAINT_LIB:-0}" != "1" ]; then
     0) trap '_dgm_lock_release "$GC_MAINT_LOCKDIR"' EXIT ;;
     1) log "another dolt-gc-maintenance run holds $GC_MAINT_LOCKDIR (pid $(head -1 "$GC_MAINT_LOCKDIR/pid" 2>/dev/null)) — exiting; nothing done in this invocation"
        exit 0 ;;
-    # Cannot create the lock at all (fs trouble): run anyway, as this job always has — refusing
-    # would silently stop ALL maintenance over a bookkeeping failure — but say so.
-    *) log "WARN: cannot create the single-instance lock $GC_MAINT_LOCKDIR — running WITHOUT overlap protection" ;;
+    # Cannot create the lock at all (fs trouble). The 2h cycle runs anyway, as this job always has —
+    # refusing would silently stop ALL maintenance over a bookkeeping failure — but says so. A
+    # TRIGGERED run is the extra path that may release the staging: under the same doubt it stays
+    # inert (a missed one costs nothing; the next poll retries).
+    *) if [ "${GC_TRIGGERED_RUN:-0}" = "1" ]; then
+         log "WARN: cannot create the single-instance lock $GC_MAINT_LOCKDIR — a TRIGGERED run (which may release the staging) does not run without overlap protection; nothing done in this invocation"
+         exit 0
+       fi
+       log "WARN: cannot create the single-instance lock $GC_MAINT_LOCKDIR — running WITHOUT overlap protection" ;;
   esac
   main
   exit 0

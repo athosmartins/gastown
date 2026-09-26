@@ -42,6 +42,9 @@ if [ ! -f "$TRIGGER" ]; then
 fi
 # shellcheck disable=SC1090
 . "$TRIGGER"
+# The real run body, captured BEFORE the end-to-end section stubs it: until gate round 2 no test
+# ran it (the env hand-off to the job it starts was only ever seen through the stub).
+_REAL_RUN_MAINT="$(declare -f _trg_run_maintenance)"
 
 # ── _gc_trigger_decision: pure. Args: streak avail size staging pct floor min_streak slack
 #    release_enabled(1|0) cooldown_ok(1|0). World = the measured 2026-09-26 numbers:
@@ -126,23 +129,56 @@ GC_TRIGGER_BACKOFF_BASE_S=300; GC_TRIGGER_BACKOFF_MAX_S=7200
 # ═══ trigger_main end to end ═════════════════════════════════════════════════════════════
 # Real: state file, streak file, own lock, log, clock arithmetic, decision order.
 # Stubs: disk/dir readers, the busy check, the maintenance launch.
-KICKS=0; KICK_ENV=""; KICK_MODE="fail"      # fail = leave the streak alone; ok = clear it (the GC was attempted)
+KICKS=0; KICK_ENV=""; KICK_MODE="fail"; KICK_RC=0   # fail = leave the streak alone; ok = clear it (the GC was attempted); else = mangle_streak <mode>
 AVAIL=10000; SIZE_MB=8247; STAGING_MB=9601; BUSY=""
-_avail_mb() { printf '%s' "$AVAIL"; }
-_trg_dir_mb() { case "$1" in */.beads/dolt/hq) printf '%s' "$SIZE_MB" ;; */.dolt-backup/hq) printf '%s' "$STAGING_MB" ;; *) printf '' ;; esac; }
-_gc_release_busy() { if [ -n "$BUSY" ]; then echo "$BUSY"; return 0; fi; return 1; }
-_trg_run_maintenance() { KICKS=$((KICKS+1)); KICK_ENV="${GC_TRIGGERED_RUN:-}"; [ "$KICK_MODE" = "ok" ] && printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; return 0; }
-NOW=2000000000
+# The readers COUNT into files: the poll calls them inside $(...), a subshell, so a shell-variable
+# counter never reaches the parent — which made the old "no disk read" assertion vacuous (it passed
+# with the reads moved ahead of the chronic check; found by the gate round 2 reviewer's mutants).
+_avail_mb() { echo x >> "$T/reads.avail"; printf '%s' "$AVAIL"; }
+_trg_dir_mb() { echo x >> "$T/reads.du"; case "$1" in */.beads/dolt/hq) printf '%s' "$SIZE_MB" ;; */.dolt-backup/hq) printf '%s' "$STAGING_MB" ;; *) printf '' ;; esac; }
+_gc_release_busy() { echo x >> "$T/reads.busy"; if [ -n "$BUSY" ]; then echo "$BUSY"; return 0; fi; return 1; }
+nreads() { if [ -f "$T/reads.$1" ]; then wc -l < "$T/reads.$1" | tr -d '[:space:]'; else echo 0; fi; }
+# mangle_streak <mode> — put the job's skip-streak file into a shape the job never writes (or remove it).
+mangle_streak() {
+  local f="$GC_SKIP_STREAK_STATE"
+  chmod 644 "$f" 2>/dev/null; rm -f "$f" 2>/dev/null; rmdir "$f" 2>/dev/null
+  case "$1" in
+    remove)     ;;
+    empty)      : > "$f" ;;
+    garble)     printf 'zz\n' > "$f" ;;
+    partial)    printf '5' > "$f" ;;               # cut mid-write: no newline
+    nocount)    printf '\n' > "$f" ;;
+    noflag)     printf '53\n' > "$f" ;;
+    badflag)    printf '53 2\n' > "$f" ;;
+    zeroone)    printf '0 1\n' > "$f" ;;
+    leadzero)   printf '053 1\n' > "$f" ;;
+    twolines)   printf '53 1\n0 0\n' > "$f" ;;
+    trailing)   printf '53 1 x\n' > "$f" ;;
+    dir)        mkdir "$f" ;;
+    unreadable) printf '53 1\n' > "$f"; chmod 000 "$f" ;;   # transient EACCES-style read failure
+  esac
+}
+_stub_run() {
+  KICKS=$((KICKS+1)); KICK_ENV="${GC_TRIGGERED_RUN:-}"
+  case "$KICK_MODE" in
+    fail) ;;
+    ok)   printf '0 0\n' > "$GC_SKIP_STREAK_STATE" ;;
+    *)    mangle_streak "$KICK_MODE" ;;
+  esac
+  return "${KICK_RC:-0}"
+}
+_trg_run_maintenance() { _stub_run; }   # (a function called from the stub sees the caller's GC_TRIGGERED_RUN=1 prefix)
+NOW=2000001600     # % 3600 == 0: the first poll of an hour (the hourly-throttled WARNs log here)
 reset_main() {
   rm -rf "$T/city"; mkdir -p "$T/city/.dolt-backup/hq" "$T/city/.beads/dolt/hq" "$T/rt"
   printf '5:__DOLT__:lock:root:gcgen\n' > "$T/city/.dolt-backup/hq/manifest"
   BACKUP_STAGING="$T/city/.dolt-backup"; DB="hq"; DOLTDIR="$T/city/.beads/dolt/hq"
-  rm -f "$GC_TRIGGER_STATE" "$GC_RELEASE_STATE" "$DOLT_GC_MAINT_LOG"; rm -rf "$GC_TRIGGER_LOCKDIR" "$GC_MAINT_LOCKDIR" "$GC_RELEASE_BACKUP_LOCKDIR"
-  printf '53 1\n' > "$GC_SKIP_STREAK_STATE"
+  rm -f "$GC_TRIGGER_STATE" "$GC_RELEASE_STATE" "$DOLT_GC_MAINT_LOG" "$T"/reads.*; rm -rf "$GC_TRIGGER_LOCKDIR" "$GC_MAINT_LOCKDIR" "$GC_RELEASE_BACKUP_LOCKDIR"
+  mangle_streak remove; printf '53 1\n' > "$GC_SKIP_STREAK_STATE"
   GC_TRIGGER_ENABLED=1; GC_RELEASE_STAGING_ENABLED=1; GC_RELEASE_MIN_STREAK=6; GC_RELEASE_SLACK_MB=2048; GC_RELEASE_COOLDOWN_H=168
   GC_MIN_FREE_PCT=""; PRUNE_ENABLED=0; GC_MIN_FREE_ABS_MB=3072; THRESHOLD_G=1
   GC_TRIGGER_BACKOFF_BASE_S=300; GC_TRIGGER_BACKOFF_MAX_S=7200
-  KICKS=0; KICK_ENV=""; KICK_MODE="fail"; AVAIL=10000; SIZE_MB=8247; STAGING_MB=9601; BUSY=""; GC_NOW_EPOCH=$NOW
+  KICKS=0; KICK_ENV=""; KICK_MODE="fail"; KICK_RC=0; AVAIL=10000; SIZE_MB=8247; STAGING_MB=9601; BUSY=""; GC_NOW_EPOCH=$NOW
 }
 poll() { trigger_main >/dev/null 2>&1; }
 sget() { _trg_state_get "$GC_TRIGGER_STATE" "$1"; }
@@ -176,15 +212,17 @@ reset_main; AVAIL=12486
 poll; GC_NOW_EPOCH=$((NOW+300)); poll; GC_NOW_EPOCH=$((NOW+300+600)); poll
 [ "$KICKS" -eq 3 ] && [ "$(sget attempts)" = "3" ] && ok "backoff: three refused attempts in a row are all recorded (attempts=3)" || bad "three failures: kicks=$KICKS attempts=$(sget attempts)"
 
-# not chronic → nothing, and it is CHEAP: neither disk reader is consulted
+# not chronic → nothing, and it is CHEAP: none of the three readers (df, du, the busy ps) is consulted.
+# (Counted through files — see the reader stubs: a shell-variable counter dies in the $(...) subshell.)
 reset_main; printf '2 0\n' > "$GC_SKIP_STREAK_STATE"; AVAIL=20000
-_READS=0; _avail_mb() { _READS=$((_READS+1)); printf '%s' "$AVAIL"; }
 poll
-[ "$KICKS" -eq 0 ] && [ "$_READS" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && ok "poll: healthy state (streak below the minimum) → exits after reading one small file, no disk read, no run" || bad "poll non-chronic: kicks=$KICKS reads=$_READS dec='$(sdec)'"
-_avail_mb() { printf '%s' "$AVAIL"; }
-reset_main; rm -f "$GC_SKIP_STREAK_STATE"; AVAIL=20000; poll
-[ "$KICKS" -eq 0 ] && ok "poll: no streak state at all (unreadable = not chronic) → no run" || bad "poll no-streak-state started a run"
-reset_main; printf 'junk\n' > "$GC_SKIP_STREAK_STATE"; AVAIL=20000; poll
+[ "$KICKS" -eq 0 ] && [ "$(nreads avail)" -eq 0 ] && [ "$(nreads du)" -eq 0 ] && [ "$(nreads busy)" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && ok "poll: healthy state (streak below the minimum) → exits after reading one small file: no df, no du, no ps, no run" || bad "poll non-chronic: kicks=$KICKS avail=$(nreads avail) du=$(nreads du) busy=$(nreads busy) dec='$(sdec)'"
+# the counter must be able to see a read at all, or the assertion above proves nothing
+reset_main; AVAIL=12486; poll
+[ "$(nreads avail)" -ge 1 ] && [ "$(nreads du)" -ge 2 ] && ok "poll: (control) in a chronic state the readers ARE counted (df=$(nreads avail), du=$(nreads du)) — the cheap-poll assertion is not vacuous" || bad "control: readers not counted (avail=$(nreads avail) du=$(nreads du))"
+reset_main; mangle_streak remove; AVAIL=20000; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && ok "poll: NO streak file (the job never skipped) → no streak, not chronic → no run" || bad "poll no-streak-state: kicks=$KICKS dec='$(sdec)'"
+reset_main; mangle_streak garble; AVAIL=20000; poll
 [ "$KICKS" -eq 0 ] && ok "poll: garbled streak state → no run" || bad "poll junk-streak started a run"
 
 # unmeasurable inputs never start a run
@@ -351,6 +389,203 @@ if [ "$(id -u)" != "0" ]; then
   chmod 644 "$GC_TRIGGER_STATE"
 fi
 
+# ═══ gate round 2 (ga-mb57np): the run's OUTCOME and the streak read are third-state too ══════
+# The reviewer's repro: the job REFUSED (its streak file still said "53 1") but the trigger's read of
+# that file after the run failed → the read collapsed to "0" = "the job cleared it": it logged
+# "dolt_gc ran", reset the backoff to attempts=0/next_allowed=0, and the very next poll started a
+# SECOND run. The job's own reader is fail-SAFE for alerts (garbled → "0 0"), which is right for a
+# counter that only drives a notify and wrong here. Class: a value that could not be read must never
+# take the branch that means "it worked" — three states (cleared / still standing / cannot tell),
+# and "cannot tell" is treated like "still standing".
+
+# (1) The strict reader itself — every shape, including the ones the job never writes.
+_sr() { printf '%b' "$1" > "$T/sr.state"; _trg_streak_read "$T/sr.state"; }
+_sr_ok=1
+_chk() { [ "$(_sr "$1")" = "$2" ] || { _sr_ok=0; echo "    (streak file '$1' read as '$(_sr "$1")', want '$2')"; }; }
+_chk '0 0\n'      "cleared"
+_chk '53 1\n'     "standing 53"
+_chk '1 0\n'      "standing 1"
+_chk '62 0\n'     "standing 62"
+_chk ''           "unreadable"          # empty
+_chk '\n'         "unreadable"          # a bare newline
+_chk 'zz\n'       "unreadable"
+_chk '5\c'        "unreadable"          # cut mid-write: no newline
+_chk '53 1\c'     "unreadable"          # a complete-looking record with no newline is a torn write
+_chk '53\n'       "unreadable"          # alerted flag missing
+_chk '53 2\n'     "unreadable"          # the flag is 0|1
+_chk '0 1\n'      "unreadable"          # cleared is EXACTLY "0 0" (what _clear_skip_streak writes)
+_chk '00 0\n'     "unreadable"
+_chk '053 1\n'    "unreadable"          # no leading zeros: the job never writes them
+_chk ' 53 1\n'    "unreadable"
+_chk '53  1\n'    "unreadable"
+_chk '53 1 x\n'   "unreadable"
+_chk '5 3 1\n'    "unreadable"
+_chk '53 1\n0 0\n' "unreadable"         # exactly one record
+_chk '-1 0\n'     "unreadable"
+_chk '53 1\n\c'   "standing 53"         # (control) the same record, newline present
+[ "$_sr_ok" = "1" ] && ok "streak reader: exactly '0 0\\n' is cleared; '<n> <0|1>\\n' (n>=1, no leading zero) is standing; every other shape (empty, cut, torn, extra field, 0 1, two lines, ...) is unreadable" || bad "streak reader misclassified a shape (see lines above)"
+unset -f _chk; unset _sr_ok
+rm -f "$T/sr.state"; [ "$(_trg_streak_read "$T/sr.state")" = "absent" ] && ok "streak reader: no file → absent (the job never skipped — no streak, not unreadable)" || bad "streak reader absent: '$(_trg_streak_read "$T/sr.state")'"
+mkdir -p "$T/sr.dir"; [ "$(_trg_streak_read "$T/sr.dir")" = "unreadable" ] && ok "streak reader: a directory where the file should be → unreadable" || bad "streak reader dir: '$(_trg_streak_read "$T/sr.dir")'"; rmdir "$T/sr.dir"
+if [ "$(id -u)" != "0" ]; then
+  printf '53 1\n' > "$T/sr.state"; chmod 000 "$T/sr.state"
+  [ "$(_trg_streak_read "$T/sr.state")" = "unreadable" ] && ok "streak reader: a file that exists but cannot be opened → unreadable (never 'cleared', never 0)" || bad "streak reader chmod 000: '$(_trg_streak_read "$T/sr.state")'"
+  chmod 644 "$T/sr.state"
+fi
+rm -f "$T/sr.state"; unset -f _sr
+
+# (2) THE regression: the outcome after a run. Every shape the file can be left in that is not exactly
+#     "0 0" counts as NOT cleared: the attempt is counted, the backoff armed, the log says it cannot tell.
+_out_ok=1
+for _mode in remove empty garble partial nocount noflag badflag zeroone leadzero twolines trailing dir; do
+  reset_main; AVAIL=12486; KICK_MODE="$_mode"; poll
+  if [ "$KICKS" -eq 1 ] && [ "$(sget attempts)" = "1" ] && [ "$(sget next_allowed)" = "$((NOW+300))" ] \
+     && ! grep -q 'skip streak is cleared' "$DOLT_GC_MAINT_LOG" && grep -q 'cannot tell whether the job cleared' "$DOLT_GC_MAINT_LOG"; then :
+  else _out_ok=0; echo "    (streak left as '$_mode' after the run: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' log='$(grep 'trigger:' "$DOLT_GC_MAINT_LOG" | tail -1)')"; fi
+done
+[ "$_out_ok" = "1" ] && ok "outcome: a streak file left absent/empty/garbled/torn/'0 1'/two-line/directory after the run → NOT 'cleared': attempt counted, 300s backoff armed, the log says it cannot tell" || bad "outcome: an unreadable streak after the run was taken as 'cleared' (see lines above)"
+unset _out_ok _mode
+if [ "$(id -u)" != "0" ]; then
+  # The reviewer's own repro: the read fails TRANSIENTLY right after the run (the file still says
+  # "53 1"). Old code: attempts=0, next_allowed=0, and the next poll started a second run.
+  reset_main; AVAIL=12486; KICK_MODE="unreadable"; poll
+  chmod 644 "$GC_SKIP_STREAK_STATE"
+  [ "$KICKS" -eq 1 ] && [ "$(sget attempts)" = "1" ] && [ "$(sget next_allowed)" = "$((NOW+300))" ] && ok "outcome: the after-run read FAILED (file still '53 1') → treated as not cleared: attempts=1, backoff armed" || bad "transient after-read: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+  KICK_MODE="fail"; GC_NOW_EPOCH=$((NOW+60)); poll
+  [ "$KICKS" -eq 1 ] && [ "$(sdec)" = "WAIT backoff" ] && ok "outcome: ...and the very next poll does NOT start a second run (the reviewer's repro: backoff was erased, a 2nd run started)" || bad "transient after-read: next poll kicks=$KICKS dec='$(sdec)' (a second run started = backoff lost)"
+fi
+# a well-formed STANDING streak keeps its own (unchanged) message; "0 0" is still the only cleared
+reset_main; AVAIL=12486; KICK_MODE="fail"; poll
+grep -q 'WITHOUT clearing the skip streak (streak=53)' "$DOLT_GC_MAINT_LOG" && ok "outcome: a readable standing streak is reported as such (streak=53)" || bad "standing streak message missing"
+reset_main; AVAIL=12486; KICK_MODE="ok"; poll
+grep -q 'skip streak is cleared' "$DOLT_GC_MAINT_LOG" && [ "$(sget attempts)" = "0" ] && [ "$(sget next_allowed)" = "0" ] && ok "outcome: exactly '0 0' is still 'cleared' → attempts back to 0 (success path intact)" || bad "cleared path broke: '$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+# the child's exit status is no longer discarded
+reset_main; AVAIL=12486; KICK_MODE="fail"; KICK_RC=127; poll
+grep -q 'exited rc=127' "$DOLT_GC_MAINT_LOG" && [ "$(sget attempts)" = "1" ] && ok "outcome: a job that could not start (rc=127) is logged as such, not as 'the job refused (see the lines above)'" || bad "rc not logged: $(grep 'trigger:' "$DOLT_GC_MAINT_LOG" | tail -1)"
+reset_main; AVAIL=12486; KICK_MODE="ok"; KICK_RC=137; poll
+grep -q 'exited rc=137' "$DOLT_GC_MAINT_LOG" && ok "outcome: a nonzero exit is logged even when the streak reads cleared" || bad "rc 137 not logged"
+
+# (3) The SAME read at decision time. Inert direction (a garbled file used to read as 0 →
+#     "streak-too-short"), but the state file then said something FALSE. Now: unreadable = its own
+#     decision, not an attempt, and the backoff it does not touch stays.
+_dt_ok=1
+for _mode in empty garble partial nocount noflag badflag zeroone leadzero twolines trailing dir; do
+  reset_main; AVAIL=20000; mangle_streak "$_mode"
+  printf 'poll=%s decision=WAIT backoff attempts=3 next_allowed=%s\n' "$((NOW-10))" "$((NOW+1000))" > "$GC_TRIGGER_STATE"
+  poll
+  if [ "$KICKS" -ne 0 ] || [ "$(sdec)" != "WAIT streak-unreadable" ] || [ "$(sget attempts)" != "3" ] || [ "$(sget next_allowed)" != "$((NOW+1000))" ]; then _dt_ok=0; echo "    (streak '$_mode' at decision time: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)')"; fi
+done
+[ "$_dt_ok" = "1" ] && ok "decision-time: an unreadable streak file → no run, state says WAIT streak-unreadable (not the false 'streak-too-short'), the recorded backoff is untouched" || bad "decision-time: an unreadable streak was mislabelled or acted on (see lines above)"
+unset _dt_ok _mode
+reset_main; AVAIL=20000; mangle_streak zeroone; poll
+grep -q "skip-streak file .* is not a complete" "$DOLT_GC_MAINT_LOG" && ok "decision-time: the unreadable streak is logged (visible, not silent)" || bad "decision-time: unreadable streak not logged"
+reset_main; AVAIL=20000; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && ok "decision-time: '0 0' (cleared) is a KNOWN not-chronic state → WAIT streak-too-short" || bad "decision-time '0 0': kicks=$KICKS dec='$(sdec)'"
+
+# (4) A backoff belongs to an EPISODE. Once the streak is KNOWN to be below the minimum (the 2h job's
+#     own GC cleared it), the episode is over: the next one starts at attempt 1, not near the cap.
+reset_main; AVAIL=12486; printf '2 0\n' > "$GC_SKIP_STREAK_STATE"
+printf 'poll=%s decision=KICK release (running) attempts=4 next_allowed=%s\n' "$((NOW-10))" "$((NOW+7000))" > "$GC_TRIGGER_STATE"
+poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && [ "$(sget attempts)" = "0" ] && [ "$(sget next_allowed)" = "0" ] && ok "episode: streak known below the minimum → the previous episode's backoff (attempts=4, +7000s) is dropped" || bad "episode reset: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+printf '53 1\n' > "$GC_SKIP_STREAK_STATE"; GC_NOW_EPOCH=$((NOW+10)); poll
+[ "$KICKS" -eq 1 ] && [ "$(sget attempts)" = "1" ] && [ "$(sget next_allowed)" = "$((NOW+10+300))" ] && ok "episode: the next chronic episode's first failure backs off 300s (not a leftover long backoff)" || bad "next episode: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+
+# (5) Knob edge: GC_RELEASE_MIN_STREAK=0 made "streak >= min" true for a HEALTHY streak of 0 — every
+#     poll (288/day) eligible, no backoff (each run clears the streak, which resets attempts).
+#     A minimum below 1 is unusable, not "always chronic".
+[ "$(dec 0 20000 $SZ $ST $PCT $FL 0 $SL 1 1)" = "WAIT unmeasurable-input" ] && [ "$(dec 0 20000 $SZ $ST $PCT $FL 00 $SL 1 1)" = "WAIT unmeasurable-input" ] && ok "decision: min_streak 0 (or 00) → WAIT unmeasurable-input, never 'every healthy poll is chronic'" || bad "decision min_streak 0 got: '$(dec 0 20000 $SZ $ST $PCT $FL 0 $SL 1 1)'"
+[ "$(dec 1 20000 $SZ $ST $PCT $FL 1 $SL 1 1)" = "KICK direct" ] && ok "decision: min_streak 1 is the smallest usable minimum (a single skip is chronic)" || bad "decision min_streak 1 got: '$(dec 1 20000 $SZ $ST $PCT $FL 1 $SL 1 1)'"
+_mz_ok=1
+for _min in 0 00 "" abc; do
+  reset_main; AVAIL=20000; GC_RELEASE_MIN_STREAK="$_min"; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; poll
+  [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT unmeasurable-input" ] || { _mz_ok=0; echo "    (GC_RELEASE_MIN_STREAK='$_min' at streak 0: kicks=$KICKS dec='$(sdec)')"; }
+done
+[ "$_mz_ok" = "1" ] && ok "poll: GC_RELEASE_MIN_STREAK 0/00/empty/non-numeric at a healthy streak → no run, WAIT unmeasurable-input (3 polls in a row can no longer start 3 GCs)" || bad "poll: an unusable GC_RELEASE_MIN_STREAK let a healthy poll through"
+unset _mz_ok _min
+
+# (6) A backoff written under a clock that ran fast must not hold the trigger inert past its own cap.
+reset_main; AVAIL=12486
+printf 'poll=%s decision=WAIT backoff attempts=2 next_allowed=%s\n' "$((NOW-10))" "$((NOW+864000))" > "$GC_TRIGGER_STATE"
+poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && [ "$(sget next_allowed)" = "$((NOW+7200))" ] && ok "backoff: a next_allowed 10 days ahead is clamped to now+cap (7200s)" || bad "clamp: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+GC_NOW_EPOCH=$((NOW+7200)); poll
+[ "$KICKS" -eq 1 ] && ok "backoff: ...and the trigger resumes when the CAP elapses, not when the skewed timestamp does" || bad "clamp: still inert at now+cap (kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)')"
+
+# (7) The kill switch is a pause, not a reset: the recorded backoff survives GC_TRIGGER_ENABLED=0.
+reset_main; AVAIL=12486
+printf 'poll=%s decision=WAIT backoff attempts=3 next_allowed=%s\n' "$((NOW-10))" "$((NOW+1000))" > "$GC_TRIGGER_STATE"
+GC_TRIGGER_ENABLED=0; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "DISABLED" ] && [ "$(sget attempts)" = "3" ] && [ "$(sget next_allowed)" = "$((NOW+1000))" ] && ok "kill switch: DISABLED keeps attempts/next_allowed (re-enabling does not forget the backoff)" || bad "disabled state: '$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+GC_TRIGGER_ENABLED=1; GC_NOW_EPOCH=$((NOW+10)); poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && ok "kill switch: after re-enabling, the backoff is still in force" || bad "re-enabled: kicks=$KICKS dec='$(sdec)'"
+reset_main; GC_TRIGGER_ENABLED=0; poll
+[ "$(sdec)" = "DISABLED" ] && [ "$(sget attempts)" = "0" ] && ok "kill switch: with no prior state DISABLED starts from a clean record" || bad "disabled first: '$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+reset_main; GC_TRIGGER_ENABLED=0; printf 'garbage\n' > "$GC_TRIGGER_STATE"; poll
+[ "$(sget attempts)" = "0" ] && [ "$(sget next_allowed)" = "0" ] && ok "kill switch: an unreadable prior state is not trusted for its backoff (records 0/0)" || bad "disabled over garbage: '$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+
+# (8) Cheapest-first inside the eligible path: a poll in its backoff window must not fork the `ps`
+#     busy check (~1.2 s at load, 24×/h for nothing) — and the header's cost claim depends on it.
+reset_main; AVAIL=12000; BUSY="backup-writer-running"
+printf 'poll=%s decision=WAIT backoff attempts=2 next_allowed=%s\n' "$((NOW-10))" "$((NOW+600))" > "$GC_TRIGGER_STATE"
+poll
+[ "$KICKS" -eq 0 ] && [ "$(nreads busy)" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && ok "cost: inside a backoff window the release poll skips the ps busy check (busy calls=0), decision WAIT backoff" || bad "backoff before busy: kicks=$KICKS busy_calls=$(nreads busy) dec='$(sdec)'"
+reset_main; AVAIL=12000; BUSY="backup-writer-running"; poll
+[ "$(nreads busy)" -eq 1 ] && [[ "$(sdec)" == "WAIT staging-busy"* ]] && ok "cost: (control) with no backoff the release poll DOES run the busy check once" || bad "busy control: busy_calls=$(nreads busy) dec='$(sdec)'"
+reset_main; AVAIL=20000; poll
+[ "$(nreads busy)" -eq 0 ] && ok "cost: a DIRECT kick never runs the busy check (nothing is released on that path)" || bad "direct kick ran the busy check ($(nreads busy))"
+
+# (9) A state that cannot be written is visible, not silent: WAIT-path writes used to fail without a
+#     word (no heartbeat, no log line). Logged at most ~hourly, so 288 polls/day cannot flood the log.
+if [ "$(id -u)" != "0" ]; then
+  reset_main; AVAIL=7263
+  printf 'poll=%s decision=WAIT x attempts=0 next_allowed=0\n' "$((NOW-10))" > "$GC_TRIGGER_STATE"; chmod 444 "$GC_TRIGGER_STATE"
+  poll
+  [ "$KICKS" -eq 0 ] && grep -q 'cannot write .* not recorded' "$DOLT_GC_MAINT_LOG" && ok "state write: a WAIT-path write that fails is logged (no more silent missing heartbeat)" || bad "silent WAIT write failure: kicks=$KICKS log='$(tail -2 "$DOLT_GC_MAINT_LOG" 2>/dev/null)'"
+  : > "$DOLT_GC_MAINT_LOG"; GC_NOW_EPOCH=$((NOW+1800)); poll
+  [ ! -s "$DOLT_GC_MAINT_LOG" ] && ok "state write: the same failure mid-hour is NOT logged again (throttled, no 288/day)" || bad "write-failure WARN not throttled: $(cat "$DOLT_GC_MAINT_LOG")"
+  GC_NOW_EPOCH=$((NOW+3600)); poll
+  grep -q 'cannot write .* not recorded' "$DOLT_GC_MAINT_LOG" && ok "state write: ...and logged again at the next hour" || bad "write-failure WARN never repeats"
+  chmod 644 "$GC_TRIGGER_STATE"
+  # an unreadable state that ALSO cannot be rewritten must not claim it reset it
+  reset_main; AVAIL=20000; mkdir -p "$T/ro"; printf 'garbage\n' > "$T/ro/state"; GC_TRIGGER_STATE="$T/ro/state"; chmod 555 "$T/ro"; chmod 444 "$T/ro/state"
+  poll
+  [ "$KICKS" -eq 0 ] && ! grep -q 'reset to a clean record' "$DOLT_GC_MAINT_LOG" && grep -q 'cannot be rewritten' "$DOLT_GC_MAINT_LOG" && ok "state: an unreadable state that cannot be rewritten says so — it does not claim 'resetting it'" || bad "unrewritable unreadable state: kicks=$KICKS log='$(tail -2 "$DOLT_GC_MAINT_LOG" 2>/dev/null)'"
+  chmod 755 "$T/ro"; chmod 644 "$T/ro/state"; rm -f "$T/ro/state"; rmdir "$T/ro"; GC_TRIGGER_STATE="$T/trigger.state"
+fi
+
+# (10) The REAL run body (until now only ever stubbed). It must hand the job GC_TRIGGERED_RUN=1 — the
+#      literal 1, and NOT the library flag (a job that loaded as a library would do nothing and exit 0) —
+#      and its exit status must reach the poll. Runs under the same bash the selftest runs under.
+eval "$_REAL_RUN_MAINT"
+cat > "$T/fakejob.sh" <<'FAKEJOB'
+#!/bin/bash
+printf 'GC_TRIGGERED_RUN=%s LIB=%s ARGS=%s\n' "${GC_TRIGGERED_RUN-<unset>}" "${DOLT_GC_MAINT_LIB-<unset>}" "$#" > "$FAKEJOB_OUT"
+[ -n "${FAKEJOB_STREAK:-}" ] && printf '%s\n' "$FAKEJOB_STREAK" > "$GC_SKIP_STREAK_STATE"
+exit "${FAKEJOB_RC:-0}"
+FAKEJOB
+chmod +x "$T/fakejob.sh"
+export FAKEJOB_OUT="$T/fakejob.out"
+_MAINT_SAVED="$MAINT"; MAINT="$T/fakejob.sh"
+rm -f "$FAKEJOB_OUT"; GC_TRIGGERED_RUN=1 _trg_run_maintenance
+[ "$(cat "$FAKEJOB_OUT" 2>/dev/null)" = "GC_TRIGGERED_RUN=1 LIB=<unset> ARGS=0" ] && ok "run body: the REAL _trg_run_maintenance hands the job GC_TRIGGERED_RUN=1, no library flag, no arguments" || bad "run body env: '$(cat "$FAKEJOB_OUT" 2>/dev/null)'"
+rm -f "$FAKEJOB_OUT"; ( unset GC_TRIGGERED_RUN; _trg_run_maintenance )
+[ "$(cat "$FAKEJOB_OUT" 2>/dev/null)" = "GC_TRIGGERED_RUN=<unset> LIB=<unset> ARGS=0" ] && ok "run body: (control) the marker comes from the CALL SITE prefix — the body itself sets nothing" || bad "run body control: '$(cat "$FAKEJOB_OUT" 2>/dev/null)'"
+export FAKEJOB_RC=7; GC_TRIGGERED_RUN=1 _trg_run_maintenance; _rc=$?
+[ "$_rc" -eq 7 ] && ok "run body: the job's exit status is returned (7)" || bad "run body rc: $_rc"
+MAINT="$T/does-not-exist.sh"; GC_TRIGGERED_RUN=1 _trg_run_maintenance 2>/dev/null; _rc=$?
+[ "$_rc" -ne 0 ] && ok "run body: a job that cannot start (missing script) is a nonzero status, not a silent 0" || bad "run body: missing job returned 0"
+export FAKEJOB_RC=0
+# ...and end to end through the poll with the REAL body: the poll's call site really passes the marker
+# (it would not if `GC_TRIGGERED_RUN=1` were dropped from the call), and the job's clear is honoured.
+MAINT="$T/fakejob.sh"
+reset_main; AVAIL=12486; export FAKEJOB_STREAK="0 0"; rm -f "$FAKEJOB_OUT"; poll
+[ "$(cat "$FAKEJOB_OUT" 2>/dev/null)" = "GC_TRIGGERED_RUN=1 LIB=<unset> ARGS=0" ] && [ "$(sget attempts)" = "0" ] && grep -q 'skip streak is cleared' "$DOLT_GC_MAINT_LOG" && ok "run body: poll → real body → job: the marker arrives, the job's clear ('0 0') is read back as cleared" || bad "poll→real body: out='$(cat "$FAKEJOB_OUT" 2>/dev/null)' state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)'"
+reset_main; AVAIL=12486; export FAKEJOB_STREAK="" FAKEJOB_RC=127; rm -f "$FAKEJOB_OUT"; poll
+[ "$(sget attempts)" = "1" ] && grep -q 'exited rc=127' "$DOLT_GC_MAINT_LOG" && ok "run body: poll → real body → a job that exits 127 leaves the streak standing → attempt counted, rc logged" || bad "poll→real body rc: state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' log='$(grep 'trigger:' "$DOLT_GC_MAINT_LOG" | tail -1)'"
+unset FAKEJOB_STREAK FAKEJOB_RC FAKEJOB_OUT _rc; MAINT="$_MAINT_SAVED"; unset _MAINT_SAVED; rm -f "$T/fakejob.sh" "$T/fakejob.out"
+_trg_run_maintenance() { _stub_run; }   # back to the stub for the rest of the file
+
 # ── the trigger is NOT a second way to delete, and does not export lib mode to its child ──
 _code="$(grep -v '^[[:space:]]*#' "$TRIGGER")"
 printf '%s\n' "$_code" | grep -Eq '(^|[^A-Za-z_])rm( |$)|rmdir|unlink|_gc_maybe_release_staging|_s3proof_' && bad "static: the trigger references a deletion/release/proof primitive — it must only DECIDE and start the job" || ok "static: no rm/rmdir/unlink, no release or S3-proof call in the trigger — deletion stays in the maintenance job"
@@ -359,7 +594,7 @@ printf '%s\n' "$_code" | grep -Eq 'GC_TRIGGERED_RUN=1' && ok "static: the job is
 /bin/bash -n "$TRIGGER" 2>/dev/null && ok "static: parses under /bin/bash (3.2) — the interpreter launchd runs it with" || bad "static: does not parse under /bin/bash 3.2"
 unset _code
 
-unset -f _avail_mb _trg_dir_mb _gc_release_busy _trg_run_maintenance reset_main poll sget sdec dec
+unset -f _avail_mb _trg_dir_mb _gc_release_busy _trg_run_maintenance _stub_run reset_main poll sget sdec dec nreads mangle_streak
 case "$T" in "${TMPDIR:-/tmp}"/dolt-gc-trigger-selftest.*) rm -rf "$T" ;; esac
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

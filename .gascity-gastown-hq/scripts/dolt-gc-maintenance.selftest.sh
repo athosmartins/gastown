@@ -535,6 +535,75 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   case "$XT" in "${TMPDIR:-/tmp}"/dolt-gc-triggered-selftest.*) rm -rf "$XT" ;; esac
 fi
 
+# ── the REAL entry point (gate round 2, ga-mb57np) ──────────────────────────────────────
+# The lock primitives are unit-tested above, but "two runs never overlap" is a property of how the
+# ENTRY POINT uses them: the held branch must stop the run, and the acquired branch must release
+# on exit. Those were only grep-tested — the reviewer's mutants (drop the held branch's `exit 0`;
+# drop the release trap) both still gave 176/0. So run the real, non-library script as a subprocess.
+# Hermetic: du/bd/dolt are PATH stubs, hq "measures" 10MB (far under the 1G threshold → the job can
+# only skip the GC), and the lock, log, streak and conf all live in a throwaway dir. CITY is
+# hardcoded in the job, so nothing else is redirected — and nothing else is touched: main()'s only
+# writes on this path are the purge stub, the log, and the streak file (all overridden).
+EP="$(mktemp -d "${TMPDIR:-/tmp}/dolt-gc-entry-selftest.XXXXXX")"
+if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry tests skipped"; else
+  mkdir -p "$EP/bin" "$EP/hq"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$EP/bd.calls"   > "$EP/bin/bd"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$EP/dolt.calls" > "$EP/bin/dolt"
+  printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$EP/notify.calls" > "$EP/bin/notify"
+  printf '#!/bin/sh\nprintf "10\\t%%s\\n" "$2"\n' > "$EP/bin/du"
+  chmod +x "$EP/bin/bd" "$EP/bin/dolt" "$EP/bin/notify" "$EP/bin/du"
+  printf 'DOLTDIR="%s"\nNOTIFY="%s"\n' "$EP/hq" "$EP/bin/notify" > "$EP/conf.env"
+  entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
+  # run the job exactly as launchd does (script, not library) but with DOLT_GC_MAINT_LIB forced off — this
+  # selftest exports it as 1 for its own library loads, which would make the child do nothing at all.
+  run_entry() { env PATH="$EP/bin:$PATH" DOLT_GC_MAINT_LIB=0 DOLT_MAINT_CONF="$EP/conf.env" DOLT_GC_MAINT_LOG="$EP/job.log" \
+                    GC_SKIP_STREAK_STATE="$EP/streak.state" GC_MAINT_LOCKDIR="$EP/run.lock.d" "$@" /bin/bash "$SCRIPT" >/dev/null 2>&1; }
+
+  # (a) a free lock: the run happens, and the lock is released when it exits (the EXIT trap)
+  entry_reset; run_entry; rc=$?
+  [ "$rc" -eq 0 ] && [ -s "$EP/bd.calls" ] && grep -q purge "$EP/bd.calls" && ok "entry: a free lock → the real job runs main() (ephemeral purge reached the bd stub)" || bad "entry free-lock: rc=$rc bd_calls='$(cat "$EP/bd.calls" 2>/dev/null)' log='$(tail -3 "$EP/job.log" 2>/dev/null)'"
+  [ ! -e "$EP/run.lock.d" ] && ok "entry: the lock is RELEASED when the run exits (a leaked dir would be reclaimed only by pid-liveness luck)" || bad "entry: the lock dir was left behind after the run ($(cat "$EP/run.lock.d/pid" 2>/dev/null))"
+  [ "$(cat "$EP/streak.state" 2>/dev/null)" = "0 0" ] && ok "entry: (control) the run reached the size-gated step — hq under the threshold cleared the streak" || bad "entry control: streak='$(cat "$EP/streak.state" 2>/dev/null)'"
+
+  # (b) a LIVE holder: the second run must stand down BEFORE doing anything — no purge, no GC step,
+  #     no streak write — and must not steal or remove the holder's lock.
+  entry_reset; sleep 300 & HOLDER=$!
+  mkdir "$EP/run.lock.d"; printf '%s\n' "$HOLDER" > "$EP/run.lock.d/pid"
+  run_entry GC_MAINT_LOCK_RE=sleep; rc=$?
+  [ "$rc" -eq 0 ] && ok "entry: a second run against a live holder exits 0 (launchd sees a clean exit)" || bad "entry held: rc=$rc"
+  [ ! -e "$EP/bd.calls" ] && [ ! -e "$EP/dolt.calls" ] && ok "entry: ...having done NOTHING — no purge, no dolt (two runs never overlap)" || bad "entry held: the second run did work: bd='$(cat "$EP/bd.calls" 2>/dev/null)' dolt='$(cat "$EP/dolt.calls" 2>/dev/null)'"
+  [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && ok "entry: ...and left the skip streak alone" || bad "entry held: streak changed to '$(cat "$EP/streak.state" 2>/dev/null)'"
+  grep -q 'another dolt-gc-maintenance run holds' "$EP/job.log" && ok "entry: ...and said so in the log (nothing done in this invocation)" || bad "entry held: no log line"
+  [ "$(cat "$EP/run.lock.d/pid" 2>/dev/null)" = "$HOLDER" ] && ok "entry: the live holder's lock is intact after the refused run (not stolen, not removed by the loser's exit trap)" || bad "entry held: lock pid now '$(cat "$EP/run.lock.d/pid" 2>/dev/null)' (holder $HOLDER)"
+  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+  # (c) a CRASHED holder (dead pid) must not wedge the job: the next run reclaims the lock and runs
+  entry_reset; mkdir "$EP/run.lock.d"; DEAD=999999; while kill -0 "$DEAD" 2>/dev/null; do DEAD=$((DEAD+1)); done
+  printf '%s\n' "$DEAD" > "$EP/run.lock.d/pid"
+  run_entry; rc=$?
+  [ "$rc" -eq 0 ] && [ -s "$EP/bd.calls" ] && [ ! -e "$EP/run.lock.d" ] && ok "entry: a dead holder's leftover lock is reclaimed — the job runs and releases (a crash cannot wedge maintenance)" || bad "entry stale: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' lock_left=$([ -e "$EP/run.lock.d" ] && echo y || echo n)"
+
+  # (d) the lock cannot be created at all: run anyway (as this job always has) — and say so
+  entry_reset; printf x > "$EP/afile"
+  run_entry GC_MAINT_LOCKDIR="$EP/afile/child.lock.d"; rc=$?
+  [ "$rc" -eq 0 ] && [ -s "$EP/bd.calls" ] && grep -q 'WITHOUT overlap protection' "$EP/job.log" && ok "entry: an uncreatable lock dir → the job still runs (maintenance is not stopped by bookkeeping) and warns loudly" || bad "entry no-lock: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"
+
+  # (d2) ...but a TRIGGERED run — the extra path that may release the staging — is inert under the same
+  #      doubt: no overlap protection, no run. (The 2h cycle above still runs: refusing IT would stop all
+  #      maintenance over a bookkeeping failure; a missed triggered run costs nothing — the next poll retries.)
+  entry_reset; printf x > "$EP/afile"
+  run_entry GC_MAINT_LOCKDIR="$EP/afile/child.lock.d" GC_TRIGGERED_RUN=1; rc=$?
+  [ "$rc" -eq 0 ] && [ ! -e "$EP/bd.calls" ] && [ ! -e "$EP/dolt.calls" ] && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && grep -q 'TRIGGERED run .* does not run without overlap protection' "$EP/job.log" && ok "entry: a TRIGGERED run whose lock cannot be created stays inert (no GC step, no release, streak untouched) and says why" || bad "entry triggered no-lock: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' streak='$(cat "$EP/streak.state" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"
+
+  # (e) a triggered run through the real entry: only the size-gated step (bd never called)
+  entry_reset; run_entry GC_TRIGGERED_RUN=1; rc=$?
+  [ "$rc" -eq 0 ] && [ ! -e "$EP/bd.calls" ] && grep -q 'triggered run' "$EP/job.log" && ok "entry: GC_TRIGGERED_RUN=1 reaches the real script's main(): GC-only run, purge/prune/flatten (bd) never called" || bad "entry triggered: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"
+  [ ! -e "$EP/run.lock.d" ] && ok "entry: a triggered run releases the lock too" || bad "entry triggered: lock left behind"
+
+  unset -f entry_reset run_entry
+  case "$EP" in "${TMPDIR:-/tmp}"/dolt-gc-entry-selftest.*) rm -rf "$EP" ;; esac
+fi
+
 # ── static: the lock wraps the real entry point, and only there ────────────────────────
 grep -Eq '_dgm_lock_acquire "\$GC_MAINT_LOCKDIR"' "$SCRIPT" && ok "static: the non-library entry point takes the single-instance lock" || bad "static: main is not wrapped by the lock"
 /bin/bash -n "$SCRIPT" 2>/dev/null && ok "static: parses under /bin/bash (3.2) — the interpreter launchd runs it with" || bad "static: does not parse under /bin/bash 3.2"
