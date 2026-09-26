@@ -9,8 +9,9 @@
 # and the recipe answered by SENDING THE DIGEST AGAIN. A mail cannot be unsent.
 # The check has three outcomes, not two: sent / not-sent / unknown. Only a query
 # that ran to completion and found no row for THIS digest is "not-sent"; a query
-# that failed, or whose output cannot be read, is "unknown" and must never
-# trigger a second send.
+# that failed, or whose output is not a list of mail.sent event rows (garbage,
+# or valid JSON in some other shape — an error envelope), is "unknown" and must
+# never trigger a second send.
 #
 # This formula has no exec script: an agent reads each step's description and
 # types the shell it finds there. So the unit under test is the text the agent
@@ -115,6 +116,8 @@ if [ "$1" = events ]; then
     empty)     : ;;
     fail)      echo 'Get "http://127.0.0.1:8372/v0/city/gascity/events": context deadline exceeded' >&2; exit 1 ;;
     garbage)   echo "<html>502 bad gateway</html>" ;;
+    envelope)  echo '{"error":"city api unavailable","status":503}' ;;
+    wrongtype) echo '{"seq":1,"type":"bead.created","ts":"2026-09-26T13:09:25-03:00","actor":"x","subject":"ga-x"}' ;;
     othersubj) row "Gas Town Digest: 2026-09-25" gastown.mayor ;;
     otherto)   row "Gas Town Digest: 2026-09-26" gastown.deacon ;;
     *) echo "stub gc: bad mode $mode" >&2; exit 99 ;;
@@ -165,6 +168,8 @@ scenario "row is addressed to someone else"            otherto        2 not-sent
 scenario "gc events fails on every try"                fail           1 unknown  2
 scenario "gc events fails, then finds the row"         fail,row       1 sent     2
 scenario "gc events exits 0 but prints garbage"        garbage        1 unknown  2
+scenario "gc events exits 0, valid JSON, not event rows" envelope     1 unknown  2
+scenario "gc events exits 0, rows of the wrong type"   wrongtype      1 unknown  2
 # -- failed then completed-empty is a real answer; a failed check after the resend is still unknown
 scenario "gc events fails, then checked and empty"     fail,empty     2 not-sent 3
 scenario "resend happened, then the check fails"       empty,fail     2 unknown  3

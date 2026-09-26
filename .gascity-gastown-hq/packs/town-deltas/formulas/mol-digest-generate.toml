@@ -733,10 +733,12 @@ again, which makes a real send look like a false failure.
 The check has THREE outcomes, not two (ga-ghxr1h): `sent`, `not-sent`,
 `unknown`. `gc events` is an HTTP call to the city API and it fails under
 load (`context deadline exceeded`, seen at load average 61-77 on
-2026-09-26). A query that FAILED — or printed something that is not event
-rows — says nothing about the mail: that is `unknown`, never `not-sent`. Only
-a query that ran to completion and found no row for THIS digest (this
-subject, addressed to the mayor) is `not-sent`. The distinction is not
+2026-09-26). A query that FAILED — or printed anything that is not a list of
+`mail.sent` event rows (an error message, an error envelope, a changed
+shape) — says nothing about the mail: that is `unknown`, never `not-sent`.
+Only a query that ran to completion, returned well-formed rows (an empty
+list is well-formed), and found none for THIS digest (this subject,
+addressed to the mayor) is `not-sent`. The distinction is not
 cosmetic: the action on `not-sent` is a second send, a mail cannot be
 unsent, and re-sending on a failed query delivers the digest twice. (Do not
 pipe `gc events` into anything either — the pipe reports the LAST command's
@@ -753,11 +755,11 @@ check_mail_sent() {   # prints: sent | not-sent | unknown
   local ev try
   for try in 1 2; do
     ev=$(gc events --since=5m --type=mail.sent 2>/dev/null) || { sleep 5; continue; }
-    printf '%s' "$ev" | jq -e --arg s "$SEND_SUBJECT" 'select(.payload.message.subject == $s and ((.payload.message.to // "") | endswith("mayor")))' >/dev/null 2>&1
+    printf '%s' "$ev" | jq -e -s --arg s "$SEND_SUBJECT" 'if all(.[]; type == "object" and .type == "mail.sent") then any(.[]; .payload.message.subject == $s and ((.payload.message.to // "") | endswith("mayor"))) else error("not mail.sent event rows") end' >/dev/null 2>&1
     case $? in
-      0) echo sent; return ;;        # a row for this digest, addressed to the mayor
-      4) echo not-sent; return ;;    # the query ran, and there is no such row
-    esac                             # any other jq status: output unreadable, try again
+      0) echo sent; return ;;        # well-formed rows, and one is this digest addressed to the mayor
+      1) echo not-sent; return ;;    # well-formed rows (or none at all), and none is this digest
+    esac                             # any other jq status: not event rows / unreadable, try again
     sleep 5
   done
   echo unknown
