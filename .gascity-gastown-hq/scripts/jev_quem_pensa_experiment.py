@@ -214,7 +214,9 @@ def call_jev_choice(state: str, question_key: str, instructions: str, options: d
         usage = payload.get("usage", {}) or {}
         tokens_in = int(usage.get("input_tokens", 0) or 0)
         tokens_out = int(usage.get("output_tokens", 0) or 0)
-    except (KeyError, TypeError, ValueError, AttributeError) as e:
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
+        # OverflowError: Python's JSON reader accepts `Infinity`/`1e999`, and int(inf) raises it —
+        # not a ValueError. "Never raises" is this function's contract, so it is listed here.
         return {"ok": False, "error": f"unparseable_answer: {e}"}
 
     if choice not in options:
@@ -429,6 +431,25 @@ def _diffstat(gc_city: str, prior: dict, gate_run_bead: dict, rig_paths: dict[st
     return "\n".join(lines), True
 
 
+def find_bead(bead_id: str, rig: str | None, gc_city: str, rig_paths: dict[str, str]) -> tuple[dict | None, list[str]]:
+    """The bead's own store is decided by its id prefix, NOT by the rig of the gate event (which is
+    where the branch was delivered): measured 25/09 on the whole gate log, ~6% of reviews are
+    cross-rig (229 `ga-` beads delivered in whatsapp_automation, 33 `wa-` beads in gascity, 22
+    `ga-` in property_scrapers ...). Reading only the event's rig store would drop exactly those
+    silently. Order: the event's rig first (right ~94% of the time, one call), then the HQ store,
+    then every other rig — the first store that has the bead wins. (bead, stores tried)."""
+    order = [rig_paths.get(rig or ""), gc_city, *rig_paths.values()]
+    tried: list[str] = []
+    for store in order:
+        if not store or store in tried:
+            continue
+        tried.append(store)
+        bead = gv._bd_show(store, bead_id)
+        if bead is not None:
+            return bead, tried
+    return None, tried
+
+
 # ── one entity ───────────────────────────────────────────────────────────────────────
 def process_entity(ent: dict, gc_city: str, ctx: dict, ask=call_jev_choice, threshold: float = CONFIDENCE_THRESHOLD):
     """Returns (status, detail). status "logged" -> detail is the record; "skip_definitive_*"
@@ -443,7 +464,13 @@ def process_entity(ent: dict, gc_city: str, ctx: dict, ask=call_jev_choice, thre
         gate_run_bead = gv._bd_show(gc_city, rv["gate_run"])
         if gate_run_bead is None:
             return "skip_gate_run_unreadable", f"gate_run={rv['gate_run']} unreadable"
-        pool = classify_pool(rv.get("branch"), gv._field(gate_run_bead.get("description", ""), "author"))
+        author = gv._field(gate_run_bead.get("description", ""), "author")
+        if not author:
+            # A gate-run with no `author:` line says nothing about who built it. "Not pool" is a
+            # fact only when an author IS there and is not a pool one; an unknown author must
+            # stay retryable, never be remembered as a definitive skip.
+            return "skip_gate_run_no_author", f"gate_run={rv['gate_run']} has no author field"
+        pool = classify_pool(rv.get("branch"), author)
         if pool is None:
             return "skip_definitive_not_pool", "builder is a named crew or the Mayor"
 
@@ -453,12 +480,9 @@ def process_entity(ent: dict, gc_city: str, ctx: dict, ask=call_jev_choice, thre
 
     diffstat_ok = None
     if experiment == EXP_NOVA:
-        rig_path = rig_paths.get(ent.get("rig") or "")
-        if not rig_path:
-            return "skip_no_rig", f"rig={ent.get('rig')!r} not in gc rig list"
-        bead = gv._bd_show(rig_path, ent["bead"])
+        bead, tried = find_bead(ent["bead"], ent.get("rig"), gc_city, rig_paths)
         if bead is None:
-            return "skip_bead_unreadable", f"bead={ent['bead']} unreadable in {rig_path}"
+            return "skip_bead_unreadable", f"bead={ent['bead']} not readable in any of {tried}"
         state, key, instructions, options = build_state_nova(bead), NOVA_KEY, NOVA_INSTRUCTIONS, NOVA_OPTIONS
     else:
         prior = ent["prior"]

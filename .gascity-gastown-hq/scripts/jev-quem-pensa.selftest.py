@@ -260,8 +260,13 @@ def test_call_choice():
         ok("single-wrapped shape still parses", r["ok"] is True and r["tokens_in"] == 3)
 
         def call(body):
+            # "never raises" is the contract under test: a raise is reported as an ordinary failed
+            # check (ok="RAISED"), not allowed to abort the rest of the suite with a traceback.
             with mock.patch("urllib.request.urlopen", return_value=fake_response(body)):
-                return q.call_jev_choice("s", "dificuldade", "i", q.NOVA_OPTIONS)
+                try:
+                    return q.call_jev_choice("s", "dificuldade", "i", q.NOVA_OPTIONS)
+                except Exception as e:  # noqa: BLE001
+                    return {"ok": "RAISED", "error": f"raised {type(e).__name__}: {e}"}
 
         for label, body in [
             ("a bare list", []), ("null", None), ("a string", "hello"), ("a number", 7),
@@ -281,6 +286,20 @@ def test_call_choice():
         ok("a missing/None confidence is refused, not read as 0", r["ok"] is False and r["error"].startswith("unparseable_answer"), str(r))
         r = call(answer_json("facil", "not-a-dict", 0.9))
         ok("probabilities that are not a mapping are refused, not a crash", r["ok"] is False and r["error"].startswith("unparseable_answer"), str(r))
+        raw_inf = (b'{"result":{"result":{"answers":{"dificuldade":{"type":"choice","choice":"facil",'
+                   b'"probabilities":{"facil":1,"media":0,"dificil":0},"confidence":1}},'
+                   b'"usage":{"input_tokens":Infinity,"output_tokens":0}}}}')
+        r = call(raw_inf)
+        ok("a non-finite token count (JSON `Infinity`; int(inf) is an OverflowError, not a ValueError) fails closed, never raises",
+           r["ok"] is False and r["error"].startswith("unparseable_answer"), str(r))
+        raw_big = raw_inf.replace(b"Infinity", b"1e999")
+        r = call(raw_big)
+        ok("an absurd token count (1e999) fails closed too", r["ok"] is False and r["error"].startswith("unparseable_answer"), str(r))
+        raw_nan = (b'{"result":{"result":{"answers":{"dificuldade":{"type":"choice","choice":"facil",'
+                   b'"probabilities":{"facil":NaN,"media":0,"dificil":0},"confidence":1}},"usage":{}}}}')
+        r = call(raw_nan)
+        ok("a NaN probability is refused (NaN compares False to everything, so it must not slip through a range check)",
+           r["ok"] is False and r["error"] == "probability_out_of_range", str(r))
         body = answer_json("facil", {"facil": 0.9, "media": 0.1, "dificil": 0}, 0.9)
         del body["result"]["result"]["usage"]
         r = call(body)
@@ -502,17 +521,55 @@ def test_process_entity(tmp):
     ok("unreadable gate-run: a TRANSIENT skip (cannot tell 'not pool' from 'could not read'), so it is retried, and Jev is not asked",
        status == "skip_gate_run_unreadable" and not status.startswith("skip_definitive") and not spy.states, str(status))
 
-    # F6 rig / bead unreadable
+    # F5b a gate-run with NO author line says nothing about who built it: transient, never "not pool"
+    w = World()
+    w.beads[("/city", "gr-noauth")] = {"id": "gr-noauth", "description": "branch_sha: X\nmarker_id: m"}
+    ent = one_entity([ev("2026-09-25T01:00:00Z", "ga-30", "PASS", "gr-noauth", "fix/ga-30", rig="gascity")], "ga-30", tmp)
+    spy = Spy(good("facil", 0.99, 0.99, q.NOVA_OPTIONS))
+    with patched(w):
+        status, detail = q.process_entity(ent, "/city", {"rig_paths": None}, ask=spy)
+    ok("gate-run readable but with no `author:` -> TRANSIENT skip (unknown is not 'not pool'), never remembered, Jev not asked",
+       status == "skip_gate_run_no_author" and not status.startswith("skip_definitive") and not spy.states, status)
+
+    # F6 the bead's own store is decided by its id prefix, not by the gate event's rig
+    ent = one_entity([ev("2026-09-25T01:00:00Z", "wa-4", "PASS", "gr5", W + "wa-4")], "wa-4", tmp)
     w = World()
     w.rigs = {}
-    ent = one_entity([ev("2026-09-25T01:00:00Z", "wa-4", "PASS", "gr5", W + "wa-4")], "wa-4", tmp)
     with patched(w):
         status, _ = q.process_entity(ent, "/city", {"rig_paths": None}, ask=Spy(good("facil", 1, 1, q.NOVA_OPTIONS)))
-    ok("rig missing from `gc rig list` -> transient skip_no_rig", status == "skip_no_rig", status)
+    ok("bead in no readable store -> transient skip_bead_unreadable", status == "skip_bead_unreadable", status)
     w = World()
     with patched(w):
-        status, _ = q.process_entity(ent, "/city", {"rig_paths": None}, ask=Spy(good("facil", 1, 1, q.NOVA_OPTIONS)))
-    ok("bead unreadable in its store -> transient skip_bead_unreadable", status == "skip_bead_unreadable", status)
+        status, detail = q.process_entity(ent, "/city", {"rig_paths": None}, ask=Spy(good("facil", 1, 1, q.NOVA_OPTIONS)))
+    ok("...and the reason lists every store that was tried", status == "skip_bead_unreadable" and "/wa" in detail and "/city" in detail, detail)
+
+    # cross-rig: measured ~6% of gate reviews (229 ga- beads gated in whatsapp_automation, 33 wa- in gascity ...)
+    w = World()
+    w.add_bead("/city", "ga-20", title="an HQ bead delivered in the whatsapp repo", description="d")
+    ent = one_entity([ev("2026-09-25T01:00:00Z", "ga-20", "PASS", "gr20", W + "ga-20", rig="whatsapp_automation")], "ga-20", tmp)
+    spy = Spy(good("media", 0.7, 0.7, q.NOVA_OPTIONS))
+    with patched(w):
+        status, rec = q.process_entity(ent, "/city", {"rig_paths": None}, ask=spy)
+    ok("cross-rig: a ga- bead gated in whatsapp_automation is found in the HQ store (not silently dropped)",
+       status == "logged" and "an HQ bead" in spy.states[0], status)
+    shows = [c[2] for c in w.calls if c[0] == "bd" and c[3] == "show" and c[4] == "ga-20"]
+    ok("cross-rig: the event's rig store is tried FIRST, then the HQ store", shows == ["/wa", "/city"], str(shows))
+    w = World()
+    w.add_bead("/wa", "wa-21", title="a wa bead delivered in the gascity repo", description="d")
+    ent = one_entity([ev("2026-09-25T01:00:00Z", "wa-21", "PASS", "gr21", W + "wa-21", rig="gascity")], "wa-21", tmp)
+    spy = Spy(good("media", 0.7, 0.7, q.NOVA_OPTIONS))
+    with patched(w):
+        status, _ = q.process_entity(ent, "/city", {"rig_paths": None}, ask=spy)
+    shows = [c[2] for c in w.calls if c[0] == "bd" and c[3] == "show" and c[4] == "wa-21"]
+    ok("cross-rig: a wa- bead gated in gascity is found in the wa store after the HQ store misses (each store tried once)",
+       status == "logged" and shows == ["/city", "/wa"], f"{status} {shows}")
+    w = World()
+    w.add_bead("/wa", "wa-22", title="t")
+    ent = one_entity([ev("2026-09-25T01:00:00Z", "wa-22", "PASS", "gr22", W + "wa-22")], "wa-22", tmp)
+    with patched(w):
+        q.process_entity(ent, "/city", {"rig_paths": None}, ask=Spy(good("media", 0.7, 0.7, q.NOVA_OPTIONS)))
+    shows = [c for c in w.calls if c[0] == "bd" and c[3] == "show" and c[4] == "wa-22"]
+    ok("the common case (bead in the event's rig) costs exactly ONE bd call", len(shows) == 1, str(shows))
 
     # F7 conserto, full pipeline
     w = World()
