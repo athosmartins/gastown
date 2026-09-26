@@ -54,9 +54,16 @@ load block nudge-author-with-fallback
 load fn gate_fail_assignee_action
 load fn gate_fail_author_is_ephemeral
 load fn gate_fail_pool_read_facts
+load fn gate_fail_pool_veto_reasons
 load fn gate_fail_redispatch_verified
 load fn gate_fail_settle_deferred_mayor_wake
-for f in nudge_author_with_fallback gate_fail_author_is_ephemeral gate_fail_pool_read_facts gate_fail_redispatch_verified gate_fail_settle_deferred_mayor_wake; do
+# The veto lists live in a sibling lib the dispatcher sources (gate round 3, blocking 2). Run the LIVE load
+# block, pointed at the lib next to the dispatcher under test — the same `[ -r ]`-guarded source, not a copy.
+_GATE_VETO_LIB_DIR="${GATE_VETO_LIB_DIR_UNDER_TEST:-$(dirname "$DISPATCHER")/scripts}"
+POOL_VETO_LOAD_BODY="$(extract_block "$DISPATCHER" pool-veto-lib-load)"
+[ -n "$POOL_VETO_LOAD_BODY" ] || { echo "FATAL: could not extract pool-veto-lib-load from $DISPATCHER" >&2; exit 2; }
+eval "$POOL_VETO_LOAD_BODY"
+for f in nudge_author_with_fallback gate_fail_author_is_ephemeral gate_fail_pool_read_facts gate_fail_pool_veto_reasons gate_fail_redispatch_verified gate_fail_settle_deferred_mayor_wake pool_veto_cfg; do
   declare -F "$f" >/dev/null 2>&1 || { echo "FATAL: $f not defined after extraction" >&2; exit 2; }
 done
 
@@ -68,6 +75,7 @@ done
 # issue found" from any other store, mirroring what the real bd does. Beads named ga-* live in
 # the HQ store ($GC_CITY); everything else (wa-*, ps-*, lx-*) lives in its rig store.
 GC_CITY="test-city"
+GATE_FAIL_NOW=1790400000   # pinned clock for pilot:held-until (expired / future)
 WA_STORE="/rig/whatsapp_automation"
 bead_home() { case "$1" in ga-*) printf '%s' "$GC_CITY" ;; *) printf '%s' "$WA_STORE" ;; esac; }
 FAIL_RECIPIENTS=""; NUDGE_LOG=""; MAIL_LOG=""; MAIL_SUBJECTS=""; MAIL_BODIES=""; BD_COMMENTS=""; BD_LOST=""; LOG_LINES=""; WARN_LINES=""
@@ -104,7 +112,7 @@ reset() {
   FAIL_RECIPIENTS=""; NUDGE_LOG=""; MAIL_LOG=""; MAIL_SUBJECTS=""; MAIL_BODIES=""; BD_COMMENTS=""; BD_LOST=""; LOG_LINES=""; WARN_LINES=""
   GATE_FAIL_DEFER_MAYOR=0; GATE_FAIL_MAYOR_DEFERRED=0; GATE_FAIL_REDISPATCH_VERIFIED=0; GATE_FAIL_CAP_ESCALATED=0
   GATE_FAIL_MAYOR_DEFER_CTX=""; GATE_FAIL_MAYOR_DEFER_CANDIDATES=""; BEAD_ID="wa-x1"; BEAD_CITY="$WA_STORE"
-  GATE_FAIL_NO_EVAL_RUN=0; BD_SHOW_JSON=""; BD_SHOW_RC=0
+  GATE_FAIL_NO_EVAL_RUN=0; BD_SHOW_JSON=""; BD_SHOW_RC=0; GATE_FAIL_POOL_VETO_REASONS=""
 }
 trim() { echo "$*" | sed 's/^ *//; s/ *$//'; }
 CTX="Gate FAIL nudge for wa-x1 (branch crew/wa-worker/wa-x1)"
@@ -153,6 +161,19 @@ eq "deferred, nothing mailed, reported undelivered" "$GATE_FAIL_MAYOR_DEFERRED:$
 reset
 nudge_author_with_fallback ga-x4 mayor mayor "msg" "Gate FAIL nudge for ga-x4" >/dev/null
 eq "flag OFF: a real Mayor author is still nudged as before" "$(trim "$NUDGE_LOG")" "mayor"
+
+echo "== 4e. when the sentinel filter EMPTIES the candidate list nothing was attempted — and the record must not claim a failure (gate round 3, low)"
+reset; BEAD_CITY="$GC_CITY"; GATE_FAIL_DEFER_MAYOR=1
+nudge_author_with_fallback ga-x8 mayor mayor "msg" "Gate FAIL nudge for ga-x8" >/dev/null
+case "$BD_COMMENTS" in
+  *"ga-x8:"*"No author candidate was nudged"*"nothing was attempted"*"Mayor was NOT paged"*) ok "an emptied list is recorded as 'nothing was attempted' (and the Mayor was NOT paged)" ;;
+  *) bad "comment for an empty candidate list does not say nothing was attempted: [$BD_COMMENTS] (lost: [$BD_LOST])" ;;
+esac
+case "$BD_COMMENTS" in *"for every candidate ()"*) bad "the comment claims a FAILURE for '()' — nothing was tried" ;; *) ok "and it does not claim 'FAILED for every candidate ()'" ;; esac
+case "$WARN_LINES" in *"author candidate (none)"*) ok "the warn line says (none), not ()" ;; *) bad "warn line still prints an empty list: [$WARN_LINES]" ;; esac
+reset; BEAD_CITY="$GC_CITY"; GATE_FAIL_DEFER_MAYOR=1; FAIL_RECIPIENTS="dog-gaabc"
+nudge_author_with_fallback ga-x9 dog-gaabc dog-gaabc "msg" "Gate FAIL nudge for ga-x9" >/dev/null
+case "$BD_COMMENTS" in *"ga-x9:"*"Author-nudge FAILED for every candidate (dog-gaabc)"*) ok "a REAL failed attempt keeps the 'FAILED for every candidate (<list>)' wording" ;; *) bad "real failure lost its wording: [$BD_COMMENTS]" ;; esac
 
 echo "== 4c. the WHOLE Mayor-sentinel family: for a non-ga bead the cascade also builds mayor-<prefix> (e.g. mayor-wa)"
 reset; GATE_FAIL_DEFER_MAYOR=1
@@ -216,6 +237,64 @@ eq "verified: route_unknown EMPTY with an evaluated fail => 0 (the default means
 eq "verified: no_eval EMPTY with a resolved route => 0 (the default means 'no evaluation')"          "$(V "$CLEAN" wa-worker 0 "")" "0"
 eq "verified: empty arguments never verify"                    "$(V '' '' '' '')" "0"
 
+echo "== 7b. the OTHER things the pool probe refuses: a 'vetoed' fact (gate round 3, blocking 2)"
+# Round 2 decided "returns to the pool by itself" from five facts, but the probe refuses many more: a bead
+# labelled pilot:no-auto-dispatch / needs-human / pool:refused:* passed as VERIFIED and the Mayor stayed
+# asleep about a bead that neither the pool probe nor the Pilot can ever pick up — a silent strand.
+# Fixture = the state a gate-FAILED source bead is really in (this very bead's labels), plus ONE veto.
+REALL='["ctx:ready","exec:auto","framework","gate-sha-failed:2ba4a0deb:code","gate:failed","gate:fix-attempt:2","gate:needs-fix","lane:small"]'
+REAL="$(bj wa-worker "" open "$REALL")"
+eq "a real gate-FAILED bead (gate:needs-fix, gate:failed, gate-sha-failed:*, gate:fix-attempt:*) is NOT vetoed" "$(F "$REAL" wa-worker)" "ok"
+eq "  ...and is VERIFIED" "$(V "$REAL" wa-worker 0 0)" "1"
+veto_case() {   # veto_case <label> [route]  -> facts and verified for the real bead + that one extra label
+  local lab="$1" rt="${2:-wa-worker}" j
+  j="$(bj "$rt" "" open "$(printf '%s' "$REALL" | jq -c --arg l "$lab" '. + [$l]')")"
+  eq "facts: +$lab => vetoed"  "$(F "$j" "$rt")" "vetoed"
+  eq "verified: +$lab => 0 (the Mayor is paged, not left asleep)" "$(V "$j" "$rt" 0 0)" "0"
+}
+veto_case pilot:no-auto-dispatch
+veto_case needs-human
+veto_case story:needs-approval
+veto_case exec:manual
+veto_case ctx:thin
+veto_case story:blocked
+veto_case needs:engine-window
+veto_case pool:refused:engine-rebuild-required
+veto_case pilot:refused-reason:scope
+veto_case pilot:text-veto:engine-rebuild
+veto_case gate:needs-human:technical
+veto_case blocked:dependency
+veto_case blocked-reason:decision
+veto_case delivery:partial                 # only the DOG probe refuses it
+veto_case delivery:pending-restart         # only the wa/ps probes refuse it
+veto_case next-action:mayor
+veto_case pilot:held
+veto_case "pilot:held-until:$((GATE_FAIL_NOW + 600))"
+veto_case pilot:no-auto-dispatch gastown.dog
+veto_case needs-human ps-worker
+eq "an EXPIRED pilot:held-until released the hold => still verified" "$(V "$(bj wa-worker "" open "$(printf '%s' "$REALL" | jq -c --arg l "pilot:held-until:$((GATE_FAIL_NOW - 600))" '. + [$l]')")" wa-worker 0 0)" "1"
+eq "refino's ROUTING suffix (next-action:<crew>-constroi) is not a veto => still verified" "$(V "$(bj wa-worker "" open "$(printf '%s' "$REALL" | jq -c '. + ["next-action:batista-constroi"]')")" wa-worker 0 0)" "1"
+eq "an EPIC-typed bead is vetoed" "$(F "$(printf '%s' "$REAL" | jq -c '.[0].issue_type="epic"')" wa-worker)" "vetoed"
+eq "an EPIC:-titled bead is vetoed" "$(F "$(printf '%s' "$REAL" | jq -c '.[0].title="EPIC: migrar tudo"')" wa-worker)" "vetoed"
+eq "several things wrong at once: all named, vetoed last (stable order)" "$(F "$(bj wa-worker "" in_progress '["gate:queued","needs-human"]')" wa-worker)" "status queued vetoed"
+eq "gate:queued / gate:reviewing are reported ONCE (as queued / reviewing), not again as vetoed" "$(F "$(bj wa-worker "" open '["gate:queued","gate:reviewing"]')" wa-worker)" "queued reviewing"
+eq "a wrong route AND a veto are both named" "$(F "$(bj gastown.dog "" open '["pilot:no-auto-dispatch"]')" wa-worker)" "route vetoed"
+R="$(gate_fail_pool_veto_reasons "$(bj wa-worker "" open '["gate:needs-fix","pilot:no-auto-dispatch","pool:refused:x"]')")"
+eq "veto reasons (wording only) name the labels" "$R" "label:pilot:no-auto-dispatch,prefix:pool:refused:x"
+eq "veto reasons: nothing for a clean bead / unreadable input (empty, never a claim)" "$(gate_fail_pool_veto_reasons "$REAL")|$(gate_fail_pool_veto_reasons '')|$(gate_fail_pool_veto_reasons 'not json')" "||"
+
+echo "== 7c. the veto lib cannot be loaded => 'unread' (=> the Mayor is paged), never 'no vetoes' (ga-q4sadt: a bare source of a missing file kills the daemon)"
+NOLIB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gate-defer-nolib.XXXXXX")"
+OUT="$(bash -c 'set -euo pipefail; _GATE_VETO_LIB_DIR="$1"; eval "$2"; echo REACHED' _ "$NOLIB_DIR" "$POOL_VETO_LOAD_BODY" 2>&1)"
+eq "the live load block, with the lib ABSENT, survives set -euo pipefail (no bare source)" "$OUT" "REACHED"
+OUT="$(bash -c 'set -euo pipefail; _GATE_VETO_LIB_DIR="$1"; eval "$2"; echo REACHED' _ "$(dirname "$DISPATCHER")/scripts" "$POOL_VETO_LOAD_BODY" 2>&1)"
+eq "the live load block, with the lib PRESENT, survives set -euo pipefail and prints nothing else" "$OUT" "REACHED"
+# run the real predicate in a shell where the lib was never loaded
+FACTS_BODY="$(extract_fn "$DISPATCHER" gate_fail_pool_read_facts)"; VER_BODY="$(extract_fn "$DISPATCHER" gate_fail_redispatch_verified)"
+OUT="$(bash -c 'eval "$1"; eval "$2"; printf "%s|%s" "$(gate_fail_pool_read_facts "$3" wa-worker)" "$(gate_fail_redispatch_verified "$3" wa-worker 0 0)"' _ "$FACTS_BODY" "$VER_BODY" "$REAL" 2>&1)"
+eq "lib absent: even a perfectly clean bead is 'unread' and NOT verified" "$OUT" "unread|0"
+rmdir "$NOLIB_DIR" 2>/dev/null || true
+
 echo "== 8. settle: the Mayor is paged at the END of the FAIL path unless the re-dispatch is verified"
 reset; GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"; GATE_FAIL_MAYOR_DEFER_CANDIDATES="wa-worker wa-worker-wa"; GATE_FAIL_REDISPATCH_VERIFIED=1
 gate_fail_settle_deferred_mayor_wake
@@ -244,6 +323,12 @@ gate_fail_settle_deferred_mayor_wake
 case "$BD_COMMENTS" in *"wa-x1:"*"Mayor page FAILED"*"nobody was woken"*) ok "mail to the Mayor failed => the comment says NOBODY was woken" ;; *) bad "comment does not admit the failed page: [$BD_COMMENTS]" ;; esac
 case "$BD_COMMENTS" in *"Mayor PAGED"*) bad "comment claims a page that never went out: [$BD_COMMENTS]" ;; *) ok "and it does NOT claim 'Mayor PAGED'" ;; esac
 case "$WARN_LINES" in *"Could not mail Mayor"*) ok "and the failure is warned in the log" ;; *) bad "no warn line: [$WARN_LINES]" ;; esac
+# a veto the pool probe applies: the page names it (and the bead comment does too)
+reset; GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"; GATE_FAIL_POOL_VETO_REASONS="label:pilot:no-auto-dispatch"
+gate_fail_settle_deferred_mayor_wake
+eq "a vetoed source bead => the Mayor is paged" "$(trim "$MAIL_LOG")" "mayor"
+case "$MAIL_BODIES" in *"pool probe REFUSES"*"label:pilot:no-auto-dispatch"*"will pick it up by itself"*) ok "the mail body names the veto and why nothing will pick the bead up" ;; *) bad "body does not name the veto: [$MAIL_BODIES]" ;; esac
+case "$BD_COMMENTS" in *"wa-x1:"*"Mayor PAGED"*"label:pilot:no-auto-dispatch"*) ok "and so does the bead comment" ;; *) bad "comment does not name the veto: [$BD_COMMENTS]" ;; esac
 # reviewer-timeout (no-eval) FAIL: the cap never bounds that loop, so the page says so
 reset; GATE_FAIL_NO_EVAL_RUN=1; GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"
 gate_fail_settle_deferred_mayor_wake
@@ -275,7 +360,7 @@ order_ok && ok "order: reset < defer-on < nudge call < defer-off < cap-covered <
 # An anchor COMMENT proves nothing by itself (deleting the code under it must not pass), so
 # each anchor is paired with the code line(s) it announces, searched inside its own line range.
 in_range() { [ -n "$1" ] && [ -n "$2" ] && sed -n "${1},${2}p" "$DISPATCHER" | grep -qE -- "$3"; }
-for v in GATE_FAIL_DEFER_MAYOR GATE_FAIL_MAYOR_DEFERRED GATE_FAIL_REDISPATCH_VERIFIED GATE_FAIL_CAP_ESCALATED GATE_FAIL_MAYOR_DEFER_CTX GATE_FAIL_MAYOR_DEFER_CANDIDATES; do
+for v in GATE_FAIL_DEFER_MAYOR GATE_FAIL_MAYOR_DEFERRED GATE_FAIL_REDISPATCH_VERIFIED GATE_FAIL_CAP_ESCALATED GATE_FAIL_MAYOR_DEFER_CTX GATE_FAIL_MAYOR_DEFER_CANDIDATES GATE_FAIL_POOL_VETO_REASONS; do
   in_range "$L_RESET" "$L_ON" "^  ${v}=" && ok "FAIL-path entry resets $v (no leak between runs of one sweep)" || bad "FAIL-path entry does not reset $v"
 done
 in_range "$L_ON" "$L_CALL1" '^  if gate_fail_author_is_ephemeral "\$AUTHOR"; then GATE_FAIL_DEFER_MAYOR=1; fi' \
@@ -300,6 +385,10 @@ L_QRW="$(awk -v a="${L_RTE:-0}" -v b="${L_FR:-0}" 'NR>a && NR<b && /label remove
   || bad "the re-read is not after both writes (route=$L_RTE status-write=$L_STW queued-write=$L_QRW re-read=$L_FR)"
 in_range "$L_FR" "$L_FRE" 'GATE_FAIL_REDISPATCH_VERIFIED=\$\(gate_fail_redispatch_verified "\$_GFAIL_FINAL_JSON" "\$_GFAIL_ROUTE" "\$_GFAIL_ROUTE_UNKNOWN" "\$\{GATE_FAIL_NO_EVAL_RUN:-1\}"\)' \
   && ok "VERIFIED is derived from the post-write re-read + route_unknown + no_eval (conservative default 1)" || bad "VERIFIED is not derived from the post-write re-read"
+in_range "$L_FR" "$L_FRE" 'GATE_FAIL_POOL_VETO_REASONS=\$\(gate_fail_pool_veto_reasons "\$_GFAIL_FINAL_JSON"\)' \
+  && ok "the veto reasons are read from the same post-write re-read as the facts" || bad "veto reasons are not derived from the post-write re-read"
+in_range "$L_FR" "$((${L_FRE:-0} + 4))" '\$_GFAIL_VETO_NOTE"' \
+  && ok "the FAIL comment on the bead carries the veto note" || bad "the FAIL comment does not carry \$_GFAIL_VETO_NOTE"
 in_range "$L_SET" "$L_TERM" '^  gate_fail_settle_deferred_mayor_wake( \|\| true)?$' \
   && ok "the settle CALL is present and runs before the terminal FAIL notification" || bad "settle call missing between its anchor and the terminal FAIL block"
 # the settle must stay INSIDE the FAIL path: it must come after the return-to-pool arm's comment
@@ -332,10 +421,16 @@ GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"; FAIL_RECIPIENTS=""
 gate_fail_settle_deferred_mayor_wake
 eq "end to end: the cap mail failed, so the deferred page is NOT suppressed — the settle pages the Mayor" "$(trim "$MAIL_LOG")" "mayor"
 reset; run_cap "gate:needs-fix gate:needs-human:technical"
-eq "gate:needs-human already on the bead => no second mail, no second author mail, flag set (an earlier cycle paged)" "$GATE_FAIL_CAP_ESCALATED:$(trim "$MAIL_LOG"):$NAF_CALLS" "1::0"
+eq "gate:needs-human already on the bead => no second cap mail, no second author mail (exactly-once, unchanged), flag NOT set: a label is not a page" "$GATE_FAIL_CAP_ESCALATED:$(trim "$MAIL_LOG"):$NAF_CALLS" "0::0"
+eq "the live cap block printed no shell error in the else arm either" "$(cat "$CAP_ERR")" ""
 GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"
 gate_fail_settle_deferred_mayor_wake
-eq "end to end: the settle does not page a second time" "$(trim "$MAIL_LOG")" ""
+eq "end to end: nothing proved a page, so the deferred page is NOT suppressed — the settle pages the Mayor (at worst twice, never zero)" "$(trim "$MAIL_LOG")" "mayor"
+# and the verified-re-dispatch test cannot silence it either: gate:needs-human* is a pool-probe veto
+reset; GATE_FAIL_MAYOR_DEFERRED=1; GATE_FAIL_MAYOR_DEFER_CTX="$CTX"
+GATE_FAIL_REDISPATCH_VERIFIED="$(V "$(bj wa-worker "" open '["gate:needs-fix","gate:needs-human:technical"]')" wa-worker 0 0)"
+gate_fail_settle_deferred_mayor_wake
+eq "a bead left at gate:needs-human is never 'verified' back in the pool => the Mayor is paged" "$GATE_FAIL_REDISPATCH_VERIFIED:$(trim "$MAIL_LOG")" "0:mayor"
 
 echo "== 11. return-to-pool arm (blocking 2a): the observations come from a re-read AFTER the writes (LIVE extracted block)"
 FR_BODY="$(extract_block "$DISPATCHER" gate-fail-final-reread)"
