@@ -18,6 +18,8 @@ trap 'rm -rf "$SCRATCH"' EXIT
 
 STUB="$SCRATCH/guard-stub.sh"
 export HOME_SCAN_GUARD_SCRIPT="$STUB"
+# A guard file that EXISTS: without it every "GUARDED" below would be INERT (registered, but a no-op -- case 10).
+printf '#!/bin/bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 export HOME_SCAN_GUARD_RIGS_ROOT="$SCRATCH/rigs"
 
 # ours(file) -> number of hooks carrying the marker anywhere in PreToolUse
@@ -181,6 +183,7 @@ echo '{}' | sh -c "$CMD" >/dev/null 2>&1; RC=$?
 rm -f "$STUB"
 OUT="$(echo '{}' | sh -c "$CMD" 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && [ -z "$OUT" ] && ok "guard file GONE (checkout moved/cleaned): exit 0, silent -- never turns every Bash call into a hook error" || bad "missing guard: rc=$RC out=$OUT"
+printf '#!/bin/bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"       # the guard is back for the cases that follow
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -240,6 +243,69 @@ for role in pool-dog pool-wa-worker pool-ps-worker pool-reviewer; do
     bad "$role overlay diverges from the activation script's entry: activation=$A overlay=$B"
   fi
 done
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- case 10: registered is not effective (INERT), and a foreign hook under the same matcher is never replaced --"
+# (gate round 1, ga-02cqk4) --check printed GUARDED and exited 0 for a hook whose command is `[ -f "$P" ] || exit 0`
+# while $P did not exist: the one command the header calls the proof of MERGED != LIVE said "live" for a no-op.
+F10="$SCRATCH/inert.json"; echo '{}' > "$F10"
+bash "$ACTIVATE" "$F10" >/dev/null 2>&1
+rm -f "$STUB"
+bash "$ACTIVATE" --check "$F10" >"$SCRATCH/o10" 2>&1; RC=$?
+if [ "$RC" -eq 1 ] && grep -q '^INERT:' "$SCRATCH/o10" && ! grep -q '^GUARDED:' "$SCRATCH/o10"; then
+  ok "--check: hook registered but the guard file is missing -> INERT, exit 1 (not GUARDED)"
+else
+  bad "--check with a missing guard file: rc=$RC out=$(cat "$SCRATCH/o10")"
+fi
+bash "$ACTIVATE" "$F10" >"$SCRATCH/o10b" 2>&1; RC=$?
+if [ "$RC" -eq 0 ] && grep -q '^INERT:' "$SCRATCH/o10b" && ! grep -q '^GUARDED:' "$SCRATCH/o10b"; then
+  ok "activation of an already-registered file with the guard file missing says INERT too (exit 0: the registration itself is fine)"
+else
+  bad "activation with a missing guard file: rc=$RC out=$(cat "$SCRATCH/o10b")"
+fi
+F10N="$SCRATCH/inert-new.json"; echo '{}' > "$F10N"
+bash "$ACTIVATE" "$F10N" >"$SCRATCH/o10c" 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q '^Registered' "$SCRATCH/o10c" && grep -q 'INERT' "$SCRATCH/o10c" && [ "$(ours "$F10N")" = "1" ] \
+  && ok "a fresh registration before the guard has merged still succeeds (exit 0) and says INERT" || bad "fresh registration, guard missing: rc=$RC out=$(cat "$SCRATCH/o10c")"
+printf '#!/bin/bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
+bash "$ACTIVATE" --check "$F10" "$F10N" >"$SCRATCH/o10d" 2>&1; RC=$?
+[ "$RC" -eq 0 ] && [ "$(grep -c '^GUARDED:' "$SCRATCH/o10d")" = "2" ] && ok "guard file present again -> --check says GUARDED for both, exit 0" || bad "--check after the guard is back: rc=$RC out=$(cat "$SCRATCH/o10d")"
+
+# a foreign hook registered under the SAME ^Bash$ matcher: kept, in place; ours replaces only OUR old copy
+F10F="$SCRATCH/foreign.json"
+cat > "$F10F" <<'JSONEOF'
+{"hooks":{"PreToolUse":[
+  {"matcher":"^Bash$","hooks":[
+    {"type":"command","command":"/opt/other-team/deny-rm.sh"},
+    {"type":"command","command":"/old/checkout/home-scan-guard.sh"},
+    {"type":"command","command":"/opt/other-team/second.sh"},
+    {"type":"command","command":"/older/copy/home-scan-guard.sh"}
+  ]},
+  {"matcher":"^Bash$","hooks":[
+    {"type":"command","command":"/opt/other-team/in-a-second-entry.sh"},
+    {"type":"command","command":"/dup/home-scan-guard.sh"}
+  ]},
+  {"matcher":"^Bash$","hooks":[{"type":"command","command":"/dup2/home-scan-guard.sh"}]}
+]}}
+JSONEOF
+bash "$ACTIVATE" "$F10F" >"$SCRATCH/o10f" 2>&1; RC=$?
+if [ "$RC" -eq 0 ] && [ "$(ours "$F10F")" = "1" ] \
+   && jq -e '(.hooks.PreToolUse | length) == 2' "$F10F" >/dev/null \
+   && jq -e '[.hooks.PreToolUse[0].hooks[].command | if contains("home-scan-guard") then "OURS" else . end] == ["/opt/other-team/deny-rm.sh","OURS","/opt/other-team/second.sh"]' "$F10F" >/dev/null \
+   && jq -e '.hooks.PreToolUse[0].hooks[1].timeout == 10' "$F10F" >/dev/null \
+   && jq -e '[.hooks.PreToolUse[1].hooks[].command] == ["/opt/other-team/in-a-second-entry.sh"]' "$F10F" >/dev/null; then
+  ok "foreign hooks under ^Bash$ survive, in order (ours replaced in place; extra copies of ours pulled out; a second ^Bash$ entry keeps its foreign hook; an entry left empty is dropped)"
+else
+  bad "foreign hook under ^Bash$: rc=$RC ours=$(ours "$F10F") file=$(jq -c . "$F10F") out=$(cat "$SCRATCH/o10f")"
+fi
+bash "$ACTIVATE" "$F10F" >"$SCRATCH/o10g" 2>&1
+grep -q '^GUARDED:' "$SCRATCH/o10g" && ok "and that file is then stable (idempotent)" || bad "foreign-hook file not stable: $(cat "$SCRATCH/o10g")"
+# no hook of ours anywhere, a foreign hook alone under ^Bash$: ours joins that entry, the foreign one stays first
+F10G="$SCRATCH/foreign-only.json"; echo '{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/opt/other-team/deny-rm.sh"}]}]}}' > "$F10G"
+bash "$ACTIVATE" "$F10G" >/dev/null 2>&1
+jq -e '(.hooks.PreToolUse | length) == 1 and (.hooks.PreToolUse[0].hooks | length) == 2 and .hooks.PreToolUse[0].hooks[0].command == "/opt/other-team/deny-rm.sh"' "$F10G" >/dev/null \
+  && ok "a ^Bash$ entry that held only a foreign hook keeps it (first) and gains ours" || bad "foreign-only ^Bash$ entry: $(jq -c . "$F10G")"
 
 echo ""
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

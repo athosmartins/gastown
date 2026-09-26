@@ -21,6 +21,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="$HERE/home-scan-guard.sh"
+# The installed hook runs `exec /bin/bash "$P"` (home-scan-guard-activate.sh): macOS bash 3.2, not the newer bash
+# this file is probably running under. The wrapper has to be exercised under exactly that shell -- it passed on
+# bash 5 while nothing pinned that the hook's own interpreter agrees.
+HOOK_BASH=/bin/bash
+[ -x "$HOOK_BASH" ] || HOOK_BASH="$(command -v bash)"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -44,7 +49,7 @@ hook_json() {
 
 # run_guard <command> [cwd]  -> sets RC and ERR
 run_guard() {
-  ERR="$(hook_json "$1" "${2-}" | env "${AGENT_ENV[@]}" bash "$GUARD" 2>&1 >/dev/null)"
+  ERR="$(hook_json "$1" "${2-}" | env "${AGENT_ENV[@]}" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"
   RC=$?
 }
 
@@ -234,6 +239,107 @@ expect_block "for d in * cwd=\$HOME"         'for d in *; do du -sk "$d"; done' 
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
+echo "-- gate round 1 (ga-02cqk4 attempt 1/3): the two blockers, as the reviewer reproduced them --"
+# ─────────────────────────────────────────────────────────────────────────
+# BLOCKER 1: the "depth <= 2 never reaches a protected folder" exemption for an ANCESTOR (/, /Users) is
+# true for the flags that STOP THE WALK (find -maxdepth, tree -L, fd/rg --max-depth) and false for du -d /
+# --max-depth and dust -d, which only limit what is PRINTED: du still opens the whole subtree to add the
+# sizes up. `du -d 1 -h /` is the most natural "what is eating my disk" query there is.
+expect_block "du -d 1 -h /Users (depth limits the printout, not the walk)" 'du -d 1 -h /Users'
+expect_block "du -d 2 /"                    'du -d 2 /'
+expect_block "du -h -d1 /"                  'du -h -d1 /'
+expect_block "du --max-depth=1 /Users"      'du --max-depth=1 /Users'
+expect_block "du --max-depth 1 /"           'du --max-depth 1 /'
+expect_block "dust -d 1 /Users"             'dust -d 1 /Users'
+expect_block "gdu -d 1 /"                   'gdu -d 1 /'
+expect_block "du -d 1 -h \$HOME (the control the guard already had)" 'du -d 1 -h /Users/athos'
+expect_block "ls -R -L 2 /Users (ls has no depth flag: -L is 'follow symlinks')" 'ls -R -L 2 /Users'
+# a depth flag that DOES stop the walk only excuses an ancestor if every stated limit is small and readable
+expect_block "tree -L 2 -L 9 / (the tools disagree on which occurrence wins)" 'tree -L 2 -L 9 /'
+expect_block "find / -maxdepth 1 -maxdepth 6"         'find / -maxdepth 1 -maxdepth 6 -name x'
+expect_block "tree -L \$N / (a limit the text does not show)" 'tree -L $N /'
+expect_block "find / -maxdepth \$N"                   'find / -maxdepth $N -name x'
+# BLOCKER 2: du, dust, gdu, ncdu and tree used ONE valued-flag table, so a letter that takes a value for one
+# tool and is a plain switch for another swallowed the PATH as its "value"; the operand list came out empty
+# and the guard checked the cwd instead. In real du -L/-P/-n are switches; in real tree -d/-t/-n are switches.
+expect_block "tree -d ~/Downloads (-d = dirs only)"   'tree -d ~/Downloads'
+expect_block "tree -t ~/Documents (-t = sort by mtime)" 'tree -t ~/Documents'
+expect_block "tree -n ~/Desktop (-n = no colour)"     'tree -n ~/Desktop'
+expect_block "du -L ~/Downloads"            'du -L ~/Downloads'
+expect_block "du -sL ~/Downloads"           'du -sL ~/Downloads'
+expect_block "du -hP ~/Documents"           'du -hP ~/Documents'
+expect_block "du -P ~"                      'du -P ~'
+expect_block "du -n ~/Pictures"             'du -n ~/Pictures'
+expect_block "gdu -n ~ (gdu is du here; -n is a switch)" 'gdu -n ~'
+expect_block "dust -P ~/Documents"          'dust -P ~/Documents'
+expect_block "the swallowed word is kept even when another operand follows" 'du -L ~/Downloads ~/gt'
+expect_block "du -L on a hot operand behind a safe one" 'du -L ~/gt ~/Downloads'
+# the same shape one tool over: BSD find takes options BEFORE the path, and the parser stopped at the first one it
+# did not know, so the path after it was read as "no operand" and the cwd was checked instead
+expect_block "find -f ~/Downloads (BSD: -f names the tree to walk)" 'find -f ~/Downloads -name x'
+expect_block "find -Hx ~/Downloads (BSD clusters its option letters)" 'find -Hx ~/Downloads -name x'
+expect_block "find -EX ~/Documents"         'find -EX ~/Documents -name x'
+expect_block "find -O3 ~/Downloads (GNU optimiser level)" 'find -O3 ~/Downloads -name x'
+expect_block "find -D tree ~/Downloads (GNU debug option takes a value)" 'find -D tree ~/Downloads -name x'
+expect_block "find -H ~/Downloads"          'find -H ~/Downloads -name x'
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate round 1: the non-blocking findings, fixed with the class --"
+# ─────────────────────────────────────────────────────────────────────────
+# a trailing slash is PROOF of a directory: a dotted directory name is not "one named file"
+expect_block "du a dotted dir with a trailing slash"    'du -sk ~/Downloads/jdk-17.0.2/'
+expect_block "cp -r a dotted dir with a trailing slash" 'cp -r ~/Documents/proj.v2/ /tmp/x'
+expect_block "rsync -a a dotted dir with a trailing slash" 'rsync -a ~/Downloads/data.bak/ /tmp/x/'
+expect_block "tar c a dotted dir with a trailing slash" 'tar czf /tmp/x.tgz ~/Documents/site.2024/'
+# ...and an explicit recursion flag means the operand is walked, so "it has an extension" proves nothing
+expect_block "cp -r ~/Downloads/x.pdf (explicit recursion)"   'cp -r ~/Downloads/x.pdf /tmp/x'
+expect_block "rsync -a ~/Documents/proj.v2 (dotted name)"     'rsync -a ~/Documents/proj.v2 /tmp/x'
+expect_block "zip -r ~/Documents/site.2024"                   'zip -r /tmp/x.zip ~/Documents/site.2024'
+expect_block "tar c a dotted name"                            'tar czf /tmp/x.tgz ~/Documents/site.2024'
+# an option VALUE can carry the path too: tar walks whatever -C / --directory points at, spelled any way
+expect_block "tar --directory=\$HOME ."              'tar czf /tmp/x.tgz --directory=/Users/athos .'
+expect_block "tar -C/Users/athos . (attached)"      'tar czf /tmp/x.tgz -C/Users/athos .'
+expect_block "tar --directory ~/Downloads ."        'tar czf /tmp/x.tgz --directory ~/Downloads .'
+expect_block "tar -czC \$HOME (C last in a cluster)" 'tar -czC /Users/athos -f /tmp/x.tgz .'
+expect_block "tar --directory=\$HOME with an expansion" 'tar czf /tmp/x.tgz --directory=$HOME .'
+# ls -d does not list a directory operand -- but the SHELL expands a glob operand by listing it
+expect_block "ls -d ~/Downloads/* (the shell lists Downloads)" 'ls -d ~/Downloads/*'
+expect_block "ls -d ~/Documents/*.pdf"              'ls -d ~/Documents/*.pdf'
+# a cd inside a subshell is scoped to it: what runs AFTER the subshell sees the outer cwd again
+expect_block "subshell cd away then a relative scan of the real cwd (\$HOME)" '(cd /tmp && ls); du -sk *' /Users/athos
+expect_block "nested subshells, the outer cwd is \$HOME again" '( (cd /tmp) ); du -sk *' /Users/athos
+expect_block "subshell that closes before && then scans"       '(cd /tmp && true) && find . -name x' /Users/athos
+expect_block "a cd on the left of a pipe runs in a subshell"    'cd /tmp | cat; du -sk *' /Users/athos
+expect_block "a backgrounded cd runs in a subshell"             'cd /tmp & du -sk *' /Users/athos
+# cd - / popd: the previous directory is TRACKED, not forgotten (a forgotten cwd behaves like a safe one)
+expect_block "cd - returns to a hot dir, then a relative scan"       'cd ~/Downloads && cd /tmp && cd - && du -sk *' /Users/athos/gt
+expect_block "pushd/popd back to \$HOME, then a relative scan"       'pushd /tmp >/dev/null; popd >/dev/null; du -sk *' /Users/athos
+# ls -T is tree mode for eza/exa/lsd only; recursion through those is still recursion
+expect_block "eza -T ~"                     'eza -T ~'
+expect_block "eza --tree ~/Documents"       'eza --tree ~/Documents'
+expect_block "exa -R ~"                     'exa -R ~'
+expect_block "lsd --tree ~"                 'lsd --tree ~'
+expect_block "eza -L 3 -T / (a depth that reaches ~/Desktop)" 'eza -L 3 -T /'
+# the bash prefilter is a SUPERSET of the classifier: doubled slashes and /./ spell the same path
+expect_block "du //Users/athos (doubled leading slash)"  'du -sk //Users/athos'
+expect_block "find /Users//athos/Desktop"                'find /Users//athos/Desktop -type f'
+expect_block "du /Users/./athos (a dot component)"       'du -sk /Users/./athos'
+expect_block "find /Users/athos/./Desktop"               'find /Users/athos/./Desktop -type f'
+expect_block "du /users/athos (case-insensitive volume)" 'du -sk /users/athos'
+# found by a differential fuzz of the prefilter against the classifier (62 of 5658 blocked commands never reached it):
+# a path that ends in "/" and is followed by a space is the directory itself, and an ancestor can be attached to an option
+expect_block "find ~/ -name x (trailing slash, then more arguments)"  'find ~/ -name x'   /Users/athos/gt
+expect_block "find /Users/athos/ -maxdepth 3"        'find /Users/athos/ -maxdepth 3 -name x' /Users/athos/gt
+expect_block "rsync -a ~/ /tmp/x"                     'rsync -a ~/ /tmp/x'                     /Users/athos/gt
+expect_block "mdfind -onlyin ~/ foo"                  'mdfind -onlyin ~/ foo'                  /Users/athos/gt
+expect_block "cd ~/ && du -sk ."                      'cd ~/ && du -sk .'                      /Users/athos/gt
+expect_block "tar -C/Users . (ancestor attached to the option)" 'tar czf /tmp/x.tgz -C/Users .' /Users/athos/gt
+expect_block "tar -C/ ."                              'tar czf /tmp/x.tgz -C/ .'               /Users/athos/gt
+expect_block "tar -C/Users/*/Desktop ."               'tar czf /tmp/x.tgz -C/Users/*/Desktop .' /Users/athos/gt
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
 echo "-- must ALLOW: the bead's explicit list, and everything an agent does all day --"
 # ─────────────────────────────────────────────────────────────────────────
 # the bead's DEVE PERMITIR
@@ -312,14 +418,49 @@ expect_allow "grep for the words in a repo file"     'grep -n "du -sk" /Users/at
 expect_allow "python that merely prints"             'python3 -c "print(1)"'
 expect_allow "cd ~ alone (nothing scanned)"          'cd ~ && git status'
 expect_allow "empty-ish command"                     ':'
+# gate round 1: what the fixes must NOT start blocking
+expect_allow "du -d 1 on a repo dir (a depth flag with a non-hot operand)" 'du -d 1 -h ~/gt'
+expect_allow "du -d 2 ~/.gastown"                    'du -d 2 ~/.gastown'
+expect_allow "du --max-depth=1 on a repo dir"        'du --max-depth=1 /Users/athos/gt/docs'
+expect_allow "dust -d 1 on a repo dir"               'dust -d 1 /Users/athos/gt'
+expect_allow "du -sL / -hP / -n on a repo dir (they are switches)" 'du -sL ~/gt && du -hP ~/gt/docs && du -n ~/gt'
+expect_allow "du -B / -t / -I with a value, on a repo dir"       'du -B 1024 -sk ~/gt && du -t 1M -sk ~/gt && du -I "*.log" -sk ~/gt'
+expect_allow "tree -d / -t / -n on a repo dir (switches)"        'tree -d ~/gt/docs && tree -t -n ~/gt/docs'
+expect_allow "tree -I pattern on a repo dir"         'tree -I node_modules ~/gt/docs'
+expect_allow "tree -I pattern with the repo as cwd"  'tree -I node_modules' /Users/athos/gt
+expect_allow "tree -L 2 / (the depth flag STOPS the walk)"       'tree -L 2 /'
+expect_allow "tree -L 1 /Users"                      'tree -L 1 /Users'
+expect_allow "tree -aL 2 / (clustered, the value is -L's)"       'tree -aL 2 /'
+expect_allow "fd -d 1 . /Users (fd's depth flag stops the walk)" 'fd -d 1 . /Users'
+expect_allow "rg --max-depth 1 pat /Users"           'rg --max-depth 1 foo /Users'
+expect_allow "find /Users -maxdepth 2 -type d"       'find /Users -maxdepth 2 -type d'
+expect_allow "eza -T -L 2 /Users (eza's level flag stops the walk)" 'eza -T -L 2 /Users'
+expect_allow "eza -T on a repo dir"                  'eza -T ~/gt/docs'
+expect_allow "BSD find option letters before a repo path" 'find -H /Users/athos/gt -name x && find -f /Users/athos/gt -name x && find -Hx ~/gt -name x && find -O3 /Users/athos/gt -name x'
+expect_allow "ls -lT ~ (macOS: full timestamps, not tree mode)"  'ls -lT ~'
+expect_allow "ls -laT /Users/athos"                  'ls -laT /Users/athos'
+expect_allow "a cd inside a subshell does not leak out of it"    '(cd ~/Downloads && ls report.pdf); find . -name "*.sh"' /Users/athos/gt
+expect_allow "a cd inside \$( ) does not leak out of it"         'x=$(cd ~/Downloads && pwd); find . -name "*.sh"' /Users/athos/gt
+expect_allow "a cd on the left of a pipe does not leak out of it" 'cd ~/Downloads | cat; find . -name "*.sh"' /Users/athos/gt
+expect_allow "cd - returns to where the command started"         'cd ~/Downloads && cd - && du -sk *' /Users/athos/gt
+expect_allow "pushd/popd round trip through a hot dir"           'pushd ~/Downloads >/dev/null; popd >/dev/null; du -sk *' /Users/athos/gt
+expect_allow "du ONE dotted-name file (no trailing slash, no recursion flag)" 'du -sk ~/Downloads/data.bak'
+expect_allow "cp -r of a repo dir with a trailing slash"         'cp -r /Users/athos/gt/docs/ /tmp/docs/'
+expect_allow "tar --directory / -C in every spelling, on a repo dir" 'tar czf /tmp/x.tgz --directory=/Users/athos/gt docs && tar czf /tmp/x.tgz -C/Users/athos/gt docs && tar -czC /Users/athos/gt -f /tmp/x.tgz docs'
+expect_allow "ls -d on a protected dir itself (a stat, no listing)" 'ls -d ~/Downloads'
+expect_allow "ls -d with a glob in a repo dir"                   'ls -d ~/gt/*'
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
 echo "-- FAIL-OPEN: a guard that breaks every Bash call is worse than the problem --"
 # ─────────────────────────────────────────────────────────────────────────
+# Runs that DELIBERATELY degrade the guard (bad input, missing interpreter, hung classifier) log to their own file, so
+# the corpus log above can assert that the must-block / must-allow cases themselves never degraded or crashed.
+DELIB="$SCRATCH/deliberate.log"
+DELIB_ENV=(GC_AGENT=selftest-agent HOME_SCAN_GUARD_LOG="$DELIB")
 run_raw() {  # stdin-text  [env assignments...]
   local input="$1"; shift
-  ERR="$(printf '%s' "$input" | env "${AGENT_ENV[@]}" "$@" bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+  ERR="$(printf '%s' "$input" | env "${DELIB_ENV[@]}" "$@" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 }
 run_raw '';                                                            [ "$RC" -eq 0 ] && ok "empty stdin -> allow" || bad "empty stdin: rc=$RC"
 run_raw 'not json at all {{{';                                         [ "$RC" -eq 0 ] && ok "malformed JSON -> allow" || bad "malformed JSON: rc=$RC err=$ERR"
@@ -340,29 +481,32 @@ run_guard "du -sk ~ 'unterminated"
 # identity variable: the session running this selftest is itself an agent session, and a leaked
 # GC_SESSION_ID/GC_ALIAS would make both of the checks below vacuous.
 NO_ID=(-u GC_AGENT -u GC_ALIAS -u GC_DIR -u GC_SESSION_NAME -u GC_SESSION_ID)
-ERR="$(hook_json "$INCIDENT" | env "${NO_ID[@]}" bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+# (a file redirect, not a pipe: the guard exits at the identity gate WITHOUT reading stdin, so with a pipe the
+# producer's SIGPIPE -- rc 141 under pipefail -- leaked into RC and this case flaked under the city's load)
+hook_json "$INCIDENT" > "$SCRATCH/incident.json"
+ERR="$(env "${NO_ID[@]}" "$HOOK_BASH" "$GUARD" < "$SCRATCH/incident.json" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "no GC_* identity (Athos's terminal) -> allow, even the incident" || bad "no-identity: rc=$RC err=$ERR"
 for v in GC_AGENT GC_ALIAS GC_DIR GC_SESSION_NAME GC_SESSION_ID; do
-  ERR="$(hook_json "$INCIDENT" | env "${NO_ID[@]}" "$v=x" bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+  ERR="$(hook_json "$INCIDENT" | env "${NO_ID[@]}" "$v=x" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
   [ "$RC" -eq 2 ] && ok "$v alone identifies an agent session -> block" || bad "$v alone: rc=$RC err=$ERR"
 done
 # broken classifier / missing helpers
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY=/nonexistent/python bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" HOME_SCAN_GUARD_PY=/nonexistent/python "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "classifier binary missing -> allow" || bad "missing python: rc=$RC err=$ERR"
 printf '#!/bin/sh\nexit 1\n' > "$SCRATCH/py-crash"; chmod +x "$SCRATCH/py-crash"
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-crash" bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-crash" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "classifier crashes (exit 1) -> allow" || bad "crashing classifier: rc=$RC err=$ERR"
 # python's OWN usage errors exit 2 too: rc==2 alone is not proof of a block, the marker line is
 printf '#!/bin/sh\necho "usage: python [option] ... [-c cmd | -m mod | file | -] [arg] ..." >&2\nexit 2\n' > "$SCRATCH/py-usage"; chmod +x "$SCRATCH/py-usage"
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-usage" bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-usage" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "interpreter exits 2 with a usage error (no BLOCKED marker) -> allow" || bad "stray rc=2 blocked: rc=$RC err=$ERR"
 printf '#!/bin/sh\nsleep 30\n' > "$SCRATCH/py-hang"; chmod +x "$SCRATCH/py-hang"
 T0=$SECONDS
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-hang" HOME_SCAN_GUARD_TIMEOUT=2 bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-hang" HOME_SCAN_GUARD_TIMEOUT=2 "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && [ $((SECONDS-T0)) -lt 10 ] && ok "classifier hangs -> allowed after the guard's own timeout (~$((SECONDS-T0))s)" || bad "hanging classifier: rc=$RC took=$((SECONDS-T0))s"
 # jq missing from PATH: cannot even read the input -> allow
 mkdir -p "$SCRATCH/nojq"; for b in bash cat env sh dirname basename date mkdir printf; do p="$(command -v $b)" && ln -sf "$p" "$SCRATCH/nojq/$b"; done
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" PATH="$SCRATCH/nojq" /bin/bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" PATH="$SCRATCH/nojq" /bin/bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "jq missing -> allow" || bad "no jq: rc=$RC err=$ERR"
 # the classifier itself, fed directly (the wrapper's prefilter never lets these reach it)
 ENGINE="$HERE/home-scan-guard.py"
@@ -382,7 +526,7 @@ DEG="$SCRATCH/degraded.log"
 degraded() {  # description  expected-log-fragment  [env assignments...]   (runs the incident through the wrapper)
   local what="$1" frag="$2"; shift 2
   : > "$DEG"
-  hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$@" bash "$GUARD" >/dev/null 2>&1; RC=$?
+  hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$@" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
   if [ "$RC" -eq 0 ] && grep -q "result=UNGUARDED" "$DEG" && grep -q -F -- "$frag" "$DEG"; then ok "degradation logged (not silent): $what"
   else bad "degradation not logged: $what -- rc=$RC log=[$(cat "$DEG")]"; fi
 }
@@ -391,20 +535,43 @@ degraded "classifier crashes" "exited 1" HOME_SCAN_GUARD_PY="$SCRATCH/py-crash"
 degraded "classifier hangs and is killed" "timed out" HOME_SCAN_GUARD_PY="$SCRATCH/py-hang" HOME_SCAN_GUARD_TIMEOUT=2
 degraded "interpreter exits 2 without the BLOCKED marker" "exited 2 without a block verdict" HOME_SCAN_GUARD_PY="$SCRATCH/py-usage"
 mkdir -p "$SCRATCH/noengine"; cp "$GUARD" "$SCRATCH/noengine/home-scan-guard.sh"
-: > "$DEG"; hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" bash "$SCRATCH/noengine/home-scan-guard.sh" >/dev/null 2>&1; RC=$?
+: > "$DEG"; hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$SCRATCH/noengine/home-scan-guard.sh" >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 0 ] && grep -q "classifier missing" "$DEG" && ok "degradation logged (not silent): classifier file gone (a moved/cleaned checkout)" || bad "missing classifier not logged: rc=$RC log=[$(cat "$DEG")]"
 : > "$DEG"; hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" PATH="$SCRATCH/nojq" /bin/bash "$GUARD" >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 0 ] && grep -q "jq not found" "$DEG" && ok "degradation logged (not silent): jq missing" || bad "missing jq not logged: rc=$RC log=[$(cat "$DEG")]"
 # and the NORMAL quiet exits are not degradations: they must leave the log empty
 : > "$DEG"
-hook_json 'git status' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" bash "$GUARD" >/dev/null 2>&1
-hook_json 'du -sk ~/gt' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" bash "$GUARD" >/dev/null 2>&1
-hook_json "$INCIDENT" | env "${NO_ID[@]}" HOME_SCAN_GUARD_LOG="$DEG" bash "$GUARD" >/dev/null 2>&1
-echo '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" bash "$GUARD" >/dev/null 2>&1
+hook_json 'git status' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1
+hook_json 'du -sk ~/gt' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1
+hook_json "$INCIDENT" | env "${NO_ID[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1
+echo '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1
 [ ! -s "$DEG" ] && ok "quiet exits (ordinary command, no identity, non-Bash tool, safe path) write nothing to the log" || bad "quiet exits polluted the log: $(cat "$DEG")"
 # an unwritable log must never turn a block into an error, nor an allow into a block
-ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG=/nonexistent/dir/x.log bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
+ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG=/nonexistent/dir/x.log "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 2 ] && ok "unwritable log -> still blocks the incident" || bad "unwritable log: rc=$RC"
+
+# The wrapper's OTHER exits that are not "nothing to see here" are counted as well. The header used to say "every way the
+# wrapper can NOT run the classifier is counted" while two were silent: a payload jq could not parse, and an unusable $HOME.
+counted() {  # description  fragment  input  [env assignments...]
+  local what="$1" frag="$2" input="$3"; shift 3
+  : > "$DEG"
+  printf '%s' "$input" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$@" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+  if [ "$RC" -eq 0 ] && grep -q "result=UNGUARDED" "$DEG" && grep -q -F -- "$frag" "$DEG"; then ok "degradation logged (not silent): $what"
+  else bad "degradation not logged: $what -- rc=$RC log=[$(cat "$DEG")]"; fi
+}
+counted "hook payload that is not JSON"   "not parseable" 'not json at all {{{ du -sk ~'
+counted "hook payload that is empty"      "empty"         ''
+counted "a scan with no usable \$HOME"    "no usable home" "$(hook_json 'du -sk ~')" HOME_SCAN_GUARD_HOME=nohome
+if [ -f "$ENGINE" ]; then
+  : > "$DEG"; printf '\377\376{"tool_name":"Bash"}' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+  [ "$RC" -eq 0 ] && grep -q "result=GAVE-UP" "$DEG" && grep -q "not valid UTF-8" "$DEG" && ok "engine: stdin that is not valid UTF-8 -> allow, and logged (was swallowed by a bare except ValueError)" || bad "engine non-UTF-8: rc=$RC log=[$(cat "$DEG")]"
+fi
+# a cwd the guard cannot know (cd - with no history) is a THIRD state, not "not hot": the relative scan after it is allowed
+# (fail-open is the contract) but COUNTED; a cwd it does know leaves the log empty
+: > "$DEG"; hook_json 'cd - && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "cd - with no history then a relative scan -> allowed, but logged UNKNOWN-CWD (not silent)" || bad "unknown cwd not logged: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'cd ~/gt && cd - && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "cd - with a KNOWN previous dir leaves the log empty" || bad "known cwd polluted the log: rc=$RC log=[$(cat "$DEG")]"
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -415,7 +582,7 @@ echo "-- COST: the hook runs on every Bash call of every agent; ordinary calls m
 printf '#!/bin/sh\ntouch "%s/py-called"\nexit 0\n' "$SCRATCH" > "$SCRATCH/py-stub"; chmod +x "$SCRATCH/py-stub"
 spawned() {  # command [cwd] -> 0 if the classifier was spawned
   rm -f "$SCRATCH/py-called"
-  hook_json "$1" "${2-}" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-stub" bash "$GUARD" >/dev/null 2>&1
+  hook_json "$1" "${2-}" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_PY="$SCRATCH/py-stub" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1
   [ -e "$SCRATCH/py-called" ]
 }
 for c in 'git status --short' 'bd list --status open --limit 0 --json' 'gc session peek x --lines 40' 'ls -la' \
@@ -426,6 +593,54 @@ done
 spawned 'du -sk ~' /Users/athos/gt && ok "python IS spawned when a scan meets \$HOME" || bad "prefilter missed 'du -sk ~'"
 spawned 'find . -name x' /Users/athos && ok "python IS spawned when the cwd itself is \$HOME" || bad "prefilter missed cwd=\$HOME"
 
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- CLASS check: no option letter can hide a hot operand (the engine, in-process, every letter) --"
+# ─────────────────────────────────────────────────────────────────────────
+# Blocker 2 was one instance of a class: a parser that decides for the tool which words are OPTIONS' values can
+# swallow the path. Rather than pin the letters the reviewer happened to try, walk EVERY letter and digit, alone and
+# clustered, for every tool that shares the du-style option parsing, with the hot operand first, last and alone. A
+# letter that really takes a value ("du -B ~/Downloads") is still a block: the swallowed word stays a candidate.
+if [ -f "$HERE/home-scan-guard.py" ]; then
+  CLASS_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" HOME_SCAN_GUARD_LOG="$LOG" python3 -I -S - <<'PY' 2>&1
+import importlib.util, os, string, sys
+spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+def blocked(cmd, cwd="/Users/athos/gt"):
+    try:
+        m.analyze(cmd, cwd, ["/Users/athos"])
+    except m.Block:
+        return True
+    return False
+
+letters = string.ascii_letters + string.digits
+missed, total = [], 0
+for tool in ("du", "dust", "gdu", "ncdu", "tree"):
+    for x in letters:
+        for flag in ("-" + x, "-s" + x, "-" + x + "s"):
+            for tail in ("~/Downloads", "~/Downloads ~/gt", "~/gt ~/Downloads", "/Users", "/Users/athos"):
+                cmd = "%s %s %s" % (tool, flag, tail)
+                total += 1
+                if not blocked(cmd):
+                    missed.append(cmd)
+# BSD find: a letter (or cluster) before the path must not hide it either
+for pre in ["-" + c for c in "EHLPXdsx"] + ["-Hx", "-EX", "-Ps", "-O1", "-O2", "-O3", "-f ~/Downloads", "-D tree", "-D opt"]:
+    cmd = "find %s ~/Downloads -name x" % pre if not pre.startswith("-f") else "find %s -name x" % pre
+    total += 1
+    if not blocked(cmd):
+        missed.append(cmd)
+print("CLASS total=%d missed=%d" % (total, len(missed)))
+for c in missed[:12]:
+    print("  MISSED: " + c)
+PY
+)"
+  case "$CLASS_OUT" in
+    "CLASS total="*" missed=0"*) ok "class: every option letter, alone and clustered, leaves a hot operand blocked (${CLASS_OUT%%$'\n'*})" ;;
+    *) bad "class: an option letter hid a hot operand -- $CLASS_OUT" ;;
+  esac
+fi
+
 # A guard that fails open on its OWN bug is silently OFF: the engine logs those as ENGINE-ERROR. A NameError from a
 # refactor once turned 71 must-block cases into silent allows here -- this is the assertion that makes that loud.
 echo ""
@@ -434,6 +649,13 @@ if grep -q 'ENGINE-ERROR' "$LOG" 2>/dev/null; then
   bad "engine internal error(s) fail-opened during this run: $(grep 'ENGINE-ERROR' "$LOG" | head -3 | cut -c1-300)"
 else
   ok "no ENGINE-ERROR line in the guard log after the whole run ($(grep -c 'BLOCKED' "$LOG" 2>/dev/null) BLOCKED lines, $(grep -c 'GAVE-UP' "$LOG" 2>/dev/null) GAVE-UP)"
+fi
+# ...nor did the WRAPPER degrade under a case that was supposed to be decided by the classifier: an expect_allow can
+# pass because the wrapper timed out or lost its interpreter and fell open, not because the classifier said allow.
+if grep -q 'UNGUARDED' "$LOG" 2>/dev/null; then
+  bad "the wrapper degraded (fell open) during the main corpus, so an allow may not be the classifier's verdict: $(grep 'UNGUARDED' "$LOG" | head -3 | cut -c1-300)"
+else
+  ok "no UNGUARDED line in the guard log after the whole run (every verdict above came from the classifier)"
 fi
 grep -q 'GAVE-UP' "$LOG" 2>/dev/null && ok "absurd nesting is logged as GAVE-UP (deliberate fail-open), not as an error" || bad "no GAVE-UP line for the nesting case"
 

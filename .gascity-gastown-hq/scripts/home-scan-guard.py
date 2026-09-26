@@ -26,18 +26,24 @@ WHAT THIS IS NOT: a sandbox. It is a LEXICAL heuristic over the command text, on
     computed at run time from something the text does not show, and a glob that the SHELL
     expands under a protected folder for a command that is not a scanner
     (`cat ~/Downloads/*.csv`, `for f in ~/Downloads/*; do ...`) -- reading files the operator
-    pointed at is the legitimate use of Downloads, so that stays out of scope.
+    pointed at is the legitimate use of Downloads, so that stays out of scope. Two more, both measured
+    (not assumed): a scanner launched BY another command (`find ~/gt -exec du -sk ~ \\;` -- only find's
+    own paths are checked), and conditional flow (the walk is linear, so a `cd` in an `if` / `case` arm
+    or after `||` is taken to have run).
   * The shell grammar it understands is a working subset (quotes, escapes, heredocs, $(...),
     backticks, pipelines, &&/||/;, for/while/if bodies, subshells and braces, redirections,
     wrappers such as timeout/nice/env/xargs, bash -c / eval), enough that text which merely
     MENTIONS a scan (a bead comment, a commit message, a heredoc body) is not a scan.
 
 STATE MODEL, in one paragraph: as the command is walked left to right the classifier tracks the
-working directory (starting from the hook payload's `cwd`, moved by cd/pushd), simple variable
-assignments (H=$HOME), and a set of "tainted" variables -- loop or `read` variables that iterate
-over the entries of $HOME (`for d in $(ls -A)` with cwd=$HOME, `ls ~ | while read d`). A scanner
-whose operand is (or lies under) $HOME, a protected folder, /Volumes, or a tainted variable, or
-whose implicit operand (the cwd) is one of those, is a finding.
+working directory (starting from the hook payload's `cwd`, moved by cd/pushd/popd; `cd -` returns to
+the tracked previous directory), simple variable assignments (H=$HOME), and a set of "tainted"
+variables -- loop or `read` variables that iterate over the entries of $HOME (`for d in $(ls -A)`
+with cwd=$HOME, `ls ~ | while read d`). A cd or assignment inside `( ... )`, on either side of a pipe or
+before `&` belongs to a subshell and does not outlive it. A scanner whose operand is (or lies under)
+$HOME, a protected folder, /Volumes, or a tainted variable, or whose implicit operand (the cwd) is one
+of those, is a finding. The cwd has a THIRD state, unknown (a `cd -` / `popd` with no history): that is
+not "safe", and a relative scan under it is allowed (fail-open) but logged as UNKNOWN-CWD.
 """
 import json
 import os
@@ -65,9 +71,42 @@ DIR_EXTENSIONS = {"app", "photoslibrary", "bundle", "framework", "xcodeproj", "x
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 KEYWORDS = {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", "{", "}", "!",
             "esac", "in", "function", "coproc"}
+# gdu is GNU du (coreutils) here. exa/eza/lsd are NOT ls: they list like it but spell recursion differently (-T / --tree),
+# and `ls -T` is macOS's full-timestamp switch -- so they keep a name of their own ("eza") instead of borrowing ls's.
 TOOL_ALIASES = {"gfind": "find", "gdu": "du", "ggrep": "grep", "gls": "ls", "gcp": "cp",
                 "gtar": "tar", "fdfind": "fd", "ripgrep": "rg", "egrep": "grep",
-                "fgrep": "grep", "zgrep": "grep", "exa": "ls", "eza": "ls", "lsd": "ls"}
+                "fgrep": "grep", "zgrep": "grep", "exa": "eza", "lsd": "eza"}
+
+# ONE option table PER TOOL. du, dust, gdu, ncdu and tree used to share a single "these letters take a value" list, so a
+# letter that takes a value for one tool and is a plain switch for another swallowed the PATH as its "value"
+# (`tree -d ~/Downloads`, `du -L ~/Downloads`, `du -P ~`): the operand list came out empty and the cwd was checked instead.
+# The tables below are for the false positives (`du -L ~/gt` is a switch and must not eat a word; `du -B 1M -sk ~/gt`
+# takes one). They are NOT what keeps a path from being hidden: whatever a valued option swallows stays a candidate operand
+# (`extra` in _operand_findings), so a wrong entry costs a false positive at worst, never a missed scan.
+TOOL_OPTS = {
+    "du":   (("B", "I", "X", "d", "t"),
+             ("--max-depth", "--block-size", "--exclude", "--exclude-from", "--threshold", "--time-style",
+              "--files0-from")),
+    "dust": (("d", "n", "X", "I", "z", "v", "e", "w", "o", "S", "M"),
+             ("--depth", "--number-of-lines", "--ignore-directory", "--ignore-all-in-file", "--min-size",
+              "--invert-filter", "--filter", "--terminal_width", "--output-format", "--stack-size", "--mtime")),
+    "ncdu": (("o", "f", "X", "t"), ("--exclude", "--exclude-from", "--color", "--threads")),
+    "tree": (("L", "P", "I", "H", "T", "o"), ("--filelimit", "--charset", "--sort", "--timefmt", "--hintro", "--houtro")),
+}
+
+# Depth flags that BOUND THE WALK (it stops descending), per tool -- only these can excuse an ancestor (/, /Users), because
+# only these keep the tool out of ~/Desktop, ~/Documents ... `du -d N` / `--max-depth` / `dust -d` merely limit what is
+# PRINTED: du still opens the whole subtree to add the sizes up (the reviewer reproduced `du -d 1 -h /Users` reaching
+# every protected folder). A tool that is not listed has no such flag (du, dust, ncdu, ls, grep -r, tar, cp ...).
+# (short letters, long names); find spells its long option with one dash and is handled as a word pair.
+TRAVERSAL_DEPTH = {
+    "find": ((), ("-maxdepth",)),
+    "tree": (("L",), ()),
+    "fd":   (("d",), ("--max-depth", "--maxdepth")),
+    "rg":   (("d",), ("--max-depth", "--maxdepth")),
+    "ag":   ((), ("--depth",)),
+    "eza":  (("L",), ("--level", "--depth")),
+}
 
 MAX_DEPTH = 8
 MAX_BRACE_ALTERNATIVES = 64
@@ -112,10 +151,12 @@ class Word:
 
 
 class Segment:
-    __slots__ = ("words", "op_before", "extra")
+    """One simple command. `parens` is the "(" / ")" tokens that stood between the previous command and this one, in
+    order -- the walker uses them to scope a `cd` to its subshell (`(cd x && ls); find .`)."""
+    __slots__ = ("words", "op_before", "extra", "parens")
 
-    def __init__(self, words, op_before, extra):
-        self.words, self.op_before, self.extra = words, op_before, extra
+    def __init__(self, words, op_before, extra, parens=""):
+        self.words, self.op_before, self.extra, self.parens = words, op_before, extra, parens
 
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -232,6 +273,7 @@ def scan(s, i, in_paren, depth):
     pending = []          # heredocs whose body starts after the next newline: (delim, strip, expand)
     skip_word = False     # the next word is a redirection target
     paren_depth = 0
+    pending_parens = []   # "(" / ")" tokens seen since the last command, attached to the next Segment
 
     def add_lit(text, quoted):
         nonlocal segs
@@ -258,7 +300,8 @@ def scan(s, i, in_paren, depth):
         nonlocal words, extra, op_before
         end_word()
         if words or extra:
-            segments.append(Segment(words, op_before, extra))
+            segments.append(Segment(words, op_before, extra, "".join(pending_parens)))
+            pending_parens.clear()
         words, extra = [], []
         op_before = op
 
@@ -409,6 +452,7 @@ def scan(s, i, in_paren, depth):
             continue
         if c == "(":
             end_segment("(")
+            pending_parens.append("(")
             paren_depth += 1
             i += 1
             continue
@@ -417,6 +461,7 @@ def scan(s, i, in_paren, depth):
             i += 1
             if in_paren and paren_depth == 0:
                 return segments, i
+            pending_parens.append(")")
             if paren_depth > 0:
                 paren_depth -= 1
             continue
@@ -435,18 +480,37 @@ class Res:
 
 
 class State:
+    """cwd is one of THREE things: a path, the string of a path we can classify, or None = we do not know (a `cd -` or
+    `popd` with no history). None is not "safe": a relative scan under it is allowed (fail-open is the contract) but
+    COUNTED, through `notes`, which every fork shares."""
+
     def __init__(self, homes, cwd):
         self.homes = homes
         self.home = homes[0]
         self.cwd = cwd
+        self.oldpwd = None           # what `cd -` returns to
+        self.dirstack = []           # pushd / popd
         self.vars = {}
         self.tainted = set()
+        self.notes = []
 
     def fork(self):
         st = State(self.homes, self.cwd)
+        st.oldpwd = self.oldpwd
+        st.dirstack = list(self.dirstack)
         st.vars = dict(self.vars)
         st.tainted = set(self.tainted)
+        st.notes = self.notes
         return st
+
+    def snapshot(self):
+        return (self.cwd, self.oldpwd, list(self.dirstack), dict(self.vars), set(self.tainted))
+
+    def restore(self, snap):
+        self.cwd, self.oldpwd, dirs, vars_, tainted = snap
+        self.dirstack = list(dirs)
+        self.vars = dict(vars_)
+        self.tainted = set(tainted)
 
 
 def lit_text(w):
@@ -668,9 +732,18 @@ NUMERIC = re.compile(r"-?[0-9]+")
 def parse_args(args, valued_short=(), valued_long=()):
     """-> (flags:set, operands:list[Word], values:dict). flags holds single letters and long
     names; `values` maps a valued option to the word that followed it."""
+    flags, ops, values, _ = parse_args_full(args, valued_short, valued_long)
+    return flags, ops, values
+
+
+def parse_args_full(args, valued_short=(), valued_long=()):
+    """parse_args plus `taken`: the WORDS consumed as the separate value of a valued option (`du -B 1K PATH` takes `1K`).
+    A caller that leans on an option table being exactly right can lose a path to it; `taken` lets it keep the
+    swallowed words as candidate operands (fail toward blocking) instead."""
     flags = set()
     ops = []
     values = {}
+    taken = []
     i = 0
     only_ops = False
     while i < len(args):
@@ -691,6 +764,7 @@ def parse_args(args, valued_short=(), valued_long=()):
                 values[name] = t.split("=", 1)[1]
             elif name in valued_long and i + 1 < len(args):
                 values[name] = lit_text(args[i + 1]) or ""
+                taken.append(args[i + 1])
                 i += 1
             i += 1
             continue
@@ -703,10 +777,11 @@ def parse_args(args, valued_short=(), valued_long=()):
                     values[ch] = rest
                 elif i + 1 < len(args):
                     values[ch] = lit_text(args[i + 1]) or ""
+                    taken.append(args[i + 1])
                     i += 1
                 break
         i += 1
-    return flags, ops, values
+    return flags, ops, values, taken
 
 
 def _numeric_word(w):
@@ -714,46 +789,119 @@ def _numeric_word(w):
     return t is not None and bool(NUMERIC.fullmatch(t))
 
 
-def shallow_depth(args):
-    """Smallest explicit depth limit (find -maxdepth N, du -d N / --max-depth=N, tree -L N ...)."""
+def shallow_depth(name, args):
+    """The depth limit that BOUNDS THE WALK for `name` (find -maxdepth N, tree -L N, fd/rg -d N / --max-depth N,
+    eza -L N ...), or None. Only the flags in TRAVERSAL_DEPTH count: for every other tool a depth flag says how much is
+    printed, not how much is opened (du -d, dust -d), or is a different flag altogether (`-L` is "follow symlinks" for
+    ls and du). A repeated flag yields the LARGEST value (the tools do not agree on which occurrence wins, and an
+    exemption must hold for every one of them); a value that is not a plain number is unknown, so no exemption."""
+    spec = TRAVERSAL_DEPTH.get(name)
+    if spec is None:
+        return None
+    shorts, longs = spec
     best = None
+
+    def take(val):
+        nonlocal best
+        # a limit we cannot read (-L $N, or nothing after the flag) is no limit at all
+        n = int(val) if (val is not None and NUMERIC.fullmatch(val)) else 10 ** 9
+        best = n if best is None else max(best, n)
+
     for k, w in enumerate(args):
         t = lit_text(w)
         if t is None:
             continue
-        val = None
-        if t in ("-maxdepth", "-d", "-L", "--max-depth", "--depth", "-mindepth") and k + 1 < len(args):
-            val = lit_text(args[k + 1])
-        elif t.startswith("--max-depth=") or t.startswith("--depth="):
-            val = t.split("=", 1)[1]
-        elif re.fullmatch(r"-[dL][0-9]+", t):
-            val = t[2:]
-        if val is not None and NUMERIC.fullmatch(val):
-            if t != "-mindepth":
-                best = int(val) if best is None else min(best, int(val))
+        nxt = lit_text(args[k + 1]) if k + 1 < len(args) else None
+        if name == "find":
+            if t == "-maxdepth":
+                take(nxt)
+        elif t.startswith("--"):
+            base, eq, val = t.partition("=")
+            if base in longs:
+                take(val if eq else nxt)
+        elif t.startswith("-") and len(t) > 1:
+            cluster = t[1:]
+            for j, ch in enumerate(cluster):
+                if ch in shorts:
+                    rest = cluster[j + 1:]
+                    take(rest if rest else nxt)
+                    break
     return best
 
 
 # ----------------------------------------------------------------------------- listers / taint
-LISTERS = {"ls", "find", "fd", "tree", "echo", "printf"}
+LISTERS = {"ls", "eza", "find", "fd", "tree", "echo", "printf"}
 
 
 def _operand_words(name, args):
     if name == "find":
-        ops = []
-        skip = {"-H", "-L", "-P", "-E", "-X", "-x", "-s", "-d"}
-        for w in args:
-            t = lit_text(w)
-            if t is not None and t in skip:
-                continue
-            if t is not None and (t.startswith("-") or t in ("(", "!", ",")):
-                break
-            ops.append(w)
-        return ops
+        return _find_paths(args)
     if name in ("echo", "printf"):
         return list(args)
     flags, ops, _ = parse_args(args)
     return [w for w in ops if not _numeric_word(w)]
+
+
+_FIND_SWITCHES = re.compile(r"-[EHLPXdsx]+")      # BSD find clusters its option letters: -Hx, -EX
+_FIND_F = re.compile(r"-[EHLPXdsx]*f")           # BSD -f PATH: the tree to walk, spelled as an option
+_FIND_LEVEL = re.compile(r"-O[0-9]*")            # GNU -O<level>
+
+
+def _find_paths(args):
+    """The path operands of a find command line: everything before the first expression. find takes options BEFORE its
+    paths (BSD: -f PATH, -Hx, -EX; GNU: -D debugopts, -O3). A parser that stops at the first word it does not know reads
+    `find -O3 ~/Downloads` as "no path" and checks the cwd instead -- so those are consumed, and -f's value IS a path."""
+    ops = []
+    i = 0
+    while i < len(args):
+        w = args[i]
+        t = lit_text(w)
+        if t is None:                                 # an expansion ($HOME, $(...)) is a path operand
+            ops.append(w)
+            i += 1
+        elif _FIND_SWITCHES.fullmatch(t) or _FIND_LEVEL.fullmatch(t):
+            i += 1
+        elif _FIND_F.fullmatch(t):
+            if i + 1 < len(args):
+                ops.append(args[i + 1])
+            i += 2
+        elif t == "-D":
+            i += 2
+        elif t.startswith("-") or t in ("(", "!", ","):
+            break
+        else:
+            ops.append(w)
+            i += 1
+    return ops
+
+
+def _tar_dir_words(args):
+    """Words naming a directory tar changes into (it then archives / extracts relative to it): `-C DIR`, `-CDIR`,
+    `--directory DIR`, `--directory=DIR`, and -C at the end of a cluster (`-czC DIR`). Every one of those spellings is a
+    way for a path to sit in an OPTION VALUE, where the operand list never sees it."""
+    out = []
+    for k, w in enumerate(args):
+        first = w.segs[0] if w.segs else None
+        if first is None or first.kind != "lit" or first.quoted:
+            continue
+        t, tail = first.text, list(w.segs[1:])
+        if t == "--directory":
+            if not tail and k + 1 < len(args):
+                out.append(args[k + 1])
+        elif t.startswith("--directory="):
+            out.append(Word([Seg("lit", t[len("--directory="):], False)] + tail))
+        elif t.startswith("-") and not t.startswith("--") and len(t) > 1:
+            for j in range(1, len(t)):            # walk the cluster: -czC DIR, -C/dir, -xzvC/dir
+                if t[j] == "C":
+                    rest = t[j + 1:]
+                    if rest or tail:
+                        out.append(Word([Seg("lit", rest, False)] + tail))
+                    elif k + 1 < len(args):
+                        out.append(args[k + 1])
+                    break
+                if not t[j].isalpha():
+                    break
+    return out
 
 
 def command_lists_home(name, args, st):
@@ -796,7 +944,10 @@ def script_lists_home(script, st, depth=0):
             continue
         name, args, _implicit = unwrapped
         if name in ("cd", "pushd"):
-            _apply_cd(args, st)
+            _apply_cd(args, st, name == "pushd")
+            continue
+        if name == "popd":
+            _apply_popd(st)
             continue
         if command_lists_home(name, args, st):
             return True
@@ -861,16 +1012,28 @@ def unwrap(words, st):
     return None
 
 
-def _apply_cd(args, st):
+def _apply_cd(args, st, is_pushd=False):
+    """cd / pushd. The previous directory is TRACKED (OLDPWD, the pushd stack): forgetting it would turn `cd -` into
+    "cwd unknown", which every later relative scan reads as "not hot" -- the same collapse of "don't know" into "safe"
+    that the rest of this file is careful about. What we genuinely cannot know stays None (and is counted)."""
     flags, ops, _ = parse_args(args)
+    prev = st.cwd
     if not ops:
-        st.cwd = st.home
-        return
-    res = resolve(ops[0], st)[0]
-    if lit_text(ops[0]) == "-":
-        st.cwd = None
-        return
-    st.cwd = path_of(res, st)
+        target = None if is_pushd else st.home        # bare `cd` = $HOME; bare `pushd` swaps the top two: unknown
+    elif lit_text(ops[0]) == "-":
+        target = st.oldpwd
+    else:
+        target = path_of(resolve(ops[0], st)[0], st)
+    if is_pushd:
+        st.dirstack.append(prev)
+    st.oldpwd = prev
+    st.cwd = target
+
+
+def _apply_popd(st):
+    prev = st.cwd
+    st.cwd = st.dirstack.pop() if st.dirstack else None
+    st.oldpwd = prev
 
 
 # ----------------------------------------------------------------------------- scanners
@@ -883,27 +1046,47 @@ def _block(reason):
     raise Block(reason)
 
 
-def _operand_findings(name, ops, st, ctx, implicit_cwd, args, allow_file, describe):
-    """Common tail for recursive scanners: every operand (or the cwd) that is hot is a block."""
-    shallow = shallow_depth(args)
-    targets = []
-    for w in ops:
-        for res in resolve(w, st):
-            targets.append(res)
+_DIR_SPELLING = re.compile(r"(^|/)\.{1,2}/?$|/$")
+
+
+def _spelled_as_dir(text):
+    """A trailing slash (or a trailing /. or /..) is PROOF of a directory: `~/Downloads/data.bak/` is not "one named
+    file" just because `.bak` looks like an extension. (looks_like_file sees only the normalised path, where the slash
+    is already gone.)"""
+    return bool(_DIR_SPELLING.search(text))
+
+
+def _note_unknown_cwd(res, st, name):
+    """A relative operand (or the implicit cwd) while the cwd is UNKNOWN: allowed, but counted -- 'do not know' must not
+    leave the same trace as 'not hot'."""
+    if st.cwd is None and not res.tainted and (not res.s or not res.s.startswith("/")):
+        st.notes.append("%s %s: cwd unknown" % (name, unquote_map(res.s).replace(DYN, "<?>") or "(cwd)"))
+
+
+def _operand_findings(name, ops, st, ctx, implicit_cwd, args, allow_file, describe, extra=()):
+    """Common tail for recursive scanners: every operand (or the cwd) that is hot is a block.
+    `extra` = words a valued option swallowed. They are checked like operands (fail toward blocking) but never
+    replace the implicit cwd: `tree -I node_modules` still scans the cwd, and `du -L ~/Downloads ~/gt` must not lose
+    ~/Downloads to an option table that was wrong about -L."""
+    shallow = shallow_depth(name, args)
+    real = [res for w in ops for res in resolve(w, st)]
     if not ops and implicit_cwd:
-        cwd_res = Res(".", False)
-        targets.append(cwd_res)
-    for res in targets:
+        real.append(Res(".", False))
+    swallowed = [res for w in extra for res in resolve(w, st)]
+    for res in real + swallowed:
         p = path_of(res, st)
+        if res in real:
+            _note_unknown_cwd(res, st, name)
         kind = classify(p, st)
         if kind is None:
             continue
         if kind == "ancestor" and shallow is not None and shallow <= 2:
             continue
-        if kind == "hot" and allow_file and p is not None and looks_like_file(p, st):
+        if kind == "hot" and allow_file and p is not None and not _spelled_as_dir(res.s) \
+                and looks_like_file(p, st):
             continue
         shown = unquote_map(res.s).replace(DYN, "<?>").replace(HDYN, "<entry-of-$HOME>")
-        _block("%s %s -- %s" % (name, shown if ops else "(cwd)", describe(kind)))
+        _block("%s %s -- %s" % (name, shown if (ops or extra) else "(cwd)", describe(kind)))
 
 
 def _describe_recursive(kind):
@@ -913,13 +1096,14 @@ def _describe_recursive(kind):
 
 
 def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
-    if name in ("du", "dust", "gdu", "ncdu", "tree"):
-        flags, ops, _ = parse_args(args, valued_short=("d", "L", "P", "I", "t", "B", "n"),
-                                   valued_long=("--max-depth", "--exclude", "--threshold"))
+    if name in TOOL_OPTS:                                 # du, dust, ncdu, tree -- gdu is du (TOOL_ALIASES)
+        shorts, longs = TOOL_OPTS[name]
+        flags, ops, _, taken = parse_args_full(args, valued_short=shorts, valued_long=longs)
         ops = [w for w in ops if not _numeric_word(w)]
+        extra = [w for w in taken if not _numeric_word(w)]
         if implicit_stdin and ctx.pipe_home:
             _block("%s fed by a listing of $HOME through xargs" % name)
-        _operand_findings(name, ops, st, ctx, True, args, name == "du", _describe_recursive)
+        _operand_findings(name, ops, st, ctx, True, args, name == "du", _describe_recursive, extra=extra)
         return
     if name == "find":
         ops = _operand_words("find", args)
@@ -962,30 +1146,43 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
         implicit = not (stdin_is_pipe or implicit_stdin)
         _operand_findings(name, paths, st, ctx, implicit, args, False, _describe_recursive)
         return
-    if name == "ls":
+    if name in ("ls", "eza"):
         flags, ops, _ = parse_args(args)
         if "d" in flags:
+            # -d lists a directory operand ITSELF (a stat), but the shell already expanded a glob operand by listing it:
+            # `ls -d ~/Downloads/*` reads Downloads. Only a glob under a protected folder is a finding here.
+            for w in ops:
+                for res in resolve(w, st):
+                    p = path_of(res, st)
+                    # the glob's PARENT is what the shell lists: `~/*` lists $HOME (fine), `~/Downloads/*` lists Downloads
+                    if has_glob(res.s) and p is not None and classify(posixpath.dirname(p), st) == "hot":
+                        _block("%s -d %s -- the shell expands the glob by listing a macOS-protected folder"
+                               % (name, unquote_map(res.s)))
             return
-        recursive = "R" in flags or "--recursive" in flags or "T" in flags
+        recursive = "R" in flags or "--recursive" in flags
+        if name == "eza":       # -T / --tree is eza's recursion; for ls, -T is the full-timestamp switch (ls -lT ~)
+            recursive = recursive or bool(flags & {"T", "--tree", "--recurse"})
         if implicit_stdin and ctx.pipe_home:
-            _block("ls fed by a listing of $HOME through xargs")
+            _block("%s fed by a listing of $HOME through xargs" % name)
+        shallow = shallow_depth(name, args)
         ops = [w for w in ops if not _numeric_word(w)]
         targets = [r for w in ops for r in resolve(w, st)]
         if not ops:
             targets = [Res(".", False)]
         for res in targets:
             p = path_of(res, st)
+            _note_unknown_cwd(res, st, name)
             kind = classify(p, st)
             if kind is None:
                 continue
             if recursive:
-                if kind == "ancestor" and (shallow_depth(args) or 99) <= 2:
+                if kind == "ancestor" and shallow is not None and shallow <= 2:
                     continue
-                _block("ls -R %s -- %s" % (unquote_map(res.s) or "(cwd)", _describe_recursive(kind)))
+                _block("%s -R %s -- %s" % (name, unquote_map(res.s) or "(cwd)", _describe_recursive(kind)))
             elif kind == "hot":
-                if p is not None and looks_like_file(p, st):
+                if p is not None and not _spelled_as_dir(res.s) and looks_like_file(p, st):
                     continue
-                _block("ls %s -- lists a macOS-protected folder" % (unquote_map(res.s) or "(cwd)"))
+                _block("%s %s -- lists a macOS-protected folder" % (name, unquote_map(res.s) or "(cwd)"))
         return
     if name == "mdfind":
         flags, ops, values = parse_args(args, valued_short=(), valued_long=())
@@ -998,7 +1195,7 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
         return
     if name in ("rsync", "ditto", "tar", "zip", "cp", "scp"):
         flags, ops, values = parse_args(args, valued_short=("C",) if name == "tar" else (),
-                                        valued_long=())
+                                        valued_long=("--directory",) if name == "tar" else ())
         if name == "tar" and args:
             first = lit_text(args[0])
             if first is not None and not first.startswith("-") and first.isalpha():
@@ -1017,10 +1214,13 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
                 pass
             elif operands:
                 operands = operands[1:]      # the archive itself
-        for k, w in enumerate(args):
-            if name == "tar" and lit_text(w) in ("-C", "--directory") and k + 1 < len(args):
-                operands.append(args[k + 1])
-        _operand_findings(name, operands, st, ctx, False, args, True, _describe_recursive)
+        if name == "tar":
+            operands.extend(_tar_dir_words(args))
+        # Getting here means recursion was asked for by name (cp -r, rsync -a, zip -r, tar), so an operand that "has an
+        # extension" proves nothing -- `cp -r ~/Documents/proj.v2 /tmp` walks a directory. The "one named file" reading
+        # survives only for tar OUTSIDE create mode (list / extract), where an operand is not something tar walks.
+        allow_file = name == "tar" and not (flags & {"c", "--create"})
+        _operand_findings(name, operands, st, ctx, False, args, allow_file, _describe_recursive)
         return
 
 
@@ -1029,7 +1229,16 @@ def analyze_script(script, st, depth=0):
     if depth > MAX_DEPTH:
         raise Abort("nesting too deep")
     ctx = Ctx()
-    for seg in script:
+    scopes = []          # the state at each "(" that is still open: a subshell's cd / assignments do not outlive it
+    for idx, seg in enumerate(script):
+        # a command on either side of a pipe, or followed by `&`, runs in a subshell of its own: a cd there does not move us
+        in_subshell = seg.op_before in ("|", "|&") or (
+            idx + 1 < len(script) and script[idx + 1].op_before in ("|", "|&", "&"))
+        for tok in seg.parens:
+            if tok == "(":
+                scopes.append(st.snapshot())
+            elif scopes:            # a stray ")" (a `case` pattern, `f()`) with nothing open is ignored
+                st.restore(scopes.pop())
         if seg.op_before not in ("|", "|&"):
             ctx.pipe_home = False
         stdin_is_pipe = seg.op_before in ("|", "|&")
@@ -1082,11 +1291,13 @@ def analyze_script(script, st, depth=0):
             inner, _ = scan(" ".join(render(w) for w in args), 0, False, depth + 1)
             analyze_script(inner, st.fork(), depth + 1)
             continue
-        if name in ("cd", "pushd"):
-            _apply_cd(args, st)
-            continue
-        if name == "popd":
-            st.cwd = None
+        if name in ("cd", "pushd", "popd"):
+            if in_subshell:
+                continue
+            if name == "popd":
+                _apply_popd(st)
+            else:
+                _apply_cd(args, st, name == "pushd")
             continue
         check_command(name, args, st, ctx, implicit, stdin_is_pipe)
         if command_lists_home(name, args, st):
@@ -1120,8 +1331,12 @@ def _record_assignments(assigns, st):
 
 
 def analyze(command, cwd, homes):
+    """Raises Block on a scan of $HOME / a protected folder. Returns the notes: places where the cwd was unknown and a
+    relative scan was allowed anyway (the caller logs them -- 'don't know' is not 'not hot')."""
     script, _ = scan(command, 0, False, 0)
-    analyze_script(script, State(homes, cwd or None))
+    st = State(homes, cwd or None)
+    analyze_script(script, st)
+    return st.notes
 
 
 # ----------------------------------------------------------------------------- entry point
@@ -1145,9 +1360,10 @@ raises the same prompt. If this block is wrong for your case, say so on the bead
 
 def _log(result, reason, command, cwd):
     """One tab-separated line per event. BLOCKED = a block; GAVE-UP = deliberate fail-open (nesting
-    too deep to trust); ENGINE-ERROR = an internal error, also a fail-open -- but a guard that fails
-    open on its own bug is a guard that is silently OFF, so this line is the only trace of it and
-    the selftest asserts none of its cases produced one."""
+    too deep to trust, input that is not UTF-8, no usable home); UNKNOWN-CWD = allowed because the cwd was not
+    knowable after a `cd -` / `popd` with no history (a third state, not "not hot"); ENGINE-ERROR = an internal error,
+    also a fail-open -- but a guard that fails open on its own bug is a guard that is silently OFF, so this line is the
+    only trace of it and the selftest asserts none of its cases produced one."""
     path = os.environ.get("HOME_SCAN_GUARD_LOG") or os.path.join(
         os.path.expanduser("~"), ".gastown", "logs", "home-scan-guard.log")
     try:
@@ -1166,10 +1382,17 @@ def _log(result, reason, command, cwd):
 def main():
     command = cwd = None
     try:
+        # Bytes, decoded here: `except ValueError` around json.loads used to swallow a UnicodeDecodeError too, with no trace.
+        raw = sys.stdin.buffer.read()
         try:
-            payload = json.loads(sys.stdin.read())
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            _log("GAVE-UP", "hook input is not valid UTF-8", None, None)
+            return 0
+        try:
+            payload = json.loads(text)
         except ValueError:
-            return 0            # not JSON: expected bad input, not an engine bug
+            return 0            # not JSON: expected bad input, not an engine bug (the wrapper counts it as UNGUARDED)
         if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
             return 0
         command = (payload.get("tool_input") or {}).get("command")
@@ -1179,12 +1402,15 @@ def main():
         home = os.environ.get("HOME_SCAN_GUARD_HOME") or os.environ.get("HOME") or ""
         home = home.rstrip("/")
         if not home.startswith("/") or home.count("/") < 2:
-            return 0           # no usable home: cannot classify anything, so do not guess
+            _log("GAVE-UP", "no usable home (%r): cannot classify anything, so not guessing" % home, command, cwd)
+            return 0
         homes = [home]
         alt = "/Users/" + posixpath.basename(home)
         if alt != home:
             homes.append(alt)
-        analyze(command, cwd, homes)
+        notes = analyze(command, cwd, homes)
+        if notes:
+            _log("UNKNOWN-CWD", "; ".join(notes[:4]), command, cwd)
         return 0
     except Block as blocked:
         reason = str(blocked)

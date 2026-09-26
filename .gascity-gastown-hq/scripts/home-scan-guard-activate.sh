@@ -15,8 +15,10 @@
 #     {"matcher":"^Bash$","hooks":[{"type":"command","command":<see below>,"timeout":10}]}
 #   * a DEDICATED entry with its own matcher, never a hook folded into an existing matcher="Bash"
 #     entry. The engine merges pool overlays into a workdir's settings.json by matcher identity
-#     (gascity internal/overlay/merge.go hookEntryKey: same matcher => the overlay entry REPLACES
-#     the base entry in place). A pool overlay carrying matcher="Bash" would therefore wipe the
+#     (gascity internal/overlay/merge.go: hookEntryKey() keys an entry by its "matcher" string and
+#     mergeHookArray() lets an overlay entry with the same key REPLACE the base entry in place --
+#     read in the engine source, .local-patches/_src-hookfix, not just measured). A pool overlay
+#     carrying matcher="Bash" would therefore wipe the
 #     dangerous-command guards that live in a workdir's own Bash entry. "^Bash$" is a tool-name
 #     regex (it still matches only the Bash tool) with an identity of its own: the overlay appends
 #     it once, idempotently, and this script and the overlay converge on the very same entry.
@@ -33,15 +35,22 @@
 #
 # MERGE SEMANTICS: any hook whose command contains the marker "home-scan-guard" is OURS (the command
 # carries it as a `: home-scan-guard;` no-op, so this never depends on the guard's path or file name).
-# The dedicated ^Bash$ entry is converged IN PLACE (created at the end if absent, extra copies
-# dropped); a hook of ours found inside any OTHER entry (an older activation that folded it into a
-# Bash entry) is removed, and that entry is dropped only if that left it empty. Nothing that is not
-# ours is ever modified, replaced or reordered.
+# The FIRST ^Bash$ entry is the dedicated one and is converged IN PLACE: our hook there is replaced by the
+# current command where it sat (appended when there was none), extra copies of ours are dropped, and every
+# hook in it that is NOT ours stays exactly where it was (someone else may register under the same matcher).
+# Every other entry loses only its hooks of ours (an older activation that folded it into a Bash entry, or a
+# second ^Bash$ entry) and is dropped only if that left it empty. Nothing that is not ours is ever
+# modified, replaced or reordered.
+#
+# THREE STATES, not two: "registered" is not "effective". The registered command is `[ -f "$P" ] || exit 0`,
+# so a hook that points at a guard file which does not exist is a registered NO-OP. Reporting that as
+# GUARDED would put the very word MERGED != LIVE warns about on a file that guards nothing, so the state
+# is INERT (and --check exits 1 on it).
 #
 # USAGE: home-scan-guard-activate.sh [--check] [path-to-settings.json ...]
 #   no paths : every crew / witness / refinery / worker settings.json that exists under
 #              ${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}
-#   --check  : write nothing; print GUARDED / NOT-GUARDED per target; exit 1 if any is not guarded
+#   --check  : write nothing; print GUARDED / INERT / NOT-GUARDED per target; exit 1 if any is not GUARDED
 #   Idempotent. A target that cannot be processed (missing, unparseable) never stops the others;
 #   the exit status is 1 if any failed.
 set -uo pipefail
@@ -67,7 +76,7 @@ TARGETS=()
 for a in "$@"; do
   case "$a" in
     --check) CHECK=1 ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,55p' "$0"; exit 0 ;;
     *) TARGETS+=("$a") ;;
   esac
 done
@@ -91,22 +100,36 @@ command -v jq >/dev/null 2>&1 || { echo "FATAL: jq not found" >&2; exit 1; }
 
 # The desired state, as ONE jq definition shared by activation and --check so they cannot drift.
 JQ_APPLY='
+  def ours: ((.command // "") | contains($marker));
   (.hooks //= {}) | (.hooks.PreToolUse //= []) |
   ({type: "command", command: $cmd, timeout: $timeout}) as $hook |
-  # the dedicated entry: converge the FIRST one in place, drop any extra copies
-  ([.hooks.PreToolUse | to_entries[] | select(.value.matcher == $m) | .key]) as $mine |
+  ([.hooks.PreToolUse | to_entries[] | select(.value.matcher == $m) | .key][0]) as $first |
   .hooks.PreToolUse |= [to_entries[]
-      | select((.value.matcher != $m) or (.key == $mine[0]))
-      | (if .value.matcher == $m then .value.hooks = [$hook] else . end)
-      | .value] |
-  # a hook of ours inside any OTHER entry (older activation): remove it; drop the entry only if
-  # that left it empty -- an entry that held none of ours is never touched
-  .hooks.PreToolUse |= map(
-    if (.matcher != $m) and (((.hooks // []) | map(select((.command // "") | contains($marker))) | length) > 0) then
-      ((.hooks | map(select(((.command // "") | contains($marker)) | not))) as $keep
-       | if ($keep | length) == 0 then empty else .hooks = $keep end)
-    else . end) |
-  (if any(.hooks.PreToolUse[]; .matcher == $m) then . else .hooks.PreToolUse += [{matcher: $m, hooks: [$hook]}] end)'
+      | .key as $i | .value as $e
+      | if $i == $first then
+          # the dedicated entry: hooks that are not ours stay where they were, ours is replaced IN PLACE by the
+          # current command (extra copies dropped), and it is appended when there was none
+          ((($e.hooks // []) | map(ours)) | index(true)) as $pos
+          | (if $pos == null then (($e.hooks // []) + [$hook])
+             else ($e.hooks | to_entries
+                   | map(select((.value | ours | not) or (.key == $pos)))
+                   | map(if (.value | ours) then $hook else .value end))
+             end) as $hs
+          | ($e | .hooks = $hs)
+        else
+          # any other entry: pull ours out; drop the entry only if that left it empty -- an entry that held
+          # none of ours is never touched
+          ((($e.hooks // []) | map(select(ours))) | length) as $n
+          | if $n == 0 then $e
+            else (($e.hooks | map(select(ours | not))) as $keep
+                  | if ($keep | length) == 0 then empty else ($e | .hooks = $keep) end)
+            end
+        end] |
+  (if $first == null then (.hooks.PreToolUse += [{matcher: $m, hooks: [$hook]}]) else . end)'
+
+# "Registered" is not "effective": the hook command is a no-op while the guard file is missing (see THREE STATES).
+guard_present() { [ -f "$GUARD_PATH" ]; }
+INERT_NOTE="hook registered, but $GUARD_PATH does not exist -- the hook is a no-op until it does"
 
 STATUS=0
 for SETTINGS in "${TARGETS[@]}"; do
@@ -135,7 +158,12 @@ for SETTINGS in "${TARGETS[@]}"; do
   # "already guarded" is decided on the SEMANTIC state (jq -S), not on bytes: a settings.json
   # whose formatting merely differs from jq's must not be rewritten (and backed up) every run.
   if [ "$(jq -S . "$SETTINGS" 2>/dev/null)" = "$(jq -S . "$TMP")" ]; then
-    echo "GUARDED: $SETTINGS"
+    if guard_present; then
+      echo "GUARDED: $SETTINGS"
+    else
+      echo "INERT: $SETTINGS ($INERT_NOTE)"
+      [ "$CHECK" -eq 1 ] && STATUS=1
+    fi
     rm -f "$TMP"
     continue
   fi
@@ -160,7 +188,8 @@ for SETTINGS in "${TARGETS[@]}"; do
   # file's own mode without having to read it (a mktemp file is 0600), then rename over it atomically.
   NEW="${SETTINGS}.new.$$"
   if cp -p "$SETTINGS" "$NEW" 2>/dev/null && cat "$TMP" > "$NEW" 2>/dev/null && mv "$NEW" "$SETTINGS"; then
-    echo "Registered home-scan-guard hook in $SETTINGS"
+    if guard_present; then echo "Registered home-scan-guard hook in $SETTINGS"
+    else echo "Registered home-scan-guard hook in $SETTINGS -- INERT: $GUARD_PATH does not exist yet, the hook is a no-op until it does"; fi
   else
     echo "FATAL: could not write $SETTINGS (original left as it was; backup at $BAK)" >&2
     rm -f "$NEW"
