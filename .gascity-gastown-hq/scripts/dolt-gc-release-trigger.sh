@@ -26,17 +26,20 @@
 #     2x gate or the 2048MB slack. It decides with the job's own functions (_gc_required_parts,
 #     _gc_headroom_ok, _gc_floor_ok, _gc_release_decision) — imported, not copied — so it cannot
 #     drift from the gate it is waiting for.
-#   - It does not retry every poll when a run fails: a run that did not reach dolt_gc backs off
-#     5 → 10 → 20 … capped at 2h (a refused run may have gone as far as an S3 proof, which is
-#     aws traffic); a success resets it. Vetoes that cost nothing to re-check (a backup writer
+#   - It does not retry every poll when a run fails: a run that left the skip streak standing (the
+#     job refused: S3 proof, health probe, busy staging, re-gate) backs off 5 → 10 → 20 … capped
+#     at 2h (a refused run may have gone as far as an S3 proof, which is aws traffic); a run that
+#     cleared the streak resets it. Vetoes that cost nothing to re-check (a backup writer
 #     is busy, a maintenance run is in flight, cooldown) wait without counting as attempts.
 #   - It does not run when the state is not chronic (streak < GC_RELEASE_MIN_STREAK): the 2h cycle
 #     owns healthy operation.
 #
-# FAIL-CLOSED: an unreadable number → no run ("WAIT unmeasurable-input"); a state file that cannot
-# be written (so the backoff could not be recorded) → no run; a live sibling poll or a live
-# maintenance run → no run. A state file that exists but is garbled/empty is "don't know" (its backoff
-# may be lost): that poll stays inert, logs it, rewrites a clean state, and the next poll proceeds.
+# FAIL-CLOSED: an unreadable number → no run ("WAIT unmeasurable-input"); an unreadable clock → no
+# run; a decision that is not exactly "KICK direct" / "KICK release" → no run ("WAIT unknown-decision");
+# a state file that cannot be written (so the backoff could not be recorded) → no run; a live sibling
+# poll or a live maintenance run → no run. A state file that exists but is not ONE COMPLETE record
+# (garbled, empty, cut mid-write, missing attempts/next_allowed) is "don't know" (its backoff may be
+# lost): that poll stays inert, logs it, rewrites a clean state, and the next poll proceeds.
 #
 # POLL COST (ga-y0g5x doctrine: the guard must not become the load it watches). Measured
 # 2026-09-26 on the live tree at load ~55 on 10 cores, whole script under /bin/bash 3.2:
@@ -54,7 +57,7 @@
 #
 # KNOBS (operator file .gc/config/dolt-maintenance.env wins over env, as for the job):
 #   GC_TRIGGER_ENABLED=0            kill switch (this trigger only; the 2h job is unaffected)
-#   GC_TRIGGER_BACKOFF_BASE_S=300   first retry delay after a run that did not reach dolt_gc
+#   GC_TRIGGER_BACKOFF_BASE_S=300   first retry delay after a run that left the skip streak standing
 #   GC_TRIGGER_BACKOFF_MAX_S=7200   cap
 #   (+ every gate knob of dolt-gc-maintenance.sh: GC_RELEASE_STAGING_ENABLED, GC_RELEASE_MIN_STREAK,
 #    GC_RELEASE_SLACK_MB, GC_RELEASE_COOLDOWN_H, GC_MIN_FREE_ABS_MB, …)
@@ -109,11 +112,17 @@ _gc_trigger_decision() {
   [ "$rel_on" = "1" ]   || { echo "WAIT release-disabled"; return 0; }
   [ "$cool_ok" = "1" ]  || { echo "WAIT cooldown"; return 0; }
   d="$(_gc_release_decision "$streak" "$avail" "$staging" "$required" "$min_streak" "$slack")"
-  if [ "$d" = "RELEASE" ]; then echo "KICK release"; else echo "WAIT ${d#REFUSE }"; fi
+  # Allow-list: the two shapes _gc_release_decision documents. Blank or anything else (a failed
+  # $(...), a changed contract) is "don't know" — never a KICK, never a WAIT with a blank reason.
+  case "$d" in
+    RELEASE)    echo "KICK release" ;;
+    "REFUSE "?*) echo "WAIT ${d#REFUSE }" ;;
+    *)          echo "WAIT unknown-release-decision" ;;
+  esac
 }
 
-# _trg_backoff_s <attempts> → seconds to wait after that many consecutive runs that did not reach
-# dolt_gc: base, then doubling, capped. A non-numeric count backs off to the cap (never to 0).
+# _trg_backoff_s <attempts> → seconds to wait after that many consecutive runs that left the skip
+# streak standing: base, then doubling, capped. A non-numeric count backs off to the cap (never to 0).
 _trg_backoff_s() {
   local n="$1" s="$GC_TRIGGER_BACKOFF_BASE_S" max="$GC_TRIGGER_BACKOFF_MAX_S" i=1
   case "$max" in ''|*[!0-9]*) max=7200 ;; esac
@@ -125,21 +134,28 @@ _trg_backoff_s() {
 }
 
 # _trg_state_get <file> <key> → the numeric value of key (poll|attempts|next_allowed), 0 when the
-# file is absent or lacks the key. Callers gate on _trg_state_readable first, so a garbled file
-# never reaches here as "no history" in a poll that could start a run.
+# file is absent or lacks the key. Callers gate on _trg_state_readable first, which admits only an
+# ABSENT file (genuinely no history) or a COMPLETE record — so a 0 from here in a poll that could
+# start a run always means "first run", never "a record that lost its fields".
 _trg_state_get() {
   local f="$1" k="$2" v=""
   [ -f "$f" ] && v="$(head -1 "$f" 2>/dev/null | awk -v k="$k" '{ for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) { x = substr($i, length(k) + 2); if (x ~ /^[0-9]+$/) print x; exit } }')"
   case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
 }
 
-# _trg_state_readable <file> → 0 iff the file is ABSENT (a first run: genuinely no history) or its
-# first line carries a poll=<epoch>; 1 when it exists but is empty/garbled/unreadable. That is a
-# third state, not "no history": the backoff it held may be lost, so the poll treats it as
+# _trg_state_readable <file> → 0 iff the file is ABSENT (a first run: genuinely no history) or holds
+# one COMPLETE record: a first line of exactly `poll=<n> decision=<text> attempts=<n> next_allowed=<n>`
+# that ended in a newline (a write cut mid-number, `next_allowed=70` of `7000`, has no newline).
+# 1 for anything else that exists — empty, garbled, partly written, a directory. That is a third
+# state, not "no history": the backoff it held may be lost or wrong, so the poll treats it as
 # "don't know" (stays inert once, says so, rewrites a clean state) rather than as zero attempts.
 _trg_state_readable() {
+  local nl
   [ -e "$1" ] || return 0
-  [ -n "$(head -1 "$1" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^poll=[0-9]+$/) { print "y"; exit } }')" ]
+  [ -f "$1" ] || return 1
+  nl="$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')"
+  case "$nl" in ''|*[!0-9]*|0) return 1 ;; esac
+  head -1 "$1" 2>/dev/null | grep -Eq '^poll=[0-9]+ decision=.+ attempts=[0-9]+ next_allowed=[0-9]+$'
 }
 
 # _trg_state_decision <file> → the last recorded decision text, "" if none.
@@ -148,7 +164,8 @@ _trg_state_decision() {
 }
 
 # _trg_state_write <file> <poll_epoch> <decision> <attempts> <next_allowed_epoch> → 0 iff written.
-# One short line; a torn write reads as "no history" (see _trg_state_get).
+# One short line. The write is truncate-then-write (not atomic), so a torn one is possible; it reads
+# as UNREADABLE (see _trg_state_readable) and the next poll rewrites it — never as "no history".
 _trg_state_write() {
   local f="$1"
   mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
@@ -178,15 +195,21 @@ _trg_record() {
   local now="$1" decision="$2" attempts="$3" next="$4" prev
   prev="$(_trg_state_decision "$GC_TRIGGER_STATE")"
   _trg_state_write "$GC_TRIGGER_STATE" "$now" "$decision" "$attempts" "$next" || return 1
-  [ "$prev" != "$decision" ] && log "trigger: decision ${prev:-<none>} → ${decision} (streak=${_TRG_STREAK:-?} avail=${_TRG_AVAIL:-?}MB size=${_TRG_SIZE:-?}MB staging=${_TRG_STAGING:-?}MB required=${_TRG_REQUIRED:-?}MB)"
+  [ "$prev" != "$decision" ] && log "trigger: decision ${prev:-<none>} → ${decision} (streak=${_TRG_STREAK:-?} avail=${_TRG_AVAIL:-?}MB size=${_TRG_SIZE:-?}MB staging=${_TRG_STAGING:-?}MB required=${_TRG_REQUIRED:-?}MB)${_TRG_NOTE:+ — ${_TRG_NOTE}}"
   return 0
 }
 
 # _trg_poll — one evaluation. Always returns 0 (a poll that decides nothing is a normal outcome).
 _trg_poll() {
   local now streak attempts next_allowed size_mb avail_mb staging_mb target pct parts rel_on cool_ok decision busy after backoff end
-  _TRG_STREAK=""; _TRG_AVAIL=""; _TRG_SIZE=""; _TRG_STAGING=""; _TRG_REQUIRED=""
+  _TRG_STREAK=""; _TRG_AVAIL=""; _TRG_SIZE=""; _TRG_STAGING=""; _TRG_REQUIRED=""; _TRG_NOTE=""
   now="$(_gc_now_epoch)"
+  case "$now" in ''|*[!0-9]*)
+    # No clock → no backoff arithmetic, no cooldown, no readable heartbeat: nothing here can be
+    # decided safely. (A blank epoch made `[ "$now" -lt "$next_allowed" ]` an error, i.e. false.)
+    log "trigger: WARN cannot read the clock ('${now}') — no decision this poll, no state written (a stale heartbeat in $GC_TRIGGER_STATE is the signal)"
+    return 0 ;;
+  esac
   if ! _trg_state_readable "$GC_TRIGGER_STATE"; then
     # exists but unreadable: the backoff it held may be lost → don't act on a guess this poll.
     log "trigger: state file $GC_TRIGGER_STATE is unreadable (garbled/empty — a torn write or a hand edit) — no run this poll; resetting it"
@@ -211,13 +234,14 @@ _trg_poll() {
   fi
 
   # 3) measure. One df + two du.
+  case "$THRESHOLD_G" in ''|*[!0-9]*)
+    _trg_record "$now" "WAIT unmeasurable-input" "$attempts" "$next_allowed"; return 0 ;;   # a garbled knob is not "no threshold"
+  esac
   size_mb="$(_trg_dir_mb "$DOLTDIR")"; _TRG_SIZE="$size_mb"
-  case "$THRESHOLD_G" in ''|*[!0-9]*) ;; *)
-    case "$size_mb" in ''|*[!0-9]*) ;; *)
-      if [ $(( size_mb / 1024 )) -lt "$THRESHOLD_G" ]; then
-        _trg_record "$now" "WAIT hq-below-threshold" "$attempts" "$next_allowed"; return 0   # the job would skip: nothing to start
-      fi ;;
-    esac ;;
+  case "$size_mb" in ''|*[!0-9]*) ;; *)   # unmeasurable size: _gc_trigger_decision refuses it below
+    if [ $(( size_mb / 1024 )) -lt "$THRESHOLD_G" ]; then
+      _trg_record "$now" "WAIT hq-below-threshold" "$attempts" "$next_allowed"; return 0   # the job would skip: nothing to start
+    fi ;;
   esac
   avail_mb="$(_avail_mb "$DOLTDIR")"; _TRG_AVAIL="$avail_mb"
   if target="$(_gc_release_target "$BACKUP_STAGING" "$DB")"; then staging_mb="$(_trg_dir_mb "$target")"; else target=""; staging_mb=0; fi
@@ -228,8 +252,14 @@ _trg_poll() {
   cool_ok=0; _gc_release_cooldown_ok "$GC_RELEASE_STATE" "$GC_RELEASE_COOLDOWN_H" "$now" && cool_ok=1
 
   decision="$(_gc_trigger_decision "$streak" "$avail_mb" "$size_mb" "$staging_mb" "$pct" "$GC_MIN_FREE_ABS_MB" "$GC_RELEASE_MIN_STREAK" "$GC_RELEASE_SLACK_MB" "$rel_on" "$cool_ok")"
+  # Allow-list, not a deny-list: only the two exact KICK strings go on. A blank or unrecognized
+  # decision (a failed $(...) under fork/memory pressure) is "don't know" → inert, visible, and not
+  # an attempt — it must never be treated like a KICK.
   case "$decision" in
+    "KICK direct"|"KICK release") ;;
     WAIT*) _trg_record "$now" "$decision" "$attempts" "$next_allowed"; return 0 ;;
+    *) _TRG_NOTE="unrecognized decision '${decision}'"
+       _trg_record "$now" "WAIT unknown-decision" "$attempts" "$next_allowed"; return 0 ;;
   esac
 
   # 4) eligible. The release path first checks the one veto that is free to re-check and must not
@@ -252,12 +282,16 @@ _trg_poll() {
   log "trigger: ${decision} — streak=${streak} avail=${avail_mb}MB size=${size_mb}MB staging=${staging_mb}MB required=${_TRG_REQUIRED}MB → starting dolt-gc-maintenance as a triggered run (attempt ${attempts})"
   GC_TRIGGERED_RUN=1 _trg_run_maintenance
   end="$(_gc_now_epoch)"
+  case "$end" in ''|*[!0-9]*) end="$now" ;; esac   # never a blank: the poll's own start is a lower bound of the true time
   after="$(_read_skip_streak "$GC_SKIP_STREAK_STATE")"; after="${after%% *}"
+  # The only outcome signal the job gives is its skip-streak file (it always exits 0). "Cleared" is
+  # what the job's own size-gated step does when it does NOT skip: it ran dolt_gc, OR found nothing to
+  # do (hq under the threshold / size unmeasurable). Either way a refusal did not happen.
   if [ "$after" = "0" ]; then
-    log "trigger: run finished — dolt_gc was attempted (skip streak cleared); backoff reset"
+    log "trigger: run finished — the skip streak is cleared (dolt_gc ran, or the job found nothing to do); backoff reset"
     _trg_state_write "$GC_TRIGGER_STATE" "$end" "$decision" 0 0 || log "trigger: WARN could not record the outcome in $GC_TRIGGER_STATE"
   else
-    log "trigger: run finished WITHOUT reaching dolt_gc (streak=${after}) — see the lines above for why; next attempt not before +${backoff}s"
+    log "trigger: run finished WITHOUT clearing the skip streak (streak=${after}) — the job refused (see the lines above for why); next attempt not before +${backoff}s"
     _trg_state_write "$GC_TRIGGER_STATE" "$end" "$decision" "$attempts" "$(( end + backoff ))" || log "trigger: WARN could not record the outcome in $GC_TRIGGER_STATE"
   fi
   return 0

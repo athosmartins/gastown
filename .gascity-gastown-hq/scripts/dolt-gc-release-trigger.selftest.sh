@@ -255,6 +255,102 @@ reset_main; AVAIL=20000; printf 'x' > "$T/afile"; GC_TRIGGER_LOCKDIR="$T/afile/t
 [ "$KICKS" -eq 0 ] && grep -q 'cannot create the trigger lock' "$DOLT_GC_MAINT_LOG" && ok "lock: an uncreatable trigger lock → no run, and it is logged (inert but not silent)" || bad "uncreatable lock: kicks=$KICKS"
 GC_TRIGGER_LOCKDIR="$T/trigger.lock.d"
 
+# ═══ gate round 1 (ga-mb57np): unknown / partial input must never take the run path ═════════
+# Class: "a case that only vetoes the known-bad". Everywhere the poll consumes a value that could
+# be missing or half-written, only the EXACT known-good shapes may proceed; anything else is a
+# third state ("don't know") and stays inert, visibly.
+
+# (1) The decision. Only the two exact KICK strings start a run — a blank/garbled decision (what a
+#     failed $(...) yields: fork ENOMEM/EAGAIN, a jetsam-killed subshell) is NOT a KICK.
+_saved_dec="$(declare -f _gc_trigger_decision)"
+_gc_trigger_decision() { printf '%s' "$FAKE_DECISION"; }
+for FAKE_DECISION in "" "garbage" "KICK" "kick direct" "KICK direct please" "RELEASE" "KICK  release"; do
+  reset_main; AVAIL=20000; poll
+  [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT unknown-decision" ] && ok "decision allow-list: '${FAKE_DECISION}' is not a KICK → no run, state says WAIT unknown-decision" || bad "decision '${FAKE_DECISION}' started or mis-recorded: kicks=$KICKS dec='$(sdec)'"
+done
+for FAKE_DECISION in "KICK direct" "KICK release"; do
+  reset_main; AVAIL=20000; poll
+  [ "$KICKS" -eq 1 ] && ok "decision allow-list: the exact string '${FAKE_DECISION}' still starts the job" || bad "exact '${FAKE_DECISION}' did not start the job (kicks=$KICKS)"
+done
+reset_main; AVAIL=20000; FAKE_DECISION="garbage"; poll
+grep -q "unrecognized decision 'garbage'" "$DOLT_GC_MAINT_LOG" && ok "decision allow-list: the unrecognized text is logged (visible, not silent)" || bad "unrecognized decision not logged"
+[ "$(sget attempts)" = "0" ] && ok "decision allow-list: an undecided poll is not an attempt (no backoff escalation)" || bad "unknown decision counted as an attempt ($(sget attempts))"
+eval "$_saved_dec"; unset _saved_dec FAKE_DECISION
+
+# (1b) The same shape one level down: the release verdict. Anything that is not REFUSE <reason> or
+#      RELEASE is unknown, not a WAIT with a blank reason.
+( _gc_release_decision() { printf ''; }
+  [ "$(dec $S 12000 $SZ $ST $PCT $FL $MIN $SL 1 1)" = "WAIT unknown-release-decision" ] ) && ok "decision: a blank release verdict → WAIT unknown-release-decision (never a blank reason, never a KICK)" || bad "blank release verdict got: '$( _gc_release_decision() { printf ''; }; dec $S 12000 $SZ $ST $PCT $FL $MIN $SL 1 1)'"
+( _gc_release_decision() { printf 'garbage'; }
+  [ "$(dec $S 12000 $SZ $ST $PCT $FL $MIN $SL 1 1)" = "WAIT unknown-release-decision" ] ) && ok "decision: a garbled release verdict → WAIT unknown-release-decision" || bad "garbled release verdict got: '$( _gc_release_decision() { printf 'garbage'; }; dec $S 12000 $SZ $ST $PCT $FL $MIN $SL 1 1)'"
+
+# (2) The state record. A line that has poll= but lost the rest (attempts/next_allowed) used to read
+#     as readable with attempts=0 next_allowed=0 → a first run, the backoff lost. Only a COMPLETE,
+#     newline-terminated record is readable; every cut/partial shape is unreadable → inert once.
+_part_ok=1; _n=0
+# \c in printf %b stops the output there — no trailing newline — which is how a cut write looks.
+_partials=(
+  "poll=$NOW decision=KICK release (runn\\c"
+  "poll=$NOW\\n"
+  "poll=$NOW decision=WAIT x attempts=6\\n"
+  "poll=$NOW decision=WAIT x attempts=6 next_allowed=\\n"
+  "poll=$NOW decision=WAIT x attempts=6 next_allowed=70\\c"
+  "poll=$NOW decision=WAIT x attempts=abc next_allowed=1\\n"
+  "poll=$NOW attempts=6 next_allowed=99999999999\\n"
+  "decision=WAIT x attempts=6 next_allowed=99999999999\\n"
+)
+for _line in "${_partials[@]}"; do
+  _n=$((_n+1))
+  reset_main; AVAIL=20000
+  printf '%b' "$_line" > "$GC_TRIGGER_STATE"
+  poll
+  if [ "$KICKS" -ne 0 ] || [ "$(sdec)" != "WAIT state-unreadable" ]; then _part_ok=0; echo "    (partial record #$_n started a run or was mis-read: kicks=$KICKS dec='$(sdec)' line='$_line')"; fi
+done
+[ "$_part_ok" = "1" ] && ok "state: every partial/torn record shape (cut after poll=, missing attempts/next_allowed, cut mid-digits with no newline, non-numeric, no poll=) → unreadable: no run, WAIT state-unreadable" || bad "state: a partial record was treated as readable (see lines above)"
+unset _part_ok _n _line _partials
+# and a COMPLETE record — including the one a crash mid-run leaves behind — still reads, and its
+# backoff is honoured (the reset above must not make the trigger forget a real backoff).
+reset_main; AVAIL=20000; printf 'poll=%s decision=KICK release (running) attempts=6 next_allowed=%s\n' "$((NOW-10))" "$((NOW+7000))" > "$GC_TRIGGER_STATE"; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && [ "$(sget attempts)" = "6" ] && ok "state: a complete record left by a crash mid-run is readable and its backoff is still in force" || bad "complete crash record: kicks=$KICKS dec='$(sdec)' attempts=$(sget attempts)"
+reset_main; AVAIL=20000; printf 'poll=%s decision=WAIT backoff attempts=2 next_allowed=%s\n' "$((NOW-10))" "$((NOW-1))" > "$GC_TRIGGER_STATE"; poll
+[ "$KICKS" -eq 1 ] && ok "state: a complete record whose backoff has elapsed lets the run proceed" || bad "complete elapsed record blocked the run (kicks=$KICKS)"
+
+# (3) The clock. A blank/non-numeric `now` made [ "$now" -lt "$next_allowed" ] an ERROR (false) and
+#     the poll went on to run. No clock → no decision, no state write (a stale heartbeat is the signal).
+_saved_now="$(declare -f _gc_now_epoch)"
+for _bad_now in "" "abc" "12x"; do
+  reset_main; AVAIL=20000
+  eval "_gc_now_epoch() { printf '%s' '$_bad_now'; }"; unset GC_NOW_EPOCH
+  poll
+  [ "$KICKS" -eq 0 ] && [ ! -e "$GC_TRIGGER_STATE" ] && grep -q 'clock' "$DOLT_GC_MAINT_LOG" && ok "clock: unreadable epoch '${_bad_now}' → no run, no state written, logged" || bad "clock '${_bad_now}': kicks=$KICKS state_exists=$([ -e "$GC_TRIGGER_STATE" ] && echo y || echo n)"
+done
+# the clock read AFTER the run: blank → the outcome record must still be a readable record with a
+# real backoff (falls back to the poll's own start epoch), not "poll= …" (unreadable, backoff lost).
+reset_main; AVAIL=20000
+# (the clock is read inside $(...), a subshell — a counter there would not persist; KICKS is set by
+#  the run stub in the parent shell, so "has the run happened yet" is visible to the stub)
+_gc_now_epoch() { if [ "$KICKS" -eq 0 ]; then printf '%s' "$NOW"; else printf ''; fi; }
+poll
+_trg_state_readable "$GC_TRIGGER_STATE" && [ "$(sget attempts)" = "1" ] && [ "$(sget next_allowed)" -ge "$((NOW+300))" ] && ok "clock: blank epoch after the run → the outcome is still a readable record with the backoff armed" || bad "post-run clock: '$(cat "$GC_TRIGGER_STATE")'"
+eval "$_saved_now"; GC_NOW_EPOCH=$NOW; unset _saved_now _bad_now
+
+# (4) The size threshold. A garbled THRESHOLD_G skipped the "the job would skip anyway" pre-check
+#     and went on to run; it must be inert like every other unmeasurable input.
+reset_main; AVAIL=20000; THRESHOLD_G="abc"; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT unmeasurable-input" ] && ok "threshold: a non-numeric THRESHOLD_G → no run, recorded as unmeasurable-input" || bad "garbled threshold: kicks=$KICKS dec='$(sdec)'"
+reset_main; AVAIL=20000; THRESHOLD_G=""; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT unmeasurable-input" ] && ok "threshold: an empty THRESHOLD_G → no run" || bad "empty threshold: kicks=$KICKS dec='$(sdec)'"
+
+# (5) The fail-closed claim of the header: a state that is READABLE but cannot be written (so the
+#     attempt cannot be recorded, so no backoff) must not start a run. (The earlier test uses a
+#     directory, which is caught one step earlier as "unreadable" — it never reached this branch.)
+if [ "$(id -u)" != "0" ]; then
+  reset_main; AVAIL=20000
+  printf 'poll=%s decision=WAIT backoff attempts=0 next_allowed=0\n' "$((NOW-10))" > "$GC_TRIGGER_STATE"; chmod 444 "$GC_TRIGGER_STATE"; poll
+  [ "$KICKS" -eq 0 ] && grep -q 'cannot write' "$DOLT_GC_MAINT_LOG" && ok "fail-closed: a readable but read-only state → the attempt cannot be recorded → no run, logged" || bad "read-only state: kicks=$KICKS"
+  chmod 644 "$GC_TRIGGER_STATE"
+fi
+
 # ── the trigger is NOT a second way to delete, and does not export lib mode to its child ──
 _code="$(grep -v '^[[:space:]]*#' "$TRIGGER")"
 printf '%s\n' "$_code" | grep -Eq '(^|[^A-Za-z_])rm( |$)|rmdir|unlink|_gc_maybe_release_staging|_s3proof_' && bad "static: the trigger references a deletion/release/proof primitive — it must only DECIDE and start the job" || ok "static: no rm/rmdir/unlink, no release or S3-proof call in the trigger — deletion stays in the maintenance job"
