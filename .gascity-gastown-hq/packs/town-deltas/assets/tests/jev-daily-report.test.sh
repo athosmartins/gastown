@@ -192,6 +192,11 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
   RC=$?
 }
 calls() { grep -c '^CALL$' "$T/notify.log"; }
+# Seconds a PLAIN run costs on this machine right now (nothing hung). The hang tests compare against it, not against a
+# fixed ceiling: every section the script runs adds interpreter startups (~1s each at this city's load of 60), so an
+# absolute number drifts into flakiness each time a section is added -- T10d took 21s and 25s against its 20s line at load
+# 38-66 once the recomecar sections landed (ga-aijm2v.8). An unkilled hang adds 30s PER CALL on top of the baseline.
+baseline_run_s() { local t0=$SECONDS; run 2026-09-20; echo $((SECONDS - t0)); }
 
 echo "jev-daily-report tests"
 
@@ -309,6 +314,7 @@ RUN_QP="$T/qp-empty.py" run 2026-09-20
 N="$(cat "$T/notify.log")"
 case "$N" in *"Quem pensa: relatório falhou"*) ok "T10c an empty quem-pensa report is a visible failure, not silence" ;; *) nok "T10c empty" "$N" ;; esac
 # T10d a HUNG quem-pensa report is killed by its own bound and does not stall the ntfy.
+BASE_S=$(baseline_run_s)
 T0=$SECONDS
 RUN_QP="$T/qp-hang.py" RUN_QP_TIMEOUT=1 run 2026-09-20
 ELAPSED=$((SECONDS - T0))
@@ -316,11 +322,12 @@ N="$(cat "$T/notify.log")"
 if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T10d hung quem-pensa report still yields exit 0 and exactly one ntfy"; else nok "T10d rc/calls" "rc=$RC calls=$(calls)"; fi
 case "$N" in *"Quem pensa: relatório falhou"*) ok "T10d the hang is a visible failure" ;; *) nok "T10d hang visible" "$N" ;; esac
 # The report is called twice (full + --resumo-pt), each bounded at 1s here, so a real kill costs
-# a few seconds even on a loaded machine. The stub sleeps 30s per call: an unkilled run would take
-# 60s+, so the 20s line separates the two cases with a wide margin (a tight one flaked-by-design
+# a few seconds over a plain run even on a loaded machine. The stub sleeps 30s per call: an unkilled
+# run would take 60s MORE than a plain run, so a line 30s above the plain run's own cost separates the
+# two cases with a wide margin on either side, whatever the load (a tight absolute one flaked-by-design
 # on this city's saturated CPU). Timing, not just the absence of the marker, so a missing stub
 # file cannot pass this vacuously.
-if [ "$ELAPSED" -lt 20 ]; then ok "T10d both hung calls were cut by the bound (${ELAPSED}s, not the stub's 30s sleep each)"; else nok "T10d killed" "took ${ELAPSED}s: the hung process was not terminated"; fi
+if [ "$ELAPSED" -lt $((BASE_S + 30)) ]; then ok "T10d both hung calls were cut by the bound (${ELAPSED}s vs ${BASE_S}s for a plain run, not the stub's 30s sleep each)"; else nok "T10d killed" "took ${ELAPSED}s against ${BASE_S}s for a plain run: the hung process was not terminated"; fi
 case "$N" in *"QP-HANG-SHOULD-NEVER-BE-PRINTED"*) nok "T10d marker" "the hung process finished its sleep" ;; *) ok "T10d the hung process never printed past its sleep" ;; esac
 # T10e a quem-pensa record in the experiment log must NOT reach the generic report. Measured on the
 # base code: summarize() files any mode it does not know under the suppression experiment's
@@ -421,13 +428,15 @@ N="$(cat "$T/notify.log")"
 case "$N" in *"Preâmbulo: relatório falhou"*) ok "T11c an empty preambulo report is a visible failure, not silence" ;; *) nok "T11c empty" "$N" ;; esac
 grep -q 'Preâmbulo: relatório falhou' "$T/out/2026-09-20.txt" 2>/dev/null \
   && ok "T11c ...and the day's file says so too" || nok "T11c file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+BASE_S=$(baseline_run_s)
 T0=$SECONDS
 RUN_PB="$T/pb-hang.py" RUN_PB_TIMEOUT=1 run 2026-09-20
 ELAPSED=$((SECONDS - T0))
 N="$(cat "$T/notify.log")"
 if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T11d hung preambulo report still yields exit 0 and exactly one ntfy"; else nok "T11d rc/calls" "rc=$RC calls=$(calls)"; fi
 case "$N" in *"Preâmbulo: relatório falhou"*) ok "T11d the hang is a visible failure" ;; *) nok "T11d hang visible" "$N" ;; esac
-if [ "$ELAPSED" -lt 20 ]; then ok "T11d the hung call was cut by the bound (${ELAPSED}s, not the stub's 30s sleep)"; else nok "T11d killed" "took ${ELAPSED}s: the hung process was not terminated"; fi
+# Relative to a plain run, like T10d: an unkilled hang adds the stub's 30s, a kill adds ~1s.
+if [ "$ELAPSED" -lt $((BASE_S + 15)) ]; then ok "T11d the hung call was cut by the bound (${ELAPSED}s vs ${BASE_S}s for a plain run, not the stub's 30s sleep)"; else nok "T11d killed" "took ${ELAPSED}s against ${BASE_S}s for a plain run: the hung process was not terminated"; fi
 case "$N" in *"PB-HANG-SHOULD-NEVER-BE-PRINTED"*) nok "T11d marker" "the hung process finished its sleep" ;; *) ok "T11d the hung process never printed past its sleep" ;; esac
 # T11e a preambulo record in the experiment log must NOT reach the generic report (same leak as T10e:
 # summarize() files any mode it does not know under the suppression experiment's "experiment arm").

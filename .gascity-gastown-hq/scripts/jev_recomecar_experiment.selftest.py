@@ -449,6 +449,21 @@ def selftest() -> int:
     bs_, vs_ = scenario("resonly_compact", cite_hidden, before_extra=learned_then_compact)
     ok("verdict: a result-only path from BEFORE a compact is not old context of the segment after it", vs_[0]["veredito"] == "nao_reusou")
 
+    # Rediscovery is measured from the result that showed the old context a ref BEFORE the boundary. A ref the old context
+    # only SAID (the agent's own words) has no such result; the first tool call that mentions it may be the very citation
+    # that makes it "reused", after the boundary -- and that call's own result is not what a restart would have to fetch.
+    def said_before(t):
+        t.turn(335_000, [bash("ls")], text="I will look at ga-said1 soon")
+    def cite_said(t):
+        t.turn(340_000, [bash("bd show ga-said1", "y" * 8000)])
+        for _ in range(4):
+            t.turn(341_000, [bash("ls")])
+    bs_, vs_ = scenario("said_only", cite_said, before_extra=said_before)
+    ok("verdict: a ref the old context only SAID, then cited after the boundary, is reused (the fixture is what it claims)",
+       vs_[0]["veredito"] == "reusou" and vs_[0]["evidencias"] == ["ga-said1"])
+    ok("verdict: ...its rediscovery is UNMEASURED (no earlier result showed it), not the size of the citing call's own result (was 2000)",
+       vs_[0]["redescoberta_tokens"] == 0 and vs_[0]["redescoberta_sem_medida"] == 1)
+
     def learned_from_preamble_result(t):
         t.turn(335_000, [bash("cat /Users/athos/gt/pre/preamble-doc.md", "ga-pre11")])
     def cite_pre(t):

@@ -630,10 +630,14 @@ def verdict(T: dict, bs: list, n: int, preamble_refs: frozenset, cfg: Config, no
     unmeasured = 0
     if reused:
         sizes = {y["tool_id"]: y["chars"] for y in ev if y["k"] == "R" and y["tool_id"]}
+        arrived = {y["tool_id"]: j for j, y in enumerate(ev) if y["k"] == "R" and y["tool_id"]}
         seen_tools = set()
         for r in reused:
             tid = seg["first_tool"].get(r)
-            if tid is None or tid not in sizes:
+            # Only a result the OLD context already had is what a restart would have to fetch again. A ref the old
+            # context merely SAID has no earlier tool call: its first one can be the very citation that made it
+            # "reused", after the boundary, and that result's size is not the rediscovery cost. Unmeasured, said so.
+            if tid is None or tid not in sizes or arrived[tid] >= b["idx"]:
                 unmeasured += 1
             elif tid not in seen_tools:
                 seen_tools.add(tid)
