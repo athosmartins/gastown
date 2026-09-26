@@ -4086,6 +4086,62 @@ gc_variable_session_count() {
     || echo "0"
 }
 
+# ── ga-z4jhda: fail-CLOSED live count for the global cap (gate side of ga-oa004t) ──
+# gc_variable_session_count above reads `timeout 10 gc session list | jq … || echo "0"`:
+# a probe that fails, times out or returns junk is indistinguishable from "no sessions",
+# the cap reads as free capacity, and the gate opens reviewers. `gc session list --json`
+# takes 7–10s under load 55+ (measured 2026-09-25) against that 10s budget, so the guard
+# switched itself off exactly when the machine was most loaded — the failure ga-oa004t
+# fixed on the Pilot side (pilot-dispatcher.sh's _pilot_variable_session_count). That
+# function is kept, body untouched, only because variable-session-cap.selftest.sh pins it
+# byte-identical to the Pilot's copy; NO admission gate reads through it any more.
+#
+# _gate_variable_session_count — sets _GVSC_N to the LIVE combined count (wa-worker +
+# ps-worker + gate-reviewer) and returns 0; returns 1 with _GVSC_N empty when the count
+# cannot be READ: probe failed / timed out / non-JSON / {"ok":false} envelope / no
+# .sessions array. Three states — has N / has none / cannot tell — never collapsed into 0.
+# The caller treats rc=1 as "do not admit": the INERT default under doubt (queued markers
+# retry next sweep; a wrongly opened reviewer is memory the machine may not have).
+#
+# "Live" = active + creating + start-pending. start-pending is a session the controller
+# accepted but has not started yet: it WILL become a process, so it counts (over-counting
+# only delays an admission). The budget is GATE_SESSION_LIST_TIMEOUT_SECS (default 30s, above
+# the measured 7–10s): fail-closed makes a too-tight budget cost a skipped sweep, where it
+# used to cost nothing visible. Honors GC_VARIABLE_SESSION_COUNT_OVERRIDE (test seam); a
+# non-numeric override is unreadable, not 0.
+#
+# Reports through an out-param, never via $(...) — same contract as the Pilot's helper. Unlike
+# the Pilot there is no sticky per-sweep "unreadable" flag: the gate reads this ONCE per
+# process (each re-exec round is a fresh process), so a hung list can cost at most one budget.
+_GVSC_N=""
+_gate_variable_session_count() {
+  local _gvsc_json
+  _GVSC_N=""
+  if [ -n "${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}" ]; then
+    case "$GC_VARIABLE_SESSION_COUNT_OVERRIDE" in
+      *[!0-9]*) return 1 ;;
+    esac
+    _GVSC_N="$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
+    return 0
+  fi
+  if ! _gvsc_json=$(gc_json_or_unknown timeout "${GATE_SESSION_LIST_TIMEOUT_SECS:-30}" gc --city "$GC_CITY" session list --json); then
+    return 1
+  fi
+  if ! _GVSC_N=$(printf '%s' "$_gvsc_json" | jq -r \
+    'if (.sessions | type) == "array"
+     then ([.sessions[]
+            | select(.template=="wa-worker" or .template=="ps-worker" or .template=="gate-reviewer")
+            | select(.state=="active" or .state=="creating" or .state=="start-pending")] | length)
+     else empty end' 2>/dev/null); then
+    _GVSC_N=""
+    return 1
+  fi
+  case "$_GVSC_N" in
+    ''|*[!0-9]*) _GVSC_N=""; return 1 ;;
+  esac
+  return 0
+}
+
 # gate_status_transition <marker_id> <new_status> — replace ALL gate-status:*
 # labels on <marker_id> with a single gate-status:<new_status>, instead of
 # the per-callsite pattern this file otherwise uses (`label remove
@@ -10719,11 +10775,17 @@ fi
 # Athos-decided ceiling (AskUserQuestion via Mayor, 2026-09-06): the ephemeral
 # "variable" session types this city spawns on demand — wa-worker + ps-worker
 # (pilot-dispatcher.sh) and gate-reviewer (this script) — must never exceed
-# this many LIVE sessions COMBINED. gc_variable_session_count() and
+# this many LIVE sessions COMBINED. _gate_variable_session_count() and
 # GC_VARIABLE_SESSION_MAX are defined earlier, BEFORE the
-# GATE_DISPATCHER_LIB_ONLY cutoff — see that definition's header comment for
-# the full rationale (why these 3 template names, why dogs are excluded, why
-# a probe error fails open).
+# GATE_DISPATCHER_LIB_ONLY cutoff — see gc_variable_session_count()'s header
+# comment for the rationale (why these 3 template names, why dogs are excluded).
+#
+# ga-z4jhda: a probe that cannot be READ (failed / timed out / non-JSON / error
+# envelope / no .sessions array) is NOT "0 live" — it used to be, which opened
+# reviewers exactly when `gc session list` was slowest (load 55+, 7–10s vs the old
+# 10s budget). It now fails CLOSED: log the blind spot, exit 0, touch no marker
+# (same "leave the FIFO queue untouched, retry next sweep" shape as the cap-hit
+# branch just below), and never reach Step 0b-1 / the atomic claim.
 #
 # On cap hit: log distinctly (never the same line as quiet-hours/headroom, so a
 # stuck queue stays diagnosable) and exit 0 WITHOUT touching any marker — same
@@ -10743,7 +10805,11 @@ fi
 # invariant (Mayor's own bead comment: "o teto e' GUARDA, nao cura"), and a
 # self-correcting one-round overshoot is a much smaller risk than changing an
 # already-complex, well-tested function's input semantics for this bead.
-_gc_variable_count="$(gc_variable_session_count)"
+if ! _gate_variable_session_count; then
+  log "cannot read the global variable-session count (gc session list failed, timed out after ${GATE_SESSION_LIST_TIMEOUT_SECS:-30}s, or returned no .sessions array) — fail CLOSED: QUEUED, leaving $COUNT marker(s) queued, retried next sweep (ga-z4jhda)."
+  exit 0
+fi
+_gc_variable_count="$_GVSC_N"
 if [ "${_gc_variable_count:-0}" -ge "$GC_VARIABLE_SESSION_MAX" ] 2>/dev/null; then
   log "GLOBAL variable-session cap hit ($_gc_variable_count/$GC_VARIABLE_SESSION_MAX: wa-worker+ps-worker+gate-reviewer combined) — QUEUED, leaving $COUNT marker(s) queued, retried next sweep (ga-jezvn)."
   exit 0

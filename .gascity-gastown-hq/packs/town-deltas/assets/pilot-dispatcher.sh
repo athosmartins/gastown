@@ -1954,8 +1954,9 @@ _pilot_ram_pressure_unreadable() {
 # it mattered (wa-worker at 5 active vs a cap of 2). Pilot's gates now call
 # _pilot_variable_session_count below, which is fail-CLOSED. This function is
 # kept only as the byte-identical twin of quality-gate-dispatcher.sh's copy
-# (variable-session-cap.selftest.sh pins the two bodies); its own fail-open
-# read is the gate dispatcher's open follow-up, not a Pilot behavior.
+# (variable-session-cap.selftest.sh pins the two bodies); NO admission gate in
+# either dispatcher reads through it any more — the gate dispatcher's own cap
+# moved to its fail-closed twin _gate_variable_session_count (ga-z4jhda).
 #
 # Deliberately a FRESH query every call, never the sweep-level $_SESSIONS_JSON
 # snapshot (fetched once, early, at "gc session list" below) — dispatch_one()
@@ -2049,8 +2050,9 @@ _pilot_live_session_count() {
 # _PLSC_N, NEVER via $(...)). Honors GC_VARIABLE_SESSION_COUNT_OVERRIDE like the
 # function above. Pilot's own spawn gates call THIS, not gc_variable_session_count:
 # that one stays untouched because its body is pinned byte-identical to the gate
-# dispatcher's copy (variable-session-cap.selftest.sh), whose own fail-open read
-# is a separate delivery (see ga-oa004t's follow-up).
+# dispatcher's copy (variable-session-cap.selftest.sh). The gate dispatcher's cap
+# was moved to its own fail-closed twin, _gate_variable_session_count (ga-z4jhda),
+# so neither script gates on the fail-open read.
 _pilot_variable_session_count() {
   if [ -n "${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}" ]; then
     _PLSC_N="$GC_VARIABLE_SESSION_COUNT_OVERRIDE"
