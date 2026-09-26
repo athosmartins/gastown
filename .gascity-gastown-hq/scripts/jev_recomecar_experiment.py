@@ -1366,6 +1366,7 @@ def format_resumo_pt(rows: list, label: str, curto: bool = False) -> str:
 # silent failure: an empty report that reads like a quiet day. So the report also reads the order wrapper's own log
 # (one line per run: "<ts> rc=<n> <summary>") and says which of five states the consumer is in.
 _RUNLINE_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) rc=(\d+)\s?(.*)$")
+_SKIP_REASON_RE = re.compile(r'"skipped":\s*"([^"]*)"')
 HEALTH_STALE_S = 2 * 3600  # 8 x the 15-minute cadence: a skipped run or two is noise, two hours of silence is not
 _HEALTH_TEXT = {
     "ok": ("consumer: last run {d} — OK", "Consumidor: última rodada {d} — OK."),
@@ -1380,9 +1381,16 @@ _HEALTH_TEXT = {
 }
 
 
-def consumer_health(log, now: datetime) -> tuple:
+DISABLED_MARKERS = ('"disabled": true',)  # what this consumer's off switch prints on an rc=0 run
+
+
+def consumer_health(log, now: datetime, *, stale_s: float = HEALTH_STALE_S, disabled_markers: tuple = DISABLED_MARKERS) -> tuple:
     """(state, detail) from the wrapper's run log: ok | failed | stale | disabled | unknown. Unknown is its own
-    answer (no log configured / missing / no run line yet) and is never folded into ok."""
+    answer (no log configured / missing / no run line yet) and is never folded into ok.
+
+    `stale_s` and `disabled_markers` are for the other order that reads its log the same way (the Portaria,
+    ga-aijm2v.12: a 5-minute cadence, and an off switch that prints text rather than JSON). The defaults are this
+    consumer's own; a caller that passes nothing gets exactly what it always got."""
     if log is None:
         return "unknown", "no run log configured"
     try:
@@ -1393,21 +1401,26 @@ def consumer_health(log, now: datetime) -> tuple:
     except OSError:
         return "unknown", f"{log} missing or unreadable"
     last = None
-    skipped = 0  # runs AFTER `last` that only found the lock taken
+    skipped = 0  # runs AFTER `last` that reported "skipped" instead of running the consumer
+    skip_why = ""  # the reason the LAST of them gave, in the log's own words
     for line in tail.splitlines():
         m = _RUNLINE_RE.match(line)
         if not m:
             continue
         if m.group(2) == "0" and '"skipped":' in m.group(3):
-            # A run that found the lock held did not run the consumer. Its line is rc=0 and fresh, so taking it for
-            # "the last run" made a lock pinned by an unrelated live pid read "OK" for as long as it stayed pinned.
-            # Freshness is judged by the last run that really ran; the skips after it are said out loud.
+            # A run that reported "skipped" did not run the consumer (this consumer: it found the lock held; the
+            # Portaria also skips when its events file is unreadable at activation). Its line is rc=0 and fresh, so taking
+            # it for "the last run" made a lock pinned by an unrelated live pid read "OK" for as long as it stayed pinned.
+            # Freshness is judged by the last run that really ran; the skips after it are said out loud, with the reason
+            # the log gave -- not an assumed one: "lock held" over a skip that was not a lock sends the reader hunting a lock.
             skipped += 1
+            why = _SKIP_REASON_RE.search(m.group(3))
+            skip_why = why.group(1) if why else "no reason given"
             continue
-        last, skipped = m, 0
-    note = f"; {skipped} later run(s) skipped (lock held)" if skipped else ""
+        last, skipped, skip_why = m, 0, ""
+    note = f"; {skipped} later run(s) skipped ({skip_why})" if skipped else ""
     if last is None:
-        return "unknown", (f"{log} has only skipped runs (lock held) so far" if skipped else f"{log} has no run line yet")
+        return "unknown", (f"{log} has only skipped runs so far ({skip_why})" if skipped else f"{log} has no run line yet")
     ts, rc, rest = parse_ts(last.group(1)), int(last.group(2)), last.group(3)
     if ts is None:
         return "unknown", f"unparseable run timestamp {last.group(1)!r}"
@@ -1415,9 +1428,9 @@ def consumer_health(log, now: datetime) -> tuple:
     when = f"{last.group(1)}, rc={rc}"
     if rc != 0:
         return "failed", f"{when}: {rest[:120]}"
-    if '"disabled": true' in rest:
+    if any(mk in rest for mk in disabled_markers):
         return "disabled", when
-    if age > HEALTH_STALE_S:
+    if age > stale_s:
         return "stale", f"{last.group(1)}, {age / 3600:.1f}h ago{note}"
     return "ok", f"{last.group(1)}, {int(max(age, 0) // 60)} min ago{note}"
 

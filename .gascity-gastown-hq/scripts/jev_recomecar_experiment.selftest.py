@@ -1212,6 +1212,39 @@ def selftest() -> int:
     ok("health: the states that make an empty report look like a quiet day say it is NOT one, in both languages",
        all("NOT 'a quiet day'" in m.health_line(s, "d", False) and "NÃO é 'dia parado'" in m.health_line(s, "d", True) for s in ("failed", "stale", "unknown")))
 
+    # ga-aijm2v.12: the Portaria reads ITS run log through this same function, with its own cadence (a 1h stale line
+    # instead of 2h) and an off switch that prints text instead of JSON. Keyword-only, so nothing that called it before
+    # changes: the defaults below are pinned to what this consumer always got.
+    old_run = wlog("w-kw-70min.log", "2026-09-21T10:50:00Z rc=0 {}")  # 70 min before NOW
+    ok("health kwargs: 70 min old is ok at the default 2h line (unchanged)", m.consumer_health(old_run, NOW)[0] == "ok")
+    ok("health kwargs: ...and stale when the caller's line is 1h", m.consumer_health(old_run, NOW, stale_s=3600)[0] == "stale")
+    ok("health kwargs: the line is inclusive of exactly stale_s (60 min old is still ok, 61 is stale)",
+       m.consumer_health(wlog("w-kw-60.log", "2026-09-21T11:00:00Z rc=0 {}"), NOW, stale_s=3600)[0] == "ok"
+       and m.consumer_health(wlog("w-kw-61.log", "2026-09-21T10:59:00Z rc=0 {}"), NOW, stale_s=3600)[0] == "stale")
+    txt_off = wlog("w-kw-txtoff.log", "2026-09-21T11:55:00Z rc=0 portaria-shadow: disabled via PORTARIA_ENABLED -- skipping")
+    ok("health kwargs: another consumer's off-switch text is NOT this one's -- the default marker leaves it 'ok' (unchanged)",
+       m.consumer_health(txt_off, NOW)[0] == "ok")
+    ok("health kwargs: ...and reads as disabled once the caller names its marker",
+       m.consumer_health(txt_off, NOW, disabled_markers=("portaria-shadow: disabled via",))[0] == "disabled")
+    ok("health kwargs: a caller's marker replaces the default, so the JSON switch is not this caller's",
+       m.consumer_health(wlog("w-kw-json.log", '2026-09-21T11:55:00Z rc=0 {"disabled": true}'), NOW, disabled_markers=("portaria-shadow: disabled via",))[0] == "ok")
+    ok("health kwargs: a failure stays a failure whatever the markers (rc is checked before the off switch)",
+       m.consumer_health(wlog("w-kw-fail.log", "2026-09-21T11:55:00Z rc=3 portaria-shadow: disabled via X"), NOW, disabled_markers=("portaria-shadow: disabled via",))[0] == "failed")
+
+    # A "skipped" run is not always a lock (the Portaria also skips when the events file is unreadable at activation), so the
+    # note says what the LOG said instead of assuming a lock: an operator told "lock held" goes hunting the wrong thing.
+    nolock = '2026-09-21T11:55:00Z rc=0 portaria-shadow: {"new": 0, "skipped": "events_unreadable_at_activation"}'
+    h_only = m.consumer_health(wlog("w-reason-only.log", nolock), NOW)
+    h_after = m.consumer_health(wlog("w-reason-after.log", okline, nolock), NOW)
+    ok("skip reason: a tail of only-skipped runs names the reason the log gave, and does not claim a lock",
+       h_only[0] == "unknown" and "events_unreadable_at_activation" in h_only[1] and "lock held" not in h_only[1])
+    ok("skip reason: skipped runs after a good one name it too (ok, with the count and the reason)",
+       h_after[0] == "ok" and "1 later run(s) skipped (events_unreadable_at_activation)" in h_after[1] and "lock held" not in h_after[1])
+    ok("skip reason: this consumer's own lock skip still says so, in the log's own words",
+       "(lock held by a live run)" in m.consumer_health(wlog("w-reason-lock.log", okline, skipline), NOW)[1])
+    ok("skip reason: a skip line whose reason cannot be read says so instead of inventing one",
+       "(no reason given)" in m.consumer_health(wlog("w-reason-none.log", okline, '2026-09-21T11:55:00Z rc=0 {"skipped": null}'), NOW)[1])
+
     def cli(args, wrapper_log):
         buf = io.StringIO()
         with mock.patch.object(m.jev_experiment, "JEV_LOG", midnight_log), mock.patch.dict(os.environ, {"JEV_RECOMECAR_LOG_FILE": str(wrapper_log)}), contextlib.redirect_stdout(buf):

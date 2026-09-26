@@ -50,6 +50,14 @@ has been reported, and is not in the next day's). Filed by measurement, every ro
 one daily report. The report also says how many observed deliveries are still waiting for their
 outcome.
 
+PORTARIA CONSUMER HEALTH (ga-aijm2v.12): a report over zero Portaria rows says "nothing to measure", which is ALSO
+what a consumer that is not running produces (order not loaded, wrapper failing every pass, an off switch left on).
+So the full report always ends with one line saying whether the consumer is ok / failed / stopped ("parado") /
+switched off / unknown, read from the order wrapper's own run log and the off-switch file; the phone summary
+mentions it only when it is NOT ok. On a day with no rows and a consumer that is not ok, neither output says
+"nothing to measure". The one exception: `--experiment <name>` filtered to a front other than the Portaria
+(name not starting with "portaria") is a report about something else and carries no Portaria line.
+
 Usage: python3 jev_experiment_report.py [--date YYYY-MM-DD] [--experiment NAME] [--json | --resumo-pt]
 Without --date it reports over ALL logged data; --date filters to one UTC day. --resumo-pt
 prints the short Portuguese block that jev-daily-report.sh sends as the end-of-day ntfy.
@@ -63,6 +71,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-experiment.jsonl"))
@@ -431,6 +440,58 @@ def _pending_line_en(pending) -> str:
             f"the day its outcome is measured, so it appears in a later daily report)")
 
 
+# ── is the Portaria consumer alive? (ga-aijm2v.12) ─────────────────────────────────────────
+HEALTH_OMIT = "omit"  # the caller did not ask for the consumer line (old callers, synthetic tests)
+# "Parado" = no run for this long. The order runs every 5 min; measured on 26/09 over 41 runs the gap between two
+# runs was p50 8.5 min, max 23 min. An hour is 2.6x that worst gap, and it is the outcome window: past it, the
+# deliveries waiting for their 60-minute outcome can no longer be measured on time.
+PORTARIA_STALE_S = 3600
+_PORTARIA_HEALTH_TEXT = {
+    "ok": ("Portaria consumer: last run {d} — OK", "Portaria (consumidor): última rodada {d} — OK."),
+    "failed": ("⚠️ Portaria consumer: the LAST RUN FAILED ({d}) — stretches of the Portaria numbers may be missing; this is NOT 'a quiet day'",
+               "⚠️ Portaria: a ÚLTIMA RODADA FALHOU ({d}) — pode faltar trecho dos números; isto NÃO é 'dia parado'."),
+    "stale": ("⚠️ Portaria consumer: no run since {d} (the order runs every 5 min) — the Portaria numbers stop there; this is NOT 'a quiet day'",
+              "⚠️ Portaria: sem rodada desde {d} (o ritmo é 5 min) — os números da Portaria param aí; isto NÃO é 'dia parado'."),
+    "disabled": ("⚠️ Portaria consumer: switched OFF ({d}) — no delivery is being observed",
+                 "⚠️ Portaria: DESLIGADA ({d}) — nenhuma entrega está sendo observada."),
+    "unknown": ("⚠️ Portaria consumer: cannot tell whether the order ever ran ({d}) — this is NOT 'a quiet day'",
+                "⚠️ Portaria: não dá para saber se a ordem já rodou ({d}) — isto NÃO é 'dia parado'."),
+}
+
+
+def load_portaria_health(now: datetime | None = None) -> tuple:
+    """(state, detail): ok | failed | stale | disabled | unknown, for the Portaria consumer. The off-switch file is
+    checked first (it is the state of the world NOW; the log only says what the last run saw), then the order
+    wrapper's run log through jev_recomecar_experiment.consumer_health() -- the same reader the "recomecar" report
+    uses, so the logic lives once. Anything that cannot be read is "unknown", never "ok" and never a crash: an
+    auxiliary line must not take the daily report down, and must not say the consumer is fine when it cannot tell."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import jev_recomecar_experiment as _jr
+        import portaria_shadow as _ps
+        cfg = _ps.config_from_env()
+        flag = _ps.disabled_file(cfg)
+        try:
+            off = flag.exists()
+        except OSError as e:
+            return "unknown", f"cannot check {flag.name}: {e}"
+        if off:
+            return "disabled", f"{flag.name} is present"
+        return _jr.consumer_health(cfg.wrapper_log, now or datetime.now(timezone.utc),
+                                   stale_s=PORTARIA_STALE_S, disabled_markers=(_ps.DISABLED_LINE,))
+    except Exception as e:  # noqa: BLE001 — see the docstring: unknown, not ok, not a crash
+        return "unknown", f"could not tell ({type(e).__name__}: {e})"
+
+
+def portaria_health_line(health: tuple, pt: bool) -> str:
+    return _PORTARIA_HEALTH_TEXT[health[0]][1 if pt else 0].format(d=health[1])
+
+
+def _health_ok(health) -> bool:
+    """True when there is nothing to say: the caller did not ask, or the consumer is fine."""
+    return health == HEALTH_OMIT or health[0] == "ok"
+
+
 def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | None, portaria_pending=PENDING_OMIT) -> str:
     def pct(x):
         return "n/d" if x is None else _pct_pt(x)
@@ -462,10 +523,16 @@ def _portaria_resumo_pt(portaria_summary: dict, cache_read_by_recipient: dict | 
 
 
 def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
-                  cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT) -> str:
+                  cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT, portaria_health=HEALTH_OMIT) -> str:
     portaria_summary = portaria_summary or {}
     if not summary and not shadow_summary and not portaria_summary:
-        return f"Jev experiment report ({date_label}): no candidate escalations logged for this window."
+        if _health_ok(portaria_health):
+            text = f"Jev experiment report ({date_label}): no candidate escalations logged for this window."
+        else:
+            # "no candidate escalations logged" reads as a quiet day; with the consumer not running it is just as
+            # true of a dead one, so state only the fact (no rows) and let the health line below say why not to trust it
+            text = f"Jev experiment report ({date_label}): no rows logged for this window."
+        return text if portaria_health == HEALTH_OMIT else text + "\n" + portaria_health_line(portaria_health, False)
 
     lines = [f"Jev experiment report — {date_label}", ""]
     for name, s in sorted(summary.items()):
@@ -515,6 +582,8 @@ def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria
         lines.extend(_format_portaria_block(name, s, _portaria_metrics(s, cache_read_by_recipient)))
     if portaria_summary and portaria_pending != PENDING_OMIT:
         lines.append(_pending_line_en(portaria_pending))
+    if portaria_health != HEALTH_OMIT:
+        lines.append(portaria_health_line(portaria_health, False))
     return "\n".join(lines)
 
 
@@ -523,7 +592,7 @@ def _pct_pt(x: float) -> str:
 
 
 def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, portaria_summary: dict | None = None,
-                    cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT) -> str:
+                    cache_read_by_recipient: dict | None = None, portaria_pending=PENDING_OMIT, portaria_health=HEALTH_OMIT) -> str:
     """wa-dln9g — the end-of-day phone notification the Athos asked for ("a % of saved
     tokens for each end of day"). Same numbers as format_report() (both read _metrics()/
     _shadow_metrics()), in Portuguese and short. Keeps the MEDIDO / ESTIMATIVA split, and
@@ -535,7 +604,10 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, porta
     results just because it was written for the suppression shape first."""
     portaria_summary = portaria_summary or {}
     if not summary and not shadow_summary and not portaria_summary:
-        return f"Dia {date_label}: nenhum alerta candidato registrado — nada a medir."
+        if _health_ok(portaria_health):
+            return f"Dia {date_label}: nenhum alerta candidato registrado — nada a medir."
+        # a consumer that is not ok makes "nada a medir" untrue; say only that there were no rows, and why not to trust it
+        return f"Dia {date_label}: nenhum registro no dia.\n" + portaria_health_line(portaria_health, True)
     blocos = []
     for name, s in sorted(summary.items()):
         m = _metrics(s)
@@ -583,6 +655,8 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, porta
         blocos.append("\n".join(linhas))
     if portaria_summary:
         blocos.append(_portaria_resumo_pt(portaria_summary, cache_read_by_recipient, portaria_pending))
+    if not _health_ok(portaria_health):  # a healthy consumer is not news on the phone; a dead one must not hide
+        blocos.append(portaria_health_line(portaria_health, True))
     return "\n\n".join(blocos)
 
 
@@ -703,15 +777,19 @@ def main() -> int:
     # transcripts are read (read-only) only for recipients that actually have safe skips to price
     cache_read = measure_cache_read({r for s in portaria_summary.values() for r in s["seguro_por_destinatario"]}) if portaria_summary else {}
     pending = load_portaria_pending() if portaria_summary else PENDING_OMIT
+    # The consumer's state belongs to a report about the Portaria (or about everything); a report filtered to
+    # some other front does not say anything about it.
+    health = load_portaria_health() if (args.experiment is None or args.experiment.startswith("portaria")) else HEALTH_OMIT
 
     if args.json:
         print(json.dumps({"suppression": summary, "shadow": shadow_summary, "portaria": portaria_summary,
                           "portaria_pending": None if pending == PENDING_OMIT else pending,
+                          "portaria_consumer": None if health == HEALTH_OMIT else {"state": health[0], "detail": health[1]},
                           "cache_read_per_call": cache_read}, ensure_ascii=False, indent=2))
     elif args.resumo_pt:
-        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período", portaria_summary, cache_read, pending))
+        print(format_resumo_pt(summary, shadow_summary, args.date or "todo o período", portaria_summary, cache_read, pending, health))
     else:
-        print(format_report(summary, shadow_summary, args.date or "all-time", portaria_summary, cache_read, pending))
+        print(format_report(summary, shadow_summary, args.date or "all-time", portaria_summary, cache_read, pending, health))
     return 0
 
 

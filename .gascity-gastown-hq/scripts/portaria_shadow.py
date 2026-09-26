@@ -223,6 +223,9 @@ class Config:
     # keep the delivery pending this long past its window closing — the next run usually reads it
     # whole — then settle it as nao_sei (never nao_agiu) so a permanently bad archive cannot wedge it
     unreadable_retry_min: int = 120
+    # the order wrapper's own one-line-per-run log ("<utc ts> rc=<n> <summary>"): how the report tells a consumer that
+    # is not running from a day with nothing to measure (ga-aijm2v.12). Same default as portaria-shadow.sh.
+    wrapper_log: Path | None = None
 
 
 def load_rig_paths(city: Path) -> dict:
@@ -272,7 +275,19 @@ def config_from_env() -> Config:
         bootstrap=e("PORTARIA_BOOTSTRAP", "tail"),
         unreadable_retry_min=int(e("PORTARIA_UNREADABLE_RETRY_MIN", "120")),
         rig_paths=load_rig_paths(city),
+        wrapper_log=Path(e("PORTARIA_LOG_FILE") or city / ".gc" / "logs" / "portaria-shadow.log"),
     )
+
+
+# What main() prints when an off switch is on (rc=0, so the wrapper logs it as a normal-looking run line). The daily
+# report matches on this text to say "switched OFF" instead of "ok" -- the reader and the writer share the constant.
+DISABLED_LINE = "portaria-shadow: disabled via"
+
+
+def disabled_file(cfg: Config) -> Path:
+    """The off-switch file. main() refuses to run while it exists; the daily report reads the same path to say the
+    Portaria is OFF (ga-aijm2v.12) -- one definition, so the switch and its report cannot drift apart."""
+    return cfg.state_file.parent / "portaria-shadow.disabled"
 
 
 # ── small helpers ──────────────────────────────────────────────────────────────────────────
@@ -1116,10 +1131,10 @@ def main(argv=None) -> int:
         print(f"usage: portaria_shadow.py [run|status]", file=sys.stderr)
         return 2
     if os.environ.get("PORTARIA_ENABLED", "1") != "1":
-        print("portaria-shadow: disabled via PORTARIA_ENABLED -- skipping")
+        print(f"{DISABLED_LINE} PORTARIA_ENABLED -- skipping")
         return 0
-    if (cfg.state_file.parent / "portaria-shadow.disabled").exists():
-        print("portaria-shadow: disabled via portaria-shadow.disabled -- skipping")
+    if disabled_file(cfg).exists():
+        print(f"{DISABLED_LINE} portaria-shadow.disabled -- skipping")
         return 0
     t = time.time()
     s = run_once(cfg)

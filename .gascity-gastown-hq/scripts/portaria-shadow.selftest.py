@@ -1473,5 +1473,144 @@ with tempfile.TemporaryDirectory() as td:
     r = wrap(fake_slow, timeout="1")
     ok("a hung run is killed by the wrapper's timeout (rc=124) and says TIMEOUT — the lock is then reclaimable", r.returncode == 124 and "TIMEOUT" in logf.read_text())
 
+# ---------------------------------------------------------------------------------------------
+print("-- 14. the report says whether the Portaria consumer is ALIVE (ga-aijm2v.12) --")
+# Catches: a report over zero rows says "nothing to measure", which is ALSO exactly what a consumer that is not running
+# produces (order not loaded, wrapper failing every pass, off switch left on). Over a 48h measurement that is the worst
+# silent failure -- an empty day that looks calm, with a decision about suppressing messages riding on it. These run the
+# real CLI as a black box, so before the fix they fail on the OLD output, not on a missing keyword.
+REPORT_PY = HERE / "jev_experiment_report.py"
+DAY = "2026-09-25"
+
+
+def zulu(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def wline(ago_min, rc=0, rest='portaria-shadow: {"new": 0, "pending": 2, "seconds": 0.5}'):
+    """One line as portaria-shadow.sh writes it: '<utc ts> rc=<n> <summary>'."""
+    return f"{zulu(datetime.now(timezone.utc) - timedelta(minutes=ago_min))} rc={rc} {rest}"
+
+
+def prow(classe="gate-held", desf="agiu"):
+    # cascade 'seguir' + no skip: no 'safe skip', so the report never goes to read the agents' transcripts
+    return {"ts": f"{DAY}T18:00:00Z", "resolved_at": f"{DAY}T19:05:00Z", "mode": "portaria", "experiment": f"portaria-{classe}",
+            "classe": classe, "canal": "mail", "destinatario": "gastown.mayor", "camada1": "seguir", "camada2": "seguir",
+            "cascata": "seguir", "desfecho": desf, "jev_ok": True, "jev_tokens_in": 400, "jev_tokens_out": 30}
+
+
+def report_cli(*flags, wrapper=None, disabled=False, rows=()):
+    """The real report CLI in a sandbox: its own experiment log, its own Portaria wrapper log + pack-state dir.
+    wrapper=None -> the wrapper log does not exist at all."""
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        (tdp / "state").mkdir()
+        (tdp / "jev-experiment.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        if wrapper is not None:
+            (tdp / "portaria-shadow.log").write_text("".join(line + "\n" for line in wrapper))
+        if disabled:
+            (tdp / "state" / "portaria-shadow.disabled").write_text("")
+        r = subprocess.run([sys.executable, str(REPORT_PY), "--date", DAY, *flags], capture_output=True, text=True, timeout=90,
+                           env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "GC_CITY_PATH": str(tdp),
+                                "GC_PACK_STATE_DIR": str(tdp / "state"), "JEV_EXPERIMENT_LOG": str(tdp / "jev-experiment.jsonl"),
+                                "PORTARIA_LOG_FILE": str(tdp / "portaria-shadow.log")})
+        return r.returncode, r.stdout + r.stderr
+
+
+# the case the bead names: 0 rows + the last run failed -> must NOT read as "nothing to measure"
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(60), wline(6, rc=3, rest="Traceback: boom")])
+ok("0 rows + last run rc=3: the ntfy does NOT say 'nada a medir'", rc_ == 0 and "nada a medir" not in pt, pt)
+ok("...it says the last run FAILED, in Portuguese", "FALHOU" in pt and "rc=3" in pt, pt)
+rc_, en = report_cli(wrapper=[wline(60), wline(6, rc=3, rest="Traceback: boom")])
+ok("0 rows + last run rc=3: the full report does not print the quiet-day line either", rc_ == 0 and "no candidate escalations logged" not in en, en)
+ok("...it carries the failed-consumer line instead", "LAST RUN FAILED" in en and "rc=3" in en, en)
+
+# healthy consumer, nothing to measure: THAT is the quiet day, and it must read as one
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(6)])
+ok("0 rows + consumer ok: the ntfy is exactly the quiet-day line (a healthy consumer is not news)",
+   pt.strip() == f"Dia {DAY}: nenhum alerta candidato registrado — nada a medir.", pt)
+rc_, en = report_cli(wrapper=[wline(6)])
+ok("0 rows + consumer ok: the full report says so -- 'consumer ok, nothing to measure' is a stated fact",
+   "no candidate escalations logged" in en and "Portaria consumer: last run" in en and "OK" in en, en)
+
+# every one of the other states is told apart from a quiet day
+rc_, pt = report_cli("--resumo-pt", wrapper=None)
+ok("0 rows + no wrapper log at all: unknown, told apart from a quiet day (never read as ok)",
+   "nada a medir" not in pt and "não dá para saber" in pt, pt)
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(60 * 3)])
+ok("0 rows + last run 3h ago (the order stopped): 'parado', not a quiet day", "nada a medir" not in pt and "sem rodada desde" in pt, pt)
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(6)], disabled=True)
+ok("0 rows + the portaria-shadow.disabled file present: DESLIGADA, even though the last log line is a fresh rc=0",
+   "nada a medir" not in pt and "DESLIGADA" in pt, pt)
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(6, rest="portaria-shadow: disabled via PORTARIA_ENABLED -- skipping")])
+ok("0 rows + the run line says 'disabled via PORTARIA_ENABLED' (rc=0, fresh): DESLIGADA, not ok",
+   "nada a medir" not in pt and "DESLIGADA" in pt, pt)
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(60), wline(6, rc=3, rest="boom"), wline(1, rest='portaria-shadow: {"new": 0}')])
+ok("a failure followed by a good run is ok again (the ntfy is quiet about it)", pt.strip() == f"Dia {DAY}: nenhum alerta candidato registrado — nada a medir.", pt)
+rc_, pt = report_cli("--resumo-pt", wrapper=[wline(6, rc=124, rest="TIMEOUT after 270s")])
+ok("a run killed by the wrapper's timeout (rc=124) is a failure", "FALHOU" in pt and "nada a medir" not in pt, pt)
+
+# a skipped run that is NOT a lock: the real writer skips when the events file is unreadable at activation
+# (portaria_shadow._run_locked), and the health line must name that, not "lock held"
+rc_, js = report_cli("--json", wrapper=[wline(1, rest='portaria-shadow: {"new": 0, "seconds": 0.1, "skipped": "events_unreadable_at_activation"}')])
+det = (json.loads(js).get("portaria_consumer") or {}) if js.lstrip().startswith("{") else {}
+ok("only skipped runs (events unreadable at activation): unknown, naming that reason -- not ok, not 'lock held'",
+   det.get("state") == "unknown" and "events_unreadable_at_activation" in det.get("detail", "") and "lock held" not in det.get("detail", ""), js)
+
+# with data: the health line rides along, the numbers are untouched
+rc_, pt_bad = report_cli("--resumo-pt", rows=[prow()], wrapper=[wline(6, rc=3, rest="boom")])
+rc_, pt_ok = report_cli("--resumo-pt", rows=[prow()], wrapper=[wline(6)])
+ok("with rows + a failed consumer: the Portaria block AND the failure line are both in the ntfy",
+   "Portaria (sombra" in pt_bad and "FALHOU" in pt_bad, pt_bad)
+ok("with rows + a healthy consumer: the ntfy carries the block and says nothing about health",
+   "Portaria (sombra" in pt_ok and "FALHOU" not in pt_ok and "consumidor" not in pt_ok.lower() and "DESLIGADA" not in pt_ok, pt_ok)
+rc_, en_ok = report_cli(rows=[prow()], wrapper=[wline(6)])
+ok("with rows + a healthy consumer: the FULL report still states the consumer's state (always)", "Portaria consumer: last run" in en_ok, en_ok)
+ok("...and the health line is the last thing in it, after the Portaria block and its pending line", en_ok.rstrip().splitlines()[-1].startswith("Portaria consumer:"), en_ok)
+
+# a filter to some other experiment does not drag the Portaria's health into an unrelated report
+rc_, en_f = report_cli("--experiment", "mayor-inbox", wrapper=[wline(6, rc=3, rest="boom")])
+ok("--experiment <another front>: no Portaria health line in a report about something else", "Portaria consumer" not in en_f, en_f)
+rc_, en_f = report_cli("--experiment", "portaria-gate-held", rows=[prow()], wrapper=[wline(6, rc=3, rest="boom")])
+ok("--experiment portaria-*: the health line is there", "LAST RUN FAILED" in en_f, en_f)
+
+# --json carries it too: a consumer of the JSON must not lose the third state
+rc_, js = report_cli("--json", wrapper=[wline(6, rc=3, rest="boom")])
+try:
+    hj = json.loads(js).get("portaria_consumer")
+except ValueError:
+    hj = None
+ok("--json: portaria_consumer {state, detail}", isinstance(hj, dict) and hj.get("state") == "failed" and "rc=3" in hj.get("detail", ""), js)
+
+# the reader is tied to the REAL writer: lines produced by portaria-shadow.sh itself, incl. its TIMEOUT line
+with tempfile.TemporaryDirectory() as td:
+    tdp = Path(td)
+    fake_ok2 = tdp / "fake-ok"
+    fake_ok2.write_text('#!/bin/sh\necho "portaria-shadow: {\\"new\\": 1}"\nexit 0\n'); fake_ok2.chmod(0o755)
+    fake_hang = tdp / "fake-hang"
+    fake_hang.write_text('#!/bin/sh\nsleep 30\n'); fake_hang.chmod(0o755)
+    wl = tdp / "portaria-shadow.log"
+
+    def wrap2(py, timeout="270"):
+        subprocess.run(["bash", str(WRAP)], capture_output=True, text=True, timeout=60,
+                       env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "PORTARIA_PYTHON": str(py),
+                            "PORTARIA_SCRIPT": "ignored.py", "PORTARIA_LOG_FILE": str(wl), "PORTARIA_TIMEOUT_S": timeout})
+
+    def health_of(log):
+        (tdp / "state").mkdir(exist_ok=True)
+        r = subprocess.run([sys.executable, str(REPORT_PY), "--json"], capture_output=True, text=True, timeout=60,
+                           env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "GC_CITY_PATH": str(tdp),
+                                "GC_PACK_STATE_DIR": str(tdp / "state"), "JEV_EXPERIMENT_LOG": str(tdp / "e.jsonl"), "PORTARIA_LOG_FILE": str(log)})
+        try:
+            return json.loads(r.stdout).get("portaria_consumer", {}).get("state")
+        except ValueError:
+            return None
+    (tdp / "e.jsonl").write_text("")
+    wrap2(fake_ok2)
+    ok("a line written by the real wrapper for a good run reads as ok", health_of(wl) == "ok", str(health_of(wl)))
+    wrap2(fake_hang, timeout="1")
+    ok("the wrapper's own 'TIMEOUT after 1s' line reads as failed", health_of(wl) == "failed", str(health_of(wl)))
+    ok("a log path that is a directory (unreadable as a file) is unknown, and the report still runs", health_of(tdp) == "unknown", str(health_of(tdp)))
+
 print(f"\nportaria-shadow selftest: PASS={PASS} FAIL={FAIL}")
 sys.exit(1 if FAIL else 0)

@@ -24,6 +24,9 @@
 #      none still says so (T15), and a FAILING or HUNG section is fail-open AND visible
 #      -- it never blocks the day's report and never reads as "no data" (T16/T17); the 7-day
 #      rollup failing ALONE is just as visible in the ntfy (T18).
+#   T19-T22 (ga-aijm2v.12) the Portaria consumer's health: a day with no rows and a consumer that is
+#      NOT running must not read as a quiet day in the ntfy (T19), a healthy one stays out of the ntfy
+#      (T20), the full report file always states it (T21), and an unreadable log never fails the day (T22).
 #   T9 (ga-aijm2v.3/F5) the gate-verdict join step runs before the report AND is
 #      fail-open: a join failure is logged to gate-verdict-join.log but never
 #      blocks or changes the report/ntfy outcome (same rc/calls as T1). T9c covers
@@ -179,10 +182,18 @@ cat >"$T/rec-empty.py" <<'EOF'
 #!/usr/bin/env python3
 EOF
 
+# ga-aijm2v.12: the report reads the Portaria consumer's run log and off-switch file. Without pinning them every test
+# below would report on the LIVE consumer of whatever machine runs this suite, so a Portaria that happens to be down
+# would change every ntfy here. The default is a healthy consumer (a fresh rc=0 line, written by run() so it never
+# ages); RUN_PLOG points a test at another log, RUN_PDISABLED=1 drops the off-switch file.
+mkdir -p "$T/pack-state"
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"
-  rm -f "$T/out/gate-verdict-join.log"
+  rm -f "$T/out/gate-verdict-join.log" "$T/pack-state/portaria-shadow.disabled"
+  [ -n "${RUN_PLOG:-}" ] || printf '%s rc=0 portaria-shadow: {"new": 0, "pending": 0}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$T/portaria-shadow.log"
+  [ -z "${RUN_PDISABLED:-}" ] || : >"$T/pack-state/portaria-shadow.disabled"
   env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
+      PORTARIA_LOG_FILE="${RUN_PLOG:-$T/portaria-shadow.log}" PORTARIA_STATE_FILE="$T/pack-state/portaria-shadow-state.json" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
       JEV_GATE_VERDICT_JOIN_TIMEOUT="${RUN_JOIN_TIMEOUT:-600}" \
       JEV_QUEM_PENSA_REPORT="${RUN_QP:-$T/qp-ok.py}" JEV_QUEM_PENSA_REPORT_TIMEOUT="${RUN_QP_TIMEOUT:-120}" \
@@ -451,6 +462,37 @@ case "$N" in *"controle 2 alerta(s); experimento 2"*) ok "T11e positive control:
 case "$N" in *"experimento 3"*) nok "T11e leak (ntfy)" "a preambulo record was counted as a fired alert: $N" ;; *) ok "T11e the preambulo record is not counted as a suppression alert" ;; esac
 case "$F" in *"## preambulo"*) nok "T11e leak (report file)" "a preambulo record became a '## preambulo' section" ;; *) ok "T11e the full report has no '## preambulo' section" ;; esac
 case "$N" in *"400 + 45 tokens"*) nok "T11e token leak" "the record's Jev tokens were counted: $N" ;; *) ok "T11e the record's Jev tokens are not counted as suppression cost" ;; esac
+
+# T19-T22 (ga-aijm2v.12): a day with NO rows (2026-09-25 has none) is the case where "nothing to measure" and "the
+# consumer is not running" print the same thing. The stub sections all answer, so the Portaria's line is the only
+# difference between the two runs below.
+NOTHING_TO_MEASURE="nenhum alerta candidato registrado — nada a medir"
+printf '%s rc=0 portaria-shadow: {"new": 0}\n%s rc=3 Traceback: boom\n' "$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ)" "$(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ)" >"$T/portaria-failed.log"
+RUN_PLOG="$T/portaria-failed.log" run 2026-09-25
+N="$(cat "$T/notify.log")"
+F="$(cat "$T/out/2026-09-25.txt" 2>/dev/null)"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T19 empty day + failed Portaria consumer: still exit 0 and exactly one ntfy"; else nok "T19 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"$NOTHING_TO_MEASURE"*) nok "T19 quiet-day line" "the ntfy says the day had nothing to measure while the consumer's last run FAILED: $N" ;; *) ok "T19 the ntfy does NOT say 'nenhum alerta candidato registrado — nada a medir'" ;; esac
+case "$N" in *"Dia 2026-09-25: nenhum registro no dia."*"Portaria: a ÚLTIMA RODADA FALHOU"*"rc=3"*) ok "T19 the ntfy says there were no rows AND that the Portaria's last run failed (rc=3)" ;; *) nok "T19 failure line" "$N" ;; esac
+case "$F" in *"LAST RUN FAILED"*) ok "T19 the full report file carries the failed-consumer line" ;; *) nok "T19 file" "$F" ;; esac
+case "$F" in *"no candidate escalations logged"*) nok "T19 file quiet-day line" "$F" ;; *) ok "T19 ...and not the quiet-day line" ;; esac
+
+run 2026-09-25
+N="$(cat "$T/notify.log")"
+F="$(cat "$T/out/2026-09-25.txt" 2>/dev/null)"
+case "$N" in *"Dia 2026-09-25: $NOTHING_TO_MEASURE."*) ok "T20 empty day + healthy consumer: the ntfy keeps the plain quiet-day line" ;; *) nok "T20 quiet day" "$N" ;; esac
+case "$N" in *"Portaria:"*) nok "T20 noise" "a HEALTHY consumer is not news on the phone: $N" ;; *) ok "T20 ...and says nothing about the Portaria's health" ;; esac
+case "$F" in *"no candidate escalations logged"*"Portaria consumer: last run"*"OK"*) ok "T21 the full report file states the consumer is OK -- 'consumer ok, nothing to measure' is a stated fact" ;; *) nok "T21 file" "$F" ;; esac
+
+RUN_PDISABLED=1 run 2026-09-25
+N="$(cat "$T/notify.log")"
+case "$N" in *"Portaria: DESLIGADA"*) ok "T21b the off-switch file makes the ntfy say DESLIGADA, though the last log line is a fresh rc=0" ;; *) nok "T21b disabled" "$N" ;; esac
+
+mkdir -p "$T/portaria-log-is-a-dir"
+RUN_PLOG="$T/portaria-log-is-a-dir" run 2026-09-25
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T22 an unreadable Portaria log never fails the day's report"; else nok "T22 rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Portaria: não dá para saber"*) ok "T22 ...it says it cannot tell (unknown), not 'ok' and not a quiet day" ;; *) nok "T22 unknown" "$N" ;; esac
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"
