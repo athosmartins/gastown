@@ -130,11 +130,16 @@ def summarize(events: list[dict]) -> dict:
         }
     )
     for ev in events:
-        if ev.get("mode") in ("shadow", "portaria"):
+        if ev.get("mode"):
             # ga-aijm2v.1/F0: shadow events have no arm/suppress fields -- without this
             # skip they'd fall through to the "experiment arm" branch below and silently
             # count as suppression-experiment data. summarize_shadow() owns these instead.
             # ga-aijm2v.4: same for the Portaria (mode=="portaria") -> summarize_portaria().
+            # ga-aijm2v.8: ANY event that names a mode belongs to that mode's own summarizer
+            # (shadow -> summarize_shadow, portaria -> summarize_portaria, recomecar ->
+            # jev_recomecar_experiment). Only the suppression events carry no `mode`. A per-mode
+            # allowlist here meant every new experiment had to remember to patch this line, or its
+            # rows silently counted as "experiment fired" -- a wrong number that looks like data.
             continue
         s = by_exp[ev.get("experiment", "unknown")]
         if ev.get("arm") == "control":
@@ -638,6 +643,18 @@ def _selftest() -> int:
     ss = suppression_summary["F-synthetic"]
     ok("suppression summary sees only its own event, unpolluted by the 5 shadow events",
        ss["control_fired"] == 1 and ss["experiment_fired"] == 0 and ss["experiment_suppressed"] == 0)
+
+    # ga-aijm2v.8: an event of ANY other mode (here the "recomecar" experiment's rows, both
+    # phases) must not leak into the suppression counts, nor into the shadow counts.
+    mixed = events + [
+        {"mode": "recomecar", "experiment": "recomecar", "phase": "fronteira", "jev_tokens_in": 999, "jev_tokens_out": 9},
+        {"mode": "recomecar", "experiment": "recomecar", "phase": "fecho"},
+        {"mode": "some-future-mode", "experiment": "F-synthetic", "jev_tokens_in": 777},
+    ]
+    mixed_supp = summarize(mixed)
+    ok("suppression summary ignores events of any other mode (recomecar rows, a mode that does not exist yet)",
+       "recomecar" not in mixed_supp and mixed_supp["F-synthetic"] == ss)
+    ok("shadow summary ignores them too", "recomecar" not in summarize_shadow(mixed) and summarize_shadow(mixed)["F-synthetic"] == s)
 
     # format_report()/format_resumo_pt() must not crash on shadow-only or mixed input,
     # and the concordance number must actually appear in both renderings.
