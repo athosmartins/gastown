@@ -721,10 +721,7 @@ Transform data into a formatted digest and deliver it.
 - Throughput: N issues/day
 ```
 
-**2. Send to mayor, then verify the send immediately (ga-8h185):**
-```bash
-gc mail send mayor/ -s "Gas Town Digest: $DATE" -m "$DIGEST"
-```
+**2. Send to mayor, then verify the send immediately (ga-8h185, ga-ghxr1h):**
 
 A prior run's close_reason cited a specific mail-bead id and "verified
 assignee=gastown.mayor" — neither had happened; the send was silently
@@ -732,13 +729,58 @@ dropped. Check right now, in this same step, not later: checking later is
 actively unsafe, because the mayor may archive the mail bead (an immediate
 hard delete, not a close — see docs/design/mail-protocol.md) before you look
 again, which makes a real send look like a false failure.
+
+The check has THREE outcomes, not two (ga-ghxr1h): `sent`, `not-sent`,
+`unknown`. `gc events` is an HTTP call to the city API and it fails under
+load (`context deadline exceeded`, seen at load average 61-77 on
+2026-09-26). A query that FAILED — or printed something that is not event
+rows — says nothing about the mail: that is `unknown`, never `not-sent`. Only
+a query that ran to completion and found no row for THIS digest (this
+subject, addressed to the mayor) is `not-sent`. The distinction is not
+cosmetic: the action on `not-sent` is a second send, a mail cannot be
+unsent, and re-sending on a failed query delivers the digest twice. (Do not
+pipe `gc events` into anything either — the pipe reports the LAST command's
+exit status and hides a failed query, which is how this bug started.)
+
+Run the send and the check as ONE command — the resend needs the same subject
+and body, and the check is up to two `gc events` calls of about 10s each at
+load 40, so give the command a couple of minutes. Read the event rows with
+`printf '%s'`, never `echo`: zsh's `echo` rewrites the backslash escapes that
+mail bodies carry inside the event JSON, and the parse then fails.
 ```bash
-gc events --since=5m --type=mail.sent | tail -5
+SEND_SUBJECT="Gas Town Digest: $DATE"
+check_mail_sent() {   # prints: sent | not-sent | unknown
+  local ev try
+  for try in 1 2; do
+    ev=$(gc events --since=5m --type=mail.sent 2>/dev/null) || { sleep 5; continue; }
+    printf '%s' "$ev" | jq -e --arg s "$SEND_SUBJECT" 'select(.payload.message.subject == $s and ((.payload.message.to // "") | endswith("mayor")))' >/dev/null 2>&1
+    case $? in
+      0) echo sent; return ;;        # a row for this digest, addressed to the mayor
+      4) echo not-sent; return ;;    # the query ran, and there is no such row
+    esac                             # any other jq status: output unreadable, try again
+    sleep 5
+  done
+  echo unknown
+}
+gc mail send mayor/ -s "$SEND_SUBJECT" -m "$DIGEST"
+MAIL_CHECK=$(check_mail_sent)
+if [ "$MAIL_CHECK" = "not-sent" ]; then   # ONLY a completed check that found nothing
+  gc mail send mayor/ -s "$SEND_SUBJECT" -m "$DIGEST"
+  MAIL_CHECK=$(check_mail_sent)
+fi
+echo "MAIL_CHECK=$MAIL_CHECK"
 ```
-If no matching event appears, retry the send once. Do not cite the send as
-done in step 4's close_reason until this check has actually passed — if it
-still hasn't after the retry, say so plainly in that close_reason instead of
-asserting delivery.
+
+What the verdict means for step 4's close_reason. Never send a third time,
+and never assert delivery the check did not confirm:
+- `sent`: the digest is confirmed delivered.
+- `not-sent`: even the one resend did not show up in `gc events`. Say so
+  plainly in step 4's close_reason instead of asserting delivery.
+- `unknown`: `gc events` could not be checked (it failed, or returned
+  unreadable output, on both tries). The digest may well have been
+  delivered — do NOT send it again. Say so plainly in step 4's close_reason
+  ("send not verified: gc events failed twice"), instead of asserting
+  delivery or claiming it failed.
 
 **3. Archive as bead — CLOSED, and NEVER type task/bug/chore:**
 
@@ -839,10 +881,11 @@ gc bd close <work-bead> --reason "Digest generated and sent"
 gc runtime drain-ack
 exit
 ```
-Only use that exact close_reason if the verifications in steps 2, 3, and 3b
-all actually passed. If any didn't, replace it with an honest account of
-what's still wrong — the work bead closing is about this step's own
-lifecycle, not a certificate that the digest was delivered.
+Only use that exact close_reason if the verifications in steps 2 (that is,
+`MAIL_CHECK=sent`), 3, and 3b all actually passed. If any didn't, replace it
+with an honest account of what's still wrong — the work bead closing is
+about this step's own lifecycle, not a certificate that the digest was
+delivered.
 
 The deacon records this run via a `type:order-run` bead for cooldown
 tracking on the next patrol cycle."""
