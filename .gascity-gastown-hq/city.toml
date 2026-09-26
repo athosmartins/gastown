@@ -87,6 +87,66 @@ source = "packs/town-deltas"
 [orders]
 skip = ["wisp-compact", "nudge-on-route", "mol-dog-jsonl"]
 
+# ga-e6ottw: same trap, three more orders — orphan-sweep, mol-dog-reaper, order-tracking-sweep.
+# The maintenance pack registers each once per scope (city + 5 rigs) and the town-deltas
+# same-name file (orders/<name>.toml) shadows only the CITY instance, so the five rig instances
+# kept running the builtin. In all three the work does NOT depend on the scope that fired it, so a
+# rig instance is a redundant extra run (of an older, worse script for orphan-sweep and the reaper):
+#   - orphan-sweep: the script walks HQ and every rig itself and never reads GC_RIG. The builtin
+#     resets a claim on ONE snapshot: no CONFIRM_THRESHOLD ledger (ga-u0vzx), no recent-update
+#     grace (ga-kq4jf), no shield stamp (ga-114ll), and no `orphan-sweep:reset` marker (ga-f6igb) —
+#     inflight-reclaim-guard.py refuses to restore a claim that lacks it, so what a rig instance
+#     wrongly resets is not healed either.
+#   - mol-dog-reaper: SQL over SHOW DATABASES, and its bd/gc calls pin BEADS_DIR to the city store.
+#     The builtin `continue`s past every database whose dependency table lacks `depends_on_id`
+#     (ga-u8nbt9; measured 26/09 on hq only: neither dependencies nor wisp_dependencies has it), so
+#     on such a database a rig instance reaps and purges nothing and the city run does it all.
+#   - order-tracking-sweep: `gc order sweep-tracking` loads the city config and sweeps EVERY store
+#     (city + rigs) whichever scope fired it, so each rig instance was one more full sweep, at the
+#     builtin's 1m instead of the 5m the override sets (Dolt poll load, see the order file). Same
+#     command as the override; only the cadence differs.
+# Why not `skip` + a renamed replacement, as for the orders above: the order name IS the file name
+# (an order file carries no name key), and eval-window-concurrency-guard.sh (ga-23z6a) rewrites
+# orders/gate-sweep.toml and orders/order-tracking-sweep.toml by path. `[[orders.overrides]]` works
+# on the config instead:
+# `rig = "*"` matches the city instance and every rig instance (also a rig added later), so the
+# first block switches the name off everywhere and the second one (no rig = city scope) switches the
+# city instance back on. Order matters: overrides apply in file order. An override that matches no
+# order is a config-load error, which keeps this from rotting quietly if the city order goes away.
+# prod-tests/gascity/story-ga-e6ottw.sh asserts the resulting live order set.
+# gate-sweep is deliberately NOT switched off: `bd gate check` acts on the store of the scope that
+# fired it, so each rig instance polls a different store and is needed. Its only difference from
+# the override is cadence (30s vs 60s; the _bd_trace guard is moot from the pack dir, where the
+# file exists). An interval override per rig was rejected: it makes removing a rig a config-load
+# error, and eval-window-concurrency-guard.sh would not widen it anyway.
+# Rollback = delete the six blocks below.
+[[orders.overrides]]
+name = "orphan-sweep"
+rig = "*"
+enabled = false
+
+[[orders.overrides]]
+name = "orphan-sweep"
+enabled = true
+
+[[orders.overrides]]
+name = "mol-dog-reaper"
+rig = "*"
+enabled = false
+
+[[orders.overrides]]
+name = "mol-dog-reaper"
+enabled = true
+
+[[orders.overrides]]
+name = "order-tracking-sweep"
+rig = "*"
+enabled = false
+
+[[orders.overrides]]
+name = "order-tracking-sweep"
+enabled = true
+
 [[rigs]]
 name = "property_scrapers"
 prefix = "ps"
