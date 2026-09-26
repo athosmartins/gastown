@@ -68,9 +68,19 @@ history()     { git --git-dir="$1/.git" log --format='%H %T' HEAD | shasum | cut
 cat > "$WORK/gc-stub" <<EOF
 #!/bin/bash
 printf 'CALL %s\\n' "\$(printf '%s' "\$*" | tr '\\n' ' ')" >> "$WORK/gc-calls"
+[ "\${STUB_FAIL:-0}" != 0 ] && echo "gc-stub: mail refused (STUB_FAIL=\${STUB_FAIL})" >&2
 exit "\${STUB_FAIL:-0}"
 EOF
 chmod +x "$WORK/gc-stub"
+# git-failmaint: every `maintenance run` exits $FM_RC at once and does nothing (FM_RC=1: a batch that FAILED,
+# e.g. pack-objects out of space; FM_RC=0: a batch that "succeeded" without packing anything, what git does
+# when another maintenance run holds its lock). Everything else is plain git.
+cat > "$WORK/git-failmaint" <<'EOF'
+#!/bin/bash
+case " $* " in *" maintenance run "*) exit "${FM_RC:-1}" ;; esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-failmaint"
 # git-slow: a stand-in for this host's permanent load — a `maintenance run` whose batch size is above
 # $SLOW_ABOVE takes 8s (the test caps a batch at 2s), everything else is plain git. It logs every batch size.
 cat > "$WORK/git-slow" <<EOF
@@ -89,6 +99,7 @@ run_jac() {
   JAC_PACKS_LIMIT="${T_PACKS:-8}" JAC_PACKS_ALARM="${T_PACKS_ALARM:-20}" JAC_FREE_KIB="${T_FREE:-90000000}" \
   JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
+  JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" \
   bash "$SCRIPT" "$@" 2>&1
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -226,6 +237,9 @@ rm -f "$WORK/state.json" "$WORK/gc-calls"
 for i in 1 2 3; do STUB_FAIL=1 T_FREE=1 run_jac "$G" >/dev/null; done
 STUB_FAIL=1 T_FREE=1 run_jac "$G" >/dev/null
 [ "$(mail_calls)" = 2 ] && ok "a mail that failed to send is retried next run (attempted != delivered)" || bad "failed mail not retried (calls=$(mail_calls))"
+grep 'alarm mail FAILED' "$WORK/log" | tail -1 | grep -q 'mail refused' \
+  && ok "the log line for a failed alarm mail carries the CAUSE (what gc said), not just 'FAILED'" \
+  || bad "failed-mail log line has no cause: $(grep 'alarm mail FAILED' "$WORK/log" | tail -1)"
 run_jac "$G" >/dev/null
 [ "$(state_field "$G" bad_streak)" = 0 ] && ok "a good run resets bad_streak to 0" || bad "bad_streak=$(state_field "$G" bad_streak) after a good run"
 
@@ -271,6 +285,127 @@ else
 fi
 out="$(T_ALARM=1024 T_DEADLINE=29 run_jac "$N")"; rc=$?
 [ "$rc" -eq 1 ] && [ "$(state_field "$N" bad_streak)" = 1 ] && ok "over the alarm size and NO progress (no time left to pack anything) → BAD, bad_streak 1" || bad "no-progress over-alarm judged wrong (rc=$rc streak=$(state_field "$N" bad_streak)): $out"
+
+echo ""
+echo "=== S15: a batch that FAILED or did NOTHING never grows the remembered batch size ==="
+# "fast" used to be judged from elapsed time BEFORE the exit code and the progress check, so a batch that
+# died at once (pack-objects out of space at the disk floor) or did nothing (another maintenance run holds
+# git's lock) was the FASTEST batch there is: the size doubled on runs where nothing succeeded, and the first
+# run after the cause cleared started at up to 200 objects (~1GiB loose) that this loaded host cannot pack
+# inside a batch timeout. Decided-on != acted-on.
+for mode in "1:failed" "0:stalled"; do
+  fmrc="${mode%%:*}"; want="${mode##*:}"
+  R="$WORK/r-$want"; mkrepo "$R" 20; rm -f "$WORK/state.json"
+  sizes=""; rcs=""
+  for n in 1 2 3; do
+    FM_RC="$fmrc" T_GIT="$WORK/git-failmaint" T_BATCH=20 run_jac "$R" >/dev/null; rcs="$rcs$?"
+    sizes="$sizes $(state_field "$R" batch_objects)"
+  done
+  [ "$(last_status)" = "$want" ] && [ "$rcs" = 111 ] && ok "$want batches: status $want, exit 1 on every run" || bad "$want path not exercised (status=$(last_status) exit codes=$rcs)"
+  [ "$sizes" = " 20 20 20" ] && ok "$want batches: the remembered batch size stays 20 across 3 runs" || bad "$want batches: remembered batch size was$sizes (want 20 20 20) — a run where nothing was packed grew it"
+done
+# the growth rule itself is intact: once the cause clears ($R is the last repo above, still 60 loose objects
+# and a remembered 20), the run packs it in fast batches and doubles the size ONCE
+T_BATCH=20 run_jac "$R" >/dev/null
+[ "$(loose_count "$R")" = 0 ] && [ "$(state_field "$R" batch_objects)" = 40 ] && ok "cause cleared: a fast batch that really packed doubles it once (20 -> 40)" || bad "growth after recovery wrong (loose=$(loose_count "$R") batch_objects=$(state_field "$R" batch_objects), want 0 and 40)"
+
+echo ""
+echo "=== S16: a state file that is valid JSON of the wrong SHAPE must not silence the alarm ==="
+# state_json accepted anything `jq -e .` accepts, and record()'s `jq '.[\$r] = ...'` errors on [] / 5 / "x" /
+# a non-object entry; `|| new=""` then swallowed the error, so the state was never rewritten and bad_streak could
+# never reach ALERT_AFTER: the one signal that says compaction is failing was off, with no log line.
+G2="$WORK/g2"; mkrepo "$G2" 20
+seed_state() {
+  case "$1" in
+    array) echo '[]' ;; number) echo '5' ;; string) echo '"x"' ;; true) echo 'true' ;; null) echo 'null' ;;
+    entry-number) jq -n --arg r "$G2" '{($r): 5}' ;;
+    entry-array) jq -n --arg r "$G2" '{($r): [1, 2]}' ;;
+  esac
+}
+for shape in array number string true null entry-number entry-array; do
+  rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log"
+  seed_state "$shape" > "$WORK/state.json"
+  T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null
+  if [ "$(mail_calls)" = 1 ] && [ "$(state_field "$G2" bad_streak)" = 3 ] && jq -e 'type == "object"' "$WORK/state.json" >/dev/null 2>&1; then
+    ok "state=$shape: 3 bad runs still reach the alarm (1 mail, bad_streak 3, state file healed to an object)"
+  else
+    bad "state=$shape: alarm silenced (mails=$(mail_calls) bad_streak=$(state_field "$G2" bad_streak) state=$(head -c 80 "$WORK/state.json" 2>/dev/null | tr '\n' ' '))"
+  fi
+  case "$shape" in
+    entry-*) grep -q "state entry for $G2 is not an object" "$WORK/log" && ok "state=$shape: the repaired entry is LOGGED" || bad "state=$shape: repaired silently" ;;
+    *)       grep -q 'unreadable — starting fresh.*not a JSON object' "$WORK/log" && ok "state=$shape: the reset is LOGGED" || bad "state=$shape: reset silently" ;;
+  esac
+done
+# the entry IS an object but a numeric field in it is not a non-negative whole number: is_uint || 0 read it as 0 with no
+# trace, so a corrupted bad_streak restarted the count and a corrupted last_alert_epoch meant "never alerted" (mail again)
+for fld in '"bad_streak":"x"' '"bad_streak":-2' '"bad_streak":[3]' '"bad_streak":2.5' '"last_alert_epoch":"soon"' '"batch_objects":"big"'; do
+  rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log"
+  jq -n --arg r "$G2" --argjson f "{$fld}" '{($r): $f}' > "$WORK/state.json"
+  T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null; T_FREE=1 run_jac "$G2" >/dev/null
+  key="${fld%%:*}"; key="${key//\"/}"
+  if [ "$(mail_calls)" = 1 ] && [ "$(state_field "$G2" bad_streak)" = 3 ] && grep -q "state entry for $G2: field(s) $key" "$WORK/log" 2>/dev/null; then
+    ok "state field $fld: dropped and LOGGED; 3 bad runs still reach the alarm (1 mail, bad_streak 3)"
+  else
+    bad "state field $fld: mails=$(mail_calls) bad_streak=$(state_field "$G2" bad_streak) log=[$(grep 'state entry' "$WORK/log" 2>/dev/null | head -2 | tr '\n' ' ')]"
+  fi
+done
+# a well-formed entry is left exactly as it is (the sanitising must not eat a healthy state)
+rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log"
+jq -n --arg r "$G2" '{($r): {bad_streak: 1, last_alert_epoch: 0, batch_objects: 20}}' > "$WORK/state.json"
+T_FREE=1 run_jac "$G2" >/dev/null
+[ "$(state_field "$G2" bad_streak)" = 2 ] && [ "$(state_field "$G2" batch_objects)" = 20 ] && ! grep -q 'state entry' "$WORK/log" \
+  && ok "a healthy entry is kept (bad_streak 1 -> 2, batch_objects 20 untouched) and nothing is logged about it" \
+  || bad "a healthy entry was disturbed (bad_streak=$(state_field "$G2" bad_streak) batch_objects=$(state_field "$G2" batch_objects))"
+# and when the state STILL cannot be rewritten (jq itself fails), that is loud and fails the run — not a quiet skip
+mkdir -p "$WORK/jqshim"; REAL_JQ="$(command -v jq)"
+cat > "$WORK/jqshim/jq" <<EOF
+#!/bin/bash
+case "\$*" in *last_run_epoch*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$WORK/jqshim/jq"
+rm -f "$WORK/state.json" "$WORK/log"
+out="$(PATH="$WORK/jqshim:$PATH" run_jac "$G2")"; rc=$?
+{ [ "$rc" -eq 1 ] && grep -q 'state update FAILED' "$WORK/log" && grep -q 'forced failure' "$WORK/log"; } \
+  && ok "jq failing while writing the state → logged with jq's own reason, and the run exits 1 (the alarm is blind, so the order must not look green)" \
+  || bad "a failed state update was not loud (rc=$rc): $(tail -n 3 "$WORK/log" 2>/dev/null | tr '\n' ' ')"
+
+echo ""
+echo "=== S17: a batch cut by the RUN DEADLINE is deferred — it is not evidence the batch was too big ==="
+# The clamp t_left = min(remaining, GIT_TIMEOUT_S) made a kill at the DEADLINE look like a batch timeout: the
+# size was halved and remembered (in a big drain every run ends with a cut batch, so it ratcheted down), and at
+# the minimum size the same kill was STATUS=timeout — BAD from the budget alone.
+V="$WORK/v"; mkrepo "$V" 20; rm -f "$WORK/state.json" "$WORK/git-batches"
+out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 T_GIT_TIMEOUT=300 T_DEADLINE=6 T_MIN_BATCH=1 T_BATCH=25 run_jac "$V")"; rc=$?
+if [ ! -s "$WORK/git-batches" ]; then bad "no batch started (host too slow for this test's 6s budget): $out"; else
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ]; } && ok "deadline cut at a normal size → status deferred, exit 0" || bad "deadline cut judged wrong (rc=$rc status=$(last_status)): $out"
+  [ "$(state_field "$V" batch_objects)" = 25 ] && ok "the remembered batch size is kept (25) — the budget ended, not the batch" || bad "remembered batch size was changed to $(state_field "$V" batch_objects) by a deadline cut"
+  printf '%s' "$out" | grep -q 'retrying with' && bad "a deadline cut was logged as 'retrying with a smaller batch': $out" || ok "no 'retrying with' — the size was not halved"
+  printf '%s' "$out" | grep -q 'run deadline' && ok "the log says the RUN DEADLINE cut it" || bad "log does not name the deadline: $out"
+fi
+rm -f "$WORK/state.json" "$WORK/git-batches"
+out="$(T_GIT="$WORK/git-slow" SLOW_ABOVE=0 T_GIT_TIMEOUT=300 T_DEADLINE=6 T_MIN_BATCH=1 T_BATCH=5 run_jac "$V")"; rc=$?
+if [ ! -s "$WORK/git-batches" ]; then bad "no batch started at the minimum size (host too slow): $out"; else
+  { [ "$rc" -eq 0 ] && [ "$(last_status)" = "deferred" ]; } && ok "deadline cut at the MINIMUM size → deferred, exit 0 (not the 'timeout' failure)" || bad "min-size deadline cut judged wrong (rc=$rc status=$(last_status)): $out"
+fi
+
+echo ""
+echo "=== S18: tier 2 after a failed tier 1 — a gc that repaired the repo clears it, a gc that never ran does not ==="
+# Tier 1 (batches) failed and packs are over the limit, so the consolidating gc runs. The alarm judges the END
+# state: gc succeeding packs the loose objects too (the failure was transient → clean), but a gc that was
+# "busy" (another one running) did nothing — that must not launder a failed tier 1 into a green run.
+mkfailrepo() { local d="$1"; mkrepo "$d" 1; for i in 2 3 4 5; do addpack "$d" "$i"; done; addcommits "$d" 20; }
+W="$WORK/w"; mkfailrepo "$W"; rm -f "$WORK/state.json"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_PACKS=3 run_jac "$W")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(last_status)" = "consolidated" ] && [ "$(loose_count "$W")" = 0 ]; } \
+  && ok "batches failed, gc consolidated and packed the loose objects → status consolidated, exit 0 (judged on the end state)" \
+  || bad "failed tier 1 + successful gc judged wrong (rc=$rc status=$(last_status) loose=$(loose_count "$W")): $out"
+W2="$WORK/w2"; mkfailrepo "$W2"; rm -f "$WORK/state.json"; echo "$$ $(hostname)" > "$W2/.git/gc.pid"
+out="$(FM_RC=1 T_GIT="$WORK/git-failmaint" T_PACKS=3 run_jac "$W2")"; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(last_status)" = "failed" ] && printf '%s' "$out" | grep -q 'already running'; } \
+  && ok "batches failed, gc was busy (did nothing) → status stays failed, exit 1 (busy does not launder a failure)" \
+  || bad "failed tier 1 + busy gc judged wrong (rc=$rc status=$(last_status)): $out"
+rm -f "$W2/.git/gc.pid"
 
 echo ""
 echo "=== S11: what actually runs in production ==="
