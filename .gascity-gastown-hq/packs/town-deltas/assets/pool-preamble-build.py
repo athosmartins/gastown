@@ -64,6 +64,23 @@ def _subst(s, paths):
 
 
 # ----------------------------------------------------------------------------- overlays
+def _subst_deep(obj, paths):
+    """{chave} -> caminho em toda string do objeto. Por replace (não str.format): o comando do hook tem `$P`/aspas e nenhum outro
+    par de chaves, mas o manifesto não deve quebrar no dia em que tiver."""
+    if isinstance(obj, str):
+        for k, v in paths.items():
+            obj = obj.replace("{" + k + "}", v)
+        return obj
+    if isinstance(obj, list):
+        return [_subst_deep(x, paths) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _subst_deep(v, paths) for k, v in obj.items()}
+    return obj
+
+
+GUARD_HOOK_MARKER = "home-scan-guard"     # ga-02cqk4: todo overlay de papel TEM que carregar este hook (ver check_overlays)
+
+
 def overlay_for(m, role):
     """settings.json (dict, ordem de chaves fixa) do papel `role`."""
     r = m["roles"][role]
@@ -77,6 +94,8 @@ def overlay_for(m, role):
     for k in ("remoteControlAtStartup", "env"):
         if k in base:
             out[k] = base[k]
+    if m["common"].get("hooks"):
+        out["hooks"] = _subst_deep(m["common"]["hooks"], m["paths"])
     out["autoMemoryEnabled"] = bool(r.get("auto_memory", m["common"]["auto_memory"]))
     out["claudeMdExcludes"] = [_subst(p, m["paths"]) for p in m["common"]["claude_md_excludes"]]
     sk = r.get("skills")
@@ -215,6 +234,28 @@ def check_fragment(m):
 
 
 # ----------------------------------------------------------------------------- check
+def check_guard_hook(role, cfg):
+    """ga-02cqk4: o hook do home-scan-guard existe, na forma que o motor não atropela. Checagem INDEPENDENTE da igualdade com o
+    manifesto: se alguém tira o hook do manifesto E dos overlays, o `check` de igualdade passa calado e o guard some."""
+    errs = []
+    hooks = cfg.get("hooks")
+    entries = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    # um `hooks` que não é objeto (mão pesada num overlay) é "não sei ler" = o mesmo erro de "sumiu", nunca uma exceção do check
+    entries = entries if isinstance(entries, list) else []
+    mine = [e for e in entries if isinstance(e, dict) and isinstance(e.get("hooks"), list)
+            and any(GUARD_HOOK_MARKER in (h.get("command") or "") for h in e["hooks"] if isinstance(h, dict))]
+    if not mine:
+        return [f"overlay '{role}': perdeu o hook PreToolUse do home-scan-guard (ga-02cqk4) — sessão de pool voltaria a poder varrer o $HOME e disparar o prompt do TCC"]
+    for e in mine:
+        if e.get("matcher") != "^Bash$":
+            errs.append(f"overlay '{role}': hook do home-scan-guard com matcher {e.get('matcher')!r}; tem que ser '^Bash$' — o motor mescla por identidade de "
+                        "matcher, então 'Bash' SUBSTITUIRIA a entrada Bash do workdir (apagando os hooks dangerous-command) e um padrão de comando no matcher nunca dispara (ga-7j1yu)")
+        for h in e["hooks"]:
+            if isinstance(h, dict) and GUARD_HOOK_MARKER in (h.get("command") or "") and "if" in h:
+                errs.append(f"overlay '{role}': hook do home-scan-guard com campo 'if' — o guard não usa (o prefiltro dele já é barato e um glob não enxerga dentro de for/do/done)")
+    return errs
+
+
 def check_overlays(m):
     errs = []
     with open(OVERLAYS / m["base_overlay"] / ".claude" / "settings.json", encoding="utf-8") as fh:
@@ -244,6 +285,7 @@ def check_overlays(m):
                 errs.append(f"overlay '{role}': perdeu o deny do overlay base '{d}'")
         if cfg.get("remoteControlAtStartup") is not False:
             errs.append(f"overlay '{role}': remoteControlAtStartup tem que ser false (wa-cy6we)")
+        errs.extend(check_guard_hook(role, cfg))
         if r["td_role"] in m["common"].get("mayor_memory_roles", []) and cfg.get("autoMemoryEnabled") is not False:
             errs.append(f"overlay '{role}': autoMemoryEnabled tem que ser false (o índice de memória desse papel é o do Mayor)")
         if not isinstance(cfg.get("autoMemoryEnabled"), bool):
