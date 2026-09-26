@@ -8,13 +8,11 @@ provider = "claude-headless"
 # flags) — see agents/gate-reviewer/agent.toml for the full rationale. overlay_dir
 # writes the override into this session's own .claude/settings.json instead,
 # which Claude Code's docs explicitly guarantee wins.
-# ga-aijm2v.6 + ga-swnkfm: o overlay POR PAPEL do revisor (`pool-reviewer`) existe e é gerado do manifesto, mas NÃO está fiado: este agente NÃO tem
-# work_dir, então roda na RAIZ da cidade, e overlay_dir faz JSON-merge no <workdir>/.claude/settings.json — na raiz isso vira o .claude/settings.json da
-# cidade e daí o .gc/settings.json de TODAS as sessões (gate-done off, CLAUDE.md fora, memória off; incidente de 26/09). O merge só ADICIONA chave:
-# reverter o overlay_dir NÃO limpa o que já vazou. Por isso aqui fica o overlay BASE (`pool`). TD_ROLE (abaixo) é env, não overlay: segue valendo.
-# Religar o pool-reviewer: passos em claude-overlays/pool-roles.json (roles.reviewer._workdir_why). Enforçado por pool-preamble-build.selftest.sh (C) e
-# por scripts/overlay-root-leak-guard.py (order de 10 min: lê a config E os dois arquivos vivos).
-overlay_dir = "packs/town-deltas/assets/claude-overlays/pool"
+# ga-aijm2v.6 + ga-swnkfm + ga-3d1wno: overlay POR PAPEL do revisor (`pool-reviewer`) com work_dir PRÓPRIO e FIXO — mesma fiação do gate-reviewer,
+# leia lá o porquê (o overlay vazou da raiz da cidade em 26/09) e a regra de nunca usar `{{.AgentBase}}` no work_dir do revisor. Dir próprio, separado do do gate-reviewer.
+# Reverter: junto com o gate-reviewer, na ordem descrita lá (overlay .../pool, sem work_dir, manifesto city-root + wired_overlay); o selftest (C) reprova meio-revert.
+overlay_dir = "packs/town-deltas/assets/claude-overlays/pool-reviewer"
+work_dir = ".gc/agents/refino-gate-reviewer"
 env = { TD_ROLE = "reviewer" }
 scope = "city"
 wake_mode = "fresh"

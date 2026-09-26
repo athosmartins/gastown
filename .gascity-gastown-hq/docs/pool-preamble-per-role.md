@@ -41,7 +41,7 @@ o selftest reprova se o commitado divergir.
 | dog | `pool-dog` | dog | ≈ 23.215 † | -6,4k chars (esconde 10,3k, devolve 3,9k de carry-over) |
 | wa-worker | `pool-wa-worker` | wa-worker | 24.235 | -4,3k (esconde 6,6k, devolve 2,3k) |
 | ps-worker | `pool-ps-worker` | ps-worker | 23.937 | -4,3k |
-| gate-reviewer, refino-gate-reviewer | `pool-reviewer` — **NÃO fiado** (ver "Revisores" abaixo); hoje `pool` | reviewer | ≈ 18.660 † **(só com o overlay religado)** | -27,0k (vale: `TD_ROLE` é env, não overlay) |
+| gate-reviewer, refino-gate-reviewer | `pool-reviewer`, com `work_dir` próprio (ga-3d1wno) — **vivo só depois de reload + prova de spawn** (ver "Revisores" abaixo) | reviewer | ≈ 18.660 † | -27,0k (vale desde já: `TD_ROLE` é env, não overlay) |
 
 † rodada 1 (23.058 e 8.228) + o delta medido na rodada 2 (+157 e +10.432). wa-worker e ps-worker têm overlay idêntico ao da rodada 1.
 
@@ -110,26 +110,45 @@ e `AskUserQuestion` num pool sem humano só penduraria a sessão); negá-las é 
 - `name-only` mantém a skill invocável (medido: o Skill tool devolveu "Launching skill" e o modelo concluiu a tarefa) — por isso é o modo dos workers.
 - Um revisor usou `SendMessage` 1 vez (avisou o Mayor de um gate-run órfão): por isso ele FICA para revisores (custa ~2,1k tokens).
 
-## Revisores: o overlay `pool-reviewer` NÃO está fiado (ga-swnkfm, 26/09)
+## Revisores: `pool-reviewer` com `work_dir` próprio (incidente ga-swnkfm, 26/09; religado em ga-3d1wno)
 
-Os revisores (gate-reviewer, refino-gate-reviewer) **não têm `work_dir`: rodam na RAIZ da cidade**. `overlay_dir` faz JSON-merge em `<workdir>/.claude/settings.json`,
+Os revisores (gate-reviewer, refino-gate-reviewer) **não tinham `work_dir`: rodavam na RAIZ da cidade**. `overlay_dir` faz JSON-merge em `<workdir>/.claude/settings.json`,
 e o `<cidade>/.gc/settings.json` — o `--settings` de TODAS as sessões — é derivado desse arquivo (engine: `installClaude` = defaults embutidos + `<cidade>/.claude/settings.json`).
 O `pool-reviewer` fiado na raiz virou a config da cidade inteira: `gate-done` OFF (builder não conseguia submeter ao gate), CLAUDE.md do Athos/gt fora, memória off, deny de `Agent`/`EnterWorktree`.
 O merge (`internal/overlay/merge.go`) **só adiciona chave**, então reverter o `overlay_dir` não limpou: a sobra voltou (2ª ocorrência) e só saiu limpando os DOIS arquivos à mão.
 
-Estado hoje: os 2 revisores usam o overlay base `pool`; a economia de -27k chars de doutrina do revisor continua valendo (é `TD_ROLE`, env); a de tools/skills/CLAUDE.md (a sonda mediu ≈ -58k tokens no 1º turno do revisor, ver o topo) **não**.
-O manifesto declara isso (`roles.reviewer.workdir = "city-root"` diz ONDE roda; `wired_overlay = "pool"` diz o que está fiado) e três coisas enforçam:
-1. `pool-preamble-build.selftest.sh` (C/C3): papel `city-root` só pode ter o overlay base; `own` exige `work_dir`; com mutações (o teste antigo EXIGIA o `pool-reviewer`).
+Estado (ga-3d1wno): cada revisor tem `work_dir` **FIXO e próprio** — `.gc/agents/gate-reviewer` e `.gc/agents/refino-gate-reviewer`, relativos à cidade como `.gc/agents/deacon` — e o overlay `pool-reviewer` fiado
+(a sonda mediu ≈ -58k tokens no 1º turno do revisor, ver o topo). O merge do overlay agora cai só no `.claude/settings.json` desses dirs, não na raiz. **Nunca `{{.AgentBase}}` no `work_dir` do revisor:** o engine resolve por SESSÃO,
+um diretório por sessão de revisor (~700/semana; o dir de dog já tem 507). Vale só no repo: **fica vivo depois do gate mergear, do reload da config (Mayor agenda) e da prova de spawn real abaixo.** Até lá os revisores seguem no `pool`, na raiz.
+O manifesto declara isso (`roles.reviewer.workdir = "own"` diz ONDE roda; `wired_overlay` só existe quando o overlay fiado difere do do papel, ex. `"pool"` enquanto `workdir = "city-root"`) e três coisas enforçam:
+1. `pool-preamble-build.selftest.sh` (C/C3): papel `city-root` só pode ter o overlay base e nenhum `work_dir`; `own` exige `work_dir` declarado E fixo (sem `{{`). As mutações partem do estado real e cobrem o incidente, o meio-revert, o template e o caminho legítimo de desligar.
 2. `scripts/overlay-root-leak-guard.py` (+ `.selftest.sh`, order `overlay-root-leak-guard` a cada 10 min): lê `gc config show` E os dois arquivos vivos; vermelho se agente na raiz tem overlay de papel, se dois agentes com overlays diferentes dividem um `work_dir`, ou se raiz/`.gc` já contêm chave de papel. `rc 2` = não consegui saber (nunca "limpo").
 3. Um crash do guard sai `rc 2`, não `rc 1`: erro não se passa por achado.
 
-Religar o `pool-reviewer` (só com prova de spawn real): dê aos 2 revisores um `work_dir` FIXO e próprio (não use `{{.AgentBase}}`: é um diretório por sessão, ~800/semana), troque `roles.reviewer.workdir` para `"own"` e REMOVA `wired_overlay`/`_wired_overlay_why` (o campo do Mayor, 49cd6f040, que registra o overlay desligado),
-aponte o `overlay_dir` dos 2 `agent.toml` para `.../pool-reviewer`, rode o selftest (C) e o guard, e confira com um spawn real que `<cidade>/.claude/settings.json` e `<cidade>/.gc/settings.json` ficaram intactos (guard `rc 0`). **Mayor agenda o reload.**
+### Prova de spawn real (depois do merge + reload; o teste sintético não pega o que o incidente pegou)
+
+Com o gate ocioso (≤ 1 dos 3 revisores ativos), UM revisor de teste pelo mesmo caminho do dispatcher (`quality-gate-dispatcher.sh`: `session new gate-reviewer --no-attach --json`):
+```bash
+CITY=/Users/athos/gt/.gascity-gastown-hq; G=$CITY/packs/town-deltas/assets/scripts/overlay-root-leak-guard.py; SHA="${TMPDIR:-/tmp}/ovl-root-before.sha"
+gc session list --json | jq -r '.sessions[] | select(.template=="gate-reviewer") | [.session_name,.state,.work_dir] | @tsv'  # 0. o reload pegou? sessões NOVAS: work_dir = $CITY/.gc/agents/gate-reviewer
+python3 $G --no-alarm; echo "guard rc=$?"                                    # 1. baseline: 0. Se não for 0, PARE (raiz já suja: ver ga-swnkfm)
+shasum -a 256 $CITY/.claude/settings.json $CITY/.gc/settings.json > "$SHA"
+gc --city $CITY session new gate-reviewer --no-attach --title "prova ga-3d1wno" --json   # 2. anote .session_name (sem tarefa: nada o aciona)
+jq -e '.permissions.deny | contains(["Agent"])' $CITY/.gc/agents/gate-reviewer/.claude/settings.json  # 3a. true = pool-reviewer caiu NO work_dir novo (o base `pool` dá false)
+shasum -a 256 -c "$SHA"; python3 $G --no-alarm; echo "guard rc=$?"           # 3b. 2x OK e rc 0 = a raiz e o .gc/settings.json ficaram byte-idênticos
+gc session kill <session_name>                                               # 4. mate o revisor de teste
+```
+Vazou (3b falhou, ou o guard deu rc 1)? Reverta TUDO junto (abaixo) e limpe os dois arquivos da raiz: o merge nunca remove chave (ver o histórico no comentário do Mayor em ga-swnkfm). Nos primeiros 10 min do reload, olhe `gate-rate` e o `session-reconciler-trace`.
+A economia medida em sessão viva e a taxa de aprovação do braço novo saem dos mesmos comandos de "Verificar (depois do deploy)" abaixo, com `CUT` = o UTC do 1º revisor spawnado depois do reload.
+
+### Reverter os revisores (TUDO junto — o selftest (C) reprova meio-revert)
+
+`overlay_dir` dos 2 `agent.toml` de volta a `.../claude-overlays/pool`, TIRE o `work_dir` deles e, no manifesto, `roles.reviewer.workdir = "city-root"` + `wired_overlay = "pool"` (+ `_wired_overlay_why` com o porquê). Sem o `work_dir` o revisor volta pra raiz, onde só o overlay base é seguro.
 
 ## Deploy e reversão
 
 - Config mudou (`overlay_dir` + `env`) → o reconciler pode ver drift em sessões de pool vivas. Sessões `wake_mode=fresh` com trabalho atribuído e revisor com veredito pendente têm isenção; ainda assim, **Mayor agenda o reload** e olha o `session-reconciler-trace` nos primeiros 10 min. Pool é efêmero: o corte vale a partir do spawn seguinte.
-- Reverter UM papel: no `city.toml` (dog/wa-worker/ps-worker) ou no `agent.toml` (revisores) volte `overlay_dir` para `.../claude-overlays/pool` e apague a linha `env`. Sem `TD_ROLE` a doutrina volta inteira.
+- Reverter UM papel: no `city.toml` (dog/wa-worker/ps-worker) volte `overlay_dir` para `.../claude-overlays/pool` e apague a linha `env`. Sem `TD_ROLE` a doutrina volta inteira. Os revisores têm receita própria (seção "Reverter os revisores"): mexer só no `overlay_dir` deles reprova o selftest.
 - Mudar algo: edite `pool-roles.json` → `python3 packs/town-deltas/assets/pool-preamble-build.py build` → `git add -f` se overlay novo → `pool-preamble-build.selftest.sh`.
   Skill nova aparece na listagem inteira até ser classificada (fail-open): `pool-preamble-build.py new-skills` lista as não classificadas.
 
