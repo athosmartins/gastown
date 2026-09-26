@@ -22,12 +22,12 @@
 # never touches TCC/permission settings. Safe to run any time, by any agent
 # or human, as often as wanted.
 #
-# Full Disk Access residual: several roots below (Apple system Group
-# Containers, some app Containers) return "Operation not permitted" without
-# Full Disk Access granted to the invoking terminal/app in System Settings >
-# Privacy & Security > Full Disk Access — a one-time GUI grant no headless
-# agent can perform. Until granted, this script's blocked-dir count stays
-# nonzero; that is expected, not a bug in the script.
+# TCC-protected roots (~/Library/Containers, ~/Library/Group Containers,
+# ~/Library/CloudStorage) are deliberately NOT measured — see dob_targets
+# (ga-gyzbha): each `du` there put a macOS permission dialog in front of the
+# Athos. Some subdirs of the roots that remain (e.g. ~/Library/Caches) still
+# answer "Operation not permitted" silently, without a dialog; those count in
+# blocked_dirs, which is expected, not a bug in the script.
 #
 # Usage:
 #   bash disk-oscillation-breakdown.sh [--json]
@@ -58,6 +58,30 @@ dob_gap_summary() {
     "$used_kb" "$measured_kb" "$gap_kb" "$gap_pct" "$blocked_n"
 }
 
+# dob_targets → the roots to measure, one per line (selftest-covered; reads only
+# $HOME and $DARWIN_TMP, touches no filesystem). Historically-heavy roots plus a
+# couple of previously-confirmed culprits from earlier disk incidents
+# (shared/data, caches) so one run gives the fuller picture.
+#
+# ga-gyzbha: ~/Library/Containers, ~/Library/Group Containers and
+# ~/Library/CloudStorage are NOT measured. They are TCC-protected: a `du` there
+# makes macOS show the Athos a permission dialog ("bash would like to access data
+# from other apps", "... files managed by iCloud Drive") and blocks until he
+# clicks. Measured 2026-09-26: disk-pressure-monitor.sh runs this script every
+# hour; tccd logged that dialog for this script's Containers `du` at 10:43:01,
+# the same second as that hour's run. Only 2 of 765 runs since 2026-08-25 ever
+# finished — the rest timed out or were reaped on that first
+# root. So these roots cost a dialog per hour and never yielded a number; they
+# stay inside the unexplained gap, which is what the summary line reports.
+dob_targets() {
+  printf '%s\n' \
+    "${DARWIN_TMP:-}" \
+    "$HOME/shared/data" \
+    "$HOME/.cache" \
+    "$HOME/Library/Caches" \
+    "$HOME/gt"
+}
+
 # Allow sourcing just the pure functions above for the selftest, without
 # running the live-filesystem collection pass below.
 if [ "${DISK_OSCILLATION_LIB:-0}" = "1" ]; then
@@ -65,24 +89,11 @@ if [ "${DISK_OSCILLATION_LIB:-0}" = "1" ]; then
 fi
 
 # ── collection (live filesystem below this line; not selftest-covered) ────
-# Historically-heavy roots per ga-lc17m's own gap hypothesis, plus a couple
-# of previously-confirmed culprits from earlier disk incidents (shared/data,
-# caches) so one run gives the fuller picture.
 DARWIN_TMP="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null | sed 's:/$::')"
-TARGETS=(
-  "$HOME/Library/Containers"
-  "$HOME/Library/Group Containers"
-  "$HOME/Library/CloudStorage"
-  "$DARWIN_TMP"
-  "$HOME/shared/data"
-  "$HOME/.cache"
-  "$HOME/Library/Caches"
-  "$HOME/gt"
-)
-# CloudStorage in particular is known to sit in slow/uninterruptible I/O on
-# this machine (FUSE-like on-demand materialization) — bounded timeout is a
-# best-effort kill, not a guarantee; a target that times out is counted as
-# fully blocked rather than forced to complete.
+TARGETS=()
+while IFS= read -r t; do TARGETS+=("$t"); done < <(dob_targets)
+# Bounded timeout is a best-effort kill, not a guarantee; a target that times
+# out is counted as fully blocked rather than forced to complete.
 PER_TARGET_TIMEOUT="${DISK_OSCILLATION_TIMEOUT_SECS:-60}"
 
 used_kb="$(df -k /System/Volumes/Data | awk 'NR==2 {print $3}')"

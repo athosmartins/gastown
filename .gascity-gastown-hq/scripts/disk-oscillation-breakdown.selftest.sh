@@ -59,5 +59,38 @@ check_summary "used=0 does not divide by zero" 0 0 0 "gap=0K(0%)"
 check_summary "blocked_dirs count passes through" 500 100 7 "blocked_dirs=7"
 
 echo
+echo "== dob_targets (ga-gyzbha) =="
+
+# The root list must never name a TCC-protected tree. A `du` there makes macOS
+# show the Athos a permission dialog ("bash would like to access data from other
+# apps" / "... files managed by iCloud Drive") and blocks until he clicks —
+# measured 2026-09-26: tccd logged that dialog for this script's `du` (hourly
+# run at 10:43:01), and 763 of 765 runs never finished anyway. Checked against
+# a fake HOME so a match is exact.
+if ! declare -F dob_targets >/dev/null; then
+  bad "dob_targets is not defined in lib mode — the root list cannot be checked"
+else
+  targets="$(HOME=/fakehome DARWIN_TMP=/fake/T dob_targets)"
+  for protected in "Library/Containers" "Library/Group Containers" \
+                   "Library/CloudStorage" "Library/Mobile Documents"; do
+    if printf '%s\n' "$targets" | grep -qF "/fakehome/$protected"; then
+      bad "dob_targets names TCC-protected root ~/$protected"
+    else
+      ok "dob_targets leaves out ~/$protected"
+    fi
+  done
+  if printf '%s\n' "$targets" | grep -qxF "/fakehome"; then
+    bad "dob_targets walks \$HOME itself (reaches Desktop/Documents/Downloads)"
+  else
+    ok "dob_targets does not walk \$HOME itself"
+  fi
+  if printf '%s\n' "$targets" | grep -qxF "/fake/T"; then
+    ok "dob_targets still measures DARWIN_TMP"
+  else
+    bad "dob_targets dropped DARWIN_TMP (got: $(printf '%s' "$targets" | tr '\n' ' '))"
+  fi
+fi
+
+echo
 echo "== summary: ${pass} ok, ${fail} failed =="
 [ "$fail" -eq 0 ]
