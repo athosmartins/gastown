@@ -287,6 +287,9 @@ _avail_mb() {
 # of 19+ digits is not a number. Where a wrapped value goes the UNSAFE way it is refused before it gets there —
 # the stuck-holder limit and the trigger's backoff knobs (garbled → their default, never "no alert" / "no
 # backoff") and the release cooldown, both its hours and the state file's epoch (fail closed: cooldown not over).
+# The trigger's own readers refuse it too: a state record or skip-streak file with a number too long to fit is
+# "unreadable" (dolt-gc-release-trigger.sh: _trg_state_readable, _trg_streak_read) — past int64 `[ ]` does not
+# compare, it errors, and an error reads as "not in backoff".
 # NOT covered, on purpose and named here so nobody reads this as a sweep of everything:
 #   - the gate's own pct / floor / slack (_gc_headroom_ok, _gc_floor_ok, _gc_required_parts,
 #     _gc_release_decision): a 19+ digit value wraps and WEAKENS the gate. It predates ga-11vdhe (the operand

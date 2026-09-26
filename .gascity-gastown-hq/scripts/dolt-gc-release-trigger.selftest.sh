@@ -509,6 +509,13 @@ _chk '53 1 x\n'   "unreadable"
 _chk '5 3 1\n'    "unreadable"
 _chk '53 1\n0 0\n' "unreadable"         # exactly one record
 _chk '-1 0\n'     "unreadable"
+# A count too long to fit is unreadable, not "a very long streak": past int64 `[ ]` fails (rc 2, "integer
+# expression expected") and the caller's `[ "$streak" -lt "$MIN" ]` reads that error as "no" — i.e. CHRONIC, the
+# direction that may start a run. (18 digits is the most that cannot wrap; the job never writes anywhere near it.)
+_chk '99999999999999999999 1\n'  "unreadable"
+_chk '18446744073709551616 1\n'  "unreadable"
+_chk '9223372036854775807 1\n'   "unreadable"      # 19 digits: still refused — the bound is on length, not on int64
+_chk '999999999999999999 1\n'    "standing 999999999999999999"   # (control) 18 digits
 _chk '53 1\n\c'   "standing 53"         # (control) the same record, newline present
 [ "$_sr_ok" = "1" ] && ok "streak reader: exactly '0 0\\n' is cleared; '<n> <0|1>\\n' (n>=1, no leading zero) is standing; every other shape (empty, cut, torn, extra field, 0 1, two lines, ...) is unreadable" || bad "streak reader misclassified a shape (see lines above)"
 unset -f _chk; unset _sr_ok
@@ -627,6 +634,29 @@ done
 reset_main; printf 'poll=%s decision=WAIT backoff attempts=0 next_allowed=0 direct_attempts=0 direct_next_allowed=0\n' "$((NOW-10))" > "$GC_TRIGGER_STATE"
 _trg_state_readable "$GC_TRIGGER_STATE" && ok "state: a plain 0 is still a complete record (only a LEADING zero is refused)" || bad "state: attempts=0 must stay readable"
 unset _row
+# ...and the LENGTH half of the same class (found by the full-diff self-audit before round 4 was submitted). A number
+# past int64 in the state record, or in the skip-streak file, used to be "readable": `[ "$now" -lt "$next_allowed" ]`
+# and `[ "$streak" -lt "$MIN" ]` then ERROR (rc 2, "integer expression expected") and an error reads as false — "not in
+# backoff", "not below the minimum" — so the poll went on to START A RUN. Both readers now refuse it: one inert poll,
+# said out loud, a clean record rewritten (the designed answer to a hand edit); an unreadable streak is `WAIT
+# streak-unreadable`. Same-shell poll (not a subshell) so the KICKS counter is real; stderr must stay empty.
+_ol_ok=1
+for _row in "S:attempts=2 next_allowed=99999999999999999999" "S:attempts=99999999999999999999 next_allowed=0" \
+            "S:attempts=2 next_allowed=0 direct_attempts=0 direct_next_allowed=18446744073709551616" \
+            "S:attempts=2 next_allowed=9223372036854775808" "K:99999999999999999999 1" "K:18446744073709551616 1"; do
+  reset_main; AVAIL=12486
+  case "$_row" in
+    S:*) printf 'poll=%s decision=WAIT backoff %s\n' "$((NOW-10))" "${_row#S:}" > "$GC_TRIGGER_STATE"; _want="WAIT state-unreadable" ;;
+    K:*) printf '%s\n' "${_row#K:}" > "$GC_SKIP_STREAK_STATE"; _want="WAIT streak-unreadable" ;;
+  esac
+  trigger_main >/dev/null 2>"$T/poll.err"
+  { [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "$_want" ] && [ "$(sget poll)" = "$NOW" ] && [ ! -s "$T/poll.err" ]; } \
+    || { _ol_ok=0; echo "    ('${_row}': kicks=$KICKS dec='$(sdec)' want '$_want', stderr='$(head -c 100 "$T/poll.err")')"; }
+done
+[ "$_ol_ok" = "1" ] && ok "state/streak: a number too long to fit (20 digits, 2^64, 2^63) in the state record or the skip-streak file → unreadable: no run, no stderr, WAIT state-unreadable / streak-unreadable (an error must not read as 'not in backoff' / 'not below the minimum')" || bad "state/streak overlong number started a run or was mis-read (see lines above)"
+reset_main; printf 'poll=%s decision=WAIT backoff attempts=2 next_allowed=999999999999999999 direct_attempts=0 direct_next_allowed=0\n' "$((NOW-10))" > "$GC_TRIGGER_STATE"
+_trg_state_readable "$GC_TRIGGER_STATE" && ok "state: (control) an 18-digit number is still a complete record — the bound is on what cannot fit" || bad "state: an 18-digit next_allowed read as unreadable"
+unset _row _want _ol_ok
 
 # (7) The kill switch is a pause, not a reset: the recorded backoff survives GC_TRIGGER_ENABLED=0.
 reset_main; AVAIL=12486

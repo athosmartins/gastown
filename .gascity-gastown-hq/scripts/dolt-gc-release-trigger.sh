@@ -56,7 +56,8 @@
 # run; a decision that is not exactly "KICK direct" / "KICK release" → no run ("WAIT unknown-decision");
 # a state file that cannot be written (so the backoff could not be recorded) → no run; a second live
 # invocation or a live maintenance run → no run. A state file that exists but is not ONE COMPLETE record
-# (garbled, empty, cut mid-write, missing attempts/next_allowed, cut between the two direct_ fields) is
+# (garbled, empty, cut mid-write, missing attempts/next_allowed, cut between the two direct_ fields, a number
+# with a leading zero or too long to fit in 64 bits) is
 # "don't know" (its backoff may be lost): that poll stays inert, logs it, rewrites a clean state, and
 # the next poll proceeds. The job's
 # skip-streak file is read the same way (_trg_streak_read: absent / cleared / standing N / unreadable):
@@ -230,7 +231,7 @@ _trg_pos_int() {
 # _trg_streak_read <file> → the job's skip-streak file as ONE of four answers, never a guess:
 #   absent         no file: the job never skipped (or never ran) — genuinely no streak
 #   cleared        the file is EXACTLY "0 0\n" — what the job's _clear_skip_streak writes
-#   standing <n>   exactly one complete line "<n> <0|1>\n", n >= 1, no leading zero
+#   standing <n>   exactly one complete line "<n> <0|1>\n", n >= 1, no leading zero, at most 18 digits
 #   unreadable     anything else that exists: empty, cut mid-write (no newline), torn, an extra field or
 #                  line, "0 1", a directory, a file that cannot be opened
 # The job's own _read_skip_streak is fail-SAFE for its alert counter (missing/garbled → "0 0"), which is
@@ -247,6 +248,7 @@ _trg_streak_read() {
   [ "$line" = "0 0" ] && { echo cleared; return 0; }
   n="${line%% *}"; flag="${line#* }"
   case "$n" in ''|0*|*[!0-9]*) echo unreadable; return 0 ;; esac
+  [ "${#n}" -le 18 ] || { echo unreadable; return 0; }     # a count too long to fit: past int64 `[ ]` errors, not compares
   case "$flag" in 0|1) ;; *) echo unreadable; return 0 ;; esac
   [ "$line" = "$n $flag" ] || { echo unreadable; return 0; }
   echo "standing $n"
@@ -336,7 +338,10 @@ _trg_state_readable() {
   # trigger writes its numbers from arithmetic — and read back through $(( )) it is OCTAL: 08/09 abort the poll
   # before it records anything (no run, no heartbeat), 007 is silently 7. Unreadable is the designed answer to
   # a hand edit: inert once, said out loud, a clean record rewritten (as _trg_streak_read does for its file).
-  head -1 "$1" 2>/dev/null | grep -Eq '^poll=(0|[1-9][0-9]*) decision=.+ attempts=(0|[1-9][0-9]*) next_allowed=(0|[1-9][0-9]*)( direct_attempts=(0|[1-9][0-9]*) direct_next_allowed=(0|[1-9][0-9]*))?$'
+  # And a number has to FIT: at most 18 digits ({0,17} after the first). Past int64 `[ ]` does not compare, it
+  # errors (rc 2) — and the poll's `[ "$now" -lt "$next_allowed" ]` reads an error as "no", i.e. "not in backoff",
+  # and starts a run. A number too long to fit is "don't know" too, not a very long backoff.
+  head -1 "$1" 2>/dev/null | grep -Eq '^poll=(0|[1-9][0-9]{0,17}) decision=.+ attempts=(0|[1-9][0-9]{0,17}) next_allowed=(0|[1-9][0-9]{0,17})( direct_attempts=(0|[1-9][0-9]{0,17}) direct_next_allowed=(0|[1-9][0-9]{0,17}))?$'
 }
 
 # _trg_state_decision <file> → the last recorded decision text, "" if none.
