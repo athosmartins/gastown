@@ -973,6 +973,179 @@ if [ -n "$_DEAD_TRANSIENT_LN" ]; then
   fi
 fi
 
+echo "── 13g. ga-i19942: a bead returned to the pool by the ga-tz0op block must NOT keep gate:queued (executes the REAL shipped block against a stateful bd stub) ──"
+# BUG (ga-i19942): the pool probe (`bd ready ... --exclude-label gate:queued`)
+# and the Pilot's ingate filter hide any bead wearing gate:queued. The ga-tz0op
+# pool-return cleared assignee + story:in-flight and wrote gc.routed_to but
+# never removed gate:queued, so the bead came back to the pool invisible
+# (measured 25/09: wa-gqkpz 71min, wa-wqn2v 43min). The ga-39l9z2 and FAIL
+# pool-returns already dropped it; this sibling did not.
+#
+# The block is extracted from the dispatcher by its own anchor comments (never
+# hand-copied, same discipline as 13d/13f) and EXECUTED, so this asserts on what
+# the bead ends up looking like, not on what the source text says. All bd
+# state lives in FILES: a stub that logged from inside $(...) would lose its
+# log with the subshell and every "nothing happened" assertion would pass empty.
+_TZ0OP_EXEC_BLOCK=$(sed -n '/ga-tz0op: REBASE_AUTHOR resolved to a pool\/ephemeral identity/,/Read current rebase-attempt counter from the marker labels/p' "$DISPATCHER")
+_T13G="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-tz0op-queued.XXXXXX")"
+[ -n "$_T13G" ] && [ -d "$_T13G" ] || { echo "FATAL: could not create 13g scratch dir"; exit 1; }
+
+# _tz0op_run <scenario-flags...> — resets the bead to the incident shape, runs
+# the real block in a subshell, leaves the resulting state under $_T13G.
+#   ASSIGN_REFUSED=1  bd assign "" is a no-op (a different actor holds the bead)
+#   STICKY_QUEUED=1   bd label remove gate:queued is a silent no-op (write lost)
+#   SHOW_FAIL=1       bd show --json fails outright (read-back impossible)
+#   NO_QUEUED=1       the bead did not carry gate:queued to begin with
+_tz0op_run() {
+  rm -f "$_T13G"/calls.log "$_T13G"/comments.log "$_T13G"/labels "$_T13G"/assignee "$_T13G"/routed_to "$_T13G"/qg.log
+  if [ "${NO_QUEUED:-0}" = "1" ]; then
+    printf '%s\n' "story:in-flight" "ctx:ready" > "$_T13G/labels"
+  else
+    printf '%s\n' "story:in-flight" "gate:queued" "ctx:ready" > "$_T13G/labels"
+  fi
+  printf '%s' "wa-worker-adhoc-dead1" > "$_T13G/assignee"
+  : > "$_T13G/routed_to"; : > "$_T13G/calls.log"; : > "$_T13G/comments.log"
+  (
+    export ASSIGN_REFUSED="${ASSIGN_REFUSED:-0}" STICKY_QUEUED="${STICKY_QUEUED:-0}" SHOW_FAIL="${SHOW_FAIL:-0}"
+    set_gate_status() { :; }
+    gate_marker_status_ensure() { echo ok; }
+    gate_fail_restore_route() { echo "wa-worker"; }
+    bd() {
+      shift 2   # drop: -C <city>
+      printf '%s\n' "$*" >> "$_T13G/calls.log"
+      case "$1" in
+        label)
+          if [ "$2" = "add" ]; then printf '%s\n' "$4" >> "$_T13G/labels"
+          elif [ "$2" = "remove" ] && [ "${STICKY_QUEUED:-0}" != "1" -o "$4" != "gate:queued" ]; then
+            grep -vxF -- "$4" "$_T13G/labels" > "$_T13G/labels.new" || true
+            mv "$_T13G/labels.new" "$_T13G/labels"
+          fi ;;
+        assign) [ "${ASSIGN_REFUSED:-0}" = "1" ] || : > "$_T13G/assignee" ;;
+        update) [ "$3" = "--set-metadata" ] && printf '%s' "${4#gc.routed_to=}" > "$_T13G/routed_to" ;;
+        comment) printf '%s :: %s\n' "$2" "$3" >> "$_T13G/comments.log" ;;
+        show)
+          [ "${SHOW_FAIL:-0}" = "1" ] && return 1
+          jq -n --rawfile a "$_T13G/assignee" --rawfile r "$_T13G/routed_to" \
+            --arg l "$(cat "$_T13G/labels")" \
+            '[{id:"wa-gqkpz", status:"in_progress", assignee:$a, labels:($l|split("\n")|map(select(length>0))), metadata:{"gc.routed_to":$r}}]' ;;
+      esac
+      return 0
+    }
+    REBASE_AUTHOR="wa-worker-adhoc-dead1" CONFLICT_KIND="merge"
+    BEAD_ID="wa-gqkpz"; BEAD_CITY="$_T13G/city"; GC_CITY="$_T13G/hq"; MARKER_ID="ga-sv1gi9"
+    BRANCH="crew/wa-worker/wa-gqkpz"; RIG="whatsapp_automation"; RIG_LIST_JSON="{}"; QG_LOG="$_T13G/qg.log"
+    eval "$_TZ0OP_EXEC_BLOCK"
+  ) >/dev/null 2>&1 || true
+}
+# The pool probe as the incident measured it: unassigned + routed to the pool
+# + NOT gate:queued. Reads the resulting state files, never the source text.
+_probe_sees_bead() {
+  [ ! -s "$_T13G/assignee" ] && [ "$(cat "$_T13G/routed_to")" = "wa-worker" ] && ! grep -qxF "gate:queued" "$_T13G/labels"
+}
+_bead_comment() { grep '^wa-gqkpz :: ' "$_T13G/comments.log" | tail -1; }
+
+if [ -z "$_TZ0OP_EXEC_BLOCK" ]; then
+  bad "13g: could not extract the ga-tz0op block for execution — anchor comments missing/renamed?"
+else
+  # Positive control: the harness itself must be able to see the defect. Seed
+  # the state by hand and ask the probe emulation — if this answered "visible"
+  # the assertions below would be measuring nothing.
+  printf '%s\n' "gate:queued" > "$_T13G/labels"; : > "$_T13G/assignee"; printf 'wa-worker' > "$_T13G/routed_to"
+  if _probe_sees_bead; then
+    bad "13g positive control: the probe emulation reports a bead WITH gate:queued as visible — the harness cannot detect the defect"
+  else
+    ok "13g positive control: the probe emulation hides an unassigned, routed bead that still wears gate:queued (the incident's exact symptom)"
+  fi
+
+  echo "── 13g-1. the incident shape: dead pool author, assignee clears, gate:queued present ──"
+  _tz0op_run
+  if grep -qxF "gate:needs-rebase" "$_T13G/labels" && ! grep -qxF "story:in-flight" "$_T13G/labels"; then
+    ok "13g-1: the block still does what it always did (gate:needs-rebase added, story:in-flight removed) — the harness ran the real block"
+  else
+    bad "13g-1: the extracted block did not run to its normal effect (labels: $(tr '\n' ' ' < "$_T13G/labels")) — harness is not exercising the real block"
+  fi
+  if grep -qxF "gate:queued" "$_T13G/labels"; then
+    bad "13g-1 AC1: the bead left the pool-return still wearing gate:queued (labels: $(tr '\n' ' ' < "$_T13G/labels")) — the pool probe cannot see it"
+  else
+    ok "13g-1 AC1: gate:queued is gone from the source bead after the pool-return"
+  fi
+  if _probe_sees_bead; then ok "13g-1: the pool probe emulation now SEES the bead (unassigned + routed to wa-worker + no gate:queued)"; else bad "13g-1: the pool probe emulation still cannot see the returned bead"; fi
+  case "$(_bead_comment)" in
+    *"gate:queued=removed"*) ok "13g-1: the bead comment reports the OBSERVED outcome 'gate:queued=removed'" ;;
+    *) bad "13g-1: the bead comment does not report 'gate:queued=removed' (got: $(_bead_comment | cut -c1-160))" ;;
+  esac
+  case "$(_bead_comment)" in
+    *"assignee=cleared"*) ok "13g-1: the comment reports the OBSERVED assignee state, not an asserted '(assignee cleared)'" ;;
+    *) bad "13g-1: the comment does not report an observed assignee state" ;;
+  esac
+  if grep -qF "gate-status" "$_T13G/calls.log"; then bad "13g-1 AC4: the block touched gate-status through bd directly"; else ok "13g-1 AC4: no direct gate-status write via bd (the marker is left to set_gate_status, exactly as before)"; fi
+  if awk '$1=="label" && $3=="ga-sv1gi9"' "$_T13G/calls.log" | grep -q .; then bad "13g-1 AC4: the block issued a label write against the MARKER id (ga-sv1gi9)"; else ok "13g-1 AC4: the marker id is never given a label write from the source-bead path (marker stays needs-rebase)"; fi
+
+  echo "── 13g-2. the removal is verified, not narrated: a silently-lost write must be reported as such ──"
+  STICKY_QUEUED=1 _tz0op_run
+  if grep -qxF "gate:queued" "$_T13G/labels"; then ok "13g-2 setup: the stub really dropped the removal (gate:queued survives)"; else bad "13g-2 setup: sticky stub did not keep gate:queued — the scenario is not exercising a lost write"; fi
+  case "$(_bead_comment)" in
+    *"STILL PRESENT"*) ok "13g-2: a removal that did not stick is reported 'STILL PRESENT' (needs investigation), not 'removed'" ;;
+    *) bad "13g-2: a lost removal was not reported as STILL PRESENT (got: $(_bead_comment | cut -c1-200))" ;;
+  esac
+  case "$(_bead_comment)" in
+    *"gate:queued=removed"*) bad "13g-2: the comment claims 'gate:queued=removed' although the label is still on the bead — narrated, not observed" ;;
+    *) ok "13g-2: the comment never claims 'removed' when the label is still there" ;;
+  esac
+
+  echo "── 13g-3. assignee still held (clear refused): gate:queued left alone, and the comment says so ──"
+  ASSIGN_REFUSED=1 _tz0op_run
+  if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-3: gate:queued removal was attempted on a bead a different actor still holds"; else ok "13g-3: no gate:queued removal attempted while the assignee is still set (ga-39l9z2 conservative rule)"; fi
+  if grep -qxF "gate:queued" "$_T13G/labels"; then ok "13g-3: gate:queued left in place"; else bad "13g-3: gate:queued was removed although the assignee clear did not apply"; fi
+  case "$(_bead_comment)" in
+    *"NOT cleared"*) ok "13g-3: the comment reports the assignee was NOT cleared (instead of the old unconditional '(assignee cleared)')" ;;
+    *) bad "13g-3: the comment does not report the failed assignee clear (got: $(_bead_comment | cut -c1-200))" ;;
+  esac
+
+  echo "── 13g-4. read-back impossible: third state, never collapsed into 'removed' or 'failed' ──"
+  SHOW_FAIL=1 _tz0op_run
+  if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-4: gate:queued removal attempted without any read-back proving the assignee is empty"; else ok "13g-4: no removal attempted when the bead cannot be read (inert under doubt)"; fi
+  case "$(_bead_comment)" in
+    *"gate:queued=UNVERIFIED"*) ok "13g-4: the comment reports gate:queued=UNVERIFIED" ;;
+    *) bad "13g-4: the comment does not report the UNVERIFIED third state (got: $(_bead_comment | cut -c1-200))" ;;
+  esac
+
+  echo "── 13g-5. the bead never carried gate:queued: nothing to remove, and no needless write ──"
+  NO_QUEUED=1 _tz0op_run
+  if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-5: a gate:queued removal was issued for a bead that does not have the label"; else ok "13g-5: no removal issued when gate:queued is absent"; fi
+  case "$(_bead_comment)" in
+    *"gate:queued=absent"*) ok "13g-5: the comment reports gate:queued=absent" ;;
+    *) bad "13g-5: the comment does not report gate:queued=absent (got: $(_bead_comment | cut -c1-200))" ;;
+  esac
+fi
+[ -n "$_T13G" ] && [ -d "$_T13G" ] && rm -rf "$_T13G"
+
+echo "── 13h. ga-i19942 AC2: EVERY pool-return that restores gc.routed_to also drops gate:queued (sweep guard — a 4th sibling cannot repeat the miss) ──"
+# A pool-return is any code site that writes gc.routed_to from a computed route
+# variable (--set-metadata "gc.routed_to=$_X_ROUTE"): it hands the source bead
+# back to a pool whose probe excludes gate:queued. Each such site must strip the
+# label within its own block. The 90-line window is far below the distance to the
+# next site (the three known ones are >4000 lines apart), so a neighbour cannot
+# satisfy it by accident.
+_PR_SITES=$(grep -n -- '--set-metadata "gc\.routed_to=\$' "$DISPATCHER" | grep -v '^[0-9]*:[[:space:]]*#' | cut -d: -f1)
+_PR_COUNT=0; _PR_MISSING=""
+for _ln in $_PR_SITES; do
+  _PR_COUNT=$((_PR_COUNT + 1))
+  if ! sed -n "${_ln},$((_ln + 90))p" "$DISPATCHER" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
+    _PR_MISSING="$_PR_MISSING $_ln"
+  fi
+done
+if [ "$_PR_COUNT" -ge 3 ]; then
+  ok "13h: the sweep found $_PR_COUNT pool-return sites (ga-39l9z2 needs-rebase, FAIL, ga-tz0op) — the guard is not vacuous"
+else
+  bad "13h: the sweep found only $_PR_COUNT pool-return sites (expected >= 3) — the grep pattern drifted and the guard would pass empty"
+fi
+if [ -z "$_PR_MISSING" ]; then
+  ok "13h AC2: every pool-return site drops gate:queued within its block"
+else
+  bad "13h AC2: pool-return site(s) at line(s)${_PR_MISSING} write gc.routed_to but never remove gate:queued — the bead returns to the pool invisible to the probe"
+fi
+
 # ── 14. ga-ivzbuz: behind-envelope circuit-break has an unreachable ceiling on
 #    a high-velocity rig, and treats a normally-exited ad-hoc worker's dead
 #    session as "abandoned" with no owner-liveness fallback ─────────────────

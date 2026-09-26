@@ -13183,6 +13183,24 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
         _TZ0OP_VERIFY_READ_OK=1
         _TZ0OP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_VERIFY_READ_OK=0
         [ -n "$_TZ0OP_VERIFY_JSON" ] || _TZ0OP_VERIFY_READ_OK=0
+        # ga-i19942: the pool probe (`bd ready ... --exclude-label gate:queued`)
+        # and the Pilot's candidate query (pilot-dispatcher.sh, same
+        # --exclude-label) both HIDE a bead wearing gate:queued, so a bead
+        # returned to the pool with a stale gate:queued is invisible to every
+        # worker — measured 25/09 on wa-gqkpz (71min) and wa-wqn2v (43min):
+        # `bd ready --metadata-field gc.routed_to=wa-worker --unassigned` listed
+        # both, the same query with the probe's --exclude-label listed neither.
+        # The two sibling pool-returns (ga-39l9z2 needs-rebase arm and the FAIL
+        # arm, ga-f54ui) already drop it; this one never did. The marker stays
+        # OPEN (needs-rebase), and gate-recovery-watchdog's FIX8 only clears a
+        # phantom gate:queued when NO marker references the bead, so nothing
+        # else cleans this up. Same conservative rule as ga-39l9z2: only drop it
+        # once the read-back CONFIRMS nobody holds the bead — dropping a label
+        # on a bead a different actor just claimed would fabricate state. The
+        # marker itself is untouched here (still needs-rebase; the Step 0a-4
+        # reaper, ga-88sl7, closes it once the branch has landed).
+        _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write read failed)"
+        _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write read failed — left untouched)"
         if [ "$_TZ0OP_VERIFY_READ_OK" = "0" ]; then
           _TZ0OP_ROUTE_OBS="gc.routed_to=UNVERIFIED (post-write read failed — state unknown, NOT a claim the restore failed)"
         else
@@ -13192,10 +13210,44 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
           else
             _TZ0OP_ROUTE_OBS="gc.routed_to='${_TZ0OP_ROUTE_OBSERVED}' NOT $_TZ0OP_ROUTE — restore did not stick, needs investigation"
           fi
+          # Three states for each read, never collapsed: a jq failure yields "?"
+          # (unknown), which must not read as "assignee empty" or "label absent".
+          _TZ0OP_ASSIGNEE_OBSERVED=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "?")
+          _TZ0OP_QUEUED_PRESENT=$(printf '%s' "$_TZ0OP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+          if [ "$_TZ0OP_ASSIGNEE_OBSERVED" = "?" ] || [ "$_TZ0OP_QUEUED_PRESENT" = "?" ]; then
+            _TZ0OP_ASSIGNEE_OBS="assignee=UNVERIFIED (post-write JSON unreadable)"
+            _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (post-write JSON unreadable — left untouched)"
+          elif [ -n "$_TZ0OP_ASSIGNEE_OBSERVED" ]; then
+            _TZ0OP_ASSIGNEE_OBS="assignee='${_TZ0OP_ASSIGNEE_OBSERVED}' NOT cleared — needs investigation"
+            _TZ0OP_QUEUED_OBS="gate:queued=left untouched (assignee still held, so the bead is not pool-visible either way)"
+          else
+            _TZ0OP_ASSIGNEE_OBS="assignee=cleared"
+            if [ "$_TZ0OP_QUEUED_PRESENT" = "no" ]; then
+              _TZ0OP_QUEUED_OBS="gate:queued=absent (nothing to remove)"
+            else
+              bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true
+              # Re-read: the remove above is fire-and-forget (-q, errors dropped),
+              # so "removed" is only claimed from what the bead now shows.
+              _TZ0OP_RECHECK_JSON=""
+              _TZ0OP_RECHECK_OK=1
+              _TZ0OP_RECHECK_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _TZ0OP_RECHECK_OK=0
+              [ -n "$_TZ0OP_RECHECK_JSON" ] || _TZ0OP_RECHECK_OK=0
+              if [ "$_TZ0OP_RECHECK_OK" = "0" ]; then
+                _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal failed — state unknown, NOT a claim the removal failed)"
+              else
+                _TZ0OP_QUEUED_AFTER=$(printf '%s' "$_TZ0OP_RECHECK_JSON" | jq -r 'if type=="array" then .[0] else . end | if ((.labels // []) | index("gate:queued")) != null then "yes" else "no" end' 2>/dev/null || echo "?")
+                case "$_TZ0OP_QUEUED_AFTER" in
+                  no)  _TZ0OP_QUEUED_OBS="gate:queued=removed" ;;
+                  yes) _TZ0OP_QUEUED_OBS="gate:queued=STILL PRESENT — removal did not stick, the pool probe cannot see this bead (needs investigation)" ;;
+                  *)   _TZ0OP_QUEUED_OBS="gate:queued=UNVERIFIED (re-read after removal unreadable)" ;;
+                esac
+              fi
+            fi
+          fi
         fi
         _TZ0OP_ROUTE_UNKNOWN_NOTE=""
         [ "$_TZ0OP_ROUTE_UNKNOWN" = "1" ] && _TZ0OP_ROUTE_UNKNOWN_NOTE=" NOTE: bead_city='$BEAD_CITY' did not reverse-resolve to any registered rig — route defaulted to gastown.dog rather than guessed (ga-u679x2)."
-        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool (assignee cleared) for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS.$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Gate (ga-tz0op): branch $BRANCH needs a rebase, but its resolved rebase-liveness author '$REBASE_AUTHOR' is a pool/ephemeral identity — no fixed session to wait for. Returned to the $_TZ0OP_ROUTE pool for a fresh worker to rebase and resubmit via /gate-done — verified post-write, not assumed: $_TZ0OP_ROUTE_OBS; $_TZ0OP_ASSIGNEE_OBS; $_TZ0OP_QUEUED_OBS (ga-i19942).$_TZ0OP_ROUTE_UNKNOWN_NOTE" 2>/dev/null || true
       fi
       REBASE_EVENT="dispatcher_needs_rebase_pool_author"
       REBASE_VERDICT="NEEDS_REBASE (pool/ephemeral author '$REBASE_AUTHOR' — returned to pool, ga-tz0op)"
