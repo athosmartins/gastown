@@ -59,11 +59,49 @@ if ! python3 "$REPORT" --date "$DAY" >"$OUT_DIR/$DAY.txt" 2>&1; then
   exit 1
 fi
 
+# ga-aijm2v.8: the "recomecar" section (Jev in shadow: when would a clean restart pay, and what would
+# it have cost). Produced by its own script from rows the consumer order already wrote -- this only
+# READS the log. Like the join above it is FAIL-OPEN: a broken or hung section must never take the
+# whole daily report down, and it must never look like "no data" (a day that failed to compute says
+# so, in the file and in the ntfy).
+RECOMECAR="${JEV_RECOMECAR_REPORT:-$HQ/scripts/jev_recomecar_experiment.py}"
+REC_TIMEOUT="${JEV_RECOMECAR_REPORT_TIMEOUT:-120}"
+REC_FAIL_NOTE="Recomeçar (sombra): seção indisponível hoje (falhou ou passou de ${REC_TIMEOUT}s) — isto NÃO é 'sem dados'; detalhe em $OUT_DIR/$DAY.txt."
+rec_run() {  # rec_run <label> <args...>: prints the script's output, or a visible FAILED line; never returns non-zero
+  local label="$1"; shift
+  local out rc
+  out=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" "$@" 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then printf '%s\n' "$out"
+  elif [ "$rc" -eq 124 ]; then printf '== recomecar (%s): section TIMED OUT after %ss ==\n' "$label" "$REC_TIMEOUT"
+  else printf '== recomecar (%s): section FAILED (rc=%s) ==\n%s\n' "$label" "$rc" "$out"
+  fi
+  return 0
+}
+{
+  echo ""
+  rec_run "$DAY" report --date "$DAY"
+  echo ""
+  rec_run "7 days ending $DAY" report --date "$DAY" --days 7
+} >>"$OUT_DIR/$DAY.txt"
+
 if ! RESUMO=$(python3 "$REPORT" --date "$DAY" --resumo-pt 2>&1); then
   notify -t "Jev: resumo de $DAY falhou" "$RESUMO"
   exit 1
 fi
 
+# The recomecar block rides on the same ntfy: the day, then ONE line of the 7-day rollup (the phase-2
+# decision rests on the rolling number; a single day is noisy at this volume).
+if ! REC_DAY=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" resumo-pt --date "$DAY" 2>/dev/null) || [ -z "$REC_DAY" ]; then
+  REC_DAY="$REC_FAIL_NOTE"
+fi
+# The rollup is the number the phase-2 decision rests on, so it gets the same rule as the day line: a
+# failed, hung OR empty answer is a visible "unavailable" line, never a silently missing one (the real
+# section script always prints a line on success -- an empty window says "nada a medir" -- so empty
+# output is a failure, same as the quem-pensa block below).
+REC_7D_FAIL_NOTE="Recomeçar, acumulado 7 dias até $DAY: indisponível (falhou ou passou de ${REC_TIMEOUT}s) — NÃO é 'sem dados'; detalhe em $OUT_DIR/$DAY.txt."
+REC_7D=$(timeout "$REC_TIMEOUT" python3 "$RECOMECAR" resumo-pt --date "$DAY" --days 7 --curto 2>/dev/null) || REC_7D=""
+[ -n "$REC_7D" ] || REC_7D="$REC_7D_FAIL_NOTE"
+RESUMO="$RESUMO"$'\n\n'"$REC_DAY"$'\n'"$REC_7D"
 # ga-aijm2v.9: the quem-pensa (which-model) calibration table, cumulative to date. Its records
 # come from the hourly jev-quem-pensa order, not from this script, so there is nothing to run
 # first -- only to read. Best-effort like the join above: its own failure must never block the

@@ -1,0 +1,15 @@
+# ga-aijm2v.8 (Jev): "hora de recomecar", in SHADOW and OFFLINE. Crews + Mayor burn ~41% of the day's
+# tokens and turns with >500k of context ~35% of all spend, because a long session glues unrelated
+# tasks together and re-reads the old context on every turn. This order reads the transcripts that
+# are already on disk, finds each task boundary, records what Jev would decide ("start clean?") and,
+# from the same transcript, what the agent did next (did it reuse the old context?). The Athos gets
+# the numbers in the daily Jev report BEFORE any live session is ever restarted (phase 2, another
+# bead). It NEVER touches a running session: it only reads files.
+# 15m cadence: a boundary is only written once its 12-turn window has closed, so latency is
+# irrelevant; a run re-reads only transcripts that changed and is single-instance (lock), so the
+# cadence cannot stack (ga-y0g5x taught us a detector's poll cost is its own load).
+[order]
+description = "Hora de recomecar (Jev, sombra offline): records at each task boundary of a long session what Jev would decide about starting clean and whether the agent then reused the old context; never touches a live session (ga-aijm2v.8)"
+trigger = "cooldown"
+interval = "15m"
+exec = "$PACK_DIR/assets/scripts/jev-recomecar.sh"
