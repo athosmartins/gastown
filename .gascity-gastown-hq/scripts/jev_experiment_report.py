@@ -85,6 +85,13 @@ def load_events(date: str | None, experiment: str | None) -> list[dict]:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue  # a corrupt line is data-quality noise, not a reason to crash the report
+            if ev.get("mode") == "quem-pensa":
+                # ga-aijm2v.9: these have their own calibration table (jev_quem_pensa_report.py).
+                # summarize() below treats any mode it does not know as a suppression-experiment
+                # "experiment arm" event, so letting them through would count every one as a
+                # fired alert. Skipped here, not in summarize(), so the mode list there stays
+                # exactly what each front owns.
+                continue
             if date and not ev.get("ts", "").startswith(date):
                 continue
             if experiment and ev.get("experiment") != experiment:

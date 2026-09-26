@@ -70,6 +70,31 @@ time.sleep(5)
 print("jev_gate_verdict_experiment: should never get here (ga-aijm2v.3 T9c)")
 EOF
 
+# ga-aijm2v.9: the quem-pensa report step. Same hermetic rule as the join: the real
+# jev_quem_pensa_report.py would read the LIVE quality-gate.jsonl, so every test runs against
+# a stub unless it says otherwise. The stubs answer like the real one: full text by default,
+# the short Portuguese block for --resumo-pt.
+cat >"$T/qp-ok.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("Quem pensa (so observacao): QP-RESUMO-STUB" if "--resumo-pt" in sys.argv else "QUEM-PENSA FULL REPORT STUB")
+EOF
+cat >"$T/qp-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_quem_pensa_report: simulated failure (ga-aijm2v.9 T10b)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/qp-empty.py" <<'EOF'
+#!/usr/bin/env python3
+EOF
+cat >"$T/qp-hang.py" <<'EOF'
+#!/usr/bin/env python3
+import time
+time.sleep(30)
+print("QP-HANG-SHOULD-NEVER-BE-PRINTED")
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -86,6 +111,7 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
   env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
       JEV_GATE_VERDICT_JOIN_TIMEOUT="${RUN_JOIN_TIMEOUT:-600}" \
+      JEV_QUEM_PENSA_REPORT="${RUN_QP:-$T/qp-ok.py}" JEV_QUEM_PENSA_REPORT_TIMEOUT="${RUN_QP_TIMEOUT:-120}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -181,6 +207,62 @@ grep -q 'TIMED OUT' "$T/out/gate-verdict-join.log" 2>/dev/null \
 grep -q 'should never get here' "$T/out/gate-verdict-join.log" 2>/dev/null \
   && nok "T9c process actually killed" "join-hang.py's post-sleep line ran -- the process was not terminated" \
   || ok "T9c the hung process was killed before finishing its sleep"
+
+# T10 (ga-aijm2v.9): the quem-pensa block. The generic report/ntfy numbers must be exactly
+# T1's whatever happens to the block, and the block must never fail SILENTLY.
+# T10a the block reaches the full report file AND the ntfy.
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T10a exit 0, exactly one ntfy with the quem-pensa step on"; else nok "T10a rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'QUEM-PENSA FULL REPORT STUB' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T10a the quem-pensa report is appended to the day's full report file" || nok "T10a report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"QP-RESUMO-STUB"*) ok "T10a the ntfy carries the quem-pensa Portuguese block" ;; *) nok "T10a ntfy block" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T10a the generic numbers are untouched by the extra block" ;; *) nok "T10a generic numbers" "$N" ;; esac
+# T10b a FAILING quem-pensa report: fail-open (rc 0, one ntfy, generic report intact) but
+# VISIBLE — one line in the ntfy and the file, and the stderr kept in quem-pensa-report.log.
+RUN_QP="$T/qp-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T10b failing quem-pensa report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T10b rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Quem pensa: relatório falhou"*) ok "T10b the failure is VISIBLE in the ntfy, not a silent absence" ;; *) nok "T10b visible failure" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T10b generic numbers still reported" ;; *) nok "T10b generic numbers" "$N" ;; esac
+grep -q 'simulated failure' "$T/out/quem-pensa-report.log" 2>/dev/null \
+  && ok "T10b the failure's stderr is kept in quem-pensa-report.log" || nok "T10b stderr kept" "$(cat "$T/out/quem-pensa-report.log" 2>&1)"
+# T10c empty output with rc 0 is ALSO a failure: the real report always prints a line, and an
+# empty block would read exactly like "nothing to report".
+RUN_QP="$T/qp-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"Quem pensa: relatório falhou"*) ok "T10c an empty quem-pensa report is a visible failure, not silence" ;; *) nok "T10c empty" "$N" ;; esac
+# T10d a HUNG quem-pensa report is killed by its own bound and does not stall the ntfy.
+T0=$SECONDS
+RUN_QP="$T/qp-hang.py" RUN_QP_TIMEOUT=1 run 2026-09-20
+ELAPSED=$((SECONDS - T0))
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T10d hung quem-pensa report still yields exit 0 and exactly one ntfy"; else nok "T10d rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Quem pensa: relatório falhou"*) ok "T10d the hang is a visible failure" ;; *) nok "T10d hang visible" "$N" ;; esac
+# The report is called twice (full + --resumo-pt), each bounded at 1s here, so a real kill costs
+# a few seconds even on a loaded machine. The stub sleeps 30s per call: an unkilled run would take
+# 60s+, so the 20s line separates the two cases with a wide margin (a tight one flaked-by-design
+# on this city's saturated CPU). Timing, not just the absence of the marker, so a missing stub
+# file cannot pass this vacuously.
+if [ "$ELAPSED" -lt 20 ]; then ok "T10d both hung calls were cut by the bound (${ELAPSED}s, not the stub's 30s sleep each)"; else nok "T10d killed" "took ${ELAPSED}s: the hung process was not terminated"; fi
+case "$N" in *"QP-HANG-SHOULD-NEVER-BE-PRINTED"*) nok "T10d marker" "the hung process finished its sleep" ;; *) ok "T10d the hung process never printed past its sleep" ;; esac
+# T10e a quem-pensa record in the experiment log must NOT reach the generic report. Measured on the
+# base code: summarize() files any mode it does not know under the suppression experiment's
+# "experiment arm", so the record shows up as a WHOLE EXTRA BLOCK ("quem-pensa-nova: controle 0
+# alerta(s); experimento 1 ..." with a bogus negative "tokens economizados"). The other
+# experiment's own numbers do not move, so asserting those alone passes on the broken code --
+# assert the leaked experiment's ABSENCE, with a positive control that the real block is there.
+cp "$T/log.jsonl" "$T/log-qp.jsonl"
+cat >>"$T/log-qp.jsonl" <<'EOF'
+{"ts": "2026-09-20T05:00:00Z", "mode": "quem-pensa", "experiment": "quem-pensa-nova", "entity_id": "wa-x", "jev_ok": true, "escolha_jev": "facil", "prob_escolha": 0.97, "confianca_jev": 0.95, "modelo_jev": "haiku", "modelo_real": "sonnet", "desfecho_veredito": "PASS", "jev_tokens_in": 400, "jev_tokens_out": 45}
+EOF
+RUN_LOG="$T/log-qp.jsonl" run 2026-09-20
+N="$(cat "$T/notify.log")"
+F="$(cat "$T/out/2026-09-20.txt" 2>/dev/null)"
+case "$N" in *"controle 2 alerta(s); experimento 2"*) ok "T10e positive control: the real experiment's block is in the ntfy (the fixture was read)" ;; *) nok "T10e control" "$N" ;; esac
+case "$N" in *"quem-pensa-nova"*) nok "T10e leak (ntfy)" "a quem-pensa record became its own suppression-experiment block: $N" ;; *) ok "T10e the ntfy has no quem-pensa-nova suppression block" ;; esac
+case "$F" in *"## quem-pensa-nova"*) nok "T10e leak (report file)" "a quem-pensa record became a '## quem-pensa-nova' section" ;; *) ok "T10e the full report has no '## quem-pensa-nova' section" ;; esac
+case "$N" in *"400 + 45 tokens"*) nok "T10e token leak" "the record's Jev tokens were counted: $N" ;; *) ok "T10e the record's Jev tokens are not counted as suppression cost" ;; esac
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

@@ -64,6 +64,23 @@ if ! RESUMO=$(python3 "$REPORT" --date "$DAY" --resumo-pt 2>&1); then
   exit 1
 fi
 
+# ga-aijm2v.9: the quem-pensa (which-model) calibration table, cumulative to date. Its records
+# come from the hourly jev-quem-pensa order, not from this script, so there is nothing to run
+# first -- only to read. Best-effort like the join above: its own failure must never block the
+# day's report or its ntfy, but it must not be SILENT either (a missing block would read exactly
+# like "no data"), so a failed/empty report puts one visible line in the file and in the ntfy.
+# The real report always prints at least one line, so empty output counts as a failure.
+QP_REPORT="${JEV_QUEM_PENSA_REPORT:-$HQ/scripts/jev_quem_pensa_report.py}"
+QP_TIMEOUT="${JEV_QUEM_PENSA_REPORT_TIMEOUT:-120}"
+QP_LOG="$OUT_DIR/quem-pensa-report.log"
+QP_FAIL="Quem pensa: relatório falhou — ver $QP_LOG"
+QP_TXT=$(timeout "$QP_TIMEOUT" python3 "$QP_REPORT" 2>>"$QP_LOG") || QP_TXT=""
+QP_PT=$(timeout "$QP_TIMEOUT" python3 "$QP_REPORT" --resumo-pt 2>>"$QP_LOG") || QP_PT=""
+[ -n "$QP_TXT" ] || QP_TXT="$QP_FAIL"
+[ -n "$QP_PT" ] || QP_PT="$QP_FAIL"
+{ echo; echo "$QP_TXT"; } >>"$OUT_DIR/$DAY.txt"
+RESUMO="$RESUMO"$'\n'"$QP_PT"
+
 # Last command: a failed ntfy makes the job's exit status non-zero (visible in
 # `launchctl list`), instead of a report that silently never reached the phone.
 notify -t "Jev — fim do dia $DAY (UTC)" "$RESUMO"

@@ -1,0 +1,16 @@
+# ga-aijm2v.9 (Jev): "quem pensa" in SHADOW mode. For every task a pool worker got (wa-worker,
+# ps-worker, dog) and every repair after a gate rejection, it records which model Jev WOULD pick
+# (haiku/sonnet for a new task, sonnet/opus for a repair) next to what the quality gate then
+# said -- so the Athos sees, with numbers, whether Jev's read predicts approval BEFORE any model
+# choice is changed. It NEVER changes which model a session uses (pools stay on Sonnet).
+# Reads quality-gate.jsonl + bd; writes only jev-experiment.jsonl (mode "quem-pensa") and a small
+# skips file. The daily Jev ntfy (jev-daily-report.sh, 21:07) carries the calibration table.
+# 1h cadence: the outcome is a gate verdict that lands minutes-to-days after the decision, so
+# latency is irrelevant; new decisions arrive at ~4/hour. A run costs ~3 s per new decision (one
+# Jev call + 2-4 bd calls, measured live 25/09: 40 decisions = 100 s) and is bounded by --limit
+# and the wrapper's timeout, and is single-instance (flock), so the cadence cannot stack.
+[order]
+description = "Quem pensa do Jev (sombra): records which model Jev would pick for each pool task and each repair after a gate FAIL, and what the gate then said; never changes a model (ga-aijm2v.9)"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/jev-quem-pensa.sh"
