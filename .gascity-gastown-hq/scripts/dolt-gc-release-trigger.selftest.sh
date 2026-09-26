@@ -168,7 +168,15 @@ rm -f "$T/bo.err"; _bo_a="$(_bo 0300 07200 1) $(_bo 0300 07200 2) $(_bo 0300 072
 _bo_b="$(_bo 08 0100 1) $(_bo 08 0100 2) $(_bo 08 0100 4) $(_bo 08 0100 5) $(_bo 09 09 1)"
 [ "$_bo_b" = "8 16 64 100 9" ] && ok "backoff: base 08 / cap 0100 → 8, 16, 64, capped at 100 (08 and 09 do not abort)" || bad "backoff padded 08/09: got '$_bo_b'"
 [ ! -s "$T/bo.err" ] && ok "backoff: ...and none of the padded cases wrote to stderr" || bad "backoff padded stderr: '$(head -c 200 "$T/bo.err")'"
-unset -f _bo; unset _bo_a _bo_b
+# A knob of 10+ digits is not a number 10# can be trusted with (gate round 2, LOW): it WRAPS — under /bin/bash 3.2
+# 18446744073709551616 reads as 0, 9223372036854775808 as negative, 99999999999999999999 as 7.7e18 — and a base or cap
+# of 0/negative is NO backoff: a real run (with an S3 proof on the release path) on every poll. Same guard as
+# _dgm_stuck_limit_h: longer than 9 digits is garbled, and garbled is the default, never "no backoff".
+_bo_c="$(_bo 300 18446744073709551616 1) $(_bo 300 9223372036854775808 8) $(_bo 300 99999999999999999999 8) $(_bo 18446744073709551616 7200 1) $(_bo 9223372036854775808 7200 3)"
+[ "$_bo_c" = "300 7200 7200 300 1200" ] && ok "backoff: a 10+-digit base or cap (2^64, 2^63, 20 nines) is garbled → the defaults 300 / 7200 — not a wrapped 0, negative or 7.7e18" || bad "backoff overlong knob: got '$_bo_c' (want '300 7200 7200 300 1200')"
+_bo_d="$(_bo 000000300 0000007200 2) $(_bo 300 999999999 20)"
+[ "$_bo_d" = "600 157286400" ] && ok "backoff: the guard is on LENGTH, not value — a 9-digit zero-padded knob (000000300) is still 300, and 999999999 is a valid (huge) cap that the attempt count bounds (20 attempts = 300 x 2^19)" || bad "backoff 9-digit knobs: got '$_bo_d' (want '600 157286400')"
+unset -f _bo; unset _bo_a _bo_b _bo_c _bo_d
 
 # ═══ trigger_main end to end ═════════════════════════════════════════════════════════════
 # Real: state file, streak file, own lock, log, clock arithmetic, decision order.
@@ -226,7 +234,7 @@ reset_main() {
   rm -rf "$T/city"; mkdir -p "$T/city/.dolt-backup/hq" "$T/city/.beads/dolt/hq" "$T/rt"
   printf '5:__DOLT__:lock:root:gcgen\n' > "$T/city/.dolt-backup/hq/manifest"
   BACKUP_STAGING="$T/city/.dolt-backup"; DB="hq"; DOLTDIR="$T/city/.beads/dolt/hq"
-  rm -f "$GC_TRIGGER_STATE" "$GC_RELEASE_STATE" "$DOLT_GC_MAINT_LOG" "$GC_RUN_OUTCOME_STATE" "$T"/reads.* "$T"/notify.calls "$GC_MAINT_LOCKDIR.stuck-alerted" "$GC_TRIGGER_LOCKDIR.stuck-alerted"; rm -rf "$GC_TRIGGER_LOCKDIR" "$GC_MAINT_LOCKDIR" "$GC_RELEASE_BACKUP_LOCKDIR"
+  rm -f "$GC_TRIGGER_STATE" "$GC_RELEASE_STATE" "$DOLT_GC_MAINT_LOG" "$GC_RUN_OUTCOME_STATE" "$T"/reads.* "$T"/notify.calls "$GC_MAINT_LOCKDIR.stuck-alerted" "$GC_TRIGGER_LOCKDIR.stuck-alerted" "$GC_MAINT_LOCKDIR.stuck-age-unknown" "$GC_TRIGGER_LOCKDIR.stuck-age-unknown"; rm -rf "$GC_TRIGGER_LOCKDIR" "$GC_MAINT_LOCKDIR" "$GC_RELEASE_BACKUP_LOCKDIR"
   mangle_streak remove; printf '53 1\n' > "$GC_SKIP_STREAK_STATE"
   GC_TRIGGER_ENABLED=1; GC_RELEASE_STAGING_ENABLED=1; GC_RELEASE_MIN_STREAK=6; GC_RELEASE_SLACK_MB=2048; GC_RELEASE_COOLDOWN_H=168
   GC_MIN_FREE_PCT=""; PRUNE_ENABLED=0; GC_MIN_FREE_ABS_MB=3072; THRESHOLD_G=1
@@ -268,6 +276,18 @@ GC_NOW_EPOCH=$((NOW+300)); poll
 [ "$KICKS" -eq 2 ] && [ "$(sget attempts)" = "2" ] && [ "$(sget next_allowed)" = "$((NOW+300+600))" ] && ok "backoff: at the boundary the next attempt starts, and the following backoff doubles to 600s" || bad "backoff boundary: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE")'"
 GC_NOW_EPOCH=$((NOW+300+599)); poll
 [ "$KICKS" -eq 2 ] && ok "backoff: 1s before the doubled window ends → still no run" || bad "backoff 1s early started a run (kicks=$KICKS)"
+# the poll's clamp (a backoff never reaches further ahead than its cap) reads the SAME operator knob: a cap of
+# 18446744073709551616 wraps to 0 under bash 3.2, which used to clamp every live backoff to "now" — i.e. erase it
+# and start a run (S3 proof and all) on the very next poll. An overlong cap is garbled → 7200, and a 900s backoff
+# stays a 900s backoff.
+for _cap in 18446744073709551616 9223372036854775808 99999999999999999999; do
+  reset_main; AVAIL=12486; GC_TRIGGER_BACKOFF_MAX_S="$_cap"
+  _trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "KICK release" 3 "$((NOW+900))" 0 0
+  poll
+  { [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] && [ "$(sget next_allowed)" = "$((NOW+900))" ]; } || { _cap_ok=0; echo "    (cap '$_cap': kicks=$KICKS dec='$(sdec)' next_allowed='$(sget next_allowed)' want $((NOW+900)))"; }
+done
+[ "${_cap_ok:-1}" = "1" ] && ok "backoff: an overlong cap knob (2^64, 2^63, 20 nines) does not wrap into 'no backoff' — a live 900s backoff still holds and is not rewritten" || bad "backoff overlong cap erased or clamped a live backoff (see lines above)"
+unset _cap _cap_ok
 
 # success clears the bookkeeping
 reset_main; AVAIL=12486; KICK_MODE="ok"
@@ -844,6 +864,18 @@ for _row in abc:3 08:8 0:3; do
     || bad "stuck note with knob '$_k': want 'over ${_want}h' + '(limit ${_want}h)' in: $(grep -h 'over \|limit' "$DOLT_GC_MAINT_LOG" | head -3)"
 done
 unset _row _k _want
+# ...and when the effective limit cannot be computed at all (a failed $(...) under fork pressure hands back blank)
+# the note falls back to 3h exactly as the alert does — it used to print "over h" while the alert said 3h
+_orig_lim="$(declare -f _dgm_stuck_limit_h)"
+for _stub in "_dgm_stuck_limit_h() { :; }" "_dgm_stuck_limit_h() { echo abc; }" "_dgm_stuck_limit_h() { echo 0; }"; do
+  eval "$_stub"
+  reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; poll
+  { grep -q "its holder has had the lock for over 3h — see the ALERT line above" "$DOLT_GC_MAINT_LOG" && [ "$(sdec)" = "WAIT maintenance-stuck" ] && [ "$(nnotify)" = "1" ]; } \
+    || { _stub_ok=0; echo "    (stub '$_stub': note='$(grep -o 'its holder has had the lock for over [^ ]*' "$DOLT_GC_MAINT_LOG" | head -1)' dec='$(sdec)' notify=$(nnotify))"; }
+done
+eval "$_orig_lim"; unset _orig_lim _stub
+[ "${_stub_ok:-1}" = "1" ] && ok "stuck: a blank / garbled / zero effective limit (a failed \$(...)) → the state note says 'over 3h', the same fallback the alert uses — never 'over h'" || bad "stuck note with an uncomputable limit (see lines above)"
+unset _stub_ok
 # a NEW holder (different pid) is a new incident; a dead holder is not "stuck" (its lock is reclaimable)
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; poll
 sleep 300 & _H2=$!
@@ -864,6 +896,64 @@ fi
 # a clock that ran BACKWARDS makes the age unknowable — never "0 seconds", never an alert
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW+3600))"; poll
 [ "$(nnotify)" = "0" ] && [ "$(sdec)" = "WAIT maintenance-running" ] && ok "stuck: a lock 'taken in the future' (clock skew) has an unknowable age → no alert" || bad "stuck skew: notify=$(nnotify) dec='$(sdec)'"
+# "once per holder" must survive a clock that steps behind the lock's stamp AFTER the alert (gate rounds 2 and 3, LOW):
+# the age-unknown WARN used to overwrite the alert's dedupe marker, so when the clock recovered the SAME holder
+# pushed a second time (pushes 1, 1, 2). The WARN keeps its own marker now.
+reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; poll
+GC_NOW_EPOCH=$((NOW-6*3600)); poll; GC_NOW_EPOCH=$((NOW-6*3600+300)); poll     # the clock is behind the stamp: the age is unknowable (and stays so)
+GC_NOW_EPOCH=$((NOW+300)); poll; GC_NOW_EPOCH=$((NOW+600)); poll               # ...and recovers
+[ "$(nnotify)" = "1" ] && [ "$(grep -c 'ALERT: the ' "$DOLT_GC_MAINT_LOG")" = "1" ] && [ "$(grep -c 'age cannot be determined' "$DOLT_GC_MAINT_LOG")" = "1" ] && ok "stuck: alert → clock steps behind the lock's stamp → clock recovers: ONE push and ONE alert in all, and the unknowable-age stretch is one WARN (a flapping clock does not re-alert the same holder)" || bad "stuck clock flap: notify=$(nnotify) alerts=$(grep -c 'ALERT: the ' "$DOLT_GC_MAINT_LOG") warns=$(grep -c 'age cannot be determined' "$DOLT_GC_MAINT_LOG")"
+
+# (3a) THE hang this bead was built for is a 2h-CYCLE run, and it must be reported whatever the skip streak says
+#      (gate round 4, ga-6sdbjq). `bd purge` has no timeout and runs only in the 2h cycle, so the hung holder is
+#      launchd's own instance of the job — and launchd runs one process per label (it does not start a second
+#      while the first runs), so the job's entry check does not get to report it. THIS poll (another label) is
+#      the reporter. Every case
+#      above ran on reset_main's chronic fixture ('53 1'), the one state in which the check used to be reached:
+#      with a healthy streak (the ~always case) the poll returned `WAIT streak-too-short` first, i.e. "did not
+#      look" was recorded as "looked, nothing there". So sweep the streak axis: no file, healthy, just under the
+#      minimum (6), at it, chronic, and a file the trigger cannot read.
+_sa_ok=1
+for _sk in absent "0 0" "1 0" "5 1" "6 1" "53 1" garbled; do
+  reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"
+  case "$_sk" in absent) rm -f "$GC_SKIP_STREAK_STATE" ;; garbled) printf 'not-a-streak\n' > "$GC_SKIP_STREAK_STATE" ;; *) printf '%s\n' "$_sk" > "$GC_SKIP_STREAK_STATE" ;; esac
+  _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"
+  poll
+  { [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT maintenance-stuck" ] && [ "$(sget poll)" = "$NOW" ] && [ "$(nnotify)" = "1" ] \
+      && [ "$(grep -c 'ALERT: the dolt-gc-maintenance lock' "$DOLT_GC_MAINT_LOG")" = "1" ]; } \
+    || { _sa_ok=0; echo "    (streak '$_sk', 5h holder: kicks=$KICKS dec='$(sdec)' heartbeat='$(sget poll)' notify=$(nnotify) alerts=$(grep -c 'ALERT: the ' "$DOLT_GC_MAINT_LOG" 2>/dev/null))"; }
+  GC_NOW_EPOCH=$((NOW+300)); poll; GC_NOW_EPOCH=$((NOW+600)); poll
+  { [ "$(nnotify)" = "1" ] && [ "$(sdec)" = "WAIT maintenance-stuck" ] && [ "$(cat "$GC_MAINT_LOCKDIR/pid")" = "$_H" ] && kill -0 "$_H" 2>/dev/null; } \
+    || { _sa_ok=0; echo "    (streak '$_sk', two later polls: notify=$(nnotify) dec='$(sdec)' — want one push total, still stuck, holder untouched)"; }
+done
+[ "$_sa_ok" = "1" ] && ok "stuck: a 5h-old holder is reported (decision WAIT maintenance-stuck, heartbeat written, ONE alert + ONE push, deduped over later polls, lock and holder untouched) at EVERY skip streak — no file, 0 0, 1 0, 5 1 (under the minimum), 6 1, 53 1, and an unreadable file" || bad "stuck: the report depends on the skip streak (see lines above)"
+unset _sa_ok _sk
+# One holder, two possible reporters: this poll, and the job's own entry point (which of them can reach a given
+# holder depends on how that holder got the lock — and on launchd's one-process-per-label behaviour, which the
+# header relies on and this selftest cannot measure). Both run the same _dgm_lock_stuck_check on the same lock, so
+# they share ONE dedupe marker: a hang that BOTH find is still one push. That is what keeps the fix correct
+# whichever of them turns out to be the one that sees a given hang.
+reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; poll
+_dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance"; _sa_rc=$?     # what the job's entry point does next
+[ "$_sa_rc" -eq 0 ] && [ "$(nnotify)" = "1" ] && [ "$(grep -c 'ALERT: the ' "$DOLT_GC_MAINT_LOG")" = "1" ] && ok "stuck: a hang found by this poll AND then by the job's entry-point check is still ONE push and ONE alert (they share the per-holder marker)" || bad "stuck two reporters: rc=$_sa_rc notify=$(nnotify) alerts=$(grep -c 'ALERT: the ' "$DOLT_GC_MAINT_LOG")"
+unset _sa_rc
+# the streak gate still says what it always said behind a run that is merely IN FLIGHT: a healthy streak →
+# streak-too-short (the 2h cycle owns healthy operation), nothing sent; the report is for HOURS, not for a run.
+reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-10799))"; poll
+[ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] && [ "$(nnotify)" = "0" ] && ok "stuck: a healthy streak behind a holder 1s under the limit → still WAIT streak-too-short, nothing sent (the report is for hours, not for a run in flight)" || bad "stuck healthy-streak young holder: kicks=$KICKS dec='$(sdec)' notify=$(nnotify)"
+# ...and the operator knob is honoured on the healthy path too (zero-padded "08" is 8h: a 9h holder alerts, a 7h one does not)
+reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_MAINT_LOCK_STUCK_H=08; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-9*3600))"; poll
+_sa_a="$(sdec)/$(nnotify)"
+reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_MAINT_LOCK_STUCK_H=08; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-7*3600))"; poll
+_sa_b="$(sdec)/$(nnotify)"
+[ "$_sa_a" = "WAIT maintenance-stuck/1" ] && [ "$_sa_b" = "WAIT streak-too-short/0" ] && ok "stuck: with a healthy streak the limit knob still applies, zero-padded included (08 = 8h: 9h alerts, 7h does not)" || bad "stuck healthy-streak knob: 9h='$_sa_a' 7h='$_sa_b'"
+unset _sa_a _sa_b; GC_MAINT_LOCK_STUCK_H=3
+# cost: with no holder the check must not fork anything. (A `ps` counted through a file, since the poll runs
+# in this shell but a counter set inside a command substitution would not reach it.)
+ps() { echo x >> "$T/reads.ps"; command ps "$@"; }
+reset_main; AVAIL=20000; printf '0 0\n' > "$GC_SKIP_STREAK_STATE"; poll
+[ "$(nreads ps)" = "0" ] && [ "$(sdec)" = "WAIT streak-too-short" ] && ok "stuck: (cost control) a healthy poll with NO holder forks no ps — the check costs a directory test" || bad "stuck cost: ps calls=$(nreads ps) dec='$(sdec)'"
+unset -f ps
 
 # (3b) A hung TRIGGERED run seen by a SECOND INVOCATION of the trigger. Under launchd this topology does not
 #      exist (a label never overlaps and the poll that started the run is blocked inside it), so these cases
@@ -887,9 +977,16 @@ reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; GC_TRIGGER_LOCK_RE="sleep"
 _hold "$GC_TRIGGER_LOCKDIR" "$_T" "$((NOW-600))"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-600))"    # a healthy run in flight (10 min)
 poll
 [ "$(nnotify)" = "0" ] && [ "$KICKS" -eq 0 ] && ok "second invocation: behind a healthy 10-minute run stays silent" || bad "second invocation healthy: notify=$(nnotify)"
-# the trigger's own kill switch is "this trigger only": while paused it does not sweep (the 2h job still alerts on its own lock)
+# A PAUSED trigger (GC_TRIGGER_ENABLED=0) reports nothing: it writes DISABLED and returns — no sweep, no poll, no
+# alert. That is a decision, not an accident, and it has a cost worth stating: the holder here is a 2h-CYCLE run
+# (launchd's own instance of the job, which is what a `bd purge` hang looks like), and the job's entry point
+# does not get to report that one (launchd runs one process per label, so no second job instance starts while
+# it hangs) — so while the trigger is paused nothing reports it. (The job's entry point does still report a hung TRIGGERED run's child, and a manual
+# second run: dolt-gc-maintenance.selftest.sh, "entry/stuck".) The header of dolt-gc-release-trigger.sh says so.
 reset_main; AVAIL=20000; GC_MAINT_LOCK_RE="sleep"; _hold "$GC_MAINT_LOCKDIR" "$_H" "$((NOW-5*3600))"; GC_TRIGGER_ENABLED=0; poll
-[ "$(nnotify)" = "0" ] && [ "$(sdec)" = "DISABLED" ] && ok "second invocation: a paused trigger (GC_TRIGGER_ENABLED=0) does not sweep or alert" || bad "second invocation paused: notify=$(nnotify) dec='$(sdec)'"
+[ "$(nnotify)" = "0" ] && [ "$(sdec)" = "DISABLED" ] && ok "paused: a trigger with GC_TRIGGER_ENABLED=0 does not poll, sweep or alert — even behind a 5h holder (a hung 2h-cycle run has no reporter while it is paused; documented in the header)" || bad "paused: notify=$(nnotify) dec='$(sdec)'"
+GC_NOW_EPOCH=$((NOW+300)); GC_TRIGGER_ENABLED=1; poll
+[ "$(nnotify)" = "1" ] && [ "$(sdec)" = "WAIT maintenance-stuck" ] && ok "paused: ...and once it is unpaused the same 5h holder is reported at once (pausing delayed the report, it did not lose it)" || bad "unpaused: notify=$(nnotify) dec='$(sdec)'"
 kill "$_H" "$_T" 2>/dev/null; wait "$_H" "$_T" 2>/dev/null; unset _H _T _H2 _DEAD
 
 # (4) Liveness of the poll, for the prod-test. The state keeps the epoch of the poll that STARTED the job

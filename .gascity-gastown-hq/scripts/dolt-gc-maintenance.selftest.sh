@@ -267,6 +267,22 @@ if [ -n "$CT" ]; then
   _pad "cooldown hours 0024 (=24): exactly 86400s is enough"                            yes _t _gc_release_cooldown_ok "$CT/s.state" 0024 $((1000000 + 86400))
   _pad "cooldown hours 08 (=8): exactly 28800s is enough"                               yes _t _gc_release_cooldown_ok "$CT/s.state" 08   $((1000000 + 28800))
   _pad "cooldown hours 08 (=8): 28799s is not"                                          no  _t _gc_release_cooldown_ok "$CT/s.state" 08   $((1000000 + 28799))
+  # the STATE's own number (epoch of the last release) meets $(( )) too. The job writes it, so a padded one is a hand
+  # edit — but "digits-only, then arithmetic" is the class of gate round 1 (gate round 3, INFO: not in the list of
+  # what was covered). "08" aborted the shell; "010" silently meant 8. And a value that WRAPS (2^64 reads as 0 =
+  # "released in 1970") would say the cooldown is long over — the unsafe direction for the guard against releasing twice.
+  printf '%s\n' 0001000000 > "$CT/p1.state"; printf '%s\n' 08 > "$CT/p2.state"; printf '%s\n' 010 > "$CT/p3.state"
+  printf '%s\n' 18446744073709551616 > "$CT/w1.state"; printf '%s\n' 99999999999999999999 > "$CT/w2.state"
+  _pad "cooldown state 0001000000 (=1000000): exactly the cooldown later is ok"         yes _t _gc_release_cooldown_ok "$CT/p1.state" 168 $((1000000 + 168*3600))
+  _pad "cooldown state 0001000000 (=1000000): 1s early is not"                          no  _t _gc_release_cooldown_ok "$CT/p1.state" 168 $((1000000 + 168*3600 - 1))
+  _pad "cooldown state 08 (=8): exactly 1h later is ok (octal aborts)"                  yes _t _gc_release_cooldown_ok "$CT/p2.state" 1 $((8 + 3600))
+  _pad "cooldown state 010 (=10): 1h after 8 is NOT enough (octal 8 would say ok)"      no  _t _gc_release_cooldown_ok "$CT/p3.state" 1 $((8 + 3600))
+  _pad "cooldown state 2^64 (wraps to 0 = 'released in 1970'): not ok, fail closed"     no  _t _gc_release_cooldown_ok "$CT/w1.state" 168 9999999999
+  _pad "cooldown state 20 nines (wraps to 7.7e18): not ok, fail closed"                 no  _t _gc_release_cooldown_ok "$CT/w2.state" 168 9999999999
+  # ...and the cooldown's own HOURS: 2^64 hours wraps to 0 hours = "no cooldown" — the same wrong way round
+  _pad "cooldown hours 2^64 (wraps to 0 = 'no cooldown'): not ok, fail closed"          no  _t _gc_release_cooldown_ok "$CT/s.state" 18446744073709551616 9999999999
+  _pad "cooldown hours 000000024 (9 digits, =24): exactly 86400s is enough (control)"   yes _t _gc_release_cooldown_ok "$CT/s.state" 000000024 $((1000000 + 86400))
+  _pad "cooldown hours 000000024 (9 digits, =24): 86399s is not (control)"              no  _t _gc_release_cooldown_ok "$CT/s.state" 000000024 $((1000000 + 86399))
   unset -f _pad _t
 fi
 
@@ -685,7 +701,7 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   _dolt_gc_notify() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$SKN"; }
   skn() { if [ -f "$SKN" ]; then wc -l < "$SKN" | tr -d '[:space:]'; else echo 0; fi; }
   SKL="$SK/l.lock.d"; SKNOW=2000001600
-  sk_reset() { rm -f "$LOG" "$SKN" "$SKL/pid" "$SKL.stuck-alerted"; rmdir "$SKL" 2>/dev/null; rmdir "$SKL.stuck-alerted" 2>/dev/null; GC_NOW_EPOCH=$SKNOW; GC_MAINT_LOCK_STUCK_H=3; }
+  sk_reset() { rm -f "$LOG" "$SKN" "$SKL/pid" "$SKL.stuck-alerted" "$SKL.stuck-age-unknown"; rmdir "$SKL" 2>/dev/null; rmdir "$SKL.stuck-alerted" 2>/dev/null; GC_NOW_EPOCH=$SKNOW; GC_MAINT_LOCK_STUCK_H=3; }
   sleep 300 & SKH=$!
   sk_hold() { mkdir -p "$SKL"; printf '%s\n' "${2:-$SKH}" > "$SKL/pid"; _mtime_set "$SKL/pid" "$(( SKNOW - $1 ))"; }   # sk_hold <age_seconds> [pid]
 
@@ -697,6 +713,9 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && ok "stuck: a live holder that took the lock 5h ago (limit 3h) → stuck (rc 0), ONE notification" || bad "stuck 5h: rc=$rc notify=$(skn)"
   grep -q "ALERT: the test-label lock $SKL has been held by LIVE pid $SKH for 5h0m (limit 3h)" "$LOG" && ok "stuck: the ALERT names the label, the lock, the pid, the age (5h0m) and the limit" || bad "stuck alert text: '$(cat "$LOG")'"
   grep -q 'NOT reclaimed' "$LOG" && ok "stuck: ...and says outright that the lock is NOT reclaimed" || bad "stuck: no 'NOT reclaimed' in the alert"
+  # the log line must not claim more than the code did (gate round 3, LOW): the marker is written BEFORE the push and
+  # _dolt_gc_notify swallows a failed push, so "Notified once" reported a delivery nobody knew had happened
+  ! grep -q 'Notified' "$LOG" && grep -q 'at most once' "$LOG" && ok "stuck: ...and does not claim delivery — the marker is written before the push and a failed push is not retried, so the line says 'at most once', not 'Notified'" || bad "stuck alert wording: '$(grep ALERT "$LOG")'"
   case "$(cat "$SKN")" in "Dolt GC|4|"*"o run pid $SKH segura o lock há 5h0m (limite 3h)"*) ok "stuck: the push is priority 4 and carries the pid and age" ;; *) bad "stuck notify text: '$(cat "$SKN")'" ;; esac
   [ "$(cat "$SKL.stuck-alerted")" = "$SKH:$(stat -f %m "$SKL/pid" 2>/dev/null || stat -c %Y "$SKL/pid")" ] && ok "stuck: the dedupe marker holds '<pid>:<pid-file mtime>'" || bad "stuck marker: '$(cat "$SKL.stuck-alerted" 2>/dev/null)'"
   _dgm_lock_stuck_check "$SKL" sleep "test-label"; rc=$?; _dgm_lock_stuck_check "$SKL" sleep "test-label"
@@ -775,6 +794,17 @@ if [ -z "$SK" ] || [ ! -d "$SK" ]; then bad "stuck: mktemp failed — stuck-hold
   [ "$(grep -c 'age cannot be determined' "$LOG")" = "1" ] && ok "stuck: ...once per holder, not on every call" || bad "stuck skew WARN repeats: $(grep -c 'age cannot be determined' "$LOG")"
   GC_NOW_EPOCH=$((SKNOW + 5*3600 + 3600)); _dgm_lock_stuck_check "$SKL" sleep x; rc=$?; GC_NOW_EPOCH=$SKNOW
   [ "$rc" -eq 0 ] && [ "$(skn)" = "1" ] && ok "stuck: ...and once the age IS readable and over the limit that holder still alerts (the WARN did not consume the alert's dedupe)" || bad "stuck: the WARN swallowed the later alert rc=$rc notify=$(skn)"
+  # ...and the OTHER order (gate rounds 2 and 3, LOW): the alert goes out FIRST, then the clock steps behind the
+  # lock's stamp, then it recovers. The unknowable-age WARN used to overwrite the alert's dedupe marker, so the
+  # recovered clock alerted the SAME holder a second time (pushes 1, 1, 2). The WARN keeps its own marker file.
+  sk_reset; sk_hold $((5*3600)); _dgm_lock_stuck_check "$SKL" sleep x                       # alert #1
+  GC_NOW_EPOCH=$((SKNOW - 6*3600)); _dgm_lock_stuck_check "$SKL" sleep x; rc_skew=$?         # clock behind the stamp: unknowable
+  _dgm_lock_stuck_check "$SKL" sleep x                                                      # ...still behind: the same stretch
+  GC_NOW_EPOCH=$SKNOW; _dgm_lock_stuck_check "$SKL" sleep x; rc_back=$?                     # ...and recovered: the same holder
+  [ "$rc_skew" -eq 1 ] && [ "$rc_back" -eq 0 ] && ok "stuck: alert → clock behind the stamp (unknowable, rc 1) → clock recovers (stuck again, rc 0)" || bad "stuck clock flap rcs: skew=$rc_skew back=$rc_back"
+  [ "$(skn)" = "1" ] && [ "$(grep -c 'ALERT: the ' "$LOG")" = "1" ] && ok "stuck: ...and the same holder was reported ONCE in all — a flapping clock does not push twice" || bad "stuck clock flap re-alerted: notify=$(skn) alerts=$(grep -c 'ALERT: the ' "$LOG")"
+  [ "$(grep -c 'age cannot be determined' "$LOG")" = "1" ] && [ "$(cat "$SKL.stuck-alerted")" = "$SKH:$(stat -f %m "$SKL/pid" 2>/dev/null || stat -c %Y "$SKL/pid")" ] && ok "stuck: ...the unknowable stretch is ONE WARN, and the alert's dedupe marker still holds '<pid>:<mtime>' (the WARN has its own file)" || bad "stuck clock flap marker='$(cat "$SKL.stuck-alerted" 2>/dev/null)' warns=$(grep -c 'age cannot be determined' "$LOG")"
+  GC_NOW_EPOCH=$SKNOW; unset rc_skew rc_back
   # dedupe is per HOLDER: a new pid, or the same pid taking the lock again later, is a new incident
   sk_reset; sk_hold $((5*3600)); _dgm_lock_stuck_check "$SKL" sleep x
   sleep 300 & SKH2=$!; sk_hold $((6*3600)) "$SKH2"; _dgm_lock_stuck_check "$SKL" sleep x
@@ -818,7 +848,7 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   printf '#!/bin/sh\nprintf "10\\t%%s\\n" "$2"\n' > "$EP/bin/du"
   chmod +x "$EP/bin/bd" "$EP/bin/dolt" "$EP/bin/notify" "$EP/bin/du"
   printf 'DOLTDIR="%s"\nNOTIFY="%s"\n' "$EP/hq" "$EP/bin/notify" > "$EP/conf.env"
-  entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log" "$EP/run.lock.d.stuck-alerted"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
+  entry_reset() { rm -f "$EP/bd.calls" "$EP/dolt.calls" "$EP/notify.calls" "$EP/job.log" "$EP/run.lock.d.stuck-alerted" "$EP/run.lock.d.stuck-age-unknown"; rm -f "$EP/run.lock.d/pid" 2>/dev/null; rmdir "$EP/run.lock.d" 2>/dev/null; printf '62 1\n' > "$EP/streak.state"; }
   # run the job exactly as launchd does (script, not library) but with DOLT_GC_MAINT_LIB forced off — this
   # selftest exports it as 1 for its own library loads, which would make the child do nothing at all.
   run_entry() { env PATH="$EP/bin:$PATH" DOLT_GC_MAINT_LIB=0 DOLT_MAINT_CONF="$EP/conf.env" DOLT_GC_MAINT_LOG="$EP/job.log" \
@@ -842,9 +872,15 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   [ "$(cat "$EP/run.lock.d/pid" 2>/dev/null)" = "$HOLDER" ] && ok "entry: the live holder's lock is intact after the refused run (not stolen, not removed by the loser's exit trap)" || bad "entry held: lock pid now '$(cat "$EP/run.lock.d/pid" 2>/dev/null)' (holder $HOLDER)"
   kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
-  # (b2) ga-11vdhe — THE acceptance scenario: a live holder whose lock is HOURS old. The second run still
+  # (b2) ga-11vdhe — a live holder whose lock is HOURS old, met by a SECOND RUN of the job. The second run still
   #      stands down without stealing anything (unchanged) — but now says how old the holder is, pushes ONE
   #      notification, and the NEXT cycle does not repeat it. Real script, real notify stub, real pids.
+  #      WHICH hang this covers: a holder that is NOT the 2h launchd instance — the child of a TRIGGERED run, or a
+  #      run started by hand. It does NOT cover the hang the bead was built for, a 2h-CYCLE run stuck in `bd purge`:
+  #      there the holder IS launchd's instance of this label, and launchd runs one process per label (no second
+  #      instance starts while it hangs), so this entry path is not reached. That hang is reported by the
+  #      trigger's poll, at every skip streak
+  #      (dolt-gc-release-trigger.selftest.sh, section 3a).
   entry_reset; sleep 300 & HOLDER=$!
   mkdir "$EP/run.lock.d"; printf '%s\n' "$HOLDER" > "$EP/run.lock.d/pid"; _mtime_set "$EP/run.lock.d/pid" "$(( $(date +%s) - 5*3600 ))"
   run_entry GC_MAINT_LOCK_RE=sleep; rc=$?

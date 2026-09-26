@@ -49,7 +49,8 @@
 #     exit status says nothing.
 #   - It does not run when the state is not chronic (streak < GC_RELEASE_MIN_STREAK): the 2h cycle
 #     owns healthy operation. A minimum below 1 is refused as unusable (with 0 every healthy poll
-#     would count as chronic).
+#     would count as chronic). (It does still LOOK, at any streak, for a hung maintenance holder — read-only;
+#     see "A HUNG HOLDER" below.)
 #
 # FAIL-CLOSED: an unreadable number → no run ("WAIT unmeasurable-input"); an unreadable clock → no
 # run; a decision that is not exactly "KICK direct" / "KICK release" → no run ("WAIT unknown-decision");
@@ -68,18 +69,34 @@
 # the 2h job and every poll — stand down, silently, for as long as it hangs. A live pid is never stolen
 # from (it may be mid-dolt_gc), but once its lock is older than GC_MAINT_LOCK_STUCK_H (default 3h) this
 # poll says so: decision `WAIT maintenance-stuck` (not the reassuring `maintenance-running`), one ALERT
-# line and ONE notification per holder (dedupe marker beside the lock; if it cannot be written there is
-# no push, so a stuck holder can never mean 288 pushes/day).
+# line and at most ONE notification per holder (dedupe marker beside the lock; if it cannot be written there
+# is no push, so a stuck holder can never mean 288 pushes/day; a push that fails is not retried). The check is
+# the FIRST thing a poll does once its state is loaded (_trg_poll, step 0) — ahead of the skip-streak gate, so
+# what it reports does not depend on the streak: a healthy streak is the ~always case, and a run hung in
+# `bd purge` never reaches the step that writes the streak, so the streak stays wherever the hang found it.
 #
-# WHO REPORTS A HUNG TRIGGERED RUN, AND WHEN — in production it is the 2h JOB, not a poll. The poll that
-# starts a run blocks in it (_trg_run_maintenance), launchd never overlaps a label, and this script is
-# started by nothing but that plist — so while a triggered run hangs there is NO later poll to notice:
-# the poll that could is the one stuck inside the run. The report comes from the job's own entry point
-# (dolt-gc-maintenance.sh, "another run holds ..."): the run's child holds the job's lock, the next 2h
-# cycle finds it, and once that holder is GC_MAINT_LOCK_STUCK_H old it alerts. That is at the first 2h
-# tick after the holder turns 3h old — 3-5h into the hang at the nominal cadence, longer when the cycle
-# runs late (it has run every 2-3.5h), and never "within a poll". Tested through the real job script
-# (dolt-gc-maintenance.selftest.sh, the "entry/stuck" cases).
+# WHO REPORTS A HUNG RUN, AND WHEN — it depends on WHICH run hung; the cases have different reporters.
+#   - A hung 2h-CYCLE run (the `bd purge` hang above: purge runs only in the 2h cycle). The holder is
+#     launchd's own instance of the job's label, and launchd runs one process per label — it does not start a
+#     second instance while the first is still running — so the job's entry point does not get to see it.
+#     THIS poll — another label, every 5 min — is the reporter, and it reports within one poll of the holder
+#     turning GC_MAINT_LOCK_STUCK_H old, at any skip streak (dolt-gc-release-trigger.selftest.sh, section 3a).
+#     (That launchd behaviour is the documented model and what this file's own locking already assumes; it was
+#     not re-measured. The alert does not depend on it: both reporters run the same check on the same lock and
+#     share one dedupe marker, so a hang that both of them find is still one push.)
+#   - A hung TRIGGERED run. The poll that starts a run blocks in it (_trg_run_maintenance), launchd never
+#     overlaps a label, and this script is started by nothing but that plist — so there is NO later poll to
+#     notice: the poll that could is the one stuck inside the run. The report comes from the job's own
+#     entry point (dolt-gc-maintenance.sh, "another run holds ..."): the run's child holds the job's lock,
+#     the next 2h cycle finds it, and once that holder is GC_MAINT_LOCK_STUCK_H old it alerts. That is at
+#     the first 2h tick after the holder turns 3h old — 3-5h into the hang at the nominal cadence, longer
+#     when the cycle runs late (it has run every 2-3.5h), and never "within a poll". Tested through the
+#     real job script (dolt-gc-maintenance.selftest.sh, the "entry/stuck" cases).
+#   - A PAUSED trigger (GC_TRIGGER_ENABLED=0) reports NOTHING: it writes `DISABLED` and returns, by design
+#     (the selftest asserts it). So while it is paused a hung 2h-cycle run has no reporter at all — the
+#     watchdog is this poll, and pausing the poll pauses it. (A hung triggered run is still reported by the
+#     job's entry point, as above.) If a 2h cycle has gone quiet while the trigger is paused, look at the
+#     job's lock by hand: `ls -ld` / `ps -p $(cat <lockdir>/pid)`.
 # _trg_stuck_sweep covers only what can really reach it: a SECOND invocation of this script while a run is
 # in flight — an operator running it by hand to see why the release is quiet. That one reports at once.
 #
@@ -105,9 +122,13 @@
 #
 # POLL COST (ga-y0g5x doctrine: the guard must not become the load it watches). Measured
 # 2026-09-26 on the live tree at load ~30-55 on 10 cores, whole script under /bin/bash 3.2:
-#   healthy state (streak 0 — the ~always case):  ≈ 0.07 s CPU (the pre-ga-11vdhe poll: ≈ 0.085 s — the
+#   healthy state (streak 0 — the ~always case):  ≈ 0.08 s CPU (the pre-ga-11vdhe poll: ≈ 0.085 s — the
 #       state record is now read with builtins), 0.2–1.3 s wall (fork latency under load; most of it
-#       is loading the job's library, ~0.35 s)
+#       is loading the job's library, ~0.35 s). The hung-holder check (_trg_poll step 0) is a directory test
+#       when no run holds the lock: a 2 x 25-run A/B of the real script in a sandbox at load ~50 gave
+#       0.074-0.078 s before it and 0.080-0.084 s after — about what its comments cost to parse. While a run
+#       DOES hold the lock (only while the 2h job or a triggered run is live — a minority of polls) it also
+#       forks the holder check (head/tr/ps/grep + stat): 0.090-0.095 s → 0.108-0.122 s on that poll.
 #   chronic state: + one df and two du (~35 ms each), and — only when a release run would start on
 #       THIS poll (past the backoff check, which is arithmetic and comes first) — the `ps -ax` busy
 #       check (~1.2 s wall). A poll inside its backoff window, or one on the direct path, never forks it.
@@ -126,7 +147,8 @@
 # dolt-gc-maintenance.log with the numbers.
 #
 # KNOBS (operator file .gc/config/dolt-maintenance.env wins over env, as for the job):
-#   GC_TRIGGER_ENABLED=0            kill switch (this trigger only; the 2h job is unaffected)
+#   GC_TRIGGER_ENABLED=0            kill switch (this trigger only; the 2h job is unaffected) — it also silences
+#                                   the hung-holder report for a hung 2h-cycle run (see "WHO REPORTS A HUNG RUN")
 #   GC_TRIGGER_BACKOFF_BASE_S=300   first retry delay after a run that left the skip streak standing
 #   GC_TRIGGER_BACKOFF_MAX_S=7200   cap
 #   GC_MAINT_LOCK_STUCK_H=3         a live lock holder older than this is reported as hung (job's knob, shared)
@@ -246,6 +268,11 @@ _trg_backoff_s() {
   local n="$1" s="$GC_TRIGGER_BACKOFF_BASE_S" max="$GC_TRIGGER_BACKOFF_MAX_S" i=1
   case "$max" in ''|*[!0-9]*) max=7200 ;; esac
   case "$s" in ''|*[!0-9]*) s=300 ;; esac
+  # More than 9 digits is garbled too (the same rule as _dgm_stuck_limit_h): $(( )) wraps at 64 bits — under
+  # bash 3.2 2^64 reads as 0 and 2^63 as negative — and a base or cap of 0 or below is NO backoff, i.e. a real
+  # run on every poll. Length first, so nothing longer than that ever reaches the arithmetic.
+  [ "${#max}" -le 9 ] || max=7200
+  [ "${#s}" -le 9 ] || s=300
   # Operator knobs: "0300" is 300, not octal 192, and "0900" must not abort (see _gc_headroom_ok). Normalized
   # BEFORE the early return below, which echoes $max into the caller's $(( now + backoff )).
   max=$(( 10#$max )); s=$(( 10#$s ))
@@ -435,7 +462,7 @@ _trg_record() {
 
 # _trg_poll — one evaluation. Always returns 0 (a poll that decides nothing is a normal outcome).
 _trg_poll() {
-  local now streak sk max_s size_mb avail_mb staging_mb target pct parts rel_on cool_ok decision kind att nxt busy backoff end run_rc rc_note token oc ocls why
+  local now streak sk max_s lim size_mb avail_mb staging_mb target pct parts rel_on cool_ok decision kind att nxt busy backoff end run_rc rc_note token oc ocls why
   _TRG_STREAK=""; _TRG_AVAIL=""; _TRG_SIZE=""; _TRG_STAGING=""; _TRG_REQUIRED=""; _TRG_NOTE=""
   _TRG_ATT=0; _TRG_NEXT=0; _TRG_DATT=0; _TRG_DNEXT=0
   now="$(_gc_now_epoch)"
@@ -458,9 +485,28 @@ _trg_poll() {
   # A backoff never reaches further ahead than its own cap: one written under a clock that ran fast
   # (or by a hand edit) must not hold the trigger inert for days. Both kinds.
   max_s="$GC_TRIGGER_BACKOFF_MAX_S"; case "$max_s" in ''|*[!0-9]*) max_s=7200 ;; esac
+  [ "${#max_s}" -le 9 ] || max_s=7200   # 10+ digits wrap in $(( )) (2^64 reads as 0 = every backoff clamped away): garbled → the default, as in _trg_backoff_s
   max_s=$(( 10#$max_s ))   # an operator knob: "08" must not abort the poll, "0300" is 300 (see _gc_headroom_ok)
   [ "$_TRG_NEXT" -gt $(( now + max_s )) ] && _TRG_NEXT=$(( now + max_s ))
   [ "$_TRG_DNEXT" -gt $(( now + max_s )) ] && _TRG_DNEXT=$(( now + max_s ))
+
+  # 0) a HUNG maintenance holder is reported first, before anything that can return early on unrelated grounds
+  #    (ga-11vdhe, gate round 4). The hang this exists for is a 2h-cycle run stuck in `bd purge` (no timeout):
+  #    its holder is launchd's own instance of the JOB, and launchd runs one process per label, so the job's
+  #    entry check does not get to say so — this poll, another label, is the reporter (see the header). It
+  #    used to sit behind the streak gate below, and a healthy streak (the ~always case) returned
+  #    `WAIT streak-too-short` first: "did not look" recorded as "looked, nothing there". A run hung in
+  #    `bd purge` never reaches the step that writes the streak, so whatever the streak was when the hang
+  #    began — healthy, usually — is what every later poll keeps seeing. Read-only and deduped per holder
+  #    (see _dgm_lock_stuck_check);
+  #    it never touches the lock. The `[ -d ]` keeps the always-case cost at a directory test — no holder,
+  #    no fork. A young holder (a run merely in flight) falls through: what the gates below say about it is
+  #    unchanged.
+  if [ -d "$GC_MAINT_LOCKDIR" ] && _dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance"; then
+    lim="$(_dgm_stuck_limit_h)"; case "$lim" in ''|*[!0-9]*|0) lim=3 ;; esac   # blank = a failed $(...) under fork pressure: the alert's own fallback
+    _TRG_NOTE="its holder has had the lock for over ${lim}h — see the ALERT line above"
+    _trg_record "$now" "WAIT maintenance-stuck"; return 0
+  fi
 
   # 1) cheapest first: not chronic → the 2h cycle owns this; no disk read at all. The streak is read
   #    strictly (see _trg_streak_read): "no streak" and "cleared" are KNOWN states (streak 0), a file
@@ -481,14 +527,9 @@ _trg_poll() {
   fi
   # (an unusable minimum — 0, blank, non-numeric — falls through: _gc_trigger_decision refuses it below)
 
-  # 2) a maintenance run in flight owns the job (and the staging) right now. One that has held the lock
-  #    for hours is not "in flight", it is hung (ga-11vdhe): say so — in the state file too, and via the
-  #    once-per-holder alert. It is never stolen from.
+  # 2) a maintenance run in flight owns the job (and the staging) right now. (One that has held the lock for
+  #    hours is not "in flight", it is hung — step 0 above has already said so and returned.)
   if _dgm_lock_held "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE"; then
-    if _dgm_lock_stuck_check "$GC_MAINT_LOCKDIR" "$GC_MAINT_LOCK_RE" "dolt-gc-maintenance"; then
-      _TRG_NOTE="its holder has had the lock for over $(_dgm_stuck_limit_h)h — see the ALERT line above"
-      _trg_record "$now" "WAIT maintenance-stuck"; return 0
-    fi
     _trg_record "$now" "WAIT maintenance-running"; return 0
   fi
 

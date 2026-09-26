@@ -281,9 +281,21 @@ _avail_mb() {
 # and "0250", and in $(( )) a leading 0 means OCTAL: "08"/"09" abort the shell ("value too great for base";
 # under /bin/bash 3.2 the enclosing command is discarded), and "0250" is silently 168 — for this gate
 # that would quietly lower the free space it demands. (`[ -ge ]` reads decimal and needs no help.)
-# Measured numbers (du, df, the clock) never carry a leading zero and are left alone. NOT covered:
-# PRUNE_KEEP_DAYS and PRUNE_BACKUP_MAX_AGE_H (_prune_plan, _backup_fresh) reach $(( )) with no digits-only
-# check at all — a different fault, in a path that is staged off (PRUNE_ENABLED=0).
+# Measured numbers (du, df, the clock) never carry a leading zero and are left alone.
+#
+# LENGTH is the other half: $(( )) WRAPS at 64 bits (bash 3.2: 2^64 reads as 0, 2^63 as negative), so a number
+# of 19+ digits is not a number. Where a wrapped value goes the UNSAFE way it is refused before it gets there —
+# the stuck-holder limit and the trigger's backoff knobs (garbled → their default, never "no alert" / "no
+# backoff") and the release cooldown, both its hours and the state file's epoch (fail closed: cooldown not over).
+# NOT covered, on purpose and named here so nobody reads this as a sweep of everything:
+#   - the gate's own pct / floor / slack (_gc_headroom_ok, _gc_floor_ok, _gc_required_parts,
+#     _gc_release_decision): a 19+ digit value wraps and WEAKENS the gate. It predates ga-11vdhe (the operand
+#     went into $(( )) before the 10# too) and needs a bound per knob — a percentage is not a megabyte count —
+#     which is a decision about the gate, not a guard to bolt on here.
+#   - PRUNE_KEEP_DAYS and PRUNE_BACKUP_MAX_AGE_H (_prune_plan, _backup_fresh) reach $(( )) with no digits-only
+#     check at all — a different fault, in a path that is staged off (PRUNE_ENABLED=0).
+#   - _skip_streak_next: its count comes from the skip-streak file the job itself writes (never padded); a
+#     hand-written "08 0" aborts the job. (The trigger's reader is strict and treats such a file as unreadable.)
 _gc_headroom_ok() {
   local avail="$1" size="$2" pct="$3"
   case "$avail" in ''|*[!0-9]*) return 1 ;; esac
@@ -627,7 +639,13 @@ _gc_release_cooldown_ok() {
   [ -e "$f" ] || return 0
   last="$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')"
   case "$last" in ''|*[!0-9]*) return 1 ;; esac
-  [ $(( now - last )) -ge $(( 10#$hrs * 3600 )) ]
+  # This is the guard against releasing the staging twice, so it fails CLOSED on a number it cannot trust — and
+  # $(( )) is not to be trusted with one too long to fit: it wraps at 64 bits (bash 3.2: 2^64 reads as 0), so a
+  # state epoch of 2^64 would read as "released in 1970" and a cooldown of 2^64 hours as "0 hours" — both "the
+  # cooldown is over". 10# because the state number may carry a leading zero (a hand edit; in $(( )) "08" aborts
+  # and "010" is 8). An epoch has 10 digits: 18 is the most that cannot wrap.
+  [ "${#last}" -le 18 ] && [ "${#hrs}" -le 9 ] || return 1
+  [ $(( now - 10#$last )) -ge $(( 10#$hrs * 3600 )) ]
 }
 
 # _gc_release_writer_active — 0 iff a process that writes the staging is running or we cannot
@@ -871,8 +889,12 @@ _dgm_fmt_age() {
 # repeat on every poll (288/day from the trigger). A missing alert is logged (WARN), never silent — but
 # unlike the alert it can recur every call; it needs the state directory to have become unwritable while a
 # holder is alive in that very directory, which is not a shape worth more machinery.
+# That makes the push AT MOST once, not "exactly once": the marker says "we tried", and _dolt_gc_notify
+# swallows a failed push, so a push that never left is not retried for that holder — the ALERT log line is the
+# durable record, and its text says so. The "age cannot be determined" WARN dedupes through a SECOND marker,
+# "<lockdir>.stuck-age-unknown" (same "<pid>:<mtime>" key), so it can never overwrite the alert's.
 _dgm_lock_stuck_check() {
-  local d="$1" re="$2" label="$3" scope="${4:-maintenance}" pid now age limit key marker mtime blocks_en blocks_pt
+  local d="$1" re="$2" label="$3" scope="${4:-maintenance}" pid now age limit key marker wmarker mtime blocks_en blocks_pt
   case "$scope" in
     trigger) blocks_en="every poll of the release trigger stands down while it holds it (the 2h maintenance job is NOT affected)"
              blocks_pt="o gatilho de 5 min do dolt_gc está parado até ele terminar (a manutenção de 2h segue normal)" ;;
@@ -889,10 +911,12 @@ _dgm_lock_stuck_check() {
   case "$age" in ''|*[!0-9]*)
     # A live holder whose age cannot be read (the clock is behind the lock's own timestamp, or the stamp
     # is unreadable) is NOT "young": it is "don't know". Not stuck — no push on a guess — but not silent
-    # either: one WARN per holder (same marker, its own key, so a later readable age still alerts).
-    key="${pid}:${mtime}:age-unknown"
-    if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
-      printf '%s\n' "$key" > "$marker" 2>/dev/null
+    # either: one WARN per holder. The WARN has its OWN marker file, not the alert's: sharing one let the WARN
+    # overwrite "alerted", and a clock that then recovered alerted the SAME holder a second time (gate rounds
+    # 2 and 3). With separate files a later readable age still alerts if it never did, and never repeats if it did.
+    wmarker="${d}.stuck-age-unknown"; key="${pid}:${mtime}"
+    if [ "$(head -1 "$wmarker" 2>/dev/null)" != "$key" ]; then
+      printf '%s\n' "$key" > "$wmarker" 2>/dev/null
       log "WARN: the ${label} lock $d is held by LIVE pid ${pid} but its age cannot be determined (clock ${now:-<blank>} vs lock stamp ${mtime:-<unreadable>}) — cannot tell whether it is stuck; no alert on a guess"
     fi
     return 1 ;;
@@ -905,7 +929,7 @@ _dgm_lock_stuck_check() {
   key="${pid}:${mtime}"
   if [ "$(head -1 "$marker" 2>/dev/null)" != "$key" ]; then
     if printf '%s\n' "$key" > "$marker" 2>/dev/null; then
-      log "ALERT: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) — ${blocks_en}. The lock is NOT reclaimed (a live pid is never stolen from). Notified once for this holder. Inspect: ps -p ${pid} -o etime=,command="
+      log "ALERT: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) — ${blocks_en}. The lock is NOT reclaimed (a live pid is never stolen from). One push is sent for this holder, at most once (the dedupe marker is written before the push and a failed push is not retried — this line is the record). Inspect: ps -p ${pid} -o etime=,command="
       _dolt_gc_notify "Dolt GC" 4 "🚨 ${label}: o run pid ${pid} segura o lock há $(_dgm_fmt_age "$age") (limite ${limit}h) — ${blocks_pt}. NÃO foi morto. Ver: ps -p ${pid} -o etime=,command="
     else
       log "WARN: the ${label} lock $d has been held by LIVE pid ${pid} for $(_dgm_fmt_age "$age") (limit ${limit}h) but the alert marker $marker cannot be written — NOT notifying (an alert that cannot be deduped would repeat on every poll)"
