@@ -135,8 +135,13 @@ if [[ "${RUN_FULL_SELFTEST:-0}" == "1" ]]; then
 fi
 
 # ── informational: is the LIVE job this file, and has it started photographing? ─
-if launchctl list 2>/dev/null | grep -q "$LABEL"; then
-    if launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -qF "$GUARD"; then
+# Captured, not piped into grep -q (gate ga-h2gdd2): `launchctl list` is ~33KB,
+# grep -q exits on the first match, launchctl takes SIGPIPE and pipefail turns a
+# MATCH into "not loaded" (~28% of runs measured). Same hazard as MAILTXT above.
+LAUNCHCTL_LIST="$(launchctl list 2>/dev/null)"
+if [[ "$LAUNCHCTL_LIST" == *"$LABEL"* ]]; then
+    LAUNCHCTL_PRINT="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null)"
+    if [[ "$LAUNCHCTL_PRINT" == *"$GUARD"* ]]; then
         log "  (info) live job $LABEL runs this file ✓"
     else
         log "  (info) live job $LABEL is loaded but its program path was not confirmed as $GUARD — check 'launchctl print gui/$(id -u)/$LABEL'"
