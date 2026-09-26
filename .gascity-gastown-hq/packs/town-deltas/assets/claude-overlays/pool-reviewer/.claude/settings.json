@@ -29,6 +29,20 @@
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
     "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "3"
   },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ": home-scan-guard; P='/Users/athos/gt/.gascity-gastown-hq/scripts/home-scan-guard.sh'; [ -f \"$P\" ] || exit 0; exec /bin/bash \"$P\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
   "autoMemoryEnabled": false,
   "claudeMdExcludes": [
     "/Users/athos/.claude/CLAUDE.md",

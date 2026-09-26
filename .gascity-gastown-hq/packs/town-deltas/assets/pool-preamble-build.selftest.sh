@@ -69,6 +69,42 @@ reset_tree; if o="$(run_check)"; then ok "controle positivo: cópia intacta pass
 
 reset_tree; sed -i.bak 's/"Bash(sudo:\*)"/"Bash(sudo:*)", "Bash"/' "$T/packs/town-deltas/assets/claude-overlays/pool-dog/.claude/settings.json"
 expect_fail "overlay editado à mão (nega Bash)" "DIVERGE"
+# ga-02cqk4: o hook PreToolUse do home-scan-guard em todo overlay de papel. Cada controle abaixo já foi provado contra o motor REAL
+# (internal/overlay/merge.go rodado standalone): com matcher "Bash" o hook do overlay SUBSTITUI a entrada Bash do workdir e os 2 hooks
+# dangerous-command dela somem; com "^Bash$" a entrada é anexada uma vez, idempotente, e a do workdir sobrevive.
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-dog/.claude/settings.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); del d["hooks"]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+expect_fail "overlay commitado do dog sem o hook do home-scan-guard" "perdeu o hook PreToolUse do home-scan-guard"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); del m["common"]["hooks"]
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "hook sai do manifesto E dos overlays regenerados juntos (a igualdade sozinha passaria calada)" "perdeu o hook PreToolUse do home-scan-guard"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["matcher"] = "Bash"
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "matcher do hook volta a 'Bash' (o motor substituiria a entrada Bash do workdir e apagaria dangerous-command)" "tem que ser '^Bash\$'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-reviewer/.claude/settings.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"] = ["isto", "não", "é", "um", "objeto"]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+expect_fail "overlay com \`hooks\` que não é objeto: o check REPORTA (não vira exceção) e trata como hook sumido" "perdeu o hook PreToolUse do home-scan-guard"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["hooks"][0]["if"] = "Bash(du *)"
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "hook ganha um campo 'if' (não enxerga dentro de for/do/done: o guard deixaria de pegar o incidente)" "campo 'if'"
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays" <<'EOF'
 import json,sys
 d=sys.argv[1]; p=d+"/pool-roles.json"; m=json.load(open(p)); m["common"]["deny_tools"].append("Read"); json.dump(m,open(p,"w"),indent=1,ensure_ascii=False)
