@@ -94,6 +94,19 @@ S3PROOF_UP_TIMEOUT="$S3_TIMEOUT"          # ga-btnq6h: same per-db upload budget
 # already crashed Dolt twice in one day.
 RESEED_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-reseed.sh"
 RESEED_TIMEOUT_SECS="${RESEED_TIMEOUT_SECS:-1800}"
+# ga-9626dq: hq alone measured NOT finishing inside the uniform budget above
+# (sync+release+restore of ~8.55GB/15836 issues; the 04:06 run on 2026-09-27
+# was still mid-restore when the wrapper's 1800s killed it via SIGTERM with
+# no trap — no error log, no cleanup, just a silent jump to the next db).
+# Every OTHER db already finishes fine inside RESEED_TIMEOUT_SECS, so this
+# override is scoped to hq only (see _reseed_budget_secs_for below) — a
+# blanket increase would just let a genuinely stuck db run longer before
+# anything catches it. hq's bigger budget is capped so it still finishes
+# before RESEED_HQ_DEADLINE_HHMM, when dolt-compact-routine's own launchd
+# job starts (colliding with it is worse than skipping a night's reseed).
+RESEED_TIMEOUT_SECS_HQ="${RESEED_TIMEOUT_SECS_HQ:-3600}"
+RESEED_HQ_DEADLINE_HHMM="${RESEED_HQ_DEADLINE_HHMM:-04:30}"
+RESEED_HQ_MIN_BUDGET_SECS="${RESEED_HQ_MIN_BUDGET_SECS:-300}"
 RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
 # ga-i99qsp: dolt-backup-reseed.sh's own disk-margin refusal used to be purely
 # "expected; retried next run" forever — for a db whose disk is CONSISTENTLY
@@ -706,11 +719,72 @@ _sync_with_stale_manifest_recovery() {
 # assumed to always self-heal. Any OTHER failure reason (including the two
 # new low-disk-specific ones below) is a real signal and is notify_fail'd
 # immediately, same channel as every other failure mode in this script.
+
+# _seconds_until_hhmm <HH:MM> [now_epoch] — pure: seconds from now_epoch
+# (defaults to the real clock) until the next local occurrence of HH:MM —
+# today if that time is still ahead, tomorrow's occurrence otherwise. Never
+# returns <= 0: "already past today's HH:MM" and "still ahead" must not
+# collapse to the same value, or a caller can't tell "no time left" apart
+# from "a full day is still ahead". now_epoch is test-only; production
+# always omits it and uses `date +%s`.
+_seconds_until_hhmm() {
+  local hhmm="$1" now_epoch="${2:-$(date +%s)}"
+  local today target_epoch
+  today="$(date -r "$now_epoch" '+%Y-%m-%d' 2>/dev/null || date -d "@$now_epoch" '+%Y-%m-%d')"
+  # BSD `date -j -f` fills any field missing from the FORMAT string (here:
+  # seconds) from the CURRENT wall-clock time rather than defaulting it to
+  # 0 — an undocumented-in-practice quirk that made this non-deterministic
+  # (drifted by however many seconds had elapsed in the current minute at
+  # call time). Spelling seconds explicitly in both the format and the
+  # value pins it to :00, matching the HH:MM the caller actually asked for.
+  target_epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "$today $hhmm:00" '+%s' 2>/dev/null \
+    || date -d "$today $hhmm:00" '+%s')"
+  if [ "$target_epoch" -le "$now_epoch" ]; then
+    target_epoch=$((target_epoch + 86400))
+  fi
+  echo $((target_epoch - now_epoch))
+}
+
+# _reseed_budget_secs_for <db> [now_epoch] — ga-9626dq: the per-db timeout(1)
+# budget for the reseed call below. Every db except hq keeps the uniform
+# RESEED_TIMEOUT_SECS unchanged. hq gets RESEED_TIMEOUT_SECS_HQ instead, but
+# capped to whatever is actually left before RESEED_HQ_DEADLINE_HHMM (so it
+# can never run into dolt-compact-routine's own launchd start) — and if
+# what's left is under RESEED_HQ_MIN_BUDGET_SECS, returns 0 so the caller
+# skips the attempt entirely instead of starting a reseed that timeout(1)
+# will just kill anyway (wasted disk churn for zero benefit). now_epoch is
+# test-only; production always omits it, which falls back to
+# RESEED_BUDGET_NOW_EPOCH (unset in production; here only so the wiring
+# test below can pin "now" without threading an extra argument through
+# _reseed_staging_if_enabled's own call site) and then the real clock.
+_reseed_budget_secs_for() {
+  local db="$1" now_epoch="${2:-${RESEED_BUDGET_NOW_EPOCH:-$(date +%s)}}"
+  if [ "$db" != "hq" ]; then
+    echo "$RESEED_TIMEOUT_SECS"
+    return 0
+  fi
+  local remaining budget
+  remaining="$(_seconds_until_hhmm "$RESEED_HQ_DEADLINE_HHMM" "$now_epoch")"
+  budget="$RESEED_TIMEOUT_SECS_HQ"
+  [ "$remaining" -lt "$budget" ] && budget="$remaining"
+  if [ "$budget" -lt "$RESEED_HQ_MIN_BUDGET_SECS" ]; then
+    echo 0
+    return 0
+  fi
+  echo "$budget"
+}
+
 _reseed_staging_if_enabled() {
   local db="$1"
   [ "$RESEED_AFTER_UPLOAD" = "1" ] || return 0
+  local timeout_secs
+  timeout_secs="$(_reseed_budget_secs_for "$db")"
+  if [ "$timeout_secs" -le 0 ]; then
+    log "$db: staging reseed skipped — not enough time before $RESEED_HQ_DEADLINE_HHMM to attempt safely (would risk colliding with dolt-compact-routine); retried next run"
+    return 0
+  fi
   local out rc
-  out="$(timeout "$RESEED_TIMEOUT_SECS" "$RESEED_SCRIPT" "$db" 2>&1)"
+  out="$(timeout "$timeout_secs" "$RESEED_SCRIPT" "$db" 2>&1)"
   rc=$?
   echo "$out" >> "$LOG"
   if [ "$rc" -eq 0 ]; then

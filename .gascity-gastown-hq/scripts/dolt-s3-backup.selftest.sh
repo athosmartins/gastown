@@ -786,6 +786,165 @@ rm -rf "$RESEED_STUB_DIR" 2>/dev/null || true
 rm -f "$NOTIFY_STUB_CALLS" "$RESEED_TEST_LOG" 2>/dev/null || true
 unset NOTIFY_STUB_CALLS
 
+# ── _seconds_until_hhmm() (ga-9626dq) — pure wall-clock helper ──────────────
+# Every other db keeps the uniform RESEED_TIMEOUT_SECS unchanged; only hq gets
+# a bigger budget, capped so it still finishes before dolt-compact-routine's
+# own 04:30 launchd start. now_epoch is injectable so this never touches the
+# real clock.
+echo ""
+echo "── _seconds_until_hhmm() (ga-9626dq) ──"
+
+type _seconds_until_hhmm >/dev/null 2>&1 \
+  && ok "_seconds_until_hhmm defined by lib-mode source" \
+  || { bad "_seconds_until_hhmm NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+# 2026-09-28 00:00:00 local -> epoch, using the same BSD/GNU fallback the
+# production code uses, so the test's "now" is computed the identical way.
+EPOCH_0000="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-28 00:00:00' '+%s' 2>/dev/null \
+  || date -d '2026-09-28 00:00:00' '+%s')"
+EPOCH_0406="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-28 04:06:00' '+%s' 2>/dev/null \
+  || date -d '2026-09-28 04:06:00' '+%s')"
+EPOCH_0429="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-28 04:29:00' '+%s' 2>/dev/null \
+  || date -d '2026-09-28 04:29:00' '+%s')"
+
+[ "$(_seconds_until_hhmm "04:30" "$EPOCH_0000")" = "16200" ] \
+  && ok "00:00 -> 04:30 deadline: 16200s remaining" \
+  || bad "00:00 -> 04:30 deadline: expected 16200, got $(_seconds_until_hhmm "04:30" "$EPOCH_0000")"
+
+[ "$(_seconds_until_hhmm "04:30" "$EPOCH_0406")" = "1440" ] \
+  && ok "04:06 -> 04:30 deadline: 1440s remaining (the real ga-9626dq timeline)" \
+  || bad "04:06 -> 04:30 deadline: expected 1440, got $(_seconds_until_hhmm "04:30" "$EPOCH_0406")"
+
+[ "$(_seconds_until_hhmm "04:30" "$EPOCH_0429")" = "60" ] \
+  && ok "04:29 -> 04:30 deadline: 60s remaining" \
+  || bad "04:29 -> 04:30 deadline: expected 60, got $(_seconds_until_hhmm "04:30" "$EPOCH_0429")"
+
+# past the deadline already -> wraps to TOMORROW's occurrence, never negative
+# or zero (a negative/zero "remaining" would look identical to "no time
+# left today", but it actually means "the whole day is still ahead").
+EPOCH_0500="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-28 05:00:00' '+%s' 2>/dev/null \
+  || date -d '2026-09-28 05:00:00' '+%s')"
+[ "$(_seconds_until_hhmm "04:30" "$EPOCH_0500")" = "84600" ] \
+  && ok "05:00 (past deadline) -> wraps to tomorrow's 04:30 (84600s)" \
+  || bad "05:00 past-deadline wrap: expected 84600, got $(_seconds_until_hhmm "04:30" "$EPOCH_0500")"
+
+# exactly AT the deadline -> also wraps (>=0 must never mean "already expired")
+EPOCH_0430="$(date -j -f '%Y-%m-%d %H:%M:%S' '2026-09-28 04:30:00' '+%s' 2>/dev/null \
+  || date -d '2026-09-28 04:30:00' '+%s')"
+[ "$(_seconds_until_hhmm "04:30" "$EPOCH_0430")" = "86400" ] \
+  && ok "exactly at 04:30 -> wraps to tomorrow (86400s), not 0" \
+  || bad "exactly-at-deadline wrap: expected 86400, got $(_seconds_until_hhmm "04:30" "$EPOCH_0430")"
+
+# ── _reseed_budget_secs_for() (ga-9626dq) — per-db timeout, hq-only override ─
+echo ""
+echo "── _reseed_budget_secs_for() (ga-9626dq) ──"
+
+type _reseed_budget_secs_for >/dev/null 2>&1 \
+  && ok "_reseed_budget_secs_for defined by lib-mode source" \
+  || { bad "_reseed_budget_secs_for NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+
+# Every OTHER db must keep the uniform default unchanged, regardless of clock
+# — this fix is scoped to hq alone; every other db already finishes inside
+# the uniform budget, so widening it for them would only delay catching a
+# genuinely stuck reseed.
+RC_OTHER="$(RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 _reseed_budget_secs_for "gastown" "$EPOCH_0429")"
+[ "$RC_OTHER" = "1800" ] \
+  && ok "non-hq db keeps the uniform RESEED_TIMEOUT_SECS even 1 minute from the hq deadline" \
+  || bad "non-hq db budget: expected 1800 (unchanged), got $RC_OTHER"
+
+# hq far from the deadline: capped at RESEED_TIMEOUT_SECS_HQ, not the full
+# time remaining (a bigger cap belongs in config, not silently unbounded).
+RC_HQ_FAR="$(RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 _reseed_budget_secs_for "hq" "$EPOCH_0000")"
+[ "$RC_HQ_FAR" = "3600" ] \
+  && ok "hq far from deadline (16200s left): capped at RESEED_TIMEOUT_SECS_HQ=3600" \
+  || bad "hq far-from-deadline budget: expected 3600 (capped), got $RC_HQ_FAR"
+
+# hq close to the deadline: budget shrinks to whatever is actually left,
+# never exceeding it even though the cap alone would allow more.
+RC_HQ_CLOSE="$(RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 _reseed_budget_secs_for "hq" "$EPOCH_0406")"
+[ "$RC_HQ_CLOSE" = "1440" ] \
+  && ok "hq close to deadline (1440s left, the real 04:06 timeline): budget shrinks to 1440, not the 3600 cap" \
+  || bad "hq close-to-deadline budget: expected 1440, got $RC_HQ_CLOSE"
+
+# hq too close to the deadline to plausibly finish: returns 0 (caller must
+# skip the attempt rather than start something timeout(1) will just kill).
+RC_HQ_TOOCLOSE="$(RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 _reseed_budget_secs_for "hq" "$EPOCH_0429")"
+[ "$RC_HQ_TOOCLOSE" = "0" ] \
+  && ok "hq 60s from deadline (below the 300s floor): returns 0 — signals skip, not a tiny doomed attempt" \
+  || bad "hq too-close-to-deadline budget: expected 0, got $RC_HQ_TOOCLOSE"
+
+# ── wiring: _reseed_staging_if_enabled() actually uses the per-db budget,
+# and skips (without invoking the reseed script at all) when it is 0 ──────
+echo ""
+echo "── _reseed_staging_if_enabled() honors the hq deadline (ga-9626dq) ──"
+
+RESEED_STUB_DIR2="$(mktemp -d)"
+RESEED_TEST_LOG2="$(mktemp)"
+RESEED_MARKER_FILE2="$(mktemp -u)"
+export RESEED_MARKER_FILE2
+cat > "$RESEED_STUB_DIR2/reseed_marker.sh" <<'STUB'
+#!/bin/bash
+touch "$RESEED_MARKER_FILE2"
+echo "=== re-seed de '$1' concluído com sucesso ==="
+exit 0
+STUB
+chmod +x "$RESEED_STUB_DIR2/reseed_marker.sh"
+
+: > "$RESEED_TEST_LOG2"
+RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+  RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  LOG="$RESEED_TEST_LOG2" \
+  _reseed_staging_if_enabled "hq"
+RC=$?
+[ "$RC" -eq 0 ] && ok "hq skip-near-deadline: returns success (soft-skip, not a failure)" \
+  || bad "hq skip-near-deadline: expected rc=0, got rc=$RC"
+[ -e "$RESEED_MARKER_FILE2" ] \
+  && bad "hq skip-near-deadline: reseed script must NOT be invoked when budget is 0" \
+  || ok "hq skip-near-deadline: reseed script correctly never invoked"
+grep -qF "not enough time before 04:30" "$RESEED_TEST_LOG2" \
+  && ok "hq skip-near-deadline: log line explains why (deadline, not disk/other)" \
+  || bad "hq skip-near-deadline: missing/wrong log line: $(cat "$RESEED_TEST_LOG2")"
+rm -f "$RESEED_MARKER_FILE2" 2>/dev/null || true
+
+# Same near-deadline instant, but a NON-hq db: must NOT skip — the deadline
+# is scoped to hq only.
+RESEED_MARKER_FILE2="$(mktemp -u)"
+: > "$RESEED_TEST_LOG2"
+RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+  RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  LOG="$RESEED_TEST_LOG2" \
+  _reseed_staging_if_enabled "gastown"
+RC=$?
+[ "$RC" -eq 0 ] && ok "non-hq db near the same instant: returns success" \
+  || bad "non-hq db near the same instant: expected rc=0, got rc=$RC"
+[ -e "$RESEED_MARKER_FILE2" ] \
+  && ok "non-hq db near the hq deadline: reseed script IS invoked (deadline doesn't apply to it)" \
+  || bad "non-hq db near the hq deadline: reseed script should have been invoked"
+rm -f "$RESEED_MARKER_FILE2" 2>/dev/null || true
+unset RESEED_MARKER_FILE2
+
+rm -rf "$RESEED_STUB_DIR2" 2>/dev/null || true
+rm -f "$RESEED_TEST_LOG2" 2>/dev/null || true
+
+# ── drift-guard: live script must actually wire the per-db budget into the
+# timeout call, not just define it as dead code ────────────────────────────
+if grep -qF 'timeout_secs="$(_reseed_budget_secs_for "$db"' "$SCRIPT"; then
+  ok "_reseed_staging_if_enabled computes its timeout via _reseed_budget_secs_for"
+else
+  bad "_reseed_staging_if_enabled does NOT call _reseed_budget_secs_for — hq override is dead code"
+fi
+if grep -qF 'timeout "$timeout_secs" "$RESEED_SCRIPT" "$db"' "$SCRIPT"; then
+  ok "the timeout(1) call uses the computed per-db budget, not the raw RESEED_TIMEOUT_SECS"
+else
+  bad "the timeout(1) call still hardcodes RESEED_TIMEOUT_SECS — per-db override never reaches the actual command"
+fi
+
 echo ""
 echo "── jsonl_sizes_match() (ga-7gfd34) ──"
 
