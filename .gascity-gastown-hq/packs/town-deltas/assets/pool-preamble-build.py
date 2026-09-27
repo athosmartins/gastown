@@ -65,8 +65,8 @@ def _subst(s, paths):
 
 # ----------------------------------------------------------------------------- overlays
 def _subst_deep(obj, paths):
-    """{chave} -> caminho em toda string do objeto. Por replace (não str.format): o comando do hook tem `$P`/aspas e nenhum outro
-    par de chaves, mas o manifesto não deve quebrar no dia em que tiver."""
+    """{chave} -> caminho em toda string do objeto. Por replace e NÃO por str.format: o comando do hook do home-scan-guard TEM chaves de
+    shell (`${HOME_SCAN_GUARD_LOG:-${HOME:-/tmp}/...}`), que o format tomaria por campo e quebraria."""
     if isinstance(obj, str):
         for k, v in paths.items():
             obj = obj.replace("{" + k + "}", v)
@@ -79,6 +79,13 @@ def _subst_deep(obj, paths):
 
 
 GUARD_HOOK_MARKER = "home-scan-guard"     # ga-02cqk4: todo overlay de papel TEM que carregar este hook (ver check_overlays)
+
+
+def _cmd(h):
+    """O `command` de um hook, ou "" se o hook não é objeto ou o command não é texto (um número/bool/lista num overlay editado à mão é
+    "não sei ler" = hook sumido, nunca uma exceção do check)."""
+    c = h.get("command") if isinstance(h, dict) else None
+    return c if isinstance(c, str) else ""
 
 
 def overlay_for(m, role):
@@ -243,7 +250,7 @@ def check_guard_hook(role, cfg):
     # um `hooks` que não é objeto (mão pesada num overlay) é "não sei ler" = o mesmo erro de "sumiu", nunca uma exceção do check
     entries = entries if isinstance(entries, list) else []
     mine = [e for e in entries if isinstance(e, dict) and isinstance(e.get("hooks"), list)
-            and any(GUARD_HOOK_MARKER in (h.get("command") or "") for h in e["hooks"] if isinstance(h, dict))]
+            and any(GUARD_HOOK_MARKER in _cmd(h) for h in e["hooks"])]
     if not mine:
         return [f"overlay '{role}': perdeu o hook PreToolUse do home-scan-guard (ga-02cqk4) — sessão de pool voltaria a poder varrer o $HOME e disparar o prompt do TCC"]
     for e in mine:
@@ -251,7 +258,7 @@ def check_guard_hook(role, cfg):
             errs.append(f"overlay '{role}': hook do home-scan-guard com matcher {e.get('matcher')!r}; tem que ser '^Bash$' — o motor mescla por identidade de "
                         "matcher, então 'Bash' SUBSTITUIRIA a entrada Bash do workdir (apagando os hooks dangerous-command) e um padrão de comando no matcher nunca dispara (ga-7j1yu)")
         for h in e["hooks"]:
-            if isinstance(h, dict) and GUARD_HOOK_MARKER in (h.get("command") or "") and "if" in h:
+            if isinstance(h, dict) and GUARD_HOOK_MARKER in _cmd(h) and "if" in h:
                 errs.append(f"overlay '{role}': hook do home-scan-guard com campo 'if' — o guard não usa (o prefiltro dele já é barato e um glob não enxerga dentro de for/do/done)")
     return errs
 
@@ -439,6 +446,44 @@ def cmd_check(m):
     return 0
 
 
+def guard_paths(cfg):
+    """Os caminhos do script do guard que o overlay `cfg` registra (o `P='...'` do comando do hook)."""
+    hooks = cfg.get("hooks")
+    entries = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    out = []
+    for e in entries if isinstance(entries, list) else []:
+        for h in (e.get("hooks") if isinstance(e, dict) and isinstance(e.get("hooks"), list) else []):
+            mm = re.search(r"P='([^']+)'", _cmd(h)) if GUARD_HOOK_MARKER in _cmd(h) else None
+            if mm:
+                out.append(mm.group(1))
+    return out
+
+
+def cmd_live(m, gt_root=None):
+    """MERGED != LIVE (ga-02cqk4). O hook de pool é `[ -f "$P" ] || exit 0`: um overlay pode registrá-lo e o guard continuar INERTE, calado, se o
+    script não existe no caminho (o `check` valida o JSON, não o disco). Para cada papel: o arquivo que o hook aponta existe? Uma sessão só pega
+    o overlay ao (re)nascer -- isto prova o disco, não as sessões já vivas. --gt-root troca a raiz (testes)."""
+    root, rc = m["paths"]["gt_root"], 0
+    for role in m["roles"]:
+        try:
+            cfg = json.loads(overlay_path(m, role).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print(f"  NOT-GUARDED {role}: overlay ilegível")
+            rc = 1
+            continue
+        paths = guard_paths(cfg)
+        if not paths:
+            print(f"  NOT-GUARDED {role}: o overlay não registra o hook do home-scan-guard")
+            rc = 1
+        for path in paths:
+            real = path.replace(root, gt_root, 1) if gt_root else path
+            live = os.path.isfile(real)
+            print(f"  {'LIVE' if live else 'INERT':11s} {role}: {real}" + ("" if live else "  (o hook está registrado mas o arquivo não existe: no-op)"))
+            rc = rc or (0 if live else 1)
+    print("pool-preamble-build live: " + ("todos os papéis LIVE" if rc == 0 else "há papel NÃO guardado ou INERTE"))
+    return rc
+
+
 def cmd_sections(m):
     errs, blocks = check_fragment(m)
     if not blocks:
@@ -481,9 +526,12 @@ def cmd_new_skills(m):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["build", "check", "sections", "per-task", "new-skills"])
+    ap.add_argument("cmd", choices=["build", "check", "live", "sections", "per-task", "new-skills"])
+    ap.add_argument("--gt-root", default=None, help="só para `live`: troca a raiz {gt_root} do manifesto (testes)")
     a = ap.parse_args(argv)
     m = load_manifest()
+    if a.cmd == "live":
+        return cmd_live(m, a.gt_root)
     return {"build": cmd_build, "check": cmd_check, "sections": cmd_sections, "per-task": cmd_per_task, "new-skills": cmd_new_skills}[a.cmd](m)
 
 

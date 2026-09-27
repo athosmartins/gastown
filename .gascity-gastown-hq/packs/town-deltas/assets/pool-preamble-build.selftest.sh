@@ -98,6 +98,19 @@ p = sys.argv[1]; d = json.load(open(p)); d["hooks"] = ["isto", "não", "é", "um
 json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
 EOF
 expect_fail "overlay com \`hooks\` que não é objeto: o check REPORTA (não vira exceção) e trata como hook sumido" "perdeu o hook PreToolUse do home-scan-guard"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-wa-worker/.claude/settings.json" <<'EOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = 12345
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+EOF
+expect_fail "hook cujo \`command\` não é texto (número): o check REPORTA em vez de estourar TypeError" "perdeu o hook PreToolUse do home-scan-guard"
+if run_check | grep -q Traceback; then bad "o check ainda estoura traceback com command não-texto"; else ok "command não-texto não gera traceback"; fi
+# `live`: registrado != vivo. O hook é [ -f "$P" ] || exit 0, então um overlay correto com o script ausente é um no-op calado.
+reset_tree
+LIVEROOT="$W/liveroot"; mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)"; then bad "live deveria dar INERT (o script não existe em $LIVEROOT)"; else echo "$o" | grep -q 'INERT.*dog' && ok "live: overlay registrado + script AUSENTE = INERT, rc != 0" || bad "live: sem INERT no output: $o"; fi
+: > "$LIVEROOT/.gascity-gastown-hq/scripts/home-scan-guard.sh"
+if o="$(PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" live --gt-root "$LIVEROOT" 2>&1)" && [ "$(echo "$o" | grep -c '^  LIVE')" = "4" ]; then ok "live: script presente = os 4 papéis de pool LIVE, rc 0"; else bad "live: esperava 4 LIVE e rc 0: $o"; fi
 reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'EOF'
 import json, sys
 p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PreToolUse"][0]["hooks"][0]["if"] = "Bash(du *)"

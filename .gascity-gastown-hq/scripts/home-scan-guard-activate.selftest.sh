@@ -358,5 +358,14 @@ done
 printf '#!/bin/bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 
 echo ""
+echo "-- --help prints the WHOLE header block (it used to stop mid-sentence at a hard-coded line number) --"
+HELP="$(bash "$ACTIVATE" --help 2>&1)"; HRC=$?
+if [ "$HRC" -eq 0 ] && [[ "$HELP" == *"--check  : write nothing"* && "$HELP" == *"the exit status is 1 if any failed"* ]]; then
+  ok "--help ends with the --check line and the exit-status contract"
+else
+  bad "--help is truncated: rc=$HRC tail=[$(printf '%s' "$HELP" | tail -2)]"
+fi
+
+echo ""
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

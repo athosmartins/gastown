@@ -18,13 +18,14 @@
 #      $HOME / protected-folder token, or a cwd that is itself $HOME / protected). Nearly every
 #      command ends here with exit 0 and no python.
 #   2. home-scan-guard.py: the exact lexical classifier, under a hard timeout. Only rc==2 blocks.
-# The filter is meant to be a SUPERSET of the classifier (a shape the classifier blocks and the filter
-# passes is a block silently switched off): home-scan-guard.selftest.sh runs the must-block corpus THROUGH
-# this file, WITH a cwd (with none every command reaches the classifier and the filter is never exercised),
-# and a differential fuzz of engine vs wrapper found no remaining miss when it was last run -- that is a
-# measurement of the shapes tried, not a proof for every spelling: a new classifier rule needs its filter rule.
+# The filter must be a SUPERSET of the classifier: a shape the classifier blocks and the filter passes is a block
+# silently switched off. home-scan-guard.selftest.sh checks it two ways -- every classifier BLOCK of the spec corpus
+# and of the structural sweeps is run through THIS file's own prefilter code (cut out of the file, one bash process,
+# a non-hot cwd; ~25k cases at the time of writing, 0 misses), and a sample goes end to end through bash + jq + python.
+# That is a measurement of the shapes tried, not a proof for every spelling: a new classifier rule needs its filter rule.
 # The classifier compares paths case-insensitively and normalises them (//, /./, ..), so the filter does
-# the same to ITS copy of the text: nocasematch, and // and /./ collapsed before any pattern runs.
+# the same to ITS copy of the text: nocasematch, and // and /./ collapsed before any pattern runs. A token boundary is any
+# character that cannot continue a path name (a backtick, `{`, `,` end a token as well as a space does).
 #
 # WIRING (why it is not just a settings.json line). Two facts about Claude Code hook config bit this
 # bead, and both are pinned by selftests:
@@ -38,9 +39,10 @@
 #     the engine appends once and idempotently.
 # See home-scan-guard-activate.sh (crews) and pool-roles.json / pool-preamble-build.py (pools);
 # both write the identical entry (home-scan-guard-activate.selftest.sh, case 9, compares them).
-# Every failure to run is exit 0, but none is silent: a wrapper that cannot run the classifier writes
+# Every failure to run is exit 0 and is COUNTED in the log: a wrapper that cannot run the classifier writes
 # UNGUARDED, a classifier that fails on its own bug writes ENGINE-ERROR (a guard that fails open on its
-# own bug is silently off), and the selftest asserts its cases produced neither.
+# own bug is silently off), and the selftest asserts its cases produced neither. The log is best effort:
+# if its directory cannot be created or written, the count is lost too (the block itself never depends on it).
 #
 # WHO is guarded: only processes whose environment carries a Gas Town identity (GC_AGENT,
 # GC_ALIAS, GC_DIR, GC_SESSION_NAME, GC_SESSION_ID). Athos's own terminal in a crew directory has
@@ -101,17 +103,22 @@ while [ "$prev" != "$cmd_n" ]; do
   cmd_n="${cmd_n//\/.\///}"
 done
 
-# a tool that can scan (or a wrapper/interpreter that can hide one -- those still put the scan
-# tool's name in the text, so the raw text is a superset of every wrapped form)
-tool_re='(^|[^[:alnum:]_.-])(du|find|gfind|gdu|dust|tree|ncdu|fd|fdfind|rg|ripgrep|ag|ack|grep|egrep|fgrep|zgrep|ggrep|ls|gls|eza|exa|lsd|mdfind|rsync|ditto|tar|gtar|zip|cp|gcp|scp|xargs)($|[^[:alnum:]_-])'
-[[ $cmd_n =~ $tool_re ]] || exit 0
+# a tool that can scan. A wrapper (sudo, nice, caffeinate ...) or a `bash -c '...'` string still puts the tool's name
+# in the text, so the text is a superset of every wrapped form; the quote-stripped copy below covers d""u, \du, 'du'.
+tool_re='(^|[^[:alnum:]_.-])(du|find|gfind|gdu|dust|tree|ncdu|fd|fdfind|rg|ripgrep|ag|ack|grep|egrep|fgrep|zgrep|ggrep|ls|gls|eza|exa|lsd|mdfind|rsync|ditto|tar|gtar|bsdtar|zip|cp|gcp|scp|xargs|rm|mv|gmv|chmod|chown|chflags|xattr)($|[^[:alnum:]_-])'
+# The shell joins d""u, \du, 'du' into du and /Us""ers/athos into /Users/athos: every test below reads the text AND a copy with the quoting
+# removed (pure bash, no spawn), so a quote in the middle of a name cannot hide it from the filter.
+cmd_q="${cmd_n//\"/}"; cmd_q="${cmd_q//\'/}"; cmd_q="${cmd_q//\\/}"
+[[ $cmd_n =~ $tool_re ]] || [[ $cmd_q =~ $tool_re ]] || exit 0
 
 # only now: a command that looks like a scan needs a home to be classified against
 home="${HOME_SCAN_GUARD_HOME:-${HOME:-}}"
 home="${home%/}"
 case "$home" in /*/*) ;; *) note UNGUARDED "no usable home (HOME_SCAN_GUARD_HOME/HOME = '$home'): cannot tell what is protected"; exit 0 ;; esac
 
-home_esc="${home//./\\.}"
+# $HOME goes into a regex: escape EVERY metacharacter (a home with a + ( [ in it made an invalid or wrong pattern)
+home_esc="${home//\\/\\\\}"
+for ch in "." "*" "+" "?" "(" ")" "[" "]" "{" "}" "^" "\$" "|"; do home_esc="${home_esc//"$ch"/\\$ch}"; done
 after='($|[^[:alnum:]_./~-]|/($|[[:space:];|&)]|[*?[{$"'"'"'`/\\]|\.($|[[:space:]"'"'"'/;|&)])|\.\.|\.\*|\.\[|\.[Tt]rash|[DdPpMmLl]))'
 # the token before a path is a boundary -- or an option cluster the path is ATTACHED to (tar -C/Users/athos, -xzC$HOME),
 # which is a value the classifier reads and the old boundary (a non-alphanumeric) hid. `~` may carry a name: ~athos/Desktop is
@@ -122,22 +129,36 @@ dots_re='\.\.'                                       # /Users/athos/gt/../Downlo
 bare_cd_re='(^|[;&|({[:space:]])(cd|pushd)[[:space:]]*($|[;&|)`])'   # cd with no operand = $HOME
 back_cd_re='(^|[;&|({[:space:]])(cd[[:space:]]+-|popd)($|[[:space:]]|[;&|)`])'   # cd - / popd: the previous dir may be a hot one
 # / and /Users are ANCESTORS of $HOME: `find / -name x` walks straight into it
-anc_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)(/|/Users/?)($|[[:space:]"'"'"')*;|&])'      # bare / or /Users
-anc_glob_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)/Users/([*?[{$]|[^[:space:]/]*[*?[{$])'   # /Users/*, /Users/*/Downloads, /Users/at*
+# (a token boundary is ANY character that cannot continue a path name: a backtick, `{`, `,`, `:` ... end a token as well as a space does)
+anc_re='(^|[^[:alnum:]_./~-]|-[[:alpha:]]+)(/|/Users/?)($|[^[:alnum:]_./~-])'      # bare / or /Users
+anc_glob_re='(^|[^[:alnum:]_./~-]|-[[:alpha:]]+)/Users/([*?[{$]|[^[:space:]/]*[*?[{$])'   # /Users/*, /Users/*/Downloads, /Users/at*
 # /U*/athos, /Us?rs, /[U]sers, /{Users,x}/..., /Vol*, /V?lumes/x: the FIRST component of an absolute path holds a glob, class, brace or
 # backslash, so it can still name /Users or /Volumes. The classifier reads those; a filter that only knew the literal names let them
 # through in silence (the selftest runs these WITH a cwd -- with none, every command goes to the classifier and the filter is never used).
-abs_glob_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)/[^[:space:]/]*[*?[{\\][^[:space:]/]*($|/|[[:space:]"'"'"')*;|&])'
+abs_glob_re='(^|[^[:alnum:]_./~-]|-[[:alpha:]]+)/[^[:space:]/]*[*?[{\\][^[:space:]/]*($|/|[^[:alnum:]_./~-])'
+# a word can chain several {a,b} groups after a SAFE-looking name (~/gt{a,b}{a,b}{a,b}...): the classifier's own cap
+# (MAX_ALTERNATIVES) treats that as "could be anything" once the count multiplies past it, regardless of what any single
+# alternative spells -- this filter cannot count alternatives cheaply, so it treats 3+ brace groups anywhere in a command
+# that also mentions ~/$HOME/the literal home as hot outright (coarse and deliberately over-inclusive: python decides the real verdict)
+chained_brace_re='\{[^{}]*\}.*\{[^{}]*\}.*\{[^{}]*\}'
 
+# `[[ =~ ]]` returns 2 for a pattern it cannot compile: that is "don't know", never "not hot" -- hand it to the classifier
+text_is_hot() {   # $1 = one copy of the command text; 0 = hot
+  local t="$1" r
+  [[ $t =~ $hot_re ]]; r=$?; [ "$r" -ne 1 ] && return 0
+  [[ $t == *"$vol_re"* ]] && return 0
+  [[ $t =~ $dots_re ]] && return 0
+  [[ $t =~ $bare_cd_re ]] && return 0
+  [[ $t =~ $back_cd_re ]] && return 0
+  [[ $t =~ $anc_re ]] && return 0
+  [[ $t =~ $anc_glob_re ]] && return 0
+  [[ $t =~ $abs_glob_re ]] && return 0
+  { [[ $t =~ $chained_brace_re ]] && [[ $t == *'~'* || $t == *'$HOME'* || $t == *"$home"* ]]; } && return 0
+  return 1
+}
 hot=0
-if   [[ $cmd_n =~ $hot_re ]];      then hot=1
-elif [[ $cmd_n == *"$vol_re"* ]];  then hot=1
-elif [[ $cmd_n =~ $dots_re ]];     then hot=1
-elif [[ $cmd_n =~ $bare_cd_re ]];  then hot=1
-elif [[ $cmd_n =~ $back_cd_re ]];  then hot=1
-elif [[ $cmd_n =~ $anc_re ]];      then hot=1
-elif [[ $cmd_n =~ $anc_glob_re ]]; then hot=1
-elif [[ $cmd_n =~ $abs_glob_re ]]; then hot=1
+if text_is_hot "$cmd_n" || { [ "$cmd_q" != "$cmd_n" ] && text_is_hot "$cmd_q"; }; then
+  hot=1
 else
   # An empty cwd is "don't know", not "not hot": a relative scan (`for d in $(ls -A); do du -sk "$d"; done`) cannot be judged
   # here, so it goes to the classifier, which counts it (UNKNOWN-CWD). Claude Code always sends a cwd; this is the payload that

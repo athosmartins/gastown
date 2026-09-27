@@ -10,9 +10,15 @@
 # ~1s. macOS TCC blames that on gc (the supervisor is the "responsible" process of every
 # agent session) -> the "gc wants to access ..." prompt (ga-6cyp1l).
 #
-# The must-block corpus was written BEFORE the guard existed (TDD: it failed with the
-# guard missing); the must-allow corpus is the other half of the contract -- a guard that
-# blocks every Bash call of every agent is worse than the problem (bead: "FAIL-OPEN").
+# HOW THE FILE IS ORGANISED -- read this before adding a case:
+#   1. the incident, then a SPEC corpus (must-BLOCK / must-ALLOW) that was written before the guard existed;
+#   2. ACCEPTED FALSE POSITIVES and KNOWN GAPS, pinned so nobody "fixes" one by re-adding a heuristic without
+#      reading why the guard is small (see the engine's header: rounds 1-4 of the gate each found one more
+#      instance of the same class in a design that read option tables and tracked stdin; round 5 removed the design);
+#   3. STRUCTURAL SWEEPS (run in-process against the engine): they do not list more examples, they LOCK THE FORM.
+#      Insert any option, any wrapper, any pipe consumer around a hot target -- BLOCK must stay BLOCK. A fifth
+#      "one more spelling" case is not a test of the class; a sweep that fails when the form regresses is;
+#   4. fail-open / cost / the engine never failed open on its own bug / LIVE dispatch.
 #
 # TEST: bash home-scan-guard.selftest.sh
 #       HOME_SCAN_GUARD_LIVE=1 bash home-scan-guard.selftest.sh   # also proves REAL hook
@@ -21,9 +27,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="$HERE/home-scan-guard.sh"
-# The installed hook runs `exec /bin/bash "$P"` (home-scan-guard-activate.sh): macOS bash 3.2, not the newer bash
-# this file is probably running under. The wrapper has to be exercised under exactly that shell -- it passed on
-# bash 5 while nothing pinned that the hook's own interpreter agrees.
+ENGINE="$HERE/home-scan-guard.py"
+# The installed hook runs `/bin/bash "$P"` (home-scan-guard-activate.sh): macOS bash 3.2, not the newer bash
+# this file is probably running under. The wrapper has to be exercised under exactly that shell.
 HOOK_BASH=/bin/bash
 [ -x "$HOOK_BASH" ] || HOOK_BASH="$(command -v bash)"
 
@@ -54,6 +60,7 @@ run_guard() {
 }
 
 expect_block() {  # name command [cwd]
+  printf '%s\0%s\0' "$2" "${3-}" >> "$SCRATCH/spec-blocks.bin"     # kept for the prefilter differential below
   run_guard "$2" "${3-}"
   if [ "$RC" -eq 2 ] && [[ "$ERR" == *TCC* ]]; then ok "BLOCK  $1"
   else bad "BLOCK  $1 -- expected rc=2 + TCC message, got rc=$RC err=[${ERR:0:160}] cmd=[$2] cwd=[${3-}]"; fi
@@ -64,8 +71,8 @@ expect_allow() {  # name command [cwd]
   else bad "ALLOW  $1 -- expected rc=0 + silent, got rc=$RC err=[${ERR:0:160}] cmd=[$2] cwd=[${3-}]"; fi
 }
 
-if [ ! -f "$GUARD" ]; then
-  echo "FATAL: guard not found at $GUARD"
+if [ ! -f "$GUARD" ] || [ ! -f "$ENGINE" ]; then
+  echo "FATAL: guard or engine not found next to this file ($GUARD, $ENGINE)"
   exit 1
 fi
 
@@ -74,6 +81,7 @@ echo "-- the incident (ga-6cyp1l, 26/09 14:52), verbatim --"
 # ─────────────────────────────────────────────────────────────────────────
 INCIDENT='cd /Users/athos && for d in $(ls -A); do [ "$d" = "Library" ] && continue; timeout 60 du -xsk "$d" 2>/dev/null; done | sort -rn | head -25'
 expect_block "incident command exactly as run by the batista crew" "$INCIDENT"
+expect_block "incident, from a repo cwd (the real one: cd is what moves it to \$HOME)" "$INCIDENT" /Users/athos/gt
 run_guard "$INCIDENT"
 if [[ "$ERR" == *"df -h /"* && "$ERR" == *"disk-growth"* && "$ERR" == *"du -xsk"* ]]; then
   ok "message names the alternatives (df -h /, disk-growth logs, du -xsk on explicit roots)"
@@ -111,6 +119,7 @@ expect_block "du /Volumes/x"               'du -sk /Volumes/Backup'
 expect_block "du mixed safe+hot operands"  'du -sk ~/gt ~/Downloads'
 expect_block "du path trick via .."        'du -sk /Users/athos/gt/../Downloads'
 expect_block "du path trick via ~/gt/../.."  'du -sk ~/gt/..'
+expect_block "du -d 1 (numeric option value) with cwd=\$HOME" 'du -d 1 -h' /Users/athos
 # find
 expect_block "find ~"                      'find ~ -maxdepth 1'
 expect_block "find \$HOME"                 'find $HOME -name foo'
@@ -128,6 +137,8 @@ expect_block "ls ~/Downloads/*"            'ls ~/Downloads/*'
 expect_block "ls -A ~/Desktop"             'ls -A ~/Desktop'
 expect_block "ls /Volumes"                 'ls /Volumes'
 expect_block "ls CloudStorage"             'ls ~/Library/CloudStorage'
+expect_block "ls ~/* (each entry is listed)" 'ls ~/*'
+expect_block "ls -la ~/.Trash"             'ls -la ~/.Trash'
 # other scanners
 expect_block "tree ~"                      'tree -L 2 ~'
 expect_block "ncdu ~"                      'ncdu ~'
@@ -149,7 +160,27 @@ expect_block "cp -R ~/Documents"           'cp -R ~/Documents /tmp/x'
 expect_block "cp -r ~/Downloads/dir"       'cp -r ~/Downloads/dir /tmp/y'
 expect_block "cp -a \$HOME"                'cp -a $HOME /tmp/y'
 expect_block "ditto ~/Documents"           'ditto ~/Documents /tmp/x'
-# cd to home / protected, then relative scan (the bead: "`cd` para o home seguido de loop/glob")
+# adversarial review (round 5): a POSIX bracket class ([[:upper:]]) is a glob that matches Desktop/Documents/... too, and must
+# not be fed raw to Python's re (which warns "nested set" on stderr -- a warning there would break the WRAPPER's own marker
+# check, since it reads only the first line of stderr looking for "home-scan-guard: BLOCKED")
+expect_block "du ~/[[:upper:]]* (POSIX bracket class matches Desktop/Documents/...)" 'du -sk ~/[[:upper:]]*'
+expect_block "du ~/[[:upper:]]* ~ (same warning-triggering glob, plus a plain \$HOME operand)" 'du -sk ~/[[:upper:]]* ~'
+# a tool name held in a plain tracked variable is the tool it names, exactly as real bash resolves it
+expect_block "T=du; \$T -sk ~ (a variable IS the command word)" 'T=du; $T -sk ~'
+expect_block "cmd=du; \${cmd} -sk ~"          'cmd=du; ${cmd} -sk ~'
+expect_block "T=du; \$T -sk ~/Downloads"      'T=du; $T -sk ~/Downloads'
+# rm/mv/chmod/chown/xattr readdir() the whole tree too -- the same TCC trigger, even though they modify rather than read
+expect_block "rm -rf ~/Downloads"           'rm -rf ~/Downloads'
+expect_block "rm -R ~/Documents"            'rm -R ~/Documents'
+expect_block "mv ~/Documents (no flag needed)" 'mv ~/Documents /tmp/x'
+expect_block "mv ONE named file INTO Downloads (accepted false positive: text can't tell same-volume rename from cross-volume copy)" 'mv /tmp/report.pdf ~/Downloads/'
+expect_block "mv ONE named file OUT of Downloads"  'mv ~/Downloads/report.pdf /tmp/x'
+expect_block "chmod -R ~/Documents"         'chmod -R 755 ~/Documents'
+expect_block "chown -R ~/Documents"         'chown -R me ~/Documents'
+expect_block "chflags -R ~/Downloads"       'chflags -R nouchg ~/Downloads'
+expect_block "xattr -r ~/Downloads"         'xattr -r -d com.apple.quarantine ~/Downloads'
+expect_block "bsdtar ~"                     'bsdtar -cf /tmp/x.tar ~'
+# cd into it, then scan relative to it (the incident's own shape)
 expect_block "cd ~ && du *"                'cd ~ && du -sk *'
 expect_block "cd ~; find ."                'cd ~; find . -name x'
 expect_block "cd \$HOME && for d in *"     'cd $HOME && for d in *; do du -sk "$d"; done'
@@ -159,9 +190,12 @@ expect_block "cd ~/Downloads && find ."    'cd ~/Downloads && find .'
 expect_block "pushd ~ then du ."           'pushd ~ >/dev/null; du -sk .'
 expect_block "subshell (cd ~ && du .)"     '(cd ~ && du -sk .)'
 expect_block "cd ~ && du (no operand)"     'cd ~ && du -sk'
+expect_block "cd ~ && du (no operand), initial cwd is a SAFE repo dir (every tracked cwd is checked, not just the first)" 'cd ~ && du -sk' /Users/athos/gt
 expect_block "cd ~ && rg pat (no path)"    'cd ~ && rg foo'
 expect_block "cd ~ && grep -r pat ."       'cd ~ && grep -r foo .'
-# home listing feeding a scanner
+expect_block "cd .. && du * (from a repo dir up to \$HOME)" 'cd .. && du -sk *' /Users/athos/gt
+expect_block "du ../.. (relative up to \$HOME)" 'du -sk ../..' /Users/athos/gt/foo
+# a listing of $HOME that feeds a measurement, whatever the plumbing
 expect_block "ls ~ | while read: du ~/\$d" 'ls ~ | while read d; do du -sk ~/"$d"; done'
 expect_block "ls ~ | while read: du \$d"   'ls ~ | while read d; do du -sk "$d"; done'
 expect_block "du \$(ls ~)"                 'du -sk $(ls ~)'
@@ -171,7 +205,15 @@ expect_block "for d in ~/*; du \$d"        'for d in ~/*; do du -sk "$d"; done'
 expect_block "for d in \$(ls ~); du ~/\$d" 'for d in $(ls ~); do du -sk ~/$d; done'
 expect_block "ls ~ | xargs du"             'ls ~ | xargs du -sk'
 expect_block "find ~ -maxdepth 1 | xargs du" 'find ~ -maxdepth 1 | xargs du -sk'
-# wrappers and indirection
+expect_block "a glob over \$HOME carried by a command that is not a producer, feeding du" 'stat -f %N ~/* | xargs du -sk' /Users/athos/gt
+expect_block "basename of a home glob, measured" 'basename -a ~/* | xargs -I{} du -sk {}' /Users/athos/gt
+expect_block "the incident with ls in the loop (each entry LISTED)" 'cd ~ && for d in *; do ls -la "$d"; done'
+expect_block "for d in \$(ls ~); ls of each entry" 'for d in $(ls ~); do ls -la ~/"$d"; done' /Users/athos/gt
+expect_block "ls ~ | xargs ls (each entry listed)" 'ls ~ | xargs ls -la' /Users/athos/gt
+expect_block "ls ~ | xargs -I{} sh -c 'ls {}'" "ls ~ | xargs -I{} sh -c 'ls -la {}'" /Users/athos/gt
+expect_block "taint via a variable holding a home listing"  'L=$(ls ~); for d in $L; do du -sk "$d"; done' /Users/athos/gt
+expect_block "taint via for-list ~/*, cwd elsewhere"        'for d in ~/*; do du -sk "$d"; done' /Users/athos/gt
+# wrappers, shells, variables, structure
 expect_block "timeout 60 du ~"             'timeout 60 du -xsk ~'
 expect_block "nice du ~"                   'nice -n 10 du -sk ~'
 expect_block "env VAR=1 du ~"              'env FOO=1 du -sk ~'
@@ -180,8 +222,10 @@ expect_block "bash -c 'du ~'"              "bash -c 'du -sk ~'"
 expect_block "sh -c \"find ~\""            'sh -c "find ~ -maxdepth 1"'
 expect_block "zsh -lc"                     "zsh -lc 'du -sk ~/Downloads'"
 expect_block "eval du ~"                   "eval 'du -sk ~'"
+expect_block "bash -c with \$HOME in double quotes" 'bash -c "du -sk $HOME"'
 expect_block "var alias H=\$HOME; du \$H"  'H=$HOME; du -sk $H'
 expect_block "var to Downloads"            'D=~/Downloads; find "$D" -type f'
+expect_block "for d in <hot dir>; du \$d"  'for d in ~/Downloads/*; do du -sk "$d"; done'
 expect_block "brace group"                 '{ du -sk ~; }'
 expect_block "if/then body"                'if true; then du -sk ~; fi'
 expect_block "pipe stage 2"                'echo x | du -sk ~'
@@ -195,6 +239,10 @@ expect_block "find / -name"                  'find / -name foo 2>/dev/null'
 expect_block "find /Users"                   'find /Users -name foo'
 expect_block "find / -maxdepth 3 (reaches ~/Desktop)" 'find / -maxdepth 3 -name foo'
 expect_block "du -sk /Users"                 'du -sk /Users'
+expect_block "du -d 1 -h / (depth limits the printout, not the walk)" 'du -d 1 -h /'
+expect_block "find / -maxdepth \$N (a limit the text does not show is no limit)" 'find / -maxdepth $N -name x'
+expect_block "find / -maxdepth \$N -maxdepth 1 (one unreadable value makes the WHOLE thing unlimited, even with a small one alongside)" 'find / -maxdepth $N -maxdepth 1 -name x'
+expect_block "find / -maxdepth 1 -maxdepth 6 (the tools disagree which occurrence wins: the largest counts)" 'find / -maxdepth 1 -maxdepth 6 -name x'
 expect_block "rg pat /"                      'rg foo /'
 expect_block "grep -r pat /Users"            'grep -r foo /Users'
 expect_block "ls -R /Users"                  'ls -R /Users'
@@ -204,30 +252,39 @@ expect_block "du /Users/*/Downloads"         'du -sk /Users/*/Downloads'
 expect_block "ls /Users/*/Desktop"           'ls -la /Users/*/Desktop'
 expect_block "du /Users/at* (glob matches \$HOME)" 'du -sk /Users/at*'
 expect_block "find /Users/\$u/Documents (unknown user)" 'find /Users/$u/Documents -name x'
+expect_block "du /U*/athos (glob in the first component)" 'du -sk /U*/athos'
+expect_block "du /[U]sers/athos/Desktop"     'du -sk /[U]sers/athos/Desktop'
+expect_block "du /System/Volumes/Data/Users/athos (firmlink to \$HOME)" 'du -sk /System/Volumes/Data/Users/athos'
 # spellings of $HOME that only NORMALISE to it
 expect_block "find ~/."                      'find ~/. -name x'
 expect_block "du ~//"                        'du -sk ~//'
 expect_block "du ~/./"                       'du -sk ~/./'
-expect_block "cd .. && du * (from a repo dir up to \$HOME)" 'cd .. && du -sk *' /Users/athos/gt
-expect_block "du ../.. (relative up to \$HOME)" 'du -sk ../..' /Users/athos/gt/foo
-# taint mechanisms, each with the cwd AWAY from $HOME so nothing else can catch them
-expect_block "taint via for-list \$(ls ~), cwd elsewhere"  'for d in $(ls ~); do du -sk "$d"; done' /Users/athos/gt
-expect_block "taint via while-read fed by ls ~, cwd elsewhere" 'ls ~ | while read -r d; do du -sk "$d"; done' /Users/athos/gt
-expect_block "taint via a variable holding a home listing"  'L=$(ls ~); for d in $L; do du -sk "$d"; done' /Users/athos/gt
-expect_block "taint via for-list ~/*, cwd elsewhere"        'for d in ~/*; do du -sk "$d"; done' /Users/athos/gt
+expect_block "du //Users//athos"             'du -sk //Users//athos'
+expect_block "du ~athos/Desktop"             'du -sk ~athos/Desktop'
 # names are case-insensitive on the default macOS volume
 expect_block "du ~/downloads (lowercase)"    'du -sk ~/downloads'
 expect_block "du ~/DOCUMENTS"                'du -sk ~/DOCUMENTS'
 expect_block "du ~/library/cloudstorage"     'du -sk ~/library/cloudstorage'
 # brace / glob expansion under $HOME
 expect_block "du ~/{gt,Downloads}"           'du -sk ~/{gt,Downloads}'
+# a brace expression past MAX_ALTERNATIVES (64) is "could be anything" (a hit), not a pass -- even when every alternative it
+# COULD show is safe: chained groups multiply (7 x {a,b} = 128), a single group with >64 comma items does not (see the ALLOW
+# control below: the single-group case only blocks when a protected NAME happens to be among its fully-expanded alternatives)
+expect_block "7 chained {a,b} groups (128 alternatives) under \$HOME" 'du -sk ~/gt{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}'
+expect_allow "6 chained {a,b} groups (64, at the cap, not over) under a repo dir" 'du -sk ~/gt{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}'
 expect_block "du ~/D* (matches Documents)"   'du -sk ~/D*'
 expect_block "du ~/.* (hidden entries incl .Trash)" 'du -sk ~/.*'
-expect_block "ls ~/.Trash"                   'ls -la ~/.Trash'
 expect_block "du Photos library (a dir with an extension)" 'du -sk ~/Pictures/Photos\ Library.photoslibrary'
 expect_block "du Group Containers"           'du -sk ~/Library/Group\ Containers'
-expect_block "bash -c with \$HOME in double quotes" 'bash -c "du -sk $HOME"'
-expect_block "du -d 1 (numeric option value) with cwd=\$HOME" 'du -d 1 -h' /Users/athos
+expect_block "du \$'...' (ANSI-C quoting, plain text)" "du -sk \$'/Users/athos/Desktop'"
+# the Drive / iCloud mounts are network-backed: ANY listing under them can prompt or hang the session (ga-khuz1)
+expect_block "ls a Google Drive folder under CloudStorage (seen in the wild)" 'timeout 15 ls "/Users/athos/Library/CloudStorage/GoogleDrive-x@example.com/My Drive" | head -3'
+expect_block "ls -la ~/Library/CloudStorage/"  'ls -la ~/Library/CloudStorage/'
+expect_block "ls an iCloud Drive folder"       'ls ~/Library/Mobile\ Documents/com~apple~CloudDocs'
+# recursion without a flag, and a cwd spelled as a variable
+expect_block "git grep --no-index over a protected folder" 'git grep --no-index foo ~/Downloads'
+expect_block "du \"\$PWD/..\" from a repo dir (= \$HOME)" 'du -sk "$PWD/.."' /Users/athos/gt
+expect_block "cd \$HOME then a recursive grep with no path (seen in the wild)" "cd /Users/athos && timeout 120 grep -rIln --include='*.sh' -E 'Group Containers|Library/Containers' --exclude-dir=venv"
 # implicit cwd taken from the hook JSON
 expect_block "find . with cwd=\$HOME"        'find . -name x'               /Users/athos
 expect_block "du (no operand) cwd=Downloads" 'du -sk'                        /Users/athos/Downloads
@@ -235,364 +292,14 @@ expect_block "rg pat cwd=Documents"          'rg foo'                        /Us
 expect_block "grep -r pat . cwd=\$HOME"      'grep -r foo .'                 /Users/athos
 expect_block "du * cwd=\$HOME"               'du -sk *'                      /Users/athos
 expect_block "ls -R cwd=Desktop"             'ls -R'                         /Users/athos/Desktop
+expect_block "ls (plain) cwd=Downloads (a listing OF the protected folder)" 'ls -la' /Users/athos/Downloads
 expect_block "for d in * cwd=\$HOME"         'for d in *; do du -sk "$d"; done' /Users/athos
-
-# ─────────────────────────────────────────────────────────────────────────
-echo ""
-echo "-- gate round 1 (ga-02cqk4 attempt 1/3): the two blockers, as the reviewer reproduced them --"
-# ─────────────────────────────────────────────────────────────────────────
-# BLOCKER 1: the "depth <= 2 never reaches a protected folder" exemption for an ANCESTOR (/, /Users) is
-# true for the flags that STOP THE WALK (find -maxdepth, tree -L, fd/rg --max-depth) and false for du -d /
-# --max-depth and dust -d, which only limit what is PRINTED: du still opens the whole subtree to add the
-# sizes up. `du -d 1 -h /` is the most natural "what is eating my disk" query there is.
-expect_block "du -d 1 -h /Users (depth limits the printout, not the walk)" 'du -d 1 -h /Users'
-expect_block "du -d 2 /"                    'du -d 2 /'
-expect_block "du -h -d1 /"                  'du -h -d1 /'
-expect_block "du --max-depth=1 /Users"      'du --max-depth=1 /Users'
-expect_block "du --max-depth 1 /"           'du --max-depth 1 /'
-expect_block "dust -d 1 /Users"             'dust -d 1 /Users'
-expect_block "gdu -d 1 /"                   'gdu -d 1 /'
-expect_block "du -d 1 -h \$HOME (the control the guard already had)" 'du -d 1 -h /Users/athos'
-expect_block "ls -R -L 2 /Users (ls has no depth flag: -L is 'follow symlinks')" 'ls -R -L 2 /Users'
-# a depth flag that DOES stop the walk only excuses an ancestor if every stated limit is small and readable
-expect_block "tree -L 2 -L 9 / (the tools disagree on which occurrence wins)" 'tree -L 2 -L 9 /'
-expect_block "find / -maxdepth 1 -maxdepth 6"         'find / -maxdepth 1 -maxdepth 6 -name x'
-expect_block "tree -L \$N / (a limit the text does not show)" 'tree -L $N /'
-expect_block "find / -maxdepth \$N"                   'find / -maxdepth $N -name x'
-# BLOCKER 2: du, dust, gdu, ncdu and tree used ONE valued-flag table, so a letter that takes a value for one
-# tool and is a plain switch for another swallowed the PATH as its "value"; the operand list came out empty
-# and the guard checked the cwd instead. In real du -L/-P/-n are switches; in real tree -d/-t/-n are switches.
-expect_block "tree -d ~/Downloads (-d = dirs only)"   'tree -d ~/Downloads'
-expect_block "tree -t ~/Documents (-t = sort by mtime)" 'tree -t ~/Documents'
-expect_block "tree -n ~/Desktop (-n = no colour)"     'tree -n ~/Desktop'
-expect_block "du -L ~/Downloads"            'du -L ~/Downloads'
-expect_block "du -sL ~/Downloads"           'du -sL ~/Downloads'
-expect_block "du -hP ~/Documents"           'du -hP ~/Documents'
-expect_block "du -P ~"                      'du -P ~'
-expect_block "du -n ~/Pictures"             'du -n ~/Pictures'
-expect_block "gdu -n ~ (gdu is du here; -n is a switch)" 'gdu -n ~'
-expect_block "dust -P ~/Documents"          'dust -P ~/Documents'
-expect_block "the swallowed word is kept even when another operand follows" 'du -L ~/Downloads ~/gt'
-expect_block "du -L on a hot operand behind a safe one" 'du -L ~/gt ~/Downloads'
-# the same shape one tool over: BSD find takes options BEFORE the path, and the parser stopped at the first one it
-# did not know, so the path after it was read as "no operand" and the cwd was checked instead
-expect_block "find -f ~/Downloads (BSD: -f names the tree to walk)" 'find -f ~/Downloads -name x'
-expect_block "find -Hx ~/Downloads (BSD clusters its option letters)" 'find -Hx ~/Downloads -name x'
-expect_block "find -EX ~/Documents"         'find -EX ~/Documents -name x'
-expect_block "find -O3 ~/Downloads (GNU optimiser level)" 'find -O3 ~/Downloads -name x'
-expect_block "find -D tree ~/Downloads (GNU debug option takes a value)" 'find -D tree ~/Downloads -name x'
-expect_block "find -H ~/Downloads"          'find -H ~/Downloads -name x'
-
-# ─────────────────────────────────────────────────────────────────────────
-echo ""
-echo "-- gate round 1: the non-blocking findings, fixed with the class --"
-# ─────────────────────────────────────────────────────────────────────────
-# a trailing slash is PROOF of a directory: a dotted directory name is not "one named file"
-expect_block "du a dotted dir with a trailing slash"    'du -sk ~/Downloads/jdk-17.0.2/'
-expect_block "cp -r a dotted dir with a trailing slash" 'cp -r ~/Documents/proj.v2/ /tmp/x'
-expect_block "rsync -a a dotted dir with a trailing slash" 'rsync -a ~/Downloads/data.bak/ /tmp/x/'
-expect_block "tar c a dotted dir with a trailing slash" 'tar czf /tmp/x.tgz ~/Documents/site.2024/'
-# ...and an explicit recursion flag means the operand is walked, so "it has an extension" proves nothing
-expect_block "cp -r ~/Downloads/x.pdf (explicit recursion)"   'cp -r ~/Downloads/x.pdf /tmp/x'
-expect_block "rsync -a ~/Documents/proj.v2 (dotted name)"     'rsync -a ~/Documents/proj.v2 /tmp/x'
-expect_block "zip -r ~/Documents/site.2024"                   'zip -r /tmp/x.zip ~/Documents/site.2024'
-expect_block "tar c a dotted name"                            'tar czf /tmp/x.tgz ~/Documents/site.2024'
-# an option VALUE can carry the path too: tar walks whatever -C / --directory points at, spelled any way
-expect_block "tar --directory=\$HOME ."              'tar czf /tmp/x.tgz --directory=/Users/athos .'
-expect_block "tar -C/Users/athos . (attached)"      'tar czf /tmp/x.tgz -C/Users/athos .'
-expect_block "tar --directory ~/Downloads ."        'tar czf /tmp/x.tgz --directory ~/Downloads .'
-expect_block "tar -czC \$HOME (C last in a cluster)" 'tar -czC /Users/athos -f /tmp/x.tgz .'
-expect_block "tar --directory=\$HOME with an expansion" 'tar czf /tmp/x.tgz --directory=$HOME .'
-# ls -d does not list a directory operand -- but the SHELL expands a glob operand by listing it
-expect_block "ls -d ~/Downloads/* (the shell lists Downloads)" 'ls -d ~/Downloads/*'
-expect_block "ls -d ~/Documents/*.pdf"              'ls -d ~/Documents/*.pdf'
-# a cd inside a subshell is scoped to it: what runs AFTER the subshell sees the outer cwd again
-expect_block "subshell cd away then a relative scan of the real cwd (\$HOME)" '(cd /tmp && ls); du -sk *' /Users/athos
-expect_block "nested subshells, the outer cwd is \$HOME again" '( (cd /tmp) ); du -sk *' /Users/athos
-expect_block "subshell that closes before && then scans"       '(cd /tmp && true) && find . -name x' /Users/athos
-expect_block "a cd on the left of a pipe runs in a subshell"    'cd /tmp | cat; du -sk *' /Users/athos
-expect_block "a backgrounded cd runs in a subshell"             'cd /tmp & du -sk *' /Users/athos
-# cd - / popd: the previous directory is TRACKED, not forgotten (a forgotten cwd behaves like a safe one)
-expect_block "cd - returns to a hot dir, then a relative scan"       'cd ~/Downloads && cd /tmp && cd - && du -sk *' /Users/athos/gt
-expect_block "pushd/popd back to \$HOME, then a relative scan"       'pushd /tmp >/dev/null; popd >/dev/null; du -sk *' /Users/athos
-# ls -T is tree mode for eza/exa/lsd only; recursion through those is still recursion
-expect_block "eza -T ~"                     'eza -T ~'
-expect_block "eza --tree ~/Documents"       'eza --tree ~/Documents'
-expect_block "exa -R ~"                     'exa -R ~'
-expect_block "lsd --tree ~"                 'lsd --tree ~'
-expect_block "eza -L 3 -T / (a depth that reaches ~/Desktop)" 'eza -L 3 -T /'
-# the bash prefilter is a SUPERSET of the classifier: doubled slashes and /./ spell the same path
-expect_block "du //Users/athos (doubled leading slash)"  'du -sk //Users/athos'
-expect_block "find /Users//athos/Desktop"                'find /Users//athos/Desktop -type f'
-expect_block "du /Users/./athos (a dot component)"       'du -sk /Users/./athos'
-expect_block "find /Users/athos/./Desktop"               'find /Users/athos/./Desktop -type f'
-expect_block "du /users/athos (case-insensitive volume)" 'du -sk /users/athos'
-# found by a differential fuzz of the prefilter against the classifier (62 of 5658 blocked commands never reached it):
-# a path that ends in "/" and is followed by a space is the directory itself, and an ancestor can be attached to an option
-expect_block "find ~/ -name x (trailing slash, then more arguments)"  'find ~/ -name x'   /Users/athos/gt
-expect_block "find /Users/athos/ -maxdepth 3"        'find /Users/athos/ -maxdepth 3 -name x' /Users/athos/gt
-expect_block "rsync -a ~/ /tmp/x"                     'rsync -a ~/ /tmp/x'                     /Users/athos/gt
-expect_block "mdfind -onlyin ~/ foo"                  'mdfind -onlyin ~/ foo'                  /Users/athos/gt
-expect_block "cd ~/ && du -sk ."                      'cd ~/ && du -sk .'                      /Users/athos/gt
-expect_block "tar -C/Users . (ancestor attached to the option)" 'tar czf /tmp/x.tgz -C/Users .' /Users/athos/gt
-expect_block "tar -C/ ."                              'tar czf /tmp/x.tgz -C/ .'               /Users/athos/gt
-expect_block "tar -C/Users/*/Desktop ."               'tar czf /tmp/x.tgz -C/Users/*/Desktop .' /Users/athos/gt
-
-# ─────────────────────────────────────────────────────────────────────────
-echo ""
-echo "-- gate round 2 (ga-02cqk4 attempt 2/3): a fixed cap must never turn 'too big to analyse' into 'not hot' --"
-# ─────────────────────────────────────────────────────────────────────────
-# The classifier had fixed caps (brace alternatives, brace rounds, stacked wrappers) and each ended in the SAME silent exit 0
-# that a genuinely safe command gets: no block, no log line. "Couldn't know" must not look like "knew it was fine". Now the
-# unexpandable becomes an unknown VALUE (the way `~/$UNSET` already is, and unknown-under-~ is hot), and nothing is capped that
-# does not have to be. The helper below asserts the LOG as well as the rc: Abort is exit 0, so an rc-only test cannot tell
-# "blocked" from "gave up quietly".
-ONE="$SCRATCH/one.log"
-blocked_and_logged() {  # name command [cwd]
-  : > "$ONE"
-  hook_json "$2" "${3-}" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; local rc=$?
-  if [ "$rc" -eq 2 ] && [ "$(grep -c 'result=BLOCKED' "$ONE")" = 1 ] && ! grep -qE 'result=(GAVE-UP|ENGINE-ERROR|UNGUARDED)' "$ONE"; then
-    ok "BLOCK+LOG  $1"
-  else
-    bad "BLOCK+LOG  $1 -- rc=$rc, log=[$(cut -c1-200 "$ONE" | tr '\n' '|')] cmd=[${2:0:120}]"
-  fi
-}
-ALT70="$(printf 'a%s,' $(seq 0 69))Desktop"
-blocked_and_logged "brace: 125 words, 25 of them ~/Desktop (the reviewer's repro; the cap was 64)" 'du -sk ~/{Desktop,x,y,z,w}{,,,,}{,,,,}'
-blocked_and_logged "brace: 71 alternatives, the last one ~/Desktop (the reviewer's second repro)"  "du -sk ~/{$ALT70}"
-blocked_and_logged "wrappers: env x8 (the reviewer's repro; the budget was 8)"                  'env env env env env env env env du -sk ~/Desktop'
-blocked_and_logged "wrappers: nice x9"                                                          'nice nice nice nice nice nice nice nice nice du -sk ~/Desktop'
-# the SAME class one site over: the brace loop had a 6-round budget, and the 7th group was left unexpanded ("desktop{,}" is
-# not a protected name). 7 two-way groups is exactly 64 items after round 6 -- under the alternatives cap, over the round cap.
-blocked_and_logged "brace: 7 chained groups (the round budget, not the alternatives cap)"       'du -sk ~/{Desktop,x}{,}{,}{,}{,}{,}{,}'
-blocked_and_logged "brace: 7 nested groups"                                                     'du -sk ~/{x,{x,{x,{x,{x,{x,{x,Desktop}}}}}}}'
-blocked_and_logged "brace: a sequence expression ({D..D}esktop is Desktop)"                      'du -sk ~/{D..D}esktop'
-expect_block "brace: {D..E}esktop"                          'du -sk ~/{D..E}esktop'
-expect_block "brace (control): a sequence with a step, then .. still normalises" 'du -sk ~/{1..9..2}/../Desktop'
-expect_block "brace: over the cap under ~/Library"          "du -sk ~/Library/{$ALT70,CloudStorage}"
-expect_block "brace: over the cap, /Users/*-style ancestor" "du -sk /Users/{$ALT70}"
-# ...and the cap must not become a blanket block: unknown under a SAFE parent is not hot
-expect_allow "brace: 71 alternatives under ~/gt"            "du -sk ~/gt/{$ALT70}"
-expect_allow "brace: 7 chained groups under ~/gt"           'du -sk ~/gt/{a,b}{,}{,}{,}{,}{,}{,}'
-expect_allow "brace: a sequence under ~/gt"                 'du -sk ~/gt/{1..3}'
-expect_allow "brace: a numeric sequence in a harmless command" 'echo {1..3}'
-# stacking: no cap on how many wrappers sit in front of the scanner
-expect_block "wrappers: 40 x env"                  "$(printf 'env %.0s' $(seq 1 40))du -sk ~/Desktop"
-expect_block "wrappers: a mix of eight kinds"      'command exec nohup setsid time timeout 5 nice sudo du -sk ~/Desktop'
-expect_block "wrappers: wrappers, then xargs"      'env env env env env env env env env xargs du -sk ~/Downloads'
-expect_allow "wrappers: 40 x env before a SAFE scan" "$(printf 'env %.0s' $(seq 1 40))du -sk ~/gt"
-# the command WORD is brace-expanded by the shell too: {du,ls} ~/Desktop runs `du ls ~/Desktop`
-expect_block "command word: {du,ls} ~/Desktop"     '{du,ls} ~/Desktop'
-expect_block "command word: du{,} ~/Desktop"       'du{,} ~/Desktop'
-expect_block "command word: a wrapper inside the braces" '{env,du} -sk ~/Desktop'
-expect_block "command word: 8 wrappers inside the braces" '{env,env,env,env,env,env,env,env,du} -sk ~/Desktop'
-expect_allow "command word: {ls,-la} ~/gt"         '{ls,-la} ~/gt'
-expect_allow "command word: {echo,hi}"             '{echo,hi}'
-# tilde prefixes: ~athos is $HOME (the prefilter in the wrapper skipped it too), ~+ / ~- are $PWD / $OLDPWD
-expect_block "tilde: ~athos/Desktop"               'du -sk ~athos/Desktop'
-expect_block "tilde: ~athos (bare)"                'du -sk ~athos'
-expect_block "tilde: find ~athos"                  'find ~athos -name x'
-expect_block "tilde: ls ~athos/Downloads"          'ls ~athos/Downloads'
-expect_block "tilde: ~+ is \$PWD (cwd ~/gt, one .. up is \$HOME)" 'du -sk ~+/../Desktop' /Users/athos/gt
-expect_block "tilde (control): ~+ with cwd=Downloads"       'du -sk ~+' /Users/athos/Downloads
-expect_allow "tilde: another user's home"          'du -sk ~someone/Desktop'
-expect_allow "tilde: ~athos/gt"                    'du -sk ~athos/gt'
-expect_allow "tilde: ~+ with cwd=~/gt"             'du -sk ~+' /Users/athos/gt
-# stdin fed by a listing of $HOME: the incident (list $HOME, measure each entry) in the other standard spelling
-G=/Users/athos/gt
-expect_block "stdin: xargs du < <(ls ~)"           'xargs du -sk < <(ls ~)' $G
-expect_block "stdin: xargs du <<< \"\$(ls ~)\""    'xargs du -sk <<< "$(ls ~)"' $G
-expect_block "stdin: while read ...; done < <(ls ~)" 'while read -r d; do du -sk "$d"; done < <(ls ~)' $G
-expect_block "stdin: IFS= read -r, ls -A"          'while IFS= read -r d; do du -sk "$d"; done < <(ls -A ~)' $G
-expect_block "stdin (control): a bare ls with cwd=\$HOME"    'while read -r d; do du -sk "$d"; done < <(ls -A)' /Users/athos
-expect_block "stdin: the listing is made after a cd" 'while read -r d; do du -sk "$d"; done < <(cd ~ && ls)' $G
-expect_block "stdin: read ONE entry, then measure it" 'read -r d < <(ls ~); du -sk "$d"' $G
-expect_block "stdin: read with no name (REPLY)"    'read -r < <(ls ~); du -sk "$REPLY"' $G
-expect_block "stdin: mapfile, loop over the array" 'mapfile -t a < <(ls ~); for d in "${a[@]}"; do du -sk "$d"; done' $G
-expect_block "stdin: readarray, measure the array" 'readarray -t a < <(ls ~); du -sk "${a[@]}"' $G
-expect_block "stdin: mapfile with no name (MAPFILE)" 'mapfile -t < <(ls ~); du -sk "${MAPFILE[@]}"' $G
-expect_block "stdin: a heredoc carrying the listing" $'xargs du -sk <<EOF\n$(ls ~)\nEOF' $G
-INNER_LOOP='while read -r d; do du -sk "$d"; done < <(ls ~)'
-expect_block "stdin: the same loop inside bash -c" "bash -c '$INNER_LOOP'" $G
-expect_allow "stdin: the same loop over ~/gt"       'while read -r d; do du -sk "$d"; done < <(ls ~/gt)' $G
-expect_allow "stdin: xargs du over ~/gt"            'xargs du -sk < <(ls ~/gt)' $G
-expect_allow "stdin: mapfile of ~/gt"               'mapfile -t a < <(ls ~/gt); du -sk "${a[@]}"' $G
-expect_allow "stdin: a loop fed by git"             'while read -r l; do du -sk "$l"; done < <(git ls-files)' $G
-expect_allow "stdin: a listing of \$HOME read but no entry scanned" 'while read -r d; do echo "$d"; done < <(ls ~)' $G
-# gate round 3: "stdin is a listing of $HOME" must survive the SHELL hop. `xargs -I{} sh -c 'du -sk "{}"'` is the incident with
-# one more process in the middle: the placeholder ({} / -I str) and the positional parameters ($0, $1, "$@") of that inner shell ARE
-# entries of $HOME, and the inner script used to be analysed as if nothing was feeding it (a static literal `{}` is not hot).
-H=/Users/athos
-expect_block "xargs sh -c: the incident, spelled with xargs + sh -c" \
-  $'cd /Users/athos && ls -A | xargs -I{} sh -c \'timeout 60 du -xsk "{}" 2>/dev/null\' | sort -rn | head -25' $H
-expect_block "xargs sh -c: ls -A, quoted placeholder"       $'ls -A | xargs -I{} sh -c \'du -sk "{}"\'' $H
-expect_block "xargs sh -c: ls, bare placeholder"            $'ls | xargs -I{} sh -c \'du -sk {}\'' $H
-expect_block "xargs sh -c: ls ~, placeholder under ~/"      $'ls ~ | xargs -I{} sh -c \'du -sk ~/{}\'' $G
-expect_block "xargs sh -c: ls -d ~/*/ (absolute entries)"   $'ls -d ~/*/ | xargs -I{} sh -c \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: positional \$0 (-n1)"            $'ls -d ~/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
-expect_block "xargs sh -c: positional \$0, echo of ~/*"     $'echo ~/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
-expect_allow "(control) ~**/* is not \$HOME in bash: ~ + ** is no tilde prefix" $'ls -d ~**/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
-expect_block "xargs sh -c: printf of ~/*"                   $'printf \'%s\\n\' ~/* | xargs -I{} sh -c \'du -sk "{}"\'' $G
-expect_block "xargs bash -c: the same"                      $'ls ~ | xargs -I{} bash -c \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: -I% (another replacement string)" $'ls ~ | xargs -I% sh -c \'du -sk "%"\'' $G
-expect_block "xargs sh -c: -I {} (value is a separate word)" $'ls ~ | xargs -I {} sh -c \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: -i (GNU, default {})"            $'ls ~ | xargs -i sh -c \'du -sk {}\'' $G
-expect_block "xargs sh -c: --replace=@@"                    $'ls ~ | xargs --replace=@@ sh -c \'du -sk "@@"\'' $G
-expect_block "xargs sh -c: -J (BSD)"                        $'ls ~ | xargs -J @ sh -c \'du -sk @\'' $G
-expect_block "xargs sh -c: positional \$1 after a name"     $'ls ~ | xargs -n1 sh -c \'du -sk "$1"\' _' $G
-expect_block "xargs sh -c: \"\$@\" after a name"            $'ls ~ | xargs sh -c \'du -sk "$@"\' _' $G
-expect_block "xargs sh -c: \${1} spelled with braces"       $'ls ~ | xargs -n1 sh -c \'du -sk "${1}"\' _' $G
-expect_block "xargs sh -c: \$* after a name"                $'ls ~ | xargs sh -c \'du -sk $*\' _' $G
-expect_block "xargs sh -c: the placeholder used twice, one use safe" $'ls ~ | xargs -I{} sh -c \'echo {}; du -sk {}\'' $G
-expect_block "xargs sh -c: find on the entry"               $'ls ~ | xargs -I{} sh -c \'find {} -type f\'' $G
-expect_block "xargs sh -c: ls -R on the entry"              $'ls ~ | xargs -I{} sh -c \'ls -R ~/{}\'' $G
-expect_block "xargs sh -c: cd into the entry, then measure" $'ls ~ | xargs -I{} sh -c \'cd ~/{} && du -sk .\'' $G
-expect_block "xargs sh -c: a wrapper between xargs and the shell" $'ls ~ | xargs -I{} timeout 5 sh -c \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: env, then the shell"             $'ls ~ | xargs -I{} env A=1 sh -c \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: bash -lc (clustered flags)"      $'ls ~ | xargs -I{} bash -lc \'du -sk "{}"\'' $G
-expect_block "xargs sh -c: the scan is inside a \$( ) of the inner script" $'ls ~ | xargs -I{} sh -c \'du -sk "$(echo {})"\'' $G
-expect_block "xargs sh -c: a shell inside the shell"        $'ls ~ | xargs -I{} sh -c "sh -c \'du -sk {}\'"' $G
-expect_block "xargs sh -c: after a filter stage in the pipeline" $'ls ~ | grep -v x | xargs -I{} sh -c \'du -sk "{}"\'' $G
-expect_block "xargs eval: the same hop through eval"        $'ls ~ | xargs -I{} eval "du -sk {}"' $G
-expect_block "xargs sh -c: fed by a redirect, not a pipe"   $'xargs -I{} sh -c \'du -sk "{}"\' < <(ls ~)' $G
-expect_block "xargs sh -c: fed by a here-string"            $'xargs -I{} sh -c \'du -sk "{}"\' <<< "$(ls ~)"' $G
-# the same hop WITHOUT xargs: whatever tells the inner script "this is an entry of $HOME" has to cross `sh -c` / `eval` too --
-# a $( ) written inside the -c string, a loop variable handed over as an argument, or one carried in by a prefix assignment
-expect_block "hop: \$(ls ~) inside a double-quoted bash -c string"  $'bash -c "du -sk $(ls ~)"' $G
-expect_block "hop: \$(ls ~) inside an eval string"                  $'eval "du -sk $(ls ~)"' $G
-expect_block "hop: \$(ls -A) inside sh -c, cwd=\$HOME"              $'sh -c "du -sk $(ls -A)"' $H
-expect_block "hop: a backtick listing inside sh -c"                 $'sh -c "du -sk `ls ~`"' $G
-expect_block "hop: a listing among other \$( ) in the string"       $'sh -c "echo $(date); du -sk $(ls ~)"' $G
-expect_block "hop: loop variable passed as \$1"                     $'for d in $(ls ~); do bash -c \'du -sk "$1"\' _ "$d"; done' $G
-expect_block "hop: loop variable passed as \$0"                     $'for d in $(ls ~); do bash -c \'du -sk "$0"\' "$d"; done' $G
-expect_block "hop: loop variable passed, read as \"\$@\""           $'for d in $(ls ~); do bash -c \'du -sk "$@"\' _ "$d"; done' $G
-expect_block "hop: an explicit protected folder passed as \$1"      $'bash -c \'du -sk "$1"\' _ ~/Downloads' $G
-expect_block "hop: loop variable carried by a prefix assignment"    $'for d in $(ls ~); do x="$d" sh -c \'du -sk "$x"\'; done' $G
-expect_block "hop: loop variable carried by env NAME=VALUE"         $'for d in $(ls ~); do env x="$d" sh -c \'du -sk "$x"\'; done' $G
-expect_block "hop: a prefix assignment of an explicit protected folder" $'x=~/Downloads sh -c \'du -sk "$x"\'' $G
-expect_block "hop: the assignment carries a listing"                $'x="$(ls ~)" sh -c \'du -sk $x\'' $G
-expect_allow "hop (control): \$(ls ~/gt) inside a bash -c string"   $'bash -c "du -sk $(ls ~/gt)"' $G
-expect_allow "hop (control): a repo loop variable passed as \$1"    $'for d in $(ls ~/gt); do bash -c \'du -sk "$1"\' _ "$d"; done' $G
-expect_allow "hop (control): a repo path passed as \$1"             $'bash -c \'du -sk "$1"\' _ ~/gt/docs' $G
-expect_allow "hop (control): a prefix assignment of a repo path"    $'x=~/gt sh -c \'du -sk "$x"\'' $G
-expect_allow "hop (control): \$(ls ~) inside -c, but only echoed"   $'sh -c "echo $(ls ~)"' $G
-expect_allow "hop (control): a \$( ) that lists nothing of \$HOME"  $'sh -c "du -sk $(git rev-parse --show-toplevel)"' $G
-expect_allow "hop (control): env with a plain value"                $'env A=1 sh -c \'du -sk ~/gt\'' $G
-# gate round 3, the wrapper's prefilter: what the classifier blocks, the wrapper must not pass in silence. A glob / class / brace /
-# backslash inside the FIRST component of an absolute path can still name /Users (or /Volumes), and a backslash before a protected
-# name is the same folder (\D = D). The same roots also have a second spelling on macOS: /System/Volumes/Data/Users/...
-# EVERY case below carries a cwd ($G): with none, the wrapper sends the command straight to the classifier (an empty cwd is "don't know"),
-# so the PREFILTER -- the stage under test -- would never run and these would pass whether or not it had the hole.
-expect_block "prefilter: glob in the first component (/U*/athos)"        'du -sk /U*/athos' $G
-expect_block "prefilter: /U*/*"                                         'du -sh /U*/*' $G
-expect_block "prefilter: ls -R /U*"                                     'ls -R /U*' $G
-expect_block "prefilter: ? in /Us?rs"                                   'du -sk /Us?rs/athos' $G
-expect_block "prefilter: a class, /[U]sers"                             'du -sk /[U]sers/athos/Desktop' $G
-expect_block "prefilter: a brace list, /{Users,x}"                      'du -sk /{Users,x}/athos/Desktop' $G
-expect_block "prefilter: find /Us?rs"                                   'find /Us?rs -name x' $G
-expect_block "prefilter: backslash before the protected name (~/\\Desktop)"  'du -sk ~/\Desktop' $G
-expect_block "prefilter: backslash, lower case (~/\\downloads)"         'du -sk ~/\downloads' $G
-expect_block "prefilter: backslash under an absolute \$HOME"            'du -sk /Users/athos/\Desktop' $G
-expect_block "prefilter: glob naming /Volumes (/Vol*)"                  'du -sk /Vol*' $G
-expect_block "prefilter: ? naming /Volumes (/V?lumes/x)"                'du -sk /V?lumes/x' $G
-expect_block "prefilter: /Vol*/x"                                       'du -sk /Vol*/x' $G
-expect_block "prefilter: find /Volume?"                                 'find /Volume? -type f' $G
-expect_block "firmlink: /System/Volumes/Data/Users/athos/Desktop"      'du -sk /System/Volumes/Data/Users/athos/Desktop' $G
-expect_block "firmlink: /System/Volumes/Data/Users/athos"              'du -sk /System/Volumes/Data/Users/athos' $G
-expect_block "firmlink: find /System/Volumes/Data (the whole data volume)" 'find /System/Volumes/Data -name x' $G
-expect_block "firmlink: ls -R /System/Volumes/Data/Users"              'ls -R /System/Volumes/Data/Users' $G
-expect_allow "prefilter (control): a glob in the first component that is not /Users" 'du -sk /usr/lib*' $G
-expect_allow "prefilter (control): ls /tmp/*"                           'ls /tmp/*' $G
-expect_allow "prefilter (control): find /usr/local/l*"                  'find /usr/local/l* -name x' $G
-expect_allow "prefilter (control): a class over /opt"                   'grep -r foo /opt/homebrew/li?/' $G
-expect_allow "prefilter (control): /Users/Shared/*"                     'ls /Users/Shared/*' $G
-expect_allow "firmlink (control): the private tmp under the data volume" 'du -sk /System/Volumes/Data/private/tmp/x' $G
-expect_allow "firmlink (control): /System/Library"                      'ls /System/Library' $G
-# gate round 3, a false positive: with explicit path operands after it, a path-LIKE first operand of a searcher is the PATTERN
-# (grep -rn "/Users/athos/Downloads" scripts/ searches scripts/ for that text). Only a lone operand (`rg ~`) is read as a path.
-expect_allow "pattern that looks like a path, explicit dir after it (grep)"  'grep -rn "/Users/athos/Downloads" scripts/' $G
-expect_allow "pattern that looks like a path, explicit dir after it (rg)"    "rg -n '/Users/athos/Documents' scripts/" $G
-expect_allow "pattern /Volumes/ with two dirs after it (rg)"                 'rg -n "/Volumes/" scripts/ packs/' $G
-expect_allow "pattern ~/Downloads (quoted) with a dir after it"              'grep -rn "~/Downloads" scripts/' $G
-expect_allow "pattern \$HOME/Desktop (single-quoted) with a dir after it"    "rg -n '\$HOME/Desktop' docs/" $G
-expect_allow "fd with a path-like pattern and a dir"                         "fd '/Users/athos/Downloads' scripts" $G
-expect_block "pattern-looking first operand, but the path after it is protected" 'grep -rn "/Users/athos/Downloads" ~/Documents' $G
-expect_block "(control) a lone path-like operand is still a path (rg ~)"    'rg ~' $G
-expect_block "(control) a lone path-like operand is still a path (grep -r ~/Downloads)" 'grep -r ~/Downloads' $G
-expect_block "(control) grep -r PATTERN ~/Downloads"                        'grep -r foo ~/Downloads' $G
-expect_block "(control) rg -e PATTERN ~/Downloads"                          'rg -e foo ~/Downloads' $G
-expect_allow "xargs sh -c (control): the listing is a repo dir, not \$HOME" $'ls ~/gt | xargs -I{} sh -c \'du -sk ~/gt/{}\'' $G
-expect_allow "xargs sh -c (control): \$0 over a repo listing"  $'ls ~/gt | xargs -n1 sh -c \'du -sk "$0"\'' $G
-expect_allow "xargs sh -c (control): fed by printf of names"   $'printf "a\\nb\\n" | xargs -I{} sh -c \'du -sk ~/gt/{}\'' $G
-expect_allow "xargs sh -c (control): \$HOME listing, inner script scans nothing" $'ls ~ | xargs -I{} sh -c \'echo {}\'' $G
-expect_allow "xargs sh -c (control): \$HOME listing, inner script only counts" $'ls ~ | xargs -I{} sh -c \'echo "{}" | wc -c\'' $G
-expect_allow "xargs sh -c (control): \$HOME listing, inner scan of a repo dir that ignores the entry" $'ls ~ | xargs -I{} sh -c \'du -sk ~/gt\'' $G
-expect_allow "xargs sh -c (control): \$0 of a \$HOME listing, inner script only echoes" $'ls ~ | xargs -n1 sh -c \'echo "$0"\'' $G
-# a hook payload with NO cwd: a relative scan cannot be judged, so it goes to the classifier, which COUNTS it
-: > "$ONE"
-hook_json 'for d in $(ls -A); do du -sk "$d"; done' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
-[ "$RC" -eq 0 ] && grep -q 'result=UNKNOWN-CWD' "$ONE" && ok "no cwd in the payload + a relative scan -> allowed but COUNTED (UNKNOWN-CWD), not silent" \
-  || bad "no-cwd payload: rc=$RC log=[$(cat "$ONE")]"
-: > "$ONE"
-printf '%s' '{"tool_name":"Bash","tool_input":{"command":"for d in $(ls -A); do du -sk \"$d\"; done"},"cwd":null}' \
-  | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
-[ "$RC" -eq 0 ] && grep -q 'result=UNKNOWN-CWD' "$ONE" && ok "cwd:null in the payload is the same: counted" || bad "cwd:null payload: rc=$RC log=[$(cat "$ONE")]"
-
-# The class, in-process: for EVERY size of every construct that used to have a cap, a hot value hidden in it is still a block,
-# and the same construct over a safe target is still an allow (a cap that became a blanket block would be its own bug).
-if [ -f "$HERE/home-scan-guard.py" ]; then
-  CAPS_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" python3 -I -S - <<'PY' 2>&1
-import importlib.util, os
-spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-
-def verdict(cmd, cwd="/Users/athos/gt"):
-    try:
-        m.analyze(cmd, cwd, ["/Users/athos"])
-    except m.Block:
-        return "block"
-    except m.Abort:
-        return "gave-up"
-    return "allow"
-
-cases = []          # (cmd, must)
-for n in range(2, 91):                                  # a brace list of n alternatives, the hot one first / middle / last
-    names = ["a%d" % i for i in range(n - 1)]
-    for pos in (0, (n - 1) // 2, n - 1):
-        hot = names[:pos] + ["Desktop"] + names[pos:]
-        cases.append(("du -sk ~/{%s}" % ",".join(hot), "block"))
-    cases.append(("du -sk ~/gt/{%s}" % ",".join(names + ["docs"]), "allow"))
-for k in range(1, 13):                                  # k chained two-way groups
-    cases.append(("du -sk ~/{Desktop,x}" + "{,}" * (k - 1), "block"))
-    cases.append(("du -sk ~/gt/{a,b}" + "{,}" * (k - 1), "allow"))
-    cases.append(("du -sk ~/{Desktop,x}" + "{,,}" * (k // 3), "block"))          # three-way groups of nothing: still ~/Desktop
-for k in range(1, 13):                                  # k nested groups
-    cases.append(("du -sk ~/" + "{x," * (k - 1) + "{x,Desktop}" + "}" * (k - 1), "block"))
-    cases.append(("du -sk ~/gt/" + "{x," * (k - 1) + "{x,docs}" + "}" * (k - 1), "allow"))
-for tail in ("~/{D..D}esktop", "~/{D..E}esktop", "~/{1..9..2}/../Desktop", "~/{a..z}ownloads"):
-    cases.append(("du -sk " + tail, "block"))
-for tail in ("~/gt/{1..3}", "~/gt/{a..z}", "~/gt/f{01..12}.txt"):
-    cases.append(("du -sk " + tail, "allow"))
-wrappers = ["env", "nice", "command", "exec", "nohup", "setsid", "time", "sudo", "caffeinate", "arch", "timeout 5",
-            "stdbuf -o0", "ionice -c 3", "env FOO=1", "nice -n 5", "command --"]
-for w in wrappers:                                      # 1..60 stacked wrappers
-    for depth in list(range(1, 25)) + [40, 60]:
-        cases.append(((w + " ") * depth + "du -sk ~/Desktop", "block"))
-        cases.append(((w + " ") * depth + "du -sk ~/gt", "allow"))
-for depth in (1, 5, 9, 20):                             # the same behind the shell own word splitting (brace expansion of the command word)
-    cases.append(("{" + "env," * depth + "du} -sk ~/Desktop", "block"))
-
-wrong = [(c, must, verdict(c)) for c, must in cases if verdict(c) != must]
-print("CAPS total=%d wrong=%d" % (len(cases), len(wrong)))
-for c, must, got in wrong[:12]:
-    print("  WRONG (want %s, got %s): %s" % (must, got, c[:110]))
-PY
-)"
-  case "$CAPS_OUT" in
-    "CAPS total="*" wrong=0"*) ok "class: no size of a brace list / chain / nest / wrapper stack hides a hot value, and none blocks a safe one (${CAPS_OUT%%$'\n'*})" ;;
-    *) bad "class: a cap collapsed 'too big' into 'not hot' (or into a false block) -- $CAPS_OUT" ;;
-  esac
-fi
+# a launched scan inside a quoted string, and a scan whose text is split by quoting
+expect_block "d\"\"u (quote-split tool name)" 'd""u -sk ~/Downloads'
+expect_block "\\du (backslash before the tool name)" '\du -sk ~/Downloads'
+expect_block "DU (macOS resolves names case-insensitively)" 'DU -sk ~/Downloads'
+expect_block "abs path to du"                '/usr/bin/du -sk ~/Downloads'
+expect_block "a scan 30 levels deep in \$( )" "echo $(printf '$(true %.0s' $(seq 1 30))du -sk ~/Downloads$(printf ')%.0s' $(seq 1 30))"
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -606,7 +313,31 @@ expect_allow "du explicit roots list"                'du -xsk ~/gt ~/.gastown ~/
 expect_allow "du -sk /Users/athos/gt/.gascity-gastown-hq" 'du -sk /Users/athos/gt/.gascity-gastown-hq'
 expect_allow "du gt/../.gastown (normalises to a safe root)" 'du -sk /Users/athos/gt/../.gastown'
 expect_allow "df -h /"                               'df -h /'
+expect_allow "df / and du of a non-home root (the guard's own advice, in one command)" 'df -h / && du -xsk /private/tmp/claude-501'
 expect_allow "read the disk-growth logs"             'cat /Users/athos/gt/.gascity-gastown-hq/.gc/logs/disk-growth-20260926.txt'
+expect_allow "a POSIX bracket class confined to a repo dir"  'du -sk /Users/athos/gt/[[:upper:]]*'
+expect_allow "a variable holding a SAFE command, resolved the same way"  'T=du; $T -sk ~/gt'
+expect_allow "an unresolved variable as the command word (known gap: dynamic, not tracked)" 'T=$1; $T -sk ~'
+# the destructive family, confined to a repo dir (must NOT start blocking ordinary use)
+expect_allow "rm -f ONE named file in Downloads"     'rm -f ~/Downloads/x.txt'
+expect_allow "rm -rf a repo build dir"               'rm -rf ~/gt/build'
+expect_allow "chmod (no -R) a repo script"           'chmod 755 ~/gt/script.sh'
+expect_allow "chmod -R a repo build dir"             'chmod -R 755 ~/gt/build'
+expect_allow "chown -R a repo build dir"             'chown -R me ~/gt/build'
+expect_allow "mv a repo dir"                         'mv ~/gt/docs /tmp/x'
+expect_allow "xattr -r a repo build dir"             'xattr -r -d com.apple.quarantine ~/gt/build'
+expect_allow "bsdtar of a repo dir"                  'bsdtar -cf /tmp/x.tar ~/gt'
+# cp/tar/zip/rsync/rm/mv/chmod/chown/xattr/chflags always need an explicit operand (or do nothing): the ancestor-cwd rule
+# (which has NO exemption for du/find/grep-family, on purpose) does not apply to them -- rule A already reads their operand.
+# The idiom that surfaced this (real corpus command): cd / ; ... ; rm -rf "$T" -- a temp-dir cleanup, not a scan of /.
+expect_allow "cd / then cp -r of two explicit safe paths (cp has no implicit-cwd mode)" 'cd / && cp -r /tmp/a /tmp/b'
+expect_allow "cd / then tar of an explicit safe path"          'cd / && tar czf /tmp/x.tgz /tmp/a'
+expect_allow "cd / then zip -r of an explicit safe path"       'cd / && zip -r /tmp/x.zip /tmp/a'
+expect_allow "cd / then rsync of two explicit safe paths"      'cd / && rsync -a /tmp/a/ /tmp/b/'
+expect_allow "cd / then rm -rf of an explicit safe path (the corpus idiom)" 'cd / && rm -rf /tmp/a'
+expect_allow "the corpus idiom verbatim: cd \$T then cleanup from /"  'T=$(mktemp -d); cd "$T" && echo hi; cd /; rm -rf "$T"'
+expect_block "cd / then du of an explicit safe path (du DOES have an implicit-cwd mode: no exemption, by design)" 'cd / && du -sk /tmp/a'
+expect_block "cd / then find of an explicit safe path (same: find is implicit-cwd, no exemption)" 'cd / && find /tmp/a -name x'
 expect_allow "read ONE file in Downloads (cat)"      'cat ~/Downloads/relatorio.pdf'
 expect_allow "read ONE file in Downloads (pdftotext)" 'pdftotext ~/Downloads/x.pdf -'
 expect_allow "read ONE file in Downloads (head)"     'head -5 ~/Downloads/x.csv'
@@ -614,7 +345,10 @@ expect_allow "read ONE file in Downloads (file)"     'file ~/Downloads/x.png'
 expect_allow "read ONE file in Downloads (stat)"     'stat -f %z ~/Downloads/x.zip'
 expect_allow "copy ONE file out of Downloads"        'cp ~/Downloads/x.pdf /tmp/x.pdf'
 expect_allow "ls one named file in Downloads"        'ls -l ~/Downloads/x.pdf'
+expect_allow "ls one file on the Desktop"            'ls -la ~/Desktop/x.txt'
 expect_allow "grep one named file in Downloads"      'grep -n foo ~/Downloads/x.txt'
+expect_allow "tar -tf an archive in Downloads"       'tar -tf ~/Downloads/a.tar'
+expect_allow "tar xf an archive in Downloads into /tmp" 'tar xf ~/Downloads/a.tar -C /tmp/x'
 # everyday repo / city work
 expect_allow "find inside the repo (abs)"            "find /Users/athos/gt -name '*.sh' -maxdepth 4"
 expect_allow "find inside the repo (~)"              "find ~/gt/.gascity-gastown-hq/scripts -name '*.sh'"
@@ -623,7 +357,9 @@ expect_allow "rg in a repo cwd"                      'rg foo'                   
 expect_allow "rg with path in repo"                  'rg -n foo /Users/athos/gt/.gascity-gastown-hq/scripts'
 expect_allow "grep -r in repo"                       'grep -rn foo /Users/athos/gt/.gascity-gastown-hq/scripts'
 expect_allow "grep one file in ~"                    'grep foo ~/.zshrc'
-expect_allow "ls the home dir itself"                'ls ~'
+expect_allow "ls the home dir itself (not recursive)" 'ls ~'
+expect_allow "ls -A the home dir itself"             'ls -A ~'
+expect_allow "a plain ls with the cwd at \$HOME (a listing of \$HOME is not a scan; recursion is)" 'ls -la' /Users/athos
 expect_allow "ls -la ~/.gastown/logs"                'ls -la ~/.gastown/logs'
 expect_allow "ls ~/gt"                               'ls ~/gt'
 expect_allow "ls -R inside the repo"                 'ls -R /Users/athos/gt/.gascity-gastown-hq/scripts'
@@ -635,27 +371,34 @@ expect_allow "for over ls of repo"                   'for d in $(ls /Users/athos
 expect_allow "tar of a repo dir"                     'tar czf /tmp/x.tgz -C /Users/athos/gt docs'
 expect_allow "rsync between repo dirs"               'rsync -a /Users/athos/gt/docs/ /tmp/docs/'
 expect_allow "cp -R inside repo"                     'cp -R /Users/athos/gt/docs /tmp/docs'
+expect_allow "cp -r of a repo dir with a trailing slash" 'cp -r /Users/athos/gt/docs/ /tmp/docs/'
 expect_allow "zip -r a repo dir"                     'zip -r /tmp/x.zip /Users/athos/gt/docs'
 expect_allow "sibling that merely starts like a protected name" 'du -sk /Users/athos/gt/Downloads-archive'
 expect_allow "a repo directory literally named Documents" 'find /Users/athos/gt/whatsapp_automation/docs/Documents -type f'
 expect_allow "du a sibling user dir that is not \$HOME (static mismatch)" 'du -sk /Users/Shared'
 expect_allow "glob under a repo dir"                 'ls /Users/athos/gt/*.sh'
-expect_allow "loop var over ls of a repo dir (NOT tainted), cwd in the repo" 'for d in $(ls /Users/athos/gt); do du -sk "$d"; done' /Users/athos/gt/docs
+expect_allow "loop var over ls of a repo dir, cwd in the repo" 'for d in $(ls /Users/athos/gt); do du -sk "$d"; done' /Users/athos/gt/docs
 expect_allow "read loop fed by something that is not a home listing" 'cat /Users/athos/gt/list.txt | while read -r d; do du -sk "$d"; done' /Users/athos/gt
 expect_allow "brace expansion that stays in the repo" 'du -sk ~/{gt,.gastown}'
 expect_allow "ls a Library folder that is not protected" 'ls ~/Library/Caches'
 expect_allow "du a go build cache under Library/Caches" 'du -sk ~/Library/Caches/go-build'
-expect_allow "du ONE file in Downloads (named, has an extension)" 'du -sk ~/Downloads/x.zip'
-expect_allow "ls one file on the Desktop"            'ls -la ~/Desktop/x.txt'
-expect_allow "tar -tf an archive in Downloads"       'tar -tf ~/Downloads/a.tar'
-expect_allow "tar xf an archive in Downloads into /tmp" 'tar xf ~/Downloads/a.tar -C /tmp/x'
+expect_allow "ls -d on a protected dir itself (a stat, no listing)" 'ls -d ~/Downloads'
+expect_allow "ls -d with a glob in a repo dir"       'ls -d ~/gt/*'
 expect_allow "find / with a shallow depth (never reaches a protected folder)" 'find / -maxdepth 1 -name Users'
+expect_allow "find /Users -maxdepth 2 -type d"       'find /Users -maxdepth 2 -type d'
 expect_allow "find under /usr/local"                 'find /usr/local -name libfoo.dylib'
 expect_allow "ls / and ls /Users (not recursive)"    'ls / /Users'
-expect_allow "df / and du of a non-home root"        'df -h / && du -xsk /private/tmp/claude-501'
+expect_allow "ls -lT ~ (macOS: full timestamps, not tree mode)"  'ls -lT ~'
+expect_allow "du -d 1 on a repo dir (a depth flag with a non-hot operand)" 'du -d 1 -h ~/gt'
+expect_allow "du -sL / -hP / -n on a repo dir (they are switches)" 'du -sL ~/gt && du -hP ~/gt/docs && du -n ~/gt'
+expect_allow "tree -d / -t / -n on a repo dir"       'tree -d ~/gt/docs && tree -t -n ~/gt/docs'
+expect_allow "BSD find option letters before a repo path" 'find -H /Users/athos/gt -name x && find -f /Users/athos/gt -name x && find -Hx ~/gt -name x'
+# an option can carry its path GLUED to it, no space (tar -C/Users/athos, find -f/Users/athos, --directory=/Users/athos)
+expect_block "tar -C glued to \$HOME (no space)"    'tar czf /tmp/x.tgz -C/Users/athos .'
+expect_block "find -f glued to \$HOME (no space)"   'find -f/Users/athos -name x'
+expect_block "tar --directory= glued to \$HOME"     'tar czf /tmp/x.tgz --directory=/Users/athos .'
 expect_allow "command -v does not run the tool"      'command -v du'
 expect_allow "xargs fed by something that is not a home listing" 'printf "a\nb\n" | xargs du -sk'
-expect_allow "rg fed by a pipe is a stdin filter, not a scan of the cwd" 'git log --oneline | rg foo' /Users/athos
 expect_allow "grep -r ... is not what runs after a git ~ revision" 'git diff HEAD~2..HEAD --stat | grep -r foo /Users/athos/gt/docs'
 expect_allow "git ~ revision syntax (HEAD~3)"        'git log --oneline HEAD~3..HEAD'
 expect_allow "git diff HEAD~1 | grep"                'git diff HEAD~1 | grep foo'
@@ -670,41 +413,52 @@ expect_allow "heredoc body mentioning scans"         $'cat <<\'EOF\'\ndu -sk ~\n
 expect_allow "heredoc inside \$() (bd create style)" $'bd create --description "$(cat <<\'EOF\'\nO agente rodou du -xsk ~ e find ~/Downloads\nEOF\n)"'
 expect_allow "heredoc with <<- and tabs"             $'cat <<-EOF\n\tdu -sk ~\n\tEOF\necho done'
 expect_allow "comment line"                          $'# du -sk ~ is what NOT to do\ngit status'
+expect_allow "echo/printf print their arguments, they never run them" 'echo du ~/Downloads; printf "%s\n" ls ~/Downloads find ~ -name x'
+expect_allow "a quoted string handed to a SCRIPT is data, not a command (bash probe.sh 'du -sk ~')" "bash /tmp/probe.sh 'du -sk ~' 'find ~ -name x'"
+expect_allow "a listing pipeline that only names non-hot paths (seen in the wild)" 'find /Users/athos/gt /private/tmp -xdev -type f -mmin -20 -size +50M 2>/dev/null | head -20 | while read f; do echo "$(du -sm "$f" | cut -f1)MB $f"; done | sort -rn | head -12' /Users/athos/gt
+expect_allow "ls of home, then ls of a named repo dir (a plain ls is not a scanner unless its operand is fed)" 'ls ~ && ls -la ~/gt' /Users/athos/gt
+expect_allow "a home glob that cannot name a protected folder (~/*.txt), read by cat, then an explicit du" 'for f in ~/*.txt; do cat "$f"; done; du -sk /private/tmp/x' /Users/athos/gt
 expect_allow "grep for the words in a repo file"     'grep -n "du -sk" /Users/athos/gt/CLAUDE.md'
+expect_allow "grep for a \$HOME pattern in a repo (single quotes: no expansion)" "grep -rn '\$HOME' /Users/athos/gt/docs"
 expect_allow "python that merely prints"             'python3 -c "print(1)"'
 expect_allow "cd ~ alone (nothing scanned)"          'cd ~ && git status'
+expect_allow "a redirect target is not a scan operand" 'du -sk /tmp/x > ~/Downloads/out.txt'
 expect_allow "empty-ish command"                     ':'
-# gate round 1: what the fixes must NOT start blocking
-expect_allow "du -d 1 on a repo dir (a depth flag with a non-hot operand)" 'du -d 1 -h ~/gt'
-expect_allow "du -d 2 ~/.gastown"                    'du -d 2 ~/.gastown'
-expect_allow "du --max-depth=1 on a repo dir"        'du --max-depth=1 /Users/athos/gt/docs'
-expect_allow "dust -d 1 on a repo dir"               'dust -d 1 /Users/athos/gt'
-expect_allow "du -sL / -hP / -n on a repo dir (they are switches)" 'du -sL ~/gt && du -hP ~/gt/docs && du -n ~/gt'
-expect_allow "du -B / -t / -I with a value, on a repo dir"       'du -B 1024 -sk ~/gt && du -t 1M -sk ~/gt && du -I "*.log" -sk ~/gt'
-expect_allow "tree -d / -t / -n on a repo dir (switches)"        'tree -d ~/gt/docs && tree -t -n ~/gt/docs'
-expect_allow "tree -I pattern on a repo dir"         'tree -I node_modules ~/gt/docs'
-expect_allow "tree -I pattern with the repo as cwd"  'tree -I node_modules' /Users/athos/gt
-expect_allow "tree -L 2 / (the depth flag STOPS the walk)"       'tree -L 2 /'
-expect_allow "tree -L 1 /Users"                      'tree -L 1 /Users'
-expect_allow "tree -aL 2 / (clustered, the value is -L's)"       'tree -aL 2 /'
-expect_allow "fd -d 1 . /Users (fd's depth flag stops the walk)" 'fd -d 1 . /Users'
-expect_allow "rg --max-depth 1 pat /Users"           'rg --max-depth 1 foo /Users'
-expect_allow "find /Users -maxdepth 2 -type d"       'find /Users -maxdepth 2 -type d'
-expect_allow "eza -T -L 2 /Users (eza's level flag stops the walk)" 'eza -T -L 2 /Users'
-expect_allow "eza -T on a repo dir"                  'eza -T ~/gt/docs'
-expect_allow "BSD find option letters before a repo path" 'find -H /Users/athos/gt -name x && find -f /Users/athos/gt -name x && find -Hx ~/gt -name x && find -O3 /Users/athos/gt -name x'
-expect_allow "ls -lT ~ (macOS: full timestamps, not tree mode)"  'ls -lT ~'
-expect_allow "ls -laT /Users/athos"                  'ls -laT /Users/athos'
-expect_allow "a cd inside a subshell does not leak out of it"    '(cd ~/Downloads && ls report.pdf); find . -name "*.sh"' /Users/athos/gt
-expect_allow "a cd inside \$( ) does not leak out of it"         'x=$(cd ~/Downloads && pwd); find . -name "*.sh"' /Users/athos/gt
-expect_allow "a cd on the left of a pipe does not leak out of it" 'cd ~/Downloads | cat; find . -name "*.sh"' /Users/athos/gt
-expect_allow "cd - returns to where the command started"         'cd ~/Downloads && cd - && du -sk *' /Users/athos/gt
-expect_allow "pushd/popd round trip through a hot dir"           'pushd ~/Downloads >/dev/null; popd >/dev/null; du -sk *' /Users/athos/gt
-expect_allow "du ONE dotted-name file (no trailing slash, no recursion flag)" 'du -sk ~/Downloads/data.bak'
-expect_allow "cp -r of a repo dir with a trailing slash"         'cp -r /Users/athos/gt/docs/ /tmp/docs/'
-expect_allow "tar --directory / -C in every spelling, on a repo dir" 'tar czf /tmp/x.tgz --directory=/Users/athos/gt docs && tar czf /tmp/x.tgz -C/Users/athos/gt docs && tar -czC /Users/athos/gt -f /tmp/x.tgz docs'
-expect_allow "ls -d on a protected dir itself (a stat, no listing)" 'ls -d ~/Downloads'
-expect_allow "ls -d with a glob in a repo dir"                   'ls -d ~/gt/*'
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- ACCEPTED FALSE POSITIVES: the guard is lexical and errs toward blocking; each of these is a harmless command it refuses --"
+# ─────────────────────────────────────────────────────────────────────────
+# Pinned so that nobody re-adds a heuristic to "fix" one without reading the engine's header: every heuristic of this kind
+# (is it a file? how deep does this flag walk? which word is the pattern? did that cd leave the subshell?) was a place a
+# scan slipped through in gate rounds 1-4. The message tells the agent what to do instead.
+expect_block "du of ONE file in Downloads (no 'is it a file?' guess: read it with cat / stat)" 'du -sk ~/Downloads/x.zip'
+expect_block "du of a dotted name in Downloads"        'du -sk ~/Downloads/data.bak'
+expect_block "tree -L 2 / (no per-tool 'depth flag stops the walk' table)" 'tree -L 2 /'
+expect_block "fd -d 1 . /Users"                        'fd -d 1 . /Users'
+expect_block "rg --max-depth 1 pat /Users"             'rg --max-depth 1 foo /Users'
+expect_block "find ~ -maxdepth 1 (only ANCESTORS of \$HOME get the shallow-find exemption)" 'find ~ -maxdepth 1 -name x'
+expect_block "a cd into a hot dir taints the cwd for the rest of the command (no subshell scoping)" '(cd ~/Downloads && ls report.pdf); find . -name "*.sh"' /Users/athos/gt
+expect_block "cd - after a hot cd (no directory stack)" 'cd ~/Downloads && cd - && du -sk *' /Users/athos/gt
+expect_block "rg on a pipe at \$HOME (every relative scan at a hot cwd is refused; use an absolute path)" 'git log --oneline | rg foo' /Users/athos
+expect_block "a search PATTERN spelled like a hot path (every non-dash word is a candidate path)" 'grep -rn "/Users/athos/Downloads" /Users/athos/gt/scripts'
+expect_block "a listing of \$HOME and a scanner in the same command"  'ls ~ && du -xsk ~/gt'
+expect_block "a hot cwd and only a relative-looking safe path"  'du -sk gt/docs' /Users/athos
+expect_block "cd ~ then a scan of an explicit SAFE path (operands are not consulted: an absolute path can be an option's value)" 'cd ~ && du -sk ~/gt'
+expect_block "an explicit safe path from a session whose cwd is \$HOME"  'du -xsk ~/gt' /Users/athos
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- KNOWN GAPS: allowed on purpose (the engine's header lists the same set; the bead is about CLI scanners, not an adversary) --"
+# ─────────────────────────────────────────────────────────────────────────
+expect_allow "GAP interpreter: python os.walk"         "python3 -c 'import os; list(os.walk(\"/Users/athos\"))'"
+expect_allow "GAP interpreter: node fs.readdirSync"    "node -e 'require(\"fs\").readdirSync(\"/Users/athos/Downloads\")'"
+expect_allow "GAP a script FILE is not read"           'bash /tmp/some-script.sh'
+expect_allow "GAP a script handed to a shell on stdin" $'bash <<\'EOF\'\ndu -sk ~/Downloads\nEOF'
+expect_allow "GAP a value only known at run time (non-hot cwd)" 'du -sk "$1"'
+expect_allow "GAP \${VAR:-default} keeps the run-time part unknown" 'du -sk "${X:-$HOME}"'
+expect_allow "GAP a glob under a protected folder for a command that is NOT a scanner (reading files the operator pointed at)" 'cat ~/Downloads/*.csv'
+expect_allow "GAP git walks the tree it is pointed at"  'git -C ~ status --short'
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -727,12 +481,14 @@ run_raw '[1,2,3]';                                                     [ "$RC" -
 run_raw "$(jq -cn --arg c 'du -sk ~' '{tool_name:"Read",tool_input:{command:$c}}')"
 [ "$RC" -eq 0 ] && ok "non-Bash tool_name -> allow" || bad "non-Bash tool: rc=$RC"
 # unbalanced quotes / parens must not crash the classifier into blocking or erroring
-for weird in "echo 'unterminated" 'echo "unterminated' 'echo $(unterminated' 'echo `unterminated' 'cat <<EOF' 'for d in' ')))' 'du -sk "$(' $'echo \x01\x02'; do
+for weird in "echo 'unterminated" 'echo "unterminated' 'echo $(unterminated' 'echo `unterminated' 'cat <<EOF' 'for d in' ')))' 'du -sk "$(' $'echo \x01\x02' 'echo ${' 'echo $((' '<<' '>' '&&' '|' ';' '((' 'echo <(' ; do
   expect_allow "unparseable but harmless: ${weird:0:24}" "$weird"
 done
-# a genuinely unparseable command that ALSO scans home is not something we can prove; it must not be an error either
+# a genuinely unparseable command that ALSO scans home: the words are still read, so it is refused
 run_guard "du -sk ~ 'unterminated"
-[ "$RC" -eq 0 ] || [ "$RC" -eq 2 ] && ok "unterminated quote + scan -> a clean decision, never a crash (rc=$RC)" || bad "unterminated+scan: rc=$RC err=$ERR"
+[ "$RC" -eq 2 ] && ok "unterminated quote + scan -> still a clean BLOCK (the words are read)" || bad "unterminated+scan: rc=$RC err=$ERR"
+run_guard 'echo "$(du -sk ~'
+[ "$RC" -eq 2 ] && ok "unterminated \$( + scan -> still a clean BLOCK" || bad "unterminated \$(+scan: rc=$RC err=$ERR"
 # no agent identity in the environment => Athos's own terminal: never blocked. Scrub EVERY
 # identity variable: the session running this selftest is itself an agent session, and a leaked
 # GC_SESSION_ID/GC_ALIAS would make both of the checks below vacuous.
@@ -765,18 +521,15 @@ mkdir -p "$SCRATCH/nojq"; for b in bash cat env sh dirname basename date mkdir p
 ERR="$(hook_json "$INCIDENT" | env "${DELIB_ENV[@]}" PATH="$SCRATCH/nojq" /bin/bash "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "jq missing -> allow" || bad "no jq: rc=$RC err=$ERR"
 # the classifier itself, fed directly (the wrapper's prefilter never lets these reach it)
-ENGINE="$HERE/home-scan-guard.py"
-if [ -f "$ENGINE" ]; then
-  printf 'garbage, not json' | env "${AGENT_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
-  [ "$RC" -eq 0 ] && ok "engine: non-JSON stdin -> allow" || bad "engine non-JSON: rc=$RC"
-  hook_json 'du -sk ~' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_HOME= HOME= python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
-  [ "$RC" -eq 0 ] && ok "engine: no usable home -> allow (cannot classify, does not guess)" || bad "engine no-home: rc=$RC"
-  deep="$(printf 'echo %s' "$(printf '$(%.0s' $(seq 1 30))")"
-  hook_json "$deep" | env "${AGENT_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
-  [ "$RC" -eq 0 ] && ok "engine: absurd nesting -> allow (gives up, never crashes or blocks)" || bad "engine deep nesting: rc=$RC"
-  hook_json 'du -sk ~' | env "${AGENT_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
-  [ "$RC" -eq 2 ] && ok "engine: direct call blocks the plain case (sanity for the three above)" || bad "engine direct sanity: rc=$RC"
-fi
+printf 'garbage, not json' | env "${DELIB_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && ok "engine: non-JSON stdin -> allow" || bad "engine non-JSON: rc=$RC"
+hook_json 'du -sk ~' | env "${DELIB_ENV[@]}" HOME_SCAN_GUARD_HOME= HOME= python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && ok "engine: no usable home -> allow (cannot classify, does not guess)" || bad "engine no-home: rc=$RC"
+deep="$(printf 'echo %s' "$(printf '$(%.0s' $(seq 1 30))")"
+hook_json "$deep" | env "${DELIB_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && ok "engine: absurd nesting with nothing in it -> allow, no crash" || bad "engine deep nesting: rc=$RC"
+hook_json 'du -sk ~' | env "${DELIB_ENV[@]}" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 2 ] && ok "engine: direct call blocks the plain case (sanity for the three above)" || bad "engine direct sanity: rc=$RC"
 # ...but every DEGRADATION is counted (a guard that quietly stops guarding is worse than none). Each scenario gets its own log.
 DEG="$SCRATCH/degraded.log"
 degraded() {  # description  expected-log-fragment  [env assignments...]   (runs the incident through the wrapper)
@@ -805,9 +558,7 @@ echo '{"tool_name":"Read","tool_input":{"file_path":"/x"}}' | env "${AGENT_ENV[@
 # an unwritable log must never turn a block into an error, nor an allow into a block
 ERR="$(hook_json "$INCIDENT" | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG=/nonexistent/dir/x.log "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
 [ "$RC" -eq 2 ] && ok "unwritable log -> still blocks the incident" || bad "unwritable log: rc=$RC"
-
-# The wrapper's OTHER exits that are not "nothing to see here" are counted as well. The header used to say "every way the
-# wrapper can NOT run the classifier is counted" while two were silent: a payload jq could not parse, and an unusable $HOME.
+# The wrapper's OTHER exits that are not "nothing to see here" are counted as well.
 counted() {  # description  fragment  input  [env assignments...]
   local what="$1" frag="$2" input="$3"; shift 3
   : > "$DEG"
@@ -818,16 +569,16 @@ counted() {  # description  fragment  input  [env assignments...]
 counted "hook payload that is not JSON"   "not parseable" 'not json at all {{{ du -sk ~'
 counted "hook payload that is empty"      "empty"         ''
 counted "a scan with no usable \$HOME"    "no usable home" "$(hook_json 'du -sk ~')" HOME_SCAN_GUARD_HOME=nohome
-if [ -f "$ENGINE" ]; then
-  : > "$DEG"; printf '\377\376{"tool_name":"Bash"}' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
-  [ "$RC" -eq 0 ] && grep -q "result=GAVE-UP" "$DEG" && grep -q "not valid UTF-8" "$DEG" && ok "engine: stdin that is not valid UTF-8 -> allow, and logged (was swallowed by a bare except ValueError)" || bad "engine non-UTF-8: rc=$RC log=[$(cat "$DEG")]"
-fi
-# a cwd the guard cannot know (cd - with no history) is a THIRD state, not "not hot": the relative scan after it is allowed
-# (fail-open is the contract) but COUNTED; a cwd it does know leaves the log empty
-: > "$DEG"; hook_json 'cd - && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
-[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "cd - with no history then a relative scan -> allowed, but logged UNKNOWN-CWD (not silent)" || bad "unknown cwd not logged: rc=$RC log=[$(cat "$DEG")]"
-: > "$DEG"; hook_json 'cd ~/gt && cd - && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
-[ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "cd - with a KNOWN previous dir leaves the log empty" || bad "known cwd polluted the log: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; printf '\377\376{"tool_name":"Bash"}' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" python3 -I -S "$ENGINE" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=GAVE-UP" "$DEG" && grep -q "not valid UTF-8" "$DEG" && ok "engine: stdin that is not valid UTF-8 -> allow, and logged" || bad "engine non-UTF-8: rc=$RC log=[$(cat "$DEG")]"
+# a cwd the guard cannot know is a THIRD state, not "not hot": a relative scan after it is allowed (fail-open is the
+# contract) but COUNTED (UNKNOWN-CWD). A cwd it does know leaves the log empty.
+: > "$DEG"; hook_json 'du -sk *' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "a relative scan with NO cwd in the payload -> allowed, but logged UNKNOWN-CWD (not silent)" || bad "no-cwd relative scan not logged: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'cd "$SOMEWHERE" && du -sk * ../x' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "a cd to a run-time value, then a relative scan -> allowed, but logged UNKNOWN-CWD" || bad "unknown cd target not logged: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'cd ~/gt && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "a KNOWN cwd leaves the log empty" || bad "known cwd polluted the log: rc=$RC log=[$(cat "$DEG")]"
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -848,312 +599,372 @@ for c in 'git status --short' 'bd list --status open --limit 0 --json' 'gc sessi
 done
 spawned 'du -sk ~' /Users/athos/gt && ok "python IS spawned when a scan meets \$HOME" || bad "prefilter missed 'du -sk ~'"
 spawned 'find . -name x' /Users/athos && ok "python IS spawned when the cwd itself is \$HOME" || bad "prefilter missed cwd=\$HOME"
-# no cwd in the payload is "don't know", not "not hot": a scan goes to the classifier (which counts it); a command with no scan tool
-# still takes the fast path
 spawned 'du -sk *' && ok "python IS spawned for a scan when the payload has no cwd" || bad "prefilter dropped a scan with no cwd"
 spawned 'git status --short' && bad "python spawned for git status with no cwd" || ok "fast path with no cwd: a command with no scan tool"
 spawned 'du -sk ~athos/Desktop' /Users/athos/gt && ok "python IS spawned for ~athos/Desktop (the prefilter reads ~name)" || bad "prefilter missed ~athos"
+# $HOME goes into a regex in the prefilter: a home with regex metacharacters must neither break it nor turn "cannot compile" into "not hot"
+# (the old escape handled only '.', so a home like /Users/a+b(c[d] made `[[ =~ ]]` return 2 and the guard quietly stood down)
+for h in '/Users/a+b(c[d]' '/Users/x.y*z' '/Users/we^ird$name|x'; do
+  ERR="$(hook_json "du -sk '$h/Desktop'" /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_HOME="$h" "$HOOK_BASH" "$GUARD" 2>&1 >/dev/null)"; RC=$?
+  [ "$RC" -eq 2 ] && ok "a \$HOME with regex metacharacters ($h) still blocks a scan of its Desktop" || bad "home with metacharacters $h: rc=$RC err=[${ERR:0:120}]"
+done
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
-echo "-- CLASS check: no option letter can hide a hot operand (the engine, in-process, every letter) --"
+echo "-- STRUCTURAL SWEEPS: lock the FORM of the guard (in-process against the engine) --"
 # ─────────────────────────────────────────────────────────────────────────
-# Blocker 2 was one instance of a class: a parser that decides for the tool which words are OPTIONS' values can
-# swallow the path. Rather than pin the letters the reviewer happened to try, walk EVERY letter and digit, alone and
-# clustered, for every tool that shares the du-style option parsing, with the hot operand first, last and alone. A
-# letter that really takes a value ("du -B ~/Downloads") is still a block: the swallowed word stays a candidate.
-if [ -f "$HERE/home-scan-guard.py" ]; then
-  CLASS_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" HOME_SCAN_GUARD_LOG="$LOG" python3 -I -S - <<'PY' 2>&1
-import importlib.util, os, string, sys
-spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# Rounds 1-4 of the gate each reproduced ONE more spelling of the same defect: an option table, a wrapper table or a
+# stdin-taint rule decided which word was the path, and a wrong entry became a silent allow. The fix for a class is a test
+# that fails when the FORM regresses, so these do not list examples: they take every scanner x every hot target and put
+# arbitrary options, wrappers and pipe consumers around them. BLOCK must stay BLOCK for every one; and the same shapes over
+# SAFE targets must stay ALLOW (or the sweep would be satisfied by a guard that blocks everything).
+cat > "$SCRATCH/sweeps.py" <<'PYEOF'
+import importlib.util, itertools, json, random, shlex, sys, time
 
-def blocked(cmd, cwd="/Users/athos/gt"):
+spec = importlib.util.spec_from_file_location("hsg", sys.argv[1])
+hsg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hsg)
+SAMPLE_OUT, BLOCKS_OUT = sys.argv[2], sys.argv[3]
+HOMES = ["/Users/athos"]
+GT = "/Users/athos/gt"
+sample, allblocks = [], []
+
+
+def verdict(cmd, cwd):
     try:
-        m.analyze(cmd, cwd, ["/Users/athos"])
-    except m.Block:
-        return True
-    return False
-
-letters = string.ascii_letters + string.digits
-missed, total = [], 0
-for tool in ("du", "dust", "gdu", "ncdu", "tree"):
-    for x in letters:
-        for flag in ("-" + x, "-s" + x, "-" + x + "s"):
-            for tail in ("~/Downloads", "~/Downloads ~/gt", "~/gt ~/Downloads", "/Users", "/Users/athos"):
-                cmd = "%s %s %s" % (tool, flag, tail)
-                total += 1
-                if not blocked(cmd):
-                    missed.append(cmd)
-# BSD find: a letter (or cluster) before the path must not hide it either
-for pre in ["-" + c for c in "EHLPXdsx"] + ["-Hx", "-EX", "-Ps", "-O1", "-O2", "-O3", "-f ~/Downloads", "-D tree", "-D opt"]:
-    cmd = "find %s ~/Downloads -name x" % pre if not pre.startswith("-f") else "find %s -name x" % pre
-    total += 1
-    if not blocked(cmd):
-        missed.append(cmd)
-print("CLASS total=%d missed=%d" % (total, len(missed)))
-for c in missed[:12]:
-    print("  MISSED: " + c)
-PY
-)"
-  case "$CLASS_OUT" in
-    "CLASS total="*" missed=0"*) ok "class: every option letter, alone and clustered, leaves a hot operand blocked (${CLASS_OUT%%$'\n'*})" ;;
-    *) bad "class: an option letter hid a hot operand -- $CLASS_OUT" ;;
-  esac
-fi
-
-# ─────────────────────────────────────────────────────────────────────────
-echo ""
-echo "-- gate round 4 (ga-p7agas): no wrapper option table decides which word is the command; a pipe does not replace grep -r / fd's cwd --"
-# ─────────────────────────────────────────────────────────────────────────
-# Blocker 1 -- ONE option table shared by six wrappers marked `-i -u -n -t -w ...` as taking a VALUE, so a switch (`caffeinate -i`,
-# `sudo -n`) swallowed the scanner's own NAME and the scan behind it was allowed with no trace. The class, not the letters: a wrapper
-# reader that decides from a table which words are option VALUES loses the command to any wrong or MISSING entry (`time -o FILE`,
-# `nice --adjustment 5` were in no table at all). The engine now reads EVERY way a wrapper's leading options can split into
-# switches and values; the sections below assert that property for every wrapper, every letter and digit, in the forms a
-# switch / a value / an attached value / a cluster / a long option take.
-# Blocker 2 -- `grep -r` and `fd` with no path walk the CWD whatever is on stdin (BSD grep measured; GNU grep's manual says the same);
-# the classifier assumed a pipe replaced the cwd operand for all of rg/ag/ack/fd/grep.
-# The reviewer's own repros, verbatim, through the real wrapper (bash 3.2) with the log asserted:
-blocked_and_logged "wrapper table: caffeinate -i (a switch; the shared table said 'valued')"     'caffeinate -i du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: caffeinate -i tar czf ~/Documents"                             'caffeinate -i tar czf /tmp/x.tgz ~/Documents' $G
-blocked_and_logged "wrapper table: caffeinate -u"                                                 'caffeinate -u du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: sudo -n (non-interactive, a switch)"                           'sudo -n du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: sudo -i (login shell, a switch)"                               'sudo -i du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: env -S STRING (the value IS the command line)"                 'env -S "du -sk ~/Downloads"' $G
-blocked_and_logged "wrapper table: /usr/bin/time -o FILE (the option was in no table)"            '/usr/bin/time -o /tmp/t.txt du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: nice --adjustment 5 (long option, separate value)"             'nice --adjustment 5 du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: sudo -D DIR"                                                   'sudo -D /tmp du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table (control that used to work): caffeinate -t 60"                  'caffeinate -t 60 du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table (control that used to work): sudo -u athos"                     'sudo -u athos du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: a scan through a shell -c behind a switch"                     "sudo -n bash -c 'du -sk ~/Downloads'" $G
-blocked_and_logged "wrapper table: a clustered switch+value, sudo -Hu athos"                      'sudo -Hu athos du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: two wrappers, each with a switch"                              'sudo -n caffeinate -i du -sk ~/Downloads' $G
-blocked_and_logged "wrapper table: env -S attached, and with a switch cluster"                    'env -iS"du -sk ~/Downloads"' $G
-expect_allow "wrapper table (control): caffeinate -i on a SAFE scan"                              'caffeinate -i du -sk ~/gt' $G
-expect_allow "wrapper table (control): sudo -n on a SAFE scan"                                    'sudo -n du -sk ~/gt' $G
-expect_allow "wrapper table (control): env -S over a SAFE command line"                           'env -S "du -sk ~/gt"' $G
-expect_allow "wrapper table (control): time -o FILE on a SAFE scan"                               '/usr/bin/time -o /tmp/t.txt du -sk ~/gt' $G
-expect_allow "wrapper table (control): nice --adjustment 5 on a SAFE scan"                        'nice --adjustment 5 du -sk ~/gt' $G
-expect_allow "wrapper table (control): timeout -s KILL 5 on a SAFE scan"                          'timeout -s KILL 5 du -sk ~/gt' $G
-expect_allow "wrapper table (control): a scan-tool word that is only an ARGUMENT, from a hot cwd" 'sudo -u athos brew install ncdu' /Users/athos
-blocked_and_logged "grep -r: a pipe does not replace the cwd operand (cd ~ && ... | grep -rl)"    'cd ~ && git log --oneline | grep -rl foo' $G
-blocked_and_logged "grep -r: same, the payload's cwd is a protected folder"                       'echo x | grep -r foo' /Users/athos/Downloads
-blocked_and_logged "fd: a pipe does not replace the cwd operand"                                  'cd ~ && echo x | fd foo' $G
-blocked_and_logged "grep -r/xargs: fed by a listing of \$HOME (the same variable, one branch over)" 'ls ~ | xargs grep -rl foo' $G
-expect_allow "grep -r (control): unpiped from a safe cwd is not a finding"                        'git log | grep -r foo' $G
-expect_allow "rg (control): rg READS stdin when piped (measured), so cd ~ && ... | rg is not a scan" 'cd ~ && git log --oneline | rg foo' $G
-expect_allow "grep -r/xargs (control): operands come from xargs' input, not from the cwd"         'git ls-files | xargs grep -rl foo' /Users/athos
-
-# The class, in-process. Every wrapper x every letter/digit x the forms an option takes x a scanner behind it; the same over a SAFE
-# target (a reading the engine adds must never become a false block); every search tool x every stdin arrangement; and the SHAPE:
-# the wrapper dispatcher is table-driven and the search branch is gated by the stdin table, so a wrapper or a tool nobody classified
-# cannot be added without the sweep above covering it.
-if [ -f "$HERE/home-scan-guard.py" ]; then
-  # The program goes to a FILE first: a heredoc inside $( ) is parsed by macOS bash 3.2 as shell text, and the quotes / backticks in a
-  # Python program of this size broke that parse ("unexpected EOF") -- the file died there and every later check silently did not run.
-  cat > "$SCRATCH/r4-class.py" <<'PY'
-import ast, importlib.util, os, re, string
-spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-src = open(os.environ["HSG_ENGINE"]).read()
-tree = ast.parse(src)
-problems = []
-total = 0
-
-
-def verdict(cmd, cwd="/Users/athos/gt"):
-    try:
-        m.analyze(cmd, cwd, ["/Users/athos"])
-    except m.Block:
+        hsg.analyze(cmd, cwd, HOMES)
+        return "allow"
+    except hsg.Block:
         return "block"
-    except m.Abort:
-        return "gave-up"
-    return "allow"
+    except BaseException as exc:          # an engine crash is neither verdict: the run must show it
+        return "ERROR %s: %s" % (type(exc).__name__, exc)
 
 
-def expect(cmd, want, cwd="/Users/athos/gt"):
-    global total
-    total += 1
+def sweep(name, cases, want, sample_every=0, stride=1):
+    fails = []
+    for i, (cmd, cwd) in enumerate(cases):
+        got = verdict(cmd, cwd)
+        if got != want:
+            fails.append((cmd, cwd, got))
+        elif want == "block":
+            if sample_every and i % sample_every == 0:
+                sample.append({"cmd": cmd, "cwd": cwd or ""})
+            if i % stride == 0:
+                allblocks.append((cmd, cwd or ""))
+    print("SWEEP\t%s\t%d\t%d" % (name, len(cases), len(fails)))
+    for cmd, cwd, got in fails[:6]:
+        print("FAILCASE\t%s\t%r\tcwd=%s\tgot=%s" % (name, cmd, cwd, got))
+
+
+SCANNERS = ["du -sk", "du", "gdu", "dust", "ncdu", "tree", "fd", "rg", "ag", "ack", "grep -r", "grep -rn",
+            "grep --recursive", "egrep -R", "mdfind", "find", "gfind", "ls -R", "ls -laR", "gls -R", "eza -R",
+            "eza -T", "rsync -a", "cp -r", "cp -R", "zip -r /tmp/x.zip", "tar czf /tmp/x.tgz", "ditto"]
+HOT = ["~", "~/", "$HOME", "${HOME}", '"$HOME"', "/Users/athos", "/Users/athos/", "~/Downloads", "~/Documents/sub",
+       "~/Desktop/", "~/Pictures", "~/Movies", "~/Music", "~/*", "~/D*", "~/.*", "/Users/athos/*", "/Users/*/Downloads",
+       "/Volumes", "/Volumes/Backup", "~/Library/CloudStorage", '"$HOME/Library/Mobile Documents"', "~/Library",
+       "/Users", "/", "~/gt/..", "~/{gt,Downloads}", "/Users/athos/gt/../Documents"]
+SAFE = ["~/gt", "~/gt/", "/tmp", "/private/tmp/claude-501", "/Users/athos/gt/docs", "~/.gastown",
+        "~/Library/Caches/go-build", "/usr/local", "~/{gt,.gastown}", '"$HOME/gt"', "/Users/athos/gt/../.gastown",
+        "${HOME}/.local", "/Users/Shared", "/Users/athos/gt/Downloads-archive",
+        "/Users/athos/gt/whatsapp_automation/docs/Documents"]
+# what an option can look like: switch, cluster, long, long=value, long value, short value, number, path value, "--"
+DECOR = ["", "-x", "-xs", "-h", "--foo", "--foo=bar", "--foo bar", "-n 5", "-L", "-P", "-d 1", "-t 1M", "-B 1024",
+         "-I x", "-e pat", "--sort path", "--max-filesize 1M", "--changed-within 1d", "--exclude-from f", "-o /tmp/o",
+         "--", "-j4"]
+
+
+def placed(tool, target, decor):
+    yield "%s %s %s" % (tool, decor, target)
+    yield "%s %s %s" % (tool, target, decor)
+    yield "%s %s %s %s" % (tool, decor, target, decor)
+
+
+# 1. OPTIONS ARE IRRELEVANT: no option shape, anywhere, turns a hot target into a safe one
+cases = [(c, GT) for t in SCANNERS for h in HOT for d in DECOR for c in placed(t, h, d)]
+sweep("options: every scanner x every hot target x every option shape x every position -> BLOCK", cases, "block", 1200, 3)
+cases = [(c, GT) for t in SCANNERS for h in SAFE for d in DECOR for c in placed(t, h, d)]
+sweep("options: the same shapes over SAFE targets -> ALLOW (the control)", cases, "allow")
+
+# 2. THE TOOL'S NAME IS ITS NAME, however spelled
+NAMES = ["du", "/usr/bin/du", "DU", '"du"', "'du'", 'd""u', "\\du", "command du", "/usr/bin/find", "FIND", "'find'"]
+cases = [("%s -sk %s" % (n, h), GT) for n in NAMES for h in ["~", "~/Downloads", "$HOME", "/Users/athos"]]
+sweep("tool name spellings (path, case, quotes, backslash, command) -> BLOCK", cases, "block")
+# ...and so is a PATH: the shell joins a quote or a backslash in the middle of a component (this also runs through the wrapper's prefilter
+# differential below, which used to read the quote-stripped copy for the tool NAME only)
+SPLIT = ['/Us""ers/athos/Downloads', "/Users/ath''os", '/Users/athos/Down"loads"', "~/D\\ownloads", '"$HOME"/Down""loads',
+         "'/Users'/athos/Desktop", '/Users/athos/"Docu"ments', '~/Lib""rary/CloudStorage', '/Vol""umes', "/Users/athos/Pic\\tures"]
+cases = [("%s %s" % (tool, path), GT) for tool in ["du -sk", "find", "rg foo", "grep -r foo", "ls -R", "tree"] for path in SPLIT]
+sweep("paths the shell joins (a quote or backslash inside a component) -> BLOCK", cases, "block")
+
+# 3. WRAPPERS ARE IRRELEVANT: no wrapper (and no wrapper option) hides the scanner
+WRAPPERS = ["env", "env -i", "env FOO=1", "sudo", "sudo -n", "sudo -i", "sudo -u athos", "sudo -D /tmp", "nice",
+            "nice -n 5", "nice --adjustment 5", "ionice -c 3", "caffeinate", "caffeinate -i", "caffeinate -u",
+            "caffeinate -t 60", "time", "time -o /tmp/t", "/usr/bin/time -o /tmp/t", "time -p", "timeout 60",
+            "timeout -k 5 60", "gtimeout 60", "nohup", "watch -n 5", "flock /tmp/l", "taskpolicy -b",
+            "script /tmp/o", "doas", "command", "exec", "stdbuf -o0", "arch -arm64", "setsid", "unbuffer",
+            "chronic", "xargs", "xargs -n1", "xargs -I{}", "parallel", "some-wrapper-nobody-has-heard-of --flag x"]
+SOME = ["du -sk", "find", "rg foo", "grep -r foo", "tree", "ls -R"]
+TGT = ["~", "~/Downloads", "/Users/athos", "~/*"]
+cases = [("%s %s %s" % (w, s, t), GT) for w in WRAPPERS for s in SOME for t in TGT]
+sweep("wrappers: every wrapper x scanner x hot target -> BLOCK", cases, "block", 100)
+cases = [("%s %s %s" % (w, s, t), GT) for w in WRAPPERS for s in SOME for t in ["~/gt", "/tmp", "/Users/athos/gt/docs"]]
+sweep("wrappers: the same over SAFE targets -> ALLOW (the control)", cases, "allow")
+PAIR = ["env", "sudo -n", "nice -n 5", "caffeinate -i", "time -o /tmp/t", "timeout 60", "nohup", "watch -n 5", "xargs -n1"]
+cases = [("%s %s %s %s" % (a, b, s, t), GT) for a in PAIR for b in PAIR for s in SOME for t in TGT]
+sweep("wrappers: chains of two wrappers -> BLOCK", cases, "block")
+cases = [("%s '%s'" % (l, inner), GT) for l in ["bash -c", "sh -c", "zsh -c", "zsh -lc", "eval", "sudo sh -c", "xargs sh -c",
+         "timeout 5 bash -c", "nice bash -c", "env -S", "env FOO=1 bash -c"]
+         for inner in ["du -sk ~", "find ~ -maxdepth 1", "ls -R ~/Documents", "cd ~ && du -sk *",
+                       'for d in $(ls ~); do du -sk "$d"; done', "du -sk ~/Downloads", "du -sk /Users/athos"]]
+sweep("launchers that take the scan as ONE string (bash -c, eval, env -S, ...) -> BLOCK", cases, "block", 20)
+cases = [("bash -c \"sh -c 'du -sk ~'\"", GT), ("sh -c 'bash -c \"du -sk ~/Downloads\"'", GT),
+         ("bash -c 'eval \"du -sk ~\"'", GT), ("bash -c 'bash -c '\"'\"'du -sk ~'\"'\"''", GT)]
+sweep("launchers nested inside launchers -> BLOCK", cases, "block")
+
+# 4. A LISTING THAT FEEDS A MEASUREMENT: every producer x every consumer plumbing x every measuring tool
+PRODUCERS = ["ls ~", "ls -A ~", "ls -la /Users/athos", "ls /Users", "ls /", "ls -1 ~/", "find ~ -maxdepth 1",
+             "find /Users -maxdepth 1", "find / -maxdepth 2", "printf '%s\\n' ~/*", "echo ~/*", "ls -d ~/*/",
+             "echo $HOME", "ls $HOME", "ls -A ${HOME}"]
+CONSUMERS = ["{P} | xargs {T}", "{P} | xargs -I{} {T} {}", "{P} | xargs -I{} sh -c '{T} {}'",
+             "{P} | xargs -I{} sh -c '{T} \"{}\"'", "{P} | xargs -n1 sh -c '{T} \"$0\"'",
+             "{P} | xargs -n 1 bash -c '{T} \"$1\"' _", "{P} | while read -r d; do {T} \"$d\"; done",
+             "for d in $({P}); do {T} \"$d\"; done", "{T} $({P})", "{T} `{P}`", "xargs {T} < <({P})",
+             "mapfile -t a < <({P}); {T} \"${a[@]}\"", "L=$({P}); {T} $L", "{P} | parallel {T} {}",
+             "{P} | xargs -I% {T} %", "{P} | sort | head -20 | xargs {T}", "{P} | xargs --max-args 1 {T}",
+             "{P} | while read d; do sh -c \"{T} $d\"; done"]
+MEASURE = ["du -sk", "du -xsk", "dust", "gdu", "ncdu", "tree", "ls -la", "ls"]
+cases = [(c.replace("{P}", p).replace("{T}", t), cwd) for c in CONSUMERS for p in PRODUCERS for t in MEASURE
+         for cwd in (GT, None)]
+sweep("feeds: every listing of \\$HOME/an ancestor x every plumbing x every measuring tool -> BLOCK", cases, "block", 200)
+SAFE_PROD = ["ls ~/gt", "ls /Users/athos/gt", "ls /tmp", "find ~/gt -maxdepth 1", "printf '%s\\n' ~/gt/*", "echo ~/.gastown/*"]
+cases = [(c.replace("{P}", p).replace("{T}", t), GT) for c in CONSUMERS for p in SAFE_PROD for t in MEASURE]
+sweep("feeds: the same plumbing fed by a SAFE listing -> ALLOW (the control)", cases, "allow")
+
+# 5. A HOT CWD: every relative-scan shape x every hot cwd
+REL = ["find .", "find", "find . -name x", "du -sk *", "du -sk", "du -sk .", "du -d 1", "du -d 1 -h", "rg foo",
+       "rg --sort path foo", "rg --pre ./x foo", "rg --max-filesize 1M foo", "fd py", "fd --changed-within 1d py",
+       "grep -r foo", "grep -r foo .", "grep -r --exclude-from f foo", "gls -R", "gls -R --sort time", "ls -R",
+       "eza -R --sort size", "eza -T --sort size", "tree", "ncdu", "dust", "gdu",
+       'for d in *; do du -sk "$d"; done', 'ls -A | xargs du -sk', "ls | xargs -I{} sh -c 'du -sk \"{}\"'",
+       'for d in $(ls -A); do du -xsk "$d"; done', 'ls -A | while read d; do du -sk "$d"; done', "du -sk ./*",
+       "rsync -a . /tmp/x", "cp -r . /tmp/x", "tar czf /tmp/x.tgz ."]
+HOTCWD = ["/Users/athos", "/Users/athos/Desktop", "/Users/athos/Documents/sub", "/Users/athos/Library/CloudStorage",
+          "/Volumes", "/Volumes/Backup", "/Users", "/"]
+cases = [(c, cwd) for c in REL for cwd in HOTCWD]
+sweep("hot cwd: every relative scan x every hot cwd -> BLOCK", cases, "block", 30)
+# NO exemption for an explicit absolute path: it can be an option's VALUE (`rg --ignore-file /tmp/ig foo` still walks the cwd), and reading
+# options is exactly what this guard does not do. (Rule B was the last place that guessed which word was the operand.)
+EXPLICIT = ["du -sk /tmp/x", "du -xsk ~/gt ~/.gastown", "find /Users/athos/gt -name x", "rg foo ~/gt", "grep -rn foo /Users/athos/gt/docs",
+            "tree /private/tmp/claude-501", "ls -R /Users/athos/gt/docs", "rg --ignore-file /tmp/ig foo", "rg --pre /usr/bin/cat foo",
+            "rg --sort path /tmp/x foo", "fd --ignore-file /tmp/ig py", "grep -r --exclude-from /tmp/ig foo", "grep -r -f /tmp/patterns",
+            "du --files0-from /tmp/l", "find -newer /tmp/ref -name x", "find -f /tmp/x", "ag --path-to-ignore /tmp/ig foo",
+            "ack --ignore-file /tmp/ig foo", "rg --files --ignore-file /tmp/ig"]
+cases = [(c, cwd) for c in EXPLICIT for cwd in HOTCWD]
+sweep("hot cwd: even a scan that names an explicit SAFE absolute path is refused (it can be an option's value) -> BLOCK", cases, "block", 40)
+cases = [("find /Users -maxdepth 1 -name x", GT), ("find / -maxdepth 2 -type d", None),
+         ("find . -maxdepth 1", "/"), ("find . -maxdepth 2 -name x", "/Users")]
+sweep("the ONE exemption: find with -maxdepth <= 2 whose only hot target is an ANCESTOR of $HOME -> ALLOW", cases, "allow")
+cases = [(c, cwd) for c in REL for cwd in [GT, GT + "/docs", "/tmp", "/private/tmp/claude-501/x", "/Users/athos/.gastown"]]
+sweep("safe cwd: the same relative scans away from $HOME -> ALLOW (the control)", cases, "allow")
+
+# 5b. A HOME WHOSE NAME HAS GLOB / REGEX CHARACTERS is still recognised as itself (its `[d]` was read as a character class, so the guard
+# could not tell its own home and stood down): the home and the payload's cwd enter the classifier as literal text
+def verdict_home(cmd, cwd, home):
+    try:
+        hsg.analyze(cmd, cwd, [home])
+        return "allow"
+    except hsg.Block:
+        return "block"
+    except BaseException as exc:
+        return "ERROR %s: %s" % (type(exc).__name__, exc)
+
+
+odd = ["/Users/a+b(c[d]", "/Users/x.y*z", "/Users/we^ird$name|x", "/Users/q?r{s,t}", "/Users/o~p"]
+bad_odd = []
+for h in odd:
+    for cmd, want in [("du -sk ~", "block"), ("du -sk ~/Downloads", "block"), ("du -sk '" + h + "/Desktop'", "block"),
+                      ("cd " + shlex.quote(h) + " && du -sk *", "block"), ("du -sk ~/gt", "allow"), ("du -sk '" + h + "/gt'", "allow")]:
+        got = verdict_home(cmd, "/Users/athos/gt", h)
+        if got != want:
+            bad_odd.append((h, cmd, want, got))
+    if verdict_home("du -sk *", h, h) != "block":
+        bad_odd.append((h, "du -sk * (cwd is the odd home)", "block", "allow"))
+print("SWEEP\ta $HOME with glob/regex characters in its name is still $HOME (5 homes x 7 shapes)\t%d\t%d" % (len(odd) * 7, len(bad_odd)))
+for h, cmd, want, got in bad_odd[:5]:
+    print("FAILCASE\todd-home\t%r\thome=%s\tgot=%s (wanted %s)" % (cmd, h, got, want))
+
+# 5c. "don't know" is COUNTED: a scan whose cwd is unknown is allowed but returns a note (the caller logs it as UNKNOWN-CWD); a known cwd returns none
+note_unknown = hsg.analyze("du -sk *", None, HOMES)
+note_after_cd = hsg.analyze('cd "$SOMEWHERE" && du -sk *', GT, HOMES)
+note_known = hsg.analyze("du -sk *", GT, HOMES)
+print("SWEEP\ta scan with NO cwd, or after a cd to a run-time value, returns a note; a known cwd returns none\t3\t%d"
+      % ((0 if note_unknown else 1) + (0 if note_after_cd else 1) + (1 if note_known else 0)))
+
+# 6. ROBUSTNESS: whatever the text is, the engine never raises (a crash is a silent fail-open) and stays fast
+random.seed(20260927)
+TOKS = ["du", "-sk", "~", "$HOME", "${HOME}", "/Users/athos", "/", "'", '"', "`", "$(", ")", "(", "{", "}", ",", ";", "&&",
+        "||", "|", "&", "<<", "<<<", "<", ">", ">>", "2>&1", "\n", " ", "\\", "$", "*", "?", "[", "]", "cd", "find",
+        "ls", "-R", "for", "d", "in", "do", "done", "xargs", "bash", "-c", "eval", "EOF", "#", "~/Downloads", "$'", "${",
+        "$((", "))", "x=", "=", "a", "b", "\t", "\x00", "é", "\ud7ff"]
+worst = 0.0
+errors = []
+for i in range(20000):
+    cmd = "".join(random.choice(TOKS) + random.choice(["", " ", ""]) for _ in range(random.randint(1, 40)))
+    t0 = time.perf_counter()
+    got = verdict(cmd, random.choice([None, GT, "/Users/athos", "/"]))
+    worst = max(worst, time.perf_counter() - t0)
+    if got.startswith("ERROR"):
+        errors.append((cmd, got))
+print("SWEEP\trobustness: 20000 random token soups never raise\t20000\t%d" % len(errors))
+for cmd, got in errors[:4]:
+    print("FAILCASE\trobustness\t%r\tcwd=?\tgot=%s" % (cmd, got))
+print("SWEEP\trobustness: worst single verdict under 1.0s (was %.3fs)\t1\t%d" % (worst, 1 if worst >= 1.0 else 0))
+def timed(name, cmd, cwd, want, limit):
+    t0 = time.perf_counter()
     got = verdict(cmd, cwd)
-    if got != want:
-        problems.append("WRONG (want %s, got %s, cwd %s): %s" % (want, got, cwd, cmd[:120]))
+    took = time.perf_counter() - t0
+    print("SWEEP\t%s (%.3fs)\t1\t%d" % (name, took, 0 if got == want and took < limit else 1))
+    if got != want or took >= limit:
+        print("FAILCASE\t%s\t%r\tcwd=%s\tgot=%s in %.2fs" % (name, cmd[:80], cwd, got, took))
 
 
-def func(name):
-    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+# a glob with many wildcards compiles to a regex that is exponential to match: it must be READ AS "could be anything", never compiled
+# (before: `du -sk ~/**************************************************x` did not return in 60s -- the wrapper kills it at 5s = a silent allow)
+timed("a component with 50 stars is 'could be anything' (BLOCK), not a hang", "du -sk ~/" + "*" * 50 + "x", GT, "block", 1.0)
+timed("a component of 40 x '*a' then a literal: BLOCK in under 1s", "du -sk ~/" + "*a" * 40 + "x", GT, "block", 1.0)
+timed("the same stars in a SAFE component (~/gt/...): still ALLOW, in under 1s", "du -sk ~/gt/" + "*" * 50 + "x", GT, "allow", 1.0)
+timed("a word of 20000 tildes reads in under 2s (the NAME= check was quadratic)", "du -sk " + "~" * 20000, GT, "allow", 2.0)
+timed("15000 DISTINCT words in one scanner segment read in under 3s", "du -sk " + " ".join("w%d" % i for i in range(15000)), GT, "allow", 3.0)
+# quoted scripts nested inside quoted scripts: a worklist, not recursion (nesting is bounded by the QUOTING, which grows ~3x per level, so
+# 8 levels is ~13KB of text). Eight levels -- the depth where the recursion this replaced gave up -- are read like one. The depth cap is tested by lowering it: past it the command is REFUSED -- a cap
+# must end in a block, never an allow (the flat fallback this replaced split on whitespace and let `bash -c 'bash -c ...du -sk ~/Downloads'` through)
+ws8, scan8, ok8 = "   ", "du -sk ~/Downloads", "true"
+for _ in range(6):
+    ws8, scan8, ok8 = "bash -c " + shlex.quote(ws8), "bash -c " + shlex.quote(scan8), "bash -c " + shlex.quote(ok8)
+timed("8 levels of bash -c around a whitespace-only script: no exception", ws8, GT, "allow", 2.0)
+timed("8 levels of bash -c around a harmless command: read, ALLOW", ok8, GT, "allow", 2.0)
+timed("8 levels of bash -c around a scan: BLOCK", scan8, GT, "block", 2.0)
+saved_cap, hsg.MAX_SCRIPT_DEPTH = hsg.MAX_SCRIPT_DEPTH, 2
+timed("past the script-depth cap (lowered to 2): a harmless command 8 levels deep is REFUSED, not allowed", ok8, GT, "block", 2.0)
+hsg.MAX_SCRIPT_DEPTH = saved_cap
+big = "echo " + "x " * 20000 + "; du -sk ~"
+t0 = time.perf_counter()
+got = verdict(big, GT)
+took = time.perf_counter() - t0
+print("SWEEP\ta 40KB command with a scan at the end is read (blocked) in under 2s (%.3fs)\t1\t%d" % (took, 0 if got == "block" and took < 2 else 1))
+# adversarial review (round 5): a heredoc body with many UNCLOSED $( used to re-lex the remaining body from every
+# occurrence independently (O(matches x body length)); many repeats of one grep-family tool name did an O(n) whole-words
+# scan once per matching word (O(n^2)). Both are ordinary generated-command shapes, not adversarial ones.
+timed("heredoc body with 400 unclosed $( : fast, not a multi-second hang", "cat <<EOF\n" + "$(" * 400 + "\nEOF\ndu -sk ~", GT, "block", 1.0)
+timed("6000 repeated grep-family words in one segment: fast, not O(n^2)", "grep " * 6000 + "foo /tmp/x", GT, "allow", 1.0)
+timed("a heredoc scan buried after 50 PROPERLY CLOSED $(...) is still found",
+      "cat <<EOF\n" + "".join("$(echo t%d) " % i for i in range(50)) + "$(du -sk ~) x\nEOF\necho done", GT, "block", 1.0)
+deep = "echo " + "$(true " * 200 + "du -sk ~" + ")" * 200
+t0 = time.perf_counter()
+got = verdict(deep, GT)
+took = time.perf_counter() - t0
+print("SWEEP\t200 levels of \\$( ) with a scan at the bottom: BLOCK, not a give-up, in under 2s (%.3fs)\t1\t%d" % (took, 0 if got == "block" and took < 2 else 1))
 
-
-# What the TOOLS do is stated HERE, not read back from the engine: a test that takes its expectation from the table it is testing
-# passes for any table (mutation-tested: flipping grep to "reads stdin" in the table moved the expectation with it and survived).
-KNOWN_WRAPPERS = {"command", "builtin", "exec", "nohup", "setsid", "time", "env", "nice", "ionice", "stdbuf", "arch", "caffeinate",
-                  "sudo", "timeout", "xargs"}
-positionals = {"timeout": 1}                       # GNU timeout: DURATION sits between its options and the command
-assigners = {"env", "sudo"}                        # NAME=VALUE words may precede the command
-wrappers = getattr(m, "WRAPPERS", None)
-wopts = getattr(m, "WRAPPER_OPTS", None)
-if not wrappers or not wopts:
-    problems.append("STRUCT: the engine has no WRAPPERS / WRAPPER_OPTS table -- the wrapper dispatcher is not table-driven")
-    wrappers = ()
-else:
-    if not KNOWN_WRAPPERS <= set(wrappers):
-        problems.append("STRUCT: wrappers missing from the engine's WRAPPERS: %s" % sorted(KNOWN_WRAPPERS - set(wrappers)))
-    if dict(m.WRAPPER_POSITIONALS) != positionals or set(m.WRAPPER_ASSIGNS) != assigners:
-        problems.append("STRUCT: WRAPPER_POSITIONALS / WRAPPER_ASSIGNS differ from what timeout / env / sudo take: %r %r"
-                        % (dict(m.WRAPPER_POSITIONALS), set(m.WRAPPER_ASSIGNS)))
-    # the option tables are for PRECISION and must be RIGHT: the reading they give (the one a cd belongs to) is the real command
-    st = m.State(["/Users/athos"], "/Users/athos/gt")
-    for cmd, want in (("caffeinate -i du -sk ~/gt", "du"), ("caffeinate -t 60 -d du -sk ~/gt", "du"), ("sudo -n du -sk ~/gt", "du"),
-                      ("sudo -i du -sk ~/gt", "du"), ("sudo -u athos -H du -sk ~/gt", "du"), ("sudo -D /tmp FOO=1 du -sk ~/gt", "du"),
-                      ("nice -n 5 du -sk ~/gt", "du"), ("nice --adjustment 5 du -sk ~/gt", "du"), ("nice -5 du -sk ~/gt", "du"),
-                      ("timeout -s KILL 5 du -sk ~/gt", "du"), ("gtimeout 5 du -sk ~/gt", "du"), ("env -u X -i FOO=1 du -sk ~/gt", "du"),
-                      ("env -S x du -sk ~/gt", "du"), ("time -p du -sk ~/gt", "du"), ("/usr/bin/time -o /tmp/t du -sk ~/gt", "du"),
-                      ("stdbuf -oL du -sk ~/gt", "du"), ("stdbuf -o L du -sk ~/gt", "du"), ("arch -arch arm64 du -sk ~/gt", "du"),
-                      ("arch -x86_64 du -sk ~/gt", "du"), ("command -p du -sk ~/gt", "du"), ("exec -a x du -sk ~/gt", "du"),
-                      ("ionice -c 3 -t du -sk ~/gt", "du"), ("nohup du -sk ~/gt", "du"), ("setsid -f du -sk ~/gt", "du"),
-                      ("xargs -0 -n 1 du -sk", "du"), ("sudo -n nice -n 5 caffeinate -i timeout 5 du -sk ~/gt", "du"),
-                      ('env FOO="$X" du -sk ~/gt', "du"), ('sudo -n BAR="$d" -i du -sk ~/gt', "du"),
-                      ('env -u X A="$d" B=2 sh -c "true"', "sh")):
-        script, _ = m.scan(cmd, 0, False, 0)
-        primary = [r.name for r in m.unwrap(list(script[0].words), st) if r.primary]
-        if primary != [want]:
-            problems.append("STRUCT: the option tables misread %r: primary reading %r, want [%r]" % (cmd, primary, want))
-        total += 1
-    # (1) SHAPE: unwrap() names only the wrappers that carry behaviour a table cannot (xargs' own parser, `command -v`, env -S).
-    # Any other wrapper spelled out in it is a hand-kept list beside the table -- the drift that produced blocker 1.
-    named = {"xargs", "command", "env"}
-    spelled = {n.value for n in ast.walk(func("unwrap")) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
-    if spelled & (set(wrappers) - named):
-        problems.append("STRUCT: unwrap() spells out wrapper names beside the table: %s" % sorted(spelled & (set(wrappers) - named)))
-    for w in wrappers:
-        if w != "xargs" and not isinstance(wopts.get(w), tuple):
-            problems.append("STRUCT: wrapper %r has no option table (a tuple) in WRAPPER_OPTS" % w)
-
-letters = string.ascii_letters + string.digits
-scanners = [("du -sk %s", "~/Downloads", "~/gt"),
-            ("tar czf /tmp/x.tgz %s", "~/Documents", "~/gt"),
-            ("sh -c 'du -sk %s'", "~/Desktop", "~/gt")]
-VAL = "5"
-
-
-def line(w, opt, tail):
-    pos = " 5" * positionals.get(w, 0)                  # timeout's DURATION sits between its options and the command
-    return "%s %s%s %s" % (w, opt, pos, tail) if opt else "%s%s %s" % (w, pos, tail)
-
-
-def forms(w):
-    out = []
-    for x in letters:
-        out += ["-%s" % x, "-%s %s" % (x, VAL), "-%s%s" % (x, VAL), "-s%s" % x, "-s%s %s" % (x, VAL)]
-        if w in assigners:
-            out.append("-%s FOO=1" % x)
-    longs = {o for o in wopts.get(w, ()) if o.startswith("--")} | {"--zz"}
-    for lo in sorted(longs):
-        out += [lo, "%s %s" % (lo, VAL), "%s=%s" % (lo, VAL)]
-    out.append("")
-    return out
-
-
-for w in wrappers:
-    for opt in forms(w):
-        for cmd, hot, safe in scanners:
-            # the ONE exception, and it is asserted rather than skipped: `command -v NAME` / `-V` LOOKS a command up and runs nothing
-            lookup = w == "command" and opt.split(" ")[0] in ("-v", "-V")
-            expect(line(w, opt, cmd % hot), "allow" if lookup else "block")
-    for opt in forms(w)[::7]:                           # the same shapes over a SAFE target: no reading may become a false block
-        for cmd, hot, safe in scanners:
-            expect(line(w, opt, cmd % safe), "allow")
-# a wrapper behind a wrapper, each with a switch or a value in front
-for w1 in wrappers:
-    for w2 in wrappers:
-        for o1, o2 in (("-n", "-i"), ("-i", "-n 5"), ("-u", "-t 9"), ("", "-o"), ("-c", "")):
-            expect(line(w1, o1, line(w2, o2, "du -sk ~/Downloads")), "block")
-            expect(line(w1, o1, line(w2, o2, "du -sk ~/gt")), "allow")
-# env -S: the value is a command line, in every spelling
-for cmd in ('env -S "du -sk ~/Downloads"', 'env -S"du -sk ~/Downloads"', 'env --split-string="du -sk ~/Downloads"',
-            'env --split-string "du -sk ~/Downloads"', 'env -iS "du -sk ~/Downloads"', 'env -i -S "du -sk ~/Downloads"',
-            "env -S 'find ~/Desktop -name x'", 'env -S "sh -c \'du -sk ~/Downloads\'"'):
-    expect(cmd, "block")
-for cmd in ('env -S "du -sk ~/gt"', 'env --split-string="du -sk ~/gt"', "env -S 'find ~/gt -name x'"):
-    expect(cmd, "allow")
-
-# The false-positive surface of the extra readings is what the engine header says it is: a reading starts at a word near the front
-# of the line, so it only bites when that word is a scanner's own name AND the cwd is hot -- `caffeinate -i make find` from $HOME reads
-# a bare `find` (an accepted, documented false positive); from a repo, and every ordinary neighbour, it is allowed.
-# Only the PRIMARY reading moves the working directory: `caffeinate -t cd ~/Downloads` is caffeinate -t <timeout "cd"> running
-# ~/Downloads -- not a `cd` (the other reading, where -t is a switch, would be one). Letting it move the cwd made the `du -sk .` after
-# it a scan of Downloads: a false block, from a reading that is only a guess.
-expect("caffeinate -t cd ~/Downloads && du -sk .", "allow")
-expect("command -p cd ~/Downloads && du -sk .", "block")             # ...and a REAL cd behind a wrapper still counts
-expect("caffeinate -i make find", "block", "/Users/athos")
-expect("caffeinate -i make find", "allow", "/Users/athos/gt")
-for cmd in ("sudo -u athos brew install tree", "sudo -u athos brew install ncdu", "nice -n 5 make -j4 tree",
-            "timeout 60 git log -- du", "env FOO=1 npm install fd", "sudo brew install tree"):
-    expect(cmd, "allow", "/Users/athos")
-
-# an assignment whose VALUE is an expansion is still an assignment (it has to be read before the "is this word a literal" test:
-# a loop variable handed to the script through `env x="$d" sh -c ...` is how the incident reaches a shell)
-for w in sorted(assigners):
-    # "-Q FOO" is an option no table knows, with a value: the table reading is WRONG there (FOO would be the command), so the
-    # assignment is only reached by the other reading -- which is where reading it after the literal test used to lose it
-    for opt in ("", "-n", "-i", "-u FOO", "-n -i", "-Q FOO", "-Q FOO -i"):
-        pre = ("%s %s " % (w, opt)).replace("  ", " ")
-        expect("for d in $(ls ~); do %sx=\"$d\" sh -c 'du -sk \"$x\"'; done" % pre, "block")
-        expect("for d in $(ls ~/gt); do %sx=\"$d\" sh -c 'du -sk \"$x\"'; done" % pre, "allow")
-
-# ---- search tools: does a pipe replace the implicit cwd operand?
-ss = getattr(m, "SEARCH_STDIN", None)
-if not ss:
-    problems.append("STRUCT: the engine has no SEARCH_STDIN table (which search tools read stdin instead of walking the cwd)")
-else:
-    body = ast.get_source_segment(src, func("check_command"))
-    if not re.search(r"\bif name in SEARCH_STDIN\b", body):
-        problems.append("STRUCT: check_command's search branch is not gated by SEARCH_STDIN")
-    if re.search(r'"rg",\s*"ag",\s*"ack"', body):
-        problems.append("STRUCT: check_command spells out the search tools beside SEARCH_STDIN")
-    flag = {"grep": "-r "}
-    # What each tool does with a pipe and no path, stated here (measured on this machine for grep and rg, 26/09: BSD grep 2.6.0
-    # -r prints ./a.txt and ignores the pipe; `echo x | rg x` prints the stdin line; the other three are from their manuals) --
-    # NOT read back from the engine's table, or flipping an entry would move the expectation with it.
-    truth = {"grep": False, "fd": False, "rg": True, "ag": True, "ack": True}
-    if {t: e[0] for t, e in ss.items()} != truth:
-        problems.append("STRUCT: SEARCH_STDIN disagrees with what the tools do: %r" % {t: e[0] for t, e in ss.items()})
-    for tool, entry in ss.items():
-        reads_stdin, evidence = entry
-        reads_stdin = truth.get(tool, reads_stdin)
-        if not str(evidence).strip():
-            problems.append("STRUCT: SEARCH_STDIN[%r] says nothing about HOW it is known (measured / documented)" % tool)
-        c = "%s %sfoo" % (tool, flag.get(tool, ""))
-        piped = "allow" if reads_stdin else "block"
-        expect("cd ~ && git log --oneline | " + c, piped)
-        expect("echo x | " + c, piped, "/Users/athos/Downloads")
-        expect("cd ~ && " + c, "block")                   # nothing on stdin: every one of them walks the cwd
-        expect("git log | " + c, "allow")                 # the cwd is safe
-        expect("ls ~ | xargs " + c, "block")              # operands: the entries of $HOME
-        expect("ls -A | xargs " + c, "block", "/Users/athos")
-        expect("git ls-files | xargs " + c, "allow", "/Users/athos")   # operands come from xargs, not from the cwd
-
-print("R4 total=%d wrong=%d" % (total, len([p for p in problems if p.startswith("WRONG")])) + (" struct=%d" % len([p for p in problems if p.startswith("STRUCT")])))
-for p in problems[:14]:
-    print("  " + p)
-if len(problems) > 14:
-    print("  ... and %d more" % (len(problems) - 14))
-PY
-  R4_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" HOME_SCAN_GUARD_LOG="$LOG" python3 -I -S "$SCRATCH/r4-class.py" 2>&1)"
-  case "$R4_OUT" in
-    "R4 total="*" wrong=0 struct=0"*) ok "class: every wrapper x every letter/digit x switch/value/attached/cluster/long reads through to the scanner, no safe target is blocked, every search tool is classified for stdin (${R4_OUT%%$'\n'*})" ;;
-    *) bad "class (gate round 4) -- $R4_OUT" ;;
-  esac
+with open(SAMPLE_OUT, "w") as fh:
+    for row in sample:
+        fh.write(json.dumps(row) + "\n")
+with open(BLOCKS_OUT, "wb") as fh:
+    for cmd, cwd in allblocks:
+        fh.write(cmd.encode() + b"\0" + cwd.encode() + b"\0")
+PYEOF
+python3 -I "$SCRATCH/sweeps.py" "$ENGINE" "$SCRATCH/sample.jsonl" "$SCRATCH/sweep-blocks.bin" > "$SCRATCH/sweeps.out" 2> "$SCRATCH/sweeps.err"; SRC=$?
+if [ "$SRC" -ne 0 ] || ! grep -q '^SWEEP' "$SCRATCH/sweeps.out"; then
+  bad "sweep driver did not run (rc=$SRC): $(head -c 600 "$SCRATCH/sweeps.err")"
+else
+  while IFS=$'\t' read -r kind name total nfail; do
+    if [ "$kind" = "SWEEP" ]; then
+      if [ "$nfail" = "0" ]; then ok "sweep [$total cases]: $name"
+      else bad "sweep: $name -- $nfail of $total failed"; fi
+    fi
+  done < <(grep '^SWEEP' "$SCRATCH/sweeps.out")
+  grep '^FAILCASE' "$SCRATCH/sweeps.out" | head -40 | while IFS=$'\t' read -r _ name cmd cwd got; do echo "        first failures: $name  $cmd  $cwd  $got"; done
 fi
 
-# A guard that fails open on its OWN bug is silently OFF: the engine logs those as ENGINE-ERROR. A NameError from a
-# refactor once turned 71 must-block cases into silent allows here -- this is the assertion that makes that loud.
+# the sampled sweep cases, THROUGH THE WRAPPER: the in-process sweeps prove the classifier, this proves the bash prefilter never
+# stands between a shape the classifier blocks and the block (a non-hot cwd, so the prefilter is the only thing that could let it by)
+echo ""
+echo "-- sweep samples THROUGH the wrapper (bash 3.2 prefilter + classifier) --"
+NSAMPLE=0; NMISS=0; MISSED=""
+if [ -s "$SCRATCH/sample.jsonl" ]; then
+  while IFS= read -r row; do
+    cmd="$(printf '%s' "$row" | jq -r .cmd)"; cwd="$(printf '%s' "$row" | jq -r .cwd)"
+    run_guard "$cmd" "$cwd"
+    NSAMPLE=$((NSAMPLE+1))
+    if [ "$RC" -ne 2 ]; then NMISS=$((NMISS+1)); MISSED="$MISSED
+        rc=$RC cwd=[$cwd] cmd=[${cmd:0:120}]"; fi
+  done < "$SCRATCH/sample.jsonl"
+fi
+[ "$NSAMPLE" -ge 60 ] && ok "the sampled set is big enough to mean something ($NSAMPLE cases)" || bad "sample too small: $NSAMPLE"
+[ "$NMISS" -eq 0 ] && ok "every sampled BLOCK of the engine is also a BLOCK of the wrapper ($NSAMPLE of $NSAMPLE)" || bad "$NMISS of $NSAMPLE engine blocks were let through by the wrapper:$MISSED"
+
+# The exhaustive half: the wrapper's OWN prefilter code (cut out of the file, so it cannot drift from what runs) over EVERY case the
+# classifier blocked -- the whole spec must-block corpus and every block the sweeps checked (the huge option sweep at stride 3) -- with a
+# non-hot cwd, so the prefilter is the only thing that can let one through. A miss is a block that is silently switched off.
+echo ""
+echo "-- the wrapper's prefilter never stands between a classifier block and the block (every blocked case, one bash process) --"
+{
+  echo 'note() { :; }'
+  echo 'prefilter() { local tool=Bash cmd="$1" cwd="$2"'
+  awk '/^# ---- 2\. cheap superset prefilter/{f=1} /^# ---- 3\. exact classifier/{f=0} f' "$GUARD" | sed 's/exit 0/return 0/g'
+  echo '  return 99; }'
+  cat <<'HARNESS'
+n=0; miss=0
+for f in "$@"; do
+  while IFS= read -r -d '' cmd && IFS= read -r -d '' cwd; do
+    [ -n "$cwd" ] || cwd=/Users/athos/gt
+    n=$((n+1))
+    prefilter "$cmd" "$cwd"; rc=$?
+    if [ "$rc" -ne 99 ]; then miss=$((miss+1)); [ "$miss" -le 12 ] && printf 'MISS cwd=[%s] cmd=[%s]\n' "$cwd" "${cmd:0:150}"; fi
+  done < "$f"
+done
+echo "RESULT n=$n miss=$miss"
+HARNESS
+} > "$SCRATCH/prefilter-harness.sh"
+DIFF_OUT="$(env HOME_SCAN_GUARD_HOME=/Users/athos "$HOOK_BASH" "$SCRATCH/prefilter-harness.sh" "$SCRATCH/spec-blocks.bin" "$SCRATCH/sweep-blocks.bin" 2>&1)"
+DN="$(printf '%s\n' "$DIFF_OUT" | sed -n 's/^RESULT n=\([0-9]*\) miss=.*/\1/p')"; DM="$(printf '%s\n' "$DIFF_OUT" | sed -n 's/^RESULT n=[0-9]* miss=\([0-9]*\)/\1/p')"
+if [ -n "$DN" ] && [ "${DN:-0}" -ge 5000 ] && [ "$DM" = "0" ]; then ok "prefilter differential: $DN classifier-BLOCKED cases (spec corpus + sweeps), 0 let through by the prefilter"
+else bad "prefilter differential: n=${DN:-?} miss=${DM:-?} (a block the prefilter switches off): $(printf '%s\n' "$DIFF_OUT" | grep '^MISS' | head -5)"; fi
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- FORM PIN: the parts of the old design that the gate kept finding holes in must not come back --"
+# ─────────────────────────────────────────────────────────────────────────
+# Gate rounds 1-4 (ga-02cqk4): a table of which option takes a value / which wrapper takes which option / which tool's depth flag
+# stops the walk / which variable is "tainted" decided what the guard read, and every wrong or missing entry was a silent allow.
+# The engine now reads EVERY non-dash word of a scanner's command as a candidate path and never asks what an option means.
+# If one of those mechanisms is re-added, this fails and points here; re-adding one needs a reason stronger than "a case slipped".
+if grep -nE '(^|[^A-Za-z_])(TOOL_OPTS|WRAPPER_OPTS|WRAPPER_POSITIONALS|TRAVERSAL_DEPTH|SEARCH_STDIN|valued_short|valued_long|parse_args|_all_starts|pipe_home|HDYN|command_lists_home|script_lists_home|looks_like_file|DIR_EXTENSIONS)([^A-Za-z_]|$)' "$ENGINE" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v '^[0-9]*:[[:space:]]*"""' >/dev/null; then
+  bad "the engine mentions a mechanism that gate rounds 1-4 removed: $(grep -nE '(TOOL_OPTS|WRAPPER_OPTS|WRAPPER_POSITIONALS|TRAVERSAL_DEPTH|SEARCH_STDIN|valued_short|valued_long|parse_args|_all_starts|pipe_home|HDYN|command_lists_home|script_lists_home|looks_like_file|DIR_EXTENSIONS)' "$ENGINE" | head -3 | cut -c1-160)"
+else
+  ok "the engine has no option table, wrapper table, depth table, stdin-taint or is-it-a-file heuristic"
+fi
+CODELINES="$(python3 -I - "$ENGINE" <<'CLEOF'
+import ast, sys
+src = open(sys.argv[1]).read()
+skip = set()
+for node in ast.walk(ast.parse(src)):
+    if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)) and node.body and isinstance(node.body[0], ast.Expr) \
+            and isinstance(getattr(node.body[0], "value", None), ast.Constant) and isinstance(node.body[0].value.value, str):
+        skip.update(range(node.body[0].lineno, node.body[0].end_lineno + 1))
+print(sum(1 for i, l in enumerate(src.splitlines(), 1) if l.strip() and not l.strip().startswith("#") and i not in skip))
+CLEOF
+)"
+[ "${CODELINES:-9999}" -le 760 ] && ok "the engine stays small enough to review in one sitting ($CODELINES code lines, docs and comments excluded; the design it replaced had 1363)" || bad "the engine grew to ${CODELINES:-?} code lines (limit 760): a guard that cannot be read cannot be trusted"
+
+# ─────────────────────────────────────────────────────────────────────────
+# The classifier can also fail OPEN on its OWN bug, silently (a caught exception is an allow). A NameError
+# once turned 71 must-block cases into silent allows here -- this is the assertion that makes that loud.
 echo ""
 echo "-- the engine never failed open on its own bug --"
 if grep -q 'ENGINE-ERROR' "$LOG" 2>/dev/null; then
   bad "engine internal error(s) fail-opened during this run: $(grep 'ENGINE-ERROR' "$LOG" | head -3 | cut -c1-300)"
 else
-  ok "no ENGINE-ERROR line in the guard log after the whole run ($(grep -c 'BLOCKED' "$LOG" 2>/dev/null) BLOCKED lines, $(grep -c 'GAVE-UP' "$LOG" 2>/dev/null) GAVE-UP)"
+  ok "no ENGINE-ERROR line in the guard log after the whole run ($(grep -c 'BLOCKED' "$LOG" 2>/dev/null) BLOCKED lines)"
 fi
 # ...nor did the WRAPPER degrade under a case that was supposed to be decided by the classifier: an expect_allow can
 # pass because the wrapper timed out or lost its interpreter and fell open, not because the classifier said allow.
@@ -1162,7 +973,11 @@ if grep -q 'UNGUARDED' "$LOG" 2>/dev/null; then
 else
   ok "no UNGUARDED line in the guard log after the whole run (every verdict above came from the classifier)"
 fi
-grep -q 'GAVE-UP' "$LOG" 2>/dev/null && ok "absurd nesting is logged as GAVE-UP (deliberate fail-open), not as an error" || bad "no GAVE-UP line for the nesting case"
+if grep -q 'GAVE-UP' "$LOG" 2>/dev/null; then
+  bad "the classifier gave up on a case of the main corpus (an ALLOW logged after the fact): $(grep 'GAVE-UP' "$LOG" | head -3 | cut -c1-300)"
+else
+  ok "no GAVE-UP line: the classifier never abandoned a command (it has no cap that ends in an allow)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────
 # LIVE (opt-in): the script working in isolation proves nothing about DISPATCH -- ga-7j1yu found a

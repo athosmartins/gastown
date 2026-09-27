@@ -88,7 +88,7 @@ TARGETS=()
 for a in "$@"; do
   case "$a" in
     --check) CHECK=1 ;;
-    -h|--help) sed -n '2,55p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set -uo pipefail$/{/^set -uo pipefail$/!p;}' "$0"; exit 0 ;;   # the whole leading comment block, however long it grows
     *) TARGETS+=("$a") ;;
   esac
 done
