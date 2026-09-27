@@ -799,7 +799,12 @@ bead_domain() {
   # batista-wa instead of the pool) is cheap to notice/bounce and far
   # smaller than the reclaim-loop this fix closes; a keyword regex over
   # freeform prose cannot fully distinguish "is about" from "mentions".
-  if printf '%s' "$hay" | grep -iE 'hex[ -]?notebook|notebook.{0,10}\bhex\b|hex[ -]?cell|c[ée]lula.{0,15}\bhex\b|hex-native|hex-monitor|hex-api|hex\.tech|hex[ -]?project|hex[ -]?run|hex[ -]?schedule|hex[ -]?publish|hex[ -]?draft' >/dev/null; then
+  # ga-a9zz5y: accented letters below are ALTERNATIONS (é|É|e), never bracket
+  # classes ([ée]) — grep matches a bracket per BYTE, and under LC_ALL=C/POSIX
+  # (the locale of the com.gascity.pilot launchd job, which sets no LANG/LC_*)
+  # a UTF-8 letter is two loose bytes, so [ée] never matches "célula". Same
+  # defect ga-671p6g fixed in escalation-router.sh's mirror of this function.
+  if printf '%s' "$hay" | grep -iE 'hex[ -]?notebook|notebook.{0,10}\bhex\b|hex[ -]?cell|c(é|É|e)lula.{0,15}\bhex\b|hex-native|hex-monitor|hex-api|hex\.tech|hex[ -]?project|hex[ -]?run|hex[ -]?schedule|hex[ -]?publish|hex[ -]?draft' >/dev/null; then
     echo "hex"; return 0
   fi
   if printf '%s' "$hay" | grep -iE 'urblink_design_system|design[ -]system|painel[ -]?hist|\bfrontend\b|\bui\b|\bux\b|\bkanban\b|\bcss\b|stylesheet|layout' >/dev/null; then
@@ -810,7 +815,8 @@ bead_domain() {
   # NOT oracle (warming) or thies (satmap visual layer only). This is the wa-nvn9/wa-o65d
   # round-robin-to-oracle loop oracle hit, and the wa-nvn9 misroute-to-thies when peter was
   # human-engaged.
-  if printf '%s' "$hay" | grep -iE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|[ií]ndice cadastral|im[oó]ve(l|is)|funil[ _-]?im[oó]vel|deals?.*(fora de bh|im[oó]ve)' >/dev/null; then
+  # ga-a9zz5y: accented letters as alternations (ó|Ó|o), not bracket classes — see comment above.
+  if printf '%s' "$hay" | grep -iE 'arcgis|zoneamento|geometria|geo-?match|quarteir|cadastr|\bitbi\b|(í|Í|i)ndice cadastral|im(ó|Ó|o)ve(l|is)|funil[ _-]?im(ó|Ó|o)vel|deals?.*(fora de bh|im(ó|Ó|o)ve)' >/dev/null; then
     echo "real-estate"; return 0
   fi
   # ga-cfc6wd: bare "warming"/"aquecimento"/"chip(s)" alone are too broad — they
@@ -987,7 +993,17 @@ bead_content_rig() {
     echo "whatsapp_automation"; return 0
   fi
   # property_scrapers domain (the recurring misroute family).
-  if printf '%s' "$hay" | grep -iE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet[áa]ri|\bim[óo]vel\b|\bim[óo]veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart[óo]rio|matr[íi]cula|incorpora|índice cadastral|indice cadastral|mega_data_set|mega data set' >/dev/null; then
+  # ga-a9zz5y: accented letters as alternations (á|Á|a), not bracket classes
+  # ([áa]) — grep matches a bracket per BYTE, and under LC_ALL=C/POSIX (the
+  # locale of the com.gascity.pilot launchd job, no LANG/LC_* set) a UTF-8
+  # letter is two loose bytes, so [áa]/[óo]/[íi] never matched "proprietário",
+  # "imóvel", "cartório", "matrícula" — they fell through to the caller's
+  # fallback. The bare literal "índice cadastral" (no brackets) is ALSO
+  # rewritten: literal UTF-8 bytes match fine under C, but grep -i only folds
+  # case for non-ASCII under a UTF-8 locale, so "ÍNDICE CADASTRAL" (all caps)
+  # still missed — spelling out the upper-case letter fixes that too. Same
+  # defect ga-671p6g fixed in escalation-router.sh's mirror of this function.
+  if printf '%s' "$hay" | grep -iE 'scraper|scrape|\bcadastro\b|cadastr[ao]|\bITBI\b|\bRFB\b|receita federal|\bCNAE\b|\bCNPJ\b|\bPBH\b|motherduck|\bHex\b|hex notebook|geocod|georreferenc|lat[ -/]?lon|point-in-polygon|pesquisa_mercado|propriet(á|Á|a)ri|\bim(ó|Ó|o)vel\b|\bim(ó|Ó|o)veis\b|\blote\b|\blotes\b|\bterreno\b|terreno_livre|cart(ó|Ó|o)rio|matr(í|Í|i)cula|incorpora|(í|Í|i)ndice cadastral|indice cadastral|mega_data_set|mega data set' >/dev/null; then
     echo "property_scrapers"; return 0
   fi
   # whatsapp_automation domain features authored as HQ (ga-) beads.

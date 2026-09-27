@@ -9392,6 +9392,85 @@ else
   bad "ga-swnsg3: REGRESSION — top-up call sites do NOT precede the both-lanes-full backoff exit (a freed slot would idle until the ~45min never-started recovery again)"
 fi
 
+# ── ga-a9zz5y: bead_domain / bead_content_rig classify accented words the
+# same under LC_ALL=C and UTF-8 ─────────────────────────────────────────────
+# bead_domain (hex/real-estate checks) and bead_content_rig (property_scrapers
+# check) wrote accented letters as bracket classes ([ée], [áa], [óo], [íi]).
+# grep matches a bracket per BYTE, so under LC_ALL=C/POSIX — the locale of the
+# com.gascity.pilot launchd job, whose plist sets no LANG/LC_* (measured) — a
+# UTF-8 letter is two loose bytes and the bracket never matches it. Same
+# defect ga-671p6g fixed in escalation-router.sh's mirror of these functions.
+# Measured against the base (pre-fix) bead_domain/bead_content_rig: "célula
+# hex" (no "notebook") classified domain="" instead of "hex", "proprietário do
+# imóvel" classified domain="" instead of "real-estate", and "proprietário do
+# imóvel, cartório, matrícula" classified content_rig="" instead of
+# "property_scrapers" — all three under LC_ALL=C only; the identical fixture
+# passed under UTF-8, so the same bug hid depending on who ran the selftest.
+echo ""
+echo "── ga-a9zz5y: bead_domain / bead_content_rig — same answer under C and UTF-8 ──"
+_BD_FN_A9ZZ5Y="$(awk '/^bead_domain\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_BCR_FN_A9ZZ5Y="$(awk '/^bead_content_rig\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_dom_a9zz5y() { ( eval "$_BD_FN_A9ZZ5Y"; bead_domain "$1" ); }
+_bcr_a9zz5y() { ( eval "$_BCR_FN_A9ZZ5Y"; bead_content_rig "$1" ); }
+dom_loc_eq() {   # dom_loc_eq <label> <bead-json> <want>
+  local label="$1" bead="$2" want="$3" got_c got_u
+  got_c=$(LC_ALL=C _dom_a9zz5y "$bead")
+  got_u=$(LC_ALL=en_US.UTF-8 _dom_a9zz5y "$bead")
+  if [ "$got_c" = "$want" ] && [ "$got_u" = "$want" ]; then ok "$label [C | UTF-8] = $want"
+  else bad "$label [C | UTF-8] = '$got_c' | '$got_u' (want $want)"; fi
+}
+bcr_loc_eq() {   # bcr_loc_eq <label> <bead-json> <want>
+  local label="$1" bead="$2" want="$3" got_c got_u
+  got_c=$(LC_ALL=C _bcr_a9zz5y "$bead")
+  got_u=$(LC_ALL=en_US.UTF-8 _bcr_a9zz5y "$bead")
+  if [ "$got_c" = "$want" ] && [ "$got_u" = "$want" ]; then ok "$label [C | UTF-8] = $want"
+  else bad "$label [C | UTF-8] = '$got_c' | '$got_u' (want $want)"; fi
+}
+# Without the UTF-8 locale installed the UTF-8 leg above would silently
+# degrade to C and prove nothing, so its absence is a failure, not a skip —
+# same guard ga-671p6g's own selftest uses.
+_A9ZZ5Y_LOCALES="$(locale -a 2>/dev/null)"; _a9zz5y_loc_rc=$?
+if [ "$_a9zz5y_loc_rc" -ne 0 ] || [ -z "$_A9ZZ5Y_LOCALES" ]; then
+  bad "locale -a gave no usable list (exit $_a9zz5y_loc_rc) — cannot tell whether the UTF-8 leg below is real"
+elif echo "$_A9ZZ5Y_LOCALES" | grep -qx 'en_US.UTF-8'; then ok "en_US.UTF-8 locale installed (UTF-8 leg is real)"
+else bad "en_US.UTF-8 locale missing — the UTF-8 leg below would silently run as C"; fi
+
+# Single accented keyword only, no OTHER independently-matching alternative in
+# the same regex (e.g. "notebook", or the bare unaccented "cadastr"/"scraper"
+# substrings) — these fixtures fail closed if the bracket-class bug regresses,
+# instead of passing by accident via a sibling keyword in the same alternation.
+dom_loc_eq "bead_domain hex: célula (accented, no 'notebook')"      '{"title":"análise da célula hex"}'                          "hex"
+dom_loc_eq "bead_domain real-estate: proprietário do imóvel"       '{"title":"proprietário do imóvel"}'                         "real-estate"
+bcr_loc_eq "bead_content_rig property_scrapers: proprietário/imóvel/cartório/matrícula" \
+  '{"title":"proprietário do imóvel, cartório, matrícula"}' "property_scrapers"
+
+# ga-a9zz5y: structural guard — no non-ASCII character inside a bracket
+# expression in bead_domain/bead_content_rig, so the next accented word added
+# in the old style is caught. Mirrors ga-671p6g's own structural guard
+# (escalation-router.selftest.sh). Comment lines are dropped (they legitimately
+# quote accented words) and the scan runs under LC_ALL=C so a UTF-8 character
+# shows up as high bytes. It must not be able to pass without having looked —
+# three ways that could happen, each its own failure: the bodies are not
+# extractable (a rename would pass vacuously); grep itself errored (exit >1
+# leaves stdout empty, which reads as "none found"); or the detector cannot
+# flag a known-bad line (positive control — a regex some grep build rejects or
+# misreads would go quiet instead of loud).
+_A9ZZ5Y_MB_BRACKET_RE='\[[^]]*[^[:print:]][^]]*\]'
+_a9zz5y_src="$(printf '%s\n%s\n' "$_BD_FN_A9ZZ5Y" "$_BCR_FN_A9ZZ5Y" | grep -v '^[[:space:]]*#')"
+printf '%s\n' 'x[óo]y' | LC_ALL=C grep -qE "$_A9ZZ5Y_MB_BRACKET_RE"; _a9zz5y_mb_ctl_rc=$?
+_a9zz5y_mb_brackets="$(printf '%s\n' "$_a9zz5y_src" | LC_ALL=C grep -nE "$_A9ZZ5Y_MB_BRACKET_RE")"; _a9zz5y_mb_rc=$?
+if [ -z "$_a9zz5y_src" ]; then
+  bad "bead_domain/bead_content_rig body not extractable from $DISPATCHER — the multibyte-bracket guard would pass vacuously"
+elif [ "$_a9zz5y_mb_ctl_rc" -ne 0 ]; then
+  bad "multibyte-bracket detector cannot flag a known-bad line (grep exit $_a9zz5y_mb_ctl_rc) — the guard would pass without looking"
+elif [ "$_a9zz5y_mb_rc" -gt 1 ]; then
+  bad "multibyte-bracket scan errored (grep exit $_a9zz5y_mb_rc) — an empty result would have read as 'none found'"
+elif [ "$_a9zz5y_mb_rc" -eq 0 ]; then
+  bad "bead_domain/bead_content_rig has a non-ASCII char inside a bracket expression (per-byte under LC_ALL=C; write (ó|Ó|o) instead): $(printf '%s' "$_a9zz5y_mb_brackets" | head -2 | cut -c1-110 | tr '\n' ' ')"
+else
+  ok "bead_domain/bead_content_rig: no non-ASCII char inside a bracket expression"
+fi
+
 # ── Verdict ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
