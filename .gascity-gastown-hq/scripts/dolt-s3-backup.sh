@@ -107,6 +107,14 @@ RESEED_TIMEOUT_SECS="${RESEED_TIMEOUT_SECS:-1800}"
 RESEED_TIMEOUT_SECS_HQ="${RESEED_TIMEOUT_SECS_HQ:-3600}"
 RESEED_HQ_DEADLINE_HHMM="${RESEED_HQ_DEADLINE_HHMM:-04:30}"
 RESEED_HQ_MIN_BUDGET_SECS="${RESEED_HQ_MIN_BUDGET_SECS:-300}"
+# ga-9626dq: a deadline-skip that recurs every night (e.g. the sync+upload
+# stages ahead of it structurally eat too much of the window) must not stay
+# silent forever — same "ga-3euoj shape" ga-i99qsp already hardened the
+# disk-margin-refusal path against. Separate state dir/threshold from
+# MARGIN_REFUSAL_STATE_DIR below: mixing the two reasons in one counter
+# would blur which condition is actually recurring.
+RESEED_HQ_DEADLINE_SKIP_STATE_DIR="${RESEED_HQ_DEADLINE_SKIP_STATE_DIR:-$CITY/.gc/logs/.dolt-reseed-hq-deadline-skips}"
+RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD="${RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD:-3}"
 RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
 # ga-i99qsp: dolt-backup-reseed.sh's own disk-margin refusal used to be purely
 # "expected; retried next run" forever — for a db whose disk is CONSISTENTLY
@@ -250,6 +258,29 @@ _margin_refusal_count_after_increment() {
 # the NEXT alarm needs another full streak, not one refusal more).
 _margin_refusal_reset() {
   rm -f "$MARGIN_REFUSAL_STATE_DIR/$1" 2>/dev/null || true
+}
+
+# _hq_deadline_skip_count_after_increment / _hq_deadline_skip_reset
+# (ga-9626dq) — same shape as _margin_refusal_count_after_increment /
+# _margin_refusal_reset above, kept as separate functions/state (rather than
+# parameterizing the existing pair) so this streak's reason can never blur
+# with the disk-margin one in the same counter file.
+_hq_deadline_skip_count_after_increment() {
+  local db="$1" f n
+  if ! mkdir -p "$RESEED_HQ_DEADLINE_SKIP_STATE_DIR" 2>/dev/null; then
+    echo "$RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD"
+    return
+  fi
+  f="$RESEED_HQ_DEADLINE_SKIP_STATE_DIR/$db"
+  n="$(cat "$f" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n+1))
+  echo "$n" > "$f" 2>/dev/null
+  echo "$n"
+}
+
+_hq_deadline_skip_reset() {
+  rm -f "$RESEED_HQ_DEADLINE_SKIP_STATE_DIR/$1" 2>/dev/null || true
 }
 
 # ga-rt7ljo: consecutive-failure-NIGHT escalation — distinct from the reseed
@@ -780,7 +811,17 @@ _reseed_staging_if_enabled() {
   local timeout_secs
   timeout_secs="$(_reseed_budget_secs_for "$db")"
   if [ "$timeout_secs" -le 0 ]; then
-    log "$db: staging reseed skipped — not enough time before $RESEED_HQ_DEADLINE_HHMM to attempt safely (would risk colliding with dolt-compact-routine); retried next run"
+    # ga-9626dq: track the streak; escalate once per streak instead of
+    # staying silent forever if this recurs every night (ga-3euoj shape) —
+    # same pattern as the disk-margin streak just below.
+    local dn; dn="$(_hq_deadline_skip_count_after_increment "$db")"
+    if [ "$dn" -ge "$RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD" ]; then
+      log "$db: staging reseed skipped — not enough time before $RESEED_HQ_DEADLINE_HHMM for ${dn} rodadas seguidas — ALARME"
+      notify_fail "backup off-box: reseed de $db sem tempo suficiente antes de $RESEED_HQ_DEADLINE_HHMM por ${dn} rodadas seguidas (colidiria com dolt-compact-routine) — ver $LOG."
+      _hq_deadline_skip_reset "$db"
+    else
+      log "$db: staging reseed skipped — not enough time before $RESEED_HQ_DEADLINE_HHMM today (expected; retried next run; ${dn}/${RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD} rodadas seguidas)"
+    fi
     return 0
   fi
   local out rc
@@ -790,6 +831,7 @@ _reseed_staging_if_enabled() {
   if [ "$rc" -eq 0 ]; then
     log "$db: staging reseed OK (freed accumulated backup bloat)"
     _margin_refusal_reset "$db"
+    _hq_deadline_skip_reset "$db"
     return 0
   fi
   if is_disk_margin_refusal "$out"; then

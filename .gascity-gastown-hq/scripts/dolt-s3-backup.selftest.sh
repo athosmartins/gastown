@@ -929,6 +929,102 @@ RC=$?
 rm -f "$RESEED_MARKER_FILE2" 2>/dev/null || true
 unset RESEED_MARKER_FILE2
 
+# ── deadline-skip streak counter (ga-9626dq, mirrors ga-i99qsp's margin
+# streak) — a skip near the hq deadline that recurs every night must not
+# stay silent forever (the exact "ga-3euoj shape" ga-i99qsp already hardened
+# the disk-margin-refusal path against); it must escalate once per streak. ──
+echo ""
+echo "── hq deadline-skip streak counter (ga-9626dq) ──"
+DEADLINE_NOTIFY_CALLS="$(mktemp)"
+cat > "$RESEED_STUB_DIR2/notify" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$DEADLINE_NOTIFY_CALLS"
+exit 0
+STUB
+chmod +x "$RESEED_STUB_DIR2/notify"
+export DEADLINE_NOTIFY_CALLS
+DEADLINE_SKIP_STATE_DIR="$(mktemp -d)"
+
+: > "$DEADLINE_NOTIFY_CALLS"; : > "$RESEED_TEST_LOG2"
+for i in 1 2; do
+  RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+    RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+    RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+    RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+    LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+    _reseed_staging_if_enabled "hq"
+done
+[ -s "$DEADLINE_NOTIFY_CALLS" ] \
+  && bad "deadline-skip streak: notify should NOT have fired yet after only 2 of 3 consecutive skips" \
+  || ok "deadline-skip streak: correctly silent through skips 1-2 of 3"
+grep -qF "1/3 rodadas" "$RESEED_TEST_LOG2" \
+  && ok "deadline-skip streak: log shows the streak count (1/3) on the first skip" \
+  || bad "deadline-skip streak: missing the streak-count log line: $(cat "$RESEED_TEST_LOG2")"
+
+RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+  RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+  LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+  _reseed_staging_if_enabled "hq"
+[ -s "$DEADLINE_NOTIFY_CALLS" ] \
+  && ok "deadline-skip streak: notify FIRES on the 3rd consecutive skip (streak reached threshold)" \
+  || bad "deadline-skip streak: notify should have fired on the 3rd consecutive skip"
+grep -qF "3 rodadas seguidas" "$DEADLINE_NOTIFY_CALLS" \
+  && ok "deadline-skip streak: notify message names the streak length" \
+  || bad "deadline-skip streak: notify message should name the streak length"
+
+: > "$DEADLINE_NOTIFY_CALLS"
+RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+  RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+  LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+  _reseed_staging_if_enabled "hq"
+[ -s "$DEADLINE_NOTIFY_CALLS" ] \
+  && bad "deadline-skip streak: notify should NOT fire again immediately after alarming — the streak must reset" \
+  || ok "deadline-skip streak: resets after alarming (4th skip alone doesn't re-fire)"
+
+# A success (ample time before the deadline) resets the streak.
+: > "$DEADLINE_NOTIFY_CALLS"
+for i in 1 2; do
+  RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+    RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+    RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+    RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+    LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+    _reseed_staging_if_enabled "hq"
+done
+RESEED_MARKER_FILE2="$(mktemp -u)"
+export RESEED_MARKER_FILE2
+RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+  RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+  RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0000" \
+  RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+  LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+  _reseed_staging_if_enabled "hq"
+[ -e "$RESEED_MARKER_FILE2" ] \
+  && ok "deadline-skip streak: a success (ample time, EPOCH_0000) actually ran the reseed" \
+  || bad "deadline-skip streak: success case should have invoked the reseed script"
+rm -f "$RESEED_MARKER_FILE2" 2>/dev/null || true
+unset RESEED_MARKER_FILE2
+: > "$DEADLINE_NOTIFY_CALLS"
+for i in 1 2; do
+  RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
+    RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
+    RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+    RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$DEADLINE_SKIP_STATE_DIR" RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD=3 \
+    LOG="$RESEED_TEST_LOG2" NOTIFY="$RESEED_STUB_DIR2/notify" \
+    _reseed_staging_if_enabled "hq"
+done
+[ -s "$DEADLINE_NOTIFY_CALLS" ] \
+  && bad "deadline-skip streak: a success in between must reset the streak (2 skips after an OK should not alarm at threshold 3)" \
+  || ok "deadline-skip streak: a reseed success resets the streak — a later run of skips needs the full streak again"
+
+rm -rf "$DEADLINE_SKIP_STATE_DIR" 2>/dev/null || true
+rm -f "$DEADLINE_NOTIFY_CALLS" 2>/dev/null || true
+unset DEADLINE_NOTIFY_CALLS
+
 rm -rf "$RESEED_STUB_DIR2" 2>/dev/null || true
 rm -f "$RESEED_TEST_LOG2" 2>/dev/null || true
 
