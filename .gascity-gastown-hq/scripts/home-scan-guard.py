@@ -854,23 +854,26 @@ class Analyzer:
                 if (h.kind == "protected" and h.root) or h.kind in ("volumes", "home-glob"):
                     self.block("ls %s -- lists a macOS-protected location: %s" % (unlit(w.t), h.desc))
         if lister or any(r in IMPLICIT_CWD for r in rec):
-            self.judge_cwd(words, rec, shallow, name)
+            self.judge_cwd(words, rec, shallow, name, lister)
 
-    def judge_cwd(self, words, rec, shallow, name):                       # B
+    def judge_cwd(self, words, rec, shallow, name, lister=False):          # B
         """A scanner (or, at a protected cwd, a plain ls) while ANY cwd it may run in is hot. Its operands are NOT consulted for
         THAT: an absolute path in the command can be an option's VALUE (`rg --ignore-file /tmp/x foo` still walks the cwd), and
         reading options is exactly what this guard does not do. Measured on 9,334 real agent commands: none had a hot PAYLOAD
         cwd, so the only way to get here is a `cd` to $HOME (the incident) or a `..` climb -- and the message says what to do.
         The cwd-unknown NOTE is different: it exists to count "don't know" as a third state, not to second-guess a block, so it
         fires only when the scan's OWN operand does not already say where it reads -- `du -sk ~/gt` with no cwd in the payload
-        is not "scanning while the cwd is unknown", it is scanning an explicit path that never looks at the cwd at all."""
+        is not "scanning while the cwd is unknown", it is scanning an explicit path that never looks at the cwd at all. A plain
+        `ls`/`eza` (rec empty, lister True) reads the cwd exactly the same as a recursive scanner does when it has no operand of
+        its own -- gate round 7's finding was that this note was gated on `rec` alone, so an unknown cwd under a bare lister
+        left the log completely empty, the same silence a genuinely safe command gets."""
         hot = [h for h in self.hot_cwds() if not (shallow and h.kind == "ancestor")]
         if not rec:
             hot = [h for h in hot if h.kind in ("protected", "volumes")]
         if hot:
             self.block("%s runs while the cwd can be %s (its operands are not consulted: run it from a directory that is not)"
                        % (name, CWD_LABEL.get(hot[0].kind, hot[0].kind)))
-        if rec and (not self.cwds or self.cwd_unknown):
+        if (rec or lister) and (not self.cwds or self.cwd_unknown):
             pwd = TOK0 + "PWD" + TOK1
             operands = [w for w in words[1:] if not w.t.startswith("-")]
             explicit = operands and all(self.subst(w.t).startswith(("/", "~", pwd)) for w in operands)

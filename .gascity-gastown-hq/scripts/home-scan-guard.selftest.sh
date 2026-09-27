@@ -591,6 +591,17 @@ counted "a scan with no usable \$HOME"    "no usable home" "$(hook_json 'du -sk 
 [ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "a cd to a run-time value, then a relative scan -> allowed, but logged UNKNOWN-CWD" || bad "unknown cd target not logged: rc=$RC log=[$(cat "$DEG")]"
 : > "$DEG"; hook_json 'cd ~/gt && du -sk *' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "a KNOWN cwd leaves the log empty" || bad "known cwd polluted the log: rc=$RC log=[$(cat "$DEG")]"
+# gate ga-a9g4ag (round 7): the UNKNOWN-CWD note above was gated on `rec` (a recursive scanner) alone, so a
+# plain, non-recursive lister (rec empty, lister True -- Rule B groups it with du/find as an IMPLICIT_CWD
+# tool) left the log completely empty on an unknown cwd: the same silence a genuinely safe command gets.
+: > "$DEG"; hook_json 'ls' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "bare 'ls' with NO cwd in the payload -> allowed, but logged UNKNOWN-CWD (not silent)" || bad "no-cwd bare ls not logged: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'eza' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && grep -q "result=UNKNOWN-CWD" "$DEG" && ok "bare 'eza' with NO cwd in the payload -> allowed, but logged UNKNOWN-CWD (not silent)" || bad "no-cwd bare eza not logged: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'ls /tmp' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "'ls /tmp' (explicit operand, no cwd) never looks at the cwd -> log stays empty" || bad "ls with explicit operand polluted the log: rc=$RC log=[$(cat "$DEG")]"
+: > "$DEG"; hook_json 'ls -la' /Users/athos/gt | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$DEG" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
+[ "$RC" -eq 0 ] && [ ! -s "$DEG" ] && ok "'ls -la' at a KNOWN safe cwd leaves the log empty" || bad "ls at known cwd polluted the log: rc=$RC log=[$(cat "$DEG")]"
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
