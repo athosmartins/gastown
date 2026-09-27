@@ -894,10 +894,24 @@ exit 0
 STUB
 chmod +x "$RESEED_STUB_DIR2/reseed_marker.sh"
 
+# ga-9626dq gate-fix 1: without these two overrides, both calls below fall
+# through to the REAL production defaults baked into the sourced script
+# (RESEED_HQ_DEADLINE_SKIP_STATE_DIR=$CITY/.gc/logs/.dolt-reseed-hq-deadline-
+# skips, NOTIFY=/Users/athos/.local/bin/notify) — a hermetic selftest must
+# never touch either. Own stub, separate from the streak-counter block's
+# below: that one asserts on notify content, this one only needs it inert.
+cat > "$RESEED_STUB_DIR2/notify_quiet" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+chmod +x "$RESEED_STUB_DIR2/notify_quiet"
+HQ_DEADLINE_TEST_STATE_DIR2="$(mktemp -d)"
+
 : > "$RESEED_TEST_LOG2"
 RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
   RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
   RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$HQ_DEADLINE_TEST_STATE_DIR2" NOTIFY="$RESEED_STUB_DIR2/notify_quiet" \
   LOG="$RESEED_TEST_LOG2" \
   _reseed_staging_if_enabled "hq"
 RC=$?
@@ -918,6 +932,7 @@ RESEED_MARKER_FILE2="$(mktemp -u)"
 RESEED_SCRIPT="$RESEED_STUB_DIR2/reseed_marker.sh" RESEED_AFTER_UPLOAD=1 \
   RESEED_TIMEOUT_SECS=1800 RESEED_TIMEOUT_SECS_HQ=3600 RESEED_HQ_DEADLINE_HHMM="04:30" \
   RESEED_HQ_MIN_BUDGET_SECS=300 RESEED_BUDGET_NOW_EPOCH="$EPOCH_0429" \
+  RESEED_HQ_DEADLINE_SKIP_STATE_DIR="$HQ_DEADLINE_TEST_STATE_DIR2" NOTIFY="$RESEED_STUB_DIR2/notify_quiet" \
   LOG="$RESEED_TEST_LOG2" \
   _reseed_staging_if_enabled "gastown"
 RC=$?
