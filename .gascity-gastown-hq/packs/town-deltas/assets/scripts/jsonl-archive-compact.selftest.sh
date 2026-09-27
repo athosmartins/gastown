@@ -796,7 +796,7 @@ PH="$WORK/ph"; mkrepo "$PH" 20; rm -f "$WORK/state.json"
 HIST_N=2 prod_run "$PH"
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PASS' && ! printf '%s' "$out" | grep -q 'unproven'; } && ok "healthy archive, order fired → PASS with nothing unproven" || bad "healthy prod run wrong (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
 rm -f "$WORK/state.json"; HIST_N=0 prod_run "$PH" 1024
-{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PASS (.*unproven' && printf '%s' "$out" | grep -qi 'over the alarm'; } && ok "fresh deploy onto an over-alarm backlog, order not fired yet → PASS with the archive size named UNPROVEN (the first tick drains it), not FAIL" || bad "fresh-deploy prod run wrong (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PASS (2 unproven' && printf '%s' "$out" | grep -qi 'over the alarm'; } && ok "fresh deploy onto an over-alarm backlog, order not fired yet → PASS naming BOTH unproven items (the controller never fired, the archive size — the first tick drains it) and counting them as 2, not FAIL" || bad "fresh-deploy prod run wrong (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
 rm -f "$WORK/state.json"; T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 JAC_REPOS="$PH" run_jac "$PH" >/dev/null; HIST_N=3 prod_run "$PH" 1024
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'draining'; } && ok "over the alarm size but the order (fired 3x) is draining it → PASS" || bad "draining backlog failed the prod test (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
 rm -f "$WORK/state.json"; HIST_N=3 prod_run "$PH" 1024

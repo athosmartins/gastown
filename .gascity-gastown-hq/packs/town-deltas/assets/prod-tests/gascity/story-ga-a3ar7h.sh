@@ -54,19 +54,22 @@ log "gc order list resolves the order ($n instance) from $src ✓ (CLI-side scan
 
 # ── 3. has the CONTROLLER fired the order? (the only proof it loaded it) ───────
 # Three states, never two: fired / never fired / could not read. A read failure is UNKNOWN, not "0".
-# Not a FAIL in any of them — a fresh reload legitimately has not reached its first tick (cooldown
-# 30m) — but neither is it silent: it is counted and printed in the PASS line.
-UNPROVEN=""
+# Not a FAIL in ANY of them by itself — a fresh reload legitimately has not reached its first tick
+# (cooldown 30m) — but neither is it silent: every unproven item is counted and listed in the PASS line.
+# ($FIRED is also what section 4 reads: an over-alarm archive is excused only when the order has NOT fired
+# yet — a fired order, or an unreadable history, cannot excuse it.)
+UNPROVEN=""; UNPROVEN_N=0
+_unproven() { UNPROVEN_N=$((UNPROVEN_N + 1)); UNPROVEN="${UNPROVEN:+$UNPROVEN; }$1"; }   # one place adds an item, so the count in the PASS line cannot disagree with the list
 FIRED="unknown"
 hist="$(_to 90 gc --city "$CITY" order history jsonl-archive-compact --json 2>/dev/null)"; hrc=$?
 fired="$(printf '%s' "$hist" | jq -r 'if .ok == true and (.entries | type == "array") then [.entries[] | select(.order == "jsonl-archive-compact")] | length else "unreadable" end' 2>/dev/null)"
 if [[ "$hrc" -ne 0 || ! "$fired" =~ ^[0-9]+$ ]]; then
   log "WARN: could not read gc order history (rc=$hrc, parsed '${fired:-nothing}') — whether the controller has fired the order is UNKNOWN"
-  UNPROVEN="controller firing UNKNOWN (gc order history unreadable)"
+  _unproven "controller firing UNKNOWN (gc order history unreadable)"
 elif [[ "$fired" -eq 0 ]]; then
   FIRED=0
   log "WARN: gc order history has 0 runs of jsonl-archive-compact — the controller has NOT fired it yet, so 'the controller loaded the order' is UNPROVEN. Re-run this test after >= 30m."
-  UNPROVEN="controller has not fired the order yet (0 runs)"
+  _unproven "controller has not fired the order yet (0 runs)"
 else
   FIRED="$fired"
   last="$(printf '%s' "$hist" | jq -r '[.entries[] | select(.order == "jsonl-archive-compact") | .executed] | max' 2>/dev/null)"
@@ -80,7 +83,7 @@ case "$rc" in
   0) log "archives within limits ✓" ;;
   3) if [[ "$FIRED" == "0" ]]; then
        log "WARN: an archive is over the alarm size and the order has NOT fired yet — its first tick is what drains it, so this is not a deploy failure. Re-run this test after >= 30m."
-       UNPROVEN="${UNPROVEN:+$UNPROVEN; }archive over the alarm size before the order's first run"
+       _unproven "archive over the alarm size before the order's first run"
      elif [[ "$FIRED" == "unknown" ]]; then
        fail "--check: an archive is over the alarm size and whether the order has ever fired is UNKNOWN (gc order history unreadable) — cannot excuse it"
      else
@@ -98,5 +101,5 @@ else
   log "no $logfile yet — the script has not run under the order since the reload"
 fi
 
-if [[ -n "$UNPROVEN" ]]; then log "PASS (1 unproven: $UNPROVEN)"; else log "PASS"; fi
+if [[ "$UNPROVEN_N" -gt 0 ]]; then log "PASS ($UNPROVEN_N unproven: $UNPROVEN)"; else log "PASS"; fi
 exit 0

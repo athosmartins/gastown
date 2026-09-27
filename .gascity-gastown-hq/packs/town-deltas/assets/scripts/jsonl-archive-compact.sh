@@ -593,8 +593,9 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
 # is a file, the parent is read-only, no space) read as "another run is in flight" and exited 0: no compaction, no state, no alarm, an order
 # that looks green while the backlog grows ~5GiB/day — the incident, through another door. Now:
 #   this run holds the lock                                                          → go on
-#   another run DEMONSTRABLY holds it (its lock DIRECTORY exists and is not stale, or another run took it in the instant after this one
-#   removed a stale one)                                                             → exit 0, "in flight": the only quiet no-op there is
+#   another run holds it, as far as anything can show: its lock DIRECTORY exists and is not stale (that includes the first minute after a
+#   run died, before it counts as stale — bounded, and the next run reclaims it), or another run took it in the instant after this one
+#   removed a stale one                                                              → exit 0, "in flight": the only quiet no-op there is
 #   anything else (cannot create it, cannot remove a stale one, cannot read its age, cannot record our pid) → exit 1, and the log says which
 lock_owner_alive() { local p; p="$(cat "$LOCK/pid" 2>/dev/null)"; is_uint "$p" && kill -0 "$p" 2>/dev/null; }
 lock_older_than() {  # lock_older_than <minutes> — 0 = older, 1 = not older, 2 = could not tell (find failed): never "not older"
