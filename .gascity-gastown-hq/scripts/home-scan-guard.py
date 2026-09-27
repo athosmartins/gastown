@@ -106,6 +106,11 @@ CHFLAGS = frozenset(["chflags"])
 CHMOD_CHOWN = frozenset(["chmod", "chown"])
 XATTR = frozenset(["xattr"])
 MOVE = frozenset(["mv", "gmv"])   # no flag needed: `mv` across filesystems copies+deletes the WHOLE tree (readdir), like cp -r
+# A segment (one simple command) runs exactly one program: SCANNER_NAMES is every basename tools() recognises as one, and
+# it is read ONLY in command position (the first word of the segment whose base is a member -- gate round 6: the previous
+# version matched a name in ANY word, so a search PATTERN or filename that happened to spell du/find/mv/... was read as if
+# that tool had run: `grep -n mv /Users/athos/Downloads/x.txt` was blocked for "running mv" when mv never ran).
+SCANNER_NAMES = ALWAYS | FIND | GREP | LS | EZA | CP | RSYNC | ZIP | TAR | RM | CHFLAGS | CHMOD_CHOWN | XATTR | MOVE
 # Rule B (a bare invocation with no resolvable operand implicitly walks the cwd) only applies to tools that HAVE that mode:
 # du/find/tree/rg-family/grep -r/ls/eza bare or with just flags operate on the cwd. cp/tar/zip/rsync/rm/mv/chmod/chown/xattr/
 # chflags all REQUIRE an explicit operand (or do nothing) -- rule A (their operand IS a hot word) already catches every
@@ -686,7 +691,13 @@ class Analyzer:
         return w.b
 
     def tools(self, words):
-        """-> (names of the RECURSIVE scanners in the segment, is a plain `ls` listing something, depth of a find)"""
+        """-> (names of the RECURSIVE scanners in the segment, is a plain `ls` listing something, depth of a find)
+
+        Only the FIRST word whose base is in SCANNER_NAMES is read as the program invoked: a segment is one simple
+        command, so once that word is found, every later word is ITS operand, not a second command to identify --
+        `grep -n mv file` searches for the literal text "mv", it does not run `mv` (gate round 6). A wrapper ahead of
+        the real command still needs no table: sudo/env/nice/time/caffeinate/... are not in SCANNER_NAMES, so the scan
+        just continues past them to the word that is."""
         flags = [unlit(w.t) for w in words if w.t.startswith("-")]
         shorts = [f[1:] for f in flags if not f.startswith("--")]
 
@@ -695,16 +706,21 @@ class Analyzer:
 
         def long(*names):
             return any(f.split("=")[0] in names for f in flags)
-        has_git = any(self.base(x) == "git" for x in words)               # hoisted: O(n) once, not once per grep-family word
-        has_recurse_word = any(unlit(x.t) == "recurse" for x in words)
         rec, lister = [], False
         for i, w in enumerate(words):
             b = self.base(w)
-            if not b:
+            if not b or b not in SCANNER_NAMES:
                 continue
             if b in ALWAYS or b in FIND:
                 rec.append(b)
             elif b in GREP:
+                # "git" (git-grep recurses with no -r) only counts as a PREFIX before this word (`git grep foo`); a
+                # "git" found only after it is grep's own pattern/operand (`grep -n git file.txt`), not a subcommand.
+                has_git = any(self.base(words[j]) == "git" for j in range(i))
+                # `--directories recurse` (the space form of --directories=recurse) is the two ADJACENT words "--directories"
+                # then "recurse" -- not a bare "recurse" anywhere, which could just as well be grep's own search pattern.
+                has_recurse_word = any(unlit(words[j].t) == "--directories" and unlit(words[j + 1].t) == "recurse"
+                                        for j in range(len(words) - 1))
                 if cluster("rR") or has_git or has_recurse_word or long("--recursive", "--dereference-recursive", "--directories=recurse"):
                     rec.append(b)
             elif b in LS or b in EZA:
@@ -730,6 +746,7 @@ class Analyzer:
                 rec.append(b)
             elif b in MOVE:
                 rec.append(b)
+            break                          # the command position is found: later words are its operands, not further commands
         return rec, lister, self.find_depth(words)
 
     @staticmethod

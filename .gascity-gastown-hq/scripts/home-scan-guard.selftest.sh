@@ -283,6 +283,7 @@ expect_block "ls -la ~/Library/CloudStorage/"  'ls -la ~/Library/CloudStorage/'
 expect_block "ls an iCloud Drive folder"       'ls ~/Library/Mobile\ Documents/com~apple~CloudDocs'
 # recursion without a flag, and a cwd spelled as a variable
 expect_block "git grep --no-index over a protected folder" 'git grep --no-index foo ~/Downloads'
+expect_block "the real GNU idiom for git-grep-style recursion: --directories recurse (space form)" 'grep --directories recurse foo /Users/athos'
 expect_block "du \"\$PWD/..\" from a repo dir (= \$HOME)" 'du -sk "$PWD/.."' /Users/athos/gt
 expect_block "cd \$HOME then a recursive grep with no path (seen in the wild)" "cd /Users/athos && timeout 120 grep -rIln --include='*.sh' -E 'Group Containers|Library/Containers' --exclude-dir=venv"
 # implicit cwd taken from the hook JSON
@@ -347,6 +348,17 @@ expect_allow "copy ONE file out of Downloads"        'cp ~/Downloads/x.pdf /tmp/
 expect_allow "ls one named file in Downloads"        'ls -l ~/Downloads/x.pdf'
 expect_allow "ls one file on the Desktop"            'ls -la ~/Desktop/x.txt'
 expect_allow "grep one named file in Downloads"      'grep -n foo ~/Downloads/x.txt'
+# gate round 6: a search PATTERN or a filename that happens to spell a scanner's name is not the scanner (mv/find/du never
+# ran; grep did, and grep alone does not recurse) -- only the word ACTUALLY in command position names the program.
+expect_allow "grep pattern spelled 'mv' (the incident's exact repro)" 'grep -n mv ~/Downloads/onefile.txt'
+expect_allow "grep pattern spelled 'find'"           'grep "find" ~/Downloads/onefile.txt'
+expect_allow "grep pattern spelled 'du'"             'grep "du" ~/Downloads/onefile.txt'
+expect_allow "grep pattern spelled 'rm'"             'grep -n rm ~/Downloads/onefile.txt'
+expect_allow "grep pattern spelled 'tar'"            'grep -n tar ~/Downloads/onefile.txt'
+expect_allow "a file NAMED like a tool, not a command run on it" 'grep -n foo ~/Downloads/mv'
+expect_allow "'git' as the search pattern (after grep, not before) does not turn on git-grep recursion" 'grep -n git ~/Downloads/onefile.txt'
+expect_allow "'recurse' as the search pattern is not the --directories value" 'grep -n recurse ~/Downloads/onefile.txt'
+expect_allow "two scanner-spelled words in one segment: only the first (du) is the command" 'du find ~/gt'
 expect_allow "tar -tf an archive in Downloads"       'tar -tf ~/Downloads/a.tar'
 expect_allow "tar xf an archive in Downloads into /tmp" 'tar xf ~/Downloads/a.tar -C /tmp/x'
 # everyday repo / city work
@@ -864,6 +876,20 @@ t0 = time.perf_counter()
 got = verdict(deep, GT)
 took = time.perf_counter() - t0
 print("SWEEP\t200 levels of \\$( ) with a scan at the bottom: BLOCK, not a give-up, in under 2s (%.3fs)\t1\t%d" % (took, 0 if got == "block" and took < 2 else 1))
+
+# 7. A TOOL NAME IN DATA POSITION IS NOT THE TOOL (gate round 6): only the FIRST word in command position may name the
+# program that runs; a search pattern, a filename, or any later operand that happens to spell du/find/mv/git/recurse/...
+# is not a second command. This does not list examples, it locks the FORM: every scanner-family name (+ git, + the
+# --directories value "recurse") x every data position around a genuinely non-recursive grep of ONE named file -> ALLOW.
+TOOLWORDS = sorted(hsg.SCANNER_NAMES) + ["git", "recurse"]
+DATAPOS = ["grep -n {w} /Users/athos/Downloads/onefile.txt", "grep {w} /Users/athos/Downloads/onefile.txt",
+           "grep -e {w} /Users/athos/Downloads/onefile.txt", "grep -n foo /Users/athos/Downloads/{w}",
+           "grep -n {w} {w} /Users/athos/Downloads/onefile.txt"]
+cases = [(p.format(w=w), GT) for p in DATAPOS for w in TOOLWORDS]
+sweep("data position: a scanner/git/recurse name as grep's pattern or filename (grep has no -r) -> ALLOW (it never ran)", cases, "allow")
+# the control: the SAME names, in COMMAND position (word 0), still name the program and still recurse over a hot target
+cases = [("%s -sk ~/Downloads" % w, GT) for w in sorted(hsg.ALWAYS | hsg.FIND | hsg.MOVE)]
+sweep("data position control: the same names in COMMAND position still recurse -> BLOCK", cases, "block")
 
 with open(SAMPLE_OUT, "w") as fh:
     for row in sample:
