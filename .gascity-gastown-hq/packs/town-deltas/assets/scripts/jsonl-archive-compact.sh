@@ -84,13 +84,30 @@
 # With no `timeout`/`gtimeout` on PATH nothing is time-bounded and batch sizing cannot adapt: every run says so.
 #
 # MODES:  (none)        compact + state + alarm
-#         --check       read-only: measure, print, exit 1 if BAD (no lock, state, mail, git writes)
+#         --check       read-only: measure, print, and exit 0 healthy / 1 a failure (a repo git cannot measure, no archive, the PRIMARY archive
+#                       absent) / 3 measured but over the alarm size (no lock, no state write, no mail, no git write). Over the loose alarm
+#                       size is excused — exit 0, and the line says "judged draining" — only by the ORDER's own recorded verdict: a fresh
+#                       (JAC_CHECK_FRESH_S, 2h) run that ended acceptably at bad_streak 0 with the backlog not grown by more than one trigger
+#                       since. --check alone has one measurement and cannot see a backlog shrinking; the order can. Any doubt = not excused.
 #         --print-config  print the effective config and exit 0
+#
+# EXIT CODES of a run: 0 healthy; 1 a failure — any repo BAD, the state cannot be written, the lock cannot be taken (and no other run holds it),
+# the PRIMARY archive absent, no archive at all. The PRIMARY is the FIRST repo of JAC_REPOS (the one the exporter writes and dolt-s3-backup.sh
+# mirrors); a later, retired one may be gone. The only quiet exit 0 that is not a healthy end of a run is "another run holds the lock".
 #
 # CADENCE: order jsonl-archive-compact, interval 30m, timeout 900s; JAC_DEADLINE_S (780s) is
 # this script's own budget so it can log its outcome before the order's timeout fires. One
 # instance at a time: an mkdir lock that records its owner's pid — reclaimed at once when the
 # owner is dead (a run SIGKILLed by the order timeout), after 90m when it still looks alive.
+# Failing to TAKE the lock is not the same as another run HOLDING it (see take_lock below): only the
+# second is a quiet exit 0. A pid that cannot be recorded, a stale lock that cannot be removed, a lock
+# whose age cannot be read: exit 1 with the reason.
+#
+# STRUCTURE (selftest S30): every place in this file that DISCARDS a failure — `|| true`, `|| :`,
+# `|| return 0`, `|| exit 0`, a literal `exit 0`, `mkdir -p`, a silenced `rm`/`rmdir` — carries
+# `# benign[<key>]: <why a failure here cannot hide one that matters>`, and the selftest pins the set of
+# keys. Adding or removing one fails the selftest until someone has read the site and updated the pin:
+# four gate rounds each found one more discard that "the class sweep" had missed.
 #
 # TEST: bash packs/town-deltas/assets/scripts/jsonl-archive-compact.selftest.sh
 set -uo pipefail
@@ -123,6 +140,7 @@ ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
 ALERT_EVERY_S="${JAC_ALERT_EVERY_S:-21600}"
 MAIL_TIMEOUT_S="${JAC_MAIL_TIMEOUT_S:-45}"           # the alarm mail's OWN cap — not the run's remaining budget: a run that used its whole budget must still be able to page (2 sends at 780s + 45s each end before the order's 900s kill)
 LOCK_STALE_MIN="${JAC_LOCK_STALE_MIN:-90}"
+CHECK_FRESH_S="${JAC_CHECK_FRESH_S:-7200}"           # --check trusts the order's recorded verdict only if that run started within this many seconds (4 order intervals)
 LOCK="${JAC_LOCK:-$RUNTIME/jsonl-archive-compact.lock}"
 STATE="${JAC_STATE:-$RUNTIME/packs/town-deltas/jsonl-archive-compact-state.json}"
 LOG="${JAC_LOG:-$CITY/.gc/logs/jsonl-archive-compact.log}"
@@ -144,10 +162,10 @@ repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
-alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S
+alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
-  exit 0
+  exit 0   # benign[print-config]: --print-config only prints the effective configuration — no run happened, so there is no failure for this exit to hide
 fi
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -155,9 +173,12 @@ log() {
   local line="[$(ts)] $*"
   echo "$line"
   [ "$MODE" = check ] && return 0
+  # benign[log-mkdir]: the line was already echoed to stdout (the order's own capture) — a log file that cannot be made must not stop the compaction it reports on
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
+  # benign[log-write]: same as above — stdout already has the line; the run's outcome is its exit code and its state, never this file
   echo "$line" >> "$LOG" 2>/dev/null || true
   if [ "$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')" -gt "$LOG_MAX_LINES" ] 2>/dev/null; then
+    # benign[log-trim]: trimming is housekeeping of a diagnostic file; when it fails the file only grows until the next run's trim succeeds
     tail -n $((LOG_MAX_LINES / 2)) "$LOG" > "$LOG.tmp.$$" 2>/dev/null && mv "$LOG.tmp.$$" "$LOG" 2>/dev/null || true
   fi
 }
@@ -304,6 +325,28 @@ is_bad() {
   return 1
 }
 
+# check_draining <repo> — sets R_PROGRESS (and R_VERDICT, the words for the log). `--check` has ONE measurement and no run start, so it cannot see a
+# backlog shrinking; the ORDER can, and records its verdict in the state. Over the loose alarm size is excused (R_PROGRESS=1) only by a verdict that is
+# FRESH (that run started <= CHECK_FRESH_S ago), ended with a status that is not a failure, at bad_streak 0 (its own alarm rule found the end state
+# acceptable — a backlog it is draining), and the backlog has not grown by more than one trigger (LOOSE_LIMIT_KIB) since it ended. A verdict that
+# is missing, stale, unreadable or of the wrong shape excuses NOTHING: the direction of every doubt here is "BAD", never "fine".
+# (The early returns below leave R_PROGRESS=0 — the strict answer — so they are not discards of a failure; they are the failure's own answer.)
+check_draining() {
+  local row st streak lrun lkib age
+  R_PROGRESS=0; R_VERDICT=""
+  row="$(jq -r --arg r "$1" '.[$r] | if type == "object" then [(.status // "-"), (.bad_streak // "-"), (.last_run_epoch // "-"), (.loose_kib // "-")] | map(tostring) | join(" ") else empty end' <<<"$STATE_JSON" 2>/dev/null)"
+  if [ -z "$row" ]; then return 0; fi
+  read -r st streak lrun lkib <<<"$row"
+  if ! { is_uint "$streak" && is_uint "$lrun" && is_uint "$lkib" && is_uint "$M_LOOSE_KIB"; }; then return 0; fi
+  if [ "$st" = "-" ] || bad_status "$st"; then return 0; fi
+  age=$(( $(date +%s) - lrun ))
+  if [ "$age" -lt 0 ] || [ "$age" -gt "$CHECK_FRESH_S" ]; then return 0; fi
+  if [ "$streak" -ne 0 ]; then return 0; fi
+  if [ "$M_LOOSE_KIB" -gt $(( lkib + LOOSE_LIMIT_KIB )) ]; then return 0; fi
+  R_PROGRESS=1
+  R_VERDICT="the order's last run (${age}s ago) ended status=$st at bad_streak 0 and the backlog has not grown by more than one trigger since — judged draining"
+}
+
 ALARM_ERR=""; ALARM_TIMED_OUT=0
 send_alarm() {  # send_alarm <repo> <status> <streak> — 0 only when the mail was really sent; ALARM_ERR = why not; ALARM_TIMED_OUT=1 = cut at the cap: delivery UNKNOWN, not "failed"
   local body out rc
@@ -341,9 +384,11 @@ write_state() {
     log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
     return 1
   fi
+  # benign[state-mkdir]: if the directory cannot be made, the write right below fails and is reported (state update FAILED, exit 1)
   mkdir -p "$(dirname "$STATE")" 2>/dev/null
   if ! { printf '%s\n' "$new" > "$STATE.tmp.$$" 2>/dev/null && mv "$STATE.tmp.$$" "$STATE" 2>/dev/null; }; then
     log "  state update FAILED ($repo): could not write $STATE — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
+    # benign[state-tmp-cleanup]: removing a leftover temp file after a write that was already reported as FAILED; the failure is the log line above and return 1
     rm -f "$STATE.tmp.$$" 2>/dev/null
     return 1
   fi
@@ -411,7 +456,9 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
 
   if [ "$MODE" = check ]; then
     G_KIB="$(gitdir_kib)"
-    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")"
+    R_VERDICT=""
+    if [ "$M_LOOSE_KIB" -ge "$LOOSE_ALARM_KIB" ]; then check_draining "$repo"; fi
+    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")${R_VERDICT:+ — over the alarm size but $R_VERDICT}"
     return
   fi
 
@@ -541,22 +588,77 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
 # quiet gap in the one job this is. So a lock is stale as soon as its owner is dead (with a
 # 1-minute floor for the instant between another run's mkdir and its pid write), or — when the
 # owner still looks alive — after LOCK_STALE_MIN (a hung run).
+#
+# THREE outcomes, never two. This used to be "mkdir; if it failed, somebody else has the lock", so every OTHER reason mkdir can fail (the path
+# is a file, the parent is read-only, no space) read as "another run is in flight" and exited 0: no compaction, no state, no alarm, an order
+# that looks green while the backlog grows ~5GiB/day — the incident, through another door. Now:
+#   this run holds the lock                                                          → go on
+#   another run DEMONSTRABLY holds it (its lock DIRECTORY exists and is not stale, or another run took it in the instant after this one
+#   removed a stale one)                                                             → exit 0, "in flight": the only quiet no-op there is
+#   anything else (cannot create it, cannot remove a stale one, cannot read its age, cannot record our pid) → exit 1, and the log says which
 lock_owner_alive() { local p; p="$(cat "$LOCK/pid" 2>/dev/null)"; is_uint "$p" && kill -0 "$p" 2>/dev/null; }
-lock_release() { rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null || true; }
-if [ "$MODE" = run ]; then
-  command -v jq >/dev/null 2>&1 || { echo "jsonl-archive-compact: jq is required but not found in PATH" >&2; exit 1; }
+lock_older_than() {  # lock_older_than <minutes> — 0 = older, 1 = not older, 2 = could not tell (find failed): never "not older"
+  local o
+  o="$(find "$LOCK" -maxdepth 0 -mmin +"$1" 2>/dev/null)" || return 2
+  [ -n "$o" ]
+}
+# lock_is_stale — 0 = stale (reclaim it), 1 = a live run's lock (yield to it), 2 = cannot tell (an age could not be read, and nothing else proved it stale)
+lock_is_stale() {
+  local old_hung old_dead
+  lock_older_than "$LOCK_STALE_MIN"; old_hung=$?
+  if [ "$old_hung" -eq 0 ]; then return 0; fi
+  if ! lock_owner_alive; then
+    lock_older_than 1; old_dead=$?
+    if [ "$old_dead" -eq 0 ]; then return 0; fi
+    if [ "$old_dead" -eq 2 ]; then return 2; fi
+  fi
+  if [ "$old_hung" -eq 2 ]; then return 2; fi
+  return 1
+}
+# lock_release — 0 = the lock is gone (removed, or already gone), 1 = it is still there. What matters is the existence check on the last line.
+# benign[lock-release]: the rm/rmdir errors are discarded because this function's own result is whether the lock still exists, tested right after them
+lock_release() { rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; [ ! -e "$LOCK" ] && [ ! -L "$LOCK" ]; }
+release_at_exit() { lock_release || log "WARNING: could not remove the lock $LOCK at exit — the next run reclaims it once this pid is gone, and fails loudly if that fails too"; }
+take_lock() {  # returns 0 holding the lock; every other outcome EXITS, as above
+  local err st
+  # benign[lock-parent-mkdir]: if the parent cannot be made, the mkdir of the lock right below fails too and reports the real reason
   mkdir -p "$(dirname "$LOCK")" 2>/dev/null
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    if { ! lock_owner_alive && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ]; } \
-       || [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
-      log "stale lock (owner gone, or older than ${LOCK_STALE_MIN}m) — reclaiming"; lock_release
-      mkdir "$LOCK" 2>/dev/null || { log "lock contended after reclaim — exit"; exit 0; }
-    else
-      log "another compaction run is in flight — exit (single-flight)"; exit 0
+  if ! err="$(mkdir "$LOCK" 2>&1)"; then
+    if [ ! -d "$LOCK" ]; then
+      log "could not create the lock $LOCK: ${err:-no output} — NOT compacting. Nothing else holds it, so this is a failure and every run will fail the same way until it is fixed"
+      exit 1
+    fi
+    lock_is_stale; st=$?
+    if [ "$st" -eq 1 ]; then
+      log "another compaction run is in flight — exit (single-flight)"; exit 0   # benign[lock-inflight]: the lock directory of another run exists and is neither stale nor unreadable — the one reason to leave without compacting and without a failure
+    elif [ "$st" -ne 0 ]; then
+      log "cannot tell whether the lock $LOCK is stale (its age could not be read) — NOT compacting: a live run and a stale lock look the same from here"
+      exit 1
+    fi
+    log "stale lock (owner gone, or older than ${LOCK_STALE_MIN}m) — reclaiming"
+    if ! lock_release; then
+      log "could not remove the stale lock $LOCK — NOT compacting. Every later run would meet the same lock, so this is a failure to fix, not a run to wait for"
+      exit 1
+    fi
+    if ! err="$(mkdir "$LOCK" 2>&1)"; then
+      if [ -d "$LOCK" ]; then
+        log "another run took the lock right after this one removed the stale one — exit (single-flight)"; exit 0   # benign[lock-lost-race]: the stale lock WAS removed and a different run created its own in the gap; that run is the one compacting
+      fi
+      log "could not create the lock $LOCK after removing a stale one: ${err:-no output} — NOT compacting"
+      exit 1
     fi
   fi
-  echo "$$" > "$LOCK/pid" 2>/dev/null || true
-  trap lock_release EXIT
+  if ! printf '%s\n' "$$" > "$LOCK/pid" 2>/dev/null; then
+    # a lock with no owner pid looks dead after one minute: a second run would reclaim it while this one still works
+    log "could not record this run's pid in $LOCK/pid — releasing the lock and NOT compacting (an ownerless lock would be reclaimed as stale while this run still worked)"
+    lock_release || log "  ...and the lock itself could not be removed either ($LOCK) — remove it by hand"
+    exit 1
+  fi
+  trap release_at_exit EXIT
+}
+if [ "$MODE" = run ]; then
+  command -v jq >/dev/null 2>&1 || { echo "jsonl-archive-compact: jq is required but not found in PATH" >&2; exit 1; }
+  take_lock
 fi
 
 if [ "$MODE" = run ] && [ -z "$_timeout_bin" ]; then
@@ -566,12 +668,24 @@ if [ "$MODE" = run ] && why="$(state_problem)"; then
   log "state file $STATE is unreadable — starting fresh: $why (bad-run streaks and remembered batch sizes reset)"
 fi
 
+# The FIRST repo in $REPOS is the PRIMARY: the archive the exporter writes and dolt-s3-backup.sh mirrors. It may not be missing — with the
+# retired archive still on disk, "absent — skipped" + exit 0 made a vanished primary read as a healthy run. A later (retired) one may be gone.
+PRIMARY=1; ABSENT_PRIMARY=0; CHECK_FAIL=0; CHECK_SIZE=0
 for repo in $REPOS; do
-  if [ ! -d "$repo/.git" ]; then log "repo=$repo absent — skipped"; continue; fi
+  if [ ! -d "$repo/.git" ]; then
+    if [ "$PRIMARY" -eq 1 ]; then
+      ABSENT_PRIMARY=1
+      log "repo=$repo is the PRIMARY archive and it is absent — NOT compacted (moved or deleted?): a leftover retired archive must not make that look like a healthy run"
+    else
+      log "repo=$repo absent — skipped (a retired archive may be gone)"
+    fi
+    PRIMARY=0; continue
+  fi
+  PRIMARY=0
   EXISTING=$((EXISTING + 1))
   compact_repo "$repo"
   if [ "$MODE" = check ]; then
-    if [ "$STATUS" = unmeasured ] || is_bad "$STATUS"; then BAD_ANY=1; fi
+    if [ "$STATUS" = unmeasured ]; then CHECK_FAIL=1; elif is_bad "$STATUS"; then CHECK_SIZE=1; fi
     continue
   fi
   record "$repo" "$STATUS" || BAD_ANY=1
@@ -581,5 +695,12 @@ if [ "$EXISTING" -eq 0 ]; then
   log "no archive repo found under: $REPOS — nothing was compacted (a misconfigured path must not look like a healthy run)"
   exit 1
 fi
-[ "$BAD_ANY" -eq 0 ] || exit 1
-exit 0
+# exit code: 0 healthy; 1 a failure (cannot measure, a run failed, the primary is absent); 3 (--check only) measured, over the alarm size, and no
+# fresh verdict of the order excuses it. There is no literal success exit here on purpose: the code is computed from everything above.
+RC=0
+if [ "$MODE" = check ]; then
+  if [ "$CHECK_FAIL" -eq 1 ] || [ "$ABSENT_PRIMARY" -eq 1 ]; then RC=1; elif [ "$CHECK_SIZE" -eq 1 ]; then RC=3; fi
+elif [ "$BAD_ANY" -eq 1 ] || [ "$ABSENT_PRIMARY" -eq 1 ]; then
+  RC=1
+fi
+exit "$RC"

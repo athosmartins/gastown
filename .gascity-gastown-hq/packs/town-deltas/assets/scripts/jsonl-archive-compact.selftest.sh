@@ -20,7 +20,7 @@ bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }     # a check that did NOT run (host too loaded for a timing fixture, a file not in this tree): counted apart, printed in RESULT — never a PASS
 
 WORK="$(mktemp -d /tmp/jsonl-archive-compact-selftest.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'chmod -R u+rwx "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT      # fixtures below chmod directories read-only: give them back first, or the cleanup cannot remove them
 
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null   # a developer's ~/.gitconfig must not change what is tested
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -120,7 +120,7 @@ chmod +x "$WORK/git-fx"
 # run_jac <repo...> [-- --check]: the script under test, sealed off from the real world.
 run_jac() {
   local repos="$1"; shift
-  JAC_REPOS="$repos" JAC_STATE="$WORK/state.json" JAC_LOG="$WORK/log" JAC_LOCK="$WORK/lock" JAC_GC="$WORK/gc-stub" \
+  JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="$WORK/gc-stub" \
   JAC_LOOSE_LIMIT_KIB="${T_LIMIT:-1024}" JAC_LOOSE_ALARM_KIB="${T_ALARM:-100000}" JAC_BATCH_OBJECTS="${T_BATCH:-25}" \
   JAC_PACKS_LIMIT="${T_PACKS:-8}" JAC_PACKS_ALARM="${T_PACKS_ALARM:-20}" JAC_FREE_KIB="${T_FREE:-90000000}" \
   JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
@@ -218,8 +218,12 @@ echo ""
 echo "=== S6: absent repos ==="
 out="$(run_jac "$WORK/nope1 $WORK/nope2")"; rc=$?
 [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'nothing was compacted' && ok "every configured repo absent → exit 1 (a wrong path must not look healthy)" || bad "all-absent handling wrong (rc=$rc): $out"
+out="$(run_jac "$B $WORK/nope2")"; rc=$?
+[ "$rc" -eq 0 ] && ok "primary present + the retired archive absent → exit 0 (the retired town-deltas archive may be gone)" || bad "retired-absent handling wrong (rc=$rc): $out"
+# ...but the PRIMARY (the first one: the archive the exporter writes and dolt-s3-backup mirrors) may not be: it vanishing while the retired
+# one still exists used to read as a healthy run (S29 has the rest)
 out="$(run_jac "$WORK/nope1 $B")"; rc=$?
-[ "$rc" -eq 0 ] && ok "one absent + one present → exit 0 (the retired town-deltas archive may be gone)" || bad "one-absent handling wrong (rc=$rc): $out"
+[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'PRIMARY archive' && ok "PRIMARY absent + the retired one present → exit 1 and the log names the PRIMARY (a vanished archive must not hide behind the leftover)" || bad "absent PRIMARY handling wrong (rc=$rc): $out"
 
 echo ""
 echo "=== S7: single-flight lock ==="
@@ -276,7 +280,7 @@ echo ""
 echo "=== S10: --check is read-only and reports BAD by exit code ==="
 H="$WORK/h"; mkrepo "$H" 20; LC="$(loose_count "$H")"; rm -rf "$WORK/state.json" "$WORK/log" "$WORK/lock"
 out="$(T_ALARM=1024 run_jac "$H" --check)"; rc=$?
-[ "$rc" -eq 1 ] && ok "over the alarm size → exit 1" || bad "--check exit $rc, want 1: $out"
+[ "$rc" -eq 3 ] && ok "over the alarm size (measured, no order verdict to excuse it) → exit 3" || bad "--check exit $rc, want 3: $out"
 [ "$(loose_count "$H")" = "$LC" ] && [ ! -e "$WORK/state.json" ] && [ ! -e "$WORK/log" ] && [ ! -e "$WORK/lock" ] && ok "read-only: no repack, no state, no log, no lock" || bad "--check wrote something"
 out="$(run_jac "$H" --check)"; rc=$?
 [ "$rc" -eq 0 ] && ok "under the alarm size → exit 0" || bad "--check exit $rc on a healthy repo: $out"
@@ -641,6 +645,218 @@ if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; th
 else
   skip "(E) no timeout/gtimeout on this host — the bounded-send check did NOT run"
 fi
+
+echo ""
+echo "=== S26: 'could not take the lock' is NOT 'another run holds it' — the lock has three outcomes and only one may be a quiet exit 0 ==="
+# take_lock treated EVERY failed mkdir as "the lock exists": when mkdir failed for another reason (EACCES/EROFS/ENOSPC, the lock path is a
+# file) the run logged "another compaction run is in flight" and exited 0 — no compaction, no state, no streak, no mail, an order that looks
+# green while the backlog grows ~5GiB/day: the incident, from a different door. The three outcomes:
+#   (1) this run holds the lock                                              → compacts
+#   (2) another run DEMONSTRABLY holds it (its lock directory exists, not stale) → exit 0, "in flight" — the only quiet no-op
+#   (3) anything else (cannot create, cannot remove a stale one, cannot read its age, cannot record our pid) → exit 1, and the log says WHY
+lockrepo() { L="$WORK/$1"; mkrepo "$L" 20; LCL="$(loose_count "$L")"; rm -f "$WORK/state.json" "$WORK/gc-calls"; : > "$WORK/log"; }
+lock_case() {  # lock_case <label> <want-rc> <want-log-regex> <must-not-log-regex> <repo-must-stay-untouched:1|0>   (the run's output is in $out, its exit in $rc)
+  local label="$1" wrc="$2" want="$3" wont="$4" untouched="$5" okk=1
+  [ "$rc" -eq "$wrc" ] || okk=0
+  printf '%s' "$out" | grep -qE "$want" || okk=0
+  { [ -z "$wont" ] || ! printf '%s' "$out" | grep -qE "$wont"; } || okk=0
+  if [ "$untouched" = 1 ] && [ "$(loose_count "$L")" != "$LCL" ]; then okk=0; fi
+  if [ "$okk" -eq 1 ]; then ok "$label"; else bad "$label (rc=$rc want $wrc; loose $LCL->$(loose_count "$L")): $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"; fi
+}
+OLD3H="$(date -v-3H +%Y%m%d%H%M.%S 2>/dev/null || date -d '3 hours ago' +%Y%m%d%H%M.%S)"
+
+# (A) the lock's parent directory is not writable: mkdir fails, NO lock directory exists — nobody is in flight
+if [ "$(id -u)" -eq 0 ]; then skip "(A)-(D),(F): running as root — directory permissions do not bind it, the unwritable-path fixtures did NOT run"; else
+lockrepo l1; mkdir -p "$WORK/ro"; chmod 555 "$WORK/ro"
+out="$(T_LOCK="$WORK/ro/lock" run_jac "$L")"; rc=$?; chmod 755 "$WORK/ro"
+lock_case "(A) lock parent unwritable → exit 1, 'could not create the lock' with mkdir's own reason, NOT 'in flight', repo untouched" 1 'could not create the lock .*(Permission denied|denied|Read-only)' 'in flight' 1
+# (B) the lock path is a regular file (mkdir: File exists — but nothing is running)
+lockrepo l2; : > "$WORK/lockfile"
+out="$(T_LOCK="$WORK/lockfile" run_jac "$L")"; rc=$?
+lock_case "(B) lock path is a regular file → exit 1, 'could not create the lock', NOT 'in flight'" 1 'could not create the lock' 'in flight' 1
+# (C) the lock path is a dangling symlink
+lockrepo l3; ln -s "$WORK/nowhere-at-all" "$WORK/locklink"
+out="$(T_LOCK="$WORK/locklink" run_jac "$L")"; rc=$?
+lock_case "(C) lock path is a dangling symlink → exit 1, 'could not create the lock', NOT 'in flight'" 1 'could not create the lock' 'in flight' 1
+# (D) a STALE lock that cannot be removed (a directory with something in it): the reclaim's own mkdir then fails with "exists" — that is
+# not "another run took it", it is a lock nobody can clear, and exit 0 here would repeat every 30 minutes for good
+lockrepo l4; mkdir -p "$WORK/lockd/keep"; touch -t "$OLD3H" "$WORK/lockd"
+out="$(T_LOCK="$WORK/lockd" run_jac "$L")"; rc=$?
+lock_case "(D) stale lock that cannot be removed → exit 1, 'could not remove the stale lock', NOT 'contended'/'in flight'" 1 'could not remove the stale lock' 'in flight|contended' 1
+fi
+# (E) the reclaim really is RACED: the stale lock is removed, and another run takes the lock in the gap. Now it IS in flight — exit 0.
+# A `mkdir` shim plays the other run: its 2nd plain mkdir of the lock creates the lock itself (owner: this shell, alive) and fails "File exists".
+mkdir -p "$WORK/mkshim"
+cat > "$WORK/mkshim/mkdir" <<EOF
+#!/bin/bash
+last="\${@: -1}"
+if [ "\$last" = "$WORK/lockrace" ] && [ "\$1" != "-p" ]; then
+  n=\$(cat "$WORK/mk-n" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "$WORK/mk-n"
+  if [ "\$n" -ge 2 ]; then /bin/mkdir "\$last" && echo "$$" > "\$last/pid"; echo "mkdir: \$last: File exists" >&2; exit 1; fi
+fi
+exec /bin/mkdir "\$@"
+EOF
+chmod +x "$WORK/mkshim/mkdir"
+lockrepo l5; rm -f "$WORK/mk-n"; mkdir -p "$WORK/lockrace"; touch -t "$OLD3H" "$WORK/lockrace"
+out="$(PATH="$WORK/mkshim:$PATH" T_LOCK="$WORK/lockrace" run_jac "$L")"; rc=$?
+lock_case "(E) stale lock removed, then ANOTHER run takes it first → exit 0 (single-flight held), repo untouched, and the log says another run took it" 0 'another run took the lock' 'could not' 1
+rm -f "$WORK/lockrace/pid"; rmdir "$WORK/lockrace" 2>/dev/null
+# (F) the pid cannot be written into the lock we just made (a `mkdir` shim leaves the new lock directory read-only). A lock with no owner
+# pid looks dead after one minute, so a second run would reclaim the lock of a run that is still working: the run must stop, release the
+# lock it made, and say so. (Not `umask`: that also breaks bash's own here-document temp files, which is a different failure.)
+if [ "$(id -u)" -ne 0 ]; then
+mkdir -p "$WORK/mkshim2"
+cat > "$WORK/mkshim2/mkdir" <<EOF
+#!/bin/bash
+last="\${@: -1}"
+if [ "\$last" = "$WORK/lockpid" ] && [ "\$1" != "-p" ]; then /bin/mkdir "\$last" && chmod 500 "\$last"; exit \$?; fi
+exec /bin/mkdir "\$@"
+EOF
+chmod +x "$WORK/mkshim2/mkdir"
+lockrepo l6
+out="$(PATH="$WORK/mkshim2:$PATH" T_LOCK="$WORK/lockpid" run_jac "$L")"; rc=$?
+lock_case "(F) cannot record the owner pid → exit 1, 'could not record', repo untouched" 1 'could not record this run.s pid' 'in flight' 1
+[ ! -e "$WORK/lockpid" ] && ok "(F) ...and the lock it had made is released (nothing left for the next run to trip over)" || { bad "(F) the half-made lock was left behind"; chmod -R u+rwx "$WORK/lockpid"; rm -rf "$WORK/lockpid"; }
+fi
+# (G) the lock exists but its AGE cannot be read (find fails): a live run and a stale lock cannot be told apart. Was: "not stale" = "in flight" = exit 0.
+mkdir -p "$WORK/findshim"; printf '#!/bin/bash\necho "find: forced failure (selftest)" >&2\nexit 1\n' > "$WORK/findshim/find"; chmod +x "$WORK/findshim/find"
+lockrepo l7; mkdir -p "$WORK/lockage"; echo 999999 > "$WORK/lockage/pid"; touch -t "$OLD3H" "$WORK/lockage"
+out="$(PATH="$WORK/findshim:$PATH" T_LOCK="$WORK/lockage" run_jac "$L")"; rc=$?
+lock_case "(G) lock exists, its age cannot be read → exit 1, 'cannot tell', NOT 'in flight'" 1 'cannot tell whether the lock' 'in flight' 1
+rm -f "$WORK/lockage/pid"; rmdir "$WORK/lockage" 2>/dev/null
+# controls — the quiet exit 0 that stays: a lock directory that exists and is fresh, or whose owner is alive
+lockrepo l8; mkdir -p "$WORK/lockfresh"
+out="$(T_LOCK="$WORK/lockfresh" run_jac "$L")"; rc=$?
+lock_case "(control) fresh lock directory → exit 0, 'in flight', repo untouched" 0 'in flight' 'could not' 1
+rmdir "$WORK/lockfresh" 2>/dev/null
+lockrepo l9; mkdir -p "$WORK/lockalive"; echo "$$" > "$WORK/lockalive/pid"; touch -t "$OLD3H" "$WORK/lockalive"
+out="$(T_LOCK="$WORK/lockalive" run_jac "$L")"; rc=$?
+lock_case "(control) owner alive but the lock is 3h old → hung run, reclaimed: exit 0 and the repo IS compacted" 0 'stale lock' 'could not' 0
+[ "$(loose_count "$L")" = 0 ] && ok "(control) ...the stale-by-age lock was reclaimed and the work done" || bad "(control) hung-run lock not reclaimed (loose=$(loose_count "$L"))"
+lockrepo l10
+out="$(run_jac "$L")"; rc=$?
+{ [ "$rc" -eq 0 ] && [ "$(loose_count "$L")" = 0 ] && [ ! -e "$WORK/lock" ]; } && ok "(control) no lock at all → this run holds it, compacts, and releases it" || bad "(control) plain run wrong (rc=$rc loose=$(loose_count "$L"))"
+
+echo ""
+echo "=== S27: --check exit codes, and a backlog the ORDER is draining is not a deploy failure ==="
+# --check exits 0 healthy / 1 cannot measure or no archive (a failure) / 2 usage / 3 over the alarm size (measured). It has ONE
+# measurement and no run start, so it cannot see a backlog shrinking; the order can, and records its verdict (status, bad_streak,
+# loose_kib, last_run_epoch) in the state. Over the alarm size is excused only by a FRESH verdict of a run that ended acceptably, at
+# bad_streak 0, with the backlog not grown by more than one trigger since. Anything missing, stale or unreadable excuses nothing.
+seed_verdict() {  # seed_verdict <name> — a fresh over-alarm repo $HC and the state of an order run that drained part of it (exit 0, bad_streak 0)
+  HC="$WORK/hc-$1"; mkrepo "$HC" 20; rm -f "$WORK/state.json" "$WORK/log"
+  T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 run_jac "$HC" >/dev/null
+  { [ "$(state_field "$HC" bad_streak)" = 0 ] && [ "$(state_field "$HC" loose_kib)" -ge 1024 ]; } || bad "S27 fixture ($1): the draining run did not leave an over-alarm state (streak=$(state_field "$HC" bad_streak) loose_kib=$(state_field "$HC" loose_kib))"
+}
+edit_state() { jq --arg r "$HC" "$1" "$WORK/state.json" > "$WORK/state.new" && mv "$WORK/state.new" "$WORK/state.json"; }
+check_rc() { out="$(T_ALARM=1024 run_jac "$HC" --check)"; rc=$?; }
+seed_verdict base; ST_SUM="$(shasum "$WORK/state.json" | cut -d' ' -f1)"; check_rc
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'draining'; } && ok "over the alarm size, but the order's last run is fresh, ended at bad_streak 0 → --check exit 0 and says it is judged draining" || bad "--check ignored a fresh draining verdict (rc=$rc): $out"
+[ "$(shasum "$WORK/state.json" | cut -d' ' -f1)" = "$ST_SUM" ] && ok "--check left the state file byte-identical (still read-only)" || bad "--check rewrote the state file"
+seed_verdict stale; edit_state '.[$r].last_run_epoch = (now | floor) - 99999'; check_rc
+[ "$rc" -eq 3 ] && ok "a STALE verdict (the order has not run for a day) excuses nothing → exit 3" || bad "stale verdict excused an over-alarm backlog (rc=$rc)"
+seed_verdict streak; edit_state '.[$r].bad_streak = 1'; check_rc
+[ "$rc" -eq 3 ] && ok "a verdict with bad_streak > 0 excuses nothing → exit 3" || bad "bad_streak 1 verdict excused (rc=$rc)"
+seed_verdict failed; edit_state '.[$r].status = "failed"'; check_rc
+[ "$rc" -eq 3 ] && ok "a verdict whose run FAILED excuses nothing → exit 3" || bad "failed-run verdict excused (rc=$rc)"
+seed_verdict nosize; edit_state '.[$r].loose_kib = null'; check_rc
+[ "$rc" -eq 3 ] && ok "a verdict that recorded no size (the run could not measure) excuses nothing → exit 3" || bad "null-size verdict excused (rc=$rc)"
+seed_verdict grown; addcommits "$HC" 40; check_rc
+[ "$rc" -eq 3 ] && ok "the backlog GREW by more than one trigger since the verdict → exit 3 (draining a while ago is not draining now)" || bad "grown backlog still excused (rc=$rc)"
+seed_verdict nostate; rm -f "$WORK/state.json"; check_rc
+[ "$rc" -eq 3 ] && ok "no state at all (a fresh deploy) → exit 3, not excused" || bad "no-state check wrong (rc=$rc)"
+seed_verdict shape; printf '[]' > "$WORK/state.json"; check_rc
+[ "$rc" -eq 3 ] && ok "a state file of the wrong shape excuses nothing → exit 3" || bad "wrong-shape state excused (rc=$rc)"
+PB="$WORK/enclosing2"; mkrepo "$PB" 3; mkdir -p "$PB/sub/.git"; rm -f "$WORK/state.json"
+out="$(run_jac "$PB/sub" --check)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a repo git cannot measure → exit 1 (a failure, not a size question)" || bad "unmeasurable repo: --check exit $rc, want 1: $out"
+
+echo ""
+echo "=== S28: the prod test tells 'cannot measure' from 'over the alarm', and does not fail a backlog the order is draining ==="
+# story-ga-a3ar7h.sh treated every non-zero --check exit as "BAD archive", and ran --check BEFORE asking whether the order had ever fired: a fresh
+# deploy onto an over-alarm backlog FAILED although the first tick would drain it, and so did a backlog the order was legitimately draining.
+PROD="$PACK/assets/prod-tests/gascity/story-ga-a3ar7h.sh"
+FC="$WORK/fakecity"; mkdir -p "$FC/packs/town-deltas/assets/scripts" "$FC/packs/town-deltas/orders" "$FC/.gc/logs" "$WORK/gcshim"
+cp "$SCRIPT" "$FC/packs/town-deltas/assets/scripts/jsonl-archive-compact.sh"; cp "$ORDER" "$FC/packs/town-deltas/orders/jsonl-archive-compact.toml"
+cat > "$WORK/gcshim/gc" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" order list "*) printf '{"orders":[{"name":"jsonl-archive-compact","source":"$FC/packs/town-deltas/orders/jsonl-archive-compact.toml"}]}' ;;
+  *" order history "*)
+     [ -n "\${HIST_FAIL:-}" ] && exit 1
+     printf '{"ok":true,"entries":['; i=0; while [ "\$i" -lt "\${HIST_N:-0}" ]; do [ "\$i" -gt 0 ] && printf ','; printf '{"order":"jsonl-archive-compact","executed":"2026-09-26T00:00:0%sZ"}' "\$((i % 10))"; i=\$((i + 1)); done; printf ']}' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$WORK/gcshim/gc"
+prod_run() {  # prod_run <repos> [alarm-KiB] — the prod test against the fake city; HIST_N / HIST_FAIL steer the fake gc
+  out="$(PATH="$WORK/gcshim:$PATH" CITY="$FC" JAC_REPOS="$1" JAC_STATE="$WORK/state.json" JAC_LOOSE_ALARM_KIB="${2:-100000}" JAC_LOOSE_LIMIT_KIB=1024 JAC_LOG="$WORK/log" bash "$PROD" 2>&1)"; rc=$?
+}
+PH="$WORK/ph"; mkrepo "$PH" 20; rm -f "$WORK/state.json"
+HIST_N=2 prod_run "$PH"
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PASS' && ! printf '%s' "$out" | grep -q 'unproven'; } && ok "healthy archive, order fired → PASS with nothing unproven" || bad "healthy prod run wrong (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+rm -f "$WORK/state.json"; HIST_N=0 prod_run "$PH" 1024
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PASS (.*unproven' && printf '%s' "$out" | grep -qi 'over the alarm'; } && ok "fresh deploy onto an over-alarm backlog, order not fired yet → PASS with the archive size named UNPROVEN (the first tick drains it), not FAIL" || bad "fresh-deploy prod run wrong (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+rm -f "$WORK/state.json"; T_ALARM=1024 T_MAX_BATCHES=1 T_BATCH=10 JAC_REPOS="$PH" run_jac "$PH" >/dev/null; HIST_N=3 prod_run "$PH" 1024
+{ [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'draining'; } && ok "over the alarm size but the order (fired 3x) is draining it → PASS" || bad "draining backlog failed the prod test (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+rm -f "$WORK/state.json"; HIST_N=3 prod_run "$PH" 1024
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qi 'over the alarm'; } && ok "over the alarm size, order fired 3x, NO fresh verdict excusing it → FAIL naming the size" || bad "stuck backlog did not fail the prod test (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+HIST_FAIL=1 prod_run "$PH" 1024
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qi 'over the alarm'; } && ok "over the alarm size and whether the order ever fired is UNKNOWN (history unreadable) → FAIL, not a quiet pass" || bad "unknown history + over-alarm did not fail (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+mkdir -p "$WORK/enclosing3"; mkrepo "$WORK/enclosing3" 2; mkdir -p "$WORK/enclosing3/sub/.git"; rm -f "$WORK/state.json"
+HIST_N=0 prod_run "$WORK/enclosing3/sub"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qi 'cannot measure'; } && ok "an archive git cannot measure → FAIL saying 'cannot measure' (even though the order has not fired: it is not a size question)" || bad "unmeasurable archive not told apart (rc=$rc): $(printf '%s' "$out" | tail -n 4 | tr '\n' ' ')"
+
+echo ""
+echo "=== S29: the PRIMARY archive is required; the retired one may be gone ==="
+out="$(run_jac "$WORK/nope1 $B" --check)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--check: PRIMARY absent while the retired archive exists → exit 1" || bad "--check hid an absent PRIMARY (rc=$rc): $out"
+out="$(run_jac "$B $WORK/nope2" --check)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--check: PRIMARY present, retired absent → exit 0" || bad "--check failed on an absent retired archive (rc=$rc): $out"
+
+echo ""
+echo "=== S30: STRUCTURE — every place that DISCARDS a failure is named, justified and pinned ==="
+# Four gate rounds in a row found one more place where a failure looked like a benign no-op, each after "the class was swept". The class is
+# mechanical to list: the constructs that throw a failure away (`|| true`, `|| :`, `|| return 0`, `|| exit 0`, `exit 0`, `mkdir -p`, a bare
+# `rm`/`rmdir` with its errors silenced). Each must carry `# benign[<key>]: <why a failure here cannot hide one that matters>` on its line or the
+# line above, and the set of keys is PINNED below: adding one — or removing one — fails this test until a person has read the site and
+# updated the pin. The scenarios that reach the exit-0 keys are S26 (lock-inflight, lock-lost-race) and S11 (print-config); the script has no literal
+# success exit at the end of a run — its exit code is computed from the run's own results.
+lint_sites() {  # lint_sites <file> — one line per discard site: "<line>|<key or MISSING>|<code>"
+  awk '
+    function annotation(s,   p, rest, q) {           # -> key when s carries "# benign[key]: <reason of 15+ chars>", else ""
+      p = index(s, "# benign["); if (!p) return ""
+      rest = substr(s, p + 9); q = index(rest, "]: "); if (q < 2) return ""
+      if (length(substr(rest, q + 3)) < 15) return ""
+      return substr(rest, 1, q - 1)
+    }
+    { L[NR] = $0 }
+    END {
+      for (n = 1; n <= NR; n++) {
+        s = L[n]
+        if (s ~ /^[ \t]*#/ || s ~ /^[ \t]*$/) continue
+        code = s; sub(/[ \t]+# benign\[.*$/, "", code)
+        if (code ~ /\|\| *true([^a-z_]|$)/ || code ~ /\|\| *:([ ;]|$)/ || code ~ /\|\| *return 0/ || code ~ /\|\| *exit 0/ \
+            || code ~ /(^|[ ;{])exit 0([ ;}]|$)/ || code ~ /(^|[ ;{])mkdir -p / || (code ~ /(^|[ ;{])(rm|rmdir) / && code ~ /2>\/dev\/null/)) {
+          k = annotation(s); if (k == "" && n > 1 && L[n-1] ~ /^[ \t]*# benign\[/) k = annotation(L[n-1])
+          printf "%d|%s|%s\n", n, (k == "" ? "MISSING" : k), code
+        }
+      }
+    }' "$1"
+}
+SITES="$(lint_sites "$SCRIPT")"
+MISSING="$(printf '%s\n' "$SITES" | grep '|MISSING|' || true)"
+[ -n "$SITES" ] && ok "the lint sees the discard sites ($(printf '%s\n' "$SITES" | wc -l | tr -d ' ') of them)" || bad "the lint found no discard sites at all — it is not looking"
+[ -z "$MISSING" ] && ok "every discard site carries '# benign[key]: <reason>'" || bad "discard site(s) with no justification: $(printf '%s' "$MISSING" | cut -c1-110 | tr '\n' ';')"
+# the pin: keys and how many sites each names. Update it ONLY after reading the site.
+EXPECTED_BENIGN="log-mkdir log-write log-trim lock-parent-mkdir lock-release lock-inflight lock-lost-race print-config state-mkdir state-tmp-cleanup"
+got="$(printf '%s\n' "$SITES" | cut -d'|' -f2 | sort | tr '\n' ' ')"; want="$(printf '%s\n' $EXPECTED_BENIGN | sort | tr '\n' ' ')"
+[ "$got" = "$want" ] && ok "the set of discard sites is exactly the pinned one" || bad "discard sites differ from the pin — got [$got] want [$want]: read the new/removed site, then update EXPECTED_BENIGN"
+# the lint itself bites: a new unjustified discard is reported, a justified one is not
+cp "$SCRIPT" "$WORK/lint-mutant.sh"
+printf '%s\n' 'cleanup_thing || true' 'other_thing || true   # benign[x]: a short one' 'ok_thing || true   # benign[some-key]: this is a sufficiently long reason' 'mkdir -p /x' 'rm -f /y 2>/dev/null' >> "$WORK/lint-mutant.sh"
+mm="$(lint_sites "$WORK/lint-mutant.sh" | grep -c '|MISSING|')"; mb="$(lint_sites "$SCRIPT" | grep -c '|MISSING|')"
+[ "$((mm - mb))" -eq 4 ] && ok "the lint bites: 4 unjustified discards appended (bare || true, a 1-word reason, mkdir -p, silenced rm) are all reported; the justified one is not" || bad "lint did not catch the mutant (reported $((mm - mb)) of 4)"
 
 echo ""
 echo "=== S11: what actually runs in production ==="
