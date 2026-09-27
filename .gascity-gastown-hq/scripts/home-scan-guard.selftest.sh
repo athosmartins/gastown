@@ -902,6 +902,250 @@ PY
   esac
 fi
 
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- gate round 4 (ga-p7agas): no wrapper option table decides which word is the command; a pipe does not replace grep -r / fd's cwd --"
+# ─────────────────────────────────────────────────────────────────────────
+# Blocker 1 -- ONE option table shared by six wrappers marked `-i -u -n -t -w ...` as taking a VALUE, so a switch (`caffeinate -i`,
+# `sudo -n`) swallowed the scanner's own NAME and the scan behind it was allowed with no trace. The class, not the letters: a wrapper
+# reader that decides from a table which words are option VALUES loses the command to any wrong or MISSING entry (`time -o FILE`,
+# `nice --adjustment 5` were in no table at all). The engine now reads EVERY way a wrapper's leading options can split into
+# switches and values; the sections below assert that property for every wrapper, every letter and digit, in the forms a
+# switch / a value / an attached value / a cluster / a long option take.
+# Blocker 2 -- `grep -r` and `fd` with no path walk the CWD whatever is on stdin (BSD grep measured; GNU grep's manual says the same);
+# the classifier assumed a pipe replaced the cwd operand for all of rg/ag/ack/fd/grep.
+# The reviewer's own repros, verbatim, through the real wrapper (bash 3.2) with the log asserted:
+blocked_and_logged "wrapper table: caffeinate -i (a switch; the shared table said 'valued')"     'caffeinate -i du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: caffeinate -i tar czf ~/Documents"                             'caffeinate -i tar czf /tmp/x.tgz ~/Documents' $G
+blocked_and_logged "wrapper table: caffeinate -u"                                                 'caffeinate -u du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: sudo -n (non-interactive, a switch)"                           'sudo -n du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: sudo -i (login shell, a switch)"                               'sudo -i du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: env -S STRING (the value IS the command line)"                 'env -S "du -sk ~/Downloads"' $G
+blocked_and_logged "wrapper table: /usr/bin/time -o FILE (the option was in no table)"            '/usr/bin/time -o /tmp/t.txt du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: nice --adjustment 5 (long option, separate value)"             'nice --adjustment 5 du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: sudo -D DIR"                                                   'sudo -D /tmp du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table (control that used to work): caffeinate -t 60"                  'caffeinate -t 60 du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table (control that used to work): sudo -u athos"                     'sudo -u athos du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: a scan through a shell -c behind a switch"                     "sudo -n bash -c 'du -sk ~/Downloads'" $G
+blocked_and_logged "wrapper table: a clustered switch+value, sudo -Hu athos"                      'sudo -Hu athos du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: two wrappers, each with a switch"                              'sudo -n caffeinate -i du -sk ~/Downloads' $G
+blocked_and_logged "wrapper table: env -S attached, and with a switch cluster"                    'env -iS"du -sk ~/Downloads"' $G
+expect_allow "wrapper table (control): caffeinate -i on a SAFE scan"                              'caffeinate -i du -sk ~/gt' $G
+expect_allow "wrapper table (control): sudo -n on a SAFE scan"                                    'sudo -n du -sk ~/gt' $G
+expect_allow "wrapper table (control): env -S over a SAFE command line"                           'env -S "du -sk ~/gt"' $G
+expect_allow "wrapper table (control): time -o FILE on a SAFE scan"                               '/usr/bin/time -o /tmp/t.txt du -sk ~/gt' $G
+expect_allow "wrapper table (control): nice --adjustment 5 on a SAFE scan"                        'nice --adjustment 5 du -sk ~/gt' $G
+expect_allow "wrapper table (control): timeout -s KILL 5 on a SAFE scan"                          'timeout -s KILL 5 du -sk ~/gt' $G
+expect_allow "wrapper table (control): a scan-tool word that is only an ARGUMENT, from a hot cwd" 'sudo -u athos brew install ncdu' /Users/athos
+blocked_and_logged "grep -r: a pipe does not replace the cwd operand (cd ~ && ... | grep -rl)"    'cd ~ && git log --oneline | grep -rl foo' $G
+blocked_and_logged "grep -r: same, the payload's cwd is a protected folder"                       'echo x | grep -r foo' /Users/athos/Downloads
+blocked_and_logged "fd: a pipe does not replace the cwd operand"                                  'cd ~ && echo x | fd foo' $G
+blocked_and_logged "grep -r/xargs: fed by a listing of \$HOME (the same variable, one branch over)" 'ls ~ | xargs grep -rl foo' $G
+expect_allow "grep -r (control): unpiped from a safe cwd is not a finding"                        'git log | grep -r foo' $G
+expect_allow "rg (control): rg READS stdin when piped (measured), so cd ~ && ... | rg is not a scan" 'cd ~ && git log --oneline | rg foo' $G
+expect_allow "grep -r/xargs (control): operands come from xargs' input, not from the cwd"         'git ls-files | xargs grep -rl foo' /Users/athos
+
+# The class, in-process. Every wrapper x every letter/digit x the forms an option takes x a scanner behind it; the same over a SAFE
+# target (a reading the engine adds must never become a false block); every search tool x every stdin arrangement; and the SHAPE:
+# the wrapper dispatcher is table-driven and the search branch is gated by the stdin table, so a wrapper or a tool nobody classified
+# cannot be added without the sweep above covering it.
+if [ -f "$HERE/home-scan-guard.py" ]; then
+  # The program goes to a FILE first: a heredoc inside $( ) is parsed by macOS bash 3.2 as shell text, and the quotes / backticks in a
+  # Python program of this size broke that parse ("unexpected EOF") -- the file died there and every later check silently did not run.
+  cat > "$SCRATCH/r4-class.py" <<'PY'
+import ast, importlib.util, os, re, string
+spec = importlib.util.spec_from_file_location("hsg", os.environ["HSG_ENGINE"])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+src = open(os.environ["HSG_ENGINE"]).read()
+tree = ast.parse(src)
+problems = []
+total = 0
+
+
+def verdict(cmd, cwd="/Users/athos/gt"):
+    try:
+        m.analyze(cmd, cwd, ["/Users/athos"])
+    except m.Block:
+        return "block"
+    except m.Abort:
+        return "gave-up"
+    return "allow"
+
+
+def expect(cmd, want, cwd="/Users/athos/gt"):
+    global total
+    total += 1
+    got = verdict(cmd, cwd)
+    if got != want:
+        problems.append("WRONG (want %s, got %s, cwd %s): %s" % (want, got, cwd, cmd[:120]))
+
+
+def func(name):
+    return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+# What the TOOLS do is stated HERE, not read back from the engine: a test that takes its expectation from the table it is testing
+# passes for any table (mutation-tested: flipping grep to "reads stdin" in the table moved the expectation with it and survived).
+KNOWN_WRAPPERS = {"command", "builtin", "exec", "nohup", "setsid", "time", "env", "nice", "ionice", "stdbuf", "arch", "caffeinate",
+                  "sudo", "timeout", "xargs"}
+positionals = {"timeout": 1}                       # GNU timeout: DURATION sits between its options and the command
+assigners = {"env", "sudo"}                        # NAME=VALUE words may precede the command
+wrappers = getattr(m, "WRAPPERS", None)
+wopts = getattr(m, "WRAPPER_OPTS", None)
+if not wrappers or not wopts:
+    problems.append("STRUCT: the engine has no WRAPPERS / WRAPPER_OPTS table -- the wrapper dispatcher is not table-driven")
+    wrappers = ()
+else:
+    if not KNOWN_WRAPPERS <= set(wrappers):
+        problems.append("STRUCT: wrappers missing from the engine's WRAPPERS: %s" % sorted(KNOWN_WRAPPERS - set(wrappers)))
+    if dict(m.WRAPPER_POSITIONALS) != positionals or set(m.WRAPPER_ASSIGNS) != assigners:
+        problems.append("STRUCT: WRAPPER_POSITIONALS / WRAPPER_ASSIGNS differ from what timeout / env / sudo take: %r %r"
+                        % (dict(m.WRAPPER_POSITIONALS), set(m.WRAPPER_ASSIGNS)))
+    # the option tables are for PRECISION and must be RIGHT: the reading they give (the one a cd belongs to) is the real command
+    st = m.State(["/Users/athos"], "/Users/athos/gt")
+    for cmd, want in (("caffeinate -i du -sk ~/gt", "du"), ("caffeinate -t 60 -d du -sk ~/gt", "du"), ("sudo -n du -sk ~/gt", "du"),
+                      ("sudo -i du -sk ~/gt", "du"), ("sudo -u athos -H du -sk ~/gt", "du"), ("sudo -D /tmp FOO=1 du -sk ~/gt", "du"),
+                      ("nice -n 5 du -sk ~/gt", "du"), ("nice --adjustment 5 du -sk ~/gt", "du"), ("nice -5 du -sk ~/gt", "du"),
+                      ("timeout -s KILL 5 du -sk ~/gt", "du"), ("gtimeout 5 du -sk ~/gt", "du"), ("env -u X -i FOO=1 du -sk ~/gt", "du"),
+                      ("env -S x du -sk ~/gt", "du"), ("time -p du -sk ~/gt", "du"), ("/usr/bin/time -o /tmp/t du -sk ~/gt", "du"),
+                      ("stdbuf -oL du -sk ~/gt", "du"), ("stdbuf -o L du -sk ~/gt", "du"), ("arch -arch arm64 du -sk ~/gt", "du"),
+                      ("arch -x86_64 du -sk ~/gt", "du"), ("command -p du -sk ~/gt", "du"), ("exec -a x du -sk ~/gt", "du"),
+                      ("ionice -c 3 -t du -sk ~/gt", "du"), ("nohup du -sk ~/gt", "du"), ("setsid -f du -sk ~/gt", "du"),
+                      ("xargs -0 -n 1 du -sk", "du"), ("sudo -n nice -n 5 caffeinate -i timeout 5 du -sk ~/gt", "du"),
+                      ('env FOO="$X" du -sk ~/gt', "du"), ('sudo -n BAR="$d" -i du -sk ~/gt', "du"),
+                      ('env -u X A="$d" B=2 sh -c "true"', "sh")):
+        script, _ = m.scan(cmd, 0, False, 0)
+        primary = [r.name for r in m.unwrap(list(script[0].words), st) if r.primary]
+        if primary != [want]:
+            problems.append("STRUCT: the option tables misread %r: primary reading %r, want [%r]" % (cmd, primary, want))
+        total += 1
+    # (1) SHAPE: unwrap() names only the wrappers that carry behaviour a table cannot (xargs' own parser, `command -v`, env -S).
+    # Any other wrapper spelled out in it is a hand-kept list beside the table -- the drift that produced blocker 1.
+    named = {"xargs", "command", "env"}
+    spelled = {n.value for n in ast.walk(func("unwrap")) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    if spelled & (set(wrappers) - named):
+        problems.append("STRUCT: unwrap() spells out wrapper names beside the table: %s" % sorted(spelled & (set(wrappers) - named)))
+    for w in wrappers:
+        if w != "xargs" and not isinstance(wopts.get(w), tuple):
+            problems.append("STRUCT: wrapper %r has no option table (a tuple) in WRAPPER_OPTS" % w)
+
+letters = string.ascii_letters + string.digits
+scanners = [("du -sk %s", "~/Downloads", "~/gt"),
+            ("tar czf /tmp/x.tgz %s", "~/Documents", "~/gt"),
+            ("sh -c 'du -sk %s'", "~/Desktop", "~/gt")]
+VAL = "5"
+
+
+def line(w, opt, tail):
+    pos = " 5" * positionals.get(w, 0)                  # timeout's DURATION sits between its options and the command
+    return "%s %s%s %s" % (w, opt, pos, tail) if opt else "%s%s %s" % (w, pos, tail)
+
+
+def forms(w):
+    out = []
+    for x in letters:
+        out += ["-%s" % x, "-%s %s" % (x, VAL), "-%s%s" % (x, VAL), "-s%s" % x, "-s%s %s" % (x, VAL)]
+        if w in assigners:
+            out.append("-%s FOO=1" % x)
+    longs = {o for o in wopts.get(w, ()) if o.startswith("--")} | {"--zz"}
+    for lo in sorted(longs):
+        out += [lo, "%s %s" % (lo, VAL), "%s=%s" % (lo, VAL)]
+    out.append("")
+    return out
+
+
+for w in wrappers:
+    for opt in forms(w):
+        for cmd, hot, safe in scanners:
+            # the ONE exception, and it is asserted rather than skipped: `command -v NAME` / `-V` LOOKS a command up and runs nothing
+            lookup = w == "command" and opt.split(" ")[0] in ("-v", "-V")
+            expect(line(w, opt, cmd % hot), "allow" if lookup else "block")
+    for opt in forms(w)[::7]:                           # the same shapes over a SAFE target: no reading may become a false block
+        for cmd, hot, safe in scanners:
+            expect(line(w, opt, cmd % safe), "allow")
+# a wrapper behind a wrapper, each with a switch or a value in front
+for w1 in wrappers:
+    for w2 in wrappers:
+        for o1, o2 in (("-n", "-i"), ("-i", "-n 5"), ("-u", "-t 9"), ("", "-o"), ("-c", "")):
+            expect(line(w1, o1, line(w2, o2, "du -sk ~/Downloads")), "block")
+            expect(line(w1, o1, line(w2, o2, "du -sk ~/gt")), "allow")
+# env -S: the value is a command line, in every spelling
+for cmd in ('env -S "du -sk ~/Downloads"', 'env -S"du -sk ~/Downloads"', 'env --split-string="du -sk ~/Downloads"',
+            'env --split-string "du -sk ~/Downloads"', 'env -iS "du -sk ~/Downloads"', 'env -i -S "du -sk ~/Downloads"',
+            "env -S 'find ~/Desktop -name x'", 'env -S "sh -c \'du -sk ~/Downloads\'"'):
+    expect(cmd, "block")
+for cmd in ('env -S "du -sk ~/gt"', 'env --split-string="du -sk ~/gt"', "env -S 'find ~/gt -name x'"):
+    expect(cmd, "allow")
+
+# The false-positive surface of the extra readings is what the engine header says it is: a reading starts at a word near the front
+# of the line, so it only bites when that word is a scanner's own name AND the cwd is hot -- `caffeinate -i make find` from $HOME reads
+# a bare `find` (an accepted, documented false positive); from a repo, and every ordinary neighbour, it is allowed.
+# Only the PRIMARY reading moves the working directory: `caffeinate -t cd ~/Downloads` is caffeinate -t <timeout "cd"> running
+# ~/Downloads -- not a `cd` (the other reading, where -t is a switch, would be one). Letting it move the cwd made the `du -sk .` after
+# it a scan of Downloads: a false block, from a reading that is only a guess.
+expect("caffeinate -t cd ~/Downloads && du -sk .", "allow")
+expect("command -p cd ~/Downloads && du -sk .", "block")             # ...and a REAL cd behind a wrapper still counts
+expect("caffeinate -i make find", "block", "/Users/athos")
+expect("caffeinate -i make find", "allow", "/Users/athos/gt")
+for cmd in ("sudo -u athos brew install tree", "sudo -u athos brew install ncdu", "nice -n 5 make -j4 tree",
+            "timeout 60 git log -- du", "env FOO=1 npm install fd", "sudo brew install tree"):
+    expect(cmd, "allow", "/Users/athos")
+
+# an assignment whose VALUE is an expansion is still an assignment (it has to be read before the "is this word a literal" test:
+# a loop variable handed to the script through `env x="$d" sh -c ...` is how the incident reaches a shell)
+for w in sorted(assigners):
+    # "-Q FOO" is an option no table knows, with a value: the table reading is WRONG there (FOO would be the command), so the
+    # assignment is only reached by the other reading -- which is where reading it after the literal test used to lose it
+    for opt in ("", "-n", "-i", "-u FOO", "-n -i", "-Q FOO", "-Q FOO -i"):
+        pre = ("%s %s " % (w, opt)).replace("  ", " ")
+        expect("for d in $(ls ~); do %sx=\"$d\" sh -c 'du -sk \"$x\"'; done" % pre, "block")
+        expect("for d in $(ls ~/gt); do %sx=\"$d\" sh -c 'du -sk \"$x\"'; done" % pre, "allow")
+
+# ---- search tools: does a pipe replace the implicit cwd operand?
+ss = getattr(m, "SEARCH_STDIN", None)
+if not ss:
+    problems.append("STRUCT: the engine has no SEARCH_STDIN table (which search tools read stdin instead of walking the cwd)")
+else:
+    body = ast.get_source_segment(src, func("check_command"))
+    if not re.search(r"\bif name in SEARCH_STDIN\b", body):
+        problems.append("STRUCT: check_command's search branch is not gated by SEARCH_STDIN")
+    if re.search(r'"rg",\s*"ag",\s*"ack"', body):
+        problems.append("STRUCT: check_command spells out the search tools beside SEARCH_STDIN")
+    flag = {"grep": "-r "}
+    # What each tool does with a pipe and no path, stated here (measured on this machine for grep and rg, 26/09: BSD grep 2.6.0
+    # -r prints ./a.txt and ignores the pipe; `echo x | rg x` prints the stdin line; the other three are from their manuals) --
+    # NOT read back from the engine's table, or flipping an entry would move the expectation with it.
+    truth = {"grep": False, "fd": False, "rg": True, "ag": True, "ack": True}
+    if {t: e[0] for t, e in ss.items()} != truth:
+        problems.append("STRUCT: SEARCH_STDIN disagrees with what the tools do: %r" % {t: e[0] for t, e in ss.items()})
+    for tool, entry in ss.items():
+        reads_stdin, evidence = entry
+        reads_stdin = truth.get(tool, reads_stdin)
+        if not str(evidence).strip():
+            problems.append("STRUCT: SEARCH_STDIN[%r] says nothing about HOW it is known (measured / documented)" % tool)
+        c = "%s %sfoo" % (tool, flag.get(tool, ""))
+        piped = "allow" if reads_stdin else "block"
+        expect("cd ~ && git log --oneline | " + c, piped)
+        expect("echo x | " + c, piped, "/Users/athos/Downloads")
+        expect("cd ~ && " + c, "block")                   # nothing on stdin: every one of them walks the cwd
+        expect("git log | " + c, "allow")                 # the cwd is safe
+        expect("ls ~ | xargs " + c, "block")              # operands: the entries of $HOME
+        expect("ls -A | xargs " + c, "block", "/Users/athos")
+        expect("git ls-files | xargs " + c, "allow", "/Users/athos")   # operands come from xargs, not from the cwd
+
+print("R4 total=%d wrong=%d" % (total, len([p for p in problems if p.startswith("WRONG")])) + (" struct=%d" % len([p for p in problems if p.startswith("STRUCT")])))
+for p in problems[:14]:
+    print("  " + p)
+if len(problems) > 14:
+    print("  ... and %d more" % (len(problems) - 14))
+PY
+  R4_OUT="$(HSG_ENGINE="$HERE/home-scan-guard.py" HOME_SCAN_GUARD_LOG="$LOG" python3 -I -S "$SCRATCH/r4-class.py" 2>&1)"
+  case "$R4_OUT" in
+    "R4 total="*" wrong=0 struct=0"*) ok "class: every wrapper x every letter/digit x switch/value/attached/cluster/long reads through to the scanner, no safe target is blocked, every search tool is classified for stdin (${R4_OUT%%$'\n'*})" ;;
+    *) bad "class (gate round 4) -- $R4_OUT" ;;
+  esac
+fi
+
 # A guard that fails open on its OWN bug is silently OFF: the engine logs those as ENGINE-ERROR. A NameError from a
 # refactor once turned 71 must-block cases into silent allows here -- this is the assertion that makes that loud.
 echo ""

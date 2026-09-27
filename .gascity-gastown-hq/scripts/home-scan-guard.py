@@ -35,6 +35,12 @@ WHAT THIS IS NOT: a sandbox. It is a LEXICAL heuristic over the command text, on
     (`xargs -I{} python3 -c ...`, GNU `parallel`, `find -exec sh -c`), an xargs replacement string that is not a literal
     (`xargs -I"$R" sh -c ...`: nothing to substitute is known, so nothing is marked), the spellings `$'/Users/athos/x'` (ANSI-C
     quoting) and a path written in a file the command then reads, and a command that GAVE UP -- see the next paragraph.
+    Two more, measured for gate round 4 and NOT fixed there (outside the two blockers of that round): (1) a wrapper that is not in
+    WRAPPER_OPTS is not read through (`watch -n 5 du -sk ~/Downloads`, `flock FILE du ...`, `taskpolicy -b du ...`,
+    `script FILE du ...`, `doas du ...` -- all allowed); adding one is a line in that table (+ WRAPPER_POSITIONALS when it takes a
+    positional word), and the selftest sweeps every entry on its own. (2) An option of a KNOWN wrapper that moves the command to
+    another DIRECTORY (`env -C DIR` / `--chdir`, `sudo -D DIR`): its value is read as a word, not as a `cd`, so
+    `env -C ~/Downloads du -sk .` is allowed (the relative operand is resolved against the payload's cwd).
   * WHO IS GUARDED, and who is not (the bead's acceptance is "crews + pools", and it is exactly that): the crews /
     witness / refinery settings.json (home-scan-guard-activate.sh) and the four pool overlays that carry the hook (dog,
     ps-worker, reviewer, wa-worker: pool-roles.json). Overlays WITHOUT the hook: the base `pool` one (gastown.boot,
@@ -75,6 +81,22 @@ walk cannot know `d` is an entry of $HOME. analyze_script notes such a redirect 
 saw one, walks the script again knowing that every `read` / `mapfile` / `readarray` / `xargs` in it is fed by
 a listing of $HOME (an over-approximation, in a script that lists $HOME through a redirect -- the exact shape
 this guard exists for).
+
+A WRAPPER'S OPTIONS DO NOT DECIDE WHICH WORD IS THE COMMAND (gate round 4). `sudo -n du ~/x`, `caffeinate -i du ~/x`,
+`time -o FILE du ~/x`: whether an option takes the NEXT word as its value is a fact about that one tool, and a reader that
+guesses it from a table loses the command to any wrong or MISSING entry (six wrappers once shared one list, and `caffeinate -i`
+-- a switch -- swallowed `du`). unwrap() therefore reads a wrapper line EVERY way its leading options could split into switches
+and values (`_all_starts`) and checks each reading like a command of its own; WRAPPER_OPTS (one table per wrapper) only picks the
+reading that is RIGHT -- the one whose `cd` counts and whose xargs marks are used. A wrong entry can cost a false positive, never a
+missed scan. The false-positive surface is small on purpose: an extra reading starts at a word near the FRONT of the line -- an
+option's value, or the first word after the real command's name when that name was read as a value -- so it only matters when
+that word is itself a scanner's name AND the cwd or its own operands are hot (`caffeinate -i make find` from $HOME reads a bare
+`find`). `env -S STRING` is a whole command line in one word and is analysed as a script.
+
+A PIPE DOES NOT ALWAYS REPLACE THE CWD. With no path, `rg` / `ag` / `ack` search STDIN when something is piped into them; `grep -r`
+and `fd` walk the CWD whatever is on stdin (SEARCH_STDIN says which, and whether that was measured on this machine or only read in
+a manual). `git log | grep -rl foo` from $HOME is a scan of $HOME. What xargs feeds is operands, not stdin: they stand where the cwd
+would, so a listing of $HOME through xargs is blocked for the search tools exactly as it is for du and ls.
 """
 import json
 import os
@@ -82,6 +104,7 @@ import posixpath
 import re
 import sys
 import time
+from collections import deque, namedtuple
 
 # ----------------------------------------------------------------------------- policy tables
 # Names are compared case-insensitively: the macOS volume is case-insensitive by default, so
@@ -106,7 +129,7 @@ KEYWORDS = {"if", "then", "elif", "else", "fi", "while", "until", "do", "done", 
 # and `ls -T` is macOS's full-timestamp switch -- so they keep a name of their own ("eza") instead of borrowing ls's.
 TOOL_ALIASES = {"gfind": "find", "gdu": "du", "ggrep": "grep", "gls": "ls", "gcp": "cp",
                 "gtar": "tar", "fdfind": "fd", "ripgrep": "rg", "egrep": "grep",
-                "fgrep": "grep", "zgrep": "grep", "exa": "eza", "lsd": "eza"}
+                "fgrep": "grep", "zgrep": "grep", "exa": "eza", "lsd": "eza", "gtimeout": "timeout"}
 
 # ONE option table PER TOOL. du, dust, gdu, ncdu and tree used to share a single "these letters take a value" list, so a
 # letter that takes a value for one tool and is a plain switch for another swallowed the PATH as its "value"
@@ -137,6 +160,48 @@ TRAVERSAL_DEPTH = {
     "rg":   (("d",), ("--max-depth", "--maxdepth")),
     "ag":   ((), ("--depth",)),
     "eza":  (("L",), ("--level", "--depth")),
+}
+
+# COMMAND WRAPPERS -- what runs another command: `nice -n 5 du ...`, `sudo -u athos du ...`, `timeout 60 du ...`. ONE option table PER
+# WRAPPER: the options that take the NEXT word as their value, read off each tool's own synopsis (man caffeinate / sudo / env /
+# nice / time / arch / stdbuf, GNU timeout). Six wrappers used to share ONE list (`-i -u -n -t -w ...`), so `caffeinate -i` and
+# `sudo -n` -- switches -- swallowed the scanner's own NAME and the scan behind it went through with no trace.
+# The tables give the reading that is RIGHT for a real command line (the one a `cd` or an xargs mark belongs to). They are NOT what
+# keeps a scanner from being hidden: unwrap() also reads EVERY other way the leading options could split into switches and values
+# (_all_starts), so an entry that is wrong or missing (`time -o FILE` was in no table at all) costs a false positive at worst,
+# never a missed scan. Only options with a SEPARATE value are listed: `-n5` / `--adjustment=5` / a switch need no entry.
+WRAPPER_OPTS = {
+    "command":    (),
+    "builtin":    (),
+    "nohup":      (),
+    "setsid":     (),
+    "exec":       ("-a",),
+    "time":       ("-o", "-f", "--output", "--format"),
+    "env":        ("-u", "-C", "-P", "-S", "-a", "--unset", "--chdir", "--split-string", "--argv0"),
+    "nice":       ("-n", "--adjustment"),
+    "ionice":     ("-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"),
+    "stdbuf":     ("-e", "-i", "-o", "--error", "--input", "--output"),
+    "arch":       ("-arch", "-d", "-e"),
+    "caffeinate": ("-t", "-w"),
+    "sudo":       ("-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u", "--close-from", "--chdir", "--group",
+                   "--host", "--prompt", "--chroot", "--role", "--command-timeout", "--type", "--other-user", "--user"),
+    "timeout":    ("-s", "-k", "--signal", "--kill-after"),
+}
+WRAPPER_POSITIONALS = {"timeout": 1}           # words between the options and the command: timeout's DURATION
+WRAPPER_ASSIGNS = frozenset(["env", "sudo"])   # NAME=VALUE words may sit between the options and the command
+WRAPPERS = frozenset(WRAPPER_OPTS) | {"xargs"}   # xargs has a parser of its own (_xargs_command): its -I / -J strings are marks
+
+# SEARCH TOOLS given no path: what is the implicit operand when something is piped INTO them? True = the tool reads stdin (the pipe
+# REPLACES the cwd), False = it walks the cwd whatever is on stdin. The classifier assumed True for all five, which made
+# `cd ~ && git log | grep -rl foo` an allowed scan of $HOME. Each entry says HOW it is known: "measured" = run on this machine,
+# "documented" = the tool's manual, and the tool is not installed here, so it is NOT measured -- a claim to re-check, not a fact.
+SEARCH_STDIN = {
+    "grep": (False, "measured: BSD grep 2.6.0 under -r/-R with no file operand prints the ./file hit and ignores the pipe; "
+                    "GNU grep's manual says the same (recursive + no file operand = the working directory)"),
+    "fd":   (False, "documented: fd never reads stdin (not installed here, not measured)"),
+    "rg":   (True,  "measured: `echo x | rg x` prints the stdin line, not a cwd hit (ripgrep 15.1.0)"),
+    "ag":   (True,  "documented: ag searches stdin when it is a pipe and no path is given (not installed here, not measured)"),
+    "ack":  (True,  "documented: ack searches stdin when it is a pipe and no file is given (not installed here, not measured)"),
 }
 
 MAX_DEPTH = 8                 # nesting of $( ) / bash -c / eval: past it NOTHING of the command is read -- an ALLOW, logged after the fact (GAVE-UP)
@@ -1040,18 +1105,17 @@ def script_lists_home(script, st, depth=0):
             for sg in w.segs:
                 if sg.kind == "sub" and script_lists_home(sg.script, st, depth + 1):
                     return True
-        unwrapped = unwrap(words, st)       # an Abort from here is logged (GAVE-UP) by main(), not swallowed as "no listing"
-        if unwrapped is None:
-            continue
-        name, args, _implicit, _marks, _envs = unwrapped
-        if name in ("cd", "pushd"):
-            _apply_cd(args, st, name == "pushd")
-            continue
-        if name == "popd":
-            _apply_popd(st)
-            continue
-        if command_lists_home(name, args, st):
-            return True
+        for r in unwrap(words, st):         # an Abort from here is logged (GAVE-UP) by main(), not swallowed as "no listing"
+            if r.name in ("cd", "pushd"):
+                if r.primary:
+                    _apply_cd(r.args, st, r.name == "pushd")
+                continue
+            if r.name == "popd":
+                if r.primary:
+                    _apply_popd(st)
+                continue
+            if command_lists_home(r.name, r.args, st):
+                return True
     return False
 
 
@@ -1063,17 +1127,6 @@ def _is_assignment(w):
     if not w.segs or w.segs[0].kind != "lit" or w.segs[0].quoted:
         return False
     return bool(_ASSIGN.match(w.segs[0].text))
-
-
-def _skip_opts(words, valued=()):
-    """Drop leading -options (and the value of those in `valued`)."""
-    i = 0
-    while i < len(words):
-        t = lit_text(words[i])
-        if t is None or not t.startswith("-") or t == "-":
-            break
-        i += 2 if t in valued and i + 1 < len(words) else 1
-    return words[i:]
 
 
 _XARGS_SHORT_VALUED = frozenset("IJnPLdsEaRS")     # -n 1 / -n1: the value is the rest of the cluster, else the next word
@@ -1125,58 +1178,187 @@ def _xargs_command(words):
     return words[i:], marks
 
 
-def unwrap(words, st):
-    """Strip env-style prefixes. Returns (name, args, implicit_stdin, marks, envs) or None when the command name is not a
-    literal we can reason about. `marks` are the strings an xargs in the chain substitutes with its input (see
-    _xargs_command); `envs` are the NAME=VALUE words an `env` in the chain sets for the command it runs."""
-    implicit = False
-    marks = []
-    envs = []
-    words = list(words)
-    # How many wrappers are stacked is NOT capped: every pass below strips at least the wrapper's own word, so the loop ends by
-    # itself (a fixed cap of 8 ran out on `env` x 8 and fell to `return None` -- "not a command I can reason about" -- so the scan
-    # behind it was allowed in silence). `budget` is just that bound spelled out: one pass per word, plus the words a brace
-    # expansion adds. Running out of it can only mean the invariant broke; that is a GAVE-UP -- an allow, but a LOGGED one.
-    budget = len(words) + 1
-    while budget > 0:
-        budget -= 1
-        if not words:
-            return None
-        t = lit_text(words[0])
+Reading = namedtuple("Reading", "name args implicit marks envs primary")
+
+
+def _is_option(t):
+    return t is not None and t.startswith("-") and t != "-"
+
+
+def _lit_word(text):
+    return Word([Seg("lit", text, False)])
+
+
+def _table_start(words, valued, positional, assigns):
+    """The ONE reading a wrapper's own option table gives: (index where its command starts, the NAME=VALUE words skipped on
+    the way). `words` is what follows the wrapper's name."""
+    i, n, envs = 0, len(words), []
+    while i < n:
+        if assigns and _is_assignment(words[i]):     # BEFORE the literal test: `x="$d"` has an expansion in it and is still one
+            envs.append(words[i])            # `env x="$d" sh -c '... $x ...'`: the value reaches the script it launches
+            i += 1
+            continue
+        t = lit_text(words[i])
         if t is None:
-            return None
+            break
+        if t == "--":
+            i += 1
+            break
+        if not _is_option(t):
+            break
+        i += 2 if t in valued and i + 1 < n else 1
+    return min(i + positional, n), tuple(envs)
+
+
+def _all_starts(words, positional, assigns):
+    """EVERY index of `words` (what follows a wrapper's name) where the command it runs could begin, whichever way the leading
+    options split into switches (one word) and options with a value (two): {index: the NAME=VALUE words skipped on the way}.
+    A word that is not an option ends the walk on that branch -- it is the command (for `timeout`, its DURATION and then the
+    command). This is what makes the option tables a matter of precision only: `caffeinate -i du ~/x` is read both as "-i is a
+    switch" (the command is du) and as "-i takes a value" (the command is whatever follows du), and the reading that reaches
+    the scanner is checked like any other. The extra readings start at words near the front of the line (an option's value, or what
+    follows the real command's name when that name was read as a value); they only matter when such a word names a scanner."""
+    n = len(words)
+    starts, seen, stack = set(), set(), [0]
+    while stack:
+        i = stack.pop()
+        if i >= n or i in seen:
+            continue
+        seen.add(i)
+        if assigns and _is_assignment(words[i]):     # BEFORE the literal test: `x="$d"` has an expansion in it and is still one
+            stack.append(i + 1)
+            continue
+        t = lit_text(words[i])
+        if t is None:
+            continue                         # not a literal: nothing readable starts here (it may be a VALUE: the other branch)
+        if t == "--":
+            if i + 1 < n:
+                starts.add(i + 1)
+        elif _is_option(t):
+            stack.append(i + 1)
+            stack.append(i + 2)
+        else:
+            starts.update(i + k for k in range(positional + 1) if i + k < n)
+    # The assignments a start carries are a function of the INDEX alone: every NAME=VALUE-looking word before it. (Tracked along
+    # the walk they depended on the path, and two paths meeting at one index kept only the first one's -- `env -Q FOO -i x="$d" sh
+    # -c ...` lost `x`.) A word that was really an option's value is over-read as an assignment, which can only ADD a variable.
+    assigned = [k for k in range(n) if _is_assignment(words[k])] if assigns else []
+    return {j: tuple(words[k] for k in assigned if k < j) for j in starts}
+
+
+def _env_split_strings(words, valued):
+    """`env -S STRING` / `--split-string STRING`: STRING is a whole command line that env splits into words and runs -- a script
+    in ONE word, which no option table can turn into a command. Returns those words (a cluster like -iS STRING, and an attached
+    -S"STRING", count)."""
+    out, i, n = [], 0, len(words)
+    while i < n:
+        t = lit_text(words[i])
+        if t is None:
+            if not _is_assignment(words[i]):
+                break                        # an expansion that is not an assignment is the command word: env's options are over
+            i += 1
+        elif t == "--split-string":
+            if i + 1 < n:
+                out.append(words[i + 1])
+            i += 2
+        elif t.startswith("--split-string="):
+            out.append(_lit_word(t.partition("=")[2]))
+            i += 1
+        elif _is_option(t) and not t.startswith("--") and 0 < t.find("S", 1) and set(t[1:t.find("S", 1)]) <= set("iv0"):
+            k = t.find("S", 1)
+            if t[k + 1:]:
+                out.append(_lit_word(t[k + 1:]))
+                i += 1
+            else:
+                if i + 1 < n:
+                    out.append(words[i + 1])
+                i += 2
+        elif _is_option(t):
+            i += 2 if t in valued and i + 1 < n else 1
+        elif _is_assignment(words[i]):
+            i += 1
+        else:
+            break
+    return out
+
+
+def unwrap(words, st):
+    """Every way the command line can be READ once its wrappers (nice, sudo, env, timeout, xargs, command ...) are stripped:
+    a list of Reading(name, args, implicit_stdin, marks, envs, primary), [] when no command name is a literal we can reason
+    about. `primary` is the reading the wrappers' own option tables give -- the only one whose side effects (a `cd`) count;
+    the others exist so that a scanner is not hidden by a table that is wrong or missing an entry (see _all_starts).
+    `marks` are the strings an xargs in the chain substitutes with its input (see _xargs_command); `envs` are the NAME=VALUE
+    words an `env` / `sudo` in the chain sets for the command it runs."""
+    out = []
+    queued, expanded = set(), set()      # states put on the queue / states already taken apart (a state is taken apart once)
+    queue = deque()
+    # The primary chain is followed to its end BEFORE any other reading is looked at, so when both reach the same place that place
+    # is primary. There is no cap on how many wrappers are stacked: every state strips at least the wrapper's own word, and a
+    # state is taken apart once, so the number of states is bounded by the words. `budget` spells that bound out; running out of
+    # it can only mean the invariant broke, and that is a GAVE-UP -- an allow, but a LOGGED one (a fixed cap of 8 used to fall to
+    # `return None` = "not a command I can reason about", and the scan behind it was allowed in silence).
+    primary_next = (list(words), False, (), (), True)
+    budget = 64 * (len(words) + 1)
+    while primary_next is not None or queue:
+        if budget <= 0:
+            raise Abort("command wrappers did not unwrap (more states than the words allow)")
+        budget -= 1
+        if primary_next is not None:
+            state, primary_next = primary_next, None
+        else:
+            state = queue.popleft()
+        ws, implicit, marks, envs, primary = state
+        if not ws:
+            continue
+        t = lit_text(ws[0])
+        if t is None:
+            continue
+        key = (id(ws[0]), len(ws), implicit, marks, tuple(id(e) for e in envs))
+        if key in expanded:
+            continue
+        expanded.add(key)
         if "{" in t:                     # `{du,ls} ~/Desktop` is `du ls ~/Desktop`: the command word is brace-expanded too
             parts = expand_braces(t)
             if parts != [t]:
-                words = [Word([Seg("lit", part, False)]) for part in parts] + words[1:]
-                budget += len(parts)
+                ws = [_lit_word(part) for part in parts] + ws[1:]
+                budget += 64 * len(parts)
                 t = parts[0]
         name = posixpath.basename(t)
         name = TOOL_ALIASES.get(name, name)
-        rest = words[1:]
-        if name in ("command", "builtin", "exec", "nohup", "setsid", "time"):
-            opts = [lit_text(w) for w in rest[:2]]
-            if name == "command" and ("-v" in opts or "-V" in opts):
-                return None
-            words = _skip_opts(rest)
-        elif name == "env":
-            rest = _skip_opts(rest, valued=("-u", "-C", "-S", "-P"))
-            while rest and _is_assignment(rest[0]):
-                envs.append(rest[0])         # `env x="$d" sh -c '... $x ...'`: the value reaches the script it launches
-                rest = rest[1:]
-            words = rest
-        elif name in ("nice", "ionice", "stdbuf", "arch", "caffeinate", "sudo"):
-            words = _skip_opts(rest, valued=("-n", "-c", "-u", "-t", "-w", "-o", "-e", "-i", "-g"))
-        elif name in ("timeout", "gtimeout"):
-            rest = _skip_opts(rest, valued=("-s", "-k", "--signal", "--kill-after"))
-            words = rest[1:]
-        elif name == "xargs":
-            words, found = _xargs_command(rest)
-            marks.extend(found)
+        rest = ws[1:]
+        if name not in WRAPPERS:
+            out.append(Reading(name, rest, implicit, marks, envs, primary))
+            continue
+        if name == "command" and any(lit_text(w) in ("-v", "-V") for w in rest[:2]):
+            continue                     # `command -v du` looks a command up, it runs nothing
+        positional = WRAPPER_POSITIONALS.get(name, 0)
+        assigns = name in WRAPPER_ASSIGNS
+        readings = []                    # (index into rest, envs added, marks added, primary): the table's own reading FIRST
+        if name == "xargs":
+            cmd_words, found = _xargs_command(rest)
+            table_i, table_envs, table_marks = len(rest) - len(cmd_words), (), tuple(m for m in found if m)
             implicit = True
         else:
-            return name, rest, implicit, tuple(marks), tuple(envs)
-    raise Abort("command wrappers did not unwrap (more passes than words)")
+            table_i, table_envs = _table_start(rest, WRAPPER_OPTS[name], positional, assigns)
+            table_marks = ()
+        if table_i < len(rest):
+            readings.append((table_i, table_envs, table_marks, primary))
+        for j, added in sorted(_all_starts(rest, positional, assigns).items()):
+            if j != table_i:
+                readings.append((j, added, (), False))
+        if name == "env":                # `env -S "du -sk ~/x"`: its value is a script, whatever the option table says
+            for value in _env_split_strings(rest, WRAPPER_OPTS["env"]):
+                out.append(Reading("sh", [_lit_word("-c"), value], implicit, marks, envs, False))
+        for j, added, added_marks, is_primary in readings:
+            nxt = (rest[j:], implicit, marks + added_marks, envs + added, is_primary)
+            if is_primary:
+                primary_next = nxt
+                continue
+            nxt_key = (id(nxt[0][0]), len(nxt[0]), implicit, nxt[2], tuple(id(e) for e in nxt[3]))
+            if nxt_key not in queued:    # queued once: without this the queue holds every start of every state (quadratic)
+                queued.add(nxt_key)
+                queue.append(nxt)
+    return out
 
 
 def _apply_cd(args, st, is_pushd=False):
@@ -1278,7 +1460,7 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
         ops = _operand_words("find", args)
         _operand_findings(name, ops, st, ctx, True, args, False, _describe_recursive)
         return
-    if name in ("rg", "ag", "ack", "fd", "grep"):
+    if name in SEARCH_STDIN:
         if name == "grep":
             flags, ops, values = parse_args(
                 args, valued_short=("e", "f", "A", "B", "C", "m", "d", "D"),
@@ -1314,8 +1496,14 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
             t = lit_text(ops[0])
             if t is None or t.startswith(("/", "~", "$")):
                 paths = ops
-        # rg/ag/ack/fd/grep read stdin (not the cwd) when they are fed by a pipe
-        implicit = not (stdin_is_pipe or implicit_stdin)
+        # With no path, what does the tool search? A PIPE replaces the cwd only for a tool that reads stdin (SEARCH_STDIN says which,
+        # and how that is known): `git log | grep -r foo` from $HOME walks $HOME. What xargs feeds is OPERANDS, not stdin: they
+        # stand where the cwd would, so there is no implicit cwd -- but if they are the entries of a listing of $HOME they are
+        # exactly what the branch above blocks for du / ls.
+        reads_stdin = SEARCH_STDIN[name][0]
+        if implicit_stdin and ctx.pipe_home:
+            _block("%s fed by a listing of $HOME through xargs" % name)
+        implicit = not implicit_stdin and not (reads_stdin and stdin_is_pipe)
         _operand_findings(name, paths, st, ctx, implicit, args, False, _describe_recursive)
         return
     if name in ("ls", "eza"):
@@ -1501,31 +1689,31 @@ def _walk_script(script, st, ctx, depth):
                     if t:
                         st.tainted.add(t)
             continue
-        unwrapped = unwrap(words, st)
-        if unwrapped is None:
-            continue
-        name, args, implicit, marks, envs = unwrapped
-        if name in SHELLS:
-            flags, ops, _ = parse_args(args, valued_short=("o", "O"))
-            if any(len(f) == 1 and f == "c" for f in flags) and ops:
-                _analyze_launched([ops[0]], ops[1:], assigns + list(envs), st, ctx, implicit, marks, depth)
-            continue
-        if name == "eval":
-            _analyze_launched(list(args), [], assigns + list(envs), st, ctx, implicit, marks, depth)
-            continue
-        if name in ("cd", "pushd", "popd"):
-            if in_subshell:
+        # Every reading of the wrapper chain is checked (see unwrap): a table that is wrong about one option must not hide the
+        # scanner. Only the PRIMARY reading moves the working directory -- a `cd` reached through a guess is not a `cd`.
+        for r in unwrap(words, st):
+            name, args, implicit, marks, envs = r.name, r.args, r.implicit, r.marks, r.envs
+            if name in SHELLS:
+                flags, ops, _ = parse_args(args, valued_short=("o", "O"))
+                if any(len(f) == 1 and f == "c" for f in flags) and ops:
+                    _analyze_launched([ops[0]], ops[1:], assigns + list(envs), st, ctx, implicit, marks, depth)
                 continue
-            if name == "popd":
-                _apply_popd(st)
-            else:
-                _apply_cd(args, st, name == "pushd")
-            continue
-        check_command(name, args, st, ctx, implicit, stdin_is_pipe)
-        if command_lists_home(name, args, st):
-            ctx.pipe_home = True
-        elif implicit and ctx.pipe_home:
-            ctx.pipe_home = True
+            if name == "eval":
+                _analyze_launched(list(args), [], assigns + list(envs), st, ctx, implicit, marks, depth)
+                continue
+            if name in ("cd", "pushd", "popd"):
+                if in_subshell or not r.primary:
+                    continue
+                if name == "popd":
+                    _apply_popd(st)
+                else:
+                    _apply_cd(args, st, name == "pushd")
+                continue
+            check_command(name, args, st, ctx, implicit, stdin_is_pipe)
+            if command_lists_home(name, args, st):
+                ctx.pipe_home = True
+            elif implicit and ctx.pipe_home:
+                ctx.pipe_home = True
 
 
 def _word_home_derived(w, st):
