@@ -560,17 +560,24 @@ def last_pass_epoch():
 # detector's "got == 0" check needs the verdict-received count too, so it gets its own
 # pattern rather than reusing that one.
 STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d+s\)")
+# ga-rzd08j: the run id the in-flight line above is FOR. Kept as its own regex (rather
+# than folded into STUCK_INFLIGHT_RE) so a future format change to the id/branch prefix
+# can never break the got/elapsed match the rest of this detector depends on — this
+# capture is purely additive, used only for the delivered-verdict corroboration below.
+# "Phase C: gate-run <id> (branch=<b>) still in flight (...)" is the ONLY emission site
+# (quality-gate-dispatcher.sh:~10579) and always carries this prefix on the same line.
+STUCK_RUN_ID_RE = re.compile(r"gate-run (\S+) \(branch=")
 
 
 def stuck_dispatching():
     """True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
     recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
     Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
-    between runs), AND no gate-reviewer session is active. Keying on the LIVE poll (not a
-    marker label) means a stranded 'gate-status:dispatching' marker — e.g. left by a killed
-    dispatcher during maintenance — does NOT false-fire. A slow-but-working run (reviewers
-    still active) is also not flagged here; the consecutive-TIMEOUT signal covers
-    alive-but-not-delivering.
+    between runs), no gate-reviewer session is active, AND the run has no DELIVERED
+    verdict recorded yet either. Keying on the LIVE poll (not a marker label) means a
+    stranded 'gate-status:dispatching' marker — e.g. left by a killed dispatcher during
+    maintenance — does NOT false-fire. A slow-but-working run (reviewers still active) is
+    also not flagged here; the consecutive-TIMEOUT signal covers alive-but-not-delivering.
 
     ga-iodjh7: deliberately NOT porting the sibling's ga-z0xx1 fix of comparing elapsed
     against the run's OWN diff-scaled timeout instead of a fixed constant. That fix targeted
@@ -581,7 +588,19 @@ def stuck_dispatching():
     "marker dispatching >12min w/ no active reviewers = spawn fail" grace period, not a
     stand-in for the full per-run budget — and this function already has independent
     corroboration the sibling lacks (no active gate-reviewer session, below), which already
-    protects a legitimately slow-but-active run without needing a wider elapsed threshold."""
+    protects a legitimately slow-but-active run without needing a wider elapsed threshold.
+
+    ga-rzd08j: "no active gate-reviewer session" alone is NOT proof of a spawn failure — a
+    reviewer that JUST delivered its verdict and exited also shows zero active sessions
+    here. Measured live 2026-09-27: the watchdog fired 10s after a reviewer's session
+    closed post-delivery, 22s before the dispatcher's own Phase C swept up the verdict and
+    merged (overall=PASS). Before calling "no active reviewer" abandonment, also check
+    whether the run already has a DELIVERED (closed) verdict bead — label gate-run:<id>,
+    via the existing _run_verdicts() helper. A closed verdict bead proves a reviewer
+    clearly showed up and did the work; Phase C just hasn't harvested it yet, which is
+    "waiting", not "stuck". Fail-safe: no run id parsed, or the verdict-bead query itself
+    fails, falls through to the pre-existing active-reviewer-only verdict — this check can
+    only ever suppress an alarm, never manufacture one the old code wouldn't already give."""
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
             return False  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
@@ -589,26 +608,42 @@ def stuck_dispatching():
     except Exception:
         return False
     vm = None
+    run_id = None
     for l in reversed(lines):
         if "sweep complete" in l:   # the most recent run already concluded → not stuck
             return False
         mm = STUCK_INFLIGHT_RE.search(l)
         if mm:
             vm = mm
+            rm = STUCK_RUN_ID_RE.search(l)
+            run_id = rm.group(1) if rm else None
             break
     if not vm:
         return False
     got, elapsed = int(vm.group(1)), int(vm.group(2))
     if not (got == 0 and elapsed > DISPATCH_STUCK_SEC):
         return False
-    # corroborate: reviewers spawned for this run are NOT active (dead/start-pending)
+    # corroborate #1: reviewers spawned for this run are NOT active (dead/start-pending)
     rs = sh(["gc", "session", "list", "--json"])
     try:
         sessions = json.loads(rs.stdout).get("sessions", []) if rs else []
     except Exception:
         return False
     active = [s for s in sessions if s.get("template") == "gate-reviewer" and s.get("state") == "active"]
-    return len(active) == 0
+    if active:
+        return False
+    # corroborate #2 (ga-rzd08j): a reviewer already DELIVERED (closed verdict bead) for
+    # THIS run — not a spawn failure, just an un-harvested verdict. Any failure resolving
+    # this (no run_id parsed, bd/Dolt unreachable) falls through to the pre-existing
+    # "no active reviewer" verdict below — never widens the window this detector closes.
+    if run_id:
+        try:
+            _names, delivered, _total, _last = _run_verdicts(run_id)
+        except Exception:
+            delivered = -1
+        if delivered > 0:
+            return False
+    return True
 
 
 def gate_infra_throttled():
