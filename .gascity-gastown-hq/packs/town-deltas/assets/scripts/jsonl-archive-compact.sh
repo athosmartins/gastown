@@ -58,7 +58,29 @@
 # Nothing here ever shortens history: no prune of reachable objects, no shallow, no squash.
 # `git gc` keeps its own 2-week expiry for unreachable objects. The S3 mirror
 # (dolt-s3-backup.sh) copies only the working tree (`--exclude ".git/*"`), so the git history
-# has NO offsite copy — compaction is the only thing this script may do to it.
+# has NO offsite copy — compaction is the only thing this script may do to it. Inside an archive
+# repo the ONE thing it ever deletes is the temp file (tmp_*) that one of its OWN killed or failed
+# steps left behind — never anything that was there before the step, never anything a process has
+# open (see LEAKS). (Outside the repos it removes only its own lock, its state temp file and the old
+# half of its log.)
+#
+# LEAKS (gate ga-obhsaf): a step killed mid-write — the run deadline or the step's own cap (SIGTERM from `timeout`), pack-objects out of space, the OOM
+# killer — leaves the temp file of the pack it was writing: objects/pack/tmp_pack_*, partial and read-only. Measured on this host's git 2026-09-27: a killed
+# `maintenance run` leaves it (11.9MB of a 12MB blob in the test, 153MiB in the reviewer's), a killed `gc` leaves it too; git's own prune keeps it two weeks. On the
+# filesystem this script exists to protect, that is one batch pack per cut, and in a big drain every run ends with a cut batch. Three rules, one place each:
+#   1. Every git step goes through run_step (selftest S34 pins it: git_arch is called from there only, the $GITBIN seam is used nowhere but in git_arch, the only git run
+#      bare on the repo is the read-only count-objects of measure(), and the set of steps is pinned). It lists the temp files
+#      before the step; after a step that did NOT end 0, the ones that APPEARED during it are that step's leak, and reclaim_leak removes them — only if lsof
+#      positively says no process has any of them open. An lsof that says one is open, no lsof, an lsof that is cut or fails or answers in any way but a clean "nothing
+#      open" (files_in_use lists them): the files are KEPT and the log says why. Under doubt the inert state is "do not delete". A list that cannot be read after a step
+#      that did not end 0 means the leak is UNKNOWN: nothing is removed and the run is BAD (R_LEAK_UNKNOWN) — not knowing is not the same as nothing left.
+#   2. What is kept, or was left by a step that ended 0, is not hidden: garbage (git count-objects: garbage files and size-garbage) is measured at the start and the end of
+#      every run that can be measured, printed in the status line, recorded in the state (informational: nothing reads it back), and a run that ENDS with more garbage
+#      FILES than it started with is BAD whatever its status: a cut that leaked is not a clean cut (is_bad, R_GARBAGE_GREW). Files, not bytes: a leak is always a new
+#      file, and a garbage file that was already there growing is somebody else's live writer.
+#   3. Not covered, on purpose: a run SIGKILLed as a whole (the order's own 900s timeout, the OOM killer, a reboot) cannot reclaim anything — its leak is garbage already
+#      on disk at the next run's start, visible in `garbage=` and pruned by git after two weeks; the script's own 780s deadline is what keeps that case rare. Older
+#      garbage is never touched: it is not known to be this script's.
 #
 # THREE STATES, NEVER TWO: a repo whose objects cannot be measured is `unmeasured` (failure),
 # not "0 loose". git is always called with --git-dir=<repo>/.git: without it a broken .git
@@ -69,6 +91,7 @@
 # shrunk it — smaller than at the run's start AND smaller than where the PREVIOUS run left it (state
 # loose_kib; unknown = the run's own before/after alone), because a backlog emptied more slowly than
 # it refills shrinks a little every run and still grows — or >= JAC_PACKS_ALARM packs, or the run
+# ended with more git garbage files than it started with (LEAKS, rule 2), or the run
 # failed / could not measure / was skipped for low disk / stalled / timed out at the minimum
 # batch size or at gc's own cap. After
 # JAC_ALERT_AFTER (3) consecutive BAD runs of a repo one mail goes to the mayor, at most one per repo per
@@ -124,6 +147,8 @@
 # `# benign[<key>]: <why a failure here cannot hide one that matters>`, and the selftest pins the set of
 # keys. Adding or removing one fails the selftest until someone has read the site and updated the pin:
 # four gate rounds each found one more discard that "the class sweep" had missed.
+# STRUCTURE (selftest S34): every place that RUNS a git step goes through run_step (LEAKS, rule 1), no git that writes runs any other way, and the set of steps is pinned the same way —
+# the gate reported the leak for the batch, and measured on this host's git the gc leaks the same way; a fourth step is one more thing that can be killed mid-write.
 #
 # TEST: bash packs/town-deltas/assets/scripts/jsonl-archive-compact.selftest.sh
 set -uo pipefail
@@ -151,12 +176,19 @@ MIN_BATCH_S="${JAC_MIN_BATCH_S:-30}"                 # do not START a batch with
 MIN_GC_BUDGET_S="${JAC_MIN_GC_BUDGET_S:-240}"        # do not START a gc with less than this left
 PRUNE_TIMEOUT_S="${JAC_PRUNE_TIMEOUT_S:-120}"        # per prune-packed after a batch
 PRUNE_MIN_S="${JAC_PRUNE_MIN_S:-15}"                 # prune-packed always gets at least this, so a batch that ends at the deadline can still prune
+# Leak accounting around every step (LEAKS in the header). The worst it can add PAST the deadline is 4 + 4 (the two temp-file lists) + 6 + 1 + 6 (two lsof
+# looks and the pause between them) = 21s. The 120s between JAC_DEADLINE_S (780) and the order's 900s kill must also fit the alarm mail of each repo (2 x 45s):
+# 780 + 21 + 90 = 891s, all caps hit at once — a limit no run is expected to touch, but it is the arithmetic, not a hope.
+LIST_TIMEOUT_S="${JAC_LIST_TIMEOUT_S:-4}"            # one listing of the object store's temp files (ms in practice)
+LSOF_TIMEOUT_S="${JAC_LSOF_TIMEOUT_S:-6}"            # one lsof look (measured 2-3.5s on this host under load 50)
+RECLAIM_WAIT_S="${JAC_RECLAIM_WAIT_S:-1}"            # between the two looks: the writer may be a step that is still dying
+LSOF="${JAC_LSOF:-}"                                 # test seam; empty = the first lsof on PATH, else /usr/sbin/lsof
 HEADROOM_KIB="${JAC_HEADROOM_KIB:-524288}"           # free space that must remain after the estimate
 ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
 ALERT_EVERY_S="${JAC_ALERT_EVERY_S:-21600}"
 MAIL_TIMEOUT_S="${JAC_MAIL_TIMEOUT_S:-45}"           # the alarm mail's OWN cap — not the run's remaining budget: a run that used its whole budget must still be able to page (2 sends at 780s + 45s each end before the order's 900s kill)
 LOCK_STALE_MIN="${JAC_LOCK_STALE_MIN:-90}"
-CHECK_FRESH_S="${JAC_CHECK_FRESH_S:-7200}"           # --check trusts the order's recorded verdict only if that run started within this many seconds (4 order intervals)
+CHECK_FRESH_S="${JAC_CHECK_FRESH_S:-7200}"           # --check trusts the order's recorded verdict only if that run ENDED within this many seconds (4 order intervals; the epoch is written after the run)
 LOCK="${JAC_LOCK:-$RUNTIME/jsonl-archive-compact.lock}"
 STATE="${JAC_STATE:-$RUNTIME/packs/town-deltas/jsonl-archive-compact-state.json}"
 LOG="${JAC_LOG:-$CITY/.gc/logs/jsonl-archive-compact.log}"
@@ -178,6 +210,7 @@ repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
+list_timeout_s=$LIST_TIMEOUT_S lsof_timeout_s=$LSOF_TIMEOUT_S reclaim_wait_s=$RECLAIM_WAIT_S
 alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S check_fresh_s=$CHECK_FRESH_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
@@ -244,20 +277,23 @@ mib() { echo $(( $1 / 1024 )); }
 # fmt <kib> — "<n>MiB", or "?" when git could not say (an unknown must never read as 0)
 fmt() { if is_uint "${1:-}"; then echo "$(( $1 / 1024 ))MiB"; else echo "?"; fi; }
 
-# measure — fills M_LOOSE_COUNT M_LOOSE_KIB M_PACKS M_PACK_KIB M_GARBAGE_KIB, or returns 1 when
+# measure — fills M_LOOSE_COUNT M_LOOSE_KIB M_PACKS M_PACK_KIB M_GARBAGE_COUNT M_GARBAGE_KIB, or returns 1 when
 # git cannot say (never a quiet zero). M_PRUNABLE (loose objects that are ALSO in a pack) is filled when git reports it and
 # is deliberately not required: only two rules read it — batch progress ("a new pack whose loose copies are all gone") and batch growth
 # ("a batch with at least a full batch of objects to pack") — and in both "unknown" means "not proven", never "fine".
+# Garbage (count-objects `garbage` files and `size-garbage`) is what a killed writer leaves: the count matters as much as the size, because a
+# tmp_pack killed before it wrote anything is a 0KiB file that still counts as garbage.
 measure() {
   local out k v
-  M_LOOSE_COUNT=""; M_LOOSE_KIB=""; M_PACKS=""; M_PACK_KIB=""; M_GARBAGE_KIB=""; M_PRUNABLE=""
-  out="$(git --git-dir="$R_GITDIR" count-objects -v 2>/dev/null)" || return 1
+  M_LOOSE_COUNT=""; M_LOOSE_KIB=""; M_PACKS=""; M_PACK_KIB=""; M_GARBAGE_COUNT=""; M_GARBAGE_KIB=""; M_PRUNABLE=""
+  out="$(git --git-dir="$R_GITDIR" count-objects -v 2>/dev/null)" || return 1      # the one git run outside run_step: it only reads (S34 pins that it is the only one)
   while IFS=': ' read -r k v; do
     case "$k" in
       count) M_LOOSE_COUNT="$v" ;;
       size) M_LOOSE_KIB="$v" ;;
       packs) M_PACKS="$v" ;;
       size-pack) M_PACK_KIB="$v" ;;
+      garbage) M_GARBAGE_COUNT="$v" ;;
       size-garbage) M_GARBAGE_KIB="$v" ;;
       prune-packable) M_PRUNABLE="$v" ;;
     esac
@@ -265,7 +301,100 @@ measure() {
 $out
 EOF
   is_uint "$M_LOOSE_COUNT" && is_uint "$M_LOOSE_KIB" && is_uint "$M_PACKS" \
-    && is_uint "$M_PACK_KIB" && is_uint "$M_GARBAGE_KIB"
+    && is_uint "$M_PACK_KIB" && is_uint "$M_GARBAGE_COUNT" && is_uint "$M_GARBAGE_KIB"
+}
+
+# list_tmp — every temp file git may have left in the object store (objects/pack/tmp_pack_*, objects/??/tmp_obj_*), one path per line, sorted. A listing that
+# FAILS — find erroring, or cut at its cap — is a non-zero return (pipefail), never an empty list: "could not list" must not read as "nothing left".
+list_tmp() {
+  [ -d "$R_GITDIR/objects" ] || return 1
+  _bounded "$LIST_TIMEOUT_S" find "$R_GITDIR/objects" -maxdepth 2 -type f -name 'tmp_*' 2>/dev/null | sort
+}
+
+# files_in_use <file...> — 0 = no process has any of them open (a TRUSTED answer); 1 = at least one is open; 2 = cannot tell. lsof's exit status alone says nothing here — it
+# exits 1 both when nothing is open and when only SOME of the named files are — so the answer is read from what it prints too: with `-F n` a file in use produces
+# `p<pid>` `f<fd>` `n<path>` lines, and a clean "none" produces NOTHING. So 0 is exactly "exit 1 and no output at all"; an n-line among lsof's field lines (exit 0 or 1) is 1 and
+# keeps ALL the files, whichever it names (attributing a hit means comparing paths, and /tmp vs /private/tmp is one symlink from "not the same file" = "not open");
+# everything else is 2: no lsof, cut at its cap, an exit status above 1, exit 0 with no hit, output that is not field lines (a message), field lines with no file name.
+files_in_use() {
+  local bin="$LSOF" out rc line hit=0
+  [ -n "$bin" ] || bin="$(command -v lsof 2>/dev/null)"
+  [ -n "$bin" ] || { [ -x /usr/sbin/lsof ] && bin=/usr/sbin/lsof; }
+  [ -n "$bin" ] && [ -x "$bin" ] || return 2
+  out="$(_bounded "$LSOF_TIMEOUT_S" "$bin" -w -F n -- "$@" 2>&1)"; rc=$?
+  [ "$rc" -le 1 ] || return 2
+  if [ -z "$out" ]; then
+    [ "$rc" -eq 1 ] && return 0
+    return 2
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "") ;;
+      p*|f*) ;;
+      n*) hit=1 ;;
+      *) return 2 ;;
+    esac
+  done <<EOF
+$out
+EOF
+  if [ "$hit" -eq 1 ]; then return 1; fi
+  return 2
+}
+
+# reclaim_leak <before-list-failed 0|1> <before-list> <what> — after a step that did NOT end 0 (STEP_RC): remove the temp files that APPEARED during it, if nobody has them open.
+# Narrow on purpose (LEAKS in the header): only tmp_* (git's own temp prefix, which its prune removes after two weeks anyway), only what was not there before the step
+# (older ones are not this step's to remove), only when files_in_use positively says 0. Every other answer keeps the files, says so in the log, and leaves the leak to the
+# run's garbage measurement (grew = BAD). Never returns non-zero: what it did not remove is the measurement's to report, not this function's to fail on.
+reclaim_leak() {
+  local before_failed="$1" before="$2" what="$3" after f nl=$'\n' n=0 kib=0 sz look gone=0 err size_txt
+  local -a files
+  if [ "$before_failed" -ne 0 ] || ! after="$(list_tmp)"; then
+    R_LEAK_UNKNOWN=1
+    log "  step '$what' ended rc=$STEP_RC and the temp files of the object store could not be listed — what it left is UNKNOWN, nothing was removed, and the run counts as BAD: not knowing is not the same as nothing left"
+    return 0
+  fi
+  files=()
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$nl$before$nl" in *"$nl$f$nl"*) continue ;; esac      # it was there before the step: not this step's
+    files+=("$f")
+    sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; is_uint "$sz" && kib=$(( kib + (sz + 1023) / 1024 ))      # the size is for the log line only
+  done <<EOF
+$after
+EOF
+  n="${#files[@]}"
+  if [ "$n" -eq 0 ]; then return 0; fi      # nothing new appeared during the step: it left nothing to reclaim
+  if [ "$kib" -ge 1024 ]; then size_txt="$(fmt "$kib")"; else size_txt="${kib}KiB"; fi
+  files_in_use "${files[@]}"; look=$?
+  if [ "$look" -eq 1 ]; then
+    sleep "$RECLAIM_WAIT_S"      # the writer may be a step that is still dying: one more look
+    files_in_use "${files[@]}"; look=$?
+  fi
+  case "$look" in
+    0) ;;
+    1) log "  step '$what' ended rc=$STEP_RC and left $n temp file(s) ($size_txt); still open by a process (lsof), also at a second look — kept: not this run's to remove (the run's garbage growth counts)"
+       return 0 ;;
+    *) log "  step '$what' ended rc=$STEP_RC and left $n temp file(s) ($size_txt); cannot tell whether they are open (no lsof, lsof cut at its ${LSOF_TIMEOUT_S}s cap, failed, or printed a message) — kept (the run's garbage growth counts)"
+       return 0 ;;
+  esac
+  for f in "${files[@]}"; do
+    if err="$(rm -f -- "$f" 2>&1)"; then gone=$((gone + 1)); else log "  could not remove $f: ${err:-no output}"; fi      # rm -f exits non-zero when it cannot remove the file
+  done
+  log "  step '$what' ended rc=$STEP_RC and left $n temp file(s) ($size_txt): removed $gone of $n — none was there before the step and no process had them open (lsof)"
+  return 0
+}
+
+STEP_OUT=""; STEP_RC=0
+# run_step <cap_s> <git args...> — THE way this script runs a git step that writes to the repo (a batch, prune-packed, gc); sets STEP_OUT (its output) and STEP_RC (its exit
+# status) and never fails itself. Lists the temp files before the step; after a step that did NOT end 0, whatever appeared during it is its leak (reclaim_leak). A step
+# that ended 0 is not suspected — but a leak it left anyway is still MEASURED at the end of the run (garbage growth, is_bad). Selftest S34 pins that every step goes through here.
+run_step() {
+  local cap="$1" before before_failed=0
+  shift
+  before="$(list_tmp)" || before_failed=1
+  STEP_OUT="$(git_arch "$cap" "$@" 2>&1)"; STEP_RC=$?
+  if [ "$STEP_RC" -ne 0 ]; then reclaim_leak "$before_failed" "$before" "$*"; fi
+  return 0
 }
 
 free_kib() {  # free KiB on the filesystem holding the repo; JAC_FREE_KIB is the test seam
@@ -339,12 +468,14 @@ is_bad() {
   bad_status "$1" && return 0
   [ "$M_LOOSE_KIB" -ge "$LOOSE_ALARM_KIB" ] 2>/dev/null && [ "${R_PROGRESS:-0}" != 1 ] && return 0
   [ "$M_PACKS" -ge "$PACKS_ALARM" ] 2>/dev/null && return 0
+  [ "${R_GARBAGE_GREW:-0}" = 1 ] && return 0      # the run ended with more git garbage FILES than it started with, whatever its status (LEAKS, rule 2)
+  [ "${R_LEAK_UNKNOWN:-0}" = 1 ] && return 0      # a step ended non-zero and what it left could not even be listed: unknown is not "nothing" (LEAKS, rule 1)
   return 1
 }
 
 # check_draining <repo> — sets R_PROGRESS (and R_VERDICT, the words for the log). `--check` has ONE measurement and no run start, so it cannot see a
 # backlog shrinking; the ORDER can, and records its verdict in the state. Over the loose alarm size is excused (R_PROGRESS=1) only by a verdict that is
-# FRESH (that run started <= CHECK_FRESH_S ago), ended with a status that is not a failure, at bad_streak 0 (its own alarm rule found the end state
+# FRESH (that run ENDED <= CHECK_FRESH_S ago: last_run_epoch is written by record(), after the run), ended with a status that is not a failure, at bad_streak 0 (its own alarm rule found the end state
 # acceptable — a backlog it is draining), and the backlog has not grown by more than one trigger (LOOSE_LIMIT_KIB) since it ended. A verdict that
 # is missing, stale, unreadable or of the wrong shape excuses NOTHING: the direction of every doubt here is "BAD", never "fine".
 # (The early returns below leave R_PROGRESS=0 — the strict answer — so they are not discards of a failure; they are the failure's own answer.)
@@ -372,11 +503,12 @@ repo:    $1
 status:  $2 (bad for $3 consecutive runs, every ~30m)
 loose:   $(fmt "$M_LOOSE_KIB") in ${M_LOOSE_COUNT:-?} objects (limit $(fmt "$LOOSE_LIMIT_KIB"), alarm $(fmt "$LOOSE_ALARM_KIB"))
 packs:   ${M_PACKS:-?} (limit $PACKS_LIMIT, alarm $PACKS_ALARM), packed $(fmt "$M_PACK_KIB")
+garbage: ${M_GARBAGE_COUNT:-?} file(s), $(fmt "$M_GARBAGE_KIB") — temp files (tmp_*) that killed or failed git steps leave in objects/; this run started with ${R_GARBAGE_BEFORE:-?}$([ "${R_GARBAGE_GREW:-0}" = 1 ] && echo " — the file count GREW, and that is why this run counts as bad")$([ "${R_LEAK_UNKNOWN:-0}" = 1 ] && echo " — a step ended non-zero and the temp files it may have left could not be listed (leak UNKNOWN: also why this run counts as bad)")
 .git:    $(fmt "$G_KIB")
 log:     $LOG
 state:   $STATE
 Why it matters: without compaction this repo grows ~5GiB/day of loose hq.jsonl copies (ga-a3ar7h).
-Nothing was deleted. Check: bash $0 --check ; then the last lines of the log.
+No history was deleted or shortened (the only files this script removes are temp files its own killed steps left; the log says which). Check: bash $0 --check ; then the last lines of the log.
 If the log says gc timed out at its OWN cap (${GC_TIMEOUT_S}s), the repo is too big for one gc: run it by
 hand, without a timeout, at low priority:  nice -n 10 git --git-dir=$1/.git gc   (26/09: 36 min for a 6GB backlog)."
   out="$(_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor/ -s "ESCALATION: jsonl-archive compaction failing [HIGH]" -m "$body" 2>&1)"; rc=$?
@@ -394,8 +526,9 @@ write_state() {
   local repo="$1" state="$2" status="$3" streak="$4" last="$5" now="$6" new jrc
   new="$(jq --arg r "$repo" --arg st "$status" --argjson streak "$streak" --argjson last "$last" --argjson now "$now" \
         --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" \
+        --arg gf "$M_GARBAGE_COUNT" --arg gk "$M_GARBAGE_KIB" \
         'def n($x): (try ($x | tonumber) catch null);
-         .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), bad_streak:$streak, last_alert_epoch:$last})
+         .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), garbage_files:n($gf), garbage_kib:n($gk), bad_streak:$streak, last_alert_epoch:$last})
          | if n($bo) != null then .[$r].batch_objects = n($bo) else . end' <<<"$state" 2>&1)"; jrc=$?
   if [ "$jrc" -ne 0 ] || ! jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1; then
     log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
@@ -457,9 +590,9 @@ BAD_ANY=0
 EXISTING=0
 
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
-  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over
+  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over before_gcount before_gkib
   R_GITDIR="$repo/.git"
-  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""
+  STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""; R_GARBAGE_GREW=0; R_GARBAGE_BEFORE=""; R_LEAK_UNKNOWN=0
   t0="$(date +%s)"
   load_state "$repo"
   saved="$(jq -r --arg r "$repo" '.[$r].batch_objects // empty' <<<"$STATE_JSON" 2>/dev/null)"
@@ -474,6 +607,7 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
     return
   fi
   before_loose="$M_LOOSE_KIB"; before_packs="$M_PACKS"; before_kib="$M_PACK_KIB"
+  before_gcount="$M_GARBAGE_COUNT"; before_gkib="$M_GARBAGE_KIB"; R_GARBAGE_BEFORE="${before_gcount} file(s), $(fmt "$before_gkib")"
 
   if [ "$MODE" = check ]; then
     G_KIB="$(gitdir_kib)"
@@ -481,7 +615,7 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
     if [ "$M_LOOSE_KIB" -ge "$LOOSE_ALARM_KIB" ]; then check_draining "$repo"; fi
     # the exit code alone (3) is not enough for someone reading the line: it must not look like a healthy one
     over=""; if is_bad ok; then over=" — OVER THE ALARM SIZE (loose >= $(fmt "$LOOSE_ALARM_KIB") or packs >= $PACKS_ALARM) and nothing excuses it: --check exits 3"; fi
-    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")${R_VERDICT:+ — over the alarm size but $R_VERDICT}$over"
+    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=${M_GARBAGE_COUNT}f/$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")${R_VERDICT:+ — over the alarm size but $R_VERDICT}$over"
     return
   fi
 
@@ -503,7 +637,7 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
         # big, a kill at the second is the budget ending (equal = the batch's own cap)
         budget_for "$GIT_TIMEOUT_S"; batch_left="$t_left"     # t_left is reused for the prune below; "fast" is judged against THIS
         b0="$(date +%s)"
-        out="$(git_arch "$t_left" maintenance run --task=loose-objects --quiet 2>&1)"; rc=$?
+        run_step "$t_left" maintenance run --task=loose-objects --quiet; out="$STEP_OUT"; rc="$STEP_RC"
         took=$(( $(date +%s) - b0 ))
         batches=$((batches + 1))
         if [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
@@ -528,7 +662,7 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
         # not a failure of prune-packed — it is idempotent, and the loose copies it did not remove stay on disk (counted as loose,
         # so bounded by the loose limit) until a later batch or a consolidating gc prunes them; only its OWN cap running out is one.
         budget_for "$PRUNE_TIMEOUT_S" "$PRUNE_MIN_S"
-        out="$(git_arch "$t_left" prune-packed --quiet 2>&1)"; rc=$?
+        run_step "$t_left" prune-packed --quiet; out="$STEP_OUT"; rc="$STEP_RC"
         if [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
           STATUS="deferred"; fast=0
           log "  prune-packed after batch $batches was cut by the run deadline after ${t_left}s — the budget ended, not a failure of prune-packed (the loose copies of what the batch packed stay on disk until a later batch or gc prunes them; nothing is lost)"
@@ -585,10 +719,10 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       # the same rule as a batch: a kill at gc's OWN cap says the repo is too big for one gc; a kill at the end of the RUN's budget
       # says nothing about gc (the run that crosses PACKS_LIMIT is one whose tier 1 just spent part of the budget)
       budget_for "$GC_TIMEOUT_S"
-      out="$(git_arch "$t_left" -c gc.autoDetach=false gc --quiet 2>&1)"; rc=$?
+      run_step "$t_left" -c gc.autoDetach=false gc --quiet; out="$STEP_OUT"; rc="$STEP_RC"
       if [ "$rc" -eq 0 ]; then STATUS="consolidated"
       elif [ "$rc" -eq 124 ] && [ "$by_deadline" -eq 1 ]; then
-        # it did NOTHING useful (a killed gc keeps no work): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
+        # it did NOTHING useful (a killed gc keeps no packed work — and leaves a tmp_pack, which run_step has just reclaimed or the garbage measurement will report): it cannot turn a failed / stalled / timed-out / skipped tier 1 green
         bad_status "$STATUS" || STATUS="deferred"
         log "  gc was cut by the run deadline after ${t_left}s — the budget ended, not evidence the repo is too big for one gc (retried next run)"
       elif [ "$rc" -eq 124 ]; then STATUS="timeout"; log "  gc timed out after ${t_left}s (its own cap)"
@@ -610,8 +744,17 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
       log "  loose shrank this run ($(fmt "$before_loose") -> $(fmt "$M_LOOSE_KIB")) but is not below where the previous run left it ($(fmt "$prev_loose")) — the backlog is not draining, only refilling as fast as it is emptied"
     fi
   fi
+  # garbage: what run_step reclaimed is gone. A garbage FILE the run ends with that it did not start with — a temp file that was kept (in use, or not provably unused), one a
+  # step that ended 0 left behind, or one that reclaim_leak could not even look for because the object store could not be listed — is a leak nothing reclaimed, and BAD
+  # whatever the status: a cut that leaked is not a clean cut. Files, not bytes: a leak is a NEW file (git gives every temp file a fresh random name; a tmp_pack killed before
+  # it wrote a byte is a 0KiB file that still counts), while bytes growing in a garbage file that was already there are somebody else's live writer, not this run's leak.
+  # An unmeasured end (status unmeasured, already BAD) leaves R_GARBAGE_GREW at 0.
+  if is_uint "$M_GARBAGE_COUNT" && is_uint "$before_gcount" && [ "$M_GARBAGE_COUNT" -gt "$before_gcount" ]; then
+    R_GARBAGE_GREW=1
+    log "  garbage grew this run ($R_GARBAGE_BEFORE -> $M_GARBAGE_COUNT file(s), $(fmt "$M_GARBAGE_KIB")): a temp file a killed or failed step left that nothing reclaimed — BAD whatever the status"
+  fi
   G_KIB="$(gitdir_kib)"
-  log "repo=$repo status=$STATUS loose=$(fmt "$before_loose")->$(fmt "$M_LOOSE_KIB") packs=${before_packs}->${M_PACKS:-?} packed=$(fmt "$before_kib")->$(fmt "$M_PACK_KIB") .git=$(fmt "$G_KIB") batches=$batches batch=${R_BATCH} elapsed=$(( $(date +%s) - t0 ))s"
+  log "repo=$repo status=$STATUS loose=$(fmt "$before_loose")->$(fmt "$M_LOOSE_KIB") packs=${before_packs}->${M_PACKS:-?} packed=$(fmt "$before_kib")->$(fmt "$M_PACK_KIB") garbage=${before_gcount}f/$(fmt "$before_gkib")->${M_GARBAGE_COUNT:-?}f/$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB") batches=$batches batch=${R_BATCH} elapsed=$(( $(date +%s) - t0 ))s"
 }
 
 # ── single-flight (check mode is read-only and skips it) ──
@@ -669,7 +812,7 @@ take_lock() {  # returns 0 holding the lock; every other outcome EXITS, as above
     if [ "$st" -eq 1 ]; then
       log "another compaction run is in flight — exit (single-flight)"; exit 0   # benign[lock-inflight]: the lock directory of another run exists and is neither stale nor unreadable — the one reason to leave without compacting and without a failure
     elif [ "$st" -ne 0 ]; then
-      log "cannot tell whether the lock $LOCK is stale (its age could not be read) — NOT compacting: a live run and a stale lock look the same from here"
+      log "cannot tell whether the lock $LOCK is stale (its age could not be read — or its holder released it just now) — NOT compacting: a live run and a stale lock look the same from here; the next run decides"
       exit 1
     fi
     log "stale lock (owner gone, or older than ${LOCK_STALE_MIN}m) — reclaiming"

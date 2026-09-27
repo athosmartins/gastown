@@ -127,6 +127,7 @@ run_jac() {
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
   JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
+  JAC_LSOF="${T_LSOF:-}" JAC_RECLAIM_WAIT_S="${T_RECLAIM_WAIT:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -1008,6 +1009,298 @@ RE="$WORK/remexact"; mkrepo "$RE" 20; rm -f "$WORK/state.json" "$WORK/git-fullba
 out="$(run_full 0 "$RE" 60)"; rc=$?
 { [ "$(loose_count "$RE")" = 0 ] && [ "$(wc -l < "$WORK/git-fullbatches" | tr -d ' ')" = 1 ] && [ "$(awk '{print $1}' "$WORK/git-fullbatches")" = 60 ]; } || bad "S31 (d) fixture: want ONE batch that started with exactly 60 unpacked objects (batches: $(tr '\n' ';' < "$WORK/git-fullbatches") loose=$(loose_count "$RE"))"
 [ "$rc" -eq 0 ] && [ "$(state_field "$RE" batch_objects)" = 120 ] && ok "(d) a batch of exactly the batch size (60 of 60) is a full batch: fast → the size doubles once (60 -> 120)" || bad "(d) boundary wrong (rc=$rc batch_objects=$(state_field "$RE" batch_objects), want 120): $out"
+
+echo ""
+echo "=== S32: a step killed mid-WRITE leaves a temp file — the run reclaims it, and a cut with a leak is not a clean cut ==="
+# Gate ga-obhsaf: a batch cut by the run deadline (or by its own cap) left a partial objects/pack/tmp_pack_* on disk while the run reported a green
+# `deferred` — +153MiB on a repo this script exists to shrink, on a filesystem at its floor, with exit 0 and streak 0. measure() read size-garbage and
+# only printed it. Every timeout test before this one killed a `sleep` in front of git (git-slow, git-fx: the sleep runs BEFORE git), and a killed sleep
+# leaves nothing. This section kills the REAL pack-objects: git-killwrite runs the real git and, once its pack-objects has written >= 1MB into its
+# tmp_pack_*, SIGTERMs the whole git process tree (what `timeout` does) and exits 124 like `timeout`. Measured on this host's git: a killed `maintenance
+# run` AND a killed `gc` both leave the tmp_pack_* (read-only, partial). If a git of another vintage cleans up after itself, or the write never gets
+# that far, the test SKIPs — it never passes without having exercised the leak.
+cat > "$WORK/git-killwrite" <<'EOF'
+#!/bin/bash
+# git-killwrite: plain git, except the FIRST invocation of the step named by $KW_STEP (maintenance | gc | prune-packed) is killed the way `timeout` kills a step
+# — SIGTERM to the whole git process tree — once the REAL pack-objects has written >= $KW_MIN_BYTES into its tmp_pack_*; then it exits $KW_EXIT (124 = what
+# `timeout` returns). $KW_MARK (created at the kill) makes every later call plain git, so a retry runs normally. $KW_LOG gets one line per decision.
+gd=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#--git-dir=}" ;; esac; done
+case "${KW_STEP:-maintenance}" in
+  maintenance)  pat=" maintenance run " ;;
+  gc)           pat=" gc " ;;
+  prune-packed) pat=" prune-packed " ;;
+esac
+case " $* " in *"$pat"*) ;; *) exec git "$@" ;; esac
+[ -e "${KW_MARK:?}" ] && exec git "$@"
+descendants() {  # the pid and every descendant, read from ps — never a pkill by name: this host runs other people's git all day
+  ps -axo pid=,ppid= | awk -v root="$1" '{ p[$1] = $2 } END { print root; for (again = 1; again;) { again = 0; for (c in p) if (!(c in seen) && (p[c] == root || (p[c] in seen))) { seen[c] = 1; print c; again = 1 } } }'
+}
+git "$@" &
+top=$!
+while kill -0 "$top" 2>/dev/null; do
+  big="$(find "$gd/objects/pack" -maxdepth 1 -name 'tmp_pack_*' -size +"${KW_MIN_BYTES:-1000000}"c 2>/dev/null | head -n 1)"
+  if [ -n "$big" ]; then
+    : > "$KW_MARK"
+    sz="$(wc -c < "$big" | tr -d ' ')"
+    for p in $(descendants "$top"); do kill -TERM "$p" 2>/dev/null; done
+    wait "$top" 2>/dev/null
+    sleep 0.3
+    echo "killed ${KW_STEP:-maintenance} at $sz bytes of ${big##*/}; on disk after the kill: $(ls "$gd/objects/pack" | grep -c '^tmp_pack_') tmp_pack file(s)" >> "${KW_LOG:?}"
+    exit "${KW_EXIT:-124}"
+  fi
+  sleep 0.01
+done
+wait "$top"; rc=$?
+echo "finished-before-kill (${KW_STEP:-maintenance}, rc=$rc): the write never reached ${KW_MIN_BYTES:-1000000} bytes while git ran" >> "${KW_LOG:?}"
+exit "$rc"
+EOF
+chmod +x "$WORK/git-killwrite"
+# mkbig <dir> <commits> <MB>: N commits of one INCOMPRESSIBLE file — pack-objects needs a while to write it, so a step can be killed while it writes
+mkbig() {
+  local d="$1" n="$2" mb="$3" i
+  git init -q "$d"
+  for i in $(seq 1 "$n"); do
+    head -c $(( mb * 1000000 )) /dev/urandom > "$d/hq.jsonl"
+    git -C "$d" add hq.jsonl && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m "big $i"
+  done
+}
+# mkbigpacked <dir>: 4 big commits frozen into ONE pack + 1 loose big commit on top — what a gc has something to rewrite for
+mkbigpacked() {
+  local d="$1"; mkbig "$d" 4 12
+  git --git-dir="$d/.git" rev-list --objects --all | git --git-dir="$d/.git" pack-objects -q "$d/.git/objects/pack/pack" >/dev/null; git --git-dir="$d/.git" prune-packed -q
+  head -c 12000000 /dev/urandom > "$d/hq.jsonl"; git -C "$d" add hq.jsonl && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m "big loose"
+}
+tmp_files()  { find "$1/.git/objects" -maxdepth 2 -type f -name 'tmp_*' 2>/dev/null | wc -l | tr -d ' '; }
+garbage_of() { git --git-dir="$1/.git" count-objects -v 2>/dev/null | awk '/^garbage:/{print $2}'; }
+have_lsof()  { command -v lsof >/dev/null 2>&1 || [ -x /usr/sbin/lsof ]; }
+# kw <step> <exit> <repo> — one run of the script over the real-kill wrapper (tuning: T_* prefix assignments on the call); fresh mark/log/state each time.
+# Sets KW_OUT and KW_RC.
+kw() {
+  local step="$1" ex="$2" repo="$3"
+  rm -f "$WORK/state.json" "$WORK/log" "$WORK/kw.mark" "$WORK/kw.log"
+  KW_OUT="$(KW_STEP="$step" KW_EXIT="$ex" KW_MARK="$WORK/kw.mark" KW_LOG="$WORK/kw.log" T_GIT="$WORK/git-killwrite" run_jac "$repo")"; KW_RC=$?
+}
+# kw_leaked — 0 when the wrapper really killed a step mid-write AND the kill left a tmp_pack (the precondition of every check below); else prints why not
+kw_leaked() {
+  grep -q '^killed ' "$WORK/kw.log" 2>/dev/null || { echo "the real write never reached 1MB while git ran: $(cat "$WORK/kw.log" 2>/dev/null)"; return 1; }
+  grep -q 'after the kill: [1-9]' "$WORK/kw.log" || { echo "this git removed its own tmp_pack on SIGTERM — nothing to reclaim: $(cat "$WORK/kw.log")"; return 1; }
+  return 0
+}
+if ! have_lsof; then
+  skip "S32: no lsof on this host — the script cannot prove a temp file is unused, so it keeps it (S33 covers that); the real-kill reclaim checks did NOT run"
+else
+  # (a) a batch cut by the RUN DEADLINE while pack-objects writes (the reviewer's repro shape: it was exit 0 / deferred / streak 0 with +66% .git)
+  KB="$WORK/kb"; mkbig "$KB" 5 12; LKB="$(loose_count "$KB")"; HKB="$(history "$KB")"
+  T_DEADLINE=100 T_MIN_BATCH=1 T_GIT_TIMEOUT=300 T_BATCH=25 kw maintenance 124 "$KB"
+  if ! why="$(kw_leaked)"; then skip "S32 (a) $why"; else
+    { [ "$KW_RC" -eq 0 ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$KW_OUT" | grep -q 'cut by the run deadline'; } \
+      && ok "(a) batch killed mid-write by the run deadline → status deferred, exit 0 (the budget ended)" || bad "(a) deadline cut judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$KB")" = 0 ] && [ "$(garbage_of "$KB")" = 0 ]; } \
+      && ok "(a) ...and the tmp_pack it left is GONE (0 temp files, count-objects garbage 0): the leak was reclaimed, not left for git's 2-week prune" \
+      || bad "(a) leak left on disk: $(tmp_files "$KB") temp file(s), garbage=$(garbage_of "$KB")"
+    printf '%s' "$KW_OUT" | grep -q 'left 1 temp file' && printf '%s' "$KW_OUT" | grep -q 'removed' && ok "(a) the log says what the step left and that it was removed" || bad "(a) no reclaim line in the log: $KW_OUT"
+    [ "$(state_field "$KB" garbage_files)" = 0 ] && [ "$(state_field "$KB" garbage_kib)" = 0 ] && ok "(a) the state records the end garbage (0 files, 0KiB)" || bad "(a) state garbage_files=$(state_field "$KB" garbage_files) garbage_kib=$(state_field "$KB" garbage_kib)"
+    { [ "$(loose_count "$KB")" = "$LKB" ] && [ "$(history "$KB")" = "$HKB" ] && git --git-dir="$KB/.git" fsck --strict >/dev/null 2>&1; } && ok "(a) nothing that is history was touched: loose objects unchanged, same commit+tree ids, fsck clean" || bad "(a) the repo changed or is damaged"
+  fi
+  # (b) the batch's OWN cap (rc 124, not the deadline): halved and retried — the leak must be gone BEFORE the retry and after the drain
+  KB2="$WORK/kb2"; mkbig "$KB2" 5 12
+  T_DEADLINE=780 T_GIT_TIMEOUT=100 T_BATCH=25 kw maintenance 124 "$KB2"
+  if ! why="$(kw_leaked)"; then skip "S32 (b) $why"; else
+    { [ "$KW_RC" -eq 0 ] && [ "$(last_status)" = "packed-loose" ] && [ "$(loose_count "$KB2")" = 0 ]; } \
+      && ok "(b) batch killed mid-write at its OWN cap → halved, retried, drained (exit 0, packed-loose, no loose objects)" || bad "(b) drain after an own-cap kill wrong (rc=$KW_RC status=$(last_status) loose=$(loose_count "$KB2")): $KW_OUT"
+    { [ "$(tmp_files "$KB2")" = 0 ] && [ "$(garbage_of "$KB2")" = 0 ]; } && ok "(b) no temp file and garbage 0 after the drain" || bad "(b) leak left: $(tmp_files "$KB2") temp file(s), garbage=$(garbage_of "$KB2")"
+    rl="$(printf '%s' "$KW_OUT" | grep -n 'left 1 temp file' | head -n 1 | cut -d: -f1)"; rt="$(printf '%s' "$KW_OUT" | grep -n 'retrying with' | head -n 1 | cut -d: -f1)"
+    { [ -n "$rl" ] && [ -n "$rt" ] && [ "$rl" -lt "$rt" ]; } && ok "(b) the reclaim is logged BEFORE the retry starts (a retry never runs on top of the killed step's leak)" || bad "(b) reclaim/retry order wrong (reclaim line $rl, retry line $rt): $KW_OUT"
+    git --git-dir="$KB2/.git" fsck --strict >/dev/null 2>&1 && ok "(b) fsck clean" || bad "(b) fsck failed"
+  fi
+  # (c) a step that FAILED (pack-objects dying — out of space at the disk floor is the incident): the same leak, another exit code
+  KB3="$WORK/kb3"; mkbig "$KB3" 5 12
+  T_DEADLINE=780 T_GIT_TIMEOUT=300 T_BATCH=25 kw maintenance 1 "$KB3"
+  if ! why="$(kw_leaked)"; then skip "S32 (c) $why"; else
+    { [ "$KW_RC" -eq 1 ] && [ "$(last_status)" = "failed" ]; } && ok "(c) a batch that died mid-write (rc 1) → status failed, exit 1" || bad "(c) failed batch judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$KB3")" = 0 ] && [ "$(garbage_of "$KB3")" = 0 ]; } && ok "(c) its temp file is reclaimed too — the rule is 'a step that did not end 0', not 'a step that timed out'" || bad "(c) leak left: $(tmp_files "$KB3") temp file(s), garbage=$(garbage_of "$KB3")"
+  fi
+  # (d) tier 2: a consolidating gc cut by the run deadline — the reviewer had not reproduced a leak from a killed gc; on this git it does leak
+  KG="$WORK/kg"; mkbigpacked "$KG"
+  T_LIMIT=100000000 T_PACKS=1 T_MIN_GC=1 T_DEADLINE=300 T_GC_TIMEOUT=600 kw gc 124 "$KG"
+  if ! why="$(kw_leaked)"; then skip "S32 (d) $why"; else
+    { [ "$KW_RC" -eq 0 ] && [ "$(last_status)" = "deferred" ] && printf '%s' "$KW_OUT" | grep -q 'gc was cut by the run deadline'; } \
+      && ok "(d) gc killed mid-write by the run deadline → deferred, exit 0" || bad "(d) deadline-cut gc judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$KG")" = 0 ] && [ "$(garbage_of "$KG")" = 0 ]; } && ok "(d) the killed gc's tmp_pack is reclaimed (a killed gc DOES leak on this git — the 'a killed gc keeps no work' comment was only half true)" || bad "(d) gc leak left: $(tmp_files "$KG") temp file(s), garbage=$(garbage_of "$KG")"
+    git --git-dir="$KG/.git" fsck --strict >/dev/null 2>&1 && ok "(d) fsck clean" || bad "(d) fsck failed"
+  fi
+  # (e) tier 2 at gc's OWN cap: timeout (BAD) — and still no leak
+  KG2="$WORK/kg2"; mkbigpacked "$KG2"
+  T_LIMIT=100000000 T_PACKS=1 T_MIN_GC=1 T_DEADLINE=780 T_GC_TIMEOUT=100 kw gc 124 "$KG2"
+  if ! why="$(kw_leaked)"; then skip "S32 (e) $why"; else
+    { [ "$KW_RC" -eq 1 ] && [ "$(last_status)" = "timeout" ]; } && ok "(e) gc killed at its OWN cap → status timeout, exit 1" || bad "(e) own-cap gc judged wrong (rc=$KW_RC status=$(last_status)): $KW_OUT"
+    { [ "$(tmp_files "$KG2")" = 0 ] && [ "$(garbage_of "$KG2")" = 0 ]; } && ok "(e) its temp file is reclaimed" || bad "(e) gc leak left: $(tmp_files "$KG2") temp file(s), garbage=$(garbage_of "$KG2")"
+  fi
+fi
+
+echo ""
+echo "=== S33: only what THIS step left, only what nobody has open — and a leak that stays is BAD, not green ==="
+# A stand-in for the step (git-leak) drops a temp file of a chosen size and exits like a cut step; lsof is stubbed to say what it can and cannot tell. What the
+# script may delete is the narrowest thing that is provably not history and provably not in use: a tmp_* file that APPEARED during a step that did not end 0,
+# with lsof printing nothing at all. Every other answer keeps the file, and the run then ends with more garbage than it started with: BAD.
+cat > "$WORK/git-leak" <<'EOF'
+#!/bin/bash
+# git-leak: the first `maintenance run` leaves $LK_KIB KiB in objects/pack/tmp_pack_LEAK<pid> and exits $LK_EXIT (default 124: cut). LK_AFTER=1 runs the real
+# step first and leaves the file behind AFTER it (a step that "succeeded" and still left a temp file). LK_CHMOD=1 makes objects/pack unreadable afterwards.
+# LK_GROW_OLD=1 leaves no new file: it appends $LK_KIB KiB to the EXISTING tmp_pack_OLD (a live writer of somebody else's, growing while the step runs).
+# LK_RODIR=1 makes objects/pack read-only afterwards (listable, but a file in it cannot be removed).
+gd=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#--git-dir=}" ;; esac; done
+case " $* " in *" maintenance run "*)
+  if [ ! -e "${LK_MARK:?}" ]; then
+    : > "$LK_MARK"
+    if [ -n "${LK_GROW_OLD:-}" ]; then
+      chmod 644 "$gd/objects/pack/tmp_pack_OLD"; head -c $(( ${LK_KIB:-64} * 1024 )) /dev/urandom >> "$gd/objects/pack/tmp_pack_OLD"; chmod 444 "$gd/objects/pack/tmp_pack_OLD"
+      exit "${LK_EXIT:-124}"
+    fi
+    rc=0; [ -n "${LK_AFTER:-}" ] && { git "$@"; rc=$?; }
+    head -c $(( ${LK_KIB:-64} * 1024 )) /dev/urandom > "$gd/objects/pack/tmp_pack_LEAK$$"; chmod 444 "$gd/objects/pack/tmp_pack_LEAK$$"
+    [ -n "${LK_CHMOD:-}" ] && chmod 000 "$gd/objects/pack"
+    [ -n "${LK_RODIR:-}" ] && chmod 555 "$gd/objects/pack"
+    [ -n "${LK_AFTER:-}" ] && exit "$rc"
+    exit "${LK_EXIT:-124}"
+  fi ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-leak"
+# lsof stubs. Real lsof exits 1 both when nothing is open and when only SOME of the named files are, so the script must read the OUTPUT, not the status.
+printf '#!/bin/bash\necho "$*" >> "%s"\nexit 1\n' "$WORK/lsof-calls" > "$WORK/lsof-none"                                                   # nothing open: no output, exit 1
+printf '#!/bin/bash\necho "$*" >> "%s"\nfor last; do :; done\nprintf "p4242\\nf9\\nn%%s\\n" "$last"\nexit 0\n' "$WORK/lsof-calls" > "$WORK/lsof-open"   # every file open by pid 4242
+printf '#!/bin/bash\necho "$*" >> "%s"\necho "lsof: WARNING: could not read the process table"\nexit 1\n' "$WORK/lsof-calls" > "$WORK/lsof-msg"             # a message is not an answer
+printf '#!/bin/bash\necho "$*" >> "%s"\nn="$(wc -l < "%s" | tr -d " ")"\n[ "$n" -le 1 ] && { for last; do :; done; printf "p4242\\nf9\\nn%%s\\n" "$last"; exit 0; }\nexit 1\n' "$WORK/lsof-calls" "$WORK/lsof-calls" > "$WORK/lsof-flaky"   # open on the first look, gone on the second
+printf '#!/bin/bash\necho "$*" >> "%s"\nprintf "p4242\\nf9\\n"\nexit 0\n' "$WORK/lsof-calls" > "$WORK/lsof-frame"                                                # field lines with no n-line: not a hit, not a clean "none"
+printf '#!/bin/bash\necho "$*" >> "%s"\nexit 0\n' "$WORK/lsof-calls" > "$WORK/lsof-zero"                                                                                   # exit 0 and nothing printed: lsof never does that
+chmod +x "$WORK/lsof-none" "$WORK/lsof-open" "$WORK/lsof-msg" "$WORK/lsof-flaky" "$WORK/lsof-frame" "$WORK/lsof-zero"
+# lk <lsof-stub> — a fresh 60-loose-object repo in $LK, one run over git-leak with that lsof; sets LK_OUT / LK_RC
+lk() {
+  local stub="$1"
+  LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20
+  rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls" "$WORK/gc-calls"
+  LK_OUT="$(LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$stub" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LK")"; LK_RC=$?
+}
+LKN=0
+# (a) nothing open, and an OLDER temp file that this step did not leave: the new one goes, the old one stays (it is not this step's to remove) and is not growth
+LKA="$WORK/lka"; mkrepo "$LKA" 20; head -c 32768 /dev/urandom > "$LKA/.git/objects/pack/tmp_pack_OLD"; chmod 444 "$LKA/.git/objects/pack/tmp_pack_OLD"
+rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls"
+LK_OUT="$(LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-none" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LKA")"; LK_RC=$?
+[ "$(ls "$LKA"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+  && ok "(a) nothing open: the temp file this step left is removed" || bad "(a) the step's own temp file is still there: $(ls "$LKA"/.git/objects/pack | tr '\n' ' ')"
+[ -e "$LKA/.git/objects/pack/tmp_pack_OLD" ] && ok "(a) an OLDER temp file (present before the step) is left alone — it is not this step's to remove" || bad "(a) a temp file that predates the step was deleted"
+{ [ "$LK_RC" -eq 0 ] && [ "$(last_status)" = "packed-loose" ]; } && ok "(a) exit 0, packed-loose: garbage did not grow (1 file before, 1 after), so it is not BAD" || bad "(a) judged wrong (rc=$LK_RC status=$(last_status)): $LK_OUT"
+printf '%s' "$LK_OUT" | grep -q 'garbage=1f/0MiB->1f/0MiB' && ok "(a) the status line carries garbage before->after (1 file, 0MiB -> 1 file, 0MiB)" || bad "(a) no garbage=… in the status line: $LK_OUT"
+[ "$(state_field "$LKA" garbage_files)" = 1 ] && ok "(a) state: garbage_files 1" || bad "(a) state garbage_files=$(state_field "$LKA" garbage_files)"
+# (a2) a leak of ZERO bytes (a tmp_pack killed before it wrote anything) that is kept still counts: garbage is judged by FILES
+LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls"
+LK_OUT="$(LK_KIB=0 LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-open" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LK")"; LK_RC=$?
+{ [ "$LK_RC" -eq 1 ] && [ "$(state_field "$LK" garbage_files)" = 1 ] && [ "$(state_field "$LK" garbage_kib)" = 0 ]; } \
+  && ok "(a2) a kept 0KiB leak: garbage_kib 0 but garbage_files 1 → the run is BAD (exit 1): the count, not the size, is what says a step leaked" || bad "(a2) a kept zero-size leak judged wrong (rc=$LK_RC files=$(state_field "$LK" garbage_files) kib=$(state_field "$LK" garbage_kib)): $LK_OUT"
+# (a3) the opposite: a garbage file that was ALREADY there and merely grows during the step is somebody else's live writer — no new file, not this run's leak, not BAD
+LKG="$WORK/lkg"; mkrepo "$LKG" 20; head -c 32768 /dev/urandom > "$LKG/.git/objects/pack/tmp_pack_OLD"; chmod 444 "$LKG/.git/objects/pack/tmp_pack_OLD"
+rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls"
+LK_OUT="$(LK_GROW_OLD=1 LK_KIB=256 LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-open" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LKG")"; LK_RC=$?
+{ [ "$LK_RC" -eq 0 ] && [ -e "$LKG/.git/objects/pack/tmp_pack_OLD" ] && [ "$(state_field "$LKG" garbage_files)" = 1 ] && [ "$(state_field "$LKG" garbage_kib)" -ge 256 ]; } \
+  && ok "(a3) an OLD garbage file that grew from 32KiB to $(state_field "$LKG" garbage_kib)KiB during the step: no new file → not this run's leak → exit 0, and it was not touched" || bad "(a3) a growing pre-existing garbage file judged wrong (rc=$LK_RC files=$(state_field "$LKG" garbage_files) kib=$(state_field "$LKG" garbage_kib)): $LK_OUT"
+# (b) lsof says the file is OPEN: kept (not ours to remove), and the run is BAD — it ends with more garbage than it started with
+lk "$WORK/lsof-open"
+{ [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ]; } && ok "(b) lsof says it is open → the file is kept" || bad "(b) an OPEN temp file was removed"
+{ [ "$LK_RC" -eq 1 ] && [ "$(state_field "$LK" bad_streak)" = 1 ]; } && ok "(b) the run is BAD (exit 1, bad_streak 1): garbage grew and nothing reclaimed it" || bad "(b) leaked-and-kept run judged wrong (rc=$LK_RC streak=$(state_field "$LK" bad_streak)): $LK_OUT"
+printf '%s' "$LK_OUT" | grep -q 'open by a process' && printf '%s' "$LK_OUT" | grep -q 'garbage grew' && ok "(b) the log names both: 'open by a process' and 'garbage grew'" || bad "(b) log does not explain the kept file / the growth: $LK_OUT"
+[ "$(wc -l < "$WORK/lsof-calls" | tr -d ' ')" = 2 ] && ok "(b) it looked twice (a dying writer needs a moment) and then gave up — bounded, not a wait loop" || bad "(b) lsof was called $(wc -l < "$WORK/lsof-calls" | tr -d ' ') times, want 2"
+# (c) lsof answers with a MESSAGE: that is not 'none open'
+lk "$WORK/lsof-msg"
+{ [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && [ "$LK_RC" -eq 1 ]; } && printf '%s' "$LK_OUT" | grep -q 'cannot tell whether' \
+  && ok "(c) lsof printed a message, not an answer → kept, BAD, and the log says 'cannot tell whether'" || bad "(c) an lsof message was read as 'nothing open' (rc=$LK_RC): $LK_OUT"
+for odd in frame zero; do
+  lk "$WORK/lsof-$odd"
+  { [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && [ "$LK_RC" -eq 1 ]; } && printf '%s' "$LK_OUT" | grep -q 'cannot tell whether' \
+    && ok "(c) lsof-$odd ($([ "$odd" = frame ] && echo 'field lines but no file name' || echo 'exit 0 and no output')) is not a clean 'none open' → kept, BAD, 'cannot tell whether' (a clean none is exactly: exit 1 and NO output)" \
+    || bad "(c) lsof-$odd was read as 'nothing open' (rc=$LK_RC): $LK_OUT"
+done
+# (d) no lsof at all
+lk "$WORK/no-such-lsof"
+{ [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && [ "$LK_RC" -eq 1 ]; } && printf '%s' "$LK_OUT" | grep -q 'cannot tell whether' \
+  && ok "(d) no lsof to ask → kept, BAD, 'cannot tell whether' (under doubt the inert state is: do not delete)" || bad "(d) a missing lsof was read as 'nothing open' (rc=$LK_RC): $LK_OUT"
+# (e) open on the first look, gone on the second (a dying writer): reclaimed after ONE more look
+lk "$WORK/lsof-flaky"
+{ [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && [ "$LK_RC" -eq 0 ] && [ "$(wc -l < "$WORK/lsof-calls" | tr -d ' ')" = 2 ]; } \
+  && ok "(e) open at the first look, gone at the second → removed (2 lsof calls), exit 0" || bad "(e) dying-writer case wrong (rc=$LK_RC lsof calls=$(wc -l < "$WORK/lsof-calls" | tr -d ' ')): $LK_OUT"
+# (f) the step "SUCCEEDED" (rc 0) and still left a temp file: nothing reclaims it (only a step that did not end 0 is suspected), but it is MEASURED, so it is BAD
+LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark"
+LK_OUT="$(LK_AFTER=1 LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-none" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LK")"; LK_RC=$?
+{ [ "$(last_status)" = "packed-loose" ] && [ "$LK_RC" -eq 1 ] && [ "$(state_field "$LK" bad_streak)" = 1 ]; } \
+  && ok "(f) a step that ended 0 but left a temp file: status packed-loose yet the RUN is BAD (exit 1) — garbage is judged on the measured end state, not on the step's exit code" \
+  || bad "(f) success-with-leak judged wrong (status=$(last_status) rc=$LK_RC streak=$(state_field "$LK" bad_streak)): $LK_OUT"
+# (g) the list of temp files cannot be read AFTER the step: the leak is UNKNOWN — said out loud, nothing deleted, lsof never asked, and the run is BAD (not knowing is not "nothing
+# left"). A deadline cut ends the run after this one step, so no retry step (whose own BEFORE-list would fail the same way) can stand in for the check.
+if [ "$(id -u)" -eq 0 ]; then skip "(g) running as root: chmod 000 does not make a directory unreadable for root, so the unreadable-object-store fixture did NOT run"
+else
+  LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls"
+  LK_OUT="$(LK_CHMOD=1 LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-none" T_RECLAIM_WAIT=0 T_DEADLINE=100 T_MIN_BATCH=1 T_GIT_TIMEOUT=300 T_BATCH=25 run_jac "$LK")"; LK_RC=$?
+  chmod 755 "$LK/.git/objects/pack" 2>/dev/null
+  { printf '%s' "$LK_OUT" | grep -q 'could not be listed' && [ ! -s "$WORK/lsof-calls" ] && [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ]; } \
+    && ok "(g) the temp-file list could not be read after the step → 'could not be listed' in the log, lsof never asked, nothing deleted" || bad "(g) an unreadable object store was handled wrong (rc=$LK_RC): $LK_OUT"
+  { [ "$LK_RC" -eq 1 ] && [ "$(state_field "$LK" bad_streak)" = 1 ] && [ "$(last_status)" = "deferred" ]; } && ok "(g) ...and the run is BAD (exit 1, bad_streak 1) although its status is only 'deferred' (a deadline cut, and the store still measurable): an unknown leak is not a clean cut" || bad "(g) an unknown leak ended exit $LK_RC, status=$(last_status), bad_streak=$(state_field "$LK" bad_streak): $LK_OUT"
+fi
+# (g2) the removal itself FAILS (the pack directory is not writable): the reason is logged, the file stays, "removed" is never said for a file that is still there, and the run is BAD
+if [ "$(id -u)" -eq 0 ]; then skip "(g2) running as root: a read-only directory does not stop root from removing a file, so the failing-removal fixture did NOT run"
+else
+  LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/lk.mark" "$WORK/lsof-calls"
+  LK_OUT="$(LK_RODIR=1 LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-none" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 run_jac "$LK")"; LK_RC=$?
+  chmod 755 "$LK/.git/objects/pack" 2>/dev/null
+  { printf '%s' "$LK_OUT" | grep -q 'could not remove' && printf '%s' "$LK_OUT" | grep -q 'removed 0 of 1' && [ "$(ls "$LK"/.git/objects/pack/tmp_pack_LEAK* 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && [ "$LK_RC" -eq 1 ]; } \
+    && ok "(g2) rm failed → 'could not remove <file>: <reason>' and 'removed 0 of 1' in the log, the file is still there, exit 1 (never 'removed' for a file that is not gone)" || bad "(g2) a failed removal was handled wrong (rc=$LK_RC): $LK_OUT"
+fi
+# (h) three BAD runs page the mayor, and the mail says why: the garbage
+LK="$WORK/lk$((++LKN))"; mkrepo "$LK" 20; rm -f "$WORK/state.json" "$WORK/log" "$WORK/gc-calls"
+addmore() { local d="$1" n="$2" base="$3" i; for i in $(seq $((base + 1)) $((base + n))); do awk -v k="$i" '{ if (NR % 997 == k % 997) print "changed line " k; else print }' "$d/hq.jsonl" > "$d/hq.jsonl.new" && mv "$d/hq.jsonl.new" "$d/hq.jsonl"; git -C "$d" add hq.jsonl && git -C "$d" -c maintenance.auto=false -c gc.auto=0 commit -q -m "more $i"; done; }
+for n in 1 2 3; do
+  rm -f "$WORK/lk.mark"; addmore "$LK" 4 $((n * 100))
+  LK_MARK="$WORK/lk.mark" T_GIT="$WORK/git-leak" T_LSOF="$WORK/lsof-open" T_RECLAIM_WAIT=0 T_GIT_TIMEOUT=100 T_BATCH=25 T_LIMIT=64 run_jac "$LK" >/dev/null
+done
+{ [ "$(mail_calls)" = 1 ] && grep -q 'garbage' "$WORK/gc-calls"; } && ok "(h) 3 runs that each leaked a kept temp file → ONE mail to the mayor, and it names the garbage" || bad "(h) alarm wrong (mails=$(mail_calls)): $(cat "$WORK/gc-calls" 2>/dev/null | cut -c1-300)"
+# (i) --check: the garbage is printed (files and size) — read-only, as ever
+out="$(run_jac "$LK" --check)"; printf '%s' "$out" | grep -q 'garbage=3f/' && ok "(i) --check prints the garbage (files/size) it sees" || bad "(i) --check does not print garbage=…: $out"
+
+echo ""
+echo "=== S34: STRUCTURE — a git step only runs through run_step, so no step can skip the leak accounting ==="
+# S30 pins the places that DISCARD a failure; this pins the places that RUN a git step. The gate reported the leak for the batch, and on this host's git the gc
+# leaks the same way: three call sites, one rule, and nothing stopped a fourth from being added without it. The rule lives in ONE function (run_step: snapshot the temp
+# files, run the step, and after a step that did not end 0 reclaim what it left). git_arch may be called from there and nowhere else; the git seam ($GITBIN) may be used
+# nowhere but in git_arch (a step could otherwise bypass both); the only git run BARE on the repo is the read-only `count-objects`; and the set of steps that go through
+# run_step is PINNED below.
+lint_steps() {  # lint_steps <file> — "OUTSIDE|<line>|<code>": a git_arch call outside run_step, or $GITBIN used outside git_arch; "BARE|<sub>": a git run bare on the repo; "STEP|<what>": a run_step call site
+  awk '
+    /^run_step\(\) *\{/ { in_rs = 1; next }
+    in_rs && /^\}/ { in_rs = 0; next }
+    /^git_arch\(\) *\{/ { in_ga = 1; next }
+    in_ga && /^\}/ { in_ga = 0; next }
+    /^[ \t]*#/ { next }
+    /^GITBIN=/ { next }
+    (!in_rs && !in_ga) && (/(^|[^a-z_])git_arch / || /\$\{?GITBIN/) { printf "OUTSIDE|%d|%s\n", NR, $0 }
+    !in_ga && match($0, /git --git-dir="\$R_GITDIR" [a-z-]+/) { b = substr($0, RSTART, RLENGTH); sub(/.* /, "", b); printf "BARE|%s\n", b }
+    /(^|[ \t;])run_step "\$[a-z_]+" / { st = $0; sub(/.*run_step "\$[a-z_]+" /, "", st); sub(/;.*$/, "", st); printf "STEP|%s\n", st }
+  ' "$1"
+}
+LS="$(lint_steps "$SCRIPT")"
+[ -n "$(printf '%s\n' "$LS" | grep '^STEP|')" ] && ok "the lint sees the run_step call sites ($(printf '%s\n' "$LS" | grep -c '^STEP|') of them)" || bad "the lint found no run_step call sites — it is not looking"
+[ -z "$(printf '%s\n' "$LS" | grep '^OUTSIDE|')" ] && ok "git_arch is called from run_step only, and the \$GITBIN seam is used in git_arch only" || bad "a git step outside run_step/git_arch (it would skip the leak accounting): $(printf '%s\n' "$LS" | grep '^OUTSIDE|' | cut -c1-120 | tr '\n' ';')"
+got_bare="$(printf '%s\n' "$LS" | grep '^BARE|' | cut -d'|' -f2 | sort -u | tr '\n' ',')"
+[ "$got_bare" = "count-objects," ] && ok "the only git run bare on the repo is the read-only count-objects (measure)" || bad "bare git subcommand(s) [$got_bare] — want only count-objects: a git that WRITES must go through run_step"
+got_steps="$(printf '%s\n' "$LS" | grep '^STEP|' | cut -d'|' -f2 | sed 's/ *--quiet.*$//' | tr '\n' ',')"
+want_steps="maintenance run --task=loose-objects,prune-packed,-c gc.autoDetach=false gc,"
+[ "$got_steps" = "$want_steps" ] && ok "the steps that go through run_step are exactly the pinned three (batch, prune-packed, gc)" || bad "steps differ from the pin — got [$got_steps] want [$want_steps]: read the new/removed step (does it write objects? then it can leak), then update the pin"
+cp "$SCRIPT" "$WORK/steps-mutant.sh"
+printf '%s\n' 'x="$(git_arch 5 repack 2>&1)"' 'run_step "$t_left" repack --quiet' 'y="$("$GITBIN" gc)"' 'git --git-dir="$R_GITDIR" repack -d' >> "$WORK/steps-mutant.sh"
+MS="$(lint_steps "$WORK/steps-mutant.sh")"
+mo="$(printf '%s\n' "$MS" | grep -c '^OUTSIDE|')"; ms="$(printf '%s\n' "$MS" | grep -c '^STEP|')"; bs="$(printf '%s\n' "$LS" | grep -c '^STEP|')"; mb="$(printf '%s\n' "$MS" | grep '^BARE|' | cut -d'|' -f2 | sort -u | tr '\n' ',')"
+{ [ "$mo" -eq 2 ] && [ "$ms" -eq $((bs + 1)) ] && [ "$mb" = "count-objects,repack," ]; } \
+  && ok "the lint bites: an appended direct git_arch call and a direct \$GITBIN call are reported as OUTSIDE, an appended 4th run_step shows up as a new step, an appended bare repack shows up as a new bare subcommand (each breaks a pin)" \
+  || bad "lint did not catch the mutant (outside=$mo want 2; steps=$ms want $((bs + 1)); bare=[$mb] want [count-objects,repack,])"
 
 echo ""
 echo "=== S11: what actually runs in production ==="
