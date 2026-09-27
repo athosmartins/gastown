@@ -3034,19 +3034,31 @@ elif [ -n "${WOULD_RESTART// /}" ]; then
   # refresh" branch below: verification wasn't attempted, not that it failed.
   emit OK "DRY RUN — no action taken; would restart daemon(s):${WOULD_RESTART}" not_applicable
 elif [ -n "${ALREADY_FRESH// /}" ]; then
-  # ga-j3j6s (confidence corrected gate-fix-2, gate_run=ga-9a45d): sensitive
-  # daemon(s) whose live process started after COMMIT_EPOCH via some other
-  # restart path (e.g. a sibling bead's own guarded restart, or the rig's own
-  # auto-deploy). Still skip the guarded restart either way (reverting to
-  # DEPLOY_EPOCH-only would just reintroduce the original over-flagging bug),
-  # but ALREADY_FRESH_PROOF (set per-daemon by already_fresh()'s AFR_TIER, at
-  # the call site above) tells us whether that pid-start ALSO cleared
+  # ga-j3j6s (confidence corrected gate-fix-2, gate_run=ga-9a45d): daemon(s)
+  # whose live process started after COMMIT_EPOCH via some other restart path
+  # (e.g. a sibling bead's own guarded restart, or the rig's own auto-deploy).
+  # Still skip the guarded restart either way (reverting to DEPLOY_EPOCH-only
+  # would just reintroduce the original over-flagging bug), but
+  # ALREADY_FRESH_PROOF (set per-daemon by already_fresh()'s AFR_TIER, at the
+  # call site above) tells us whether that pid-start ALSO cleared
   # DEPLOY_EPOCH — the identical bar verify_fresh() uses, a genuine positive
   # confirmation — or only COMMIT_EPOCH, a commit-vs-check-time correlation a
   # launchd KeepAlive respawn from an unrelated crash could satisfy while
   # still running pre-deploy code. A batch is only as trustworthy as its
   # weakest member, so one weak match downgrades the whole emitted PROOF.
-  emit OK "sensitive daemon(s) already running post-deploy code via some other restart path, no restart needed:${ALREADY_FRESH}" "$ALREADY_FRESH_PROOF"
+  # ga-95lo9b (gate-fix-1): already_fresh() is now consulted for EVERY
+  # AFFECTED+running label before the is_sensitive/SAFE split (see the
+  # per-label loop above), so ALREADY_FRESH can hold a SAFE, explicitly
+  # non-sensitive daemon (e.g. com.urblink.inbound-sweep — restart_policy.yaml
+  # keeps it out of sensitive_daemons on purpose) just as easily as a
+  # sensitive one. The message below must stay sensitivity-agnostic: calling
+  # every member "sensitive" here would contradict the town's own policy file
+  # and mislead whoever reads this in a bead comment or halt notification.
+  # SELFTEST-EXTRACT daemon-refresh-already-fresh-emit: BEGIN (ga-95lo9b) —
+  # evaluated standalone by daemon-refresh-already-fresh-safe.selftest.sh
+  # with ALREADY_FRESH/ALREADY_FRESH_PROOF set and emit() stubbed.
+  emit OK "daemon(s) already running post-deploy code via some other restart path, no restart needed:${ALREADY_FRESH}" "$ALREADY_FRESH_PROOF"
+  # SELFTEST-EXTRACT daemon-refresh-already-fresh-emit: END
 else
   # ga-vmq1i: AFFECTED was non-empty, but every affected daemon was skipped for
   # having no live PID (a scheduled/one-shot job, per the Step-4 loop above) —

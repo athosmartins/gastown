@@ -146,6 +146,31 @@ has " $AFFECTED_NOT_RUNNING " " $LABEL " && [ "$ALREADY_FRESH_CALLS" -eq 0 ] && 
   && ok "T7 control: not-running short-circuits before any freshness/guard check" \
   || bad "T7 affected_not_running='$AFFECTED_NOT_RUNNING' already_fresh_calls=$ALREADY_FRESH_CALLS guard_calls=$GUARD_CALLS"
 
+# ── T8: gate-fix-1 regression — batch-summary emit() must not call a SAFE ──
+# ── daemon "sensitive" just because it landed in ALREADY_FRESH ──────────────
+echo "── T8. batch-summary OK message for ALREADY_FRESH must not say 'sensitive' ──"
+EMIT_BLOCK="$(extract daemon-refresh-already-fresh-emit)"
+[ -n "$EMIT_BLOCK" ] || { echo "FATAL: sentinel daemon-refresh-already-fresh-emit not found in $HELPER"; exit 1; }
+ok "located the live already-fresh emit() line via sentinel extraction"
+
+EMIT_STATUS="" EMIT_MSG="" EMIT_PROOF=""
+emit() { EMIT_STATUS="$1"; EMIT_MSG="$2"; EMIT_PROOF="$3"; }
+ALREADY_FRESH=" $LABEL "
+ALREADY_FRESH_PROOF="not_verified"
+eval "$EMIT_BLOCK"
+
+if ! has "$EMIT_MSG" "sensitive" && ! has "$EMIT_MSG" "SENSITIVE"; then
+  ok "T8 emit message does not claim the daemon is sensitive"
+else
+  bad "T8 emit message='$EMIT_MSG' — still calls a batch that can contain a SAFE, explicitly non-sensitive daemon (restart_policy.yaml keeps com.urblink.inbound-sweep out of sensitive_daemons) 'sensitive', contradicting the town's own policy file"
+fi
+has "$EMIT_MSG" "daemon(s) already running post-deploy code via some other restart path, no restart needed:$ALREADY_FRESH" \
+  && ok "T8 emit message still carries the substantive content unchanged" \
+  || bad "T8 emit message='$EMIT_MSG' lost expected content"
+[ "$EMIT_STATUS" = "OK" ] && [ "$EMIT_PROOF" = "not_verified" ] \
+  && ok "T8 emit status/proof passthrough unchanged" \
+  || bad "T8 emit status='$EMIT_STATUS' proof='$EMIT_PROOF'"
+
 echo ""
 echo "== result: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
