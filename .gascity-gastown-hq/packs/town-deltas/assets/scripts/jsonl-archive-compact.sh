@@ -69,8 +69,15 @@
 # failed / could not measure / was skipped for low disk / stalled / timed out at the minimum
 # batch size or at gc's own cap. After
 # JAC_ALERT_AFTER (3) consecutive BAD runs one mail goes to the mayor, at most once per
-# JAC_ALERT_EVERY_S (6h); an undelivered mail is retried next run (delivered != attempted) and the
-# log says WHY it failed. Exit 1 whenever any repo is BAD, so the order runner shows the failure too --
+# JAC_ALERT_EVERY_S (6h). The send is RECORDED FIRST (state last_alert_epoch = now, written before
+# `gc mail send`) and un-recorded when the send fails: a state that cannot be written means NO mail
+# (logged, exit 1) — never a mail every 30 minutes because the timestamp of one that went out was
+# lost — and an undelivered mail is retried next run (delivered != attempted), the log saying WHY.
+# The send has its own cap (JAC_MAIL_TIMEOUT_S, 45s) so a hung gc/Dolt cannot hold the run until the
+# order's kill; a send cut at that cap is delivery UNKNOWN (it may have gone out), so it stays on record —
+# retrying could send it twice. Every case where the mail stays on record without a confirmed delivery — that
+# timeout, a send that failed AND whose slot could not be given back, a run killed between the record and the
+# send — is logged and exits 1, and the next attempt waits out JAC_ALERT_EVERY_S. Exit 1 whenever any repo is BAD, so the order runner shows the failure too --
 # and also when the STATE cannot be updated: the streak is what reaches the alarm, so a run that cannot
 # record it is blind, and must not look green. The state file must be a JSON OBJECT (a valid-JSON
 # `[]`, `5` or `"x"`, an entry that is not an object, or an empty file, is repaired and LOGGED, never silently kept).
@@ -114,6 +121,7 @@ PRUNE_MIN_S="${JAC_PRUNE_MIN_S:-15}"                 # prune-packed always gets 
 HEADROOM_KIB="${JAC_HEADROOM_KIB:-524288}"           # free space that must remain after the estimate
 ALERT_AFTER="${JAC_ALERT_AFTER:-3}"
 ALERT_EVERY_S="${JAC_ALERT_EVERY_S:-21600}"
+MAIL_TIMEOUT_S="${JAC_MAIL_TIMEOUT_S:-45}"           # the alarm mail's OWN cap — not the run's remaining budget: a run that used its whole budget must still be able to page (2 sends at 780s + 45s each end before the order's 900s kill)
 LOCK_STALE_MIN="${JAC_LOCK_STALE_MIN:-90}"
 LOCK="${JAC_LOCK:-$RUNTIME/jsonl-archive-compact.lock}"
 STATE="${JAC_STATE:-$RUNTIME/packs/town-deltas/jsonl-archive-compact-state.json}"
@@ -136,7 +144,7 @@ repos=$REPOS
 loose_limit_kib=$LOOSE_LIMIT_KIB loose_alarm_kib=$LOOSE_ALARM_KIB
 packs_limit=$PACKS_LIMIT packs_alarm=$PACKS_ALARM batch_objects=$BATCH_OBJECTS batch_max=$BATCH_MAX max_batches=$MAX_BATCHES
 git_timeout_s=$GIT_TIMEOUT_S gc_timeout_s=$GC_TIMEOUT_S prune_timeout_s=$PRUNE_TIMEOUT_S prune_min_s=$PRUNE_MIN_S deadline_s=$DEADLINE_S min_batch_s=$MIN_BATCH_S
-alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S
+alert_after=$ALERT_AFTER alert_every_s=$ALERT_EVERY_S mail_timeout_s=$MAIL_TIMEOUT_S
 state=$STATE log=$LOG lock=$LOCK
 EOF
   exit 0
@@ -296,8 +304,8 @@ is_bad() {
   return 1
 }
 
-ALARM_ERR=""
-send_alarm() {  # send_alarm <repo> <status> <streak> — 0 only when the mail was really sent; ALARM_ERR = why not
+ALARM_ERR=""; ALARM_TIMED_OUT=0
+send_alarm() {  # send_alarm <repo> <status> <streak> — 0 only when the mail was really sent; ALARM_ERR = why not; ALARM_TIMED_OUT=1 = cut at the cap: delivery UNKNOWN, not "failed"
   local body out rc
   body="jsonl-archive compaction is not keeping up.
 repo:    $1
@@ -311,42 +319,71 @@ Why it matters: without compaction this repo grows ~5GiB/day of loose hq.jsonl c
 Nothing was deleted. Check: bash $0 --check ; then the last lines of the log.
 If the log says gc timed out at its OWN cap (${GC_TIMEOUT_S}s), the repo is too big for one gc: run it by
 hand, without a timeout, at low priority:  nice -n 10 git --git-dir=$1/.git gc   (26/09: 36 min for a 6GB backlog)."
-  out="$("$GCBIN" mail send mayor/ -s "ESCALATION: jsonl-archive compaction failing [HIGH]" -m "$body" 2>&1)"; rc=$?
+  out="$(_bounded "$MAIL_TIMEOUT_S" "$GCBIN" mail send mayor/ -s "ESCALATION: jsonl-archive compaction failing [HIGH]" -m "$body" 2>&1)"; rc=$?
   ALARM_ERR="$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ' | cut -c1-200)"
+  # 124 is `timeout`'s own "cut at the cap"; without a timeout binary nothing bounded the send, so the code is gc's.
+  ALARM_TIMED_OUT=0; if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then ALARM_TIMED_OUT=1; fi
   return "$rc"
 }
 
-# record <repo> <status> — writes the state entry, bumps/reset the bad streak, and mails when due.
+# write_state <repo> <state-json> <status> <streak> <last-alert-epoch> <now> — writes THIS repo's entry (this run's status and
+# measurements, the bad-run streak, the time of the last alarm mail) into the state file. 0 = written; 1 = not computed or not
+# written (logged, with the reason). Three outcomes, never two: computed and written / could not be computed / could not be
+# written — the last two used to be a quiet skip (`|| new=""`): the streak never advanced, the alarm never fired, no log line.
+write_state() {
+  local repo="$1" state="$2" status="$3" streak="$4" last="$5" now="$6" new jrc
+  new="$(jq --arg r "$repo" --arg st "$status" --argjson streak "$streak" --argjson last "$last" --argjson now "$now" \
+        --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" \
+        'def n($x): (try ($x | tonumber) catch null);
+         .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), bad_streak:$streak, last_alert_epoch:$last})
+         | if n($bo) != null then .[$r].batch_objects = n($bo) else . end' <<<"$state" 2>&1)"; jrc=$?
+  if [ "$jrc" -ne 0 ] || ! jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1; then
+    log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
+    return 1
+  fi
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
+  if ! { printf '%s\n' "$new" > "$STATE.tmp.$$" 2>/dev/null && mv "$STATE.tmp.$$" "$STATE" 2>/dev/null; }; then
+    log "  state update FAILED ($repo): could not write $STATE — the bad-run streak cannot advance and no alarm mail can go out until the state can be written"
+    rm -f "$STATE.tmp.$$" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+# record <repo> <status> — writes the state entry, bumps/resets the bad streak, and mails when due.
+# The mail is RECORDED BEFORE it is sent: last_alert_epoch is the only thing that rate-limits it, and it used to be
+# persisted only by the write AFTER the send — when that write failed, a mail that HAD been delivered was forgotten and
+# went out again every run (an action took effect, its record was lost, so it is replayed). Now: no record, no mail.
 record() {
-  local repo="$1" status="$2" state streak last now bad=0 new jrc state_failed=0
+  local repo="$1" status="$2" state streak last now bad=0 state_failed=0
   load_state "$repo"; state="$STATE_JSON"
   streak="$(jq -r --arg r "$repo" '.[$r].bad_streak // 0' <<<"$state" 2>/dev/null)"; is_uint "$streak" || streak=0
   last="$(jq -r --arg r "$repo" '.[$r].last_alert_epoch // 0' <<<"$state" 2>/dev/null)"; is_uint "$last" || last=0
   now="$(date +%s)"
   if is_bad "$status"; then bad=1; streak=$((streak + 1)); else streak=0; fi
   if [ "$bad" -eq 1 ] && [ "$streak" -ge "$ALERT_AFTER" ] && [ $((now - last)) -ge "$ALERT_EVERY_S" ]; then
-    if send_alarm "$repo" "$status" "$streak"; then last="$now"; log "  alarm mailed to mayor ($repo, status=$status, bad_streak=$streak)"
-    else log "  alarm mail FAILED (${ALARM_ERR:-no output}) — will retry next run ($repo)"; fi
-  fi
-  new="$(jq --arg r "$repo" --arg st "$status" --argjson streak "$streak" --argjson last "$last" --argjson now "$now" \
-        --arg lk "$M_LOOSE_KIB" --arg lc "$M_LOOSE_COUNT" --arg pk "$M_PACKS" --arg pks "$M_PACK_KIB" --arg g "${G_KIB:-}" --arg bo "${R_BATCH_SAVE:-}" \
-        'def n($x): (try ($x | tonumber) catch null);
-         .[$r] = ((.[$r] // {}) + {last_run_epoch:$now, status:$st, loose_kib:n($lk), loose_objects:n($lc), packs:n($pk), pack_kib:n($pks), gitdir_kib:n($g), bad_streak:$streak, last_alert_epoch:$last})
-         | if n($bo) != null then .[$r].batch_objects = n($bo) else . end' <<<"$state" 2>&1)"; jrc=$?
-  # Three outcomes, never two: the update computed and was written / could not be computed / could not be written. The
-  # second and third used to be a quiet skip (`|| new=""`): the streak never advanced, the alarm never fired, no log line.
-  if [ "$jrc" -ne 0 ] || ! jq -e 'type == "object"' <<<"$new" >/dev/null 2>&1; then
-    log "  state update FAILED ($repo): jq rc=$jrc: $(printf '%s' "$new" | tail -n 2 | tr '\n' ' ' | cut -c1-200) — the bad-run streak cannot advance, so the alarm is blind"
-    state_failed=1
-  else
-    mkdir -p "$(dirname "$STATE")" 2>/dev/null
-    if ! { printf '%s\n' "$new" > "$STATE.tmp.$$" 2>/dev/null && mv "$STATE.tmp.$$" "$STATE" 2>/dev/null; }; then
-      log "  state update FAILED ($repo): could not write $STATE — the bad-run streak cannot advance, so the alarm is blind"
-      rm -f "$STATE.tmp.$$" 2>/dev/null
+    if write_state "$repo" "$state" "$status" "$streak" "$now" "$now"; then       # the mail is on record from here on
+      if send_alarm "$repo" "$status" "$streak"; then
+        log "  alarm mailed to mayor ($repo, status=$status, bad_streak=$streak)"
+      elif [ "$ALARM_TIMED_OUT" -eq 1 ]; then
+        # cut at the cap: the mail may have gone out and only its return hung. Not "failed" — UNKNOWN — so the slot is NOT given
+        # back: a retry could send it twice, and under doubt the inert state is "do not contact again". Loud, and the run fails.
+        log "  alarm mail TIMED OUT after ${MAIL_TIMEOUT_S}s — delivery UNKNOWN; it stays on record as sent (a retry could send it twice), so the next attempt waits up to ${ALERT_EVERY_S}s ($repo)"
+        state_failed=1
+      elif write_state "$repo" "$state" "$status" "$streak" "$last" "$now"; then   # it FAILED (gc said so): give the slot back
+        log "  alarm mail FAILED (${ALARM_ERR:-no output}) — slot given back, will retry next run ($repo)"
+      else
+        log "  alarm mail FAILED (${ALARM_ERR:-no output}) and its slot could not be released — it stays on record as sent, so the next attempt waits up to ${ALERT_EVERY_S}s ($repo)"
+        state_failed=1
+      fi
+    else
+      log "  alarm due but NOT mailed ($repo, status=$status, bad_streak=$streak): it could not be recorded first, and a mail whose record is lost would repeat every run"
       state_failed=1
     fi
+  else
+    write_state "$repo" "$state" "$status" "$streak" "$last" "$now" || state_failed=1
   fi
-  [ "$state_failed" -eq 1 ] && bad=1     # the run is not green when it cannot record itself (the stored streak is untouched)
+  [ "$state_failed" -eq 1 ] && bad=1     # the run is not green when it cannot record itself
   return "$bad"
 }
 
@@ -523,7 +560,7 @@ if [ "$MODE" = run ]; then
 fi
 
 if [ "$MODE" = run ] && [ -z "$_timeout_bin" ]; then
-  log "WARNING: no timeout/gtimeout on PATH — batches, prune and gc are NOT time-bounded (only the order's own kill limits a run), and batch sizing cannot adapt (it reacts to timeouts)"
+  log "WARNING: no timeout/gtimeout on PATH — batches, prune, gc and the alarm mail are NOT time-bounded (only the order's own kill limits a run), and batch sizing cannot adapt (it reacts to timeouts)"
 fi
 if [ "$MODE" = run ] && why="$(state_problem)"; then
   log "state file $STATE is unreadable — starting fresh: $why (bad-run streaks and remembered batch sizes reset)"

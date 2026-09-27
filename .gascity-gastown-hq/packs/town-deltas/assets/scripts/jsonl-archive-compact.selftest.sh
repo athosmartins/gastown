@@ -14,10 +14,10 @@ CITY_ROOT="$(cd "$PACK/../.." && pwd)"                  # .../.gascity-gastown-h
 SCRIPT="$HERE/jsonl-archive-compact.sh"
 ORDER="$PACK/orders/jsonl-archive-compact.toml"
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
-skip() { echo "  SKIP: $1"; }     # not counted: the host was too loaded for a timing-based fixture to run at all
+skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }     # a check that did NOT run (host too loaded for a timing fixture, a file not in this tree): counted apart, printed in RESULT — never a PASS
 
 WORK="$(mktemp -d /tmp/jsonl-archive-compact-selftest.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -69,6 +69,7 @@ history()     { git --git-dir="$1/.git" log --format='%H %T' HEAD | shasum | cut
 cat > "$WORK/gc-stub" <<EOF
 #!/bin/bash
 printf 'CALL %s\\n' "\$(printf '%s' "\$*" | tr '\\n' ' ')" >> "$WORK/gc-calls"
+[ -n "\${STUB_SLEEP:-}" ] && sleep "\$STUB_SLEEP"     # a hung gc / Dolt: sleeps in the foreground so \`timeout\` (whole process group) kills it like the real thing
 [ "\${STUB_FAIL:-0}" != 0 ] && echo "gc-stub: mail refused (STUB_FAIL=\${STUB_FAIL})" >&2
 exit "\${STUB_FAIL:-0}"
 EOF
@@ -125,7 +126,7 @@ run_jac() {
   JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
   JAC_GIT="${T_GIT:-git}" JAC_GIT_TIMEOUT_S="${T_GIT_TIMEOUT:-300}" JAC_MAX_BATCHES="${T_MAX_BATCHES:-0}" JAC_DEADLINE_S="${T_DEADLINE:-780}" \
   JAC_MIN_BATCH_S="${T_MIN_BATCH:-}" JAC_GC_TIMEOUT_S="${T_GC_TIMEOUT:-}" JAC_MIN_GC_BUDGET_S="${T_MIN_GC:-}" \
-  JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" \
+  JAC_PRUNE_TIMEOUT_S="${T_PRUNE_TIMEOUT:-}" JAC_PRUNE_MIN_S="${T_PRUNE_MIN:-}" JAC_MAIL_TIMEOUT_S="${T_MAIL_TIMEOUT:-}" \
   "$SCRIPT" "$@" 2>&1     # executed, not `bash $SCRIPT`: production runs the shebang (/bin/bash 3.2 on macOS), not whatever bash is first in PATH
 }
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
@@ -133,7 +134,7 @@ state_field() { jq -r --arg r "$1" ".[\$r].$2" "$WORK/state.json" 2>/dev/null; }
 mail_calls()  { [ -f "$WORK/gc-calls" ] && wc -l < "$WORK/gc-calls" | tr -d ' ' || echo 0; }
 
 echo "=== jsonl-archive-compact.selftest.sh ==="
-[ -x "$SCRIPT" ] && ok "script exists and is executable" || { bad "script missing or not executable: $SCRIPT"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+[ -x "$SCRIPT" ] && ok "script exists and is executable" || { bad "script missing or not executable: $SCRIPT"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="; exit 1; }
 bash -n "$SCRIPT" && ok "script parses (PATH bash)" || bad "script has a syntax error"
 [ "$(head -n 1 "$SCRIPT")" = "#!/bin/bash" ] && ok "shebang is #!/bin/bash — the tests below execute the script through it" || bad "unexpected shebang: $(head -n 1 "$SCRIPT")"
 /bin/bash -n "$SCRIPT" && ok "script parses under /bin/bash ($(/bin/bash -c 'echo $BASH_VERSION'), the shebang interpreter)" || bad "script does not parse under /bin/bash"
@@ -560,6 +561,88 @@ rm -f "$WORK/state.json"; out="$(run_jac "$E0")"
 printf '%s' "$out" | grep -q 'unreadable' && bad "an ABSENT state file (first run) was logged as a problem: $out" || ok "an absent state file (a first run) is not a problem and logs nothing about it"
 
 echo ""
+echo "=== S25: the alarm mail is RECORDED before it is sent — a state that cannot be written means no mail, not a mail every run ==="
+# record() mailed first and persisted last_alert_epoch (the ONLY thing that rate-limits the mail) in the state write AFTER
+# it. When that write failed, the mail that HAD been delivered was forgotten: the next run read the same streak and the same
+# stale last_alert_epoch and mailed again, every 30 minutes — each one a permanent bead + Dolt commit, in the disk pressure
+# this script exists for — and the log called the alarm "blind" when it was in fact repeating (an action took effect, its
+# record was lost, so it is replayed). jq shim: fails only the state-update call (the one that mentions last_run_epoch);
+# JQ_FAIL_WRITES lists which of a run's state writes fail by ordinal ("2"), or "all". Write 1 is the record-before-send,
+# write 2 is giving the slot back after a failed send.
+mkdir -p "$WORK/jqshim2"; REAL_JQ="$(command -v jq)"
+cat > "$WORK/jqshim2/jq" <<EOF
+#!/bin/bash
+case "\$*" in *last_run_epoch*)
+  n=\$(cat "$WORK/jq-writes" 2>/dev/null || echo 0); n=\$((n + 1)); echo "\$n" > "$WORK/jq-writes"
+  case ",\${JQ_FAIL_WRITES:-}," in *",\$n,"*|*",all,"*) echo "jq: forced failure (selftest)" >&2; exit 5 ;; esac ;;
+esac
+exec "$REAL_JQ" "\$@"
+EOF
+chmod +x "$WORK/jqshim2/jq"
+G3="$WORK/g3"; mkrepo "$G3" 20
+# a streak already past ALERT_AFTER with no alert on record: every run below is one where the mail is DUE
+seed_due() { rm -f "$WORK/state.json" "$WORK/gc-calls" "$WORK/log" "$WORK/jq-writes"; jq -n --arg r "$G3" '{($r): {bad_streak: 5, last_alert_epoch: 0}}' > "$WORK/state.json"; }
+run_due() { rm -f "$WORK/jq-writes"; PATH="$WORK/jqshim2:$PATH" T_FREE=1 run_jac "$G3"; }   # T_FREE=1 → skipped-low-disk: a BAD run every time
+T25="$(date +%s)"
+
+# (A) the incident: the mail is due and the state cannot be written
+seed_due; rcs=""
+for n in 1 2 3; do JQ_FAIL_WRITES=all run_due >/dev/null; rcs="$rcs$?"; done
+if [ "$(mail_calls)" = 0 ] && [ "$rcs" = 111 ] && [ "$(grep -c 'alarm due but NOT mailed' "$WORK/log")" = 3 ] && [ "$(state_field "$G3" last_alert_epoch)" = 0 ]; then
+  ok "(A) state unwritable, mail due, 3 runs → 0 mails (was: 1 per run), exit 1 every run, 'NOT mailed' logged every run, nothing half-recorded"
+else
+  bad "(A) an unwritable state still mails or is quiet (mails=$(mail_calls) exit codes=$rcs 'NOT mailed' lines=$(grep -c 'alarm due but NOT mailed' "$WORK/log") last_alert_epoch=$(state_field "$G3" last_alert_epoch))"
+fi
+grep -q 'forced failure' "$WORK/log" && ok "(A) the jq reason is in the log" || bad "(A) the failure has no cause in the log: $(tail -n 3 "$WORK/log" | tr '\n' ' ')"
+grep 'state update FAILED' "$WORK/log" | grep -q 'alarm is blind' && bad "(A) the log still claims the alarm is 'blind' although at streak >= threshold the old behaviour was to REPEAT it" || ok "(A) no false 'blind' claim in the failure text"
+
+# (B) control: a healthy state → exactly one mail, on record, and the rate limit holds
+seed_due; run_due >/dev/null; run_due >/dev/null
+la="$(state_field "$G3" last_alert_epoch)"
+if [ "$(mail_calls)" = 1 ] && [ "$la" -ge "$T25" ] 2>/dev/null; then
+  ok "(B) healthy state → one mail, last_alert_epoch on record ($la), the second due-looking run is rate-limited"
+else
+  bad "(B) healthy path wrong (mails=$(mail_calls) last_alert_epoch=$la)"
+fi
+
+# (C) a send that FAILS gives the slot back — attempted != delivered — and the next run retries
+seed_due; STUB_FAIL=1 run_due >/dev/null
+if [ "$(mail_calls)" = 1 ] && [ "$(state_field "$G3" last_alert_epoch)" = 0 ] && grep -q 'alarm mail FAILED.*mail refused.*will retry next run' "$WORK/log"; then
+  ok "(C) failed send → last_alert_epoch back to 0 (not on record), the log carries the cause and says it retries"
+else
+  bad "(C) failed send left the slot claimed or unexplained (mails=$(mail_calls) last_alert_epoch=$(state_field "$G3" last_alert_epoch)): $(grep 'alarm' "$WORK/log" | tail -n 2 | tr '\n' ' ')"
+fi
+run_due >/dev/null
+[ "$(mail_calls)" = 2 ] && [ "$(state_field "$G3" last_alert_epoch)" -ge "$T25" ] 2>/dev/null && ok "(C) the next run retries and records the mail that really went out" || bad "(C) no retry after a failed send (mails=$(mail_calls))"
+
+# (D) double fault: the send failed AND the slot could not be given back. The mail was NOT delivered, but it stays on record,
+# so the next attempt waits out the window (bounded: ALERT_EVERY_S) — and both facts are logged and fail the run.
+seed_due; STUB_FAIL=1 JQ_FAIL_WRITES=2 run_due >/dev/null; rc=$?
+{ [ "$rc" -eq 1 ] && grep -q 'alarm mail FAILED' "$WORK/log" && grep -q 'could not be released' "$WORK/log"; } \
+  && ok "(D) send failed + slot not released → both logged, exit 1" \
+  || bad "(D) double fault not loud (rc=$rc): $(grep 'alarm' "$WORK/log" | tail -n 3 | tr '\n' ' ')"
+run_due >/dev/null
+[ "$(mail_calls)" = 1 ] && ok "(D) the slot stays held for the window: no mail storm even then (1 attempt, retried after JAC_ALERT_EVERY_S)" || bad "(D) double fault re-mailed (mails=$(mail_calls))"
+
+# (E) a HUNG send is bounded by its own cap (a hung gc/Dolt must not hold the run until the order's kill). A send cut at
+# the cap is delivery UNKNOWN — it may have gone out and only its return hung — so, unlike a send that FAILED (C: gc said
+# so), it is NOT given back: retrying an unknown delivery could send it twice, and under doubt the inert state is "do not
+# contact again". It says so loudly and fails the run; the next attempt waits out the window.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  seed_due; SECONDS=0; STUB_SLEEP=60 T_MAIL_TIMEOUT=2 run_due >/dev/null; rc=$?; took=$SECONDS
+  if [ "$took" -lt 40 ] && [ "$rc" -eq 1 ] && [ "$(state_field "$G3" last_alert_epoch)" -ge "$T25" ] 2>/dev/null \
+     && grep -q 'alarm mail TIMED OUT after 2s.*delivery UNKNOWN' "$WORK/log"; then
+    ok "(E) a send that hangs is cut at JAC_MAIL_TIMEOUT_S (run took ${took}s, not 60), logged as TIMED OUT / delivery UNKNOWN, exit 1, and stays on record"
+  else
+    bad "(E) hung send not bounded, or not loud, or released (took=${took}s rc=$rc last_alert_epoch=$(state_field "$G3" last_alert_epoch)): $(grep 'alarm' "$WORK/log" | tail -n 2 | tr '\n' ' ')"
+  fi
+  run_due >/dev/null
+  [ "$(mail_calls)" = 1 ] && ok "(E) no second send while the first one's delivery is unknown (1 attempt in the window)" || bad "(E) an unknown-delivery send was retried at once (mails=$(mail_calls))"
+else
+  skip "(E) no timeout/gtimeout on this host — the bounded-send check did NOT run"
+fi
+
+echo ""
 echo "=== S11: what actually runs in production ==="
 cfg="$("$SCRIPT" --print-config)"
 printf '%s' "$cfg" | grep -q 'packs/maintenance/jsonl-archive' && printf '%s' "$cfg" | grep -q 'packs/town-deltas/jsonl-archive' \
@@ -569,7 +652,7 @@ if [ -f "$S3SCRIPT" ]; then
   grep -q '^JSONL_ARCHIVE_DIR=.*packs/maintenance/jsonl-archive' "$S3SCRIPT" && ok "the archive dolt-s3-backup.sh mirrors is one of the compacted repos" || bad "dolt-s3-backup.sh mirrors a different archive path"
   grep -A2 -- 's3 sync "\$JSONL_ARCHIVE_DIR/"' "$S3SCRIPT" | grep -q -- '--exclude ".git/\*"' && ok "S3 sync excludes .git — history has no offsite copy, so compaction must never shorten it" || bad "S3 sync no longer excludes .git — re-read the header of jsonl-archive-compact.sh"
 else
-  ok "dolt-s3-backup.sh not in this tree — cross-checks skipped"
+  skip "dolt-s3-backup.sh not in this tree — the two S3-sync cross-checks did NOT run (they are not counted as passes)"
 fi
 [ -f "$ORDER" ] && ok "order file exists: $ORDER" || bad "order file missing: $ORDER"
 trigger="$(sed -n 's/^trigger *= *"\(.*\)"/\1/p' "$ORDER")"; interval="$(sed -n 's/^interval *= *"\(.*\)"/\1/p' "$ORDER")"
@@ -583,5 +666,6 @@ deadline="$(sed -n 's/^DEADLINE_S="\${JAC_DEADLINE_S:-\([0-9]*\)}".*/\1/p' "$SCR
 [ "$exec_line" = '$PACK_DIR/assets/scripts/jsonl-archive-compact.sh' ] && ok "order: exec points at the script" || bad "order exec is '$exec_line'"
 
 echo ""
-echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
+echo "=== RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="
+[ "$SKIP" -eq 0 ] || echo "    ($SKIP check(s) did not run — see the SKIP lines above; FAIL=0 does not cover them)"
 [ "$FAIL" -eq 0 ]
