@@ -1,0 +1,31 @@
+Reboot — domingo 27/09 ~05:50 (Mayor, sessão 896bbce3). AUTORIZADO pelo Athos: AskUserQuestion na sessão do
+Mayor 896bbce3, 27/09 ~05:5x, pergunta "Reiniciar o Mac mini? swap 10,9 GB desde ontem; supervisor estoura fds
+~seg 15h" → resposta "Reiniciar agora, domingo cedo (Recomendado)".
+MOTIVO: swap 10,9 GB parado desde 26/09 (checagem noturna ga-06mt3k recomendou); supervisor gc vaza ~1.036
+fds/h (ga-0ox5tq, 19.900 às 22:51 de 26/09, teto 61.440 → estouraria ~seg 28/09 15h). Reboot zera os dois.
+
+PRÉ (feito 05:4x): central_sender_restart_safe.py = "fila sem envio em voo — pode reiniciar"; system_paused=0.
+ENVIO NÃO PAUSADO (launchd religa; o envio retoma sozinho). df livre 13 GB, swap 10,9 GB.
+
+================ PÓS-BOOT (próxima sessão do Mayor — bead no hook) ================
+1. `gc dolt status` = running; df -h / ; sysctl vm.swapusage (~0).
+2. ENVIO: GET 127.0.0.1:8095/api/outreach/config → confirmar system_paused="0" (não foi pausado).
+3. Lista única: curl -s 127.0.0.1:8095/api/outreach/lista-unica >/dev/null (aquece; esperar "calculando" sumir).
+4. `gc session list`: crews e pools voltando (Login expired → /login + gc session reset).
+5. inbound-capture com AMOSTRAGEM ligada: grep 'masked samples: dir=' /tmp/inbound_capture.log (wa-xdgyx).
+6. Job novo com.whatsapp.reabrir-lotes-obito carregado (launchctl list | grep reabrir) — wa-bmv1l.
+7. fds do supervisor zerados: lsof -p $(pgrep -f 'gc supervisor run') | wc -l (esperado < 3.000). Anotar
+   em ga-0ox5tq; o conserto definitivo (fsnotify v1.10.1) segue na janela de engine.
+
+AGENDA QUE ESTAVA EM CronCreate DA SESSÃO 896bbce3 (morre com o reboot — refazer à mão):
+A. ~06:45 dom 27/09 — wa-3qgf3: depois do com.whatsapp.lotes-rebuild das 06:30, conferir num lote de
+   apartamento em prédio antigo (caso do teste da bead) que o R$/m² de terreno no mapa saiu CORRIGIDO; se sim,
+   fechar a bead com evidência; senão, devolver ao wa-worker. Se o reboot atrasar o rebuild das 06:30,
+   rodar à mão: launchctl kickstart gui/$(id -u)/com.whatsapp.lotes-rebuild.
+B. ~21:00 dom 27/09 — campanha de SEGUNDA 28/09: data/queue.db status=scheduled pra 2026-09-28 (~>110);
+   slot-scheduler vivo; wa-jpzq6 fechada pela oracle-wa?
+C. seg 28/09 ~16h — MEDIÇÃO de RAM/disco pro Athos (ga-ormexj): top PhysMem/compressor, swap, df, e o pico do
+   filho --sync-one mega_data_set do MotherDuck (wa-vvk5c). Decisão do Athos: não comprar SSD; consertos grátis.
+
+---- registro ----
+[27/09 05:49:23] PRÉ OK: safe=sem envio em voo; paused=0; df 13 GB; swap 10,9 GB. Disparando reboot.
