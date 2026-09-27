@@ -2685,6 +2685,13 @@ print(json.dumps({"label": label, "entrypoint": entry, "closure": closure}))
 ' "$label" "$entry" "${closures[@]}"
 }
 
+# SELFTEST-EXTRACT daemon-refresh-label-loop: BEGIN (ga-95lo9b) — evaluated
+# standalone by daemon-refresh-already-fresh-safe.selftest.sh against stubbed
+# daemon_pid/already_fresh/is_sensitive/policy_says_sensitive/
+# guard_allows_restart/verify_fresh/classify_guarded/log, real bash control
+# flow otherwise. Keep this loop's body free of anything that would not
+# survive a bare `eval` (no local declarations at this scope, no early
+# `return` — `continue`/`break` only).
 for label in $AFFECTED; do
   # Only refresh LONG-LIVED daemons that are running RIGHT NOW (have a live PID).
   # A discovered job with no current PID is a scheduled/one-shot agent (e.g. a
@@ -2697,17 +2704,35 @@ for label in $AFFECTED; do
     AFFECTED_NOT_RUNNING="$AFFECTED_NOT_RUNNING $label"
     continue
   fi
-  if is_sensitive "$label" || policy_says_sensitive "$label"; then
-    if already_fresh "$label"; then
-      if [ "$AFR_TIER" = "verified" ]; then
-        log "SENSITIVE $label: current process started after DEPLOY_EPOCH ($DEPLOY_EPOCH) via some other restart path — same bar verify_fresh() uses; positively confirmed fresh, not flagging for guarded restart (ga-j3j6s)."
-      else
-        log "SENSITIVE $label: current process started after this code was committed (COMMIT_EPOCH=$COMMIT_EPOCH) but not after DEPLOY_EPOCH ($DEPLOY_EPOCH) — plausibly already running the new code via some other restart path; not flagging for guarded restart, but this is a correlation, not proof (PROOF=not_verified — ga-j3j6s, confidence corrected gate-fix-2)."
-        ALREADY_FRESH_PROOF="not_verified"
-      fi
-      ALREADY_FRESH="$ALREADY_FRESH $label"
-      continue
+  # ga-95lo9b: already_fresh() used to be consulted ONLY on the SENSITIVE
+  # branch below — a SAFE daemon (deploy_restart-listed but not sensitive,
+  # e.g. com.urblink.inbound-sweep) had NO freshness short-circuit at all and
+  # went straight to guard_allows_restart() every cycle. For a daemon whose
+  # restart_guard_scripts entry refuses based on SCHEDULE STATE (busy mid-
+  # sweep) rather than code staleness — inbound_sweep's own
+  # restart_guard_scripts comment in restart_policy.yaml names this exact
+  # daemon-refresh.sh behavior as a known, out-of-WA's-scope bug — that guard
+  # refusal repeats on nearly every cycle regardless of whether the process
+  # already restarted onto fresh code via some other path (verified live:
+  # ga-95lo9b, a guarded-restart-verified process at 06:08 was still
+  # re-flagged NEEDS_GUARDED_RESTART at 06:55-07:05 because this check was
+  # never reached for it). Hoisted here so EVERY AFFECTED+running label gets
+  # the same floor-epoch proof before either restart path — this can only
+  # ever ADD true-fresh detections (same safety argument point 7's own
+  # SENSITIVE-only version already established), never mask a real stale
+  # daemon: a label that fails this check falls through to the SENSITIVE/SAFE
+  # branches exactly as before this change.
+  if already_fresh "$label"; then
+    if [ "$AFR_TIER" = "verified" ]; then
+      log "$label: current process started after DEPLOY_EPOCH ($DEPLOY_EPOCH) via some other restart path — same bar verify_fresh() uses; positively confirmed fresh, not flagging for guarded restart (ga-j3j6s; ga-95lo9b widened this off the SENSITIVE-only path)."
+    else
+      log "$label: current process started after this code was committed (COMMIT_EPOCH=$COMMIT_EPOCH) but not after DEPLOY_EPOCH ($DEPLOY_EPOCH) — plausibly already running the new code via some other restart path; not flagging for guarded restart, but this is a correlation, not proof (PROOF=not_verified — ga-j3j6s, confidence corrected gate-fix-2; ga-95lo9b widened this off the SENSITIVE-only path)."
+      ALREADY_FRESH_PROOF="not_verified"
     fi
+    ALREADY_FRESH="$ALREADY_FRESH $label"
+    continue
+  fi
+  if is_sensitive "$label" || policy_says_sensitive "$label"; then
     sani="${label//[^A-Za-z0-9_]/_}"
     drain_var="DRAIN_CMD_${sani}"
     drain="${!drain_var:-}"
@@ -2760,6 +2785,7 @@ for label in $AFFECTED; do
     WOULD_RESTART="$WOULD_RESTART $label"
   fi
 done
+# SELFTEST-EXTRACT daemon-refresh-label-loop: END
 
 RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
