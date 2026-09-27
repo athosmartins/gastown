@@ -26,7 +26,10 @@
 #      uses) and `git prune-packed` after each. The batch size ADAPTS: it starts at
 #      JAC_BATCH_OBJECTS (60), is halved whenever a batch hits its OWN timeout (retried at once with the
 #      smaller size, down to 5), is remembered per repo in the state file, and doubles once after
-#      a run whose batches all made progress, with no timeouts and a fast last batch. A batch that FAILED
+#      a run whose batches all made progress, with no timeouts and a fast last FULL-size batch (one that had at least
+#      that many unpacked loose objects to pack: the last batch of a drain is usually a REMAINDER of a few objects that
+#      finishes at once whatever the size is, so it is no evidence about the size, and it leaves the verdict of the last
+#      full batch as it was; so does a batch that only pruned copies of objects already in a pack). A batch that FAILED
 #      or did nothing (pack-objects out of space; another maintenance run holding git's lock) is never
 #      "fast": growing on a run where nothing was packed would start the first run after the cause
 #      cleared at ~200 objects (~1GiB loose), which this host cannot pack inside a batch timeout. A batch
@@ -68,16 +71,27 @@
 # it refills shrinks a little every run and still grows — or >= JAC_PACKS_ALARM packs, or the run
 # failed / could not measure / was skipped for low disk / stalled / timed out at the minimum
 # batch size or at gc's own cap. After
-# JAC_ALERT_AFTER (3) consecutive BAD runs one mail goes to the mayor, at most once per
-# JAC_ALERT_EVERY_S (6h). The send is RECORDED FIRST (state last_alert_epoch = now, written before
-# `gc mail send`) and un-recorded when the send fails: a state that cannot be written means NO mail
-# (logged, exit 1) — never a mail every 30 minutes because the timestamp of one that went out was
-# lost — and an undelivered mail is retried next run (delivered != attempted), the log saying WHY.
-# The send has its own cap (JAC_MAIL_TIMEOUT_S, 45s) so a hung gc/Dolt cannot hold the run until the
-# order's kill; a send cut at that cap is delivery UNKNOWN (it may have gone out), so it stays on record —
-# retrying could send it twice. Every case where the mail stays on record without a confirmed delivery — that
-# timeout, a send that failed AND whose slot could not be given back, a run killed between the record and the
-# send — is logged and exits 1, and the next attempt waits out JAC_ALERT_EVERY_S. Exit 1 whenever any repo is BAD, so the order runner shows the failure too --
+# JAC_ALERT_AFTER (3) consecutive BAD runs of a repo one mail goes to the mayor, at most one per repo per
+# JAC_ALERT_EVERY_S (6h) — each repo keeps its own streak and its own last_alert_epoch, so two BAD repos can mail twice in
+# a window, and a send that FAILED is given back and retried (that is not a second mail). The send is RECORDED FIRST (state
+# last_alert_epoch = now, written before `gc mail send`), then ANNOUNCED in the log ("alarm mail: sending now"), then sent, and
+# un-recorded when the send FAILS: a state that cannot be written means NO mail (logged, exit 1) — never a mail every 30
+# minutes because the timestamp of one that went out was lost — and an undelivered mail is retried next run (delivered !=
+# attempted), the log saying WHY. The send has its own cap (JAC_MAIL_TIMEOUT_S, 45s) so a hung gc/Dolt cannot hold the run until
+# the order's kill; a send cut at that cap is delivery UNKNOWN (it may have gone out), so it stays on record — retrying could
+# send it twice.
+# Every announced attempt ends in exactly ONE of these outcome lines (mailed: "alarm mailed to mayor"; cut at the cap: "alarm mail
+# TIMED OUT ... delivery UNKNOWN", stays on record, exit 1; failed: "alarm mail FAILED ... slot given back", retried next run; failed
+# twice: "alarm mail FAILED ... could not be released", stays on record, exit 1) — OR NONE, when the run itself DIES between the record
+# and the outcome (SIGKILL by the order's timeout, the OOM killer, a reboot): a dead process logs nothing and exits with nothing, so
+# no "is logged and exits 1" can be promised for it. That case leaves this trace and no other: the state has the mail on record, and
+# the log (and the order's captured output) ends its alarm lines at "sending now" with no outcome line after it. It means delivery
+# NOT KNOWN, and under doubt the slot stays taken — the next alarm waits out JAC_ALERT_EVERY_S — while the next run's "stale lock ...
+# reclaiming" line (once that lock is over a minute old) shows that a run died. When the record itself cannot be written there is no
+# attempt and no mail: "alarm due but NOT mailed". Selftest S25 F kills a run in the middle of a send and pins all of the above; its
+# trace check also runs over the mails of S9 and of S25 A-E (each attempt ends in exactly one outcome), and S25 F pins that this
+# paragraph's vocabulary is the code's.
+# Exit 1 whenever any repo is BAD, so the order runner shows the failure too --
 # and also when the STATE cannot be updated: the streak is what reaches the alarm, so a run that cannot
 # record it is blind, and must not look green. The state file must be a JSON OBJECT (a valid-JSON
 # `[]`, `5` or `"x"`, an entry that is not an object, or an empty file, is repaired and LOGGED, never silently kept).
@@ -97,8 +111,10 @@
 #
 # CADENCE: order jsonl-archive-compact, interval 30m, timeout 900s; JAC_DEADLINE_S (780s) is
 # this script's own budget so it can log its outcome before the order's timeout fires. One
-# instance at a time: an mkdir lock that records its owner's pid — reclaimed at once when the
-# owner is dead (a run SIGKILLed by the order timeout), after 90m when it still looks alive.
+# instance at a time: an mkdir lock that records its owner's pid — reclaimed when the owner is dead
+# (a run SIGKILLed by the order timeout) and the lock is over a minute old (the floor covers the instant
+# between another run's mkdir and its pid write; a run that finds a younger dead lock yields to it as "in
+# flight" and the next one reclaims it), after 90m when the owner still looks alive.
 # Failing to TAKE the lock is not the same as another run HOLDING it (see take_lock below): only the
 # second is a quiet exit 0. A pid that cannot be recorded, a stale lock that cannot be removed, a lock
 # whose age cannot be read: exit 1 with the reason.
@@ -230,7 +246,8 @@ fmt() { if is_uint "${1:-}"; then echo "$(( $1 / 1024 ))MiB"; else echo "?"; fi;
 
 # measure — fills M_LOOSE_COUNT M_LOOSE_KIB M_PACKS M_PACK_KIB M_GARBAGE_KIB, or returns 1 when
 # git cannot say (never a quiet zero). M_PRUNABLE (loose objects that are ALSO in a pack) is filled when git reports it and
-# is deliberately not required: only the batch-progress rule reads it, and there "unknown" means "not proven".
+# is deliberately not required: only two rules read it — batch progress ("a new pack whose loose copies are all gone") and batch growth
+# ("a batch with at least a full batch of objects to pack") — and in both "unknown" means "not proven", never "fine".
 measure() {
   local out k v
   M_LOOSE_COUNT=""; M_LOOSE_KIB=""; M_PACKS=""; M_PACK_KIB=""; M_GARBAGE_KIB=""; M_PRUNABLE=""
@@ -399,6 +416,9 @@ write_state() {
 # The mail is RECORDED BEFORE it is sent: last_alert_epoch is the only thing that rate-limits it, and it used to be
 # persisted only by the write AFTER the send — when that write failed, a mail that HAD been delivered was forgotten and
 # went out again every run (an action took effect, its record was lost, so it is replayed). Now: no record, no mail.
+# The record is followed by an ATTEMPT line and then the send, and every attempt is followed by exactly ONE outcome line — unless the run
+# itself dies in between (SIGKILL by the order's timeout, the OOM killer, a reboot), which no code in a dead process can log. That case
+# leaves the attempt line with no outcome after it: the trace of "on record, delivery not known" (selftest S25 F kills a run there).
 record() {
   local repo="$1" status="$2" state streak last now bad=0 state_failed=0
   load_state "$repo"; state="$STATE_JSON"
@@ -408,6 +428,7 @@ record() {
   if is_bad "$status"; then bad=1; streak=$((streak + 1)); else streak=0; fi
   if [ "$bad" -eq 1 ] && [ "$streak" -ge "$ALERT_AFTER" ] && [ $((now - last)) -ge "$ALERT_EVERY_S" ]; then
     if write_state "$repo" "$state" "$status" "$streak" "$now" "$now"; then       # the mail is on record from here on
+      log "  alarm mail: sending now, its slot already on record ($repo, status=$status, bad_streak=$streak) — its outcome is logged right after; a log that ends at this line means the run died mid-send and whether the mail went out is not known"
       if send_alarm "$repo" "$status" "$streak"; then
         log "  alarm mailed to mayor ($repo, status=$status, bad_streak=$streak)"
       elif [ "$ALARM_TIMED_OUT" -eq 1 ]; then
@@ -436,7 +457,7 @@ BAD_ANY=0
 EXISTING=0
 
 compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller handles is_bad via record
-  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed
+  local repo="$1" t0 before_loose before_packs before_kib batches=0 prev_count prev_packs prev_unpacked prev_loose need out rc t_left batch_left b0 took timeouts=0 fast=0 saved by_deadline progressed over
   R_GITDIR="$repo/.git"
   STATUS="ok"; G_KIB=""; R_PROGRESS=0; R_BATCH_SAVE=""
   t0="$(date +%s)"
@@ -458,7 +479,9 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
     G_KIB="$(gitdir_kib)"
     R_VERDICT=""
     if [ "$M_LOOSE_KIB" -ge "$LOOSE_ALARM_KIB" ]; then check_draining "$repo"; fi
-    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")${R_VERDICT:+ — over the alarm size but $R_VERDICT}"
+    # the exit code alone (3) is not enough for someone reading the line: it must not look like a healthy one
+    over=""; if is_bad ok; then over=" — OVER THE ALARM SIZE (loose >= $(fmt "$LOOSE_ALARM_KIB") or packs >= $PACKS_ALARM) and nothing excuses it: --check exits 3"; fi
+    log "repo=$repo mode=check loose=$(fmt "$M_LOOSE_KIB")/${M_LOOSE_COUNT}obj packs=$M_PACKS packed=$(fmt "$M_PACK_KIB") garbage=$(fmt "$M_GARBAGE_KIB") .git=$(fmt "$G_KIB")${R_VERDICT:+ — over the alarm size but $R_VERDICT}$over"
     return
   fi
 
@@ -473,6 +496,9 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
         if [ "$(remaining)" -lt "$MIN_BATCH_S" ]; then STATUS="deferred"; break; fi
         if [ "$MAX_BATCHES" -gt 0 ] && [ "$batches" -ge "$MAX_BATCHES" ]; then STATUS="deferred"; break; fi
         prev_count="$M_LOOSE_COUNT"; prev_packs="$M_PACKS"
+        # what this batch has to pack: the loose objects that are NOT already in a pack (git prunes those first). "" = git did not
+        # say, which is "not proven" — the same direction as everywhere else in this file
+        prev_unpacked=""; if is_uint "$M_PRUNABLE" && [ "$M_PRUNABLE" -le "$prev_count" ]; then prev_unpacked=$(( prev_count - M_PRUNABLE )); fi
         # t_left is the smaller of the per-batch timeout and what is left of the RUN: a kill at the first is a batch that was too
         # big, a kill at the second is the budget ending (equal = the batch's own cap)
         budget_for "$GIT_TIMEOUT_S"; batch_left="$t_left"     # t_left is reused for the prune below; "fast" is judged against THIS
@@ -527,8 +553,14 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
           break
         fi
         # "fast" is judged only for a batch that PACKED something: a batch that died at once or did nothing is the quickest one
-        # there is, and crediting it doubled the remembered size on runs where nothing succeeded
-        [ "$((took * 4))" -lt "$batch_left" ] && fast=1 || fast=0
+        # there is, and crediting it doubled the remembered size on runs where nothing succeeded. It is judged only for a FULL-size
+        # batch too — one that had at least R_BATCH unpacked objects to pack. The last batch of a drain is a REMAINDER (fewer objects
+        # left than the batch size) that finishes at once whatever the size is: crediting it doubled the remembered size after two
+        # batches that were each nearly too slow, and a batch that only pruned copies of objects already packed is the same
+        # thing. Those leave `fast` as the last full batch set it. (The variable decided on must be the one acted on.)
+        if [ -n "$prev_unpacked" ] && [ "$prev_unpacked" -ge "$R_BATCH" ]; then
+          [ "$((took * 4))" -lt "$batch_left" ] && fast=1 || fast=0
+        fi
       done
       [ "$STATUS" = ok ] && STATUS="packed-loose"
       # grow the remembered batch once, and only after a run that was still making progress (packed everything, or ran out of
@@ -597,6 +629,10 @@ compact_repo() {  # compact_repo <repo> — sets STATUS, returns nothing; caller
 #   run died, before it counts as stale — bounded, and the next run reclaims it), or another run took it in the instant after this one
 #   removed a stale one                                                              → exit 0, "in flight": the only quiet no-op there is
 #   anything else (cannot create it, cannot remove a stale one, cannot read its age, cannot record our pid) → exit 1, and the log says which
+# Known and accepted: the reclaim of a stale lock is check-then-act (lock_release, then mkdir). Two runs that both saw the same stale lock can each
+# pass lock_release, the second removing the first's fresh lock, so both hold it. That takes two runs within about a second — the order is one
+# instance whose interval (30m) exceeds its timeout (900s), so it needs a manual run racing a tick — and what two runs can then do to one repo is
+# limited by git's own locks: a second gc is refused (gc.pid, selftest S8) and a second `maintenance run` skips its task (maintenance.lock).
 lock_owner_alive() { local p; p="$(cat "$LOCK/pid" 2>/dev/null)"; is_uint "$p" && kill -0 "$p" 2>/dev/null; }
 lock_older_than() {  # lock_older_than <minutes> — 0 = older, 1 = not older, 2 = could not tell (find failed): never "not older"
   local o

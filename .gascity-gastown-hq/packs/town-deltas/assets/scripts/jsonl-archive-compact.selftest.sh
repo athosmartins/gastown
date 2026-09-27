@@ -120,7 +120,7 @@ chmod +x "$WORK/git-fx"
 # run_jac <repo...> [-- --check]: the script under test, sealed off from the real world.
 run_jac() {
   local repos="$1"; shift
-  JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="$WORK/gc-stub" \
+  JAC_REPOS="$repos" JAC_STATE="${T_STATE:-$WORK/state.json}" JAC_LOG="${T_LOG:-$WORK/log}" JAC_LOCK="${T_LOCK:-$WORK/lock}" JAC_GC="${T_GC:-$WORK/gc-stub}" \
   JAC_LOOSE_LIMIT_KIB="${T_LIMIT:-1024}" JAC_LOOSE_ALARM_KIB="${T_ALARM:-100000}" JAC_BATCH_OBJECTS="${T_BATCH:-25}" \
   JAC_PACKS_LIMIT="${T_PACKS:-8}" JAC_PACKS_ALARM="${T_PACKS_ALARM:-20}" JAC_FREE_KIB="${T_FREE:-90000000}" \
   JAC_ALERT_EVERY_S="${T_ALERT_EVERY:-21600}" JAC_HEADROOM_KIB=0 \
@@ -132,6 +132,22 @@ run_jac() {
 last_status() { grep -o 'status=[a-z-]*' "$WORK/log" | tail -1 | cut -d= -f2; }
 state_field() { jq -r --arg r "$1" ".[\$r].$2" "$WORK/state.json" 2>/dev/null; }
 mail_calls()  { [ -f "$WORK/gc-calls" ] && wc -l < "$WORK/gc-calls" | tr -d ' ' || echo 0; }
+# alarm_trace <log> — the alarm's LOG PROTOCOL as one word: every announced attempt ("alarm mail: sending now") is followed by exactly one outcome
+# line (mailed / TIMED OUT / FAILED), and an outcome never appears without its attempt. Prints
+#   closed          every attempt ended in exactly one outcome (or there were none)
+#   open            the LAST attempt has no outcome — what a run that died mid-send leaves
+#   BROKEN:<why>    an outcome with no attempt, a second outcome, or a new attempt over an unfinished one that no dead run explains
+# An unfinished attempt followed by a new attempt is legitimate only when a "stale lock ... reclaiming" line lies between them (the dead run's
+# lock was reclaimed). This is the structural half of the header's promise: it runs over the mails of S9 and of S25 A-E (each must end closed), and
+# S25 F pins the one case it cannot close — a dead run — so the protocol is checked over many scenarios, not one.
+alarm_trace() {
+  awk '
+    /alarm mail: sending now/ { if (open && !reclaimed) { print "BROKEN:attempt over an unfinished one"; bad = 1; exit } open = 1; reclaimed = 0; next }
+    /stale lock \(owner gone/ { reclaimed = 1; next }
+    /alarm mailed to mayor|alarm mail TIMED OUT|alarm mail FAILED/ { if (!open) { print "BROKEN:outcome without an attempt"; bad = 1; exit } open = 0; next }
+    END { if (!bad) print (open ? "open" : "closed") }
+  ' "$1"
+}
 
 echo "=== jsonl-archive-compact.selftest.sh ==="
 [ -x "$SCRIPT" ] && ok "script exists and is executable" || { bad "script missing or not executable: $SCRIPT"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP ==="; exit 1; }
@@ -275,15 +291,24 @@ grep 'alarm mail FAILED' "$WORK/log" | tail -1 | grep -q 'mail refused' \
   || bad "failed-mail log line has no cause: $(grep 'alarm mail FAILED' "$WORK/log" | tail -1)"
 run_jac "$G" >/dev/null
 [ "$(state_field "$G" bad_streak)" = 0 ] && ok "a good run resets bad_streak to 0" || bad "bad_streak=$(state_field "$G" bad_streak) after a good run"
+[ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" -ge 4 ] \
+  && ok "log protocol: every one of the $(grep -c 'alarm mail: sending now' "$WORK/log") mail attempts above is announced ('sending now') and ends in exactly one outcome line" \
+  || bad "alarm log protocol broken over the S9 mails: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log")"
 
 echo ""
 echo "=== S10: --check is read-only and reports BAD by exit code ==="
 H="$WORK/h"; mkrepo "$H" 20; LC="$(loose_count "$H")"; rm -rf "$WORK/state.json" "$WORK/log" "$WORK/lock"
 out="$(T_ALARM=1024 run_jac "$H" --check)"; rc=$?
 [ "$rc" -eq 3 ] && ok "over the alarm size (measured, no order verdict to excuse it) → exit 3" || bad "--check exit $rc, want 3: $out"
+printf '%s' "$out" | grep -q 'OVER THE ALARM SIZE' && ok "...and the LINE says so in words ('OVER THE ALARM SIZE'), so it cannot be read as a healthy one when only the exit code differs" || bad "--check's over-alarm line looks like a healthy one: $out"
 [ "$(loose_count "$H")" = "$LC" ] && [ ! -e "$WORK/state.json" ] && [ ! -e "$WORK/log" ] && [ ! -e "$WORK/lock" ] && ok "read-only: no repack, no state, no log, no lock" || bad "--check wrote something"
 out="$(run_jac "$H" --check)"; rc=$?
 [ "$rc" -eq 0 ] && ok "under the alarm size → exit 0" || bad "--check exit $rc on a healthy repo: $out"
+printf '%s' "$out" | grep -q 'OVER THE ALARM SIZE' && bad "a healthy repo's --check line claims to be over the alarm size: $out" || ok "...and a healthy repo's line does not say 'OVER THE ALARM SIZE'"
+# the packs alarm is an alarm size too: 5 packs against JAC_PACKS_ALARM=3
+HP="$WORK/hp"; mkrepo "$HP" 1; for i in 2 3 4 5; do addpack "$HP" "$i"; done
+out="$(T_PACKS_ALARM=3 run_jac "$HP" --check)"; rc=$?
+{ [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q 'OVER THE ALARM SIZE'; } && ok "packs >= the packs alarm → exit 3 and the line says 'OVER THE ALARM SIZE'" || bad "packs alarm --check wrong (rc=$rc): $out"
 
 echo ""
 echo "=== S12: a loaded host — a batch that times out is halved and retried, and the size is remembered ==="
@@ -599,6 +624,9 @@ else
 fi
 grep -q 'forced failure' "$WORK/log" && ok "(A) the jq reason is in the log" || bad "(A) the failure has no cause in the log: $(tail -n 3 "$WORK/log" | tr '\n' ' ')"
 grep 'state update FAILED' "$WORK/log" | grep -q 'alarm is blind' && bad "(A) the log still claims the alarm is 'blind' although at streak >= threshold the old behaviour was to REPEAT it" || ok "(A) no false 'blind' claim in the failure text"
+{ [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 0 ]; } \
+  && ok "(A) log protocol: a mail that could not be recorded is never announced as 'sending now' (0 attempts, 0 outcomes)" \
+  || bad "(A) a mail that was never recorded or sent left an attempt line: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log")"
 
 # (B) control: a healthy state → exactly one mail, on record, and the rate limit holds
 seed_due; run_due >/dev/null; run_due >/dev/null
@@ -608,6 +636,9 @@ if [ "$(mail_calls)" = 1 ] && [ "$la" -ge "$T25" ] 2>/dev/null; then
 else
   bad "(B) healthy path wrong (mails=$(mail_calls) last_alert_epoch=$la)"
 fi
+{ [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 1 ] && [ "$(grep -c 'alarm mailed to mayor' "$WORK/log")" = 1 ]; } \
+  && ok "(B) log protocol: 1 announced attempt, 1 'alarm mailed' outcome after it" \
+  || bad "(B) log protocol broken: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log"), mailed=$(grep -c 'alarm mailed to mayor' "$WORK/log")"
 
 # (C) a send that FAILS gives the slot back — attempted != delivered — and the next run retries
 seed_due; STUB_FAIL=1 run_due >/dev/null
@@ -618,6 +649,9 @@ else
 fi
 run_due >/dev/null
 [ "$(mail_calls)" = 2 ] && [ "$(state_field "$G3" last_alert_epoch)" -ge "$T25" ] 2>/dev/null && ok "(C) the next run retries and records the mail that really went out" || bad "(C) no retry after a failed send (mails=$(mail_calls))"
+{ [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 2 ]; } \
+  && ok "(C) log protocol: the failed attempt and the retry are each announced and each end in exactly one outcome" \
+  || bad "(C) log protocol broken: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log")"
 
 # (D) double fault: the send failed AND the slot could not be given back. The mail was NOT delivered, but it stays on record,
 # so the next attempt waits out the window (bounded: ALERT_EVERY_S) — and both facts are logged and fail the run.
@@ -627,6 +661,9 @@ seed_due; STUB_FAIL=1 JQ_FAIL_WRITES=2 run_due >/dev/null; rc=$?
   || bad "(D) double fault not loud (rc=$rc): $(grep 'alarm' "$WORK/log" | tail -n 3 | tr '\n' ' ')"
 run_due >/dev/null
 [ "$(mail_calls)" = 1 ] && ok "(D) the slot stays held for the window: no mail storm even then (1 attempt, retried after JAC_ALERT_EVERY_S)" || bad "(D) double fault re-mailed (mails=$(mail_calls))"
+{ [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 1 ]; } \
+  && ok "(D) log protocol: 1 announced attempt, closed by its 'FAILED' outcome" \
+  || bad "(D) log protocol broken: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log")"
 
 # (E) a HUNG send is bounded by its own cap (a hung gc/Dolt must not hold the run until the order's kill). A send cut at
 # the cap is delivery UNKNOWN — it may have gone out and only its return hung — so, unlike a send that FAILED (C: gc said
@@ -642,9 +679,64 @@ if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; th
   fi
   run_due >/dev/null
   [ "$(mail_calls)" = 1 ] && ok "(E) no second send while the first one's delivery is unknown (1 attempt in the window)" || bad "(E) an unknown-delivery send was retried at once (mails=$(mail_calls))"
+  { [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 1 ]; } \
+    && ok "(E) log protocol: the announced attempt is closed by its 'TIMED OUT' outcome" \
+    || bad "(E) log protocol broken: $(alarm_trace "$WORK/log"), attempts=$(grep -c 'alarm mail: sending now' "$WORK/log")"
 else
   skip "(E) no timeout/gtimeout on this host — the bounded-send check did NOT run"
 fi
+
+# (F) the run DIES between the record and the outcome — SIGKILL by the order's timeout, the OOM killer, a reboot. A dead process can log nothing and
+# exit with nothing, so the header may not promise "is logged and exits 1" for it (it did, and the gate caught the claim). What it CAN promise, and
+# this pins, is the TRACE: the mail is on record, the log's alarm lines end at "sending now" with no outcome after them, the dead run's lock is left
+# behind and later reclaimed, and the slot stays taken (delivery not known: under doubt the inert state is "do not contact again"). The stub is `gc`
+# itself: called to send the mail it SIGKILLs the run — the pid the run recorded in its own lock — and never answers. Deterministic, no timing.
+cat > "$WORK/gc-suicide" <<EOF
+#!/bin/bash
+printf 'CALL %s\\n' "\$(printf '%s' "\$*" | tr '\\n' ' ')" >> "$WORK/gc-calls"
+kill -9 "\$(cat "$WORK/lock/pid")"
+exit 0
+EOF
+chmod +x "$WORK/gc-suicide"
+seed_due; rm -rf "$WORK/lock"
+out="$(T_GC="$WORK/gc-suicide" run_due 2>&1)"; rc=$?
+[ "$rc" -eq 137 ] && [ "$(mail_calls)" = 1 ] && ok "(F) the run was SIGKILLed inside its own send (exit 137 = killed by signal 9: no exit path, no trap ran; gc was called once)" || bad "(F) the kill did not land mid-send (rc=$rc mails=$(mail_calls)): $out"
+{ [ "$(alarm_trace "$WORK/log")" = open ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 1 ] && ! grep -q 'alarm mailed to mayor\|alarm mail TIMED OUT\|alarm mail FAILED' "$WORK/log"; } \
+  && ok "(F) the trace: the log holds the announced attempt ('sending now') and NO outcome line after it — delivery not known, and visibly so" \
+  || bad "(F) a run killed mid-send left no attempt-without-outcome trace (trace=$(alarm_trace "$WORK/log")): $(grep 'alarm' "$WORK/log" | tail -n 3 | tr '\n' ' ')"
+{ [ "$(state_field "$G3" last_alert_epoch)" -ge "$T25" ] && [ "$(state_field "$G3" bad_streak)" = 6 ]; } 2>/dev/null \
+  && ok "(F) the state says what the log says: the mail is on record (last_alert_epoch=$(state_field "$G3" last_alert_epoch)) and the streak advanced (6)" \
+  || bad "(F) state after the kill: last_alert_epoch=$(state_field "$G3" last_alert_epoch) bad_streak=$(state_field "$G3" bad_streak)"
+[ -d "$WORK/lock" ] && ok "(F) the dead run's lock is left behind (its EXIT trap never ran), as the lock section of the header describes" || bad "(F) no lock left by a SIGKILLed run"
+touch -t "$(date -v-5M +%Y%m%d%H%M.%S 2>/dev/null || date -d '5 minutes ago' +%Y%m%d%H%M.%S)" "$WORK/lock"
+run_due >/dev/null; rc=$?
+{ [ "$rc" -eq 1 ] && [ "$(mail_calls)" = 1 ] && grep -q 'stale lock (owner gone' "$WORK/log" && [ "$(alarm_trace "$WORK/log")" = open ]; } \
+  && ok "(F) the next run reclaims the dead run's lock ('stale lock ... reclaiming' in the log), does NOT mail again inside the window (1 call in total), and the unfinished attempt stays visible" \
+  || bad "(F) run after the kill wrong (rc=$rc mails=$(mail_calls) trace=$(alarm_trace "$WORK/log")): $(tail -n 3 "$WORK/log" | tr '\n' ' ')"
+T_ALERT_EVERY=0 run_due >/dev/null
+{ [ "$(mail_calls)" = 2 ] && [ "$(alarm_trace "$WORK/log")" = closed ] && [ "$(grep -c 'alarm mail: sending now' "$WORK/log")" = 2 ]; } \
+  && ok "(F) once the window has passed the alarm goes out again, its attempt closed by an outcome (the unfinished one before it is explained by the reclaimed lock)" \
+  || bad "(F) no alarm after the window / protocol broken (mails=$(mail_calls) trace=$(alarm_trace "$WORK/log"))"
+[ ! -d "$WORK/lock" ] && ok "(F) no lock left after a normal run" || bad "(F) a lock is left after a normal run"
+# the trace check itself bites: each of its three verdicts is reachable
+tl="$WORK/trace-fixture.log"
+printf '%s\n' 'x alarm mail: sending now' 'x alarm mailed to mayor' > "$tl";                        t1="$(alarm_trace "$tl")"
+printf '%s\n' 'x alarm mail: sending now' > "$tl";                                                 t2="$(alarm_trace "$tl")"
+printf '%s\n' 'x alarm mail: sending now' 'x alarm mail: sending now' > "$tl";                      t3="$(alarm_trace "$tl")"
+printf '%s\n' 'x alarm mailed to mayor' > "$tl";                                                    t4="$(alarm_trace "$tl")"
+printf '%s\n' 'x alarm mail: sending now' 'x stale lock (owner gone, x)' 'x alarm mail: sending now' 'x alarm mail FAILED (y)' > "$tl"; t5="$(alarm_trace "$tl")"
+{ [ "$t1" = closed ] && [ "$t2" = open ] && [ "${t3%%:*}" = BROKEN ] && [ "${t4%%:*}" = BROKEN ] && [ "$t5" = closed ]; } \
+  && ok "(F) the protocol check bites: pair=closed, lone attempt=open, attempt over an unfinished one=BROKEN, outcome without attempt=BROKEN, unfinished + reclaim + new pair=closed" \
+  || bad "(F) protocol check verdicts wrong: pair=$t1 lone=$t2 double=$t3 orphan-outcome=$t4 reclaimed=$t5"
+# the header names the log lines the alarm path emits — every phrase it quotes must really be one of the script's log lines (a comment that promises a trace
+# the code does not write is worse than none: it stops the next reader from looking for the hole)
+header="$(sed -n '1,/^set -uo pipefail/p' "$SCRIPT" | sed 's/^#[ ]*//' | tr '\n' ' ' | tr -s ' ')"
+missing=""
+for m in 'alarm mail: sending now' 'alarm mailed to mayor' 'alarm mail TIMED OUT' 'delivery UNKNOWN' 'alarm mail FAILED' 'slot given back' 'could not be released' 'alarm due but NOT mailed' 'stale lock'; do
+  case "$header" in *"$m"*) ;; *) missing="$missing [header lacks: $m]" ;; esac
+  grep 'log "' "$SCRIPT" | grep -qF -- "$m" || missing="$missing [no log line has: $m]"
+done
+[ -z "$missing" ] && ok "(F) the header's alarm vocabulary is the code's: all 9 phrases it quotes are in the header AND on a log line" || bad "(F) header/code drift in the alarm log vocabulary:$missing"
 
 echo ""
 echo "=== S26: 'could not take the lock' is NOT 'another run holds it' — the lock has three outcomes and only one may be a quiet exit 0 ==="
@@ -752,6 +844,7 @@ edit_state() { jq --arg r "$HC" "$1" "$WORK/state.json" > "$WORK/state.new" && m
 check_rc() { out="$(T_ALARM=1024 run_jac "$HC" --check)"; rc=$?; }
 seed_verdict base; ST_SUM="$(shasum "$WORK/state.json" | cut -d' ' -f1)"; check_rc
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'draining'; } && ok "over the alarm size, but the order's last run is fresh, ended at bad_streak 0 → --check exit 0 and says it is judged draining" || bad "--check ignored a fresh draining verdict (rc=$rc): $out"
+printf '%s' "$out" | grep -q 'OVER THE ALARM SIZE' && bad "an EXCUSED (draining) over-alarm backlog is worded as an unexcused one: $out" || ok "the excused line says 'judged draining', not 'OVER THE ALARM SIZE' (the words are only for a backlog nothing excuses)"
 [ "$(shasum "$WORK/state.json" | cut -d' ' -f1)" = "$ST_SUM" ] && ok "--check left the state file byte-identical (still read-only)" || bad "--check rewrote the state file"
 seed_verdict stale; edit_state '.[$r].last_run_epoch = (now | floor) - 99999'; check_rc
 [ "$rc" -eq 3 ] && ok "a STALE verdict (the order has not run for a day) excuses nothing → exit 3" || bad "stale verdict excused an over-alarm backlog (rc=$rc)"
@@ -857,6 +950,64 @@ cp "$SCRIPT" "$WORK/lint-mutant.sh"
 printf '%s\n' 'cleanup_thing || true' 'other_thing || true   # benign[x]: a short one' 'ok_thing || true   # benign[some-key]: this is a sufficiently long reason' 'mkdir -p /x' 'rm -f /y 2>/dev/null' >> "$WORK/lint-mutant.sh"
 mm="$(lint_sites "$WORK/lint-mutant.sh" | grep -c '|MISSING|')"; mb="$(lint_sites "$SCRIPT" | grep -c '|MISSING|')"
 [ "$((mm - mb))" -eq 4 ] && ok "the lint bites: 4 unjustified discards appended (bare || true, a 1-word reason, mkdir -p, silenced rm) are all reported; the justified one is not" || bad "lint did not catch the mutant (reported $((mm - mb)) of 4)"
+
+echo ""
+echo "=== S31: the remembered batch size is judged by FULL batches — a REMAINDER batch, or one that only pruned, is no evidence about the size ==="
+# The last batch of a drain is a remainder (fewer loose objects left than the batch size): it finishes at once whatever the size is. "fast" used to be
+# taken from the LAST batch, so two full batches that were each nearly too slow (took*4 just under the cap: not fast) followed by an instant remainder
+# doubled the remembered size, and the next big drain wasted a whole batch cap finding out it was too big. Decided-on (the speed of a partial batch) !=
+# acted-on (the size of full ones). git-slowfull slows ONLY a maintenance run that has at least a full batch of unpacked loose objects to pack.
+cat > "$WORK/git-slowfull" <<'EOF'
+#!/bin/bash
+gd=""; n=""; for a in "$@"; do case "$a" in --git-dir=*) gd="${a#--git-dir=}" ;; maintenance.loose-objects.batchSize=*) n="${a#*=}" ;; esac; done
+case " $* " in *" maintenance run "*)
+  c="$(git --git-dir="$gd" count-objects -v | awk '/^count:/{print $2}')"; p="$(git --git-dir="$gd" count-objects -v | awk '/^prune-packable:/{print $2}')"
+  s="$(date +%s)"
+  if [ -n "$n" ] && [ $((c - p)) -ge "$n" ]; then sleep "${SLOWFULL_S:-0}"; fi
+  git "$@"; rc=$?
+  echo "$((c - p)) $(( $(date +%s) - s ))" >> "$SLOWFULL_LOG"      # <unpacked loose objects when it started> <seconds it took>
+  exit $rc ;;
+esac
+exec git "$@"
+EOF
+chmod +x "$WORK/git-slowfull"
+run_full() { SLOWFULL_S="$1" SLOWFULL_LOG="$WORK/git-fullbatches" T_GIT="$WORK/git-slowfull" T_GIT_TIMEOUT=20 T_BATCH="${3:-25}" run_jac "$2"; }   # run_full <sleep-s of a full batch> <repo> [batch size]
+# (a) the reviewer's repro: 60 loose objects, batch 25 → full (60), full (35), remainder (10). The two full batches take ~6s of a 20s cap (6*4 >= 20: not fast).
+RM="$WORK/rem"; mkrepo "$RM" 20; rm -f "$WORK/state.json" "$WORK/git-fullbatches"
+out="$(run_full 6 "$RM")"; rc=$?
+rem_took="$(tail -n 1 "$WORK/git-fullbatches" 2>/dev/null | awk '{print $2}')"; rem_n="$(tail -n 1 "$WORK/git-fullbatches" 2>/dev/null | awk '{print $1}')"
+if [ "$(wc -l < "$WORK/git-fullbatches" | tr -d ' ')" != 3 ] || [ "${rem_n:-99}" -ge 25 ]; then
+  if printf '%s' "$out" | grep -q 'timed out'; then
+    skip "S31 (a) host too loaded: a full batch hit the 20s cap, so the fixture (2 full batches + a remainder) did not form — the remainder check did NOT run"
+  else
+    bad "S31 (a) fixture: expected 3 batches (full, full, remainder), got: $(tr '\n' ';' < "$WORK/git-fullbatches") rc=$rc: $out"
+  fi
+elif [ "${rem_took:-99}" -ge 5 ]; then
+  skip "S31 (a) host too loaded: the remainder batch took ${rem_took}s (it must be under 5s to look fast) — the remainder check did NOT run"
+else
+  [ "$rc" -eq 0 ] && [ "$(loose_count "$RM")" = 0 ] && [ "$(last_status)" = "packed-loose" ] && ok "(a) drained by 2 slow full batches + 1 instant remainder (batches: $(tr '\n' ';' < "$WORK/git-fullbatches"))" || bad "(a) drain wrong (rc=$rc loose=$(loose_count "$RM") status=$(last_status))"
+  [ "$(state_field "$RM" batch_objects)" = 25 ] && ok "(a) the remembered size stays 25: an instant REMAINDER after two slow full batches is no evidence that 25 is too small" || bad "(a) remembered batch_objects=$(state_field "$RM" batch_objects), want 25 — the remainder batch was credited as fast"
+fi
+# (b) control: growth itself is intact — full batches that ARE fast (and a remainder after them) still double the size once
+RF="$WORK/remfast"; mkrepo "$RF" 20; rm -f "$WORK/state.json" "$WORK/git-fullbatches"
+out="$(run_full 0 "$RF")"; rc=$?
+[ "$rc" -eq 0 ] && [ "$(state_field "$RF" batch_objects)" = 50 ] && ok "(b) control: full batches that were fast (then a remainder) still double the remembered size once (25 -> 50)" || bad "(b) growth broken (rc=$rc batch_objects=$(state_field "$RF" batch_objects), want 50): $out"
+# (c) a batch that only PRUNED: every loose object is already in a pack, so there is nothing left to pack (the pack count stays put) and the loose copies
+# are just removed. It is the fastest batch there is and proves nothing about packing 25 objects. prune-packable (60) is subtracted from the loose
+# count (60): 0 to pack, not full.
+RP="$WORK/rempr"; mkrepo "$RP" 20; rm -f "$WORK/state.json" "$WORK/git-fullbatches"
+git --git-dir="$RP/.git" rev-list --objects --all | git --git-dir="$RP/.git" pack-objects -q "$RP/.git/objects/pack/pack" >/dev/null
+pk0="$(git --git-dir="$RP/.git" count-objects -v | awk '/^prune-packable:/{print $2}')"; lc0="$(loose_count "$RP")"
+out="$(run_full 0 "$RP")"; rc=$?
+{ [ "$pk0" = "$lc0" ] && [ "$lc0" -ge 25 ]; } || bad "S31 (c) fixture: want every loose object already packed (prune-packable=$pk0 loose=$lc0)"
+{ [ "$rc" -eq 0 ] && [ "$(loose_count "$RP")" = 0 ] && [ "$(state_field "$RP" batch_objects)" = 25 ]; } \
+  && ok "(c) a batch that only pruned copies of already-packed objects ($lc0 of $lc0 loose were packed) does not grow the size (stays 25)" \
+  || bad "(c) prune-only batch handled wrong (rc=$rc loose=$(loose_count "$RP") batch_objects=$(state_field "$RP" batch_objects), want 0 and 25): $out"
+# (d) the boundary: a batch that had EXACTLY a full batch of objects to pack (60 loose, batch 60) packed a full-size batch — if it was fast, it counts
+RE="$WORK/remexact"; mkrepo "$RE" 20; rm -f "$WORK/state.json" "$WORK/git-fullbatches"
+out="$(run_full 0 "$RE" 60)"; rc=$?
+{ [ "$(loose_count "$RE")" = 0 ] && [ "$(wc -l < "$WORK/git-fullbatches" | tr -d ' ')" = 1 ] && [ "$(awk '{print $1}' "$WORK/git-fullbatches")" = 60 ]; } || bad "S31 (d) fixture: want ONE batch that started with exactly 60 unpacked objects (batches: $(tr '\n' ';' < "$WORK/git-fullbatches") loose=$(loose_count "$RE"))"
+[ "$rc" -eq 0 ] && [ "$(state_field "$RE" batch_objects)" = 120 ] && ok "(d) a batch of exactly the batch size (60 of 60) is a full batch: fast → the size doubles once (60 -> 120)" || bad "(d) boundary wrong (rc=$rc batch_objects=$(state_field "$RE" batch_objects), want 120): $out"
 
 echo ""
 echo "=== S11: what actually runs in production ==="
