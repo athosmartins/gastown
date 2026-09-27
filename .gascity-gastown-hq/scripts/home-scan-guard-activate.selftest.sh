@@ -174,9 +174,12 @@ fi
 echo ""
 echo "-- case 7: the registered command really is fail-open and really propagates a block --"
 CMD="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$F1")"
-printf '#!/bin/bash\ncat >/dev/null\necho BLOCKED-BY-STUB >&2\nexit 2\n' > "$STUB"; chmod +x "$STUB"
+# The stub speaks the wrapper's own protocol (the marker line first on stderr, then exit 2). It used to print a bare
+# BLOCKED-BY-STUB and rely on ANY exit 2 propagating; that is the contract case 11 retired on purpose -- a bare exit 2 is what a
+# syntax error in the wrapper looks like, and it must not block.
+printf '#!/bin/bash\ncat >/dev/null\necho "home-scan-guard: BLOCKED (BLOCKED-BY-STUB)" >&2\nexit 2\n' > "$STUB"; chmod +x "$STUB"
 OUT="$(echo '{}' | sh -c "$CMD" 2>&1 >/dev/null)"; RC=$?
-[ "$RC" -eq 2 ] && [[ "$OUT" == *BLOCKED-BY-STUB* ]] && ok "guard present: its exit 2 and stderr reach Claude Code through the hook command" || bad "propagation: rc=$RC out=$OUT"
+[ "$RC" -eq 2 ] && [[ "$OUT" == *BLOCKED-BY-STUB* ]] && ok "guard present: its BLOCK verdict (exit 2 + marker) and stderr reach Claude Code through the hook command" || bad "propagation: rc=$RC out=$OUT"
 printf '#!/bin/bash\nexit 0\n' > "$STUB"
 echo '{}' | sh -c "$CMD" >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 0 ] && ok "guard present and allowing: exit 0" || bad "allow path: rc=$RC"
@@ -306,6 +309,53 @@ F10G="$SCRATCH/foreign-only.json"; echo '{"hooks":{"PreToolUse":[{"matcher":"^Ba
 bash "$ACTIVATE" "$F10G" >/dev/null 2>&1
 jq -e '(.hooks.PreToolUse | length) == 1 and (.hooks.PreToolUse[0].hooks | length) == 2 and .hooks.PreToolUse[0].hooks[0].command == "/opt/other-team/deny-rm.sh"' "$F10G" >/dev/null \
   && ok "a ^Bash$ entry that held only a foreign hook keeps it (first) and gains ours" || bad "foreign-only ^Bash$ entry: $(jq -c . "$F10G")"
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- case 11: the REGISTERED command is itself fail-open (gate round 3) --"
+# `exec /bin/bash "$P"` handed bash's OWN exit status to Claude Code, and bash exits 2 on a SYNTAX ERROR in the script (a file half-
+# written by a checkout, a bad merge). Exit 2 is how a hook says BLOCK, so a broken wrapper blocked EVERY Bash call of every agent --
+# the one failure a guard that must fail open exists to never cause. Only the wrapper's own verdict (rc 2 AND its marker line on
+# stderr) may block; anything else is exit 0, and counted (UNGUARDED). The registered command is executed for real, under each
+# shell Claude Code might run it with, against scratch guard scripts.
+F11="$SCRATCH/cmd.json"; echo '{}' > "$F11"
+bash "$ACTIVATE" "$F11" >/dev/null 2>&1
+HOOK11="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$F11")"
+LOG11="$SCRATCH/case11.log"
+# run_hook <shell> <guard script body>  -> RC, ERR
+run_hook() {
+  printf '%s\n' "$2" > "$STUB"; : > "$LOG11"
+  ERR="$(printf '{"tool_name":"Bash"}' | HOME_SCAN_GUARD_LOG="$LOG11" "$1" -c "$HOOK11" 2>&1 >/dev/null)"; RC=$?
+}
+for SH in sh bash zsh; do
+  command -v "$SH" >/dev/null 2>&1 || { echo "  (skip: no $SH on this machine)"; continue; }
+  run_hook "$SH" 'if then fi ( (('
+  [ "$RC" -eq 0 ] && grep -q 'result=UNGUARDED' "$LOG11" \
+    && ok "[$SH] a wrapper with a SYNTAX ERROR (bash exits 2) does not block: exit 0, counted as UNGUARDED" \
+    || bad "[$SH] syntax-error wrapper: rc=$RC (want 0 + an UNGUARDED line) log=[$(cat "$LOG11")] err=[${ERR:0:120}]"
+  run_hook "$SH" 'exit 2'
+  [ "$RC" -eq 0 ] && grep -q 'result=UNGUARDED' "$LOG11" \
+    && ok "[$SH] exit 2 WITHOUT the guard's marker line is not a block (python's own usage error exits 2 too): exit 0, counted" \
+    || bad "[$SH] marker-less exit 2: rc=$RC log=[$(cat "$LOG11")]"
+  run_hook "$SH" 'exit 1'
+  [ "$RC" -eq 0 ] && grep -q 'result=UNGUARDED' "$LOG11" \
+    && ok "[$SH] a wrapper that exits 1 does not block, and is counted" || bad "[$SH] exit 1: rc=$RC log=[$(cat "$LOG11")]"
+  run_hook "$SH" 'kill -9 $$'
+  [ "$RC" -eq 0 ] && grep -q 'result=UNGUARDED' "$LOG11" \
+    && ok "[$SH] a wrapper killed by a signal does not block, and is counted" || bad "[$SH] killed wrapper: rc=$RC log=[$(cat "$LOG11")]"
+  run_hook "$SH" 'echo "home-scan-guard: BLOCKED (du ~ -- a scan)" >&2; echo "why: TCC" >&2; exit 2'
+  [ "$RC" -eq 2 ] && [[ "$ERR" == *"home-scan-guard: BLOCKED (du ~ -- a scan)"* && "$ERR" == *"why: TCC"* ]] && [ ! -s "$LOG11" ] \
+    && ok "[$SH] the wrapper's own verdict (rc 2 + marker) still BLOCKS, with its whole message on stderr, and is not logged as a failure" \
+    || bad "[$SH] a real block: rc=$RC err=[${ERR:0:160}] log=[$(cat "$LOG11")]"
+  run_hook "$SH" 'exit 0'
+  [ "$RC" -eq 0 ] && [ ! -s "$LOG11" ] && [ -z "$ERR" ] \
+    && ok "[$SH] an allowing wrapper: exit 0, silent, nothing logged" || bad "[$SH] allow: rc=$RC err=[$ERR] log=[$(cat "$LOG11")]"
+  # the payload on stdin still reaches the wrapper (the command substitution must not eat it)
+  run_hook "$SH" 'cat > "'"$SCRATCH"'/case11.stdin"; exit 0'
+  [ "$(cat "$SCRATCH/case11.stdin" 2>/dev/null)" = '{"tool_name":"Bash"}' ] \
+    && ok "[$SH] the hook payload on stdin reaches the wrapper intact" || bad "[$SH] stdin not passed through: [$(cat "$SCRATCH/case11.stdin" 2>/dev/null)]"
+done
+printf '#!/bin/bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 
 echo ""
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

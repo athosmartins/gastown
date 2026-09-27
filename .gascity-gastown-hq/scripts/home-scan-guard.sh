@@ -18,9 +18,12 @@
 #      $HOME / protected-folder token, or a cwd that is itself $HOME / protected). Nearly every
 #      command ends here with exit 0 and no python.
 #   2. home-scan-guard.py: the exact lexical classifier, under a hard timeout. Only rc==2 blocks.
-# The filter must never be narrower than the classifier (it would silently disable a block);
-# home-scan-guard.selftest.sh runs the whole must-block corpus THROUGH this file to prove it. The
-# classifier compares paths case-insensitively and normalises them (//, /./, ..), so the filter does
+# The filter is meant to be a SUPERSET of the classifier (a shape the classifier blocks and the filter
+# passes is a block silently switched off): home-scan-guard.selftest.sh runs the must-block corpus THROUGH
+# this file, WITH a cwd (with none every command reaches the classifier and the filter is never exercised),
+# and a differential fuzz of engine vs wrapper found no remaining miss when it was last run -- that is a
+# measurement of the shapes tried, not a proof for every spelling: a new classifier rule needs its filter rule.
+# The classifier compares paths case-insensitively and normalises them (//, /./, ..), so the filter does
 # the same to ITS copy of the text: nocasematch, and // and /./ collapsed before any pattern runs.
 #
 # WIRING (why it is not just a settings.json line). Two facts about Claude Code hook config bit this
@@ -109,7 +112,7 @@ home="${home%/}"
 case "$home" in /*/*) ;; *) note UNGUARDED "no usable home (HOME_SCAN_GUARD_HOME/HOME = '$home'): cannot tell what is protected"; exit 0 ;; esac
 
 home_esc="${home//./\\.}"
-after='($|[^[:alnum:]_./~-]|/($|[[:space:];|&)]|[*?[{$"'"'"'`/]|\.($|[[:space:]"'"'"'/;|&)])|\.\.|\.\*|\.\[|\.[Tt]rash|[DdPpMmLl]))'
+after='($|[^[:alnum:]_./~-]|/($|[[:space:];|&)]|[*?[{$"'"'"'`/\\]|\.($|[[:space:]"'"'"'/;|&)])|\.\.|\.\*|\.\[|\.[Tt]rash|[DdPpMmLl]))'
 # the token before a path is a boundary -- or an option cluster the path is ATTACHED to (tar -C/Users/athos, -xzC$HOME),
 # which is a value the classifier reads and the old boundary (a non-alphanumeric) hid. `~` may carry a name: ~athos/Desktop is
 # $HOME/Desktop, ~+ / ~- are $PWD / $OLDPWD (a superset: `~foo` reaches the classifier too, which is free to say no)
@@ -121,6 +124,10 @@ back_cd_re='(^|[;&|({[:space:]])(cd[[:space:]]+-|popd)($|[[:space:]]|[;&|)`])'  
 # / and /Users are ANCESTORS of $HOME: `find / -name x` walks straight into it
 anc_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)(/|/Users/?)($|[[:space:]"'"'"')*;|&])'      # bare / or /Users
 anc_glob_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)/Users/([*?[{$]|[^[:space:]/]*[*?[{$])'   # /Users/*, /Users/*/Downloads, /Users/at*
+# /U*/athos, /Us?rs, /[U]sers, /{Users,x}/..., /Vol*, /V?lumes/x: the FIRST component of an absolute path holds a glob, class, brace or
+# backslash, so it can still name /Users or /Volumes. The classifier reads those; a filter that only knew the literal names let them
+# through in silence (the selftest runs these WITH a cwd -- with none, every command goes to the classifier and the filter is never used).
+abs_glob_re='(^|[[:space:]"'"'"'=(]|-[[:alpha:]]+)/[^[:space:]/]*[*?[{\\][^[:space:]/]*($|/|[[:space:]"'"'"')*;|&])'
 
 hot=0
 if   [[ $cmd_n =~ $hot_re ]];      then hot=1
@@ -130,6 +137,7 @@ elif [[ $cmd_n =~ $bare_cd_re ]];  then hot=1
 elif [[ $cmd_n =~ $back_cd_re ]];  then hot=1
 elif [[ $cmd_n =~ $anc_re ]];      then hot=1
 elif [[ $cmd_n =~ $anc_glob_re ]]; then hot=1
+elif [[ $cmd_n =~ $abs_glob_re ]]; then hot=1
 else
   # An empty cwd is "don't know", not "not hot": a relative scan (`for d in $(ls -A); do du -sk "$d"; done`) cannot be judged
   # here, so it goes to the classifier, which counts it (UNKNOWN-CWD). Claude Code always sends a cwd; this is the payload that

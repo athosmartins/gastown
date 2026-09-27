@@ -30,16 +30,29 @@ WHAT THIS IS NOT: a sandbox. It is a LEXICAL heuristic over the command text, on
     (not assumed): a scanner launched BY another command (`find ~/gt -exec du -sk ~ \\;` -- only find's
     own paths are checked), conditional flow (the walk is linear, so a `cd` in an `if` / `case` arm
     or after `||` is taken to have run), a listing of $HOME saved to a FILE and read back later
-    (`ls ~ > l; ...; done < l` -- only a pipe, `< <(...)`, `<<<` and a heredoc carry the listing), and a
-    command that GAVE UP: nesting deeper than MAX_DEPTH ends the walk of the whole command, so a scan after
-    that point is not looked at (logged as GAVE-UP -- counted, never silent).
-  * NO FIXED CAP ENDS IN AN ALLOW. A brace expansion past MAX_BRACE_ALTERNATIVES, a `{a..z}` sequence and
-    a brace expression that will not expand become DYN -- a value the text does not reveal, exactly what
-    `~/$UNSET` is -- and the classifier decides on what it COULD be (`~/{...70 names..., Desktop}` is
-    hot; the same list under `~/gt` is not). The number of stacked wrappers (`env env env ... du`) and of
-    brace rounds has no cap that matters: each pass provably shrinks its input, so both end by themselves,
-    and the stop each loop keeps for the day that stops being true is loud (GAVE-UP, or DYN), never an allow.
-    "Too big to analyse" used to collapse into "not hot", the verdict of a command that is safe.
+    (`ls ~ > l; ...; done < l` -- only a pipe, `< <(...)`, `<<<` and a heredoc carry the listing), a script
+    handed to a shell on stdin (`bash <<'EOF'` -- the body is not read), other launchers of a scan
+    (`xargs -I{} python3 -c ...`, GNU `parallel`, `find -exec sh -c`), an xargs replacement string that is not a literal
+    (`xargs -I"$R" sh -c ...`: nothing to substitute is known, so nothing is marked), the spellings `$'/Users/athos/x'` (ANSI-C
+    quoting) and a path written in a file the command then reads, and a command that GAVE UP -- see the next paragraph.
+  * WHO IS GUARDED, and who is not (the bead's acceptance is "crews + pools", and it is exactly that): the crews /
+    witness / refinery settings.json (home-scan-guard-activate.sh) and the four pool overlays that carry the hook (dog,
+    ps-worker, reviewer, wa-worker: pool-roles.json). Overlays WITHOUT the hook: the base `pool` one (gastown.boot,
+    gastown.deacon) and the `longlived*` ones (gastown.mayor and the named WA crews -- those crews are guarded only
+    where home-scan-guard-activate.sh registered the hook in their own settings.json). NOT guarded at all: the Mayor,
+    boot and the deacon, any workdir that is none of the above, and the built-in Grep / Glob tools of every session
+    (the matcher is `^Bash$`). Those rely on the doctrine text alone.
+  * WHAT "FAIL-OPEN" MEANS HERE, said without softening. GAVE-UP is an ALLOW, logged after the fact: the log tells someone
+    once the TCC prompt has already appeared, it stops nothing. MAX_DEPTH is a fixed cap that ends in one: a command nested
+    deeper than that (`$( )`, `bash -c`, `eval`) is not analysed AT ALL -- scan() parses the whole command before anything is
+    walked, so a scan written BEFORE the deep nesting is unexamined too (measured: `du -sk ~/Desktop; echo $(...11 levels...)`
+    -> allowed, GAVE-UP logged). Nothing an agent types by accident nests that deep; a generator that does would be the one
+    to blame. The caps that used to end in an allow silently and no longer do: a brace expansion past MAX_BRACE_ALTERNATIVES,
+    a `{a..z}` sequence and a brace expression that will not expand become DYN -- a value the text does not reveal, exactly
+    what `~/$UNSET` is -- and the classifier decides on what it COULD be (`~/{...70 names..., Desktop}` is hot; the same list
+    under `~/gt` is not); and the number of stacked wrappers (`env env env ... du`) has no cap at all (each pass strips a word,
+    so the loop ends by itself; an env x8 chain that reaches a scanner BLOCKS). "Too big to analyse" used to collapse into
+    "not hot", the verdict of a command that is safe.
   * The shell grammar it understands is a working subset (quotes, escapes, heredocs, $(...),
     backticks, pipelines, &&/||/;, for/while/if bodies, subshells and braces, redirections,
     wrappers such as timeout/nice/env/xargs, bash -c / eval), enough that text which merely
@@ -126,7 +139,7 @@ TRAVERSAL_DEPTH = {
     "eza":  (("L",), ("--level", "--depth")),
 }
 
-MAX_DEPTH = 8                 # nesting of $( ) / bash -c / eval: past it the command is not read (GAVE-UP, logged)
+MAX_DEPTH = 8                 # nesting of $( ) / bash -c / eval: past it NOTHING of the command is read -- an ALLOW, logged after the fact (GAVE-UP)
 MAX_BRACE_ALTERNATIVES = 64   # a bound on WORK, not on what is understood: past it the brace expression is DYN (unknown), see expand_braces
 
 # ----------------------------------------------------------------------------- markers
@@ -134,6 +147,9 @@ DYN = "\ue000"     # a value the text does not reveal
 HDYN = "\ue001"    # a value that is an ENTRY OF $HOME (loop/read variable over a home listing)
 _QMAP = {"*": "\ue010", "?": "\ue011", "[": "\ue012", "{": "\ue013", "}": "\ue014", ",": "\ue015"}
 _UNQMAP = {v: k for k, v in _QMAP.items()}
+# What scan() calls the positional parameters of a script: $0..$9 -> ?0..?9, $@ -> ?@, $* -> ?*, and a bare ? for the braced
+# spellings it cannot name (${1}, ${@}, ${10}). When xargs feeds a shell from a listing of $HOME these ARE entries of $HOME.
+POSITIONAL_VARS = frozenset(["?" + c for c in "0123456789@*"] + ["?"])
 
 
 def quote_map(text):
@@ -511,6 +527,9 @@ class State:
         self.vars = {}
         self.tainted = set()
         self.notes = []
+        # Strings that xargs substitutes, textually, with an entry of a $HOME listing (-I{} -> "{}"). Set only on the state of a
+        # script that xargs launched (`xargs -I{} sh -c '...'`); resolve() reads every literal containing one as an entry of $HOME.
+        self.entry_marks = ()
 
     def fork(self):
         st = State(self.homes, self.cwd)
@@ -519,6 +538,7 @@ class State:
         st.vars = dict(self.vars)
         st.tainted = set(self.tainted)
         st.notes = self.notes
+        st.entry_marks = self.entry_marks
         return st
 
     def snapshot(self):
@@ -541,16 +561,25 @@ def lit_text(w):
     return "".join(parts)
 
 
-def render(w):
-    """Best-effort source text of a word (used to re-parse `bash -c STRING` / `eval STRING`)."""
+SUB_VAR = "__hsg_sub%d"     # the variable a command substitution is rewritten to when its word is rendered as script text
+
+
+def render(w, subs=None):
+    """Best-effort source text of a word (used to re-parse `bash -c STRING` / `eval STRING`). A command substitution is
+    rewritten to `${__hsg_sub<k>}`, and the substitution itself is appended to `subs` as entry k, so the caller can say what
+    that variable holds: written as a fixed placeholder (as this used to do) `bash -c "du -sk $(ls ~)"` scanned a static name,
+    and the fact that it was a listing of $HOME was lost at the shell boundary."""
     parts = []
     for sg in w.segs:
         if sg.kind == "lit":
             parts.append(sg.text)
         elif sg.kind == "var":
             parts.append("$" + sg.text if _IDENT.fullmatch(sg.text) else DYN)
-        else:
+        elif subs is None:
             parts.append("__sub__")
+        else:
+            parts.append("${" + SUB_VAR % len(subs) + "}")
+            subs.append(sg)
     return "".join(parts)
 
 
@@ -626,6 +655,11 @@ def resolve(word, st, in_assignment=False):
     for idx, sg in enumerate(word.segs):
         if sg.kind == "lit":
             t = sg.text
+            if st.entry_marks and any(mk in t for mk in st.entry_marks):
+                # xargs replaces EVERY occurrence of its -I string, quoted or not, before the shell ever parses the script
+                for mk in st.entry_marks:
+                    t = t.replace(mk, HDYN)
+                tainted = True
             if sg.quoted:
                 t = quote_map(t)
             elif idx == 0 and t.startswith("~"):
@@ -689,9 +723,16 @@ def comp_matches(comp, names):
     return any(rx.fullmatch(n) for n in names)
 
 
+FIRMLINK_ROOT = "/System/Volumes/Data"     # the data volume: /System/Volumes/Data/Users/x is the same folder as /Users/x
+
+
 def norm(p):
     p = posixpath.normpath(p)
-    return "/" if p.startswith("//") and set(p) == {"/"} else p
+    if p.startswith("//") and set(p) == {"/"}:
+        return "/"
+    if p == FIRMLINK_ROOT or p.startswith(FIRMLINK_ROOT + "/"):
+        return p[len(FIRMLINK_ROOT):] or "/"
+    return p
 
 
 def _comp_ok(comp, target):
@@ -743,6 +784,11 @@ def classify(p, st):
                 return "hot"
             return "hot" if comp_matches(rel[1], LIBRARY_HOT) else None
         return None
+    # `/Vol*`, `/V?lumes/x`, `/[V]olumes`: a glob that can only be /Volumes is /Volumes. The exact test at the top misses it, and
+    # the loop above only knows the home's own components. A component that is nothing BUT wildcards (`/*/bin`) is not a claim
+    # about /Volumes -- it is every top-level directory, which is what `ancestor` is for.
+    if pc and not _is_static(pc[0]) and re.search(r"[^*?\[\]" + DYN + HDYN + "]", pc[0]) and _comp_ok(pc[0], "Volumes"):
+        return "hot"
     return None
 
 
@@ -997,7 +1043,7 @@ def script_lists_home(script, st, depth=0):
         unwrapped = unwrap(words, st)       # an Abort from here is logged (GAVE-UP) by main(), not swallowed as "no listing"
         if unwrapped is None:
             continue
-        name, args, _implicit = unwrapped
+        name, args, _implicit, _marks, _envs = unwrapped
         if name in ("cd", "pushd"):
             _apply_cd(args, st, name == "pushd")
             continue
@@ -1030,15 +1076,67 @@ def _skip_opts(words, valued=()):
     return words[i:]
 
 
+_XARGS_SHORT_VALUED = frozenset("IJnPLdsEaRS")     # -n 1 / -n1: the value is the rest of the cluster, else the next word
+_XARGS_LONG_VALUED = frozenset(["--arg-file", "--delimiter", "--max-args", "--max-chars", "--max-procs",
+                                "--process-slot-var"])
+
+
+def _xargs_command(words):
+    """xargs' own options are read up to the first word that is not one; what is left is the command it runs. Returns
+    (command words, replacement strings). The replacement strings are what xargs substitutes, textually, with each input line
+    in that command: -I STR / -ISTR, BSD -J STR, GNU -i[STR] and --replace[=STR] (default {}). Option clusters count (-0I{},
+    -rn1), and a long option's value may be the next word (--max-args 1) -- read as the command instead, that value made
+    `ls ~ | xargs --max-args 1 du -sk` a command called "1", which nothing looks at."""
+    marks = []
+    i, n = 0, len(words)
+    while i < n:
+        t = lit_text(words[i])
+        if t is None or t == "-" or not t.startswith("-"):
+            break
+        i += 1
+        if t == "--":
+            break
+        if t.startswith("--"):
+            opt, eq, val = t.partition("=")
+            if opt == "--replace":
+                marks.append(val if eq else "{}")
+            elif opt in _XARGS_LONG_VALUED and not eq and i < n:
+                i += 1
+            continue
+        for k in range(1, len(t)):
+            c, rest = t[k], t[k + 1:]
+            if c in "IJ":
+                value = rest
+                if not value and i < n:
+                    value = lit_text(words[i]) or ""
+                    i += 1
+                if value:
+                    marks.append(value)
+                break
+            if c == "i":                                  # -i[STR]: the value can only be attached
+                marks.append(rest or "{}")
+                break
+            if c in _XARGS_SHORT_VALUED:
+                if not rest and i < n:
+                    i += 1
+                break
+            if c in "le":                                 # -l[N] / -e[STR]: attached or nothing
+                break
+    return words[i:], marks
+
+
 def unwrap(words, st):
-    """Strip env-style prefixes. Returns (name, args, implicit_stdin) or None when the command
-    name is not a literal we can reason about."""
+    """Strip env-style prefixes. Returns (name, args, implicit_stdin, marks, envs) or None when the command name is not a
+    literal we can reason about. `marks` are the strings an xargs in the chain substitutes with its input (see
+    _xargs_command); `envs` are the NAME=VALUE words an `env` in the chain sets for the command it runs."""
     implicit = False
+    marks = []
+    envs = []
     words = list(words)
     # How many wrappers are stacked is NOT capped: every pass below strips at least the wrapper's own word, so the loop ends by
     # itself (a fixed cap of 8 ran out on `env` x 8 and fell to `return None` -- "not a command I can reason about" -- so the scan
     # behind it was allowed in silence). `budget` is just that bound spelled out: one pass per word, plus the words a brace
-    # expansion adds. Running out of it can only mean the invariant broke, and a stop is logged (Abort -> GAVE-UP), not allowed.
+    # expansion adds. Running out of it can only mean the invariant broke; that is a GAVE-UP -- an allow, but a LOGGED one.
     budget = len(words) + 1
     while budget > 0:
         budget -= 1
@@ -1064,6 +1162,7 @@ def unwrap(words, st):
         elif name == "env":
             rest = _skip_opts(rest, valued=("-u", "-C", "-S", "-P"))
             while rest and _is_assignment(rest[0]):
+                envs.append(rest[0])         # `env x="$d" sh -c '... $x ...'`: the value reaches the script it launches
                 rest = rest[1:]
             words = rest
         elif name in ("nice", "ionice", "stdbuf", "arch", "caffeinate", "sudo"):
@@ -1072,10 +1171,11 @@ def unwrap(words, st):
             rest = _skip_opts(rest, valued=("-s", "-k", "--signal", "--kill-after"))
             words = rest[1:]
         elif name == "xargs":
-            words = _skip_opts(rest, valued=("-I", "-n", "-P", "-L", "-d", "-s", "-E", "-a", "-J", "-R"))
+            words, found = _xargs_command(rest)
+            marks.extend(found)
             implicit = True
         else:
-            return name, rest, implicit
+            return name, rest, implicit, tuple(marks), tuple(envs)
     raise Abort("command wrappers did not unwrap (more passes than words)")
 
 
@@ -1204,10 +1304,13 @@ def check_command(name, args, st, ctx, implicit_stdin, stdin_is_pipe):
         else:  # ag / ack
             flags, ops, values = parse_args(args, valued_short=("A", "B", "C", "G", "m", "g"),
                                             valued_long=("--ignore", "--file-search-regex"))
-        has_pattern_flag = bool(flags & {"e", "f", "--regexp", "--file"})
+        # `rg --files DIR...` has no pattern at all: every operand is a path
+        has_pattern_flag = bool(flags & {"e", "f", "--regexp", "--file"}) or (name == "rg" and "--files" in flags)
         paths = ops if has_pattern_flag else ops[1:]
-        # A pattern that looks like a path is examined too: `rg ~` is far more likely a path.
-        if not has_pattern_flag and ops:
+        # A LONE operand that looks like a path is examined as one: `rg ~` is far more likely a path than a pattern. With paths
+        # after it the first operand is certainly the pattern (`grep -rn "/Users/athos/Downloads" scripts/` searches scripts/ for
+        # that text), and reading it as a path blocked a legitimate repo search with a message that described something else.
+        if not has_pattern_flag and len(ops) == 1:
             t = lit_text(ops[0])
             if t is None or t.startswith(("/", "~", "$")):
                 paths = ops
@@ -1315,6 +1418,33 @@ def analyze_script(script, st, depth=0):
         _walk_script(script, entry, Ctx(fed=True), depth)
 
 
+def _analyze_launched(script_words, arg_words, assigns, st, ctx, implicit, marks, depth):
+    """Analyse the script a command launches (`sh -c STRING ARGS...`, `eval STRING`) -- with everything that tells it "this is an
+    entry of $HOME" carried across the boundary. The inner script used to start as a plain fork of the outer state, so the
+    incident with ONE more process in the middle was read as a static, unprotected name. Four ways the fact crosses:
+      * xargs feeds the launcher from a listing of $HOME: the -I replacement string (substituted into the text before any shell
+        parses it) and the positional parameters ($0, $1, "$@") are entries of $HOME;
+      * a command substitution written in the -c string (`bash -c "du -sk $(ls ~)"`): it is rendered as a variable, tainted
+        when that substitution lists $HOME;
+      * an argument handed to the shell (`bash -c 'du -sk "$1"' _ "$d"`): if it is derived from $HOME, so are the positionals;
+      * a prefix assignment (`x="$d" sh -c '... $x ...'`, `env x="$d" sh ...`): the inner script sees the variable.
+    Anything not fed by such a value starts as a plain fork."""
+    subs = []
+    text = " ".join(render(w, subs) for w in script_words)
+    inner, _ = scan(text, 0, False, depth + 1)
+    child = st.fork()
+    for k, sg in enumerate(subs):
+        if script_lists_home(sg.script, st):
+            child.tainted.add(SUB_VAR % k)
+    if any(_word_home_derived(w, st) for w in arg_words):
+        child.tainted |= POSITIONAL_VARS
+    _record_assignments(assigns, child)
+    if implicit and ctx.pipe_home:
+        child.entry_marks = tuple(child.entry_marks) + tuple(m for m in marks if m)
+        child.tainted |= POSITIONAL_VARS
+    analyze_script(inner, child, depth + 1)
+
+
 def _walk_script(script, st, ctx, depth):
     scopes = []          # the state at each "(" that is still open: a subshell's cd / assignments do not outlive it
     for idx, seg in enumerate(script):
@@ -1374,16 +1504,14 @@ def _walk_script(script, st, ctx, depth):
         unwrapped = unwrap(words, st)
         if unwrapped is None:
             continue
-        name, args, implicit = unwrapped
+        name, args, implicit, marks, envs = unwrapped
         if name in SHELLS:
             flags, ops, _ = parse_args(args, valued_short=("o", "O"))
             if any(len(f) == 1 and f == "c" for f in flags) and ops:
-                inner, _ = scan(render(ops[0]), 0, False, depth + 1)
-                analyze_script(inner, st.fork(), depth + 1)
+                _analyze_launched([ops[0]], ops[1:], assigns + list(envs), st, ctx, implicit, marks, depth)
             continue
         if name == "eval":
-            inner, _ = scan(" ".join(render(w) for w in args), 0, False, depth + 1)
-            analyze_script(inner, st.fork(), depth + 1)
+            _analyze_launched(list(args), [], assigns + list(envs), st, ctx, implicit, marks, depth)
             continue
         if name in ("cd", "pushd", "popd"):
             if in_subshell:

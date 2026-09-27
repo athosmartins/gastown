@@ -25,9 +25,10 @@
 #   * no command pattern in "matcher" (that never fires -- ga-7j1yu) and no "if": this guard's bash
 #     prefilter already makes the no-op case nearly free, and an "if" glob could not see inside a
 #     `for ... do ... done`.
-#   * the command is fail-open twice over: it exits 0 when the guard file is gone (a checkout that
-#     moved must not turn every Bash call of every crew into a hook error), and home-scan-guard.sh
-#     itself exits 0 on any failure of its own.
+#   * the command is fail-open three times over: it exits 0 when the guard file is gone (a checkout that
+#     moved must not turn every Bash call of every crew into a hook error), home-scan-guard.sh
+#     itself exits 0 on any failure of its own, and the command only lets the wrapper's own BLOCK verdict
+#     through (rc 2 + marker on stderr) -- a wrapper that cannot even be parsed exits 0 too, counted.
 #   * the guard path is the MAIN checkout, never a worktree: a hook that points into a worktree
 #     dies when the worktree is cleaned up (same trap pkill-exec-guard-activate.sh documents).
 #     Because the command is a no-op while that file does not exist, running this BEFORE the guard has
@@ -48,8 +49,11 @@
 # is INERT (and --check exits 1 on it).
 #
 # USAGE: home-scan-guard-activate.sh [--check] [path-to-settings.json ...]
-#   no paths : every crew / witness / refinery / worker settings.json that exists under
-#              ${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}
+#   no paths : every crew / witness / refinery settings.json that exists under
+#              ${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}   (the four globs at the bottom of this file -- there is no
+#              "worker" one: pool roles get the hook from their overlays, see pool-roles.json. Not covered by either:
+#              the Mayor, the deacon, boot, the long-lived overlays and any workdir that is neither -- the header of
+#              home-scan-guard.py lists them among the known gaps.)
 #   --check  : write nothing; print GUARDED / INERT / NOT-GUARDED per target; exit 1 if any is not GUARDED
 #   Idempotent. A target that cannot be processed (missing, unparseable) never stops the others;
 #   the exit status is 1 if any failed.
@@ -69,7 +73,15 @@ case "$GUARD_PATH" in
 esac
 # the leading `: home-scan-guard;` is a no-op whose only job is to carry the MARKER inside the command
 # itself, so identifying "our" hook never depends on the guard's path or file name.
-HOOK_CMD=": ${MARKER}; P='${GUARD_PATH}'; [ -f \"\$P\" ] || exit 0; exec /bin/bash \"\$P\""
+# The rest runs the wrapper and decides what Claude Code sees. It used to be `exec /bin/bash "$P"`, which handed bash's OWN
+# exit status to Claude Code -- and bash exits 2 on a SYNTAX ERROR in the script (a file half-written by a checkout, a bad
+# merge), 2 being exactly how a hook says BLOCK: a broken wrapper blocked every Bash call of every agent. Now only the wrapper's
+# own verdict blocks (rc 2 AND its marker line "home-scan-guard: BLOCKED" first on stderr, the same test the wrapper applies
+# to python); every other outcome is exit 0 and leaves an UNGUARDED line in the guard's log, so it is fail-open but counted.
+# POSIX only (Claude Code may run it under sh, bash or zsh): pool-roles.json carries the same text, and case 9 of the
+# selftest compares the two, case 11 runs it under all three shells.
+HOOK_TAIL='[ -f "$P" ] || exit 0; e=$(/bin/bash "$P" 2>&1 >/dev/null); r=$?; case "$r:$e" in 2:"home-scan-guard: BLOCKED"*) printf "%s\n" "$e" >&2; exit 2;; 0:*) exit 0;; esac; L="${HOME_SCAN_GUARD_LOG:-${HOME:-/tmp}/.gastown/logs/home-scan-guard.log}"; mkdir -p "${L%/*}" 2>/dev/null; printf "%s\tresult=UNGUARDED\treason=hook wrapper exited %s without a block verdict\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$r" >> "$L" 2>/dev/null; exit 0'
+HOOK_CMD=": ${MARKER}; P='${GUARD_PATH}'; ${HOOK_TAIL}"
 
 CHECK=0
 TARGETS=()

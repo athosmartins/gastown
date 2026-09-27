@@ -419,6 +419,115 @@ expect_allow "stdin: xargs du over ~/gt"            'xargs du -sk < <(ls ~/gt)' 
 expect_allow "stdin: mapfile of ~/gt"               'mapfile -t a < <(ls ~/gt); du -sk "${a[@]}"' $G
 expect_allow "stdin: a loop fed by git"             'while read -r l; do du -sk "$l"; done < <(git ls-files)' $G
 expect_allow "stdin: a listing of \$HOME read but no entry scanned" 'while read -r d; do echo "$d"; done < <(ls ~)' $G
+# gate round 3: "stdin is a listing of $HOME" must survive the SHELL hop. `xargs -I{} sh -c 'du -sk "{}"'` is the incident with
+# one more process in the middle: the placeholder ({} / -I str) and the positional parameters ($0, $1, "$@") of that inner shell ARE
+# entries of $HOME, and the inner script used to be analysed as if nothing was feeding it (a static literal `{}` is not hot).
+H=/Users/athos
+expect_block "xargs sh -c: the incident, spelled with xargs + sh -c" \
+  $'cd /Users/athos && ls -A | xargs -I{} sh -c \'timeout 60 du -xsk "{}" 2>/dev/null\' | sort -rn | head -25' $H
+expect_block "xargs sh -c: ls -A, quoted placeholder"       $'ls -A | xargs -I{} sh -c \'du -sk "{}"\'' $H
+expect_block "xargs sh -c: ls, bare placeholder"            $'ls | xargs -I{} sh -c \'du -sk {}\'' $H
+expect_block "xargs sh -c: ls ~, placeholder under ~/"      $'ls ~ | xargs -I{} sh -c \'du -sk ~/{}\'' $G
+expect_block "xargs sh -c: ls -d ~/*/ (absolute entries)"   $'ls -d ~/*/ | xargs -I{} sh -c \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: positional \$0 (-n1)"            $'ls -d ~/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
+expect_block "xargs sh -c: positional \$0, echo of ~/*"     $'echo ~/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
+expect_allow "(control) ~**/* is not \$HOME in bash: ~ + ** is no tilde prefix" $'ls -d ~**/* | xargs -n1 sh -c \'du -sk "$0"\'' $G
+expect_block "xargs sh -c: printf of ~/*"                   $'printf \'%s\\n\' ~/* | xargs -I{} sh -c \'du -sk "{}"\'' $G
+expect_block "xargs bash -c: the same"                      $'ls ~ | xargs -I{} bash -c \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: -I% (another replacement string)" $'ls ~ | xargs -I% sh -c \'du -sk "%"\'' $G
+expect_block "xargs sh -c: -I {} (value is a separate word)" $'ls ~ | xargs -I {} sh -c \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: -i (GNU, default {})"            $'ls ~ | xargs -i sh -c \'du -sk {}\'' $G
+expect_block "xargs sh -c: --replace=@@"                    $'ls ~ | xargs --replace=@@ sh -c \'du -sk "@@"\'' $G
+expect_block "xargs sh -c: -J (BSD)"                        $'ls ~ | xargs -J @ sh -c \'du -sk @\'' $G
+expect_block "xargs sh -c: positional \$1 after a name"     $'ls ~ | xargs -n1 sh -c \'du -sk "$1"\' _' $G
+expect_block "xargs sh -c: \"\$@\" after a name"            $'ls ~ | xargs sh -c \'du -sk "$@"\' _' $G
+expect_block "xargs sh -c: \${1} spelled with braces"       $'ls ~ | xargs -n1 sh -c \'du -sk "${1}"\' _' $G
+expect_block "xargs sh -c: \$* after a name"                $'ls ~ | xargs sh -c \'du -sk $*\' _' $G
+expect_block "xargs sh -c: the placeholder used twice, one use safe" $'ls ~ | xargs -I{} sh -c \'echo {}; du -sk {}\'' $G
+expect_block "xargs sh -c: find on the entry"               $'ls ~ | xargs -I{} sh -c \'find {} -type f\'' $G
+expect_block "xargs sh -c: ls -R on the entry"              $'ls ~ | xargs -I{} sh -c \'ls -R ~/{}\'' $G
+expect_block "xargs sh -c: cd into the entry, then measure" $'ls ~ | xargs -I{} sh -c \'cd ~/{} && du -sk .\'' $G
+expect_block "xargs sh -c: a wrapper between xargs and the shell" $'ls ~ | xargs -I{} timeout 5 sh -c \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: env, then the shell"             $'ls ~ | xargs -I{} env A=1 sh -c \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: bash -lc (clustered flags)"      $'ls ~ | xargs -I{} bash -lc \'du -sk "{}"\'' $G
+expect_block "xargs sh -c: the scan is inside a \$( ) of the inner script" $'ls ~ | xargs -I{} sh -c \'du -sk "$(echo {})"\'' $G
+expect_block "xargs sh -c: a shell inside the shell"        $'ls ~ | xargs -I{} sh -c "sh -c \'du -sk {}\'"' $G
+expect_block "xargs sh -c: after a filter stage in the pipeline" $'ls ~ | grep -v x | xargs -I{} sh -c \'du -sk "{}"\'' $G
+expect_block "xargs eval: the same hop through eval"        $'ls ~ | xargs -I{} eval "du -sk {}"' $G
+expect_block "xargs sh -c: fed by a redirect, not a pipe"   $'xargs -I{} sh -c \'du -sk "{}"\' < <(ls ~)' $G
+expect_block "xargs sh -c: fed by a here-string"            $'xargs -I{} sh -c \'du -sk "{}"\' <<< "$(ls ~)"' $G
+# the same hop WITHOUT xargs: whatever tells the inner script "this is an entry of $HOME" has to cross `sh -c` / `eval` too --
+# a $( ) written inside the -c string, a loop variable handed over as an argument, or one carried in by a prefix assignment
+expect_block "hop: \$(ls ~) inside a double-quoted bash -c string"  $'bash -c "du -sk $(ls ~)"' $G
+expect_block "hop: \$(ls ~) inside an eval string"                  $'eval "du -sk $(ls ~)"' $G
+expect_block "hop: \$(ls -A) inside sh -c, cwd=\$HOME"              $'sh -c "du -sk $(ls -A)"' $H
+expect_block "hop: a backtick listing inside sh -c"                 $'sh -c "du -sk `ls ~`"' $G
+expect_block "hop: a listing among other \$( ) in the string"       $'sh -c "echo $(date); du -sk $(ls ~)"' $G
+expect_block "hop: loop variable passed as \$1"                     $'for d in $(ls ~); do bash -c \'du -sk "$1"\' _ "$d"; done' $G
+expect_block "hop: loop variable passed as \$0"                     $'for d in $(ls ~); do bash -c \'du -sk "$0"\' "$d"; done' $G
+expect_block "hop: loop variable passed, read as \"\$@\""           $'for d in $(ls ~); do bash -c \'du -sk "$@"\' _ "$d"; done' $G
+expect_block "hop: an explicit protected folder passed as \$1"      $'bash -c \'du -sk "$1"\' _ ~/Downloads' $G
+expect_block "hop: loop variable carried by a prefix assignment"    $'for d in $(ls ~); do x="$d" sh -c \'du -sk "$x"\'; done' $G
+expect_block "hop: loop variable carried by env NAME=VALUE"         $'for d in $(ls ~); do env x="$d" sh -c \'du -sk "$x"\'; done' $G
+expect_block "hop: a prefix assignment of an explicit protected folder" $'x=~/Downloads sh -c \'du -sk "$x"\'' $G
+expect_block "hop: the assignment carries a listing"                $'x="$(ls ~)" sh -c \'du -sk $x\'' $G
+expect_allow "hop (control): \$(ls ~/gt) inside a bash -c string"   $'bash -c "du -sk $(ls ~/gt)"' $G
+expect_allow "hop (control): a repo loop variable passed as \$1"    $'for d in $(ls ~/gt); do bash -c \'du -sk "$1"\' _ "$d"; done' $G
+expect_allow "hop (control): a repo path passed as \$1"             $'bash -c \'du -sk "$1"\' _ ~/gt/docs' $G
+expect_allow "hop (control): a prefix assignment of a repo path"    $'x=~/gt sh -c \'du -sk "$x"\'' $G
+expect_allow "hop (control): \$(ls ~) inside -c, but only echoed"   $'sh -c "echo $(ls ~)"' $G
+expect_allow "hop (control): a \$( ) that lists nothing of \$HOME"  $'sh -c "du -sk $(git rev-parse --show-toplevel)"' $G
+expect_allow "hop (control): env with a plain value"                $'env A=1 sh -c \'du -sk ~/gt\'' $G
+# gate round 3, the wrapper's prefilter: what the classifier blocks, the wrapper must not pass in silence. A glob / class / brace /
+# backslash inside the FIRST component of an absolute path can still name /Users (or /Volumes), and a backslash before a protected
+# name is the same folder (\D = D). The same roots also have a second spelling on macOS: /System/Volumes/Data/Users/...
+# EVERY case below carries a cwd ($G): with none, the wrapper sends the command straight to the classifier (an empty cwd is "don't know"),
+# so the PREFILTER -- the stage under test -- would never run and these would pass whether or not it had the hole.
+expect_block "prefilter: glob in the first component (/U*/athos)"        'du -sk /U*/athos' $G
+expect_block "prefilter: /U*/*"                                         'du -sh /U*/*' $G
+expect_block "prefilter: ls -R /U*"                                     'ls -R /U*' $G
+expect_block "prefilter: ? in /Us?rs"                                   'du -sk /Us?rs/athos' $G
+expect_block "prefilter: a class, /[U]sers"                             'du -sk /[U]sers/athos/Desktop' $G
+expect_block "prefilter: a brace list, /{Users,x}"                      'du -sk /{Users,x}/athos/Desktop' $G
+expect_block "prefilter: find /Us?rs"                                   'find /Us?rs -name x' $G
+expect_block "prefilter: backslash before the protected name (~/\\Desktop)"  'du -sk ~/\Desktop' $G
+expect_block "prefilter: backslash, lower case (~/\\downloads)"         'du -sk ~/\downloads' $G
+expect_block "prefilter: backslash under an absolute \$HOME"            'du -sk /Users/athos/\Desktop' $G
+expect_block "prefilter: glob naming /Volumes (/Vol*)"                  'du -sk /Vol*' $G
+expect_block "prefilter: ? naming /Volumes (/V?lumes/x)"                'du -sk /V?lumes/x' $G
+expect_block "prefilter: /Vol*/x"                                       'du -sk /Vol*/x' $G
+expect_block "prefilter: find /Volume?"                                 'find /Volume? -type f' $G
+expect_block "firmlink: /System/Volumes/Data/Users/athos/Desktop"      'du -sk /System/Volumes/Data/Users/athos/Desktop' $G
+expect_block "firmlink: /System/Volumes/Data/Users/athos"              'du -sk /System/Volumes/Data/Users/athos' $G
+expect_block "firmlink: find /System/Volumes/Data (the whole data volume)" 'find /System/Volumes/Data -name x' $G
+expect_block "firmlink: ls -R /System/Volumes/Data/Users"              'ls -R /System/Volumes/Data/Users' $G
+expect_allow "prefilter (control): a glob in the first component that is not /Users" 'du -sk /usr/lib*' $G
+expect_allow "prefilter (control): ls /tmp/*"                           'ls /tmp/*' $G
+expect_allow "prefilter (control): find /usr/local/l*"                  'find /usr/local/l* -name x' $G
+expect_allow "prefilter (control): a class over /opt"                   'grep -r foo /opt/homebrew/li?/' $G
+expect_allow "prefilter (control): /Users/Shared/*"                     'ls /Users/Shared/*' $G
+expect_allow "firmlink (control): the private tmp under the data volume" 'du -sk /System/Volumes/Data/private/tmp/x' $G
+expect_allow "firmlink (control): /System/Library"                      'ls /System/Library' $G
+# gate round 3, a false positive: with explicit path operands after it, a path-LIKE first operand of a searcher is the PATTERN
+# (grep -rn "/Users/athos/Downloads" scripts/ searches scripts/ for that text). Only a lone operand (`rg ~`) is read as a path.
+expect_allow "pattern that looks like a path, explicit dir after it (grep)"  'grep -rn "/Users/athos/Downloads" scripts/' $G
+expect_allow "pattern that looks like a path, explicit dir after it (rg)"    "rg -n '/Users/athos/Documents' scripts/" $G
+expect_allow "pattern /Volumes/ with two dirs after it (rg)"                 'rg -n "/Volumes/" scripts/ packs/' $G
+expect_allow "pattern ~/Downloads (quoted) with a dir after it"              'grep -rn "~/Downloads" scripts/' $G
+expect_allow "pattern \$HOME/Desktop (single-quoted) with a dir after it"    "rg -n '\$HOME/Desktop' docs/" $G
+expect_allow "fd with a path-like pattern and a dir"                         "fd '/Users/athos/Downloads' scripts" $G
+expect_block "pattern-looking first operand, but the path after it is protected" 'grep -rn "/Users/athos/Downloads" ~/Documents' $G
+expect_block "(control) a lone path-like operand is still a path (rg ~)"    'rg ~' $G
+expect_block "(control) a lone path-like operand is still a path (grep -r ~/Downloads)" 'grep -r ~/Downloads' $G
+expect_block "(control) grep -r PATTERN ~/Downloads"                        'grep -r foo ~/Downloads' $G
+expect_block "(control) rg -e PATTERN ~/Downloads"                          'rg -e foo ~/Downloads' $G
+expect_allow "xargs sh -c (control): the listing is a repo dir, not \$HOME" $'ls ~/gt | xargs -I{} sh -c \'du -sk ~/gt/{}\'' $G
+expect_allow "xargs sh -c (control): \$0 over a repo listing"  $'ls ~/gt | xargs -n1 sh -c \'du -sk "$0"\'' $G
+expect_allow "xargs sh -c (control): fed by printf of names"   $'printf "a\\nb\\n" | xargs -I{} sh -c \'du -sk ~/gt/{}\'' $G
+expect_allow "xargs sh -c (control): \$HOME listing, inner script scans nothing" $'ls ~ | xargs -I{} sh -c \'echo {}\'' $G
+expect_allow "xargs sh -c (control): \$HOME listing, inner script only counts" $'ls ~ | xargs -I{} sh -c \'echo "{}" | wc -c\'' $G
+expect_allow "xargs sh -c (control): \$HOME listing, inner scan of a repo dir that ignores the entry" $'ls ~ | xargs -I{} sh -c \'du -sk ~/gt\'' $G
+expect_allow "xargs sh -c (control): \$0 of a \$HOME listing, inner script only echoes" $'ls ~ | xargs -n1 sh -c \'echo "$0"\'' $G
 # a hook payload with NO cwd: a relative scan cannot be judged, so it goes to the classifier, which COUNTS it
 : > "$ONE"
 hook_json 'for d in $(ls -A); do du -sk "$d"; done' | env "${AGENT_ENV[@]}" HOME_SCAN_GUARD_LOG="$ONE" "$HOOK_BASH" "$GUARD" >/dev/null 2>&1; RC=$?
