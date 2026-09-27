@@ -973,13 +973,19 @@ if [ -n "$_DEAD_TRANSIENT_LN" ]; then
   fi
 fi
 
-echo "── 13g. ga-i19942: a bead returned to the pool by the ga-tz0op block must NOT keep gate:queued (executes the REAL shipped block against a stateful bd stub) ──"
+echo "── 13g. ga-i19942/ga-3bp42c: a bead returned to the pool by the ga-tz0op block must NOT keep gate:queued OR gate:reviewing (executes the REAL shipped block against a stateful bd stub) ──"
 # BUG (ga-i19942): the pool probe (`bd ready ... --exclude-label gate:queued`)
 # and the Pilot's ingate filter hide any bead wearing gate:queued. The ga-tz0op
 # pool-return cleared assignee + story:in-flight and wrote gc.routed_to but
 # never removed gate:queued, so the bead came back to the pool invisible
 # (measured 25/09: wa-gqkpz 71min, wa-wqn2v 43min). The ga-39l9z2 and FAIL
 # pool-returns already dropped it; this sibling did not.
+#
+# BUG (ga-3bp42c): the same probe/Pilot exact-match veto list (see
+# scripts/pool-probe-vetoes.sh POOL_VETO_EXACT_DOG/WA) ALSO includes
+# gate:reviewing — the ga-i19942 fix above dropped only gate:queued, so a
+# bead that entered this block still wearing gate:reviewing stayed invisible
+# even after gate:queued was cleared (measured on wa-13be2, 2h20 invisible).
 #
 # The block is extracted from the dispatcher by its own anchor comments (never
 # hand-copied, same discipline as 13d/13f) and EXECUTED, so this asserts on what
@@ -992,21 +998,22 @@ _T13G="$(mktemp -d "${TMPDIR:-/tmp}/gc-gate-tz0op-queued.XXXXXX")"
 
 # _tz0op_run <scenario-flags...> — resets the bead to the incident shape, runs
 # the real block in a subshell, leaves the resulting state under $_T13G.
-#   ASSIGN_REFUSED=1  bd assign "" is a no-op (a different actor holds the bead)
-#   STICKY_QUEUED=1   bd label remove gate:queued is a silent no-op (write lost)
-#   SHOW_FAIL=1       bd show --json fails outright (read-back impossible)
-#   NO_QUEUED=1       the bead did not carry gate:queued to begin with
+#   ASSIGN_REFUSED=1    bd assign "" is a no-op (a different actor holds the bead)
+#   STICKY_QUEUED=1     bd label remove gate:queued is a silent no-op (write lost)
+#   STICKY_REVIEWING=1  bd label remove gate:reviewing is a silent no-op (write lost)
+#   SHOW_FAIL=1         bd show --json fails outright (read-back impossible)
+#   NO_QUEUED=1         the bead did not carry gate:queued OR gate:reviewing to begin with
 _tz0op_run() {
   rm -f "$_T13G"/calls.log "$_T13G"/comments.log "$_T13G"/labels "$_T13G"/assignee "$_T13G"/routed_to "$_T13G"/qg.log
   if [ "${NO_QUEUED:-0}" = "1" ]; then
     printf '%s\n' "story:in-flight" "ctx:ready" > "$_T13G/labels"
   else
-    printf '%s\n' "story:in-flight" "gate:queued" "ctx:ready" > "$_T13G/labels"
+    printf '%s\n' "story:in-flight" "gate:queued" "gate:reviewing" "ctx:ready" > "$_T13G/labels"
   fi
   printf '%s' "wa-worker-adhoc-dead1" > "$_T13G/assignee"
   : > "$_T13G/routed_to"; : > "$_T13G/calls.log"; : > "$_T13G/comments.log"
   (
-    export ASSIGN_REFUSED="${ASSIGN_REFUSED:-0}" STICKY_QUEUED="${STICKY_QUEUED:-0}" SHOW_FAIL="${SHOW_FAIL:-0}"
+    export ASSIGN_REFUSED="${ASSIGN_REFUSED:-0}" STICKY_QUEUED="${STICKY_QUEUED:-0}" STICKY_REVIEWING="${STICKY_REVIEWING:-0}" SHOW_FAIL="${SHOW_FAIL:-0}"
     set_gate_status() { :; }
     gate_marker_status_ensure() { echo ok; }
     gate_fail_restore_route() { echo "wa-worker"; }
@@ -1016,9 +1023,13 @@ _tz0op_run() {
       case "$1" in
         label)
           if [ "$2" = "add" ]; then printf '%s\n' "$4" >> "$_T13G/labels"
-          elif [ "$2" = "remove" ] && [ "${STICKY_QUEUED:-0}" != "1" -o "$4" != "gate:queued" ]; then
-            grep -vxF -- "$4" "$_T13G/labels" > "$_T13G/labels.new" || true
-            mv "$_T13G/labels.new" "$_T13G/labels"
+          elif [ "$2" = "remove" ]; then
+            if { [ "${STICKY_QUEUED:-0}" = "1" ] && [ "$4" = "gate:queued" ]; } || { [ "${STICKY_REVIEWING:-0}" = "1" ] && [ "$4" = "gate:reviewing" ]; }; then
+              : # sticky: the write is silently lost, same as a real backend dropping it
+            else
+              grep -vxF -- "$4" "$_T13G/labels" > "$_T13G/labels.new" || true
+              mv "$_T13G/labels.new" "$_T13G/labels"
+            fi
           fi ;;
         assign) [ "${ASSIGN_REFUSED:-0}" = "1" ] || : > "$_T13G/assignee" ;;
         update) [ "$3" = "--set-metadata" ] && printf '%s' "${4#gc.routed_to=}" > "$_T13G/routed_to" ;;
@@ -1038,9 +1049,10 @@ _tz0op_run() {
   ) >/dev/null 2>&1 || true
 }
 # The pool probe as the incident measured it: unassigned + routed to the pool
-# + NOT gate:queued. Reads the resulting state files, never the source text.
+# + NOT gate:queued + NOT gate:reviewing (both are exact-match probe vetoes).
+# Reads the resulting state files, never the source text.
 _probe_sees_bead() {
-  [ ! -s "$_T13G/assignee" ] && [ "$(cat "$_T13G/routed_to")" = "wa-worker" ] && ! grep -qxF "gate:queued" "$_T13G/labels"
+  [ ! -s "$_T13G/assignee" ] && [ "$(cat "$_T13G/routed_to")" = "wa-worker" ] && ! grep -qxF "gate:queued" "$_T13G/labels" && ! grep -qxF "gate:reviewing" "$_T13G/labels"
 }
 _bead_comment() { grep '^wa-gqkpz :: ' "$_T13G/comments.log" | tail -1; }
 
@@ -1054,10 +1066,16 @@ else
   if _probe_sees_bead; then
     bad "13g positive control: the probe emulation reports a bead WITH gate:queued as visible — the harness cannot detect the defect"
   else
-    ok "13g positive control: the probe emulation hides an unassigned, routed bead that still wears gate:queued (the incident's exact symptom)"
+    ok "13g positive control: the probe emulation hides an unassigned, routed bead that still wears gate:queued (the ga-i19942 incident's exact symptom)"
+  fi
+  printf '%s\n' "gate:reviewing" > "$_T13G/labels"; : > "$_T13G/assignee"; printf 'wa-worker' > "$_T13G/routed_to"
+  if _probe_sees_bead; then
+    bad "13g positive control (reviewing): the probe emulation reports a bead WITH gate:reviewing as visible — the harness cannot detect the defect"
+  else
+    ok "13g positive control (reviewing): the probe emulation hides an unassigned, routed bead that still wears gate:reviewing (ga-3bp42c's exact symptom, wa-13be2)"
   fi
 
-  echo "── 13g-1. the incident shape: dead pool author, assignee clears, gate:queued present ──"
+  echo "── 13g-1. the incident shape: dead pool author, assignee clears, gate:queued + gate:reviewing present ──"
   _tz0op_run
   if grep -qxF "gate:needs-rebase" "$_T13G/labels" && ! grep -qxF "story:in-flight" "$_T13G/labels"; then
     ok "13g-1: the block still does what it always did (gate:needs-rebase added, story:in-flight removed) — the harness ran the real block"
@@ -1069,10 +1087,19 @@ else
   else
     ok "13g-1 AC1: gate:queued is gone from the source bead after the pool-return"
   fi
-  if _probe_sees_bead; then ok "13g-1: the pool probe emulation now SEES the bead (unassigned + routed to wa-worker + no gate:queued)"; else bad "13g-1: the pool probe emulation still cannot see the returned bead"; fi
+  if grep -qxF "gate:reviewing" "$_T13G/labels"; then
+    bad "13g-1 AC1b: the bead left the pool-return still wearing gate:reviewing (labels: $(tr '\n' ' ' < "$_T13G/labels")) — the pool probe cannot see it"
+  else
+    ok "13g-1 AC1b: gate:reviewing is gone from the source bead after the pool-return"
+  fi
+  if _probe_sees_bead; then ok "13g-1: the pool probe emulation now SEES the bead (unassigned + routed to wa-worker + no gate:queued/gate:reviewing)"; else bad "13g-1: the pool probe emulation still cannot see the returned bead"; fi
   case "$(_bead_comment)" in
     *"gate:queued=removed"*) ok "13g-1: the bead comment reports the OBSERVED outcome 'gate:queued=removed'" ;;
-    *) bad "13g-1: the bead comment does not report 'gate:queued=removed' (got: $(_bead_comment | cut -c1-160))" ;;
+    *) bad "13g-1: the bead comment does not report 'gate:queued=removed' (got: $(_bead_comment | cut -c1-220))" ;;
+  esac
+  case "$(_bead_comment)" in
+    *"gate:reviewing=removed"*) ok "13g-1: the bead comment reports the OBSERVED outcome 'gate:reviewing=removed'" ;;
+    *) bad "13g-1: the bead comment does not report 'gate:reviewing=removed' (got: $(_bead_comment | cut -c1-220))" ;;
   esac
   case "$(_bead_comment)" in
     *"assignee=cleared"*) ok "13g-1: the comment reports the OBSERVED assignee state, not an asserted '(assignee cleared)'" ;;
@@ -1081,58 +1108,122 @@ else
   if grep -qF "gate-status" "$_T13G/calls.log"; then bad "13g-1 AC4: the block touched gate-status through bd directly"; else ok "13g-1 AC4: no direct gate-status write via bd (the marker is left to set_gate_status, exactly as before)"; fi
   if awk '$1=="label" && $3=="ga-sv1gi9"' "$_T13G/calls.log" | grep -q .; then bad "13g-1 AC4: the block issued a label write against the MARKER id (ga-sv1gi9)"; else ok "13g-1 AC4: the marker id is never given a label write from the source-bead path (marker stays needs-rebase)"; fi
 
-  echo "── 13g-2. the removal is verified, not narrated: a silently-lost write must be reported as such ──"
+  echo "── 13g-2. gate:queued removal is verified, not narrated: a silently-lost write must be reported as such ──"
   STICKY_QUEUED=1 _tz0op_run
   if grep -qxF "gate:queued" "$_T13G/labels"; then ok "13g-2 setup: the stub really dropped the removal (gate:queued survives)"; else bad "13g-2 setup: sticky stub did not keep gate:queued — the scenario is not exercising a lost write"; fi
   case "$(_bead_comment)" in
-    *"STILL PRESENT"*) ok "13g-2: a removal that did not stick is reported 'STILL PRESENT' (needs investigation), not 'removed'" ;;
-    *) bad "13g-2: a lost removal was not reported as STILL PRESENT (got: $(_bead_comment | cut -c1-200))" ;;
+    *"gate:queued=STILL PRESENT"*) ok "13g-2: a gate:queued removal that did not stick is reported 'STILL PRESENT' (needs investigation), not 'removed'" ;;
+    *) bad "13g-2: a lost gate:queued removal was not reported as STILL PRESENT (got: $(_bead_comment | cut -c1-220))" ;;
   esac
   case "$(_bead_comment)" in
     *"gate:queued=removed"*) bad "13g-2: the comment claims 'gate:queued=removed' although the label is still on the bead — narrated, not observed" ;;
-    *) ok "13g-2: the comment never claims 'removed' when the label is still there" ;;
+    *) ok "13g-2: the comment never claims 'gate:queued=removed' when the label is still there" ;;
+  esac
+  if grep -qxF "gate:reviewing" "$_T13G/labels"; then bad "13g-2: gate:reviewing did not get removed even though only gate:queued was sticky — the two removals are not independent"; else ok "13g-2: gate:reviewing removal is unaffected by the sticky gate:queued write (independent removals)"; fi
+  case "$(_bead_comment)" in
+    *"gate:reviewing=removed"*) ok "13g-2: the comment still reports gate:reviewing=removed despite the stuck gate:queued write" ;;
+    *) bad "13g-2: the comment does not report gate:reviewing=removed (got: $(_bead_comment | cut -c1-220))" ;;
   esac
 
-  echo "── 13g-3. assignee still held (clear refused): gate:queued left alone, and the comment says so ──"
+  echo "── 13g-2b. gate:reviewing removal is verified, not narrated: a silently-lost write must be reported as such (independent of gate:queued) ──"
+  STICKY_REVIEWING=1 _tz0op_run
+  if grep -qxF "gate:reviewing" "$_T13G/labels"; then ok "13g-2b setup: the stub really dropped the removal (gate:reviewing survives)"; else bad "13g-2b setup: sticky stub did not keep gate:reviewing — the scenario is not exercising a lost write"; fi
+  case "$(_bead_comment)" in
+    *"gate:reviewing=STILL PRESENT"*) ok "13g-2b: a gate:reviewing removal that did not stick is reported 'STILL PRESENT' (needs investigation), not 'removed'" ;;
+    *) bad "13g-2b: a lost gate:reviewing removal was not reported as STILL PRESENT (got: $(_bead_comment | cut -c1-220))" ;;
+  esac
+  case "$(_bead_comment)" in
+    *"gate:reviewing=removed"*) bad "13g-2b: the comment claims 'gate:reviewing=removed' although the label is still on the bead — narrated, not observed" ;;
+    *) ok "13g-2b: the comment never claims 'gate:reviewing=removed' when the label is still there" ;;
+  esac
+  if grep -qxF "gate:queued" "$_T13G/labels"; then bad "13g-2b: gate:queued did not get removed even though only gate:reviewing was sticky — the two removals are not independent"; else ok "13g-2b: gate:queued removal is unaffected by the sticky gate:reviewing write (independent removals)"; fi
+
+  echo "── 13g-3. assignee still held (clear refused): gate:queued + gate:reviewing left alone, and the comment says so ──"
   ASSIGN_REFUSED=1 _tz0op_run
   if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-3: gate:queued removal was attempted on a bead a different actor still holds"; else ok "13g-3: no gate:queued removal attempted while the assignee is still set (ga-39l9z2 conservative rule)"; fi
   if grep -qxF "gate:queued" "$_T13G/labels"; then ok "13g-3: gate:queued left in place"; else bad "13g-3: gate:queued was removed although the assignee clear did not apply"; fi
+  if grep -q '^label remove wa-gqkpz gate:reviewing' "$_T13G/calls.log"; then bad "13g-3: gate:reviewing removal was attempted on a bead a different actor still holds"; else ok "13g-3: no gate:reviewing removal attempted while the assignee is still set (same conservative rule)"; fi
+  if grep -qxF "gate:reviewing" "$_T13G/labels"; then ok "13g-3: gate:reviewing left in place"; else bad "13g-3: gate:reviewing was removed although the assignee clear did not apply"; fi
   case "$(_bead_comment)" in
     *"NOT cleared"*) ok "13g-3: the comment reports the assignee was NOT cleared (instead of the old unconditional '(assignee cleared)')" ;;
-    *) bad "13g-3: the comment does not report the failed assignee clear (got: $(_bead_comment | cut -c1-200))" ;;
+    *) bad "13g-3: the comment does not report the failed assignee clear (got: $(_bead_comment | cut -c1-220))" ;;
+  esac
+  case "$(_bead_comment)" in
+    *"gate:reviewing=left untouched"*) ok "13g-3: the comment reports gate:reviewing left untouched (assignee still held)" ;;
+    *) bad "13g-3: the comment does not report gate:reviewing left untouched (got: $(_bead_comment | cut -c1-220))" ;;
   esac
 
-  echo "── 13g-4. read-back impossible: third state, never collapsed into 'removed' or 'failed' ──"
+  echo "── 13g-4. read-back impossible: third state, never collapsed into 'removed' or 'failed', for both labels ──"
   SHOW_FAIL=1 _tz0op_run
-  if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-4: gate:queued removal attempted without any read-back proving the assignee is empty"; else ok "13g-4: no removal attempted when the bead cannot be read (inert under doubt)"; fi
+  if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-4: gate:queued removal attempted without any read-back proving the assignee is empty"; else ok "13g-4: no gate:queued removal attempted when the bead cannot be read (inert under doubt)"; fi
   case "$(_bead_comment)" in
     *"gate:queued=UNVERIFIED"*) ok "13g-4: the comment reports gate:queued=UNVERIFIED" ;;
-    *) bad "13g-4: the comment does not report the UNVERIFIED third state (got: $(_bead_comment | cut -c1-200))" ;;
+    *) bad "13g-4: the comment does not report the UNVERIFIED third state for gate:queued (got: $(_bead_comment | cut -c1-220))" ;;
+  esac
+  if grep -q '^label remove wa-gqkpz gate:reviewing' "$_T13G/calls.log"; then bad "13g-4: gate:reviewing removal attempted without any read-back proving the assignee is empty"; else ok "13g-4: no gate:reviewing removal attempted when the bead cannot be read (inert under doubt)"; fi
+  case "$(_bead_comment)" in
+    *"gate:reviewing=UNVERIFIED"*) ok "13g-4: the comment reports gate:reviewing=UNVERIFIED" ;;
+    *) bad "13g-4: the comment does not report the UNVERIFIED third state for gate:reviewing (got: $(_bead_comment | cut -c1-220))" ;;
   esac
 
-  echo "── 13g-5. the bead never carried gate:queued: nothing to remove, and no needless write ──"
+  echo "── 13g-5. the bead never carried gate:queued or gate:reviewing: nothing to remove, and no needless write ──"
   NO_QUEUED=1 _tz0op_run
   if grep -q '^label remove wa-gqkpz gate:queued' "$_T13G/calls.log"; then bad "13g-5: a gate:queued removal was issued for a bead that does not have the label"; else ok "13g-5: no removal issued when gate:queued is absent"; fi
   case "$(_bead_comment)" in
     *"gate:queued=absent"*) ok "13g-5: the comment reports gate:queued=absent" ;;
-    *) bad "13g-5: the comment does not report gate:queued=absent (got: $(_bead_comment | cut -c1-200))" ;;
+    *) bad "13g-5: the comment does not report gate:queued=absent (got: $(_bead_comment | cut -c1-220))" ;;
+  esac
+  if grep -q '^label remove wa-gqkpz gate:reviewing' "$_T13G/calls.log"; then bad "13g-5: a gate:reviewing removal was issued for a bead that does not have the label"; else ok "13g-5: no removal issued when gate:reviewing is absent"; fi
+  case "$(_bead_comment)" in
+    *"gate:reviewing=absent"*) ok "13g-5: the comment reports gate:reviewing=absent" ;;
+    *) bad "13g-5: the comment does not report gate:reviewing=absent (got: $(_bead_comment | cut -c1-220))" ;;
   esac
 fi
 [ -n "$_T13G" ] && [ -d "$_T13G" ] && rm -rf "$_T13G"
 
-echo "── 13h. ga-i19942 AC2: EVERY pool-return that restores gc.routed_to also drops gate:queued (sweep guard — a 4th sibling cannot repeat the miss) ──"
+echo "── 13h. ga-i19942/ga-3bp42c AC2: EVERY pool-return that restores gc.routed_to also drops gate:queued AND gate:reviewing (sweep guard — a 4th sibling cannot repeat the miss) ──"
 # A pool-return is any code site that writes gc.routed_to from a computed route
 # variable (--set-metadata "gc.routed_to=$_X_ROUTE"): it hands the source bead
-# back to a pool whose probe excludes gate:queued. Each such site must strip the
-# label within its own block. The 90-line window is far below the distance to the
-# next site (the three known ones are >4000 lines apart), so a neighbour cannot
-# satisfy it by accident.
+# back to a pool whose probe excludes both gate:queued and gate:reviewing
+# (scripts/pool-probe-vetoes.sh POOL_VETO_EXACT_DOG/WA). Each such site must
+# strip both labels within its own block.
 _PR_SITES=$(grep -n -- '--set-metadata "gc\.routed_to=\$' "$DISPATCHER" | grep -v '^[0-9]*:[[:space:]]*#' | cut -d: -f1)
 _PR_COUNT=0; _PR_MISSING=""
 for _ln in $_PR_SITES; do
   _PR_COUNT=$((_PR_COUNT + 1))
-  if ! sed -n "${_ln},$((_ln + 90))p" "$DISPATCHER" | grep -qF 'label remove "$BEAD_ID" "gate:queued"'; then
-    _PR_MISSING="$_PR_MISSING $_ln"
+  # gate:queued is always removed right at (or just before) the route write
+  # itself, gated on the same confirmed-empty-assignee check — a tight
+  # forward-only window catches all known sites and is far below the
+  # distance to the next site (the three known ones are >4000 lines apart),
+  # so a neighbour cannot satisfy it by accident.
+  # ga-3bp42c gate-fix: capture the window into a variable FIRST and grep it
+  # via a here-string, never `producer | grep -qF ...` directly. Under
+  # set -o pipefail, grep -q exits the instant it finds a match — if the
+  # producer (sed) still has buffered output left to write, it can catch
+  # SIGPIPE and exit non-zero, and pipefail then reports THAT failure for
+  # the whole pipeline even though grep found what it was looking for.
+  # Measured directly: a `producer | grep -q` loop under pipefail returned
+  # false "not found" in 18/20 runs against a match earlier in the stream.
+  # A here-string has no live pipe (bash fully buffers it first), so grep's
+  # own exit status is the only one that can flow through `if !`.
+  _PR_FWD=$(sed -n "${_ln},$((_ln + 90))p" "$DISPATCHER")
+  if ! grep -qF 'label remove "$BEAD_ID" "gate:queued"' <<<"$_PR_FWD"; then
+    _PR_MISSING="$_PR_MISSING ${_ln}(gate:queued)"
+  fi
+  # gate:reviewing is ALSO an exact-match pool-probe veto, but unlike
+  # gate:queued the known sites clear it EARLY — at the point the
+  # FAIL/rebase classification is decided, up to 146 lines BEFORE the
+  # gc.routed_to write (ga-f54ui's FAIL/needs-fix arm) — not gated on the
+  # assignee check, since ending the "in review" state is safe regardless of
+  # which downstream branch (keep-with-live-author vs. pool-return) is
+  # eventually taken. A forward-only window would false-positive on every
+  # known-good site, so this one looks backward far enough to cover the
+  # known max with margin; 250 lines backward is still nowhere near the
+  # >4000-line gap to the next site.
+  _PR_START=$((_ln - 250)); [ "$_PR_START" -lt 1 ] && _PR_START=1
+  _PR_WIDE=$(sed -n "${_PR_START},$((_ln + 90))p" "$DISPATCHER")
+  if ! grep -qF 'label remove "$BEAD_ID" "gate:reviewing"' <<<"$_PR_WIDE"; then
+    _PR_MISSING="$_PR_MISSING ${_ln}(gate:reviewing)"
   fi
 done
 if [ "$_PR_COUNT" -ge 3 ]; then
@@ -1141,9 +1232,9 @@ else
   bad "13h: the sweep found only $_PR_COUNT pool-return sites (expected >= 3) — the grep pattern drifted and the guard would pass empty"
 fi
 if [ -z "$_PR_MISSING" ]; then
-  ok "13h AC2: every pool-return site drops gate:queued within its block"
+  ok "13h AC2: every pool-return site drops both gate:queued and gate:reviewing within its block"
 else
-  bad "13h AC2: pool-return site(s) at line(s)${_PR_MISSING} write gc.routed_to but never remove gate:queued — the bead returns to the pool invisible to the probe"
+  bad "13h AC2: pool-return site(s)${_PR_MISSING} write gc.routed_to but are missing the listed gate:* removal — the bead returns to the pool still wearing a probe-veto label"
 fi
 
 # ── 14. ga-ivzbuz: behind-envelope circuit-break has an unreachable ceiling on

@@ -140,11 +140,20 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # too (tagged wa-qq33j, same convention) — 14 wa-qq33j-tagged (9 pre-existing
 # + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou) + 2
 # ga-n2cpe-tagged = 16.
+# ga-3bp42c (2026-09-27) added a 17th site: the ga-tz0op pool-return (a
+# rebase-liveness author resolving to a pool/ephemeral identity) used to drop
+# only gate:queued — gate:reviewing is ALSO an exact-match pool-probe veto
+# (scripts/pool-probe-vetoes.sh), so a bead entering that branch still
+# wearing gate:reviewing stayed invisible to every pool worker even after
+# gate:queued was cleared (measured on wa-13be2, 2h20 invisible). Tagged
+# wa-qq33j, same convention — 15 wa-qq33j-tagged (9 pre-existing + 1
+# ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1
+# ga-3bp42c) + 2 ga-n2cpe-tagged = 17.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "16" ]; then
-  ok "total gate:reviewing clear call sites = 16 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "17" ]; then
+  ok "total gate:reviewing clear call sites = 17 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 16 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 17 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"
