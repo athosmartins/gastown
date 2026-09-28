@@ -282,6 +282,35 @@ _s3_current_backup_verified() {
   return 1
 }
 
+# _should_release_manifestless_primary <has_local_manifest:0|1> <s3_manifest_ok:0|1>
+#   <old_mtime> <run_epoch> <s3_closure_ok:0|1> → 0 (true) ONLY when ALL hold:
+#   the local primary has NO manifest (ga-qh8gkw rule #2 — this path NEVER
+#   touches a primary that already has one, whatever the other inputs say),
+#   the S3 manifest object for the db exists (a real head-object, not an
+#   inference), the S3 fingerprint's run is STRICTLY newer than the primary's
+#   own mtime (the same "generation" reasoning dolt-backup-residue-
+#   reclaim.sh's _should_release_residue already uses: proof the fingerprint
+#   describes a state captured after whatever process last wrote here, not
+#   before), and dolt-backup-s3-proof.sh's S3-ALONE closure proof
+#   (_s3proof_s3_closure_ok) succeeded — i.e. S3 restores on its own, with NO
+#   dependency on a local manifest that does not exist (unlike
+#   _s3_current_backup_verified above, which requires _s3proof_local_closure_ok
+#   first and is therefore structurally unusable here — see ga-qh8gkw / the
+#   dog-3 diagnosis on ga-9626dq this closes).
+#
+# Any empty/non-numeric/unset input fails CLOSED (ga-p5q3 family): "I could
+# not tell" must never produce the same action as "it is fine".
+_should_release_manifestless_primary() {
+  local has_manifest="${1-}" s3_manifest_ok="${2-}" old_mtime="${3-}" run_epoch="${4-}" s3_closure_ok="${5-}"
+  [ "$has_manifest" = "0" ] || return 1
+  [ "$s3_manifest_ok" = "1" ] || return 1
+  case "$old_mtime" in ''|*[!0-9]*) return 1 ;; esac
+  case "$run_epoch" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$run_epoch" -gt "$old_mtime" ] || return 1
+  [ "$s3_closure_ok" = "1" ] || return 1
+  return 0
+}
+
 # _publish_db_fingerprint <db> <local_dir> <issues> — ga-6xo4r0: syncs
 # <local_dir> (the JUST-PROMOTED, already restore-verified backup for <db>)
 # to S3, then MERGES a fresh, per-db-timestamped entry for <db> into
@@ -402,6 +431,214 @@ _publish_after_swap() {
     log "S3 fingerprint refresh OK for '$db' — residue-reclaim can see this swap once its settle window clears"
   else
     log "S3 fingerprint refresh FAILED for '$db' (non-fatal — local backup already verified and promoted; this db's .old stays spared until a future reseed or daily run succeeds at publishing)"
+  fi
+}
+
+# _release_manifestless_primary <db> — ga-qh8gkw: Mayor's decision (28/09),
+# answering ga-9626dq's dog-3 diagnosis. hq's PRIMARY (.dolt-backup/hq) has NO
+# manifest and provides ZERO backup value, but neither existing mechanism can
+# free it: dolt-backup-residue-reclaim.sh only ever globs "$BACKUP_ROOT"/*.old
+# (a bare primary is never a match), and this file's own low-disk mode
+# (_s3_current_backup_verified, above) delegates to
+# _s3proof_repair_then_prove, which requires _s3proof_local_closure_ok FIRST —
+# a valid LOCAL manifest — structurally impossible for a dir that has none.
+#
+# This is a narrower, STANDALONE justification: when the S3 copy alone
+# proves restorable (_s3proof_s3_closure_ok — no local manifest needed) AND
+# the S3 fingerprint is newer than the primary itself (the same "generation"
+# proof dolt-backup-residue-reclaim.sh already uses for .old residue, reused
+# here via its own already-sourced _parse_fingerprint_to_file /
+# _fingerprint_db_state), the primary is definitively worthless and can be
+# freed on its own — no fresh build, no swap, nothing else touched. Unlike
+# the low-disk modes above, this does NOT run as part of a reseed cycle: it
+# is invoked ad hoc (`dolt-backup-reseed.sh --release-manifestless-primary
+# <db>`), specifically for the case where a full reseed cannot even start
+# (e.g. <db>.new already sits there as residue from an interrupted run —
+# Preflight 3 would refuse immediately).
+#
+# ga-qh8gkw rule #2 (NEVER on a valid primary, NEVER on .new): the very first
+# check below is the local manifest — a primary WITH one is left alone,
+# unconditionally, regardless of what S3 says. This function only ever
+# targets the bare "$BACKUP_ROOT/$db" path — never "$db.new" — by construction
+# (it is not part of this function's own glob/argument surface at all).
+#
+# Every branch here RETURNS (never die()/exit) — this is deliberately safe to
+# call from a sourcing test harness (DOLT_BACKUP_RESEED_LIB=1) without killing
+# it, unlike _run_reseed.
+_release_manifestless_primary() {
+  local db="$1"
+  if [ -z "$db" ]; then
+    log "release-manifestless-primary: uso: $0 --release-manifestless-primary <nome-do-banco>"
+    return 1
+  fi
+  local primary_dir="$BACKUP_ROOT/$db"
+  local old_dir="$primary_dir.old"
+
+  if [ ! -d "$primary_dir" ]; then
+    log "release-manifestless-primary '$db': nada a liberar — não existe cópia primária em $primary_dir"
+    return 0
+  fi
+  if [ -s "$primary_dir/manifest" ]; then
+    log "release-manifestless-primary '$db': RECUSANDO — a primária TEM manifest válido (backup saudável); este caminho só existe para uma primária SEM manifesto"
+    return 0
+  fi
+  if [ -e "$old_dir" ]; then
+    log "release-manifestless-primary '$db': RECUSANDO — já existe $old_dir de um ciclo anterior; libere-o primeiro (dolt-backup-residue-reclaim.sh)"
+    return 0
+  fi
+
+  local old_mtime; old_mtime="$(stat -f %m "$primary_dir" 2>/dev/null)"
+  if [ -z "$old_mtime" ]; then
+    log "release-manifestless-primary '$db': RECUSANDO — não consegui ler o mtime de $primary_dir"
+    return 0
+  fi
+
+  local fp_file parsed_file
+  fp_file="$(mktemp "${TMPDIR:-/tmp}/dolt-primary-release-fp.XXXXXX" 2>/dev/null)" || { log "release-manifestless-primary '$db': RECUSANDO — não consegui criar arquivo temporário para o fingerprint"; return 0; }
+  parsed_file="$(mktemp "${TMPDIR:-/tmp}/dolt-primary-release-parsed.XXXXXX" 2>/dev/null)" || { rm -f "$fp_file"; log "release-manifestless-primary '$db': RECUSANDO — não consegui criar arquivo temporário para o parse"; return 0; }
+
+  local fp_state; fp_state="$(printf 'unfetched\t')"
+  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" "$fp_file" >/dev/null 2>&1; then
+    _parse_fingerprint_to_file "$fp_file" "$db" "$parsed_file"
+    fp_state="$(_fingerprint_db_state "$fp_file" "$db")"
+  fi
+  local run_epoch="" size_bytes="" head=""
+  if [ -s "$parsed_file" ]; then
+    IFS="$(printf '\t')" read -r run_epoch size_bytes head < "$parsed_file"
+  fi
+  rm -f "$fp_file" "$parsed_file" 2>/dev/null
+
+  local manifest_ok=0
+  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3api head-object --bucket "$BUCKET" --key "$db/manifest" >/dev/null 2>&1; then
+    manifest_ok=1
+  fi
+
+  local closure_ok=0
+  if _s3proof_s3_closure_ok "$db"; then
+    closure_ok=1
+  fi
+
+  if _should_release_manifestless_primary 0 "$manifest_ok" "$old_mtime" "${run_epoch:-}" "$closure_ok"; then
+    local freed_size; freed_size="$(du -sh "$primary_dir" 2>/dev/null | awk '{print $1}')"
+    log "release-manifestless-primary '$db': PROVA S3-ONLY OK — manifest do S3 presente (head-object OK), fingerprint mais novo que a cópia local (run_epoch=${run_epoch} > mtime=${old_mtime}), S3 fecha sozinho (_s3proof_s3_closure_ok, sem depender de manifest local) — liberando a primária sem manifesto ($primary_dir, ~${freed_size:-?})"
+    if [ "${RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN:-0}" = "1" ]; then
+      log "release-manifestless-primary '$db': DRY-RUN — nada apagado (RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1)"
+      return 0
+    fi
+    case "$primary_dir" in
+      "$BACKUP_ROOT"/*)
+        case "$(basename "$primary_dir")" in
+          *.old|*.new)
+            log "release-manifestless-primary '$db': RECUSANDO rm -rf — '$primary_dir' tem forma .old/.new (guarda de segurança; este caminho só apaga a primária BARE)"
+            return 0
+            ;;
+        esac
+        if rm -rf "$primary_dir"; then
+          log "release-manifestless-primary '$db': LIBERADA (~${freed_size:-?}) — '$db' fica SEM BACKUP LOCAL até um reseed completo ou a promoção de $db.new logo abaixo"
+        else
+          log "release-manifestless-primary '$db': FALHA no rm -rf de $primary_dir"
+          return 1
+        fi
+        ;;
+      *)
+        log "release-manifestless-primary '$db': RECUSANDO rm -rf — '$primary_dir' está fora de \$BACKUP_ROOT (guarda de segurança)"
+        return 0
+        ;;
+    esac
+  else
+    log "release-manifestless-primary '$db': SPARED — prova S3-only não estabelecida (manifest_ok=$manifest_ok run_epoch=${run_epoch:-none} old_mtime=$old_mtime closure_ok=$closure_ok fingerprint_state=${fp_state%%$'\t'*}) — nada foi apagado"
+    return 0
+  fi
+
+  _maybe_promote_new_after_primary_release "$db"
+}
+
+# _maybe_promote_new_after_primary_release <db> — ga-qh8gkw step 3: after
+# _release_manifestless_primary actually frees a manifest-less primary, check
+# whether a "$db.new" residue is sitting there ready to take its place, and
+# whether disk NOW covers a REAL restore+row-count verification — the exact
+# same proof Passo 2 of _run_reseed demands before ANY promotion (a manifest
+# only proves the build finished, never that it restores; dolt-backup-swap-
+# repair.sh deliberately defers this same verification to this file rather
+# than reimplement it — see that script's own header). If the margin is not
+# there, this leaves $db.new EXACTLY as it was and logs why: S3 remains the
+# only network until a future run has the room to try. It never invents a
+# weaker proof just because disk is tight — same "fail toward inert" stance
+# as the release above.
+_maybe_promote_new_after_primary_release() {
+  local db="$1"
+  local primary_dir="$BACKUP_ROOT/$db"
+  local new_dir="$primary_dir.new"
+  local old_dir="$primary_dir.old"
+
+  if [ ! -d "$new_dir" ]; then
+    log "release-manifestless-primary '$db': nada para promover — $new_dir não existe"
+    return 0
+  fi
+  if [ ! -s "$new_dir/manifest" ]; then
+    log "release-manifestless-primary '$db': $new_dir existe mas SEM manifest — não é promovível por este caminho"
+    return 0
+  fi
+  if [ -e "$old_dir" ]; then
+    log "release-manifestless-primary '$db': não promovendo $new_dir — $old_dir existe (não deveria neste ponto); investigue"
+    return 0
+  fi
+  if [ -e "$primary_dir" ]; then
+    log "release-manifestless-primary '$db': não promovendo $new_dir — $primary_dir já existe de novo (concorrência?); investigue"
+    return 0
+  fi
+
+  local live_kb; live_kb="$(du -sk "$CITY/.beads/dolt/$db" 2>/dev/null | awk '{print $1}')"
+  if [ -z "$live_kb" ]; then
+    log "release-manifestless-primary '$db': não consegui medir o tamanho vivo de '$db' — deixando $new_dir no lugar; S3 é a rede até então. Registrado e parando."
+    return 0
+  fi
+  local free_kb; free_kb="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -z "$free_kb" ]; then
+    log "release-manifestless-primary '$db': não consegui medir o disco livre — deixando $new_dir no lugar; S3 é a rede até então. Registrado e parando."
+    return 0
+  fi
+  local need_kb=$(( live_kb * LOW_DISK_MARGIN_PCT / 100 ))
+  if [ "$free_kb" -lt "$need_kb" ]; then
+    log "release-manifestless-primary '$db': deixando $new_dir no lugar — margem insuficiente para verificar (livre $((free_kb/1024))MB, preciso ~$((need_kb/1024))MB = ${LOW_DISK_MARGIN_PCT}% do vivo); S3 é a rede até haver disco. Registrado e parando."
+    return 0
+  fi
+
+  log "release-manifestless-primary '$db': livre $((free_kb/1024))MB cobre a verificação (~$((need_kb/1024))MB) — restaurando $new_dir para conferir antes de promover."
+  local live_count
+  live_count=$(timeout 60 "$GC_BIN" dolt sql -q "SELECT COUNT(*) FROM \`$db\`.issues" 2>/dev/null \
+               | grep -oE '^\| *[0-9]+' | grep -oE '[0-9]+' | head -1)
+  if [ -z "$live_count" ]; then
+    log "release-manifestless-primary '$db': não consegui ler a contagem viva de '$db' — deixando $new_dir no lugar sem promover (sem baseline não há verificação possível)"
+    return 0
+  fi
+
+  local verify_dir; verify_dir=$(mktemp -d "/tmp/reseed-primary-release-verify-$db.XXXXXX" 2>/dev/null) || { log "release-manifestless-primary '$db': não consegui criar diretório de verificação — deixando $new_dir no lugar"; return 0; }
+  local restored_count=""
+  if ( cd "$verify_dir" && timeout 1800 "$DOLT_BIN" backup restore "file://$new_dir" "${db}_verify" >/dev/null 2>&1 ); then
+    restored_count=$(cd "$verify_dir/${db}_verify" 2>/dev/null && timeout 120 "$DOLT_BIN" sql -q "SELECT COUNT(*) FROM issues" 2>/dev/null \
+                     | grep -oE '^\| *[0-9]+' | grep -oE '[0-9]+' | head -1)
+  fi
+  rm -rf "$verify_dir" 2>/dev/null
+
+  if [ -z "$restored_count" ]; then
+    log "release-manifestless-primary '$db': $new_dir NÃO restaura (ou não consegui ler o dado restaurado) — mantendo $new_dir intacto, NÃO promovendo. '$db' fica SEM BACKUP LOCAL até um reseed completo; o S3 (verificado acima) é o único fallback nesta janela."
+    notify_fail "release-manifestless-primary: '$db' está SEM BACKUP LOCAL — a primária inválida foi liberada com prova do S3, mas $new_dir não restaura. Ver $LOG."
+    return 0
+  fi
+  if [ "$restored_count" -lt "$live_count" ]; then
+    log "release-manifestless-primary '$db': $new_dir restaura mas com MENOS dado que a origem ($restored_count < $live_count) — mantendo $new_dir intacto, NÃO promovendo. '$db' fica SEM BACKUP LOCAL até um reseed completo; o S3 é o único fallback nesta janela."
+    notify_fail "release-manifestless-primary: '$db' está SEM BACKUP LOCAL — $new_dir restaura com menos dado que a origem ($restored_count < $live_count). Ver $LOG."
+    return 0
+  fi
+
+  if mv "$new_dir" "$primary_dir"; then
+    local new_size; new_size=$(du -sh "$primary_dir" 2>/dev/null | awk '{print $1}')
+    log "release-manifestless-primary '$db': $new_dir VERIFICADO (restaurado=$restored_count vs vivo=$live_count) e PROMOVIDO para $primary_dir (~${new_size:-?}) — '$db' tem backup local válido de novo."
+    _publish_after_swap "$db" "$primary_dir" "$restored_count"
+  else
+    log "release-manifestless-primary '$db': $new_dir VERIFICADO mas o mv para $primary_dir FALHOU — '$db' está SEM BACKUP LOCAL agora. Investigue imediatamente; $new_dir (verificado) pode estar parcialmente movido."
+    notify_fail "release-manifestless-primary: '$db' está SEM BACKUP LOCAL — $new_dir foi verificado mas o mv para $primary_dir falhou. Ver $LOG."
   fi
 }
 
@@ -669,6 +906,15 @@ _run_reseed() {
 # dolt-backup-reseed.selftest.sh.
 if [ "${DOLT_BACKUP_RESEED_LIB:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
+fi
+
+# ga-qh8gkw: standalone mode — free a manifest-less PRIMARY on S3-only proof
+# (see _release_manifestless_primary's own header). Never runs as part of the
+# normal `dolt-backup-reseed.sh <db>` invocation below; must be asked for
+# explicitly.
+if [ "$DB" = "--release-manifestless-primary" ]; then
+  _release_manifestless_primary "${2:-}"
+  exit $?
 fi
 
 _run_reseed "$DB"

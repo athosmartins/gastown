@@ -269,6 +269,245 @@ FAKE_AWS_FINGERPRINT_OK=0 _s3_current_backup_verified hq "$LOCALDIR" \
   && ok "fingerprint unreadable but S3 closed + identical → verified (identity is proven per file, not by a size ratio)" \
   || bad "an unreadable fingerprint vetoed a proven mirror"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1b (ga-qh8gkw): _should_release_manifestless_primary() — pure function
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── _should_release_manifestless_primary() (ga-qh8gkw) ──"
+for fn in _should_release_manifestless_primary _release_manifestless_primary _maybe_promote_new_after_primary_release; do
+  type "$fn" >/dev/null 2>&1 && ok "$fn defined by lib-mode source" || { bad "$fn NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
+done
+
+OLD=1990000; FRESH=2000001; STALE=1980000
+_should_release_manifestless_primary 0 1 "$OLD" "$FRESH" 1 \
+  && ok "happy path: no local manifest + S3 manifest ok + fresher fingerprint + S3 closure ok → release" \
+  || bad "happy path should release"
+_should_release_manifestless_primary 1 1 "$OLD" "$FRESH" 1 \
+  && bad "has_manifest=1 (a VALID primary) must NEVER release, whatever else is true (ga-qh8gkw rule #2)" \
+  || ok "primary HAS a manifest → correctly refused, regardless of S3 state"
+_should_release_manifestless_primary 0 0 "$OLD" "$FRESH" 1 \
+  && bad "s3_manifest_ok=0 must NOT release" \
+  || ok "S3 manifest object missing/unconfirmed → correctly spared"
+_should_release_manifestless_primary 0 1 "$OLD" "$STALE" 1 \
+  && bad "fingerprint OLDER than the primary's own mtime must NOT release (not yet fresher)" \
+  || ok "stale fingerprint (older than primary) → correctly spared (expected, self-healing)"
+_should_release_manifestless_primary 0 1 "$OLD" "$OLD" 1 \
+  && bad "fingerprint EQUAL to primary mtime must NOT release (needs strictly newer)" \
+  || ok "fingerprint equal to primary mtime → correctly spared (boundary)"
+_should_release_manifestless_primary 0 1 "$OLD" "$FRESH" 0 \
+  && bad "s3_closure_ok=0 must NOT release — S3 does not actually restore" \
+  || ok "S3 closure NOT proven (S3 indeterminate or does not restore) → correctly spared"
+_should_release_manifestless_primary 0 1 "" "$FRESH" 1 \
+  && bad "empty old_mtime should fail closed" \
+  || ok "empty old_mtime → fails closed"
+_should_release_manifestless_primary 0 1 "$OLD" "" 1 \
+  && bad "empty run_epoch should fail closed" \
+  || ok "empty run_epoch → fails closed"
+_should_release_manifestless_primary 0 1 "$OLD" abc 1 \
+  && bad "non-numeric run_epoch should fail closed" \
+  || ok "non-numeric run_epoch → fails closed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1c (ga-qh8gkw): _release_manifestless_primary() — stubbed aws, real
+# rm -rf against a throwaway fixture (same shape as dolt-backup-residue-
+# reclaim.selftest.sh's own _reclaim_one_residue tests).
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── _release_manifestless_primary() — stubbed aws, real fixture (ga-qh8gkw) ──"
+
+PRIMARY_ROOT="$LIB_SCRATCH/primary-root"
+
+# mk_primary_scenario — (re)builds $PRIMARY_ROOT/hq as a manifest-LESS primary
+# (some real bytes, no "manifest" file) with a fixed past mtime, and a fresh S3
+# bucket ($FB/hq) holding a CLOSED backup (6 tables, all present) — i.e. by
+# default the S3-only proof passes. A scenario that wants a broken S3 damages
+# $FB/hq AFTER this returns, same convention as reset_lib_case above.
+mk_primary_scenario() {
+  rm -rf "${PRIMARY_ROOT:?}/hq" "${PRIMARY_ROOT:?}/hq.old" "${PRIMARY_ROOT:?}/hq.new" "$FB"
+  mkdir -p "$PRIMARY_ROOT/hq"
+  dd if=/dev/zero of="$PRIMARY_ROOT/hq/data.bin" bs=1024 count=900 >/dev/null 2>&1
+  touch -t 202601010000 "$PRIMARY_ROOT/hq"   # fixed past mtime — 2026-01-01
+  mkdir -p "$FB"; mk_backup_tables "$FB/hq" 6
+  : > "$FAKE_AWS_CALLS"
+  unset FAKE_S3_LIST_FAIL FAKE_S3_DRYRUN_FAIL FAKE_S3_UP_FAIL FAKE_S3_UP_NOOP \
+        FAKE_AWS_FINGERPRINT_OK FAKE_AWS_MANIFEST_OK FAKE_FP_DB FAKE_FP_SIZE FAKE_FP_RUN_UTC
+  FAKE_FP_DB=hq
+}
+
+_run_release() {
+  : > "$LOG"
+  BACKUP_ROOT="$PRIMARY_ROOT" \
+  RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN="${TEST_DRY_RUN:-0}" \
+    _release_manifestless_primary hq
+}
+
+# Scenario A: everything checks out (default mk_primary_scenario: S3 closed,
+# fingerprint run_utc 2026-09-17 — well after the primary's 2026-01-01 mtime,
+# manifest head-object ok by default) → the manifest-less primary is deleted.
+mk_primary_scenario
+_run_release
+[ ! -e "$PRIMARY_ROOT/hq" ] && ok "scenario A (all checks pass): manifest-less primary actually DELETED" || bad "scenario A: primary should have been deleted"
+grep -qF "PROVA S3-ONLY OK" "$LOG" && ok "scenario A: logged the S3-only proof" || bad "scenario A: missing the S3-only proof log line"
+grep -qF "LIBERADA" "$LOG" && ok "scenario A: logged LIBERADA" || bad "scenario A: missing LIBERADA log line"
+
+# Scenario B (ga-qh8gkw rule #2 — MANDATORY): the primary HAS a valid
+# manifest. Must be refused UNCONDITIONALLY, even though S3 would verify fine.
+mk_primary_scenario
+mk_backup_tables "$PRIMARY_ROOT/hq" 3   # overwrite with a REAL manifest+tables
+_run_release
+[ -d "$PRIMARY_ROOT/hq" ] && [ -s "$PRIMARY_ROOT/hq/manifest" ] && ok "scenario B (primary HAS a manifest): STILL PRESENT, untouched — this path never touches a valid primary" || bad "scenario B: RULE #2 VIOLATED — a primary with a valid manifest was touched"
+grep -qF "TEM manifest válido" "$LOG" && ok "scenario B: logged the exact refusal reason" || bad "scenario B: missing the has-manifest refusal reason"
+
+# Scenario C: S3 closure proof fails (a table the S3 manifest names is
+# missing from the bucket) — the bead's literal "S3 indeterminado → não
+# libera" acceptance case, closure-proof variant.
+mk_primary_scenario
+s3_drop_table "$FB" hq 3
+_run_release
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario C (S3 closure proof FAILS — a manifest table missing from the bucket): primary STILL PRESENT" || bad "scenario C: FAIL-CLOSED VIOLATED — primary deleted despite an unrestorable S3 copy"
+grep -qF "SPARED" "$LOG" && ok "scenario C: logged SPARED" || bad "scenario C: missing SPARED log line"
+
+# Scenario D: the S3 fingerprint fetch itself fails outright (network blip,
+# bucket unreachable) — "S3 indeterminado", fingerprint variant.
+mk_primary_scenario
+: > "$LOG"
+FAKE_AWS_FINGERPRINT_OK=0 BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario D (S3 fingerprint fetch fails outright): primary STILL PRESENT" || bad "scenario D: FAIL-CLOSED VIOLATED — primary deleted despite an unfetchable fingerprint"
+
+# Scenario E: the manifest head-object probe fails (S3 says the object is not
+# there even though the closure proof's own separate download would succeed).
+mk_primary_scenario
+: > "$LOG"
+FAKE_AWS_MANIFEST_OK=0 BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario E (S3 manifest head-object probe FAILS): primary STILL PRESENT" || bad "scenario E: FAIL-CLOSED VIOLATED — primary deleted despite a failed manifest head-object probe"
+
+# Scenario F: the fingerprint IS readable but is OLDER than the primary's own
+# mtime — the S3-published state predates whatever last wrote this primary,
+# so it cannot vouch for it yet. Expected/self-healing, not a hard error.
+mk_primary_scenario
+: > "$LOG"
+FAKE_FP_RUN_UTC="2020-01-01T00:00:00Z" BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario F (fingerprint older than the primary): primary STILL PRESENT" || bad "scenario F: primary deleted despite a stale (pre-primary) fingerprint"
+
+# Scenario G: DRY_RUN — every check passes, but nothing is actually deleted.
+mk_primary_scenario
+TEST_DRY_RUN=1 _run_release
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario G (DRY_RUN=1): primary STILL PRESENT" || bad "scenario G: DRY_RUN=1 should never delete"
+grep -qF "DRY-RUN" "$LOG" && ok "scenario G: logged DRY-RUN" || bad "scenario G: missing DRY-RUN log line"
+
+# Scenario H: a $db.old already exists from a prior cycle — refuse outright,
+# never race with whatever produced that residue.
+mk_primary_scenario
+mkdir -p "$PRIMARY_ROOT/hq.old"
+_run_release
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario H (hq.old already exists): primary STILL PRESENT — refused before even checking S3" || bad "scenario H: should have refused with hq.old present"
+grep -qF "já existe" "$LOG" && ok "scenario H: logged the hq.old-exists refusal" || bad "scenario H: missing the hq.old-exists refusal reason"
+rm -rf "$PRIMARY_ROOT/hq.old"
+
+# Scenario I: no primary at all — clean no-op, no crash.
+rm -rf "$PRIMARY_ROOT/hq"
+: > "$LOG"
+BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+grep -qF "nada a liberar" "$LOG" && ok "scenario I (no primary at all): clean no-op logged" || bad "scenario I: expected a 'nada a liberar' no-op log line"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1d (ga-qh8gkw): _maybe_promote_new_after_primary_release() — stubbed
+# dolt/gc/df, real restore-dir plumbing against a throwaway fixture.
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── _maybe_promote_new_after_primary_release() (ga-qh8gkw step 3) ──"
+
+PROMOTE_CITY="$LIB_SCRATCH/promote-city"
+cat > "$LIB_SCRATCH/bin/dolt" <<'DOLTEOF'
+#!/bin/bash
+args="$*"
+case "$args" in
+  *"backup restore"*)
+    [ "${FAKE_RESTORE_FAIL:-0}" = "1" ] && exit 1
+    verify_name="${@: -1}"
+    mkdir -p "./$verify_name"
+    echo marker > "./$verify_name/marker"
+    exit 0
+    ;;
+  *"SELECT COUNT(*) FROM issues"*)
+    [ "${FAKE_RESTORED_COUNT_UNREADABLE:-0}" = "1" ] && exit 0
+    echo "| ${FAKE_RESTORED_COUNT:-50} |"
+    ;;
+  *) exit 0 ;;
+esac
+DOLTEOF
+chmod +x "$LIB_SCRATCH/bin/dolt"
+cat > "$LIB_SCRATCH/bin/gc" <<'GCEOF'
+#!/bin/bash
+echo "| ${FAKE_LIVE_COUNT:-50} |"
+exit 0
+GCEOF
+chmod +x "$LIB_SCRATCH/bin/gc"
+cat > "$LIB_SCRATCH/bin/df" <<'DFEOF'
+#!/bin/bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted"
+echo "fake 1 1 ${FAKE_DF_FREE_KB:-999999} 1% /System/Volumes/Data"
+DFEOF
+chmod +x "$LIB_SCRATCH/bin/df"
+
+mk_promote_scenario() {   # a released primary (absent), a valid .new, a small live db
+  rm -rf "$PRIMARY_ROOT" "$PROMOTE_CITY"
+  mkdir -p "$PRIMARY_ROOT" "$PROMOTE_CITY/.beads/dolt/hq"
+  dd if=/dev/zero of="$PROMOTE_CITY/.beads/dolt/hq/live.bin" bs=1024 count=1000 >/dev/null 2>&1
+  mk_backup_tables "$PRIMARY_ROOT/hq.new" 4
+}
+# NOTIFY_CALLS_FILE_PROMOTE: this test's own scratch file for the fake notify
+# below — never the real $NOTIFY. Without this override, notify_fail's $NOTIFY
+# resolves to the REAL /Users/athos/.local/bin/notify (resolved once, at this
+# whole file's Part-1 LIB-mode source, from an unset DOLT_BACKUP_RESIDUE_
+# RECLAIM_NOTIFY) and scenario P3 below would fire an actual push notification.
+NOTIFY_CALLS_FILE_PROMOTE="$LIB_SCRATCH/notify-calls-promote.log"
+cat > "$LIB_SCRATCH/bin/notify" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$NOTIFY_CALLS_FILE_PROMOTE"
+exit 0
+STUB
+chmod +x "$LIB_SCRATCH/bin/notify"
+
+_run_promote() {
+  (cd "$LIB_SCRATCH" && PATH="$LIB_SCRATCH/bin:$PATH" DOLT_BIN=dolt GC_BIN=gc \
+    NOTIFY="$LIB_SCRATCH/bin/notify" \
+    BACKUP_ROOT="$PRIMARY_ROOT" CITY="$PROMOTE_CITY" LOW_DISK_MARGIN_PCT=120 \
+    _maybe_promote_new_after_primary_release hq)
+}
+
+# Scenario P1: ample margin, restore succeeds with restored>=live → promoted.
+mk_promote_scenario
+: > "$LOG"
+FAKE_DF_FREE_KB=50000 FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 _run_promote
+[ -d "$PRIMARY_ROOT/hq" ] && [ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "scenario P1 (ample margin, verified restore): hq.new PROMOTED to hq" || bad "scenario P1: expected hq.new promoted to hq"
+grep -qF "PROMOVIDO" "$LOG" && ok "scenario P1: logged PROMOVIDO" || bad "scenario P1: missing PROMOVIDO log line"
+
+# Scenario P2: margin insufficient — leaves .new in place, logs why, never
+# attempts a restore at all (this is the branch that actually fires today,
+# per the Mayor's own measured numbers on ga-qh8gkw).
+mk_promote_scenario
+: > "$LOG"
+FAKE_DF_FREE_KB=500 FAKE_LIVE_COUNT=50 _run_promote
+[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ok "scenario P2 (margin insufficient): hq.new LEFT IN PLACE, hq not created" || bad "scenario P2: hq.new should have been left untouched"
+grep -qF "margem insuficiente" "$LOG" && ok "scenario P2: logged the margin-insufficient reason" || bad "scenario P2: missing the margin-insufficient log line"
+
+# Scenario P3: margin covers it, but the restore FAILS — must NOT promote, and
+# must alarm (this is the "SEM BACKUP LOCAL" window the header warns about).
+mk_promote_scenario
+: > "$LOG"; : > "$NOTIFY_CALLS_FILE_PROMOTE"
+FAKE_DF_FREE_KB=50000 FAKE_LIVE_COUNT=50 FAKE_RESTORE_FAIL=1 _run_promote
+[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ok "scenario P3 (restore fails): hq.new LEFT IN PLACE, hq NOT created" || bad "scenario P3: hq.new should have been left untouched after a failed restore"
+grep -qF "SEM BACKUP LOCAL" "$LOG" && ok "scenario P3: logged the SEM BACKUP LOCAL alarm" || bad "scenario P3: missing the SEM BACKUP LOCAL log line"
+[ -s "$NOTIFY_CALLS_FILE_PROMOTE" ] && ok "scenario P3: notify_fail fired (real gap: primary already freed, new does not restore)" || bad "scenario P3: notify_fail should have fired"
+
+# Scenario P4: no .new at all → clean no-op, no crash.
+mk_promote_scenario
+rm -rf "$PRIMARY_ROOT/hq.new"
+: > "$LOG"
+_run_promote
+grep -qF "nada para promover" "$LOG" && ok "scenario P4 (no .new present): clean no-op logged" || bad "scenario P4: expected a 'nada para promover' no-op log line"
+
 rm -rf "$LIB_SCRATCH" 2>/dev/null
 unset FAKE_BUCKET_DIR FAKE_AWS_CALLS
 
@@ -861,7 +1100,26 @@ else
   bad "_s3_current_backup_verified no longer calls _s3proof_repair_then_prove"
 fi
 if grep -qE '^\. .*dolt-backup-s3-proof\.sh"' "$SCRIPT"; then ok "reseed sources dolt-backup-s3-proof.sh"; else bad "reseed does not source dolt-backup-s3-proof.sh — _s3proof_repair_then_prove would be undefined"; fi
-if grep -qF 's3api head-object' "$SCRIPT"; then bad "the weak head-object proof is back in reseed (an object's existence says nothing about restoring)"; else ok "no head-object proof in reseed"; fi
+HEAD_OBJECT_HITS="$(grep -cF 's3api head-object' "$SCRIPT")"
+# ga-qh8gkw: _release_manifestless_primary legitimately adds ONE head-object
+# call — but only ever as one of THREE required checks (manifest presence +
+# fingerprint newer-than-mtime + the strong _s3proof_s3_closure_ok restore
+# proof), the same shape dolt-backup-residue-reclaim.sh already uses for .old
+# residue. What this guard must still catch is head-object EVER standing in
+# as the deletion proof BY ITSELF (the pre-ga-gsnee8 defect) — so it asserts
+# the exact count AND that the stronger closure proof sits in the same
+# function, not merely "zero head-object calls anywhere in the file".
+if [ "$HEAD_OBJECT_HITS" -eq 1 ]; then
+  ok "exactly one head-object call in reseed (ga-qh8gkw's _release_manifestless_primary; none in the low-disk _s3_current_backup_verified path)"
+else
+  bad "expected exactly 1 head-object call (ga-qh8gkw), found $HEAD_OBJECT_HITS — a head-object proof may have crept back into (or vanished from) the low-disk path"
+fi
+if awk '/^_release_manifestless_primary\(\)/,/^\}/' "$SCRIPT" | grep -qF 's3api head-object' \
+   && awk '/^_release_manifestless_primary\(\)/,/^\}/' "$SCRIPT" | grep -qF '_s3proof_s3_closure_ok "$db"'; then
+  ok "the one head-object call lives in _release_manifestless_primary ALONGSIDE the strong _s3proof_s3_closure_ok proof — never alone"
+else
+  bad "head-object is not paired with _s3proof_s3_closure_ok inside _release_manifestless_primary — would be the weak pre-ga-gsnee8 proof again"
+fi
 N_VERIFY=$(grep -c '_s3_current_backup_verified "\$DB" "\$BACKUP_DIR"' "$SCRIPT")
 N_RM=$(grep -c 'rm -rf "\$BACKUP_DIR"' "$SCRIPT")
 if [ "$N_VERIFY" = "2" ] && [ "$N_RM" = "$N_VERIFY" ]; then
