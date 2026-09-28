@@ -32,10 +32,16 @@ TWO TIERS, per this bead's own "Mecanismo" text:
      text is split into blocks and Jev answers one atomic noul (0..1) question per block --
      "is this block relevant to the task" -- in a SINGLE call_jev_multi call (the state, i.e.
      all the blocks together, is billed once; ga-aijm2v.4). Logged as experiment "cut-output-jev".
+     tokens_would_save there is summed ONLY over blocks Jev judged would_cut: an output over the
+     state budget is judged from a head+tail SAMPLE, and the un-judged middle counts as KEPT (the
+     record says `sampled`), so the number can never exceed what Jev actually looked at.
 
 THIRD STATE, everywhere: Jev down/error/unparseable -> that block's `relevant`/`would_cut` stay
 None -- never coerced into "safe to cut". A caller (there is none yet: shadow mode has no
-caller) MUST NOT treat a None here as permission to drop the block.
+caller) MUST NOT treat a None here as permission to drop the block. A Jev call slower than
+JEV_DEADLINE_S (below the wrapper's 12s watchdog, which would SIGKILL python and log nothing) is
+logged as the same third state (jev_ok=False, error "deadline"), so "Jev unreachable N/M" also
+counts the SLOW failures, not only the fast ones.
 
 FAIL-OPEN, by construction: this script is on the Bash hot path of every pool session in the
 city (matcher "^Bash$" in pool-roles.json), so EVERY exception -- JSON parse, missing field,
@@ -54,6 +60,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -70,6 +77,15 @@ MAX_JEV_BLOCKS = int(os.environ.get("CUT_OUTPUT_SHADOW_MAX_BLOCKS", "13"))  # po
 MAX_JEV_STATE_CHARS = int(os.environ.get("CUT_OUTPUT_SHADOW_MAX_STATE_CHARS", "20000"))
 CONFIDENCE_THRESHOLD = float(os.environ.get("CUT_OUTPUT_SHADOW_CONFIDENCE", "0.85"))
 COMMAND_LOG_CHARS = 300  # the logged command is a fingerprint for the report, not a full replay
+# Jev gets this long, in total, before the failure is logged as the third state. It must stay BELOW the
+# wrapper's watchdog (cut-output-shadow.sh, CUT_OUTPUT_SHADOW_TIMEOUT, 12s): the watchdog SIGKILLs python
+# and nothing is logged, so a slow vault/Jev would only ever be counted when it happened to be FAST to fail.
+JEV_DEADLINE_S = float(os.environ.get("CUT_OUTPUT_SHADOW_JEV_DEADLINE_S", "9"))
+
+# chunk_text() puts this between the head and the tail sample of an output over the state budget. It is
+# NOT command output: build_jev_log_record() takes "was this output sampled?" from its presence in the
+# blocks (one source, nothing to keep in sync) and never counts its characters as savings.
+SAMPLE_MARKER = "...[middle omitted for Jev's state budget]..."
 
 DISABLED_SENTINEL = Path(
     os.environ.get(
@@ -104,28 +120,32 @@ def chunk_text(text: str, max_blocks: int = MAX_JEV_BLOCKS, max_total_chars: int
     if len(text) > max_total_chars:
         half = max_total_chars // 2
         if half > 0:
-            budgeted = text[:half] + "\n...[middle omitted for Jev's state budget]...\n" + text[-half:]
+            budgeted = text[:half] + f"\n{SAMPLE_MARKER}\n" + text[-half:]
         else:
             # max_total_chars in {0, 1}: half==0 would make text[-half:] a Python "negative
             # zero" slice, which returns the FULL text instead of an empty suffix -- silently
             # defeating the "never send an unbounded amount of text to Jev" guarantee above.
-            budgeted = "...[omitted for Jev's state budget]..."
+            budgeted = SAMPLE_MARKER
 
     paragraphs = [p for p in budgeted.split("\n\n") if p.strip()]
     if len(paragraphs) >= 2:
         source_blocks = paragraphs
+        sep = "\n\n"
     else:
         source_blocks = budgeted.splitlines() or [budgeted]
+        sep = "\n"
 
     if len(source_blocks) <= max_blocks:
         return source_blocks
 
-    # Merge down to max_blocks contiguous groups of roughly equal size (never reorders content).
+    # Merge down to max_blocks contiguous groups of roughly equal size (never reorders content). Groups
+    # are re-joined with the separator the text was SPLIT on, so a merged block is the original text,
+    # not the original plus an invented blank line per join (which used to inflate the block's size).
     n = len(source_blocks)
     group_size = -(-n // max_blocks)  # ceil
     merged: list[str] = []
     for i in range(0, n, group_size):
-        merged.append("\n\n".join(source_blocks[i : i + group_size]))
+        merged.append(sep.join(source_blocks[i : i + group_size]))
     return merged[:max_blocks]
 
 
@@ -193,8 +213,23 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
     }
 
 
+def _source_chars(block: str) -> int:
+    """Characters of `block` that are real command output: the SAMPLE_MARKER chunk_text may have put
+    inside it is not, so it is never counted as text a cut would remove."""
+    return len(block) - block.count(SAMPLE_MARKER) * len(SAMPLE_MARKER)
+
+
 def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: dict) -> dict:
-    """Pure. `jev_result` is call_jev_multi()'s return (ok True or False)."""
+    """Pure. `jev_result` is call_jev_multi()'s return (ok True or False).
+
+    tokens_would_save is summed ONLY over the blocks Jev judged would_cut (gate_run ga-qxm60a). Anything
+    else is KEPT and contributes nothing: text Jev never saw (chunk_text sends a head+tail SAMPLE of an
+    output over the state budget), a block whose answer was missing/unparseable, a block Jev was not
+    confident enough about. An earlier version computed tokens(FULL text) - tokens(kept blocks), so the
+    sampled-out middle -- text nobody judged -- counted as "would save" whatever Jev answered, and the
+    blank-line separators that block-splitting drops counted too. A saving derived by subtraction from
+    text the judge never saw is not a measurement; a saving built from the judged-and-cut blocks cannot
+    exceed what was judged."""
     record: dict = {
         "ts": _now_iso(),
         "mode": "shadow",
@@ -221,25 +256,32 @@ def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: d
 
     answers = jev_result.get("answers", {})
     bad = jev_result.get("bad", {})
-    kept_chars = 0
+    cut_chars = 0  # characters of blocks Jev judged would_cut -- the ONLY source of a saving
+    judged_chars = 0  # characters of command output that were actually put in front of Jev
     per_block = []
     for i, b in enumerate(blocks):
         key = f"{QUESTION_KEY_PREFIX}{i}"
+        n = _source_chars(b)
+        judged_chars += n
         noul = answers.get(key)
         if noul is None:
-            per_block.append({"idx": i, "chars": len(b), "relevant": None, "confidence": None, "would_cut": None, "bad_reason": bad.get(key)})
-            kept_chars += len(b)  # unknown -> keep, never cut on doubt
+            # unknown -> keep, never cut on doubt
+            per_block.append({"idx": i, "chars": n, "relevant": None, "confidence": None, "would_cut": None, "bad_reason": bad.get(key)})
             continue
         relevant = noul >= 0.5
         confidence = noul if relevant else (1.0 - noul)
         would_cut = (not relevant) and confidence >= CONFIDENCE_THRESHOLD
-        per_block.append({"idx": i, "chars": len(b), "noul": noul, "relevant": relevant, "confidence": confidence, "would_cut": would_cut})
-        if not would_cut:
-            kept_chars += len(b)
+        per_block.append({"idx": i, "chars": n, "noul": noul, "relevant": relevant, "confidence": confidence, "would_cut": would_cut})
+        if would_cut:
+            cut_chars += n
     record["blocks"] = per_block
-    record["chars_after_provisional"] = kept_chars
-    kept_chars_tokens = max(0, round(kept_chars / coc.CHARS_PER_TOKEN))
-    record["tokens_would_save"] = max(0, coc.estimate_tokens(text) - kept_chars_tokens)
+    # observability: the report cannot tell a sampled judgement from a whole-output one without these
+    record["sampled"] = any(SAMPLE_MARKER in b for b in blocks)
+    record["chars_judged"] = judged_chars
+    # what would remain of the WHOLE output: everything except the judged-and-cut blocks, so the
+    # un-judged middle of a sampled output stays in
+    record["chars_after_provisional"] = max(0, len(text) - cut_chars)
+    record["tokens_would_save"] = max(0, round(cut_chars / coc.CHARS_PER_TOKEN))
     record["omitted_signatures"] = coc.extract_signatures(
         "\n".join(blocks[pb["idx"]] for pb in per_block if pb.get("would_cut") is True)
     )
@@ -251,6 +293,37 @@ def _log(record: dict) -> None:
     je.JEV_LOG.parent.mkdir(parents=True, exist_ok=True)
     with je.JEV_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def call_jev_with_deadline(state: str, questions: dict, deadline_s: float | None = None) -> dict:
+    """call_jev_multi() under a hard deadline, always returning a call_jev_multi-shaped dict.
+
+    Why (gate_run ga-qxm60a): credential lookup is two vault CLI spawns of up to 20s each, plus an 8s
+    HTTP call, but the wrapper's watchdog SIGKILLs python at 12s -- and a killed process writes nothing.
+    A slow vault therefore vanished from the log instead of being counted as "Jev unreachable", so that
+    number only ever contained the failures that were FAST. Here the slow failure is a record too:
+    ok=False, error="deadline" -- the same third state as any other unreachable Jev, never coerced into
+    "cut" or "keep". An exception escaping the call (its contract says it never raises) gets the same
+    treatment instead of propagating out of process() and losing the measurement.
+
+    The call runs in a daemon thread; on deadline it is abandoned (it may finish later and its result
+    is dropped, the interpreter does not wait for it)."""
+    deadline = JEV_DEADLINE_S if deadline_s is None else deadline_s
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["result"] = je.call_jev_multi(state, questions)
+        except Exception as e:  # noqa: BLE001 -- any failure is the third state, never a lost record
+            box["result"] = {"ok": False, "error": f"exception:{type(e).__name__}"}
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if worker.is_alive():
+        return {"ok": False, "error": "deadline"}
+    result = box.get("result")
+    return result if isinstance(result, dict) else {"ok": False, "error": "no_result"}
 
 
 def process(hook_input: dict) -> None:
@@ -269,6 +342,8 @@ def process(hook_input: dict) -> None:
         return
 
     command = hook_input.get("tool_input", {}).get("command", "") if isinstance(hook_input.get("tool_input"), dict) else ""
+    if not isinstance(command, str):
+        command = ""  # only a fingerprint for the report: not knowing it must not cost the whole measurement
     raw_tool_use_id = hook_input.get("tool_use_id")
     tool_use_id = raw_tool_use_id if isinstance(raw_tool_use_id, str) and raw_tool_use_id else None
     meta = {
@@ -291,7 +366,7 @@ def process(hook_input: dict) -> None:
     if not blocks:
         return
     state, questions = build_jev_state_and_questions(command, blocks)
-    jev_result = je.call_jev_multi(state, questions)
+    jev_result = call_jev_with_deadline(state, questions)
     _log(build_jev_log_record(jev_result, blocks, text, meta))
 
 
@@ -344,6 +419,16 @@ def _selftest() -> int:
     single_blob = "x" * 1000  # no blank lines, no newlines at all
     chunks3 = chunk_text(single_blob, max_blocks=5, max_total_chars=1_000_000)
     ok("chunk_text on a single-line blob (no paragraphs) still returns <= max_blocks", 1 <= len(chunks3) <= 5)
+    # merged groups are re-joined with the separator the text was SPLIT on: the blocks reassemble to the
+    # original text exactly (only the separators BETWEEN blocks are dropped, never invented within one)
+    line_text = "\n".join(f"row {i} {'y' * (i % 7)}" for i in range(500))
+    ok("chunk_text (line mode, merged): the blocks re-join to the ORIGINAL text, no invented blank lines",
+       "\n".join(chunk_text(line_text, max_blocks=7, max_total_chars=1_000_000)) == line_text)
+    para_text = "\n\n".join(f"para {i}\nsecond line {i}" for i in range(40))
+    ok("chunk_text (paragraph mode, merged): the blocks re-join to the ORIGINAL text",
+       "\n\n".join(chunk_text(para_text, max_blocks=6, max_total_chars=1_000_000)) == para_text)
+    ok("chunk_text never returns more than max_blocks, for every input size around the merge boundary",
+       all(len(chunk_text("\n".join("l" * 5 for _ in range(n)), max_blocks=13, max_total_chars=1_000_000)) <= 13 for n in range(1, 200)))
     huge = "A" * 50_000
     chunks4 = chunk_text(huge, max_blocks=3, max_total_chars=10_000)
     ok("chunk_text respects the total char budget on huge input", sum(len(c) for c in chunks4) <= 10_000 + 200)
@@ -501,6 +586,134 @@ def _selftest() -> int:
     rec_bad = build_jev_log_record(jr_bad, ["one block"], "one block", {"tool_use_id": "tu5", "command": "x"})
     ok("jev record: a bad/garbled answer -> would_cut is None, not True", rec_bad["blocks"][0]["would_cut"] is None)
     ok("jev record: a bad/garbled answer's block is counted toward KEPT chars (never cut on doubt)", rec_bad["chars_after_provisional"] == len("one block"))
+
+    # ---- gate_run ga-qxm60a, blocking issue 2: tokens_would_save counted text Jev NEVER SAW. For
+    # output over the state budget chunk_text sends only a head+tail sample, but the saving used to be
+    # tokens(FULL text) - tokens(kept judged blocks): the un-sampled middle counted as "would save"
+    # whatever Jev answered. The saving may only come from blocks Jev judged would_cut; everything
+    # else -- the sampled-out middle, unparseable answers, low-confidence answers -- is KEPT. ----
+    def _all_answers(blks: list[str], noul: float) -> dict:
+        return {"ok": True, "answers": {f"block_{i}": noul for i in range(len(blks))}, "bad": {}, "tokens_in": 1, "tokens_out": 1}
+
+    big_unstructured = "\n".join(f"{i:04d} " + "x" * 390 for i in range(150))  # ~59k chars, 150 lines: under max_lines, so the Jev tier
+    ok("setup: the big fixture is over the Jev state budget", len(big_unstructured) > MAX_JEV_STATE_CHARS)
+    ok("setup: the big fixture is unstructured (no fixed rule applies)", coc.classify_output("curl x", big_unstructured) is None)
+    big_blocks = chunk_text(big_unstructured)
+    big_meta = {"tool_use_id": "tu-big", "command": "curl x"}
+
+    rec_all_rel = build_jev_log_record(_all_answers(big_blocks, 0.95), big_blocks, big_unstructured, big_meta)
+    ok(
+        "sampled text, Jev says every block is relevant (nothing would be cut) -> tokens_would_save == 0, "
+        "not the never-judged middle",
+        rec_all_rel["tokens_would_save"] == 0,
+    )
+    ok(
+        "sampled text: chars_after_provisional keeps the un-judged middle (nothing cut -> everything kept)",
+        rec_all_rel["chars_after_provisional"] == len(big_unstructured),
+    )
+    ok("sampled text: the record says it was sampled", rec_all_rel.get("sampled") is True)
+    ok(
+        "sampled text: chars_judged is what Jev actually saw (<= the state budget), not the whole output",
+        isinstance(rec_all_rel.get("chars_judged"), int) and 0 < rec_all_rel["chars_judged"] <= MAX_JEV_STATE_CHARS,
+    )
+
+    rec_all_noise = build_jev_log_record(_all_answers(big_blocks, 0.05), big_blocks, big_unstructured, big_meta)
+    max_saving = coc.estimate_tokens("x" * MAX_JEV_STATE_CHARS)  # the most any judgement of a 20k-char sample can justify
+    ok(
+        "sampled text, Jev says everything it saw is noise -> saving is bounded by the text it saw "
+        f"({rec_all_noise['tokens_would_save']} <= {max_saving}), never the full {rec_all_noise['tokens_before']}",
+        0 < rec_all_noise["tokens_would_save"] <= max_saving,
+    )
+    ok(
+        "sampled text, all judged blocks cut: chars_after_provisional still holds the un-judged middle",
+        rec_all_noise["chars_after_provisional"] > len(big_unstructured) - MAX_JEV_STATE_CHARS - 200,
+    )
+
+    # blocks are built by splitting on paragraph boundaries and re-joining merged groups: the blank-line
+    # separators between blocks are not in any block. With NOTHING cut, that dropped text must not show
+    # up as a saving either (same root: the saving was derived by subtraction, not from the cut blocks).
+    paras_text = "\n\n".join(f"paragraph {i}: " + "word " * 40 for i in range(30))
+    paras_blocks = chunk_text(paras_text)
+    rec_paras = build_jev_log_record(_all_answers(paras_blocks, 0.95), paras_blocks, paras_text, big_meta)
+    ok("unsampled text with blank-line separators, nothing cut -> tokens_would_save == 0", rec_paras["tokens_would_save"] == 0)
+    ok("unsampled text: the record says it was NOT sampled", rec_paras.get("sampled") is False)
+
+    # a block that Jev could not judge (bad answer) is kept -- and so is everything around it
+    rec_partial = build_jev_log_record(
+        {"ok": True, "answers": {"block_0": 0.05}, "bad": {"block_1": "unparseable_answer: x"}, "tokens_in": 1, "tokens_out": 1},
+        ["A" * 220, "B" * 220], "A" * 220 + "\n\n" + "B" * 220, big_meta,
+    )
+    ok(
+        "only the block Jev judged would_cut is counted (220 chars / 2.2 = 100 tokens); the unparseable one is kept",
+        rec_partial["tokens_would_save"] == 100,
+    )
+
+    # ---- gate_run ga-qxm60a, medium finding: a slow vault/Jev used to get python SIGKILLed by the
+    # wrapper's watchdog with NO record written, so "Jev unreachable N/M" only ever counted the FAST
+    # failures. process() now owns a deadline below the watchdog and logs the slow failure as the
+    # third state (jev_ok=False, error="deadline"). ----
+    release_slow = threading.Event()
+
+    def _slow_jev(state, questions):
+        release_slow.wait(3)  # far longer than the 0.2s deadline below
+        return {"ok": True, "answers": {k: 0.05 for k in questions}, "bad": {}, "tokens_in": 1, "tokens_out": 1}
+
+    hook_big = {
+        "tool_name": "Bash", "tool_response": {"stdout": big_unstructured, "stderr": ""}, "tool_use_id": "tu-slow",
+        "session_id": "s-slow", "transcript_path": "/tmp/s-slow.jsonl", "tool_input": {"command": "curl x"},
+    }
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=_slow_jev), \
+             mock.patch(f"{__name__}.JEV_DEADLINE_S", 0.2, create=True):
+            t0 = time.monotonic()
+            process(hook_big)
+            took = time.monotonic() - t0
+        release_slow.set()
+        dl_lines = log_path.read_text().splitlines() if log_path.exists() else []
+        ok("deadline: a Jev call slower than the deadline returns near the deadline, not when Jev finally answers "
+           f"(took {took:.1f}s)", took < 2.0)
+        ok("deadline: the slow failure is LOGGED (not lost to a watchdog kill)", len(dl_lines) == 1)
+        rec_dl = json.loads(dl_lines[0]) if dl_lines else {}
+        ok("deadline: record is the Jev third state (jev_ok False, error 'deadline')",
+           rec_dl.get("jev_ok") is False and rec_dl.get("jev_error") == "deadline")
+        ok("deadline: no per-block verdicts and no would-save number are invented",
+           rec_dl.get("blocks") is None and rec_dl.get("tokens_would_save") is None)
+
+    # a hook input whose tool_input.command is not a string (null / missing / odd type) is still a
+    # measurable large output: the command is only a fingerprint for the report, so "don't know" is an
+    # empty command, not a TypeError that silently drops the whole record
+    for odd_cmd in (None, 123, ["ls"]):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "jev-experiment.jsonl"
+            raised_cmd = False
+            with mock.patch.object(je, "JEV_LOG", log_path), \
+                 mock.patch.object(je, "call_jev_multi", return_value={"ok": False, "error": "no_credentials"}):
+                try:
+                    process({**hook_big, "tool_input": {"command": odd_cmd}})
+                except Exception:
+                    raised_cmd = True
+            cmd_lines = log_path.read_text().splitlines() if log_path.exists() else []
+            ok(f"non-string tool_input.command ({odd_cmd!r}): process() does not raise and still logs the measurement",
+               not raised_cmd and len(cmd_lines) == 1 and json.loads(cmd_lines[0]).get("command") == "")
+
+    # an exception escaping call_jev_multi (contract says it never raises, but a bug there must not
+    # silently drop the measurement either) is the same third state, not a lost record
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        raised = False
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=RuntimeError("boom")):
+            try:
+                process(hook_big)
+            except Exception:
+                raised = True
+        exc_lines = log_path.read_text().splitlines() if log_path.exists() else []
+        ok("exception in call_jev_multi: process() does not propagate it", not raised)
+        rec_exc = json.loads(exc_lines[0]) if exc_lines else {}
+        ok("exception in call_jev_multi: logged as jev_ok False with the error class, blocks None",
+           rec_exc.get("jev_ok") is False and str(rec_exc.get("jev_error", "")).startswith("exception:") and rec_exc.get("blocks") is None)
 
     # ---- process(): end to end, with a temp log file and a mocked Jev, verifying the hook NEVER
     # emits anything other than the caller printing "{}" (main() owns the print; process() only logs) ----

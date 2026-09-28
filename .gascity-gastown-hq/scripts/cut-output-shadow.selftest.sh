@@ -122,6 +122,25 @@ else
   bad "hang case: rc=$RC out=[$OUT] elapsed=$((t1 - t0))s"
 fi
 
+# The watchdog is `( sleep N && kill -9 pid ) &`. When the classifier finishes normally the wrapper
+# stops the watchdog -- and used to kill only the subshell, orphaning its `sleep N` child for up to N
+# seconds on EVERY large-output call (harmless one at a time; a process per call on a machine that is
+# already at load 56-64). A distinctive N (4177) lets this test tell its own orphan from any other sleep.
+# (The `[7]` keeps this script's own command line from matching its own pattern. Cleanup is by pid:
+# pkill is blocked in agent sessions.)
+kill_test_sleeps() { local p; for p in $(pgrep -f 'sleep 417[7]' 2>/dev/null); do kill "$p" >/dev/null 2>&1 || true; done; }
+kill_test_sleeps
+printf '#!/bin/sh\necho "{}"\n' > "$SCRATCH/py-fast"; chmod +x "$SCRATCH/py-fast"
+run "$BIG" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-fast" "CUT_OUTPUT_SHADOW_TIMEOUT=4177"
+sleep 0.3
+ORPHANS="$(pgrep -f 'sleep 417[7]' 2>/dev/null | wc -l | tr -d ' ')"
+kill_test_sleeps  # never leave a 4177s sleep behind, pass or fail
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ "$ORPHANS" = "0" ]; then
+  ok "normal run: the watchdog's sleep is stopped with the watchdog -- no orphaned 'sleep' left behind"
+else
+  bad "watchdog cleanup: rc=$RC out=[$OUT] orphaned sleep processes=$ORPHANS"
+fi
+
 printf '#!/bin/sh\necho "not valid json at all"\n' > "$SCRATCH/py-badjson"; chmod +x "$SCRATCH/py-badjson"
 expect_noop "classifier prints invalid JSON" "$BIG" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-badjson"
 

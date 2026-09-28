@@ -5,12 +5,14 @@ output into one of these shapes:
 
   1. "pytest": a pytest run whose last session reached its final summary banner. Kept = the
      FAILURES section (first failure header up to the short-summary section, or up to the banner)
-     + the banner line (or, if nothing failed, just the banner). Everything else (setup noise,
-     collection, PASSED lines) is the omitted part.
+     + the banner line (or, if nothing failed, just the banner). When the banner says failed/error
+     but there is no FAILURES section (`--tb=no`), kept = the short-summary section + the banner.
+     Everything else (setup noise, collection, PASSED lines) is the omitted part.
   2. "log-tail": a generic long/log-shaped dump. Kept = head N + tail N + every line that looks
      like an error/exception/traceback signal, in original order. Everything else is omitted.
   3. "unknown": recognizably pytest, but not in a shape the rule can cut safely (killed/truncated
-     mid-run, no final banner after the last session). Nothing is omitted, everything is kept --
+     mid-run, no final banner after the last session; or a banner that says failed/error while
+     nothing in the output lists what failed). Nothing is omitted, everything is kept --
      the shadow log records it as unknown, distinct from both "cut" and "nothing to cut".
   4. None ("unstructured"): output is large but does not match any fixed shape above. The
      caller (cut-output-shadow.py) is the one that decides what to do with an unstructured
@@ -65,9 +67,12 @@ _ERROR_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# pytest's own banner lines. "session starts" without the leading "=" is deliberately loose:
-# some CI wrappers reflow or strip the "=" padding, but never rename the phrase itself.
-_PYTEST_SESSION_RE = re.compile(r"session starts", re.IGNORECASE)
+# pytest's own header line: "=== test session starts ===". The "=" padding is optional (some CI
+# wrappers strip it) but the line must BE the header -- nothing else on it. The bare phrase anywhere in
+# any line was too loose: a non-pytest log that merely said "new session starts here" became an
+# "unreadable pytest run" (rule "unknown"), never reaching log-tail. Anchored with no nested quantifier,
+# so it stays linear on a hostile 100k-wide "=====x" line.
+_PYTEST_SESSION_RE = re.compile(r"^[\s=_-]*test session starts[\s=_-]*$", re.IGNORECASE)
 # pytest's own trailing one-line summary banner, e.g. "===== 5 passed in 0.12s =====",
 # "=== 2 failed, 3 passed in 1.02s ===", "==== no tests ran in 0.01s ====" (no digit-count phrase
 # at all, printed whenever 0 tests are collected) or "=== 1 failed in 65.32s (0:01:05) ===" (runs
@@ -90,6 +95,9 @@ _PYTEST_FINAL_SUMMARY_RE = re.compile(
 # "___ test_name ___". Same linearity rule as above (`_{5,}\s` pins where the underscore run ends).
 _PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}\s.*\s_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE)
 _PYTEST_SHORT_SUMMARY_RE = re.compile(r"short test summary info", re.IGNORECASE)
+# The banner's own outcome words that mean "look at what failed": "2 failed", "1 error", "3 errors".
+# \b keeps "xfailed" (an expected failure) from counting -- x and f are both word characters.
+_PYTEST_BANNER_FAILURE_RE = re.compile(r"\b(?:failed|errors?)\b", re.IGNORECASE)
 
 
 def estimate_tokens(text: str) -> int:
@@ -185,10 +193,14 @@ def classify_pytest(text: str) -> dict | None:
         (pytest's own "=== ... in X.XXs ===" line, matched by shape, never assumed to be the last
         line of `text`). Kept = that banner line + every line from the first FAILURES header of
         that session up to (not including) its "short test summary info" header, or up to the
-        banner when there is no such section. Nothing failed -> kept is just the banner.
+        banner when there is no such section. Nothing failed -> kept is just the banner. The
+        banner says failed/error but there is NO FAILURES section (`--tb=no`) -> kept is the
+        short-summary section (pytest's compact failure list) + the banner.
       * rule "unknown" (keep everything, omit nothing) when the last session has NO final banner
         after it -- output killed/truncated mid-run, or a banner that belongs to an earlier,
-        already-finished run. There is no summary to anchor on, so the rule does not cut."""
+        already-finished run -- or when the banner says failed/error and there is no failure
+        listing of any kind. There is nothing to anchor on / no way to know what failed, so the
+        rule does not cut."""
     if not text:
         return None
     lines, offsets = _split_lines(text)
@@ -216,6 +228,18 @@ def classify_pytest(text: str) -> dict | None:
             banner_idx,
         )
         kept_idx.update(range(failure_idx, body_end))
+    elif _PYTEST_BANNER_FAILURE_RE.search(lines[banner_idx]):
+        # The banner says something failed/errored, yet there is no FAILURES section (`--tb=no`, or a
+        # collection error reported only in the short summary). "No FAILURES header" is NOT "nothing
+        # failed": keep pytest's own compact failure list; and if there is not even that, we do not know
+        # what failed, so we do not cut (rule "unknown") instead of keeping a banner that hides it.
+        short_idx = next(
+            (i for i in range(session_idx + 1, banner_idx) if _PYTEST_SHORT_SUMMARY_RE.search(lines[i])),
+            None,
+        )
+        if short_idx is None:
+            return _unknown_verdict(text, "pytest-failed-no-failure-listing")
+        kept_idx.update(range(short_idx, banner_idx))
     return _verdict_from_kept_lines("pytest", text, lines, offsets, kept_idx)
 
 
@@ -252,7 +276,10 @@ def classify_log_tail(
 
 _SIGNATURE_BEAD_ID_RE = re.compile(r"\b(?:ga|wa|gt)-[a-z0-9]{4,10}\b")
 _SIGNATURE_PATH_RE = re.compile(r"/[\w.-]+(?:/[\w.-]+){2,}")
-_SIGNATURE_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+# A sha-looking token has BOTH a hex letter and a digit. A bare digit run (byte count, epoch, id) filled
+# the 8-signature budget ahead of real error-line snippets and substring-matched unrelated later lines
+# (JSON usage counters), pushing referenced_later up; a letters-only word ("defaced") is a word.
+_SIGNATURE_SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b")
 
 
 def extract_signatures(text: str, max_signatures: int = 8) -> list[str]:
@@ -673,6 +700,71 @@ def _selftest() -> int:
         ok("real capture: kept_text only ever contains WHOLE lines of the original (no partial banner)",
            all(ln in original_lines for ln in r_real["kept_text"].splitlines()))
 
+    # ---- gate_run ga-qxm60a, medium finding (third state): "no FAILURES section found" was read as
+    # "nothing failed". `pytest --tb=no` (or any run whose only failure listing is the "short test
+    # summary info" section) has failures but no FAILURES header, so kept was the banner alone and the
+    # FAILED test names went to omitted_text -- while a module comment promised "a shape this misses
+    # degrades to don't cut". The banner itself says whether something failed; when it does, the failure
+    # listing must be in kept, in whichever form pytest printed it, or the rule does not cut at all. ----
+    tb_no_head = (
+        "============================= test session starts ==============================\n"
+        "platform darwin -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0\n"
+        "rootdir: /work/proj\n"
+        "collected 120 items\n"
+        "\n"
+    )
+    tb_no_body = "".join(f"test_x.py::test_{i} {'FAILED' if i in (7, 63) else 'PASSED'}  [{i}%]\n" for i in range(120))
+    tb_no_short = (
+        "=========================== short test summary info ============================\n"
+        "FAILED test_x.py::test_7 - assert 1 == 2\n"
+        "FAILED test_x.py::test_63 - ValueError: boom\n"
+    )
+    tb_no_banner = "=================== 2 failed, 118 passed in 0.50s ====================\n"
+    pytest_tb_no = tb_no_head + tb_no_body + tb_no_short + tb_no_banner
+    r_tb = classify_output("pytest --tb=no -v", pytest_tb_no)
+    ok("--tb=no run with failures -> a pytest verdict", r_tb is not None and r_tb["rule"] == "pytest")
+    if r_tb and r_tb["rule"] == "pytest":
+        ok("--tb=no: the FAILED test names (short test summary) are KEPT", "FAILED test_x.py::test_7 - assert 1 == 2" in r_tb["kept_text"] and "FAILED test_x.py::test_63 - ValueError: boom" in r_tb["kept_text"])
+        ok("--tb=no: the banner is kept", "2 failed, 118 passed" in r_tb["kept_text"])
+        ok("--tb=no: the failed test names are NOT left only in omitted_text", "test_7 - assert 1 == 2" not in r_tb["omitted_text"])
+        ok("--tb=no: the 118 routine PASSED lines are still cut", "PASSED" not in r_tb["kept_text"] and "PASSED" in r_tb["omitted_text"])
+        ok("--tb=no: no line is both kept and omitted", overlap_problems(pytest_tb_no, r_tb) == [] and span_problems(pytest_tb_no, r_tb) == [])
+    pytest_tb_no_no_listing = tb_no_head + tb_no_body + tb_no_banner  # e.g. -rN --tb=no: the banner says failed, nothing lists what
+    r_tb_none = classify_output("pytest --tb=no -rN -v", pytest_tb_no_no_listing)
+    ok(
+        "banner says 'failed' but no failure listing exists anywhere -> 'unknown' (do not cut), not a banner-only cut",
+        r_tb_none is not None and r_tb_none["rule"] == "unknown" and r_tb_none["omitted_text"] == "" and r_tb_none["kept_text"] == pytest_tb_no_no_listing,
+    )
+    pytest_collect_error = (
+        tb_no_head + tb_no_body
+        + "=========================== short test summary info ============================\n"
+        "ERROR test_y.py - ImportError: no module named thing\n"
+        "=================================== 1 error in 0.10s ===================================\n"
+    )
+    r_err = classify_output("pytest --tb=no", pytest_collect_error)
+    ok("banner says 'error' -> the ERROR line of the short summary is kept",
+       r_err is not None and r_err["rule"] == "pytest" and "ERROR test_y.py - ImportError" in r_err["kept_text"])
+    pytest_x_only = tb_no_head + tb_no_body.replace("FAILED", "XFAIL") + "=================== 118 passed, 2 xfailed, 1 xpassed in 0.50s ====================\n"
+    r_x = classify_output("pytest -v", pytest_x_only)
+    ok("'xfailed'/'xpassed' in the banner are not failures: still a plain pytest cut (banner only), not 'unknown'",
+       r_x is not None and r_x["rule"] == "pytest" and "118 passed, 2 xfailed" in r_x["kept_text"] and r_x["kept_text"].count("\n") == 1)
+
+    # ---- gate_run ga-qxm60a, low findings: signatures and the pytest-shape gate were both too loose ----
+    sig_noise = extract_signatures("size 104857600 bytes at epoch 1790626971, sha abc1234def5678, count 1234567, word defaced")
+    ok("signatures: a bare digit run (byte count, epoch) is not a sha-looking token", not any(s.isdigit() for s in sig_noise))
+    ok("signatures: a word made only of a-f letters ('defaced') is not a sha-looking token", "defaced" not in sig_noise)
+    ok("signatures: a real short/long sha (letters AND digits) is still found", "abc1234def5678" in sig_noise)
+    log_mentions_phrase = "\n".join(["tmux: new session starts here"] + [f"INFO step {i} ok" for i in range(400)])
+    r_phrase = classify_output("cmd", log_mentions_phrase)
+    ok(
+        "a non-pytest log that merely MENTIONS 'session starts' is a log-tail cut, not an 'unreadable pytest run'",
+        r_phrase is not None and r_phrase["rule"] == "log-tail" and r_phrase["omitted_text"] != "",
+    )
+    pytest_stripped_padding = pytest_pass.replace("============================= test session starts ==============================", "test session starts")
+    r_stripped = classify_pytest(pytest_stripped_padding)
+    ok("a pytest header whose '=' padding was stripped by a wrapper is still recognized",
+       r_stripped is not None and r_stripped["rule"] == "pytest" and "200 passed" in r_stripped["kept_text"])
+
     # ---- the property, over every classifier, over many cut points ----
     log_odd_separators = "\r\n".join(
         ["head line"] + [f"noise {i}\x0cmore text {i}" for i in range(80)] + ["ERROR: boom", "tail line"]
@@ -686,6 +778,9 @@ def _selftest() -> int:
         "long-log-with-errors": long_log,
         "duplicate-line-log": dup_log,
         "crlf-and-odd-separators": log_odd_separators,
+        "pytest-tb-no": pytest_tb_no,
+        "pytest-tb-no-no-listing": pytest_tb_no_no_listing,
+        "pytest-collect-error": pytest_collect_error,
     }
     rng = random.Random(20260928)
     exercised = {"classify_pytest": 0, "classify_log_tail": 0, "classify_output": 0}

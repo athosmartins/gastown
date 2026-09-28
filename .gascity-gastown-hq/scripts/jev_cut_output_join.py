@@ -43,6 +43,7 @@ import calendar
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -103,25 +104,30 @@ def select_candidates(records: list[dict], since_hours: float, limit: int) -> li
     for rec in records:
         if rec.get("mode") == JOIN_MODE and rec.get("experiment") in SOURCE_EXPERIMENTS:
             eid = rec.get("entity_id")
-            if eid is not None:
+            if isinstance(eid, str):  # an unhashable/odd-typed id is a malformed line, not a key
                 joined_keys.add((rec["experiment"], eid))
             continue
         if rec.get("mode") != "shadow" or rec.get("experiment") not in SOURCE_EXPERIMENTS:
             continue
         sigs = rec.get("omitted_signatures")
-        if not sigs:
-            continue  # nothing to look for -- not a candidate, not a "no" either
-        if not rec.get("transcript_path") or not rec.get("tool_use_id") or not rec.get("entity_id"):
-            continue  # jev-experiment.jsonl is shared/multi-writer -- a malformed line missing
-            # any of these must be skipped here, not crash later on r["entity_id"]/rec["entity_id"]
+        if not isinstance(sigs, list) or not sigs:
+            continue  # nothing to look for (or not a list at all) -- not a candidate, not a "no" either
+        if not all(_nonempty_str(rec.get(k)) for k in ("transcript_path", "tool_use_id", "entity_id")):
+            continue  # jev-experiment.jsonl is shared/multi-writer: a line that is valid JSON but is
+            # missing one of these, or has it as the wrong TYPE (an int id, a list entity_id), must be
+            # skipped here -- not crash the whole run later (re.escape / set membership / `in`)
         ts_epoch = _ts_to_epoch(rec.get("ts", ""))
         if cutoff is not None and ts_epoch is not None and ts_epoch < cutoff:
             continue
         sources.append(rec)
 
     candidates = [r for r in sources if (r["experiment"], r["entity_id"]) not in joined_keys]
-    candidates.sort(key=lambda r: r.get("ts", ""))
+    candidates.sort(key=lambda r: str(r.get("ts") or ""))  # a null/odd ts must not be compared with a str
     return candidates[:limit] if limit > 0 else candidates
+
+
+def _nonempty_str(v: object) -> bool:
+    return isinstance(v, str) and bool(v)
 
 
 def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signatures: list[str]) -> tuple[bool | None, str | None]:
@@ -130,34 +136,44 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     depending on whether any signature appears, as a raw substring, in any line AFTER the split
     point.
 
-    The split point is the END of the CONTIGUOUS run of lines (starting at the first occurrence)
-    that mention `tool_use_id` -- not just the first such line. A real tool call's own tool_use
-    and tool_result entries are typically two ADJACENT lines that both embed the id (the result
-    carries it back for correlation), and the tool_result line's `content` is exactly the raw
-    stdout/stderr the omitted_signatures were extracted from in the first place. Splitting after
-    only the FIRST of that pair would leave the tool's own result line inside the "later" window,
-    so every signature (which by construction is a substring of that same result) would match on
-    its own call -- referenced_later would fire on essentially every candidate, regardless of
-    whether the agent ever actually looked at it again. Extending the split point across the
-    whole contiguous id-bearing run treats that adjacent call+result block as "at the call", and
-    only a genuinely later line counts."""
+    The split point is the LAST line, anywhere in the transcript, that carries `tool_use_id`. A
+    tool_use_id is unique to one call, so every line that mentions it belongs to that call's own
+    lifecycle: the assistant's tool_use, the hook attachments, the tool_result, the post-hook
+    lines. The tool_result's `content` is exactly the raw stdout/stderr the omitted_signatures were
+    extracted from, so every signature is a substring of it BY CONSTRUCTION -- if any of the call's
+    own lines were left inside the "later" window, referenced_later would fire on the call's own
+    result instead of on a later turn.
+
+    Earlier versions cut at the end of the first CONTIGUOUS run of id-bearing lines. That holds only
+    when tool_use and tool_result are adjacent. Parallel tool batches interleave (A's tool_use, B's
+    tool_use, A's hook lines, A's tool_result, B's ...), so the run ended at A's tool_use and A's own
+    result fell into the "later" window -- referenced_later inflated on every call that ran in a
+    batch, which is the norm for pool sessions (gate_run ga-qxm60a). "Everything up to the last line
+    that names this call" is the whole lifecycle regardless of how the lines interleave.
+
+    The id is matched as a whole token (not a raw substring), so "tu-1" is not located inside the
+    unrelated later id "tu-12". Signatures themselves stay a deliberately LOOSE substring search: a
+    SIBLING call's result in the same batch can repeat a path by coincidence, which biases the rate
+    UP (the conservative direction for a go/no-go on cutting) -- unlike the self-match above, which
+    is systematic and made the rate uninformative."""
     try:
         lines = Path(transcript_path).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return None, None
 
+    id_re = re.compile(r"(?<![\w-])" + re.escape(tool_use_id) + r"(?![\w-])") if _nonempty_str(tool_use_id) else None
     split_idx = None
-    for i, ln in enumerate(lines):
-        if tool_use_id in ln:
-            split_idx = i
-        elif split_idx is not None:
-            break  # contiguous run of id-bearing lines has ended
+    if id_re is not None:
+        for i, ln in enumerate(lines):
+            if id_re.search(ln):
+                split_idx = i  # keep going: the LAST such line is the split point
     if split_idx is None:
         return None, None
 
+    usable = [s for s in signatures if _nonempty_str(s)]  # a non-string entry is malformed data, not a crash
     for ln in lines[split_idx + 1 :]:
-        for sig in signatures:
-            if sig and sig in ln:
+        for sig in usable:
+            if sig in ln:
                 return True, sig
     return False, None
 
@@ -325,6 +341,74 @@ def _selftest() -> int:
             r_genuine_later is True and sig_genuine_later == "ga-adjacent-sig",
         )
 
+        # ---- gate_run ga-qxm60a, blocking issue 1: PARALLEL tool batches. Real Claude Code
+        # transcripts interleave them: both tool_use lines first, then A's hook attachments and A's
+        # tool_result, then B's. The call's id is NOT on one contiguous run of lines (B's tool_use sits
+        # between A's tool_use and A's own result), so a "first contiguous run" split point leaves A's
+        # own tool_result -- which by construction contains every signature extracted from A's output --
+        # inside the "later" window. Every signature below appears ONLY in the call's own lifecycle
+        # lines (tool_use / hook attachments / tool_result), never in a later turn. ----
+        parallel = Path(td) / "parallel.jsonl"
+        parallel.write_text(
+            "\n".join(
+                [
+                    '{"type":"assistant","text":"running two commands at once"}',
+                    '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_A","input":{"command":"pytest"}}]}}',
+                    '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_B","input":{"command":"git status"}}]}}',
+                    '{"type":"attachment","attachment":{"type":"hook_success","toolUseID":"toolu_A","hookName":"PostToolUse:Bash"}}',
+                    '{"type":"attachment","attachment":{"type":"hook_success","toolUseID":"toolu_B","hookName":"PostToolUse:Bash"}}',
+                    '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"300 passed ga-only-in-a-result"}]}}',
+                    '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_B","content":"clean ga-only-in-b-result"}]}}',
+                    '{"type":"assistant","text":"both done, moving on"}',
+                ]
+            )
+        )
+        r_par_a, _ = scan_transcript_for_signatures(str(parallel), "toolu_A", ["ga-only-in-a-result"])
+        ok(
+            "parallel batch: a signature that only appears in call A's OWN interleaved tool_result is not 'referenced later' "
+            "(the bug gate_run ga-qxm60a found)",
+            r_par_a is False,
+        )
+        r_par_b, _ = scan_transcript_for_signatures(str(parallel), "toolu_B", ["ga-only-in-b-result"])
+        ok("parallel batch: same for call B (its result is the LAST id-bearing line)", r_par_b is False)
+
+        # the exact shape the reviewer reproduced: transcript truncated right after the batch's own
+        # results, so NO later turn exists at all -> must be False, not True
+        parallel_trunc = Path(td) / "parallel-trunc.jsonl"
+        parallel_trunc.write_text("\n".join(parallel.read_text().splitlines()[:7]))
+        r_par_trunc, _ = scan_transcript_for_signatures(str(parallel_trunc), "toolu_A", ["ga-only-in-a-result"])
+        ok("parallel batch, transcript ends right after the results (no later turn exists) -> False", r_par_trunc is False)
+
+        # ...and the fix must not overcorrect: a genuine later turn after the whole batch is found
+        parallel_later = Path(td) / "parallel-later.jsonl"
+        parallel_later.write_text(
+            parallel.read_text() + '\n{"type":"assistant","text":"back to ga-only-in-a-result, I need that"}'
+        )
+        r_par_later, sig_par_later = scan_transcript_for_signatures(str(parallel_later), "toolu_A", ["ga-only-in-a-result"])
+        ok(
+            "parallel batch + a genuine later turn citing the signature -> still True",
+            r_par_later is True and sig_par_later == "ga-only-in-a-result",
+        )
+
+        # a tool_use_id is matched as a whole token: "tu-1" must not be located inside "tu-12" (a
+        # different, later call). Raw substring matching would treat the later call's lines as part
+        # of tu-1's own lifecycle and move the split point past a genuine later reference.
+        delimited = Path(td) / "delimited.jsonl"
+        delimited.write_text(
+            "\n".join(
+                [
+                    '{"type":"tool_use","tool_use_id":"tu-1","input":"run it"}',
+                    '{"type":"tool_result","tool_use_id":"tu-1","content":"output ga-delim-sig"}',
+                    '{"type":"tool_use","tool_use_id":"tu-12","input":"cat ga-delim-sig again"}',
+                ]
+            )
+        )
+        r_delim, sig_delim = scan_transcript_for_signatures(str(delimited), "tu-1", ["ga-delim-sig"])
+        ok(
+            "tool_use_id is matched as a whole token: 'tu-1' is not found inside 'tu-12', so the later call's reference counts",
+            r_delim is True and sig_delim == "ga-delim-sig",
+        )
+
         # ---- read_jsonl: tolerant of garbage lines ----
         garbage = Path(td) / "garbage.jsonl"
         garbage.write_text('{"a":1}\nnot json\n\n{"b":2}\n[1,2,3]\n')
@@ -366,6 +450,35 @@ def _selftest() -> int:
 
         cands_limited = select_candidates(recs2, since_hours=0, limit=1)
         ok("select_candidates respects --limit", len(cands_limited) == 1)
+
+        # The log is shared and multi-writer ("not assumed to be pristine"): a line that is valid JSON
+        # but carries a field of the WRONG TYPE must be skipped like a missing one, never crash the
+        # whole run (which would lose every other record's join). The earlier guard covered only a
+        # missing entity_id; a non-string id, an unhashable entity_id, a non-list signature field or a
+        # null ts (which the oldest-first sort then compares with strings) crashed the same way.
+        wrong_types = [
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-good", "omitted_signatures": ["s"], "transcript_path": "/tmp/g", "tool_use_id": "tu-g", "ts": base_ts},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-int-tuid", "omitted_signatures": ["s"], "transcript_path": "/tmp/a", "tool_use_id": 12345, "ts": base_ts},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": ["not", "hashable"], "omitted_signatures": ["s"], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-sigs-str", "omitted_signatures": "not-a-list", "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-path-int", "omitted_signatures": ["s"], "transcript_path": 7, "tool_use_id": "tu-d", "ts": base_ts},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-null-ts", "omitted_signatures": ["s"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": None},
+            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": ["unhashable", "join"], "referenced_later": True},
+        ]
+        try:
+            wt_cands = select_candidates(wrong_types, since_hours=0, limit=10)
+            wt_raised = None
+        except Exception as e:  # noqa: BLE001
+            wt_cands, wt_raised = [], type(e).__name__
+        ok(f"select_candidates: records with wrong-typed fields are skipped, never crash the run (raised: {wt_raised})", wt_raised is None)
+        wt_ids = {c["entity_id"] for c in wt_cands}
+        ok("select_candidates: the well-formed record survives next to the malformed ones", "wt-good" in wt_ids)
+        ok("select_candidates: unusable records (int tool_use_id, list entity_id, str signatures, int path) are excluded",
+           wt_ids <= {"wt-good", "wt-null-ts"})
+        ok("select_candidates: a null ts alone does not disqualify an otherwise valid record (it only skips the age filter)", "wt-null-ts" in wt_ids)
+        r_sig_types, _ = scan_transcript_for_signatures(str(transcript), "tu-1", [None, 5, "ga-wk0qi2"])
+        ok("scan_transcript_for_signatures: a non-string entry in the signature list is ignored, not a TypeError",
+           r_sig_types is True)
 
         # ---- run(): end to end against a temp log, idempotent on rerun ----
         log_path = Path(td) / "jev-experiment.jsonl"

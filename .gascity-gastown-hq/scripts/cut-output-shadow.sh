@@ -97,10 +97,27 @@ printf '%s' "$input" > "$tmp/in" 2>/dev/null || { echo "{}"; exit 0; }
 
 "$PY" "$ENGINE" < "$tmp/in" > "$tmp/out" 2>"$tmp/err" &
 pid=$!
-( sleep "${CUT_OUTPUT_SHADOW_TIMEOUT:-12}"; kill -9 "$pid" ) >/dev/null 2>&1 &
+# Watchdog: `sleep N && kill -9 pid`. The sleep is a background child of the watchdog subshell and its pid
+# goes to a file, so it can be stopped BY PID once the classifier is done -- killing only the subshell
+# used to orphan `sleep N` (up to 12s) on every large-output call. By pid, not pkill: pkill is blocked in
+# agent sessions, and these hooks run in exactly those sessions. `wait $! && kill -9`: a sleep stopped
+# early exits non-zero, so the kill -9 is skipped.
+(
+  sleep "${CUT_OUTPUT_SHADOW_TIMEOUT:-12}" &
+  echo $! > "$tmp/sleeper.pid"
+  wait $! && kill -9 "$pid"
+) >/dev/null 2>&1 &
 watchdog=$!
 disown "$watchdog" 2>/dev/null
 { wait "$pid"; rc=$?; } 2>/dev/null
+# Stop the watchdog: its sleep first, then the subshell. The recorded pid is only signalled while it is
+# still the watchdog's own child (a pid that already exited could have been reused by anything).
+sleeper=""
+read -r sleeper 2>/dev/null < "$tmp/sleeper.pid"  # stderr first: a missing file's error must not leak
+case "$sleeper" in
+  ''|*[!0-9]*) ;;
+  *) [ "$(ps -o ppid= -p "$sleeper" 2>/dev/null | tr -d ' ')" = "$watchdog" ] && kill "$sleeper" >/dev/null 2>&1 ;;
+esac
 kill "$watchdog" >/dev/null 2>&1
 
 # Trust the classifier's own output ONLY if it ran cleanly (rc 0) and printed valid JSON --
