@@ -100,7 +100,13 @@ def chunk_text(text: str, max_blocks: int = MAX_JEV_BLOCKS, max_total_chars: int
     budgeted = text
     if len(text) > max_total_chars:
         half = max_total_chars // 2
-        budgeted = text[:half] + "\n...[middle omitted for Jev's state budget]...\n" + text[-half:]
+        if half > 0:
+            budgeted = text[:half] + "\n...[middle omitted for Jev's state budget]...\n" + text[-half:]
+        else:
+            # max_total_chars in {0, 1}: half==0 would make text[-half:] a Python "negative
+            # zero" slice, which returns the FULL text instead of an empty suffix -- silently
+            # defeating the "never send an unbounded amount of text to Jev" guarantee above.
+            budgeted = "...[omitted for Jev's state budget]..."
 
     paragraphs = [p for p in budgeted.split("\n\n") if p.strip()]
     if len(paragraphs) >= 2:
@@ -321,6 +327,12 @@ def _selftest() -> int:
     chunks4 = chunk_text(huge, max_blocks=3, max_total_chars=10_000)
     ok("chunk_text respects the total char budget on huge input", sum(len(c) for c in chunks4) <= 10_000 + 200)
     ok("chunk_text budget sample keeps head and tail markers", chunks4 and ("A" in chunks4[0]))
+    chunks5 = chunk_text(huge, max_blocks=3, max_total_chars=0)
+    ok(
+        "chunk_text with max_total_chars=0 does not fall back to sending the full text "
+        "(Python's text[-0:] 'negative zero' gotcha)",
+        sum(len(c) for c in chunks5) < len(huge),
+    )
 
     # ---- build_jev_state_and_questions ----
     state, qs = build_jev_state_and_questions("pytest -x", ["block one text", "block two text"])

@@ -39,6 +39,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import json
 import os
@@ -80,8 +81,12 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def _ts_to_epoch(ts: str) -> float | None:
+    """`ts` is always UTC (the "Z" suffix). calendar.timegm() interprets the struct_time as UTC
+    directly and returns its epoch -- unlike time.mktime() - time.timezone, which is wrong by up
+    to 1h on a host in a DST-observing zone during DST (time.timezone is always the STANDARD-time
+    offset, never the DST-adjusted one)."""
     try:
-        return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
     except (ValueError, TypeError):
         return None
 
@@ -106,8 +111,9 @@ def select_candidates(records: list[dict], since_hours: float, limit: int) -> li
         sigs = rec.get("omitted_signatures")
         if not sigs:
             continue  # nothing to look for -- not a candidate, not a "no" either
-        if not rec.get("transcript_path") or not rec.get("tool_use_id"):
-            continue
+        if not rec.get("transcript_path") or not rec.get("tool_use_id") or not rec.get("entity_id"):
+            continue  # jev-experiment.jsonl is shared/multi-writer -- a malformed line missing
+            # any of these must be skipped here, not crash later on r["entity_id"]/rec["entity_id"]
         ts_epoch = _ts_to_epoch(rec.get("ts", ""))
         if cutoff is not None and ts_epoch is not None and ts_epoch < cutoff:
             continue
@@ -121,11 +127,20 @@ def select_candidates(records: list[dict], since_hours: float, limit: int) -> li
 def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signatures: list[str]) -> tuple[bool | None, str | None]:
     """(referenced_later, matched_signature). None when the transcript is missing/unreadable or
     `tool_use_id` cannot be located in it (unknown, never coerced to False). Otherwise True/False
-    depending on whether any signature appears, as a raw substring, in any line AFTER the one
-    containing `tool_use_id` -- the FIRST such line is used as the split point (a tool call and
-    its own result are typically adjacent lines; using the first occurrence is the conservative
-    choice, since it means later-genuine-uses cannot hide before an earlier administrative
-    mention of the same id gets to run)."""
+    depending on whether any signature appears, as a raw substring, in any line AFTER the split
+    point.
+
+    The split point is the END of the CONTIGUOUS run of lines (starting at the first occurrence)
+    that mention `tool_use_id` -- not just the first such line. A real tool call's own tool_use
+    and tool_result entries are typically two ADJACENT lines that both embed the id (the result
+    carries it back for correlation), and the tool_result line's `content` is exactly the raw
+    stdout/stderr the omitted_signatures were extracted from in the first place. Splitting after
+    only the FIRST of that pair would leave the tool's own result line inside the "later" window,
+    so every signature (which by construction is a substring of that same result) would match on
+    its own call -- referenced_later would fire on essentially every candidate, regardless of
+    whether the agent ever actually looked at it again. Extending the split point across the
+    whole contiguous id-bearing run treats that adjacent call+result block as "at the call", and
+    only a genuinely later line counts."""
     try:
         lines = Path(transcript_path).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -135,7 +150,8 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     for i, ln in enumerate(lines):
         if tool_use_id in ln:
             split_idx = i
-            break
+        elif split_idx is not None:
+            break  # contiguous run of id-bearing lines has ended
     if split_idx is None:
         return None, None
 
@@ -264,12 +280,63 @@ def _selftest() -> int:
             r_before is False,
         )
 
+        # the real-transcript shape this front actually runs against: tool_use and tool_result
+        # are ADJACENT lines sharing the same tool_use_id, and the tool_result's own `content` IS
+        # the raw stdout/stderr the omitted_signatures were extracted from -- so it embeds the
+        # signature by construction. This must NOT count as "referenced later": it is the call's
+        # own result, not a later turn looking back at it. (This is the exact case gate_run
+        # ga-qksyc3 found unguarded by the prior transcript2 case above, whose tool_result content
+        # was the literal string "output" and so never exercised the bug at all.)
+        transcript3 = Path(td) / "t3.jsonl"
+        transcript3.write_text(
+            "\n".join(
+                [
+                    '{"type":"tool_use","tool_use_id":"tu-3","input":"run pytest"}',
+                    '{"type":"tool_result","tool_use_id":"tu-3","content":"...300 passed... ga-adjacent-sig ..."}',
+                    '{"type":"assistant","text":"nothing more said about it"}',
+                ]
+            )
+        )
+        r_own_result, _ = scan_transcript_for_signatures(str(transcript3), "tu-3", ["ga-adjacent-sig"])
+        ok(
+            "a signature that appears only inside the call's own ADJACENT tool_result content "
+            "does not count as 'referenced later' (the bug gate_run ga-qksyc3 found)",
+            r_own_result is False,
+        )
+
+        # ...but a signature in a line genuinely AFTER that same adjacent call+result pair must
+        # still be detected -- the fix must not overcorrect into never finding real later uses.
+        transcript4 = Path(td) / "t4.jsonl"
+        transcript4.write_text(
+            "\n".join(
+                [
+                    '{"type":"tool_use","tool_use_id":"tu-4","input":"run pytest"}',
+                    '{"type":"tool_result","tool_use_id":"tu-4","content":"...300 passed... ga-adjacent-sig ..."}',
+                    '{"type":"assistant","text":"I still need ga-adjacent-sig for the next step"}',
+                ]
+            )
+        )
+        r_genuine_later, sig_genuine_later = scan_transcript_for_signatures(
+            str(transcript4), "tu-4", ["ga-adjacent-sig"]
+        )
+        ok(
+            "a signature genuinely referenced AFTER the adjacent call+result pair is still "
+            "detected as 'referenced later'",
+            r_genuine_later is True and sig_genuine_later == "ga-adjacent-sig",
+        )
+
         # ---- read_jsonl: tolerant of garbage lines ----
         garbage = Path(td) / "garbage.jsonl"
         garbage.write_text('{"a":1}\nnot json\n\n{"b":2}\n[1,2,3]\n')
         recs = read_jsonl(garbage)
         ok("read_jsonl skips malformed/non-object lines, keeps valid ones", recs == [{"a": 1}, {"b": 2}])
         ok("read_jsonl on a missing file -> []", read_jsonl(Path(td) / "nope.jsonl") == [])
+
+        # ---- _ts_to_epoch: must be a true UTC->epoch conversion, independent of host timezone
+        # or DST (the old time.mktime(...) - time.timezone always used the STANDARD-time offset,
+        # off by up to 1h on a DST-observing host during DST) ----
+        ok("_ts_to_epoch: UTC epoch zero round-trips exactly", _ts_to_epoch("1970-01-01T00:00:00Z") == 0.0)
+        ok("_ts_to_epoch: malformed timestamp -> None", _ts_to_epoch("not-a-timestamp") is None)
 
         # ---- select_candidates ----
         base_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -279,6 +346,10 @@ def _selftest() -> int:
             {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "e3", "omitted_signatures": ["s3"], "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
             {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": False},
             {"mode": "shadow", "experiment": "some-other-front", "entity_id": "e4", "omitted_signatures": ["s4"], "transcript_path": "/tmp/d", "tool_use_id": "tu-d", "ts": base_ts},
+            # malformed record (shared multi-writer log, "not assumed to be pristine"): otherwise
+            # a valid shadow candidate but missing entity_id -- must be skipped here, not crash
+            # r["entity_id"] later in select_candidates or rec["entity_id"] in run().
+            {"mode": "shadow", "experiment": "cut-output-fixed", "omitted_signatures": ["s5"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": base_ts},
         ]
         cands = select_candidates(recs2, since_hours=0, limit=10)
         cand_ids = {c["entity_id"] for c in cands}
@@ -286,6 +357,7 @@ def _selftest() -> int:
         ok("select_candidates: e2 has no signatures -> excluded", "e2" not in cand_ids)
         ok("select_candidates: e3 (unjoined, has signatures) -> included", "e3" in cand_ids)
         ok("select_candidates: e4 belongs to a different experiment -> excluded", "e4" not in cand_ids)
+        ok("select_candidates: record missing entity_id -> excluded, does not raise", len(cands) == 1)
 
         cands_limited = select_candidates(recs2, since_hours=0, limit=1)
         ok("select_candidates respects --limit", len(cands_limited) == 1)
