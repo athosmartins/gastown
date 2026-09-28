@@ -265,6 +265,10 @@ suspended = false
 # spawns. Shadow mode by default (detects + alerts, never blocks) — see the
 # script's own header for the staged-rollout rationale.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
+# ga-mrfgaw: Athos, 2026-09-28 — mayor + named crews always get Remote Control,
+# no manual /rc. Explicit here because the workspace default provider ("claude")
+# has no --remote-control; only claude-rc does.
+provider = "claude-rc"
 
 [[patches.agent]]
 dir = ""

@@ -1,5 +1,6 @@
 max_active_sessions = 1
 suspended = true
 work_dir = "/Users/athos/gt/lexbh/crew/batista"
+provider = "claude-rc"
 
 option_defaults = { effort = "high" }
