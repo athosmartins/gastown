@@ -57,14 +57,18 @@ _ERROR_LINE_RE = re.compile(
 # pytest's own banner lines. "session starts" without the leading "=" is deliberately loose:
 # some CI wrappers reflow or strip the "=" padding, but never rename the phrase itself.
 _PYTEST_SESSION_RE = re.compile(r"session starts", re.IGNORECASE)
-# pytest's own trailing one-line summary banner, e.g. "===== 5 passed in 0.12s =====" or
-# "=== 2 failed, 3 passed in 1.02s ===". Anchored on this exact shape (equals-padding, one or
-# more outcome counters, and the "in X.XXs" duration) rather than "the last non-blank line of
-# text" -- a caller that appends anything after the real pytest output (e.g. stderr) can then
-# never displace the summary out of position (ga-wk0qi2 gate feedback, attempt 1, blocking
-# issue 1: an all-pass run with non-empty stderr previously lost the summary entirely).
+# pytest's own trailing one-line summary banner, e.g. "===== 5 passed in 0.12s =====",
+# "=== 2 failed, 3 passed in 1.02s ===", or "==== no tests ran in 0.01s ====" (no digit-count
+# phrase at all, printed whenever 0 tests are collected). Anchored on the STRUCTURAL shape pytest
+# uses for every one of its final-summary variants -- "=" padding wrapping some text that ends in
+# "in X.XXs" -- rather than enumerating the specific outcome words (passed/failed/errors/no tests
+# ran/...) or assuming "the last non-blank line of text". A caller that appends anything after the
+# real pytest output (e.g. stderr) can then never displace the summary out of position, for ANY
+# pytest banner shape, not just the digit-count ones (ga-wk0qi2 gate feedback: attempt 1 blocking
+# issue 1 fixed only the digit-count shapes; attempt 3 blocking issue 1 found "no tests ran" was
+# still uncovered -- this generalizes to the whole class instead of adding one more literal phrase).
 _PYTEST_FINAL_SUMMARY_RE = re.compile(
-    r"^=+\s*(?:\d+\s+\S+(?:,\s*)?)+\s*in\s+[\d.]+s\s*=+\s*$",
+    r"^=+.*\bin\s+[\d.]+s\s*=+\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}.*_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE | re.MULTILINE)
@@ -351,6 +355,32 @@ def _selftest() -> int:
     ok("pytest failure + trailing stderr-shaped text -> still a verdict", r2_stderr is not None)
     if r2_stderr:
         ok("regression (blocking issue 1): failure case summary survives trailing stderr", "1 failed, 150 passed" in r2_stderr["kept_text"])
+
+    # ---- classify_pytest: regression, ga-wk0qi2 gate feedback attempt 3, blocking issue 1.
+    # attempt 1's fix only recognized pytest's DIGIT-COUNT summary banners ("N passed", "N
+    # failed, M passed", ...). pytest's "no tests ran in X.XXs" banner (printed when 0 tests are
+    # collected) has no digit-count phrase at all, so it fell through to the same "last non-blank
+    # line" fallback that a trailing stderr line displaces -- reproducing the exact bug class on
+    # an uncovered shape, not a new bug. The fix generalizes to ANY "=" + "in X.XXs" pytest
+    # banner shape, so this must survive the identical trailing-stderr scenario. ----
+    pytest_no_tests_ran = (
+        "============================= test session starts ==============================\n"
+        "collected 0 items\n"
+        + "\n".join(f"DeprecationWarning: warning {i}" for i in range(40))
+        + "\n=================================== no tests ran in 0.01s ===================================\n"
+        "\nDeprecationWarning: something unrelated printed to stderr by a plugin"
+    )
+    r_no_tests = classify_pytest(pytest_no_tests_ran)
+    ok("pytest 'no tests ran' + trailing stderr-shaped text -> still a verdict", r_no_tests is not None)
+    if r_no_tests:
+        ok(
+            "regression (attempt 3, blocking issue 1): kept text has the 'no tests ran' banner",
+            "no tests ran" in r_no_tests["kept_text"],
+        )
+        ok(
+            "regression (attempt 3, blocking issue 1): kept text is not just the trailing stderr line",
+            r_no_tests["kept_text"].strip() != "DeprecationWarning: something unrelated printed to stderr by a plugin",
+        )
 
     # ---- classify_pytest: omitted_text is position-based, not content-based ----
     ok(
