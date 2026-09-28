@@ -137,6 +137,25 @@ time.sleep(30)
 print("PB-HANG-SHOULD-NEVER-BE-PRINTED")
 EOF
 
+# ga-bwzzqd (epic ga-aijm2v): the gate-fail-categoria report step. Hermetic for the same reason
+# as the quem-pensa/preambulo ones: the real jev_gate_fail_categoria_report.py reads the LIVE
+# jev-experiment.jsonl + quality-gate.jsonl, so every test runs against a stub unless it says
+# otherwise. Called TWICE (full report, then --resumo-pt), same shape as the quem-pensa stub.
+cat >"$T/fc-ok.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("Gate-fail-categoria (Jev, so observacao): FC-RESUMO-STUB" if "--resumo-pt" in sys.argv else "GATE-FAIL-CATEGORIA FULL REPORT STUB")
+EOF
+cat >"$T/fc-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_gate_fail_categoria_report: simulated failure (ga-bwzzqd T23b)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/fc-empty.py" <<'EOF'
+#!/usr/bin/env python3
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -202,6 +221,7 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
       JEV_QUEM_PENSA_REPORT="${RUN_QP:-$T/qp-ok.py}" JEV_QUEM_PENSA_REPORT_TIMEOUT="${RUN_QP_TIMEOUT:-120}" \
       JEV_PREAMBULO_REPORT="${RUN_PB:-$T/pb-ok.py}" JEV_PREAMBULO_REPORT_TIMEOUT="${RUN_PB_TIMEOUT:-300}" \
       JEV_RECOMECAR_REPORT="${RUN_REC:-$HQ/scripts/jev_recomecar_experiment.py}" JEV_RECOMECAR_REPORT_TIMEOUT="${RUN_REC_TIMEOUT:-120}" \
+      JEV_GATE_FAIL_CATEGORIA_REPORT="${RUN_FC:-$T/fc-ok.py}" JEV_GATE_FAIL_CATEGORIA_REPORT_TIMEOUT="${RUN_FC_TIMEOUT:-120}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -465,6 +485,27 @@ case "$N" in *"controle 2 alerta(s); experimento 2"*) ok "T11e positive control:
 case "$N" in *"experimento 3"*) nok "T11e leak (ntfy)" "a preambulo record was counted as a fired alert: $N" ;; *) ok "T11e the preambulo record is not counted as a suppression alert" ;; esac
 case "$F" in *"## preambulo"*) nok "T11e leak (report file)" "a preambulo record became a '## preambulo' section" ;; *) ok "T11e the full report has no '## preambulo' section" ;; esac
 case "$N" in *"400 + 45 tokens"*) nok "T11e token leak" "the record's Jev tokens were counted: $N" ;; *) ok "T11e the record's Jev tokens are not counted as suppression cost" ;; esac
+
+# T23 (ga-bwzzqd): the gate-fail-categoria block. Same contract as T10/T11: the generic numbers
+# stay exactly T1's whatever happens to this block, and the block never fails SILENTLY.
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T23a exit 0, exactly one ntfy with the gate-fail-categoria step on"; else nok "T23a rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'GATE-FAIL-CATEGORIA FULL REPORT STUB' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T23a the gate-fail-categoria report is appended to the day's full report file" || nok "T23a report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"FC-RESUMO-STUB"*) ok "T23a the ntfy carries the gate-fail-categoria Portuguese block" ;; *) nok "T23a ntfy block" "$N" ;; esac
+case "$N" in *"QP-RESUMO-STUB"*) ok "T23a the quem-pensa block is still there (the blocks coexist)" ;; *) nok "T23a coexist" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T23a the generic numbers are untouched by the extra block" ;; *) nok "T23a generic numbers" "$N" ;; esac
+RUN_FC="$T/fc-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T23b failing gate-fail-categoria report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T23b rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Gate-fail-categoria: relatório falhou"*) ok "T23b the failure is VISIBLE in the ntfy, not a silent absence" ;; *) nok "T23b visible failure" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T23b generic numbers still reported" ;; *) nok "T23b generic numbers" "$N" ;; esac
+grep -q 'simulated failure' "$T/out/gate-fail-categoria-report.log" 2>/dev/null \
+  && ok "T23b the failure's stderr is kept in gate-fail-categoria-report.log" || nok "T23b stderr kept" "$(cat "$T/out/gate-fail-categoria-report.log" 2>&1)"
+RUN_FC="$T/fc-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"Gate-fail-categoria: relatório falhou"*) ok "T23c an empty gate-fail-categoria report is a visible failure, not silence" ;; *) nok "T23c empty" "$N" ;; esac
 
 # T19-T22 (ga-aijm2v.12): a day with NO rows (2026-09-25 has none) is the case where "nothing to measure" and "the
 # consumer is not running" print the same thing. The stub sections all answer, so the Portaria's line is the only

@@ -1,0 +1,20 @@
+# ga-bwzzqd (epic ga-aijm2v) — gate-fail-categoria do Jev, modo SOMBRA. Para toda review que
+# vem depois de um FAIL (um conserto), pergunta ao Jev (5 perguntas atômicas sim/nao, numa
+# chamada só) que TIPO de reprovação foi essa — ajuste pequeno e localizado / falta teste / bug
+# de lógica / escopo errado ou incompleto / precisa rebase — e registra se seria candidata a um
+# "conserto leve" (sessão com contexto mínimo). NADA muda: o gate, a sessão de conserto e o
+# roteamento seguem exatamente como hoje; isto só loga o que o Jev diria ao lado do que
+# realmente aconteceu, para uma medição futura (rotular ~100 FAILs à mão e comparar — ver
+# ga-bwzzqd) decidir se vale propor uma mudança de verdade.
+# Reads quality-gate.jsonl + bd (reusando o join do jev-quem-pensa); writes only
+# jev-experiment.jsonl (mode "gate-fail-categoria"). O ntfy diário do Jev (jev-daily-report.sh,
+# 21:07) carrega a tabela de distribuição.
+# 1h cadence, mesmo raciocínio do jev-quem-pensa: o desfecho (veredito da review do conserto)
+# chega minutos a dias depois da decisão, então latência não importa; é single-instance (flock
+# dentro do próprio script python) e bounded por --limit + o timeout do wrapper, então o
+# cadence não empilha.
+[order]
+description = "Gate-fail-categoria do Jev (sombra): classifica cada conserto após um FAIL em 5 categorias atômicas e registra se seria candidato a um conserto leve; nunca muda o roteamento real (ga-bwzzqd)"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/jev-gate-fail-categoria.sh"

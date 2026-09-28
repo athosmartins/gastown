@@ -138,6 +138,23 @@ PB_TXT=$(cat "$PB_FULL" 2>/dev/null) || PB_TXT=""
 { echo; echo "$PB_TXT"; } >>"$OUT_DIR/$DAY.txt"
 RESUMO="$RESUMO"$'\n'"$PB_PT"
 
+# ga-bwzzqd (epic ga-aijm2v): gate-fail-categoria (which KIND of gate rejection, SHADOW) table,
+# cumulative to date. Its records come from the hourly jev-gate-fail-categoria order, so there
+# is nothing to run first -- only to read. Same best-effort shape as every block above: a
+# failure here must never block the day's report or its ntfy, and must not be SILENT (a missing
+# block reads exactly like "no data"). The real report always prints at least one line, so
+# empty output counts as a failure.
+FC_REPORT="${JEV_GATE_FAIL_CATEGORIA_REPORT:-$HQ/scripts/jev_gate_fail_categoria_report.py}"
+FC_TIMEOUT="${JEV_GATE_FAIL_CATEGORIA_REPORT_TIMEOUT:-120}"
+FC_LOG="$OUT_DIR/gate-fail-categoria-report.log"
+FC_FAIL="Gate-fail-categoria: relatório falhou — ver $FC_LOG"
+FC_TXT=$(timeout "$FC_TIMEOUT" python3 "$FC_REPORT" 2>>"$FC_LOG") || FC_TXT=""
+FC_PT=$(timeout "$FC_TIMEOUT" python3 "$FC_REPORT" --resumo-pt 2>>"$FC_LOG") || FC_PT=""
+[ -n "$FC_TXT" ] || FC_TXT="$FC_FAIL"
+[ -n "$FC_PT" ] || FC_PT="$FC_FAIL"
+{ echo; echo "$FC_TXT"; } >>"$OUT_DIR/$DAY.txt"
+RESUMO="$RESUMO"$'\n'"$FC_PT"
+
 # Last command: a failed ntfy makes the job's exit status non-zero (visible in
 # `launchctl list`), instead of a report that silently never reached the phone.
 notify -t "Jev — fim do dia $DAY (UTC)" "$RESUMO"
