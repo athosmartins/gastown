@@ -57,8 +57,14 @@ _ERROR_LINE_RE = re.compile(
 # pytest's own banner lines. "session starts" without the leading "=" is deliberately loose:
 # some CI wrappers reflow or strip the "=" padding, but never rename the phrase itself.
 _PYTEST_SESSION_RE = re.compile(r"session starts", re.IGNORECASE)
-_PYTEST_SUMMARY_RE = re.compile(
-    r"^={0,}\s*(?:(\d+)\s+failed)?[, ]*(?:(\d+)\s+passed)?[, ]*(?:(\d+)\s+error)?[^=\n]*={0,}\s*$",
+# pytest's own trailing one-line summary banner, e.g. "===== 5 passed in 0.12s =====" or
+# "=== 2 failed, 3 passed in 1.02s ===". Anchored on this exact shape (equals-padding, one or
+# more outcome counters, and the "in X.XXs" duration) rather than "the last non-blank line of
+# text" -- a caller that appends anything after the real pytest output (e.g. stderr) can then
+# never displace the summary out of position (ga-wk0qi2 gate feedback, attempt 1, blocking
+# issue 1: an all-pass run with non-empty stderr previously lost the summary entirely).
+_PYTEST_FINAL_SUMMARY_RE = re.compile(
+    r"^=+\s*(?:\d+\s+\S+(?:,\s*)?)+\s*in\s+[\d.]+s\s*=+\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}.*_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE | re.MULTILINE)
@@ -72,28 +78,37 @@ def estimate_tokens(text: str) -> int:
     return max(0, round(len(text) / CHARS_PER_TOKEN))
 
 
-def _dedup_keep_order(lines: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for ln in lines:
-        if ln in seen:
-            continue
-        seen.add(ln)
-        out.append(ln)
-    return out
+def _text_outside_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """Pure. Concatenates the parts of `text` NOT covered by any (start, end) char span in
+    `spans`, in original order -- a POSITION-based complement, never a content-based one. Used to
+    compute what a classifier omitted without re-matching kept lines by text, which silently
+    mishandles a line that is genuinely repeated at another position (ga-wk0qi2 gate feedback,
+    attempt 1, blocking issue 2)."""
+    if not spans:
+        return text
+    ordered = sorted(spans)
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in ordered:
+        if start > cursor:
+            pieces.append(text[cursor:start])
+        cursor = max(cursor, end)
+    if cursor < len(text):
+        pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def classify_pytest(text: str) -> dict | None:
     """None if `text` is not recognizably a pytest run. Otherwise a verdict dict:
-    {rule: "pytest", kept_text, chars_before, chars_after, tokens_before, tokens_after,
-     lines_total, lines_kept}. Kept text = every FAILURES section (from a `___ name ___` or
-     `=== FAILURES ===` banner to the next banner or the short-summary section) plus the
-     trailing summary line(s); if nothing failed, kept text is just the last non-blank line
-     (pytest's own one-line summary, e.g. "5 passed in 0.42s")."""
+    {rule: "pytest", kept_text, omitted_text, chars_before, chars_after, tokens_before,
+     tokens_after, lines_total, lines_kept}. Kept text = every FAILURES section (from a
+     `___ name ___` or `=== FAILURES ===` banner to the next banner or the short-summary section)
+     plus the trailing summary line (pytest's own "=== ... in X.XXs ===" banner, found by shape
+     and position, not by assuming it is the last line of `text`); if nothing failed, kept text is
+     just that summary line. `omitted_text` is the position-based complement of the kept spans."""
     if not text or not _PYTEST_SESSION_RE.search(text):
         return None
 
-    lines = text.splitlines()
     chars_before = len(text)
     tokens_before = estimate_tokens(text)
 
@@ -103,31 +118,48 @@ def classify_pytest(text: str) -> dict | None:
     if m:
         short_summary_pos = m.start()
 
+    body_span: tuple[int, int] | None = None
     if failure_starts:
         end = short_summary_pos if short_summary_pos is not None and short_summary_pos > failure_starts[0] else len(text)
-        kept_body = text[failure_starts[0]:end].rstrip("\n")
+        body_span = (failure_starts[0], end)
+        kept_body = text[body_span[0]:body_span[1]].rstrip("\n")
     else:
         kept_body = ""
 
     # The trailing one-line summary ("5 failed, 2 passed in 1.3s") is always kept: it is the
-    # cheapest possible signal of whether anything needs attention.
-    trailing = ""
-    for ln in reversed(lines):
-        if ln.strip():
-            trailing = ln
-            break
+    # cheapest possible signal of whether anything needs attention. Take the LAST match of
+    # pytest's own banner shape anywhere in `text` -- see _PYTEST_FINAL_SUMMARY_RE's own comment
+    # for why this replaces the old "last non-blank line of text" heuristic.
+    summary_span: tuple[int, int] | None = None
+    summary_matches = list(_PYTEST_FINAL_SUMMARY_RE.finditer(text))
+    if summary_matches:
+        last = summary_matches[-1]
+        trailing = last.group(0).strip()
+        summary_span = (last.start(), last.end())
+    else:
+        # Best-effort fallback for output that never matches the expected banner shape at all.
+        trailing = ""
+        for ln in reversed(text.splitlines()):
+            if ln.strip():
+                trailing = ln
+                break
 
     kept_parts = [p for p in (kept_body, trailing) if p]
     kept_text = "\n\n".join(kept_parts) if kept_parts else trailing
     chars_after = len(kept_text)
+
+    spans = [s for s in (body_span, summary_span) if s is not None]
+    omitted_text = _text_outside_spans(text, spans)
+
     return {
         "rule": "pytest",
         "kept_text": kept_text,
+        "omitted_text": omitted_text,
         "chars_before": chars_before,
         "chars_after": chars_after,
         "tokens_before": tokens_before,
         "tokens_after": estimate_tokens(kept_text),
-        "lines_total": len(lines),
+        "lines_total": len(text.splitlines()),
         "lines_kept": len(kept_text.splitlines()) if kept_text else 0,
     }
 
@@ -141,8 +173,10 @@ def classify_log_tail(
     """None when `text` has at most `max_lines` lines (nothing to cut) or is empty. Otherwise a
     verdict dict shaped like classify_pytest()'s, rule="log-tail". Kept = the first
     `head_lines`, the last `tail_lines`, and every line matching the error/exception/traceback
-    signal — deduped, kept in ORIGINAL order — plus a bracketed omitted-count marker line, e.g.
-    "[142 lines omitted; run with RAW=1]"."""
+    signal, selected and reconstructed by LINE INDEX (never by re-matching line content — a
+    physically-omitted line that happens to share text with a kept line must still count as
+    omitted; ga-wk0qi2 gate feedback, attempt 1, blocking issue 2) — kept in ORIGINAL order, plus
+    a bracketed omitted-count marker line, e.g. "[142 lines omitted; run with RAW=1]"."""
     if not text:
         return None
     lines = text.splitlines()
@@ -153,33 +187,35 @@ def classify_log_tail(
     chars_before = len(text)
     tokens_before = estimate_tokens(text)
 
-    head = lines[:head_lines]
-    tail = lines[-tail_lines:] if tail_lines > 0 else []
-    error_lines = [ln for ln in lines if _ERROR_LINE_RE.search(ln)]
+    head_end = min(head_lines, total)
+    tail_start = max(total - tail_lines, head_end) if tail_lines > 0 else total
 
-    kept_lines = _dedup_keep_order(head + error_lines + tail)
-    omitted = total - len(kept_lines)
+    kept_idx: set[int] = set(range(0, head_end))
+    if tail_lines > 0:
+        kept_idx.update(range(tail_start, total))
+    kept_idx.update(i for i, ln in enumerate(lines) if _ERROR_LINE_RE.search(ln))
+
+    sorted_kept = sorted(kept_idx)
+    omitted = total - len(sorted_kept)
     marker = f"[{max(omitted, 0)} lines omitted; run with RAW=1]"
 
-    # Reconstruct by scanning the original lines once, keeping only members of the selected set,
-    # in original order, with the omitted-count marker spliced in right after `head`. This keeps
-    # the shape readable instead of "head glued to tail with error lines shuffled to the end".
-    kept_set = set(kept_lines)
-    ordered_kept = [ln for ln in lines if ln in kept_set]
-    # de-dup ordered_kept too (a line could legitimately repeat verbatim in the source; we only
-    # want to dedup within our SELECTED lines when the same physical selection reasons collide,
-    # not collapse genuine repeats in head/tail) -- accept genuine repeats, this is display text.
-    kept_text = "\n".join(head) + f"\n{marker}\n" + "\n".join(ln for ln in ordered_kept if ln not in head)
+    # Splice the marker in right after the head block, then every other kept index (error lines
+    # and tail) in original order -- same visual shape as before, now derived from indices.
+    head_part = lines[:head_end]
+    rest_part = [lines[i] for i in sorted_kept if i >= head_end]
+    kept_text = "\n".join(head_part) + f"\n{marker}\n" + "\n".join(rest_part)
+    omitted_text = "\n".join(lines[i] for i in range(total) if i not in kept_idx)
     chars_after = len(kept_text)
     return {
         "rule": "log-tail",
         "kept_text": kept_text,
+        "omitted_text": omitted_text,
         "chars_before": chars_before,
         "chars_after": chars_after,
         "tokens_before": tokens_before,
         "tokens_after": estimate_tokens(kept_text),
         "lines_total": total,
-        "lines_kept": len(head) + len(ordered_kept),
+        "lines_kept": len(sorted_kept),
         "lines_omitted": omitted,
     }
 
@@ -295,6 +331,37 @@ def _selftest() -> int:
         ok("pytest failure: kept text drops the 150 PASSED lines", r2["kept_text"].count("PASSED") == 0)
         ok("pytest failure: cuts size down a lot", r2["chars_after"] < r2["chars_before"] / 3)
 
+    # ---- classify_pytest: regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 1.
+    # cut-output-shadow.py's process() builds `text` as stdout + "\n" + stderr whenever stderr is
+    # non-empty -- i.e. ANYTHING after pytest's own stdout, including a routine stderr warning on
+    # an all-pass run, used to become "the last non-blank line" and silently replace the real
+    # summary. The fix must find the summary by its own banner shape, not by position. ----
+    pytest_pass_with_stderr = pytest_pass + "\nDeprecationWarning: something something"
+    r_stderr = classify_pytest(pytest_pass_with_stderr)
+    ok("pytest + trailing stderr-shaped text -> still a verdict", r_stderr is not None)
+    if r_stderr:
+        ok("regression (blocking issue 1): kept text still has the real summary", "200 passed" in r_stderr["kept_text"])
+        ok(
+            "regression (blocking issue 1): kept text is not just the stderr line",
+            r_stderr["kept_text"].strip() != "DeprecationWarning: something something",
+        )
+    # same repro but with a FAILURE present too, since the trailing-summary logic runs regardless
+    pytest_fail_with_stderr = pytest_fail + "\nDeprecationWarning: something something"
+    r2_stderr = classify_pytest(pytest_fail_with_stderr)
+    ok("pytest failure + trailing stderr-shaped text -> still a verdict", r2_stderr is not None)
+    if r2_stderr:
+        ok("regression (blocking issue 1): failure case summary survives trailing stderr", "1 failed, 150 passed" in r2_stderr["kept_text"])
+
+    # ---- classify_pytest: omitted_text is position-based, not content-based ----
+    ok(
+        "pytest all-pass: omitted_text does not contain the summary line",
+        r is not None and "200 passed" not in r["omitted_text"],
+    )
+    ok(
+        "pytest all-pass: omitted_text contains the dropped PASSED lines",
+        r is not None and "PASSED" in r["omitted_text"],
+    )
+
     # ---- classify_log_tail ----
     short_log = "\n".join(f"line {i}" for i in range(50))
     ok("short log (under max_lines) -> None", classify_log_tail(short_log) is None)
@@ -314,6 +381,29 @@ def _selftest() -> int:
         ok("long log: has an omitted-count marker naming RAW=1", "lines omitted; run with RAW=1" in r3["kept_text"])
         ok("long log: cuts size down", r3["chars_after"] < r3["chars_before"])
         ok("long log: lines_total matches input", r3["lines_total"] == 300)
+        ok("long log: omitted_text has the dropped middle noise", "step 200 ok" in r3["omitted_text"])
+        ok("long log: omitted_text does not have a head line", "step 0 ok" not in r3["omitted_text"])
+        ok("long log: omitted_text does not have a tail line", "step 299 ok" not in r3["omitted_text"])
+
+    # ---- classify_log_tail: regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 2.
+    # A line placed once in the (kept) head and again, verbatim, deep in the (should-be-omitted)
+    # middle must still count that middle occurrence as omitted -- selection by index, not by
+    # re-matching line text against the whole file. ----
+    dup_line = "processing ga-dupe99 at /Users/athos/gt/dup/path.py"
+    dup_lines = [dup_line] + [f"noise {i}" for i in range(300)]
+    dup_lines[150] = dup_line  # exact same text as the head line, physically in the omitted middle
+    dup_log = "\n".join(dup_lines)
+    r_dup = classify_log_tail(dup_log)
+    ok("duplicate-line log -> a verdict (not None)", r_dup is not None)
+    if r_dup:
+        ok(
+            "regression (blocking issue 2): the middle occurrence of a head-duplicated line is still in omitted_text",
+            r_dup["omitted_text"].count(dup_line) == 1,
+        )
+        ok(
+            "regression (blocking issue 2): kept_text still has exactly the head's one occurrence",
+            r_dup["kept_text"].count(dup_line) == 1,
+        )
 
     # a long log with NO error-shaped lines at all must still cut (head+tail+marker), never
     # crash on "no error lines to interleave".

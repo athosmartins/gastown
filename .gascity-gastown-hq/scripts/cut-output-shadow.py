@@ -144,11 +144,13 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def build_fixed_log_record(verdict: dict, text: str, meta: dict) -> dict:
-    """Pure. `verdict` is classify_output()'s return; `text` is the full original output (used
-    to compute the omitted portion's signatures); `meta` carries session/tool identifiers."""
-    kept_lines = set(verdict["kept_text"].splitlines())
-    omitted_text = "\n".join(ln for ln in text.splitlines() if ln not in kept_lines)
+def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
+    """Pure. `verdict` is classify_output()'s return, which now carries its own POSITION-based
+    `omitted_text` (never re-derived here by content-diffing kept_text against the original —
+    that silently miscounted a genuinely-repeated line as "kept" wherever else it occurred;
+    ga-wk0qi2 gate feedback, attempt 1, blocking issue 2). `meta` carries session/tool
+    identifiers."""
+    omitted_text = verdict.get("omitted_text", "")
     return {
         "ts": _now_iso(),
         "mode": "shadow",
@@ -254,7 +256,7 @@ def process(hook_input: dict) -> None:
 
     verdict = coc.classify_output(command, text)
     if verdict is not None:
-        _log(build_fixed_log_record(verdict, text, meta))
+        _log(build_fixed_log_record(verdict, meta))
         return
 
     # Unstructured, large: ask Jev, one call, atomic per-block questions.
@@ -332,12 +334,61 @@ def _selftest() -> int:
     verdict = coc.classify_output("cat log.txt", text)
     ok("setup: classify_output found a log-tail verdict for the fixture", verdict is not None and verdict["rule"] == "log-tail")
     if verdict:
-        rec = build_fixed_log_record(verdict, text, {"session_id": "s1", "transcript_path": "/tmp/t.jsonl", "tool_use_id": "tu1", "command": "cat log.txt"})
+        rec = build_fixed_log_record(verdict, {"session_id": "s1", "transcript_path": "/tmp/t.jsonl", "tool_use_id": "tu1", "command": "cat log.txt"})
         ok("fixed record has the right experiment name", rec["experiment"] == EXPERIMENT_FIXED)
         ok("fixed record echoes tool_use_id/session_id", rec["tool_use_id"] == "tu1" and rec["session_id"] == "s1")
         ok("fixed record has referenced_later=None (filled in later, offline)", rec["referenced_later"] is None)
         ok("fixed record's tokens_would_save is non-negative", rec["tokens_would_save"] >= 0)
         ok("fixed record extracted a signature from the omitted noise", isinstance(rec["omitted_signatures"], list))
+
+    # ---- regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 1: an all-pass pytest run
+    # with non-empty stderr must NOT lose the "N passed" summary just because process() appends
+    # stderr after stdout (the exact repro the reviewer used) ----
+    all_pass_stdout = (
+        "============================= test session starts ==============================\n"
+        + "\n".join(f"test_mod.py::test_{i} PASSED" for i in range(300))
+        + "\n============================== 300 passed in 1.00s ===============================\n"
+    )
+    kept_verdict = coc.classify_pytest(all_pass_stdout + "\nDeprecationWarning: something something")
+    ok(
+        "regression (blocking issue 1): kept_text has the real summary even with trailing stderr-shaped text",
+        kept_verdict is not None and "300 passed" in kept_verdict["kept_text"],
+    )
+    ok(
+        "regression (blocking issue 1): kept_text does NOT pick the stderr line as the summary",
+        kept_verdict is not None and kept_verdict["kept_text"].strip() != "DeprecationWarning: something something",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("pytest case must not call Jev")):
+            process({
+                "tool_name": "Bash",
+                "tool_response": {"stdout": all_pass_stdout, "stderr": "DeprecationWarning: something something"},
+                "tool_use_id": "tu-pytest-stderr",
+                "tool_input": {"command": "pytest"},
+            })
+        end_to_end_rec = json.loads(log_path.read_text().splitlines()[0])
+        ok(
+            "regression (blocking issue 1): end-to-end process() still classifies this as pytest, not a fallback",
+            end_to_end_rec["rule"] == "pytest" and end_to_end_rec["tokens_would_save"] > 0,
+        )
+
+    # ---- regression, ga-wk0qi2 gate feedback attempt 1, blocking issue 2: a line that is
+    # genuinely repeated once in the (kept) head and again in the (omitted) middle must still show
+    # up in omitted_signatures for its middle occurrence ----
+    dup_line = "processing ga-dupe99 at /Users/athos/gt/dup/path.py"
+    log_lines = [dup_line] + [f"noise {i}" for i in range(300)]
+    log_lines[150] = dup_line  # exact same text, deep in the middle -- should still be "omitted"
+    dup_text = "\n".join(log_lines)
+    dup_verdict = coc.classify_output("cat dup.log", dup_text)
+    ok("setup: classify_output found a log-tail verdict for the duplicate-line fixture", dup_verdict is not None and dup_verdict["rule"] == "log-tail")
+    if dup_verdict:
+        dup_rec = build_fixed_log_record(dup_verdict, {"tool_use_id": "tu-dup", "command": "cat dup.log"})
+        ok(
+            "regression (blocking issue 2): the middle occurrence of a repeated line is still captured as an omitted signature",
+            "ga-dupe99" in dup_rec["omitted_signatures"],
+        )
 
     # ---- build_jev_log_record: Jev ok, mixed relevant/irrelevant blocks ----
     blocks = ["irrelevant noise block", "relevant error block with a real path /tmp/x"]
