@@ -155,6 +155,23 @@ FC_PT=$(timeout "$FC_TIMEOUT" python3 "$FC_REPORT" --resumo-pt 2>>"$FC_LOG") || 
 { echo; echo "$FC_TXT"; } >>"$OUT_DIR/$DAY.txt"
 RESUMO="$RESUMO"$'\n'"$FC_PT"
 
+# ga-55gq9p (epic ga-aijm2v): dispatch-dedup ("bead ja resolvida ou duplicada", SHADOW) table,
+# cumulative to date. Its records come from the hourly jev-dispatch-dedup order, so there is
+# nothing to run first -- only to read. Same best-effort shape as every block above: a failure
+# here must never block the day's report or its ntfy, and must not be SILENT (a missing block
+# reads exactly like "no data"). The real report always prints at least one line, so empty
+# output counts as a failure.
+DD_REPORT="${JEV_DISPATCH_DEDUP_REPORT:-$HQ/scripts/jev_dispatch_dedup_report.py}"
+DD_TIMEOUT="${JEV_DISPATCH_DEDUP_REPORT_TIMEOUT:-120}"
+DD_LOG="$OUT_DIR/dispatch-dedup-report.log"
+DD_FAIL="Dispatch-dedup: relatório falhou — ver $DD_LOG"
+DD_TXT=$(timeout "$DD_TIMEOUT" python3 "$DD_REPORT" 2>>"$DD_LOG") || DD_TXT=""
+DD_PT=$(timeout "$DD_TIMEOUT" python3 "$DD_REPORT" --resumo-pt 2>>"$DD_LOG") || DD_PT=""
+[ -n "$DD_TXT" ] || DD_TXT="$DD_FAIL"
+[ -n "$DD_PT" ] || DD_PT="$DD_FAIL"
+{ echo; echo "$DD_TXT"; } >>"$OUT_DIR/$DAY.txt"
+RESUMO="$RESUMO"$'\n'"$DD_PT"
+
 # Last command: a failed ntfy makes the job's exit status non-zero (visible in
 # `launchctl list`), instead of a report that silently never reached the phone.
 notify -t "Jev — fim do dia $DAY (UTC)" "$RESUMO"

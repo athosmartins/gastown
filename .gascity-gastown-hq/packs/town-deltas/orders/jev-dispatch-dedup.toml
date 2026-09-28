@@ -1,0 +1,18 @@
+# ga-55gq9p (epic ga-aijm2v) — dispatch-dedup do Jev, modo SOMBRA. Para todo bead recem
+# despachado pelo Pilot, busca no recall os ~5 fechamentos mais parecidos e pergunta ao Jev (3
+# perguntas atomicas sim/nao, uma chamada por candidato) se um deles ja resolveu o MESMO
+# problema de fundo, foi fechado como entregue (nao cancelado/duplicata) — e registra se a
+# sessao "teria segurado e mandado ao Mayor com a candidata". NADA muda: o dispatch real ja
+# aconteceu quando isto roda; isto so loga o que o Jev diria, para uma medicao futura (ver
+# ga-55gq9p — 32 pares historicos ja calibrados offline) decidir se vale propor suspensao real.
+# Reads pilot-dispatcher.jsonl + bd show + recall; writes only jev-experiment.jsonl (mode
+# "dispatch-dedup"). O ntfy diario do Jev (jev-daily-report.sh, 21:07) carrega a taxa de
+# sinalizacao.
+# 1h cadence, mesmo raciocinio das outras frentes: latencia de minutos a horas nao importa para
+# uma medicao offline; e single-instance (flock dentro do proprio script python) e bounded por
+# --limit + o timeout do wrapper, entao o cadence nao empilha.
+[order]
+description = "Dispatch-dedup do Jev (sombra): para cada bead recem-despachado, pergunta ao recall+Jev se um fechamento anterior ja resolveu o mesmo problema; nunca segura o dispatch real (ga-55gq9p)"
+trigger = "cooldown"
+interval = "1h"
+exec = "$PACK_DIR/assets/scripts/jev-dispatch-dedup.sh"

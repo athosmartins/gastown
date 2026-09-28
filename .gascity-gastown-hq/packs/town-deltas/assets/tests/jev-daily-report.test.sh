@@ -156,6 +156,25 @@ cat >"$T/fc-empty.py" <<'EOF'
 #!/usr/bin/env python3
 EOF
 
+# ga-55gq9p (epic ga-aijm2v): the dispatch-dedup report step. Hermetic for the same reason as
+# the gate-fail-categoria stub above: the real jev_dispatch_dedup_report.py reads the LIVE
+# jev-experiment.jsonl, so every test runs against a stub unless it says otherwise. Called
+# TWICE (full report, then --resumo-pt), same shape as the fc stub.
+cat >"$T/dd-ok.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("Dispatch-dedup (Jev, so observacao): DD-RESUMO-STUB" if "--resumo-pt" in sys.argv else "DISPATCH-DEDUP FULL REPORT STUB")
+EOF
+cat >"$T/dd-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_dispatch_dedup_report: simulated failure (ga-55gq9p T24b)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/dd-empty.py" <<'EOF'
+#!/usr/bin/env python3
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -222,6 +241,7 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
       JEV_PREAMBULO_REPORT="${RUN_PB:-$T/pb-ok.py}" JEV_PREAMBULO_REPORT_TIMEOUT="${RUN_PB_TIMEOUT:-300}" \
       JEV_RECOMECAR_REPORT="${RUN_REC:-$HQ/scripts/jev_recomecar_experiment.py}" JEV_RECOMECAR_REPORT_TIMEOUT="${RUN_REC_TIMEOUT:-120}" \
       JEV_GATE_FAIL_CATEGORIA_REPORT="${RUN_FC:-$T/fc-ok.py}" JEV_GATE_FAIL_CATEGORIA_REPORT_TIMEOUT="${RUN_FC_TIMEOUT:-120}" \
+      JEV_DISPATCH_DEDUP_REPORT="${RUN_DD:-$T/dd-ok.py}" JEV_DISPATCH_DEDUP_REPORT_TIMEOUT="${RUN_DD_TIMEOUT:-120}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -537,6 +557,27 @@ RUN_PLOG="$T/portaria-log-is-a-dir" run 2026-09-25
 N="$(cat "$T/notify.log")"
 if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T22 an unreadable Portaria log never fails the day's report"; else nok "T22 rc/calls" "rc=$RC calls=$(calls)"; fi
 case "$N" in *"Portaria: não dá para saber"*) ok "T22 ...it says it cannot tell (unknown), not 'ok' and not a quiet day" ;; *) nok "T22 unknown" "$N" ;; esac
+
+# T24 (ga-55gq9p): the dispatch-dedup block. Same contract as T10/T11/T23: the generic numbers
+# stay exactly T1's whatever happens to this block, and the block never fails SILENTLY.
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T24a exit 0, exactly one ntfy with the dispatch-dedup step on"; else nok "T24a rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'DISPATCH-DEDUP FULL REPORT STUB' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T24a the dispatch-dedup report is appended to the day's full report file" || nok "T24a report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"DD-RESUMO-STUB"*) ok "T24a the ntfy carries the dispatch-dedup Portuguese block" ;; *) nok "T24a ntfy block" "$N" ;; esac
+case "$N" in *"FC-RESUMO-STUB"*) ok "T24a the gate-fail-categoria block is still there (the blocks coexist)" ;; *) nok "T24a coexist" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T24a the generic numbers are untouched by the extra block" ;; *) nok "T24a generic numbers" "$N" ;; esac
+RUN_DD="$T/dd-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T24b failing dispatch-dedup report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T24b rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Dispatch-dedup: relatório falhou"*) ok "T24b the failure is VISIBLE in the ntfy, not a silent absence" ;; *) nok "T24b visible failure" "$N" ;; esac
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T24b generic numbers still reported" ;; *) nok "T24b generic numbers" "$N" ;; esac
+grep -q 'simulated failure' "$T/out/dispatch-dedup-report.log" 2>/dev/null \
+  && ok "T24b the failure's stderr is kept in dispatch-dedup-report.log" || nok "T24b stderr kept" "$(cat "$T/out/dispatch-dedup-report.log" 2>&1)"
+RUN_DD="$T/dd-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"Dispatch-dedup: relatório falhou"*) ok "T24c an empty dispatch-dedup report is a visible failure, not silence" ;; *) nok "T24c empty" "$N" ;; esac
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"
