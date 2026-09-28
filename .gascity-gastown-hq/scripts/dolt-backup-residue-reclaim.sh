@@ -286,12 +286,22 @@ PY
 #   absent        readable file, no entry for the db              detail: empty
 #   unrecognized  entry not an object, or a status this code does not know
 #   unreadable    file missing / not JSON / not the expected shape
-# Diagnostic ONLY: no decision may branch on this. Whether a db is proven is
-# decided by _parse_fingerprint_to_file alone, fail-closed. This exists so a log
-# line can say "the fingerprint marks hq FAILED, last ok <date>" instead of
-# showing empty fields that read the same as "never existed" (ga-p5q3: error
-# and empty must not collapse into one value). The caller supplies "unfetched"
-# itself when the fetch never produced a file.
+# Diagnostic ONLY for _reclaim_one_residue: no decision there may branch on
+# this. Whether a db is proven is decided by _parse_fingerprint_to_file alone,
+# fail-closed. This exists so a log line can say "the fingerprint marks hq
+# FAILED, last ok <date>" instead of showing empty fields that read the same as
+# "never existed" (ga-p5q3: error and empty must not collapse into one value).
+# The caller supplies "unfetched" itself when the fetch never produced a file.
+#
+# ONE deliberate exception (ga-qaa1k7): dolt-backup-reseed.sh's
+# _release_manifestless_primary branches on the single word "failed" to skip
+# the freshness comparison — and only after the live S3-only closure proof has
+# passed in the same run. That is safe because "failed" is printed ONLY for an
+# entry that parsed and carries status == "failed"; every other outcome
+# (absent, unrecognized, unreadable — including a python crash, via the
+# `|| printf` below — and the caller's "unfetched") is a different word and
+# keeps failing closed. Any new caller that branches on a state must do the
+# same: act on the one word it means, never on "anything but ok".
 _fingerprint_db_state() {
   local json_file="$1" db="$2"
   "$PY" - "$json_file" "$db" 2>/dev/null <<'PY' || printf 'unreadable\t\n'
