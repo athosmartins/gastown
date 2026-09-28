@@ -77,6 +77,16 @@
 #              config" -- so overlay_dir is not an available fix here either). Confirmed 27/09 16:21: a wa-worker
 #              wisp under this exact template ran `find / -maxdepth 6 -iname gate-done*` unblocked, see ga-awsf9k.
 #              home-scan-guard.py's own "KNOWN GAPS" list (WHO IS GUARDED) predates this fix.
+#              ALSO, if present:
+#              ${HOME_SCAN_GUARD_POOL_BASE_SETTINGS:-/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json}
+#              (ga-9bgxwi) -- the pool overlay BASE (pool-roles.json base_overlay), not a per-role overlay. Every
+#              per-role overlay already carries this hook via a SEPARATE generator (pool-roles.json common.hooks +
+#              pool-preamble-build.py), and CITY_SETTINGS above puts the identical entry in the root for every
+#              session; overlay-root-leak-guard.py diffs role overlays against this base to find a role that leaked
+#              to the root, so a hook present in every role but absent from the base leaf-matched all of them and
+#              was misread as a leak (false positive, ga-9bgxwi). Converging it into the base too makes the guard's
+#              own model agree that this leaf is universal, not role-specific -- closing the false positive instead
+#              of teaching the guard a name-based exception.
 #   --check  : write nothing; print GUARDED / INERT / NOT-GUARDED per target; exit 1 if any is not GUARDED
 #   Idempotent. A target that cannot be processed (missing, unparseable) never stops the others;
 #   the exit status is 1 if any failed.
@@ -89,6 +99,16 @@ RIGS_ROOT="${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}"
 # like every other target this script has never seen. HOME_SCAN_GUARD_CITY_SETTINGS overrides independently.
 # .claude/settings.json (NOT .gc/settings.json -- see the USAGE block above): the stable override input.
 CITY_SETTINGS="${HOME_SCAN_GUARD_CITY_SETTINGS:-$RIGS_ROOT/.gascity-gastown-hq/.claude/settings.json}"
+# ga-9bgxwi: the pool BASE overlay (pool-roles.json base_overlay) -- NOT a per-role overlay (those already carry
+# this hook via pool-roles.json common.hooks + pool-preamble-build.py, a separate generator). overlay-root-leak-
+# guard.py treats any leaf that is in a per-role overlay but NOT in the base as "a role leaked to the city root" --
+# and CITY_SETTINGS above puts this exact hook entry in the root for EVERY session (root-resident or not), which
+# happens to leaf-match every role overlay's copy of the same hook, so the guard misread deliberate, universal
+# registration as a role-overlay leak (false positive, escalates to Athos after 4h). Converging the identical entry
+# into the base too makes it universal in the guard's own model (no role's delta any more), closing the false
+# positive at the source instead of teaching the guard a name-based exception. Registering it here (not by hand)
+# keeps this and CITY_SETTINGS as the ONE place this hook's exact command is authored for both channels.
+POOL_BASE_SETTINGS="${HOME_SCAN_GUARD_POOL_BASE_SETTINGS:-$RIGS_ROOT/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json}"
 GUARD_PATH="${HOME_SCAN_GUARD_SCRIPT:-/Users/athos/gt/.gascity-gastown-hq/scripts/home-scan-guard.sh}"
 MARKER="home-scan-guard"
 ENTRY_MATCHER='^Bash$'
@@ -137,6 +157,9 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
   # whose city root has no override file at all yet -- absence is not an error, it just means "nothing to
   # add hooks to here today") must not turn into a FATAL below.
   [ -f "$CITY_SETTINGS" ] && TARGETS+=("$CITY_SETTINGS")
+  # ga-9bgxwi: the pool BASE overlay -- see POOL_BASE_SETTINGS above. Added only if present, same reasoning
+  # as CITY_SETTINGS (a city/checkout this script has never seen must not turn into a FATAL below).
+  [ -f "$POOL_BASE_SETTINGS" ] && TARGETS+=("$POOL_BASE_SETTINGS")
 fi
 if [ "${#TARGETS[@]}" -eq 0 ]; then
   echo "FATAL: no settings.json targets found under $RIGS_ROOT" >&2

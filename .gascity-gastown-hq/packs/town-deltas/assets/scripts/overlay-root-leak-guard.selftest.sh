@@ -415,6 +415,32 @@ fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
 r = subprocess.run([GUARD, "--city", str(c), "--overlays-dir", str(OVERLAYS), "--config-toml", str(CFG_CLEAN), "--no-alarm"], capture_output=True, text=True, timeout=60)
 check(r.returncode == 0 and "═══" in r.stdout, "lock livre => roda normalmente", f"rc={r.returncode}")
 
+# ================================================================== J. hook comum na raiz (ga-9bgxwi)
+section("J. hook comum (home-scan-guard) registrado direto na raiz, fora de qualquer overlay de papel (ga-9bgxwi)")
+# ga-awsf9k registra o hook home-scan-guard direto em <cidade>/.claude/settings.json (home-scan-guard-activate.sh),
+# INDEPENDENTE do mecanismo de overlay_dir/role_deltas que este guard audita. Essa UNICA folha (hooks.PreToolUse.[]
+# com o marcador "home-scan-guard") tambem esta em TODO overlay por papel (pool-roles.json common.hooks, ver case 9
+# do selftest do activate) — entao ela intersecta role_deltas() e o guard confundia registro deliberado e universal
+# com vazamento de papel. O fix (ga-9bgxwi) poe a MESMA folha no overlay base 'pool': ela deixa de ser delta de
+# NENHUM papel, e o guard para de apontar pra ela.
+c = new_city()
+common_hooks = jread(OVERLAYS / "pool-dog/.claude/settings.json")["hooks"]
+root = merge(jread(c / ".claude/settings.json"), {"hooks": common_hooks})
+jwrite(c / ".claude/settings.json", root); install_claude(c)
+rc, j, r = run(c, CFG_CLEAN)
+check(rc == 0, "guard: raiz com SO o hook home-scan-guard (registrado direto, fora de overlay de papel completo) NAO e vazamento", f"rc={rc} {r.stdout[:300]}")
+check(j is not None and not j["findings"], "achado zero: a folha do hook e universal (esta no overlay base), nenhum papel e apontado como fonte", str(j and j["findings"]))
+# controle: uma folha de papel DE VERDADE (deny "Agent", exclusiva do pool-reviewer, ga-e87w1f/NEVER_DENY_BUILDERS)
+# ao lado do MESMO hook continua vazamento — a folha universal nao virou um jeito de esconder uma folha real.
+c2 = new_city()
+root2 = jread(c2 / ".claude/settings.json")
+root2 = merge(root2, {"hooks": common_hooks, "permissions": {"deny": root2["permissions"]["deny"] + ["Agent"]}})
+jwrite(c2 / ".claude/settings.json", root2); install_claude(c2)
+rc, j, r = run(c2, CFG_CLEAN)
+check(rc == 1 and files_hit(j) == [".claude/settings.json", ".gc/settings.json"], "controle: folha de papel real (deny Agent) na raiz JUNTO com o hook comum continua vazamento nos dois arquivos", f"rc={rc} {files_hit(j)}")
+art = [f for f in (j or {"findings": []})["findings"] if f["kind"] == "artifact-contaminated"]
+check(bool(art) and all(f["sources"] == ["pool-reviewer"] for f in art), "fonte apontada e SO pool-reviewer (unico papel que nega Agent), o hook comum nao polui a atribuicao", str([f["sources"] for f in art]))
+
 # ================================================================== L. cidade viva (somente leitura)
 section("L. cidade viva: o guard le a cidade real (--no-alarm --no-lock, somente leitura)")
 live = os.environ.get("GC_CITY_PATH") or os.environ.get("GC_CITY")
