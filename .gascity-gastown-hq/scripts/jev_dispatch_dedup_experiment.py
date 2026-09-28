@@ -207,20 +207,79 @@ def build_pairs() -> list[dict]:
 
 
 # ── bd lookups ───────────────────────────────────────────────────────────────────────────
-def bd_show(bead_id: str) -> dict | None:
+def load_routes(gc_city: str) -> dict[str, str] | None:
+    """prefix -> absolute store path, from <city>/.beads/routes.jsonl (the paths in that file
+    are relative to the CITY, e.g. {"prefix":"wa","path":"../whatsapp_automation"}). Returns
+    None -- not {} -- when the file cannot be read at all: "no routes file" must not look like
+    "this prefix has no route". One malformed line is skipped, not fatal to the rest."""
+    routes: dict[str, str] = {}
     try:
-        r = subprocess.run(["bd", "show", bead_id, "--json"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+        with open(os.path.join(gc_city, ".beads", "routes.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("prefix") and entry.get("path"):
+                    routes[entry["prefix"]] = os.path.normpath(os.path.join(gc_city, entry["path"]))
+    except OSError:
         return None
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
+    return routes
+
+
+# bd_read states. Three ways a read can come back empty-handed, and they mean different things:
+# the bead is not in its store (not_found), its prefix has no store we know of (no_route), or we
+# could not find out (error). None of them may ever read as "found, and not a duplicate".
+BD_OK, BD_NOT_FOUND, BD_NO_ROUTE, BD_ERROR = "ok", "not_found", "no_route", "error"
+
+
+def bd_read(bead_id: str, gc_city: str | None = None) -> tuple[str, dict | str]:
+    """Read one bead from the store its id prefix belongs to (ga-59u277). `bd show <id>` run
+    with no -C only sees the store of the cwd, so a wa-*/lx-* bead read from the HQ city was
+    "not found" and 38 of 39 dispatched beads were skipped as unreadable (28/09).
+    Returns (state, payload): BD_OK -> the bead dict; any other state -> a short reason. An
+    unrecognised prefix is BD_NO_ROUTE -- never guessed to be HQ. Doubt (timeout, unparsable
+    output, unreadable routes file, a bd failure that is not the "no issues found" answer)
+    is BD_ERROR, so it stays retryable instead of being taken for an absent bead."""
+    gc_city = gc_city or gv.DEFAULT_GC_CITY
+    routes = load_routes(gc_city)
+    if routes is None:
+        return BD_ERROR, f"routes.jsonl unreadable under {gc_city}"
+    prefix = bead_id.split("-", 1)[0]
+    store = routes.get(prefix)
+    if store is None:
+        return BD_NO_ROUTE, f"prefix {prefix!r} is not in routes.jsonl"
     try:
-        d = json.loads(r.stdout)
+        r = subprocess.run(["bd", "-C", store, "show", bead_id, "--json"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return BD_ERROR, f"bd show failed to run: {type(e).__name__}"
+    try:
+        d = json.loads(r.stdout) if r.stdout.strip() else None
     except ValueError:
-        return None
+        d = None
+    if r.returncode != 0:
+        # bd answers a bead that is not in the store with rc=1 and {"error": "no issues found
+        # matching the provided IDs"} on stdout; a store it cannot open prints nothing there.
+        if isinstance(d, dict) and "no issue" in str(d.get("error", "")).lower():
+            return BD_NOT_FOUND, f"not in {store}"
+        return BD_ERROR, f"bd show rc={r.returncode} in {store}"
     if isinstance(d, list):
-        return d[0] if d else None
-    return d
+        d = d[0] if d else None
+        if d is None:
+            return BD_NOT_FOUND, f"not in {store}"
+    if not isinstance(d, dict) or not d.get("id"):
+        return BD_ERROR, f"bd show returned unparsable output in {store}"
+    return BD_OK, d
+
+
+def bd_show(bead_id: str, gc_city: str | None = None) -> dict | None:
+    """The bead, or None for any state that is not BD_OK. Only for callers that do not need to
+    tell the empty states apart (the offline calibration CLI); the live path uses bd_read."""
+    state, payload = bd_read(bead_id, gc_city)
+    return payload if state == BD_OK else None
 
 
 def recall_query(text: str, k: int = 5, timeout_s: int = 90) -> list[dict] | None:
@@ -353,7 +412,16 @@ def load_done(jev_log) -> set[str]:
     return done
 
 
-def process_entity(ent: dict, ask=None) -> tuple[str, dict | str]:
+# bd_read state -> the skip status process_entity reports. Each keeps its own name so the log
+# says WHY a bead was not judged; all are transient (never recorded in jev-experiment.jsonl).
+_READ_SKIP_STATUS = {
+    BD_NOT_FOUND: "skip_bead_not_found",
+    BD_NO_ROUTE: "skip_no_route",
+    BD_ERROR: "skip_bead_read_error",
+}
+
+
+def process_entity(ent: dict, ask=None, gc_city: str | None = None) -> tuple[str, dict | str]:
     """Returns (status, detail). status=='logged' -> detail is the record ready to append to
     jev_experiment.JEV_LOG (one record per DISPATCHED BEAD, aggregating every candidate recall
     returned — not one record per pair, unlike the offline calibrate() path above, which needs
@@ -361,9 +429,10 @@ def process_entity(ent: dict, ask=None) -> tuple[str, dict | str]:
     is a short (transient, retryable) reason and Jev was never called for this bead."""
     ask = ask or ask_jev_pair
     bead_id = ent["bead"]
-    tb = bd_show(bead_id)
-    if not tb:
-        return "skip_bead_unreadable", f"bead={bead_id} unreadable"
+    state, payload = bd_read(bead_id, gc_city)
+    if state != BD_OK:
+        return _READ_SKIP_STATUS.get(state, "skip_bead_read_error"), f"bead={bead_id} {payload}"
+    tb = payload
     target_title = tb.get("title") or ""
     target_desc = tb.get("description") or ""
     query = f"{target_title} {target_desc[:1500]}".strip()
@@ -439,7 +508,7 @@ def run(
 
     counts: dict[str, int] = {"considered": len(entities), "skipped_done": len(entities) - len(todo)}
     for ent in todo[:limit]:
-        status, detail = process_entity(ent, ask=ask)
+        status, detail = process_entity(ent, ask=ask, gc_city=gc_city)
         counts[status] = counts.get(status, 0) + 1
         if status == "logged":
             if not dry_run:
@@ -580,10 +649,10 @@ def _selftest() -> int:
     ok(f"load_done: an entity failed {MAX_JEV_FAILS} times stays unresolved -- marked done, not retried forever",
        "ga-b4" in d)
 
-    def fake_bd_show_target(bead_id):
+    def fake_bd_read_target(bead_id, gc_city=None):
         if bead_id == "ga-target":
-            return {"id": "ga-target", "title": "Fix the flaky login test", "description": "the login test flakes on CI"}
-        return None
+            return BD_OK, {"id": "ga-target", "title": "Fix the flaky login test", "description": "the login test flakes on CI"}
+        return BD_NOT_FOUND, "not in store"
 
     def fake_recall_hit(query, k=5):
         return [
@@ -595,21 +664,100 @@ def _selftest() -> int:
         return {"ok": True, "answers": {"mesmo_problema": 0.9, "candidata_resolve": 0.9, "candidata_entregue": 0.9},
                 "bad": {}, "tokens_in": 40, "tokens_out": 4}
 
-    with mock.patch.object(sys.modules[__name__], "bd_show", side_effect=fake_bd_show_target), \
+    with mock.patch.object(sys.modules[__name__], "bd_read", side_effect=fake_bd_read_target), \
          mock.patch.object(sys.modules[__name__], "recall_query", side_effect=fake_recall_hit):
         status, detail = process_entity({"entity_id": "ga-target", "bead": "ga-target", "rig": "gascity", "ts": "2026-09-28T00:00:00Z"}, ask=fake_ask_confident)
     ok("process_entity: happy path logs, excludes the target's own id from recall's candidates, and flags seria_segurada",
        status == "logged" and detail["candidatos_checados"] == 1 and detail["melhor_candidato"] == "ga-closed1"
        and detail["seria_segurada"] is True and detail["jev_ok"] is True)
 
-    with mock.patch.object(sys.modules[__name__], "bd_show", side_effect=lambda bid: None):
-        status2, detail2 = process_entity({"entity_id": "ga-x", "bead": "ga-x", "rig": "gascity", "ts": "2026-09-28T00:00:00Z"})
-    ok("process_entity: bd show failed -> skip_bead_unreadable, never calls recall/Jev", status2 == "skip_bead_unreadable")
+    # Each empty read keeps its own status, and none of them reaches recall or Jev.
+    for read_state, want_status in ((BD_NOT_FOUND, "skip_bead_not_found"), (BD_NO_ROUTE, "skip_no_route"),
+                                    (BD_ERROR, "skip_bead_read_error")):
+        recall_spy = mock.Mock(return_value=[])
+        ask_spy = mock.Mock()
+        with mock.patch.object(sys.modules[__name__], "bd_read", side_effect=lambda bid, gc_city=None, s=read_state: (s, "why")), \
+             mock.patch.object(sys.modules[__name__], "recall_query", recall_spy):
+            status2, detail2 = process_entity({"entity_id": "ga-x", "bead": "ga-x", "rig": "gascity", "ts": "2026-09-28T00:00:00Z"}, ask=ask_spy)
+        ok(f"process_entity: bd_read {read_state} -> {want_status}, never calls recall/Jev, reason carries the bead",
+           status2 == want_status and "ga-x" in detail2 and not recall_spy.called and not ask_spy.called)
 
-    with mock.patch.object(sys.modules[__name__], "bd_show", side_effect=fake_bd_show_target), \
+    with mock.patch.object(sys.modules[__name__], "bd_read", side_effect=fake_bd_read_target), \
          mock.patch.object(sys.modules[__name__], "recall_query", side_effect=lambda q, k=5: None):
         status3, detail3 = process_entity({"entity_id": "ga-target", "bead": "ga-target", "rig": "gascity", "ts": "2026-09-28T00:00:00Z"})
     ok("process_entity: recall failed -> skip_recall_failed, never calls Jev", status3 == "skip_recall_failed")
+
+    # ga-59u277 -- the store a bead lives in is decided by its id PREFIX (.beads/routes.jsonl),
+    # never by the cwd of whoever runs this. FakeBd behaves like the real `bd`: it only finds a
+    # bead in the store it is pointed at (`-C <dir>`, else the HQ cwd), and answers a miss with
+    # rc=1 + the same JSON error a truly missing bead gets -- measured live 28/09, where
+    # `bd show wa-efb29` from the HQ cwd was "not found" and `bd -C <wa rig> show wa-efb29` read it.
+    with tempfile.TemporaryDirectory() as city_td:
+        city = Path(city_td) / "city"
+        wa_rig, lx_rig = Path(city_td) / "whatsapp_automation", Path(city_td) / "lexbh"
+        (city / ".beads").mkdir(parents=True)
+        (city / ".beads" / "routes.jsonl").write_text(
+            '{"prefix":"ga","path":"."}\n{"prefix":"wa","path":"../whatsapp_automation"}\n'
+            '{"prefix":"lx","path":"../lexbh"}\n'
+        )
+        fake_stores = {str(city): {"ga-hq1"}, str(wa_rig): {"wa-efb29"}, str(lx_rig): {"lx-b5q"}}
+        bd_calls: list[list[str]] = []
+
+        def fake_bd_run(cmd, **kw):
+            bd_calls.append(list(cmd))
+            store = cmd[cmd.index("-C") + 1] if "-C" in cmd else str(city)
+            bead_id = cmd[cmd.index("show") + 1]
+            if store not in fake_stores:
+                return subprocess.CompletedProcess(cmd, 1, "", f"Error: cannot use -C directory {store!r}")
+            if bead_id in fake_stores[store]:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([{"id": bead_id, "title": f"title of {bead_id}"}]), "")
+            return subprocess.CompletedProcess(
+                cmd, 1, json.dumps({"error": "no issues found matching the provided IDs", "schema_version": 1}),
+                f'Error fetching {bead_id}: no issue found matching "{bead_id}"')
+
+        with mock.patch.object(gv, "DEFAULT_GC_CITY", str(city)), \
+             mock.patch.object(subprocess, "run", side_effect=fake_bd_run):
+            wa_bead = bd_show("wa-efb29")
+            lx_bead = bd_show("lx-b5q")
+            hq_bead = bd_show("ga-hq1")
+        ok("bd_show: a wa-* bead is read from the WA rig store, not the HQ cwd (ga-59u277 regression)",
+           bool(wa_bead) and wa_bead["id"] == "wa-efb29")
+        ok("bd_show: an lx-* bead is read from the lexbh rig store (ga-59u277 regression)",
+           bool(lx_bead) and lx_bead["id"] == "lx-b5q")
+        ok("bd_show: a ga-* bead still reads fine from the HQ store", bool(hq_bead) and hq_bead["id"] == "ga-hq1")
+
+        # Three states, never collapsed: read / not there / could not find out.
+        with mock.patch.object(subprocess, "run", side_effect=fake_bd_run):
+            bd_calls.clear()
+            st_ok, _ = bd_read("wa-efb29", str(city))
+            st_missing, why_missing = bd_read("wa-nosuchbead", str(city))
+            st_route, why_route = bd_read("zz-abc", str(city))
+        ok("bd_read: found -> ok, and the command carried -C <the WA rig store>",
+           st_ok == BD_OK and bd_calls[0][:3] == ["bd", "-C", str(wa_rig)])
+        ok("bd_read: a bead genuinely absent from its own store -> not_found", st_missing == BD_NOT_FOUND)
+        ok("bd_read: an unknown prefix -> no_route (never guessed to be HQ), and bd was never run for it",
+           st_route == BD_NO_ROUTE and "zz" in why_route and len(bd_calls) == 2)
+
+        broken = Path(city_td) / "city2"
+        (broken / ".beads").mkdir(parents=True)
+        (broken / ".beads" / "routes.jsonl").write_text('{"prefix":"wa","path":"../gone-rig"}\n')
+        with mock.patch.object(subprocess, "run", side_effect=fake_bd_run):
+            st_store, _ = bd_read("wa-efb29", str(broken))
+        ok("bd_read: the store cannot be opened -> error, NOT not_found (empty stdout is doubt, not absence)",
+           st_store == BD_ERROR)
+
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("bd", 30)):
+            st_timeout, _ = bd_read("wa-efb29", str(city))
+        ok("bd_read: bd timing out -> error", st_timeout == BD_ERROR)
+
+        st_noroutes, _ = bd_read("wa-efb29", str(Path(city_td) / "no-such-city"))
+        ok("bd_read: routes.jsonl unreadable -> error, not no_route (we cannot say the prefix has no store)",
+           st_noroutes == BD_ERROR)
+
+        garbage = subprocess.CompletedProcess([], 0, "not json at all", "")
+        with mock.patch.object(subprocess, "run", return_value=garbage):
+            st_garbage, _ = bd_read("wa-efb29", str(city))
+        ok("bd_read: rc=0 with unparsable output -> error", st_garbage == BD_ERROR)
 
     # run(): dry-run doesn't write; a real run does; re-running is idempotent (dedup).
     with tempfile.TemporaryDirectory() as td:
@@ -620,7 +768,7 @@ def _selftest() -> int:
         jl = Path(td) / "jev-experiment.jsonl"
 
         with mock.patch.object(jev_experiment, "JEV_LOG", jl), \
-             mock.patch.object(sys.modules[__name__], "bd_show", side_effect=fake_bd_show_target), \
+             mock.patch.object(sys.modules[__name__], "bd_read", side_effect=fake_bd_read_target), \
              mock.patch.object(sys.modules[__name__], "recall_query", side_effect=fake_recall_hit):
             counts1 = run(gc_city="/city", dispatch_log=str(dl), dry_run=True, ask=fake_ask_confident, now=now_ts)
             ok("run: dry-run reports one logged entity but writes nothing",
