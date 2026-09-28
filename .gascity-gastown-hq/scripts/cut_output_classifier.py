@@ -51,6 +51,15 @@ import sys
 
 CHARS_PER_TOKEN = 2.2  # packs/town-deltas/assets/claude-overlays/pool-roles.json: chars_per_token
 
+# The `mode` of the rows this front writes to the shared jev-experiment.jsonl, and of the offline join's
+# rows. Defined HERE because this module has no dependencies and is already imported by the hook
+# (cut-output-shadow.py), the join and (through it) the report -- one definition, nothing to keep in sync.
+# NOT "shadow": jev_experiment_report.summarize_shadow() owns every mode=="shadow" row and reads F0's
+# agree/would_dispense fields, so this front's rows under that mode printed false "Jev unavailable" and
+# negative-savings lines in the daily report (gate_run ga-75ya0i). Every sibling front has its own mode.
+RECORD_MODE = "cut-output"
+JOIN_MODE = "cut-output-join"
+
 # Below this many characters, cutting is not worth the risk of losing something the agent
 # needed — the fixed-rule and Jev paths are both skipped by the caller. Kept here (not just in
 # the hook) so classify_output()'s own "does this even qualify as large" gate matches whatever

@@ -19,9 +19,11 @@ conservative direction for a front that is deciding whether it is safe to ever g
 APPEND-ONLY, never mutates: jev-experiment.jsonl is a shared log written by many processes
 across the whole city. This script never rewrites an existing line (racy, and every other
 consumer of that file assumes it is append-only) -- it APPENDS a new record per case, with
-mode="shadow-join" and the SAME experiment name as the record it is about, keyed by entity_id
-(the original record's tool_use_id) so the report can join the two by entity_id + experiment
-without ever touching the original line.
+mode="cut-output-join" (cut_output_classifier.JOIN_MODE) and the SAME experiment name as the
+record it is about, keyed by entity_id (the original record's tool_use_id) so the report can join
+the two by entity_id + experiment without ever touching the original line. The source records
+carry mode="cut-output" (RECORD_MODE), never "shadow": that mode belongs to
+jev_experiment_report.summarize_shadow(), which reads F0's agree/would_dispense fields.
 
 THIRD STATE: a case with no extracted signatures (nothing distinctive was cut -- e.g. an
 all-passed pytest run) is SKIPPED, not joined with referenced_later=False -- there was nothing to
@@ -29,10 +31,26 @@ look for, which is not the same as looking and finding nothing. A missing/unread
 or a tool_use_id this script cannot locate inside it (already rotated/reaped, or the hook fired
 on a transcript path that no longer exists), yields referenced_later=None, never False.
 
+SETTLING (gate_run ga-75ya0i): "no later turn exists YET" is not "no later turn referenced it".
+The join runs while pool sessions are live, and an appended record is final (a joined entity is
+never looked at again), so a verdict is written only when it can no longer change:
+  * True is final as soon as it is seen -- a reference that exists stays true, however live the
+    session still is;
+  * False (and "cannot locate the call") is final only once the session is over, taken as "its
+    transcript has not been written for --settle-hours" (default 3h, JEV_CUT_OUTPUT_JOIN_SETTLE_HOURS);
+    until then the candidate is left UNRECORDED and counted as pending, so the next run sees the
+    later turns. The report shows how many are still waiting;
+  * a transcript that cannot be read at all is unknown (None): nothing will ever change that.
+The one assumption is that a transcript untouched for that long belongs to a finished session; pool
+sessions are ephemeral and do not resume, which is what makes the assumption safe here.
+Because a True is written at once and a False only later, the measured rate reads HIGH while sessions
+are still live (the conservative direction for a go/no-go on cutting) and converges as they settle;
+the report's "not joined yet" line says how many cases are still waiting.
+
 CLI:
-  python3 jev_cut_output_join.py run [--log PATH] [--since-hours N] [--limit N] [--dry-run]
+  python3 jev_cut_output_join.py run [--log PATH] [--since-hours N] [--limit N] [--settle-hours H] [--dry-run]
     Single-instance (flock). Idempotent: skips any (experiment, entity_id) that already has a
-    shadow-join record in the log.
+    cut-output-join record in the log.
   python3 jev_cut_output_join.py selftest
     Pure filesystem (tmp dirs), no network, no live jev-experiment.jsonl touched.
 """
@@ -50,14 +68,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_experiment as je  # noqa: E402
+from cut_output_classifier import JOIN_MODE, RECORD_MODE  # noqa: E402,F401  (JOIN_MODE is re-exported to the report)
 
 SOURCE_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
-JOIN_MODE = "shadow-join"
 
 DEFAULT_LOG_DIR = Path(os.environ.get("JEV_CUT_OUTPUT_JOIN_DIR", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs"))
 LOCK_PATH = DEFAULT_LOG_DIR / "jev-cut-output-join.lock"
 DEFAULT_LIMIT = 200
 DEFAULT_SINCE_HOURS = 24.0 * 7  # a week: long enough that a slow report cron still catches most cases
+
+
+def _env_float(name: str, default: float) -> float:
+    """A bad value in the environment must not stop the daily join at import time: fall back."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# how long a transcript must sit unwritten before its session counts as over (see SETTLING above)
+DEFAULT_SETTLE_HOURS = _env_float("JEV_CUT_OUTPUT_JOIN_SETTLE_HOURS", 3.0)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -92,14 +122,30 @@ def _ts_to_epoch(ts: str) -> float | None:
         return None
 
 
-def select_candidates(records: list[dict], since_hours: float, limit: int) -> list[dict]:
-    """Records that (a) are a source shadow record for this front, (b) have at least one
-    omitted_signatures entry, (c) are newer than `since_hours`, and (d) do not already have a
-    shadow-join counterpart. Oldest first (so a bounded --limit makes progress across runs
+def is_join_candidate(rec: dict) -> bool:
+    """Can the join act on this record at all? A source record of this front (mode RECORD_MODE -- a legacy
+    mode=="shadow" row is another front's, or a stress-run leftover, never this front's), with at least one
+    omitted_signatures entry, and with everything the transcript lookup needs, each of the right TYPE.
+    jev-experiment.jsonl is shared and multi-writer ("not assumed to be pristine"): a line that is valid
+    JSON but lacks one of these, or carries it as the wrong type (an int id, a list entity_id), is skipped
+    here rather than crashing the run later (re.escape / set membership / `in`). Age and "already joined"
+    are the caller's business. The report counts its pending backlog with THIS function, so what it calls
+    "waiting to be joined" is exactly what the join would pick up."""
+    if rec.get("mode") != RECORD_MODE or rec.get("experiment") not in SOURCE_EXPERIMENTS:
+        return False
+    sigs = rec.get("omitted_signatures")
+    if not isinstance(sigs, list) or not sigs:
+        return False  # nothing to look for (or not a list at all) -- not a candidate, not a "no" either
+    return all(_nonempty_str(rec.get(k)) for k in ("transcript_path", "tool_use_id", "entity_id"))
+
+
+def select_candidates(records: list[dict], since_hours: float, limit: int, now: float | None = None) -> list[dict]:
+    """Records that (a) pass is_join_candidate(), (b) are newer than `since_hours`, and (c) do not already
+    have a cut-output-join counterpart. Oldest first (so a bounded --limit makes progress across runs
     instead of re-scanning the same newest N forever)."""
     joined_keys: set[tuple[str, str]] = set()
     sources: list[dict] = []
-    cutoff = time.time() - since_hours * 3600 if since_hours > 0 else None
+    cutoff = (time.time() if now is None else now) - since_hours * 3600 if since_hours > 0 else None
 
     for rec in records:
         if rec.get("mode") == JOIN_MODE and rec.get("experiment") in SOURCE_EXPERIMENTS:
@@ -107,15 +153,8 @@ def select_candidates(records: list[dict], since_hours: float, limit: int) -> li
             if isinstance(eid, str):  # an unhashable/odd-typed id is a malformed line, not a key
                 joined_keys.add((rec["experiment"], eid))
             continue
-        if rec.get("mode") != "shadow" or rec.get("experiment") not in SOURCE_EXPERIMENTS:
+        if not is_join_candidate(rec):
             continue
-        sigs = rec.get("omitted_signatures")
-        if not isinstance(sigs, list) or not sigs:
-            continue  # nothing to look for (or not a list at all) -- not a candidate, not a "no" either
-        if not all(_nonempty_str(rec.get(k)) for k in ("transcript_path", "tool_use_id", "entity_id")):
-            continue  # jev-experiment.jsonl is shared/multi-writer: a line that is valid JSON but is
-            # missing one of these, or has it as the wrong TYPE (an int id, a list entity_id), must be
-            # skipped here -- not crash the whole run later (re.escape / set membership / `in`)
         ts_epoch = _ts_to_epoch(rec.get("ts", ""))
         if cutoff is not None and ts_epoch is not None and ts_epoch < cutoff:
             continue
@@ -131,10 +170,11 @@ def _nonempty_str(v: object) -> bool:
 
 
 def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signatures: list[str]) -> tuple[bool | None, str | None]:
-    """(referenced_later, matched_signature). None when the transcript is missing/unreadable or
-    `tool_use_id` cannot be located in it (unknown, never coerced to False). Otherwise True/False
-    depending on whether any signature appears, as a raw substring, in any line AFTER the split
-    point.
+    """(referenced_later, matched_signature). None when the transcript is missing/unreadable,
+    `tool_use_id` cannot be located in it, or there is no usable (non-empty string) signature to look
+    for (unknown, never coerced to False). Otherwise True/False depending on whether any signature
+    appears, as a raw substring, in any line AFTER the split point. A False here only says "not in
+    the transcript as it is NOW"; whether that may be recorded is run()'s call (see SETTLING).
 
     The split point is the LAST line, anywhere in the transcript, that carries `tool_use_id`. A
     tool_use_id is unique to one call, so every line that mentions it belongs to that call's own
@@ -156,6 +196,10 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     SIBLING call's result in the same batch can repeat a path by coincidence, which biases the rate
     UP (the conservative direction for a go/no-go on cutting) -- unlike the self-match above, which
     is systematic and made the rate uninformative."""
+    usable = [s for s in signatures if _nonempty_str(s)]  # a non-string entry is malformed data, not a crash
+    if not usable:
+        return None, None  # nothing to look for is not "looked and found nothing" (the same two-states rule as a missing id)
+
     try:
         lines = Path(transcript_path).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -170,7 +214,6 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     if split_idx is None:
         return None, None
 
-    usable = [s for s in signatures if _nonempty_str(s)]  # a non-string entry is malformed data, not a crash
     for ln in lines[split_idx + 1 :]:
         for sig in usable:
             if sig in ln:
@@ -184,28 +227,66 @@ def _log(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def run(since_hours: float, limit: int, dry_run: bool) -> int:
-    records = read_jsonl(je.JEV_LOG)
-    candidates = select_candidates(records, since_hours, limit)
-    processed = 0
-    for rec in candidates:
+def transcript_idle_seconds(transcript_path: str, now: float) -> float | None:
+    """Seconds since the transcript was last written. None when it cannot be stat'ed: unknown, which is
+    neither "just written" (0) nor "long finished" (infinity)."""
+    try:
+        return max(0.0, now - Path(transcript_path).stat().st_mtime)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def verdict_is_final(referenced_later: bool | None, idle_s: float | None, settle_s: float) -> bool:
+    """May this verdict be appended now? An appended join record is never revisited (select_candidates
+    treats a joined entity as done), so only a verdict that can no longer change qualifies.
+      True  -> always: a reference that exists stays true, however live the session still is.
+      False -> only once the session is over (idle >= settle_s). While it is live, "not referenced YET"
+               is a different fact from "not referenced"; recording it stamps a session that has not
+               had its later turns as "the cut was safe", the dangerous direction for a go/no-go.
+      None  -> when the session is over as well (the call may simply not be flushed to the transcript
+               yet), or when the transcript cannot be read at all (nothing will ever change that).
+    An unknown idle time is not "settled": a definite False with no way to tell the session is over waits."""
+    if referenced_later is True:
+        return True
+    if idle_s is None:
+        return referenced_later is None
+    return idle_s >= settle_s
+
+
+def join_pass(records: list[dict], since_hours: float, limit: int, now: float, settle_s: float) -> tuple[list[dict], int]:
+    """(join records to append, number of candidates left pending). Reads transcripts, writes nothing.
+    A pending candidate gets no record at all, so a later run still sees it."""
+    out: list[dict] = []
+    pending = 0
+    for rec in select_candidates(records, since_hours, limit, now=now):
         referenced_later, matched = scan_transcript_for_signatures(
             rec["transcript_path"], rec["tool_use_id"], rec["omitted_signatures"]
         )
-        join_rec = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        if not verdict_is_final(referenced_later, transcript_idle_seconds(rec["transcript_path"], now), settle_s):
+            pending += 1
+            continue
+        out.append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "mode": JOIN_MODE,
             "experiment": rec["experiment"],
             "entity_id": rec["entity_id"],
             "referenced_later": referenced_later,
             "matched_signature": matched,
-        }
+        })
+    return out, pending
+
+
+def run(since_hours: float, limit: int, dry_run: bool, now: float | None = None, settle_s: float | None = None) -> int:
+    now = time.time() if now is None else now
+    settle_s = (DEFAULT_SETTLE_HOURS if settle_s is None else settle_s)
+    settle_s = max(0.0, settle_s)
+    joins, pending = join_pass(read_jsonl(je.JEV_LOG), since_hours, limit, now, settle_s)
+    for join_rec in joins:
         if dry_run:
             print(json.dumps(join_rec, ensure_ascii=False))
         else:
             _log(join_rec)
-        processed += 1
-    print(f"jev_cut_output_join: processed {processed} candidate(s) (dry_run={dry_run})")
+    print(f"jev_cut_output_join: processed {len(joins)} candidate(s), {pending} left pending (session not settled) (dry_run={dry_run})")
     return 0
 
 
@@ -217,6 +298,8 @@ def main() -> int:
     r.add_argument("--log", default=None, help="override jev-experiment.jsonl path (test seam)")
     r.add_argument("--since-hours", type=float, default=DEFAULT_SINCE_HOURS)
     r.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    r.add_argument("--settle-hours", type=float, default=DEFAULT_SETTLE_HOURS,
+                   help="a transcript untouched this long counts as a finished session; only then is a False/unknown verdict written")
     r.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -234,7 +317,7 @@ def main() -> int:
         print("jev_cut_output_join: another instance holds the lock, exiting", file=sys.stderr)
         return 0  # not an error: the daily report tolerates a skipped join (best-effort)
     try:
-        return run(args.since_hours, args.limit, args.dry_run)
+        return run(args.since_hours, args.limit, args.dry_run, settle_s=args.settle_hours * 3600.0)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
@@ -425,19 +508,19 @@ def _selftest() -> int:
         # ---- select_candidates ----
         base_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         recs2 = [
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e1", "omitted_signatures": ["s1"], "transcript_path": "/tmp/a", "tool_use_id": "tu-a", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e2", "omitted_signatures": [], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "e3", "omitted_signatures": ["s3"], "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
-            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": False},
-            {"mode": "shadow", "experiment": "some-other-front", "entity_id": "e4", "omitted_signatures": ["s4"], "transcript_path": "/tmp/d", "tool_use_id": "tu-d", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "omitted_signatures": ["s1"], "transcript_path": "/tmp/a", "tool_use_id": "tu-a", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "omitted_signatures": [], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "omitted_signatures": ["s3"], "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
+            {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": False},
+            {"mode": RECORD_MODE, "experiment": "some-other-front", "entity_id": "e4", "omitted_signatures": ["s4"], "transcript_path": "/tmp/d", "tool_use_id": "tu-d", "ts": base_ts},
             # malformed record (shared multi-writer log, "not assumed to be pristine"): otherwise
             # a valid shadow candidate but missing entity_id -- must be skipped here, not crash
             # r["entity_id"] later in select_candidates or rec["entity_id"] in run().
-            {"mode": "shadow", "experiment": "cut-output-fixed", "omitted_signatures": ["s5"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "omitted_signatures": ["s5"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": base_ts},
             # a hook input that carried no tool_use_id is logged with tool_use_id=None (cut-output-
             # shadow.py never invents a placeholder id): there is no call to locate in the transcript,
             # so it must be skipped -- not joined by searching for some made-up id.
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "no-tool-use-id-abc", "omitted_signatures": ["s6"], "transcript_path": "/tmp/f", "tool_use_id": None, "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "no-tool-use-id-abc", "omitted_signatures": ["s6"], "transcript_path": "/tmp/f", "tool_use_id": None, "ts": base_ts},
         ]
         cands = select_candidates(recs2, since_hours=0, limit=10)
         cand_ids = {c["entity_id"] for c in cands}
@@ -457,13 +540,13 @@ def _selftest() -> int:
         # missing entity_id; a non-string id, an unhashable entity_id, a non-list signature field or a
         # null ts (which the oldest-first sort then compares with strings) crashed the same way.
         wrong_types = [
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-good", "omitted_signatures": ["s"], "transcript_path": "/tmp/g", "tool_use_id": "tu-g", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-int-tuid", "omitted_signatures": ["s"], "transcript_path": "/tmp/a", "tool_use_id": 12345, "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": ["not", "hashable"], "omitted_signatures": ["s"], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-sigs-str", "omitted_signatures": "not-a-list", "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-path-int", "omitted_signatures": ["s"], "transcript_path": 7, "tool_use_id": "tu-d", "ts": base_ts},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "wt-null-ts", "omitted_signatures": ["s"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": None},
-            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": ["unhashable", "join"], "referenced_later": True},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "wt-good", "omitted_signatures": ["s"], "transcript_path": "/tmp/g", "tool_use_id": "tu-g", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "wt-int-tuid", "omitted_signatures": ["s"], "transcript_path": "/tmp/a", "tool_use_id": 12345, "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": ["not", "hashable"], "omitted_signatures": ["s"], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "wt-sigs-str", "omitted_signatures": "not-a-list", "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "wt-path-int", "omitted_signatures": ["s"], "transcript_path": 7, "tool_use_id": "tu-d", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "wt-null-ts", "omitted_signatures": ["s"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": None},
+            {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": ["unhashable", "join"], "referenced_later": True},
         ]
         try:
             wt_cands = select_candidates(wrong_types, since_hours=0, limit=10)
@@ -480,6 +563,125 @@ def _selftest() -> int:
         ok("scan_transcript_for_signatures: a non-string entry in the signature list is ignored, not a TypeError",
            r_sig_types is True)
 
+        # "looked for nothing" is not "looked and found nothing": a signature list with no usable
+        # (string) entry is unknown, never False
+        r_no_usable, _ = scan_transcript_for_signatures(str(transcript), "tu-1", [None, 5, ""])
+        ok("scan_transcript_for_signatures: no usable signature at all -> None (nothing to look for), never False",
+           r_no_usable is None)
+
+        # ---- the records of THIS front live under their own mode, never under "shadow" ----
+        # jev_experiment_report.summarize_shadow() owns every mode=="shadow" row (gate_run ga-75ya0i, blocking
+        # issue 2), and the 40 rows an earlier stress-run left in the live log carry that mode: they must not be
+        # candidates here even when every other field looks valid.
+        legacy = [
+            {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "t", "omitted_signatures": ["s"],
+             "transcript_path": "/tmp/legacy", "tool_use_id": "t", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "toolu_real", "omitted_signatures": ["s"],
+             "transcript_path": "/tmp/real", "tool_use_id": "toolu_real", "ts": base_ts},
+            {"mode": "shadow-join", "experiment": "cut-output-jev", "entity_id": "toolu_real", "referenced_later": False},
+        ]
+        leg_ids = [c["entity_id"] for c in select_candidates(legacy, since_hours=0, limit=10)]
+        ok("select_candidates: a legacy mode=='shadow' row is not a candidate (it belongs to summarize_shadow, not to this front)",
+           "t" not in leg_ids)
+        ok("select_candidates: a legacy 'shadow-join' row does not count as this front's join (only cut-output-join does)",
+           leg_ids == ["toolu_real"])
+        ok("the join and record modes are this front's own, and differ from 'shadow' and from each other",
+           RECORD_MODE == "cut-output" and JOIN_MODE == "cut-output-join" and "shadow" not in (RECORD_MODE, JOIN_MODE))
+
+        # ---- gate_run ga-75ya0i, blocking issue 1: "no later turn YET" is not "not referenced later" ----
+        # scan_transcript_for_signatures() answers False whenever nothing follows the call, and run() used to
+        # write that as a permanent join record; select_candidates() then treats any joined entity as done, so
+        # a session still in progress was stamped "the cut was safe" before it had a later turn, and the record
+        # was never looked at again. Rules under test: True is final the moment it is seen (a reference that
+        # exists stays true); False -- and "cannot locate the call" -- are final only once the session is over,
+        # taken as "the transcript has not been written for settle_s"; anything else is left unrecorded so the
+        # next run still sees the later turns; a transcript that cannot be read at all is unknown, recorded.
+        now_t = 1_800_000_000.0
+        settle = 3 * 3600.0
+
+        def _tr(name: str, tool_use_id: str, idle_s: float, later: str | None = None) -> Path:
+            lines = [
+                '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"%s"}]}}' % tool_use_id,
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"%s","content":"out ga-late-sig"}]}}' % tool_use_id,
+            ]
+            if later:
+                lines.append(later)
+            p = Path(td) / name
+            p.write_text("\n".join(lines) + "\n")
+            os.utime(p, (now_t - idle_s, now_t - idle_s))  # mtime = "last written idle_s ago"
+            return p
+
+        def _src(eid: str, tpath: Path | str, tuid: str) -> dict:
+            return {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": eid, "omitted_signatures": ["ga-late-sig"],
+                    "transcript_path": str(tpath), "tool_use_id": tuid, "ts": base_ts}
+
+        cite = '{"type":"assistant","text":"back to ga-late-sig, I need that"}'
+        p_a = _tr("a.jsonl", "toolu_a", idle_s=60)                      # live session, no later turn yet
+        p_b = _tr("b.jsonl", "toolu_b", idle_s=60, later=cite)          # live session, later turn already cites it
+        p_c = _tr("c.jsonl", "toolu_c", idle_s=settle + 60)             # finished session, never cited
+        p_d = _tr("d.jsonl", "toolu_d", idle_s=60)                      # live session; the id is not in the transcript (yet)
+        p_e = _tr("e.jsonl", "toolu_e", idle_s=settle + 60)             # finished session; the id is not in the transcript
+        recs_s = [
+            _src("ent_a", p_a, "toolu_a"), _src("ent_b", p_b, "toolu_b"), _src("ent_c", p_c, "toolu_c"),
+            _src("ent_d", p_d, "toolu_never_logged"), _src("ent_e", p_e, "toolu_never_logged"),
+            _src("ent_f", Path(td) / "gone.jsonl", "toolu_f"),          # transcript file does not exist
+        ]
+        joins1, pending1 = join_pass(recs_s, since_hours=0, limit=100, now=now_t, settle_s=settle)
+        by_eid = {j["entity_id"]: j for j in joins1}
+        ok("live session, no later turn yet -> NOT recorded (the bug: it was stamped referenced_later=False forever)",
+           "ent_a" not in by_eid)
+        ok("live session, later turn already cites the signature -> recorded True at once (True never needs settling)",
+           by_eid.get("ent_b", {}).get("referenced_later") is True)
+        ok("finished session (idle >= settle), never cited -> recorded False",
+           "ent_c" in by_eid and by_eid["ent_c"]["referenced_later"] is False)
+        ok("live session where the call cannot be located yet -> NOT recorded (it may simply not be flushed)",
+           "ent_d" not in by_eid)
+        ok("finished session where the call cannot be located -> recorded None (unknown), never False",
+           "ent_e" in by_eid and by_eid["ent_e"]["referenced_later"] is None)
+        ok("transcript file gone -> recorded None (unknown; nothing will ever change that)",
+           "ent_f" in by_eid and by_eid["ent_f"]["referenced_later"] is None)
+        ok("the two candidates left unrecorded are counted as pending, not silently dropped", pending1 == 2)
+
+        # the reviewer's sequence: first run sees no later turn; the later turn arrives; the next run must see it
+        log_s = Path(td) / "settle-log.jsonl"
+        with log_s.open("w") as f:
+            f.write(json.dumps(_src("ent_a", p_a, "toolu_a")) + "\n")
+        orig_log_s = je.JEV_LOG
+        try:
+            je.JEV_LOG = log_s
+            run(since_hours=0, limit=10, dry_run=False, now=now_t, settle_s=settle)
+            ok("run(): first run on a live session with no later turn writes no join record", len(log_s.read_text().splitlines()) == 1)
+            with p_a.open("a") as f:
+                f.write(cite + "\n")
+            os.utime(p_a, (now_t - 30, now_t - 30))  # still a live session
+            run(since_hours=0, limit=10, dry_run=False, now=now_t, settle_s=settle)
+            lines_s = log_s.read_text().splitlines()
+            ok("run(): after the later turn arrives, the next run records it (referenced_later=True)",
+               len(lines_s) == 2 and json.loads(lines_s[1])["referenced_later"] is True)
+            run(since_hours=0, limit=10, dry_run=False, now=now_t, settle_s=settle)
+            ok("run(): and stays idempotent afterwards", len(log_s.read_text().splitlines()) == 2)
+
+            # a live session that never cites it: pending while live, False only once the session is over
+            log_s.write_text(json.dumps(_src("ent_g", p_d, "toolu_d")) + "\n")
+            run(since_hours=0, limit=10, dry_run=False, now=now_t, settle_s=settle)
+            ok("run(): live session, id located, nothing cited -> pending", len(log_s.read_text().splitlines()) == 1)
+            run(since_hours=0, limit=10, dry_run=False, now=now_t + settle + 120, settle_s=settle)
+            lines_g = log_s.read_text().splitlines()
+            ok("run(): once the transcript has been idle for the settle window (session over), the False verdict is recorded",
+               len(lines_g) == 2 and json.loads(lines_g[1])["referenced_later"] is False)
+        finally:
+            je.JEV_LOG = orig_log_s
+
+        idle_known = transcript_idle_seconds(str(p_c), now_t)
+        ok("transcript_idle_seconds: seconds since the transcript was last written", idle_known is not None and abs(idle_known - (settle + 60)) < 1.0)
+        ok("transcript_idle_seconds: a file that cannot be stat'ed is None (unknown), not 0 and not infinity",
+           transcript_idle_seconds(str(Path(td) / "nope.jsonl"), now_t) is None)
+        ok("verdict_is_final: True is final whatever the idle time", verdict_is_final(True, 0.0, settle) and verdict_is_final(True, None, settle))
+        ok("verdict_is_final: False needs a settled transcript; unknown idle time is not settled",
+           not verdict_is_final(False, 60.0, settle) and verdict_is_final(False, settle, settle) and not verdict_is_final(False, None, settle))
+        ok("verdict_is_final: None is final only when settled, or when the transcript cannot be read at all",
+           not verdict_is_final(None, 60.0, settle) and verdict_is_final(None, settle + 1, settle) and verdict_is_final(None, None, settle))
+
         # ---- run(): end to end against a temp log, idempotent on rerun ----
         log_path = Path(td) / "jev-experiment.jsonl"
         orig_log = je.JEV_LOG
@@ -491,7 +693,7 @@ def _selftest() -> int:
             )
             with log_path.open("w") as f:
                 f.write(json.dumps({
-                    "mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e-src",
+                    "mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e-src",
                     "omitted_signatures": ["ga-found-me"], "transcript_path": str(src_transcript),
                     "tool_use_id": "tu-src", "ts": base_ts,
                 }) + "\n")
@@ -500,7 +702,7 @@ def _selftest() -> int:
             ok("run(): appended exactly one join record", len(lines_after) == 2)
             joined = json.loads(lines_after[1])
             ok("run(): join record has referenced_later=True", joined["referenced_later"] is True)
-            ok("run(): join record mode is shadow-join", joined["mode"] == JOIN_MODE)
+            ok("run(): join record mode is the front's own cut-output-join (never shadow / shadow-join)", joined["mode"] == JOIN_MODE == "cut-output-join")
 
             run(since_hours=0, limit=10, dry_run=False)
             lines_after2 = log_path.read_text().splitlines()

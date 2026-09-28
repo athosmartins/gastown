@@ -89,6 +89,10 @@ JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-ga
 BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL = 4000
 
 
+# the experiment names of the cut-large-output front (cut-output-shadow.py); its rows are mode "cut-output"
+CUT_OUTPUT_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
+
+
 def _filing_ts(ev: dict) -> str:
     """The timestamp `--date` files a row under: `resolved_at` for Portaria rows (see the module
     docstring for why), the row's own `ts` for everything else."""
@@ -118,6 +122,13 @@ def load_events(date: str | None, experiment: str | None) -> list[dict]:
                 # so this line is no longer what keeps them out of the suppression counts; it stays
                 # because load_events() feeds all the summarizers and the quem-pensa and preambulo
                 # selftests pin it.
+                continue
+            if ev.get("mode") == "shadow" and ev.get("experiment") in CUT_OUTPUT_EXPERIMENTS:
+                # ga-wk0qi2: the cut-large-output front logs under its own mode ("cut-output", table in
+                # jev_cut_output_report.py), so a mode=="shadow" row of ITS experiments is not F0 data: it is one
+                # of the 40 rows a stress run left in the live log (entity_id "t", 2026-09-28T21:17-21:19Z, before
+                # the mode existed). summarize_shadow() would print them as a Jev-unavailable front with negative
+                # savings. Dropped at the source, like the modes above; the log is append-only, so it is not cleaned.
                 continue
             if date and not _filing_ts(ev).startswith(date):
                 continue
@@ -762,6 +773,30 @@ def _selftest() -> int:
     only_shadow_report = format_report(empty_suppression, shadow_summary, "selftest")
     ok("format_report() with shadow data but no suppression data does not print 'no candidate escalations'",
        "no candidate escalations logged" not in only_shadow_report)
+
+    # ga-wk0qi2: load_events() drops the legacy mode=="shadow" rows of the cut-large-output experiments (40 stress-
+    # run rows in the live log) but keeps every other shadow row -- including a same-mode row of ANOTHER front,
+    # and a row of the cut-output experiments under a mode that is not "shadow"
+    import tempfile
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "jev-experiment.jsonl"
+        rows = [
+            {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "t", "jev_ok": False},
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "t2"},
+            {"mode": "shadow", "experiment": "F-synthetic", "agree": True, "would_dispense": False},
+            {"mode": "cut-output", "experiment": "cut-output-jev", "entity_id": "toolu_x"},
+        ]
+        lp.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        with mock.patch.object(sys.modules[__name__], "JEV_LOG", lp):
+            loaded_cut = load_events(None, None)
+            loaded_only_cut = load_events(None, "cut-output-jev")
+        ok("load_events drops mode=='shadow' rows of the cut-output experiments, keeps the rest",
+           [e.get("entity_id") or e.get("experiment") for e in loaded_cut] == ["F-synthetic", "toolu_x"])
+        ok("load_events: asking for a cut-output experiment by name does not resurrect its legacy shadow rows",
+           [e.get("entity_id") for e in loaded_only_cut] == ["toolu_x"])
+        ok("summarize_shadow over the loaded events holds only the genuine F0 front", sorted(summarize_shadow(loaded_cut)) == ["F-synthetic"])
 
     print(f"\njev_experiment_report selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0

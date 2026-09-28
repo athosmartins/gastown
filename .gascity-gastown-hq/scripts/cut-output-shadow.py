@@ -36,6 +36,14 @@ TWO TIERS, per this bead's own "Mecanismo" text:
      state budget is judged from a head+tail SAMPLE, and the un-judged middle counts as KEPT (the
      record says `sampled`), so the number can never exceed what Jev actually looked at.
 
+RECORD MODE: every row goes to jev-experiment.jsonl with mode "cut-output" (cut_output_classifier.
+RECORD_MODE), never "shadow". That mode belongs to jev_experiment_report.summarize_shadow(), which
+reads F0's agree/would_dispense fields -- this front's rows under it made the daily report print a
+"Jev unavailable" section for the fixed tier (which never calls Jev) and subtract Jev's token cost
+from savings that section never credits (gate_run ga-75ya0i). The measurement has its own report
+(jev_cut_output_report.py, wired into jev-daily-report.sh) and its own offline join
+(jev_cut_output_join.py, mode "cut-output-join").
+
 THIRD STATE, everywhere: Jev down/error/unparseable -> that block's `relevant`/`would_cut` stay
 None -- never coerced into "safe to cut". A caller (there is none yet: shadow mode has no
 caller) MUST NOT treat a None here as permission to drop the block. A Jev call slower than
@@ -194,7 +202,7 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
     is_unknown = verdict["rule"] == "unknown"
     return {
         "ts": _now_iso(),
-        "mode": "shadow",
+        "mode": coc.RECORD_MODE,
         "experiment": EXPERIMENT_FIXED,
         "entity_id": _entity_id(meta),
         "session_id": meta.get("session_id"),
@@ -232,7 +240,7 @@ def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: d
     exceed what was judged."""
     record: dict = {
         "ts": _now_iso(),
-        "mode": "shadow",
+        "mode": coc.RECORD_MODE,
         "experiment": EXPERIMENT_JEV,
         "entity_id": _entity_id(meta),
         "session_id": meta.get("session_id"),
@@ -766,6 +774,68 @@ def _selftest() -> int:
             ok("process(): unstructured case wrote exactly one log line", len(lines2) == 1)
             rec2 = json.loads(lines2[0])
             ok("process(): unstructured case logged experiment cut-output-jev", rec2["experiment"] == EXPERIMENT_JEV)
+
+    # ---- gate_run ga-75ya0i, blocking issue 2: this front's rows must not be read as F0 shadow rows. The daily
+    # Jev report (jev_experiment_report.py) aggregates EVERY mode=="shadow" row by experiment name, expecting
+    # F0's agree / would_dispense fields; records logged under that mode printed "Jev unavailable" for the fixed
+    # tier (which never calls Jev) and subtracted Jev's token cost from savings the section never credits. The
+    # only test that can prove they stay out is one that pushes the REAL records through the real report. ----
+    import jev_experiment_report as jer
+
+    def _real_records() -> list[dict]:
+        big_pytest = (
+            "============================= test session starts ==============================\n"
+            + "\n".join(f"t{i} PASSED" for i in range(300))
+            + "\n============================== 300 passed in 1.0s ================================\n"
+        )
+        prose = "\n\n".join(f"random unstructured paragraph number {i} with no test/log shape at all, just prose padding to grow it" for i in range(80))
+
+        def _hook(stdout: str, tuid: str) -> dict:
+            return {"tool_name": "Bash", "tool_response": {"stdout": stdout, "stderr": ""}, "tool_use_id": tuid,
+                    "session_id": "s-rep", "transcript_path": "/tmp/s-rep.jsonl", "tool_input": {"command": "x"}}
+
+        with tempfile.TemporaryDirectory() as td_rep:
+            lp = Path(td_rep) / "jev-experiment.jsonl"
+            with mock.patch.object(je, "JEV_LOG", lp):
+                process(_hook(big_pytest, "toolu_fixed"))
+                with mock.patch.object(je, "call_jev_multi", return_value={"ok": True, "answers": {f"block_{i}": 0.05 for i in range(13)}, "bad": {}, "tokens_in": 5000, "tokens_out": 13}):
+                    process(_hook(prose, "toolu_jev_ok"))
+                with mock.patch.object(je, "call_jev_multi", return_value={"ok": False, "error": "no_credentials"}):
+                    process(_hook(prose, "toolu_jev_down"))
+            return [json.loads(ln) for ln in lp.read_text().splitlines()]
+
+    real_recs = _real_records()
+    ok("setup: the hook logged one fixed-rule record and two Jev-tier records (Jev ok / Jev down)",
+       [r["experiment"] for r in real_recs] == [EXPERIMENT_FIXED, EXPERIMENT_JEV, EXPERIMENT_JEV])
+    ok("every record this front logs carries its own mode (coc.RECORD_MODE), never 'shadow'",
+       all(r["mode"] == coc.RECORD_MODE for r in real_recs) and coc.RECORD_MODE != "shadow")
+    join_like = {"mode": coc.JOIN_MODE, "experiment": EXPERIMENT_FIXED, "entity_id": "toolu_fixed", "referenced_later": False}
+    ev_all = real_recs + [join_like]
+    ok("jev_experiment_report.summarize_shadow() sees none of this front's records (it read them as F0 rows before)",
+       jer.summarize_shadow(ev_all) == {})
+    ok("jev_experiment_report.summarize() sees none of them either", jer.summarize(ev_all) == {})
+    rep_text = jer.format_report(jer.summarize(ev_all), jer.summarize_shadow(ev_all), "selftest")
+    rep_pt = jer.format_resumo_pt(jer.summarize(ev_all), jer.summarize_shadow(ev_all), "selftest")
+    ok("the daily report prints no section, no 'Jev-unavailable' line and no negative savings for this front",
+       "cut-output" not in rep_text and "Jev-unavailable" not in rep_text and "~-" not in rep_text)
+    ok("the daily Portuguese summary (the phone text) prints nothing for this front either",
+       "cut-output" not in rep_pt and "indisponível" not in rep_pt and "~-" not in rep_pt)
+
+    # ...and through load_events(), against a log that ALSO holds the 40 rows an earlier stress run left behind
+    # (mode "shadow", experiment cut-output-jev, entity_id "t", command "c") next to a genuine F0 shadow row
+    with tempfile.TemporaryDirectory() as td_ev:
+        lp = Path(td_ev) / "jev-experiment.jsonl"
+        junk = [{"ts": f"2026-09-28T21:{17 + i // 40:02d}:{i:02d}Z", "mode": "shadow", "experiment": EXPERIMENT_JEV, "entity_id": "t",
+                 "command": "c", "session_id": None, "jev_ok": False, "tokens_would_save": None, "jev_tokens_in": 1692, "jev_tokens_out": 0}
+                for i in range(40)]
+        f0 = {"ts": "2026-09-28T12:00:00Z", "mode": "shadow", "experiment": "F-synthetic", "agree": True, "would_dispense": False}
+        lp.write_text("\n".join(json.dumps(r) for r in junk + [f0] + real_recs) + "\n")
+        with mock.patch.object(jer, "JEV_LOG", lp):
+            loaded = jer.load_events(None, None)
+        ok("load_events: the legacy stress-run rows (mode 'shadow', a cut-output experiment) are dropped at the source",
+           not any(e.get("entity_id") == "t" for e in loaded))
+        ok("load_events: a genuine F0 shadow row still reaches summarize_shadow, and it is the only thing there",
+           sorted(jer.summarize_shadow(loaded)) == ["F-synthetic"])
 
     # ---- main(): disabled sentinel short-circuits everything, even malformed stdin ----
     with tempfile.TemporaryDirectory() as td:

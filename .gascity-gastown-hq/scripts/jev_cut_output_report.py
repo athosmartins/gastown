@@ -26,13 +26,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_experiment as je  # noqa: E402
-from jev_cut_output_join import JOIN_MODE, SOURCE_EXPERIMENTS, read_jsonl  # noqa: E402
+from jev_cut_output_join import JOIN_MODE, RECORD_MODE, SOURCE_EXPERIMENTS, is_join_candidate, read_jsonl  # noqa: E402
 
 
 def compute_stats(records: list[dict]) -> dict:
     """Pure. Splits records into the two source experiments (fixed-rule, Jev-tier) and their
-    shadow-join counterparts (keyed by entity_id), then aggregates. Never raises on a malformed
-    or missing field on any one record -- one bad record is skipped, not fatal to the report."""
+    cut-output-join counterparts (keyed by entity_id), then aggregates. Only this front's own modes
+    are read (RECORD_MODE / JOIN_MODE): a mode=="shadow" row of the same experiment name is not this
+    front's data. Never raises on a malformed or missing field on any one record -- one bad record is
+    skipped, not fatal to the report."""
     stats: dict = {exp: {
         "count": 0,
         "tokens_would_save_total": 0,
@@ -45,6 +47,7 @@ def compute_stats(records: list[dict]) -> dict:
         "sampled_count": 0,  # cut-output-jev only: Jev judged a head+tail sample, not the whole output
     } for exp in SOURCE_EXPERIMENTS}
     joins: dict[tuple[str, str], bool | None] = {}
+    candidates: set[tuple[str, str]] = set()  # records the join could act on (whether or not it has yet)
 
     for rec in records:
         mode = rec.get("mode")
@@ -56,8 +59,10 @@ def compute_stats(records: list[dict]) -> dict:
             if isinstance(eid, str):  # an unhashable/odd-typed id (partial multi-writer line) is skipped, not a key
                 joins[(exp, eid)] = rec.get("referenced_later")
             continue
-        if mode != "shadow":
+        if mode != RECORD_MODE:
             continue
+        if is_join_candidate(rec):
+            candidates.add((exp, rec["entity_id"]))
         s = stats[exp]
         s["count"] += 1
         saved = rec.get("tokens_would_save")
@@ -90,6 +95,9 @@ def compute_stats(records: list[dict]) -> dict:
         "referenced_false": referenced_false,
         "referenced_unknown": referenced_unknown,
         "referenced_rate": (referenced_true / (referenced_true + referenced_false)) if (referenced_true + referenced_false) > 0 else None,
+        # candidates with no join record yet: the join leaves a case unrecorded while its session may still
+        # produce later turns (jev_cut_output_join.py, SETTLING), so they are outside every number above
+        "pending": len(candidates - set(joins)),
     }
     return stats
 
@@ -119,6 +127,12 @@ def format_report(stats: dict) -> str:
             f"not referenced: {j['referenced_false']}, unknown: {j['referenced_unknown']} "
             f"(measured rate: {rate_str}; bead's own expected ceiling: ~8% of reread — compare, do not auto-decide)"
         )
+    if j["pending"]:
+        lines.append(
+            f"  {j['pending']} cut(s) not joined yet — their session may still be running (a False verdict is written "
+            f"only once it is over, so the rate above reads high until then) or the join's --limit/--since-hours "
+            f"window has not reached them; not in the rate above"
+        )
     no_signature = sum(stats[exp]["no_signature_count"] for exp in SOURCE_EXPERIMENTS)
     if no_signature:
         lines.append(
@@ -137,9 +151,17 @@ def format_resumo_pt(stats: dict) -> str:
     # cases the fixed rule could not read count as observed, but they cut nothing -- say so instead
     # of letting "N via regra fixa" read as N cuts
     fixed_note = f" ({fixed_unknown} sem corte: formato não reconhecido)" if fixed_unknown else ""
+    # "conferido(s)" is the population the rate is computed over (a verdict of yes or no); joins with no verdict
+    # (unknown) and cuts still waiting for their session to end are named apart, not folded into that count
+    decided = j["referenced_true"] + j["referenced_false"]
+    join_notes = ""
+    if j["referenced_unknown"]:
+        join_notes += f", {j['referenced_unknown']} sem veredito"
+    if j["pending"]:
+        join_notes += f", {j['pending']} aguardando a sessão terminar"
     return (
         f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa{fixed_note}, "
-        f"{jev} via Jev. Join offline: {j['total']} conferido(s), taxa de 'precisou depois' = {rate_str} "
+        f"{jev} via Jev. Join offline: {decided} conferido(s){join_notes}, taxa de 'precisou depois' = {rate_str} "
         f"(teto esperado do bead: ~8%)."
     )
 
@@ -174,14 +196,14 @@ def _selftest() -> int:
             print(f"  FAIL {label}")
 
     records = [
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e1", "tokens_would_save": 100},
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e2", "tokens_would_save": 200},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "e3", "tokens_would_save": 50, "jev_ok": True},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "e4", "tokens_would_save": None, "jev_ok": False},
-        {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": True},
-        {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "e2", "referenced_later": False},
-        {"mode": "shadow-join", "experiment": "cut-output-jev", "entity_id": "e3", "referenced_later": False},
-        {"mode": "shadow", "experiment": "unrelated-front", "entity_id": "e9", "tokens_would_save": 999},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "tokens_would_save": 100},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "tokens_would_save": 200},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "tokens_would_save": 50, "jev_ok": True},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e4", "tokens_would_save": None, "jev_ok": False},
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": True},
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "referenced_later": False},
+        {"mode": JOIN_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "referenced_later": False},
+        {"mode": RECORD_MODE, "experiment": "unrelated-front", "entity_id": "e9", "tokens_would_save": 999},
     ]
     stats = compute_stats(records)
     ok("fixed-rule count", stats["cut-output-fixed"]["count"] == 2)
@@ -206,8 +228,8 @@ def _selftest() -> int:
     # shape but could not cut it safely) are counted and shown SEPARATELY, and their None
     # tokens_would_save must not enter the average as if it were a measured "saves nothing" ----
     unk_records = records + [
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e10", "rule": "unknown", "tokens_would_save": None},
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e11", "rule": "unknown", "tokens_would_save": None},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e10", "rule": "unknown", "tokens_would_save": None},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e11", "rule": "unknown", "tokens_would_save": None},
     ]
     unk_stats = compute_stats(unk_records)
     ok("unknown records still count as observed fixed-rule cases", unk_stats["cut-output-fixed"]["count"] == 4)
@@ -224,15 +246,15 @@ def _selftest() -> int:
     # found"), yet the report sets that rate beside the bead's ~8% ceiling. Say how many were left
     # out. And a Jev saving computed from a head+tail SAMPLE is a lower bound: say how many. ----
     sig_records = [
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "s1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "s2", "tokens_would_save": 90, "omitted_signatures": []},
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "s3", "tokens_would_save": 80},  # field missing
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "s4", "rule": "unknown", "tokens_would_save": None, "omitted_signatures": []},
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "s5", "tokens_would_save": 0, "omitted_signatures": []},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "s6", "tokens_would_save": 50, "jev_ok": True, "sampled": True, "omitted_signatures": ["/a/b/c"]},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "s7", "tokens_would_save": 40, "jev_ok": True, "sampled": False, "omitted_signatures": []},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "s8", "tokens_would_save": None, "jev_ok": False},
-        {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "s1", "referenced_later": False},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s2", "tokens_would_save": 90, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s3", "tokens_would_save": 80},  # field missing
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s4", "rule": "unknown", "tokens_would_save": None, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s5", "tokens_would_save": 0, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s6", "tokens_would_save": 50, "jev_ok": True, "sampled": True, "omitted_signatures": ["/a/b/c"]},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s7", "tokens_would_save": 40, "jev_ok": True, "sampled": False, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s8", "tokens_would_save": None, "jev_ok": False},
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "s1", "referenced_later": False},
     ]
     sig_stats = compute_stats(sig_records)
     ok("fixed tier: exactly the real cuts with an empty/missing omitted_signatures are 'nothing to look for' "
@@ -245,8 +267,8 @@ def _selftest() -> int:
     ok("format_report says how many cuts had nothing to look for and are outside the rate", "3 cut(s) had no signature to look for" in sig_text)
     ok("format_report says how many Jev numbers come from a sample (lower bound)", "1 judged only a head+tail sample" in sig_text)
     quiet_text = format_report(compute_stats([
-        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "q1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
-        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "q2", "tokens_would_save": 50, "jev_ok": True, "sampled": False, "omitted_signatures": ["/a/b/c"]},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "q1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
+        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "q2", "tokens_would_save": 50, "jev_ok": True, "sampled": False, "omitted_signatures": ["/a/b/c"]},
     ]))
     ok("format_report stays quiet about both when every cut has signatures and nothing was sampled",
        "no signature to look for" not in quiet_text and "head+tail sample" not in quiet_text)
@@ -255,15 +277,68 @@ def _selftest() -> int:
     # hashable (a list, from a partially-written multi-writer line) was used as a dict key -> TypeError.
     try:
         bad_stats = compute_stats([
-            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": ["unhashable"], "referenced_later": True},
-            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "good", "referenced_later": False},
-            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "x", "tokens_would_save": "not-a-number", "omitted_signatures": 5},
+            {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": ["unhashable"], "referenced_later": True},
+            {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "good", "referenced_later": False},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "x", "tokens_would_save": "not-a-number", "omitted_signatures": 5},
         ])
         bad_raised = None
     except Exception as e:  # noqa: BLE001
         bad_stats, bad_raised = None, type(e).__name__
     ok(f"compute_stats: a join record with an unhashable entity_id is skipped, never raises (raised: {bad_raised})", bad_raised is None)
     ok("compute_stats: the well-formed join record beside it is still counted", bad_stats is not None and bad_stats["joins"]["total"] == 1)
+
+    # ---- gate_run ga-75ya0i: this front's rows have their own mode. A legacy mode=="shadow" row of the same
+    # experiment (the 40 stress-run rows in the live log: entity_id "t", command "c") is NOT this front's
+    # data -- jev_experiment_report.summarize_shadow() owns that mode -- so it must not count here either ----
+    legacy_stats = compute_stats(records + [
+        {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "t", "command": "c", "tokens_would_save": 9999, "jev_ok": False},
+        {"mode": "shadow-join", "experiment": "cut-output-jev", "entity_id": "t", "referenced_later": True},
+    ])
+    ok("legacy mode=='shadow' rows of a cut-output experiment are ignored (count unchanged)",
+       legacy_stats["cut-output-jev"]["count"] == stats["cut-output-jev"]["count"] and legacy_stats["cut-output-jev"]["jev_unreachable_count"] == stats["cut-output-jev"]["jev_unreachable_count"])
+    ok("legacy 'shadow' / 'shadow-join' rows do not touch the join counts either", legacy_stats["joins"] == stats["joins"])
+
+    # ---- gate_run ga-75ya0i, blocking issue 1 (report side): records the join has NOT written a verdict for
+    # yet (session still live) are shown as waiting -- the join leaves them unrecorded on purpose, and a
+    # report that only says "N case(s) checked" reads a backlog exactly like a finished measurement ----
+    def _cand(eid, exp="cut-output-fixed", **kw):
+        r = {"mode": RECORD_MODE, "experiment": exp, "entity_id": eid, "tokens_would_save": 10, "omitted_signatures": ["ga-x"],
+             "transcript_path": "/tmp/t.jsonl", "tool_use_id": eid}
+        r.update(kw)
+        return r
+
+    pend_records = [
+        _cand("p1"), _cand("p2", exp="cut-output-jev", jev_ok=True),                    # waiting for the join
+        _cand("p3"), {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "p3", "referenced_later": False},  # joined
+        _cand("p4", omitted_signatures=[]),                                              # nothing to look for: never a candidate
+        _cand("p5", tool_use_id=None),                                                   # no call to locate: never a candidate
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "p6", "rule": "unknown", "tokens_would_save": None},
+    ]
+    pend_stats = compute_stats(pend_records)
+    ok("pending backlog: exactly the records the join could act on and has not joined yet (p1, p2)", pend_stats["joins"]["pending"] == 2)
+    ok("pending backlog counts nothing when every candidate is joined or unjoinable", stats["joins"]["pending"] == 0)
+    ok("every pending record is one is_join_candidate() accepts (the report and the join cannot disagree)",
+       all(is_join_candidate(r) for r in pend_records if r["mode"] == RECORD_MODE and r["entity_id"] in ("p1", "p2", "p3"))
+       and not is_join_candidate(pend_records[4]) and not is_join_candidate(pend_records[5]))
+    pend_text = format_report(pend_stats)
+    ok("format_report says how many cuts are still waiting for their session to finish, outside the rate",
+       "2 cut(s) not joined yet" in pend_text and "session" in pend_text)
+    ok("format_report stays quiet about waiting cuts when there are none", "not joined yet" not in format_report(stats))
+    ok("format_resumo_pt says how many are still waiting", "2 aguardando" in format_resumo_pt(pend_stats))
+    ok("format_resumo_pt stays quiet about waiting cuts when there are none", "aguardando" not in format_resumo_pt(stats))
+
+    # the phone text used to print "N conferido(s)" counting unknown joins next to a rate whose denominator
+    # excludes them: N must be the cases the rate is computed over, with the unknown ones named apart
+    unk_join = compute_stats([
+        _cand("u1"), _cand("u2"), _cand("u3"),
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "u1", "referenced_later": True},
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "u2", "referenced_later": False},
+        {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "u3", "referenced_later": None},
+    ])
+    unk_pt = format_resumo_pt(unk_join)
+    ok("format_resumo_pt: the checked count is the rate's own denominator (2), unknown joins are named apart (1)",
+       "2 conferido(s)" in unk_pt and "1 sem veredito" in unk_pt and "50.0%" in unk_pt)
+    ok("format_resumo_pt: no 'sem veredito' when no join is unknown", "sem veredito" not in format_resumo_pt(stats))
 
     empty_stats = compute_stats([])
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)
