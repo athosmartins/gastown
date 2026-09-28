@@ -109,7 +109,7 @@ def chunk_text(text: str, max_blocks: int = MAX_JEV_BLOCKS, max_total_chars: int
         source_blocks = budgeted.splitlines() or [budgeted]
 
     if len(source_blocks) <= max_blocks:
-        return source_blocks[:max_blocks] if len(source_blocks) <= max_blocks else source_blocks
+        return source_blocks
 
     # Merge down to max_blocks contiguous groups of roughly equal size (never reorders content).
     n = len(source_blocks)
@@ -214,7 +214,8 @@ def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: d
             kept_chars += len(b)
     record["blocks"] = per_block
     record["chars_after_provisional"] = kept_chars
-    record["tokens_would_save"] = max(0, coc.estimate_tokens(text) - coc.estimate_tokens(" " * kept_chars))
+    kept_chars_tokens = max(0, round(kept_chars / coc.CHARS_PER_TOKEN))
+    record["tokens_would_save"] = max(0, coc.estimate_tokens(text) - kept_chars_tokens)
     record["omitted_signatures"] = coc.extract_signatures(
         "\n".join(blocks[pb["idx"]] for pb in per_block if pb.get("would_cut") is True)
     )
