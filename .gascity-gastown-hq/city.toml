@@ -16,9 +16,15 @@ ready_delay_ms = 0
 # Athos's 2026-08-30 policy stands (RC only for the Mayor and named crews): pool/autonomous roles
 # stay on claude-headless. Nothing here is keyed on the provider NAME — no script in the city
 # branches on `provider == "claude"`.
+# ga-n56ase: Athos, 2026-09-28 — "para todos crew members, o modelo default é Opus 5.5".
+# Pinned HERE with the claude CLI's own "opus" alias (latest Opus = Opus 5.5 today) instead of
+# relying on ~/.claude/settings.json's global model. NOT via option_defaults.model: the engine's
+# builtin "opus" choice maps to `--model claude-opus-4-8` (checked in gc-1.1.1-engwin0919), which
+# would silently DOWNGRADE every crew. claude-rc is used by the Mayor + the 10 named crews only;
+# the Mayor already ran Opus 5.5, so this is a no-op for it.
 [providers.claude-rc]
 base = "builtin:claude"
-args_append = ["--remote-control"]
+args_append = ["--remote-control", "--model", "opus"]
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
@@ -534,7 +540,8 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp-firecrawl"
 #           whose recall is the gate's whole value);
 #   high  — triage/refinement roles (refino and context-check reviewers,
 #           auto-refiner): Sonnet 5's own default, recommended for most work.
-# Crews keep their agent.toml "high". Suspended roles (boot, deacon) and the
+# Crews set their own effort in agent.toml: "medium" by Athos's mandate
+# (ga-n56ase, 2026-09-28 — Opus 5.5's own default). Suspended roles (boot, deacon) and the
 # unused per-rig witness/refinery/polecat are left alone on purpose.
 # Takes effect on each session's NEXT launch; the post-merge soft reload
 # (ga-hawi) keeps running sessions from being drained over the new hash.

@@ -15,13 +15,13 @@
 # (same convention as mcp-strict-headless-provider.selftest.sh — `gc config show` resolution
 # needs untracked local state such as .gc/site.toml that a clean checkout does not have):
 #   1. [providers.claude-rc] exists, is built on builtin:claude and adds --remote-control;
-#   2. it adds NOTHING else that changes behaviour (no MCP/model/settings flags);
+#   2. it adds exactly --remote-control + --model opus (ga-n56ase: crews run Opus 5.5), no MCP/settings/effort flags;
 #   3. peter-wa uses it, and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
 #      committed suspended=true -- the never-gets-a-bead dispatch-safety guarantee
 #      now lives independently in pilot-dispatcher.sh's _crew_is_suspended, see its
 #      own selftest Scenario 22e) leaves its session caps unchanged;
-#   4. RC did not leak: plain `claude` and `claude-headless` do not carry --remote-control,
-#      and no other agent uses claude-rc.
+#   4. RC did not leak: plain `claude` and `claude-headless` do not carry --remote-control, claude-rc
+#      users are exactly the named crews, and only gastown.mayor is patched onto it (ga-mrfgaw).
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,11 +53,13 @@ else
     && ok "claude-rc.args_append carries --remote-control" || bad "claude-rc.args_append is missing --remote-control"
 fi
 
-echo "── 2. claude-rc adds nothing else that changes behaviour ──"
-if args_of claude-rc | grep -E -- '--strict-mcp-config|--mcp-config|--model|--settings|remoteControlAtStartup|--effort|--dangerously' >/dev/null; then
-  bad "claude-rc.args_append carries a flag beyond --remote-control: $(args_of claude-rc)"
+echo "── 2. claude-rc adds only RC + the Opus pin (ga-n56ase), nothing else ──"
+# ga-n56ase (Athos 2026-09-28): crews run Opus 5.5 by mandate, pinned here with the CLI's own
+# "opus" alias. Exact match on purpose: a different model id, or any extra flag, fails.
+if [ "$(args_of claude-rc)" = 'args_append = ["--remote-control", "--model", "opus"]' ]; then
+  ok "claude-rc.args_append is exactly RC + --model opus (MCP surface, effort and permissions untouched)"
 else
-  ok "claude-rc.args_append is only the RC flag (Mayor/crew MCP surface, model and permissions untouched)"
+  bad "claude-rc.args_append is not exactly [--remote-control, --model, opus]: $(args_of claude-rc)"
 fi
 
 echo "── 3. peter-wa uses it and stays in its on-demand steady state (ga-3g2rjo) ──"
@@ -82,16 +84,21 @@ if args_of claude-headless | grep -- '--remote-control' >/dev/null; then
 else
   ok "claude-headless has no --remote-control (pool roles stay headless)"
 fi
+# ga-mrfgaw (Athos 2026-09-28): RC widened from peter-wa alone to the Mayor + ALL named crews.
+# Still an exact set, so a pool/autonomous role landing on claude-rc fails here.
+EXPECTED_RC_CREWS="batista-lx batista-ps batista-wa digo-wa mila-ma mila-wa oracle-wa peter-wa thies-ps thies-wa "
 users="$(grep -l '^provider = "claude-rc"$' "$AGENTS_DIR"/*/agent.toml 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null | sort | tr '\n' ' ' || true)"
-if [ "$(echo "$users" | tr -d ' ')" = "peter-wa" ]; then
-  ok "only peter-wa uses claude-rc"
+if [ "$users" = "$EXPECTED_RC_CREWS" ]; then
+  ok "claude-rc users are exactly the named crews"
 else
-  bad "unexpected claude-rc users: '${users:-none}'"
+  bad "unexpected claude-rc users: '${users:-none}' (expected '$EXPECTED_RC_CREWS')"
 fi
-if grep -q -E '^provider *= *"claude-rc"' "$CITY_TOML"; then
-  bad "city.toml patches an agent onto claude-rc — RC scope must be reviewed against the 2026-08-30 policy"
+# Which [[patches.agent]] blocks move an agent onto claude-rc: only gastown.mayor may.
+patched="$(awk '/^\[\[patches\.agent\]\]$/{n=""} /^\[/ && !/^\[\[patches\.agent\]\]$/{n=""} /^name = /{n=$3} /^provider *= *"claude-rc"/{print n}' "$CITY_TOML" | tr -d '"' | sort | tr '\n' ' ')"
+if [ "$patched" = "gastown.mayor " ]; then
+  ok "only gastown.mayor is patched onto claude-rc in city.toml"
 else
-  ok "no [[patches.agent]] moves another agent onto claude-rc"
+  bad "city.toml patches unexpected agents onto claude-rc: '${patched:-none}' — RC scope must be reviewed against the 2026-08-30 / 2026-09-28 policy"
 fi
 
 echo
