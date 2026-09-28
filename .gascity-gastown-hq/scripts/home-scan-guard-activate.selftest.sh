@@ -195,7 +195,7 @@ HOME_SCAN_GUARD_SCRIPT="relative/path.sh" bash "$ACTIVATE" "$FOK" >"$SCRATCH/o8"
 [ "$RC" -eq 1 ] && grep -q 'absolute' "$SCRATCH/o8" && ok "relative guard path refused" || bad "relative path: rc=$RC out=$(cat "$SCRATCH/o8")"
 HOME_SCAN_GUARD_SCRIPT="/tmp/it's/bad.sh" bash "$ACTIVATE" "$FOK" >"$SCRATCH/o8b" 2>&1; RC=$?
 [ "$RC" -eq 1 ] && grep -q 'single quote' "$SCRATCH/o8b" && ok "guard path with a single quote refused (it is embedded in single quotes)" || bad "quote path: rc=$RC out=$(cat "$SCRATCH/o8b")"
-mkdir -p "$SCRATCH/rigs/wa/crew/batista/.claude" "$SCRATCH/rigs/wa/crew/.claude" "$SCRATCH/rigs/wa/witness/.claude" "$SCRATCH/rigs/wa/refinery/.claude" "$SCRATCH/rigs/wa/polecats/x/.claude" "$SCRATCH/rigs/ps/crew/worker/.claude" "$SCRATCH/rigs/.gascity-gastown-hq/.claude"
+mkdir -p "$SCRATCH/rigs/wa/crew/batista/.claude" "$SCRATCH/rigs/wa/crew/.claude" "$SCRATCH/rigs/wa/witness/.claude" "$SCRATCH/rigs/wa/refinery/.claude" "$SCRATCH/rigs/wa/polecats/x/.claude" "$SCRATCH/rigs/ps/crew/worker/.claude" "$SCRATCH/rigs/.gascity-gastown-hq/.claude" "$SCRATCH/rigs/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude"
 for d in wa/crew/batista wa/crew wa/witness wa/refinery wa/polecats/x ps/crew/worker; do echo '{}' > "$SCRATCH/rigs/$d/.claude/settings.json"; done
 # ga-awsf9k: the one target that is NOT a per-workdir settings.json under a persistent crew/witness/refinery
 # dir -- the city-root .claude/settings.json, the OVERRIDE gc's own hooks.Install merges into .gc/settings.json
@@ -207,10 +207,14 @@ for d in wa/crew/batista wa/crew wa/witness wa/refinery wa/polecats/x ps/crew/wo
 # path was absent from every default TARGETS glob and CITY_SETTINGS did not exist, so N below was 5 and this
 # file stayed NOT-GUARDED forever -- the exact gap a wa-worker wisp hit running `find / -maxdepth 6 ...` unblocked.
 echo '{}' > "$SCRATCH/rigs/.gascity-gastown-hq/.claude/settings.json"
+# ga-9bgxwi: the pool BASE overlay -- see POOL_BASE_SETTINGS in the activation script. Present here so default
+# discovery picks it up too (N below includes it); case 8's earlier empty-discovery runs above never saw this
+# path, so this is the only place it needs a fixture.
+echo '{}' > "$SCRATCH/rigs/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json"
 bash "$ACTIVATE" >"$SCRATCH/o8c" 2>&1; RC=$?
 N="$(grep -c '^Registered' "$SCRATCH/o8c")"
-if [ "$RC" -eq 0 ] && [ "$N" = "6" ] && [ "$(ours "$SCRATCH/rigs/wa/crew/batista/.claude/settings.json")" = "1" ] && [ "$(ours "$SCRATCH/rigs/wa/polecats/x/.claude/settings.json")" = "0" ] && [ "$(ours "$SCRATCH/rigs/.gascity-gastown-hq/.claude/settings.json")" = "1" ]; then
-  ok "no args: discovers crew/*, crew, witness, refinery settings AND the city-root .claude/settings.json override (6), and nothing else"
+if [ "$RC" -eq 0 ] && [ "$N" = "7" ] && [ "$(ours "$SCRATCH/rigs/wa/crew/batista/.claude/settings.json")" = "1" ] && [ "$(ours "$SCRATCH/rigs/wa/polecats/x/.claude/settings.json")" = "0" ] && [ "$(ours "$SCRATCH/rigs/.gascity-gastown-hq/.claude/settings.json")" = "1" ] && [ "$(ours "$SCRATCH/rigs/.gascity-gastown-hq/packs/town-deltas/assets/claude-overlays/pool/.claude/settings.json")" = "1" ]; then
+  ok "no args: discovers crew/*, crew, witness, refinery settings, the city-root override AND the pool base overlay (7), and nothing else"
 else
   bad "default discovery: rc=$RC registered=$N out=$(cat "$SCRATCH/o8c")"
 fi
@@ -248,7 +252,10 @@ F9="$SCRATCH/cross.json"; echo '{}' > "$F9"
 env -u HOME_SCAN_GUARD_SCRIPT bash "$ACTIVATE" "$F9" >/dev/null 2>&1
 A="$(jq -cS '.hooks.PreToolUse[0]' "$F9" 2>/dev/null)"
 OVDIR="$HERE/../packs/town-deltas/assets/claude-overlays"
-for role in pool-dog pool-wa-worker pool-ps-worker pool-reviewer; do
+# ga-9bgxwi: "pool" (the BASE overlay) joins the per-role overlays here -- it carries the identical entry too now
+# (see POOL_BASE_SETTINGS in the activation script), so overlay-root-leak-guard.py's role-vs-base diff no longer
+# leaf-matches this hook against every role and misreads deliberate, universal registration as a role leak.
+for role in pool pool-dog pool-wa-worker pool-ps-worker pool-reviewer; do
   B="$(jq -cS '.hooks.PreToolUse[0]' "$OVDIR/$role/.claude/settings.json" 2>/dev/null)"
   if [ -n "$A" ] && [ "$A" != "null" ] && [ "$A" = "$B" ]; then
     ok "$role overlay's PreToolUse entry == what the activation script writes for a crew (byte for byte, key-sorted)"
