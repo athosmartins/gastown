@@ -55,7 +55,7 @@ Fluxo de conclusão:
    git -c user.name="$GC_ALIAS" -c user.email="${GC_ALIAS}@gascity.local" commit -m "<type>(<bead>): <descrição>"
    git push origin HEAD
    ```
-2. Rodar `/gate-done` para criar o marker no city DB (veja a skill `gate-done` pro fluxo completo — self-audit, verificação de push, criação do marker)
+2. Rodar `/gate-done` para criar o marker no city DB (veja a skill `gate-done` pro fluxo completo — self-audit, verificação de push, criação do marker). `/gate-done` é um SLASH COMMAND nativo (`commands/gate-done.md`), materializado na sua própria sessão — NÃO é um script em disco. Nunca rode `find`/`ls -R` tentando localizá-lo: se `/gate-done` não aparecer disponível, isso é sinal de que a sessão não tem o command materializado (bug a reportar, não um arquivo a caçar) — ver ga-awsf9k, uma sessão wisp que tentou `find / -maxdepth 6 -iname gate-done*` a partir da raiz.
 3. O launchd guard detecta o marker em ~2 min, despacha 3 revisores independentes e mergeia direto em main.
 4. Você receberá mail quando o gate passar ou falhar.
 

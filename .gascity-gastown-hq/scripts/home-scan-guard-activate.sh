@@ -51,15 +51,44 @@
 # USAGE: home-scan-guard-activate.sh [--check] [path-to-settings.json ...]
 #   no paths : every crew / witness / refinery settings.json that exists under
 #              ${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}   (the four globs at the bottom of this file -- there is no
-#              "worker" one: pool roles get the hook from their overlays, see pool-roles.json. Not covered by either:
-#              the Mayor, the deacon, boot, the long-lived overlays and any workdir that is neither -- the header of
-#              home-scan-guard.py lists them among the known gaps.)
+#              "worker" one: pool roles get the hook from their overlays, see pool-roles.json), PLUS the one city-root
+#              ${HOME_SCAN_GUARD_CITY_SETTINGS:-/Users/athos/gt/.gascity-gastown-hq/.claude/settings.json} (ga-awsf9k).
+#              THIS IS THE OVERRIDE INPUT, NOT THE DERIVED `.gc/settings.json` -- do not retarget this at
+#              `.gc/settings.json` again, that was tried and reverted within under a minute (28/09, see the bead).
+#              Read from gc's own source (internal/hooks/hooks.go desiredClaudeSettings/readClaudeSettingsOverride,
+#              engine-window-0926 worktree, gastownhall/gascity#2109's neighborhood): on every reconcile tick, for
+#              every workdir, gc rebuilds `.gc/settings.json` fresh as embedded-base MERGED with the highest-priority
+#              override it finds, and the FIRST candidate it checks -- ahead of the legacy hook file and ahead of
+#              `.gc/settings.json`'s own prior content -- is exactly `citylayout.ClaudeSettingsPath(cityDir)` ==
+#              `<cityDir>/.claude/settings.json` (internal/citylayout/layout.go). That file already exists here
+#              (created 26/09, carries remoteControlAtStartup/permissions.deny/env -- those three fields are proof
+#              this override path is live and load-bearing: they show up in the merged `.gc/settings.json` and are
+#              NOT in the embedded base). The merge itself (internal/overlay/merge.go MergeSettingsJSON) unions hook
+#              categories and merges entries by matcher identity -- same shape home-scan-guard-activate.sh's own
+#              JQ_APPLY below replicates for the crew/witness/refinery targets -- so writing our hook into THIS file
+#              the same way is stable: every reconcile tick re-reads it and re-merges it into `.gc/settings.json`,
+#              instead of `.gc/settings.json` being the thing edited (which that same tick then discards, since it
+#              is the OUTPUT of the merge, not an input to it). Registering the hook here reaches every session that
+#              is neither one of the four crew/witness/refinery globs nor a pool-role overlay: the Mayor, the deacon,
+#              boot, auto-refiner, context-check-reviewer, the long-lived overlays, and any ephemeral WISP a named
+#              crew spawns under a bare `<rig>/claude-headless` template (no [[patches.agent]] matches that name --
+#              confirmed via `gc config explain`, "claude-headless" is synthesized per rig from [providers.claude-
+#              headless] and is NOT a patchable agent identity, `patches.agent` on it errors "not found in merged
+#              config" -- so overlay_dir is not an available fix here either). Confirmed 27/09 16:21: a wa-worker
+#              wisp under this exact template ran `find / -maxdepth 6 -iname gate-done*` unblocked, see ga-awsf9k.
+#              home-scan-guard.py's own "KNOWN GAPS" list (WHO IS GUARDED) predates this fix.
 #   --check  : write nothing; print GUARDED / INERT / NOT-GUARDED per target; exit 1 if any is not GUARDED
 #   Idempotent. A target that cannot be processed (missing, unparseable) never stops the others;
 #   the exit status is 1 if any failed.
 set -uo pipefail
 
 RIGS_ROOT="${HOME_SCAN_GUARD_RIGS_ROOT:-/Users/athos/gt}"
+# Derived from RIGS_ROOT (not a bare absolute default): the real city root is $RIGS_ROOT/.gascity-gastown-hq, and
+# keeping this relationship means a sandboxed RIGS_ROOT (the selftest's $SCRATCH/rigs) naturally sandboxes this
+# target too -- it resolves to a path that does not exist there, so the `[ -f ]` guard below skips it, exactly
+# like every other target this script has never seen. HOME_SCAN_GUARD_CITY_SETTINGS overrides independently.
+# .claude/settings.json (NOT .gc/settings.json -- see the USAGE block above): the stable override input.
+CITY_SETTINGS="${HOME_SCAN_GUARD_CITY_SETTINGS:-$RIGS_ROOT/.gascity-gastown-hq/.claude/settings.json}"
 GUARD_PATH="${HOME_SCAN_GUARD_SCRIPT:-/Users/athos/gt/.gascity-gastown-hq/scripts/home-scan-guard.sh}"
 MARKER="home-scan-guard"
 ENTRY_MATCHER='^Bash$'
@@ -102,6 +131,12 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
     TARGETS+=("$f")
   done
   shopt -u nullglob
+  # ga-awsf9k: the city-root .claude/settings.json -- the override gc merges into .gc/settings.json on
+  # every reconcile tick, reaching every session in the city -- see the USAGE block above. Added only if
+  # present: a city this script has never seen (different RIGS_ROOT, no city checkout there yet, or one
+  # whose city root has no override file at all yet -- absence is not an error, it just means "nothing to
+  # add hooks to here today") must not turn into a FATAL below.
+  [ -f "$CITY_SETTINGS" ] && TARGETS+=("$CITY_SETTINGS")
 fi
 if [ "${#TARGETS[@]}" -eq 0 ]; then
   echo "FATAL: no settings.json targets found under $RIGS_ROOT" >&2
