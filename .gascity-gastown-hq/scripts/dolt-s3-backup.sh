@@ -618,7 +618,7 @@ _report_s3_state_only() {
 # and the next completed sync makes them part of the manifest or leaves them as orphans).
 #
 # Deliberately NOT used after _sync_with_stale_manifest_recovery's refusals: that path wipes
-# the staging (rm -rf) before retrying, so there is no valid staging left to mirror.
+# the staging (rm -rf) before the offline sync, so there is no valid staging left to mirror.
 #
 # Same return contract as _mirror_staging_after_disk_refusal: 0 iff S3 is proven restorable
 # (and, when the staging was mirrored, identical to it). Never touches the ok/failed counters.
@@ -678,37 +678,42 @@ _sync_with_connection_timeout_retry() {
 # _sync_with_stale_manifest_recovery <db> <dest> — called after an initial
 # sync attempt already failed with is_stale_manifest_error. Wipes the local
 # staging dir (structural corruption per is_stale_manifest_error's own header
-# — safely regenerable, never touches live .beads/dolt or S3) and retries
-# ONCE via the server.
+# — safely regenerable, never touches live .beads/dolt or S3) and goes
+# STRAIGHT to the server-free _offline_backup_sync.
 #
-# ga-yct7r1: that server-mediated retry is PREDICTABLE to fail for the SAME
-# structural reason the offline path exists for — a live server holds a
-# cached view of the staging dir that was just wiped out from under it. That
-# made this the one branch most likely to need the offline fallback and, until
-# this fix, the one branch that didn't have it (the sibling
-# is_connection_timeout_error branch already falls back to
-# _offline_backup_sync below). So, same invariant as that branch: only count
-# this db as failed if BOTH the reinit-retry AND the offline fallback fail.
-# Returns 0 on either recovery path succeeding; returns 1 (having logged the
-# FAILED tripwire dolt-compact-routine.sh's precondition greps for) otherwise.
+# ga-cnrr3a: this used to retry ONCE via the server first (ga-yct7r1 then added
+# the offline fallback behind that retry). The retry is PREDICTABLE to fail for
+# the same structural reason the offline path exists for — a live server holds a
+# cached view of the staging dir that was just wiped out from under it — and it
+# is not free: MEASURED 2026-09-28 18:01-18:02, hq: the retry failed with 'table
+# file not found' (a different hash than the first attempt) after writing ~6.2GB
+# into the fresh staging, which took the free space from ~16GB to ~10GB, and the
+# offline fallback's own preflight (needs 13.5GB) then refused. The result: hq had
+# no off-site backup from 2026-09-27 07:40Z on, and the nightly would have
+# repeated the same sequence. The retry has also never once been the path that
+# recovered (the log's 'auto-recover OK after staging reinit' count was 0; every
+# earlier stale-manifest recovery ended in 'offline-sync fallback OK'), so
+# dropping it costs no recovery that was actually happening. Without it the space
+# after the reinit is what the offline preflight below is checked against.
+#
+# Only this branch changes — the connection-timeout branch keeps its retries and
+# its own offline fallback (its staging is healthy; the retries can succeed).
+#
+# The disk preflight below is the only gate and it fails closed: a refusal, or a
+# live size / free-space number that cannot be measured, returns 1 with the
+# tripwire logged and runs NOTHING — neither the sync nor the offline copy is
+# started on a guess. Returns 0 on the offline sync succeeding; returns 1 (having
+# logged the FAILED tripwire dolt-compact-routine.sh's precondition greps for)
+# otherwise.
 _sync_with_stale_manifest_recovery() {
   local db="$1" dest="$2"
-  log "$db: stale-manifest staging detected — auto-reinit ${dest} and retry once"
+  log "$db: stale-manifest staging detected — auto-reinit ${dest} and go straight to offline sync (no server retry — ga-cnrr3a)"
   case "$dest" in
     "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
     *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
   esac
   if ! _sync_disk_preflight "$db"; then
     log "$db: DOLT_BACKUP sync FAILED (disk preflight refused after stale-manifest reinit)"
-    return 1
-  fi
-  if _sync_once "$db" >> "$LOG" 2>&1; then
-    log "$db: auto-recover OK after staging reinit"
-    return 0
-  fi
-  log "$db: stale-manifest retry FAILED — falling back to offline sync (no server involved)"
-  if ! _sync_disk_preflight "$db"; then
-    log "$db: DOLT_BACKUP sync FAILED (disk preflight refused before offline fallback)"
     return 1
   fi
   if _offline_backup_sync "$db" "$dest"; then

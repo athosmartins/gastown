@@ -210,46 +210,48 @@ else
   bad "no call site matches the expected '_sync_disk_preflight' guard shape"
 fi
 callsites="$(grep -cF '_sync_disk_preflight "$db"' "$SCRIPT")"
-[ "$callsites" -eq 5 ] \
-  && ok "exactly 5 occurrences of _sync_disk_preflight \"\$db\" (1 in the main loop's initial attempt, 1 in the main loop's offline-fallback-after-timeout branch, 1 in the connection-timeout retry loop, 2 in stale-manifest recovery — retry + its own offline fallback)" \
-  || bad "expected exactly 5 occurrences of _sync_disk_preflight \"\$db\" (def excluded — this counts call sites only), got $callsites — a guard was added, removed, or a call site's db var name drifted"
+[ "$callsites" -eq 4 ] \
+  && ok "exactly 4 occurrences of _sync_disk_preflight \"\$db\" (1 in the main loop's initial attempt, 1 in the main loop's offline-fallback-after-timeout branch, 1 in the connection-timeout retry loop, 1 in stale-manifest recovery — the gate before its direct offline sync, ga-cnrr3a)" \
+  || bad "expected exactly 4 occurrences of _sync_disk_preflight \"\$db\" (def excluded — this counts call sites only), got $callsites — a guard was added, removed, or a call site's db var name drifted"
 if grep -qF 'FAILED_DBS="$FAILED_DBS ${db}(disco)"' "$SCRIPT"; then
   ok "main-loop disk refusals are counted with a distinct (disco) marker, same pattern as (sync)/(s3)"
 else
   bad "main-loop disk refusals are not counted with the expected (disco) marker — 'CONTADA' (Mayor's ga-odtd3f requirement) would silently regress"
 fi
 
-# ── _sync_with_stale_manifest_recovery() (ga-yct7r1) — exercised live with a
-# simulated-failure stub (not just a drift-guard grep): the OLD code physically
-# could not pass scenario B below (it had no offline fallback at all, and
-# counted the db as failed the moment the reinit-retry failed) — this proves
-# the fallback is real, not just declared. Real dolt/network are NEVER called:
-# $DOLT is pointed at a fake stub binary, and _offline_backup_sync is shadowed
-# by a controllable stub (its own behavior is covered by
-# dolt-offline-backup-sync.selftest.sh — here we only need to prove this
-# function calls it correctly and reacts to its result).
-echo "── _sync_with_stale_manifest_recovery() (ga-yct7r1) — simulated-failure test ──"
+# ── _sync_with_stale_manifest_recovery() (ga-yct7r1, reshaped by ga-cnrr3a) — exercised
+# live with a simulated-failure stub (not just a drift-guard grep). ga-cnrr3a: after the
+# reinit the function goes STRAIGHT to the offline sync and must never call the server
+# (_sync_once) again. MEASURED 2026-09-28 18:01-18:02, hq: that server retry failed with
+# 'table file not found' after writing ~6.2GB into the fresh staging, which is what made
+# the offline fallback's own disk preflight refuse (free 10175MB < needs 13467MB) — and
+# left hq with no off-site backup. Real dolt/network are NEVER called: $DOLT is pointed at
+# a fake stub that only records it was invoked (and would fail with the stale-manifest
+# signature), and _offline_backup_sync is shadowed by a controllable stub (its own
+# behavior is covered by dolt-offline-backup-sync.selftest.sh — here we only need to prove
+# this function calls it correctly and reacts to its result).
+echo "── _sync_with_stale_manifest_recovery() (ga-yct7r1 / ga-cnrr3a) — simulated-failure test ──"
 
 type _sync_with_stale_manifest_recovery >/dev/null 2>&1 \
   && ok "_sync_with_stale_manifest_recovery defined by lib-mode source" \
   || { bad "_sync_with_stale_manifest_recovery NOT defined — lib mode broken"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
 
 SMR_STUB_DIR="$(mktemp -d)"
-SMR_DOLT_COUNT_FILE="$(mktemp)"
+# Exported: the fake dolt below runs as a child process and writes its call counter here.
+# Unexported, it saw an empty path, never wrote the counter, and every "the server was
+# never called" assertion in this block passed vacuously — including at the pre-ga-cnrr3a HEAD.
+export SMR_DOLT_COUNT_FILE="$(mktemp)"
 SMR_LOG="$(mktemp)"
 SMR_DEST_PARENT="$(mktemp -d)"
 SMR_DEST="$SMR_DEST_PARENT/testdb"
+SMR_CITY="$(mktemp -d)"
 
 cat > "$SMR_STUB_DIR/dolt" <<'STUB'
 #!/bin/bash
-# Fake `dolt`: the reinit-retry attempt. Fails with the stale-manifest
-# signature unless SMR_STUB_RETRY_OK=1.
+# Fake `dolt`: any call means the server-mediated retry ran. It fails with the
+# stale-manifest signature, exactly like the hq incident.
 n=$(( $(cat "$SMR_DOLT_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$SMR_DOLT_COUNT_FILE"
-if [ "${SMR_STUB_RETRY_OK:-0}" = "1" ]; then
-  echo "ok"
-  exit 0
-fi
 echo "error opening table file: table file not found: /fake/path"
 exit 1
 STUB
@@ -262,79 +264,79 @@ _offline_backup_sync() {
   printf '%s %s\n' "$1" "$2" >> "$SMR_OFFLINE_CALLS"
   [ "${SMR_STUB_OFFLINE_OK:-0}" = "1" ]
 }
-# Shadow the new disk preflight (ga-odtd3f) too — these scenarios exercise
-# the stale-manifest retry/fallback CONTROL FLOW, not disk math (which gets
-# its own dedicated hermetic tests below). Defaults to "disk OK" so
-# scenarios A-C keep testing exactly what they tested before this gate
-# existed; scenario D below flips it to prove the gate itself stops this
-# function cold instead of writing into a disk already proven insufficient.
-_sync_disk_preflight() { [ "${SMR_STUB_DISK_OK:-1}" = "1" ]; }
+# Keep the REAL disk gate reachable under another name (scenario F runs it against
+# unmeasurable disk numbers), then shadow _sync_disk_preflight. The shadow models the
+# incident: while the server has not been touched the disk is as SMR_STUB_DISK_OK says;
+# once the fake dolt has run (the ~6GB the server retry wrote on hq), the gate refuses —
+# so a function that still retries via the server first cannot reach the offline sync.
+eval "_smr_real_sync_disk_preflight() $(declare -f _sync_disk_preflight | sed '1d')"
+_sync_disk_preflight() {
+  if [ "${SMR_REAL_PREFLIGHT:-0}" = "1" ]; then _smr_real_sync_disk_preflight "$@"; return $?; fi
+  [ "$(cat "$SMR_DOLT_COUNT_FILE" 2>/dev/null || echo 0)" != "0" ] && return 1
+  [ "${SMR_STUB_DISK_OK:-1}" = "1" ]
+}
 
 _run_smr_scenario() {
-  # <retry_ok> <offline_ok> <label> [<disk_ok>]
-  local retry_ok="$1" offline_ok="$2" label="$3" disk_ok="${4:-1}"
+  # <offline_ok> <label> [<disk_ok>] [<real_preflight>]
+  local offline_ok="$1" label="$2" disk_ok="${3:-1}" real_pf="${4:-0}"
   echo "  -- scenario: $label --"
   rm -rf "$SMR_DEST"; mkdir -p "$SMR_DEST"; touch "$SMR_DEST/marker"
   echo 0 > "$SMR_DOLT_COUNT_FILE"
   : > "$SMR_LOG"; : > "$SMR_OFFLINE_CALLS"
-  DOLT="$SMR_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$SMR_LOG" BACKUP_ROOT="$SMR_DEST_PARENT" \
-    SMR_STUB_RETRY_OK="$retry_ok" SMR_STUB_OFFLINE_OK="$offline_ok" SMR_STUB_DISK_OK="$disk_ok" \
+  DOLT="$SMR_STUB_DIR/dolt" HOST=127.0.0.1 PORT=0 LOG="$SMR_LOG" BACKUP_ROOT="$SMR_DEST_PARENT" CITY="$SMR_CITY" \
+    SMR_STUB_OFFLINE_OK="$offline_ok" SMR_STUB_DISK_OK="$disk_ok" SMR_REAL_PREFLIGHT="$real_pf" \
     _sync_with_stale_manifest_recovery "testdb" "$SMR_DEST"
 }
 
-# Scenario A: reinit-retry succeeds → offline fallback never invoked.
-if _run_smr_scenario 1 0 "reinit-retry succeeds"; then
-  ok "scenario A (retry succeeds): returns success"
+# Scenario A (the hq incident, ga-cnrr3a): the offline sync is reached only if the server
+# is NOT written to first. Any server call flips the disk gate to "refuse" (see the shadow
+# above), so at the old HEAD — which retried via the server before the offline sync — this
+# returned failure with the dolt stub invoked once; now it succeeds with zero server calls.
+if _run_smr_scenario 1 "reinit, then straight to the offline sync (server retry would eat the disk)"; then
+  ok "scenario A (direct offline): returns success"
 else
-  bad "scenario A (retry succeeds): should have returned success"
+  bad "scenario A (direct offline): should have returned success — the server retry before the offline sync is the ga-cnrr3a bug"
 fi
+[ "$(cat "$SMR_DOLT_COUNT_FILE")" = "0" ] \
+  && ok "scenario A: the server (_sync_once) was NEVER called after the reinit" \
+  || bad "scenario A: the server retry ran ($(cat "$SMR_DOLT_COUNT_FILE") call(s)) — it writes ~6GB and fails 'table file not found' (ga-cnrr3a)"
+[ "$(cat "$SMR_OFFLINE_CALLS")" = "testdb $SMR_DEST" ] \
+  && ok "scenario A: offline sync invoked exactly once with the correct db + dest" \
+  || bad "scenario A: offline sync invoked with unexpected args/count: $(cat "$SMR_OFFLINE_CALLS")"
+grep -qF "go straight to offline sync" "$SMR_LOG" \
+  && ok "scenario A: logged that it went straight to the offline sync" || bad "scenario A: missing the straight-to-offline log line"
+grep -qF "offline-sync fallback OK" "$SMR_LOG" \
+  && ok "scenario A: logged offline-sync fallback OK" || bad "scenario A: missing the offline-sync fallback OK log line"
 grep -qF "auto-recover OK after staging reinit" "$SMR_LOG" \
-  && ok "scenario A: logged the auto-recover OK line" || bad "scenario A: missing auto-recover OK log line"
-[ -s "$SMR_OFFLINE_CALLS" ] \
-  && bad "scenario A: offline fallback should NOT be invoked when the retry itself succeeds" \
-  || ok "scenario A: offline fallback correctly not invoked"
+  && bad "scenario A: the server-retry success line must be gone" || ok "scenario A: no server-retry success line"
+grep -qF "DOLT_BACKUP sync FAILED" "$SMR_LOG" \
+  && bad "scenario A: must NOT log a FAILED tripwire — it succeeded via the offline sync" \
+  || ok "scenario A: no FAILED tripwire logged on success"
 [ ! -e "$SMR_DEST/marker" ] \
-  && ok "scenario A: staging dir was wiped before the retry (auto-reinit ran)" \
+  && ok "scenario A: staging dir was wiped before the offline sync (auto-reinit ran)" \
   || bad "scenario A: staging dir marker survived — auto-reinit did not run"
 
-# Scenario B (the bug ga-yct7r1 closes): reinit-retry fails, offline fallback
-# succeeds → the round finishes OK via the fallback, with BOTH log lines the
-# bug's invariant (b) requires (which path failed, which path saved it).
-if _run_smr_scenario 0 1 "retry fails, offline fallback succeeds"; then
-  ok "scenario B (offline fallback succeeds): returns success — proves the fallback this bug was missing"
+# Scenario C: the offline sync fails → counts as failed, fail-closed with the FAILED
+# tripwire logged (invariant c: never a silent OK) — and still no server call.
+if _run_smr_scenario 0 "offline sync fails"; then
+  bad "scenario C (offline fails): should have returned failure"
 else
-  bad "scenario B (offline fallback succeeds): should have returned success"
-fi
-grep -qF "stale-manifest retry FAILED — falling back to offline sync (no server involved)" "$SMR_LOG" \
-  && ok "scenario B: logged which path was attempted (falling back)" || bad "scenario B: missing the falling-back log line"
-grep -qF "offline-sync fallback OK" "$SMR_LOG" \
-  && ok "scenario B: logged offline-sync fallback OK" || bad "scenario B: missing the offline-sync fallback OK log line"
-[ "$(cat "$SMR_OFFLINE_CALLS")" = "testdb $SMR_DEST" ] \
-  && ok "scenario B: offline fallback invoked with the correct db + dest" \
-  || bad "scenario B: offline fallback invoked with unexpected args: $(cat "$SMR_OFFLINE_CALLS")"
-grep -qF "DOLT_BACKUP sync FAILED" "$SMR_LOG" \
-  && bad "scenario B: must NOT log a FAILED tripwire — it eventually succeeded via the fallback" \
-  || ok "scenario B: no FAILED tripwire logged on eventual success"
-
-# Scenario C: reinit-retry AND offline fallback both fail → counts as failed,
-# fail-closed with the FAILED tripwire logged (invariant c: never a silent OK).
-if _run_smr_scenario 0 0 "retry fails, offline fallback also fails"; then
-  bad "scenario C (both fail): should have returned failure"
-else
-  ok "scenario C (both fail): returns failure"
+  ok "scenario C (offline fails): returns failure"
 fi
 grep -qF "DOLT_BACKUP sync FAILED (after stale-manifest recovery)" "$SMR_LOG" \
   && ok "scenario C: logged the FAILED tripwire" || bad "scenario C: missing the FAILED tripwire line"
 grep -qF "offline-sync fallback OK" "$SMR_LOG" \
   && bad "scenario C: must NOT log a false offline-sync fallback OK line" \
-  || ok "scenario C: no false success line when the offline fallback also failed"
+  || ok "scenario C: no false success line when the offline sync failed"
+[ "$(cat "$SMR_DOLT_COUNT_FILE")" = "0" ] \
+  && ok "scenario C: the server was not called as a second chance either" \
+  || bad "scenario C: the server was called after the offline sync failed"
 
-# Scenario D (ga-odtd3f): disk preflight refuses right after the rm -rf
-# reinit — must fail immediately, must NOT attempt the retry OR the offline
-# fallback (both would write into a disk already proven insufficient). Both
-# retry_ok and offline_ok are set to 1 (would succeed if attempted) so a
-# pass here can only mean the disk gate stopped things BEFORE either ran.
-if _run_smr_scenario 1 1 "disk preflight refuses after reinit" 0; then
+# Scenario D (ga-odtd3f): the disk gate refuses right after the reinit — must fail
+# immediately and run NEITHER the server NOR the offline sync (either would write into a
+# disk already proven insufficient). offline_ok=1 (would succeed if attempted) so a pass
+# here can only mean the gate stopped things BEFORE the offline sync ran.
+if _run_smr_scenario 1 "disk preflight refuses after reinit" 0; then
   bad "scenario D (disk refuses): should have returned failure"
 else
   ok "scenario D (disk refuses): returns failure"
@@ -342,14 +344,66 @@ fi
 grep -qF "DOLT_BACKUP sync FAILED (disk preflight refused after stale-manifest reinit)" "$SMR_LOG" \
   && ok "scenario D: logged the disk-preflight-refused tripwire" || bad "scenario D: missing the disk-preflight-refused tripwire line"
 [ "$(cat "$SMR_DOLT_COUNT_FILE")" = "0" ] \
-  && ok "scenario D: the reinit retry (_sync_once) was never attempted" \
+  && ok "scenario D: the server (_sync_once) was never attempted" \
   || bad "scenario D: _sync_once was called despite the disk preflight refusing first"
 [ -s "$SMR_OFFLINE_CALLS" ] \
-  && bad "scenario D: offline fallback should NOT be invoked when disk preflight already refused" \
-  || ok "scenario D: offline fallback correctly not invoked"
+  && bad "scenario D: offline sync should NOT be invoked when the disk preflight already refused" \
+  || ok "scenario D: offline sync correctly not invoked"
 
-unset -f _offline_backup_sync _sync_disk_preflight
-rm -rf "$SMR_STUB_DIR" "$SMR_DEST_PARENT" 2>/dev/null || true
+# Scenario F (ga-cnrr3a, "indeterminate → does not run"): the REAL gate, fed a number it
+# cannot measure, refuses (fail-closed) — and the recovery must then run nothing, exactly
+# like a plain refusal. offline_ok=1 again, so only the gate can be why it did not run.
+# Shadows du/df as plain functions like the _sync_disk_preflight tests above.
+du() { return 0; }                       # no output → the live db size is unreadable
+if _run_smr_scenario 1 "real gate, live db size unreadable" 1 1; then
+  bad "scenario F1 (size unreadable): should have returned failure — an unmeasurable disk must not run the offline sync"
+else
+  ok "scenario F1 (size unreadable): returns failure"
+fi
+grep -qF "could not measure live db size" "$SMR_LOG" \
+  && ok "scenario F1: the real gate logged the fail-closed reason" || bad "scenario F1: missing the fail-closed reason from the real gate"
+[ -s "$SMR_OFFLINE_CALLS" ] \
+  && bad "scenario F1: offline sync ran although the disk could not be measured" \
+  || ok "scenario F1: offline sync did not run"
+[ "$(cat "$SMR_DOLT_COUNT_FILE")" = "0" ] \
+  && ok "scenario F1: the server was not called either" || bad "scenario F1: the server was called although the disk could not be measured"
+unset -f du
+du() {
+  if [ "$2" = "$SMR_CITY/.beads/dolt/testdb" ]; then printf '%s\t%s\n' 1048576 "$2"; else command du "$@"; fi
+}
+df() {
+  if [ "$2" = "/System/Volumes/Data" ]; then
+    printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted\n'
+    printf '/dev/x 1 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' ""
+  else
+    command df "$@"
+  fi
+}
+if _run_smr_scenario 1 "real gate, free space unreadable" 1 1; then
+  bad "scenario F2 (free space unreadable): should have returned failure"
+else
+  ok "scenario F2 (free space unreadable): returns failure"
+fi
+grep -qF "could not measure free disk space" "$SMR_LOG" \
+  && ok "scenario F2: the real gate logged the fail-closed reason" || bad "scenario F2: missing the fail-closed reason from the real gate"
+[ -s "$SMR_OFFLINE_CALLS" ] \
+  && bad "scenario F2: offline sync ran although the free space could not be measured" \
+  || ok "scenario F2: offline sync did not run"
+unset -f du df
+
+# Drift guard: the recovery function must not reference the server call at all any more —
+# that is the class of the bug (a write-heavy retry between the reinit and the offline
+# sync), not just the one call the incident happened to hit.
+SM_FN_BODY="$(awk '/^_sync_with_stale_manifest_recovery\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
+printf '%s\n' "$SM_FN_BODY" | grep -qE '_sync_once|CALL DOLT_BACKUP|"\$DOLT"' \
+  && bad "_sync_with_stale_manifest_recovery references a server-mediated sync again — ga-cnrr3a's direct-to-offline contract regressed" \
+  || ok "_sync_with_stale_manifest_recovery has no server-mediated sync call (direct-to-offline, ga-cnrr3a)"
+printf '%s\n' "$SM_FN_BODY" | grep -qF '_offline_backup_sync "$db" "$dest"' \
+  && ok "_sync_with_stale_manifest_recovery still calls _offline_backup_sync" \
+  || bad "_sync_with_stale_manifest_recovery no longer calls _offline_backup_sync — it would have no recovery at all"
+
+unset -f _offline_backup_sync _sync_disk_preflight _smr_real_sync_disk_preflight
+rm -rf "$SMR_STUB_DIR" "$SMR_DEST_PARENT" "$SMR_CITY" 2>/dev/null || true
 rm -f "$SMR_DOLT_COUNT_FILE" "$SMR_LOG" "$SMR_OFFLINE_CALLS" 2>/dev/null || true
 
 # ── is_connection_timeout_error() — ga-gdsq5 transient-timeout retry mitigation ──
