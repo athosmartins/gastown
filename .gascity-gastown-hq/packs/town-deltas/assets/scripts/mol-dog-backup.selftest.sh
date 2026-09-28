@@ -360,9 +360,14 @@ else
   ok "no-manifest + 1KB (fresh bootstrap staging) is correctly NOT broken residue"
 fi
 if lib_call staging_broken_residue no-manifest ""; then
-  bad "no-manifest + unmeasurable size was classified as broken residue — must fail OPEN on an unmeasurable size (same convention as dolt-backup-reseed.sh's OLD_DIR_KB)"
+  ok "no-manifest + unmeasurable size IS broken residue — fails toward the inert action (skip the write) when the size cannot be read, never toward proceeding"
 else
-  ok "no-manifest + unmeasurable size is correctly NOT broken residue (fail-open on size, matches reseed.sh's own convention)"
+  bad "no-manifest + unmeasurable size was NOT classified as broken residue — an unmeasurable read collapsed into 'safe to write', the third-state bug this fix exists to catch"
+fi
+if lib_call staging_broken_residue no-manifest "abc"; then
+  ok "no-manifest + non-numeric size IS broken residue (same fail-toward-inert rule as an empty size)"
+else
+  bad "no-manifest + non-numeric size was NOT classified as broken residue"
 fi
 for st in has-manifest no-dir unknown ""; do
   if lib_call staging_broken_residue "$st" 200000; then

@@ -278,17 +278,31 @@ is_fallback_eligible_failure() {
 #
 # A FRESH/near-empty no-manifest staging (dest_kb below the floor — the normal
 # first-ever-sync bootstrap state) is NOT broken residue and must still be
-# written; only a floor-crossing amount of unmanifested content counts. An
-# unmeasurable dest_kb is treated as 0/not-broken — the same fail-open-on-size
-# convention dolt-backup-reseed.sh's own OLD_DIR_KB/OLD_KB_NOW already use — so a
-# transient `du` failure skips this refusal rather than freezing the job.
+# written; only a floor-crossing amount of unmanifested content counts.
+#
+# An UNMEASURABLE dest_kb (du failed — empty or non-numeric) is treated as
+# BROKEN (refuse to write), not the reverse. This is deliberately the
+# opposite direction from dolt-backup-reseed.sh's own OLD_DIR_KB/OLD_KB_NOW
+# convention: there, an unmeasurable size feeds a SUM (free + old) used to
+# decide whether there's enough room to proceed, so folding it to 0 makes
+# that sum SMALLER and biases toward refusing — the safe direction in that
+# context. Here, folding an unmeasurable size to "not broken" would bias
+# toward the OPPOSITE outcome: proceeding to WRITE when we can't even tell
+# how much unmanifested content is already sitting there. The write is the
+# mutating action this whole function exists to gate; per this codebase's
+# own third-state rule, "don't know" must default to the inert action
+# (skip), never silently collapse into the same outcome as "known safe."
+staging_broken_residue_size_ok() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 STAGING_BROKEN_RESIDUE_FLOOR_KB="${MOL_DOG_BACKUP_BROKEN_RESIDUE_FLOOR_KB:-102400}"
 staging_broken_residue() {
     local dest_state="$1" dest_kb="$2"
     [ "$dest_state" = "no-manifest" ] || return 1
-    case "$dest_kb" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
+    staging_broken_residue_size_ok "$dest_kb" || return 0
     [ "$dest_kb" -ge "$STAGING_BROKEN_RESIDUE_FLOOR_KB" ]
 }
 
