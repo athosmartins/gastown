@@ -111,11 +111,15 @@ def format_report(stats: dict) -> str:
 
 def format_resumo_pt(stats: dict) -> str:
     fixed = stats["cut-output-fixed"]["count"]
+    fixed_unknown = stats["cut-output-fixed"]["unknown_count"]
     jev = stats["cut-output-jev"]["count"]
     j = stats["joins"]
     rate_str = f"{j['referenced_rate']*100:.1f}%" if j["referenced_rate"] is not None else "sem dado"
+    # cases the fixed rule could not read count as observed, but they cut nothing -- say so instead
+    # of letting "N via regra fixa" read as N cuts
+    fixed_note = f" ({fixed_unknown} sem corte: formato não reconhecido)" if fixed_unknown else ""
     return (
-        f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa, "
+        f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa{fixed_note}, "
         f"{jev} via Jev. Join offline: {j['total']} conferido(s), taxa de 'precisou depois' = {rate_str} "
         f"(teto esperado do bead: ~8%)."
     )
@@ -193,6 +197,8 @@ def _selftest() -> int:
     ok("unknown records do not enter the tokens_would_save average", unk_stats["cut-output-fixed"]["tokens_would_save_known"] == 2)
     ok("format_report shows the unknown count", "2 unknown" in format_report(unk_stats))
     ok("format_report stays quiet about unknown when there are none", "unknown" not in format_report(stats).split("Offline join")[0])
+    ok("format_resumo_pt says how many fixed-rule cases could not be cut", "2 sem corte" in format_resumo_pt(unk_stats))
+    ok("format_resumo_pt stays quiet about 'sem corte' when there are none", "sem corte" not in format_resumo_pt(stats))
 
     empty_stats = compute_stats([])
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)

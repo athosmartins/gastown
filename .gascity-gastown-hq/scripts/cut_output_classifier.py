@@ -78,11 +78,17 @@ _PYTEST_SESSION_RE = re.compile(r"session starts", re.IGNORECASE)
 # cannot displace it. A pytest run whose last session has no such line after it is NOT cut at all
 # (classify_pytest returns rule "unknown"): a shape this regex misses degrades to "don't cut",
 # never to a guessed summary.
+# LINEAR on hostile lines: the "=" run must be followed by whitespace (`=+\s`), which fixes where
+# `=+` ends. Without it `=+` and the following `.*` can split a long "=====" line n ways and each
+# split rescans the line -- quadratic, tens of seconds on one 20k-char line inside a hook that runs
+# on every pool Bash call.
 _PYTEST_FINAL_SUMMARY_RE = re.compile(
-    r"^=+.*\bin\s+[\d.]+s(?:\s*\(\d+:\d{2}:\d{2}\))?\s*=+\s*$",
+    r"^=+\s.*\bin\s+[\d.]+s(?:\s*\(\d+:\d{2}:\d{2}\))?\s*=+\s*$",
     re.IGNORECASE,
 )
-_PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}.*_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE)  # matched per line
+# pytest's failure-section headers, matched per line: "=== FAILURES ===" and the per-test
+# "___ test_name ___". Same linearity rule as above (`_{5,}\s` pins where the underscore run ends).
+_PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}\s.*\s_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE)
 _PYTEST_SHORT_SUMMARY_RE = re.compile(r"short test summary info", re.IGNORECASE)
 
 
@@ -723,6 +729,34 @@ def _selftest() -> int:
         ok("rendered_text: stripping the markers leaves exactly kept_text",
            "".join(ln for ln in r_render["rendered_text"].splitlines(keepends=True) if not marker_line_re.match(ln.strip())) == r_render["kept_text"])
         ok("chars_after measures what the agent would see (rendered_text), markers included", r_render["chars_after"] == len(r_render["rendered_text"]))
+
+    # ---- ga-wk0qi2 full-diff sweep: the banner/header regexes must stay LINEAR on hostile lines.
+    # This runs in a PostToolUse hook on every pool Bash call; `^=+.*\bin...` had an ambiguous split
+    # between `=+` and `.*`, so a single very long '='/'_' line (a progress bar, a separator someone
+    # printed 100k wide) made matching quadratic -- tens of seconds of CPU stalling the agent's call
+    # until the wrapper's watchdog killed it. ----
+    import time as _time
+
+    def timed(fn, *args):
+        t0 = _time.monotonic()
+        result = fn(*args)
+        return result, _time.monotonic() - t0
+
+    hostile = (
+        "============ test session starts ============\n"
+        + "=" * 12000 + "x\n"
+        + "_" * 12000 + "x\n"
+        + "ordinary line\n"
+        + "============ 1 passed in 0.10s ============\n"
+    )
+    r_hostile, took = timed(classify_pytest, hostile)
+    ok(f"hostile 12k-char '='/'_' lines classify quickly (took {took:.2f}s, limit 2s)", took < 2.0)
+    ok("hostile lines: the real banner is still found and kept",
+       r_hostile is not None and r_hostile["rule"] == "pytest" and "1 passed in 0.10s" in r_hostile["kept_text"])
+    ok("hostile lines: a 12k '=' line is not mistaken for the summary banner", r_hostile is not None and "=" * 12000 not in r_hostile["kept_text"])
+    hostile_log = "\n".join(["start"] + ["=" * 12000 + "x"] * 3 + [f"noise {i}" for i in range(300)])
+    _, took_log = timed(classify_output, "cmd", hostile_log)
+    ok(f"hostile lines through classify_output stay fast (took {took_log:.2f}s, limit 2s)", took_log < 2.0)
 
     print(f"\ncut_output_classifier selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0

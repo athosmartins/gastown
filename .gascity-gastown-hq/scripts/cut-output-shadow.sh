@@ -16,8 +16,11 @@
 # number than cut_output_classifier.py's MIN_CHARS_TO_CONSIDER -- this is a SUPERSET prefilter
 # (same discipline as home-scan-guard.sh's prefilter/classifier split): if this wrapper skipped
 # python for something the classifier would have acted on, that measurement is silently lost.
-# A mismatch is safe in the direction of "this wrapper spawns python slightly more often than
-# strictly needed", never in the direction of hiding a case the classifier would have caught.
+# The size it compares is len(stdout) + len(stderr) plus the one newline the engine inserts
+# between them when stderr is non-empty -- i.e. exactly the length of the text the classifier
+# gates on -- so at the default thresholds nothing the classifier would have taken is skipped here.
+# (Only if someone RAISES this threshold above MIN_CHARS_TO_CONSIDER does the wrapper start hiding
+# cases; keep it the same or smaller.)
 set -u
 
 # ---- 0. kill switch (checked before anything else, including jq) -------------------------
@@ -46,9 +49,13 @@ tool=""; size=0; jq_ok=""
   IFS= read -r -d '' jq_ok
 } < <(printf '%s' "$input" | jq -j '
     (if type == "object" then . else {} end) as $h
+    | (($h.tool_response.stdout? // "") | if type == "string" then . else "" end | length) as $o
+    | (($h.tool_response.stderr? // "") | if type == "string" then . else "" end | length) as $e
     | ($h.tool_name | if type == "string" then . else "" end), "\u0000",
-      ((($h.tool_response.stdout? // "") | if type == "string" then . else "" end | length)
-       + (($h.tool_response.stderr? // "") | if type == "string" then . else "" end | length) | tostring), "\u0000",
+      # the classifier sees stdout + "\n" + stderr when stderr is non-empty (cut-output-shadow.py
+      # process()), so count that one joining newline here too -- otherwise a combined length of
+      # exactly MIN-1 would be skipped here although the classifier would have taken it.
+      (($o + $e + (if $e > 0 then 1 else 0 end)) | tostring), "\u0000",
       "ok", "\u0000"' 2>/dev/null)
 
 if [ "$jq_ok" != "ok" ] || [ "$tool" != "Bash" ]; then

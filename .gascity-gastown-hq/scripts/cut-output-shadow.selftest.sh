@@ -89,6 +89,20 @@ if [ -f "$MARKER" ]; then ok "large output: python WAS spawned (prefilter let it
 else bad "large output: python was never spawned (prefilter over-filtered)"; fi
 rm -f "$MARKER"
 
+# Boundary: cut-output-shadow.py's process() joins stdout and stderr with ONE extra "\n" whenever
+# stderr is non-empty, so the text the classifier gates on (len(text) >= 2000) is
+# len(stdout) + 1 + len(stderr). The wrapper is documented as a SUPERSET prefilter (it may spawn
+# python too often, never too rarely) -- at stdout 999 + stderr 1000 the classifier's text is 2000
+# chars and would be classified, so the wrapper must let it through.
+EDGE_OUT="$(python3 -c 'print("a" * 999, end="")')"
+EDGE_ERR="$(python3 -c 'print("b" * 1000, end="")')"
+EDGE="$(hook_json Bash "$EDGE_OUT" "$EDGE_ERR" 'noisy-tool')"
+rm -f "$MARKER"
+run "$EDGE" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
+if [ -f "$MARKER" ]; then ok "boundary: stdout 999 + stderr 1000 (classifier text = 2000 chars) -> python WAS spawned"
+else bad "boundary: stdout 999 + stderr 1000 was skipped by the prefilter, but the classifier would have taken it (superset violated)"; fi
+rm -f "$MARKER"
+
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
 echo "-- fail-open: every way the wrapper or classifier can misbehave still yields {} / rc 0 --"

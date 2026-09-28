@@ -55,6 +55,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -152,6 +153,14 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _entity_id(meta: dict) -> str:
+    """The record's join key: the real tool_use_id when the hook input had one, otherwise a fresh
+    unique id. A shared placeholder would make every id-less record collide on one key, so the first
+    join would mark all of them as already joined."""
+    tool_use_id = meta.get("tool_use_id")
+    return tool_use_id if tool_use_id else f"no-tool-use-id-{uuid.uuid4().hex[:12]}"
+
+
 def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
     """Pure. `verdict` is classify_output()'s return, which now carries its own POSITION-based
     `omitted_text` (never re-derived here by content-diffing kept_text against the original —
@@ -167,7 +176,7 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
         "ts": _now_iso(),
         "mode": "shadow",
         "experiment": EXPERIMENT_FIXED,
-        "entity_id": meta["tool_use_id"],
+        "entity_id": _entity_id(meta),
         "session_id": meta.get("session_id"),
         "transcript_path": meta.get("transcript_path"),
         "tool_use_id": meta.get("tool_use_id"),
@@ -190,7 +199,7 @@ def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: d
         "ts": _now_iso(),
         "mode": "shadow",
         "experiment": EXPERIMENT_JEV,
-        "entity_id": meta["tool_use_id"],
+        "entity_id": _entity_id(meta),
         "session_id": meta.get("session_id"),
         "transcript_path": meta.get("transcript_path"),
         "tool_use_id": meta.get("tool_use_id"),
@@ -260,10 +269,15 @@ def process(hook_input: dict) -> None:
         return
 
     command = hook_input.get("tool_input", {}).get("command", "") if isinstance(hook_input.get("tool_input"), dict) else ""
+    raw_tool_use_id = hook_input.get("tool_use_id")
+    tool_use_id = raw_tool_use_id if isinstance(raw_tool_use_id, str) and raw_tool_use_id else None
     meta = {
         "session_id": hook_input.get("session_id"),
         "transcript_path": hook_input.get("transcript_path"),
-        "tool_use_id": hook_input.get("tool_use_id") or "unknown",
+        # None (not knowing) when the hook input carries no usable id -- never a placeholder string:
+        # the offline join would go looking for that string in the transcript as if it were a real
+        # call id. Each record still gets its own entity_id (see _entity_id).
+        "tool_use_id": tool_use_id,
         "command": command,
     }
 
@@ -439,6 +453,28 @@ def _selftest() -> int:
             "process(): truncated pytest is logged as 'unknown' with no would-save number",
             unk_e2e["experiment"] == EXPERIMENT_FIXED and unk_e2e["rule"] == "unknown" and unk_e2e["tokens_would_save"] is None,
         )
+
+    # ---- ga-wk0qi2 full-diff sweep: a hook input WITHOUT a tool_use_id must not be logged under the
+    # literal string "unknown". The offline join would then search the transcript for the WORD
+    # "unknown" (found almost anywhere -> a wrong split point and a wrong referenced_later), and
+    # every id-less record would share one entity_id, so the first join would mark all of them as
+    # already joined. Not knowing the id is None, and each record still gets its own entity_id. ----
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("pytest case must not call Jev")):
+            for _ in range(2):
+                process({
+                    "tool_name": "Bash",
+                    "tool_response": {"stdout": all_pass_stdout, "stderr": ""},
+                    "transcript_path": "/tmp/t.jsonl",
+                    "tool_input": {"command": "pytest"},
+                })
+        idless = [json.loads(ln) for ln in log_path.read_text().splitlines()]
+        ok("id-less hook input: still logs one record per call", len(idless) == 2)
+        ok("id-less hook input: tool_use_id is None (not knowing), never the string 'unknown'", all(r["tool_use_id"] is None for r in idless))
+        ok("id-less hook input: entity_id is never the literal 'unknown'", all(r["entity_id"] != "unknown" for r in idless))
+        ok("id-less hook input: two records get DIFFERENT entity_ids", len({r["entity_id"] for r in idless}) == 2)
 
     # ---- build_jev_log_record: Jev ok, mixed relevant/irrelevant blocks ----
     blocks = ["irrelevant noise block", "relevant error block with a real path /tmp/x"]

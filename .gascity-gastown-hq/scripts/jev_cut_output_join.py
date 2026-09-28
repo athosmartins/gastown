@@ -350,9 +350,14 @@ def _selftest() -> int:
             # a valid shadow candidate but missing entity_id -- must be skipped here, not crash
             # r["entity_id"] later in select_candidates or rec["entity_id"] in run().
             {"mode": "shadow", "experiment": "cut-output-fixed", "omitted_signatures": ["s5"], "transcript_path": "/tmp/e", "tool_use_id": "tu-e", "ts": base_ts},
+            # a hook input that carried no tool_use_id is logged with tool_use_id=None (cut-output-
+            # shadow.py never invents a placeholder id): there is no call to locate in the transcript,
+            # so it must be skipped -- not joined by searching for some made-up id.
+            {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "no-tool-use-id-abc", "omitted_signatures": ["s6"], "transcript_path": "/tmp/f", "tool_use_id": None, "ts": base_ts},
         ]
         cands = select_candidates(recs2, since_hours=0, limit=10)
         cand_ids = {c["entity_id"] for c in cands}
+        ok("select_candidates: record with tool_use_id=None -> excluded (nothing to locate in the transcript)", "no-tool-use-id-abc" not in cand_ids)
         ok("select_candidates: e1 already joined -> excluded", "e1" not in cand_ids)
         ok("select_candidates: e2 has no signatures -> excluded", "e2" not in cand_ids)
         ok("select_candidates: e3 (unjoined, has signatures) -> included", "e3" in cand_ids)
