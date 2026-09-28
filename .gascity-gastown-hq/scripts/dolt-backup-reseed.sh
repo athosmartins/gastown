@@ -283,31 +283,52 @@ _s3_current_backup_verified() {
 }
 
 # _should_release_manifestless_primary <has_local_manifest:0|1> <s3_manifest_ok:0|1>
-#   <old_mtime> <run_epoch> <s3_closure_ok:0|1> → 0 (true) ONLY when ALL hold:
-#   the local primary has NO manifest (ga-qh8gkw rule #2 — this path NEVER
-#   touches a primary that already has one, whatever the other inputs say),
-#   the S3 manifest object for the db exists (a real head-object, not an
-#   inference), the S3 fingerprint's run is STRICTLY newer than the primary's
-#   own mtime (the same "generation" reasoning dolt-backup-residue-
-#   reclaim.sh's _should_release_residue already uses: proof the fingerprint
-#   describes a state captured after whatever process last wrote here, not
-#   before), and dolt-backup-s3-proof.sh's S3-ALONE closure proof
+#   <old_mtime> <run_epoch> <s3_closure_ok:0|1> <fp_status> → 0 (true) ONLY when
+#   ALL hold: the local primary has NO manifest (ga-qh8gkw rule #2 — this path
+#   NEVER touches a primary that already has one, whatever the other inputs
+#   say), the S3 manifest object for the db exists (a real head-object, not an
+#   inference), and dolt-backup-s3-proof.sh's S3-ALONE closure proof
 #   (_s3proof_s3_closure_ok) succeeded — i.e. S3 restores on its own, with NO
 #   dependency on a local manifest that does not exist (unlike
 #   _s3_current_backup_verified above, which requires _s3proof_local_closure_ok
 #   first and is therefore structurally unusable here — see ga-qh8gkw / the
 #   dog-3 diagnosis on ga-9626dq this closes).
 #
+# The remaining check — freshness — branches on <fp_status> (the state word
+# _fingerprint_db_state prints: "ok", "failed", "absent", "unrecognized",
+# "unreadable", or the caller's own "unfetched"):
+#   - fp_status = "ok" (or empty, for callers written before this parameter
+#     existed — ga-qh8gkw's original 5-arg shape): the S3 fingerprint's run
+#     must be STRICTLY newer than the primary's own mtime (the same
+#     "generation" reasoning dolt-backup-residue-reclaim.sh's
+#     _should_release_residue already uses: proof the fingerprint describes a
+#     state captured after whatever process last wrote here, not before).
+#   - fp_status = "failed" (ga-qaa1k7 — Mayor's decision, 28/09, on ga-qh8gkw):
+#     the freshness comparison is SKIPPED. A writer marking its OWN daily run
+#     "failed" (e.g. disk pressure) has no run_epoch to compare — but that
+#     tells us nothing about the S3 copy dolt-backup-s3-proof.sh just proved,
+#     live, closes on its own. A manifest-less primary already carries ZERO
+#     backup value; freeing it on a live S3-only proof never makes anything
+#     LESS recoverable than it already was, so a merely-failed writer run is
+#     not a reason to keep it. (Rule #2 above still applies unconditionally —
+#     has_manifest must be 0 — so this never touches a primary that would
+#     otherwise be spared for having its own valid manifest.)
+#   - any OTHER fp_status (absent/unrecognized/unreadable/unfetched): falls
+#     through to the same freshness check as "ok" — with no run_epoch to
+#     compare, that check fails closed exactly as it did before this fp_status
+#     parameter existed.
+#
 # Any empty/non-numeric/unset input fails CLOSED (ga-p5q3 family): "I could
 # not tell" must never produce the same action as "it is fine".
 _should_release_manifestless_primary() {
-  local has_manifest="${1-}" s3_manifest_ok="${2-}" old_mtime="${3-}" run_epoch="${4-}" s3_closure_ok="${5-}"
+  local has_manifest="${1-}" s3_manifest_ok="${2-}" old_mtime="${3-}" run_epoch="${4-}" s3_closure_ok="${5-}" fp_status="${6-}"
   [ "$has_manifest" = "0" ] || return 1
   [ "$s3_manifest_ok" = "1" ] || return 1
+  [ "$s3_closure_ok" = "1" ] || return 1
+  [ "$fp_status" = "failed" ] && return 0
   case "$old_mtime" in ''|*[!0-9]*) return 1 ;; esac
   case "$run_epoch" in ''|*[!0-9]*) return 1 ;; esac
   [ "$run_epoch" -gt "$old_mtime" ] || return 1
-  [ "$s3_closure_ok" = "1" ] || return 1
   return 0
 }
 
@@ -456,6 +477,14 @@ _publish_after_swap() {
 # (e.g. <db>.new already sits there as residue from an interrupted run —
 # Preflight 3 would refuse immediately).
 #
+# ga-qaa1k7 (continuation, Mayor's decision on ga-qh8gkw, 28/09): a
+# fingerprint that is merely "failed" (the daily writer refused, e.g. for
+# disk pressure — hq's own real case) has no run_epoch to compare, so the
+# freshness check above could never pass — yet the live S3-only closure
+# proof this function runs is a stronger, independent check that does not
+# depend on the writer at all. See _should_release_manifestless_primary's
+# own header for the exact fp_status branch this adds.
+#
 # ga-qh8gkw rule #2 (NEVER on a valid primary, NEVER on .new): the very first
 # check below is the local manifest — a primary WITH one is left alone,
 # unconditionally, regardless of what S3 says. This function only ever
@@ -518,9 +547,15 @@ _release_manifestless_primary() {
     closure_ok=1
   fi
 
-  if _should_release_manifestless_primary 0 "$manifest_ok" "$old_mtime" "${run_epoch:-}" "$closure_ok"; then
+  local fp_status="${fp_state%%$'\t'*}"
+
+  if _should_release_manifestless_primary 0 "$manifest_ok" "$old_mtime" "${run_epoch:-}" "$closure_ok" "$fp_status"; then
     local freed_size; freed_size="$(du -sh "$primary_dir" 2>/dev/null | awk '{print $1}')"
-    log "release-manifestless-primary '$db': PROVA S3-ONLY OK — manifest do S3 presente (head-object OK), fingerprint mais novo que a cópia local (run_epoch=${run_epoch} > mtime=${old_mtime}), S3 fecha sozinho (_s3proof_s3_closure_ok, sem depender de manifest local) — liberando a primária sem manifesto ($primary_dir, ~${freed_size:-?})"
+    if [ "$fp_status" = "failed" ]; then
+      log "release-manifestless-primary '$db': PROVA S3-ONLY OK (fingerprint marcado 'failed', last_ok=${fp_state#*$'\t'} — sem run_epoch para comparar frescor; ga-qaa1k7: dispensado quando a closure AO VIVO já prova sozinha) — manifest do S3 presente (head-object OK), S3 fecha sozinho (_s3proof_s3_closure_ok, sem depender de manifest local) — liberando a primária sem manifesto ($primary_dir, ~${freed_size:-?})"
+    else
+      log "release-manifestless-primary '$db': PROVA S3-ONLY OK — manifest do S3 presente (head-object OK), fingerprint mais novo que a cópia local (run_epoch=${run_epoch} > mtime=${old_mtime}), S3 fecha sozinho (_s3proof_s3_closure_ok, sem depender de manifest local) — liberando a primária sem manifesto ($primary_dir, ~${freed_size:-?})"
+    fi
     if [ "${RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN:-0}" = "1" ]; then
       log "release-manifestless-primary '$db': DRY-RUN — nada apagado (RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1)"
       return 0
@@ -546,7 +581,7 @@ _release_manifestless_primary() {
         ;;
     esac
   else
-    log "release-manifestless-primary '$db': SPARED — prova S3-only não estabelecida (manifest_ok=$manifest_ok run_epoch=${run_epoch:-none} old_mtime=$old_mtime closure_ok=$closure_ok fingerprint_state=${fp_state%%$'\t'*}) — nada foi apagado"
+    log "release-manifestless-primary '$db': SPARED — prova S3-only não estabelecida (manifest_ok=$manifest_ok run_epoch=${run_epoch:-none} old_mtime=$old_mtime closure_ok=$closure_ok fingerprint_state=${fp_status:-none}) — nada foi apagado"
     return 0
   fi
 

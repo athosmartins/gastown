@@ -307,6 +307,32 @@ _should_release_manifestless_primary 0 1 "$OLD" abc 1 \
   && bad "non-numeric run_epoch should fail closed" \
   || ok "non-numeric run_epoch → fails closed"
 
+# ga-qaa1k7: fp_status="failed" bypasses the freshness comparison (empty
+# run_epoch and all) as long as manifest_ok + closure_ok still hold — but
+# every OTHER gate (rule #2's has_manifest, s3_manifest_ok, s3_closure_ok)
+# still applies exactly as before.
+_should_release_manifestless_primary 0 1 "$OLD" "" 1 failed \
+  && ok "fp_status=failed + closure ok + no local manifest → release even with NO run_epoch to compare (ga-qaa1k7)" \
+  || bad "fp_status=failed should bypass the freshness check and release"
+_should_release_manifestless_primary 0 1 "$OLD" "$STALE" 1 failed \
+  && ok "fp_status=failed → release even when a (stale/irrelevant) run_epoch happens to be present too" \
+  || bad "fp_status=failed should release regardless of a present run_epoch"
+_should_release_manifestless_primary 0 1 "$OLD" "" 0 failed \
+  && bad "fp_status=failed must NOT bypass s3_closure_ok=0 (closure NOT proven)" \
+  || ok "fp_status=failed + S3 closure NOT proven → still correctly spared"
+_should_release_manifestless_primary 0 0 "$OLD" "" 1 failed \
+  && bad "fp_status=failed must NOT bypass s3_manifest_ok=0 (S3 manifest missing)" \
+  || ok "fp_status=failed + S3 manifest object missing → still correctly spared"
+_should_release_manifestless_primary 1 1 "$OLD" "" 1 failed \
+  && bad "fp_status=failed must NEVER override rule #2 (has_manifest=1 — a VALID primary)" \
+  || ok "fp_status=failed + primary HAS a manifest → still correctly refused (rule #2 wins)"
+_should_release_manifestless_primary 0 1 "$OLD" "$STALE" 1 ok \
+  && bad "fp_status=ok (explicit) must still enforce freshness — a stale run_epoch must not release" \
+  || ok "fp_status=ok (explicit) + stale run_epoch → still correctly spared (failed is the ONLY bypass)"
+_should_release_manifestless_primary 0 1 "$OLD" "" 1 absent \
+  && bad "fp_status=absent (no entry at all) must NOT bypass freshness — falls through and fails closed" \
+  || ok "fp_status=absent + no run_epoch → falls through to the freshness check and fails closed"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1c (ga-qh8gkw): _release_manifestless_primary() — stubbed aws, real
 # rm -rf against a throwaway fixture (same shape as dolt-backup-residue-
@@ -409,6 +435,51 @@ rm -rf "$PRIMARY_ROOT/hq"
 : > "$LOG"
 BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
 grep -qF "nada a liberar" "$LOG" && ok "scenario I (no primary at all): clean no-op logged" || bad "scenario I: expected a 'nada a liberar' no-op log line"
+
+# ── ga-qaa1k7 (continuation of ga-qh8gkw): a fingerprint marked "failed" (the
+#    daily writer refused, e.g. disk pressure — hq's own real 28/09 case) must
+#    no longer block release when the LIVE S3-only closure proof + manifest
+#    head-object still hold on their own — reproduces the bead's literal
+#    scenario (SPARED on the pre-fix HEAD, RELEASED after).
+FAILED_META="$LIB_SCRATCH/seed-meta-failed.json"
+cat > "$FAILED_META" <<'JSON'
+{
+  "run_utc": "2026-09-20T07:00:00Z",
+  "databases": {
+    "hq": {"status": "failed", "reason": "disco+s3", "last_ok_run_utc": "2026-09-27T07:40:36Z", "last_ok": null}
+  }
+}
+JSON
+
+# Scenario J: fingerprint "failed" but S3 closure + manifest still prove live
+# → RELEASED even with no run_epoch to compare against the primary's mtime.
+mk_primary_scenario
+: > "$LOG"
+FAKE_S3_META_SEED_FILE="$FAILED_META" BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ ! -e "$PRIMARY_ROOT/hq" ] && ok "scenario J (fingerprint 'failed', S3 closure+manifest live-proven): manifest-less primary actually DELETED (ga-qaa1k7)" || bad "scenario J: primary should have been deleted — a merely-failed writer run must not block a live S3-only proof"
+grep -qF "fingerprint marcado 'failed'" "$LOG" && ok "scenario J: logged the failed-status bypass reason" || bad "scenario J: missing the failed-status bypass log line"
+grep -qF "last_ok=2026-09-27T07:40:36Z" "$LOG" && ok "scenario J: logged the last_ok_run_utc detail carried by the failed fingerprint" || bad "scenario J: missing the last_ok detail in the log"
+
+# Scenario K: fingerprint "failed" AND the S3 closure proof itself fails (a
+# manifest table missing from the bucket) — the failed-status bypass must
+# NEVER substitute for the closure proof, only for the freshness comparison.
+mk_primary_scenario
+s3_drop_table "$FB" hq 3
+: > "$LOG"
+FAKE_S3_META_SEED_FILE="$FAILED_META" BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ -d "$PRIMARY_ROOT/hq" ] && ok "scenario K (fingerprint 'failed' AND S3 closure proof fails): primary STILL PRESENT — the bypass never substitutes for the closure proof" || bad "scenario K: FAIL-CLOSED VIOLATED — primary deleted despite an unrestorable S3 copy"
+grep -qF "SPARED" "$LOG" && ok "scenario K: logged SPARED" || bad "scenario K: missing SPARED log line"
+
+# Scenario L (ga-qh8gkw rule #2, reaffirmed): a primary that HAS a valid local
+# manifest is refused before the fingerprint is even read — a "failed"
+# fingerprint must never change that outcome.
+mk_primary_scenario
+mk_backup_tables "$PRIMARY_ROOT/hq" 3   # overwrite with a REAL manifest+tables
+: > "$LOG"
+FAKE_S3_META_SEED_FILE="$FAILED_META" BACKUP_ROOT="$PRIMARY_ROOT" _release_manifestless_primary hq
+[ -d "$PRIMARY_ROOT/hq" ] && [ -s "$PRIMARY_ROOT/hq/manifest" ] && ok "scenario L (primary HAS a manifest + fingerprint 'failed'): STILL PRESENT — rule #2 wins regardless of fingerprint status" || bad "scenario L: RULE #2 VIOLATED — a primary with a valid manifest was touched"
+grep -qF "TEM manifest válido" "$LOG" && ok "scenario L: logged the exact refusal reason" || bad "scenario L: missing the has-manifest refusal reason"
+rm -f "$FAILED_META"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1d (ga-qh8gkw): _maybe_promote_new_after_primary_release() — stubbed
