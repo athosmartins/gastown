@@ -98,7 +98,71 @@ o="$(PPM_GATE_LOG="$W/gate.jsonl" python3 "$TOOL" gate-rate --cutover 2026-09-25
 echo "$o" | grep -q 'ANTES .*8/10' && echo "$o" | grep -q 'DEPOIS .*4/10' && ok "ANTES 8/10 e DEPOIS 4/10 (re-execução, dry-run e outro evento não entram)" || { bad "contagem 1ª tentativa errada:"; echo "$o" | sed 's/^/      /'; }
 echo "$o" | grep -q 'linhas ilegíveis do log ignoradas: 1' && ok "linha ilegível pulada E contada" || bad "linha ilegível não foi contada"
 { [ $rc -eq 1 ] && echo "$o" | grep -q 'VEREDITO: ALERTA'; } && ok "queda significativa E abaixo de todo o histórico -> ALERTA (exit 1)" || { bad "esperava ALERTA (rc=$rc)"; echo "$o" | sed 's/^/      /' | tail -6; }
-echo "== gate-rate: FAIL mecânico (timeout/verdict:pending/merge-quebrado) separado de FAIL de revisão (ga-w3yvoz)"
+echo "== classify_fail_reason(): formas REAIS que quality-gate-dispatcher.sh produz, íntegras E truncadas a 200 chars (gate-fix-1, ga-w3yvoz)"
+# quality-gate-dispatcher.sh:8901 grava só `head -1 | tr '\n' ' ' | cut -c1-200` de FAIL_REASONS no log --
+# o texto que classify_fail_reason() recebe em produção é SEMPRE a versão truncada, nunca o texto completo.
+# O veredito do gate (ga-j3fjog) pegou 3 formas mecânicas reais que a 1ª versão perdia (virava "review"):
+# verdict:TIMEOUT por revisor, no-verdict-label, e "Post-merge integrity check failed" (não começa com
+# "Merge failed", cai fora do startswith). Também cobre o caso NEGATIVO que a 1ª correção introduziria se só
+# trocasse o marcador sem entender o porquê: o fail-safe de comentário ilegível (ga-w7pm55 fail-safe) usa o
+# MESMO texto de label ("Reviewer N verdict:pending: ...") do caso genuinamente mecânico -- casar o label cru
+# confundiria os dois; o marcador certo é a frase que só existe no template mecânico.
+o="$(python3 - "$TOOL" <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ppm", sys.argv[1])
+ppm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ppm)
+cfr = ppm.classify_fail_reason
+
+cases = [
+    ("verdict:TIMEOUT por revisor (dispatcher ~9945-9950, no reviewer judgment)",
+     "Reviewer 1 verdict:TIMEOUT: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment). No reviewer judgment was recorded — the reviewer died or drained before delivering a verdict, so this is an infrastructure failure, not a code rejection: re-submit the SAME commit with /gate-done, no code change needed (ga-w7pm55).",
+     "mechanical"),
+    ("no-verdict-label (nenhum label verdict: presente; dispatcher ~9945-9950)",
+     "Reviewer 1 no-verdict-label: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment). No reviewer judgment was recorded — the reviewer died or drained before delivering a verdict, so this is an infrastructure failure, not a code rejection: re-submit the SAME commit with /gate-done, no code change needed (ga-w7pm55).",
+     "mechanical"),
+    ("Post-merge integrity check failed (dispatcher ~7238-7244, NÃO começa com 'Merge failed')",
+     "Post-merge integrity check failed: merge silently dropped branch changes.",
+     "mechanical"),
+    ("top-level TIMEOUT, Phase C (dispatcher ~10509)",
+     "TIMEOUT: reviewers did not submit verdicts within 30 minutes.",
+     "mechanical"),
+    ("Merge failed after all-PASS verdict (dispatcher ~7147)",
+     "Merge failed after all-PASS verdict. Merge result: conflict. Check git state of rig gascity.",
+     "mechanical"),
+    ("REGRESSÃO: fail-safe de comentário ilegível, label verdict:pending (ga-w7pm55 fail-safe, dispatcher ~9938) -- FAIL real de revisor, NUNCA mecânico mesmo casando 'verdict:pending'",
+     "Reviewer 1 verdict:pending: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment); its comments could not be read this sweep, so a reviewer FAIL cannot be ruled out (ga-w7pm55 fail-safe).",
+     "review"),
+    ("revisor real, veredito no label (dispatcher ~9938 FAIL_COMMENT branch)",
+     "Reviewer 1 FAIL: VERDICT: FAIL — race condition in shared cache",
+     "review"),
+    ("revisor real, label perdeu a corrida mas comentário ancorado (dispatcher ~9938)",
+     "Reviewer 1 FAIL: VERDICT: FAIL — off-by-one in the retry cap",
+     "review"),
+]
+
+bad_cases = []
+for label, reason, expect in cases:
+    got = cfr(reason)
+    tag = "OK " if got == expect else "BAD"
+    print(f"{tag} integral   | {label} | want={expect} got={got}")
+    if got != expect:
+        bad_cases.append(label + " (integral)")
+    truncated = reason[:200]
+    got_t = cfr(truncated)
+    tag_t = "OK " if got_t == expect else "BAD"
+    print(f"{tag_t} truncado200 | {label} | want={expect} got={got_t}")
+    if got_t != expect:
+        bad_cases.append(label + " (truncado a 200 chars, como o log real grava)")
+
+sys.exit(1 if bad_cases else 0)
+EOF
+)"
+rc=$?
+echo "$o" | sed 's/^/      /'
+[ $rc -eq 0 ] && ok "classify_fail_reason(): todas as 8 formas reais, íntegras e truncadas a 200 chars, classificadas certo" || bad "classify_fail_reason(): pelo menos uma forma real classificada errado (ver linhas BAD acima)"
+
+echo "== gate-rate: mesmas formas reais, fim-a-fim pelo comando (não só a função isolada) (ga-w3yvoz)"
 python3 - "$W/gate_mech.jsonl" <<'EOF'
 import json, sys, datetime as dt
 T = dt.datetime(2026, 9, 25, tzinfo=dt.timezone.utc); rows = []
@@ -107,21 +171,24 @@ def run(bead, ts, res, reason=None):
     if reason is not None: r["reason"] = reason
     rows.append(json.dumps(r))
 h = lambda x: dt.timedelta(hours=x)
-# ANTES: 4 FAILs -- 2 de revisão real, 1 timeout, 1 verdict:pending (2/4 mecânicos)
+# ANTES: 5 FAILs -- 2 de revisão real, 1 timeout de topo, 1 verdict:TIMEOUT por revisor (truncado a 200
+# chars como o dispatcher realmente grava), 1 fail-safe de comentário ilegível (verdict:pending -- tem que
+# ficar "review", não "mechanical", mesmo casando o label) (2/5 mecânicos)
 run("b0", T - h(30), "PASS"); run("b1", T - h(30), "PASS")
 run("b2", T - h(30), "FAIL", "Reviewer 1 FAIL: VERDICT: FAIL ")
 run("b3", T - h(30), "FAIL", "Reviewer 1 FAIL: VERDICT: FAIL (lens: CORRECTNESS)")
-run("b4", T - h(30), "FAIL", "TIMEOUT: reviewers did not submit verdict")
-run("b5", T - h(30), "FAIL", "Reviewer 1 verdict:pending: verdict bead closed without explicit PASS")
-# DEPOIS: 3 FAILs -- 1 de revisão real, 2 merge-quebrado-apos-PASS (2/3 mecânicos)
+run("b4", T - h(30), "FAIL", "TIMEOUT: reviewers did not submit verdicts within 30 minutes.")
+run("b5", T - h(30), "FAIL", "Reviewer 1 verdict:TIMEOUT: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment). No reviewer judgment was recorded — the reviewer died or drained before deli")
+run("b6", T - h(30), "FAIL", "Reviewer 1 verdict:pending: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment); its comments could not be read this sweep, so a reviewer FAIL cannot be rule")
+# DEPOIS: 3 FAILs -- 1 de revisão real, 1 merge-quebrado-apos-PASS, 1 post-merge-integrity (2/3 mecânicos)
 run("a0", T + h(5), "PASS")
 run("a1", T + h(5), "FAIL", "Reviewer 1 FAIL: VERDICT: FAIL ")
 run("a2", T + h(5), "FAIL", "Merge failed after all-PASS verdict. Merge conflict.")
-run("a3", T + h(5), "FAIL", "Merge failed after all-PASS verdict. Rebase needed.")
+run("a3", T + h(5), "FAIL", "Post-merge integrity check failed: merge silently dropped branch changes.")
 open(sys.argv[1], "w").write("\n".join(rows) + "\n")
 EOF
 o="$(PPM_GATE_LOG="$W/gate_mech.jsonl" python3 "$TOOL" gate-rate --cutover 2026-09-25T00:00:00Z --window-hours 48 --history-windows 1 2>&1)"
-echo "$o" | grep -q 'MECÂNICOS.*ANTES 2/4.*DEPOIS 2/3' && ok "breakdown mecânico/revisão: ANTES 2/4, DEPOIS 2/3" || { bad "breakdown mecânico ausente ou errado:"; echo "$o" | sed 's/^/      /'; }
+echo "$o" | grep -q 'MECÂNICOS.*ANTES 2/5.*DEPOIS 2/3' && ok "breakdown mecânico/revisão fim-a-fim: ANTES 2/5, DEPOIS 2/3 (inclui verdict:TIMEOUT truncado e post-merge-integrity certos, fail-safe verdict:pending NÃO contado)" || { bad "breakdown mecânico ausente ou errado:"; echo "$o" | sed 's/^/      /'; }
 # controle: FAILs sem campo "reason" (fixture antiga, sem essa informação) não podem ser CHUTADOS como mecânicos --
 # terceiro estado (não sei classificar) tem que cair no lado conservador (review), nunca inflar a contagem mecânica.
 o2="$(PPM_GATE_LOG="$W/gate.jsonl" python3 "$TOOL" gate-rate --cutover 2026-09-25T00:00:00Z --window-hours 48 --history-windows 3 2>&1)"

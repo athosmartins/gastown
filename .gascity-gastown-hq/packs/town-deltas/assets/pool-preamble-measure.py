@@ -263,17 +263,29 @@ def norm_cdf(x):
 
 def classify_fail_reason(reason):
     # ga-w3yvoz: um FAIL "mecânico" (plumbing do próprio gate: timeout de revisor, verdict bead fechado sem
-    # PASS/FAIL explícito, requeue, merge que quebrou depois de um veredito all-PASS) é um estado DIFERENTE de
-    # um FAIL "de revisão" (o revisor leu o diff e achou um defeito real). Os dois viram o MESMO "result": "FAIL"
-    # no log — terceiro estado colapsado em booleano (root-class:error-vs-empty) — e por isso um pico de FAILs
+    # PASS/FAIL explícito — qualquer que seja o label: pending/TIMEOUT/ABORTED/REQUEUED/ausente —, merge que
+    # quebrou depois de um veredito all-PASS, integridade pós-merge falhou) é um estado DIFERENTE de um FAIL
+    # "de revisão" (o revisor leu o diff e achou um defeito real). Os dois viram o MESMO "result": "FAIL" no
+    # log — terceiro estado colapsado em booleano (root-class:error-vs-empty) — e por isso um pico de FAILs
     # mecânicos (ex.: gate travado, causa a investigar em outro bead) aparenta "queda de qualidade" pro
     # gate-rate sem ser uma.
+    #
+    # gate-fix-1 (ga-w3yvoz): a 1ª versão casava o LABEL cru (`"verdict:pending" in reason`), mas
+    # quality-gate-dispatcher.sh usa o MESMO texto de label ("Reviewer N ${VERDICT_LABEL}: verdict bead
+    # closed without explicit PASS...") tanto pro caso genuinamente mecânico (ninguém julgou — dispatcher.sh
+    # ~9945) quanto pro fail-safe de comentário ilegível (ga-w7pm55 fail-safe — dispatcher.sh ~9938), que É
+    # revisão real pendente de confirmação e por doutrina fica "code"/blocking. Casar o label cru confundia
+    # os dois sempre que VERDICT_LABEL calhava de ser "verdict:pending". A frase abaixo só existe no template
+    # genuinamente mecânico — e cabe dentro dos 200 chars que quality-gate-dispatcher.sh:8901 trunca antes de
+    # gravar no log (`head -1 | cut -c1-200`), então funciona no dado real truncado, não só no texto completo.
     reason = reason or ""
     if reason.startswith("TIMEOUT"):
         return "mechanical"
-    if "verdict:pending" in reason or "verdict:REQUEUED" in reason:
+    if "No reviewer judgment was recorded" in reason:
         return "mechanical"
     if reason.startswith("Merge failed"):
+        return "mechanical"
+    if reason.startswith("Post-merge integrity check failed"):
         return "mechanical"
     return "review"
 
