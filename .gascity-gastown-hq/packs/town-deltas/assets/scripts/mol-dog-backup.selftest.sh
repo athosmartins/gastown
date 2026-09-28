@@ -343,6 +343,35 @@ else
   bad "the pre-existing fallback classes now depend on the staging state — regression"
 fi
 
+# ── staging_broken_residue: only reseed/swap-repair can recover this (ga-9626dq) ─
+# Measured live on hq, 2026-09-28: mol-dog-backup kept writing gigabytes more into
+# an already no-manifest hq primary every ~6h, because "no-manifest" alone (the
+# released-staging class above) is ALSO the shape of "a prior attempt left real
+# content and never finished" — the two must not collapse into the same decision.
+echo "── staging_broken_residue (ga-9626dq) ──"
+if lib_call staging_broken_residue no-manifest 200000; then
+  ok "no-manifest + 200000KB (well above the default 100MB floor) is broken residue"
+else
+  bad "no-manifest + 200000KB was NOT classified as broken residue — the ga-9626dq bug"
+fi
+if lib_call staging_broken_residue no-manifest 1; then
+  bad "no-manifest + 1KB (a fresh bootstrap staging) was classified as broken residue — would block the FIRST-EVER sync"
+else
+  ok "no-manifest + 1KB (fresh bootstrap staging) is correctly NOT broken residue"
+fi
+if lib_call staging_broken_residue no-manifest ""; then
+  bad "no-manifest + unmeasurable size was classified as broken residue — must fail OPEN on an unmeasurable size (same convention as dolt-backup-reseed.sh's OLD_DIR_KB)"
+else
+  ok "no-manifest + unmeasurable size is correctly NOT broken residue (fail-open on size, matches reseed.sh's own convention)"
+fi
+for st in has-manifest no-dir unknown ""; do
+  if lib_call staging_broken_residue "$st" 200000; then
+    bad "staging state '${st:-<empty>}' + 200000KB was classified as broken residue — only no-manifest should ever trigger this"
+  else
+    ok "staging state '${st:-<empty>}' + 200000KB is correctly NOT broken residue (state alone gates this, not size)"
+  fi
+done
+
 # ── staging_manifest_state: three states that must never collapse ────────────────
 echo "── staging_manifest_state (ga-ypxbxm) ──"
 UT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mol-dog-backup-state-selftest.XXXXXX")"
@@ -755,6 +784,44 @@ EOF2
   esac
   [ ! -s "$FB_WORK/offline-noavail.log" ] \
     && ok "the offline sync was not invoked" || bad "the offline sync ran with unmeasurable free space"
+
+  # (g) an ALREADY broken staging (no manifest, real content left by a prior
+  # incomplete attempt, present BEFORE this run even starts) must SKIP outright —
+  # neither the server-mediated attempt nor the offline fallback may write more
+  # into it (ga-9626dq: measured live on hq, six-hourly runs kept adding
+  # gigabytes to an already no-manifest primary without ever completing it).
+  echo "── already-broken staging: no-manifest with pre-existing residue (ga-9626dq) ──"
+  fb_new_db brokenresidue
+  BR_DEST="$FB_WORK/backup/brokenresidue"
+  head -c 20480 /dev/zero > "$BR_DEST/$RESIDUE_NAME"   # residue from a PRIOR run, before this attempt starts
+  BR_LIVE="$(fb_live_kb brokenresidue)"
+  BR_OUT=$(MOL_DOG_BACKUP_BROKEN_RESIDUE_FLOOR_KB=10 FB_AVAIL_KB=$((BR_LIVE * 4)) fb_run brokenresidue)
+  case "$BR_OUT" in
+    "SKIP brokenresidue("*"already broken"*) ok "already-broken staging (no manifest, pre-existing residue) → SKIP outright: $BR_OUT" ;;
+    *) bad "already-broken staging did not SKIP outright — got '$BR_OUT' (the ga-9626dq bug: would write more)" ;;
+  esac
+  [ ! -s "$FB_WORK/offline-brokenresidue.log" ] \
+    && ok "no offline fallback was attempted over an already-broken staging" \
+    || bad "the offline fallback ran over an already-broken staging"
+  if [ "$(fb_files "$BR_DEST")" = "1" ] && [ ! -e "$BR_DEST/manifest" ]; then
+    ok "the pre-existing residue is untouched — SKIP added nothing and deleted nothing"
+  else
+    bad "the staging changed under an already-broken SKIP: $(find "$BR_DEST" -type f 2>/dev/null | tr '\n' ' ')"
+  fi
+
+  # (h) the SAME pre-existing content below the floor (a fresh/near-empty
+  # bootstrap staging) must NOT be treated as broken — the normal first-ever
+  # sync still has to run.
+  fb_new_db freshboot
+  FBOOT_DEST="$FB_WORK/backup/freshboot"
+  head -c 512 /dev/zero > "$FBOOT_DEST/$RESIDUE_NAME"   # tiny — below any realistic floor
+  FBOOT_LIVE="$(fb_live_kb freshboot)"
+  FBOOT_OUT=$(MOL_DOG_BACKUP_BROKEN_RESIDUE_FLOOR_KB=10 FB_AVAIL_KB=$((FBOOT_LIVE * 4)) fb_run freshboot)
+  if [ "$FBOOT_OUT" = "OK freshboot" ]; then
+    ok "fresh/near-empty no-manifest staging (below the floor) is NOT broken residue — the normal sync still ran: $FBOOT_OUT"
+  else
+    bad "fresh/near-empty staging was wrongly refused — got '$FBOOT_OUT' (would block every first-ever sync)"
+  fi
 
   rm -rf "$FB_WORK" 2>/dev/null
 fi

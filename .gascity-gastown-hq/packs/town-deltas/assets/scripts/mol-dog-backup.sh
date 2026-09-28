@@ -262,6 +262,36 @@ is_fallback_eligible_failure() {
     esac
 }
 
+# staging_broken_residue <dest_state> <dest_kb> — PURE. True (0) when a staging is
+# ALREADY in the state only dolt-backup-reseed.sh / dolt-backup-swap-repair.sh can
+# recover (no manifest, but real content left by a prior incomplete attempt) —
+# ga-9626dq, measured live on hq 2026-09-28: this job's offline fallback kept
+# writing gigabytes more into an already no-manifest hq primary every ~6h without
+# ever completing a manifest. `dolt backup sync`'s file:// target is append-only,
+# and this job has no staging+verify+swap step of its own (unlike the reseed
+# pipeline it collides with — both target the SAME <db>-backup remote). Freeing or
+# completing that state needs the restore+row-count proof those scripts gate on;
+# this job never runs it, so writing more here cannot help and only grows a
+# residue no existing reclaim path can free (residue-reclaim only knows <db>.old;
+# the low-disk S3-proof needs a LOCAL manifest to compare against, which a
+# no-manifest dir can never supply).
+#
+# A FRESH/near-empty no-manifest staging (dest_kb below the floor — the normal
+# first-ever-sync bootstrap state) is NOT broken residue and must still be
+# written; only a floor-crossing amount of unmanifested content counts. An
+# unmeasurable dest_kb is treated as 0/not-broken — the same fail-open-on-size
+# convention dolt-backup-reseed.sh's own OLD_DIR_KB/OLD_KB_NOW already use — so a
+# transient `du` failure skips this refusal rather than freezing the job.
+STAGING_BROKEN_RESIDUE_FLOOR_KB="${MOL_DOG_BACKUP_BROKEN_RESIDUE_FLOOR_KB:-102400}"
+staging_broken_residue() {
+    local dest_state="$1" dest_kb="$2"
+    [ "$dest_state" = "no-manifest" ] || return 1
+    case "$dest_kb" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$dest_kb" -ge "$STAGING_BROKEN_RESIDUE_FLOOR_KB" ]
+}
+
 # deacon_nudge_allowed <suspended_flag> — PURE. Nudging a suspended agent
 # queues forever: the recipient never wakes to consume it, and every
 # `gc nudge poll` iteration reloads the ENTIRE queue state regardless of
@@ -326,6 +356,20 @@ sync_db_with_fallback() {
             pre_kb="$(staging_size_kb "$dest")"
             ;;
     esac
+
+    # ga-9626dq: refuse BOTH the server-mediated attempt and the offline
+    # fallback when the destination is ALREADY broken-with-residue (see
+    # staging_broken_residue above) — checked before either sync path runs,
+    # so neither one can add to a state this job has no way to recover.
+    if [ -n "$dest" ]; then
+        local pre_state
+        pre_state="$(staging_manifest_state "$dest")"
+        if staging_broken_residue "$pre_state" "${pre_kb:-}"; then
+            printf 'SKIP %s(staging already broken: %s residual, manifest=%s — recoverable only via dolt-backup-reseed.sh/dolt-backup-swap-repair.sh; not writing more)\n' \
+                "$db" "$(fmt_kb "$pre_kb")" "$pre_state"
+            return
+        fi
+    fi
 
     sync_output=$(cd "$db_dir" && run_bounded "$bound" dolt backup sync "${db}-backup" 2>&1) || sync_rc=$?
 
