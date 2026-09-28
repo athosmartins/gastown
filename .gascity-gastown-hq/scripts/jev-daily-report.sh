@@ -54,6 +54,19 @@ elif [ "$JOIN_RC" -ne 0 ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run exited non-zero ($JOIN_RC), see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
 fi
 
+# ga-wk0qi2: same best-effort offline join, for the cut-large-output front (fixed-rule +
+# Jev-tier SHADOW measurement of what would be cut from big Bash output -- see that script's
+# own docstring). Same NEVER-blocks-the-report discipline as the gate-verdict join above.
+CLO_JOIN_SCRIPT="${JEV_CUT_OUTPUT_JOIN:-$HQ/scripts/jev_cut_output_join.py}"
+CLO_JOIN_TIMEOUT="${JEV_CUT_OUTPUT_JOIN_TIMEOUT:-600}"
+CLO_JOIN_RC=0
+timeout "$CLO_JOIN_TIMEOUT" python3 "$CLO_JOIN_SCRIPT" run >>"$OUT_DIR/cut-output-join.log" 2>&1 || CLO_JOIN_RC=$?
+if [ "$CLO_JOIN_RC" -eq 124 ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_cut_output_join.py run TIMED OUT after ${CLO_JOIN_TIMEOUT}s, see $OUT_DIR/cut-output-join.log" >>"$OUT_DIR/cut-output-join.log"
+elif [ "$CLO_JOIN_RC" -ne 0 ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_cut_output_join.py run exited non-zero ($CLO_JOIN_RC), see $OUT_DIR/cut-output-join.log" >>"$OUT_DIR/cut-output-join.log"
+fi
+
 if ! python3 "$REPORT" --date "$DAY" >"$OUT_DIR/$DAY.txt" 2>&1; then
   notify -t "Jev: relatório de $DAY falhou" "Detalhe em $OUT_DIR/$DAY.txt"
   exit 1
@@ -118,6 +131,20 @@ QP_PT=$(timeout "$QP_TIMEOUT" python3 "$QP_REPORT" --resumo-pt 2>>"$QP_LOG") || 
 [ -n "$QP_PT" ] || QP_PT="$QP_FAIL"
 { echo; echo "$QP_TXT"; } >>"$OUT_DIR/$DAY.txt"
 RESUMO="$RESUMO"$'\n'"$QP_PT"
+
+# ga-wk0qi2: the cut-large-output calibration table, cumulative to date. Same best-effort,
+# always-visible-on-failure discipline as the blocks above -- a missing block here would read
+# exactly like "no data", so a failed/empty report is one visible line, not silence.
+CLO_REPORT="${JEV_CUT_OUTPUT_REPORT:-$HQ/scripts/jev_cut_output_report.py}"
+CLO_TIMEOUT="${JEV_CUT_OUTPUT_REPORT_TIMEOUT:-120}"
+CLO_LOG="$OUT_DIR/cut-output-report.log"
+CLO_FAIL="Cortar-saída-grande: relatório falhou — ver $CLO_LOG"
+CLO_TXT=$(timeout "$CLO_TIMEOUT" python3 "$CLO_REPORT" 2>>"$CLO_LOG") || CLO_TXT=""
+CLO_PT=$(timeout "$CLO_TIMEOUT" python3 "$CLO_REPORT" --resumo-pt 2>>"$CLO_LOG") || CLO_PT=""
+[ -n "$CLO_TXT" ] || CLO_TXT="$CLO_FAIL"
+[ -n "$CLO_PT" ] || CLO_PT="$CLO_FAIL"
+{ echo; echo "$CLO_TXT"; } >>"$OUT_DIR/$DAY.txt"
+RESUMO="$RESUMO"$'\n'"$CLO_PT"
 
 # ga-aijm2v.7: the preambulo (per-task doctrine diet, SHADOW) table, cumulative to date. Its records
 # come from the hourly jev-preambulo order, so there is nothing to run first -- only to read. ONE

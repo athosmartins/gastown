@@ -40,6 +40,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ": cut-output-shadow; P='/Users/athos/gt/.gascity-gastown-hq/scripts/cut-output-shadow.sh'; [ -f \"$P\" ] || { printf '{}'; exit 0; }; /bin/bash \"$P\"",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   },
   "autoMemoryEnabled": true,
