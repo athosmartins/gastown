@@ -155,6 +155,24 @@ FOUND="$(_discover_dbs "$SCRATCH/discover" | sort | tr '\n' ',' )"
 [ "$FOUND" = "gastown,hq," ] && ok "discovers real dbs, excludes .new/.old in-progress reseed artifacts" || bad "expected 'gastown,hq,', got '$FOUND'"
 [ -z "$(_discover_dbs "$SCRATCH/does-not-exist")" ] && ok "missing backup root -> empty, not an error" || bad "missing root should produce empty"
 
+echo "── _discover_live_dbs <doltdir> (ga-e01691): the LIVE dbs, not the backup copies ──"
+# The weekly job used to enumerate BACKUP directories only, so a live db whose
+# backup dir was gone (27/09: low-disk mode freed .dolt-backup/hq, leaving only
+# hq.new) never entered the loop and vanished from the summary -- "no backup"
+# printed the same thing as "nothing to check". Live discovery is what closes it.
+rm -rf "$SCRATCH/live"
+mkdir -p "$SCRATCH/live/hq/.dolt" "$SCRATCH/live/gastown/.dolt" \
+         "$SCRATCH/live/.dolt" "$SCRATCH/live/.doltcfg" "$SCRATCH/live/.dolt_dropped_databases" \
+         "$SCRATCH/live/leftover-no-dolt-dir" \
+         "$SCRATCH/live/testdb_abc123/.dolt" "$SCRATCH/live/beads_t9f2/.dolt" "$SCRATCH/live/beads_pt77/.dolt"
+: > "$SCRATCH/live/server.log"
+FOUND="$(_discover_live_dbs "$SCRATCH/live" | sort | tr '\n' ',')"
+[ "$FOUND" = "gastown,hq," ] && ok "lists directories holding a .dolt; skips hidden server dirs, plain files, dirs that are not dolt dbs, and the testdb_/beads_t/beads_pt orphan prefixes" || bad "expected 'gastown,hq,', got '$FOUND'"
+mkdir -p "$SCRATCH/live/beads/.dolt"
+FOUND="$(_discover_live_dbs "$SCRATCH/live" | sort | tr '\n' ',')"
+case "$FOUND" in *"beads,"*) ok "the real 'beads' db is not mistaken for a beads_t*/beads_pt* test orphan" ;; *) bad "'beads' must be discovered, got '$FOUND'" ;; esac
+[ -z "$(_discover_live_dbs "$SCRATCH/does-not-exist" 2>/dev/null)" ] && ok "missing live dir -> empty (main() is what decides that is an error, see below)" || bad "missing live dir should produce empty"
+
 # ════════════════════════════════════════════════════════════════════════════
 # 2. _verify_one_db — one db's full restore+compare cycle
 # ════════════════════════════════════════════════════════════════════════════
@@ -172,11 +190,23 @@ OUT="$(_verify_one_db hq)"; RC=$?
 [ "$OUT" = "hq=SKIP(sem-banco-vivo)" ] && ok "missing live db correctly reported as SKIP" || bad "expected 'hq=SKIP(sem-banco-vivo)', got '$OUT'"
 [ "$RC" -eq 0 ] && ok "SKIP is not a failure exit code" || bad "SKIP should exit 0"
 
-echo "── _verify_one_db: no backup -> SKIP ──"
+echo "── _verify_one_db: live db with NO local backup -> NO-BACKUP (ga-e01691), not SKIP ──"
+# SKIP means "could not check right now" (disk, no baseline) and is not an alarm.
+# A live db with no backup dir at all is a different fact: nothing to restore
+# from. Reporting it as SKIP filed it in the same bucket as a transient disk
+# squeeze, and a run of "OK + one SKIP" is recorded as a clean, closed chore.
 _reset_fixture
 rm -rf "$BACKUP_ROOT/hq"
+: > "$SCRATCH/fake-dolt.log"
+OUT="$(FAKE_DOLT_LOG="$SCRATCH/fake-dolt.log" _verify_one_db hq)"; RC=$?
+[ "$OUT" = "hq=NO-BACKUP(sem-backup-local)" ] && ok "live db without a backup dir is reported as NO-BACKUP(sem-backup-local)" || bad "expected 'hq=NO-BACKUP(sem-backup-local)', got '$OUT'"
+[ "$RC" -eq 3 ] && ok "NO-BACKUP exits 3: not 0 (SKIP/OK) and not 1 (a backup that was checked and is broken)" || bad "NO-BACKUP should exit 3, got $RC"
+[ ! -s "$SCRATCH/fake-dolt.log" ] && ok "no backup means no restore attempt" || bad "should never call dolt when there is no backup to restore"
+_reset_fixture
+rm -rf "$BACKUP_ROOT/hq"; mkdir -p "$BACKUP_ROOT/hq.new"
 OUT="$(_verify_one_db hq)"
-[ "$OUT" = "hq=SKIP(sem-backup)" ] && ok "missing backup correctly reported as SKIP" || bad "expected 'hq=SKIP(sem-backup)', got '$OUT'"
+[ "$OUT" = "hq=NO-BACKUP(sem-backup-local)" ] && ok "an in-progress hq.new is not a backup: still NO-BACKUP" || bad "expected NO-BACKUP with only hq.new present, got '$OUT'"
+grep -q "hq.new" "$RESTORE_VERIFY_LOG" && ok "the log says a hq.new reseed artifact is sitting there (the 27/09 shape), so the reader knows where to look" || bad "expected the log to mention hq.new: $(cat "$RESTORE_VERIFY_LOG")"
 
 echo "── _verify_one_db: live query fails -> SKIP(sem-baseline), never attempts restore ──"
 _reset_fixture
@@ -363,6 +393,16 @@ grep -q "gastown.dog" "$SCRATCH/fake-bd.log" && ok "all-SKIP run is routed to ga
 grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "an all-SKIP run must NOT close its own bead — nothing was actually verified" || ok "all-SKIP bead is left open (no close call)"
 grep -q "SEM VERIFICACAO" "$SCRATCH/fake-bd.log" && ok "title is textually distinct from the OK case, not just same-title-different-type" || bad "expected a distinguishing title for the all-SKIP case"
 
+echo "── _file_summary_bead: a live db with no local backup (overall_rc=3) files an OPEN P1 bug, titled for what it is ──"
+: > "$SCRATCH/fake-bd.log"
+FAKE_BD_LOG="$SCRATCH/fake-bd.log" _file_summary_bead "alpha=OK(10) hq=NO-BACKUP(sem-backup-local) " 3
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "a missing backup files a --type=bug, not a clean chore" || bad "expected a bug create call: $(cat "$SCRATCH/fake-bd.log")"
+grep -q -- "--priority=1" "$SCRATCH/fake-bd.log" && ok "P1: a live production db with nothing to restore from is unprotected" || bad "expected --priority=1: $(cat "$SCRATCH/fake-bd.log")"
+grep -q "gastown.dog" "$SCRATCH/fake-bd.log" && ok "routed to gastown.dog like the other actionable outcomes" || bad "expected gc.routed_to routing metadata"
+grep -q "SEM BACKUP LOCAL" "$SCRATCH/fake-bd.log" && ok "title names the condition (SEM BACKUP LOCAL), not the generic FALHOU" || bad "expected a SEM BACKUP LOCAL title: $(cat "$SCRATCH/fake-bd.log")"
+grep -q "hq=NO-BACKUP" "$SCRATCH/fake-bd.log" && ok "the affected db is named in the bead" || bad "expected hq=NO-BACKUP in the bead"
+grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "a missing-backup bead must NOT be closed by the job that found it" || ok "left open (no close call)"
+
 echo "── _file_summary_bead: bd itself is unreachable — the summary bead-create call fails ──"
 # Self-audit finding (ga-jz7gg /gate-done pre-flight sweep): the summary bead
 # IS the only channel the digest reads (mol-digest-generate.toml's
@@ -417,6 +457,98 @@ FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
 RC=$?
 [ "$RC" -eq 0 ] && ok "nothing to verify -> clean exit 0" || bad "empty backup root should not be treated as failure"
 [ ! -s "$SCRATCH/fake-bd.log" ] && ok "nothing to verify -> no summary bead filed (no fabricated record for a no-op)" || bad "should not file a bead when there was nothing to check"
+
+echo "── main (ga-e01691): the 27/09 shape — live hq, its backup dir gone, only hq.new left — is REPORTED, not dropped ──"
+# This is the regression itself. Before the fix main() walked the backup dir, so
+# 'hq' (no dir, just hq.new, which _discover_dbs filters out) never entered the
+# loop: no OK, no SKIP, no line at all, and the run was filed as a clean chore.
+rm -rf "$SCRATCH/city4"
+DOLTDIR="$SCRATCH/city4/doltdir"; BACKUP_ROOT="$SCRATCH/city4/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/alpha" "$BACKUP_ROOT/hq.new"
+: > "$SCRATCH/fake-bd.log"; : > "$RESTORE_VERIFY_LOG"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 3 ] && ok "a live db with no backup exits 3 (not 0, even though alpha verified OK)" || bad "expected exit 3, got $RC"
+grep -q "hq=NO-BACKUP(sem-backup-local)" "$SCRATCH/fake-bd.log" && ok "hq appears in the summary bead as NO-BACKUP — the line that was missing on 27/09" || bad "expected hq=NO-BACKUP in the summary: $(cat "$SCRATCH/fake-bd.log")"
+grep -q "alpha=OK" "$SCRATCH/fake-bd.log" && ok "the db that does have a backup is still verified and listed alongside it" || bad "expected alpha=OK in the summary"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && grep -q -- "--priority=1" "$SCRATCH/fake-bd.log" && ok "filed as an OPEN P1 bug, not a clean chore" || bad "expected a P1 bug: $(cat "$SCRATCH/fake-bd.log")"
+grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && bad "the missing-backup run must not close its own bead" || ok "bead left open"
+
+echo "── main (ga-e01691): a live db with no backup at ALL (no hq.new either) is reported the same way ──"
+rm -rf "$BACKUP_ROOT/hq.new"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 3 ] && grep -q "hq=NO-BACKUP" "$SCRATCH/fake-bd.log" && ok "no hq.new needed: the live db alone is enough to put it in the summary" || bad "expected rc 3 and hq=NO-BACKUP, got rc=$RC: $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main (ga-e01691): ONLY live dbs and NO backup dir anywhere -> still rc 3, not the 'nothing to verify' no-op ──"
+rm -rf "$SCRATCH/city5"
+DOLTDIR="$SCRATCH/city5/doltdir"; BACKUP_ROOT="$SCRATCH/city5/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$BACKUP_ROOT"
+: > "$SCRATCH/fake-bd.log"
+FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 3 ] && ok "empty backup root + a live db is a gap, not a clean no-op (the old code returned 0 here and filed nothing)" || bad "expected rc 3, got $RC"
+[ "$(grep -c 'BD-CALLED.*create' "$SCRATCH/fake-bd.log")" = "1" ] && ok "one summary bead filed" || bad "expected one create call: $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main (ga-e01691): NO-BACKUP and a real FAIL in the same run -> rc 1 (FALHOU), and the NO-BACKUP db is still named ──"
+rm -rf "$SCRATCH/city6"
+DOLTDIR="$SCRATCH/city6/doltdir"; BACKUP_ROOT="$SCRATCH/city6/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/alpha"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 500' FAKE_DOLT_SQL_OUTPUT='| 499' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 1 ] && ok "a proven integrity FAIL keeps rc 1" || bad "expected rc 1, got $RC"
+grep -q "hq=NO-BACKUP" "$SCRATCH/fake-bd.log" && grep -q "alpha=FAIL" "$SCRATCH/fake-bd.log" && ok "both results are in the one summary" || bad "expected hq=NO-BACKUP and alpha=FAIL: $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main (ga-e01691): an orphan backup (no live db) is still LISTED, as SKIP(sem-banco-vivo) — the union keeps it visible ──"
+rm -rf "$SCRATCH/city7"
+DOLTDIR="$SCRATCH/city7/doltdir"; BACKUP_ROOT="$SCRATCH/city7/backup"
+mkdir -p "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/alpha" "$BACKUP_ROOT/fixdepkeys_0d16"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 0 ] && ok "alpha OK + an orphan backup SKIP is still a clean run (an orphan backup is not an alarm)" || bad "expected rc 0, got $RC"
+grep -q "fixdepkeys_0d16=SKIP(sem-banco-vivo)" "$SCRATCH/fake-bd.log" && ok "the orphan backup is reported, as before" || bad "expected fixdepkeys_0d16=SKIP(sem-banco-vivo): $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main (ga-e01691): test-orphan live dirs (testdb_*, beads_t*, beads_pt*) are NOT demanded to have a backup ──"
+rm -rf "$SCRATCH/city8"
+DOLTDIR="$SCRATCH/city8/doltdir"; BACKUP_ROOT="$SCRATCH/city8/backup"
+mkdir -p "$DOLTDIR/alpha/.dolt" "$DOLTDIR/testdb_abc/.dolt" "$DOLTDIR/beads_t1/.dolt" "$DOLTDIR/beads_pt2/.dolt" "$BACKUP_ROOT/alpha"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 0 ] && ok "orphans from tests do not raise a NO-BACKUP alarm" || bad "expected rc 0, got $RC: $(cat "$SCRATCH/fake-bd.log")"
+grep -q -E "testdb_abc|beads_t1|beads_pt2" "$SCRATCH/fake-bd.log" && bad "orphan dbs must not appear in the summary" || ok "and they are not listed"
+
+echo "── main (ga-e01691): the LIVE dir cannot be read -> incomplete (rc 2), never a clean OK and never a silent no-op ──"
+rm -rf "$SCRATCH/city9"
+DOLTDIR="$SCRATCH/city9/no-such-doltdir"; BACKUP_ROOT="$SCRATCH/city9/backup"
+mkdir -p "$BACKUP_ROOT/alpha"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+# alpha itself is SKIP(sem-banco-vivo) here (its live dir is the missing one);
+# what matters is that the run is not filed as clean and says why.
+[ "$RC" -eq 2 ] && ok "unreadable live dir -> rc 2" || bad "expected rc 2, got $RC"
+grep -q "vivos=SKIP(sem-diretorio-vivo)" "$SCRATCH/fake-bd.log" && ok "the summary says the live list could not be read" || bad "expected vivos=SKIP(sem-diretorio-vivo): $(cat "$SCRATCH/fake-bd.log")"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "filed as an open bug" || bad "expected a bug create"
+rm -rf "$SCRATCH/city10"
+DOLTDIR="$SCRATCH/city10/no-such-doltdir"; BACKUP_ROOT="$SCRATCH/city10/empty-backup"
+mkdir -p "$BACKUP_ROOT"
+: > "$SCRATCH/fake-bd.log"
+FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 2 ] && grep -q "vivos=SKIP(sem-diretorio-vivo)" "$SCRATCH/fake-bd.log" && ok "unreadable live dir AND empty backup root: still rc 2 with a bead — 'could not list' is not 'nothing to check'" || bad "expected rc 2 + a bead, got rc=$RC: $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main (ga-e01691): a healthy fully-verified run is STILL clean (rc 0, closed chore) — the new checks did not over-alarm ──"
+rm -rf "$SCRATCH/city11"
+DOLTDIR="$SCRATCH/city11/doltdir"; BACKUP_ROOT="$SCRATCH/city11/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/hq" "$BACKUP_ROOT/alpha"
+: > "$SCRATCH/fake-bd.log"
+FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 0 ] && grep -q "hq=OK" "$SCRATCH/fake-bd.log" && grep -q "alpha=OK" "$SCRATCH/fake-bd.log" && grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && ok "live+backup for every db -> rc 0, both listed, closed chore" || bad "expected a clean run, got rc=$RC: $(cat "$SCRATCH/fake-bd.log")"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

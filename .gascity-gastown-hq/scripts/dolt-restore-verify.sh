@@ -1,6 +1,9 @@
 #!/bin/bash
 # dolt-restore-verify.sh (ga-jz7gg, scope items 3+4) — read-only, disk-safe
-# weekly integrity check: restores each backed-up db to a scratch dir,
+# weekly integrity check: restores each LIVE db's backup to a scratch dir (the
+# list comes from the live dbs, not from the backup directory — ga-e01691: a db
+# with no backup dir gets a NO-BACKUP line and a P1 bead, it never drops out of
+# the summary),
 # compares its issue count against what the live db held WHEN THE BACKUP WAS
 # TAKEN (ga-jsk5p8 — not against the live db of right now, except when the
 # snapshot time cannot be determined: then the old strict live-now rule
@@ -55,7 +58,7 @@ NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 # writer slack, since — unlike reseed — there is no second "new backup"
 # directory coexisting with a "verify" directory at the same time.
 DISK_MARGIN_PCT="${RESTORE_VERIFY_DISK_MARGIN_PCT:-200}"
-ONLY_DBS="${RESTORE_VERIFY_ONLY_DBS:-}"   # space-separated allowlist; empty = every backed-up db
+ONLY_DBS="${RESTORE_VERIFY_ONLY_DBS:-}"   # space-separated allowlist; empty = every live db + every backup dir
 
 # ── Snapshot baseline (ga-jsk5p8) ───────────────────────────────────────────
 # A backup is a snapshot of the PAST; the live db keeps growing after it. The
@@ -139,6 +142,33 @@ _discover_dbs() {
   (cd "$root" 2>/dev/null && ls -1 2>/dev/null) | grep -vE '\.(new|old)$' || true
 }
 
+# _discover_live_dbs <doltdir> (ga-e01691) — every LIVE db: a non-hidden
+# directory holding a .dolt. This, not the backup directory, is what defines
+# "what has to be verified". The job used to walk .dolt-backup/ only, so a live
+# db whose backup dir was gone never entered the loop and left no line in the
+# summary (27/09: low-disk mode freed .dolt-backup/hq, leaving only hq.new, and
+# the primary db vanished from the check — "no backup" printed the same as
+# "nothing to check").
+# Skipped: hidden entries (.dolt, .doltcfg, .dolt_dropped_databases — the server's
+# own state), plain files (server.log, proxy.lock), directories that are not dolt
+# dbs, and the test-orphan prefixes gc dolt-cleanup owns (testdb_*, beads_t*,
+# beads_pt*). The prefixes are matched with the underscore on purpose: the real
+# 'beads' db must not be mistaken for a beads_t* orphan.
+# Prints nothing for a missing dir; main() is what decides that is an error.
+_discover_live_dbs() {
+  local root="$1" d name
+  [ -d "$root" ] || return 0
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    case "$name" in
+      testdb_*|beads_t*|beads_pt*) continue ;;
+    esac
+    [ -d "${d}.dolt" ] || continue
+    printf '%s\n' "$name"
+  done
+}
+
 # _now_epoch — wall clock, epoch seconds. RESTORE_VERIFY_NOW_EPOCH is a TEST
 # HOOK (pins "now" so the age tests do not depend on the real clock); nothing
 # in production sets it, and a non-numeric value is ignored (real clock), never
@@ -194,12 +224,17 @@ _live_counts_with_post() {
   printf '%s\n' "$row" | awk -F'|' '{gsub(/[[:space:]]/,"",$2); gsub(/[[:space:]]/,"",$3); print $2, $3}'
 }
 
-# _verify_one_db <db> — echoes "<db>=OK(n)" / "SKIP(reason)" / "FAIL(reason)"
-# to stdout and returns 0 for OK/SKIP, 1 for FAIL. SKIP is deliberately NOT a
-# failure: "could not check right now" (no baseline, no disk headroom) is a
-# different, honest third state from "checked and it's broken" — collapsing
-# them would either mask a real integrity failure as routine, or alarm on a
-# transient disk squeeze that isn't the backup's fault.
+# _verify_one_db <db> — echoes "<db>=OK(n)" / "SKIP(reason)" / "FAIL(reason)" /
+# "NO-BACKUP(reason)" to stdout and returns 0 for OK/SKIP, 1 for FAIL, 3 for
+# NO-BACKUP. SKIP is deliberately NOT a failure: "could not check right now" (no
+# baseline, no disk headroom) is a different, honest third state from "checked
+# and it's broken" — collapsing them would either mask a real integrity failure
+# as routine, or alarm on a transient disk squeeze that isn't the backup's fault.
+# NO-BACKUP is a fourth, and it is not a SKIP either (ga-e01691): a LIVE db with
+# no backup directory at all has nothing to restore from, i.e. it is unprotected.
+# Filing that under SKIP put it in the same bucket as a disk squeeze, and a run
+# of "OK + one SKIP" is recorded as a clean, closed chore. rc 3 keeps it apart
+# from 0 (OK/SKIP) and from 1 (a backup that WAS checked and is broken).
 _verify_one_db() {
   local db="$1"
   if [ ! -d "$DOLTDIR/$db" ]; then
@@ -208,9 +243,13 @@ _verify_one_db() {
     return 0
   fi
   if [ ! -d "$BACKUP_ROOT/$db" ]; then
-    log "pulando '$db': sem backup em $BACKUP_ROOT"
-    echo "${db}=SKIP(sem-backup)"
-    return 0
+    if [ -d "$BACKUP_ROOT/$db.new" ]; then
+      log "'$db': SEM BACKUP LOCAL em $BACKUP_ROOT/$db — so existe $db.new (reseed que nao terminou; nao e backup restauravel)"
+    else
+      log "'$db': SEM BACKUP LOCAL em $BACKUP_ROOT/$db — banco vivo sem nada para restaurar"
+    fi
+    echo "${db}=NO-BACKUP(sem-backup-local)"
+    return 3
   fi
 
   # Baseline = the live db as it was WHEN THE BACKUP WAS TAKEN (see the
@@ -332,6 +371,14 @@ _verify_one_db() {
 # that checked nothing — the exact SKIP/OK collapse _verify_one_db's own
 # header warns against, just one level up. Filed as an open bug like FAIL,
 # but lower priority: it needs eyes, but it isn't a proven integrity break.
+# It is also the shape of a run whose LIST of live dbs could not be read
+# (ga-e01691): a db missing from the list is a db nobody checked, and a run that
+# cannot tell "no dbs" from "could not list them" must not file a clean record.
+# overall_rc=3 (ga-e01691) is a LIVE db with no local backup at all: nothing to
+# restore from, so the db is unprotected. Not a FAIL (no backup was checked and
+# found broken) and not a SKIP (that is a transient "could not check"): its own
+# title, an OPEN P1 bug routed to gastown.dog, never closed by the job that found
+# it — the missing backup is the thing that has to be fixed first.
 _file_summary_bead() {
   local results="$1" overall_rc="$2" title body bead_id meta
   body="Verificacao de restore automatizada (ga-jz7gg). Resultado por banco:
@@ -343,9 +390,16 @@ Log completo: $LOG"
     bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=chore --priority=3 --labels=restore-verify --description="$body" --silent 2>/dev/null)
     [ -n "$bead_id" ] && timeout 30 "$BD_BIN" -C "$CITY" close "$bead_id" --reason "restore-verify semanal limpo" -q 2>/dev/null
   elif [ "$overall_rc" -eq 2 ]; then
-    title="Restore-verify semanal SEM VERIFICACAO (todos os bancos SKIP): $results"
+    title="Restore-verify semanal SEM VERIFICACAO (nenhum banco verificado, ou lista de bancos vivos ilegivel): $results"
     meta='{"gc.routed_to":"gastown.dog"}'
     bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=bug --priority=2 --labels=restore-verify --description="$body" --metadata="$meta" --silent 2>/dev/null)
+  elif [ "$overall_rc" -eq 3 ]; then
+    title="Restore-verify semanal SEM BACKUP LOCAL (banco vivo sem nada para restaurar): $results"
+    body="$body
+
+Banco(s) marcado(s) NO-BACKUP: existe banco vivo, mas nao existe $BACKUP_ROOT/<banco>. Enquanto isso o banco nao tem copia local restauravel. Recriar o backup (scripts/dolt-backup-reseed.sh re-semeia o backup de UM banco) e rodar de novo; esta bead so fecha quando o proximo restore-verify listar o banco como OK."
+    meta='{"gc.routed_to":"gastown.dog"}'
+    bead_id=$(timeout 30 "$BD_BIN" -C "$CITY" create --title="$title" --type=bug --priority=1 --labels=restore-verify --description="$body" --metadata="$meta" --silent 2>/dev/null)
   else
     title="Restore-verify semanal FALHOU: $results"
     meta='{"gc.routed_to":"gastown.dog"}'
@@ -366,10 +420,25 @@ Log completo: $LOG"
 }
 
 main() {
-  local db_list results="" overall_rc=0 db one_result one_rc ok_count=0 fail_seen=0
-  if [ -n "$ONLY_DBS" ]; then db_list="$ONLY_DBS"; else db_list="$(_discover_dbs "$BACKUP_ROOT")"; fi
-  if [ -z "$db_list" ]; then
-    log "nenhum banco encontrado em $BACKUP_ROOT — nada a verificar"
+  local db_list results="" overall_rc=0 db one_result one_rc ok_count=0 fail_seen=0 nobackup_seen=0 live_list_bad=0
+  if [ -n "$ONLY_DBS" ]; then
+    db_list="$ONLY_DBS"
+  else
+    # The list is the LIVE dbs plus whatever backup dirs exist (ga-e01691). Live
+    # first: a db with no backup dir must still get a line in the summary. Backup
+    # dirs stay in the union so an orphaned backup (fixdepkeys_*, a dropped db)
+    # keeps reporting SKIP(sem-banco-vivo) instead of disappearing.
+    # An unreadable live dir is not "no dbs": with no list of what is alive this
+    # run cannot know what it failed to check, so it is filed as incomplete below
+    # rather than as a clean no-op.
+    if [ ! -d "$DOLTDIR" ]; then
+      live_list_bad=1
+      log "AVISO: nao consegui listar os bancos vivos ($DOLTDIR nao e um diretorio) — so os backups existentes serao verificados e o resumo sai como INCOMPLETO"
+    fi
+    db_list="$( { _discover_live_dbs "$DOLTDIR"; _discover_dbs "$BACKUP_ROOT"; } | sort -u )"
+  fi
+  if [ -z "$db_list" ] && [ "$live_list_bad" -eq 0 ]; then
+    log "nenhum banco vivo em $DOLTDIR e nenhum backup em $BACKUP_ROOT — nada a verificar"
     return 0
   fi
   for db in $db_list; do
@@ -377,15 +446,27 @@ main() {
     one_result="$(_verify_one_db "$db")"; one_rc=$?
     results="${results}${one_result} "
     case "$one_result" in "${db}=OK("*) ok_count=$((ok_count + 1)) ;; esac
-    [ "$one_rc" -ne 0 ] && fail_seen=1
+    case "$one_rc" in
+      0) ;;
+      3) nobackup_seen=1 ;;
+      *) fail_seen=1 ;;
+    esac
   done
+  [ "$live_list_bad" -eq 1 ] && results="${results}vivos=SKIP(sem-diretorio-vivo) "
   if [ "$fail_seen" -eq 1 ]; then
     overall_rc=1
-  elif [ "$ok_count" -eq 0 ]; then
-    # Every db this run SKIPped -- nothing was actually verified. Distinct
-    # from overall_rc=0, which requires at least one real restore+compare;
-    # collapsing this into rc=0 would file a "clean" bead on a run that
-    # proved nothing (see _file_summary_bead's overall_rc=2 branch).
+  elif [ "$nobackup_seen" -eq 1 ]; then
+    # A live db with nothing to restore from outranks "nothing verified" (rc=2):
+    # it is a proven gap, not just an absence of proof. A real FAIL still wins —
+    # both are P1 bugs and the NO-BACKUP db is named in the same results string.
+    overall_rc=3
+  elif [ "$ok_count" -eq 0 ] || [ "$live_list_bad" -eq 1 ]; then
+    # Every db this run SKIPped -- nothing was actually verified -- or the list of
+    # live dbs could not be read, so "everything OK" is only true of the dbs that
+    # happened to have a backup dir. Distinct from overall_rc=0, which requires at
+    # least one real restore+compare over a list that was actually read;
+    # collapsing this into rc=0 would file a "clean" bead on a run that proved
+    # nothing (see _file_summary_bead's overall_rc=2 branch).
     overall_rc=2
   fi
   log "=== resumo: $results ==="
