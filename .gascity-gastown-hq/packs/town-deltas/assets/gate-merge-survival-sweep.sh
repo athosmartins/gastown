@@ -147,7 +147,14 @@ notify_athos() {
 # this (97 bogus divergent verdicts in one run, 28/09) when git errored
 # during a concurrent town-root operation. Echoes one of: yes | no | error.
 # On error, logs the captured stderr so the underlying git failure is
-# diagnosable instead of silently misclassified.
+# diagnosable instead of silently misclassified. The warn() call is pinned to
+# fd2 (1>&2) so its log line can never leak into the caller's `res=$(...)`
+# capture: under production config (gate-merge-survival-sweep.plist sets
+# SURVIVAL_LOG_STDOUT=1), warn()->_log_emit() echoes to stdout too, and
+# without this redirect that line lands INSIDE res ahead of the "error"
+# token — a two-line value the downstream `case "$res" in error) ...` can't
+# exact-match, so it falls through silently and reproduces the exact bug
+# ga-kj7fpt exists to fix (caught by gate review on fix-attempt 1).
 _is_ancestor() {
   local gdir="$1" container="$2" ancestor="$3" descendant="$4" out rc
   out=$(git_in "$gdir" "$container" merge-base --is-ancestor "$ancestor" "$descendant" 2>&1)
@@ -155,7 +162,7 @@ _is_ancestor() {
   case "$rc" in
     0) echo "yes" ;;
     1) echo "no" ;;
-    *) warn "merge-base --is-ancestor $ancestor $descendant failed rc=$rc: $out"; echo "error" ;;
+    *) warn "merge-base --is-ancestor $ancestor $descendant failed rc=$rc: $out" 1>&2; echo "error" ;;
   esac
 }
 

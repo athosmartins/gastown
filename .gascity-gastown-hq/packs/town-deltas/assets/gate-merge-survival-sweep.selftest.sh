@@ -144,8 +144,23 @@ chmod +x "$FAKE_GIT_ERR_DIR/git"
 git -C "$R" update-ref refs/remotes/origin/main "$D1"
 eq "sanity: with a healthy git, this pair is genuinely divergent" \
   "$(survival_classify "$R" 0 "$C3" origin/main)" "divergent"
-eq "is-ancestor rc=128 (git failure) on both directions -> unresolved, NOT divergent" \
+eq "is-ancestor rc=128 (git failure) on the FIRST direction checked -> unresolved, NOT divergent" \
   "$(PATH="$FAKE_GIT_ERR_DIR:$PATH" survival_classify "$R" 0 "$C3" origin/main)" "unresolved"
+
+# ── 1d. ga-kj7fpt gate-review finding: the 1c test above passes vacuously.
+# `$(...)` makes `[ -t 1 ]` false and SURVIVAL_LOG_STDOUT defaults to 0, so
+# _log_emit() never echoes and _is_ancestor's `res` is a clean "error" even
+# WITHOUT the fix. gate-merge-survival-sweep.plist sets SURVIVAL_LOG_STDOUT=1
+# unconditionally in production, so THIS is the config that must be tested:
+# under it, warn()'s log line used to land inside `res=$(_is_ancestor ...)`
+# ahead of the "error" token, a two-line value the exact-match
+# `case "$res" in error)` can't match — falling through silently toward
+# content-equivalence/divergent, reproducing the original bug. The fix pins
+# warn()'s output to fd2 for this one call so it can never enter the
+# captured return channel, regardless of SURVIVAL_LOG_STDOUT.
+echo "── 1d. ga-kj7fpt: same failure, but under the ACTUAL production config (SURVIVAL_LOG_STDOUT=1) ──"
+eq "is-ancestor rc=128 UNDER PRODUCTION LOGGING CONFIG -> still unresolved, NOT divergent" \
+  "$(SURVIVAL_LOG_STDOUT=1 PATH="$FAKE_GIT_ERR_DIR:$PATH" survival_classify "$R" 0 "$C3" origin/main)" "unresolved"
 
 # ── 2. iso_to_epoch + entry_within_retention ────────────────────────────────
 echo "── 2. age / retention helpers ──"
