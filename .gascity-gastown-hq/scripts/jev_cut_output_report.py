@@ -38,6 +38,7 @@ def compute_stats(records: list[dict]) -> dict:
         "tokens_would_save_total": 0,
         "tokens_would_save_known": 0,  # how many records had a non-None tokens_would_save
         "jev_unreachable_count": 0,  # cut-output-jev only
+        "unknown_count": 0,  # cut-output-fixed only: shape recognized, rule could not cut it (rule "unknown")
     } for exp in SOURCE_EXPERIMENTS}
     joins: dict[tuple[str, str], bool | None] = {}
 
@@ -61,6 +62,8 @@ def compute_stats(records: list[dict]) -> dict:
             s["tokens_would_save_known"] += 1
         if exp == "cut-output-jev" and rec.get("jev_ok") is False:
             s["jev_unreachable_count"] += 1
+        if exp == "cut-output-fixed" and rec.get("rule") == "unknown":
+            s["unknown_count"] += 1
 
     referenced_true = 0
     referenced_false = 0
@@ -89,6 +92,8 @@ def format_report(stats: dict) -> str:
         s = stats[exp]
         avg = (s["tokens_would_save_total"] / s["tokens_would_save_known"]) if s["tokens_would_save_known"] else None
         lines.append(f"  {label}: {s['count']} case(s), avg tokens_would_save={avg:.0f}" if avg is not None else f"  {label}: {s['count']} case(s), no measurable tokens_would_save yet")
+        if exp == "cut-output-fixed" and s["unknown_count"]:
+            lines.append(f"    {s['unknown_count']} unknown (shape recognized but the rule could not cut it, kept in full; not in the average)")
         if exp == "cut-output-jev":
             lines.append(f"    Jev unreachable in {s['jev_unreachable_count']}/{s['count']} case(s) (third state, never counted as a cut)")
     j = stats["joins"]
@@ -173,6 +178,21 @@ def _selftest() -> int:
 
     pt = format_resumo_pt(stats)
     ok("format_resumo_pt is non-empty and mentions SOMBRA", "SOMBRA" in pt)
+
+    # ---- ga-wk0qi2 gate feedback attempt 4: 'unknown' fixed-rule records (the rule recognized the
+    # shape but could not cut it safely) are counted and shown SEPARATELY, and their None
+    # tokens_would_save must not enter the average as if it were a measured "saves nothing" ----
+    unk_records = records + [
+        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e10", "rule": "unknown", "tokens_would_save": None},
+        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "e11", "rule": "unknown", "tokens_would_save": None},
+    ]
+    unk_stats = compute_stats(unk_records)
+    ok("unknown records still count as observed fixed-rule cases", unk_stats["cut-output-fixed"]["count"] == 4)
+    ok("unknown records are counted on their own", unk_stats["cut-output-fixed"]["unknown_count"] == 2)
+    ok("the plain stats report zero unknown", stats["cut-output-fixed"]["unknown_count"] == 0)
+    ok("unknown records do not enter the tokens_would_save average", unk_stats["cut-output-fixed"]["tokens_would_save_known"] == 2)
+    ok("format_report shows the unknown count", "2 unknown" in format_report(unk_stats))
+    ok("format_report stays quiet about unknown when there are none", "unknown" not in format_report(stats).split("Offline join")[0])
 
     empty_stats = compute_stats([])
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)

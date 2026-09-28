@@ -25,7 +25,9 @@ the hard way.
 TWO TIERS, per this bead's own "Mecanismo" text:
   1. Fixed rule (no AI, no network): cut_output_classifier.classify_output() recognizes a pytest
      run or a generic long/log-shaped dump and would keep head+tail+error-lines+summary. Cheap,
-     deterministic, logged as experiment "cut-output-fixed".
+     deterministic, logged as experiment "cut-output-fixed". A pytest run it cannot read (killed or
+     truncated, no final summary) comes back as rule "unknown": nothing would be cut, and the
+     record carries tokens_would_save=None -- a distinct third state, not a zero-token cut.
   2. Jev, ONLY for output that is large but matches neither fixed shape ("unstructured"): the
      text is split into blocks and Jev answers one atomic noul (0..1) question per block --
      "is this block relevant to the task" -- in a SINGLE call_jev_multi call (the state, i.e.
@@ -157,6 +159,10 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
     ga-wk0qi2 gate feedback, attempt 1, blocking issue 2). `meta` carries session/tool
     identifiers."""
     omitted_text = verdict.get("omitted_text", "")
+    # rule "unknown" = the classifier recognized the shape but cannot cut it safely (e.g. a pytest
+    # run with no final summary): nothing is cut, and that is NOT the same fact as "cutting saves 0
+    # tokens" -- so tokens_would_save is None (third state), which the report keeps out of its average.
+    is_unknown = verdict["rule"] == "unknown"
     return {
         "ts": _now_iso(),
         "mode": "shadow",
@@ -167,11 +173,12 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
         "tool_use_id": meta.get("tool_use_id"),
         "command": meta.get("command", "")[:COMMAND_LOG_CHARS],
         "rule": verdict["rule"],
+        "reason": verdict.get("reason"),
         "chars_before": verdict["chars_before"],
         "chars_after": verdict["chars_after"],
         "tokens_before": verdict["tokens_before"],
         "tokens_after": verdict["tokens_after"],
-        "tokens_would_save": max(0, verdict["tokens_before"] - verdict["tokens_after"]),
+        "tokens_would_save": None if is_unknown else max(0, verdict["tokens_before"] - verdict["tokens_after"]),
         "omitted_signatures": coc.extract_signatures(omitted_text),
         "referenced_later": None,  # filled in by the offline join (jev_cut_output_join.py)
     }
@@ -400,6 +407,37 @@ def _selftest() -> int:
         ok(
             "regression (blocking issue 2): the middle occurrence of a repeated line is still captured as an omitted signature",
             "ga-dupe99" in dup_rec["omitted_signatures"],
+        )
+
+    # ---- ga-wk0qi2 gate feedback attempt 4 (+ Mayor's directive): a pytest run the fixed rule cannot
+    # read (killed/truncated, no final summary banner) is the explicit 'unknown' state -- logged as
+    # its own thing, never as a cut of 0 tokens (which would drag the average down as if the rule had
+    # examined it and found nothing worth cutting) and never re-routed to Jev. ----
+    truncated_pytest = all_pass_stdout[: all_pass_stdout.index("test_mod.py::test_250")] + "test_mod.py::test_25"
+    unk_verdict = coc.classify_output("pytest", truncated_pytest)
+    ok("setup: truncated pytest -> classify_output returns the 'unknown' verdict", unk_verdict is not None and unk_verdict["rule"] == "unknown")
+    if unk_verdict:
+        unk_rec = build_fixed_log_record(unk_verdict, {"tool_use_id": "tu-unk", "command": "pytest"})
+        ok("unknown record: rule is logged as 'unknown'", unk_rec["rule"] == "unknown")
+        ok("unknown record: tokens_would_save is None (third state), not 0", unk_rec["tokens_would_save"] is None)
+        ok("unknown record: nothing omitted -> no omitted_signatures to join on", unk_rec["omitted_signatures"] == [])
+        ok("unknown record: chars_after == chars_before (nothing was cut)", unk_rec["chars_after"] == unk_rec["chars_before"])
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("unknown pytest case must not call Jev")):
+            process({
+                "tool_name": "Bash",
+                "tool_response": {"stdout": truncated_pytest, "stderr": ""},
+                "tool_use_id": "tu-pytest-truncated",
+                "tool_input": {"command": "pytest"},
+            })
+        unk_lines = log_path.read_text().splitlines()
+        ok("process(): truncated pytest writes exactly one fixed-rule record", len(unk_lines) == 1)
+        unk_e2e = json.loads(unk_lines[0])
+        ok(
+            "process(): truncated pytest is logged as 'unknown' with no would-save number",
+            unk_e2e["experiment"] == EXPERIMENT_FIXED and unk_e2e["rule"] == "unknown" and unk_e2e["tokens_would_save"] is None,
         )
 
     # ---- build_jev_log_record: Jev ok, mixed relevant/irrelevant blocks ----

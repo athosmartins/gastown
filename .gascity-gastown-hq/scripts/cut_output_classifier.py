@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """cut_output_classifier.py (ga-wk0qi2, child of ga-aijm2v) — the "regra fixa" half of the
 cut-large-output SHADOW front: pure, no-I/O, no-network classification of a Bash command's
-output into one of three shapes:
+output into one of these shapes:
 
-  1. "pytest": a pytest run. Kept = the FAILURES section(s) + the final one-line summary
-     (or, if nothing failed, just the summary line). Everything else (setup noise, collection,
-     PASSED lines) is the omitted part.
+  1. "pytest": a pytest run whose last session reached its final summary banner. Kept = the
+     FAILURES section (first failure header up to the short-summary section, or up to the banner)
+     + the banner line (or, if nothing failed, just the banner). Everything else (setup noise,
+     collection, PASSED lines) is the omitted part.
   2. "log-tail": a generic long/log-shaped dump. Kept = head N + tail N + every line that looks
-     like an error/exception/traceback signal (deduped), in original order. Everything else is
-     omitted.
-  3. None ("unstructured"): output is large but does not match either fixed shape above. The
+     like an error/exception/traceback signal, in original order. Everything else is omitted.
+  3. "unknown": recognizably pytest, but not in a shape the rule can cut safely (killed/truncated
+     mid-run, no final banner after the last session). Nothing is omitted, everything is kept --
+     the shadow log records it as unknown, distinct from both "cut" and "nothing to cut".
+  4. None ("unstructured"): output is large but does not match any fixed shape above. The
      caller (cut-output-shadow.py) is the one that decides what to do with an unstructured
      block (ask Jev), never this module — this module answers ONLY "does a fixed, no-AI rule
      apply here, and if so what would it keep".
 
+SINGLE SOURCE (ga-wk0qi2 gate attempt 4): a classifier only chooses WHICH LINES to keep, and
+_verdict_from_kept_lines() derives everything else from that one partition -- kept_text,
+omitted_text, kept_spans/omitted_spans, rendered_text (what the agent would see, with omitted-run
+markers), the counts. For every verdict each input line is in exactly one of kept/omitted, and
+the two rebuild the input exactly; a classifier cannot report text as kept that it did not pick
+from the input. The selftest checks this over real and synthetic outputs cut at many points.
+
 THIRD STATE: classify_output() returns None when no fixed rule applies (including when the
 output is simply too small to bother with) — None is "no fixed-rule verdict", never "cut
-everything" or "cut nothing". A caller must not treat None as either extreme.
+everything" or "cut nothing". A caller must not treat None as either extreme. Likewise rule
+"unknown" is "could not read this, so did not cut", never "examined, nothing worth cutting".
 
 NEVER RAISES: every public function here is total over its documented input types (str/str).
 Encoding weirdness, empty strings, binary-looking bytes-as-text -- all produce a verdict or
@@ -58,20 +69,20 @@ _ERROR_LINE_RE = re.compile(
 # some CI wrappers reflow or strip the "=" padding, but never rename the phrase itself.
 _PYTEST_SESSION_RE = re.compile(r"session starts", re.IGNORECASE)
 # pytest's own trailing one-line summary banner, e.g. "===== 5 passed in 0.12s =====",
-# "=== 2 failed, 3 passed in 1.02s ===", or "==== no tests ran in 0.01s ====" (no digit-count
-# phrase at all, printed whenever 0 tests are collected). Anchored on the STRUCTURAL shape pytest
-# uses for every one of its final-summary variants -- "=" padding wrapping some text that ends in
-# "in X.XXs" -- rather than enumerating the specific outcome words (passed/failed/errors/no tests
-# ran/...) or assuming "the last non-blank line of text". A caller that appends anything after the
-# real pytest output (e.g. stderr) can then never displace the summary out of position, for ANY
-# pytest banner shape, not just the digit-count ones (ga-wk0qi2 gate feedback: attempt 1 blocking
-# issue 1 fixed only the digit-count shapes; attempt 3 blocking issue 1 found "no tests ran" was
-# still uncovered -- this generalizes to the whole class instead of adding one more literal phrase).
+# "=== 2 failed, 3 passed in 1.02s ===", "==== no tests ran in 0.01s ====" (no digit-count phrase
+# at all, printed whenever 0 tests are collected) or "=== 1 failed in 65.32s (0:01:05) ===" (runs
+# over a minute append an H:MM:SS suffix). Matched against ONE LINE at a time and anchored on the
+# STRUCTURAL shape pytest uses for every one of its final-summary variants -- "=" padding wrapping
+# some text that ends in "in X.XXs" -- rather than enumerating outcome words or assuming "the last
+# non-blank line of text", so anything a caller appends after the real pytest output (e.g. stderr)
+# cannot displace it. A pytest run whose last session has no such line after it is NOT cut at all
+# (classify_pytest returns rule "unknown"): a shape this regex misses degrades to "don't cut",
+# never to a guessed summary.
 _PYTEST_FINAL_SUMMARY_RE = re.compile(
-    r"^=+.*\bin\s+[\d.]+s\s*=+\s*$",
-    re.IGNORECASE | re.MULTILINE,
+    r"^=+.*\bin\s+[\d.]+s(?:\s*\(\d+:\d{2}:\d{2}\))?\s*=+\s*$",
+    re.IGNORECASE,
 )
-_PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}.*_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE | re.MULTILINE)
+_PYTEST_FAILURES_HEADER_RE = re.compile(r"^_{5,}.*_{5,}\s*$|^={3,}\s*FAILURES\s*={3,}\s*$", re.IGNORECASE)  # matched per line
 _PYTEST_SHORT_SUMMARY_RE = re.compile(r"short test summary info", re.IGNORECASE)
 
 
@@ -82,90 +93,124 @@ def estimate_tokens(text: str) -> int:
     return max(0, round(len(text) / CHARS_PER_TOKEN))
 
 
-def _text_outside_spans(text: str, spans: list[tuple[int, int]]) -> str:
-    """Pure. Concatenates the parts of `text` NOT covered by any (start, end) char span in
-    `spans`, in original order -- a POSITION-based complement, never a content-based one. Used to
-    compute what a classifier omitted without re-matching kept lines by text, which silently
-    mishandles a line that is genuinely repeated at another position (ga-wk0qi2 gate feedback,
-    attempt 1, blocking issue 2)."""
-    if not spans:
-        return text
-    ordered = sorted(spans)
-    pieces: list[str] = []
-    cursor = 0
-    for start, end in ordered:
-        if start > cursor:
-            pieces.append(text[cursor:start])
-        cursor = max(cursor, end)
-    if cursor < len(text):
-        pieces.append(text[cursor:])
-    return "".join(pieces)
+def _split_lines(text: str) -> tuple[list[str], list[int]]:
+    """Pure. `text` as lines WITH their terminators (so "".join(lines) == text exactly, for any
+    line-ending style splitlines() knows -- \\n, \\r\\n, \\x0c, \\u2028 ...) plus the char offset at
+    which each line starts (`offsets[i]` .. `offsets[i+1]` is line i; len(offsets) == len(lines)+1)."""
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for ln in lines:
+        offsets.append(offsets[-1] + len(ln))
+    return lines, offsets
+
+
+def _verdict_from_kept_lines(rule: str, text: str, lines: list[str], offsets: list[int], kept_idx: set[int], **extra) -> dict:
+    """The ONE place a verdict is built (ga-wk0qi2 gate feedback, attempt 4 + Mayor's directive).
+    A classifier's whole job is to decide WHICH LINES of `text` to keep (`kept_idx`); everything
+    else -- kept_text, omitted_text, the spans, the agent-facing rendered_text, every count -- is
+    derived here from that single partition. Earlier versions built kept_text from ad-hoc pieces
+    (kept_parts) and omitted_text from spans, two sources that any branch could make disagree: text
+    reported as kept AND omitted, or a "kept" line that was never in the input.
+
+    By construction, for every verdict: each line of `text` is in exactly one of kept/omitted;
+    kept_spans + omitted_spans tile [0, len(text)) with no gap or overlap; kept_text and
+    omitted_text are exactly the concatenation of their spans (no synthetic text -- a classifier
+    cannot add a "kept" line that is not in the input, because it can only pick indices).
+    `rendered_text` is what the agent WOULD see: kept lines in order, with one
+    "[N lines omitted; run with RAW=1]" marker per omitted run. chars_after/tokens_after measure
+    THAT, so the shadow number includes the marker's own cost."""
+    total = len(lines)
+    kept_spans: list[tuple[int, int]] = []
+    omitted_spans: list[tuple[int, int]] = []
+    rendered: list[str] = []
+    lines_kept = 0
+    i = 0
+    while i < total:
+        is_kept = i in kept_idx
+        j = i
+        while j < total and (j in kept_idx) == is_kept:
+            j += 1
+        span = (offsets[i], offsets[j])
+        if is_kept:
+            kept_spans.append(span)
+            rendered.append(text[span[0]:span[1]])
+            lines_kept += j - i
+        else:
+            omitted_spans.append(span)
+            rendered.append(f"[{j - i} lines omitted; run with RAW=1]\n")
+        i = j
+    kept_text = "".join(text[s:e] for s, e in kept_spans)
+    omitted_text = "".join(text[s:e] for s, e in omitted_spans)
+    rendered_text = "".join(rendered)
+    verdict = {
+        "rule": rule,
+        "kept_text": kept_text,
+        "omitted_text": omitted_text,
+        "rendered_text": rendered_text,
+        "kept_spans": kept_spans,
+        "omitted_spans": omitted_spans,
+        "chars_before": len(text),
+        "chars_after": len(rendered_text),
+        "tokens_before": estimate_tokens(text),
+        "tokens_after": estimate_tokens(rendered_text),
+        "lines_total": total,
+        "lines_kept": lines_kept,
+        "lines_omitted": total - lines_kept,
+    }
+    verdict.update(extra)
+    return verdict
+
+
+def _unknown_verdict(text: str, reason: str) -> dict:
+    """The third state, made explicit: the text is recognizably the kind of thing a rule handles
+    but not in a shape that rule can cut safely (e.g. a pytest run with no final summary banner --
+    killed or truncated mid-run). Nothing is omitted, everything is kept, rule == "unknown". Never
+    an invented "trailing" line: not knowing how to cut means not cutting (the shadow log then
+    records the case as unknown, distinct from both "cut" and "nothing to cut")."""
+    lines, offsets = _split_lines(text)
+    return _verdict_from_kept_lines("unknown", text, lines, offsets, set(range(len(lines))), reason=reason)
 
 
 def classify_pytest(text: str) -> dict | None:
-    """None if `text` is not recognizably a pytest run. Otherwise a verdict dict:
-    {rule: "pytest", kept_text, omitted_text, chars_before, chars_after, tokens_before,
-     tokens_after, lines_total, lines_kept}. Kept text = every FAILURES section (from a
-     `___ name ___` or `=== FAILURES ===` banner to the next banner or the short-summary section)
-     plus the trailing summary line (pytest's own "=== ... in X.XXs ===" banner, found by shape
-     and position, not by assuming it is the last line of `text`); if nothing failed, kept text is
-     just that summary line. `omitted_text` is the position-based complement of the kept spans."""
-    if not text or not _PYTEST_SESSION_RE.search(text):
+    """None if `text` is not recognizably a pytest run (no "test session starts" line). Otherwise
+    a verdict dict from _verdict_from_kept_lines():
+
+      * rule "pytest" when the LAST pytest session in `text` ran to its final summary banner
+        (pytest's own "=== ... in X.XXs ===" line, matched by shape, never assumed to be the last
+        line of `text`). Kept = that banner line + every line from the first FAILURES header of
+        that session up to (not including) its "short test summary info" header, or up to the
+        banner when there is no such section. Nothing failed -> kept is just the banner.
+      * rule "unknown" (keep everything, omit nothing) when the last session has NO final banner
+        after it -- output killed/truncated mid-run, or a banner that belongs to an earlier,
+        already-finished run. There is no summary to anchor on, so the rule does not cut."""
+    if not text:
         return None
+    lines, offsets = _split_lines(text)
 
-    chars_before = len(text)
-    tokens_before = estimate_tokens(text)
+    session_idx = None
+    banner_idx = None
+    for i, ln in enumerate(lines):
+        if _PYTEST_SESSION_RE.search(ln):
+            session_idx = i
+        if _PYTEST_FINAL_SUMMARY_RE.match(ln):
+            banner_idx = i
+    if session_idx is None:
+        return None
+    if banner_idx is None or banner_idx <= session_idx:
+        return _unknown_verdict(text, "pytest-no-final-summary")
 
-    failure_starts = [m.start() for m in _PYTEST_FAILURES_HEADER_RE.finditer(text)]
-    short_summary_pos = None
-    m = _PYTEST_SHORT_SUMMARY_RE.search(text)
-    if m:
-        short_summary_pos = m.start()
-
-    body_span: tuple[int, int] | None = None
-    if failure_starts:
-        end = short_summary_pos if short_summary_pos is not None and short_summary_pos > failure_starts[0] else len(text)
-        body_span = (failure_starts[0], end)
-        kept_body = text[body_span[0]:body_span[1]].rstrip("\n")
-    else:
-        kept_body = ""
-
-    # The trailing one-line summary ("5 failed, 2 passed in 1.3s") is always kept: it is the
-    # cheapest possible signal of whether anything needs attention. Take the LAST match of
-    # pytest's own banner shape anywhere in `text` -- see _PYTEST_FINAL_SUMMARY_RE's own comment
-    # for why this replaces the old "last non-blank line of text" heuristic.
-    summary_span: tuple[int, int] | None = None
-    summary_matches = list(_PYTEST_FINAL_SUMMARY_RE.finditer(text))
-    if summary_matches:
-        last = summary_matches[-1]
-        trailing = last.group(0).strip()
-        summary_span = (last.start(), last.end())
-    else:
-        # Best-effort fallback for output that never matches the expected banner shape at all.
-        trailing = ""
-        for ln in reversed(text.splitlines()):
-            if ln.strip():
-                trailing = ln
-                break
-
-    kept_parts = [p for p in (kept_body, trailing) if p]
-    kept_text = "\n\n".join(kept_parts) if kept_parts else trailing
-    chars_after = len(kept_text)
-
-    spans = [s for s in (body_span, summary_span) if s is not None]
-    omitted_text = _text_outside_spans(text, spans)
-
-    return {
-        "rule": "pytest",
-        "kept_text": kept_text,
-        "omitted_text": omitted_text,
-        "chars_before": chars_before,
-        "chars_after": chars_after,
-        "tokens_before": tokens_before,
-        "tokens_after": estimate_tokens(kept_text),
-        "lines_total": len(text.splitlines()),
-        "lines_kept": len(kept_text.splitlines()) if kept_text else 0,
-    }
+    kept_idx: set[int] = {banner_idx}
+    failure_idx = next(
+        (i for i in range(session_idx + 1, banner_idx) if _PYTEST_FAILURES_HEADER_RE.match(lines[i])),
+        None,
+    )
+    if failure_idx is not None:
+        body_end = next(
+            (i for i in range(failure_idx + 1, banner_idx) if _PYTEST_SHORT_SUMMARY_RE.search(lines[i])),
+            banner_idx,
+        )
+        kept_idx.update(range(failure_idx, body_end))
+    return _verdict_from_kept_lines("pytest", text, lines, offsets, kept_idx)
 
 
 def classify_log_tail(
@@ -177,19 +222,17 @@ def classify_log_tail(
     """None when `text` has at most `max_lines` lines (nothing to cut) or is empty. Otherwise a
     verdict dict shaped like classify_pytest()'s, rule="log-tail". Kept = the first
     `head_lines`, the last `tail_lines`, and every line matching the error/exception/traceback
-    signal, selected and reconstructed by LINE INDEX (never by re-matching line content — a
-    physically-omitted line that happens to share text with a kept line must still count as
-    omitted; ga-wk0qi2 gate feedback, attempt 1, blocking issue 2) — kept in ORIGINAL order, plus
-    a bracketed omitted-count marker line, e.g. "[142 lines omitted; run with RAW=1]"."""
+    signal, chosen by LINE INDEX (never by re-matching line content -- a physically-omitted line
+    that happens to share text with a kept line must still count as omitted; ga-wk0qi2 gate
+    feedback, attempt 1, blocking issue 2). The verdict itself is built by
+    _verdict_from_kept_lines(), so its rendered_text carries one "[N lines omitted; run with
+    RAW=1]" marker per omitted run, e.g. "[142 lines omitted; run with RAW=1]"."""
     if not text:
         return None
-    lines = text.splitlines()
+    lines, offsets = _split_lines(text)
     total = len(lines)
     if total <= max_lines:
         return None
-
-    chars_before = len(text)
-    tokens_before = estimate_tokens(text)
 
     head_end = min(head_lines, total)
     tail_start = max(total - tail_lines, head_end) if tail_lines > 0 else total
@@ -198,30 +241,7 @@ def classify_log_tail(
     if tail_lines > 0:
         kept_idx.update(range(tail_start, total))
     kept_idx.update(i for i, ln in enumerate(lines) if _ERROR_LINE_RE.search(ln))
-
-    sorted_kept = sorted(kept_idx)
-    omitted = total - len(sorted_kept)
-    marker = f"[{max(omitted, 0)} lines omitted; run with RAW=1]"
-
-    # Splice the marker in right after the head block, then every other kept index (error lines
-    # and tail) in original order -- same visual shape as before, now derived from indices.
-    head_part = lines[:head_end]
-    rest_part = [lines[i] for i in sorted_kept if i >= head_end]
-    kept_text = "\n".join(head_part) + f"\n{marker}\n" + "\n".join(rest_part)
-    omitted_text = "\n".join(lines[i] for i in range(total) if i not in kept_idx)
-    chars_after = len(kept_text)
-    return {
-        "rule": "log-tail",
-        "kept_text": kept_text,
-        "omitted_text": omitted_text,
-        "chars_before": chars_before,
-        "chars_after": chars_after,
-        "tokens_before": tokens_before,
-        "tokens_after": estimate_tokens(kept_text),
-        "lines_total": total,
-        "lines_kept": len(sorted_kept),
-        "lines_omitted": omitted,
-    }
+    return _verdict_from_kept_lines("log-tail", text, lines, offsets, kept_idx)
 
 
 _SIGNATURE_BEAD_ID_RE = re.compile(r"\b(?:ga|wa|gt)-[a-z0-9]{4,10}\b")
@@ -408,7 +428,8 @@ def _selftest() -> int:
         ok("long log: kept text has the tail", "step 299 ok" in r3["kept_text"])
         ok("long log: kept text has the ERROR line even though it's in the middle", "connection refused" in r3["kept_text"])
         ok("long log: kept text has the Traceback line", "Traceback" in r3["kept_text"])
-        ok("long log: has an omitted-count marker naming RAW=1", "lines omitted; run with RAW=1" in r3["kept_text"])
+        ok("long log: rendered_text has an omitted-count marker naming RAW=1", "lines omitted; run with RAW=1" in r3["rendered_text"])
+        ok("long log: kept_text is pure source text -- no synthetic marker in it", "lines omitted" not in r3["kept_text"])
         ok("long log: cuts size down", r3["chars_after"] < r3["chars_before"])
         ok("long log: lines_total matches input", r3["lines_total"] == 300)
         ok("long log: omitted_text has the dropped middle noise", "step 200 ok" in r3["omitted_text"])
@@ -476,6 +497,232 @@ def _selftest() -> int:
     ok("extract_signatures caps at max_signatures", len(extract_signatures(sig_text, max_signatures=2)) == 2)
     ok("extract_signatures is deterministic across calls", extract_signatures(sig_text) == extract_signatures(sig_text))
     ok("extract_signatures never duplicates a signature", len(sigs) == len(set(sigs)))
+
+    # =========================================================================================
+    # ga-wk0qi2 gate feedback, attempt 4 (gate_run ga-1k8gzc) + Mayor's class-level directive:
+    # kept_text and omitted_text used to come from TWO independent sources (kept_parts vs. spans),
+    # so any branch that added kept text without adding its span reported the same text as kept AND
+    # omitted. The invariant below is the class, not the reported instance: for EVERY verdict,
+    # every line of the input is in exactly one of kept / omitted, and the two together rebuild the
+    # input. Checked over real + synthetic texts cut at many points (mid-test, no FAILURES, no
+    # banner, mid-banner, mid-line), through every classify_* entrypoint.
+    # =========================================================================================
+    from collections import Counter
+    import random
+
+    marker_line_re = re.compile(r"^\[\d+ lines omitted; run with RAW=1\]$")
+
+    def overlap_problems(text: str, verdict: dict) -> list[str]:
+        """Text-level oracle, deliberately independent of how a verdict is built: a multiset of
+        non-blank stripped lines. kept + omitted must equal the original -- an EXTRA line means the
+        same content was reported as both kept and omitted; a MISSING line means content was lost."""
+        def norm(s: str) -> Counter:
+            return Counter(ln.strip() for ln in s.splitlines() if ln.strip())
+        kept = Counter({k: v for k, v in norm(verdict["kept_text"]).items() if not marker_line_re.match(k)})
+        omitted = norm(verdict["omitted_text"])
+        original = norm(text)
+        combined = kept + omitted
+        problems = []
+        if combined != original:
+            extra = combined - original
+            missing = original - combined
+            if extra:
+                problems.append(f"reported as kept AND omitted (or invented): {list(extra)[:2]!r}")
+            if missing:
+                problems.append(f"lost (neither kept nor omitted): {list(missing)[:2]!r}")
+        return problems
+
+    def span_problems(text: str, verdict: dict) -> list[str]:
+        """Structural oracle: kept_spans + omitted_spans tile [0, len(text)) exactly (no gap, no
+        overlap, no empty span), every span starts on a line boundary, and kept_text/omitted_text
+        are EXACTLY the concatenation of their spans (no synthetic text, single source)."""
+        ks, os_ = verdict.get("kept_spans"), verdict.get("omitted_spans")
+        if ks is None or os_ is None:
+            return ["verdict carries no kept_spans/omitted_spans"]
+        problems = []
+        line_starts = {0}
+        pos = 0
+        for ln in text.splitlines(keepends=True):
+            pos += len(ln)
+            line_starts.add(pos)
+        cursor = 0
+        for s, e in sorted(list(ks) + list(os_)):
+            if s != cursor:
+                problems.append(f"gap or overlap: expected span to start at {cursor}, got {s}")
+            if e <= s:
+                problems.append(f"empty/inverted span ({s},{e})")
+            if s not in line_starts:
+                problems.append(f"span starts mid-line at {s}")
+            cursor = e
+        if cursor != len(text):
+            problems.append(f"spans end at {cursor}, text is {len(text)} chars")
+        if "".join(text[s:e] for s, e in ks) != verdict["kept_text"]:
+            problems.append("kept_text is not exactly the concatenation of kept_spans")
+        if "".join(text[s:e] for s, e in os_) != verdict["omitted_text"]:
+            problems.append("omitted_text is not exactly the concatenation of omitted_spans")
+        return problems
+
+    real_pytest_fail = (
+        "============================= test session starts ==============================\n"
+        "platform darwin -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0\n"
+        "rootdir: /work/proj\n"
+        "plugins: anyio-4.13.0\n"
+        "collected 34 items\n"
+        "\n"
+        "test_real.py ................................FF                          [100%]\n"
+        "\n"
+        "=================================== FAILURES ===================================\n"
+        "_________________________________ test_broken __________________________________\n"
+        "\n"
+        "    def test_broken():\n"
+        '        data = {"a": 1}\n'
+        '>       assert data["a"] == 2\n'
+        "E       assert 1 == 2\n"
+        "\n"
+        "test_real.py:14: AssertionError\n"
+        "_________________________________ test_raises __________________________________\n"
+        "\n"
+        "    def test_raises():\n"
+        '>       raise ValueError("boom in fixture setup")\n'
+        "E       ValueError: boom in fixture setup\n"
+        "\n"
+        "test_real.py:17: ValueError\n"
+        "=============================== warnings summary ===============================\n"
+        "test_real.py::test_ok_2\n"
+        "  /work/proj/test_real.py:6: DeprecationWarning: legacy thing\n"
+        '    warnings.warn("legacy thing", DeprecationWarning)\n'
+        "\n"
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED test_real.py::test_broken - assert 1 == 2\n"
+        "FAILED test_real.py::test_raises - ValueError: boom in fixture setup\n"
+        "=================== 2 failed, 32 passed, 1 warning in 0.12s ====================\n"
+    )
+
+    # ---- the reported case (gate_run ga-1k8gzc, blocking issue 1): pytest session start, no
+    # FAILURES section, and NO final banner (output killed/truncated mid-run). The old fallback
+    # invented a "trailing" line, kept it, and never gave it a span -- so omitted_text was the
+    # ENTIRE text while kept_text was one of its own lines. Now: "don't know how to cut" -> keep
+    # everything, rule "unknown", nothing omitted. ----
+    truncated_no_banner = pytest_pass[: pytest_pass.index("test_mod.py::test_120")] + "test_mod.py::test_12"
+    r_trunc = classify_pytest(truncated_no_banner)
+    ok("reported case: truncated pytest (no failures, no banner) -> a verdict, not None", r_trunc is not None)
+    if r_trunc:
+        ok("reported case: state is 'unknown' (cannot cut), not a pytest cut", r_trunc["rule"] == "unknown")
+        ok("reported case: nothing is omitted", r_trunc["omitted_text"] == "")
+        ok("reported case: everything is kept, verbatim", r_trunc["kept_text"] == truncated_no_banner)
+        ok("reported case: no line is both kept and omitted", overlap_problems(truncated_no_banner, r_trunc) == [])
+        ok("reported case: chars_after == chars_before (no cut claimed)", r_trunc["chars_after"] == r_trunc["chars_before"])
+
+    # sibling shape: cut inside a failure body, no banner. The FAILURES-present sub-case used to keep the
+    # last line twice (body span AND trailing); now it is the same 'unknown' state.
+    fail_body_cut = pytest_fail[: pytest_fail.index("short test summary")]
+    fail_body_cut = fail_body_cut[: fail_body_cut.rindex("\n")]  # drop the partial banner line
+    r_fail_cut = classify_pytest(fail_body_cut)
+    ok("failure-body cut, no banner -> unknown, keep everything",
+       r_fail_cut is not None and r_fail_cut["rule"] == "unknown" and r_fail_cut["kept_text"] == fail_body_cut and r_fail_cut["omitted_text"] == "")
+
+    # sibling shape: a COMPLETE earlier run followed by a new session that never finished. The old run's
+    # banner must not be taken as the summary of the run that is actually incomplete.
+    stale_banner_then_new_session = pytest_pass + "\n============ test session starts ============\ntest_mod.py::test_0 PASSED\n"
+    r_stale = classify_pytest(stale_banner_then_new_session)
+    ok("stale banner from an earlier run + new unfinished session -> unknown",
+       r_stale is not None and r_stale["rule"] == "unknown" and r_stale["omitted_text"] == "")
+
+    # classify_output must surface 'unknown' as the verdict (not fall through to log-tail, which would
+    # quietly reassign a pytest-shaped output the classifier could not read).
+    big_truncated = pytest_pass[: pytest_pass.index("test_mod.py::test_150")] + "test_mod.py::test_15"
+    r_big_trunc = classify_output("pytest", big_truncated)
+    ok("classify_output: big truncated pytest -> 'unknown' (not silently re-routed to log-tail)",
+       r_big_trunc is not None and r_big_trunc["rule"] == "unknown" and r_big_trunc["omitted_text"] == "")
+
+    # ---- pytest's own "(H:MM:SS)" suffix on long runs is part of the banner shape ----
+    long_run_banner = pytest_fail.replace("1 failed, 150 passed in 3.10s", "1 failed, 150 passed in 65.32s (0:01:05)")
+    r_long_run = classify_pytest(long_run_banner)
+    ok("long-run banner '... in 65.32s (0:01:05) ===' is recognized as the pytest summary",
+       r_long_run is not None and r_long_run["rule"] == "pytest" and "65.32s (0:01:05)" in r_long_run["kept_text"])
+
+    # ---- FAILURES present, NO short-summary section, trailing stderr after the banner: the body
+    # must stop at the banner (not swallow it + the stderr), and the banner must be kept exactly once ----
+    fail_no_short = (
+        pytest_fail[: pytest_fail.index("=========================== short test summary info")]
+        + "======================= 1 failed, 150 passed in 3.10s ========================\n"
+        + "StderrNoise: something a plugin printed to stderr\n"
+    )
+    r_no_short = classify_pytest(fail_no_short)
+    ok("failures + no short-summary + trailing stderr -> a pytest verdict", r_no_short is not None and r_no_short["rule"] == "pytest")
+    if r_no_short and r_no_short["rule"] == "pytest":
+        ok("banner is kept exactly once (body span does not swallow it)", r_no_short["kept_text"].count("1 failed, 150 passed") == 1)
+        ok("trailing stderr after the banner is omitted, not smuggled into the failure body",
+           "StderrNoise" not in r_no_short["kept_text"] and "StderrNoise" in r_no_short["omitted_text"])
+
+    # ---- real captured pytest output ----
+    r_real = classify_pytest(real_pytest_fail)
+    ok("real pytest capture -> pytest rule", r_real is not None and r_real["rule"] == "pytest")
+    if r_real and r_real["rule"] == "pytest":
+        ok("real capture: both failures kept", "test_broken" in r_real["kept_text"] and "boom in fixture setup" in r_real["kept_text"])
+        ok("real capture: final summary kept", "2 failed, 32 passed, 1 warning in 0.12s" in r_real["kept_text"])
+        ok("real capture: collection/rootdir noise omitted", "rootdir:" in r_real["omitted_text"] and "rootdir:" not in r_real["kept_text"])
+        original_lines = set(real_pytest_fail.splitlines())
+        ok("real capture: kept_text only ever contains WHOLE lines of the original (no partial banner)",
+           all(ln in original_lines for ln in r_real["kept_text"].splitlines()))
+
+    # ---- the property, over every classifier, over many cut points ----
+    log_odd_separators = "\r\n".join(
+        ["head line"] + [f"noise {i}\x0cmore text {i}" for i in range(80)] + ["ERROR: boom", "tail line"]
+    )
+    corpus = {
+        "real-pytest-fail": real_pytest_fail,
+        "real-pytest-fail+stderr": real_pytest_fail + "\nDeprecationWarning: something unrelated",
+        "synthetic-pytest-pass": pytest_pass,
+        "synthetic-pytest-fail": pytest_fail,
+        "pytest-no-tests-ran": pytest_no_tests_ran,
+        "long-log-with-errors": long_log,
+        "duplicate-line-log": dup_log,
+        "crlf-and-odd-separators": log_odd_separators,
+    }
+    rng = random.Random(20260928)
+    exercised = {"classify_pytest": 0, "classify_log_tail": 0, "classify_output": 0}
+    violations: list[str] = []
+    for name, full in corpus.items():
+        starts = [0]
+        for ln in full.splitlines(keepends=True):
+            starts.append(starts[-1] + len(ln))
+        step = max(1, len(starts) // 40)
+        points = {1, len(full) - 1, len(full)}
+        points.update(starts[::step])
+        points.update(min(len(full), s + 3) for s in starts[::step])  # cut mid-line
+        points.update(rng.randrange(1, len(full) + 1) for _ in range(25))
+        for m in re.finditer(r"session starts|FAILURES|short test summary|warnings summary|passed|failed|no tests ran", full):
+            points.update({m.start(), m.start() + 4, m.end()})  # right at / inside / just after key banners
+        for p in sorted(q for q in points if 0 < q <= len(full)):
+            for variant, text in (("prefix", full[:p]), ("prefix+stderr", full[:p] + "\nSomeWarning: from stderr")):
+                calls = {
+                    "classify_pytest": classify_pytest(text),
+                    "classify_log_tail": classify_log_tail(text, head_lines=5, tail_lines=5, max_lines=30),
+                    "classify_output": classify_output("cmd", text),
+                }
+                for fn, verdict in calls.items():
+                    if verdict is None:
+                        continue
+                    exercised[fn] += 1
+                    problems = overlap_problems(text, verdict) + span_problems(text, verdict)
+                    if problems:
+                        violations.append(f"{name}[{variant}@{p}] {fn} rule={verdict.get('rule')}: {problems[0]}")
+    for fn, n in exercised.items():
+        ok(f"property: {fn} was actually exercised on >= 40 cut texts (got {n})", n >= 40)
+    ok(f"property: kept/omitted never overlap and always rebuild the text ({len(violations)} violation(s))", not violations)
+    for v in violations[:8]:
+        print(f"    violation: {v}")
+
+    # ---- rendered_text / chars_after: the agent-facing text is derived from the SAME partition ----
+    r_render = classify_log_tail(long_log)
+    if r_render:
+        marker_total = sum(int(m.group(1)) for m in re.finditer(r"^\[(\d+) lines omitted; run with RAW=1\]$", r_render["rendered_text"], re.MULTILINE))
+        ok("rendered_text: per-gap omitted-line markers add up to lines_omitted", marker_total == r_render["lines_omitted"])
+        ok("rendered_text: stripping the markers leaves exactly kept_text",
+           "".join(ln for ln in r_render["rendered_text"].splitlines(keepends=True) if not marker_line_re.match(ln.strip())) == r_render["kept_text"])
+        ok("chars_after measures what the agent would see (rendered_text), markers included", r_render["chars_after"] == len(r_render["rendered_text"]))
 
     print(f"\ncut_output_classifier selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0
