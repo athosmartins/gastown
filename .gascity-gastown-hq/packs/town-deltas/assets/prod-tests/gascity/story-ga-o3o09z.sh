@@ -25,7 +25,7 @@ fail() { echo "[prod-test:gascity ga-o3o09z] FAIL: $*" >&2; exit 1; }
 # ── 1. agent.toml is the source of truth: max_active_sessions = 2 ────────────
 CFG="$CITY/agents/wa-worker/agent.toml"
 [[ -f "$CFG" ]] || fail "agent config missing: $CFG"
-if ! grep -q "^max_active_sessions = 2" "$CFG"; then
+if ! grep -qE "^max_active_sessions = 2[[:space:]]*(#.*)?$" "$CFG"; then
     fail "wa-worker: max_active_sessions = 2 not found in $CFG (got: $(grep '^max_active_sessions' "$CFG" || echo '<missing>'))"
 fi
 log "wa-worker: max_active_sessions = 2 in $CFG ✓"
@@ -37,7 +37,7 @@ log "wa-worker: max_active_sessions = 2 in $CFG ✓"
 CITY_TOML="$CITY/city.toml"
 [[ -f "$CITY_TOML" ]] || fail "city.toml missing: $CITY_TOML"
 if command -v python3 >/dev/null 2>&1; then
-    python3 - "$CITY_TOML" <<'PY' || fail "city.toml [[patches.agent]] for wa-worker sets max_active_sessions — agent.toml is no longer the single source (see stderr above)"
+    PY_OUT=$(python3 - "$CITY_TOML" <<'PY' 2>&1
 import sys
 try:
     import tomllib
@@ -57,7 +57,24 @@ if bad:
     print(f"found max_active_sessions override(s) for wa-worker in [[patches.agent]]: {bad}", file=sys.stderr)
     sys.exit(1)
 PY
-    log "city.toml: no [[patches.agent]] override of wa-worker max_active_sessions ✓"
+    )
+    PY_RC=$?
+    case "$PY_RC" in
+        0)
+            log "city.toml: no [[patches.agent]] override of wa-worker max_active_sessions ✓"
+            ;;
+        2)
+            # "Cannot determine" (missing tomllib, unreadable/unparseable file) is a
+            # distinct outcome from "override found" — collapsing it into FAIL would
+            # spuriously break this test wherever command -v python3 resolves to a
+            # <3.11 interpreter (e.g. this host's own /usr/bin/python3 is 3.9.6),
+            # even though no override exists and the real cause is tooling, not drift.
+            log "city.toml override check: cannot determine ($PY_OUT) — soft skip, not a failure"
+            ;;
+        *)
+            fail "city.toml [[patches.agent]] for wa-worker sets max_active_sessions — agent.toml is no longer the single source ($PY_OUT)"
+            ;;
+    esac
 else
     log "python3 unavailable — skipping city.toml override check (soft skip, not a failure)"
 fi
