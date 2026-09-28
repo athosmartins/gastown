@@ -691,10 +691,13 @@ _sync_with_connection_timeout_retry() {
 # offline fallback's own preflight (needs 13.5GB) then refused. The result: hq had
 # no off-site backup from 2026-09-27 07:40Z on, and the nightly would have
 # repeated the same sequence. The retry has also never once been the path that
-# recovered (the log's 'auto-recover OK after staging reinit' count was 0; every
-# earlier stale-manifest recovery ended in 'offline-sync fallback OK'), so
-# dropping it costs no recovery that was actually happening. Without it the space
-# after the reinit is what the offline preflight below is checked against.
+# recovered: dolt-s3-backup.log holds 3 stale-manifest reinits (2026-09-17, 09-18,
+# 09-28) and 0 'auto-recover OK after staging reinit' lines. The only one that got
+# to a working offline sync (09-18, after the retry failed) recovered THERE; the
+# other two failed (09-17 predates the offline fallback; 09-28 is the incident
+# above). So dropping the retry costs no recovery that was actually happening.
+# Without it the space after the reinit is what the offline preflight below is
+# checked against.
 #
 # Only this branch changes — the connection-timeout branch keeps its retries and
 # its own offline fallback (its staging is healthy; the retries can succeed).
