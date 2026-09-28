@@ -137,6 +137,28 @@ notify_athos() {
   notify "$@" >/dev/null 2>&1 || true
 }
 
+# _is_ancestor <git_dir> <container> <ancestor> <descendant> — wraps `git
+# merge-base --is-ancestor`, distinguishing a true rc1 ("not an ancestor")
+# from any OTHER nonzero rc (git itself failed: corrupt commit-graph, lock
+# contention, transient object-store error, etc). ga-kj7fpt: a bare `if git
+# ...; then` treats rc1 and rc128 identically (both "not zero"), so a git
+# FAILURE on either direction check silently fell through toward
+# content-equivalence and then plain "divergent" — a live sweep hit exactly
+# this (97 bogus divergent verdicts in one run, 28/09) when git errored
+# during a concurrent town-root operation. Echoes one of: yes | no | error.
+# On error, logs the captured stderr so the underlying git failure is
+# diagnosable instead of silently misclassified.
+_is_ancestor() {
+  local gdir="$1" container="$2" ancestor="$3" descendant="$4" out rc
+  out=$(git_in "$gdir" "$container" merge-base --is-ancestor "$ancestor" "$descendant" 2>&1)
+  rc=$?
+  case "$rc" in
+    0) echo "yes" ;;
+    1) echo "no" ;;
+    *) warn "merge-base --is-ancestor $ancestor $descendant failed rc=$rc: $out"; echo "error" ;;
+  esac
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # PURE DECISION FUNCTION — the heart of the sweep; fully unit-testable on a real
 # local git repo with no network.
@@ -148,20 +170,34 @@ notify_athos() {
 #                a FF-only re-push of merge_sha is provably lossless).
 #   divergent  — neither is an ancestor of the other (genuine clobber, new work
 #                on main_ref; auto-FF unsafe → escalate).
-#   unresolved — merge_sha or main_ref does not resolve to a commit object.
+#   unresolved — merge_sha or main_ref does not resolve to a commit object, OR
+#                a `merge-base --is-ancestor` check itself failed (git error,
+#                not a genuine ancestry answer — ga-kj7fpt). This is
+#                deliberately the SAME verdict as an unresolvable sha: both
+#                mean "the classifier could not get a real answer", and both
+#                get the same soft escalation (comment + ntfy P3, no bead
+#                reopen, no Mayor mail) rather than being acted on as if they
+#                were a confirmed clobber.
 # Ancestry note: `merge-base --is-ancestor X X` is rc0, so an exact match
 # (origin == merge_sha) classifies as survived (X is an ancestor of itself).
 # ═════════════════════════════════════════════════════════════════════════════
 survival_classify() {
-  local gdir="$1" container="$2" sha="$3" mref="$4"
+  local gdir="$1" container="$2" sha="$3" mref="$4" res
   git_in "$gdir" "$container" rev-parse -q --verify "${sha}^{commit}" >/dev/null 2>&1 || { echo "unresolved"; return 0; }
   git_in "$gdir" "$container" rev-parse -q --verify "${mref}^{commit}" >/dev/null 2>&1 || { echo "unresolved"; return 0; }
-  if git_in "$gdir" "$container" merge-base --is-ancestor "$sha" "$mref" 2>/dev/null; then
-    echo "survived"; return 0
-  fi
-  if git_in "$gdir" "$container" merge-base --is-ancestor "$mref" "$sha" 2>/dev/null; then
-    echo "ff_heal"; return 0
-  fi
+
+  res=$(_is_ancestor "$gdir" "$container" "$sha" "$mref")
+  case "$res" in
+    error) echo "unresolved"; return 0 ;;
+    yes) echo "survived"; return 0 ;;
+  esac
+
+  res=$(_is_ancestor "$gdir" "$container" "$mref" "$sha")
+  case "$res" in
+    error) echo "unresolved"; return 0 ;;
+    yes) echo "ff_heal"; return 0 ;;
+  esac
+
   if _survival_content_equivalent "$gdir" "$container" "$sha" "$mref"; then
     echo "content_equivalent"; return 0
   fi

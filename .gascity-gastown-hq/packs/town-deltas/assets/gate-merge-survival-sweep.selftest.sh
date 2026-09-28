@@ -115,6 +115,38 @@ fi
 git -C "$R" update-ref refs/remotes/origin/main "$C2"
 rc0 "ff_heal precondition: origin ancestor-of merge" git -C "$R" merge-base --is-ancestor "$C2" "$C3"
 
+# ── 1c. ga-kj7fpt: a `git merge-base --is-ancestor` command that itself FAILS
+# (rc>1 — corrupt commit-graph, lock contention, transient object-store error)
+# must NOT be treated as "not an ancestor" (rc1). The pre-fix code ran the
+# is-ancestor calls as a bare `if ...; then`, which only distinguishes rc0
+# from "anything else" — a real git failure on EITHER direction check was
+# silently swallowed and fell through to content-equivalence and then plain
+# "divergent", exactly the false-positive class that produced 97 bogus
+# divergent verdicts in one live sweep (28/09, 14:57-14:58). A fake `git`
+# on PATH that returns 128 ONLY for merge-base --is-ancestor (passing every
+# other invocation through to the real binary unchanged) isolates the one
+# failure mode under test without faking the whole git surface.
+echo "── 1c. ga-kj7fpt: git error on is-ancestor must not misclassify as divergent ──"
+REAL_GIT="$(command -v git)"
+FAKE_GIT_ERR_DIR="$T/fakegit_err"; mkdir -p "$FAKE_GIT_ERR_DIR"
+cat > "$FAKE_GIT_ERR_DIR/git" <<FAKEGIT
+#!/usr/bin/env bash
+case " \$* " in
+  *" merge-base --is-ancestor "*)
+    echo "fatal: simulated git error (e.g. corrupt commit-graph)" >&2
+    exit 128
+    ;;
+esac
+exec "$REAL_GIT" "\$@"
+FAKEGIT
+chmod +x "$FAKE_GIT_ERR_DIR/git"
+
+git -C "$R" update-ref refs/remotes/origin/main "$D1"
+eq "sanity: with a healthy git, this pair is genuinely divergent" \
+  "$(survival_classify "$R" 0 "$C3" origin/main)" "divergent"
+eq "is-ancestor rc=128 (git failure) on both directions -> unresolved, NOT divergent" \
+  "$(PATH="$FAKE_GIT_ERR_DIR:$PATH" survival_classify "$R" 0 "$C3" origin/main)" "unresolved"
+
 # ── 2. iso_to_epoch + entry_within_retention ────────────────────────────────
 echo "── 2. age / retention helpers ──"
 TS="2026-06-11T00:00:00Z"
@@ -145,7 +177,12 @@ grep -q 'survival_classify()' "$SWEEP"          && ok "defines survival_classify
 grep -q 'escalate_divergent()' "$SWEEP"         && ok "defines escalate_divergent"         || bad "missing escalate_divergent def"
 grep -q 'escalate_unresolved()' "$SWEEP"        && ok "defines escalate_unresolved"        || bad "missing escalate_unresolved def"
 grep -q 'push origin "${SHA}:refs/heads/$RDEFAULT"' "$SWEEP" && ok "ff_heal does FF-only re-push" || bad "ff_heal re-push missing"
-grep -q 'merge-base --is-ancestor "\$mref" "\$sha"' "$SWEEP" && ok "ff_heal direction is origin-ancestor-of-merge (lossless)" || bad "ff_heal ancestry direction wrong/missing"
+# ga-kj7fpt: the raw `merge-base --is-ancestor` call moved into the
+# _is_ancestor helper (so its rc can be checked properly) — the direction
+# guard now asserts on the call SITE (mref then sha = origin-ancestor-of-
+# merge), not the git invocation itself.
+grep -q '_is_ancestor "\$gdir" "\$container" "\$mref" "\$sha"' "$SWEEP" && ok "ff_heal direction is origin-ancestor-of-merge (lossless)" || bad "ff_heal ancestry direction wrong/missing"
+grep -q '_is_ancestor()' "$SWEEP" && ok "defines _is_ancestor helper (ga-kj7fpt)" || bad "missing _is_ancestor def"
 grep -q 'bd -C "\$beadcity" reopen "\$bead"' "$SWEEP" && ok "divergent reopens source bead (re-enqueue)" || bad "reopen missing"
 grep -q 'gate:merge-orphan' "$SWEEP"            && ok "labels orphan bead gate:merge-orphan" || bad "orphan label missing"
 grep -q 'mail send mayor' "$SWEEP"              && ok "escalates divergent to Mayor"         || bad "Mayor escalation missing"
