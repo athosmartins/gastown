@@ -69,6 +69,36 @@
 # Mesma regra de volta: se o swap saturar de novo ou o disk-floor ficar CRITICAL,
 # volta pra 2 (e avisa o Athos, que decidiu o 4).
 #
+# Baixado 4 -> 2 em 2026-09-28 (Mayor, ga-o3o09z; decisao registrada em
+# comentario de 2026-09-25 20:33Z, execucao dispatchada pelo Pilot em 28/09
+# 04:24Z). Motivo: a regra do Athos de 19/09 ("WA 4; se a rajada repetir -> 2")
+# se cumpriu em 25/09 ~15:15-16:20 (load 60-74, swap 9 GB, disco 4,4 GB) - nao
+# e decisao nova de capacidade, e aplicar a regra dele no lugar que de fato
+# manda: o CONTROLADOR criava/acordava sessoes wa-worker-N ate 4 sem consultar
+# o teto do plist do Pilot, entao havia 4 ativas contra o 2 do Pilot.
+#
+# FONTE UNICA: este valor e o que o controlador usa para decidir spawn/wake de
+# wa-worker-N. O env PILOT_WA_WORKER_MAX=2 do plist do Pilot
+# (~/Library/LaunchAgents/com.gascity.pilot.plist) fica redundante-mas-
+# consistente (2 == 2): ele so limita o que o PROPRIO Pilot despacha, nunca
+# alcanca o controlador - por isso o descasamento de 25/09 so se corrige aqui.
+#
+# SEGURANCA verificada ANTES de aplicar, no codigo do engine (nao so na
+# teoria): baixar max_active_sessions ao vivo via `gc reload` e um DRENO
+# gracioso, nunca kill de sessao com trabalho em andamento.
+# applyNestedCaps/capWakeConfigByDemand (cmd/gc/pool_desired_state.go,
+# cmd/gc/session_reconcile.go) so bloqueiam ADMISSAO de sessao nova ou wake de
+# sessao asleep; sessoes ja active/start-pending/creating so sao CONTADAS no
+# orcamento, nunca tocadas. canonicalConfigHash exclui pool-scaling do hash de
+# drift, entao o cap sozinho nunca dispara restart/drain forcado de sessao
+# viva (cmd/gc/config_hash.go). No momento desta mudanca so havia 1 wa-worker
+# ativo (abaixo do 2 novo), entao nem esse dreno gracioso chegou a ser
+# exercitado na pratica.
+#
+# GATILHO DE VOLTA PRA 4 (mesma decisao do Mayor): maquina sem swap crescente
+# E disco > 15 GB livre por periodo sustentado - subir de volta tambem e
+# executar a regra dele, sem precisar perguntar de novo.
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -77,7 +107,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 4
+max_active_sessions = 2
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
