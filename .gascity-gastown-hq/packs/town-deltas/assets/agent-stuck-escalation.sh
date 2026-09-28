@@ -1164,10 +1164,28 @@ human_turn_label_present() {
 # _filter_exec_manual bridge documents (ga-8mzgn): a static default resolves
 # to whichever tree happens to live at that path (wrong worktree), and the
 # selftest's fake city fixture doesn't have a real scripts/ dir at all.
-# Fetched ONCE per process (cached in _CANONICAL_PARK_VOCAB_JSON) since this
-# script evaluates many beads per run and the vocabulary never changes
-# mid-pass — mirrors lifecycle-coherence-janitor.sh's _park_vocab_json
-# (ga-8lrud), same fetch-once-per-sweep reasoning.
+# Fetched ONCE per process since this script evaluates many beads per run
+# and the vocabulary never changes mid-pass — mirrors lifecycle-coherence-
+# janitor.sh's _park_vocab_json (ga-8lrud), same fetch-once-per-sweep
+# reasoning. NOTE (gate fix, ga-9ozbby): the _CANONICAL_PARK_VOCAB_JSON
+# global below is NOT what makes this fetch-once — it's mutated inside
+# canonical_park_vocab_json(), and every call site that captures this
+# function's stdout via `$(...)` forks a subshell to do so; a mutation to a
+# global made inside that subshell is discarded the instant the subshell
+# exits, so the mutation never reaches the parent process's copy of the
+# variable. Calling `$(canonical_park_vocab_json)` from N different call
+# sites (or N times in a loop) re-fetches N times no matter what this
+# function does internally — confirmed empirically (5 calls in a mock
+# per-bead loop → 5 fetches, not 1). What actually makes this fetch-once is
+# structural: the ONE `$(canonical_park_vocab_json)` call below runs at the
+# top level (not inside the per-bead loop), and its result is threaded into
+# canonical_park_label_present() as an explicit argument — exactly
+# lifecycle-coherence-janitor.sh's own pattern (`local _park_vocab;
+# _park_vocab=$(_park_vocab_json)` once per sweep, then `--argjson pv
+# "$_park_vocab"` in every per-bead jq call, never re-invoking
+# _park_vocab_json). canonical_park_vocab_json() keeps its own internal
+# caching only because it's harmless and cheap for any OTHER single-shot
+# caller — it is not what provides the fetch-once guarantee here.
 AGENT_STUCK_BEAD_STATE_PY_OVERRIDE="${AGENT_STUCK_BEAD_STATE_PY_OVERRIDE:-}"
 _CANONICAL_PARK_VOCAB_JSON=""
 canonical_park_vocab_json() {
@@ -1222,10 +1240,18 @@ except Exception:
 # output) makes this function ALWAYS return 1 (no match) — an error in
 # consulting the canonical source is NEVER silently treated as "parked"; the
 # bead falls through unchanged to every check that existed before this fix.
+#
+# $2 (vocab) is the caller's PRE-FETCHED canonical_park_vocab_json() output
+# — this is what makes the fetch-once-per-process guarantee documented above
+# actually hold (gate fix, ga-9ozbby): the one production call site below
+# fetches once, before the per-bead loop, and threads the string in here on
+# every iteration. Falls back to fetching directly only when no $2 is given
+# (defensive default for any future/test caller invoking this function in
+# isolation) — that path is NOT fetch-once and re-fetches every call.
 canonical_park_label_present() {
-    local labels_csv="${1:-}" vocab
+    local labels_csv="${1:-}" vocab="${2:-}"
     [ -z "$labels_csv" ] && return 1
-    vocab="$(canonical_park_vocab_json)"
+    [ -z "$vocab" ] && vocab="$(canonical_park_vocab_json)"
     [ "$vocab" = "{}" ] && return 1
     printf '%s' "$labels_csv" | tr ',' '\n' | jq -Rs --argjson pv "$vocab" '
         (split("\n") | map(select(length > 0))) as $labels
@@ -1752,6 +1778,13 @@ scheduled_crew_count=0
 # scripts/bead_state.py's canonical vocabulary, outside the narrow human-turn
 # subset), reported in RESUMO, never silently dropped.
 canonical_park_count=0
+# _AGENT_STUCK_PARK_VOCAB (gate fix, ga-9ozbby): fetched ONCE here, at the top
+# level, before the per-bead loop starts — then threaded into every
+# canonical_park_label_present() call below as an explicit argument. This is
+# the actual fetch-once mechanism (see canonical_park_vocab_json()'s own
+# comment above for why calling it via `$(...)` from inside the loop would
+# NOT cache across iterations).
+_AGENT_STUCK_PARK_VOCAB="$(canonical_park_vocab_json)"
 
 # ── Process each stuck bead ───────────────────────────────────────────────────
 while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
@@ -1859,7 +1892,7 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     # branches below ever get a chance to fire. Counted separately
     # (canonical_park_count) and reported in the run summary — never
     # silently dropped, same precedent as human_turn_count above.
-    if canonical_park_label_present "$labels"; then
+    if canonical_park_label_present "$labels" "$_AGENT_STUCK_PARK_VOCAB"; then
         canonical_park_count=$((canonical_park_count + 1))
         log "$bead_id: bead.updated_at parado ${age_min}min — label de PARK canônico presente (labels=$labels) — SUPRIMINDO escalação (bead parado por design aguardando decisão externa, ga-9ozbby)"
         continue
