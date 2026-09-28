@@ -1998,6 +1998,82 @@ assert_absent "$ACTIONS" "Agente travado: ga-sched05" "T83e: thies-wa exempt und
 assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-sched06" "T83e: peter-wa NOT exempt once the caller's list omits it (override replaces, never merges)"
 log_contains "T83e" "touchpoint agendado: 09:00/15:00" "T83e: log shows the CALLER's schedule label"
 
+# ── T84-T91 (ga-9ozbby): canonical_park_label_present() — the detector must ──
+# respect scripts/bead_state.py's canonical PARK vocabulary, not just the
+# narrow human-turn subset human_turn_label_present() (ga-fkc1vx) already
+# covers. Reproduces the live incident (Mayor, 28/09): wa-030oj carried
+# waiting-on:canario-oracle-faixa-aguardando + delivery:partial +
+# pilot:no-auto-dispatch and escalated twice as "Agente travado ... 234min
+# sem progresso" even though nothing about it was ever going to progress on
+# its own — the fix stayed behind a flag, and flipping it was oracle-wa's own
+# decision. These tests use the REAL scripts/bead_state.py (not shimmed —
+# canonical_park_vocab_json resolves it relative to the script's own
+# location), so they also catch real drift between the two files, not just a
+# fixture.
+echo "T84: bead with waiting-on:<slug> (+ delivery:partial + pilot:no-auto-dispatch) → suppressed, not escalated (ga-9ozbby, wa-030oj reproduction)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-1 oracle-wa 2200 '["waiting-on:canario-oracle-faixa-aguardando","delivery:partial","pilot:no-auto-dispatch"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-1"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-1" "T84: no mail — waiting-on:* parks the bead by design"
+assert_absent "$ACTIONS" "notify" "T84: no notify — canonical park suppresses"
+[ ! -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-1" ] && ok "T84: no escalation state written (suppression is log-only)" || bad "T84: unexpected state file written on suppression"
+
+echo "T85: bead with blocked-on:<slug> → suppressed (ga-9ozbby, PARK_PREFIXES coverage)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-2 dog-ga-9ozbby-2 2200 '["blocked-on:external-review"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-2"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-2" "T85: no mail — blocked-on:* parks the bead by design"
+
+echo "T86: bead with next-action:mayor → suppressed (ga-9ozbby — the exact label class this bug's title names)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-3 dog-ga-9ozbby-3 2200 '["next-action:mayor"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-3"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-3" "T86: no mail — next-action:mayor parks the bead by design"
+
+echo "T87: bead with bare pilot:held → suppressed (ga-9ozbby, PARK_EXACT coverage)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-4 dog-ga-9ozbby-4 2200 '["pilot:held"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-4"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-4" "T87: no mail — pilot:held parks the bead by design"
+
+echo "T88: bead with needs:engine-window → suppressed (ga-9ozbby)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-5 dog-ga-9ozbby-5 2200 '["needs:engine-window"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-5"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-5" "T88: no mail — needs:engine-window parks the bead by design"
+
+echo "T89: bare gate:needs-human (no :product suffix) → STILL escalates (ga-9ozbby non-regression of ga-lxk26/T79 — canonical_park_label_present excludes this prefix on purpose, a reviewer may be 1 keypress from unstuck)"
+printf '[%s]' "$(make_bead_json ga-9ozbby-6 dog-ga-9ozbby-6 2200 '["gate:needs-human"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-6"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-6" "T89: still escalates — bare gate:needs-human is deliberately excluded from the canonical park check (ga-lxk26 owns this label's remediation)"
+
+echo "T90: two beads suppressed by canonical park in one pass → RESUMO line reports the count, not silence (ga-9ozbby, precedent human_turn_count/ga-fkc1vx T80)"
+printf '[%s,%s]' \
+    "$(make_bead_json ga-9ozbby-7 dog-ga-9ozbby-7 2200 '["waiting-on:x"]')" \
+    "$(make_bead_json ga-9ozbby-8 dog-ga-9ozbby-8 2200 '["blocked-by:y"]')" \
+    > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-7" "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-8"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 run_script > /dev/null
+assert_absent "$ACTIONS" "mail:mayor" "T90: neither bead escalates"
+log_contains "T90" "2 bead(s) parada(s) de proposito por label PARK canonico" "T90: RESUMO line reports the count of canonically-parked beads, not silence"
+
+echo "T91: bead_state.py UNAVAILABLE (bridge path broken) + waiting-on:X → STILL escalates (ga-9ozbby Fazer#3: error must never be silently treated as parked)"
+export AGENT_STUCK_BEAD_STATE_PY_OVERRIDE="$WORK/nonexistent-bead_state.py"
+printf '[%s]' "$(make_bead_json ga-9ozbby-9 dog-ga-9ozbby-9 2200 '["waiting-on:x"]')" > "$BEADS_FIXTURE"
+rm -f "$WORK/city/.gc/state/agent-stuck-escalation/ga-9ozbby-9"
+: > "$ACTIONS"
+STUCK_AGENT_SEC=1800 AGENT_STUCK_BEAD_STATE_PY_OVERRIDE="$AGENT_STUCK_BEAD_STATE_PY_OVERRIDE" run_script > /dev/null
+assert_contains "$ACTIONS" "mail:mayor|Agente travado: ga-9ozbby-9" "T91: still escalates — canonical vocabulary unreachable, fail-open means 'behave as before this fix', never 'treat as parked'"
+unset AGENT_STUCK_BEAD_STATE_PY_OVERRIDE
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

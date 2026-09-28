@@ -1137,6 +1137,108 @@ human_turn_label_present() {
     return 1
 }
 
+# canonical_park_vocab_json / canonical_park_label_present (ga-9ozbby):
+# scripts/bead_state.py's PARK_PREFIXES/PARK_EXACT is the city's single
+# canonical park vocabulary (ga-7qsxr) — the SAME disease human_turn_label_
+# present() above only partially cured. That function recognizes just the 4
+# labels that route the BEAD to the human/Athos queue specifically
+# (next-action:athos/story:needs-approval/story:refino-escalado/gate:needs-
+# human:product); every OTHER canonical park reason — waiting-on:*,
+# next-action:mayor, blocked*, pilot:held (bare), depends-on:*, needs:engine-
+# window, story:blocked, framework:engine, pool:refused/pilot:refused, etc.
+# — fell through to the SAME "sem progresso" escalation as a genuinely stuck
+# agent, because this daemon (like pilot-dispatcher.sh/lifecycle-coherence-
+# janitor.sh before their own ga-7qsxr/ga-8lrud fixes) kept its own private,
+# incomplete interpreter of the label instead of consulting the canonical
+# source.
+#
+# Concrete (Mayor, 28/09): wa-030oj carried waiting-on:canario-oracle-faixa-
+# aguardando + delivery:partial + pilot:no-auto-dispatch — a fix merged
+# behind a flag, flipping it is oracle-wa's OWN decision. Escalated TWICE in
+# one day as "Agente travado: wa-030oj — 234min sem progresso" (mail
+# ga-wisp-mxngs4). Nothing about that bead was ever going to move on its
+# own — the correct signal is "parked by design", not "stuck agent".
+#
+# bead_state.py is resolved relative to THIS script's own location, not a
+# static $GC_CITY_PATH default — same trap pilot-dispatcher.sh's
+# _filter_exec_manual bridge documents (ga-8mzgn): a static default resolves
+# to whichever tree happens to live at that path (wrong worktree), and the
+# selftest's fake city fixture doesn't have a real scripts/ dir at all.
+# Fetched ONCE per process (cached in _CANONICAL_PARK_VOCAB_JSON) since this
+# script evaluates many beads per run and the vocabulary never changes
+# mid-pass — mirrors lifecycle-coherence-janitor.sh's _park_vocab_json
+# (ga-8lrud), same fetch-once-per-sweep reasoning.
+AGENT_STUCK_BEAD_STATE_PY_OVERRIDE="${AGENT_STUCK_BEAD_STATE_PY_OVERRIDE:-}"
+_CANONICAL_PARK_VOCAB_JSON=""
+canonical_park_vocab_json() {
+    [ -n "$_CANONICAL_PARK_VOCAB_JSON" ] && { printf '%s' "$_CANONICAL_PARK_VOCAB_JSON"; return 0; }
+    local _cpv_bsp="$AGENT_STUCK_BEAD_STATE_PY_OVERRIDE" _cpv_sd
+    if [ -z "$_cpv_bsp" ]; then
+        _cpv_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+        _cpv_bsp="${_cpv_sd:+$_cpv_sd/../../../scripts}/bead_state.py"
+    fi
+    if ! command -v python3 >/dev/null 2>&1 || [ ! -f "$_cpv_bsp" ]; then
+        _CANONICAL_PARK_VOCAB_JSON="{}"
+        printf '%s' "$_CANONICAL_PARK_VOCAB_JSON"
+        return 0
+    fi
+    _CANONICAL_PARK_VOCAB_JSON=$(python3 -c '
+import sys, json
+sys.path.insert(0, "'"$(dirname "$_cpv_bsp")"'")
+try:
+    from bead_state import PARK_PREFIXES, PARK_EXACT
+    print(json.dumps({"prefixes": list(PARK_PREFIXES), "exact": list(PARK_EXACT)}))
+except Exception:
+    print("{}")
+' 2>/dev/null)
+    case "$_CANONICAL_PARK_VOCAB_JSON" in
+        '{'*'}') : ;;  # looks like a JSON object, keep it
+        *) _CANONICAL_PARK_VOCAB_JSON="{}" ;;  # empty/crash/anything unexpected → fail open
+    esac
+    printf '%s' "$_CANONICAL_PARK_VOCAB_JSON"
+}
+
+# canonical_park_label_present: true iff the comma-joined label list $1
+# carries a label matching bead_state.py's canonical PARK vocabulary — a
+# STRICT SUPERSET of human_turn_label_present() above (see rationale there).
+#
+# ONE deliberate exclusion: the "gate:needs-human" PREFIX (bare, or any
+# suffix other than :product — :product is already caught by human_turn_
+# label_present above) is dropped from the fetched vocabulary before
+# matching. This daemon has its OWN, separately tested reason to keep
+# escalating that specific family (ga-fkc1vx/ga-lxk26, selftest T79): a gate
+# reviewer whose session is blocked on a permission-confirmation dialog
+# NEEDS this escalation to fire so the differentiated BLOQUEADO-EM-PROMPT/
+# 1-keypress remedy triggers (gate_reviewer_permission_prompt_session below)
+# — suppressing it here would silence that path, the opposite of a
+# stuck-agent daemon's job. bead_state.py's own PARK_PREFIXES entry for
+# "gate:needs-human" exists for a DIFFERENT consumer population (the
+# painel/Pilot/lifecycle-coherence-janitor world, where nobody is ever
+# mid-review waiting on a keypress) — every OTHER canonical park label has
+# no such exception in THIS file.
+#
+# Fail-open (Fazer item 3, ga-9ozbby): canonical_park_vocab_json() degrading
+# to "{}" (python3/bead_state.py unavailable, or ANY crash/unexpected
+# output) makes this function ALWAYS return 1 (no match) — an error in
+# consulting the canonical source is NEVER silently treated as "parked"; the
+# bead falls through unchanged to every check that existed before this fix.
+canonical_park_label_present() {
+    local labels_csv="${1:-}" vocab
+    [ -z "$labels_csv" ] && return 1
+    vocab="$(canonical_park_vocab_json)"
+    [ "$vocab" = "{}" ] && return 1
+    printf '%s' "$labels_csv" | tr ',' '\n' | jq -Rs --argjson pv "$vocab" '
+        (split("\n") | map(select(length > 0))) as $labels
+        | (($pv.prefixes // []) | map(select(. != "gate:needs-human"))) as $prefixes
+        | ($pv.exact // []) as $exact
+        | ($labels | any(
+            . as $lbl
+            | ($exact | index($lbl)) != null
+              or ($prefixes | any(. as $p | $lbl | startswith($p)))
+          ))
+    ' 2>/dev/null | grep -qx true
+}
+
 # is_human_assignee (ga-tiwmm): an in_progress bead assigned to a HUMAN
 # identity (e.g. "athosmartins@gmail.com") has no Gas Town agent
 # session-template by construction — "sessão ausente" is not a stall signal
@@ -1645,6 +1747,11 @@ human_turn_count=0
 # beads exempted because their assignee is a scheduled-session crew with no
 # live session between touchpoints, reported in RESUMO, never silently dropped.
 scheduled_crew_count=0
+# canonical_park_count (ga-9ozbby): same contract as human_turn_count above —
+# beads suppressed by canonical_park_label_present() below (parked per
+# scripts/bead_state.py's canonical vocabulary, outside the narrow human-turn
+# subset), reported in RESUMO, never silently dropped.
+canonical_park_count=0
 
 # ── Process each stuck bead ───────────────────────────────────────────────────
 while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
@@ -1739,6 +1846,22 @@ while IFS='|' read -r bead_id assignee age_secs title labels active_window; do
     if human_turn_label_present "$labels"; then
         human_turn_count=$((human_turn_count + 1))
         log "$bead_id: bead.updated_at parado ${age_min}min — label de turno-do-humano presente (labels=$labels) — SUPRIMINDO escalação (bead parado por design aguardando decisão do Athos, ga-fkc1vx)"
+        continue
+    fi
+
+    # Canonical PARK label present (ga-9ozbby): the bead carries a label
+    # from scripts/bead_state.py's canonical PARK vocabulary (waiting-on:*,
+    # next-action:mayor, blocked*, pilot:held, depends-on:*, needs:engine-
+    # window, story:blocked, ...) — broader than human_turn_label_present
+    # just above, which only recognizes the subset that routes to the
+    # human/Athos queue specifically. Runs right after it, for the same
+    # reason: must win before the assignee-empty/session-health escalation
+    # branches below ever get a chance to fire. Counted separately
+    # (canonical_park_count) and reported in the run summary — never
+    # silently dropped, same precedent as human_turn_count above.
+    if canonical_park_label_present "$labels"; then
+        canonical_park_count=$((canonical_park_count + 1))
+        log "$bead_id: bead.updated_at parado ${age_min}min — label de PARK canônico presente (labels=$labels) — SUPRIMINDO escalação (bead parado por design aguardando decisão externa, ga-9ozbby)"
         continue
     fi
 
@@ -2316,6 +2439,9 @@ if [ "$human_turn_count" -gt 0 ]; then
 fi
 if [ "$scheduled_crew_count" -gt 0 ]; then
     log "RESUMO: ${scheduled_crew_count} bead(s) de crew com sessao agendada sem sessao viva agora (SCHEDULED_CREWS=${SCHEDULED_CREWS}) — nao contam para escalacao enquanto < ${SCHEDULED_CREW_MAX_GAP_SEC}s (ga-dyf4fb)."
+fi
+if [ "$canonical_park_count" -gt 0 ]; then
+    log "RESUMO: ${canonical_park_count} bead(s) parada(s) de proposito por label PARK canonico (waiting-on:/blocked*/next-action:mayor/pilot:held/etc, scripts/bead_state.py) — nao contam para escalacao (ga-9ozbby)."
 fi
 
 log "=== pass complete ==="
