@@ -261,6 +261,23 @@ def norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 
+def classify_fail_reason(reason):
+    # ga-w3yvoz: um FAIL "mecânico" (plumbing do próprio gate: timeout de revisor, verdict bead fechado sem
+    # PASS/FAIL explícito, requeue, merge que quebrou depois de um veredito all-PASS) é um estado DIFERENTE de
+    # um FAIL "de revisão" (o revisor leu o diff e achou um defeito real). Os dois viram o MESMO "result": "FAIL"
+    # no log — terceiro estado colapsado em booleano (root-class:error-vs-empty) — e por isso um pico de FAILs
+    # mecânicos (ex.: gate travado, causa a investigar em outro bead) aparenta "queda de qualidade" pro
+    # gate-rate sem ser uma.
+    reason = reason or ""
+    if reason.startswith("TIMEOUT"):
+        return "mechanical"
+    if "verdict:pending" in reason or "verdict:REQUEUED" in reason:
+        return "mechanical"
+    if reason.startswith("Merge failed"):
+        return "mechanical"
+    return "review"
+
+
 def load_gate():
     runs, bad = [], 0
     if not GATE_LOG.exists():
@@ -294,6 +311,10 @@ def cmd_gate_rate(a):
         xs = [r for r in first.values() if lo <= r["_ts"] < hi and (rig is None or r["rig"] == rig)]
         k = sum(1 for r in xs if r["result"] == "PASS")
         return k, len(xs)
+    def mech_fails(lo, hi, rig=None):
+        fails = [r for r in first.values() if lo <= r["_ts"] < hi and (rig is None or r["rig"] == rig) and r["result"] == "FAIL"]
+        m = sum(1 for r in fails if classify_fail_reason(r.get("reason")) == "mechanical")
+        return m, len(fails)
     lo_b, hi_b, lo_a, hi_a = cut - w, cut, cut, min(cut + w, now)
     kb, nb = bucket(lo_b, hi_b); ka, na = bucket(lo_a, hi_a)
     rig_names = sorted({r["rig"] for r in first.values() if lo_b <= r["_ts"] < hi_a})
@@ -307,6 +328,10 @@ def cmd_gate_rate(a):
         k1, n1 = bucket(lo_b, hi_b, rig); k2, n2 = bucket(lo_a, hi_a, rig)
         if n1 + n2:
             print(f"    rig {rig:22s} antes {k1}/{n1}   depois {k2}/{n2}")
+    mb, fb = mech_fails(lo_b, hi_b); ma, fa = mech_fails(lo_a, hi_a)
+    if fb or fa:
+        print(f"\n  dos FAILs, quantos são MECÂNICOS (timeout de revisor / verdict:pending / merge quebrou após all-PASS — plumbing do gate, não o código revisado): ANTES {mb}/{fb}   DEPOIS {ma}/{fa}")
+        print("  mecânico != qualidade: se ele dominar a queda, o alarme abaixo aponta pro código errado — investigue o gate, não o corte de contexto/prompt.")
     if not nb or not na:
         print("\nVEREDITO: SEM AMOSTRA de um dos lados — não dá pra concluir (não é 'ok', é 'não sei'). Espere mais horas.")
         return 2
