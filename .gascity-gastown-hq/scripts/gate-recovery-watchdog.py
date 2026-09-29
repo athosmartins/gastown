@@ -555,7 +555,11 @@ def last_pass_epoch():
     except Exception:
         return 0
     for l in reversed(lines):
-        if "Gate PASSED:" in l:
+        # ga-hqrnmu: the shared verdict recognizer, not a `"Gate PASSED:" in l` substring — that one is blind to
+        # the Pilot-origin form `Gate PASSED (origin=Pilot): …` (18% of PASS lines), so a recovery the Pilot
+        # merged was not seen until the next plain PASS (median 19 min later, max 6.6 h). Defined with FIX 10 below.
+        vm = GATE_VERDICT_LINE_RE.match(l)
+        if vm and vm.group(1) == "PASSED":
             return log_ts_epoch(l) or 0
     return 0
 
@@ -1804,9 +1808,11 @@ def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
     the gate was already flowing, and the Mayor closed them by hand."""
     body = (
         "O QUE TRAVOU: %s\n"
-        "Esta bead é só o REGISTRO do alarme (sem dog, sem rota). O watchdog a FECHA sozinho assim que "
-        "o gate produzir um veredito real (Gate PASSED, ou FAIL de revisor) DEPOIS da criação dela — "
-        "então, se ela ainda está aberta, o gate NÃO voltou a produzir vereditos e ela pede o seu olhar "
+        "Esta bead é só o REGISTRO do alarme (sem dog, sem rota). O watchdog a FECHA sozinho quando vê "
+        "um veredito real do gate (Gate PASSED, ou FAIL de revisor) DEPOIS da criação dela. "
+        "Se ela continua aberta, o watchdog não viu (ou não conseguiu verificar) um veredito posterior — "
+        "o gate pode de fato estar parado, mas também pode ser log ilegível, consulta de beads "
+        "indisponível ou o auto-fechamento desligado. Confira o gate antes de assumir qualquer um dos dois "
         "(ga-hqrnmu).\n\n" % reason
     ) + REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
     # REPAIR_AUDIT_LABEL rides on the create (atomic) — the sweep finds the bead by it; the
@@ -4690,22 +4696,48 @@ def recover_needs_rebase_markers(now, rstate):
 # not read the log" must not both look like "nothing happened", and neither may look like
 # "resolved":
 #   verdict AFTER the bead's created_at  -> close, with the verdict quoted as evidence
-#   read OK, no verdict after created_at -> leave open (the gate has NOT recovered)
+#   read OK, no verdict after created_at -> leave open (no evidence of recovery — NOT proof it has not)
 #   log unreadable / created_at unparsable -> leave open (cannot know — inert state)
+# "Open" therefore means only "this watchdog did not see, or could not verify, a later verdict" —
+# the same wording the card body uses. It is never a claim about the gate's true state: a kill
+# switch, an unreadable log, a failing bd query/close, or a verdict form the recognizer does not
+# know all leave a bead open too.
 #
-# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` line, or a `Gate FAILED: Reviewer N FAIL:` line
-# (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is NOT one — it is the very failure
-# these alarms report (recent_timeouts() counts it as the gate-down signal), so closing on it
-# would close the alarm BECAUSE of the fault. Merge failures / source-parked / preflight aborts
-# are not reviewer verdicts either; leaving those out only ever keeps a bead open.
+# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` / `Gate PASSED (origin=Pilot):` line, or a
+# `Gate FAILED: Reviewer N FAIL:` line (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is
+# NOT one — it is the very failure these alarms report (recent_timeouts() counts it as the
+# gate-down signal), so closing on it would close the alarm BECAUSE of the fault. The COMPOSITE
+# line — a Phase C timeout that also collected a reviewer FAIL, logged as one line "Reviewer N
+# FAIL: …\nTIMEOUT: …" (dispatcher ga-h8vc8y) — is a timeout too, so it is skipped the same way.
+# Merge failures / source-parked / preflight aborts are not reviewer verdicts either; leaving
+# those out only ever keeps a bead open.
 #
-# SCOPE: only beads labelled REPAIR_AUDIT_LABEL with NO assignee — the unrouted alarm records.
+# SCOPE OF THE EVIDENCE: ANY later verdict closes the bead, not one for the run/branch the alarm
+# names. That is the right question for "did the gate come back" — but a run whose reviewers all
+# delivered just before the alarm and finalised just after it could close an alarm about a
+# DIFFERENT, still-stuck run. Accepted trade-off, not a guarantee: the close reason says so
+# ("vale para QUALQUER run — não prova que o run citado no alarme terminou") and quotes the verdict,
+# so whoever reads the closed bead can see exactly what it was closed on.
+#
+# SCOPE OF THE BEADS: only beads labelled REPAIR_AUDIT_LABEL with NO assignee — the unrouted alarm records.
 # A bead a dog or the Mayor owns is never touched. Beads a dog was actually spawned for
 # (direct-spawn / sling) are closed by that dog per REPAIR_HEADER, not here.
 # ═══════════════════════════════════════════════════════════════════════════════
 GRW_CLOSE_REPAIR_AUDIT_ENABLED = os.environ.get("GRW_CLOSE_REPAIR_AUDIT_ENABLED", "1") != "0"
 REPAIR_AUDIT_MAX_PER_SWEEP = int(os.environ.get("GRW_REPAIR_AUDIT_MAX_PER_SWEEP", "10"))
-GATE_VERDICT_LINE_RE = re.compile(r"\[quality-gate-dispatcher\] Gate (PASSED|FAILED): (.*)$")
+_REPAIR_AUDIT_DRYRUN_SEEN = set()   # bead ids already reported as would-close under GRW_DRY_RUN (this process)
+# The dispatcher emits the verdict in TWO PASS forms (quality-gate-dispatcher.sh:~8232/8235):
+#   `Gate PASSED: branch=...`                 — a merge the dispatcher itself ran
+#   `Gate PASSED (origin=Pilot): branch=...`  — a merge the Pilot dispatched (18% of PASS lines, 209/1188 measured 29/09)
+# so the optional `(origin=...)` tag sits BEFORE the colon. A recognizer that misses it is not merely
+# incomplete — it reads a real verdict as "no verdict" and the alarm stays open, with nothing counting
+# what was not recognised (gate-run ga-lor9cy). last_pass_epoch() uses this same regex (resolved at call time).
+# ANCHORED at the line start, used with .match(): the dispatcher's log() writes `[ts] [quality-gate-dispatcher] <msg>`
+# and a multi-line <msg> (a reviewer FAIL comment) puts its 2nd+ lines in the log WITHOUT that prefix. A comment that
+# QUOTES a verdict line ("… returns [] for `[ts] [quality-gate-dispatcher] Gate PASSED …`") would otherwise be read
+# as a verdict — dated by the QUOTED timestamp — which is the destructive direction (it can close a real alarm).
+GATE_VERDICT_LINE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[quality-gate-dispatcher\] "
+                                  r"Gate (PASSED|FAILED)(?: \(origin=[^)]*\))?: (.*)$")
 GATE_REVIEWER_FAIL_RE = re.compile(r"Reviewer \d+ FAIL:")
 
 
@@ -4715,11 +4747,17 @@ def _gate_verdicts_in(lines):
     skipped — an undatable verdict can prove nothing about being AFTER anything."""
     out = []
     for l in lines:
-        m = GATE_VERDICT_LINE_RE.search(l)
+        m = GATE_VERDICT_LINE_RE.match(l)
         if not m:
             continue
         if m.group(1) == "FAILED" and not GATE_REVIEWER_FAIL_RE.match(m.group(2)):
             continue   # TIMEOUT / merge failure / parked source / preflight abort — not a reviewer verdict
+        if m.group(1) == "FAILED" and "TIMEOUT:" in m.group(2):
+            # a Phase C timeout that ALSO collected a reviewer FAIL logs both in ONE line (dispatcher
+            # ga-h8vc8y: "Reviewer 1 FAIL: …\nTIMEOUT: reviewers did not submit …"). The run timed out —
+            # the very fault these alarms report — so it is not a recovery. Skipping only ever leaves a
+            # bead open (the inert side); the next real verdict still closes it.
+            continue
         e = log_ts_epoch(l)
         if e is None:
             continue
@@ -4755,8 +4793,12 @@ def repair_audit_verdict(created_epoch, verdicts):
 
 def _open_repair_audit_beads():
     """[bead dicts] open + REPAIR_AUDIT_LABEL, or None on query failure (fail-safe skip).
-    --limit 0: a sweep must not silently stop at bd's default 50 (ga-21kmp)."""
-    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", REPAIR_AUDIT_LABEL,
+    --limit 0: a sweep must not silently stop at bd's default 50 (ga-21kmp).
+    BD_CACHE_FRESH=1: THIS read decides a `bd close` (the assignee-empty + still-open check), and
+    bd-list-cached.sh's own header says such a call site must not decide from a cached read. The
+    5s TTL is far below POLL_SEC so the practical risk was nil — but a fresh read removes the
+    question, and costs one live query per sweep."""
+    r = sh(["env", "BD_CACHE_FRESH=1", "bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", REPAIR_AUDIT_LABEL,
             "--status", "open", "--limit", "0", "--json"], timeout=25)
     if not r or r.returncode != 0:
         return None
@@ -4799,10 +4841,17 @@ def close_recovered_repair_audit_beads(now):
         if action != "close":
             continue
         v_epoch, v_line = ev
-        reason = ("grw FIX10 (ga-hqrnmu): o gate recuperou sozinho — veredito às %s (dispatcher log), "
-                  "posterior à criação desta bead (%s): %s. Fechada pelo watchdog; reabra se o gate voltar a parar."
+        reason = ("grw FIX10 (ga-hqrnmu): o gate produziu um veredito real às %s (dispatcher log), "
+                  "posterior à criação desta bead (%s): %s. Vale para QUALQUER run — não prova que o run "
+                  "citado no alarme terminou. Fechada pelo watchdog; reabra se o gate voltar a parar."
                   % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v_epoch)), b.get("created_at"), v_line[:200]))
         if GRW_DRY_RUN:
+            # A dry-run never closes, so the SAME bead comes back every POLL_SEC sweep. Record the
+            # would-close once per bead per process — otherwise the ledger and log grow without bound
+            # for as long as dry-run stays on. (Skipped beads don't count toward the per-sweep cap.)
+            if bid in _REPAIR_AUDIT_DRYRUN_SEEN:
+                continue
+            _REPAIR_AUDIT_DRYRUN_SEEN.add(bid)
             print("[watchdog] repair-audit DRY-RUN would CLOSE %s (%s)" % (bid, v_line[:120]), flush=True)
             _recovery_ledger("would_close_recovered_repair_audit",
                              {"bead": bid, "created_at": b.get("created_at"), "verdict": v_line[:200], "dry_run": True})

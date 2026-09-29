@@ -64,6 +64,17 @@ def reviewer_fail(epoch):
 def timeout_fail(epoch):
     return "%s [quality-gate-dispatcher] Gate FAILED: TIMEOUT: reviewers did not submit verdicts within 28 minutes.\n" % logts(epoch)
 
+def pilot_passed(epoch, branch="crew/wa-worker/wa-2auxx"):
+    # The REAL Pilot-origin PASS form: quality-gate-dispatcher.sh:8232 puts " (origin=Pilot)" BEFORE the colon.
+    # 209 of 1184 PASS lines in the live log (18%) are this form — the first cut of the sweep could not see them.
+    return "%s [quality-gate-dispatcher] Gate PASSED (origin=Pilot): branch=%s tier=NON-CODE merge_sha=abc123 elapsed=412s\n" % (logts(epoch), branch)
+
+def composite_fail(epoch):
+    # quality-gate-dispatcher.sh:10535 (ga-h8vc8y): a Phase C timeout that ALSO collected a real reviewer FAIL logs
+    # both in ONE line — the collected reasons, a literal backslash-n, then the TIMEOUT sentinel.
+    return ("%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\\nTIMEOUT: reviewers did not "
+            "submit verdicts within 34 minutes.\n" % logts(epoch))
+
 def bead(bid, created, assignee=""):
     return {"id": bid, "created_at": created if isinstance(created, str) else iso(created), "assignee": assignee,
             "status": "open", "labels": ["pilot:no-auto-dispatch", m.REPAIR_AUDIT_LABEL]}
@@ -72,9 +83,9 @@ class CP:
     def __init__(self, stdout="", returncode=0):
         self.stdout, self.returncode = stdout, returncode
 
-def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry_run=False, log_bytes=None):
-    """Run close_recovered_repair_audit_beads() against a temp dispatcher log. Returns
-    (closed_ids, close_reasons, list_args, output-was-printed?) — closed_ids = beads a `bd close` was issued for."""
+def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry_run=False, log_bytes=None, repeat=1):
+    """Run close_recovered_repair_audit_beads() `repeat` times against a temp dispatcher log. Returns
+    (closes, calls, ledger) — closes = [(bead_id, reason)] for every `bd close` issued."""
     fd, path = tempfile.mkstemp(prefix="grw-dispatch-log-")
     lfd, lpath = tempfile.mkstemp(prefix="grw-recovery-log-")
     os.close(lfd)
@@ -97,7 +108,8 @@ def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry
             return CP("")
         m.sh = fake_sh
         try:
-            m.close_recovered_repair_audit_beads(NOW)
+            for _ in range(repeat):
+                m.close_recovered_repair_audit_beads(NOW)
         finally:
             m.DISPATCH_LOG, m.sh, m.RECOVERY_LOG, m.GRW_DRY_RUN, m.GRW_ENABLED = saved
         with open(lpath) as f:
@@ -204,6 +216,98 @@ check(m.repair_audit_verdict(T, None)[0] == "keep:unreadable", "pure: None (unre
 check(m.repair_audit_verdict(None, v)[0] == "keep:unknown-age", "pure: no created_at → keep:unknown-age", "pure unknown-age wrong")
 check(m.repair_audit_verdict(T, [(T, "same-second")])[0] == "keep:no-verdict", "pure: a verdict in the SAME second is not 'after' (strict)", "pure strictness wrong")
 
+# ── 16. THE Pilot-origin PASS (gate-run ga-lor9cy, blocking issue 1): 18% of production PASS lines ──
+# A recovered gate whose latest verdict is a Pilot merge kept its alarm open until the next PLAIN pass
+# (median 19 min later, p90 78 min, max 6.6 h) — the very symptom ga-hqrnmu exists to remove — and silently.
+closes, _, _ = sweep([pilot_passed(T + 600)], [bead("ga-x16", T)])
+check([c[0] for c in closes] == ["ga-x16"],
+      "a Pilot-origin 'Gate PASSED (origin=Pilot):' after T counts as a verdict → closed",
+      "Pilot-origin PASS was not recognised as a verdict: %r" % (closes,))
+check(closes and "origin=Pilot" in closes[0][1] and "wa-2auxx" in closes[0][1],
+      "the close reason quotes the Pilot line (branch + origin) as evidence",
+      "close reason does not quote the Pilot verdict: %r" % (closes,))
+_pl = m._gate_verdicts_in([pilot_passed(T + 600), passed(T + 700)])
+check(len(_pl) == 2, "pure: _gate_verdicts_in sees BOTH the Pilot-origin and the plain PASS form",
+      "pure reader missed a PASS form: %r" % (_pl,))
+# origin tag on a FAILED line must not turn a non-verdict into one: the TIMEOUT rule still applies.
+_of = m._gate_verdicts_in(["%s [quality-gate-dispatcher] Gate FAILED (origin=Pilot): TIMEOUT: reviewers did not submit verdicts\n" % logts(T + 600)])
+check(_of == [], "an origin-tagged FAILED that is a TIMEOUT is still NOT a verdict", "origin-tagged TIMEOUT counted as a verdict: %r" % (_of,))
+
+# ── 17. composite: a reviewer FAIL collected by a run that ALSO timed out (ga-h8vc8y) → stays open ─────
+# The run timed out — that is the fault these alarms report. Leaving it open only ever costs a longer alarm.
+closes, _, _ = sweep([composite_fail(T + 600)], [bead("ga-x17", T)])
+check(closes == [], "reviewer-FAIL + TIMEOUT in one line → stays OPEN (the run timed out)",
+      "closed on a composite TIMEOUT line: %r" % (closes,))
+closes, _, _ = sweep([composite_fail(T + 600), pilot_passed(T + 900)], [bead("ga-x17b", T)])
+check([c[0] for c in closes] == ["ga-x17b"] and "origin=Pilot" in closes[0][1],
+      "…and a real verdict AFTER the composite line still closes it, quoting THAT verdict, not the composite",
+      "composite line masked or replaced the real verdict: %r" % (closes,))
+
+# ── 18. dry-run must not write the same would_close ledger line on every 120s sweep ─────────────────
+closes, _, ledger = sweep([passed(T + 600)], [bead("ga-x18", T)], dry_run=True, repeat=3)
+_wc = [e for e in ledger if e.get("event") == "would_close_recovered_repair_audit" and e.get("bead") == "ga-x18"]
+check(closes == [] and len(_wc) == 1,
+      "dry-run over 3 sweeps → exactly ONE would_close ledger line for the bead (no unbounded growth)",
+      "dry-run ledger grew per sweep: %d lines" % len(_wc))
+
+# ── 19. the sweep DECIDES a close from the list → it must read LIVE, not through the 5s cache ─────────
+# bd-list-cached.sh's own header: a call site that itself closes a bead from the result should use BD_CACHE_FRESH=1.
+_, calls, _ = sweep([passed(T + 600)], [bead("ga-x19", T)])
+lq = [c for c in calls if "list" in c]
+check(lq and "BD_CACHE_FRESH=1" in lq[0] and lq[0].index("BD_CACHE_FRESH=1") < lq[0].index("list"),
+      "the open-bead list is a FRESH read (BD_CACHE_FRESH=1) — the ownership/open check that gates a close is never cached",
+      "list query is not a fresh read: %r" % (lq,))
+
+# ── 20. last_pass_epoch() has the SAME blindness class → same recognizer, so a Pilot PASS counts ───────
+def last_pass(lines):
+    fd, path = tempfile.mkstemp(prefix="grw-dispatch-log-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(lines)
+        saved = m.DISPATCH_LOG
+        m.DISPATCH_LOG = path
+        try:
+            return m.last_pass_epoch()
+        finally:
+            m.DISPATCH_LOG = saved
+    finally:
+        os.unlink(path)
+_e = T + 600
+check(int(last_pass([pilot_passed(_e)])) == int(_e),
+      "last_pass_epoch() finds a Pilot-origin PASS (the 'gate recovered' reset no longer waits for a plain pass)",
+      "last_pass_epoch() is blind to the Pilot-origin PASS: %r" % (last_pass([pilot_passed(_e)]),))
+check(last_pass(["%s [some-other] Logged for digest (infra mirror off): 🤖 Pilot Gate PASSED\n" % logts(_e)]) == 0,
+      "…while a digest line that merely says 'Pilot Gate PASSED' is still not a pass", "digest noise counted as a pass")
+check(last_pass([composite_fail(_e), timeout_fail(_e + 5)]) == 0,
+      "…and FAILED lines are never a pass", "a FAILED line was counted as a pass")
+
+# ── 21. QUOTED verdict text inside a multi-line reviewer comment is NOT a log line ───────────────────
+# dispatcher log() is `echo "[ts] [quality-gate-dispatcher] $*"`; a reviewer's FAIL comment is multi-line, so its
+# 2nd+ lines land in the log WITHOUT the prefix. When such a comment QUOTES a verdict line (a reviewer explaining
+# a regex bug does exactly that), an unanchored recognizer takes the quote as a verdict — and log_ts_epoch()
+# then dates it by the quoted timestamp. Measured on the live log 29/09: 1 such line in ~1700 verdict-shaped
+# lines, and it is the very feedback of this bead's first gate run (ga-lor9cy). It fails in the DESTRUCTIVE
+# direction (a fabricated verdict closes a real alarm), so the line must start with the dispatcher's prefix.
+def quoted_in_comment(epoch_real, epoch_quoted):
+    return [
+        "%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\n" % logts(epoch_real),
+        "Lens: CORRECTNESS. Fact-checked: m._gate_verdicts_in([\"%s [quality-gate-dispatcher] Gate PASSED "
+        "(origin=Pilot): branch=crew/wa-worker/wa-2auxx tier=NON-CODE\"]) returns []\n" % logts(epoch_quoted),
+        "Plain form quoted too: %s [quality-gate-dispatcher] Gate PASSED: branch=x tier=CODE\n" % logts(epoch_quoted),
+    ]
+# real reviewer-FAIL BEFORE the bead exists; the only thing AFTER T is text quoted inside its comment
+closes, _, _ = sweep(quoted_in_comment(T - 600, T + 600), [bead("ga-x21", T)])
+check(closes == [],
+      "a verdict QUOTED on a continuation line (no `[ts] [quality-gate-dispatcher]` prefix) is not a verdict → stays OPEN",
+      "closed on quoted text inside a reviewer comment: %r" % (closes,))
+_qv = m._gate_verdicts_in(quoted_in_comment(T - 600, T + 600))
+check(len(_qv) == 1 and _qv[0][0] < T,
+      "pure: only the REAL prefixed line is a verdict, dated by ITS timestamp (not the quoted one)",
+      "pure reader took quoted text as a verdict: %r" % (_qv,))
+check(last_pass(quoted_in_comment(T - 600, T + 600)) == 0,
+      "last_pass_epoch() does not take quoted 'Gate PASSED' text as a pass either",
+      "last_pass_epoch() returned %r for quoted text" % (last_pass(quoted_in_comment(T - 600, T + 600)),))
+
 # ══ Part 2 — the REPAIR names WHAT is stuck ═══════════════════════════════════════════════════════
 def inflight_line(run_id="ga-q2n5yw", branch="crew/ps-worker/ps-5c35", got=0, elapsed=860, timeout=2520):
     return ("%s [quality-gate-dispatcher] Phase C: gate-run %s (branch=%s) still in flight "
@@ -258,6 +362,15 @@ if creates:
     check("O QUE TRAVOU" in cbody and "ga-q2n5yw" in cbody and "crew/ps-worker/ps-5c35" in cbody,
           "BODY opens with what is stuck and names run + branch", "body does not name run/branch")
     check("FECHA sozinho" in cbody, "BODY says the watchdog closes it itself (so the Mayor knows not to act on a stale card)", "body omits the auto-close contract")
+    # gate-run ga-lor9cy, blocking issue 2: "still open ⇒ the gate did NOT recover" is false whenever the bead is open for
+    # any OTHER reason (kill switch, unreadable log, bead query down, failing bd close, a verdict the recognizer missed).
+    check("não viu (ou não conseguiu verificar) um veredito posterior" in cbody,
+          "BODY words 'still open' as 'the watchdog did not see (or could not verify) a later verdict' — the ambiguous case is named",
+          "body does not state the ambiguity of an open card")
+    check("NÃO voltou a produzir" not in cbody and "gate NÃO voltou" not in cbody,
+          "BODY no longer claims the absolute 'the gate did NOT resume producing verdicts'",
+          "body still asserts the gate did not recover: %r" % (cbody[:400],))
+    check("confira o gate" in cbody.lower(), "BODY tells the reader to CHECK the gate rather than assume", "body does not point at checking the gate")
     labels = cargs[cargs.index("-l") + 1].split(",") if "-l" in cargs else []
     check(m.REPAIR_AUDIT_LABEL in labels,
           "created WITH REPAIR_AUDIT_LABEL atomically (the sweep finds the bead by it; no label-add window)", "audit label not on the create: %r" % (labels,))
