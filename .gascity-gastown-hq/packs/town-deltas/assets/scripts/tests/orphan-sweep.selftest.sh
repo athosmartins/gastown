@@ -42,7 +42,7 @@ ln -s "$SELF_DIR/orphan-sweep.fake-gc" "$FAKE_GC_DIR/gc"
 # ga-ck3sz7: the sweep runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh): $FAKE_GC_DIR, a dir holding only
 # a symlink to `jq`, and the system dirs. This used to be "$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" — and the real
 # gc and bd live in /opt/homebrew/bin, so the moment $WORK went away under a running sweep `gc` resolved to the REAL one
-# (and `gc bd update ... --add-label orphan-sweep:reset` would have run against the real city).
+# (the real gc would have answered `gc session list` / `gc bd update` in place of the fake).
 . "$SELF_DIR/../../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/../../selftest-sandbox-path.lib.sh" >&2; exit 2; }
 sandbox_path_init "$WORK" jq || exit 2   # jq: the ledger and the session/bead JSON; gc is the fake above, everything else is in the system dirs
 

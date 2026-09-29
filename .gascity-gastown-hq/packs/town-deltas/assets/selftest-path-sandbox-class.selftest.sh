@@ -56,7 +56,9 @@ exemption_reason() {
 }
 
 # scan_leaky <root> — print (relative to <root>) every *.selftest.sh under it that matches the class, one per line.
-# One awk process for the whole tree: the pack has ~270 selftests and this runs on every gate pass.
+# awk runs once per xargs batch, not once per file: the pack has ~270 selftests and this runs on every gate pass.
+# THREE outcomes, not two: leaks found / nothing found / could not scan. If xargs or awk fails the scan returns 3 and
+# class_verdict says UNSCANNABLE — an empty result from a broken scan must never read as "no leaks".
 SCAN_AWK="$ROOT/scan.awk"
 cat > "$SCAN_AWK" <<'AWK'
 function flush() {
@@ -76,26 +78,28 @@ FNR == 1 { flush(); file = FILENAME; stubs = 0; keeps = 0; libref = 0; init = 0 
 END { flush() }
 AWK
 scan_leaky() {
-  local root="$1" list
-  list="$ROOT/scan.list"
+  local root="$1" list out
+  list="$ROOT/scan.list"; out="$ROOT/scan.out"
   find "$root" -name '*.selftest.sh' ! -name "$SELF_NAME" 2>/dev/null | sort > "$list"
   [ -s "$list" ] || return 0
   # xargs keeps the awk invocation count low without blowing the arg limit; FNR==1 resets state per file.
-  xargs awk -f "$SCAN_AWK" < "$list" | sed "s#^${root%/}/##" | sort
+  xargs awk -f "$SCAN_AWK" < "$list" > "$out" 2> "$ROOT/scan.err" || return 3
+  sed "s#^${root%/}/##" "$out" | sort
 }
 
 # class_verdict <root> <exempt-list> — print one line per problem; return non-zero if any.
 #   LEAK  <file>            matches the class and is not exempt
 #   STALE <file> <why>      exempt, but no longer matches the class / no longer exists
+#   UNSCANNABLE <root>      the scan itself failed — no verdict on the tree (NOT the same as "no leaks")
 class_verdict() {
   local root="$1" exempt="$2" leaky bad=0 f
-  leaky="$(scan_leaky "$root")"
+  leaky="$(scan_leaky "$root")" || { echo "UNSCANNABLE $root (awk/xargs failed: $(head -c 200 "$ROOT/scan.err" 2>/dev/null | tr '\n' ' '))"; return 1; }
   for f in $leaky; do
     case " $exempt " in *" $f "*) : ;; *) echo "LEAK  $f"; bad=1 ;; esac
   done
   for f in $exempt; do
     if [ ! -f "$root/$f" ]; then echo "STALE $f (file no longer exists — take it off EXEMPT_LIST)"; bad=1
-    elif ! printf '%s\n' "$leaky" | grep -Fxq -- "$f"; then echo "STALE $f (no longer matches the class — converted or stopped stubbing gc/bd — take it off EXEMPT_LIST)"; bad=1
+    elif ! grep -Fxq -- "$f" <<<"$leaky"; then echo "STALE $f (no longer matches the class — converted or stopped stubbing gc/bd — take it off EXEMPT_LIST)"; bad=1
     fi
   done
   return $bad
@@ -228,14 +232,18 @@ cp "$FX/leak-gc-ambient.selftest.sh" "$BAD/exempt-me.selftest.sh"
 V="$(class_verdict "$ROOT/b" "assets/exempt-me.selftest.sh")"; rc=$?
 [ "$rc" -eq 0 ] && [ -z "$V" ] && ok "B an exempt leaky file is honoured (no verdict)" || nok "B an exempt leaky file was not honoured" "$V"
 V="$(class_verdict "$ROOT/b" "")"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$V" | grep -q '^LEAK  assets/exempt-me.selftest.sh' && ok "B the same file without the exemption is a LEAK" || nok "B a leaky file was not reported" "rc=$rc $V"
+[ "$rc" -ne 0 ] && grep -q '^LEAK  assets/exempt-me.selftest.sh' <<<"$V" && ok "B the same file without the exemption is a LEAK" || nok "B a leaky file was not reported" "rc=$rc $V"
 cp "$FX/safe-converted.selftest.sh" "$BAD/exempt-me.selftest.sh"
 V="$(class_verdict "$ROOT/b" "assets/exempt-me.selftest.sh")"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$V" | grep -q '^STALE assets/exempt-me.selftest.sh (no longer matches' && ok "B an exemption for a since-converted file is STALE (fails until removed)" || nok "B a stale exemption went unnoticed" "rc=$rc $V"
+[ "$rc" -ne 0 ] && grep -q '^STALE assets/exempt-me.selftest.sh (no longer matches' <<<"$V" && ok "B an exemption for a since-converted file is STALE (fails until removed)" || nok "B a stale exemption went unnoticed" "rc=$rc $V"
 V="$(class_verdict "$ROOT/b" "assets/exempt-me.selftest.sh assets/ghost.selftest.sh")"; rc=$?
-[ "$rc" -ne 0 ] && printf '%s' "$V" | grep -q '^STALE assets/ghost.selftest.sh (file no longer exists' && ok "B an exemption for a file that is gone is STALE" || nok "B a dangling exemption went unnoticed" "rc=$rc $V"
+[ "$rc" -ne 0 ] && grep -q '^STALE assets/ghost.selftest.sh (file no longer exists' <<<"$V" && ok "B an exemption for a file that is gone is STALE" || nok "B a dangling exemption went unnoticed" "rc=$rc $V"
 V="$(class_verdict "$ROOT/b" "")"; rc=$?
 [ "$rc" -eq 0 ] && ok "B a converted file with no exemption is clean" || nok "B a converted file was reported" "$V"
+_good_awk="$SCAN_AWK"; SCAN_AWK="$ROOT/broken.awk"; printf 'this is ( not awk\n' > "$SCAN_AWK"
+V="$(class_verdict "$ROOT/b" "")"; rc=$?
+SCAN_AWK="$_good_awk"
+[ "$rc" -ne 0 ] && grep -q '^UNSCANNABLE ' <<<"$V" && ok "B a scan that FAILS is UNSCANNABLE, never an empty (clean) verdict" || nok "B a failed scan was not reported as such" "rc=$rc $V"
 for f in $EXEMPT_LIST; do
   R="$(exemption_reason "$f")" && [ -n "$R" ] && ok "B every exemption carries a reason: $f" || nok "B exemption without a reason: $f"
 done
