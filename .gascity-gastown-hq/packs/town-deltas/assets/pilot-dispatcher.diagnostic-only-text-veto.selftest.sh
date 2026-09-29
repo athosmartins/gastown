@@ -98,6 +98,11 @@ if [ -z "$FC_FN" ]; then
 fi
 
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
+# ga-ck3sz7: the extracted dispatcher functions run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They
+# label beads and sling; if $SHIMBIN vanished under a running wrapper, the real `bd`/`gc` further down $PATH
+# would take those calls. Here "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq || exit 2   # jq: the extracted functions' JSON handling; bd/gc are the shims written below
 CALLLOG="$WORK/bd-calls.tsv"
 : > "$CALLLOG"
 cat > "$SHIMBIN/bd" <<SHIM
@@ -118,7 +123,7 @@ chmod +x "$SHIMBIN/bd"
 run_fc() {
   local input="$1"
   cat > "$WORK/run_fc.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $PRE
@@ -140,7 +145,7 @@ run_rtv() {
   local db="$1" input="$2"
   : > "$CALLLOG"
   cat > "$WORK/run_rtv.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $DIAGRE
 $TVP

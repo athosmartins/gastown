@@ -73,6 +73,12 @@ EOF
 chmod +x "$WORK/bin/gc" "$WORK/bin/ps"
 PS_UUID="11111111-2222-4333-8444-555555555555"
 sed -i '' "s/live-in-ps-0000-4000-8000-000000000001/$PS_UUID/" "$WORK/bin/ps"
+# ga-ck3sz7: the wrapper chain runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). The reaper asks `gc`
+# which sessions are live and DELETES the scratchpads of the rest; if $WORK/bin/gc vanished under it, the real
+# `gc` further down $PATH would answer with the real town's sessions and the sweep would reap against those.
+# Here "command not found" is the only outcome.
+. "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq python3 || exit 2   # jq: the session list parse; python3: safe-clean.py; gc/ps are the fakes above
 
 mk() {  # mk <sid> <age_minutes>
   mkdir -p "$CHAIN_ROOT/proj/$1/scratchpad/tree"; : > "$CHAIN_ROOT/proj/$1/scratchpad/tree/copy"
@@ -83,7 +89,7 @@ mk dead-10m 10
 mk live-in-gc 45
 mk "$PS_UUID" 45
 LOG="$WORK/reaper.log"
-PATH="$WORK/bin:$PATH" \
+PATH="$SANDBOX_PATH" \
   GC_BIN="$WORK/bin/gc" \
   SCRATCHPAD_SWEEP_REAPER="$REAPER" \
   SCRATCHPAD_REAPER_ROOT="$CHAIN_ROOT" \

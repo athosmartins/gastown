@@ -38,6 +38,11 @@ case "$1" in
 esac
 EOF
 chmod +x "$MOCKBIN/gc"
+# ga-ck3sz7: the script runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It mails the Mayor
+# (`gc mail send`); if $MOCKBIN/gc vanished under it, the real `gc` further down $PATH would send that mail
+# for real. Here "command not found" is the only outcome.
+. "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORKDIR" timeout || exit 2   # timeout: bounds the gc calls; gc/notify are the mocks above
 
 # run_case <n_canonical_patches> <n_decoy_patches> <label> — fresh FAKE_HOME
 # per call so the one-shot MARKER never carries over between cases, and
@@ -62,7 +67,7 @@ run_case() {
   for ((i = 1; i <= n_decoy; i++)); do
     touch "$case_home/gt/docs/pending-engine-window/ga-decoy$i.patch"
   done
-  HOME="$case_home" MOCK_CAPTURE_DIR="$capture" PATH="$MOCKBIN:$PATH" \
+  HOME="$case_home" MOCK_CAPTURE_DIR="$capture" PATH="$SANDBOX_PATH" \
     bash "$SCRIPT" > "$capture/stdout" 2>&1
   echo "$capture"
 }

@@ -131,6 +131,11 @@ echo "gc $*" >> "$E2E_GC_LOG"
 exit 0
 STUB
 chmod +x "$E2E/bin/gc"
+# ga-ck3sz7: the exporter runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It mails the Mayor
+# (`gc mail send`) when an export comes up short; if $E2E/bin/gc vanished under it, the real `gc` further down
+# $PATH would send that mail for real. Here "command not found" is the only outcome.
+. "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$E2E" git jq || exit 2   # git: the archive repo; jq: row scrub; dolt is the stubbed dolt-target.sh, gc the stub above
 
 ARCH="$E2E/archive"
 OUT=""
@@ -138,7 +143,7 @@ run_export() {  # run_export <export-rows> <source-count|ERR> [scrubbed-away-row
   : > "$E2E/gc.log"
   OUT=$(
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS="$1" STUB_SOURCE_COUNT="$2" STUB_TEST_ROWS="${3:-0}" \
-    PATH="$E2E/bin:$PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
+    PATH="$SANDBOX_PATH" GC_CITY="$E2E/city" GC_PACK_STATE_DIR="${E2E_STATE:-$E2E/state}" \
     GC_JSONL_ARCHIVE_REPO="$ARCH" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
   )
@@ -347,7 +352,7 @@ mkdir -p "$TD_STATE"
 OUT=$(
   env -u GC_JSONL_ARCHIVE_REPO -u GC_CITY_RUNTIME_DIR \
     E2E_GC_LOG="$E2E/gc.log" STUB_EXPORT_ROWS=200 STUB_SOURCE_COUNT=200 STUB_TEST_ROWS=0 \
-    PATH="$E2E/bin:$PATH" GC_CITY="$CITY2" GC_PACK_STATE_DIR="$TD_STATE" \
+    PATH="$SANDBOX_PATH" GC_CITY="$CITY2" GC_PACK_STATE_DIR="$TD_STATE" \
     bash "$E2E/scripts/jsonl-export.sh" 2>&1
 )
 RC=$?

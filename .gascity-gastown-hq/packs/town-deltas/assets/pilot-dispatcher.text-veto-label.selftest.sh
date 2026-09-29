@@ -125,6 +125,11 @@ if [ -z "$RTV_FN" ]; then
 fi
 
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
+# ga-ck3sz7: the extracted dispatcher functions run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They
+# label beads and sling; if $SHIMBIN vanished under a running wrapper, the real `bd`/`gc` further down $PATH
+# would take those calls. Here "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq || exit 2   # jq: the extracted functions' JSON handling; bd/gc are the shims written below
 CALLLOG="$WORK/bd-calls.tsv"
 COMMENTLOG="$WORK/bd-comments.tsv"
 MAILLOG="$WORK/gc-mail.tsv"
@@ -198,7 +203,7 @@ run_rtv() {
   : > "$COMMENTLOG"
   : > "$MAILLOG"
   cat > "$WORK/run.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 export GC_CITY="/fake/city"
 $LOG_FN
 $TVP
@@ -338,7 +343,7 @@ echo "  _reconcile_text_veto_labels \"<db>\" | _filter_candidates"
 echo "  (this is the exact ordering shipped at all 19 real call sites, post ga-fgdmol)"
 : > "$CALLLOG"
 cat > "$WORK/chain.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $PRE
@@ -367,7 +372,7 @@ echo "  this fix's reordering was chosen specifically to avoid. Not testing a bu
 echo "  the design rationale documented in this function's header."
 : > "$CALLLOG"
 cat > "$WORK/wrongorder.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $PRE

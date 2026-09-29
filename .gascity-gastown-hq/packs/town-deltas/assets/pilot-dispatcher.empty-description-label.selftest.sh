@@ -104,6 +104,11 @@ if [ -z "$FC_FN" ]; then
 fi
 
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
+# ga-ck3sz7: the extracted dispatcher functions run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They
+# label beads and sling; if $SHIMBIN vanished under a running wrapper, the real `bd`/`gc` further down $PATH
+# would take those calls. Here "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq || exit 2   # jq: the extracted functions' JSON handling; bd/gc are the shims written below
 CALLLOG="$WORK/bd-calls.tsv"
 MAILLOG="$WORK/gc-mail.tsv"
 : > "$CALLLOG"
@@ -172,7 +177,7 @@ run_red() {
   local db="$1" input="$2" extra="${3:-}"
   : > "$CALLLOG"; : > "$MAILLOG"
   cat > "$WORK/run.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 export GC_CITY=/fake/db
 $LOG_FN
 $RED_FN
@@ -265,7 +270,7 @@ echo "  (this is the exact ordering shipped in every one of the 19 real call sit
 IN7='[{"id":"ga-chain1","assignee":null,"labels":[],"issue_type":"bug","description":"   "}]'
 : > "$CALLLOG"; : > "$MAILLOG"
 cat > "$WORK/chain.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 export GC_CITY=/fake/db
 $LOG_FN
 $LE_FN
@@ -299,7 +304,7 @@ echo "  defect this fix's placement was chosen specifically to avoid. This is no
 echo "  in THIS fix — it is proving the design rationale documented in this function's header."
 : > "$CALLLOG"; : > "$MAILLOG"
 cat > "$WORK/wrongorder.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 export GC_CITY=/fake/db
 $LOG_FN
 $LE_FN

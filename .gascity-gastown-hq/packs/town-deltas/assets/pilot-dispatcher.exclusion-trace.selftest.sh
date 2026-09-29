@@ -504,6 +504,11 @@ fi
 echo ""
 echo "Scenario 5: _filter_unblocked (AC1 + AC4, fake bd shim)"
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
+# ga-ck3sz7: the extracted dispatcher functions run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They
+# label beads and sling; if $SHIMBIN vanished under a running wrapper, the real `bd`/`gc` further down $PATH
+# would take those calls. Here "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq || exit 2   # jq: the extracted functions' JSON handling; bd/gc are the shims written below
 cat > "$SHIMBIN/bd" <<'SHIM'
 #!/usr/bin/env bash
 if [ "$1" = "blocked" ] || { [ "$1" = "-C" ] && [ "$3" = "blocked" ]; }; then
@@ -515,7 +520,7 @@ SHIM
 chmod +x "$SHIMBIN/bd"
 UB_FN="$(extract_fn _filter_unblocked)"
 cat > "$WORK/s5.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $UB_FN
@@ -552,7 +557,7 @@ SHIM
 chmod +x "$SHIMBIN/bd"
 ED_FN="$(extract_fn _filter_explicit_deps)"
 cat > "$WORK/s6.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $ED_FN
@@ -592,7 +597,7 @@ echo '[]'
 SHIM
 chmod +x "$SHIMBIN/bd"
 cat > "$WORK/s7.sh" <<EOF
-export PATH="$SHIMBIN:\$PATH"
+export PATH="$SANDBOX_PATH"
 $LOG_FN
 $LE_FN
 $PRE

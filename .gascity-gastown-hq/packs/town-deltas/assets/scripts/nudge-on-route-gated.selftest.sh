@@ -65,6 +65,12 @@ esac
 exit 0
 FAKE
 chmod +x "$SBX/bin/gc" "$SBX/bin/bd"
+# ga-ck3sz7: the script runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It calls `gc session
+# nudge`; if $SBX/bin vanished under a running scenario, the real `gc` further down $PATH would wake real agents.
+# Here "command not found" is the only outcome. The harness itself runs on this PATH too (new_case exports it), so it
+# is assembled from what the harness and the script use: jq, timeout.
+. "$SELF_DIR/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$SBX" jq timeout || exit 2   # gc/bd are the fakes above
 
 NOW="$(date +%s)"
 PAST=$((NOW - 3600)); FUTURE=$((NOW + 3600))
@@ -88,7 +94,7 @@ new_case() {
   FX="$SBX/fx.$1"; STATE="$SBX/state.$1"; mkdir -p "$FX" "$STATE"
   : > "$FX/events.jsonl"; : > "$FX/nudges.log"
   export GNR_FX="$FX" GC_CITY="$SBX/city" GC_PACK_STATE_DIR="$STATE" GNR_STATE_DIR="$STATE"
-  export GNR_LOOKBACK=5m GNR_BUDGET_S=60 PATH="$SBX/bin:$PATH"
+  export GNR_LOOKBACK=5m GNR_BUDGET_S=60 PATH="$SANDBOX_PATH"
   mkdir -p "$SBX/city"
   # pool members for gastown.dog: dog-1 idle, dog-2 busy
   jq -cn --argjson a "$(member gastown.dog-1)" --argjson b "$(member gastown.dog-2)" '{ok:true,sessions:[$a,$b]}' > "$FX/members.gastown.dog.json"
