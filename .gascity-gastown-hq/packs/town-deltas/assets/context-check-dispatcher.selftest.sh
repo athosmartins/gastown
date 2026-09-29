@@ -25,6 +25,17 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/context-check-dispatcher.sh"
+# ga-ck3sz7: every e2e block runs the dispatcher on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They used to
+# run it with "...:/usr/local/bin:/opt/homebrew/bin" — the dir the real gc and bd live in — so "with no live bd" (section 8)
+# was false on this box, and the `bd` stub of section 11 (first on that PATH) fell through to the REAL bd the moment its
+# fixture dir vanished. Sourced at the top: a missing lib refuses to start instead of dying half way through.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+# _sb_init <dir> — <dir>/bin is where a stub goes; sets SANDBOX_PATH. jq/git/timeout are what the dispatcher (and the
+# `timeout 120 bash` wrapper the e2e blocks put in front of it) really need from outside /usr/bin:/bin.
+_sb_init() { mkdir -p "$1/bin" && sandbox_path_init "$1" jq git timeout; }
+# The e2e blocks bound the dispatcher with `timeout 120` (was 30). It is a hang-guard, not an assertion about speed: a
+# sweep of 6 fixture beads measured 3s-33s wall on this box depending on load (30s was blown on the ORIGINAL PATH too,
+# 31s, at load ~48), and a killed sweep never reaches the last fixture (ga-stillthin2) — a red test caused by the machine.
 
 PASS=0
 FAIL=0
@@ -700,8 +711,9 @@ fi
 # 8. DRY_RUN must not write labels or spawn. With no live bd the queue is empty →
 #    it exits 0 without spawning, logging the dry-run sweep start.
 _drycity="$(mktemp -d)"
+_sb_init "$_drycity/sb" || exit 2
 CONTEXT_CHECK_CITY_OVERRIDE="$_drycity" DRY_RUN=1 \
-  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  PATH="$SANDBOX_PATH" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
 _drylog=$(cat "$_drycity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
@@ -714,8 +726,9 @@ rm -rf "$_drycity"
 
 # 9. Kill-switch e2e: CONTEXT_CHECK_ENABLED=0 exits 0 with the no-op log line.
 _kcity="$(mktemp -d)"
+_sb_init "$_kcity/sb" || exit 2
 CONTEXT_CHECK_CITY_OVERRIDE="$_kcity" CONTEXT_CHECK_ENABLED=0 \
-  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  PATH="$SANDBOX_PATH" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _krc=$?
 _klog=$(cat "$_kcity/.gc/logs/context-check-dispatcher.log" 2>/dev/null || echo "")
@@ -769,10 +782,11 @@ fi
 #     written to the candidate's OWN store via a stub bd_ on PATH (multi-store).
 _ecity="$(mktemp -d)"
 mkdir -p "$_ecity/.gc/logs"
+_sb_init "$_ecity/sb" || exit 2   # the `bd` stub below lives in $_ecity/sb/bin — first on SANDBOX_PATH, and the only bd there is
 # Stub `bd` so the dispatcher's `bd_ list` returns three crafted candidates and
 # label/comment writes are captured (no live Dolt). One ready+manual, one
 # ready+auto, one thin (empty desc).
-cat > "$_ecity/bd" <<'STUB'
+cat > "$_ecity/sb/bin/bd" <<'STUB'
 #!/usr/bin/env bash
 # Minimal bd stub: serve `list` candidates for type=task, no-op everything else.
 case "$1 $2" in
@@ -824,7 +838,7 @@ fi
 echo "$cmd $*" >> "$LEDGER"
 exit 0
 STUB
-chmod +x "$_ecity/bd"
+chmod +x "$_ecity/sb/bin/bd"
 LEDGER="$_ecity/ledger.txt"; export LEDGER
 # ga-o9uvc (incidental, pre-existing): $_ecity is a bare mktemp dir, not a git
 # repo — CC_BUILT_IDS's `git -C "$CC_STORE" for-each-ref | grep ...` pipeline
@@ -843,8 +857,8 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_TEST_BLOCKED_IDS="" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=1 \
-  PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
-  timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
+  PATH="$SANDBOX_PATH" \
+  timeout 120 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled=$(cat "$LEDGER" 2>/dev/null || echo "")
 # ga-manual1: ctx:ready + exec:manual.
 if echo "$_eled" | grep -E 'label add ga-manual1 ctx:ready' >/dev/null \
@@ -913,8 +927,8 @@ CONTEXT_CHECK_CITY_OVERRIDE="$_ecity" \
   CONTEXT_CHECK_TEST_BLOCKED_IDS="" \
   CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0 \
   CONTEXT_CHECK_EXEC_CLASS=0 \
-  PATH="$_ecity:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
-  timeout 30 bash "$DISPATCHER" >/dev/null 2>&1 || true
+  PATH="$SANDBOX_PATH" \
+  timeout 120 bash "$DISPATCHER" >/dev/null 2>&1 || true
 _eled2=$(cat "$LEDGER" 2>/dev/null || echo "")
 if echo "$_eled2" | grep -E 'label add ga-manual1 ctx:ready' >/dev/null \
    && ! echo "$_eled2" | grep -E 'label add ga-manual1 exec:' >/dev/null; then
