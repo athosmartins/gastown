@@ -175,6 +175,47 @@ cat >"$T/dd-empty.py" <<'EOF'
 #!/usr/bin/env python3
 EOF
 
+# ga-wk0qi2: the cut-large-output front's two steps -- the offline join (runs BEFORE the report, its output only goes
+# to cut-output-join.log) and the report (called twice: full text, then --resumo-pt). Hermetic for the same reason as
+# every stub above: the real join takes a flock in the LIVE logs directory and the real report reads the log, so
+# without these every test in this suite would run this front's real scripts on whatever machine runs it.
+cat >"$T/clo-join-ok.py" <<'EOF'
+#!/usr/bin/env python3
+print("jev_cut_output_join: processed 0 candidate(s), 0 left pending (session not settled) (dry_run=False)")
+EOF
+cat >"$T/clo-join-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_cut_output_join: simulated failure (ga-wk0qi2 T25e)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/clo-join-hang.py" <<'EOF'
+#!/usr/bin/env python3
+import time
+time.sleep(30)
+print("CLO-JOIN-HANG-SHOULD-NEVER-BE-PRINTED")
+EOF
+cat >"$T/clo-ok.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("Cortar-saida-grande (SOMBRA): CLO-RESUMO-STUB" if "--resumo-pt" in sys.argv else "CUT-LARGE-OUTPUT FULL REPORT STUB")
+EOF
+cat >"$T/clo-fail.py" <<'EOF'
+#!/usr/bin/env python3
+import sys
+print("jev_cut_output_report: simulated failure (ga-wk0qi2 T25b)", file=sys.stderr)
+sys.exit(1)
+EOF
+cat >"$T/clo-empty.py" <<'EOF'
+#!/usr/bin/env python3
+EOF
+cat >"$T/clo-hang.py" <<'EOF'
+#!/usr/bin/env python3
+import time
+time.sleep(30)
+print("CLO-HANG-SHOULD-NEVER-BE-PRINTED")
+EOF
+
 # 2 control + 2 experiment on 2026-09-20: one suppressed by a working Jev
 # (300 in / 20 out tokens), one fired because Jev had no credentials.
 cat >"$T/log.jsonl" <<'EOF'
@@ -242,6 +283,8 @@ run() {  # run [date-arg...] with the sandboxed env; sets RC
       JEV_RECOMECAR_REPORT="${RUN_REC:-$HQ/scripts/jev_recomecar_experiment.py}" JEV_RECOMECAR_REPORT_TIMEOUT="${RUN_REC_TIMEOUT:-120}" \
       JEV_GATE_FAIL_CATEGORIA_REPORT="${RUN_FC:-$T/fc-ok.py}" JEV_GATE_FAIL_CATEGORIA_REPORT_TIMEOUT="${RUN_FC_TIMEOUT:-120}" \
       JEV_DISPATCH_DEDUP_REPORT="${RUN_DD:-$T/dd-ok.py}" JEV_DISPATCH_DEDUP_REPORT_TIMEOUT="${RUN_DD_TIMEOUT:-120}" \
+      JEV_CUT_OUTPUT_JOIN="${RUN_CLO_JOIN:-$T/clo-join-ok.py}" JEV_CUT_OUTPUT_JOIN_TIMEOUT="${RUN_CLO_JOIN_TIMEOUT:-600}" \
+      JEV_CUT_OUTPUT_REPORT="${RUN_CLO:-$T/clo-ok.py}" JEV_CUT_OUTPUT_REPORT_TIMEOUT="${RUN_CLO_TIMEOUT:-120}" \
       bash "$SCRIPT" "$@" >"$T/stdout" 2>&1
   RC=$?
 }
@@ -578,6 +621,64 @@ grep -q 'simulated failure' "$T/out/dispatch-dedup-report.log" 2>/dev/null \
 RUN_DD="$T/dd-empty.py" run 2026-09-20
 N="$(cat "$T/notify.log")"
 case "$N" in *"Dispatch-dedup: relatório falhou"*) ok "T24c an empty dispatch-dedup report is a visible failure, not silence" ;; *) nok "T24c empty" "$N" ;; esac
+
+# T25 (ga-wk0qi2): the cut-large-output join + report. Same contract as every block above: best-effort (never blocks or
+# changes the day's report and ntfy) and VISIBLE when it fails (a missing block would read exactly like "no data").
+rm -f "$T/out/cut-output-join.log" "$T/out/cut-output-report.log"
+run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T25a healthy cut-output blocks: exit 0, exactly one ntfy"; else nok "T25a rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'CUT-LARGE-OUTPUT FULL REPORT STUB' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T25a the cut-output report is appended to the day's full report file" || nok "T25a report file" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"CLO-RESUMO-STUB"*) ok "T25a the ntfy carries the cut-output Portuguese block" ;; *) nok "T25a ntfy block" "$N" ;; esac
+case "$N" in *"Cortar-saída-grande: relatório falhou"*) nok "T25a no false failure line" "$N" ;; *) ok "T25a a healthy report prints no failure line" ;; esac
+
+RUN_CLO="$T/clo-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T25b failing cut-output report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T25b rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Cortar-saída-grande: relatório falhou"*) ok "T25b the failure is VISIBLE in the ntfy, not a silent absence" ;; *) nok "T25b visible failure (ntfy)" "$N" ;; esac
+grep -q 'Cortar-saída-grande: relatório falhou' "$T/out/2026-09-20.txt" 2>/dev/null \
+  && ok "T25b ...and in the day's full report file" || nok "T25b visible failure (file)" "$(cat "$T/out/2026-09-20.txt" 2>&1)"
+case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T25b generic numbers still reported" ;; *) nok "T25b generic numbers" "$N" ;; esac
+grep -q 'simulated failure' "$T/out/cut-output-report.log" 2>/dev/null \
+  && ok "T25b the failure's stderr is kept in cut-output-report.log" || nok "T25b stderr kept" "$(cat "$T/out/cut-output-report.log" 2>&1)"
+
+RUN_CLO="$T/clo-empty.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+case "$N" in *"Cortar-saída-grande: relatório falhou"*) ok "T25c an empty cut-output report is a visible failure, not silence" ;; *) nok "T25c empty" "$N" ;; esac
+
+# T25d: a HUNG report is killed by the bound (a stub that exits fast would not prove the kill). Compared against what a
+# PLAIN run costs right now, not a fixed ceiling (see baseline_run_s); an unkilled hang adds 30s per call.
+B25="$(baseline_run_s)"
+t25=$SECONDS
+RUN_CLO="$T/clo-hang.py" RUN_CLO_TIMEOUT=1 run 2026-09-20
+E25=$((SECONDS - t25))
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T25d hung cut-output report still yields exit 0 and exactly one ntfy (fail-open)"; else nok "T25d rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"Cortar-saída-grande: relatório falhou"*) ok "T25d the hang is a visible failure in the ntfy" ;; *) nok "T25d visible failure" "$N" ;; esac
+[ "$E25" -lt $((B25 + 15)) ] && ok "T25d the hung report was killed at its bound (took ${E25}s against a plain run of ${B25}s)" || nok "T25d bound" "took ${E25}s against a plain run of ${B25}s: not killed"
+grep -q 'CLO-HANG-SHOULD-NEVER' "$T/out/2026-09-20.txt" "$T/notify.log" 2>/dev/null \
+  && nok "T25d process actually killed" "the hung stub's post-sleep line ran" || ok "T25d the hung process was killed before finishing its sleep"
+
+# T25e/f: the JOIN step failing or hanging only ever shows up in cut-output-join.log; the report and the ntfy are unaffected.
+rm -f "$T/out/cut-output-join.log"
+RUN_CLO_JOIN="$T/clo-join-fail.py" run 2026-09-20
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T25e failing cut-output join: same rc and one ntfy as a healthy run"; else nok "T25e rc/calls" "rc=$RC calls=$(calls)"; fi
+case "$N" in *"CLO-RESUMO-STUB"*"Redução de alertas"*|*"Redução de alertas"*"CLO-RESUMO-STUB"*) ok "T25e the day's report and the cut-output block are still delivered" ;; *) nok "T25e report unaffected" "$N" ;; esac
+grep -q 'exited non-zero (1)' "$T/out/cut-output-join.log" 2>/dev/null && grep -q 'simulated failure' "$T/out/cut-output-join.log" \
+  && ok "T25e the join failure is logged (exit code and stderr) in cut-output-join.log" || nok "T25e join log" "$(cat "$T/out/cut-output-join.log" 2>&1)"
+
+rm -f "$T/out/cut-output-join.log"
+t25=$SECONDS
+RUN_CLO_JOIN="$T/clo-join-hang.py" RUN_CLO_JOIN_TIMEOUT=1 run 2026-09-20
+E25=$((SECONDS - t25))
+N="$(cat "$T/notify.log")"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T25f hung cut-output join: same rc and one ntfy as a healthy run"; else nok "T25f rc/calls" "rc=$RC calls=$(calls)"; fi
+grep -q 'TIMED OUT after 1s' "$T/out/cut-output-join.log" 2>/dev/null && ok "T25f the hang is logged as TIMED OUT in cut-output-join.log" || nok "T25f timeout note" "$(cat "$T/out/cut-output-join.log" 2>&1)"
+[ "$E25" -lt $((B25 + 15)) ] && ok "T25f the hung join was killed at its bound (took ${E25}s against a plain run of ${B25}s)" || nok "T25f bound" "took ${E25}s against a plain run of ${B25}s: not killed"
+grep -q 'CLO-JOIN-HANG-SHOULD-NEVER' "$T/out/cut-output-join.log" 2>/dev/null \
+  && nok "T25f process actually killed" "the hung stub's post-sleep line ran" || ok "T25f the hung join was killed before finishing its sleep"
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # cut-output-shadow.sh (ga-wk0qi2, child of ga-aijm2v) -- PostToolUse:Bash AND PostToolUseFailure:Bash hook wrapper.
-# SHADOW MODE ONLY: this always emits "{}" (a no-op hookSpecificOutput) on stdout. It never
-# blocks, never modifies a real tool result, and every failure mode here is exit 0. See
-# cut-output-shadow.py's own header for the full design (fixed-rule + Jev two-tier measurement,
+# SHADOW MODE ONLY: the answer is "{}" (a no-op hookSpecificOutput) on stdout, always, in practice: every failure
+# path below prints it itself, and on the happy path the wrapper relays the engine's stdout when that is valid JSON
+# -- the ENGINE only ever prints "{}", so the guarantee "a shadow cannot alter a tool result" is held by
+# cut-output-shadow.py, not by this wrapper (a selftest pins the relay). It never blocks and every failure mode here
+# is exit 0. See
+# cut-output-shadow.py's own header for the full design (the fixed-rule measurement -- the Jev tier is ga-d0hm85's --,
 # PASSO 0's updatedToolOutput shape finding, fail-open discipline).
 #
 # TWO EVENTS, ONE WRAPPER: Claude Code sends a Bash call's output on PostToolUse only when the call SUCCEEDED

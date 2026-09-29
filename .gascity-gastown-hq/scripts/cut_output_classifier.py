@@ -18,10 +18,11 @@ output into one of these shapes:
   4. "no-gain": a shape a rule recognized, but cutting it would not make the output shorter (every
      omitted run costs a "[N lines omitted]" marker). Nothing is omitted; a live rule would leave it
      alone. Its own state, so it is neither a phantom "0-token cut" nor an error.
-  5. None ("unstructured"): output is large but does not match any fixed shape above. The
-     caller (cut-output-shadow.py) is the one that decides what to do with an unstructured
-     block (ask Jev), never this module — this module answers ONLY "does a fixed, no-AI rule
-     apply here, and if so what would it keep".
+  5. None ("unstructured"): output is large but does not match any fixed shape above. This module
+     answers ONLY "does a fixed, no-AI rule apply here, and if so what would it keep", so for such an
+     output it has no verdict of its own to give. The caller (cut-output-shadow.py) records it with
+     unmatched_verdict() -- rule "unmatched", "no fixed rule applies, so nothing is cut" -- and sends
+     it nowhere else (a Jev tier for these outputs was split off this bead: ga-d0hm85).
 
 SINGLE SOURCE (ga-wk0qi2 gate attempt 4): a classifier only chooses WHICH LINES to keep, and
 _verdict_from_kept_lines() derives everything else from that one partition -- kept_text,
@@ -32,8 +33,9 @@ from the input. The selftest checks this over real and synthetic outputs cut at 
 
 THIRD STATE: classify_output() returns None when no fixed rule applies (including when the
 output is simply too small to bother with) — None is "no fixed-rule verdict", never "cut
-everything" or "cut nothing". A caller must not treat None as either extreme. Likewise rule
-"unknown" is "could not read this, so did not cut", never "examined, nothing worth cutting".
+everything" or "cut nothing". A caller must not treat None as either extreme. Likewise rules
+"unknown" and "unmatched" are "could not read / no rule for this, so did not cut", never
+"examined, nothing worth cutting" (that one is "no-gain", a measured zero).
 
 NEVER RAISES: every public function here is total over its documented input types (str/str).
 Encoding weirdness, empty strings, binary-looking bytes-as-text -- all produce a verdict or
@@ -77,10 +79,14 @@ EVENT_SUCCESS = "PostToolUse"
 EVENT_FAILURE = "PostToolUseFailure"
 
 # Below this many characters, cutting is not worth the risk of losing something the agent
-# needed — the fixed-rule and Jev paths are both skipped by the caller. Kept here (not just in
+# needed — the caller skips such an output entirely (no row at all). Kept here (not just in
 # the hook) so classify_output()'s own "does this even qualify as large" gate matches whatever
 # a unit test asserts about it, instead of the threshold living only in the hook wrapper.
 MIN_CHARS_TO_CONSIDER = 2000
+
+# Rules whose verdict keeps EVERYTHING by design (nothing omitted, so rendered_text is as long as the text): the shrink
+# check in _verdict_from_kept_lines() must not read that as "a cut that did not shrink" and rewrite it to "no-gain".
+NOTHING_CUT_RULES = ("unknown", "no-gain", "unmatched")
 
 DEFAULT_HEAD_LINES = 20
 DEFAULT_TAIL_LINES = 20
@@ -218,7 +224,7 @@ def _verdict_from_kept_lines(rule: str, text: str, lines: list[str], offsets: li
         "lines_omitted": total - lines_kept,
     }
     verdict.update(extra)
-    if rule not in ("unknown", "no-gain") and len(rendered_text) >= len(text):
+    if rule not in NOTHING_CUT_RULES and len(rendered_text) >= len(text):
         # A rule that would hand back as much text as it was given, or MORE, is not a cut: every omitted run
         # costs a "[N lines omitted; run with RAW=1]" marker, and on a log of alternating error/ok lines each
         # marker is longer than the one short line it replaces. A live rule would leave that output alone, so
@@ -237,6 +243,18 @@ def _unknown_verdict(text: str, reason: str) -> dict:
     records the case as unknown, distinct from both "cut" and "nothing to cut")."""
     lines, offsets = _split_lines(text)
     return _verdict_from_kept_lines("unknown", text, lines, offsets, set(range(len(lines))), reason=reason)
+
+
+def unmatched_verdict(text: str) -> dict:
+    """The third state for a large output NO fixed rule applies to (classify_output() answered None for it): rule
+    "unmatched", reason "no-fixed-rule-applies", everything kept, nothing omitted -- built through the same single
+    partition as every other verdict, so the same invariants hold (tiles the text, nothing invented). Not
+    "unknown" (that is a shape the rule recognized and could not read) and not "no-gain" (a rule evaluated it and
+    a cut would not shrink it): here nothing was evaluated at all, so the shadow log carries no would-save number
+    for it -- it only records HOW MUCH large output the fixed rules never reach, which a bare None (or a row that
+    is simply not written) would leave to read as a call too small to consider. Never raises."""
+    lines, offsets = _split_lines(text)
+    return _verdict_from_kept_lines("unmatched", text, lines, offsets, set(range(len(lines))), reason="no-fixed-rule-applies")
 
 
 def classify_pytest(text: str) -> dict | None:
@@ -374,8 +392,9 @@ def classify_output(command: str, text: str) -> dict | None:
     (used only to help recognize shape, e.g. a bare 'pytest'/'python -m pytest' invocation is a
     weak extra signal but NOT required — the text itself is authoritative, since a command can
     invoke pytest indirectly via a wrapper script). Returns None when text is under
-    MIN_CHARS_TO_CONSIDER (too small to bother) or matches neither fixed shape — the caller
-    should treat None as "ask Jev, or leave it alone", never as a verdict of its own."""
+    MIN_CHARS_TO_CONSIDER (too small to bother) or matches neither fixed shape. None is "no fixed rule
+    has a verdict here", never a verdict of its own: for a large output the caller records
+    unmatched_verdict(text), for a small one it writes nothing."""
     if not text or len(text) < MIN_CHARS_TO_CONSIDER:
         return None
     verdict = classify_pytest(text)
@@ -958,6 +977,34 @@ def _selftest() -> int:
     ok(f"property: kept/omitted never overlap and always rebuild the text ({len(violations)} violation(s))", not violations)
     for v in violations[:8]:
         print(f"    violation: {v}")
+
+    # ---- Mayor 28/09 23:1x: the Jev tier left this bead (ga-d0hm85), so a large output NO fixed rule applies to is no
+    # longer handed to anything. classify_output() still answers None for it (no verdict from a rule), and the caller
+    # records that as a verdict of its own -- 'unmatched', "I do not know how to cut this, so I do not cut it" -- built
+    # the same single-source way as every other one, so the same partition oracles hold for it ----
+    unmatched_fn = globals().get("unmatched_verdict")
+    # large enough to be considered (>= MIN_CHARS_TO_CONSIDER) and short enough that no rule applies (<= DEFAULT_MAX_LOG_LINES lines)
+    unmatched_prose = "\n\n".join(f"paragraph {i} with some ordinary words" for i in range(80))
+    ok("setup: the unmatched prose fixture really is large and rule-less (>= MIN_CHARS, <= max log lines)",
+       len(unmatched_prose) >= MIN_CHARS_TO_CONSIDER and len(unmatched_prose.splitlines()) <= DEFAULT_MAX_LOG_LINES)
+    ok("unmatched_verdict exists: 'no fixed rule applies' has a verdict of its own, not only a None", callable(unmatched_fn))
+    if callable(unmatched_fn):
+        for u_label, u_text in (
+            ("prose paragraphs", unmatched_prose),
+            ("one 5k-char line", "z" * 5000),
+            ("no trailing newline", "a\nb\nc"),
+            ("empty", ""),
+        ):
+            uv = unmatched_fn(u_text)
+            ok(f"unmatched_verdict ({u_label}): rule 'unmatched' with its own reason, not 'unknown' (that means a recognized shape)",
+               uv["rule"] == "unmatched" and uv["reason"] == "no-fixed-rule-applies")
+            ok(f"unmatched_verdict ({u_label}): nothing omitted, everything kept as-is -- and NOT rewritten into 'no-gain' by the shrink check",
+               uv["omitted_text"] == "" and uv["omitted_spans"] == [] and uv["kept_text"] == u_text and uv["rendered_text"] == u_text
+               and uv["chars_before"] == uv["chars_after"] == len(u_text) and uv["tokens_before"] == uv["tokens_after"])
+            ok(f"unmatched_verdict ({u_label}): same partition oracles as every rule (tiles the text, nothing invented)",
+               not overlap_problems(u_text, uv) and not span_problems(u_text, uv))
+        ok("classify_output still answers None for such an output (the verdict above is the caller's, not a rule's)",
+           classify_output("cmd", unmatched_prose) is None)
 
     # ---- rendered_text / chars_after: the agent-facing text is derived from the SAME partition ----
     r_render = classify_log_tail(long_log)

@@ -89,7 +89,9 @@ JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-ga
 BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL = 4000
 
 
-# the experiment names of the cut-large-output front (cut-output-shadow.py); its rows are mode "cut-output"
+# the experiment names of the cut-large-output front (cut-output-shadow.py); its rows are mode "cut-output".
+# "cut-output-jev" stays in this tuple although nothing writes it any more (the Jev tier is ga-d0hm85's): the 40 legacy
+# rows this exclusion exists for carry exactly that name in the live, append-only log.
 CUT_OUTPUT_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
 
 

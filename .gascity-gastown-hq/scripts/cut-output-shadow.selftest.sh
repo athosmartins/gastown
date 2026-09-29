@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # cut-output-shadow.selftest.sh (ga-wk0qi2) -- hermetic tests for cut-output-shadow.sh's own
 # prefilter/dispatch/fail-open behavior. cut_output_classifier.py's classification logic and
-# cut-output-shadow.py's Jev/logging logic have their OWN selftest subcommands (pure Python,
-# mocked network) -- this file only exercises the bash wrapper: does it skip python when it
+# cut-output-shadow.py's logging logic have their OWN selftest subcommands (pure Python,
+# no network) -- this file only exercises the bash wrapper: does it skip python when it
 # should, does it dispatch when it should, and does every failure mode still print "{}"/exit 0.
 #
 # TEST: bash cut-output-shadow.selftest.sh
@@ -220,7 +220,7 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
-echo "-- live dispatch to the REAL cut-output-shadow.py (no network: fixed-rule + Jev-unreachable third state) --"
+echo "-- live dispatch to the REAL cut-output-shadow.py (fixed rule only: no network, no credential lookup) --"
 # ─────────────────────────────────────────────────────────────────────────
 LOG="$SCRATCH/jev-experiment.jsonl"
 PYTEST_OUT=$(python3 -c "
@@ -239,21 +239,31 @@ else
   bad "live pytest case: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"
 fi
 
-# unstructured + large -> Jev tier. Force jev_experiment's credential resolution to fail
-# (no_credentials) so this stays fully offline and deterministic, and still checks the wrapper's
-# real end-to-end plumbing into cut-output-shadow.py's Jev-unreachable THIRD STATE.
+# unstructured + large -> no fixed rule applies.
 UNSTRUCT_OUT=$(python3 -c "
 print('\n\n'.join(f'random unstructured paragraph {i} with generic prose text, no test or log shape' for i in range(80)))
 ")
 UNSTRUCT_JSON="$(hook_json Bash "$UNSTRUCT_OUT" '' 'some-tool --verbose')"
-rm -f "$LOG"
-run "$UNSTRUCT_JSON" "JEV_EXPERIMENT_LOG=$LOG" "CLOUDFLARE_ACCOUNT_ID=" "CLOUDFLARE_API_TOKEN=" "JEV_SECRET_BIN=/nonexistent/secret"
-if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "1" ] \
-   && [ "$(jq -r .experiment < "$LOG")" = "cut-output-jev" ] \
-   && [ "$(jq -r .jev_ok < "$LOG")" = "false" ] && [ "$(jq -r .blocks < "$LOG")" = "null" ]; then
-  ok "live: large unstructured output + no Jev credentials -> one cut-output-jev shadow log line, jev_ok=false, blocks=null (third state), {} on stdout"
+
+# Mayor 28/09 23:1x (7th gate rejection): the Jev tier left this bead (ga-d0hm85), so a large output no fixed rule
+# applies to must reach NOTHING outside the process: one 'unmatched' row, {} on stdout. "Jev is never contacted" is
+# measured on the real process, not read off the source: JEV_SECRET_BIN points at a script that leaves a marker file
+# if anything runs it (the credential lookup was the first thing the old tier did), and the credentials are
+# unset so that lookup would have had to run it.
+cat > "$SCRATCH/secret-marker" <<MARKER
+#!/bin/sh
+: > "$SCRATCH/secret-was-run"
+exit 1
+MARKER
+chmod +x "$SCRATCH/secret-marker"
+rm -f "$LOG" "$SCRATCH/secret-was-run"
+run "$UNSTRUCT_JSON" "JEV_EXPERIMENT_LOG=$LOG" "CLOUDFLARE_ACCOUNT_ID=" "CLOUDFLARE_API_TOKEN=" "JEV_SECRET_BIN=$SCRATCH/secret-marker"
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ ! -e "$SCRATCH/secret-was-run" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "1" ] \
+   && [ "$(jq -r .experiment < "$LOG")" = "cut-output-fixed" ] && [ "$(jq -r .rule < "$LOG")" = "unmatched" ] \
+   && [ "$(jq -r '.tokens_would_save | type' < "$LOG")" = "null" ] && [ "$(jq -r '.omitted_signatures | length' < "$LOG")" = "0" ]; then
+  ok "live: large unstructured output -> the secret CLI is never run, one cut-output-fixed row with rule=unmatched and tokens_would_save=null, {} on stdout"
 else
-  bad "live unstructured case: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"
+  bad "live unmatched case: rc=$RC out=[$OUT] secret-cli-was-run=[$([ -e "$SCRATCH/secret-was-run" ] && echo YES || echo no)] log=[$(cat "$LOG" 2>/dev/null)]"
 fi
 
 # a large FAILING pytest run (exit 1) through the real wrapper and the real engine: measured, and the row says

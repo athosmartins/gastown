@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """jev_cut_output_join.py (ga-wk0qi2, child of ga-aijm2v) — OFFLINE join for the cut-large-
 output SHADOW front. cut-output-shadow.py (the live PostToolUse + PostToolUseFailure hook) logs, for every large Bash
-output, what a fixed rule or Jev WOULD have cut and a handful of "signatures" (bead ids, absolute
+output, what the fixed rule WOULD have cut and a handful of "signatures" (bead ids, absolute
 paths, sha-looking tokens, error-line snippets) extracted from the cut/would-cut portion. That
 alone cannot say whether the agent actually needed the cut content later -- the only way to know
 is to look at what the SAME session did in LATER turns, which does not exist yet at hook time.
@@ -82,7 +82,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_experiment as je  # noqa: E402
 from cut_output_classifier import JOIN_MODE, RECORD_MODE, extract_signatures  # noqa: E402,F401  (JOIN_MODE is re-exported to the report; extract_signatures is used by the selftest)
 
-SOURCE_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
+# The fixed rule is the only source: the Jev tier that used to be a second one left this bead (ga-d0hm85), and a row
+# still carrying its old experiment name is nobody's candidate, however complete it looks.
+SOURCE_EXPERIMENTS = ("cut-output-fixed",)
 
 DEFAULT_LOG_DIR = Path(os.environ.get("JEV_CUT_OUTPUT_JOIN_DIR", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs"))
 LOCK_PATH = DEFAULT_LOG_DIR / "jev-cut-output-join.lock"
@@ -619,6 +621,7 @@ def _selftest() -> int:
             {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "omitted_signatures": ["s1"], "transcript_path": "/tmp/a", "tool_use_id": "tu-a", "ts": base_ts},
             {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "omitted_signatures": [], "transcript_path": "/tmp/b", "tool_use_id": "tu-b", "ts": base_ts},
             {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "omitted_signatures": ["s3"], "transcript_path": "/tmp/c", "tool_use_id": "tu-c", "ts": base_ts},
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e7", "omitted_signatures": ["s7"], "transcript_path": "/tmp/g", "tool_use_id": "tu-g", "ts": base_ts},
             {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": False},
             {"mode": RECORD_MODE, "experiment": "some-other-front", "entity_id": "e4", "omitted_signatures": ["s4"], "transcript_path": "/tmp/d", "tool_use_id": "tu-d", "ts": base_ts},
             # malformed record (shared multi-writer log, "not assumed to be pristine"): otherwise
@@ -635,9 +638,14 @@ def _selftest() -> int:
         ok("select_candidates: record with tool_use_id=None -> excluded (nothing to locate in the transcript)", "no-tool-use-id-abc" not in cand_ids)
         ok("select_candidates: e1 already joined -> excluded", "e1" not in cand_ids)
         ok("select_candidates: e2 has no signatures -> excluded", "e2" not in cand_ids)
-        ok("select_candidates: e3 (unjoined, has signatures) -> included", "e3" in cand_ids)
+        ok("select_candidates: e7 (unjoined fixed-rule record, has signatures) -> included", "e7" in cand_ids)
         ok("select_candidates: e4 belongs to a different experiment -> excluded", "e4" not in cand_ids)
         ok("select_candidates: record missing entity_id -> excluded, does not raise", len(cands) == 1)
+
+        # Mayor 28/09 23:1x (7th gate rejection): the Jev tier is out of this bead (ga-d0hm85), so the fixed rule is the
+        # ONLY source this join reads. A complete-looking row of the old Jev experiment is nobody's candidate.
+        ok("the join's one source experiment is the fixed rule (the Jev tier is ga-d0hm85's)", SOURCE_EXPERIMENTS == ("cut-output-fixed",))
+        ok("select_candidates: a row of the old Jev experiment is not a candidate, however complete it looks", "e3" not in cand_ids)
 
         cands_limited = select_candidates(recs2, since_hours=0, limit=1)
         ok("select_candidates respects --limit", len(cands_limited) == 1)
@@ -684,9 +692,9 @@ def _selftest() -> int:
         legacy = [
             {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "t", "omitted_signatures": ["s"],
              "transcript_path": "/tmp/legacy", "tool_use_id": "t", "ts": base_ts},
-            {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "toolu_real", "omitted_signatures": ["s"],
+            {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "toolu_real", "omitted_signatures": ["s"],
              "transcript_path": "/tmp/real", "tool_use_id": "toolu_real", "ts": base_ts},
-            {"mode": "shadow-join", "experiment": "cut-output-jev", "entity_id": "toolu_real", "referenced_later": False},
+            {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "toolu_real", "referenced_later": False},
         ]
         leg_ids = [c["entity_id"] for c in select_candidates(legacy, since_hours=0, limit=10)]
         ok("select_candidates: a legacy mode=='shadow' row is not a candidate (it belongs to summarize_shadow, not to this front)",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """jev_cut_output_report.py (ga-wk0qi2, child of ga-aijm2v) — daily/cumulative digest for the
-cut-large-output SHADOW front (cut-output-shadow.py logs the raw shadow records; jev_cut_output_
-join.py adds the offline "was the cut content referenced later" verdict). Reports CUMULATIVE
+cut-large-output SHADOW front, fixed rule only (cut-output-shadow.py logs the raw shadow records; jev_cut_output_
+join.py adds the offline "was the cut content referenced later" verdict; the Jev tier is ga-d0hm85's). Reports CUMULATIVE
 totals to date, same choice as jev_gate_fail_classify_report.py — this front is high-VOLUME (it
 fires on every large Bash output across every pool session, unlike a rare real-review-FAIL), so a
 running total is more informative on any given day than a slice that might be near-empty on a
@@ -42,8 +42,8 @@ IGNORED_ERROR_ENTITY_IDS = frozenset({"no-tool-use-id-a63be92ef344", "no-tool-us
 
 
 def compute_stats(records: list[dict]) -> dict:
-    """Pure. Splits records into the two source experiments (fixed-rule, Jev-tier) and their
-    cut-output-join counterparts (keyed by entity_id), then aggregates. Only this front's own modes
+    """Pure. Splits records into the source experiment (the fixed rule) and its cut-output-join
+    counterparts (keyed by entity_id), then aggregates. Only this front's own modes
     are read (RECORD_MODE / JOIN_MODE): a mode=="shadow" row of the same experiment name is not this
     front's data. Never raises on a malformed or missing field on any one record -- one bad record is
     skipped, not fatal to the report."""
@@ -51,18 +51,22 @@ def compute_stats(records: list[dict]) -> dict:
         "count": 0,
         "tokens_would_save_total": 0,
         "tokens_would_save_known": 0,  # how many records had a non-None tokens_would_save
-        "jev_unreachable_count": 0,  # cut-output-jev only
-        "unknown_count": 0,  # cut-output-fixed only: shape recognized, rule could not cut it (rule "unknown")
-        # real cuts (tokens_would_save > 0) with no signature to search for: the offline join skips them,
-        # so they are outside the referenced-later rate -- counted here so the report can say so
+        "unknown_count": 0,  # shape recognized, rule could not cut it (rule "unknown")
+        "unmatched_count": 0,  # a large output no fixed rule applies to (rule "unmatched"): nothing evaluated, nothing cut
+        # Every REAL cut (tokens_would_save > 0) is in exactly one of four places, and the report says how many are
+        # in each: a join candidate (joined, or pending), no_signature_count, or unjoinable_count. A cut in none of
+        # them reads as covered by the referenced-later rate while the join never looks at it.
+        # -- nothing distinctive to search for: the offline join skips it
         "no_signature_count": 0,
-        "sampled_count": 0,  # cut-output-jev only: Jev judged a head+tail sample, not the whole output
+        # -- signatures, but the row lacks what the join needs to search with (transcript path, tool_use_id,
+        #    entity_id) or carries the signature list as something that is not a list: the join cannot act on it
+        "unjoinable_count": 0,
         # which hook event the row came from: PostToolUseFailure = the command exited non-zero (PostToolUse fires
         # ONLY for exit 0), so the failed-command population is countable apart; a row with no hook_event at all
         # (logged before the field existed) is in neither bucket
         "failure_count": 0,
         "event_unrecorded_count": 0,
-        "no_gain_count": 0,  # cut-output-fixed only: rule "no-gain" -- shape recognized, cutting would not shrink it
+        "no_gain_count": 0,  # rule "no-gain" -- shape recognized, cutting would not shrink it
     } for exp in SOURCE_EXPERIMENTS}
     joins: dict[tuple[str, str], bool | None] = {}
     candidates: set[tuple[str, str]] = set()  # records the join could act on (whether or not it has yet)
@@ -106,15 +110,17 @@ def compute_stats(records: list[dict]) -> dict:
         if isinstance(saved, (int, float)):
             s["tokens_would_save_total"] += saved
             s["tokens_would_save_known"] += 1
-            if saved > 0 and not rec.get("omitted_signatures"):
-                s["no_signature_count"] += 1
-        if exp == "cut-output-jev" and rec.get("jev_ok") is False:
-            s["jev_unreachable_count"] += 1
-        if exp == "cut-output-jev" and rec.get("sampled") is True:
-            s["sampled_count"] += 1
-        if exp == "cut-output-fixed" and rec.get("rule") == "unknown":
+            if saved > 0:
+                if not rec.get("omitted_signatures"):
+                    s["no_signature_count"] += 1
+                elif not is_join_candidate(rec):
+                    s["unjoinable_count"] += 1
+        rule = rec.get("rule")
+        if rule == "unknown":
             s["unknown_count"] += 1
-        if exp == "cut-output-fixed" and rec.get("rule") == "no-gain":
+        elif rule == "unmatched":
+            s["unmatched_count"] += 1
+        elif rule == "no-gain":
             s["no_gain_count"] += 1
 
     referenced_true = 0
@@ -170,24 +176,22 @@ def format_report(stats: dict) -> str:
             f"count is available; this is NOT a report of zero cases."
         )
     lines = ["Cut-large-output (ga-wk0qi2, SHADOW — nothing is actually cut yet):"]
-    for exp, label in (("cut-output-fixed", "Fixed-rule tier (pytest/log-tail, no AI)"), ("cut-output-jev", "Jev tier (unstructured large blocks)")):
-        s = stats[exp]
-        avg = (s["tokens_would_save_total"] / s["tokens_would_save_known"]) if s["tokens_would_save_known"] else None
-        lines.append(f"  {label}: {s['count']} case(s), avg tokens_would_save={avg:.0f}" if avg is not None else f"  {label}: {s['count']} case(s), no measurable tokens_would_save yet")
-        if exp == "cut-output-fixed" and s["unknown_count"]:
-            lines.append(f"    {s['unknown_count']} unknown (shape recognized but the rule could not cut it, kept in full; not in the average)")
-        if exp == "cut-output-fixed" and s["no_gain_count"]:
-            lines.append(
-                f"    {s['no_gain_count']} no-gain (shape recognized, but cutting would not shrink the output -- nothing omitted; "
-                f"a measured 0 tokens saved, so it IS in the average, unlike 'unknown')"
-            )
-        if exp == "cut-output-jev":
-            lines.append(f"    Jev unreachable in {s['jev_unreachable_count']}/{s['count']} case(s) (third state, never counted as a cut)")
-            if s["sampled_count"]:
-                lines.append(
-                    f"    {s['sampled_count']} judged only a head+tail sample (their tokens_would_save is a lower bound: "
-                    f"the never-judged middle counts as kept)"
-                )
+    label = "Fixed rule (pytest/log-tail, no AI)"
+    s = stats["cut-output-fixed"]
+    avg = (s["tokens_would_save_total"] / s["tokens_would_save_known"]) if s["tokens_would_save_known"] else None
+    lines.append(f"  {label}: {s['count']} case(s), avg tokens_would_save={avg:.0f}" if avg is not None else f"  {label}: {s['count']} case(s), no measurable tokens_would_save yet")
+    if s["unknown_count"]:
+        lines.append(f"    {s['unknown_count']} unknown (shape recognized but the rule could not cut it, kept in full; not in the average)")
+    if s["unmatched_count"]:
+        lines.append(
+            f"    {s['unmatched_count']} unmatched (large output no fixed rule applies to, kept in full -- nothing was evaluated, so "
+            f"they are not in the average; this is how much large output the rule does not reach)"
+        )
+    if s["no_gain_count"]:
+        lines.append(
+            f"    {s['no_gain_count']} no-gain (shape recognized, but cutting would not shrink the output -- nothing omitted; "
+            f"a measured 0 tokens saved, so it IS in the average, unlike 'unknown')"
+        )
     j = stats["joins"]
     total_cases = sum(stats[exp]["count"] for exp in SOURCE_EXPERIMENTS)
     if total_cases:
@@ -237,6 +241,12 @@ def format_report(stats: dict) -> str:
             f"  {no_signature} cut(s) had no signature to look for — outside the rate above "
             f"(nothing to search is not 'searched and not found')"
         )
+    unjoinable = sum(stats[exp]["unjoinable_count"] for exp in SOURCE_EXPERIMENTS)
+    if unjoinable:
+        lines.append(
+            f"  {unjoinable} cut(s) the join cannot check (the row has signatures but no transcript path or tool_use_id, or a "
+            f"malformed signature list) — outside the rate above (not looked for is not 'looked for and not found')"
+        )
     e = stats["errors"]
     if e["total"]:
         kinds = ", ".join(f"{stage}: {err} x{n}" for (stage, err), n in sorted(e["by_kind"].items(), key=lambda kv: (-kv[1], kv[0])))
@@ -244,8 +254,8 @@ def format_report(stats: dict) -> str:
         lines.append(f"  Hook errors: {e['total']} call(s) whose measurement was LOST -- {kinds}{note}")
     else:
         lines.append(
-            "  Hook errors: none logged (a zero here means 'none that could be written down': jq missing, an unwritable "
-            "log or a missing wrapper script leave no row)"
+            "  Hook errors: none logged (a zero here means 'none that could be written down': jq missing, an unparseable "
+            "payload, an unwritable log or a missing wrapper script leave no row)"
         )
     return "\n".join(lines)
 
@@ -257,12 +267,17 @@ def format_resumo_pt(stats: dict) -> str:
         )
     fixed = stats["cut-output-fixed"]["count"]
     fixed_unknown = stats["cut-output-fixed"]["unknown_count"]
-    jev = stats["cut-output-jev"]["count"]
+    fixed_unmatched = stats["cut-output-fixed"]["unmatched_count"]
     j = stats["joins"]
     rate_str = f"{j['referenced_rate']*100:.1f}%" if j["referenced_rate"] is not None else "sem dado"
     # cases the fixed rule could not read count as observed, but they cut nothing -- say so instead
     # of letting "N via regra fixa" read as N cuts
-    fixed_note = f" ({fixed_unknown} sem corte: formato não reconhecido)" if fixed_unknown else ""
+    fixed_notes = []
+    if fixed_unknown:
+        fixed_notes.append(f"{fixed_unknown} sem corte: formato não reconhecido")
+    if fixed_unmatched:
+        fixed_notes.append(f"{fixed_unmatched} sem regra aplicável")
+    fixed_note = f" ({'; '.join(fixed_notes)})" if fixed_notes else ""
     # "conferido(s)" is the population the rate is computed over (a verdict of yes or no); joins with no verdict
     # (unknown) and cuts still waiting for their session to end are named apart, not folded into that count
     decided = j["referenced_true"] + j["referenced_false"]
@@ -279,8 +294,8 @@ def format_resumo_pt(stats: dict) -> str:
     if stats["errors"]["total"]:
         extra += f" O hook perdeu {stats['errors']['total']} medição(ões) por erro."
     return (
-        f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa{fixed_note}, "
-        f"{jev} via Jev. Join offline: {decided} conferido(s){join_notes}, taxa de 'precisou depois' = {rate_str} "
+        f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa{fixed_note}. "
+        f"Join offline: {decided} conferido(s){join_notes}, taxa de 'precisou depois' = {rate_str} "
         f"(só conta citação literal, taxa baixa não prova que cortar não perde nada; teto esperado do bead: ~8%).{extra}"
     )
 
@@ -318,27 +333,22 @@ def _selftest() -> int:
     records = [
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "tokens_would_save": 100},
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "tokens_would_save": 200},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "tokens_would_save": 50, "jev_ok": True},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "e4", "tokens_would_save": None, "jev_ok": False},
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e1", "referenced_later": True},
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "e2", "referenced_later": False},
-        {"mode": JOIN_MODE, "experiment": "cut-output-jev", "entity_id": "e3", "referenced_later": False},
         {"mode": RECORD_MODE, "experiment": "unrelated-front", "entity_id": "e9", "tokens_would_save": 999},
     ]
     stats = compute_stats(records)
     ok("fixed-rule count", stats["cut-output-fixed"]["count"] == 2)
     ok("fixed-rule tokens_would_save_total", stats["cut-output-fixed"]["tokens_would_save_total"] == 300)
-    ok("jev-tier count", stats["cut-output-jev"]["count"] == 2)
-    ok("jev-tier tokens_would_save_known excludes the None case", stats["cut-output-jev"]["tokens_would_save_known"] == 1)
-    ok("jev-tier jev_unreachable_count", stats["cut-output-jev"]["jev_unreachable_count"] == 1)
+    ok("fixed-rule tokens_would_save_known counts both numbers", stats["cut-output-fixed"]["tokens_would_save_known"] == 2)
     ok("unrelated-front is ignored entirely", "unrelated-front" not in stats)
-    ok("joins total = 3", stats["joins"]["total"] == 3)
+    ok("joins total = 2", stats["joins"]["total"] == 2)
     ok("joins referenced_true = 1", stats["joins"]["referenced_true"] == 1)
-    ok("joins referenced_false = 2", stats["joins"]["referenced_false"] == 2)
-    ok("joins referenced_rate = 1/3", abs(stats["joins"]["referenced_rate"] - (1 / 3)) < 1e-9)
+    ok("joins referenced_false = 1", stats["joins"]["referenced_false"] == 1)
+    ok("joins referenced_rate = 1/2", abs(stats["joins"]["referenced_rate"] - 0.5) < 1e-9)
 
     report_text = format_report(stats)
-    ok("format_report mentions both tiers", "Fixed-rule tier" in report_text and "Jev tier" in report_text)
+    ok("format_report names the fixed rule", "Fixed rule" in report_text)
     ok("format_report never claims a verdict (no 'safe'/'unsafe' word)", "safe" not in report_text.lower())
 
     pt = format_resumo_pt(stats)
@@ -364,34 +374,29 @@ def _selftest() -> int:
     # ---- gate_run ga-qxm60a, low finding: the referenced-later rate silently leaves out every cut that
     # had no signature to look for (the join skips them -- nothing to search is not "searched, not
     # found"), yet the report sets that rate beside the bead's ~8% ceiling. Say how many were left
-    # out. And a Jev saving computed from a head+tail SAMPLE is a lower bound: say how many. ----
+    # out. ----
     sig_records = [
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s2", "tokens_would_save": 90, "omitted_signatures": []},
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s3", "tokens_would_save": 80},  # field missing
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s4", "rule": "unknown", "tokens_would_save": None, "omitted_signatures": []},
         {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "s5", "tokens_would_save": 0, "omitted_signatures": []},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s6", "tokens_would_save": 50, "jev_ok": True, "sampled": True, "omitted_signatures": ["/a/b/c"]},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s7", "tokens_would_save": 40, "jev_ok": True, "sampled": False, "omitted_signatures": []},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "s8", "tokens_would_save": None, "jev_ok": False},
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "s1", "referenced_later": False},
     ]
     sig_stats = compute_stats(sig_records)
     ok("fixed tier: exactly the real cuts with an empty/missing omitted_signatures are 'nothing to look for' "
        "(s2, s3) -- not the one with signatures (s1), the 'unknown' one with no cut (s4), or the zero-token one (s5)",
        sig_stats["cut-output-fixed"].get("no_signature_count") == 2)
-    ok("Jev tier: a cut with no signatures is counted (s7); an unreachable Jev (no cut) is not (s8)",
-       sig_stats["cut-output-jev"].get("no_signature_count") == 1)
-    ok("Jev tier: sampled judgements are counted (s6)", sig_stats["cut-output-jev"].get("sampled_count") == 1)
     sig_text = format_report(sig_stats)
-    ok("format_report says how many cuts had nothing to look for and are outside the rate", "3 cut(s) had no signature to look for" in sig_text)
-    ok("format_report says how many Jev numbers come from a sample (lower bound)", "1 judged only a head+tail sample" in sig_text)
+    ok("format_report says how many cuts had nothing to look for and are outside the rate", "2 cut(s) had no signature to look for" in sig_text)
     quiet_text = format_report(compute_stats([
-        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "q1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"]},
-        {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "q2", "tokens_would_save": 50, "jev_ok": True, "sampled": False, "omitted_signatures": ["/a/b/c"]},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "q1", "tokens_would_save": 100, "omitted_signatures": ["ga-x"],
+         "transcript_path": "/tmp/q.jsonl", "tool_use_id": "q1"},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "q2", "tokens_would_save": 50, "omitted_signatures": ["/a/b/c"],
+         "transcript_path": "/tmp/q.jsonl", "tool_use_id": "q2"},
     ]))
-    ok("format_report stays quiet about both when every cut has signatures and nothing was sampled",
-       "no signature to look for" not in quiet_text and "head+tail sample" not in quiet_text)
+    ok("format_report stays quiet about both when every cut has signatures and the join can check every one",
+       "no signature to look for" not in quiet_text and "the join cannot check" not in quiet_text)
 
     # compute_stats promises to never raise on a malformed record. A join record whose entity_id is not
     # hashable (a list, from a partially-written multi-writer line) was used as a dict key -> TypeError.
@@ -412,10 +417,13 @@ def _selftest() -> int:
     # data -- jev_experiment_report.summarize_shadow() owns that mode -- so it must not count here either ----
     legacy_stats = compute_stats(records + [
         {"mode": "shadow", "experiment": "cut-output-jev", "entity_id": "t", "command": "c", "tokens_would_save": 9999, "jev_ok": False},
+        {"mode": "shadow", "experiment": "cut-output-fixed", "entity_id": "t2", "command": "c", "tokens_would_save": 9999},
         {"mode": "shadow-join", "experiment": "cut-output-jev", "entity_id": "t", "referenced_later": True},
+        {"mode": "shadow-join", "experiment": "cut-output-fixed", "entity_id": "t2", "referenced_later": True},
     ])
-    ok("legacy mode=='shadow' rows of a cut-output experiment are ignored (count unchanged)",
-       legacy_stats["cut-output-jev"]["count"] == stats["cut-output-jev"]["count"] and legacy_stats["cut-output-jev"]["jev_unreachable_count"] == stats["cut-output-jev"]["jev_unreachable_count"])
+    ok("legacy mode=='shadow' rows of a cut-output experiment are ignored (count and total unchanged)",
+       legacy_stats["cut-output-fixed"]["count"] == stats["cut-output-fixed"]["count"]
+       and legacy_stats["cut-output-fixed"]["tokens_would_save_total"] == stats["cut-output-fixed"]["tokens_would_save_total"])
     ok("legacy 'shadow' / 'shadow-join' rows do not touch the join counts either", legacy_stats["joins"] == stats["joins"])
 
     # ---- gate_run ga-75ya0i, blocking issue 1 (report side): records the join has NOT written a verdict for
@@ -428,7 +436,7 @@ def _selftest() -> int:
         return r
 
     pend_records = [
-        _cand("p1"), _cand("p2", exp="cut-output-jev", jev_ok=True),                    # waiting for the join
+        _cand("p1"), _cand("p2"),                                                        # waiting for the join
         _cand("p3"), {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "p3", "referenced_later": False},  # joined
         _cand("p4", omitted_signatures=[]),                                              # nothing to look for: never a candidate
         _cand("p5", tool_use_id=None),                                                   # no call to locate: never a candidate
@@ -469,9 +477,9 @@ def _selftest() -> int:
         return _cand(eid, exp=exp, hook_event=event, **kw)
 
     split_records = [
-        _ev("ok1", "PostToolUse"), _ev("ok2", "PostToolUse"), _ev("ok3", "PostToolUse", exp="cut-output-jev", jev_ok=True),
+        _ev("ok1", "PostToolUse"), _ev("ok2", "PostToolUse"), _ev("ok3", "PostToolUse"),
         _ev("f1", "PostToolUseFailure", exit_code=1), _ev("f2", "PostToolUseFailure", exit_code=2),
-        _ev("f3", "PostToolUseFailure", exp="cut-output-jev", jev_ok=True, exit_code=1),
+        _ev("f3", "PostToolUseFailure", exit_code=1),
         _cand("old1"),  # no hook_event at all (a row from before the field existed)
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "ok1", "referenced_later": False},
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "ok2", "referenced_later": False},
@@ -480,10 +488,8 @@ def _selftest() -> int:
         {"mode": JOIN_MODE, "experiment": "cut-output-fixed", "entity_id": "old1", "referenced_later": True},
     ]
     split_stats = compute_stats(split_records)
-    ok("failed-command cases are counted per tier (2 fixed... 1 in the fixed tier is f1+f2, 1 in the Jev tier is f3)",
-       split_stats["cut-output-fixed"]["failure_count"] == 2 and split_stats["cut-output-jev"]["failure_count"] == 1)
-    ok("a row with no hook_event is counted apart, in neither bucket", split_stats["cut-output-fixed"]["event_unrecorded_count"] == 1
-       and split_stats["cut-output-jev"]["event_unrecorded_count"] == 0)
+    ok("failed-command cases are counted (f1, f2, f3)", split_stats["cut-output-fixed"]["failure_count"] == 3)
+    ok("a row with no hook_event is counted apart, in neither bucket", split_stats["cut-output-fixed"]["event_unrecorded_count"] == 1)
     ok("the offline join is split by the event of the row it joined: exit-0 runs 0/2 referenced later",
        split_stats["joins"]["by_event"]["success"] == {"referenced_true": 0, "referenced_false": 2})
     ok("the offline join is split: failed runs 1/2 referenced later", split_stats["joins"]["by_event"]["failure"] == {"referenced_true": 1, "referenced_false": 1})
@@ -511,8 +517,7 @@ def _selftest() -> int:
     err_stats = compute_stats(records + err_records)
     ok("error rows are counted per (stage, error)", err_stats["errors"]["by_kind"] == {("wrapper", "engine_rc_137"): 2, ("engine", "TypeError"): 1})
     ok("error rows are counted in total", err_stats["errors"]["total"] == 3)
-    ok("error rows are NOT cases: the tier counts are unchanged", err_stats["cut-output-fixed"]["count"] == stats["cut-output-fixed"]["count"]
-       and err_stats["cut-output-jev"]["count"] == stats["cut-output-jev"]["count"])
+    ok("error rows are NOT cases: the case count is unchanged", err_stats["cut-output-fixed"]["count"] == stats["cut-output-fixed"]["count"])
     ok("error rows do not enter the offline join", err_stats["joins"] == stats["joins"])
     err_text = format_report(err_stats)
     ok("format_report names the lost measurements and their reasons",
@@ -520,6 +525,11 @@ def _selftest() -> int:
     none_text = format_report(stats)
     ok("with no error rows the report still says so -- and what a zero cannot see (jq missing, unwritable log, missing wrapper)",
        "Hook errors: none logged" in none_text and "unwritable log" in none_text)
+    # the wrapper cannot even SIZE a payload jq cannot parse (e.g. an output truncated through an emoji leaves a lone
+    # surrogate escape that jq rejects and python accepts), so that call gets `{}` and NO row: a zero here does not
+    # cover it, and the wrapper's own header says so -- the report's footnote has to name it too
+    ok("the 'none logged' footnote also names the payload the wrapper cannot parse (no row either)",
+       "an unparseable payload" in none_text)
     ok("format_resumo_pt says how many measurements the hook lost", "3 medição" in format_resumo_pt(err_stats))
     ok("format_resumo_pt stays quiet about hook errors when there are none", "medição" not in format_resumo_pt(stats))
     # the two rows a pre-guard selftest run left in the live log (2026-09-29T00:03:17Z) are not hook failures
@@ -549,6 +559,63 @@ def _selftest() -> int:
     ok("no-gain cases stay in the average as a real zero: (0 + 100) / 2", "avg tokens_would_save=50" in format_report(ng_stats))
     ok("format_report says what a no-gain case is", "1 no-gain" in format_report(ng_stats) and "would not shrink" in format_report(ng_stats))
     ok("format_report stays quiet about no-gain when there are none", "no-gain" not in format_report(stats))
+
+    # ---- Mayor 28/09 23:1x, after the 7th gate rejection: this bead reports the FIXED RULE only (the Jev tier is
+    # ga-d0hm85). The report has one tier; a row of the old Jev experiment is not this front's data, is not a join
+    # candidate and is not "waiting" either; and nothing printed, in the full text or the phone text, names Jev ----
+    fixed_only = [r for r in records if r.get("experiment") != "cut-output-jev"]
+    jev_leftover = {"mode": RECORD_MODE, "experiment": "cut-output-jev", "entity_id": "j1", "tokens_would_save": 500, "jev_ok": True,
+                    "omitted_signatures": ["ga-x"], "transcript_path": "/tmp/j.jsonl", "tool_use_id": "j1"}
+    no_jev = compute_stats(fixed_only + [jev_leftover, {"mode": JOIN_MODE, "experiment": "cut-output-jev", "entity_id": "j1", "referenced_later": True}])
+    ok("no Jev tier: 'cut-output-jev' is not a section of the stats, and a row or join of that name is not counted anywhere",
+       "cut-output-jev" not in no_jev and no_jev["cut-output-fixed"]["count"] == 2 and no_jev["joins"]["total"] == 2 and no_jev["joins"]["pending"] == 0)
+    ok("no Jev tier: is_join_candidate() refuses a row of the old Jev experiment (the report and the join cannot disagree)", not is_join_candidate(jev_leftover))
+    ok("no Jev tier: the full report never says 'Jev'", "Jev" not in format_report(no_jev))
+    ok("no Jev tier: the phone text never says 'Jev' ('via Jev' used to be a count in it)", "Jev" not in format_resumo_pt(no_jev))
+
+    # ---- 'unmatched': a large output no fixed rule applies to. It is one row of the rule's own third state (nothing was
+    # evaluated, nothing cut), so it is counted apart and kept OUT of the average -- unlike 'no-gain', a measured zero ----
+    um_stats = compute_stats([
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "m1", "rule": "unmatched", "tokens_would_save": None, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "m2", "rule": "unmatched", "tokens_would_save": None, "omitted_signatures": []},
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "m3", "rule": "pytest", "tokens_would_save": 100, "omitted_signatures": ["ga-x"],
+         "transcript_path": "/tmp/m.jsonl", "tool_use_id": "m3"},
+    ])
+    um = um_stats["cut-output-fixed"]
+    ok("unmatched: counted on their own (2), and not folded into 'unknown' (a recognized shape) or 'no-gain' (a measured zero)",
+       um.get("unmatched_count") == 2 and um["unknown_count"] == 0 and um["no_gain_count"] == 0)
+    ok("unmatched: still observed cases (3) but not in the average (1 known number)", um["count"] == 3 and um["tokens_would_save_known"] == 1)
+    ok("unmatched: an unmatched row is not a 'cut with no signature' either (it cut nothing)", um["no_signature_count"] == 0)
+    um_text = format_report(um_stats)
+    ok("format_report says how many large outputs no fixed rule applies to, kept in full and outside the average",
+       "2 unmatched" in um_text and "no fixed rule applies" in um_text and "not in the average" in um_text)
+    ok("format_report stays quiet about unmatched when there are none", "unmatched" not in format_report(stats))
+    ok("format_resumo_pt says how many had no rule to apply ('sem regra')", "2 sem regra" in format_resumo_pt(um_stats))
+    ok("format_resumo_pt stays quiet about 'sem regra' when there are none", "sem regra" not in format_resumo_pt(stats))
+
+    # ---- accounting must be EXHAUSTIVE (gate_run ga-nw6sbx, same-class sibling): every real cut (tokens_would_save > 0) is
+    # in exactly one place -- a candidate (joined, or pending), or 'no signature', or 'the join cannot check it'. A cut
+    # with signatures but no transcript path / tool_use_id was in none: not pending, not joined, not counted, and the
+    # report did not say so, so its rate looked like it covered every cut ----
+    acct_stats = compute_stats([
+        _cand("c1"),                                   # a candidate, not joined yet: pending
+        _cand("c2", omitted_signatures=[]),            # nothing to look for
+        _cand("c3", transcript_path=None),             # signatures, but no transcript to search
+        _cand("c4", tool_use_id=None),                 # signatures, but no call to locate in it
+        _cand("c5", omitted_signatures="not-a-list"),  # a malformed signature list (truthy, not a list)
+        _cand("c6", tokens_would_save=0, omitted_signatures=[]),  # a real no-gain row (nothing omitted): not a cut, in no bucket by design
+        {"mode": RECORD_MODE, "experiment": "cut-output-fixed", "entity_id": "c7", "rule": "unknown", "tokens_would_save": None},
+    ])
+    ac = acct_stats["cut-output-fixed"]
+    ok("accounting: cuts the join cannot act on (c3, c4, c5) are counted apart", ac.get("unjoinable_count") == 3)
+    ok("accounting: ...and no cut is counted twice (c2 stays 'no signature', c1 stays a candidate)",
+       ac["no_signature_count"] == 1 and acct_stats["joins"]["pending"] == 1)
+    real_cuts = 5  # c1..c5 have tokens_would_save > 0
+    ok("accounting is exhaustive: pending + joined + no-signature + cannot-check == every real cut",
+       acct_stats["joins"]["pending"] + acct_stats["joins"]["total"] + ac["no_signature_count"] + (ac.get("unjoinable_count") or 0) == real_cuts)
+    ok("format_report says how many cuts the join cannot check, outside the rate",
+       "3 cut(s) the join cannot check" in format_report(acct_stats))
+    ok("format_report stays quiet about that when every cut is checkable", "the join cannot check" not in format_report(stats))
 
     empty_stats = compute_stats([])
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)

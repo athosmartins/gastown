@@ -54,8 +54,8 @@ elif [ "$JOIN_RC" -ne 0 ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run exited non-zero ($JOIN_RC), see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
 fi
 
-# ga-wk0qi2: same best-effort offline join, for the cut-large-output front (fixed-rule +
-# Jev-tier SHADOW measurement of what would be cut from big Bash output -- see that script's
+# ga-wk0qi2: same best-effort offline join, for the cut-large-output front (fixed-rule
+# SHADOW measurement of what would be cut from big Bash output -- see that script's
 # own docstring). Same NEVER-blocks-the-report discipline as the gate-verdict join above.
 CLO_JOIN_SCRIPT="${JEV_CUT_OUTPUT_JOIN:-$HQ/scripts/jev_cut_output_join.py}"
 CLO_JOIN_TIMEOUT="${JEV_CUT_OUTPUT_JOIN_TIMEOUT:-600}"
