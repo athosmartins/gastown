@@ -74,8 +74,37 @@
 # same value (see [[error-empty-must-not-produce-same-value]]). The retry
 # loop only buys TIME for a transient condition to clear — the LAST attempt
 # in the budget still fail-closes exactly like before if nothing ever clears.
+#
+# MANUAL REBOOTS (the Mayor's, or anyone's, ga-7e3fwa): run
+#     scripts/nightly-reboot.sh --check-guards
+# BEFORE rebooting by hand. Measured: the manual reboots of 2026-09-26 03:36,
+# 09-27 05:50, 09-28 13:08 and 09-29 06:56 (osascript -> loginwindow, each
+# authorized for swap pressure) killed the property_scrapers nightly because
+# that path never went through Guard 4 — this script had no way to just CHECK.
+# The mode runs Guards 2+3+4 once, through the very same functions the nightly
+# uses, and prints one line per guard:
+#     guard2 gate-markers: ok
+#     guard3 hq-in-progress: BLOCK hq beads in_progress = 2
+#     guard4 scraper-daily: unknown <why it could not tell>
+# Three states, never collapsed: ok (safe), BLOCK (something is in flight),
+# unknown (the guard could not look — NOT safe). Exit 0 only if all three are
+# ok; every guard is evaluated even after one blocks, so a single run shows
+# everything in the way. It does NOT reboot, does NOT touch the skip streak,
+# sends no mail or notify, writes nothing to the nightly log, and ignores the
+# 01:00-01:19 window (a manual reboot is not at 01:05). An unknown argument is
+# refused with exit 2 — a typo must never fall through into the real flow.
+# A Guard 4 BLOCK means: wait for the rodada to finish, or write in the
+# reboot runbook (docs/runbooks/reboot-*-pre.txt) that it WILL be killed.
 
 set -uo pipefail
+
+CHECK_GUARDS_ONLY=0
+if [ "$#" -eq 1 ] && [ "$1" = "--check-guards" ]; then
+    CHECK_GUARDS_ONLY=1
+elif [ "$#" -ne 0 ]; then
+    echo "usage: nightly-reboot.sh [--check-guards]" >&2
+    exit 2
+fi
 
 CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 GC="${GC_BIN:-/opt/homebrew/bin/gc}"
@@ -272,7 +301,9 @@ macos_update_install_if_ready() {
 }
 # nightly-reboot.selftest.sh:MACOS-UPDATE-FUNCTIONS-END
 
-log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
+# --check-guards is a read-only preflight, not a fire of the nightly job: it
+# neither writes the "fired" line nor is subject to the window below.
+[ "${CHECK_GUARDS_ONLY}" -eq 1 ] || log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
 
 # --- Guard 1: window sanity ---------------------------------------------
 # Only fire inside 01:00-01:19. Catches a late replay if the box was
@@ -283,7 +314,7 @@ log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
 # long that run may then spend retrying once accepted.
 HOUR=$(date +%-H)
 MINUTE=$(date +%-M)
-if [ "${HOUR}" -ne 1 ] || [ "${MINUTE}" -ge 20 ]; then
+if [ "${CHECK_GUARDS_ONLY}" -eq 0 ] && { [ "${HOUR}" -ne 1 ] || [ "${MINUTE}" -ge 20 ]; }; then
     log "SKIP: fired at ${HOUR}:$(printf '%02d' "${MINUTE}") — outside the 01:00-01:19 firing window, likely a late replay. Not rebooting."
     exit 0
 fi
@@ -398,43 +429,115 @@ PY
 RETRY_INTERVAL="${NIGHTLY_REBOOT_RETRY_INTERVAL:-300}"
 RETRY_MAX_ATTEMPTS="${NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS:-18}"
 
-# Runs Guard 2 (gate markers) + Guard 3 (hq in-progress) + Guard 4 (scraper
-# daily in flight, ps-70jq) once. Sets BLOCK_REASON on failure. Returns 0 only
-# if ALL guards pass.
-check_guards_once() {
+# Guard 2 (gate markers), Guard 3 (hq in-progress) and Guard 4 (scraper daily
+# in flight, ps-70jq), one function each, shared by the nightly retry loop
+# (check_guards_once) and the read-only --check-guards mode
+# (check_guards_report, ga-7e3fwa) — one implementation, so a manual reboot is
+# judged by exactly what the nightly is judged by. Each guard sets
+# GUARD_STATE to
+#   ok       it looked and it is safe
+#   block    it looked and something is in flight
+#   unknown  it could not look (or could not parse what it saw) -> NOT safe
+# and GUARD_REASON to a human string, and returns 0 only for "ok" — callers
+# decide on the return code, GUARD_STATE only picks the label. It starts as
+# "unknown" on entry, so a failing path that forgets to set it is reported as
+# unknown (NOT safe), never as ok or BLOCK.
+#
+# nightly-reboot.selftest.sh:GUARDS-FUNCTIONS-START — sentinel for the selftest
+# (Scenario 7f), same isolation technique as the blocks above: it extracts this
+# block, with no Guard 1 and no reboot call in it, to prove the nightly path
+# still yields the same BLOCK_REASON text. Needs CITY, BD, GATE_ERR, HQ_ERR and
+# scraper_daily_state from above.
+guard_gate_markers() {
+    GUARD_STATE="unknown"; GUARD_REASON=""
     GATE_JSON=$("${CITY}/scripts/gate-queue-composition.sh" --json 2>"${GATE_ERR}")
     GATE_RC=$?
     if [ "${GATE_RC}" -ne 0 ] || [ -z "${GATE_JSON}" ]; then
-        BLOCK_REASON="gate-queue-composition.sh failed (rc=${GATE_RC}: $(cat "${GATE_ERR}" 2>/dev/null)) — unknown gate state treated as NOT safe"
+        GUARD_REASON="gate-queue-composition.sh failed (rc=${GATE_RC}: $(cat "${GATE_ERR}" 2>/dev/null)) — unknown gate state treated as NOT safe"
         return 1
     fi
     GATE_REAL=$(printf '%s' "${GATE_JSON}" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("real","?"))' 2>/dev/null)
-    if [ "${GATE_REAL}" != "0" ]; then
-        BLOCK_REASON="gate real-work markers in flight = ${GATE_REAL} (raw: ${GATE_JSON})"
-        return 1
-    fi
+    case "${GATE_REAL}" in
+        0) GUARD_STATE="ok"; return 0 ;;
+        ''|*[!0-9]*) GUARD_STATE="unknown" ;;  # "?" (no "real" key) or unparseable: could not tell
+        *) GUARD_STATE="block" ;;
+    esac
+    GUARD_REASON="gate real-work markers in flight = ${GATE_REAL} (raw: ${GATE_JSON})"
+    return 1
+}
+guard_hq_in_progress() {
+    GUARD_STATE="unknown"; GUARD_REASON=""
     HQ_INPROGRESS_JSON=$("${BD}" -C "${CITY}" list --status in_progress --json --limit 0 2>"${HQ_ERR}")
     HQ_RC=$?
     if [ "${HQ_RC}" -ne 0 ] || ! printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
-        BLOCK_REASON="bd list --status in_progress (hq) failed (rc=${HQ_RC}: $(cat "${HQ_ERR}" 2>/dev/null)) — unknown state treated as NOT safe"
+        GUARD_REASON="bd list --status in_progress (hq) failed (rc=${HQ_RC}: $(cat "${HQ_ERR}" 2>/dev/null)) — unknown state treated as NOT safe"
         return 1
     fi
     HQ_INPROGRESS_COUNT=$(printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
-    if [ "${HQ_INPROGRESS_COUNT}" != "0" ]; then
-        BLOCK_REASON="hq beads in_progress = ${HQ_INPROGRESS_COUNT}"
-        return 1
-    fi
+    case "${HQ_INPROGRESS_COUNT}" in
+        0) GUARD_STATE="ok"; return 0 ;;
+        ''|*[!0-9]*) GUARD_STATE="unknown" ;;  # count could not be computed from the JSON
+        *) GUARD_STATE="block" ;;
+    esac
+    GUARD_REASON="hq beads in_progress = ${HQ_INPROGRESS_COUNT}"
+    return 1
+}
+guard_scraper_daily() {
+    GUARD_STATE="unknown"; GUARD_REASON=""
     scraper_daily_state
-    if [ "${SCRAPER_DAILY_STATE}" = "running" ]; then
-        BLOCK_REASON="property_scrapers daily em execução — ${SCRAPER_DAILY_REASON}"
-        return 1
-    fi
-    if [ "${SCRAPER_DAILY_STATE}" != "clear" ]; then
-        BLOCK_REASON="property_scrapers daily: estado desconhecido (${SCRAPER_DAILY_REASON}) — unknown treated as NOT safe"
-        return 1
-    fi
+    case "${SCRAPER_DAILY_STATE}" in
+        clear) GUARD_STATE="ok"; return 0 ;;
+        running)
+            GUARD_STATE="block"
+            GUARD_REASON="property_scrapers daily em execução — ${SCRAPER_DAILY_REASON}"
+            ;;
+        *) GUARD_REASON="property_scrapers daily: estado desconhecido (${SCRAPER_DAILY_REASON}) — unknown treated as NOT safe" ;;
+    esac
+    return 1
+}
+
+# Nightly: runs the three guards in order ONCE and stops at the first that is
+# not ok, so the log gets a single BLOCK_REASON per attempt and a guard that is
+# not reached is not queried (a failing gate never calls bd). Sets BLOCK_REASON
+# on failure. Returns 0 only if ALL guards pass.
+check_guards_once() {
+    guard_gate_markers || { BLOCK_REASON="${GUARD_REASON}"; return 1; }
+    guard_hq_in_progress || { BLOCK_REASON="${GUARD_REASON}"; return 1; }
+    guard_scraper_daily || { BLOCK_REASON="${GUARD_REASON}"; return 1; }
     return 0
 }
+
+# --check-guards: same guards, but every one is evaluated (no stopping at the
+# first) and each gets its own stdout line "<label>: ok" or
+# "<label>: BLOCK|unknown <reason>", so one run shows everything in the way of
+# a manual reboot. Returns 0 only if all three are ok.
+report_guard() {
+    local label="$1" fn="$2" reason
+    if "${fn}"; then
+        printf '%s: ok\n' "${label}"
+        return 0
+    fi
+    # bd/gate stderr can span lines; the contract is one line per guard.
+    reason=$(printf '%s' "${GUARD_REASON}" | tr '\n' ' ')
+    case "${GUARD_STATE}" in
+        block) printf '%s: BLOCK %s\n' "${label}" "${reason}" ;;
+        *) printf '%s: unknown %s\n' "${label}" "${reason}" ;;
+    esac
+    return 1
+}
+check_guards_report() {
+    local rc=0
+    report_guard "guard2 gate-markers" guard_gate_markers || rc=1
+    report_guard "guard3 hq-in-progress" guard_hq_in_progress || rc=1
+    report_guard "guard4 scraper-daily" guard_scraper_daily || rc=1
+    return "${rc}"
+}
+# nightly-reboot.selftest.sh:GUARDS-FUNCTIONS-END
+
+if [ "${CHECK_GUARDS_ONLY}" -eq 1 ]; then
+    check_guards_report
+    exit $?
+fi
 
 ATTEMPT=1
 while true; do

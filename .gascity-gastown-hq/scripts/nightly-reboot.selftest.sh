@@ -55,8 +55,10 @@ cat > "$FAKEBIN/date" <<'EOF'
 # Pins Guard 1's window check to 01:05 so every scenario clears it
 # regardless of when the selftest actually runs. Anything else (the log()
 # timestamp, the notify %H:%M text) delegates to the real date.
+# FAKE_HOUR overrides the pinned hour: Scenario 7 (--check-guards) runs at 14h,
+# OUTSIDE the 01:00-01:19 window, on purpose — see that scenario's comment.
 case "$1" in
-  +%-H) echo 1 ;;
+  +%-H) echo "${FAKE_HOUR:-1}" ;;
   +%-M) echo 5 ;;
   *) exec /bin/date "$@" ;;
 esac
@@ -466,6 +468,182 @@ SYSCTL
   PATH="$FAKEBIN:$PATH" SCRAPER_RODADA_DIR="$RDIR" scraper_daily_state
   [ "$SCRAPER_DAILY_STATE" = "clear" ] && ok "6g: rodada iniciada ANTES do boot -> clear (pid reusado, epoch lido em SEGUNDOS)" || bad "6g: esperava clear, veio $SCRAPER_DAILY_STATE — o epoch de boot provavelmente veio em microssegundos ($SCRAPER_DAILY_REASON)"
   rm -f "$FAKEBIN/sysctl"
+fi
+
+echo ""
+echo "── Scenario 7: --check-guards (ga-7e3fwa) — read-only preflight for the Mayor's MANUAL reboot ──"
+# Os reboots manuais de 26/09, 27/09, 28/09 e 29/09 mataram o noturno do
+# scraper porque o caminho manual nao passa pelo Guard 4 — e o script nao tinha
+# modo de so CHECAR. --check-guards roda os mesmos Guards 2+3+4 do noturno, uma
+# vez, sem reiniciar, sem tocar o streak, sem mail, sem notify, sem log.
+#
+# SEGURANCA (mesma doutrina do cabecalho): todo run completo daqui roda com a
+# hora falsa em 14h, FORA da janela 01:00-01:19. Contra o script ANTERIOR ao fix
+# (que ignora --check-guards) isso cai no Guard 1 e sai com SKIP — o reboot fica
+# estruturalmente inalcancavel, mesmo com bd/gate/scraper todos "limpos". Nao e
+# acaso: --check-guards tambem tem que funcionar a qualquer hora (o reboot do
+# Mayor nao e as 01:05), entao 14h e o caso que prova as duas coisas de uma vez.
+# SHUTDOWN_BIN e SOFTWAREUPDATE_BIN vao pra fakes por cinto-e-suspensorio.
+FAKE_SHUTDOWN="$TMP/shutdown7"; SHUTDOWN_CALLS="$TMP/shutdown7.calls"
+cat > "$FAKE_SHUTDOWN" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SHUTDOWN_CALLS"
+EOF
+chmod +x "$FAKE_SHUTDOWN"
+FAKE_SU7="$TMP/softwareupdate7"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_SU7"; chmod +x "$FAKE_SU7"
+MAIL7_LOG="$TMP/mail7.log"; FAKE_GC7="$TMP/gc7"
+cat > "$FAKE_GC7" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$MAIL7_LOG"
+EOF
+chmod +x "$FAKE_GC7"
+
+# fake bd controlado por arquivo: modo "fail" -> rc=1 (estado DESCONHECIDO),
+# senao devolve o JSON pedido (ex.: '[]' = zero in_progress).
+FAKE_BD7="$TMP/bd7"; BD7_MODE="$TMP/bd7.mode"; BD7_JSON="$TMP/bd7.json"; BD7_COUNTER="$TMP/bd7-calls"
+cat > "$FAKE_BD7" <<EOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$BD7_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BD7_COUNTER"
+if [ "\$(cat "$BD7_MODE" 2>/dev/null)" = "fail" ]; then echo "fake bd: dolt unreachable" >&2; exit 1; fi
+cat "$BD7_JSON"
+EOF
+chmod +x "$FAKE_BD7"
+set_bd7() { printf '%s' "$1" > "$BD7_MODE"; printf '%s\n' "$2" > "$BD7_JSON"; }
+
+R7DIR="$TMP/rodada7"
+LIVE7=$$
+BOOT7=$(( $(/bin/date +%s) - 7200 ))
+AFTER7=$(/bin/date -r $(( $(/bin/date +%s) - 3600 )) +%Y-%m-%dT%H:%M:%S.000000)
+mk7() { printf '{"rodada_id":"%s","pid":%s,"phase":"scraping","status":"%s","started_at":"%s"}' "$1" "$2" "$3" "$4" > "$R7DIR/$1.json"; }
+
+reset7() {
+  rm -f "$GATE_COUNTER" "$BD7_COUNTER" "$STREAK_FILE_PATH" "$SHUTDOWN_CALLS"
+  : > "$NOTIFY_LOG"; : > "$FAKE_LOG"; : > "$MAIL7_LOG"
+  rm -rf "$R7DIR"; mkdir -p "$R7DIR"
+}
+run_cg() {
+  PATH="$FAKEBIN:$PATH" FAKE_HOUR=14 \
+    CITY="$FAKE_CITY" BD_BIN="$FAKE_BD7" GC_BIN="$FAKE_GC7" \
+    NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_AS_USER="nobody" \
+    SHUTDOWN_BIN="$FAKE_SHUTDOWN" SOFTWAREUPDATE_BIN="$FAKE_SU7" \
+    SCRAPER_RODADA_DIR="$R7DIR" SCRAPER_BOOT_EPOCH="$BOOT7" \
+    NIGHTLY_REBOOT_RETRY_INTERVAL=1 NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=3 \
+    timeout 60 bash "$SCRIPT" "$@" >"$TMP/cg.out" 2>"$TMP/cg.err"
+  echo $?
+}
+# Nada de efeito colateral: sem shutdown, sem log do noturno, sem notify, sem
+# mail, e o streak exatamente como estava ($2 = valor esperado; vazio = ausente).
+assert_read_only7() {
+  local label="$1" want_streak="$2" got_streak
+  got_streak=$(cat "$STREAK_FILE_PATH" 2>/dev/null || true)
+  [ ! -s "$SHUTDOWN_CALLS" ] && ok "$label: nenhuma chamada de shutdown" || bad "$label: SAFETY — shutdown foi chamado: $(cat "$SHUTDOWN_CALLS")"
+  [ ! -s "$FAKE_LOG" ] && ok "$label: log do noturno intocado" || bad "$label: escreveu no log do noturno: $(head -3 "$FAKE_LOG")"
+  [ ! -s "$NOTIFY_LOG" ] && ok "$label: nenhum notify" || bad "$label: mandou notify: $(cat "$NOTIFY_LOG")"
+  [ ! -s "$MAIL7_LOG" ] && ok "$label: nenhum mail" || bad "$label: mandou mail: $(cat "$MAIL7_LOG")"
+  [ "$got_streak" = "$want_streak" ] && ok "$label: streak intocado (${want_streak:-ausente})" || bad "$label: streak mudou: esperava '${want_streak}', veio '${got_streak}'"
+}
+line_count7() { wc -l < "$TMP/cg.out" | tr -d ' '; }
+has_line7() { grep -Fx -- "$1" "$TMP/cg.out" >/dev/null; }
+line_of7() { grep -F -- "$1" "$TMP/cg.out" | head -1; }
+
+echo "  -- 7a: tudo limpo (fora da janela de 01h) -> exit 0, tres linhas ok, streak intocado --"
+reset7; write_fake_gate 1; set_bd7 json '[]'
+printf '1\n' > "$STREAK_FILE_PATH"
+rc=$(run_cg --check-guards)
+[ "$rc" = "0" ] && ok "7a: exit 0 quando todos os guards estao ok" || bad "7a: esperava exit 0, veio $rc ($(head -3 "$TMP/cg.out" | tr '\n' '|'))"
+[ "$(line_count7)" = "3" ] && ok "7a: exatamente uma linha por guard" || bad "7a: esperava 3 linhas, veio $(line_count7): $(tr '\n' '|' < "$TMP/cg.out")"
+has_line7 "guard2 gate-markers: ok" && ok "7a: guard 2 ok" || bad "7a: falta 'guard2 gate-markers: ok'"
+has_line7 "guard3 hq-in-progress: ok" && ok "7a: guard 3 ok" || bad "7a: falta 'guard3 hq-in-progress: ok'"
+has_line7 "guard4 scraper-daily: ok" && ok "7a: guard 4 ok" || bad "7a: falta 'guard4 scraper-daily: ok'"
+assert_read_only7 "7a" "1"
+
+echo "  -- 7b: hq bloqueia E scraper rodando -> os DOIS aparecem (sem curto-circuito), sem retry --"
+reset7; write_fake_gate 1; set_bd7 json '[{"id":"fake-inprogress-1"}]'
+mk7 live "$LIVE7" running "$AFTER7"
+printf '1\n' > "$STREAK_FILE_PATH"
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7b: exit != 0 com guard bloqueando (rc=$rc)" || bad "7b: exit 0 com hq em andamento e scraper rodando"
+has_line7 "guard2 gate-markers: ok" && ok "7b: guard 2 ok" || bad "7b: falta 'guard2 gate-markers: ok'"
+line_of7 "guard3 hq-in-progress:" | grep -F "BLOCK hq beads in_progress = 1" >/dev/null && ok "7b: guard 3 = BLOCK com o motivo" || bad "7b: linha do guard 3: '$(line_of7 'guard3 hq-in-progress:')'"
+line_of7 "guard4 scraper-daily:" | grep -F "BLOCK" >/dev/null && ok "7b: guard 4 avaliado mesmo com o 3 bloqueado (sem curto-circuito)" || bad "7b: guard 4 nao foi avaliado apos o bloqueio do 3: '$(line_of7 'guard4 scraper-daily:')'"
+line_of7 "guard4 scraper-daily:" | grep -F "live" >/dev/null && ok "7b: guard 4 nomeia a rodada" || bad "7b: guard 4 sem o id da rodada"
+[ "$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)" = "1" ] && ok "7b: gate consultado uma vez (sem loop de retry)" || bad "7b: gate consultado $(cat "$GATE_COUNTER" 2>/dev/null || echo 0)x"
+[ "$(cat "$BD7_COUNTER" 2>/dev/null || echo 0)" = "1" ] && ok "7b: hq consultado uma vez (sem loop de retry)" || bad "7b: bd consultado $(cat "$BD7_COUNTER" 2>/dev/null || echo 0)x"
+assert_read_only7 "7b" "1"
+
+echo "  -- 7c: SO a rodada do scraper (o incidente real) -> BLOCK no guard 4, 2 e 3 ok --"
+reset7; write_fake_gate 1; set_bd7 json '[]'
+mk7 bc6496e8 "$LIVE7" running "$AFTER7"
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7c: exit != 0 so por causa do scraper" || bad "7c: exit 0 com rodada do scraper rodando — reboot manual mataria o noturno de novo"
+has_line7 "guard2 gate-markers: ok" && has_line7 "guard3 hq-in-progress: ok" && ok "7c: guards 2 e 3 ok" || bad "7c: guards 2/3 deviam estar ok: $(tr '\n' '|' < "$TMP/cg.out")"
+line_of7 "guard4 scraper-daily:" | grep -F "BLOCK" | grep -F "bc6496e8" >/dev/null && ok "7c: guard 4 = BLOCK citando a rodada bc6496e8" || bad "7c: linha do guard 4: '$(line_of7 'guard4 scraper-daily:')'"
+assert_read_only7 "7c" ""
+
+echo "  -- 7d: estado DESCONHECIDO nos tres guards -> 'unknown', nunca 'ok' nem 'BLOCK' --"
+reset7; write_fake_gate 0; set_bd7 fail ''
+printf '{not json' > "$R7DIR/corrupt.json"
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7d: exit != 0 (unknown nao e ok)" || bad "7d: exit 0 com estado desconhecido — erro colapsado em ok"
+[ "$(line_count7)" = "3" ] && ok "7d: uma linha por guard mesmo com stderr multilinha dos comandos" || bad "7d: esperava 3 linhas, veio $(line_count7): $(tr '\n' '|' < "$TMP/cg.out")"
+line_of7 "guard2 gate-markers:" | grep -F ": unknown" >/dev/null && ok "7d: guard 2 = unknown" || bad "7d: linha do guard 2: '$(line_of7 'guard2 gate-markers:')'"
+line_of7 "guard3 hq-in-progress:" | grep -F ": unknown" >/dev/null && ok "7d: guard 3 = unknown" || bad "7d: linha do guard 3: '$(line_of7 'guard3 hq-in-progress:')'"
+line_of7 "guard4 scraper-daily:" | grep -F ": unknown" >/dev/null && ok "7d: guard 4 = unknown" || bad "7d: linha do guard 4: '$(line_of7 'guard4 scraper-daily:')'"
+grep -E ": (ok|BLOCK)" "$TMP/cg.out" >/dev/null && bad "7d: um estado desconhecido foi rotulado ok/BLOCK: $(tr '\n' '|' < "$TMP/cg.out")" || ok "7d: nenhum desconhecido rotulado como ok ou BLOCK"
+assert_read_only7 "7d" ""
+
+echo "  -- 7e: argumento desconhecido -> recusa (exit 2), nao cai no fluxo real do reboot --"
+reset7; write_fake_gate 1; set_bd7 json '[]'
+rc=$(run_cg --check-guard)
+[ "$rc" = "2" ] && ok "7e: typo em --check-guards sai com exit 2" || bad "7e: esperava exit 2, veio $rc — um typo cairia no fluxo real do reboot"
+[ ! -s "$TMP/cg.out" ] && ok "7e: nenhuma saida de guard" || bad "7e: imprimiu saida de guard: $(head -3 "$TMP/cg.out" | tr '\n' '|')"
+[ "$(cat "$GATE_COUNTER" 2>/dev/null || echo 0)" = "0" ] && [ "$(cat "$BD7_COUNTER" 2>/dev/null || echo 0)" = "0" ] && ok "7e: nenhum guard executado" || bad "7e: guards rodaram com argumento invalido"
+assert_read_only7 "7e" ""
+
+echo "  -- 7f: caminho do NOTURNO preservado apos extrair os guards (BLOCK_REASON identico), isolado por extracao --"
+GUARDS_SNIPPET="$TMP/guards-functions.sh"
+sed -n '/GUARDS-FUNCTIONS-START/,/GUARDS-FUNCTIONS-END/p' "$SCRIPT" > "$GUARDS_SNIPPET"
+if [ ! -s "$GUARDS_SNIPPET" ]; then
+  bad "7f: sentinel extraction found nothing in $SCRIPT — cannot test check_guards_once (expected on the pre-fix script)"
+else
+  # shellcheck disable=SC2034  # consumidas pelo snippet carregado dinamicamente
+  CITY="$FAKE_CITY"
+  # shellcheck disable=SC2034
+  BD="$FAKE_BD7"
+  # shellcheck disable=SC2034
+  GATE_ERR="$TMP/gate-err7"
+  # shellcheck disable=SC2034
+  HQ_ERR="$TMP/hq-err7"
+  # shellcheck source=/dev/null
+  source "$SCRAPER_SNIPPET"
+  # shellcheck source=/dev/null
+  source "$GUARDS_SNIPPET"
+  g7() { SCRAPER_RODADA_DIR="$R7DIR" SCRAPER_BOOT_EPOCH="$BOOT7" check_guards_once; }
+
+  reset7; write_fake_gate 1; set_bd7 json '[]'
+  g7; [ $? -eq 0 ] && ok "7f: tudo limpo -> check_guards_once retorna 0" || bad "7f: esperava 0 com tudo limpo"
+
+  reset7; write_fake_gate 0; set_bd7 json '[]'
+  g7; rc=$?
+  [ "$rc" -eq 1 ] && printf '%s' "$BLOCK_REASON" | grep -F "gate-queue-composition.sh failed" >/dev/null && ok "7f: gate falhando -> mesma BLOCK_REASON de sempre" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
+
+  reset7; write_fake_gate 1; set_bd7 json '[{"id":"x"},{"id":"y"}]'
+  g7; rc=$?
+  [ "$rc" -eq 1 ] && [ "$BLOCK_REASON" = "hq beads in_progress = 2" ] && ok "7f: hq em andamento -> 'hq beads in_progress = 2'" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
+
+  reset7; write_fake_gate 1; set_bd7 json '[]'; mk7 live "$LIVE7" running "$AFTER7"
+  g7; rc=$?
+  [ "$rc" -eq 1 ] && printf '%s' "$BLOCK_REASON" | grep -F "property_scrapers daily em execução" >/dev/null && ok "7f: scraper rodando -> mesma BLOCK_REASON de sempre" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
+
+  reset7; write_fake_gate 1; set_bd7 json '[]'; printf '{not json' > "$R7DIR/corrupt.json"
+  g7; rc=$?
+  [ "$rc" -eq 1 ] && printf '%s' "$BLOCK_REASON" | grep -F "estado desconhecido" >/dev/null && ok "7f: scraper desconhecido -> continua NAO seguro" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
+
+  # curto-circuito do noturno preservado: gate falhando nao consulta o bd.
+  reset7; write_fake_gate 0; set_bd7 json '[]'
+  g7
+  [ "$(cat "$BD7_COUNTER" 2>/dev/null || echo 0)" = "0" ] && ok "7f: noturno continua curto-circuitando (gate falho -> bd nao consultado)" || bad "7f: bd consultado apos falha do gate"
 fi
 
 echo ""
