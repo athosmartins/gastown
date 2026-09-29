@@ -87,12 +87,19 @@
 #     guard3 hq-in-progress: BLOCK hq beads in_progress = 2
 #     guard4 scraper-daily: unknown <why it could not tell>
 # Three states, never collapsed: ok (safe), BLOCK (something is in flight),
-# unknown (the guard could not look — NOT safe). Exit 0 only if all three are
-# ok; every guard is evaluated even after one blocks, so a single run shows
-# everything in the way. It does NOT reboot, does NOT touch the skip streak,
-# sends no mail or notify, writes nothing to the nightly log, and ignores the
-# 01:00-01:19 window (a manual reboot is not at 01:05). An unknown argument is
-# refused with exit 2 — a typo must never fall through into the real flow.
+# unknown (the guard could not look — NOT safe). An "ok" can carry a caveat,
+# e.g. "guard2 gate-markers: ok (3 unreadable markers, ...)": markers the gate
+# could not classify never block (nightly rule, unchanged) but are not silent.
+# Exit 0 only if all three are ok, and 1 for BLOCK and unknown alike — read the
+# label, not just the code. Every guard is evaluated even after one blocks, so a
+# single run shows everything in the way, one line each even when the command's
+# stderr spans several. There is no timeout: a wedged Dolt hangs this like it
+# hangs bd (Ctrl-C = treat as unknown; macOS has no /usr/bin/timeout, and the
+# nightly must not gain a dependency on one). It does NOT reboot, does NOT
+# touch the skip streak, sends no mail or notify, writes nothing to the nightly
+# log, and ignores the 01:00-01:19 window (a manual reboot is not at 01:05). An
+# unknown argument is refused with exit 2 — a typo must never fall through into
+# the real flow.
 # A Guard 4 BLOCK means: wait for the rodada to finish, or write in the
 # reboot runbook (docs/runbooks/reboot-*-pre.txt) that it WILL be killed.
 
@@ -441,7 +448,8 @@ RETRY_MAX_ATTEMPTS="${NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS:-18}"
 # and GUARD_REASON to a human string, and returns 0 only for "ok" — callers
 # decide on the return code, GUARD_STATE only picks the label. It starts as
 # "unknown" on entry, so a failing path that forgets to set it is reported as
-# unknown (NOT safe), never as ok or BLOCK.
+# unknown (NOT safe), never as ok or BLOCK. GUARD_NOTE (reset on entry too) is a
+# caveat that --check-guards prints after an "ok"; it never changes a return code.
 #
 # nightly-reboot.selftest.sh:GUARDS-FUNCTIONS-START — sentinel for the selftest
 # (Scenario 7f), same isolation technique as the blocks above: it extracts this
@@ -449,7 +457,7 @@ RETRY_MAX_ATTEMPTS="${NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS:-18}"
 # still yields the same BLOCK_REASON text. Needs CITY, BD, GATE_ERR, HQ_ERR and
 # scraper_daily_state from above.
 guard_gate_markers() {
-    GUARD_STATE="unknown"; GUARD_REASON=""
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
     GATE_JSON=$("${CITY}/scripts/gate-queue-composition.sh" --json 2>"${GATE_ERR}")
     GATE_RC=$?
     if [ "${GATE_RC}" -ne 0 ] || [ -z "${GATE_JSON}" ]; then
@@ -458,32 +466,56 @@ guard_gate_markers() {
     fi
     GATE_REAL=$(printf '%s' "${GATE_JSON}" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("real","?"))' 2>/dev/null)
     case "${GATE_REAL}" in
-        0) GUARD_STATE="ok"; return 0 ;;
-        ''|*[!0-9]*) GUARD_STATE="unknown" ;;  # "?" (no "real" key) or unparseable: could not tell
+        0)
+            GUARD_STATE="ok"
+            # Markers the gate could not classify (its "unknown" count) are not
+            # "real" work, so — like the nightly always did — they do not block.
+            # But an "ok" that hides them reads as "looked and saw nothing", so
+            # --check-guards says how many there were. GUARD_NOTE only decorates
+            # the label; the return code, and so the nightly, is unchanged. If the
+            # count itself cannot be read (key absent, null) that is said too —
+            # "could not tell how many" must not print the same bare "ok" as "zero".
+            GATE_UNREADABLE=$(printf '%s' "${GATE_JSON}" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("unknown","?"))' 2>/dev/null)
+            case "${GATE_UNREADABLE}" in
+                0) ;;
+                ''|*[!0-9]*) GUARD_NOTE="unreadable-marker count unavailable (gate JSON has no numeric \"unknown\") — see scripts/gate-queue-composition.sh" ;;
+                *) GUARD_NOTE="${GATE_UNREADABLE} unreadable markers, not counted as real work — see scripts/gate-queue-composition.sh" ;;
+            esac
+            return 0
+            ;;
+        ''|*[!0-9]*)  # "?" (no "real" key) or unparseable: could not tell
+            GUARD_REASON="gate JSON has no numeric \"real\" count (raw: ${GATE_JSON}) — unknown gate state treated as NOT safe"
+            return 1
+            ;;
         *) GUARD_STATE="block" ;;
     esac
     GUARD_REASON="gate real-work markers in flight = ${GATE_REAL} (raw: ${GATE_JSON})"
     return 1
 }
 guard_hq_in_progress() {
-    GUARD_STATE="unknown"; GUARD_REASON=""
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
     HQ_INPROGRESS_JSON=$("${BD}" -C "${CITY}" list --status in_progress --json --limit 0 2>"${HQ_ERR}")
     HQ_RC=$?
     if [ "${HQ_RC}" -ne 0 ] || ! printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
         GUARD_REASON="bd list --status in_progress (hq) failed (rc=${HQ_RC}: $(cat "${HQ_ERR}" 2>/dev/null)) — unknown state treated as NOT safe"
         return 1
     fi
-    HQ_INPROGRESS_COUNT=$(printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+    # Only a JSON LIST has a count. Valid JSON that is not a list (null, {}, an
+    # error envelope) prints "?" — it must not be read as "zero in_progress".
+    HQ_INPROGRESS_COUNT=$(printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else "?")' 2>/dev/null)
     case "${HQ_INPROGRESS_COUNT}" in
         0) GUARD_STATE="ok"; return 0 ;;
-        ''|*[!0-9]*) GUARD_STATE="unknown" ;;  # count could not be computed from the JSON
+        ''|*[!0-9]*)  # not a list: the count could not be computed
+            GUARD_REASON="bd list --status in_progress (hq) returned JSON that is not a list (raw: ${HQ_INPROGRESS_JSON}) — count unknown, treated as NOT safe"
+            return 1
+            ;;
         *) GUARD_STATE="block" ;;
     esac
     GUARD_REASON="hq beads in_progress = ${HQ_INPROGRESS_COUNT}"
     return 1
 }
 guard_scraper_daily() {
-    GUARD_STATE="unknown"; GUARD_REASON=""
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
     scraper_daily_state
     case "${SCRAPER_DAILY_STATE}" in
         clear) GUARD_STATE="ok"; return 0 ;;
@@ -514,7 +546,11 @@ check_guards_once() {
 report_guard() {
     local label="$1" fn="$2" reason
     if "${fn}"; then
-        printf '%s: ok\n' "${label}"
+        if [ -n "${GUARD_NOTE}" ]; then
+            printf '%s: ok (%s)\n' "${label}" "$(printf '%s' "${GUARD_NOTE}" | tr '\n' ' ')"
+        else
+            printf '%s: ok\n' "${label}"
+        fi
         return 0
     fi
     # bd/gate stderr can span lines; the contract is one line per guard.

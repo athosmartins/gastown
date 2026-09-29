@@ -505,11 +505,42 @@ FAKE_BD7="$TMP/bd7"; BD7_MODE="$TMP/bd7.mode"; BD7_JSON="$TMP/bd7.json"; BD7_COU
 cat > "$FAKE_BD7" <<EOF
 #!/usr/bin/env bash
 n=\$(( \$(cat "$BD7_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BD7_COUNTER"
-if [ "\$(cat "$BD7_MODE" 2>/dev/null)" = "fail" ]; then echo "fake bd: dolt unreachable" >&2; exit 1; fi
+if [ "\$(cat "$BD7_MODE" 2>/dev/null)" = "fail" ]; then
+  # stderr de DUAS linhas, como o bd real quando o Dolt cai: o contrato de "uma
+  # linha por guard" so e testado se o stderr de fato quebra linha.
+  echo "fake bd: dolt unreachable" >&2
+  echo "      bd: connection refused" >&2
+  exit 1
+fi
 cat "$BD7_JSON"
 EOF
 chmod +x "$FAKE_BD7"
 set_bd7() { printf '%s' "$1" > "$BD7_MODE"; printf '%s\n' "$2" > "$BD7_JSON"; }
+
+# gate falhando com stderr MULTILINHA (3 linhas, igual ao gate-queue-composition.sh
+# real nos caminhos "bd fora do PATH" e "nao consegui ler os markers").
+write_fake_gate_multiline_fail() {
+  cat > "$FAKE_GATE" <<EOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$GATE_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$GATE_COUNTER"
+echo "ERRO: nao consegui ler os markers." >&2
+echo "      bd: connection refused" >&2
+echo "      Isto e UNKNOWN, nao 'fila vazia'." >&2
+exit 2
+EOF
+  chmod +x "$FAKE_GATE"
+}
+# gate que sai 0 imprimindo EXATAMENTE o JSON pedido (pode faltar a chave "real",
+# pode ser multilinha) — para exercitar os ramos de parse dos guards.
+write_fake_gate_json() {
+  cat > "$FAKE_GATE" <<EOF
+#!/usr/bin/env bash
+n=\$(( \$(cat "$GATE_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$GATE_COUNTER"
+printf '%s\n' '$1'
+exit 0
+EOF
+  chmod +x "$FAKE_GATE"
+}
 
 R7DIR="$TMP/rodada7"
 LIVE7=$$
@@ -582,11 +613,15 @@ line_of7 "guard4 scraper-daily:" | grep -F "BLOCK" | grep -F "bc6496e8" >/dev/nu
 assert_read_only7 "7c" ""
 
 echo "  -- 7d: estado DESCONHECIDO nos tres guards -> 'unknown', nunca 'ok' nem 'BLOCK' --"
-reset7; write_fake_gate 0; set_bd7 fail ''
+reset7; write_fake_gate_multiline_fail; set_bd7 fail ''
 printf '{not json' > "$R7DIR/corrupt.json"
 rc=$(run_cg --check-guards)
 [ "$rc" != "0" ] && ok "7d: exit != 0 (unknown nao e ok)" || bad "7d: exit 0 com estado desconhecido — erro colapsado em ok"
+# O gate e o bd fakes aqui imprimem stderr de 3 e 2 linhas: se o tr '\n' ' ' do
+# report_guard sumir, a saida vira 3+2+... linhas e esta asserção reprova.
 [ "$(line_count7)" = "3" ] && ok "7d: uma linha por guard mesmo com stderr multilinha dos comandos" || bad "7d: esperava 3 linhas, veio $(line_count7): $(tr '\n' '|' < "$TMP/cg.out")"
+line_of7 "guard2 gate-markers:" | grep -F "connection refused" >/dev/null && ok "7d: o stderr multilinha do gate foi preservado na MESMA linha" || bad "7d: linha do guard 2 perdeu o stderr: '$(line_of7 'guard2 gate-markers:')'"
+line_of7 "guard3 hq-in-progress:" | grep -F "connection refused" >/dev/null && ok "7d: o stderr multilinha do bd foi preservado na MESMA linha" || bad "7d: linha do guard 3 perdeu o stderr: '$(line_of7 'guard3 hq-in-progress:')'"
 line_of7 "guard2 gate-markers:" | grep -F ": unknown" >/dev/null && ok "7d: guard 2 = unknown" || bad "7d: linha do guard 2: '$(line_of7 'guard2 gate-markers:')'"
 line_of7 "guard3 hq-in-progress:" | grep -F ": unknown" >/dev/null && ok "7d: guard 3 = unknown" || bad "7d: linha do guard 3: '$(line_of7 'guard3 hq-in-progress:')'"
 line_of7 "guard4 scraper-daily:" | grep -F ": unknown" >/dev/null && ok "7d: guard 4 = unknown" || bad "7d: linha do guard 4: '$(line_of7 'guard4 scraper-daily:')'"
@@ -645,6 +680,78 @@ else
   g7
   [ "$(cat "$BD7_COUNTER" 2>/dev/null || echo 0)" = "0" ] && ok "7f: noturno continua curto-circuitando (gate falho -> bd nao consultado)" || bad "7f: bd consultado apos falha do gate"
 fi
+
+# 7g-7i (gate ga-plx4g8, round 1): 7d so alcanca os retornos ANTECIPADOS dos
+# guards (gate rc!=0, bd rc!=0, marker corrompido), que ja saem rotulados
+# "unknown" pela inicializacao de GUARD_STATE. Os ramos de parse que o diff
+# ADICIONOU — JSON valido mas sem o dado ("real" ausente, contagem que nao sai) —
+# so eram exercitados por mutacao: virar unknown->block neles deixava o selftest
+# verde. Aqui cada um tem um caso que reprova se o ramo for removido ou virado.
+state_of7() { line_of7 "$1" | sed -E 's/^[^:]*: ([A-Za-z]+).*/\1/'; }
+no_traceback7() { ! grep -F "Traceback" "$TMP/cg.err" >/dev/null 2>&1; }
+
+echo "  -- 7g: JSON VALIDO mas sem o dado ('real' ausente / bd nao devolve lista) -> 'unknown', nunca ok nem BLOCK --"
+reset7; write_fake_gate_json '{"total":0}'; set_bd7 json 'null'
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7g: exit != 0" || bad "7g: exit 0 com gate sem 'real' e bd 'null'"
+[ "$(line_count7)" = "3" ] && ok "7g: uma linha por guard" || bad "7g: esperava 3 linhas, veio $(line_count7): $(tr '\n' '|' < "$TMP/cg.out")"
+[ "$(state_of7 'guard2 gate-markers:')" = "unknown" ] && ok "7g: gate sem chave 'real' = unknown (nao BLOCK)" || bad "7g: guard 2 = '$(line_of7 'guard2 gate-markers:')'"
+[ "$(state_of7 'guard3 hq-in-progress:')" = "unknown" ] && ok "7g: bd 'null' (contagem impossivel) = unknown (nao BLOCK)" || bad "7g: guard 3 = '$(line_of7 'guard3 hq-in-progress:')'"
+[ "$(state_of7 'guard4 scraper-daily:')" = "ok" ] && ok "7g: guard 4 segue ok (sem rodada)" || bad "7g: guard 4 = '$(line_of7 'guard4 scraper-daily:')'"
+line_of7 "guard3 hq-in-progress:" | grep -F "not a list" >/dev/null && ok "7g: guard 3 diz POR QUE e desconhecido (nao imprime 'in_progress = ' vazio)" || bad "7g: guard 3 sem motivo: '$(line_of7 'guard3 hq-in-progress:')'"
+line_of7 "guard2 gate-markers:" | grep -F '"real"' >/dev/null && ok "7g: guard 2 diz POR QUE e desconhecido" || bad "7g: guard 2 sem motivo: '$(line_of7 'guard2 gate-markers:')'"
+no_traceback7 && ok "7g: nenhum traceback do python vaza no stderr" || bad "7g: traceback no stderr: $(head -3 "$TMP/cg.err" | tr '\n' '|')"
+assert_read_only7 "7g" ""
+
+echo "  -- 7g2: bd devolve JSON valido que NAO e lista ('{}') -> unknown, nunca ok (erro nao vira zero) --"
+reset7; write_fake_gate 1; set_bd7 json '{}'
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7g2: exit != 0 com bd devolvendo '{}'" || bad "7g2: exit 0 — objeto vazio lido como zero in_progress"
+[ "$(state_of7 'guard3 hq-in-progress:')" = "unknown" ] && ok "7g2: guard 3 = unknown" || bad "7g2: guard 3 = '$(line_of7 'guard3 hq-in-progress:')'"
+no_traceback7 && ok "7g2: sem traceback" || bad "7g2: traceback no stderr"
+
+echo "  -- 7g3: GUARD_STATE nao vaza entre guards (BLOCK, unknown e BLOCK alternados; depois o inverso) --"
+reset7; write_fake_gate_json '{"total":2,"real":2,"phantom":0,"unknown":0}'; set_bd7 json 'null'
+mk7 live "$LIVE7" running "$AFTER7"
+run_cg --check-guards >/dev/null
+s2=$(state_of7 'guard2 gate-markers:'); s3=$(state_of7 'guard3 hq-in-progress:'); s4=$(state_of7 'guard4 scraper-daily:')
+[ "$s2/$s3/$s4" = "BLOCK/unknown/BLOCK" ] && ok "7g3: BLOCK / unknown / BLOCK" || bad "7g3: esperava BLOCK/unknown/BLOCK, veio $s2/$s3/$s4"
+reset7; write_fake_gate_json '{"total":0}'; set_bd7 json '[{"id":"x"}]'
+printf '{not json' > "$R7DIR/corrupt.json"
+run_cg --check-guards >/dev/null
+s2=$(state_of7 'guard2 gate-markers:'); s3=$(state_of7 'guard3 hq-in-progress:'); s4=$(state_of7 'guard4 scraper-daily:')
+[ "$s2/$s3/$s4" = "unknown/BLOCK/unknown" ] && ok "7g3: unknown / BLOCK / unknown" || bad "7g3: esperava unknown/BLOCK/unknown, veio $s2/$s3/$s4"
+
+echo "  -- 7h: 'uma linha por guard' tambem no caminho BLOCK (o JSON cru do gate pode vir indentado) --"
+reset7; write_fake_gate_json $'{\n  "total": 2,\n  "real": 2,\n  "phantom": 0,\n  "unknown": 0\n}'; set_bd7 json '[]'
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "7h: exit != 0 com marker real em andamento" || bad "7h: exit 0 com 2 markers reais"
+[ "$(line_count7)" = "3" ] && ok "7h: uma linha por guard com o JSON cru multilinha do gate" || bad "7h: esperava 3 linhas, veio $(line_count7): $(tr '\n' '|' < "$TMP/cg.out")"
+[ "$(state_of7 'guard2 gate-markers:')" = "BLOCK" ] && line_of7 "guard2 gate-markers:" | grep -F "in flight = 2" >/dev/null && ok "7h: guard 2 = BLOCK com a contagem" || bad "7h: guard 2 = '$(line_of7 'guard2 gate-markers:')'"
+
+echo "  -- 7i: markers ILEGIVEIS nao viram 'ok' mudo (a linha diz quantos), e o noturno segue igual --"
+reset7; write_fake_gate_json '{"total":3,"real":0,"phantom":0,"unknown":3}'; set_bd7 json '[]'
+rc=$(run_cg --check-guards)
+[ "$rc" = "0" ] && ok "7i: exit 0 (ilegivel nao conta como real — mesma decisao do noturno)" || bad "7i: esperava exit 0, veio $rc"
+line_of7 "guard2 gate-markers:" | grep -E "^guard2 gate-markers: ok \(3 unreadable markers" >/dev/null && ok "7i: guard 2 = ok, mas diz '3 unreadable markers'" || bad "7i: guard 2 = '$(line_of7 'guard2 gate-markers:')'"
+has_line7 "guard3 hq-in-progress: ok" && has_line7 "guard4 scraper-daily: ok" && ok "7i: a nota nao vaza para os guards 3 e 4" || bad "7i: nota vazou: $(tr '\n' '|' < "$TMP/cg.out")"
+assert_read_only7 "7i" ""
+if declare -F g7 >/dev/null; then
+  reset7; write_fake_gate_json '{"total":3,"real":0,"phantom":0,"unknown":3}'; set_bd7 json '[]'
+  g7; [ $? -eq 0 ] && ok "7i: noturno (check_guards_once) continua tratando ilegivel como nao-bloqueante" || bad "7i: check_guards_once mudou de decisao com markers ilegiveis"
+fi
+
+echo "  -- 7j: a contagem de ilegiveis em si NAO da pra ler (chave ausente / null) -> a linha diz isso, nao um 'ok' liso --"
+# "nao consegui saber quantos ilegiveis" nao pode imprimir o mesmo 'ok' de "zero ilegiveis".
+for j7 in '{"total":0,"real":0,"phantom":0}' '{"total":0,"real":0,"phantom":0,"unknown":null}'; do
+  reset7; write_fake_gate_json "$j7"; set_bd7 json '[]'
+  rc=$(run_cg --check-guards)
+  [ "$rc" = "0" ] && ok "7j: exit 0 (a contagem ausente nao vira BLOCK — mesma decisao do noturno) [$j7]" || bad "7j: esperava exit 0, veio $rc [$j7]"
+  line_of7 "guard2 gate-markers:" | grep -E "^guard2 gate-markers: ok \(unreadable-marker count unavailable" >/dev/null && ok "7j: guard 2 = ok, mas diz que a contagem de ilegiveis nao esta disponivel [$j7]" || bad "7j: guard 2 = '$(line_of7 'guard2 gate-markers:')' [$j7]"
+done
+reset7; write_fake_gate_json '{"total":0,"real":0,"phantom":0,"unknown":0}'; set_bd7 json '[]'
+rc=$(run_cg --check-guards)
+has_line7 "guard2 gate-markers: ok" && ok "7j: com 'unknown':0 explicito o guard 2 segue sendo um 'ok' liso" || bad "7j: guard 2 = '$(line_of7 'guard2 gate-markers:')'"
 
 echo ""
 echo "nightly-reboot selftest: PASS=$PASS FAIL=$FAIL"
