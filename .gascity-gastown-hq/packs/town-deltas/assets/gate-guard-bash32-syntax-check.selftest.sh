@@ -80,6 +80,10 @@ eq()  { [ "$2" = "$3" ] && ok "$1" || bad "$1 — got '$2', want '$3'"; }
 
 [ -f "$GUARD" ] || { echo "FATAL: missing $GUARD"; exit 1; }
 [ -x /bin/bash ] || { echo "FATAL: /bin/bash missing — this selftest exists to run under the real 3.2"; exit 1; }
+# ga-ck3sz7: section 2 runs the live block on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). The driver stubs
+# `bd` as a shell FUNCTION, which cannot vanish under the running block — so this is defence in depth, not a leak seen
+# in the wild: the block never calls `gc`, and if a future edit to it does, "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 bash -n "$GUARD" && ok "guard passes bash -n (PATH bash) syntax check" || bad "guard has syntax errors under PATH bash"
 /bin/bash -n "$GUARD" && ok "guard passes /bin/bash -n (the real 3.2 interpreter) syntax check — this fix must not itself repeat ga-6aj348" \
   || bad "REGRESSION: guard.sh itself fails to parse under /bin/bash 3.2 — this fix would BE the next ga-6aj348"
@@ -357,7 +361,8 @@ trap 'rm -rf "$TMPD"' EXIT
 # correct run red (gate round 4, medium finding: the verdict depended on ambient
 # state).
 SCRATCH="$TMPD/scratch"
-mkdir -p "$SCRATCH"
+mkdir -p "$SCRATCH" "$TMPD/sb/bin"
+sandbox_path_init "$TMPD/sb" git || exit 2   # git: the block's fetch/diff/show; bd/log/err/set_gate_status are driver functions, no stub dir needed
 
 LIVE_BLOCK="$TMPD/live-block.sh"
 sed -n '/^# SELFTEST-EXTRACT bash32-check: BEGIN$/,/^# SELFTEST-EXTRACT bash32-check: END$/p' "$GUARD" | sed '1d;$d' > "$LIVE_BLOCK"
@@ -615,8 +620,8 @@ b32_run() {
   local rig="$1" branch="$2" shim="${3:-}" bead="${4-ga-selftest}"
   local calls="$TMPD/calls.$RANDOM.$RANDOM"
   : > "$calls"
-  local pathv="$PATH"
-  [ -n "$shim" ] && pathv="$shim:$PATH"
+  local pathv="$SANDBOX_PATH"
+  [ -n "$shim" ] && pathv="$shim:$SANDBOX_PATH"
   env PATH="$pathv" TMPDIR="$SCRATCH" RIG_PATH="$rig" BEAD_ID="$bead" BRANCH="$branch" \
       MARKER_ID="ga-marker-selftest" GC_CITY="/nonexistent-city" \
       GUARD="$GUARD" BLOCK="$LIVE_BLOCK" CALLS="$calls" \

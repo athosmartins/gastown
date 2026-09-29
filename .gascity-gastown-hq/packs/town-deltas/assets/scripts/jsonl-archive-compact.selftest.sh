@@ -870,9 +870,9 @@ echo "=== S28: the prod test tells 'cannot measure' from 'over the alarm', and d
 # story-ga-a3ar7h.sh treated every non-zero --check exit as "BAD archive", and ran --check BEFORE asking whether the order had ever fired: a fresh
 # deploy onto an over-alarm backlog FAILED although the first tick would drain it, and so did a backlog the order was legitimately draining.
 PROD="$PACK/assets/prod-tests/gascity/story-ga-a3ar7h.sh"
-FC="$WORK/fakecity"; mkdir -p "$FC/packs/town-deltas/assets/scripts" "$FC/packs/town-deltas/orders" "$FC/.gc/logs" "$WORK/gcshim"
+FC="$WORK/fakecity"; mkdir -p "$FC/packs/town-deltas/assets/scripts" "$FC/packs/town-deltas/orders" "$FC/.gc/logs" "$WORK/gcsb/bin"
 cp "$SCRIPT" "$FC/packs/town-deltas/assets/scripts/jsonl-archive-compact.sh"; cp "$ORDER" "$FC/packs/town-deltas/orders/jsonl-archive-compact.toml"
-cat > "$WORK/gcshim/gc" <<EOF
+cat > "$WORK/gcsb/bin/gc" <<EOF
 #!/bin/bash
 case " \$* " in
   *" order list "*) printf '{"orders":[{"name":"jsonl-archive-compact","source":"$FC/packs/town-deltas/orders/jsonl-archive-compact.toml"}]}' ;;
@@ -882,9 +882,15 @@ case " \$* " in
   *) exit 1 ;;
 esac
 EOF
-chmod +x "$WORK/gcshim/gc"
+chmod +x "$WORK/gcsb/bin/gc"
+# ga-ck3sz7: the prod test resolves `gc` through PATH (unlike run_jac, which is handed JAC_GC=<absolute stub>), so it
+# runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). The stub above is the only `gc` it can find; if
+# $WORK vanished under a running prod test, the real `gc` further down $PATH would answer `order list` / `order
+# history` with the real town's orders. Here "command not found" is the only outcome.
+. "$HERE/../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK/gcsb" git jq timeout || exit 2   # git: the archives; jq: state; timeout: bounds git (the script warns without it); gc is the stub above
 prod_run() {  # prod_run <repos> [alarm-KiB] — the prod test against the fake city; HIST_N / HIST_FAIL steer the fake gc
-  out="$(PATH="$WORK/gcshim:$PATH" CITY="$FC" JAC_REPOS="$1" JAC_STATE="$WORK/state.json" JAC_LOOSE_ALARM_KIB="${2:-100000}" JAC_LOOSE_LIMIT_KIB=1024 JAC_LOG="$WORK/log" bash "$PROD" 2>&1)"; rc=$?
+  out="$(PATH="$SANDBOX_PATH" CITY="$FC" JAC_REPOS="$1" JAC_STATE="$WORK/state.json" JAC_LOOSE_ALARM_KIB="${2:-100000}" JAC_LOOSE_LIMIT_KIB=1024 JAC_LOG="$WORK/log" bash "$PROD" 2>&1)"; rc=$?
 }
 PH="$WORK/ph"; mkrepo "$PH" 20; rm -f "$WORK/state.json"
 HIST_N=2 prod_run "$PH"

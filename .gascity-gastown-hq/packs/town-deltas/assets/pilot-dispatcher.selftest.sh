@@ -66,6 +66,10 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/pilot-dispatcher.sh"
+# ga-ck3sz7: the one scenario that puts a stub dir in front of the ambient PATH (18aa, the fake `git`) runs on a PATH with
+# NO real gc/bd (selftest-sandbox-path.lib.sh). Every other scenario builds its own "$SHIMBIN:/usr/bin:/bin:/usr/local/bin",
+# which already leaves gc/bd out. Sourced here, at the top, so a missing lib refuses to start instead of dying at line 4353.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 
 PASS=0
 FAIL=0
@@ -4347,10 +4351,11 @@ fi
 echo "Scenario 18aa (FINDING 4): _rig_has_any_path — git-probe timeout (exit 124) → fail-open (present), NOT absent"
 _RHAP_FN="$(awk '/^_rig_has_any_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
 _RRP_FN="$(awk '/^rig_root_path\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
-FAKEGIT="$WORK/fakegit"; mkdir -p "$FAKEGIT"
+FAKEGIT_SB="$WORK/fakegit-sb"; FAKEGIT="$FAKEGIT_SB/bin"; mkdir -p "$FAKEGIT"
 printf '#!/usr/bin/env bash\nexit 124\n' > "$FAKEGIT/git"; chmod +x "$FAKEGIT/git"
+sandbox_path_init "$FAKEGIT_SB" jq timeout || exit 2   # jq: rig_root_path; timeout: the ls-files bound; git is the fake above
 RIGROOT="$WORK/rigroot-ps"; mkdir -p "$RIGROOT"   # a REAL dir that does NOT contain the cited file
-_probe() { ( PATH="$FAKEGIT:$PATH"; unset PILOT_TEST_RIG_HAS_FILE; PILOT_RIG_PATHS_JSON='{"rigs":[{"name":"property_scrapers","path":"'"$RIGROOT"'"}]}'; eval "$_RRP_FN"; eval "$_RHAP_FN"; _rig_has_any_path property_scrapers "scripts/foo.py" && echo present || echo absent ); }
+_probe() { ( PATH="$SANDBOX_PATH"; unset PILOT_TEST_RIG_HAS_FILE; PILOT_RIG_PATHS_JSON='{"rigs":[{"name":"property_scrapers","path":"'"$RIGROOT"'"}]}'; eval "$_RRP_FN"; eval "$_RHAP_FN"; _rig_has_any_path property_scrapers "scripts/foo.py" && echo present || echo absent ); }
 if [ "$(_probe)" = present ]; then
   ok "git-probe timeout (124) → fail-open (present) — probe failure NEVER conflated with file-absent"
 else
