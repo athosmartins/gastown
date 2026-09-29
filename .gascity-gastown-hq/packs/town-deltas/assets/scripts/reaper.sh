@@ -143,6 +143,15 @@
 #         HEALTHY databases as "unrecognised schema" — measured 8 of 300 probes at load ~45 (and every probe on a
 #         140 KB column list) — and made the reaper selftests fail at random under load. It is now the pipe-free
 #         field_listed (selftest C13). The same idiom may live in other scripts: ga-5bxuam.
+#  8. ga-8xw4ev — THE ORPHAN PROBES ARE A `LEFT JOIN`, NOT `NOT EXISTS`. The count of note 7b was cut at Dolt's 30 s
+#     read timeout in most rounds of 29/09 (orphan_count_unknown 4-6 in reaper-summary.log, one "Reaper anomalies"
+#     mail each) for a number that existed (82 orphans, all in hq, steady). Dolt plans `NOT EXISTS (SELECT 1 FROM
+#     wisps ...)` with a Project of EVERY column of the child table under the join; `LEFT JOIN wisps w ON w.id =
+#     c.issue_id WHERE w.id IS NULL` does not: on hq.wisp_events, 4-15 s against 0.6-1.2 s at load ~55. Same counts
+#     on the 4 child tables of all 8 live bead stores, and the same LIMIT early stop (scratch table of 400k rows, 90%
+#     orphans: 2000 ids in 0.2-0.5 s under either shape). Applied to the count probe, the sweep's orphan SAMPLE and
+#     the dry-run probe. The sweep's DELETE guard stays NOT EXISTS: it is the safety-critical statement and is bounded
+#     by its IN (list). Selftests C5b and C14 (count), O2 and O9 (sweep).
 set -euo pipefail
 
 # Trace bd invocations to $GC_BD_TRACE when set (no-op otherwise).
@@ -965,6 +974,11 @@ purge_closed_wisps() {  # purge_closed_wisps <db>
 #  * SELECT: an anti-join with a LIMIT. It is index-ordered on issue_id, so it stops as soon as it
 #    has ORPHAN_SELECT_ROWS orphan rows (measured 19/09 on the 1.9M-row wisp_events: ~0.5 ms per
 #    row; the same anti-join WITHOUT a limit costs 15-25 s, right at Dolt's 30 s cutoff).
+#    Written as LEFT JOIN ... WHERE w.id IS NULL, not NOT EXISTS (ga-8xw4ev): same rows, same LIMIT early
+#    stop, but Dolt plans the NOT EXISTS form with a Project of EVERY column of the child table under the
+#    join. Measured on the live hq.wisp_events at load ~55: the sample 4-7 s against 1-3 s (header note 8 has
+#    the count probe's numbers). The dry-run probe has the same shape. The DELETE guard below stays NOT
+#    EXISTS on purpose: it is the safety-critical statement, bounded by its IN (list), and needs no faster plan.
 #  * DELETE: by issue_id (indexed), ROW-bounded (delete_rows_bounded), with the SAME NOT EXISTS
 #    re-checked inside the statement — a row of a live wisp cannot be removed even if the sample
 #    was stale. Only "the wisp is gone" qualifies; never age.
@@ -1035,7 +1049,8 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
             get_sql_count "$db" "orphan $table rows (dry run)" "
                 SELECT COUNT(*) FROM (
                     SELECT 1 FROM \`$db\`.$table c
-                    WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id)
+                    LEFT JOIN \`$db\`.wisps w ON w.id = c.issue_id
+                    WHERE w.id IS NULL
                     LIMIT $ORPHAN_SELECT_ROWS
                 ) orphan_probe
             "
@@ -1075,7 +1090,8 @@ sweep_orphan_children() {  # sweep_orphan_children <db>
             fi
             get_sql_rows "$db" "orphan $table sample" "
                 SELECT c.issue_id FROM \`$db\`.$table c
-                WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id)
+                LEFT JOIN \`$db\`.wisps w ON w.id = c.issue_id
+                WHERE w.id IS NULL
                 LIMIT $ORPHAN_SELECT_ROWS
             "
             if [ "$SQL_ROWS_FAILED" -eq 1 ]; then
@@ -1213,7 +1229,7 @@ count_orphan_children() {
                 continue
             fi
             # One line on purpose (the selftest targets it by regex); $db passed valid_database_identifier.
-            get_sql_count "$db" "orphan $table" "SELECT COUNT(*) FROM (SELECT 1 FROM \`$db\`.$table c WHERE NOT EXISTS (SELECT 1 FROM \`$db\`.wisps w WHERE w.id = c.issue_id) LIMIT $cap) orphan_count_probe"
+            get_sql_count "$db" "orphan $table" "SELECT COUNT(*) FROM (SELECT 1 FROM \`$db\`.$table c LEFT JOIN \`$db\`.wisps w ON w.id = c.issue_id WHERE w.id IS NULL LIMIT $cap) orphan_count_probe"
             if [ "$SQL_COUNT_FAILED" -eq 1 ]; then
                 ORPHAN_COUNT_UNKNOWN=$((ORPHAN_COUNT_UNKNOWN + 1))
                 continue

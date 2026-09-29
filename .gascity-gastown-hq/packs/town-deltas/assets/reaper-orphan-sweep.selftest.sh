@@ -253,6 +253,15 @@ N="$(sqlcount 'DELETE FROM `hq`.wisp_events WHERE .*LIMIT 50')"
 [ "${N:-0}" -ge 3 ] && ok "O2 the events went in $N bounded statements (LIMIT 50), not one" || nok "O2 not row-bounded" "bounded events deletes: $N"
 [ "$(sqlcount 'DELETE FROM `hq`.wisp_events WHERE issue_id IN \(.*\) AND NOT EXISTS')" -ge 1 ] \
   && ok "O2 every sweep DELETE re-checks NOT EXISTS inside the statement" || nok "O2 the DELETE is not guarded"
+# ga-8xw4ev: the SAMPLE is the LEFT JOIN ... IS NULL anti-join (Dolt plans NOT EXISTS with a Project of every
+# column of the child table under the join: 4-7 s against 1-3 s on the live hq.wisp_events at load ~55). The DELETE guard
+# above stays NOT EXISTS on purpose: it is the safety-critical statement and is bounded by its IN (list).
+# (the statement is multi-line in the script: the log holds it with runs of spaces where the newlines were)
+NS="$(sqlcount 'SELECT c\.issue_id FROM `hq`\.wisp_events c[[:space:]]+LEFT JOIN `hq`\.wisps w ON w\.id = c\.issue_id[[:space:]]+WHERE w\.id IS NULL[[:space:]]+LIMIT 50')"
+NSX="$(grep 'SELECT c\.issue_id' "$SQL_LOG" | grep -c 'NOT EXISTS' || true)"
+{ [ "${NS:-0}" -ge 1 ] && [ "${NSX:-1}" = "0" ]; } \
+  && ok "O2 the orphan SAMPLE is the LEFT JOIN ... IS NULL anti-join ($NS statements), never NOT EXISTS" \
+  || nok "O2 the sample is not the LEFT JOIN form" "left_join=$NS not_exists=$NSX"
 
 # ── O3: the wall-clock budget ─────────────────────────────────────────────────
 echo "O3: sweep time budget"
@@ -357,6 +366,12 @@ new_db; seed_orphans; : > "$CALLS"
 run_reaper GC_REAPER_DRY_RUN=1
 [ "$(orphans)" = "3,2,4,1" ] && [ "$(live)" = "3,1,3,1" ] && ok "O9 dry run deletes nothing" || nok "O9 dry run mutated the database" "$(orphans) / $(live)"
 [ "$(field would_sweep)" = "10" ] && printf '%s' "$OUT" | grep '(dry run)' >/dev/null && ok "O9 reports would_sweep:10" || nok "O9 dry-run summary" "$OUT"
+ND="$(sqlcount 'orphan_probe')"
+NDJ="$(grep 'orphan_probe' "$SQL_LOG" | grep -c -E 'LEFT JOIN .*wisps w ON w\.id = c\.issue_id[[:space:]]+WHERE w\.id IS NULL' || true)"
+NDX="$(grep 'orphan_probe' "$SQL_LOG" | grep -c 'NOT EXISTS' || true)"
+{ [ "${ND:-0}" -ge 4 ] && [ "${NDJ:-0}" = "$ND" ] && [ "${NDX:-1}" = "0" ]; } \
+  && ok "O9 the $ND dry-run probes are the LEFT JOIN ... IS NULL anti-join (ga-8xw4ev), never NOT EXISTS" \
+  || nok "O9 a dry-run probe is not the LEFT JOIN form" "probes=$ND left_join=$NDJ not_exists=$NDX"
 
 # ── O10: the kill switch and its validation ───────────────────────────────────
 echo "O10: GC_REAPER_ORPHAN_SWEEP"
