@@ -61,6 +61,11 @@ for tool in dolt jq; do
 done
 [ -f "$REAPER_SH" ] || { echo "FAIL: script under test not found: $REAPER_SH"; exit 1; }
 
+# ga-d21b40: the script under test gets a PATH with NO real gc/bd on it (see the lib). Sourced from a
+# non-`*.selftest.sh` file so the gate's base-commit check cannot carry the fix onto the base with this file.
+_SANDBOX_LIB="$HERE/selftest-sandbox-path.lib.sh"
+. "$_SANDBOX_LIB" || { echo "FATAL: cannot load $_SANDBOX_LIB (ga-d21b40) — refusing to run the script under test on a PATH that can reach the real gc" >&2; exit 2; }
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/reaper-orphan-count-selftest.XXXXXX")" || exit 1
 # chmod first: C9b makes a directory read-only, and a test that dies inside it must not leave an undeletable tree.
 trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
@@ -74,6 +79,8 @@ SUMLOG="$CITY/.gc/runtime/reaper-summary.log"
 
 # ── the script under test + stubs, side by side (the script sources its siblings) ──
 SD="$T/scripts"; mkdir -p "$SD" "$T/bin"
+# The child's PATH: stub dir + links to the two harmless tools + system dirs. NO real gc/bd (ga-d21b40).
+sandbox_path_init "$T" dolt jq || { echo "FATAL: could not build the sandbox PATH (ga-d21b40)" >&2; exit 2; }
 cp "$REAPER_SH" "$SD/reaper.sh"
 cat > "$SD/_bd_trace.sh" <<'EOF'
 _BD_TRACE_CALLER="${1:-unknown}"
@@ -203,7 +210,7 @@ run_reaper() {  # run_reaper [ENV=val ...] ; sets OUT and RC
   # ${envs[@]+...}: macOS bash 3.2 treats an EMPTY array expansion as unbound under `set -u`.
   # /bin/bash, not `bash`: PATH may resolve to Homebrew bash 5.x, but launchd and the gate run the script
   # under the system bash 3.2 — the version whose quirks (empty arrays, [[ =~ ]]) bite.
-  OUT="$( cd "$T" && env GC_CITY_PATH="$CITY" GC_CITY="$CITY" PATH="$T/bin:$PATH" GC_REAPER_PURGE_RETRY_PAUSE_S=0 \
+  OUT="$( cd "$T" && env GC_CITY_PATH="$CITY" GC_CITY="$CITY" PATH="$SANDBOX_PATH" GC_REAPER_PURGE_RETRY_PAUSE_S=0 \
         FAIL_COUNT="$T/failcount" ${envs[@]+"${envs[@]}"} /bin/bash "$SD/reaper.sh" 2>"$T/stderr.log" )"; RC=$?
 }
 # one summary field: everything after "<name>:" up to the next comma (so "4+", "unknown", "off" come through)
