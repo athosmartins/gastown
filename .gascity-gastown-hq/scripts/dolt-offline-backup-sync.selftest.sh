@@ -307,9 +307,17 @@ if grep -qF 'OFFLINE_SYNC_TIMEOUT=1800' "$RESEED_SCRIPT"; then
 else
   bad "reseed does not pin OFFLINE_SYNC_TIMEOUT to its old 1800s budget"
 fi
-SYNC_CALL_LINE=$(grep -nF '_offline_backup_sync "$DB" "$NEW_DIR"' "$RESEED_SCRIPT" | head -1 | cut -d: -f1)
-RESTORE_LINE=$(grep -nF 'backup restore' "$RESEED_SCRIPT" | head -1 | cut -d: -f1)
-MV_LINE=$(grep -nF 'mv "$BACKUP_DIR" "$OLD_DIR"' "$RESEED_SCRIPT" | head -1 | cut -d: -f1)
+# Order the three steps inside _run_reseed only (ga-7vmcr1). The file carries
+# other 'backup restore' calls above it -- _maybe_promote_new_after_primary_release
+# (ga-qh8gkw) verifies with its own restore -- so a file-wide `head -1` picks up
+# that one instead of the reseed flow's Passo 2 restore. The body is printed as
+# "<file line>:<text>" so the reported numbers stay real file lines. If
+# _run_reseed is missing the body is empty, every line comes back empty and the
+# guard goes red instead of passing on nothing.
+RESEED_BODY=$(awk '/^_run_reseed\(\)/ {f=1} f {print NR ":" $0} f && /^}/ {exit}' "$RESEED_SCRIPT")
+SYNC_CALL_LINE=$(printf '%s\n' "$RESEED_BODY" | grep -F '_offline_backup_sync "$DB" "$NEW_DIR"' | head -1 | cut -d: -f1)
+RESTORE_LINE=$(printf '%s\n' "$RESEED_BODY" | grep -F 'backup restore' | head -1 | cut -d: -f1)
+MV_LINE=$(printf '%s\n' "$RESEED_BODY" | grep -F 'mv "$BACKUP_DIR" "$OLD_DIR"' | head -1 | cut -d: -f1)
 if [ -n "$SYNC_CALL_LINE" ] && [ -n "$RESTORE_LINE" ] && [ -n "$MV_LINE" ] \
    && [ "$RESTORE_LINE" -gt "$SYNC_CALL_LINE" ] && [ "$MV_LINE" -gt "$RESTORE_LINE" ]; then
   ok "order preserved: sync new backup -> restore + verify -> swap (nothing deleted before verification, per the file's own non-negotiable rule)"
