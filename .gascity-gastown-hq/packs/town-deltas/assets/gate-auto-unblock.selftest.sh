@@ -17,7 +17,12 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT   # limpa em TODA saída (a lição do ga-nrkh92)
 
 BIN="$TMP/bin"; mkdir -p "$BIN"
-export PATH="$BIN:$PATH"
+# ga-ck3sz7: o script roda num PATH SEM bd/gc reais (selftest-sandbox-path.lib.sh). Este script MUTA beads
+# (bd label remove/update/comment); se $BIN sumisse debaixo dele enquanto roda, o `bd` REAL mais adiante no PATH
+# receberia essas mutações. Aqui "command not found" é o único desfecho.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$TMP" jq flock || exit 2   # jq: label/comment parsing; flock: the single-instance lock
+export PATH="$SANDBOX_PATH"
 
 # ── shims ──────────────────────────────────────────────────────────────
 # Dirigidos por arquivos em $TMP/fx: cada teste escreve a fixture e roda.
@@ -465,7 +470,7 @@ chmod +x "$FAKE_DATE_BIN/date"
 
 setup ga-xt8zrf-gnu '["gate:needs-human"]' 'origin/fix/ga-xt8zrf-gnu' '+ dead1234' '1700000000' \
   '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: PASS — reviewer 1 clean"}]'
-OUT="$(PATH="$FAKE_DATE_BIN:$PATH" run)"
+OUT="$(PATH="$FAKE_DATE_BIN:$SANDBOX_PATH" run)"
 case "$OUT" in *"R5 ga-xt8zrf-gnu"*"nenhum veredito FAIL"*)
     ok "armadilha D sobrevive em host com GNU date (last_fail_epoch não vira 'agora' quando \$d vazio)";;
   *) bad "em host GNU-date, last_fail_epoch viraria 'agora' e a mensagem mudaria para 'sem commit apos a reprovacao'" "$OUT";; esac
