@@ -27,6 +27,11 @@
 # C4  the alert text carries no counts, so the mail dedupe (same text within the TTL) sends it once.
 # C5  the count is BOUNDED (LIMIT cap+1): it cannot run past Dolt's 30 s cutoff on a huge table, and a capped
 #     answer is a lower bound ("N+"), not a number that reads as exact.
+# C5b the probe's SHAPE (ga-8xw4ev): `LEFT JOIN wisps … WHERE w.id IS NULL`, never `NOT EXISTS`. Same rows and same
+#     LIMIT semantics, but Dolt projects every column of the child table (old_value/new_value/comment…) before the
+#     `Project [1]` under NOT EXISTS: 4-15 s against 0.6-1.2 s on the live 72k-row hq.wisp_events at load ~55 (the bead
+#     measured 22 s cold), and the 30 s server cutoff ended most rounds of 29/09 in `orphan_count_unknown`. C3's fault injection keys on the same
+#     text, so a probe that reverted to the old shape would also stop being injectable (C3 goes red, not silent).
 # C6  the count has its OWN wall-clock budget; what it did not reach is unknown (and mailed), not zero.
 # C7  the count runs AFTER every database's purge: a slow count must not starve the purge budget of the
 #     databases after it (the per-database budget hazard the in-loop placement has). Asserted on the ORDER of
@@ -45,6 +50,8 @@
 # C12 the order's timeout covers ALL the script's wall-clock budgets, the count's included.
 # C13 the schema probe never false-negatives: `printf | grep -qx` under pipefail skipped HEALTHY databases as
 #     "unrecognised schema" (and flaked this suite); it is now a pipe-free whole-line membership test.
+# C14 the two probe shapes count the SAME rows on real Dolt — including a NULL issue_id, where `w.id = NULL` is never
+#     true, so both shapes call the row an orphan (the equivalence the switch of ga-8xw4ev rests on).
 
 set -uo pipefail
 
@@ -275,14 +282,14 @@ case "$OUT" in
 esac
 { [ "$RC" -eq 0 ] && [ "$(mail_count)" = "1" ] && grep -q 'orphan wisp_comments count failed' "$CALLS"; } && ok "C3 the failed reads are an anomaly (mailed) and the run still completes" || nok "C3 failure not reported" "rc=$RC mails=$(mail_count)"
 fresh; echo 99 > "$T/failcount"
-run_reaper FAKE_DF_AVAIL_KB=$LOW_DISK FAIL_RE='wisp_events c WHERE NOT EXISTS.*orphan_count_probe'
+run_reaper FAKE_DF_AVAIL_KB=$LOW_DISK FAIL_RE='wisp_events c LEFT JOIN.*orphan_count_probe'
 { [ "$(fld orphan_count)" = "5+" ] && [ "$(fld orphan_count_unknown)" = "1" ]; } && ok "C3 only the events probe failed -> orphan_count:5+ (a lower bound: 2 comments + 3 labels known), unknown:1" || nok "C3 partial" "$OUT"
 # Answered ZEROS must not speak for a probe that did not answer: that is "unknown", not "0" and not "0+".
 new_db
 sql "INSERT INTO wisps (id,status,issue_type,created_at,updated_at,closed_at) VALUES ('live-open','open','task',$(H 1),$(H 1),NULL);
      CALL DOLT_COMMIT('-Am','live only','--author','t <t@t.local>');" >/dev/null
 fresh; echo 99 > "$T/failcount"
-run_reaper FAKE_DF_AVAIL_KB=$LOW_DISK FAIL_RE='wisp_events c WHERE NOT EXISTS.*orphan_count_probe'
+run_reaper FAKE_DF_AVAIL_KB=$LOW_DISK FAIL_RE='wisp_events c LEFT JOIN.*orphan_count_probe'
 { [ "$(fld orphan_count)" = "unknown" ] && [ "$(fld orphan_count_unknown)" = "1" ]; } && ok "C3 two probes answered zero and one failed -> unknown: the zeros do not speak for the failed probe" || nok "C3 zeros + a failure read as a number" "$OUT"
 
 # ── C4: the alert text carries no counts -> the mail dedupe holds ──────────────
@@ -308,6 +315,15 @@ run_reaper FAKE_DF_AVAIL_KB=$LOW_DISK GC_REAPER_ORPHAN_COUNT_ALERT=3
 { [ "$(fld orphan_count)" = "4+" ] && [ "$(fld orphan_count_over_dbs)" = "1" ]; } && ok "C5 130 orphan events with alert 3 -> orphan_count:4+ (capped at 4 = alert+1), over_dbs:1" || nok "C5 capped count" "$OUT"
 NP="$(sqlcount 'orphan_count_probe')"; NU="$(grep 'orphan_count_probe' "$SQL_LOG" | grep -c -v 'LIMIT 4' || true)"
 { [ "${NP:-0}" -ge 3 ] && [ "${NU:-1}" = "0" ]; } && ok "C5 all $NP count statements carry LIMIT 4 (none is an unbounded anti-join)" || nok "C5 unbounded count statement" "probes=$NP without_limit=$NU"
+
+# ── C5b: the probe's shape — LEFT JOIN … IS NULL, never NOT EXISTS (ga-8xw4ev) ────────────────────────────────
+# Read off the SAME statements C5 just logged (no new run). Both counts are compared with the number of probes, not
+# with a literal, so a probe added or dropped later cannot make this vacuous: EVERY count statement must be the
+# LEFT JOIN form, and NONE may be the NOT EXISTS form. A grep that finds nothing must not read as "no NOT EXISTS
+# anywhere" while the probes were never issued, hence the NP >= 3 guard first.
+NJ="$(grep 'orphan_count_probe' "$SQL_LOG" | grep -c -E 'LEFT JOIN `hq`\.wisps w ON w\.id = c\.issue_id WHERE w\.id IS NULL LIMIT 4' || true)"
+NX="$(grep 'orphan_count_probe' "$SQL_LOG" | grep -c 'NOT EXISTS' || true)"
+{ [ "${NP:-0}" -ge 3 ] && [ "${NJ:-0}" = "$NP" ] && [ "${NX:-1}" = "0" ]; } && ok "C5b all $NP count statements are 'LEFT JOIN … WHERE w.id IS NULL LIMIT 4', none is NOT EXISTS" || nok "C5b probe shape" "probes=$NP left_join=$NJ not_exists=$NX; first: $(grep 'orphan_count_probe' "$SQL_LOG" | head -1 | cut -c1-260)"
 
 # ── C6: the count's own budget ────────────────────────────────────────────────
 echo "C6: the count has its own wall-clock budget; what it did not reach is unknown, not zero"
@@ -483,6 +499,27 @@ SEM="$( . "$PROBE_SRC" 2>/dev/null
   t $'id\nissue_id\ntype' issue_id; t $'id\nissue_id_x\ntype' issue_id; t $'id\nxissue_id\ntype' issue_id; t '' issue_id
   t $'issue_id\ntype' issue_id; t $'type\nissue_id' issue_id; t $'a*b\nc' 'a*b'; t $'axb\nc' 'a*b' )"
 [ "$SEM" = "0 1 1 1 0 0 0 1 " ] && ok "C13 field_listed is a whole-line match (listed, superstring, prefix, empty, first, last, literal glob)" || nok "C13 field_listed semantics" "got '$SEM', want '0 1 1 1 0 0 0 1 '"
+
+# ── C14: the old and the new probe shape count the SAME rows, on real Dolt (ga-8xw4ev) ─────────────────────────
+echo "C14: 'NOT EXISTS' and 'LEFT JOIN … IS NULL' agree row for row, a NULL issue_id included"
+# The production tables declare issue_id NOT NULL, so the reaper's own run (C2) cannot exercise the NULL case; a scratch
+# table whose issue_id IS nullable does. w.id = NULL is never true, so under BOTH shapes a NULL row has no parent = orphan.
+# Unbounded here (no LIMIT): what is compared is the SEMANTICS; LIMIT is pinned by C5. Each side is asserted against
+# its expected NUMBER as well as against the other, so two shapes that were wrong in the same way cannot agree their way to green.
+new_db; seed_orphans
+sql "CREATE TABLE ev_nullable (n INT NOT NULL AUTO_INCREMENT PRIMARY KEY, issue_id VARCHAR(255) NULL);
+     INSERT INTO ev_nullable (issue_id) VALUES ('live-open'),('live-recent'),('gone-1'),('gone-1'),(NULL),(NULL);
+     CALL DOLT_COMMIT('-Am','nullable child table','--author','t <t@t.local>');" >/dev/null
+old_shape() { scalar "SELECT COUNT(*) FROM (SELECT 1 FROM $1 c WHERE NOT EXISTS (SELECT 1 FROM wisps w WHERE w.id = c.issue_id)) p"; }
+new_shape() { scalar "SELECT COUNT(*) FROM (SELECT 1 FROM $1 c LEFT JOIN wisps w ON w.id = c.issue_id WHERE w.id IS NULL) p"; }
+# expected orphans per table from seed_orphans (C2's numbers): comments 2, labels 3, events 4; the nullable one: 2 x gone-1 + 2 x NULL = 4
+EQ_BAD=""
+for spec in wisp_comments:2 wisp_labels:3 wisp_events:4 ev_nullable:4; do
+  tbl="${spec%%:*}"; want="${spec##*:}"
+  o="$(old_shape "$tbl")"; n="$(new_shape "$tbl")"
+  [ "$o" = "$want" ] && [ "$n" = "$want" ] || EQ_BAD="$EQ_BAD $tbl(old=$o new=$n want=$want)"
+done
+[ -z "$EQ_BAD" ] && ok "C14 both shapes count 2 / 3 / 4 orphans in comments / labels / events, and 4 in a table with NULL issue_ids (2 gone + 2 NULL)" || nok "C14 the two probe shapes disagree or miscount" "$EQ_BAD"
 
 echo ""
 echo "reaper-orphan-count selftest (ga-hpdpij): $PASS passed, $FAIL failed"

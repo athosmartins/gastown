@@ -385,6 +385,18 @@ SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) ver
 # Any QUEUED ending. Checked AFTER SWEEP_QUEUED_RETRY_RE, so a line that matches both is the retry kind.
 SWEEP_QUEUED_ANY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED\b")
 SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
+# Lines that prove a branch LEFT the QUEUED-retry loop (ga-clexh7): a gate-run exists for it, so it was
+# admitted to review and is no longer what the FIFO keeps re-picking. None of them is a 'sweep complete'
+# line: the finalize line is deliberately named 'Gate run complete', not 'Dispatcher sweep complete'
+# (ga-eqjo, comment above its emitter in quality-gate-dispatcher.sh), so a branch that goes on to review +
+# merge writes no 'sweep complete' line at all after its last QUEUED one — measured 29/09, 10:47 → 11:12.
+# Each pattern names ITS branch, and only that branch: a Phase C line for another branch's in-flight run
+# says nothing about the one being counted.
+HOL_PROGRESS_RES = (
+    re.compile(r"Phase C: gate-run \S+ \(branch=([^\s)]+)\)"),
+    re.compile(r"Gate PASSED(?: \([^)]*\))?: branch=(\S+)"),      # also 'Gate PASSED (origin=Pilot): branch=…'
+    re.compile(r"Gate run complete: gate_run=\S+ branch=(\S+)"),  # emitted for FAIL too — the 1:1 line
+)
 MARKER_BRANCH_RE = re.compile(r"^branch:(.+)$")  # marker label form: branch:crew/<rig>-<name>/<bead>  (gt-mqkwj)
 # supervisor init-failure loop (ga-h3w2y): a rig with no `path` in site.toml makes
 # the supervisor cycle "init failure #N" / "validate rigs: rig \"X\": path is
@@ -543,7 +555,11 @@ def last_pass_epoch():
     except Exception:
         return 0
     for l in reversed(lines):
-        if "Gate PASSED:" in l:
+        # ga-hqrnmu: the shared verdict recognizer, not a `"Gate PASSED:" in l` substring — that one is blind to
+        # the Pilot-origin form `Gate PASSED (origin=Pilot): …` (18% of PASS lines), so a recovery the Pilot
+        # merged was not seen until the next plain PASS (median 19 min later, max 6.6 h). Defined with FIX 10 below.
+        vm = GATE_VERDICT_LINE_RE.match(l)
+        if vm and vm.group(1) == "PASSED":
             return log_ts_epoch(l) or 0
     return 0
 
@@ -567,10 +583,20 @@ STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d
 # "Phase C: gate-run <id> (branch=<b>) still in flight (...)" is the ONLY emission site
 # (quality-gate-dispatcher.sh:~10579) and always carries this prefix on the same line.
 STUCK_RUN_ID_RE = re.compile(r"gate-run (\S+) \(branch=")
+# ga-hqrnmu: the branch of that same in-flight line, so the REPAIR bead can NAME what is stuck
+# (all six beads the Mayor had to close by hand cited only ga-rwpwz8 — none said which run).
+STUCK_BRANCH_RE = re.compile(r"gate-run \S+ \(branch=([^)\s]+)\)")
 
 
 def stuck_dispatching():
-    """True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
+    """Bool view of stuck_dispatching_detail() — kept for every caller/selftest that only needs the verdict."""
+    return stuck_dispatching_detail()[0]
+
+
+def stuck_dispatching_detail():
+    """(stuck, run_id, branch) — run_id/branch are None when not stuck or not parseable (ga-hqrnmu).
+
+    True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
     recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
     Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
     between runs), no gate-reviewer session is active, AND the run has no DELIVERED
@@ -603,35 +629,38 @@ def stuck_dispatching():
     only ever suppress an alarm, never manufacture one the old code wouldn't already give."""
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
-            return False  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
+            return (False, None, None)  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
         lines = _read_log_last_lines(DISPATCH_LOG, 15)      # ga-b1iulk: tolerant of non-UTF-8 bytes
     except Exception:
-        return False
+        return (False, None, None)
     vm = None
     run_id = None
+    branch = None
     for l in reversed(lines):
         if "sweep complete" in l:   # the most recent run already concluded → not stuck
-            return False
+            return (False, None, None)
         mm = STUCK_INFLIGHT_RE.search(l)
         if mm:
             vm = mm
             rm = STUCK_RUN_ID_RE.search(l)
             run_id = rm.group(1) if rm else None
+            bm = STUCK_BRANCH_RE.search(l)
+            branch = bm.group(1) if bm else None
             break
     if not vm:
-        return False
+        return (False, None, None)
     got, elapsed = int(vm.group(1)), int(vm.group(2))
     if not (got == 0 and elapsed > DISPATCH_STUCK_SEC):
-        return False
+        return (False, None, None)
     # corroborate #1: reviewers spawned for this run are NOT active (dead/start-pending)
     rs = sh(["gc", "session", "list", "--json"])
     try:
         sessions = json.loads(rs.stdout).get("sessions", []) if rs else []
     except Exception:
-        return False
+        return (False, None, None)
     active = [s for s in sessions if s.get("template") == "gate-reviewer" and s.get("state") == "active"]
     if active:
-        return False
+        return (False, None, None)
     # corroborate #2 (ga-rzd08j): a reviewer already DELIVERED (closed verdict bead) for
     # THIS run — not a spawn failure, just an un-harvested verdict. Any failure resolving
     # this (no run_id parsed, bd/Dolt unreachable) falls through to the pre-existing
@@ -642,8 +671,8 @@ def stuck_dispatching():
         except Exception:
             delivered = -1
         if delivered > 0:
-            return False
-    return True
+            return (False, None, None)
+    return (True, run_id, branch)
 
 
 def gate_infra_throttled():
@@ -678,6 +707,17 @@ HOL_KIND_QUEUED_OTHER = "queued-other"      # any other 'verdict=QUEUED' — del
 HOL_KIND_UNKNOWN = "unknown"
 
 
+def _hol_progress_branch(line):
+    """Branch named by a HOL_PROGRESS_RES line (a gate-run exists for it), else None. PURE."""
+    if "branch=" not in line:
+        return None
+    for rx in HOL_PROGRESS_RES:
+        mp = rx.search(line)
+        if mp:
+            return mp.group(1)
+    return None
+
+
 def _scan_headofline(lines):
     """PURE (no I/O) trailing-run scan of dispatcher-log lines → (kind, branch, count).
 
@@ -686,11 +726,27 @@ def _scan_headofline(lines):
     as the newest one (HOL_KIND_CONFLICT_RETRY or HOL_KIND_QUEUED_OTHER). The run
     ends at the first sweep that is anything else — a real PASS/FAIL/merge, another
     branch, or the other kind — so the two kinds never inflate each other's count.
-    Returns (None, None, 0) when the newest completion is not a QUEUED at all."""
+    Returns (None, None, 0) when the newest completion is not a QUEUED at all.
+
+    A branch that leaves the loop for review leaves NO sweep-complete line behind (see
+    HOL_PROGRESS_RES), so the sweeps alone cannot tell 'still re-picked' from 'admitted, passed
+    and merged since' (ga-clexh7: 2 QUEUED sweeps, then review + PASS + merge, then 25 minutes of
+    nothing matching — a repair dog was dispatched for the merged branch). A progress line naming
+    the SAME branch therefore ends its run: newer than every counted sweep → no run at all;
+    between two counted sweeps → the older ones belong to a previous episode. Progress lines for
+    OTHER branches are ignored, exactly like the rest of the noise."""
     kind = None
     branch = None
     count = 0
+    progressed = set()   # branches with a progress line NEWER than the sweep being read
     for l in reversed(lines):
+        pb = _hol_progress_branch(l)
+        if pb is not None:
+            if kind is not None and pb == branch:
+                break    # the run being counted ends here: older same-branch sweeps are a past episode
+            if kind is None:
+                progressed.add(pb)
+            continue
         if "Dispatcher sweep complete:" not in l:
             continue
         mq = SWEEP_QUEUED_RETRY_RE.search(l)
@@ -704,6 +760,8 @@ def _scan_headofline(lines):
                 break
             k, b = HOL_KIND_QUEUED_OTHER, ma.group(1)
         if kind is None:
+            if b in progressed:
+                break    # newest QUEUED sweep, but that branch went on to review since → no run
             kind, branch = k, b
         if k != kind or b != branch:
             break  # head-of-line moved to a different branch/kind → not a single-branch wedge
@@ -807,6 +865,39 @@ def headofline_stall():
     if kind == HOL_KIND_CONFLICT_RETRY and count >= HEADOFLINE_MIN_SWEEPS:
         return (branch, count)
     return (None, 0)
+
+
+# What the marker list says about a head-of-line branch (ga-clexh7). THREE states, never two:
+# 'could not read the list' is not 'read it and the branch is not queued'.
+HOL_QUEUE_QUEUED = "queued"        # an open gate-status:queued marker names the branch
+HOL_QUEUE_NOT_QUEUED = "not-queued"  # the list WAS read and no open queued marker names the branch
+HOL_QUEUE_UNKNOWN = "unknown"      # the list could not be read
+
+
+def _hol_queue_state(rows, branch):
+    """PURE: classify `branch` against _queued_markers_read()'s rows (None = unreadable)."""
+    if rows is None:
+        return HOL_QUEUE_UNKNOWN
+    return HOL_QUEUE_QUEUED if any(r[1] == branch for r in rows) else HOL_QUEUE_NOT_QUEUED
+
+
+def hol_branch_queue_state(branch):
+    """Live check of the ARTIFACT behind a head-of-line signal: is the branch still an open
+    gate-status:queued marker? The signal itself is read from a log, and a log run can outlive the
+    condition it saw (ga-clexh7: the branch was reviewed, PASSED and merged while its two QUEUED
+    sweeps were still the newest lines naming it)."""
+    return _hol_queue_state(_queued_markers_read(), branch)
+
+
+def hol_repair_verdict(queue_state):
+    """PURE: 'repair' or 'skip:not-queued' for a head-of-line signal, given hol_branch_queue_state().
+
+    Only a READ that shows the branch is no longer queued suppresses the repair dog — the re-anchor
+    runbook is for a branch the FIFO keeps re-picking from gate-status:queued, and this one is not (its
+    marker is closed or in another gate-status; whatever else is wrong with it is another detector's).
+    An unreadable list suppresses nothing: this is the detector for a stuck gate, and going quiet
+    because its own read failed would hide a real wedge behind an unrelated bd/Dolt hiccup."""
+    return "skip:not-queued" if queue_state == HOL_QUEUE_NOT_QUEUED else "repair"
 
 
 def headofline_nonrepair():
@@ -948,7 +1039,15 @@ def _queued_markers():
     genuinely stuck open one. Filtered at both the query (--status) and parse
     (status check) layers, since a future query refactor could silently drop
     the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
-    no orphan fire)."""
+    no orphan fire). A caller that must tell 'could not read' from 'none queued'
+    uses _queued_markers_read() instead — this wrapper deliberately collapses them."""
+    return _queued_markers_read() or []
+
+
+def _queued_markers_read():
+    """_queued_markers()'s rows, or None when the marker list could NOT be read (bd failed, timed out, or
+    returned something that is not JSON). [] means the read succeeded and no open marker is queued — a
+    different fact from None, which says nothing about the queue (ga-clexh7)."""
     # --include-infra é OBRIGATÓRIO (Mayor, 07/08): o bd 1.1.0 classifica bead
     # `--ephemeral` como INFRA e o OMITE de `bd list` por padrão. Markers de gate
     # nasciam ephemeral, então ESTE watchdog — cujo trabalho é justamente detectar
@@ -960,11 +1059,13 @@ def _queued_markers():
             "--status", "open,in_progress",  # ga-h199q
             "-l", "type:quality-gate-marker", "-l", "gate-status:queued", "--json"], timeout=25)
     if not r or r.returncode != 0:
-        return []
+        return None
     try:
         rows = json.loads(r.stdout)
     except Exception:
-        return []
+        return None
+    if rows is not None and not isinstance(rows, list):
+        return None   # a shape we do not know how to read is 'could not read', not 'none queued'
     out = []
     for row in rows or []:
         if row.get("status") not in ("open", "in_progress"):
@@ -1685,6 +1786,12 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
     ) % (reason, DOLT_INSTABILITY_WINDOW_SEC // 60, dolt_hits, DOLT_INSTABILITY_MIN_HITS, diag_path, DISPATCH_LOG)
 
 
+# ga-hqrnmu: label that marks a bead as a watchdog ALARM RECORD nobody owns (no assignee, no
+# gc.routed_to, pilot:no-auto-dispatch) — the ONLY beads close_recovered_repair_audit_beads()
+# ever closes. A bead a dog/Mayor owns (assignee set) or that carries no such label is never touched.
+REPAIR_AUDIT_LABEL = "gate-watchdog:repair-audit"
+
+
 def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
     """ga-rwpwz8: durable audit record for a gate-down alarm with NO positive Dolt
     evidence. Created WITHOUT --assignee (so it never carries gc.routed_to) and
@@ -1692,9 +1799,26 @@ def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
     the Pilot can pick it up — only the Mayor, woken separately, is meant to act
     on it. Best-effort and guarded like every other bd call in this file: returns
     the new bead id, or None if creation failed (the Mayor wake still fires
-    either way, it just won't have a bead id to point at)."""
-    body = REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
-    cr = sh(["bd", "-C", CITY, "create", title, "-t", "task", "--stdin", "--json"],
+    either way, it just won't have a bead id to point at).
+
+    ga-hqrnmu: it ALSO carries REPAIR_AUDIT_LABEL and opens with what is stuck (`reason`
+    already names the run + branch) and how it closes. Without both, a transient stall
+    (spawn after boot, a load spike — the normal outcome) became a permanent card in the
+    Mayor's Travadas column that said nothing about WHICH run: six piled up 26-29/09 while
+    the gate was already flowing, and the Mayor closed them by hand."""
+    body = (
+        "O QUE TRAVOU: %s\n"
+        "Esta bead é só o REGISTRO do alarme (sem dog, sem rota). O watchdog a FECHA sozinho quando vê "
+        "um veredito real do gate (Gate PASSED, ou FAIL de revisor) DEPOIS da criação dela. "
+        "Se ela continua aberta, o watchdog não viu (ou não conseguiu verificar) um veredito posterior — "
+        "o gate pode de fato estar parado, mas também pode ser log ilegível, consulta de beads "
+        "indisponível ou o auto-fechamento desligado. Confira o gate antes de assumir qualquer um dos dois "
+        "(ga-hqrnmu).\n\n" % reason
+    ) + REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
+    # REPAIR_AUDIT_LABEL rides on the create (atomic) — the sweep finds the bead by it; the
+    # pilot:no-auto-dispatch veto keeps its own follow-up label call, unchanged from ga-rwpwz8.
+    cr = sh(["bd", "-C", CITY, "create", title, "-t", "task", "--stdin", "--json",
+             "-l", REPAIR_AUDIT_LABEL],
             stdin=body, timeout=45)
     if not cr or cr.returncode != 0:
         return None
@@ -4558,6 +4682,238 @@ def recover_needs_rebase_markers(now, rstate):
         print("[watchdog] needs-rebase sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX 10 (ga-hqrnmu): close a REPAIR audit bead once the gate has recovered on its own.
+#
+# WHY: with no positive Dolt signal, spawn_repair_agent() files an UNROUTED audit bead
+# for the Mayor (ga-rwpwz8 — correct: no destructive runbook goes to an unsupervised dog).
+# Nothing ever closed it, and the normal outcome of these alarms is a transient stall that
+# clears by itself (a reviewer spawn after boot, a load spike). Measured 29/09: six such
+# beads sat in Travadas (26/09 21:53 … 29/09 07:05) while the gate was flowing — at 07:28
+# it PASSed ga-7vmcr1 with 2 reviewers. The Mayor closed all six by hand.
+#
+# THE RULE is a three-state read, never a two-state one — "I found no verdict" and "I could
+# not read the log" must not both look like "nothing happened", and neither may look like
+# "resolved":
+#   verdict AFTER the bead's created_at  -> close, with the verdict quoted as evidence
+#   read OK, no verdict after created_at -> leave open (no evidence of recovery — NOT proof it has not)
+#   log unreadable / created_at unparsable -> leave open (cannot know — inert state)
+# "Open" therefore means only "this watchdog did not see, or could not verify, a later verdict" —
+# the same wording the card body uses. It is never a claim about the gate's true state: a kill
+# switch, an unreadable log, a failing bd query/close, or a verdict form the recognizer does not
+# know all leave a bead open too.
+#
+# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` / `Gate PASSED (origin=Pilot):` entry, or a
+# `Gate FAILED: Reviewer N FAIL:` entry (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is
+# NOT one — it is the very failure these alarms report (recent_timeouts() counts it as the
+# gate-down signal), so closing on it would close the alarm BECAUSE of the fault. The COMPOSITE
+# entry — a Phase C timeout that also collected a reviewer FAIL (dispatcher ga-h8vc8y) — is a
+# timeout too, so it is skipped the same way. Merge failures / source-parked / preflight aborts
+# are not reviewer verdicts either; leaving those out only ever keeps a bead open.
+#
+# AN ENTRY IS NOT A PHYSICAL LINE. The dispatcher's log() is `echo "[ts] [quality-gate-dispatcher] $*"`
+# and the reviewer's FAIL comment inside `Gate FAILED: $FAIL_REASONS` is multi-line, so only the FIRST
+# line carries the prefix; the rest are continuation lines. In the composite, FAIL_REASONS is
+# `Reviewer N FAIL: <multi-line comment>\n` + `TIMEOUT: reviewers did not submit verdicts within N
+# minutes.` (the `\n` is a literal backslash-n) — so the TIMEOUT sentence ends up on the LAST
+# CONTINUATION line, never on the prefixed line. Measured 29/09 on the live log: 448 of 448 `Gate
+# FAILED: Reviewer N FAIL:` entries are multi-line. _log_entries() therefore groups each prefixed
+# line with the lines that follow it up to the next prefixed line, and the composite/timeout test
+# reads the WHOLE entry (gate-run ga-ic6882: the first cut tested only the prefixed line, so the
+# guard could never fire and a timed-out run read as a recovery).
+# Two consequences, both on the inert side:
+#   * the whole-entry search over-skips a real reviewer FAIL whose comment merely QUOTES the sentinel
+#     sentence — that only keeps a bead open until the next verdict;
+#   * a FAILED entry that is the LAST one in the window is not counted: the TIMEOUT tail is the last
+#     thing written, so an entry still being written is indistinguishable from a plain FAIL until a
+#     later entry proves it finished. PASS entries are single-line and need no such wait.
+# NOT closed by grouping: a quote that starts a continuation line at column 0 is textually identical to
+# a real entry start, so it is read as one. It can only reproduce a verdict line copied from the log
+# (which then exists twice), or a hand-typed example — accepted, and an indented quote is safe.
+#
+# SCOPE OF THE EVIDENCE: ANY later verdict closes the bead, not one for the run/branch the alarm
+# names. That is the right question for "did the gate come back" — but a run whose reviewers all
+# delivered just before the alarm and finalised just after it could close an alarm about a
+# DIFFERENT, still-stuck run. Accepted trade-off, not a guarantee: the close reason says so
+# ("vale para QUALQUER run — não prova que o run citado no alarme terminou") and quotes the verdict,
+# so whoever reads the closed bead can see exactly what it was closed on.
+#
+# SCOPE OF THE BEADS: only beads labelled REPAIR_AUDIT_LABEL with NO assignee — the unrouted alarm records.
+# A bead a dog or the Mayor owns is never touched. Beads a dog was actually spawned for
+# (direct-spawn / sling) are closed by that dog per REPAIR_HEADER, not here.
+# ═══════════════════════════════════════════════════════════════════════════════
+GRW_CLOSE_REPAIR_AUDIT_ENABLED = os.environ.get("GRW_CLOSE_REPAIR_AUDIT_ENABLED", "1") != "0"
+REPAIR_AUDIT_MAX_PER_SWEEP = int(os.environ.get("GRW_REPAIR_AUDIT_MAX_PER_SWEEP", "10"))
+_REPAIR_AUDIT_DRYRUN_SEEN = set()   # bead ids already reported as would-close under GRW_DRY_RUN (this process)
+# The dispatcher emits the verdict in TWO PASS forms (quality-gate-dispatcher.sh:~8232/8235):
+#   `Gate PASSED: branch=...`                 — a merge the dispatcher itself ran
+#   `Gate PASSED (origin=Pilot): branch=...`  — a merge the Pilot dispatched (18% of PASS lines, 209/1188 measured 29/09)
+# so the optional `(origin=...)` tag sits BEFORE the colon. A recognizer that misses it is not merely
+# incomplete — it reads a real verdict as "no verdict" and the alarm stays open, with nothing counting
+# what was not recognised (gate-run ga-lor9cy). last_pass_epoch() uses this same regex (resolved at call time).
+# ANCHORED at the line start, used with .match(): the dispatcher's log() writes `[ts] [quality-gate-dispatcher] <msg>`
+# and a multi-line <msg> (a reviewer FAIL comment) puts its 2nd+ lines in the log WITHOUT that prefix. A comment that
+# QUOTES a verdict line ("… returns [] for `[ts] [quality-gate-dispatcher] Gate PASSED …`") would otherwise be read
+# as a verdict — dated by the QUOTED timestamp — which is the destructive direction (it can close a real alarm).
+GATE_VERDICT_LINE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[quality-gate-dispatcher\] "
+                                  r"Gate (PASSED|FAILED)(?: \(origin=[^)]*\))?: (.*)$")
+GATE_REVIEWER_FAIL_RE = re.compile(r"Reviewer \d+ FAIL:")
+# The first line of ANY dispatcher-log entry (log()/warn()/err() all write `[ts] [<who>] …`). A line that does not
+# start like this is a CONTINUATION of the entry above it (the 2nd+ lines of a multi-line message).
+GATE_ENTRY_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[")
+# The dispatcher's literal FAIL_REASONS text for a Phase C timeout (quality-gate-dispatcher.sh:~10509, its ONLY emit site).
+GATE_TIMEOUT_SENTINEL = "TIMEOUT: reviewers did not submit"
+
+
+def _log_entries(lines):
+    """PURE. Group physical dispatcher-log `lines` into ENTRIES → [(head, continuation_lines, finished)].
+    `head` is the prefixed first line; `continuation_lines` are the prefix-less lines after it up to the next
+    prefixed line; `finished` is True when a LATER entry exists — proof the writer moved on, so this entry is
+    complete. The last entry is not finished (it may still be being written). Continuation lines that come
+    before the first prefixed line (a tail read cut mid-entry) belong to an entry outside the window: dropped."""
+    entries = []
+    for l in lines:
+        if GATE_ENTRY_START_RE.match(l):
+            entries.append((l, []))
+        elif entries:
+            entries[-1][1].append(l)
+    return [(head, cont, i < len(entries) - 1) for i, (head, cont) in enumerate(entries)]
+
+
+def _gate_verdicts_in(lines):
+    """PURE. [(epoch, head_line_text)] for every REAL gate verdict ENTRY in dispatcher-log `lines`
+    (see the FIX 10 block above for what counts and why an entry is not a physical line). An entry
+    whose timestamp does not parse is skipped — an undatable verdict can prove nothing about being AFTER anything."""
+    out = []
+    for head, cont, finished in _log_entries(lines):
+        m = GATE_VERDICT_LINE_RE.match(head)
+        if not m:
+            continue
+        if m.group(1) == "FAILED":
+            if not GATE_REVIEWER_FAIL_RE.match(m.group(2)):
+                continue   # TIMEOUT / merge failure / parked source / preflight abort — not a reviewer verdict
+            if GATE_TIMEOUT_SENTINEL in "\n".join([m.group(2)] + cont):
+                # a Phase C timeout that ALSO collected a reviewer FAIL (dispatcher ga-h8vc8y): the sentinel sits at
+                # the end of the entry's LAST continuation line. The run timed out — the very fault these alarms
+                # report — so it is not a recovery. Skipping only ever leaves a bead open (the inert side).
+                continue
+            if not finished:
+                continue   # last entry in the window: its TIMEOUT tail may not be written yet — wait for a later entry
+        e = log_ts_epoch(head)
+        if e is None:
+            continue
+        out.append((e, head.strip()))
+    return out
+
+
+def _read_gate_verdicts():
+    """[(epoch, line)] of the real verdicts in the dispatcher-log tail, or None when the log
+    could not be read (None is NOT an empty list: 'unreadable' must never read as 'no verdicts')."""
+    try:
+        return _gate_verdicts_in(_read_log_tail_lines(DISPATCH_LOG, HEADOFLINE_TAIL_BYTES))
+    except Exception:
+        return None
+
+
+def repair_audit_verdict(created_epoch, verdicts):
+    """PURE decision for one REPAIR audit bead → (action, evidence).
+      ("close", (epoch, line))  a real verdict landed strictly AFTER the bead's creation;
+                                evidence is the EARLIEST such verdict in the window
+      ("keep:no-verdict", None) log read fine, nothing after created_at — no evidence of recovery
+                                (NOT proof the gate is still down: it may simply not have produced one yet)
+      ("keep:unreadable", None) verdicts is None — the log could not be read
+      ("keep:unknown-age", None) created_epoch is None — cannot order verdicts against it"""
+    if created_epoch is None:
+        return ("keep:unknown-age", None)
+    if verdicts is None:
+        return ("keep:unreadable", None)
+    after = [v for v in verdicts if v[0] > created_epoch]
+    if not after:
+        return ("keep:no-verdict", None)
+    return ("close", min(after))
+
+
+def _open_repair_audit_beads():
+    """[bead dicts] open + REPAIR_AUDIT_LABEL, or None on query failure (fail-safe skip).
+    --limit 0: a sweep must not silently stop at bd's default 50 (ga-21kmp).
+    BD_CACHE_FRESH=1: THIS read decides a `bd close` (the assignee-empty + still-open check), and
+    bd-list-cached.sh's own header says such a call site must not decide from a cached read. The
+    5s TTL is far below POLL_SEC so the practical risk was nil — but a fresh read removes the
+    question, and costs one live query per sweep."""
+    r = sh(["env", "BD_CACHE_FRESH=1", "bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", REPAIR_AUDIT_LABEL,
+            "--status", "open", "--limit", "0", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout)
+    except Exception:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def close_recovered_repair_audit_beads(now):
+    """FIX 10 (ga-hqrnmu): close every unowned REPAIR audit bead the gate has since recovered
+    from (repair_audit_verdict), quoting the verdict. Bounded per sweep, dry-run aware, fully
+    fail-safe — every uncertain read leaves the bead OPEN. Reads the log only when at least one
+    such bead is open, so a healthy town pays one bd query per sweep and nothing else."""
+    if not GRW_ENABLED or not GRW_CLOSE_REPAIR_AUDIT_ENABLED:
+        return
+    beads = _open_repair_audit_beads()
+    if beads is None:
+        print("[watchdog] repair-audit: bead query unavailable — fail-safe skip", flush=True)
+        return
+    beads = [b for b in beads if b.get("id") and not (b.get("assignee") or "").strip()]
+    if not beads:
+        return
+    verdicts = _read_gate_verdicts()
+    if verdicts is None:
+        print("[watchdog] repair-audit: dispatcher log unreadable — %d bead(s) left open (cannot tell)"
+              % len(beads), flush=True)
+        return
+    beads.sort(key=lambda b: _iso_epoch(b.get("created_at")) or 0.0)
+    acted = 0
+    unverifiable = []
+    for b in beads:
+        if acted >= REPAIR_AUDIT_MAX_PER_SWEEP:
+            break
+        bid = b["id"]
+        action, ev = repair_audit_verdict(_iso_epoch(b.get("created_at")), verdicts)
+        if action == "keep:unknown-age":
+            unverifiable.append(bid)   # an anomaly (bd always stamps created_at), unlike keep:no-verdict — say so
+        if action != "close":
+            continue
+        v_epoch, v_line = ev
+        reason = ("grw FIX10 (ga-hqrnmu): o gate produziu um veredito real às %s (dispatcher log), "
+                  "posterior à criação desta bead (%s): %s. Vale para QUALQUER run — não prova que o run "
+                  "citado no alarme terminou. Fechada pelo watchdog; reabra se o gate voltar a parar."
+                  % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v_epoch)), b.get("created_at"), v_line[:200]))
+        if GRW_DRY_RUN:
+            # A dry-run never closes, so the SAME bead comes back every POLL_SEC sweep. Record the
+            # would-close once per bead per process — otherwise the ledger and log grow without bound
+            # for as long as dry-run stays on. (Skipped beads don't count toward the per-sweep cap.)
+            if bid in _REPAIR_AUDIT_DRYRUN_SEEN:
+                continue
+            _REPAIR_AUDIT_DRYRUN_SEEN.add(bid)
+            print("[watchdog] repair-audit DRY-RUN would CLOSE %s (%s)" % (bid, v_line[:120]), flush=True)
+            _recovery_ledger("would_close_recovered_repair_audit",
+                             {"bead": bid, "created_at": b.get("created_at"), "verdict": v_line[:200], "dry_run": True})
+            acted += 1
+            continue
+        r = sh(["bd", "-C", CITY, "close", bid, "-r", reason], timeout=25)
+        if not (r and r.returncode == 0):
+            print("[watchdog] repair-audit: bd close %s FAILED — left open, will retry next sweep" % bid, flush=True)
+            continue
+        _recovery_ledger("closed_recovered_repair_audit",
+                         {"bead": bid, "created_at": b.get("created_at"), "verdict": v_line[:200]})
+        print("[watchdog] CLOSED recovered REPAIR audit bead %s (verdict: %s)" % (bid, v_line[:120]), flush=True)
+        acted += 1
+    if unverifiable:
+        print("[watchdog] repair-audit: %d bead(s) left open — created_at unparsable, cannot order verdicts against it: %s"
+              % (len(unverifiable), ", ".join(unverifiable)), flush=True)
+    if acted:
+        print("[watchdog] repair-audit sweep: %d bead(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
@@ -4572,6 +4928,7 @@ def main():
   last_loop_spawn = 0
   last_orphan_spawn = 0
   hol_nonrepair_logged = {}  # ga-mlzqg4: branch -> epoch of the last log-only HOL line (rate limit)
+  hol_stale_skip_logged = {}  # ga-clexh7: branch -> epoch of the last 'repair skipped, branch left the queue' line
   orphan_logged = {}         # ga-b1iulk: marker id -> epoch of the last log-only orphan line (rate limit)
 
   print("[watchdog] gate+pilot watchdog started — governed repair-agent spawner "
@@ -4653,6 +5010,10 @@ def main():
             recover_needs_rebase_markers(now, rstate)
         except Exception as e:
             print("[watchdog] recover_needs_rebase_markers error (continuing): %r" % e, flush=True)
+        try:
+            close_recovered_repair_audit_beads(now)
+        except Exception as e:
+            print("[watchdog] close_recovered_repair_audit_beads error (continuing): %r" % e, flush=True)
 
         # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
         # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot
@@ -4667,7 +5028,7 @@ def main():
 
         # ===== gate down: 2+ timeouts OR a marker stuck dispatching w/ no reviewers =====
         n_to, last_to = recent_timeouts()
-        stuck = stuck_dispatching()
+        stuck, stuck_run, stuck_branch = stuck_dispatching_detail()
         problem = ((n_to >= 2) or stuck) and not infra
         if saw_gate and lp and lp > last_gate_spawn:
             print("[watchdog] gate recovered (Gate PASSED after repair dispatch) — resetting", flush=True)
@@ -4676,6 +5037,10 @@ def main():
         if problem:
             reason = ("%d timeouts em %dmin" % (n_to, TIMEOUT_WINDOW_SEC // 60)) if n_to >= 2 \
                      else "marcador dispatching travado sem revisores ativos"
+            if stuck and (stuck_run or stuck_branch):
+                # ga-hqrnmu: name WHAT is stuck — in the title too, or every REPAIR card reads the same.
+                # Keeps "marcador ... travado" (cond_for's dedup tokens + REPAIR_DOG_TITLE_RE match on it).
+                reason += " (run %s, branch %s)" % (stuck_run or "?", stuck_branch or "?")
             dolt_hits = dolt_instability()
             diag = snapshot(reason, dolt_hits)
             how = governed_spawn(gov, sessions, now, "gate", reason, diag, dolt_hits, "Gate travou")
@@ -4701,11 +5066,21 @@ def main():
             notify("Gate destravou — fila voltou a drenar (head-of-line resolvido).", 3)
             gov.reset_prefix("gate-loop:"); saw_loop = False
         if hb and not infra:
-            ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
-            lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
-                                  "Gate preso em branch stale (head-of-line)", branch=hb)
-            if lhow is not None:
-                last_loop_spawn = now; saw_loop = True
+            # ga-clexh7: hb comes from a LOG run, and a log run can outlive the condition it saw —
+            # confirm against the marker (the artifact) before paying for a repair dog.
+            if hol_repair_verdict(hol_branch_queue_state(hb)) != "repair":
+                if now - hol_stale_skip_logged.get(hb, 0) >= HEADOFLINE_NONREPAIR_LOG_EVERY_SEC:
+                    print("[watchdog] head-of-line repair SKIPPED (no dog spawned): the log still shows %d QUEUED-retry "
+                          "sweeps on %s, but no open gate-status:queued marker names it any more — it is no longer the "
+                          "re-picked head of the queue (its marker moved to another gate-status or closed), so the "
+                          "stale-branch runbook has nothing to act on (ga-clexh7)" % (hcount, hb), flush=True)
+                    hol_stale_skip_logged[hb] = now
+            else:
+                ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
+                lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
+                                      "Gate preso em branch stale (head-of-line)", branch=hb)
+                if lhow is not None:
+                    last_loop_spawn = now; saw_loop = True
 
         # --- HEAD-OF-LINE, non-conflict QUEUED endings (ga-mlzqg4): LOG ONLY. No
         #     snapshot(), no governed_spawn() — headofline_nonrepair() says why a repair
