@@ -221,6 +221,16 @@ RESEED_PUBLISH_FINGERPRINT="${RESEED_PUBLISH_FINGERPRINT:-1}"
 # cabeçalho, "BASTARIA É UMA CONTA DE DUAS CÓPIAS"). 100 = a restauração ocupa
 # ~1x o vivo. Só entra na conta do modo ULTRA (Preflight 2).
 RESTORE_COPY_PCT="${RESEED_RESTORE_COPY_PCT:-100}"
+# ga-9d0o7k: what a restore for verification must LEAVE free, or it is not
+# started. Used only by the OPTIONAL promotion of "$db.new" after a manifest-less
+# primary release (_maybe_promote_new_after_primary_release) -- NOT by the low-disk
+# and ultra modes, which exist precisely to reclaim space when the disk is already
+# under this floor (applying it there would recreate the catch-22 they break).
+# The floor is dolt-disk-floor-guard.sh's DOLT_DISK_FLOOR_WARN_GB (8): under it
+# Dolt itself is at risk. The swap reserve covers what the OS swap file grows by
+# while the restore runs (3,4 -> 5,3GB in a single night, measured 28/09).
+DOLT_OP_FLOOR_MB="${RESEED_DOLT_FLOOR_MB:-8192}"
+SWAP_RESERVE_MB="${RESEED_SWAP_RESERVE_MB:-2048}"
 # ga-gsnee8: a prova de S3 do modo de baixo disco pode REPARAR o S3 (espelhar o
 # local para lá) antes de passar. Isso roda dentro do orçamento (~1800s) dos
 # chamadores (dolt-s3-backup.sh, dolt-compact-routine.sh, disk-floor-guard) --
@@ -485,6 +495,12 @@ _publish_after_swap() {
 # depend on the writer at all. See _should_release_manifestless_primary's
 # own header for the exact fp_status branch this adds.
 #
+# ga-9d0o7k: releasing NO LONGER promotes "$db.new" as a side effect. On 29/09
+# the chained promotion restored ~9GB right after the release and took the disk
+# to 4,4GB. The two steps are separate now: this one only frees; the promotion
+# runs with `--release-manifestless-primary <db> --promote` (chained, on request)
+# or later, alone, with `--promote-new-after-release <db>`.
+#
 # ga-qh8gkw rule #2 (NEVER on a valid primary, NEVER on .new): the very first
 # check below is the local manifest — a primary WITH one is left alone,
 # unconditionally, regardless of what S3 says. This function only ever
@@ -495,11 +511,20 @@ _publish_after_swap() {
 # call from a sourcing test harness (DOLT_BACKUP_RESEED_LIB=1) without killing
 # it, unlike _run_reseed.
 _release_manifestless_primary() {
-  local db="$1"
+  local db="$1" promote_flag="${2:-}"
   if [ -z "$db" ]; then
-    log "release-manifestless-primary: uso: $0 --release-manifestless-primary <nome-do-banco>"
+    log "release-manifestless-primary: uso: $0 --release-manifestless-primary <nome-do-banco> [--promote]"
     return 1
   fi
+  # Validated up front, before anything is read or deleted: a mistyped flag must
+  # not silently turn into "release without promoting" (or the reverse).
+  case "$promote_flag" in
+    ''|--promote) ;;
+    *)
+      log "release-manifestless-primary '$db': RECUSANDO — argumento desconhecido '$promote_flag' (o único aceito é --promote); nada foi lido nem apagado"
+      return 1
+      ;;
+  esac
   local primary_dir="$BACKUP_ROOT/$db"
   local old_dir="$primary_dir.old"
 
@@ -585,7 +610,14 @@ _release_manifestless_primary() {
     return 0
   fi
 
-  _maybe_promote_new_after_primary_release "$db"
+  # ga-9d0o7k: freeing is cheap and safe; restoring the whole "$db.new" to verify
+  # it is expensive and risky -- so the promotion is its OWN step, run only when
+  # asked (--promote here, or --promote-new-after-release later, standalone).
+  if [ "$promote_flag" = "--promote" ]; then
+    _maybe_promote_new_after_primary_release "$db"
+  else
+    log "release-manifestless-primary '$db': liberação concluída — a promoção de $db.new é um passo SEPARADO e NÃO rodou (ga-9d0o7k: liberar é barato e seguro, restaurar a cópia inteira para verificar é caro e arriscado). Para tentar quando houver disco: $0 --promote-new-after-release $db"
+  fi
 }
 
 # _maybe_promote_new_after_primary_release <db> — ga-qh8gkw step 3: after
@@ -600,6 +632,12 @@ _release_manifestless_primary() {
 # only network until a future run has the room to try. It never invents a
 # weaker proof just because disk is tight — same "fail toward inert" stance
 # as the release above.
+#
+# ga-9d0o7k: "the restore fits" (free >= LOW_DISK_MARGIN_PCT of live) is not
+# enough -- the restore must also leave the Dolt operating floor plus a swap
+# reserve free (DOLT_OP_FLOOR_MB + SWAP_RESERVE_MB), or the promotion is
+# deferred ("adiado por disco") and hq.new stays exactly as it was. Not run
+# by the release unless asked (see _release_manifestless_primary's header).
 _maybe_promote_new_after_primary_release() {
   local db="$1"
   local primary_dir="$BACKUP_ROOT/$db"
@@ -639,7 +677,29 @@ _maybe_promote_new_after_primary_release() {
     return 0
   fi
 
-  log "release-manifestless-primary '$db': livre $((free_kb/1024))MB cobre a verificação (~$((need_kb/1024))MB) — restaurando $new_dir para conferir antes de promover."
+  # ga-9d0o7k: the margin above only says the restore FITS. It says nothing about
+  # what the disk looks like once it is there -- on 29/09 05:25 "livre 16758MB
+  # cobre a verificação (~10865MB)" restored ~9GB and left 4,4GB (CRITICAL, under
+  # the 8GB Dolt floor). Require that what is left AFTER the restore still covers
+  # the Dolt floor plus the swap reserve. A reserve number that is not a plain
+  # non-negative integer is "can't tell", never "no reserve": it defers.
+  local knob
+  for knob in "$DOLT_OP_FLOOR_MB" "$SWAP_RESERVE_MB" "$RESTORE_COPY_PCT"; do
+    case "$knob" in
+      ''|*[!0-9]*)
+        log "release-manifestless-primary '$db': adiado por disco — parâmetro de reserva inválido ('$knob' em RESEED_DOLT_FLOOR_MB / RESEED_SWAP_RESERVE_MB / RESEED_RESTORE_COPY_PCT); sem um número confiável não começo uma restauração. Deixando $new_dir no lugar; S3 é a rede até então. Registrado e parando."
+        return 0
+        ;;
+    esac
+  done
+  local restore_kb=$(( live_kb * 10#$RESTORE_COPY_PCT / 100 ))
+  local reserve_kb=$(( (10#$DOLT_OP_FLOOR_MB + 10#$SWAP_RESERVE_MB) * 1024 ))
+  if [ "$free_kb" -lt $(( restore_kb + reserve_kb )) ]; then
+    log "release-manifestless-primary '$db': adiado por disco — restaurar $new_dir para verificar custaria ~$((restore_kb/1024))MB e deixaria ~$(( (free_kb - restore_kb)/1024 ))MB livres (livre agora $((free_kb/1024))MB), abaixo do piso de operação do Dolt (${DOLT_OP_FLOOR_MB}MB) + reserva de swap (${SWAP_RESERVE_MB}MB) = $((reserve_kb/1024))MB. Deixando $new_dir no lugar; S3 é a rede até haver disco. Registrado e parando."
+    return 0
+  fi
+
+  log "release-manifestless-primary '$db': livre $((free_kb/1024))MB cobre a verificação (~$((need_kb/1024))MB) e ainda sobram ~$(( (free_kb - restore_kb)/1024 ))MB depois da restauração (piso+swap = $((reserve_kb/1024))MB) — restaurando $new_dir para conferir antes de promover."
   local live_count
   live_count=$(timeout 60 "$GC_BIN" dolt sql -q "SELECT COUNT(*) FROM \`$db\`.issues" 2>/dev/null \
                | grep -oE '^\| *[0-9]+' | grep -oE '[0-9]+' | head -1)
@@ -1196,7 +1256,18 @@ fi
 # normal `dolt-backup-reseed.sh <db>` invocation below; must be asked for
 # explicitly.
 if [ "$DB" = "--release-manifestless-primary" ]; then
-  _release_manifestless_primary "${2:-}"
+  _release_manifestless_primary "${2:-}" "${3:-}"
+  exit $?
+fi
+
+# ga-9d0o7k: the promotion of "$db.new" after a release, as its own explicit
+# command (the release no longer chains it unless given --promote).
+if [ "$DB" = "--promote-new-after-release" ]; then
+  if [ -z "${2:-}" ]; then
+    log "promote-new-after-release: uso: $0 --promote-new-after-release <nome-do-banco>"
+    exit 1
+  fi
+  _maybe_promote_new_after_primary_release "$2"
   exit $?
 fi
 
