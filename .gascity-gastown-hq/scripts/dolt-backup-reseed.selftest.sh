@@ -25,6 +25,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/dolt-backup-reseed.sh"
 S3_BACKUP_SCRIPT="$HERE/dolt-s3-backup.sh"
 
+# notify_fail (sourced from dolt-backup-residue-reclaim.sh) runs
+# ${DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY:-/Users/athos/.local/bin/notify}. In this
+# script only the hq.new promotion calls it (restore fails / fewer rows / mv fails).
+# The lib-level scenario P3 overrides $NOTIFY per call, but a real subprocess such as
+# scenario 17d resolves it to the REAL notify and would push a "SEM BACKUP LOCAL"
+# alarm to the phone on every run -- and so would any scenario added later that
+# reaches those paths. /usr/bin/true swallows the args.
+export DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -562,9 +571,10 @@ _run_promote() {
 }
 
 # ga-9d0o7k: "ample" now means ample ABOVE the Dolt operating floor + swap reserve
-# (8192+2048MB by default) — the 1000KB live fixture leaves 12000000KB (~11.4GB)
-# free after a ~1MB restore, comfortably over the 10240MB reserve.
-AMPLE_FREE_KB=12000000
+# (8192+4096MB by default = 12288MB) — the 1000KB live fixture leaves ~13.3GB free
+# after a ~1MB restore (14000000KB = 13672MB free), comfortably over the reserve.
+AMPLE_FREE_KB=14000000
+DEFAULT_RESERVE_MB=$(( 8192 + 4096 ))   # RESEED_DOLT_FLOOR_MB + RESEED_SWAP_RESERVE_MB defaults
 
 # Scenario P1: ample margin, restore succeeds with restored>=live → promoted.
 mk_promote_scenario
@@ -610,7 +620,7 @@ DOLT_CALLS="$LIB_SCRATCH/dolt-calls.log"
 
 # Scenario P5 (the regression): the incident's numbers. The OLD 120% margin passes
 # (16758 >= 10865) but a ~9054MB restore would leave ~7704MB free — under the
-# 8192MB floor + 2048MB swap reserve. Must defer: hq.new untouched, NO restore.
+# 8192MB floor + 4096MB swap reserve. Must defer: hq.new untouched, NO restore.
 # (On the pre-fix HEAD this scenario restores and promotes — that is the bug.)
 mk_promote_scenario
 : > "$LOG"; : > "$DOLT_CALLS"; : > "$NOTIFY_CALLS_FILE_PROMOTE"
@@ -623,9 +633,9 @@ grep -qF "SEM BACKUP LOCAL" "$LOG" && bad "scenario P5: a deferral is not a fail
 [ -s "$NOTIFY_CALLS_FILE_PROMOTE" ] && bad "scenario P5: deferral must not fire notify_fail (same as the old margin-insufficient branch)" || ok "scenario P5: no notify_fail on a plain deferral"
 
 # Scenario P6: the boundary, to the KB. Restoring (RESTORE_COPY_PCT=100 → 9271800KB)
-# must leave >= floor+swap = (8192+2048)*1024 = 10485760KB; free = 19757560KB is
+# must leave >= floor+swap = (8192+4096)*1024 = 12582912KB; free = 21854712KB is
 # exactly enough (>=), one KB less is not.
-BOUND_KB=$(( LIVE_KB_0929 + (8192 + 2048) * 1024 ))
+BOUND_KB=$(( LIVE_KB_0929 + DEFAULT_RESERVE_MB * 1024 ))
 mk_promote_scenario
 : > "$LOG"; : > "$DOLT_CALLS"
 FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=$BOUND_KB FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
@@ -636,6 +646,25 @@ mk_promote_scenario
 FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=$(( BOUND_KB - 1 )) FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
   FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
 [ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ! grep -qF "backup restore" "$DOLT_CALLS" && ok "scenario P6b (one KB under floor+swap): deferred, no restore" || bad "scenario P6b: one KB short of floor+swap must defer without restoring"
+
+# Scenario P6c (calibration of the swap-reserve DEFAULT): the one measured incident
+# took the disk down ~12250MB (16758MB free -> ~4,4GiB) for a ~9054MB live db, i.e.
+# ~3200MB MORE than the restore itself. A disk with free just above live + 8192 +
+# 2048 MB passes a 2048MB swap reserve yet, by that same observed consumption, would
+# land near 7GB -- under the 8GB floor. The default reserve is 4096MB so this defers;
+# the knob still works (RESEED_SWAP_RESERVE_MB=2048 lets the same disk through).
+CALIB_KB=$(( LIVE_KB_0929 + (8192 + 2048) * 1024 + 1024 ))
+mk_promote_scenario
+: > "$LOG"; : > "$DOLT_CALLS"
+FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=$CALIB_KB FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
+  FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
+[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ! grep -qF "backup restore" "$DOLT_CALLS" && grep -qF "adiado por disco" "$LOG" \
+  && ok "scenario P6c (free = live + floor + 2048MB swap, default reserve 4096MB): deferred, no restore" \
+  || bad "scenario P6c: a disk that a 2048MB swap reserve would let through, but that the observed 12.2GB consumption would drop under the floor, must defer by default"
+mk_promote_scenario
+: > "$LOG"
+SWAP_RESERVE_MB=2048 FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=$CALIB_KB FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 _run_promote
+[ -d "$PRIMARY_ROOT/hq" ] && [ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "scenario P6c: the same disk with RESEED_SWAP_RESERVE_MB=2048 promotes — the default is the only thing that deferred it" || bad "scenario P6c: the swap-reserve knob must still override the default"
 
 # Scenario P7: the reserve is what blocked P5 — same disk, knobs at 0 → promotes.
 # Also proves RESEED_DOLT_FLOOR_MB / RESEED_SWAP_RESERVE_MB are the wired knobs.
@@ -648,9 +677,12 @@ DOLT_OP_FLOOR_MB=0 SWAP_RESERVE_MB=0 FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=
 # Scenario P8: a garbage reserve knob must not read as "0 = no reserve" (three
 # states: has / hasn't / can't tell — the third one is inert). Ample disk, so
 # ONLY the unusable number can be what defers. All three knobs feed the check:
-# the floor, the swap reserve and the restore-copy size.
+# the floor, the swap reserve and the restore-copy size. "9223372036854775807" is a
+# plain digits-only number that is NOT usable: bash 3.2 wraps 64-bit arithmetic, so
+# (10#9223372036854775807 + 2048) * 1024 = 2096128KB would read as a ~2GB reserve --
+# the same "unusable number == no reserve" collapse, so the digit count is bounded.
 for knob in DOLT_OP_FLOOR_MB SWAP_RESERVE_MB RESTORE_COPY_PCT; do
-  for garbage in abc "" "-5" "8GB"; do
+  for garbage in abc "" "-5" "8GB" "9223372036854775807"; do
     mk_promote_scenario
     : > "$LOG"; : > "$DOLT_CALLS"
     ( export "$knob=$garbage"; FAKE_DF_FREE_KB=99999999 FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
@@ -660,6 +692,35 @@ for knob in DOLT_OP_FLOOR_MB SWAP_RESERVE_MB RESTORE_COPY_PCT; do
       || bad "scenario P8: $knob='$garbage' must defer (inert), not be read as no-reserve"
   done
 done
+
+# Scenario P9: a MEASUREMENT that is not a plain number is "can't tell", not "enough".
+# `[ abc -lt N ]` is rc 2, which an `if` reads as false, so an unchecked non-numeric
+# df/du value falls through to the restore; and du's "abc" evaluates to 0 inside $(( )),
+# i.e. a zero-size live db that "needs" nothing. Ample real disk, so ONLY the unreadable
+# number can be what defers.
+for what in free live; do
+  mk_promote_scenario
+  : > "$LOG"; : > "$DOLT_CALLS"
+  if [ "$what" = free ]; then
+    FAKE_DF_FREE_KB=abc FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
+  else
+    FAKE_LIVE_KB=abc FAKE_DF_FREE_KB=$AMPLE_FREE_KB FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
+  fi
+  [ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ! grep -qF "backup restore" "$DOLT_CALLS" && grep -qF "não consegui medir" "$LOG" \
+    && ok "scenario P9 (df/du '$what' value is not a number): deferred, no restore, hq.new intact" \
+    || bad "scenario P9: a non-numeric $what measurement must defer, not fall through to the restore"
+done
+
+# Scenario P10: RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1 is honored by the
+# promotion too (the release honors it; an operator who set it expects nothing to
+# change). Ample disk, so the dry-run switch is the only thing that stops the restore.
+mk_promote_scenario
+: > "$LOG"; : > "$DOLT_CALLS"
+RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1 FAKE_DF_FREE_KB=$AMPLE_FREE_KB FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
+  FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
+[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ! grep -qF "backup restore" "$DOLT_CALLS" && grep -qF "DRY-RUN" "$LOG" && ! grep -qF "PROMOVIDO" "$LOG" \
+  && ok "scenario P10 (DRY_RUN=1, ample disk): nothing restored or moved, log says DRY-RUN" \
+  || bad "scenario P10: the promotion must honor RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1"
 
 # ── ga-9d0o7k, second half: the promotion no longer rides along with the release.
 #    Freeing the primary is cheap and safe; restoring ~9GB to verify hq.new is
@@ -1309,19 +1370,63 @@ run_cli "$ROOT16" --promote-new-after-release hq
 if [ "$RC" -eq 0 ]; then ok "scenario 16 (--promote-new-after-release, roomy disk): exits 0"; else bad "scenario 16: expected exit 0, got $RC — $(tail -3 "$ROOT16/out.log")"; fi
 if [ -d "$ROOT16/city/.dolt-backup/hq" ] && [ ! -e "$ROOT16/city/.dolt-backup/hq.new" ]; then ok "scenario 16: hq.new PROMOTED to hq by the standalone command"; else bad "scenario 16: expected hq.new promoted to hq"; fi
 if grep -qF "PROMOVIDO" "$ROOT16/out.log" 2>/dev/null; then ok "scenario 16: logged PROMOVIDO"; else bad "scenario 16: missing PROMOVIDO log line"; fi
+# The standalone command runs no release, so its log lines must not claim one.
+if grep -qF "promote-new-after-release 'hq'" "$ROOT16/out.log" 2>/dev/null && ! grep -qF "release-manifestless-primary 'hq'" "$ROOT16/out.log" 2>/dev/null; then ok "scenario 16: standalone log lines carry the promote-new-after-release tag, not the release's"; else bad "scenario 16: the standalone promotion logs under 'release-manifestless-primary' — it runs no release"; fi
 rm -rf "$ROOT16" 2>/dev/null
 
+# Exit-code contract of --promote-new-after-release (scenarios 16-17e). Whatever wraps
+# it must be able to tell the outcomes apart -- in particular "deferred" from "promoted":
+#   0 settled (promoted / nothing to promote / dry-run)   3 deferred, may succeed later
+#   1 did not promote and waiting will not fix it (or bad usage)
+
 # Scenario 17: the incident's shape at the subprocess level — free ~10190MB is far
-# above 120% of the 5MB live db, but a restore would leave < the 10240MB reserve
-# (default 8192 floor + 2048 swap). Deferred, hq.new intact, no env override used.
+# above 120% of the 5MB live db, but a restore would leave < the 12288MB reserve
+# (default 8192 floor + 4096 swap). Deferred (rc 3, NOT 0), hq.new intact, no env override.
 ROOT17="/tmp/reseed-selftest-s17.$$"
 setup_scenario "$ROOT17" 5 5 10200
 mv "$ROOT17/city/.dolt-backup/hq" "$ROOT17/city/.dolt-backup/hq.new"
 run_cli "$ROOT17" --promote-new-after-release hq
-if [ "$RC" -eq 0 ]; then ok "scenario 17 (default reserve, disk under floor+swap after the restore): exits 0 (a deferral is not an error)"; else bad "scenario 17: expected exit 0, got $RC — $(tail -3 "$ROOT17/out.log")"; fi
+if [ "$RC" -eq 3 ]; then ok "scenario 17 (default reserve, disk under floor+swap after the restore): exits 3 — deferred, distinct from promoted (0) and stuck (1)"; else bad "scenario 17: expected exit 3 (deferred), got $RC — $(tail -3 "$ROOT17/out.log")"; fi
 if [ ! -e "$ROOT17/city/.dolt-backup/hq" ] && [ -d "$ROOT17/city/.dolt-backup/hq.new" ]; then ok "scenario 17: hq.new LEFT IN PLACE, hq not created"; else bad "scenario 17: the default floor+swap reserve must defer this promotion"; fi
 if grep -qF "adiado por disco" "$ROOT17/out.log" 2>/dev/null; then ok "scenario 17: logged 'adiado por disco'"; else bad "scenario 17: missing the 'adiado por disco' log line"; fi
 rm -rf "$ROOT17" 2>/dev/null
+
+# Scenario 17b: a healthy primary already sits where hq.new would go -> refused, rc 1
+# (waiting will not fix it), both dirs untouched, and the log does not call it a race.
+ROOT17B="/tmp/reseed-selftest-s17b.$$"
+setup_scenario "$ROOT17B" 5 5 20000
+cp -R "$ROOT17B/city/.dolt-backup/hq" "$ROOT17B/city/.dolt-backup/hq.new"
+run_cli "$ROOT17B" --promote-new-after-release hq
+if [ "$RC" -eq 1 ] && [ -d "$ROOT17B/city/.dolt-backup/hq" ] && [ -d "$ROOT17B/city/.dolt-backup/hq.new" ]; then ok "scenario 17b (a primary already exists): exits 1, both dirs untouched"; else bad "scenario 17b: expected exit 1 with hq and hq.new untouched, got rc=$RC"; fi
+if grep -qF "uma primária válida já ocupa o lugar" "$ROOT17B/out.log" 2>/dev/null && ! grep -qF "concorrência?)" "$ROOT17B/out.log" 2>/dev/null; then ok "scenario 17b: the log names the usual cause (a healthy primary), not just a race"; else bad "scenario 17b: missing/incorrect 'primary already exists' explanation"; fi
+rm -rf "$ROOT17B" 2>/dev/null
+
+# Scenario 17c: no hq.new at all -> nothing to promote, settled: rc 0.
+ROOT17C="/tmp/reseed-selftest-s17c.$$"
+setup_scenario "$ROOT17C" 5 5 20000
+rm -rf "$ROOT17C/city/.dolt-backup/hq"
+run_cli "$ROOT17C" --promote-new-after-release hq
+if [ "$RC" -eq 0 ] && grep -qF "nada para promover" "$ROOT17C/out.log" 2>/dev/null; then ok "scenario 17c (no hq.new): exits 0 — nothing to do is settled"; else bad "scenario 17c: expected exit 0 + 'nada para promover', got rc=$RC"; fi
+rm -rf "$ROOT17C" 2>/dev/null
+
+# Scenario 17d: roomy disk but the restore FAILS -> not promoted, rc 1, hq.new intact,
+# and the SEM BACKUP LOCAL alarm text (the notifier itself is stubbed at the top).
+ROOT17D="/tmp/reseed-selftest-s17d.$$"
+setup_scenario "$ROOT17D" 5 5 20000
+mv "$ROOT17D/city/.dolt-backup/hq" "$ROOT17D/city/.dolt-backup/hq.new"
+FAKE_RESTORE_FAIL=1 run_cli "$ROOT17D" --promote-new-after-release hq
+if [ "$RC" -eq 1 ] && [ ! -e "$ROOT17D/city/.dolt-backup/hq" ] && [ -d "$ROOT17D/city/.dolt-backup/hq.new" ]; then ok "scenario 17d (restore fails): exits 1, hq.new intact, hq not created"; else bad "scenario 17d: expected exit 1 with hq.new left in place, got rc=$RC"; fi
+if grep -qF "SEM BACKUP LOCAL" "$ROOT17D/out.log" 2>/dev/null; then ok "scenario 17d: logged the SEM BACKUP LOCAL alarm"; else bad "scenario 17d: missing the SEM BACKUP LOCAL alarm line"; fi
+rm -rf "$ROOT17D" 2>/dev/null
+
+# Scenario 17e: RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1 -> nothing restored or
+# moved, rc 0 (a dry-run is not a failure), hq.new intact.
+ROOT17E="/tmp/reseed-selftest-s17e.$$"
+setup_scenario "$ROOT17E" 5 5 20000
+mv "$ROOT17E/city/.dolt-backup/hq" "$ROOT17E/city/.dolt-backup/hq.new"
+RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1 run_cli "$ROOT17E" --promote-new-after-release hq
+if [ "$RC" -eq 0 ] && [ ! -e "$ROOT17E/city/.dolt-backup/hq" ] && [ -d "$ROOT17E/city/.dolt-backup/hq.new" ] && grep -qF "DRY-RUN" "$ROOT17E/out.log" 2>/dev/null && ! grep -qF "PROMOVIDO" "$ROOT17E/out.log" 2>/dev/null; then ok "scenario 17e (DRY_RUN=1): exits 0, hq.new untouched, log says DRY-RUN"; else bad "scenario 17e: the standalone promotion must honor RESEED_RELEASE_MANIFESTLESS_PRIMARY_DRY_RUN=1 (rc=$RC)"; fi
+rm -rf "$ROOT17E" 2>/dev/null
 
 # Scenario 18: bad CLI usage aborts BEFORE touching anything (S3 never contacted).
 ROOT18="/tmp/reseed-selftest-s18.$$"
