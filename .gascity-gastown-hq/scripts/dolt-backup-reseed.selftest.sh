@@ -754,6 +754,26 @@ export FAKE_PS_OUT="$(printf '%s\n%s' "$$ $PPID /bin/bash /x/scripts/dolt-backup
 _run_stale_new hq
 [ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "S18 (only this process and its launching shell mention the script): still RELEASED — self is not 'another run'" || bad "S18: the tool refused because of its own command line"
 
+# S18b: bash forks a subshell for every $(...) and ps lists it with the SAME command
+# line as the script — a DESCENDANT of this process, not "another run". Found by the
+# first real-environment dry run (busy: <pid> bash dolt-backup-reseed.sh --release-stale-new hq),
+# which the stubbed S18 above (self + ancestors only) could not see.
+mk_stalenew_scenario; : > "$LOG"
+export FAKE_PS_OUT="$(printf '%s\n%s\n%s\n%s' \
+  "$$ $PPID /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq" \
+  "9101 $$ /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq" \
+  "9102 9101 /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq" \
+  "9103 9102 timeout 20 aws s3 cp s3://b/hq/manifest /tmp/x")"
+_run_stale_new hq
+[ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "S18b (this run's own subshells and grandchildren carry the same command line): still RELEASED" || bad "S18b: the tool refused because of its own subshell (a descendant of \$\$) — it can never release for real"
+# …but a look-alike that is NOT ours (parent is launchd, not this run) still blocks.
+mk_stalenew_scenario; : > "$LOG"
+export FAKE_PS_OUT="$(printf '%s\n%s' \
+  "$$ $PPID /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq" \
+  "9201 1 /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq")"
+_run_stale_new hq
+kept "S18c (an identical-looking command whose parent is NOT this run = a different, concurrent run)" "idle=0"
+
 # S19: dry run proves but deletes nothing.
 mk_stalenew_scenario; export TEST_DRY_RUN=1; : > "$LOG"; _run_stale_new hq
 if [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && stale_untouched; then ok "S19 (DRY_RUN=1): nothing deleted"; else bad "S19: DRY_RUN=1 deleted something"; fi

@@ -783,6 +783,11 @@ _stale_new_idle_state() {
       for (k = 1; k <= n; k++) {
         q = order[k]
         if (q in skip) continue
+        # descendente deste processo (o bash forka um subshell por $(...) e o ps o lista
+        # com a MESMA linha de comando do script): também não é "outra execução".
+        mine = 0; p = par[q]
+        for (i = 0; i < 64 && p != "" && p != 0; i++) { if (p == me || p == me2) { mine = 1; break }; p = par[p] }
+        if (mine) continue
         if (index(cmd[q], path) > 0 || cmd[q] ~ re) { print q " " substr(cmd[q], 1, 160); exit }
       }
     }')"
