@@ -385,6 +385,18 @@ SWEEP_QUEUED_RETRY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) ver
 # Any QUEUED ending. Checked AFTER SWEEP_QUEUED_RETRY_RE, so a line that matches both is the retry kind.
 SWEEP_QUEUED_ANY_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=QUEUED\b")
 SWEEP_COMPLETE_RE = re.compile(r"Dispatcher sweep complete: branch=(\S+) verdict=")
+# Lines that prove a branch LEFT the QUEUED-retry loop (ga-clexh7): a gate-run exists for it, so it was
+# admitted to review and is no longer what the FIFO keeps re-picking. None of them is a 'sweep complete'
+# line: the finalize line is deliberately named 'Gate run complete', not 'Dispatcher sweep complete'
+# (ga-eqjo, comment above its emitter in quality-gate-dispatcher.sh), so a branch that goes on to review +
+# merge writes no 'sweep complete' line at all after its last QUEUED one — measured 29/09, 10:47 → 11:12.
+# Each pattern names ITS branch, and only that branch: a Phase C line for another branch's in-flight run
+# says nothing about the one being counted.
+HOL_PROGRESS_RES = (
+    re.compile(r"Phase C: gate-run \S+ \(branch=([^\s)]+)\)"),
+    re.compile(r"Gate PASSED(?: \([^)]*\))?: branch=(\S+)"),      # also 'Gate PASSED (origin=Pilot): branch=…'
+    re.compile(r"Gate run complete: gate_run=\S+ branch=(\S+)"),  # emitted for FAIL too — the 1:1 line
+)
 MARKER_BRANCH_RE = re.compile(r"^branch:(.+)$")  # marker label form: branch:crew/<rig>-<name>/<bead>  (gt-mqkwj)
 # supervisor init-failure loop (ga-h3w2y): a rig with no `path` in site.toml makes
 # the supervisor cycle "init failure #N" / "validate rigs: rig \"X\": path is
@@ -678,6 +690,17 @@ HOL_KIND_QUEUED_OTHER = "queued-other"      # any other 'verdict=QUEUED' — del
 HOL_KIND_UNKNOWN = "unknown"
 
 
+def _hol_progress_branch(line):
+    """Branch named by a HOL_PROGRESS_RES line (a gate-run exists for it), else None. PURE."""
+    if "branch=" not in line:
+        return None
+    for rx in HOL_PROGRESS_RES:
+        mp = rx.search(line)
+        if mp:
+            return mp.group(1)
+    return None
+
+
 def _scan_headofline(lines):
     """PURE (no I/O) trailing-run scan of dispatcher-log lines → (kind, branch, count).
 
@@ -686,11 +709,27 @@ def _scan_headofline(lines):
     as the newest one (HOL_KIND_CONFLICT_RETRY or HOL_KIND_QUEUED_OTHER). The run
     ends at the first sweep that is anything else — a real PASS/FAIL/merge, another
     branch, or the other kind — so the two kinds never inflate each other's count.
-    Returns (None, None, 0) when the newest completion is not a QUEUED at all."""
+    Returns (None, None, 0) when the newest completion is not a QUEUED at all.
+
+    A branch that leaves the loop for review leaves NO sweep-complete line behind (see
+    HOL_PROGRESS_RES), so the sweeps alone cannot tell 'still re-picked' from 'admitted, passed
+    and merged since' (ga-clexh7: 2 QUEUED sweeps, then review + PASS + merge, then 25 minutes of
+    nothing matching — a repair dog was dispatched for the merged branch). A progress line naming
+    the SAME branch therefore ends its run: newer than every counted sweep → no run at all;
+    between two counted sweeps → the older ones belong to a previous episode. Progress lines for
+    OTHER branches are ignored, exactly like the rest of the noise."""
     kind = None
     branch = None
     count = 0
+    progressed = set()   # branches with a progress line NEWER than the sweep being read
     for l in reversed(lines):
+        pb = _hol_progress_branch(l)
+        if pb is not None:
+            if kind is not None and pb == branch:
+                break    # the run being counted ends here: older same-branch sweeps are a past episode
+            if kind is None:
+                progressed.add(pb)
+            continue
         if "Dispatcher sweep complete:" not in l:
             continue
         mq = SWEEP_QUEUED_RETRY_RE.search(l)
@@ -704,6 +743,8 @@ def _scan_headofline(lines):
                 break
             k, b = HOL_KIND_QUEUED_OTHER, ma.group(1)
         if kind is None:
+            if b in progressed:
+                break    # newest QUEUED sweep, but that branch went on to review since → no run
             kind, branch = k, b
         if k != kind or b != branch:
             break  # head-of-line moved to a different branch/kind → not a single-branch wedge
@@ -807,6 +848,39 @@ def headofline_stall():
     if kind == HOL_KIND_CONFLICT_RETRY and count >= HEADOFLINE_MIN_SWEEPS:
         return (branch, count)
     return (None, 0)
+
+
+# What the marker list says about a head-of-line branch (ga-clexh7). THREE states, never two:
+# 'could not read the list' is not 'read it and the branch is not queued'.
+HOL_QUEUE_QUEUED = "queued"        # an open gate-status:queued marker names the branch
+HOL_QUEUE_NOT_QUEUED = "not-queued"  # the list WAS read and no open queued marker names the branch
+HOL_QUEUE_UNKNOWN = "unknown"      # the list could not be read
+
+
+def _hol_queue_state(rows, branch):
+    """PURE: classify `branch` against _queued_markers_read()'s rows (None = unreadable)."""
+    if rows is None:
+        return HOL_QUEUE_UNKNOWN
+    return HOL_QUEUE_QUEUED if any(r[1] == branch for r in rows) else HOL_QUEUE_NOT_QUEUED
+
+
+def hol_branch_queue_state(branch):
+    """Live check of the ARTIFACT behind a head-of-line signal: is the branch still an open
+    gate-status:queued marker? The signal itself is read from a log, and a log run can outlive the
+    condition it saw (ga-clexh7: the branch was reviewed, PASSED and merged while its two QUEUED
+    sweeps were still the newest lines naming it)."""
+    return _hol_queue_state(_queued_markers_read(), branch)
+
+
+def hol_repair_verdict(queue_state):
+    """PURE: 'repair' or 'skip:not-queued' for a head-of-line signal, given hol_branch_queue_state().
+
+    Only a READ that shows the branch is no longer queued suppresses the repair dog — the re-anchor
+    runbook is for a branch the FIFO keeps re-picking from gate-status:queued, and this one is not (its
+    marker is closed or in another gate-status; whatever else is wrong with it is another detector's).
+    An unreadable list suppresses nothing: this is the detector for a stuck gate, and going quiet
+    because its own read failed would hide a real wedge behind an unrelated bd/Dolt hiccup."""
+    return "skip:not-queued" if queue_state == HOL_QUEUE_NOT_QUEUED else "repair"
 
 
 def headofline_nonrepair():
@@ -948,7 +1022,15 @@ def _queued_markers():
     genuinely stuck open one. Filtered at both the query (--status) and parse
     (status check) layers, since a future query refactor could silently drop
     the CLI flag (ga-huke4). Returns [] on any error (fail-safe: no markers →
-    no orphan fire)."""
+    no orphan fire). A caller that must tell 'could not read' from 'none queued'
+    uses _queued_markers_read() instead — this wrapper deliberately collapses them."""
+    return _queued_markers_read() or []
+
+
+def _queued_markers_read():
+    """_queued_markers()'s rows, or None when the marker list could NOT be read (bd failed, timed out, or
+    returned something that is not JSON). [] means the read succeeded and no open marker is queued — a
+    different fact from None, which says nothing about the queue (ga-clexh7)."""
     # --include-infra é OBRIGATÓRIO (Mayor, 07/08): o bd 1.1.0 classifica bead
     # `--ephemeral` como INFRA e o OMITE de `bd list` por padrão. Markers de gate
     # nasciam ephemeral, então ESTE watchdog — cujo trabalho é justamente detectar
@@ -960,11 +1042,13 @@ def _queued_markers():
             "--status", "open,in_progress",  # ga-h199q
             "-l", "type:quality-gate-marker", "-l", "gate-status:queued", "--json"], timeout=25)
     if not r or r.returncode != 0:
-        return []
+        return None
     try:
         rows = json.loads(r.stdout)
     except Exception:
-        return []
+        return None
+    if rows is not None and not isinstance(rows, list):
+        return None   # a shape we do not know how to read is 'could not read', not 'none queued'
     out = []
     for row in rows or []:
         if row.get("status") not in ("open", "in_progress"):
@@ -4572,6 +4656,7 @@ def main():
   last_loop_spawn = 0
   last_orphan_spawn = 0
   hol_nonrepair_logged = {}  # ga-mlzqg4: branch -> epoch of the last log-only HOL line (rate limit)
+  hol_stale_skip_logged = {}  # ga-clexh7: branch -> epoch of the last 'repair skipped, branch left the queue' line
   orphan_logged = {}         # ga-b1iulk: marker id -> epoch of the last log-only orphan line (rate limit)
 
   print("[watchdog] gate+pilot watchdog started — governed repair-agent spawner "
@@ -4701,11 +4786,21 @@ def main():
             notify("Gate destravou — fila voltou a drenar (head-of-line resolvido).", 3)
             gov.reset_prefix("gate-loop:"); saw_loop = False
         if hb and not infra:
-            ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
-            lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
-                                  "Gate preso em branch stale (head-of-line)", branch=hb)
-            if lhow is not None:
-                last_loop_spawn = now; saw_loop = True
+            # ga-clexh7: hb comes from a LOG run, and a log run can outlive the condition it saw —
+            # confirm against the marker (the artifact) before paying for a repair dog.
+            if hol_repair_verdict(hol_branch_queue_state(hb)) != "repair":
+                if now - hol_stale_skip_logged.get(hb, 0) >= HEADOFLINE_NONREPAIR_LOG_EVERY_SEC:
+                    print("[watchdog] head-of-line repair SKIPPED (no dog spawned): the log still shows %d QUEUED-retry "
+                          "sweeps on %s, but no open gate-status:queued marker names it any more — it is no longer the "
+                          "re-picked head of the queue (its marker moved to another gate-status or closed), so the "
+                          "stale-branch runbook has nothing to act on (ga-clexh7)" % (hcount, hb), flush=True)
+                    hol_stale_skip_logged[hb] = now
+            else:
+                ldiag = snapshot("head-of-line block: %dx QUEUED-retry no branch %s" % (hcount, hb), 0)
+                lhow = governed_spawn(gov, sessions, now, "gate-loop", hb, ldiag, 0,
+                                      "Gate preso em branch stale (head-of-line)", branch=hb)
+                if lhow is not None:
+                    last_loop_spawn = now; saw_loop = True
 
         # --- HEAD-OF-LINE, non-conflict QUEUED endings (ga-mlzqg4): LOG ONLY. No
         #     snapshot(), no governed_spawn() — headofline_nonrepair() says why a repair
