@@ -47,6 +47,11 @@ for tool in dolt jq; do
 done
 [ -f "$REAPER_SH" ] || { echo "FAIL: script under test not found: $REAPER_SH"; exit 1; }
 
+# ga-d21b40: the script under test gets a PATH with NO real gc/bd on it (see the lib). Sourced from a
+# non-`*.selftest.sh` file so the gate's base-commit check cannot carry the fix onto the base with this file.
+_SANDBOX_LIB="$HERE/selftest-sandbox-path.lib.sh"
+. "$_SANDBOX_LIB" || { echo "FATAL: cannot load $_SANDBOX_LIB (ga-d21b40) — refusing to run the script under test on a PATH that can reach the real gc" >&2; exit 2; }
+
 T="$(mktemp -d "${TMPDIR:-/tmp}/reaper-selftest.XXXXXX")" || exit 1
 trap 'rm -rf "$T"' EXIT
 export DOLT_ROOT_PATH="$T/doltroot"; mkdir -p "$DOLT_ROOT_PATH"
@@ -57,6 +62,8 @@ CALLS="$T/calls.log"; : > "$CALLS"
 
 # ── the script under test + stubs, side by side (the script sources its siblings) ──
 SD="$T/scripts"; mkdir -p "$SD" "$T/bin"
+# The child's PATH: stub dir + links to the two harmless tools + system dirs. NO real gc/bd (ga-d21b40).
+sandbox_path_init "$T" dolt jq || { echo "FATAL: could not build the sandbox PATH (ga-d21b40)" >&2; exit 2; }
 cp "$REAPER_SH" "$SD/reaper.sh"
 cat > "$SD/_bd_trace.sh" <<'EOF'
 _BD_TRACE_CALLER="${1:-unknown}"
@@ -151,7 +158,7 @@ seed_main() {  # rows for R1/R5 (split schema)
 run_reaper() {  # run_reaper [ENV=val ...] ; sets OUT and RC
   local envs=("$@")
   # ${envs[@]+...}: macOS bash 3.2 treats an EMPTY array expansion as unbound under `set -u`.
-  OUT="$( cd "$T" && env GC_CITY_PATH="$CITY" GC_CITY="$CITY" PATH="$T/bin:$PATH" ${envs[@]+"${envs[@]}"} bash "$SD/reaper.sh" 2>"$T/stderr.log" )"; RC=$?
+  OUT="$( cd "$T" && env GC_CITY_PATH="$CITY" GC_CITY="$CITY" PATH="$SANDBOX_PATH" ${envs[@]+"${envs[@]}"} bash "$SD/reaper.sh" 2>"$T/stderr.log" )"; RC=$?
 }
 field() { printf '%s' "$OUT" | grep -o "$1:[0-9a-z]*" | head -1 | cut -d: -f2; }
 mail_count() { grep -c '^gc mail send' "$CALLS" || true; }
@@ -267,13 +274,13 @@ chmod +x "$T/bin_date/date"
 # top-of-function check also skips the candidate scan; that is not observable from here, the
 # assert below covers the outcome — the in-loop check alone would produce the same outcome.)
 new_db split; seed_main; : > "$CALLS"; rm -f "$T/date.n"
-run_reaper PATH="$T/bin_date:$T/bin:$PATH" DATE_SEQ="1000 2000" DATE_STATE="$T/date.n"
+run_reaper PATH="$T/bin_date:$SANDBOX_PATH" DATE_SEQ="1000 2000" DATE_STATE="$T/date.n"
 [ "$(field purged)" = "0" ] && [ "$(field purge_batches)" = "0" ] && [ "$(scalar "SELECT COUNT(*) FROM wisps")" = "13" ] \
   && ok "R8a a budget already spent purges nothing" || nok "R8a purged despite an exhausted budget" "$OUT"
 [ "$(field purge_capped_dbs)" = "1" ] && ok "R8a ...and the summary says work REMAINS (purge_capped_dbs:1)" || nok "R8a capped not reported" "$OUT"
 # R8b: the budget runs out AFTER the candidate scan, before the first chunk -> capped, nothing deleted.
 new_db split; seed_main; : > "$CALLS"; rm -f "$T/date.n"
-run_reaper PATH="$T/bin_date:$T/bin:$PATH" DATE_SEQ="1000 1100 1300" DATE_STATE="$T/date.n"
+run_reaper PATH="$T/bin_date:$SANDBOX_PATH" DATE_SEQ="1000 1100 1300" DATE_STATE="$T/date.n"
 [ "$(field purged)" = "0" ] && [ "$(field purge_batches)" = "0" ] && [ "$(scalar "SELECT COUNT(*) FROM wisps")" = "13" ] \
   && ok "R8b a budget spent mid-run stops before the first chunk" || nok "R8b purged despite an exhausted budget" "$OUT"
 [ "$(field purge_capped_dbs)" = "1" ] && ok "R8b ...and is reported as capped" || nok "R8b capped not reported" "$OUT"
