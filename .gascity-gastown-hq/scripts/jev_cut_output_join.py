@@ -24,8 +24,9 @@ The rate is a PROXY, not a bound in either direction, and it is wrong both ways:
     paraphrase, silent reliance, an error line shortened or reflowed) is invisible, overstating how
     safe a cut would have been -- the dangerous direction for a front deciding whether it is ever safe
     to go live. Only a verbatim id/path/sha/80-char error snippet counts.
-So a LOW rate is not evidence that cutting is safe; it is the number a human weighs together with what
-the report says it cannot see. Only the UP direction is "conservative"; do not read the whole proxy as such.
+So a LOW rate is not evidence that cutting is safe. jev_cut_output_report.py prints that caveat on the
+line right after the rate (full report) and inside the phone text, so the human weighing the number sees it.
+Only the UP direction is "conservative"; do not read the whole proxy as such.
 
 APPEND-ONLY, never mutates: jev-experiment.jsonl is a shared log written by many processes
 across the whole city. This script never rewrites an existing line (racy, and every other

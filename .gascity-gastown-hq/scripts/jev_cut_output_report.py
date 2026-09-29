@@ -221,6 +221,10 @@ def format_report(stats: dict) -> str:
             f"not referenced: {j['referenced_false']}, unknown: {j['referenced_unknown']} "
             f"(measured rate: {rate_str}; bead's own expected ceiling: ~8% of reread — compare, do not auto-decide)"
         )
+        lines.append(
+            "  The rate counts only signatures (bead id, path, sha, error-line snippet) a later turn quoted VERBATIM; a later turn "
+            "that acted on the cut content without quoting it is not seen, so a low rate does not show that cutting would lose nothing"
+        )
     if j["pending"]:
         lines.append(
             f"  {j['pending']} cut(s) not joined yet — their session may still be running (a False verdict is written "
@@ -277,7 +281,7 @@ def format_resumo_pt(stats: dict) -> str:
     return (
         f"Cortar-saída-grande (SOMBRA, nada é cortado de verdade ainda): {fixed} caso(s) via regra fixa{fixed_note}, "
         f"{jev} via Jev. Join offline: {decided} conferido(s){join_notes}, taxa de 'precisou depois' = {rate_str} "
-        f"(teto esperado do bead: ~8%).{extra}"
+        f"(só conta citação literal, taxa baixa não prova que cortar não perde nada; teto esperado do bead: ~8%).{extra}"
     )
 
 
@@ -550,6 +554,19 @@ def _selftest() -> int:
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)
     ok("format_report on empty stats doesn't crash and says no joined cases yet", "no joined cases yet" in format_report(empty_stats))
     ok("format_resumo_pt on empty stats doesn't crash", isinstance(format_resumo_pt(empty_stats), str))
+
+    # ---- the join's module docstring says a low rate does not show that cutting loses nothing (only a VERBATIM
+    # quote counts; a later turn that used the cut content without quoting it is invisible), and that the report
+    # says so. A promise in a comment is only worth what the printed report delivers, so the caveat is pinned
+    # where the rate is printed -- the full report and the phone text -- and only when there IS a rate to
+    # misread. (Worded without the word "safe": the report never states a verdict, see the test above.) ----
+    with_rate = compute_stats(records)
+    with_rate_text = format_report(with_rate)
+    ok("format_report: next to the rate it says only VERBATIM quotes count and a low rate does not show that cutting loses nothing",
+       "VERBATIM" in with_rate_text and "does not show" in with_rate_text)
+    ok("format_resumo_pt: the phone text says the rate counts only literal quotes ('citação literal')",
+       "citação literal" in format_resumo_pt(with_rate))
+    ok("format_report: no caveat when there is no joined case to misread yet", "VERBATIM" not in format_report(compute_stats([])))
 
     # ---- gate_run ga-q6bac0, low finding: a log that cannot be READ is not a log with no rows. read_jsonl() returns
     # [] for both, so an unreadable log printed "0 case(s)" and "Hook errors: none logged" -- the words of a quiet
