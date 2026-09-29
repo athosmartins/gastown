@@ -626,7 +626,7 @@ mk_promote_scenario
 : > "$LOG"; : > "$DOLT_CALLS"; : > "$NOTIFY_CALLS_FILE_PROMOTE"
 FAKE_LIVE_KB=$LIVE_KB_0929 FAKE_DF_FREE_KB=$FREE_KB_0929 FAKE_LIVE_COUNT=50 FAKE_RESTORED_COUNT=50 \
   FAKE_DOLT_CALLS="$DOLT_CALLS" _run_promote
-[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ok "scenario P5 (29/09 05:25 numbers): hq.new LEFT IN PLACE, hq not created" || bad "scenario P5: the restore would leave ~7.7GB free (< 8GB floor + 2GB swap) — hq.new must not be promoted"
+[ ! -e "$PRIMARY_ROOT/hq" ] && [ -d "$PRIMARY_ROOT/hq.new" ] && ok "scenario P5 (29/09 05:25 numbers): hq.new LEFT IN PLACE, hq not created" || bad "scenario P5: the restore would leave ~7.7GB free (< 8GB floor + 4GB swap reserve) — hq.new must not be promoted"
 grep -qF "backup restore" "$DOLT_CALLS" && bad "scenario P5: a restore was ATTEMPTED — the whole point is that the ~9GB restore never starts" || ok "scenario P5: NO restore attempted (the disk never gets the ~9GB hit)"
 grep -qF "adiado por disco" "$LOG" && ok "scenario P5: logged 'adiado por disco'" || bad "scenario P5: missing the 'adiado por disco' log line"
 grep -qF "SEM BACKUP LOCAL" "$LOG" && bad "scenario P5: a deferral is not a failed restore — must not claim 'SEM BACKUP LOCAL'" || ok "scenario P5: deferral not dressed up as a restore failure"
@@ -1361,7 +1361,7 @@ run_cli() {   # <root> <args...> — like run_scenario, but the caller picks the
   RC=$?
 }
 
-# Scenario 16: roomy disk (~20GB fake: 5MB restore + 10240MB reserve fits) → the
+# Scenario 16: roomy disk (~20GB fake: 5MB restore + 12288MB reserve fits) → the
 # standalone promotion verifies hq.new and promotes it to hq.
 ROOT16="/tmp/reseed-selftest-s16.$$"
 setup_scenario "$ROOT16" 5 5 20000
