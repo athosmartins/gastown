@@ -27,16 +27,20 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -f "$CITY_TOML" ] || { echo "FATAL: city.toml not found at $CITY_TOML"; exit 1; }
 [ -d "$AGENTS_DIR" ] || { echo "FATAL: agents dir not found at $AGENTS_DIR"; exit 1; }
 
-echo "── 1+2. every claude-rc crew runs effort = medium ──"
+# ga-ufskhy E2 (Athos 29/09 ~20:55): crews em "high" por 48h pra medir a aprovação no gate (37%
+# em "medium" desde 28/09). Ao fim do teste, ou volta tudo pra "medium" (reverter este bloco junto),
+# ou o Athos decide manter "high". A linha do agent.toml carrega o comentário do experimento.
+EXPECTED_EFFORT="high"
+echo "── 1+2. every claude-rc crew runs effort = $EXPECTED_EFFORT ──"
 n=0
 for f in "$AGENTS_DIR"/*/agent.toml; do
   grep -q '^provider = "claude-rc"$' "$f" || continue
   n=$((n+1))
   crew="$(basename "$(dirname "$f")")"
-  if grep -q '^option_defaults = { effort = "medium" }$' "$f"; then
-    ok "$crew: effort = medium"
+  if grep -q "^option_defaults = { effort = \"$EXPECTED_EFFORT\" }" "$f"; then
+    ok "$crew: effort = $EXPECTED_EFFORT"
   else
-    bad "$crew: effort is not medium ($(grep '^option_defaults' "$f" || echo 'no option_defaults — builtin default is max'))"
+    bad "$crew: effort is not $EXPECTED_EFFORT ($(grep '^option_defaults' "$f" || echo 'no option_defaults — builtin default is max'))"
   fi
   if grep -E '^option_defaults.*model' "$f" >/dev/null; then
     bad "$crew: sets option_defaults.model — the engine maps 'opus' to claude-opus-4-8 (a downgrade)"

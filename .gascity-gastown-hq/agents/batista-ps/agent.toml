@@ -3,6 +3,6 @@ min_active_sessions = 0
 work_dir = "/Users/athos/gt/property_scrapers/crew/batista"
 provider = "claude-rc"
 
-option_defaults = { effort = "medium" }
+option_defaults = { effort = "high" }  # ga-ufskhy E2: teste 48h (Athos 29/09 20:5x), voltar a "medium" se não subir a aprovação
 
 suspended = true
