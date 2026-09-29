@@ -579,10 +579,20 @@ STUCK_INFLIGHT_RE = re.compile(r"still in flight \((\d+)/\d+ verdicts, (\d+)s/\d
 # "Phase C: gate-run <id> (branch=<b>) still in flight (...)" is the ONLY emission site
 # (quality-gate-dispatcher.sh:~10579) and always carries this prefix on the same line.
 STUCK_RUN_ID_RE = re.compile(r"gate-run (\S+) \(branch=")
+# ga-hqrnmu: the branch of that same in-flight line, so the REPAIR bead can NAME what is stuck
+# (all six beads the Mayor had to close by hand cited only ga-rwpwz8 — none said which run).
+STUCK_BRANCH_RE = re.compile(r"gate-run \S+ \(branch=([^)\s]+)\)")
 
 
 def stuck_dispatching():
-    """True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
+    """Bool view of stuck_dispatching_detail() — kept for every caller/selftest that only needs the verdict."""
+    return stuck_dispatching_detail()[0]
+
+
+def stuck_dispatching_detail():
+    """(stuck, run_id, branch) — run_id/branch are None when not stuck or not parseable (ga-hqrnmu).
+
+    True only if the dispatcher is ACTIVELY polling a run that is stuck: the most
     recent dispatcher-log line is a Phase C 'still in flight (0/N verdicts, Ys/Ts)' with
     Y past DISPATCH_STUCK_SEC, the log is fresh (dispatcher still polling, not moved on /
     between runs), no gate-reviewer session is active, AND the run has no DELIVERED
@@ -615,35 +625,38 @@ def stuck_dispatching():
     only ever suppress an alarm, never manufacture one the old code wouldn't already give."""
     try:
         if time.time() - os.path.getmtime(DISPATCH_LOG) > 120:
-            return False  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
+            return (False, None, None)  # dispatcher not actively writing → between runs (ENGINE-STALL covers dead)
         lines = _read_log_last_lines(DISPATCH_LOG, 15)      # ga-b1iulk: tolerant of non-UTF-8 bytes
     except Exception:
-        return False
+        return (False, None, None)
     vm = None
     run_id = None
+    branch = None
     for l in reversed(lines):
         if "sweep complete" in l:   # the most recent run already concluded → not stuck
-            return False
+            return (False, None, None)
         mm = STUCK_INFLIGHT_RE.search(l)
         if mm:
             vm = mm
             rm = STUCK_RUN_ID_RE.search(l)
             run_id = rm.group(1) if rm else None
+            bm = STUCK_BRANCH_RE.search(l)
+            branch = bm.group(1) if bm else None
             break
     if not vm:
-        return False
+        return (False, None, None)
     got, elapsed = int(vm.group(1)), int(vm.group(2))
     if not (got == 0 and elapsed > DISPATCH_STUCK_SEC):
-        return False
+        return (False, None, None)
     # corroborate #1: reviewers spawned for this run are NOT active (dead/start-pending)
     rs = sh(["gc", "session", "list", "--json"])
     try:
         sessions = json.loads(rs.stdout).get("sessions", []) if rs else []
     except Exception:
-        return False
+        return (False, None, None)
     active = [s for s in sessions if s.get("template") == "gate-reviewer" and s.get("state") == "active"]
     if active:
-        return False
+        return (False, None, None)
     # corroborate #2 (ga-rzd08j): a reviewer already DELIVERED (closed verdict bead) for
     # THIS run — not a spawn failure, just an un-harvested verdict. Any failure resolving
     # this (no run_id parsed, bd/Dolt unreachable) falls through to the pre-existing
@@ -654,8 +667,8 @@ def stuck_dispatching():
         except Exception:
             delivered = -1
         if delivered > 0:
-            return False
-    return True
+            return (False, None, None)
+    return (True, run_id, branch)
 
 
 def gate_infra_throttled():
@@ -1769,6 +1782,12 @@ def repair_runbook(reason, diag_path, dolt_hits, kind="gate"):
     ) % (reason, DOLT_INSTABILITY_WINDOW_SEC // 60, dolt_hits, DOLT_INSTABILITY_MIN_HITS, diag_path, DISPATCH_LOG)
 
 
+# ga-hqrnmu: label that marks a bead as a watchdog ALARM RECORD nobody owns (no assignee, no
+# gc.routed_to, pilot:no-auto-dispatch) — the ONLY beads close_recovered_repair_audit_beads()
+# ever closes. A bead a dog/Mayor owns (assignee set) or that carries no such label is never touched.
+REPAIR_AUDIT_LABEL = "gate-watchdog:repair-audit"
+
+
 def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
     """ga-rwpwz8: durable audit record for a gate-down alarm with NO positive Dolt
     evidence. Created WITHOUT --assignee (so it never carries gc.routed_to) and
@@ -1776,9 +1795,24 @@ def _create_unrouted_audit_bead(title, reason, diag_path, dolt_hits, kind):
     the Pilot can pick it up — only the Mayor, woken separately, is meant to act
     on it. Best-effort and guarded like every other bd call in this file: returns
     the new bead id, or None if creation failed (the Mayor wake still fires
-    either way, it just won't have a bead id to point at)."""
-    body = REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
-    cr = sh(["bd", "-C", CITY, "create", title, "-t", "task", "--stdin", "--json"],
+    either way, it just won't have a bead id to point at).
+
+    ga-hqrnmu: it ALSO carries REPAIR_AUDIT_LABEL and opens with what is stuck (`reason`
+    already names the run + branch) and how it closes. Without both, a transient stall
+    (spawn after boot, a load spike — the normal outcome) became a permanent card in the
+    Mayor's Travadas column that said nothing about WHICH run: six piled up 26-29/09 while
+    the gate was already flowing, and the Mayor closed them by hand."""
+    body = (
+        "O QUE TRAVOU: %s\n"
+        "Esta bead é só o REGISTRO do alarme (sem dog, sem rota). O watchdog a FECHA sozinho assim que "
+        "o gate produzir um veredito real (Gate PASSED, ou FAIL de revisor) DEPOIS da criação dela — "
+        "então, se ela ainda está aberta, o gate NÃO voltou a produzir vereditos e ela pede o seu olhar "
+        "(ga-hqrnmu).\n\n" % reason
+    ) + REPAIR_HEADER + repair_runbook(reason, diag_path, dolt_hits, kind)
+    # REPAIR_AUDIT_LABEL rides on the create (atomic) — the sweep finds the bead by it; the
+    # pilot:no-auto-dispatch veto keeps its own follow-up label call, unchanged from ga-rwpwz8.
+    cr = sh(["bd", "-C", CITY, "create", title, "-t", "task", "--stdin", "--json",
+             "-l", REPAIR_AUDIT_LABEL],
             stdin=body, timeout=45)
     if not cr or cr.returncode != 0:
         return None
@@ -4642,6 +4676,153 @@ def recover_needs_rebase_markers(now, rstate):
         print("[watchdog] needs-rebase sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX 10 (ga-hqrnmu): close a REPAIR audit bead once the gate has recovered on its own.
+#
+# WHY: with no positive Dolt signal, spawn_repair_agent() files an UNROUTED audit bead
+# for the Mayor (ga-rwpwz8 — correct: no destructive runbook goes to an unsupervised dog).
+# Nothing ever closed it, and the normal outcome of these alarms is a transient stall that
+# clears by itself (a reviewer spawn after boot, a load spike). Measured 29/09: six such
+# beads sat in Travadas (26/09 21:53 … 29/09 07:05) while the gate was flowing — at 07:28
+# it PASSed ga-7vmcr1 with 2 reviewers. The Mayor closed all six by hand.
+#
+# THE RULE is a three-state read, never a two-state one — "I found no verdict" and "I could
+# not read the log" must not both look like "nothing happened", and neither may look like
+# "resolved":
+#   verdict AFTER the bead's created_at  -> close, with the verdict quoted as evidence
+#   read OK, no verdict after created_at -> leave open (the gate has NOT recovered)
+#   log unreadable / created_at unparsable -> leave open (cannot know — inert state)
+#
+# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` line, or a `Gate FAILED: Reviewer N FAIL:` line
+# (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is NOT one — it is the very failure
+# these alarms report (recent_timeouts() counts it as the gate-down signal), so closing on it
+# would close the alarm BECAUSE of the fault. Merge failures / source-parked / preflight aborts
+# are not reviewer verdicts either; leaving those out only ever keeps a bead open.
+#
+# SCOPE: only beads labelled REPAIR_AUDIT_LABEL with NO assignee — the unrouted alarm records.
+# A bead a dog or the Mayor owns is never touched. Beads a dog was actually spawned for
+# (direct-spawn / sling) are closed by that dog per REPAIR_HEADER, not here.
+# ═══════════════════════════════════════════════════════════════════════════════
+GRW_CLOSE_REPAIR_AUDIT_ENABLED = os.environ.get("GRW_CLOSE_REPAIR_AUDIT_ENABLED", "1") != "0"
+REPAIR_AUDIT_MAX_PER_SWEEP = int(os.environ.get("GRW_REPAIR_AUDIT_MAX_PER_SWEEP", "10"))
+GATE_VERDICT_LINE_RE = re.compile(r"\[quality-gate-dispatcher\] Gate (PASSED|FAILED): (.*)$")
+GATE_REVIEWER_FAIL_RE = re.compile(r"Reviewer \d+ FAIL:")
+
+
+def _gate_verdicts_in(lines):
+    """PURE. [(epoch, line_text)] for every REAL gate verdict in dispatcher-log `lines`
+    (see the FIX 10 block above for what counts). A line whose timestamp does not parse is
+    skipped — an undatable verdict can prove nothing about being AFTER anything."""
+    out = []
+    for l in lines:
+        m = GATE_VERDICT_LINE_RE.search(l)
+        if not m:
+            continue
+        if m.group(1) == "FAILED" and not GATE_REVIEWER_FAIL_RE.match(m.group(2)):
+            continue   # TIMEOUT / merge failure / parked source / preflight abort — not a reviewer verdict
+        e = log_ts_epoch(l)
+        if e is None:
+            continue
+        out.append((e, l.strip()))
+    return out
+
+
+def _read_gate_verdicts():
+    """[(epoch, line)] of the real verdicts in the dispatcher-log tail, or None when the log
+    could not be read (None is NOT an empty list: 'unreadable' must never read as 'no verdicts')."""
+    try:
+        return _gate_verdicts_in(_read_log_tail_lines(DISPATCH_LOG, HEADOFLINE_TAIL_BYTES))
+    except Exception:
+        return None
+
+
+def repair_audit_verdict(created_epoch, verdicts):
+    """PURE decision for one REPAIR audit bead → (action, evidence).
+      ("close", (epoch, line))  a real verdict landed strictly AFTER the bead's creation;
+                                evidence is the EARLIEST such verdict in the window
+      ("keep:no-verdict", None) log read fine, nothing after created_at — gate not recovered
+      ("keep:unreadable", None) verdicts is None — the log could not be read
+      ("keep:unknown-age", None) created_epoch is None — cannot order verdicts against it"""
+    if created_epoch is None:
+        return ("keep:unknown-age", None)
+    if verdicts is None:
+        return ("keep:unreadable", None)
+    after = [v for v in verdicts if v[0] > created_epoch]
+    if not after:
+        return ("keep:no-verdict", None)
+    return ("close", min(after))
+
+
+def _open_repair_audit_beads():
+    """[bead dicts] open + REPAIR_AUDIT_LABEL, or None on query failure (fail-safe skip).
+    --limit 0: a sweep must not silently stop at bd's default 50 (ga-21kmp)."""
+    r = sh(["bash", BD_LIST_CACHED, "-C", CITY, "list", "-l", REPAIR_AUDIT_LABEL,
+            "--status", "open", "--limit", "0", "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout)
+    except Exception:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def close_recovered_repair_audit_beads(now):
+    """FIX 10 (ga-hqrnmu): close every unowned REPAIR audit bead the gate has since recovered
+    from (repair_audit_verdict), quoting the verdict. Bounded per sweep, dry-run aware, fully
+    fail-safe — every uncertain read leaves the bead OPEN. Reads the log only when at least one
+    such bead is open, so a healthy town pays one bd query per sweep and nothing else."""
+    if not GRW_ENABLED or not GRW_CLOSE_REPAIR_AUDIT_ENABLED:
+        return
+    beads = _open_repair_audit_beads()
+    if beads is None:
+        print("[watchdog] repair-audit: bead query unavailable — fail-safe skip", flush=True)
+        return
+    beads = [b for b in beads if b.get("id") and not (b.get("assignee") or "").strip()]
+    if not beads:
+        return
+    verdicts = _read_gate_verdicts()
+    if verdicts is None:
+        print("[watchdog] repair-audit: dispatcher log unreadable — %d bead(s) left open (cannot tell)"
+              % len(beads), flush=True)
+        return
+    beads.sort(key=lambda b: _iso_epoch(b.get("created_at")) or 0.0)
+    acted = 0
+    unverifiable = []
+    for b in beads:
+        if acted >= REPAIR_AUDIT_MAX_PER_SWEEP:
+            break
+        bid = b["id"]
+        action, ev = repair_audit_verdict(_iso_epoch(b.get("created_at")), verdicts)
+        if action == "keep:unknown-age":
+            unverifiable.append(bid)   # an anomaly (bd always stamps created_at), unlike keep:no-verdict — say so
+        if action != "close":
+            continue
+        v_epoch, v_line = ev
+        reason = ("grw FIX10 (ga-hqrnmu): o gate recuperou sozinho — veredito às %s (dispatcher log), "
+                  "posterior à criação desta bead (%s): %s. Fechada pelo watchdog; reabra se o gate voltar a parar."
+                  % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(v_epoch)), b.get("created_at"), v_line[:200]))
+        if GRW_DRY_RUN:
+            print("[watchdog] repair-audit DRY-RUN would CLOSE %s (%s)" % (bid, v_line[:120]), flush=True)
+            _recovery_ledger("would_close_recovered_repair_audit",
+                             {"bead": bid, "created_at": b.get("created_at"), "verdict": v_line[:200], "dry_run": True})
+            acted += 1
+            continue
+        r = sh(["bd", "-C", CITY, "close", bid, "-r", reason], timeout=25)
+        if not (r and r.returncode == 0):
+            print("[watchdog] repair-audit: bd close %s FAILED — left open, will retry next sweep" % bid, flush=True)
+            continue
+        _recovery_ledger("closed_recovered_repair_audit",
+                         {"bead": bid, "created_at": b.get("created_at"), "verdict": v_line[:200]})
+        print("[watchdog] CLOSED recovered REPAIR audit bead %s (verdict: %s)" % (bid, v_line[:120]), flush=True)
+        acted += 1
+    if unverifiable:
+        print("[watchdog] repair-audit: %d bead(s) left open — created_at unparsable, cannot order verdicts against it: %s"
+              % (len(unverifiable), ", ".join(unverifiable)), flush=True)
+    if acted:
+        print("[watchdog] repair-audit sweep: %d bead(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
+
+
 def main():
   # ---- state ----
   gov = Governor()       # dedup + concurrent cap + per-condition cooldown/back-off
@@ -4738,6 +4919,10 @@ def main():
             recover_needs_rebase_markers(now, rstate)
         except Exception as e:
             print("[watchdog] recover_needs_rebase_markers error (continuing): %r" % e, flush=True)
+        try:
+            close_recovered_repair_audit_beads(now)
+        except Exception as e:
+            print("[watchdog] close_recovered_repair_audit_beads error (continuing): %r" % e, flush=True)
 
         # ga-htjni follow-up (dog investigation 2026-06-15): if the gate is
         # ALIVE-but-infra-throttled (Dolt-hot or quota DEFER), a repair dog cannot
@@ -4752,7 +4937,7 @@ def main():
 
         # ===== gate down: 2+ timeouts OR a marker stuck dispatching w/ no reviewers =====
         n_to, last_to = recent_timeouts()
-        stuck = stuck_dispatching()
+        stuck, stuck_run, stuck_branch = stuck_dispatching_detail()
         problem = ((n_to >= 2) or stuck) and not infra
         if saw_gate and lp and lp > last_gate_spawn:
             print("[watchdog] gate recovered (Gate PASSED after repair dispatch) — resetting", flush=True)
@@ -4761,6 +4946,10 @@ def main():
         if problem:
             reason = ("%d timeouts em %dmin" % (n_to, TIMEOUT_WINDOW_SEC // 60)) if n_to >= 2 \
                      else "marcador dispatching travado sem revisores ativos"
+            if stuck and (stuck_run or stuck_branch):
+                # ga-hqrnmu: name WHAT is stuck — in the title too, or every REPAIR card reads the same.
+                # Keeps "marcador ... travado" (cond_for's dedup tokens + REPAIR_DOG_TITLE_RE match on it).
+                reason += " (run %s, branch %s)" % (stuck_run or "?", stuck_branch or "?")
             dolt_hits = dolt_instability()
             diag = snapshot(reason, dolt_hits)
             how = governed_spawn(gov, sessions, now, "gate", reason, diag, dolt_hits, "Gate travou")
