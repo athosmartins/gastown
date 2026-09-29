@@ -3,18 +3,22 @@
 cut-large-output SHADOW front: pure, no-I/O, no-network classification of a Bash command's
 output into one of these shapes:
 
-  1. "pytest": a pytest run whose last session reached its final summary banner. Kept = the
-     FAILURES section (first failure header up to the short-summary section, or up to the banner)
-     + the banner line (or, if nothing failed, just the banner). When the banner says failed/error
-     but there is no FAILURES section (`--tb=no`), kept = the short-summary section + the banner.
-     Everything else (setup noise, collection, PASSED lines) is the omitted part.
+  1. "pytest": a pytest run whose last session reached its final summary banner. The rule only
+     judges that session's own block (last "test session starts" header to its first banner) and keeps
+     EVERYTHING outside it (an earlier run, a build step before it, `echo rc=$?` or stderr after the
+     banner). Inside the block, kept = the FAILURES section and/or the short test summary, up to the
+     banner (nothing failed -> nothing kept but the banner). Only setup noise, collection and PASSED
+     lines inside the block are the omitted part.
   2. "log-tail": a generic long/log-shaped dump. Kept = head N + tail N + every line that looks
      like an error/exception/traceback signal, in original order. Everything else is omitted.
   3. "unknown": recognizably pytest, but not in a shape the rule can cut safely (killed/truncated
      mid-run, no final banner after the last session; or a banner that says failed/error while
      nothing in the output lists what failed). Nothing is omitted, everything is kept --
      the shadow log records it as unknown, distinct from both "cut" and "nothing to cut".
-  4. None ("unstructured"): output is large but does not match any fixed shape above. The
+  4. "no-gain": a shape a rule recognized, but cutting it would not make the output shorter (every
+     omitted run costs a "[N lines omitted]" marker). Nothing is omitted; a live rule would leave it
+     alone. Its own state, so it is neither a phantom "0-token cut" nor an error.
+  5. None ("unstructured"): output is large but does not match any fixed shape above. The
      caller (cut-output-shadow.py) is the one that decides what to do with an unstructured
      block (ask Jev), never this module — this module answers ONLY "does a fixed, no-AI rule
      apply here, and if so what would it keep".
@@ -59,6 +63,18 @@ CHARS_PER_TOKEN = 2.2  # packs/town-deltas/assets/claude-overlays/pool-roles.jso
 # negative-savings lines in the daily report (gate_run ga-75ya0i). Every sibling front has its own mode.
 RECORD_MODE = "cut-output"
 JOIN_MODE = "cut-output-join"
+# A row that says "a large-output call was NOT measured, and why" (cut-output-shadow.py's engine and
+# cut-output-shadow.sh's wrapper both write them). Without it a hook that dies on every call reads in the
+# report exactly like a quiet day: "0 cases". Same mode as the measurement rows, its own experiment name.
+ERROR_EXPERIMENT = "cut-output-error"
+
+# The two hook events that carry a Bash call's output. PostToolUse fires only for a call that SUCCEEDED
+# (exit 0) and carries tool_response.{stdout,stderr}; a call that exits non-zero fires PostToolUseFailure
+# INSTEAD, with no tool_response and the whole merged output in `error` as "Exit code N\n<output>". Verified
+# live on Claude Code 2.1.284 (gate_run ga-vrv1tz): registering only PostToolUse measured only the commands
+# that worked, so any rate said nothing about the failed-command half (where a cut is most plausibly costly).
+EVENT_SUCCESS = "PostToolUse"
+EVENT_FAILURE = "PostToolUseFailure"
 
 # Below this many characters, cutting is not worth the risk of losing something the agent
 # needed — the fixed-rule and Jev paths are both skipped by the caller. Kept here (not just in
@@ -107,6 +123,27 @@ _PYTEST_SHORT_SUMMARY_RE = re.compile(r"short test summary info", re.IGNORECASE)
 # The banner's own outcome words that mean "look at what failed": "2 failed", "1 error", "3 errors".
 # \b keeps "xfailed" (an expected failure) from counting -- x and f are both word characters.
 _PYTEST_BANNER_FAILURE_RE = re.compile(r"\b(?:failed|errors?)\b", re.IGNORECASE)
+
+
+# The header Claude Code puts in front of a failed Bash call's output. ONE newline belongs to it; a blank
+# first line of the output itself survives. Anchored at the very start: the same words further down are output.
+# At most 4 digits: real codes are 0-255 (or a small negative). An unbounded \d+ handed int() a 5000-digit string
+# from an error that merely STARTS with "Exit code 9999..." and int() refuses that (Python's digit limit) -- a
+# "never raises" helper that raised. cut-output-shadow.sh's jq prefilter uses the same bound, so both agree.
+_EXIT_CODE_HEADER_RE = re.compile(r"\AExit code (-?\d{1,4})(?:\n|\Z)")
+
+
+def strip_exit_code_header(error: str) -> tuple[int | None, str]:
+    """Pure. `error` is a PostToolUseFailure payload's `error` string. Returns (exit_code, output): the code
+    and the output with the header removed, or (None, error) when the text does not start with the header.
+    None means "the payload did not say", never 0 -- a timeout or an interrupted call carries no exit code,
+    and not knowing it must not read as "exited 0". Never raises."""
+    if not isinstance(error, str):
+        return None, ""
+    m = _EXIT_CODE_HEADER_RE.match(error)
+    if not m:
+        return None, error
+    return int(m.group(1)), error[m.end():]
 
 
 def estimate_tokens(text: str) -> int:
@@ -181,6 +218,14 @@ def _verdict_from_kept_lines(rule: str, text: str, lines: list[str], offsets: li
         "lines_omitted": total - lines_kept,
     }
     verdict.update(extra)
+    if rule not in ("unknown", "no-gain") and len(rendered_text) >= len(text):
+        # A rule that would hand back as much text as it was given, or MORE, is not a cut: every omitted run
+        # costs a "[N lines omitted; run with RAW=1]" marker, and on a log of alternating error/ok lines each
+        # marker is longer than the one short line it replaces. A live rule would leave that output alone, so
+        # the verdict says exactly that -- everything kept, nothing omitted (so the join has nothing to look
+        # for), its own rule name, and 0 saved tokens that are TRUE rather than a max(0, negative) clamp.
+        # (gate_run ga-vrv1tz: such cases were logged as "0-token cuts" and their omitted lines sent to the join.)
+        return _verdict_from_kept_lines("no-gain", text, lines, offsets, set(range(total)), reason=f"{rule}-would-not-shrink")
     return verdict
 
 
@@ -196,59 +241,62 @@ def _unknown_verdict(text: str, reason: str) -> dict:
 
 def classify_pytest(text: str) -> dict | None:
     """None if `text` is not recognizably a pytest run (no "test session starts" line). Otherwise
-    a verdict dict from _verdict_from_kept_lines():
+    a verdict dict from _verdict_from_kept_lines().
 
-      * rule "pytest" when the LAST pytest session in `text` ran to its final summary banner
-        (pytest's own "=== ... in X.XXs ===" line, matched by shape, never assumed to be the last
-        line of `text`). Kept = that banner line + every line from the first FAILURES header of
-        that session up to (not including) its "short test summary info" header, or up to the
-        banner when there is no such section. Nothing failed -> kept is just the banner. The
-        banner says failed/error but there is NO FAILURES section (`--tb=no`) -> kept is the
-        short-summary section (pytest's compact failure list) + the banner.
-      * rule "unknown" (keep everything, omit nothing) when the last session has NO final banner
-        after it -- output killed/truncated mid-run, or a banner that belongs to an earlier,
-        already-finished run -- or when the banner says failed/error and there is no failure
-        listing of any kind. There is nothing to anchor on / no way to know what failed, so the
-        rule does not cut."""
+    The rule understands ONE thing: a pytest session block, from the LAST "test session starts" header to the
+    FIRST final-summary banner after it (pytest's own "=== ... in X.XXs ===" line, matched by shape, never
+    assumed to be the last line of `text`). It may cut lines INSIDE that block and nothing else: every line
+    before the header (an earlier pytest run, a build step) and every line from the banner on (the banner
+    itself, `echo rc=$?`, stderr appended by the caller) is kept, because the rule did not recognize it.
+    The FIRST banner, not the last: a banner-shaped line printed after the real one by some later command
+    must not become "the summary" and pull the real one into the cut region.
+
+    Inside the block: kept = everything from the first FAILURES header (or, with no FAILURES section, the
+    "short test summary info" header) up to the banner -- the tracebacks AND pytest's own compact failure
+    list. Omitted = the setup/collection noise and the routine PASSED lines before that point. The banner
+    says failed/error but nothing in the block lists what failed (`-rN --tb=no`) -> we do not know what
+    failed, so the rule does not cut (rule "unknown").
+
+      * rule "pytest": the block above was cut (something inside it omitted).
+      * rule "unknown" (keep everything, omit nothing): the last session has NO banner after it -- output
+        killed/truncated mid-run, or a banner that belongs to an earlier, already-finished run -- or the
+        banner says failed/error with no failure listing of any kind. Nothing to anchor on, so no cut.
+      * rule "no-gain" (from _verdict_from_kept_lines): the cut would not have made the output shorter."""
     if not text:
         return None
     lines, offsets = _split_lines(text)
 
     session_idx = None
-    banner_idx = None
     for i, ln in enumerate(lines):
         if _PYTEST_SESSION_RE.search(ln):
             session_idx = i
-        if _PYTEST_FINAL_SUMMARY_RE.match(ln):
-            banner_idx = i
     if session_idx is None:
         return None
-    if banner_idx is None or banner_idx <= session_idx:
+    banner_idx = next(
+        (i for i in range(session_idx + 1, len(lines)) if _PYTEST_FINAL_SUMMARY_RE.match(lines[i])),
+        None,
+    )
+    if banner_idx is None:
         return _unknown_verdict(text, "pytest-no-final-summary")
 
-    kept_idx: set[int] = {banner_idx}
+    # Everything outside [session_idx, banner_idx) is kept: before the header, and the banner onwards.
+    kept_idx: set[int] = set(range(0, session_idx)) | set(range(banner_idx, len(lines)))
     failure_idx = next(
         (i for i in range(session_idx + 1, banner_idx) if _PYTEST_FAILURES_HEADER_RE.match(lines[i])),
         None,
     )
-    if failure_idx is not None:
-        body_end = next(
-            (i for i in range(failure_idx + 1, banner_idx) if _PYTEST_SHORT_SUMMARY_RE.search(lines[i])),
-            banner_idx,
-        )
-        kept_idx.update(range(failure_idx, body_end))
+    short_idx = next(
+        (i for i in range(session_idx + 1, banner_idx) if _PYTEST_SHORT_SUMMARY_RE.search(lines[i])),
+        None,
+    )
+    listing_start = failure_idx if failure_idx is not None else short_idx
+    if listing_start is not None:
+        kept_idx.update(range(listing_start, banner_idx))
     elif _PYTEST_BANNER_FAILURE_RE.search(lines[banner_idx]):
-        # The banner says something failed/errored, yet there is no FAILURES section (`--tb=no`, or a
-        # collection error reported only in the short summary). "No FAILURES header" is NOT "nothing
-        # failed": keep pytest's own compact failure list; and if there is not even that, we do not know
-        # what failed, so we do not cut (rule "unknown") instead of keeping a banner that hides it.
-        short_idx = next(
-            (i for i in range(session_idx + 1, banner_idx) if _PYTEST_SHORT_SUMMARY_RE.search(lines[i])),
-            None,
-        )
-        if short_idx is None:
-            return _unknown_verdict(text, "pytest-failed-no-failure-listing")
-        kept_idx.update(range(short_idx, banner_idx))
+        # The banner says something failed/errored, yet the block has no FAILURES section and no short
+        # summary either. "No FAILURES header" is NOT "nothing failed": we do not know what failed, so we do
+        # not cut (rule "unknown") instead of keeping a banner that hides it.
+        return _unknown_verdict(text, "pytest-failed-no-failure-listing")
     return _verdict_from_kept_lines("pytest", text, lines, offsets, kept_idx)
 
 
@@ -695,8 +743,10 @@ def _selftest() -> int:
     ok("failures + no short-summary + trailing stderr -> a pytest verdict", r_no_short is not None and r_no_short["rule"] == "pytest")
     if r_no_short and r_no_short["rule"] == "pytest":
         ok("banner is kept exactly once (body span does not swallow it)", r_no_short["kept_text"].count("1 failed, 150 passed") == 1)
-        ok("trailing stderr after the banner is omitted, not smuggled into the failure body",
-           "StderrNoise" not in r_no_short["kept_text"] and "StderrNoise" in r_no_short["omitted_text"])
+        # what follows pytest's own banner is not pytest output: the rule does not recognize it, so it keeps it
+        # (it used to omit it -- gate_run ga-vrv1tz, medium finding)
+        ok("trailing stderr after the banner is KEPT (not pytest output, not the rule's to judge) and kept exactly once",
+           r_no_short["kept_text"].count("StderrNoise") == 1 and "StderrNoise" not in r_no_short["omitted_text"])
 
     # ---- real captured pytest output ----
     r_real = classify_pytest(real_pytest_fail)
@@ -774,6 +824,80 @@ def _selftest() -> int:
     ok("a pytest header whose '=' padding was stripped by a wrapper is still recognized",
        r_stripped is not None and r_stripped["rule"] == "pytest" and "200 passed" in r_stripped["kept_text"])
 
+    # ---- gate_run ga-vrv1tz, medium finding: the pytest rule judged the WHOLE output but only understands ONE
+    # pytest session. Everything outside the block it recognized -- an earlier run's failures, text before the
+    # session header, and whatever follows the banner (`echo rc=$?`, stderr) -- was silently omitted, and a
+    # banner-SHAPED line printed after the real one ("=== build finished in 5s ===") replaced the real summary
+    # (the LAST banner-shaped line won). The rule now claims only [last session header, that session's FIRST
+    # banner) and keeps every other line: the one thing it may cut is what it positively recognized. ----
+    r_two = classify_pytest(pytest_fail + pytest_pass)
+    ok("two pytest runs (failing, then passing) -> a pytest verdict", r_two is not None and r_two["rule"] == "pytest")
+    if r_two and r_two["rule"] == "pytest":
+        ok("two runs: the EARLIER run's failure and summary are kept (the rule only judges the last session)",
+           "test_thing_broken" in r_two["kept_text"] and "1 failed, 150 passed" in r_two["kept_text"])
+        ok("two runs: the last run's summary is kept", "200 passed" in r_two["kept_text"])
+        ok("two runs: the last run's routine PASSED lines are still cut", "test_mod.py::test_199 PASSED" in r_two["omitted_text"])
+        ok("two runs: nothing of the earlier run is in omitted_text",
+           "test_thing_broken" not in r_two["omitted_text"] and "150 passed" not in r_two["omitted_text"])
+    r_rc = classify_pytest(pytest_fail + "rc=1\n")
+    ok("`pytest; echo rc=$?`: the exit-code line after the banner is kept, not omitted",
+       r_rc is not None and r_rc["rule"] == "pytest" and "rc=1" in r_rc["kept_text"] and "rc=1" not in r_rc["omitted_text"])
+    r_pre = classify_pytest("cd /work/proj && make build\nbuild step 1 ok\nbuild step 2 ok\n" + pytest_pass)
+    ok("output BEFORE the pytest session header (a build step) is kept, not omitted",
+       r_pre is not None and r_pre["rule"] == "pytest" and "build step 2 ok" in r_pre["kept_text"] and "build step" not in r_pre["omitted_text"])
+    r_fake = classify_pytest(pytest_fail + "=== build finished in 5.0s ===\n")
+    ok("a banner-SHAPED line after the real banner does not replace it: the real summary is kept AND the later line is kept",
+       r_fake is not None and r_fake["rule"] == "pytest" and "1 failed, 150 passed" in r_fake["kept_text"]
+       and "build finished in 5.0s" in r_fake["kept_text"] and "1 failed, 150 passed" not in r_fake["omitted_text"])
+    r_fail_short = classify_pytest(pytest_fail)
+    ok("FAILURES present: pytest's own compact failure list (short test summary info) is kept along with the tracebacks",
+       r_fail_short is not None and "FAILED test_mod.py::test_thing_broken" in r_fail_short["kept_text"]
+       and "FAILED test_mod.py::test_thing_broken" not in r_fail_short["omitted_text"])
+
+    # ---- gate_run ga-vrv1tz, low finding: a rule that would hand back MORE text than it was given is not a cut.
+    # 400 alternating ERROR/ok lines: every 'ok' line between two kept ERROR lines became its own
+    # "[1 lines omitted; run with RAW=1]" marker, longer than the line it replaced -- logged as a 0-token "cut"
+    # (max(0, ...) hid the negative) whose omitted lines fed the join as if something had been cut. ----
+    alternating = "\n".join(f"ERROR: step {i} failed" if i % 2 else f"INFO ok {i}" for i in range(400))
+    r_alt = classify_log_tail(alternating)
+    ok("alternating ERROR/ok log: the rule would ENLARGE the output -> 'no-gain' (an explicit state), not a cut",
+       r_alt is not None and r_alt["rule"] == "no-gain")
+    if r_alt:
+        ok("no-gain: nothing is omitted and the output is unchanged", r_alt["omitted_text"] == "" and r_alt["kept_text"] == alternating
+           and r_alt["chars_after"] == r_alt["chars_before"] and r_alt["tokens_after"] == r_alt["tokens_before"])
+        ok("no-gain: says which rule it was and why", r_alt.get("reason") == "log-tail-would-not-shrink")
+    r_alt_out = classify_output("cmd", alternating)
+    ok("classify_output surfaces 'no-gain' (not None: the shape was recognized, it is just not worth cutting)",
+       r_alt_out is not None and r_alt_out["rule"] == "no-gain")
+    r_real_cut = classify_log_tail(long_log)
+    ok("a log that does shrink is still a plain log-tail cut", r_real_cut is not None and r_real_cut["rule"] == "log-tail"
+       and r_real_cut["chars_after"] < r_real_cut["chars_before"])
+
+    # ---- gate_run ga-vrv1tz, blocking issue 1: a Bash call that exits non-zero reaches the hook as
+    # PostToolUseFailure, whose only payload is `error` = "Exit code N\n<merged stdout+stderr>" (verified live
+    # on Claude Code 2.1.284). strip_exit_code_header() is the one place that header is understood. ----
+    ok("strip_exit_code_header: 'Exit code 1' header is split off, output preserved exactly",
+       strip_exit_code_header("Exit code 1\nabc\ndef") == (1, "abc\ndef"))
+    ok("strip_exit_code_header: multi-digit and negative codes", strip_exit_code_header("Exit code 137\nx") == (137, "x")
+       and strip_exit_code_header("Exit code -1\nx") == (-1, "x"))
+    ok("strip_exit_code_header: only ONE newline belongs to the header (a blank first output line survives)",
+       strip_exit_code_header("Exit code 2\n\nfoo") == (2, "\nfoo"))
+    ok("strip_exit_code_header: a header with no output at all", strip_exit_code_header("Exit code 3") == (3, ""))
+    ok("strip_exit_code_header: an error that is not an exit-code error -> (None, the whole text): not knowing the code is None, not 0",
+       strip_exit_code_header("Command timed out after 120s\nstuff") == (None, "Command timed out after 120s\nstuff"))
+    ok("strip_exit_code_header: the header is only recognized at the START", strip_exit_code_header("x\nExit code 1\ny") == (None, "x\nExit code 1\ny"))
+    ok("strip_exit_code_header: never raises on odd input", strip_exit_code_header("") == (None, "")
+       and strip_exit_code_header(None) == (None, ""))  # type: ignore[arg-type]
+    huge_digits = "Exit code " + "9" * 5000 + "\nz"
+    try:
+        huge_result, huge_raised = strip_exit_code_header(huge_digits), None
+    except Exception as e:  # noqa: BLE001
+        huge_result, huge_raised = None, type(e).__name__
+    ok(f"strip_exit_code_header: a 5000-digit 'exit code' is not a header and does not raise (raised: {huge_raised})",
+       huge_raised is None and huge_result == (None, huge_digits))
+    ok("strip_exit_code_header: a 4-digit code is still a header, a 5-digit one is not",
+       strip_exit_code_header("Exit code 1234\nx") == (1234, "x") and strip_exit_code_header("Exit code 12345\nx")[0] is None)
+
     # ---- the property, over every classifier, over many cut points ----
     log_odd_separators = "\r\n".join(
         ["head line"] + [f"noise {i}\x0cmore text {i}" for i in range(80)] + ["ERROR: boom", "tail line"]
@@ -790,6 +914,10 @@ def _selftest() -> int:
         "pytest-tb-no": pytest_tb_no,
         "pytest-tb-no-no-listing": pytest_tb_no_no_listing,
         "pytest-collect-error": pytest_collect_error,
+        "two-pytest-runs": pytest_fail + pytest_pass,
+        "pytest-then-rc-line": pytest_fail + "rc=1\n",
+        "pytest-then-fake-banner": pytest_fail + "=== build finished in 5.0s ===\n",
+        "alternating-error-log": alternating,
     }
     rng = random.Random(20260928)
     exercised = {"classify_pytest": 0, "classify_log_tail": 0, "classify_output": 0}
@@ -817,6 +945,12 @@ def _selftest() -> int:
                         continue
                     exercised[fn] += 1
                     problems = overlap_problems(text, verdict) + span_problems(text, verdict)
+                    # a rule never hands back MORE text than it was given, and a verdict that names a cut really
+                    # is smaller (unknown / no-gain keep everything, so they are exactly as long)
+                    if verdict["chars_after"] > verdict["chars_before"]:
+                        problems.append(f"chars_after {verdict['chars_after']} > chars_before {verdict['chars_before']}: the rule ENLARGES the output")
+                    if verdict["rule"] in ("pytest", "log-tail") and verdict["chars_after"] >= verdict["chars_before"]:
+                        problems.append(f"rule {verdict['rule']!r} names a cut that is not smaller than its input")
                     if problems:
                         violations.append(f"{name}[{variant}@{p}] {fn} rule={verdict.get('rule')}: {problems[0]}")
     for fn, n in exercised.items():

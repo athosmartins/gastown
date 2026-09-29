@@ -24,11 +24,26 @@ fi
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# The wrapper now writes an ERROR row into jev-experiment.jsonl whenever a large-output call's measurement is
+# lost, so every test below that makes it fail on purpose would append to the LIVE log (a stress run once left
+# 40 junk rows in it that way). Point the default at a throwaway file for the whole suite; tests that read a log
+# still pass their own JEV_EXPERIMENT_LOG explicitly, this is the net under the ones that don't.
+export JEV_EXPERIMENT_LOG="$SCRATCH/jev-experiment.default.jsonl"
+
 # hook_json <tool_name> <stdout> <stderr> [command] -> the PostToolUse JSON on stdin
 hook_json() {
   jq -cn --arg t "$1" --arg out "$2" --arg err "$3" --arg cmd "${4-}" \
     '{tool_name:$t, tool_response:{stdout:$out, stderr:$err}, tool_use_id:"tu-test",
       session_id:"sess-test", transcript_path:"/tmp/sess-test.jsonl",
+      tool_input:{command:$cmd}}'
+}
+
+# hook_failure_json <tool_name> <error> [command] -> the PostToolUseFailure JSON on stdin. Shape captured live
+# from Claude Code 2.1.284: NO tool_response; the merged output is in `error` as "Exit code N\n<output>".
+hook_failure_json() {
+  jq -cn --arg t "$1" --arg err "$2" --arg cmd "${3-}" \
+    '{hook_event_name:"PostToolUseFailure", tool_name:$t, error:$err, tool_use_id:"tu-fail",
+      session_id:"sess-fail", transcript_path:"/tmp/sess-fail.jsonl", is_interrupt:false, duration_ms:1,
       tool_input:{command:$cmd}}'
 }
 
@@ -102,6 +117,57 @@ run "$EDGE" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
 if [ -f "$MARKER" ]; then ok "boundary: stdout 999 + stderr 1000 (classifier text = 2000 chars) -> python WAS spawned"
 else bad "boundary: stdout 999 + stderr 1000 was skipped by the prefilter, but the classifier would have taken it (superset violated)"; fi
 rm -f "$MARKER"
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- PostToolUseFailure (a Bash call that exited non-zero): the prefilter must read \`error\`, not tool_response --"
+# ─────────────────────────────────────────────────────────────────────────
+# gate_run ga-vrv1tz: PostToolUse does not fire for a Bash call that exits non-zero; PostToolUseFailure does, with
+# no tool_response at all. The prefilter used to read only .tool_response.stdout/stderr, so a failure payload
+# was sized 0 and dropped here -- before python was ever asked -- however large the output.
+HDR=$'Exit code 1\n'
+rm -f "$MARKER"
+run "$(hook_failure_json Bash "${HDR}boom" 'false')" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
+if [ ! -f "$MARKER" ]; then ok "failure payload, small output: python was never spawned"
+else bad "failure payload, small output: python WAS spawned"; fi
+
+FAIL_BIG_OUT="$(python3 -c 'print("x" * 5000, end="")')"
+rm -f "$MARKER"
+run "$(hook_failure_json Bash "${HDR}${FAIL_BIG_OUT}" 'pytest')" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
+if [ -f "$MARKER" ]; then ok "failure payload, large output: python WAS spawned (the prefilter reads .error)"
+else bad "failure payload, large output: python was never spawned -- the prefilter sized it 0 (blocking issue, ga-vrv1tz)"; fi
+
+# The classifier gates on the OUTPUT (header stripped): len(output) >= 2000. The wrapper must agree at the edge
+# for every header shape -- one digit, several, negative, and no header at all -- or it hides (or over-admits) a case.
+edge_case() {  # edge_case <label> <error-string> <expect: spawn|skip>
+  rm -f "$MARKER"
+  run "$(hook_failure_json Bash "$2" 'noisy-tool')" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
+  if [ "$3" = spawn ]; then
+    if [ -f "$MARKER" ]; then ok "boundary: $1 -> python spawned"; else bad "boundary: $1 was SKIPPED but the classifier would take it (superset violated)"; fi
+  else
+    if [ ! -f "$MARKER" ]; then ok "boundary: $1 -> python skipped"; else bad "boundary: $1 was spawned though the classifier gates it out (header counted as output?)"; fi
+  fi
+}
+A1999="$(python3 -c 'print("a" * 1999, end="")')"; A2000="$(python3 -c 'print("a" * 2000, end="")')"
+edge_case "'Exit code 1' + 1999 chars of output" $'Exit code 1\n'"$A1999" skip
+edge_case "'Exit code 1' + 2000 chars of output" $'Exit code 1\n'"$A2000" spawn
+edge_case "'Exit code 137' + 1999 chars (multi-digit header)" $'Exit code 137\n'"$A1999" skip
+edge_case "'Exit code 137' + 2000 chars" $'Exit code 137\n'"$A2000" spawn
+edge_case "'Exit code -1' + 1999 chars (negative code)" $'Exit code -1\n'"$A1999" skip
+edge_case "'Exit code -1' + 2000 chars" $'Exit code -1\n'"$A2000" spawn
+edge_case "'Exit code 1234' + 1999 chars (4 digits: still a header)" $'Exit code 1234\n'"$A1999" skip
+A1980="$(python3 -c 'print("a" * 1980, end="")')"
+edge_case "'Exit code' + a 20-digit number + 1980 chars: not a header, so the whole 2011 chars count" $'Exit code 99999999999999999999\n'"$A1980" spawn
+edge_case "no header, 1999 chars (a timeout/interrupt error)" "$A1999" skip
+edge_case "no header, 2000 chars" "$A2000" spawn
+
+rm -f "$MARKER"
+run "$(hook_failure_json Read "${HDR}${FAIL_BIG_OUT}" '')" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/marker-python"
+if [ ! -f "$MARKER" ]; then ok "failure payload for a non-Bash tool: python was never spawned"
+else bad "failure payload for a non-Bash tool: python WAS spawned"; fi
+expect_noop "failure payload: always {} on stdout (shadow contract)" "$(hook_failure_json Bash "${HDR}${FAIL_BIG_OUT}" 'pytest')"
+expect_noop "error that is not a string -> {}" '{"tool_name":"Bash","error":{"message":"x"}}'
+expect_noop "failure payload with no error field -> {}" '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash"}'
 
 # ─────────────────────────────────────────────────────────────────────────
 echo ""
@@ -189,6 +255,101 @@ if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" 
 else
   bad "live unstructured case: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"
 fi
+
+# a large FAILING pytest run (exit 1) through the real wrapper and the real engine: measured, and the row says
+# it came from PostToolUseFailure with exit code 1 (the population the registration used to miss entirely)
+FAIL_PYTEST_OUT=$(python3 -c "
+print('=' * 30 + ' test session starts ' + '=' * 30)
+for i in range(300):
+    print(f't{i} PASSED')
+print('_' * 20 + ' test_boom ' + '_' * 20)
+print('E   assert 1 == 2')
+print('=' * 20 + ' short test summary info ' + '=' * 20)
+print('FAILED test_mod.py::test_boom - assert 1 == 2')
+print('=' * 20 + ' 1 failed, 300 passed in 1.0s ' + '=' * 20, end='')
+")
+FAIL_PYTEST_JSON="$(hook_failure_json Bash "Exit code 1"$'\n'"$FAIL_PYTEST_OUT" 'pytest')"
+rm -f "$LOG"
+run "$FAIL_PYTEST_JSON" "JEV_EXPERIMENT_LOG=$LOG"
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ -f "$LOG" ] && [ "$(wc -l < "$LOG" | tr -d ' ')" = "1" ] \
+   && [ "$(jq -r .experiment < "$LOG")" = "cut-output-fixed" ] && [ "$(jq -r .rule < "$LOG")" = "pytest" ] \
+   && [ "$(jq -r .hook_event < "$LOG")" = "PostToolUseFailure" ] && [ "$(jq -r .exit_code < "$LOG")" = "1" ] \
+   && [ "$(jq -r '.tokens_would_save > 0' < "$LOG")" = "true" ]; then
+  ok "live: a large FAILING pytest run (PostToolUseFailure) produces one cut-output-fixed row with hook_event=PostToolUseFailure, exit_code=1, a real saving, and {} on stdout"
+else
+  bad "live failing pytest case: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────
+echo ""
+echo "-- a LOST measurement is COUNTED: every failure after the size gate leaves one error row (never a bare {}) --"
+# ─────────────────────────────────────────────────────────────────────────
+# gate_run ga-vrv1tz, medium finding: fail-open was silent AND uncounted -- a missing python3, a watchdog SIGKILL,
+# an ImportError all ended as a bare "{}", so a dead hook read in the report exactly like a quiet day. Only calls
+# that PASSED the size gate are counted: a call small enough to skip was never going to be measured.
+row_count() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+error_row_count() { [ -f "$1" ] && jq -c 'select(.experiment == "cut-output-error")' "$1" 2>/dev/null | wc -l | tr -d ' ' || echo 0; }
+expect_error_row() {  # expect_error_row <name> <stdin-json> <expected .error> [env...]
+  local name="$1" input="$2" want="$3"; shift 3
+  rm -f "$LOG"
+  run "$input" "JEV_EXPERIMENT_LOG=$LOG" "$@"
+  if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ "$(row_count "$LOG")" = "1" ] \
+     && [ "$(jq -r .experiment < "$LOG")" = "cut-output-error" ] && [ "$(jq -r .stage < "$LOG")" = "wrapper" ] \
+     && [ "$(jq -r .error < "$LOG")" = "$want" ] && [ "$(jq -r '.size | type' < "$LOG")" = "number" ]; then
+    ok "$name -> {} AND one wrapper error row (error=$want)"
+  else
+    bad "$name: rc=$RC out=[$OUT] want error=$want log=[$(cat "$LOG" 2>/dev/null)]"
+  fi
+}
+expect_no_error_row() {  # expect_no_error_row <name> <stdin-json> [env...]
+  local name="$1" input="$2"; shift 2
+  rm -f "$LOG"
+  run "$input" "JEV_EXPERIMENT_LOG=$LOG" "$@"
+  if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ "$(error_row_count "$LOG")" = "0" ]; then ok "$name -> no error row"
+  else bad "$name: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"; fi
+}
+
+expect_error_row "python interpreter missing" "$BIG" python_missing "CUT_OUTPUT_SHADOW_PY=/nonexistent/python3"
+expect_error_row "engine crashes (exit 1)" "$BIG" engine_rc_1 "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-crash"
+expect_error_row "engine hangs -> watchdog SIGKILL (137)" "$BIG" engine_rc_137 "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-hang" "CUT_OUTPUT_SHADOW_TIMEOUT=2"
+expect_error_row "engine prints invalid JSON" "$BIG" engine_bad_output "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-badjson"
+expect_error_row "mktemp fails (TMPDIR unusable)" "$BIG" mktemp_failed "TMPDIR=/nonexistent/dir"
+expect_error_row "the same on a PostToolUseFailure payload" "$FAIL_PYTEST_JSON" engine_rc_1 "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-crash"
+
+mkdir -p "$SCRATCH/no-engine"; cp "$WRAPPER" "$SCRATCH/no-engine/cut-output-shadow.sh"
+rm -f "$LOG"
+OUT="$(printf '%s' "$BIG" | env "JEV_EXPERIMENT_LOG=$LOG" bash "$SCRATCH/no-engine/cut-output-shadow.sh" 2>/dev/null)"; RC=$?
+if [ "$RC" -eq 0 ] && [ "$OUT" = "{}" ] && [ "$(row_count "$LOG")" = "1" ] && [ "$(jq -r .error < "$LOG")" = "engine_missing" ]; then
+  ok "engine script missing next to the wrapper -> {} AND one error row (error=engine_missing)"
+else bad "engine missing: rc=$RC out=[$OUT] log=[$(cat "$LOG" 2>/dev/null)]"; fi
+
+# no error row where nothing was lost: small output, another tool, a clean engine run, the kill switch
+expect_no_error_row "small Bash output (never a candidate)" "$SMALL"
+expect_no_error_row "non-Bash tool with huge output" "$NONBASH"
+expect_no_error_row "a clean engine run that prints {}" "$BIG" "CUT_OUTPUT_SHADOW_PY=$SCRATCH/py-fast"
+: > "$DISABLED_FILE"
+expect_no_error_row "kill switch on, huge output (an operator's choice, not a failure)" "$BIG" "CUT_OUTPUT_SHADOW_DISABLED=$DISABLED_FILE"
+rm -f "$DISABLED_FILE"
+expect_no_error_row "the real engine on a large pytest run (a healthy measurement)" "$PYTEST_JSON"
+
+# The wrapper writes its row with printf (python is what may be broken), so the mode/experiment names are literals
+# there. They must be the ones the classifier module defines -- and the report must actually count the row.
+rm -f "$LOG"
+run "$BIG" "JEV_EXPERIMENT_LOG=$LOG" "CUT_OUTPUT_SHADOW_PY=/nonexistent/python3"
+if python3 - "$LOG" "$HERE" <<'PY'
+import json, sys
+sys.path.insert(0, sys.argv[2])
+import cut_output_classifier as coc
+row = json.loads(open(sys.argv[1]).read().splitlines()[0])
+assert row["mode"] == coc.RECORD_MODE, (row["mode"], coc.RECORD_MODE)
+assert row["experiment"] == coc.ERROR_EXPERIMENT, (row["experiment"], coc.ERROR_EXPERIMENT)
+assert isinstance(row["ts"], str) and row["entity_id"].startswith("wrapper-"), row
+PY
+then ok "the wrapper's literal mode/experiment names equal cut_output_classifier.RECORD_MODE / ERROR_EXPERIMENT"
+else bad "the wrapper's error row does not match the classifier's constants: $(cat "$LOG")"; fi
+REPORT_OUT="$(python3 "$HERE/jev_cut_output_report.py" --log "$LOG" 2>&1)"
+if printf '%s' "$REPORT_OUT" | grep -q 'python_missing'; then ok "the real report counts the wrapper's row and names its reason (python_missing)"
+else bad "report did not surface the wrapper's error row: $REPORT_OUT"; fi
 
 echo ""
 echo "cut-output-shadow.selftest.sh: PASS=$PASS FAIL=$FAIL"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""cut-output-shadow.py (ga-wk0qi2, child of ga-aijm2v) — PostToolUse:Bash hook, SHADOW MODE
-ONLY. Measures what a "cut large tool output before it enters the agent's context" rule WOULD
+"""cut-output-shadow.py (ga-wk0qi2, child of ga-aijm2v) — PostToolUse:Bash AND PostToolUseFailure:Bash
+hook, SHADOW MODE ONLY. Measures what a "cut large tool output before it enters the agent's context" rule WOULD
 do, for every pool session (dog/wa-worker/ps-worker/reviewer — see pool-roles.json), and logs
 that to jev-experiment.jsonl. It NEVER modifies the real tool output.
 
@@ -22,12 +22,25 @@ unchanged -- which would have made a naive live rollout silently do nothing whil
 This is pinned here so whoever eventually flips this from shadow to live does not rediscover it
 the hard way.
 
+TWO EVENTS (gate_run ga-vrv1tz; payloads captured live from Claude Code 2.1.284): a Bash call's output
+reaches a hook on ONE of two events. PostToolUse fires only when the call SUCCEEDED (exit 0), carrying
+tool_response.{stdout, stderr}. A call that exits non-zero fires PostToolUseFailure INSTEAD -- no tool_response;
+the merged output is in `error` as "Exit code N\n<output>". Registered on PostToolUse alone this hook measured
+only the commands that worked (never a failing pytest run, a killed command, ...), so any rate it produced said
+nothing about the failed-command half -- where a cut is most plausibly costly (whether it really is: that is
+what this front measures). read_bash_output() understands both shapes; every record carries hook_event and
+exit_code (None when the payload does not say -- a success carries no code, and a timeout has none; never 0),
+and the report shows the failed-command population apart. SCOPE: the RESULT of a foreground Bash call only --
+not Monitor/BashOutput, Read, Grep or MCP tool output.
+
 TWO TIERS, per this bead's own "Mecanismo" text:
   1. Fixed rule (no AI, no network): cut_output_classifier.classify_output() recognizes a pytest
      run or a generic long/log-shaped dump and would keep head+tail+error-lines+summary. Cheap,
      deterministic, logged as experiment "cut-output-fixed". A pytest run it cannot read (killed or
      truncated, no final summary) comes back as rule "unknown": nothing would be cut, and the
-     record carries tokens_would_save=None -- a distinct third state, not a zero-token cut.
+     record carries tokens_would_save=None -- a distinct third state, not a zero-token cut. A shape it
+     recognizes but could not make SHORTER (each omitted run costs a marker) is rule "no-gain": nothing
+     omitted, a measured tokens_would_save of 0 (it did evaluate it), nothing for the join to look for.
   2. Jev, ONLY for output that is large but matches neither fixed shape ("unstructured"): the
      text is split into blocks and Jev answers one atomic noul (0..1) question per block --
      "is this block relevant to the task" -- in a SINGLE call_jev_multi call (the state, i.e.
@@ -51,16 +64,21 @@ JEV_DEADLINE_S (below the wrapper's 12s watchdog, which would SIGKILL python and
 logged as the same third state (jev_ok=False, error "deadline"), so "Jev unreachable N/M" also
 counts the SLOW failures, not only the fast ones.
 
-FAIL-OPEN, by construction: this script is on the Bash hot path of every pool session in the
+FAIL-OPEN, by construction, but COUNTED: this script is on the Bash hot path of every pool session in the
 city (matcher "^Bash$" in pool-roles.json), so EVERY exception -- JSON parse, missing field,
 Jev network error, a bug in this file -- is caught and turns into printing "{}" and exit(0).
 Nothing this script does can block or corrupt a real tool call: the worst case is a lost shadow
-measurement, never a lost or altered tool result. A CUT_OUTPUT_SHADOW_DISABLED sentinel file
-(if present) short-circuits everything before any work is done, as an emergency kill switch.
+measurement, never a lost or altered tool result. A lost measurement is not silent, though: main() writes
+one row (experiment "cut-output-error", stage "engine", the exception CLASS, never its message) and
+cut-output-shadow.sh writes the same shape for its own failure paths (stage "wrapper"), so a hook that dies
+on every call shows up in the report instead of reading like a quiet day. The one failure that cannot be
+recorded is the log itself being unwritable -- there is nowhere left to write it (the report says so).
+A CUT_OUTPUT_SHADOW_DISABLED sentinel file (if present) short-circuits everything before any work is
+done, as an emergency kill switch.
 
 CLI:
   python3 cut-output-shadow.py             (no args) -- the real hook entrypoint, reads the
-      PostToolUse hook JSON from stdin, ALWAYS prints "{}" to stdout, exit 0 always.
+      PostToolUse / PostToolUseFailure hook JSON from stdin, ALWAYS prints "{}" to stdout, exit 0 always.
   python3 cut-output-shadow.py selftest    -- mocked (no live Jev credential or repo needed).
 """
 from __future__ import annotations
@@ -117,8 +135,9 @@ JEV_FALSE_DESC = "This block is generic noise/boilerplate the agent is unlikely 
 
 def chunk_text(text: str, max_blocks: int = MAX_JEV_BLOCKS, max_total_chars: int = MAX_JEV_STATE_CHARS) -> list[str]:
     """Pure, no I/O. Splits `text` into at most `max_blocks` roughly-equal chunks, first trying
-    paragraph (blank-line) boundaries and falling back to fixed-size slicing when there are no
-    blank lines to split on (e.g. one giant single-line blob). The TOTAL character budget across
+    paragraph (blank-line) boundaries and falling back to one block per LINE when there are none. It
+    never slices inside a line: one giant single-line blob stays ONE block (the budget below still bounds
+    how much of it is ever sent). The TOTAL character budget across
     all returned blocks never exceeds `max_total_chars` -- for text bigger than that budget, a
     head+tail sample is taken (half the budget from the start, half from the end) rather than
     silently sending an unbounded amount of text to Jev. Never raises; empty text -> []."""
@@ -209,13 +228,18 @@ def build_fixed_log_record(verdict: dict, meta: dict) -> dict:
         "transcript_path": meta.get("transcript_path"),
         "tool_use_id": meta.get("tool_use_id"),
         "command": meta.get("command", "")[:COMMAND_LOG_CHARS],
+        "hook_event": meta.get("hook_event"),
+        "exit_code": meta.get("exit_code"),
         "rule": verdict["rule"],
         "reason": verdict.get("reason"),
         "chars_before": verdict["chars_before"],
         "chars_after": verdict["chars_after"],
         "tokens_before": verdict["tokens_before"],
         "tokens_after": verdict["tokens_after"],
-        "tokens_would_save": None if is_unknown else max(0, verdict["tokens_before"] - verdict["tokens_after"]),
+        # No max(0, ...) clamp: a classifier verdict is never longer than its input (a cut that would not
+        # shrink the text is the explicit rule "no-gain", saving exactly 0), so the difference cannot be
+        # negative -- and if a future rule ever broke that, the number should SHOW it, not be hidden as 0.
+        "tokens_would_save": None if is_unknown else verdict["tokens_before"] - verdict["tokens_after"],
         "omitted_signatures": coc.extract_signatures(omitted_text),
         "referenced_later": None,  # filled in by the offline join (jev_cut_output_join.py)
     }
@@ -247,6 +271,8 @@ def build_jev_log_record(jev_result: dict, blocks: list[str], text: str, meta: d
         "transcript_path": meta.get("transcript_path"),
         "tool_use_id": meta.get("tool_use_id"),
         "command": meta.get("command", "")[:COMMAND_LOG_CHARS],
+        "hook_event": meta.get("hook_event"),
+        "exit_code": meta.get("exit_code"),
         "chars_before": len(text),
         "tokens_before": coc.estimate_tokens(text),
         "block_count": len(blocks),
@@ -303,6 +329,39 @@ def _log(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def build_error_record(stage: str, exc: BaseException, hook_input: object) -> dict:
+    """Pure. One row that says "a call this hook should have looked at was NOT measured, and this is what
+    broke". `stage` is who failed ("engine" here; the bash wrapper writes "wrapper" rows of the same shape).
+    `error` is the exception's CLASS only, never its message: a message can quote command output, and this
+    row goes into a log that several daily reports read. The tool_use_id / session_id are kept when the hook
+    input had them, so a lost measurement can be matched to its call."""
+    def _str_field(name: str) -> str | None:
+        value = hook_input.get(name) if isinstance(hook_input, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    tool_use_id = _str_field("tool_use_id")
+    return {
+        "ts": _now_iso(),
+        "mode": coc.RECORD_MODE,
+        "experiment": coc.ERROR_EXPERIMENT,
+        "entity_id": _entity_id({"tool_use_id": tool_use_id}),
+        "stage": stage,
+        "error": type(exc).__name__,
+        "tool_use_id": tool_use_id,
+        "session_id": _str_field("session_id"),
+    }
+
+
+def _record_engine_failure(exc: BaseException, hook_input: object) -> None:
+    """Never raises. Writes the error row for an exception main() is about to swallow. If THE LOG is what
+    failed (unwritable, disk full) there is nowhere left to write "I could not write": that one case stays
+    invisible here, and the report says so instead of pretending a zero is a healthy zero."""
+    try:
+        _log(build_error_record("engine", exc, hook_input))
+    except Exception:  # noqa: BLE001 -- see docstring: the failed log cannot record its own failure
+        pass
+
+
 def call_jev_with_deadline(state: str, questions: dict, deadline_s: float | None = None) -> dict:
     """call_jev_multi() under a hard deadline, always returning a call_jev_multi-shaped dict.
 
@@ -334,19 +393,45 @@ def call_jev_with_deadline(state: str, questions: dict, deadline_s: float | None
     return result if isinstance(result, dict) else {"ok": False, "error": "no_result"}
 
 
+def read_bash_output(hook_input: dict) -> tuple[str, str, int | None] | None:
+    """Pure. (text, hook_event, exit_code) for a Bash hook payload, or None when it carries no output text
+    this script can read (not a Bash call, or neither payload shape). The shape decides, and it has to be
+    both, because Claude Code sends a Bash call's output on ONE of two events (verified live, 2.1.284):
+
+      * PostToolUse -- the call succeeded (exit 0): tool_response.{stdout, stderr}. stderr is appended after
+        stdout with one newline between them. The payload carries no exit code -> exit_code None.
+      * PostToolUseFailure -- the call exited non-zero: NO tool_response; `error` holds the merged output as
+        "Exit code N\n<output>". The header is not output and is not counted (a live cut would keep it);
+        N goes into the record. An error without the header (a timeout, an interrupt) is still output the
+        agent reads: measured, exit_code None.
+
+    cut-output-shadow.sh's prefilter computes this same length in jq; the two must agree at the boundary."""
+    if hook_input.get("tool_name") != "Bash":
+        return None
+    tool_response = hook_input.get("tool_response")
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout") or ""
+        stderr = tool_response.get("stderr") or ""
+        text = stdout if not stderr else f"{stdout}\n{stderr}"
+        if not isinstance(text, str):
+            return None
+        return text, coc.EVENT_SUCCESS, None
+    error = hook_input.get("error")
+    if isinstance(error, str):
+        exit_code, output = coc.strip_exit_code_header(error)
+        return output, coc.EVENT_FAILURE, exit_code
+    return None
+
+
 def process(hook_input: dict) -> None:
     """Does the actual work (classification, optional Jev call, logging). Raises freely --
     main() is the only place that catches. Kept separate from main() so tests can call this
     directly and assert on what got logged without going through stdin/stdout plumbing."""
-    if hook_input.get("tool_name") != "Bash":
+    parsed = read_bash_output(hook_input)
+    if parsed is None:
         return
-    tool_response = hook_input.get("tool_response")
-    if not isinstance(tool_response, dict):
-        return
-    stdout = tool_response.get("stdout") or ""
-    stderr = tool_response.get("stderr") or ""
-    text = stdout if not stderr else f"{stdout}\n{stderr}"
-    if not isinstance(text, str) or len(text) < coc.MIN_CHARS_TO_CONSIDER:
+    text, hook_event, exit_code = parsed
+    if len(text) < coc.MIN_CHARS_TO_CONSIDER:
         return
 
     command = hook_input.get("tool_input", {}).get("command", "") if isinstance(hook_input.get("tool_input"), dict) else ""
@@ -362,6 +447,8 @@ def process(hook_input: dict) -> None:
         # call id. Each record still gets its own entity_id (see _entity_id).
         "tool_use_id": tool_use_id,
         "command": command,
+        "hook_event": hook_event,
+        "exit_code": exit_code,
     }
 
     verdict = coc.classify_output(command, text)
@@ -388,18 +475,35 @@ def main() -> int:
     except OSError:
         pass  # an unreadable sentinel path must not become "guard is on" by accident here either
 
+    hook_input: object = None
     try:
         raw = sys.stdin.read()
         hook_input = json.loads(raw) if raw else {}
         if isinstance(hook_input, dict):
             process(hook_input)
-    except Exception:
-        pass  # SHADOW MODE, fail-open: a bug here must never affect the real tool call
+    except Exception as e:  # noqa: BLE001
+        # SHADOW MODE, fail-open: a bug here must never affect the real tool call. It is COUNTED, though: one
+        # error row (the exception's class), so a hook that dies on every call shows in the report instead of
+        # reading like a quiet day.
+        _record_engine_failure(e, hook_input)
     print("{}")
     return 0
 
 
 def _selftest() -> int:
+    """Runs the whole suite with jev_experiment.JEV_LOG pointed at a throwaway file. main() writes an error row
+    whenever it swallows an exception, so any test that reaches it without its own temp log would append to the
+    LIVE jev-experiment.jsonl -- the way a stress run once left 40 junk rows in it. Individual tests still patch
+    their own log; this is the net under the ones that forget."""
+    import tempfile
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory() as guard_dir, \
+         mock.patch.object(je, "JEV_LOG", Path(guard_dir) / "selftest-default-log.jsonl"):
+        return _selftest_suite()
+
+
+def _selftest_suite() -> int:
     import tempfile
     from unittest import mock
 
@@ -414,6 +518,9 @@ def _selftest() -> int:
         else:
             failed += 1
             print(f"  FAIL {label}")
+
+    ok("selftest isolation: the suite's default log is a throwaway file, never the live jev-experiment.jsonl",
+       "selftest-default-log" in str(je.JEV_LOG) and str(je.JEV_LOG) != "/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-experiment.jsonl")
 
     # ---- chunk_text ----
     ok("chunk_text('') == []", chunk_text("") == [])
@@ -529,6 +636,21 @@ def _selftest() -> int:
         ok("unknown record: tokens_would_save is None (third state), not 0", unk_rec["tokens_would_save"] is None)
         ok("unknown record: nothing omitted -> no omitted_signatures to join on", unk_rec["omitted_signatures"] == [])
         ok("unknown record: chars_after == chars_before (nothing was cut)", unk_rec["chars_after"] == unk_rec["chars_before"])
+    # ---- gate_run ga-vrv1tz, low finding: tokens_would_save was clamped with max(0, before - after), which hid a
+    # rule that ENLARGES the output (400 alternating ERROR/ok lines: each omitted 'ok' line became a longer
+    # marker) and logged it as a 0-token "cut" whose omitted lines went to the join. That verdict is now the
+    # explicit rule "no-gain": nothing omitted, a measured zero (not None -- the rule DID evaluate it), and
+    # nothing for the join to look for. The clamp is gone: a negative number would now show up as one. ----
+    alt_text = "\n".join(f"ERROR: step {i} failed" if i % 2 else f"INFO ok {i}" for i in range(400))
+    alt_verdict = coc.classify_output("cmd", alt_text)
+    ok("setup: the alternating ERROR/ok log is a 'no-gain' verdict", alt_verdict is not None and alt_verdict["rule"] == "no-gain")
+    if alt_verdict:
+        alt_rec = build_fixed_log_record(alt_verdict, {"tool_use_id": "tu-alt", "command": "cmd"})
+        ok("no-gain record: rule is logged as 'no-gain' and its reason says which rule gave up", alt_rec["rule"] == "no-gain" and alt_rec["reason"] == "log-tail-would-not-shrink")
+        ok("no-gain record: tokens_would_save is a measured 0 (the rule evaluated it), not None and not a clamped negative", alt_rec["tokens_would_save"] == 0)
+        ok("no-gain record: nothing omitted, so no omitted_signatures for the join to look for", alt_rec["omitted_signatures"] == [])
+        ok("no-gain record: chars_after == chars_before (the output is not enlarged)", alt_rec["chars_after"] == alt_rec["chars_before"])
+
     with tempfile.TemporaryDirectory() as td:
         log_path = Path(td) / "jev-experiment.jsonl"
         with mock.patch.object(je, "JEV_LOG", log_path), \
@@ -568,6 +690,169 @@ def _selftest() -> int:
         ok("id-less hook input: tool_use_id is None (not knowing), never the string 'unknown'", all(r["tool_use_id"] is None for r in idless))
         ok("id-less hook input: entity_id is never the literal 'unknown'", all(r["entity_id"] != "unknown" for r in idless))
         ok("id-less hook input: two records get DIFFERENT entity_ids", len({r["entity_id"] for r in idless}) == 2)
+
+    # ---- gate_run ga-vrv1tz, blocking issue 1: PostToolUse does NOT fire for a Bash call that exits non-zero.
+    # Claude Code fires PostToolUseFailure instead, with no tool_response: the merged output is in `error`,
+    # as "Exit code N\n<output>" (payload captured live from Claude Code 2.1.284; keys: session_id,
+    # transcript_path, cwd, prompt_id, permission_mode, hook_event_name, tool_name, tool_input, tool_use_id,
+    # error, is_interrupt, duration_ms). Registered only for PostToolUse, every failing pytest run, killed
+    # command or masked-exit-code failure was silently outside the measurement -- the half of the population
+    # where a cut is most plausibly costly. The selftests above hand-built tool_response dicts for the
+    # failing-pytest shapes, which production could never deliver to this hook. ----
+    failing_pytest_out = (
+        "=" * 30 + " test session starts " + "=" * 30 + "\n"
+        + "\n".join(f"test_mod.py::test_{i} PASSED" for i in range(200))
+        + "\n" + "_" * 20 + " test_boom " + "_" * 20 + "\nE   assert 1 == 2\ntest_mod.py:42: AssertionError\n"
+        + "=" * 20 + " short test summary info " + "=" * 20 + "\nFAILED test_mod.py::test_boom - assert 1 == 2\n"
+        + "=" * 20 + " 1 failed, 200 passed in 3.10s " + "=" * 20 + "\n"
+    ).rstrip("\n")  # the live payload's error has no trailing newline: 'x'*2500 + "\n" arrived as 2500 chars
+
+    def _failure_hook(error, **kw) -> dict:
+        h = {
+            "session_id": "s-fail", "transcript_path": "/tmp/s-fail.jsonl", "cwd": "/tmp", "prompt_id": "p1",
+            "permission_mode": "bypassPermissions", "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+            "tool_input": {"command": "pytest", "description": "run the tests"}, "tool_use_id": "toolu_fail1",
+            "error": error, "is_interrupt": False, "duration_ms": 2375,
+        }
+        h.update(kw)
+        return h
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("pytest case must not call Jev")):
+            process(_failure_hook("Exit code 1\n" + failing_pytest_out))
+        fail_lines = log_path.read_text().splitlines() if log_path.exists() else []
+        ok("PostToolUseFailure: a failing pytest run (exit 1) IS measured -- exactly one record", len(fail_lines) == 1)
+        fail_rec = json.loads(fail_lines[0]) if fail_lines else {}
+        ok("PostToolUseFailure: classified by the fixed rule as pytest, with a real would-save number",
+           fail_rec.get("experiment") == EXPERIMENT_FIXED and fail_rec.get("rule") == "pytest" and (fail_rec.get("tokens_would_save") or 0) > 0)
+        ok("PostToolUseFailure: the record says which event it came from and the exit code",
+           fail_rec.get("hook_event") == coc.EVENT_FAILURE and fail_rec.get("exit_code") == 1)
+        ok("PostToolUseFailure: the 'Exit code N' header is not part of the measured text (chars_before == the output's length)",
+           fail_rec.get("chars_before") == len(failing_pytest_out))
+        ok("PostToolUseFailure: the tool_use_id/session are carried for the offline join",
+           fail_rec.get("tool_use_id") == "toolu_fail1" and fail_rec.get("session_id") == "s-fail" and fail_rec.get("entity_id") == "toolu_fail1")
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("pytest case must not call Jev")):
+            process({"tool_name": "Bash", "tool_response": {"stdout": all_pass_stdout, "stderr": ""}, "tool_use_id": "toolu_ok1",
+                     "tool_input": {"command": "pytest"}})
+        ok_rec = json.loads(log_path.read_text().splitlines()[0])
+        ok("PostToolUse (success): the record says PostToolUse; the payload carries no exit code, so exit_code is None (not 0)",
+           ok_rec.get("hook_event") == coc.EVENT_SUCCESS and ok_rec.get("exit_code") is None)
+
+    # a failure payload that is NOT an "Exit code N" error (a timeout, an interrupt) is still output the agent
+    # reads: measured, with exit_code None -- not knowing the code is not "0" and not a reason to skip it
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("pytest case must not call Jev")):
+            process(_failure_hook("Command timed out after 120000ms\n" + all_pass_stdout, is_interrupt=True))
+        to_rec = json.loads(log_path.read_text().splitlines()[0]) if log_path.exists() else {}
+        ok("PostToolUseFailure without an 'Exit code N' header: still measured, exit_code None",
+           to_rec.get("hook_event") == coc.EVENT_FAILURE and to_rec.get("exit_code") is None and to_rec.get("experiment") == EXPERIMENT_FIXED)
+
+    # the size gate is applied to the OUTPUT (header stripped), same number the wrapper's prefilter computes
+    for out_len, expect_rows in ((coc.MIN_CHARS_TO_CONSIDER - 1, 0), (coc.MIN_CHARS_TO_CONSIDER, 1)):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "jev-experiment.jsonl"
+            with mock.patch.object(je, "JEV_LOG", log_path), \
+                 mock.patch.object(je, "call_jev_multi", return_value={"ok": False, "error": "no_credentials"}):
+                process(_failure_hook("Exit code 2\n" + "z" * out_len))
+            n_rows = len(log_path.read_text().splitlines()) if log_path.exists() else 0
+            ok(f"PostToolUseFailure size gate: header + {out_len} chars of output -> {expect_rows} row(s) (the header does not count)",
+               n_rows == expect_rows)
+
+    # a failing UNSTRUCTURED output takes the Jev tier like a successful one, and the row says where it came from
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        unstructured_fail = "\n\n".join(f"random unstructured paragraph number {i} with no test/log shape at all, just prose padding to grow it" for i in range(80))
+        with mock.patch.object(je, "JEV_LOG", log_path), \
+             mock.patch.object(je, "call_jev_multi", return_value={"ok": False, "error": "no_credentials"}) as m_fail:
+            process(_failure_hook("Exit code 3\n" + unstructured_fail, tool_input={"command": "some-tool"}))
+        jev_fail_rec = json.loads(log_path.read_text().splitlines()[0]) if log_path.exists() else {}
+        ok("PostToolUseFailure, unstructured output: goes to the Jev tier once, row carries hook_event and exit_code",
+           m_fail.call_count == 1 and jev_fail_rec.get("experiment") == EXPERIMENT_JEV
+           and jev_fail_rec.get("hook_event") == coc.EVENT_FAILURE and jev_fail_rec.get("exit_code") == 3)
+
+    # payloads with NO readable output: nothing is logged and nothing raises (this hook must never fail a call)
+    for label, odd in (
+        ("neither tool_response nor error", {"tool_name": "Bash", "tool_use_id": "t"}),
+        ("error that is not a string", _failure_hook({"message": "x" * 5000})),
+        ("error null", _failure_hook(None)),
+        ("tool_response that is not an object", {"tool_name": "Bash", "tool_response": "x" * 5000}),
+        ("a failure payload for another tool", _failure_hook("Exit code 1\n" + "z" * 5000, tool_name="Read")),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "jev-experiment.jsonl"
+            raised_odd = False
+            with mock.patch.object(je, "JEV_LOG", log_path), \
+                 mock.patch.object(je, "call_jev_multi", side_effect=AssertionError("must not call Jev")):
+                try:
+                    process(odd)
+                except Exception:
+                    raised_odd = True
+            ok(f"unreadable payload ({label}): process() does not raise and logs nothing",
+               not raised_odd and not log_path.exists())
+
+    # ---- gate_run ga-vrv1tz, medium finding: fail-open was SILENT and UNCOUNTED. main() turned any exception into
+    # a bare "{}" and the wrapper threw python's stderr away, so a hook that died on every call read in the
+    # report exactly like a quiet day ("0 case(s)"). A failure now leaves one row -- the class of the exception,
+    # never its message (that can quote command output) -- and STILL prints "{}" and returns 0. ----
+    import contextlib
+    import io
+
+    def _run_main(stdin_text: str, sentinel_dir: str, jev_log: Path, boom: Exception | None = None) -> tuple[int, str]:
+        buf = io.StringIO()
+        patches = [
+            mock.patch.object(je, "JEV_LOG", jev_log),
+            mock.patch(f"{__name__}.DISABLED_SENTINEL", Path(sentinel_dir) / "does-not-exist"),
+            mock.patch.object(sys, "stdin", mock.MagicMock(read=mock.Mock(return_value=stdin_text))),
+        ]
+        if boom is not None:
+            patches.append(mock.patch(f"{__name__}.process", side_effect=boom))
+        with contextlib.ExitStack() as stack:
+            for pt in patches:
+                stack.enter_context(pt)
+            with contextlib.redirect_stdout(buf):
+                rc_ = main()
+        return rc_, buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        rc_e, out_e = _run_main(json.dumps({"tool_name": "Bash", "tool_use_id": "toolu_boom", "session_id": "s-boom"}), td, log_path, boom=RuntimeError("secret output text"))
+        err_lines = log_path.read_text().splitlines() if log_path.exists() else []
+        ok("an exception inside process(): main() still prints {} and returns 0", rc_e == 0 and out_e.strip() == "{}")
+        ok("an exception inside process(): exactly one ERROR row is logged (the failure is countable, not silent)", len(err_lines) == 1)
+        err_rec = json.loads(err_lines[0]) if err_lines else {}
+        ok("error row: own experiment name and this front's mode, stage 'engine', the exception CLASS",
+           err_rec.get("experiment") == coc.ERROR_EXPERIMENT and err_rec.get("mode") == coc.RECORD_MODE
+           and err_rec.get("stage") == "engine" and err_rec.get("error") == "RuntimeError")
+        ok("error row: never carries the exception's MESSAGE (it can quote command output)", "secret output text" not in err_lines[0])
+        ok("error row: keeps the tool_use_id/session for correlation", err_rec.get("tool_use_id") == "toolu_boom" and err_rec.get("session_id") == "s-boom")
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        rc_j, out_j = _run_main("not json {{{", td, log_path)
+        j_lines = log_path.read_text().splitlines() if log_path.exists() else []
+        ok("malformed JSON on stdin: {} / rc 0 and ONE error row naming the exception class",
+           rc_j == 0 and out_j.strip() == "{}" and len(j_lines) == 1 and json.loads(j_lines[0]).get("error") == "JSONDecodeError")
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "jev-experiment.jsonl"
+        _run_main("", td, log_path)
+        _run_main(json.dumps({"tool_name": "Read", "tool_response": {"stdout": "x" * 5000}}), td, log_path)
+        _run_main(json.dumps({"tool_name": "Bash", "tool_response": {"stdout": "ok", "stderr": ""}}), td, log_path)
+        ok("no error row for the normal quiet paths: empty stdin, another tool, a small output", not log_path.exists())
+
+    with tempfile.TemporaryDirectory() as td:
+        # the log path is a DIRECTORY: nothing can be written, including the error row. That is the one failure
+        # this script cannot record -- it must still be silent for the agent: {} and rc 0, never a traceback.
+        rc_u, out_u = _run_main(json.dumps({"tool_name": "Bash"}), td, Path(td), boom=RuntimeError("x"))
+        ok("when even the error row cannot be written: {} / rc 0, no exception escapes", rc_u == 0 and out_u.strip() == "{}")
 
     # ---- build_jev_log_record: Jev ok, mixed relevant/irrelevant blocks ----
     blocks = ["irrelevant noise block", "relevant error block with a real path /tmp/x"]
@@ -810,7 +1095,10 @@ def _selftest() -> int:
     ok("every record this front logs carries its own mode (coc.RECORD_MODE), never 'shadow'",
        all(r["mode"] == coc.RECORD_MODE for r in real_recs) and coc.RECORD_MODE != "shadow")
     join_like = {"mode": coc.JOIN_MODE, "experiment": EXPERIMENT_FIXED, "entity_id": "toolu_fixed", "referenced_later": False}
-    ev_all = real_recs + [join_like]
+    error_like = build_error_record("engine", RuntimeError("x"), {"tool_use_id": "toolu_err", "session_id": "s-err"})
+    ok("setup: an error row has this front's mode and its own experiment name",
+       error_like["mode"] == coc.RECORD_MODE and error_like["experiment"] == coc.ERROR_EXPERIMENT)
+    ev_all = real_recs + [join_like, error_like]
     ok("jev_experiment_report.summarize_shadow() sees none of this front's records (it read them as F0 rows before)",
        jer.summarize_shadow(ev_all) == {})
     ok("jev_experiment_report.summarize() sees none of them either", jer.summarize(ev_all) == {})

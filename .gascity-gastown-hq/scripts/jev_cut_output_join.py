@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """jev_cut_output_join.py (ga-wk0qi2, child of ga-aijm2v) — OFFLINE join for the cut-large-
-output SHADOW front. cut-output-shadow.py (the live PostToolUse hook) logs, for every large Bash
+output SHADOW front. cut-output-shadow.py (the live PostToolUse + PostToolUseFailure hook) logs, for every large Bash
 output, what a fixed rule or Jev WOULD have cut and a handful of "signatures" (bead ids, absolute
 paths, sha-looking tokens, error-line snippets) extracted from the cut/would-cut portion. That
 alone cannot say whether the agent actually needed the cut content later -- the only way to know

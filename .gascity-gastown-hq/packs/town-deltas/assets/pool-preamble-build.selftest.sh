@@ -105,6 +105,43 @@ json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n
 EOF
 expect_fail "hook cujo \`command\` não é texto (número): o check REPORTA em vez de estourar TypeError" "perdeu o hook PreToolUse do home-scan-guard"
 if run_check | grep -q Traceback; then bad "o check ainda estoura traceback com command não-texto"; else ok "command não-texto não gera traceback"; fi
+# ga-wk0qi2 (gate_run ga-vrv1tz): o hook cut-output-shadow tem que estar nos DOIS eventos que carregam a saída de um Bash. PostToolUse só dispara
+# para Bash que saiu com 0; um que sai com código != 0 dispara PostToolUseFailure. Registrado só no primeiro, a medição via só os comandos que
+# funcionaram — verificado ao vivo no Claude Code 2.1.284. Cada controle abaixo mexe em UM evento e TEM que reprovar.
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-dog/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); del d["hooks"]["PostToolUseFailure"]
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "overlay commitado do dog sem o hook PostToolUseFailure do cut-output-shadow" "perdeu o hook PostToolUseFailure do cut-output-shadow"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); del m["common"]["hooks"]["PostToolUseFailure"]
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "PostToolUseFailure sai do manifesto E dos overlays regenerados juntos (a igualdade sozinha passaria calada)" "perdeu o hook PostToolUseFailure do cut-output-shadow"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); del m["common"]["hooks"]["PostToolUse"]
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "PostToolUse sai (só o de falha ficou): a medição perderia os comandos que funcionaram" "perdeu o hook PostToolUse do cut-output-shadow"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-roles.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; m = json.load(open(p)); m["common"]["hooks"]["PostToolUseFailure"][0]["matcher"] = "Bash"
+json.dump(m, open(p, "w"), indent=1, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+PP_ASSETS_DIR="$T/packs/town-deltas/assets" python3 "$BUILD" build >/dev/null 2>&1
+expect_fail "matcher do PostToolUseFailure volta a 'Bash' (mescla por identidade de matcher: substituiria a entrada do workdir)" "PostToolUseFailure do cut-output-shadow com matcher 'Bash'"
+reset_tree; python3 - "$T/packs/town-deltas/assets/claude-overlays/pool-reviewer/.claude/settings.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["hooks"]["PostToolUseFailure"] = "isto não é uma lista"
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False); open(p, "a").write("\n")
+PYEOF
+expect_fail "PostToolUseFailure que não é lista: o check REPORTA (não vira exceção) e trata como hook sumido" "perdeu o hook PostToolUseFailure do cut-output-shadow"
+if run_check | grep -q Traceback; then bad "o check estoura traceback com PostToolUseFailure malformado"; else ok "PostToolUseFailure malformado não gera traceback"; fi
 # `live`: registrado != vivo. O hook é [ -f "$P" ] || exit 0, então um overlay correto com o script ausente é um no-op calado.
 reset_tree
 LIVEROOT="$W/liveroot"; mkdir -p "$LIVEROOT/.gascity-gastown-hq/scripts"

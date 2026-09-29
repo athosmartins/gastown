@@ -79,6 +79,11 @@ def _subst_deep(obj, paths):
 
 
 GUARD_HOOK_MARKER = "home-scan-guard"     # ga-02cqk4: todo overlay de papel TEM que carregar este hook (ver check_overlays)
+# ga-wk0qi2 (gate_run ga-vrv1tz): a saída de um Bash chega ao hook por UM de dois eventos — PostToolUse só se o comando saiu com 0; com código != 0
+# dispara PostToolUseFailure NO LUGAR (sem tool_response; a saída fica em `error`). Verificado ao vivo no Claude Code 2.1.284. Registrado só no
+# primeiro, o cut-output-shadow media só os comandos que funcionaram; por isso o check exige os DOIS.
+CUT_OUTPUT_HOOK_MARKER = "cut-output-shadow"
+CUT_OUTPUT_EVENTS = ("PostToolUse", "PostToolUseFailure")
 
 
 def _cmd(h):
@@ -263,6 +268,29 @@ def check_guard_hook(role, cfg):
     return errs
 
 
+def check_cut_output_hooks(role, cfg):
+    """ga-wk0qi2: o hook do cut-output-shadow existe nos DOIS eventos que carregam a saída de um Bash, com o matcher `^Bash$` (mesma razão do
+    home-scan-guard: o motor mescla por identidade de matcher). Checagem INDEPENDENTE da igualdade com o manifesto: se o evento sai do manifesto E dos
+    overlays juntos, a igualdade passa calada e a medição volta a enxergar só os comandos que funcionaram. Um `hooks`/evento que não é o tipo esperado
+    é "não sei ler" = hook sumido, nunca uma exceção do check."""
+    errs = []
+    hooks = cfg.get("hooks")
+    for event in CUT_OUTPUT_EVENTS:
+        entries = hooks.get(event) if isinstance(hooks, dict) else None
+        entries = entries if isinstance(entries, list) else []
+        mine = [e for e in entries if isinstance(e, dict) and isinstance(e.get("hooks"), list)
+                and any(CUT_OUTPUT_HOOK_MARKER in _cmd(h) for h in e["hooks"])]
+        if not mine:
+            errs.append(f"overlay '{role}': perdeu o hook {event} do cut-output-shadow (ga-wk0qi2) — PostToolUse só dispara para Bash que saiu com 0 e "
+                        "PostToolUseFailure para o que saiu com código != 0; sem um dos dois a medição não vê essa metade dos comandos")
+            continue
+        for e in mine:
+            if e.get("matcher") != "^Bash$":
+                errs.append(f"overlay '{role}': hook {event} do cut-output-shadow com matcher {e.get('matcher')!r}; tem que ser '^Bash$' — o motor mescla por "
+                            "identidade de matcher, então 'Bash' SUBSTITUIRIA a entrada Bash do workdir")
+    return errs
+
+
 def check_overlays(m):
     errs = []
     with open(OVERLAYS / m["base_overlay"] / ".claude" / "settings.json", encoding="utf-8") as fh:
@@ -293,6 +321,7 @@ def check_overlays(m):
         if cfg.get("remoteControlAtStartup") is not False:
             errs.append(f"overlay '{role}': remoteControlAtStartup tem que ser false (wa-cy6we)")
         errs.extend(check_guard_hook(role, cfg))
+        errs.extend(check_cut_output_hooks(role, cfg))
         if r["td_role"] in m["common"].get("mayor_memory_roles", []) and cfg.get("autoMemoryEnabled") is not False:
             errs.append(f"overlay '{role}': autoMemoryEnabled tem que ser false (o índice de memória desse papel é o do Mayor)")
         if not isinstance(cfg.get("autoMemoryEnabled"), bool):
