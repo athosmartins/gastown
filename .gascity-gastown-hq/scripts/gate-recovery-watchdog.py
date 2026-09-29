@@ -4703,14 +4703,33 @@ def recover_needs_rebase_markers(now, rstate):
 # switch, an unreadable log, a failing bd query/close, or a verdict form the recognizer does not
 # know all leave a bead open too.
 #
-# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` / `Gate PASSED (origin=Pilot):` line, or a
-# `Gate FAILED: Reviewer N FAIL:` line (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is
+# WHAT COUNTS AS A VERDICT: a `Gate PASSED:` / `Gate PASSED (origin=Pilot):` entry, or a
+# `Gate FAILED: Reviewer N FAIL:` entry (a reviewer delivered a FAIL). `Gate FAILED: TIMEOUT` is
 # NOT one — it is the very failure these alarms report (recent_timeouts() counts it as the
 # gate-down signal), so closing on it would close the alarm BECAUSE of the fault. The COMPOSITE
-# line — a Phase C timeout that also collected a reviewer FAIL, logged as one line "Reviewer N
-# FAIL: …\nTIMEOUT: …" (dispatcher ga-h8vc8y) — is a timeout too, so it is skipped the same way.
-# Merge failures / source-parked / preflight aborts are not reviewer verdicts either; leaving
-# those out only ever keeps a bead open.
+# entry — a Phase C timeout that also collected a reviewer FAIL (dispatcher ga-h8vc8y) — is a
+# timeout too, so it is skipped the same way. Merge failures / source-parked / preflight aborts
+# are not reviewer verdicts either; leaving those out only ever keeps a bead open.
+#
+# AN ENTRY IS NOT A PHYSICAL LINE. The dispatcher's log() is `echo "[ts] [quality-gate-dispatcher] $*"`
+# and the reviewer's FAIL comment inside `Gate FAILED: $FAIL_REASONS` is multi-line, so only the FIRST
+# line carries the prefix; the rest are continuation lines. In the composite, FAIL_REASONS is
+# `Reviewer N FAIL: <multi-line comment>\n` + `TIMEOUT: reviewers did not submit verdicts within N
+# minutes.` (the `\n` is a literal backslash-n) — so the TIMEOUT sentence ends up on the LAST
+# CONTINUATION line, never on the prefixed line. Measured 29/09 on the live log: 448 of 448 `Gate
+# FAILED: Reviewer N FAIL:` entries are multi-line. _log_entries() therefore groups each prefixed
+# line with the lines that follow it up to the next prefixed line, and the composite/timeout test
+# reads the WHOLE entry (gate-run ga-ic6882: the first cut tested only the prefixed line, so the
+# guard could never fire and a timed-out run read as a recovery).
+# Two consequences, both on the inert side:
+#   * the whole-entry search over-skips a real reviewer FAIL whose comment merely QUOTES the sentinel
+#     sentence — that only keeps a bead open until the next verdict;
+#   * a FAILED entry that is the LAST one in the window is not counted: the TIMEOUT tail is the last
+#     thing written, so an entry still being written is indistinguishable from a plain FAIL until a
+#     later entry proves it finished. PASS entries are single-line and need no such wait.
+# NOT closed by grouping: a quote that starts a continuation line at column 0 is textually identical to
+# a real entry start, so it is read as one. It can only reproduce a verdict line copied from the log
+# (which then exists twice), or a hand-typed example — accepted, and an indented quote is safe.
 #
 # SCOPE OF THE EVIDENCE: ANY later verdict closes the bead, not one for the run/branch the alarm
 # names. That is the right question for "did the gate come back" — but a run whose reviewers all
@@ -4739,29 +4758,51 @@ _REPAIR_AUDIT_DRYRUN_SEEN = set()   # bead ids already reported as would-close u
 GATE_VERDICT_LINE_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[quality-gate-dispatcher\] "
                                   r"Gate (PASSED|FAILED)(?: \(origin=[^)]*\))?: (.*)$")
 GATE_REVIEWER_FAIL_RE = re.compile(r"Reviewer \d+ FAIL:")
+# The first line of ANY dispatcher-log entry (log()/warn()/err() all write `[ts] [<who>] …`). A line that does not
+# start like this is a CONTINUATION of the entry above it (the 2nd+ lines of a multi-line message).
+GATE_ENTRY_START_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] \[")
+# The dispatcher's literal FAIL_REASONS text for a Phase C timeout (quality-gate-dispatcher.sh:~10509, its ONLY emit site).
+GATE_TIMEOUT_SENTINEL = "TIMEOUT: reviewers did not submit"
+
+
+def _log_entries(lines):
+    """PURE. Group physical dispatcher-log `lines` into ENTRIES → [(head, continuation_lines, finished)].
+    `head` is the prefixed first line; `continuation_lines` are the prefix-less lines after it up to the next
+    prefixed line; `finished` is True when a LATER entry exists — proof the writer moved on, so this entry is
+    complete. The last entry is not finished (it may still be being written). Continuation lines that come
+    before the first prefixed line (a tail read cut mid-entry) belong to an entry outside the window: dropped."""
+    entries = []
+    for l in lines:
+        if GATE_ENTRY_START_RE.match(l):
+            entries.append((l, []))
+        elif entries:
+            entries[-1][1].append(l)
+    return [(head, cont, i < len(entries) - 1) for i, (head, cont) in enumerate(entries)]
 
 
 def _gate_verdicts_in(lines):
-    """PURE. [(epoch, line_text)] for every REAL gate verdict in dispatcher-log `lines`
-    (see the FIX 10 block above for what counts). A line whose timestamp does not parse is
-    skipped — an undatable verdict can prove nothing about being AFTER anything."""
+    """PURE. [(epoch, head_line_text)] for every REAL gate verdict ENTRY in dispatcher-log `lines`
+    (see the FIX 10 block above for what counts and why an entry is not a physical line). An entry
+    whose timestamp does not parse is skipped — an undatable verdict can prove nothing about being AFTER anything."""
     out = []
-    for l in lines:
-        m = GATE_VERDICT_LINE_RE.match(l)
+    for head, cont, finished in _log_entries(lines):
+        m = GATE_VERDICT_LINE_RE.match(head)
         if not m:
             continue
-        if m.group(1) == "FAILED" and not GATE_REVIEWER_FAIL_RE.match(m.group(2)):
-            continue   # TIMEOUT / merge failure / parked source / preflight abort — not a reviewer verdict
-        if m.group(1) == "FAILED" and "TIMEOUT:" in m.group(2):
-            # a Phase C timeout that ALSO collected a reviewer FAIL logs both in ONE line (dispatcher
-            # ga-h8vc8y: "Reviewer 1 FAIL: …\nTIMEOUT: reviewers did not submit …"). The run timed out —
-            # the very fault these alarms report — so it is not a recovery. Skipping only ever leaves a
-            # bead open (the inert side); the next real verdict still closes it.
-            continue
-        e = log_ts_epoch(l)
+        if m.group(1) == "FAILED":
+            if not GATE_REVIEWER_FAIL_RE.match(m.group(2)):
+                continue   # TIMEOUT / merge failure / parked source / preflight abort — not a reviewer verdict
+            if GATE_TIMEOUT_SENTINEL in "\n".join([m.group(2)] + cont):
+                # a Phase C timeout that ALSO collected a reviewer FAIL (dispatcher ga-h8vc8y): the sentinel sits at
+                # the end of the entry's LAST continuation line. The run timed out — the very fault these alarms
+                # report — so it is not a recovery. Skipping only ever leaves a bead open (the inert side).
+                continue
+            if not finished:
+                continue   # last entry in the window: its TIMEOUT tail may not be written yet — wait for a later entry
+        e = log_ts_epoch(head)
         if e is None:
             continue
-        out.append((e, l.strip()))
+        out.append((e, head.strip()))
     return out
 
 

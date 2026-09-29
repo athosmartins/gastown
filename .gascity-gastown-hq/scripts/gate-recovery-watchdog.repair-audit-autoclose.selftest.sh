@@ -14,6 +14,8 @@
 # once a real gate verdict (Gate PASSED, or a reviewer FAIL) appears AFTER its created_at, quoting
 # the verdict. Three states, never two: verdict-after -> close; log read + no verdict -> leave;
 # log unreadable / created_at unparsable -> leave. `Gate FAILED: TIMEOUT` is the fault itself, not a verdict.
+# A verdict is a log ENTRY, not a physical line: fixtures here use the production shape (one prefixed line + the
+# reviewer's prefix-less continuation lines, the TIMEOUT sentence ending the last one) — gate-run ga-ic6882.
 #
 # Exercises close_recovered_repair_audit_beads() end-to-end against a REAL temp file standing in for
 # DISPATCH_LOG, with sh() mocked (no real subprocess, no real bd, no real Dolt).
@@ -59,7 +61,18 @@ def passed(epoch, branch="fix/ga-7vmcr1"):
     return "%s [quality-gate-dispatcher] Gate PASSED: branch=%s tier=CODE merge_sha=abc123 elapsed=641s\n" % (logts(epoch), branch)
 
 def reviewer_fail(epoch):
-    return "%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\n" % logts(epoch)
+    # The REAL shape of a reviewer FAIL entry (quality-gate-dispatcher.sh:9882 → log "Gate FAILED: $FAIL_REASONS"): ONE prefixed
+    # line, then the reviewer's multi-line comment WITHOUT a prefix. Measured on the live log 29/09: 448 of 448 such entries
+    # are multi-line, 0 single-line — so a fixture that puts the whole FAIL on one physical line tests a shape production never emits.
+    return ("%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\n"
+            "Lens: CORRECTNESS. Reviewed abc123.\n"
+            "\n"
+            "Blocking issue 1: the guard never fires.\\n\n" % logts(epoch))
+
+def later(epoch):
+    # any LATER entry — what the dispatcher writes right after a verdict (labels, nudges…). It is the proof that the entry
+    # before it is complete (a multi-line entry that is the LAST thing in the log may still be being written).
+    return "%s [quality-gate-dispatcher] Marking ga-x gate:needs-fix (attempt 1/3) for autonomous Pilot re-dispatch\n" % logts(epoch)
 
 def timeout_fail(epoch):
     return "%s [quality-gate-dispatcher] Gate FAILED: TIMEOUT: reviewers did not submit verdicts within 28 minutes.\n" % logts(epoch)
@@ -70,10 +83,18 @@ def pilot_passed(epoch, branch="crew/wa-worker/wa-2auxx"):
     return "%s [quality-gate-dispatcher] Gate PASSED (origin=Pilot): branch=%s tier=NON-CODE merge_sha=abc123 elapsed=412s\n" % (logts(epoch), branch)
 
 def composite_fail(epoch):
-    # quality-gate-dispatcher.sh:10535 (ga-h8vc8y): a Phase C timeout that ALSO collected a real reviewer FAIL logs
-    # both in ONE line — the collected reasons, a literal backslash-n, then the TIMEOUT sentinel.
-    return ("%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\\nTIMEOUT: reviewers did not "
-            "submit verdicts within 34 minutes.\n" % logts(epoch))
+    # quality-gate-dispatcher.sh:9882 + :10535 (ga-h8vc8y): a Phase C timeout that ALSO collected a real reviewer FAIL.
+    # FAIL_REASONS = "Reviewer 1 FAIL: <multi-line comment>" + a LITERAL backslash-n + "TIMEOUT: …", and log() writes only the
+    # first line with the prefix — so the TIMEOUT sentence ends the LAST CONTINUATION line. This is the shape gate-run ga-ic6882
+    # showed the first cut could not see (its fixture had the whole thing on one physical line: 0 of 448 in production).
+    return ("%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL\n"
+            "Lens: CORRECTNESS. Reviewed abc123.\n"
+            "\n"
+            "Non-blocking findings: none\\nTIMEOUT: reviewers did not submit verdicts within 34 minutes.\n" % logts(epoch))
+
+def phys(*chunks):
+    # the reader gets PHYSICAL lines (str.splitlines of the log bytes) — flatten multi-line fixtures the same way.
+    return "".join(chunks).splitlines()
 
 def bead(bid, created, assignee=""):
     return {"id": bid, "created_at": created if isinstance(created, str) else iso(created), "assignee": assignee,
@@ -139,8 +160,11 @@ check(closes == [], "only 'Gate FAILED: TIMEOUT' after T → stays OPEN (a timeo
       "closed because of a TIMEOUT line: %r" % (closes,))
 
 # ── 4. a reviewer FAIL is a delivered verdict → the gate is producing verdicts → closes ───────────
-closes, _, _ = sweep([reviewer_fail(T + 600)], [bead("ga-x3", T)])
-check([c[0] for c in closes] == ["ga-x3"], "a reviewer FAIL after T counts as a verdict → closed", "reviewer FAIL not counted: %r" % (closes,))
+closes, _, _ = sweep([reviewer_fail(T + 600), later(T + 660)], [bead("ga-x3", T)])
+check([c[0] for c in closes] == ["ga-x3"], "a (multi-line) reviewer FAIL after T counts as a verdict → closed", "reviewer FAIL not counted: %r" % (closes,))
+check(closes and "Gate FAILED: Reviewer 1 FAIL" in closes[0][1] and "Blocking issue" not in closes[0][1],
+      "the close reason quotes the entry's PREFIXED head line only, not the reviewer's whole comment",
+      "close reason quotes the wrong text for a multi-line entry: %r" % (closes,))
 
 # ── 5. THREE states: unreadable log is NOT 'no verdict' and NOT 'resolved' ────────────────────────
 closes, _, _ = sweep([passed(T + 600)], [bead("ga-x4", T)], log_missing=True)
@@ -240,13 +264,56 @@ check(_of == [], "an origin-tagged FAILED that is a TIMEOUT is still NOT a verdi
 
 # ── 17. composite: a reviewer FAIL collected by a run that ALSO timed out (ga-h8vc8y) → stays open ─────
 # The run timed out — that is the fault these alarms report. Leaving it open only ever costs a longer alarm.
-closes, _, _ = sweep([composite_fail(T + 600)], [bead("ga-x17", T)])
-check(closes == [], "reviewer-FAIL + TIMEOUT in one line → stays OPEN (the run timed out)",
-      "closed on a composite TIMEOUT line: %r" % (closes,))
-closes, _, _ = sweep([composite_fail(T + 600), pilot_passed(T + 900)], [bead("ga-x17b", T)])
+# The REAL shape (gate-run ga-ic6882): the TIMEOUT sentence is on the last CONTINUATION line of a multi-line entry, so a
+# reader that looks at physical lines never sees it. The composite is followed by a later entry (as it always is in
+# production) so the completeness rule cannot be what keeps it open — only the sentinel test can.
+closes, _, _ = sweep([composite_fail(T + 600), later(T + 660)], [bead("ga-x17", T)])
+check(closes == [], "reviewer-FAIL + TIMEOUT (real multi-line shape, TIMEOUT on the last continuation line) → stays OPEN",
+      "closed on a composite TIMEOUT entry — a timed-out run read as a recovery: %r" % (closes,))
+_cv = m._gate_verdicts_in(phys(composite_fail(T + 600), later(T + 660)))
+check(_cv == [], "pure: the composite entry is not a verdict", "pure reader counted the composite as a verdict: %r" % (_cv,))
+closes, _, _ = sweep([composite_fail(T + 600), later(T + 660), pilot_passed(T + 900)], [bead("ga-x17b", T)])
 check([c[0] for c in closes] == ["ga-x17b"] and "origin=Pilot" in closes[0][1],
-      "…and a real verdict AFTER the composite line still closes it, quoting THAT verdict, not the composite",
-      "composite line masked or replaced the real verdict: %r" % (closes,))
+      "…and a real verdict AFTER the composite entry still closes it, quoting THAT verdict, not the composite",
+      "composite entry masked or replaced the real verdict: %r" % (closes,))
+# the plain (non-composite) multi-line reviewer FAIL right before it must NOT be swept up by the sentinel test
+closes, _, _ = sweep([reviewer_fail(T + 600), later(T + 660)], [bead("ga-x17c", T)])
+check([c[0] for c in closes] == ["ga-x17c"],
+      "a multi-line reviewer FAIL WITHOUT the TIMEOUT sentence is still a verdict (the sentinel test does not over-reach)",
+      "the composite guard swallowed a plain reviewer FAIL: %r" % (closes,))
+
+# ── 17b. an entry is only trusted once a LATER entry proves it is complete (the third state: 'still being written') ──
+# The TIMEOUT tail is the LAST thing written into a multi-line FAILED entry. An entry that is the final thing in the
+# log cannot be told from a plain FAIL, so it is not counted yet; the next log line resolves it either way.
+closes, _, _ = sweep([reviewer_fail(T + 600)], [bead("ga-x17d", T)])
+check(closes == [], "a FAILED entry that is the LAST thing in the log → not counted yet (may be half-written) → stays OPEN",
+      "closed on a possibly half-written FAILED entry: %r" % (closes,))
+_lv = m._gate_verdicts_in(phys(reviewer_fail(T + 600)))
+check(_lv == [], "pure: the trailing FAILED entry is not a verdict until a later entry exists", "pure reader counted an unfinished entry: %r" % (_lv,))
+_lv = m._gate_verdicts_in(phys(reviewer_fail(T + 600), later(T + 601)))
+check(len(_lv) == 1, "pure: …and the same entry IS a verdict once a later entry exists", "pure reader dropped a finished entry: %r" % (_lv,))
+closes, _, _ = sweep([passed(T + 600)], [bead("ga-x17e", T)])
+check([c[0] for c in closes] == ["ga-x17e"],
+      "a single-line PASS as the LAST line still closes at once (no completeness wait — it is one atomic line)",
+      "a trailing PASS was held back: %r" % (closes,))
+
+# ── 17c. grouping: continuation lines belong to the entry above; a window cut mid-entry drops its orphan lines ──
+_ents = m._log_entries(phys(reviewer_fail(T + 600), later(T + 660)))
+check(len(_ents) == 2 and len(_ents[0][1]) == 3 and _ents[0][2] is True and _ents[1][2] is False,
+      "pure: _log_entries groups the 3 continuation lines under their prefixed head; only the LAST entry is unfinished",
+      "_log_entries grouped wrongly: %r" % (_ents,))
+_orphan = m._gate_verdicts_in(["Non-blocking findings: none\\nTIMEOUT: reviewers did not submit verdicts within 34 minutes."]
+                              + phys(passed(T + 600)))
+check(len(_orphan) == 1 and "Gate PASSED" in _orphan[0][1],
+      "pure: continuation lines BEFORE the first prefixed line (tail read cut mid-entry) are dropped, and do not hide the next verdict",
+      "orphan continuation line broke the reader: %r" % (_orphan,))
+# an INDENTED quote of a verdict inside a comment is a continuation line, never an entry (the live log holds one, ga-ic6882's own feedback)
+_iq = m._gate_verdicts_in(phys(reviewer_fail(T - 600),
+                               "  %s [quality-gate-dispatcher] Gate PASSED: branch=x tier=CODE\n" % logts(T + 600),
+                               later(T - 500)))
+check(len(_iq) == 1 and _iq[0][0] < T,
+      "pure: an indented quote of a PASS line inside a reviewer comment is not a verdict (only the real FAIL, dated before T, is)",
+      "an indented quote was read as a verdict: %r" % (_iq,))
 
 # ── 18. dry-run must not write the same would_close ledger line on every 120s sweep ─────────────────
 closes, _, ledger = sweep([passed(T + 600)], [bead("ga-x18", T)], dry_run=True, repeat=3)
@@ -299,6 +366,7 @@ def quoted_in_comment(epoch_real, epoch_quoted):
         "Lens: CORRECTNESS. Fact-checked: m._gate_verdicts_in([\"%s [quality-gate-dispatcher] Gate PASSED "
         "(origin=Pilot): branch=crew/wa-worker/wa-2auxx tier=NON-CODE\"]) returns []\n" % logts(epoch_quoted),
         "Plain form quoted too: %s [quality-gate-dispatcher] Gate PASSED: branch=x tier=CODE\n" % logts(epoch_quoted),
+        later(epoch_real + 5),      # the entry is finished, so the real FAIL is countable — only the QUOTES must not be
     ]
 # real reviewer-FAIL BEFORE the bead exists; the only thing AFTER T is text quoted inside its comment
 closes, _, _ = sweep(quoted_in_comment(T - 600, T + 600), [bead("ga-x21", T)])
