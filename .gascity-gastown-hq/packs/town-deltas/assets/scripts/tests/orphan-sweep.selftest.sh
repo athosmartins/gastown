@@ -39,16 +39,19 @@ RESET_LOG="$WORK/reset.log"
 FAKE_GC_DIR="$WORK/bin"
 mkdir -p "$FAKE_GC_DIR"
 ln -s "$SELF_DIR/orphan-sweep.fake-gc" "$FAKE_GC_DIR/gc"
+# ga-ck3sz7: the sweep runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh): $FAKE_GC_DIR, a dir holding only
+# a symlink to `jq`, and the system dirs. This used to be "$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" — and the real
+# gc and bd live in /opt/homebrew/bin, so the moment $WORK went away under a running sweep `gc` resolved to the REAL one
+# (and `gc bd update ... --add-label orphan-sweep:reset` would have run against the real city).
+. "$SELF_DIR/../../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/../../selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq || exit 2   # jq: the ledger and the session/bead JSON; gc is the fake above, everything else is in the system dirs
 
 run_sweep() {
     # $1 = FAKE_SESSION_JSON, $2 = FAKE_INPROGRESS_JSON, $3 = FAKE_AGENTS
-    # env -i: fully isolated PATH so the REAL `gc`/`bd` binaries (which also
-    # live under /opt/homebrew/bin, same dir as `jq`) are NEVER reachable —
-    # $FAKE_GC_DIR is listed first so our `gc` shim wins the lookup, but we
-    # do not rely on ordering alone: /opt/homebrew/bin/gc must never run
-    # against the real production city during a "test".
+    # env -i + PATH="$SANDBOX_PATH": the REAL `gc`/`bd` are not on the PATH at all. $FAKE_GC_DIR is first so our `gc`
+    # shim is what answers; if it vanishes the answer is "command not found", never /opt/homebrew/bin/gc.
     env -i \
-        PATH="$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" \
+        PATH="$SANDBOX_PATH" \
         HOME="$HOME" \
         GC_CITY="$CITY" \
         RESET_LOG="$RESET_LOG" \
@@ -68,7 +71,7 @@ ledger_count() {
 }
 
 echo "── 0. harness sanity: confirm the gc SHIM (not the real binary) is what runs ──"
-SHIM_CHECK=$(env -i PATH="$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" HOME="$HOME" gc rig list --json)
+SHIM_CHECK=$(env -i PATH="$SANDBOX_PATH" HOME="$HOME" gc rig list --json)
 if [ "$SHIM_CHECK" = '{"rigs":[]}' ]; then
     ok "gc resolves to the test shim, not the real production binary"
 else
