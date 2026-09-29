@@ -18,6 +18,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/scripts" && pwd)"
 SCRIPT="$HERE/digest-sweep.sh"
+ASSETS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ga-ck3sz7: the sweep runs on a PATH with NO real bd (selftest-sandbox-path.lib.sh). It CLOSES beads; if
+# $FIXTURE_DIR vanished under it while it ran, the real `bd` further down $PATH would close real digests.
+# Here "command not found" is the only outcome.
+. "$ASSETS/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $ASSETS/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 
 P=0; F=0
 ok(){ echo "  ok: $*"; P=$((P+1)); }
@@ -36,6 +41,7 @@ TOMORROW="$(date -u -v+1d +%Y-%m-%d 2>/dev/null || date -u -d tomorrow +%Y-%m-%d
 
 FIXTURE_DIR="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
+mkdir -p "$FIXTURE_DIR/bin"
 
 CLOSED_LOG="$FIXTURE_DIR/closed.log"
 : > "$CLOSED_LOG"
@@ -45,7 +51,7 @@ LIST_ARGS_LOG="$FIXTURE_DIR/list-args.log"
 # Stub `bd`: `bd list ...` records the exact args it was called with (so we
 # can assert --include-infra was requested) and prints a fixed fixture;
 # `bd close <id> ...` records the id instead of touching any real database.
-cat > "$FIXTURE_DIR/bd" <<STUB
+cat > "$FIXTURE_DIR/bin/bd" <<STUB
 #!/usr/bin/env bash
 case "\$1" in
   list)
@@ -61,7 +67,8 @@ case "\$1" in
     ;;
 esac
 STUB
-chmod +x "$FIXTURE_DIR/bd"
+chmod +x "$FIXTURE_DIR/bin/bd"
+sandbox_path_init "$FIXTURE_DIR" jq || exit 2   # jq: the sweep's title parse; bd is the stub above
 
 cat > "$FIXTURE_DIR/fixture.json" <<JSON
 [
@@ -74,7 +81,7 @@ cat > "$FIXTURE_DIR/fixture.json" <<JSON
 ]
 JSON
 
-PATH="$FIXTURE_DIR:$PATH" "$SCRIPT"
+PATH="$SANDBOX_PATH" "$SCRIPT"
 RC=$?
 [ "$RC" -eq 0 ] && ok "script exits 0" || bad "script exited $RC"
 

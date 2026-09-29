@@ -73,8 +73,9 @@ done
 #    any real session/bead state ─────────────────────────────────────────
 STUBDIR="$(mktemp -d)"
 trap 'rm -rf "$STUBDIR"' EXIT
+mkdir -p "$STUBDIR/bin"
 
-cat > "$STUBDIR/gc" <<'STUB'
+cat > "$STUBDIR/bin/gc" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "session list")
@@ -95,7 +96,12 @@ case "$1 $2" in
     ;;
 esac
 STUB
-chmod +x "$STUBDIR/gc"
+chmod +x "$STUBDIR/bin/gc"
+# ga-ck3sz7: the extracted patrol code runs on a PATH with NO real gc (selftest-sandbox-path.lib.sh). It calls
+# `gc mail send` (the Mayor's inbox) on a read failure; if $STUBDIR vanished under it, the real `gc` further down
+# $PATH would send that mail for real. Here "command not found" is the only outcome.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$STUBDIR" jq || exit 2   # jq: the extracted code's session/bead parse; gc is the stub above
 
 TWO_LIVE_SESSIONS='{"sessions":[{"id":"s1","name":"gastown.dog-1","state":"active","closed":false},{"id":"s2","name":"gastown.dog-2","state":"active","closed":false}]}'
 ONE_OVERLAY_ROW='[{"metadata":{"configured_named_identity":"lexbh/gastown.witness","state":"active"},"status":"open"}]'
@@ -111,7 +117,7 @@ run_scenario() {
     STUB_SESSIONS_RC="$sessions_rc" STUB_SESSIONS_BODY="$sessions_body" \
     STUB_BEADS_RC="$beads_rc" STUB_BEADS_BODY="$beads_body" \
     MAIL_LOG="$mail_log" \
-    PATH="$STUBDIR:$PATH" \
+    PATH="$SANDBOX_PATH" \
     bash -c "$LIVENESS_CODE"$'\n''echo "RESULT MAP_COUNT=$MAP_COUNT SESSION_COUNT=$SESSION_COUNT"' 2>&1
   )"
   rc=$?

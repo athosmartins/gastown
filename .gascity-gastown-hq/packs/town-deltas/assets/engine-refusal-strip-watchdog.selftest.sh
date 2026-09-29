@@ -21,6 +21,10 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ga-ck3sz7: the watchdog runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It labels and comments
+# real beads (`bd label add`, `bd comment`); if $WORK vanished under a running pass, the real `bd` further down
+# $PATH would take those mutations. Here "command not found" is the only outcome.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 WATCHDOG="$HERE/engine-refusal-strip-watchdog.sh"
 [ -f "$WATCHDOG" ] || { echo "FAIL: watchdog not found at $WATCHDOG" >&2; exit 1; }
 
@@ -144,6 +148,7 @@ case "\$3" in
 esac
 SHIM
 chmod +x "$SHIM_DIR/bd"
+sandbox_path_init "$WORK" flock timeout jq || exit 2   # flock: single-instance lock; timeout: bounds gc/bd; jq: bead parse; gc/bd are the shims above
 
 # ── fixture builders ─────────────────────────────────────────────────────────
 
@@ -235,7 +240,7 @@ reset_all() {
 }
 
 run() {  # run [extra env assignments...]
-    env GC_CITY_PATH="$WORK/city" PATH="$SHIM_DIR:$PATH" \
+    env GC_CITY_PATH="$WORK/city" PATH="$SANDBOX_PATH" \
         LOOKBACK_HOURS=72 DOLT_DB=hq "$@" \
         bash "$WATCHDOG" >/dev/null 2>&1
 }

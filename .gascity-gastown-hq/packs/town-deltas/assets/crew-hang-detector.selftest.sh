@@ -19,6 +19,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DETECTOR="$HERE/crew-hang-detector.sh"
 [ -f "$DETECTOR" ] || { echo "FAIL: detector not found at $DETECTOR" >&2; exit 1; }
+# ga-ck3sz7: the detector runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It nudges sessions and
+# files warrant beads; if $WORK vanished under a running pass, the real `gc` further down $PATH would take
+# those calls. Here "command not found" is the only outcome.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 
 PASS=0; FAIL=0
 ok()   { echo "  ok: $*"; PASS=$((PASS+1)); }
@@ -59,6 +63,7 @@ echo "notify \$*" >> "$ACTIONS"
 exit 0
 SHIM
 chmod +x "$SHIM_DIR/notify"
+sandbox_path_init "$WORK" timeout python3 jq || exit 2   # timeout bounds every gc call; python3/jq parse; gc/notify are the shims above
 
 # Active-work spinner pane (frozen frame): ellipsis + parenthesized elapsed.
 ACTIVE_PANE_A=$'  some tool output line\n✳ Gitifying… (15m 49s · ↓ 61.3k tokens)\n❯ \n  [Opus] ctx: 10%'
@@ -99,7 +104,7 @@ fresh_city() {  # echo a clean city path
 # Run one detector pass against an existing city (state preserved across calls).
 pass() {  # pass <city> [extra env assignments...]
     local city="$1"; shift
-    env GC_CITY_PATH="$city" PATH="$SHIM_DIR:$PATH" \
+    env GC_CITY_PATH="$city" PATH="$SANDBOX_PATH" \
         STALE_SEC=600 ESCALATE_SEC=1200 DRY_RUN=0 PEEK_LINES=40 "$@" \
         bash "$DETECTOR" >/dev/null 2>&1
 }
