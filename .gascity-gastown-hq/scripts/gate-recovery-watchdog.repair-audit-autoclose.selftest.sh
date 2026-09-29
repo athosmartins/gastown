@@ -104,9 +104,11 @@ class CP:
     def __init__(self, stdout="", returncode=0):
         self.stdout, self.returncode = stdout, returncode
 
-def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry_run=False, log_bytes=None, repeat=1):
+def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry_run=False, log_bytes=None, repeat=1,
+          enabled=True, close_enabled=True, max_per_sweep=None):
     """Run close_recovered_repair_audit_beads() `repeat` times against a temp dispatcher log. Returns
-    (closes, calls, ledger) — closes = [(bead_id, reason)] for every `bd close` issued."""
+    (closes, calls, ledger) — closes = [(bead_id, reason)] for every `bd close` issued.
+    enabled / close_enabled / max_per_sweep drive the two kill switches and the per-sweep cap (restored afterwards)."""
     fd, path = tempfile.mkstemp(prefix="grw-dispatch-log-")
     lfd, lpath = tempfile.mkstemp(prefix="grw-recovery-log-")
     os.close(lfd)
@@ -114,10 +116,15 @@ def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(log_bytes if log_bytes is not None else "".join(log_lines).encode("utf-8"))
-        saved = (m.DISPATCH_LOG, m.sh, m.RECOVERY_LOG, m.GRW_DRY_RUN, m.GRW_ENABLED)
+        saved = (m.DISPATCH_LOG, m.sh, m.RECOVERY_LOG, m.GRW_DRY_RUN, m.GRW_ENABLED,
+                 m.GRW_CLOSE_REPAIR_AUDIT_ENABLED, m.REPAIR_AUDIT_MAX_PER_SWEEP)
         m.DISPATCH_LOG = "/nonexistent/grw-dispatch.log" if log_missing else path
         m.RECOVERY_LOG = lpath
         m.GRW_DRY_RUN = dry_run
+        m.GRW_ENABLED = enabled
+        m.GRW_CLOSE_REPAIR_AUDIT_ENABLED = close_enabled
+        if max_per_sweep is not None:
+            m.REPAIR_AUDIT_MAX_PER_SWEEP = max_per_sweep
 
         def fake_sh(args, timeout=20, stdin=None):
             calls.append(list(args))
@@ -132,7 +139,8 @@ def sweep(log_lines, beads, list_fails=False, close_rc=0, log_missing=False, dry
             for _ in range(repeat):
                 m.close_recovered_repair_audit_beads(NOW)
         finally:
-            m.DISPATCH_LOG, m.sh, m.RECOVERY_LOG, m.GRW_DRY_RUN, m.GRW_ENABLED = saved
+            (m.DISPATCH_LOG, m.sh, m.RECOVERY_LOG, m.GRW_DRY_RUN, m.GRW_ENABLED,
+             m.GRW_CLOSE_REPAIR_AUDIT_ENABLED, m.REPAIR_AUDIT_MAX_PER_SWEEP) = saved
         with open(lpath) as f:
             ledger = [json.loads(x) for x in f if x.strip()]
         return closes, calls, ledger
@@ -205,11 +213,50 @@ closes, _, _ = sweep([passed(T + 600)], [bead("ga-old", T), bead("ga-new", T + 1
 check([c[0] for c in closes] == ["ga-old"], "old bead closes, bead created AFTER the verdict stays open", "wrong subset closed: %r" % (closes,))
 
 # ── 10. digest / non-dispatcher lines that merely CONTAIN 'Gate PASSED' are not verdicts ──────────
+# The merge-failure line is FOLLOWED by a later entry (gate-run ga-gbdzt9). A FAILED entry that is the LAST thing in the log is
+# dropped by the completeness rule (17b) before the reviewer-FAIL prefix guard is ever reached — the first cut of this fixture
+# ended on it, so the whole check passed with that guard deleted. Only the guard may reject it here.
 noise = ["%s [some-other] Logged for digest (infra mirror off): Quality Gate PASSED\n" % logts(T + 600),
          "%s [some-other] Logged for digest (infra mirror off): 🤖 Pilot Gate PASSED\n" % logts(T + 700),
-         "%s [quality-gate-dispatcher] Gate FAILED: Merge failed after all-PASS verdict. Merge result: x\n" % logts(T + 800)]
+         "%s [quality-gate-dispatcher] Gate FAILED: Merge failed after all-PASS verdict. Merge result: x\n" % logts(T + 800),
+         later(T + 810)]
 closes, _, _ = sweep(noise, [bead("ga-x10", T)])
 check(closes == [], "digest lines / merge-failure lines are not verdicts → stays OPEN", "closed on a non-verdict line: %r" % (closes,))
+
+# ── 10b. every non-reviewer `Gate FAILED:` shape in the live log is not a verdict (the prefix guard, in isolation) ──
+# One REAL line per shape: every non-reviewer, non-TIMEOUT `Gate FAILED:` form present in the live dispatcher log on 29/09
+# (TIMEOUT has its own checks, #3/#16). That is what the log HAS held, not a proof of what the dispatcher could ever emit — the
+# guard rejects by exclusion, so a new form is rejected too. GATE_REVIEWER_FAIL_RE.match(...) is the ONLY thing between these and
+# a "recovery" that closes a real alarm (the destructive direction). Each entry is followed by a LATER entry, so it is FINISHED (the
+# completeness rule cannot be what rejects it) and none carries the TIMEOUT sentence (the sentinel test cannot either).
+# Gate-run ga-gbdzt9: with the guard replaced by `if False:` the suite stayed 62/62 green.
+NONREVIEWER_FAILED = [
+    ("merge failed (rebase)",   "Merge failed after all-PASS verdict. Merge result: failed_merge_time_rebase. Check git state of rig whatsapp_automation."),
+    ("merge failed (conflict)", "Merge failed after all-PASS verdict. Merge result: failed_merge_time_conflict. Check git state of rig whatsapp_automation."),
+    ("dead reviewer (verdict:pending)", "Reviewer 1 verdict:pending: verdict bead closed without explicit PASS (no verdict:PASS label and no explicit PASS comment).\\n"),
+    ("live re-check unreadable", "the live re-check immediately before push could not read source bead wa-zdzc8 (bd show failed, returned empty, or did not parse) — refusing to push blind (ga-360a7l)"),
+    ("source bead parked", "Source bead wa-llq1a now carries a park-worthy label (park:needs-human) applied after this gate-run began — re-checked live immediately before merge (ga-lxz5w)."),
+    ("source bead already closed", "Source bead ga-rhzbii is already closed — a different branch/process resolved it after this gate-run began (ga-lxz5w: 2-branch race, sequential variant)."),
+    ("commit already has a FAIL", "Commit 6b84f74f712f81e0d3d8c4cb2ea025e9942292ae already carries a recorded FAIL verdict from an earlier, independent gate-run (fail-closed by SHA, ga-nooaw)."),
+    ("branch does not name the bead", "Branch crew/wa-worker/wa-zyfoe's own commits (1 unique vs main) do not reference source bead wa-zyfoe anywhere (ga-y9a1d: branch-content-coherence)."),
+]
+def failed_entry(epoch, text, origin=""):
+    return "%s [quality-gate-dispatcher] Gate FAILED%s: %s\n" % (logts(epoch), origin, text)
+for _name, _txt in NONREVIEWER_FAILED:
+    _v = m._gate_verdicts_in(phys(failed_entry(T + 600, _txt), later(T + 660)))
+    check(_v == [], "pure: a FINISHED '%s' FAILED entry is not a verdict" % _name,
+          "a '%s' FAILED entry was read as a gate verdict: %r" % (_name, _v))
+_v = m._gate_verdicts_in(phys(failed_entry(T + 600, NONREVIEWER_FAILED[0][1], origin=" (origin=Pilot)"), later(T + 660)))
+check(_v == [], "pure: …and the same with the Pilot-origin tag on the FAILED line", "an origin-tagged merge failure was read as a verdict: %r" % (_v,))
+_shapes_log = "".join(failed_entry(T + 600 + 10 * i, t) + later(T + 605 + 10 * i) for i, (_n, t) in enumerate(NONREVIEWER_FAILED))
+closes, _, _ = sweep([_shapes_log], [bead("ga-x10b", T)])
+check(closes == [], "sweep: every non-reviewer FAILED shape, each finished → the alarm stays OPEN",
+      "closed on a non-reviewer FAILED entry: %r" % (closes,))
+# positive control: a real, finished reviewer FAIL AFTER them still closes, and the evidence is IT, not one of the non-verdicts
+closes, _, _ = sweep([_shapes_log, reviewer_fail(T + 900), later(T + 960)], [bead("ga-x10c", T)])
+check([c[0] for c in closes] == ["ga-x10c"] and "Reviewer 1 FAIL" in closes[0][1] and "Merge failed" not in closes[0][1],
+      "…and a real reviewer FAIL after them closes it, quoting THAT verdict (the non-verdicts neither mask nor replace it)",
+      "wrong evidence / not closed: %r" % (closes,))
 
 # ── 11. a non-UTF-8 byte in the log must not blank the read (ga-b1iulk class) ─────────────────────
 raw = b"\xff\xfe garbage forensics line\n" + passed(T + 600).encode("utf-8")
@@ -231,6 +278,9 @@ _, calls, _ = sweep([passed(T + 600)], [bead("ga-x14", T)])
 lq = [c for c in calls if "list" in c]
 check(lq and m.REPAIR_AUDIT_LABEL in lq[0] and "--limit" in lq[0] and lq[0][lq[0].index("--limit") + 1] == "0",
       "the sweep lists ONLY REPAIR_AUDIT_LABEL beads, with --limit 0 (ga-21kmp)", "list query wrong: %r" % (lq,))
+check(lq and "--status" in lq[0] and lq[0][lq[0].index("--status") + 1] == "open",
+      "…and ONLY open ones (--status open) — a closed alarm is never re-closed, nor a stale one re-quoted",
+      "list query is not scoped to open beads: %r" % (lq,))
 
 # ── 15. pure decision function: the four states ───────────────────────────────────────────────────
 v = [(T - 600, "old"), (T + 600, "first-after"), (T + 900, "later")]
@@ -380,6 +430,57 @@ check(len(_qv) == 1 and _qv[0][0] < T,
 check(last_pass(quoted_in_comment(T - 600, T + 600)) == 0,
       "last_pass_epoch() does not take quoted 'Gate PASSED' text as a pass either",
       "last_pass_epoch() returned %r for quoted text" % (last_pass(quoted_in_comment(T - 600, T + 600)),))
+
+# ── 22. guards the mutation sweep found unpinned (gate-run ga-gbdzt9's class: a check that passes without exercising its guard) ──
+# Method: each guard in the FIX 10 code was replaced, one at a time, by its inert form; a guard whose removal left the suite green
+# had no test. The ones below are the survivors that were real gaps (the reviewer-FAIL prefix guard is pinned by 10b above).
+
+# 22a. the TIMEOUT sentinel can sit on the HEAD line too: a reviewer comment with no line break makes the composite ONE physical line
+# (FAIL_REASONS = "Reviewer 1 FAIL: <comment>" + literal backslash-n + "TIMEOUT: …"). The live log has 0 of these today (gate-run
+# ga-ic6882 measured 448 of 448 reviewer-FAIL entries multi-line), which is exactly why a reader that only searches the continuation lines would ship unnoticed until one appears.
+def oneline_composite(epoch):
+    return ("%s [quality-gate-dispatcher] Gate FAILED: Reviewer 1 FAIL: VERDICT: FAIL. Non-blocking: none"
+            "\\nTIMEOUT: reviewers did not submit verdicts within 34 minutes.\n" % logts(epoch))
+_oc = m._gate_verdicts_in(phys(oneline_composite(T + 600), later(T + 660)))
+check(_oc == [], "pure: a composite whose TIMEOUT sentence is on the HEAD line (one-line comment) is not a verdict",
+      "a one-line composite was read as a verdict — a timed-out run counted as a recovery: %r" % (_oc,))
+closes, _, _ = sweep([oneline_composite(T + 600), later(T + 660)], [bead("ga-x22a", T)])
+check(closes == [], "sweep: the one-line composite leaves the alarm OPEN", "closed on a one-line composite: %r" % (closes,))
+
+# 22b. an UNDATABLE verdict (the regex accepts any digits: month 13, hour 99) proves nothing about being AFTER the bead → skipped,
+# never carried as (None, line) — comparing None to the bead's epoch would crash the whole sweep and strand every alarm behind it.
+_bad_ts = "[2026-13-45 99:99:99] [quality-gate-dispatcher] Gate PASSED: branch=fix/ga-undatable tier=CODE merge_sha=abc elapsed=1s\n"
+_ud = m._gate_verdicts_in([_bad_ts])
+check(_ud == [], "pure: a verdict line whose timestamp does not parse is skipped, not returned undated", "undatable verdict returned: %r" % (_ud,))
+try:
+    closes, _, _ = sweep([_bad_ts, passed(T + 700)], [bead("ga-x22b", T)])
+except Exception as ex:          # noqa: BLE001 — the point is that NO exception escapes the sweep
+    closes = ex
+check(isinstance(closes, list) and [c[0] for c in closes] == ["ga-x22b"] and "ga-7vmcr1" in closes[0][1] and "undatable" not in closes[0][1],
+      "sweep: an undatable verdict neither crashes the sweep nor becomes the evidence — the next datable verdict closes the bead",
+      "undatable verdict broke the sweep or was quoted as evidence: %r" % (closes,))
+
+# 22c. the per-sweep cap bounds the work of one sweep, OLDEST first (beads deliberately handed over out of age order).
+_cap_beads = [bead("ga-c3", T + 3), bead("ga-c1", T + 1), bead("ga-c2", T + 2)]
+closes, _, _ = sweep([passed(T + 600)], _cap_beads, max_per_sweep=2)
+check([c[0] for c in closes] == ["ga-c1", "ga-c2"],
+      "the per-sweep cap holds (REPAIR_AUDIT_MAX_PER_SWEEP=2 → 2 closes, the OLDEST two; the third waits for the next sweep)",
+      "cap not honoured or not oldest-first: %r" % ([c[0] for c in closes],))
+
+# 22d. both kill switches turn the sweep off COMPLETELY — not one bd query, not one close. (The card body tells the Mayor that
+# 'auto-fechamento desligado' is a reason an alarm stays open; that promise is only true if the switches really do it.)
+for _kw, _nm in (({"enabled": False}, "GRW_ENABLED=0"), ({"close_enabled": False}, "GRW_CLOSE_REPAIR_AUDIT_ENABLED=0")):
+    closes, calls, _ = sweep([passed(T + 600)], [bead("ga-x22d", T)], **_kw)
+    check(closes == [] and calls == [], "%s → the sweep does nothing (no bd query, no close)" % _nm,
+          "%s did not switch the sweep off: closes=%r calls=%r" % (_nm, closes, calls))
+
+# 22e. a bd reply that is valid JSON but NOT a list (an error object) is 'query failed' → skip, never iterated as beads.
+try:
+    closes, _, _ = sweep([passed(T + 600)], {"error": "database is locked"})
+except Exception as ex:          # noqa: BLE001
+    closes = ex
+check(closes == [], "a bd reply that is a JSON object, not a list, is a failed query → nothing closed, nothing raised",
+      "a non-list bd reply was treated as beads: %r" % (closes,))
 
 # ══ Part 2 — the REPAIR names WHAT is stuck ═══════════════════════════════════════════════════════
 def inflight_line(run_id="ga-q2n5yw", branch="crew/ps-worker/ps-5c35", got=0, elapsed=860, timeout=2520):
