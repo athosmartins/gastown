@@ -41,6 +41,26 @@ done
 # ── Real-git fixture (local only, no network) ───────────────────────────────
 T="$(mktemp -d 2>/dev/null || mktemp -d -t galzj2e)"
 trap 'rm -rf "$T" 2>/dev/null || true' EXIT
+# ga-ck3sz7: every full-sweep child below (`bash "$SWEEP"`) runs on a PATH with NO real gc/bd
+# (selftest-sandbox-path.lib.sh). The sweep reopens/labels/comments beads and mails the Mayor; SURVIVAL_DRY_RUN=1 is
+# the only thing standing between it and the real town, and a fake bd earlier in PATH only holds while $T exists.
+# Here "command not found" is the only outcome. The fake `bd` (used by section 13) lives in $T/bin from the start,
+# so the children that never had a bd stub (surge tests) get the same answer for an unknown bead: "" = not closed.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+FAKE_BD_DIR="$T/bin"; mkdir -p "$FAKE_BD_DIR"
+cat > "$FAKE_BD_DIR/bd" <<'FAKEBD'
+#!/usr/bin/env bash
+# invoked as: bd -C <city> show <bead> --json
+bead="$4"
+case "$bead" in
+  closed-story) echo '{"id":"closed-story","status":"closed"}' ;;
+  closed-story-array) echo '[{"id":"closed-story-array","status":"closed"}]' ;;
+  open-story) echo '{"id":"open-story","status":"open"}' ;;
+  *) echo "" ;;  # not found / empty response
+esac
+FAKEBD
+chmod +x "$FAKE_BD_DIR/bd"
+sandbox_path_init "$T" git jq timeout || exit 2   # git: the sweep's ancestry checks; jq: ledger parse; timeout: bounds fetch; bd is the fake above
 R="$T/repo"
 git init -q -b main "$R"
 git -C "$R" config user.email t@example.com
@@ -417,7 +437,7 @@ for i in $(seq 1 10); do
   git -C "$RRB" push -q origin main
 done
 
-OUTB=$(GC_CITY_PATH="$TB/city" SURVIVAL_LEDGER_FILE="$LEDGERB" SURVIVAL_ALERT_DIR="$TB/alerted" \
+OUTB=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TB/city" SURVIVAL_LEDGER_FILE="$LEDGERB" SURVIVAL_ALERT_DIR="$TB/alerted" \
   SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
 
 printf '%s\n' "$OUTB" | grep 'WOULD-ESCALATE(divergent)' >/dev/null \
@@ -463,7 +483,7 @@ for i in 1 2; do
   git -C "$RRC" push -q origin main
 done
 
-OUTC=$(GC_CITY_PATH="$TC/city" SURVIVAL_LEDGER_FILE="$LEDGERC" SURVIVAL_ALERT_DIR="$TC/alerted" \
+OUTC=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TC/city" SURVIVAL_LEDGER_FILE="$LEDGERC" SURVIVAL_ALERT_DIR="$TC/alerted" \
   SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
 
 INDIV_LINES_C=$(printf '%s\n' "$OUTC" | grep -c 'WOULD-ESCALATE(divergent)')
@@ -494,20 +514,7 @@ echo "── 13. _bead_already_closed (closed-bead escalation skip) ──"
 # through, so PATH-prepending a fake executable is the standard way to test
 # it without touching a real Dolt store -- matches this file's own stated
 # "NO live Dolt" testing philosophy).
-FAKE_BD_DIR="$T/fakebd"; mkdir -p "$FAKE_BD_DIR"
-cat > "$FAKE_BD_DIR/bd" <<'FAKEBD'
-#!/usr/bin/env bash
-# invoked as: bd -C <city> show <bead> --json
-bead="$4"
-case "$bead" in
-  closed-story) echo '{"id":"closed-story","status":"closed"}' ;;
-  closed-story-array) echo '[{"id":"closed-story-array","status":"closed"}]' ;;
-  open-story) echo '{"id":"open-story","status":"open"}' ;;
-  *) echo "" ;;  # not found / empty response
-esac
-FAKEBD
-chmod +x "$FAKE_BD_DIR/bd"
-OLDPATH="$PATH"; PATH="$FAKE_BD_DIR:$PATH"
+OLDPATH="$PATH"; PATH="$SANDBOX_PATH"   # fake bd is $T/bin/bd (defined at the top, with the sandbox)
 
 rc0 "closed bead -> true"                       _bead_already_closed anycity closed-story
 rc0 "closed bead, array-shaped bd output -> true" _bead_already_closed anycity closed-story-array
@@ -547,7 +554,7 @@ for i in 1 2; do
   git -C "$RRD" push -q origin main
 done
 
-OUTD=$(PATH="$FAKE_BD_DIR:$PATH" GC_CITY_PATH="$TD/city" SURVIVAL_LEDGER_FILE="$LEDGERD" SURVIVAL_ALERT_DIR="$TD/alerted" \
+OUTD=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TD/city" SURVIVAL_LEDGER_FILE="$LEDGERD" SURVIVAL_ALERT_DIR="$TD/alerted" \
   SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
 
 printf '%s\n' "$OUTD" | grep -q 'WOULD-SKIP(closed-bead) .*bead=closed-story' \

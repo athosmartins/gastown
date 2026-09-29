@@ -128,12 +128,19 @@ echo "stub gc: unexpected call: $*" >&2; exit 98
 STUB
 chmod +x "$TMP/bin/gc"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/sleep"; chmod +x "$TMP/bin/sleep"
+# ga-ck3sz7: the recipe runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). It calls `gc mail send`
+# (the Mayor's inbox); if $TMP vanished under a running recipe, the real `gc` further down $PATH would send that
+# mail for real. Here "command not found" is the only outcome. bash/zsh are linked from the harness's PATH so
+# the shells under test (and the stub's `env bash`) are the same ones as before.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+SANDBOX_SHELLS="bash"; command -v zsh >/dev/null 2>&1 && SANDBOX_SHELLS="bash zsh"
+sandbox_path_init "$TMP" jq $SANDBOX_SHELLS || exit 2   # jq: the stub's mail.sent row; gc/sleep are the stubs above
 
 # run <shell> <events-modes>: execute the delivered recipe once; set the result vars.
 run() {
   local sh="$1" modes="$2" d
   d="$(mktemp -d "$TMP/run.XXXXXX")"; : > "$d/sends.log"
-  OUT="$(cd "$d" && env PATH="$TMP/bin:$PATH" STUB_DIR="$d" EV_MODES="$modes" DATE=2026-09-26 \
+  OUT="$(cd "$d" && env PATH="$SANDBOX_PATH" STUB_DIR="$d" EV_MODES="$modes" DATE=2026-09-26 \
         DIGEST='digest body: 3 filed, "quoted", a\nb' "$sh" "$TMP/recipe.sh" 2>"$d/stderr")"
   SENDS="$(wc -l < "$d/sends.log" | tr -d ' ')"
   EVCALLS="$(cat "$d/events.count" 2>/dev/null || echo 0)"

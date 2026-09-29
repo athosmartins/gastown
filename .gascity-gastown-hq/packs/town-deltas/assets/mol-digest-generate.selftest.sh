@@ -161,6 +161,13 @@ echo "Error: context deadline exceeded" >&2
 exit 1
 STUB
 chmod +x "$TMP/bin/gc"
+# ga-ck3sz7: the recipe blocks run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). The delivered
+# step-3 block runs `gc bd create`; if $TMP vanished under a running block, the real `gc` further down $PATH would
+# file a real digest bead. Here "command not found" is the only outcome. bash/zsh are linked from the harness's
+# PATH so the shells under test are the same ones as before (the sandbox does not swap in /bin/bash 3.2).
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+SANDBOX_SHELLS="bash"; command -v zsh >/dev/null 2>&1 && SANDBOX_SHELLS="bash zsh"
+sandbox_path_init "$TMP" jq python3 $SANDBOX_SHELLS || exit 2   # jq: metadata/count checks; python3: the rotate hook; gc is the stub above
 
 # ---- defect 1: session lifecycle counts ---------------------------------------
 BLOCK="$TMP/lifecycle.sh"
@@ -170,7 +177,7 @@ if [ ! -s "$BLOCK" ]; then
 else
   # run_block <shell> <city> <since> <until> -> "woke=<n> stopped=<n>"
   run_block() {
-    PATH="$TMP/bin:$PATH" GC_CITY_PATH="$2" SINCE="$3" UNTIL="$4" "$1" "$BLOCK" 2>/dev/null | tail -n 1
+    PATH="$SANDBOX_PATH" GC_CITY_PATH="$2" SINCE="$3" UNTIL="$4" "$1" "$BLOCK" 2>/dev/null | tail -n 1
   }
   W0=2026-09-25T00:00:00Z; W1=2026-09-26T00:00:00Z
 
@@ -231,7 +238,7 @@ else
   [ "$got" = "session.woke=N/A session.stopped=N/A session.crashed=N/A" ] && ok "lifecycle row without a seq -> N/A" || bad "row without seq: got '$got'"
   # an unparseable window must not slide through as a number
   # (asserts the guard's own message: without it jq choking on the empty epoch would also print N/A)
-  err=$(PATH="$TMP/bin:$PATH" GC_CITY_PATH="$CITY" SINCE="not-a-date" UNTIL="$W1" bash "$BLOCK" 2>&1 >/dev/null)
+  err=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$CITY" SINCE="not-a-date" UNTIL="$W1" bash "$BLOCK" 2>&1 >/dev/null)
   got=$(run_block bash "$CITY" "not-a-date" "$W1")
   case "$err" in
     *'cannot parse SINCE/UNTIL'*)
@@ -272,7 +279,7 @@ STUB
     [ "$got" = "$want" ] && ok "$sh: race window, no rotation: $got" || bad "$sh: race window control: got '$got', want '$want'"
     # armed: the rotation happens between the chain check and the live-file read
     cp -R "$CITY" "$TMP/city-race-$sh"; touch "$TMP/city-race-$sh/rotate.armed"
-    got=$(PATH="$TMP/bin:$PATH" GC_CITY_PATH="$TMP/city-race-$sh" SINCE="$R0" UNTIL="$R1" "$sh" "$BLOCK" 2>"$TMP/race.err" | tail -n 1)
+    got=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TMP/city-race-$sh" SINCE="$R0" UNTIL="$R1" "$sh" "$BLOCK" 2>"$TMP/race.err" | tail -n 1)
     err=$(cat "$TMP/race.err")
     if [ ! -e "$TMP/city-race-$sh/rotate.done" ]; then
       bad "$sh: rotation hook never fired (the block no longer reads the newest archive in the count phase?) — this test proves nothing"
@@ -318,7 +325,7 @@ else
 if [ "\$1 \$2" = "bd create" ]; then printf '%s\n' "\$@" > "$TMP/create.args"; echo wisp-test1; fi
 STUB
   rm -f "$TMP/create.args"
-  PATH="$TMP/bin:$PATH" SINCE=2026-09-25T00:00:00Z UNTIL=2026-09-26T00:00:00Z DATE=2026-09-25 bash "$CREATE" >/dev/null 2>&1
+  PATH="$SANDBOX_PATH" SINCE=2026-09-25T00:00:00Z UNTIL=2026-09-26T00:00:00Z DATE=2026-09-25 bash "$CREATE" >/dev/null 2>&1
   META=$(awk 'f{print; exit} $0=="--metadata"{f=1}' "$TMP/create.args" 2>/dev/null)
   if printf '%s' "$META" | jq -e '.["digest.since"] == "2026-09-25T00:00:00Z" and .["digest.until"] == "2026-09-26T00:00:00Z"' >/dev/null 2>&1; then
     ok "--metadata parses and carries digest.since/digest.until"
