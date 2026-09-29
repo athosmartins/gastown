@@ -120,7 +120,15 @@ if [ -z "$TOWN_SANDBOX" ] || [ ! -d "$TOWN_SANDBOX" ]; then
   echo "FATAL: could not create the fixture sandbox dir" >&2
   exit 2
 fi
-trap 'rm -rf "$TOWN_SANDBOX"' EXIT
+# ga-ck3sz7: every stub-`gc`/`bd` run below uses a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the per-
+# scenario $SANDBOX_BIN* dirs go in front. The sandbox root is a SEPARATE dir, not a child of $TOWN_SANDBOX: the
+# ownership guard walks $TOWNROOT (== $TOWN_SANDBOX) for git repos, and extra dirs there would be part of what it sees.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+SB_ROOT="$(mktemp -d)"
+[ -n "$SB_ROOT" ] && [ -d "$SB_ROOT" ] || { echo "FATAL: could not create the PATH-sandbox dir" >&2; exit 2; }
+mkdir -p "$SB_ROOT/bin"
+sandbox_path_init "$SB_ROOT" jq || exit 2
+trap 'rm -rf "$TOWN_SANDBOX" "$SB_ROOT"' EXIT
 GC_CITY="$TOWN_SANDBOX/city"
 mkdir -p "$GC_CITY" || { echo "FATAL: could not create $GC_CITY" >&2; exit 2; }
 TOWNROOT="$(dirname "$GC_CITY")"
@@ -200,7 +208,7 @@ chmod +x "$SANDBOX_BIN/gc"
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
-_repos_out="$(PATH="$SANDBOX_BIN:$PATH" _ownership_guard_repos)"
+_repos_out="$(PATH="$SANDBOX_BIN:$SANDBOX_PATH" _ownership_guard_repos)"
 _repos_rc=$?
 if [ "$_repos_rc" -eq 1 ]; then
   ok "a real failing gc -> _ownership_guard_repos returns 1 (exit code survives the \$(...) the real callers use)"
@@ -223,7 +231,7 @@ chmod +x "$SANDBOX_BIN/gc"
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
-_repos_out2="$(PATH="$SANDBOX_BIN:$PATH" _ownership_guard_repos)"
+_repos_out2="$(PATH="$SANDBOX_BIN:$SANDBOX_PATH" _ownership_guard_repos)"
 _repos_rc2=$?
 if [ "$_repos_rc2" -eq 0 ]; then
   ok "a real succeeding gc -> _ownership_guard_repos returns 0"
@@ -277,7 +285,7 @@ _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
 _memo_tmp="$(mktemp)"
-PATH="$SANDBOX_BIN2:$PATH" _ownership_guard_repos > "$_memo_tmp"; _first_rc=$?
+PATH="$SANDBOX_BIN2:$SANDBOX_PATH" _ownership_guard_repos > "$_memo_tmp"; _first_rc=$?
 _first_out="$(cat "$_memo_tmp")"
 if [ "$_first_rc" -eq 1 ]; then
   ok "first call (cache-miss) with failing gc -> returns 1, as before"
@@ -293,7 +301,7 @@ fi
 # again and coincidentally also failed" into a loud, unambiguous failure
 # instead of a test that could pass for the wrong reason.
 rm -f "$SANDBOX_BIN2/gc"
-PATH="$SANDBOX_BIN2:$PATH" _ownership_guard_repos > "$_memo_tmp"; _second_rc=$?
+PATH="$SANDBOX_BIN2:$SANDBOX_PATH" _ownership_guard_repos > "$_memo_tmp"; _second_rc=$?
 _second_out="$(cat "$_memo_tmp")"
 if [ "$_second_rc" -eq 1 ]; then
   ok "second call, SAME sweep, no reset (cache-hit) -> still returns 1 (fix-attempt-2: closes the gate's blocking issue 1)"
@@ -318,9 +326,9 @@ chmod +x "$SANDBOX_BIN3/gc"
 _OWNERSHIP_GUARD_REPOS=""
 _OWNERSHIP_GUARD_REPOS_DONE=""
 _OWNERSHIP_GUARD_REPOS_FAILED=""
-PATH="$SANDBOX_BIN3:$PATH" _ownership_guard_repos > "$_memo_tmp"; _c1_rc=$?
+PATH="$SANDBOX_BIN3:$SANDBOX_PATH" _ownership_guard_repos > "$_memo_tmp"; _c1_rc=$?
 rm -f "$SANDBOX_BIN3/gc"
-PATH="$SANDBOX_BIN3:$PATH" _ownership_guard_repos > "$_memo_tmp"; _c2_rc=$?
+PATH="$SANDBOX_BIN3:$SANDBOX_PATH" _ownership_guard_repos > "$_memo_tmp"; _c2_rc=$?
 if [ "$_c1_rc" -eq 0 ] && [ "$_c2_rc" -eq 0 ]; then
   ok "success caches clean -> both first call and cache-hit return 0 (happy path unaffected by the fix)"
 else
@@ -388,8 +396,8 @@ EOF
   _OWNERSHIP_GUARD_REPOS=""
   _OWNERSHIP_GUARD_REPOS_DONE=""
   _OWNERSHIP_GUARD_REPOS_FAILED=""
-  PATH="$SANDBOX_BIN5:$PATH" _target_has_real_branch "e2e-bead-one" >/dev/null 2>&1
-  PATH="$SANDBOX_BIN5:$PATH" _target_has_real_branch "e2e-bead-two" >/dev/null 2>&1
+  PATH="$SANDBOX_BIN5:$SANDBOX_PATH" _target_has_real_branch "e2e-bead-one" >/dev/null 2>&1
+  PATH="$SANDBOX_BIN5:$SANDBOX_PATH" _target_has_real_branch "e2e-bead-two" >/dev/null 2>&1
   _gc_calls="$(cat "$GC_CALL_COUNT_FILE" 2>/dev/null || echo "?")"
   if [ "$_gc_calls" = "1" ]; then
     ok "ga-130et FIXED end-to-end: 2 real calls to _target_has_real_branch (simulating 2 beads, 1 sweep) invoked gc rig list only ONCE"
@@ -450,8 +458,8 @@ EOF
   _OWNERSHIP_GUARD_REPOS_DONE=""
   _OWNERSHIP_GUARD_REPOS_FAILED=""
   echo 0 > "$GC_CALL_COUNT_FILE6"
-  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-nocontrol" 2>/dev/null) || true
-  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
+  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _beadid_matched_crew_branch_ref "e2e2-bead-nocontrol" 2>/dev/null) || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _filter_built >/dev/null 2>&1 || true
   _gc_calls_nocontrol="$(cat "$GC_CALL_COUNT_FILE6" 2>/dev/null || echo "?")"
   if [ "$_gc_calls_nocontrol" -gt 1 ] 2>/dev/null; then
     ok "negative control: WITHOUT the prime call, 1 \$(...)-wrapped call + 1 piped call invoke gc $_gc_calls_nocontrol times — reproduces fix-attempt-1's exact gap, confirming this test can actually detect it"
@@ -466,11 +474,11 @@ EOF
   _OWNERSHIP_GUARD_REPOS_DONE=""
   _OWNERSHIP_GUARD_REPOS_FAILED=""
   echo 0 > "$GC_CALL_COUNT_FILE6"
-  PATH="$SANDBOX_BIN6:$PATH" _ownership_guard_repos_prime
-  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-one" 2>/dev/null) || true
-  _e2e2_rt2=$(PATH="$SANDBOX_BIN6:$PATH" _beadid_matched_crew_branch_ref "e2e2-bead-two" 2>/dev/null) || true
-  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
-  printf '[]' | PATH="$SANDBOX_BIN6:$PATH" _filter_built >/dev/null 2>&1 || true
+  PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _ownership_guard_repos_prime
+  _e2e2_rt=$(PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _beadid_matched_crew_branch_ref "e2e2-bead-one" 2>/dev/null) || true
+  _e2e2_rt2=$(PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _beadid_matched_crew_branch_ref "e2e2-bead-two" 2>/dev/null) || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _filter_built >/dev/null 2>&1 || true
+  printf '[]' | PATH="$SANDBOX_BIN6:$SANDBOX_PATH" _filter_built >/dev/null 2>&1 || true
   _gc_calls="$(cat "$GC_CALL_COUNT_FILE6" 2>/dev/null || echo "?")"
   if [ "$_gc_calls" = "1" ]; then
     ok "ga-130et fix-attempt-2 FIXED end-to-end: prime once, then 2 \$(...)-wrapped calls (_beadid_matched_crew_branch_ref) + 2 piped calls (_filter_built) invoke gc rig list only ONCE total"
@@ -566,7 +574,7 @@ GCEOF
 
   # -- Negative control: fix-attempt-2's exact shipped shape (bare call) —
   #    must abort before the post marker prints. --
-  _p3_neg_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_neg_script" 2>&1)"; _p3_neg_rc=$?
+  _p3_neg_out="$(PATH="$SANDBOX_BIN7:$SANDBOX_PATH" bash "$_p3_neg_script" 2>&1)"; _p3_neg_rc=$?
   if [ "$_p3_neg_rc" -ne 0 ] && ! printf '%s' "$_p3_neg_out" | grep POST_PRIME_MARKER >/dev/null; then
     ok "negative control: fix-attempt-2's bare invocation shape aborts the whole script on a gc failure (rc=$_p3_neg_rc, post-marker absent) — confirms this test can detect the bug"
   else
@@ -575,7 +583,7 @@ GCEOF
 
   # -- Positive proof: the ACTUAL shipped top-level invocation line — must
   #    survive a gc failure and keep running. --
-  _p3_pos_out="$(PATH="$SANDBOX_BIN7:$PATH" bash "$_p3_pos_script" 2>&1)"; _p3_pos_rc=$?
+  _p3_pos_out="$(PATH="$SANDBOX_BIN7:$SANDBOX_PATH" bash "$_p3_pos_script" 2>&1)"; _p3_pos_rc=$?
   if [ "$_p3_pos_rc" -eq 0 ] && printf '%s' "$_p3_pos_out" | grep POST_PRIME_MARKER >/dev/null; then
     ok "ga-130et fix-attempt-3 FIXED: the shipped top-level invocation ('$_p3_invoke_line') survives a gc rig list failure and the script keeps running"
   else

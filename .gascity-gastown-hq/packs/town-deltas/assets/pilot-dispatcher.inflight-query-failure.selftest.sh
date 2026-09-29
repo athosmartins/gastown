@@ -195,6 +195,11 @@ if [ -z "$_block_src" ] || [ -z "$_setline" ] || [ -z "$_gjou_src" ]; then
 else
   SANDBOX_BIN="$(mktemp -d)"
   FAKE_CITY="$(mktemp -d)"
+  # ga-ck3sz7: the fetch block runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the stub `gc`/`bd`
+  # in $SANDBOX_BIN go in front. If $SANDBOX_BIN vanished mid-run the real `bd` must not be waiting further down.
+  . "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+  SB_ROOT="$(mktemp -d)"; mkdir -p "$SB_ROOT/bin"
+  sandbox_path_init "$SB_ROOT" jq || exit 2
   # A `gc` that reports zero non-HQ rigs — isolates sub-scenarios A/B/C to
   # the HQ fetch only. Scenario D below swaps this for a `gc` that reports
   # one rig, to exercise the per-rig fetch branch too.
@@ -231,7 +236,7 @@ EOF
       echo 'echo "IN_FLIGHT_QUERY_OK=$IN_FLIGHT_QUERY_OK"'
       echo 'echo "IN_FLIGHT_RAW_JSON=$IN_FLIGHT_RAW_JSON"'
     } > "$script"
-    PATH="$SANDBOX_BIN:$PATH" bash "$script" 2>&1
+    PATH="$SANDBOX_BIN:$SANDBOX_PATH" bash "$script" 2>&1
     local rc=$?
     rm -f "$script"
     return $rc
@@ -299,7 +304,7 @@ echo "[]"; exit 0
   rm -f "$WARN_LOG"
   rm -rf "$FAKE_RIG"
 
-  rm -rf "$SANDBOX_BIN" "$FAKE_CITY"
+  rm -rf "$SANDBOX_BIN" "$FAKE_CITY" "$SB_ROOT"
 fi
 
 echo ""

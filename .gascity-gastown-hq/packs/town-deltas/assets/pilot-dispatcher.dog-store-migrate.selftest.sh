@@ -146,6 +146,13 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-dog-store-migrate-selftest.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# ga-ck3sz7: every migration below runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the per-call
+# `bd` stub dir goes in front. The migration creates, closes and retracts beads — if a stub dir vanished mid-run,
+# the real `bd` further down $PATH must not be there to take those writes.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+mkdir -p "$WORK/bin"
+sandbox_path_init "$WORK" jq || exit 2
+
 FAKE_RIGS_JSON='{"rigs":[{"name":"gascity","path":"'"$WORK"'/gascity"},{"name":"gastown","path":"'"$WORK"'/gastown"},{"name":"lexbh","path":"'"$WORK"'/lexbh"},{"name":"marketing","path":"'"$WORK"'/marketing"},{"name":"whatsapp_automation","path":"'"$WORK"'/wa"},{"name":"property_scrapers","path":"'"$WORK"'/ps"}]}'
 mkdir -p "$WORK/gascity" "$WORK/gastown" "$WORK/lexbh" "$WORK/marketing" "$WORK/wa" "$WORK/ps"
 
@@ -394,7 +401,7 @@ STORY_JSON='{"id":"ORIG-1","title":"daemon gap bug","priority":2,"issue_type":"b
 run_migrate() { # run_migrate <scenario> [<story_json>]
   local _scenario="$1" _story="${2:-$STORY_JSON}" _bin
   _bin=$(fake_bd "$_scenario")
-  PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+  PATH="$_bin:$SANDBOX_PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
     bash -c "$DISPATCHER_OPTS
 warn() { echo \"WARN: \$*\" >&2; }
 log()  { echo \"LOG: \$*\"; }
@@ -410,7 +417,7 @@ run_migrate_cold() {
   local _scenario="$1" _bin
   _bin=$(fake_bd "$_scenario")
   : > "$GCLIST_COUNT"
-  PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="" GC_CITY="$WORK/gascity" FAKE_RIGS_JSON="$FAKE_RIGS_JSON" GCLIST_COUNT="$GCLIST_COUNT" \
+  PATH="$_bin:$SANDBOX_PATH" PILOT_RIG_PATHS_JSON="" GC_CITY="$WORK/gascity" FAKE_RIGS_JSON="$FAKE_RIGS_JSON" GCLIST_COUNT="$GCLIST_COUNT" \
     bash -c "$DISPATCHER_OPTS
 warn() { echo \"WARN: \$*\" >&2; }
 log()  { echo \"LOG: \$*\"; }
@@ -755,7 +762,7 @@ EOS_TAIL
   run_callsite() { # run_callsite <scenario> -> MIGRATED:<id> | PARKED (stdout only; the WARN/LOG chatter is not the result)
     local _bin
     _bin=$(fake_bd "$1")
-    PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+    PATH="$_bin:$SANDBOX_PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
       STORY_ID=ORIG-1 STORY="$STORY_JSON" STORY_BEAD_CITY="$WORK/gastown" STORY_RIG=gastown STORY_LABELS=lane:small \
       /bin/bash "$CALLSITE_SCRIPT" 2>/dev/null | grep -E '^(MIGRATED:|PARKED$)'
   }
@@ -824,7 +831,7 @@ fi
 run_migrate_state_stub() { # run_migrate_state_stub <token> — scenario close_fails, state helper stubbed to print <token>
   local _bin
   _bin=$(fake_bd close_fails)
-  STATE_TOKEN="$1" PATH="$_bin:$PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
+  STATE_TOKEN="$1" PATH="$_bin:$SANDBOX_PATH" PILOT_RIG_PATHS_JSON="$FAKE_RIGS_JSON" GC_CITY="$WORK/gascity" \
     bash -c "$DISPATCHER_OPTS
 warn() { echo \"WARN: \$*\" >&2; }
 log()  { echo \"LOG: \$*\"; }
