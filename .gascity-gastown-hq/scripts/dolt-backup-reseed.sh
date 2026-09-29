@@ -709,7 +709,8 @@ _maybe_promote_new_after_primary_release() {
 #      a primária, nunca é apagado);
 #   5. nada em curso: sem o lock do backup noturno e sem processo de
 #      backup/restore/reseed (nem nada com o caminho do .new); ps ilegível conta
-#      como "em curso" — o próprio processo e seus ancestrais não contam.
+#      como "em curso" — o próprio processo, seus ancestrais e seus descendentes
+#      (os subshells de $(...) têm a mesma linha de comando do script) não contam.
 # Read-only no S3 (nunca sobe, nunca apaga lá). Só remove "$BACKUP_ROOT/<db>.new".
 # Prova de efeito: du antes/depois e df antes/depois na linha de log.
 # RESEED_RELEASE_STALE_NEW_DRY_RUN=1 prova e loga, sem apagar.
@@ -752,8 +753,9 @@ _newest_mtime() {
 # "unknown<TAB>motivo". Só "idle" autoriza; o lock do backup noturno, um
 # processo de backup/restore/reseed, qualquer processo com o caminho do .new na
 # linha de comando, ou um ps que não respondeu, contam como NÃO idle. Este
-# processo e seus ancestrais (o shell que o lançou cita o script na própria
-# linha de comando) não são "outra execução".
+# processo, seus ancestrais (o shell que o lançou cita o script na própria
+# linha de comando) e seus descendentes (o bash forka um subshell por $(...),
+# que o ps lista com a mesma linha de comando) não são "outra execução".
 _stale_new_idle_state() {
   local new_dir="$1"
   local lockdir="${RESEED_S3_BACKUP_LOCKDIR:-$CITY/.gc/logs/.dolt-s3-backup.lock.d}"
