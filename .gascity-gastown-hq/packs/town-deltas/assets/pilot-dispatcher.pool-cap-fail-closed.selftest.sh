@@ -40,6 +40,9 @@ ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
+# ga-ck3sz7: every sweep below runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the fake `gc`
+# in $WORK/bin is the only one it can find, so a vanished $WORK can never turn into a real `gc session new`.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 
 # fn_src <name> — the function's source verbatim, or nothing if the file does not define it.
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
@@ -86,6 +89,7 @@ shift
 exec "$@"
 TOEOF
 chmod +x "$WORK/bin/timeout"
+sandbox_path_init "$WORK" jq || exit 2   # jq: the session-list parsing; gc and timeout are the shims above
 
 reset() { rm -f "$WORK"/list.calls "$WORK"/new.log "$WORK"/sl.* "$WORK"/new.rc "$WORK"/log.txt; }
 # sessions_json <template:state>... -> {"sessions":[…]}
@@ -108,7 +112,7 @@ logged() { grep -qF -- "$1" "$WORK/log.txt" 2>/dev/null; }
 run_topup() {
   local _max="$1"; shift
   (
-    PATH="${TOPUP_PATH:-$WORK/bin:$PATH}"
+    PATH="${TOPUP_PATH:-$SANDBOX_PATH}"
     SELFTEST_WORK="$WORK"; export SELFTEST_WORK
     GC_CITY="test-city"; DRY_RUN=0; GC_VARIABLE_SESSION_MAX=9
     PILOT_DOLT_SATURATED_AT_START=0
@@ -210,7 +214,7 @@ echo "Helper: _pilot_live_session_count"
 if [ "$HAVE_HELPER" = "1" ]; then
   run_helper() { # <sl.json-writer-fn-args…> ; prints "rc=<rc> n=<_PLSC_N>"
     (
-      PATH="$WORK/bin:$PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK; GC_CITY="test-city"
+      PATH="$SANDBOX_PATH"; SELFTEST_WORK="$WORK"; export SELFTEST_WORK; GC_CITY="test-city"
       unset GC_VARIABLE_SESSION_COUNT_OVERRIDE
       eval "$FUNCS"
       "$@"; _rc=$?
@@ -236,7 +240,7 @@ if [ "$HAVE_HELPER" = "1" ]; then
   if [ -n "$REAL_TIMEOUT" ]; then
     reset; sessions_json "wa-worker:active" "wa-worker:active" > "$WORK/sl.json"; echo 4 > "$WORK/sl.sleep"
     _slow=$(
-      PATH="$WORK/bin-real:$WORK/bin:$PATH"
+      PATH="$WORK/bin-real:$SANDBOX_PATH"
       mkdir -p "$WORK/bin-real"; ln -sf "$REAL_TIMEOUT" "$WORK/bin-real/timeout"
       SELFTEST_WORK="$WORK"; export SELFTEST_WORK; GC_CITY="test-city"; PILOT_SESSION_LIST_TIMEOUT_SECS=1
       eval "$FUNCS"; _pilot_live_session_count wa-worker; _rc=$?; printf 'rc=%s n=%s' "$_rc" "${_PLSC_N:-}"

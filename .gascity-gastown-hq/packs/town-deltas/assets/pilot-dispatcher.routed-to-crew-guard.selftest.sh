@@ -77,6 +77,13 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-routed-to-crew-guard-selftest.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# ga-ck3sz7: the guard and the reclaim run on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the stub
+# `bd` (a per-call dir in Part A, $WORK/bin in Part B) goes in front. _pilot_crew_stale_reclaim strips
+# labels and reassigns beads — if its stub dir vanished mid-run, the real `bd` must not be there to take that.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+mkdir -p "$WORK/bin"
+sandbox_path_init "$WORK" jq || exit 2
+
 # fake_bd_show <routed_to_value|FAIL|GARBAGE> — bd stub for the guard test:
 # answers `show --json` with a single-object array carrying the given
 # gc.routed_to metadata value; any other subcommand is a silent no-op.
@@ -125,7 +132,7 @@ echo "=== Part A: _pilot_routed_to_pool_guard ==="
 run_guard() { # run_guard <bd_mode> <bead_id> <city> <sling_target>
   local _bd_mode="$1" _bid="$2" _city="$3" _target="$4" _bin
   _bin=$(fake_bd_show "$_bd_mode")
-  PATH="$_bin:$PATH" bash -c "$GUARD_FN"'
+  PATH="$_bin:$SANDBOX_PATH" bash -c "$GUARD_FN"'
 _pilot_routed_to_pool_guard "'"$_bid"'" "'"$_city"'" "'"$_target"'"'
 }
 
@@ -247,7 +254,7 @@ run_reclaim() {
   # _extra_env listed LAST so a caller-supplied override (e.g. TEST_REPOS_OK=0)
   # wins over the defaults to its left — env applies assignments in order and
   # the last one for a given name wins.
-  env TEST_HAS_BRANCH="$_has_branch" PATH="$BIN:$PATH" $_extra_env bash -c "
+  env TEST_HAS_BRANCH="$_has_branch" PATH="$BIN:$SANDBOX_PATH" $_extra_env bash -c "
 warn() { :; }
 _ownership_guard_repos() { [ \"\${TEST_REPOS_OK:-1}\" = \"1\" ]; }
 _beadid_branch_signal() {

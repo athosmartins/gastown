@@ -59,6 +59,11 @@ cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 CALLS="$WORK/calls.log"
 mkdir -p "$WORK/bin"
+# ga-ck3sz7: the spawn runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh): the stub `gc` in
+# $WORK/bin is the only one it can find. `_pilot_topup_spawn` runs `gc session new` — if the stub vanished under
+# it, a real gc further down $PATH would open a REAL session; here that is "command not found" instead.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" timeout || exit 2   # the spawn is bounded by a real `timeout`; gc is the stub below
 
 # run_spawn <pool> <pending> <gc_script_body>
 # gc_script_body is shell code (a script BODY, using `exit` not `return`)
@@ -90,7 +95,7 @@ $_rs_gc_body
 GCSCRIPT
   chmod +x "$WORK/bin/gc"
   (
-    PATH="$WORK/bin:$PATH"
+    PATH="$SANDBOX_PATH"
     GC_CITY="test-city"
     PILOT_SPAWN_TIMEOUT_SECS=5
     PILOT_TOPUP_RETRY_DELAY_SECS=0

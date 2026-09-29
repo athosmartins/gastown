@@ -55,6 +55,10 @@ set -u
 # a dev worktree before merge, or the live HQ checkout after.
 SELFTEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SELFTEST_DIR/pilot-manual-reclaim.sh"
+# ga-ck3sz7: the script runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). This script strips
+# Pilot markers with `bd label remove` / `bd update`; if $WORK vanished under it while it ran, the real `bd`
+# further down $PATH would take those mutations for real. Here "command not found" is the only outcome.
+. "$SELFTEST_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELFTEST_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 PASS=0; FAIL=0
 ck() { if [ "$2" = "$3" ]; then echo "PASS: $1"; PASS=$((PASS+1)); else echo "FAIL: $1 (want=$2 got=$3)"; FAIL=$((FAIL+1)); fi; }
 
@@ -142,10 +146,11 @@ case "$sub" in
 esac
 EOF
 chmod +x "$BINS"/*
+sandbox_path_init "$WORK" jq || exit 2   # jq: the script's marker check; bd is the stub above
 
 run_script() {
   rm -f "${MUT}.showcount"
-  PMR_SCENARIO="$1" PATH="$BINS:$PATH" bash "$SCRIPT" "gt-testbead" >"$WORK/out.log" 2>"$WORK/err.log"
+  PMR_SCENARIO="$1" PATH="$SANDBOX_PATH" bash "$SCRIPT" "gt-testbead" >"$WORK/out.log" 2>"$WORK/err.log"
   echo $?
 }
 

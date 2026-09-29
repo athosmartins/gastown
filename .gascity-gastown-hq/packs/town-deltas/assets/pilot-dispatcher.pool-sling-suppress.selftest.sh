@@ -75,6 +75,13 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-pool-sling-suppress-selftest.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# ga-ck3sz7: each scenario's fake `gc` lives in its own dir (fake_gc / fake_gc_failing) and is put IN FRONT of
+# $SANDBOX_PATH — a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). If a scenario's dir vanished, the
+# probe would find no `gc` at all ("command not found" reads as not-live), never the real town's `gc session list`.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+mkdir -p "$WORK/bin"
+sandbox_path_init "$WORK" jq timeout || exit 2   # the helper pipes gc's JSON through jq, bounded by a real `timeout`
+
 # fake_gc <sessions-json-body> — writes a real executable `gc` to its own
 # sandbox bin dir that answers ANY `... session list --json` with the given
 # body and records that it was actually invoked (a marker file), so a
@@ -115,7 +122,7 @@ echo "pilot-dispatcher.pool-sling-suppress.selftest — ephemeral-pool sling sup
 # ── Scenario A: gastown.dog has one ACTIVE instance → live (true) ──────────
 echo "Scenario A: gastown.dog has an ACTIVE live instance — reports live"
 BIN=$(fake_gc '{"sessions":[{"template":"gastown.dog","state":"active","alias":"gastown.dog-2"}]}')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"' ; then
   ok "ACTIVE gastown.dog instance -> live"
 else
@@ -125,7 +132,7 @@ fi
 # ── Scenario B: CREATING counts as live too ─────────────────────────────────
 echo "Scenario B: gastown.dog has a CREATING (not yet active) instance — still reports live"
 BIN=$(fake_gc '{"sessions":[{"template":"gastown.dog","state":"creating","alias":"gastown.dog-9"}]}')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"'; then
   ok "CREATING gastown.dog instance -> live"
 else
@@ -138,7 +145,7 @@ BIN=$(fake_gc '{"sessions":[
   {"template":"wa-worker","state":"active","alias":"wa-worker-1"},
   {"template":"gastown.dog","state":"asleep","alias":"gastown.dog-3"}
 ]}')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"'; then
   bad "no matching active/creating gastown.dog session -> reported live (should be dead)"
 else
@@ -148,7 +155,7 @@ fi
 # ── Scenario D: empty sessions list → dead ──────────────────────────────────
 echo "Scenario D: empty session list — reports dead"
 BIN=$(fake_gc '{"sessions":[]}')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"'; then
   bad "empty session list -> reported live (should be dead)"
 else
@@ -158,7 +165,7 @@ fi
 # ── Scenario E: non-pool target short-circuits BEFORE any gc call ──────────
 echo "Scenario E: named-crew target (not a pool template) — never calls gc at all"
 BIN=$(fake_gc '{"sessions":[{"template":"mila-wa","state":"active"}]}')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "mila-wa"'; then
   bad "named-crew target 'mila-wa' -> reported live (should always be dead — not a pool template)"
 else
@@ -173,7 +180,7 @@ fi
 # ── Scenario F: gc fails outright — fail-open to dead, never crashes ───────
 echo "Scenario F: gc session list fails (non-zero exit, no JSON) — fails open to dead"
 BIN=$(fake_gc_failing)
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "$LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"'; then
   bad "failing gc -> reported live (fail-open must mean 'do not suppress', i.e. dead)"
 else
@@ -183,7 +190,7 @@ fi
 # ── Scenario G: garbage/unparseable JSON — fail-open to dead, no crash ─────
 echo "Scenario G: gc returns non-JSON garbage — fails open to dead, does not crash under set -u"
 BIN=$(fake_gc 'not json at all')
-if PATH="$BIN:$PATH" GC_CITY="hq" bash -c "set -u; $LIVE_FN"'
+if PATH="$BIN:$SANDBOX_PATH" GC_CITY="hq" bash -c "set -u; $LIVE_FN"'
 _pilot_pool_target_has_live_session "gastown.dog"'; then
   bad "garbage jq input -> reported live (should fail open to dead)"
 else

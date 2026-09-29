@@ -13,6 +13,12 @@
 # Run:  bash packs/town-deltas/assets/dog-pool-preflight-reclaim.selftest.sh
 set -u
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ga-ck3sz7: the preflight runs on a PATH with NO real gc/bd (see selftest-sandbox-path.lib.sh). The stubs
+# below are the only gc/bd it can find; if $WORK ever vanishes under it, "command not found" is the outcome,
+# never a `bd assign` / `gc session ...` on the real town.
+. "$HERE/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $HERE/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+
 CITY="/Users/athos/gt/.gascity-gastown-hq"
 PREFLIGHT="$CITY/scripts/dog-pool-preflight-reclaim.py"
 PASS=0; FAIL=0
@@ -50,7 +56,10 @@ case "$sub" in
       exit 0
     fi
     echo '[]'; exit 0 ;;
-  show)    echo '[]'; exit 0 ;;
+  # The guard reads the bead back after `label remove` (ga-jzye0) and only proceeds once it sees a real bead
+  # object whose labels no longer hold story:in-flight; `[]` reads as "could not confirm" and aborts the reclaim.
+  # This stub models a removal that landed.
+  show)    echo '[{"id":"ga-zomb1","labels":[]}]'; exit 0 ;;
   label|assign|update|comment) echo "MUT $*" >>"${DOG_PREFLIGHT_MUT}"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -83,9 +92,10 @@ EOF
 printf '#!/usr/bin/env bash\nexit 0\n' >"$BINS/notify"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$BINS/quota-stub"
 chmod +x "$BINS"/*
+sandbox_path_init "$WORK" python3 || exit 2   # python3 runs the preflight; bd/gc/git/notify are the stubs above
 
 run_preflight() {
-  DOG_SCENARIO="$1" PATH="$BINS:$PATH" IRG_QUOTA_CHECK="$BINS/quota-stub" \
+  DOG_SCENARIO="$1" PATH="$SANDBOX_PATH" IRG_QUOTA_CHECK="$BINS/quota-stub" \
     DOG_PREFLIGHT_BUDGET_SEC=30 python3 "$PREFLIGHT" >/dev/null 2>&1
 }
 
