@@ -40,6 +40,15 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/refino-gate-dispatcher.sh"
+# ga-ck3sz7: the two blocks that run the dispatcher (section 7 and the ga-owlmfj B3 end-to-end) run it on a PATH with NO real
+# gc/bd (selftest-sandbox-path.lib.sh). Both used to put /opt/homebrew/bin on the PATH (section 7 literally, B3 through
+# dirname-of-jq) — the dir the real gc, bd and jq all live in — so a fixture shim that vanished, or was never there, fell
+# through to the REAL bd/gc. ga-owlmfj already cost one hung selftest that way. Sourced at the top: a missing lib refuses
+# to start instead of dying half way through.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+# _sb_init <dir> — <dir>/bin is where a shim goes; sets SANDBOX_PATH. jq is what the dispatcher needs from outside
+# /usr/bin:/bin; timeout only when this box has one (the dispatcher and the B3 wrapper both treat it as optional).
+_sb_init() { local _t="jq"; command -v timeout >/dev/null 2>&1 && _t="jq timeout"; mkdir -p "$1/bin" && sandbox_path_init "$1" $_t; }
 
 PASS=0
 FAIL=0
@@ -364,8 +373,9 @@ _drycity="$(mktemp -d)"
 # stores, and /opt/homebrew/bin on PATH puts the REAL bd in reach — so this
 # "hermetic" check read production and, whenever a story was queued there, reached
 # the rubric heredoc (which then ran a backticked bd serve and hung the selftest).
+_sb_init "$_drycity/sb" || exit 2   # ga-ck3sz7: and now there really is no bd to reach, whatever REFINO_GATE_STORES says
 REFINO_CITY_OVERRIDE="$_drycity" REFINO_GATE_STORES="$_drycity" DRY_RUN=1 \
-  PATH="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" \
+  PATH="$SANDBOX_PATH" \
   bash "$DISPATCHER" >/dev/null 2>&1
 _dryrc=$?
 _drylog=$(cat "$_drycity/.gc/logs/refino-gate-dispatcher.log" 2>/dev/null || echo "")
@@ -919,11 +929,12 @@ fi
 _ow_run() {   # _ow_run <spawn: fail|ok> <create: ok|fail> <streak seed | -> [streak path]
   local spawn="$1" create="$2" seed="$3" spath="${4:-}" _to=""
   OW_SB=$(mktemp -d)
-  mkdir -p "$OW_SB/shim" "$OW_SB/city/.gc" "$OW_SB/home"
+  mkdir -p "$OW_SB/city/.gc" "$OW_SB/home"
+  _sb_init "$OW_SB/sb" || exit 2   # shims live in $OW_SB/sb/bin, first on SANDBOX_PATH; no real gc/bd/notify behind them
   [ -n "$spath" ] || spath="$OW_SB/streak"
   [ "$seed" = "-" ] || printf '%s\n' "$seed" > "$OW_SB/streak"
   OW_STREAK_PATH="$spath"
-  cat > "$OW_SB/shim/bd" <<'SHIM'
+  cat > "$OW_SB/sb/bin/bd" <<'SHIM'
 #!/bin/bash
 echo "bd $*" >> "$OW_CALLS"
 case " $* " in
@@ -940,7 +951,7 @@ case " $* " in
 esac
 exit 0
 SHIM
-  cat > "$OW_SB/shim/gc" <<'SHIM'
+  cat > "$OW_SB/sb/bin/gc" <<'SHIM'
 #!/bin/bash
 echo "gc $*" >> "$OW_CALLS"
 case " $* " in
@@ -956,15 +967,14 @@ case " $* " in
 esac
 exit 0
 SHIM
-  printf '#!/bin/bash\necho "notify $*" >> "$OW_CALLS"\nexit 0\n' > "$OW_SB/shim/notify"
-  chmod +x "$OW_SB/shim/bd" "$OW_SB/shim/gc" "$OW_SB/shim/notify"
+  printf '#!/bin/bash\necho "notify $*" >> "$OW_CALLS"\nexit 0\n' > "$OW_SB/sb/bin/notify"
+  chmod +x "$OW_SB/sb/bin/bd" "$OW_SB/sb/bin/gc" "$OW_SB/sb/bin/notify"
   command -v timeout >/dev/null 2>&1 && _to="timeout 120"
-  local _jqdir; _jqdir=$(dirname "$(command -v jq)")
   # NB: sourcing the dispatcher at the top of this file turned on `set -e` in THIS
   # shell, so a non-zero exit from the script under test must be captured with
   # `|| OW_RC=$?` — a bare `OW_RC=$?` on the next line is never reached.
   OW_RC=0
-  ( cd / && $_to env -i HOME="$OW_SB/home" PATH="$OW_SB/shim:$_jqdir:/usr/bin:/bin" \
+  ( cd / && $_to env -i HOME="$OW_SB/home" PATH="$SANDBOX_PATH" \
       REFINO_CITY_OVERRIDE="$OW_SB/city" REFINO_GATE_STORES="$OW_SB/city" QUIET_HOURS_OVERRIDE=OPEN \
       REFINO_START_FAIL_STREAK_FILE="$spath" \
       OW_CALLS="$OW_SB/calls" OW_SPAWN="$spawn" OW_CREATE="$create" \
