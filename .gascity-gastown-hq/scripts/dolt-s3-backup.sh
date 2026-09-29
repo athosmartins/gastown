@@ -487,8 +487,22 @@ SYNC_DISK_FLOOR_GB="${SYNC_DISK_FLOOR_GB:-3}"         # absolute backstop for sm
 # free-space number refuses rather than proceeding on a guess — same
 # posture as every other preflight in this city's Dolt backup scripts.
 _sync_disk_preflight() {
-  local db="$1"
-  local live_kb free_kb need_kb floor_kb
+  _sync_disk_preflight_credit "$1" 0
+}
+
+# _sync_disk_preflight_credit <db> <credit_kb> — the disk gate above, with <credit_kb> KB
+# counted as free on top of what df reports. ONLY for the ga-qcrpxj question "would the free
+# space cover the sync if a manifest-less staging residue were deleted first?" — the answer
+# to a hypothetical, never the gate in front of a write (that stays _sync_disk_preflight, run
+# for real after the delete). <credit_kb> that is empty or not a number credits NOTHING: an
+# amount that cannot be read must never make a refusal easier to pass. With credit 0 this is
+# byte-for-byte the old gate, log lines included (the e2e cases count them); with a credit
+# its lines say so, and never contain "sync preflight REFUSED"/"sync preflight OK".
+_sync_disk_preflight_credit() {
+  local db="$1" credit_kb="${2:-0}"
+  local live_kb free_kb need_kb floor_kb tag=""
+  case "$credit_kb" in ''|*[!0-9]*) credit_kb=0 ;; esac
+  [ "$credit_kb" -gt 0 ] && tag=" com crédito de $((credit_kb/1024))MB do resíduo sem manifesto"
   live_kb="$(du -sk "$CITY/.beads/dolt/$db" 2>/dev/null | awk '{print $1}')"
   case "${live_kb:-}" in
     ''|*[!0-9]*)
@@ -503,14 +517,23 @@ _sync_disk_preflight() {
       return 1
       ;;
   esac
+  free_kb=$(( free_kb + credit_kb ))
   need_kb=$(( live_kb * SYNC_DISK_MARGIN_PCT / 100 ))
   floor_kb=$(( SYNC_DISK_FLOOR_GB * 1024 * 1024 ))
   [ "$need_kb" -lt "$floor_kb" ] && need_kb="$floor_kb"
   if [ "$free_kb" -lt "$need_kb" ]; then
-    log "$db: sync preflight REFUSED — disco insuficiente (livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB) — não vou escrever até o Dolt morrer (precedente: ga-odtd3f, 2026-09-21, outage de ~5h20)"
+    if [ "$credit_kb" -gt 0 ]; then
+      log "$db: sync preflight${tag} ainda RECUSARIA — livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB"
+    else
+      log "$db: sync preflight REFUSED — disco insuficiente (livre=$((free_kb/1024))MB precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB, margem=${SYNC_DISK_MARGIN_PCT}%, piso=${SYNC_DISK_FLOOR_GB}GB) — não vou escrever até o Dolt morrer (precedente: ga-odtd3f, 2026-09-21, outage de ~5h20)"
+    fi
     return 1
   fi
-  log "$db: sync preflight OK (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
+  if [ "$credit_kb" -gt 0 ]; then
+    log "$db: sync preflight${tag} passaria (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
+  else
+    log "$db: sync preflight OK (livre=$((free_kb/1024))MB >= precisa=$((need_kb/1024))MB, vivo=$((live_kb/1024))MB)"
+  fi
   return 0
 }
 
@@ -578,6 +601,59 @@ _staging_manifest_fp() {
     [0-9]*-[0-9]*) echo "$out" ;;
     *) echo unreadable ;;
   esac
+}
+
+# ga-qcrpxj — a manifest-less staging can be the very thing that refuses the disk gate.
+# MEASURED 2026-09-29 04:00:52, hq: the gate refused (livre=9600MB precisa=13572MB, vivo=9048MB)
+# with 6,384,952 KB of PARTIAL sync residue in .dolt-backup/hq and NO manifest — what the server
+# retry of 2026-09-28 18:0x had written before failing 'table file not found'. That residue does
+# not restore (a backup dir without a manifest is worth nothing), and the reinit in
+# _sync_with_stale_manifest_recovery is exactly what deletes it — but the gate runs BEFORE the
+# reinit, so the sync that would have deleted the residue was refused for the space the residue
+# itself held (~16GB free without it >= 13.6GB). Three nights in a row (ga-cnrr3a's fix never got
+# to run). The residue is not "free space" until it is actually gone, so the answer is not to
+# pretend it is: when the gate refuses, ask the hypothetical (_sync_disk_preflight_credit) and,
+# only if the answer is yes, DELETE first — the real gate then measures the real disk, and its
+# refusal still stops everything. The old refusal path (mirror-or-report) stays for every case
+# below that is not a plain, quiet, readable, manifest-less residue.
+RESIDUE_QUIET_MIN="${RESIDUE_QUIET_MIN:-30}"   # a residue written to within this many minutes may still have a writer
+
+# _staging_residue_kb <dest> — prints the size in KB of a staging dir that is SAFE to reinit
+# because it is a manifest-less residue, rc 0; anything else prints nothing and returns 1, and
+# every "cannot tell" is an "else" (inert — nothing gets deleted on a guess):
+#   - <dest> is not a real directory strictly under $BACKUP_ROOT (also refuses a symlink, a
+#     path with '..', and an unset BACKUP_ROOT — whose glob would otherwise match every path);
+#   - a manifest exists (a healthy or damaged backup is never treated as residue) or the
+#     manifest state could not be read (_staging_manifest_fp says 'unreadable');
+#   - the dir is empty (nothing to free — and no residue to blame the refusal on);
+#   - something in it was written within RESIDUE_QUIET_MIN minutes, or that could not be
+#     checked (a live writer's first sync into a fresh dir has no manifest until it ends);
+#   - its size could not be read as a positive number.
+_staging_residue_kb() {
+  local dest="$1" kb recent
+  [ -n "${BACKUP_ROOT:-}" ] || return 1
+  case "$RESIDUE_QUIET_MIN" in ''|*[!0-9]*) return 1 ;; esac
+  case "$dest" in *..*) return 1 ;; esac
+  case "$dest" in "$BACKUP_ROOT"/?*) ;; *) return 1 ;; esac
+  [ -d "$dest" ] && [ ! -L "$dest" ] || return 1
+  [ "$(_staging_manifest_fp "$dest")" = absent ] || return 1
+  [ -n "$(ls -A "$dest" 2>/dev/null)" ] || return 1
+  recent="$(find "$dest" -mmin "-$RESIDUE_QUIET_MIN" -print -quit 2>/dev/null)" || return 1
+  [ -z "$recent" ] || return 1
+  kb="$(du -sk "$dest" 2>/dev/null | awk '{print $1}')"
+  case "${kb:-}" in ''|*[!0-9]*|0) return 1 ;; esac
+  echo "$kb"
+}
+
+# _residue_reinit_would_unblock <db> <dest> — rc 0 iff <dest> is a manifest-less residue
+# (_staging_residue_kb) AND the disk gate would pass with that residue's size counted as free.
+# Only a question: it deletes nothing. The caller deletes (via the stale-manifest recovery, whose
+# own gate runs after the delete) and only on rc 0; rc 1 leaves the old refusal path untouched.
+_residue_reinit_would_unblock() {
+  local db="$1" dest="$2" residue_kb
+  residue_kb="$(_staging_residue_kb "$dest")" || return 1
+  log "$db: $dest has NO manifest (does not restore) and holds $((residue_kb/1024))MB of residue; checking whether deleting it would let the sync fit (ga-qcrpxj)"
+  _sync_disk_preflight_credit "$db" "$residue_kb"
 }
 
 # _report_s3_state_only <db> — read-only: is S3's OWN copy of <db> restorable (manifest
@@ -709,8 +785,8 @@ _sync_with_connection_timeout_retry() {
 # logged the FAILED tripwire dolt-compact-routine.sh's precondition greps for)
 # otherwise.
 _sync_with_stale_manifest_recovery() {
-  local db="$1" dest="$2"
-  log "$db: stale-manifest staging detected — auto-reinit ${dest} and go straight to offline sync (no server retry — ga-cnrr3a)"
+  local db="$1" dest="$2" why="${3:-stale-manifest staging detected}"
+  log "$db: ${why} — auto-reinit ${dest} and go straight to offline sync (no server retry — ga-cnrr3a)"
   case "$dest" in
     "$BACKUP_ROOT"/*) rm -rf "${dest:?}" ;;
     *) log "$db: REFUSING auto-reinit — dest '$dest' outside BACKUP_ROOT (safety guard)" ;;
@@ -1179,21 +1255,37 @@ for db in $DBS; do
   # follows an attempt that was cut. Taken per db, right before the first attempt.
   pre_fp="$(_staging_manifest_fp "$dest")"
   # 1) native consistent backup -> local staging (incremental)
+  offline_done=0
   if ! _sync_disk_preflight "$db"; then
-    failed=$((failed+1))
-    # ga-rt7ljo: the streak note is a cheap bookkeeping write — take it BEFORE the (slow, network)
-    # mirror below, so a mirror that stalls or is killed can never lose tonight's failure count.
-    _backup_fail_note "$db"
-    # ga-btnq6h: today's local sync is refused, but mirroring the staging that already
-    # exists needs no local disk — do it, and say in the alert whether S3 is sound.
-    if _mirror_staging_after_disk_refusal "$db" "$dest"; then
-      FAILED_DBS="$FAILED_DBS ${db}(disco)"
+    # ga-qcrpxj: the refusal may be for space that only a manifest-less staging residue holds
+    # (hq, 2026-09-29: 6.4GB of it, refused three nights running). If deleting exactly that would
+    # let the sync fit, do the reinit-and-offline-sync now — its own gate runs AFTER the delete,
+    # so the disk is measured, not assumed — instead of refusing for the residue's own sake.
+    # Anything that is not a plain, quiet, readable, manifest-less residue (a staging WITH a
+    # manifest, an unreadable one, a live writer, an unreadable size, a residue that would not
+    # free enough) takes the refusal path below exactly as before.
+    if _residue_reinit_would_unblock "$db" "$dest"; then
+      if ! _sync_with_stale_manifest_recovery "$db" "$dest" "manifest-less staging residue refused the disk gate"; then
+        failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
+        _backup_fail_note "$db"; continue
+      fi
+      offline_done=1
     else
-      FAILED_DBS="$FAILED_DBS ${db}(disco+s3)"
+      failed=$((failed+1))
+      # ga-rt7ljo: the streak note is a cheap bookkeeping write — take it BEFORE the (slow, network)
+      # mirror below, so a mirror that stalls or is killed can never lose tonight's failure count.
+      _backup_fail_note "$db"
+      # ga-btnq6h: today's local sync is refused, but mirroring the staging that already
+      # exists needs no local disk — do it, and say in the alert whether S3 is sound.
+      if _mirror_staging_after_disk_refusal "$db" "$dest"; then
+        FAILED_DBS="$FAILED_DBS ${db}(disco)"
+      else
+        FAILED_DBS="$FAILED_DBS ${db}(disco+s3)"
+      fi
+      continue
     fi
-    continue
   fi
-  if ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
+  if [ "$offline_done" -eq 0 ] && ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
     cat "$SYNC_OUT" >> "$LOG"
     if is_stale_manifest_error "$(cat "$SYNC_OUT")"; then

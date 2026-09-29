@@ -1715,9 +1715,9 @@ unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD BACKUP_FAIL_FAKE_MAIL F
 # failure exit + the success path + the final summary, not just declares it ──
 echo "── drift-guard: escalation wiring present in live script (ga-rt7ljo) ──"
 callsites="$(grep -cF '_backup_fail_note "$db"' "$SCRIPT")"
-[ "$callsites" -eq 6 ] \
-  && ok "exactly 6 occurrences of _backup_fail_note \"\$db\" (1 per failure exit: disco x2, sync x3, s3 x1 — every FAILED_DBS append site has a matching streak-note call)" \
-  || bad "expected exactly 6 occurrences of _backup_fail_note \"\$db\", got $callsites — a failure exit was added/removed without updating the streak wiring"
+[ "$callsites" -eq 7 ] \
+  && ok "exactly 7 occurrences of _backup_fail_note \"\$db\" (1 per failure exit: disco x2, sync x4 — incl. the ga-qcrpxj residue recovery failing —, s3 x1; every FAILED_DBS append site has a matching streak-note call)" \
+  || bad "expected exactly 7 occurrences of _backup_fail_note \"\$db\", got $callsites — a failure exit was added/removed without updating the streak wiring"
 if grep -qF '_backup_fail_streak_note_success "$db"' "$SCRIPT"; then
   ok "success path resets the per-db streak (_backup_fail_streak_note_success called)"
 else
@@ -2430,6 +2430,293 @@ if [ "$E2E_RC" -eq 0 ] && grep -q 'hq: OK (issues=5' "$E2E_LOG" && [ ! -s "$E2E_
 else
   bad "e2e H: healthy night misbehaved (rc=$E2E_RC): $(tail -6 "$E2E_LOG" | tr '\n' '|')"
 fi
+
+# ── ga-qcrpxj: a manifest-less residue must not refuse, by its own weight, the sync that deletes it ──
+# MEASURED 2026-09-29 04:00:52 (hq): "sync preflight REFUSED — livre=9600MB precisa=13572MB
+# (vivo=9048MB, margem=150%)" with 6,384,952 KB of manifest-less residue in .dolt-backup/hq. The
+# reinit that deletes that residue runs AFTER the gate, so the residue refused the sync meant to
+# get rid of it — three nights running. Without it ~16GB would have been free (>= 13.6GB).
+echo "── _staging_residue_kb() / _sync_disk_preflight_credit() / _residue_reinit_would_unblock() (ga-qcrpxj) ──"
+unset -f du df 2>/dev/null
+for _rq_f in _staging_residue_kb _sync_disk_preflight_credit _residue_reinit_would_unblock; do
+  type "$_rq_f" >/dev/null 2>&1 && ok "$_rq_f defined by lib-mode source" \
+    || bad "$_rq_f NOT defined — the residue-aware disk preflight is missing"
+done
+
+RQ_ROOT="$(mktemp -d)"; RQ_OUTSIDE="$(mktemp -d)"; RQ_LOG="$(mktemp)"; RQ_CITY="$(mktemp -d)"
+mkdir -p "$RQ_CITY/.beads/dolt/hq"
+rq_mk() { # <dir> — two table files and NO manifest, mtimes pinned far outside the quiet window
+  mkdir -p "$1"; head -c 4096 /dev/zero > "$1/aaa.darc"; head -c 8192 /dev/zero > "$1/bbb.darc"
+  touch -t 202601010000 "$1/aaa.darc" "$1/bbb.darc"; touch -t 202601010000 "$1"
+}
+rq_kb() { # <dest> [<backup_root>] — sets RQ_KB (what it printed) and RQ_RC
+  RQ_KB="$(BACKUP_ROOT="${2-$RQ_ROOT}" LOG="$RQ_LOG" _staging_residue_kb "$1" 2>/dev/null)"; RQ_RC=$?
+}
+rq_none() { # <label> — the last rq_kb must have said "no": rc EXACTLY 1 (not 127: a missing function is not a 'no') and nothing printed
+  if [ "$RQ_RC" -eq 1 ] && [ -z "$RQ_KB" ]; then ok "$1"; else bad "$1 (rc=$RQ_RC printed='$RQ_KB')"; fi
+}
+
+rq_mk "$RQ_ROOT/res"; rq_kb "$RQ_ROOT/res"
+case "$RQ_KB" in ''|*[!0-9]*|0) bad "a quiet manifest-less residue: expected a positive KB, rc=$RQ_RC printed='$RQ_KB'" ;;
+  *) [ "$RQ_RC" -eq 0 ] && ok "a quiet, readable, manifest-less residue → its size in KB ($RQ_KB), rc 0" || bad "residue sized ($RQ_KB) but rc=$RQ_RC" ;;
+esac
+
+rq_mk "$RQ_ROOT/withman"; printf 'm' > "$RQ_ROOT/withman/manifest"; touch -t 202601010000 "$RQ_ROOT/withman/manifest" "$RQ_ROOT/withman"
+rq_kb "$RQ_ROOT/withman"; rq_none "a staging WITH a manifest is never residue — nothing to count, nothing to delete"
+
+if [ "$(id -u)" != 0 ]; then
+  rq_mk "$RQ_ROOT/unread"; printf 'm' > "$RQ_ROOT/unread/manifest"; chmod 000 "$RQ_ROOT/unread/manifest"
+  rq_kb "$RQ_ROOT/unread"; rq_none "a manifest that exists but cannot be read is not 'absent' — inert (third state)"
+  chmod 600 "$RQ_ROOT/unread/manifest"
+else
+  ok "(skipped: unreadable-manifest case needs a non-root user)"
+fi
+
+rq_mk "$RQ_ROOT/recent"; printf 'x' > "$RQ_ROOT/recent/ccc.darc"
+rq_kb "$RQ_ROOT/recent"; rq_none "something written within the quiet window (a live writer's first sync has no manifest yet) → inert"
+
+mkdir -p "$RQ_ROOT/empty"; rq_kb "$RQ_ROOT/empty"; rq_none "an empty staging dir has nothing to free → inert"
+rq_kb "$RQ_ROOT/never-created"; rq_none "no staging dir at all → inert"
+ln -s "$RQ_ROOT/res" "$RQ_ROOT/link"; rq_kb "$RQ_ROOT/link"; rq_none "a symlink is not a residue dir (its target may live anywhere) → inert"
+rq_mk "$RQ_OUTSIDE/res"; rq_kb "$RQ_OUTSIDE/res"; rq_none "a residue-shaped dir OUTSIDE \$BACKUP_ROOT is never touched"
+rq_kb "$RQ_OUTSIDE/res" ""; rq_none "an EMPTY \$BACKUP_ROOT must not turn the prefix glob into 'every path' → inert"
+rq_kb "$RQ_ROOT/res/../res"; rq_none "a path with '..' is refused even though it resolves under \$BACKUP_ROOT"
+du() { return 1; }
+rq_kb "$RQ_ROOT/res"; rq_none "a size that cannot be read → inert (no credit, so no delete on a guess)"
+du() { printf '0\t%s\n' "$2"; }
+rq_kb "$RQ_ROOT/res"; rq_none "a size of 0 → inert (nothing to gain by deleting it)"
+unset -f du
+
+# the credit math, with the 2026-09-29 numbers: live 9048MB, free 9600MB, residue 6,384,952 KB
+du() { case "$2" in
+  "$RQ_CITY/.beads/dolt/hq") printf '9265152\t%s\n' "$2" ;;
+  "$RQ_ROOT/res")            printf '6384952\t%s\n' "$2" ;;
+  *) command du "$@" ;; esac; }
+df() { if [ "$2" = "/System/Volumes/Data" ]; then
+  printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/x 1 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "${RQ_FREE_KB-0}"
+  else command df "$@"; fi; }
+rq_credit() { # <free_kb> <credit> — RQ_RC + a fresh RQ_LOG
+  : > "$RQ_LOG"
+  RQ_FREE_KB="$1" CITY="$RQ_CITY" LOG="$RQ_LOG" SYNC_DISK_MARGIN_PCT=150 SYNC_DISK_FLOOR_GB=3 \
+    _sync_disk_preflight_credit hq "$2"; RQ_RC=$?
+}
+rq_credit 9830400 0
+if [ "$RQ_RC" -eq 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=9600MB precisa=13572MB, vivo=9048MB, margem=150%' "$RQ_LOG"; then
+  ok "credit 0 on the 09-29 numbers: refuses with the incident's exact line (livre=9600MB precisa=13572MB) — the gate itself is unchanged"
+else bad "credit 0 (09-29 numbers) did not reproduce the incident refusal: rc=$RQ_RC log='$(cat "$RQ_LOG")'"; fi
+rq_credit 9830400 6384952
+if [ "$RQ_RC" -eq 0 ] && grep -qF 'livre=15835MB >= precisa=13572MB' "$RQ_LOG" && grep -qF 'passaria' "$RQ_LOG" \
+   && ! grep -qF 'sync preflight OK' "$RQ_LOG" && ! grep -qF 'sync preflight REFUSED' "$RQ_LOG"; then
+  ok "credit 6,384,952 KB (the residue) → passes (15835MB >= 13572MB), and says 'passaria' — never the gate's own OK/REFUSED wording"
+else bad "the residue credit did not turn the 09-29 refusal into a pass: rc=$RQ_RC log='$(cat "$RQ_LOG")'"; fi
+rq_credit 9830400 1048576
+if [ "$RQ_RC" -eq 1 ] && grep -qF 'ainda RECUSARIA' "$RQ_LOG" && ! grep -qF 'sync preflight REFUSED' "$RQ_LOG"; then
+  ok "a credit that is not enough (1GB) → still refuses, worded as a hypothetical ('ainda RECUSARIA')"
+else bad "an insufficient credit did not refuse: rc=$RQ_RC log='$(cat "$RQ_LOG")'"; fi
+for _rq_bad in abc "" -5 1e9 "9 9"; do
+  rq_credit 9830400 "$_rq_bad"
+  if [ "$RQ_RC" -eq 1 ] && grep -qF 'sync preflight REFUSED' "$RQ_LOG"; then
+    ok "a credit that is not a plain number ('$_rq_bad') credits NOTHING — same refusal as no credit"
+  else bad "credit '$_rq_bad' was not treated as 0: rc=$RQ_RC log='$(cat "$RQ_LOG")'"; fi
+done
+du() { case "$2" in "$RQ_CITY/.beads/dolt/hq") return 1 ;; *) command du "$@" ;; esac; }
+rq_credit 9830400 6384952
+[ "$RQ_RC" -eq 1 ] && grep -qF 'could not measure live db size' "$RQ_LOG" \
+  && ok "an unreadable LIVE size still refuses even with a credit (fail-closed is not bought back)" \
+  || bad "unreadable live size + credit did not refuse: rc=$RQ_RC log='$(cat "$RQ_LOG")'"
+du() { case "$2" in
+  "$RQ_CITY/.beads/dolt/hq") printf '9265152\t%s\n' "$2" ;;
+  "$RQ_ROOT/res")            printf '6384952\t%s\n' "$2" ;;
+  *) command du "$@" ;; esac; }
+
+# _residue_reinit_would_unblock: yes only for a residue whose deletion makes the gate pass; a question, never a delete
+rq_would() { # <dest> <free_kb>
+  : > "$RQ_LOG"
+  RQ_FREE_KB="$2" CITY="$RQ_CITY" BACKUP_ROOT="$RQ_ROOT" LOG="$RQ_LOG" SYNC_DISK_MARGIN_PCT=150 SYNC_DISK_FLOOR_GB=3 \
+    _residue_reinit_would_unblock hq "$1"; RQ_RC=$?
+}
+rq_would "$RQ_ROOT/res" 9830400
+[ "$RQ_RC" -eq 0 ] && grep -qF 'has NO manifest' "$RQ_LOG" && [ -d "$RQ_ROOT/res" ] && [ -f "$RQ_ROOT/res/aaa.darc" ] \
+  && ok "would-unblock: residue + the 09-29 free space → yes, logs why, and deletes NOTHING itself" \
+  || bad "would-unblock (yes case) wrong: rc=$RQ_RC log='$(cat "$RQ_LOG")'"
+rq_would "$RQ_ROOT/res" 5120000
+[ "$RQ_RC" -eq 1 ] && [ -f "$RQ_ROOT/res/aaa.darc" ] \
+  && ok "would-unblock: residue too small to make the gate pass (5000MB free) → no" \
+  || bad "would-unblock said yes for a residue that would not free enough: rc=$RQ_RC"
+rq_would "$RQ_ROOT/withman" 9830400
+[ "$RQ_RC" -eq 1 ] && ! grep -qF 'has NO manifest' "$RQ_LOG" \
+  && ok "would-unblock: a staging with a manifest → no, and it does not even claim to look at a residue" \
+  || bad "would-unblock touched a staging with a manifest: rc=$RQ_RC log='$(cat "$RQ_LOG")'"
+unset -f du df
+
+# the real gate must be unchanged when called the old way: re-source in a subshell (earlier blocks unset the real one)
+RQ_WRAP_LOG="$(mktemp)"
+RQ_WRAP_RC="$( ( export DOLT_S3_BACKUP_LIB=1; . "$SCRIPT" >/dev/null 2>&1
+  du() { case "$2" in "$RQ_CITY/.beads/dolt/hq") printf '9265152\t%s\n' "$2" ;; *) command du "$@" ;; esac; }
+  df() { if [ "$2" = "/System/Volumes/Data" ]; then
+    printf 'Filesystem 512-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/x 1 1 9830400 1%% 1 1 1%% /System/Volumes/Data\n'
+    else command df "$@"; fi; }
+  CITY="$RQ_CITY" LOG="$RQ_WRAP_LOG" SYNC_DISK_MARGIN_PCT=150 SYNC_DISK_FLOOR_GB=3 _sync_disk_preflight hq; echo $? ) 2>/dev/null | tail -1)"
+[ "$RQ_WRAP_RC" = 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=9600MB precisa=13572MB, vivo=9048MB, margem=150%, piso=3GB) — não vou escrever até o Dolt morrer' "$RQ_WRAP_LOG" \
+  && ok "_sync_disk_preflight (the 1-argument gate every other call site uses) is byte-for-byte what it was: same verdict, same log line" \
+  || bad "_sync_disk_preflight changed behaviour: rc=$RQ_WRAP_RC log='$(cat "$RQ_WRAP_LOG")'"
+rm -rf "$RQ_ROOT" "$RQ_OUTSIDE" "$RQ_LOG" "$RQ_CITY" "$RQ_WRAP_LOG"
+
+echo "── drift-guard: the first refusal site asks the residue question BEFORE it refuses (ga-qcrpxj) ──"
+RQ_FIRST_BLOCK="$(awk '/^for db in \$DBS; do/{l=1} l&&/if ! _sync_disk_preflight "\$db"; then/{f=1} f{print} f&&/if \[ "\$offline_done" -eq 0 \] && ! DOLT_CLI_PASSWORD/{exit}' "$SCRIPT")"
+printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_residue_reinit_would_unblock "$db" "$dest"' \
+  && printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_sync_with_stale_manifest_recovery "$db" "$dest"' \
+  && printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' \
+  && ok "the first site: residue question → reinit+offline recovery; otherwise the ga-btnq6h mirror-and-report refusal, unchanged" \
+  || bad "the first refusal site lost the residue branch, the recovery call, or the original mirror-and-report refusal"
+RQ_ORD_Q="$(printf '%s\n' "$RQ_FIRST_BLOCK" | grep -nF '_residue_reinit_would_unblock' | head -1 | cut -d: -f1)"
+RQ_ORD_M="$(printf '%s\n' "$RQ_FIRST_BLOCK" | grep -nF '_mirror_staging_after_disk_refusal' | head -1 | cut -d: -f1)"
+[ -n "$RQ_ORD_Q" ] && [ -n "$RQ_ORD_M" ] && [ "$RQ_ORD_Q" -lt "$RQ_ORD_M" ] \
+  && ok "…and the question comes first, so the mirror never runs on a residue the reinit is about to delete" \
+  || bad "residue question is not ahead of the mirror (question@${RQ_ORD_Q:-?} mirror@${RQ_ORD_M:-?})"
+
+# ── end-to-end, with the 2026-09-29 numbers: the WHOLE script as a subprocess ───────────────────
+# Stubs: dolt (no server sync is ever allowed to succeed; the offline path — `--data-dir <clone>
+# backup sync-url` — writes a closed backup), du (hq live = 9048MB, the residue = 6,384,952 KB),
+# df (9600MB free while the residue exists; its blocks come back only once it is really gone).
+echo "── end-to-end: a manifest-less residue refuses the gate (ga-qcrpxj) — real subprocess, 09-29 numbers ──"
+e2e29_write_stubs() { # <bin dir>
+  local b="$1"; e2e_write_stubs "$b"
+  cat > "$b/du" <<'STUB'
+#!/bin/bash
+if [ "$1" = "-sk" ]; then
+  case "$2" in
+    */.beads/dolt/hq) printf '%s\t%s\n' "$E29_LIVE_KB" "$2"; exit 0 ;;
+    */.dolt-backup/hq) if [ -e "$2/residue.bin" ]; then printf '%s\t%s\n' "$E29_RESIDUE_KB" "$2"; exit 0; fi ;;
+  esac
+fi
+exec /usr/bin/du "$@"
+STUB
+  cat > "$b/df" <<'STUB'
+#!/bin/bash
+avail="$E29_FREE_KB"
+if [ ! -e "$E29_STAGING/residue.bin" ] && [ "${E29_RECLAIM:-yes}" = yes ]; then avail=$((avail + E29_RESIDUE_KB)); fi
+printf 'Filesystem 1024-blocks Used Available Capacity iused ifree %%iused Mounted\n/dev/fake 99999999 1 %s 1%% 1 1 1%% /System/Volumes/Data\n' "$avail"
+STUB
+  cat > "$b/dolt" <<'STUB'
+#!/bin/bash
+args="$*"; q=""; prev=""
+for a in "$@"; do [ "$prev" = "-q" ] && q="$a"; prev="$a"; done
+echo "dolt: $args" >> "$E29_CALLS"
+case "$args" in
+  *"backup sync-url"*)
+    dest=""; for a in "$@"; do case "$a" in file://*) dest="${a#file://}" ;; esac; done
+    mkdir -p "$dest" && cp -R "$E29_STATE/fresh_backup/." "$dest/"; exit 0 ;;
+  *"SELECT @@port"*) printf '@@port\n43999\n'; exit 0 ;;
+esac
+case "$q" in
+  "SHOW DATABASES") printf 'Database\nhq\ninformation_schema\n' ;;
+  "SELECT 1") echo 1 ;;
+  *"CALL DOLT_BACKUP('add'"*) : ;;
+  *"dolt_log ORDER BY date"*) printf 'commit_hash\nabc123\n' ;;
+  *"SELECT COUNT(*)"*) printf 'COUNT(*)\n5\n' ;;
+  *"CALL DOLT_BACKUP('sync'"*) echo "error opening table file: table file not found: /fake"; exit 1 ;;
+esac
+exit 0
+STUB
+  chmod +x "$b"/*
+}
+
+# e2e29_case <name> <staging: residue|residue-recent|with-manifest> <free_kb> <reclaim: yes|no>
+e2e29_case() {
+  local name="$1" kind="$2" free_kb="$3" reclaim="$4" E i st
+  E="$E2E_ROOT/$name"; E2E_DIR="$E"
+  if ! grep -qF 'CITY="${DOLT_S3_BACKUP_CITY:-' "$SCRIPT" || ! grep -qF 'NOTIFY="${DOLT_S3_BACKUP_NOTIFY:-' "$SCRIPT"; then
+    mkdir -p "$E"; E2E_LOG="$E/never-ran.log"; E2E_RC=99
+    bad "e2e29 $name: the script under test has no DOLT_S3_BACKUP_CITY/NOTIFY override — running it would touch the REAL city; NOT run"
+    return 0
+  fi
+  mkdir -p "$E/state" "$E/tmp" "$E/home" "$E/city/.gc/logs" "$E/city/.gc/runtime/packs/dolt" "$E/city/.beads/dolt/hq" "$E/bucket"
+  e2e29_write_stubs "$E/bin"
+  printf 'listener:\n  port: 43210\ndata_dir: "%s"\n' "$E/city/.beads/dolt" > "$E/city/.gc/runtime/packs/dolt/dolt-config.yaml"
+  echo live > "$E/city/.beads/dolt/hq/blob"
+  st="$E/city/.dolt-backup/hq"; mkdir -p "$st"
+  for i in 1 2 3; do printf 'partial%s' "$i" > "$st/$(e2e_tid "$i").darc"; done
+  printf 'x' > "$st/residue.bin"
+  [ "$kind" = with-manifest ] && e2e_mkmanifest "$st/manifest" 3
+  touch -t 202609281800 "$st"/* "$st"                                  # 28/09 18:00 — the failed server retry, ~10h old
+  [ "$kind" = residue-recent ] && printf 'still-writing' > "$st/$(e2e_tid 3).darc"
+  e2e_mkbackup "$E/bucket/hq" 2                                        # S3: the older closed copy
+  e2e_mkbackup "$E/state/fresh_backup" 4                               # what the offline sync-url writes
+  E2E_LOG="$E/city/.gc/logs/dolt-s3-backup.log"
+  env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOLT_S3_BACKUP_CITY="$E/city" DOLT_S3_BACKUP_NOTIFY="$E/bin/notify" BACKUP_FAIL_FAKE_MAIL="$E/bin/fake_mail" \
+    RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" OFFLINE_SYNC_TMP_ROOT="$E/tmp" \
+    E2E_NOTIFY_CALLS="$E/notify.calls" E2E_CALLS="$E/gc.calls" \
+    E29_LIVE_KB=9265152 E29_RESIDUE_KB=6384952 E29_FREE_KB="$free_kb" E29_RECLAIM="$reclaim" \
+    E29_STAGING="$st" E29_STATE="$E/state" E29_CALLS="$E/dolt.calls" \
+    timeout 120 /bin/bash "$SCRIPT" > "$E/run.out" 2>&1
+  E2E_RC=$?
+  : >> "$E/notify.calls"; : >> "$E/aws.calls"; : >> "$E/dolt.calls"
+}
+e29_count() { grep -c -- "$1" "$2" 2>/dev/null || true; }             # 0 on no match (grep -c exits 1 there)
+
+# ── R1: THE night — 9600MB free, 6.4GB of residue, no manifest. The old script refused it and stopped. ──
+e2e29_case r1-residue-refused residue 9830400 yes
+R1L="$E2E_LOG"; R1D="$E2E_DIR"
+if [ "$(e29_count 'hq: sync preflight REFUSED — disco insuficiente (livre=9600MB precisa=13572MB, vivo=9048MB' "$R1L")" = 1 ]; then
+  ok "e2e R1: the harness reproduces the 04:00:52 refusal (livre=9600MB precisa=13572MB, vivo=9048MB)"
+else bad "e2e R1: harness did not reproduce the incident refusal: $(grep 'hq:' "$R1L" | head -3 | tr '\n' '|')"; fi
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: OK (issues=5' "$R1L" && grep -qF 'offline-sync fallback OK' "$R1L"; then
+  ok "e2e R1: the night now SUCCEEDS — residue deleted, offline sync done, hq: OK (the bug: refused for the residue's own weight)"
+else bad "e2e R1: hq was not backed up (rc=$E2E_RC): $(grep 'hq' "$R1L" | tail -6 | tr '\n' '|')"; fi
+grep -qF 'sync preflight com crédito de 6235MB do resíduo sem manifesto passaria (livre=15835MB' "$R1L" \
+  && ok "e2e R1: the log shows the question and its numbers (credit 6235MB → 15835MB >= 13572MB) before anything was deleted" \
+  || bad "e2e R1: no 'passaria' line with the credit numbers: $(grep 'hq:' "$R1L" | head -4 | tr '\n' '|')"
+grep -qF 'manifest-less staging residue refused the disk gate — auto-reinit' "$R1L" \
+  && ok "e2e R1: the reinit says WHY (not the 'stale-manifest detected' line — no such error happened)" \
+  || bad "e2e R1: the reinit line does not give the real reason"
+[ "$(e29_count 'hq: sync preflight OK (livre=15835MB' "$R1L")" = 1 ] \
+  && ok "e2e R1: the REAL gate ran after the delete and measured the real disk (livre=15835MB), not the hypothesis" \
+  || bad "e2e R1: no real post-delete gate line (livre=15835MB): $(grep 'preflight' "$R1L" | tr '\n' '|')"
+[ ! -e "$R1D/city/.dolt-backup/hq/residue.bin" ] && e2e_same "$R1D/state/fresh_backup/manifest" "$R1D/city/.dolt-backup/hq/manifest" \
+  && ok "e2e R1: the residue is gone and the staging is now the fresh, closed backup (manifest present)" \
+  || bad "e2e R1: staging still holds the residue or has no fresh manifest"
+e2e_same "$R1D/bucket/hq/manifest" "$R1D/city/.dolt-backup/hq/manifest" \
+  && ok "e2e R1: S3 advanced to the fresh manifest (the 3-night-old off-site gap is closed)" \
+  || bad "e2e R1: S3 manifest did not advance"
+[ "$(e29_count "DOLT_BACKUP('sync'" "$R1D/dolt.calls")" = 0 ] && [ "$(e29_count 'backup sync-url' "$R1D/dolt.calls")" = 1 ] \
+  && ok "e2e R1: the server was never asked to sync (ga-cnrr3a's ~6GB write is not repeated) — one offline sync-url" \
+  || bad "e2e R1: wrong dolt calls: $(grep -E "sync" "$R1D/dolt.calls" | tr '\n' '|')"
+[ ! -s "$R1D/notify.calls" ] && ok "e2e R1: no alert — the night is healthy" || bad "e2e R1: an alert fired: $(cat "$R1D/notify.calls")"
+
+# ── R2: same numbers, but the staging HAS a manifest — never treated as residue, refused as before ──
+e2e29_case r2-with-manifest with-manifest 9830400 yes
+if [ "$E2E_RC" -eq 0 ] && [ -e "$E2E_DIR/city/.dolt-backup/hq/residue.bin" ] && ! grep -qF 'auto-reinit' "$E2E_LOG" \
+   && [ "$(e29_count 'hq: sync preflight REFUSED' "$E2E_LOG")" = 1 ] && grep -q 'hq(disco' "$E2E_DIR/notify.calls" \
+   && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ]; then
+  ok "e2e R2: a staging WITH a manifest is left alone — refused and reported exactly as before (ga-btnq6h), nothing deleted"
+else bad "e2e R2: a staging with a manifest was touched or not reported (rc=$E2E_RC): $(grep 'hq:' "$E2E_LOG" | tail -4 | tr '\n' '|')"; fi
+
+# ── R3: a residue written to a minute ago may have a live writer — inert ──
+e2e29_case r3-recent-writes residue-recent 9830400 yes
+if [ "$E2E_RC" -eq 0 ] && [ -e "$E2E_DIR/city/.dolt-backup/hq/residue.bin" ] && ! grep -qF 'auto-reinit' "$E2E_LOG" \
+   && ! grep -qF 'has NO manifest' "$E2E_LOG" && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] \
+   && grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls"; then
+  ok "e2e R3: a residue with a recent write is NOT deleted (a live writer may own it); the night stays refused and the alert says disco+s3"
+else bad "e2e R3: a recently written residue was deleted or the refusal went unreported (rc=$E2E_RC): $(grep 'hq:' "$E2E_LOG" | tail -4 | tr '\n' '|')"; fi
+
+# ── R4: a residue that would NOT free enough (5000MB free + 6235MB < 13572MB) — no delete for nothing ──
+e2e29_case r4-too-small residue 5120000 yes
+if [ "$E2E_RC" -eq 0 ] && [ -e "$E2E_DIR/city/.dolt-backup/hq/residue.bin" ] && ! grep -qF 'auto-reinit' "$E2E_LOG" \
+   && grep -qF 'ainda RECUSARIA' "$E2E_LOG" && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] \
+   && grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls"; then
+  ok "e2e R4: deleting the residue would not make the sync fit → it is KEPT ('ainda RECUSARIA' logged), refusal and alert as before"
+else bad "e2e R4: expected residue KEPT + no reinit + 'ainda RECUSARIA' logged + alert disco+s3 (rc=$E2E_RC, residue kept=$([ -e "$E2E_DIR/city/.dolt-backup/hq/residue.bin" ] && echo yes || echo NO)): $(grep 'hq:' "$E2E_LOG" | tail -4 | tr '\n' '|')"; fi
+
+# ── R5: the hypothesis says yes, but the OS does not give the space back (a snapshot pins it). The real gate must refuse. ──
+e2e29_case r5-no-reclaim residue 9830400 no
+if [ "$E2E_RC" -eq 0 ] && [ "$(e29_count 'hq: sync preflight REFUSED' "$E2E_LOG")" = 2 ] \
+   && grep -qF 'disk preflight refused after stale-manifest reinit' "$E2E_LOG" \
+   && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] && [ "$(e29_count "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" = 0 ] \
+   && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" && ! grep -qF 'hq: OK' "$E2E_LOG"; then
+  ok "e2e R5: the credit is a hypothesis, not trusted — the post-delete gate re-measured (still 9600MB), REFUSED, and NOTHING was written; alert hq(sync)"
+else bad "e2e R5: the sync ran (or was hidden) although the disk never freed (rc=$E2E_RC): $(grep 'hq:' "$E2E_LOG" | tail -5 | tr '\n' '|')"; fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
