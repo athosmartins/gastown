@@ -148,7 +148,27 @@ def compute_stats(records: list[dict]) -> dict:
     return stats
 
 
+def log_problem(path: Path) -> str | None:
+    """Why the log could not be READ, or None when it can. read_jsonl() answers [] for a log it cannot open,
+    exactly as it does for an empty one, so without this an unreadable (or missing, or wrongly pointed-at) log
+    printed "0 case(s)" and "Hook errors: none logged" -- the words of a quiet day. There are three states:
+    has rows / has none / could not be read, and the third must not print as the second. An EMPTY readable
+    log is a real "no rows" and is not a problem. Never raises."""
+    try:
+        with path.open("rb") as f:
+            f.read(1)
+    except OSError as e:
+        return f"{type(e).__name__}: {e.strerror or e}"
+    return None
+
+
 def format_report(stats: dict) -> str:
+    if stats.get("log_problem"):
+        # nothing was read, so every number below would be a zero that means "unknown" -- print none of them
+        return (
+            f"Cut-large-output (ga-wk0qi2, SHADOW): LOG NOT READ ({stats['log_problem']}) -- no case, join or hook-error "
+            f"count is available; this is NOT a report of zero cases."
+        )
     lines = ["Cut-large-output (ga-wk0qi2, SHADOW — nothing is actually cut yet):"]
     for exp, label in (("cut-output-fixed", "Fixed-rule tier (pytest/log-tail, no AI)"), ("cut-output-jev", "Jev tier (unstructured large blocks)")):
         s = stats[exp]
@@ -227,6 +247,10 @@ def format_report(stats: dict) -> str:
 
 
 def format_resumo_pt(stats: dict) -> str:
+    if stats.get("log_problem"):
+        return (
+            f"Cortar-saída-grande (SOMBRA): log não lido ({stats['log_problem']}) -- sem dado nenhum, isto NÃO é zero caso."
+        )
     fixed = stats["cut-output-fixed"]["count"]
     fixed_unknown = stats["cut-output-fixed"]["unknown_count"]
     jev = stats["cut-output-jev"]["count"]
@@ -269,6 +293,7 @@ def main() -> int:
     log_path = Path(args.log) if args.log else je.JEV_LOG
     records = read_jsonl(log_path)
     stats = compute_stats(records)
+    stats["log_problem"] = log_problem(log_path)  # None when readable; read_jsonl's [] cannot tell that from "no rows"
     print(format_resumo_pt(stats) if args.resumo_pt else format_report(stats))
     return 0
 
@@ -525,6 +550,48 @@ def _selftest() -> int:
     ok("compute_stats on empty input never raises, counts are zero", empty_stats["cut-output-fixed"]["count"] == 0 and empty_stats["joins"]["total"] == 0)
     ok("format_report on empty stats doesn't crash and says no joined cases yet", "no joined cases yet" in format_report(empty_stats))
     ok("format_resumo_pt on empty stats doesn't crash", isinstance(format_resumo_pt(empty_stats), str))
+
+    # ---- gate_run ga-q6bac0, low finding: a log that cannot be READ is not a log with no rows. read_jsonl() returns
+    # [] for both, so an unreadable log printed "0 case(s)" and "Hook errors: none logged" -- the words of a quiet
+    # day (three states: has rows / has none / could not be read). ----
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td_r:
+        td_p = Path(td_r)
+        empty_log = td_p / "empty.jsonl"
+        empty_log.write_text("")
+        some_log = td_p / "some.jsonl"
+        some_log.write_text('{"mode": "cut-output", "experiment": "cut-output-fixed", "entity_id": "z1", "tokens_would_save": 10}\n')
+        not_a_file = td_p / "a-directory"
+        not_a_file.mkdir()
+        gone_log = td_p / "no-such-log.jsonl"
+        ok("log_problem: a readable log is no problem", log_problem(some_log) is None)
+        ok("log_problem: an EMPTY log is readable -- 'no rows' is a real answer, not a problem", log_problem(empty_log) is None)
+        ok("log_problem: a log that does not exist is a problem (no data was read)", isinstance(log_problem(gone_log), str) and bool(log_problem(gone_log)))
+        ok("log_problem: a path that cannot be opened for reading (a directory) is a problem", isinstance(log_problem(not_a_file), str) and bool(log_problem(not_a_file)))
+
+        bad_stats = compute_stats([])
+        bad_stats["log_problem"] = "PermissionError: Permission denied"
+        bad_text = format_report(bad_stats)
+        ok("format_report: an unreadable log says LOG NOT READ and why", "LOG NOT READ" in bad_text and "Permission denied" in bad_text)
+        ok("format_report: an unreadable log does NOT print the quiet-day words ('0 case(s)', 'none logged')",
+           "case(s)" not in bad_text and "none logged" not in bad_text and "no joined cases yet" not in bad_text)
+        bad_pt = format_resumo_pt(bad_stats)
+        ok("format_resumo_pt: an unreadable log says so, and prints no count that could pass for a real zero",
+           "log não lido" in bad_pt and "Permission denied" in bad_pt and "0 caso(s)" not in bad_pt and "conferido" not in bad_pt)
+        ok("format_report/format_resumo_pt: a stats dict with no log_problem key behaves as before (readable)",
+           "LOG NOT READ" not in format_report(compute_stats([])) and "log não lido" not in format_resumo_pt(compute_stats([])))
+
+        me = str(Path(__file__).resolve())
+        run_bad = subprocess.run([sys.executable, me, "--log", str(not_a_file)], capture_output=True, text=True, timeout=60)
+        ok("end to end: --log <unreadable path> prints LOG NOT READ (and still exits 0: the daily report is best-effort)",
+           "LOG NOT READ" in run_bad.stdout and run_bad.returncode == 0)
+        run_bad_pt = subprocess.run([sys.executable, me, "--resumo-pt", "--log", str(gone_log)], capture_output=True, text=True, timeout=60)
+        ok("end to end: --resumo-pt on a missing log prints the Portuguese 'log não lido' line", "log não lido" in run_bad_pt.stdout)
+        run_empty = subprocess.run([sys.executable, me, "--log", str(empty_log)], capture_output=True, text=True, timeout=60)
+        ok("end to end (control): an empty but readable log is still an ordinary report, not LOG NOT READ",
+           "LOG NOT READ" not in run_empty.stdout and "0 case(s)" in run_empty.stdout)
 
     print(f"\njev_cut_output_report selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0

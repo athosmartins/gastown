@@ -9,12 +9,23 @@ This script does that lookup, after the fact, exactly like jev_gate_fail_classif
 and jev_quem_pensa_experiment.py's own offline joins (see their DESIGN sections).
 
 PROXY, deliberately loose (this bead's own text): "did a later turn of the same session mention
-one of the cut block's ids/paths/error snippets". This is a substring search over the RAW TEXT of
+one of the cut block's ids/paths/error snippets". This is a substring search over the text of
 every transcript line after the tool call in question -- not a structured re-parse of Claude
-Code's own transcript schema, which is not a public contract and can change across versions. A
-false positive here (the signature happens to appear for an unrelated reason) biases the
-"referenced later" rate UP, i.e. toward UNDERSTATING how safe a cut would have been -- the
-conservative direction for a front that is deciding whether it is safe to ever go live.
+Code's own transcript schema, which is not a public contract and can change across versions. The
+transcript is JSON, so a signature is looked for as raw text AND in its JSON-escaped spelling
+(signature_forms): without that a signature holding a quote, a backslash, a tab or an ESC byte could
+never match, however verbatim the later quote.
+
+The rate is a PROXY, not a bound in either direction, and it is wrong both ways:
+  * UP: a coincidental match -- a sibling call in the same parallel batch repeating a path, an
+    ordinary word shaped like a bead id ("wa-worker") -- counts as "the agent needed it",
+    understating how safe a cut would have been;
+  * DOWN: a later turn that ACTED on the cut content without quoting any signature verbatim (a
+    paraphrase, silent reliance, an error line shortened or reflowed) is invisible, overstating how
+    safe a cut would have been -- the dangerous direction for a front deciding whether it is ever safe
+    to go live. Only a verbatim id/path/sha/80-char error snippet counts.
+So a LOW rate is not evidence that cutting is safe; it is the number a human weighs together with what
+the report says it cannot see. Only the UP direction is "conservative"; do not read the whole proxy as such.
 
 APPEND-ONLY, never mutates: jev-experiment.jsonl is a shared log written by many processes
 across the whole city. This script never rewrites an existing line (racy, and every other
@@ -68,7 +79,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_experiment as je  # noqa: E402
-from cut_output_classifier import JOIN_MODE, RECORD_MODE  # noqa: E402,F401  (JOIN_MODE is re-exported to the report)
+from cut_output_classifier import JOIN_MODE, RECORD_MODE, extract_signatures  # noqa: E402,F401  (JOIN_MODE is re-exported to the report; extract_signatures is used by the selftest)
 
 SOURCE_EXPERIMENTS = ("cut-output-fixed", "cut-output-jev")
 
@@ -169,12 +180,34 @@ def _nonempty_str(v: object) -> bool:
     return isinstance(v, str) and bool(v)
 
 
+def signature_forms(sig: str) -> list[str]:
+    """Every form one signature can take INSIDE a line of a JSON-encoded transcript. A signature is raw
+    tool-output text; the transcript stores that text as a JSON string, so the same characters are there
+    only in their escaped spelling: `"` as `\\"`, a backslash as `\\\\`, a tab as `\\t`, ESC as `\\u001b`,
+    and non-ASCII either as itself or, for a writer that escapes it, as `\\uXXXX`. `sig in line` alone can
+    therefore NEVER match a signature holding any of those, however verbatim the later quote is -- and
+    the no-match reads as a definite False (gate_run ga-q6bac0). The raw form comes first (it is the only
+    form for the ids/paths/shas that make up most signatures, so those cost nothing extra); the escaped
+    forms follow, without duplicates. Never raises."""
+    forms = [sig]
+    for ascii_only in (False, True):
+        encoded = json.dumps(sig, ensure_ascii=ascii_only)[1:-1]  # drop the surrounding quotes
+        if encoded not in forms:
+            forms.append(encoded)
+    return forms
+
+
 def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signatures: list[str]) -> tuple[bool | None, str | None]:
     """(referenced_later, matched_signature). None when the transcript is missing/unreadable,
     `tool_use_id` cannot be located in it, or there is no usable (non-empty string) signature to look
     for (unknown, never coerced to False). Otherwise True/False depending on whether any signature
-    appears, as a raw substring, in any line AFTER the split point. A False here only says "not in
-    the transcript as it is NOW"; whether that may be recorded is run()'s call (see SETTLING).
+    appears -- as raw text or in its JSON-escaped spelling (signature_forms) -- in any record AFTER
+    the split point. A False here only says "not in the transcript as it is NOW"; whether that may be
+    recorded is run()'s call (see SETTLING).
+
+    RECORDS are split on "\\n" only, never str.splitlines(): splitlines also breaks at U+2028, U+2029
+    and U+0085, which JSON.stringify leaves raw inside a string, so one record was cut in two and the
+    tail of the call's own tool_result (every signature, by construction) landed after the split point.
 
     The split point is the LAST line, anywhere in the transcript, that carries `tool_use_id`. A
     tool_use_id is unique to one call, so every line that mentions it belongs to that call's own
@@ -192,16 +225,18 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     that names this call" is the whole lifecycle regardless of how the lines interleave.
 
     The id is matched as a whole token (not a raw substring), so "tu-1" is not located inside the
-    unrelated later id "tu-12". Signatures themselves stay a deliberately LOOSE substring search: a
-    SIBLING call's result in the same batch can repeat a path by coincidence, which biases the rate
-    UP (the conservative direction for a go/no-go on cutting) -- unlike the self-match above, which
-    is systematic and made the rate uninformative."""
+    unrelated later id "tu-12". Signatures themselves stay a deliberately LOOSE substring search, and
+    the looseness cuts BOTH ways -- see the module docstring: a coincidental match (a SIBLING call's
+    result in the same batch repeating a path, an ordinary word shaped like a bead id) pushes the rate
+    UP, while a later turn that used the cut content without quoting any signature verbatim is
+    invisible and pushes it DOWN. What the escaping fix removes is a third, purely mechanical way to
+    miss: a verbatim quote that could not match because of how JSON spells it."""
     usable = [s for s in signatures if _nonempty_str(s)]  # a non-string entry is malformed data, not a crash
     if not usable:
         return None, None  # nothing to look for is not "looked and found nothing" (the same two-states rule as a missing id)
 
     try:
-        lines = Path(transcript_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = Path(transcript_path).read_text(encoding="utf-8", errors="replace").split("\n")
     except OSError:
         return None, None
 
@@ -214,9 +249,10 @@ def scan_transcript_for_signatures(transcript_path: str, tool_use_id: str, signa
     if split_idx is None:
         return None, None
 
+    forms_by_sig = [(sig, signature_forms(sig)) for sig in usable]
     for ln in lines[split_idx + 1 :]:
-        for sig in usable:
-            if sig in ln:
+        for sig, forms in forms_by_sig:
+            if any(form in ln for form in forms):
                 return True, sig
     return False, None
 
@@ -491,6 +527,77 @@ def _selftest() -> int:
             "tool_use_id is matched as a whole token: 'tu-1' is not found inside 'tu-12', so the later call's reference counts",
             r_delim is True and sig_delim == "ga-delim-sig",
         )
+
+        # ---- gate_run ga-q6bac0, blocking issue 1: a signature is raw tool-output text, but the transcript
+        # is JSON-encoded, so a signature holding a double quote, a backslash, a tab or an ESC byte is NOT a
+        # substring of the line that quotes it (it is there as \" \\ \t \u001b), and a plain `sig in line`
+        # answered a definite False for a later turn that quoted it verbatim -- permanently, once the
+        # session settled. Every fixture above is hand-written ASCII with plain ids, so none of them could see
+        # this. These fixtures are written by json.dumps, the way the real transcript is, and run in both
+        # encodings a writer can use (raw non-ASCII, or \uXXXX for it). ----
+        def _enc_transcript(name: str, tuid: str, result_text: str, later_text: str | None, ascii_only: bool) -> Path:
+            recs_t = [
+                {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tuid, "input": {"command": "run-it"}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tuid, "content": result_text}]}},
+            ]
+            if later_text is not None:
+                recs_t.append({"type": "assistant", "message": {"content": [{"type": "text", "text": later_text}]}})
+            p = Path(td) / name
+            p.write_text("\n".join(json.dumps(r, ensure_ascii=ascii_only) for r in recs_t) + "\n", encoding="utf-8")
+            return p
+
+        special_sigs = {
+            "double quote (JSON error line)": '{"level":"error","msg":"disk full on the data volume"}',
+            "backslash (Windows path)": r"ERROR: cannot open C:\Users\x\y.txt",
+            "tab": "ERROR\tfailed to open the config file",
+            "ESC / ANSI colour": "\x1b[31mERROR\x1b[0m: build failed in stage two",
+            "non-ASCII": "ERROR: échec de la connexion au serveur — café ☕",
+            "quote + backslash + tab together": 'ERROR\t"C:\\tmp\\x" not found',
+        }
+        for si, (label, sig_sp) in enumerate(special_sigs.items()):
+            for ascii_only in (False, True):
+                enc_name = "\\uXXXX" if ascii_only else "raw"
+                cited = _enc_transcript(f"enc-{si}-{int(ascii_only)}-c.jsonl", f"toolu_enc{si}{int(ascii_only)}c",
+                                        f"output containing {sig_sp} in the middle", f"as I said, {sig_sp} is what failed", ascii_only)
+                r_c, m_c = scan_transcript_for_signatures(str(cited), f"toolu_enc{si}{int(ascii_only)}c", [sig_sp])
+                ok(f"signature with {label}, transcript encoded {enc_name}: quoted verbatim by a later turn -> True",
+                   r_c is True and m_c == sig_sp)
+                uncited = _enc_transcript(f"enc-{si}-{int(ascii_only)}-u.jsonl", f"toolu_enc{si}{int(ascii_only)}u",
+                                          f"output containing {sig_sp} in the middle", "something else entirely", ascii_only)
+                r_u, _ = scan_transcript_for_signatures(str(uncited), f"toolu_enc{si}{int(ascii_only)}u", [sig_sp])
+                ok(f"signature with {label}, transcript encoded {enc_name}: only in the call's OWN result -> still False (no over-correction)",
+                   r_u is False)
+
+        # the reviewer's end-to-end shape: signatures produced by extract_signatures() from a JSON log, and a
+        # later turn quoting the first one verbatim
+        json_log = "\n".join('{"level":"error","msg":"upstream timed out","attempt":%d}' % i for i in range(30))
+        e2e_sigs = extract_signatures(json_log)
+        ok("extract_signatures on a JSON log yields error-line signatures that contain double quotes",
+           bool(e2e_sigs) and any('"' in s for s in e2e_sigs))
+        e2e = _enc_transcript("e2e.jsonl", "toolu_e2e", json_log, "the last failure was " + e2e_sigs[0], False)
+        r_e2e, m_e2e = scan_transcript_for_signatures(str(e2e), "toolu_e2e", e2e_sigs)
+        ok("end to end: an extract_signatures() signature quoted verbatim by a later turn is found (True)", r_e2e is True and m_e2e is not None)
+        e2e_own = _enc_transcript("e2e-own.jsonl", "toolu_e2eo", json_log, "unrelated later turn", False)
+        r_e2e_own, _ = scan_transcript_for_signatures(str(e2e_own), "toolu_e2eo", e2e_sigs)
+        ok("end to end: the same signatures that only sit in the call's own result stay False", r_e2e_own is False)
+
+        # ---- sibling of the same class: the transcript is JSONL, records are separated by "\n" ONLY. ----
+        # str.splitlines() also breaks at U+2028, U+2029 and U+0085, which JSON.stringify leaves RAW inside a
+        # string. One record was cut in two: the id sat on the first piece and the rest of the call's own
+        # tool_result -- every signature, by construction -- on a piece "after" the split point, so the call's
+        # own output was counted as a later reference (the self-match bug again, through the record boundary).
+        for sep_label, sep in (("U+2028", "\u2028"), ("U+2029", "\u2029"), ("U+0085", "\u0085")):
+            sep_tuid = "toolu_sep" + sep_label[-4:]
+            sep_p = _enc_transcript(f"sep-{sep_label[-4:]}.jsonl", sep_tuid,
+                                    f"first part of the output{sep} then ga-after-separator and more", "unrelated later turn", False)
+            ok(f"the transcript line holding a raw {sep_label} really is ONE physical line (the fixture is what real JSON.stringify writes)",
+               len(sep_p.read_text(encoding="utf-8").split("\n")) == 4 and sep in sep_p.read_text(encoding="utf-8"))
+            r_sep, _ = scan_transcript_for_signatures(str(sep_p), sep_tuid, ["ga-after-separator"])
+            ok(f"a raw {sep_label} inside the call's own tool_result does not split the record: its own text is not a later turn -> False", r_sep is False)
+            sep_later = _enc_transcript(f"sep-later-{sep_label[-4:]}.jsonl", sep_tuid + "l",
+                                        f"first part{sep} then more", f"I need ga-after-separator{sep} now", False)
+            r_sep_l, _ = scan_transcript_for_signatures(str(sep_later), sep_tuid + "l", ["ga-after-separator"])
+            ok(f"...and a genuine later turn that cites it (its own text also holds a raw {sep_label}) is still found -> True", r_sep_l is True)
 
         # ---- read_jsonl: tolerant of garbage lines ----
         garbage = Path(td) / "garbage.jsonl"
