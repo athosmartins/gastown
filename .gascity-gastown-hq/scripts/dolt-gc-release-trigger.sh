@@ -47,6 +47,13 @@
 #     attempt counted, backoff armed, the log says which signal said what. Until ga-11vdhe success was
 #     inferred from the streak file alone ("cleared" = probably worked); the job always exits 0, so its
 #     exit status says nothing.
+#   - It does not start a run against a Dolt that is not answering (ga-y5ezoz). Just before it would record an
+#     attempt it asks the job's own probe (_gc_dolt_reachable: the job's client, port and database, `SELECT 1`);
+#     no answer → `WAIT dolt-unreachable`: no run, no attempt, no backoff, the skip streak untouched, and the
+#     next poll asks again. RunAtLoad fires a poll seconds after a boot — the day's peak of free disk, before Dolt
+#     is up — and the run it used to start cleared the streak and pushed "dolt gc FALHOU" for a GC that never
+#     began. The same word from the JOB's own probe (Dolt lost between the two) is not an attempt either: the
+#     kind's backoff is put back as it was (see step 6 of _trg_poll).
 #   - It does not run when the state is not chronic (streak < GC_RELEASE_MIN_STREAK): the 2h cycle
 #     owns healthy operation. A minimum below 1 is refused as unusable (with 0 every healthy poll
 #     would count as chronic). (It does still LOOK, at any streak, for a hung maintenance holder — read-only;
@@ -133,6 +140,9 @@
 #   chronic state: + one df and two du (~35 ms each), and — only when a release run would start on
 #       THIS poll (past the backoff check, which is arithmetic and comes first) — the `ps -ax` busy
 #       check (~1.2 s wall). A poll inside its backoff window, or one on the direct path, never forks it.
+#       And — only on a poll that would start a run, after every veto above — one `dolt sql` `SELECT 1`
+#       (ga-y5ezoz): the reachability probe — 0.4-1.5 s wall over 5 probes at load ~45, 0.1 s against a refused
+#       port, 15 s at most (its timeout).
 # StartInterval=300 ≫ any of these; ≈ 20 CPU-seconds/day in total. A pid-verified single-instance
 # lock (same helper as the job) means a long child run can never stack polls.
 #
@@ -467,7 +477,7 @@ _trg_record() {
 
 # _trg_poll — one evaluation. Always returns 0 (a poll that decides nothing is a normal outcome).
 _trg_poll() {
-  local now streak sk max_s lim size_mb avail_mb staging_mb target pct parts rel_on cool_ok decision kind att nxt busy backoff end run_rc rc_note token oc ocls why
+  local now streak sk max_s lim size_mb avail_mb staging_mb target pct parts rel_on cool_ok decision kind att nxt prev_att prev_nxt busy backoff end run_rc rc_note token oc ocls why
   _TRG_STREAK=""; _TRG_AVAIL=""; _TRG_SIZE=""; _TRG_STAGING=""; _TRG_REQUIRED=""; _TRG_NOTE=""
   _TRG_ATT=0; _TRG_NEXT=0; _TRG_DATT=0; _TRG_DNEXT=0
   now="$(_gc_now_epoch)"
@@ -581,8 +591,22 @@ _trg_poll() {
     _trg_record "$now" "WAIT staging-busy:${busy}"; return 0
   fi
 
+  # 4b) Dolt has to be able to take the call at all (ga-y5ezoz). Measured 2026-09-29: RunAtLoad fired this poll
+  #    32 s after a boot, on the day's peak of free space (25.7 GB); Dolt was not accepting connections yet, the
+  #    job it started cleared the 28-cycle skip streak, pushed "dolt gc FALHOU" and this trigger reset its
+  #    backoff — five minutes later the streak read 0 and the window was gone. "Dolt refused the connection" is
+  #    a state of its own: not an attempt at the GC, so it does not arm a backoff, does not count, and touches
+  #    neither the streak nor the other kind's memory — the next poll (5 min) simply asks again. Last of the
+  #    vetoes, because it is the only one that forks a dolt client (~1 s at load): a healthy poll, a poll inside
+  #    its backoff and a poll that is not eligible never get here.
+  if ! _gc_dolt_reachable; then
+    _TRG_NOTE="dolt did not answer a connection to ${DB} (${_GC_DOLT_UNREACHABLE_WHY:-no reason recorded}) — no run started, not counted as an attempt; the next poll asks again"
+    _trg_record "$now" "WAIT dolt-unreachable"; return 0
+  fi
+
   # 5) start the job. The attempt is recorded BEFORE the run: if it cannot be recorded there is no
   #    backoff to rely on → do not start; and a crash mid-run keeps the backoff in force.
+  prev_att="$att"; prev_nxt="$nxt"     # what this kind's backoff was before the attempt (a run that turns out not to be one puts it back)
   att=$(( att + 1 ))
   backoff="$(_trg_backoff_s "$att")"
   _trg_set_backoff "$kind" "$att" "$(( now + backoff ))"
@@ -614,8 +638,24 @@ _trg_poll() {
   case "$oc" in
     gc-ok|gc-failed|below-threshold)                        ocls=terminal ;;
     skip-headroom|release-not-taken|released-still-short|size-unmeasurable)   ocls=skipped ;;
+    dolt-unreachable)                                       ocls=unreachable ;;
     absent|stale|unreadable)                                ocls=none ;;
     *)                                                      ocls=unknown ;;
+  esac
+  # The job's OWN probe found Dolt not answering although this poll's had (a few seconds earlier) — Dolt went
+  # away in between, or answered too slowly once. dolt_gc was never attempted and the job left the streak alone,
+  # so this run is not an attempt either (ga-y5ezoz): put this kind's backoff back as it was and ask again next
+  # poll. Only with a streak that is STANDING — the job's word and the streak file must agree, as everywhere in
+  # this step: "unreachable" with a cleared or unreadable streak contradicts itself and falls through below
+  # to "cannot confirm", i.e. counted.
+  case "$sk" in
+    "standing "*)
+      if [ "$ocls" = "unreachable" ]; then
+        log "trigger: run finished — outcome=${oc}: dolt stopped answering between this poll's probe and the job's own; dolt_gc was not attempted, the skip streak is untouched (streak=${sk#standing }); NOT counted as an attempt, the ${kind} backoff is back to what it was${rc_note}"
+        _trg_set_backoff "$kind" "$prev_att" "$prev_nxt"
+        _trg_state_write "$GC_TRIGGER_STATE" "$end" "WAIT dolt-unreachable" "$_TRG_ATT" "$_TRG_NEXT" "$_TRG_DATT" "$_TRG_DNEXT" || log "trigger: WARN could not record the outcome in $GC_TRIGGER_STATE"
+        return 0
+      fi ;;
   esac
   if [ "$sk" = "cleared" ] && [ "$ocls" = "terminal" ]; then
     log "trigger: run finished — outcome=${oc}, the skip streak is cleared; backoff reset${rc_note}"

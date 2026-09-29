@@ -988,6 +988,38 @@ main() {
   return 0
 }
 
+# _gc_dolt_probe_timeout_s → whole seconds the reachability probe below may take (GC_DOLT_PROBE_TIMEOUT_S,
+# default 15). Blank, not a number, longer than 3 digits or 0 is garbled → the default; "015" is 15, not octal.
+_gc_dolt_probe_timeout_s() {
+  local t="${GC_DOLT_PROBE_TIMEOUT_S:-15}"
+  case "$t" in ''|*[!0-9]*) echo 15; return 0 ;; esac
+  [ "${#t}" -le 3 ] || { echo 15; return 0; }
+  t=$(( 10#$t ))
+  [ "$t" -ge 1 ] || t=15
+  echo "$t"
+}
+
+# _gc_dolt_reachable → 0 iff Dolt takes a connection to $DB right now (ga-y5ezoz): the SAME client, host, port
+# and database the dolt_gc call uses, asked for `SELECT 1`. 1 otherwise, with the reason (the client's rc and the
+# first line it said) left in _GC_DOLT_UNREACHABLE_WHY for the caller's log line — so call it directly, not
+# through $(...), or the reason is lost with the subshell. "Could not ask" (no dolt binary, a timeout, a
+# database that is not loaded yet) is 1 too: a call that cannot be delivered is not an attempt, and it must not
+# read the same as "dolt_gc ran and failed" (measured 2026-09-29: the trigger fired 32 s after a boot, Dolt
+# refused the connection, and the job cleared a 28-cycle skip streak and pushed "dolt gc FALHOU" for a GC that
+# never started). Read-only. Measured 2026-09-29 at load ~45: 0.4-1.5 s wall against the live hq (5 probes), 0.1 s against a
+# refused port — and only on a run that has already passed the gate.
+_gc_dolt_reachable() {
+  local out rc t
+  _GC_DOLT_UNREACHABLE_WHY=""
+  t="$(_gc_dolt_probe_timeout_s)"
+  case "$t" in ''|*[!0-9]*) t=15 ;; esac     # a failed $(...) under fork pressure hands back blank
+  out="$(DOLT_CLI_PASSWORD='' timeout "$t" dolt --host 127.0.0.1 --port "$PORT" --user root --no-tls sql -q "USE \`$DB\`; SELECT 1;" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  out="${out%%$'\n'*}"
+  _GC_DOLT_UNREACHABLE_WHY="client rc=${rc}${out:+: ${out:0:300}}"
+  return 1
+}
+
 # _gc_record_outcome <outcome> — ga-11vdhe: the run's explicit RESULT, for the trigger that started it.
 # The job always exits 0 once it is running, so until now the trigger could only infer "did it work?" from
 # the skip-streak file (cleared = probably yes). This is the real signal: one line, `token=<t> outcome=<x>`,
@@ -997,7 +1029,9 @@ main() {
 # record, which the trigger reads as "cannot tell" (= not cleared), never as success.
 # Outcome words: below-threshold (hq MEASURED under the threshold) · size-unmeasurable (hq could not be
 # measured — decided nothing, cleared nothing) · skip-headroom · release-not-taken · released-still-short ·
-# gc-ok · gc-failed · unknown (the step returned without saying — a path added later that forgot to set one).
+# dolt-unreachable (the gate was met but Dolt would not take a connection — dolt_gc was never attempted and
+# the streak is untouched; ga-y5ezoz) · gc-ok · gc-failed · unknown (the step returned without saying — a
+# path added later that forgot to set one).
 _gc_record_outcome() {
   case "${GC_RUN_TOKEN:-}" in ''|*[!0-9.]*) return 0 ;; esac
   { mkdir -p "$(dirname "$GC_RUN_OUTCOME_STATE")" 2>/dev/null \
@@ -1098,6 +1132,19 @@ _run_size_gc_step() {
     fi
   fi
 
+  # ga-y5ezoz: three answers, not two — the GC ran / it ran and failed / it could not even be asked. The streak
+  # clear below is defined as "we reached an ACTUAL attempt" (ga-azzfw req. 3), and a connection Dolt refuses is
+  # not one: measured 2026-09-29, a trigger run 32 s after a boot met the gate (25.7 GB free, the day's peak),
+  # Dolt was not up yet, and this step cleared a 28-cycle streak, pushed "dolt gc FALHOU" and the trigger's
+  # backoff reset — the post-boot window (free space fell to 18.7 GB by 07:13) was spent on a GC that never
+  # started. So ask first; if Dolt does not answer, nothing is cleared, nothing is alerted as a GC failure, and
+  # the next run/poll decides again. Only here, past the gate: the skip path (the ~always case) forks no dolt client.
+  if ! _gc_dolt_reachable; then
+    log "dolt did not answer a connection to ${DB} (${_GC_DOLT_UNREACHABLE_WHY}) — NOT attempting dolt_gc: a call that could not be delivered is not an attempt, so the skip streak is left as it is and no GC-failure alert is sent; the next run tries again"
+    _RUN_OUTCOME="dolt-unreachable"
+    return 0
+  fi
+
   local pre; pre="$(du -sh "$DOLTDIR" 2>/dev/null | awk '{print $1}')"
   log "hq=${pre} >= ${THRESHOLD_G}G, headroom ok — running online dolt_gc ..."
   # ga-azzfw requirement 3: the headroom problem this cycle is resolved the moment we
@@ -1129,7 +1176,8 @@ back down toward its live-data floor."
     local rc=$?
     log "dolt_gc FAILED (rc=$rc)"
     _RUN_OUTCOME="gc-failed"
-    "$NOTIFY" -t "Dolt gc" -p 4 "🚨 Manutenção dolt gc FALHOU (rc=$rc) — store em ${pre}, verificar antes de re-inchar" 2>/dev/null || true
+    # via the wrapper (same $NOTIFY call, same swallowed failure) so the selftest can see this push instead of firing a real one
+    _dolt_gc_notify "Dolt gc" 4 "🚨 Manutenção dolt gc FALHOU (rc=$rc) — store em ${pre}, verificar antes de re-inchar"
   fi
   return 0
 }

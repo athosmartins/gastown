@@ -191,6 +191,11 @@ _avail_mb() { echo x >> "$T/reads.avail"; printf '%s' "$AVAIL"; }
 _trg_dir_mb() { echo x >> "$T/reads.du"; case "$1" in */.beads/dolt/hq) printf '%s' "$SIZE_MB" ;; */.dolt-backup/hq) printf '%s' "$STAGING_MB" ;; *) printf '' ;; esac; }
 _gc_release_busy() { echo x >> "$T/reads.busy"; if [ -n "$BUSY" ]; then echo "$BUSY"; return 0; fi; return 1; }
 nreads() { if [ -f "$T/reads.$1" ]; then wc -l < "$T/reads.$1" | tr -d '[:space:]'; else echo 0; fi; }
+# The reachability probe (ga-y5ezoz), stubbed so nothing here ever opens a connection to the live Dolt. DOLT_UP=0 is
+# a Dolt that refuses the connection; the reason goes where the real probe puts it (_GC_DOLT_UNREACHABLE_WHY, which the
+# trigger reads in the same shell — it is not called through $(...)). Counted into a file, like the other readers.
+DOLT_UP=1; DOLT_WHY="client rc=1: dial tcp 127.0.0.1:52756: connect: connection refused"
+_gc_dolt_reachable() { echo x >> "$T/reads.dolt"; _GC_DOLT_UNREACHABLE_WHY=""; [ "$DOLT_UP" = "1" ] && return 0; _GC_DOLT_UNREACHABLE_WHY="$DOLT_WHY"; return 1; }
 # mangle_streak <mode> — put the job's skip-streak file into a shape the job never writes (or remove it).
 mangle_streak() {
   local f="$GC_SKIP_STREAK_STATE"
@@ -239,7 +244,7 @@ reset_main() {
   GC_TRIGGER_ENABLED=1; GC_RELEASE_STAGING_ENABLED=1; GC_RELEASE_MIN_STREAK=6; GC_RELEASE_SLACK_MB=2048; GC_RELEASE_COOLDOWN_H=168
   GC_MIN_FREE_PCT=""; PRUNE_ENABLED=0; GC_MIN_FREE_ABS_MB=3072; THRESHOLD_G=1
   GC_TRIGGER_BACKOFF_BASE_S=300; GC_TRIGGER_BACKOFF_MAX_S=7200
-  KICKS=0; KICK_ENV=""; KICK_MODE="fail"; KICK_RC=0; KICK_KIND=""; KICK_TOKEN=""; KICK_OUTCOME=""; AVAIL=10000; SIZE_MB=8247; STAGING_MB=9601; BUSY=""; GC_NOW_EPOCH=$NOW
+  KICKS=0; KICK_ENV=""; KICK_MODE="fail"; KICK_RC=0; KICK_KIND=""; KICK_TOKEN=""; KICK_OUTCOME=""; AVAIL=10000; SIZE_MB=8247; STAGING_MB=9601; BUSY=""; DOLT_UP=1; GC_NOW_EPOCH=$NOW
   GC_MAINT_LOCK_STUCK_H=3; GC_MAINT_LOCK_RE="dolt-gc-maintenance"; GC_TRIGGER_LOCK_RE="dolt-gc-release-trigger"
 }
 # The notification is a stub that counts INTO A FILE (the stuck check runs in the parent shell here, but the
@@ -1067,6 +1072,106 @@ _lvw "$((NOW-10))" "WAIT x"; [ "$(_trg_liveness "$GC_TRIGGER_STATE" "$GC_TRIGGER
 unset -f _lv _lvw; unset _L
 reset_main
 
+# ═══ ga-y5ezoz: a Dolt that is not answering is not a chance to run — and not an attempt ═════════════
+# Measured 2026-09-29, .gc/logs/dolt-gc-maintenance.log: a boot at 06:58:38; RunAtLoad fired a poll at 06:59:10 —
+# the day's peak of free disk (25.7 GB), a 28-cycle skip streak — and the job it started met `USE hq: dial tcp
+# 127.0.0.1:52756: connect: connection refused`. It had already cleared the streak ("dolt_gc attempted"), so the
+# next poll read streak 0 → "streak-too-short", and the window was gone. Two guards: the trigger asks whether
+# Dolt answers BEFORE it records an attempt (this section, DOLT_UP), and the job asks before it clears the streak
+# (dolt-gc-maintenance.selftest.sh). What the job says back when ITS probe fails is the outcome 'dolt-unreachable'.
+_ur_ok=1
+for _case in "direct 20000" "release 12486"; do
+  set -- $_case; _k="$1"; _av="$2"
+  reset_main; AVAIL="$_av"; DOLT_UP=0
+  poll
+  if [ "$KICKS" -ne 0 ] || [ "$(sdec)" != "WAIT dolt-unreachable" ] \
+     || [ "$(sget attempts)" != "0" ] || [ "$(sget next_allowed)" != "0" ] || [ "$(sget direct_attempts)" != "0" ] || [ "$(sget direct_next_allowed)" != "0" ] \
+     || [ "$(cat "$GC_SKIP_STREAK_STATE")" != "53 1" ] || [ "$(nreads dolt)" -ne 1 ] \
+     || ! grep -q 'connection refused' "$DOLT_GC_MAINT_LOG" || ! grep -q 'not counted as an attempt' "$DOLT_GC_MAINT_LOG"; then
+    _ur_ok=0; echo "    ($_k chance, Dolt down: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' streak='$(cat "$GC_SKIP_STREAK_STATE")' probes=$(nreads dolt) log='$(tail -2 "$DOLT_GC_MAINT_LOG" 2>/dev/null)')"
+  fi
+  # the boot, replayed: 5 min later Dolt is up, the chance is still there → the run starts at once, no backoff carried over
+  DOLT_UP=1; GC_NOW_EPOCH=$((NOW+300)); poll
+  { [ "$KICKS" -eq 1 ] && [ "$KICK_KIND" = "$_k" ]; } || { _ur_ok=0; echo "    ($_k chance, Dolt back: kicks=$KICKS kind='$KICK_KIND' state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)')"; }
+done
+[ "$_ur_ok" = "1" ] && ok "unreachable: a KICK (direct and release alike) while Dolt refuses the connection → no run, decision 'WAIT dolt-unreachable', NO attempt, NO backoff (both kinds still 0/0), the streak file untouched — and the next poll, Dolt up, starts the run" || bad "unreachable: see lines above"
+unset _ur_ok _case _k _av
+# it is not an attempt even with history: an existing backoff record is left exactly as it was
+reset_main; AVAIL=12486; DOLT_UP=0
+_trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "WAIT backoff" 2 "$((NOW-10))" 3 "$((NOW-5))"
+poll
+if [ "$KICKS" -eq 0 ] && [ "$(sdec)" = "WAIT dolt-unreachable" ] && [ "$(sget attempts)" = "2" ] && [ "$(sget next_allowed)" = "$((NOW-10))" ] && [ "$(sget direct_attempts)" = "3" ] && [ "$(sget direct_next_allowed)" = "$((NOW-5))" ]; then
+  ok "unreachable: prior backoff history (release 2, direct 3) is left exactly as recorded — an unanswered poll neither counts nor erases"
+else bad "unreachable with history: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE")'"; fi
+# the decision is logged when it CHANGES, not every poll (288/day while Dolt is down would bury the log)
+reset_main; AVAIL=20000; DOLT_UP=0
+poll; GC_NOW_EPOCH=$((NOW+300)); poll; GC_NOW_EPOCH=$((NOW+600)); poll
+[ "$(grep -c 'WAIT dolt-unreachable' "$DOLT_GC_MAINT_LOG")" = "1" ] && [ "$(nreads dolt)" -eq 3 ] && ok "unreachable: three polls in a row with Dolt down → three probes, ONE log line (change-only), state still says WAIT dolt-unreachable" || bad "unreachable repeat: log lines=$(grep -c 'WAIT dolt-unreachable' "$DOLT_GC_MAINT_LOG") probes=$(nreads dolt)"
+# cheapest first: the probe forks a dolt client, so it is asked only by a poll that would otherwise START a run
+_pc_ok=1
+reset_main; AVAIL=20000; poll
+[ "$(nreads dolt)" -eq 1 ] && [ "$KICKS" -eq 1 ] || { _pc_ok=0; echo "    (control: an eligible poll must ask exactly once: probes=$(nreads dolt) kicks=$KICKS)"; }
+reset_main; printf '2 0\n' > "$GC_SKIP_STREAK_STATE"; AVAIL=20000; DOLT_UP=0; poll
+[ "$(nreads dolt)" -eq 0 ] && [ "$(sdec)" = "WAIT streak-too-short" ] || { _pc_ok=0; echo "    (healthy streak probed: probes=$(nreads dolt) dec='$(sdec)')"; }
+reset_main; AVAIL=7263; DOLT_UP=0; poll
+[ "$(nreads dolt)" -eq 0 ] && [ "$(sdec)" = "WAIT would-not-unblock-gc" ] || { _pc_ok=0; echo "    (ineligible sample probed: probes=$(nreads dolt) dec='$(sdec)')"; }
+reset_main; AVAIL=12486; DOLT_UP=0; _trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "KICK release" 1 "$((NOW+200))" 0 0; poll
+[ "$(nreads dolt)" -eq 0 ] && [ "$(sdec)" = "WAIT backoff" ] || { _pc_ok=0; echo "    (poll inside its backoff probed: probes=$(nreads dolt) dec='$(sdec)')"; }
+reset_main; AVAIL=12000; BUSY="backup-writer-running"; DOLT_UP=0; poll
+[ "$(nreads dolt)" -eq 0 ] && [[ "$(sdec)" == "WAIT staging-busy"* ]] || { _pc_ok=0; echo "    (busy staging probed: probes=$(nreads dolt) dec='$(sdec)')"; }
+reset_main; AVAIL=20000; DOLT_UP=0; GC_TRIGGER_ENABLED=0; poll
+[ "$(nreads dolt)" -eq 0 ] && [ "$(sdec)" = "DISABLED" ] || { _pc_ok=0; echo "    (paused trigger probed: probes=$(nreads dolt) dec='$(sdec)')"; }
+[ "$_pc_ok" = "1" ] && ok "unreachable: the probe is the LAST veto — never asked on a healthy streak, an ineligible sample, a poll inside its backoff, a busy staging or a paused trigger; an eligible poll asks exactly once" || bad "unreachable: probe cost (see lines above)"
+unset _pc_ok
+
+# The job's OWN probe finds Dolt down although this poll's answered (it went away in between): the job says
+# outcome=dolt-unreachable and leaves the streak standing. That run was not an attempt either.
+_ur_ok=1
+for _case in "direct 20000" "release 12486"; do
+  set -- $_case; _k="$1"; _av="$2"
+  reset_main; AVAIL="$_av"; KICK_OUTCOME="dolt-unreachable"
+  poll
+  if [ "$KICKS" -ne 1 ] || [ "$(sdec)" != "WAIT dolt-unreachable" ] \
+     || [ "$(sget attempts)" != "0" ] || [ "$(sget next_allowed)" != "0" ] || [ "$(sget direct_attempts)" != "0" ] || [ "$(sget direct_next_allowed)" != "0" ] \
+     || ! grep -q 'NOT counted as an attempt' "$DOLT_GC_MAINT_LOG"; then
+    _ur_ok=0; echo "    ($_k run, job reports dolt-unreachable: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)' log='$(tail -2 "$DOLT_GC_MAINT_LOG" 2>/dev/null)')"
+  fi
+  GC_NOW_EPOCH=$((NOW+1)); KICK_OUTCOME=""; poll     # no backoff was armed: the very next poll may run again
+  [ "$KICKS" -eq 2 ] || { _ur_ok=0; echo "    ($_k run: the poll right after was held back — kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE" 2>/dev/null)')"; }
+done
+[ "$_ur_ok" = "1" ] && ok "outcome dolt-unreachable (streak standing): the run is NOT an attempt for either kind — no attempt counted, no backoff armed, decision 'WAIT dolt-unreachable', and the next poll is free to run" || bad "outcome dolt-unreachable: see lines above"
+unset _ur_ok _case _k _av
+# ...and it puts the kind's backoff back as it WAS (not zero) and leaves the other kind's memory alone
+reset_main; AVAIL=12486; KICK_OUTCOME="dolt-unreachable"
+_trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "WAIT backoff" 2 "$((NOW-10))" 3 "$((NOW+90))"
+poll
+if [ "$KICKS" -eq 1 ] && [ "$(sget attempts)" = "2" ] && [ "$(sget next_allowed)" = "$((NOW-10))" ] && [ "$(sget direct_attempts)" = "3" ] && [ "$(sget direct_next_allowed)" = "$((NOW+90))" ]; then
+  ok "outcome dolt-unreachable: a release run restores ITS backoff to what it was (2 / NOW-10), and the direct one (3 / NOW+90) is untouched"
+else bad "outcome dolt-unreachable with history: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE")'"; fi
+reset_main; AVAIL=20000; KICK_OUTCOME="dolt-unreachable"
+_trg_state_write "$GC_TRIGGER_STATE" "$((NOW-60))" "WAIT backoff" 4 "$((NOW+90))" 1 "$((NOW-3))"
+poll
+if [ "$KICKS" -eq 1 ] && [ "$(sget direct_attempts)" = "1" ] && [ "$(sget direct_next_allowed)" = "$((NOW-3))" ] && [ "$(sget attempts)" = "4" ] && [ "$(sget next_allowed)" = "$((NOW+90))" ]; then
+  ok "outcome dolt-unreachable: a direct run restores ITS backoff (1 / NOW-3), and the release one (4 / NOW+90) is untouched"
+else bad "outcome dolt-unreachable, direct, with history: kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE")'"; fi
+# fail-closed: the job's word and the streak file must AGREE. 'unreachable' + a cleared or unreadable streak
+# contradicts itself → "cannot confirm" → counted as before.
+_fc_ok=1
+for _mode in ok garble partial twolines; do
+  reset_main; AVAIL=12486; KICK_MODE="$_mode"; KICK_OUTCOME="dolt-unreachable"; poll
+  { [ "$KICKS" -eq 1 ] && [ "$(sget attempts)" = "1" ] && [ "$(sget next_allowed)" = "$((NOW+300))" ] && grep -q 'cannot' "$DOLT_GC_MAINT_LOG"; } || { _fc_ok=0; echo "    (dolt-unreachable + streak '$_mode': kicks=$KICKS state='$(cat "$GC_TRIGGER_STATE")' log='$(tail -1 "$DOLT_GC_MAINT_LOG")')"; }
+done
+[ "$_fc_ok" = "1" ] && ok "outcome dolt-unreachable + a CLEARED or UNREADABLE streak contradicts itself → 'cannot confirm', counted as a failed attempt (fail-closed, as for every other disagreement)" || bad "outcome dolt-unreachable, disagreeing streak: see lines above"
+unset _fc_ok _mode
+# a record for another run's token can never say 'unreachable' about this one
+reset_main; AVAIL=12486; KICK_OUTCOME="stale"; poll
+[ "$(sget attempts)" = "1" ] && ok "outcome: a stale record (another run's token) is still 'cannot tell' → counted (unchanged by the new word)" || bad "stale outcome after the new word: '$(cat "$GC_TRIGGER_STATE")'"
+# static: the probe is asked before the attempt is recorded, in the poll's source order
+_l_probe="$(grep -n 'if ! _gc_dolt_reachable' "$TRIGGER" | head -1 | cut -d: -f1)"
+_l_att="$(grep -n 'att=\$(( att + 1 ))' "$TRIGGER" | head -1 | cut -d: -f1)"
+[ -n "$_l_probe" ] && [ -n "$_l_att" ] && [ "$_l_probe" -lt "$_l_att" ] && ok "static: the reachability probe (line $_l_probe) is asked before the attempt is counted (line $_l_att)" || bad "static: probe line '$_l_probe' vs attempt line '$_l_att' — an attempt could be recorded for a Dolt nobody asked"
+unset _l_probe _l_att
+
 # ── the trigger is NOT a second way to delete, and does not export lib mode to its child ──
 _code="$(grep -v '^[[:space:]]*#' "$TRIGGER")"
 printf '%s\n' "$_code" | grep -Eq '(^|[^A-Za-z_])rm( |$)|rmdir|unlink|_gc_maybe_release_staging|_s3proof_' && bad "static: the trigger references a deletion/release/proof primitive — it must only DECIDE and start the job" || ok "static: no rm/rmdir/unlink, no release or S3-proof call in the trigger — deletion stays in the maintenance job"
@@ -1076,7 +1181,7 @@ printf '%s\n' "$_code" | grep -Eq 'GC_TRIGGERED_KIND="\$kind" GC_RUN_TOKEN="\$to
 /bin/bash -n "$TRIGGER" 2>/dev/null && ok "static: parses under /bin/bash (3.2) — the interpreter launchd runs it with" || bad "static: does not parse under /bin/bash 3.2"
 unset _code
 
-unset -f _avail_mb _trg_dir_mb _gc_release_busy _trg_run_maintenance _stub_run reset_main poll sget sdec dec nreads mangle_streak _dolt_gc_notify nnotify _mtime_set _hold
+unset -f _avail_mb _trg_dir_mb _gc_release_busy _gc_dolt_reachable _trg_run_maintenance _stub_run reset_main poll sget sdec dec nreads mangle_streak _dolt_gc_notify nnotify _mtime_set _hold
 case "$T" in "${TMPDIR:-/tmp}"/dolt-gc-trigger-selftest.*) rm -rf "$T" ;; esac
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

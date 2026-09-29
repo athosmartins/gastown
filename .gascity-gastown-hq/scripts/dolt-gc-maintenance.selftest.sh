@@ -553,13 +553,28 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   FAKE_DU_FAIL=0
   du() { case "${1:-}" in -sm) [ "$FAKE_DU_FAIL" = "1" ] && return 1; printf '%s\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; -sh) printf '%sM\t%s\n' "$FAKE_HQ_MB" "${2:-}" ;; *) command du "$@" ;; esac; }
   _avail_mb() { printf '%s' "$FAKE_AVAIL"; }
-  timeout() { shift; "$@"; }
-  dolt() { DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return "$DOLT_RC"; }
+  # The client, as two kinds of call (ga-y5ezoz): the `CALL dolt_gc()` (DOLT_CALLS, DOLT_RC) and everything else —
+  # the reachability probe (PROBE_RC, PROBE_MSG on stderr). A Dolt that is DOWN refuses both: PROBE_RC=1 makes the
+  # probe fail, and then the CALL must never be reached. The probe runs inside $(...) — a subshell — so what it
+  # and the `timeout` wrapper saw is counted INTO FILES, never into shell variables (the same trap the trigger
+  # selftest documents for its readers): nprobe = how many probes, lastprobe = the last argv, targs = the
+  # `timeout` durations in call order.
+  PROBE_RC=0; PROBE_MSG=""
+  nprobe() { if [ -s "$XT/probe.calls" ]; then wc -l < "$XT/probe.calls" | tr -d '[:space:]'; else echo 0; fi; }
+  lastprobe() { tail -1 "$XT/probe.calls" 2>/dev/null; }
+  targs() { cat "$XT/timeout.args" 2>/dev/null; }
+  timeout() { printf ' %s' "$1" >> "$XT/timeout.args"; shift; "$@"; }
+  dolt() {
+    case "$*" in
+      *dolt_gc*) DOLT_CALLS=$((DOLT_CALLS+1)); FAKE_HQ_MB=4000; return "$DOLT_RC" ;;
+      *)         printf '%s\n' "$*" >> "$XT/probe.calls"; [ -n "$PROBE_MSG" ] && printf '%s\n' "$PROBE_MSG" >&2; return "$PROBE_RC" ;;
+    esac
+  }
   # RELEASE_RC=1: the release was not taken; RELEASE_RC=0: it "released" (and RELEASE_AVAIL is what free space is afterwards)
   _gc_maybe_release_staging() { RELEASE_CALLS=$((RELEASE_CALLS+1)); [ "$RELEASE_RC" -eq 0 ] && FAKE_AVAIL="${RELEASE_AVAIL:-$FAKE_AVAIL}"; return "$RELEASE_RC"; }
   _dolt_gc_notify() { NOTIFY_N=$((NOTIFY_N+1)); }
   _dolt_gc_mail_mayor() { MAIL_N=$((MAIL_N+1)); }
-  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_DU_FAIL=0; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; RELEASE_RC=1; RELEASE_AVAIL=""; DOLT_RC=0; rm -f "$GC_RUN_OUTCOME_STATE"; unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN; }
+  xreset() { : > "$BD_LOG"; : > "$LOG"; printf '62 1\n' > "$GC_SKIP_STREAK_STATE"; FAKE_DU_FAIL=0; FAKE_HQ_MB=8247; FAKE_AVAIL=3000; DOLT_CALLS=0; RELEASE_CALLS=0; NOTIFY_N=0; MAIL_N=0; RELEASE_RC=1; RELEASE_AVAIL=""; DOLT_RC=0; PROBE_RC=0; PROBE_MSG=""; : > "$XT/probe.calls"; : > "$XT/timeout.args"; rm -f "$GC_RUN_OUTCOME_STATE"; unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN GC_DOLT_PROBE_TIMEOUT_S; }
 
   # a NORMAL 2h cycle that skips advances the streak (unchanged behavior) and still tries the release
   xreset; main
@@ -677,7 +692,90 @@ if [ -z "$XT" ] || [ ! -d "$XT" ]; then bad "triggered: mktemp failed — tests 
   GC_RUN_OUTCOME_STATE="$_SAVED_OS"; unset _SAVED_OS; rm -f "$XT/afile"
   # the single write site: exactly one CALL of _gc_record_outcome outside its definition
   [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c '_gc_record_outcome "')" = "1" ] && ok "static: the outcome is recorded from exactly one call site (the wrapper) — no exit path can be forgotten by adding a second writer" || bad "static: _gc_record_outcome is called from $(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c '_gc_record_outcome "') places"
-  unset -f oc
+
+  # ── ga-y5ezoz: a Dolt that REFUSES the connection is not "dolt_gc ran and failed" ─────────────────────
+  # Measured 2026-09-29 06:58-07:04, .gc/logs/dolt-gc-maintenance.log: a boot at 06:58:38; the trigger's
+  # RunAtLoad poll at 06:59:10 met the gate (streak 28, 25.7 GB free); the step then ran
+  #   USE `hq`: dial tcp 127.0.0.1:52756: connect: connection refused
+  # and — having already cleared the streak as "dolt_gc attempted" — recorded gc-failed and pushed
+  # "dolt gc FALHOU". Five minutes later the streak read 0, the trigger said "streak-too-short", and the
+  # post-boot peak of free disk was gone. The stub below IS that client: with PROBE_RC=1 every call is refused.
+  sk() { _read_skip_streak "$GC_SKIP_STREAK_STATE"; }
+  _REFUSED="dial tcp 127.0.0.1:52756: connect: connection refused"
+  _ur_ok=1
+  for _kind in release direct; do
+    xreset; FAKE_AVAIL=20000; PROBE_RC=1; PROBE_MSG="$_REFUSED"
+    GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND="$_kind" main
+    if [ "$(oc)" != "token=100.7 outcome=dolt-unreachable" ] || [ "$(sk)" != "62 1" ] \
+       || [ "$DOLT_CALLS" -ne 0 ] || [ "$NOTIFY_N" -ne 0 ] || [ "$MAIL_N" -ne 0 ] || [ "$RELEASE_CALLS" -ne 0 ] \
+       || ! grep -q 'connection refused' "$LOG" || ! grep -q 'NOT attempting dolt_gc' "$LOG" \
+       || grep -q -e 'dolt_gc FAILED' -e 'skip streak cleared' -e 'running online dolt_gc' "$LOG"; then
+      _ur_ok=0; echo "    (triggered $_kind: outcome='$(oc)' streak='$(sk)' dolt=$DOLT_CALLS notify=$NOTIFY_N mail=$MAIL_N release=$RELEASE_CALLS log='$(tail -3 "$LOG")')"
+    fi
+  done
+  [ "$_ur_ok" = "1" ] && ok "refused: Dolt refusing the connection at a met gate → outcome 'dolt-unreachable' (NOT gc-failed), the streak stays 62 (not cleared), the CALL is never made, no 'FALHOU' push, no mail, and the log carries the client's own words" || bad "refused: see lines above"
+  unset _ur_ok _kind
+  xreset; FAKE_AVAIL=20000; PROBE_RC=1; PROBE_MSG="$_REFUSED"; main
+  if [ "$(sk)" = "62 1" ] && [ "$DOLT_CALLS" -eq 0 ] && [ "$NOTIFY_N" -eq 0 ] && [ ! -e "$GC_RUN_OUTCOME_STATE" ] && grep -q 'NOT attempting dolt_gc' "$LOG"; then
+    ok "refused: the normal 2h cycle has the same conflation and gets the same answer — streak untouched, no CALL, no push, no outcome file (no token)"
+  else bad "refused 2h cycle: streak='$(sk)' dolt=$DOLT_CALLS notify=$NOTIFY_N outcome='$(oc)' log='$(tail -3 "$LOG")'"; fi
+  # "could not ask" is the same third state as "asked and refused": a timeout (124), a missing client (127), a
+  # database that is not loaded yet — none of them is an attempt at the GC.
+  _ur_ok=1
+  for _rc in 124 127 1 2 255; do
+    xreset; FAKE_AVAIL=20000; PROBE_RC="$_rc"; PROBE_MSG=""
+    GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+    if [ "$(oc)" != "token=100.7 outcome=dolt-unreachable" ] || [ "$(sk)" != "62 1" ] || [ "$DOLT_CALLS" -ne 0 ] || [ "$NOTIFY_N" -ne 0 ] || ! grep -q "client rc=${_rc}" "$LOG"; then
+      _ur_ok=0; echo "    (probe rc=$_rc: outcome='$(oc)' streak='$(sk)' dolt=$DOLT_CALLS notify=$NOTIFY_N log='$(tail -2 "$LOG")')"
+    fi
+  done
+  [ "$_ur_ok" = "1" ] && ok "refused: a probe that times out (124), cannot start (127) or fails with any other rc → the same inert 'dolt-unreachable', and the log says which rc" || bad "refused: probe rc variants (see lines above)"
+  unset _ur_ok _rc
+  xreset; FAKE_AVAIL=20000; PROBE_RC=1; PROBE_MSG="$(printf 'first line\nsecond line that must not be logged')"; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  grep -q 'first line' "$LOG" && ! grep -q 'second line' "$LOG" && ok "refused: only the client's first line goes in the log (one line per event)" || bad "refused: log='$(tail -3 "$LOG")'"
+  # the control: a REACHABLE Dolt whose dolt_gc then fails is still a failure — alerted, streak cleared (that IS an attempt)
+  xreset; FAKE_AVAIL=20000; DOLT_RC=1; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  if [ "$(oc)" = "token=100.7 outcome=gc-failed" ] && [ "$(sk)" = "0 0" ] && [ "$DOLT_CALLS" -eq 1 ] && [ "$(nprobe)" -eq 1 ] && [ "$NOTIFY_N" -eq 1 ]; then
+    ok "control: Dolt reachable but dolt_gc fails → still gc-failed, streak cleared, and the FALHOU push is still sent (once) — the probe only separates 'could not ask' from 'asked and failed'"
+  else bad "control: outcome='$(oc)' streak='$(sk)' dolt=$DOLT_CALLS probe=$(nprobe) notify=$NOTIFY_N"; fi
+  xreset; FAKE_AVAIL=20000; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(oc)" = "token=100.7 outcome=gc-ok" ] && [ "$(sk)" = "0 0" ] && [ "$DOLT_CALLS" -eq 1 ] && [ "$NOTIFY_N" -eq 0 ] && ok "control: Dolt reachable and dolt_gc succeeds → gc-ok, streak cleared, no push (the happy path is unchanged)" || bad "control gc-ok: outcome='$(oc)' streak='$(sk)' dolt=$DOLT_CALLS notify=$NOTIFY_N"
+  # the probe costs a dolt client, so it is asked ONLY when a GC is about to be attempted
+  _pc_ok=1
+  xreset; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main;   [ "$(nprobe)" -eq 0 ] || { _pc_ok=0; echo "    (headroom skip probed: $(nprobe))"; }
+  xreset; GC_TRIGGERED_RUN=0 main;                                                [ "$(nprobe)" -eq 0 ] || { _pc_ok=0; echo "    (2h-cycle headroom skip probed: $(nprobe))"; }
+  xreset; FAKE_HQ_MB=500; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main; [ "$(nprobe)" -eq 0 ] || { _pc_ok=0; echo "    (below-threshold probed: $(nprobe))"; }
+  xreset; FAKE_DU_FAIL=1; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main; [ "$(nprobe)" -eq 0 ] || { _pc_ok=0; echo "    (size-unmeasurable probed: $(nprobe))"; }
+  xreset; RELEASE_RC=0; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main; [ "$(nprobe)" -eq 0 ] || { _pc_ok=0; echo "    (released-still-short probed: $(nprobe))"; }
+  [ "$_pc_ok" = "1" ] && ok "probe cost: never asked on a headroom skip, a below-threshold hq, an hq that cannot be measured, or a release that still falls short — only when the CALL is next" || bad "probe cost: see lines above"
+  unset _pc_ok
+  xreset; RELEASE_RC=0; RELEASE_AVAIL=20000; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(oc)" = "token=100.7 outcome=gc-ok" ] && [ "$(nprobe)" -eq 1 ] && ok "probe: a release run that frees enough room is probed too, right before the CALL (release → gate met → probe → dolt_gc → gc-ok)" || bad "probe after release: outcome='$(oc)' probe=$(nprobe)"
+  xreset; RELEASE_RC=0; RELEASE_AVAIL=20000; PROBE_RC=1; PROBE_MSG="$_REFUSED"; GC_RUN_TOKEN=100.7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=release main
+  [ "$(oc)" = "token=100.7 outcome=dolt-unreachable" ] && [ "$(sk)" = "62 1" ] && [ "$DOLT_CALLS" -eq 0 ] && ok "probe: Dolt lost after the staging release made room → dolt-unreachable, streak untouched (the release itself already happened and is not undone here — it has its own cooldown)" || bad "probe after release, refused: outcome='$(oc)' streak='$(sk)' dolt=$DOLT_CALLS"
+  # the probe asks the SAME endpoint and database the CALL uses — a probe against another port or db proves nothing
+  xreset; FAKE_AVAIL=20000; GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  case "$(lastprobe)" in
+    *"--host 127.0.0.1 --port $PORT --user root --no-tls sql -q "*'USE `hq`'*'SELECT 1'*) ok "probe: same client, host, port and database as the CALL (\`--host 127.0.0.1 --port $PORT ... USE \`hq\`; SELECT 1\`)" ;;
+    *) bad "probe argv: '$(lastprobe)'" ;;
+  esac
+  # ...and the timeout knob: bounded (15 s default), the CALL keeps its own 300, the probe comes first
+  xreset; FAKE_AVAIL=20000; GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(targs)" = " 15 300" ] && ok "probe: bounded by a 15 s timeout, asked before the CALL (whose 300 s cap is unchanged)" || bad "probe timeout order: '$(targs)' (want ' 15 300')"
+  xreset; FAKE_AVAIL=20000; GC_DOLT_PROBE_TIMEOUT_S=7 GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct main
+  [ "$(targs)" = " 7 300" ] && ok "probe: GC_DOLT_PROBE_TIMEOUT_S=7 is honored" || bad "probe timeout knob: '$(targs)'"
+  _tk=""
+  for _v in 30 015 008 "" abc 0 000 1234 -5 " 9" 2.5; do _tk="$_tk [$_v]=$(GC_DOLT_PROBE_TIMEOUT_S="$_v" _gc_dolt_probe_timeout_s)"; done
+  [ "$_tk" = " [30]=30 [015]=15 [008]=8 []=15 [abc]=15 [0]=15 [000]=15 [1234]=15 [-5]=15 [ 9]=15 [2.5]=15" ] && ok "probe knob: 30→30, zero-padded 015→15 and 008→8 (not octal, no abort), and blank / letters / 0 / 4+ digits / sign / space / decimal → the 15 s default" || bad "probe knob: '$_tk'"
+  unset _tk _v
+  # order in the source: the probe is asked BEFORE the streak is cleared as "attempted", and the FALHOU push has one route
+  _l_probe="$(grep -n 'if ! _gc_dolt_reachable' "$SCRIPT" | head -1 | cut -d: -f1)"
+  _l_clear="$(grep -n '_clear_skip_streak "\$GC_SKIP_STREAK_STATE" "dolt_gc attempted"' "$SCRIPT" | head -1 | cut -d: -f1)"
+  [ -n "$_l_probe" ] && [ -n "$_l_clear" ] && [ "$_l_probe" -lt "$_l_clear" ] && ok "static: the reachability probe (line $_l_probe) comes before the streak is cleared as 'dolt_gc attempted' (line $_l_clear)" || bad "static: probe line '$_l_probe' vs clear line '$_l_clear' — the streak may be cleared before Dolt was asked"
+  unset _l_probe _l_clear
+  [ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cF '"$NOTIFY" -t "Dolt gc"')" = "0" ] && ok "static: the 'dolt gc FALHOU' push goes through _dolt_gc_notify, so a selftest run never fires the real one" || bad "static: a direct \$NOTIFY call for the dolt gc failure is back (a selftest run would push it for real)"
+  unset _REFUSED
+  unset -f oc sk nprobe lastprobe targs
 
   unset -f du _avail_mb timeout dolt _gc_maybe_release_staging _dolt_gc_notify _dolt_gc_mail_mayor xreset
   unset GC_TRIGGERED_RUN GC_TRIGGERED_KIND GC_RUN_TOKEN
@@ -926,6 +1024,40 @@ if [ -z "$EP" ] || [ ! -d "$EP" ]; then bad "entry: mktemp failed — real-entry
   entry_reset; run_entry GC_TRIGGERED_RUN=1; rc=$?
   [ "$rc" -eq 0 ] && [ ! -e "$EP/bd.calls" ] && grep -q 'triggered run' "$EP/job.log" && ok "entry: GC_TRIGGERED_RUN=1 reaches the real script's main(): GC-only run, purge/prune/flatten (bd) never called" || bad "entry triggered: rc=$rc bd='$(cat "$EP/bd.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"
   [ ! -e "$EP/run.lock.d" ] && ok "entry: a triggered run releases the lock too" || bad "entry triggered: lock left behind"
+
+  # (f) ga-y5ezoz — the same three answers through the REAL script, the REAL `timeout` binary and a REAL executable
+  #     `dolt` (the function stubs above bypass both): hq measures 8247 MB with 40000 MB free, so the gate is met and
+  #     the run reaches the reachability probe. A Dolt that refuses the connection prints what the real client
+  #     printed on 2026-09-29 and exits 1.
+  printf '#!/bin/sh\ncase "$1" in -sm) printf "8247\\t%%s\\n" "$2" ;; -sh) printf "8.0G\\t%%s\\n" "$2" ;; *) exec /usr/bin/du "$@" ;; esac\n' > "$EP/bin/du"
+  printf '#!/bin/sh\nprintf "Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/x 1 1 40960000 1%%%% /\\n"\n' > "$EP/bin/df"
+  cp "$EP/bin/dolt" "$EP/bin/dolt-up"
+  printf '#!/bin/sh\necho "$@" >> "%s"\necho "failed to initialize commit identity session variables from environment: dial tcp 127.0.0.1:52756: connect: connection refused" >&2\nexit 1\n' "$EP/dolt.calls" > "$EP/bin/dolt-down"
+  chmod +x "$EP/bin/du" "$EP/bin/df" "$EP/bin/dolt-up" "$EP/bin/dolt-down"
+  entry_dolt() { cp "$EP/bin/dolt-$1" "$EP/bin/dolt"; }
+  entry_oc() { head -1 "$EP/outcome.state" 2>/dev/null; }
+  # the TRIGGERED run against a Dolt that refuses
+  entry_reset; rm -f "$EP/outcome.state"; entry_dolt down
+  run_entry GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct GC_RUN_TOKEN=100.7 GC_RUN_OUTCOME_STATE="$EP/outcome.state"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && [ "$(entry_oc)" = "token=100.7 outcome=dolt-unreachable" ] \
+     && [ "$(wc -l < "$EP/dolt.calls" | tr -d '[:space:]')" = "1" ] && ! grep -q 'dolt_gc' "$EP/dolt.calls" && [ ! -e "$EP/notify.calls" ] \
+     && grep -q 'connection refused' "$EP/job.log" && ! grep -q 'dolt_gc FAILED' "$EP/job.log"; then
+    ok "entry: a triggered run at a met gate against a Dolt that refuses (real script, real timeout, real client exec) → streak still 62, outcome dolt-unreachable, ONE client call (the probe — never the CALL), no push, no 'FAILED'"
+  else bad "entry refused: rc=$rc streak='$(cat "$EP/streak.state" 2>/dev/null)' outcome='$(entry_oc)' dolt_calls='$(cat "$EP/dolt.calls" 2>/dev/null)' notify='$(cat "$EP/notify.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"; fi
+  # the normal 2h cycle against the same refusing Dolt: purge still happens (step 1 is unchanged), the streak survives
+  entry_reset; entry_dolt down
+  run_entry; rc=$?
+  if [ "$rc" -eq 0 ] && grep -q purge "$EP/bd.calls" && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "62 1" ] && [ "$(wc -l < "$EP/dolt.calls" | tr -d '[:space:]')" = "1" ] && [ ! -e "$EP/notify.calls" ]; then
+    ok "entry: the 2h cycle against a Dolt that refuses → purge still runs, the streak is not cleared, no CALL, no push"
+  else bad "entry refused 2h: rc=$rc streak='$(cat "$EP/streak.state" 2>/dev/null)' dolt_calls='$(cat "$EP/dolt.calls" 2>/dev/null)' notify='$(cat "$EP/notify.calls" 2>/dev/null)'"; fi
+  # the control: the same run against a Dolt that answers → the probe AND the CALL go through, the streak clears
+  entry_reset; rm -f "$EP/outcome.state"; entry_dolt up
+  run_entry GC_TRIGGERED_RUN=1 GC_TRIGGERED_KIND=direct GC_RUN_TOKEN=100.7 GC_RUN_OUTCOME_STATE="$EP/outcome.state"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(cat "$EP/streak.state" 2>/dev/null)" = "0 0" ] && [ "$(entry_oc)" = "token=100.7 outcome=gc-ok" ] \
+     && [ "$(wc -l < "$EP/dolt.calls" | tr -d '[:space:]')" = "2" ] && sed -n 2p "$EP/dolt.calls" | grep -q 'CALL dolt_gc' && sed -n 1p "$EP/dolt.calls" | grep -q 'SELECT 1'; then
+    ok "entry: (control) a Dolt that answers → probe first, then CALL dolt_gc, outcome gc-ok, streak cleared — through the real timeout and a real client exec"
+  else bad "entry control: rc=$rc streak='$(cat "$EP/streak.state" 2>/dev/null)' outcome='$(entry_oc)' dolt_calls='$(cat "$EP/dolt.calls" 2>/dev/null)' log='$(tail -2 "$EP/job.log" 2>/dev/null)'"; fi
+  unset -f entry_dolt entry_oc
 
   unset -f entry_reset run_entry
   case "$EP" in "${TMPDIR:-/tmp}"/dolt-gc-entry-selftest.*) rm -rf "$EP" ;; esac
