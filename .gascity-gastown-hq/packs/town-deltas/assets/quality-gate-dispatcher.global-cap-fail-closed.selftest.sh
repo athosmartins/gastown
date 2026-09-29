@@ -68,6 +68,10 @@ command -v timeout >/dev/null 2>&1 || { echo "FATAL: no 'timeout' on PATH — th
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/gate-globalcap-selftest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
+# ga-ck3sz7: the cap block runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the fake `gc` in
+# $WORK/bin is the only one it can find, so a vanished $WORK cannot turn into a `gc session list` on the real town.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$WORK" jq timeout || exit 2   # the gate bounds its probe with a real `timeout` and parses with jq
 
 # Fake gc — behaviour steered by files in $SELFTEST_WORK. `exec sleep`: a plain `sleep` child
 # would survive `timeout`'s SIGTERM to this script and hold the pipe open, stalling the caller's
@@ -112,7 +116,7 @@ reached() { [ -f "$WORK/reached" ]; }
 # sentinel. `exit 0` inside the block ends the subshell, like the real script's early exit.
 run_block() {
   (
-    PATH="$WORK/bin:$PATH"
+    PATH="$SANDBOX_PATH"
     SELFTEST_WORK="$WORK"; export SELFTEST_WORK
     GC_CITY="test-city"; COUNT=3; GC_VARIABLE_SESSION_MAX=6
     unset GC_VARIABLE_SESSION_COUNT_OVERRIDE 2>/dev/null || true
@@ -134,7 +138,7 @@ echo "quality-gate-dispatcher.global-cap-fail-closed.selftest — unreadable ses
 # ── Harness sanity: the fake gc is executable and is what the block would call ──
 echo "S0: harness — fake gc is a real executable and serves a session list"
 reset; sessions_json wa-worker:active > "$WORK/sl.json"
-_probe_out="$(PATH="$WORK/bin:$PATH" SELFTEST_WORK="$WORK" gc --city x session list --json 2>&1)"
+_probe_out="$(PATH="$SANDBOX_PATH" SELFTEST_WORK="$WORK" gc --city x session list --json 2>&1)"
 case "$_probe_out" in
   *wa-worker*) ok "S0: fake gc serves the fixture (stub is executable, would be found on PATH)" ;;
   *) bad "S0: fake gc did not serve the fixture (got: $_probe_out) — every scenario below would be measuring the wrong thing" ;;

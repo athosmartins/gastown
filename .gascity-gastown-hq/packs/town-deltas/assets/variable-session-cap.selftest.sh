@@ -109,6 +109,10 @@ fi
 exit 0
 EOF
 chmod +x "$FAKE_BIN_DIR/gc"
+# ga-ck3sz7: the code under test runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh); the fake `gc`
+# above is the only one it can find, so a vanished $TMPDIR_SELFTEST cannot turn into a real `gc session list`.
+. "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
+sandbox_path_init "$TMPDIR_SELFTEST" jq timeout || exit 2   # the count is `timeout 10 gc ... | jq`; gc is the fake above
 
 echo "── gc_variable_session_count: pilot vs gate, byte-identical? ────────────"
 extract_fn() { awk "/^gc_variable_session_count\\(\\) \\{/,/^\\}/" "$1"; }
@@ -137,7 +141,7 @@ if [ -n "$PILOT_FN" ]; then
 
     # shellcheck disable=SC1090
     source "$EXTRACTED"
-    export PATH="$FAKE_BIN_DIR:$PATH"
+    export PATH="$SANDBOX_PATH"
     export GC_CITY="/nonexistent-city"
     unset GC_VARIABLE_SESSION_COUNT_OVERRIDE 2>/dev/null || true
 
@@ -225,7 +229,7 @@ $(date +%s)" > "$TMPDIR_SELFTEST/ram-emergency.level"
   eq "$(_gate_ram_pressure_blocks)" "1" "gate RAM: GATE_RAM_PRESSURE_OVERRIDE=EMERGENCY seam works"
   unset GATE_RAM_PRESSURE_OVERRIDE
 
-  export PATH="$FAKE_BIN_DIR:$PATH"
+  export PATH="$SANDBOX_PATH"
   export GC_CITY="/nonexistent-city"
   unset GC_VARIABLE_SESSION_COUNT_OVERRIDE 2>/dev/null || true
 
