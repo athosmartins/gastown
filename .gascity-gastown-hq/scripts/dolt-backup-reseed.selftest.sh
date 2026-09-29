@@ -579,6 +579,220 @@ rm -rf "$PRIMARY_ROOT/hq.new"
 _run_promote
 grep -qF "nada para promover" "$LOG" && ok "scenario P4 (no .new present): clean no-op logged" || bad "scenario P4: expected a 'nada para promover' no-op log line"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 1e (ga-bo08jp): _should_release_stale_new() + _release_stale_new() —
+# frees a "<db>.new" staging that is OLDER than a valid primary and than a fresh,
+# proven S3 copy. Stubbed aws / ps / df; the rm -rf is REAL, against a scratch
+# fixture. hq.new (8.7 GB, 27/09, restore-verify timed out twice) had no tool
+# that could free it: residue-reclaim globs *.old only, and the manifest-less
+# path refuses a primary that HAS a manifest.
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── _should_release_stale_new() — pure gate (ga-bo08jp) ──"
+
+if type _should_release_stale_new >/dev/null 2>&1 && type _release_stale_new >/dev/null 2>&1; then
+  ok "_should_release_stale_new and _release_stale_new defined by lib-mode source"
+else
+  bad "_should_release_stale_new / _release_stale_new NOT defined — the mode does not exist yet"
+fi
+
+# args: new_mtime primary_mtime run_epoch now fp_max_age primary_ok s3_manifest_ok s3_closure_ok idle
+gate() { _should_release_stale_new "$@" 2>/dev/null; }
+GN=1000; GP=5000; GR=6000; GNOW=7000; GMAX=129600
+gate $GN $GP $GR $GNOW $GMAX 1 1 1 1 && ok "gate: staging older than primary AND fingerprint, fingerprint fresh, all proofs 1, idle → release" || bad "gate: the all-good case must release"
+gate $GP $GP $GR $GNOW $GMAX 1 1 1 1 && bad "gate: staging mtime == primary mtime released (must be STRICTLY older)" || ok "gate: staging as new as the primary → keep"
+gate 5500 $GP $GR $GNOW $GMAX 1 1 1 1 && bad "gate: staging NEWER than the primary released (it may be the freshest copy / a build in progress)" || ok "gate: staging newer than the primary → keep"
+gate $GR $GP $GR $GNOW $GMAX 1 1 1 1 && bad "gate: staging mtime == fingerprint run released (must be STRICTLY older)" || ok "gate: fingerprint not newer than the staging → keep"
+gate $GN $GP 900 $GNOW $GMAX 1 1 1 1 && bad "gate: fingerprint OLDER than the staging released" || ok "gate: fingerprint older than the staging → keep"
+gate $GN $GP $GR $(( GR + GMAX + 1 )) $GMAX 1 1 1 1 && bad "gate: fingerprint older than the max age released" || ok "gate: fingerprint stale (age > max) → keep"
+gate $GN $GP $GR $(( GR + GMAX )) $GMAX 1 1 1 1 && ok "gate: fingerprint exactly at the max age → still fresh" || bad "gate: age == max must still count as fresh"
+gate $GN $GP $GR $(( GR - 1 )) $GMAX 1 1 1 1 && bad "gate: fingerprint from the FUTURE released (clock says now < run_epoch)" || ok "gate: fingerprint newer than 'now' → keep (fail closed on a clock that disagrees)"
+for pos in 6 7 8 9; do
+  for v in 0 "" x 2; do
+    args=($GN $GP $GR $GNOW $GMAX 1 1 1 1); args[$((pos-1))]="$v"
+    gate "${args[@]}" && bad "gate: arg $pos='$v' released (only a literal 1 is proof)" || ok "gate: arg $pos='$v' → keep"
+  done
+done
+for pos in 1 2 3 4 5; do
+  for v in "" abc -5 1.5; do
+    args=($GN $GP $GR $GNOW $GMAX 1 1 1 1); args[$((pos-1))]="$v"
+    gate "${args[@]}" && bad "gate: numeric arg $pos='$v' released" || ok "gate: numeric arg $pos='$v' → keep (fail closed)"
+  done
+done
+gate && bad "gate: no args released" || ok "gate: no args → keep"
+
+echo ""
+echo "── _release_stale_new() — stubbed aws/ps/df, real rm against a scratch fixture (ga-bo08jp) ──"
+
+PRIMARY_ROOT="$LIB_SCRATCH/stale-root"
+STALE_LOCKDIR="$LIB_SCRATCH/no-such-backup.lock.d"
+ago_iso()   { date -u -v-"$1"S +%Y-%m-%dT%H:%M:%SZ; }        # <secs ago> → ISO UTC
+ago_touch() { date -v-"$1"S +%Y%m%d%H%M.%S; }                  # <secs ago> → touch -t
+set_tree_mtime() { local t; t="$(ago_touch "$2")"; find "$1" -exec touch -t "$t" {} +; }   # <dir> <secs ago>
+
+cat > "$LIB_SCRATCH/bin/ps-stub" <<'PSEOF'
+#!/bin/bash
+# `ps -axo pid=,ppid=,command=` stand-in. FAKE_PS_OUT adds lines; FAKE_PS_FAIL=1
+# fails; FAKE_PS_EMPTY=1 prints nothing (a real ps always lists at least launchd).
+[ "${FAKE_PS_FAIL:-0}" = "1" ] && exit 1
+[ "${FAKE_PS_EMPTY:-0}" = "1" ] && exit 0
+[ -n "${FAKE_PS_OUT:-}" ] && printf '%s\n' "$FAKE_PS_OUT"
+printf '%s\n' "    1     0 /sbin/launchd" "  501     1 /usr/bin/some-harmless-daemon --flag"
+exit 0
+PSEOF
+chmod +x "$LIB_SCRATCH/bin/ps-stub"
+
+# A fingerprint whose hq entry is marked FAILED (the daily writer refused) but whose
+# top-level run_utc is fresh — if the code ignored "status" it would pass this.
+STALE_FAILED_META="$LIB_SCRATCH/seed-meta-stale-failed.json"
+cat > "$STALE_FAILED_META" <<JSON
+{"run_utc": "$(ago_iso 3600)", "databases": {"hq": {"status": "failed", "reason": "disco+s3", "last_ok_run_utc": "2026-09-27T07:40:36Z"}}}
+JSON
+
+# mk_stalenew_scenario — primary hq (valid closure, written 3h ago); staging hq.new
+# (written 2 DAYS ago, 4 tables, some bytes); a sibling other.new that must never
+# be touched; S3 holds a closed copy of hq; the fingerprint was published 1h ago.
+mk_stalenew_scenario() {
+  chmod -R u+w "$PRIMARY_ROOT" 2>/dev/null
+  rm -rf "${PRIMARY_ROOT:?}" "$FB" "$STALE_LOCKDIR"
+  mkdir -p "$PRIMARY_ROOT" "$FB"
+  mk_backup_tables "$PRIMARY_ROOT/hq" 6
+  dd if=/dev/zero of="$PRIMARY_ROOT/hq/data.bin" bs=1024 count=900 >/dev/null 2>&1
+  mk_backup_tables "$PRIMARY_ROOT/hq.new" 4
+  dd if=/dev/zero of="$PRIMARY_ROOT/hq.new/data.bin" bs=1024 count=500 >/dev/null 2>&1
+  mk_backup_tables "$PRIMARY_ROOT/other.new" 2
+  mk_backup_tables "$FB/hq" 6
+  set_tree_mtime "$PRIMARY_ROOT/hq" 10800
+  set_tree_mtime "$PRIMARY_ROOT/hq.new" 172800
+  set_tree_mtime "$PRIMARY_ROOT/other.new" 172800
+  : > "$FAKE_AWS_CALLS"
+  unset FAKE_S3_LIST_FAIL FAKE_S3_DRYRUN_FAIL FAKE_S3_UP_FAIL FAKE_S3_UP_NOOP FAKE_AWS_FINGERPRINT_OK \
+        FAKE_AWS_MANIFEST_OK FAKE_FP_SIZE FAKE_S3_META_SEED_FILE FAKE_PS_OUT FAKE_PS_FAIL FAKE_PS_EMPTY TEST_DRY_RUN
+  export FAKE_FP_DB=hq FAKE_FP_RUN_UTC
+  FAKE_FP_RUN_UTC="$(ago_iso 3600)"
+}
+
+_run_stale_new() {   # [db] — rc of _release_stale_new; subshell so a bad implementation cannot kill the harness
+  (cd "$LIB_SCRATCH" && PATH="$LIB_SCRATCH/bin:$PATH" \
+    BACKUP_ROOT="$PRIMARY_ROOT" NOTIFY="$LIB_SCRATCH/bin/notify" \
+    RESEED_PS_BIN="$LIB_SCRATCH/bin/ps-stub" \
+    RESEED_S3_BACKUP_LOCKDIR="$STALE_LOCKDIR" \
+    RESEED_RELEASE_STALE_NEW_DRY_RUN="${TEST_DRY_RUN:-0}" \
+    _release_stale_new "$@") >/dev/null 2>&1
+}
+stale_untouched() {   # primary dir (its payload file — S2 removes its manifest ON PURPOSE), sibling and bucket intact
+  [ -f "$PRIMARY_ROOT/hq/data.bin" ] \
+    && [ -s "$PRIMARY_ROOT/other.new/manifest" ] && [ -s "$FB/hq/manifest" ]
+}
+kept() {   # <label> <log-substring> — hq.new still fully there, everything else intact, and the log says why
+  if [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && [ -f "$PRIMARY_ROOT/hq.new/data.bin" ] && stale_untouched; then
+    ok "$1: hq.new KEPT, primary/sibling/bucket intact"
+  else
+    bad "$1: FAIL-CLOSED VIOLATED — hq.new was (partly) deleted, or something else was touched"
+  fi
+  if grep -qF "SPARED" "$LOG" && grep -qF "$2" "$LOG"; then ok "$1: logged SPARED with '$2'"; else bad "$1: log lacks SPARED / '$2' — $(tr '\n' '|' < "$LOG" | cut -c1-260)"; fi
+}
+
+# S1: every proof holds → the tool deletes hq.new and nothing else.
+mk_stalenew_scenario; : > "$LOG"
+_run_stale_new hq; rc=$?
+[ "$rc" -eq 0 ] && ok "S1 (all proofs hold): rc 0" || bad "S1: rc=$rc"
+[ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "S1: hq.new actually DELETED" || bad "S1: hq.new should have been deleted"
+stale_untouched && ok "S1: primary hq, sibling other.new and the S3 bucket untouched" || bad "S1: something besides hq.new was touched"
+grep -qF "PROVA OK" "$LOG" && ok "S1: logged the proof (PROVA OK)" || bad "S1: missing PROVA OK line"
+grep -qF "LIBERADA" "$LOG" && ok "S1: logged LIBERADA" || bad "S1: missing LIBERADA line"
+grep -qF "du antes=" "$LOG" && grep -qF "df livre antes=" "$LOG" && ok "S1: logged du and df before/after (the bead's required evidence)" || bad "S1: log lacks du/df antes/depois"
+grep -qE 's3 sync|s3 rm|delete-object|--delete' "$FAKE_AWS_CALLS" && bad "S1: the tool MUTATED S3 (sync/rm/delete)" || ok "S1: the tool made only read calls to S3"
+
+# S2/S3: the primary is not a valid backup → hq.new might be the only copy of anything → keep.
+mk_stalenew_scenario; rm -f "$PRIMARY_ROOT/hq/manifest"; : > "$LOG"; _run_stale_new hq
+kept "S2 (primary has NO manifest)" "primary_ok=0"
+mk_stalenew_scenario; rm -f "$PRIMARY_ROOT/hq/$(tid 2).darc"; : > "$LOG"; _run_stale_new hq
+kept "S3 (primary manifest names a table missing locally)" "primary_ok=0"
+
+# S4/S5/S6/S7: S3 not proven → keep.
+mk_stalenew_scenario; s3_drop_table "$FB" hq 3; : > "$LOG"; _run_stale_new hq
+kept "S4 (S3 manifest names a table missing from the bucket)" "s3_closure_ok=0"
+mk_stalenew_scenario; export FAKE_AWS_MANIFEST_OK=0; : > "$LOG"; _run_stale_new hq
+kept "S5 (S3 manifest head-object fails)" "s3_manifest_ok=0"
+mk_stalenew_scenario; export FAKE_AWS_FINGERPRINT_OK=0; : > "$LOG"; _run_stale_new hq
+kept "S6 (fingerprint cannot be fetched — unknown is not fresh)" "SPARED"
+mk_stalenew_scenario; export FAKE_S3_META_SEED_FILE="$STALE_FAILED_META"; : > "$LOG"; _run_stale_new hq
+kept "S7 (fingerprint marks hq FAILED — here, unlike the manifest-less primary, that is NOT proof)" "fingerprint_state=failed"
+
+# S8/S9/S10/S11: the age relations.
+mk_stalenew_scenario; FAKE_FP_RUN_UTC="$(ago_iso 432000)"; : > "$LOG"; _run_stale_new hq
+kept "S8 (fingerprint 5 days old, staging 2 days old: S3 proof predates the staging)" "SPARED"
+mk_stalenew_scenario; set_tree_mtime "$PRIMARY_ROOT/hq" 3600; set_tree_mtime "$PRIMARY_ROOT/hq.new" 18000; FAKE_FP_RUN_UTC="$(ago_iso 36000)"; : > "$LOG"; _run_stale_new hq
+kept "S8b (fingerprint FRESH at 10h but OLDER than the staging's 5h: the S3 proof predates the staging, so it cannot vouch for it)" "SPARED"
+mk_stalenew_scenario; set_tree_mtime "$PRIMARY_ROOT/hq.new" 432000; FAKE_FP_RUN_UTC="$(ago_iso 259200)"; : > "$LOG"; _run_stale_new hq
+kept "S9 (fingerprint newer than the staging but 3 days old > 36h)" "SPARED"
+mk_stalenew_scenario; set_tree_mtime "$PRIMARY_ROOT/hq.new" 3600; FAKE_FP_RUN_UTC="$(ago_iso 1800)"; : > "$LOG"; _run_stale_new hq
+kept "S10 (staging written 1h ago, NEWER than the primary's 3h)" "SPARED"
+mk_stalenew_scenario; touch "$PRIMARY_ROOT/hq.new/$(tid 1)"; : > "$LOG"; _run_stale_new hq
+kept "S11 (dir mtime is old but a file INSIDE hq.new was just written — a build in progress)" "SPARED"
+
+# S12–S17: the backup/restore must not be running (unknown counts as running).
+mk_stalenew_scenario; mkdir -p "$STALE_LOCKDIR"; : > "$LOG"; _run_stale_new hq
+kept "S12 (nightly dolt-s3-backup single-instance lock present)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4242 1 /bin/bash /x/scripts/dolt-s3-backup.sh"; : > "$LOG"; _run_stale_new hq
+kept "S13 (dolt-s3-backup.sh is running)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4243 1 /bin/bash /x/scripts/dolt-backup-reseed.sh hq"; : > "$LOG"; _run_stale_new hq
+kept "S14 (another dolt-backup-reseed.sh is running)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4244 1 /bin/bash /x/scripts/dolt-restore-verify.sh"; : > "$LOG"; _run_stale_new hq
+kept "S15 (dolt-restore-verify.sh is running)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_OUT="4245 4244 timeout 1800 dolt backup restore file://$PRIMARY_ROOT/hq.new hq_verify"; : > "$LOG"; _run_stale_new hq
+kept "S16 (a process has hq.new open — a restore of it)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_FAIL=1; : > "$LOG"; _run_stale_new hq
+kept "S17a (ps fails: whether a backup runs is UNKNOWN)" "idle=0"
+mk_stalenew_scenario; export FAKE_PS_EMPTY=1; : > "$LOG"; _run_stale_new hq
+kept "S17b (ps lists nothing at all — not a believable idle)" "idle=0"
+
+# S18: this very invocation (and the shell that launched it) mention the reseed script; they are NOT "another run".
+mk_stalenew_scenario; : > "$LOG"
+export FAKE_PS_OUT="$(printf '%s\n%s' "$$ $PPID /bin/bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq" "$PPID 1 /bin/zsh -c bash /x/scripts/dolt-backup-reseed.sh --release-stale-new hq")"
+_run_stale_new hq
+[ ! -e "$PRIMARY_ROOT/hq.new" ] && ok "S18 (only this process and its launching shell mention the script): still RELEASED — self is not 'another run'" || bad "S18: the tool refused because of its own command line"
+
+# S19: dry run proves but deletes nothing.
+mk_stalenew_scenario; export TEST_DRY_RUN=1; : > "$LOG"; _run_stale_new hq
+if [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && stale_untouched; then ok "S19 (DRY_RUN=1): nothing deleted"; else bad "S19: DRY_RUN=1 deleted something"; fi
+grep -qF "PROVA OK" "$LOG" && grep -qF "DRY-RUN" "$LOG" && ok "S19: still logs the proof, then DRY-RUN" || bad "S19: expected PROVA OK + DRY-RUN in the log"
+unset TEST_DRY_RUN
+
+# S20: nothing to release is a clean no-op.
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new"; : > "$LOG"; _run_stale_new hq; rc=$?
+[ "$rc" -eq 0 ] && grep -qF "nada a liberar" "$LOG" && ok "S20 (no hq.new): rc 0, 'nada a liberar' logged" || bad "S20: expected rc 0 and 'nada a liberar' (rc=$rc)"
+
+# S21: a symlink named hq.new is never followed or removed by this path.
+mk_stalenew_scenario; rm -rf "$PRIMARY_ROOT/hq.new"; mkdir -p "$LIB_SCRATCH/elsewhere"; echo keep > "$LIB_SCRATCH/elsewhere/precious"
+ln -s "$LIB_SCRATCH/elsewhere" "$PRIMARY_ROOT/hq.new"
+touch -h -t "$(ago_touch 172800)" "$PRIMARY_ROOT/hq.new"   # old link mtime: every OTHER gate passes, so only the symlink guard stands in the way
+: > "$LOG"; _run_stale_new hq
+if [ -L "$PRIMARY_ROOT/hq.new" ] && [ -f "$LIB_SCRATCH/elsewhere/precious" ]; then ok "S21 (hq.new is a symlink): link and target untouched"; else bad "S21: a symlink hq.new was removed/followed"; fi
+grep -qF "RECUSANDO" "$LOG" && ok "S21: logged RECUSANDO" || bad "S21: missing RECUSANDO"
+rm -rf "$LIB_SCRATCH/elsewhere"
+
+# S22: db names that could steer the rm elsewhere are refused outright.
+for badname in "" "../hq" "hq/x" "a b" "hq.old" ".." "hq;x"; do
+  mk_stalenew_scenario; : > "$LOG"
+  _run_stale_new "$badname"; rc=$?
+  if [ "$rc" -ne 0 ] && [ -s "$PRIMARY_ROOT/hq.new/manifest" ] && stale_untouched; then ok "S22: db name '$badname' → rc=$rc, nothing deleted"; else bad "S22: db name '$badname' was not refused cleanly (rc=$rc)"; fi
+done
+
+# S23: a failing rm is a FAILURE, never reported as freed.
+mk_stalenew_scenario; chmod 555 "$PRIMARY_ROOT"; : > "$LOG"; : > "$NOTIFY_CALLS_FILE_PROMOTE"; _run_stale_new hq; rc=$?
+chmod 755 "$PRIMARY_ROOT"
+if [ "$(id -u)" = "0" ]; then
+  ok "S23 skipped (root ignores directory permissions)"
+else
+  [ "$rc" -ne 0 ] && ok "S23 (rm fails): rc=$rc, nonzero" || bad "S23: a failed rm returned 0"
+  grep -qF "FALHA" "$LOG" && ! grep -qF "LIBERADA" "$LOG" && ok "S23: logged FALHA and did NOT claim LIBERADA" || bad "S23: log claims success or lacks FALHA"
+  [ -s "$NOTIFY_CALLS_FILE_PROMOTE" ] && ok "S23: notify_fail fired (a delete that fails is a real anomaly)" || bad "S23: notify_fail should have fired"
+fi
+unset FAKE_FP_RUN_UTC FAKE_FP_DB FAKE_PS_OUT FAKE_PS_FAIL FAKE_PS_EMPTY FAKE_AWS_MANIFEST_OK FAKE_AWS_FINGERPRINT_OK FAKE_S3_META_SEED_FILE
+rm -f "$STALE_FAILED_META"
+
 rm -rf "$LIB_SCRATCH" 2>/dev/null
 unset FAKE_BUCKET_DIR FAKE_AWS_CALLS
 
@@ -1180,10 +1394,27 @@ HEAD_OBJECT_HITS="$(grep -cF 's3api head-object' "$SCRIPT")"
 # as the deletion proof BY ITSELF (the pre-ga-gsnee8 defect) — so it asserts
 # the exact count AND that the stronger closure proof sits in the same
 # function, not merely "zero head-object calls anywhere in the file".
-if [ "$HEAD_OBJECT_HITS" -eq 1 ]; then
-  ok "exactly one head-object call in reseed (ga-qh8gkw's _release_manifestless_primary; none in the low-disk _s3_current_backup_verified path)"
+#
+# ga-bo08jp: _release_stale_new adds a SECOND one, under the same rule — one of
+# several required checks next to _s3proof_s3_closure_ok and the primary's own
+# local closure, never the proof by itself.
+if [ "$HEAD_OBJECT_HITS" -eq 2 ]; then
+  ok "exactly two head-object calls in reseed (ga-qh8gkw's _release_manifestless_primary + ga-bo08jp's _release_stale_new; none in the low-disk _s3_current_backup_verified path)"
 else
-  bad "expected exactly 1 head-object call (ga-qh8gkw), found $HEAD_OBJECT_HITS — a head-object proof may have crept back into (or vanished from) the low-disk path"
+  bad "expected exactly 2 head-object calls (ga-qh8gkw + ga-bo08jp), found $HEAD_OBJECT_HITS — a head-object proof may have crept back into (or vanished from) the low-disk path"
+fi
+if awk '/^_release_stale_new\(\)/,/^\}/' "$SCRIPT" | grep -qF 's3api head-object' \
+   && awk '/^_release_stale_new\(\)/,/^\}/' "$SCRIPT" | grep -qF '_s3proof_s3_closure_ok "$db"' \
+   && awk '/^_release_stale_new\(\)/,/^\}/' "$SCRIPT" | grep -qF '_s3proof_local_closure_ok "$primary_dir"'; then
+  ok "_release_stale_new pairs its head-object probe with BOTH closure proofs (S3 alone + the primary's local closure)"
+else
+  bad "_release_stale_new lacks the head-object + _s3proof_s3_closure_ok + _s3proof_local_closure_ok trio"
+fi
+N_STALE_RM=$(awk '/^_release_stale_new\(\)/,/^\}/' "$SCRIPT" | grep -c 'rm -rf ')
+if [ "$N_STALE_RM" -eq 1 ] && awk '/^_release_stale_new\(\)/,/^\}/' "$SCRIPT" | grep -qF '"$BACKUP_ROOT"/*.new)'; then
+  ok "_release_stale_new has exactly one rm -rf, behind a \"\$BACKUP_ROOT\"/*.new case guard"
+else
+  bad "_release_stale_new: expected exactly one rm -rf behind a case guard on \"\$BACKUP_ROOT\"/*.new (found $N_STALE_RM rm -rf)"
 fi
 if awk '/^_release_manifestless_primary\(\)/,/^\}/' "$SCRIPT" | grep -qF 's3api head-object' \
    && awk '/^_release_manifestless_primary\(\)/,/^\}/' "$SCRIPT" | grep -qF '_s3proof_s3_closure_ok "$db"'; then

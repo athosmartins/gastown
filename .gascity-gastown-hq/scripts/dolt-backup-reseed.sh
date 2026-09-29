@@ -677,6 +677,247 @@ _maybe_promote_new_after_primary_release() {
   fi
 }
 
+# ═══ ga-bo08jp: LIBERAR UM <db>.new VELHO, ÓRFÃO DE UMA PRIMÁRIA VÁLIDA ═══
+#
+# Caso medido 29/09: .dolt-backup/hq.new (8,7 GB, de 27/09) — um reseed que nunca
+# terminou, cuja verificação de restauração estourou 30 min DUAS vezes (nunca
+# provada) — sobrevivia ao lado de uma primária .dolt-backup/hq JÁ boa (manifest,
+# 9,4 GB, sincronizada às 05:58) e de um S3 em dia. Nenhuma ferramenta o
+# liberava: dolt-backup-residue-reclaim.sh só varre *.old; _release_manifestless_
+# primary só age sobre uma primária SEM manifest (e recusa a que TEM); e o Preflight 3
+# de _run_reseed morre com "$db.new já existe" — ou seja, o resíduo também
+# TRAVA todo reseed futuro do banco, e o disco que ele ocupa (~2x o banco é o que
+# o dolt_gc do hq precisa) é justamente o que falta.
+#
+# Um .new só vale algo enquanto é a única cópia mais nova que existe. Aqui ele
+# está provadamente superado: é mais velho que a primária e que a prova do S3, e
+# os DOIS (primária + S3) fecham sozinhos. Apagá-lo nunca deixa nada menos
+# recuperável do que já estava.
+#
+# Só apaga com TODAS as provas abaixo; qualquer uma ausente, ilegível ou
+# indeterminada → NADA é apagado (três estados: provado / refutado / não sei —
+# só o primeiro autoriza; ga-p5q3). Standalone e ad hoc, como o irmão acima:
+#   dolt-backup-reseed.sh --release-stale-new <db>
+#   1. primária: existe, não é symlink, TEM manifest e fecha localmente
+#      (_s3proof_local_closure_ok — toda tabela que o manifest nomeia existe);
+#   2. S3: head-object do manifest E fecho do S3 sozinho (_s3proof_s3_closure_ok);
+#   3. frescor: o fingerprint do db é status ok, mais novo que o .new e com no
+#      máximo RESEED_RELEASE_STALE_NEW_FP_MAX_AGE_SECS (36h) — "failed" NÃO vale
+#      aqui (diferente da primária sem manifest: lá a primária já não valia nada);
+#   4. idade: o item mais novo DENTRO do .new é estritamente mais velho que o
+#      item mais novo da primária (um .new sendo escrito agora, ou mais novo que
+#      a primária, nunca é apagado);
+#   5. nada em curso: sem o lock do backup noturno e sem processo de
+#      backup/restore/reseed (nem nada com o caminho do .new); ps ilegível conta
+#      como "em curso" — o próprio processo e seus ancestrais não contam.
+# Read-only no S3 (nunca sobe, nunca apaga lá). Só remove "$BACKUP_ROOT/<db>.new".
+# Prova de efeito: du antes/depois e df antes/depois na linha de log.
+# RESEED_RELEASE_STALE_NEW_DRY_RUN=1 prova e loga, sem apagar.
+
+# _should_release_stale_new <new_mtime> <primary_mtime> <run_epoch> <now>
+#   <fp_max_age_secs> <primary_ok> <s3_manifest_ok> <s3_closure_ok> <idle> → 0
+# (true) SÓ quando todas as provas acima valem. Pura: toda entrada vem do chamador.
+# Entrada vazia/não numérica, ou flag diferente do literal "1", falha FECHADO.
+_should_release_stale_new() {
+  local new_mtime="${1-}" primary_mtime="${2-}" run_epoch="${3-}" now="${4-}" max_age="${5-}"
+  local primary_ok="${6-}" s3_manifest_ok="${7-}" s3_closure_ok="${8-}" idle="${9-}"
+  local v
+  for v in "$new_mtime" "$primary_mtime" "$run_epoch" "$now" "$max_age"; do
+    case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  done
+  [ "$new_mtime" -lt "$primary_mtime" ] || return 1
+  [ "$new_mtime" -lt "$run_epoch" ] || return 1
+  # Um relógio que discorda (fingerprint "do futuro") não vira frescor.
+  [ "$now" -ge "$run_epoch" ] || return 1
+  [ $(( 10#$now - 10#$run_epoch )) -le "$max_age" ] || return 1
+  [ "$primary_ok" = "1" ] || return 1
+  [ "$s3_manifest_ok" = "1" ] || return 1
+  [ "$s3_closure_ok" = "1" ] || return 1
+  [ "$idle" = "1" ] || return 1
+  return 0
+}
+
+# _newest_mtime <dir> — epoch do item MAIS NOVO dentro de <dir> (o próprio
+# diretório incluído). Imprime nada se não conseguiu medir tudo: ausência de
+# medida nunca vira "0" (= "muito antigo", que autorizaria apagar).
+_newest_mtime() {
+  local raw out
+  raw="$(find "$1" -exec stat -f %m {} + 2>/dev/null)" || return 0
+  out="$(printf '%s\n' "$raw" | sort -n | tail -n 1)"
+  case "$out" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$out"
+}
+
+# _stale_new_idle_state <new_dir> — imprime "idle", "busy<TAB>motivo" ou
+# "unknown<TAB>motivo". Só "idle" autoriza; o lock do backup noturno, um
+# processo de backup/restore/reseed, qualquer processo com o caminho do .new na
+# linha de comando, ou um ps que não respondeu, contam como NÃO idle. Este
+# processo e seus ancestrais (o shell que o lançou cita o script na própria
+# linha de comando) não são "outra execução".
+_stale_new_idle_state() {
+  local new_dir="$1"
+  local lockdir="${RESEED_S3_BACKUP_LOCKDIR:-$CITY/.gc/logs/.dolt-s3-backup.lock.d}"
+  local ps_bin="${RESEED_PS_BIN:-ps}"
+  local busy_re='dolt-s3-backup[.]sh|dolt-backup-reseed[.]sh|dolt-restore-verify|dolt-offline-backup-sync|dolt-backup-swap-repair|dolt .*backup (restore|sync)'
+  if [ -e "$lockdir" ]; then
+    printf 'busy\tlock do backup noturno presente (%s)\n' "$lockdir"
+    return 0
+  fi
+  local snap
+  if ! snap="$("$ps_bin" -ww -axo pid=,ppid=,command= 2>/dev/null)"; then
+    printf 'unknown\tps falhou\n'
+    return 0
+  fi
+  if [ -z "$snap" ]; then
+    printf 'unknown\tps não listou nenhum processo\n'
+    return 0
+  fi
+  local hit
+  hit="$(printf '%s\n' "$snap" | awk -v me="$$" -v me2="${BASHPID:-$$}" -v path="$new_dir" -v re="$busy_re" '
+    { pid = $1; ppid = $2; c = $0
+      sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", c)
+      par[pid] = ppid; cmd[pid] = c; order[++n] = pid }
+    END {
+      p = me;  for (i = 0; i < 64 && p != "" && p != 0; i++) { skip[p] = 1; p = par[p] }
+      p = me2; for (i = 0; i < 64 && p != "" && p != 0; i++) { skip[p] = 1; p = par[p] }
+      for (k = 1; k <= n; k++) {
+        q = order[k]
+        if (q in skip) continue
+        if (index(cmd[q], path) > 0 || cmd[q] ~ re) { print q " " substr(cmd[q], 1, 160); exit }
+      }
+    }')"
+  if [ -n "$hit" ]; then
+    printf 'busy\tprocesso em curso: %s\n' "$hit"
+    return 0
+  fi
+  printf 'idle\t\n'
+}
+
+# _release_stale_new <db> — ver o cabeçalho acima. Toda ramificação RETORNA
+# (nunca die/exit): seguro de chamar de um harness que faz source do script.
+# Retorno: 0 = liberou, poupou (prova não estabelecida), dry-run ou nada a
+# fazer; 1 = uso inválido ou o apagamento falhou.
+_release_stale_new() {
+  local db="${1-}"
+  if [ -z "$db" ]; then
+    log "release-stale-new: uso: $0 --release-stale-new <nome-do-banco>"
+    return 1
+  fi
+  case "$db" in
+    *[!A-Za-z0-9_]*)
+      log "release-stale-new: RECUSANDO nome de banco '$db' — só [A-Za-z0-9_] (o nome vira parte de um caminho que será apagado)"
+      return 1
+      ;;
+  esac
+  case "${BACKUP_ROOT:-}" in
+    ''|/)
+      log "release-stale-new '$db': RECUSANDO — BACKUP_ROOT vazio ou '/'"
+      return 1
+      ;;
+  esac
+  local primary_dir="$BACKUP_ROOT/$db"
+  local new_dir="$BACKUP_ROOT/$db.new"
+
+  if [ -L "$new_dir" ]; then
+    log "release-stale-new '$db': RECUSANDO — $new_dir é um symlink; este caminho nunca segue nem remove link"
+    return 0
+  fi
+  if [ ! -e "$new_dir" ]; then
+    log "release-stale-new '$db': nada a liberar — não existe $new_dir"
+    return 0
+  fi
+  if [ ! -d "$new_dir" ]; then
+    log "release-stale-new '$db': RECUSANDO — $new_dir não é um diretório"
+    return 0
+  fi
+
+  # 4. idade (medida antes das provas caras, mas decidida só no gate abaixo)
+  local new_mtime primary_mtime=""
+  new_mtime="$(_newest_mtime "$new_dir")"
+  [ -d "$primary_dir" ] && primary_mtime="$(_newest_mtime "$primary_dir")"
+
+  # 1. primária: TEM manifest e fecha localmente
+  local primary_ok=0
+  if [ -d "$primary_dir" ] && [ ! -L "$primary_dir" ] && _s3proof_local_closure_ok "$primary_dir"; then
+    primary_ok=1
+  fi
+
+  # 3. frescor do S3 (fingerprint)
+  local fp_file parsed_file
+  fp_file="$(mktemp "${TMPDIR:-/tmp}/dolt-stale-new-fp.XXXXXX" 2>/dev/null)" || { log "release-stale-new '$db': SPARED — não consegui criar arquivo temporário para o fingerprint; nada foi apagado"; return 0; }
+  parsed_file="$(mktemp "${TMPDIR:-/tmp}/dolt-stale-new-parsed.XXXXXX" 2>/dev/null)" || { rm -f "$fp_file"; log "release-stale-new '$db': SPARED — não consegui criar arquivo temporário para o parse; nada foi apagado"; return 0; }
+  local fp_state; fp_state="$(printf 'unfetched\t')"
+  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3 cp "s3://$BUCKET/_meta/latest.json" "$fp_file" >/dev/null 2>&1; then
+    _parse_fingerprint_to_file "$fp_file" "$db" "$parsed_file"
+    fp_state="$(_fingerprint_db_state "$fp_file" "$db")"
+  fi
+  local run_epoch=""
+  if [ -s "$parsed_file" ]; then
+    IFS="$(printf '\t')" read -r run_epoch _ _ < "$parsed_file"   # só o run_epoch decide aqui (tamanho/head não)
+  fi
+  rm -f "$fp_file" "$parsed_file" 2>/dev/null
+  local fp_kind="" fp_detail=""
+  IFS="$(printf '\t')" read -r fp_kind fp_detail <<< "$fp_state"
+
+  # 2. S3: manifest presente E fecha sozinho
+  local manifest_ok=0
+  if timeout "$AWS_TIMEOUT_SECS" "$AWS" s3api head-object --bucket "$BUCKET" --key "$db/manifest" >/dev/null 2>&1; then
+    manifest_ok=1
+  fi
+  local closure_ok=0
+  if _s3proof_s3_closure_ok "$db"; then
+    closure_ok=1
+  fi
+
+  # 5. nada em curso
+  local idle_state idle_kind idle_detail idle=0
+  idle_state="$(_stale_new_idle_state "$new_dir")"
+  IFS="$(printf '\t')" read -r idle_kind idle_detail <<< "$idle_state"
+  [ "$idle_kind" = "idle" ] && idle=1
+
+  local now max_age
+  now=$(date +%s)
+  max_age="${RESEED_RELEASE_STALE_NEW_FP_MAX_AGE_SECS:-129600}"
+
+  if _should_release_stale_new "${new_mtime:-}" "${primary_mtime:-}" "${run_epoch:-}" "$now" "$max_age" \
+       "$primary_ok" "$manifest_ok" "$closure_ok" "$idle"; then
+    local before_kb df_before after_kb df_after freed_mb=""
+    before_kb="$(du -sk "$new_dir" 2>/dev/null | awk '{print $1}')"
+    df_before="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"
+    case "$before_kb" in ''|*[!0-9]*) : ;; *) freed_mb=$(( before_kb / 1024 )) ;; esac
+    log "release-stale-new '$db': PROVA OK — primária $primary_dir TEM manifest e fecha localmente (item mais novo=${primary_mtime}); S3 fecha sozinho (_s3proof_s3_closure_ok) e o manifest existe (head-object OK para ${db}/manifest); fingerprint status ok, run_epoch=${run_epoch} (idade $(( 10#$now - 10#$run_epoch ))s <= ${max_age}s) mais novo que $new_dir (item mais novo=${new_mtime}); $new_dir é mais velho que a primária; nenhum backup/restore/reseed em curso — ${db}.new (~${freed_mb:-?}MB) está superado"
+    if [ "${RESEED_RELEASE_STALE_NEW_DRY_RUN:-0}" = "1" ]; then
+      log "release-stale-new '$db': DRY-RUN — nada apagado (RESEED_RELEASE_STALE_NEW_DRY_RUN=1); liberaria ~${freed_mb:-?}MB"
+      return 0
+    fi
+    case "$new_dir" in
+      "$BACKUP_ROOT"/*.new)
+        if [ "$(basename "$new_dir")" != "$db.new" ]; then
+          log "release-stale-new '$db': RECUSANDO — '$new_dir' não tem a forma <db>.new esperada (guarda de segurança)"
+          return 0
+        fi
+        # Verifica o EFEITO (o diretório sumiu), não só o retorno do rm.
+        if rm -rf "$new_dir" 2>>"$LOG" && [ ! -e "$new_dir" ]; then
+          after_kb=0
+          df_after="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"
+          log "release-stale-new '$db': LIBERADA — $new_dir removida: du antes=${before_kb:-?}KB depois=${after_kb}KB (liberou ~${freed_mb:-?}MB); df livre antes=${df_before:-?}KB depois=${df_after:-?}KB (prova: ver a linha PROVA OK acima)"
+        else
+          log "release-stale-new '$db': FALHA ao remover $new_dir (pode estar parcialmente removido; a primária e o S3 não foram tocados) — investigue"
+          notify_fail "release-stale-new: falha ao remover ${new_dir} — ver $LOG"
+          return 1
+        fi
+        ;;
+      *)
+        log "release-stale-new '$db': RECUSANDO — '$new_dir' fora de \$BACKUP_ROOT/*.new (guarda de segurança)"
+        return 0
+        ;;
+    esac
+  else
+    log "release-stale-new '$db': SPARED — prova não estabelecida, nada foi apagado (primary_ok=${primary_ok} s3_manifest_ok=${manifest_ok} s3_closure_ok=${closure_ok} idle=${idle} [${idle_kind:-?}${idle_detail:+: $idle_detail}] new_mtime=${new_mtime:-none} primary_mtime=${primary_mtime:-none} run_epoch=${run_epoch:-none} now=${now} max_age=${max_age}s fingerprint_state=${fp_kind:-unknown}${fp_detail:+ ($fp_detail)})"
+  fi
+  return 0
+}
+
 # _run_reseed <db> — todo o mecanismo (preflights, construção, verificação,
 # troca), extraído para função só para caber num LIB mode testável
 # (DOLT_BACKUP_RESEED_LIB=1) sem mudar nenhum comportamento do fluxo normal.
@@ -949,6 +1190,14 @@ fi
 # explicitly.
 if [ "$DB" = "--release-manifestless-primary" ]; then
   _release_manifestless_primary "${2:-}"
+  exit $?
+fi
+
+# ga-bo08jp: standalone mode — free a stale "<db>.new" left beside a valid
+# primary and a fresh, proven S3 copy (see _release_stale_new's own header).
+# Like the mode above, never part of the normal invocation; must be asked for.
+if [ "$DB" = "--release-stale-new" ]; then
+  _release_stale_new "${2:-}"
   exit $?
 fi
 
