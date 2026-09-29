@@ -215,6 +215,11 @@ check(m.repair_audit_verdict(T, [(T - 5, "x")])[0] == "keep:no-verdict", "pure: 
 check(m.repair_audit_verdict(T, None)[0] == "keep:unreadable", "pure: None (unreadable) → keep:unreadable", "pure unreadable wrong")
 check(m.repair_audit_verdict(None, v)[0] == "keep:unknown-age", "pure: no created_at → keep:unknown-age", "pure unknown-age wrong")
 check(m.repair_audit_verdict(T, [(T, "same-second")])[0] == "keep:no-verdict", "pure: a verdict in the SAME second is not 'after' (strict)", "pure strictness wrong")
+# the decision function's own doc must not promise what "keep:no-verdict" cannot know (same class as the card body, ga-lor9cy #2)
+_rav_doc = m.repair_audit_verdict.__doc__ or ""
+check("gate not recovered" not in _rav_doc and "no evidence of recovery" in _rav_doc,
+      "repair_audit_verdict doc says keep:no-verdict = 'no evidence of recovery', not the absolute 'gate not recovered'",
+      "repair_audit_verdict doc still claims the gate has not recovered: %r" % (_rav_doc[:300],))
 
 # ── 16. THE Pilot-origin PASS (gate-run ga-lor9cy, blocking issue 1): 18% of production PASS lines ──
 # A recovered gate whose latest verdict is a Pilot merge kept its alarm open until the next PLAIN pass

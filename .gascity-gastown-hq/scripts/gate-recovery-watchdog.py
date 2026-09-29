@@ -4778,7 +4778,8 @@ def repair_audit_verdict(created_epoch, verdicts):
     """PURE decision for one REPAIR audit bead → (action, evidence).
       ("close", (epoch, line))  a real verdict landed strictly AFTER the bead's creation;
                                 evidence is the EARLIEST such verdict in the window
-      ("keep:no-verdict", None) log read fine, nothing after created_at — gate not recovered
+      ("keep:no-verdict", None) log read fine, nothing after created_at — no evidence of recovery
+                                (NOT proof the gate is still down: it may simply not have produced one yet)
       ("keep:unreadable", None) verdicts is None — the log could not be read
       ("keep:unknown-age", None) created_epoch is None — cannot order verdicts against it"""
     if created_epoch is None:
