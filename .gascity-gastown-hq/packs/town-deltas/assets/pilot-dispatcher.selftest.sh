@@ -6567,7 +6567,7 @@ fi
 # A recording bd wrapper (argv → $STATE/bd-calls.log) is layered over the stateful shim so we can
 # assert on WRITES (label add story:in-flight / pilot:dispatched, dispatch comment, claim stamps),
 # which the base shim otherwise swallows. A `timeout` shim is REQUIRED here: the harness PATH has no
-# `timeout`, so the real spawn call (`timeout 60 gc session new …`) would 127 → be misread as a spawn
+# `timeout`, so the real spawn call (`timeout <budget> gc session new …`) would 127 → be misread as a spawn
 # failure and the below-cap control could never reach the in-flight marking it must prove.
 CAPQ_WA_RIG_DIR="$WORK/capq-fake-wa-rig"
 CAPQ_PS_RIG_DIR="$WORK/capq-fake-ps-rig"
@@ -6582,7 +6582,7 @@ case "\$*" in
   *"rig list"*)      printf '{"rigs":[{"name":"whatsapp_automation","path":"$CAPQ_WA_RIG_DIR","hq":false},{"name":"property_scrapers","path":"$CAPQ_PS_RIG_DIR","hq":false}]}' ;;
   *sling*)           printf '{"bead_id":"tt-capq-sling-1"}' ;;
   *"session list"*)  echo x >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_list.calls"; if [ -n "\${CAPQ_SESSION_LIST_OUT:-}" ]; then printf '%s' "\$CAPQ_SESSION_LIST_OUT"; else printf '{"sessions":[]}'; fi ;;
-  *"session new"*)   if [ -n "\${CAPQ_FAIL_SPAWN_FOR:-}" ] && printf '%s' "\$*" | grep -qF -- "\$CAPQ_FAIL_SPAWN_FOR"; then exit 1; fi; echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_new.log" ;;
+  *"session new"*)   if [ -n "\${CAPQ_FAIL_SPAWN_FOR:-}" ] && printf '%s' "\$*" | grep -qF -- "\$CAPQ_FAIL_SPAWN_FOR"; then exit 1; fi; if [ -n "\${CAPQ_SPAWN_SLEEP:-}" ]; then sleep "\$CAPQ_SPAWN_SLEEP"; fi; echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/session_new.log" ;;
   *"session nudge"*) : ;;
   *) : ;;
 esac
@@ -6590,8 +6590,16 @@ exit 0
 CAPQ_GC_EOF
 chmod +x "$CAPQ_SHIMBIN/gc"
 
+# ga-6hr8p7: for a `gc session new` this shim also (a) RECORDS the budget it was handed — one line per spawn attempt
+# in $STATE/spawn_timeout_secs.log, so a scenario can count attempts and read the budget — and (b) with
+# CAPQ_TIMEOUT_KILL_SPAWN=1 plays the kill: exit 124 without running the spawn (what a real `timeout` reports).
 cat > "$CAPQ_SHIMBIN/timeout" <<'CAPQ_TO_EOF'
 #!/usr/bin/env bash
+case "$*" in
+  *"session new"*)
+    echo "$1" >> "${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/spawn_timeout_secs.log"
+    [ -z "${CAPQ_TIMEOUT_KILL_SPAWN:-}" ] || exit 124 ;;
+esac
 shift            # drop the duration; run the wrapped command directly
 exec "$@"
 CAPQ_TO_EOF
@@ -6626,6 +6634,9 @@ run_capq_dispatch() {
     PILOT_DOLT_CPU_OVERRIDE="$([ "${5:-0}" = "1" ] && echo 250 || echo 10)" \
     CAPQ_SESSION_LIST_OUT="${4:-}" \
     CAPQ_FAIL_SPAWN_FOR="${CAPQ_FAIL_SPAWN_FOR:-}" \
+    CAPQ_SPAWN_SLEEP="${CAPQ_SPAWN_SLEEP:-}" \
+    CAPQ_TIMEOUT_KILL_SPAWN="${CAPQ_TIMEOUT_KILL_SPAWN:-}" \
+    PILOT_SLOW_SPAWN_SECS="${PILOT_SLOW_SPAWN_SECS:-}" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     DISPATCH_TO_CAPACITY=1 \
@@ -7119,6 +7130,119 @@ LOG_SWF="$(run_dispatch "")"
 sweep_expect '.dry_run' '"1"'           "SWEEP-F: dry_run is the string '1' (same encoding as pilot_dispatch.dry_run)"
 sweep_expect '(.dispatched >= 1)' 'true' "SWEEP-F: the simulated dispatch is counted in dispatched"
 sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-F: the buckets add up to candidates"
+
+# ── Scenario SPAWN (ga-6hr8p7): the spawn budget — 150 s by default, ONE slow spawn per sweep ─────────────
+# Incident (30/09): `gc session new` took 38 s by hand at load ~40 and 60+ s at load 50-80, and every spawn was
+# bounded by `timeout 60` — under load the kill landed before the CLI finished on EVERY attempt: 134 "Could not
+# spawn wa-worker" in 12 h, the pool stuck at 1 of 2 while 6 approved beads starved. Two halves: a budget that
+# covers the measured worst case, and a cap of ONE slow spawn per sweep so a longer budget cannot stack N x 150 s.
+# The `timeout` shim above records every spawn attempt + the budget it got and can play the kill (exit 124), so
+# "how many spawns did the sweep START" is counted, not inferred. A slow-but-successful spawn is a real 3 s stub
+# against a 2 s threshold — not 1/2: $SECONDS ticks on wall-clock boundaries, so an instant spawn can read 1 s.
+SPAWN_ROUTED2="[$(capq_bead wa-sp1 10 wa-worker whatsapp_automation),$(capq_bead wa-sp2 11 wa-worker whatsapp_automation)]"
+SPAWN_FIRST2="[$(capq_bead wa-sq1 10 '' whatsapp_automation),$(capq_bead wa-sq2 11 '' whatsapp_automation)]"
+spawn_attempts() { if [ -f "$STATE/spawn_timeout_secs.log" ]; then wc -l < "$STATE/spawn_timeout_secs.log" | tr -d ' '; else echo 0; fi; }
+spawn_min_budget() { sort -n "$STATE/spawn_timeout_secs.log" 2>/dev/null | head -1; }
+
+echo "Scenario SPAWN-A (ga-6hr8p7): the DEFAULT spawn budget covers the measured worst case — at BOTH dispatch_one arms"
+LOG_SPA="$(run_capq_dispatch "$CAPQ_WA_FX" 0 0)"
+_spa_wa=$(spawn_min_budget)
+grep -q "wa-worker session spawned for wa-capq1" <<< "$LOG_SPA" \
+  && ok "SPAWN-A: harness reached the real wa-worker spawn (not a vacuous pass)" \
+  || bad "SPAWN-A: the wa-worker spawn was never reached — the budget assertion below proves nothing"
+LOG_SPA2="$(run_capq_dispatch "$CAPQ_PS_FX" 0 0)"
+_spa_ps=$(spawn_min_budget)
+grep -q "ps-worker session spawned for ps-capq1" <<< "$LOG_SPA2" \
+  && ok "SPAWN-A: harness reached the real ps-worker spawn (not a vacuous pass)" \
+  || bad "SPAWN-A: the ps-worker spawn was never reached — the budget assertion below proves nothing"
+[ "${_spa_wa:-0}" -ge 150 ] 2>/dev/null \
+  && ok "SPAWN-A: the wa-worker arm spawns on a ${_spa_wa} s budget (>= 150) — a 60+ s spawn under load survives" \
+  || bad "SPAWN-A: the wa-worker arm's default budget is '${_spa_wa:-none}' s — a spawn of 60+ s is killed before it finishes, every sweep (the incident)"
+[ "${_spa_ps:-0}" -ge 150 ] 2>/dev/null \
+  && ok "SPAWN-A: the ps-worker arm spawns on a ${_spa_ps} s budget (>= 150)" \
+  || bad "SPAWN-A: the ps-worker arm's default budget is '${_spa_ps:-none}' s — same defect on the mirror arm"
+
+echo "Scenario SPAWN-B (ga-6hr8p7): CONTROL — two routed beads, fast spawns: BOTH spawn, nothing is deferred (the cap does not over-block)"
+LOG_SPB="$(run_capq_dispatch "$SPAWN_ROUTED2" 0 0)"
+if [ "$(spawn_attempts)" = "2" ] && ! grep -q "ga-6hr8p7" <<< "$LOG_SPB" && grep -q "dispatched=2" <<< "$LOG_SPB"; then
+  ok "SPAWN-B: 2 spawns, dispatched=2, no ga-6hr8p7 deferral line"
+else
+  bad "SPAWN-B: expected 2 spawn attempts / dispatched=2 / no deferral, saw $(spawn_attempts) attempt(s) (log: $(grep -E 'ga-6hr8p7|dispatched=' <<< "$LOG_SPB" | head -3 | tr '\n' '|'))"
+fi
+
+echo "Scenario SPAWN-C (ga-6hr8p7): the first spawn is KILLED at the budget (exit 124) — the next ROUTED bead is deferred BEFORE the claim (zero writes), and the sweep is a stall, not saturation"
+CAPQ_TIMEOUT_KILL_SPAWN=1
+LOG_SPC="$(run_capq_dispatch "$SPAWN_ROUTED2" 0 0)"
+CAPQ_TIMEOUT_KILL_SPAWN=""
+if grep -qE "Could not spawn wa-worker for wa-sp[12]" <<< "$LOG_SPC"; then
+  ok "SPAWN-C: harness reached the failed-spawn path (not a vacuous pass)"
+else
+  bad "SPAWN-C: no 'Could not spawn' line — the kill never landed on a spawn, the assertions below prove nothing"
+fi
+[ "$(spawn_attempts)" = "1" ] \
+  && ok "SPAWN-C: exactly ONE spawn was started in the sweep (was: one per candidate, each waiting out its own budget)" \
+  || bad "SPAWN-C: $(spawn_attempts) spawns started after a kill — a sweep with N candidates blocks for N x the budget"
+_spc_first=wa-sp1; grep -q "Could not spawn wa-worker for wa-sp2" <<< "$LOG_SPC" && _spc_first=wa-sp2
+_spc_other=wa-sp2; [ "$_spc_first" = "wa-sp2" ] && _spc_other=wa-sp1
+grep -q "ga-6hr8p7: pool-routed candidates DEFERRED this sweep (first: $_spc_other)" <<< "$LOG_SPC" \
+  && ok "SPAWN-C: the other routed bead ($_spc_other) is DEFERRED pre-claim and the deferral is announced" \
+  || bad "SPAWN-C: no pre-claim DEFERRED line for $_spc_other — it was tried (or dropped silently)"
+[ "$(capq_n "label (add|remove) $_spc_other")" = "0" ] && [ "$(capq_n "update $_spc_other")" = "0" ] && [ "$(capq_n "comment $_spc_other")" = "0" ] \
+  && ok "SPAWN-C: zero writes to the deferred bead (no claim → stamp → release churn on a box that is slow because of load)" \
+  || bad "SPAWN-C: the deferred bead $_spc_other was written to — the pre-claim skip is not pre-claim"
+[ "$(capq_n "label add $_spc_first story:in-flight")" = "0" ] && [ "$(capq_n "label add $_spc_first pilot:dispatched")" = "0" ] \
+  && ok "SPAWN-C: the killed bead ($_spc_first) is NOT marked in-flight/dispatched (ga-d20od rollback intact)" \
+  || bad "SPAWN-C: the bead whose spawn was killed was marked in-flight/dispatched — a false 'em execução'"
+grep -q "exit=124 after .*TIMED OUT" <<< "$LOG_SPC" \
+  && ok "SPAWN-C: the failure line now says exit=124, how long it ran, and that the session MAY exist (was: an opaque 'Could not spawn')" \
+  || bad "SPAWN-C: the failed-spawn warning still carries no exit code / duration / timeout hint"
+if grep -q "ga-y1m40: dispatched=0 with free slots" <<< "$LOG_SPC" && ! grep -q "ga-in9ebr: POOL-SATURATED sweep" <<< "$LOG_SPC"; then
+  ok "SPAWN-C: the sweep counts toward the stall streak and is NOT called POOL-SATURATED (a box too loaded to spawn is not a full pool)"
+else
+  bad "SPAWN-C: the killed/deferred sweep was read as pool saturation (or left no stall marker) — a real spawn outage would be hidden"
+fi
+sweep_expect '.spawn_failed' '1' "SPAWN-C: pilot_sweep: the killed spawn is spawn_failed=1"
+sweep_expect '.refused_by_guard' '{"rig_native_spawn_deferred_slow":1}' "SPAWN-C: pilot_sweep: the deferral is filed under refused_by_guard (a deliberate deferral, not a fault)"
+sweep_expect "$SWEEP_CLOSES" 'true' "SPAWN-C: pilot_sweep: the buckets still add up to candidates"
+
+echo "Scenario SPAWN-D (ga-6hr8p7): a SLOW spawn that SUCCEEDS (3 s vs a 2 s threshold) spends the sweep's one slow spawn too — the next routed bead is deferred"
+CAPQ_SPAWN_SLEEP=3; PILOT_SLOW_SPAWN_SECS=2
+LOG_SPD="$(run_capq_dispatch "$SPAWN_ROUTED2" 0 0)"
+CAPQ_SPAWN_SLEEP=""; PILOT_SLOW_SPAWN_SECS=""
+if [ "$(spawn_attempts)" = "1" ] && grep -q "dispatched=1" <<< "$LOG_SPD" && grep -q "ga-6hr8p7: pool-routed candidates DEFERRED" <<< "$LOG_SPD"; then
+  ok "SPAWN-D: the slow (but successful) first spawn was dispatched; the second bead was deferred — one slow spawn per sweep"
+else
+  bad "SPAWN-D: expected 1 spawn + dispatched=1 + a DEFERRED line after a slow success, saw $(spawn_attempts) spawn(s) (log: $(grep -E 'ga-6hr8p7|dispatched=' <<< "$LOG_SPD" | head -3 | tr '\n' '|'))"
+fi
+[ "$(( $(capq_n 'label add wa-sp1 story:in-flight') + $(capq_n 'label add wa-sp2 story:in-flight') ))" = "1" ] \
+  && ok "SPAWN-D: exactly ONE bead ended in-flight (the one whose spawn really happened)" \
+  || bad "SPAWN-D: in-flight count is not 1 — a deferred bead was marked in-flight, or the spawned one was not"
+
+echo "Scenario SPAWN-E (ga-6hr8p7): FIRST-SIGHT beads (no gc.routed_to yet) — the second is claimed, then DEFERRED in the pool arm and released; nothing is marked in-flight"
+CAPQ_TIMEOUT_KILL_SPAWN=1
+LOG_SPE="$(run_capq_dispatch "$SPAWN_FIRST2" 0 0)"
+CAPQ_TIMEOUT_KILL_SPAWN=""
+[ "$(spawn_attempts)" = "1" ] \
+  && ok "SPAWN-E: exactly ONE spawn started for two first-sight beads" \
+  || bad "SPAWN-E: $(spawn_attempts) spawns started after a kill — the in-arm gate does not stop the second one"
+_spe_first=wa-sq1; grep -q "Could not spawn wa-worker for wa-sq2" <<< "$LOG_SPE" && _spe_first=wa-sq2
+_spe_other=wa-sq2; [ "$_spe_first" = "wa-sq2" ] && _spe_other=wa-sq1
+if grep -q "ga-6hr8p7: spawn of wa-worker for $_spe_other DEFERRED" <<< "$LOG_SPE"; then
+  ok "SPAWN-E: $_spe_other reached the pool arm and was DEFERRED there (claim released), announced by name"
+else
+  bad "SPAWN-E: no in-arm DEFERRED line for $_spe_other (log: $(grep -E 'ga-6hr8p7|wa-sq' <<< "$LOG_SPE" | head -4 | tr '\n' '|'))"
+fi
+[ "$(capq_n "label add $_spe_other pilot:dispatching")" -ge 1 ] && [ "$(capq_n "label remove $_spe_other pilot:dispatching")" -ge 1 ] \
+  && ok "SPAWN-E: the deferred bead was claimed and then RELEASED (pilot:dispatching removed — it does not sit claimed until TTL)" \
+  || bad "SPAWN-E: the deferred bead's claim was not released (added=$(capq_n "label add $_spe_other pilot:dispatching") removed=$(capq_n "label remove $_spe_other pilot:dispatching"))"
+[ "$(capq_n "set-metadata gc.routed_to=wa-worker")" -ge 1 ] && [ "$(capq_n 'unset-metadata gc.routed_to')" = "0" ] \
+  && ok "SPAWN-E: gc.routed_to=wa-worker stays SET (the bead remains visible to top-up and worker self-serve)" \
+  || bad "SPAWN-E: gc.routed_to was not stamped or was unset on a deferred bead"
+[ "$(capq_n 'label add wa-sq[12] story:in-flight')" = "0" ] \
+  && ok "SPAWN-E: neither bead is marked in-flight" \
+  || bad "SPAWN-E: a bead was marked in-flight although no worker was spawned for it"
+sweep_expect '.results | to_entries | sort_by(.key) | from_entries' '{"rig_native_spawn_deferred_slow":1,"rig_native_spawn_failed":1}' "SPAWN-E: pilot_sweep results name both outcomes (the kill and the deferral)"
+sweep_expect '.refused_by_guard' '{"rig_native_spawn_deferred_slow":1}' "SPAWN-E: the in-arm deferral is filed under refused_by_guard too"
 
 # ── Scenario TOPUP: pool top-up (ga-93yxc) ────────────────────────────────────
 # The cap-skip above (ga-mfeip, ga-v3o6i) sets gc.routed_to=<pool> and gives up

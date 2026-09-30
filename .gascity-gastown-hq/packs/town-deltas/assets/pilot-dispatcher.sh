@@ -7935,6 +7935,76 @@ _topup_rig_pending() {
   return 0
 }
 
+# ── ga-6hr8p7: the spawn budget — a generous timeout, but only ONE slow spawn per sweep ──────────
+# Measured 2026-09-30 (Mayor): the Pilot could not refill the wa-worker pool — 134 "Could not spawn
+# wa-worker ... live=1 < 2" between 29/09 13:35 and 30/09 01:14 while 25+ approved beads waited, 6 of them
+# alarmed "starving" (274-825 min). `gc session new` took 38 s by hand at load ~40 and 60+ s at load 50-80,
+# and every spawn was bounded by `timeout 60`: under load the kill landed BEFORE the CLI finished, on every
+# attempt, so the pool never refilled. A budget tuned for a calm box turns into a hard outage exactly when
+# the box is busiest (ga-mfeip raised it 30 -> 60 on 2026-06-30 for the same reason), and the next sweep
+# fails identically.
+#
+# Two halves, because either one alone is wrong:
+#   1. The default is 150 s at all four spawn sites — two in _pilot_topup_spawn, one per pool arm in
+#      dispatch_one (PILOT_SPAWN_TIMEOUT_SECS still overrides it): headroom over the worst spawn measured
+#      (60+ s), not a hair over the median. The literal is repeated at each site on purpose — the selftests
+#      extract _pilot_topup_spawn on its own (with the two helpers below), and a shared variable set
+#      elsewhere would not exist in that copy.
+#   2. A longer timeout alone lets ONE bad sweep block for N x 150 s (top-up for two pools plus every
+#      dispatch candidate, each waiting out its own timeout). So a sweep gets ONE slow spawn: once any spawn
+#      times out (exit 124) or merely takes >= PILOT_SLOW_SPAWN_SECS (default 60 — the old budget, i.e. a
+#      spawn the old code would have killed), _PILOT_SLOW_SPAWN_SEEN flips and every later spawn site this
+#      sweep DEFERS instead of trying. The script is re-exec'd by launchd each sweep, so the flag resets by
+#      construction and the next sweep decides again. Deferral is the inert outcome — no spawn, no retry —
+#      the same state a timed-out spawn already leaves (ga-oa004t: outcome unknown, the next sweep's live
+#      count decides).
+_PILOT_SLOW_SPAWN_SEEN=0
+
+# _pilot_slow_spawn_budget_spent — 0 (true) iff a spawn earlier THIS sweep was slow.
+# (Multi-line on purpose: the selftests pull functions out with an awk that ends at a lone `}` line.)
+_pilot_slow_spawn_budget_spent() {
+  [ "${_PILOT_SLOW_SPAWN_SEEN:-0}" = "1" ]
+}
+
+# _pilot_note_spawn_timing <rc> <t0> — call right after a `gc session new` attempt; <t0> is $SECONDS taken
+# just before it. Flags the sweep as spent on exit 124 (killed at the budget — slow by definition) or when
+# the attempt ran >= PILOT_SLOW_SPAWN_SECS, whatever its exit code (a spawn that fails after 100 s is as slow
+# as one that succeeds after 100 s). A non-numeric PILOT_SLOW_SPAWN_SECS falls back to 60 — never to "off".
+# A missing/non-numeric <t0> means the duration is UNKNOWN, which is not "instant": it counts as slow (the inert
+# answer for a spawn gate is to not stack another spawn behind one we cannot time). Callers always pass $SECONDS.
+# $SECONDS has whole-second resolution and ticks on wall-clock second boundaries, so a reading is off by <1 s —
+# noise against a 60 s threshold, but it is why a selftest must not use a 1 s threshold to tell "instant" from "slow".
+# Always returns 0; runs in the caller's shell (never call it via $(...), the flag would be lost).
+_pilot_note_spawn_timing() {
+  local _rc="$1" _t0="${2:-}" _slow="${PILOT_SLOW_SPAWN_SECS:-60}"
+  case "$_slow" in ''|*[!0-9]*) _slow=60 ;; esac
+  case "$_t0" in
+    ''|*[!0-9]*) _PILOT_SLOW_SPAWN_SEEN=1; return 0 ;;
+  esac
+  if [ "$_rc" = "124" ] || [ $(( SECONDS - _t0 )) -ge "$_slow" ]; then
+    _PILOT_SLOW_SPAWN_SEEN=1
+  fi
+  return 0
+}
+
+# _pilot_slow_spawn_deferred_for <story_json> — dispatch_lane()'s PRE-claim twin of the in-arm deferral
+# (same shape as _pilot_pool_cap_full_for): 0 iff the spawn budget is spent AND the candidate is already
+# committed to a pool that would spawn a session for it (gc.routed_to = wa-worker|ps-worker, spawn enabled).
+# Without it every remaining candidate would be claimed, stamped and released again (~5 Dolt writes each,
+# on a box that is slow precisely because of load) just to learn what the flag already says. A candidate
+# the pool arm has not seen yet (no gc.routed_to) can only be decided inside dispatch_one(), after the claim.
+_pilot_slow_spawn_deferred_for() {
+  local _story="$1" _routed
+  _pilot_slow_spawn_budget_spent || return 1
+  _routed=$(printf '%s' "$_story" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
+  case "$_routed" in
+    wa-worker) [ "${PILOT_SPAWN_WA_WORKER:-1}" = "1" ] || return 1 ;;
+    ps-worker) [ "${PILOT_SPAWN_PS_WORKER:-1}" = "1" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
 # _pilot_topup_spawn pool pending — spawns a pool worker session for top-up.
 # ga-kmm6rb: the old inline call discarded BOTH stdout and stderr via
 # `>/dev/null 2>&1`, so all 3/3 top-up spawn failures observed since the
@@ -7959,16 +8029,23 @@ _topup_rig_pending() {
 # reasoned bet given the available evidence, not a substitute for that live
 # proof (ACEITE #3), which needs a real production sweep to observe.
 _pilot_topup_spawn() {
-  local _pool="$1" _pending="$2" _err _rc
-  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+  local _pool="$1" _pending="$2" _err _rc _t0
+  # ga-6hr8p7: a spawn earlier THIS sweep was slow — defer instead of stacking a second one behind it.
+  if _pilot_slow_spawn_budget_spent; then
+    log "  ga-6hr8p7: pool top-up spawn for $_pool ($_pending) DEFERRED — a spawn earlier this sweep was slow (>= ${PILOT_SLOW_SPAWN_SECS:-60}s or timed out); one slow spawn per sweep, the next sweep's live count decides."
+    return 1
+  fi
+  _t0=$SECONDS
+  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
       --title-hint "pool top-up: $_pending" 2>&1 >/dev/null)
   _rc=$?
+  _pilot_note_spawn_timing "$_rc" "$_t0"
   if [ "$_rc" -eq 0 ]; then
     return 0
   fi
   # ga-oa004t: exit 124 is `timeout` killing the CLI, NOT "the session was not
   # created" — the outcome is UNKNOWN. `gc session new` takes ~50s under load
-  # (against this 60s budget) and creates the session bead BEFORE it finishes:
+  # (against the 60s budget of the day; 150s since ga-6hr8p7) and creates the session bead BEFORE it finishes:
   # measured 2026-09-25, the session bead landed 2s (12:54:02) and 6s (14:59:49)
   # before the kill — and the blind retry below then opens a SECOND session for
   # the same bead. A timeout collapsed to "failed" is the same error-vs-empty
@@ -7976,7 +8053,13 @@ _pilot_topup_spawn() {
   # up for this sweep with no retry. If a session did land it is counted by the
   # next sweep's live probe; if none did, the next sweep's top-up retries anyway.
   if [ "$_rc" -eq 124 ]; then
-    warn "ga-oa004t: pool top-up spawn for $_pool ($_pending) TIMED OUT after ${PILOT_SPAWN_TIMEOUT_SECS:-60}s (exit=124): ${_err:-<no stderr captured>} — outcome UNKNOWN (the session may already exist) — NOT retrying this sweep; the next sweep's live count decides."
+    warn "ga-oa004t: pool top-up spawn for $_pool ($_pending) TIMED OUT after ${PILOT_SPAWN_TIMEOUT_SECS:-150}s (exit=124): ${_err:-<no stderr captured>} — outcome UNKNOWN (the session may already exist) — NOT retrying this sweep; the next sweep's live count decides."
+    return 1
+  fi
+  # ga-6hr8p7: a failure that ITSELF took >= the slow threshold is no transient blip to retry after 3 s —
+  # the retry would be a second slow spawn in the same sweep. Same give-up as the timeout above.
+  if _pilot_slow_spawn_budget_spent; then
+    warn "ga-6hr8p7: pool top-up spawn failed for $_pool ($_pending) after $(( SECONDS - _t0 ))s (exit=$_rc): ${_err:-<no stderr captured>} — that was a slow spawn, NOT retrying this sweep (one slow spawn per sweep); the next sweep's live count decides."
     return 1
   fi
   warn "ga-kmm6rb: pool top-up spawn failed for $_pool ($_pending), attempt 1/2 (exit=$_rc): ${_err:-<no stderr captured>} — retrying once this sweep"
@@ -7987,9 +8070,11 @@ _pilot_topup_spawn() {
   # hitting the exact same saturated instant again, giving the retry no
   # better odds than the original attempt.
   sleep "${PILOT_TOPUP_RETRY_DELAY_SECS:-3}"
-  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
+  _t0=$SECONDS
+  _err=$(timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new "$_pool" --no-attach \
       --title-hint "pool top-up: $_pending" 2>&1 >/dev/null)
   _rc=$?
+  _pilot_note_spawn_timing "$_rc" "$_t0"
   if [ "$_rc" -eq 0 ]; then
     log "  ga-kmm6rb: pool top-up spawn for $_pool ($_pending) succeeded on retry (attempt 1 had failed, see prior warn line)."
     return 0
@@ -10982,18 +11067,35 @@ TASK
             DISPATCH_RESULT="rig_native_pool_session_cap_queued"
             return 1
           else
+            # ga-6hr8p7: ONE slow spawn per sweep. A spawn earlier this sweep timed out or ran >= PILOT_SLOW_SPAWN_SECS
+            # (see _pilot_note_spawn_timing): do not queue another behind it. Released like the unreadable-count exit —
+            # claim label + stamp + sling fingerprint gone, gc.routed_to kept SET, builder slot given back — and
+            # deliberately NOT _pilot_capacity_queued: a box too loaded to spawn is not a full pool, so the Step 5
+            # stall streak must keep seeing it.
+            if _pilot_slow_spawn_budget_spent; then
+              log "  ga-6hr8p7: spawn of wa-worker for $STORY_ID DEFERRED — a spawn earlier this sweep was slow (>= ${PILOT_SLOW_SPAWN_SECS:-60}s or timed out); one slow spawn per sweep (claim released, story:approved + gc.routed_to=wa-worker kept; the next sweep retries)."
+              _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+              DISPATCH_RESULT="rig_native_spawn_deferred_slow"
+              return 1
+            fi
             log "  ga-mfeip: spawning wa-worker for $STORY_ID (slot=$BUILDER_TARGET, live=$_live_wa_count < ${PILOT_WA_WORKER_MAX:-4})."
             # spawn timeout raised 30→60 (env PILOT_SPAWN_TIMEOUT_SECS): under a HOT Dolt
             # (~300% CPU) `gc session new` routinely took >30s → 157 "Could not spawn" in one
             # session → routed beads starved waiting for the supervisor fallback (2026-06-30).
-            if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new wa-worker --no-attach \
+            # ga-6hr8p7: 60→150 — at load 50-80 it took 60+ s and the kill landed before the CLI finished,
+            # 134 times in 12 h (see the spawn-budget block above _pilot_topup_spawn).
+            _spawn_t0=$SECONDS
+            _spawn_rc=0
+            timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new wa-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
-                >/dev/null 2>&1; then
+                >/dev/null 2>&1 || _spawn_rc=$?
+            _pilot_note_spawn_timing "$_spawn_rc" "$_spawn_t0"
+            if [ "$_spawn_rc" -eq 0 ]; then
               log "  ga-mfeip: wa-worker session spawned for $STORY_ID (slot=$BUILDER_TARGET). [ga-oa004t path=dispatch_one pool_live_before=$_live_wa_count max=${PILOT_WA_WORKER_MAX:-4}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_WA:-}" ]; then _PCAP_LIVE_WA=$(( _PCAP_LIVE_WA + 1 )); fi
             else
-              warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep"
+              warn "ga-mfeip: Could not spawn wa-worker for $STORY_ID — gc.routed_to=wa-worker set; ga-93yxc pool top-up retries on a later sweep [ga-6hr8p7 exit=$_spawn_rc after $(( SECONDS - _spawn_t0 ))s of ${PILOT_SPAWN_TIMEOUT_SECS:-150}s$([ "$_spawn_rc" = "124" ] && printf ' -- TIMED OUT: the session may still have been created, the next sweep live count decides')]"
               # ga-d20od: the spawn genuinely failed/timed out — no worker was
               # dispatched. Release the claim and abort HERE, mirroring the
               # sibling failure paths above (rig_dedup_skip, pool_ownership_refuse,
@@ -11061,15 +11163,30 @@ TASK
             DISPATCH_RESULT="rig_native_pool_session_cap_queued"
             return 1
           else
+            # ga-6hr8p7: ONE slow spawn per sweep. A spawn earlier this sweep timed out or ran >= PILOT_SLOW_SPAWN_SECS
+            # (see _pilot_note_spawn_timing): do not queue another behind it. Released like the unreadable-count exit —
+            # claim label + stamp + sling fingerprint gone, gc.routed_to kept SET, builder slot given back — and
+            # deliberately NOT _pilot_capacity_queued: a box too loaded to spawn is not a full pool, so the Step 5
+            # stall streak must keep seeing it.
+            if _pilot_slow_spawn_budget_spent; then
+              log "  ga-6hr8p7: spawn of ps-worker for $STORY_ID DEFERRED — a spawn earlier this sweep was slow (>= ${PILOT_SLOW_SPAWN_SECS:-60}s or timed out); one slow spawn per sweep (claim released, story:approved + gc.routed_to=ps-worker kept; the next sweep retries)."
+              _pilot_release_count_unreadable "$STORY_ID" "$STORY_BEAD_CITY" "$BUILDER_TARGET"
+              DISPATCH_RESULT="rig_native_spawn_deferred_slow"
+              return 1
+            fi
             log "  ga-mfeip: spawning ps-worker for $STORY_ID (live=$_live_ps_count < ${PILOT_PS_WORKER_MAX:-2})."
-            if timeout "${PILOT_SPAWN_TIMEOUT_SECS:-60}" gc --city "$GC_CITY" session new ps-worker --no-attach \
+            _spawn_t0=$SECONDS
+            _spawn_rc=0
+            timeout "${PILOT_SPAWN_TIMEOUT_SECS:-150}" gc --city "$GC_CITY" session new ps-worker --no-attach \
                 --title-hint "build $STORY_ID: $STORY_TITLE" \
-                >/dev/null 2>&1; then
+                >/dev/null 2>&1 || _spawn_rc=$?
+            _pilot_note_spawn_timing "$_spawn_rc" "$_spawn_t0"
+            if [ "$_spawn_rc" -eq 0 ]; then
               log "  ga-mfeip: ps-worker session spawned for $STORY_ID. [ga-oa004t path=dispatch_one pool_live_before=$_live_ps_count max=${PILOT_PS_WORKER_MAX:-2}]"
               # ga-in9ebr: keep the per-sweep pre-claim count honest (a spawn only ever raises it).
               if [ -n "${_PCAP_LIVE_PS:-}" ]; then _PCAP_LIVE_PS=$(( _PCAP_LIVE_PS + 1 )); fi
             else
-              warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep"
+              warn "ga-mfeip: Could not spawn ps-worker for $STORY_ID — gc.routed_to=ps-worker set; ga-93yxc pool top-up retries on a later sweep [ga-6hr8p7 exit=$_spawn_rc after $(( SECONDS - _spawn_t0 ))s of ${PILOT_SPAWN_TIMEOUT_SECS:-150}s$([ "$_spawn_rc" = "124" ] && printf ' -- TIMED OUT: the session may still have been created, the next sweep live count decides')]"
               # ga-d20od: mirrors the wa-worker spawn-failure rollback above —
               # same defect shape (unconditional story:in-flight + pilot:dispatched
               # marking below used to run even when no worker was ever spawned).
@@ -11582,6 +11699,9 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       rig_native_dog_store_migrated (ga-6u64fm): the dog-store guard REFUSED the dispatch and
 #                       RESOLVED it by moving the bead to a store a builder reads — the benign end of the same
 #                       guard whose park end is rig_native_dog_store_blind; the tally key tells the two apart.
+#                       Also rig_native_spawn_deferred_slow (ga-6hr8p7): the spawn was DEFERRED because an
+#                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
+#                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
 #                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t) and
 #                       any name not classified here
@@ -11627,7 +11747,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
@@ -11712,6 +11832,21 @@ dispatch_lane() {
       # ga-ov3gow: this bead never reaches dispatch_one(), so nothing else would record it — and it is the
       # commonest queue path. Same name dispatch_one() gives the in-arm cap: one kind of queue, one bucket.
       _pilot_sweep_note "$pick_id" 1 "rig_native_pool_session_cap_queued"
+      continue
+    fi
+
+    # ── ga-6hr8p7: skip a pool-routed candidate BEFORE the claim once this sweep's one slow spawn is spent ──
+    # Same pre-claim shape as the cap skip above, for the same reason (no claim → stamp → release churn on a
+    # box that is slow precisely because of load) — but NOT the same accounting: this is no capacity queue, so
+    # it does not feed POOL_CAP_QUEUED, and it counts in NONQUEUE_FAILS so the Step 5 stall streak still sees a
+    # sweep that dispatched nothing because spawning is too slow (a full pool is backpressure; this is not).
+    if _pilot_slow_spawn_deferred_for "$pick"; then
+      if [ "${_PILOT_SLOW_SPAWN_DEFER_LOGGED:-0}" != "1" ]; then
+        _PILOT_SLOW_SPAWN_DEFER_LOGGED=1
+        log "ga-6hr8p7: pool-routed candidates DEFERRED this sweep (first: $pick_id) — a spawn earlier this sweep was slow (>= ${PILOT_SLOW_SPAWN_SECS:-60}s or timed out); one slow spawn per sweep, not claimed, no writes (the next sweep retries)."
+      fi
+      _pilot_sweep_note "$pick_id" 1 "rig_native_spawn_deferred_slow"
+      NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
       continue
     fi
 
