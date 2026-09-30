@@ -68,7 +68,8 @@ For pytest and JS the check is stricter about not blaming you for the
 environment, because those tests import the code under test. They run inside a
 sandbox (no network, writes only to a scratch dir) since they are being run
 against pre-fix code. Your test files, their `conftest.py` and anything under
-`tests/`/`tests-js/`/`fixtures/` come along onto the base; every OTHER file you
+`tests/`, `tests-js/`, `test/`, `__tests__/` or `fixtures/` come along onto the
+base; every OTHER file you
 changed stays pre-fix, because that is the fix. Each test file also runs on
 your branch as a control — a test that does not pass THERE is never counted as
 "failing on base" — and every test is also run ALONE, so a test that only

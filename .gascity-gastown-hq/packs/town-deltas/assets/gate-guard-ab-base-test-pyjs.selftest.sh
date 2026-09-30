@@ -649,6 +649,8 @@ fstate() { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* state=\([^ ]
 fold()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* old=\([^ ]*\).*/\1/p'; }
 fwhy()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* why=\([^ ]*\).*/\1/p'; }
 tot()    { printf '%s\n' "$OUT" | grep '^TOTALS ' | tr ' ' '\n' | grep "^$1=" | cut -d= -f2; }
+# runs_in <trace-file>: how many test runs GATE_ABT_TRACE saw (the file only exists once a run started).
+runs_in() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
 
 if want 5 && need_fn gate_base_test_pyjs_measure; then
   if [ "$HAVE_PYTEST" != yes ]; then
@@ -747,8 +749,10 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     OUT=$(GATE_ABT_PYJS_MAX=1 measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_fails.py)
     eq "more files than the cap -> every file unmeasured, why=cap (a cap hit is visible, never a silent truncation)" \
       "$(fstate tests/test_passes.py)/$(fstate tests/test_fails.py)/$(fwhy tests/test_fails.py)" "unmeasured/unmeasured/cap"
-    OUT=$(GATE_ABT_PYJS_BUDGET=0 measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
+    rm -f "$H_SCRATCH/trace-budget"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-budget" GATE_ABT_PYJS_BUDGET=0 measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
     eq "an exhausted time budget -> unmeasured, why=budget" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/budget"
+    eq "...and it SPENDS NOTHING: not one test run was started once the budget was gone (a budget that still pays for the base run is no budget)" "$(runs_in "$H_SCRATCH/trace-budget")" "0"
     OUT=$(measure "$C" "" "deadbeef00000000000000000000000000000000" "$TIP" tests/test_passes.py)
     eq "an unresolvable base sha -> unmeasured, why=worktree" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/worktree"
     OUT=$(gate_base_test_pyjs_measure "$H_SCRATCH/rig-novenv" "$BASE" "$TIP" "tests/test_passes.py")
@@ -795,8 +799,18 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     C8B="$H_SCRATCH/case8b"; mk_case "$C8B" ""; BASE8B=$(git -C "$C8B" rev-parse HEAD); fix_code "$C8B" ""
     printf 'import os\nfrom lib.mod import double\n\ndef test_env_a():\n    assert os.path.exists("/definitely/not/here/a")\n\ndef test_env_b():\n    assert os.path.exists("/definitely/not/here/b")\n\ndef test_real():\n    assert double(2) == 4\n' > "$C8B/tests/test_mixed.py"
     TIP8B=$(commit_all "$C8B" "fix + two env-broken tests and one real one")
-    OUT=$(measure "$C8B" "" "$BASE8B" "$TIP8B" tests/test_mixed.py)
+    rm -f "$H_SCRATCH/trace8b"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace8b" measure "$C8B" "" "$BASE8B" "$TIP8B" tests/test_mixed.py)
     eq "candidates that do not pass alone at tip are skipped, and the next one is tried: the real test still decides -> fails-on-base" "$(fstate tests/test_mixed.py)" "fails-on-base"
+    eq "...and a candidate that fails alone at tip costs ONE run, not two: base, env_a@tip, env_b@tip, real@tip, real@base = 5 (no base run for a test the control already rejected)" "$(runs_in "$H_SCRATCH/trace8b")" "5"
+
+    echo "  -- a test the FIX breaks: green on base, red at tip -> the control is not green, so nothing is concluded --"
+    C8C="$H_SCRATCH/case8c"; mk_case "$C8C" ""; BASE8C=$(git -C "$C8C" rev-parse HEAD); fix_code "$C8C" ""
+    printf 'from lib.mod import double\n\ndef test_old_behaviour():\n    assert double(2) == 2\n' > "$C8C/tests/test_breaks_at_tip.py"
+    TIP8C=$(commit_all "$C8C" "fix + a test of the OLD behaviour, which the fix turns red")
+    OUT=$(measure "$C8C" "" "$BASE8C" "$TIP8C" tests/test_breaks_at_tip.py)
+    eq "a test that passes on base and FAILS at tip (the fix broke it) -> unmeasured, why=tip-not-green: a red control supports neither answer" "$(fstate tests/test_breaks_at_tip.py)/$(fwhy tests/test_breaks_at_tip.py)" "unmeasured/tip-not-green"
+    eq "...and it is never counted as evidence: ran=0" "$(tot ran)" "0"
 
     echo "  -- a rig that is a SUBDIRECTORY of the repo (the gascity layout) --"
     C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"
