@@ -2077,6 +2077,60 @@ _pilot_variable_session_count() {
   _pilot_live_session_count wa-worker ps-worker gate-reviewer
 }
 
+# ── ga-5je3zv: an unreadable session count HALTS the dispatch phase — it is not a per-candidate event ──
+# ga-oa004t made an unreadable count fail CLOSED, and that stays right: never open a worker without knowing
+# the count. The defect was what happened AFTER. _PLSC_UNREADABLE is sticky for the sweep, so once ONE
+# `session list` read failed, every later candidate still paid the full dispatch_one() price — atomic claim,
+# builder choice, ~1 min of prompt assembly — only to reach the count gate, fail instantly, and release the
+# claim. Measured 2026-09-30: one 30s timeout at 18:55 (disk/swap spike) and the sweep then claimed and
+# released 85 candidates over 79 min with ZERO spawns, holding the launchd StartInterval the whole time (19
+# approved beads parked, last merge 80 min old). The same shape already cost a 1h02 sweep on 2026-09-26
+# (71 "cannot read" lines). The count was readable again within seconds; the flag just never let anyone ask.
+#
+# So a sweep that cannot read the count stops DISPATCHING: one log line, the lane loops break, the rig
+# fallback scan is skipped. Nothing else changes — the fail-closed gates below stay as they are, and the
+# next sweep is a fresh process that re-reads from scratch (the cost of a blip is one sweep, never a wedge).
+# The halt is per-sweep state on purpose: no file, nothing to go stale.
+#
+# The same gate carries the second half of the fix: a time budget for the dispatch phase. Nothing bounded
+# how long the loops could run, so ANY slow per-candidate path (this one, or the next one) could hold the
+# StartInterval for hours. PILOT_DISPATCH_MAX_SECS (default 900 = 15 min; 0 = no cap) is measured from the
+# start of the dispatch phase, NOT the script start: sweeps are p50 346 s / p90 887 s end to end (353
+# sweeps in the pilot-dispatcher.log tail of 26-30/09, start→complete), much of it before the loops, and
+# a cap counted from the script start would skip dispatch altogether on exactly the busy sweeps that have
+# the most to dispatch. The budget is checked
+# BETWEEN candidates — a dispatch already in flight is never killed.
+#
+# Both are reported through _PILOT_HALT (the reason key, "" = running normally), logged ONCE.
+_PILOT_HALT=""            # sticky per sweep: why the dispatch phase stopped ("" = it has not)
+_PILOT_DISPATCH_T0=""     # $SECONDS when the dispatch phase began (set at Step 4)
+
+# _pilot_dispatch_halt <reason-key> <message> — stop the dispatch phase; the FIRST reason wins and is the
+# only one logged (a halt must be one line, not one per candidate left un-attempted).
+_pilot_dispatch_halt() {
+  [ -z "${_PILOT_HALT:-}" ] || return 0
+  _PILOT_HALT="$1"
+  warn "ga-5je3zv: dispatch phase HALTED for the rest of this sweep ($1): $2"
+  return 0
+}
+
+# _pilot_dispatch_should_stop — returns 0 iff the dispatch phase must not start another candidate: it was
+# halted already, or its time budget is spent (which halts it, once, here). Returns 1 = keep going.
+# NEVER call via $(...): it sets _PILOT_HALT, and an assignment inside a command substitution dies with the
+# subshell. Called only as an `if` condition (the script runs under set -e).
+_pilot_dispatch_should_stop() {
+  local _max="${PILOT_DISPATCH_MAX_SECS:-900}" _t0="${_PILOT_DISPATCH_T0:-}"
+  [ -z "${_PILOT_HALT:-}" ] || return 0
+  case "$_max" in ''|*[!0-9]*) _max=900 ;; esac
+  case "$_t0" in ''|*[!0-9]*) return 1 ;; esac   # the phase has not started: no budget to spend
+  [ "$_max" -gt 0 ] || return 1
+  if [ $(( SECONDS - _t0 )) -ge "$_max" ]; then
+    _pilot_dispatch_halt "time-budget" "the dispatch phase has run $(( SECONDS - _t0 ))s, over PILOT_DISPATCH_MAX_SECS=${_max}s — candidates not yet attempted stay story:approved for the next sweep (set PILOT_DISPATCH_MAX_SECS=0 to lift the cap)."
+    return 0
+  fi
+  return 1
+}
+
 # _dolt_probe — populate DOLT_PID + DOLT_LATENCY_MS once. Honors the test seams.
 _dolt_probe() {
   if [ -n "$PILOT_DOLT_LATENCY_OVERRIDE_MS" ]; then
@@ -9109,6 +9163,7 @@ _PCAP_N=""         # out-param of _pilot_pool_live_count
 _PCAP_POOL=""      # out-params of _pilot_pool_cap_full_for (valid only after a hit)
 _PCAP_LIVE=""
 _PCAP_MAX=""
+_PCAP_COUNT_UNREADABLE=""   # ga-5je3zv: set by THIS _pilot_pool_cap_full_for call iff a pool-committed candidate's count could not be READ
 _PCAP_CALL_QUEUED=0   # dispatch_lane() reads this after dispatch_one(): did THIS call end as a cap QUEUE?
 _PCAP_WARNED_WA=""    # "cannot read the live count" is announced once per pool per sweep (see below)
 _PCAP_WARNED_PS=""
@@ -9179,6 +9234,7 @@ _pilot_pool_live_count() {
 # skip must stay out of that mode's way.
 _pilot_pool_cap_full_for() {
   local _story="$1" _routed _pool _max
+  _PCAP_COUNT_UNREADABLE=""   # per call: only THIS candidate's probe may tell dispatch_lane to halt
   if [ "${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}" != "1" ]; then return 1; fi
   _routed=$(printf '%s' "$_story" | jq -r '.metadata["gc.routed_to"] // ""' 2>/dev/null || echo "")
   case "$_routed" in
@@ -9189,7 +9245,11 @@ _pilot_pool_cap_full_for() {
     *) return 1 ;;
   esac
   case "$_max" in ''|*[!0-9]*) return 1 ;; esac
-  _pilot_pool_live_count "$_pool" || return 1
+  # Return 1 either way ("not full: proceed to the claim") — but ga-5je3zv: a count that could not be READ for
+  # a bead committed to a spawn-enabled pool means dispatch_one() WILL fail at its own fail-closed count gate
+  # (the sticky _PLSC_UNREADABLE), after a claim + prompt assembly it then has to undo. dispatch_lane() reads
+  # this flag and halts the dispatch phase instead of paying that for every candidate.
+  _pilot_pool_live_count "$_pool" || { _PCAP_COUNT_UNREADABLE=1; return 1; }
   if [ "$_PCAP_N" -lt "$_max" ]; then return 1; fi
   _PCAP_POOL="$_pool"; _PCAP_LIVE="$_PCAP_N"; _PCAP_MAX="$_max"
   return 0
@@ -11656,6 +11716,7 @@ No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)?
 # can never WIDEN a wedged pipe (the fd-leak/CPU-incident class this guards).
 
 DISPATCHED=0
+_PILOT_DISPATCH_T0=$SECONDS    # ga-5je3zv: the dispatch phase starts HERE — its time budget (PILOT_DISPATCH_MAX_SECS) counts from now
 OWNERSHIP_GUARD_VETO_COUNT=0   # ga-8jxe1 AC4 — see the two increment sites in dispatch_one()
 # ga-in9ebr: candidates left QUEUED because their worker pool is at its session cap
 # (counted once per bead per sweep), and NONQUEUE_FAILS = every OTHER reason a sweep can
@@ -11708,6 +11769,11 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it
+#   halted              ga-5je3zv: null for a sweep that ran its dispatch phase to the end; otherwise the reason it
+#                       was cut short — "session-count-unreadable" (the live session count could not be read) or
+#                       "time-budget" (PILOT_DISPATCH_MAX_SECS spent). A sweep with halted != null has candidates
+#                       it never attempted, so its buckets still add up to `candidates` but `candidates` is NOT
+#                       the size of the backlog. Additive: no consumer that ignores the key changes.
 #   small_slots, big_slots   free lane capacity when the sweep started (tells a stall from saturation)
 #   results             {<DISPATCH_RESULT>: n} — the per-name tally of the SAME outcomes the buckets above
 #                       count (both come from one per-bead outcome list), in the vocabulary of
@@ -11740,6 +11806,7 @@ _pilot_sweep_emit() {
   if _line=$(printf '%s' "${SWEEP_OUTCOMES:-}" | jq -R -s -c \
     --arg ts "$_ts" --arg dry_run "${DRY_RUN:-0}" \
     --arg saturated "${_pool_saturated_sweep:-0}" \
+    --arg halted "${_PILOT_HALT:-}" \
     --arg small "${SMALL_SLOTS:-0}" --arg big "${BIG_SLOTS:-0}" '
     def num($s): (try ($s | tonumber) catch null);
     def cls($o):
@@ -11766,6 +11833,7 @@ _pilot_sweep_emit() {
         failed_other: n("failed_other"),
         unclassified: n("unclassified"),
         pool_saturated: num($saturated),
+        halted: (if $halted == "" then null else $halted end),
         small_slots: num($small), big_slots: num($big),
         results: tally([$outs[] | select(.r != "") | .r]) }
     ' 2>/dev/null) && [ -n "$_line" ] \
@@ -11803,6 +11871,11 @@ dispatch_lane() {
       warn "Lane $lane: iteration guard hit (${_iter}>${_iter_max}) — stopping loop (pool-removal anomaly?)."
       break
     fi
+    # ga-5je3zv: the dispatch phase was halted (session count unreadable) or has spent its time budget —
+    # start no further candidate, in this lane or the next. The reason was logged once, where it was decided.
+    # Falls to the cut-short accounting below (candidates left un-attempted → NONQUEUE_FAILS), so the Step 5
+    # stall streak still sees a sweep that dispatched nothing for want of a readable count.
+    if _pilot_dispatch_should_stop; then break; fi
     local n
     n=$(echo "$pool" | jq 'length' 2>/dev/null || echo "0")
     if [ "${n:-0}" -le 0 ] 2>/dev/null; then _exhausted=1; break; fi
@@ -11833,6 +11906,19 @@ dispatch_lane() {
       # commonest queue path. Same name dispatch_one() gives the in-arm cap: one kind of queue, one bucket.
       _pilot_sweep_note "$pick_id" 1 "rig_native_pool_session_cap_queued"
       continue
+    fi
+
+    # ── ga-5je3zv: a pool-committed candidate whose pool count could not be READ → halt, do not claim ──
+    # The probe above just failed for THIS candidate (session list timed out / errored / malformed). Every
+    # later candidate would read the same sticky _PLSC_UNREADABLE and fail the same way, only AFTER the claim
+    # and ~1 min of prompt assembly each (85 times in 79 min on 2026-09-30, zero spawns). This one is
+    # accounted under the name dispatch_one() gives the same condition, so the sweep event still closes
+    # (failed_other — a fault, not saturation) and Step 5 still sees a sweep that dispatched nothing.
+    if [ -n "${_PCAP_COUNT_UNREADABLE:-}" ]; then
+      _pilot_sweep_note "$pick_id" 1 "rig_native_pool_count_unreadable"
+      NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+      _pilot_dispatch_halt "session-count-unreadable" "the live session count could not be read (session list unreadable/timed out) on the pre-claim probe for $pick_id — no further candidate is claimed this sweep (fail-closed gates unchanged; the next sweep re-reads from scratch)."
+      break
     fi
 
     # ── ga-6hr8p7: skip a pool-routed candidate BEFORE the claim once this sweep's one slow spawn is spent ──
@@ -11872,6 +11958,13 @@ dispatch_lane() {
       _pilot_sweep_note "$pick_id" 1 "${DISPATCH_RESULT:-}"
       if [ "$_PCAP_CALL_QUEUED" != "1" ]; then
         NONQUEUE_FAILS=$((NONQUEUE_FAILS + 1))
+      fi
+      # ga-5je3zv: dispatch_one() reached its fail-closed count gate and could not READ the session count
+      # (first-sight candidate: the pre-claim probe only covers beads already committed to a pool). The claim
+      # was released by dispatch_one(); stop here rather than repeat claim → assemble → release for the rest.
+      if [ "${DISPATCH_RESULT:-}" = "rig_native_pool_count_unreadable" ]; then
+        _pilot_dispatch_halt "session-count-unreadable" "dispatch_one() could not read the live session count for $pick_id (session list unreadable/timed out) — no further candidate is claimed this sweep (fail-closed gates unchanged; the next sweep re-reads from scratch)."
+        break
       fi
     fi
 
@@ -11926,7 +12019,12 @@ fi
 # (HQ got at least one success this sweep — HQ keeps precedence, no rig scan).
 # Because DISPATCHED==0 implies neither lane consumed a slot, SMALL_SLOTS/
 # BIG_SLOTS (computed once in Step 1) are still the FULL free capacity here.
-if [ "$DISPATCHED" -eq "0" ] && [ -z "$STEP2C_RAN" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
+#
+# ga-5je3zv: skipped once the dispatch phase was HALTED (session count unreadable / time budget spent). The
+# rig scan only exists to find NEW candidates for the same lane loops, and those loops would stop at their
+# first iteration — so it would cost its Dolt reads for nothing, on the very box that just could not answer
+# `session list`. The halt reason was logged where it was decided.
+if [ "$DISPATCHED" -eq "0" ] && [ -z "$STEP2C_RAN" ] && [ -z "${_PILOT_HALT:-}" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
   log "ga-y1m40: HQ pool had candidate(s) but dispatched=0 this sweep (all vetoed/skipped?) — scanning rig DBs as fallback ..."
   _scan_rig_fallback_pool
   if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
@@ -11973,6 +12071,11 @@ fi
 
 if [ "$DISPATCHED" -eq "0" ]; then
   log "No dispatches this sweep (lane slots may have been won by a concurrent process, or all picks skipped)."
+fi
+# ga-5je3zv: one closing line when the dispatch phase was cut short, so a grep for the marker answers "did this
+# sweep stop early, and why" without reading the sweep (the WARN where it was decided is the first half of it).
+if [ -n "${_PILOT_HALT:-}" ]; then
+  log "ga-5je3zv: dispatch phase was HALTED this sweep (${_PILOT_HALT}) after $(( SECONDS - ${_PILOT_DISPATCH_T0:-$SECONDS} ))s; dispatched=$DISPATCHED — candidates not attempted stay story:approved for the next sweep."
 fi
 
 # ga-ov3gow: the sweep's ONE aggregate `pilot_sweep` line (schema: the block above dispatch_lane). After

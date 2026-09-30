@@ -6637,6 +6637,7 @@ run_capq_dispatch() {
     CAPQ_SPAWN_SLEEP="${CAPQ_SPAWN_SLEEP:-}" \
     CAPQ_TIMEOUT_KILL_SPAWN="${CAPQ_TIMEOUT_KILL_SPAWN:-}" \
     PILOT_SLOW_SPAWN_SECS="${PILOT_SLOW_SPAWN_SECS:-}" \
+    PILOT_DISPATCH_MAX_SECS="${PILOT_DISPATCH_MAX_SECS:-}" \
     PILOT_INFLIGHT_RETRIES=3 \
     PILOT_INFLIGHT_SLEEP=0 \
     DISPATCH_TO_CAPACITY=1 \
@@ -6799,9 +6800,20 @@ _cqi_warns=$(printf '%s\n' "$LOG_CQI" | grep -c 'ga-in9ebr: cannot read the wa-w
 echo "$LOG_CQI" | grep "ga-in9ebr: wa-capq2 QUEUED" >/dev/null \
   && bad "CAPQ-I: a bead was skipped on an UNREADABLE count — a blind probe must never suppress a dispatch" \
   || ok "CAPQ-I: no skip on an unreadable count"
-[ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ] \
-  && ok "CAPQ-I: the bead fell through to dispatch_one (claimed) — the PRE-claim probe still only skips on positive evidence (dispatch_one itself now fails CLOSED on an unreadable count: see CAPQ-P)" \
-  || bad "CAPQ-I: the bead never reached dispatch_one although the count was unreadable"
+# ga-5je3zv: this used to assert the bead was CLAIMED here ("fell through to dispatch_one"). That was true, and
+# it was the defect: since ga-oa004t dispatch_one() fails CLOSED on the same sticky unreadable flag, so the claim
+# could only ever end in claim → ~1 min of prompt assembly → release, for EVERY candidate (85 times in 79 min on
+# 2026-09-30, zero spawns). The pre-claim probe still never SKIPS a bead on a guess (no "QUEUED" line above) — it
+# HALTS the dispatch phase, and the bead stays exactly as it was: unclaimed, story:approved, gc.routed_to kept.
+[ "$(capq_n 'label add wa-capq2 pilot:dispatching')" = "0" ] \
+  && ok "CAPQ-I: the routed bead was NOT claimed on an unreadable count (ga-5je3zv) — dispatch_one() cannot spawn without the count, so the claim → assemble → release churn is what the halt removes" \
+  || bad "CAPQ-I: the routed bead was claimed although the count was unreadable — the pre-claim probe must halt the dispatch phase instead (ga-5je3zv)"
+echo "$LOG_CQI" | grep "ga-5je3zv: dispatch phase HALTED for the rest of this sweep (session-count-unreadable)" >/dev/null \
+  && ok "CAPQ-I: the halt is announced in the log (the blind spot is not silent)" \
+  || bad "CAPQ-I: no 'dispatch phase HALTED … (session-count-unreadable)' line — a halted sweep would look like an idle one"
+[ ! -s "$STATE/session_new.log" ] \
+  && ok "CAPQ-I: nothing was spawned" \
+  || bad "CAPQ-I: a worker session was spawned on an unreadable count"
 
 echo "Scenario CAPQ-I2 (ga-in9ebr): an UNREADABLE live count is probed ONCE per pool per sweep — each routed candidate must not pay another failing probe"
 # Relational, so it does not depend on how many `gc session list` calls dispatch_one() itself makes per
@@ -6820,8 +6832,14 @@ run_capq_dispatch "$CAPQ_NC3" "" "" "session-list-is-not-json" 0 0 >/dev/null; _
 # the candidate count AT ALL, with the pre-claim skip on or off. (It used to grow +1 per candidate through
 # dispatch_one()'s own fail-open re-probe — the very probe that read a timeout as "0 live" and spawned.) A flat
 # count could also mean the candidates never reached dispatch_one(), so "not vacuous" is proven twice: the
-# counter read real calls, AND all 3 candidates were claimed (reached dispatch_one and were refused there) in the
-# run whose count stayed flat ($STATE still holds that last run's bd calls).
+# counter read real calls, AND the candidates' claim counts are pinned for the last run (OFF, $STATE still holds
+# its bd calls).
+#
+# ga-5je3zv: the claim counts changed on purpose. Before, ALL 3 candidates were claimed, refused at dispatch_one()'s
+# fail-closed gate and released — the claim → assemble → release churn that held the StartInterval for 79 min on
+# 2026-09-30. Now an unreadable count HALTS the dispatch phase: with the pre-claim skip ON the probe fails on the
+# first routed candidate and NONE is claimed (asserted below); with it OFF the first candidate is the one that
+# finds out (in dispatch_one()) and ONLY it is claimed.
 if [ "$_nc_on1" -gt 0 ] 2>/dev/null && [ "$_nc_off1" -gt 0 ] 2>/dev/null; then
   ok "CAPQ-I2: harness counted real 'gc session list' calls (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — the counter is live"
 else
@@ -6831,9 +6849,17 @@ _nc_claimed=0
 for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
   [ "$(capq_n "label add $_nc_id pilot:dispatching")" -ge 1 ] && _nc_claimed=$((_nc_claimed + 1))
 done
-[ "$_nc_claimed" = "3" ] \
-  && ok "CAPQ-I2: all 3 candidates reached dispatch_one() (claimed) — a flat probe count is not because they were never tried" \
-  || bad "CAPQ-I2: only $_nc_claimed of 3 candidates reached dispatch_one() — the flat-count check below would be vacuous"
+[ "$_nc_claimed" = "1" ] && [ "$(capq_n "label add wa-nc4 pilot:dispatching")" -ge 1 ] \
+  && ok "CAPQ-I2: with the pre-claim skip OFF only the FIRST candidate (wa-nc4) reached dispatch_one() and found the count unreadable — the other 2 were never claimed (ga-5je3zv halt; was: all 3)" \
+  || bad "CAPQ-I2: $_nc_claimed of 3 candidates were claimed with the pre-claim skip OFF (first: $(capq_n "label add wa-nc4 pilot:dispatching")) — expected exactly the first; the dispatch phase should halt on the first unreadable count"
+_nc_on_claimed=0
+run_capq_dispatch "$CAPQ_NC3" "" "" "session-list-is-not-json" 0 1 >/dev/null
+for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
+  [ "$(capq_n "label add $_nc_id pilot:dispatching")" -ge 1 ] && _nc_on_claimed=$((_nc_on_claimed + 1))
+done
+[ "$_nc_on_claimed" = "0" ] \
+  && ok "CAPQ-I2: with the pre-claim skip ON none of the 3 routed candidates is claimed — the probe failing for the first halts the phase before any claim" \
+  || bad "CAPQ-I2: $_nc_on_claimed of 3 routed candidates were claimed on an unreadable count with the pre-claim skip ON — the halt did not fire before the claim"
 [ "$_nc_on3" = "$_nc_on1" ] && [ "$_nc_off3" = "$_nc_off1" ] \
   && ok "CAPQ-I2: extra routed candidates add NO 'session list' probe at all (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — after one unreadable probe every later gate fails fast" \
   || bad "CAPQ-I2: probe count grew with the candidate count (on: $_nc_on1→$_nc_on3, off: $_nc_off1→$_nc_off3) — a failing probe is re-paid per candidate, so a hung list stalls the sweep"
@@ -6872,9 +6898,14 @@ _cqi3_w=$(printf '%s\n' "$LOG_CQI3" | grep -c 'ga-in9ebr: cannot read the wa-wor
 # `timeout 10 gc session list | jq … || echo "0"`: a probe that timed out (7–10s measured under load 55+)
 # read as "0 live" and the bead was SPAWNED past the cap (2026-09-25: wa-worker at 5 active, cap 2 →
 # swap 9 GB → disk 4.4 GB). Unreadable must mean "do not spawn", and must read as a FAULT, not as a busy pool.
+# ga-5je3zv: the fixture is a FIRST-SIGHT bead (CAPQ_WA_FX, no gc.routed_to), not the routed one this scenario
+# used to run on. A routed bead no longer REACHES dispatch_one() under an unreadable count — the pre-claim probe
+# halts the dispatch phase first (CAPQ-I, HALT-A below) — so it would leave dispatch_one()'s own fail-closed gate
+# (the defence in depth this scenario pins) untested. A first-sight bead is exactly the one the pre-claim probe
+# cannot know about, so it is the one that still gets here.
 echo "Scenario CAPQ-P (ga-oa004t): an UNREADABLE live count at dispatch_one() spawns NOTHING — claim released, bead NOT in-flight, and the sweep is a FAULT (failed_other), not 'pool saturation'"
-LOG_CQP="$(run_capq_dispatch "$CAPQ_WA_ROUTED_FX" "" "" "session-list-is-not-json")"
-if [ "$(capq_n 'label add wa-capq2 pilot:dispatching')" -ge 1 ]; then
+LOG_CQP="$(run_capq_dispatch "$CAPQ_WA_FX" "" "" "session-list-is-not-json")"
+if [ "$(capq_n 'label add wa-capq1 pilot:dispatching')" -ge 1 ]; then
   ok "CAPQ-P: harness reached dispatch_one (the bead was claimed) — not a vacuous pass"
 else
   bad "CAPQ-P: the bead was never claimed — dispatch_one() was not reached, the assertions below prove nothing"
@@ -6885,10 +6916,10 @@ fi
 echo "$LOG_CQP" | grep -E 'ga-oa004t: cannot read the (global variable-session|wa-worker live session) count' >/dev/null \
   && ok "CAPQ-P: the refusal is announced in the log (ga-oa004t), not silent" \
   || bad "CAPQ-P: no 'ga-oa004t: cannot read the … count' line — an unreadable probe would be invisible"
-[ "$(capq_n 'label add wa-capq2 story:in-flight')" = "0" ] && [ "$(capq_n 'label add wa-capq2 pilot:dispatched')" = "0" ] \
+[ "$(capq_n 'label add wa-capq1 story:in-flight')" = "0" ] && [ "$(capq_n 'label add wa-capq1 pilot:dispatched')" = "0" ] \
   && ok "CAPQ-P: the bead is NOT marked in-flight/dispatched (no worker was assigned)" \
   || bad "CAPQ-P: the bead was marked in-flight/dispatched with no worker behind it (false 'em execução')"
-[ ! -f "$STATE/wa-capq2.dispatching" ] && grep -q 'released wa-capq2' "$STATE/releases.log" 2>/dev/null \
+[ ! -f "$STATE/wa-capq1.dispatching" ] && grep -q 'released wa-capq1' "$STATE/releases.log" 2>/dev/null \
   && ok "CAPQ-P: the claim (pilot:dispatching) was RELEASED" \
   || bad "CAPQ-P: the claim was NOT released — the bead would sit claimed until the TTL recovery"
 [ "$(capq_n 'set-metadata gc.routed_to=wa-worker')" -ge 1 ] && [ "$(capq_n 'unset-metadata gc.routed_to')" = "0" ] \
@@ -7130,6 +7161,98 @@ LOG_SWF="$(run_dispatch "")"
 sweep_expect '.dry_run' '"1"'           "SWEEP-F: dry_run is the string '1' (same encoding as pilot_dispatch.dry_run)"
 sweep_expect '(.dispatched >= 1)' 'true' "SWEEP-F: the simulated dispatch is counted in dispatched"
 sweep_expect "$SWEEP_CLOSES" 'true'     "SWEEP-F: the buckets add up to candidates"
+
+# ── Scenario HALT (ga-5je3zv): an UNREADABLE session count halts the dispatch phase; the phase has a time budget ──
+# Incident (30/09 18:44→20:14): ONE `gc session list` read timed out; the sticky unreadable flag then made every
+# spawn gate fail (correctly — fail-CLOSED, ga-oa004t) but the lane loop kept going: for each of the 85 approved
+# beads it claimed, chose a builder, assembled the prompt (~1 min), hit the count gate, failed and released the
+# claim. Zero spawns in 79 min, the launchd StartInterval held the whole time. These are the RUNTIME scenarios
+# (real dispatch_one → dispatch_lane → sweep event on the CAPQ harness); the loop's decisions are unit-proven,
+# with stubs, in pilot-dispatcher.count-unreadable-halt.selftest.sh. An error envelope ({"ok":false,…}) is how
+# the harness's `gc session list` fails: it parses as JSON and carries no .sessions, i.e. UNKNOWN, never zero.
+HALT_DEAD_LIST='{"ok":false,"error":{"code":"native_store_unavailable","message":"sessions unavailable"}}'
+halt_claimed() { # <id>... — how many of these beads were CLAIMED (pilot:dispatching written) this sweep
+  local _n=0 _i
+  for _i in "$@"; do [ "$(capq_n "label add $_i pilot:dispatching")" -ge 1 ] && _n=$((_n + 1)); done
+  printf '%s' "$_n"
+}
+halt_spawns() { local _c; _c=$(grep -c 'session new' "$STATE/session_new.log" 2>/dev/null) || _c=0; printf '%s' "${_c:-0}"; }
+
+echo "Scenario HALT-A (ga-5je3zv): 3 beads ROUTED to wa-worker + a dead 'session list' — the pre-claim probe halts the dispatch phase: NOTHING is claimed, nothing spawned, ONE log line"
+HALT_A_FX="[$(capq_bead wa-ha1 10 wa-worker whatsapp_automation),$(capq_bead wa-ha2 11 wa-worker whatsapp_automation),$(capq_bead wa-ha3 12 wa-worker whatsapp_automation)]"
+LOG_HA="$(run_capq_dispatch "$HALT_A_FX" "" "" "$HALT_DEAD_LIST")"
+_ha_n=$(printf '%s\n' "$LOG_HA" | grep -c 'dispatch phase HALTED for the rest of this sweep (session-count-unreadable)') || _ha_n=0
+[ "$_ha_n" = "1" ] \
+  && ok "HALT-A: the halt is logged exactly ONCE (and is what this scenario reached — not a vacuous pass)" \
+  || bad "HALT-A: expected exactly ONE 'dispatch phase HALTED … (session-count-unreadable)' line, saw $_ha_n"
+[ "$(halt_claimed wa-ha1 wa-ha2 wa-ha3)" = "0" ] \
+  && ok "HALT-A: NONE of the 3 beads was claimed — no claim → assemble → release churn on a dispatch that cannot happen (was: all 3)" \
+  || bad "HALT-A: $(halt_claimed wa-ha1 wa-ha2 wa-ha3) of 3 beads were claimed under an unreadable count — the sweep still pays the per-candidate price"
+[ "$(halt_spawns)" = "0" ] \
+  && ok "HALT-A: nothing was spawned (fail-closed gates unchanged)" \
+  || bad "HALT-A: $(halt_spawns) worker session(s) spawned on an unreadable count"
+_ha_close=$(printf '%s\n' "$LOG_HA" | grep -c 'ga-5je3zv: dispatch phase was HALTED this sweep (session-count-unreadable)') || _ha_close=0
+[ "$_ha_close" = "1" ] \
+  && ok "HALT-A: ONE closing line says the sweep was cut short and why (grep-able, next to the sweep summary)" \
+  || bad "HALT-A: expected exactly one closing 'dispatch phase was HALTED this sweep' line, saw $_ha_close"
+sweep_expect '.halted' '"session-count-unreadable"' "HALT-A: the pilot_sweep event carries halted=\"session-count-unreadable\""
+sweep_expect '.candidates' '1'                     "HALT-A: only the candidate that met the dead probe is counted — the other 2 were never attempted"
+sweep_expect '.failed_other' '1'                   "HALT-A: … under failed_other (a FAULT)"
+sweep_expect '.results' '{"rig_native_pool_count_unreadable":1}' "HALT-A: results names it (rig_native_pool_count_unreadable)"
+sweep_expect '(.queued_pool_cap + .queued_global_cap)' '0' "HALT-A: … and NOT under a *_queued bucket (a dead session list is not a busy pool)"
+sweep_expect '.pool_saturated' '0'                 "HALT-A: pool_saturated=0"
+sweep_expect "$SWEEP_CLOSES" 'true'                "HALT-A: the buckets still add up to candidates"
+if printf '%s\n' "$LOG_HA" | grep "POOL-SATURATED sweep" >/dev/null; then
+  bad "HALT-A: a halted sweep was reported as POOL-SATURATED ('backpressure, not a stall') — the stall gate would never see a dead session list"
+else
+  ok "HALT-A: NOT reported as POOL-SATURATED"
+fi
+[ -f "$FIXCITY/.gc/pilot-dispatcher-stall.count" ] \
+  && ok "HALT-A: the halted sweep still feeds the Step 5 stall streak (dispatched=0 with free slots is exactly what it is)" \
+  || bad "HALT-A: the halted sweep left no stall-streak record — a run of halted sweeps would never page"
+
+echo "Scenario HALT-B (ga-5je3zv): 3 FIRST-SIGHT beads + a dead 'session list' — the first one finds out in dispatch_one() (claim released), the phase halts: the other 2 are never claimed"
+HALT_B_FX="[$(capq_bead wa-hb1 10 '' whatsapp_automation),$(capq_bead wa-hb2 11 '' whatsapp_automation),$(capq_bead wa-hb3 12 '' whatsapp_automation)]"
+LOG_HB="$(run_capq_dispatch "$HALT_B_FX" "" "" "$HALT_DEAD_LIST")"
+_hb_claimed=$(halt_claimed wa-hb1 wa-hb2 wa-hb3)
+[ "$_hb_claimed" = "1" ] \
+  && ok "HALT-B: exactly ONE bead was claimed (it reached dispatch_one()'s fail-closed gate) — was: all 3 (85 of 85 in the incident)" \
+  || bad "HALT-B: $_hb_claimed of 3 first-sight beads were claimed — expected exactly 1; the loop keeps paying claim → assemble → release"
+echo "$LOG_HB" | grep 'ga-oa004t: cannot read the .* count' >/dev/null \
+  && ok "HALT-B: the harness reached dispatch_one()'s fail-closed count gate (not a vacuous pass)" \
+  || bad "HALT-B: dispatch_one()'s count gate was never reached — the assertions above/below prove nothing"
+echo "$LOG_HB" | grep 'dispatch_one() could not read the live session count' >/dev/null \
+  && ok "HALT-B: the halt names the in-arm path that found the dead count" \
+  || bad "HALT-B: no halt line for the in-arm path"
+[ "$(halt_spawns)" = "0" ] && ok "HALT-B: nothing spawned" || bad "HALT-B: $(halt_spawns) worker session(s) spawned on an unreadable count"
+sweep_expect '.halted' '"session-count-unreadable"' "HALT-B: the event carries halted"
+sweep_expect '.candidates' '1'                      "HALT-B: candidates=1 (the 2 un-attempted are not counted)"
+sweep_expect '.results' '{"rig_native_pool_count_unreadable":1}' "HALT-B: results names the failure"
+sweep_expect "$SWEEP_CLOSES" 'true'                 "HALT-B: the buckets still add up to candidates"
+
+echo "Scenario HALT-C (control, ga-5je3zv): the SAME 3 first-sight beads with a READABLE list — no halt, all 3 claimed and spawned (the halt does not over-block)"
+LOG_HC="$(run_capq_dispatch "$HALT_B_FX" "" "" '{"sessions":[]}')"
+if [ "$(halt_claimed wa-hb1 wa-hb2 wa-hb3)" = "3" ] && [ "$(halt_spawns)" = "3" ]; then
+  ok "HALT-C: 3 claimed, 3 spawned"
+else
+  bad "HALT-C: claimed=$(halt_claimed wa-hb1 wa-hb2 wa-hb3) spawned=$(halt_spawns) — expected 3/3 on a readable list (the halt over-blocks, or the harness changed)"
+fi
+echo "$LOG_HC" | grep 'dispatch phase HALTED' >/dev/null \
+  && bad "HALT-C: a halt fired on a READABLE session list" \
+  || ok "HALT-C: no halt line"
+sweep_expect '.halted' 'null'                        "HALT-C: the event says halted=null for a sweep that ran to the end"
+
+echo "Scenario HALT-D (ga-5je3zv): the dispatch phase has a TIME BUDGET — PILOT_DISPATCH_MAX_SECS=1 with a 2 s spawn: the first bead spawns, the budget is spent, the other 2 are not started"
+LOG_HD="$(PILOT_DISPATCH_MAX_SECS=1 CAPQ_SPAWN_SLEEP=2 run_capq_dispatch "$HALT_B_FX" "" "" '{"sessions":[]}')"
+[ "$(halt_spawns)" = "1" ] && [ "$(halt_claimed wa-hb1 wa-hb2 wa-hb3)" = "1" ] \
+  && ok "HALT-D: 1 bead claimed and spawned, then the budget stopped the loop (was: all 3, with no bound on how long)" \
+  || bad "HALT-D: claimed=$(halt_claimed wa-hb1 wa-hb2 wa-hb3) spawned=$(halt_spawns) — expected 1/1; nothing bounds the dispatch phase"
+echo "$LOG_HD" | grep -F 'dispatch phase HALTED for the rest of this sweep (time-budget)' >/dev/null \
+  && ok "HALT-D: the halt says time-budget and (see the line) names PILOT_DISPATCH_MAX_SECS" \
+  || bad "HALT-D: no 'dispatch phase HALTED … (time-budget)' line"
+sweep_expect '.halted' '"time-budget"'               "HALT-D: the event carries halted=\"time-budget\""
+sweep_expect '.dispatched' '1'                       "HALT-D: the dispatch that was already in flight completed (the budget never kills one)"
+sweep_expect "$SWEEP_CLOSES" 'true'                  "HALT-D: the buckets still add up to candidates"
 
 # ── Scenario SPAWN (ga-6hr8p7): the spawn budget — 150 s by default, ONE slow spawn per sweep ─────────────
 # Incident (30/09): `gc session new` took 38 s by hand at load ~40 and 60+ s at load 50-80, and every spawn was
