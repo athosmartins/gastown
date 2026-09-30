@@ -4934,6 +4934,141 @@ rebase_deploy_deps_verdict() {
   echo "yes"
 }
 
+# rebase_union_blob_to_file <gd> <rev> <path> <outfile> <max_bytes>   (ga-5w2gpw item b)
+# Writes <rev>:<path> to <outfile>. Three outcomes, never two (error != empty):
+#   rc 0  the file was written — an ABSENT path writes an EMPTY file (the path simply is not in that tree)
+#   rc 2  unreadable (ls-tree / cat-file failed)        rc 3  not a regular file (symlink, submodule, tree)
+#   rc 4  larger than <max_bytes>
+rebase_union_blob_to_file() {
+  local gd="$1" rev="$2" path="$3" out="$4" max="$5" ent mode type oid sz
+  if ! ent=$(git --git-dir="$gd" ls-tree "$rev" -- "$path" 2>/dev/null); then return 2; fi
+  if [ -z "$ent" ]; then : > "$out"; return 0; fi
+  mode=$(printf '%s' "$ent" | cut -d' ' -f1)
+  type=$(printf '%s' "$ent" | cut -d' ' -f2)
+  oid=$(printf '%s' "$ent" | cut -d' ' -f3 | cut -f1)
+  if [ "$type" != "blob" ]; then return 3; fi
+  case "$mode" in 100644|100755) : ;; *) return 3 ;; esac
+  case "$oid" in *[!0-9a-f]*|"") return 2 ;; esac
+  if ! sz=$(git --git-dir="$gd" cat-file -s "$oid" 2>/dev/null); then return 2; fi
+  case "$sz" in ''|*[!0-9]*) return 2 ;; esac
+  if [ "$sz" -gt "$max" ]; then return 4; fi
+  if ! git --git-dir="$gd" cat-file blob "$oid" > "$out" 2>/dev/null; then return 2; fi
+  return 0
+}
+
+# rebase_union_paths_verdict <gd> <main_ref> <orig_tip> <new_tip> <expected_tree> <actual_tree>   (ga-5w2gpw item b)
+# Called ONLY by rebase_content_verdict(), and ONLY once the resulting tree differs from the reference merge.
+# Echoes exactly one of:
+#   yes              every path on which the two trees differ is declared merge=union at <new_tip>, and in each
+#                    of them NO LINE WAS LOST (below)
+#   no               all of them are union paths, and at least one lost a line (or carries conflict markers)
+#   not-applicable   some differing path is NOT a union path (or nothing declares merge=union at all): this is
+#                    not this function's question — the caller keeps the answer it always had
+#   unknown:union-*  could not tell (diff error, unreadable blob, not a regular file, past the size cap, no
+#                    merge-base, a C-quoted path, a check-attr failure): never yes, never no
+#
+# WHY this exists: for a merge=union path "the rebased tree equals the reference merge" is the WRONG question.
+# union keeps BOTH sides' lines and is not associative: a rebase replays the branch commit by commit, so each
+# intermediate step unions differently from one union of the two end states. The trees then differ by ORDER,
+# by a residue line an intermediate commit added and a later one edited away, or by a duplicated block one side
+# keeps and the other collapses — with nothing lost on either side. whatsapp_automation declares exactly that for
+# docs/data_dictionary.md (the append-only atlas every crew edits) and the gate refused 3 pushes on 30/09 alone
+# ("content verdict=no … Diverging paths: docs/data_dictionary.md"), each failing a review-approved PASS as
+# failed_merge_time_rebase. ga-ub5hkz fixed the sibling deploy_deps.json case; this is the same class.
+#
+# THE QUESTION ASKED INSTEAD — "was any line lost?" — by multiset arithmetic over four blobs: B = merge-base,
+# M = main, O = the branch tip (what the author submitted), A = the resulting tip. For every distinct non-blank
+# line l, with c_X(l) its count in X:
+#     need(l) = max(0, c_O(l)-c_B(l))        what the branch added
+#             + max(0, c_M(l)-c_B(l))        what main added
+#             + min(c_B(l), c_M(l), c_O(l))  what nobody touched
+#     lost    iff c_A(l) < need(l)
+# A line one side deleted and the other left alone needs nothing (either outcome is a legitimate union result);
+# a line both sides added is needed twice (union keeps both). Blank lines are ignored (markdown is full of them).
+# STRICT ON PURPOSE: a legitimate outcome this rejects stays "no" — exactly today's behaviour — whereas accepting a
+# loss is the silent content loss ga-m07gc exists to stop. Conflict markers in A that none of B/M/O carries are
+# corruption, not content, and read "no".
+#
+# Scope is what .gitattributes at <new_tip> declares (filtered to git's built-in drivers, as ga-stisew does) and
+# resolved with `git check-attr`, so a custom driver (merge=deploydeps) is never treated as union. Regular files
+# only, at most GATE_UNION_VERDICT_MAX_BYTES (default 2000000) each. Always returns 0 (callers run under set -e).
+rebase_union_paths_verdict() {
+  local gd="$1" main_ref="$2" orig_tip="$3" new_tip="$4" expected="$5" actual="$6"
+  local diffout diff_rc attrs_file p driver base_sha max_bytes rc
+  local fb fm fo fa any_loss=0 npaths=0 detail
+  max_bytes="${GATE_UNION_VERDICT_MAX_BYTES:-2000000}"
+  case "$max_bytes" in ''|*[!0-9]*) max_bytes=2000000 ;; esac
+  diffout=$(git --git-dir="$gd" diff-tree -r --no-renames --name-only "$expected" "$actual" 2>/dev/null); diff_rc=$?
+  if [ "$diff_rc" -ne 0 ]; then echo "unknown:union-diff-error"; return 0; fi
+  if [ -z "$diffout" ]; then echo "not-applicable"; return 0; fi
+  attrs_file=$(rebase_git_attributes_file "$gd" "$new_tip")
+  if [ -z "$attrs_file" ]; then echo "not-applicable"; return 0; fi
+  # 1. EVERY differing path must be declared merge=union — one foreign path and this is not our question.
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    case "$p" in \"*) rm -f "$attrs_file"; echo "unknown:union-quoted-path"; return 0 ;; esac
+    if ! driver=$(git --git-dir="$gd" -c core.attributesFile="$attrs_file" check-attr merge -- "$p" 2>/dev/null | sed -n 's/^.*: merge: //p'); then
+      rm -f "$attrs_file"; echo "unknown:union-attr-error"; return 0
+    fi
+    if [ "$driver" != "union" ]; then rm -f "$attrs_file"; echo "not-applicable"; return 0; fi
+    npaths=$((npaths + 1))
+  done <<< "$diffout"
+  rm -f "$attrs_file"
+  if [ "$npaths" -eq 0 ]; then echo "not-applicable"; return 0; fi
+  # 2. the three-way base (what the author's branch forked from).
+  if ! base_sha=$(git --git-dir="$gd" merge-base "$main_ref" "$orig_tip" 2>/dev/null) || [ -z "$base_sha" ]; then
+    echo "unknown:union-no-merge-base"; return 0
+  fi
+  # 3. per path: line arithmetic.
+  fb=$(mktemp "${TMPDIR:-/tmp}/gc-gate-union-b.XXXXXX" 2>/dev/null) || { echo "unknown:union-no-tmp"; return 0; }
+  fm=$(mktemp "${TMPDIR:-/tmp}/gc-gate-union-m.XXXXXX" 2>/dev/null) || { rm -f "$fb"; echo "unknown:union-no-tmp"; return 0; }
+  fo=$(mktemp "${TMPDIR:-/tmp}/gc-gate-union-o.XXXXXX" 2>/dev/null) || { rm -f "$fb" "$fm"; echo "unknown:union-no-tmp"; return 0; }
+  fa=$(mktemp "${TMPDIR:-/tmp}/gc-gate-union-a.XXXXXX" 2>/dev/null) || { rm -f "$fb" "$fm" "$fo"; echo "unknown:union-no-tmp"; return 0; }
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    rc=0
+    rebase_union_blob_to_file "$gd" "$base_sha" "$p" "$fb" "$max_bytes" || rc=$?
+    [ "$rc" -eq 0 ] && { rebase_union_blob_to_file "$gd" "$main_ref" "$p" "$fm" "$max_bytes" || rc=$?; }
+    [ "$rc" -eq 0 ] && { rebase_union_blob_to_file "$gd" "$orig_tip" "$p" "$fo" "$max_bytes" || rc=$?; }
+    [ "$rc" -eq 0 ] && { rebase_union_blob_to_file "$gd" "$new_tip" "$p" "$fa" "$max_bytes" || rc=$?; }
+    case "$rc" in
+      0) : ;;
+      4) rm -f "$fb" "$fm" "$fo" "$fa"; echo "unknown:union-too-large"; return 0 ;;
+      3) rm -f "$fb" "$fm" "$fo" "$fa"; echo "unknown:union-not-regular-file"; return 0 ;;
+      *) rm -f "$fb" "$fm" "$fo" "$fa"; echo "unknown:union-unreadable"; return 0 ;;
+    esac
+    # Tag every line with its source (1=B 2=M 3=O 4=A) so ONE awk sees all four — an EMPTY blob has no first
+    # line, so counting files by FNR==1 would silently renumber the rest.
+    if ! detail=$( { awk '{ print 1 "\t" $0 }' "$fb"; awk '{ print 2 "\t" $0 }' "$fm"
+                     awk '{ print 3 "\t" $0 }' "$fo"; awk '{ print 4 "\t" $0 }' "$fa"; } | awk '
+        { i = index($0, "\t"); t = substr($0, 1, i - 1); l = substr($0, i + 1)
+          if (l ~ /^[ \t\r]*$/) next
+          c[t SUBSEP l]++; seen[l] = 1 }
+        END {
+          for (l in seen) {
+            cb = c[1 SUBSEP l] + 0; cm = c[2 SUBSEP l] + 0; co = c[3 SUBSEP l] + 0; ca = c[4 SUBSEP l] + 0
+            ao = (co > cb) ? co - cb : 0; am = (cm > cb) ? cm - cb : 0
+            k = cb; if (cm < k) k = cm; if (co < k) k = co
+            need = ao + am + k
+            if (ca < need) print "LOST x" (need - ca) ": " l
+            if ((l ~ /^(<<<<<<<|>>>>>>>) / || l == "=======") && ca > cb && ca > cm && ca > co) print "MARKER: " l
+          }
+        }' ); then
+      rm -f "$fb" "$fm" "$fo" "$fa"; echo "unknown:union-awk-failed"; return 0
+    fi
+    if [ -n "$detail" ]; then
+      any_loss=1
+      if [ "$(type -t log 2>/dev/null)" = "function" ]; then
+        # awk NR<=3 drains its whole input — `| head -3` would close early and SIGPIPE the writer (C11).
+        log "rebase_union_paths_verdict: $p (merge=union) LOST content vs branch/main/base — $(printf '%s\n' "$detail" | awk 'NR <= 3 { printf "%s; ", $0 }' | cut -c1-300)" >&2
+      fi
+    fi
+  done <<< "$diffout"
+  rm -f "$fb" "$fm" "$fo" "$fa"
+  if [ "$any_loss" -eq 1 ]; then echo "no"; else echo "yes"; fi
+  return 0
+}
+
 # rebase_content_verdict <worktree> <main_ref> <orig_tip> <new_tip>
 #   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
 #                   (ga-r5dsgp: OU o merge-tree conflitou SO em
@@ -5104,6 +5239,20 @@ rebase_content_verdict() {
   esac
   if [ "${#actual}" -ne 40 ]; then echo "unknown:bad-actual-sha"; return 0; fi
   if [ "$expected" = "$actual" ]; then echo "yes"; return 0; fi
+  # ga-5w2gpw (b): the trees differ. If EVERY path where they differ is declared merge=union, tree
+  # equality is the wrong question (union is not associative — a commit-by-commit rebase and one union of
+  # the end states legitimately differ in order / residue / duplicates); ask "was a line lost?" instead. See
+  # rebase_union_paths_verdict(). Only the literal yes / no / unknown:* answer here; "not-applicable" (a
+  # foreign path differs, or no union declaration) — and anything unrecognised — falls through to the
+  # deploy_deps arbiter below exactly as before, whose default for any other mismatch is "no".
+  local uv
+  uv=$(rebase_union_paths_verdict "$gd" "$main_ref" "$orig_tip" "$new_tip" "$expected" "$actual")
+  case "$uv" in
+    yes) echo "yes"; return 0 ;;
+    no) echo "no"; return 0 ;;
+    unknown:*) echo "$uv"; return 0 ;;
+    *) : ;;
+  esac
   # ga-ub5hkz: the trees differ. That is "no" — unless the ONLY difference is
   # daemons/deploy_deps.json, in which case the reference side may be the wrong
   # one: the reference merge leaves the custom merge driver out (ga-stisew), so
@@ -5874,10 +6023,15 @@ gate_noeval_requeue_decision() {
   _next=$((_cur + 1))
   bd -C "$GC_CITY" label add "$_id" "gate:noeval-requeue:$_next" -q 2>/dev/null || true
   # Verify by READING IT BACK (a fire-and-forget `|| true` write proves nothing — ga-6dp9).
-  if ! _back=$(gate_marker_label_snapshot "$_id") \
-     || ! printf '%s\n' "$_back" | tr ' ' '\n' | grep -qx "gate:noeval-requeue:$_next"; then
+  # The snapshot is space-joined, so membership is a `case`, not `printf | grep -q`: under pipefail grep -q
+  # exits on the first match, printf can take a SIGPIPE, and a TRUE match then reads as "not recorded".
+  if ! _back=$(gate_marker_label_snapshot "$_id"); then
     printf 'fail:not-recorded\n'; return 0
   fi
+  case " $_back " in
+    *" gate:noeval-requeue:$_next "*) : ;;
+    *) printf 'fail:not-recorded\n'; return 0 ;;
+  esac
   for _l in $(printf '%s\n' "$_labels" | tr ' ' '\n' | grep '^gate:noeval-requeue:'); do
     [ "$_l" = "gate:noeval-requeue:$_next" ] && continue
     bd -C "$GC_CITY" label remove "$_id" "$_l" -q 2>/dev/null || true
