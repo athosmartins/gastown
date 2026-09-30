@@ -60,10 +60,21 @@ gate_diff_summary() {
 #   any cwd (the gate's subdirectory and the builder's toplevel then render the same payload) and `literal` keeps a name
 #   containing * or [ from being read as a glob. A file whose per-file diff still comes back empty is listed as omitted, never
 #   counted as shown: an empty answer is not the same thing as "shown, and there was nothing to see".
+#   ga-5w2gpw (E6 item d): "whole" is decided by TWO ceilings, lines AND bytes. The line budget (arg 6, default 6000) and
+#   GATE_DIFF_BYTE_BUDGET (env, default 400000, 0 = no byte ceiling). Measured on the E4 dataset (182 partial runs of 2,628):
+#   median 2,837 diff lines, p90 6,476, max 13,607 — the old 2000-line default cut a diff of ordinary size, and 89% of those runs
+#   fit in 6000 lines. But the task travels as ONE command-line argument (macOS ARG_MAX is 1,048,576 bytes for args + env) and
+#   fills the reviewer context, and both are BYTES: stored tasks reach 193 KB at 2,003 lines and dense diffs run 450 B/line,
+#   so 6000 lines alone could hand one reviewer 900 KB. A diff over either ceiling is coverage=partial; its header names the
+#   bytes when they are what tripped it. A single file bigger than a ceiling is still shown whole (the first-file rule below),
+#   which leaves coverage=partial with nothing omitted: the payload is complete but too large to hand over, and the caller
+#   (the gate) must treat that like any other partial. DIFF_RAW_TOTAL_BYTES is the byte length of the whole diff;
+#   DIFF_LIMIT_LINES / DIFF_LIMIT_BYTES are the ceilings actually applied, so a caller can quote them without re-deriving the
+#   defaults (and a garbage value falls back to the default, never to "no ceiling").
 #   COVERAGE, for the caller that has to act on it (the header above is prose for the reviewer; these are for code). Three
 #   states, because "the reviewer was shown all of it", "shown part of it" and "we cannot tell" must not read the same:
-#     DIFF_COVERAGE      full     the whole diff is in the payload (within budget, and it has text)
-#                        partial  over budget: DIFF_SHOWN_FILES of the file_count files are in it, DIFF_SHOWN_LINES of the
+#     DIFF_COVERAGE      full     the whole diff is in the payload (within BOTH ceilings, and it has text)
+#                        partial  over a ceiling: DIFF_SHOWN_FILES of the file_count files are in it, DIFF_SHOWN_LINES of the
 #                                 DIFF_RAW_TOTAL_LINES lines; DIFF_OMITTED_LIST names the rest (one "  - <file>" per line)
 #                        unknown  the whole-diff read came back empty (see KNOWN LIMIT): "shown in full" would be a guess
 #     DIFF_SHOWN_FILES / DIFF_SHOWN_LINES / DIFF_OMITTED_LIST as above (0 / 0 / "" for full and unknown).
@@ -76,19 +87,40 @@ gate_diff_summary() {
 #   dispatcher does not yet; changing it means changing what the production gate does on a git failure, a separate bead.
 gate_build_diff_payload() {
   local _git_fn="${1:-}" _base="${2:-}" _head="${3:-}" _changed_files="${4:-}"
-  local _file_count="${5:-0}" _budget="${6:-2000}" _escape_hatch_cmd="${7:-}"
-  local DIFF_RAW="" _df="" _FILE_DIFF="" _FILE_DIFF_LINES=0
-  local _DIFF_SHOWN_LINES=0 _DIFF_SHOWN_FILES=0 DIFF_OMITTED_FILES=""
+  local _file_count="${5:-0}" _budget="${6:-6000}" _escape_hatch_cmd="${7:-}"
+  local _byte_budget="${GATE_DIFF_BYTE_BUDGET:-400000}"
+  local DIFF_RAW="" _df="" _FILE_DIFF="" _FILE_DIFF_LINES=0 _FILE_DIFF_BYTES=0
+  local _DIFF_SHOWN_LINES=0 _DIFF_SHOWN_BYTES=0 _DIFF_SHOWN_FILES=0 DIFF_OMITTED_FILES=""
+  local _over=0 _over_bytes=0 _fits=1 _scope="" _counts_ok=1 _sz_ok=1
+  case "$_budget" in ''|*[!0-9]*) _budget=6000 ;; esac
+  case "$_byte_budget" in ''|*[!0-9]*) _byte_budget=400000 ;; esac
   DIFF_COVERAGE="unknown"; DIFF_SHOWN_FILES=0; DIFF_SHOWN_LINES=0; DIFF_OMITTED_LIST=""
+  DIFF_LIMIT_LINES="$_budget"; DIFF_LIMIT_BYTES="$_byte_budget"
 
   DIFF_RAW=$("$_git_fn" diff "$_base...$_head" 2>/dev/null || true)
   if [ -z "$DIFF_RAW" ]; then
     DIFF_RAW_TOTAL_LINES=0
+    DIFF_RAW_TOTAL_BYTES=0
   else
     DIFF_RAW_TOTAL_LINES=$(printf '%s\n' "$DIFF_RAW" | wc -l | tr -d ' ')
+    DIFF_RAW_TOTAL_BYTES=$(printf '%s\n' "$DIFF_RAW" | wc -c | tr -d ' ')
   fi
 
-  if [ "$DIFF_RAW_TOTAL_LINES" -le "$_budget" ]; then
+  # A count that did not come back as a number is NOT "within budget". The old check was `[ lines -le budget ]`, which failed
+  # CLOSED: a garbage count made `[` error and the code fell into the partial branch. Flipped to `-gt` the same garbage would
+  # read as "not over" and hand a reviewer a payload nobody measured — so the numbers are validated first, and a bad one is
+  # over (partial, which the gate parks), never whole.
+  _counts_ok=1
+  case "$DIFF_RAW_TOTAL_LINES" in ''|*[!0-9]*) _counts_ok=0 ;; esac
+  case "$DIFF_RAW_TOTAL_BYTES" in ''|*[!0-9]*) _counts_ok=0 ;; esac
+  if [ "$_counts_ok" = "0" ]; then
+    _over=1
+  else
+    if [ "$DIFF_RAW_TOTAL_LINES" -gt "$_budget" ]; then _over=1; fi
+    if [ "$_byte_budget" -gt 0 ] && [ "$DIFF_RAW_TOTAL_BYTES" -gt "$_byte_budget" ]; then _over=1; _over_bytes=1; fi
+  fi
+
+  if [ "$_over" = "0" ]; then
     DIFF_FULL="$DIFF_RAW"
     DIFF_HEADER="FULL DIFF (complete — $DIFF_RAW_TOTAL_LINES lines across $_file_count file(s), nothing omitted):"
     # An empty read is not "the whole diff was shown" (KNOWN LIMIT above): only a diff that HAS text is full coverage.
@@ -104,12 +136,27 @@ gate_build_diff_payload() {
         continue
       fi
       _FILE_DIFF_LINES=$(printf '%s\n' "$_FILE_DIFF" | wc -l | tr -d ' ')
+      _FILE_DIFF_BYTES=$(printf '%s\n' "$_FILE_DIFF" | wc -c | tr -d ' ')
+      # Same rule as an empty per-file diff: a file whose size did not come back as a number cannot be placed, so it is listed
+      # as omitted and never counted as shown (and arithmetic on a non-number would abort a `set -u` caller, the dispatcher).
+      _sz_ok=1
+      case "$_FILE_DIFF_LINES" in ''|*[!0-9]*) _sz_ok=0 ;; esac
+      case "$_FILE_DIFF_BYTES" in ''|*[!0-9]*) _sz_ok=0 ;; esac
+      if [ "$_sz_ok" = "0" ]; then
+        DIFF_OMITTED_FILES="${DIFF_OMITTED_FILES}  - ${_df} (its size could not be measured - not shown)
+"
+        continue
+      fi
+      _fits=1
+      if [ $((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES)) -gt "$_budget" ]; then _fits=0; fi
+      if [ "$_byte_budget" -gt 0 ] && [ $((_DIFF_SHOWN_BYTES + _FILE_DIFF_BYTES)) -gt "$_byte_budget" ]; then _fits=0; fi
       # Always take at least the first file whole (even if it alone exceeds the
       # budget) — one complete file beats zero, and this still never cuts a hunk.
-      if [ $((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES)) -le "$_budget" ] || [ "$_DIFF_SHOWN_FILES" = "0" ]; then
+      if [ "$_fits" = "1" ] || [ "$_DIFF_SHOWN_FILES" = "0" ]; then
         DIFF_FULL="${DIFF_FULL}${_FILE_DIFF}
 "
         _DIFF_SHOWN_LINES=$((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES))
+        _DIFF_SHOWN_BYTES=$((_DIFF_SHOWN_BYTES + _FILE_DIFF_BYTES))
         _DIFF_SHOWN_FILES=$((_DIFF_SHOWN_FILES + 1))
       else
         DIFF_OMITTED_FILES="${DIFF_OMITTED_FILES}  - ${_df}
@@ -117,7 +164,10 @@ gate_build_diff_payload() {
       fi
     done <<< "$_changed_files"
 
-    DIFF_HEADER="PARTIAL DIFF — showing $_DIFF_SHOWN_FILES of $_file_count files ($_DIFF_SHOWN_LINES of $DIFF_RAW_TOTAL_LINES total diff lines). DO NOT treat the omitted files below as reviewed — you have not seen them:
+    # The wording of a LINE-driven partial is unchanged; bytes are named only when the byte ceiling is part of the reason.
+    _scope="$_DIFF_SHOWN_LINES of $DIFF_RAW_TOTAL_LINES total diff lines"
+    if [ "$_over_bytes" = "1" ]; then _scope="$_scope, $_DIFF_SHOWN_BYTES of $DIFF_RAW_TOTAL_BYTES bytes"; fi
+    DIFF_HEADER="PARTIAL DIFF — showing $_DIFF_SHOWN_FILES of $_file_count files ($_scope). DO NOT treat the omitted files below as reviewed — you have not seen them:
 OMITTED FILES ($((_file_count - _DIFF_SHOWN_FILES))):
 ${DIFF_OMITTED_FILES}To review the FULL diff yourself: $_escape_hatch_cmd"
     DIFF_COVERAGE="partial"; DIFF_SHOWN_FILES="$_DIFF_SHOWN_FILES"; DIFF_SHOWN_LINES="$_DIFF_SHOWN_LINES"; DIFF_OMITTED_LIST="$DIFF_OMITTED_FILES"

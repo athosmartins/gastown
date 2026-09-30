@@ -246,12 +246,24 @@ GATE_SPAWN_STAGGER_SECS="${GATE_SPAWN_STAGGER_SECS:-3}"
 case "$GATE_SPAWN_STAGGER_SECS" in ''|*[!0-9]*) GATE_SPAWN_STAGGER_SECS=3 ;; esac
 [ "$GATE_SPAWN_STAGGER_SECS" -gt 15 ] 2>/dev/null && GATE_SPAWN_STAGGER_SECS=15
 
-# ga-p4g6: raw-diff line budget embedded in the reviewer task text. Below this,
-# the full diff is shown verbatim and the header says so plainly. At/above it,
-# the diff is truncated on WHOLE-FILE boundaries (never mid-hunk) and the header
-# switches to PARTIAL with real counts + the omitted file list — see Step 7.
-GATE_DIFF_LINE_BUDGET="${GATE_DIFF_LINE_BUDGET:-2000}"
-case "$GATE_DIFF_LINE_BUDGET" in ''|*[!0-9]*) GATE_DIFF_LINE_BUDGET=2000 ;; esac
+# ga-p4g6: raw-diff budget embedded in the reviewer task text. Within it, the full
+# diff is shown verbatim and the header says so plainly. Over it, the payload the
+# lib builds is truncated on WHOLE-FILE boundaries (never mid-hunk) and its header
+# switches to PARTIAL with real counts + the omitted file list.
+# ga-5w2gpw (E6 item d): the budget is now the limit of what ONE reviewer can be handed WHOLE, and the gate
+# no longer runs a review over a partial payload at all — Step 5c parks such a diff before any reviewer is
+# spawned. Two ceilings, because the task travels as one command-line argument (ARG_MAX 1 MB) and fills the
+# reviewer context, both BYTES: lines (default 6000 — E4 measured the partial runs at median 2,837, p90 6,476
+# lines, so 89% fit; the old 2000 cut ordinary diffs) and bytes (default 400000, ~2x the largest task ever
+# delivered, 193 KB; 0 = no byte ceiling). gate-review-task.lib.sh and pre-gate-review.sh carry the SAME
+# defaults (the lib is sourced further down, so the literals repeat); gate-e6d-whole-diff-or-park.selftest.sh
+# fails if the three drift apart.
+# SELFTEST-EXTRACT gate-diff-budget: BEGIN
+GATE_DIFF_LINE_BUDGET="${GATE_DIFF_LINE_BUDGET:-6000}"
+case "$GATE_DIFF_LINE_BUDGET" in ''|*[!0-9]*) GATE_DIFF_LINE_BUDGET=6000 ;; esac
+GATE_DIFF_BYTE_BUDGET="${GATE_DIFF_BYTE_BUDGET:-400000}"
+case "$GATE_DIFF_BYTE_BUDGET" in ''|*[!0-9]*) GATE_DIFF_BYTE_BUDGET=400000 ;; esac
+# SELFTEST-EXTRACT gate-diff-budget: END
 
 # ── ga-dupnv (bug 2 root): bound reviewer task-delivery so a hung `gc session
 # nudge/submit` cannot blow the sweep's wall-clock budget. Observed live
@@ -15361,6 +15373,87 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
   esac
 fi
 
+# ── Step 5c (ga-5w2gpw, E6 item d): a reviewer is handed the WHOLE diff, or no run starts ───────────────────
+# Until now the payload was capped at 2000 lines, cut on whole-file boundaries, and headed "PARTIAL DIFF — … DO NOT
+# treat the omitted files as reviewed". Then that reviewer's PASS was taken as the verdict on the WHOLE change and the
+# branch merged: nothing in this dispatcher read DIFF_COVERAGE (only the builder's pre-gate-review.sh did). E4: 182 of
+# 2,628 runs (6.9%) were partial; in the ones where the reviewer passed, the files nobody read merged with the rest.
+# Two changes. (1) The ceiling moved to what one reviewer can really take WHOLE (6000 lines AND 400000 bytes — see the
+# GATE_DIFF_LINE_BUDGET note at the top). On the E4 dataset that turns roughly 7 in 10 of the old partial runs into whole
+# ones (89% by the line ceiling alone; the byte ceiling is what binds on dense diffs — an estimate, byte density is partly
+# imputed). (2) What is still over a ceiling is PARKED here, fail-closed, with no reviewer spawned: the gate neither
+# reviews a piece nor merges on one. The parking mirrors the ga-acb circuit-break (marker at gate-status:error,
+# gate:needs-human:technical, author + Mayor told), not a FAIL: nothing was judged, so no gate:fix-attempt is consumed
+# and no "Fix THESE blocking issues" feedback is posted.
+# It runs BEFORE Step 6 on purpose — a parked run must leave no gate-run bead for the zombie/timeout machinery to fail.
+# Only coverage=partial parks. coverage=unknown (the whole-diff read came back empty) keeps its old handling: changing what
+# the gate does on a git failure is a separate bead (see the KNOWN LIMIT in gate-review-task.lib.sh).
+# Not done here, deliberately: splitting an oversized diff across several reviewers. The gate-reviewer pool holds 3
+# sessions (agents/gate-reviewer/agent.toml, ga-5hdsr) and a spawn that finds it full parks the marker at gate-status:error
+# (the spawn-abort path below) — so extra reviewers per run would trade "files merge unread" for "busy pool parks markers".
+# Expect about 3 in 10 of the old partial runs (roughly 1.5 a day at E4 volume) to park here; if that turns out to cost more
+# human attention than it is worth, the next step is chunking across reviewers behind a pool-headroom check (the byte and
+# line ceilings are env knobs until then).
+# SELFTEST-EXTRACT gate-diff-park: BEGIN
+DIFF_SUMMARY=$(gate_diff_summary git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
+if [ "$IS_CONTAINER_RIG" = "1" ]; then
+  DIFF_ESCAPE_HATCH_CMD="git --git-dir=$GIT_DIR_PATH diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
+else
+  DIFF_ESCAPE_HATCH_CMD="cd $RIG_PATH && git diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
+fi
+gate_build_diff_payload git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH" "$CHANGED_FILES" "$DIFF_FILE_COUNT" "$GATE_DIFF_LINE_BUDGET" "$DIFF_ESCAPE_HATCH_CMD"
+
+if [ "${DIFF_COVERAGE:-unknown}" = "partial" ]; then
+  _DP_SIZE="${DIFF_RAW_TOTAL_LINES:-?} lines / ${DIFF_RAW_TOTAL_BYTES:-?} bytes across ${DIFF_FILE_COUNT:-?} file(s)"
+  _DP_LIMIT="${DIFF_LIMIT_LINES:-$GATE_DIFF_LINE_BUDGET} lines / ${DIFF_LIMIT_BYTES:-$GATE_DIFF_BYTE_BUDGET} bytes"
+  err "Branch $BRANCH: diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole — parking before dispatch (ga-5w2gpw); the gate does not review a piece of a diff and merge on it."
+  # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
+  set_gate_status "$MARKER_ID" "error"
+  # ga-36ta4: apply-then-verify FIRST, so every comment below cites the VERIFIED state.
+  _NH_STATUS="failed"
+  [ -n "$BEAD_ID" ] && _NH_STATUS=$(gate_apply_needs_human "$BEAD_CITY" "$BEAD_ID" "gate:needs-human:technical")
+  [ "$_NH_STATUS" != "armed" ] && warn "gate:needs-human FAILED TO APPLY on $BEAD_ID after retry (ga-5w2gpw/ga-36ta4) — circuit-breaker NOT armed."
+  bd -C "$GC_CITY" comment "$MARKER_ID" "ga-5w2gpw PARKED before reviewer dispatch: branch $BRANCH has a diff of $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole (GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET). Nothing was reviewed, nothing merged, no fix attempt consumed. Marker parked at gate-status:error. Source bead $BEAD_ID: $(gate_needs_human_clause "$_NH_STATUS")" 2>/dev/null || true
+  if [ -n "$BEAD_ID" ]; then
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "story:in-flight"            -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"             -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"           -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" assign       "$BEAD_ID" ""                           -q 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-5w2gpw PARKED before review (marker $MARKER_ID): branch $BRANCH has a diff of $_DP_SIZE, over the $_DP_LIMIT the gate can hand ONE reviewer whole. The gate does not review a part of a diff and merge on it, so nothing was reviewed and nothing merged; no gate:fix-attempt was consumed. $(gate_needs_human_clause "$_NH_STATUS") story:in-flight + gate:reviewing + pilot:dispatched stripped (Pilot lane slot freed). WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher." 2>/dev/null || true
+  fi
+  gc --city "$GC_CITY" mail send mayor \
+    -s "Gate parked: $BRANCH diff too large to review whole (${BEAD_ID:-unknown})" \
+    -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) was parked before reviewer dispatch (ga-5w2gpw): its diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole. The gate no longer reviews a piece of a diff and merges on it. $(gate_needs_human_clause "$_NH_STATUS") Decide: have the builder split the branch, or review and merge it by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher." 2>/dev/null \
+    || warn "Could not mail Mayor for the ga-5w2gpw diff-too-large park of $BRANCH"
+  if [ -n "$AUTHOR" ]; then
+    gc --city "$GC_CITY" mail send "$AUTHOR" \
+      -s "Gate parked: your branch $BRANCH is too large to review whole" \
+      -m "Your branch $BRANCH (bead ${BEAD_ID:-unknown}) was parked before review: its diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole, and the gate does not review a part of a diff and merge on it. $(gate_needs_human_clause "$_NH_STATUS") Split the work into branches that each stay under those limits and send each one through /gate-done." \
+      2>/dev/null || warn "Could not mail author $AUTHOR for the ga-5w2gpw diff-too-large park of $BRANCH"
+  fi
+  mkdir -p "$(dirname "$QG_LOG")"
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg branch "$BRANCH" \
+    --arg bead "$BEAD_ID" \
+    --arg rig "${RIG:-unknown}" \
+    --arg marker "$MARKER_ID" \
+    --arg author "$AUTHOR" \
+    --arg lines "${DIFF_RAW_TOTAL_LINES:-?}" \
+    --arg bytes "${DIFF_RAW_TOTAL_BYTES:-?}" \
+    --arg files "${DIFF_FILE_COUNT:-?}" \
+    --arg limit_lines "${DIFF_LIMIT_LINES:-$GATE_DIFF_LINE_BUDGET}" \
+    --arg limit_bytes "${DIFF_LIMIT_BYTES:-$GATE_DIFF_BYTE_BUDGET}" \
+    --arg event "dispatcher_park_diff_too_large" \
+    '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, lines: $lines, bytes: $bytes, files: $files, limit_lines: $limit_lines, limit_bytes: $limit_bytes}' \
+    >> "$QG_LOG" 2>/dev/null || true
+  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=PARKED (ga-5w2gpw diff too large to review whole: $_DP_SIZE) ==="
+  # A deliberately-handled terminal outcome for ONE marker, not a dispatcher failure: exit 0 (ga-dmox — exit 1 poisons
+  # daemon-presence-watchdog's FAILING counter).
+  exit 0
+fi
+# SELFTEST-EXTRACT gate-diff-park: END
+
 # ── Step 6: Create gate-run tracking bead ────────────────────────────────────
 
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -15408,17 +15501,9 @@ fi
 #
 # The dispatcher polls these beads for closed status + verdict label.
 
-# ga-gnr3tw: the summary + diff payload (and the FULL/PARTIAL header that says how much of the diff the reviewer
-# sees — the ga-p4g6 design notes live with the function) are built by the shared lib, so the builder's
-# pre-gate-review.sh shows its reviewer exactly what this gate shows its own. The escape-hatch command is the
-# only piece that depends on this rig, so it is computed here and handed in.
-DIFF_SUMMARY=$(gate_diff_summary git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
-if [ "$IS_CONTAINER_RIG" = "1" ]; then
-  DIFF_ESCAPE_HATCH_CMD="git --git-dir=$GIT_DIR_PATH diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
-else
-  DIFF_ESCAPE_HATCH_CMD="cd $RIG_PATH && git diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
-fi
-gate_build_diff_payload git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH" "$CHANGED_FILES" "$DIFF_FILE_COUNT" "$GATE_DIFF_LINE_BUDGET" "$DIFF_ESCAPE_HATCH_CMD"
+# ga-gnr3tw / ga-5w2gpw: DIFF_SUMMARY, DIFF_HEADER and DIFF_FULL were built ONCE, at Step 5c above (before this gate-run
+# existed), because a diff too large to hand a reviewer whole parks the marker there — and a parked run must not leave a
+# gate-run bead behind. Every reviewer below gets that same payload, and it is always a WHOLE diff by the time it gets here.
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()

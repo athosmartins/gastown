@@ -62,7 +62,8 @@
 # Knobs (env): PRE_GATE_MODEL / PRE_GATE_EFFORT (override the live gate-reviewer config; recorded as such),
 #   PRE_GATE_MAX_USD (3)  PRE_GATE_TIMEOUT_SECS (1500)  PRE_GATE_MAX_RUNS (3)  PRE_GATE_MAX_CONCURRENT (2)
 #   PRE_GATE_MIN_DF_GIB (10)  PRE_GATE_MIN_SWAP_MB (300)  PRE_GATE_MIN_SYSTEM_CHARS (10000)
-#   PRE_GATE_LOG_DIR  PRE_GATE_CITY  PRE_GATE_CLAUDE_BIN  GATE_DIFF_LINE_BUDGET (2000, same tunable as the gate)
+#   PRE_GATE_LOG_DIR  PRE_GATE_CITY  PRE_GATE_CLAUDE_BIN  GATE_DIFF_LINE_BUDGET (6000) and GATE_DIFF_BYTE_BUDGET (400000) —
+#   the same tunables, with the same defaults, as the gate (ga-5w2gpw): a diff over either is partial here and is PARKED by the gate
 
 set -uo pipefail   # deliberately NOT -e: every failing step is a named outcome below, never a silent abort
 
@@ -627,7 +628,7 @@ pg_run_inner() {
   gitc() { git -C "$repo" "$@"; }
   summary="$(gate_diff_summary gitc "$base_ref" "$head_ref")"
   escape="cd $repo && git diff $base_ref...$head_ref"
-  gate_build_diff_payload gitc "$base_ref" "$head_ref" "$changed_files" "$file_count" "${GATE_DIFF_LINE_BUDGET:-2000}" "$escape"
+  gate_build_diff_payload gitc "$base_ref" "$head_ref" "$changed_files" "$file_count" "${GATE_DIFF_LINE_BUDGET:-6000}" "$escape"
   lines="$DIFF_RAW_TOTAL_LINES"
   # The file list said there are changed files; the diff TEXT has none. `git diff base...head` failed (or came back empty)
   # while --name-only did not, and the shared builder renders that as "FULL DIFF (complete — 0 lines …)" over a blank body:
@@ -778,6 +779,11 @@ pg_run_inner() {
     echo "── COVERAGE: $coverage — the reviewer was shown $( [ "$partial" = true ] && echo "only PART of this diff (${DIFF_SHOWN_LINES:-?} of $lines diff lines)" || echo "a diff whose coverage could not be established" ) ──"
     if [ "$partial" = true ] && [ -n "${DIFF_OMITTED_LIST:-}" ]; then
       echo "Files it was NOT shown (nobody has reviewed these):"; printf '%s' "$DIFF_OMITTED_LIST"
+    fi
+    if [ "$partial" = true ]; then
+      # ga-5w2gpw: the live gate hands each reviewer the WHOLE diff or does not review it: over ${DIFF_LIMIT_LINES:-?} lines /
+      # ${DIFF_LIMIT_BYTES:-?} bytes it PARKS the branch (gate-status:error + needs-human) instead of merging on a part.
+      echo "NOTE: the real gate parks a diff over ${DIFF_LIMIT_LINES:-?} lines / ${DIFF_LIMIT_BYTES:-?} bytes instead of reviewing a part of it (this one is ${DIFF_RAW_TOTAL_LINES:-?} lines / ${DIFF_RAW_TOTAL_BYTES:-?} bytes). Split the branch before /gate-done."
     fi
     if [ "$out_verdict" = INCONCLUSIVE ] && [ "$verdict" = "PASS" ]; then
       echo "Its verdict was PASS, but only for what it saw, so this is INCONCLUSIVE, not a clearance. Re-running shows it the same part; review the files above yourself with the reviewer's lens."

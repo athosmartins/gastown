@@ -294,8 +294,11 @@ if grep -Eq '^FULL DIFF \(first 2000 lines\):$' "$LIB" "$DISPATCHER"; then
 else
   ok "old unconditional 'FULL DIFF (first 2000 lines):' template line is gone"
 fi
-if grep -q 'GATE_DIFF_LINE_BUDGET="\${GATE_DIFF_LINE_BUDGET:-2000}"' "$DISPATCHER"; then
-  ok "GATE_DIFF_LINE_BUDGET tunable present with the original 2000-line default (no behavior change beyond the fix)"
+# ga-5w2gpw (E6 item d): the default moved 2000 -> 6000 on purpose (E4: the 182 partial runs had median 2,837 / p90 6,476 diff
+# lines, so 2000 cut ordinary diffs) and the gate now PARKS what is still over the ceiling instead of reviewing a part of it.
+# This guard pins the tunable and its number; gate-e6d-whole-diff-or-park.selftest.sh pins that dispatcher, lib and pre-gate agree.
+if grep -q 'GATE_DIFF_LINE_BUDGET="\${GATE_DIFF_LINE_BUDGET:-6000}"' "$DISPATCHER"; then
+  ok "GATE_DIFF_LINE_BUDGET tunable present with the ga-5w2gpw 6000-line default"
 else
   bad "GATE_DIFF_LINE_BUDGET default missing/changed — drift"
 fi
