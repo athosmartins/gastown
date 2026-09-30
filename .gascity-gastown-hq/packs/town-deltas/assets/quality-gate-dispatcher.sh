@@ -5008,11 +5008,14 @@ rebase_union_paths_verdict() {
   local gd="$1" main_ref="$2" orig_tip="$3" new_tip="$4" expected="$5" actual="$6"
   local diffout diff_rc attrs_file p driver base_sha max_bytes rc
   local fb fm fo fa any_loss=0 npaths=0 detail
-  max_bytes="${GATE_UNION_VERDICT_MAX_BYTES:-2000000}"
-  case "$max_bytes" in ''|*[!0-9]*) max_bytes=2000000 ;; esac
   diffout=$(git --git-dir="$gd" diff-tree -r --no-renames --name-only "$expected" "$actual" 2>/dev/null); diff_rc=$?
   if [ "$diff_rc" -ne 0 ]; then echo "unknown:union-diff-error"; return 0; fi
   if [ -z "$diffout" ]; then echo "not-applicable"; return 0; fi
+  # Read AFTER the diff_rc check on purpose, not before it: the numeric-guard pattern below has a lone pipe character, and sitting
+  # right above the status read it makes error-empty-conflation-scan (C7, a one-line lookback) report a false positive that would
+  # page the silent-ignorance monitor as a NEW finding. Nothing above this point uses max_bytes.
+  max_bytes="${GATE_UNION_VERDICT_MAX_BYTES:-2000000}"
+  case "$max_bytes" in ''|*[!0-9]*) max_bytes=2000000 ;; esac
   attrs_file=$(rebase_git_attributes_file "$gd" "$new_tip")
   if [ -z "$attrs_file" ]; then echo "not-applicable"; return 0; fi
   # 1. EVERY differing path must be declared merge=union — one foreign path and this is not our question.
