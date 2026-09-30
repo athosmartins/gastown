@@ -12,19 +12,26 @@ DEDUPE — what counts as "the same issue" (the bead says "por arquivo+linha+cla
   * file+line: both issues cite the same file, and the cited lines overlap (±LINE_SLACK);
     if either side cites the file without a line, the file alone is a WEAK match.
   * classe: reviewers do not emit a class (E4 assigns classes after the fact, with an LLM),
-    so the class is approximated by the defect DESCRIPTION: the overlap coefficient of the
-    two issues' significant tokens (identifiers, words >= 4 chars). Two different defects on
-    the same line (a swallowed error and a lying comment) share the citation but not the
-    description, so they stay separate. If BOTH issues carry an explicit "class: <x>" tag
-    and the tags differ, that decides it: not duplicates.
-  * thresholds are deliberately conservative: a false MERGE drops a real finding from what
-    the builder sees (harmful); a false KEEP only shows the same defect twice (harmless).
-    Every doubt resolves to KEEP BOTH.
+    so the class is approximated by the defect DESCRIPTION: the words of the issue text with
+    the file citations and the "Blocking issue N" header REMOVED (a path is not a description:
+    two different defects in scripts/gate-e5-switch.sh share "scripts", "gate", "switch"), kept
+    as significant tokens (identifiers, words >= 4 chars). Two issues are the same defect only
+    when they share at least MIN_SHARED_TOKENS of those tokens AND the symmetric overlap
+    (Jaccard: shared / union) reaches the threshold. A symmetric measure on purpose: overlap
+    divided by the SMALLER side lets a terse finding be swallowed whole by a long one about
+    another defect that merely names the same identifier. If BOTH issues carry an explicit
+    "class: <x>" tag and the tags differ, that decides it: not duplicates.
+  * thresholds are deliberately conservative: a false MERGE hides a real finding behind another
+    issue's text (harmful); a false KEEP only shows the same defect twice (harmless). Measured on
+    the fixtures of gate-e5-second-reviewer.selftest.sh: different defects in one file score
+    0.00-0.05, the same defect in different words 0.41-0.50; the thresholds sit between.
+    When the evidence is thin the two issues stay separate.
   * an issue with no citation at all is merged only with a textually identical one.
   * issues of the SAME reviewer are never merged with each other.
 
-Nothing else is dropped: each reviewer's preamble and non-blocking findings / coverage tail
-are kept verbatim under "other notes".
+What a merge keeps: the more detailed wording of the two issues (tagged with every reviewer that
+found it). Each reviewer's preamble — including any text on its "VERDICT: FAIL" line — and its
+non-blocking findings / coverage tail are kept verbatim under "other notes".
 
 Stdlib only; safe on the python3 that launchd's PATH finds. Any failure is the CALLER's cue
 to fall back to the legacy concatenation — this script never guesses a partial answer.
@@ -34,15 +41,16 @@ import re
 import sys
 
 LINE_SLACK = 3
-STRONG_THRESHOLD = 0.50   # both sides cite a line range and the ranges overlap
-WEAK_THRESHOLD = 0.65     # the file matches but a side has no line number
+STRONG_THRESHOLD = 0.35   # both sides cite a line range and the ranges overlap (Jaccard of the descriptions)
+WEAK_THRESHOLD = 0.50     # the file matches but a side has no line number
+MIN_SHARED_TOKENS = 3     # fewer shared description words than this is never "the same defect"
 
 ISSUE_RE = re.compile(r'^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*Blocking[ \t]+issue[ \t]+(\d+)\b', re.I)
 NONBLOCK_RE = re.compile(r'^[ \t]*(?:#{1,6}[ \t]*)?(?:\*\*)?[ \t]*Non-?[ \t]*blocking\b', re.I)
 COVERAGE_RE = re.compile(r'^[ \t]*(?:\*\*)?[ \t]*Coverage[ \t]*(?:\*\*)?[ \t]*:', re.I)
 TERMINATOR_RE = re.compile(
     r'^[ \t]*(?:#{1,3}[ \t]+\S|(?:Verified|Checked)\b|Summary[ \t]*:|Lens[ \t]*:)', re.I)
-VERDICT_LINE_RE = re.compile(r'^[ \t]*VERDICT[ \t]*:[ \t]*FAIL\b.*$', re.I)
+VERDICT_LINE_RE = re.compile(r'^[ \t]*VERDICT[ \t]*:[ \t]*FAIL\b[ \t]*[-—–:,;.]*[ \t]*', re.I)
 CITE_RE = re.compile(
     r'(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:py|sh|js|jsx|ts|tsx|toml|json|md|yaml|yml|html|css|sql|go|plist|txt|cfg|ini))'
     r'(?::(\d+)(?:-(\d+))?)?', re.I)
@@ -96,7 +104,9 @@ def parse_comment(text):
     for it in issues:
         body = "\n".join(it["lines"]).rstrip()
         out.append({"header": it["lines"][0], "body": body})
-    pre_txt = "\n".join(l for l in preamble if not VERDICT_LINE_RE.match(l)).strip()
+    # the keyword alone is noise (the merged header says it); anything else on that line is the
+    # reviewer's own text (the SHA it reviewed, the lens, a caveat) and stays
+    pre_txt = "\n".join(VERDICT_LINE_RE.sub("", l, count=1) for l in preamble).strip()
     return pre_txt, out, "\n".join(tail).strip()
 
 
@@ -137,19 +147,29 @@ def cite_strength(ca, cb):
     return best
 
 
+def description_of(body):
+    """The defect description: the issue text without its 'Blocking issue N' header and without
+    any file citation (path tokens say WHERE, not WHAT — and two different defects in one file
+    share every one of them)."""
+    return CITE_RE.sub(" ", ISSUE_RE.sub("", body, count=1))
+
+
 def tokens_of(body):
     toks = set()
-    for t in TOKEN_RE.findall(body):
+    for t in TOKEN_RE.findall(description_of(body)):
         t = t.lower()
         if t not in STOPWORDS:
             toks.add(t)
     return toks
 
 
-def overlap(ta, tb):
+def similarity(ta, tb):
+    """(shared token count, Jaccard) of two token sets. Symmetric: a short issue cannot be
+    'contained' in a long one just because the long one is long."""
     if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / float(min(len(ta), len(tb)))
+        return 0, 0.0
+    shared = len(ta & tb)
+    return shared, shared / float(len(ta | tb))
 
 
 def class_tag(body):
@@ -161,18 +181,27 @@ def norm_text(body):
     return re.sub(r'\s+', ' ', re.sub(r'^[ \t]*(?:#{1,6}[ \t]*)?Blocking issue[ \t]+\d+', '', body, flags=re.I)).strip().lower()
 
 
-def is_duplicate(a, b):
-    """a, b: prepared issue dicts from different reviewers."""
+def duplicate_score(a, b):
+    """a, b: prepared issue dicts from different reviewers. None when they are NOT the same
+    defect (the default under any doubt); otherwise a score in (0, 1] — the Jaccard of their
+    descriptions, or 1.0 for two citation-less issues with identical text — used to pick the
+    BEST match when an issue resembles several."""
     ta, tb = class_tag(a["body"]), class_tag(b["body"])
     if ta is not None and tb is not None and ta != tb:
-        return False
+        return None
     if not a["cites"] and not b["cites"]:
-        return a["norm"] == b["norm"] and a["norm"] != ""
+        return 1.0 if (a["norm"] == b["norm"] and a["norm"] != "") else None
     strength = cite_strength(a["cites"], b["cites"])
     if not strength:
-        return False
-    sim = overlap(a["tokens"], b["tokens"])
-    return sim >= (STRONG_THRESHOLD if strength == "strong" else WEAK_THRESHOLD)
+        return None
+    shared, jac = similarity(a["tokens"], b["tokens"])
+    if shared < MIN_SHARED_TOKENS:
+        return None
+    return jac if jac >= (STRONG_THRESHOLD if strength == "strong" else WEAK_THRESHOLD) else None
+
+
+def is_duplicate(a, b):
+    return duplicate_score(a, b) is not None
 
 
 def prepare(body, reviewer):
@@ -212,13 +241,13 @@ def union(reviewers):
             notes.append((idx, pre, tail))
         for body in issues_b:
             cand = prepare(body, idx)
-            hit = None
+            hit, best = None, 0.0
             for m in merged:
                 if idx in m["reviewers"]:
                     continue          # never merge two issues of the same reviewer
-                if is_duplicate(m, cand):
-                    hit = m
-                    break
+                score = duplicate_score(m, cand)
+                if score is not None and score > best:     # the BEST match, not the first one seen
+                    hit, best = m, score
             if hit is None:
                 merged.append(cand)
             else:
@@ -231,8 +260,8 @@ def union(reviewers):
     first = order[0]
     counts = ", ".join("reviewer %d: %d" % (i, per_reviewer[i]) for i in order)
     head = ("Reviewer %d FAIL: VERDICT: FAIL — E5: union of %d independent reviews (%s blocking issue(s)); "
-            "%d duplicate(s) merged (same file:line, same defect), %d distinct issue(s) below. "
-            "Nothing else was dropped." % (first, len(order), counts, duplicates, len(merged)))
+            "%d duplicate(s) merged (same file:line and same defect description; the more detailed wording is shown), "
+            "%d distinct issue(s) below. Each reviewer's other notes follow verbatim." % (first, len(order), counts, duplicates, len(merged)))
     parts = [head, ""]
     for n, m in enumerate(merged, 1):
         who = " and ".join("reviewer %d" % i for i in m["reviewers"])
