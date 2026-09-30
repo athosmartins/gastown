@@ -6,4 +6,3 @@ provider = "claude-rc"
 
 option_defaults = { effort = "high" }  # ga-ufskhy E2: teste 48h (Athos 29/09 20:5x), voltar a "medium" se não subir a aprovação
 
-suspended = true
