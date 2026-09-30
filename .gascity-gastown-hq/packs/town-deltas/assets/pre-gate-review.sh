@@ -29,6 +29,7 @@
 #                                     [--no-fetch] [--dry-run] [--print-task]
 #   pre-gate-review.sh arm <bead-id>          prints "on" or "off" (pure; no side effects)
 #   pre-gate-review.sh roster <bead-id> <branch>   /gate-done Step 3: records the assignment, prints "on" or "off"
+#                                     (exit 0 = printed and recorded; 4 = printed, roster row NOT written; 3 = no arm; 2 = usage)
 # Run it from inside the builder's checkout, with HEAD on the branch under review and a clean tree.
 # The file can also be `source`d (the functions are reused by pre-gate-apuracao.sh and the selftest).
 #
@@ -135,7 +136,7 @@ PY
 }
 
 # pg_prior_runs <bead-or-branch-key> <field> — how many runs that actually launched claude were already made for it.
-# A corrupt line is skipped, not fatal: the cap is a brake, not a ledger.
+# A corrupt line (truncated JSON, or valid JSON that is not a record) is skipped, not fatal: the cap is a brake, not a ledger.
 pg_prior_runs() {
   # No file yet = no run has ever been recorded = 0 (true). A file that EXISTS but cannot be read is a different thing:
   # we cannot know how much was already spent, and "0" would silently lift the per-bead cap on a spending path. That
@@ -153,6 +154,8 @@ for line in open(path, encoding="utf-8", errors="replace"):
     try:
         r = json.loads(line)
     except ValueError:
+        continue
+    if not isinstance(r, dict):   # valid JSON that is not a record (12, null, [..]): skipped like a corrupt line
         continue
     if r.get("event") == "run" and r.get("launched") is True and r.get(field) == key:
         n += 1
@@ -188,18 +191,50 @@ pg_machine_guard() {
 
 # ── concurrency slots (each run is a multi-minute xhigh session on a machine that saturates) ───────────────
 PG_SLOT_DIR=""
+# pg_slot_claim <dir> — mkdir is the atomic claim; then record who holds it. 0 = claimed (PG_SLOT_DIR set), 1 = the slot
+# already exists, 2 = it cannot be created or written (an environment fault — never reported as "taken").
+pg_slot_claim() {
+  local dir="$1"
+  if ! mkdir "$dir" 2>/dev/null; then [ -d "$dir" ] && return 1; return 2; fi
+  if ! echo $$ > "$dir/pid" 2>/dev/null; then rmdir "$dir" 2>/dev/null; return 2; fi
+  PG_SLOT_DIR="$dir"; return 0
+}
+# pg_slot_acquire — take one of PRE_GATE_MAX_CONCURRENT slots. 0 = held (PG_SLOT_DIR set); 1 = every slot is held by a live
+# process (busy); 2 = the slots directory cannot be used (a fault, reported as such: "cannot tell" is not "all taken").
+# A slot is ABANDONED when its owner is dead, or when it never got a pid (the owner died between mkdir and the pid write)
+# and is older than a minute (the window it is legitimately empty is microseconds). An abandoned slot is taken over by
+# RENAMING it away first: a rename is atomic, so of two processes that both saw the same dead slot only one wins it. The
+# loser of a race the other way round (it displaced a slot a live process had just re-taken) puts it back.
 pg_slot_acquire() {
-  local max="${PRE_GATE_MAX_CONCURRENT:-2}" root n pid
+  local max="${PRE_GATE_MAX_CONCURRENT:-2}" root n dir pid gpid grave rc abandoned
   root="$(pg_log_dir)/slots"
-  mkdir -p "$root" 2>/dev/null || return 1
+  mkdir -p "$root" 2>/dev/null || return 2
   n=1
   while [ "$n" -le "$max" ]; do
-    if mkdir "$root/$n" 2>/dev/null; then echo $$ > "$root/$n/pid"; PG_SLOT_DIR="$root/$n"; return 0; fi
-    pid="$(cat "$root/$n/pid" 2>/dev/null || true)"
-    # A slot whose owner is gone (crash, kill -9) is reclaimed; an unreadable pid file counts as held.
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$root/$n/pid" 2>/dev/null; rmdir "$root/$n" 2>/dev/null
-      if mkdir "$root/$n" 2>/dev/null; then echo $$ > "$root/$n/pid"; PG_SLOT_DIR="$root/$n"; return 0; fi
+    dir="$root/$n"
+    pg_slot_claim "$dir"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    [ "$rc" -eq 2 ] && return 2
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    abandoned=0
+    if [ -n "$pid" ]; then
+      kill -0 "$pid" 2>/dev/null || abandoned=1
+    elif [ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      abandoned=1
+    fi
+    if [ "$abandoned" -eq 1 ]; then
+      grave="$root/$n.abandoned.$$"
+      if mv "$dir" "$grave" 2>/dev/null; then
+        gpid="$(cat "$grave/pid" 2>/dev/null || true)"
+        if [ -n "$gpid" ] && [ "$gpid" != "$pid" ] && kill -0 "$gpid" 2>/dev/null; then
+          [ -e "$dir" ] || mv "$grave" "$dir" 2>/dev/null || true   # a live process had just re-taken it: put it back
+        else
+          rm -f "$grave/pid" 2>/dev/null; rmdir "$grave" 2>/dev/null
+          pg_slot_claim "$dir"; rc=$?
+          [ "$rc" -eq 0 ] && return 0
+          [ "$rc" -eq 2 ] && return 2
+        fi
+      fi
     fi
     n=$((n + 1))
   done
@@ -397,8 +432,8 @@ pg_run_inner() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --bead)       bead="${2:-}"; bead_given=1; shift 2 || break ;;
-      --base)       base="${2:-}"; shift 2 || break ;;
-      --head)       head="${2:-}"; shift 2 || break ;;
+      --base)       [ -n "${2:-}" ] || { pg_log "--base needs a ref (an unset variable?) — refusing rather than using the default"; return 2; }; base="$2"; shift 2 ;;
+      --head)       [ -n "${2:-}" ] || { pg_log "--head needs a ref (an unset variable?) — refusing rather than using the default"; return 2; }; head="$2"; shift 2 ;;
       --lens)       lens="${2:-}"; shift 2 || break ;;
       --force)      force=1; shift ;;
       --no-fetch)   fetch=0; shift ;;
@@ -505,7 +540,10 @@ pg_run_inner() {
   author="${PRE_GATE_AUTHOR:-${GC_ALIAS:-${GC_AGENT:-$(git -C "$repo" config user.name 2>/dev/null)}}}"; author="${author:-unknown}"
   rig="${PRE_GATE_RIG:-$(basename "$repo")}"
   lens_text="$(gate_reviewer_lens "$lens")"
-  task="$(gate_render_review_task "$lens" 1 "$branch" "$author" "$rig" "$branch_sha" "$lens_text" "$changed_files" "$summary" \
+  # The header says "reviewer <i> of <required>". One reviewer is rehearsed, so <required> = <i> (lens 1 stays "1 of 1"):
+  # "2 of 1" named a reviewer that cannot exist. The gate prints its own count ("N of 2" on code, 1 on non-code); the count
+  # appears only in that header line.
+  task="$(gate_render_review_task "$lens" "$lens" "$branch" "$author" "$rig" "$branch_sha" "$lens_text" "$changed_files" "$summary" \
             "$DIFF_HEADER" "$DIFF_FULL" "" "" text)" || { pg_inconclusive "render-failed"; return $?; }
 
   if [ "$printtask" -eq 1 ]; then printf '%s\n' "$task"; pg_finish DRYRUN print-task 0; return $?; fi
@@ -545,7 +583,14 @@ pg_run_inner() {
     pg_finish DRYRUN dry-run 0; return $?
   fi
 
-  pg_slot_acquire || { pg_inconclusive "busy:all-${PRE_GATE_MAX_CONCURRENT:-2}-slots-taken"; return $?; }
+  local slot_rc
+  pg_slot_acquire; slot_rc=$?
+  case "$slot_rc" in
+    0) ;;
+    1) pg_inconclusive "busy:all-${PRE_GATE_MAX_CONCURRENT:-2}-slots-taken"; return $? ;;
+    *) pg_log "cannot create or write the concurrency slots under $(pg_log_dir)/slots — that is a fault, not a busy machine"
+       pg_inconclusive "slots-unusable"; return $? ;;
+  esac
   _inc_extra="model=$model effort=$effort"
 
   pg_log "reviewing $branch@${branch_sha:0:9} vs $base_ref — lens $lens, $file_count file(s), $lines diff line(s)$([ "$partial" = true ] && echo ', PARTIAL'), model=$model effort=$effort, cap \$$max_usd / ${tmo}s, attempt $PG_ATTEMPT"
@@ -603,16 +648,19 @@ pg_main() {
     roster)
       # /gate-done Step 3. Puts EVERY submission on the roster, whether or not the builder ran Step 2b: without this a bead
       # whose builder skipped the step is on neither arm, and the intention-to-treat comparison quietly becomes a
-      # comparison among the builders who complied. Prints the arm (the marker label); a roster write that fails is
-      # reported on stderr but never withholds the arm — the label and the roster then disagree, visibly.
+      # comparison among the builders who complied. Prints the arm (the marker label). Exit status is the third state the
+      # caller needs: 0 = arm printed AND on the roster; 4 = arm printed but the roster row was NOT written (WARN on
+      # stderr; the arm is still printed so the label goes on and the two then disagree, visibly); 2 = usage; 3 = no arm
+      # (nothing printed). /gate-done Step 3 leaves this stderr attached and reports every non-zero outcome.
       shift
-      local rbead="${1:-}" rbranch="${2:-}" rarm rrc
+      local rbead="${1:-}" rbranch="${2:-}" rarm rrc rec_rc=0
       [ -n "$rbead" ] && [ -n "$rbranch" ] || { pg_log "usage: pre-gate-review.sh roster <bead-id> <branch>"; return 2; }
       rarm="$(pregate_arm_for_bead "$rbead")"; rrc=$?
       [ "$rrc" -eq 0 ] || return "$rrc"
       pg_record assign bead="$rbead" branch="$rbranch" sha="$(git rev-parse HEAD 2>/dev/null || true)" arm="$rarm" source=gate-done >/dev/null \
-        || pg_log "WARN: the assignment of $rbead ($rarm) could NOT be written to the roster"
+        || { rec_rc=4; pg_log "WARN: the assignment of $rbead ($rarm) could NOT be written to the roster"; }
       printf '%s\n' "$rarm"
+      return "$rec_rc"
       ;;
     run) shift; pg_run "$@" ;;
     ""|-h|--help) pg_usage; return 2 ;;

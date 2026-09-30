@@ -98,9 +98,9 @@ STUB_A='
 git_rig() {
   if [ "${3:-}" = "--" ]; then
     case "${4:-}" in
-      file_a.py) i=1; while [ "$i" -le 20 ]; do echo "A_LINE_$i"; i=$((i+1)); done ;;
-      file_b.py) i=1; while [ "$i" -le 20 ]; do echo "B_LINE_$i"; i=$((i+1)); done ;;
-      file_c.py) i=1; while [ "$i" -le 20 ]; do echo "C_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)file_a.py") i=1; while [ "$i" -le 20 ]; do echo "A_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)file_b.py") i=1; while [ "$i" -le 20 ]; do echo "B_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)file_c.py") i=1; while [ "$i" -le 20 ]; do echo "C_LINE_$i"; i=$((i+1)); done ;;
     esac
   else
     i=1; while [ "$i" -le 20 ]; do echo "A_LINE_$i"; i=$((i+1)); done
@@ -150,8 +150,8 @@ STUB_C='
 git_rig() {
   if [ "${3:-}" = "--" ]; then
     case "${4:-}" in
-      big_file.py) i=1; while [ "$i" -le 30 ]; do echo "BIG_LINE_$i"; i=$((i+1)); done ;;
-      small_file.py) i=1; while [ "$i" -le 5 ]; do echo "SMALL_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)big_file.py") i=1; while [ "$i" -le 30 ]; do echo "BIG_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)small_file.py") i=1; while [ "$i" -le 5 ]; do echo "SMALL_LINE_$i"; i=$((i+1)); done ;;
     esac
   else
     i=1; while [ "$i" -le 30 ]; do echo "BIG_LINE_$i"; i=$((i+1)); done
@@ -170,6 +170,97 @@ case "$HEADER_C" in *"30 of 35 total diff lines"*) ok "C: header reports correct
 case "$FULL_C" in *"BIG_LINE_30"*) ok "C: oversized first file still captured WHOLE (last line present)";; *) bad "C: first file was cut instead of shown whole";; esac
 case "$FULL_C" in *"SMALL_LINE"*) bad "C: omitted small_file leaked into DIFF_FULL";; *) ok "C: second file cleanly omitted (whole-file cut)";; esac
 case "$HEADER_C" in *"small_file.py"*) ok "C: omitted file named in header";; *) bad "C: omitted file not named — got: $HEADER_C";; esac
+
+# ── ga-gnr3tw (gate ga-46y473, attempt 1): per-file diffs must resolve from ANY cwd ────────────────────────────────────
+# `git diff --name-only` prints ROOT-relative names; the gascity rig runs git from `.gascity-gastown-hq/`, a SUBDIRECTORY of
+# the toplevel, where a plain per-file pathspec matched nothing: every per-file diff came back empty, and over budget the
+# reviewer was told "PARTIAL DIFF - showing N of N files" over a blank body. The builder's pre-gate-review.sh runs git from the
+# toplevel, so builder and gate were shown DIFFERENT payloads for exactly the big gascity diffs. Scenarios D and E use a real
+# git repository (hermetic: no user config) and the real lib, not a stub that agrees with the fix by construction.
+T="$(mktemp -d "${TMPDIR:-/tmp}/gate-trunc.XXXXXX")" || { echo "mktemp failed"; exit 2; }
+trap 'rm -rf "$T"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+# .a-outside/ sorts BEFORE .hq/ in git name order, so a file outside the runner's cwd is the FIRST one shown
+TOP="$T/top"; mkdir -p "$TOP/.hq/commands" "$TOP/.a-outside"
+git -C "$TOP" init -q && git -C "$TOP" symbolic-ref HEAD refs/heads/main
+gen() { i=1; while [ "$i" -le "$3" ]; do echo "$2 line $i"; i=$((i+1)); done > "$1"; }   # gen <file> <tag> <n-lines>
+gen "$TOP/.hq/commands/a.md" base 3; gen "$TOP/.a-outside/b.md" base 3; gen "$TOP/.hq/c.sh" base 3
+git -C "$TOP" add -A && git -C "$TOP" commit -q -m base && git -C "$TOP" update-ref refs/remotes/origin/main HEAD
+git -C "$TOP" checkout -q -b feature
+gen "$TOP/.hq/commands/a.md" feat 30; gen "$TOP/.a-outside/b.md" feat 8; gen "$TOP/.hq/c.sh" feat 30
+git -C "$TOP" add -A && git -C "$TOP" commit -q -m feat && git -C "$TOP" update-ref refs/remotes/origin/feature HEAD
+CF_D="$(git -C "$TOP" diff --name-only origin/main...origin/feature)"
+NF_D="$(printf '%s\n' "$CF_D" | awk 'NF { n++ } END { print n + 0 }')"
+if [ "$NF_D" = "3" ]; then ok "D fixture: a real repo whose 3 changed files sit under .hq/ (the runner's cwd) and .a-outside/ (outside it)"
+else bad "D fixture: expected 3 changed files, got $NF_D"; fi
+# the gate's runner (git -C <subdirectory>) and the builder's runner (git -C <toplevel>)
+STUB_SUB="git_rig() { git -C '$TOP/.hq' \"\$@\"; }"
+STUB_TOP="git_rig() { git -C '$TOP' \"\$@\"; }"
+
+run_block "scenario D1 (real git, runner in a SUBDIRECTORY - the gate on the gascity rig)" "$CF_D" "$NF_D" 60 "$STUB_SUB"
+OUT_D1="$LAST_BLOCK_OUTPUT"
+HEADER_D1="$(extract_section "$OUT_D1" "===HEADER-START===" "===HEADER-END===")"
+FULL_D1="$(extract_section "$OUT_D1" "===FULL-START===" "===FULL-END===")"
+run_block "scenario D2 (same diff, runner at the TOPLEVEL - the builder)" "$CF_D" "$NF_D" 60 "$STUB_TOP"
+OUT_D2="$LAST_BLOCK_OUTPUT"
+HEADER_D2="$(extract_section "$OUT_D2" "===HEADER-START===" "===HEADER-END===")"
+FULL_D2="$(extract_section "$OUT_D2" "===FULL-START===" "===FULL-END===")"
+
+case "$HEADER_D1" in *"PARTIAL DIFF"*) ok "D1: over budget -> PARTIAL header";; *) bad "D1: expected a PARTIAL header — got: $HEADER_D1";; esac
+case "$FULL_D1" in *"diff --git a/.hq/c.sh"*) ok "D1: a file INSIDE the runner's subdirectory is really in the payload (the per-file pathspec resolved)";; *) bad "D1: BLANK BODY under a PARTIAL header — the per-file diff of .hq/c.sh did not resolve from the subdirectory";; esac
+case "$FULL_D1" in *"diff --git a/.a-outside/b.md"*) ok "D1: a file OUTSIDE the runner's subdirectory is in the payload too (:(top) names the same file from any cwd)";; *) bad "D1: the per-file diff of .a-outside/b.md did not resolve from the subdirectory";; esac
+case "$HEADER_D1" in *"showing 2 of 3 files"*) ok "D1: header counts the two files that are really shown (2 of 3)";; *) bad "D1: expected 'showing 2 of 3 files' — got: $HEADER_D1";; esac
+case "$HEADER_D1" in *"showing 0 of"*) bad "D1: header claims 0 files shown — got: $HEADER_D1";; *) ok "D1: header does not claim zero files shown";; esac
+if [ "$FULL_D1" = "$FULL_D2" ] && [ "$HEADER_D1" = "$HEADER_D2" ]; then ok "D1 == D2: the gate (subdirectory) and the builder (toplevel) are shown a byte-identical header and payload"
+else bad "D: the gate and the builder are shown DIFFERENT payloads for the same diff"; fi
+
+# D3 mutation control: the previous pathspec (plain <name>) must reproduce the blank body from the subdirectory — else D1
+# is green for the wrong reason and cannot tell the fix from the bug.
+sed 's/-- ":(top,literal)\$_df"/-- "$_df"/' "$LIB" > "$T/lib.oldpathspec.sh"
+if cmp -s "$LIB" "$T/lib.oldpathspec.sh"; then
+  bad "D3 mutation control: the pathspec line in the lib was not found, so the mutation did not apply"
+else
+  LIB_SAVED="$LIB"; LIB="$T/lib.oldpathspec.sh"
+  run_block "scenario D3 (MUTANT: the previous plain pathspec, runner in a subdirectory)" "$CF_D" "$NF_D" 60 "$STUB_SUB"
+  LIB="$LIB_SAVED"
+  FULL_D3="$(extract_section "$LAST_BLOCK_OUTPUT" "===FULL-START===" "===FULL-END===")"
+  case "$FULL_D3" in
+    *"diff --git"*) bad "D3 mutation control: the old pathspec unexpectedly produced diff text from a subdirectory — D1 cannot discriminate" ;;
+    *)              ok "D3 mutation control: the previous plain pathspec gives a BLANK body from the subdirectory (the bug the gate found), so D1 is load-bearing" ;;
+  esac
+fi
+
+# ── Scenario E: a per-file diff that comes back EMPTY is listed as omitted, never counted as shown ─────────────────────
+# (third state: "shown, and there was nothing to see" is not the same answer as "could not get it")
+STUB_E='
+git_rig() {
+  if [ "${3:-}" = "--" ]; then
+    case "${4:-}" in
+      ":(top,literal)file_e.py") : ;;
+      ":(top,literal)file_a.py") i=1; while [ "$i" -le 20 ]; do echo "A_LINE_$i"; i=$((i+1)); done ;;
+      ":(top,literal)file_f.py") i=1; while [ "$i" -le 5 ]; do echo "F_LINE_$i"; i=$((i+1)); done ;;
+    esac
+  else
+    i=1; while [ "$i" -le 20 ]; do echo "A_LINE_$i"; i=$((i+1)); done
+    i=1; while [ "$i" -le 5 ]; do echo "F_LINE_$i"; i=$((i+1)); done
+  fi
+}
+'
+run_block "scenario E (first file's per-file diff is empty)" "file_e.py
+file_a.py
+file_f.py" 3 10 "$STUB_E"
+OUT_E="$LAST_BLOCK_OUTPUT"
+HEADER_E="$(extract_section "$OUT_E" "===HEADER-START===" "===HEADER-END===")"
+FULL_E="$(extract_section "$OUT_E" "===FULL-START===" "===FULL-END===")"
+case "$HEADER_E" in *"1 of 3 files"*) ok "E: the empty file is NOT counted as shown (1 of 3)";; *) bad "E: header counts an empty diff as shown — got: $HEADER_E";; esac
+case "$HEADER_E" in *"file_e.py (its per-file diff came back empty"*) ok "E: the empty file is named in the header with the reason";; *) bad "E: the empty file is not explained — got: $HEADER_E";; esac
+case "$HEADER_E" in *"OMITTED FILES (2)"*) ok "E: OMITTED FILES count (2) matches what is listed (empty file + over-budget file)";; *) bad "E: OMITTED FILES count is wrong — got: $HEADER_E";; esac
+case "$FULL_E" in *"A_LINE_20"*) ok "E: the first NON-EMPTY file is still taken whole";; *) bad "E: the first non-empty file was not taken whole";; esac
+case "$FULL_E" in *"F_LINE"*) bad "E: an over-budget file leaked into the payload";; *) ok "E: the over-budget file stays out";; esac
 
 # ── Mutation control: prove this harness actually detects the pre-fix shape.
 # Reproduce the ORIGINAL bug (header hardcoded to "FULL"/"first 2000 lines"

@@ -277,6 +277,20 @@ reset_state; mkdir -p "$T/logs/slots/1" "$T/logs/slots/2"; echo 999999 > "$T/log
 OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; eq "$rc" "0" "stale slots (dead pids) are reclaimed and the run proceeds"
 # the run needed ONE slot: it reclaimed slot 1 and must have released it; slot 2 was never touched (still stale, harmless)
 [ ! -d "$T/logs/slots/1" ] && ok "the slot the run took is released after the run" || bad "the slot the run took leaked"
+# a slot with NO pid yet and a FRESH mtime is a slot being taken right now (mkdir done, pid not yet written): held, not stolen
+reset_state; mkdir -p "$T/logs/slots/1" "$T/logs/slots/2"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "pid-less FRESH slots are treated as held (an owner may be mid-acquire)"; has_str "$L" "reason=busy" "…reason says busy"
+# a slot that NEVER got a pid and is old is a crashed acquire (owner died between mkdir and the pid write): reclaimed, not held forever
+reset_state; mkdir -p "$T/logs/slots/1" "$T/logs/slots/2"; touch -t 202001010000 "$T/logs/slots/1"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?
+eq "$rc" "0" "an OLD pid-less slot (crashed acquire) is reclaimed and the run proceeds — it is not held forever"
+[ ! -d "$T/logs/slots/1" ] && ok "…and the reclaimed slot is released afterwards" || bad "…the reclaimed slot leaked"
+ls "$T/logs/slots" 2>/dev/null | grep -q 'abandoned' && bad "takeover leftovers in the slots dir: $(ls "$T/logs/slots" | tr '\n' ' ')" || ok "…(no *.abandoned.* entries in the slots dir)"
+# the slots directory CANNOT be created: that is a fault, not a busy machine — the reason must say which
+reset_state; mkdir -p "$T/logs"; : > "$T/logs/slots"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "slots dir cannot be created → INCONCLUSIVE"; has_str "$L" "reason=slots-unusable" "…reason names the fault"; not_str "$L" "reason=busy" "…and it is NOT reported as busy"; eq "$(ncalls)" "0" "…and claude never launched"
 # claude missing
 reset_state
 OUT="$(run_pg PRE_GATE_CLAUDE_BIN=/nonexistent/claude -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
@@ -317,6 +331,26 @@ has_str "$REC" '"launched": true' "run record: launched=true"; has_str "$REC" '"
 has_str "$REC" '"model_resolved": "claude-sonnet-5-5"' "run record: the model that actually answered"; has_str "$REC" '"verdict": "PASS"' "run record: verdict"
 has_str "$REC" '"effort": "xhigh"' "run record: effort read from city.toml"
 # `--bead ""` (an unset variable) is refused, never silently read as "no bead = manual mode"
+# --base / --head with no value (an unset variable expands to nothing) are usage errors — never a silent fall back to the default ref
+for flag in --base --head; do
+  reset_state
+  OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch "$flag")"; rc=$?
+  eq "$rc" "2" "$flag as the last argument (no value) → usage error exit 2"; eq "$(ncalls)" "0" "$flag with no value → claude never launched"
+  OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch "$flag" "")"; rc=$?
+  eq "$rc" "2" "$flag \"\" (unset variable) → usage error exit 2, not the default ref"; eq "$(ncalls)" "0" "$flag \"\" → claude never launched"
+done
+# --lens N renders "reviewer N of N": the impossible "2 of 1" named a reviewer that cannot exist
+for n in 1 2 3; do
+  T_N="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" GC_ALIAS=builder-alias bash "$PG" run feat/x --no-fetch --lens "$n" --print-task 2>/dev/null)"
+  has_str "$T_N" "You are reviewer $n of $n for branch: feat/x" "--lens $n renders 'reviewer $n of $n'"
+done
+# a run-log line that is valid JSON but not a record (12, null, [..], a string) is skipped like a corrupt line — it must not
+# turn every bead INCONCLUSIVE forever; the valid record next to it is still counted
+reset_state; mkdir -p "$T/logs"
+printf '%s\n' '12' 'null' '[1,2]' '"str"' "{\"event\": \"run\", \"launched\": true, \"bead\": \"$ON_BEAD\"}" > "$T/logs/runs.jsonl"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "0" "non-object JSON lines in runs.jsonl do not make the log 'unreadable'"; not_str "$L" "runs-log-unreadable" "…no runs-log-unreadable"
+eq "$(field "$L" attempt)" "2" "…and the valid launched record beside them is still counted (attempt 2)"
 reset_state
 OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "" --no-fetch)"; rc=$?
 eq "$rc" "2" "--bead with an empty id → usage error exit 2 (not a silent manual-mode run)"; eq "$(ncalls)" "0" "--bead \"\" → claude never launched"
@@ -345,10 +379,16 @@ OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_
 eq "$OUT" "off" "roster on a control bead prints off (and records it: the control arm is on the roster too)"
 (cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "" feat/x >/dev/null 2>&1); eq "$?" "2" "roster with an empty bead id → exit 2 (usage), not an arm"
 (cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "$ON_BEAD" >/dev/null 2>&1); eq "$?" "2" "roster with no branch → exit 2"
-# a roster write that FAILS must not withhold the arm (the label still goes on) — and must say so
+# a roster write that FAILS must not withhold the arm (the label still goes on) — and must say so, on stderr AND in the
+# exit status: /gate-done Step 3 tells "arm ok, roster missing" (4) from "all recorded" (0) and from "no arm" (3) by it
 : > "$T/notadir"
-OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/notadir/sub" bash "$PG" roster "$ON_BEAD" feat/x 2>"$T/roster.err")"
+OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/notadir/sub" bash "$PG" roster "$ON_BEAD" feat/x 2>"$T/roster.err")"; rc=$?
 eq "$OUT" "on" "roster write fails → the arm is still printed"; has_str "$(cat "$T/roster.err")" "could NOT be written to the roster" "…and the failure is reported on stderr, not swallowed"
+eq "$rc" "4" "…and the exit status is 4 (arm printed, roster row NOT written), not 0"
+# the arm cannot be computed (no sha256 tool): nothing printed, exit 3 — never an arm, never "off"
+OUT="$( cd "$T/work" && export PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs"
+        source "$PG"; pregate_arm_for_bead() { return 3; }; pg_main roster "$ON_BEAD" feat/x 2>/dev/null )"; rc=$?
+eq "$rc" "3" "roster: arm cannot be computed → exit 3"; eq "$OUT" "" "…and no arm is printed (unknown must not read as on or off)"
 # an EXISTING but unreadable run log must not read as "0 runs so far" (that would silently lift the spend cap)
 reset_state; mkdir -p "$T/logs/runs.jsonl"
 OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"

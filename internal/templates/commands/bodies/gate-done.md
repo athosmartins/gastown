@@ -831,14 +831,28 @@ SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-
 # Provado com par controlado: marker ephemeral ve=0 e um idêntico não-ephemeral
 # ve=1, na MESMA consulta. Se algum dia voltar a usar --ephemeral, as ~113
 # consultas por type:quality-gate-marker precisam de --include-infra ANTES.
-# ga-gnr3tw: stamp the A/B arm of the pre-gate experiment (Step 2b) on the marker, and put this submission on the
-# experiment roster whether or not Step 2b ran (otherwise a builder who skipped it is on neither arm and the comparison
-# quietly becomes one among the builders who complied). The arm is a pure function of the bead id, so it is recomputed
-# here and survives Step 2b having run in another shell. If it cannot be computed (no sha256 tool, empty id) NO label is
+# ga-gnr3tw: put this submission on the pre-gate experiment roster (Step 2b) whether or not Step 2b ran (otherwise a
+# builder who skipped it is on neither arm and the comparison quietly becomes one among the builders who complied), and
+# learn the A/B arm so it can be stamped on the marker once the marker exists (after the read-back below). The arm is a
+# pure function of the bead id, so it is recomputed here and survives Step 2b having run in another shell.
+# `roster` exits 0 = arm printed AND on the roster; 4 = arm printed but the roster row was NOT written; anything else =
+# no arm. Its stderr stays attached to YOUR terminal on purpose (the WARN naming a failed roster write is the only trace of
+# it), and every outcome other than 0 prints a "pre-gate roster NOT recorded" line: a submission that is missing from the
+# roster must be visible, never silently absent. If the arm cannot be computed (no sha256 tool, empty id) NO label is
 # written: "unknown" must never read as "off" in the measurement.
-PREGATE_ARM=$(bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" roster "$BEAD_ID" "$BRANCH" 2>/dev/null) || PREGATE_ARM=""
-PREGATE_LABEL_ARG=""
-case "$PREGATE_ARM" in on|off) PREGATE_LABEL_ARG="-l pregate:$PREGATE_ARM" ;; esac
+# This runs in every agent's shell, which in this city is zsh, not bash. The block between the SELFTEST-EXTRACT sentinels
+# is executed VERBATIM under bash AND zsh by gate-done-pregate-stamp.selftest.sh — keep the sentinels in place.
+# SELFTEST-EXTRACT pregate-roster: BEGIN
+PREGATE_ARM=$(bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" roster "$BEAD_ID" "$BRANCH") && PREGATE_RC=0 || PREGATE_RC=$?
+case "$PREGATE_RC:$PREGATE_ARM" in
+  0:on|0:off) ;;
+  4:on|4:off)
+    echo "pre-gate roster NOT recorded: the assignment of $BEAD_ID ($PREGATE_ARM) could not be written to the roster (see the WARN above) - it will be missing from the experiment count; the marker still gets its pregate:$PREGATE_ARM label." ;;
+  *)
+    echo "pre-gate roster NOT recorded: no arm could be determined for $BEAD_ID (roster exit $PREGATE_RC) - it is off the roster and gets no pregate:* label."
+    PREGATE_ARM="" ;;
+esac
+# SELFTEST-EXTRACT pregate-roster: END
 
 MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   "ready-for-gate: $BRANCH" \
@@ -848,7 +862,6 @@ MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   -l "branch:$BRANCH" \
   -l "source-bead:$BEAD_ID" \
   -l "bead-rig:$BEAD_RIG" \
-  $PREGATE_LABEL_ARG \
   -d "branch: $BRANCH
 bead_id: $BEAD_ID
 author: $AUTHOR
@@ -896,6 +909,23 @@ case ",$_MARKER_LABELS," in
     fi
     ;;
 esac
+
+# ga-gnr3tw: stamp the pre-gate arm on the marker. This is deliberately NOT an argument of the `bd create` above: a
+# `-l pregate:$ARM` kept in an unquoted variable is ONE argv word under zsh (which does not split it), so bd stored the
+# label " pregate:on" (leading space) and every `bd list -l pregate:on` read it as an arm with no beads. A separate,
+# fully quoted call has no splitting to get wrong; and like the read-back above this checks the label that LANDED, not the
+# exit code of the call. The measurement counts the roster row, not this label, so a miss here only weakens the audit trail.
+# SELFTEST-EXTRACT pregate-stamp: BEGIN
+if [ -n "${PREGATE_ARM:-}" ]; then
+  bd -C "$GC_CITY_PATH" label add "$MARKER_ID" "pregate:$PREGATE_ARM" -q 2>/dev/null || true
+  _PG_LABELS=$(bd -C "$GC_CITY_PATH" show "$MARKER_ID" --json 2>/dev/null \
+    | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(",")' 2>/dev/null || echo "")
+  case ",$_PG_LABELS," in
+    *,"pregate:$PREGATE_ARM",*) echo "Pre-gate arm: pregate:$PREGATE_ARM is on marker $MARKER_ID." ;;
+    *) echo "Warning: marker $MARKER_ID does NOT carry pregate:$PREGATE_ARM (labels: ${_PG_LABELS:-<unreadable>}) - the roster row is what the experiment counts; only the marker's audit trail is affected." ;;
+  esac
+fi
+# SELFTEST-EXTRACT pregate-stamp: END
 
 # Stamp gate:queued on the SOURCE bead (ga-dt6bu / ga-oonk3 thrash fix). Without it, a
 # bead created with no lifecycle label sits RAW between marker creation and the gate

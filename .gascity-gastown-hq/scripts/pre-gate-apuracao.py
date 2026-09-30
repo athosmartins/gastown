@@ -36,6 +36,7 @@ import time
 from collections import defaultdict
 
 HQ_DEFAULT = os.environ.get("GC_CITY_PATH") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ANY_STAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 GATE_LINE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*Gate run complete: gate_run=(\S+) branch=(\S+) verdict=(\w+) elapsed=(\d+)s")
 
@@ -81,8 +82,15 @@ def load_jsonl(path):
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except ValueError:
+                bad += 1
+                continue
+            # valid JSON that is not a record (12, null, [..], "x") is as unreadable as truncated JSON: counted, and it
+            # must not crash the report on the first r.get() (that would print a traceback instead of the measurement)
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
                 bad += 1
     return rows, bad
 
@@ -110,6 +118,9 @@ def main():
     ap.add_argument("--min-n", type=int, default=30, help="mínimo de branches por braço para dar veredito (bead: ~30)")
     ap.add_argument("--reviewer-usd", type=float, default=0.60, help="ESTIMATIVA de US$ por tentativa do revisor (E0: 8,93/15)")
     ap.add_argument("--target", type=float, default=0.70, help="alvo de aprovação na 1a tentativa do braço on")
+    ap.add_argument("--wait-h", type=float, default=48.0,
+                    help="horas que uma branch ainda sem desfecho do gate conta como 'aguardando'; depois disso ela vai para 'sem desfecho localizável'")
+    ap.add_argument("--now", type=float, help="época UTC 'de agora' (só para teste; padrão: o relógio)")
     a = ap.parse_args()
 
     runs_path = a.runs or os.path.join(a.hq, ".gc/logs/pre-gate-review/runs.jsonl")
@@ -164,8 +175,16 @@ def main():
 
     # ── desfechos do gate por branch, em ordem ──
     outcomes = defaultdict(list)   # branch -> [(epoch, verdict)]
+    log_start = None               # the earliest dated line of the log: how far back it can testify at all
     with open(log_path, encoding="utf-8", errors="replace") as f:
         for line in f:
+            t = ANY_STAMP.match(line)
+            if t:
+                try:
+                    e = parse_local(t.group(1))
+                    log_start = e if log_start is None else min(log_start, e)
+                except (ValueError, OverflowError):
+                    pass
             m = GATE_LINE.match(line)
             if m:
                 outcomes[m.group(3)].append((parse_local(m.group(1)), m.group(4)))
@@ -186,11 +205,23 @@ def main():
 
     # ── por branch: 1a tentativa, tentativas totais, tempo até o 1o PASS ──
     per = {}
-    waiting = 0
+    now = a.now if a.now is not None else time.time()
+    # "no gate outcome found for this branch" is NOT one answer. Only the first is a bead that simply has not been judged yet:
+    #   waiting   the assignment is recent (<= --wait-h): the gate has not run, or not finished, yet
+    #   stale     older than that and still no outcome: renamed branch, never submitted to the gate, or a stuck gate
+    #   log_gap   the dispatcher log does not reach back to the assignment (rotated, or no dated line at all): an outcome may
+    #             exist and simply not be readable here
+    # All three stay out of the rates; each is printed, so none of them can pass for "still waiting".
+    waiting = stale = log_gap = 0
     for b, v in roster.items():
         after = [(t, vd) for (t, vd) in outcomes.get(b, []) if t >= v["ts"] - 60]
         if not after:
-            waiting += 1
+            if log_start is None or v["ts"] < log_start - 60:
+                log_gap += 1
+            elif now - v["ts"] <= a.wait_h * 3600:
+                waiting += 1
+            else:
+                stale += 1
             continue
         first_v = after[0][1]
         pass_t = next((t for (t, vd) in after if vd == "PASS"), None)
@@ -208,7 +239,10 @@ def main():
     print("═══ APURAÇÃO DO E3 — PRÉ-REVISÃO DO CONSTRUTOR (ga-gnr3tw, P0 ga-ufskhy) ═══")
     print(f"  janela: {'a partir de ' + a.since if a.since else 'todo o roster'}   roster: {len(roster)} branches"
           f" ({sum(1 for v in roster.values() if v['arm']=='on')} on / {sum(1 for v in roster.values() if v['arm']=='off')} off)")
-    print(f"  aguardando 1o desfecho do gate: {waiting}   desfecho não-PASS/FAIL (infra/timeout): on={other['on']} off={other['off']}")
+    print(f"  aguardando 1o desfecho do gate: {waiting} (atribuídas há ≤ {a.wait_h:g}h)   desfecho não-PASS/FAIL (infra/timeout): on={other['on']} off={other['off']}")
+    if stale or log_gap:
+        print(f"  ⚠ SEM desfecho e FORA da conta: {stale} sem desfecho localizável após {a.wait_h:g}h (branch renomeada, nunca chegou ao gate ou gate parado), "
+              f"{log_gap} que o log do dispatcher não cobre (log rodado ou sem linha datada — pode haver desfecho que não dá pra ler daqui)")
     if anomalies or conflicts or bad_rows or bad_assign:
         print(f"  ⚠ anomalias FORA da conta: {len(anomalies)} com braço gravado ≠ recalculado (ou não recalculável), "
               f"{len(set(conflicts))} branch(es) com braços conflitantes, {bad_assign} linha(s) de atribuição malformada(s), "
@@ -289,6 +323,9 @@ def main():
         cost_per[arm] = cpa
         att = statistics.mean([p["attempts"] for p in ps]) if ps else float("nan")
         print(f"  {arm:<10}{len(ps):>6}{len(ap_):>7}{('n/a' if att != att else f'{att:.2f}'):>11}{pre_usd:>14.2f}{rev_usd:>22.2f}{('n/a' if cpa != cpa else f'{cpa:.2f}'):>14}")
+    n_cost = {arm: sum(1 for p in per.values() if p["arm"] == arm) for arm in ("on", "off")}
+    print(f"  (esta tabela conta TODA branch com algum desfecho do gate: on={n_cost['on']} off={n_cost['off']}; a tabela da taxa acima só as "
+          f"de 1o desfecho PASS/FAIL: on={n_on} off={n_off} — a diferença são as de 1o desfecho infra/timeout: on={other['on']} off={other['off']})")
     print(f"  pré-gate = EXATO (total_cost_usd por run). revisor = ESTIMATIVA {a.reviewer_usd:.2f}/tentativa (E0). construtor = NÃO MEDIDO:")
     print("  o retrabalho do braço on (consertar o que a pré-revisão achou) não está em nenhum número acima — o custo real do on é MAIOR que o mostrado.")
     print("  (relógio: começa na PRIMEIRA linha do roster da branch — no braço on isso é o Step 2b, então o tempo da")

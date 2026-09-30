@@ -65,7 +65,9 @@ open(f"{hq}/.gc/logs/pre-gate-review/runs.jsonl", "w").write("\n".join(json.dump
 open(f"{hq}/.gc/logs/quality-gate-dispatcher.log", "w").write("\n".join(l for _, l in log) + ("\n" if log else ""))
 PY
 }
-apu() { python3 "$APU" --hq "$1" "${@:2}" 2>&1; }
+# The clock is pinned (T0 + 1h) so "assigned recently" does not depend on when this suite runs; a test that needs another
+# instant passes its own --now, which wins because argparse takes the last occurrence.
+apu() { python3 "$APU" --hq "$1" --now "$((T0 + 3600))" "${@:2}" 2>&1; }
 
 T0=1790000000   # 2026-09-22T... an instant; only differences matter
 
@@ -108,7 +110,11 @@ gen "$A_HQ" "$T/specA.json"
 OUT="$(apu "$A_HQ" --min-n 10)"; rc=$?
 eq "$rc" "0" "apuracao exits 0 on good data"
 has "$OUT" "roster: 23 branches (13 on / 10 off)" "roster counts: 14 assigned on − 1 anomaly = 13 on, 10 off"
-has "$OUT" "aguardando 1o desfecho do gate: 1" "one bead is still waiting for its first gate outcome"
+has "$OUT" "aguardando 1o desfecho do gate: 1 (atribuídas há ≤ 48h)" "one bead is still waiting for its first gate outcome — and the window that word means is printed"
+hasnt "$OUT" "SEM desfecho e FORA da conta" "no stale / log-gap warning while nothing is stale and the log covers the roster"
+has "$OUT" "esta tabela conta TODA branch com algum desfecho do gate: on=12 off=10" "the COST table's population is stated: 12 on (11 PASS/FAIL + 1 infra) and 10 off"
+has "$OUT" "a tabela da taxa acima só as de 1o desfecho PASS/FAIL: on=11 off=10" "…next to the RATE table's population (11 on, 10 off), so the two denominators can no longer differ unlabelled"
+has "$OUT" "a diferença são as de 1o desfecho infra/timeout: on=1 off=0" "…and the difference is named (the 1 infra-first bead)"
 has "$OUT" "on=1 off=0" "the infra (ERROR) first outcome is counted apart, not as PASS or FAIL"
 has "$OUT" "1 com braço gravado ≠ recalculado" "the roster arm that disagrees with the real function is flagged"
 has "$OUT" "1 linha(s) ilegível(is)" "the corrupt runs.jsonl line is counted, not fatal, not silent"
@@ -138,6 +144,57 @@ echo "── 3. ITT + the date window ──"
 OUTS="$(apu "$A_HQ" --min-n 10 --since "$(python3 -c "import time;print(time.strftime('%Y-%m-%d',time.gmtime($T0-86400)))")")"
 has "$OUTS" "roster: 22 branches" "--since drops the assignment made 5 days earlier (23 → 22)"
 has "$OUTS" "on (pré)         10        8    80%" "after the date cut: on = 8/10 = 80%"
+
+echo "── 3b. 'no outcome' is three different things: waiting, stale, log gap ──"
+# X: assigned at T0, no gate outcome ever. Y: a later, unrelated bead whose outcome makes the log start after X's assignment.
+XB=($(pick on 2 onx)); YB=($(pick on 1 ony))
+python3 - "$T/specF.json" "${XB[0]}" "${YB[0]}" "$T0" <<'PY'
+import json, sys
+x, y, t0 = sys.argv[2], sys.argv[3], int(sys.argv[4])
+L = [{"bead": x, "branch": f"crew/x/{x}", "assign_arm": "on", "t0": t0, "outcomes": [], "runs": []}]
+json.dump({"beads": L}, open(sys.argv[1], "w"))
+PY
+# F1: fresh, no outcome, the log has an EARLIER dated line (an unrelated outcome two hours before) -> genuinely waiting
+F1_HQ="$T/hqF1"; mk_hq "$F1_HQ"; gen "$F1_HQ" "$T/specF.json"
+python3 - "$F1_HQ" "$T0" <<'PY'
+import sys, time
+hq, t0 = sys.argv[1], int(sys.argv[2])
+stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0 - 7200))
+open(f"{hq}/.gc/logs/quality-gate-dispatcher.log", "w").write(f"[{stamp}] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-old branch=crew/x/other verdict=PASS elapsed=60s ===\n")
+PY
+OUTF1="$(apu "$F1_HQ")"
+has "$OUTF1" "aguardando 1o desfecho do gate: 1" "F1 fresh + covered by the log → waiting"
+hasnt "$OUTF1" "SEM desfecho e FORA da conta" "F1 …and not flagged as stale or a log gap"
+# F2: same data, 3 days later -> stale, NOT waiting: an old bead with no outcome is not 'still waiting'
+OUTF2="$(apu "$F1_HQ" --now "$((T0 + 259200))")"
+has "$OUTF2" "aguardando 1o desfecho do gate: 0" "F2 older than the window → no longer counted as waiting"
+has "$OUTF2" "1 sem desfecho localizável após 48h" "F2 …reported as stale, out loud"
+# F2b: the window is an argument
+OUTF2B="$(apu "$F1_HQ" --now "$((T0 + 259200))" --wait-h 96)"
+has "$OUTF2B" "aguardando 1o desfecho do gate: 1 (atribuídas há ≤ 96h)" "F2b --wait-h 96 widens the window (and the printed window follows)"
+# F3: the log starts AFTER the assignment (rotated): an outcome may exist and not be readable -> log gap, never 'waiting'
+F3_HQ="$T/hqF3"; mk_hq "$F3_HQ"
+python3 - "$T/specF3.json" "${XB[0]}" "${YB[0]}" "$T0" <<'PY'
+import json, sys
+x, y, t0 = sys.argv[2], sys.argv[3], int(sys.argv[4])
+L = [{"bead": x, "branch": f"crew/x/{x}", "assign_arm": "on", "t0": t0, "outcomes": [], "runs": []},
+     {"bead": y, "branch": f"crew/x/{y}", "assign_arm": "on", "t0": t0 + 10800, "outcomes": [["PASS", 10]], "runs": []}]
+json.dump({"beads": L}, open(sys.argv[1], "w"))
+PY
+gen "$F3_HQ" "$T/specF3.json"
+OUTF3="$(apu "$F3_HQ" --now "$((T0 + 14400))")"
+has "$OUTF3" "1 que o log do dispatcher não cobre" "F3 assignment older than the log's first line → 'the log does not cover it'"
+has "$OUTF3" "aguardando 1o desfecho do gate: 0" "F3 …and it is NOT counted as waiting"
+# F4: a log with no dated line at all cannot testify about anything: every outcome-less bead is a log gap
+F4_HQ="$T/hqF4"; mk_hq "$F4_HQ"; gen "$F4_HQ" "$T/specF.json"; printf 'no timestamps here\n' > "$F4_HQ/.gc/logs/quality-gate-dispatcher.log"
+OUTF4="$(apu "$F4_HQ")"
+has "$OUTF4" "1 que o log do dispatcher não cobre" "F4 an undated log → log gap, not 'waiting'"
+# F5: valid JSON that is not a record must not crash the report — it is counted with the unreadable lines
+F5_HQ="$T/hqF5"; mk_hq "$F5_HQ"; gen "$F5_HQ" "$T/specF.json"
+printf '%s\n' '12' 'null' '[1,2]' '"str"' >> "$F5_HQ/.gc/logs/pre-gate-review/runs.jsonl"
+OUTF5="$(apu "$F5_HQ")"; rc=$?
+eq "$rc" "0" "F5 non-object JSON lines → exit 0 (no traceback)"; hasnt "$OUTF5" "Traceback" "F5 …no Python traceback in the report"
+has "$OUTF5" "4 linha(s) ilegível(is) em runs.jsonl" "F5 …and all four are counted as unreadable, not dropped"
 
 echo "── 4. DEGENERATE INPUTS never print a clean zero ──"
 E_HQ="$T/hqE"; mk_hq "$E_HQ"

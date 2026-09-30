@@ -53,6 +53,13 @@ gate_diff_summary() {
 #   "I reviewed part of the change" can no longer produce the same text.
 #   Note: "|| true" suppresses SIGPIPE (exit 141) if a downstream consumer of this output truncates under
 #   pipefail — kept from the original for parity.
+#   Per-file diffs use the pathspec ":(top,literal)<path>". `git diff --name-only` prints ROOT-relative names, but a plain
+#   pathspec is resolved against the runner's cwd, and the gascity rig runs git from `.gascity-gastown-hq/`, a SUBDIRECTORY
+#   of the toplevel: there every per-file diff came back EMPTY (measured: 0 lines, versus 104 from the toplevel), so the
+#   reviewer read "PARTIAL DIFF — showing N of N files" over a blank body. `:(top)` makes the name mean the same thing from
+#   any cwd (the gate's subdirectory and the builder's toplevel then render the same payload) and `literal` keeps a name
+#   containing * or [ from being read as a glob. A file whose per-file diff still comes back empty is listed as omitted, never
+#   counted as shown: an empty answer is not the same thing as "shown, and there was nothing to see".
 gate_build_diff_payload() {
   local _git_fn="${1:-}" _base="${2:-}" _head="${3:-}" _changed_files="${4:-}"
   local _file_count="${5:-0}" _budget="${6:-2000}" _escape_hatch_cmd="${7:-}"
@@ -73,7 +80,12 @@ gate_build_diff_payload() {
     DIFF_FULL=""
     while IFS= read -r _df; do
       [ -z "$_df" ] && continue
-      _FILE_DIFF=$("$_git_fn" diff "$_base...$_head" -- "$_df" 2>/dev/null || true)
+      _FILE_DIFF=$("$_git_fn" diff "$_base...$_head" -- ":(top,literal)$_df" 2>/dev/null || true)
+      if [ -z "$_FILE_DIFF" ]; then
+        DIFF_OMITTED_FILES="${DIFF_OMITTED_FILES}  - ${_df} (its per-file diff came back empty - not shown)
+"
+        continue
+      fi
       _FILE_DIFF_LINES=$(printf '%s\n' "$_FILE_DIFF" | wc -l | tr -d ' ')
       # Always take at least the first file whole (even if it alone exceeds the
       # budget) — one complete file beats zero, and this still never cuts a hunk.
