@@ -2778,6 +2778,27 @@ gate_base_test_file_state() { _gate_base_test_classify state "${1-}" "${2-}" "${
 #     unknown    — unreadable, or read but no test actually passed (zero tests, all skipped).
 gate_base_test_old_form_state() { _gate_base_test_classify old "${1-}" "" "" ""; }
 
+# gate_base_test_is_code_helper <path>  (ga-kisvqp)
+#   yes when <path> is test-side (gate_base_test_is_support) but is CODE that is not itself a test:
+#   conftest.py, a .py/.js/.ts/... helper or a shell script under tests/. These are copied onto the base tree
+#   so a test that imports them gets an honest answer — and they are exactly what could ALSO be the fix (a bead
+#   that repairs test infrastructure). Copying the fix onto base makes the new tests pass there, which must not
+#   read as "proves nothing": a passes-on-base answer is not trusted when any such file travelled (see
+#   _gate_base_test_measure_one). Data (json, txt, snapshots, csv...) cannot be a code fix and does not count;
+#   a test file is handled as a test, and so is a *.selftest.sh. Empty path -> no. Pure (no IO).
+gate_base_test_is_code_helper() {
+  local f="${1-}" base=""
+  if [ -z "$f" ]; then printf 'no'; return 0; fi
+  if [ "$(gate_base_test_is_support "$f")" != "yes" ]; then printf 'no'; return 0; fi
+  if [ "$(gate_base_test_kind "$f")" != "none" ]; then printf 'no'; return 0; fi
+  base="${f##*/}"
+  case "$base" in
+    (*.py|*.js|*.mjs|*.cjs|*.jsx|*.ts|*.tsx|*.sh) printf 'yes' ;;
+    (*) printf 'no' ;;
+  esac
+  return 0
+}
+
 # gate_base_test_sandbox_profile <scratch> [<home>]  (ga-kisvqp)
 #   The macOS sandbox-exec (Seatbelt) profile every pytest/js run is wrapped in. Why the
 #   pytest/js extension needs one when the bash one did not: these files IMPORT the code under
@@ -3081,7 +3102,7 @@ _gate_base_test_alone_table() {
 #     why    "-" for a measured state, else the reason it is unmeasured
 #     old    added | old-passes | old-fails | unknown, only for passes-on-base (ga-yl1k3w repair test)
 #   Reads its caller's locals (dynamic scope): rig basewt tipwt basedir tipdir scratch base tip t0
-#   budget alone_max — it only exists as gate_base_test_pyjs_measure's body, split out for size.
+#   budget alone_max supcode — it only exists as gate_base_test_pyjs_measure's body, split out for size.
 #   Order: tip is the CONTROL and runs first (a file that is not green at tip measures nothing);
 #   then base with the test-side overlay. A test that fails at base is re-run ALONE at both trees. If
 #   instead EVERY tip-passing test passes at base, each is run ALONE at base before the file may be
@@ -3131,6 +3152,10 @@ _gate_base_test_measure_one() {
     (fails-on-base) echo "fails-on-base - -" ;;
     (no-tests) echo "no-tests - -" ;;
     (passes-on-base)
+      # A code helper travelled to base with the tests (supcode, set by the caller). It may itself be the fix,
+      # in which case "passes on base" says nothing about the tests: unmeasured, never a refusal. A FAILURE on
+      # base (handled above) stays evidence either way.
+      if [ "${supcode:-0}" -gt 0 ]; then echo "unmeasured support-overlay -"; return 0; fi
       # ga-yl1k3w for pytest/js: did base's OWN copy of this file pass on base? Old red + new green is
       # a repair, which no builder can make fail on base. An ADDED file has no old form.
       ex=$(git -C "$rig" ls-tree --full-tree "$base" -- "$full" 2>/dev/null) && rc=0 || rc=$?
@@ -3182,7 +3207,7 @@ gate_base_test_pyjs_measure() {
   local max="${GATE_ABT_PYJS_MAX:-8}" budget="${GATE_ABT_PYJS_BUDGET:-240}" alone_max="${GATE_ABT_ALONE_PASS_MAX:-8}"
   local t0=$SECONDS f="" kind="" relf="" list="" prefix="" scratch="" real="" basewt="" tipwt="" basedir="" tipdir=""
   local n=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclass=0 npy=0 njs=0
-  local fail_why="" res="" st="" why="" old="" rest="" sup="" lst="" had_f=1 mat=0
+  local fail_why="" res="" st="" why="" old="" rest="" sup="" lst="" had_f=1 mat=0 supcode=0
 
   list=$(printf '%s\n' "$files" | grep -v '^$' || true)
   n=$(printf '%s\n' "$list" | grep -c . || true)
@@ -3231,6 +3256,7 @@ gate_base_test_pyjs_measure() {
           if ! { mkdir -p "$(dirname "$basewt/$f")" && git -C "$rig" show "${tip}:${f}" > "$basewt/$f"; } 2>/dev/null; then
             fail_why="overlay"; break
           fi
+          if [ "$(gate_base_test_is_code_helper "$f")" = "yes" ]; then supcode=$((supcode + 1)); fi
         fi
       done
       IFS="$oldifs"

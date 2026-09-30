@@ -99,6 +99,22 @@ if need_fn gate_base_test_is_support; then
   eq "empty path -> no" "$(gate_base_test_is_support "")" "no"
 fi
 
+if need_fn gate_base_test_is_code_helper; then
+  echo "  -- gate_base_test_is_code_helper --"
+  eq "tests/conftest.py is a code helper" "$(gate_base_test_is_code_helper tests/conftest.py)" "yes"
+  eq "a .py helper under tests/ is" "$(gate_base_test_is_code_helper tests/gate_pyjs_helper.py)" "yes"
+  eq "a .js setup file under tests-js/ is" "$(gate_base_test_is_code_helper tests-js/setup.js)" "yes"
+  eq "a .ts helper under __tests__/ is" "$(gate_base_test_is_code_helper src/__tests__/util.ts)" "yes"
+  eq "a shell helper under tests/ is" "$(gate_base_test_is_code_helper tests/run.sh)" "yes"
+  eq "a json fixture is DATA, not a code helper" "$(gate_base_test_is_code_helper tests/fixtures/data.json)" "no"
+  eq "a snapshot / text fixture is data" "$(gate_base_test_is_code_helper tests/fixtures/out.txt)" "no"
+  eq "a test file is a TEST, handled on its own, not a helper" "$(gate_base_test_is_code_helper tests/test_mod.py)" "no"
+  eq "a js test file likewise" "$(gate_base_test_is_code_helper tests-js/a.test.js)" "no"
+  eq "production code is not test-side at all" "$(gate_base_test_is_code_helper lib/mod.py)" "no"
+  eq "a *.selftest.sh file is a test of the sh kind, not a helper" "$(gate_base_test_is_code_helper packs/x/foo.selftest.sh)" "no"
+  eq "empty -> no" "$(gate_base_test_is_code_helper "")" "no"
+fi
+
 # tsv <id> <outcome> [<id> <outcome> ...] -> an outcome table as the runners emit it:
 # a "#ok" header (the run was READ) then one "id<TAB>outcome" row per test.
 tsv() {
@@ -624,15 +640,11 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     printf 'from lib.mod import triple\n\ndef test_triple():\n    assert triple(2) == 6\n' > "$C/tests/test_newsym.py"
     printf 'def helper():\n    return 1\n' > "$C/tests/test_zero.py"
     printf 'import pytest\npytest.importorskip("no_such_module_xyz_gate")\n\ndef test_x():\n    assert True\n' > "$C/tests/test_skipall.py"
-    # The helper is imported by a unique top-level name: the WA venv ships a stray top-level `tests`
-    # package in site-packages that shadows `tests.helpers`, which would make this fixture fail at tip.
-    printf 'def one():\n    return 1\n' > "$C/tests/gate_pyjs_helper.py"
-    printf 'from gate_pyjs_helper import one\n\ndef test_h():\n    assert one() == 1\n' > "$C/tests/test_uses_helper.py"
     printf 'STATE = []\n\nfrom lib.mod import double\n\ndef test_a():\n    STATE.append(1)\n\ndef test_b():\n    assert STATE or double(2) == 4\n' > "$C/tests/test_leak.py"
     printf 'from lib.other import inc\n\ndef test_old_red():\n    assert inc(1) == 2\n' > "$C/tests/test_old.py"
     printf 'from lib.mod import double\n\ndef test_keep():\n    assert callable(double) and double is not None\n' > "$C/tests/test_keep.py"
     TIP=$(commit_all "$C" "fix + tests")
-    PYFILES="tests/test_fails.py tests/test_passes.py tests/test_env.py tests/test_newsym.py tests/test_zero.py tests/test_skipall.py tests/test_uses_helper.py tests/test_leak.py tests/test_old.py tests/test_keep.py"
+    PYFILES="tests/test_fails.py tests/test_passes.py tests/test_env.py tests/test_newsym.py tests/test_zero.py tests/test_skipall.py tests/test_leak.py tests/test_old.py tests/test_keep.py"
 
     echo "  -- verdict per file --"
     OUT=$(GATE_ABT_RUN_TIMEOUT=60 GATE_ABT_PYJS_MAX=20 measure "$C" "" "$BASE" "$TIP" $PYFILES)   # 10 files: above the default cap of 8
@@ -643,14 +655,13 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     eq "a test importing a symbol the fix ADDS: base collection error, tip green -> fails-on-base (classic TDD red)" "$(fstate tests/test_newsym.py)" "fails-on-base"
     eq "a test_*.py that holds no tests -> no-tests (not counted as a test file)" "$(fstate tests/test_zero.py)" "no-tests"
     eq "a module skipped wholesale -> unmeasured (it did not run), not no-tests" "$(fstate tests/test_skipall.py)" "unmeasured"
-    eq "a helper the branch adds travels with the test (overlay): the test passes on base -> passes-on-base, not a false ImportError credit" "$(fstate tests/test_uses_helper.py)" "passes-on-base"
     eq "passes in the file run ONLY thanks to a sibling's leaked state, but fails ALONE on base -> fails-on-base (alone sweep), never refused" "$(fstate tests/test_leak.py)" "fails-on-base"
     eq "a MODIFIED test that was RED on base and is green now, green on base too -> passes-on-base with old=old-fails (a repair)" "$(fstate tests/test_old.py)/$(fold tests/test_old.py)" "passes-on-base/old-fails"
     eq "a MODIFIED test that was green before as well -> passes-on-base with old=old-passes (still refusable)" "$(fstate tests/test_keep.py)/$(fold tests/test_keep.py)" "passes-on-base/old-passes"
     eq "an ADDED test that passes on base has no old form -> old=added" "$(fold tests/test_passes.py)" "added"
-    eq "TOTALS counted = files that are really tests (zero-test script excluded)" "$(tot counted)" "9"
-    eq "TOTALS copy_ok = counted (every counted file was materialised on both trees)" "$(tot copy_ok)" "9"
-    eq "TOTALS ran = files with a real answer (fails-on-base + passes-on-base)" "$(tot ran)" "7"
+    eq "TOTALS counted = files that are really tests (zero-test script excluded)" "$(tot counted)" "8"
+    eq "TOTALS copy_ok = counted (every counted file was materialised on both trees)" "$(tot copy_ok)" "8"
+    eq "TOTALS ran = files with a real answer (fails-on-base + passes-on-base)" "$(tot ran)" "6"
     eq "TOTALS failed = files that fail on base" "$(tot failed)" "3"
     eq "TOTALS repaired = passes-on-base whose old form was red" "$(tot repaired)" "1"
     eq "TOTALS unclassified = passes-on-base whose old form could not be measured" "$(tot unclassified)" "0"
@@ -670,6 +681,30 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     eq "totals of {fails, passes} -> reprovou-na-base" "$(gate_base_test_verdict 2 2 2 1 0 0)" "reprovou-na-base"
     eq "totals of {repaired test} -> consertou-teste-vermelho" "$(gate_base_test_verdict 1 1 1 0 1 0)" "consertou-teste-vermelho"
     eq "totals of {zero-test script only} -> sem-teste-novo" "$(gate_base_test_verdict 0 0 0 0 0 0)" "sem-teste-novo"
+
+    echo "  -- test-side support files that travel to base: code helpers vs data --"
+    # A CODE helper (conftest / .py under tests/) is overlaid so a test importing it does not get a false ImportError
+    # 'fails-on-base'. But a helper could ALSO be the fix (a bead repairing test infrastructure); overlaying it then
+    # puts the fix on base and the new tests pass there. A 'passes-on-base' answer is therefore not trusted when code
+    # helpers were overlaid: unmeasured, never a refusal. Evidence that a test FAILS on base is unaffected.
+    C4="$H_SCRATCH/case4"; mk_case "$C4" ""; BASE4=$(git -C "$C4" rev-parse HEAD); fix_code "$C4" ""
+    # (unique module name: the WA venv ships a stray top-level `tests` package that would shadow `tests.helpers`)
+    printf 'def one():\n    return 1\n' > "$C4/tests/gate_pyjs_helper.py"
+    printf 'from gate_pyjs_helper import one\n\ndef test_h():\n    assert one() == 1\n' > "$C4/tests/test_helper_passes.py"
+    printf 'from gate_pyjs_helper import one\nfrom lib.mod import double\n\ndef test_h2():\n    assert double(one() + 1) == 4\n' > "$C4/tests/test_helper_needs_fix.py"
+    TIP4=$(commit_all "$C4" "fix + helper + tests")
+    OUT=$(measure "$C4" "" "$BASE4" "$TIP4" tests/test_helper_passes.py tests/test_helper_needs_fix.py)
+    eq "a code helper was overlaid and the test passes on base -> unmeasured, why=support-overlay (the helper might BE the fix)" \
+      "$(fstate tests/test_helper_passes.py)/$(fwhy tests/test_helper_passes.py)" "unmeasured/support-overlay"
+    eq "...but a test that uses the same helper and FAILS on base is still fails-on-base (overlay makes the evidence accurate, not weaker)" \
+      "$(fstate tests/test_helper_needs_fix.py)" "fails-on-base"
+    eq "...so the totals cannot refuse this submission: ran=1 of 2, failed=1" "$(tot ran)/$(tot failed)" "1/1"
+    C5="$H_SCRATCH/case5"; mk_case "$C5" ""; BASE5=$(git -C "$C5" rev-parse HEAD); fix_code "$C5" ""
+    mkdir -p "$C5/tests/fixtures"; printf '{"n": 1}\n' > "$C5/tests/fixtures/data.json"
+    printf 'import json, pathlib\n\ndef test_data():\n    assert json.loads(pathlib.Path(__file__).parent.joinpath("fixtures/data.json").read_text())["n"] == 1\n' > "$C5/tests/test_data.py"
+    TIP5=$(commit_all "$C5" "data fixture + test")
+    OUT=$(measure "$C5" "" "$BASE5" "$TIP5" tests/test_data.py)
+    eq "a DATA fixture cannot be a code fix: the test passes on base -> still passes-on-base (refusable)" "$(fstate tests/test_data.py)" "passes-on-base"
 
     echo "  -- the alone sweep is bounded: too many tests to check -> unmeasured, never a refusal --"
     printf 'from lib.mod import double\n\ndef test_1():\n    assert callable(double)\n\ndef test_2():\n    assert callable(double)\n\ndef test_3():\n    assert callable(double)\n' > "$C/tests/test_three.py"
