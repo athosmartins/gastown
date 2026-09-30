@@ -2984,7 +2984,7 @@ gate_base_test_sandbox_exec() {
 #   <only> for py is a pytest node id ("tests/t.py::test_a[x]"), for js the test's full name.
 gate_base_test_run_table() {
   local kind="${1-}" rig="${2-}" cwd="${3-}" scratch="${4-}" rel="${5-}" only="${6-}"
-  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" rc=0 real="" interp="" here=""
+  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" rc=0 real="" interp="" here="" node="" vt="" pat=""
   if [ -z "$kind" ] || [ -z "$rig" ] || [ -z "$rel" ] || [ ! -d "$cwd" ] || [ ! -d "$scratch" ]; then return 1; fi
   real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
   rm -f "$real/outcomes.jsonl" "$real/outcomes.jsonl.part" "$real/vitest.json" 2>/dev/null
@@ -3003,8 +3003,290 @@ gate_base_test_run_table() {
       esac
       gate_base_test_parse_pytest "$real/outcomes.jsonl"
       ;;
+    (js)
+      node=$(command -v node 2>/dev/null) || return 1
+      vt="$rig/node_modules/vitest/vitest.mjs"
+      if [ ! -f "$vt" ]; then return 1; fi
+      if [ -n "$only" ]; then
+        # vitest's -t is a REGEX matched against the test's full name. Anchored and escaped, so a
+        # name that is only a prefix of a sibling ("A pass" vs "A passes") matches nothing instead
+        # of quietly running the sibling.
+        pat="^$(printf '%s' "$only" | sed -e 's/[][\.*^$+?(){}|/-]/\\&/g')\$"
+      fi
+      # --no-cache: vitest otherwise tries to write a results cache under node_modules/.vite, which
+      # for a borrowed node_modules is the rig's REAL one. The sandbox refuses the write, and —
+      # measured — vitest then exits 1 with EPERM noise even though every test passed. The report
+      # is still complete (so the 0|1 filter below would tolerate it); the flag just keeps the run
+      # clean and its exit status meaning "tests failed" and nothing else.
+      if [ -n "$pat" ]; then
+        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache \
+          --reporter=json --outputFile="$real/vitest.json" -t "$pat" && rc=0 || rc=$?
+      else
+        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache \
+          --reporter=json --outputFile="$real/vitest.json" && rc=0 || rc=$?
+      fi
+      case "$rc" in
+        (0|1) ;;
+        (*) return 1 ;;
+      esac
+      gate_base_test_parse_vitest "$real/vitest.json" "$rel"
+      ;;
     (*) return 1 ;;
   esac
+}
+
+# _gate_base_test_alone_table <kind> <rig> <cwd> <scratch> <relfile> <ids> [file]  (ga-kisvqp)
+#   Runs each id in <ids> (one per line) ALONE and prints ONE outcome table holding, for each run,
+#   only the row of the test that was asked for (plus any collect-error row: the file never loaded).
+#   The other rows of a filtered run are "skip" (vitest reports filtered-out tests as skipped) and
+#   would overwrite the real answer of a sibling when tables are merged — the asked-for row is the
+#   only one a single-test run can vouch for. Status 1, nothing printed, if ANY of the runs is
+#   unreadable: a missing answer must not be dropped from the merge and leave the rest looking whole.
+#   py ids are pytest node ids; js ids are "<relfile>::<full name>" (the full name is what -t needs).
+#   With a 7th argument "file" each id is run as the WHOLE file instead: used when the file-run at
+#   base was a collection error, where no single test can run (pytest answers a node id inside a
+#   module that cannot import with "found no collectors", a usage error) and the question is only
+#   whether the file-level failure reproduces.
+#   Iterates through a pipe and never expands an id unquoted: ids hold "[a b]" and would glob.
+_gate_base_test_alone_table() {
+  local kind="$1" rig="$2" cwd="$3" scratch="$4" relf="$5" ids="$6" level="${7-}" out=""
+  out=$(printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    only="$id"
+    if [ "$level" = "file" ]; then
+      only=""
+    elif [ "$kind" = "js" ]; then
+      case "$id" in
+        ("$relf"::*) only="${id#"$relf"::}" ;;
+        (*) only="" ;;
+      esac
+    fi
+    if t=$(gate_base_test_run_table "$kind" "$rig" "$cwd" "$scratch" "$relf" "$only"); then
+      printf '%s\n' "$t" | GATE_TID="$id" awk -F'\t' 'NR > 1 && ($1 == ENVIRON["GATE_TID"] || $2 == "collect-error")'
+    else
+      printf '\001UNREADABLE\n'
+    fi
+  done) || return 1
+  case "$out" in
+    (*$'\001'UNREADABLE*) return 1 ;;
+  esac
+  printf '#ok\n'
+  if [ -n "$out" ]; then printf '%s\n' "$out" | awk '!seen[$0]++'; fi
+  return 0
+}
+
+# _gate_base_test_measure_one <kind> <relfile> <fullpath>  (ga-kisvqp)
+#   One test file's verdict. Prints "<state> <why> <old>" (three words, "-" when not applicable):
+#     state  fails-on-base | passes-on-base | no-tests | unmeasured   (gate_base_test_file_state)
+#     why    "-" for a measured state, else the reason it is unmeasured
+#     old    added | old-passes | old-fails | unknown, only for passes-on-base (ga-yl1k3w repair test)
+#   Reads its caller's locals (dynamic scope): rig basewt tipwt basedir tipdir scratch base tip t0
+#   budget alone_max — it only exists as gate_base_test_pyjs_measure's body, split out for size.
+#   Order: tip is the CONTROL and runs first (a file that is not green at tip measures nothing);
+#   then base with the test-side overlay. A test that fails at base is re-run ALONE at both trees. If
+#   instead EVERY tip-passing test passes at base, each is run ALONE at base before the file may be
+#   called passes-on-base: a test that passes in the file run only on state a sibling leaked — and
+#   fails on its own — does depend on the fix, and refusing it would be refusing a good test. More
+#   tip-passing tests than GATE_ABT_ALONE_PASS_MAX to check alone -> unmeasured, never a refusal.
+_gate_base_test_measure_one() {
+  local kind="$1" relf="$2" full="$3"
+  local T="" B="" B2="" D="" D2="" AT="" AB="" st="" old="-" ids="" n=0 O="" ex="" rc=0 lvl=""
+  T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
+  if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
+  B=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf") || { echo "unmeasured base-unreadable -"; return 0; }
+  D=$(gate_base_test_decisive "$T" "$B")
+  if [ -n "$D" ]; then
+    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D") || AT=""
+    case "$B" in
+      (*$'\t'collect-error*) lvl="file" ;;
+      (*) lvl="" ;;
+    esac
+    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$D" "$lvl") || AB=""
+    st=$(gate_base_test_file_state "$T" "$B" "$AT" "$AB")
+  else
+    st=$(gate_base_test_file_state "$T" "$B")
+    if [ "$st" = "passes-on-base" ]; then
+      ids=$(printf '%s\n' "$T" | awk -F'\t' 'NR > 1 && $2 == "pass" { print $1 }')
+      n=$(printf '%s\n' "$ids" | grep -c . || true)
+      if [ "$n" -gt "$alone_max" ]; then echo "unmeasured too-many-tests -"; return 0; fi
+      if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
+      B2=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$ids") || B2=""
+      D2=$(gate_base_test_decisive "$T" "$B2")
+      if [ -n "$D2" ]; then
+        AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D2") || AT=""
+        st=$(gate_base_test_file_state "$T" "$B2" "$AT" "$B2")
+      else
+        st=$(gate_base_test_file_state "$T" "$B2")
+      fi
+    fi
+  fi
+  case "$st" in
+    (fails-on-base) echo "fails-on-base - -" ;;
+    (no-tests) echo "no-tests - -" ;;
+    (passes-on-base)
+      # ga-yl1k3w for pytest/js: did base's OWN copy of this file pass on base? Old red + new green is
+      # a repair, which no builder can make fail on base. An ADDED file has no old form.
+      ex=$(git -C "$rig" ls-tree --full-tree "$base" -- "$full" 2>/dev/null) && rc=0 || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        old="unknown"
+      elif [ -z "$ex" ]; then
+        old="added"
+      elif [ $((SECONDS - t0)) -ge "$budget" ]; then
+        old="unknown"
+      elif git -C "$rig" show "${base}:${full}" > "$basewt/$full" 2>/dev/null; then
+        if O=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf"); then
+          old=$(gate_base_test_old_form_state "$O")
+        else
+          old="unknown"
+        fi
+        # put the branch's version back: the overlay must hold for whatever runs next on this tree
+        git -C "$rig" show "${tip}:${full}" > "$basewt/$full" 2>/dev/null || true
+      else
+        old="unknown"
+      fi
+      echo "passes-on-base - $old" ;;
+    (*) echo "unmeasured not-conclusive -" ;;
+  esac
+  return 0
+}
+
+# gate_base_test_pyjs_measure <rig> <base-sha> <tip-sha> <files>  (ga-kisvqp, E7 of ga-ufskhy)
+#   The ga-rstae base check for pytest/js: does a new/changed test file FAIL on the pre-fix base?
+#   <files> = newline-separated, repo-root-relative (what `git diff --name-only` prints) py/js test
+#   files. Prints one line per file, in order:
+#       FILE <path> kind=<py|js> state=<state> why=<reason|-> old=<old|->
+#   then exactly one line:
+#       TOTALS files=N counted=N copy_ok=N ran=N failed=N repaired=N unclassified=N py=N js=N
+#   — the arguments gate_base_test_verdict already takes (counted = detected; files whose state is
+#   no-tests are not counted: a test_*.py script is not a test). ALWAYS returns 0: "could not
+#   measure" is an answer (state=unmeasured, reason in why=), and the guard runs under set -e.
+#   How: a scratch tree holds two detached checkouts, BASE (the pre-fix commit) and TIP (the
+#   branch). Every test-side file the branch changed (gate_base_test_is_support: the tests, their
+#   conftest/helpers/fixtures) is copied from TIP onto BASE, so a test that imports a helper the
+#   branch added does not "fail" on an ImportError; every OTHER changed file stays at BASE, because
+#   that is the fix. Each file then runs on TIP as the control, and on BASE (see
+#   _gate_base_test_measure_one). Every run is sandboxed (gate_base_test_sandbox_exec); with no
+#   working sandbox nothing runs at all.
+#   Bounds: GATE_ABT_PYJS_MAX files (default 8; more -> all unmeasured, why=cap), GATE_ABT_PYJS_BUDGET
+#   seconds for the whole measurement (default 240; then the rest is unmeasured, why=budget),
+#   GATE_ABT_RUN_TIMEOUT per run (default 90), GATE_ABT_ALONE_PASS_MAX alone checks (default 8).
+gate_base_test_pyjs_measure() {
+  local rig="${1-}" base="${2-}" tip="${3-}" files="${4-}"
+  local max="${GATE_ABT_PYJS_MAX:-8}" budget="${GATE_ABT_PYJS_BUDGET:-240}" alone_max="${GATE_ABT_ALONE_PASS_MAX:-8}"
+  local t0=$SECONDS f="" kind="" relf="" list="" prefix="" scratch="" real="" basewt="" tipwt="" basedir="" tipdir=""
+  local n=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclass=0 npy=0 njs=0
+  local fail_why="" res="" st="" why="" old="" rest="" sup="" lst="" had_f=1 mat=0
+
+  list=$(printf '%s\n' "$files" | grep -v '^$' || true)
+  n=$(printf '%s\n' "$list" | grep -c . || true)
+  npy=$(printf '%s\n' "$list" | grep -c -E '(^|/)(test_[^/]*|[^/]*_test)\.py$' || true)
+  njs=$(printf '%s\n' "$list" | grep -c -E '\.(test|spec)\.(js|mjs|cjs|jsx|ts|tsx)$' || true)
+
+  if [ "$n" -eq 0 ]; then
+    echo "TOTALS files=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 py=0 js=0"
+    return 0
+  fi
+
+  # Preconditions. Any failure marks EVERY file unmeasured with its reason and stops: nothing is run.
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then fail_why="inputs"
+  elif [ "$n" -gt "$max" ]; then fail_why="cap"
+  fi
+  if [ -z "$fail_why" ]; then
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-kisvqp-basetest.XXXXXX" 2>/dev/null) || scratch=""
+    if [ -z "$scratch" ]; then fail_why="scratch"; else real=$(cd "$scratch" 2>/dev/null && pwd -P) || real=""; scratch="$real"; fi
+    if [ -z "$scratch" ]; then [ -n "$fail_why" ] || fail_why="scratch"; fi
+  fi
+  if [ -z "$fail_why" ] && ! gate_base_test_sandbox_ok "$scratch"; then fail_why="no-sandbox"; fi
+  if [ -z "$fail_why" ]; then
+    prefix=$(git -C "$rig" rev-parse --show-prefix 2>/dev/null) || fail_why="worktree"
+  fi
+  if [ -z "$fail_why" ]; then
+    basewt="$scratch/base-wt"; tipwt="$scratch/tip-wt"
+    basedir="$basewt${prefix:+/${prefix%/}}"; tipdir="$tipwt${prefix:+/${prefix%/}}"
+    if ! git -C "$rig" worktree add --detach --quiet "$basewt" "$base" >/dev/null 2>&1; then fail_why="worktree"
+    elif ! git -C "$rig" worktree add --detach --quiet "$tipwt" "$tip" >/dev/null 2>&1; then fail_why="worktree"
+    fi
+  fi
+  if [ -z "$fail_why" ]; then
+    # A borrowed node_modules: neither checkout has its own. The sandbox keeps the link read-only.
+    if [ -d "$rig/node_modules" ]; then
+      [ -e "$basedir/node_modules" ] || ln -s "$rig/node_modules" "$basedir/node_modules" 2>/dev/null || true
+      [ -e "$tipdir/node_modules" ] || ln -s "$rig/node_modules" "$tipdir/node_modules" 2>/dev/null || true
+    fi
+    # Overlay the branch's test-side files onto BASE (everything else stays pre-fix).
+    if ! lst=$(git -C "$rig" -c core.quotePath=false diff --name-only --no-renames --diff-filter=AM "$base" "$tip" -- ':(top)*' 2>/dev/null); then
+      fail_why="overlay"
+    else
+      sup=$(printf '%s\n%s\n' "$lst" "$list" | grep -v '^$' | awk '!seen[$0]++' || true)
+      had_f=1; case "$-" in *f*) had_f=0 ;; esac
+      set -f
+      local oldifs="$IFS"; IFS=$'\n'
+      for f in $sup; do
+        if [ "$(gate_base_test_is_support "$f")" = "yes" ]; then
+          if ! { mkdir -p "$(dirname "$basewt/$f")" && git -C "$rig" show "${tip}:${f}" > "$basewt/$f"; } 2>/dev/null; then
+            fail_why="overlay"; break
+          fi
+        fi
+      done
+      IFS="$oldifs"
+      if [ "$had_f" -eq 1 ]; then set +f; fi
+    fi
+  fi
+
+  had_f=1; case "$-" in *f*) had_f=0 ;; esac
+  set -f
+  local oldifs2="$IFS"; IFS=$'\n'
+  for f in $list; do
+    kind=$(gate_base_test_kind "$f")
+    st="unmeasured"; why="$fail_why"; old="-"; mat=0
+    if [ -z "$fail_why" ]; then
+      case "$kind" in
+        (py|js)
+          relf="${f#"$prefix"}"
+          if [ "$relf" = "$f" ] && [ -n "$prefix" ]; then
+            why="outside-rig"
+          elif [ ! -f "$basedir/$relf" ] || [ ! -f "$tipdir/$relf" ]; then
+            why="missing-file"
+          else
+            mat=1
+            if [ $((SECONDS - t0)) -ge "$budget" ]; then
+              why="budget"
+            else
+              res=$(_gate_base_test_measure_one "$kind" "$relf" "$f")
+              st="${res%% *}"; rest="${res#* }"; why="${rest%% *}"; old="${rest#* }"
+            fi
+          fi ;;
+        (*) why="not-a-test" ;;
+      esac
+    fi
+    # copy_ok counts the files that are COUNTED and were materialised on both trees: it is compared with
+    # counted by gate_base_test_verdict, so a no-tests script must be in neither.
+    if [ "$st" != "no-tests" ]; then
+      counted=$((counted + 1))
+      if [ "$mat" -eq 1 ]; then copy_ok=$((copy_ok + 1)); fi
+    fi
+    case "$st" in
+      (fails-on-base) ran=$((ran + 1)); failed=$((failed + 1)) ;;
+      (passes-on-base)
+        ran=$((ran + 1))
+        case "$old" in
+          (old-fails) repaired=$((repaired + 1)) ;;
+          (added|old-passes) ;;
+          (*) unclass=$((unclass + 1)) ;;
+        esac ;;
+    esac
+    echo "FILE $f kind=$kind state=$st why=${why:--} old=${old:--}"
+  done
+  IFS="$oldifs2"
+  if [ "$had_f" -eq 1 ]; then set +f; fi
+
+  # Teardown: both checkouts, then the scratch tree. Never fails the caller.
+  if [ -n "$basewt" ]; then git -C "$rig" worktree remove --force "$basewt" >/dev/null 2>&1 || true; fi
+  if [ -n "$tipwt" ]; then git -C "$rig" worktree remove --force "$tipwt" >/dev/null 2>&1 || true; fi
+  if [ -n "$basewt" ]; then git -C "$rig" worktree prune >/dev/null 2>&1 || true; fi
+  if [ -n "$scratch" ] && [ -d "$scratch" ]; then rm -rf "$scratch" 2>/dev/null || true; fi
+  echo "TOTALS files=$n counted=$counted copy_ok=$copy_ok ran=$ran failed=$failed repaired=$repaired unclassified=$unclass py=$npy js=$njs"
+  return 0
 }
 
 # gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'> <its-diagnostic>

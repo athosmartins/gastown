@@ -494,6 +494,213 @@ PY
   fi
 fi
 
+if need_fn gate_base_test_run_table; then
+  echo "  -- gate_base_test_run_table (vitest) --"
+  if [ "$HAVE_VITEST" != yes ]; then
+    skip "no vitest at $WA_NODE_MODULES (or no node) — vitest runs not exercised"
+  else
+    JRIG="$H_SCRATCH/rig-js"; mk_rig "$JRIG"
+    cat > "$JRIG/tests-js/a.test.js" <<'JS'
+describe('A', () => {
+  it('passes', () => { expect(1 + 1).toBe(2); });
+  it('fails', () => { expect(1 + 1).toBe(3); });
+  it.skip('is skipped', () => {});
+  it('has (regex)? [chars]', () => { expect(true).toBe(true); });
+});
+JS
+    printf "const x = require('../no-such-module');\ndescribe('B', () => { it('x', () => { expect(x).toBeTruthy(); }); });\n" > "$JRIG/tests-js/b.test.js"
+    printf "describe('S', () => { it('spins', () => { for (;;) {} }); });\n" > "$JRIG/tests-js/spin.test.js"
+    printf "describe('N', () => { it('net', async () => {\n  const net = await import('node:net');\n  await new Promise((res, rej) => { const s = net.connect(%s, '127.0.0.1', () => { s.end(); res(); }); s.on('error', rej); });\n}); });\n" "$PORT" > "$JRIG/tests-js/net.test.js"
+    printf "describe('W', () => { it('writes', async () => {\n  const fs = await import('node:fs');\n  fs.writeFileSync('%s/vitest-escape', 'x');\n}); });\n" "$H_SCRATCH" > "$JRIG/tests-js/write.test.js"
+    mkdir -p "$JRIG/src"; printf "describe('O', () => { it('o', () => {}); });\n" > "$JRIG/src/outside.test.js"
+    JS_S="$H_SCRATCH/jrs"; mkdir -p "$JS_S"
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/a.test.js); RC=$?
+    eq "a vitest file runs to a readable table (status 0)" "$RC" "0"
+    eq "...one row per test: statuses right, skipped is skip, regex characters in the name intact" "$T" \
+      "$(printf '#ok\ntests-js/a.test.js::A passes\tpass\ntests-js/a.test.js::A fails\tfail\ntests-js/a.test.js::A is skipped\tskip\ntests-js/a.test.js::A has (regex)? [chars]\tpass')"
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/a.test.js "A has (regex)? [chars]")
+    eq "run ALONE (by full name): exactly the requested test is a pass" \
+      "$(printf '%s\n' "$T" | grep -c "$(printf 'tests-js/a.test.js::A has (regex)? \\[chars\\]\tpass')")" "1"
+    eq "...and every OTHER test is reported skip (filtered out), never pass" \
+      "$(printf '%s\n' "$T" | grep -v -F 'has (regex)' | grep -c "$(printf '\tpass$')")" "0"
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/a.test.js "A pass")
+    eq "a name that is only a PREFIX of another test matches nothing (anchored), so the alone run cannot pick up a sibling" \
+      "$(printf '%s\n' "$T" | grep -c "$(printf '\tpass$')")" "0"
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/b.test.js); RC=$?
+    eq "a suite that cannot load is a readable collect-error table (status 0)" "$RC" "0"
+    eq "...keyed by the file" "$T" "$(printf '#ok\ntests-js/b.test.js\tcollect-error')"
+    T=$(GATE_ABT_RUN_TIMEOUT=4 gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/spin.test.js); RC=$?
+    eq "a test that spins forever is killed by the budget -> UNREADABLE (status 1)" "$RC" "1"; eq "...and prints nothing" "$T" ""
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/net.test.js)
+    eq "a vitest test that reaches the network FAILS under the sandbox" "$T" "$(printf '#ok\ntests-js/net.test.js::N net\tfail')"
+    T=$(gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/write.test.js)
+    eq "a vitest test that writes outside the scratch FAILS under the sandbox" "$T" "$(printf '#ok\ntests-js/write.test.js::W writes\tfail')"
+    eq "...and the file was not created" "$([ -e "$H_SCRATCH/vitest-escape" ] && echo created || echo absent)" "absent"
+    gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" src/outside.test.js >/dev/null
+    eq "a file outside vitest's include (never run) -> status 1, NOT an empty table" "$?" "1"
+    gate_base_test_run_table js "$JRIG" "$JRIG" "$JS_S" tests-js/does-not-exist.test.js >/dev/null
+    eq "a file that does not exist -> status 1" "$?" "1"
+    mkdir -p "$H_SCRATCH/rig-js-nonm"
+    gate_base_test_run_table js "$H_SCRATCH/rig-js-nonm" "$JRIG" "$JS_S" tests-js/a.test.js >/dev/null
+    eq "a rig with no node_modules/vitest -> status 1" "$?" "1"
+    # Nothing the run did may touch the rig's REAL node_modules (vitest wants to write a results cache there).
+    NM_NEWER=$(find "$WA_NODE_MODULES/.vite" -newer "$JRIG/vitest.config.js" -type f 2>/dev/null | head -1)
+    eq "the borrowed node_modules was not written to (vitest cache stays off)" "$NM_NEWER" ""
+  fi
+fi
+
+# ── 5. The orchestrator: base vs tip over real git history ──
+echo "── 5. gate_base_test_pyjs_measure (base/tip over real git history) ──"
+
+# mk_case <repo-dir> <subdir>: a repo whose RIG lives at <repo-dir>/<subdir> ("" = the toplevel).
+# Base commit = code with a bug (double returns x), one test already RED on base, one green.
+mk_case() {
+  local R="$1" SUB="$2" D=""
+  D="$R${SUB:+/$SUB}"
+  mkdir -p "$D/lib" "$D/tests" "$D/tests-js"
+  git -C "$R" init -q . && git -C "$R" config user.email t@t && git -C "$R" config user.name t
+  printf '[pytest]\npythonpath = . lib\ntestpaths = tests\n' > "$D/pytest.ini"
+  : > "$D/lib/__init__.py"
+  printf 'def double(x):\n    return x\n' > "$D/lib/mod.py"
+  printf 'module.exports = { double: (x) => x };\n' > "$D/lib/mod.js"
+  printf 'def inc(x):\n    return x + 1\n' > "$D/lib/other.py"
+  printf 'from lib.other import inc\n\ndef test_old_red():\n    assert inc(1) == 3\n' > "$D/tests/test_old.py"
+  printf 'from lib.mod import double\n\ndef test_keep():\n    assert callable(double)\n' > "$D/tests/test_keep.py"
+  printf "export default { test: { environment: 'node', include: ['tests-js/**/*.test.js'], globals: true } };\n" > "$D/vitest.config.js"
+  printf '/venv\n/node_modules\n' > "$R/.gitignore"
+  [ "$HAVE_PYTEST" = yes ] && ln -s "$WA_VENV" "$D/venv"
+  [ "$HAVE_VITEST" = yes ] && ln -s "$WA_NODE_MODULES" "$D/node_modules"
+  git -C "$R" add -A && git -C "$R" commit -q -m base
+}
+# fix_commit <repo-dir> <subdir>: the "fix" — double works, and triple exists.
+fix_code() {
+  local D="$1${2:+/$2}"
+  printf 'def double(x):\n    return x + x\n\ndef triple(x):\n    return x * 3\n' > "$D/lib/mod.py"
+  printf 'module.exports = { double: (x) => x + x };\n' > "$D/lib/mod.js"
+}
+commit_all() { git -C "$1" add -A && git -C "$1" commit -q -m "$2" && git -C "$1" rev-parse HEAD; }
+# measure <repo> <subdir> <base> <tip> <files...>  (files are repo-root-relative, like `git diff --name-only`)
+measure() {
+  local R="$1" SUB="$2" B="$3" T="$4"; shift 4
+  gate_base_test_pyjs_measure "$R${SUB:+/$SUB}" "$B" "$T" "$(printf '%s\n' "$@")"
+}
+fstate() { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* state=\([^ ]*\).*/\1/p'; }
+fold()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* old=\([^ ]*\).*/\1/p'; }
+fwhy()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* why=\([^ ]*\).*/\1/p'; }
+tot()    { printf '%s\n' "$OUT" | grep '^TOTALS ' | tr ' ' '\n' | grep "^$1=" | cut -d= -f2; }
+
+if need_fn gate_base_test_pyjs_measure; then
+  if [ "$HAVE_PYTEST" != yes ]; then
+    skip "no pytest-capable venv — measure scenarios not exercised"
+  else
+    TMP_BEFORE=$(ls -A "${TMPDIR:-/tmp}" 2>/dev/null | grep -c '^gate-kisvqp-basetest\.')
+    C="$H_SCRATCH/case1"; mk_case "$C" ""
+    BASE=$(git -C "$C" rev-parse HEAD)
+    fix_code "$C" ""
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$C/tests/test_fails.py"
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$C/tests/test_passes.py"
+    printf 'import os\n\ndef test_env():\n    assert os.path.exists("/definitely/not/here/gate")\n' > "$C/tests/test_env.py"
+    printf 'from lib.mod import triple\n\ndef test_triple():\n    assert triple(2) == 6\n' > "$C/tests/test_newsym.py"
+    printf 'def helper():\n    return 1\n' > "$C/tests/test_zero.py"
+    printf 'import pytest\npytest.importorskip("no_such_module_xyz_gate")\n\ndef test_x():\n    assert True\n' > "$C/tests/test_skipall.py"
+    # The helper is imported by a unique top-level name: the WA venv ships a stray top-level `tests`
+    # package in site-packages that shadows `tests.helpers`, which would make this fixture fail at tip.
+    printf 'def one():\n    return 1\n' > "$C/tests/gate_pyjs_helper.py"
+    printf 'from gate_pyjs_helper import one\n\ndef test_h():\n    assert one() == 1\n' > "$C/tests/test_uses_helper.py"
+    printf 'STATE = []\n\nfrom lib.mod import double\n\ndef test_a():\n    STATE.append(1)\n\ndef test_b():\n    assert STATE or double(2) == 4\n' > "$C/tests/test_leak.py"
+    printf 'from lib.other import inc\n\ndef test_old_red():\n    assert inc(1) == 2\n' > "$C/tests/test_old.py"
+    printf 'from lib.mod import double\n\ndef test_keep():\n    assert callable(double) and double is not None\n' > "$C/tests/test_keep.py"
+    TIP=$(commit_all "$C" "fix + tests")
+    PYFILES="tests/test_fails.py tests/test_passes.py tests/test_env.py tests/test_newsym.py tests/test_zero.py tests/test_skipall.py tests/test_uses_helper.py tests/test_leak.py tests/test_old.py tests/test_keep.py"
+
+    echo "  -- verdict per file --"
+    OUT=$(GATE_ABT_RUN_TIMEOUT=60 GATE_ABT_PYJS_MAX=20 measure "$C" "" "$BASE" "$TIP" $PYFILES)   # 10 files: above the default cap of 8
+    eq "output ends in exactly one TOTALS line" "$(printf '%s\n' "$OUT" | grep -c '^TOTALS ')" "1"
+    eq "a test that needs the fix: passes at tip, FAILS at base, confirmed alone -> fails-on-base" "$(fstate tests/test_fails.py)" "fails-on-base"
+    eq "a test that passes with or without the fix -> passes-on-base (the file that may be refused)" "$(fstate tests/test_passes.py)" "passes-on-base"
+    eq "a test that fails at TIP too (environment, not the fix) -> unmeasured, never fails-on-base" "$(fstate tests/test_env.py)" "unmeasured"
+    eq "a test importing a symbol the fix ADDS: base collection error, tip green -> fails-on-base (classic TDD red)" "$(fstate tests/test_newsym.py)" "fails-on-base"
+    eq "a test_*.py that holds no tests -> no-tests (not counted as a test file)" "$(fstate tests/test_zero.py)" "no-tests"
+    eq "a module skipped wholesale -> unmeasured (it did not run), not no-tests" "$(fstate tests/test_skipall.py)" "unmeasured"
+    eq "a helper the branch adds travels with the test (overlay): the test passes on base -> passes-on-base, not a false ImportError credit" "$(fstate tests/test_uses_helper.py)" "passes-on-base"
+    eq "passes in the file run ONLY thanks to a sibling's leaked state, but fails ALONE on base -> fails-on-base (alone sweep), never refused" "$(fstate tests/test_leak.py)" "fails-on-base"
+    eq "a MODIFIED test that was RED on base and is green now, green on base too -> passes-on-base with old=old-fails (a repair)" "$(fstate tests/test_old.py)/$(fold tests/test_old.py)" "passes-on-base/old-fails"
+    eq "a MODIFIED test that was green before as well -> passes-on-base with old=old-passes (still refusable)" "$(fstate tests/test_keep.py)/$(fold tests/test_keep.py)" "passes-on-base/old-passes"
+    eq "an ADDED test that passes on base has no old form -> old=added" "$(fold tests/test_passes.py)" "added"
+    eq "TOTALS counted = files that are really tests (zero-test script excluded)" "$(tot counted)" "9"
+    eq "TOTALS copy_ok = counted (every counted file was materialised on both trees)" "$(tot copy_ok)" "9"
+    eq "TOTALS ran = files with a real answer (fails-on-base + passes-on-base)" "$(tot ran)" "7"
+    eq "TOTALS failed = files that fail on base" "$(tot failed)" "3"
+    eq "TOTALS repaired = passes-on-base whose old form was red" "$(tot repaired)" "1"
+    eq "TOTALS unclassified = passes-on-base whose old form could not be measured" "$(tot unclassified)" "0"
+    # Feed the totals to the REAL ga-rstae verdict function: the pieces must compose.
+    eq "the totals drive gate_base_test_verdict: two unmeasured files -> nao-consegui-medir (partial measurement is not proof)" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
+
+    echo "  -- verdict composition: only clean answers may refuse --"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
+    eq "one file, passes on base -> totals give passou-na-base (the refusal)" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "passou-na-base"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_fails.py)
+    eq "passes + fails-on-base together -> reprovou-na-base (the good case wins)" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "reprovou-na-base"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_old.py)
+    eq "a pure repair -> consertou-teste-vermelho (never refused)" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "consertou-teste-vermelho"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_env.py)
+    eq "a passing file plus an UNMEASURED one -> nao-consegui-medir (never refused on partial evidence)" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_zero.py)
+    eq "only a zero-test script -> counted=0 -> sem-teste-novo" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "sem-teste-novo"
+
+    echo "  -- degraded environments: every one is unmeasured, none is a refusal --"
+    OUT=$(GATE_ABT_SANDBOX_EXEC=/nonexistent/sandbox-exec measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
+    eq "no working sandbox -> unmeasured, why=no-sandbox" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/no-sandbox"
+    eq "...and ran=0 (nothing was executed)" "$(tot ran)" "0"
+    OUT=$(GATE_ABT_PYJS_MAX=1 measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_fails.py)
+    eq "more files than the cap -> every file unmeasured, why=cap (a cap hit is visible, never a silent truncation)" \
+      "$(fstate tests/test_passes.py)/$(fstate tests/test_fails.py)/$(fwhy tests/test_fails.py)" "unmeasured/unmeasured/cap"
+    OUT=$(GATE_ABT_PYJS_BUDGET=0 measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
+    eq "an exhausted time budget -> unmeasured, why=budget" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/budget"
+    OUT=$(measure "$C" "" "deadbeef00000000000000000000000000000000" "$TIP" tests/test_passes.py)
+    eq "an unresolvable base sha -> unmeasured, why=worktree" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/worktree"
+    OUT=$(gate_base_test_pyjs_measure "$H_SCRATCH/rig-novenv" "$BASE" "$TIP" "tests/test_passes.py")
+    eq "a rig that is not a git repo -> unmeasured (and no crash)" "$(fstate tests/test_passes.py)" "unmeasured"
+    OUT=$(gate_base_test_pyjs_measure "$C" "$BASE" "$TIP" "")
+    eq "an empty file list -> TOTALS with counted=0 (nothing to measure is a MEASURED zero only for the caller that listed nothing)" "$(tot counted)" "0"
+    eq "tests/ helper-only file (no kind) handed in by mistake -> unmeasured, never silently dropped" \
+      "$(OUT=$(measure "$C" "" "$BASE" "$TIP" tests/gate_pyjs_helper.py); fstate tests/gate_pyjs_helper.py)" "unmeasured"
+    C_TMPLEFT=$(ls -A "${TMPDIR:-/tmp}" 2>/dev/null | grep -c '^gate-kisvqp-basetest\.')
+    eq "no scratch directory left behind in TMPDIR" "$C_TMPLEFT" "$TMP_BEFORE"
+    eq "no throwaway worktree left registered in the repo" "$(git -C "$C" worktree list | wc -l | tr -d ' ')" "1"
+    eq "the rig's own files were not touched by the runs" "$(git -C "$C" status --porcelain | wc -l | tr -d ' ')" "0"
+
+    echo "  -- timeouts: a run that exceeds its budget is unmeasured --"
+    C2="$H_SCRATCH/case2"; mk_case "$C2" ""
+    printf 'def double(x):\n    while True:\n        pass\n' > "$C2/lib/mod.py"; git -C "$C2" add -A; git -C "$C2" commit -q -m "base hangs"
+    BASE2=$(git -C "$C2" rev-parse HEAD); fix_code "$C2" ""
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$C2/tests/test_hang.py"
+    TIP2=$(commit_all "$C2" "fix")
+    OUT=$(GATE_ABT_RUN_TIMEOUT=4 measure "$C2" "" "$BASE2" "$TIP2" tests/test_hang.py)
+    eq "base hangs (infinite loop) while tip is fine -> unmeasured, NOT fails-on-base (slowness is not evidence)" "$(fstate tests/test_hang.py)" "unmeasured"
+
+    echo "  -- a rig that is a SUBDIRECTORY of the repo (the gascity layout) --"
+    C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"
+    BASE3=$(git -C "$C3" rev-parse HEAD); fix_code "$C3" "rig"
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$C3/rig/tests/test_fails.py"
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$C3/rig/tests/test_passes.py"
+    TIP3=$(commit_all "$C3" "fix + tests")
+    OUT=$(measure "$C3" "rig" "$BASE3" "$TIP3" rig/tests/test_fails.py rig/tests/test_passes.py)
+    eq "subdirectory rig: root-relative paths resolve to the right files (fails-on-base)" "$(fstate rig/tests/test_fails.py)" "fails-on-base"
+    eq "subdirectory rig: (passes-on-base)" "$(fstate rig/tests/test_passes.py)" "passes-on-base"
+
+    echo "  -- the guard runs under set -euo pipefail --"
+    OUT=$(bash -c 'set -euo pipefail; GATE_GUARD_LIB_ONLY=1 . "$1"; O=$(gate_base_test_pyjs_measure "$2" "$3" "$4" "tests/test_env.py"); echo "survived:$(printf "%s\n" "$O" | grep -c "^TOTALS ")"' _ "$GUARD" "$C" "$BASE" "$TIP" 2>&1 | tail -1)
+    eq "an unmeasured file (non-zero runs inside) does not abort the sweep under set -e" "$OUT" "survived:1"
+  fi
+fi
+
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
 if [ "$FAIL" -eq 0 ]; then
