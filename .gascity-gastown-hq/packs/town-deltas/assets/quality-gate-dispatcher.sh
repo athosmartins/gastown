@@ -5824,6 +5824,68 @@ gate_park_note_skipped() {
   return 0
 }
 
+# gate_noeval_requeue_decision <marker_id>   (ga-5w2gpw item a)
+# A run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that timed out, or a
+# verdict bead closed with no verdict (ga-w7pm55) — is not a rejection of anything, so it
+# is re-queued (fresh reviewers on the next sweep) instead of going down the FAIL path,
+# which would post "Fix THESE specific blocking issues" on a bead nobody found fault with
+# and hand it back to the pool. E4 (docs/reports/gate-e4-historico.md §1): these were 110
+# of the 207 reprovações sem revisão de código.
+#
+# The requeue must be BOUNDED: a reviewer that is wedged on every attempt would loop
+# forever. The bound is a counter label on the MARKER (gate:noeval-requeue:N — the marker
+# survives a requeue, the gate-run bead does not) capped by GATE_NOEVAL_REQUEUE_CAP
+# (default 2; 0 turns the requeue off). Past the cap the caller takes the legacy no-eval
+# FAIL path, unchanged (hold class, fix-attempt untouched, Mayor paged by
+# gate_fail_settle_deferred_mayor_wake).
+#
+# Prints exactly one line, and ONLY the literal "requeue:<n>" earns a requeue:
+#   requeue:<n>         the n-th requeue; the counter label was written AND read back
+#   fail:cap            the cap is spent (or 0): nothing written
+#   fail:unreadable     the marker could not be read (bd failed, non-JSON, an error
+#                       envelope, or a payload that is not THIS marker): nothing written
+#   fail:not-recorded   the counter write did not stick: a count that cannot be recorded
+#                       cannot bound the loop, so there is no requeue
+#   fail:no-marker      empty marker id
+# Three states, never two (error != empty): an unreadable counter is NOT a counter of 0 —
+# reading it as 0 would let a run that cannot be bounded requeue forever.
+# Write order is add-new, VERIFY, then remove-old (the same add-before-remove invariant as
+# set_gate_status): a write that is lost must never leave the counter lower than it was.
+# Always returns 0: the caller runs under `set -e`.
+gate_noeval_requeue_decision() {
+  local _id="${1:-}" _cap="${GATE_NOEVAL_REQUEUE_CAP:-2}" _raw _mid _labels _cur _next _l _back
+  case "$_cap" in ''|*[!0-9]*) _cap=2 ;; esac
+  if [ -z "$_id" ]; then printf 'fail:no-marker\n'; return 0; fi
+  if ! _raw=$(bd -C "$GC_CITY" show "$_id" --json 2>/dev/null) || [ -z "$_raw" ]; then
+    printf 'fail:unreadable\n'; return 0
+  fi
+  if ! _mid=$(printf '%s' "$_raw" | jq -r 'if type=="array" then .[0] else . end | .id // empty' 2>/dev/null) \
+     || [ "$_mid" != "$_id" ]; then
+    printf 'fail:unreadable\n'; return 0
+  fi
+  if ! _labels=$(printf '%s' "$_raw" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null); then
+    printf 'fail:unreadable\n'; return 0
+  fi
+  # MAX, not MIN: coexisting counters are what a lost `label remove` leaves behind ({1,2}),
+  # and MIN would read that as 1 and stall below the cap.
+  _cur=$(printf '%s\n' "$_labels" | tr ' ' '\n' | sed -n 's/^gate:noeval-requeue:\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
+  [ -z "$_cur" ] && _cur=0
+  if [ "$_cur" -ge "$_cap" ]; then printf 'fail:cap\n'; return 0; fi
+  _next=$((_cur + 1))
+  bd -C "$GC_CITY" label add "$_id" "gate:noeval-requeue:$_next" -q 2>/dev/null || true
+  # Verify by READING IT BACK (a fire-and-forget `|| true` write proves nothing — ga-6dp9).
+  if ! _back=$(gate_marker_label_snapshot "$_id") \
+     || ! printf '%s\n' "$_back" | tr ' ' '\n' | grep -qx "gate:noeval-requeue:$_next"; then
+    printf 'fail:not-recorded\n'; return 0
+  fi
+  for _l in $(printf '%s\n' "$_labels" | tr ' ' '\n' | grep '^gate:noeval-requeue:'); do
+    [ "$_l" = "gate:noeval-requeue:$_next" ] && continue
+    bd -C "$GC_CITY" label remove "$_id" "$_l" -q 2>/dev/null || true
+  done
+  printf 'requeue:%s\n' "$_next"
+  return 0
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -6233,6 +6295,44 @@ cleanup_reviewer_sessions
 GATE_END_EPOCH=$(date +%s)
 ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
 
+# ── ga-5w2gpw (a): NO-EVAL re-queue — a run nobody judged is not a FAIL ──────────
+# GATE_FAIL_NO_EVAL=1 (raised by Phase C's genuine-timeout branch, ga-mcapdq, and by
+# gate_collect_verdicts for a verdict bead closed with no verdict, ga-w7pm55) means NO
+# reviewer evaluated this code. It used to fall through to the FAIL path below: "Fix THESE
+# specific blocking issues" posted on the source bead, gate:needs-fix, and the bead handed
+# back to the pool to repair a defect nobody found (E4: 110 of the 207 reprovações sem
+# revisão de código). Convert it into the infra requeue right below instead — same
+# mechanism as a dead reviewer (ga-eqjo): marker back to queued, fresh reviewers next sweep.
+# BOUNDED by gate_noeval_requeue_decision (see its header): past the cap, or when the
+# counter is unreadable / unrecordable, nothing changes here and the run takes the legacy
+# no-eval FAIL path (hold class, fix-attempt untouched, Mayor paged). Only the literal
+# "requeue:<n>" converts; anything else — garbage, empty, a fail:* reason — stays inert.
+# Runs BEFORE the requeue block: after it the flag would be consumed too late. A run with a
+# JUDGED FAIL (GATE_FAIL_NO_EVAL=0) never reaches the decision — a real rejection stays a FAIL.
+# SELFTEST-EXTRACT noeval-requeue-gate: BEGIN
+if [ "${GATE_FAIL_NO_EVAL:-0}" = "1" ] && [ "$OVERALL_VERDICT" = "FAIL" ] && [ "${QUOTA_REQUEUE:-0}" != "1" ]; then
+  local _NOEVAL_DECISION
+  # `if ! x=$(...)`, never `x=$(... || true)`: a fatal shell error inside the function kills
+  # the command-substitution subshell BEFORE the `|| true` is reached, and its non-zero status
+  # would then abort this whole `set -e` finalize. A dead decision is the inert one: no requeue.
+  if ! _NOEVAL_DECISION=$(gate_noeval_requeue_decision "$MARKER_ID" 2>/dev/null); then
+    _NOEVAL_DECISION=""
+  fi
+  case "$_NOEVAL_DECISION" in
+    requeue:[0-9]*)
+      QUOTA_REQUEUE=1
+      REQUEUE_REASON="no-eval"
+      GATE_NOEVAL_REQUEUE_N="${_NOEVAL_DECISION#requeue:}"
+      GATE_FAIL_NO_EVAL=0  # consumed: it must not leak into the next run finalized in this sweep
+      log "ga-5w2gpw: run $GATE_RUN_ID produced no verdict from any reviewer (timeout / verdict bead closed empty) — re-queueing marker $MARKER_ID (no-eval requeue $GATE_NOEVAL_REQUEUE_N of ${GATE_NOEVAL_REQUEUE_CAP:-2}) instead of failing code nobody judged."
+      ;;
+    *)
+      warn "ga-5w2gpw: run $GATE_RUN_ID produced no verdict from any reviewer, but it is NOT re-queued (${_NOEVAL_DECISION:-no decision}) — taking the legacy no-eval FAIL path (hold class, fix-attempt untouched)."
+      ;;
+  esac
+fi
+# SELFTEST-EXTRACT noeval-requeue-gate: END
+
 # ── ga-x3nmz: QUOTA-STOP re-queue — never false-FAIL on an exhausted 5h window ─
 # A timeout or dead reviewer slot that coincided with an exhausted Claude 5h
 # quota is a quota-stop, not a logic failure. Re-queue the marker (back to
@@ -6243,7 +6343,38 @@ ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
 # (AC4). This branch is mutually exclusive with the PASS/FAIL paths below.
 # SELFTEST-EXTRACT infra-requeue-block: BEGIN
 if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
-  if [ "${REQUEUE_REASON:-quota}" = "dead-reviewer" ]; then
+  if [ "${REQUEUE_REASON:-quota}" = "dead-reviewer" ] || [ "${REQUEUE_REASON:-quota}" = "no-eval" ]; then
+    # ga-5w2gpw (a): REQUEUE_REASON=no-eval shares this branch's MECHANISM (verdict beads
+    # parked REQUEUED, marker back to queued through gate_requeue_respecting_external,
+    # gate-run superseded, gate:reviewing cleared) — only the WORDS differ, because "the
+    # reviewer died" and "the 5h quota ran out" would both be false for a reviewer that
+    # simply delivered no verdict. The dead-reviewer values below are the original texts,
+    # byte for byte (gate-dl3x9s-requeue-external.selftest.sh asserts them).
+    if [ "${REQUEUE_REASON:-quota}" = "no-eval" ]; then
+      _RQ_TAG="ga-5w2gpw"
+      _RQ_KIND="NO-EVAL re-queue (ga-5w2gpw)"
+      _RQ_LOG_CAUSE="the run ended with no verdict from any reviewer (a live reviewer timed out, or a verdict bead closed without one) — nobody judged the code, so this is not a code FAIL."
+      _RQ_VB_CAUSE="no verdict was delivered (reviewer timed out, or closed without judging — NOT a code FAIL)."
+      _RQ_MK_CAUSE="the run ended with no verdict from any reviewer (nobody judged the code, NOT a code FAIL)"
+      _RQ_MK_OK_CAUSE="the run ended with no verdict from any reviewer (a live reviewer timed out, or a verdict bead closed without one; no-eval requeue ${GATE_NOEVAL_REQUEUE_N:-?} of ${GATE_NOEVAL_REQUEUE_CAP:-2}) — nobody judged the code, so this is NOT a code FAIL."
+      _RQ_RUN_KIND="no-eval re-queue, ga-5w2gpw"
+      _RQ_RUN_CAUSE="no reviewer delivered a verdict (timeout, or a verdict bead closed without one)"
+      _RQ_CLOSE_KIND="no-eval re-queue (ga-5w2gpw)"
+      _RQ_NOTIFY_TITLE="⏸️ Gate re-enfileirado: revisor sem veredito"
+      _RQ_NOTIFY_BODY="Gate $BRANCH re-enfileirado — o revisor não entregou veredito (timeout / sem veredito): ninguém avaliou o código, não é FAIL (ga-5w2gpw)."
+    else
+      _RQ_TAG="ga-eqjo"
+      _RQ_KIND="INFRA re-queue (ga-eqjo)"
+      _RQ_LOG_CAUSE="reviewer session(s) died mid-review (Dolt hiccup/crash class, not a code FAIL)."
+      _RQ_VB_CAUSE="reviewer session died mid-review (infra failure, NOT a code FAIL)."
+      _RQ_MK_CAUSE="reviewer session(s) died mid-review (an infra failure, NOT a code FAIL)"
+      _RQ_MK_OK_CAUSE="reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL."
+      _RQ_RUN_KIND="infra re-queue, ga-eqjo"
+      _RQ_RUN_CAUSE="reviewer session(s) died mid-review"
+      _RQ_CLOSE_KIND="infra re-queue (ga-eqjo)"
+      _RQ_NOTIFY_TITLE="⚠️ Gate re-enfileirado: reviewer morreu"
+      _RQ_NOTIFY_BODY="Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)."
+    fi
     # ga-eqjo (code-review fix): the old blocking Step 8 poll loop silently
     # self-healed a reviewer session dying mid-review (Dolt hiccup, OOM,
     # crash — the ga-4u16h/ga-h9o17 incident class) via mid-poll respawn.
@@ -6260,7 +6391,7 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # instead, reusing the exact same proven re-queue MECHANISM as the
     # ga-x3nmz quota-stop path immediately below (never FAIL, never burn a
     # fix-attempt), with reason-appropriate messaging.
-    log "INFRA re-queue (ga-eqjo): marker $MARKER_ID re-queued — reviewer session(s) died mid-review (Dolt hiccup/crash class, not a code FAIL)."
+    log "${_RQ_KIND}: marker $MARKER_ID re-queued — ${_RQ_LOG_CAUSE}"
     for VB in "${VERDICT_BEAD_IDS[@]}"; do
       if VB_JSON=$(bd -C "$GC_CITY" show "$VB" --json 2>/dev/null); then
         VB_STATUS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
@@ -6278,7 +6409,7 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
           bd -C "$GC_CITY" label add    "$VB" "verdict:REQUEUED" -q 2>/dev/null || true
           # ga-dl3x9s: written BEFORE the marker requeue below, so it cannot state the
           # marker's fate (an external transition may still win) — say what is true now.
-          bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-eqjo) — reviewer session died mid-review (infra failure, NOT a code FAIL). Marker is re-queued for a fresh attempt unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
+          bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (${_RQ_TAG}) — ${_RQ_VB_CAUSE} Marker is re-queued for a fresh attempt unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
           bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
           ;;
       esac
@@ -6317,12 +6448,12 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # same sweep this dead-reviewer condition is confirmed.
     bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (infra re-queue, ga-n2cpe)
     if [ "$_RQ_SKIPPED" = "1" ]; then
-      bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo) NOT applied: reviewer session(s) died mid-review (an infra failure, NOT a code FAIL), but ${_RQ_WHY} (ga-dl3x9s)." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "${_RQ_KIND} NOT applied: ${_RQ_MK_CAUSE}, but ${_RQ_WHY} (ga-dl3x9s)." 2>/dev/null || true
     else
-      bd -C "$GC_CITY" comment "$MARKER_ID" "INFRA re-queue (ga-eqjo): reviewer session(s) died mid-review — an infra failure (Dolt hiccup/crash class, ga-4u16h/ga-h9o17), NOT a code FAIL. Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "${_RQ_KIND}: ${_RQ_MK_OK_CAUSE} Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
     fi
     if [ "$GATE_RUN_ID" != "unknown" ]; then
-      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (infra re-queue, ga-eqjo): reviewer session(s) died mid-review; marker $MARKER_ID ${_RQ_NOTE}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (${_RQ_RUN_KIND}): ${_RQ_RUN_CAUSE}; marker $MARKER_ID ${_RQ_NOTE}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
       # ga-fi1dh: retire THIS gate-run bead (superseded, NOT left at gate-status:
       # running) — mirrors set_gate_status's other supersede call sites
       # (quality-gate-guard.sh Vector B, supersede_sibling_runs above). Without
@@ -6332,13 +6463,13 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
       # terminally FAILs the marker that was just re-queued for a fresh attempt
       # — before that attempt ever runs.
       set_gate_status "$GATE_RUN_ID" "superseded"
-      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — infra re-queue (ga-eqjo), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
+      bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — ${_RQ_CLOSE_KIND}, marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
     fi
     # ga-dl3x9s: "re-enfileirado" is a claim about the marker; when nothing was
     # re-queued (an external transition won, or the write failed) there is nothing
     # to announce (the dispatcher log has the "respecting it" / write-failure line).
     if [ "$_RQ_SKIPPED" != "1" ]; then
-      notify -t "⚠️ Gate re-enfileirado: reviewer morreu" -p 3 "Gate $BRANCH re-enfileirado — sessão de reviewer morreu em pleno review (falha de infra, não é FAIL) (ga-eqjo)." 2>/dev/null || true
+      notify -t "$_RQ_NOTIFY_TITLE" -p 3 "$_RQ_NOTIFY_BODY" 2>/dev/null || true
     fi
     return 0
   fi
