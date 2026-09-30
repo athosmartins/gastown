@@ -80,8 +80,8 @@ args = sys.argv[2:]; i = args.index("--"); on = args[:i]; off = args[i+1:-1]; t0
 L = []
 def bead(b, arm, outcomes, runs=(), assign_arm=None, dt=0):
     L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": assign_arm or arm, "t0": t0 + dt, "outcomes": outcomes, "runs": list(runs)})
-pgpass = {"launched": True, "verdict": "PASS", "cost_usd": 0.5}
-pgfail = {"launched": True, "verdict": "FAIL", "cost_usd": 0.5}
+pgpass = {"launched": True, "verdict": "PASS", "cost_usd": 0.5, "cost_known": True}
+pgfail = {"launched": True, "verdict": "FAIL", "cost_usd": 0.5, "cost_known": True}
 # on b1-b4: pre-gate PASS, gate PASS first try (30 min)
 for b in on[0:4]: bead(b, "on", [["PASS", 30]], [pgpass])
 # on b5,b6: guard refused (nothing spent) ; gate PASS first try
@@ -92,14 +92,16 @@ bead(on[6], "on", [["PASS", 30]], [{"launched": False, "verdict": "SKIPPED", "re
 bead(on[7], "on", [["PASS", 30]])
 # on b9: pre-gate FAIL, gate FAIL then PASS (90 min)  ; b10: pre-gate FAIL, gate FAIL FAIL
 bead(on[8], "on", [["FAIL", 30], ["PASS", 90]], [pgfail]); bead(on[9], "on", [["FAIL", 30], ["FAIL", 90]], [pgfail])
-# on b11: first gate outcome is infra (ERROR) -> not PASS/FAIL ; b12: no gate outcome yet (waiting)
+# on b11: first gate outcome carries a token the dispatcher does NOT emit today ("Gate run complete" only ever says PASS or FAIL;
+#   "ERROR" is synthetic) -> exercises the forward-compat guard, NOT an infra outcome: infra aborts are logged as FAIL (see 2b)
+# on b12: no gate outcome yet (waiting)
 bead(on[10], "on", [["ERROR", 30]]); bead(on[11], "on", [])
 # on b13: roster says off but the real function says on -> ANOMALY, out of the count
 bead(on[12], "on", [["PASS", 30]], assign_arm="off")
 # on b14: assigned BEFORE --since (old) -> excluded by the date cut in the --since test
 bead(on[13], "on", [["FAIL", 30]], dt=-86400 * 5)
 # off o1-o5 PASS first ; o6,o7 FAIL then PASS ; o8 FAIL FAIL ; o9,o10 FAIL once
-bead(off[0], "off", [["PASS", 30]], [{"launched": True, "verdict": "PASS", "cost_usd": 0.5, "forced": True}])   # a --force run in the control arm
+bead(off[0], "off", [["PASS", 30]], [{"launched": True, "verdict": "PASS", "cost_usd": 0.5, "cost_known": True, "forced": True}])   # a --force run in the control arm
 for b in off[1:5]: bead(b, "off", [["PASS", 30]])
 for b in off[5:7]: bead(b, "off", [["FAIL", 30], ["PASS", 90]])
 bead(off[7], "off", [["FAIL", 30], ["FAIL", 90]])
@@ -114,8 +116,8 @@ has "$OUT" "aguardando 1o desfecho do gate: 1 (atribuídas há ≤ 48h)" "one be
 hasnt "$OUT" "SEM desfecho e FORA da conta" "no stale / log-gap warning while nothing is stale and the log covers the roster"
 has "$OUT" "esta tabela conta TODA branch com algum desfecho do gate: on=12 off=10" "the COST table's population is stated: 12 on (11 PASS/FAIL + 1 infra) and 10 off"
 has "$OUT" "a tabela da taxa acima só as de 1o desfecho PASS/FAIL: on=11 off=10" "…next to the RATE table's population (11 on, 10 off), so the two denominators can no longer differ unlabelled"
-has "$OUT" "a diferença são as de 1o desfecho infra/timeout: on=1 off=0" "…and the difference is named (the 1 infra-first bead)"
-has "$OUT" "on=1 off=0" "the infra (ERROR) first outcome is counted apart, not as PASS or FAIL"
+has "$OUT" "a diferença são as de 1o desfecho com token inesperado: on=1 off=0" "…and the cost-table difference is named for what it is: an unexpected token (the line above spells it 'nem PASS nem FAIL')"
+has "$OUT" "desfecho com token inesperado (nem PASS nem FAIL): on=1 off=0" "the unexpected-token first outcome is counted apart, not as PASS or FAIL"
 has "$OUT" "1 com braço gravado ≠ recalculado" "the roster arm that disagrees with the real function is flagged"
 has "$OUT" "1 linha(s) ilegível(is)" "the corrupt runs.jsonl line is counted, not fatal, not silent"
 has "$OUT" "on (pré)         11        8    73%" "PRIMARY on: 11 branches, 8 first-try PASS, 73% (b14 old-but-in-window counts here; see the --since test)"
@@ -135,6 +137,16 @@ has "$OUT" "NÃO MEDIDO" "builder rework cost is declared NOT MEASURED"
 has "$OUT" "ESTIMATIVA" "reviewer cost is labelled an ESTIMATE"
 has "$OUT" "mediana 30 min (n=9)" "time to first gate PASS, on: median 30 min over 9 approved beads"
 has "$OUT" "mediana 30 min (n=7)" "time to first gate PASS, off: median 30 min over 7 approved beads"
+echo "── 2b. a FAIL that no reviewer judged is NOT separable from this log — and the report must not pretend it is ──"
+# The live dispatcher log holds exactly two tokens in "Gate run complete" lines (PASS, FAIL): a run where no reviewer judged
+# (timeout with a live reviewer, reviewer died before judging — GATE_FAIL_NO_EVAL) is logged verdict=FAIL. A bucket labelled
+# "infra/timeout" therefore reads 0 in production, and "on=0 off=0" next to it is a reassuring zero about something this log
+# cannot see. The report says so instead, and says which way the error leans.
+hasnt "$OUT" "(infra/timeout)" "the old 'infra/timeout' label is gone (it could only ever read 0 against the real log)"
+hasnt "$OUT" "1o desfecho infra/timeout" "…and so is the cost-table sentence that named it"
+has "$OUT" "FAIL inclui runs em que NENHUM revisor julgou" "the report states that FAIL includes runs no reviewer judged"
+has "$OUT" "NÃO separável deste log" "…and that they are not separable from this log"
+has "$OUT" "só emite PASS ou FAIL" "…because the outcome line only ever says PASS or FAIL"
 # --min-n default (30) => INCONCLUSIVO, no verdict
 OUT30="$(apu "$A_HQ")"
 has "$OUT30" "INCONCLUSIVO" "n < 30 per arm → INCONCLUSIVO"
@@ -230,7 +242,7 @@ import json, sys
 args = sys.argv[2:]; i = args.index("--"); on = args[:i]; off = args[i+1:-1]; t0 = int(args[-1])
 L = []
 for k, b in enumerate(on):     # 38/40 = 95% first-try, pre-gate spend US$0.10 each
-    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 20]] if k < 38 else [["FAIL", 20], ["PASS", 60]], "runs": [{"launched": True, "verdict": "PASS", "cost_usd": 0.10}]})
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 20]] if k < 38 else [["FAIL", 20], ["PASS", 60]], "runs": [{"launched": True, "verdict": "PASS", "cost_usd": 0.10, "cost_known": True}]})
 for k, b in enumerate(off):    # 22/40 = 55% first-try, many retries
     L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "off", "t0": t0, "outcomes": [["PASS", 20]] if k < 22 else [["FAIL", 20], ["FAIL", 60], ["PASS", 100]]})
 json.dump({"beads": L}, open(sys.argv[1], "w"))
@@ -240,19 +252,82 @@ OUTB="$(apu "$B_HQ")"
 has "$OUTB" "CRITÉRIO ATINGIDO" "strong + cheap + n=40/arm → criterion met (proposal for the Mayor, not an auto-enable)"
 has "$OUTB" "diferença exclui 0 (efeito real, não acaso)?  → SIM" "the CI excludes 0"
 hasnt "$OUTB" "CONTROLE CONTAMINADO" "no contamination warning when the control arm is clean"
+has "$OUTB" "pré-gate = EXATO" "every launched run has a known cost → the pre-gate figure may be called EXATO"
+hasnt "$OUTB" "SEM custo conhecido" "…and no unknown-cost warning appears"
+has "$OUTB" "a taxa conta como reprovação os runs em que nenhum revisor julgou" "the verdict section says the rate counts no-reviewer-judged runs as FAIL"
+has "$OUTB" "viés para BAIXO" "…and which way that leans (toward NOT reaching on ≥ target)"
 # same on-rate but the on arm costs MORE per approved bead than off → must NOT be green
 python3 - "$T/specB.json" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
 for b in s["beads"]:
     if b["assign_arm"] == "on":
-        b["runs"] = [{"launched": True, "verdict": "PASS", "cost_usd": 9.00}]
+        b["runs"] = [{"launched": True, "verdict": "PASS", "cost_usd": 9.00, "cost_known": True}]
 json.dump(s, open(sys.argv[1], "w"))
 PY
 gen "$B_HQ" "$T/specB.json"
 OUTB3="$(apu "$B_HQ")"
 has "$OUTB3" "CRITÉRIO NÃO ATINGIDO" "on wins on approval but costs far more per approved bead → criterion NOT met"
 has "$OUTB3" "US\$/aprovada on ≤ off (PARCIAL, sem construtor)?" "the cost condition is printed as PARTIAL (no builder cost)"
+
+echo "── 5c. a run whose cost is UNKNOWN is a lower bound — never a \$0 reported as EXATO ──"
+# The bug this guards (gate ga-ta6wow): pre-gate-review.sh wrote cost_usd=0 for a run with no result event (timeout rc=124,
+# kill rc=137, garbage stream), and this report summed it and printed "pré-gate = EXATO". A timed-out run can burn up to the
+# per-run cap, and the error leans toward ENABLING the step. Ruler: a cost this code could not know must not look like $0.
+mk_b() {   # mk_b <out.json> <arm-to-poison|none> <extra-launched-run-json> <on-arm-first-try: pass|fail>
+  python3 - "$@" "${BON[@]}" -- "${BOFF[@]}" "$T0" <<'PY'
+import json, sys
+a = sys.argv[1:]; i = a.index("--")
+out, poison, runjson, first = a[0], a[1], json.loads(a[2]), a[3]
+on = a[4:i]; off = a[i+1:-1]; t0 = int(a[-1])
+known = {"launched": True, "verdict": "PASS", "cost_usd": 0.10, "cost_known": True}
+L = []
+for k, b in enumerate(on):
+    ok = k < 38 and first == "pass"
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 20]] if ok else [["FAIL", 20], ["PASS", 60]], "runs": [dict(known)]})
+for k, b in enumerate(off):
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "off", "t0": t0, "outcomes": [["PASS", 20]] if k < 22 else [["FAIL", 20], ["FAIL", 60], ["PASS", 100]], "runs": []})
+if poison in ("on", "off"):
+    next(x for x in L if x["assign_arm"] == poison)["runs"].append(runjson)
+json.dump({"beads": L}, open(out, "w"))
+PY
+}
+UNK_TIMEOUT='{"launched": true, "verdict": "INCONCLUSIVE", "reason": "timeout:1500s", "cost_known": false, "exit_code": 124}'
+C_HQ="$T/hqC"; mk_hq "$C_HQ"
+mk_b "$T/specC.json" on "$UNK_TIMEOUT" pass; gen "$C_HQ" "$T/specC.json"
+OUTC="$(apu "$C_HQ")"
+has "$OUTC" "SEM custo conhecido: on=1 off=0" "a launched run with cost_known=false is counted and named (on=1)"
+has "$OUTC" "≥4.00" "the pre-gate US\$ is printed as a LOWER BOUND (40 known runs × 0.10, the unknown one adds nothing): ≥4.00"
+has "$OUTC" "LIMITE INFERIOR" "…and labelled LIMITE INFERIOR"
+hasnt "$OUTC" "pré-gate = EXATO" "…and it is no longer called EXATO"
+has "$OUTC" "→ INDETERMINADO" "the cost condition reads INDETERMINADO, not SIM"
+has "$OUTC" "CRITÉRIO INDETERMINADO" "rate and CI pass, cost unknown → the criterion is INDETERMINADO"
+hasnt "$OUTC" "CRITÉRIO ATINGIDO" "…never ATINGIDO (this is the direction the old zero erred in)"
+hasnt "$OUTC" "CRITÉRIO NÃO ATINGIDO" "…and not a made-up NÃO either: it is unknown"
+# the same money, but unknown for a different reason each time: none of these may be read as a cost
+for flavor in \
+  'legacy zero (old writer: cost_usd=0, no cost_known)|{"launched": true, "verdict": "INCONCLUSIVE", "reason": "timeout:1s", "cost_usd": 0}' \
+  'known-flag but cost is a string|{"launched": true, "verdict": "PASS", "cost_known": true, "cost_usd": "abc"}' \
+  'known-flag but cost is NaN|{"launched": true, "verdict": "PASS", "cost_known": true, "cost_usd": NaN}' \
+  'known-flag but cost is negative|{"launched": true, "verdict": "PASS", "cost_known": true, "cost_usd": -1}' \
+  'known-flag but cost is a bool|{"launched": true, "verdict": "PASS", "cost_known": true, "cost_usd": true}' \
+  'known-flag but no cost_usd|{"launched": true, "verdict": "PASS", "cost_known": true}'; do
+  label="${flavor%%|*}"; js="${flavor#*|}"
+  mk_b "$T/specC2.json" on "$js" pass; gen "$C_HQ" "$T/specC2.json"; O="$(apu "$C_HQ")"
+  hasnt "$O" "Traceback" "unknown cost — $label: the report does not crash on it (a string cost used to raise inside float())"
+  has "$O" "SEM custo conhecido: on=1 off=0" "unknown cost — $label: counted as unknown"
+  has "$O" "CRITÉRIO INDETERMINADO" "unknown cost — $label: criterion INDETERMINADO"
+  hasnt "$O" "CRITÉRIO ATINGIDO" "unknown cost — $label: never ATINGIDO"
+done
+# an unknown cost in the CONTROL arm (a --force run that timed out) poisons the comparison just the same
+mk_b "$T/specC3.json" off "$UNK_TIMEOUT" pass; gen "$C_HQ" "$T/specC3.json"; O="$(apu "$C_HQ")"
+has "$O" "SEM custo conhecido: on=0 off=1" "unknown cost in the OFF arm is counted (off=1)"
+has "$O" "CRITÉRIO INDETERMINADO" "…and makes the criterion INDETERMINADO too"
+# when another condition already fails the verdict is still decisive: an unknown cost does not soften a NÃO into a maybe
+mk_b "$T/specC4.json" on "$UNK_TIMEOUT" fail; gen "$C_HQ" "$T/specC4.json"; O="$(apu "$C_HQ")"
+has "$O" "CRITÉRIO NÃO ATINGIDO" "on rate far below target + an unknown cost → still NÃO ATINGIDO (decisive)"
+hasnt "$O" "CRITÉRIO INDETERMINADO" "…not INDETERMINADO"
+has "$O" "SEM custo conhecido: on=1 off=0" "…and the unknown cost is still reported"
 
 echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"

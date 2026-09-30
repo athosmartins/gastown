@@ -199,6 +199,14 @@ case "${STUB_MODE:-pass}" in
   garbage)   echo 'not json at all' ;;
   timeout)   sleep 30 ;;
   echo_template) res success false '# If PASS:\nnothing\n# If FAIL:\nVERDICT: PASS\nSummary: ok' 0.2 ;;
+  # a result event that carries NO cost (or one that is not a usable number): the run was judged, the money is unknown
+  nocost)    printf '{"type":"system","subtype":"init","model":"claude-sonnet-5-5"}\n{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS","num_turns":4}\n' ;;
+  cost_str)  res success false 'VERDICT: PASS' '"abc"' ;;
+  cost_neg)  res success false 'VERDICT: PASS' -1 ;;
+  cost_null) res success false 'VERDICT: PASS' null ;;
+  cost_bool) res success false 'VERDICT: PASS' true ;;
+  cost_tiny) res success false 'VERDICT: PASS' 0.00005 ;;
+  cost_int)  res success false 'VERDICT: PASS' 2 ;;
 esac
 exit 0
 EOF
@@ -240,6 +248,42 @@ reset_state
 OUT="$(run_pg STUB_MODE=timeout PRE_GATE_TIMEOUT_SECS=1 -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
 eq "$rc" "3" "timeout → INCONCLUSIVE exit 3"; has_str "$L" "reason=timeout:1s" "timeout reason is named"
 
+echo "── 5b. A RUN WHOSE COST IS UNKNOWN IS RECORDED AS UNKNOWN — NEVER AS \$0 ──"
+# The builder console already prints "\$?" for a run with no result event, so the code KNEW it did not know. The record is
+# what pre-gate-apuracao.py sums into "custo do pré-gate", and a 0 there reads as "free" on the very condition that decides
+# whether to propose enabling the step for everyone. So: no cost_usd / turns key at all, and cost_known=false says so out loud.
+rec_for() {   # rec_for <STUB_MODE> [ENV=VAL ...] — one run from a clean state; prints that run's record line
+  local mode="$1"; shift; reset_state
+  run_pg STUB_MODE="$mode" ${@+"$@"} -- run feat/x --no-fetch >/dev/null
+  grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null
+}
+REC="$(rec_for timeout PRE_GATE_TIMEOUT_SECS=1)"
+has_str "$REC" '"launched": true' "timeout: the run is recorded as launched"
+has_str "$REC" '"cost_known": false' "timeout: cost_known=false (the money is UNKNOWN)"
+not_str "$REC" '"cost_usd"' "timeout: NO cost_usd key (a 0 would read as 'this run was free')"
+not_str "$REC" '"turns"' "timeout: NO turns key either"
+REC="$(rec_for garbage)"
+has_str "$REC" '"cost_known": false' "garbage stream (claude exit 0, no result event): cost_known=false"
+not_str "$REC" '"cost_usd"' "garbage stream: NO cost_usd key"
+REC="$(rec_for nocost)"
+has_str "$REC" '"verdict": "PASS"' "result event without a cost: the run is still judged (verdict PASS)"
+has_str "$REC" '"cost_known": false' "…but its cost is unknown"
+not_str "$REC" '"cost_usd"' "…so there is NO cost_usd key"
+has_str "$REC" '"turns": 4' "…while turns, which it did report, is kept (known and unknown are decided per field)"
+for mode in cost_str cost_neg cost_null cost_bool; do
+  REC="$(rec_for "$mode")"
+  has_str "$REC" '"cost_known": false' "STUB_MODE=$mode (total_cost_usd is not a usable number): cost_known=false"
+  not_str "$REC" '"cost_usd"' "STUB_MODE=$mode: no cost_usd key (a string / negative / null / true is not a cost)"
+done
+REC="$(rec_for pass)"
+has_str "$REC" '"cost_known": true' "a known cost: cost_known=true"; has_str "$REC" '"cost_usd": 0.42' "…with the exact figure"
+REC="$(rec_for error)"
+has_str "$REC" '"cost_known": true' "an error_max_budget run DID spend money: its cost is known"; has_str "$REC" '"cost_usd": 3.01' "…and it is recorded (the cap overrun is visible)"
+REC="$(rec_for cost_tiny)"
+has_str "$REC" '"cost_known": true' "a tiny cost (python prints it as 5e-05) is still KNOWN"; has_str "$REC" '"cost_usd": 5e-05' "…and recorded as a number, not dropped for its notation"
+REC="$(rec_for cost_int)"
+has_str "$REC" '"cost_known": true' "an integer cost is known"; has_str "$REC" '"cost_usd": 2.0' "…recorded as 2.0"
+
 echo "── 6. EVERY WAY OF NOT BEING ABLE TO JUDGE IS INCONCLUSIVE ──"
 reset_state
 OUT="$(run_pg STUB_MODE=pass PRE_GATE_MIN_DF_GIB=99999999 -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
@@ -266,6 +310,24 @@ reset_state; G checkout -q -b feat/empty main
 OUT="$(run_pg -- run feat/empty --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
 eq "$rc" "3" "empty diff → INCONCLUSIVE (nothing to review is not a pass)"; has_str "$L" "reason=empty-diff" "reason names the empty diff"
 G checkout -q feat/x
+# `git diff base...head` FAILS while --name-only and --stat still work: file_count > 0 but there is no diff TEXT. The shared
+# payload builder turns that into "FULL DIFF (complete — 0 lines across N file(s), nothing omitted)" over a blank body, and a
+# reviewer that was shown nothing can answer PASS — a clearance for code it never saw, handed to the builder. Refuse instead.
+REAL_GIT="$(command -v git)"; mkdir -p "$T/shim"
+cat > "$T/shim/git" <<SHIM
+#!/bin/bash
+has_diff=0; has_list=0
+for a in "\$@"; do case "\$a" in diff) has_diff=1 ;; --name-only|--stat) has_list=1 ;; esac; done
+if [ \$has_diff -eq 1 ] && [ \$has_list -eq 0 ]; then echo "fatal: simulated git diff failure" >&2; exit 128; fi
+exec "$REAL_GIT" "\$@"
+SHIM
+chmod +x "$T/shim/git"
+reset_state
+OUT="$(run_pg PATH="$T/shim:$T/bin:$PATH" STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "git diff fails but --name-only lists files → INCONCLUSIVE (a blank body is not a diff to clear)"
+has_str "$L" "reason=diff-text-empty" "…reason names it: the file list and the diff text disagree"
+eq "$(ncalls)" "0" "…and claude never launched (nothing spent on a review of nothing)"
+rm -rf "$T/shim"
 # busy: hold both slots with LIVE pids
 reset_state; mkdir -p "$T/logs/slots/1" "$T/logs/slots/2"; sleep 30 & S1=$!; sleep 30 & S2=$!
 echo $S1 > "$T/logs/slots/1/pid"; echo $S2 > "$T/logs/slots/2/pid"

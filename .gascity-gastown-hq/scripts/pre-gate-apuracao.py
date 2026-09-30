@@ -15,7 +15,16 @@ NÃO use "% de runs que reprovam": uma bead que reprova 3x e passa conta 3 FAIL 
 O QUE ESTE SCRIPT NÃO INVENTA (terceiro estado, dito em voz alta em vez de virar zero):
   * custo do CONSTRUTOR (retrabalho do braço on) — não é medido em lugar nenhum; sai como "NÃO MEDIDO".
   * custo do REVISOR por tentativa — é uma ESTIMATIVA (--reviewer-usd, padrão US$0,60 = 8,93/15 julgamentos do E0,
-    ga-5vi6cp), rotulada como tal. O custo do pré-gate é EXATO (total_cost_usd de cada run).
+    ga-5vi6cp), rotulada como tal. O custo do pré-gate é EXATO só para os runs cujo registro PROVA o custo
+    (cost_known=true e um cost_usd numérico, finito e >= 0 — run_cost()). Um run sem evento de resultado (timeout, kill,
+    stream sem resultado) tem custo DESCONHECIDO e pode ter gasto até o teto por run: ele NÃO entra como 0 — a soma vira
+    LIMITE INFERIOR (≥), e a condição de custo do critério fica INDETERMINADA. Registro sem cost_known=true (inclusive um
+    cost_usd=0 de um escritor antigo) também é desconhecido: só o escritor atual sabe dizer que sabia.
+  * runs em que NENHUM revisor julgou (timeout com revisor vivo, revisor que morreu antes de julgar): a linha "Gate run
+    complete" do dispatcher só emite PASS ou FAIL, e esses runs saem como FAIL. NÃO são separáveis deste log. A taxa da
+    1a tentativa os conta como reprovação — viés para BAIXO nos dois braços, e mais severo no teste absoluto "on >= alvo".
+    O que o script imprime como "token inesperado" é só a guarda para o dia em que o dispatcher emitir outra palavra;
+    hoje lê 0 e NÃO mede infra.
   * a regra de atribuição é EXECUTADA (pre-gate-review.sh: pregate_arm_for_bead), nunca reimplementada aqui; se o braço
     gravado no roster divergir do recalculado, a bead vai para "anomalias" e sai da conta.
 
@@ -93,6 +102,20 @@ def load_jsonl(path):
             else:
                 bad += 1
     return rows, bad
+
+
+def run_cost(r):
+    """US$ of one launched run, or None when the record does not PROVE a cost.
+
+    Three states, never two: known (cost_known is True AND cost_usd is a finite number >= 0), unknown (anything else).
+    The old reading — float(r.get("cost_usd", 0) or 0) — turned a missing, null, zero-by-default or garbage cost into 0.00
+    and printed it as EXATO; a string there raised inside float(). bool is excluded: True is an int in Python."""
+    if r.get("cost_known") is not True:
+        return None
+    c = r.get("cost_usd")
+    if isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c) or c < 0:
+        return None
+    return float(c)
 
 
 def recompute_arms(assets_dir, beads):
@@ -239,7 +262,9 @@ def main():
     print("═══ APURAÇÃO DO E3 — PRÉ-REVISÃO DO CONSTRUTOR (ga-gnr3tw, P0 ga-ufskhy) ═══")
     print(f"  janela: {'a partir de ' + a.since if a.since else 'todo o roster'}   roster: {len(roster)} branches"
           f" ({sum(1 for v in roster.values() if v['arm']=='on')} on / {sum(1 for v in roster.values() if v['arm']=='off')} off)")
-    print(f"  aguardando 1o desfecho do gate: {waiting} (atribuídas há ≤ {a.wait_h:g}h)   desfecho não-PASS/FAIL (infra/timeout): on={other['on']} off={other['off']}")
+    print(f"  aguardando 1o desfecho do gate: {waiting} (atribuídas há ≤ {a.wait_h:g}h)   desfecho com token inesperado (nem PASS nem FAIL): on={other['on']} off={other['off']}")
+    print("  nota: FAIL inclui runs em que NENHUM revisor julgou (timeout ou morte do revisor) — NÃO separável deste log, que só emite PASS ou FAIL.")
+    print("        O 'token inesperado' acima é só a guarda para o dia em que o dispatcher emitir outra palavra: hoje lê 0 e NÃO mede infra.")
     if stale or log_gap:
         print(f"  ⚠ SEM desfecho e FORA da conta: {stale} sem desfecho localizável após {a.wait_h:g}h (branch renomeada, nunca chegou ao gate ou gate parado), "
               f"{log_gap} que o log do dispatcher não cobre (log rodado ou sem linha datada — pode haver desfecho que não dá pra ler daqui)")
@@ -311,22 +336,37 @@ def main():
     def arm_cost(arm):
         ps = [p for p in per.values() if p["arm"] == arm]
         approved = [p for p in ps if p["approved"]]
-        pre_usd = sum(float(r.get("cost_usd", 0) or 0) for b in {p["bead"] for p in ps} for r in launched.get(b, []))
+        # known and unknown are summed APART: an unknown run contributes nothing to the sum AND is counted, so the figure
+        # can be printed as the lower bound it is (never as a total that happens to include a 0 it invented)
+        costs = [run_cost(r) for b in {p["bead"] for p in ps} for r in launched.get(b, [])]
+        pre_usd = sum(c for c in costs if c is not None)
+        n_unknown = sum(1 for c in costs if c is None)
         rev_usd = a.reviewer_usd * sum(p["attempts"] for p in ps)
-        return ps, approved, pre_usd, rev_usd
+        return ps, approved, pre_usd, rev_usd, n_unknown
+
+    def lb(x, unknown):   # "≥" marks a figure that is only a lower bound
+        return ("n/a" if x != x else (("≥" if unknown else "") + f"{x:.2f}"))
     print("  ── CUSTO POR BEAD APROVADA (PARCIAL) ──")
     print(f"  {'braço':<10}{'beads':>6}{'aprov.':>7}{'tent./bead':>11}{'pré-gate US$':>14}{'revisor US$ (estim.)':>22}{'US$/aprovada':>14}")
-    cost_per = {}
+    cost_per, unk = {}, {}
     for arm in ("on", "off"):
-        ps, ap_, pre_usd, rev_usd = arm_cost(arm)
+        ps, ap_, pre_usd, rev_usd, unk[arm] = arm_cost(arm)
         cpa = (pre_usd + rev_usd) / len(ap_) if ap_ else float("nan")
         cost_per[arm] = cpa
         att = statistics.mean([p["attempts"] for p in ps]) if ps else float("nan")
-        print(f"  {arm:<10}{len(ps):>6}{len(ap_):>7}{('n/a' if att != att else f'{att:.2f}'):>11}{pre_usd:>14.2f}{rev_usd:>22.2f}{('n/a' if cpa != cpa else f'{cpa:.2f}'):>14}")
+        print(f"  {arm:<10}{len(ps):>6}{len(ap_):>7}{('n/a' if att != att else f'{att:.2f}'):>11}{lb(pre_usd, unk[arm]):>14}{rev_usd:>22.2f}{lb(cpa, unk[arm]):>14}")
+    unknown_total = unk["on"] + unk["off"]
     n_cost = {arm: sum(1 for p in per.values() if p["arm"] == arm) for arm in ("on", "off")}
     print(f"  (esta tabela conta TODA branch com algum desfecho do gate: on={n_cost['on']} off={n_cost['off']}; a tabela da taxa acima só as "
-          f"de 1o desfecho PASS/FAIL: on={n_on} off={n_off} — a diferença são as de 1o desfecho infra/timeout: on={other['on']} off={other['off']})")
-    print(f"  pré-gate = EXATO (total_cost_usd por run). revisor = ESTIMATIVA {a.reviewer_usd:.2f}/tentativa (E0). construtor = NÃO MEDIDO:")
+          f"de 1o desfecho PASS/FAIL: on={n_on} off={n_off} — a diferença são as de 1o desfecho com token inesperado: on={other['on']} off={other['off']})")
+    if unknown_total:
+        print(f"  ⚠ run(s) do pré-gate lançados SEM custo conhecido: on={unk['on']} off={unk['off']}"
+              f" (timeout, kill ou stream sem evento de resultado) — um run assim pode ter gasto até o teto de gasto por run."
+              f" O pré-gate US$ e o US$/aprovada acima são LIMITE INFERIOR (≥) e a condição de custo fica INDETERMINADA.")
+        print("  pré-gate = LIMITE INFERIOR (soma só dos runs com total_cost_usd conhecido).")
+    else:
+        print("  pré-gate = EXATO (total_cost_usd por run).")
+    print(f"  revisor = ESTIMATIVA {a.reviewer_usd:.2f}/tentativa (E0). construtor = NÃO MEDIDO:")
     print("  o retrabalho do braço on (consertar o que a pré-revisão achou) não está em nenhum número acima — o custo real do on é MAIOR que o mostrado.")
     print("  (relógio: começa na PRIMEIRA linha do roster da branch — no braço on isso é o Step 2b, então o tempo da")
     print("   pré-revisão conta a desfavor do on, que é o certo: é custo dele)")
@@ -344,15 +384,23 @@ def main():
         return 0
     c_on, c_off = cost_per["on"], cost_per["off"]
     rate_ok = p_on >= a.target
-    cost_ok = (c_on == c_on and c_off == c_off and c_on <= c_off)
+    # three states: True / False / None (= cannot tell). With ANY launched run of unknown cost in either arm the two
+    # US$/aprovada are lower bounds, and "on <= off" between two lower bounds proves nothing in either direction.
+    cost_ok = None if unknown_total else (c_on == c_on and c_off == c_off and c_on <= c_off)
+    print("  (nota: a taxa conta como reprovação os runs em que nenhum revisor julgou — viés para BAIXO em 'on ≥ alvo': um NÃO abaixo pode ser em parte infra, não conteúdo.)")
     print(f"  on ≥ {pct(a.target)}?  {pct(p_on)}  → {'SIM' if rate_ok else 'NÃO'}")
-    print(f"  US$/aprovada on ≤ off (PARCIAL, sem construtor)?  {('n/a' if c_on != c_on else f'{c_on:.2f}')} vs {('n/a' if c_off != c_off else f'{c_off:.2f}')}  → {'SIM' if cost_ok else 'NÃO'}")
+    print(f"  US$/aprovada on ≤ off (PARCIAL, sem construtor)?  {lb(c_on, unk['on'])} vs {lb(c_off, unk['off'])}  → "
+          f"{'INDETERMINADO (custo do pré-gate desconhecido em ' + str(unknown_total) + ' run(s))' if cost_ok is None else ('SIM' if cost_ok else 'NÃO')}")
     excl0 = (d == d) and dlo > 0
     print(f"  diferença exclui 0 (efeito real, não acaso)?  → {'SIM' if excl0 else 'NÃO'}")
-    if rate_ok and cost_ok and excl0:
-        print("  ► CRITÉRIO ATINGIDO — propor ligar a pré-revisão pra todos (decisão do Mayor; custo do construtor ainda não medido).")
-    else:
+    if not rate_ok or not excl0 or cost_ok is False:
+        # a failed condition is decisive whatever the unknown cost turns out to be
         print("  ► CRITÉRIO NÃO ATINGIDO — escrever o relatório do porquê (qual condição falhou acima).")
+    elif cost_ok is None:
+        print("  ► CRITÉRIO INDETERMINADO — taxa e diferença passam, mas o custo do pré-gate é desconhecido em "
+              f"{unknown_total} run(s): NÃO proponha ligar a pré-revisão com este número. Não pare o experimento; apure de novo.")
+    else:
+        print("  ► CRITÉRIO ATINGIDO — propor ligar a pré-revisão pra todos (decisão do Mayor; custo do construtor ainda não medido).")
     return 0
 
 

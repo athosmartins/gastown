@@ -60,6 +60,12 @@ gate_diff_summary() {
 #   any cwd (the gate's subdirectory and the builder's toplevel then render the same payload) and `literal` keeps a name
 #   containing * or [ from being read as a glob. A file whose per-file diff still comes back empty is listed as omitted, never
 #   counted as shown: an empty answer is not the same thing as "shown, and there was nothing to see".
+#   KNOWN LIMIT (moved verbatim from the dispatcher, not introduced here): the whole-diff call below is `|| true`, so a
+#   `git diff` that FAILS reads as an empty diff and renders "FULL DIFF (complete - 0 lines across N file(s), nothing omitted)"
+#   over a blank body: a failed read and an empty diff look the same. The promise above holds for a diff that was read, not
+#   for one that could not be. A caller that already holds a non-empty file list can tell the two apart from
+#   DIFF_RAW_TOTAL_LINES = 0 and should refuse to review: pre-gate-review.sh does (reason diff-text-empty). The gate
+#   dispatcher does not yet; changing it means changing what the production gate does on a git failure, a separate bead.
 gate_build_diff_payload() {
   local _git_fn="${1:-}" _base="${2:-}" _head="${3:-}" _changed_files="${4:-}"
   local _file_count="${5:-0}" _budget="${6:-2000}" _escape_hatch_cmd="${7:-}"

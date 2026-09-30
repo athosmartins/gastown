@@ -13,7 +13,7 @@
 # A/B (the reason `--bead` exists): the step is switched on for half the beads, by a deterministic hash of the bead id
 # (pregate_arm_for_bead below — auditable, recomputable, not chosen by the builder). `run <branch> --bead <id>`
 # on a control-arm bead prints SKIPPED and exits 0 without spending anything. Every assignment and every run is
-# appended to <city>/.gc/logs/pre-gate-review/runs.jsonl for pre-gate-apuracao.sh, which reports approval on x off.
+# appended to <city>/.gc/logs/pre-gate-review/runs.jsonl for pre-gate-apuracao.py, which reports approval on x off.
 #
 # THREE outcomes, never two (a check that cannot run must not read as a check that passed):
 #   exit 0   PASS         no blocking defect found       (also: SKIPPED — control arm, or the per-bead run cap)
@@ -31,7 +31,7 @@
 #   pre-gate-review.sh roster <bead-id> <branch>   /gate-done Step 3: records the assignment, prints "on" or "off"
 #                                     (exit 0 = printed and recorded; 4 = printed, roster row NOT written; 3 = no arm; 2 = usage)
 # Run it from inside the builder's checkout, with HEAD on the branch under review and a clean tree.
-# The file can also be `source`d (the functions are reused by pre-gate-apuracao.sh and the selftest).
+# The file can also be `source`d (the functions are reused by pre-gate-apuracao.py and the selftest).
 #
 # Knobs (env): PRE_GATE_MODEL / PRE_GATE_EFFORT (override the live gate-reviewer config; recorded as such),
 #   PRE_GATE_MAX_USD (3)  PRE_GATE_TIMEOUT_SECS (1500)  PRE_GATE_MAX_RUNS (3)  PRE_GATE_MAX_CONCURRENT (2)
@@ -117,7 +117,7 @@ pg_record() {
 import json, sys, time
 path, event, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
 NUM = {"attempt", "cost_usd", "turns", "duration_s", "task_bytes", "diff_lines", "exit_code", "prior_runs"}
-BOOL = {"launched", "partial", "forced"}
+BOOL = {"launched", "partial", "forced", "cost_known"}
 d = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
 for p in pairs:
     k, _, v = p.partition("=")
@@ -362,7 +362,7 @@ pg_with_timeout() {
 pg_parse_stream() {
   local py; py="$(pg_python)" || py="python3"
   "$py" - "$1" "$2" <<'PY'
-import json, re, sys
+import json, math, re, sys
 stream, outtxt = sys.argv[1:3]
 res, models = None, set()
 try:
@@ -389,10 +389,17 @@ open(outtxt, "w", encoding="utf-8").write(text)
 verdict = "NONE"
 for m in re.finditer(r"^VERDICT:\s*(PASS|FAIL)\b", text, re.M):
     verdict = m.group(1)
+# COST / TURNS are a number we can trust or EMPTY (= unknown). Empty is never 0: the caller records "unknown", and an
+# unknown cost that became 0 would read as "this run was free" in the apuracao. A missing key, null, a string, a bool
+# (True is an int in Python), NaN/inf and a negative number are not measurements. COST is fixed-point: Python prints a
+# tiny float as 5e-05, which the record writer's number parsing would then drop as if it were text.
+cost, turns = res.get("total_cost_usd"), res.get("num_turns")
+cost_ok = isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0
+turns_ok = isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0
 print("RESULT=present")
 print(f"VERDICT={verdict}")
-print(f"COST={res.get('total_cost_usd', '')}")
-print(f"TURNS={res.get('num_turns', '')}")
+print(f"COST={format(cost, '.6f') if cost_ok else ''}")
+print(f"TURNS={turns if turns_ok else ''}")
 print(f"MODELS={','.join(sorted(models))}")
 print(f"SUBTYPE={res.get('subtype', '')}")
 print(f"ISERR={'true' if res.get('is_error') else 'false'}")
@@ -534,6 +541,11 @@ pg_run_inner() {
   escape="cd $repo && git diff $base_ref...$head_ref"
   gate_build_diff_payload gitc "$base_ref" "$head_ref" "$changed_files" "$file_count" "${GATE_DIFF_LINE_BUDGET:-2000}" "$escape"
   lines="$DIFF_RAW_TOTAL_LINES"
+  # The file list said there are changed files; the diff TEXT has none. `git diff base...head` failed (or came back empty)
+  # while --name-only did not, and the shared builder renders that as "FULL DIFF (complete — 0 lines …)" over a blank body:
+  # a reviewer shown nothing can answer PASS. That would hand the builder a clearance for code nobody read, so refuse.
+  # (Unset counts as 0 too: a payload builder that did not run must not read as "a diff of N lines".)
+  [ "${lines:-0}" -gt 0 ] || { pg_inconclusive "diff-text-empty"; return $?; }
   local partial=false; case "$DIFF_HEADER" in PARTIAL*) partial=true ;; esac
 
   local author rig lens_text task
@@ -623,8 +635,15 @@ pg_run_inner() {
   else out_verdict=INCONCLUSIVE; reason="no-verdict-line"; code=3
   fi
 
+  # A run with no result event (timeout rc=124, kill rc=137, a stream with no result) has NO known cost — and it may have
+  # burned up to the per-run cap. The record says so (cost_known=false, no cost_usd key) instead of writing 0: the apuracao
+  # sums cost_usd, and a 0 there reads as "this run was free" on the condition that decides whether to enable the step.
+  # cost / turns are empty when unknown (pg_parse_stream) and are decided per field.
+  local cost_known=false; local -a meas=()
+  if [ -n "$cost" ]; then cost_known=true; meas+=(cost_usd="$cost"); fi
+  if [ -n "$turns" ]; then meas+=(turns="$turns"); fi
   pg_record run bead="$bead" branch="$branch" sha="$branch_sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict="$out_verdict" reason="$reason" \
-    launched=true forced="$([ "$force" -eq 1 ] && echo true || echo false)" cost_usd="${cost:-0}" turns="${turns:-0}" duration_s="$dur" model="$model" model_resolved="$models" effort="$effort" \
+    launched=true forced="$([ "$force" -eq 1 ] && echo true || echo false)" cost_known="$cost_known" ${meas[@]+"${meas[@]}"} duration_s="$dur" model="$model" model_resolved="$models" effort="$effort" \
     config_source="$cfg_src" settings="$settings_kind" lens="$lens" exit_code="$rc" task_bytes="${#task}" diff_lines="$lines" partial="$partial" \
     fetch="$fetch_state" review_file="$review_file" >/dev/null || pg_log "WARN: this run was NOT recorded — the measurement will not see it"
 
