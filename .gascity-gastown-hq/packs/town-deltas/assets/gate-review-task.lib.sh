@@ -60,6 +60,14 @@ gate_diff_summary() {
 #   any cwd (the gate's subdirectory and the builder's toplevel then render the same payload) and `literal` keeps a name
 #   containing * or [ from being read as a glob. A file whose per-file diff still comes back empty is listed as omitted, never
 #   counted as shown: an empty answer is not the same thing as "shown, and there was nothing to see".
+#   COVERAGE, for the caller that has to act on it (the header above is prose for the reviewer; these are for code). Three
+#   states, because "the reviewer was shown all of it", "shown part of it" and "we cannot tell" must not read the same:
+#     DIFF_COVERAGE      full     the whole diff is in the payload (within budget, and it has text)
+#                        partial  over budget: DIFF_SHOWN_FILES of the file_count files are in it, DIFF_SHOWN_LINES of the
+#                                 DIFF_RAW_TOTAL_LINES lines; DIFF_OMITTED_LIST names the rest (one "  - <file>" per line)
+#                        unknown  the whole-diff read came back empty (see KNOWN LIMIT): "shown in full" would be a guess
+#     DIFF_SHOWN_FILES / DIFF_SHOWN_LINES / DIFF_OMITTED_LIST as above (0 / 0 / "" for full and unknown).
+#   They are reset on entry, so a builder that never ran cannot leave the previous call's answer behind.
 #   KNOWN LIMIT (moved verbatim from the dispatcher, not introduced here): the whole-diff call below is `|| true`, so a
 #   `git diff` that FAILS reads as an empty diff and renders "FULL DIFF (complete - 0 lines across N file(s), nothing omitted)"
 #   over a blank body: a failed read and an empty diff look the same. The promise above holds for a diff that was read, not
@@ -71,6 +79,7 @@ gate_build_diff_payload() {
   local _file_count="${5:-0}" _budget="${6:-2000}" _escape_hatch_cmd="${7:-}"
   local DIFF_RAW="" _df="" _FILE_DIFF="" _FILE_DIFF_LINES=0
   local _DIFF_SHOWN_LINES=0 _DIFF_SHOWN_FILES=0 DIFF_OMITTED_FILES=""
+  DIFF_COVERAGE="unknown"; DIFF_SHOWN_FILES=0; DIFF_SHOWN_LINES=0; DIFF_OMITTED_LIST=""
 
   DIFF_RAW=$("$_git_fn" diff "$_base...$_head" 2>/dev/null || true)
   if [ -z "$DIFF_RAW" ]; then
@@ -82,6 +91,8 @@ gate_build_diff_payload() {
   if [ "$DIFF_RAW_TOTAL_LINES" -le "$_budget" ]; then
     DIFF_FULL="$DIFF_RAW"
     DIFF_HEADER="FULL DIFF (complete — $DIFF_RAW_TOTAL_LINES lines across $_file_count file(s), nothing omitted):"
+    # An empty read is not "the whole diff was shown" (KNOWN LIMIT above): only a diff that HAS text is full coverage.
+    if [ "$DIFF_RAW_TOTAL_LINES" -gt 0 ]; then DIFF_COVERAGE="full"; DIFF_SHOWN_FILES="$_file_count"; DIFF_SHOWN_LINES="$DIFF_RAW_TOTAL_LINES"; fi
   else
     DIFF_FULL=""
     while IFS= read -r _df; do
@@ -109,6 +120,7 @@ gate_build_diff_payload() {
     DIFF_HEADER="PARTIAL DIFF — showing $_DIFF_SHOWN_FILES of $_file_count files ($_DIFF_SHOWN_LINES of $DIFF_RAW_TOTAL_LINES total diff lines). DO NOT treat the omitted files below as reviewed — you have not seen them:
 OMITTED FILES ($((_file_count - _DIFF_SHOWN_FILES))):
 ${DIFF_OMITTED_FILES}To review the FULL diff yourself: $_escape_hatch_cmd"
+    DIFF_COVERAGE="partial"; DIFF_SHOWN_FILES="$_DIFF_SHOWN_FILES"; DIFF_SHOWN_LINES="$_DIFF_SHOWN_LINES"; DIFF_OMITTED_LIST="$DIFF_OMITTED_FILES"
   fi
   return 0
 }

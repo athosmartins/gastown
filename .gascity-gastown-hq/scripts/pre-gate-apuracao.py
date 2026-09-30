@@ -118,6 +118,39 @@ def run_cost(r):
     return float(c)
 
 
+# O que o revisor VIU decide o que o seu PASS vale. Sobre um diff que ele viu só em parte (ou de cobertura desconhecida) o
+# PASS diz "nada nos arquivos que li", que não é a liberação que o PASS total dá ao construtor: misturar os dois na linha de
+# calibração faria "pré-revisão PASS → gate 1a-PASS" medir uma coisa que não é a que o Step 2b promete.
+PASS_PARCIAL = "PASS sem cobertura total"
+
+
+def run_coverage(r):
+    """'full' | 'partial' | 'unknown' — quanto do diff o revisor viu neste run. Três estados, nunca dois.
+
+    Registro novo traz `coverage` (full | partial:<n>/<m> | unknown). Registro anterior a ele traz só `partial`: False quer
+    dizer que o diff inteiro foi mostrado, True que foi parcial; ausente ou de outro tipo NÃO quer dizer 'inteiro'."""
+    cov = r.get("coverage")
+    if isinstance(cov, str) and cov:
+        return "full" if cov == "full" else ("partial" if cov.startswith("partial") else "unknown")
+    if r.get("partial") is False:
+        return "full"
+    if r.get("partial") is True:
+        return "partial"
+    return "unknown"
+
+
+def pre_group(r):
+    """O veredito de um run da pré-revisão para a calibração: PASS só com cobertura total; PASS_PARCIAL quando o revisor
+    disse PASS sem ter visto tudo — venha isso como PASS de um escritor antigo (cobertura não total) ou como o INCONCLUSIVE
+    partial-diff / coverage-unknown do escritor atual (o script recusa a liberação, e o registro guarda o motivo)."""
+    v = r.get("verdict", "?")
+    if v == "PASS" and run_coverage(r) != "full":
+        return PASS_PARCIAL
+    if v == "INCONCLUSIVE" and str(r.get("reason", "")).startswith(("partial-diff", "coverage-unknown")):
+        return PASS_PARCIAL
+    return v
+
+
 def recompute_arms(assets_dir, beads):
     """Ask the REAL pregate_arm_for_bead (bash) — one process for all beads. {bead: 'on'|'off'|None}"""
     if not beads:
@@ -318,13 +351,14 @@ def main():
     if ran:
         verdicts = defaultdict(int)
         for b in ran:
-            verdicts[launched[b][0].get("verdict", "?")] += 1
+            verdicts[pre_group(launched[b][0])] += 1
         print("  1o veredito da pré-revisão nas beads que rodaram: " + ", ".join(f"{k}={v}" for k, v in sorted(verdicts.items())))
-        for v in ("PASS", "FAIL"):
-            grp = [per[b] for b in per if per[b]["arm"] == "on" and per[b]["bead"] in launched and launched[per[b]["bead"]][0].get("verdict") == v and per[b]["first"] in ("PASS", "FAIL")]
+        for v in ("PASS", PASS_PARCIAL, "FAIL"):
+            grp = [per[b] for b in per if per[b]["arm"] == "on" and per[b]["bead"] in launched and pre_group(launched[per[b]["bead"]][0]) == v and per[b]["first"] in ("PASS", "FAIL")]
             if grp:
                 kk = sum(1 for p in grp if p["first"] == "PASS")
-                print(f"     pré-revisão {v} → gate 1a-PASS {kk}/{len(grp)} ({pct(kk/len(grp))})  [calibração; n pequeno, olhe o IC antes de concluir]")
+                nota = "  [FORA da calibração do PASS: o revisor não viu o diff inteiro]" if v == PASS_PARCIAL else "  [calibração; n pequeno, olhe o IC antes de concluir]"
+                print(f"     pré-revisão {v} → gate 1a-PASS {kk}/{len(grp)} ({pct(kk/len(grp))}){nota}")
     print("  (a taxa por INTENÇÃO DE TRATAR acima já inclui quem não rodou; baixa aderência DILUI o efeito, não o inverte)")
     contaminated = sorted({p["bead"] for p in per.values() if p["arm"] == "off" and launched.get(p["bead"])})
     if contaminated:
@@ -385,20 +419,25 @@ def main():
     c_on, c_off = cost_per["on"], cost_per["off"]
     rate_ok = p_on >= a.target
     # three states: True / False / None (= cannot tell). With ANY launched run of unknown cost in either arm the two
-    # US$/aprovada are lower bounds, and "on <= off" between two lower bounds proves nothing in either direction.
-    cost_ok = None if unknown_total else (c_on == c_on and c_off == c_off and c_on <= c_off)
+    # US$/aprovada are lower bounds, and "on <= off" between two lower bounds proves nothing in either direction. The same
+    # goes for an arm with no approved bead: its US$/aprovada is NaN (a division by zero approvals), and a comparison against
+    # NaN is False — which would print NÃO for something that was never computed.
+    cost_calc = c_on == c_on and c_off == c_off
+    cost_ok = None if (unknown_total or not cost_calc) else (c_on <= c_off)
+    cost_why = (f"custo do pré-gate desconhecido em {unknown_total} run(s)" if unknown_total
+                else "um braço sem bead aprovada: US$/aprovada não calculável")
     print("  (nota: a taxa conta como reprovação os runs em que nenhum revisor julgou — viés para BAIXO em 'on ≥ alvo': um NÃO abaixo pode ser em parte infra, não conteúdo.)")
     print(f"  on ≥ {pct(a.target)}?  {pct(p_on)}  → {'SIM' if rate_ok else 'NÃO'}")
     print(f"  US$/aprovada on ≤ off (PARCIAL, sem construtor)?  {lb(c_on, unk['on'])} vs {lb(c_off, unk['off'])}  → "
-          f"{'INDETERMINADO (custo do pré-gate desconhecido em ' + str(unknown_total) + ' run(s))' if cost_ok is None else ('SIM' if cost_ok else 'NÃO')}")
+          f"{'INDETERMINADO (' + cost_why + ')' if cost_ok is None else ('SIM' if cost_ok else 'NÃO')}")
     excl0 = (d == d) and dlo > 0
     print(f"  diferença exclui 0 (efeito real, não acaso)?  → {'SIM' if excl0 else 'NÃO'}")
     if not rate_ok or not excl0 or cost_ok is False:
         # a failed condition is decisive whatever the unknown cost turns out to be
         print("  ► CRITÉRIO NÃO ATINGIDO — escrever o relatório do porquê (qual condição falhou acima).")
     elif cost_ok is None:
-        print("  ► CRITÉRIO INDETERMINADO — taxa e diferença passam, mas o custo do pré-gate é desconhecido em "
-              f"{unknown_total} run(s): NÃO proponha ligar a pré-revisão com este número. Não pare o experimento; apure de novo.")
+        print(f"  ► CRITÉRIO INDETERMINADO — taxa e diferença passam, mas a condição de custo não se decide ({cost_why}): "
+              "NÃO proponha ligar a pré-revisão com este número. Não pare o experimento; apure de novo.")
     else:
         print("  ► CRITÉRIO ATINGIDO — propor ligar a pré-revisão pra todos (decisão do Mayor; custo do construtor ainda não medido).")
     return 0

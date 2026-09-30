@@ -16,13 +16,22 @@
 # appended to <city>/.gc/logs/pre-gate-review/runs.jsonl for pre-gate-apuracao.py, which reports approval on x off.
 #
 # THREE outcomes, never two (a check that cannot run must not read as a check that passed):
-#   exit 0   PASS         no blocking defect found       (also: SKIPPED — control arm, or the per-bead run cap)
-#   exit 10  FAIL         blocking defect(s) — printed; fix, commit, re-run (the cap is PRE_GATE_MAX_RUNS runs per bead)
+#   exit 0   PASS         no blocking defect found IN A DIFF THE REVIEWER SAW WHOLE (coverage=full)
+#                         (also exit 0: SKIPPED — control arm, or the per-bead run cap)
+#   exit 10  FAIL         blocking defect(s) — printed; fix, commit, re-run (the cap is PRE_GATE_MAX_RUNS runs per bead).
+#                         A FAIL stands on partial coverage too (a defect found is a defect found); the files the reviewer
+#                         was NOT shown are printed under it.
 #   exit 3   INCONCLUSIVE could not judge (machine guard, busy, timeout, no verdict line, dirty tree, ...) —
 #                         reason printed. The builder submits anyway: an unavailable rehearsal is not a verdict.
-#   exit 2   usage error
-# Every `run` that gets past argument parsing ends its stdout with one machine-readable line (a usage error, exit 2,
-# prints only usage on stderr):  PREGATE_RESULT arm=.. verdict=.. reason=.. attempt=.. record=..
+#                         Includes a reviewer PASS on a diff it was shown only PART of (reason partial-diff:<shown>/<total>-files,
+#                         over GATE_DIFF_LINE_BUDGET) or of unknown coverage (reason coverage-unknown): "no defect in the part I
+#                         saw" is not the clearance a PASS hands the builder, and the two must not read the same. The files not
+#                         shown are printed; the raw reviewer verdict is kept in the record (reviewer_verdict).
+#   exit 2   the call itself was wrong: a usage error, a bad or empty argument, or not inside a git checkout
+# Every `run` that ends in exit 0, 3 or 10 ends its stdout with one machine-readable line. Exit 2 does not: it prints its
+# reason (and, for a usage error, the usage) on stderr and no result line:
+#   PREGATE_RESULT arm=.. verdict=.. reason=.. attempt=.. coverage=.. record=..
+#   coverage = full | partial:<shown>/<total> (files) | unknown, or n/a when the run ended before a diff was read.
 #
 # Usage:
 #   pre-gate-review.sh [run] <branch> [--bead <id>] [--base <ref>] [--head <ref>] [--lens N] [--force]
@@ -116,7 +125,7 @@ pg_record() {
   "$py" - "$file" "$@" <<'PY' || { pg_log "WARN: record NOT written to $file"; return 1; }
 import json, sys, time
 path, event, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
-NUM = {"attempt", "cost_usd", "turns", "duration_s", "task_bytes", "diff_lines", "exit_code", "prior_runs"}
+NUM = {"attempt", "cost_usd", "turns", "duration_s", "task_bytes", "diff_lines", "exit_code", "prior_runs", "shown_files", "total_files", "shown_lines"}
 BOOL = {"launched", "partial", "forced", "cost_known"}
 d = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
 for p in pairs:
@@ -407,11 +416,13 @@ PY
 }
 
 # ── result reporting ────────────────────────────────────────────────────────────────────────────────────────
-PG_ARM="manual"; PG_ATTEMPT="0"; PG_WORK=""
+PG_ARM="manual"; PG_ATTEMPT="0"; PG_WORK=""; PG_COVERAGE="n/a"
 # pg_finish <verdict> <reason> <exit-code> — the one exit path: prints the machine line and returns the code.
+# The line carries the diff coverage (full | partial:<shown>/<total> | unknown | n/a): a PASS-shaped result must say how much
+# of the diff stood behind it, or a partial rehearsal and a full one are the same text to the reader and to any parser.
 pg_finish() {
-  printf 'PREGATE_RESULT arm=%s verdict=%s reason=%s attempt=%s record=%s\n' \
-    "$PG_ARM" "$1" "${2:-none}" "$PG_ATTEMPT" "${PG_RECORD_FILE:-none}"
+  printf 'PREGATE_RESULT arm=%s verdict=%s reason=%s attempt=%s coverage=%s record=%s\n' \
+    "$PG_ARM" "$1" "${2:-none}" "$PG_ATTEMPT" "$PG_COVERAGE" "${PG_RECORD_FILE:-none}"
   return "$3"
 }
 
@@ -452,6 +463,7 @@ pg_run_inner() {
     esac
   done
   [ -n "$branch" ] || { pg_log "missing <branch>"; pg_usage; return 2; }
+  PG_COVERAGE="n/a"   # per run: a sourced caller that runs twice must not carry the last run's coverage into this one
   PG_PY="$(pg_python)" || PG_PY=""
   case "$lens" in 1|2|3) ;; *) pg_log "--lens must be 1, 2 or 3"; return 2 ;; esac
   # `--bead ""` is what an unset shell variable produces. Reading it as "no bead" would silently switch to manual mode,
@@ -488,11 +500,11 @@ pg_run_inner() {
     pg_finish SKIPPED control-arm 0; return $?
   fi
 
-  # inconclusive(<reason>) — record + report. Nothing was spent unless the caller passes launched=true.
-  local _inc_extra=""
+  # inconclusive(<reason>) — record + report. Nothing was spent: it records launched=false (the one launched run is
+  # recorded further down, once the reviewer has been started).
   pg_inconclusive() {
     local reason="$1"
-    [ "$dry" -eq 0 ] && { pg_record run bead="$bead" branch="$branch" sha="$sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict=INCONCLUSIVE reason="$reason" launched=false $_inc_extra >/dev/null || true; }
+    [ "$dry" -eq 0 ] && { pg_record run bead="$bead" branch="$branch" sha="$sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict=INCONCLUSIVE reason="$reason" launched=false >/dev/null || true; }
     pg_log "INCONCLUSIVE: $reason"
     pg_finish INCONCLUSIVE "$reason" 3
   }
@@ -546,7 +558,15 @@ pg_run_inner() {
   # a reviewer shown nothing can answer PASS. That would hand the builder a clearance for code nobody read, so refuse.
   # (Unset counts as 0 too: a payload builder that did not run must not read as "a diff of N lines".)
   [ "${lines:-0}" -gt 0 ] || { pg_inconclusive "diff-text-empty"; return $?; }
-  local partial=false; case "$DIFF_HEADER" in PARTIAL*) partial=true ;; esac
+  # Coverage, three states (the lib publishes them; nothing here parses the prose header): full / partial / unknown.
+  # Unset counts as unknown, never as full: a payload builder that did not report must not read as "the reviewer saw it all".
+  local coverage partial=false
+  case "${DIFF_COVERAGE:-}" in
+    full)    coverage="full" ;;
+    partial) coverage="partial:${DIFF_SHOWN_FILES:-?}/$file_count"; partial=true ;;
+    *)       coverage="unknown" ;;
+  esac
+  PG_COVERAGE="$coverage"
 
   local author rig lens_text task
   author="${PRE_GATE_AUTHOR:-${GC_ALIAS:-${GC_AGENT:-$(git -C "$repo" config user.name 2>/dev/null)}}}"; author="${author:-unknown}"
@@ -590,8 +610,8 @@ pg_run_inner() {
        --allowedTools "$allow" --max-budget-usd "$max_usd")
 
   if [ "$dry" -eq 1 ]; then
-    printf 'PREGATE_DRYRUN model=%s effort=%s config=%s settings=%s lens=%s task_bytes=%s system_bytes=%s diff_lines=%s partial=%s base=%s head=%s cwd=%s max_usd=%s timeout=%ss\n' \
-      "$model" "$effort" "$cfg_src" "$settings_kind" "$lens" "${#task}" "${#system}" "$lines" "$partial" "$base_ref" "$head_ref" "$repo" "$max_usd" "$tmo"
+    printf 'PREGATE_DRYRUN model=%s effort=%s config=%s settings=%s lens=%s task_bytes=%s system_bytes=%s diff_lines=%s partial=%s coverage=%s base=%s head=%s cwd=%s max_usd=%s timeout=%ss\n' \
+      "$model" "$effort" "$cfg_src" "$settings_kind" "$lens" "${#task}" "${#system}" "$lines" "$partial" "$coverage" "$base_ref" "$head_ref" "$repo" "$max_usd" "$tmo"
     pg_finish DRYRUN dry-run 0; return $?
   fi
 
@@ -603,9 +623,8 @@ pg_run_inner() {
     *) pg_log "cannot create or write the concurrency slots under $(pg_log_dir)/slots — that is a fault, not a busy machine"
        pg_inconclusive "slots-unusable"; return $? ;;
   esac
-  _inc_extra="model=$model effort=$effort"
 
-  pg_log "reviewing $branch@${branch_sha:0:9} vs $base_ref — lens $lens, $file_count file(s), $lines diff line(s)$([ "$partial" = true ] && echo ', PARTIAL'), model=$model effort=$effort, cap \$$max_usd / ${tmo}s, attempt $PG_ATTEMPT"
+  pg_log "reviewing $branch@${branch_sha:0:9} vs $base_ref — lens $lens, $file_count file(s), $lines diff line(s), coverage $coverage, model=$model effort=$effort, cap \$$max_usd / ${tmo}s, attempt $PG_ATTEMPT"
   local t0=$SECONDS rc
   ( cd "$repo" && pg_with_timeout "$tmo" "${cmd[@]}" < "$work/task.txt" > "$work/stream.jsonl" 2> "$work/stderr.txt" )
   rc=$?
@@ -630,7 +649,14 @@ pg_run_inner() {
   elif [ "$rc" -eq 127 ]; then out_verdict=INCONCLUSIVE; reason="no-timeout-tool"; code=3
   elif [ "$result" != "present" ]; then out_verdict=INCONCLUSIVE; reason="no-result:claude-exit-$rc:$(head -c 120 "$work/stderr.txt" 2>/dev/null | tr '\n' ' ')"; code=3
   elif [ "$iserr" = "true" ]; then out_verdict=INCONCLUSIVE; reason="claude-error:${subtype:-unknown}"; code=3
-  elif [ "$verdict" = "PASS" ]; then out_verdict=PASS; reason="none"; code=0
+  elif [ "$verdict" = "PASS" ] && [ "$coverage" = "full" ]; then out_verdict=PASS; reason="none"; code=0
+  # A reviewer PASS is only a clearance for what the reviewer was shown. On a diff it saw PART of (or of unknown coverage) it
+  # says "no blocking defect in what I read", which is not what PASS tells the builder ("nothing found; go to Step 3") and is
+  # indistinguishable from a full-coverage PASS to Step 2b, to the result line and to the apuracao's calibration. So it is
+  # INCONCLUSIVE, with the numbers in the reason and the reviewer's raw verdict kept in the record. (A FAIL below stands: a
+  # defect found in the part it read is a defect.)
+  elif [ "$verdict" = "PASS" ] && [ "$partial" = true ]; then out_verdict=INCONCLUSIVE; reason="partial-diff:${DIFF_SHOWN_FILES:-?}/${file_count}-files"; code=3
+  elif [ "$verdict" = "PASS" ]; then out_verdict=INCONCLUSIVE; reason="coverage-unknown"; code=3
   elif [ "$verdict" = "FAIL" ]; then out_verdict=FAIL; reason="blocking"; code=10
   else out_verdict=INCONCLUSIVE; reason="no-verdict-line"; code=3
   fi
@@ -645,11 +671,23 @@ pg_run_inner() {
   pg_record run bead="$bead" branch="$branch" sha="$branch_sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict="$out_verdict" reason="$reason" \
     launched=true forced="$([ "$force" -eq 1 ] && echo true || echo false)" cost_known="$cost_known" ${meas[@]+"${meas[@]}"} duration_s="$dur" model="$model" model_resolved="$models" effort="$effort" \
     config_source="$cfg_src" settings="$settings_kind" lens="$lens" exit_code="$rc" task_bytes="${#task}" diff_lines="$lines" partial="$partial" \
+    coverage="$coverage" shown_files="${DIFF_SHOWN_FILES:-0}" total_files="$file_count" shown_lines="${DIFF_SHOWN_LINES:-0}" reviewer_verdict="${verdict:-none}" \
     fetch="$fetch_state" review_file="$review_file" >/dev/null || pg_log "WARN: this run was NOT recorded — the measurement will not see it"
 
   echo "── pre-gate review: $out_verdict (attempt $PG_ATTEMPT, ${dur}s, \$${cost:-?}, model ${models:-?}) ──"
   if [ -s "$work/review.txt" ]; then cat "$work/review.txt"; echo; fi
   [ -n "$review_file" ] && echo "(full text: $review_file)"
+  if [ "$coverage" != "full" ]; then
+    echo "── COVERAGE: $coverage — the reviewer was shown $( [ "$partial" = true ] && echo "only PART of this diff (${DIFF_SHOWN_LINES:-?} of $lines diff lines)" || echo "a diff whose coverage could not be established" ) ──"
+    if [ "$partial" = true ] && [ -n "${DIFF_OMITTED_LIST:-}" ]; then
+      echo "Files it was NOT shown (nobody has reviewed these):"; printf '%s' "$DIFF_OMITTED_LIST"
+    fi
+    if [ "$out_verdict" = INCONCLUSIVE ] && [ "$verdict" = "PASS" ]; then
+      echo "Its verdict was PASS, but only for what it saw, so this is INCONCLUSIVE, not a clearance. Re-running shows it the same part; review the files above yourself with the reviewer's lens."
+    elif [ "$out_verdict" = FAIL ]; then
+      echo "The FAIL stands (a defect found is a defect). Fixing it does not clear the files above."
+    fi
+  fi
   if [ "$out_verdict" = FAIL ]; then
     echo "Fix the blocking issue(s), commit, and re-run — at most ${PRE_GATE_MAX_RUNS:-3} runs per bead, then submit."
   fi

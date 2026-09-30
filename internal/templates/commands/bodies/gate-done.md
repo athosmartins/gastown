@@ -771,15 +771,18 @@ bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" run "<BRANCH>" 
 echo "pre-gate exit code: $?"
 ```
 
-The last line of output is `PREGATE_RESULT arm=… verdict=… reason=… attempt=…`. Three
+The last line of output is `PREGATE_RESULT arm=… verdict=… reason=… attempt=… coverage=…`.
+`coverage=` says how much of your diff the reviewer was shown: `full`, `partial:<shown>/<total>`
+(files — a diff over the line budget is cut, and the files it did not get are listed), `unknown`,
+or `n/a` when the run ended before a diff was read. A PASS only clears what was read. Three
 outcomes, never two — a check that could not run is not a check that passed:
 
 | exit | verdict | what you do |
 |---|---|---|
-| 0 | `PASS` | No blocking defect found. Go to Step 3. |
+| 0 | `PASS` | No blocking defect found in a diff the reviewer saw whole (`coverage=full`). Go to Step 3. |
 | 0 | `SKIPPED` | Control arm, or you already used the per-bead cap (3 runs). Go to Step 3. |
-| 10 | `FAIL` | The reviewer found blocking defect(s), printed above. For EACH one, re-read the cited lines and decide whether it is real. Fix the real ones — fix the CLASS, sweep your whole diff for siblings, not only the cited line (the same shape hides elsewhere in the same diff) — commit, and re-run `/gate-done` from Step 1. If you judge a finding a false positive you may still submit: say which and why in `SELF_AUDIT_SUMMARY`; the real gate decides. |
-| 3 | `INCONCLUSIVE` | It could not judge (`reason=` says why: machine guard, busy, timeout, no verdict line…). NOT a verdict, and not a reason to wait. Go to Step 3 and put `pre-gate inconclusive (<reason>)` in `SELF_AUDIT_SUMMARY`. |
+| 10 | `FAIL` | The reviewer found blocking defect(s), printed above. For EACH one, re-read the cited lines and decide whether it is real. Fix the real ones — fix the CLASS, sweep your whole diff for siblings, not only the cited line (the same shape hides elsewhere in the same diff) — commit, and re-run `/gate-done` from Step 1. If you judge a finding a false positive you may still submit: say which and why in `SELF_AUDIT_SUMMARY`; the real gate decides. If `coverage=` is not `full`, the FAIL stands but fixing it does not clear the files listed under `COVERAGE` — nobody has reviewed those. |
+| 3 | `INCONCLUSIVE` | It could not judge (`reason=` says why: machine guard, busy, timeout, no verdict line…). NOT a verdict, and not a reason to wait. Go to Step 3 and put `pre-gate inconclusive (<reason>)` in `SELF_AUDIT_SUMMARY`. **Exception — `reason=partial-diff:<shown>/<total>-files` or `reason=coverage-unknown`:** the reviewer said PASS, but only for the part it was shown (or an amount that could not be established). That is not a clearance, and re-running shows it the same part. The unread files are listed under `COVERAGE` in the output: review those yourself with the reviewer's lens (the Pre-flight Self-Audit), then go to Step 3 and put `pre-gate partial (<reason>): <what you checked in the unread files, and what you found>` in `SELF_AUDIT_SUMMARY`. |
 | 2 (or anything else) | — | The call itself was wrong (bad flag, empty `<BEAD_ID>`) or the script crashed. NOT a verdict. Fix the call if it is yours (an empty `<BEAD_ID>` means Step 2 did not run in this shell), otherwise go to Step 3 and say `pre-gate not run (<what happened>)` in `SELF_AUDIT_SUMMARY`. |
 
 The step is fail-open on tooling (a missing script or an unresolved model must never

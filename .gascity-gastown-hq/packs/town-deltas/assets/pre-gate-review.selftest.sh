@@ -9,7 +9,8 @@
 #   2. THE ARM IS DETERMINISTIC, BALANCED AND INDEPENDENT of the ga-rstae arm (which also splits by bead-id hash).
 #   3. THREE OUTCOMES. PASS / FAIL / INCONCLUSIVE are distinct exit codes, and every way of NOT being able to judge
 #      (guard, busy, timeout, no verdict line, claude error, dirty tree, HEAD off the branch, empty diff) is
-#      INCONCLUSIVE — never a PASS.
+#      INCONCLUSIVE — never a PASS. So is a reviewer PASS on a diff it saw only PART of (or of unknown coverage): the
+#      result line, the record and the console all say how much of the diff stood behind the verdict.
 #   4. IT WRITES NOTHING TO THE GATE and reviews with the LIVE gate-reviewer model/effort, read-only tools and a
 #      sanitized environment; the control arm spends nothing; the per-bead run cap holds.
 # Exit 0 iff every assertion holds. Bash 3.2 compatible (the interpreter macOS launchd gives the dispatcher).
@@ -283,6 +284,75 @@ REC="$(rec_for cost_tiny)"
 has_str "$REC" '"cost_known": true' "a tiny cost (python prints it as 5e-05) is still KNOWN"; has_str "$REC" '"cost_usd": 5e-05' "…and recorded as a number, not dropped for its notation"
 REC="$(rec_for cost_int)"
 has_str "$REC" '"cost_known": true' "an integer cost is known"; has_str "$REC" '"cost_usd": 2.0' "…recorded as 2.0"
+
+echo "── 5c. A PASS ON PART OF THE DIFF IS NOT A PASS (coverage: full / partial / unknown) ──"
+# gate ga-0ygcas, third state: over GATE_DIFF_LINE_BUDGET the reviewer is shown only some of the files (the lib says so in the
+# task: "PARTIAL DIFF — showing 1 of 3 files"). The script computed that, logged it, and then let a reviewer PASS on the part it
+# saw end as `verdict=PASS reason=none`, exit 0 — the same text as a PASS on the whole diff, which Step 2b tells the builder is
+# "no blocking defect found". Driven through `run` with a real small budget (a unit test of the lib would not have caught it:
+# the lib was right, the outcome ladder ignored it).
+G checkout -q -b feat/partial main
+for n in 1 2 3; do i=0; : > "$T/work/p$n.txt"; while [ "$i" -lt 10 ]; do echo "line $n.$i" >> "$T/work/p$n.txt"; i=$((i+1)); done; done
+G add p1.txt p2.txt p3.txt; G commit -q -m "three files"
+reset_state
+OUT="$(run_pg STUB_MODE=pass GATE_DIFF_LINE_BUDGET=20 -- run feat/partial --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+has_str "$(cat "$T/stub/call-1.stdin" 2>/dev/null)" "PARTIAL DIFF — showing 1 of 3 files" "fixture: the reviewer really was told PARTIAL DIFF, 1 of 3 files"
+eq "$rc" "3" "reviewer PASS on 1 of 3 files → exit 3 (was: exit 0)"
+eq "$(field "$L" verdict)" "INCONCLUSIVE" "…verdict=INCONCLUSIVE, never PASS"
+eq "$(field "$L" reason)" "partial-diff:1/3-files" "…the reason carries the numbers"
+eq "$(field "$L" coverage)" "partial:1/3" "…and the machine line carries the coverage"
+has_str "$OUT" "── COVERAGE: partial:1/3" "the builder is told, in words, that the reviewer saw only part"
+NOT_SHOWN="$(sed -n '/Files it was NOT shown/,$p' <<<"$OUT")"
+has_str "$NOT_SHOWN" "p2.txt" "the files nobody reviewed are listed (p2.txt)"
+has_str "$NOT_SHOWN" "p3.txt" "…(p3.txt)"
+not_str "$NOT_SHOWN" "p1.txt" "…and the file that WAS shown is not listed as unreviewed"
+has_str "$OUT" "not a clearance" "the console says the PASS is not a clearance"
+REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+has_str "$REC" '"launched": true' "record: the run was launched (money was spent)"
+has_str "$REC" '"verdict": "INCONCLUSIVE"' "record: verdict INCONCLUSIVE"
+has_str "$REC" '"reviewer_verdict": "PASS"' "record: what the reviewer actually said is kept (reviewer_verdict=PASS)"
+has_str "$REC" '"coverage": "partial:1/3"' "record: coverage"
+has_str "$REC" '"partial": true' "record: partial=true"
+has_str "$REC" '"shown_files": 1' "record: shown_files=1"
+has_str "$REC" '"total_files": 3' "record: total_files=3"
+# a FAIL on part of the diff stands: a defect found is a defect. It still says what was not read.
+reset_state
+OUT="$(run_pg STUB_MODE=fail GATE_DIFF_LINE_BUDGET=20 -- run feat/partial --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "10" "reviewer FAIL on 1 of 3 files → still exit 10"
+eq "$(field "$L" verdict)" "FAIL" "…verdict=FAIL stands"
+eq "$(field "$L" coverage)" "partial:1/3" "…and says it was on a partial diff"
+has_str "$OUT" "Files it was NOT shown" "…and lists what was not read"
+has_str "$OUT" "does not clear the files above" "…and that fixing the defect does not clear them"
+REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+has_str "$REC" '"reviewer_verdict": "FAIL"' "record: reviewer_verdict=FAIL"; has_str "$REC" '"coverage": "partial:1/3"' "record: coverage=partial on the FAIL too"
+# the dry run reports it as well (no money): a builder can see it before spending
+reset_state
+OUT="$(run_pg GATE_DIFF_LINE_BUDGET=20 -- run feat/partial --no-fetch --dry-run)"
+has_str "$OUT" "coverage=partial:1/3" "dry run: coverage is reported"
+G checkout -q feat/x
+# the control: a diff inside the budget is FULL, and a PASS on it is a PASS, with no coverage warning
+reset_state
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "0" "PASS on a full-coverage diff → exit 0 (the fix does not turn every PASS into INCONCLUSIVE)"
+eq "$(field "$L" verdict)" "PASS" "…verdict=PASS"; eq "$(field "$L" reason)" "none" "…reason=none"; eq "$(field "$L" coverage)" "full" "…coverage=full"
+not_str "$OUT" "── COVERAGE:" "…and no coverage warning"
+REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+has_str "$REC" '"coverage": "full"' "record: coverage=full"; has_str "$REC" '"partial": false' "record: partial=false"; has_str "$REC" '"reviewer_verdict": "PASS"' "record: reviewer_verdict=PASS"
+# unknown coverage is the third state: a payload builder that does not report (unset) must not read as "saw it all"
+reset_state
+OUT="$( cd "$T/work" && export PATH="$T/bin:$PATH" STUB_DIR="$T/stub" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" PRE_GATE_CLAUDE_BIN=claude \
+          PRE_GATE_MIN_DF_GIB=0 PRE_GATE_MIN_SWAP_MB=0 PRE_GATE_MIN_SYSTEM_CHARS=1000 STUB_MODE=pass
+        eval "$(declare -f gate_build_diff_payload | sed '1s/gate_build_diff_payload/_real_gate_build_diff_payload/')"
+        gate_build_diff_payload() { _real_gate_build_diff_payload "$@"; local _rc=$?; unset DIFF_COVERAGE; return "$_rc"; }
+        pg_run feat/x --no-fetch 2>/dev/null )"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "builder that reports no coverage + reviewer PASS → exit 3"
+eq "$(field "$L" verdict)" "INCONCLUSIVE" "…verdict=INCONCLUSIVE"; eq "$(field "$L" reason)" "coverage-unknown" "…reason=coverage-unknown"; eq "$(field "$L" coverage)" "unknown" "…coverage=unknown"
+REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+has_str "$REC" '"coverage": "unknown"' "record: coverage=unknown"; has_str "$REC" '"reviewer_verdict": "PASS"' "record: the reviewer's PASS is kept"
+# a run that ended before any diff was read has no coverage to report — n/a, not "full"
+reset_state
+OUT="$(run_pg STUB_MODE=pass PRE_GATE_MIN_DF_GIB=99999999 -- run feat/x --no-fetch)"; L="$(last_line "$OUT")"
+eq "$(field "$L" coverage)" "n/a" "a refusal before the diff is read reports coverage=n/a"
 
 echo "── 6. EVERY WAY OF NOT BEING ABLE TO JUDGE IS INCONCLUSIVE ──"
 reset_state

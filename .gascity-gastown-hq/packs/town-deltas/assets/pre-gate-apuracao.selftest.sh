@@ -80,7 +80,8 @@ args = sys.argv[2:]; i = args.index("--"); on = args[:i]; off = args[i+1:-1]; t0
 L = []
 def bead(b, arm, outcomes, runs=(), assign_arm=None, dt=0):
     L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": assign_arm or arm, "t0": t0 + dt, "outcomes": outcomes, "runs": list(runs)})
-pgpass = {"launched": True, "verdict": "PASS", "cost_usd": 0.5, "cost_known": True}
+# a real PASS record always says how much of the diff the reviewer saw (a PASS that does not is read as "coverage unknown", 5d)
+pgpass = {"launched": True, "verdict": "PASS", "cost_usd": 0.5, "cost_known": True, "coverage": "full", "partial": False}
 pgfail = {"launched": True, "verdict": "FAIL", "cost_usd": 0.5, "cost_known": True}
 # on b1-b4: pre-gate PASS, gate PASS first try (30 min)
 for b in on[0:4]: bead(b, "on", [["PASS", 30]], [pgpass])
@@ -328,6 +329,67 @@ mk_b "$T/specC4.json" on "$UNK_TIMEOUT" fail; gen "$C_HQ" "$T/specC4.json"; O="$
 has "$O" "CRITÉRIO NÃO ATINGIDO" "on rate far below target + an unknown cost → still NÃO ATINGIDO (decisive)"
 hasnt "$O" "CRITÉRIO INDETERMINADO" "…not INDETERMINADO"
 has "$O" "SEM custo conhecido: on=1 off=0" "…and the unknown cost is still reported"
+
+echo "── 5d. a PASS on PART of the diff is not calibrated with the PASSes on the WHOLE diff (gate ga-0ygcas) ──"
+# pre-gate-review.sh used to record a reviewer PASS on 1 of 3 files as verdict=PASS, exactly like a PASS on the whole diff, and
+# this report's calibration line ("pré-revisão PASS → gate 1a-PASS") mixed the two: it would have measured how often a rehearsal
+# that read HALF the diff predicts the gate under the label of one that read all of it. The current writer records that run as
+# INCONCLUSIVE (reason partial-diff / coverage-unknown, the reviewer's own word kept in reviewer_verdict); an OLDER writer's
+# record still says PASS. Both are read here as "PASS without full coverage", and a record that says nothing about coverage is
+# not "whole" either.
+DON=($(pick on 8 ond)); DOFF=($(pick off 2 offd))
+D_HQ="$T/hqD"; mk_hq "$D_HQ"
+python3 - "$T/specD.json" "${DON[@]}" -- "${DOFF[@]}" "$T0" <<'PY'
+import json, sys
+a = sys.argv[2:]; i = a.index("--"); on = a[:i]; off = a[i+1:-1]; t0 = int(a[-1])
+def run(**kw):
+    d = {"launched": True, "cost_usd": 0.5, "cost_known": True}; d.update(kw); return d
+runs = [   # (the bead's first pre-gate run, its first gate outcome)
+  (run(verdict="PASS", coverage="full", partial=False), "PASS"),                                                                    # d1 whole diff
+  (run(verdict="INCONCLUSIVE", reason="partial-diff:1/3-files", coverage="partial:1/3", partial=True, reviewer_verdict="PASS"), "FAIL"),   # d2 current writer, partial
+  (run(verdict="PASS", partial=True), "PASS"),                                                                                      # d3 older writer: PASS on a partial diff
+  (run(verdict="PASS", partial=False), "PASS"),                                                                                     # d4 older writer: whole diff shown
+  (run(verdict="PASS"), "FAIL"),                                                                                                    # d5 PASS, and the record says nothing about coverage
+  (run(verdict="INCONCLUSIVE", reason="coverage-unknown", coverage="unknown", reviewer_verdict="PASS"), "PASS"),                    # d6 coverage unknown
+  (run(verdict="INCONCLUSIVE", reason="timeout:1500s", cost_known=False), "FAIL"),                                                  # d7 an ordinary INCONCLUSIVE stays one
+  (run(verdict="FAIL", reason="blocking", coverage="partial:1/3", partial=True, reviewer_verdict="FAIL"), "FAIL"),                  # d8 a FAIL on a partial diff is a FAIL
+]
+L = []
+for b, (r, g) in zip(on, runs):
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [[g, 30]], "runs": [r]})
+for b in off:
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "off", "t0": t0, "outcomes": [["PASS", 30]], "runs": []})
+json.dump({"beads": L}, open(sys.argv[1], "w"))
+PY
+gen "$D_HQ" "$T/specD.json"
+OUTD="$(apu "$D_HQ" --min-n 1)"
+has "$OUTD" "FAIL=1, INCONCLUSIVE=1, PASS=2, PASS sem cobertura total=4" "1st pre-gate verdicts: 2 PASS on the whole diff, 4 PASS without full coverage (d2 d3 d5 d6), 1 ordinary INCONCLUSIVE (d7), 1 FAIL (d8)"
+has "$OUTD" "pré-revisão PASS → gate 1a-PASS 2/2" "the PASS calibration holds only the two whole-diff PASSes (d1, and d4 whose older record says partial=false)"
+has "$OUTD" "pré-revisão PASS sem cobertura total → gate 1a-PASS 2/4" "the PASSes that saw part of the diff, or an unknown amount, have a line of their own (d7 is not among them: 2/4, not 2/5)"
+has "$OUTD" "FORA da calibração do PASS" "…and that line says why it is not the PASS calibration"
+has "$OUTD" "pré-revisão FAIL → gate 1a-PASS 0/1" "a FAIL on a partial diff is still a FAIL (d8)"
+
+echo "── 5e. an arm with no approved bead has no US\$/aprovada: INDETERMINADO, not a NÃO (gate ga-0ygcas, low) ──"
+# cost per approved is NaN when an arm has no approved bead (a division by zero approvals), and `c_on <= NaN` is False: the report
+# printed "→ NÃO" and "CRITÉRIO NÃO ATINGIDO" for a comparison that was never made — cannot-compute read as a failed condition.
+E_HQ="$T/hqE"; mk_hq "$E_HQ"
+python3 - "$T/specE.json" "${BON[@]}" -- "${BOFF[@]}" "$T0" <<'PY'
+import json, sys
+a = sys.argv[1:]; i = a.index("--")
+out, on, off, t0 = a[0], a[1:i], a[i+1:-1], int(a[-1])
+L = []
+for b in on:   # every on bead passes first time, with a known cost
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 20]], "runs": [{"launched": True, "verdict": "PASS", "coverage": "full", "cost_usd": 0.10, "cost_known": True}]})
+for b in off:  # no off bead is ever approved
+    L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": "off", "t0": t0, "outcomes": [["FAIL", 20], ["FAIL", 60]], "runs": []})
+json.dump({"beads": L}, open(out, "w"))
+PY
+gen "$E_HQ" "$T/specE.json"
+OUTE="$(apu "$E_HQ")"
+has "$OUTE" "INDETERMINADO (um braço sem bead aprovada: US\$/aprovada não calculável)" "the cost condition says WHY it cannot be decided"
+has "$OUTE" "CRITÉRIO INDETERMINADO" "rate and CI pass, cost not computable → the criterion is INDETERMINADO"
+hasnt "$OUTE" "CRITÉRIO NÃO ATINGIDO" "…not a NÃO for a comparison that was never made"
+hasnt "$OUTE" "CRITÉRIO ATINGIDO" "…and never ATINGIDO"
 
 echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"
