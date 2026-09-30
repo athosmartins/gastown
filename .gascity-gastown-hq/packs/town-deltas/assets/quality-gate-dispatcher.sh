@@ -4771,14 +4771,25 @@ rebase_git_attributes_file() {
   printf '%s' "$tmp"
 }
 
-# rebase_deploy_deps_verdict <wt> <gd> <main_ref> <new_tip> <mt_out>   (ga-r5dsgp)
+# rebase_deploy_deps_verdict <wt> <gd> <main_ref> <new_tip> <mt_out> [mode]   (ga-r5dsgp, ga-ub5hkz)
 #
-# Called ONLY by rebase_content_verdict(), and ONLY when its ground-truth
-# merge-tree(main_ref, orig_tip) conflicted and printed a tree (<mt_out> is
-# that call's own stdout — reused, never recomputed, so it carries the SAME
-# core.attributesFile filtering the verdict call used, ga-stisew). Prints one
-# line: "yes" or "unknown:<reason>" — never "no": nothing here can PROVE a
-# rebase lost content, it can only fail to verify it.
+# Called ONLY by rebase_content_verdict(), and ONLY for a ground-truth
+# merge-tree(main_ref, orig_tip) that disagrees with the rebase on
+# daemons/deploy_deps.json. <mt_out> is that call's own stdout — reused, never
+# recomputed, so it carries the SAME core.attributesFile filtering the verdict
+# call used (ga-stisew). Prints one line: "yes" or "unknown:<reason>" — never
+# "no": nothing here can PROVE a rebase lost content, it can only fail to
+# verify it. (The caller decides which of those reasons still mean "no" — see
+# the mapping in rebase_content_verdict().)
+#
+# <mode> says HOW the ground truth disagrees:
+#   conflict (default, ga-r5dsgp) — the merge-tree CONFLICTED and printed a
+#       tree; requirement 1 below applies.
+#   clean    (ga-ub5hkz) — the merge-tree was CLEAN (rc=0, <mt_out> is just the
+#       tree oid) but its tree differs from the rebase's. Nothing conflicted,
+#       so requirement 1 has nothing to look at; requirement 2 is what pins the
+#       disagreement to deploy_deps.json. Any other <mode> is unknown: a value
+#       nobody defined must not silently pick one of the two.
 #
 # WHY this exists: daemons/deploy_deps.json (whatsapp_automation) is a
 # GENERATED file registered with a custom merge driver (merge=deploydeps), and
@@ -4790,12 +4801,25 @@ rebase_git_attributes_file() {
 # back "unknown" every sweep: 59 sweeps on one marker, 2.5h head-of-line
 # block, P0 in the queue (ga-r5dsgp).
 #
+# WHY "clean" exists too (ga-ub5hkz): the same missing driver makes the ground
+# truth WRONG without conflicting. When main and the branch move the derived
+# `n` to the same value (each adding a different item), the text merge applies
+# the two "equal" edits once and comes out clean at n+1, while the driver — which
+# the real rebase runs — unions both items and gives n+2. The trees then differ
+# only in this file and the verdict was "no": 25 branches between 15/09 and
+# 29/09, each burning a GATE_FIX_CAP slot on correct code. Which side is right
+# is answered by regenerating, not by comparing text, so the same arbiter is
+# asked here; the conflicted case just shows up as a conflict instead of as a
+# clean-but-stale result.
+#
 # WHAT "yes" MEANS here — all four must hold, each with its own unknown suffix
 # when it does not (a "could not verify" is never folded into "verified"):
-#   1. the ONLY conflicting path in <mt_out> is daemons/deploy_deps.json;
-#   2. new_tip's tree differs from the conflicted merge's own tree at EXACTLY
-#      that one path (git diff-tree) — so every OTHER path, including files
-#      neither side conflicted on, is byte-identical to the ground-truth merge.
+#   1. (conflict mode only) the ONLY conflicting path in <mt_out> is
+#      daemons/deploy_deps.json;
+#   2. new_tip's tree differs from the ground-truth merge's own tree (the
+#      conflicted one, or in clean mode the clean one) at EXACTLY that one path
+#      (git diff-tree) — so every OTHER path, including files neither side
+#      conflicted on, is byte-identical to the ground-truth merge.
 #      This is the part a sole-conflict check alone does not give: a rebase
 #      that silently dropped some other file still has "one conflicting path";
 #   3. the generator at new_tip is byte-identical (blob) to the one at
@@ -4811,17 +4835,26 @@ rebase_git_attributes_file() {
 # overloaded host it therefore times out with its own visible suffix rather
 # than stalling the sweep; the marker just keeps today's "not verified" state.
 rebase_deploy_deps_verdict() {
-  local wt="$1" gd="$2" main_ref="$3" new_tip="$4" mt_out="$5"
+  local wt="$1" gd="$2" main_ref="$3" new_tip="$4" mt_out="$5" mode="${6:-conflict}"
   local paths expected actual diffout diff_rc tip_sha wt_head wt_dirty wt_rc
-  local main_gen tip_gen chk_err chk_rc chk_timeout
+  local main_gen tip_gen chk_err chk_rc chk_timeout why
+  case "$mode" in
+    conflict|clean) : ;;
+    *) echo "unknown:deploy-deps-bad-mode"; return 0 ;;
+  esac
   # 1. sole conflicting path. Lines after the tree oid, up to the blank line,
   # are "<mode> <oid> <stage>\t<path>"; an unexpected shape survives `cut` as
   # a non-matching "path", so it can only make this check fail, never pass.
-  paths=$(printf '%s\n' "$mt_out" | tail -n +2 | sed '/^$/q' | sed '/^$/d' | cut -f2- | sort -u)
-  if [ "$paths" != "daemons/deploy_deps.json" ]; then
-    echo "unknown:merge-tree-conflict"; return 0
+  # Clean mode has no conflicting path to name — requirement 2 carries it.
+  if [ "$mode" = "conflict" ]; then
+    paths=$(printf '%s\n' "$mt_out" | tail -n +2 | sed '/^$/q' | sed '/^$/d' | cut -f2- | sort -u)
+    if [ "$paths" != "daemons/deploy_deps.json" ]; then
+      echo "unknown:merge-tree-conflict"; return 0
+    fi
   fi
-  # 2. every other path identical to the ground-truth merge's tree.
+  # 2. every other path identical to the ground-truth merge's tree. In clean
+  # mode this is also the ONLY thing restricting the disagreement to
+  # deploy_deps.json, so it may not be skipped or loosened.
   expected=$(printf '%s\n' "$mt_out" | head -1)
   case "$expected" in
     *[!0-9a-f]*|"") echo "unknown:bad-expected-sha"; return 0 ;;
@@ -4865,8 +4898,13 @@ rebase_deploy_deps_verdict() {
   # `type -t`, not bare `type`: on macOS `log` is also /usr/bin/log (the system
   # logging CLI), which a bare `type log` happily finds when the dispatcher's
   # own log() function is not loaded — this must only ever call the function.
+  if [ "$mode" = "clean" ]; then
+    why="the only path where the rebase differs from the clean text merge is daemons/deploy_deps.json (ga-ub5hkz)"
+  else
+    why="sole conflict is daemons/deploy_deps.json (ga-r5dsgp)"
+  fi
   if [ "$(type -t log 2>/dev/null)" = "function" ]; then
-    log "rebase_content_verdict: running gen_daemon_deps.py --check (timeout ${chk_timeout}s) — sole conflict is daemons/deploy_deps.json (ga-r5dsgp)" >&2
+    log "rebase_content_verdict: running gen_daemon_deps.py --check (timeout ${chk_timeout}s) — $why" >&2
   fi
   chk_err=$( cd "$wt" && timeout "$chk_timeout" python3 scripts/gen_daemon_deps.py --check 2>&1 >/dev/null ); chk_rc=$?
   case "$chk_rc" in
@@ -4892,8 +4930,19 @@ rebase_deploy_deps_verdict() {
 #   yes           — a arvore do rebase bate com a do merge 3-way: nada se perdeu
 #                   (ga-r5dsgp: OU o merge-tree conflitou SO em
 #                   daemons/deploy_deps.json e rebase_deploy_deps_verdict()
-#                   provou o resto — ver la os 4 requisitos)
+#                   provou o resto — ver la os 4 requisitos;
+#                   ga-ub5hkz: OU o merge-tree foi LIMPO mas as arvores so
+#                   divergem nesse mesmo arquivo e o mesmo arbitro provou o
+#                   resto — o texto limpo pode estar velho, o driver do rebase
+#                   e quem soma os itens)
 #   no            — DIFEREM: o rebase perdeu ou alterou conteudo; NAO empurrar
+#                   (ga-ub5hkz: segue "no" quando o arbitro de deploy_deps.json
+#                   nao abona — diverge TAMBEM outro path (tree-mismatch),
+#                   ninguem pode abonar o tip (gerador ausente ou diferente do
+#                   de main) ou o --check RODOU e reprovou. Fica "no" porque e
+#                   deterministico: o classificador do gate manda "no" pra
+#                   needs-rebase e "unknown" pro retry transitorio, ga-10uqmi,
+#                   e re-rodar nao muda o resultado)
 #   unknown:*     — nao deu pra comparar. Terceiro estado explicito: quem chama
 #                   trata como "nao verificado", nunca como "verificado ok"
 #                   (todo comparador no dispatcher testa "= yes"/"!= yes",
@@ -4951,6 +5000,12 @@ rebase_deploy_deps_verdict() {
 #                                                         GATE_DEPLOY_DEPS_CHECK_TIMEOUT
 #                     :deploy-deps-check-unavailable   — python3/timeout ausente (127)
 #                     :deploy-deps-check-failed        — --check saiu != 0
+#                   (ga-ub5hkz) e estes, num merge-tree LIMPO que so difere em
+#                   deploy_deps.json — o arbitro NAO PODE rodar, entao nao ha
+#                   veredito e o retry e o tratamento certo (nunca "no"):
+#                     :deploy-deps-wt-not-at-tip / :deploy-deps-check-timeout /
+#                     :deploy-deps-check-unavailable / :deploy-deps-diff-error /
+#                     :deploy-deps-bad-mode / :deploy-deps-no-verdict
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   # ga-pgxs78: every "unknown" now carries WHICH of the could-not-verify
@@ -5023,7 +5078,33 @@ rebase_content_verdict() {
     *[!0-9a-f]*|"") echo "unknown:bad-actual-sha"; return 0 ;;
   esac
   if [ "${#actual}" -ne 40 ]; then echo "unknown:bad-actual-sha"; return 0; fi
-  if [ "$expected" = "$actual" ]; then echo "yes"; else echo "no"; fi
+  if [ "$expected" = "$actual" ]; then echo "yes"; return 0; fi
+  # ga-ub5hkz: the trees differ. That is "no" — unless the ONLY difference is
+  # daemons/deploy_deps.json, in which case the reference side may be the wrong
+  # one: the reference merge leaves the custom merge driver out (ga-stisew), so
+  # a text merge that comes out CLEAN can still be stale (same `n` bumped by
+  # both sides, counted once), while the real rebase ran the driver. Ask the
+  # generator, exactly as the conflicted case above does; rebase_deploy_deps_
+  # verdict() (clean mode) is also what pins the difference to that one path,
+  # so a tree that differs anywhere else comes back as tree-mismatch => "no".
+  #
+  # The mapping is the point of this block: only "yes" upgrades. Three outcomes
+  # stay "no", because re-running reproduces each and "unknown" would send a
+  # deterministic failure into the transient retry path (ga-10uqmi): another
+  # path differs too (tree-mismatch), nothing can vouch for the tip (generator
+  # absent or not main's), or the generator's --check ran and rejected it.
+  # Everything else — the arbiter could not run, or said something this block
+  # does not know — is "unknown:*": three states, and "could not tell" never
+  # becomes "no".
+  local ddv
+  ddv=$(rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out" clean)
+  case "$ddv" in
+    yes) echo "yes" ;;
+    unknown:deploy-deps-tree-mismatch|unknown:deploy-deps-generator-unverified|unknown:deploy-deps-check-failed)
+      echo "no" ;;
+    unknown:*) echo "$ddv" ;;
+    *) echo "unknown:deploy-deps-no-verdict" ;;
+  esac
 }
 
 # rebase_content_lost_paths <worktree> <main_ref> <orig_tip> <new_tip> — lista

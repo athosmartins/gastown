@@ -207,9 +207,13 @@ LOST_CONFLICT=$( . "$TMP/block.sh"; rebase_content_lost_paths "$RC" "$CMAIN" "$C
 
 # Teste 4 — MUTACAO: se a comparacao nao comparar, o Teste 2 tem de ficar
 # vermelho. Sem isto, os testes acima poderiam passar por acidente.
-sed 's/if \[ "\$expected" = "\$actual" \]; then echo "yes"; else echo "no"; fi/echo "yes"/' \
+# (ga-ub5hkz: a comparacao agora e `if ...; then echo "yes"; return 0; fi` seguida
+# do arbitro de deploy_deps.json; o guard "mutacao aplicou" e cmp, nao grep —
+# o grep antigo casava com OUTRA linha que tambem termina em echo "yes" e
+# passava mesmo com o sed sem efeito.)
+sed 's/if \[ "\$expected" = "\$actual" \]; then echo "yes"; return 0; fi/echo "yes"; return 0/' \
   "$TMP/block.sh" > "$TMP/block_mut.sh"
-if ! grep -q 'echo "yes"$' "$TMP/block_mut.sh"; then
+if cmp -s "$TMP/block.sh" "$TMP/block_mut.sh"; then
   bad "mutacao nao aplicou — o teste 4 nao esta provando nada"
 else
   V4=$( . "$TMP/block_mut.sh"; rebase_content_verdict "$R" "$MAIN" "$FEAT" "$LOSSY" )
@@ -384,8 +388,8 @@ fi
 # $wt must be a REAL, non-bare checkout for this (unlike Teste 6's bare
 # .repo.git): --check reads $wt's on-disk files, exactly as the live
 # dispatcher's $TMP_REBASE_WT already is post-commit, pre-push.
-mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|none]
-  local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" pre=''
+mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|none] [main_n:5]
+  local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" main_n="${5:-5}" pre=''
   mkdir -p "$R/daemons" "$R/scripts"
   git -C "$R" init -q
   git -C "$R" config user.email t@t; git -C "$R" config user.name T
@@ -427,11 +431,15 @@ PYEOF
   [ "$gen_mode" = "selfattest" ] && printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' > "$R/scripts/gen_daemon_deps.py"
   git -C "$R" add -A; git -C "$R" commit -qm "branch regenerates deploy_deps.json"
   git -C "$R" checkout -q ddjmain
-  printf '{"n": 5}\n' > "$R/daemons/deploy_deps.json"
+  # main_n=5 (default): main and the branch changed the same line to DIFFERENT
+  # values, so a plain text merge conflicts. main_n=1 (ga-ub5hkz): both sides
+  # changed it to the SAME value {"n": 1}, so a plain text merge is CLEAN — and
+  # WRONG, because the merge driver would add both sides' items ({"n": 2}).
+  printf '{"n": %s}\n' "$main_n" > "$R/daemons/deploy_deps.json"
   [ "$with_other" = "1" ] && printf 'main-version\n' > "$R/other.txt"
   git -C "$R" add -A; git -C "$R" commit -qm "main regenerates deploy_deps.json differently"
 }
-# ddj_setup <dir> [with_other] [with_feature] [gen_mode] — builds the fixture
+# ddj_setup <dir> [with_other] [with_feature] [gen_mode] [main_n] — builds the fixture
 # and sets DDJ_MAIN / DDJ_BRANCH, leaving $dir checked out detached at the
 # branch, ready for a "rebase result" commit on top.
 ddj_setup() {
@@ -592,6 +600,152 @@ grep -q 'rebase_deploy_deps_verdict "\$wt" "\$gd" "\$main_ref" "\$new_tip" "\$ou
   && ok "rebase_content_verdict still delegates its conflicted-merge-tree branch to rebase_deploy_deps_verdict" || bad "the ga-r5dsgp delegation is gone from rebase_content_verdict"
 grep -q 'gen_daemon_deps.py --check' "$DISPATCHER" \
   && ok "dispatcher still invokes the generator's --check as the verification step" || bad "the --check invocation is gone from the dispatcher"
+
+# Teste 9 (ga-ub5hkz) — daemons/deploy_deps.json, but the TEXT merge is CLEAN.
+#
+# INCIDENTE (medido no log do dispatcher, 15-29/09: 25 branches distintas, uma
+# delas 21x no mesmo dia): main e a branch mudam o MESMO `n` para o MESMO valor
+# (289 -> 290), cada uma somando um item DIFERENTE. O merge-tree de referencia
+# (que deixa de fora o driver custom, ga-stisew) aplica as duas mudancas
+# "iguais" UMA vez so e sai LIMPO em 290 — errado. O rebase real roda o driver
+# (uniao + recalculo do n) e da 291 — correto. As arvores divergem so em
+# deploy_deps.json, o veredito era "no", e o failed_merge_time_rebase gastava
+# um slot do GATE_FIX_CAP em codigo certo. O Teste 8 cobre o caso em que o
+# texto CONFLITA; este cobre o caso em que ele NAO conflita — o outro meio.
+#
+# O arbitro e o gerador (arquivo derivado se arbitra regenerando): "yes" so
+# quando as arvores divergem EXATAMENTE nesse path, o gerador e o de main e
+# --check passa. O que o gerador nao abona continua "no" (determinístico: o
+# classificador do gate manda "no" para needs-rebase e "unknown" para o retry
+# transitorio — ga-10uqmi — entao um tip provadamente ruim NAO pode virar
+# unknown). "unknown" fica so para "nao consegui rodar o arbitro".
+#
+# Fixture: main_n=1 => main e branch escrevem {"n": 1} (texto limpo, errado);
+# o gerador de fixture aceita so {"n": 2} (o que o driver produziria).
+RC1="$TMP/repo-ddj-clean"; ddj_setup "$RC1" 0 1 canon 1
+C1_MAIN="$DDJ_MAIN"; C1_BRANCH="$DDJ_BRANCH"
+
+# Teste 9-premise — sem isto o 9a passaria por acidente: o merge-tree puro tem
+# de ser LIMPO (rc=0) e o texto que ele produz tem de ser o valor ERRADO.
+C1_MT=$(git -C "$RC1" merge-tree --write-tree "$C1_MAIN" "$C1_BRANCH" 2>/dev/null); C1_MT_RC=$?
+C1_REF_CONTENT=$(git -C "$RC1" show "$(printf '%s\n' "$C1_MT" | head -1):daemons/deploy_deps.json" 2>/dev/null)
+{ [ "$C1_MT_RC" -eq 0 ] && [ "$C1_REF_CONTENT" = '{"n": 1}' ]; } \
+  && ok "premissa: o texto de main e branch merge LIMPO (rc=0) e em valor errado {\"n\": 1} — o driver daria {\"n\": 2}" \
+  || bad "premissa quebrada: esperava merge-tree limpo com {\"n\": 1}, deu rc=$C1_MT_RC conteudo='$C1_REF_CONTENT'"
+
+# Teste 9a — O FIX: o tip do rebase tem deploy_deps.json canonico ({"n": 2}),
+# todo o resto identico a referencia, e --check passa => "yes" (hoje: "no").
+printf '{"n": 2}\n' > "$RC1/daemons/deploy_deps.json"
+git -C "$RC1" commit -qam "rebase tip: the merge driver's deploy_deps.json (both sides' items)"
+C1_GOOD=$(git -C "$RC1" rev-parse HEAD)
+V9A=$(run_verdict_at "$RC1" "$C1_MAIN" "$C1_BRANCH" "$C1_GOOD")
+[ "$V9A" = "yes" ] && ok "texto limpo mas errado + so deploy_deps.json diverge + --check verde => yes (o falso 'content verdict=no' do ga-ub5hkz)" \
+                   || bad "esperava yes (so deploy_deps.json diverge, gerador abona), deu '$V9A' (gasta GATE_FIX_CAP em codigo certo)"
+
+# Teste 9b — CONTROLE (Mayor: "divergencia que inclua QUALQUER outro caminho
+# continua no"): deploy_deps.json canonico E feature.txt descartado pelo tip.
+# O merge de referencia e limpo e TEM feature.txt; o tip nao => 2 paths
+# divergem => "no", nem yes nem unknown.
+RC2="$TMP/repo-ddj-clean-lostfile"; ddj_setup "$RC2" 0 1 canon 1
+C2_MAIN="$DDJ_MAIN"; C2_BRANCH="$DDJ_BRANCH"
+git -C "$RC2" rm -q feature.txt
+printf '{"n": 2}\n' > "$RC2/daemons/deploy_deps.json"
+git -C "$RC2" commit -qam "rebase tip: canonical deploy_deps.json but feature.txt silently dropped"
+C2_TIP=$(git -C "$RC2" rev-parse HEAD)
+V9B=$(run_verdict_at "$RC2" "$C2_MAIN" "$C2_BRANCH" "$C2_TIP")
+[ "$V9B" = "no" ] && ok "deploy_deps.json + OUTRO path divergem => segue no (o fix nunca afrouxa perda de conteudo em outro arquivo)" \
+                  || bad "esperava no quando feature.txt some junto com a divergencia de deploy_deps.json, deu '$V9B'"
+
+# Teste 9c — CONTROLE: so feature.txt diverge (deploy_deps.json do tip e
+# byte-identico ao da referencia, {"n": 1}) => "no", como sempre. Sem isto um
+# fix que devolvesse yes a QUALQUER arvore divergente passaria em 9a.
+RC3="$TMP/repo-ddj-clean-otherpath"; ddj_setup "$RC3" 0 1 canon 1
+C3_MAIN="$DDJ_MAIN"; C3_BRANCH="$DDJ_BRANCH"
+git -C "$RC3" rm -q feature.txt
+git -C "$RC3" commit -qm "rebase tip: only feature.txt dropped, deploy_deps.json untouched"
+C3_TIP=$(git -C "$RC3" rev-parse HEAD)
+V9C=$(run_verdict_at "$RC3" "$C3_MAIN" "$C3_BRANCH" "$C3_TIP")
+[ "$V9C" = "no" ] && ok "so um arquivo que NAO e deploy_deps.json diverge => no (comportamento anterior intacto)" \
+                  || bad "esperava no quando so feature.txt diverge, deu '$V9C'"
+
+# Teste 9d — SEGURANCA: so deploy_deps.json diverge, mas o conteudo do tip esta
+# ERRADO ({"n": 999}) — o gerador nao abona. Tem de ser "no" (deterministico:
+# needs-rebase), NAO "unknown" (que cairia no retry transitorio e ressoaria —
+# ga-10uqmi) e jamais "yes".
+RC4="$TMP/repo-ddj-clean-wrong"; ddj_setup "$RC4" 0 1 canon 1
+C4_MAIN="$DDJ_MAIN"; C4_BRANCH="$DDJ_BRANCH"
+printf '{"n": 999}\n' > "$RC4/daemons/deploy_deps.json"
+git -C "$RC4" commit -qam "rebase tip: deploy_deps.json the generator does not vouch for"
+C4_TIP=$(git -C "$RC4" rev-parse HEAD)
+V9D=$(run_verdict_at "$RC4" "$C4_MAIN" "$C4_BRANCH" "$C4_TIP")
+[ "$V9D" = "no" ] && ok "--check reprova o deploy_deps.json do tip => no (deterministico, segue pra needs-rebase; nunca yes nem unknown)" \
+                  || bad "esperava no quando o gerador nao abona o tip, deu '$V9D'"
+
+# Teste 9e — SEGURANCA: a branch reescreveu o proprio gerador pra aprovar tudo,
+# e o deploy_deps.json do tip esta errado. Gerador diferente do de main => nao
+# ha quem abone => "no", nunca yes.
+RC5="$TMP/repo-ddj-clean-selfattest"; ddj_setup "$RC5" 0 1 selfattest 1
+C5_MAIN="$DDJ_MAIN"; C5_BRANCH="$DDJ_BRANCH"
+printf '{"n": 999}\n' > "$RC5/daemons/deploy_deps.json"
+git -C "$RC5" commit -qam "rebase tip: the branch's own always-approving generator vouches for a WRONG file"
+C5_TIP=$(git -C "$RC5" rev-parse HEAD)
+V9E=$(run_verdict_at "$RC5" "$C5_MAIN" "$C5_BRANCH" "$C5_TIP")
+[ "$V9E" = "no" ] && ok "gerador do tip difere do de main => no (a branch nao atesta a propria saida)" \
+                  || bad "esperava no quando a branch reescreveu o gerador, deu '$V9E'"
+
+# Teste 9f — "nao consegui rodar o arbitro" NAO e "no": um --check que estoura
+# o timeout e transitorio, e o retry e o tratamento certo. Um "no" aqui
+# mandaria uma branch correta pra needs-rebase por causa de carga na maquina.
+RC6="$TMP/repo-ddj-clean-slow"; ddj_setup "$RC6" 0 1 slow 1
+C6_MAIN="$DDJ_MAIN"; C6_BRANCH="$DDJ_BRANCH"
+printf '{"n": 2}\n' > "$RC6/daemons/deploy_deps.json"
+git -C "$RC6" commit -qam "good content, slow generator"
+C6_TIP=$(git -C "$RC6" rev-parse HEAD)
+T0=$(date +%s)
+V9F=$( export GATE_DEPLOY_DEPS_CHECK_TIMEOUT=1; run_verdict_at "$RC6" "$C6_MAIN" "$C6_BRANCH" "$C6_TIP" )
+T1=$(date +%s)
+{ [ "$V9F" = "unknown:deploy-deps-check-timeout" ] && [ $((T1 - T0)) -lt 20 ]; } \
+  && ok "--check estoura o timeout => unknown:deploy-deps-check-timeout em $((T1 - T0))s (nao consegui verificar != conteudo perdido)" \
+  || bad "esperava unknown:deploy-deps-check-timeout em <20s, deu '$V9F' apos $((T1 - T0))s"
+
+# Teste 9g — idem quando o worktree nao esta no new_tip: --check leria arquivos
+# que nao sao o que sera empurrado, entao nao ha veredito — unknown, nao no.
+RC7="$TMP/repo-ddj-clean-wt"; ddj_setup "$RC7" 0 1 canon 1
+C7_MAIN="$DDJ_MAIN"; C7_BRANCH="$DDJ_BRANCH"
+printf '{"n": 2}\n' > "$RC7/daemons/deploy_deps.json"
+git -C "$RC7" commit -qam "good tip"
+C7_TIP=$(git -C "$RC7" rev-parse HEAD)
+git -C "$RC7" checkout -q --detach "$C7_BRANCH"
+V9G=$(run_verdict_at "$RC7" "$C7_MAIN" "$C7_BRANCH" "$C7_TIP")
+[ "$V9G" = "unknown:deploy-deps-wt-not-at-tip" ] \
+  && ok "\$wt fora do new_tip => unknown:deploy-deps-wt-not-at-tip (sem arbitro, sem veredito)" \
+  || bad "esperava unknown:deploy-deps-wt-not-at-tip, deu '$V9G'"
+
+# Teste 9b-mut / 9e-mut — MUTACAO: neutralize cada requisito e o MESMO fixture
+# tem de virar yes. Sem isso 9b/9e poderiam passar por outro motivo e nao
+# provar nada sobre o requisito que dizem provar.
+sed 's/if \[ "\$diffout" != "daemons\/deploy_deps.json" \]; then/if false; then/' \
+  "$TMP/block.sh" > "$TMP/block_mut9b.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut9b.sh"; then
+  bad "9b-mut: mutacao nao aplicou — 9b nao esta provando nada"
+else
+  V9BM=$( . "$TMP/block_mut9b.sh"; rebase_content_verdict "$RC2" "$C2_MAIN" "$C2_BRANCH" "$C2_TIP" )
+  [ "$V9BM" = "yes" ] && ok "9b-mut: sem o requisito 'so deploy_deps.json diverge' o tip que perdeu feature.txt vira yes => e esse requisito que o segura" \
+                      || bad "9b-mut: o codigo mutado deveria dar yes pro tip que perdeu feature.txt, deu '$V9BM'"
+fi
+sed 's/ || \[ "\$main_gen" != "\$tip_gen" \]//' "$TMP/block.sh" > "$TMP/block_mut9e.sh"
+if cmp -s "$TMP/block.sh" "$TMP/block_mut9e.sh"; then
+  bad "9e-mut: mutacao nao aplicou — 9e nao esta provando nada"
+else
+  V9EM=$( . "$TMP/block_mut9e.sh"; rebase_content_verdict "$RC5" "$C5_MAIN" "$C5_BRANCH" "$C5_TIP" )
+  [ "$V9EM" = "yes" ] && ok "9e-mut: sem o requisito 'gerador e o de main' a branch auto-atestada vira yes => e esse requisito que a segura" \
+                      || bad "9e-mut: o codigo mutado deveria dar yes pra branch auto-atestada, deu '$V9EM'"
+fi
+
+echo "── Teste 9h — drift-guard: the clean-text branch is still wired to the arbiter ──"
+grep -q 'rebase_deploy_deps_verdict "\$wt" "\$gd" "\$main_ref" "\$new_tip" "\$out" clean' "$DISPATCHER" \
+  && ok "rebase_content_verdict still delegates its clean-but-different branch to rebase_deploy_deps_verdict (clean mode)" \
+  || bad "the ga-ub5hkz delegation is gone from rebase_content_verdict"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
