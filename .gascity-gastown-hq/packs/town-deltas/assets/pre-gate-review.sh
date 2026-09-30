@@ -28,10 +28,27 @@
 #                         saw" is not the clearance a PASS hands the builder, and the two must not read the same. The files not
 #                         shown are printed; the raw reviewer verdict is kept in the record (reviewer_verdict).
 #   exit 2   the call itself was wrong: a usage error, a bad or empty argument, or not inside a git checkout
+#   exit 129/130/143   the script was interrupted (HUP / INT / TERM) — see "A paid run always leaves a row" below
 # Every `run` that ends in exit 0, 3 or 10 ends its stdout with one machine-readable line. Exit 2 does not: it prints its
 # reason (and, for a usage error, the usage) on stderr and no result line:
 #   PREGATE_RESULT arm=.. verdict=.. reason=.. attempt=.. coverage=.. record=..
 #   coverage = full | partial:<shown>/<total> (files) | unknown, or n/a when the run ended before a diff was read.
+#
+# A paid run always leaves a row (ga-gnr3tw, gate ga-dkdir3). The spend is not the reviewer's verdict, it starts when claude
+# does — and a run that is killed mid-review (TERM, INT, HUP, SIGKILL, a session drain, a reboot) has a verdict nobody
+# reads, but it still cost money and still counts against the per-bead cap. So the log gets TWO rows per launched run,
+# tied by one run_id:
+#   1. BEFORE claude starts: verdict=PENDING launched=true cost_known=false. If this row cannot be written the run does not
+#      start (INCONCLUSIVE record-unwritable): a spend that cannot leave a trace is refused, not made blind.
+#   2. AFTER it: the FINAL row (the outcome, the cost when known), written by pg_settle_live — from the normal path, from the
+#      HUP/INT/TERM trap (INCONCLUSIVE reason=interrupted:<SIG>, and the reviewer process tree is stopped; the trap also prints
+#      the PREGATE_RESULT line), or from the EXIT net (reason=abnormal-exit). The trap and the EXIT net exist when the file is
+#      EXECUTED; a caller that `source`s it owns its own traps. What cannot write the FINAL row is a death that runs no shell
+#      code at all (SIGKILL, power loss, a reboot): the PENDING row then stays, and stands for a run that was launched whose
+#      cost and outcome are unknown.
+# Readers treat every row with one run_id as ONE run: pg_prior_runs counts it once, pre-gate-apuracao.py keeps the FINAL row
+# over the PENDING one. A PENDING or interrupted run with no outcome counts toward the cap and has an UNKNOWN cost — never $0,
+# and never "exact".
 #
 # Usage:
 #   pre-gate-review.sh [run] <branch> [--bead <id>] [--base <ref>] [--head <ref>] [--lens N] [--force]
@@ -145,6 +162,9 @@ PY
 }
 
 # pg_prior_runs <bead-or-branch-key> <field> — how many runs that actually launched claude were already made for it.
+# A launched run has a PENDING row and, once it ends, a FINAL row with the same run_id: they are ONE run (counted once), and a
+# PENDING row that never got its FINAL (the run was killed, or is still going) is a run too — that is the case the cap must
+# not miss, because the money was spent. A launched row with no run_id cannot be tied to any other row, so it is its own run.
 # A corrupt line (truncated JSON, or valid JSON that is not a record) is skipped, not fatal: the cap is a brake, not a ledger.
 pg_prior_runs() {
   # No file yet = no run has ever been recorded = 0 (true). A file that EXISTS but cannot be read is a different thing:
@@ -158,7 +178,7 @@ pg_prior_runs() {
   "$py" - "$file" "$1" "$2" <<'PY' 2>/dev/null || return 1
 import json, sys
 path, key, field = sys.argv[1:4]
-n = 0
+ids, anonymous = set(), 0
 for line in open(path, encoding="utf-8", errors="replace"):
     try:
         r = json.loads(line)
@@ -167,9 +187,55 @@ for line in open(path, encoding="utf-8", errors="replace"):
     if not isinstance(r, dict):   # valid JSON that is not a record (12, null, [..]): skipped like a corrupt line
         continue
     if r.get("event") == "run" and r.get("launched") is True and r.get(field) == key:
-        n += 1
-print(n)
+        rid = r.get("run_id")
+        if isinstance(rid, str) and rid:
+            ids.add(rid)          # PENDING and FINAL of one run share it: one run
+        else:
+            anonymous += 1
+print(len(ids) + anonymous)
 PY
+}
+
+# ── the launched run: provisional row before the spend, FINAL row after (see the header) ─────────────────────────────
+PG_RUN_SEQ=0        # per process: two runs from one sourced shell in the same second must not share a run_id
+PG_LIVE_ID=""       # run_id of a launched run that has no FINAL row yet ("" = none in flight)
+PG_LIVE_KV=()       # the key=value pairs known when it launched; every row of that run repeats them
+PG_CHILD=""         # pid of the reviewer subshell while it runs (so a signal can stop what it started)
+
+# pg_settle_live <verdict> <reason> [key=value ...] — write the FINAL row of the launched run, once. Nothing in flight = no-op.
+# The in-flight id is cleared BEFORE the write: a signal that lands while the row is being written must not write a second
+# one. If the write fails the PENDING row stands (counted, cost unknown), and that is said out loud.
+pg_settle_live() {
+  local verdict="$1" reason="$2" id="$PG_LIVE_ID"
+  shift 2
+  [ -n "$id" ] || return 0
+  PG_LIVE_ID=""
+  pg_record run run_id="$id" ${PG_LIVE_KV[@]+"${PG_LIVE_KV[@]}"} verdict="$verdict" reason="$reason" launched=true "$@" >/dev/null \
+    || { pg_log "WARN: the outcome of run $id could NOT be written — its provisional row (PENDING, cost unknown) stays on the log and still counts toward the cap"; return 1; }
+}
+
+# pg_kill_tree <pid> — TERM a process and everything under it, children first (found with `pgrep -P`: without pgrep only <pid>
+# itself is signalled). The reviewer is subshell -> timeout -> claude, and TERM to the subshell alone leaves claude running,
+# spending, with nobody watching.
+pg_kill_tree() {
+  local p="$1" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do pg_kill_tree "$c"; done
+  kill -TERM "$p" 2>/dev/null
+  return 0
+}
+
+# pg_on_signal <SIG> <exit-code> — HUP / INT / TERM handler (script mode). Stop the reviewer, settle the run as interrupted
+# BEFORE exiting, then exit. Further signals are ignored meanwhile: a second TERM must not cut the record short.
+pg_on_signal() {
+  local sig="$1" code="$2" was_live=0
+  trap '' HUP INT TERM
+  [ -n "$PG_CHILD" ] && pg_kill_tree "$PG_CHILD"
+  PG_CHILD=""
+  [ -n "$PG_LIVE_ID" ] && was_live=1
+  pg_settle_live INCONCLUSIVE "interrupted:$sig" cost_known=false exit_code="$code" || true
+  # last, and best effort: stdout may already be gone (HUP), and the record above is what matters
+  [ "$was_live" -eq 1 ] && { pg_finish INCONCLUSIVE "interrupted:$sig" "$code" || true; }
+  exit "$code"
 }
 
 # ── machine guard (the E0 guard: never add a heavy job to a machine already short of disk/swap) ──────────────
@@ -352,6 +418,11 @@ PY
 }
 
 # ── run claude under a wall-clock limit ───────────────────────────────────────────────────────────────────────
+# pg_have_timeout_tool — is there ANY way to bound a run's wall clock? Asked before launching, so that "no way to bound it" is
+# refused up front as its own reason and an exit 127 AFTER launch can only mean claude / nice / env failed to exec.
+pg_have_timeout_tool() {
+  command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || command -v perl >/dev/null 2>&1
+}
 # pg_with_timeout <secs> <cmd...> — exit 124 means it timed out; 127 means there is no way to bound it (then we do not run it).
 pg_with_timeout() {
   local secs="$1"; shift
@@ -430,8 +501,13 @@ pg_usage() {
   sed -n '/^# Usage:/,/^# Run it from/p' "$PG_SELF" | sed 's/^# \{0,1\}//' >&2
 }
 
-# pg_cleanup — release the slot and remove the scratch dir. Idempotent; also runs from the EXIT trap in script mode.
+# pg_cleanup — settle any run still in flight, release the slot, remove the scratch dir. Idempotent; also runs from the EXIT
+# trap in script mode. A run still in flight HERE means the shell is leaving by a path that never reached its own final row
+# (a set -u abort, a failed command substitution, a signal that had no handler): it is recorded as abnormal-exit, so a launched
+# run is never the one that left nothing behind. On the normal path PG_LIVE_ID is already empty and this does nothing extra.
 pg_cleanup() {
+  if [ -n "$PG_CHILD" ]; then pg_kill_tree "$PG_CHILD"; PG_CHILD=""; fi
+  pg_settle_live INCONCLUSIVE "abnormal-exit" cost_known=false || true
   pg_slot_release
   if [ -n "$PG_WORK" ] && [ -d "$PG_WORK" ]; then rm -rf "$PG_WORK"; fi
   PG_WORK=""
@@ -500,8 +576,8 @@ pg_run_inner() {
     pg_finish SKIPPED control-arm 0; return $?
   fi
 
-  # inconclusive(<reason>) — record + report. Nothing was spent: it records launched=false (the one launched run is
-  # recorded further down, once the reviewer has been started).
+  # inconclusive(<reason>) — record + report. Nothing was spent: it records launched=false. A launched run never comes
+  # through here: its PENDING row is written just BEFORE claude starts (further down) and its FINAL row by pg_settle_live.
   pg_inconclusive() {
     local reason="$1"
     [ "$dry" -eq 0 ] && { pg_record run bead="$bead" branch="$branch" sha="$sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict=INCONCLUSIVE reason="$reason" launched=false >/dev/null || true; }
@@ -600,6 +676,7 @@ pg_run_inner() {
 
   local max_usd="${PRE_GATE_MAX_USD:-3}" tmo="${PRE_GATE_TIMEOUT_SECS:-1500}" bin="${PRE_GATE_CLAUDE_BIN:-claude}"
   command -v "$bin" >/dev/null 2>&1 || { pg_inconclusive "claude-not-found"; return $?; }
+  pg_have_timeout_tool || { pg_inconclusive "no-timeout-tool"; return $?; }
   local allow="Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*),Bash(git grep:*),Bash(git ls-files:*),Bash(git cat-file:*),Bash(git rev-parse:*),Bash(git status:*)"
   local -a cmd
   cmd=(nice -n 15 env -u GC_SESSION_NAME -u GC_ALIAS -u GC_AGENT -u GC_SESSION_ID -u GC_TEMPLATE -u GC_CITY_PATH
@@ -624,10 +701,30 @@ pg_run_inner() {
        pg_inconclusive "slots-unusable"; return $? ;;
   esac
 
+  # ── the spend starts here: put it on the record FIRST ──
+  # The PENDING row is written BEFORE claude starts, so a run that is killed mid-review (TERM, SIGKILL, a drain, a reboot) is
+  # still on the log: it counts toward the per-bead cap and the apuracao sees it, with an unknown cost, instead of never
+  # having happened. A spend that cannot be recorded is not made.
+  PG_RUN_SEQ=$((PG_RUN_SEQ + 1))
+  local run_id="$ts-$$-$PG_RUN_SEQ-$RANDOM"
+  PG_LIVE_KV=(bead="$bead" branch="$branch" sha="$branch_sha" arm="$PG_ARM" attempt="$PG_ATTEMPT"
+              forced="$([ "$force" -eq 1 ] && echo true || echo false)" model="$model" effort="$effort" config_source="$cfg_src"
+              settings="$settings_kind" lens="$lens" task_bytes="${#task}" diff_lines="$lines" partial="$partial" coverage="$coverage"
+              shown_files="${DIFF_SHOWN_FILES:-0}" total_files="$file_count" shown_lines="${DIFF_SHOWN_LINES:-0}" fetch="$fetch_state")
+  pg_record run run_id="$run_id" "${PG_LIVE_KV[@]}" verdict=PENDING reason=launched launched=true cost_known=false >/dev/null \
+    || { pg_inconclusive "record-unwritable"; return $?; }
+  PG_LIVE_ID="$run_id"
+
   pg_log "reviewing $branch@${branch_sha:0:9} vs $base_ref — lens $lens, $file_count file(s), $lines diff line(s), coverage $coverage, model=$model effort=$effort, cap \$$max_usd / ${tmo}s, attempt $PG_ATTEMPT"
   local t0=$SECONDS rc
-  ( cd "$repo" && pg_with_timeout "$tmo" "${cmd[@]}" < "$work/task.txt" > "$work/stream.jsonl" 2> "$work/stderr.txt" )
-  rc=$?
+  # A background job and `wait`, not a foreground run: bash holds a trapped signal until the foreground command it is waiting for
+  # has finished, so a TERM sent mid-review would only be seen after claude did (up to PRE_GATE_TIMEOUT_SECS later) and the
+  # handler would then exit without ever settling the run. `wait` returns at once for a trapped signal; pg_on_signal stops the
+  # reviewer tree and writes the interrupted row.
+  ( cd "$repo" && pg_with_timeout "$tmo" "${cmd[@]}" < "$work/task.txt" > "$work/stream.jsonl" 2> "$work/stderr.txt" ) &
+  PG_CHILD=$!
+  wait "$PG_CHILD"; rc=$?
+  PG_CHILD=""
   local dur=$((SECONDS - t0))
 
   local parsed verdict cost turns models subtype iserr result
@@ -645,8 +742,9 @@ pg_run_inner() {
   fi
 
   local out_verdict reason code
+  # (rc 127 is not special here: whether there is a tool to bound the run was checked before launching, so a 127 now is
+  # claude / nice / env failing to exec, and the generic no-result branch names it with the exit code and stderr)
   if [ "$rc" -eq 124 ]; then out_verdict=INCONCLUSIVE; reason="timeout:${tmo}s"; code=3
-  elif [ "$rc" -eq 127 ]; then out_verdict=INCONCLUSIVE; reason="no-timeout-tool"; code=3
   elif [ "$result" != "present" ]; then out_verdict=INCONCLUSIVE; reason="no-result:claude-exit-$rc:$(head -c 120 "$work/stderr.txt" 2>/dev/null | tr '\n' ' ')"; code=3
   elif [ "$iserr" = "true" ]; then out_verdict=INCONCLUSIVE; reason="claude-error:${subtype:-unknown}"; code=3
   elif [ "$verdict" = "PASS" ] && [ "$coverage" = "full" ]; then out_verdict=PASS; reason="none"; code=0
@@ -668,11 +766,10 @@ pg_run_inner() {
   local cost_known=false; local -a meas=()
   if [ -n "$cost" ]; then cost_known=true; meas+=(cost_usd="$cost"); fi
   if [ -n "$turns" ]; then meas+=(turns="$turns"); fi
-  pg_record run bead="$bead" branch="$branch" sha="$branch_sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict="$out_verdict" reason="$reason" \
-    launched=true forced="$([ "$force" -eq 1 ] && echo true || echo false)" cost_known="$cost_known" ${meas[@]+"${meas[@]}"} duration_s="$dur" model="$model" model_resolved="$models" effort="$effort" \
-    config_source="$cfg_src" settings="$settings_kind" lens="$lens" exit_code="$rc" task_bytes="${#task}" diff_lines="$lines" partial="$partial" \
-    coverage="$coverage" shown_files="${DIFF_SHOWN_FILES:-0}" total_files="$file_count" shown_lines="${DIFF_SHOWN_LINES:-0}" reviewer_verdict="${verdict:-none}" \
-    fetch="$fetch_state" review_file="$review_file" >/dev/null || pg_log "WARN: this run was NOT recorded — the measurement will not see it"
+  # The FINAL row of the run whose PENDING row was written before launch (same run_id, and PG_LIVE_KV repeats what was known then).
+  # If this write fails, pg_settle_live says so and the PENDING row stands: counted, cost unknown — never "not recorded".
+  pg_settle_live "$out_verdict" "$reason" cost_known="$cost_known" ${meas[@]+"${meas[@]}"} duration_s="$dur" model_resolved="$models" \
+    exit_code="$rc" reviewer_verdict="${verdict:-none}" review_file="$review_file" || true
 
   echo "── pre-gate review: $out_verdict (attempt $PG_ATTEMPT, ${dur}s, \$${cost:-?}, model ${models:-?}) ──"
   if [ -s "$work/review.txt" ]; then cat "$work/review.txt"; echo; fi
@@ -728,8 +825,10 @@ pg_main() {
 # Run only when executed; `source pre-gate-review.sh` just defines the functions.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   trap pg_cleanup EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  # HUP too: a tmux session kill (a drain) delivers it. Each handler settles a launched run as interrupted before it exits.
+  trap 'pg_on_signal HUP 129' HUP
+  trap 'pg_on_signal INT 130' INT
+  trap 'pg_on_signal TERM 143' TERM
   pg_main "$@"
   exit $?
 fi

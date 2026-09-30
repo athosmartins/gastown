@@ -13,6 +13,10 @@
 #      result line, the record and the console all say how much of the diff stood behind the verdict.
 #   4. IT WRITES NOTHING TO THE GATE and reviews with the LIVE gate-reviewer model/effort, read-only tools and a
 #      sanitized environment; the control arm spends nothing; the per-bead run cap holds.
+#   5. A PAID RUN ALWAYS LEAVES A ROW. The log gets a PENDING row BEFORE claude starts and a FINAL row after (one run_id); a run
+#      interrupted by TERM / INT / HUP is settled as INCONCLUSIVE interrupted:<SIG> and its reviewer process tree is stopped;
+#      SIGKILL leaves the PENDING row; an abnormal exit is settled by the EXIT net; a spend whose PENDING row cannot be written is
+#      refused. All of them count toward the per-bead cap with an UNKNOWN cost (never 0), and the real apuracao reads them so.
 # Exit 0 iff every assertion holds. Bash 3.2 compatible (the interpreter macOS launchd gives the dispatcher).
 
 set -uo pipefail
@@ -199,6 +203,11 @@ case "${STUB_MODE:-pass}" in
   error)     res error_max_budget_usd true 'budget exceeded' 3.01 ;;
   garbage)   echo 'not json at all' ;;
   timeout)   sleep 30 ;;
+  # a review still running when the script is signalled: its pid and its child's are recorded so the test can prove the WHOLE tree stopped
+  hang)      echo $$ > "$STUB_DIR/stub.pid"; sleep 120 & echo $! > "$STUB_DIR/sleep.pid"; wait ;;
+  exit127)   exit 127 ;;   # claude (or nice/env) itself failing to exec: NOT "there is no timeout tool"
+  # the reviewer finishes fine, but the run log became read-only while it ran: the FINAL row cannot be written
+  lockrecord) chmod 444 "${PRE_GATE_LOG_DIR:?}/runs.jsonl"; res success false 'VERDICT: PASS' 0.42 ;;
   echo_template) res success false '# If PASS:\nnothing\n# If FAIL:\nVERDICT: PASS\nSummary: ok' 0.2 ;;
   # a result event that carries NO cost (or one that is not a usable number): the run was judged, the money is unknown
   nocost)    printf '{"type":"system","subtype":"init","model":"claude-sonnet-5-5"}\n{"type":"result","subtype":"success","is_error":false,"result":"VERDICT: PASS","num_turns":4}\n' ;;
@@ -225,6 +234,12 @@ last_line() { tail -n 1 <<<"$1"; }
 field() { sed -n "s/.*[ ]$2=\([^ ]*\).*/\1/p" <<<"$1" | head -n1; }   # field <line> <key>
 reset_state() { rm -rf "$T/logs" "$T/stub"; mkdir -p "$T/stub"; }
 ncalls() { ls "$T/stub"/call-*.argv 2>/dev/null | wc -l | tr -d ' '; }
+# A launched run leaves TWO rows (PENDING before claude starts, the FINAL outcome after) tied by one run_id. A check on the OUTCOME
+# must read the FINAL row only: the PENDING row also says launched=true / cost_known=false / the same bead, so a check on those
+# fields over both rows would pass on the wrong one.
+run_rows()     { grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null; }
+final_rows()   { run_rows | grep -v '"verdict": "PENDING"'; }
+pending_rows() { run_rows | grep '"verdict": "PENDING"'; }
 
 echo "── 5. THREE OUTCOMES ──"
 reset_state
@@ -256,7 +271,7 @@ echo "── 5b. A RUN WHOSE COST IS UNKNOWN IS RECORDED AS UNKNOWN — NEVER AS
 rec_for() {   # rec_for <STUB_MODE> [ENV=VAL ...] — one run from a clean state; prints that run's record line
   local mode="$1"; shift; reset_state
   run_pg STUB_MODE="$mode" ${@+"$@"} -- run feat/x --no-fetch >/dev/null
-  grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null
+  final_rows
 }
 REC="$(rec_for timeout PRE_GATE_TIMEOUT_SECS=1)"
 has_str "$REC" '"launched": true' "timeout: the run is recorded as launched"
@@ -307,7 +322,7 @@ has_str "$NOT_SHOWN" "p2.txt" "the files nobody reviewed are listed (p2.txt)"
 has_str "$NOT_SHOWN" "p3.txt" "…(p3.txt)"
 not_str "$NOT_SHOWN" "p1.txt" "…and the file that WAS shown is not listed as unreviewed"
 has_str "$OUT" "not a clearance" "the console says the PASS is not a clearance"
-REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+REC="$(final_rows)"
 has_str "$REC" '"launched": true' "record: the run was launched (money was spent)"
 has_str "$REC" '"verdict": "INCONCLUSIVE"' "record: verdict INCONCLUSIVE"
 has_str "$REC" '"reviewer_verdict": "PASS"' "record: what the reviewer actually said is kept (reviewer_verdict=PASS)"
@@ -323,7 +338,7 @@ eq "$(field "$L" verdict)" "FAIL" "…verdict=FAIL stands"
 eq "$(field "$L" coverage)" "partial:1/3" "…and says it was on a partial diff"
 has_str "$OUT" "Files it was NOT shown" "…and lists what was not read"
 has_str "$OUT" "does not clear the files above" "…and that fixing the defect does not clear them"
-REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+REC="$(final_rows)"
 has_str "$REC" '"reviewer_verdict": "FAIL"' "record: reviewer_verdict=FAIL"; has_str "$REC" '"coverage": "partial:1/3"' "record: coverage=partial on the FAIL too"
 # the dry run reports it as well (no money): a builder can see it before spending
 reset_state
@@ -336,7 +351,7 @@ OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "
 eq "$rc" "0" "PASS on a full-coverage diff → exit 0 (the fix does not turn every PASS into INCONCLUSIVE)"
 eq "$(field "$L" verdict)" "PASS" "…verdict=PASS"; eq "$(field "$L" reason)" "none" "…reason=none"; eq "$(field "$L" coverage)" "full" "…coverage=full"
 not_str "$OUT" "── COVERAGE:" "…and no coverage warning"
-REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+REC="$(final_rows)"
 has_str "$REC" '"coverage": "full"' "record: coverage=full"; has_str "$REC" '"partial": false' "record: partial=false"; has_str "$REC" '"reviewer_verdict": "PASS"' "record: reviewer_verdict=PASS"
 # unknown coverage is the third state: a payload builder that does not report (unset) must not read as "saw it all"
 reset_state
@@ -347,12 +362,173 @@ OUT="$( cd "$T/work" && export PATH="$T/bin:$PATH" STUB_DIR="$T/stub" PRE_GATE_C
         pg_run feat/x --no-fetch 2>/dev/null )"; rc=$?; L="$(last_line "$OUT")"
 eq "$rc" "3" "builder that reports no coverage + reviewer PASS → exit 3"
 eq "$(field "$L" verdict)" "INCONCLUSIVE" "…verdict=INCONCLUSIVE"; eq "$(field "$L" reason)" "coverage-unknown" "…reason=coverage-unknown"; eq "$(field "$L" coverage)" "unknown" "…coverage=unknown"
-REC="$(grep '"event": "run"' "$T/logs/runs.jsonl" 2>/dev/null)"
+REC="$(final_rows)"
 has_str "$REC" '"coverage": "unknown"' "record: coverage=unknown"; has_str "$REC" '"reviewer_verdict": "PASS"' "record: the reviewer's PASS is kept"
 # a run that ended before any diff was read has no coverage to report — n/a, not "full"
 reset_state
 OUT="$(run_pg STUB_MODE=pass PRE_GATE_MIN_DF_GIB=99999999 -- run feat/x --no-fetch)"; L="$(last_line "$OUT")"
 eq "$(field "$L" coverage)" "n/a" "a refusal before the diff is read reports coverage=n/a"
+
+echo "── 5d. A PAID RUN ALWAYS LEAVES A ROW: PENDING before the spend, FINAL after, an interrupted run is settled (gate ga-dkdir3) ──"
+# The bug: the run was recorded only AFTER claude finished. A run killed mid-review (TERM, INT, HUP, SIGKILL, a session drain, a
+# reboot) — exactly the case where money was spent and nobody knows how much — left NO row: it did not count toward PRE_GATE_MAX_RUNS,
+# the apuracao filed its bead under "never ran", and the arm's pre-gate cost was printed as EXATO with that spend left out. Driven with
+# real signals against the real script (a stub reviewer that hangs), not by calling the record function.
+run_pg_bg() {   # run_pg_bg [ENV=VAL ...] -- <args> — the script in the BACKGROUND; its pid in PG_BG, output in $T/bg.out / $T/bg.err
+  local envs=()
+  while [ "${1:-}" != "--" ]; do envs+=("$1"); shift; done; shift
+  # perl puts SIGINT/SIGQUIT back to their default first: a background job of a NON-interactive shell starts with them IGNORED, and a
+  # signal that was ignored on entry can never be trapped — without this the INT case would test bash, not the script
+  ( cd "$T/work" && exec perl -e '$SIG{INT}="DEFAULT"; $SIG{QUIT}="DEFAULT"; exec @ARGV' env PATH="$T/bin:$PATH" STUB_DIR="$T/stub" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" \
+      PRE_GATE_CLAUDE_BIN=claude PRE_GATE_MIN_DF_GIB=0 PRE_GATE_MIN_SWAP_MB=0 PRE_GATE_MIN_SYSTEM_CHARS=1000 GC_SESSION_NAME=builder-session GC_ALIAS=builder-alias \
+      ${envs[@]+"${envs[@]}"} bash "$PG" "$@" >"$T/bg.out" 2>"$T/bg.err" ) &
+  PG_BG=$!
+}
+wait_for_file() { local f="$1" n="${2:-120}"; while [ ! -s "$f" ] && [ "$n" -gt 0 ]; do sleep 0.5; n=$((n - 1)); done; [ -s "$f" ]; }
+tree_pids() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do tree_pids "$c"; done; echo "$1"; }
+run_ids() { python3 -c '
+import json, sys
+print(" ".join(str(r.get("run_id", "")) for r in map(json.loads, open(sys.argv[1])) if r.get("event") == "run" and r.get("launched") is True))' "$T/logs/runs.jsonl"; }
+alive_any() { local p; for p in "$@"; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
+APUR="${APURACAO_UNDER_TEST:-$SELF_DIR/../../../scripts/pre-gate-apuracao.py}"
+mk_contract_hq() {   # a minimal HQ around the fixture's real runs.jsonl, with one gate outcome for feat/x AFTER the assignment
+  local hq="$T/hq-contract"; mkdir -p "$hq/packs/town-deltas/assets" "$hq/.gc/logs"
+  cp "$PG" "$LIB" "$hq/packs/town-deltas/assets/"
+  python3 - "$hq" <<'PY'
+import sys, time
+hq = sys.argv[1]; st = lambda e: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e))
+now = time.time()
+open(f"{hq}/.gc/logs/quality-gate-dispatcher.log", "w").write(
+  f"[{st(now - 3600)}] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-old branch=other/x verdict=PASS elapsed=60s ===\n"
+  f"[{st(now + 120)}] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-r1 branch=feat/x verdict=PASS elapsed=60s ===\n")
+PY
+  echo "$hq"
+}
+
+for spec in "TERM:143" "INT:130" "HUP:129"; do
+  sig="${spec%%:*}"; want="${spec##*:}"
+  reset_state
+  run_pg_bg STUB_MODE=hang -- run feat/x --bead "$ON_BEAD" --no-fetch
+  if wait_for_file "$T/stub/sleep.pid" 240; then ok "($sig) the reviewer is running (stub started)"; else bad "($sig) the stub reviewer never started"; fi
+  STUB_PIDS="$(cat "$T/stub/stub.pid" 2>/dev/null) $(cat "$T/stub/sleep.pid" 2>/dev/null)"
+  has_str "$(pending_rows)" '"verdict": "PENDING"' "($sig) WHILE the reviewer runs, the PENDING row is already on the log (written before the spend)"
+  has_str "$(pending_rows)" '"cost_known": false' "($sig) …with cost_known=false (nothing is known yet)"
+  t_sig=$SECONDS; kill -"$sig" "$PG_BG"; wait "$PG_BG"; rc=$?; took=$((SECONDS - t_sig))
+  eq "$rc" "$want" "($sig) the script exits $want"
+  [ "$took" -lt 60 ] && ok "($sig) it exited ${took}s after the signal — not after the 120s review (the trap is not held back by the foreground child)" || bad "($sig) it took ${took}s to act on the signal (held until the review finished?)"
+  eq "$(run_rows | wc -l | tr -d ' ')" "2" "($sig) exactly two rows for the one run: PENDING + FINAL"
+  IDS="$(run_ids)"; set -- $IDS
+  [ "$#" -eq 2 ] && [ -n "$1" ] && [ "$1" = "$2" ] && ok "($sig) …tied by one run_id ($1)" || bad "($sig) the two rows do not share a run_id: [$IDS]"
+  FINAL="$(final_rows)"
+  has_str "$FINAL" "\"reason\": \"interrupted:$sig\"" "($sig) FINAL row: reason=interrupted:$sig (its own cause, not 'never ran')"
+  has_str "$FINAL" '"verdict": "INCONCLUSIVE"' "($sig) …verdict=INCONCLUSIVE (a killed review judged nothing)"
+  has_str "$FINAL" '"launched": true' "($sig) …launched=true (money was spent)"
+  has_str "$FINAL" '"cost_known": false' "($sig) …cost_known=false"
+  not_str "$FINAL" '"cost_usd"' "($sig) …and NO cost_usd key (the cost of an interrupted run is unknown, never 0)"
+  has_str "$FINAL" "\"exit_code\": $want" "($sig) …exit_code=$want"
+  has_str "$(cat "$T/bg.out")" "reason=interrupted:$sig" "($sig) the builder console gets a PREGATE_RESULT line naming the interruption"
+  eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "1" "($sig) the interrupted run counts as ONE run toward the per-bead cap (PENDING and FINAL are one run, not two)"
+  n=20; while alive_any $STUB_PIDS && [ "$n" -gt 0 ]; do sleep 0.5; n=$((n - 1)); done
+  if alive_any $STUB_PIDS; then
+    bad "($sig) the reviewer process tree is STILL RUNNING after the script exited (pids: $STUB_PIDS) — an unattended run that keeps spending"; kill -TERM $STUB_PIDS 2>/dev/null
+  else ok "($sig) the whole reviewer tree (claude and its child) was stopped — nothing keeps spending unattended"; fi
+  if [ "$sig" = "TERM" ]; then
+    # the consequence that matters: the next run for this bead sees the interrupted one, so the spend brake holds
+    OUT="$(run_pg STUB_MODE=pass PRE_GATE_MAX_RUNS=1 -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+    eq "$rc" "0" "(TERM) with PRE_GATE_MAX_RUNS=1 the next run is SKIPPED, exit 0"; has_str "$L" "reason=max-runs" "(TERM) …reason=max-runs: the interrupted run consumed the cap"
+    eq "$(ncalls)" "1" "(TERM) …and no second reviewer was launched"
+    # writer -> reader: the REAL apuracao reads the REAL rows this script just wrote
+    HQC="$(mk_contract_hq)"; APU_OUT="$(python3 "$APUR" --hq "$HQC" --runs "$T/logs/runs.jsonl" --min-n 1 2>&1)"
+    has_str "$APU_OUT" "INTERROMPIDOS por sinal ou saída anormal (TERM/INT/HUP, dreno, abnormal-exit): on=1 off=0" "(TERM) apuracao: the run is listed as INTERROMPIDO"
+    has_str "$APU_OUT" "rodaram a pré-revisão: 1 de 1 beads" "(TERM) apuracao: the bead is counted as having RUN the step (it did — it is not 'SEM REGISTRO')"
+    not_str "$APU_OUT" "× SEM REGISTRO" "(TERM) apuracao: …and it is not filed under the 'never ran' bucket (\"não rodaram: N × SEM REGISTRO\")"
+    has_str "$APU_OUT" "SEM custo conhecido: on=1 off=0" "(TERM) apuracao: the run is an unknown-cost run"
+    not_str "$APU_OUT" "pré-gate = EXATO" "(TERM) apuracao: the pre-gate figure is NOT called EXATO while a launched run has no cost"
+    has_str "$APU_OUT" "LIMITE INFERIOR" "(TERM) apuracao: …it is a lower bound"
+    not_str "$APU_OUT" "Traceback" "(TERM) apuracao: no traceback"
+  fi
+done
+set --
+
+# a control that must NOT change: an uninterrupted run is still ONE run — PENDING + FINAL under one run_id, the FINAL carrying the result
+reset_state
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?
+eq "$rc" "0" "control: an uninterrupted PASS run → exit 0"
+eq "$(run_rows | wc -l | tr -d ' ')" "2" "control: two rows (PENDING + FINAL)"
+IDS="$(run_ids)"; set -- $IDS; [ "$#" -eq 2 ] && [ -n "$1" ] && [ "$1" = "$2" ] && ok "control: …under one run_id" || bad "control: run_id differs or is empty: [$IDS]"; set --
+has_str "$(final_rows)" '"cost_usd": 0.42' "control: the FINAL row carries the cost"; has_str "$(final_rows)" '"verdict": "PASS"' "control: …and the verdict"
+not_str "$(final_rows)" "interrupted" "control: …and nothing says interrupted"
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "1" "control: pg_prior_runs counts it once"
+# two runs of one bead are two run_ids (the counter is per process AND per run), and count 2
+run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch >/dev/null
+IDS="$(run_ids)"; set -- $IDS; eq "$(printf '%s\n' "$@" | sort -u | wc -l | tr -d ' ')" "2" "control: two runs of the same bead have two distinct run_ids"; set --
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "2" "control: …and count as 2"
+# a launched row with NO run_id (a writer from before run_id) cannot be tied to any other row: each is its own run
+reset_state; mkdir -p "$T/logs"
+printf '%s\n' "{\"event\": \"run\", \"launched\": true, \"bead\": \"$ON_BEAD\"}" "{\"event\": \"run\", \"launched\": true, \"bead\": \"$ON_BEAD\"}" \
+              "{\"event\": \"run\", \"launched\": true, \"bead\": \"$ON_BEAD\", \"run_id\": \"r1\", \"verdict\": \"PENDING\"}" "{\"event\": \"run\", \"launched\": true, \"bead\": \"$ON_BEAD\", \"run_id\": \"r1\", \"verdict\": \"PASS\"}" > "$T/logs/runs.jsonl"
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "3" "two id-less rows are two runs; a PENDING + FINAL pair sharing r1 is one → 3"
+
+# SIGKILL cannot be trapped: only the PENDING row can be there, and it must be enough
+reset_state
+run_pg_bg STUB_MODE=hang -- run feat/x --bead "$ON_BEAD" --no-fetch
+wait_for_file "$T/stub/sleep.pid" 240 && ok "(KILL) the reviewer is running" || bad "(KILL) the stub reviewer never started"
+KTREE="$(tree_pids "$PG_BG")"
+kill -KILL "$PG_BG"; wait "$PG_BG" 2>/dev/null; rc=$?
+kill -TERM $KTREE 2>/dev/null   # the orphaned reviewers of THIS test (SIGKILL leaves them; the script could not stop them)
+eq "$rc" "137" "(KILL) the script died of SIGKILL (137)"
+eq "$(run_rows | wc -l | tr -d ' ')" "1" "(KILL) exactly one row: the PENDING one — no FINAL was possible"
+has_str "$(pending_rows)" '"launched": true' "(KILL) …and it says launched=true: the spend is on the record"
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "1" "(KILL) a PENDING run with no FINAL still counts toward the cap"
+OUT="$(run_pg STUB_MODE=pass PRE_GATE_MAX_RUNS=1 -- run feat/x --bead "$ON_BEAD" --no-fetch)"; L="$(last_line "$OUT")"
+has_str "$L" "reason=max-runs" "(KILL) …so with PRE_GATE_MAX_RUNS=1 the next run is SKIPPED"
+HQC="$(mk_contract_hq)"
+APU_LIVE="$(python3 "$APUR" --hq "$HQC" --runs "$T/logs/runs.jsonl" --min-n 1 2>&1)"
+has_str "$APU_LIVE" "EM CURSO (linha PENDING de ≤ 40 min — pode ainda terminar): on=1 off=0" "(KILL) apuracao: a FRESH PENDING is 'em curso' (the run may still be going) — not asserted dead"
+APU_LOST="$(python3 "$APUR" --hq "$HQC" --runs "$T/logs/runs.jsonl" --min-n 1 --now "$(( $(date +%s) + 7200 ))" 2>&1)"
+has_str "$APU_LOST" "SEM DESFECHO GRAVADO há mais de 40 min (SIGKILL, reboot, queda — só a linha PENDING ficou): on=1 off=0" "(KILL) apuracao: an OLD PENDING is 'sem desfecho gravado' (a run that ended without leaving an outcome)"
+not_str "$APU_LOST" "pré-gate = EXATO" "(KILL) apuracao: …and its cost is unknown, so the pre-gate figure is not EXATO"
+has_str "$APU_LOST" "SEM custo conhecido: on=1 off=0" "(KILL) apuracao: …it is counted as an unknown-cost run"
+
+# the EXIT net: the shell leaves by a path that never reaches the final row (here: it dies right after the PENDING row is written)
+reset_state
+OUT="$( cd "$T/work" && export PATH="$T/bin:$PATH" STUB_DIR="$T/stub" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" PRE_GATE_CLAUDE_BIN=claude PRE_GATE_MIN_DF_GIB=0 PRE_GATE_MIN_SWAP_MB=0 PRE_GATE_MIN_SYSTEM_CHARS=1000 STUB_MODE=pass
+        source "$PG"; trap pg_cleanup EXIT
+        pg_log() { [ "${1#reviewing}" != "$1" ] && exit 9; return 0; }   # (no `case` in here: bash 3.2 cannot parse its `)` inside $( ))
+        pg_run feat/x --bead "$ON_BEAD" --no-fetch 2>/dev/null )"; rc=$?
+eq "$rc" "9" "(abnormal exit) the shell dies right after the PENDING row"
+has_str "$(final_rows)" '"reason": "abnormal-exit"' "(abnormal exit) the EXIT net writes the FINAL row: reason=abnormal-exit"
+has_str "$(final_rows)" '"launched": true' "(abnormal exit) …launched=true"; not_str "$(final_rows)" '"cost_usd"' "(abnormal exit) …and no invented cost"
+eq "$(run_rows | wc -l | tr -d ' ')" "2" "(abnormal exit) …PENDING + FINAL, and no third row"
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs "$ON_BEAD" bead)" "1" "(abnormal exit) …counted once"
+# idempotent: settling twice writes one row
+( source "$PG"; export PRE_GATE_LOG_DIR="$T/logs" PRE_GATE_CITY="$T/city"; PG_LIVE_ID=rid-x; PG_LIVE_KV=(bead=b1 branch=br1)
+  pg_settle_live INCONCLUSIVE interrupted:TERM cost_known=false; pg_settle_live INCONCLUSIVE abnormal-exit cost_known=false; pg_cleanup )
+eq "$(grep -c '"run_id": "rid-x"' "$T/logs/runs.jsonl")" "1" "settling an already-settled run (a second signal, then the EXIT net) writes exactly ONE row"
+
+# the PENDING row cannot be written: the spend is refused, not made blind
+reset_state; mkdir -p "$T/logs/slots"; : > "$T/logs/runs.jsonl"; chmod 444 "$T/logs/runs.jsonl"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"; chmod 644 "$T/logs/runs.jsonl"
+eq "$rc" "3" "the PENDING row cannot be written → INCONCLUSIVE exit 3"; has_str "$L" "reason=record-unwritable" "…reason=record-unwritable"
+eq "$(ncalls)" "0" "…and claude was NEVER launched (a spend that cannot be recorded is not made)"
+# the FINAL row cannot be written: the run still happened, its PENDING row stands, and the builder is told
+# (the stub reviewer makes the log read-only while it runs, so the failure is a real one, at the real moment)
+reset_state
+OUT="$(run_pg STUB_MODE=lockrecord -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"; chmod 644 "$T/logs/runs.jsonl" 2>/dev/null
+eq "$rc" "0" "the FINAL row cannot be written: the run's own outcome (PASS) still stands, exit 0"
+has_str "$(cat "$T/last.err")" "could NOT be written" "…and the builder is told the outcome was not written"
+has_str "$(cat "$T/last.err")" "PENDING" "…and told what stands in its place (the provisional PENDING row)"
+eq "$(run_rows | wc -l | tr -d ' ')" "1" "…the log has the PENDING row only"
+eq "$(PRE_GATE_LOG_DIR="$T/logs" pg_prior_runs feat/x branch)" "1" "…and that PENDING row counts toward the cap"
+
+# an exit 127 AFTER launch is claude / nice / env failing to exec — not "there is no timeout tool"
+reset_state
+OUT="$(run_pg STUB_MODE=exit127 -- run feat/x --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "claude exits 127 → INCONCLUSIVE"; has_str "$L" "reason=no-result:claude-exit-127" "…reason names the exit code of claude"; not_str "$L" "no-timeout-tool" "…and is NOT misfiled as 'no-timeout-tool'"
+# whether anything can bound the run is asked BEFORE launching
+r="$(env PATH=/nonexistent /bin/bash -c 'source "'"$PG"'" 2>/dev/null; pg_have_timeout_tool; echo "rc=$?"')"
+eq "$r" "rc=1" "no timeout / gtimeout / perl on PATH → pg_have_timeout_tool fails (refused before any launch, reason no-timeout-tool)"
+pg_have_timeout_tool && ok "this machine has a way to bound a run" || bad "pg_have_timeout_tool is false on a machine with perl"
 
 echo "── 6. EVERY WAY OF NOT BEING ABLE TO JUDGE IS INCONCLUSIVE ──"
 reset_state

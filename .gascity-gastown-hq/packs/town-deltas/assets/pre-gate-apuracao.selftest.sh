@@ -391,6 +391,113 @@ has "$OUTE" "CRITÉRIO INDETERMINADO" "rate and CI pass, cost not computable →
 hasnt "$OUTE" "CRITÉRIO NÃO ATINGIDO" "…not a NÃO for a comparison that was never made"
 hasnt "$OUTE" "CRITÉRIO ATINGIDO" "…and never ATINGIDO"
 
+echo "── 5f. a launched run leaves TWO rows (PENDING + FINAL, one run_id): they are ONE run; a run with no outcome is its own cause (gate ga-dkdir3) ──"
+# pre-gate-review.sh writes a PENDING row BEFORE claude starts and a FINAL row after; a run killed mid-review has only the PENDING
+# row, or a FINAL that says interrupted. Read naively, that (a) counts every finished run twice, and (b) files a killed run under
+# "SEM REGISTRO" — "the builder never ran Step 2b" — and prices the arm as EXATO with that run's spend left out.
+HON=($(pick on 6 onh)); HOFF=($(pick off 1 offh))
+mk_h() {   # mk_h <out.json> [live-ts-offset-seconds] — one on bead per shape of run, one control bead with an interrupted forced run
+  python3 - "$1" "$T0" "${HON[@]}" -- "${HOFF[@]}" <<'PY'
+import json, sys, time
+out, t0 = sys.argv[1], int(sys.argv[2]); a = sys.argv[3:]; i = a.index("--"); on, off = a[:i], a[i+1:]
+utc = lambda e: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e))
+def run(rid, **kw):
+    d = {"launched": True, "run_id": rid}; d.update(kw); return d
+pend = lambda rid, **kw: run(rid, verdict="PENDING", reason="launched", cost_known=False, **kw)
+L = []
+def bead(b, arm, runs): L.append({"bead": b, "branch": f"crew/x/{b}", "assign_arm": arm, "t0": t0, "outcomes": [["PASS", 30]], "runs": runs})
+# h1: finished PASS, cost 0.50 known — PENDING + FINAL under one run_id: ONE run
+bead(on[0], "on", [pend("r1"), run("r1", verdict="PASS", coverage="full", partial=False, cost_known=True, cost_usd=0.5)])
+# h2: interrupted by TERM — PENDING + a FINAL that says so
+bead(on[1], "on", [pend("r2"), run("r2", verdict="INCONCLUSIVE", reason="interrupted:TERM", cost_known=False, exit_code=143)])
+# h3: only a PENDING row, an hour old (SIGKILL / reboot: nothing could be written after it)
+bead(on[2], "on", [pend("r3")])
+# h4: only a PENDING row, 10 minutes old (the run may still be going)
+bead(on[3], "on", [pend("r4", ts=utc(t0 + 3000))])
+# h5: two launched rows from a writer with no run_id — nothing ties them, so they are TWO runs
+bead(on[4], "on", [run(None, verdict="PASS", coverage="full", cost_known=True, cost_usd=0.3) for _ in range(2)])
+for r in L[-1]["runs"]: del r["run_id"]
+# h6 (control arm, --force): interrupted by the EXIT net
+bead(off[0], "off", [pend("r6"), run("r6", verdict="INCONCLUSIVE", reason="abnormal-exit", cost_known=False, forced=True)])
+json.dump({"beads": L}, open(out, "w"))
+PY
+}
+H_HQ="$T/hqH"; mk_hq "$H_HQ"; mk_h "$T/specH.json"; gen "$H_HQ" "$T/specH.json"
+OUTH="$(apu "$H_HQ" --min-n 1)"; rc=$?
+eq "$rc" "0" "H: exit 0"; hasnt "$OUTH" "Traceback" "H: no traceback"
+has "$OUTH" "INTERROMPIDOS por sinal ou saída anormal (TERM/INT/HUP, dreno, abnormal-exit): on=1 off=1" "H: the TERM run (h2) and the abnormal-exit run (h6, control arm) are INTERROMPIDOS — the FINAL row's own cause, counted ONCE each"
+has "$OUTH" "SEM DESFECHO GRAVADO há mais de 40 min (SIGKILL, reboot, queda — só a linha PENDING ficou): on=1 off=0" "H: the hour-old PENDING with no FINAL (h3) is 'sem desfecho gravado'"
+has "$OUTH" "EM CURSO (linha PENDING de ≤ 40 min — pode ainda terminar): on=1 off=0" "H: the 10-minute-old PENDING (h4) is 'em curso' — not declared dead"
+has "$OUTH" "rodaram a pré-revisão: 5 de 5 beads (100%)" "H: all 5 on beads RAN the step — the killed ones are not 'never ran'"
+hasnt "$OUTH" "× SEM REGISTRO" "H: no on bead is filed under the 'never ran' bucket"
+has "$OUTH" "1o veredito da pré-revisão nas beads que rodaram: PASS=2, run sem desfecho (interrompido ou em curso)=3" "H: first verdicts: h1 + h5 PASS; h2 h3 h4 have NO verdict (their own group, outside the PASS calibration)"
+has "$OUTH" "SEM custo conhecido: on=3 off=1" "H: unknown-cost runs = h2 + h3 + h4 (on=3) and h6 (off=1): each counted ONCE — a PENDING + FINAL pair is not two unknown runs"
+has "$OUTH" "LIMITE INFERIOR" "H: with unknown-cost runs the pre-gate figure is a lower bound"
+hasnt "$OUTH" "pré-gate = EXATO" "H: …never EXATO while a launched run has no cost"
+has "$OUTH" "≥1.10" "H: on-arm pre-gate spend is 0.50 (h1, once) + 0.30 + 0.30 (h5: two id-less runs) = 1.10, printed as a lower bound"
+has "$OUTH" "CONTROLE CONTAMINADO: 1 bead(s) do braço OFF" "H: the forced control-arm run is still flagged"
+# the grace window is an argument
+OUTHG="$(apu "$H_HQ" --min-n 1 --pending-grace-min 100)"
+has "$OUTHG" "EM CURSO (linha PENDING de ≤ 100 min — pode ainda terminar): on=2 off=0" "H: --pending-grace-min 100 makes the hour-old PENDING (h3) 'em curso' too (and the printed window follows)"
+has "$OUTHG" "SEM DESFECHO GRAVADO há mais de 100 min (SIGKILL, reboot, queda — só a linha PENDING ficou): on=0 off=0" "H: …and nothing is then 'sem desfecho gravado'"
+# a PENDING + FINAL pair on its own: ONE run, known cost, EXATO — the dedupe must not turn a clean run into an unknown one
+H2_HQ="$T/hqH2"; mk_hq "$H2_HQ"
+python3 - "$T/specH2.json" "$T0" "${HON[0]}" <<'PY'
+import json, sys
+out, t0, b = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+runs = [{"launched": True, "run_id": "r1", "verdict": "PENDING", "reason": "launched", "cost_known": False},
+        {"launched": True, "run_id": "r1", "verdict": "PASS", "coverage": "full", "partial": False, "cost_known": True, "cost_usd": 0.5}]
+json.dump({"beads": [{"bead": b, "branch": f"crew/x/{b}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 30]], "runs": runs}]}, open(out, "w"))
+PY
+gen "$H2_HQ" "$T/specH2.json"; OUTH2="$(apu "$H2_HQ" --min-n 1)"
+has "$OUTH2" "pré-gate = EXATO" "H2: a clean PENDING + FINAL pair is EXATO (the PENDING row is not a second, unknown run)"
+hasnt "$OUTH2" "SEM custo conhecido" "H2: …and no unknown-cost run is reported"
+has "$OUTH2" "1.10" "H2: US\$/aprovada = (0.50 pre-gate + 0.60 reviewer estimate) / 1 approved = 1.10 — the run's 0.50 is counted once, not twice"
+has "$OUTH2" "INTERROMPIDOS por sinal ou saída anormal (TERM/INT/HUP, dreno, abnormal-exit): on=0 off=0" "H2: …and the report says plainly that nothing was interrupted (a real count, not a placeholder)"
+# the other order in the file (FINAL first, PENDING after) must give the same answer: the FINAL row wins wherever it sits
+python3 - "$H2_HQ/.gc/logs/pre-gate-review/runs.jsonl" <<'PY'
+import sys
+p = sys.argv[1]; L = open(p).read().splitlines()
+runs = [i for i, l in enumerate(L) if '"event": "run"' in l]
+L[runs[0]], L[runs[1]] = L[runs[1]], L[runs[0]]
+open(p, "w").write("\n".join(L) + "\n")
+PY
+OUTH3="$(apu "$H2_HQ" --min-n 1)"
+has "$OUTH3" "pré-gate = EXATO" "H3: FINAL before PENDING in the file → still ONE clean run (the FINAL row wins, wherever it sits)"
+hasnt "$OUTH3" "SEM custo conhecido" "H3: …and no unknown-cost run"
+
+# a run killed on a bead with NO gate outcome yet is not in the cost table (its population is "branches with an outcome") — but it
+# spent money, and a killed run is exactly the kind that never reaches an outcome. Leaving it out of the "is any cost unknown?" test
+# would print EXATO with that spend missing: the same hole as an unrecorded run, one step later.
+H4_HQ="$T/hqH4"; mk_hq "$H4_HQ"
+python3 - "$T/specH4.json" "$T0" "${HON[0]}" "${HON[1]}" <<'PY'
+import json, sys
+out, t0, b1, b2 = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+clean = [{"launched": True, "run_id": "r1", "verdict": "PASS", "coverage": "full", "partial": False, "cost_known": True, "cost_usd": 0.5}]
+killed = [{"launched": True, "run_id": "r2", "verdict": "PENDING", "reason": "launched", "cost_known": False},
+          {"launched": True, "run_id": "r2", "verdict": "INCONCLUSIVE", "reason": "interrupted:TERM", "cost_known": False, "exit_code": 143}]
+L = [{"bead": b1, "branch": f"crew/x/{b1}", "assign_arm": "on", "t0": t0, "outcomes": [["PASS", 30]], "runs": clean},
+     {"bead": b2, "branch": f"crew/x/{b2}", "assign_arm": "on", "t0": t0, "outcomes": [], "runs": killed}]
+json.dump({"beads": L}, open(out, "w"))
+PY
+gen "$H4_HQ" "$T/specH4.json"
+# an EARLIER dated line, so the log covers the waiting bead's assignment (without it the report rightly says "log gap", not "waiting")
+python3 - "$H4_HQ" "$T0" <<'PYLOG'
+import sys, time
+hq, t0 = sys.argv[1], int(sys.argv[2]); path = f"{hq}/.gc/logs/quality-gate-dispatcher.log"
+old = open(path).read()
+stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0 - 7200))
+open(path, "w").write(f"[{stamp}] [quality-gate-dispatcher] === Gate run complete: gate_run=ga-old branch=crew/x/other verdict=PASS elapsed=60s ===\n" + old)
+PYLOG
+OUTH4="$(apu "$H4_HQ" --min-n 1)"
+has "$OUTH4" "aguardando 1o desfecho do gate: 1" "H4: the killed run's bead is still waiting for its gate outcome (so it is NOT in the cost table)"
+has "$OUTH4" "INTERROMPIDOS por sinal ou saída anormal (TERM/INT/HUP, dreno, abnormal-exit): on=1 off=0" "H4: …but the interrupted-runs block is roster-wide and sees it"
+has "$OUTH4" "SEM custo conhecido: on=1 off=0" "H4: …and its unknown cost is counted"
+has "$OUTH4" "Inclui 1 run(s) de beads do roster que ainda não têm desfecho do gate" "H4: …with the reason it is outside the sum, said plainly"
+hasnt "$OUTH4" "pré-gate = EXATO" "H4: …so the pre-gate figure is NOT called EXATO (a spent run is missing from the sum)"
+has "$OUTH4" "≥0.50" "H4: …it is printed as a lower bound (the known 0.50 only)"
+hasnt "$OUTH4" "CRITÉRIO ATINGIDO" "H4: …and the criterion cannot be ATINGIDO on it"
+
 echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]

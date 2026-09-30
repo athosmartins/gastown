@@ -20,6 +20,13 @@ O QUE ESTE SCRIPT NÃO INVENTA (terceiro estado, dito em voz alta em vez de vira
     stream sem resultado) tem custo DESCONHECIDO e pode ter gasto até o teto por run: ele NÃO entra como 0 — a soma vira
     LIMITE INFERIOR (≥), e a condição de custo do critério fica INDETERMINADA. Registro sem cost_known=true (inclusive um
     cost_usd=0 de um escritor antigo) também é desconhecido: só o escritor atual sabe dizer que sabia.
+  * runs INTERROMPIDOS. O escritor grava DUAS linhas por run lançado, amarradas por run_id: PENDING (verdict=PENDING, antes
+    de o claude começar) e a FINAL (o desfecho). Aqui elas são UM run só (settle_runs: a FINAL vence a PENDING). Um run sem
+    FINAL foi lançado e gastou — só que ninguém sabe quanto nem com que resultado. Há três causas e o relatório as separa,
+    nenhuma vira "SEM REGISTRO" (que quer dizer: o construtor nem rodou o Step 2b): (a) INTERROMPIDO por sinal ou saída
+    anormal (a FINAL diz reason=interrupted:<SIG> / abnormal-exit); (b) SEM DESFECHO GRAVADO há mais de --pending-grace-min
+    (SIGKILL, reboot, queda — a PENDING ficou); (c) EM CURSO (PENDING recente: o run pode ainda terminar). Nos três o custo
+    é DESCONHECIDO — entram como run lançado sem custo (soma vira ≥, condição de custo INDETERMINADA), nunca como EXATO.
   * runs em que NENHUM revisor julgou (timeout com revisor vivo, revisor que morreu antes de julgar): a linha "Gate run
     complete" do dispatcher só emite PASS ou FAIL, e esses runs saem como FAIL. NÃO são separáveis deste log. A taxa da
     1a tentativa os conta como reprovação — viés para BAIXO nos dois braços, e mais severo no teste absoluto "on >= alvo".
@@ -118,10 +125,50 @@ def run_cost(r):
     return float(c)
 
 
+def settle_runs(rows):
+    """One record per LAUNCHED run. A launched run leaves two rows tied by run_id — PENDING (written before claude starts) and
+    the FINAL outcome — and they are ONE run: counting both would double every run and its cost. The FINAL row wins over the
+    PENDING one; a PENDING with no FINAL stays (the run was launched and its outcome is unknown). A launched row with no
+    run_id cannot be tied to any other row, so it is its own run — merging unrelated rows would be the wrong direction to err."""
+    best, anonymous = {}, []
+    for r in rows:
+        if r.get("event") != "run" or r.get("launched") is not True:
+            continue
+        rid = r.get("run_id")
+        if not isinstance(rid, str) or not rid:
+            anonymous.append(r)
+            continue
+        cur = best.get(rid)
+        # a PENDING row never replaces a settled one; anything else replaces (among two settled rows the later one wins)
+        if cur is None or r.get("verdict") != "PENDING" or cur.get("verdict") == "PENDING":
+            best[rid] = r
+    return list(best.values()) + anonymous
+
+
+def run_kind(r, now, grace_s):
+    """'finished' | 'interrupted' | 'lost' | 'live' — what became of one settled launched run. Three unfinished states, never one:
+      interrupted  the writer itself settled it as interrupted (a TERM/INT/HUP handler, or the EXIT net: abnormal-exit)
+      live         a PENDING row younger than the grace window: the run may simply still be going
+      lost         a PENDING row older than that (SIGKILL, reboot, a crash) — or one whose age cannot be established (an
+                   unreadable ts, a stamp in the future): an unknown age is not evidence that it is still running"""
+    if r.get("verdict") == "PENDING":
+        try:
+            age = now - parse_utc(r["ts"])
+        except (KeyError, ValueError, TypeError):
+            return "lost"
+        return "live" if 0 <= age <= grace_s else "lost"
+    if r.get("verdict") == "INCONCLUSIVE" and str(r.get("reason", "")).startswith(("interrupted", "abnormal-exit")):
+        return "interrupted"
+    return "finished"
+
+
 # O que o revisor VIU decide o que o seu PASS vale. Sobre um diff que ele viu só em parte (ou de cobertura desconhecida) o
 # PASS diz "nada nos arquivos que li", que não é a liberação que o PASS total dá ao construtor: misturar os dois na linha de
 # calibração faria "pré-revisão PASS → gate 1a-PASS" medir uma coisa que não é a que o Step 2b promete.
 PASS_PARCIAL = "PASS sem cobertura total"
+# Um run lançado que nunca teve desfecho (PENDING sem FINAL, ou interrompido) não tem veredito: não é PASS, não é FAIL e não é
+# um INCONCLUSIVE de "não deu pra julgar" — é um run cujo veredito ninguém sabe. Grupo próprio, fora da calibração do PASS.
+SEM_DESFECHO = "run sem desfecho (interrompido ou em curso)"
 
 
 def run_coverage(r):
@@ -144,6 +191,8 @@ def pre_group(r):
     disse PASS sem ter visto tudo — venha isso como PASS de um escritor antigo (cobertura não total) ou como o INCONCLUSIVE
     partial-diff / coverage-unknown do escritor atual (o script recusa a liberação, e o registro guarda o motivo)."""
     v = r.get("verdict", "?")
+    if v == "PENDING" or (v == "INCONCLUSIVE" and str(r.get("reason", "")).startswith(("interrupted", "abnormal-exit"))):
+        return SEM_DESFECHO
     if v == "PASS" and run_coverage(r) != "full":
         return PASS_PARCIAL
     if v == "INCONCLUSIVE" and str(r.get("reason", "")).startswith(("partial-diff", "coverage-unknown")):
@@ -176,6 +225,8 @@ def main():
     ap.add_argument("--target", type=float, default=0.70, help="alvo de aprovação na 1a tentativa do braço on")
     ap.add_argument("--wait-h", type=float, default=48.0,
                     help="horas que uma branch ainda sem desfecho do gate conta como 'aguardando'; depois disso ela vai para 'sem desfecho localizável'")
+    ap.add_argument("--pending-grace-min", type=float, default=40.0,
+                    help="minutos que um run com linha PENDING e sem FINAL conta como 'em curso' (padrão 40 = teto de 25 min do run + kill-after + folga); depois disso é 'sem desfecho gravado'")
     ap.add_argument("--now", type=float, help="época UTC 'de agora' (só para teste; padrão: o relógio)")
     a = ap.parse_args()
 
@@ -246,15 +297,16 @@ def main():
                 outcomes[m.group(3)].append((parse_local(m.group(1)), m.group(4)))
 
     # ── runs por bead ──
-    launched = defaultdict(list)    # bead -> [record] (só as que lançaram o claude)
+    launched = defaultdict(list)    # bead -> [record] (só as que lançaram o claude; UM registro por run — settle_runs)
     refused = defaultdict(list)     # bead -> [reason] (guarda/busy/etc.: nada foi gasto)
     capped = set()
-    for r in rows:
-        if r.get("event") != "run" or not r.get("bead"):
-            continue
-        if r.get("launched") is True:
+    for r in settle_runs(rows):
+        if r.get("bead"):
             launched[r["bead"]].append(r)
-        elif r.get("reason") == "max-runs":
+    for r in rows:
+        if r.get("event") != "run" or not r.get("bead") or r.get("launched") is True:
+            continue
+        if r.get("reason") == "max-runs":
             capped.add(r["bead"])
         elif r.get("verdict") == "INCONCLUSIVE":
             refused[r["bead"]].append(str(r.get("reason", "?")).split(":")[0])
@@ -360,6 +412,24 @@ def main():
                 nota = "  [FORA da calibração do PASS: o revisor não viu o diff inteiro]" if v == PASS_PARCIAL else "  [calibração; n pequeno, olhe o IC antes de concluir]"
                 print(f"     pré-revisão {v} → gate 1a-PASS {kk}/{len(grp)} ({pct(kk/len(grp))}){nota}")
     print("  (a taxa por INTENÇÃO DE TRATAR acima já inclui quem não rodou; baixa aderência DILUI o efeito, não o inverte)")
+    # ── runs lançados sem desfecho: a causa é dita, e o custo é DESCONHECIDO nos três casos ──
+    # Todo o roster, não só as branches que já têm desfecho do gate: um run interrompido numa bead que ainda aguarda o gate
+    # também gastou, e a tabela de custo (que só conta branches com desfecho) não o mostraria.
+    grace_s = a.pending_grace_min * 60
+    bead_arm = {v["bead"]: v["arm"] for v in roster.values() if v["bead"]}
+    unfinished = {"on": defaultdict(int), "off": defaultdict(int)}
+    for b, rs in launched.items():
+        if b not in bead_arm:
+            continue
+        for r in rs:
+            kind = run_kind(r, now, grace_s)
+            if kind != "finished":
+                unfinished[bead_arm[b]][kind] += 1
+    print("  ── RUNS LANÇADOS SEM DESFECHO (o custo de cada um é DESCONHECIDO) ──")
+    print(f"  INTERROMPIDOS por sinal ou saída anormal (TERM/INT/HUP, dreno, abnormal-exit): on={unfinished['on']['interrupted']} off={unfinished['off']['interrupted']}")
+    print(f"  SEM DESFECHO GRAVADO há mais de {a.pending_grace_min:g} min (SIGKILL, reboot, queda — só a linha PENDING ficou): on={unfinished['on']['lost']} off={unfinished['off']['lost']}")
+    print(f"  EM CURSO (linha PENDING de ≤ {a.pending_grace_min:g} min — pode ainda terminar): on={unfinished['on']['live']} off={unfinished['off']['live']}")
+    print("  (não são 'SEM REGISTRO': o run FOI lançado e gastou. Contam no teto por bead e entram nos custos como desconhecidos — nunca como 0, nunca como EXATO.)")
     contaminated = sorted({p["bead"] for p in per.values() if p["arm"] == "off" and launched.get(p["bead"])})
     if contaminated:
         print(f"  ⚠ CONTROLE CONTAMINADO: {len(contaminated)} bead(s) do braço OFF rodaram a pré-revisão (--force): {', '.join(contaminated[:5])}"
@@ -380,11 +450,21 @@ def main():
 
     def lb(x, unknown):   # "≥" marks a figure that is only a lower bound
         return ("n/a" if x != x else (("≥" if unknown else "") + f"{x:.2f}"))
+    # Runs of roster beads that are NOT in this table (no gate outcome yet: waiting, stale, log gap, or a first outcome that is neither
+    # PASS nor FAIL) still spent money, and a run killed mid-review is the kind that never reaches an outcome. Leaving them out of the
+    # "is any cost unknown?" test would print EXATO with that spend missing — the same hole as an unrecorded run, one step later.
+    # Their known cost stays out of the SUM (the table's population is stated below); their UNKNOWN cost is what forces the lower bound.
+    in_table = {p["bead"] for p in per.values()}
+    outside = {"on": 0, "off": 0}
+    for b, rs in launched.items():
+        if b in bead_arm and b not in in_table:
+            outside[bead_arm[b]] += sum(1 for r in rs if run_cost(r) is None)
     print("  ── CUSTO POR BEAD APROVADA (PARCIAL) ──")
     print(f"  {'braço':<10}{'beads':>6}{'aprov.':>7}{'tent./bead':>11}{'pré-gate US$':>14}{'revisor US$ (estim.)':>22}{'US$/aprovada':>14}")
     cost_per, unk = {}, {}
     for arm in ("on", "off"):
         ps, ap_, pre_usd, rev_usd, unk[arm] = arm_cost(arm)
+        unk[arm] += outside[arm]
         cpa = (pre_usd + rev_usd) / len(ap_) if ap_ else float("nan")
         cost_per[arm] = cpa
         att = statistics.mean([p["attempts"] for p in ps]) if ps else float("nan")
@@ -394,8 +474,12 @@ def main():
     print(f"  (esta tabela conta TODA branch com algum desfecho do gate: on={n_cost['on']} off={n_cost['off']}; a tabela da taxa acima só as "
           f"de 1o desfecho PASS/FAIL: on={n_on} off={n_off} — a diferença são as de 1o desfecho com token inesperado: on={other['on']} off={other['off']})")
     if unknown_total:
+        outside_total = outside["on"] + outside["off"]
+        outside_note = (f" Inclui {outside_total} run(s) de beads do roster que ainda não têm desfecho do gate: fora da soma, mas gastaram."
+                        if outside_total else "")
         print(f"  ⚠ run(s) do pré-gate lançados SEM custo conhecido: on={unk['on']} off={unk['off']}"
-              f" (timeout, kill ou stream sem evento de resultado) — um run assim pode ter gasto até o teto de gasto por run."
+              f" (timeout, kill, stream sem evento de resultado, ou run interrompido / sem desfecho gravado) — um run assim pode ter gasto até o teto de gasto por run."
+              f"{outside_note}"
               f" O pré-gate US$ e o US$/aprovada acima são LIMITE INFERIOR (≥) e a condição de custo fica INDETERMINADA.")
         print("  pré-gate = LIMITE INFERIOR (soma só dos runs com total_cost_usd conhecido).")
     else:
