@@ -513,7 +513,30 @@
 #      changed *.py whose old and new versions parse to the SAME AST
 #      (comments, blank lines, quote style, wrapping) is dropped from $CHANGED
 #      before any closure/import matching (Step 1c below), and from the
-#      per-daemon narrowing set (ga0fawwr_narrow_changed) so both windows agree.
+#      per-daemon narrowing set (ga0fawwr_narrow_changed).
+#      THAT ALONE DOES NOT REACH A DAEMON THE RIG DETECTOR COVERS (gate
+#      ga-yxz43u): point 20 trusts detect_stale_daemons.py EXCLUSIVELY for those
+#      entries — in production every WA daemon, the three incident importers
+#      included — and its --mode own is a bare timestamp rule (newest commit on
+#      the daemon's file + registered assets + one-hop imports is newer than the
+#      process start) that never reads $CHANGED. Being stateless it also re-flags
+#      those importers on the NEXT deploy with any real python change, whose own
+#      window holds no cosmetic file. So Step 3b (rig_detector_cosmetic_only)
+#      re-examines every label the detector flagged, against the code its process
+#      LOADED (newest commit at or before its start, not the deploy window — a
+#      real change from an earlier unrestarted deploy is then still seen), and
+#      downgrades it ONLY when every changed file that could explain the flag
+#      (own file, registered assets, deploy_deps.json closure, anything imported)
+#      parses to the same AST as that version. Anything else keeps the label
+#      flagged and logs why: an entry the detector does not cover, a changed
+#      template it renders, no live pid or start time, no commit to compare
+#      against, an entrypoint that does not parse, no changed file that explains
+#      the flag (unexplained is not cosmetic), a classifier failure, or any file
+#      that is not AST-identical — a changed asset of any extension included,
+#      since only *.py can be classified. FORCE_RESTART_LABELS is never
+#      reconsidered. A cosmetic-only deploy still exits at the early OK below
+#      before the detector is consulted; the importers it leaves stale-by-
+#      timestamp are cleared by Step 3b on the deploy that follows.
 #      Detector-side only: it removes a false positive, nothing restarts.
 #      Deliberately NARROWER than "no runtime effect", because a wrongly
 #      dropped file hides a real stale daemon while a wrongly kept one costs a
@@ -525,16 +548,21 @@
 #      chmod combined with a comment edit in one deploy is dropped; a chmod
 #      alone (identical bytes) is kept.
 #      Accepted residuals: line numbers shift (tracebacks, %(lineno)d) and a
-#      module that reads its own source text would see different bytes. "The
+#      module that reads its own source text would see different bytes. On the
+#      $CHANGED-based path (daemons the rig detector does not cover), "the
 #      running process already executes identical code" holds only if the
 #      daemon is running the PRE-deploy version: one left stale by an EARLIER
 #      unrestarted deploy, with no .perdaemon "stuck" record (ga-n2jnsa widens
 #      those back regardless), used to be re-flagged incidentally by any later
 #      touch of the same file and now is not (untouched files already had that
-#      blind spot). The early OK for a cosmetic-only deploy sits before the
-#      FORCE_RESTART_LABELS fold, exactly like the pre-existing "no python
-#      changed" OK just after it: a forced label is not restarted by a deploy
-#      that changed no daemon code.
+#      blind spot). On the rig-detector path Step 3b instead compares with the
+#      process's own loaded version, taken from git history at its start time;
+#      a process started while the runtime checkout lagged that history could
+#      have loaded something older (the assumption the rig detector's own
+#      _mudou_interface makes too). The early OK for a cosmetic-only deploy sits
+#      before the FORCE_RESTART_LABELS fold, exactly like the pre-existing "no
+#      python changed" OK just after it: a forced label is not restarted by a
+#      deploy that changed no daemon code.
 #      The per-COMMIT probe inside ga0fawwr_daemon_closure_epoch is left raw:
 #      it only ever removes flags (already_fresh), and a python spawn per
 #      commit per label is not worth it. Not applied to *.sh — a shell "#"
@@ -1393,15 +1421,19 @@ fi
 # Placed AFTER the plist/no_restart_paths/tests-docs gates above on purpose —
 # those judge the raw changed set exactly as before — and BEFORE anything is
 # derived from $CHANGED (CHANGED_PY, the stems, the deploy_deps.json closure
-# match), so every matcher below sees one consistent, filtered set. A classifier
-# failure leaves $CHANGED untouched (fail toward flagging, never toward hiding).
+# match), so every $CHANGED-based matcher below sees one consistent, filtered
+# set. The rig-owned detector (Step 3) does NOT read $CHANGED — it is a
+# timestamp rule — so this filter never reaches a daemon it covers; Step 3b
+# (rig_detector_cosmetic_only) handles those against each process's own loaded
+# code. A classifier failure leaves $CHANGED untouched (fail toward flagging,
+# never toward hiding).
 COSMETIC_DROPPED=""
 if [ -n "$CHANGED" ]; then
   if COSMETIC_CLS="$(cosmetic_py_classify "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" "$CHANGED")"; then
     COSMETIC_DROPPED="$(printf '%s\n' "$COSMETIC_CLS" | sed -n 's/^D://p')"
     if [ -n "$COSMETIC_DROPPED" ]; then
       CHANGED="$(printf '%s\n' "$COSMETIC_CLS" | sed -n 's/^K://p')"
-      log "ignoring $(printf '%s\n' "$COSMETIC_DROPPED" | grep -c .) python file(s) whose old and new versions parse to the SAME AST (comment/format-only change — the running process already executes identical code): $(printf '%s\n' "$COSMETIC_DROPPED" | tr '\n' ' ')"
+      log "ignoring $(printf '%s\n' "$COSMETIC_DROPPED" | grep -c .) python file(s) whose old and new versions parse to the SAME AST (comment/format-only change — a process running the pre-deploy code executes identical code; a daemon the rig detector flags is judged separately in Step 3b): $(printf '%s\n' "$COSMETIC_DROPPED" | tr '\n' ' ')"
     fi
   else
     log "WARN: could not classify comment/format-only python changes (classifier failed or timed out) — every changed file is matched as-is, this run."
@@ -2320,6 +2352,159 @@ for fr_label in $FORCE_RESTART_LABELS; do
   esac
 done
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+# ── Step 3b: cosmetic downgrade for rig-detector labels (ga-jjgcaw, point 21) ─
+# WHY THIS BLOCK EXISTS. Step 1c drops comment/format-only python from $CHANGED,
+# but Step 3 trusts the rig detector EXCLUSIVELY for every entry it covers
+# (header point 20) — in production that is every WA daemon, the three
+# importers of lib/human_name_guard.py in the incident included. The detector's
+# own mode is a pure timestamp rule (last commit on the daemon's own file +
+# registered assets + one-hop imports is newer than the process start): it
+# never reads $CHANGED, so the Step 1c filter cannot reach it, and a comment-
+# only edit still flags every importer. Being stateless, it also re-flags them
+# on the NEXT deploy that has any real python change, whose own window holds no
+# cosmetic file at all — so this cannot be gated on this window's drops.
+#
+# WHAT IT ASKS, per label the detector flagged: measured against the code the
+# process actually loaded (the newest commit at or before its start — the same
+# reference the detector's own interface check uses), is every changed file
+# that could explain the flag (the entrypoint itself, its registered assets,
+# its deploy_deps.json closure, anything it imports) AST-identical to that
+# version? It downgrades ONLY on that positive answer. Everything else keeps
+# the label flagged, and says why: not every entry rig-covered (another matcher
+# may also be flagging it), a changed template it renders, no live pid or start
+# time, no commit to compare against, an entrypoint that does not parse, no
+# changed file that explains the flag (unexplained != cosmetic), a classifier
+# failure or timeout, any file that is not AST-identical — which includes a
+# changed asset of any extension, since only *.py can be classified.
+# Reference point is the process START, not the deploy window: a real change
+# from an EARLIER unrestarted deploy is then still seen (its blob differs from
+# what the process loaded) instead of being hidden by a window that only
+# holds the cosmetic edit.
+# Accepted residual: "the code the process loaded" is taken from git history at
+# its start time. A process started while the runtime checkout lagged behind
+# that history could have loaded something older (same assumption the rig
+# detector's _mudou_interface makes).
+# Only ever REMOVES a label from AFFECTED/AFFECTED_RIG_DETECTOR (nothing
+# restarts here); FORCE_RESTART_LABELS is never reconsidered.
+RIG_COSMETIC_WHY=""
+rig_detector_cosmetic_only() {  # rig_detector_cosmetic_only <label> -> 0 ONLY on positive proof
+  local label="$1" entries e tmpl pid start base raw rel cls first
+  RIG_COSMETIC_WHY=""
+  entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
+  if [ -z "${entries// /}" ]; then RIG_COSMETIC_WHY="its entrypoints could not be read"; return 1; fi
+  for e in $entries; do
+    if ! rig_detector_covers_entry "$e"; then
+      RIG_COSMETIC_WHY="entry $e is not covered by the rig detector, so another matcher may be flagging it too"
+      return 1
+    fi
+  done
+  # Step 3's template matcher runs for EVERY entry, covered or not: a changed
+  # template it renders is an independent reason the detector's verdict cannot
+  # explain away.
+  if [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+    for e in $entries; do
+      [ -f "$RUNTIME_DIR/$e" ] || continue
+      while IFS= read -r tmpl; do
+        [ -n "$tmpl" ] || continue
+        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$(basename "$tmpl")" >/dev/null; then
+          RIG_COSMETIC_WHY="a template it renders changed in this deploy"
+          return 1
+        fi
+      done < <(daemon_template_names "$RUNTIME_DIR/$e")
+    done
+  fi
+  pid="$(daemon_pid "$label")"
+  if [ -z "$pid" ]; then RIG_COSMETIC_WHY="no live pid, so the code it loaded cannot be identified"; return 1; fi
+  start="$(pid_start_epoch "$pid" || true)"
+  case "$start" in
+    ''|*[!0-9]*) RIG_COSMETIC_WHY="the start time of pid $pid could not be read"; return 1 ;;
+  esac
+  base="$(git -C "$RUNTIME_DIR" rev-list -1 --before="@$start" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
+  if [ -z "$base" ]; then RIG_COSMETIC_WHY="no commit at or before its start ($start) to compare against"; return 1; fi
+  if ! raw="$(git -C "$RUNTIME_DIR" diff --name-only --no-renames "$base" "$POST_DEPLOY_SHA" 2>/dev/null)"; then
+    RIG_COSMETIC_WHY="git diff ${base:0:12}..${POST_DEPLOY_SHA:0:12} failed"
+    return 1
+  fi
+  # Own parse, not daemon_all_import_stems(): that helper answers "imports
+  # nothing" for a file it could not read or parse, and this decision must not
+  # treat "could not tell" as "nothing reaches it". A non-zero exit here (bad
+  # deploy_deps.json, unreadable/unparsable entrypoint) keeps the label.
+  if ! rel="$(RSD_ENTRIES="$entries" RSD_RAW="$raw" python3 - "$RUNTIME_DIR" "$DEPLOY_DEPS_JSON" <<'PY' 2>/dev/null
+import ast, json, os, sys
+runtime, deps_path = sys.argv[1], sys.argv[2]
+raw = [ln for ln in os.environ.get("RSD_RAW", "").splitlines() if ln]
+rawset = set(raw)
+entries = os.environ.get("RSD_ENTRIES", "").split()
+if not entries:
+    sys.exit(1)
+deps = json.load(open(deps_path, encoding="utf-8"))["daemons"] if os.path.exists(deps_path) else {}
+by_stem = {}
+for p in raw:
+    if p.endswith(".py"):
+        by_stem.setdefault(os.path.basename(p)[:-3], []).append(p)
+rel = set()
+for e in entries:
+    if e in rawset:
+        rel.add(e)
+    info = deps.get(e)
+    if isinstance(info, dict):
+        for key in ("closure", "assets"):
+            for p in info.get(key) or []:
+                if isinstance(p, str) and p in rawset:
+                    rel.add(p)
+    tree = ast.parse(open(os.path.join(runtime, e), encoding="utf-8", errors="replace").read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                names.update(a.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.update(node.module.split("."))
+            for a in node.names:
+                names.add(a.name)
+    for n in names:
+        rel.update(by_stem.get(n, ()))
+for p in sorted(rel):
+    print(p)
+PY
+)"; then
+    RIG_COSMETIC_WHY="could not work out which changed files reach it (entrypoint or deploy_deps.json unreadable)"
+    return 1
+  fi
+  if [ -z "$rel" ]; then
+    RIG_COSMETIC_WHY="no file changed since its start is its own file, asset, closure member or import — the detector's flag is not explained by one"
+    return 1
+  fi
+  if ! cls="$(cosmetic_py_classify "$base" "$POST_DEPLOY_SHA" "$rel")"; then
+    RIG_COSMETIC_WHY="the comment/format-only classifier failed or timed out"
+    return 1
+  fi
+  first="$(printf '%s\n' "$cls" | sed -n 's/^K://p' | head -1)"
+  if [ -n "$first" ]; then
+    RIG_COSMETIC_WHY="$first changed since its start and is not comment/format-only (identical AST)"
+    return 1
+  fi
+  return 0
+}
+
+RIG_COSMETIC_DOWNGRADED=""
+if [ "$RIG_DETECTOR_USED" -eq 1 ] && [ -n "${AFFECTED_RIG_DETECTOR// /}" ]; then
+  for label in $AFFECTED_RIG_DETECTOR; do
+    case " $FORCE_RESTART_LABELS " in *" $label "*) continue ;; esac
+    if rig_detector_cosmetic_only "$label"; then
+      RIG_COSMETIC_DOWNGRADED="$RIG_COSMETIC_DOWNGRADED $label"
+      log "rig-detector cosmetic check: $label downgraded out of AFFECTED — the rig's own-mode detector flagged it, but every changed file that reaches it (own file, registered assets, closure, imports) parses to the SAME AST as the version its running process loaded."
+    else
+      log "rig-detector cosmetic check: $label stays AFFECTED — $RIG_COSMETIC_WHY."
+    fi
+  done
+  if [ -n "${RIG_COSMETIC_DOWNGRADED// /}" ]; then
+    AFFECTED="$(for l in $AFFECTED; do case " $RIG_COSMETIC_DOWNGRADED " in *" $l "*) ;; *) echo "$l" ;; esac; done | tr '\n' ' ' | sed 's/ $//')"
+    AFFECTED_RIG_DETECTOR="$(for l in $AFFECTED_RIG_DETECTOR; do case " $RIG_COSMETIC_DOWNGRADED " in *" $l "*) ;; *) echo "$l" ;; esac; done | tr '\n' ' ' | sed 's/ $//')"
+  fi
+fi
 
 # ── per-daemon baseline narrowing (ga-0fawwr) ─────────────────────────────────
 # THE BUG THIS BLOCK FIXES: everything above computes ONE shared $CHANGED
