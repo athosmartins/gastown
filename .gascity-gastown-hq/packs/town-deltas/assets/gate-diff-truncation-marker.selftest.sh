@@ -13,19 +13,22 @@
 # fed into a hardcoded header at :5028/:5092 that never varied with truncation
 # state.
 #
-# Strategy: extract the live diff-truncation block VERBATIM from the dispatcher
-# (DIFF_SUMMARY=... through the closing `fi`, bounded by the stable anchors
-# `DIFF_SUMMARY=$(git_rig diff --stat` and `VERDICT_BEAD_IDS=()`), and exercise
-# it under the SAME `set -euo pipefail` the dispatcher uses, against a stubbed
-# git_rig() returning controlled, exact-line-count fake diffs. Then drift-guard
-# the shipped source and mutation-test the harness itself (prove it goes RED
-# against the pre-fix hardcoded-header shape).
+# Strategy: extract the dispatcher's LIVE call site VERBATIM (`DIFF_SUMMARY=$(gate_diff_summary ...`
+# through the `gate_build_diff_payload ...` call — the stable anchors) and exercise it, with
+# gate-review-task.lib.sh sourced, under the SAME `set -euo pipefail` the dispatcher uses, against
+# a stubbed git_rig() returning controlled, exact-line-count fake diffs. Then drift-guard the
+# shipped source and mutation-test the harness itself (prove it goes RED against the pre-fix
+# hardcoded-header shape).
+# ga-gnr3tw: the truncation logic moved from the dispatcher into gate_build_diff_payload (the lib the
+# builder's pre-gate-review.sh shares), so what the harness executes is now the dispatcher's real call
+# site plus the lib function behind it; the header template drift guards below read the lib.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+LIB="$SELF_DIR/gate-review-task.lib.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -33,12 +36,13 @@ bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
 echo "== gate-diff-truncation-marker.selftest =="
 
-BLOCK="$(awk '/^DIFF_SUMMARY=\$\(git_rig diff --stat/{p=1} /^VERDICT_BEAD_IDS=\(\)$/{p=0} p' "$DISPATCHER")"
+BLOCK="$(awk '/^DIFF_SUMMARY=\$\(gate_diff_summary/{p=1} p{print} /^gate_build_diff_payload /{exit}' "$DISPATCHER")"
 if [ -z "$BLOCK" ]; then
-  bad "could not locate the diff-truncation block in dispatcher (anchors missing/renamed)"
+  bad "could not locate the dispatcher call site of the diff payload (anchors missing/renamed)"
 else
-  ok "located live diff-truncation block ($(printf '%s\n' "$BLOCK" | wc -l | tr -d ' ') lines)"
+  ok "located the dispatcher call site of the diff payload ($(printf '%s\n' "$BLOCK" | wc -l | tr -d ' ') lines)"
 fi
+if [ -r "$LIB" ]; then ok "prompt lib present ($LIB)"; else bad "prompt lib missing: $LIB"; fi
 
 # run_block <label> <changed_files> <file_count> <budget> <full_diff_lines> <stub_body>
 # Sources a fresh bash with set -euo pipefail (matching the dispatcher), a stubbed
@@ -64,6 +68,7 @@ run_block() {
       RIG_PATH="/fake/rig/path"
       GIT_DIR_PATH="/fake/rig/path"
       '"$_stub_body"'
+      source "'"$LIB"'"
       '"$BLOCK"'
       echo "===HEADER-START==="
       printf "%s\n" "$DIFF_HEADER"
@@ -188,13 +193,13 @@ case "$MUT_HEADER" in
 esac
 
 # ── Drift guards on the shipped source ────────────────────────────────────────
-if grep -Eq '^\$DIFF_HEADER$' "$DISPATCHER"; then
+if grep -Eq '^\$DIFF_HEADER$' "$LIB"; then
   ok "shipped task template embeds \$DIFF_HEADER (not a hardcoded string)"
 else
   bad "shipped task template no longer embeds \$DIFF_HEADER — drift"
 fi
-if grep -Eq '^FULL DIFF \(first 2000 lines\):$' "$DISPATCHER"; then
-  bad "shipped source still contains the old unconditional 'FULL DIFF (first 2000 lines):' template line"
+if grep -Eq '^FULL DIFF \(first 2000 lines\):$' "$LIB" "$DISPATCHER"; then
+  bad "shipped source still contains the old unconditional 'FULL DIFF (first 2000 lines):' template line (lib or dispatcher)"
 else
   ok "old unconditional 'FULL DIFF (first 2000 lines):' template line is gone"
 fi

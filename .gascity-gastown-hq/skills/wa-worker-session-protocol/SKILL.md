@@ -56,6 +56,7 @@ Fluxo de conclusão:
    git push origin HEAD
    ```
 2. Rodar `/gate-done` para criar o marker no city DB (veja a skill `gate-done` pro fluxo completo — self-audit, verificação de push, criação do marker). `/gate-done` é um SLASH COMMAND nativo (`commands/gate-done.md`), materializado na sua própria sessão — NÃO é um script em disco. Nunca rode `find`/`ls -R` tentando localizá-lo: se `/gate-done` não aparecer disponível, isso é sinal de que a sessão não tem o command materializado (bug a reportar, não um arquivo a caçar) — ver ga-awsf9k, uma sessão wisp que tentou `find / -maxdepth 6 -iname gate-done*` a partir da raiz.
+   Dentro do `/gate-done` há o **Step 2b (pré-revisão, experimento A/B ga-gnr3tw)**: para METADE das beads (função fixa do id da bead — você não escolhe) ele roda o prompt do próprio revisor do gate no SEU diff antes de gastar um ciclo de gate; nas demais imprime `SKIPPED … control-arm` e segue. Rode-o em background (leva minutos), leia o veredito: `FAIL` = conserte o que for real (a CLASSE, varrendo o diff todo), commite e rode `/gate-done` de novo (máx. 3 vezes por bead); `INCONCLUSIVE` = não é veredito, siga para o Step 3 e registre o motivo. Não use `--force` para "ver em que braço está".
 3. O launchd guard detecta o marker em ~2 min, despacha 3 revisores independentes e mergeia direto em main.
 4. Você receberá mail quando o gate passar ou falhar.
 

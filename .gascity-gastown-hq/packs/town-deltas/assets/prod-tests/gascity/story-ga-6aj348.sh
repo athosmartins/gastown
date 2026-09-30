@@ -22,8 +22,11 @@
 # syntax check below therefore names /bin/bash explicitly, the same
 # interpreter the dispatcher runs under, and refuses to skip if it is absent.
 #
-# Verifies the DEPLOYED dispatcher directly (not a hand-copied re-assertion of
-# the same claims), then runs the dedicated selftest end-to-end against it.
+# Verifies the DEPLOYED files directly (not a hand-copied re-assertion of the same
+# claims), then runs the dedicated selftest end-to-end against them.
+# ga-gnr3tw: the prompt text moved out of quality-gate-dispatcher.sh into
+# gate-review-task.lib.sh (shared with the builder's pre-gate-review.sh), so the
+# prompt claims below are checked in the deployed LIB; the parse check still covers both.
 #
 # Called by run.sh after deploy (STORY_ID=ga-6aj348). Exits 0 on pass.
 
@@ -32,6 +35,7 @@ set -uo pipefail
 CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
 ASSETS="$CITY/packs/town-deltas/assets"
 DISPATCHER="$ASSETS/quality-gate-dispatcher.sh"
+TASKLIB="$ASSETS/gate-review-task.lib.sh"
 SELFTEST="$ASSETS/gate-6aj348-recall-bar.selftest.sh"
 BASH32=/bin/bash
 
@@ -39,35 +43,37 @@ log()  { echo "[prod-test:gascity ga-6aj348] $*"; }
 fail() { echo "[prod-test:gascity ga-6aj348] FAIL: $*" >&2; exit 1; }
 
 [[ -f "$DISPATCHER" ]] || fail "missing: $DISPATCHER"
+[[ -f "$TASKLIB" ]]    || fail "missing: $TASKLIB"
 [[ -f "$SELFTEST" ]]   || fail "missing: $SELFTEST"
 [[ -x "$BASH32" ]]     || fail "$BASH32 not executable — cannot run the real-interpreter syntax check"
-log "Deployed dispatcher + selftest found."
+log "Deployed dispatcher + prompt lib + selftest found."
 
 # ── 1. Syntax: the deployed dispatcher must parse under /bin/bash 3.2 ──────────
 # NOT bare "bash -n" (Homebrew 5.3 in PATH accepts what 3.2 rejects).
 log "Checking dispatcher syntax under $BASH32 ($("$BASH32" --version | head -n1 | sed 's/ (.*//'))..."
 "$BASH32" -n "$DISPATCHER" || fail "quality-gate-dispatcher.sh does not parse under $BASH32"
-log "  syntax OK ✓"
+"$BASH32" -n "$TASKLIB" || fail "gate-review-task.lib.sh does not parse under $BASH32"
+log "  syntax OK (dispatcher + prompt lib) ✓"
 
 # ── 2. The old suppressive instruction is gone from the DEPLOYED file ──────────
 log "Checking the ungrounded DROP-it instruction is gone..."
-grep -qF 'If you cannot ground a blocking issue in specific' "$DISPATCHER" \
-  && fail "old ungrounded DROP-it sentence still present in the deployed dispatcher"
+grep -qF 'If you cannot ground a blocking issue in specific' "$TASKLIB" \
+  && fail "old ungrounded DROP-it sentence still present in the deployed prompt lib"
 log "  gone ✓"
 
 # ── 3. The concrete blocking bar reaches the deployed reviewer prompt ──────────
 log "Checking the concrete WHAT BLOCKS / WHAT DOES NOT BLOCK bar is present..."
-grep -qE 'WHAT BLOCKS \(verdict FAIL\)' "$DISPATCHER" \
-  || fail "WHAT BLOCKS bar missing from the deployed dispatcher"
-grep -qF 'WHAT DOES NOT BLOCK' "$DISPATCHER" \
-  || fail "WHAT DOES NOT BLOCK bar missing from the deployed dispatcher"
+grep -qE 'WHAT BLOCKS \(verdict FAIL\)' "$TASKLIB" \
+  || fail "WHAT BLOCKS bar missing from the deployed prompt lib"
+grep -qF 'WHAT DOES NOT BLOCK' "$TASKLIB" \
+  || fail "WHAT DOES NOT BLOCK bar missing from the deployed prompt lib"
 log "  present ✓"
 
 # ── 4. Non-blocking findings have a reporting slot in BOTH verdict templates ───
 log "Checking the Non-blocking findings slot is wired into both PASS and FAIL..."
-_NBF_COUNT=$(grep -cF "Non-blocking findings: <one per line" "$DISPATCHER")
+_NBF_COUNT=$(grep -cF "Non-blocking findings: <one per line" "$TASKLIB")
 [[ "$_NBF_COUNT" -ge 2 ]] \
-  || fail "Non-blocking findings slot found in only $_NBF_COUNT template(s) of the deployed dispatcher, need >=2 (PASS + FAIL)"
+  || fail "Non-blocking findings slot found in only $_NBF_COUNT template(s) of the deployed prompt lib, need >=2 (PASS + FAIL)"
 log "  present in both ($_NBF_COUNT occurrences) ✓"
 
 # ── 5. The dedicated selftest passes end-to-end against the deployed file ──────

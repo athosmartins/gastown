@@ -5939,6 +5939,23 @@ log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; : >
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
 
+# ── ga-gnr3tw: what a reviewer is shown lives in ONE lib, shared with the builder's pre-gate-review.sh ──
+# The lens, the diff payload and the task prompt used to be inline below. The builder now runs the SAME lens on
+# its own diff before /gate-done (the E3 experiment), and a second copy of the prompt would drift from this one.
+# Without the lib no reviewer task can be rendered, so its absence is fatal — but a bare `source` of a missing
+# file kills this `set -euo pipefail` daemon with no log line (ga-q4sadt), so check first and say why. This runs
+# before any marker is claimed, so a bad deploy leaves the queue untouched instead of stranding a claimed marker.
+# `|| true`: a failed `cd` in the substitution is a live errexit trigger; with it the path is just "/gate-review-
+# task.lib.sh", which the [ -r ] test below reads as "no lib".
+_GATE_TASK_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gate-review-task.lib.sh" || true
+if [ -r "$_GATE_TASK_LIB" ]; then
+  source "$_GATE_TASK_LIB"
+else
+  err "gate-review-task.lib.sh missing or unreadable ($_GATE_TASK_LIB) — cannot render the reviewer task; exiting before any marker is claimed (ga-gnr3tw)"
+  exit 1
+fi
+unset _GATE_TASK_LIB
+
 # ── ga-piscg: systemic spawn-abort escalation (consecutive-abort alert) ───────
 # The dispatcher processes exactly ONE queued marker per sweep. A broken spawn
 # mechanism (gate-reviewer template misconfig / session-cap deadlock — ga-mzc3h)
@@ -15024,67 +15041,17 @@ fi
 #
 # The dispatcher polls these beads for closed status + verdict label.
 
-DIFF_SUMMARY=$(git_rig diff --stat "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null | tail -5 | tr '\n' ' ' | cut -c1-300 || true)
-
-# ga-p4g6: the old `head -2000` truncation sliced through diff hunks mid-file
-# AND the header unconditionally said "FULL DIFF (first 2000 lines)" — "full"
-# and "silently truncated at 45%" rendered as IDENTICAL text, so a reviewer
-# trusting the header had no way to know 9 of 20 changed files (including the
-# one with the real bug) were never shown. Measured impact: 14% of live
-# branches (3/21 sampled) truncate silently; the worst cases show reviewers as
-# little as 25-38% of the actual change.
-#
-# Fix: capture the full diff ONCE (avoid a 2nd/3rd `git diff` invocation), and
-# if it exceeds the budget, rebuild it by walking $CHANGED_FILES in order and
-# including each file's diff WHOLE — stopping before the file that would blow
-# the budget, never inside one. The header then states real numbers and names
-# every omitted file, so "I reviewed the change" and "I reviewed part of the
-# change" can no longer produce the same text.
-#
-# Note: "|| true" suppresses SIGPIPE (exit 141) if a downstream consumer of
-# this output truncates under pipefail — kept from the original for parity.
-DIFF_RAW=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" 2>/dev/null || true)
-if [ -z "$DIFF_RAW" ]; then
-  DIFF_RAW_TOTAL_LINES=0
+# ga-gnr3tw: the summary + diff payload (and the FULL/PARTIAL header that says how much of the diff the reviewer
+# sees — the ga-p4g6 design notes live with the function) are built by the shared lib, so the builder's
+# pre-gate-review.sh shows its reviewer exactly what this gate shows its own. The escape-hatch command is the
+# only piece that depends on this rig, so it is computed here and handed in.
+DIFF_SUMMARY=$(gate_diff_summary git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
+if [ "$IS_CONTAINER_RIG" = "1" ]; then
+  DIFF_ESCAPE_HATCH_CMD="git --git-dir=$GIT_DIR_PATH diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
 else
-  DIFF_RAW_TOTAL_LINES=$(printf '%s\n' "$DIFF_RAW" | wc -l | tr -d ' ')
+  DIFF_ESCAPE_HATCH_CMD="cd $RIG_PATH && git diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
 fi
-
-if [ "$DIFF_RAW_TOTAL_LINES" -le "$GATE_DIFF_LINE_BUDGET" ]; then
-  DIFF_FULL="$DIFF_RAW"
-  DIFF_HEADER="FULL DIFF (complete — $DIFF_RAW_TOTAL_LINES lines across $DIFF_FILE_COUNT file(s), nothing omitted):"
-else
-  DIFF_FULL=""
-  _DIFF_SHOWN_LINES=0
-  _DIFF_SHOWN_FILES=0
-  DIFF_OMITTED_FILES=""
-  while IFS= read -r _df; do
-    [ -z "$_df" ] && continue
-    _FILE_DIFF=$(git_rig diff "origin/$DEFAULT_BRANCH...origin/$BRANCH" -- "$_df" 2>/dev/null || true)
-    _FILE_DIFF_LINES=$(printf '%s\n' "$_FILE_DIFF" | wc -l | tr -d ' ')
-    # Always take at least the first file whole (even if it alone exceeds the
-    # budget) — one complete file beats zero, and this still never cuts a hunk.
-    if [ $((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES)) -le "$GATE_DIFF_LINE_BUDGET" ] || [ "$_DIFF_SHOWN_FILES" = "0" ]; then
-      DIFF_FULL="${DIFF_FULL}${_FILE_DIFF}
-"
-      _DIFF_SHOWN_LINES=$((_DIFF_SHOWN_LINES + _FILE_DIFF_LINES))
-      _DIFF_SHOWN_FILES=$((_DIFF_SHOWN_FILES + 1))
-    else
-      DIFF_OMITTED_FILES="${DIFF_OMITTED_FILES}  - ${_df}
-"
-    fi
-  done <<< "$CHANGED_FILES"
-
-  if [ "$IS_CONTAINER_RIG" = "1" ]; then
-    DIFF_ESCAPE_HATCH_CMD="git --git-dir=$GIT_DIR_PATH diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
-  else
-    DIFF_ESCAPE_HATCH_CMD="cd $RIG_PATH && git diff origin/$DEFAULT_BRANCH...origin/$BRANCH"
-  fi
-
-  DIFF_HEADER="PARTIAL DIFF — showing $_DIFF_SHOWN_FILES of $DIFF_FILE_COUNT files ($_DIFF_SHOWN_LINES of $DIFF_RAW_TOTAL_LINES total diff lines). DO NOT treat the omitted files below as reviewed — you have not seen them:
-OMITTED FILES ($((DIFF_FILE_COUNT - _DIFF_SHOWN_FILES))):
-${DIFF_OMITTED_FILES}To review the FULL diff yourself: $DIFF_ESCAPE_HATCH_CMD"
-fi
+gate_build_diff_payload git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH" "$CHANGED_FILES" "$DIFF_FILE_COUNT" "$GATE_DIFF_LINE_BUDGET" "$DIFF_ESCAPE_HATCH_CMD"
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()
@@ -15125,12 +15092,8 @@ for i in $(seq 1 $REQUIRED_REVIEWERS); do
     log "  Spawn stagger: settling ${GATE_SPAWN_STAGGER_SECS}s before reviewer 1 (ga-cvhoj — let the setup Dolt-burst subside before gc prime)"
     sleep "$GATE_SPAWN_STAGGER_SECS" || true
   fi
-  REVIEWER_LENS=""
-  case "$i" in
-    1) REVIEWER_LENS="CORRECTNESS: focus on logic errors, edge cases, off-by-one bugs, null/empty handling, error propagation, and incorrect assumptions. Be adversarial. (The ga-p5q3 third-state check now lives in the reviewer prompt template as a MANDATORY dimension for ALL lenses — ga-31ac, mila-wa. Do not duplicate it here: saying it twice dilutes both.)" ;;
-    2) REVIEWER_LENS="SECURITY & ROBUSTNESS: focus on injection risks, unsafe eval/exec, credentials in code, path traversal, race conditions, resource leaks, and missing input validation." ;;
-    3) REVIEWER_LENS="DESIGN & MAINTAINABILITY: focus on architectural concerns, code duplication, missing tests, test quality, unclear naming, violation of existing conventions, and tech debt introduced." ;;
-  esac
+  # ga-gnr3tw: the per-index lens text lives in the shared lib (gate_reviewer_lens), next to the prompt that carries it.
+  REVIEWER_LENS=$(gate_reviewer_lens "$i")
 
   # Create a verdict bead for this reviewer.
   # NOTE: deliberately NOT --ephemeral. The reviewer's durable-pull channel
@@ -15168,76 +15131,10 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
 
   # Build the review task message for the session nudge.
   # Each session gets: (a) the diff, (b) its specific lens, (c) exact bd commands to record verdict.
-  REVIEW_TASK=$(cat <<TASK
-QUALITY GATE REVIEW — You are reviewer $i of $REQUIRED_REVIEWERS for branch: $BRANCH
-Author (EXCLUDED from reviewing): $AUTHOR
-Rig: $RIG
-Branch SHA: $BRANCH_SHA
-
-YOUR REVIEW LENS: $REVIEWER_LENS
-
-CHANGED FILES:
-$CHANGED_FILES
-
-DIFF SUMMARY:
-$DIFF_SUMMARY
-
-$DIFF_HEADER
-$DIFF_FULL
-
---- YOUR TASK ---
-Review this diff adversarially using ONLY your assigned lens above.
-You must NOT know or consider what the other reviewers think (you are independent).
-This author ($AUTHOR) cannot be a reviewer of their own work.
-
-REFUTATION PASS — FACT-CHECK, NOT A SEVERITY FILTER:
-For EVERY issue you are about to raise, RE-READ the exact changed lines in the
-diff and verify the defect is actually there: is it really present in THIS
-diff, at the lines you cite, given the surrounding context — or are you
-pattern-matching on superficially-similar code, or assuming context you did not
-actually verify in the diff? This refutation pass asks only one question —
-does the defect exist in the code? — and is never a filter on how severe or
-how certain the issue feels.
-
-WHAT BLOCKS (verdict FAIL): any defect you can ground in specific changed
-lines that could cause incorrect behavior, a failing test, data loss, or a
-misleading result/log/comment.
-WHAT DOES NOT BLOCK: pure style or naming preferences with no behavioral
-effect — report these too, just do not fail the verdict on them alone.
-LOW CONFIDENCE: if you are not sure whether something is really a defect,
-RE-READ the surrounding code until you can decide either way — never silence
-or drop a finding just because you are unsure.
-Every issue that survives the fact-check gets reported at its real severity,
-blocking or not — nothing you found gets dropped silently. Your verdict is
-FAIL only if at least one blocking issue survives the fact-check; otherwise
-it is PASS, with any non-blocking findings still listed below.
-WHY THIS MATTERS: this gate fails on ANY single reviewer FAIL, so a
-false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycle
-on correct code. Be adversarial about whether the CODE actually has the
-defect, never about whether a real finding deserves to be reported: verify
-each issue is real, then report everything real you find, at its true severity.
-
-After completing your review, record your verdict with EXACTLY these bash commands:
-
-bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
-# If PASS:
-bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:PASS"
-bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
-Summary: <2-3 sentence summary of what you checked and why it passes your lens>
-Non-blocking findings: <one per line as severity: description, or none>"
-bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
-
-# If FAIL:
-# bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:FAIL"
-# bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: FAIL
-# Blocking issue 1: <description>
-# Blocking issue 2: <description> (if any)
-# Non-blocking findings: <one per line as severity: description, or none>"
-# bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
-
-Run those commands and then exit your session. Do not start other work.
-TASK
-)
+  # ga-gnr3tw: the task text is rendered by the shared lib (gate_render_review_task, bead mode), the same function
+  # the builder's pre-gate-review.sh calls in text mode — one prompt, so the builder rehearses the lens it will meet.
+  REVIEW_TASK=$(gate_render_review_task "$i" "$REQUIRED_REVIEWERS" "$BRANCH" "$AUTHOR" "$RIG" "$BRANCH_SHA" \
+    "$REVIEWER_LENS" "$CHANGED_FILES" "$DIFF_SUMMARY" "$DIFF_HEADER" "$DIFF_FULL" "$GC_CITY" "$VERDICT_BEAD_ID" bead)
 
   # Spawn an independent reviewer session (no attach, fresh wake mode).
   # Uses "gate-reviewer" template (not gastown.dog) to avoid consuming the

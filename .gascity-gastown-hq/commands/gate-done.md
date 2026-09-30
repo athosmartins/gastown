@@ -1,7 +1,7 @@
 ---
 description: Signal work ready for quality gate (writes durable marker; launchd guard picks it up within ~2 min)
 argument-hint: ""
-allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*)
+allowed-tools: Bash(git status:*), Bash(git push:*), Bash(git rev-parse:*), Bash(git fetch:*), Bash(git log:*), Bash(git diff:*), Bash(git config:*), Bash(bd create:*), Bash(bd label:*), Bash(bd list:*), Bash(bd show:*), Bash(gc rig list:*), Bash(bash:*)
 ---
 
 # Gate Done — Signal Work Ready for Quality Gate
@@ -17,10 +17,14 @@ Arguments: $ARGUMENTS
 1. Runs a mandatory self-audit of your OWN diff for the "third state" defect
    class (see below) — the single class reviewers reject most often.
 2. Validates your working tree is clean and pushed.
-3. Creates a durable bead marker in the CITY database (so the guard can find
+3. For half of all beads (experiment ga-gnr3tw, Step 2b): runs the gate
+   reviewer's own prompt on your diff before it costs a gate cycle, and tells
+   you what it would reject. The other half skips it, by a fixed function of
+   the bead id.
+4. Creates a durable bead marker in the CITY database (so the guard can find
    it), then re-reads it to confirm the ready-for-gate label landed —
    self-healing if not (ga-ehbw5).
-4. You are DONE — the launchd guard sweeps every ~2 min, claims the marker,
+5. You are DONE — the launchd guard sweeps every ~2 min, claims the marker,
    and spawns a gate-runner in a separate session. You will be mailed when the
    gate passes or fails.
 
@@ -738,6 +742,49 @@ inside a registered rig directory. `Bead rig` shows which Dolt store owns the so
 bead (HQ `gascity` vs the code-rig); it is recorded so the gate closes the bead in
 the correct store.
 
+## Step 2b: Pre-gate self-review (A/B experiment, ga-gnr3tw — half of all beads)
+
+**Why.** The gate now rejects what an easier reviewer used to approve — measured
+(E0, ga-5vi6cp): of 10 diffs re-judged, 7 had a real behaviour defect and 0 were
+unfounded. The bar is not coming down; what ARRIVES has to get better. About half of
+the FAILs are an edge case / an error that reads as empty / a third state, a fifth is
+a comment promising more than the code does, a tenth is a test that never exercises
+the path. You can catch those yourself if you look with the reviewer's own eyes: this
+step runs the gate reviewer's OWN prompt (same lens, same bar, same model and effort)
+on your diff BEFORE it costs a gate cycle. It writes nothing to the gate.
+
+**It is an experiment, so it runs for half of the beads.** Which half is a fixed
+function of your bead id (SHA-256 parity) — not something you pick or should try to
+predict. On the other half the script prints `SKIPPED … control-arm`, exits 0 within a
+second, and there is nothing for you to do: go to Step 3. Do NOT pass `--force` to see
+which arm you are in, or to re-roll: it contaminates the measurement the Mayor is
+using to decide whether this becomes mandatory.
+
+Run it from your checkout (HEAD on your branch, clean tree, already pushed by Step 1),
+filling `<BRANCH>` and `<BEAD_ID>` from what Step 2 printed (shell variables do not
+persist between tool calls). **A review takes minutes (up to ~25) — run it as a
+BACKGROUND command (Bash tool `run_in_background: true`) and read the output when it
+finishes; do not kill it, and do not treat the wait as a hang.**
+
+```bash
+bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" run "<BRANCH>" --bead "<BEAD_ID>"
+echo "pre-gate exit code: $?"
+```
+
+The last line of output is `PREGATE_RESULT arm=… verdict=… reason=… attempt=…`. Three
+outcomes, never two — a check that could not run is not a check that passed:
+
+| exit | verdict | what you do |
+|---|---|---|
+| 0 | `PASS` | No blocking defect found. Go to Step 3. |
+| 0 | `SKIPPED` | Control arm, or you already used the per-bead cap (3 runs). Go to Step 3. |
+| 10 | `FAIL` | The reviewer found blocking defect(s), printed above. For EACH one, re-read the cited lines and decide whether it is real. Fix the real ones — fix the CLASS, sweep your whole diff for siblings, not only the cited line (the same shape hides elsewhere in the same diff) — commit, and re-run `/gate-done` from Step 1. If you judge a finding a false positive you may still submit: say which and why in `SELF_AUDIT_SUMMARY`; the real gate decides. |
+| 3 | `INCONCLUSIVE` | It could not judge (`reason=` says why: machine guard, busy, timeout, no verdict line…). NOT a verdict, and not a reason to wait. Go to Step 3 and put `pre-gate inconclusive (<reason>)` in `SELF_AUDIT_SUMMARY`. |
+| 2 (or anything else) | — | The call itself was wrong (bad flag, empty `<BEAD_ID>`) or the script crashed. NOT a verdict. Fix the call if it is yours (an empty `<BEAD_ID>` means Step 2 did not run in this shell), otherwise go to Step 3 and say `pre-gate not run (<what happened>)` in `SELF_AUDIT_SUMMARY`. |
+
+The step is fail-open on tooling (a missing script or an unresolved model must never
+block a submission) and fail-visible (the reason is printed and recorded).
+
 ## Step 3: Create the ready-for-gate marker
 
 The marker MUST be written to the city database (same database the guard reads).
@@ -784,6 +831,13 @@ SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-
 # Provado com par controlado: marker ephemeral ve=0 e um idêntico não-ephemeral
 # ve=1, na MESMA consulta. Se algum dia voltar a usar --ephemeral, as ~113
 # consultas por type:quality-gate-marker precisam de --include-infra ANTES.
+# ga-gnr3tw: stamp the A/B arm of the pre-gate experiment (Step 2b) on the marker. The arm is a pure function of the
+# bead id, so it is recomputed here and survives Step 2b having run in another shell. If it cannot be computed
+# (no sha256 tool, empty id) NO label is written: "unknown" must never read as "off" in the measurement.
+PREGATE_ARM=$(bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" arm "$BEAD_ID" 2>/dev/null) || PREGATE_ARM=""
+PREGATE_LABEL_ARG=""
+case "$PREGATE_ARM" in on|off) PREGATE_LABEL_ARG="-l pregate:$PREGATE_ARM" ;; esac
+
 MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   "ready-for-gate: $BRANCH" \
   -t chore \
@@ -792,6 +846,7 @@ MARKER_ID=$(bd -C "$GC_CITY_PATH" create \
   -l "branch:$BRANCH" \
   -l "source-bead:$BEAD_ID" \
   -l "bead-rig:$BEAD_RIG" \
+  $PREGATE_LABEL_ARG \
   -d "branch: $BRANCH
 bead_id: $BEAD_ID
 author: $AUTHOR

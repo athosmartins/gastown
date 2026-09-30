@@ -24,17 +24,21 @@
 #     unrelated case pattern. Writing prose that "happens to parse" is luck;
 #     zero apostrophes is the checkable invariant the pre-fix text already held.
 #
-# Every assertion below runs against the dispatcher file (GATE_UNDER_TEST
-# overrides the default, so this harness can be pointed at an older revision to
-# prove it fails there). The render check also EXECUTES the real REVIEW_TASK
-# command substitution under /bin/bash 3.2 with stub variables, so "the new
-# text reaches the reviewer prompt" is proven on the rendered output, not just
-# on the source text. No live Dolt/gc/launchd. Exit 0 iff every assertion holds.
+# ga-gnr3tw: the prompt no longer lives inside quality-gate-dispatcher.sh. It moved to
+# gate-review-task.lib.sh so the builder's pre-gate-review.sh renders the SAME text. The prompt
+# assertions below therefore read the lib (TASKLIB_UNDER_TEST overrides the default); the compile
+# guard still covers the dispatcher (GATE_UNDER_TEST overrides). To prove this harness fails on an
+# older revision, point BOTH at a pre-ga-gnr3tw dispatcher, which carries the prompt inline: the
+# prompt checks and the render then fall back to the inline REVIEW_TASK block.
+# The render check EXECUTES the real render under /bin/bash 3.2 with stub variables, so "the new
+# text reaches the reviewer prompt" is proven on the rendered output, not just on the source text.
+# No live Dolt/gc/launchd. Exit 0 iff every assertion holds.
 
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="${GATE_UNDER_TEST:-$SELF_DIR/quality-gate-dispatcher.sh}"
+TASKLIB="${TASKLIB_UNDER_TEST:-$SELF_DIR/gate-review-task.lib.sh}"
 BASH32=/bin/bash
 
 PASS=0
@@ -54,16 +58,23 @@ extract_block() {
     f && seen && /^\)$/ { exit }
   ' "$1"
 }
-# Just the prompt text between the heredoc opener and the TASK terminator.
+# Just the prompt text between each heredoc opener and its TASK terminator. In the lib that is the three
+# `cat <<TASK` bodies (judging text, bead-mode tail, text-mode tail); in a pre-ga-gnr3tw dispatcher it is the
+# one inline `REVIEW_TASK=$(cat <<TASK` body — both match `<<TASK`.
 extract_body() {
+  # Anchored to a real opener line — optional indent, optional `REVIEW_TASK=$(`, then `cat <<TASK` and nothing else — so a
+  # COMMENT that merely mentions the heredoc marker can never open a capture (a lib header comment did exactly that once,
+  # and the capture swallowed code up to the next TASK line).
   awk '
-    /REVIEW_TASK=\$\(cat <<TASK/ { f=1; next }
-    f && /^TASK$/ { exit }
+    /^[[:space:]]*(REVIEW_TASK=\$\()?cat <<TASK[[:space:]]*$/ { f=1; next }
+    f && /^TASK$/ { f=0; next }
     f { print }
   ' "$1"
 }
+# True when the file under test still carries the prompt inline (a pre-ga-gnr3tw dispatcher).
+prompt_is_inline() { grep -qE 'REVIEW_TASK=\$\(cat <<TASK' "$1"; }
 
-echo "── 1. COMPILE-GUARD: dispatcher parses under /bin/bash 3.2 ──"
+echo "── 1. COMPILE-GUARD: dispatcher and prompt lib parse under /bin/bash 3.2 ──"
 # NEVER bare "bash -n": in PATH that is Homebrew bash 5.3, which accepts what
 # the real interpreter rejects (this is exactly how the first attempt slipped).
 if [ ! -x "$BASH32" ]; then
@@ -78,11 +89,19 @@ else
     bad "dispatcher: $BASH32 -n FAILED — ${_parse_err##*/}"
   fi
 fi
+if [ ! -x "$BASH32" ]; then
+  :   # already reported above
+elif [ ! -f "$TASKLIB" ]; then
+  bad "prompt lib not found: $TASKLIB"
+else
+  _parse_err="$("$BASH32" -n "$TASKLIB" 2>&1)"
+  if [ $? -eq 0 ]; then ok "prompt lib: $BASH32 -n clean"; else bad "prompt lib: $BASH32 -n FAILED — ${_parse_err##*/}"; fi
+fi
 
 echo "── 2. REVIEW_TASK HEREDOC HAS ZERO APOSTROPHES (bash 3.2 comsub scan) ──"
-_BODY="$(extract_body "$GATE")"
+_BODY="$(extract_body "$TASKLIB")"
 if [ -z "$_BODY" ]; then
-  bad "could not locate the REVIEW_TASK heredoc body (marker moved? update extract_body)"
+  bad "could not locate the REVIEW_TASK heredoc body in $TASKLIB (marker moved? update extract_body)"
 else
   _APOS=$(printf '%s\n' "$_BODY" | tr -cd "'" | wc -c | tr -d ' ')
   if [ "$_APOS" -eq 0 ]; then
@@ -94,37 +113,37 @@ else
 fi
 
 echo "── 3. OLD SUPPRESSIVE FRAMING IS GONE ──"
-hasnot "$GATE" 'If you cannot ground a blocking issue in specific' \
+hasnot "$TASKLIB" 'If you cannot ground a blocking issue in specific' \
   "the ungrounded DROP-it instruction is gone"
-hasnot "$GATE" 'REFUTATION PASS — MANDATORY BEFORE ANY FAIL' \
+hasnot "$TASKLIB" 'REFUTATION PASS — MANDATORY BEFORE ANY FAIL' \
   "old MANDATORY-BEFORE-ANY-FAIL heading is gone"
 
 echo "── 4. CONCRETE BLOCKING BAR IS IN THE SOURCE ──"
-has "$GATE" 'WHAT BLOCKS \(verdict FAIL\)' \
+has "$TASKLIB" 'WHAT BLOCKS \(verdict FAIL\)' \
   "concrete WHAT BLOCKS bar is present"
-has "$GATE" 'incorrect behavior, a failing test, data loss, or a' \
+has "$TASKLIB" 'incorrect behavior, a failing test, data loss, or a' \
   "blocking bar names incorrect behavior / failing test / data loss"
-has "$GATE" 'misleading result/log/comment' \
+has "$TASKLIB" 'misleading result/log/comment' \
   "blocking bar names misleading result/log/comment"
-has "$GATE" 'WHAT DOES NOT BLOCK' \
+has "$TASKLIB" 'WHAT DOES NOT BLOCK' \
   "explicit non-blocking bar (style/naming) is present"
 
 echo "── 5. REFUTATION PASS IS A FACT-CHECK, NOT A SEVERITY FILTER ──"
-has "$GATE" 'FACT-CHECK, NOT A SEVERITY FILTER' \
+has "$TASKLIB" 'FACT-CHECK, NOT A SEVERITY FILTER' \
   "refutation-pass heading names it a fact-check, not a severity filter"
-has "$GATE" 'never a filter on how severe or' \
+has "$TASKLIB" 'never a filter on how severe or' \
   "prompt states the refutation pass never filters on severity"
 
 echo "── 6. LOW CONFIDENCE ⇒ RE-READ, NEVER SILENCE ──"
-has "$GATE" 'never silence' \
+has "$TASKLIB" 'never silence' \
   "low-confidence directive tells the reviewer to re-read, never silence a finding"
 
 echo "── 7. NON-BLOCKING FINDINGS ARE REPORTED, NOT DROPPED SILENTLY ──"
-has "$GATE" 'nothing you found gets dropped silently' \
+has "$TASKLIB" 'nothing you found gets dropped silently' \
   "prompt states findings are never dropped silently"
 # The slot must exist in BOTH the PASS and the FAIL comment templates — a
 # single has() only proves >=1 occurrence, so count explicitly.
-_NBF_COUNT=$(grep -cE "Non-blocking findings: <one per line" "$GATE")
+_NBF_COUNT=$(grep -cE "Non-blocking findings: <one per line" "$TASKLIB")
 if [ "$_NBF_COUNT" -ge 2 ]; then
   ok "Non-blocking findings slot present in BOTH PASS and FAIL templates ($_NBF_COUNT occurrences)"
 else
@@ -132,46 +151,63 @@ else
 fi
 
 echo "── 8. RENDER: the new text reaches the reviewer prompt under /bin/bash 3.2 ──"
-_BLOCK="$(extract_block "$GATE")"
-if [ -z "$_BLOCK" ] || [ ! -x "$BASH32" ]; then
-  bad "could not extract/execute the REVIEW_TASK block (block empty or $BASH32 missing)"
+# ga-gnr3tw: the gate renders through gate_render_review_task (bead mode). A pre-ga-gnr3tw dispatcher (only
+# reachable through the *_UNDER_TEST overrides) still carries the prompt as an inline REVIEW_TASK block.
+_WORK="$(mktemp -d "${TMPDIR:-/tmp}/gate-6aj348.XXXXXX")"
+if [ ! -x "$BASH32" ]; then
+  bad "$BASH32 missing — cannot execute the render"
+elif prompt_is_inline "$TASKLIB"; then
+  _BLOCK="$(extract_block "$TASKLIB")"
+  if [ -z "$_BLOCK" ]; then
+    bad "could not extract the inline REVIEW_TASK block from $TASKLIB"
+  else
+    {
+      echo 'i=2; REQUIRED_REVIEWERS=3; BRANCH=feat/selftest-branch; AUTHOR=selftest-author'
+      echo 'RIG=selftest-rig; BRANCH_SHA=0000000; REVIEWER_LENS=selftest-lens'
+      echo 'CHANGED_FILES=a.sh; DIFF_SUMMARY=1-file; DIFF_HEADER=hdr; DIFF_FULL=diff-body'
+      echo 'GC_CITY=/selftest/city; VERDICT_BEAD_ID=ga-selftest'
+      printf '%s\n' "$_BLOCK"
+      echo 'printf "%s\n" "$REVIEW_TASK"'
+    } > "$_WORK/render.sh"
+  fi
 else
-  _WORK="$(mktemp -d "${TMPDIR:-/tmp}/gate-6aj348.XXXXXX")"
   {
-    echo 'i=2; REQUIRED_REVIEWERS=3; BRANCH=feat/selftest-branch; AUTHOR=selftest-author'
-    echo 'RIG=selftest-rig; BRANCH_SHA=0000000; REVIEWER_LENS=selftest-lens'
-    echo 'CHANGED_FILES=a.sh; DIFF_SUMMARY=1-file; DIFF_HEADER=hdr; DIFF_FULL=diff-body'
-    echo 'GC_CITY=/selftest/city; VERDICT_BEAD_ID=ga-selftest'
-    printf '%s\n' "$_BLOCK"
-    echo 'printf "%s\n" "$REVIEW_TASK"'
+    echo 'set -euo pipefail'
+    echo "source \"$TASKLIB\""
+    echo 'gate_render_review_task 2 3 feat/selftest-branch selftest-author selftest-rig 0000000 selftest-lens a.sh 1-file hdr diff-body /selftest/city ga-selftest bead'
   } > "$_WORK/render.sh"
+fi
+if [ -f "$_WORK/render.sh" ]; then
   _RENDERED="$("$BASH32" "$_WORK/render.sh" 2>"$_WORK/render.err")"
   _RC=$?
   if [ "$_RC" -ne 0 ] || [ -z "$_RENDERED" ]; then
-    bad "REVIEW_TASK block failed to render under $BASH32 (rc=$_RC): $(head -n1 "$_WORK/render.err")"
+    bad "review task failed to render under $BASH32 (rc=$_RC): $(head -n1 "$_WORK/render.err")"
   else
-    ok "REVIEW_TASK block renders under $BASH32"
-    r_has() { if printf '%s\n' "$_RENDERED" | grep -qF -- "$1"; then ok "$2"; else bad "$2 — not in rendered prompt: $1"; fi; }
+    ok "review task renders under $BASH32"
+    # Here-string, not `printf | grep -q`: under `set -o pipefail` grep -q exits on its first match, printf can
+    # take SIGPIPE (141) mid-write, and the pipeline then reports FAILURE for a phrase that IS in the prompt.
+    # That made this harness fail at random (a different assertion each run) before ga-gnr3tw.
+    r_has() { if grep -qF -- "$1" <<<"$_RENDERED"; then ok "$2"; else bad "$2 — not in rendered prompt: $1"; fi; }
     r_has 'reviewer 2 of 3 for branch: feat/selftest-branch' "variables expand into the rendered prompt (sanity)"
     r_has 'WHAT BLOCKS (verdict FAIL)'          "rendered prompt carries the concrete WHAT BLOCKS bar"
     r_has 'WHAT DOES NOT BLOCK'                 "rendered prompt carries the WHAT DOES NOT BLOCK bar"
     r_has 'FACT-CHECK, NOT A SEVERITY FILTER'   "rendered prompt frames the refutation pass as a fact-check"
     r_has 'never silence'                       "rendered prompt tells the reviewer to re-read, never silence"
     r_has 'nothing you found gets dropped silently' "rendered prompt says findings are never dropped silently"
-    _R_NBF=$(printf '%s\n' "$_RENDERED" | grep -cF 'Non-blocking findings: <one per line')
+    _R_NBF=$(grep -cF 'Non-blocking findings: <one per line' <<<"$_RENDERED")
     if [ "$_R_NBF" -ge 2 ]; then
       ok "rendered prompt has the Non-blocking findings slot in PASS and FAIL templates ($_R_NBF)"
     else
       bad "rendered prompt has the Non-blocking findings slot $_R_NBF time(s), need >=2"
     fi
-    if printf '%s\n' "$_RENDERED" | grep -qF 'DROP it'; then
+    if grep -qF 'DROP it' <<<"$_RENDERED"; then
       bad "rendered prompt still tells the reviewer to DROP findings"
     else
       ok "rendered prompt no longer tells the reviewer to DROP findings"
     fi
   fi
-  rm -rf "$_WORK"
 fi
+rm -rf "$_WORK"
 
 echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"
