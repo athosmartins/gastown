@@ -784,6 +784,20 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     OUT=$(GATE_ABT_RUN_TIMEOUT=12 measure "$C7" "" "$BASE7" "$TIP7" tests/test_huge_newsym.py)
     eq "import error on base + a 40-test file whose full tip run exceeds the budget: measured from a collect-only sample, not the whole file" "$(fstate tests/test_huge_newsym.py)" "fails-on-base"
 
+    echo "  -- cost: the first CONFIRMED failing test is enough, the other candidates are not run --"
+    C8="$H_SCRATCH/case8"; mk_case "$C8" ""; BASE8=$(git -C "$C8" rev-parse HEAD); fix_code "$C8" ""
+    printf 'from lib.mod import double\n\ndef test_a():\n    assert double(2) == 4\n\ndef test_b():\n    assert double(3) == 6\n\ndef test_c():\n    assert double(4) == 8\n' > "$C8/tests/test_three_fail.py"
+    TIP8=$(commit_all "$C8" "fix + three tests that need it")
+    rm -f "$H_SCRATCH/trace8"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace8" measure "$C8" "" "$BASE8" "$TIP8" tests/test_three_fail.py)
+    eq "three tests fail on base -> fails-on-base" "$(fstate tests/test_three_fail.py)" "fails-on-base"
+    eq "...with exactly 3 runs: base (fail-fast), the first candidate alone at tip, the same alone at base (not 7)" "$(wc -l < "$H_SCRATCH/trace8" | tr -d ' ')" "3"
+    C8B="$H_SCRATCH/case8b"; mk_case "$C8B" ""; BASE8B=$(git -C "$C8B" rev-parse HEAD); fix_code "$C8B" ""
+    printf 'import os\nfrom lib.mod import double\n\ndef test_env_a():\n    assert os.path.exists("/definitely/not/here/a")\n\ndef test_env_b():\n    assert os.path.exists("/definitely/not/here/b")\n\ndef test_real():\n    assert double(2) == 4\n' > "$C8B/tests/test_mixed.py"
+    TIP8B=$(commit_all "$C8B" "fix + two env-broken tests and one real one")
+    OUT=$(measure "$C8B" "" "$BASE8B" "$TIP8B" tests/test_mixed.py)
+    eq "candidates that do not pass alone at tip are skipped, and the next one is tried: the real test still decides -> fails-on-base" "$(fstate tests/test_mixed.py)" "fails-on-base"
+
     echo "  -- a rig that is a SUBDIRECTORY of the repo (the gascity layout) --"
     C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"
     BASE3=$(git -C "$C3" rev-parse HEAD); fix_code "$C3" "rig"

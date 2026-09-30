@@ -3109,6 +3109,10 @@ gate_base_test_run_table() {
     esac
     ff_py="--maxfail=$failfast"; ff_js="--bail=$failfast"
   fi
+  # GATE_ABT_TRACE=<file>: one line per sandboxed run (kind, checkout dir name, single test or -). Unset in
+  # production; the selftest sets it to count runs, and it is the first thing to reach for when a measurement
+  # is slower than expected.
+  if [ -n "${GATE_ABT_TRACE:-}" ]; then printf '%s\t%s\t%s\n' "$kind" "${cwd##*/}" "${only:--}" >> "$GATE_ABT_TRACE" 2>/dev/null || true; fi
   real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
   rm -f "$real/outcomes.jsonl" "$real/outcomes.jsonl.part" "$real/vitest.json" 2>/dev/null
   case "$kind" in
@@ -3228,6 +3232,32 @@ _gate_base_test_alone_table() {
   return 0
 }
 
+# _gate_base_test_first_confirmed <kind> <relfile> <base-table> <candidate-ids> [file]  (ga-kisvqp)
+#   Tries the candidate ids in order, at most alone_max of them. Each is run ALONE at tip first — the control:
+#   one that does not PASS there (environment, clock, order) is skipped, never counted — and only then ALONE
+#   at base. The first that passes at tip and fails at base settles the file: prints fails-on-base and the
+#   remaining candidates are never run (each costs a process start on a host where a WA test file takes ~6s
+#   just to import). Otherwise prints unmeasured. With a 5th argument "file" the base run is the WHOLE file
+#   (the file-level collection error must reproduce; see _gate_base_test_alone_table). The verdict for a
+#   candidate is still gate_base_test_file_state's — this only decides how many candidates get paid for.
+#   Reads its caller's locals (dynamic scope): rig tipdir basedir scratch alone_max t0 budget.
+_gate_base_test_first_confirmed() {
+  local kind="$1" relf="$2" B="$3" ids="$4" level="${5-}" res=""
+  res=$(printf '%s\n' "$ids" | {
+    k=0
+    while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      k=$((k + 1))
+      if [ "$k" -gt "$alone_max" ] || [ $((SECONDS - t0)) -ge "$budget" ]; then break; fi
+      at=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$id") || continue
+      printf '%s\n' "$at" | GATE_TID="$id" awk -F'\t' '$1 == ENVIRON["GATE_TID"] && $2 == "pass" { f = 1 } END { exit !f }' || continue
+      ab=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$id" "$level") || continue
+      if [ "$(gate_base_test_file_state "$at" "$B" "$at" "$ab")" = "fails-on-base" ]; then echo "fails-on-base"; break; fi
+    done
+  })
+  if [ "$res" = "fails-on-base" ]; then echo "fails-on-base"; else echo "unmeasured"; fi
+}
+
 # _gate_base_test_measure_one <kind> <relfile> <fullpath>  (ga-kisvqp)
 #   One test file's verdict. Prints "<state> <why> <old>" (three words, "-" when not applicable):
 #     state  fails-on-base | passes-on-base | no-tests | unmeasured   (gate_base_test_file_state)
@@ -3264,20 +3294,13 @@ _gate_base_test_measure_one() {
     # confirmation is the same tests alone at base. The tip table IS the alone-at-tip table: a test that does not
     # pass there (environment, clock, order) is never counted. The classifier is unchanged: it is handed a tip
     # table that holds exactly the candidates.
-    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$F") || AT=""
-    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$F") || AB=""
-    st=$(gate_base_test_file_state "$AT" "$B" "$AT" "$AB")
-    # Base showed failing tests, so the file HAS tests: an empty alone-at-tip table is "could not control", never no-tests.
-    if [ "$st" = "no-tests" ]; then st="unmeasured"; fi
+    st=$(_gate_base_test_first_confirmed "$kind" "$relf" "$B" "$F" "")
   elif [ -n "$lvl" ] && [ "$kind" = "py" ] && F=$(gate_base_test_collect_ids "$kind" "$rig" "$tipdir" "$scratch" "$relf") && [ -n "$F" ]; then
     # (c) The file cannot even be collected on base (typically: it imports a symbol the fix adds — the classic
     # TDD red). The control is a few of ITS tests, listed without running anything and then run ALONE at tip;
     # the confirmation is the whole file failing to load on base again. Same shape as (a), and for the same
     # reason: a big file must not need a full run at tip just to show the tests are sound there.
-    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$F") || AT=""
-    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$F" "file") || AB=""
-    st=$(gate_base_test_file_state "$AT" "$B" "$AT" "$AB")
-    if [ "$st" = "no-tests" ]; then st="unmeasured"; fi
+    st=$(_gate_base_test_first_confirmed "$kind" "$relf" "$B" "$F" "file")
   else
     # (b) No failure on base (a full run), or (c') a collection error the sample above could not control (js, or an
     # unreadable listing): a FULL tip run is the control.
@@ -3292,9 +3315,7 @@ _gate_base_test_measure_one() {
     esac
     D=$(gate_base_test_decisive "$T" "$B")
     if [ -n "$D" ]; then
-      AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D") || AT=""
-      AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$D" "$lvl") || AB=""
-      st=$(gate_base_test_file_state "$T" "$B" "$AT" "$AB")
+      st=$(_gate_base_test_first_confirmed "$kind" "$relf" "$B" "$D" "$lvl")
     else
       st=$(gate_base_test_file_state "$T" "$B")
       if [ "$st" = "passes-on-base" ]; then
