@@ -7,6 +7,6 @@ provider = "claude-rc"
 # script's own header for the staged-rollout rationale.
 pre_start = ["/Users/athos/gt/.gascity-gastown-hq/scripts/claude-credential-preflight.sh"]
 
-option_defaults = { effort = "medium" }
+option_defaults = { effort = "high" }  # ga-ufskhy E2: teste 48h (Athos 29/09 20:5x), voltar a "medium" se não subir a aprovação
 
 suspended = true

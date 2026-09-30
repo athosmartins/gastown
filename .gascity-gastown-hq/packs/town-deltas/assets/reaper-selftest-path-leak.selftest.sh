@@ -19,6 +19,10 @@
 # Fail CLOSED: if the selftest never reaches the reaper, or the reaper never finishes, that is a FAIL, not a
 # green run (an empty sentinel log proves nothing if the reaper did not run).
 #
+# Cost (this test is run by a reviewer with a wall-clock budget, on a box at load ~50): the three probes run IN
+# PARALLEL, and each selftest harness is killed the moment its verdict is in — the verdict needs only the FIRST
+# reaper run of each selftest, so the rest of the selftest (the part that takes minutes) is never waited for and
+# never left running in the background to load the box. LEAK_ONLY=count|sweep|schema-purge runs a single probe.
 # Bound on a slow box: B waits up to LEAK_WAIT_S (default 400) for the reaper to start and again for it to end.
 # LEAK_ASSETS_DIR points the driver at another copy of the selftests (used to replay the pre-fix files).
 set -uo pipefail
@@ -33,14 +37,26 @@ ok()  { PASS=$((PASS+1)); echo "  ok   - $1"; }
 nok() { FAIL=$((FAIL+1)); echo "  FAIL - $1"; [ -n "${2:-}" ] && echo "         $2"; }
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/reaper-path-leak-selftest.XXXXXX")" || exit 1
-HPIDS=""
 kill_tree() {  # kill_tree <pid> — the pid and all its descendants, deepest first (by pid: no pattern kills)
   local c
   for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
   kill "$1" 2>/dev/null
   return 0
 }
-cleanup() { local p; for p in $HPIDS; do kill_tree "$p"; done; sleep 1; rm -rf "$ROOT"; }
+kill_harness() {  # kill_harness <pid> — only if it is STILL a selftest harness: a recycled pid is never touched
+  if ps -o command= -p "${1:-0}" 2>/dev/null | grep -q '[.]selftest[.]sh'; then kill_tree "$1"; fi
+  return 0
+}
+# The probes run in subshells, whose variables the parent cannot see: each records its harness pid in
+# $ROOT/<tag>.hpid (removed once that harness has been killed) and the EXIT trap reaps whatever is left.
+cleanup() {
+  local f p
+  for f in "$ROOT"/*.hpid; do
+    [ -f "$f" ] || continue
+    p="$(cat "$f" 2>/dev/null)"; [ -n "$p" ] && kill_harness "$p"
+  done
+  sleep 1; rm -rf "$ROOT"
+}
 trap cleanup EXIT
 
 # ══ A: the helper in isolation ═══════════════════════════════════════════════════════════════════════════
@@ -102,7 +118,7 @@ leak_probe() {
   # SLOW_RE/SLOW_S: the harnesses that support it hold the reaper's first statement for a few seconds, so the
   # stub dir is deleted while the reaper is demonstrably mid-run (the others are simply fast enough to race it).
   ( cd "$ASSETS" && exec env TMPDIR="$W" PATH="$SENT:$PATH" SLOW_RE='SHOW DATABASES' SLOW_S=6 /bin/bash "$st" >"$ROOT/$tag.out" 2>&1 ) &
-  hpid=$!; HPIDS="$HPIDS $hpid"
+  hpid=$!; echo "$hpid" > "$ROOT/$tag.hpid"
   t0=$SECONDS; main=""
   while [ $((SECONDS - t0)) -lt "$LEAK_WAIT_S" ]; do
     main="$(reaper_main_pid "$W")" && [ -n "$main" ] && break
@@ -134,9 +150,26 @@ leak_probe() {
 }
 
 echo "B: the reaper selftests, stub dir deleted under a running reaper"
-for pair in "count:reaper-orphan-count.selftest.sh" "sweep:reaper-orphan-sweep.selftest.sh" "schema-purge:reaper-schema-purge.selftest.sh"; do
+PAIRS="count:reaper-orphan-count.selftest.sh sweep:reaper-orphan-sweep.selftest.sh schema-purge:reaper-schema-purge.selftest.sh"
+RAN=0
+for pair in $PAIRS; do   # launch: one background probe per selftest; each writes its verdict to $ROOT/<tag>.result
   tag="${pair%%:*}"; st="${pair#*:}"
-  leak_probe "$tag" "$st"
+  case "${LEAK_ONLY:-}" in ""|"$tag") ;; *) continue ;; esac
+  RAN=$((RAN+1))
+  (
+    leak_probe "$tag" "$st"
+    # the verdict is in: stop the harness NOW, its remaining minutes of selftest prove nothing here
+    hp="$(cat "$ROOT/$tag.hpid" 2>/dev/null)"; [ -n "$hp" ] && kill_harness "$hp"; rm -f "$ROOT/$tag.hpid"
+    printf '%s\n%s\n' "$PROBE_RESULT" "$PROBE_WHY" > "$ROOT/$tag.result"
+  ) &
+done
+[ "$RAN" -gt 0 ] || nok "B0 LEAK_ONLY='${LEAK_ONLY:-}' matches no probe (count | sweep | schema-purge) — nothing was tested"
+wait
+for pair in $PAIRS; do   # report in a fixed order; a probe that left no verdict is a FAIL, never a silent pass
+  tag="${pair%%:*}"; st="${pair#*:}"
+  case "${LEAK_ONLY:-}" in ""|"$tag") ;; *) continue ;; esac
+  PROBE_RESULT="$(sed -n 1p "$ROOT/$tag.result" 2>/dev/null)"; PROBE_WHY="$(sed -n 2p "$ROOT/$tag.result" 2>/dev/null)"
+  [ -n "$PROBE_RESULT" ] || { PROBE_RESULT=nok; PROBE_WHY="the probe left no verdict (its subshell died)"; }
   if [ "$PROBE_RESULT" = ok ]; then
     ok "B-$tag $st: no gc/bd call escaped after the stub dir vanished mid-run"
   else

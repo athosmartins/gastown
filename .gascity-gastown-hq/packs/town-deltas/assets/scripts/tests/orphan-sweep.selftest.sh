@@ -39,8 +39,8 @@ RESET_LOG="$WORK/reset.log"
 FAKE_GC_DIR="$WORK/bin"
 mkdir -p "$FAKE_GC_DIR"
 ln -s "$SELF_DIR/orphan-sweep.fake-gc" "$FAKE_GC_DIR/gc"
-# ga-ck3sz7: the sweep runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh): $FAKE_GC_DIR, a dir holding only
-# a symlink to `jq`, and the system dirs. This used to be "$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" — and the real
+# ga-ck3sz7: the sweep runs on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh): $FAKE_GC_DIR (which holds the fake
+# `gc`), $WORK/tools (a symlink to `jq`) and the system dirs. This used to be "$FAKE_GC_DIR:/opt/homebrew/bin:/usr/bin:/bin" — and the real
 # gc and bd live in /opt/homebrew/bin, so the moment $WORK went away under a running sweep `gc` resolved to the REAL one
 # (the real gc would have answered `gc session list` / `gc bd update` in place of the fake).
 . "$SELF_DIR/../../selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/../../selftest-sandbox-path.lib.sh" >&2; exit 2; }
