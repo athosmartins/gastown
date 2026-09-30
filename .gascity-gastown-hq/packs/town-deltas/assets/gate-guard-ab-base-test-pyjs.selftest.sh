@@ -505,6 +505,23 @@ PY
     gate_base_test_run_table rb "$RIG" "$RIG" "$RS" tests/test_many.py >/dev/null; eq "an unknown kind -> status 1" "$?" "1"
     gate_base_test_run_table py "$RIG" "$RIG/no-such-dir" "$RS" tests/test_many.py >/dev/null; eq "a cwd that does not exist -> status 1" "$?" "1"
     gate_base_test_run_table py "$RIG" "$RIG" "$RS" "" >/dev/null; eq "an empty test file -> status 1" "$?" "1"
+    # Node ids WITHOUT running anything: the cheap way to get a control sample from a file too slow to run in full.
+    if type gate_base_test_collect_ids >/dev/null 2>&1; then
+      IDS=$(gate_base_test_collect_ids py "$RIG" "$RIG" "$RS" tests/test_many.py); RC=$?
+      eq "collect-only lists every node id, parametrised ids with spaces intact (status 0)" "$RC" "0"
+      eq "...exactly the five tests, in file order" "$IDS" "$(printf 'tests/test_many.py::test_pass\ntests/test_many.py::test_fail\ntests/test_many.py::test_skip\ntests/test_many.py::test_param[a b]\ntests/test_many.py::test_param[c]')"
+      eq "nothing was executed: no test ran (a failing test is listed, not run)" "$(GATE_ABT_SAMPLE=2 gate_base_test_collect_ids py "$RIG" "$RIG" "$RS" tests/test_many.py | wc -l | tr -d ' ')" "2"
+      OUT=$(gate_base_test_collect_ids py "$RIG" "$RIG" "$RS" tests/test_zero.py); RC=$?
+      eq "a file with no tests is a readable EMPTY list (status 0, nothing printed)" "$RC/$OUT" "0/"
+      OUT=$(gate_base_test_collect_ids py "$RIG" "$RIG" "$RS" tests/test_collect.py); RC=$?
+      eq "a file that cannot be imported -> status 1 and no ids (unreadable, never 'no tests')" "$RC/$OUT" "1/"
+      OUT=$(gate_base_test_collect_ids py "$RIG" "$RIG" "$RS" tests/does_not_exist.py); RC=$?
+      eq "a file that does not exist -> status 1" "$RC/$OUT" "1/"
+      gate_base_test_collect_ids js "$RIG" "$RIG" "$RS" tests-js/a.test.js >/dev/null; eq "js is not supported -> status 1 (the caller falls back to a full run)" "$?" "1"
+      gate_base_test_collect_ids py "$H_SCRATCH/rig-novenv" "$RIG" "$RS" tests/test_many.py >/dev/null; eq "a rig with no usable interpreter -> status 1" "$?" "1"
+    else
+      bad "gate_base_test_collect_ids not defined"
+    fi
     # Fail-fast: stop after N failures. The table then holds exactly those failures and is NOT a full run.
     printf 'import pytest\n\n@pytest.mark.parametrize("i", range(6))\ndef test_bad(i):\n    assert False\n' > "$RIG/tests/test_manyfail.py"
     T=$(gate_base_test_run_table py "$RIG" "$RIG" "$RS" tests/test_manyfail.py "" 2)
@@ -759,6 +776,13 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     TIP6=$(commit_all "$C6" "fix + huge test")
     OUT=$(GATE_ABT_RUN_TIMEOUT=12 measure "$C6" "" "$BASE6" "$TIP6" tests/test_huge.py)
     eq "a 40-test file whose FULL run at tip exceeds the budget is still measured: fails-on-base from 3 failing tests, never the whole file" "$(fstate tests/test_huge.py)" "fails-on-base"
+
+    echo "  -- a file that cannot even be imported on base, too slow to run in full at tip: sampled control --"
+    C7="$H_SCRATCH/case7"; mk_case "$C7" ""; BASE7=$(git -C "$C7" rev-parse HEAD); fix_code "$C7" ""
+    printf 'import time\nimport pytest\nfrom lib.mod import double, triple   # triple exists only WITH the fix\n\n@pytest.mark.parametrize("i", range(40))\ndef test_x(i):\n    time.sleep(0.5)   # a full run at tip takes ~20s\n    assert double(2) == 4 and triple(1) == 3\n' > "$C7/tests/test_huge_newsym.py"
+    TIP7=$(commit_all "$C7" "fix + huge test that imports a new symbol")
+    OUT=$(GATE_ABT_RUN_TIMEOUT=12 measure "$C7" "" "$BASE7" "$TIP7" tests/test_huge_newsym.py)
+    eq "import error on base + a 40-test file whose full tip run exceeds the budget: measured from a collect-only sample, not the whole file" "$(fstate tests/test_huge_newsym.py)" "fails-on-base"
 
     echo "  -- a rig that is a SUBDIRECTORY of the repo (the gascity layout) --"
     C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"

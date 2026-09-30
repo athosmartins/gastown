@@ -3158,6 +3158,36 @@ gate_base_test_run_table() {
   esac
 }
 
+# gate_base_test_collect_ids <kind> <rig> <cwd> <scratch> <relfile>  (ga-kisvqp)
+#   The node ids of a pytest file, listed WITHOUT running a single test (pytest --collect-only, inside the
+#   sandbox): at most GATE_ABT_SAMPLE (default 5), one per line, in file order. It exists so a control can
+#   be taken from a file that is too slow to run in full — a few of its tests run alone are enough to show
+#   the tests are sound at tip — without paying for the other 165. Status 0 with nothing printed = the file
+#   was read and holds no tests; status 1, nothing printed = it could not be read (a collection error, a
+#   missing file, no interpreter, a budget overrun, a bad GATE_ABT_SAMPLE) — never the same as "no tests".
+#   pytest only: a js file returns status 1 and the caller falls back to a full run.
+gate_base_test_collect_ids() {
+  local kind="${1-}" rig="${2-}" cwd="${3-}" scratch="${4-}" rel="${5-}"
+  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" n="${GATE_ABT_SAMPLE:-5}" rc=0 real="" interp="" out=""
+  if [ "$kind" != "py" ]; then return 1; fi
+  if [ -z "$rig" ] || [ -z "$rel" ] || [ ! -d "$cwd" ] || [ ! -d "$scratch" ]; then return 1; fi
+  case "$n" in
+    (''|*[!0-9]*|0) return 1 ;;
+  esac
+  real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
+  interp=$(gate_base_test_py_interp "$rig") || return 1
+  gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$interp" -m pytest -p no:cacheprovider -p no:randomly -p no:xdist \
+    -o addopts= --collect-only -q --color=no "$rel" && rc=0 || rc=$?
+  case "$rc" in
+    (0|5) ;;
+    (*) return 1 ;;
+  esac
+  # node-id lines only: the ones that START with "<relfile>::" (the summary and any warning lines do not)
+  out=$(GATE_P="${rel}::" awk 'index($0, ENVIRON["GATE_P"]) == 1' "$real/run.log" 2>/dev/null | head -n "$n") || true
+  if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+  return 0
+}
+
 # _gate_base_test_alone_table <kind> <rig> <cwd> <scratch> <relfile> <ids> [file]  (ga-kisvqp)
 #   Runs each id in <ids> (one per line) ALONE and prints ONE outcome table holding, for each run,
 #   only the row of the test that was asked for (plus any collect-error row: the file never loaded).
@@ -3209,8 +3239,10 @@ _gate_base_test_alone_table() {
 #     (a) some tests FAIL on base: those few are re-run ALONE at tip (the control — a test that does not
 #         pass there is never counted) and ALONE at base (the confirmation). No full run of the file at tip
 #         is needed, so a huge file costs seconds, not minutes.
-#     (b) no failure on base (a full run), or (c) a collection error: a FULL run at tip is the control
-#         (a file that is not green there measures nothing). If EVERY tip-passing test passes at base, each
+#     (c) a collection error on base (pytest): the tip's node ids are LISTED without running them and a few
+#         run alone at tip are the control; the confirmation is the whole file failing to load on base again.
+#     (b) no failure on base (a full run), or a collection error that (c) could not sample (js): a FULL run
+#         at tip is the control (a file that is not green there measures nothing). If EVERY tip-passing test passes at base, each
 #         is then run ALONE at base before the file may be called passes-on-base: a test that passes in the
 #         file run only on state a sibling leaked — and fails on its own — does depend on the fix, and
 #         refusing it would be refusing a good test. More tip-passing tests than
@@ -3237,8 +3269,18 @@ _gate_base_test_measure_one() {
     st=$(gate_base_test_file_state "$AT" "$B" "$AT" "$AB")
     # Base showed failing tests, so the file HAS tests: an empty alone-at-tip table is "could not control", never no-tests.
     if [ "$st" = "no-tests" ]; then st="unmeasured"; fi
+  elif [ -n "$lvl" ] && [ "$kind" = "py" ] && F=$(gate_base_test_collect_ids "$kind" "$rig" "$tipdir" "$scratch" "$relf") && [ -n "$F" ]; then
+    # (c) The file cannot even be collected on base (typically: it imports a symbol the fix adds — the classic
+    # TDD red). The control is a few of ITS tests, listed without running anything and then run ALONE at tip;
+    # the confirmation is the whole file failing to load on base again. Same shape as (a), and for the same
+    # reason: a big file must not need a full run at tip just to show the tests are sound there.
+    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$F") || AT=""
+    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$F" "file") || AB=""
+    st=$(gate_base_test_file_state "$AT" "$B" "$AT" "$AB")
+    if [ "$st" = "no-tests" ]; then st="unmeasured"; fi
   else
-    # (b) No failure on base (a full run) or (c) a collection error: a FULL tip run is the control.
+    # (b) No failure on base (a full run), or (c') a collection error the sample above could not control (js, or an
+    # unreadable listing): a FULL tip run is the control.
     if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
     T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
     # A control that is not green (nothing passes, or the file did not load) cannot support either answer, and a
