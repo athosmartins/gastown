@@ -2845,6 +2845,168 @@ gate_base_test_sandbox_ok() {
   return 0
 }
 
+# gate_base_test_parse_pytest <jsonl-file>  (ga-kisvqp)
+#   The outcome table (see _gate_base_test_classify) for one pytest run, read from the file the
+#   gate_basetest_outcomes plugin wrote. The plugin writes the file ONCE, at session end, through
+#   a rename, and closes it with a {"end": true} line — so a pytest killed by the timeout, a
+#   crash before sessionfinish, or a half-written file all leave NO end line, and this returns 1
+#   with no output: an unreadable run must never read as "zero tests" (a readable, genuinely
+#   empty run is "#ok" alone). Also 1 for a missing/empty path, invalid JSON, or rows after the
+#   sentinel. Needs jq (the guard already does).
+gate_base_test_parse_pytest() {
+  local f="${1-}" out=""
+  if [ -z "$f" ] || [ ! -f "$f" ]; then return 1; fi
+  out=$(jq -r -s '
+    if (length == 0) or ((.[-1] | type) != "object") or (.[-1].end != true) then empty
+    elif ([ .[:-1][] | select(type != "object" or has("end")) ] | length) > 0 then empty
+    else ("#ok", (.[:-1][] | [.id, .o] | @tsv)) end' "$f" 2>/dev/null) || return 1
+  if [ -z "$out" ]; then return 1; fi
+  printf '%s\n' "$out"
+  return 0
+}
+
+# gate_base_test_parse_vitest <json-file> <relfile>  (ga-kisvqp)
+#   The outcome table for ONE test file out of a vitest --reporter=json report. Ids are
+#   "<relfile>::<fullName>" (relative, so the base and tip trees — which live at different
+#   absolute paths — produce the same ids). Statuses: passed -> pass, failed -> fail,
+#   skipped/pending/todo/disabled -> skip; any OTHER word is passed through untouched, so the
+#   classifier rejects the table instead of this mapping it to pass. A suite that failed before
+#   any test ran — and one that failed although every test passed (a beforeAll/afterAll error) —
+#   contributes a collect-error row keyed by <relfile>: the file did not run cleanly.
+#   The file is selected by "ends with /<relfile>" so ab.test.js is never read as a.test.js.
+#   Status 1, no output, when the report is missing/invalid, has no testResults array, or does
+#   not mention <relfile> at all (vitest never ran it: unmeasured, not "no tests").
+gate_base_test_parse_vitest() {
+  local json="${1-}" rel="${2-}" out=""
+  if [ -z "$json" ] || [ -z "$rel" ] || [ ! -f "$json" ]; then return 1; fi
+  out=$(jq -r --arg rel "$rel" '
+    def word: if . == "passed" then "pass"
+              elif . == "failed" then "fail"
+              elif (. == "skipped" or . == "pending" or . == "todo" or . == "disabled") then "skip"
+              else . end;
+    if (.testResults | type) != "array" then empty
+    else
+      [ .testResults[] | select((.name // "") | endswith("/" + $rel)) ] as $f
+      | if ($f | length) == 0 then empty
+        else ("#ok",
+          ($f[]
+           | ((.assertionResults // []) as $a
+              | ($a[] | [$rel + "::" + .fullName, (.status | word)] | @tsv),
+                (if .status == "failed" and ([ $a[] | select(.status == "failed") ] | length) == 0
+                 then ([$rel, "collect-error"] | @tsv) else empty end))))
+        end
+    end' "$json" 2>/dev/null) || return 1
+  if [ -z "$out" ]; then return 1; fi
+  printf '%s\n' "$out"
+  return 0
+}
+
+# _gate_base_test_timeout_bin  (ga-kisvqp)
+#   Prints the path of GNU timeout (`timeout`, else Homebrew's `gtimeout`); status 1 when neither
+#   exists. Resolved to a path because the sandboxed child runs with a scrubbed PATH.
+_gate_base_test_timeout_bin() {
+  local t=""
+  t=$(command -v timeout 2>/dev/null) || t=$(command -v gtimeout 2>/dev/null) || return 1
+  printf '%s' "$t"
+}
+
+# gate_base_test_py_interp <rig>  (ga-kisvqp)
+#   The python the RIG's pytest tests run under: <rig>/venv/bin/python, else <rig>/.venv/bin/python
+#   — but only one that can actually `import pytest`. Prints its path; status 1, nothing printed,
+#   when there is none. No fallback to whatever python3 is on PATH, on purpose: measured on this
+#   host, the CommandLineTools and Homebrew python3 have no pytest, so a PATH guess would report
+#   every test as a collection error — "I have no interpreter" reading as "the test fails on
+#   base". A rig with no venv is simply unmeasured for pytest.
+gate_base_test_py_interp() {
+  local rig="${1-}" cand="" tbin="" ok=1
+  if [ -z "$rig" ]; then return 1; fi
+  tbin=$(_gate_base_test_timeout_bin) || tbin=""
+  for cand in "$rig/venv/bin/python" "$rig/.venv/bin/python"; do
+    [ -x "$cand" ] || continue
+    if [ -n "$tbin" ]; then
+      env -i PATH=/usr/bin:/bin "$tbin" 30 "$cand" -c 'import pytest' >/dev/null 2>&1 && ok=0 || ok=1
+    else
+      env -i PATH=/usr/bin:/bin "$cand" -c 'import pytest' >/dev/null 2>&1 && ok=0 || ok=1
+    fi
+    if [ "$ok" -eq 0 ]; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
+}
+
+# gate_base_test_sandbox_exec <scratch> <secs> <cwd> <cmd> [args...]  (ga-kisvqp)
+#   Runs <cmd> in <cwd> under the gate_base_test_sandbox_profile sandbox, with a SCRUBBED
+#   environment (env -i: none of the guard's tokens reach builder-authored test code), HOME and
+#   TMPDIR pointed into <scratch>, a fixed git identity, no bytecode writes, and a <secs> budget
+#   (then SIGTERM, and SIGKILL 5s later). Output goes to <scratch>/run.log. Returns the command's
+#   own status (124 = budget exceeded), or 97 when it could NOT be run safely — no scratch/cwd,
+#   no sandbox-exec, no timeout binary, an unbuildable profile, a non-numeric budget: the command
+#   is then not started at all, never started unsandboxed. 97 is outside what pytest, vitest and
+#   timeout return, so a caller cannot mistake "not run" for a result.
+#   <scratch>/plugin is put on PYTHONPATH (the pytest outcome plugin is copied there).
+gate_base_test_sandbox_exec() {
+  local scratch="${1-}" secs="${2-}" cwd="${3-}" real="" prof="" tbin="" rc=0
+  local sbx="${GATE_ABT_SANDBOX_EXEC:-/usr/bin/sandbox-exec}"
+  shift 3 2>/dev/null || return 97
+  if [ -z "$scratch" ] || [ ! -d "$scratch" ] || [ -z "$cwd" ] || [ ! -d "$cwd" ] || [ ! -x "$sbx" ] || [ "$#" -lt 1 ]; then
+    return 97
+  fi
+  case "$secs" in
+    (''|*[!0-9]*) return 97 ;;
+  esac
+  real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 97
+  prof=$(gate_base_test_sandbox_profile "$real" "${HOME:-}") || return 97
+  tbin=$(_gate_base_test_timeout_bin) || return 97
+  mkdir -p "$real/home" "$real/tmp" "$real/plugin" 2>/dev/null || return 97
+  ( cd "$cwd" 2>/dev/null && exec "$tbin" -k 5 "$secs" env -i \
+      PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
+      HOME="$real/home" TMPDIR="$real/tmp" LANG=en_US.UTF-8 \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$real/plugin" GATE_BT_OUTCOMES="$real/outcomes.jsonl" \
+      CI=1 NO_COLOR=1 GIT_CONFIG_NOSYSTEM=1 \
+      GIT_AUTHOR_NAME=gate-basetest GIT_AUTHOR_EMAIL=gate-basetest@invalid \
+      GIT_COMMITTER_NAME=gate-basetest GIT_COMMITTER_EMAIL=gate-basetest@invalid \
+      "$sbx" -p "$prof" "$@" ) >"$real/run.log" 2>&1 && rc=0 || rc=$?
+  return "$rc"
+}
+
+# gate_base_test_run_table <kind> <rig> <cwd> <scratch> <relfile> [<only>]  (ga-kisvqp)
+#   Runs ONE test file (or, with <only>, ONE test of it) in the sandbox and prints its outcome
+#   table (see _gate_base_test_classify). <cwd> is the directory the tests run from (the rig's
+#   directory inside a checkout — base or tip), <relfile> the test file relative to it, <rig> the
+#   REAL rig path that owns the interpreter / node_modules. Status 1, nothing printed, for every
+#   way the run did not produce a table that can be trusted: not runnable (see
+#   gate_base_test_sandbox_exec), no interpreter, a budget overrun, an exit status that is not one
+#   of the ordinary "tests ran" ones, or a result file that does not parse. The budget is
+#   GATE_ABT_RUN_TIMEOUT seconds (default 90).
+#   kind py: pytest of the rig's venv. Plugin-recorded outcomes, cache/random/xdist plugins off
+#            and ini addopts neutralised so the run is the same on every tree and host. Exit
+#            statuses 0 (all passed) 1 (some failed) 2 (collection error) 5 (none collected) count
+#            as "ran"; 3 (internal error) and 4 (usage error) do not.
+#   <only> for py is a pytest node id ("tests/t.py::test_a[x]"), for js the test's full name.
+gate_base_test_run_table() {
+  local kind="${1-}" rig="${2-}" cwd="${3-}" scratch="${4-}" rel="${5-}" only="${6-}"
+  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" rc=0 real="" interp="" here=""
+  if [ -z "$kind" ] || [ -z "$rig" ] || [ -z "$rel" ] || [ ! -d "$cwd" ] || [ ! -d "$scratch" ]; then return 1; fi
+  real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
+  rm -f "$real/outcomes.jsonl" "$real/outcomes.jsonl.part" "$real/vitest.json" 2>/dev/null
+  case "$kind" in
+    (py)
+      interp=$(gate_base_test_py_interp "$rig") || return 1
+      here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      mkdir -p "$real/plugin" 2>/dev/null || return 1
+      cp "$here/gate_basetest_outcomes.py" "$real/plugin/" 2>/dev/null || return 1
+      gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$interp" -m pytest \
+        -p gate_basetest_outcomes -p no:cacheprovider -p no:randomly -p no:xdist -o addopts= \
+        -q --tb=no --color=no "${only:-$rel}" && rc=0 || rc=$?
+      case "$rc" in
+        (0|1|2|5) ;;
+        (*) return 1 ;;
+      esac
+      gate_base_test_parse_pytest "$real/outcomes.jsonl"
+      ;;
+    (*) return 1 ;;
+  esac
+}
+
 # gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'> <its-diagnostic>
 #   ga-7dx2vw: what ONE `/bin/bash -n` run means. The parser gives TWO signals —
 #   an exit status and a diagnostic (stderr) — and the verdict has to come from
