@@ -28,7 +28,8 @@
 # T5: shebang-only change -> still flagged (a restart is the only way a running
 #    process picks up a different interpreter).
 # T6: new version does not parse -> still flagged (cannot tell).
-# T7: brand-new lib file (no old blob) -> still flagged.
+# T7: brand-new lib file (no old blob) -> still flagged. The daemon file is
+#    byte-identical across the deploy, so the ADDED lib is the only changed path.
 # T8 (per-daemon precision, the incident's own shape): two daemons, one imports
 #    only the comment-only file, the other a really-changed file -> only the
 #    second is GUARDED.
@@ -36,6 +37,25 @@
 #    the comment-only file too: a label whose OWN window since its last-clean
 #    point contains only the comment-only edit is downgraded, not re-halted.
 # T10: mode-only change (chmod +x, same bytes) -> still flagged.
+# T11: DELETED lib file (no new blob), daemon file unchanged -> still flagged.
+# T12: lib path whose blob is unreadable on BOTH sides (a gitlink) -> still flagged.
+# T13: comment-only edit on a file over the 2 MiB cap -> still flagged.
+# T14: the classifier itself fails (T1's exact fixture) -> the raw list is kept,
+#    the delivery is still flagged, and the failure is logged.
+# T15: same for the per-daemon narrowing path (T9's exact fixture): a failed
+#    classifier must not downgrade the label, and the failure must be logged.
+#
+# HOW THESE TESTS ARE HELD TO ACCOUNT (gate ga-w1cl44): a keep-case is only worth
+# having if it FAILS when the branch that keeps the file is inverted; a keep-case
+# whose fixture also changes something else passes through that other change
+# (the first T7 did — it rewrote the daemon's own import as well). So (1) each
+# case asserts its premise — the deploy diff is exactly the path under test — and
+# (2) each "could not tell -> keep" branch of cosmetic_py_classify was mutated to
+# "drop" on a copy of the script and the suite re-run: added -> T7, deleted ->
+# T11, both blobs unreadable -> T12, oversize -> T13, shebang -> T5, unparsable ->
+# T6, mode-only (identical bytes) -> T10, docstring -> T4, classifier failure ->
+# T14/T15, narrowing -> T9. T14/T15 reuse the T1/T9 fixtures byte for byte, so the
+# ONLY variable is whether the classifier works.
 
 # No `pipefail` at file level (ga-uel7sb): assertions below are `X | grep ...`
 # pipes; under pipefail an early-exiting reader can SIGPIPE the writer and turn
@@ -137,8 +157,25 @@ commit_at() {  # commit_at <epoch> <message>
   GIT_AUTHOR_DATE="@$1" GIT_COMMITTER_DATE="@$1" git -C "$RUNTIME" commit -q -m "$2"
 }
 
-# invoke_helper <pre_sha> <post_sha>   (DAEMON_BASELINE_OVERRIDES read from env)
+# commit_index_at <epoch> <message>: commit the index AS IS. commit_at's `add -A`
+# would drop a gitlink staged with update-index (its path is not in the worktree).
+commit_index_at() {
+  GIT_AUTHOR_DATE="@$1" GIT_COMMITTER_DATE="@$1" git -C "$RUNTIME" commit -q -m "$2"
+}
+
+# only_changed <label> <pre> <post> <path>: the case's PREMISE — the deploy diff
+# is exactly <path>. A keep-case whose fixture also changes another file (the
+# daemon's own, say) is flagged through that file whatever the classifier does
+# with <path>, and passes without testing anything (gate ga-w1cl44, first T7).
+only_changed() {
+  local got; got="$(git -C "$RUNTIME" diff --name-only "$2" "$3")"
+  [ "$got" = "$4" ] && ok "$1 premise: the deploy diff is exactly $4" \
+    || nok "$1 premise: the deploy diff is not just $4" "got [$got]"
+}
+
+# invoke_helper <pre_sha> <post_sha>   (DAEMON_BASELINE_OVERRIDES, HELPER_PATH read from env)
 invoke_helper() {
+  PATH="${HELPER_PATH:-$PATH}" \
   MOCK_DIR="$MOCK" \
   RUNTIME_DIR="$RUNTIME" \
   PRE_DEPLOY_SHA="$1" POST_DEPLOY_SHA="$2" \
@@ -154,6 +191,19 @@ invoke_helper() {
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/daemon-refresh-comment-only.XXXXXX")"
 trap 'rm -rf "$TMP_ROOT"' EXIT
+
+# A python3 that fails ONLY when daemon-refresh.sh runs its cosmetic classifier
+# (`python3 - <pre> <post>` with COSMETIC_CHANGED in the environment) and defers
+# to the real one for everything else. Put it first on PATH with HELPER_PATH.
+REAL_PY3="$(command -v python3)"
+FAILING_CLASSIFIER_DIR="$TMP_ROOT/failing-classifier"
+mkdir -p "$FAILING_CLASSIFIER_DIR"
+cat > "$FAILING_CLASSIFIER_DIR/python3" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "-" ] && [ -n "\${COSMETIC_CHANGED+x}" ]; then exit 1; fi
+exec "$REAL_PY3" "\$@"
+EOF
+chmod +x "$FAILING_CLASSIFIER_DIR/python3"
 
 NOW=$(date +%s)
 CHANGE_EPOCH=$((NOW - 300))
@@ -181,6 +231,7 @@ run_lib_case() {
   printf '%s' "$v2" > "$RUNTIME/lib/human_name_guard.py"
   commit_at "$CHANGE_EPOCH" "lib change"
   C1=$(git -C "$RUNTIME" rev-parse HEAD)
+  only_changed "$(echo "$name" | tr a-z A-Z)" "$C0" "$C1" lib/human_name_guard.py
   OUT=$(invoke_helper "$C0" "$C1"); RC=$?
   V=$(field VERDICT "$OUT"); P=$(field PROOF "$OUT"); G=$(field GUARDED "$OUT")
 }
@@ -188,7 +239,7 @@ run_lib_case() {
 # ════════════════════════════════════════════════════════════════════════════
 # T1: the incident — comment-only edit to an imported lib
 # ════════════════════════════════════════════════════════════════════════════
-run_lib_case t1 '# guard for human names
+COMMENT_ONLY_V2='# guard for human names
 # wa-rhfeg: comentario novo explicando a lista abaixo,
 # em varias linhas, sem mudar uma unica instrucao.
 SEMPTY = ("sem nome", "")  # trailing comment too
@@ -199,6 +250,7 @@ def guard():
     x = {"a": 1}
     return x["a"]
 '
+run_lib_case t1 "$COMMENT_ONLY_V2"
 [ "$RC" -eq 0 ] && ok "T1 exit 0 — a comment-only lib edit does not hold the delivery" \
   || nok "T1 exit" "rc=$RC verdict=$V guarded=[$G]"
 [ "$V" = "OK" ] && ok "T1 verdict OK (got '$V')" || nok "T1 verdict" "got '$V' out=[$OUT]"
@@ -206,7 +258,10 @@ def guard():
   || nok "T1 proof" "got '$P'"
 [ -z "${G// /}" ] && ok "T1 GUARDED empty — the stale sensitive daemon is not flagged" \
   || nok "T1 guarded" "[$G]"
-grep -q 'comment/format-only' "$CASE_DIR/stderr.log" \
+# Anchored on the drop line itself: 'comment/format-only' ALSO appears in the
+# classifier-failure WARN and in the early-OK line, so matching it could not tell
+# a real drop from a failed classifier.
+grep -q 'ignoring [0-9]* python file' "$CASE_DIR/stderr.log" \
   && ok "T1 the drop is logged (a hidden filter that changes a verdict must be visible)" \
   || nok "T1 log" "$(tail -5 "$CASE_DIR/stderr.log")"
 
@@ -277,6 +332,7 @@ C0=$(git -C "$RUNTIME" rev-parse HEAD)
 printf '#!/usr/bin/python3\n%s' "$LIB_V1" > "$RUNTIME/lib/human_name_guard.py"
 commit_at "$CHANGE_EPOCH" "shebang"
 C1=$(git -C "$RUNTIME" rev-parse HEAD)
+only_changed T5 "$C0" "$C1" lib/human_name_guard.py
 OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T5 shebang-only change stays flagged" \
   || nok "T5" "rc=$RC verdict=$V out=[$OUT]"
@@ -293,21 +349,27 @@ def guard(:
 
 # ════════════════════════════════════════════════════════════════════════════
 # T7: brand-new lib file (no old blob) stays flagged
+#   The daemon file is BYTE-IDENTICAL at C0 and C1 — it already imports
+#   lib.new_guard at C0, where the module does not exist yet — so the ADDED
+#   lib/new_guard.py is the only changed path and the daemon can only be flagged
+#   because the classifier KEPT it. (The first version of this test also rewrote
+#   the daemon's import at C1: a real AST change to the daemon's own entrypoint
+#   flagged it whatever the classifier did with the lib, so a classifier that
+#   dropped every added file left the suite green — gate ga-w1cl44.)
 # ════════════════════════════════════════════════════════════════════════════
 new_case t7
-printf '%s' "$LIB_V1" > "$RUNTIME/lib/other_guard.py"
-add_daemon central_sender human_name_guard 4001
-printf '%s' "$LIB_V1" > "$RUNTIME/lib/human_name_guard.py"
+add_daemon central_sender new_guard 4001
 commit_at $((CHANGE_EPOCH - 7200)) base
 C0=$(git -C "$RUNTIME" rev-parse HEAD)
-# the daemon now imports a lib module that did not exist at C0
-printf 'from lib.new_guard import guard\nprint(guard())\n' > "$RUNTIME/daemons/central_sender.py"
 printf '%s' "$LIB_V1" > "$RUNTIME/lib/new_guard.py"
 commit_at "$CHANGE_EPOCH" "new lib file"
 C1=$(git -C "$RUNTIME" rev-parse HEAD)
-OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT")
+only_changed T7 "$C0" "$C1" lib/new_guard.py
+OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT"); G=$(field GUARDED "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T7 added file stays flagged" \
   || nok "T7" "rc=$RC verdict=$V out=[$OUT]"
+echo "$G" | grep -q 'com.test.central-sender' && ok "T7 GUARDED names the daemon that imports the added file" \
+  || nok "T7 guarded" "[$G]"
 
 # ════════════════════════════════════════════════════════════════════════════
 # T8: per-daemon precision — only the daemon importing the REAL change is flagged
@@ -341,29 +403,33 @@ echo "$G" | grep -q 'com.test.central-sender' \
 #   downgrade it — which it can only do if the narrow set drops the comment-only
 #   file too.
 # ════════════════════════════════════════════════════════════════════════════
-new_case t9
-printf '%s' "$LIB_V1" > "$RUNTIME/lib/cosmetic_guard.py"
-printf '%s' "$LIB_V1" > "$RUNTIME/lib/real_guard.py"
-printf 'from lib.cosmetic_guard import guard\nfrom lib.real_guard import guard as g2\nprint(guard(), g2())\n' \
-  > "$RUNTIME/daemons/central_sender.py"
-cat > "$RUNTIME/launchd/central_sender-wrapper.sh" <<EOF
+# run_narrowing_case <case-name> -> sets OUT RC V G  (T9's scenario, reused by T15)
+run_narrowing_case() {
+  new_case "$1"
+  printf '%s' "$LIB_V1" > "$RUNTIME/lib/cosmetic_guard.py"
+  printf '%s' "$LIB_V1" > "$RUNTIME/lib/real_guard.py"
+  printf 'from lib.cosmetic_guard import guard\nfrom lib.real_guard import guard as g2\nprint(guard(), g2())\n' \
+    > "$RUNTIME/daemons/central_sender.py"
+  cat > "$RUNTIME/launchd/central_sender-wrapper.sh" <<EOF
 #!/usr/bin/env bash
 exec "\$BASEDIR/venv/bin/python3" "\$BASEDIR/daemons/central_sender.py"
 EOF
-make_plist "$AGENTS" com.test.central-sender /bin/bash "$RUNTIME/launchd/central_sender-wrapper.sh"
-commit_at $((CHANGE_EPOCH - 7200)) base
-C0=$(git -C "$RUNTIME" rev-parse HEAD)
-sed 's/return x\["a"\]/return x["a"] * 2/' <<<"$LIB_V1" > "$RUNTIME/lib/real_guard.py"
-commit_at $((CHANGE_EPOCH - 600)) "real change"
-C1=$(git -C "$RUNTIME" rev-parse HEAD)
-printf '# only a comment\n%s' "$LIB_V1" > "$RUNTIME/lib/cosmetic_guard.py"
-commit_at "$CHANGE_EPOCH" "comment-only change"
-C2=$(git -C "$RUNTIME" rev-parse HEAD)
-# the daemon was restarted AFTER C1 but BEFORE C2 landed
-seed_running com.test.central-sender 4001 "$(lstart_of $((CHANGE_EPOCH - 300)))"
-DAEMON_BASELINE_OVERRIDES="com.test.central-sender $C1"
-OUT=$(invoke_helper "$C0" "$C2"); RC=$?; V=$(field VERDICT "$OUT"); G=$(field GUARDED "$OUT")
-DAEMON_BASELINE_OVERRIDES=""
+  make_plist "$AGENTS" com.test.central-sender /bin/bash "$RUNTIME/launchd/central_sender-wrapper.sh"
+  commit_at $((CHANGE_EPOCH - 7200)) base
+  C0=$(git -C "$RUNTIME" rev-parse HEAD)
+  sed 's/return x\["a"\]/return x["a"] * 2/' <<<"$LIB_V1" > "$RUNTIME/lib/real_guard.py"
+  commit_at $((CHANGE_EPOCH - 600)) "real change"
+  C1=$(git -C "$RUNTIME" rev-parse HEAD)
+  printf '# only a comment\n%s' "$LIB_V1" > "$RUNTIME/lib/cosmetic_guard.py"
+  commit_at "$CHANGE_EPOCH" "comment-only change"
+  C2=$(git -C "$RUNTIME" rev-parse HEAD)
+  # the daemon was restarted AFTER C1 but BEFORE C2 landed
+  seed_running com.test.central-sender 4001 "$(lstart_of $((CHANGE_EPOCH - 300)))"
+  DAEMON_BASELINE_OVERRIDES="com.test.central-sender $C1"
+  OUT=$(invoke_helper "$C0" "$C2"); RC=$?; V=$(field VERDICT "$OUT"); G=$(field GUARDED "$OUT")
+  DAEMON_BASELINE_OVERRIDES=""
+}
+run_narrowing_case t9
 [ "$V" = "OK" ] && [ "$RC" -eq 0 ] \
   && ok "T9 narrowing downgrades the label: its own window holds only a comment-only edit" \
   || nok "T9" "rc=$RC verdict=$V guarded=[$G] out=[$OUT]"
@@ -379,9 +445,97 @@ C0=$(git -C "$RUNTIME" rev-parse HEAD)
 chmod +x "$RUNTIME/lib/human_name_guard.py"
 commit_at "$CHANGE_EPOCH" "chmod +x"
 C1=$(git -C "$RUNTIME" rev-parse HEAD)
+only_changed T10 "$C0" "$C1" lib/human_name_guard.py
 OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT")
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T10 mode-only change stays flagged" \
   || nok "T10" "rc=$RC verdict=$V out=[$OUT]"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T11: a DELETED lib file (no new blob) stays flagged
+#   Mirror of T7: the daemon file is untouched, only the lib disappears.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t11
+printf '%s' "$LIB_V1" > "$RUNTIME/lib/human_name_guard.py"
+add_daemon central_sender human_name_guard 4001
+commit_at $((CHANGE_EPOCH - 7200)) base
+C0=$(git -C "$RUNTIME" rev-parse HEAD)
+rm -f "$RUNTIME/lib/human_name_guard.py"
+commit_at "$CHANGE_EPOCH" "delete lib"
+C1=$(git -C "$RUNTIME" rev-parse HEAD)
+only_changed T11 "$C0" "$C1" lib/human_name_guard.py
+OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT"); G=$(field GUARDED "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T11 deleted file stays flagged" \
+  || nok "T11" "rc=$RC verdict=$V out=[$OUT]"
+echo "$G" | grep -q 'com.test.central-sender' && ok "T11 GUARDED names the daemon that imports the deleted file" \
+  || nok "T11 guarded" "[$G]"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T12: a path whose blob cannot be read on EITHER side stays flagged
+#   A gitlink (mode 160000) at lib/vendored_guard.py: `git diff --name-only`
+#   lists it when the recorded commit moves, but `git cat-file blob <sha>:<path>`
+#   fails at both ends — the "missing blob" the classifier comment promises to keep.
+# ════════════════════════════════════════════════════════════════════════════
+new_case t12
+add_daemon central_sender vendored_guard 4001
+git -C "$RUNTIME" add daemons launchd >/dev/null 2>&1
+git -C "$RUNTIME" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,lib/vendored_guard.py
+commit_index_at $((CHANGE_EPOCH - 7200)) base
+C0=$(git -C "$RUNTIME" rev-parse HEAD)
+git -C "$RUNTIME" update-index --cacheinfo 160000,2222222222222222222222222222222222222222,lib/vendored_guard.py
+commit_index_at "$CHANGE_EPOCH" "move the gitlink"
+C1=$(git -C "$RUNTIME" rev-parse HEAD)
+only_changed T12 "$C0" "$C1" lib/vendored_guard.py
+git -C "$RUNTIME" cat-file blob "$C0:lib/vendored_guard.py" >/dev/null 2>&1 \
+  && nok "T12 premise: the blob at C0 should be unreadable" \
+  || ok "T12 premise: the blob at C0 is unreadable (a gitlink, not a blob)"
+OUT=$(invoke_helper "$C0" "$C1"); RC=$?; V=$(field VERDICT "$OUT"); G=$(field GUARDED "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T12 unreadable blob stays flagged (cannot tell != cosmetic)" \
+  || nok "T12" "rc=$RC verdict=$V out=[$OUT]"
+echo "$G" | grep -q 'com.test.central-sender' && ok "T12 GUARDED names the daemon that imports the unreadable path" \
+  || nok "T12 guarded" "[$G]"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T13: a comment-only edit on a file over the 2 MiB cap stays flagged
+#   T1's edit plus 2.2 MB of comment: still AST-identical, so ONLY the size cap
+#   keeps it. Without the cap this would be dropped — the parse of an arbitrarily
+#   large blob is exactly what the cap exists to bound.
+# ════════════════════════════════════════════════════════════════════════════
+BIG_V2="$(printf '# '; head -c 2200000 /dev/zero | tr '\0' x; printf '\n%s' "$LIB_V1")"
+run_lib_case t13 "$BIG_V2"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T13 oversize comment-only edit stays flagged (cannot afford to tell != cosmetic)" \
+  || nok "T13" "rc=$RC verdict=$V out=[$OUT]"
+echo "$G" | grep -q 'com.test.central-sender' && ok "T13 GUARDED names the stale sensitive daemon" \
+  || nok "T13 guarded" "[$G]"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T14: the classifier ITSELF fails -> the raw list is kept (fail toward flagging)
+#   T1's exact fixture, which T1 shows is dropped when the classifier works. Here
+#   python3 fails for the classifier only, so the ONLY difference is whether it
+#   could answer. "Could not tell" must not collapse into "nothing changed".
+# ════════════════════════════════════════════════════════════════════════════
+HELPER_PATH="$FAILING_CLASSIFIER_DIR:$PATH" run_lib_case t14 "$COMMENT_ONLY_V2"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && [ "$RC" -ne 0 ] \
+  && ok "T14 a failed classifier leaves the delivery flagged (raw list kept)" \
+  || nok "T14" "rc=$RC verdict=$V out=[$OUT]"
+echo "$G" | grep -q 'com.test.central-sender' && ok "T14 GUARDED names the stale sensitive daemon" \
+  || nok "T14 guarded" "[$G]"
+grep -q 'could not classify' "$CASE_DIR/stderr.log" \
+  && ok "T14 the classifier failure is logged" \
+  || nok "T14 log" "$(tail -5 "$CASE_DIR/stderr.log")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T15: the classifier fails on the per-daemon narrowing path
+#   T9's exact fixture (which T9 shows is downgraded when the classifier works).
+#   A failed classifier must leave the raw window list — the label stays flagged
+#   — and the failure must be visible, not a silent fall-through.
+# ════════════════════════════════════════════════════════════════════════════
+HELPER_PATH="$FAILING_CLASSIFIER_DIR:$PATH" run_narrowing_case t15
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && [ "$RC" -ne 0 ] \
+  && ok "T15 a failed classifier does not downgrade the label (raw narrowing window kept)" \
+  || nok "T15" "rc=$RC verdict=$V guarded=[$G] out=[$OUT]"
+grep -q 'could not classify.*narrowing window' "$CASE_DIR/stderr.log" \
+  && ok "T15 the narrowing-path classifier failure is logged" \
+  || nok "T15 log" "$(grep -i 'classif' "$CASE_DIR/stderr.log" | tail -5)"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 echo ""

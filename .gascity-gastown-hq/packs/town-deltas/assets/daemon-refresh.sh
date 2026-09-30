@@ -519,10 +519,22 @@
 #      dropped file hides a real stale daemon while a wrongly kept one costs a
 #      restart request: docstrings are NOT stripped (click/typer/FastAPI/
 #      argparse serve them and __doc__ is readable); a shebang edit, a mode-
-#      only change, an added or deleted file, an unparsable file and a
-#      missing blob all KEEP the file — "could not tell" is not "cosmetic".
-#      Accepted residual: line numbers shift (tracebacks, %(lineno)d) and a
-#      module that reads its own source text would see different bytes.
+#      only change (same bytes), an added or deleted file, an unparsable file,
+#      a file over 2 MiB and a missing blob all KEEP the file — "could not
+#      tell" is not "cosmetic". The classifier compares BLOBS, not modes, so a
+#      chmod combined with a comment edit in one deploy is dropped; a chmod
+#      alone (identical bytes) is kept.
+#      Accepted residuals: line numbers shift (tracebacks, %(lineno)d) and a
+#      module that reads its own source text would see different bytes. "The
+#      running process already executes identical code" holds only if the
+#      daemon is running the PRE-deploy version: one left stale by an EARLIER
+#      unrestarted deploy, with no .perdaemon "stuck" record (ga-n2jnsa widens
+#      those back regardless), used to be re-flagged incidentally by any later
+#      touch of the same file and now is not (untouched files already had that
+#      blind spot). The early OK for a cosmetic-only deploy sits before the
+#      FORCE_RESTART_LABELS fold, exactly like the pre-existing "no python
+#      changed" OK just after it: a forced label is not restarted by a deploy
+#      that changed no daemon code.
 #      The per-COMMIT probe inside ga0fawwr_daemon_closure_epoch is left raw:
 #      it only ever removes flags (already_fresh), and a python spawn per
 #      commit per label is not worth it. Not applied to *.sh — a shell "#"
@@ -2380,10 +2392,14 @@ ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline
     # ga-jjgcaw (header point 21): same comment/format-only drop as Step 1c,
     # or a label whose own window holds only such an edit could never be
     # downgraded here while the wide set (already filtered) no longer flags
-    # it. A classifier failure leaves the raw list in the cache (still flags).
-    if narrow_cls="$(cosmetic_py_classify "$sha" "$POST_DEPLOY_SHA" "$(cat "$cache")")" \
-       && [ -n "$(printf '%s\n' "$narrow_cls" | sed -n 's/^D://p')" ]; then
-      printf '%s\n' "$narrow_cls" | sed -n 's/^K://p' > "$cache.tmp" && mv "$cache.tmp" "$cache"
+    # it. A classifier failure leaves the raw list in the cache (still flags)
+    # and says so — a fail-toward-flagging that nobody can see is not countable.
+    if narrow_cls="$(cosmetic_py_classify "$sha" "$POST_DEPLOY_SHA" "$(cat "$cache")")"; then
+      if [ -n "$(printf '%s\n' "$narrow_cls" | sed -n 's/^D://p')" ]; then
+        printf '%s\n' "$narrow_cls" | sed -n 's/^K://p' > "$cache.tmp" && mv "$cache.tmp" "$cache"
+      fi
+    else
+      log "WARN: could not classify comment/format-only python changes for the narrowing window since ${sha:0:12} (classifier failed or timed out) — the raw list is kept, this run."
     fi
   fi
   cat "$cache" 2>/dev/null || true
