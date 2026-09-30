@@ -62,15 +62,13 @@ gate_diff_summary() {
 #   counted as shown: an empty answer is not the same thing as "shown, and there was nothing to see".
 #   ga-5w2gpw (E6 item d): "whole" is decided by TWO ceilings, lines AND bytes. The line budget (arg 6, default 6000) and
 #   GATE_DIFF_BYTE_BUDGET (env, default 400000, 0 = no byte ceiling). Measured on the E4 dataset (182 partial runs of 2,628):
-#   median 2,837 diff lines, p90 6,476, max 13,607 — the old 2000-line default cut a diff of ordinary size, and 89% of those runs
-#   fit in 6000 lines. But the task travels as ONE command-line argument (macOS ARG_MAX is 1,048,576 bytes for args + env) and
-#   fills the reviewer context, and both are BYTES: stored tasks reach 193 KB at 2,003 lines and dense diffs run 450 B/line,
-#   so 6000 lines alone could hand one reviewer 900 KB. A diff over either ceiling is coverage=partial; its header names the
-#   bytes when they are what tripped it. A single file bigger than a ceiling is still shown whole (the first-file rule below),
-#   which leaves coverage=partial with nothing omitted: the payload is complete but too large to hand over, and the caller
-#   (the gate) must treat that like any other partial. DIFF_RAW_TOTAL_BYTES is the byte length of the whole diff;
-#   DIFF_LIMIT_LINES / DIFF_LIMIT_BYTES are the ceilings actually applied, so a caller can quote them without re-deriving the
-#   defaults (and a garbage value falls back to the default, never to "no ceiling").
+#   median 2,837 diff lines, p90 6,476, max 13,607: the old 2000 default cut ordinary diffs, and 89% fit in 6000 lines. But the
+#   task travels as ONE command-line argument (macOS ARG_MAX is 1,048,576 bytes for args + env) and fills the reviewer context,
+#   both BYTES: stored tasks reach 193 KB at 2,003 lines and dense diffs run 450 B/line, so 6000 lines alone could hand one
+#   reviewer 900 KB. A diff over either ceiling is coverage=partial; the header names the bytes when they tripped it. A single
+#   file over a ceiling is still shown whole (first-file rule below): coverage=partial with nothing omitted, complete but too
+#   large to hand over, which the gate treats like any partial. DIFF_RAW_TOTAL_BYTES is the byte length of the whole diff;
+#   DIFF_LIMIT_LINES / DIFF_LIMIT_BYTES are the ceilings applied (a garbage value falls back to the default, never to "no ceiling").
 #   COVERAGE, for the caller that has to act on it (the header above is prose for the reviewer; these are for code). Three
 #   states, because "the reviewer was shown all of it", "shown part of it" and "we cannot tell" must not read the same:
 #     DIFF_COVERAGE      full     the whole diff is in the payload (within BOTH ceilings, and it has text)

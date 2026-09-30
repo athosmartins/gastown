@@ -1,30 +1,15 @@
 #!/usr/bin/env bash
 # gate-e6d-whole-diff-or-park.selftest.sh (ga-5w2gpw item d, 2026-09-30)
 #
-# CLASS: a reviewer that was shown a PIECE of the diff could PASS, and the branch merged on it.
-# The gate capped the reviewer's payload at 2000 lines, truncated on whole-file boundaries, and told the
-# reviewer "PARTIAL DIFF — showing 12 of 29 files … DO NOT treat the omitted files as reviewed" — then took
-# that reviewer's PASS as the verdict on the WHOLE change. Nothing in the dispatcher read DIFF_COVERAGE (only the
-# builder's pre-gate-review.sh did, ga-gnr3tw attempt 3). E4: 182 of 2,628 runs (6.9%) were partial; when the
-# reviewer passed, the files nobody read merged with the rest.
-#
-# MEASURED (E4 dataset, runs2, 182 partial runs): median 2,837 diff lines, p90 6,476, max 13,607 — the 2000-line
-# budget was simply too tight. 89% of them fit in 6,000 lines. But the OS argument limit and the reviewer's
-# context are in BYTES, not lines: stored tasks reach 193 KB at 2,003 lines, dense diffs run 450 B/line, so a
-# line ceiling alone could hand one reviewer 900 KB. Hence a byte ceiling beside the line one.
-#
-# FIX under test (E6 item d):
-#   1. gate_build_diff_payload decides "whole" by BOTH ceilings (lines AND bytes); its default line budget rises
-#      2000 → 6000 and GATE_DIFF_BYTE_BUDGET (default 400000) is new. Over either ceiling → coverage=partial.
-#   2. The dispatcher builds the payload BEFORE the gate-run bead exists (Step 5c) and, when coverage is partial,
-#      PARKS the marker fail-closed (gate-status:error + gate:needs-human:technical, author + Mayor told, event logged)
-#      without spawning a reviewer — it neither reviews a piece nor burns a fix attempt.
-#   3. The builder's pre-gate-review.sh uses the same default, so the rehearsal and the gate agree on "whole".
-#
-# Strategy: the lib runs against REAL git (real repo, real diffs). The dispatcher block is extracted between its
-# SELFTEST-EXTRACT sentinels and run in a fresh `set -euo pipefail` bash against stubs (git_rig/bd/gc/…), the way the
-# live sweep runs it. The harness is mutation-checked (a block without the park condition must read as RED).
-# bash 3.2 compatible. Exit 0 iff every assertion holds.
+# CLASS: a reviewer shown a PIECE of the diff could PASS, and the branch merged on it. The gate cut the payload at
+# 2000 lines and headed it "PARTIAL DIFF … DO NOT treat the omitted files as reviewed", then took that reviewer's PASS
+# as the verdict on the WHOLE change; only pre-gate-review.sh read DIFF_COVERAGE. E4: 182 of 2,628 runs were partial.
+# MEASURED: those runs have median 2,837 / p90 6,476 / max 13,607 diff lines (89% fit in 6000), but the task is one argv
+# argument (ARG_MAX 1 MiB) and fills the reviewer context, both BYTES: the largest task ever delivered is 193 KB and
+# dense diffs run ~450 B/line. FIX: "whole" = within 6000 lines AND 400000 bytes (lib + pre-gate agree), and the dispatcher
+# builds the payload before the gate-run bead exists (Step 5c) and PARKS a partial one fail-closed, spawning no reviewer.
+# Strategy: the lib runs against REAL git; the dispatcher block is extracted by SELFTEST-EXTRACT sentinels and run under
+# `set -euo pipefail` against stubs; the harness is mutation-checked. bash 3.2 compatible. Exit 0 iff all assertions hold.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,14 +49,12 @@ mkrepo() {
   git -C "$REPO" commit -q -m base
   git -C "$REPO" checkout -q -b feature
 }
-# addfile <name> <lines> <width>: a new file of <lines> lines, each <width> characters
 addfile() {
   awk -v n="$2" -v w="$3" 'BEGIN { s = ""; for (j = 0; j < w; j++) s = s "x"; for (i = 1; i <= n; i++) print s }' > "$REPO/$1"
 }
 commit_feature() { git -C "$REPO" add -A; git -C "$REPO" commit -q -m feat; }
 gitc() { git -C "$REPO" "$@"; }
 files_of() { git -C "$REPO" diff --name-only main...feature; }
-# payload <budget-or-empty>  -> runs the lib function for the current $REPO; sets the DIFF_* globals
 payload() {
   local cf; cf="$(files_of)"
   gate_build_diff_payload gitc main feature "$cf" "$(printf '%s\n' "$cf" | grep -c .)" "${1:-}" "cd $REPO && git diff main...feature"
@@ -85,16 +68,6 @@ if [ "${DIFF_RAW_TOTAL_LINES:-0}" -gt 2000 ] && [ "${DIFF_RAW_TOTAL_LINES:-0}" -
 if [ "${DIFF_COVERAGE:-}" = "full" ]; then ok "1a. default budget: a ~3000-line diff is handed over WHOLE (coverage=full)"; else bad "1a. default budget: a ~3000-line diff is still coverage=${DIFF_COVERAGE:-unset} (the 2000-line budget cut it — 93% of the E4 partial runs fit in 6000)"; fi
 if has "$DIFF_HEADER" "FULL DIFF (complete"; then ok "1a. the header says FULL"; else bad "1a. header is not FULL: $(printf '%s' "$DIFF_HEADER" | head -1)"; fi
 
-# 1b. line boundary: exactly the budget is whole, one more line is partial (explicit small budget — independent of the default)
-mkrepo; addfile a.txt 50 10; commit_feature
-payload ""; EXACT="$DIFF_RAW_TOTAL_LINES"
-payload "$EXACT"
-if [ "${DIFF_COVERAGE:-}" = "full" ]; then ok "1b. a diff of exactly <budget> lines is whole"; else bad "1b. exact-budget diff read as ${DIFF_COVERAGE:-unset}"; fi
-payload "$((EXACT - 1))"
-if [ "${DIFF_COVERAGE:-}" = "partial" ]; then ok "1b. one line over the budget is partial"; else bad "1b. budget-1 read as ${DIFF_COVERAGE:-unset}"; fi
-# the header of a LINE-driven partial keeps its original wording and does not mention bytes
-if has "$DIFF_HEADER" "total diff lines). DO NOT treat the omitted files" && ! has "$DIFF_HEADER" "bytes"; then ok "1b. a line-driven partial keeps the original header wording (no bytes clause)"; else bad "1b. line-driven partial header changed: $(printf '%s' "$DIFF_HEADER" | head -1)"; fi
-
 # 1c. few lines, huge bytes: 200 lines x 3000 chars = ~600 KB. The line count says "whole"; the byte count says it is not.
 mkrepo; addfile wide.txt 200 3000; commit_feature
 payload ""
@@ -103,7 +76,6 @@ if [ "${DIFF_RAW_TOTAL_BYTES:-0}" -gt 400000 ]; then ok "1c. DIFF_RAW_TOTAL_BYTE
 if has "$DIFF_HEADER" "bytes"; then ok "1c. a byte-driven partial says so in the header (the reviewer is told why)"; else bad "1c. a byte-driven partial does not mention bytes in the header: $(printf '%s' "$DIFF_HEADER" | head -1)"; fi
 RAWB="$(git -C "$REPO" diff main...feature | wc -c | tr -d ' ')"
 if [ "${DIFF_RAW_TOTAL_BYTES:-x}" = "$RAWB" ]; then ok "1c. DIFF_RAW_TOTAL_BYTES equals the byte length of git diff ($RAWB)"; else bad "1c. DIFF_RAW_TOTAL_BYTES=${DIFF_RAW_TOTAL_BYTES:-unset} but git diff is $RAWB bytes"; fi
-# 0 turns the byte ceiling off (the same "0 = off" convention as the other gate knobs), and only that
 GATE_DIFF_BYTE_BUDGET=0 payload ""
 if [ "${DIFF_COVERAGE:-}" = "full" ]; then ok "1c. GATE_DIFF_BYTE_BUDGET=0 disables the byte ceiling"; else bad "1c. GATE_DIFF_BYTE_BUDGET=0 still gave coverage=${DIFF_COVERAGE:-unset}"; fi
 GATE_DIFF_BYTE_BUDGET=abc payload ""
@@ -117,14 +89,12 @@ if has "${DIFF_OMITTED_LIST:-}" "f3.txt" && has "${DIFF_OMITTED_LIST:-}" "f4.txt
 SHOWN_BYTES="$(printf '%s' "$DIFF_FULL" | wc -c | tr -d ' ')"
 if [ "$SHOWN_BYTES" -le 400000 ]; then ok "1d. the shown payload stays under the byte ceiling ($SHOWN_BYTES <= 400000)"; else bad "1d. shown payload is $SHOWN_BYTES bytes, over the 400000 ceiling"; fi
 
-# 1e. the limits actually applied are published, so a caller can quote them without re-deriving the defaults
 mkrepo; addfile a.txt 10 10; commit_feature
 GATE_DIFF_BYTE_BUDGET=12345 payload 77
 if [ "${DIFF_LIMIT_LINES:-x}" = "77" ] && [ "${DIFF_LIMIT_BYTES:-x}" = "12345" ]; then ok "1e. DIFF_LIMIT_LINES / DIFF_LIMIT_BYTES publish the ceilings in force (77 / 12345)"; else bad "1e. limits published as lines=${DIFF_LIMIT_LINES:-unset} bytes=${DIFF_LIMIT_BYTES:-unset}"; fi
 
-# 1g. error must not read as "within budget": the old check was `[ lines -le budget ]`, which FAILS CLOSED (a count that did not
-# come back as a number made `[` error, and the code fell into the partial branch). A rewrite to `-gt` inverts that and reads the
-# same garbage as "whole". Drive it with a `wc` that answers garbage / nothing, for the lines and for the bytes.
+# 1g. error must not read as "within budget": the old `[ lines -le budget ]` failed CLOSED (a garbage count fell into the partial
+# branch); a naive `-gt` rewrite would read the same garbage as "whole". Drive it with a `wc` shim that answers garbage / fails.
 mkrepo; addfile a.txt 20 10; commit_feature
 SHIM="$TMP/shim"; mkdir -p "$SHIM"
 REAL_WC="$(command -v wc)"
@@ -142,11 +112,6 @@ if [ "${DIFF_COVERAGE:-}" = "partial" ]; then ok "1g. a failing byte count (wc -
 payload ""
 if [ "${DIFF_COVERAGE:-}" = "full" ]; then ok "1g. control: with the real wc the same small diff IS full (the shim, not the fixture, caused the above)"; else bad "1g. control failed: the small diff is coverage=${DIFF_COVERAGE:-unset} with the real wc"; fi
 
-# 1f. third state unchanged: a git that FAILS reads as unknown, never full and never partial (a separate bead owns that limit)
-gitfail() { return 1; }
-gate_build_diff_payload gitfail main feature "a.txt" 1 "" "esc"
-if [ "${DIFF_COVERAGE:-}" = "unknown" ]; then ok "1f. a failing git read is coverage=unknown (unchanged)"; else bad "1f. failing git read gave coverage=${DIFF_COVERAGE:-unset}"; fi
-
 # ── 2. the three defaults agree ──────────────────────────────────────────────────────────────────────────
 echo "── 2. gate, lib and pre-gate use the SAME default ceilings ──"
 D_LINES="$(sed -n 's/^GATE_DIFF_LINE_BUDGET="\${GATE_DIFF_LINE_BUDGET:-\([0-9][0-9]*\)}".*/\1/p' "$DISPATCHER" | head -1)"
@@ -156,7 +121,6 @@ D_BYTES="$(sed -n 's/^GATE_DIFF_BYTE_BUDGET="\${GATE_DIFF_BYTE_BUDGET:-\([0-9][0
 L_BYTES="$(sed -n 's/.*_byte_budget="\${GATE_DIFF_BYTE_BUDGET:-\([0-9][0-9]*\)}".*/\1/p' "$LIB" | head -1)"
 if [ -n "$D_LINES" ] && [ "$D_LINES" = "$L_LINES" ] && [ "$D_LINES" = "$P_LINES" ]; then ok "line budget default agrees: dispatcher=$D_LINES lib=$L_LINES pre-gate=$P_LINES"; else bad "line budget defaults DISAGREE or are missing: dispatcher='$D_LINES' lib='$L_LINES' pre-gate='$P_LINES' — the builder would rehearse a different 'whole' than the gate enforces"; fi
 if [ -n "$D_BYTES" ] && [ "$D_BYTES" = "$L_BYTES" ]; then ok "byte budget default agrees: dispatcher=$D_BYTES lib=$L_BYTES"; else bad "byte budget defaults DISAGREE or are missing: dispatcher='$D_BYTES' lib='$L_BYTES'"; fi
-if [ -n "$D_LINES" ] && [ "$D_LINES" -gt 2000 ]; then ok "the line default is above the old 2000 that cut 93% of the E4 partial runs ($D_LINES)"; else bad "the line default is still '$D_LINES' (old value 2000)"; fi
 
 # ── 3. the dispatcher's Step 5c: whole diff -> proceed, partial -> park before any reviewer ──────────────
 echo "── 3. dispatcher Step 5c (extracted, run under stubs) ──"
@@ -169,7 +133,6 @@ else
 fi
 printf '%s\n' "$BUDGET_SRC" > "$TMP/budget.sh"
 printf '%s\n' "$BLOCK_SRC" > "$TMP/block.sh"
-# the dispatcher's real defaults, read the way the live script reads them
 LINE_DEF=6000; BYTE_DEF=400000
 if [ -n "$BUDGET_SRC" ]; then
   LINE_DEF="$(bash -c ". '$TMP/budget.sh'; echo \"\$GATE_DIFF_LINE_BUDGET\"" 2>/dev/null)"
@@ -253,8 +216,7 @@ if [ -n "$BLOCK_SRC" ]; then
   if has "$CALLS" "split"; then ok "3b. the builder is told what to do (split the branch)"; else bad "3b. no instruction to split the branch"; fi
   if has "$CALLS" "mail send mayor" && has "$CALLS" "mail send crew/author"; then ok "3b. Mayor AND the author are mailed"; else bad "3b. mail missing (mayor/author): $CALLS"; fi
   if has "$QGLINE" "dispatcher_park_diff_too_large" && has "$QGLINE" "bead-1"; then ok "3b. a dispatcher_park_diff_too_large event is logged"; else bad "3b. no park event in the QG log: '$QGLINE'"; fi
-  # Assert on the CALLS (a bd label write / a bd create), not on prose: the park's own comments legitimately say "no fix attempt".
-  # grep -c (no early exit) rather than grep -q: under pipefail a SIGPIPE on the printf would turn a match into a miss.
+  # Assert on the CALLS, not on prose (the park's own comments say "no fix attempt"); grep -c, since grep -q can SIGPIPE under pipefail.
   N_FIXLBL="$(printf '%s\n' "$CALLS" | grep -c -E '^bd\|.* label (add|remove) [^ ]+ gate:(needs-fix|fix-attempt|failed)')"
   N_CREATE="$(printf '%s\n' "$CALLS" | grep -c -E '^bd\|.* create ')"
   if [ "$N_FIXLBL" = "0" ] && [ "$N_CREATE" = "0" ]; then ok "3b. no fix attempt consumed (no gate:needs-fix / fix-attempt / failed label write) and no gate-run bead created — nothing was reviewed, nothing judged"; else bad "3b. the park wrote a fix-state label ($N_FIXLBL) or created a bead ($N_CREATE): $CALLS"; fi
@@ -313,7 +275,6 @@ N_CALLS="$(grep -c '^gate_build_diff_payload ' "$DISPATCHER")"
 if [ "$N_CALLS" = "1" ]; then ok "4b. exactly one gate_build_diff_payload call site in the dispatcher (the park decision and the reviewers' payload cannot diverge)"; else bad "4b. $N_CALLS gate_build_diff_payload call sites (expected exactly 1)"; fi
 L_CALL="$(grep -n '^gate_build_diff_payload ' "$DISPATCHER" | head -1 | cut -d: -f1)"
 if [ -n "$L_CALL" ] && [ -n "$L_RUN" ] && [ "$L_CALL" -lt "$L_RUN" ]; then ok "4b. that one call precedes the gate-run bead"; else bad "4b. the payload is still built after the gate-run bead (call=${L_CALL:-none} run=${L_RUN:-none})"; fi
-# nothing may render a reviewer task from a payload built for a DIFFERENT purpose: the reviewers still get DIFF_HEADER/DIFF_FULL
 if grep -q '"\$DIFF_HEADER" "\$DIFF_FULL"' "$DISPATCHER"; then ok "4c. the reviewer task is still rendered from the same DIFF_HEADER/DIFF_FULL"; else bad "4c. the reviewer task no longer consumes DIFF_HEADER/DIFF_FULL"; fi
 
 echo

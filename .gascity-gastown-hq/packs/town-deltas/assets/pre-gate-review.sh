@@ -781,8 +781,7 @@ pg_run_inner() {
       echo "Files it was NOT shown (nobody has reviewed these):"; printf '%s' "$DIFF_OMITTED_LIST"
     fi
     if [ "$partial" = true ]; then
-      # ga-5w2gpw: the live gate hands each reviewer the WHOLE diff or does not review it: over ${DIFF_LIMIT_LINES:-?} lines /
-      # ${DIFF_LIMIT_BYTES:-?} bytes it PARKS the branch (gate-status:error + needs-human) instead of merging on a part.
+      # ga-5w2gpw: the live gate reviews the WHOLE diff or parks the branch (gate-status:error + needs-human).
       echo "NOTE: the real gate parks a diff over ${DIFF_LIMIT_LINES:-?} lines / ${DIFF_LIMIT_BYTES:-?} bytes instead of reviewing a part of it (this one is ${DIFF_RAW_TOTAL_LINES:-?} lines / ${DIFF_RAW_TOTAL_BYTES:-?} bytes). Split the branch before /gate-done."
     fi
     if [ "$out_verdict" = INCONCLUSIVE ] && [ "$verdict" = "PASS" ]; then
