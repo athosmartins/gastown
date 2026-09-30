@@ -118,21 +118,30 @@ BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
 GC_DOCTOR_STATE_DIR="${GC_DOCTOR_STATE_DIR:-$HOME/.gastown/state}"
 STATE_FILE="${GC_DOCTOR_STATE_FILE:-$GC_DOCTOR_STATE_DIR/mol-dog-doctor.state.json}"
 ADVISORY_COOLDOWN_S="${GC_DOCTOR_ADVISORY_COOLDOWN_S:-21600}"  # 6h — matches the two cited town precedents (ga-2uz59)
+# ga-29lbag: this order declares `timeout = "300s"` (mol-dog-doctor.toml). A run that overshoots is
+# killed by the engine and reports nothing, so the per-database loop below stops STARTING new
+# databases once the script has been running DOCTOR_BUDGET_S and lists the rest as "not measured"
+# instead. 200s leaves 100s for the tail (report + deacon ping) even when a single step runs to
+# its own STEP_TIMEOUT_S. Measured 30/09: the old probe was still running after 175s at load 40-80
+# (traced) when it died; the fixed one takes ~7s untraced at load ~38 (107s under xtrace at load 81).
+DOCTOR_BUDGET_S="${GC_DOCTOR_BUDGET_S:-200}"
+STEP_TIMEOUT_S="${GC_DOCTOR_STEP_TIMEOUT_S:-10}"
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
-        run_bounded 10 \
+        run_bounded "$STEP_TIMEOUT_S" \
         dolt --host "$HOST" --port "$PORT" --user "$USER" --no-tls sql "$@"
 }
 
-file_mtime() {
-    file_path="$1"
-    file_mtime_value=$(stat -c %Y "$file_path" 2>/dev/null \
-        || stat -f %m "$file_path" 2>/dev/null || echo "0")
-    case "$file_mtime_value" in
-        ''|*[!0-9]*) file_mtime_value=0 ;;
-    esac
-    printf '%s\n' "$file_mtime_value"
+# ga-29lbag: a step that could not be measured must say so, never read as a clean value.
+# Items are listed in the report, the log summary and the DOG_DONE ping (see UNMEASURED_NOTE).
+UNMEASURED_ITEMS=""
+append_unmeasured() {
+    if [ -n "$UNMEASURED_ITEMS" ]; then
+        UNMEASURED_ITEMS="$UNMEASURED_ITEMS, $1"
+    else
+        UNMEASURED_ITEMS="$1"
+    fi
 }
 
 backup_path_matches_db() {
@@ -146,18 +155,40 @@ backup_path_matches_db() {
     return 1
 }
 
+# newest_backup_mtime_for_db <db_name> — epoch seconds of the newest artifact under
+# BACKUP_ARTIFACT_DIR whose path matches <db_name>; 0 when nothing matches or nothing is readable.
+#
+# ga-29lbag: the paths are matched in pure bash and their mtimes read with ONE `stat` for the whole
+# match set. This used to fork a subshell plus one or two `stat`s PER matching file, and a fork
+# costs 0.1-0.2s at this city's typical load (~40): hq's backup dir holds ~250 files, so hq alone
+# took 83s and the eight databases ~103s together (untraced, load ~40, measured live 30/09) — by far
+# the largest share of the probe. The same scan is 2.6s for hq after this change, with identical
+# answers on all 8 databases. A file that vanishes between `find` and `stat` just drops out of the batch.
 newest_backup_mtime_for_db() {
     db_name="$1"
     newest_mtime=0
+    local -a matched_paths=()
     while IFS= read -r -d '' backup_path; do
         backup_rel_path="${backup_path#$BACKUP_ARTIFACT_DIR/}"
         if backup_path_matches_db "$db_name" "$backup_rel_path"; then
-            backup_mtime=$(file_mtime "$backup_path")
+            matched_paths+=("$backup_path")
+        fi
+    done < <(find "$BACKUP_ARTIFACT_DIR" -type f -print0 2>/dev/null)
+    if [ "${#matched_paths[@]}" -gt 0 ]; then
+        # GNU form first, BSD/macOS form when the first prints nothing (unsupported flag).
+        matched_mtimes=$(stat -c %Y "${matched_paths[@]}" 2>/dev/null) || true
+        if [ -z "$matched_mtimes" ]; then
+            matched_mtimes=$(stat -f %m "${matched_paths[@]}" 2>/dev/null) || true
+        fi
+        while IFS= read -r backup_mtime; do
+            case "$backup_mtime" in
+                ''|*[!0-9]*) continue ;;
+            esac
             if [ "$backup_mtime" -gt "$newest_mtime" ]; then
                 newest_mtime="$backup_mtime"
             fi
-        fi
-    done < <(find "$BACKUP_ARTIFACT_DIR" -type f -print0 2>/dev/null)
+        done <<< "$matched_mtimes"
+    fi
     printf '%s\n' "$newest_mtime"
 }
 
@@ -181,9 +212,31 @@ newest_backup_mtime_for_db() {
 # alarm forever for a backup that was never behind. TIMESTAMPDIFF computes a
 # pure calendar difference against a literal UTC epoch with no session-tz
 # reinterpretation, so it is correct regardless of @@system_time_zone.
+#
+# ga-29lbag (the chronic `exit status 124`, 48 runs in 6 days): two defects lived in this function.
+#  1. `ORDER BY date DESC` forces Dolt to read and sort the db's WHOLE commit history. hq gets a
+#     commit per bd write; measured 30/09 (load 40-80), that query took 31s on hq and the server
+#     aborted it ("row read wait bigger than connection timeout") — three times the 10s step bound,
+#     so a 124 whenever it is that slow (48 runs in 6 days did not get through). dolt_log already walks
+#     newest-first from HEAD, so `LIMIT 1` alone answers in ~0.2s. It returned the identical epoch to
+#     the ORDER BY form on 6 of the 7 other dbs (beads, dc, gastown, lexbh, marketing,
+#     whatsapp_automation; property_scrapers commits every minute so it was not compared); on hq the
+#     ORDER BY form cannot finish, so there is nothing to compare — `LIMIT 1` returned a value from the last minute.
+#  2. The docblock promised "Empty output on any failure", but the old body was a bare pipeline:
+#     under this script's `set -eo pipefail` a timed-out dolt_sql (run_bounded exit 124) made the
+#     FUNCTION return 124, and the caller's plain `DB_LAST_COMMIT_EPOCH=$(...)` assignment then
+#     killed the whole probe with that 124. Failure is now swallowed here and yields empty, which
+#     backup_should_warn() already treats as "unmeasured" (falls back to the age-only check) — the
+#     one failing query no longer takes the other seven databases and every later step with it.
 db_last_commit_epoch() {
     db_name="$1"
-    dolt_sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date) AS SIGNED) FROM \`$db_name\`.dolt_log ORDER BY date DESC LIMIT 1" 2>/dev/null | tail -1
+    local epoch=""
+    epoch=$(dolt_sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date) AS SIGNED) FROM \`$db_name\`.dolt_log LIMIT 1" 2>/dev/null | tail -1) || epoch=""
+    case "$epoch" in
+        ''|*[!0-9]*) epoch="" ;;
+    esac
+    printf '%s\n' "$epoch"
+    return 0
 }
 
 # backup_should_warn <backup_mtime> <now_s> <stale_s> <db_last_commit_epoch>
@@ -432,18 +485,35 @@ if [ -z "$CONN_MAX" ]; then
 fi
 CONN_MAX_DISPLAY="${CONN_MAX:-unknown}"
 
-CONN_COUNT=$(dolt_sql -r csv -q "SELECT COUNT(*) FROM information_schema.PROCESSLIST" 2>/dev/null \
-    | tail -1 || echo "0")
+# ga-29lbag: a timed-out/failed count used to fall into `|| echo "0"` and be reported as a MEASURED
+# zero ("0/256") — the same error==empty collapse CONN_MAX and ORPHAN_COUNT already avoid. The
+# numeric value (CONN_COUNT_NUM) stays empty when unmeasured and feeds the predicates and the
+# cooldown state; CONN_COUNT is the display form ("unknown" instead of a fake 0).
+CONN_COUNT_NUM=$(dolt_sql -r csv -q "SELECT COUNT(*) FROM information_schema.PROCESSLIST" 2>/dev/null \
+    | tail -1) || CONN_COUNT_NUM=""
+case "$CONN_COUNT_NUM" in
+    ''|*[!0-9]*) CONN_COUNT_NUM="" ;;
+esac
+CONN_COUNT="${CONN_COUNT_NUM:-unknown}"
 CONN_WARN=""
-if conn_should_warn "$CONN_COUNT" "$CONN_MAX" "$CONN_WARN_PCT"; then
+if conn_should_warn "$CONN_COUNT_NUM" "$CONN_MAX" "$CONN_WARN_PCT"; then
     CONN_WARN=" [WARN: ${CONN_COUNT} connections >= ${CONN_WARN_PCT}% of max ${CONN_MAX}]"
 fi
 
-# Disk usage of Dolt data directory.
-DISK_USAGE=$(du -sh "$DOLT_DATA_DIR" 2>/dev/null | cut -f1 || echo "unknown")
+# Disk usage of Dolt data directory. ga-29lbag: bounded like every other step; `|| true` keeps the
+# total du printed even when it exits 1 on one unreadable subdirectory (the old `|| echo unknown`
+# appended a second line to the value in that case).
+DISK_USAGE=$(run_bounded "$STEP_TIMEOUT_S" du -sh "$DOLT_DATA_DIR" 2>/dev/null | cut -f1) || true
+DISK_USAGE="${DISK_USAGE:-unknown}"
 
 # Orphan database detection.
-ALL_DBS=$(dolt_sql -r csv -q "SHOW DATABASES" 2>/dev/null | tail -n +2 || true)
+# ga-29lbag: a failed SHOW DATABASES used to leave ALL_DBS empty, so the backup-freshness check
+# below found nothing to check and the run looked clean. It now says so in the report.
+DBLIST_OK=true
+ALL_DBS=$(dolt_sql -r csv -q "SHOW DATABASES" 2>/dev/null | tail -n +2) || DBLIST_OK=false
+if [ "$DBLIST_OK" != "true" ]; then
+    append_unmeasured "database list (backup freshness skipped)"
+fi
 SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schema|sys)$"
 USER_DBS=$(printf '%s\n' "$ALL_DBS" | grep -viE "$SYSTEM_DBS" || true)
 # ga-fwzg4: delegate the orphan COUNT to `gc dolt-cleanup` (hyphen) itself —
@@ -480,12 +550,26 @@ fi
 # Scope mirrors mol-dog-backup.sh: only DBs with a configured <db>-backup
 # remote are eligible. Cities with user DBs but no backup remotes
 # (legitimate config) must not get false stale-backup alarms.
+#
+# ga-29lbag: `dolt backup` is a CLI that opens the database directory, and it ran here once per
+# database with no bound at all (~0.5-1.4s each at load ~40; it could also hang). It is now bounded,
+# and three-state: listed => eligible, exit 0 without the remote => legitimately not eligible
+# (`dolt backup` exits 0 with empty output when no remote exists — checked on a fresh repo), and a
+# timeout/failure => "not measured", no longer folded into "not eligible".
 BACKUP_ELIGIBLE_DBS=""
 for db in $USER_DBS; do
     db_dir="$DOLT_DATA_DIR/$db"
     if [ -d "$db_dir/.dolt" ]; then
-        if (cd "$db_dir" && dolt backup 2>/dev/null | awk '{print $1}' | grep -x "${db}-backup" >/dev/null); then
-            BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
+        if [ "$SECONDS" -ge "$DOCTOR_BUDGET_S" ]; then
+            append_unmeasured "backup remotes of $db (probe budget ${DOCTOR_BUDGET_S}s spent)"
+            continue
+        fi
+        if backup_remotes=$(cd "$db_dir" && run_bounded "$STEP_TIMEOUT_S" dolt backup 2>/dev/null); then
+            if printf '%s\n' "$backup_remotes" | awk '{print $1}' | grep -x "${db}-backup" >/dev/null; then
+                BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
+            fi
+        else
+            append_unmeasured "backup remotes of $db"
         fi
     fi
 done
@@ -499,6 +583,10 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
         BACKUP_STALE_ITEMS=""
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
+            if [ "$SECONDS" -ge "$DOCTOR_BUDGET_S" ]; then
+                append_unmeasured "backup freshness of $db (probe budget ${DOCTOR_BUDGET_S}s spent)"
+                continue
+            fi
             NEWEST_BACKUP_MTIME=$(newest_backup_mtime_for_db "$db")
             if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
                 append_backup_stale "$db backup missing"
@@ -523,6 +611,13 @@ REPORT_BODY="Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX_DISPLAY}${CONN_WARN}
 Disk: ${DISK_USAGE}
 Orphan DBs: ${ORPHAN_COUNT_DISPLAY}${ORPHAN_WARN}${BACKUP_STALE}"
+# ga-29lbag: steps that could not run this cycle are named, not silently absent. Deliberately NOT
+# part of WARNINGS: a blind spot under load must not page the Mayor every cooldown (the ga-2uz59 /
+# ga-wrl5x noise class) — it lands in this report, the log summary and the DOG_DONE ping.
+if [ -n "$UNMEASURED_ITEMS" ]; then
+    REPORT_BODY="${REPORT_BODY}
+Not measured this run: ${UNMEASURED_ITEMS}"
+fi
 
 if [ -n "$WARNINGS" ]; then
     # ga-2uz59 AC2: the substantive payload always hits the log every cycle,
@@ -560,10 +655,10 @@ if [ -n "$WARNINGS" ]; then
 
     if advisory_should_alert "${PREV_CLASS:-OK}" "$DOCTOR_ELAPSED_S" "$ADVISORY_COOLDOWN_S" \
         "$LATENCY_MS" "$PREV_LATENCY_MS" "$LATENCY_IS_WARN" \
-        "$CONN_COUNT" "$PREV_CONN_COUNT" "$CONN_IS_WARN" \
+        "$CONN_COUNT_NUM" "$PREV_CONN_COUNT" "$CONN_IS_WARN" \
         "$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT" "$ORPHAN_IS_WARN"; then
         if send_mayor_mail -s "Dolt health advisory [MEDIUM]" -m "$REPORT_BODY"; then
-            state_write "$STATE_FILE" "MEDIUM" "$DOCTOR_NOW_EPOCH" "$LATENCY_MS" "$CONN_COUNT" "$ORPHAN_COUNT"
+            state_write "$STATE_FILE" "MEDIUM" "$DOCTOR_NOW_EPOCH" "$LATENCY_MS" "$CONN_COUNT_NUM" "$ORPHAN_COUNT"
         fi
     else
         echo "doctor: MEDIUM advisory suppressed — within ${ADVISORY_COOLDOWN_S}s cooldown and not worsened since last alert (elapsed ${DOCTOR_ELAPSED_S}s)"
@@ -579,5 +674,8 @@ else
 fi
 
 SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX_DISPLAY}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT_DISPLAY}"
+if [ -n "$UNMEASURED_ITEMS" ]; then
+    SUMMARY="$SUMMARY [not measured: $UNMEASURED_ITEMS]"
+fi
 nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "doctor: $SUMMARY"

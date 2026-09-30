@@ -6,8 +6,17 @@
 # threshold tripped every afternoon on all 10 DBs simultaneously, paging the Mayor with
 # an identical false-positive "Dolt health advisory [MEDIUM]" for most of every day. See
 # mol-dog-doctor.sh's own header comment for the full rationale.
+#
+# ga-29lbag: `timeout` is declared rather than left to the engine default (300s for an exec order
+# that names none — see mol-dog-reaper.toml), because the script now budgets itself against it:
+# GC_DOCTOR_BUDGET_S=200 stops it starting new per-database work, leaving 100s for the report. The
+# `exit status 124` reproduced live on 30/09 (48 runs in 6 days) was NOT this timeout firing — the
+# script died by itself at ~176s, when a bounded `dolt_log` query on hq timed out inside it (see
+# db_last_commit_epoch()). The selftest fails if the script's budget plus 60s of tail is ever
+# more than this timeout.
 [order]
 description = "Probe Dolt server health and report status"
 exec = "$PACK_DIR/assets/scripts/mol-dog-doctor.sh"
 trigger = "cooldown"
 interval = "5m"
+timeout = "300s"

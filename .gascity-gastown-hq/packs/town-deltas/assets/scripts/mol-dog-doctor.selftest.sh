@@ -718,8 +718,10 @@ fi
 if grep -qF 'LATENCY_IS_WARN="false"' "$SCRIPT" && grep -qF 'CONN_IS_WARN="false"' "$SCRIPT" \
     && grep -qF 'ORPHAN_IS_WARN="false"' "$SCRIPT" \
     && grep -qF '"$LATENCY_MS" "$PREV_LATENCY_MS" "$LATENCY_IS_WARN"' "$SCRIPT" \
-    && grep -qF '"$CONN_COUNT" "$PREV_CONN_COUNT" "$CONN_IS_WARN"' "$SCRIPT" \
+    && grep -qF '"$CONN_COUNT_NUM" "$PREV_CONN_COUNT" "$CONN_IS_WARN"' "$SCRIPT" \
     && grep -qF '"$ORPHAN_COUNT" "$PREV_ORPHAN_COUNT" "$ORPHAN_IS_WARN"' "$SCRIPT"; then
+  # ga-29lbag: the connection argument is now CONN_COUNT_NUM (numeric, empty when unmeasured) —
+  # CONN_COUNT became the display string ("unknown"), which must never reach the numeric predicate.
   ok "caller computes and passes LATENCY_IS_WARN/CONN_IS_WARN/ORPHAN_IS_WARN into advisory_should_alert()"
 else
   bad "caller no longer wires the is_warn flags into advisory_should_alert() — (c) may be permanently deaf or ungated again"
@@ -960,6 +962,164 @@ else
   bad "could not extract state_read_field()/state_write() source from $SCRIPT"
 fi
 rm -f "$STATE_FN_SNIPPET"
+
+# ── ga-29lbag: the chronic `gc: order exec mol-dog-doctor failed: exit status 124` ──
+# ── (48 runs in 6 days). Reproduced live 30/09: NOT the engine's 300s timeout — the ──
+# ── script died by itself, at ~176s, because db_last_commit_epoch()'s bounded hq    ──
+# ── query timed out (10s, run_bounded exit 124) and `set -e` + `pipefail` turned    ──
+# ── that into the exit code of the whole probe. Plus ~103s of per-file forks in the ──
+# ── backup-mtime scan. Run against the pre-fix script: the timeout/ORDER BY/stat    ──
+# ── count/budget/unmeasured checks FAIL there (11 of the 14 new checks); the normal ──
+# ── reply and no-artifact checks are regression guards and pass on both.            ──
+echo "── probe survives a timed-out step and finishes in time (ga-29lbag) ──"
+
+GA29_TMP="$(mktemp -d)"
+GA29_LCE_SNIP="$GA29_TMP/lce.sh"
+sed -n '/^db_last_commit_epoch()/,/^}/p' "$SCRIPT" > "$GA29_LCE_SNIP"
+
+# Run db_last_commit_epoch() in a CHILD bash under the script's own `set -euo pipefail`, called the
+# way the script calls it (a plain `VAR=$(...)` assignment) — that is the shape the bug killed.
+# $1 = body of the dolt_sql stub. Prints the child's stdout then "rc=<n>".
+ga29_lce_child() {
+  local child="$GA29_TMP/child.$RANDOM.sh"
+  cat > "$child" <<CHILD
+set -euo pipefail
+dolt_sql() { $1; }
+source "$GA29_LCE_SNIP"
+DB_LAST_COMMIT_EPOCH=\$(db_last_commit_epoch hq)
+echo "value=[\$DB_LAST_COMMIT_EPOCH]"
+CHILD
+  bash "$child" 2>/dev/null
+  echo "rc=$?"
+  rm -f "$child"
+}
+
+if [ -s "$GA29_LCE_SNIP" ]; then
+  GA29_OUT=$(ga29_lce_child 'return 124')
+  if [ "$GA29_OUT" = "$(printf 'value=[]\nrc=0')" ]; then
+    ok "a timed-out dolt_sql (exit 124) makes db_last_commit_epoch() yield EMPTY and the caller survives set -euo pipefail — the old body killed the whole probe with that 124"
+  else
+    bad "db_last_commit_epoch() under set -euo pipefail with a timed-out dolt_sql gave: $(printf '%s' "$GA29_OUT" | tr '\n' ' ') — expected 'value=[] rc=0' (the chronic exit-124 bug)"
+  fi
+
+  GA29_OUT=$(ga29_lce_child "printf 'CAST(TIMESTAMPDIFF(SECOND, ...) AS SIGNED)\n'")
+  if [ "$GA29_OUT" = "$(printf 'value=[]\nrc=0')" ]; then
+    ok "a header-only / non-numeric reply (query returned no row) is reported as unmeasured (empty), never passed on as a number"
+  else
+    bad "non-numeric dolt_sql output was not normalised to empty: $(printf '%s' "$GA29_OUT" | tr '\n' ' ')"
+  fi
+
+  GA29_SQL_CAPTURE="$GA29_TMP/sql.captured"
+  GA29_OUT=$(ga29_lce_child "printf '%s\n' \"\$*\" > '$GA29_SQL_CAPTURE'; printf 'hdr\n1790000000\n'")
+  if [ "$GA29_OUT" = "$(printf 'value=[1790000000]\nrc=0')" ]; then
+    ok "a normal reply (header + epoch) still comes through as the epoch"
+  else
+    bad "a normal reply was not passed through: $(printf '%s' "$GA29_OUT" | tr '\n' ' ')"
+  fi
+
+  # The query actually SENT: no full-history sort (ORDER BY is what made hq's query run >30s and
+  # get aborted by the server), and the ga-gh8mb timezone-agnostic form is kept.
+  if [ -s "$GA29_SQL_CAPTURE" ] && ! grep -qi 'ORDER BY' "$GA29_SQL_CAPTURE" \
+      && grep -qF 'LIMIT 1' "$GA29_SQL_CAPTURE" \
+      && grep -qF "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)" "$GA29_SQL_CAPTURE"; then
+    ok "the dolt_log query sent has no ORDER BY (no full-history sort on hq) and keeps LIMIT 1 + TIMESTAMPDIFF"
+  else
+    bad "the dolt_log query sent is wrong (ORDER BY back, LIMIT 1 or TIMESTAMPDIFF gone): $(cat "$GA29_SQL_CAPTURE" 2>/dev/null)"
+  fi
+else
+  bad "could not extract db_last_commit_epoch() from $SCRIPT"
+fi
+
+# newest_backup_mtime_for_db(): ONE stat for the whole match set, not one or two forks per file
+# (hq's backup dir holds ~250 files; a fork costs 0.1-0.2s at this city's load => 83s for hq alone).
+GA29_MT_SNIP="$GA29_TMP/mt.sh"
+sed -n '/^backup_path_matches_db()/,/^}/p;/^newest_backup_mtime_for_db()/,/^}/p' "$SCRIPT" > "$GA29_MT_SNIP"
+GA29_ART="$GA29_TMP/art"
+mkdir -p "$GA29_ART/hq" "$GA29_ART/other"
+for i in $(seq 1 60); do : > "$GA29_ART/hq/f$i"; touch -t 202501010101 "$GA29_ART/hq/f$i"; done
+: > "$GA29_ART/hq/newest"; touch -t 202606150000 "$GA29_ART/hq/newest"
+: > "$GA29_ART/other/later"; touch -t 202609010000 "$GA29_ART/other/later"   # newer, but another db's — must be ignored
+GA29_EXPECT=$(stat -c %Y "$GA29_ART/hq/newest" 2>/dev/null || stat -f %m "$GA29_ART/hq/newest" 2>/dev/null)
+mkdir -p "$GA29_TMP/bin"
+GA29_REAL_STAT="$(command -v stat)"
+cat > "$GA29_TMP/bin/stat" <<SHIM
+#!/bin/sh
+echo call >> "$GA29_TMP/stat.calls"
+exec "$GA29_REAL_STAT" "\$@"
+SHIM
+chmod +x "$GA29_TMP/bin/stat"
+
+if [ -s "$GA29_MT_SNIP" ] && [ -n "$GA29_EXPECT" ]; then
+  : > "$GA29_TMP/stat.calls"
+  GA29_GOT=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "source '$GA29_MT_SNIP'; newest_backup_mtime_for_db hq" 2>/dev/null)
+  GA29_CALLS=$(wc -l < "$GA29_TMP/stat.calls" | tr -d ' ')
+  if [ "$GA29_GOT" = "$GA29_EXPECT" ]; then
+    ok "newest_backup_mtime_for_db hq returns the newest hq artifact's mtime ($GA29_EXPECT) and ignores another db's newer file"
+  else
+    bad "newest_backup_mtime_for_db hq returned '$GA29_GOT', expected '$GA29_EXPECT'"
+  fi
+  if [ "${GA29_CALLS:-999}" -le 2 ]; then
+    ok "61 matching files cost $GA29_CALLS stat invocation(s) (<=2: GNU form, then BSD fallback) — not one or two per file"
+  else
+    bad "61 matching files cost $GA29_CALLS stat invocations — the per-file fork pattern (83s on hq at load ~40) is back"
+  fi
+  : > "$GA29_TMP/stat.calls"
+  GA29_NONE=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "source '$GA29_MT_SNIP'; newest_backup_mtime_for_db nosuchdb" 2>/dev/null)
+  if [ "$GA29_NONE" = "0" ] && [ ! -s "$GA29_TMP/stat.calls" ]; then
+    ok "a db with no artifacts reports 0 (the caller's 'backup missing') without calling stat"
+  else
+    bad "a db with no artifacts returned '$GA29_NONE' (stat calls: $(wc -l < "$GA29_TMP/stat.calls" | tr -d ' ')), expected 0 and none"
+  fi
+else
+  bad "could not build the newest_backup_mtime_for_db fixture/snippet (snippet size: $(wc -c < "$GA29_MT_SNIP" 2>/dev/null), expected mtime: '${GA29_EXPECT:-}')"
+fi
+
+# The script budgets itself below the order timeout (the comment in mol-dog-doctor.toml promises this).
+GA29_TIMEOUT=$(sed -n 's/^timeout = "\([0-9][0-9]*\)s".*/\1/p' "$ORDER_TOML" 2>/dev/null)
+GA29_BUDGET=$(sed -n 's/^DOCTOR_BUDGET_S="${GC_DOCTOR_BUDGET_S:-\([0-9][0-9]*\)}".*/\1/p' "$SCRIPT")
+if [ -n "$GA29_TIMEOUT" ] && [ -n "$GA29_BUDGET" ] && [ $((GA29_BUDGET + 60)) -le "$GA29_TIMEOUT" ]; then
+  ok "the order declares timeout=${GA29_TIMEOUT}s and the script's own budget (${GA29_BUDGET}s) leaves >=60s of tail inside it"
+else
+  bad "order timeout ('${GA29_TIMEOUT:-undeclared}') / script budget ('${GA29_BUDGET:-missing}') violate budget+60 <= timeout — a run could be killed by the engine before it reports"
+fi
+
+# Step bounds and three-state reporting (static drift-guards; the main body needs a live Dolt).
+if [ "$(grep -cF 'if [ "$SECONDS" -ge "$DOCTOR_BUDGET_S" ]; then' "$SCRIPT")" -ge 2 ]; then
+  ok "both per-database loops (backup remotes, backup freshness) check the probe budget before starting a database"
+else
+  bad "a per-database loop no longer checks \$SECONDS against DOCTOR_BUDGET_S — it can run past the order timeout again"
+fi
+if grep -qF 'run_bounded "$STEP_TIMEOUT_S" dolt backup' "$SCRIPT" && grep -qF 'run_bounded "$STEP_TIMEOUT_S" du -sh' "$SCRIPT"; then
+  ok "the dolt backup CLI and du are bounded (they used to run unbounded, once per database)"
+else
+  bad "dolt backup / du is no longer bounded by STEP_TIMEOUT_S"
+fi
+if grep -qF 'CONN_COUNT="${CONN_COUNT_NUM:-unknown}"' "$SCRIPT" && ! grep -E 'CONN_COUNT.*echo "0"' "$SCRIPT" >/dev/null; then
+  ok "an unmeasured connection count is displayed as 'unknown', not folded into a measured 0"
+else
+  bad "CONN_COUNT can again report a failed query as 0 connections"
+fi
+if grep -qF '"$CONN_COUNT_NUM" "$PREV_CONN_COUNT" "$CONN_IS_WARN"' "$SCRIPT" \
+    && grep -qF '"$LATENCY_MS" "$CONN_COUNT_NUM" "$ORPHAN_COUNT"' "$SCRIPT"; then
+  ok "the cooldown predicate and state file receive the numeric count (empty when unmeasured), never the display string"
+else
+  bad "advisory_should_alert/state_write no longer receive CONN_COUNT_NUM — 'unknown' would reach jq --argjson"
+fi
+
+GA29_AU_SNIP="$GA29_TMP/au.sh"
+sed -n '/^append_unmeasured()/,/^}/p' "$SCRIPT" > "$GA29_AU_SNIP"
+GA29_AU_OUT=$(bash -c "UNMEASURED_ITEMS=''; source '$GA29_AU_SNIP'; append_unmeasured 'database list'; append_unmeasured 'backup remotes of hq'; printf '%s' \"\$UNMEASURED_ITEMS\"" 2>/dev/null)
+if [ "$GA29_AU_OUT" = "database list, backup remotes of hq" ]; then
+  ok "append_unmeasured() accumulates the not-measured items in order"
+else
+  bad "append_unmeasured() produced '$GA29_AU_OUT'"
+fi
+if grep -qF 'Not measured this run: ${UNMEASURED_ITEMS}' "$SCRIPT" && grep -qF '[not measured: $UNMEASURED_ITEMS]' "$SCRIPT"; then
+  ok "unmeasured items reach both the report body and the log/DOG_DONE summary"
+else
+  bad "unmeasured items no longer reach the report body and/or the summary line"
+fi
+rm -rf "$GA29_TMP"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
