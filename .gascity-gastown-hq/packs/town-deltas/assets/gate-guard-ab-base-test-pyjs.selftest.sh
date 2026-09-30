@@ -710,6 +710,24 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     eq "totals of {repaired test} -> consertou-teste-vermelho" "$(gate_base_test_verdict 1 1 1 0 1 0)" "consertou-teste-vermelho"
     eq "totals of {zero-test script only} -> sem-teste-novo" "$(gate_base_test_verdict 0 0 0 0 0 0)" "sem-teste-novo"
 
+    echo "  -- a modified file whose OLD form cannot be classified: never refused, never read as repaired --"
+    # Base's own copy of the file held a helper and no test, so there is no old red and no old green to compare
+    # with. The new test passes on base, which makes the file passes-on-base — but "was it already green?" has no
+    # answer, and the refusal is only allowed on a clean "yes, green before as well" (ga-yl1k3w). If unclassified
+    # stopped being counted, these totals would read as a plain passou-na-base: a refusal nobody measured.
+    C9="$H_SCRATCH/case9"; mk_case "$C9" ""
+    printf 'def helper():\n    return 1\n' > "$C9/tests/test_was_empty.py"
+    BASE9=$(commit_all "$C9" "base: a test file that holds no test yet")
+    fix_code "$C9" ""
+    printf 'from lib.mod import double\n\ndef test_now():\n    assert callable(double)\n' > "$C9/tests/test_was_empty.py"
+    TIP9=$(commit_all "$C9" "fix + the file gains its first test")
+    OUT=$(measure "$C9" "" "$BASE9" "$TIP9" tests/test_was_empty.py)
+    eq "new form passes on base, old form held no test -> passes-on-base with old=unknown" \
+      "$(fstate tests/test_was_empty.py)/$(fold tests/test_was_empty.py)" "passes-on-base/unknown"
+    eq "TOTALS count it as unclassified, not as repaired" "$(tot unclassified)/$(tot repaired)" "1/0"
+    eq "the totals cannot refuse it: nao-consegui-medir, not passou-na-base" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
+
     echo "  -- test-side support files that travel to base: code helpers vs data --"
     # A CODE helper (conftest / .py under tests/) is overlaid so a test importing it does not get a false ImportError
     # 'fails-on-base'. But a helper could ALSO be the fix (a bead repairing test infrastructure); overlaying it then
@@ -755,12 +773,53 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     eq "...and it SPENDS NOTHING: not one test run was started once the budget was gone (a budget that still pays for the base run is no budget)" "$(runs_in "$H_SCRATCH/trace-budget")" "0"
     OUT=$(measure "$C" "" "deadbeef00000000000000000000000000000000" "$TIP" tests/test_passes.py)
     eq "an unresolvable base sha -> unmeasured, why=worktree" "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)" "unmeasured/worktree"
+    # An input that is missing is a refusal to start, named as such — and nothing is run. (Each of the three is
+    # checked on its own: a check that only tested `-z "$rig"` would pass the first and miss the rest.)
+    for _in in rig base tip; do
+      rm -f "$H_SCRATCH/trace-in-$_in"
+      case "$_in" in
+        (rig)  OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-in-$_in" measure "" "" "$BASE" "$TIP" tests/test_passes.py) ;;
+        (base) OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-in-$_in" measure "$C" "" "" "$TIP" tests/test_passes.py) ;;
+        (tip)  OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-in-$_in" measure "$C" "" "$BASE" "" tests/test_passes.py) ;;
+      esac
+      eq "an empty $_in input -> unmeasured, why=inputs, and not one test was run" \
+        "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)/$(runs_in "$H_SCRATCH/trace-in-$_in")" "unmeasured/inputs/0"
+    done
+    # A listed path the tip does not hold cannot be overlaid onto base: the base tree would be half-built, and a
+    # half-built base proves nothing either way. Every file is unmeasured (not just the ghost) and nothing runs.
+    rm -f "$H_SCRATCH/trace-ghost"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-ghost" measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_ghost.py)
+    eq "a listed file the tip does not hold -> EVERY file unmeasured, why=overlay" \
+      "$(fstate tests/test_passes.py)/$(fwhy tests/test_passes.py)/$(fstate tests/test_ghost.py)/$(fwhy tests/test_ghost.py)" "unmeasured/overlay/unmeasured/overlay"
+    eq "...and not one test was run" "$(runs_in "$H_SCRATCH/trace-ghost")" "0"
+    # A test file that is a symlink to somewhere the checkout does not have: it overlays onto base as plain text,
+    # but at tip it dangles. Not a regular file on BOTH trees -> not materialised -> never run, never vouched for.
+    C10="$H_SCRATCH/case10"; mk_case "$C10" ""; BASE10=$(git -C "$C10" rev-parse HEAD); fix_code "$C10" ""
+    ln -s /nonexistent/gate-selftest/test_real.py "$C10/tests/test_link.py"
+    TIP10=$(commit_all "$C10" "fix + a test file that is a dangling symlink")
+    rm -f "$H_SCRATCH/trace-link"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-link" measure "$C10" "" "$BASE10" "$TIP10" tests/test_link.py)
+    eq "a test file that is not a regular file on both trees -> unmeasured, why=missing-file, nothing run" \
+      "$(fstate tests/test_link.py)/$(fwhy tests/test_link.py)/$(runs_in "$H_SCRATCH/trace-link")" "unmeasured/missing-file/0"
+    eq "...counted but NOT materialised, so the totals cannot vouch for it: counted=1 copy_ok=0 ran=0" \
+      "$(tot counted)/$(tot copy_ok)/$(tot ran)" "1/0/0"
+    eq "...and gate_base_test_verdict cannot refuse on it: nao-consegui-medir" \
+      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
     OUT=$(gate_base_test_pyjs_measure "$H_SCRATCH/rig-novenv" "$BASE" "$TIP" "tests/test_passes.py")
     eq "a rig that is not a git repo -> unmeasured (and no crash)" "$(fstate tests/test_passes.py)" "unmeasured"
     OUT=$(gate_base_test_pyjs_measure "$C" "$BASE" "$TIP" "")
     eq "an empty file list -> TOTALS with counted=0 (nothing to measure is a MEASURED zero only for the caller that listed nothing)" "$(tot counted)" "0"
-    eq "tests/ helper-only file (no kind) handed in by mistake -> unmeasured, never silently dropped" \
-      "$(OUT=$(measure "$C" "" "$BASE" "$TIP" tests/gate_pyjs_helper.py); fstate tests/gate_pyjs_helper.py)" "unmeasured"
+    # (The helper lives in case C4, where it exists at tip: against C it would be a ghost path and answer why=overlay,
+    # which is a different branch than the one this line is about.)
+    rm -f "$H_SCRATCH/trace-notatest"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-notatest" measure "$C4" "" "$BASE4" "$TIP4" tests/gate_pyjs_helper.py)
+    eq "a tests/ helper (no kind) handed in by mistake -> unmeasured, why=not-a-test, never silently dropped" \
+      "$(fstate tests/gate_pyjs_helper.py)/$(fwhy tests/gate_pyjs_helper.py)" "unmeasured/not-a-test"
+    eq "...counted (it was asked about) but not materialised, and nothing was run for it" \
+      "$(tot counted)/$(tot copy_ok)/$(runs_in "$H_SCRATCH/trace-notatest")" "1/0/0"
+    OUT=$(measure "$C" "" "$BASE" "$TIP" lib/mod.py)
+    eq "production code (not test-side at all) handed in by mistake -> unmeasured, why=not-a-test" \
+      "$(fstate lib/mod.py)/$(fwhy lib/mod.py)" "unmeasured/not-a-test"
     eq "no scratch directory left behind after ~20 measurements (incl. timeouts and refused setups)" "$(ls -A "$PRIV5" | wc -l | tr -d ' ')" "0"
     eq "no throwaway worktree left registered in the repo" "$(git -C "$C" worktree list | wc -l | tr -d ' ')" "1"
     eq "the rig's own files were not touched by the runs" "$(git -C "$C" status --porcelain | wc -l | tr -d ' ')" "0"
@@ -819,6 +878,15 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     TIP3=$(commit_all "$C3" "fix + tests")
     OUT=$(measure "$C3" "rig" "$BASE3" "$TIP3" rig/tests/test_fails.py)
     eq "subdirectory rig: root-relative paths resolve to the right file (fails-on-base)" "$(fstate rig/tests/test_fails.py)" "fails-on-base"
+    # A test file that lives OUTSIDE the rig's subtree is not something the rig's runner (its pytest.ini, its venv,
+    # its cwd) can run. It is named as such, counted, not materialised — and the file inside the rig is unaffected.
+    mkdir -p "$C3/outside"; printf 'from lib.mod import double\n\ndef test_o():\n    assert callable(double)\n' > "$C3/outside/test_o.py"
+    TIP3B=$(commit_all "$C3" "a test file OUTSIDE the rig subtree")
+    OUT=$(measure "$C3" "rig" "$BASE3" "$TIP3B" rig/tests/test_fails.py outside/test_o.py)
+    eq "a test file outside the rig subtree -> unmeasured, why=outside-rig; the file inside it is still measured" \
+      "$(fstate outside/test_o.py)/$(fwhy outside/test_o.py)/$(fstate rig/tests/test_fails.py)" "unmeasured/outside-rig/fails-on-base"
+    eq "...counted but not materialised: counted=2 copy_ok=1 ran=1 failed=1" \
+      "$(tot counted)/$(tot copy_ok)/$(tot ran)/$(tot failed)" "2/1/1/1"
 
     echo "  -- the guard runs under set -euo pipefail --"
     OUT=$(bash -c 'set -euo pipefail; GATE_GUARD_LIB_ONLY=1 . "$1"; O=$(gate_base_test_pyjs_measure "$2" "$3" "$4" "tests/test_env.py"); echo "survived:$(printf "%s\n" "$O" | grep -c "^TOTALS ")"' _ "$GUARD" "$C" "$BASE" "$TIP" 2>&1 | tail -1)
