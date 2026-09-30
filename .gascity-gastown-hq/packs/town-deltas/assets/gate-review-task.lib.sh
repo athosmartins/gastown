@@ -16,6 +16,11 @@
 # Contract: pure functions — stdout, plus the two globals gate_build_diff_payload documents. No bd, no gc,
 # no network. Safe under `set -euo pipefail` (every positional read is ${N:-}) and under /bin/bash 3.2.
 #
+# Two OPTIONAL pieces are appended by the gate only (E5, ga-syxaki): ${GATE_E5_COV_RULES} (a paragraph asking the reviewer to
+# list what it examined) and ${GATE_E5_COV_PASS_LINE} (the matching line of the PASS template). Both are read as ${VAR:-} and are
+# set ONLY by gate-e5-second-reviewer.lib.sh (gate_e5_task_vars) inside the dispatcher while the E5 flag is on — a builder running
+# pre-gate-review.sh never sets them, so the builder text and the flag-off gate text are byte-identical to before.
+#
 # Editing the prompt text below changes what every reviewer is told, and what the builder rehearses against. Keep the
 # prose free of apostrophes: while this text sat inside a command substitution in the dispatcher, one stray apostrophe
 # made /bin/bash 3.2 misparse the whole file and the gate spawned no reviewer for ~3h (ga-6aj348). It no longer sits in a
@@ -223,7 +228,7 @@ WHY THIS MATTERS: this gate fails on ANY single reviewer FAIL, so a
 false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycle
 on correct code. Be adversarial about whether the CODE actually has the
 defect, never about whether a real finding deserves to be reported: verify
-each issue is real, then report everything real you find, at its true severity.
+each issue is real, then report everything real you find, at its true severity.${GATE_E5_COV_RULES:-}
 TASK
 }
 
@@ -237,7 +242,7 @@ bd -C "$GC_CITY" label remove "$VERDICT_BEAD_ID" "verdict:pending"
 bd -C "$GC_CITY" label add "$VERDICT_BEAD_ID" "verdict:PASS"
 bd -C "$GC_CITY" comment "$VERDICT_BEAD_ID" "VERDICT: PASS
 Summary: <2-3 sentence summary of what you checked and why it passes your lens>
-Non-blocking findings: <one per line as severity: description, or none>"
+${GATE_E5_COV_PASS_LINE:-}Non-blocking findings: <one per line as severity: description, or none>"
 bd -C "$GC_CITY" close "$VERDICT_BEAD_ID"
 
 # If FAIL:
