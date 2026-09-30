@@ -65,6 +65,8 @@ unset _QHC_SCRIPT
 GATE_E5_LIB_OK=0
 GATE_E5_COV_RULES=""; GATE_E5_COV_PASS_LINE=""
 GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_ACTIVE=0
+GATE_E5_RUN_VB_JSON=""
+GATE_E5_RUN_ARM=""; GATE_E5_RUN_DESC_LINE=""
 _E5_LIB="${GC_CITY}/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
 if [ -r "$_E5_LIB" ]; then { source "$_E5_LIB" 2>/dev/null && GATE_E5_LIB_OK=1; } || true; fi
 unset _E5_LIB
@@ -10569,7 +10571,9 @@ gate_phase_c_all_pending_closed() {
 # missing field from aborting the dispatcher under `set -euo pipefail` — an
 # absent field makes grep exit 1 (no match) and pipefail would propagate it;
 # a no-match now yields an empty string instead, letting callers fall back.
+# SELFTEST-EXTRACT run-desc-extract-fn: BEGIN
 extract() { echo "$DESC" | grep -E "^$1:" | head -1 | sed "s/^$1: *//" || true; }
+# SELFTEST-EXTRACT run-desc-extract-fn: END
 
 # ── ga-zl277: guaranteed reviewer-session cleanup on EVERY exit path ───────────
 # Reviewer sessions used to be closed ONLY at Step 9 (the success/timeout path).
@@ -10814,6 +10818,12 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       MARKER_ID=$(extract "marker_id")
       PC_STARTED_AT=$(extract "started_at")
       PC_TIMEOUT_MIN=$(extract "verdict_timeout_minutes")
+      # ga-syxaki (E5, gate attempt 1, blocking issue 3): the arm Step 5 persisted in THIS run's record. It is the only arm Phase C
+      # may act on: a run admitted while the flag was off, an older run, or one whose arm was never measured carries no "B" here
+      # and never gets a first-fail extra, whatever the flag says now and whatever the bead's arm recomputes to.
+      # SELFTEST-EXTRACT e5-run-arm: BEGIN
+      GATE_E5_RUN_ARM=$(extract "e5_arm")
+      # SELFTEST-EXTRACT e5-run-arm: END
       case "$REQUIRED_REVIEWERS" in ''|*[!0-9]*) REQUIRED_REVIEWERS=1 ;; esac
       case "$PC_TIMEOUT_MIN" in ''|*[!0-9]*) PC_TIMEOUT_MIN="$VERDICT_TIMEOUT_MINUTES" ;; esac
 
@@ -10869,6 +10879,10 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         log "  Phase C: verdict-bead query for gate-run $GATE_RUN_ID failed this sweep (transient Dolt hiccup?) — skipping, will retry next sweep (root-class:error-vs-empty). NOT treating as died-before-Step-7."
         continue
       fi
+      # ga-syxaki (E5, gate attempt 1): keep THIS run's list under its own name. gate_collect_verdicts (below)
+      # assigns the global VB_JSON once per bead, so after it VB_JSON is the last bead's answer, not the list;
+      # the E5 rehydrate/hook decide on the list and must not read the clobbered global.
+      GATE_E5_RUN_VB_JSON="$VB_JSON"
       VERDICT_BEAD_IDS=()
       while IFS= read -r PC_VBID; do
         [ -z "$PC_VBID" ] && continue
@@ -10879,8 +10893,8 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # ga-syxaki (E5): abandoned extra slots leave the run; live ones raise the required count.
       # State lives on the verdict beads (labels) — survives a dispatcher crash. No E5 label in
       # the answer -> not even called.
-      case "$VB_JSON" in
-        *e5-extra*) if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_rehydrate "$VB_JSON" || true; fi ;;
+      case "$GATE_E5_RUN_VB_JSON" in
+        *e5-extra*) if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_rehydrate "$GATE_E5_RUN_VB_JSON" || true; fi ;;
       esac
 
       # ga-eqjo (gate-fix-3): this emptiness guard MUST run before any
@@ -10940,12 +10954,14 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # bead's first judged FAIL — BEFORE the decision below, so it is taken on the reviewers
       # that delivered (extra never makes the run worse than arm A). Present only when an extra
       # slot exists or the flag is on; otherwise neither test passes and nothing runs.
+      # SELFTEST-EXTRACT e5-phase-c-hook-call: BEGIN
       if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then
         _e5_hook=0
-        case "$VB_JSON" in *e5-extra*) _e5_hook=1 ;; esac
+        case "$GATE_E5_RUN_VB_JSON" in *e5-extra*) _e5_hook=1 ;; esac
         if [ "$_e5_hook" = "0" ] && [ "$(gate_e5_enabled)" = "1" ]; then _e5_hook=1; fi
         if [ "$_e5_hook" = "1" ]; then gate_e5_phase_c_hook || true; fi
       fi
+      # SELFTEST-EXTRACT e5-phase-c-hook-call: END
 
       # SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN
       if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
@@ -15380,13 +15396,20 @@ esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 
-# ga-syxaki (E5): arm + big-diff trigger, decided BEFORE the run record exists. Flag off ->
+# ga-syxaki (E5): arm + big-diff trigger, decided BEFORE the run record exists — and decided ONCE: this is the only read of
+# the flag for this run's admission. GATE_E5_ACTIVE (the admit log, the prompt pieces, the big-diff extra) is derived from it
+# here, and Step 6 writes the arm into the run record for Phase C to read back; neither Step 7 nor Phase C reads the flag again
+# to decide what this run IS (gate attempt 1, blocking issue 3: a second read plus an arm that defaulted to "A" let a flip
+# between the two log an unmeasured run as a measured arm-A run). An arm nobody measured is "?", never "A". Flag off ->
 # this block is one string test and nothing else.
-GATE_E5_ARM="A"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""
+# SELFTEST-EXTRACT e5-admit-step5: BEGIN
+GATE_E5_ARM="?"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_ACTIVE=0
 if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
+  GATE_E5_ACTIVE=1
   gate_e5_admit_decision || true
   log "E5: bead=$BEAD_ID arm=$GATE_E5_ARM trigger=$GATE_E5_TRIGGER size=$GATE_E5_SIZE_STATE (${GATE_E5_RAW_LINES:-?} lines)"
 fi
+# SELFTEST-EXTRACT e5-admit-step5: END
 
 # ── Step 5b (ga-dupnv, bug 1): live-sibling-run guard — SAFETY NET ────────────
 # A marker can be claimed twice for the SAME branch: the dispatcher dies mid-run
@@ -15547,6 +15570,13 @@ fi
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 GATE_START_EPOCH=$(date +%s)
 
+# ga-syxaki (E5): the admission decision travels in the run record, for Phase C to read back (see Step 5). Only a run admitted
+# under the flag carries the line, so with the flag off the record is byte-identical to today's.
+# SELFTEST-EXTRACT e5-run-desc: BEGIN
+GATE_E5_RUN_DESC_LINE=""
+if [ "${GATE_E5_ACTIVE:-0}" = "1" ]; then GATE_E5_RUN_DESC_LINE=$'\n'"e5_arm: ${GATE_E5_ARM:-?}"; fi
+# SELFTEST-EXTRACT e5-run-desc: END
+
 GATE_RUN_ID=$(bd -C "$GC_CITY" create \
   "gate-run: $BRANCH ($BEAD_ID)" \
   -t chore \
@@ -15564,7 +15594,7 @@ required_reviewers: $REQUIRED_REVIEWERS
 branch_sha: $BRANCH_SHA
 marker_id: $MARKER_ID
 started_at: $NOW
-verdict_timeout_minutes: $VERDICT_TIMEOUT_MINUTES" \
+verdict_timeout_minutes: $VERDICT_TIMEOUT_MINUTES${GATE_E5_RUN_DESC_LINE:-}" \
   --json 2>/dev/null | jq -r '.id // empty' || echo "")
 
 if [ -z "$GATE_RUN_ID" ]; then
@@ -15620,13 +15650,14 @@ trap 'exit 129' HUP
 
 log "Spawning $REQUIRED_REVIEWERS independent reviewer session(s) ..."
 
-# ga-syxaki (E5): with the flag on, every reviewer of BOTH arms is asked to list what it
-# examined (the Coverage line); off -> the two pieces stay "" and the task is unchanged.
-GATE_E5_ACTIVE=0
-if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
-  GATE_E5_ACTIVE=1
-  gate_e5_task_vars
+# ga-syxaki (E5): a run ADMITTED under the flag (GATE_E5_ACTIVE, decided once at Step 5 — no second read of the flag here) has
+# every reviewer of BOTH arms asked to list what it examined (the Coverage line); otherwise the two pieces stay "" and the
+# task is unchanged.
+# SELFTEST-EXTRACT e5-step7-task-vars: BEGIN
+if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "${GATE_E5_ACTIVE:-0}" = "1" ]; then
+  gate_e5_task_vars admitted
 fi
+# SELFTEST-EXTRACT e5-step7-task-vars: END
 
 for i in $(seq 1 $REQUIRED_REVIEWERS); do
   # ga-cvhoj: reviewer 1 spawns FIRST, immediately after the dispatcher's own

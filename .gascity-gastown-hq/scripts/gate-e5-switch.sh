@@ -35,8 +35,13 @@ status() {
   fi
   local counter="$CITY/.gc/gate-e5-spend-$(date +%Y-%m-%d).count" n=0
   [ -r "$counter" ] && n="$(cat "$counter" 2>/dev/null || echo 0)"
-  case "$n" in ''|*[!0-9]*) n="ilegível" ;; esac
-  echo "  extras pagos hoje: $n · estimativa US\$ $(awk -v n="${n//[!0-9]/}" -v u="$EST_USD" 'BEGIN{printf "%.2f", (n==""?0:n)*u}') de US\$ $CAP_USD (teto; estimativa = contagem × US\$ $EST_USD)"
+  # an unreadable counter is UNKNOWN spend, not "US$ 0.00 of the cap": say so instead of multiplying garbage by the unit cost
+  local est
+  case "$n" in
+    ''|*[!0-9]*) n="ilegível"; est="desconhecida (contador ilegível)" ;;
+    *) est="US\$ $(awk -v n="$n" -v u="$EST_USD" 'BEGIN{printf "%.2f", n*u}')" ;;
+  esac
+  echo "  extras pagos hoje: $n · estimativa $est de US\$ $CAP_USD (teto; estimativa = contagem × US\$ $EST_USD)"
   [ -e "$counter.alerted" ] && echo "  ⚠ o teto do dia JÁ foi atingido — nenhum extra novo até amanhã."
   return 0
 }
