@@ -2627,6 +2627,157 @@ gate_base_test_outside_subtree() {
   return 0
 }
 
+# gate_base_test_kind <path>  (ga-kisvqp, E7 of ga-ufskhy)
+#   Which test convention a changed file belongs to, by NAME only (no IO):
+#     sh   — *.selftest.sh, the only kind the ga-rstae base check measured.
+#     py   — pytest's default patterns: test_*.py and *_test.py.
+#     js   — *.test.<ext> / *.spec.<ext> for js mjs cjs jsx ts tsx (vitest/jest's).
+#     none — anything else: production code, conftest.py, helpers, data. An empty
+#            path is none — an unresolved input is never a test.
+#   Name-based on purpose: whether the file really HOLDS tests is measured later, by
+#   running it (a test_*.py script with zero tests reads `no-tests`, not a test).
+#   Prints exactly one word; always returns 0 (the guard runs under set -e).
+gate_base_test_kind() {
+  local f="$1" base=""
+  if [ -z "$f" ]; then printf 'none'; return 0; fi
+  base="${f##*/}"
+  case "$base" in
+    (*.selftest.sh) printf 'sh' ;;
+    (test_*.py|*_test.py) printf 'py' ;;
+    (*.test.js|*.test.mjs|*.test.cjs|*.test.jsx|*.test.ts|*.test.tsx) printf 'js' ;;
+    (*.spec.js|*.spec.mjs|*.spec.cjs|*.spec.jsx|*.spec.ts|*.spec.tsx) printf 'js' ;;
+    (*) printf 'none' ;;
+  esac
+  return 0
+}
+
+# gate_base_test_is_support <path>  (ga-kisvqp)
+#   yes when <path> is TEST-SIDE: a file that must travel with the test when it is run
+#   against the base tree — the test file itself (py/js), any conftest.py, and anything
+#   under a tests/, tests-js/, test/, __tests__/ or fixtures/ directory. A test that
+#   imports a helper the branch also added fails on base with an ImportError that says
+#   nothing about the fix; overlaying the test-side files removes that noise, while
+#   leaving every OTHER changed file at base, because those ARE the fix.
+#   A directory counts only as a whole path component ("/tests/"), never as a substring
+#   (lib/contest/x.py is production code). Empty path -> no. Pure (no IO).
+gate_base_test_is_support() {
+  local f="$1" kind=""
+  if [ -z "$f" ]; then printf 'no'; return 0; fi
+  kind=$(gate_base_test_kind "$f")
+  case "$kind" in
+    (py|js) printf 'yes'; return 0 ;;
+  esac
+  if [ "${f##*/}" = "conftest.py" ]; then printf 'yes'; return 0; fi
+  case "/$f" in
+    (*/tests/*|*/tests-js/*|*/test/*|*/__tests__/*|*/fixtures/*) printf 'yes' ;;
+    (*) printf 'no' ;;
+  esac
+  return 0
+}
+
+# _gate_base_test_classify <mode> <tip> <base> <alone-tip> <alone-base>  (ga-kisvqp)
+#   The ONE classifier behind gate_base_test_decisive / _file_state / _old_form_state, so
+#   the three can never disagree about what "decisive" means. Each table argument is an
+#   OUTCOME TABLE: a "#ok" header line (the run was READ and parsed) then one
+#   "<id><TAB><outcome>" row per test, outcome in pass | fail | skip | collect-error.
+#   The header is what keeps "unreadable" from looking like "empty": a table with no
+#   "#ok" line, or with any malformed row, is UNREADABLE and every mode answers
+#   unmeasured/unknown/nothing — it never reads as "zero tests" or "all passed".
+#   Pure (no IO besides the awk child); prints one word or a list of ids.
+_gate_base_test_classify() {
+  local mode="$1"
+  printf '\001tip\n%s\n\001base\n%s\n\001atip\n%s\n\001abase\n%s\n\001old\n%s\n' \
+    "$2" "$3" "$4" "$5" "$2" \
+    | GATE_ABT_ALONE_MAX="${GATE_ABT_ALONE_MAX:-3}" awk -v mode="$mode" '
+function has(s, id) { return ((s SUBSEP id) in val) }
+function get(s, id) { return has(s, id) ? val[s, id] : "" }
+function bfail(s, id) { return (get(s, id) == "fail") || (!has(s, id) && cerr[s]) }
+function readable(s) { return okflag[s] && !bad[s] }
+function decisive(   i, id) {
+  nd = 0
+  for (i = 1; i <= cnt["tip"]; i++) {
+    id = ord["tip", i]
+    if (get("tip", id) == "pass" && bfail("base", id)) { nd++; dec[nd] = id }
+  }
+  lim = (nd < max) ? nd : max
+}
+BEGIN { FS = "\t"; SEC = sprintf("%c", 1); max = ENVIRON["GATE_ABT_ALONE_MAX"] + 0; if (max < 1) max = 3 }
+substr($0, 1, 1) == SEC { sec = substr($0, 2); next }
+$0 == "#ok" { okflag[sec] = 1; next }
+$0 == "" { next }
+{
+  if (NF != 2 || ($2 != "pass" && $2 != "fail" && $2 != "skip" && $2 != "collect-error")) { bad[sec] = 1; next }
+  if (!((sec SUBSEP $1) in val)) { cnt[sec]++; ord[sec, cnt[sec]] = $1 }
+  val[sec, $1] = $2
+  if ($2 == "collect-error") cerr[sec] = 1
+  if ($2 == "pass") npass[sec]++
+  if ($2 == "fail" || $2 == "collect-error") nred[sec]++
+}
+END {
+  if (mode == "old") {
+    if (!readable("old")) { print "unknown"; exit 0 }
+    if (nred["old"] > 0) print "old-fails"
+    else if (npass["old"] > 0) print "old-passes"
+    else print "unknown"
+    exit 0
+  }
+  if (mode == "decisive") {
+    if (readable("tip") && readable("base")) { decisive(); for (i = 1; i <= lim; i++) print dec[i] }
+    exit 0
+  }
+  if (!readable("tip") || !readable("base")) { print "unmeasured"; exit 0 }
+  if (cnt["tip"] == 0) { print "no-tests"; exit 0 }
+  if (cerr["tip"] || npass["tip"] == 0) { print "unmeasured"; exit 0 }
+  decisive()
+  if (nd > 0) {
+    if (!readable("atip") || !readable("abase")) { print "unmeasured"; exit 0 }
+    for (i = 1; i <= lim; i++) {
+      id = dec[i]
+      if (get("atip", id) == "pass" && bfail("abase", id)) { print "fails-on-base"; exit 0 }
+    }
+    print "unmeasured"; exit 0
+  }
+  for (i = 1; i <= cnt["tip"]; i++) {
+    id = ord["tip", i]
+    if (get("tip", id) == "pass" && get("base", id) != "pass") { print "unmeasured"; exit 0 }
+  }
+  print "passes-on-base"
+}'
+}
+
+# gate_base_test_decisive <tip-table> <base-table>  (ga-kisvqp)
+#   The tests worth re-running ALONE: they PASS at tip (the control: the test is sound
+#   in this environment with the fix applied) and FAIL at base (a failing assertion, or a
+#   collection error that took the whole file down — then every tip-passing test is a
+#   candidate). A test that also fails at tip, is skipped, or is merely absent at base is
+#   never decisive: none of those says "the fix is what this test needs". Prints at most
+#   GATE_ABT_ALONE_MAX (default 3) ids, one per line — each costs a process start on both
+#   trees. Prints nothing when either table is unreadable.
+gate_base_test_decisive() { _gate_base_test_classify decisive "${1-}" "${2-}" "" ""; }
+
+# gate_base_test_file_state <tip> <base> [<alone-tip> <alone-base>]  (ga-kisvqp)
+#   One file's answer, from its outcome tables (see _gate_base_test_classify):
+#     fails-on-base  — a decisive test (passes at tip, fails at base) ALSO passes alone at tip
+#                      and fails alone at base. Evidence the test depends on the fix.
+#     passes-on-base — readable tables, at least one test passes at tip, and EVERY test that
+#                      passes at tip also passes at base. Evidence the test proves nothing.
+#     no-tests       — the tip run was read cleanly and held zero tests (a test_*.py that is a
+#                      script). Not a test file; not counted.
+#     unmeasured     — everything else: an unreadable table, a control that is not green, a
+#                      skip or an absent test at base, a file-run failure that does not
+#                      reproduce alone (order/clock/env dependence, lição wa-br1w4r /
+#                      wa-u4bdpn). Never evidence in either direction.
+#   Only passes-on-base can lead to a refusal, and only when every other file agrees.
+gate_base_test_file_state() { _gate_base_test_classify state "${1-}" "${2-}" "${3-}" "${4-}"; }
+
+# gate_base_test_old_form_state <old-table>  (ga-kisvqp)
+#   ga-yl1k3w for pytest/js: what does base's OWN copy of a changed test file do on base?
+#     old-fails  — it ran and has a failing test or a collection error: old red + new green
+#                  is a REPAIR (the code was right, only the test was wrong).
+#     old-passes — it ran and is green: passing in BOTH forms proves nothing.
+#     unknown    — unreadable, or read but no test actually passed (zero tests, all skipped).
+gate_base_test_old_form_state() { _gate_base_test_classify old "${1-}" "" "" ""; }
+
 # gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'> <its-diagnostic>
 #   ga-7dx2vw: what ONE `/bin/bash -n` run means. The parser gives TWO signals —
 #   an exit status and a diagnostic (stderr) — and the verdict has to come from
