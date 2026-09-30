@@ -388,7 +388,7 @@ fi
 # $wt must be a REAL, non-bare checkout for this (unlike Teste 6's bare
 # .repo.git): --check reads $wt's on-disk files, exactly as the live
 # dispatcher's $TMP_REBASE_WT already is post-commit, pre-push.
-mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|none] [main_n:5]
+mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow|degraded|selfattest|crash|killed|exit2|none] [main_n:5]
   local R="$1" with_other="${2:-0}" with_feature="${3:-0}" gen_mode="${4:-canon}" main_n="${5:-5}" pre=''
   mkdir -p "$R/daemons" "$R/scripts"
   git -C "$R" init -q
@@ -396,11 +396,23 @@ mkrepo_ddj() {  # <dir> [with_other:0|1] [with_feature:0|1] [gen_mode:canon|slow
   case "$gen_mode" in
     slow)     pre='import time; time.sleep(30)' ;;
     degraded) pre='sys.stderr.write("AVISO varredura degradada: 1 plist(s) nao parseiam agora\n")' ;;
+    # The three ways the REAL generator ends WITHOUT a drift verdict (ga-ub5hkz
+    # gate attempt 1): an uncaught exception (rc 1), a SIGKILL/OOM-kill (rc 137)
+    # and its own selftest/usage exit (rc 2). None of them says "the file is
+    # stale" — only rc 4 does — so none may ever be read as a rejection.
+    crash)    pre='raise RuntimeError("generator blew up before reaching a verdict")' ;;
+    killed)   pre='import os, signal; os.kill(os.getpid(), signal.SIGKILL)' ;;
+    exit2)    pre='sys.exit(2)' ;;
   esac
   # Fixture generator: --check passes iff the committed file's content is
   # exactly the one "canonical" string — a minimal stand-in for the real
   # rig's scripts/gen_daemon_deps.py (wa-9lxa7's "compara o build fresco
   # contra o commitado"); this test only needs pass/fail, not real closures.
+  # Exit codes mirror the real main(): 0 in sync, 4 drift ("DESATUALIZADO"),
+  # 1 committed file missing OR an uncaught exception, 2 selftest fail (and
+  # argparse usage errors). The fixture used to signal drift with 1, which is
+  # the code a CRASH produces in production — so a suite that was green for
+  # "drift => no" was equally green for "crash => no" (ga-ub5hkz gate FAIL).
   if [ "$gen_mode" != "none" ]; then   # none: a rig that never had a generator
     cat > "$R/scripts/gen_daemon_deps.py" <<PYEOF
 #!/usr/bin/env python3
@@ -409,7 +421,7 @@ CANON = '{"n": 2}\n'
 if "--check" in sys.argv[1:]:
     $pre
     with open("daemons/deploy_deps.json") as f:
-        sys.exit(0 if f.read() == CANON else 1)
+        sys.exit(0 if f.read() == CANON else 4)
 sys.exit(0)
 PYEOF
   fi
@@ -473,8 +485,8 @@ printf '{"n": 999}\n' > "$RD/daemons/deploy_deps.json"
 git -C "$RD" commit -qam "corrupted: does not match the generator"
 DDJ_BAD_TIP=$(git -C "$RD" rev-parse HEAD)
 V8B=$(run_verdict_at "$RD" "$DDJ_MAIN" "$DDJ_BRANCH" "$DDJ_BAD_TIP")
-[ "$V8B" = "unknown:deploy-deps-check-failed" ] && ok "--check FAILS on drifted content => unknown:deploy-deps-check-failed (never silently upgraded to yes)" \
-                   || bad "expected unknown:deploy-deps-check-failed for drifted content, got '$V8B' (would silently push bad content)"
+[ "$V8B" = "unknown:deploy-deps-check-drift" ] && ok "--check reports DRIFT (rc 4) on drifted content => unknown:deploy-deps-check-drift (never silently upgraded to yes)" \
+                   || bad "expected unknown:deploy-deps-check-drift for drifted content, got '$V8B' (would silently push bad content)"
 
 # Teste 8c — SAFETY: a rig whose main has NO generator at all => nothing to
 # vouch for the file, so it cannot be verified; falls through with its own
@@ -671,7 +683,9 @@ V9C=$(run_verdict_at "$RC3" "$C3_MAIN" "$C3_BRANCH" "$C3_TIP")
 # Teste 9d — SEGURANCA: so deploy_deps.json diverge, mas o conteudo do tip esta
 # ERRADO ({"n": 999}) — o gerador nao abona. Tem de ser "no" (deterministico:
 # needs-rebase), NAO "unknown" (que cairia no retry transitorio e ressoaria —
-# ga-10uqmi) e jamais "yes".
+# ga-10uqmi) e jamais "yes". "Reprova" aqui e o codigo de DRIFT do gerador (4,
+# o unico que significa "arquivo desatualizado"); crash/kill/uso saem com
+# outros codigos e sao os Testes 9i-9k — la o resultado e unknown, nao no.
 RC4="$TMP/repo-ddj-clean-wrong"; ddj_setup "$RC4" 0 1 canon 1
 C4_MAIN="$DDJ_MAIN"; C4_BRANCH="$DDJ_BRANCH"
 printf '{"n": 999}\n' > "$RC4/daemons/deploy_deps.json"
@@ -720,6 +734,30 @@ V9G=$(run_verdict_at "$RC7" "$C7_MAIN" "$C7_BRANCH" "$C7_TIP")
 [ "$V9G" = "unknown:deploy-deps-wt-not-at-tip" ] \
   && ok "\$wt fora do new_tip => unknown:deploy-deps-wt-not-at-tip (sem arbitro, sem veredito)" \
   || bad "esperava unknown:deploy-deps-wt-not-at-tip, deu '$V9G'"
+
+# Testes 9i / 9j / 9k — "o arbitro nao chegou a um veredito" NAO e "o arbitro
+# reprovou" (gate FAIL 1/3 do ga-ub5hkz, terceiro estado colapsado em "no").
+# So o codigo 4 do gerador real ("deploy_deps.json DESATUALIZADO") e uma
+# reprovacao; o gerador tambem sai com 1 (arquivo commitado ausente OU
+# excecao nao tratada), 2 (selftest/uso) e e morto por sinal (137: SIGKILL/OOM,
+# irmao do timeout 124 que ja era tratado). O tip aqui esta CERTO ({"n": 2}) —
+# o unico que varia e como o gerador termina —, entao um "no" mandaria codigo
+# correto pra needs-rebase (queimando GATE_FIX_CAP, ga-10uqmi) so porque a
+# maquina estava sob carga. Tem de ser unknown (retry transitorio), nunca no.
+for c in "9i:crash:o gerador levanta excecao (rc 1)" \
+         "9j:killed:o gerador e morto por SIGKILL (rc 137)" \
+         "9k:exit2:o gerador sai com 2 (selftest/uso)"; do
+  c_id="${c%%:*}"; c_rest="${c#*:}"; c_mode="${c_rest%%:*}"; c_what="${c_rest#*:}"
+  CR="$TMP/repo-ddj-clean-$c_mode"; ddj_setup "$CR" 0 1 "$c_mode" 1
+  CR_MAIN="$DDJ_MAIN"; CR_BRANCH="$DDJ_BRANCH"
+  printf '{"n": 2}\n' > "$CR/daemons/deploy_deps.json"
+  git -C "$CR" commit -qam "correct tip; the generator cannot reach a verdict ($c_mode)"
+  CR_TIP=$(git -C "$CR" rev-parse HEAD)
+  VCR=$(run_verdict_at "$CR" "$CR_MAIN" "$CR_BRANCH" "$CR_TIP")
+  [ "$VCR" = "unknown:deploy-deps-check-failed" ] \
+    && ok "$c_id: $c_what => unknown:deploy-deps-check-failed (sem veredito != reprovado; nunca no)" \
+    || bad "$c_id: $c_what — esperava unknown:deploy-deps-check-failed, deu '$VCR' (um arbitro que nao rodou virou reprovacao: queima GATE_FIX_CAP em codigo certo)"
+done
 
 # Teste 9b-mut / 9e-mut — MUTACAO: neutralize cada requisito e o MESMO fixture
 # tem de virar yes. Sem isso 9b/9e poderiam passar por outro motivo e nao

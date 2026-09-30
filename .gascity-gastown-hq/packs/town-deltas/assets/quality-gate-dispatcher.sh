@@ -4907,10 +4907,18 @@ rebase_deploy_deps_verdict() {
     log "rebase_content_verdict: running gen_daemon_deps.py --check (timeout ${chk_timeout}s) — $why" >&2
   fi
   chk_err=$( cd "$wt" && timeout "$chk_timeout" python3 scripts/gen_daemon_deps.py --check 2>&1 >/dev/null ); chk_rc=$?
+  # The generator's main() exits 4 — and ONLY 4 — for "deploy_deps.json
+  # DESATUALIZADO" (a verdict: it ran to the end and the committed file is
+  # stale). Everything else non-zero is NOT a verdict: 1 is "committed file
+  # missing" OR any uncaught exception, 2 is its own selftest failure OR an
+  # argparse usage error, and >=128 is death by signal (SIGKILL/OOM under the
+  # load this file's comments cite). Those all stay under check-failed, i.e.
+  # "could not verify", so a caller can tell "rejected" from "never finished".
   case "$chk_rc" in
     0) : ;;
     124) echo "unknown:deploy-deps-check-timeout"; return 0 ;;
     127) echo "unknown:deploy-deps-check-unavailable"; return 0 ;;
+    4) echo "unknown:deploy-deps-check-drift"; return 0 ;;
     *) echo "unknown:deploy-deps-check-failed"; return 0 ;;
   esac
   # --check exits 0 even when its plist scan was degraded (it demotes the
@@ -4939,10 +4947,13 @@ rebase_deploy_deps_verdict() {
 #                   (ga-ub5hkz: segue "no" quando o arbitro de deploy_deps.json
 #                   nao abona — diverge TAMBEM outro path (tree-mismatch),
 #                   ninguem pode abonar o tip (gerador ausente ou diferente do
-#                   de main) ou o --check RODOU e reprovou. Fica "no" porque e
-#                   deterministico: o classificador do gate manda "no" pra
-#                   needs-rebase e "unknown" pro retry transitorio, ga-10uqmi,
-#                   e re-rodar nao muda o resultado)
+#                   de main) ou o --check rodou ATE O FIM e disse que o arquivo
+#                   esta desatualizado (exit 4, check-drift — o unico codigo do
+#                   gerador que e veredito; crash, kill e uso NAO sao "no", ver
+#                   check-failed abaixo). Fica "no" porque e deterministico: o
+#                   classificador do gate manda "no" pra needs-rebase e
+#                   "unknown" pro retry transitorio, ga-10uqmi, e re-rodar nao
+#                   muda o resultado)
 #   unknown:*     — nao deu pra comparar. Terceiro estado explicito: quem chama
 #                   trata como "nao verificado", nunca como "verificado ok"
 #                   (todo comparador no dispatcher testa "= yes"/"!= yes",
@@ -4999,13 +5010,27 @@ rebase_deploy_deps_verdict() {
 #                     :deploy-deps-check-timeout       — --check estourou
 #                                                         GATE_DEPLOY_DEPS_CHECK_TIMEOUT
 #                     :deploy-deps-check-unavailable   — python3/timeout ausente (127)
-#                     :deploy-deps-check-failed        — --check saiu != 0
-#                   (ga-ub5hkz) e estes, num merge-tree LIMPO que so difere em
-#                   deploy_deps.json — o arbitro NAO PODE rodar, entao nao ha
-#                   veredito e o retry e o tratamento certo (nunca "no"):
+#                     :deploy-deps-check-drift         — --check rodou ate o fim e disse
+#                                                         DESATUALIZADO (exit 4)
+#                     :deploy-deps-check-failed        — --check saiu != 0 SEM veredito:
+#                                                         excecao/arquivo ausente (1),
+#                                                         selftest ou uso (2), --assert
+#                                                         (3, o gate nao passa), morto por
+#                                                         sinal (>=128)
+#                   (ga-ub5hkz) num merge-tree LIMPO que so difere em
+#                   deploy_deps.json o resultado e um destes dois grupos:
+#                   - SO estes viram "no" (deterministico, re-rodar reproduz):
+#                     :deploy-deps-tree-mismatch / :deploy-deps-generator-unverified
+#                     / :deploy-deps-check-drift
+#                   - o arbitro NAO chegou a um veredito, entao o retry e o
+#                     tratamento certo (NUNCA "no"; e o default de qualquer
+#                     sufixo novo):
 #                     :deploy-deps-wt-not-at-tip / :deploy-deps-check-timeout /
-#                     :deploy-deps-check-unavailable / :deploy-deps-diff-error /
-#                     :deploy-deps-bad-mode / :deploy-deps-no-verdict
+#                     :deploy-deps-check-unavailable / :deploy-deps-check-failed /
+#                     :deploy-deps-diff-error / :deploy-deps-bad-mode /
+#                     :deploy-deps-no-verdict
+#                   No modo conflito (ga-r5dsgp) NENHUM sufixo vira "no": a linha
+#                   do arbitro sai como esta, inclusive check-drift.
 rebase_content_verdict() {
   local wt="$1" main_ref="$2" orig_tip="$3" new_tip="$4"
   # ga-pgxs78: every "unknown" now carries WHICH of the could-not-verify
@@ -5092,15 +5117,18 @@ rebase_content_verdict() {
   # stay "no", because re-running reproduces each and "unknown" would send a
   # deterministic failure into the transient retry path (ga-10uqmi): another
   # path differs too (tree-mismatch), nothing can vouch for the tip (generator
-  # absent or not main's), or the generator's --check ran and rejected it.
-  # Everything else — the arbiter could not run, or said something this block
-  # does not know — is "unknown:*": three states, and "could not tell" never
-  # becomes "no".
+  # absent or not main's), or the generator's --check ran to the end and said
+  # the file is stale (check-drift: its exit 4, the one code that is a verdict).
+  # Everything else — the arbiter could not run, was killed, crashed before
+  # reaching a verdict (check-failed: exit 1/2/>=128), or said something this
+  # block does not know — is "unknown:*": three states, and "could not tell"
+  # never becomes "no". When adding a suffix to rebase_deploy_deps_verdict(),
+  # decide HERE which side of that line it is on; the default is unknown.
   local ddv
   ddv=$(rebase_deploy_deps_verdict "$wt" "$gd" "$main_ref" "$new_tip" "$out" clean)
   case "$ddv" in
     yes) echo "yes" ;;
-    unknown:deploy-deps-tree-mismatch|unknown:deploy-deps-generator-unverified|unknown:deploy-deps-check-failed)
+    unknown:deploy-deps-tree-mismatch|unknown:deploy-deps-generator-unverified|unknown:deploy-deps-check-drift)
       echo "no" ;;
     unknown:*) echo "$ddv" ;;
     *) echo "unknown:deploy-deps-no-verdict" ;;
