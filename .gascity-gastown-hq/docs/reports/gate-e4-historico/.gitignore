@@ -1,0 +1,9 @@
+# artefacts a re-run creates next to the scripts — the dataset stays OUT of the repo (≈120 MB; it holds full stored diffs)
+e4.db
+raw_*/
+*.log
+out_*.txt
+stats_out.json
+final_out.json
+second_ids.txt
+__pycache__/
