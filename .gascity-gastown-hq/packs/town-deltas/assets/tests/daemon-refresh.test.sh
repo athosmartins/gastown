@@ -138,6 +138,19 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
 nok()  { FAIL=$((FAIL+1)); echo "  FAIL - $1"; [ -n "${2:-}" ] && echo "         $2"; }
 
+# bump_file <abs-path>: make <abs-path> differ in a deploy diff. For *.py the
+# edit MUST be a real statement, not a comment: daemon-refresh.sh (ga-jjgcaw,
+# header point 21) deliberately ignores a python file whose old and new versions
+# parse to the same AST, and a bare "# changed" line was this suite's stand-in
+# for "this file changed" until then — every case below would silently test
+# "nothing changed" instead. Non-python files keep the comment.
+bump_file() {
+  case "$1" in
+    *.py) echo "_deploy_changed = $(date +%s%N)" >> "$1" ;;
+    *)    echo "# changed $(date +%s%N)" >> "$1" ;;
+  esac
+}
+
 # field <name> <stdout>  →  echoes the value of "name=..." line from helper output
 field() { echo "$2" | grep "^$1=" | head -1 | sed "s/^$1=//"; }
 
@@ -467,7 +480,7 @@ run_helper() {  # run_helper <changed-relpaths...>  (commits a deploy diff first
   local f
   for f in "$@"; do
     mkdir -p "$RUNTIME/$(dirname "$f")"
-    echo "# changed $(date +%s%N)" >> "$RUNTIME/$f"
+    bump_file "$RUNTIME/$f"
   done
   ( cd "$RUNTIME"
     git add -A >/dev/null 2>&1
@@ -506,7 +519,7 @@ run_helper_stderr() {  # run_helper_stderr <changed-relpaths...>
   local f
   for f in "$@"; do
     mkdir -p "$RUNTIME/$(dirname "$f")"
-    echo "# changed $(date +%s%N)" >> "$RUNTIME/$f"
+    bump_file "$RUNTIME/$f"
   done
   ( cd "$RUNTIME"
     git add -A >/dev/null 2>&1
@@ -1848,7 +1861,7 @@ count_py_calls() {  # count_py_calls <changed-relpaths...> -> prints call count
   pre=$(git -C "$RUNTIME" rev-parse HEAD)
   for f in "$@"; do
     mkdir -p "$RUNTIME/$(dirname "$f")"
-    echo "# changed $(date +%s%N)" >> "$RUNTIME/$f"
+    bump_file "$RUNTIME/$f"
   done
   ( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && \
     GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" \
@@ -2796,7 +2809,7 @@ seed_running com.test.central-sender 69001 "$STALE_LSTART"
 SENSITIVE_DAEMONS="central-sender"
 ( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m base --allow-empty )
 WIDE_PRE=$(git -C "$RUNTIME" rev-parse HEAD)
-echo "# changed $(date +%s%N)" >> "$RUNTIME/daemons/central_sender.py"
+bump_file "$RUNTIME/daemons/central_sender.py"
 ( cd "$RUNTIME"; git add -A >/dev/null 2>&1; git commit -q -m "bead merge" --allow-empty )
 BEAD_PRE="$WIDE_PRE"
 BEAD_POST=$(git -C "$RUNTIME" rev-parse HEAD)

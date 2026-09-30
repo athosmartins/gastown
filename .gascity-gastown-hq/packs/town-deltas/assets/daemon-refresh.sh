@@ -502,6 +502,32 @@
 #      (points 16-19) could never provide, because none of those change
 #      membership. This one does, deliberately: suppressing the false
 #      positive IS the fix, not a side effect of one.
+#  21. (ga-jjgcaw) Every point above asks WHICH daemon a changed file reaches;
+#      none asks whether the file changed in a way a running process could
+#      notice. MEDIDO 29/09 (wa-7oqxq): commit 36146a6ba edited lib/
+#      human_name_guard.py only in comment lines (ast.dump of old and new is
+#      identical), yet the delivery HALTED asking for a guarded restart of
+#      three importers — one of them conversation-monitor, which processes
+#      inbound — for a restart that changes nothing. The Mayor released four
+#      such halts by hand that day, proving AST equality each time. Now a
+#      changed *.py whose old and new versions parse to the SAME AST
+#      (comments, blank lines, quote style, wrapping) is dropped from $CHANGED
+#      before any closure/import matching (Step 1c below), and from the
+#      per-daemon narrowing set (ga0fawwr_narrow_changed) so both windows agree.
+#      Detector-side only: it removes a false positive, nothing restarts.
+#      Deliberately NARROWER than "no runtime effect", because a wrongly
+#      dropped file hides a real stale daemon while a wrongly kept one costs a
+#      restart request: docstrings are NOT stripped (click/typer/FastAPI/
+#      argparse serve them and __doc__ is readable); a shebang edit, a mode-
+#      only change, an added or deleted file, an unparsable file and a
+#      missing blob all KEEP the file — "could not tell" is not "cosmetic".
+#      Accepted residual: line numbers shift (tracebacks, %(lineno)d) and a
+#      module that reads its own source text would see different bytes.
+#      The per-COMMIT probe inside ga0fawwr_daemon_closure_epoch is left raw:
+#      it only ever removes flags (already_fresh), and a python spawn per
+#      commit per label is not worth it. Not applied to *.sh — a shell "#"
+#      line can be data (heredoc body, multi-line quoted string) and there is
+#      no parser here to tell the two apart.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -1023,6 +1049,61 @@ fi
 COMMIT_EPOCH="$(git -C "$RUNTIME_DIR" show -s --format=%ct "$POST_DEPLOY_SHA" 2>/dev/null || true)"
 case "$COMMIT_EPOCH" in ''|*[!0-9]*) COMMIT_EPOCH="$DEPLOY_EPOCH" ;; esac
 
+# ── cosmetic-python classifier (ga-jjgcaw, header point 21) ───────────────────
+# cosmetic_py_classify <from-sha> <to-sha> <changed-multiline>
+# Prints one line per input path: "D:<path>" when it is a *.py whose blob at
+# <from-sha> and at <to-sha> parse to the SAME AST (comment/blank-line/format-
+# only edit), "K:<path>" for everything else. Returns non-zero, printing
+# nothing, when it could not answer for the WHOLE list (python failed, timed
+# out, or the line count does not add up) — callers must then keep the raw
+# list. Three states, not two: "identical AST" (D), "changed or cannot tell"
+# (K), "classifier itself failed" (rc!=0, all K). Anything short of a positive
+# AST match keeps the file.
+COSMETIC_FILTER_TIMEOUT="${COSMETIC_FILTER_TIMEOUT:-20}"
+cosmetic_py_classify() {
+  local out n_in n_out
+  out="$(COSMETIC_RUNTIME="$RUNTIME_DIR" COSMETIC_CHANGED="$3" \
+    timeout "$COSMETIC_FILTER_TIMEOUT" python3 - "$1" "$2" <<'PY' 2>/dev/null
+import ast, os, subprocess, sys
+runtime = os.environ["COSMETIC_RUNTIME"]
+pre, post = sys.argv[1], sys.argv[2]
+MAX_BYTES = 2 * 1024 * 1024
+
+def blob(sha, path):
+    r = subprocess.run(["git", "-C", runtime, "cat-file", "blob", sha + ":" + path],
+                       capture_output=True, timeout=10)
+    return r.stdout if r.returncode == 0 else None
+
+def cosmetic(path):
+    old, new = blob(pre, path), blob(post, path)
+    if old is None or new is None or old == new:
+        return False
+    if len(old) > MAX_BYTES or len(new) > MAX_BYTES:
+        return False
+    first_old, first_new = old.split(b"\n", 1)[0], new.split(b"\n", 1)[0]
+    if first_old != first_new and (first_old.startswith(b"#!") or first_new.startswith(b"#!")):
+        return False
+    try:
+        return ast.dump(ast.parse(old)) == ast.dump(ast.parse(new))
+    except Exception:
+        return False
+
+for path in os.environ.get("COSMETIC_CHANGED", "").splitlines():
+    if not path:
+        continue
+    try:
+        drop = path.endswith(".py") and cosmetic(path)
+    except Exception:
+        drop = False
+    print(("D:" if drop else "K:") + path)
+PY
+  )" || return 1
+  n_in="$(printf '%s\n' "$3" | grep -c .)"
+  n_out="$(printf '%s\n' "$out" | grep -c .)"
+  [ "$n_in" -eq "$n_out" ] || return 1
+  printf '%s\n' "$out"
+}
+
 # ── Step 1: changed files in this deploy ──────────────────────────────────────
 CHANGED="$(git -C "$RUNTIME_DIR" diff --name-only "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" 2>/dev/null || true)"
 
@@ -1296,6 +1377,25 @@ if [ -n "${CHANGED// /}" ] && [ -n "${POLICY_NO_RESTART_PATHS// /}" ]; then
   fi
 fi
 
+# ── Step 1c: drop comment/format-only *.py changes (ga-jjgcaw, header point 21) ─
+# Placed AFTER the plist/no_restart_paths/tests-docs gates above on purpose —
+# those judge the raw changed set exactly as before — and BEFORE anything is
+# derived from $CHANGED (CHANGED_PY, the stems, the deploy_deps.json closure
+# match), so every matcher below sees one consistent, filtered set. A classifier
+# failure leaves $CHANGED untouched (fail toward flagging, never toward hiding).
+COSMETIC_DROPPED=""
+if [ -n "$CHANGED" ]; then
+  if COSMETIC_CLS="$(cosmetic_py_classify "$PRE_DEPLOY_SHA" "$POST_DEPLOY_SHA" "$CHANGED")"; then
+    COSMETIC_DROPPED="$(printf '%s\n' "$COSMETIC_CLS" | sed -n 's/^D://p')"
+    if [ -n "$COSMETIC_DROPPED" ]; then
+      CHANGED="$(printf '%s\n' "$COSMETIC_CLS" | sed -n 's/^K://p')"
+      log "ignoring $(printf '%s\n' "$COSMETIC_DROPPED" | grep -c .) python file(s) whose old and new versions parse to the SAME AST (comment/format-only change — the running process already executes identical code): $(printf '%s\n' "$COSMETIC_DROPPED" | tr '\n' ' ')"
+    fi
+  else
+    log "WARN: could not classify comment/format-only python changes (classifier failed or timed out) — every changed file is matched as-is, this run."
+  fi
+fi
+
 CHANGED_PY="$(echo "$CHANGED" | grep -E '\.py$' || true)"
 CHANGED_TEMPLATES="$(echo "$CHANGED" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
 
@@ -1349,6 +1449,10 @@ done <<< "$CHANGED_PY"
 set +f
 
 if [ -z "$CHANGED_PY_FOR_STEMS" ] && [ -z "$CHANGED_TEMPLATES" ]; then
+  if [ -n "$COSMETIC_DROPPED" ]; then
+    log "the only python this deploy changed is comment/format-only (identical AST) or tests/docs/md-covered — no daemon code affected — OK."
+    emit OK "no daemon-relevant python changed (comment/format-only edits ignored, identical AST: $(printf '%s\n' "$COSMETIC_DROPPED" | tr '\n' ' ' | sed 's/ $//'); tests/docs/md excluded)" not_applicable
+  fi
   log "deploy changed no daemon-relevant *.py (tests/**, docs/**, *.md-covered python excluded — see CHANGED_PY_FOR_STEMS above) and no template files — no daemon code affected — OK."
   emit OK "no python source (excluding tests/docs/md) or template changed" not_applicable
 fi
@@ -2266,12 +2370,20 @@ ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline
   # changed" (a real, safe signal to downgrade on). Returning 1 only on the
   # former, distinct from printing empty output on the latter, is what lets
   # the caller tell them apart.
-  local sha="$1" cache
+  local sha="$1" cache narrow_cls
   cache="$DISCO_DIR/.ga0fawwr-changed.$(echo "$sha" | tr -c 'A-Za-z0-9' '_')"
   if [ ! -f "$cache" ]; then
     if ! git -C "$RUNTIME_DIR" diff --name-only "$sha" "$POST_DEPLOY_SHA" > "$cache" 2>/dev/null; then
       rm -f "$cache" 2>/dev/null
       return 1
+    fi
+    # ga-jjgcaw (header point 21): same comment/format-only drop as Step 1c,
+    # or a label whose own window holds only such an edit could never be
+    # downgraded here while the wide set (already filtered) no longer flags
+    # it. A classifier failure leaves the raw list in the cache (still flags).
+    if narrow_cls="$(cosmetic_py_classify "$sha" "$POST_DEPLOY_SHA" "$(cat "$cache")")" \
+       && [ -n "$(printf '%s\n' "$narrow_cls" | sed -n 's/^D://p')" ]; then
+      printf '%s\n' "$narrow_cls" | sed -n 's/^K://p' > "$cache.tmp" && mv "$cache.tmp" "$cache"
     fi
   fi
   cat "$cache" 2>/dev/null || true
