@@ -32,8 +32,10 @@ calling it before: the verdict itself is never part of Jev's prompt. Net effect:
 lines changed in quality-gate-dispatcher.sh or /gate-done, and evaluate_shadow() (F0) is
 used completely unmodified.
 
-Idempotent: re-running against the same quality-gate.jsonl never double-logs (dedup by
-`gate_run`, checked against jev-experiment.jsonl's own existing "gate-verdict" entries).
+Idempotent: re-running against the same quality-gate.jsonl never double-logs an ANSWERED gate
+run (dedup by `gate_run`, checked against jev-experiment.jsonl's own existing "gate-verdict"
+entries with jev_ok=true). A gate run Jev could not be asked about (jev_ok=false) is retried on
+later runs, up to MAX_JEV_FAILS times, and counted as `jev_failed` in the summary.
 Every git/bd/network call is best-effort and skips (never raises) on failure — a rig
 this script can't resolve, a marker bead it can't read, or a SHA git no longer has just
 means that one gate run is left unmeasured, never a crash of the batch.
@@ -77,6 +79,10 @@ DIFF_LINE_BUDGET = 250
 # it will never be able to log, is pure waste. Default window is generous (a few
 # missed daily runs still get fully covered) without re-walking history.
 DEFAULT_SINCE_DAYS = 4.0
+# ga-tf7df1: a gate run Jev could not be asked about (jev_ok=false) is retried by later runs, but
+# only this many times -- a permanent failure must not re-call Jev on every daily run forever.
+# Same value and same rule as the sibling jev_*_experiment scripts.
+MAX_JEV_FAILS = 3
 
 INSTRUCTIONS = (
     "You are shown the commit log and diff for a code change submitted to an "
@@ -155,13 +161,19 @@ def iter_dispatcher_complete(qg_log_path, since_days: float | None = None):
             yield ev
 
 
-def already_processed(jev_log_path, experiment: str) -> set[str]:
-    """entity_ids already fully logged (mode=='shadow') for this experiment. Missing
-    log file -> empty set (first run ever), never an error."""
-    seen: set[str] = set()
+def load_done(jev_log_path, experiment: str) -> set[str]:
+    """entity_ids that need no further work this run: Jev answered (mode=='shadow' and
+    jev_ok is True), or Jev failed MAX_JEV_FAILS times on it (left unmeasured rather than
+    retried forever). A jev_ok=false row is the third state -- Jev could not be asked, so
+    nothing was measured -- and is NOT an answer: treating it as done tombstoned every gate
+    run an outage touched, and the agreement rate was later computed over a sample that
+    lost exactly those runs (ga-tf7df1). Same rule as every sibling jev_*_experiment.
+    Missing log file -> empty set (first run ever), never an error."""
+    fails: dict[str, int] = {}
+    done: set[str] = set()
     p = Path(jev_log_path)
     if not p.exists():
-        return seen
+        return done
     with p.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -171,9 +183,14 @@ def already_processed(jev_log_path, experiment: str) -> set[str]:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(ev, dict) and ev.get("mode") == "shadow" and ev.get("experiment") == experiment and ev.get("entity_id"):
-                seen.add(ev["entity_id"])
-    return seen
+            if not (isinstance(ev, dict) and ev.get("mode") == "shadow" and ev.get("experiment") == experiment and ev.get("entity_id")):
+                continue
+            if ev.get("jev_ok") is True:
+                done.add(ev["entity_id"])
+            else:
+                fails[ev["entity_id"]] = fails.get(ev["entity_id"], 0) + 1
+    done.update(k for k, n in fails.items() if n >= MAX_JEV_FAILS)
+    return done
 
 
 def _field(description: str | None, field: str) -> str | None:
@@ -351,14 +368,14 @@ def run(gc_city: str | None = None, qg_log: str | None = None, dry_run: bool = F
         limit: int | None = None, since_days: float | None = DEFAULT_SINCE_DAYS) -> dict:
     gc_city = gc_city or DEFAULT_GC_CITY
     qg_log = qg_log or f"{gc_city}/.gc/quality-gate.jsonl"
-    seen = already_processed(jev_experiment.JEV_LOG, EXPERIMENT)
+    done = load_done(jev_experiment.JEV_LOG, EXPERIMENT)
     rig_paths = _rig_paths()
-    counts: dict[str, int] = {"considered": 0, "skipped_dup": 0}
+    counts: dict[str, int] = {"considered": 0, "skipped_dup": 0, "jev_failed": 0}
 
     for ev in iter_dispatcher_complete(qg_log, since_days=since_days):
         counts["considered"] += 1
         gate_run = ev["gate_run"]
-        if gate_run in seen:
+        if gate_run in done:
             counts["skipped_dup"] += 1
             continue
         if limit is not None and counts.get("logged", 0) >= limit:
@@ -368,7 +385,11 @@ def run(gc_city: str | None = None, qg_log: str | None = None, dry_run: bool = F
         if status == "logged":
             if not dry_run:
                 jev_experiment._log(detail)
-            seen.add(gate_run)
+            # One attempt per gate_run per run: a failed one is retried by the NEXT run (load_done),
+            # not again here if the same gate_run shows up twice in the log.
+            done.add(gate_run)
+            if detail["jev_ok"] is not True:
+                counts["jev_failed"] += 1
             print(
                 f"[{status}] gate_run={gate_run} bead={ev.get('bead')} "
                 f"decisao_atual={detail['decisao_atual']} jev_ok={detail['jev_ok']} "
@@ -377,17 +398,23 @@ def run(gc_city: str | None = None, qg_log: str | None = None, dry_run: bool = F
         else:
             print(f"[{status}] gate_run={gate_run} bead={ev.get('bead')} -- {detail}")
 
-    other_skips = sum(v for k, v in counts.items() if k not in ("considered", "logged", "skipped_dup"))
+    other_skips = sum(
+        v for k, v in counts.items() if k not in ("considered", "logged", "skipped_dup", "jev_failed")
+    )
+    # jev_failed is a subset of logged: rows written with jev_ok=false (Jev unreachable/garbled).
     print(
         f"jev_gate_verdict_experiment: considered={counts['considered']} "
-        f"logged={counts.get('logged', 0)} skipped_dup={counts['skipped_dup']} "
-        f"other_skips={other_skips}"
+        f"logged={counts.get('logged', 0)} jev_failed={counts['jev_failed']} "
+        f"skipped_dup={counts['skipped_dup']} other_skips={other_skips}"
     )
     return counts
 
 
 def _selftest() -> int:
+    import contextlib
+    import io
     import tempfile
+    import urllib.error
     from unittest import mock
 
     this = sys.modules[__name__]
@@ -445,16 +472,36 @@ def _selftest() -> int:
             without_filter == ["ga-recent", "ga-old", "ga-no-ts"],
         )
 
+        def jrow(entity_id, jev_ok, mode="shadow", experiment="gate-verdict"):
+            row = {"mode": mode, "experiment": experiment, "entity_id": entity_id}
+            if jev_ok is not None:
+                row["jev_ok"] = jev_ok
+            return json.dumps(row)
+
         jl = Path(td) / "jev-experiment.jsonl"
-        jl.write_text(
-            '{"mode":"shadow","experiment":"gate-verdict","entity_id":"ga-x2"}\n'
-            '{"mode":"shadow","experiment":"other-front","entity_id":"ga-x4"}\n'
-            '{"mode":"shadow_pending","experiment":"gate-verdict","entity_id":"ga-x9"}\n'
-        )
-        ok("already_processed: only counts mode=shadow entries for the right experiment",
-           already_processed(jl, "gate-verdict") == {"ga-x2"})
-        ok("already_processed: missing log file -> empty set, not an error",
-           already_processed(Path(td) / "nope.jsonl", "gate-verdict") == set())
+        jl.write_text("\n".join(
+            [jrow("ga-x2", True),
+             jrow("ga-x4", True, experiment="other-front"),
+             jrow("ga-x9", True, mode="shadow_pending"),
+             jrow("ga-f1", False),
+             jrow("ga-f2", False), jrow("ga-f2", False),
+             jrow("ga-r1", False), jrow("ga-r1", True),
+             jrow("ga-nokey", None)]
+            + [jrow("ga-f3", False)] * MAX_JEV_FAILS
+        ) + "\n")
+        done = load_done(jl, "gate-verdict")
+        ok("load_done: only counts mode=shadow entries for the right experiment",
+           "ga-x2" in done and "ga-x4" not in done and "ga-x9" not in done)
+        ok("load_done: a jev_ok=false row is NOT done -- Jev was unreachable, nothing was measured",
+           "ga-f1" not in done)
+        ok(f"load_done: failed twice (below MAX_JEV_FAILS={MAX_JEV_FAILS}) is still not done",
+           "ga-f2" not in done)
+        ok(f"load_done: failed {MAX_JEV_FAILS} times stops being retried (bounded, not forever)",
+           "ga-f3" in done)
+        ok("load_done: failed and then answered is done", "ga-r1" in done)
+        ok("load_done: a row with no jev_ok at all is not an answer", "ga-nokey" not in done)
+        ok("load_done: missing log file -> empty set, not an error",
+           load_done(Path(td) / "nope.jsonl", "gate-verdict") == set())
 
     desc = "branch: fix/x\nbase_commit: deadbeef\nself_audit: multi word note here\n"
     ok("_field: extracts base_commit", _field(desc, "base_commit") == "deadbeef")
@@ -678,6 +725,69 @@ def _selftest() -> int:
                 "run(): since_days honored end-to-end -- a window that excludes everything sees nothing",
                 counts4.get("considered", 0) == 0,
             )
+
+    # ga-tf7df1: "Jev could not be asked" (jev_ok=false) is the third state, not an answer. A Jev
+    # outage during a run must not tombstone the gate runs it hit, or the agreement rate is later
+    # computed over a sample that lost exactly the runs where Jev was down.
+    with tempfile.TemporaryDirectory() as td:
+        qg = Path(td) / "quality-gate.jsonl"
+        recent_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        qg.write_text(json.dumps({**ev, "event": "dispatcher_complete", "ts": recent_ts}) + "\n")
+        jl = Path(td) / "jev-experiment.jsonl"
+
+        def run_quiet():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                counts = run(gc_city="/city", qg_log=str(qg), dry_run=False)
+            return counts, buf.getvalue()
+
+        def jev_ok_rows():
+            return [json.loads(x)["jev_ok"] for x in jl.read_text().splitlines()] if jl.exists() else []
+
+        with mock.patch.object(this, "_run", side_effect=fake_run_e2e), \
+             mock.patch.object(jev_experiment, "JEV_LOG", jl), \
+             mock.patch.object(jev_experiment, "CF_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"), \
+             mock.patch.object(jev_experiment, "CF_API_TOKEN", "tok"):
+            with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("jev down")):
+                c1, out1 = run_quiet()
+            ok(
+                "run(): Jev down -> logged as jev_ok=false and reported as jev_failed in the summary "
+                "(not folded into other_skips)",
+                c1.get("logged") == 1 and c1.get("jev_failed") == 1 and jev_ok_rows() == [False]
+                and "jev_failed=1" in out1 and "other_skips=0" in out1,
+            )
+
+            with mock.patch("urllib.request.urlopen", return_value=_fake_response(live_shape)):
+                c2, out2 = run_quiet()
+            ok(
+                "run(): Jev back -> the gate run that hit the outage is RE-EVALUATED, not skipped as a duplicate",
+                c2.get("skipped_dup", 0) == 0 and c2.get("logged") == 1 and c2.get("jev_failed", 0) == 0
+                and jev_ok_rows() == [False, True] and "jev_failed=0" in out2,
+            )
+
+            with mock.patch("urllib.request.urlopen", side_effect=AssertionError("an answered gate run must not call Jev")):
+                c3, _out3 = run_quiet()
+            ok(
+                "run(): once Jev has answered, the gate run is done -- dedup still works",
+                c3.get("skipped_dup") == 1 and c3.get("logged", 0) == 0 and len(jev_ok_rows()) == 2,
+            )
+
+        jl.unlink()
+        with mock.patch.object(this, "_run", side_effect=fake_run_e2e), \
+             mock.patch.object(jev_experiment, "JEV_LOG", jl), \
+             mock.patch.object(jev_experiment, "CF_ACCOUNT_ID", "0123456789abcdef0123456789abcdef"), \
+             mock.patch.object(jev_experiment, "CF_API_TOKEN", "tok"), \
+             mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("jev down")) as jev_calls:
+            for _ in range(MAX_JEV_FAILS):
+                run_quiet()
+            calls_at_cap = jev_calls.call_count
+            c_cap, _out_cap = run_quiet()
+        ok(
+            f"run(): a gate run Jev keeps failing on is tried {MAX_JEV_FAILS} times, then left alone "
+            "(a permanent failure does not re-call Jev every run)",
+            calls_at_cap == MAX_JEV_FAILS and jev_calls.call_count == calls_at_cap
+            and c_cap.get("skipped_dup") == 1 and jev_ok_rows() == [False] * MAX_JEV_FAILS,
+        )
 
     print(f"\njev_gate_verdict_experiment selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0
