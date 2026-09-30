@@ -3366,6 +3366,39 @@ echo "$OUT" | grep -q "WARN:.*detect_stale_daemons.py" \
   && ok "T89 a WARN log names the failing rig detector (not silent)" \
   || nok "T89 expected a WARN mentioning detect_stale_daemons.py" "$OUT"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T90 (ga-29uvkf): a LEFTOVER file in $TMPDIR must not switch the symbol
+# calculator off. The batch manifest used to come from
+# `mktemp "$TMPDIR/daemon-refresh-symreach.XXXXXX.json"`; BSD/macOS mktemp only
+# substitutes trailing X's, so it created the literal name and — once a killed
+# run left that file behind — failed "File exists" on every later run. The
+# manifest path was then "", the calculator got `--batch ""`, and T62-T81 (29
+# checks) went red on an untouched main while production degraded every
+# GUARDED verdict to NÃO CALCULADO. The suite sat on the operator's real
+# $TMPDIR, so the failure depended on litter no test created.
+# Same fixture as T62 (a confirmed reach), with the helper's TMPDIR pointed at
+# a private dir that already holds that exact leftover (this file fails on the
+# pre-fix helper: the calculator is never invoked and the daemon lands in
+# GUARDED_SYMBOL_NOT_COMPUTED).
+# ════════════════════════════════════════════════════════════════════════════
+SENSITIVE_DAEMONS="central-sender"
+new_case t90
+make_symbol_script "$RUNTIME"
+cat > "$RUNTIME/daemons/central_sender.py" <<<'print("send")'
+make_plist "$AGENTS" com.test.central-sender "$RUNTIME/venv/bin/python3" "$RUNTIME/daemons/central_sender.py"
+seed_running com.test.central-sender 90001 "$STALE_LSTART"
+seed_symbol_result daemons/central_sender.py confirmed
+T90_TMP="$CASE_DIR/tmpdir"
+mkdir -p "$T90_TMP"
+echo '{"entries": []}' > "$T90_TMP/daemon-refresh-symreach.XXXXXX.json"
+OUT=$(TMPDIR="$T90_TMP" run_helper daemons/central_sender.py); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T90 verdict NEEDS_GUARDED_RESTART" || nok "T90 verdict" "got '$V' out=[$OUT]"
+[ -f "$MOCK/symbol_batch_argv.json" ] && ok "T90 calculator was invoked despite the leftover file in \$TMPDIR" || nok "T90 calculator invoked" "missing $MOCK/symbol_batch_argv.json (leftover \$TMPDIR file switched the calculator off)"
+echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep "com.test.central-sender" >/dev/null && ok "T90 lands in GUARDED_SYMBOL_CONFIRMED" || nok "T90 guarded_symbol_confirmed" "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")"
+[ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T90 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T90 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
+[ "$(ls "$T90_TMP" | wc -l | tr -d ' ')" = "1" ] && ok "T90 the helper leaves no new temp file behind in \$TMPDIR" || nok "T90 tmpdir litter" "$(ls "$T90_TMP")"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"

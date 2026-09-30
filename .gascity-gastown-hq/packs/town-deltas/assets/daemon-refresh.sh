@@ -2891,7 +2891,17 @@ elif [ -n "${GUARDED// /}" ]; then
         GUARDED_SYMBOL_NOT_COMPUTED="$GUARDED_SYMBOL_NOT_COMPUTED $label"
       done
     else
-      SR_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/daemon-refresh-symreach.XXXXXX.json")"
+      # ga-29uvkf: the manifest lives in $DISCO_DIR (private mktemp -d dir,
+      # removed by the EXIT trap above), NOT in its own `mktemp` file. The
+      # previous `mktemp "$TMPDIR/daemon-refresh-symreach.XXXXXX.json"` put a
+      # suffix after the X's, and BSD/macOS mktemp only substitutes TRAILING
+      # X's: it created the LITERAL path "...symreach.XXXXXX.json" and, once a
+      # killed run left that file behind, failed with "File exists" on every
+      # run after it. SR_MANIFEST was then "", the batch calculator got
+      # `--batch ""`, and every GUARDED verdict silently degraded to
+      # NÃO CALCULADO (measured 29-30/09: 29 red checks in daemon-refresh.test.sh
+      # T62-T81, and the same "line N: : No such file" in story-delivery.log).
+      SR_MANIFEST="$DISCO_DIR/symreach-manifest.json"
       {
         printf '{"entries": ['
         SR_FIRST=1
