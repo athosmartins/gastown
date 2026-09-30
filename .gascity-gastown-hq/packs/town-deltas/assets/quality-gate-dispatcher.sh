@@ -55,6 +55,20 @@ _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
 [ -r "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
 unset _QHC_SCRIPT
 
+# ga-syxaki (E5): 2nd independent reviewer, as an A/B experiment — OFF by default. The lib is
+# sourced fail-soft (same [ -r ] convention as the libs above: a bare `source` of a missing
+# file kills this set -e daemon). Every call site below is guarded by GATE_E5_LIB_OK=1 AND
+# the flag (touch $GC_CITY/.gc/gate-e5-second-reviewer.on), so with the flag off — or the lib
+# absent — none of it runs and the reviewer prompt is byte-identical to before. The
+# GATE_E5_COV_* prompt pieces default to "" here; gate-review-task.lib.sh reads them as ${VAR:-}
+# (see its header), so they are empty — and the prompt byte-identical — unless gate_e5_task_vars ran.
+GATE_E5_LIB_OK=0
+GATE_E5_COV_RULES=""; GATE_E5_COV_PASS_LINE=""
+GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_ACTIVE=0
+_E5_LIB="${GC_CITY}/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+if [ -r "$_E5_LIB" ]; then { source "$_E5_LIB" 2>/dev/null && GATE_E5_LIB_OK=1; } || true; fi
+unset _E5_LIB
+
 # ga-0bjqix: canonical Dolt-server PID resolution (dolt.pid + basename+LISTEN
 # verification, never a bare process-table sort) for the ambient-CPU headroom
 # check below. Same source-fail-soft convention as the sibling libs above —
@@ -9403,6 +9417,8 @@ jq -c -n \
     gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s,
     reviewers: $reviewers, dry_run: $dry_run}' \
   >> "$QG_LOG" 2>/dev/null || true
+# ga-syxaki (E5): outcome line for a run that had an extra reviewer slot (no-op otherwise).
+if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_log_run_end || true; fi
 
 # ga-eqjo (code-review fix): this used to be the literal LAST line of the
 # script, so "sweep complete" correctly meant "the one marker this process
@@ -10264,7 +10280,7 @@ gate_collect_verdicts() {
   # collected but not finalized must not survive into the next bead's collect
   # (same leak concern as QUOTA_REQUEUE/REQUEUE_REASON at the call sites).
   GATE_FAIL_NO_EVAL=0
-  local _judged_fails=0 _noverdict_fails=0
+  local _judged_fails=0 _noverdict_fails=0 _e5x=0
   # ga-h8vc8y: the judged-FAIL count is ALSO handed to the caller (the local
   # above dies with this function), because Phase C's timeout branch runs right
   # after this collect and must know whether a reviewer that DID deliver
@@ -10273,6 +10289,11 @@ gate_collect_verdicts() {
   # count (same staleness concern as GATE_FAIL_NO_EVAL); assigned its real
   # value once, after the loop.
   GATE_COLLECT_JUDGED_FAILS=0
+  # ga-syxaki (E5): recomputed from scratch each call, like the two counters above. The FAIL
+  # texts are kept per reviewer so a run with an extra reviewer can be answered with the
+  # deduplicated UNION of the blocking issues instead of pasted paragraphs.
+  GATE_E5_FAIL_IDX=(); GATE_E5_FAIL_TXT=(); GATE_E5_UNION_STATS=""
+  GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_EXTRA_UNDELIVERED=0
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
     # ga-art5: `|| echo "[]"` used to mask a failed `bd show` as an empty
@@ -10293,6 +10314,8 @@ gate_collect_verdicts() {
     fi
     VB_STATUS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
     VB_LABELS=$(printf '%s' "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null || true)
+    _e5x=0
+    case " $VB_LABELS " in *" e5-extra "*) GATE_E5_EXTRA_SEEN=1; _e5x=1 ;; esac
 
     # ga-7lz1: a reviewer that WRITES its verdict (label + comment) but DRAINS
     # before the final `bd close` leaves this bead OPEN forever — the
@@ -10339,6 +10362,14 @@ gate_collect_verdicts() {
     if [ "$VB_STATUS" = "closed" ]; then
       VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
       gate_check_verdict_identity_link "$VB"
+      case " $VB_LABELS " in
+        *" e5-extra "*)
+          case " $VB_LABELS " in
+            *" verdict:PASS "*) GATE_E5_EXTRA_VERDICT="PASS" ;;
+            *" verdict:FAIL "*) GATE_E5_EXTRA_VERDICT="FAIL" ;;
+            *)                  GATE_E5_EXTRA_VERDICT="NONE" ;;
+          esac ;;
+      esac
       if echo "$VB_LABELS" | grep "verdict:PASS" >/dev/null; then
         : # explicit PASS — continue
       elif echo "$VB_LABELS" | grep "verdict:FAIL" >/dev/null; then
@@ -10377,6 +10408,7 @@ gate_collect_verdicts() {
           FAIL_COMMENT="INCONCLUSIVE — verdict:FAIL with empty/unparseable reason (raw bead $VB; see forensics log above)"
         fi
         FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+        GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
       else
         # ga-86l90a8 (thies): the reviewer writes `label add verdict:PASS` THEN
         # `comment "VERDICT: PASS"` THEN closes the bead (Step "If PASS" ~L2284).
@@ -10408,7 +10440,12 @@ gate_collect_verdicts() {
         else
           # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
           # PASS is the ONLY acceptable verdict; anything else blocks the merge.
-          ANY_FAIL=1
+          # ga-syxaki (E5): ...EXCEPT for the optional extra reviewer slot. The extra may only
+          # ADD a delivered verdict; one that closed with no judgment (or whose comments cannot
+          # be read) is "not delivered", never a FAIL — otherwise its death would turn a
+          # reviewer-1 PASS into a FAIL, which arm A would not do. ANY_FAIL is set below,
+          # explicitly, for every branch that is a real (or fail-safe) rejection.
+          [ "$_e5x" = "1" ] || ANY_FAIL=1
           # ga-w7pm55: "blocks the merge" is not the same as "the code was
           # rejected". Symmetric to the PASS rescue above: a reviewer whose
           # label add lost the race but whose anchored "VERDICT: FAIL" comment
@@ -10432,10 +10469,16 @@ gate_collect_verdicts() {
             FAIL_COMMENT=""
             FAIL_COMMENT_UNREADABLE=1
           fi
-          if [ -n "$FAIL_COMMENT" ]; then
+          if [ "$_e5x" = "1" ] && [ -z "$FAIL_COMMENT" ]; then
+            VERDICTS_RECEIVED=$((VERDICTS_RECEIVED - 1))   # it was counted as "closed" above; it delivered nothing
+            GATE_E5_EXTRA_VERDICT="NONE"; GATE_E5_EXTRA_UNDELIVERED=1
+            log "  Reviewer $((j+1)) (bead $VB) is the E5 extra slot and closed with no verdict (or unreadable comments) — NOT delivered; it neither counts nor fails the run (arm-A behaviour, ga-syxaki)."
+          elif [ -n "$FAIL_COMMENT" ]; then
+            ANY_FAIL=1
             _judged_fails=$((_judged_fails + 1))
             log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:FAIL label but its verdict COMMENT is an explicit FAIL — counting as a real reviewer rejection (ga-w7pm55, mirror of the ga-86l90a8 PASS rescue). comment=$(printf '%s' "$FAIL_COMMENT" | tr '\n' ' ' | cut -c1-200)"
             FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
+            GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
           elif [ "$FAIL_COMMENT_UNREADABLE" = "1" ]; then
             _judged_fails=$((_judged_fails + 1))
             warn "Reviewer $((j+1)) (bead $VB) closed with no verdict label and its comments could not be read (bd/jq failed) — cannot rule out a real reviewer FAIL, so counting it as a code-class FAIL (fail-safe, ga-w7pm55)."
@@ -10463,6 +10506,11 @@ gate_collect_verdicts() {
     GATE_FAIL_NO_EVAL=1
   fi
   GATE_COLLECT_JUDGED_FAILS="$_judged_fails"  # ga-h8vc8y: read by Phase C's timeout branch
+  # ga-syxaki (E5): only a run that HAS an extra reviewer slot gets the union; any failure in
+  # it leaves FAIL_REASONS as the concatenation built above.
+  if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$GATE_E5_EXTRA_SEEN" = "1" ]; then
+    gate_e5_union_reasons || true
+  fi
 }
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: END
 
@@ -10828,6 +10876,12 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       done < <(printf '%s' "$VB_JSON" | jq -r '
           sort_by([(.labels[]? | select(startswith("reviewer-index:")) | ltrimstr("reviewer-index:") | tonumber)] | (.[0] // 0))
           | .[].id' 2>/dev/null)
+      # ga-syxaki (E5): abandoned extra slots leave the run; live ones raise the required count.
+      # State lives on the verdict beads (labels) — survives a dispatcher crash. No E5 label in
+      # the answer -> not even called.
+      case "$VB_JSON" in
+        *e5-extra*) if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then gate_e5_rehydrate "$VB_JSON" || true; fi ;;
+      esac
 
       # ga-eqjo (gate-fix-3): this emptiness guard MUST run before any
       # "${VERDICT_BEAD_IDS[@]}" expansion below. bash 3.2 (the only bash on
@@ -10881,6 +10935,17 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       GATE_START_EPOCH="$PC_START_EPOCH"
       QUOTA_REQUEUE=0
       REQUEUE_REASON="quota"
+
+      # ga-syxaki (E5): retire an extra reviewer that can no longer help / spawn one for an arm-B
+      # bead's first judged FAIL — BEFORE the decision below, so it is taken on the reviewers
+      # that delivered (extra never makes the run worse than arm A). Present only when an extra
+      # slot exists or the flag is on; otherwise neither test passes and nothing runs.
+      if [ "${GATE_E5_LIB_OK:-0}" = "1" ]; then
+        _e5_hook=0
+        case "$VB_JSON" in *e5-extra*) _e5_hook=1 ;; esac
+        if [ "$_e5_hook" = "0" ] && [ "$(gate_e5_enabled)" = "1" ]; then _e5_hook=1; fi
+        if [ "$_e5_hook" = "1" ]; then gate_e5_phase_c_hook || true; fi
+      fi
 
       # SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN
       if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
@@ -15315,6 +15380,14 @@ esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 
+# ga-syxaki (E5): arm + big-diff trigger, decided BEFORE the run record exists. Flag off ->
+# this block is one string test and nothing else.
+GATE_E5_ARM="A"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""
+if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
+  gate_e5_admit_decision || true
+  log "E5: bead=$BEAD_ID arm=$GATE_E5_ARM trigger=$GATE_E5_TRIGGER size=$GATE_E5_SIZE_STATE (${GATE_E5_RAW_LINES:-?} lines)"
+fi
+
 # ── Step 5b (ga-dupnv, bug 1): live-sibling-run guard — SAFETY NET ────────────
 # A marker can be claimed twice for the SAME branch: the dispatcher dies mid-run
 # (Terminated/SIGTERM/launchd overlap) leaving the marker gate-status:dispatching,
@@ -15546,6 +15619,14 @@ trap 'exit 130' INT
 trap 'exit 129' HUP
 
 log "Spawning $REQUIRED_REVIEWERS independent reviewer session(s) ..."
+
+# ga-syxaki (E5): with the flag on, every reviewer of BOTH arms is asked to list what it
+# examined (the Coverage line); off -> the two pieces stay "" and the task is unchanged.
+GATE_E5_ACTIVE=0
+if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
+  GATE_E5_ACTIVE=1
+  gate_e5_task_vars
+fi
 
 for i in $(seq 1 $REQUIRED_REVIEWERS); do
   # ga-cvhoj: reviewer 1 spawns FIRST, immediately after the dispatcher's own
@@ -15796,6 +15877,10 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
   # a cheap stable fingerprint. `|| echo ""` keeps set -euo pipefail happy.
   _peek_base=$(gc --city "$GC_CITY" session peek "$SESSION_ID" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
   REVIEW_TASKS+=("$REVIEW_TASK")
+  if [ "$GATE_E5_ACTIVE" = "1" ]; then
+    [ "$i" = "1" ] && gate_e5_log_admit "$REVIEW_TASK" "$VERDICT_BEAD_ID"
+    gate_e5_log_session "$i" "$SESSION_ID" "${SESSION_NAME:-}" "$(printf '%s' "$SESSION_JSON" | jq -r '.session_key // empty' 2>/dev/null || true)" "$VERDICT_BEAD_ID"
+  fi
   REVIEWER_PEEK_BASELINE+=("$_peek_base")
   REVIEWER_ACKED+=(0)
 
@@ -15832,6 +15917,12 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     sleep "$GATE_SPAWN_STAGGER_SECS" || true
   fi
 done
+
+# ga-syxaki (E5): arm B + a diff of >= 800 lines -> a 2nd independent reviewer next to reviewer
+# 1. Best-effort: any failure inside is a logged decline and the run continues with one reviewer.
+if [ "$GATE_E5_ACTIVE" = "1" ] && [ "$GATE_E5_TRIGGER" = "big-diff" ]; then
+  gate_e5_step7_extra || true
+fi
 
 log "All $REQUIRED_REVIEWERS reviewer sessions spawned: ${SESSION_IDS[*]}"
 
