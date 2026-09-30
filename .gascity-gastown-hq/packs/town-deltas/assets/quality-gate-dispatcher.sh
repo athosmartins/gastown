@@ -6040,6 +6040,65 @@ gate_noeval_requeue_decision() {
   return 0
 }
 
+# gate_finish_bead_already_closed <marker_id> <gate_run_id> <bead_city> <bead_id> <branch> <sha> [early|late]
+# (ga-5w2gpw item c)  A review-approved PASS whose SOURCE BEAD was closed while the run was in flight (another
+# branch or a human resolved it — ga-lxz5w's sequential 2-branch race) used to be downgraded to FAIL and sent
+# down the whole FAIL path: a "Fix THESE specific blocking issues" comment on a CLOSED bead, gate:failed, a
+# hold-class SHA stamp, an author nudge. There is nothing to fix — the reviewers approved this code and the bead
+# it answered is done. E4 counted 17 of the 207 no-review FAILs as exactly this.
+# This ends the run as a TERMINAL SKIP instead. Nothing is merged (ga-lxz5w's "never merge onto a terminal bead"
+# stands), and the record says so plainly:
+#   - ONE audit comment on the source bead that is NOT a verdict (it never starts with the verdict prefix E4 and
+#     the Pilot read as a FAIL), naming branch, exact sha and gate-run, and saying the branch was NOT merged;
+#   - the marker set superseded and CLOSED with a reason that says the same;
+#   - the gate-run bead superseded and closed (Phase C must not re-select it), skipped when GATE_RUN_ID=unknown;
+#   - gate:reviewing cleared on the source bead (the head-of-line guard every other terminal path carries);
+#   - dispatcher_complete result=SKIPPED_BEAD_CLOSED in QG_LOG and the "Gate run complete" line: progress for
+#     gate-health-monitor, and neither a PASS nor a FAIL for anything that counts verdicts.
+# Writes are best-effort but never silent: a write that fails is warned about by name. A marker left open by a
+# failed close is recovered by the dispatching-TTL requeue, and the rerun lands here again — self-healing, not
+# stuck. Always returns 0 (callers run under `set -e`). Takes the ids as arguments, so nothing here depends on
+# the caller's locals.
+gate_finish_bead_already_closed() {
+  local marker_id="${1:-}" run_id="${2:-}" bead_city="${3:-}" bead_id="${4:-}" branch="${5:-}" sha="${6:-}" where="${7:-early}"
+  local when_txt rc
+  case "$where" in
+    late) when_txt="between review and push (the authoritative re-check right before the merge)" ;;
+    *)    when_txt="after this gate-run began (the early live re-check)" ;;
+  esac
+  if [ -n "$bead_id" ]; then
+    bd -C "$bead_city" comment "$bead_id" "Gate run ended WITHOUT a verdict on the code (ga-5w2gpw): this bead was already closed ${when_txt}, so branch ${branch} (sha ${sha}, gate-run ${run_id}) was NOT merged and is NOT a failed review — nothing for the author to fix. If the change is still wanted, open a follow-up bead for it; the branch is intact. The marker was closed as superseded." 2>/dev/null \
+      || warn "ga-5w2gpw: could not write the audit comment on already-closed bead $bead_id"
+    bd -C "$bead_city" label remove "$bead_id" "gate:reviewing" -q 2>/dev/null || true
+  fi
+  if [ -n "$marker_id" ]; then
+    rc=0; set_gate_status "$marker_id" "superseded" || rc=$?
+    [ "$rc" -eq 0 ] || warn "ga-5w2gpw: marker $marker_id: set_gate_status superseded FAILED (rc=$rc) — the marker may stay claimed; the dispatching-TTL recovery will requeue it and the rerun will end here again"
+    bd -C "$GC_CITY" comment "$marker_id" "Gate run ended as a terminal SKIP (ga-5w2gpw): source bead ${bead_id} was already closed ${when_txt}. Branch ${branch} (sha ${sha}) was NOT merged. No reviewer rejected it; this is not a FAIL." 2>/dev/null || true
+    bd -C "$GC_CITY" close "$marker_id" -r "Gate marker terminal: SUPERSEDED — source bead ${bead_id} was already closed ${when_txt}; branch ${branch} NOT merged (ga-5w2gpw). Not a FAIL." 2>/dev/null \
+      || warn "ga-5w2gpw: marker $marker_id: bd close FAILED — it will be recovered by the dispatching-TTL requeue"
+  fi
+  if [ -n "$run_id" ] && [ "$run_id" != "unknown" ]; then
+    bd -C "$GC_CITY" comment "$run_id" "Gate run ended without a verdict on the code (ga-5w2gpw): source bead ${bead_id} was already closed ${when_txt}. Branch ${branch} NOT merged; marker ${marker_id} closed as superseded. This is NOT a FAIL." 2>/dev/null || true
+    set_gate_status "$run_id" "superseded" || true
+    bd -C "$GC_CITY" close "$run_id" -r "gate-run superseded (terminal) — source bead ${bead_id} already closed, branch NOT merged (ga-5w2gpw); marker ${marker_id} closed as superseded." 2>/dev/null || true
+  fi
+  if [ -n "${QG_LOG:-}" ]; then
+    mkdir -p "$(dirname "$QG_LOG")" 2>/dev/null || true
+    jq -c -n \
+      --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$branch" --arg bead "$bead_id" \
+      --arg rig "${RIG:-unknown}" --arg tier "${TIER:-unknown}" --arg gate_run "$run_id" --arg marker "$marker_id" \
+      --arg where "$where" --arg dry_run "${DRY_RUN:-0}" \
+      --argjson elapsed_s "${ELAPSED_S:-0}" --argjson reviewers "${REQUIRED_REVIEWERS:-0}" \
+      '{ts: $ts, event: "dispatcher_complete", branch: $branch, bead: $bead, rig: $rig, tier: $tier,
+        result: "SKIPPED_BEAD_CLOSED", reason: ("source bead already closed (" + $where + ") — branch not merged, not a FAIL"),
+        gate_run: $gate_run, marker: $marker, elapsed_s: $elapsed_s, reviewers: $reviewers, dry_run: $dry_run}' \
+      >> "$QG_LOG" 2>/dev/null || true
+  fi
+  log "=== Gate run complete: gate_run=${run_id} branch=${branch} verdict=SKIPPED_BEAD_CLOSED elapsed=${ELAPSED_S:-0}s ==="
+  return 0
+}
+
 # Lib-only entrypoint for quality-gate-reconvene.selftest.sh: expose the helpers
 # above WITHOUT running the live dispatcher (mirrors quality-gate-guard.sh's
 # GATE_GUARD_LIB_ONLY). Must precede the log-redirect + live work below. Never
@@ -6791,10 +6850,15 @@ if [ "$OVERALL_VERDICT" = "PASS" ] && [ -n "$BEAD_ID" ]; then
   GATE_LXZ5W_NOW="$(date -u +%FT%TZ)"
   case "$GATE_LXZ5W_BLOCK" in
     closed)
-      OVERALL_VERDICT="FAIL"
-      GATE_SHA_FAIL_CLASS="hold"  # ga-4cy2t: administrative (resolved elsewhere), not a code rejection
-      FAIL_REASONS="Source bead $BEAD_ID is already closed — a different branch/process resolved it after this gate-run began (ga-lxz5w: 2-branch race, sequential variant). Not merging $BRANCH onto an already-terminal bead; a human should confirm whether these changes are still needed as a follow-up."
-      warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) at $GATE_LXZ5W_NOW — downgrading $BRANCH's in-flight PASS to FAIL before merge. labels=[$GATE_LXZ5W_LIVE_LABELS]"
+      # ga-5w2gpw (c): a CLOSED bead is not a rejection of this code — the reviewers approved it and the bead
+      # it answered is done. It used to be downgraded to FAIL here (hold class) and then walk the whole FAIL
+      # path: "Fix THESE specific blocking issues" on a closed bead, gate:failed, an author nudge. It now ends
+      # the run as a terminal skip: nothing merged (ga-lxz5w's never-merge-onto-a-terminal-bead stands), an
+      # honest audit trail, marker and gate-run closed, and a SKIPPED_BEAD_CLOSED result that is neither PASS nor
+      # FAIL. A park:* label (a human HOLD) is a different thing and still downgrades to FAIL below.
+      warn "ga-lxz5w: bead $BEAD_ID already closed (resolved elsewhere) at $GATE_LXZ5W_NOW — ending $BRANCH's in-flight run as a terminal skip before merge, NOT a FAIL (ga-5w2gpw). labels=[$GATE_LXZ5W_LIVE_LABELS]"
+      gate_finish_bead_already_closed "$MARKER_ID" "$GATE_RUN_ID" "$BEAD_CITY" "$BEAD_ID" "$BRANCH" "$BRANCH_SHA" early
+      return 0
       ;;
     park:*)
       OVERALL_VERDICT="FAIL"
@@ -7380,6 +7444,9 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           # definitive, non-retryable block: retrying the git push changes
           # neither a human decision nor a bead's terminal state.
           err "  ga-360a7l: late live re-check on $BEAD_ID at $GATE_360A7L_NOW (attempt $((MERGE_ATTEMPT+1))) blocks the push: $GATE_360A7L_LATE. labels=[$GATE_LXZ5W_LIVE_LABELS]"
+          # ga-5w2gpw (c): remember WHICH kind of block this was — a CLOSED bead ends the run as a terminal
+          # skip (bead-closed-late block in gate_finalize_run); a park:* hold keeps failing as before.
+          if [ "$GATE_360A7L_LATE" = "closed" ]; then GATE_BEAD_CLOSED_LATE=1; else GATE_BEAD_CLOSED_LATE=0; fi
           GATE_360A7L_LATE_REASON="source bead $BEAD_ID now reads '$GATE_360A7L_LATE' on the live re-check immediately before push, at $GATE_360A7L_NOW (labels=[$GATE_LXZ5W_LIVE_LABELS]) — this landed after every earlier check in this run, including the Step 10 ga-lxz5w(b) re-check; not pushing (ga-360a7l)"
           MERGE_RESULT="failed_bead_blocked_late"
           return 1
@@ -7489,6 +7556,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       fi
     }
 
+    GATE_BEAD_CLOSED_LATE=0  # ga-5w2gpw (c): set by do_merge_ff's pre-push re-check ONLY when it saw a CLOSED bead
     while [ "$MERGE_ATTEMPT" -lt "$MAX_MERGE_RETRIES" ]; do
       MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
       log "Merge attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES ..."
@@ -7514,6 +7582,20 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
         sleep 2
       fi
     done
+
+    # ── ga-5w2gpw (c): the bead was CLOSED between review and push — a terminal skip, not a FAIL ──────────
+    # do_merge_ff's authoritative pre-push re-check (ga-360a7l) saw the source bead CLOSED. Same verdict as the
+    # early re-check: the reviewers approved this code and the bead it answered is done, so there is nothing to
+    # fix and nothing to "degrade" — end the run here, before the generic failed_* block below turns it into a
+    # FAIL. BOTH conditions are required: the flag is only ever set together with failed_bead_blocked_late, and a
+    # park:* hold (flag 0) or any other merge failure (a stale flag from another run) keeps the FAIL handling.
+    # SELFTEST-EXTRACT bead-closed-late: BEGIN
+    if [ "${MERGE_RESULT:-}" = "failed_bead_blocked_late" ] && [ "${GATE_BEAD_CLOSED_LATE:-0}" = "1" ]; then
+      warn "ga-5w2gpw: bead $BEAD_ID was closed between review and push — ending $BRANCH's run as a terminal skip, NOT a FAIL (merge result: $MERGE_RESULT)."
+      gate_finish_bead_already_closed "$MARKER_ID" "$GATE_RUN_ID" "$BEAD_CITY" "$BEAD_ID" "$BRANCH" "$BRANCH_SHA" late
+      return 0
+    fi
+    # SELFTEST-EXTRACT bead-closed-late: END
 
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
