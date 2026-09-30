@@ -2799,6 +2799,98 @@ gate_base_test_is_code_helper() {
   return 0
 }
 
+# _gate_base_test_norm_path <relative-path>  (ga-kisvqp)
+#   Lexical normalisation of a RELATIVE path: drops "" and ".", lets ".." pop one component. Prints the
+#   result (the empty string when the path resolves to the root itself). Status 1, nothing printed, for an
+#   empty or absolute path and for any path that climbs above its root — the caller must never be handed
+#   a location outside the tree it is working in. Pure (no IO, nothing resolved against the filesystem:
+#   a link target is judged by where it POINTS, not by what is on disk).
+_gate_base_test_norm_path() {
+  local p="${1-}" out="" comp="" old_ifs="$IFS" had_f=1 rc=0
+  case "$p" in
+    (''|/*) return 1 ;;
+  esac
+  case "$-" in (*f*) had_f=0 ;; esac
+  set -f
+  IFS=/
+  for comp in $p; do
+    case "$comp" in
+      (''|.) ;;
+      (..)
+        if [ -z "$out" ]; then rc=1; break; fi
+        case "$out" in
+          (*/*) out="${out%/*}" ;;
+          (*) out="" ;;
+        esac ;;
+      (*) out="${out:+$out/}$comp" ;;
+    esac
+  done
+  IFS="$old_ifs"
+  if [ "$had_f" -eq 1 ]; then set +f; fi
+  if [ "$rc" -ne 0 ]; then return 1; fi
+  printf '%s' "$out"
+  return 0
+}
+
+# gate_base_test_materialize_links <checkout>  (ga-kisvqp)
+#   A fresh checkout of a commit has none of a live rig's untracked runtime state, and any tracked
+#   SYMLINK into it dangles. Real case (whatsapp_automation): `logs -> shared/logs` and
+#   `data -> shared/data` are tracked, `shared/` is not, so a module that opens logs/<name>.log at
+#   import time — a great many of them — fails with FileNotFoundError and the tip CONTROL is not green:
+#   every such test is unmeasurable for a reason that has nothing to do with the fix. For each tracked
+#   symlink whose RELATIVE target (resolved from the link's own directory) lies inside the checkout and
+#   does not exist, this creates it as an empty directory. Never followed: absolute targets, targets
+#   that climb out of the tree, targets that already exist. Nothing is linked to the live rig's real
+#   state: tests get an empty directory inside the sandbox scratch, where they may write, and never the
+#   production data. Prints the number of directories created (0 when the argument is not a checkout).
+#   ALWAYS returns 0. A target that is really a FILE becomes an empty directory and the test that wanted
+#   the file fails at tip as before: unmeasured, which is the safe answer.
+gate_base_test_materialize_links() {
+  local root="${1-}" made=""
+  if [ -z "$root" ] || [ ! -d "$root" ]; then printf '0'; return 0; fi
+  made=$(git -C "$root" ls-files -s 2>/dev/null | awk -F'\t' '{ split($1, a, " "); if (a[1] == "120000") print $2 }' | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    tgt=$(readlink "$root/$p" 2>/dev/null) || continue
+    [ -z "$tgt" ] && continue
+    case "$tgt" in
+      (/*) continue ;;
+    esac
+    dir="${p%/*}"; [ "$dir" = "$p" ] && dir=""
+    res=$(_gate_base_test_norm_path "${dir:+$dir/}$tgt") || continue
+    [ -z "$res" ] && continue
+    if [ ! -e "$root/$res" ] && [ ! -L "$root/$res" ]; then
+      if mkdir -p "$root/$res" 2>/dev/null; then echo "$res"; fi
+    fi
+  done) || made=""
+  printf '%s' "$(printf '%s\n' "$made" | grep -c . || true)"
+  return 0
+}
+
+# gate_base_test_mirror_runtime_dirs <live-rig> <checkout-dir>  (ga-kisvqp)
+#   Conventional runtime directories (logs data tmp var run cache .cache output outputs) that the LIVE rig
+#   has and a fresh checkout of a commit lacks, created in <checkout-dir> as EMPTY real directories.
+#   Why: whatsapp_automation keeps `logs -> shared/logs` and `data -> shared/data` as untracked symlinks on
+#   the host. A checkout has neither, and any module that opens logs/<x>.log while it is imported —
+#   daemons/admin_dashboard.py is one, measured on a real fix commit (wa-crqqja) — fails at tip, so the
+#   CONTROL is not green and the test is unmeasurable for a reason that has nothing to do with the fix.
+#   Only names the live rig actually has are mirrored (a name is never invented), only when the live entry
+#   is a directory or a link to one (a FILE called `var` stays a file), and only when the checkout lacks it.
+#   Nothing is linked and nothing is copied: the directory is empty, inside the sandbox scratch, so a test
+#   can write there but never read production data (shared/data holds the live databases). A test that
+#   needs real files in it fails at tip and is unmeasured — the safe answer. Prints the number created;
+#   0 for any missing/empty argument. ALWAYS returns 0.
+gate_base_test_mirror_runtime_dirs() {
+  local live="${1-}" dst="${2-}" name="" made=0
+  if [ -z "$live" ] || [ -z "$dst" ] || [ ! -d "$live" ] || [ ! -d "$dst" ]; then printf '0'; return 0; fi
+  for name in logs data tmp var run cache .cache output outputs; do
+    if [ -d "$live/$name" ] && [ ! -e "$dst/$name" ] && [ ! -L "$dst/$name" ]; then
+      if mkdir "$dst/$name" 2>/dev/null; then made=$((made + 1)); fi
+    fi
+  done
+  printf '%s' "$made"
+  return 0
+}
+
 # gate_base_test_sandbox_profile <scratch> [<home>]  (ga-kisvqp)
 #   The macOS sandbox-exec (Seatbelt) profile every pytest/js run is wrapped in. Why the
 #   pytest/js extension needs one when the bash one did not: these files IMPORT the code under
@@ -2989,7 +3081,7 @@ gate_base_test_sandbox_exec() {
   return "$rc"
 }
 
-# gate_base_test_run_table <kind> <rig> <cwd> <scratch> <relfile> [<only>]  (ga-kisvqp)
+# gate_base_test_run_table <kind> <rig> <cwd> <scratch> <relfile> [<only> [<failfast>]]  (ga-kisvqp)
 #   Runs ONE test file (or, with <only>, ONE test of it) in the sandbox and prints its outcome
 #   table (see _gate_base_test_classify). <cwd> is the directory the tests run from (the rig's
 #   directory inside a checkout — base or tip), <relfile> the test file relative to it, <rig> the
@@ -3003,10 +3095,20 @@ gate_base_test_sandbox_exec() {
 #            statuses 0 (all passed) 1 (some failed) 2 (collection error) 5 (none collected) count
 #            as "ran"; 3 (internal error) and 4 (usage error) do not.
 #   <only> for py is a pytest node id ("tests/t.py::test_a[x]"), for js the test's full name.
+#   <failfast> (a positive integer) stops the run after that many failing tests (pytest --maxfail, vitest
+#   --bail). The table then holds those failures and NOT the rest of the file: it is an answer to "which
+#   tests fail?", never to "do they all pass?". A run that hits no failure is a full run. Anything that is
+#   not a positive integer is refused (status 1) rather than read as "no bound".
 gate_base_test_run_table() {
-  local kind="${1-}" rig="${2-}" cwd="${3-}" scratch="${4-}" rel="${5-}" only="${6-}"
-  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" rc=0 real="" interp="" here="" node="" vt="" pat=""
+  local kind="${1-}" rig="${2-}" cwd="${3-}" scratch="${4-}" rel="${5-}" only="${6-}" failfast="${7-}"
+  local secs="${GATE_ABT_RUN_TIMEOUT:-90}" rc=0 real="" interp="" here="" node="" vt="" pat="" ff_py="" ff_js=""
   if [ -z "$kind" ] || [ -z "$rig" ] || [ -z "$rel" ] || [ ! -d "$cwd" ] || [ ! -d "$scratch" ]; then return 1; fi
+  if [ -n "$failfast" ]; then
+    case "$failfast" in
+      (*[!0-9]*|0|0[0-9]*) return 1 ;;
+    esac
+    ff_py="--maxfail=$failfast"; ff_js="--bail=$failfast"
+  fi
   real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
   rm -f "$real/outcomes.jsonl" "$real/outcomes.jsonl.part" "$real/vitest.json" 2>/dev/null
   case "$kind" in
@@ -3017,7 +3119,7 @@ gate_base_test_run_table() {
       cp "$here/gate_basetest_outcomes.py" "$real/plugin/" 2>/dev/null || return 1
       gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$interp" -m pytest \
         -p gate_basetest_outcomes -p no:cacheprovider -p no:randomly -p no:xdist -o addopts= \
-        -q --tb=no --color=no "${only:-$rel}" && rc=0 || rc=$?
+        -q --tb=no --color=no ${ff_py:+"$ff_py"} "${only:-$rel}" && rc=0 || rc=$?
       case "$rc" in
         (0|1|2|5) ;;
         (*) return 1 ;;
@@ -3040,10 +3142,10 @@ gate_base_test_run_table() {
       # is still complete (so the 0|1 filter below would tolerate it); the flag just keeps the run
       # clean and its exit status meaning "tests failed" and nothing else.
       if [ -n "$pat" ]; then
-        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache \
+        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache ${ff_js:+"$ff_js"} \
           --reporter=json --outputFile="$real/vitest.json" -t "$pat" && rc=0 || rc=$?
       else
-        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache \
+        gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$node" "$vt" run "$rel" --no-cache ${ff_js:+"$ff_js"} \
           --reporter=json --outputFile="$real/vitest.json" && rc=0 || rc=$?
       fi
       case "$rc" in
@@ -3102,49 +3204,70 @@ _gate_base_test_alone_table() {
 #     why    "-" for a measured state, else the reason it is unmeasured
 #     old    added | old-passes | old-fails | unknown, only for passes-on-base (ga-yl1k3w repair test)
 #   Reads its caller's locals (dynamic scope): rig basewt tipwt basedir tipdir scratch base tip t0
-#   budget alone_max supcode — it only exists as gate_base_test_pyjs_measure's body, split out for size.
-#   Order: tip is the CONTROL and runs first (a file that is not green at tip measures nothing);
-#   then base with the test-side overlay. A test that fails at base is re-run ALONE at both trees. If
-#   instead EVERY tip-passing test passes at base, each is run ALONE at base before the file may be
-#   called passes-on-base: a test that passes in the file run only on state a sibling leaked — and
-#   fails on its own — does depend on the fix, and refusing it would be refusing a good test. More
-#   tip-passing tests than GATE_ABT_ALONE_PASS_MAX to check alone -> unmeasured, never a refusal.
+#   budget alone_max failfast supcode — it only exists as gate_base_test_pyjs_measure's body, split out for size.
+#   Order — BASE first (with the test-side overlay), stopping after GATE_ABT_FAILFAST failures:
+#     (a) some tests FAIL on base: those few are re-run ALONE at tip (the control — a test that does not
+#         pass there is never counted) and ALONE at base (the confirmation). No full run of the file at tip
+#         is needed, so a huge file costs seconds, not minutes.
+#     (b) no failure on base (a full run), or (c) a collection error: a FULL run at tip is the control
+#         (a file that is not green there measures nothing). If EVERY tip-passing test passes at base, each
+#         is then run ALONE at base before the file may be called passes-on-base: a test that passes in the
+#         file run only on state a sibling leaked — and fails on its own — does depend on the fix, and
+#         refusing it would be refusing a good test. More tip-passing tests than
+#         GATE_ABT_ALONE_PASS_MAX to check alone -> unmeasured, never a refusal.
 _gate_base_test_measure_one() {
   local kind="$1" relf="$2" full="$3"
-  local T="" B="" B2="" D="" D2="" AT="" AB="" st="" old="-" ids="" n=0 O="" ex="" rc=0 lvl=""
-  T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
-  # A control that is not green (nothing passes, or the file did not load) cannot support either answer, and
-  # a file with no tests at all is not a test: neither needs the base run. Judging the tip table against ITSELF
-  # is the cheap way to ask exactly that — only a green control reads passes-on-base here.
-  case "$(gate_base_test_file_state "$T" "$T")" in
-    (no-tests) echo "no-tests - -"; return 0 ;;
-    (unmeasured) echo "unmeasured tip-not-green -"; return 0 ;;
+  local T="" B="" B2="" D="" D2="" AT="" AB="" st="" old="-" ids="" n=0 O="" ex="" rc=0 lvl="" F=""
+  # BASE first, stopping after a few failures: when the new tests do fail on base (the case the check hopes
+  # for) that is seconds, however big the file is — the old order ran the WHOLE file at tip before looking at
+  # base, which a 170-test file could not finish inside the budget (measured on real WA history, wa-qtfcv).
+  B=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "" "$failfast") || { echo "unmeasured base-unreadable -"; return 0; }
+  F=$(printf '%s\n' "$B" | awk -F'\t' 'NR > 1 && $2 == "fail" { print $1 }' | head -n "$failfast")
+  case "$B" in
+    (*$'\t'collect-error*) lvl="file" ;;
+    (*) lvl="" ;;
   esac
-  if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
-  B=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf") || { echo "unmeasured base-unreadable -"; return 0; }
-  D=$(gate_base_test_decisive "$T" "$B")
-  if [ -n "$D" ]; then
-    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D") || AT=""
-    case "$B" in
-      (*$'\t'collect-error*) lvl="file" ;;
-      (*) lvl="" ;;
-    esac
-    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$D" "$lvl") || AB=""
-    st=$(gate_base_test_file_state "$T" "$B" "$AT" "$AB")
+  if [ -n "$F" ] && [ -z "$lvl" ]; then
+    # (a) Some tests FAIL on base. The control is those tests run ALONE at tip — no full tip run needed — and the
+    # confirmation is the same tests alone at base. The tip table IS the alone-at-tip table: a test that does not
+    # pass there (environment, clock, order) is never counted. The classifier is unchanged: it is handed a tip
+    # table that holds exactly the candidates.
+    AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$F") || AT=""
+    AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$F") || AB=""
+    st=$(gate_base_test_file_state "$AT" "$B" "$AT" "$AB")
+    # Base showed failing tests, so the file HAS tests: an empty alone-at-tip table is "could not control", never no-tests.
+    if [ "$st" = "no-tests" ]; then st="unmeasured"; fi
   else
-    st=$(gate_base_test_file_state "$T" "$B")
-    if [ "$st" = "passes-on-base" ]; then
-      ids=$(printf '%s\n' "$T" | awk -F'\t' 'NR > 1 && $2 == "pass" { print $1 }')
-      n=$(printf '%s\n' "$ids" | grep -c . || true)
-      if [ "$n" -gt "$alone_max" ]; then echo "unmeasured too-many-tests -"; return 0; fi
-      if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
-      B2=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$ids") || B2=""
-      D2=$(gate_base_test_decisive "$T" "$B2")
-      if [ -n "$D2" ]; then
-        AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D2") || AT=""
-        st=$(gate_base_test_file_state "$T" "$B2" "$AT" "$B2")
-      else
-        st=$(gate_base_test_file_state "$T" "$B2")
+    # (b) No failure on base (a full run) or (c) a collection error: a FULL tip run is the control.
+    if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
+    T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
+    # A control that is not green (nothing passes, or the file did not load) cannot support either answer, and a
+    # file with no tests at all is not a test. Judging the tip table against ITSELF is the cheap way to ask exactly
+    # that — only a green control reads passes-on-base here.
+    case "$(gate_base_test_file_state "$T" "$T")" in
+      (no-tests) echo "no-tests - -"; return 0 ;;
+      (unmeasured) echo "unmeasured tip-not-green -"; return 0 ;;
+    esac
+    D=$(gate_base_test_decisive "$T" "$B")
+    if [ -n "$D" ]; then
+      AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D") || AT=""
+      AB=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$D" "$lvl") || AB=""
+      st=$(gate_base_test_file_state "$T" "$B" "$AT" "$AB")
+    else
+      st=$(gate_base_test_file_state "$T" "$B")
+      if [ "$st" = "passes-on-base" ]; then
+        ids=$(printf '%s\n' "$T" | awk -F'\t' 'NR > 1 && $2 == "pass" { print $1 }')
+        n=$(printf '%s\n' "$ids" | grep -c . || true)
+        if [ "$n" -gt "$alone_max" ]; then echo "unmeasured too-many-tests -"; return 0; fi
+        if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
+        B2=$(_gate_base_test_alone_table "$kind" "$rig" "$basedir" "$scratch" "$relf" "$ids") || B2=""
+        D2=$(gate_base_test_decisive "$T" "$B2")
+        if [ -n "$D2" ]; then
+          AT=$(_gate_base_test_alone_table "$kind" "$rig" "$tipdir" "$scratch" "$relf" "$D2") || AT=""
+          st=$(gate_base_test_file_state "$T" "$B2" "$AT" "$B2")
+        else
+          st=$(gate_base_test_file_state "$T" "$B2")
+        fi
       fi
     fi
   fi
@@ -3196,7 +3319,8 @@ _gate_base_test_measure_one() {
 #   branch). Every test-side file the branch changed (gate_base_test_is_support: the tests, their
 #   conftest/helpers/fixtures) is copied from TIP onto BASE, so a test that imports a helper the
 #   branch added does not "fail" on an ImportError; every OTHER changed file stays at BASE, because
-#   that is the fix. Each file then runs on TIP as the control, and on BASE (see
+#   that is the fix. Each file runs on BASE first, failing fast; TIP is the control — for just the failing
+#   tests, alone, when base fails, and for the whole file otherwise (see
 #   _gate_base_test_measure_one). Every run is sandboxed (gate_base_test_sandbox_exec); with no
 #   working sandbox nothing runs at all.
 #   Bounds: GATE_ABT_PYJS_MAX files (default 8; more -> all unmeasured, why=cap), GATE_ABT_PYJS_BUDGET
@@ -3204,7 +3328,7 @@ _gate_base_test_measure_one() {
 #   GATE_ABT_RUN_TIMEOUT per run (default 90), GATE_ABT_ALONE_PASS_MAX alone checks (default 8).
 gate_base_test_pyjs_measure() {
   local rig="${1-}" base="${2-}" tip="${3-}" files="${4-}"
-  local max="${GATE_ABT_PYJS_MAX:-8}" budget="${GATE_ABT_PYJS_BUDGET:-240}" alone_max="${GATE_ABT_ALONE_PASS_MAX:-8}"
+  local max="${GATE_ABT_PYJS_MAX:-8}" budget="${GATE_ABT_PYJS_BUDGET:-240}" alone_max="${GATE_ABT_ALONE_PASS_MAX:-8}" failfast="${GATE_ABT_FAILFAST:-3}"
   local t0=$SECONDS f="" kind="" relf="" list="" prefix="" scratch="" real="" basewt="" tipwt="" basedir="" tipdir=""
   local n=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclass=0 npy=0 njs=0
   local fail_why="" res="" st="" why="" old="" rest="" sup="" lst="" had_f=1 mat=0 supcode=0
@@ -3238,6 +3362,13 @@ gate_base_test_pyjs_measure() {
     fi
   fi
   if [ -z "$fail_why" ]; then
+    # Tracked symlinks into untracked runtime dirs (WA: logs -> shared/logs) dangle in a fresh checkout and
+    # fail the control for reasons unrelated to the fix: give them empty directories inside the scratch.
+    gate_base_test_materialize_links "$basewt" >/dev/null
+    gate_base_test_materialize_links "$tipwt" >/dev/null
+    # ...and the same for runtime dirs that are untracked on the host (WA: logs/, data/): empty ones, mirrored.
+    gate_base_test_mirror_runtime_dirs "$rig" "$basedir" >/dev/null
+    gate_base_test_mirror_runtime_dirs "$rig" "$tipdir" >/dev/null
     # A borrowed node_modules: neither checkout has its own. The sandbox keeps the link read-only.
     if [ -d "$rig/node_modules" ]; then
       [ -e "$basedir/node_modules" ] || ln -s "$rig/node_modules" "$basedir/node_modules" 2>/dev/null || true

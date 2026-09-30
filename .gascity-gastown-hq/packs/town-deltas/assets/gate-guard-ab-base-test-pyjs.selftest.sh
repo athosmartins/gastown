@@ -505,6 +505,15 @@ PY
     gate_base_test_run_table rb "$RIG" "$RIG" "$RS" tests/test_many.py >/dev/null; eq "an unknown kind -> status 1" "$?" "1"
     gate_base_test_run_table py "$RIG" "$RIG/no-such-dir" "$RS" tests/test_many.py >/dev/null; eq "a cwd that does not exist -> status 1" "$?" "1"
     gate_base_test_run_table py "$RIG" "$RIG" "$RS" "" >/dev/null; eq "an empty test file -> status 1" "$?" "1"
+    # Fail-fast: stop after N failures. The table then holds exactly those failures and is NOT a full run.
+    printf 'import pytest\n\n@pytest.mark.parametrize("i", range(6))\ndef test_bad(i):\n    assert False\n' > "$RIG/tests/test_manyfail.py"
+    T=$(gate_base_test_run_table py "$RIG" "$RIG" "$RS" tests/test_manyfail.py "" 2)
+    eq "with a fail-fast bound of 2, exactly 2 failures are recorded (the other 4 tests never ran)" "$(printf '%s\n' "$T" | grep -c "$(printf '\tfail$')")" "2"
+    eq "...and the table is still a readable one (#ok header)" "$(printf '%s\n' "$T" | head -1)" "#ok"
+    T=$(gate_base_test_run_table py "$RIG" "$RIG" "$RS" tests/test_manyfail.py "" "")
+    eq "no bound -> all 6 failures are recorded" "$(printf '%s\n' "$T" | grep -c "$(printf '\tfail$')")" "6"
+    gate_base_test_run_table py "$RIG" "$RIG" "$RS" tests/test_manyfail.py "" "two" >/dev/null
+    eq "a non-numeric bound -> status 1 (never silently 'no bound')" "$?" "1"
     # What the plugin records for the awkward phases — each of these is a way a run could be misread.
     printf 'import pytest\n\n@pytest.fixture\ndef boom():\n    yield\n    raise RuntimeError("teardown")\n\ndef test_td(boom):\n    assert True\n' > "$RIG/tests/test_teardown.py"
     T=$(gate_base_test_run_table py "$RIG" "$RIG" "$RS" tests/test_teardown.py)
@@ -676,7 +685,7 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_env.py)
     eq "a passing file plus an UNMEASURED one -> nao-consegui-medir (never refused on partial evidence)" \
       "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
-    eq "...and the not-green file never cost a base run (why=tip-not-green)" "$(fwhy tests/test_env.py)" "tip-not-green"
+    eq "...for a reason that is reported, not blank" "$([ -n "$(fwhy tests/test_env.py)" ] && [ "$(fwhy tests/test_env.py)" != "-" ] && echo reported)" "reported"
     # The remaining compositions are pure arithmetic over totals the big scenario above already asserted:
     eq "totals of {fails, passes} -> reprovou-na-base" "$(gate_base_test_verdict 2 2 2 1 0 0)" "reprovou-na-base"
     eq "totals of {repaired test} -> consertou-teste-vermelho" "$(gate_base_test_verdict 1 1 1 0 1 0)" "consertou-teste-vermelho"
@@ -744,6 +753,13 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     OUT=$(GATE_ABT_RUN_TIMEOUT=4 measure "$C2" "" "$BASE2" "$TIP2" tests/test_hang.py)
     eq "base hangs (infinite loop) while tip is fine -> unmeasured, NOT fails-on-base (slowness is not evidence)" "$(fstate tests/test_hang.py)" "unmeasured"
 
+    echo "  -- a file too slow to run in full: base first, fail-fast, then only the failing tests at tip --"
+    C6="$H_SCRATCH/case6"; mk_case "$C6" ""; BASE6=$(git -C "$C6" rev-parse HEAD); fix_code "$C6" ""
+    printf 'import time\nimport pytest\nfrom lib.mod import double\n\n@pytest.mark.parametrize("i", range(40))\ndef test_x(i):\n    assert double(2) == 4   # fails instantly on base\n    time.sleep(0.5)         # only reached WITH the fix: a full run at tip takes ~20s\n' > "$C6/tests/test_huge.py"
+    TIP6=$(commit_all "$C6" "fix + huge test")
+    OUT=$(GATE_ABT_RUN_TIMEOUT=12 measure "$C6" "" "$BASE6" "$TIP6" tests/test_huge.py)
+    eq "a 40-test file whose FULL run at tip exceeds the budget is still measured: fails-on-base from 3 failing tests, never the whole file" "$(fstate tests/test_huge.py)" "fails-on-base"
+
     echo "  -- a rig that is a SUBDIRECTORY of the repo (the gascity layout) --"
     C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"
     BASE3=$(git -C "$C3" rev-parse HEAD); fix_code "$C3" "rig"
@@ -792,6 +808,75 @@ if need_fn gate_base_test_pyjs_scan; then
   eq "an unresolvable base (git diff FAILS) -> UNREAD, NOT 'files=0'" "$OUT" "UNREAD"
   eq "empty inputs -> UNREAD" "$(gate_base_test_pyjs_scan "" "$B6" "$T6")" "UNREAD"
   eq "a rig that is not a repo -> UNREAD" "$(gate_base_test_pyjs_scan "$H_SCRATCH/rig-novenv" "$B6" "$T6")" "UNREAD"
+fi
+
+# ── 6b. Dangling runtime links: a fresh checkout has symlinks into directories that only exist in a live rig ──
+echo "── 6b. gate_base_test_materialize_links ──"
+if need_fn _gate_base_test_norm_path; then
+  echo "  -- _gate_base_test_norm_path --"
+  eq "a plain relative path is unchanged" "$(_gate_base_test_norm_path shared/logs)" "shared/logs"
+  eq "'.' and empty components are dropped" "$(_gate_base_test_norm_path ./a//b/.)" "a/b"
+  eq "'..' pops one component" "$(_gate_base_test_norm_path a/b/../c)" "a/c"
+  eq "several '..' pop several" "$(_gate_base_test_norm_path a/b/../../c)" "c"
+  _gate_base_test_norm_path ../x >/dev/null; eq "a path that climbs above the root -> status 1" "$?" "1"
+  _gate_base_test_norm_path a/../../x >/dev/null; eq "...also when it climbs AFTER descending" "$?" "1"
+  eq "a path that resolves to the root itself is the empty string (nothing to create)" "$(_gate_base_test_norm_path a/..)" ""
+  _gate_base_test_norm_path /etc/passwd >/dev/null; eq "an absolute path -> status 1 (never followed)" "$?" "1"
+  _gate_base_test_norm_path "" >/dev/null; eq "empty -> status 1" "$?" "1"
+fi
+if need_fn gate_base_test_materialize_links; then
+  echo "  -- gate_base_test_materialize_links --"
+  L="$H_SCRATCH/links"; mkdir -p "$L/src" && git -C "$L" init -q . && git -C "$L" config user.email t@t && git -C "$L" config user.name t
+  ln -s shared/logs "$L/logs"                          # the WA shape: a tracked link into an untracked runtime dir
+  ln -s shared/data "$L/data"
+  ln -s ../../elsewhere/x "$L/src/up"                   # relative to the LINK'S directory: src/../../elsewhere = climbs out
+  ln -s /etc "$L/abs"                                   # absolute: never followed
+  mkdir -p "$L/real"; printf 'k\n' > "$L/real/keep"; ln -s real "$L/already"   # target exists (git tracks files, not empty dirs)
+  ln -s ../real/sub "$L/src/inner"                      # relative to src/: resolves to real/sub, inside the tree
+  printf 'x\n' > "$L/file.txt"; ln -s file.txt "$L/tofile"   # target is an existing FILE
+  git -C "$L" add -A; git -C "$L" commit -q -m links
+  # A fresh checkout of that commit: every link is exactly as dangling as in the WA case.
+  git -C "$L" worktree add --detach -q "$H_SCRATCH/links-wt" HEAD
+  N=$(gate_base_test_materialize_links "$H_SCRATCH/links-wt")
+  eq "reports how many directories it created (logs, data, real/sub = 3)" "$N" "3"
+  eq "logs -> shared/logs now resolves to an empty directory" "$([ -d "$H_SCRATCH/links-wt/shared/logs" ] && echo dir)" "dir"
+  eq "data -> shared/data likewise" "$([ -d "$H_SCRATCH/links-wt/shared/data" ] && echo dir)" "dir"
+  eq "a link relative to its own directory is resolved from THERE (src/inner -> real/sub)" "$([ -d "$H_SCRATCH/links-wt/real/sub" ] && echo dir)" "dir"
+  eq "a target that would climb out of the tree is NOT created" "$([ -e "$H_SCRATCH/elsewhere" ] && echo created || echo absent)" "absent"
+  eq "an absolute target is left alone" "$([ -e "$H_SCRATCH/links-wt/etc" ] && echo created || echo absent)" "absent"
+  eq "an existing target is untouched (the file is still a file)" "$([ -f "$H_SCRATCH/links-wt/file.txt" ] && echo file)" "file"
+  eq "running it again creates nothing (idempotent)" "$(gate_base_test_materialize_links "$H_SCRATCH/links-wt")" "0"
+  eq "not a git checkout -> 0, no error" "$(gate_base_test_materialize_links "$H_SCRATCH/no-such-dir")" "0"
+  eq "empty argument -> 0" "$(gate_base_test_materialize_links "")" "0"
+  git -C "$L" worktree remove --force "$H_SCRATCH/links-wt" >/dev/null 2>&1
+fi
+
+if need_fn gate_base_test_mirror_runtime_dirs; then
+  echo "  -- gate_base_test_mirror_runtime_dirs --"
+  # The live rig has untracked runtime directories (WA: logs -> shared/logs, data -> shared/data, created on the
+  # host, never committed). A fresh checkout has none, and modules that open logs/<x>.log at import fail.
+  LR="$H_SCRATCH/live-rig"; mkdir -p "$LR/shared/logs" "$LR/shared/data" "$LR/cache" "$LR/secrets" "$LR/shared/other"
+  ln -s shared/logs "$LR/logs"; ln -s shared/data "$LR/data"          # symlinks into the shared runtime tree
+  printf 'k\n' > "$LR/shared/data/production.db"                       # real data that must NEVER reach the sandbox
+  : > "$LR/var"                                                        # a FILE named like a runtime dir
+  ln -s shared/other "$LR/output"
+  WT="$H_SCRATCH/fresh-checkout"; mkdir -p "$WT/lib" "$WT/run"; : > "$WT/lib/x.py"   # 'run' already exists in the checkout
+  mkdir -p "$LR/run"; printf 'live\n' > "$LR/run/pid"
+  N=$(gate_base_test_mirror_runtime_dirs "$LR" "$WT")
+  eq "the live rig's logs, data, cache, output -> 4 empty dirs created (run already existed, var is a file)" "$N" "4"
+  eq "logs/ exists and is an EMPTY real directory (not a link into the live rig)" "$([ -d "$WT/logs" ] && [ ! -L "$WT/logs" ] && [ -z "$(ls -A "$WT/logs")" ] && echo empty-dir)" "empty-dir"
+  eq "data/ is empty: production data never travels into the sandbox" "$([ -d "$WT/data" ] && [ -z "$(ls -A "$WT/data")" ] && echo empty-dir)" "empty-dir"
+  eq "a symlink-to-dir in the live rig (output) is mirrored as a plain empty dir too" "$([ -d "$WT/output" ] && [ ! -L "$WT/output" ] && echo dir)" "dir"
+  eq "a name NOT on the conventional list (secrets, shared) is never mirrored" "$([ -e "$WT/secrets" ] || [ -e "$WT/shared" ] && echo mirrored || echo absent)" "absent"
+  eq "a live-rig FILE that has a runtime-dir name (var) is not turned into a directory" "$([ -e "$WT/var" ] && echo created || echo absent)" "absent"
+  eq "an entry the checkout already has (run) is left exactly as it is" "$([ -z "$(ls -A "$WT/run")" ] && echo untouched)" "untouched"
+  eq "running it again creates nothing (idempotent)" "$(gate_base_test_mirror_runtime_dirs "$LR" "$WT")" "0"
+  mkdir -p "$H_SCRATCH/wt2" "$H_SCRATCH/lr2"
+  eq "a live rig without runtime dirs -> nothing is invented: count 0" "$(gate_base_test_mirror_runtime_dirs "$H_SCRATCH/lr2" "$H_SCRATCH/wt2")" "0"
+  eq "...and the checkout stays empty" "$(ls -A "$H_SCRATCH/wt2" | wc -l | tr -d ' ')" "0"
+  eq "missing live rig -> 0" "$(gate_base_test_mirror_runtime_dirs "$H_SCRATCH/nope" "$WT")" "0"
+  eq "missing checkout -> 0" "$(gate_base_test_mirror_runtime_dirs "$LR" "$H_SCRATCH/nope")" "0"
+  eq "empty arguments -> 0" "$(gate_base_test_mirror_runtime_dirs "" "")" "0"
 fi
 
 # ── 7. The arm-B call site, END TO END: the real block, extracted verbatim, run under production options ──
