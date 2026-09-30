@@ -70,11 +70,12 @@ sandbox (no network, writes only to a scratch dir) since they are being run
 against pre-fix code. Your test files, their `conftest.py` and anything under
 `tests/`, `tests-js/`, `test/`, `__tests__/` or `fixtures/` come along onto the
 base; every OTHER file you
-changed stays pre-fix, because that is the fix. Each test file also runs on
-your branch as a control — a test that does not pass THERE is never counted as
-"failing on base" — and every test is also run ALONE, so a test that only
-passes (or only fails) because of state another test left behind does not
-decide the outcome. Anything the check cannot measure (the rig has no
+changed stays pre-fix, because that is the fix. Your branch is the control: a
+test counts as "failing on base" only if it passes ALONE on your branch and
+fails ALONE on base, and a file is refused only after each of its tests has
+also been run ALONE on base (a file with too many tests to do that is "could
+not measure"). So a test that only passes (or only fails) because of state
+another test left behind never decides the outcome. Anything the check cannot measure (the rig has no
 venv/node_modules, a timeout, a test that needs the network or the clock)
 is recorded as "could not measure" and never refused. Write tests that do not
 depend on order, wall-clock time or the network and you will never notice the
