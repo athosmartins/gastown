@@ -3092,6 +3092,13 @@ _gate_base_test_measure_one() {
   local kind="$1" relf="$2" full="$3"
   local T="" B="" B2="" D="" D2="" AT="" AB="" st="" old="-" ids="" n=0 O="" ex="" rc=0 lvl=""
   T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
+  # A control that is not green (nothing passes, or the file did not load) cannot support either answer, and
+  # a file with no tests at all is not a test: neither needs the base run. Judging the tip table against ITSELF
+  # is the cheap way to ask exactly that — only a green control reads passes-on-base here.
+  case "$(gate_base_test_file_state "$T" "$T")" in
+    (no-tests) echo "no-tests - -"; return 0 ;;
+    (unmeasured) echo "unmeasured tip-not-green -"; return 0 ;;
+  esac
   if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
   B=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf") || { echo "unmeasured base-unreadable -"; return 0; }
   D=$(gate_base_test_decisive "$T" "$B")
@@ -3179,8 +3186,6 @@ gate_base_test_pyjs_measure() {
 
   list=$(printf '%s\n' "$files" | grep -v '^$' || true)
   n=$(printf '%s\n' "$list" | grep -c . || true)
-  npy=$(printf '%s\n' "$list" | grep -c -E '(^|/)(test_[^/]*|[^/]*_test)\.py$' || true)
-  njs=$(printf '%s\n' "$list" | grep -c -E '\.(test|spec)\.(js|mjs|cjs|jsx|ts|tsx)$' || true)
 
   if [ "$n" -eq 0 ]; then
     echo "TOTALS files=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 py=0 js=0"
@@ -3238,6 +3243,11 @@ gate_base_test_pyjs_measure() {
   local oldifs2="$IFS"; IFS=$'\n'
   for f in $list; do
     kind=$(gate_base_test_kind "$f")
+    # py=/js= are tallied from the SAME classifier that picks the runner, never from a second pattern.
+    case "$kind" in
+      (py) npy=$((npy + 1)) ;;
+      (js) njs=$((njs + 1)) ;;
+    esac
     st="unmeasured"; why="$fail_why"; old="-"; mat=0
     if [ -z "$fail_why" ]; then
       case "$kind" in
@@ -3286,6 +3296,48 @@ gate_base_test_pyjs_measure() {
   if [ -n "$basewt" ]; then git -C "$rig" worktree prune >/dev/null 2>&1 || true; fi
   if [ -n "$scratch" ] && [ -d "$scratch" ]; then rm -rf "$scratch" 2>/dev/null || true; fi
   echo "TOTALS files=$n counted=$counted copy_ok=$copy_ok ran=$ran failed=$failed repaired=$repaired unclassified=$unclass py=$npy js=$njs"
+  return 0
+}
+
+# gate_base_test_totals_field <scan-output> <key>  (ga-kisvqp)
+#   One numeric field of the TOTALS line gate_base_test_pyjs_measure ends with. Status 1, nothing
+#   printed, when there is no TOTALS line, the key is absent or empty, or its value is not a plain
+#   non-negative integer: a number that cannot be read must never be handed to the verdict as 0.
+#   The key is matched whole (ran is not repaired). Pure (no IO).
+gate_base_test_totals_field() {
+  local out="${1-}" key="${2-}" v=""
+  if [ -z "$key" ]; then return 1; fi
+  v=$(printf '%s\n' "$out" | grep '^TOTALS ' | tail -1 | tr ' ' '\n' | grep "^${key}=" | head -1 | cut -d= -f2) || true
+  case "$v" in
+    (''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$v"
+  return 0
+}
+
+# gate_base_test_pyjs_scan <rig> <base-sha> <tip-sha>  (ga-kisvqp)
+#   What the arm-B call site runs: find the py/js TEST files the branch added or changed between
+#   <base> and <tip> (paths resolved against <rig>, like the *.selftest.sh detection next to it),
+#   then gate_base_test_pyjs_measure them. Prints that function's FILE/TOTALS lines, or the single
+#   line "UNREAD" when the list of changed files could not be read at all (empty input, not a repo,
+#   an sha git cannot resolve). UNREAD is its own state on purpose: an empty list from a FAILED
+#   `git diff` would otherwise read as "this branch changes no test" and be scored sem-teste-novo —
+#   the error-reads-as-empty collapse. ALWAYS returns 0.
+#   Rename detection is off, so a moved-and-edited test arrives as an ADD and is measured; with it
+#   on, --diff-filter=AM would skip the renamed file entirely (a silent bypass).
+gate_base_test_pyjs_scan() {
+  local rig="${1-}" base="${2-}" tip="${3-}" all="" list="" f=""
+  if [ -z "$rig" ] || [ -z "$base" ] || [ -z "$tip" ]; then echo "UNREAD"; return 0; fi
+  if ! all=$(git -C "$rig" -c core.quotePath=false diff --name-only --no-renames --diff-filter=AM "${base}..${tip}" \
+      -- '*.py' '*.js' '*.mjs' '*.cjs' '*.jsx' '*.ts' '*.tsx' 2>/dev/null); then
+    echo "UNREAD"; return 0
+  fi
+  list=$(printf '%s\n' "$all" | while IFS= read -r f; do
+    case "$(gate_base_test_kind "$f")" in
+      (py|js) printf '%s\n' "$f" ;;
+    esac
+  done)
+  gate_base_test_pyjs_measure "$rig" "$base" "$tip" "$list"
   return 0
 }
 
@@ -6255,18 +6307,22 @@ fi
 #          submission's range passes unmodified against the PRE-FIX base
 #          commit — i.e. proves nothing about this branch's own diff.
 #
-# Scope (deliberate, not a placeholder): only *.selftest.sh files are
-# measured. This repo's dominant, uniformly-runnable test convention for the
-# files this guard protects (packs/town-deltas/assets/*.sh) is exactly this
-# bash selftest pattern (see gate-guard-submission-time-coherence.selftest.sh
-# and its siblings) — it runs inline with zero setup (no venv/npm install/
-# network) and is what every existing check in this file already assumes.
-# Other rigs' test conventions (pytest, jest, go test, ...) are NOT run by
-# this check — a submission whose only new tests are those file types is
-# indistinguishable, from here, from "no new test files": it lands in
-# sem-teste-novo, never nao-consegui-medir, because this check never
-# attempted to look for them. Extending coverage to another test convention
-# is future work, tracked separately — not a defect of this bead.
+# Scope: two test conventions are measured.
+#   * *.selftest.sh — run inline right here, unchanged since ga-rstae: this repo's
+#     dominant, zero-setup test convention (no venv/npm install/network).
+#   * pytest (test_*.py, *_test.py) and JS (*.test.* / *.spec.*) — ga-kisvqp, E7 of
+#     ga-ufskhy (docs/reports/gate-e4-historico.md item 4: 10.1% of gate FAILs, 12.5%
+#     after 25/09, are "a test that passes without exercising the path"). Those import
+#     the code under test, so they are measured by gate_base_test_pyjs_scan: a BASE and
+#     a TIP checkout (the tip is the control — a test only counts as failing on base if
+#     it PASSES at tip), the branch's test-side files copied onto base, every run inside
+#     a sandbox (no network, writes only to scratch) because builder tests are being run
+#     against PRE-fix code, and every failure/pass re-run ALONE (lição wa-br1w4r /
+#     wa-u4bdpn). The interpreter is the rig's venv and vitest the rig's node_modules;
+#     a rig without them is unmeasured, never refused. Same verdict words, same arm.
+# Other conventions (go test, ...) are still NOT run: a submission whose only new
+# tests are those file types is indistinguishable, from here, from "no new test
+# files" and lands in sem-teste-novo.
 #
 # Same fail-open posture as Step 5b-pre immediately above: any uncertainty
 # (RIG_PATH unresolved, fetch/rev-parse/merge-base failure, worktree
@@ -6322,6 +6378,9 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
     _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
     _ABT_OUTSIDE="unknown"                 # ga-x4mkk2: "never measured" must not read as 0
     _ABT_BASE=""; _ABT_TEST_FILES=""
+    _ABT_SH_N=0; _ABT_NPY=0; _ABT_NJS=0; _ABT_PYJS_OUT=""; _ABT_PYJS_FILE_LIST=""   # ga-kisvqp: pytest/js half
+    _ABT_PYJS_STATE="none"                 # none | measured | unread | skipped-sh-cap (never a bare 0 for "could not look")
+    _ABT_PYJS_DET=0; _ABT_PYJS_COPY=0; _ABT_PYJS_RAN=0; _ABT_PYJS_FAILED=0; _ABT_PYJS_REP=0; _ABT_PYJS_UNC=0
 
     git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
     _ABT_MAIN_SHA=$(git -C "$RIG_PATH" rev-parse "origin/main" 2>/dev/null || echo "")
@@ -6337,7 +6396,37 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
       _ABT_TEST_FILES=$(git -C "$RIG_PATH" diff --name-only --diff-filter=AM "${_ABT_BASE}..${_ABT_BRANCH_SHA}" -- '*.selftest.sh' 2>/dev/null || echo "")
       [ -n "$_ABT_TEST_FILES" ] && _ABT_DETECTED=$(printf '%s\n' "$_ABT_TEST_FILES" | grep -c .)
 
-      if [ "$_ABT_DETECTED" -eq 0 ]; then
+      # ga-kisvqp: the pytest/js half. Skipped when the selftest cap below already decides the
+      # verdict (no point spending a sandboxed test run on a submission that cannot be measured).
+      _ABT_SH_N=$_ABT_DETECTED
+      if [ "$_ABT_DETECTED" -le 15 ]; then
+        _ABT_PYJS_OUT=$(gate_base_test_pyjs_scan "$RIG_PATH" "$_ABT_BASE" "$_ABT_BRANCH_SHA")
+        if [ "$_ABT_PYJS_OUT" = "UNREAD" ]; then
+          _ABT_PYJS_STATE="unread"
+        elif _abt_n=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" counted) \
+          && _abt_c=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" copy_ok) \
+          && _abt_r=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" ran) \
+          && _abt_f=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" failed) \
+          && _abt_p=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" repaired) \
+          && _abt_u=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" unclassified) \
+          && _ABT_NPY=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" py) \
+          && _ABT_NJS=$(gate_base_test_totals_field "$_ABT_PYJS_OUT" js); then
+          _ABT_PYJS_STATE="measured"
+          _ABT_PYJS_DET=$_abt_n; _ABT_PYJS_COPY=$_abt_c; _ABT_PYJS_RAN=$_abt_r
+          _ABT_PYJS_FAILED=$_abt_f; _ABT_PYJS_REP=$_abt_p; _ABT_PYJS_UNC=$_abt_u
+        else
+          _ABT_PYJS_STATE="unread"; _ABT_NPY=0; _ABT_NJS=0     # a TOTALS line we cannot read is not a zero
+        fi
+        # "Could not read" is one phantom test file that was never measured: detected > copy_ok, so the
+        # verdict is nao-consegui-medir — never sem-teste-novo (which says "I looked and found none") and
+        # never a refusal. The same accounting gate_base_test_verdict already uses for a partial measurement.
+        if [ "$_ABT_PYJS_STATE" = "unread" ]; then _ABT_PYJS_DET=1; fi
+        _ABT_PYJS_FILE_LIST=$(printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE \([^ ]*\) .*/\1/p' | tr '\n' ' ')
+      else
+        _ABT_PYJS_STATE="skipped-sh-cap"
+      fi
+
+      if [ $((_ABT_DETECTED + _ABT_PYJS_DET)) -eq 0 ]; then
         _ABT_VERDICT="sem-teste-novo"        # explicit success: we DID determine there's nothing new
       elif [ "$_ABT_DETECTED" -gt 15 ]; then
         # Safety cap, not a silent truncation: >15 changed selftest files in
@@ -6347,7 +6436,10 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
         # nao-consegui-medir case, so a cap hit is visible, not silent.
         _ABT_VERDICT="nao-consegui-medir"
       else
-        _ABT_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-basetest.XXXXXX" 2>/dev/null || echo "")
+        _ABT_WT=""
+        if [ "$_ABT_DETECTED" -gt 0 ]; then     # ga-kisvqp: py/js alone needs no selftest checkout
+          _ABT_WT=$(mktemp -d "${TMPDIR:-/tmp}/gate-rstae-basetest.XXXXXX" 2>/dev/null || echo "")
+        fi
         if [ -n "$_ABT_WT" ] && git -C "$RIG_PATH" worktree add --detach --quiet "$_ABT_WT" "$_ABT_BASE" 2>/dev/null; then
           while IFS= read -r _abt_f; do
             [ -z "$_abt_f" ] && continue
@@ -6390,6 +6482,11 @@ ABT_TEST_FILES_EOF
         else
           [ -n "$_ABT_WT" ] && rm -rf "$_ABT_WT" 2>/dev/null   # mktemp ok but worktree add itself failed
         fi
+        # ga-kisvqp: one tally across both conventions, so the verdict below is the unchanged ga-rstae rule
+        # applied to every test file in the submission.
+        _ABT_DETECTED=$((_ABT_DETECTED + _ABT_PYJS_DET)); _ABT_COPY_OK=$((_ABT_COPY_OK + _ABT_PYJS_COPY))
+        _ABT_RAN=$((_ABT_RAN + _ABT_PYJS_RAN)); _ABT_FAILED=$((_ABT_FAILED + _ABT_PYJS_FAILED))
+        _ABT_REPAIRED=$((_ABT_REPAIRED + _ABT_PYJS_REP)); _ABT_UNCLASSIFIED=$((_ABT_UNCLASSIFIED + _ABT_PYJS_UNC))
         _ABT_VERDICT=$(gate_base_test_verdict "$_ABT_DETECTED" "$_ABT_COPY_OK" "$_ABT_RAN" "$_ABT_FAILED" "$_ABT_REPAIRED" "$_ABT_UNCLASSIFIED")
       fi
     fi
@@ -6397,13 +6494,17 @@ ABT_TEST_FILES_EOF
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab:arm-b" -q 2>/dev/null || true
     bd -C "$GC_CITY" label add "$MARKER_ID" "gate-ab-basetest:$_ABT_VERDICT" -q 2>/dev/null || true
     log "AB-BASE-TEST bead=$BEAD_ID arm=B verdict=$_ABT_VERDICT branch=$BRANCH base=$_ABT_BASE detected=$_ABT_DETECTED copy_ok=$_ABT_COPY_OK ran=$_ABT_RAN failed=$_ABT_FAILED repaired=$_ABT_REPAIRED unclassified=$_ABT_UNCLASSIFIED outside-subtree=$_ABT_OUTSIDE"
+    # ga-kisvqp: the pytest/js breakdown rides on its OWN lines, so the line above keeps the exact shape
+    # gate-ab-apuracao.sh (and ga-x4mkk2's last-field rule) depend on.
+    log "AB-BASE-TEST-PYJS bead=$BEAD_ID arm=B sh=$_ABT_SH_N py=$_ABT_NPY js=$_ABT_NJS pyjs=$_ABT_PYJS_STATE marker=$MARKER_ID"
+    printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE /AB-BASE-TEST-FILE bead='"$BEAD_ID"' /p' | while IFS= read -r _abt_l; do log "$_abt_l"; done
 
     if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
       err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed selftest(s) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
       set_gate_status "$MARKER_ID" "error"
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
 $_ABT_DETECTED new/changed selftest file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
-Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ')
+Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ')$_ABT_PYJS_FILE_LIST
 (For a selftest you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
 Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
   git push origin $BRANCH

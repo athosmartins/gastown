@@ -48,20 +48,36 @@ reviewed — see "branch-content-coherence" below for the fix. If your work is
 a slice of a parent epic, citing the parent is fine and encouraged — just
 ADD a commit citing your own bead too, don't cite only the parent's id.
 
-**If you added or changed a `*.selftest.sh` file, make sure it actually
-FAILS against the code that existed before your fix (ga-rstae).** This is
-just test-driven-development's own Iron Law — a test that passes with or
-without your fix proves nothing — but it is now also mechanically checked,
-for HALF of submissions, right after you push: an A/B experiment (arm
-assignment is a deterministic hash of your bead id, not something you
-control or predict) re-runs every new/changed selftest file against the
-commit your branch is based on, with none of your own fix applied. If EVERY
-one of them still passes there, the "arm B" half of the experiment refuses
-the marker with `gate-status:error` — see "base-commit test check" below for
-the fix. Arm A never sees this check; if you're in it, this paragraph is
-inert for you. You cannot tell which arm you're in ahead of time, and
-shouldn't try — writing a test that fails on base is simply correct practice
-either way.
+**If you added or changed a test — a `*.selftest.sh`, a pytest file
+(`test_*.py`, `*_test.py`) or a JS test (`*.test.*`, `*.spec.*`) — make sure it
+actually FAILS against the code that existed before your fix (ga-rstae; pytest
+and JS since ga-kisvqp).** This is just test-driven-development's own Iron Law
+— a test that passes with or without your fix proves nothing — but it is now
+also mechanically checked, for HALF of submissions, right after you push: an
+A/B experiment (arm assignment is a deterministic hash of your bead id, not
+something you control or predict) re-runs every new/changed test file against
+the commit your branch is based on, with none of your own fix applied. If EVERY
+one of them still passes there, the "arm B" half of the experiment refuses the
+marker with `gate-status:error`; the comment the guard leaves on the marker
+names the files and what to do. Arm A never sees this check; if you're in it,
+this paragraph is inert for you. You cannot tell which arm you're in ahead of
+time, and shouldn't try — writing a test that fails on base is simply correct
+practice either way.
+
+For pytest and JS the check is stricter about not blaming you for the
+environment, because those tests import the code under test. They run inside a
+sandbox (no network, writes only to a scratch dir) since they are being run
+against pre-fix code. Your test files, their `conftest.py` and anything under
+`tests/`/`tests-js/`/`fixtures/` come along onto the base; every OTHER file you
+changed stays pre-fix, because that is the fix. Each test file also runs on
+your branch as a control — a test that does not pass THERE is never counted as
+"failing on base" — and every test is also run ALONE, so a test that only
+passes (or only fails) because of state another test left behind does not
+decide the outcome. Anything the check cannot measure (the rig has no
+venv/node_modules, a timeout, a test that needs the network or the clock)
+is recorded as "could not measure" and never refused. Write tests that do not
+depend on order, wall-clock time or the network and you will never notice the
+check exists.
 
 ## Pre-flight Self-Audit: THE THIRD STATE (mandatory — before you push)
 

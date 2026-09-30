@@ -52,6 +52,9 @@ GATE_GUARD_LIB_ONLY=1 . "$GUARD"
 set +e  # the guard sets -euo pipefail and it leaks into this sourcing shell
 
 need_fn() { type "$1" >/dev/null 2>&1 || { bad "FATAL: $1 not defined after LIB_ONLY sourcing"; return 1; }; }
+# Sections 4 and 5 run real sandboxed pytest/vitest and take minutes on a loaded host. GATE_SELFTEST_ONLY
+# ("4 5", "5", ...) limits the run to those; unset = everything. Sections 1-3 are pure and always run.
+want() { [ -z "${GATE_SELFTEST_ONLY:-}" ] && return 0; case " $GATE_SELFTEST_ONLY " in (*" $1 "*) return 0 ;; (*) return 1 ;; esac; }
 
 # ── 1. Pure functions ────────────────────────────────────────────────────────
 echo "── 1. pure function unit tests ──"
@@ -325,6 +328,22 @@ JSON
     "$(gate_base_test_decisive "$T" "$(printf '#ok\ntests-js/a.test.js::A does x\tfail')")" "tests-js/a.test.js::A does x"
 fi
 
+if need_fn gate_base_test_totals_field; then
+  echo "  -- gate_base_test_totals_field --"
+  SCAN=$(printf 'FILE a.py kind=py state=fails-on-base why=- old=-\nTOTALS files=3 counted=2 copy_ok=2 ran=1 failed=1 repaired=0 unclassified=1 py=2 js=1\n')
+  eq "reads a field from the TOTALS line" "$(gate_base_test_totals_field "$SCAN" counted)" "2"
+  eq "a key that is a prefix of another (ran vs repaired) is matched EXACTLY" "$(gate_base_test_totals_field "$SCAN" ran)" "1"
+  eq "zero is a value, not an absence" "$(gate_base_test_totals_field "$SCAN" repaired)" "0"
+  OUT=$(gate_base_test_totals_field "$SCAN" nope); RC=$?
+  eq "an unknown key -> status 1" "$RC" "1"; eq "...and prints nothing" "$OUT" ""
+  gate_base_test_totals_field "FILE a.py kind=py state=x" counted >/dev/null; eq "no TOTALS line at all -> status 1 (never 0)" "$?" "1"
+  gate_base_test_totals_field "TOTALS files=3 counted=two ran=1" counted >/dev/null; eq "a non-numeric value -> status 1" "$?" "1"
+  gate_base_test_totals_field "TOTALS files=3 counted= ran=1" counted >/dev/null; eq "an empty value -> status 1" "$?" "1"
+  gate_base_test_totals_field "" counted >/dev/null; eq "empty output -> status 1" "$?" "1"
+  gate_base_test_totals_field "$SCAN" "" >/dev/null; eq "empty key -> status 1" "$?" "1"
+  gate_base_test_totals_field "UNREAD" counted >/dev/null; eq "UNREAD carries no totals -> status 1" "$?" "1"
+fi
+
 # ── 4. Real runs: sandbox + pytest in throwaway repos ──
 echo "── 4. real runs (sandbox + pytest) ──"
 
@@ -352,7 +371,7 @@ mk_rig() {
   printf '/venv\n/node_modules\n' > "$d/.gitignore"
 }
 
-if need_fn gate_base_test_py_interp; then
+if want 4 && need_fn gate_base_test_py_interp; then
   echo "  -- gate_base_test_py_interp --"
   if [ "$HAVE_PYTEST" = yes ]; then
     mk_rig "$H_SCRATCH/rig-interp"
@@ -374,7 +393,7 @@ if need_fn gate_base_test_py_interp; then
   gate_base_test_py_interp "" >/dev/null; eq "empty rig path -> status 1" "$?" "1"
 fi
 
-if need_fn gate_base_test_sandbox_exec; then
+if want 4 && need_fn gate_base_test_sandbox_exec; then
   echo "  -- gate_base_test_sandbox_exec (real sandbox) --"
   SX="$H_SCRATCH/sx"; mkdir -p "$SX" "$H_SCRATCH/sxcwd"
   # A listener on loopback: the POSITIVE CONTROL for the network claim. Without a reachable target a
@@ -419,7 +438,7 @@ s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1], flush=True
     "$([ -e "$SX/should-not-exist" ] && echo ran || echo not-run)" "not-run"
 fi
 
-if need_fn gate_base_test_run_table; then
+if want 4 && need_fn gate_base_test_run_table; then
   echo "  -- gate_base_test_run_table (pytest) --"
   if [ "$HAVE_PYTEST" != yes ]; then
     skip "no pytest-capable venv at $WA_VENV — pytest runs not exercised"
@@ -494,7 +513,7 @@ PY
   fi
 fi
 
-if need_fn gate_base_test_run_table; then
+if want 4 && need_fn gate_base_test_run_table; then
   echo "  -- gate_base_test_run_table (vitest) --"
   if [ "$HAVE_VITEST" != yes ]; then
     skip "no vitest at $WA_NODE_MODULES (or no node) — vitest runs not exercised"
@@ -582,18 +601,20 @@ commit_all() { git -C "$1" add -A && git -C "$1" commit -q -m "$2" && git -C "$1
 # measure <repo> <subdir> <base> <tip> <files...>  (files are repo-root-relative, like `git diff --name-only`)
 measure() {
   local R="$1" SUB="$2" B="$3" T="$4"; shift 4
-  gate_base_test_pyjs_measure "$R${SUB:+/$SUB}" "$B" "$T" "$(printf '%s\n' "$@")"
+  TMPDIR="${PRIV5:-${TMPDIR:-/tmp}}" gate_base_test_pyjs_measure "$R${SUB:+/$SUB}" "$B" "$T" "$(printf '%s\n' "$@")"
 }
 fstate() { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* state=\([^ ]*\).*/\1/p'; }
 fold()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* old=\([^ ]*\).*/\1/p'; }
 fwhy()   { printf '%s\n' "$OUT" | grep -F "FILE $1 " | sed -n 's/.* why=\([^ ]*\).*/\1/p'; }
 tot()    { printf '%s\n' "$OUT" | grep '^TOTALS ' | tr ' ' '\n' | grep "^$1=" | cut -d= -f2; }
 
-if need_fn gate_base_test_pyjs_measure; then
+if want 5 && need_fn gate_base_test_pyjs_measure; then
   if [ "$HAVE_PYTEST" != yes ]; then
     skip "no pytest-capable venv — measure scenarios not exercised"
   else
-    TMP_BEFORE=$(ls -A "${TMPDIR:-/tmp}" 2>/dev/null | grep -c '^gate-kisvqp-basetest\.')
+    # A PRIVATE TMPDIR for every measurement: the shared one also holds other runs' scratch dirs (this very
+    # selftest can be running twice, and so can the guard), so "nothing left behind" is only checkable here.
+    PRIV5="$H_SCRATCH/private-tmp5"; mkdir -p "$PRIV5"
     C="$H_SCRATCH/case1"; mk_case "$C" ""
     BASE=$(git -C "$C" rev-parse HEAD)
     fix_code "$C" ""
@@ -641,18 +662,22 @@ if need_fn gate_base_test_pyjs_measure; then
     OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
     eq "one file, passes on base -> totals give passou-na-base (the refusal)" \
       "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "passou-na-base"
-    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_fails.py)
-    eq "passes + fails-on-base together -> reprovou-na-base (the good case wins)" \
-      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "reprovou-na-base"
-    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_old.py)
-    eq "a pure repair -> consertou-teste-vermelho (never refused)" \
-      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "consertou-teste-vermelho"
     OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_passes.py tests/test_env.py)
     eq "a passing file plus an UNMEASURED one -> nao-consegui-medir (never refused on partial evidence)" \
       "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "nao-consegui-medir"
-    OUT=$(measure "$C" "" "$BASE" "$TIP" tests/test_zero.py)
-    eq "only a zero-test script -> counted=0 -> sem-teste-novo" \
-      "$(gate_base_test_verdict "$(tot counted)" "$(tot copy_ok)" "$(tot ran)" "$(tot failed)" "$(tot repaired)" "$(tot unclassified)")" "sem-teste-novo"
+    eq "...and the not-green file never cost a base run (why=tip-not-green)" "$(fwhy tests/test_env.py)" "tip-not-green"
+    # The remaining compositions are pure arithmetic over totals the big scenario above already asserted:
+    eq "totals of {fails, passes} -> reprovou-na-base" "$(gate_base_test_verdict 2 2 2 1 0 0)" "reprovou-na-base"
+    eq "totals of {repaired test} -> consertou-teste-vermelho" "$(gate_base_test_verdict 1 1 1 0 1 0)" "consertou-teste-vermelho"
+    eq "totals of {zero-test script only} -> sem-teste-novo" "$(gate_base_test_verdict 0 0 0 0 0 0)" "sem-teste-novo"
+
+    echo "  -- the alone sweep is bounded: too many tests to check -> unmeasured, never a refusal --"
+    printf 'from lib.mod import double\n\ndef test_1():\n    assert callable(double)\n\ndef test_2():\n    assert callable(double)\n\ndef test_3():\n    assert callable(double)\n' > "$C/tests/test_three.py"
+    git -C "$C" add -A; git -C "$C" commit -q -m "three tests"; TIP_B=$(git -C "$C" rev-parse HEAD)
+    OUT=$(GATE_ABT_ALONE_PASS_MAX=2 measure "$C" "" "$BASE" "$TIP_B" tests/test_three.py)
+    eq "3 tests, bound lowered to 2 -> unmeasured, why=too-many-tests (an unchecked test could be the one that depends on the fix)" \
+      "$(fstate tests/test_three.py)/$(fwhy tests/test_three.py)" "unmeasured/too-many-tests"
+    eq "...and so the totals cannot refuse: ran=0" "$(tot ran)" "0"
 
     echo "  -- degraded environments: every one is unmeasured, none is a refusal --"
     OUT=$(GATE_ABT_SANDBOX_EXEC=/nonexistent/sandbox-exec measure "$C" "" "$BASE" "$TIP" tests/test_passes.py)
@@ -671,8 +696,7 @@ if need_fn gate_base_test_pyjs_measure; then
     eq "an empty file list -> TOTALS with counted=0 (nothing to measure is a MEASURED zero only for the caller that listed nothing)" "$(tot counted)" "0"
     eq "tests/ helper-only file (no kind) handed in by mistake -> unmeasured, never silently dropped" \
       "$(OUT=$(measure "$C" "" "$BASE" "$TIP" tests/gate_pyjs_helper.py); fstate tests/gate_pyjs_helper.py)" "unmeasured"
-    C_TMPLEFT=$(ls -A "${TMPDIR:-/tmp}" 2>/dev/null | grep -c '^gate-kisvqp-basetest\.')
-    eq "no scratch directory left behind in TMPDIR" "$C_TMPLEFT" "$TMP_BEFORE"
+    eq "no scratch directory left behind after ~20 measurements (incl. timeouts and refused setups)" "$(ls -A "$PRIV5" | wc -l | tr -d ' ')" "0"
     eq "no throwaway worktree left registered in the repo" "$(git -C "$C" worktree list | wc -l | tr -d ' ')" "1"
     eq "the rig's own files were not touched by the runs" "$(git -C "$C" status --porcelain | wc -l | tr -d ' ')" "0"
 
@@ -689,15 +713,168 @@ if need_fn gate_base_test_pyjs_measure; then
     C3="$H_SCRATCH/case3"; mk_case "$C3" "rig"
     BASE3=$(git -C "$C3" rev-parse HEAD); fix_code "$C3" "rig"
     printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$C3/rig/tests/test_fails.py"
-    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$C3/rig/tests/test_passes.py"
     TIP3=$(commit_all "$C3" "fix + tests")
-    OUT=$(measure "$C3" "rig" "$BASE3" "$TIP3" rig/tests/test_fails.py rig/tests/test_passes.py)
-    eq "subdirectory rig: root-relative paths resolve to the right files (fails-on-base)" "$(fstate rig/tests/test_fails.py)" "fails-on-base"
-    eq "subdirectory rig: (passes-on-base)" "$(fstate rig/tests/test_passes.py)" "passes-on-base"
+    OUT=$(measure "$C3" "rig" "$BASE3" "$TIP3" rig/tests/test_fails.py)
+    eq "subdirectory rig: root-relative paths resolve to the right file (fails-on-base)" "$(fstate rig/tests/test_fails.py)" "fails-on-base"
 
     echo "  -- the guard runs under set -euo pipefail --"
     OUT=$(bash -c 'set -euo pipefail; GATE_GUARD_LIB_ONLY=1 . "$1"; O=$(gate_base_test_pyjs_measure "$2" "$3" "$4" "tests/test_env.py"); echo "survived:$(printf "%s\n" "$O" | grep -c "^TOTALS ")"' _ "$GUARD" "$C" "$BASE" "$TIP" 2>&1 | tail -1)
     eq "an unmeasured file (non-zero runs inside) does not abort the sweep under set -e" "$OUT" "survived:1"
+  fi
+fi
+
+# ── 6. Detection: which changed files are py/js tests, and "could not read" vs "none" ──
+echo "── 6. gate_base_test_pyjs_scan (detection) ──"
+if need_fn gate_base_test_pyjs_scan; then
+  # No sandbox on purpose: detection must be provable WITHOUT executing anything. With the sandbox
+  # unavailable, every detected file comes back unmeasured/no-sandbox and nothing runs.
+  D6="$H_SCRATCH/case6"; mkdir -p "$D6/lib" "$D6/tests" "$D6/tests-js" "$D6/docs"
+  git -C "$D6" init -q . && git -C "$D6" config user.email t@t && git -C "$D6" config user.name t
+  printf 'x = 1\n' > "$D6/lib/mod.py"; printf 'base\n' > "$D6/docs/readme.md"; printf 'def test_old():\n    assert True\n' > "$D6/tests/test_moved_from.py"
+  git -C "$D6" add -A; git -C "$D6" commit -q -m base; B6=$(git -C "$D6" rev-parse HEAD)
+  printf 'x = 2\n' > "$D6/lib/mod.py"                                        # production py: not a test
+  printf 'def test_a():\n    assert True\n' > "$D6/tests/test_new.py"        # py test, added
+  printf 'def test_b():\n    assert True\n' > "$D6/tests/b_test.py"          # py test, *_test.py
+  printf 'it("c", () => {});\n' > "$D6/tests-js/c.test.js"                   # js test
+  printf 'it("d", () => {});\n' > "$D6/tests-js/d.spec.ts"                   # ts spec
+  printf 'export const e = 1;\n' > "$D6/tests-js/helper.js"                  # js helper: not a test
+  printf 'new\n' > "$D6/docs/readme.md"                                       # doc: irrelevant
+  git -C "$D6" mv tests/test_moved_from.py tests/test_moved_to.py             # a RENAME must count as an added test
+  printf 'def test_old():\n    assert 1 == 1\n' > "$D6/tests/test_moved_to.py"
+  git -C "$D6" add -A; git -C "$D6" commit -q -m tip; T6=$(git -C "$D6" rev-parse HEAD)
+  OUT=$(GATE_ABT_SANDBOX_EXEC=/nonexistent/sandbox-exec GATE_ABT_PYJS_MAX=20 gate_base_test_pyjs_scan "$D6" "$B6" "$T6")
+  FILES6=$(printf '%s\n' "$OUT" | grep '^FILE ' | sed 's/^FILE \([^ ]*\) .*/\1/' | sort | tr '\n' ' ')
+  eq "exactly the py/js TEST files are detected (production py, js helper and docs are not)" \
+    "$FILES6" "tests-js/c.test.js tests-js/d.spec.ts tests/b_test.py tests/test_moved_to.py tests/test_new.py "
+  eq "a renamed-and-edited test counts as an added one (rename detection is off)" \
+    "$(printf '%s\n' "$OUT" | grep -c 'FILE tests/test_moved_to.py')" "1"
+  eq "with no sandbox nothing ran: every detected file is unmeasured/no-sandbox" \
+    "$(printf '%s\n' "$OUT" | grep '^FILE ' | grep -c 'state=unmeasured why=no-sandbox')" "5"
+  eq "TOTALS are for the 5 files" "$(printf '%s\n' "$OUT" | grep '^TOTALS ' | grep -c 'files=5 counted=5 copy_ok=0 ran=0')" "1"
+  eq "a branch that changes no py/js test -> TOTALS files=0 (a MEASURED zero)" \
+    "$(git -C "$D6" commit -q --allow-empty -m empty; gate_base_test_pyjs_scan "$D6" "$T6" "$(git -C "$D6" rev-parse HEAD)" | grep -c '^TOTALS files=0 counted=0')" "1"
+  OUT=$(gate_base_test_pyjs_scan "$D6" "deadbeef00000000000000000000000000000000" "$T6")
+  eq "an unresolvable base (git diff FAILS) -> UNREAD, NOT 'files=0'" "$OUT" "UNREAD"
+  eq "empty inputs -> UNREAD" "$(gate_base_test_pyjs_scan "" "$B6" "$T6")" "UNREAD"
+  eq "a rig that is not a repo -> UNREAD" "$(gate_base_test_pyjs_scan "$H_SCRATCH/rig-novenv" "$B6" "$T6")" "UNREAD"
+fi
+
+# ── 7. The arm-B call site, END TO END: the real block, extracted verbatim, run under production options ──
+echo "── 7. call site (Step 5b-pre2 block, verbatim) ──"
+if want 7 && [ "$HAVE_PYTEST" = yes ]; then
+  # The block is cut out of the live script with the same awk the sibling selftests use, so this tests what
+  # actually ships, not a copy. Stubs only for the side-effect commands; options are the guard's own.
+  BLOCK=$(awk '/Step 5b-pre2 \(ga-rstae\)/,/^fi$/' "$GUARD")
+  if [ -z "$BLOCK" ]; then bad "could not extract the arm-B block from the guard"; else
+    ok "the arm-B block is extractable (the drift anchor the sibling selftests rely on still holds)"
+    # run_block <rig> <bead> <branch> [scan-stub-output]: prints the block's exit status; side effects land in $LOGF.
+    run_block() {
+      ( GATE_GUARD_LIB_ONLY=1 . "$GUARD"; set -euo pipefail
+        export TMPDIR="${PRIV7:-${TMPDIR:-/tmp}}"      # private: see the leftover assertion at the end
+        RIG_PATH="$1"; BEAD_ID="$2"; BRANCH="$3"; MARKER_ID="mk-e2e"; GC_CITY="/nonexistent-city"
+        log()  { echo "LOG $*" >> "$LOGF"; }
+        err()  { echo "ERR $*" >> "$LOGF"; }
+        set_gate_status() { echo "STATUS $*" >> "$LOGF"; }
+        # one log line per call, even for the multi-line refusal comment (the greps below are line-based)
+        bd()   { printf 'BD %s\n' "$(printf '%s ' "$@" | tr '\n' ' ')" >> "$LOGF"; return 0; }
+        if [ -n "${4-}" ]; then S4="$4"; gate_base_test_pyjs_scan() { echo CALLED >> "$LOGF"; printf '%s\n' "$S4"; }; fi
+        eval "$BLOCK"
+        echo "REACHED-END" >> "$LOGF"
+      ) >/dev/null 2>&1
+      echo $?
+    }
+    # mk_remote <dir>: a rig that has an origin (the block fetches origin main + the branch).
+    mk_remote() {
+      mkdir -p "$1"; git init -q --bare "$1/origin.git"
+      mk_case "$1/rig" ""
+      git -C "$1/rig" branch -M main
+      git -C "$1/rig" remote add origin "$1/origin.git"
+      git -C "$1/rig" push -q origin main
+    }
+    # branch <rig> <name>: start a feature branch from main
+    branch() { git -C "$1" checkout -q -b "$2"; }
+    push_branch() { git -C "$1" add -A; git -C "$1" commit -q -m "feat"; git -C "$1" push -q origin "$2"; }
+    logged() { grep -c -E -- "$1" "$LOGF" 2>/dev/null || true; }
+    BEAD_B=ga-pj5va; BEAD_A=ga-rstae
+    eq "fixture bead $BEAD_B is in arm B" "$(gate_ab_arm_for_bead $BEAD_B)" "B"
+    eq "fixture bead $BEAD_A is in arm A" "$(gate_ab_arm_for_bead $BEAD_A)" "A"
+
+    echo "  -- arm B, a pytest test that needs the fix: reprovou-na-base, no refusal --"
+    PRIV7="$H_SCRATCH/private-tmp7"; mkdir -p "$PRIV7"; export TMPDIR_SAVED7="${TMPDIR:-}"
+    E1="$H_SCRATCH/e2e1"; mk_remote "$E1"; branch "$E1/rig" feat/e1; fix_code "$E1/rig" ""
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$E1/rig/tests/test_fails.py"
+    push_branch "$E1/rig" feat/e1
+    LOGF="$H_SCRATCH/e1.log"; : > "$LOGF"
+    RC=$(GATE_ABT_RUN_TIMEOUT=60 run_block "$E1/rig" $BEAD_B feat/e1)
+    eq "the block completes (exit 0) — a test that depends on the fix is the GOOD case" "$RC" "0"
+    eq "verdict reprovou-na-base, recorded in the AB-BASE-TEST line" "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=reprovou-na-base ')" "1"
+    eq "the marker is labelled gate-ab-basetest:reprovou-na-base" "$(logged 'BD .*label add mk-e2e gate-ab-basetest:reprovou-na-base')" "1"
+    eq "the per-file result is logged under its own token" "$(logged 'AB-BASE-TEST-FILE .*tests/test_fails.py kind=py state=fails-on-base')" "1"
+    eq "the py/js breakdown goes on its OWN line (the AB-BASE-TEST line keeps its exact shape: gate-ab-apuracao.sh greps it)" \
+      "$(logged 'AB-BASE-TEST-PYJS bead=ga-pj5va arm=B sh=0 py=1 js=0 pyjs=measured')" "1"
+    eq "nothing was refused: no STATUS error" "$(logged '^STATUS')" "0"
+
+    echo "  -- arm B, a pytest test that passes on base: REFUSED --"
+    E2="$H_SCRATCH/e2e2"; mk_remote "$E2"; branch "$E2/rig" feat/e2; fix_code "$E2/rig" ""
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$E2/rig/tests/test_passes.py"
+    push_branch "$E2/rig" feat/e2
+    LOGF="$H_SCRATCH/e2.log"; : > "$LOGF"
+    RC=$(GATE_ABT_RUN_TIMEOUT=60 run_block "$E2/rig" $BEAD_B feat/e2)
+    eq "the block refuses (exit 1)" "$RC" "1"
+    eq "verdict passou-na-base" "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=passou-na-base ')" "1"
+    eq "the marker is set to gate-status error (fixable and re-submittable)" "$(logged '^STATUS mk-e2e error')" "1"
+    eq "the refusal comment NAMES the pytest file the builder must strengthen" "$(logged 'BD .*comment mk-e2e .*tests/test_passes.py')" "1"
+    eq "...and is not a refusal without the marker label: passou-na-base label present" "$(logged 'BD .*label add mk-e2e gate-ab-basetest:passou-na-base')" "1"
+
+    echo "  -- arm A: untouched, nothing measured --"
+    E3="$H_SCRATCH/e2e3"; mk_remote "$E3"; branch "$E3/rig" feat/e3; fix_code "$E3/rig" ""
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$E3/rig/tests/test_passes.py"
+    push_branch "$E3/rig" feat/e3
+    LOGF="$H_SCRATCH/e3.log"; : > "$LOGF"
+    RC=$(run_block "$E3/rig" $BEAD_A feat/e3 "TOTALS files=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 py=0 js=0")
+    eq "the same branch under an arm-A bead completes (exit 0)" "$RC" "0"
+    eq "arm A: the py/js scan is NEVER called (byte-for-byte today's behaviour)" "$(logged '^CALLED')" "0"
+    eq "arm A: no AB-BASE-TEST line, no label" "$(logged 'AB-BASE-TEST |gate-ab')" "0"
+    eq "arm A: only the AB-ARM line is written" "$(logged 'AB-ARM bead=ga-rstae arm=A')" "1"
+
+    echo "  -- arm B, the changed-file list cannot be read: never sem-teste-novo, never a refusal --"
+    LOGF="$H_SCRATCH/e5.log"; : > "$LOGF"
+    RC=$(run_block "$E3/rig" $BEAD_B feat/e3 "UNREAD")
+    eq "UNREAD -> the block completes (no refusal)" "$RC" "0"
+    eq "UNREAD -> verdict nao-consegui-medir (NOT sem-teste-novo: that is the claim 'I looked and there is nothing')" \
+      "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=nao-consegui-medir ')" "1"
+    eq "UNREAD is recorded, on the PYJS line" "$(logged 'AB-BASE-TEST-PYJS bead=ga-pj5va arm=B .*pyjs=unread')" "1"
+
+    echo "  -- arm B, bash selftest + pytest together: counts add up --"
+    E6="$H_SCRATCH/e2e6"; mk_remote "$E6"; branch "$E6/rig" feat/e6; fix_code "$E6/rig" ""
+    printf '#!/bin/bash\nexit 0\n' > "$E6/rig/check.selftest.sh"
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$E6/rig/tests/test_fails.py"
+    push_branch "$E6/rig" feat/e6
+    LOGF="$H_SCRATCH/e6.log"; : > "$LOGF"
+    RC=$(GATE_ABT_RUN_TIMEOUT=60 run_block "$E6/rig" $BEAD_B feat/e6)
+    eq "a selftest that passes on base + a pytest that FAILS on base -> reprovou-na-base (no refusal)" \
+      "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=reprovou-na-base .*detected=2 copy_ok=2 ran=2 failed=1')" "1"
+    eq "...and exit 0" "$RC" "0"
+    E7="$H_SCRATCH/e2e7"; mk_remote "$E7"; branch "$E7/rig" feat/e7; fix_code "$E7/rig" ""
+    printf '#!/bin/bash\nexit 0\n' > "$E7/rig/check.selftest.sh"
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$E7/rig/tests/test_passes.py"
+    push_branch "$E7/rig" feat/e7
+    LOGF="$H_SCRATCH/e7.log"; : > "$LOGF"
+    RC=$(GATE_ABT_RUN_TIMEOUT=60 run_block "$E7/rig" $BEAD_B feat/e7)
+    eq "a selftest AND a pytest that both pass on base -> refused" "$RC" "1"
+    eq "...and the refusal names BOTH files" "$(logged 'BD .*comment mk-e2e .*check.selftest.sh.*tests/test_passes.py')" "1"
+
+    echo "  -- arm B, a rig with no venv: the pytest file is unmeasured, never refused --"
+    E8="$H_SCRATCH/e2e8"; mk_remote "$E8"; branch "$E8/rig" feat/e8; fix_code "$E8/rig" ""
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n' > "$E8/rig/tests/test_passes.py"
+    push_branch "$E8/rig" feat/e8
+    rm -f "$E8/rig/venv"
+    LOGF="$H_SCRATCH/e8.log"; : > "$LOGF"
+    RC=$(run_block "$E8/rig" $BEAD_B feat/e8)
+    eq "no interpreter -> exit 0 (no refusal)" "$RC" "0"
+    eq "...verdict nao-consegui-medir" "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=nao-consegui-medir ')" "1"
+    eq "no scratch directory, worktree dir or probe file left behind by any of the above (incl. the arm-A and refusal paths)" \
+      "$(ls -A "$PRIV7" | wc -l | tr -d ' ')" "0"
   fi
 fi
 
