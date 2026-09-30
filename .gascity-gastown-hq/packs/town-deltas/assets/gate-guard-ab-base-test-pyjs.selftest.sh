@@ -192,6 +192,64 @@ if need_fn gate_base_test_old_form_state; then
     "$(gate_base_test_old_form_state "")" "unknown"
 fi
 
+# ── 2. Sandbox: the boundary that makes running builder tests against PRE-fix code safe ──
+echo "── 2. sandbox ──"
+
+# A scratch tree for this whole harness. mktemp under the default TMPDIR is a SYMLINKED path on
+# macOS (/var -> /private/var) — exactly the shape the sandbox profile must be robust to.
+H_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/gate-pyjs-selftest.XXXXXX")
+trap '[ -n "${H_SCRATCH:-}" ] && rm -rf "$H_SCRATCH"' EXIT
+
+if need_fn gate_base_test_sandbox_profile; then
+  echo "  -- gate_base_test_sandbox_profile --"
+  P=$(gate_base_test_sandbox_profile /private/tmp/scr /Users/someone)
+  case "$P" in *"(deny network*)"*) ok "profile denies all network" ;; *) bad "profile does not deny network: $P" ;; esac
+  case "$P" in *"(deny file-write*)"*) ok "profile denies all file writes by default" ;; *) bad "profile does not deny writes" ;; esac
+  case "$P" in *'(subpath "/private/tmp/scr")'*) ok "profile allows writes only under the scratch subpath" ;; *) bad "scratch subpath not allowed" ;; esac
+  case "$P" in *'(literal "/dev/null")'*) ok "profile keeps /dev/null writable (every tool redirects to it)" ;; *) bad "/dev/null not allowed" ;; esac
+  N_ALLOW=$(printf '%s\n' "$P" | grep -c 'allow file-write')
+  eq "exactly ONE write allowance (a second one is a widened sandbox)" "$N_ALLOW" "1"
+  case "$P" in *'(deny file-read* (subpath "/Users/someone/Library/CloudStorage"))'*) ok "profile denies READ of the TCC-protected CloudStorage (a scan would raise the macOS prompt)" ;; *) bad "CloudStorage read not denied" ;; esac
+  case "$P" in *'(subpath "/Users/someone/Documents")'*) ok "profile denies READ of Documents" ;; *) bad "Documents read not denied" ;; esac
+  P2=$(gate_base_test_sandbox_profile /private/tmp/scr "")
+  case "$P2" in *"Documents"*) bad "no home given but a home path was invented" ;; *) ok "no home given -> no read denials invented" ;; esac
+  gate_base_test_sandbox_profile "" /Users/x >/dev/null 2>&1; eq "empty scratch -> refused (an empty subpath would allow everything)" "$?" "1"
+  gate_base_test_sandbox_profile "relative/dir" /Users/x >/dev/null 2>&1; eq "relative scratch -> refused (the sandbox resolves absolute paths)" "$?" "1"
+  gate_base_test_sandbox_profile '/tmp/a"b' /Users/x >/dev/null 2>&1; eq "scratch with a double quote -> refused (profile injection)" "$?" "1"
+  gate_base_test_sandbox_profile '/tmp/a\b' /Users/x >/dev/null 2>&1; eq "scratch with a backslash -> refused" "$?" "1"
+  gate_base_test_sandbox_profile "$(printf '/tmp/a\nb')" /Users/x >/dev/null 2>&1; eq "scratch with a newline -> refused" "$?" "1"
+  eq "a refused profile prints nothing (no half-built profile to run with)" \
+    "$(gate_base_test_sandbox_profile '/tmp/a"b' /Users/x 2>/dev/null)" ""
+  gate_base_test_sandbox_profile /private/tmp/scr 'bad"home' >/dev/null 2>&1; eq "home with a quote -> refused" "$?" "1"
+fi
+
+if need_fn gate_base_test_sandbox_ok; then
+  echo "  -- gate_base_test_sandbox_ok (runs the real sandbox) --"
+  mkdir -p "$H_SCRATCH/probe1"
+  gate_base_test_sandbox_ok "$H_SCRATCH/probe1"; eq "a working sandbox-exec passes the probe" "$?" "0"
+  gate_base_test_sandbox_ok "$H_SCRATCH/does-not-exist" 2>/dev/null; eq "a scratch dir that does not exist -> probe fails (not 'sandbox ok')" "$?" "1"
+  gate_base_test_sandbox_ok "" 2>/dev/null; eq "empty scratch -> probe fails" "$?" "1"
+  # Symlinked scratch: the profile must be built from the REAL path or every write is denied.
+  ln -s "$H_SCRATCH/probe1" "$H_SCRATCH/link1"
+  gate_base_test_sandbox_ok "$H_SCRATCH/link1"; eq "a scratch given as a SYMLINK still passes (canonicalised, not silently read-only)" "$?" "0"
+  # A sandbox that does not sandbox must be CAUGHT, not trusted. Three fakes, each a distinct way to lie:
+  mkdir -p "$H_SCRATCH/fakes" "$H_SCRATCH/probe2"
+  printf '#!/bin/bash\nshift 2\nexec "$@"\n' > "$H_SCRATCH/fakes/decorative"      # ignores the profile, runs the command freely
+  printf '#!/bin/bash\nexit 1\n'             > "$H_SCRATCH/fakes/denies-all"      # refuses everything, inside writes too
+  printf '#!/bin/bash\nexit 0\n'             > "$H_SCRATCH/fakes/runs-nothing"    # claims success, executes nothing
+  chmod +x "$H_SCRATCH/fakes/"*
+  ( GATE_ABT_SANDBOX_EXEC="$H_SCRATCH/fakes/decorative" gate_base_test_sandbox_ok "$H_SCRATCH/probe2" 2>/dev/null )
+  eq "a DECORATIVE sandbox (lets the outside write through) -> probe fails" "$?" "1"
+  LEFT=$(ls -A "$(dirname "$(cd "$H_SCRATCH/probe2" && pwd -P)")" 2>/dev/null | grep -c '^\.gate-abt-probe\.')
+  eq "the probe cleans up the outside file it provoked from a decorative sandbox" "$LEFT" "0"
+  ( GATE_ABT_SANDBOX_EXEC="$H_SCRATCH/fakes/denies-all" gate_base_test_sandbox_ok "$H_SCRATCH/probe2" 2>/dev/null )
+  eq "a sandbox that denies even the inside write -> probe fails" "$?" "1"
+  ( GATE_ABT_SANDBOX_EXEC="$H_SCRATCH/fakes/runs-nothing" gate_base_test_sandbox_ok "$H_SCRATCH/probe2" 2>/dev/null )
+  eq "a sandbox that reports success but runs nothing (no inside file appears) -> probe fails" "$?" "1"
+  # A sandbox that cannot deny is not a sandbox: with sandbox-exec hidden the probe must fail.
+  ( GATE_ABT_SANDBOX_EXEC=/nonexistent/sandbox-exec gate_base_test_sandbox_ok "$H_SCRATCH/probe1" 2>/dev/null ); eq "sandbox-exec unavailable -> probe fails, never 'ok'" "$?" "1"
+fi
+
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
 if [ "$FAIL" -eq 0 ]; then

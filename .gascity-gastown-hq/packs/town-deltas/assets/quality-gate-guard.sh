@@ -2778,6 +2778,73 @@ gate_base_test_file_state() { _gate_base_test_classify state "${1-}" "${2-}" "${
 #     unknown    — unreadable, or read but no test actually passed (zero tests, all skipped).
 gate_base_test_old_form_state() { _gate_base_test_classify old "${1-}" "" "" ""; }
 
+# gate_base_test_sandbox_profile <scratch> [<home>]  (ga-kisvqp)
+#   The macOS sandbox-exec (Seatbelt) profile every pytest/js run is wrapped in. Why the
+#   pytest/js extension needs one when the bash one did not: these files IMPORT the code under
+#   test and are run against the PRE-fix tree, where the code may still do the harmful thing the
+#   fix removes (wa-x2stb: a test run against old code really pushed). The profile makes that
+#   run inert: no network at all, writes only under <scratch> (plus /dev/null, dtracehelper and
+#   the tty nodes), and — when <home> is given — no READ of the TCC-protected folders, because a
+#   scan of them raises the macOS permission prompt and blocks the session (ga-6cyp1l).
+#   A deny-by-default write rule with exactly one allowance: a second allowance is a widened
+#   sandbox. <scratch> must be an absolute, REAL path (the profile matches resolved paths; the
+#   caller canonicalises with pwd -P). Refused — nothing printed, status 1 — when <scratch> is
+#   empty, relative, or holds a quote, backslash or newline (profile injection), or when <home>
+#   is given but not absolute/clean: an empty subpath would allow everything.
+#   Pure (no IO).
+gate_base_test_sandbox_profile() {
+  local scratch="${1-}" home="${2-}" d=""
+  case "$scratch" in
+    (/*) ;;
+    (*) return 1 ;;
+  esac
+  case "$scratch$home" in
+    (*'"'*|*'\'*|*$'\n'*) return 1 ;;
+  esac
+  if [ -n "$home" ]; then
+    case "$home" in
+      (/*) ;;
+      (*) return 1 ;;
+    esac
+  fi
+  printf '(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n'
+  printf '(allow file-write* (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper") (regex #"^/dev/tty"))\n' "$scratch"
+  if [ -n "$home" ]; then
+    for d in Desktop Documents Downloads Pictures Movies Music "Library/CloudStorage" "Library/Mobile Documents"; do
+      printf '(deny file-read* (subpath "%s/%s"))\n' "$home" "$d"
+    done
+  fi
+  return 0
+}
+
+# gate_base_test_sandbox_ok <scratch>  (ga-kisvqp)
+#   Does the sandbox actually sandbox, HERE, NOW? Status 0 only when, under the real profile
+#   built for <scratch>: a write inside it succeeds AND a write just outside it is refused. A
+#   missing sandbox-exec, an unbuildable profile, a scratch that is not a directory, or a write
+#   that escapes all return 1 — and the caller then runs NOTHING: "no sandbox -> no run" is the
+#   inert state, because the alternative is executing builder code against pre-fix code with
+#   the machine's network and files. <scratch> may be a symlink (macOS TMPDIR is under
+#   /var -> /private/var); the profile is built from its real path. GATE_ABT_SANDBOX_EXEC
+#   (default /usr/bin/sandbox-exec) exists so the selftest can prove the missing-binary
+#   branch; the guard itself never sets it. Leaves no file behind outside <scratch>.
+gate_base_test_sandbox_ok() {
+  local scratch="${1-}" real="" prof="" outside=""
+  local sbx="${GATE_ABT_SANDBOX_EXEC:-/usr/bin/sandbox-exec}"
+  if [ -z "$scratch" ] || [ ! -d "$scratch" ] || [ ! -x "$sbx" ]; then return 1; fi
+  real=$(cd "$scratch" 2>/dev/null && pwd -P) || return 1
+  prof=$(gate_base_test_sandbox_profile "$real" "") || return 1
+  outside="$(dirname "$real")/.gate-abt-probe.$$"
+  # Both probe files are removed BEFORE use: a file left by an earlier probe (or a fake
+  # sandbox) must never be mistaken for evidence that THIS sandbox just wrote it.
+  rm -f "$outside" "$real/.probe-in" 2>/dev/null
+  "$sbx" -p "$prof" /usr/bin/touch "$real/.probe-in" >/dev/null 2>&1 || return 1
+  [ -f "$real/.probe-in" ] || return 1
+  rm -f "$real/.probe-in" 2>/dev/null
+  "$sbx" -p "$prof" /usr/bin/touch "$outside" >/dev/null 2>&1
+  if [ -e "$outside" ]; then rm -f "$outside" 2>/dev/null; return 1; fi
+  return 0
+}
+
 # gate_bash32_parse_class <exit-status-of-'/bin/bash -n <file>'> <its-diagnostic>
 #   ga-7dx2vw: what ONE `/bin/bash -n` run means. The parser gives TWO signals —
 #   an exit status and a diagnostic (stderr) — and the verdict has to come from
