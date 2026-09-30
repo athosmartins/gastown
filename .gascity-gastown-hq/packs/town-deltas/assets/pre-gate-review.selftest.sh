@@ -334,6 +334,31 @@ eq "$rc" "0" "--force on a control bead runs"; eq "$(ncalls)" "1" "--force launc
 has_str "$(cat "$T/logs/runs.jsonl")" '"forced": true' "a forced run is recorded as forced"
 reset_state; run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch >/dev/null
 has_str "$(cat "$T/logs/runs.jsonl")" '"forced": false' "a normal run is recorded as not forced"
+# `roster` (gate-done Step 3): every submission lands on the roster, run or not, and the arm is printed for the label
+reset_state
+OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "$ON_BEAD" feat/x 2>/dev/null)"; rc=$?
+eq "$rc" "0" "roster → exit 0"; eq "$OUT" "on" "roster prints the arm for the marker label ($ON_BEAD → on)"
+REC="$(cat "$T/logs/runs.jsonl" 2>/dev/null)"
+has_str "$REC" '"event": "assign"' "roster writes an assign row"; has_str "$REC" "\"bead\": \"$ON_BEAD\"" "…for this bead"; has_str "$REC" '"source": "gate-done"' "…tagged as coming from gate-done"
+eq "$(ncalls)" "0" "roster never launches claude"
+OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "$OFF_BEAD" feat/x 2>/dev/null)"
+eq "$OUT" "off" "roster on a control bead prints off (and records it: the control arm is on the roster too)"
+(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "" feat/x >/dev/null 2>&1); eq "$?" "2" "roster with an empty bead id → exit 2 (usage), not an arm"
+(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "$ON_BEAD" >/dev/null 2>&1); eq "$?" "2" "roster with no branch → exit 2"
+# a roster write that FAILS must not withhold the arm (the label still goes on) — and must say so
+: > "$T/notadir"
+OUT="$(cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$T/city" PRE_GATE_LOG_DIR="$T/notadir/sub" bash "$PG" roster "$ON_BEAD" feat/x 2>"$T/roster.err")"
+eq "$OUT" "on" "roster write fails → the arm is still printed"; has_str "$(cat "$T/roster.err")" "could NOT be written to the roster" "…and the failure is reported on stderr, not swallowed"
+# an EXISTING but unreadable run log must not read as "0 runs so far" (that would silently lift the spend cap)
+reset_state; mkdir -p "$T/logs/runs.jsonl"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "3" "run log exists but cannot be read → INCONCLUSIVE (never 'zero runs so far')"; has_str "$L" "reason=runs-log-unreadable" "reason names it"; eq "$(ncalls)" "0" "unreadable run log → claude never launched"
+# the other way to be unreadable: a real file with no read permission (the -r test, not the parse failure above)
+reset_state; mkdir -p "$T/logs"; printf '%s\n' '{"event":"run","bead":"x","launched":true}' > "$T/logs/runs.jsonl"; chmod 000 "$T/logs/runs.jsonl"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+chmod 600 "$T/logs/runs.jsonl"
+eq "$rc" "3" "run log with no read permission → INCONCLUSIVE"; has_str "$L" "reason=runs-log-unreadable" "…same named reason"; eq "$(ncalls)" "0" "…and claude never launched"
+reset_state
 # dry run assigns nothing and records nothing
 reset_state
 OUT="$(run_pg -- run feat/x --bead "$ON_BEAD" --no-fetch --dry-run)"; rc=$?

@@ -3,9 +3,11 @@
 
 PERGUNTA: rodar o prompt do PRÓPRIO revisor no diff do construtor antes do /gate-done (Step 2b) sobe a aprovação
 na 1a tentativa? BRAÇO `on` = a bead caiu na metade que roda a pré-revisão; `off` = controle. A atribuição é uma função
-fixa do id da bead (pre-gate-review.sh: paridade do SHA-256 de "pregate:<bead>"), gravada NO MOMENTO da submissão em
-runs.jsonl (evento `assign`) — por isso a apuração é por INTENÇÃO DE TRATAR: conta a bead pelo braço a que foi atribuída,
-tenha o construtor rodado a pré-revisão ou não. Aderência (quantas do braço `on` de fato rodaram) sai em separado.
+fixa do id da bead (pre-gate-review.sh: paridade do SHA-256 de "pregate:<bead>"). Toda submissão entra no roster
+(runs.jsonl, evento `assign`) — o /gate-done Step 3 grava via `pre-gate-review.sh roster`, tenha o construtor rodado o
+Step 2b ou não; o Step 2b (`run --bead`) grava também. Por isso a apuração é por INTENÇÃO DE TRATAR: conta a bead pelo
+braço a que foi atribuída, tenha rodado a pré-revisão ou não. Aderência (quantas do braço `on` de fato rodaram) sai em
+separado. Só fica fora do roster quem submeteu por um gate-done ANTIGO (sessão materializada antes do merge), sem Step 3 novo.
 
 MÉTRICA PRIMÁRIA: aprovação na PRIMEIRA tentativa por braço (o 1o "Gate run complete" da branch depois da atribuição).
 NÃO use "% de runs que reprovam": uma bead que reprova 3x e passa conta 3 FAIL + 1 PASS e infla o problema.
@@ -122,13 +124,18 @@ def main():
     since = parse_utc(a.since + "T00:00:00Z") if a.since else None
 
     # ── roster: 1 linha por branch (a 1a atribuição vence; arm conflitante = anomalia) ──
-    roster, conflicts = {}, []
+    roster, conflicts, bad_assign = {}, [], 0
     for r in rows:
-        if r.get("event") != "assign" or not r.get("branch") or r.get("arm") not in ("on", "off"):
+        if r.get("event") != "assign":
+            continue
+        # a roster row we cannot read is COUNTED, not skipped: a silent drop shrinks an arm and nobody would know
+        if not r.get("branch") or r.get("arm") not in ("on", "off"):
+            bad_assign += 1
             continue
         try:
             ts = parse_utc(r["ts"])
         except (KeyError, ValueError):
+            bad_assign += 1
             continue
         if since and ts < since:
             continue
@@ -140,6 +147,12 @@ def main():
         roster[b] = {"bead": r.get("bead", ""), "arm": r["arm"], "ts": ts}
 
     recomputed = recompute_arms(assets, {v["bead"] for v in roster.values() if v["bead"]})
+    if roster and not any(recomputed.values()):
+        # Not one arm could be recomputed: the arm function did not run (script missing/unreadable, no sha tool). Treating
+        # every bead as an "anomaly" would print a tidy empty report — an invalid measurement dressed as a null result.
+        print(f"FALHA: não consegui recalcular NENHUM braço com {os.path.join(assets, 'pre-gate-review.sh')} "
+              f"(script ilegível ou sem ferramenta sha256) — a apuração NÃO foi feita.", file=sys.stderr)
+        return 2
     anomalies = []
     for b, v in list(roster.items()):
         rc = recomputed.get(v["bead"])
@@ -196,9 +209,10 @@ def main():
     print(f"  janela: {'a partir de ' + a.since if a.since else 'todo o roster'}   roster: {len(roster)} branches"
           f" ({sum(1 for v in roster.values() if v['arm']=='on')} on / {sum(1 for v in roster.values() if v['arm']=='off')} off)")
     print(f"  aguardando 1o desfecho do gate: {waiting}   desfecho não-PASS/FAIL (infra/timeout): on={other['on']} off={other['off']}")
-    if anomalies or conflicts or bad_rows:
+    if anomalies or conflicts or bad_rows or bad_assign:
         print(f"  ⚠ anomalias FORA da conta: {len(anomalies)} com braço gravado ≠ recalculado (ou não recalculável), "
-              f"{len(set(conflicts))} branch(es) com braços conflitantes, {bad_rows} linha(s) ilegível(is) em runs.jsonl")
+              f"{len(set(conflicts))} branch(es) com braços conflitantes, {bad_assign} linha(s) de atribuição malformada(s), "
+              f"{bad_rows} linha(s) ilegível(is) em runs.jsonl")
         for b, bead, got, want in anomalies[:5]:
             print(f"      {b} bead={bead} gravado={got} recalculado={want}")
     print()
@@ -277,6 +291,8 @@ def main():
         print(f"  {arm:<10}{len(ps):>6}{len(ap_):>7}{('n/a' if att != att else f'{att:.2f}'):>11}{pre_usd:>14.2f}{rev_usd:>22.2f}{('n/a' if cpa != cpa else f'{cpa:.2f}'):>14}")
     print(f"  pré-gate = EXATO (total_cost_usd por run). revisor = ESTIMATIVA {a.reviewer_usd:.2f}/tentativa (E0). construtor = NÃO MEDIDO:")
     print("  o retrabalho do braço on (consertar o que a pré-revisão achou) não está em nenhum número acima — o custo real do on é MAIOR que o mostrado.")
+    print("  (relógio: começa na PRIMEIRA linha do roster da branch — no braço on isso é o Step 2b, então o tempo da")
+    print("   pré-revisão conta a desfavor do on, que é o certo: é custo dele)")
     for arm in ("on", "off"):
         ts_ = [p["t_pass_min"] for p in per.values() if p["arm"] == arm and p["t_pass_min"] is not None]
         print(f"  tempo da atribuição até o 1o PASS do gate ({arm}): "

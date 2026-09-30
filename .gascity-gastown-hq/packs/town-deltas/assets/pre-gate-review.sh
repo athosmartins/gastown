@@ -21,18 +21,20 @@
 #   exit 3   INCONCLUSIVE could not judge (machine guard, busy, timeout, no verdict line, dirty tree, ...) —
 #                         reason printed. The builder submits anyway: an unavailable rehearsal is not a verdict.
 #   exit 2   usage error
-# The last stdout line is always machine-readable:  PREGATE_RESULT arm=.. verdict=.. reason=.. attempt=.. record=..
+# Every `run` that gets past argument parsing ends its stdout with one machine-readable line (a usage error, exit 2,
+# prints only usage on stderr):  PREGATE_RESULT arm=.. verdict=.. reason=.. attempt=.. record=..
 #
 # Usage:
 #   pre-gate-review.sh [run] <branch> [--bead <id>] [--base <ref>] [--head <ref>] [--lens N] [--force]
 #                                     [--no-fetch] [--dry-run] [--print-task]
 #   pre-gate-review.sh arm <bead-id>          prints "on" or "off" (pure; no side effects)
+#   pre-gate-review.sh roster <bead-id> <branch>   /gate-done Step 3: records the assignment, prints "on" or "off"
 # Run it from inside the builder's checkout, with HEAD on the branch under review and a clean tree.
 # The file can also be `source`d (the functions are reused by pre-gate-apuracao.sh and the selftest).
 #
 # Knobs (env): PRE_GATE_MODEL / PRE_GATE_EFFORT (override the live gate-reviewer config; recorded as such),
 #   PRE_GATE_MAX_USD (3)  PRE_GATE_TIMEOUT_SECS (1500)  PRE_GATE_MAX_RUNS (3)  PRE_GATE_MAX_CONCURRENT (2)
-#   PRE_GATE_MIN_DF_GIB (10)  PRE_GATE_MIN_SWAP_MB (300)  PRE_GATE_MIN_SYSTEM_CHARS (1000)
+#   PRE_GATE_MIN_DF_GIB (10)  PRE_GATE_MIN_SWAP_MB (300)  PRE_GATE_MIN_SYSTEM_CHARS (10000)
 #   PRE_GATE_LOG_DIR  PRE_GATE_CITY  PRE_GATE_CLAUDE_BIN  GATE_DIFF_LINE_BUDGET (2000, same tunable as the gate)
 
 set -uo pipefail   # deliberately NOT -e: every failing step is a named outcome below, never a silent abort
@@ -135,11 +137,15 @@ PY
 # pg_prior_runs <bead-or-branch-key> <field> — how many runs that actually launched claude were already made for it.
 # A corrupt line is skipped, not fatal: the cap is a brake, not a ledger.
 pg_prior_runs() {
+  # No file yet = no run has ever been recorded = 0 (true). A file that EXISTS but cannot be read is a different thing:
+  # we cannot know how much was already spent, and "0" would silently lift the per-bead cap on a spending path. That
+  # case returns 1 with nothing printed and the caller refuses to launch.
   local file py
   file="$(pg_log_dir)/runs.jsonl"
-  [ -r "$file" ] || { printf '0'; return 0; }
+  [ -e "$file" ] || { printf '0'; return 0; }
+  [ -r "$file" ] || return 1
   py="$(pg_python)" || py="python3"
-  "$py" - "$file" "$1" "$2" <<'PY' 2>/dev/null || printf '0'
+  "$py" - "$file" "$1" "$2" <<'PY' 2>/dev/null || return 1
 import json, sys
 path, key, field = sys.argv[1:4]
 n = 0
@@ -440,15 +446,6 @@ pg_run_inner() {
     pg_finish SKIPPED control-arm 0; return $?
   fi
 
-  # ── per-bead cap ──
-  local prior; prior="$(pg_prior_runs "$key" "$keyfield")"
-  PG_ATTEMPT=$((prior + 1))
-  if [ "$prior" -ge "${PRE_GATE_MAX_RUNS:-3}" ] && [ "$force" -eq 0 ]; then
-    pg_log "already ran $prior time(s) for $key (cap ${PRE_GATE_MAX_RUNS:-3}) — submit to the gate"
-    [ "$dry" -eq 0 ] && { pg_record run bead="$bead" branch="$branch" sha="$sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict=SKIPPED reason=max-runs launched=false >/dev/null || true; }
-    pg_finish SKIPPED max-runs 0; return $?
-  fi
-
   # inconclusive(<reason>) — record + report. Nothing was spent unless the caller passes launched=true.
   local _inc_extra=""
   pg_inconclusive() {
@@ -457,6 +454,16 @@ pg_run_inner() {
     pg_log "INCONCLUSIVE: $reason"
     pg_finish INCONCLUSIVE "$reason" 3
   }
+
+  # ── per-bead cap ──
+  local prior
+  prior="$(pg_prior_runs "$key" "$keyfield")" || { pg_inconclusive "runs-log-unreadable"; return $?; }
+  PG_ATTEMPT=$((prior + 1))
+  if [ "$prior" -ge "${PRE_GATE_MAX_RUNS:-3}" ] && [ "$force" -eq 0 ]; then
+    pg_log "already ran $prior time(s) for $key (cap ${PRE_GATE_MAX_RUNS:-3}) — submit to the gate"
+    [ "$dry" -eq 0 ] && { pg_record run bead="$bead" branch="$branch" sha="$sha" arm="$PG_ARM" attempt="$PG_ATTEMPT" verdict=SKIPPED reason=max-runs launched=false >/dev/null || true; }
+    pg_finish SKIPPED max-runs 0; return $?
+  fi
 
   command -v git >/dev/null 2>&1 || { pg_inconclusive no-git; return $?; }
   type gate_render_review_task >/dev/null 2>&1 || { pg_inconclusive "prompt-lib-missing"; return $?; }
@@ -592,6 +599,20 @@ pg_main() {
       [ -n "${1:-}" ] || { pg_log "usage: pre-gate-review.sh arm <bead-id>"; return 2; }
       pregate_arm_for_bead "$1" || return $?
       echo
+      ;;
+    roster)
+      # /gate-done Step 3. Puts EVERY submission on the roster, whether or not the builder ran Step 2b: without this a bead
+      # whose builder skipped the step is on neither arm, and the intention-to-treat comparison quietly becomes a
+      # comparison among the builders who complied. Prints the arm (the marker label); a roster write that fails is
+      # reported on stderr but never withholds the arm — the label and the roster then disagree, visibly.
+      shift
+      local rbead="${1:-}" rbranch="${2:-}" rarm rrc
+      [ -n "$rbead" ] && [ -n "$rbranch" ] || { pg_log "usage: pre-gate-review.sh roster <bead-id> <branch>"; return 2; }
+      rarm="$(pregate_arm_for_bead "$rbead")"; rrc=$?
+      [ "$rrc" -eq 0 ] || return "$rrc"
+      pg_record assign bead="$rbead" branch="$rbranch" sha="$(git rev-parse HEAD 2>/dev/null || true)" arm="$rarm" source=gate-done >/dev/null \
+        || pg_log "WARN: the assignment of $rbead ($rarm) could NOT be written to the roster"
+      printf '%s\n' "$rarm"
       ;;
     run) shift; pg_run "$@" ;;
     ""|-h|--help) pg_usage; return 2 ;;

@@ -27,7 +27,8 @@ trap '[ -n "${T:-}" ] && [ -d "$T" ] && rm -rf "$T"' EXIT
 echo "── 1. COMPILE-GUARD ──"
 if python3 -m py_compile "$APU" 2>/dev/null; then ok "pre-gate-apuracao.py compiles"; else bad "pre-gate-apuracao.py does NOT compile"; fi
 if [ -f "$PG" ]; then ok "pre-gate-review.sh present (arm rule is executed from it, not reimplemented)"; else bad "missing $PG"; fi
-if grep -qE 'sha256|hashlib|% 100000007' "$APU"; then bad "the apuracao reimplements the arm rule (sha256/polynomial found) — it must EXECUTE pregate_arm_for_bead"; else ok "the apuracao does not reimplement the arm rule"; fi
+# hashing CODE, not the word: the error message may legitimately say "sem ferramenta sha256"
+if grep -qE 'hashlib|hexdigest|% *100000007|shasum|sha256sum|openssl' "$APU"; then bad "the apuracao reimplements the arm rule (hashing code found) — it must EXECUTE pregate_arm_for_bead"; else ok "the apuracao does not reimplement the arm rule"; fi
 
 # shellcheck disable=SC1090
 source "$PG"
@@ -146,6 +147,17 @@ has "$OUTE" "roster: 0 branches" "empty roster says 0 branches"
 has "$OUTE" "n/a" "empty arms print n/a, not 0%"
 hasnt "$OUTE" " 0%" "no '0%' rate is invented for an empty arm"
 has "$OUTE" "INCONCLUSIVO" "empty roster → INCONCLUSIVO"
+# a malformed roster row is COUNTED, never silently dropped; and an arm function that cannot run invalidates the report
+Z_HQ="$T/hqZ"; mk_hq "$Z_HQ"
+printf '%s\n' '{"ts":"2026-09-30T00:00:00Z","event":"assign","bead":"ga-z1","branch":"crew/x/ga-z1","arm":"maybe"}' \
+               '{"ts":"not-a-date","event":"assign","bead":"ga-z2","branch":"crew/x/ga-z2","arm":"on"}' \
+               '{"ts":"2026-09-30T00:00:00Z","event":"assign","bead":"ga-z3","arm":"on"}' > "$Z_HQ/.gc/logs/pre-gate-review/runs.jsonl"
+OUTZ="$(apu "$Z_HQ")"; rc=$?
+eq "$rc" "0" "an empty-after-filter roster is still exit 0"; has "$OUTZ" "3 linha(s) de atribuição malformada(s)" "3 malformed roster rows (bad arm, bad ts, no branch) are counted"
+V_HQ="$T/hqV"; mk_hq "$V_HQ"; rm -f "$V_HQ/packs/town-deltas/assets/pre-gate-review.sh"
+printf '%s\n' '{"ts":"2026-09-30T00:00:00Z","event":"assign","bead":"ga-v1","branch":"crew/x/ga-v1","arm":"on"}' > "$V_HQ/.gc/logs/pre-gate-review/runs.jsonl"
+OUTV="$(apu "$V_HQ")"; rc=$?
+eq "$rc" "2" "the arm function cannot run (script missing) → exit 2, not a tidy empty report"; has "$OUTV" "NENHUM braço" "and it says why"
 M_HQ="$T/hqM"; mk_hq "$M_HQ"; rm -f "$M_HQ/.gc/logs/pre-gate-review/runs.jsonl"
 OUTM="$(apu "$M_HQ")"; rc=$?
 eq "$rc" "2" "missing runs.jsonl → exit 2 (NOT a silent empty report)"; has "$OUTM" "FALHA" "missing runs.jsonl → says FALHA"

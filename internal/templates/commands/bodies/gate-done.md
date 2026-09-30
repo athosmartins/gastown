@@ -831,10 +831,12 @@ SELF_AUDIT_SUMMARY=$(printf '%s' "${SELF_AUDIT_SUMMARY:-<not recorded - see Pre-
 # Provado com par controlado: marker ephemeral ve=0 e um idêntico não-ephemeral
 # ve=1, na MESMA consulta. Se algum dia voltar a usar --ephemeral, as ~113
 # consultas por type:quality-gate-marker precisam de --include-infra ANTES.
-# ga-gnr3tw: stamp the A/B arm of the pre-gate experiment (Step 2b) on the marker. The arm is a pure function of the
-# bead id, so it is recomputed here and survives Step 2b having run in another shell. If it cannot be computed
-# (no sha256 tool, empty id) NO label is written: "unknown" must never read as "off" in the measurement.
-PREGATE_ARM=$(bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" arm "$BEAD_ID" 2>/dev/null) || PREGATE_ARM=""
+# ga-gnr3tw: stamp the A/B arm of the pre-gate experiment (Step 2b) on the marker, and put this submission on the
+# experiment roster whether or not Step 2b ran (otherwise a builder who skipped it is on neither arm and the comparison
+# quietly becomes one among the builders who complied). The arm is a pure function of the bead id, so it is recomputed
+# here and survives Step 2b having run in another shell. If it cannot be computed (no sha256 tool, empty id) NO label is
+# written: "unknown" must never read as "off" in the measurement.
+PREGATE_ARM=$(bash "$GC_CITY_PATH/packs/town-deltas/assets/pre-gate-review.sh" roster "$BEAD_ID" "$BRANCH" 2>/dev/null) || PREGATE_ARM=""
 PREGATE_LABEL_ARG=""
 case "$PREGATE_ARM" in on|off) PREGATE_LABEL_ARG="-l pregate:$PREGATE_ARM" ;; esac
 
