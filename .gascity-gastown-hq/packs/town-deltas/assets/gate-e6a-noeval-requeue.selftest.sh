@@ -1,35 +1,21 @@
 #!/usr/bin/env bash
 # gate-e6a-noeval-requeue.selftest.sh (ga-5w2gpw item a, 2026-09-30)
 #
-# CLASS: a gate run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that
-# timed out (Phase C genuine timeout), or a reviewer whose verdict bead closed with
-# no verdict (ga-w7pm55) — used to end as a FAIL. ga-mcapdq/ga-w7pm55 already kept it
-# out of gate:fix-attempt and classed the SHA stamp "hold", but the run still went
-# down the FAIL path: a "GATE-FEEDBACK … Fix THESE specific blocking issues" comment
-# on the source bead, gate:needs-fix, and the bead handed back to the pool to "fix"
-# a thing nobody found wrong. E4 (docs/reports/gate-e4-historico.md §1) counted 110
-# of the 207 no-review FAILs as exactly this; the dispatcher log shows it still
-# happening (16 on 26/09, 8 on 29/09, 5 on 30/09).
+# CLASS: a gate run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that timed out (Phase C genuine timeout), or a
+# reviewer whose verdict bead closed with no verdict (ga-w7pm55) — used to end as a FAIL. ga-mcapdq/ga-w7pm55 kept it out of
+# gate:fix-attempt and classed the SHA stamp "hold", but the run still went down the FAIL path: a "GATE-FEEDBACK … Fix THESE specific
+# blocking issues" comment on the source bead, gate:needs-fix, the bead handed back to the pool to "fix" a thing nobody found wrong.
+# E4 (docs/reports/gate-e4-historico.md §1): 110 of the 207 no-review FAILs; the log shows 16 on 26/09, 8 on 29/09, 5 on 30/09.
 #
-# FIX under test: a no-eval FAIL is RE-QUEUED instead (the marker goes back to
-# gate-status:queued, a fresh run mints fresh reviewers), BOUNDED — a counter label on
-# the marker (gate:noeval-requeue:N, cap GATE_NOEVAL_REQUEUE_CAP, default 2). Past the
-# cap, or when the counter cannot be read or recorded, the run takes the legacy FAIL
-# path unchanged: an unbounded requeue would loop forever on a reviewer that is
-# wedged on every attempt.
+# FIX under test: a no-eval FAIL is RE-QUEUED instead (marker back to gate-status:queued, fresh reviewers next sweep), BOUNDED by a
+# counter label on the marker (gate:noeval-requeue:N, cap GATE_NOEVAL_REQUEUE_CAP, default 2). Past the cap, or when the counter
+# cannot be read or recorded, the run takes the legacy FAIL path unchanged: an unbounded requeue would loop on a wedged reviewer.
+# Three states, never two: the counter is READ (a number, maybe 0) or UNREADABLE — and unreadable is never 0, or a run that cannot
+# be bounded would requeue forever.
 #
-# Three states, never two (error != empty): the counter is READ (a number, maybe 0),
-# or UNREADABLE (bd failed, non-JSON, an error envelope without this marker's id) —
-# and an unreadable counter is never read as 0, because that would let a run that
-# cannot be bounded requeue forever.
-#
-# Strategy (this repo's SELFTEST-EXTRACT convention): the decision function is sourced
-# from the dispatcher in lib-only mode; the glue block and the requeue block are
-# extracted from the LIVE dispatcher by sentinel and run in-process against a
-# stateful marker stub — never a hand-copied duplicate. Only bd/notify/log/warn/
-# set_gate_status are stubbed. Every case runs under `set -e` like the dispatcher.
-#
-# Exit 0 iff every assertion holds. Runs under /bin/bash 3.2 (launchd's bash).
+# Strategy (SELFTEST-EXTRACT convention): the decision function is sourced from the dispatcher in lib-only mode; the glue and
+# requeue blocks are extracted from the LIVE dispatcher by sentinel and run against a stateful marker stub. Only bd / notify / log /
+# warn / set_gate_status are stubbed; every case runs under `set -e`. Exit 0 iff every assertion holds. /bin/bash 3.2 (launchd's).
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,11 +33,9 @@ echo "== gate-e6a-noeval-requeue.selftest =="
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
 
 # /bin/bash -n, never bare `bash -n` (Homebrew bash 5.3 accepts what 3.2 rejects).
-if /bin/bash -n "$DISPATCHER" 2>/dev/null; then
-  ok "dispatcher parses under /bin/bash (3.2) — the interpreter launchd actually runs"
-else
-  bad "dispatcher does NOT parse under /bin/bash 3.2"
-fi
+/bin/bash -n "$DISPATCHER" 2>/dev/null \
+  && ok "dispatcher parses under /bin/bash (3.2) — the interpreter launchd actually runs" \
+  || bad "dispatcher does NOT parse under /bin/bash 3.2"
 
 GATE_DISPATCHER_LIB_ONLY=1 source "$DISPATCHER" \
   || { echo "FATAL: could not source dispatcher in lib-only mode" >&2; exit 2; }
@@ -152,27 +136,21 @@ else
 
   new_case "type:quality-gate-marker gate-status:dispatching"
   decide "$MARKER_ID"
-  if [ "$DECISION" = "requeue:1" ] && has_label "gate:noeval-requeue:1"; then
-    ok "first no-eval run → requeue:1, and the counter label gate:noeval-requeue:1 is on the marker (recorded BEFORE the requeue, so a later failure cannot leave the loop unbounded)"
-  else
-    bad "first no-eval run must requeue and record 1: decision=[$DECISION] labels=[$MARK_LABELS]"
-  fi
+  [ "$DECISION" = "requeue:1" ] && has_label "gate:noeval-requeue:1" \
+    && ok "first no-eval run → requeue:1, and the counter label gate:noeval-requeue:1 is on the marker (recorded BEFORE the requeue, so a later failure cannot leave the loop unbounded)" \
+    || bad "first no-eval run must requeue and record 1: decision=[$DECISION] labels=[$MARK_LABELS]"
 
   new_case "type:quality-gate-marker gate-status:dispatching gate:noeval-requeue:1"
   decide "$MARKER_ID"
-  if [ "$DECISION" = "requeue:2" ] && has_label "gate:noeval-requeue:2" && ! has_label "gate:noeval-requeue:1"; then
-    ok "second no-eval run → requeue:2; the stale counter is replaced, not stacked"
-  else
-    bad "second run must requeue:2 and replace the counter: decision=[$DECISION] labels=[$MARK_LABELS]"
-  fi
+  [ "$DECISION" = "requeue:2" ] && has_label "gate:noeval-requeue:2" && ! has_label "gate:noeval-requeue:1" \
+    && ok "second no-eval run → requeue:2; the stale counter is replaced, not stacked" \
+    || bad "second run must requeue:2 and replace the counter: decision=[$DECISION] labels=[$MARK_LABELS]"
 
   new_case "type:quality-gate-marker gate-status:dispatching gate:noeval-requeue:2"
   decide "$MARKER_ID"
-  if [ "$DECISION" = "fail:cap" ] && has_label "gate:noeval-requeue:2" && [ -z "$(printf '%s' "$BD_LOG" | grep -F 'label add')" ]; then
-    ok "at the cap (2 requeues already spent) → fail:cap, and NOTHING is written — the legacy FAIL path takes over, so a reviewer wedged on every attempt cannot loop forever"
-  else
-    bad "at the cap the decision must be fail:cap with no writes: decision=[$DECISION] labels=[$MARK_LABELS] bd=[$BD_LOG]"
-  fi
+  [ "$DECISION" = "fail:cap" ] && has_label "gate:noeval-requeue:2" && [ -z "$(printf '%s' "$BD_LOG" | grep -F 'label add')" ] \
+    && ok "at the cap (2 requeues already spent) → fail:cap, and NOTHING is written — the legacy FAIL path takes over, so a reviewer wedged on every attempt cannot loop forever" \
+    || bad "at the cap the decision must be fail:cap with no writes: decision=[$DECISION] labels=[$MARK_LABELS] bd=[$BD_LOG]"
 
   new_case "type:quality-gate-marker gate-status:dispatching gate:noeval-requeue:1 gate:noeval-requeue:2"
   decide "$MARKER_ID"
@@ -196,11 +174,9 @@ else
   for variant in __FAIL__ "this is not json" '{"error":"database is locked"}' '[{"id":"someone-else","status":"open","labels":[]}]'; do
     new_case "type:quality-gate-marker gate-status:dispatching" open "$variant"
     decide "$MARKER_ID"
-    if [ "$DECISION" = "fail:unreadable" ] && [ -z "$(printf '%s' "$BD_LOG" | grep -F 'label add')" ]; then
-      ok "unreadable marker [$variant] → fail:unreadable, nothing written (an unreadable counter is not a counter of 0)"
-    else
-      bad "unreadable marker [$variant] must be fail:unreadable with no writes: decision=[$DECISION] bd=[$BD_LOG]"
-    fi
+    [ "$DECISION" = "fail:unreadable" ] && [ -z "$(printf '%s' "$BD_LOG" | grep -F 'label add')" ] \
+      && ok "unreadable marker [$variant] → fail:unreadable, nothing written (an unreadable counter is not a counter of 0)" \
+      || bad "unreadable marker [$variant] must be fail:unreadable with no writes: decision=[$DECISION] bd=[$BD_LOG]"
   done
 
   new_case "type:quality-gate-marker gate-status:dispatching"
@@ -240,44 +216,32 @@ $GLUE_SRC
   }
   new_case "type:quality-gate-marker gate-status:dispatching"
   run_glue 1 FAIL 0 "requeue:1"
-  if [ "$(getl QR)" = "1" ] && [ "$(getl REASON)" = "no-eval" ] && [ "$(getl NOEVAL)" = "0" ]; then
-    ok "no-eval FAIL + decision requeue → QUOTA_REQUEUE=1, REQUEUE_REASON=no-eval, and the no-eval flag is CONSUMED (cannot leak into the next run)"
-  else
-    bad "no-eval FAIL must become a no-eval requeue: $(printf '%s' "$OUT" | tr '\n' ' ')"
-  fi
+  [ "$(getl QR)" = "1" ] && [ "$(getl REASON)" = "no-eval" ] && [ "$(getl NOEVAL)" = "0" ] \
+    && ok "no-eval FAIL + decision requeue → QUOTA_REQUEUE=1, REQUEUE_REASON=no-eval, and the no-eval flag is CONSUMED (cannot leak into the next run)" \
+    || bad "no-eval FAIL must become a no-eval requeue: $(printf '%s' "$OUT" | tr '\n' ' ')"
   run_glue 1 FAIL 0 "fail:cap"
-  if [ "$(getl QR)" = "0" ] && [ "$(getl NOEVAL)" = "1" ] && [ "$(getl REASON)" = "quota" ]; then
-    ok "decision fail:cap → nothing changes: the no-eval flag stays 1 and the run takes the legacy FAIL path (hold class, fix-attempt untouched)"
-  else
-    bad "a refused requeue must leave the legacy path intact: $(printf '%s' "$OUT" | tr '\n' ' ')"
-  fi
+  [ "$(getl QR)" = "0" ] && [ "$(getl NOEVAL)" = "1" ] && [ "$(getl REASON)" = "quota" ] \
+    && ok "decision fail:cap → nothing changes: the no-eval flag stays 1 and the run takes the legacy FAIL path (hold class, fix-attempt untouched)" \
+    || bad "a refused requeue must leave the legacy path intact: $(printf '%s' "$OUT" | tr '\n' ' ')"
   for shape in "unreadable counter:fail:unreadable" "counter not recorded:fail:not-recorded" "garbage decision:banana" "empty decision:"; do
     desc="${shape%%:*}"; dec="${shape#*:}"
     run_glue 1 FAIL 0 "$dec"
-    if [ "$(getl QR)" = "0" ] && [ "$(getl NOEVAL)" = "1" ]; then
-      ok "$desc ([$dec]) → inert: no requeue, legacy FAIL path (only the literal requeue:<n> earns a requeue)"
-    else
-      bad "$desc ([$dec]) must not requeue: $(printf '%s' "$OUT" | tr '\n' ' ')"
-    fi
+    [ "$(getl QR)" = "0" ] && [ "$(getl NOEVAL)" = "1" ] \
+      && ok "$desc ([$dec]) → inert: no requeue, legacy FAIL path (only the literal requeue:<n> earns a requeue)" \
+      || bad "$desc ([$dec]) must not requeue: $(printf '%s' "$OUT" | tr '\n' ' ')"
   done
   run_glue 0 FAIL 0 "requeue:1"
-  if [ "$(getl QR)" = "0" ] && [ "$(getl CALLS)" = "0" ]; then
-    ok "a JUDGED FAIL (no-eval=0) is never requeued, and the decision is not even consulted — a real rejection stays a FAIL"
-  else
-    bad "a judged FAIL must not reach the requeue decision: $(printf '%s' "$OUT" | tr '\n' ' ')"
-  fi
+  [ "$(getl QR)" = "0" ] && [ "$(getl CALLS)" = "0" ] \
+    && ok "a JUDGED FAIL (no-eval=0) is never requeued, and the decision is not even consulted — a real rejection stays a FAIL" \
+    || bad "a judged FAIL must not reach the requeue decision: $(printf '%s' "$OUT" | tr '\n' ' ')"
   run_glue 1 PASS 0 "requeue:1"
-  if [ "$(getl QR)" = "0" ] && [ "$(getl CALLS)" = "0" ]; then
-    ok "a PASS is never touched, even with a stale no-eval flag"
-  else
-    bad "a PASS must not reach the requeue decision: $(printf '%s' "$OUT" | tr '\n' ' ')"
-  fi
+  [ "$(getl QR)" = "0" ] && [ "$(getl CALLS)" = "0" ] \
+    && ok "a PASS is never touched, even with a stale no-eval flag" \
+    || bad "a PASS must not reach the requeue decision: $(printf '%s' "$OUT" | tr '\n' ' ')"
   run_glue 1 FAIL 1 "requeue:1"
-  if [ "$(getl QR)" = "1" ] && [ "$(getl CALLS)" = "0" ] && [ "$(getl REASON)" = "quota" ]; then
-    ok "an infra requeue already decided (dead reviewer / quota-stop) is left alone — not overwritten, no second counter bump"
-  else
-    bad "an already-requeued run must be left as is: $(printf '%s' "$OUT" | tr '\n' ' ')"
-  fi
+  [ "$(getl QR)" = "1" ] && [ "$(getl CALLS)" = "0" ] && [ "$(getl REASON)" = "quota" ] \
+    && ok "an infra requeue already decided (dead reviewer / quota-stop) is left alone — not overwritten, no second counter bump" \
+    || bad "an already-requeued run must be left as is: $(printf '%s' "$OUT" | tr '\n' ' ')"
 fi
 
 # ── 3. the requeue block: REQUEUE_REASON=no-eval ────────────────────────────
@@ -295,50 +259,36 @@ run_infra() { # run_infra <REQUEUE_REASON>
 new_case "type:quality-gate-marker gate-status:dispatching"
 run_infra no-eval
 ALLC="$(getl COMMENTS)$(getl CLOSES)$(getl NOTIFY)$(getl WARN)"
-if [ "$(getl GS)" = "gate-status:queued" ] && has "$OUT" "RC=0" && ! has "$OUT" "unbound variable"; then
-  ok "no-eval: the marker ends exactly at gate-status:queued and the block returns 0 under set -e"
-else
-  bad "no-eval must requeue the marker: GS='$(getl GS)' out=[$OUT]"
-fi
-if ! has "$ALLC" "QUOTA" && ! has "$ALLC" "quota" && ! has "$ALLC" "died"; then
-  ok "no-eval: no message blames the 5h quota or claims a reviewer died (it did neither — it delivered no verdict)"
-else
-  bad "no-eval messages must not say quota/died: [$ALLC]"
-fi
-if has "$(cmt "$MARKER_ID")" "ga-5w2gpw" && has "$(cmt "$MARKER_ID")" "no verdict" && has "$(cmt "$MARKER_ID")" "NOT a code FAIL" \
-   && has "$(cmt "$GATE_RUN_ID")" "No verdict recorded" && has "$(getl CLOSES)" "no-eval re-queue (ga-5w2gpw)"; then
-  ok "no-eval: marker comment, gate-run comment and close reason name ga-5w2gpw, say no verdict was delivered, and say NOT a code FAIL"
-else
-  bad "no-eval wording missing: marker=[$(cmt "$MARKER_ID")] run=[$(cmt "$GATE_RUN_ID")] closes=[$(getl CLOSES)]"
-fi
-if has "$(cmt vb-e6a)" "VERDICT: REQUEUED (ga-5w2gpw)"; then
-  ok "no-eval: the verdict bead is parked REQUEUED with the no-eval tag"
-else
-  bad "no-eval verdict-bead comment missing: [$(cmt vb-e6a)]"
-fi
+[ "$(getl GS)" = "gate-status:queued" ] && has "$OUT" "RC=0" && ! has "$OUT" "unbound variable" \
+  && ok "no-eval: the marker ends exactly at gate-status:queued and the block returns 0 under set -e" \
+  || bad "no-eval must requeue the marker: GS='$(getl GS)' out=[$OUT]"
+! has "$ALLC" "QUOTA" && ! has "$ALLC" "quota" && ! has "$ALLC" "died" \
+  && ok "no-eval: no message blames the 5h quota or claims a reviewer died (it did neither — it delivered no verdict)" \
+  || bad "no-eval messages must not say quota/died: [$ALLC]"
+has "$(cmt "$MARKER_ID")" "ga-5w2gpw" && has "$(cmt "$MARKER_ID")" "no verdict" && has "$(cmt "$MARKER_ID")" "NOT a code FAIL" \
+   && has "$(cmt "$GATE_RUN_ID")" "No verdict recorded" && has "$(getl CLOSES)" "no-eval re-queue (ga-5w2gpw)" \
+  && ok "no-eval: marker comment, gate-run comment and close reason name ga-5w2gpw, say no verdict was delivered, and say NOT a code FAIL" \
+  || bad "no-eval wording missing: marker=[$(cmt "$MARKER_ID")] run=[$(cmt "$GATE_RUN_ID")] closes=[$(getl CLOSES)]"
+has "$(cmt vb-e6a)" "VERDICT: REQUEUED (ga-5w2gpw)" \
+  && ok "no-eval: the verdict bead is parked REQUEUED with the no-eval tag" \
+  || bad "no-eval verdict-bead comment missing: [$(cmt vb-e6a)]"
 has "$(getl BD)" "label remove $BEAD_ID gate:reviewing" \
   && ok "no-eval: gate:reviewing is cleared on the source bead (same head-of-line guard as the other requeues, ga-n2cpe)" \
   || bad "no-eval must clear gate:reviewing: bd=[$(getl BD)]"
-if ! has "$(getl BD)" "GATE-FEEDBACK" && ! has "$(getl BD)" "gate:needs-fix" && ! has "$(getl BD)" "gate:failed" && ! has "$(getl BD)" "gate:fix-attempt" && ! has "$(getl BD)" "gate-sha-failed"; then
-  ok "no-eval: NOTHING FAIL-shaped is written — no GATE-FEEDBACK, no gate:failed / needs-fix / fix-attempt, no gate-sha-failed stamp"
-else
-  bad "no-eval wrote FAIL-shaped state: bd=[$(getl BD)]"
-fi
-if has "$(getl NOTIFY)" "re-enfileirado"; then
-  ok "no-eval: the push notice says the gate was re-queued"
-else
-  bad "no-eval push notice missing: [$(getl NOTIFY)]"
-fi
+! has "$(getl BD)" "GATE-FEEDBACK" && ! has "$(getl BD)" "gate:needs-fix" && ! has "$(getl BD)" "gate:failed" && ! has "$(getl BD)" "gate:fix-attempt" && ! has "$(getl BD)" "gate-sha-failed" \
+  && ok "no-eval: NOTHING FAIL-shaped is written — no GATE-FEEDBACK, no gate:failed / needs-fix / fix-attempt, no gate-sha-failed stamp" \
+  || bad "no-eval wrote FAIL-shaped state: bd=[$(getl BD)]"
+has "$(getl NOTIFY)" "re-enfileirado" \
+  && ok "no-eval: the push notice says the gate was re-queued" \
+  || bad "no-eval push notice missing: [$(getl NOTIFY)]"
 
 new_case "type:quality-gate-marker gate-status:dispatching gate-status:needs-rebase"
 run_infra no-eval
 MKC="$(cmt "$MARKER_ID")"; GRC="$(cmt "$GATE_RUN_ID")"
-if [ "$(getl GS)" = "gate-status:needs-rebase" ] && ! has "$(getl STATUS)" "$MARKER_ID:queued" && has "$OUT" "RC=0" \
-   && has "$MKC" "NOT applied" && ! has "$MKC" "Marker re-queued" && has "$GRC" "NOT re-queued" && [ -z "$(getl NOTIFY)" ]; then
-  ok "no-eval: an external needs-rebase present at the closing write survives, and no message claims a requeue that did not happen (ga-dl3x9s contract)"
-else
-  bad "no-eval must respect an external transition honestly: GS='$(getl GS)' marker=[$MKC] run=[$GRC] notify=[$(getl NOTIFY)]"
-fi
+[ "$(getl GS)" = "gate-status:needs-rebase" ] && ! has "$(getl STATUS)" "$MARKER_ID:queued" && has "$OUT" "RC=0" \
+   && has "$MKC" "NOT applied" && ! has "$MKC" "Marker re-queued" && has "$GRC" "NOT re-queued" && [ -z "$(getl NOTIFY)" ] \
+  && ok "no-eval: an external needs-rebase present at the closing write survives, and no message claims a requeue that did not happen (ga-dl3x9s contract)" \
+  || bad "no-eval must respect an external transition honestly: GS='$(getl GS)' marker=[$MKC] run=[$GRC] notify=[$(getl NOTIFY)]"
 
 # the two existing reasons keep their own wording (the parametrisation must not leak)
 for REASON in dead-reviewer quota; do
@@ -359,11 +309,9 @@ echo "── 4. wiring drift-guards ──"
 GFR_START="$(grep -n '^gate_finalize_run() {' "$DISPATCHER" | head -1 | cut -d: -f1)"
 GLUE_LINE="$(grep -n 'SELFTEST-EXTRACT noeval-requeue-gate: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)"
 INFRA_LINE="$(grep -n 'SELFTEST-EXTRACT infra-requeue-block: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)"
-if [ -n "$GFR_START" ] && [ -n "$GLUE_LINE" ] && [ -n "$INFRA_LINE" ] && [ "$GFR_START" -lt "$GLUE_LINE" ] && [ "$GLUE_LINE" -lt "$INFRA_LINE" ]; then
-  ok "the no-eval glue is inside gate_finalize_run and runs BEFORE the infra-requeue block it feeds (order matters: after it the flag would be consumed too late)"
-else
-  bad "wiring order wrong or glue missing: gate_finalize_run=$GFR_START glue=$GLUE_LINE infra=$INFRA_LINE"
-fi
+[ -n "$GFR_START" ] && [ -n "$GLUE_LINE" ] && [ -n "$INFRA_LINE" ] && [ "$GFR_START" -lt "$GLUE_LINE" ] && [ "$GLUE_LINE" -lt "$INFRA_LINE" ] \
+  && ok "the no-eval glue is inside gate_finalize_run and runs BEFORE the infra-requeue block it feeds (order matters: after it the flag would be consumed too late)" \
+  || bad "wiring order wrong or glue missing: gate_finalize_run=$GFR_START glue=$GLUE_LINE infra=$INFRA_LINE"
 
 echo "gate-e6a-noeval-requeue selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

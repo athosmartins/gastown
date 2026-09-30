@@ -1,33 +1,23 @@
 #!/usr/bin/env bash
 # gate-e6c-closed-bead-terminal.selftest.sh (ga-5w2gpw item c, 2026-09-30)
 #
-# CLASS: a review-approved PASS whose SOURCE BEAD was closed while the run was in flight
-# (another branch or a human resolved it: ga-lxz5w's "sequential 2-branch race") used to be
-# downgraded to a FAIL — then down the whole FAIL path: a "GATE-FEEDBACK … Fix THESE specific
-# blocking issues" comment on a CLOSED bead, a gate:failed label, a hold-class SHA stamp, a
-# fix-attempt accounting decision, an author nudge. There is nothing to fix: the reviewers
-# approved this code and the bead it answered is already done. E4 counted 17 of the 207
-# no-review FAILs as exactly this ("bead já fechada").
+# CLASS: a review-approved PASS whose SOURCE BEAD was closed while the run was in flight (another branch or a human resolved it:
+# ga-lxz5w's "sequential 2-branch race") used to be downgraded to a FAIL and sent down the whole FAIL path — a "GATE-FEEDBACK … Fix
+# THESE specific blocking issues" comment on a CLOSED bead, gate:failed, a hold-class SHA stamp, an author nudge. There is nothing
+# to fix. E4: 17 of the 207 no-review FAILs ("bead já fechada").
 #
-# FIX under test: a bead that is already CLOSED — seen by the early live re-check (Step 10) or by
-# the authoritative one right before the push (do_merge_ff, ga-360a7l) — ends the run as a TERMINAL
-# SKIP, not a FAIL. Nothing is merged (that part of ga-lxz5w stands: never merge onto a terminal
-# bead). The run says so honestly: one audit comment on the source bead that is NOT a verdict
-# (it must not start with GATE-FEEDBACK — E4 and the Pilot read that prefix as a verdict), the marker
-# is closed as SUPERSEDED with a reason that says the branch was NOT merged, the gate-run is
-# superseded and closed, gate:reviewing is cleared, and the run is logged as
-# dispatcher_complete result=SKIPPED_BEAD_CLOSED (gate-health-monitor counts it as progress, and it
-# is neither a PASS nor a FAIL).
+# FIX under test: a bead already CLOSED — seen by the early live re-check (Step 10) or the authoritative one right before the push
+# (do_merge_ff, ga-360a7l) — ends the run as a TERMINAL SKIP, not a FAIL. Nothing is merged (ga-lxz5w stands: never merge onto a
+# terminal bead). One audit comment on the source bead that is NOT a verdict (it must not start with GATE-FEEDBACK — E4 and the
+# Pilot read that prefix as one), the marker closed as SUPERSEDED saying the branch was NOT merged, the gate-run superseded and
+# closed, gate:reviewing cleared, and dispatcher_complete result=SKIPPED_BEAD_CLOSED logged (progress for gate-health-monitor).
 #
-# What must NOT change: a park:* label (needs-approval / withdraw / needs-human) is a human HOLD, not a
-# terminal bead — it still downgrades to FAIL exactly as before; an UNREADABLE bead (bd show failed) is
-# a third state and never reads as closed; and a late "closed" flag left over from another run must not
-# hijack an unrelated merge failure.
+# What must NOT change: a park:* label (needs-approval / withdraw / needs-human) is a human HOLD, not a terminal bead — it still
+# downgrades to FAIL; an UNREADABLE bead (bd show failed) is a third state and never reads as closed; a late "closed" flag left over
+# from another run must not hijack an unrelated merge failure.
 #
-# Strategy (this repo's SELFTEST-EXTRACT convention): the early re-check block is extracted from the LIVE
-# dispatcher between its two stable comment anchors, and the late block by sentinel, then run in-process
-# against stubs (bd/notify/log/warn/set_gate_status/gate_bead_live_merge_block). The helper function is
-# sourced lib-only. Every case runs under `set -e` like the dispatcher. bash 3.2 compatible.
+# Strategy (SELFTEST-EXTRACT convention): the early re-check block is extracted from the LIVE dispatcher between its two comment
+# anchors, the late block by sentinel, and both run in-process against stubs, under `set -e` like the dispatcher. bash 3.2 compatible.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,51 +96,35 @@ run_early() {
 
 new_case
 run_early closed closed
-if [ "$(getl REACHED_AFTER)" != "1" ] && [ "$RC" = "0" ]; then
-  ok "closed bead: the block ENDS the run (returns 0) instead of falling through to the FAIL path — the run never reaches the merge/FAIL code"
-else
-  bad "closed bead must terminate the run; it fell through (REACHED_AFTER=$(getl REACHED_AFTER) rc=$RC verdict=$(getl VERDICT) reasons=[$(getl REASONS)])"
-fi
-if [ "$(getl VERDICT)" != "FAIL" ]; then
-  ok "closed bead: OVERALL_VERDICT is never flipped to FAIL"
-else
-  bad "closed bead still downgrades the run to FAIL (verdict=FAIL, reasons=[$(getl REASONS)])"
-fi
+[ "$(getl REACHED_AFTER)" != "1" ] && [ "$RC" = "0" ] \
+  && ok "closed bead: the block ENDS the run (returns 0) instead of falling through to the FAIL path — the run never reaches the merge/FAIL code" \
+  || bad "closed bead must terminate the run; it fell through (REACHED_AFTER=$(getl REACHED_AFTER) rc=$RC verdict=$(getl VERDICT) reasons=[$(getl REASONS)])"
+[ "$(getl VERDICT)" != "FAIL" ] \
+  && ok "closed bead: OVERALL_VERDICT is never flipped to FAIL" \
+  || bad "closed bead still downgrades the run to FAIL (verdict=FAIL, reasons=[$(getl REASONS)])"
 SRC_C="$(cmt "$BEAD_ID")"
-if has "$SRC_C" "ga-5w2gpw" && has "$SRC_C" "already closed" && has "$SRC_C" "NOT merged" && has "$SRC_C" "$BRANCH" && has "$SRC_C" "$BRANCH_SHA" \
-   && has "$SRC_C" "$GATE_RUN_ID"; then
-  ok "closed bead: ONE audit comment on the source bead names the branch, the exact sha, the gate-run, says it was NOT merged and why"
-else
-  bad "closed bead: the audit comment on the source bead is missing or incomplete: [$SRC_C]"
-fi
+has "$SRC_C" "ga-5w2gpw" && has "$SRC_C" "already closed" && has "$SRC_C" "NOT merged" && has "$SRC_C" "$BRANCH" && has "$SRC_C" "$BRANCH_SHA" \
+   && has "$SRC_C" "$GATE_RUN_ID" \
+  && ok "closed bead: ONE audit comment on the source bead names the branch, the exact sha, the gate-run, says it was NOT merged and why" \
+  || bad "closed bead: the audit comment on the source bead is missing or incomplete: [$SRC_C]"
 case "$SRC_C" in *"@$BEAD_ID: GATE-FEEDBACK"*) bad "the audit comment starts with GATE-FEEDBACK — E4 and the Pilot would read it as a verdict" ;; *) ok "the audit comment does NOT start with GATE-FEEDBACK (it is not a verdict)" ;; esac
-if has "$(getl CLOSES)" "@$MARKER_ID: " && has "$(getl CLOSES)" "SUPERSEDED" && has "$(getl CLOSES)" "NOT merged" && has "$(getl STATUS)" "$MARKER_ID:superseded"; then
-  ok "closed bead: the marker is set superseded and CLOSED with a reason that says the branch was NOT merged"
-else
-  bad "closed bead: marker not terminally closed honestly: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
-fi
-if has "$(getl STATUS)" "$GATE_RUN_ID:superseded" && has "$(getl CLOSES)" "@$GATE_RUN_ID: "; then
-  ok "closed bead: the gate-run bead is superseded and closed too (Phase C must not re-select it)"
-else
-  bad "closed bead: gate-run not retired: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
-fi
-if has "$(getl LABELS)" "$BEAD_CITY@label remove bead-e6c gate:reviewing" 2>/dev/null || has "$(getl BD)" "label remove $BEAD_ID gate:reviewing"; then
-  ok "closed bead: gate:reviewing is cleared on the source bead (same head-of-line guard as the other terminal paths)"
-else
-  bad "closed bead: gate:reviewing not cleared: bd=[$(getl BD)]"
-fi
+has "$(getl CLOSES)" "@$MARKER_ID: " && has "$(getl CLOSES)" "SUPERSEDED" && has "$(getl CLOSES)" "NOT merged" && has "$(getl STATUS)" "$MARKER_ID:superseded" \
+  && ok "closed bead: the marker is set superseded and CLOSED with a reason that says the branch was NOT merged" \
+  || bad "closed bead: marker not terminally closed honestly: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
+has "$(getl STATUS)" "$GATE_RUN_ID:superseded" && has "$(getl CLOSES)" "@$GATE_RUN_ID: " \
+  && ok "closed bead: the gate-run bead is superseded and closed too (Phase C must not re-select it)" \
+  || bad "closed bead: gate-run not retired: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
+has "$(getl LABELS)" "$BEAD_CITY@label remove bead-e6c gate:reviewing" 2>/dev/null || has "$(getl BD)" "label remove $BEAD_ID gate:reviewing" \
+  && ok "closed bead: gate:reviewing is cleared on the source bead (same head-of-line guard as the other terminal paths)" \
+  || bad "closed bead: gate:reviewing not cleared: bd=[$(getl BD)]"
 BDW="$(getl BD)"
-if ! has "$BDW" "gate:failed" && ! has "$BDW" "gate:needs-fix" && ! has "$BDW" "gate:fix-attempt" && ! has "$BDW" "gate-sha-failed" && ! has "$BDW" "GATE-FEEDBACK"; then
-  ok "closed bead: NOTHING FAIL-shaped is written (no gate:failed / needs-fix / fix-attempt / gate-sha-failed, no GATE-FEEDBACK)"
-else
-  bad "closed bead wrote FAIL-shaped state: bd=[$BDW]"
-fi
+! has "$BDW" "gate:failed" && ! has "$BDW" "gate:needs-fix" && ! has "$BDW" "gate:fix-attempt" && ! has "$BDW" "gate-sha-failed" && ! has "$BDW" "GATE-FEEDBACK" \
+  && ok "closed bead: NOTHING FAIL-shaped is written (no gate:failed / needs-fix / fix-attempt / gate-sha-failed, no GATE-FEEDBACK)" \
+  || bad "closed bead wrote FAIL-shaped state: bd=[$BDW]"
 QGL="$(getl QGLINE)"
-if has "$QGL" '"event":"dispatcher_complete"' && has "$QGL" '"result":"SKIPPED_BEAD_CLOSED"' && has "$QGL" "\"gate_run\":\"$GATE_RUN_ID\""; then
-  ok "closed bead: logged as dispatcher_complete result=SKIPPED_BEAD_CLOSED (progress for gate-health-monitor, neither PASS nor FAIL)"
-else
-  bad "closed bead: jsonl event missing or wrong: [$QGL]"
-fi
+has "$QGL" '"event":"dispatcher_complete"' && has "$QGL" '"result":"SKIPPED_BEAD_CLOSED"' && has "$QGL" "\"gate_run\":\"$GATE_RUN_ID\"" \
+  && ok "closed bead: logged as dispatcher_complete result=SKIPPED_BEAD_CLOSED (progress for gate-health-monitor, neither PASS nor FAIL)" \
+  || bad "closed bead: jsonl event missing or wrong: [$QGL]"
 has "$(getl LOG)" "verdict=SKIPPED_BEAD_CLOSED" \
   && ok "closed bead: the 'Gate run complete' line says verdict=SKIPPED_BEAD_CLOSED" \
   || bad "closed bead: 'Gate run complete' line missing or still says PASS/FAIL: [$(getl LOG)]"
@@ -159,44 +133,34 @@ has "$(getl LOG)" "verdict=SKIPPED_BEAD_CLOSED" \
 for park in park:needs-approval park:withdraw park:needs-human; do
   new_case
   run_early "$park" open
-  if [ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "FAIL" ] && [ -z "$(getl COMMENTS)" ] && [ -z "$(getl CLOSES)" ]; then
-    ok "$park: unchanged — still downgrades to FAIL and falls through, and writes nothing (a hold is not a terminal bead)"
-  else
-    bad "$park must behave exactly as before: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT) comments=[$(getl COMMENTS)] closes=[$(getl CLOSES)]"
-  fi
+  [ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "FAIL" ] && [ -z "$(getl COMMENTS)" ] && [ -z "$(getl CLOSES)" ] \
+    && ok "$park: unchanged — still downgrades to FAIL and falls through, and writes nothing (a hold is not a terminal bead)" \
+    || bad "$park must behave exactly as before: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT) comments=[$(getl COMMENTS)] closes=[$(getl CLOSES)]"
 done
 # unknown: a failed read is the third state — never "closed"
 new_case
 run_early unknown open
-if [ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "PASS" ] && [ -z "$(getl CLOSES)" ]; then
-  ok "unknown (bd show failed): not closed, not failed — proceeds toward the authoritative late re-check exactly as before (ga-360a7l)"
-else
-  bad "unknown must not terminate or fail the run: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT) closes=[$(getl CLOSES)]"
-fi
+[ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "PASS" ] && [ -z "$(getl CLOSES)" ] \
+  && ok "unknown (bd show failed): not closed, not failed — proceeds toward the authoritative late re-check exactly as before (ga-360a7l)" \
+  || bad "unknown must not terminate or fail the run: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT) closes=[$(getl CLOSES)]"
 new_case
 run_early ok open
-if [ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "PASS" ] && [ -z "$(getl CLOSES)" ]; then
-  ok "ok (open, no hold): untouched — proceeds to merge"
-else
-  bad "an open bead must proceed: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT)"
-fi
+[ "$(getl REACHED_AFTER)" = "1" ] && [ "$(getl VERDICT)" = "PASS" ] && [ -z "$(getl CLOSES)" ] \
+  && ok "ok (open, no hold): untouched — proceeds to merge" \
+  || bad "an open bead must proceed: reached=$(getl REACHED_AFTER) verdict=$(getl VERDICT)"
 
 # honest about a FAILED write: the marker write that does not land is never narrated as done
 new_case; MARKER_SET_RC=3
 run_early closed closed
-if has "$(getl WARN)" "$MARKER_ID" && has "$(getl WARN)" "FAILED"; then
-  ok "a marker write that fails is reported (warn), not swallowed — and the run still ends (the stale-claim recovery requeues a stuck marker)"
-else
-  bad "a failed marker write must be warned about: warn=[$(getl WARN)]"
-fi
+has "$(getl WARN)" "$MARKER_ID" && has "$(getl WARN)" "FAILED" \
+  && ok "a marker write that fails is reported (warn), not swallowed — and the run still ends (the stale-claim recovery requeues a stuck marker)" \
+  || bad "a failed marker write must be warned about: warn=[$(getl WARN)]"
 new_case
 GATE_RUN_ID_SAVE="$GATE_RUN_ID"; GATE_RUN_ID="unknown"
 run_early closed closed
-if ! has "$(getl STATUS)" "unknown:" && ! has "$(getl CLOSES)" "@unknown: "; then
-  ok "GATE_RUN_ID=unknown (the gate-run bead was never created): no writes against a bead called 'unknown'"
-else
-  bad "wrote against the 'unknown' gate-run sentinel: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
-fi
+! has "$(getl STATUS)" "unknown:" && ! has "$(getl CLOSES)" "@unknown: " \
+  && ok "GATE_RUN_ID=unknown (the gate-run bead was never created): no writes against a bead called 'unknown'" \
+  || bad "wrote against the 'unknown' gate-run sentinel: status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
 GATE_RUN_ID="$GATE_RUN_ID_SAVE"
 
 # ── 2. the late block (do_merge_ff's authoritative re-check right before the push) ───────────────────
@@ -219,26 +183,20 @@ echo REACHED_AFTER=1; echo \"VERDICT=\$OVERALL_VERDICT\"
   }
   new_case
   run_late failed_bead_blocked_late 1
-  if [ "$(getl REACHED_AFTER)" != "1" ] && [ "$RC" = "0" ] && has "$(getl CLOSES)" "@$MARKER_ID: " && has "$(getl STATUS)" "$MARKER_ID:superseded" \
-     && has "$(cmt "$BEAD_ID")" "already closed" && has "$(getl QGLINE)" "SKIPPED_BEAD_CLOSED"; then
-    ok "late: MERGE_RESULT=failed_bead_blocked_late AND the closed flag → terminal skip (marker + gate-run closed, audit comment, SKIPPED_BEAD_CLOSED)"
-  else
-    bad "late closed bead must terminate as a skip: reached=$(getl REACHED_AFTER) rc=$RC status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
-  fi
+  [ "$(getl REACHED_AFTER)" != "1" ] && [ "$RC" = "0" ] && has "$(getl CLOSES)" "@$MARKER_ID: " && has "$(getl STATUS)" "$MARKER_ID:superseded" \
+     && has "$(cmt "$BEAD_ID")" "already closed" && has "$(getl QGLINE)" "SKIPPED_BEAD_CLOSED" \
+    && ok "late: MERGE_RESULT=failed_bead_blocked_late AND the closed flag → terminal skip (marker + gate-run closed, audit comment, SKIPPED_BEAD_CLOSED)" \
+    || bad "late closed bead must terminate as a skip: reached=$(getl REACHED_AFTER) rc=$RC status=[$(getl STATUS)] closes=[$(getl CLOSES)]"
   new_case
   run_late failed_bead_blocked_late 0
-  if [ "$(getl REACHED_AFTER)" = "1" ] && [ -z "$(getl CLOSES)" ]; then
-    ok "late: a park:* block (closed flag 0) is NOT hijacked — falls through to the FAIL handling as before"
-  else
-    bad "late park must fall through untouched: reached=$(getl REACHED_AFTER) closes=[$(getl CLOSES)]"
-  fi
+  [ "$(getl REACHED_AFTER)" = "1" ] && [ -z "$(getl CLOSES)" ] \
+    && ok "late: a park:* block (closed flag 0) is NOT hijacked — falls through to the FAIL handling as before" \
+    || bad "late park must fall through untouched: reached=$(getl REACHED_AFTER) closes=[$(getl CLOSES)]"
   new_case
   run_late failed_push_race 1
-  if [ "$(getl REACHED_AFTER)" = "1" ] && [ -z "$(getl CLOSES)" ]; then
-    ok "late: a STALE closed flag left by another run does not hijack an unrelated merge failure (both conditions are required)"
-  else
-    bad "a stale closed flag hijacked failed_push_race: reached=$(getl REACHED_AFTER) closes=[$(getl CLOSES)]"
-  fi
+  [ "$(getl REACHED_AFTER)" = "1" ] && [ -z "$(getl CLOSES)" ] \
+    && ok "late: a STALE closed flag left by another run does not hijack an unrelated merge failure (both conditions are required)" \
+    || bad "a stale closed flag hijacked failed_push_race: reached=$(getl REACHED_AFTER) closes=[$(getl CLOSES)]"
   new_case
   run_late direct_ff 1
   [ "$(getl REACHED_AFTER)" = "1" ] && [ -z "$(getl CLOSES)" ] \
@@ -254,11 +212,9 @@ declare -F gate_finish_bead_already_closed >/dev/null 2>&1 \
 GFR_START="$(grep -n '^gate_finalize_run() {' "$DISPATCHER" | head -1 | cut -d: -f1)"
 LATE_LINE="$(grep -n 'SELFTEST-EXTRACT bead-closed-late: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)"
 FAILBLK="$(grep -n 'Merge failed despite all-PASS verdict — degrade to FAIL' "$DISPATCHER" | head -1 | cut -d: -f1)"
-if [ -n "$GFR_START" ] && [ -n "$LATE_LINE" ] && [ -n "$FAILBLK" ] && [ "$GFR_START" -lt "$LATE_LINE" ] && [ "$LATE_LINE" -lt "$FAILBLK" ]; then
-  ok "the late skip sits inside gate_finalize_run and BEFORE the generic 'merge failed → degrade to FAIL' block that would otherwise swallow it"
-else
-  bad "late skip wiring order wrong: gate_finalize_run=$GFR_START late=$LATE_LINE fail-block=$FAILBLK"
-fi
+[ -n "$GFR_START" ] && [ -n "$LATE_LINE" ] && [ -n "$FAILBLK" ] && [ "$GFR_START" -lt "$LATE_LINE" ] && [ "$LATE_LINE" -lt "$FAILBLK" ] \
+  && ok "the late skip sits inside gate_finalize_run and BEFORE the generic 'merge failed → degrade to FAIL' block that would otherwise swallow it" \
+  || bad "late skip wiring order wrong: gate_finalize_run=$GFR_START late=$LATE_LINE fail-block=$FAILBLK"
 
 echo "gate-e6c-closed-bead-terminal selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

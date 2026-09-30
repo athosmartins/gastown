@@ -4971,55 +4971,56 @@ rebase_union_blob_to_file() {
 #   not-applicable   some differing path is NOT a union path (or nothing declares merge=union at all): this is
 #                    not this function's question — the caller keeps the answer it always had
 #   unknown:union-*  could not tell (diff error, unreadable blob, not a regular file, past the size cap, no
-#                    merge-base, a C-quoted path, a check-attr failure): never yes, never no
+#                    merge-base, a C-quoted path, a check-attr failure): never yes here. The CALLER decides which of
+#                    these re-running reproduces (too-large, not-regular-file, quoted-path, no-merge-base → "no") and
+#                    which may pass (the rest stay unknown) — see rebase_content_verdict().
 #
-# WHY this exists: for a merge=union path "the rebased tree equals the reference merge" is the WRONG question.
-# union keeps BOTH sides' lines and is not associative: a rebase replays the branch commit by commit, so each
-# intermediate step unions differently from one union of the two end states. The trees then differ by ORDER,
-# by a residue line an intermediate commit added and a later one edited away, or by a duplicated block one side
-# keeps and the other collapses — with nothing lost on either side. whatsapp_automation declares exactly that for
-# docs/data_dictionary.md (the append-only atlas every crew edits) and the gate refused 3 pushes on 30/09 alone
-# ("content verdict=no … Diverging paths: docs/data_dictionary.md"), each failing a review-approved PASS as
-# failed_merge_time_rebase. ga-ub5hkz fixed the sibling deploy_deps.json case; this is the same class.
+# WHY: for a merge=union path "the rebased tree equals the reference merge" is the WRONG question. union keeps BOTH sides'
+# lines and is not associative: a rebase replays the branch commit by commit, so the trees can differ by ORDER, by a residue line
+# an intermediate commit added and a later one edited away, or by a duplicated block one side collapses — with nothing lost.
+# whatsapp_automation declares that for docs/data_dictionary.md (the append-only atlas) and the gate refused 3 pushes on 30/09
+# alone (content verdict=no, each failing a review-approved PASS as failed_merge_time_rebase). ga-ub5hkz fixed the sibling
+# deploy_deps.json case; this is the same class.
 #
-# THE QUESTION ASKED INSTEAD — "was any line lost?" — by multiset arithmetic over four blobs: B = merge-base,
-# M = main, O = the branch tip (what the author submitted), A = the resulting tip. For every distinct non-blank
-# line l, with c_X(l) its count in X:
+# THE QUESTION ASKED INSTEAD — "was any line lost?" — by multiset arithmetic over four blobs: B = merge-base, M = main,
+# O = the branch tip (what the author submitted), A = the resulting tip. For every distinct non-blank line l, c_X(l) its count in X:
 #     need(l) = max(0, c_O(l)-c_B(l))        what the branch added
 #             + max(0, c_M(l)-c_B(l))        what main added
 #             + min(c_B(l), c_M(l), c_O(l))  what nobody touched
 #     lost    iff c_A(l) < need(l)
-# A line one side deleted and the other left alone needs nothing (either outcome is a legitimate union result);
-# a line both sides added is needed twice (union keeps both). Blank lines are ignored (markdown is full of them).
-# STRICT ON PURPOSE: a legitimate outcome this rejects stays "no" — exactly today's behaviour — whereas accepting a
-# loss is the silent content loss ga-m07gc exists to stop. Conflict markers in A that none of B/M/O carries are
-# corruption, not content, and read "no".
+# A line one side deleted and the other left alone needs nothing; a line both sides added is needed twice (union keeps both).
+# Blank lines are ignored. STRICT ON PURPOSE: a legitimate outcome this rejects stays "no" — today's behaviour — whereas accepting
+# a loss is the silent content loss ga-m07gc exists to stop. Conflict markers in A that none of B/M/O carries read "no".
 #
-# Scope is what .gitattributes at <new_tip> declares (filtered to git's built-in drivers, as ga-stisew does) and
-# resolved with `git check-attr`, so a custom driver (merge=deploydeps) is never treated as union. Regular files
-# only, at most GATE_UNION_VERDICT_MAX_BYTES (default 2000000) each. Always returns 0 (callers run under set -e).
+# Scope is what .gitattributes at <new_tip> declares (filtered to git's built-in drivers, as ga-stisew does) and resolved with
+# `git check-attr`, so a custom driver (merge=deploydeps) is never treated as union. Regular files only, at most
+# GATE_UNION_VERDICT_MAX_BYTES each; the default is 20000000: a 2 MB cap was 96.5% used by the 1.93 MB atlas, while the awk keeps
+# every distinct line of four blobs in memory, so the cap stays a real bound (past it the verdict is "no"). Always returns 0 (set -e).
 rebase_union_paths_verdict() {
   local gd="$1" main_ref="$2" orig_tip="$3" new_tip="$4" expected="$5" actual="$6"
   local diffout diff_rc attrs_file p driver base_sha max_bytes rc
   local fb fm fo fa any_loss=0 npaths=0 detail
-  diffout=$(git --git-dir="$gd" diff-tree -r --no-renames --name-only "$expected" "$actual" 2>/dev/null); diff_rc=$?
+  diffout=$(git --git-dir="$gd" -c core.quotepath=false diff-tree -r --no-renames --name-only "$expected" "$actual" 2>/dev/null); diff_rc=$?
   if [ "$diff_rc" -ne 0 ]; then echo "unknown:union-diff-error"; return 0; fi
   if [ -z "$diffout" ]; then echo "not-applicable"; return 0; fi
   # Read AFTER the diff_rc check on purpose, not before it: the numeric-guard pattern below has a lone pipe character, and sitting
   # right above the status read it makes error-empty-conflation-scan (C7, a one-line lookback) report a false positive that would
   # page the silent-ignorance monitor as a NEW finding. Nothing above this point uses max_bytes.
-  max_bytes="${GATE_UNION_VERDICT_MAX_BYTES:-2000000}"
-  case "$max_bytes" in ''|*[!0-9]*) max_bytes=2000000 ;; esac
+  max_bytes="${GATE_UNION_VERDICT_MAX_BYTES:-20000000}"
+  case "$max_bytes" in ''|*[!0-9]*) max_bytes=20000000 ;; esac
   attrs_file=$(rebase_git_attributes_file "$gd" "$new_tip")
   if [ -z "$attrs_file" ]; then echo "not-applicable"; return 0; fi
   # 1. EVERY differing path must be declared merge=union — one foreign path and this is not our question.
   while IFS= read -r p; do
     [ -z "$p" ] && continue
-    case "$p" in \"*) rm -f "$attrs_file"; echo "unknown:union-quoted-path"; return 0 ;; esac
     if ! driver=$(git --git-dir="$gd" -c core.attributesFile="$attrs_file" check-attr merge -- "$p" 2>/dev/null | sed -n 's/^.*: merge: //p'); then
       rm -f "$attrs_file"; echo "unknown:union-attr-error"; return 0
     fi
     if [ "$driver" != "union" ]; then rm -f "$attrs_file"; echo "not-applicable"; return 0; fi
+    # Only a path that would be judged here needs a real name: a C-quoted one (quotes, backslash, control chars — core.quotepath=false
+    # already keeps ordinary non-ASCII names plain) cannot be looked up as a blob. Checked AFTER the driver, so a foreign quoted path
+    # is "not-applicable" as before, not a deterministic answer turned into a third state.
+    case "$p" in \"*) rm -f "$attrs_file"; echo "unknown:union-quoted-path"; return 0 ;; esac
     npaths=$((npaths + 1))
   done <<< "$diffout"
   rm -f "$attrs_file"
@@ -5256,9 +5257,13 @@ rebase_content_verdict() {
   # deploy_deps arbiter below exactly as before, whose default for any other mismatch is "no".
   local uv
   uv=$(rebase_union_paths_verdict "$gd" "$main_ref" "$orig_tip" "$new_tip" "$expected" "$actual")
+  # Same rule as the deploy_deps mapping below: a cause that re-running REPRODUCES (too large, not a regular file, a C-quoted
+  # path, no merge-base) is "no" — what a union-path mismatch answered before this function existed. "unknown" would send it
+  # into the ga-10uqmi transient-retry loop, which never converges and never reaches a human. Causes that may not recur
+  # (unreadable, awk-failed, no-tmp, attr-error, diff-error) stay unknown:*, and so does any suffix added later (the default).
   case "$uv" in
     yes) echo "yes"; return 0 ;;
-    no) echo "no"; return 0 ;;
+    no|unknown:union-too-large|unknown:union-not-regular-file|unknown:union-quoted-path|unknown:union-no-merge-base) echo "no"; return 0 ;;
     unknown:*) echo "$uv"; return 0 ;;
     *) : ;;
   esac
@@ -5983,33 +5988,21 @@ gate_park_note_skipped() {
 }
 
 # gate_noeval_requeue_decision <marker_id>   (ga-5w2gpw item a)
-# A run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that timed out, or a
-# verdict bead closed with no verdict (ga-w7pm55) — is not a rejection of anything, so it
-# is re-queued (fresh reviewers on the next sweep) instead of going down the FAIL path,
-# which would post "Fix THESE specific blocking issues" on a bead nobody found fault with
-# and hand it back to the pool. E4 (docs/reports/gate-e4-historico.md §1): these were 110
-# of the 207 reprovações sem revisão de código.
-#
-# The requeue must be BOUNDED: a reviewer that is wedged on every attempt would loop
-# forever. The bound is a counter label on the MARKER (gate:noeval-requeue:N — the marker
-# survives a requeue, the gate-run bead does not) capped by GATE_NOEVAL_REQUEUE_CAP
-# (default 2; 0 turns the requeue off). Past the cap the caller takes the legacy no-eval
-# FAIL path, unchanged (hold class, fix-attempt untouched, Mayor paged by
-# gate_fail_settle_deferred_mayor_wake).
-#
+# A run in which NOBODY JUDGED THE CODE — a live-but-slow reviewer that timed out, or a verdict bead closed with no verdict
+# (ga-w7pm55) — is not a rejection of anything, so it is re-queued (fresh reviewers next sweep) instead of going down the FAIL
+# path, which would post "Fix THESE specific blocking issues" on a bead nobody found fault with and hand it back to the pool.
+# E4 (docs/reports/gate-e4-historico.md §1): 110 of the 207 reprovações sem revisão de código.
+# BOUNDED: a reviewer wedged on every attempt would loop forever. The bound is a counter label on the MARKER
+# (gate:noeval-requeue:N — the marker survives a requeue, the gate-run bead does not), capped by GATE_NOEVAL_REQUEUE_CAP
+# (default 2; 0 = off). Past the cap the caller takes the legacy no-eval FAIL path, unchanged.
 # Prints exactly one line, and ONLY the literal "requeue:<n>" earns a requeue:
 #   requeue:<n>         the n-th requeue; the counter label was written AND read back
 #   fail:cap            the cap is spent (or 0): nothing written
-#   fail:unreadable     the marker could not be read (bd failed, non-JSON, an error
-#                       envelope, or a payload that is not THIS marker): nothing written
-#   fail:not-recorded   the counter write did not stick: a count that cannot be recorded
-#                       cannot bound the loop, so there is no requeue
+#   fail:unreadable     the marker could not be read (bd failed, non-JSON, an error envelope, not THIS marker): nothing written
+#   fail:not-recorded   the counter write did not stick: a count that cannot be recorded cannot bound the loop
 #   fail:no-marker      empty marker id
-# Three states, never two (error != empty): an unreadable counter is NOT a counter of 0 —
-# reading it as 0 would let a run that cannot be bounded requeue forever.
-# Write order is add-new, VERIFY, then remove-old (the same add-before-remove invariant as
-# set_gate_status): a write that is lost must never leave the counter lower than it was.
-# Always returns 0: the caller runs under `set -e`.
+# Three states, never two (error != empty): an unreadable counter is NOT 0. Write order is add-new, VERIFY, then remove-old
+# (set_gate_status's add-before-remove): a lost write must never leave the counter lower than it was. Always returns 0 (set -e).
 gate_noeval_requeue_decision() {
   local _id="${1:-}" _cap="${GATE_NOEVAL_REQUEUE_CAP:-2}" _raw _mid _labels _cur _next _l _back
   case "$_cap" in ''|*[!0-9]*) _cap=2 ;; esac
@@ -6050,24 +6043,18 @@ gate_noeval_requeue_decision() {
 }
 
 # gate_finish_bead_already_closed <marker_id> <gate_run_id> <bead_city> <bead_id> <branch> <sha> [early|late]
-# (ga-5w2gpw item c)  A review-approved PASS whose SOURCE BEAD was closed while the run was in flight (another
-# branch or a human resolved it — ga-lxz5w's sequential 2-branch race) used to be downgraded to FAIL and sent
-# down the whole FAIL path: a "Fix THESE specific blocking issues" comment on a CLOSED bead, gate:failed, a
-# hold-class SHA stamp, an author nudge. There is nothing to fix — the reviewers approved this code and the bead
-# it answered is done. E4 counted 17 of the 207 no-review FAILs as exactly this.
-# This ends the run as a TERMINAL SKIP instead. Nothing is merged (ga-lxz5w's "never merge onto a terminal bead"
-# stands), and the record says so plainly:
-#   - ONE audit comment on the source bead that is NOT a verdict (it never starts with the verdict prefix E4 and
-#     the Pilot read as a FAIL), naming branch, exact sha and gate-run, and saying the branch was NOT merged;
-#   - the marker set superseded and CLOSED with a reason that says the same;
-#   - the gate-run bead superseded and closed (Phase C must not re-select it), skipped when GATE_RUN_ID=unknown;
-#   - gate:reviewing cleared on the source bead (the head-of-line guard every other terminal path carries);
-#   - dispatcher_complete result=SKIPPED_BEAD_CLOSED in QG_LOG and the "Gate run complete" line: progress for
-#     gate-health-monitor, and neither a PASS nor a FAIL for anything that counts verdicts.
-# Writes are best-effort but never silent: a write that fails is warned about by name. A marker left open by a
-# failed close is recovered by the dispatching-TTL requeue, and the rerun lands here again — self-healing, not
-# stuck. Always returns 0 (callers run under `set -e`). Takes the ids as arguments, so nothing here depends on
-# the caller's locals.
+# (ga-5w2gpw item c)  A review-approved PASS whose SOURCE BEAD was closed while the run was in flight (another branch or a human
+# resolved it — ga-lxz5w's 2-branch race) used to be downgraded to FAIL and sent down the whole FAIL path: a "Fix THESE specific
+# blocking issues" comment on a CLOSED bead, gate:failed, a hold-class SHA stamp, an author nudge. There is nothing to fix. E4: 17
+# of the 207 no-review FAILs. This ends the run as a TERMINAL SKIP instead. Nothing is merged (ga-lxz5w's "never merge onto a
+# terminal bead" stands), and the record says so: ONE audit comment on the source bead that is NOT a verdict (it never starts with
+# the prefix the Pilot read as a FAIL) naming branch, sha and gate-run and saying the branch was NOT merged; the marker superseded
+# and CLOSED; the gate-run bead superseded and closed (skipped when GATE_RUN_ID=unknown); gate:reviewing cleared on the source
+# bead; dispatcher_complete result=SKIPPED_BEAD_CLOSED in QG_LOG — progress for gate-health-monitor, neither PASS nor FAIL.
+# Writes are best-effort. The three that decide the terminal state — the audit comment, the marker's superseded status, the marker
+# close — warn by name when they fail; the rest are silent `|| true`. It self-heals either way: a marker left open is recovered by
+# the dispatching-TTL requeue, a gate-run left unsuperseded is re-picked by Phase C, and the rerun lands here again (idempotent).
+# Always returns 0 (callers run under `set -e`). Takes the ids as arguments, so nothing depends on the caller's locals.
 gate_finish_bead_already_closed() {
   local marker_id="${1:-}" run_id="${2:-}" bead_city="${3:-}" bead_id="${4:-}" branch="${5:-}" sha="${6:-}" where="${7:-early}"
   local when_txt rc
@@ -6518,19 +6505,13 @@ GATE_END_EPOCH=$(date +%s)
 ELAPSED_S=$((GATE_END_EPOCH - GATE_START_EPOCH))
 
 # ── ga-5w2gpw (a): NO-EVAL re-queue — a run nobody judged is not a FAIL ──────────
-# GATE_FAIL_NO_EVAL=1 (raised by Phase C's genuine-timeout branch, ga-mcapdq, and by
-# gate_collect_verdicts for a verdict bead closed with no verdict, ga-w7pm55) means NO
-# reviewer evaluated this code. It used to fall through to the FAIL path below: "Fix THESE
-# specific blocking issues" posted on the source bead, gate:needs-fix, and the bead handed
-# back to the pool to repair a defect nobody found (E4: 110 of the 207 reprovações sem
-# revisão de código). Convert it into the infra requeue right below instead — same
-# mechanism as a dead reviewer (ga-eqjo): marker back to queued, fresh reviewers next sweep.
-# BOUNDED by gate_noeval_requeue_decision (see its header): past the cap, or when the
-# counter is unreadable / unrecordable, nothing changes here and the run takes the legacy
-# no-eval FAIL path (hold class, fix-attempt untouched, Mayor paged). Only the literal
-# "requeue:<n>" converts; anything else — garbage, empty, a fail:* reason — stays inert.
-# Runs BEFORE the requeue block: after it the flag would be consumed too late. A run with a
-# JUDGED FAIL (GATE_FAIL_NO_EVAL=0) never reaches the decision — a real rejection stays a FAIL.
+# GATE_FAIL_NO_EVAL=1 (Phase C's genuine-timeout branch, ga-mcapdq; gate_collect_verdicts for a verdict bead closed with no
+# verdict, ga-w7pm55) means NO reviewer evaluated this code. It used to fall through to the FAIL path below: "Fix THESE specific
+# blocking issues" on the source bead, gate:needs-fix, the bead handed back to the pool to repair a defect nobody found (E4: 110 of
+# 207). Convert it into the infra requeue right below instead — the dead-reviewer mechanism (ga-eqjo): marker back to queued.
+# BOUNDED by gate_noeval_requeue_decision: past the cap, or with the counter unreadable / unrecordable, nothing changes here and the
+# run takes the legacy no-eval FAIL path (hold class, fix-attempt untouched, Mayor paged). Only the literal "requeue:<n>" converts.
+# Runs BEFORE the requeue block, or the flag would be consumed too late. A JUDGED FAIL (GATE_FAIL_NO_EVAL=0) never gets here.
 # SELFTEST-EXTRACT noeval-requeue-gate: BEGIN
 if [ "${GATE_FAIL_NO_EVAL:-0}" = "1" ] && [ "$OVERALL_VERDICT" = "FAIL" ] && [ "${QUOTA_REQUEUE:-0}" != "1" ]; then
   local _NOEVAL_DECISION
@@ -15371,19 +15352,20 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
 fi
 
 # ── Step 5c (ga-5w2gpw, E6 item d): a reviewer is handed the WHOLE diff, or no run starts ───────────────────
-# The payload used to be cut at 2000 lines and headed "PARTIAL DIFF — … DO NOT treat the omitted files as reviewed";
-# that reviewer's PASS was then taken as the verdict on the WHOLE change and the branch merged (nothing here read
-# DIFF_COVERAGE). E4: 182 of 2,628 runs were partial. Now (1) the ceiling is what one reviewer can take WHOLE (6000 lines
-# AND 400000 bytes; roughly 7 in 10 of the old partial runs fit — an estimate, byte density is partly imputed), and (2) a
-# diff still over a ceiling is PARKED here, fail-closed, with no reviewer spawned: the gate neither reviews a piece nor
-# merges on one. Like the ga-acb circuit-break (marker at gate-status:error, gate:needs-human:technical, author + Mayor
-# told), not a FAIL: nothing was judged, so no fix attempt is consumed. It runs BEFORE Step 6 so a parked run leaves no
-# gate-run bead for the zombie/timeout machinery to fail. Only coverage=partial parks; coverage=unknown (an empty whole-diff
-# read) keeps its old handling — a git failure is a separate bead (KNOWN LIMIT in gate-review-task.lib.sh).
-# Not done here, deliberately: splitting a diff across reviewers. The gate-reviewer pool holds 3 sessions (ga-5hdsr) and a
-# spawn that finds it full parks the marker at gate-status:error (the spawn-abort path below), so extra reviewers per run
-# would trade "files merge unread" for "busy pool parks markers". Expect ~3 in 10 old partial runs (~1.5/day) to park; if
-# that costs too much attention, chunk across reviewers behind a pool-headroom check (the ceilings are env knobs until then).
+# The payload used to be cut at 2000 lines ("PARTIAL DIFF — … DO NOT treat the omitted files as reviewed") and that reviewer's
+# PASS was taken as the verdict on the WHOLE change (nothing read DIFF_COVERAGE). E4: 182 of 2,628 runs. Now the ceiling is what
+# one reviewer can take WHOLE (6000 lines AND 400000 bytes; ~7 in 10 of the old partial runs fit — an estimate) and anything else
+# PARKS here, fail-closed, before Step 6, so no gate-run bead is left for the zombie/timeout machinery to fail. Like the ga-acb
+# circuit-break: marker at gate-status:error, gate:needs-human:technical, author + Mayor told — NOT a FAIL (nothing was judged).
+# Only coverage=full proceeds: the GOOD state is required, the bad ones are not enumerated. partial parks as "too large". unknown
+# (the whole-diff read came back EMPTY) parks as "could not be read" when a change is indicated — a file is listed (a real change
+# always has diff text), or none is but `git diff --quiet` does not say "no difference" (rc != 0: a diff git can see, or a git that
+# failed, so the empty list may be the broken read). Only a diff git confirms empty falls through, as it always did. Before, unknown
+# fell through under "FULL DIFF (complete — 0 lines …)" over a BLANK body, and a PASS on nothing merged (gate run ga-a7k39w).
+# Parked, not re-queued: a re-queue needs its own bound (unbounded, it is ga-10uqmi's resonance loop, which never reaches a human).
+# Not done, deliberately: splitting a diff across reviewers. The gate-reviewer pool holds 3 sessions (ga-5hdsr) and a full pool parks
+# the marker at error — "files merge unread" traded for "busy pool parks markers". Expect ~1.5 parks/day; if that costs too much
+# attention, chunk behind a pool-headroom check (the ceilings are env knobs until then).
 # SELFTEST-EXTRACT gate-diff-park: BEGIN
 DIFF_SUMMARY=$(gate_diff_summary git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH")
 if [ "$IS_CONTAINER_RIG" = "1" ]; then
@@ -15393,43 +15375,74 @@ else
 fi
 gate_build_diff_payload git_rig "origin/$DEFAULT_BRANCH" "origin/$BRANCH" "$CHANGED_FILES" "$DIFF_FILE_COUNT" "$GATE_DIFF_LINE_BUDGET" "$DIFF_ESCAPE_HATCH_CMD"
 
-if [ "${DIFF_COVERAGE:-unknown}" = "partial" ]; then
+_DP_KIND=""
+case "${DIFF_COVERAGE:-unknown}" in
+  full) : ;;
+  partial) _DP_KIND="too-large" ;;
+  *)
+    # unknown — or a value this code has never heard of, which must not read as full either.
+    if [ "${DIFF_FILE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+      _DP_KIND="unreadable"
+    else
+      _DP_QUIET_RC=0
+      git_rig diff --quiet "origin/$DEFAULT_BRANCH...origin/$BRANCH" >/dev/null 2>&1 || _DP_QUIET_RC=$?
+      if [ "$_DP_QUIET_RC" -ne 0 ]; then _DP_KIND="unreadable"; fi
+    fi
+    ;;
+esac
+
+if [ -n "$_DP_KIND" ]; then
   _DP_SIZE="${DIFF_RAW_TOTAL_LINES:-?} lines / ${DIFF_RAW_TOTAL_BYTES:-?} bytes across ${DIFF_FILE_COUNT:-?} file(s)"
   _DP_LIMIT="${DIFF_LIMIT_LINES:-$GATE_DIFF_LINE_BUDGET} lines / ${DIFF_LIMIT_BYTES:-$GATE_DIFF_BYTE_BUDGET} bytes"
-  err "Branch $BRANCH: diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole — parking before dispatch (ga-5w2gpw); the gate does not review a piece of a diff and merge on it."
+  if [ "$_DP_KIND" = "unreadable" ]; then
+    _DP_WHAT="has no readable diff: ${DIFF_FILE_COUNT:-?} changed file(s) are listed (or git cannot say the branch is empty) but git returned no diff text, so there is nothing to hand a reviewer"
+    _DP_PRINCIPLE="The gate does not send a reviewer to judge a diff it could not read and merge on its PASS"
+    _DP_TODO="WHAT TO DO: re-run /gate-done to try again. If it parks again the rig's git read is failing — run 'git diff origin/$DEFAULT_BRANCH...origin/$BRANCH' in the rig; the Mayor decides."
+    _DP_SUBJ="diff could not be read"
+    _DP_EVENT="dispatcher_park_diff_unreadable"
+    _DP_LOGWHY="diff could not be read"
+  else
+    _DP_WHAT="has a diff of $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole (GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET)"
+    _DP_PRINCIPLE="The gate does not review a part of a diff and merge on it"
+    _DP_TODO="WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher."
+    _DP_SUBJ="diff too large to review whole"
+    _DP_EVENT="dispatcher_park_diff_too_large"
+    _DP_LOGWHY="diff too large to review whole: $_DP_SIZE"
+  fi
+  err "Branch $BRANCH: parking before dispatch (ga-5w2gpw) — it $_DP_WHAT. $_DP_PRINCIPLE."
   # ga-7fwt1: set_gate_status() — add-before-remove, queried live.
   set_gate_status "$MARKER_ID" "error"
   # ga-36ta4: apply-then-verify FIRST, so every comment below cites the VERIFIED state.
   _NH_STATUS="failed"
   [ -n "$BEAD_ID" ] && _NH_STATUS=$(gate_apply_needs_human "$BEAD_CITY" "$BEAD_ID" "gate:needs-human:technical")
   [ "$_NH_STATUS" != "armed" ] && warn "gate:needs-human FAILED TO APPLY on $BEAD_ID after retry (ga-5w2gpw/ga-36ta4) — circuit-breaker NOT armed."
-  bd -C "$GC_CITY" comment "$MARKER_ID" "ga-5w2gpw PARKED before reviewer dispatch: branch $BRANCH has a diff of $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole (GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET). Nothing was reviewed, nothing merged, no fix attempt consumed. Marker parked at gate-status:error. Source bead $BEAD_ID: $(gate_needs_human_clause "$_NH_STATUS")" 2>/dev/null || true
+  bd -C "$GC_CITY" comment "$MARKER_ID" "ga-5w2gpw PARKED before reviewer dispatch: branch $BRANCH $_DP_WHAT. Nothing was reviewed, nothing merged, no fix attempt consumed. Marker parked at gate-status:error. Source bead $BEAD_ID: $(gate_needs_human_clause "$_NH_STATUS")" 2>/dev/null || true
   if [ -n "$BEAD_ID" ]; then
     for _DP_LBL in story:in-flight gate:reviewing pilot:dispatched; do
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "$_DP_LBL" -q 2>/dev/null || true
     done
     bd -C "$BEAD_CITY" assign "$BEAD_ID" "" -q 2>/dev/null || true
-    bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-5w2gpw PARKED before review (marker $MARKER_ID): branch $BRANCH has a diff of $_DP_SIZE, over the $_DP_LIMIT the gate can hand ONE reviewer whole. The gate does not review a part of a diff and merge on it, so nothing was reviewed and nothing merged; no gate:fix-attempt was consumed. $(gate_needs_human_clause "$_NH_STATUS") story:in-flight + gate:reviewing + pilot:dispatched stripped (Pilot lane slot freed). WHAT TO DO: split the work into branches that each stay under those limits and send each one through /gate-done. If this change really must land as ONE piece, the Mayor decides: read it and merge by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher." 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-5w2gpw PARKED before review (marker $MARKER_ID): branch $BRANCH $_DP_WHAT. $_DP_PRINCIPLE, so nothing was reviewed and nothing merged; no gate:fix-attempt was consumed. $(gate_needs_human_clause "$_NH_STATUS") story:in-flight + gate:reviewing + pilot:dispatched stripped (Pilot lane slot freed). $_DP_TODO" 2>/dev/null || true
   fi
   gc --city "$GC_CITY" mail send mayor \
-    -s "Gate parked: $BRANCH diff too large to review whole (${BEAD_ID:-unknown})" \
-    -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) was parked before reviewer dispatch (ga-5w2gpw): its diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole. The gate no longer reviews a piece of a diff and merges on it. $(gate_needs_human_clause "$_NH_STATUS") Decide: have the builder split the branch, or review and merge it by hand, or raise GATE_DIFF_LINE_BUDGET / GATE_DIFF_BYTE_BUDGET on the dispatcher." 2>/dev/null \
-    || warn "Could not mail Mayor for the ga-5w2gpw diff-too-large park of $BRANCH"
+    -s "Gate parked: $BRANCH $_DP_SUBJ (${BEAD_ID:-unknown})" \
+    -m "Branch $BRANCH (bead ${BEAD_ID:-unknown}, rig ${RIG:-unknown}, marker $MARKER_ID) was parked before reviewer dispatch (ga-5w2gpw): it $_DP_WHAT. $_DP_PRINCIPLE. $(gate_needs_human_clause "$_NH_STATUS") $_DP_TODO" 2>/dev/null \
+    || warn "Could not mail Mayor for the ga-5w2gpw ($_DP_KIND) park of $BRANCH"
   if [ -n "$AUTHOR" ]; then
     gc --city "$GC_CITY" mail send "$AUTHOR" \
-      -s "Gate parked: your branch $BRANCH is too large to review whole" \
-      -m "Your branch $BRANCH (bead ${BEAD_ID:-unknown}) was parked before review: its diff is $_DP_SIZE, over the $_DP_LIMIT one reviewer can be handed whole, and the gate does not review a part of a diff and merge on it. $(gate_needs_human_clause "$_NH_STATUS") Split the work into branches that each stay under those limits and send each one through /gate-done." \
-      2>/dev/null || warn "Could not mail author $AUTHOR for the ga-5w2gpw diff-too-large park of $BRANCH"
+      -s "Gate parked: your branch $BRANCH — $_DP_SUBJ" \
+      -m "Your branch $BRANCH (bead ${BEAD_ID:-unknown}) was parked before review: it $_DP_WHAT. $_DP_PRINCIPLE. $(gate_needs_human_clause "$_NH_STATUS") $_DP_TODO" \
+      2>/dev/null || warn "Could not mail author $AUTHOR for the ga-5w2gpw ($_DP_KIND) park of $BRANCH"
   fi
   mkdir -p "$(dirname "$QG_LOG")"
   jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "$BEAD_ID" \
     --arg rig "${RIG:-unknown}" --arg marker "$MARKER_ID" --arg author "$AUTHOR" \
     --arg lines "${DIFF_RAW_TOTAL_LINES:-?}" --arg bytes "${DIFF_RAW_TOTAL_BYTES:-?}" --arg files "${DIFF_FILE_COUNT:-?}" \
     --arg limit_lines "${DIFF_LIMIT_LINES:-$GATE_DIFF_LINE_BUDGET}" --arg limit_bytes "${DIFF_LIMIT_BYTES:-$GATE_DIFF_BYTE_BUDGET}" \
-    --arg event "dispatcher_park_diff_too_large" \
+    --arg event "$_DP_EVENT" \
     '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, lines: $lines, bytes: $bytes, files: $files, limit_lines: $limit_lines, limit_bytes: $limit_bytes}' \
     >> "$QG_LOG" 2>/dev/null || true
-  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=PARKED (ga-5w2gpw diff too large to review whole: $_DP_SIZE) ==="
+  log "=== Dispatcher sweep complete: branch=$BRANCH verdict=PARKED (ga-5w2gpw $_DP_LOGWHY) ==="
   # A deliberately-handled terminal outcome for ONE marker, not a dispatcher failure: exit 0 (ga-dmox — exit 1 poisons
   # daemon-presence-watchdog's FAILING counter).
   exit 0
@@ -15484,8 +15497,9 @@ fi
 # The dispatcher polls these beads for closed status + verdict label.
 
 # ga-gnr3tw / ga-5w2gpw: DIFF_SUMMARY, DIFF_HEADER and DIFF_FULL were built ONCE, at Step 5c above (before this gate-run
-# existed), because a diff too large to hand a reviewer whole parks the marker there — and a parked run must not leave a
-# gate-run bead behind. Every reviewer below gets that same payload, and it is always a WHOLE diff by the time it gets here.
+# existed), because a diff too large to hand a reviewer whole, or one that could not be read, parks the marker there — and a
+# parked run must not leave a gate-run bead behind. Every reviewer below gets that same payload, and it is a WHOLE diff by the
+# time it gets here (coverage=full) — or one git itself confirmed empty, which has nothing in it for a reviewer to miss.
 
 VERDICT_BEAD_IDS=()
 SESSION_IDS=()

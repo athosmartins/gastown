@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # gate-e6d-whole-diff-or-park.selftest.sh (ga-5w2gpw item d, 2026-09-30)
 #
-# CLASS: a reviewer shown a PIECE of the diff could PASS, and the branch merged on it. The gate cut the payload at
-# 2000 lines and headed it "PARTIAL DIFF … DO NOT treat the omitted files as reviewed", then took that reviewer's PASS
-# as the verdict on the WHOLE change; only pre-gate-review.sh read DIFF_COVERAGE. E4: 182 of 2,628 runs were partial.
-# MEASURED: those runs have median 2,837 / p90 6,476 / max 13,607 diff lines (89% fit in 6000), but the task is one argv
-# argument (ARG_MAX 1 MiB) and fills the reviewer context, both BYTES: the largest task ever delivered is 193 KB and
-# dense diffs run ~450 B/line. FIX: "whole" = within 6000 lines AND 400000 bytes (lib + pre-gate agree), and the dispatcher
-# builds the payload before the gate-run bead exists (Step 5c) and PARKS a partial one fail-closed, spawning no reviewer.
+# CLASS: a reviewer shown a PIECE of the diff could PASS, and the branch merged on it. The gate cut the payload at 2000 lines and
+# headed it "PARTIAL DIFF … DO NOT treat the omitted files as reviewed", then took that reviewer's PASS as the verdict on the WHOLE
+# change; only pre-gate-review.sh read DIFF_COVERAGE. E4: 182 of 2,628 runs were partial. Those runs have median 2,837 / p90 6,476 /
+# max 13,607 diff lines (89% fit in 6000), but the task is one argv argument (ARG_MAX 1 MiB) and fills the reviewer context, both
+# BYTES: the largest task ever delivered is 193 KB and dense diffs run ~450 B/line.
+# FIX: "whole" = within 6000 lines AND 400000 bytes (lib + pre-gate agree). The dispatcher builds the payload before the gate-run
+# bead exists (Step 5c) and PARKS anything but coverage=full, spawning no reviewer: a partial diff as "too large", and an UNREADABLE
+# one (files listed, no diff text — gate run ga-a7k39w) as "could not be read". A diff git itself confirms empty still proceeds.
 # Strategy: the lib runs against REAL git; the dispatcher block is extracted by SELFTEST-EXTRACT sentinels and run under
 # `set -euo pipefail` against stubs; the harness is mutation-checked. bash 3.2 compatible. Exit 0 iff all assertions hold.
 set -uo pipefail
@@ -148,6 +149,7 @@ git_rig() {
   case "$*" in
     "diff --stat "*) echo " $SC_FILES files changed, $SC_LINES insertions(+)"; return 0 ;;
     *"-- :(top,literal)"*) gen "$((SC_LINES / SC_FILES))" "$SC_WIDTH"; return 0 ;;
+    "diff --quiet "*) return "${SC_QUIET_RC:-0}" ;;
     "diff "*"...origin/"*) [ "${SC_GITFAIL:-0}" = "1" ] && return 1; gen "$SC_LINES" "$SC_WIDTH"; return 0 ;;
   esac
   return 0
@@ -233,9 +235,18 @@ if [ -n "$BLOCK_SRC" ]; then
     if reached && has "$OUT" "COVERAGE=full"; then ok "3c. exactly at the byte ceiling is whole"; else bad "3c. a diff of exactly $BYTE_DEF bytes was not whole: $(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')"; fi
   fi
 
-  # 3d. an unreadable diff (git fails) is the third state: unchanged, it is not parked here (that limit belongs to a separate bead)
+  # 3d. the THIRD state (gate run ga-a7k39w): files are listed but the whole-diff read came back empty (git failed). It used to fall
+  # through and hand reviewers "FULL DIFF (complete — 0 lines …)" over a blank body; a PASS on nothing then merged the branch.
   run_block 10 30 2 SC_GITFAIL=1
-  if reached && has "$OUT" "COVERAGE=unknown" && ! has "$CALLS" "set_gate_status"; then ok "3d. a failing git read is coverage=unknown and is NOT parked by this change (unchanged behaviour)"; else bad "3d. unknown coverage handled differently: $(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')"; fi
+  if ! reached && [ "$RC" = "0" ] && has "$CALLS" "set_gate_status|m-1 error" && has "$CALLS" "gate_apply_needs_human|bead-city bead-1 gate:needs-human:technical"; then ok "3d. files listed but the diff read fails (coverage=unknown): parked at error + needs-human, no reviewer"; else bad "3d. an unreadable diff fell through to the reviewers (rc=$RC): $(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')"; fi
+  if has "$CALLS" "could not be read" && ! has "$CALLS" "too large" && ! has "$CALLS" "split the work" && has "$QGLINE" "dispatcher_park_diff_unreadable"; then ok "3d. it says 'could not be read' (nothing is large: no split advice, own event name)"; else bad "3d. wording/event wrong: $(printf '%s' "$CALLS" | head -2 | tr '\n' ' ') | $QGLINE"; fi
+  # 3d2. nothing listed: a branch git CONFIRMS empty still proceeds (rc 0); anything else (a diff git can see, or a git that failed) parks.
+  run_block 0 30 0
+  if reached && has "$OUT" "COVERAGE=unknown" && ! has "$CALLS" "set_gate_status"; then ok "3d2. nothing listed and git confirms 'no difference' (diff --quiet rc 0): falls through, unchanged"; else bad "3d2. a provably empty branch was parked: $(printf '%s' "$CALLS" | head -2 | tr '\n' ' ')"; fi
+  for _QRC in 1 128; do
+    run_block 0 30 0 SC_QUIET_RC=$_QRC
+    if ! reached && has "$CALLS" "set_gate_status|m-1 error"; then ok "3d2. nothing listed but git does not say 'no difference' (diff --quiet rc $_QRC): parked"; else bad "3d2. empty list + diff --quiet rc $_QRC fell through"; fi
+  done
 
   # 3e. a needs-human write that did not verify still parks, and says so
   run_block "$((LINE_DEF + 1))" 30 3 SC_NH_STATUS=failed
@@ -247,16 +258,18 @@ if [ -n "$BLOCK_SRC" ]; then
   run_block "$((LINE_DEF + 1))" 30 3 SC_BEAD_ID=
   if ! reached && [ "$RC" = "0" ] && has "$CALLS" "set_gate_status|m-1 error" && ! has "$CALLS" "gate_apply_needs_human"; then ok "3f. no source bead id: marker still parked, no bead write attempted"; else bad "3f. no-bead case wrong (rc=$RC): $(printf '%s' "$CALLS" | head -3 | tr '\n' ' ')"; fi
 
-  # 3g. MUTATION: without the park condition the harness must see the over-ceiling diff fall through
-  sed 's/= "partial" \]/= "never-partial" ]/' "$TMP/block.sh" > "$TMP/block.mut.sh"
-  if cmp -s "$TMP/block.sh" "$TMP/block.mut.sh"; then
-    bad "3g. mutation did not apply (the park condition no longer reads = \"partial\" ]) — the harness cannot prove it detects a missing park"
-  else
-    cp "$TMP/block.sh" "$TMP/block.orig.sh"; cp "$TMP/block.mut.sh" "$TMP/block.sh"
-    run_block "$((LINE_DEF + 1))" 30 3
-    if reached; then ok "3g. mutation check: with the park condition removed the over-ceiling diff FALLS THROUGH — the 3b assertions are not vacuous"; else bad "3g. mutated block still parked — the harness cannot tell a park from no park"; fi
-    cp "$TMP/block.orig.sh" "$TMP/block.sh"
-  fi
+  # 3g. MUTATION: remove each park cause in turn; the harness must then see that diff FALL THROUGH (3b / 3d are not vacuous)
+  cp "$TMP/block.sh" "$TMP/block.orig.sh"
+  mutate_and_run() { # <what> <sed-expr> <run_block args...>
+    local what="$1" expr="$2"; shift 2
+    sed "$expr" "$TMP/block.orig.sh" > "$TMP/block.sh"
+    if cmp -s "$TMP/block.sh" "$TMP/block.orig.sh"; then bad "3g. the $what mutation did not apply — the harness cannot prove it detects a missing park"; return; fi
+    run_block "$@"
+    if reached; then ok "3g. mutation check: without the $what park the diff FALLS THROUGH — the assertions above are not vacuous"; else bad "3g. the block with the $what park removed still parked"; fi
+  }
+  mutate_and_run "too-large" 's/partial) _DP_KIND="too-large"/partial) _DP_KIND=""/' "$((LINE_DEF + 1))" 30 3
+  mutate_and_run "unreadable" 's/_DP_KIND="unreadable"/_DP_KIND=""/' 10 30 2 SC_GITFAIL=1
+  cp "$TMP/block.orig.sh" "$TMP/block.sh"
 fi
 
 # ── 4. wiring in the real file ───────────────────────────────────────────────────────────────────────────

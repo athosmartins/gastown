@@ -1,37 +1,22 @@
 #!/usr/bin/env bash
 # gate-e6b-union-content-verdict.selftest.sh (ga-5w2gpw item b, 2026-09-30)
 #
-# CLASS: the merge-time content guard (ga-m07gc) refuses to push when the tree the
-# rebase/merge produced differs from the reference 3-way merge (`merge-tree --write-tree`).
-# For a path declared `merge=union` that comparison is the WRONG question: union keeps
-# BOTH sides' lines and is not associative — a rebase replays the branch commit by commit,
-# so each intermediate step unions differently from one union of the two end states. The
-# two trees then differ by ORDER, by a residue line an intermediate commit added and a
-# later one edited away, or by a duplicated block one side keeps and the other collapses —
-# with no line lost on either side. whatsapp_automation declares exactly that for
-# docs/data_dictionary.md (the append-only atlas every crew edits), and the gate refused
-# 3 pushes on 30/09 alone ("content verdict=no … Diverging paths: docs/data_dictionary.md"),
-# each one failing a review-approved PASS as `failed_merge_time_rebase` — the dominant
-# residue of "merge falho depois de ALL PASS" (E4 §1; ga-ub5hkz fixed the sibling
-# deploy_deps.json case).
+# CLASS: the merge-time content guard (ga-m07gc) refuses to push when the tree the rebase/merge produced differs from the reference
+# 3-way merge (`merge-tree --write-tree`). For a `merge=union` path that comparison is the WRONG question: union keeps BOTH sides'
+# lines and is not associative, so a commit-by-commit rebase and one union of the end states differ by ORDER, by a residue line, or
+# by a duplicated block — with no line lost. whatsapp_automation declares that for docs/data_dictionary.md (the append-only atlas)
+# and the gate refused 3 pushes on 30/09 alone, each failing a review-approved PASS as `failed_merge_time_rebase` (E4 §1; ga-ub5hkz
+# fixed the sibling deploy_deps.json case).
 #
-# FIX under test: when EVERY path on which the trees differ is declared merge=union (read
-# from new_tip's .gitattributes, as ga-stisew does), the verdict asks the right question —
-# was any line LOST? — by multiset arithmetic over the four blobs (merge-base, main, branch
-# tip, resulting tip): the result must still contain every line the branch added, every line
-# main added, and every line nobody touched. Anything else stays exactly as before.
+# FIX under test: when EVERY differing path is declared merge=union (from new_tip's .gitattributes, as ga-stisew does) the verdict
+# asks "was any line LOST?" by multiset arithmetic over merge-base, main, branch tip and resulting tip. Anything else stays as before.
 #
-# This file is deliberately ASYMMETRIC: the lossless divergences must read "yes", and every
-# way a union file can really lose content must still read "no" — a guard that only ever
-# says yes is not a guard. Fixtures are real git repos and real `git rebase` runs (the
-# union driver is git's own); the four lossless histories were found by brute force
-# (scratchpad search over small append/edit histories) and encoded verbatim.
-#
-# Three states, never two: a blob that cannot be read, a path that is not a regular file, a
-# blob past the size cap, or a diff that errors is `unknown:union-*` — never yes, never no.
-#
-# Strategy: the live `gate-rebase-content-verdict` block is extracted by sentinel (never a
-# copy) and run against the repos. Exit 0 iff every assertion holds. bash 3.2 compatible.
+# ASYMMETRIC on purpose: the lossless divergences must read "yes" and every way a union file can really lose content must still read
+# "no" — a guard that only ever says yes is not a guard. Fixtures are real git repos and real `git rebase` runs; the four lossless
+# histories were found by brute force and encoded verbatim. Three states, never two: a blob that cannot be read, a path that is not a
+# regular file, a blob past the size cap or a diff that errors is `unknown:union-*` — and section 6 pins which of those the gate acts
+# on as "no" (they reproduce) and which stay unknown (they may not).
+# Strategy: the live `gate-rebase-content-verdict` block is extracted by sentinel and run against the repos. bash 3.2 compatible.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,15 +41,18 @@ export GIT_AUTHOR_NAME=T GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=T GIT_COMMITTER
 
 # ── fixture helpers ──────────────────────────────────────────────────────────
 # cf <repo> "<line|line|…>" <msg> — write docs/dd.md (one line per `|`) and commit.
+# DDFILE (default docs/dd.md) names the union file; BIGPAD=N prepends N untouched filler lines of ~80 bytes (a LARGE union file).
+DDFILE="docs/dd.md"; BIGPAD=0
 cf() {
-  mkdir -p "$1/docs"
-  printf '%s' "$2" | tr '|' '\n' > "$1/docs/dd.md"; printf '\n' >> "$1/docs/dd.md"
+  mkdir -p "$(dirname "$1/$DDFILE")"
+  { if [ "$BIGPAD" -gt 0 ]; then awk -v n="$BIGPAD" 'BEGIN { for (i = 1; i <= n; i++) printf "pad-%06d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n", i }'; fi
+    printf '%s' "$2" | tr '|' '\n'; printf '\n'; } > "$1/$DDFILE"
   git -C "$1" add -A; git -C "$1" commit -qm "$3"
 }
 # mkbase <repo> — `main` with the union declaration (and a custom, NON-union driver line, like the real rig).
 mkbase() {
   mkdir -p "$1"; git -C "$1" init -q -b main
-  printf 'docs/dd.md merge=union\ndaemons/deps.json merge=deploydeps\n' > "$1/.gitattributes"
+  printf '%s merge=union\ndaemons/deps.json merge=deploydeps\n' "$DDFILE" > "$1/.gitattributes"
   echo base-other > "$1/other.txt"
   cf "$1" "H|t1|t2|t3|t4" base
 }
@@ -79,7 +67,7 @@ verdict() { # verdict <repo> <new_tip>   (MAIN/FEAT globals)
 }
 # ref_tree <repo> — the reference tree exactly as the gate computes it (filtered attributes, shared git-dir).
 ref_tree() {
-  local a="$TMP/attrs.$$"; printf 'docs/dd.md merge=union\n' > "$a"
+  local a="$TMP/attrs.$$"; printf '%s merge=union\n' "$DDFILE" > "$a"
   git --git-dir="$(git -C "$1" rev-parse --absolute-git-dir)" -c core.attributesFile="$a" merge-tree --write-tree "$MAIN" "$FEAT" 2>/dev/null | head -1
 }
 # ── 1. the four LOSSLESS divergences (found by brute force, encoded verbatim) ──
@@ -131,7 +119,7 @@ echo "── 2. real losses in a union file still read no ──"
 loss() { # loss <label> <name> <mutate-cmd using \$F (the file) and \$R>
   build_hist "$2" "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
   [ -n "$NEW" ] || { bad "$1: fixture did not rebase"; return; }
-  local R="$SC_REPO" F="$SC_REPO/docs/dd.md"
+  local R="$SC_REPO" F="$SC_REPO/$DDFILE"
   git -C "$R" checkout -q --detach "$NEW"
   local before; before="$(git -C "$R" rev-parse "HEAD^{tree}")"
   eval "$3"
@@ -190,8 +178,12 @@ build_hist unread "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|
 git -C "$SC_REPO" checkout -q --detach "$NEW"
 rm -f "$SC_REPO/docs/dd.md"; ln -s ../other.txt "$SC_REPO/docs/dd.md"
 git -C "$SC_REPO" add -A; git -C "$SC_REPO" commit -q --amend --no-edit
-eq "a SYMLINK where the union file was → unknown:union-not-regular-file (never yes, never no)" \
-   "$(verdict "$SC_REPO" "$(git -C "$SC_REPO" rev-parse HEAD)")" "unknown:union-not-regular-file"
+SYM_TIP="$(git -C "$SC_REPO" rev-parse HEAD)"; SYM_GD="$(git -C "$SC_REPO" rev-parse --absolute-git-dir)"
+eq "a SYMLINK where the union file was: the union function cannot tell (unknown:union-not-regular-file, never yes)" \
+   "$( . "$TMP/block.sh"; rebase_union_paths_verdict "$SYM_GD" "$MAIN" "$FEAT" "$SYM_TIP" "$(ref_tree "$SC_REPO")" "$(git -C "$SC_REPO" rev-parse "${SYM_TIP}^{tree}")" 2>&1 )" "unknown:union-not-regular-file"
+# ...but the VERDICT the gate acts on is no: it reproduces on every rebase, so it must reach a human, not the retry machinery
+eq "...and rebase_content_verdict answers no (deterministic; anything but no feeds the bounded-retry loop of ga-10uqmi)" \
+   "$(verdict "$SC_REPO" "$SYM_TIP")" "no"
 
 build_hist hidden "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
 git -C "$SC_REPO" checkout -q --detach "$NEW"
@@ -207,6 +199,57 @@ if [ -f "$OBJ" ]; then
 else
   bad "fixture: the amended blob is not a loose object at $OBJ — cannot simulate an unreadable blob"
 fi
+
+
+# ── 6. gate attempt 1, blocking issue 2: deterministic causes are a NO, not a retry ──────────────────────
+# Every caller of rebase_content_verdict routes ONLY a literal "no" to an immediate needs-rebase; anything else becomes
+# CONFLICT_KIND=transient and goes through the bounded-retry / exile machinery ga-10uqmi documents as a measured resonance loop
+# that "never converged and never reached a human". A cause that reproduces on every rebase (the file is past the size cap, is
+# not a regular file, has a path git cannot hand to check-attr, has no merge-base) is not a hiccup: before this fix a mismatch on
+# such a file was "no" (it reached a human) and after the cap it would have become an endless retry.
+echo "── 6. deterministic union causes answer no at the VERDICT level; only transient ones stay unknown ──"
+build_hist map "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+MAPR="$SC_REPO"; MAPNEW="$NEW"
+map_verdict() { # map_verdict <what the union function answers>  -> what rebase_content_verdict tells the gate
+  ( . "$TMP/block.sh"; STUB="$1"; rebase_union_paths_verdict() { echo "$STUB"; }; rebase_content_verdict "$MAPR" "$MAIN" "$FEAT" "$MAPNEW" 2>/dev/null )
+}
+for c in too-large not-regular-file quoted-path no-merge-base; do
+  eq "union says unknown:union-$c (deterministic) → the verdict is no" "$(map_verdict "unknown:union-$c")" "no"
+done
+for c in unreadable awk-failed no-tmp attr-error diff-error; do
+  eq "union says unknown:union-$c (transient) → stays unknown:union-$c" "$(map_verdict "unknown:union-$c")" "unknown:union-$c"
+done
+eq "a NEW unknown:union-* nobody decided defaults to unknown (never no, never yes)" "$(map_verdict "unknown:union-something-new")" "unknown:union-something-new"
+
+# the cap: the real whatsapp_automation docs/data_dictionary.md is 1.93 MB and growing ~70 KB at a time — a 2 MB cap was 96.5% used
+BIGPAD=40000 lossless "S5 a 3.2 MB union file" s5 "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+BIG_BYTES="$(wc -c < "$SC_REPO/$DDFILE" | tr -d ' ')"
+[ "$BIG_BYTES" -gt 3000000 ] && ok "fixture: the union file is $BIG_BYTES bytes (past the old 2,000,000 cap)" || bad "fixture: the union file is only $BIG_BYTES bytes"
+BIG_NEW="$NEW"
+GATE_UNION_VERDICT_MAX_BYTES=100000 verdict "$SC_REPO" "$BIG_NEW" > "$TMP/big-small-cap.out"
+eq "the same file with the cap forced under its size → no (deterministic), not a retry-loop unknown" "$(cat "$TMP/big-small-cap.out")" "no"
+
+# paths git quotes in its output: non-ASCII names are printed RAW (core.quotePath=false) and are judged like any other path
+DDFILE='docs/relatório.md' lossless "S6 a non-ASCII union filename" s6 "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+build_hist nonascii "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+git -C "$SC_REPO" checkout -q --detach "$NEW"
+echo "branch-only" > "$SC_REPO/docs/relatório-extra.md"; git -C "$SC_REPO" add -A; git -C "$SC_REPO" commit -q --amend --no-edit
+eq "L8 a non-ASCII NON-union path also differs → no (was unknown:union-quoted-path, a retry loop for a deterministic mismatch)" \
+   "$(verdict "$SC_REPO" "$(git -C "$SC_REPO" rev-parse HEAD)")" "no"
+# a name with a double quote is still C-quoted by git whatever quotePath says. It is NOT a union path, so it is not this function's
+# question (not-applicable, checked BEFORE the quoting matters) and the verdict the gate acts on stays no
+build_hist quoted "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+git -C "$SC_REPO" checkout -q --detach "$NEW"
+echo "x" > "$SC_REPO/docs/we\"ird.md"; git -C "$SC_REPO" add -A; git -C "$SC_REPO" commit -q --amend --no-edit
+Q_TIP="$(git -C "$SC_REPO" rev-parse HEAD)"; Q_GD="$(git -C "$SC_REPO" rev-parse --absolute-git-dir)"
+eq "a NON-union filename containing a double quote: not this function's question (not-applicable, not a third state)" \
+   "$( . "$TMP/block.sh"; rebase_union_paths_verdict "$Q_GD" "$MAIN" "$FEAT" "$Q_TIP" "$(ref_tree "$SC_REPO")" "$(git -C "$SC_REPO" rev-parse "${Q_TIP}^{tree}")" 2>&1 )" "not-applicable"
+eq "...and the verdict the gate acts on is no" "$(verdict "$SC_REPO" "$Q_TIP")" "no"
+# the quoting branch itself stays reachable when a catch-all declares EVERY path union: a C-quoted name cannot be looked up as a blob
+echo '* merge=union' >> "$SC_REPO/.gitattributes"; git -C "$SC_REPO" add -A; git -C "$SC_REPO" commit -q --amend --no-edit
+Q_TIP="$(git -C "$SC_REPO" rev-parse HEAD)"
+eq "a quoted name that IS declared union → unknown:union-quoted-path (the caller maps it to no)" \
+   "$( . "$TMP/block.sh"; rebase_union_paths_verdict "$Q_GD" "$MAIN" "$FEAT" "$Q_TIP" "$(ref_tree "$SC_REPO")" "$(git -C "$SC_REPO" rev-parse "${Q_TIP}^{tree}")" 2>&1 )" "unknown:union-quoted-path"
 
 # ── 5. wiring: the existing behaviour is untouched where union does not apply ──
 echo "── 5. wiring ──"
