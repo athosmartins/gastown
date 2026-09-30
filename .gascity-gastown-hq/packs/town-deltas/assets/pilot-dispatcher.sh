@@ -8,7 +8,7 @@
 #   already in-flight/done/assigned. The pool is ordered strictly by:
 #       priority (0-4 asc; missing = 99 = last)
 #         > type rank (bug → tech-debt → task → chore → feature/story)
-#           > created_at (oldest first)
+#           > created_at (NEWEST first — Athos priority 2026-06-24)
 #             > id (final deterministic tiebreak).
 #   So a P0 story is dispatched BEFORE a P3 bug (reversal of the old hard
 #   bugs-before-stories tiering), and within the same priority a bug still beats
@@ -8972,7 +8972,7 @@ log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
 
 # ── Step 3: Split candidates by lane, pick one per available lane ─────────────
 # For each candidate classify its lane. Build two sorted candidate lists.
-# Pick highest priority (P0>P1>P2..., tie-break oldest) from each.
+# Pick highest priority (P0>P1>P2..., then type rank, then NEWEST created_at) from each.
 # Only dispatch into a lane if it has a free slot.
 
 # _split_candidates_by_lane <json>: classify each candidate into SMALL/BIG
@@ -9002,7 +9002,7 @@ log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 # wa-tm2a: ordering key shared by _top_candidate and _queue_preview.
 # Sort strictly by:  priority (0-4 asc; missing = 99 = last)
 #                      > type rank (bug → tech-debt → task → chore → feature/story)
-#                        > created_at (oldest first)
+#                        > created_at (NEWEST first — Athos priority 2026-06-24)
 #                          > id (final deterministic tiebreak).
 # Type rank derives from the bead's OWN type — issue_type (or legacy .type),
 # overridden to "tech-debt" when the tech-debt LABEL is present (tech-debt beads
