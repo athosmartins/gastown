@@ -307,6 +307,7 @@ gate_e5_admit_decision() {
 # either step leaves at most one thing to clean up, and a bead that Phase C would wait on
 # never exists without a session behind it.
 GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
+GATE_E5_EXTRA_WINDOW_SECS=""   # set by the first-fail hook just before it spawns; logged on e5_extra_spawn
 GATE_E5_DECLINE_REASON=""
 gate_e5_decline() {
   GATE_E5_DECLINE_REASON="$1"
@@ -408,7 +409,7 @@ Best-effort by design: if this reviewer does not deliver, the run is decided by 
   log "  E5: extra reviewer spawned for gate-run $_run (trigger=$_e5_trig): session=$_sid verdict_bead=$_vb2 (extra review #$_n today; assign_verified=$_vassign)"
   gate_e5_log_event e5_extra_spawn gate_run "$_run" bead "${BEAD_ID:-}" trigger "$_e5_trig" \
     extra_vb "$_vb2" session_id "$_sid" session_name "${_sname:-}" session_key "${_skey:-}" \
-    extras_today "$_n" est_cost_usd "$GATE_E5_EST_COST_USD"
+    extras_today "$_n" est_cost_usd "$GATE_E5_EST_COST_USD" window_secs "${GATE_E5_EXTRA_WINDOW_SECS:-}"
   return 0
 }
 
@@ -527,6 +528,45 @@ gate_e5_read_task() {
       | first // ""' 2>/dev/null || true
 }
 
+# ── the extra reviewer's OWN window ───────────────────────────────────────────
+# Phase C's clock belongs to the run: PC_TIMEOUT_SECS counted from the run's start. A first-fail extra is born when reviewer 1's FAIL
+# arrives — median 13.8 min into a run whose timeout is 22 min + files + lines/100 — so on the shared clock it often had minutes left,
+# was paid for, held the builder's FAIL back, and was then retired undelivered (the gate attempt 2 reviewer's simulation over the 1890
+# single-reviewer judged-FAIL runs in quality-gate.jsonl: an extra delivered before the shared clock retired it ~22% of the time at a
+# 22 min timeout, ~60% at 29 min, ~98% only at the 50 min cap — a simulation, not a run of this code). So the extra gets the run's review
+# timeout counted from ITS OWN birth, and the run's deadline (PC_TIMEOUT_SECS) moves to it once reviewer 1 has delivered.
+# Two limits keep that honest:
+#  - the CEILING: the guard aborts any gate-run older than GATE_RUN_TTL_MINUTES=90 (quality-gate-guard.sh), so the extra's window is
+#    capped so the run ends 10 min before that — 4800s. The size-scaled run timeout tops out at 50 min, so a first FAIL at the very end
+#    still leaves 30 min; the cap bites only for a run whose timeout is longer — the heavy-selftest floor (ga-4158gs) ignores the 50 min
+#    cap and goes up to 120 — and for those the floor below may decline the extra.
+#  - the FLOOR: a window shorter than GATE_E5_MIN_WINDOW_SECS (default 900s, a bit over a median review) is not started at all —
+#    declined, with a named reason, before any money is spent.
+# Every number here is read as a number or not at all: a garbage ceiling / floor / timeout is UNKNOWN, and an unknown window starts no
+# extra and grants no extension (inert, exactly as arm A).
+gate_e5_run_ceiling_secs() {
+  local _c="${GATE_E5_RUN_CEILING_SECS-4800}"
+  case "$_c" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$_c"
+}
+gate_e5_min_window_secs() {
+  local _m="${GATE_E5_MIN_WINDOW_SECS-900}"
+  case "$_m" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$_m"
+}
+# gate_e5_extra_window_secs <offset> — seconds an extra born <offset> seconds into the run may take: min(run timeout, ceiling - offset).
+# Prints nothing when it cannot be told (non-numeric input / ceiling). May print 0 or a negative number: the ceiling is already spent.
+gate_e5_extra_window_secs() {
+  local _off="$1" _t="${PC_TIMEOUT_SECS:-}" _c _w
+  case "$_off" in ''|*[!0-9]*) return 0 ;; esac
+  case "$_t" in ''|*[!0-9]*) return 0 ;; esac
+  _c=$(gate_e5_run_ceiling_secs)
+  [ -n "$_c" ] || return 0
+  _w=$((_c - _off))
+  [ "$_w" -lt "$_t" ] || _w="$_t"
+  printf '%s' "$_w"
+}
+
 # gate_e5_phase_c_hook — runs in Phase C after gate_collect_verdicts and the PC_* time math,
 # before the decision block. Two jobs, in this order:
 #   1. retire an extra reviewer that can no longer help (timeout / dead session / run timed
@@ -558,14 +598,21 @@ gate_e5_phase_c_hook() {
 
   if [ -n "$_extra_vb" ]; then
     # ── job 1: is the extra slot still worth waiting for? ──
-    local _closed=0
+    local _closed=0 _unreadable=0
     case "$(gate_e5_bead_status "$_extra_vb")" in
       closed)
         # Closed WITH a verdict: delivered, the collect counted it — nothing to do. Closed
         # WITHOUT one (the collect flagged it undelivered): it can never deliver, retire it
-        # so the run is decided on the reviewers that did.
-        [ "${GATE_E5_EXTRA_UNDELIVERED:-0}" = "1" ] || return 0
-        _closed=1 ;;
+        # so the run is decided on the reviewers that did. Closed but its comments could not
+        # be READ (the collect flagged it unreadable): unknown — it may hold a real FAIL, and
+        # retiring is final, so it is kept this sweep (no session-closed shortcut: a finished
+        # extra's session is closed by design) and only its own clock retires it, below.
+        if [ "${GATE_E5_EXTRA_UNREADABLE:-0}" = "1" ]; then
+          _unreadable=1
+        else
+          [ "${GATE_E5_EXTRA_UNDELIVERED:-0}" = "1" ] || return 0
+          _closed=1
+        fi ;;
       open|in_progress|blocked|hooked|pinned) : ;;
       *) return 0 ;;                            # unreadable: leave it; nothing is decided on a guess
     esac
@@ -577,17 +624,33 @@ gate_e5_phase_c_hook() {
     for _i in "${!VERDICT_BEAD_IDS[@]}"; do
       [ "${VERDICT_BEAD_IDS[$_i]}" = "$_extra_vb" ] && _extra_sid="${SESSION_IDS[$_i]:-}"
     done
+    # The extra's own clock (see "the extra reviewer's OWN window" above): its age, when it was born (offset into the run) and the
+    # window it was granted. Any of the three unreadable leaves _window empty = "cannot tell" — no own deadline, no extension.
+    local _age="" _offset="" _window="" _run_past=0 _others_done=0
+    case "$_created_epoch" in ''|*[!0-9]*) : ;; *) _age=$((_now - _created_epoch)); [ "$_age" -ge 0 ] || _age=0 ;; esac
+    case "${PC_ELAPSED:-}" in ''|*[!0-9]*) : ;; *)
+      [ -n "$_age" ] && { _offset=$((PC_ELAPSED - _age)); [ "$_offset" -ge 0 ] || _offset=0; _window=$(gate_e5_extra_window_secs "$_offset"); } ;;
+    esac
+    [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null && _run_past=1
+    # "Everyone else has delivered": the required count includes the extra, which is pending — so one short of it.
+    case "${VERDICTS_RECEIVED:-}${REQUIRED_REVIEWERS:-}" in ''|*[!0-9]*) : ;; *)
+      [ $((VERDICTS_RECEIVED + 1)) -eq "$REQUIRED_REVIEWERS" ] && _others_done=1 ;;
+    esac
     if [ "$_closed" = "1" ]; then
       _why="extra-closed-without-verdict"
-    elif [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null; then
+    elif [ -n "$_window" ] && [ "$_age" -gt "$_window" ]; then
+      _why="extra-timeout"            # its OWN window is spent (before, this could never fire: the shared clock always tripped first)
+    elif [ "$_run_past" = "1" ] && { [ "$_others_done" != "1" ] || [ -z "$_window" ]; }; then
+      # The shared clock has run out AND either a required reviewer has not delivered (the run is about to time out on it) or the
+      # extra's window cannot be measured (a window that cannot be told cannot be granted).
       _why="run-timeout"
-    else
-      case "$_created_epoch" in
-        ''|*[!0-9]*) warn "  E5: the extra reviewer's age is unreadable (created_at='${_extra_created:-<none>}') — not retiring it on age (the run timeout and a confirmed-closed session still apply)." ;;
-        *) if [ $((_now - _created_epoch)) -gt "${PC_TIMEOUT_SECS:-0}" ]; then _why="extra-timeout"; fi ;;
-      esac
+    elif [ -z "$_age" ]; then
+      warn "  E5: the extra reviewer's age is unreadable (created_at='${_extra_created:-<none>}') — not retiring it on age (the run timeout and a confirmed-closed session still apply)."
     fi
-    if [ -z "$_why" ] && [ -n "$_extra_sid" ] && [ "$_extra_sid" != "__UNKNOWN__" ]; then
+    # Whatever clock ended the wait for an extra whose comments could not be read, the reason says so: the apuração can then count
+    # "retired unread" apart from "retired having delivered nothing" (the same event, two different facts).
+    if [ "$_unreadable" = "1" ] && [ -n "$_why" ]; then _why="extra-comments-unreadable"; fi
+    if [ -z "$_why" ] && [ "$_unreadable" != "1" ] && [ -n "$_extra_sid" ] && [ "$_extra_sid" != "__UNKNOWN__" ]; then
       _sess_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
       if [ -n "$_sess_json" ] && [ "$(reviewer_session_confirmed_closed "$_extra_sid" "$_sess_json")" = "1" ]; then
         _why="extra-session-closed"
@@ -599,6 +662,18 @@ gate_e5_phase_c_hook() {
       gate_e5_log_event e5_extra_abandoned gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" extra_vb "$_extra_vb" reason "$_why"
       gate_e5_drop_slot "$_extra_vb"
       gate_collect_verdicts
+    elif [ "$_others_done" = "1" ] && [ -n "$_window" ]; then
+      # Kept, and reviewer 1 has already delivered: what the run is now waiting for is this extra, so the run's deadline is the
+      # extra's — born at _offset, it may take _window, and never past the ceiling. The decision block below (and the "still in
+      # flight" line) read PC_TIMEOUT_SECS; raised, never lowered, recomputed from the extra's birth on every sweep (no state kept).
+      local _deadline=$((_offset + _window))
+      case "${PC_TIMEOUT_SECS:-}" in ''|*[!0-9]*) : ;; *)
+        if [ "$_deadline" -gt "$PC_TIMEOUT_SECS" ]; then
+          PC_TIMEOUT_SECS="$_deadline"
+          PC_TIMEOUT_MIN=$(( (_deadline + 59) / 60 ))
+          log "  E5: gate-run ${GATE_RUN_ID:-?} waits for its extra reviewer inside the extra's own window — run deadline moved to ${PC_TIMEOUT_SECS}s (extra born at ${_offset}s, window ${_window}s, age ${_age}s)."
+        fi ;;
+      esac
     fi
     return 0
   fi
@@ -637,9 +712,20 @@ gate_e5_phase_c_hook() {
   if [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null; then
     gate_e5_decline "run-already-timed-out"; return 0
   fi
-  local _task1
+  # No paid extra without a real window to finish in (see "the extra reviewer's OWN window"): measured from now, capped by the ceiling.
+  local _win _minwin _task1
+  _win=$(gate_e5_extra_window_secs "${PC_ELAPSED:-}")
+  _minwin=$(gate_e5_min_window_secs)
+  if [ -z "$_win" ] || [ -z "$_minwin" ]; then gate_e5_decline "run-window-unreadable"; return 0; fi
+  if [ "$_win" -lt "$_minwin" ]; then gate_e5_decline "too-little-time-left"; return 0; fi
+  GATE_E5_EXTRA_WINDOW_SECS="$_win"
   _task1=$(gate_e5_read_task "${VERDICT_BEAD_IDS[0]}")
-  if gate_e5_spawn_extra "${GATE_RUN_ID:-}" "${VERDICT_BEAD_IDS[0]}" "$_task1" "$_e5_trig"; then
+  local _spawned=0
+  gate_e5_spawn_extra "${GATE_RUN_ID:-}" "${VERDICT_BEAD_IDS[0]}" "$_task1" "$_e5_trig" && _spawned=1
+  # The window was granted to THIS spawn only: cleared on every way out of the call, so a later spawn in the same dispatcher process
+  # (the big-diff one, which has no window of its own) never logs this run's number as its own.
+  GATE_E5_EXTRA_WINDOW_SECS=""
+  if [ "$_spawned" = "1" ]; then
     VERDICT_BEAD_IDS+=("$GATE_E5_EXTRA_VB")
     SESSION_IDS+=("$GATE_E5_EXTRA_SNAME")
     REQUIRED_REVIEWERS=$((REQUIRED_REVIEWERS + 1))

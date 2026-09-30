@@ -430,7 +430,29 @@ case "$C" in *"comment ga-newvb1 QUALITY GATE REVIEW — You are reviewer 2 of 2
 case "$C" in *"nudge ga-wisp-new1"*) ok "task queued to the new session" ;; *) bad "task not delivered" ;; esac
 case "$C" in *"session pin ga-wisp-new1"*) ok "extra reviewer pinned (drain-exempt like reviewer 1)" ;; *) bad "extra reviewer not pinned" ;; esac
 check "spend counted (1 extra review today)" 1 "$(cat "$TMP"/city/.gc/gate-e5-spend-*.count 2>/dev/null | head -1)"
+check "event e5_extra_spawn records the window the extra was granted (run timeout 1800s, capped by the 4800s ceiling at t=300s)" 1800 "$(jq -r 'select(.event=="e5_extra_spawn") | .window_secs' "$TMP/city/.gc/quality-gate.jsonl")"
+F="$(new_fix spawn-late)"; show_bead "$F" "$ARM_B_ID" '["story:in-flight"]'
+OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+PC_ELAPSED=1700
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+check "a first FAIL at t=1700s of a 1800s run still gets an extra (its window is its own, not the 100s left)" "REQ=2 N=2" "$OUT"
+check "...and the event records the full 1800s window" 1800 "$(jq -r 'select(.event=="e5_extra_spawn") | .window_secs' "$TMP/city/.gc/quality-gate.jsonl")"
 check "event e5_extra_spawn logged with the session key (for cost)" "ga-run001|first-fail|ga-newvb1|key-new1" "$(jq -r 'select(.event=="e5_extra_spawn") | [.gate_run,.trigger,.extra_vb,.session_key] | join("|")' "$TMP/city/.gc/quality-gate.jsonl")"
+# The window belongs to the ONE spawn the hook granted it to. A big-diff extra has no window of its own (it is born with reviewer 1, on
+# the run's clock); one spawned later in the same dispatcher process must log an EMPTY window_secs, not the first-fail run's 1800.
+F="$(new_fix spawn-stale-window)"; show_bead "$F" "$ARM_B_ID" '["story:in-flight"]'
+scn "$F" GATE_E5_ENABLED=1 -- <<EOF >/dev/null
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+gate_e5_phase_c_hook
+gate_e5_spawn_extra ga-run002 ga-vb0001 "\$(gate_e5_read_task ga-vb0001)" big-diff
+EOF
+check "a big-diff spawn after a first-fail spawn in the same process does not inherit that run's window_secs" "1800|" "$(jq -r 'select(.event=="e5_extra_spawn") | .window_secs' "$TMP/city/.gc/quality-gate.jsonl" | paste -sd'|' -)"
 
 decline_case() { # decline_case <label> <expected-reason> <fixture-mutator-cmd> <env> <hook-prelude-override>
   local label="$1" reason="$2" mut="$3" envs="$4" pre="$5"
@@ -459,6 +481,12 @@ decline_case "a no-verdict run (dead reviewer)" "" "" GATE_E5_ENABLED=1 "GATE_FA
 decline_case "reviewer 1 PASSED" "" "" GATE_E5_ENABLED=1 "ANY_FAIL=0; GATE_COLLECT_JUDGED_FAILS=0"
 decline_case "reviewer 1 has not delivered yet" "" "" GATE_E5_ENABLED=1 "VERDICTS_RECEIVED=0"
 decline_case "run already past its timeout" "run-already-timed-out" "" GATE_E5_ENABLED=1 "PC_ELAPSED=4000"
+# gate attempt 2, blocking issue 1: an extra is only worth paying for if it can finish. It gets its own window (the run timeout, counted
+# from its birth) capped by the run ceiling (the guard aborts a run at 90 min) — below the minimum review window it is not started at all,
+# with a NAMED reason, instead of being paid for and then retired undelivered by the shared run clock.
+decline_case "too little run budget left for a review (ceiling 2000s, run at 1500s -> 500s window)" "too-little-time-left" "" "GATE_E5_ENABLED=1 GATE_E5_RUN_CEILING_SECS=2000" "PC_ELAPSED=1500"
+decline_case "run ceiling unreadable (garbage): the window cannot be measured" "run-window-unreadable" "" "GATE_E5_ENABLED=1 GATE_E5_RUN_CEILING_SECS=abc" ""
+decline_case "run timeout unreadable (PC_TIMEOUT_SECS not a number)" "run-window-unreadable" "" GATE_E5_ENABLED=1 "PC_TIMEOUT_SECS=soon"
 decline_case "daily cap reached" "daily-cap-reached" "echo 50 > \"$TMP/city/.gc/gate-e5-spend-\$(date +%Y-%m-%d).count\"" GATE_E5_ENABLED=1 ""
 decline_case "daily cap unreadable" "daily-cap-unreadable" "" "GATE_E5_ENABLED=1 GATE_E5_DAILY_CAP_USD=abc" ""
 decline_case "reviewer 1's task not on its bead" "reviewer-1-task-unavailable" "echo '[]' > \"\$f/comments-ga-vb0001.json\"" GATE_E5_ENABLED=1 ""
@@ -496,41 +524,69 @@ check "verdict-bead create failed: nothing counted against the cap" "" "$(cat "$
 
 echo "  · one attempt per run, and retiring an extra that cannot help:"
 EXTRA_OPEN='[{"id":"ga-vb0001","status":"closed","created_at":"2026-09-30T17:00:00Z","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"]},{"id":"ga-newvb1","status":"open","created_at":"__CREATED__","labels":["type:quality-gate-verdict","reviewer-index:2","verdict:pending","e5-extra","e5-trigger:first-fail"]}]'
-retire_case() { # retire_case <label> <expected reason> <created_at> <pc_elapsed> <closed-session 0|1>
-  local f; f="$(new_fix "r-$1")"; show_bead "$f" "$ARM_B_ID" '[]'
+iso_ago() { python3 -c 'import datetime,sys;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+# retire_case <label> <expected reason, "" = kept> <extra age in SECONDS, "" = created_at unreadable> <pc_elapsed> <closed-session 0|1>
+#             [verdicts_received=1] [run timeout secs=1800] [expected PC_TIMEOUT_SECS after the hook = the run timeout unless given]
+# The extra's age is a number, not a timestamp, on purpose: an extra is created AFTER its run started, so age <= pc_elapsed in every
+# state production can produce. (Gate attempt 2: the old case "extra older than the run's timeout" put a 45-minute-old extra inside a
+# 5-minute-old run — a state that cannot exist — so the branch it claimed to test was never shown to fire. A fixture that cannot
+# happen is now a FAILED assertion here, not a green one.)
+retire_case() {
+  local label="$1" want="$2" age="$3" elapsed="$4" closed="$5" received="${6:-1}" tmo="${7:-1800}" want_pt="${8:-}"
+  [ -n "$want_pt" ] || want_pt="$tmo"
+  local f; f="$(new_fix "r-$label")"; show_bead "$f" "$ARM_B_ID" '[]'
+  if [ -n "$age" ] && [ "$age" -gt "$elapsed" ]; then bad "$label: IMPOSSIBLE FIXTURE — the extra is ${age}s old inside a run that is only ${elapsed}s old (an extra is created after its run starts)"; return; fi
   jq -n '[{id:"ga-newvb1",status:"open",labels:["e5-extra"]}]' > "$f/show-ga-newvb1.json"
-  [ "$5" = "1" ] && touch "$f/closed-gate-reviewer-adhoc-new1"
-  local vbj="${EXTRA_OPEN/__CREATED__/$3}"
-  local out
+  [ "$closed" = "1" ] && touch "$f/closed-gate-reviewer-adhoc-new1"
+  local created=""; [ -n "$age" ] && created="$(iso_ago "$age")"
+  local vbj="${EXTRA_OPEN/__CREATED__/$created}"
+  local out pt
   out="$(scn "$f" GATE_E5_ENABLED=1 -- <<EOF
 BEAD_ID="$ARM_B_ID"
 GATE_E5_RUN_VB_JSON='$vbj'; VB_JSON="\$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(rev-sess-1 gate-reviewer-adhoc-new1); REQUIRED_REVIEWERS=2
-VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
-PC_ELAPSED=$4; PC_TIMEOUT_SECS=1800
+VERDICTS_RECEIVED=$received; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
+PC_ELAPSED=$elapsed; PC_TIMEOUT_SECS=$tmo; PC_TIMEOUT_MIN=\$(( $tmo / 60 ))
 gate_e5_phase_c_hook
 echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]} IDS=\${VERDICT_BEAD_IDS[*]}"
+echo "PT=\$PC_TIMEOUT_SECS PM=\$PC_TIMEOUT_MIN"
 EOF
 )"
-  if [ -n "$2" ]; then
-    check "$1: extra retired, slot dropped, REQUIRED back to 1" "REQ=1 N=1 IDS=ga-vb0001" "$out"
-    check "$1: reason logged" "$2" "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
-    grep -q 'bd -C .* label add ga-newvb1 e5-extra-abandoned' "$f/calls.log" && ok "$1: verdict bead labelled e5-extra-abandoned (Phase C ignores it from now on)" || bad "$1: abandoned label not written"
-    grep -q 'bd -C .* close ga-newvb1' "$f/calls.log" && ok "$1: verdict bead closed" || bad "$1: verdict bead not closed"
-    grep -q 'session close gate-reviewer-adhoc-new1' "$f/calls.log" && ok "$1: extra session closed" || bad "$1: extra session not closed"
-    grep -q '^collect$' "$f/calls.log" && ok "$1: verdicts re-collected without the extra" || bad "$1: no re-collect after dropping the slot"
+  pt="$(printf '%s\n' "$out" | sed -n 2p)"; out="$(printf '%s\n' "$out" | sed -n 1p)"
+  if [ -n "$want" ]; then
+    check "$label: extra retired, slot dropped, REQUIRED back to 1" "REQ=1 N=1 IDS=ga-vb0001" "$out"
+    check "$label: reason logged" "$want" "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+    grep -q 'bd -C .* label add ga-newvb1 e5-extra-abandoned' "$f/calls.log" && ok "$label: verdict bead labelled e5-extra-abandoned (Phase C ignores it from now on)" || bad "$label: abandoned label not written"
+    grep -q 'bd -C .* close ga-newvb1' "$f/calls.log" && ok "$label: verdict bead closed" || bad "$label: verdict bead not closed"
+    grep -q 'session close gate-reviewer-adhoc-new1' "$f/calls.log" && ok "$label: extra session closed" || bad "$label: extra session not closed"
+    grep -q '^collect$' "$f/calls.log" && ok "$label: verdicts re-collected without the extra" || bad "$label: no re-collect after dropping the slot"
+    check "$label: a retired extra leaves the run deadline alone" "PT=$tmo" "${pt%% PM=*}"
   else
-    check "$1: extra kept, run still waiting" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$out"
-    grep -q 'e5-extra-abandoned' "$f/calls.log" && bad "$1: abandoned although it can still deliver" || ok "$1: not abandoned"
+    check "$label: extra kept, run still waiting" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$out"
+    grep -q 'e5-extra-abandoned' "$f/calls.log" && bad "$label: abandoned although it can still deliver" || ok "$label: not abandoned"
+    check "$label: the run's deadline is the extra's own (PC_TIMEOUT_SECS, and PC_TIMEOUT_MIN for the messages)" "PT=$want_pt PM=$(( (want_pt + 59) / 60 ))" "$pt"
   fi
 }
-NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; OLD_ISO="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=45)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
-retire_case "extra still young, run young, session alive" "" "$NOW_ISO" 300 0
-retire_case "run timed out" "run-timeout" "$NOW_ISO" 4000 0
-retire_case "extra older than the run's timeout" "extra-timeout" "$OLD_ISO" 300 0
-retire_case "extra session confirmed closed" "extra-session-closed" "$NOW_ISO" 300 1
-# gate attempt 1 (non-blocking): an UNREADABLE age is "could not tell", not "too old" — a possibly live extra is not retired on it
-# (the run timeout and a confirmed-closed session still retire it, as they do when the age is known).
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# the ordinary states (run timeout 1800s)
+retire_case "extra still young, run young, session alive" "" 0 300 0 1 1800 2100
+retire_case "extra session confirmed closed" "extra-session-closed" 0 300 1
+# gate attempt 2, blocking issue 1 — a FIRST-FAIL extra is born late (reviewer 1's FAIL arrives at, say, t=1000s) and must get its
+# OWN window (the run timeout, counted from its creation), not whatever is left of the shared run clock. Every state below is one a
+# real run produces: age <= elapsed, offset = elapsed - age is when reviewer 1 delivered.
+retire_case "first-fail extra born at t=1000s, run past the shared 1800s clock, extra 1500s old: still inside its own window" "" 1500 2500 0 1 1800 2800
+retire_case "first-fail extra born at t=1000s, at t=1800s (the shared clock's last second): kept, deadline is 1000+1800" "" 800 1800 0 1 1800 2800
+retire_case "first-fail extra born at t=1000s, 1850s old (own window spent), run at 2850s" "extra-timeout" 1850 2850 0
+# the shared clock still rules when reviewer 1 has NOT delivered (the big-diff extra is born with reviewer 1): only a run whose other
+# reviewers all delivered may outlive its run timeout for the extra
+retire_case "reviewer 1 still pending, run past its timeout: the run times out as it always did" "run-timeout" 1790 1810 0 0
+retire_case "reviewer 1 still pending, run young" "" 100 120 0 0
+# the run never outlives the guard's hard cap (GATE_RUN_TTL_MINUTES=90 -> E5 ceiling 4800s): a 3000s run timeout with reviewer 1's
+# FAIL at t=2900s leaves the extra min(3000, 4800-2900)=1900s, not 3000s
+retire_case "ceiling: extra born at t=2900s, run timeout 3000s, 1100s old: deadline is the 4800s ceiling, not 2900+3000" "" 1100 4000 0 1 3000 4800
+retire_case "ceiling: the same extra 1950s old (ceiling window 1900s spent)" "extra-timeout" 1950 4850 0 1 3000
+# an UNREADABLE age is "could not tell", not "too old" — a possibly live extra is not retired on it, and it cannot be granted a window
+# it cannot be measured against (the run timeout and a confirmed-closed session still retire it, as they do when the age is known)
 retire_case "extra age unreadable (no created_at), run young, session alive" "" "" 300 0
 retire_case "extra age unreadable, but the run timed out" "run-timeout" "" 4000 0
 # extra already delivered (bead closed) -> nothing to do, not retired
@@ -612,7 +668,7 @@ bd() {
   case " $* " in
     *" list "*)     cat "$FIX/list.json"; return 0 ;;
     *" show "*)     local id; id=$(printf '%s\n' "$@" | awk '/^show$/ {getline; print; exit}'); [ -f "$FIX/show-$id.json" ] && { cat "$FIX/show-$id.json"; return 0; }; return 1 ;;
-    *" comments "*) local id; id=$(printf '%s\n' "$@" | awk '/^comments$/ {getline; print; exit}'); [ -f "$FIX/comments-$id.json" ] && cat "$FIX/comments-$id.json" || echo "[]"; return 0 ;;
+    *" comments "*) local id; id=$(printf '%s\n' "$@" | awk '/^comments$/ {getline; print; exit}'); [ -f "$FIX/comments-fail-$id" ] && return 1; [ -f "$FIX/comments-$id.json" ] && cat "$FIX/comments-$id.json" || echo "[]"; return 0 ;;
     *" create "*)   echo "create $*" >> "$CALLS"; echo '{"id":"ga-newvb1"}'; return 0 ;;
     *)              echo "bd $*" >> "$CALLS"; return 0 ;;
   esac
@@ -643,7 +699,7 @@ flow_fix() { # flow_fix <name> <list-json> -> fixture dir with the verdict beads
   echo "$d"
 }
 FLOW_TAIL='
-BEAD_ID="$ARM_ID"; PC_ELAPSED=300; PC_TIMEOUT_SECS=1800
+BEAD_ID="$ARM_ID"; PC_ELAPSED="${FLOW_ELAPSED:-300}"; PC_TIMEOUT_SECS=1800; PC_TIMEOUT_MIN=30
 REQUIRED_REVIEWERS=1   # the run record says 1; the rehydrate block adds the LIVE extras on top
 DESC="$RUN_DESC"       # the gate-run bead description Phase C reads the run record from
 '"$FLOW_EXTRACT_FN"'
@@ -653,6 +709,9 @@ for _dummy in 1; do
 '"$FLOW_HOOKCALL"'
 done
 echo "REQ=$REQUIRED_REVIEWERS N=${#VERDICT_BEAD_IDS[@]} IDS=${VERDICT_BEAD_IDS[*]}"
+'
+FLOW_TAIL_PT="$FLOW_TAIL"'
+echo "PT=$PC_TIMEOUT_SECS PM=$PC_TIMEOUT_MIN"
 '
 R1_FAIL='{"id":"ga-vb0001","status":"closed","created_at":"2026-09-30T17:00:00Z","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:1","verdict:FAIL"]}'
 # (a) the reviewer's repro: reviewer 1 closed FAIL + an extra that was ABANDONED in an earlier sweep -> NO second extra
@@ -664,21 +723,51 @@ grep -q '^session-new$' "$F/calls.log" && bad "REAL chain: a SECOND extra was sp
 F="$(flow_fix firstfail "[$R1_FAIL]")"
 OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
 check "REAL chain: first judged FAIL of an arm-B bead -> one extra appended, REQUIRED 1->2" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$OUT"
-# (c) an extra in flight, young -> kept; old -> retired as extra-timeout — both through the real chain
+# (c) an extra in flight, through the real chain. Ages are real-run ages (extra age <= run elapsed): reviewer 1's FAIL arrives at
+# offset = elapsed - age and the extra was born then. young: born 300s ago in a 300s run (a big-diff extra, born with the run).
+# own-window-spent: reviewer 1 FAILed at t=400s; at t=3400s the extra is 3000s old, past its own 1800s window -> retired as extra-timeout.
 EXTRA_LIVE='{"id":"ga-newvb1","status":"open","created_at":"__CREATED__","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra","e5-trigger:first-fail"]}'
-for spec in "young:$NOW_ISO:REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "old:$OLD_ISO:REQ=1 N=1 IDS=ga-vb0001"; do
-  nm="${spec%%:*}"; rest="${spec#*:}"; created="${rest%%:REQ=*}"; want="REQ=${rest##*:REQ=}"
-  F="$(flow_fix "live-$nm" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$created}]")"
+for spec in "young:300:300:REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "own-window-spent:3000:3400:REQ=1 N=1 IDS=ga-vb0001"; do
+  nm="${spec%%:*}"; rest="${spec#*:}"; age="${rest%%:*}"; rest="${rest#*:}"; elapsed="${rest%%:*}"; want="${rest#*:}"
+  F="$(flow_fix "live-$nm" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$(iso_ago "$age")}]")"
   printf '%s' '[{"id":"ga-newvb1","status":"open","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra"],"assignee":"gate-reviewer-adhoc-new1"}]' > "$F/show-ga-newvb1.json"
-  OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
-  check "REAL chain: an in-flight extra ($nm) is $([ "$nm" = young ] && echo kept || echo 'retired as extra-timeout')" "$want" "$OUT"
+  OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" FLOW_ELAPSED="$elapsed" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+  check "REAL chain: an in-flight extra ($nm, ${age}s old in a ${elapsed}s run) is $([ "$nm" = young ] && echo kept || echo 'retired as extra-timeout')" "$want" "$OUT"
 done
 check "REAL chain: the old extra's retirement reason is extra-timeout" extra-timeout "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | tail -1)"
+# (c2) gate attempt 2, blocking issue 1, through the REAL chain (real collect -> real hook): reviewer 1 FAILed at t=1000s, the extra
+# was born then; at t=2500s the shared 1800s run clock has run out, but the extra (1500s old) is inside its own window — it is KEPT, and
+# the deadline Phase C then compares against (PC_TIMEOUT_SECS) is the extra's: 1000+1800.
+F="$(flow_fix "live-ownwindow" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$(iso_ago 1500)}]")"
+printf '%s' '[{"id":"ga-newvb1","status":"open","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra"],"assignee":"gate-reviewer-adhoc-new1"}]' > "$F/show-ga-newvb1.json"
+OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" FLOW_ELAPSED=2500 RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL_PT")"
+check "REAL chain: a first-fail extra inside its own window survives the shared run clock, and the run's deadline moves to it" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1 PT=2800 PM=47" "$(printf '%s' "$OUT" | tr '\n' ' ' | sed 's/ $//')"
+grep -q 'e5-extra-abandoned' "$F/calls.log" && bad "REAL chain: the extra was retired although it is inside its own window" || ok "REAL chain: not retired"
 # (d) the extra's own `bd show` failing inside the collect must not blind the hook to it: the hook decides from the run list
-F="$(flow_fix "live-showfail" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$OLD_ISO}]")"   # no show-ga-newvb1.json -> every `bd show` of it fails
-OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+F="$(flow_fix "live-showfail" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$(iso_ago 3000)}]")"   # no show-ga-newvb1.json -> every `bd show` of it fails (and the extra is past its window: still nothing retired on a guess)
+OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" FLOW_ELAPSED=3400 RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
 check "REAL chain: the extra's bead unreadable this sweep -> nothing retired on a guess, nothing new spawned" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$OUT"
 grep -q '^session-new$' "$F/calls.log" && bad "REAL chain: spawned another extra while one exists but could not be read" || ok "REAL chain: no spawn while the existing extra is unreadable"
+# (d2) gate attempt 2 (non-blocking, third state), through the REAL chain (real collect -> real hook). The same extra — bead closed, session
+# closed (how a FINISHED extra looks), no verdict label — in two worlds: its comments read fine and hold no verdict ("delivered nothing":
+# retired for good, as before), or the read of its comments FAILS ("unknown": it may hold a real FAIL; retiring is final, so it is kept and
+# re-read next sweep). Error and empty must not produce the same outcome.
+EXTRA_CLOSED='{"id":"ga-newvb1","status":"closed","created_at":"__CREATED__","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","e5-extra","e5-trigger:first-fail"]}'
+for spec in "empty:REQ=1 N=1 IDS=ga-vb0001" "unreadable:REQ=2 N=2 IDS=ga-vb0001 ga-newvb1"; do
+  nm="${spec%%:*}"; want="${spec#*:}"
+  F="$(flow_fix "closed-$nm" "[$R1_FAIL,${EXTRA_CLOSED/__CREATED__/$(iso_ago 200)}]")"
+  printf '%s' '[{"id":"ga-newvb1","status":"closed","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","e5-extra"],"assignee":"gate-reviewer-adhoc-new1"}]' > "$F/show-ga-newvb1.json"
+  touch "$F/closed-gate-reviewer-adhoc-new1"
+  [ "$nm" = unreadable ] && touch "$F/comments-fail-ga-newvb1"
+  OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" FLOW_ELAPSED=300 RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+  check "REAL chain: extra closed without a verdict, comments $nm -> $([ "$nm" = empty ] && echo 'retired (delivered nothing)' || echo 'kept (unknown, re-read next sweep)')" "$want" "$OUT"
+  if [ "$nm" = unreadable ]; then
+    grep -q 'e5-extra-abandoned' "$F/calls.log" && bad "REAL chain: an extra whose comments could not be read was abandoned (a real FAIL would be erased for good)" || ok "REAL chain: the unreadable extra was not abandoned"
+    grep -q 'session close gate-reviewer-adhoc-new1' "$F/calls.log" && bad "REAL chain: the unreadable extra's session was closed" || ok "REAL chain: the unreadable extra's session left alone"
+  else
+    check "REAL chain: the empty extra's retirement reason" extra-closed-without-verdict "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | tail -1)"
+  fi
+done
 # (e) gate attempt 1, blocking issue 3, through the real chain: the arm is what ADMISSION persisted in the run record (Step 5,
 # one read of the flag), not what Phase C recomputes from the bead id under whatever the flag says now. A run admitted while
 # the flag was off has no e5_arm line; one admitted as arm A says A — neither may get an extra because the flag is on NOW and
@@ -849,7 +938,7 @@ EOF
     cat <<'EOF'
 VERDICT_BEAD_IDS=(vb1 vb2)
 gate_collect_verdicts
-printf 'VR=%s ANY=%s NOEVAL=%s JUDGED=%s UNDELIVERED=%s EXTRAV=%s\n' "$VERDICTS_RECEIVED" "$ANY_FAIL" "$GATE_FAIL_NO_EVAL" "$GATE_COLLECT_JUDGED_FAILS" "$GATE_E5_EXTRA_UNDELIVERED" "$GATE_E5_EXTRA_VERDICT"
+printf 'VR=%s ANY=%s NOEVAL=%s JUDGED=%s UNDELIVERED=%s UNREAD=%s EXTRAV=%s\n' "$VERDICTS_RECEIVED" "$ANY_FAIL" "$GATE_FAIL_NO_EVAL" "$GATE_COLLECT_JUDGED_FAILS" "$GATE_E5_EXTRA_UNDELIVERED" "$GATE_E5_EXTRA_UNREADABLE" "$GATE_E5_EXTRA_VERDICT"
 EOF
   } > "$f"
   env -i HOME="$HOME" PATH="$PATH" CITYDIR="$TMP/city" LIBFILE="$LIB" VB1="$1" VB2="$2" VB2C="$3" "$BASH32" "$f" 2>"$TMP/collect.err"
@@ -859,19 +948,22 @@ V2_NOVERDICT='{"status":"closed","labels":["type:quality-gate-verdict","reviewer
 V2_PASS='{"status":"closed","labels":["type:quality-gate-verdict","reviewer-index:2","e5-extra","verdict:PASS"],"assignee":"s2"}'
 V2_FAIL='{"status":"closed","labels":["type:quality-gate-verdict","reviewer-index:2","e5-extra","verdict:FAIL"],"assignee":"s2"}'
 OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[]')"
-check "R1 PASS + extra closed with NO verdict: run stays a PASS (extra not delivered, not counted)" "VR=1 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=1 EXTRAV=NONE" "$OUT"
+check "R1 PASS + extra closed with NO verdict: run stays a PASS (extra not delivered, not counted)" "VR=1 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=1 UNREAD=0 EXTRAV=NONE" "$OUT"
 OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" FAILREAD)"
-check "R1 PASS + extra closed, its comments UNREADABLE: still not a FAIL (an unreadable extra is 'not delivered', arm-A behaviour)" "VR=1 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=1 EXTRAV=NONE" "$OUT"
+# gate attempt 2 (non-blocking, third state): "could not read the comments" is NOT "delivered nothing". UNDELIVERED=1 makes the hook retire
+# the extra for good, which on a failed read erases a real FAIL it may have written — so the unreadable extra is its own state.
+check "R1 PASS + extra closed, its comments UNREADABLE: not a FAIL, not counted, and NOT 'undelivered' (unknown — the hook must not retire it on this)" "VR=1 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=0 UNREAD=1 EXTRAV=UNREADABLE" "$OUT"
+# (the same extra read fine on the next sweep is the label-race case two checks below: its FAIL comment counts — nothing was erased)
 OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[{"text":"VERDICT: FAIL\nBlocking issue 1: real defect in a.sh:3"}]')"
-check "R1 PASS + extra closed with a FAIL *comment* but no label (label race): the delivered FAIL counts" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 EXTRAV=NONE" "$OUT"
+check "R1 PASS + extra closed with a FAIL *comment* but no label (label race): the delivered FAIL counts" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 UNREAD=0 EXTRAV=NONE" "$OUT"
 OUT="$(collect_case2 "$V1P" "$V2_FAIL" '[{"text":"VERDICT: FAIL\nBlocking issue 1: real defect in a.sh:3"}]')"
-check "R1 PASS + extra delivered FAIL: the run FAILs (an extra can add a rejection)" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 EXTRAV=FAIL" "$OUT"
+check "R1 PASS + extra delivered FAIL: the run FAILs (an extra can add a rejection)" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 UNREAD=0 EXTRAV=FAIL" "$OUT"
 OUT="$(collect_case2 "$V1P" "$V2_PASS" '[]')"
-check "R1 PASS + extra delivered PASS: PASS" "VR=2 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=0 EXTRAV=PASS" "$OUT"
+check "R1 PASS + extra delivered PASS: PASS" "VR=2 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=0 UNREAD=0 EXTRAV=PASS" "$OUT"
 # and the plain (non-extra) path keeps today's strictness: a reviewer closed with no verdict IS a no-eval FAIL
 V2_PLAIN_NOVERDICT='{"status":"closed","labels":["type:quality-gate-verdict","reviewer-index:2"],"assignee":"s2"}'
 OUT="$(collect_case2 "$V1P" "$V2_PLAIN_NOVERDICT" '[]')"
-check "a NORMAL reviewer closed with no verdict is still a no-evaluation FAIL (pre-E5 strictness untouched)" "VR=2 ANY=1 NOEVAL=1 JUDGED=0 UNDELIVERED=0 EXTRAV=-" "$OUT"
+check "a NORMAL reviewer closed with no verdict is still a no-evaluation FAIL (pre-E5 strictness untouched)" "VR=2 ANY=1 NOEVAL=1 JUDGED=0 UNDELIVERED=0 UNREAD=0 EXTRAV=-" "$OUT"
 
 # hook: a closed extra that delivered nothing is retired
 F="$(new_fix closedundelivered)"; show_bead "$F" "$ARM_B_ID" '[]'
@@ -888,6 +980,37 @@ EOF
 )"
 check "hook: a closed-without-verdict extra is retired; the run is decided on reviewer 1" "REQ=1 IDS=ga-vb0001" "$OUT"
 check "hook: reason logged" extra-closed-without-verdict "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+
+# hook: a closed extra whose comments could not be READ is unknown, not "delivered nothing" (gate attempt 2, non-blocking, third state).
+# Retiring is final (label, close, session close), so the extra is kept — even with its session confirmed closed, which is exactly how a
+# FINISHED extra looks — and only its own clock retires it, under a reason that says it was never read.
+unread_case() { # unread_case <label> <extra age s> <pc_elapsed> <expected reason, "" = kept>
+  local label="$1" age="$2" elapsed="$3" want="$4" f out
+  f="$(new_fix "unread-$label")"; show_bead "$f" "$ARM_B_ID" '[]'
+  jq -n '[{id:"ga-newvb1",status:"closed",labels:["e5-extra"]}]' > "$f/show-ga-newvb1.json"
+  touch "$f/closed-gate-reviewer-adhoc-new1"
+  local vbj="${EXTRA_OPEN/__CREATED__/$(iso_ago "$age")}"
+  out="$(scn "$f" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+GATE_E5_RUN_VB_JSON='$vbj'; VB_JSON="\$CLOBBERED_VB_JSON"
+VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(rev-sess-1 gate-reviewer-adhoc-new1); REQUIRED_REVIEWERS=2
+VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
+PC_ELAPSED=$elapsed; PC_TIMEOUT_SECS=1800; GATE_E5_EXTRA_UNREADABLE=1
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS IDS=\${VERDICT_BEAD_IDS[*]}"
+EOF
+)"
+  if [ -n "$want" ]; then
+    check "hook, unreadable extra, $label: retired by its clock" "REQ=1 IDS=ga-vb0001" "$out"
+    check "hook, unreadable extra, $label: the reason says it was never read" "$want" "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | tail -1)"
+  else
+    check "hook, unreadable extra, $label: kept in its slot (the run keeps waiting; the next sweep re-reads it)" "REQ=2 IDS=ga-vb0001 ga-newvb1" "$out"
+    grep -q 'e5-extra-abandoned' "$f/calls.log" && bad "hook, unreadable extra, $label: abandoned on a failed read" || ok "hook, unreadable extra, $label: not abandoned"
+    grep -q 'session close gate-reviewer-adhoc-new1' "$f/calls.log" && bad "hook, unreadable extra, $label: its session was closed on a failed read" || ok "hook, unreadable extra, $label: its session left alone"
+  fi
+}
+unread_case "young, session already closed (a finished extra)" 200 300 ""
+unread_case "its own window spent (1850s old > 1800s)" 1850 2850 "extra-comments-unreadable"
 
 # ── the switch script ───────────────────────────────────────────────────────────
 echo "── 11. scripts/gate-e5-switch.sh: the Mayor's switch (cited authorization, not before the E2 window, status) ──"

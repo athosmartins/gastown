@@ -10295,7 +10295,7 @@ gate_collect_verdicts() {
   # texts are kept per reviewer so a run with an extra reviewer can be answered with the
   # deduplicated UNION of the blocking issues instead of pasted paragraphs.
   GATE_E5_FAIL_IDX=(); GATE_E5_FAIL_TXT=(); GATE_E5_UNION_STATS=""
-  GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_EXTRA_UNDELIVERED=0
+  GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_EXTRA_UNDELIVERED=0; GATE_E5_EXTRA_UNREADABLE=0
   for j in "${!VERDICT_BEAD_IDS[@]}"; do
     VB="${VERDICT_BEAD_IDS[$j]}"
     # ga-art5: `|| echo "[]"` used to mask a failed `bd show` as an empty
@@ -10443,10 +10443,11 @@ gate_collect_verdicts() {
           # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
           # PASS is the ONLY acceptable verdict; anything else blocks the merge.
           # ga-syxaki (E5): ...EXCEPT for the optional extra reviewer slot. The extra may only
-          # ADD a delivered verdict; one that closed with no judgment (or whose comments cannot
-          # be read) is "not delivered", never a FAIL — otherwise its death would turn a
-          # reviewer-1 PASS into a FAIL, which arm A would not do. ANY_FAIL is set below,
-          # explicitly, for every branch that is a real (or fail-safe) rejection.
+          # ADD a delivered verdict; one that closed with no judgment is "not delivered", and one
+          # whose comments cannot be read is "unknown" (left in its slot, re-read next sweep) —
+          # never a FAIL either way, otherwise its death would turn a reviewer-1 PASS into a
+          # FAIL, which arm A would not do. ANY_FAIL is set below, explicitly, for every branch
+          # that is a real (or fail-safe) rejection.
           [ "$_e5x" = "1" ] || ANY_FAIL=1
           # ga-w7pm55: "blocks the merge" is not the same as "the code was
           # rejected". Symmetric to the PASS rescue above: a reviewer whose
@@ -10472,9 +10473,18 @@ gate_collect_verdicts() {
             FAIL_COMMENT_UNREADABLE=1
           fi
           if [ "$_e5x" = "1" ] && [ -z "$FAIL_COMMENT" ]; then
-            VERDICTS_RECEIVED=$((VERDICTS_RECEIVED - 1))   # it was counted as "closed" above; it delivered nothing
-            GATE_E5_EXTRA_VERDICT="NONE"; GATE_E5_EXTRA_UNDELIVERED=1
-            log "  Reviewer $((j+1)) (bead $VB) is the E5 extra slot and closed with no verdict (or unreadable comments) — NOT delivered; it neither counts nor fails the run (arm-A behaviour, ga-syxaki)."
+            VERDICTS_RECEIVED=$((VERDICTS_RECEIVED - 1))   # it was counted as "closed" above; it has delivered nothing we can SEE
+            if [ "$FAIL_COMMENT_UNREADABLE" = "1" ]; then
+              # Third state, not the second (gate attempt 2, root-class:error-vs-empty): "the comments could not be read" is NOT "the
+              # extra delivered nothing". The hook retires an undelivered extra for good (label, close, session close) — done on a failed
+              # read, that erases a real "VERDICT: FAIL" the extra wrote. So this sweep it is merely not counted: the slot stays, the
+              # next sweep reads again, and only the extra's own clock (the hook) ends the wait — as "extra-comments-unreadable".
+              GATE_E5_EXTRA_VERDICT="UNREADABLE"; GATE_E5_EXTRA_UNREADABLE=1
+              warn "  Reviewer $((j+1)) (bead $VB) is the E5 extra slot, closed with no verdict label, and its comments could NOT be read (bd/jq failed) — unknown, not 'delivered nothing': not counted, not retired; re-read next sweep (ga-syxaki)."
+            else
+              GATE_E5_EXTRA_VERDICT="NONE"; GATE_E5_EXTRA_UNDELIVERED=1
+              log "  Reviewer $((j+1)) (bead $VB) is the E5 extra slot and closed with no verdict — NOT delivered; it neither counts nor fails the run (arm-A behaviour, ga-syxaki)."
+            fi
           elif [ -n "$FAIL_COMMENT" ]; then
             ANY_FAIL=1
             _judged_fails=$((_judged_fails + 1))
