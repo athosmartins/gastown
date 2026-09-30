@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """ga-26k2y1 E4 step 4 — for each FAIL->PASS pair: what did the fix ADD? ("what should have been done the first time").
 Mechanical part (no LLM): fix delta = lines in the PASS diff that were not in the FAIL diff (added by the fix) and lines of the FAIL diff that are gone from the PASS diff
-(removed/rewritten by the fix), per file, from the two stored reviewer tasks (each embeds the full diff the reviewer saw). LLM part: batches of PAIRS_PER_CALL pairs,
-fixed label set (below), grounded in the delta text it is shown. Output table pair_out(fail_comment, ...). Resumable.
+(removed/rewritten by the fix), per file, from the two stored reviewer tasks (each embeds the diff the reviewer saw — the WHOLE diff only when its header says FULL DIFF).
+The delta is therefore only meaningful when BOTH sides are full: a partial diff leaves whole files out, and the set difference would read those files as added/removed by the fix.
+Every pair is still judged, and fail_partial / pass_partial are stored (NULL = the DIFF header did not parse); the consumers (e4_final.py, e4_extras.py, e4_lint.py) analyse
+only the pairs whose two flags are both 0. LLM part: batches of PAIRS_PER_CALL pairs, fixed label set (below), grounded in the delta text it is shown.
+Output table pair_out_<tag>(fail_comment, ...). Resumable.
 
   python3 pairs_judge.py --tag main --model sonnet --effort medium --workers 2 [--limit N]
 """
 import argparse, collections, concurrent.futures as cf, json, os, re, sqlite3, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from f6_analyze import parse_task   # same parser as the latent-defect front
+from f6_analyze import parse_task, tri   # same parser as the latent-defect front; tri: absent / unparsed -> NULL, never 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAIRS_PER_CALL = 4
@@ -56,7 +59,7 @@ def delta_of(fail_task, pass_task, cap=7000):
     if len(text) > cap: text = text[:cap] + "\n[...delta clipped...]"
     return text or "(no line-level difference between the two stored diffs)", dict(delta_files=nfiles, delta_added=added_n, delta_removed=removed_n, delta_tests_only=int(test_only and nfiles > 0),
                                                                                     delta_comment_share=(comment_only_lines / total_lines) if total_lines else None,
-                                                                                    fail_lines=f["total_lines"], pass_partial=int(bool(p["partial"])), fail_partial=int(bool(f["partial"])))
+                                                                                    fail_lines=f["total_lines"], pass_partial=tri(p["partial"]), fail_partial=tri(f["partial"]))
 
 
 def call(model, effort, prompt, timeout=600):
@@ -112,7 +115,7 @@ def main():
                 o = got[p["id"]]; m = p["m"]
                 ft = [t for t in (o.get("fix_types") or []) if t in TYPES]
                 s.execute(f"INSERT OR REPLACE INTO pair_out_{a.tag} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (p["id"], p["bead"], json.dumps(ft), str(o.get("addressed_all")), int(bool(o.get("beyond_cited"))), str(o.get("first_time") or ""), str(o.get("why") or "")[:250],
+                          (p["id"], p["bead"], json.dumps(ft), str(o.get("addressed_all")), tri(o.get("beyond_cited")), str(o.get("first_time") or ""), str(o.get("why") or "")[:250],
                            m["delta_files"], m["delta_added"], m["delta_removed"], m["delta_tests_only"], m["delta_comment_share"], m["fail_lines"], m["pass_partial"], m["fail_partial"], a.model))
             s.commit(); print(f"  call {ix} ok cost=${cost:.3f} total=${total:.2f}", flush=True)
     print(f"[pairs:{a.tag}] finished total=${total:.2f}")

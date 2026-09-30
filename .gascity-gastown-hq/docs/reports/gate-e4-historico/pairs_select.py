@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""ga-26k2y1 E4 step 4 (pairs) — select FAIL -> PASS pairs: Era-B beads whose LAST reviewer FAIL is followed directly by the PASS that merged them, where both gate runs
-have a stored reviewer task (the stored task embeds the full diff the reviewer saw, so no git is needed and dangling shas do not matter).
-Writes pairs(bead_id, db, fail_run, pass_run, fail_comment, month, n_fail_before, fail_partial, pass_partial). Fetches the missing task texts (read-only Dolt) into task_full.
-Selection: all candidates if <=260, else a seeded sample stratified by month; multi-FAIL beads are over-represented on purpose (more room for 'what the fix added')."""
+"""ga-26k2y1 E4 step 4 (pairs) — select FAIL -> PASS pairs: per Era-B bead, the FIRST PASS that directly follows a reviewer FAIL (FAIL_REVIEW), taken only when both gate runs
+have a stored reviewer-task header (x_tasks). The stored task embeds the diff the reviewer saw, so no git is needed and dangling shas do not matter — but that diff is WHOLE only
+when the task header says FULL DIFF; pairs_judge.py records the partial flags (pair_out_<tag>.fail_partial / pass_partial) and the consumers drop the partial pairs.
+Writes pairs(bead_id, db, fail_run, pass_run, fail_comment, month, n_fail_before) — no partial flags here. Fetches the missing task texts (read-only Dolt) into task_full.
+Selection: every candidate if there are <=260; otherwise a seeded uniform sample per month, sized in proportion to the month's share of the candidates with a floor of 20 per
+month (a month with fewer than 20 candidates is taken whole, so the small months are over-represented and the total can pass 260). One pair per bead; n_fail_before (how many
+reviewer FAILs preceded the PASS) is recorded but plays no part in the selection."""
 import os, random, re, sqlite3, sys, time, collections
 import pymysql
 HERE = os.path.dirname(os.path.abspath(__file__))

@@ -3,8 +3,8 @@
 A  FAIL rate per run by the share of the diff the reviewer actually received, within size bands (partial diffs are the 'reviewer never saw it' mechanism)
 B  first-attempt FAIL probability per 100 diff lines by size bucket — does splitting a big change reduce total rework, or only per-bead FAIL probability?
 C  gate-process FAILs (no reviewer judged the code) by period
-E  reviewer timeouts / no verdict (FAIL_PROCESS subtype) by diff size — does the review budget cut big reviews short?
-D  reviewer structure: reviewers per run, review lens, and blocking issues per FAIL verdict by exact diff size ("did the reviewer stop at the first defect?" signal)"""
+D  reviewer structure: reviewers per run, review lens, and blocking issues per FAIL verdict by exact diff size ("did the reviewer stop at the first defect?" signal)
+E  reviewer timeouts / no verdict (FAIL_PROCESS subtype) by diff size — does the review budget cut big reviews short?"""
 import math, os, sqlite3
 import numpy as np, pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__)); CUT = "2026-09-25 16:04:00"
@@ -19,7 +19,7 @@ r["cov"] = (r.shown_lines / r.diff_lines).clip(upper=1.0)
 r["covb"] = pd.cut(r["cov"], [-0.001, 0.10, 0.50, 0.9999, 1.0], labels=["<10%", "10-49%", "50-99%", "100%"])
 r["sizeb"] = pd.cut(r.diff_lines, [0, 200, 800, 3000, 1e9], labels=["<200", "200-799", "800-2999", ">=3000"], right=False)
 r["fail"] = (r.verdict == "FAIL").astype(int); r["post"] = (r.created_at >= CUT).astype(int)
-print("== A. FAIL rate per run by share of the diff the reviewer received (all runs with a verdict, n=%d) ==" % len(r))
+print("== A. FAIL rate per run by share of the diff the reviewer received (runs with a PASS/FAIL verdict AND a parsed diff size, n=%d) ==" % len(r))
 for c, g in r.groupby("covb", observed=True): print(f"  received {c:7s}: FAIL {pct(int(g.fail.sum()), len(g))}")
 print("  ... within size >=800 diff lines (where partial diffs live):")
 big = r[r.diff_lines >= 800]

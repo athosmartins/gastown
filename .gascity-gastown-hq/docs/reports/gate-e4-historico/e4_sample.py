@@ -4,7 +4,8 @@ prefix of a partial run is still a usable sample:
   prio 0  issues filed on/after the reviewer-prompt-v2 cut (2026-09-25 16:04Z == 13:04 -03)
   prio 1  issues of beads that had >=2 reviewer FAILs (needed for recurrence and for the latent-defect front)
   prio 2  the rest, in a fixed pseudo-random order (md5 of bi_id) so a prefix is a random sample
-Also writes bi_second (the ~10% independent second-judgement sample, stratified by month x rig, seeded) and prints the composition."""
+Also writes bi_second (the ~10% independent second-judgement sample: seeded, drawn per month x rig cell at 10% with at least 1 issue; a cell with fewer than 5 issues
+contributes none, so the sample under-represents the smallest cells) and prints the composition."""
 import hashlib, os, sqlite3, random, collections
 
 HERE = os.path.dirname(os.path.abspath(__file__))

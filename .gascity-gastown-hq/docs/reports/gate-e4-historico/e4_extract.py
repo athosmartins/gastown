@@ -5,15 +5,17 @@ Sources (all read through the live Dolt sql-server; port is read from the live d
   x_comments   source-bead comments in hq / whatsapp_automation / property_scrapers / gastown, paged by DAY on created_at
                (a month-wide scan on hq blows the server's 30s read_timeout; a timed-out window is split in halves down to 1 h; a window that still fails at 1 h is
                NOT retried further: it is listed in x_meta -> errors and printed at the end, so a gap is visible, never silent)
-                 kind V = 'GATE-FEEDBACK%'          (the FAIL verdict text handed back to the builder)
+                 kind V = 'GATE-FEEDBACK%'          (CANDIDATE verdicts, captured by the bare prefix: the dispatcher's verdicts open with 'GATE-FEEDBACK (gate_run=', but a builder's
+                                                      reply or a hand-posted review can start the same way — e4_parse.py keeps only the ones that carry the run header)
                  kind P = 'Quality gate PASSED%'     (the merge record: branch, sha, gate_run)
                  kind B = 'Gate FAILED (attempt%'    (dispatcher bookkeeping, one per FAIL — NOT a verdict; it quotes "GATE-FEEDBACK above",
                                                       which is why a substring count of GATE-FEEDBACK is ~2x the number of verdicts)
                  kind X = other '%quality gate FAILED%' (measured only: a completeness check on the V prefix rule)
   x_beads      issues row + labels for every bead that appears in x_comments
   x_runs       hq gate-run beads (label type:quality-gate-run; exist only from 2026-08-18) + their header comment
-  x_tasks      reviewer-1 task header per run (Author, Rig, Branch SHA, CHANGED FILES, DIFF SUMMARY) from the verdict bead
-               (label gate-run:<id>); only the first HEAD_CHARS of the task are kept — the full diff stays in Dolt and is fetched on demand
+  x_tasks      the task header of EVERY reviewer of each run, one row per verdict bead (label gate-run:<id>; e4_parse.py and e4_runs_aug.py read reviewer_index='1'):
+               Author, Rig, Branch SHA, CHANGED FILES, DIFF SUMMARY, DIFF header. Only the first HEAD_CHARS of the task are kept — the full diff stays in Dolt and is
+               fetched on demand (f6_fetch.py, pairs_select.py)
 Usage: nice -n 10 python3 e4_extract.py [--from 2026-05-15] [--to 2026-10-01] [--out e4.db]
 """
 import argparse, datetime as dt, json, os, re, sqlite3, sys, time

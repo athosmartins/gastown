@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ga-26k2y1 E4 step 1b — parse the raw extraction (x_* tables in e4.db) into analysis tables. Pure function of e4.db; no network, no Dolt.
 
-  attempts   one row per gate OUTCOME on a source bead: every 'GATE-FEEDBACK' (FAIL) and every 'Quality gate PASSED' comment.
+  attempts   one row per gate OUTCOME on a source bead: every dispatcher verdict (a comment that OPENS with the run header 'GATE-FEEDBACK (gate_run=...') and every
+               'Quality gate PASSED' comment. A comment that merely starts with 'GATE-FEEDBACK' but has no run header (a builder's reply, a hand-posted review) is not a
+               gate outcome: it is left out and listed at the end of the run (measured: 5 of 1,891).
                outcome: PASS | FAIL_REVIEW (>=1 reviewer blocking issue) | FAIL_PROCESS (gate mechanics: merge failed after ALL-PASS,
                SHA fail-closed replay, source bead already closed, rebase, ...) | FAIL_UNSTRUCT (reviewer FAIL without parsable markers)
                attempt_no = position of the outcome among that bead's outcomes ordered by created_at (1 = first time the gate judged it)
@@ -13,8 +15,9 @@ import argparse, hashlib, json, os, re, sqlite3
 HERE = os.path.dirname(os.path.abspath(__file__))
 RIG = {"hq": "hq", "whatsapp_automation": "wa", "property_scrapers": "ps", "gastown": "gt"}
 RX_HDR = re.compile(r"GATE-FEEDBACK \(gate_run=(\S+) branch=([^)]*)\)")
+RX_VERDICT_START = re.compile(r"GATE-FEEDBACK \(gate_run=")   # what every dispatcher verdict opens with (e4_extract.py captures by the bare 'GATE-FEEDBACK' prefix only)
 # two PASS comment variants exist for the same merge: 'Quality gate PASSED. Branch X merged to Y (sha=Z) ... (gate_run=R)' and, when the dispatcher declines to close the bead,
-# 'Quality gate PASSED and branch X merged to Y (sha=Z) — but NOT closing (...)' (no gate_run). Measured 2026-09-30: 601 of 4,491 PASS rows were the second variant and 600 of them
+# 'Quality gate PASSED and branch X merged to Y (sha=Z) — but NOT closing (...)' (no gate_run). Measured 2026-09-30: 601 of 4,492 PASS rows were the second variant and 600 of them
 # duplicated a first-variant row with the same (bead, sha) — counting both inflated attempt-level pass rates by ~13%.
 RX_PASS = re.compile(r"Quality gate PASSED(?:\.| and) [Bb]ranch (\S+) merged to (\S+) \(sha=([0-9a-f]{7,40})\)")
 RX_GATE_RUN = re.compile(r"gate_run=([^\s)]+)")
@@ -73,9 +76,12 @@ def main():
                     structured INT, text TEXT, text_len INT);
     CREATE TABLE runs2(run_id TEXT PRIMARY KEY, source_bead TEXT, created_at TEXT, closed_at TEXT, status TEXT, tier TEXT, reviewers_required INT,
                        elapsed_s INT, author TEXT, rig_name TEXT, branch TEXT, sha TEXT, n_files INT, insertions INT, deletions INT, verdict TEXT);""")
-    n_v = n_p = 0
+    n_v = n_p = 0; not_verdict = []
     for db, cid, iid, au, ca, kind, text in s.execute("SELECT db,id,issue_id,author,created_at,kind,text FROM x_comments WHERE kind IN ('V','P') ORDER BY created_at").fetchall():
         rig = RIG[db]
+        if kind == "V" and not RX_VERDICT_START.match(text):
+            not_verdict.append((db, iid, au, ca[:10]))   # prefix-only capture: not a dispatcher verdict, so not a gate outcome (counted and printed below, never dropped silently)
+            continue
         if kind == "P":
             m = RX_PASS.search(text); g = RX_GATE_RUN.search(text)
             s.execute("INSERT INTO attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL)", (db, rig, iid, cid, ca, "PASS", "", g.group(1) if g else "", m.group(1) if m else "", 0, 0, m.group(3) if m else "")); n_p += 1
@@ -116,6 +122,7 @@ def main():
     s.commit()
     # a header/PASS line that did not parse leaves gate_run='' (the row is kept, but it cannot be joined to runs2): count them so the gap is visible
     print("attempts with an unparsed gate_run:", s.execute("SELECT outcome, COUNT(*) FROM attempts WHERE gate_run='' GROUP BY 1").fetchall())
+    print(f"comments that start with 'GATE-FEEDBACK' but are NOT dispatcher verdicts (no run header) — excluded from attempts: {len(not_verdict)} {not_verdict}")
     for q in ("SELECT outcome, COUNT(*) FROM attempts GROUP BY 1", "SELECT process_subtype, COUNT(*) FROM attempts WHERE outcome='FAIL_PROCESS' GROUP BY 1",
               "SELECT rig, outcome, COUNT(*) FROM attempts GROUP BY 1,2", "SELECT COUNT(*), SUM(structured) FROM bi", "SELECT COUNT(*), SUM(author<>''), SUM(sha<>''), SUM(n_files IS NOT NULL) FROM runs2"):
         print(q[:60], "->", s.execute(q).fetchall())

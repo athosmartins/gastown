@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """ga-26k2y1 E4 step 2 — classify blocking issues with a FIXED taxonomy (taxonomy_prompt.md), in BATCHES (never one call per item).
 
-Reads  e4.db  table `bi_sample(bi_id TEXT PRIMARY KEY, text TEXT)`  (built by e4_parse.py), writes `cls_<tag>(bi_id, cls, tags, conf, why, batch, model)`.
-Resumable: items already present in cls_<tag> are skipped; every finished batch is committed at once, raw model output is kept in
-raw_<tag>/ so a parse failure never costs a re-run. Low concurrency + nice (the machine runs at load 40+).
+Reads  e4.db  table `bi_sample(bi_id, text, prio, month, rig)`  (built by e4_sample.py; read in `prio` order), writes `cls_<tag>(bi_id, cls, tags, conf, why, batch, model)`.
+Resumable: items already present in cls_<tag> are skipped; every finished batch is committed at once. The raw model output of each call is written to raw_<tag>/ for
+inspection; a batch whose call fails or whose output does not parse is re-sent to the model ONCE (a second call; it overwrites the raw file), then reported as FAILED and left undone.
+Low concurrency + nice (the machine runs at load 40+).
 
   python3 e4_classify.py --tag primary --model sonnet --effort medium --batch 12 [--limit N] [--ids-file f.txt]
   python3 e4_classify.py --tag second  --model claude-opus-5-5 --effort medium --batch 12 --ids-file second_ids.txt

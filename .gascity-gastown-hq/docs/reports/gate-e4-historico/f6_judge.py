@@ -5,13 +5,16 @@ One `claude -p` call per BEAD (all its later-round issues together, sharing the 
 Evidence pack per issue (built mechanically, no LLM): symbols the issue cites (backticked spans, snake_case / camelCase identifiers, func() names) are searched in the
 added/context lines of the round-1 diff, the previous round's diff and the round-N diff; +-5 lines around the best hits are shown. Also given: what the round-1 reviewer
 wrote about those symbols, and the blocking issues of every earlier round (to recognise REPEATS).
-Grounding rule enforced AFTER the call (never trusted from the model): a LATENT label must carry `r1_line` — a line that occurs VERBATIM in the round-1 stored diff — and
-`rn_line` that occurs verbatim in the round-N diff; otherwise the label is downgraded to INDETERMINATE (flag `ungrounded`).
+Grounding rule enforced AFTER the call (never trusted from the model): a LATENT label must carry `r1_line` — a line that occurs VERBATIM in the round-1 stored task text (which embeds
+the diff the reviewer saw; the check searches that whole text, not only its diff lines) — and `rn_line` that occurs verbatim in the round-N stored task text; otherwise the label is
+downgraded to INDETERMINATE (flag `ungrounded`). f6_git.py's audit later checks every quote against the real files at each round's sha.
 
   python3 f6_judge.py --tag seeds --beads wa-br1w4r,wa-0efsc3
   python3 f6_judge.py --tag main --model sonnet --effort high --workers 2
 """
-import argparse, collections, concurrent.futures as cf, json, os, re, sqlite3, subprocess, time
+import argparse, collections, concurrent.futures as cf, json, os, re, sqlite3, subprocess, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from f6_analyze import tri   # model-reported booleans: absent -> NULL, never 0
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STOP = {"blocking", "issue", "root_class", "error_vs_empty", "third_state", "third", "state", "shape", "comment", "which", "there", "should", "would", "before", "after",
@@ -149,7 +152,7 @@ def call(model, effort, prompt, timeout=900):
 
 
 def ground(label, r1_line, rn_line, r1text, rntext):
-    """verbatim check against the STORED diffs; LATENT without two verbatim quotes is downgraded."""
+    """verbatim check against the STORED task texts (each embeds the diff the reviewer saw); LATENT without two verbatim quotes is downgraded."""
     norm = lambda x: re.sub(r"\s+", " ", x or "").strip()
     ok1 = bool(norm(r1_line)) and norm(r1_line) in re.sub(r"\s+", " ", r1text)
     okn = bool(norm(rn_line)) and norm(rn_line) in re.sub(r"\s+", " ", rntext)
@@ -215,7 +218,7 @@ def main():
                 lab_raw = str(o.get("label", "")).upper()
                 lab, ung, ok1, okn = ground(lab_raw, o.get("r1_line"), o.get("rn_line"), tasks[it["r1_run"]], tasks[it["run"]])
                 s.execute(f"INSERT OR REPLACE INTO f6_judge_{a.tag} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (it["bi_id"], bead, it["rnd"], lab_raw, lab, ung, str(o.get("r1_reviewer_status") or ""), int(bool(o.get("same_class_as_earlier"))),
+                          (it["bi_id"], bead, it["rnd"], lab_raw, lab, ung, str(o.get("r1_reviewer_status") or ""), tri(o.get("same_class_as_earlier")),
                            str(o.get("r1_line") or "")[:400], str(o.get("rn_line") or "")[:400], int(ok1), int(okn), float(o.get("conf") or 0), str(o.get("why") or "")[:300], a.model))
             s.commit()
             print(f"  {bead}: {len(issues)} issues  {dict(collections.Counter(str(got[i['sid']].get('label')) for i in issues))}  cost=${cost:.2f} total=${total:.2f}", flush=True)

@@ -4,7 +4,7 @@ proposal's family (one uncovered issue and the verdict still FAILs). A ceiling i
 (it is what the A/B experiment measures). Two different metrics are kept apart on purpose:
   first-try approval   moves only if round-1 FAIL verdicts disappear (builder-side proposals)
   rework rounds        moves if later rounds disappear (reviewer-completeness and gate-mechanics proposals) — first-try approval does NOT move
-Reads cls_primary, attempts, bead_out, f6 tables (whichever exist). Pure function of e4.db."""
+Reads cls_primary, attempts and bead_out (all required). The Frente 6 ceiling is not computed here: it comes from the f6 tables in e4_final.py section 4. Pure function of e4.db."""
 import collections, json, os, sqlite3
 import pandas as pd
 

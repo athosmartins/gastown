@@ -29,10 +29,12 @@ v = bi.groupby("comment_id").agg(cls=("cls", list), created=("created_at", "firs
 print("\n== verdict-level: any D / any C / any A ==")
 for c in "DCA":
     m = v.cls.map(lambda l, c=c: c in l); print(f"  verdicts with >=1 class-{c} issue: {m.mean():.1%} ({int(m.sum())}/{len(v)})  pre {m[v.post==0].mean():.1%}  post {m[v.post==1].mean():.1%}")
-print("\n== pairs by regime ==")
-p = pd.read_sql("select p.*, a.created_at from pair_out_main p join attempts a on a.comment_id=p.fail_comment", s); p["post"] = (p.created_at >= CUT).astype(int); p["ft"] = p.fix_types.map(json.loads)
+print("\n== pairs by regime (only the pairs with a FULL diff on both sides, as in e4_final.py section 5) ==")
+p = pd.read_sql("select p.*, a.created_at from pair_out_main p join attempts a on a.comment_id=p.fail_comment where p.fail_partial = 0 and p.pass_partial = 0", s)   # NULL (unparsed header) fails '= 0': left out
+p["post"] = (p.created_at >= CUT).astype(int); p["ft"] = p.fix_types.map(json.loads)
 for post, g in p.groupby("post"):
-    print(f"  post={post} n={len(g)} beyond_cited={g.beyond_cited.mean():.0%} first_time top: {dict(g.first_time.value_counts().head(3))}")
+    bc = g.beyond_cited.dropna()   # NULL = the model left the field out: not counted as "no"
+    print(f"  post={post} n={len(g)} beyond_cited={bc.mean():.0%} (n={len(bc)}) first_time top: {dict(g.first_time.value_counts().head(3))}")
 print("\n== A/B arithmetic (two-proportion, alpha=0.05 two-sided, power 0.80) ==")
 def n_per_arm(p1, p2): return math.ceil((1.96 + 0.8416) ** 2 * (p1 * (1 - p1) + p2 * (1 - p2)) / (p1 - p2) ** 2)
 post = pd.read_sql("select first_try_pass, first_ts from bead_out where first_ts >= '2026-09-25 16:04:00'", s); base = post.first_try_pass.mean(); days = (pd.Timestamp("2026-09-30 13:00") - pd.Timestamp(CUT)).total_seconds() / 86400
@@ -42,8 +44,10 @@ for d in (0.08, 0.10, 0.15):
     n = n_per_arm(base, base + d); print(f"  detect +{d:.0%}: {n} beads per arm -> {2*n} total -> {2*n/rate:.0f} days at 50/50")
 
 print("\n== headline + second-reviewer experiment arithmetic ==")
-bo = pd.read_sql("select n_fail_review, n_fail_process, first_try_pass, first_ts from bead_out", s)
+bo = pd.read_sql("select n_fail_review, n_fail_process, first_try_pass, first_ts, final from bead_out", s)
 print(f"  first gate outcome is PASS: {int(bo.first_try_pass.sum())} of {len(bo)} = {bo.first_try_pass.mean():.1%};  beads with zero FAIL attempts of any kind: {int(((bo.n_fail_review + bo.n_fail_process) == 0).sum())} (the difference = beads that passed first and were gated again later)")
+ff = bo[(bo.n_fail_review + bo.n_fail_process) >= 1]; fin = {k: int(v) for k, v in ff.final.value_counts().items()}
+print(f"  beads with >=1 FAIL attempt of any kind: {len(ff)}; final state {fin}; passed {fin.get('passed', 0)} of {len(ff)} = {fin.get('passed', 0)/len(ff):.1%}, and {fin.get('passed', 0)} of the {len(ff) - fin.get('open', 0)} that are no longer open")
 fb = bo[bo.n_fail_review >= 1]; later = fb.n_fail_review - 1
 print(f"  beads with >=1 reviewer FAIL: {len(fb)}; later-round verdicts per such bead: mean {later.mean():.3f}, sd {later.std():.3f}  (too noisy for a count metric)")
 for d in (0.15, 0.20):

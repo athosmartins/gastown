@@ -6,13 +6,19 @@ M2 (Era-B beads with >=2 reviewer FAILs): for every LATER-round blocking issue, 
       round1_view: omitted  = file is in the round-1 OMITTED FILES list (unseen by construction)
                    shown    = file's diff was in the round-1 task (candidate LATENT — needs a content check)
                    absent   = file not in the round-1 diff at all (added later / context file)
-                   nocite   = the issue cites no file that appears in any round's diff
+                   nocite   = the issue cites no file that appears in the round-1 diff, the round-1 OMITTED FILES list or the round-N diff (intermediate rounds are not consulted)
       overlap      = share of the round-N added lines of that file that already existed IDENTICALLY as added lines in round 1
 Writes f6_issue(bi_id, ...) and prints the aggregates used in the report."""
 import collections, os, re, sqlite3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RX_PATH = re.compile(r"[\w][\w./-]*\.(?:py|js|sh|html|toml|md|json|sql|ya?ml|plist|css|txt)\b")
+
+
+def tri(v):
+    """A model-reported boolean as a tri-state for sqlite: 1 / 0 for a JSON true / false, NULL when the field is absent or is not a boolean.
+    (int(bool(v)) stores an ABSENT field as 0 — the same value as an explicit "no" — and the string "false" as 1.) Shared by f6_judge.py, f6_git.py and pairs_judge.py."""
+    return int(v) if isinstance(v, bool) else None
 
 
 def parse_task(text):
@@ -88,7 +94,7 @@ def main():
                 cov_f = (r1["shown_files"] / r1["total_files"]) if r1["total_files"] else None
                 cov_l = (r1["shown_lines"] / r1["total_lines"]) if r1["total_lines"] else None
                 s.execute("INSERT INTO f6_issue VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                          (bi_id, bead, rnd, a[4], rev[0][4], ",".join(sorted(cf)), view, overlap, int(bool(r1["partial"])), cov_f, cov_l, int(bool(tN["partial"])), len(r1["omitted"])))
+                          (bi_id, bead, rnd, a[4], rev[0][4], ",".join(sorted(cf)), view, overlap, tri(r1["partial"]), cov_f, cov_l, tri(tN["partial"]), len(r1["omitted"])))
                 out[view] += 1
     s.commit()
     n = sum(out.values())

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """ga-26k2y1 E4 step 1d — ADDITIVE fix to runs2 (does not drop anything, so it is safe while other jobs read e4.db).
 Why: the stored DIFF SUMMARY line is cut mid-number for big diffs ("14 files changed, 1958 ..."), so insertions/deletions parse as 0 for exactly the large runs.
-The DIFF header line is exact and always present: 'FULL DIFF (complete — N lines across M file(s)...)' or 'PARTIAL DIFF — showing A of B files (C of D total diff lines)'.
+The DIFF header line is exact: 'FULL DIFF (complete — N lines across M file(s)...)' or 'PARTIAL DIFF — showing A of B files (C of D total diff lines)'. A stored head without a
+parsable header leaves the run's columns NULL (unknown, never 0); the last line of the run prints how many heads were seen and how many parsed.
 Adds to runs2: diff_lines (total diff lines the change has), diff_partial (1 if the reviewer got a partial diff), shown_files, total_files, shown_lines."""
 import os, re, sqlite3
 HERE = os.path.dirname(os.path.abspath(__file__))
