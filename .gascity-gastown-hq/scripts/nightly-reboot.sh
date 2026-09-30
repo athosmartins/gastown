@@ -56,12 +56,18 @@
 # OFF by deliberate Athos decision since 2026-08-20, for token-cost reasons —
 # see scripts/city-night-window.sh's own header. So no calendar slot is
 # structurally guaranteed idle; this script checks REAL in-flight state at
-# fire-time instead. The two hard gates below mirror exactly what the
-# 2026-08-29 human-supervised reboot actually required
+# fire-time instead. The two hard gates below started as exactly what the
+# 2026-08-29 human-supervised reboot required
 # (docs/runbooks/reboot-20260829-pre.txt): zero gate markers in flight, zero
-# hq beads in_progress. Non-hq in-progress beads (e.g. wa crew work) are
-# logged but NOT blocking — that precedent already treated those as fine,
-# since inflight-reclaim-guard reclaims them afterward regardless of reboot.
+# hq beads in_progress. The second was relaxed by ga-2vl5yr: a human reads
+# "in_progress" and knows which of those beads has a builder behind it; a script
+# that counts them never reaches zero once the Mayor keeps a mission bead open
+# (12 skipped nights, swap 9 GB, disk 4.7 GB). Guard 3 now blocks only on an
+# hq bead whose assignee is a live, non-coordinator session that touched it
+# recently — rule, rationale and knobs in the comment above guard_hq_in_progress().
+# Non-hq in-progress beads (e.g. wa crew work) are logged but NOT blocking —
+# that precedent already treated those as fine, since inflight-reclaim-guard
+# reclaims them afterward regardless of reboot.
 #
 # Runs as root (LaunchDaemon, no UserName key) so it can call /sbin/shutdown
 # directly, same as the proven com.athos.reboot-once-0700 /
@@ -84,7 +90,7 @@
 # The mode runs Guards 2+3+4 once, through the very same functions the nightly
 # uses, and prints one line per guard:
 #     guard2 gate-markers: ok
-#     guard3 hq-in-progress: BLOCK hq beads in_progress = 2
+#     guard3 hq-in-progress: BLOCK hq beads in_progress = 1 blocking: ga-xyz [builder gastown.dog-1 (gastown.dog), touched 3m ago]
 #     guard4 scraper-daily: unknown <why it could not tell>
 # Three states, never collapsed: ok (safe), BLOCK (something is in flight),
 # unknown (the guard could not look — NOT safe). An "ok" can carry a caveat,
@@ -492,8 +498,153 @@ guard_gate_markers() {
     GUARD_REASON="gate real-work markers in flight = ${GATE_REAL} (raw: ${GATE_JSON})"
     return 1
 }
+# Guard 3 — which hq in_progress beads can a reboot actually break (ga-2vl5yr)?
+# It used to block on ANY in_progress bead. In a city where the Mayor keeps
+# mission beads open for days that never reaches zero: the nightly SKIPPED 12
+# nights in a row (swap 9 GB, disk 4.7 GB, wa-worker ceiling stuck at 2). A
+# reboot breaks a bead only when a process is running for it right now, so a bead
+# blocks only if ALL of these hold:
+#   - its assignee (matched by session id, alias or session_name) is a LIVE
+#     session: any state except asleep/suspended/closed/drained — an unrecognized
+#     or missing state counts as live, "cannot tell" is not "dead";
+#   - that session's template is not a coordinator (mayor, deacon, dispatcher,
+#     boot, witnesses: their beads are missions, and the session is restarted
+#     after the reboot anyway; override with NIGHTLY_REBOOT_COORDINATOR_TEMPLATES);
+#   - the bead was touched within the last NIGHTLY_REBOOT_ACTIVE_WINDOW_MIN
+#     minutes (default 60; the newer of updated_at and heartbeat_at). A live
+#     builder that went silent for longer is stuck, and must not pin the reboot
+#     forever the way any-in_progress did. A timestamp that cannot be read blocks.
+# Everything else (no assignee, no session, dead session, coordinator, idle) is
+# ignored but NAMED, with the reason, in GUARD_NOTE / HQ_IGNORED_NOTE — nothing
+# is dropped silently. Unreadable input (bd query fails, JSON is not a list of
+# objects) is "unknown" (NOT safe), never "no live session".
+#
+# Sessions come from `bd query 'type=session AND status=open'`, NOT from
+# `bd list --type session`: list is blind to ephemeral wisp sessions (gate
+# reviewers, pool workers) and saw 7 of 20 sessions when measured, which would
+# have read every live gate reviewer as absent. Going through bd also keeps the
+# guard off gc, whose behavior as root in this LaunchDaemon was not verified
+# (bd list is proven as root by the nightly log; bd query reads the same store).
+# Known residual: bd omits the assignee key on an unassigned bead, so a bd that
+# renamed that field would look like "everything unassigned" and cannot be told
+# apart from it. Python source below has no apostrophes on purpose: it lives in
+# a single-quoted shell string (bash 3.2 safe, no heredoc).
+HQ_CLASSIFY_PY='
+import calendar, fnmatch, json, re, sys, time
+
+def emit(state, text):
+    print(state + "\t" + " ".join(str(text).split()))
+    sys.exit(0)
+
+DEAD = ("asleep", "suspended", "closed", "drained")
+TS = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
+
+def parse_ts(v):
+    m = TS.match(v.strip()) if isinstance(v, str) else None
+    if not m:
+        return None
+    try:
+        y, mo, d, h, mi, s = [int(m.group(i)) for i in range(1, 7)]
+        t = calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
+        z = m.group(7)
+        if z != "Z":
+            digits = z[1:].replace(":", "")
+            off = int(digits[:2]) * 3600 + int(digits[2:]) * 60
+            t -= off if z[0] == "+" else -off
+        return t
+    except Exception:
+        return None
+
+def main():
+    try:
+        window = int(sys.argv[1])
+    except ValueError:
+        emit("unknown", "NIGHTLY_REBOOT_ACTIVE_WINDOW_MIN is not an integer: " + sys.argv[1])
+    globs = sys.argv[2].split()
+    doc = json.load(sys.stdin)
+    beads, sessions = doc["beads"], doc["sessions"]
+    if not isinstance(beads, list) or any(not isinstance(b, dict) for b in beads):
+        emit("unknown", "in_progress JSON is not a list of objects")
+    if not isinstance(sessions, list) or any(not isinstance(s, dict) for s in sessions):
+        emit("unknown", "session query returned JSON that is not a list of objects")
+
+    def md_of(s):
+        m = s.get("metadata")
+        return m if isinstance(m, dict) else {}
+    # A store that cannot name a single session would read every assignee as
+    # "no session for assignee" and pass the guard by default. A running city
+    # always has sessions (the Mayor is pinned), so none at all, or none with a
+    # readable session_name/alias, means the read is broken: unknown, not "safe".
+    if any(isinstance(b.get("assignee"), str) and b["assignee"].strip() for b in beads):
+        if not sessions:
+            emit("unknown", "session query returned no sessions at all while in_progress beads have assignees")
+        if not any(md_of(s).get("session_name") or md_of(s).get("alias") for s in sessions):
+            emit("unknown", "no session carries a readable session_name or alias, so assignees cannot be matched")
+    def names(s):
+        m = md_of(s)
+        return set(v for v in (s.get("id"), m.get("session_name"), m.get("alias")) if isinstance(v, str) and v)
+    def state_of(s):
+        v = md_of(s).get("state")
+        return v.strip().lower() if isinstance(v, str) else ""
+    def template_of(s):
+        v = md_of(s).get("template")
+        return v.strip() if isinstance(v, str) else ""
+    def is_coordinator(s):
+        t = template_of(s)
+        return bool(t) and any(fnmatch.fnmatchcase(t, g) for g in globs)
+
+    now = time.time()
+    blocking, ignored = [], []
+    for b in beads:
+        bid = str(b.get("id") or "?")
+        who = b.get("assignee")
+        who = who.strip() if isinstance(who, str) else ""
+        if not who:
+            ignored.append(bid + " (no assignee)")
+            continue
+        mine = [s for s in sessions if who in names(s)]
+        if not mine:
+            ignored.append(bid + " (no session for assignee " + who + ")")
+            continue
+        live = [s for s in mine if state_of(s) not in DEAD]
+        if not live:
+            ignored.append(bid + " (session " + who + " is " + (state_of(mine[0]) or "not running") + ")")
+            continue
+        builders = [s for s in live if not is_coordinator(s)]
+        if not builders:
+            ignored.append(bid + " (coordinator " + who + ")")
+            continue
+        tpl = template_of(builders[0]) or "unknown template"
+        stamps, unreadable = [], False
+        for k in ("updated_at", "heartbeat_at"):
+            v = b.get(k)
+            if v is None or v == "":
+                continue
+            t = parse_ts(v)
+            if t is None:
+                unreadable = True
+            else:
+                stamps.append(t)
+        if unreadable or not stamps:
+            blocking.append(bid + " [builder " + who + " (" + tpl + "), activity unknown: no readable updated_at/heartbeat_at]")
+            continue
+        age = max(0, int((now - max(stamps)) // 60))
+        if age > window:
+            ignored.append(bid + " (idle " + str(age) + "m, over the " + str(window) + "m window: " + who + ")")
+        else:
+            blocking.append(bid + " [builder " + who + " (" + tpl + "), touched " + str(age) + "m ago]")
+
+    if blocking:
+        emit("block", "hq beads in_progress = %d blocking: %s" % (len(blocking), "; ".join(blocking)))
+    emit("ok", "%d hq in_progress beads not blocking: %s" % (len(ignored), "; ".join(ignored)))
+
+try:
+    main()
+except Exception as e:
+    emit("unknown", "classifier error: " + type(e).__name__ + ": " + str(e))
+'
 guard_hq_in_progress() {
-    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""; HQ_IGNORED_NOTE=""
     HQ_INPROGRESS_JSON=$("${BD}" -C "${CITY}" list --status in_progress --json --limit 0 2>"${HQ_ERR}")
     HQ_RC=$?
     if [ "${HQ_RC}" -ne 0 ] || ! printf '%s' "${HQ_INPROGRESS_JSON}" | /usr/bin/python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
@@ -509,9 +660,39 @@ guard_hq_in_progress() {
             GUARD_REASON="bd list --status in_progress (hq) returned JSON that is not a list (raw: ${HQ_INPROGRESS_JSON}) — count unknown, treated as NOT safe"
             return 1
             ;;
-        *) GUARD_STATE="block" ;;
     esac
-    GUARD_REASON="hq beads in_progress = ${HQ_INPROGRESS_COUNT}"
+    # Something is in progress: which of it has a process a reboot would kill?
+    # (HQ_ERR is free again — the list call's stderr is no longer needed.)
+    HQ_SESSIONS_JSON=$("${BD}" -C "${CITY}" query --json 'type=session AND status=open' --limit=0 2>"${HQ_ERR}")
+    HQ_SESS_RC=$?
+    if [ "${HQ_SESS_RC}" -ne 0 ]; then
+        GUARD_REASON="bd query type=session (hq) failed (rc=${HQ_SESS_RC}: $(cat "${HQ_ERR}" 2>/dev/null)) — cannot tell which in_progress beads have a live session, treated as NOT safe"
+        return 1
+    fi
+    local tab window coordinators verdict detail
+    tab="$(printf '\t')"
+    window="${NIGHTLY_REBOOT_ACTIVE_WINDOW_MIN:-60}"
+    coordinators="${NIGHTLY_REBOOT_COORDINATOR_TEMPLATES:-gastown.mayor gastown.deacon control-dispatcher gastown.boot gastown.witness */gastown.witness}"
+    HQ_CLASSIFY_OUT=$(printf '{"beads":%s,"sessions":%s}' "${HQ_INPROGRESS_JSON}" "${HQ_SESSIONS_JSON}" \
+        | /usr/bin/python3 -c "${HQ_CLASSIFY_PY}" "${window}" "${coordinators}" 2>&1)
+    verdict="${HQ_CLASSIFY_OUT%%"${tab}"*}"
+    detail="${HQ_CLASSIFY_OUT#*"${tab}"}"
+    case "${verdict}" in
+        ok)
+            GUARD_STATE="ok"
+            HQ_IGNORED_NOTE="${detail}"
+            GUARD_NOTE="${detail}"
+            return 0
+            ;;
+        block)
+            GUARD_STATE="block"
+            GUARD_REASON="${detail}"
+            return 1
+            ;;
+    esac
+    # No verdict (python missing/crashed, or the classifier said unknown): NOT safe.
+    [ "${verdict}" = "unknown" ] || detail="no verdict from the classifier (raw: ${HQ_CLASSIFY_OUT})"
+    GUARD_REASON="hq in_progress beads could not be classified (${detail}) — treated as NOT safe"
     return 1
 }
 guard_scraper_daily() {
@@ -590,7 +771,7 @@ while true; do
     sleep "${RETRY_INTERVAL}"
     ATTEMPT=$((ATTEMPT+1))
 done
-log "guards OK on attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS}: 0 real gate markers, 0 hq in_progress, no scraper daily running"
+log "guards OK on attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS}: 0 real gate markers, no recently-active live builder on any hq in_progress bead, no scraper daily running${HQ_IGNORED_NOTE:+ (${HQ_IGNORED_NOTE})}"
 
 # --- Informational only: other rigs' in_progress count (not a gate) ------
 # Precedent (2026-08-29 runbook) treated non-hq in-progress as non-blocking —

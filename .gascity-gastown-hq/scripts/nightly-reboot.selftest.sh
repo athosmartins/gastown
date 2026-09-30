@@ -19,7 +19,14 @@
 #
 # So: every full-script scenario below (1-3) keeps the fake `bd` reporting a
 # permanent in-progress bead — the hq guard NEVER clears, for either script
-# version, so neither can ever reach its reboot line. This is the same
+# version, so neither can ever reach its reboot line. (ga-2vl5yr: since Guard 3
+# only blocks on a bead backed by a LIVE, recently-touched builder session, that
+# fake bead is assigned to a live fake session with a fresh updated_at — a bare
+# `{"id":...}` would now be ignored by the new script and let it through. The
+# old script blocks on ANY in-progress bead, so it still never clears either.
+# Scenario 8 does clear every guard on purpose, but only with SHUTDOWN_BIN and
+# SOFTWAREUPDATE_BIN faked, and only with a bead shape the pre-fix script blocks.)
+# This is the same
 # invariant the original ga-g5bzf selftest relied on (it called Guard 3
 # "unconditionally SKIPs... the real /sbin/shutdown line is architecturally
 # unreachable regardless of how Guard 2 behaves") — kept here on purpose,
@@ -106,14 +113,34 @@ EOF
 # scenario below — see the file header for why this must never change to
 # "eventually clears" in a scenario that runs the real script. -------------
 FAKE_BD="$TMP/bd"
-BD_COUNTER="$TMP/bd-calls"
+BD_COUNTER="$TMP/bd-calls"   # counts `list` calls only: one per hq-guard evaluation
 cat > "$FAKE_BD" <<EOF
 #!/usr/bin/env bash
-n=\$(( \$(cat "$BD_COUNTER" 2>/dev/null || echo 0) + 1 ))
-echo "\$n" > "$BD_COUNTER"
-echo '[{"id":"fake-inprogress-1"}]'
+# argv: -C <city> <subcommand> ...
+case "\$3" in
+  list)
+    n=\$(( \$(cat "$BD_COUNTER" 2>/dev/null || echo 0) + 1 ))
+    echo "\$n" > "$BD_COUNTER"
+    # a bead a LIVE builder session is working on, touched just now (ga-2vl5yr)
+    printf '[{"id":"fake-inprogress-1","assignee":"fake-builder","updated_at":"%s"}]\n' "\$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ;;
+  query)
+    echo '[{"id":"ga-fake-sess","issue_type":"session","status":"open","metadata":{"session_name":"fake-builder","alias":"fake-builder","template":"wa-worker","state":"awake"}}]'
+    ;;
+esac
 EOF
 chmod +x "$FAKE_BD"
+
+# Fakes that make a full-script run SAFE even when every guard clears: only the
+# new script honours them (the pre-fix one never gets that far, see header).
+FAKE_SHUTDOWN1="$TMP/shutdown1"; SHUTDOWN1_CALLS="$TMP/shutdown1.calls"
+cat > "$FAKE_SHUTDOWN1" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$SHUTDOWN1_CALLS"
+EOF
+chmod +x "$FAKE_SHUTDOWN1"
+FAKE_SU1="$TMP/softwareupdate1"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FAKE_SU1"; chmod +x "$FAKE_SU1"
 
 # --- fake notify: captures calls instead of paging Athos's phone. ---------
 NOTIFY_LOG="$TMP/notify.log"
@@ -125,7 +152,7 @@ EOF
 chmod +x "$FAKE_NOTIFY"
 
 reset_all() {
-  rm -f "$GATE_COUNTER" "$BD_COUNTER" "$STREAK_FILE_PATH"
+  rm -f "$GATE_COUNTER" "$BD_COUNTER" "$STREAK_FILE_PATH" "$SHUTDOWN1_CALLS"
   : > "$NOTIFY_LOG"; : > "$FAKE_LOG"
 }
 
@@ -135,6 +162,9 @@ run_nightly_reboot() {
     BD_BIN="$FAKE_BD" \
     NOTIFY_BIN="$FAKE_NOTIFY" \
     NOTIFY_AS_USER="nobody" \
+    SHUTDOWN_BIN="$FAKE_SHUTDOWN1" \
+    SOFTWAREUPDATE_BIN="$FAKE_SU1" \
+    SCRAPER_RODADA_DIR="$TMP/no-such-rodada-dir" \
     NIGHTLY_REBOOT_RETRY_INTERVAL=1 \
     NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=3 \
     NIGHTLY_REBOOT_ALARM_THRESHOLD=2 \
@@ -149,6 +179,7 @@ assert_never_rebooted() {
   else
     ok "$scenario: never reached the reboot line (hq fake-bd block held)"
   fi
+  [ ! -s "$SHUTDOWN1_CALLS" ] && ok "$scenario: fake shutdown never called" || bad "$scenario: SAFETY VIOLATION — shutdown called: $(cat "$SHUTDOWN1_CALLS")"
 }
 
 echo "── Scenario 1: gate healthy from the first attempt, hq NEVER clears ──"
@@ -177,7 +208,7 @@ bcalls=$(cat "$BD_COUNTER" 2>/dev/null || echo 0)
 [ "$gcalls" = "3" ] && ok "2: gate called on every attempt (retried past the transient failure)" || bad "2: expected 3 gate calls, got $gcalls"
 [ "$bcalls" = "2" ] && ok "2: hq only checked once gate cleared (attempts 2 and 3)" || bad "2: expected 2 bd calls, got $bcalls"
 grep -q "attempt 1/3 blocked (gate-queue-composition.sh failed" "$FAKE_LOG" && ok "2: log shows the first-attempt gate block" || bad "2: log missing the attempt-1 gate-block line"
-grep -q "attempt 2/3 blocked (hq beads in_progress = 1)" "$FAKE_LOG" && ok "2: log shows the block reason switching to hq once gate recovered — this is the fix" || bad "2: retry did NOT recover on the gate side, or reason didn't switch"
+grep -q "attempt 2/3 blocked (hq beads in_progress = 1 blocking" "$FAKE_LOG" && ok "2: log shows the block reason switching to hq once gate recovered — this is the fix" || bad "2: retry did NOT recover on the gate side, or reason didn't switch"
 assert_never_rebooted "2"
 
 echo ""
@@ -502,20 +533,50 @@ chmod +x "$FAKE_GC7"
 # fake bd controlado por arquivo: modo "fail" -> rc=1 (estado DESCONHECIDO),
 # senao devolve o JSON pedido (ex.: '[]' = zero in_progress).
 FAKE_BD7="$TMP/bd7"; BD7_MODE="$TMP/bd7.mode"; BD7_JSON="$TMP/bd7.json"; BD7_COUNTER="$TMP/bd7-calls"
+BD7_QMODE="$TMP/bd7.qmode"; BD7_QJSON="$TMP/bd7.qjson"; BD7_QCOUNTER="$TMP/bd7-qcalls"
 cat > "$FAKE_BD7" <<EOF
 #!/usr/bin/env bash
-n=\$(( \$(cat "$BD7_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BD7_COUNTER"
-if [ "\$(cat "$BD7_MODE" 2>/dev/null)" = "fail" ]; then
-  # stderr de DUAS linhas, como o bd real quando o Dolt cai: o contrato de "uma
-  # linha por guard" so e testado se o stderr de fato quebra linha.
-  echo "fake bd: dolt unreachable" >&2
-  echo "      bd: connection refused" >&2
-  exit 1
-fi
-cat "$BD7_JSON"
+# argv: -C <city> <subcommand> ...
+case "\$3" in
+  list)
+    # \`bd list --type session\` NAO enxerga as sessoes efemeras (wisps): so 7 das 20
+    # sessoes reais nesta cidade (medido ao vivo, ga-2vl5yr). O guard nao pode
+    # depender dele; reproduzido aqui como "[]" pra que quem o usar reprove o 8e.
+    case " \$* " in *" --type "*|*" -t "*) echo '[]'; exit 0 ;; esac
+    n=\$(( \$(cat "$BD7_COUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BD7_COUNTER"
+    if [ "\$(cat "$BD7_MODE" 2>/dev/null)" = "fail" ]; then
+      # stderr de DUAS linhas, como o bd real quando o Dolt cai: o contrato de "uma
+      # linha por guard" so e testado se o stderr de fato quebra linha.
+      echo "fake bd: dolt unreachable" >&2
+      echo "      bd: connection refused" >&2
+      exit 1
+    fi
+    cat "$BD7_JSON"
+    ;;
+  query)
+    # o caminho que ENXERGA todas as sessoes (inclusive wisps): bd query 'type=session ...'
+    n=\$(( \$(cat "$BD7_QCOUNTER" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BD7_QCOUNTER"
+    if [ "\$(cat "$BD7_QMODE" 2>/dev/null)" = "fail" ]; then
+      echo "fake bd query: session store unreachable" >&2
+      echo "      bd: connection refused" >&2
+      exit 1
+    fi
+    cat "$BD7_QJSON"
+    ;;
+esac
 EOF
 chmod +x "$FAKE_BD7"
 set_bd7() { printf '%s' "$1" > "$BD7_MODE"; printf '%s\n' "$2" > "$BD7_JSON"; }
+set_sess7() { printf '%s' "$1" > "$BD7_QMODE"; printf '%s\n' "$2" > "$BD7_QJSON"; }
+
+# ISO-8601 UTC, $1 minutos atras (o formato que o bd devolve em updated_at).
+ts7() { /bin/date -u -r $(( $(/bin/date +%s) - ${1:-0} * 60 )) +%Y-%m-%dT%H:%M:%SZ; }
+# bead in_progress: id, assignee ("" = sem dono), minutos desde o ultimo toque.
+bead7() { printf '{"id":"%s","assignee":"%s","updated_at":"%s"}' "$1" "$2" "$(ts7 "${3:-0}")"; }
+# sessao (issue_type=session): id, session_name, alias, template, state.
+sess7() { printf '{"id":"%s","issue_type":"session","status":"open","metadata":{"session_name":"%s","alias":"%s","template":"%s","state":"%s"}}' "$1" "$2" "$3" "$4" "$5"; }
+# a sessao-construtora viva que a maioria dos casos usa como dono do bead.
+BUILDER_SESS7="$(sess7 ga-sess-b fake-builder fake-builder wa-worker awake)"
 
 # gate falhando com stderr MULTILINHA (3 linhas, igual ao gate-queue-composition.sh
 # real nos caminhos "bd fora do PATH" e "nao consegui ler os markers").
@@ -549,9 +610,10 @@ AFTER7=$(/bin/date -r $(( $(/bin/date +%s) - 3600 )) +%Y-%m-%dT%H:%M:%S.000000)
 mk7() { printf '{"rodada_id":"%s","pid":%s,"phase":"scraping","status":"%s","started_at":"%s"}' "$1" "$2" "$3" "$4" > "$R7DIR/$1.json"; }
 
 reset7() {
-  rm -f "$GATE_COUNTER" "$BD7_COUNTER" "$STREAK_FILE_PATH" "$SHUTDOWN_CALLS"
+  rm -f "$GATE_COUNTER" "$BD7_COUNTER" "$BD7_QCOUNTER" "$STREAK_FILE_PATH" "$SHUTDOWN_CALLS"
   : > "$NOTIFY_LOG"; : > "$FAKE_LOG"; : > "$MAIL7_LOG"
   rm -rf "$R7DIR"; mkdir -p "$R7DIR"
+  set_sess7 ok "[$BUILDER_SESS7]"
 }
 run_cg() {
   PATH="$FAKEBIN:$PATH" FAKE_HOUR=14 \
@@ -590,7 +652,7 @@ has_line7 "guard4 scraper-daily: ok" && ok "7a: guard 4 ok" || bad "7a: falta 'g
 assert_read_only7 "7a" "1"
 
 echo "  -- 7b: hq bloqueia E scraper rodando -> os DOIS aparecem (sem curto-circuito), sem retry --"
-reset7; write_fake_gate 1; set_bd7 json '[{"id":"fake-inprogress-1"}]'
+reset7; write_fake_gate 1; set_bd7 json "[$(bead7 fake-inprogress-1 fake-builder 0)]"
 mk7 live "$LIVE7" running "$AFTER7"
 printf '1\n' > "$STREAK_FILE_PATH"
 rc=$(run_cg --check-guards)
@@ -663,9 +725,9 @@ else
   g7; rc=$?
   [ "$rc" -eq 1 ] && printf '%s' "$BLOCK_REASON" | grep -F "gate-queue-composition.sh failed" >/dev/null && ok "7f: gate falhando -> mesma BLOCK_REASON de sempre" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
 
-  reset7; write_fake_gate 1; set_bd7 json '[{"id":"x"},{"id":"y"}]'
+  reset7; write_fake_gate 1; set_bd7 json "[$(bead7 x fake-builder 0),$(bead7 y fake-builder 5)]"
   g7; rc=$?
-  [ "$rc" -eq 1 ] && [ "$BLOCK_REASON" = "hq beads in_progress = 2" ] && ok "7f: hq em andamento -> 'hq beads in_progress = 2'" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
+  [ "$rc" -eq 1 ] && case "$BLOCK_REASON" in "hq beads in_progress = 2 blocking"*) true ;; *) false ;; esac && ok "7f: hq em andamento -> 'hq beads in_progress = 2 blocking ...'" || bad "7f: rc=$rc reason='$BLOCK_REASON'"
 
   reset7; write_fake_gate 1; set_bd7 json '[]'; mk7 live "$LIVE7" running "$AFTER7"
   g7; rc=$?
@@ -716,7 +778,7 @@ mk7 live "$LIVE7" running "$AFTER7"
 run_cg --check-guards >/dev/null
 s2=$(state_of7 'guard2 gate-markers:'); s3=$(state_of7 'guard3 hq-in-progress:'); s4=$(state_of7 'guard4 scraper-daily:')
 [ "$s2/$s3/$s4" = "BLOCK/unknown/BLOCK" ] && ok "7g3: BLOCK / unknown / BLOCK" || bad "7g3: esperava BLOCK/unknown/BLOCK, veio $s2/$s3/$s4"
-reset7; write_fake_gate_json '{"total":0}'; set_bd7 json '[{"id":"x"}]'
+reset7; write_fake_gate_json '{"total":0}'; set_bd7 json "[$(bead7 x fake-builder 0)]"
 printf '{not json' > "$R7DIR/corrupt.json"
 run_cg --check-guards >/dev/null
 s2=$(state_of7 'guard2 gate-markers:'); s3=$(state_of7 'guard3 hq-in-progress:'); s4=$(state_of7 'guard4 scraper-daily:')
@@ -752,6 +814,200 @@ done
 reset7; write_fake_gate_json '{"total":0,"real":0,"phantom":0,"unknown":0}'; set_bd7 json '[]'
 rc=$(run_cg --check-guards)
 has_line7 "guard2 gate-markers: ok" && ok "7j: com 'unknown':0 explicito o guard 2 segue sendo um 'ok' liso" || bad "7j: guard 2 = '$(line_of7 'guard2 gate-markers:')'"
+
+echo ""
+echo "── Scenario 8: Guard 3 blocks only on REAL in-flight work (ga-2vl5yr) ──"
+# O guard 3 bloqueava em QUALQUER bead in_progress do hq. Numa cidade com beads-missao do
+# Mayor abertas por dias isso nunca zera: o noturno pulou 12 noites seguidas (swap 9 GB,
+# disco 4,7 GB, teto do wa-worker preso em 2). Agora so bloqueia o que um reboot de fato
+# quebra: bead cujo dono e uma sessao VIVA que nao e coordenadora e que mexeu no bead
+# recentemente. Tudo que ele ignora aparece na nota (nada some em silencio), e toda
+# leitura que nao da pra fazer continua sendo unknown/BLOCK — nunca "ok".
+G3="guard3 hq-in-progress:"
+MAYOR_SESS8="$(sess7 gh-050 gastown__mayor gastown.mayor gastown.mayor awake)"
+run_full8() {   # o NOTURNO de verdade (sem --check-guards), na janela 01:05, com shutdown FALSO
+  PATH="$FAKEBIN:$PATH" \
+    CITY="$FAKE_CITY" BD_BIN="$FAKE_BD7" GC_BIN="$FAKE_GC7" \
+    NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_AS_USER="nobody" \
+    SHUTDOWN_BIN="$FAKE_SHUTDOWN" SOFTWAREUPDATE_BIN="$FAKE_SU7" \
+    SCRAPER_RODADA_DIR="$R7DIR" SCRAPER_BOOT_EPOCH="$BOOT7" \
+    NIGHTLY_REBOOT_RETRY_INTERVAL=1 NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=3 \
+    timeout 60 bash "$SCRIPT" >"$TMP/cg.out" 2>"$TMP/cg.err"
+  echo $?
+}
+
+echo "  -- 8a: O BUG — 5 beads in_progress sem executor vivo (coordenacao/sem dono/sessao dormindo/sem sessao) -> ok --"
+reset7; write_fake_gate 1
+set_sess7 ok "[$MAYOR_SESS8,$(sess7 ga-sess-z sleepy-worker sleepy-worker wa-worker asleep)]"
+set_bd7 json "[$(bead7 ga-mayor1 gastown.mayor 0),$(bead7 ga-mayor2 gastown.mayor 600),$(bead7 ga-unassigned '' 0),$(bead7 ga-asleep sleepy-worker 0),$(bead7 ga-nosess ghost 0)]"
+rc=$(run_cg --check-guards)
+[ "$rc" = "0" ] && ok "8a: exit 0 (era BLOCK 'hq beads in_progress = 5' antes do fix)" || bad "8a: esperava exit 0, veio $rc ($(tr '\n' '|' < "$TMP/cg.out"))"
+[ "$(state_of7 "$G3")" = "ok" ] && ok "8a: guard 3 = ok" || bad "8a: guard 3 = '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "5 hq in_progress beads not blocking" >/dev/null && ok "8a: a linha diz que 5 beads foram ignoradas (nada some em silencio)" || bad "8a: sem a nota das ignoradas: '$(line_of7 "$G3")'"
+for want in "ga-mayor1 (coordinator gastown.mayor)" "ga-mayor2 (coordinator gastown.mayor)" "ga-unassigned (no assignee)" "ga-asleep (session sleepy-worker is asleep)" "ga-nosess (no session for assignee ghost)"; do
+  line_of7 "$G3" | grep -F -- "$want" >/dev/null && ok "8a: nota explica '$want'" || bad "8a: falta '$want' em '$(line_of7 "$G3")'"
+done
+[ "$(line_count7)" = "3" ] && ok "8a: continua uma linha por guard" || bad "8a: esperava 3 linhas, veio $(line_count7)"
+assert_read_only7 "8a" ""
+[ "$(cat "$BD7_QCOUNTER" 2>/dev/null || echo 0)" = "1" ] && ok "8a: sessoes lidas uma vez, via 'bd query'" || bad "8a: bd query chamado $(cat "$BD7_QCOUNTER" 2>/dev/null || echo 0)x"
+
+echo "  -- 8a2: coordenadoras padrao (control-dispatcher, deacon, boot, witnesses) nao bloqueiam; construtoras bloqueiam --"
+for tpl in control-dispatcher gastown.deacon gastown.boot lexbh/gastown.witness property_scrapers/gastown.witness gastown.mayor; do
+  reset7; write_fake_gate 1
+  set_sess7 ok "[$(sess7 ga-sess-c coord-x coord-x "$tpl" awake)]"; set_bd7 json "[$(bead7 ga-c coord-x 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "ok" ] && ok "8a2: template '$tpl' vivo e recente -> nao bloqueia" || bad "8a2: '$tpl' -> '$(line_of7 "$G3")'"
+done
+for tpl in gate-reviewer wa-worker ps-worker batista-wa gastown.dog; do
+  reset7; write_fake_gate 1
+  set_sess7 ok "[$(sess7 ga-sess-c builder-x builder-x "$tpl" awake)]"; set_bd7 json "[$(bead7 ga-c builder-x 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8a2: template '$tpl' vivo e recente -> BLOCK" || bad "8a2: '$tpl' -> '$(line_of7 "$G3")'"
+done
+reset7; write_fake_gate 1
+set_sess7 ok "[$MAYOR_SESS8]"; set_bd7 json "[$(bead7 ga-mayor1 gastown.mayor 0)]"
+NIGHTLY_REBOOT_COORDINATOR_TEMPLATES="nada-casa-com-isto" run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8a2: NIGHTLY_REBOOT_COORDINATOR_TEMPLATES sobrescreve a lista" || bad "8a2: override ignorado: '$(line_of7 "$G3")'"
+
+echo "  -- 8b: construtor VIVO e recente -> BLOCK, com id e dono; bead de coordenadora ao lado nao conta --"
+reset7; write_fake_gate 1
+set_sess7 ok "[$BUILDER_SESS7,$MAYOR_SESS8]"
+set_bd7 json "[$(bead7 ga-build fake-builder 3),$(bead7 ga-mayor1 gastown.mayor 0)]"
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "8b: exit != 0" || bad "8b: exit 0 com construtor vivo trabalhando"
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8b: guard 3 = BLOCK" || bad "8b: guard 3 = '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "BLOCK hq beads in_progress = 1 blocking" >/dev/null && ok "8b: conta so o que bloqueia (1, nao 2)" || bad "8b: '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "ga-build" | grep -F "fake-builder" >/dev/null && ok "8b: nomeia o bead e o dono" || bad "8b: sem id/dono: '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "ga-mayor1" >/dev/null && bad "8b: bead da coordenadora apareceu como bloqueio" || ok "8b: bead da coordenadora fora do motivo do bloqueio"
+[ "$(line_count7)" = "3" ] && ok "8b: uma linha por guard" || bad "8b: esperava 3 linhas, veio $(line_count7)"
+
+echo "  -- 8c: construtor vivo mas PARADO (bead sem toque > janela) nao prende o reboot pra sempre; heartbeat conta como toque --"
+reset7; write_fake_gate 1; set_bd7 json "[$(bead7 ga-idle fake-builder 180)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "ok" ] && ok "8c: 180min sem toque -> nao bloqueia (zumbi nao trava o reboot)" || bad "8c: '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "ga-idle (idle 18" >/dev/null && ok "8c: a nota diz que esta parado" || bad "8c: '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1; set_bd7 json "[$(bead7 ga-recent fake-builder 55)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8c: 55min -> ainda dentro da janela de 60min -> BLOCK" || bad "8c: '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1; set_bd7 json "[$(bead7 ga-old fake-builder 65)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "ok" ] && ok "8c: 65min -> fora da janela -> ok" || bad "8c: '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1; set_bd7 json "[$(bead7 ga-idle fake-builder 180)]"
+NIGHTLY_REBOOT_ACTIVE_WINDOW_MIN=240 run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8c: NIGHTLY_REBOOT_ACTIVE_WINDOW_MIN=240 estica a janela" || bad "8c: '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1
+set_bd7 json "[{\"id\":\"ga-hb\",\"assignee\":\"fake-builder\",\"updated_at\":\"$(ts7 300)\",\"heartbeat_at\":\"$(ts7 2)\"}]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8c: updated_at velho mas heartbeat_at fresco -> BLOCK (vale o toque mais recente)" || bad "8c: '$(line_of7 "$G3")'"
+
+echo "  -- 8d: estado da sessao — vivo = tudo que nao for dormindo/suspensa/fechada; estado desconhecido nao e 'morto' --"
+for st in awake active start-pending creating frobnicating; do
+  reset7; write_fake_gate 1
+  set_sess7 ok "[$(sess7 ga-sess-b fake-builder fake-builder wa-worker "$st")]"; set_bd7 json "[$(bead7 ga-s fake-builder 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8d: state='$st' -> BLOCK" || bad "8d: state='$st' -> '$(line_of7 "$G3")'"
+done
+for st in asleep suspended closed drained; do
+  reset7; write_fake_gate 1
+  set_sess7 ok "[$(sess7 ga-sess-b fake-builder fake-builder wa-worker "$st")]"; set_bd7 json "[$(bead7 ga-s fake-builder 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "ok" ] && ok "8d: state='$st' -> ok (nada rodando pra matar)" || bad "8d: state='$st' -> '$(line_of7 "$G3")'"
+done
+reset7; write_fake_gate 1
+set_sess7 ok '[{"id":"ga-sess-b","issue_type":"session","status":"open","metadata":{"session_name":"fake-builder","template":"wa-worker"}}]'
+set_bd7 json "[$(bead7 ga-s fake-builder 0)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8d: sessao SEM campo state -> BLOCK (nao saber nao e 'morta')" || bad "8d: sem state -> '$(line_of7 "$G3")'"
+
+echo "  -- 8e: sessao EFEMERA (wisp, ex.: gate-reviewer) so aparece via 'bd query' — 'bd list --type session' e cego a ela --"
+reset7; write_fake_gate 1
+set_sess7 ok "[$(sess7 ga-wisp-8knnt8 gate-reviewer-adhoc-6f3b5db194 gate-reviewer-adhoc-6f3b5db194 gate-reviewer active)]"
+set_bd7 json "[$(bead7 ga-4a2j1y gate-reviewer-adhoc-6f3b5db194 1)]"
+rc=$(run_cg --check-guards)
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8e: revisor do gate vivo (wisp) -> BLOCK" || bad "8e: revisor vivo nao foi visto: '$(line_of7 "$G3")' — se o guard usou 'bd list --type session', so ve 7 de 20 sessoes"
+line_of7 "$G3" | grep -F "ga-4a2j1y" >/dev/null && ok "8e: nomeia o bead do revisor" || bad "8e: '$(line_of7 "$G3")'"
+
+echo "  -- 8f: nao consigo ler as sessoes -> unknown (nunca ok, nunca 'nenhuma sessao viva'); zero beads nem consulta --"
+reset7; write_fake_gate 1; set_sess7 fail '[]'; set_bd7 json "[$(bead7 ga-x fake-builder 0)]"
+rc=$(run_cg --check-guards)
+[ "$rc" != "0" ] && ok "8f: exit != 0" || bad "8f: exit 0 sem conseguir ler as sessoes — erro colapsado em 'sem sessao viva'"
+[ "$(state_of7 "$G3")" = "unknown" ] && ok "8f: guard 3 = unknown" || bad "8f: guard 3 = '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "session" | grep -F "connection refused" >/dev/null && ok "8f: diz POR QUE (sessoes) e preserva o stderr na mesma linha" || bad "8f: '$(line_of7 "$G3")'"
+[ "$(line_count7)" = "3" ] && ok "8f: uma linha por guard com stderr multilinha" || bad "8f: esperava 3 linhas, veio $(line_count7)"
+no_traceback7 && ok "8f: sem traceback" || bad "8f: traceback no stderr"
+reset7; write_fake_gate 1; set_sess7 fail '[]'; set_bd7 json '[]'
+rc=$(run_cg --check-guards)
+[ "$rc" = "0" ] && [ "$(cat "$BD7_QCOUNTER" 2>/dev/null || echo 0)" = "0" ] && ok "8f: zero beads in_progress -> ok sem sequer consultar as sessoes" || bad "8f: rc=$rc, query x$(cat "$BD7_QCOUNTER" 2>/dev/null || echo 0)"
+for junk in '{}' 'null' '"oops"' '["oops"]' '[1,2]'; do
+  reset7; write_fake_gate 1; set_sess7 ok "$junk"; set_bd7 json "[$(bead7 ga-x fake-builder 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "unknown" ] && ok "8f: sessoes = $junk -> unknown" || bad "8f: sessoes = $junk -> '$(line_of7 "$G3")'"
+done
+reset7; write_fake_gate 1; set_bd7 json '[7, "x"]'
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "unknown" ] && ok "8f: lista de beads com elemento que nao e objeto -> unknown" || bad "8f: '$(line_of7 "$G3")'"
+
+echo "  -- 8g: o dono do bead casa com a sessao por id, alias OU session_name --"
+for who in ga-sess-1 alias-1 sname-1; do
+  reset7; write_fake_gate 1
+  set_sess7 ok "[$(sess7 ga-sess-1 sname-1 alias-1 wa-worker awake)]"; set_bd7 json "[$(bead7 ga-w "$who" 0)]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8g: assignee='$who' casa com a sessao viva -> BLOCK" || bad "8g: assignee='$who' -> '$(line_of7 "$G3")'"
+done
+
+echo "  -- 8h: sessao viva mas hora do bead ilegivel/ausente -> BLOCK (nao saber a idade nao e 'parado') --"
+for badbead in '{"id":"ga-bad","assignee":"fake-builder","updated_at":"garbage"}' '{"id":"ga-none","assignee":"fake-builder"}' '{"id":"ga-null","assignee":"fake-builder","updated_at":null}'; do
+  reset7; write_fake_gate 1; set_bd7 json "[$badbead]"
+  run_cg --check-guards >/dev/null
+  [ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8h: $badbead -> BLOCK" || bad "8h: $badbead -> '$(line_of7 "$G3")'"
+  line_of7 "$G3" | grep -F "activity unknown" >/dev/null && ok "8h: diz que a atividade e desconhecida" || bad "8h: '$(line_of7 "$G3")'"
+done
+reset7; write_fake_gate 1; set_bd7 json "[{\"id\":\"ga-frac\",\"assignee\":\"fake-builder\",\"updated_at\":\"$(ts7 3 | sed 's/Z$//').123456789Z\"}]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "BLOCK" ] && ok "8h: timestamp com nanossegundos (Go RFC3339Nano), bead de 3min -> BLOCK" || bad "8h: nanossegundos: '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "activity unknown" >/dev/null && bad "8h: timestamp com fracao de segundo foi lido como DESCONHECIDO em vez de 3min" || ok "8h: a fracao de segundo e lida normalmente (idade real, nao 'desconhecida')"
+
+echo "  -- 8k: loja de sessoes que nao consegue NOMEAR nenhuma sessao -> unknown (senao todo dono vira 'sem sessao' e o guard passa por padrao) --"
+reset7; write_fake_gate 1; set_sess7 ok '[]'; set_bd7 json "[$(bead7 ga-x fake-builder 0)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "unknown" ] && ok "8k: nenhuma sessao no total, beads com dono -> unknown" || bad "8k: lista vazia -> '$(line_of7 "$G3")'"
+line_of7 "$G3" | grep -F "no sessions at all" >/dev/null && ok "8k: diz POR QUE" || bad "8k: '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1
+set_sess7 ok '[{"id":"ga-sess-b","issue_type":"session","status":"open","metadata":{"template":"wa-worker","state":"awake"}}]'
+set_bd7 json "[$(bead7 ga-x fake-builder 0)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "unknown" ] && ok "8k: sessoes sem session_name/alias legiveis (drift de schema) -> unknown, nao 'sem sessao viva'" || bad "8k: sem nomes -> '$(line_of7 "$G3")'"
+reset7; write_fake_gate 1; set_sess7 ok '[]'; set_bd7 json "[$(bead7 ga-u '' 0)]"
+run_cg --check-guards >/dev/null
+[ "$(state_of7 "$G3")" = "ok" ] && ok "8k: so beads sem dono + zero sessoes -> ok (nao ha dono pra casar; nao e erro)" || bad "8k: sem dono -> '$(line_of7 "$G3")'"
+
+echo "  -- 8i: o NOTURNO de ponta a ponta — so coordenacao em andamento -> chega ao reboot (shutdown FALSO) e zera o streak --"
+reset7; write_fake_gate 1
+set_sess7 ok "[$MAYOR_SESS8]"
+set_bd7 json "[$(bead7 ga-m1 gastown.mayor 0),$(bead7 ga-m2 gastown.mayor 600),$(bead7 ga-u '' 0),$(bead7 ga-n ghost 0),$(bead7 ga-m3 gastown.mayor 5)]"
+printf '12\n' > "$STREAK_FILE_PATH"
+rc=$(run_full8)
+[ -s "$SHUTDOWN_CALLS" ] && grep -F -- "-r now" "$SHUTDOWN_CALLS" >/dev/null && ok "8i: chegou ao reboot (fake): shutdown -r now" || bad "8i: NAO rebootou com 5 beads de coordenacao — o bug continua (rc=$rc; $(tail -3 "$FAKE_LOG" | tr '\n' '|'))"
+grep -F "guards OK on attempt 1/3" "$FAKE_LOG" >/dev/null && ok "8i: guards passaram na 1a tentativa" || bad "8i: log sem 'guards OK on attempt 1/3': $(tail -3 "$FAKE_LOG" | tr '\n' '|')"
+grep -F "5 hq in_progress beads not blocking" "$FAKE_LOG" >/dev/null && ok "8i: o log do noturno registra as 5 ignoradas" || bad "8i: log nao registra o que foi ignorado"
+[ "$(cat "$STREAK_FILE_PATH" 2>/dev/null)" = "0" ] && ok "8i: streak 12 -> 0 (a noite limpa zera)" || bad "8i: streak = '$(cat "$STREAK_FILE_PATH" 2>/dev/null)'"
+reset7; write_fake_gate 1
+set_sess7 ok "[$BUILDER_SESS7,$MAYOR_SESS8]"
+set_bd7 json "[$(bead7 ga-m1 gastown.mayor 0),$(bead7 ga-build fake-builder 2)]"
+rc=$(run_full8)
+[ ! -s "$SHUTDOWN_CALLS" ] && ok "8i: com um construtor vivo trabalhando o noturno NAO reinicia (fail-closed preservado)" || bad "8i: SAFETY — reiniciou com construtor vivo: $(cat "$SHUTDOWN_CALLS")"
+grep -F "SKIP: guards still blocked after 3/3 attempts" "$FAKE_LOG" >/dev/null && ok "8i: SKIP registrado apos esgotar as tentativas" || bad "8i: sem a linha de SKIP: $(tail -3 "$FAKE_LOG" | tr '\n' '|')"
+
+if declare -F g7 >/dev/null; then
+  echo "  -- 8j: mesmo caminho pela extracao por sentinela (check_guards_once) --"
+  reset7; write_fake_gate 1; set_sess7 ok "[$MAYOR_SESS8]"; set_bd7 json "[$(bead7 ga-m1 gastown.mayor 0),$(bead7 ga-u '' 0)]"
+  g7; rc=$?
+  [ "$rc" -eq 0 ] && ok "8j: check_guards_once retorna 0 com so coordenacao em andamento" || bad "8j: rc=$rc reason='${BLOCK_REASON:-}'"
+  case "${HQ_IGNORED_NOTE:-}" in "2 hq in_progress beads not blocking"*) ok "8j: HQ_IGNORED_NOTE guarda o que foi ignorado, pro log do noturno" ;; *) bad "8j: HQ_IGNORED_NOTE='${HQ_IGNORED_NOTE:-}'" ;; esac
+  reset7; write_fake_gate 1; set_bd7 json '[]'
+  g7; rc=$?
+  [ "$rc" -eq 0 ] && [ -z "${HQ_IGNORED_NOTE:-}" ] && ok "8j: sem beads -> HQ_IGNORED_NOTE vazio (nao vaza da avaliacao anterior)" || bad "8j: rc=$rc note='${HQ_IGNORED_NOTE:-}'"
+fi
 
 echo ""
 echo "nightly-reboot selftest: PASS=$PASS FAIL=$FAIL"
