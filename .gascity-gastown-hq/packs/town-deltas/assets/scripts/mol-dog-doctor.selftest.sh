@@ -159,7 +159,7 @@ fi
 echo "── db_last_commit_epoch() timezone correctness (ga-gh8mb) ──"
 
 DB_COMMIT_FN_TEXT=$(sed -n '/^db_last_commit_epoch()/,/^}/p' "$SCRIPT")
-if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -F "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)" >/dev/null; then
+if printf '%s' "$DB_COMMIT_FN_TEXT" | grep -F "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', " >/dev/null; then
   ok "db_last_commit_epoch() uses TIMESTAMPDIFF (timezone-agnostic), not session-tz-sensitive UNIX_TIMESTAMP"
 else
   bad "db_last_commit_epoch() does not use TIMESTAMPDIFF — the ga-gh8mb timezone double-conversion bug may have regressed"
@@ -969,8 +969,8 @@ rm -f "$STATE_FN_SNIPPET"
 # ── query timed out (10s, run_bounded exit 124) and `set -e` + `pipefail` turned    ──
 # ── that into the exit code of the whole probe. Plus ~103s of per-file forks in the ──
 # ── backup-mtime scan. Run against the pre-fix script: the timeout/ORDER BY/stat    ──
-# ── count/budget/unmeasured checks FAIL there (11 of the 14 new checks); the normal ──
-# ── reply and no-artifact checks are regression guards and pass on both.            ──
+# ── count/mtime/budget/unmeasured checks FAIL there; the normal reply and           ──
+# ── no-artifact checks are regression guards and pass on both.                      ──
 echo "── probe survives a timed-out step and finishes in time (ga-29lbag) ──"
 
 GA29_TMP="$(mktemp -d)"
@@ -1018,13 +1018,17 @@ if [ -s "$GA29_LCE_SNIP" ]; then
   fi
 
   # The query actually SENT: no full-history sort (ORDER BY is what made hq's query run >30s and
-  # get aborted by the server), and the ga-gh8mb timezone-agnostic form is kept.
+  # get aborted by the server), no dependence on dolt_log's row order (a bare `LIMIT 1` there is not
+  # an SQL guarantee, and an older commit coming back first would SUPPRESS a real stale-backup
+  # alarm), and the ga-gh8mb timezone-agnostic form is kept. The answer is MAX() over dolt_branches.
   if [ -s "$GA29_SQL_CAPTURE" ] && ! grep -qi 'ORDER BY' "$GA29_SQL_CAPTURE" \
-      && grep -qF 'LIMIT 1' "$GA29_SQL_CAPTURE" \
-      && grep -qF "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date)" "$GA29_SQL_CAPTURE"; then
-    ok "the dolt_log query sent has no ORDER BY (no full-history sort on hq) and keeps LIMIT 1 + TIMESTAMPDIFF"
+      && ! grep -qi 'dolt_log' "$GA29_SQL_CAPTURE" \
+      && grep -qF 'MAX(latest_commit_date)' "$GA29_SQL_CAPTURE" \
+      && grep -qF '.dolt_branches' "$GA29_SQL_CAPTURE" \
+      && grep -qF "TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', MAX(latest_commit_date))" "$GA29_SQL_CAPTURE"; then
+    ok "the commit-recency query reads MAX(latest_commit_date) from dolt_branches: no ORDER BY, no dependence on dolt_log's row order, TIMESTAMPDIFF kept"
   else
-    bad "the dolt_log query sent is wrong (ORDER BY back, LIMIT 1 or TIMESTAMPDIFF gone): $(cat "$GA29_SQL_CAPTURE" 2>/dev/null)"
+    bad "the commit-recency query sent is wrong (ORDER BY or dolt_log back, MAX(latest_commit_date) over dolt_branches or TIMESTAMPDIFF gone): $(cat "$GA29_SQL_CAPTURE" 2>/dev/null)"
   fi
 else
   bad "could not extract db_last_commit_epoch() from $SCRIPT"
@@ -1051,20 +1055,23 @@ chmod +x "$GA29_TMP/bin/stat"
 
 if [ -s "$GA29_MT_SNIP" ] && [ -n "$GA29_EXPECT" ]; then
   : > "$GA29_TMP/stat.calls"
-  GA29_GOT=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "source '$GA29_MT_SNIP'; newest_backup_mtime_for_db hq" 2>/dev/null)
+  # Under the script's own `set -euo pipefail`, as production runs it (gate fix: it used to run without).
+  GA29_GOT=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "set -euo pipefail; source '$GA29_MT_SNIP'; newest_backup_mtime_for_db hq" 2>/dev/null)
   GA29_CALLS=$(wc -l < "$GA29_TMP/stat.calls" | tr -d ' ')
   if [ "$GA29_GOT" = "$GA29_EXPECT" ]; then
     ok "newest_backup_mtime_for_db hq returns the newest hq artifact's mtime ($GA29_EXPECT) and ignores another db's newer file"
   else
     bad "newest_backup_mtime_for_db hq returned '$GA29_GOT', expected '$GA29_EXPECT'"
   fi
-  if [ "${GA29_CALLS:-999}" -le 2 ]; then
-    ok "61 matching files cost $GA29_CALLS stat invocation(s) (<=2: GNU form, then BSD fallback) — not one or two per file"
+  # 1..2, not just <=2 (gate fix): "0 calls" is a function that never reached stat at all, and a bound
+  # that only checks the upper end lets a broken/absent scan pass this check vacuously.
+  if [ "${GA29_CALLS:-999}" -ge 1 ] && [ "${GA29_CALLS:-999}" -le 2 ]; then
+    ok "61 matching files cost $GA29_CALLS stat invocation(s) (1-2: GNU form, then BSD fallback) — not one or two per file"
   else
-    bad "61 matching files cost $GA29_CALLS stat invocations — the per-file fork pattern (83s on hq at load ~40) is back"
+    bad "61 matching files cost $GA29_CALLS stat invocations, expected 1-2 (0 = the scan never ran; many = the per-file fork pattern, 83s on hq at load ~40, is back)"
   fi
   : > "$GA29_TMP/stat.calls"
-  GA29_NONE=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "source '$GA29_MT_SNIP'; newest_backup_mtime_for_db nosuchdb" 2>/dev/null)
+  GA29_NONE=$(PATH="$GA29_TMP/bin:$PATH" BACKUP_ARTIFACT_DIR="$GA29_ART" bash -c "set -euo pipefail; source '$GA29_MT_SNIP'; newest_backup_mtime_for_db nosuchdb" 2>/dev/null)
   if [ "$GA29_NONE" = "0" ] && [ ! -s "$GA29_TMP/stat.calls" ]; then
     ok "a db with no artifacts reports 0 (the caller's 'backup missing') without calling stat"
   else
@@ -1119,6 +1126,248 @@ if grep -qF 'Not measured this run: ${UNMEASURED_ITEMS}' "$SCRIPT" && grep -qF '
 else
   bad "unmeasured items no longer reach the report body and/or the summary line"
 fi
+# ── ga-29lbag gate fix (attempt 1): the THIRD STATE. "Nothing to warn about" is only a recovery ──
+# ── when every step that could warn was actually measured; and an unmeasured number must not ────
+# ── be persisted as a measured 0. Reviewer's repro, on the real script: healthy cycle -> 1 mail, ──
+# ── a cycle whose SHOW DATABASES failed reset the cooldown state to OK, the next healthy cycle ───
+# ── mailed the Mayor AGAIN seconds later (the ga-2uz59/ga-wrl5x duplicate-mail class).         ───
+echo "── an unmeasured cycle is not a recovery; an unmeasured value is not a measured 0 (ga-29lbag gate fix) ──"
+
+# Pure predicate first: only a fully measured cycle (empty list) may clear the cooldown state.
+GA29_RC_SNIP="$GA29_TMP/rc.sh"
+sed -n '/^recovery_is_confirmed()/,/^}/p' "$SCRIPT" > "$GA29_RC_SNIP"
+if [ -s "$GA29_RC_SNIP" ]; then
+  if bash -c "source '$GA29_RC_SNIP'; recovery_is_confirmed ''" 2>/dev/null \
+      && ! bash -c "source '$GA29_RC_SNIP'; recovery_is_confirmed 'database list (backup freshness skipped)'" 2>/dev/null \
+      && ! bash -c "source '$GA29_RC_SNIP'; recovery_is_confirmed 'a, b'" 2>/dev/null; then
+    ok "recovery_is_confirmed(): true only for an empty not-measured list"
+  else
+    bad "recovery_is_confirmed() gave the wrong answer for an empty / non-empty not-measured list"
+  fi
+else
+  bad "could not extract recovery_is_confirmed() from $SCRIPT"
+fi
+
+# state_write(): an unmeasured (empty) measurement is stored as null and reads back empty; a measured
+# 0 stays 0. Before the fix ${x:-0} stored a fake measured 0 for both, and the next cycle compared
+# against a value nobody ever saw.
+GA29_SW_SNIP="$GA29_TMP/sw.sh"
+sed -n '/^state_read_field()/,/^}/p;/^state_write()/,/^}/p' "$SCRIPT" > "$GA29_SW_SNIP"
+GA29_SW_OUT=$(bash -c "
+  set -euo pipefail
+  source '$GA29_SW_SNIP'
+  f='$GA29_TMP/sw.state.json'
+  state_write \"\$f\" MEDIUM 1790000000 84 '' ''
+  echo \"unmeasured conn=[\$(state_read_field \"\$f\" conn_count)] orphan=[\$(state_read_field \"\$f\" orphan_count)] json=\$(jq -c '[.conn_count,.orphan_count]' \"\$f\")\"
+  state_write \"\$f\" MEDIUM 1790000000 84 0 0
+  echo \"measured-zero conn=[\$(state_read_field \"\$f\" conn_count)] orphan=[\$(state_read_field \"\$f\" orphan_count)] json=\$(jq -c '[.conn_count,.orphan_count]' \"\$f\")\"
+" 2>&1)
+if [ "$GA29_SW_OUT" = "$(printf 'unmeasured conn=[] orphan=[] json=[null,null]\nmeasured-zero conn=[0] orphan=[0] json=[0,0]')" ]; then
+  ok "state_write() stores an unmeasured connection/orphan count as null (reads back empty) and keeps a measured 0 as 0"
+else
+  bad "state_write() null-vs-zero handling wrong: $(printf '%s' "$GA29_SW_OUT" | tr '\n' ' ')"
+fi
+
+# ── End-to-end on the REAL script (run as a child, never sourced), with stub dolt/gc first on PATH ──
+# ── and a stub `gc mail send` that records instead of mailing. runtime.sh/latency.sh are replaced ──
+# ── by a tiny shim: the real runtime.sh costs 6-10s of python start-ups per run at this city's ───
+# ── load, and this needs ~20 runs; the real bootstrap is covered by the checks near the top of ───
+# ── this file. Everything else — dolt_sql(), the probes, the state machine, the report — is the ──
+# ── shipped code. Validated by running this whole file against the revision the gate rejected ──
+# ── (34ce5307): 13 checks FAIL there — the state reset to OK after a blind cycle, the 2nd mail, ──
+# ── 0/0 persisted for unknown counts, the unnamed blind spots — and all pass on the fixed script; ──
+# ── the control and fresh-backup checks are regression guards and pass on both.                  ──
+GA29_DOCTOR="$SCRIPT"
+GA29_E2E="$GA29_TMP/e2e"
+mkdir -p "$GA29_E2E/bin" "$GA29_E2E/packs/dolt/assets/scripts"
+cat > "$GA29_E2E/packs/dolt/assets/scripts/runtime.sh" <<'SHIM'
+DOLT_DATA_DIR="${GC_DOLT_DATA_DIR}"
+GC_DOLT_PORT=39999
+run_bounded() { shift; "$@"; }
+SHIM
+cat > "$GA29_E2E/packs/dolt/assets/scripts/latency.sh" <<'SHIM'
+now_ms() { printf '%s\n' "$(( $(date +%s) * 1000 ))"; }
+latency_should_warn() { [ "$1" -ge "$2" ]; }
+SHIM
+cat > "$GA29_E2E/bin/dolt" <<'STUB'
+#!/bin/sh
+# stub dolt: `dolt backup` (CLI, run inside a db dir) and `dolt --host .. sql [-r csv] -q <query>`.
+# STUB_*_FAIL=1 makes that one step exit 124, exactly what run_bounded returns on a timeout.
+if [ "$1" = "backup" ]; then
+  [ "${STUB_BACKUP_FAIL:-0}" = 1 ] && exit 124
+  echo "$(basename "$PWD")-backup file:///stub"; exit 0
+fi
+q=""; for a in "$@"; do q="$a"; done
+case "$q" in
+  *active_branch*) printf 'active_branch()\nmain\n' ;;
+  *max_connections*) [ "${STUB_MAXCONN_FAIL:-0}" = 1 ] && exit 124; printf 'x\n256\n' ;;
+  *information_schema.PROCESSLIST*) [ "${STUB_COUNT_FAIL:-0}" = 1 ] && exit 124; printf 'c\n7\n' ;;
+  *"SHOW DATABASES"*) [ "${STUB_DBLIST_FAIL:-0}" = 1 ] && exit 124; printf 'Database\nhq\nlexbh\ninformation_schema\n' ;;
+  *dolt_branches*|*dolt_log*) [ "${STUB_COMMIT_FAIL:-0}" = 1 ] && exit 124; printf 'x\n%s\n' "${STUB_COMMIT_EPOCH:-0}" ;;
+  *) exit 0 ;;
+esac
+STUB
+cat > "$GA29_E2E/bin/gc" <<'STUB'
+#!/bin/sh
+# stub gc: mail is recorded, never sent; canned replies for the few other calls the doctor makes.
+case "$1 $2" in
+  "mail send") { printf 'MAIL:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$STUB_MAILLOG"; exit 0 ;;
+  "agent list") echo '{"agents":[{"qualified_name":"gastown.deacon","suspended":true}]}'; exit 0 ;;
+esac
+if [ "$1" = "dolt-cleanup" ]; then
+  [ "${STUB_CLEANUP_FAIL:-0}" = 1 ] && { echo '{"ok":false}'; exit 1; }
+  echo '{"ok":true,"summary":{"errors_total":0},"dropped":{"count":0}}'; exit 0
+fi
+exit 0
+STUB
+chmod +x "$GA29_E2E/bin/dolt" "$GA29_E2E/bin/gc"
+
+# ga29_new <name> [fresh] — a scratch city with two dbs whose backups are 2025 old (stale) unless "fresh".
+ga29_new() {
+  local d="$GA29_E2E/s-$1" db
+  mkdir -p "$d/city" "$d/home" "$d/state"
+  for db in hq lexbh; do
+    mkdir -p "$d/data/$db/.dolt" "$d/art/$db"
+    : > "$d/art/$db/backup.bin"
+    [ "${2:-}" = "fresh" ] || touch -t 202501010101 "$d/art/$db/backup.bin"
+  done
+  printf '%s\n' "$d"
+}
+ga29_fresh()  { touch "$1"/art/*/backup.bin; }
+# ga29_cycle <scenario-dir> [VAR=value ...] — one run of the doctor; output in <dir>/last.out
+ga29_cycle() {
+  local d="$1"; shift
+  env -i PATH="$GA29_E2E/bin:$PATH" HOME="$d/home" GC_CITY_PATH="$d/city" \
+      GC_SYSTEM_PACKS_DIR="$GA29_E2E/packs" GC_DOLT_DATA_DIR="$d/data" \
+      GC_DOCTOR_STATE_DIR="$d/state" GC_BACKUP_ARTIFACT_DIR="$d/art" \
+      STUB_MAILLOG="$d/mail.log" STUB_COMMIT_EPOCH="$(date +%s)" "$@" \
+      bash "$GA29_DOCTOR" > "$d/last.out" 2>&1
+  echo $? > "$d/last.rc"
+}
+ga29_mails() { local n; n=$(grep -c '^MAIL:' "$1/mail.log" 2>/dev/null); echo "${n:-0}"; }
+ga29_class() { jq -r '.class // "?"' "$1/state/mol-dog-doctor.state.json" 2>/dev/null || echo "?"; }
+ga29_field() { jq -r --arg f "$2" 'if has($f) then (.[$f] | if . == null then "null" else tostring end) else "absent" end' "$1/state/mol-dog-doctor.state.json" 2>/dev/null || echo "?"; }
+
+# Each scenario is a function that prints "ok: <msg>" / "bad: <msg>" lines. They are independent (own
+# scratch city), so they run in PARALLEL: a doctor cycle forks dozens of processes and a fork costs
+# 0.1-0.2s at this city's load, so ~15 cycles back to back would be minutes. The MEDIUM starting
+# state is written with the script's OWN state_write (not hand-built JSON) instead of spending a
+# whole cycle to reach it.
+sc_ok()  { echo "ok: $1"; }
+sc_bad() { echo "bad: $(printf '%s' "$1" | tr '\n' ' ')"; }
+ga29_seed_medium() {   # $1 scenario dir — as if a MEDIUM advisory was mailed just now
+  bash -c "source '$GA29_SW_SNIP'; state_write '$1/state/mol-dog-doctor.state.json' MEDIUM \"\$(date +%s)\" 0 7 0"
+}
+
+# Reviewer's repro. State: MEDIUM was mailed a moment ago and the backup is still stale. A cycle whose
+# SHOW DATABASES failed must NOT reset that state, so the next healthy cycle must not mail again.
+sc_repro() {
+  local d; d=$(ga29_new repro); ga29_seed_medium "$d"
+  ga29_cycle "$d" STUB_DBLIST_FAIL=1
+  local rc c2 m2 log2; rc=$(cat "$d/last.rc"); c2=$(ga29_class "$d"); m2=$(ga29_mails "$d"); log2=$(cat "$d/last.out")
+  ga29_cycle "$d"; local m3; m3=$(ga29_mails "$d")
+  if [ "$rc" = "0" ] && [ "$c2" = "MEDIUM" ] && [ "$m2" = "0" ] && [ "$m3" = "0" ]; then
+    sc_ok "stale backup: a cycle whose SHOW DATABASES failed leaves the cooldown state at MEDIUM, and the next healthy cycle does NOT mail the Mayor a second time"
+  else
+    sc_bad "unmeasured cycle reset the alert state or re-mailed: failing cycle rc=$rc state=$c2 mails=$m2, next healthy cycle mails=$m3 (expected rc=0, MEDIUM, 0, 0)"
+  fi
+  case "$log2" in
+    *"recovery is not confirmed"*) sc_ok "the skipped state reset is logged ('recovery is not confirmed — state left as-is'), not silent" ;;
+    *) sc_bad "an unmeasured cycle left the state alone but did not say so: $log2" ;;
+  esac
+}
+
+# Control for the above: with nothing failing, repeated cycles on a stale backup mail exactly once
+# (so a 2nd mail in the repro could only come from the state having been reset). Also the measured
+# side of the snapshot: real counts persist as numbers.
+sc_control() {
+  local d; d=$(ga29_new control)
+  ga29_cycle "$d"; ga29_cycle "$d"
+  if [ "$(ga29_mails "$d")" = "1" ] && [ "$(ga29_class "$d")" = "MEDIUM" ]; then
+    sc_ok "control: two healthy cycles on a stale backup mail the Mayor once (the cooldown works)"
+  else
+    sc_bad "control run mailed $(ga29_mails "$d") time(s) / class $(ga29_class "$d") — expected 1 / MEDIUM"
+  fi
+  local snap; snap="$(ga29_field "$d" conn_count)/$(ga29_field "$d" orphan_count)"
+  if [ "$snap" = "7/0" ]; then
+    sc_ok "state file: measured connections/orphans persist as the numbers 7/0"
+  else
+    sc_bad "state file: measured connections/orphans persisted as $snap (want 7/0)"
+  fi
+}
+
+# Every blind spot that can hide a warning. Backup FRESH (the cycle would otherwise look recovered),
+# MEDIUM already recorded: a cycle that could not look must keep MEDIUM and name what it missed.
+ga29_blind_spot() {   # $1 label, $2 expected "not measured" text, $3 "clear" to also run the recovery cycle, rest: env overrides
+  local label="$1" expect="$2" clear="$3"; shift 3
+  local d; d=$(ga29_new "blind-$label" fresh); ga29_seed_medium "$d"
+  ga29_cycle "$d" "$@"
+  local held named=no; held=$(ga29_class "$d"); grep -qF -- "$expect" "$d/last.out" && named=yes
+  if [ "$held" = "MEDIUM" ] && [ "$named" = "yes" ] && [ "$(ga29_mails "$d")" = "0" ]; then
+    sc_ok "blind spot '$label': the cycle names it ('$expect') and keeps the MEDIUM state"
+  else
+    sc_bad "blind spot '$label': state after the blind cycle=$held (want MEDIUM), named in report=$named (want yes), mails=$(ga29_mails "$d") (want 0)"
+  fi
+  if [ "$clear" = "clear" ]; then
+    ga29_cycle "$d"
+    if [ "$(ga29_class "$d")" = "OK" ]; then
+      sc_ok "a fully measured cycle with no warnings still clears MEDIUM to OK (the guard does not make the state sticky forever)"
+    else
+      sc_bad "a fully measured, warning-free cycle left the state at $(ga29_class "$d") instead of OK"
+    fi
+  fi
+}
+sc_blind_dblist()     { ga29_blind_spot dblist     "database list"         clear STUB_DBLIST_FAIL=1; }
+sc_blind_backup_cli() { ga29_blind_spot backup-cli "backup remotes of"     no    STUB_BACKUP_FAIL=1; }
+sc_blind_budget()     { ga29_blind_spot budget     "probe budget"          no    GC_DOCTOR_BUDGET_S=0; }
+sc_blind_conn_count() { ga29_blind_spot conn-count "connection count"      no    STUB_COUNT_FAIL=1; }
+sc_blind_conn_limit() { ga29_blind_spot conn-limit "connection limit"      no    STUB_MAXCONN_FAIL=1; }
+sc_blind_orphans()    { ga29_blind_spot orphans    "orphan database count" no    STUB_CLEANUP_FAIL=1; }
+
+# The persisted snapshot: an unmeasured count is null, never a made-up 0, and the mail says 'unknown'.
+sc_snapshot() {
+  local d; d=$(ga29_new snap-unmeasured); ga29_cycle "$d" STUB_COUNT_FAIL=1 STUB_CLEANUP_FAIL=1
+  local snap; snap="$(ga29_field "$d" conn_count)/$(ga29_field "$d" orphan_count)"
+  if [ "$snap" = "null/null" ] && grep -qF 'Connections: unknown/256' "$d/mail.log" && grep -qF 'Orphan DBs: unknown' "$d/mail.log"; then
+    sc_ok "state file: a failed COUNT(*) and a failed orphan probe persist as null/null (not 0/0), matching the 'unknown' in the mail"
+  else
+    sc_bad "unmeasured connection/orphan counts persisted as $snap (want null/null): $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null)"
+  fi
+}
+
+# db_last_commit_epoch failing (the query this PR is about) is counted, but only when it matters: the
+# epoch can only turn a warning into 'no warning', so it is a blind spot exactly when the age-only fallback warned.
+sc_commit_stale() {
+  local d; d=$(ga29_new lc-stale); ga29_cycle "$d" STUB_COMMIT_FAIL=1
+  if grep -qF 'backup is' "$d/mail.log" && grep -qF 'Not measured this run: ' "$d/mail.log" && grep -qF 'last commit of hq' "$d/mail.log"; then
+    sc_ok "commit-time query failed + backup old by age alone: the warning is sent AND the report says the commit time was not measured (the alarm may be a false one on an idle db)"
+  else
+    sc_bad "a failed commit-time query behind an age-only backup warning is not reported as unmeasured: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null)"
+  fi
+}
+sc_commit_fresh() {
+  local d; d=$(ga29_new lc-fresh fresh); ga29_seed_medium "$d"; ga29_cycle "$d" STUB_COMMIT_FAIL=1
+  if [ "$(ga29_class "$d")" = "OK" ] && ! grep -qF 'last commit of' "$d/last.out"; then
+    sc_ok "commit-time query failed but the backup is fresh by age: fully measured (the epoch cannot change that verdict), so the state clears to OK and nothing is listed as unmeasured"
+  else
+    sc_bad "fresh backup + failed commit-time query: state=$(ga29_class "$d") (want OK), output: $(tr '\n' ' ' < "$d/last.out")"
+  fi
+}
+
+GA29_SCENARIOS="repro control blind_dblist blind_backup_cli blind_budget blind_conn_count blind_conn_limit blind_orphans snapshot commit_stale commit_fresh"
+for GA29_N in $GA29_SCENARIOS; do ( "sc_$GA29_N" > "$GA29_E2E/res.$GA29_N" 2>&1 ) & done
+wait
+for GA29_N in $GA29_SCENARIOS; do
+  if [ ! -s "$GA29_E2E/res.$GA29_N" ]; then bad "e2e scenario '$GA29_N' produced no result"; continue; fi
+  while IFS= read -r GA29_LINE; do
+    case "$GA29_LINE" in
+      "ok: "*)  ok  "${GA29_LINE#ok: }" ;;
+      "bad: "*) bad "${GA29_LINE#bad: }" ;;
+      *)        bad "e2e scenario '$GA29_N' printed unexpected output: $GA29_LINE" ;;
+    esac
+  done < "$GA29_E2E/res.$GA29_N"
+done
+
 rm -rf "$GA29_TMP"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="

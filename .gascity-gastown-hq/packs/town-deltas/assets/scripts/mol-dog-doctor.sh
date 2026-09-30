@@ -193,14 +193,15 @@ newest_backup_mtime_for_db() {
 }
 
 # db_last_commit_epoch <db_name> — live query, epoch seconds of the db's newest
-# dolt_log commit (integer; CAST ... AS SIGNED drops the sub-second fraction
+# commit on any branch (integer; CAST ... AS SIGNED drops the sub-second fraction
 # a ms-precision `date` column carries, which bash's integer `-le`/`-gt`
 # tests below cannot parse). Empty output on any failure (unreachable
 # server, missing db) — dolt_sql() is already bounded, and stderr is
 # discarded same as every other dolt_sql call in this script.
 #
 # ga-gh8mb: uses TIMESTAMPDIFF(SECOND, epoch, date), NOT UNIX_TIMESTAMP(date).
-# dolt_log.date is already UTC, but UNIX_TIMESTAMP() interprets a naive
+# The commit date (dolt_log.date then, dolt_branches.latest_commit_date now — same UTC value, see
+# ga-29lbag below) is already UTC, but UNIX_TIMESTAMP() interprets a naive
 # datetime string as being in the SESSION's time zone (@@time_zone=SYSTEM,
 # which on this city's server resolves to @@system_time_zone=-03) and
 # converts it to epoch from there — double-converting an already-UTC value
@@ -217,11 +218,17 @@ newest_backup_mtime_for_db() {
 #  1. `ORDER BY date DESC` forces Dolt to read and sort the db's WHOLE commit history. hq gets a
 #     commit per bd write; measured 30/09 (load 40-80), that query took 31s on hq and the server
 #     aborted it ("row read wait bigger than connection timeout") — three times the 10s step bound,
-#     so a 124 whenever it is that slow (48 runs in 6 days did not get through). dolt_log already walks
-#     newest-first from HEAD, so `LIMIT 1` alone answers in ~0.2s. It returned the identical epoch to
-#     the ORDER BY form on 6 of the 7 other dbs (beads, dc, gastown, lexbh, marketing,
-#     whatsapp_automation; property_scrapers commits every minute so it was not compared); on hq the
-#     ORDER BY form cannot finish, so there is nothing to compare — `LIMIT 1` returned a value from the last minute.
+#     so a 124 whenever it is that slow (48 runs in 6 days did not get through). The answer now comes
+#     from dolt_branches (one row per branch, so tiny whatever the history size): the newest
+#     latest_commit_date over ALL branches. A first attempt used `dolt_log ... LIMIT 1`, which is
+#     fast but leans on dolt_log returning HEAD first — an ordering SQL does not promise, and if it
+#     ever handed back an older commit, `last_commit <= backup_mtime` would SUPPRESS a real stale-
+#     backup alarm (the dangerous direction). MAX() does not depend on row order, and a branch we
+#     did not expect can only make the value newer, i.e. bias toward warning, never toward silence.
+#     Measured 30/09 (load ~30): the same epoch as `dolt_log LIMIT 1` on all 8 databases (hq,
+#     whatsapp_automation, gastown, dc, lexbh, marketing, property_scrapers, beads), ~1s each
+#     including the CLI start-up, and dolt_branches.latest_commit_date is UTC like dolt_log.date, so
+#     the ga-gh8mb TIMESTAMPDIFF form below stays correct.
 #  2. The docblock promised "Empty output on any failure", but the old body was a bare pipeline:
 #     under this script's `set -eo pipefail` a timed-out dolt_sql (run_bounded exit 124) made the
 #     FUNCTION return 124, and the caller's plain `DB_LAST_COMMIT_EPOCH=$(...)` assignment then
@@ -231,7 +238,7 @@ newest_backup_mtime_for_db() {
 db_last_commit_epoch() {
     db_name="$1"
     local epoch=""
-    epoch=$(dolt_sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', date) AS SIGNED) FROM \`$db_name\`.dolt_log LIMIT 1" 2>/dev/null | tail -1) || epoch=""
+    epoch=$(dolt_sql -r csv -q "SELECT CAST(TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', MAX(latest_commit_date)) AS SIGNED) FROM \`$db_name\`.dolt_branches" 2>/dev/null | tail -1) || epoch=""
     case "$epoch" in
         ''|*[!0-9]*) epoch="" ;;
     esac
@@ -366,22 +373,44 @@ state_read_field() {
 }
 
 # state_write <state_file> <class> <alert_at> <latency_ms> <conn_count> <orphan_count>
-# Atomic (tmp+mv) write of the cooldown-state snapshot. Empty numeric args
-# (used for the OK/recovered cycle, which only wants to record class="OK")
-# collapse to 0 via ${x:-0} — never left blank, which would fail --argjson.
+# Atomic (tmp+mv) write of the cooldown-state snapshot. Empty args are never
+# left blank (that would fail --argjson). alert_at collapses to 0, which
+# state_read_field/the elapsed-time check read as "no alert recorded". The three
+# MEASUREMENTS (latency_ms, conn_count, orphan_count) are written as JSON null
+# when empty (ga-29lbag gate fix): an unmeasured count is not a measured 0, and
+# a fake 0 in the snapshot made the next cycle compare against a value nobody
+# ever saw. state_read_field reads null back as empty, which
+# advisory_should_alert() treats as "no baseline" (any in-WARN metric then
+# counts as worse — the cautious side), the same as the first-ever run.
 # Best-effort: a write failure (unwritable state dir, disk full) must not
 # take down the doctor probe itself, so this always returns 0.
 state_write() {
     local state_file="$1" class="$2" alert_at="$3" latency_ms="$4" conn_count="$5" orphan_count="$6"
     mkdir -p "$(dirname "$state_file")" 2>/dev/null || true
     jq -n --arg class "$class" --argjson alert_at "${alert_at:-0}" \
-        --argjson latency_ms "${latency_ms:-0}" --argjson conn_count "${conn_count:-0}" \
-        --argjson orphan_count "${orphan_count:-0}" \
+        --argjson latency_ms "${latency_ms:-null}" --argjson conn_count "${conn_count:-null}" \
+        --argjson orphan_count "${orphan_count:-null}" \
         '{class: $class, alert_at: $alert_at, latency_ms: $latency_ms, conn_count: $conn_count, orphan_count: $orphan_count}' \
         > "${state_file}.tmp.$$" 2>/dev/null \
         && mv -f "${state_file}.tmp.$$" "$state_file" 2>/dev/null \
         || rm -f "${state_file}.tmp.$$" 2>/dev/null
     return 0
+}
+
+# recovery_is_confirmed <unmeasured_items> — pure predicate (ga-29lbag gate fix, third state).
+# "No warning this cycle" only means "recovered" when every step that could raise a warning was
+# actually measured. UNMEASURED_ITEMS is deliberately kept out of WARNINGS (a blind spot under load
+# must not page the Mayor every cooldown), so a cycle whose SHOW DATABASES failed, whose
+# `dolt backup` timed out, or whose probe budget ran out reaches the no-warning branch with an
+# EMPTY warning set for the wrong reason: it did not look. Clearing the cooldown state there is
+# what the branch does when it KNOWS things are fine — the next fully measured cycle then saw the
+# same stale backup as a fresh OK->MEDIUM transition and mailed the Mayor a second time within
+# seconds (reproduced on the real script, 3 cycles). Only a fully measured cycle (empty list) may
+# clear it; otherwise the state stays as it was. Cost of that caution: an incident that really did
+# recover stays recorded as MEDIUM until the next fully measured cycle, and the 6h cooldown
+# bounds how long a genuinely new warning could be held back in the meantime.
+recovery_is_confirmed() {
+    [ -z "$1" ]
 }
 
 # advisory_should_alert <prev_class> <elapsed_s> <cooldown_s> \
@@ -484,6 +513,12 @@ if [ -z "$CONN_MAX" ]; then
     esac
 fi
 CONN_MAX_DISPLAY="${CONN_MAX:-unknown}"
+# ga-29lbag gate fix: every step that can raise a warning is registered as "not measured" when it
+# yields nothing, so an empty warning set is only read as recovery for a cycle that really looked
+# (see recovery_is_confirmed()). Without a known limit conn_should_warn() never warns.
+if [ -z "$CONN_MAX" ]; then
+    append_unmeasured "connection limit"
+fi
 
 # ga-29lbag: a timed-out/failed count used to fall into `|| echo "0"` and be reported as a MEASURED
 # zero ("0/256") — the same error==empty collapse CONN_MAX and ORPHAN_COUNT already avoid. The
@@ -495,6 +530,9 @@ case "$CONN_COUNT_NUM" in
     ''|*[!0-9]*) CONN_COUNT_NUM="" ;;
 esac
 CONN_COUNT="${CONN_COUNT_NUM:-unknown}"
+if [ -z "$CONN_COUNT_NUM" ]; then
+    append_unmeasured "connection count"
+fi
 CONN_WARN=""
 if conn_should_warn "$CONN_COUNT_NUM" "$CONN_MAX" "$CONN_WARN_PCT"; then
     CONN_WARN=" [WARN: ${CONN_COUNT} connections >= ${CONN_WARN_PCT}% of max ${CONN_MAX}]"
@@ -541,6 +579,9 @@ else
     ORPHAN_COUNT=""
 fi
 ORPHAN_COUNT_DISPLAY="${ORPHAN_COUNT:-unknown}"
+if [ -z "$ORPHAN_COUNT" ]; then
+    append_unmeasured "orphan database count"
+fi
 ORPHAN_WARN=""
 if [ -n "$ORPHAN_COUNT" ] && [ "$ORPHAN_COUNT" -gt 0 ]; then
     ORPHAN_WARN=" [WARN: $ORPHAN_COUNT orphan DBs detected — run gc dolt-cleanup]"
@@ -596,6 +637,14 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
             if backup_should_warn "$NEWEST_BACKUP_MTIME" "$NOW_S" "$BACKUP_STALE_S" "$DB_LAST_COMMIT_EPOCH"; then
                 BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
                 append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+                # ga-29lbag gate fix: the commit epoch can only turn a warning into "no warning"
+                # (an idle db whose backup already has its newest commit). With the epoch missing
+                # this warning came from the age alone, so it may be a false alarm on an idle db —
+                # say so. When the age-only check does NOT warn, the missing epoch changes nothing
+                # (fresh either way), so that case is fully measured and is not listed.
+                if [ -z "$DB_LAST_COMMIT_EPOCH" ]; then
+                    append_unmeasured "last commit of $db (its backup-age warning is age-only)"
+                fi
             fi
         done
         if [ -n "$BACKUP_STALE_ITEMS" ]; then
@@ -667,9 +716,15 @@ else
     # Recovered (or never triggered) — clear the recorded class to OK so a
     # FUTURE MEDIUM occurrence is treated as a fresh transition and alerts
     # immediately, rather than inheriting a stale cooldown from an already-
-    # resolved incident (ga-2uz59 AC1a).
+    # resolved incident (ga-2uz59 AC1a). ga-29lbag gate fix: only when the cycle
+    # was fully measured — see recovery_is_confirmed(). An unmeasured cycle proves
+    # nothing about recovery, so the state file is left exactly as it was.
     if [ -f "$STATE_FILE" ]; then
-        state_write "$STATE_FILE" "OK" "" "" "" ""
+        if recovery_is_confirmed "$UNMEASURED_ITEMS"; then
+            state_write "$STATE_FILE" "OK" "" "" "" ""
+        else
+            echo "doctor: no warning this cycle, but recovery is not confirmed — state left as-is (not measured: $UNMEASURED_ITEMS)"
+        fi
     fi
 fi
 
