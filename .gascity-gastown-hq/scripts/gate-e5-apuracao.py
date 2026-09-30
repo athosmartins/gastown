@@ -220,7 +220,7 @@ def build_runs(events, since):
         if since and str(ev.get("ts", ""))[:10] < since:
             continue
         if ev["event"] == "e5_admit" and g:
-            runs[g] = {"gate_run": g, "bead": ev.get("bead", ""), "arm": ev.get("arm", "A"), "ts": ev.get("ts", ""),
+            runs[g] = {"gate_run": g, "bead": ev.get("bead", ""), "arm": ev.get("arm") or "?", "ts": ev.get("ts", ""),
                        "trigger": ev.get("trigger", "none"), "size_state": ev.get("size_state", ""),
                        "raw_lines": ev.get("raw_lines", ""), "rig": ev.get("rig", ""), "tier": ev.get("tier", ""),
                        "result": None, "reason": "", "extra": None, "declined": None, "abandoned": None,

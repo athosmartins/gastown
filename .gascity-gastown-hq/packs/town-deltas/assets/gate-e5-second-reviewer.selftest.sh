@@ -242,17 +242,49 @@ Blocking issue 1: an unrelated problem in other.py:5 with the parser
 EOF
 mk_payload "1=$TMP/same.txt" "2=$TMP/other.txt" | union | jq -r '.stats | "\(.duplicates_merged),\(.distinct_issues)"' > "$TMP/o.txt"
 check "two similar issues of the SAME reviewer stay two (0 merged, 3 distinct)" "0,3" "$(cat "$TMP/o.txt")"
-# same file+line but a DIFFERENT defect (low overlap) -> kept
+# same file+line but a DIFFERENT defect (low overlap) -> kept. The file names are REAL length on
+# purpose (gate attempt 1, ga-syxaki): with a 6-char "run.sh" the path contributes no tokens, so this
+# fixture never exercised the thing it claims to test — path words inflating the overlap.
 cat > "$TMP/d1.txt" <<'EOF'
 VERDICT: FAIL
-Blocking issue 1: run.sh:40 swallows the curl failure and returns an empty default instead of an error
+Blocking issue 1: packs/town-deltas/assets/quality-gate-dispatcher.sh:40 swallows the curl failure and returns an empty default instead of an error
 EOF
 cat > "$TMP/d2.txt" <<'EOF'
 VERDICT: FAIL
-Blocking issue 1: run.sh:40 the comment above claims retries happen three times but the loop body executes once
+Blocking issue 1: packs/town-deltas/assets/quality-gate-dispatcher.sh:40 the comment above claims retries happen three times but the loop body executes once
 EOF
 mk_payload "1=$TMP/d1.txt" "2=$TMP/d2.txt" | union | jq -r '.stats | "\(.duplicates_merged),\(.distinct_issues)"' > "$TMP/o.txt"
 check "same file:line but a different defect stays separate (0 merged, 2 distinct)" "0,2" "$(cat "$TMP/o.txt")"
+u_pair() { # u_pair <issue text of reviewer 1> <issue text of reviewer 2> -> "<merged>,<distinct>"
+  printf 'VERDICT: FAIL\n%s\n' "$1" > "$TMP/up1.txt"; printf 'VERDICT: FAIL\n%s\n' "$2" > "$TMP/up2.txt"
+  mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r '.stats | "\(.duplicates_merged),\(.distinct_issues)"'
+}
+# gate attempt 1, blocking issue 1 — the two repros the reviewer ran against the branch. Both cite the same REAL
+# file a couple of lines apart; the defects differ. Only the path words (scripts, gate, switch...) and a few
+# common words are shared, which used to reach the 0.50 overlap-over-the-smaller-side bar.
+check "same real file, lines 40 vs 42, two DIFFERENT defects: not merged (path words are not a description)" "0,2" \
+  "$(u_pair 'Blocking issue 1: scripts/gate-e5-switch.sh:40 - the quoting of $cite is missing' \
+            'Blocking issue 1: scripts/gate-e5-switch.sh:42 - the refusal when the flag file is absent exits zero')"
+LONG_OTHER='Blocking issue 1: packs/town-deltas/assets/quality-gate-dispatcher.sh:10141 the function gate_e5_union_reasons rewrites FAIL_REASONS with a backslash-n tail while the legacy concatenation ends with a real newline, so downstream watchdogs that parse the Reviewer N FAIL prefix see a doubled prefix on the last line'
+check "a SHORT finding is not absorbed by a LONG one about another defect that merely names the same identifier" "0,2" \
+  "$(u_pair 'Blocking issue 1: quality-gate-dispatcher.sh:10140 - gate_e5_union_reasons ignores its return code' "$LONG_OTHER")"
+check "...and the short finding survives in the merged text the builder reads" 1 \
+  "$(printf 'VERDICT: FAIL\n%s\n' 'Blocking issue 1: quality-gate-dispatcher.sh:10140 - gate_e5_union_reasons ignores its return code' > "$TMP/up1.txt"; printf 'VERDICT: FAIL\n%s\n' "$LONG_OTHER" > "$TMP/up2.txt"; mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .text | grep -c 'ignores its return code')"
+# ...and the fix must not turn the dedupe off: a genuine duplicate in different words, real-length names, still merges.
+check "the SAME defect in different words (paths of different length, lines 10503 vs 10500-10510) is still merged" "1,1" \
+  "$(u_pair "Blocking issue 1: packs/town-deltas/assets/quality-gate-dispatcher.sh:10503 gate_e5_phase_c_hook reads VB_JSON as the run's verdict-bead list, but gate_collect_verdicts overwrites that global VB_JSON once per bead, so after the collect the hook sees only the last bead's JSON." \
+            "Blocking issue 2: quality-gate-dispatcher.sh:10500-10510 VB_JSON is a global clobbered by gate_collect_verdicts for every bead; gate_e5_phase_c_hook then reads VB_JSON, which now holds just the last verdict bead, not the run's list.")"
+# a citation alone never decides: same file + same line, NOTHING else in common
+check "same file:line and no description in common: not merged" "0,2" \
+  "$(u_pair 'Blocking issue 1: scripts/gate-e5-switch.sh:40 alpha bravo charlie delta' 'Blocking issue 1: scripts/gate-e5-switch.sh:40 echo foxtrot golf hotel')"
+# the merged header no longer promises an absolute it cannot keep
+check "the merged header makes no 'nothing else was dropped' absolute" 0 \
+  "$(printf 'VERDICT: FAIL\nBlocking issue 1: a.py:1 x\n' > "$TMP/up1.txt"; cp "$TMP/up1.txt" "$TMP/up2.txt"; mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .text | grep -c 'Nothing else was dropped')"
+# a verdict line that carries more than the keyword is kept, not swallowed whole (gate attempt 1, non-blocking)
+printf 'VERDICT: FAIL — reviewed at SHA 9f3c2ab over the FULL diff\nBlocking issue 1: scripts/gate-e5-switch.sh:40 alpha bravo charlie delta\n' > "$TMP/up1.txt"
+printf 'VERDICT: FAIL\nBlocking issue 1: other_file_name.py:7 echo foxtrot golf hotel\n' > "$TMP/up2.txt"
+check "text after 'VERDICT: FAIL' on the verdict line is kept in the merged notes" 1 \
+  "$(mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .text | grep -c 'reviewed at SHA 9f3c2ab over the FULL diff')"
 # explicit, DIFFERENT class tags decide it even when the text overlaps
 cat > "$TMP/c1.txt" <<'EOF'
 VERDICT: FAIL
@@ -350,6 +382,11 @@ gc() {
 }
 git_rig() { echo "git_rig $*" >> "$CALLS"; return 0; }
 GC_CITY="$CITYDIR"; QG_LOG="$CITYDIR/.gc/quality-gate.jsonl"; BRANCH="crew/x/ga-demo"; GATE_RUN_ID="ga-run001"; BEAD_CITY="$CITYDIR"
+# gate attempt 1, blocking issue 2: gate_collect_verdicts assigns the GLOBAL VB_JSON once per bead, so by the time the
+# hook runs it holds ONE bead's answer — not the run's list. Every hook scenario below hands the hook the run's real
+# list through GATE_E5_RUN_VB_JSON and leaves VB_JSON on this clobbered value, so a hook that reads VB_JSON again
+# takes a different decision and its scenario fails.
+CLOBBERED_VB_JSON='[{"id":"ga-vb0001","status":"closed","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"]}]'
 source "$LIBFILE"
 EOF
 TASK1_TEXT="$(printf '%s' "$TASK_OFF" | sed 's/ga-vb0001/ga-vb0001/g')"
@@ -366,7 +403,8 @@ scn() { # scn <fixdir> <env...> -- <script>
   env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" FIXDIR="$fix" CITYDIR="$TMP/city" LIBFILE="$LIB" ${envs[@]+"${envs[@]}"} "$BASH32" "$fix/scn.sh" 2>"$fix/stderr"
 }
 HOOK_COMMON='
-VB_JSON="[{\"id\":\"ga-vb0001\",\"status\":\"closed\",\"created_at\":\"2026-09-30T17:00:00Z\",\"labels\":[\"type:quality-gate-verdict\",\"reviewer-index:1\",\"verdict:FAIL\"]}]"
+GATE_E5_RUN_ARM="B"   # the arm persisted in the gate-run record at admission (Step 5) and read back by Phase C — see section 12
+GATE_E5_RUN_VB_JSON="[{\"id\":\"ga-vb0001\",\"status\":\"closed\",\"created_at\":\"2026-09-30T17:00:00Z\",\"labels\":[\"type:quality-gate-verdict\",\"reviewer-index:1\",\"verdict:FAIL\"]}]"; VB_JSON="$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001); SESSION_IDS=(rev-sess-1); REQUIRED_REVIEWERS=1
 VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
 PC_ELAPSED=300; PC_TIMEOUT_SECS=1800
@@ -427,6 +465,22 @@ decline_case "reviewer 1's task not on its bead" "reviewer-1-task-unavailable" "
 decline_case "template drifted (anchor missing)" "task-anchor-missing" "jq -n '[{\"text\":\"QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: x\\nno lens line here ga-vb0001\"}]' > \"\$f/comments-ga-vb0001.json\"" GATE_E5_ENABLED=1 ""
 decline_case "Claude quota exhausted" "claude-quota-limited" "" GATE_E5_ENABLED=1 "gate_quota_limited() { printf 1; }"
 decline_case "no free session slot" "spawn-failed" "touch \"\$f/spawn-fail\"" GATE_E5_ENABLED=1 ""
+# gate attempt 1, blocking issue 3: the arm is decided ONCE, when the run is admitted, and carried in the run record. A run
+# that was not admitted as arm B — admitted while the flag was off (the Mayor flips it mid-flight), an older run with no
+# e5_arm line, or one whose arm could not be measured — must never get a first-fail extra just because the flag is on NOW
+# and the bead's arm recomputes to B. (Silent: such a run is not in the experiment's denominator, so there is nothing to record.)
+decline_case "run admitted with the flag off (no persisted arm)" "" "" GATE_E5_ENABLED=1 'GATE_E5_RUN_ARM=""'
+decline_case "run admitted with an unmeasured arm (?)" "" "" GATE_E5_ENABLED=1 'GATE_E5_RUN_ARM="?"'
+decline_case "run admitted as arm A although the bead recomputes to B" "" "" GATE_E5_ENABLED=1 'GATE_E5_RUN_ARM="A"'
+decline_case "persisted arm is garbage" "" "" GATE_E5_ENABLED=1 'GATE_E5_RUN_ARM="b B"'
+F="$(new_fix runarm-log)"; show_bead "$F" "$ARM_B_ID" '[]'
+scn "$F" GATE_E5_ENABLED=1 -- >/dev/null <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+GATE_E5_RUN_ARM=""
+gate_e5_phase_c_hook
+EOF
+case "$(cat "$F/stderr")" in *"not admitted as arm B"*) ok "a run admitted outside the experiment says so in the dispatcher log (no silent skip)" ;; *) bad "no log line for a run that was not admitted as arm B: $(cat "$F/stderr" | head -3)" ;; esac
 # the verdict-bead create failing must also close the session it just opened
 F="$(new_fix createfail)"; show_bead "$F" "$ARM_B_ID" '[]'; touch "$F/create-fail"
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
@@ -450,7 +504,7 @@ retire_case() { # retire_case <label> <expected reason> <created_at> <pc_elapsed
   local out
   out="$(scn "$f" GATE_E5_ENABLED=1 -- <<EOF
 BEAD_ID="$ARM_B_ID"
-VB_JSON='$vbj'
+GATE_E5_RUN_VB_JSON='$vbj'; VB_JSON="\$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(rev-sess-1 gate-reviewer-adhoc-new1); REQUIRED_REVIEWERS=2
 VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
 PC_ELAPSED=$4; PC_TIMEOUT_SECS=1800
@@ -475,11 +529,15 @@ retire_case "extra still young, run young, session alive" "" "$NOW_ISO" 300 0
 retire_case "run timed out" "run-timeout" "$NOW_ISO" 4000 0
 retire_case "extra older than the run's timeout" "extra-timeout" "$OLD_ISO" 300 0
 retire_case "extra session confirmed closed" "extra-session-closed" "$NOW_ISO" 300 1
+# gate attempt 1 (non-blocking): an UNREADABLE age is "could not tell", not "too old" — a possibly live extra is not retired on it
+# (the run timeout and a confirmed-closed session still retire it, as they do when the age is known).
+retire_case "extra age unreadable (no created_at), run young, session alive" "" "" 300 0
+retire_case "extra age unreadable, but the run timed out" "run-timeout" "" 4000 0
 # extra already delivered (bead closed) -> nothing to do, not retired
 F="$(new_fix delivered)"; jq -n '[{id:"ga-newvb1",status:"closed",labels:["e5-extra","verdict:FAIL"]}]' > "$F/show-ga-newvb1.json"
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 BEAD_ID="$ARM_B_ID"
-VB_JSON='${EXTRA_OPEN/__CREATED__/$NOW_ISO}'
+GATE_E5_RUN_VB_JSON='${EXTRA_OPEN/__CREATED__/$NOW_ISO}'; VB_JSON="\$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(a b); REQUIRED_REVIEWERS=2
 VERDICTS_RECEIVED=2; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=2
 PC_ELAPSED=4000; PC_TIMEOUT_SECS=1800
@@ -492,7 +550,7 @@ check "a DELIVERED extra is never retired (even past the timeout)" "REQ=2 N=2" "
 F="$(new_fix once)"; show_bead "$F" "$ARM_B_ID" '[]'
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 BEAD_ID="$ARM_B_ID"
-VB_JSON='[{"id":"ga-vb0001","status":"closed","labels":["verdict:FAIL"]},{"id":"ga-oldvb","status":"closed","labels":["e5-extra","e5-extra-abandoned"]}]'
+GATE_E5_RUN_VB_JSON='[{"id":"ga-vb0001","status":"closed","labels":["verdict:FAIL"]},{"id":"ga-oldvb","status":"closed","labels":["e5-extra","e5-extra-abandoned"]}]'; VB_JSON="\$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001); SESSION_IDS=(a); REQUIRED_REVIEWERS=1
 VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
 PC_ELAPSED=300; PC_TIMEOUT_SECS=1800
@@ -502,6 +560,136 @@ EOF
 )"
 check "an abandoned extra blocks a second spawn for the same run" "REQ=1 N=1" "$OUT"
 grep -q '^session-new$' "$F/calls.log" && bad "spawned a second extra for the same run" || ok "no second session"
+# gate attempt 1, blocking issue 2 — the hook is handed the run's list, and an UNREADABLE list is not "no extra yet"
+F="$(new_fix nolist)"; show_bead "$F" "$ARM_B_ID" '[]'
+OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+unset GATE_E5_RUN_VB_JSON
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+check "no run list captured (never reached the query): the hook does NOT fall back to the clobbered VB_JSON, and spawns nothing" "REQ=1 N=1" "$OUT"
+grep -q '^session-new$' "$F/calls.log" && bad "spawned an extra with no run list to check the one-attempt rule against" || ok "no session spawned without the run list"
+check "...and says why (decline reason run-verdict-list-unavailable)" run-verdict-list-unavailable "$(jq -r 'select(.event=="e5_extra_declined") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+F="$(new_fix notarray)"; show_bead "$F" "$ARM_B_ID" '[]'
+OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+GATE_E5_RUN_VB_JSON='{"error":"not a list"}'
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+check "a run list that is not a JSON array is unreadable too: nothing spawned" "REQ=1 N=1" "$OUT"
+
+# The REAL Phase C chain: the extracted rehydrate block (list query -> rehydrate -> the REAL gate_collect_verdicts) followed by
+# the extracted hook-call block. The hook tests above hand-set the state; this is what production actually produces at that
+# point. (Gate attempt 1: the old tests stubbed gate_collect_verdicts and hand-set VB_JSON to the full list — a state the
+# real flow never produces — so 185 green assertions hid a hook that spawned a SECOND extra for a run that had abandoned one.)
+FLOW_REHY="$(extract_block "$DISPATCHER" phase-c-verdict-rehydrate)"
+FLOW_HOOKCALL="$(extract_block "$DISPATCHER" e5-phase-c-hook-call)"
+FLOW_EXTRACT_FN="$(extract_block "$DISPATCHER" run-desc-extract-fn)"; FLOW_RUNARM="$(extract_block "$DISPATCHER" e5-run-arm)"
+FLOW_COLLECT="$(extract_block "$DISPATCHER" gate-collect-verdicts-fn)"; FLOW_PEEK="$(extract_block "$DISPATCHER" session-peek-reports-dead-fn)"; FLOW_IDENT="$(extract_block "$DISPATCHER" gate-verdict-identity-link-fn)"
+[ -n "$FLOW_REHY" ] && [ -n "$FLOW_HOOKCALL" ] && [ -n "$FLOW_COLLECT" ] && [ -n "$FLOW_PEEK" ] && [ -n "$FLOW_IDENT" ] && ok "Phase C rehydrate block, hook-call block and the collect function extracted from the dispatcher" || bad "could not extract the Phase C blocks (rehydrate=${#FLOW_REHY} hookcall=${#FLOW_HOOKCALL} collect=${#FLOW_COLLECT})"
+[ -n "$FLOW_EXTRACT_FN" ] && [ -n "$FLOW_RUNARM" ] && ok "the dispatcher's real extract() and the run-arm read-back block extracted" || bad "could not extract the run-arm read-back (extract-fn=${#FLOW_EXTRACT_FN} run-arm=${#FLOW_RUNARM}): Phase C does not read the arm persisted at admission"
+flow_case() { # flow_case <fixdir> <env...> -- <tail script on stdin: sets BEAD_ID/PC_*, runs the blocks, prints>
+  local fix="$1"; shift
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  {
+    cat <<'EOF'
+set -euo pipefail
+FIX="$FIXDIR"; CALLS="$FIX/calls.log"; : > "$CALLS"
+log()  { echo "LOG: $*" >&2; }
+warn() { echo "WARN: $*" >&2; }
+_ts_to_epoch() { python3 -c 'import sys,datetime; print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")).timestamp()))' "$1"; }
+gc_json_or_unknown() { "$@"; }
+reviewer_session_confirmed_closed() { [ -f "$FIX/closed-$1" ] && echo 1 || echo 0; }
+assign_verdict_bead_verified() { echo "assign $1 $2" >> "$CALLS"; return 0; }
+gate_nudge() { echo "nudge $1" >> "$CALLS"; return 0; }
+bd() {
+  case " $* " in
+    *" list "*)     cat "$FIX/list.json"; return 0 ;;
+    *" show "*)     local id; id=$(printf '%s\n' "$@" | awk '/^show$/ {getline; print; exit}'); [ -f "$FIX/show-$id.json" ] && { cat "$FIX/show-$id.json"; return 0; }; return 1 ;;
+    *" comments "*) local id; id=$(printf '%s\n' "$@" | awk '/^comments$/ {getline; print; exit}'); [ -f "$FIX/comments-$id.json" ] && cat "$FIX/comments-$id.json" || echo "[]"; return 0 ;;
+    *" create "*)   echo "create $*" >> "$CALLS"; echo '{"id":"ga-newvb1"}'; return 0 ;;
+    *)              echo "bd $*" >> "$CALLS"; return 0 ;;
+  esac
+}
+gc() {
+  case " $* " in
+    *" session new "*)  echo "session-new" >> "$CALLS"; echo '{"session_id":"ga-wisp-new1","session_name":"gate-reviewer-adhoc-new1","session_key":"key-new1"}'; return 0 ;;
+    *" session list "*) echo '{"sessions":[]}'; return 0 ;;
+    *" session peek "*) echo "scrollback"; return 0 ;;
+    *)                  echo "gc $*" >> "$CALLS"; return 0 ;;
+  esac
+}
+git_rig() { return 0; }
+GC_CITY="$CITYDIR"; QG_LOG="$CITYDIR/.gc/quality-gate.jsonl"; BRANCH="crew/x/ga-demo"; GATE_RUN_ID="ga-run001"; BEAD_CITY="$CITYDIR"
+EOF
+    echo "$FLOW_PEEK"; echo "$FLOW_IDENT"; echo "$FLOW_COLLECT"
+    echo 'source "$LIBFILE"; GATE_E5_LIB_OK=1'
+    cat
+  } > "$fix/flow.sh"
+  env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" FIXDIR="$fix" CITYDIR="$TMP/city" LIBFILE="$LIB" ${envs[@]+"${envs[@]}"} "$BASH32" "$fix/flow.sh" 2>"$fix/stderr"
+}
+flow_fix() { # flow_fix <name> <list-json> -> fixture dir with the verdict beads' show/comments files
+  local d; d="$(new_fix "flow-$1")"; printf '%s' "$2" > "$d/list.json"
+  show_bead "$d" "$ARM_B_ID" '["story:in-flight"]'
+  # like the real `bd show --json`: an ARRAY holding the one bead
+  printf '%s' '[{"id":"ga-vb0001","status":"closed","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"],"assignee":"rev-sess-1","created_at":"2026-09-30T17:00:00Z"}]' > "$d/show-ga-vb0001.json"
+  jq -n --arg t "$TASK1_TEXT" '[{"text":$t},{"text":"VERDICT: FAIL\nBlocking issue 1: a real defect in scripts/gate-e5-switch.sh:40 — the quoting of $cite is missing"}]' > "$d/comments-ga-vb0001.json"
+  echo "$d"
+}
+FLOW_TAIL='
+BEAD_ID="$ARM_ID"; PC_ELAPSED=300; PC_TIMEOUT_SECS=1800
+REQUIRED_REVIEWERS=1   # the run record says 1; the rehydrate block adds the LIVE extras on top
+DESC="$RUN_DESC"       # the gate-run bead description Phase C reads the run record from
+'"$FLOW_EXTRACT_FN"'
+'"$FLOW_RUNARM"'
+for _dummy in 1; do
+'"$FLOW_REHY"'
+'"$FLOW_HOOKCALL"'
+done
+echo "REQ=$REQUIRED_REVIEWERS N=${#VERDICT_BEAD_IDS[@]} IDS=${VERDICT_BEAD_IDS[*]}"
+'
+R1_FAIL='{"id":"ga-vb0001","status":"closed","created_at":"2026-09-30T17:00:00Z","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:1","verdict:FAIL"]}'
+# (a) the reviewer's repro: reviewer 1 closed FAIL + an extra that was ABANDONED in an earlier sweep -> NO second extra
+F="$(flow_fix abandoned "[$R1_FAIL,{\"id\":\"ga-oldvb\",\"status\":\"closed\",\"created_at\":\"2026-09-30T17:01:00Z\",\"labels\":[\"type:quality-gate-verdict\",\"gate-run:ga-run001\",\"reviewer-index:2\",\"e5-extra\",\"e5-extra-abandoned\"]}]")"
+OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+check "REAL chain: an abandoned extra + reviewer 1's FAIL -> NO second extra for the same run" "REQ=1 N=1 IDS=ga-vb0001" "$OUT"
+grep -q '^session-new$' "$F/calls.log" && bad "REAL chain: a SECOND extra was spawned for a run that had already abandoned one (the reviewer's repro)" || ok "REAL chain: no second session for the run"
+# (b) first-fail trigger through the real chain: no extra yet -> exactly one is spawned
+F="$(flow_fix firstfail "[$R1_FAIL]")"
+OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+check "REAL chain: first judged FAIL of an arm-B bead -> one extra appended, REQUIRED 1->2" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$OUT"
+# (c) an extra in flight, young -> kept; old -> retired as extra-timeout — both through the real chain
+EXTRA_LIVE='{"id":"ga-newvb1","status":"open","created_at":"__CREATED__","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra","e5-trigger:first-fail"]}'
+for spec in "young:$NOW_ISO:REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "old:$OLD_ISO:REQ=1 N=1 IDS=ga-vb0001"; do
+  nm="${spec%%:*}"; rest="${spec#*:}"; created="${rest%%:REQ=*}"; want="REQ=${rest##*:REQ=}"
+  F="$(flow_fix "live-$nm" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$created}]")"
+  printf '%s' '[{"id":"ga-newvb1","status":"open","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra"],"assignee":"gate-reviewer-adhoc-new1"}]' > "$F/show-ga-newvb1.json"
+  OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+  check "REAL chain: an in-flight extra ($nm) is $([ "$nm" = young ] && echo kept || echo 'retired as extra-timeout')" "$want" "$OUT"
+done
+check "REAL chain: the old extra's retirement reason is extra-timeout" extra-timeout "$(jq -r 'select(.event=="e5_extra_abandoned") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | tail -1)"
+# (d) the extra's own `bd show` failing inside the collect must not blind the hook to it: the hook decides from the run list
+F="$(flow_fix "live-showfail" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$OLD_ISO}]")"   # no show-ga-newvb1.json -> every `bd show` of it fails
+OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL")"
+check "REAL chain: the extra's bead unreadable this sweep -> nothing retired on a guess, nothing new spawned" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$OUT"
+grep -q '^session-new$' "$F/calls.log" && bad "REAL chain: spawned another extra while one exists but could not be read" || ok "REAL chain: no spawn while the existing extra is unreadable"
+# (e) gate attempt 1, blocking issue 3, through the real chain: the arm is what ADMISSION persisted in the run record (Step 5,
+# one read of the flag), not what Phase C recomputes from the bead id under whatever the flag says now. A run admitted while
+# the flag was off has no e5_arm line; one admitted as arm A says A — neither may get an extra because the flag is on NOW and
+# the bead's own arm happens to be B.
+for spec in "flag-off-at-admission:required_reviewers: 1" "admitted-as-A:required_reviewers: 1"$'\n'"e5_arm: A" "unmeasured:required_reviewers: 1"$'\n'"e5_arm: ?"; do
+  nm="${spec%%:*}"; rd="${spec#*:}"
+  F="$(flow_fix "notadm-$nm" "[$R1_FAIL]")"
+  OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" RUN_DESC="$rd" -- <<<"$FLOW_TAIL")"
+  check "REAL chain: run $nm + the flag on now + a bead that recomputes to B -> NO first-fail extra" "REQ=1 N=1 IDS=ga-vb0001" "$OUT"
+  grep -q '^session-new$' "$F/calls.log" && bad "REAL chain: run $nm: an extra was spawned for a run that was not admitted as arm B" || ok "REAL chain: run $nm: no session spawned"
+done
 # flag OFF + no extra bead -> not a single bd/gc call
 F="$(new_fix inert)"
 OUT="$(scn "$F" GATE_E5_ENABLED=0 -- <<EOF
@@ -690,7 +878,7 @@ F="$(new_fix closedundelivered)"; show_bead "$F" "$ARM_B_ID" '[]'
 jq -n '[{id:"ga-newvb1",status:"closed",labels:["e5-extra"]}]' > "$F/show-ga-newvb1.json"
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 BEAD_ID="$ARM_B_ID"
-VB_JSON='${EXTRA_OPEN/__CREATED__/$NOW_ISO}'
+GATE_E5_RUN_VB_JSON='${EXTRA_OPEN/__CREATED__/$NOW_ISO}'; VB_JSON="\$CLOBBERED_VB_JSON"
 VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(a b); REQUIRED_REVIEWERS=2
 VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
 PC_ELAPSED=300; PC_TIMEOUT_SECS=1800; GATE_E5_EXTRA_UNDELIVERED=1
@@ -719,12 +907,68 @@ if [ ! -x "$SW" ]; then bad "switch script missing or not executable: $SW"; else
   SW_ARGS=(status); OUT="$(sw)"; case "$OUT" in *"LIGADO"*"Mayor, bead ga-syxaki"*) ok "status shows ON and who authorized it" ;; *) bad "status after on: $OUT" ;; esac
   echo 3 > "$SWC/.gc/gate-e5-spend-$(date +%Y-%m-%d).count"; : > "$SWC/.gc/gate-e5-spend-$(date +%Y-%m-%d).count.alerted"
   SW_ARGS=(status); OUT="$(sw)"; case "$OUT" in *"extras pagos hoje: 3"*"US\$ 1.80"*"JÁ foi atingido"*) ok "status reports today's extras, the estimate, and that the cap was hit" ;; *) bad "status spend lines wrong: $OUT" ;; esac
+  # gate attempt 1 (non-blocking): an UNREADABLE spend counter is "unknown", never "US$ 0.00 of the cap"
+  echo "not-a-number" > "$SWC/.gc/gate-e5-spend-$(date +%Y-%m-%d).count"
+  SW_ARGS=(status); OUT="$(sw)"
+  case "$OUT" in *"US\$ 0.00"*) bad "status renders an unreadable counter as zero spend: $OUT" ;; *"ilegível"*"desconhecid"*) ok "status: an unreadable spend counter is reported as unknown, not as US\$ 0.00" ;; *) bad "status for an unreadable counter: $OUT" ;; esac
   SW_ARGS=(off); sw >/dev/null 2>&1; RC=$?
   [ "$RC" = "0" ] && [ ! -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && check "off removes the flag; the reader sees 0" 0 "$(env -i PATH="$PATH" GC_CITY="$SWC" "$BASH32" -c "source '$LIB'; gate_e5_enabled")" || bad "off failed: rc=$RC"
   SW_ARGS=(on "urgent: Athos asked in bead ga-syxaki #9"); sw GATE_E5_NOT_BEFORE_EPOCH=99999999999 GATE_E5_FORCE_EARLY=1 >/dev/null 2>&1; RC=$?
   [ "$RC" = "0" ] && [ -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && ok "GATE_E5_FORCE_EARLY=1 is the explicit override for an early start" || bad "force-early failed: rc=$RC"
   SW_ARGS=(bogus); sw >/dev/null 2>&1; check "unknown subcommand: usage error (rc 2)" 2 "$?"
 fi
+
+# ── 12. gate attempt 1, blocking issue 3 ─────────────────────────────────────────
+echo "── 12. The arm is decided ONCE (Step 5), carried in the run record, and an unmeasured arm is never A ──"
+S5="$(extract_block "$DISPATCHER" e5-admit-step5)"; S6="$(extract_block "$DISPATCHER" e5-run-desc)"; S7="$(extract_block "$DISPATCHER" e5-step7-task-vars)"
+if [ -n "$S5" ] && [ -n "$S6" ] && [ -n "$S7" ]; then ok "Step 5 admission, Step 6 run-record line and Step 7 task-vars blocks extracted from the dispatcher"
+else bad "could not extract the admission blocks (step5=${#S5} step6=${#S6} step7=${#S7}): the flag is still read at two different times and the arm is not carried"; fi
+build_step_sh() {
+{
+  cat <<'EOF'
+set -euo pipefail
+log() { :; }; warn() { :; }
+git_rig() { seq 1 10 | sed 's/^/+l /'; }
+DEFAULT_BRANCH=main; BRANCH=crew/x/ga-demo; REQUIRED_REVIEWERS=1; BEAD_ID="$BEAD"; GATE_RUN_ID=ga-run1
+GATE_E5_LIB_OK=0; GATE_E5_COV_RULES=""; GATE_E5_COV_PASS_LINE=""; GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_ACTIVE=0
+source "$LIBFILE"; GATE_E5_LIB_OK=1
+GATE_E5_ENABLED="$F5"
+EOF
+  printf '%s\n' "$S5"
+  echo 'GATE_E5_ENABLED="$F7"   # the Mayor flips the flag between Step 5 and the later steps'
+  printf '%s\n' "$S6"; printf '%s\n' "$S7"
+  cat <<'EOF'
+echo "ACTIVE=$GATE_E5_ACTIVE ARM=$GATE_E5_ARM TRIGGER=$GATE_E5_TRIGGER COV=${#GATE_E5_COV_RULES} RUNDESC=[${GATE_E5_RUN_DESC_LINE//$'\n'/|}]"
+EOF
+} > "$TMP/step.sh"
+}
+build_step_sh
+step_run() { # step_run <flag at Step 5> <flag at Step 7> <bead>
+  env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" GC_CITY="$TMP/city" LIBFILE="$LIB" F5="$1" F7="$2" BEAD="$3" "$BASH32" "$TMP/step.sh" 2>&1
+}
+if [ -n "$S5" ] && [ -n "$S6" ] && [ -n "$S7" ]; then
+  OUT="$(step_run 0 0 "$ARM_B_ID")"
+  check "flag off throughout: inert — not active, the arm is UNMEASURED (?), no prompt pieces, nothing added to the run record" "ACTIVE=0 ARM=? TRIGGER=none COV=0 RUNDESC=[]" "$OUT"
+  OUT="$(step_run 0 1 "$ARM_B_ID")"
+  check "THE RACE: flag off at Step 5, the Mayor turns it on before Step 7 -> the run stays OUT of the experiment (not active, arm ?, nothing logged as arm A)" "ACTIVE=0 ARM=? TRIGGER=none COV=0 RUNDESC=[]" "$OUT"
+  OUT="$(step_run 1 1 "$ARM_B_ID")"
+  case "$OUT" in "ACTIVE=1 ARM=B TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: B]") ok "flag on at Step 5, arm-B bead: active, arm B measured, prompt pieces set, the run record carries 'e5_arm: B'" ;; *) bad "flag on, arm B: $OUT" ;; esac
+  OUT="$(step_run 1 1 "$ARM_A_ID")"
+  case "$OUT" in "ACTIVE=1 ARM=A TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: A]") ok "flag on at Step 5, arm-A bead: active, arm A MEASURED (the only way to read A), record carries 'e5_arm: A'" ;; *) bad "flag on, arm A: $OUT" ;; esac
+  OUT="$(step_run 1 0 "$ARM_B_ID")"
+  case "$OUT" in "ACTIVE=1 ARM=B TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: B]") ok "the inverse race: flag on at Step 5, off before Step 7 -> the run was ADMITTED, so it stays active and gets the same prompt pieces it was logged with" ;; *) bad "inverse race: $OUT" ;; esac
+fi
+check "an arm nobody measured defaults to ? in the lib (No arm must never read as A)" "?" "$(run_lib -- <<<'printf "%s" "$GATE_E5_ARM"')"
+OUT="$(run_lib GATE_E5_ENABLED=1 QG_LOG="$TMP/city/.gc/quality-gate.jsonl" -- <<<'unset GATE_E5_ARM; GATE_RUN_ID=ga-run1; BEAD_ID=ga-x; BRANCH=b; gate_e5_log_admit "task text" ga-vb0001; jq -r "select(.event==\"e5_admit\") | .arm" "$QG_LOG" | tail -1')"
+check "an admit record written with no arm decision logs arm ? (not A)" "?" "$OUT"
+check "gate_e5_task_vars with no argument still follows the flag (off -> empty pieces)" "[][]" "$(run_lib -- <<<'gate_e5_task_vars; printf "[%s][%s]" "$GATE_E5_COV_RULES" "$GATE_E5_COV_PASS_LINE"')"
+OUT="$(run_lib -- <<<'gate_e5_task_vars admitted; printf "%s|%s" "$GATE_E5_COV_RULES" "$GATE_E5_COV_PASS_LINE"')"
+case "$OUT" in *"COVERAGE REPORT (required)"*"|Coverage: <"*) ok "gate_e5_task_vars admitted: the pieces are set WITHOUT a second read of the flag (here the flag is off)" ;; *) bad "gate_e5_task_vars admitted did not set the pieces: $OUT" ;; esac
+AFTER5="$(awk '/# SELFTEST-EXTRACT e5-admit-step5: END/ {f=1; next} f && !/^[[:space:]]*#/ && /gate_e5_enabled/ {print NR": "$0}' "$DISPATCHER")"
+[ -z "$AFTER5" ] && ok "after the Step 5 admission the dispatcher never reads the flag again (Phase C's own read is earlier in the file and is about spending, not admission)" || bad "the flag is read again after Step 5:
+$AFTER5"
+N_DESC="$(awk '/^GATE_RUN_ID=\$\(bd -C "\$GC_CITY" create/ {f=1} f && /GATE_E5_RUN_DESC_LINE/ {n++} f && /--json/ {exit} END {print n+0}' "$DISPATCHER")"
+check "the gate-run bead is created with the run-record line in its description" 1 "$N_DESC"
 
 # ── 10. wiring ──────────────────────────────────────────────────────────────────
 echo "── 10. Every E5 call site in the dispatcher is behind the GATE_E5_LIB_OK guard ──"
@@ -756,6 +1000,75 @@ if true; then
     [ "$want" = "$got" ] || MISM=$((MISM+1))
   done
   [ "$MISM" -ge 5 ] && ok "mutation 'drop the salt' is caught by the spec comparison ($MISM of 30 ids differ)" || bad "unsalted mutation survived the spec comparison (only $MISM of 30 differ)"
+  # union (gate attempt 1, blocking issue 1). The three defences overlap (description without the path, symmetric
+  # measure, minimum shared words), so ONE mutant per defence proves little — any other defence still stops the
+  # reviewer's repro. So: (1) revert ALL of them (= the old behaviour) and the repro must merge again; (2) remove
+  # each defence alone and the pair that ONLY that defence stops must merge.
+  mutate_union() { # mutate_union <out> <which: all|path|symmetric|minimum>
+    python3 - "$UNION" "$1" "$2" <<'PYMUT_EOF'
+import re, sys
+src, out, which = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+def sub(old, new):
+    global s
+    assert old in s, "mutation anchor missing: %r" % old
+    s = s.replace(old, new)
+if which in ("all", "path"):
+    sub("for t in TOKEN_RE.findall(description_of(body)):", "for t in TOKEN_RE.findall(body):")
+if which in ("all", "symmetric"):
+    sub("return shared, shared / float(len(ta | tb))", "return shared, shared / float(min(len(ta), len(tb)))")
+if which in ("all", "minimum"):
+    s = re.sub(r"^MIN_SHARED_TOKENS = \d+", "MIN_SHARED_TOKENS = 0", s, flags=re.M)
+if which == "all":
+    sub("STRONG_THRESHOLD = 0.35", "STRONG_THRESHOLD = 0.50")
+open(out, "w").write(s)
+PYMUT_EOF
+  }
+  merged_count() { # merged_count <union-script> <issue1> <issue2> -> duplicates_merged
+    printf 'VERDICT: FAIL\n%s\n' "$2" > "$TMP/m1.txt"; printf 'VERDICT: FAIL\n%s\n' "$3" > "$TMP/m2.txt"
+    mk_payload "1=$TMP/m1.txt" "2=$TMP/m2.txt" | python3 "$1" | jq -r '.stats.duplicates_merged'
+  }
+  P_REPRO1_A='Blocking issue 1: scripts/gate-e5-switch.sh:40 - the quoting of $cite is missing'
+  P_REPRO1_B='Blocking issue 1: scripts/gate-e5-switch.sh:42 - the refusal when the flag file is absent exits zero'
+  P_THIN_A='Blocking issue 1: other-file-name.sh:40 swallows failure'; P_THIN_B='Blocking issue 1: other-file-name.sh:41 swallows failure'
+  P_TERSE_A='Blocking issue 1: scripts/gate-e5-switch.sh:40 cap_state returns unknown counter unreadable'
+  P_TERSE_B='Blocking issue 1: scripts/gate-e5-switch.sh:42 the function cap_state reads the counter file, and when the counter holds garbage the caller treats unknown as ok in one branch while every other branch declines, which makes the daily spend guard inconsistent across sweeps and lets the spawn path run past the limit'
+  mutate_union "$TMP/union.all.py" all && R="$(merged_count "$TMP/union.all.py" "$P_REPRO1_A" "$P_REPRO1_B")"
+  [ "$R" = "1" ] && ok "mutation 'revert every defence' (path tokens + overlap over the smaller side + no minimum) is caught: the reviewer's repro merges again" || bad "full-revert mutant did not reproduce the old merge (merged=$R)"
+  mutate_union "$TMP/union.min.py" minimum && R0="$(merged_count "$UNION" "$P_THIN_A" "$P_THIN_B")" && R="$(merged_count "$TMP/union.min.py" "$P_THIN_A" "$P_THIN_B")"
+  [ "$R0" = "0" ] && [ "$R" = "1" ] && ok "mutation 'no minimum of shared words' is caught by the thin-evidence pair (real: $R0 merged, mutant: $R)" || bad "minimum-shared mutant survived (real=$R0 mutant=$R)"
+  mutate_union "$TMP/union.sym.py" symmetric && R0="$(merged_count "$UNION" "$P_TERSE_A" "$P_TERSE_B")" && R="$(merged_count "$TMP/union.sym.py" "$P_TERSE_A" "$P_TERSE_B")"
+  [ "$R0" = "0" ] && [ "$R" = "1" ] && ok "mutation 'overlap over the smaller side' is caught by the terse-in-long pair (real: $R0 merged, mutant: $R)" || bad "symmetric-measure mutant survived (real=$R0 mutant=$R)"
+  mutate_union "$TMP/union.path.py" path && R="$(merged_count "$TMP/union.path.py" "$P_REPRO1_A" "$P_REPRO1_B")"
+  ok "(info) restoring path tokens alone: repro merged=$R — the other two defences overlap with it by design"
+  # gate attempt 1, blocking issue 3 — the new defences must be noticed too.
+  # (1) the hook obeys the arm PERSISTED at admission: drop that requirement and a run that was never admitted as arm B gets an extra.
+  LIB_SAVE="$LIB"; cp "$LIB" "$TMP/lib.mut2"; sed -i.bak 's/\[ "\${GATE_E5_RUN_ARM:-}" != "B" \]/false/' "$TMP/lib.mut2"
+  if cmp -s "$LIB" "$TMP/lib.mut2"; then bad "run-arm mutation did not apply (the hook no longer tests \"\${GATE_E5_RUN_ARM:-}\" != \"B\")"; else
+    F="$(new_fix mutrunarm)"; show_bead "$F" "$ARM_B_ID" '[]'
+    LIB="$TMP/lib.mut2"
+    OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+GATE_E5_RUN_ARM=""
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+    LIB="$LIB_SAVE"
+    [ "$OUT" = "REQ=2 N=2" ] && ok "mutation 'ignore the persisted arm' is caught: without the requirement a never-admitted run gets an extra (the decline cases above go red)" || bad "persisted-arm mutant survived (got '$OUT')"
+  fi
+  # (2) Step 7 must not read the flag again: put the OLD Step 7 block back and the race reproduces (an ACTIVE run whose arm was never measured).
+  S7_SAVE="$S7"
+  S7='GATE_E5_ACTIVE=0
+if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
+  GATE_E5_ACTIVE=1
+  gate_e5_task_vars
+fi'
+  build_step_sh
+  OUT="$(step_run 0 1 "$ARM_B_ID")"
+  case "$OUT" in "ACTIVE=1 ARM=?"*) ok "mutation 'Step 7 reads the flag again' is caught: the race then yields an ACTIVE run with an unmeasured arm ($OUT)" ;; *) bad "old-Step-7 mutant did not reproduce the race (got '$OUT')" ;; esac
+  S7="$S7_SAVE"; build_step_sh
   cp "$TASKLIB" "$TMP/tasklib.mut.sh"; sed -i.bak 's/\${GATE_E5_COV_RULES:-}/\n${GATE_E5_COV_RULES:-}/' "$TMP/tasklib.mut.sh"
   if cmp -s "$TASKLIB" "$TMP/tasklib.mut.sh"; then bad "task-lib mutation did not apply"; else
     M_OFF="$(render_task off bead "$TMP/tasklib.mut.sh")"

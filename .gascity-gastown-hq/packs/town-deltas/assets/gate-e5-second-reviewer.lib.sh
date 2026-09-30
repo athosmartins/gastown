@@ -135,7 +135,7 @@ gate_e5_prompt_fingerprint() {
 # apuração and the stratification keys (size, rig, tier), written before any reviewer runs.
 gate_e5_log_admit() {
   gate_e5_log_event e5_admit gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" branch "${BRANCH:-}" \
-    rig "${RIG:-}" tier "${TIER:-}" author "${AUTHOR:-}" arm "${GATE_E5_ARM:-A}" \
+    rig "${RIG:-}" tier "${TIER:-}" author "${AUTHOR:-}" arm "${GATE_E5_ARM:-?}" \
     trigger "${GATE_E5_TRIGGER:-none}" size_state "${GATE_E5_SIZE_STATE:-}" raw_lines "${GATE_E5_RAW_LINES:-}" \
     base_reviewers "${REQUIRED_REVIEWERS:-}" review_prompt_cksum "$(gate_e5_prompt_fingerprint "${1:-}" "${2:-}")"
 }
@@ -165,10 +165,14 @@ gate_e5_log_run_end() {
 # parses the heredoc inside $(...) quote-aware and only the leading "#" of the commented FAIL
 # example hides its lone quote — so that line cannot start with a ${VAR}. The rules paragraph
 # tells the reviewer the Coverage line belongs in a FAIL comment too.)
+#   gate_e5_task_vars            follows the flag (off -> the pieces stay empty)
+#   gate_e5_task_vars admitted   the caller already holds the run's admission (decided from ONE read of the flag at Step 5):
+#                                set the pieces without reading the flag again, so a run that was admitted stays consistent
+#                                (logged as an E5 run AND given the prompt it was logged with) if the flag moves afterwards.
 gate_e5_task_vars() {
   GATE_E5_COV_RULES=""
   GATE_E5_COV_PASS_LINE=""
-  [ "$(gate_e5_enabled)" = "1" ] || return 0
+  [ "${1:-}" = "admitted" ] || [ "$(gate_e5_enabled)" = "1" ] || return 0
   GATE_E5_COV_RULES='
 
 COVERAGE REPORT (required): add ONE line starting with "Coverage:" to your VERDICT comment — a FAIL comment as much as a PASS one — listing the files — and, for long files, the line ranges or functions — that you actually read, and naming every changed file or hunk you did NOT examine. It is a record of what you looked at, nothing more: listing less than the whole diff does not make any finding optional, and it never changes what counts as blocking.'
@@ -270,7 +274,9 @@ gate_e5_spend_record() {
 # GATE_E5_RAW_LINES, GATE_E5_TRIGGER (none | big-diff). Measures the diff the same way the
 # reviewer's header does (line count of the raw `git diff`), which is the basis of E4's
 # 800-line threshold — NOT the numstat sum the timeout scaler uses.
-GATE_E5_ARM="A"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
+# Unmeasured is "?", NEVER "A" (see gate_e5_arm_for_bead): the dispatcher sets this to "?" at Step 5 and only a decision made there
+# replaces it, so a run nobody admitted cannot be logged as a measured arm-A run.
+GATE_E5_ARM="?"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
 gate_e5_admit_decision() {
   GATE_E5_ARM=$(gate_e5_arm_for_bead "${BEAD_ID:-}") || GATE_E5_ARM="?"
   GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
@@ -310,7 +316,7 @@ gate_e5_decline() {
 }
 gate_e5_spawn_extra() {
   local _run="$1" _vb1="$2" _task1="$3" _e5_trig="$4"
-  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _vassign=0 _n
+  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _peek_out _vassign=0 _n
   GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
   GATE_E5_DECLINE_REASON=""
 
@@ -382,7 +388,13 @@ Best-effort by design: if this reviewer does not deliver, the run is decided by 
   else
     warn "  E5: extra reviewer spawn JSON had no session_name — durable pull channel NOT wired (nudge + timeout are the only channels)."
   fi
-  _peek=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null | cksum 2>/dev/null | awk '{print $1}' || echo "")
+  # The terminal fingerprint BEFORE the task lands (the ACK pass compares a fresh peek against it). A peek that FAILS leaves it empty
+  # = "no baseline", which the ACK pass reads as unknown — the same value the dispatcher's own baseline has — but a failed peek is now
+  # its own branch instead of hiding behind `|| echo ""` (error-empty-conflation-scan C2).
+  _peek=""
+  if _peek_out=$(gc --city "$GC_CITY" session peek "$_sid" --lines 40 2>/dev/null); then
+    _peek=$(printf '%s' "$_peek_out" | cksum 2>/dev/null | awk '{print $1}')
+  fi
   if type gate_nudge >/dev/null 2>&1; then
     gate_nudge "$_sid" "$_task2" --delivery queue 2>/dev/null \
       || warn "  E5: initial queue of the extra reviewer's task failed (session $_sid) — the ACK pass / durable pull will retry"
@@ -521,12 +533,28 @@ gate_e5_read_task() {
 #      out) so the decision below is taken on the reviewers that DID deliver;
 #   2. for arm B, when reviewer 1 has just delivered the bead's first judged FAIL and no
 #      extra slot exists yet, spawn reviewer 2 and keep the run in flight.
-# Reads: VB_JSON VERDICT_BEAD_IDS SESSION_IDS VERDICTS_RECEIVED ANY_FAIL REQUIRED_REVIEWERS
+# Reads: GATE_E5_RUN_VB_JSON GATE_E5_RUN_ARM VERDICT_BEAD_IDS SESSION_IDS VERDICTS_RECEIVED ANY_FAIL REQUIRED_REVIEWERS
 # GATE_FAIL_NO_EVAL GATE_COLLECT_JUDGED_FAILS PC_ELAPSED PC_TIMEOUT_SECS BEAD_ID GATE_RUN_ID.
 # Modifies the slot arrays / REQUIRED_REVIEWERS / collect results when it acts.
+#
+# The run's verdict-bead LIST comes from GATE_E5_RUN_VB_JSON, captured by the dispatcher right after its
+# list query — NEVER from VB_JSON. gate_collect_verdicts assigns the global VB_JSON once per bead, so by
+# the time this hook runs VB_JSON is the LAST bead's `bd show` answer, not the list (gate attempt 1,
+# ga-syxaki): reading it made an abandoned extra invisible (the one-attempt rule then spawned a second
+# extra for the same run) and made the in-flight path work only because the extra happens to sort last.
+# A list that is missing or is not a JSON array is "could not tell", not "no extra exists": the hook does
+# nothing (arm-A behaviour) and says why.
+# GATE_E5_RUN_ARM is the arm persisted in the run record at admission (the dispatcher reads it back from the gate-run description):
+# the first-fail trigger fires only for a run admitted as arm B, never for one the flag or the bead id merely says is B now.
 gate_e5_phase_c_hook() {
   local _extra_vb _extra_sid _extra_created _why="" _now _created_epoch _sess_json _i _e5_trig="first-fail"
-  _extra_vb=$(printf '%s' "${VB_JSON:-[]}" | jq -r '[.[]? | select((.labels // []) | index("e5-extra")) | select(((.labels // []) | index("e5-extra-abandoned")) | not)] | first | .id // empty' 2>/dev/null || echo "")
+  local _runvb="${GATE_E5_RUN_VB_JSON:-}"
+  if ! printf '%s' "$_runvb" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    warn "  E5: the run's verdict-bead list was not captured / is not a JSON array (gate-run ${GATE_RUN_ID:-?}) — cannot tell whether an extra reviewer exists; the hook does nothing this sweep."
+    [ "$(gate_e5_enabled)" = "1" ] && gate_e5_decline "run-verdict-list-unavailable"
+    return 0
+  fi
+  _extra_vb=$(printf '%s' "$_runvb" | jq -r '[.[]? | select((.labels // []) | index("e5-extra")) | select(((.labels // []) | index("e5-extra-abandoned")) | not)] | first | .id // empty' 2>/dev/null || echo "")
 
   if [ -n "$_extra_vb" ]; then
     # ── job 1: is the extra slot still worth waiting for? ──
@@ -541,7 +569,7 @@ gate_e5_phase_c_hook() {
       open|in_progress|blocked|hooked|pinned) : ;;
       *) return 0 ;;                            # unreadable: leave it; nothing is decided on a guess
     esac
-    _extra_created=$(printf '%s' "$VB_JSON" | jq -r --arg v "$_extra_vb" '[.[]? | select(.id==$v)] | first | .created_at // empty' 2>/dev/null || echo "")
+    _extra_created=$(printf '%s' "$_runvb" | jq -r --arg v "$_extra_vb" '[.[]? | select(.id==$v)] | first | .created_at // empty' 2>/dev/null || echo "")
     _created_epoch=""
     [ -n "$_extra_created" ] && _created_epoch=$(_ts_to_epoch "$_extra_created" 2>/dev/null || echo "")
     _now=$(date +%s)
@@ -555,7 +583,7 @@ gate_e5_phase_c_hook() {
       _why="run-timeout"
     else
       case "$_created_epoch" in
-        ''|*[!0-9]*) _why="extra-age-unreadable" ;;
+        ''|*[!0-9]*) warn "  E5: the extra reviewer's age is unreadable (created_at='${_extra_created:-<none>}') — not retiring it on age (the run timeout and a confirmed-closed session still apply)." ;;
         *) if [ $((_now - _created_epoch)) -gt "${PC_TIMEOUT_SECS:-0}" ]; then _why="extra-timeout"; fi ;;
       esac
     fi
@@ -578,10 +606,20 @@ gate_e5_phase_c_hook() {
   # ── job 2: the first-fail trigger ──
   # Any e5-extra bead at all (even an abandoned one) means this run already had its one
   # attempt — never a second spawn for the same run.
-  if [ -n "$(printf '%s' "${VB_JSON:-[]}" | jq -r '[.[]? | select((.labels // []) | index("e5-extra"))] | first | .id // empty' 2>/dev/null || echo "")" ]; then
+  if [ -n "$(printf '%s' "$_runvb" | jq -r '[.[]? | select((.labels // []) | index("e5-extra"))] | first | .id // empty' 2>/dev/null || echo "")" ]; then
     return 0
   fi
   [ "$(gate_e5_enabled)" = "1" ] || return 0
+  # The arm is what ADMISSION persisted in this run's record (GATE_E5_RUN_ARM, read back by Phase C), not what is recomputed here
+  # from the bead id under whatever the flag says now: a run admitted while the flag was off, an older run with no e5_arm line, or one
+  # whose arm was never measured is OUTSIDE the experiment — no extra, however the bead's own arm computes. (Only a bead that WOULD be
+  # arm B is worth a log line; for the rest the silence is the normal case.)
+  if [ "${GATE_E5_RUN_ARM:-}" != "B" ]; then
+    if [ "$(gate_e5_arm_for_bead "${BEAD_ID:-}")" = "B" ]; then
+      log "  E5: gate-run ${GATE_RUN_ID:-?} of bead ${BEAD_ID:-?} was not admitted as arm B (e5_arm=${GATE_E5_RUN_ARM:-absent}) — outside the experiment, so no first-fail extra."
+    fi
+    return 0
+  fi
   [ "$(gate_e5_arm_for_bead "${BEAD_ID:-}")" = "B" ] || return 0
   [ "${#VERDICT_BEAD_IDS[@]}" -eq 1 ] || return 0
   # Only a run whose single reviewer delivered a real, judged FAIL. A no-verdict FAIL (dead

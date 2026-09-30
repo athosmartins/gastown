@@ -163,6 +163,20 @@ for line in open(sys.argv[1]):
 PYEOF
 python3 "$SCRIPT" --qg-log "$TMP/qg-bad.jsonl" --lib "$LIB" --no-cost >/dev/null 2>"$TMP/err.txt"; RC=$?
 [ "$RC" -ne 0 ] && grep -q "FATAL: braço gravado" "$TMP/err.txt" && ok "a wrong recorded arm aborts loudly (rc=$RC)" || bad "a wrong recorded arm was accepted (rc=$RC)"
+# gate attempt 1, blocking issue 3: an admit record with NO arm field is an UNMEASURED arm ("?", outside A/B), never A. Read as A, a
+# bead whose live arm is B would abort the whole analysis with "braço gravado != recalculado" over a record that only lacked a field.
+python3 - "$QG" "$TMP/qg-noarm.jsonl" "${B_IDS[0]}" <<'PYEOF'
+import json, sys
+out = open(sys.argv[2], "w")
+for line in open(sys.argv[1]):
+    try: o = json.loads(line)
+    except ValueError: out.write(line); continue
+    if o.get("event") == "e5_admit" and o.get("bead") == sys.argv[3]:
+        o.pop("arm", None)
+    out.write(json.dumps(o) + "\n")
+PYEOF
+python3 "$SCRIPT" --qg-log "$TMP/qg-noarm.jsonl" --lib "$LIB" --no-cost --json >"$TMP/noarm.json" 2>"$TMP/err.txt"; RC=$?
+[ "$RC" = "0" ] && ok "an admit record with no arm field does not abort the audit (read as ?, not as A)" || bad "an admit record with no arm field aborted the analysis (rc=$RC): $(head -1 "$TMP/err.txt")"
 python3 "$SCRIPT" --qg-log "$QG" --lib /nonexistent/lib.sh --no-cost >/dev/null 2>"$TMP/err.txt"; RC=$?
 [ "$RC" -ne 0 ] && ok "a missing lib aborts (no guessed arm rule), rc=$RC" || bad "missing lib did not abort"
 
