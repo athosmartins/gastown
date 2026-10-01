@@ -38,20 +38,37 @@ done
 [ "${#A_IDS[@]}" -ge 12 ] && [ "${#B_IDS[@]}" -ge 16 ] && ok "12 arm-A and 16 arm-B beads picked with the live arm function" || { bad "could not pick the fixture beads"; exit 1; }
 
 # ── fixture: known answer ─────────────────────────────────────────────────────
-python3 - "$TMP" "${A_IDS[*]}" "${B_IDS[*]}" <<'PYEOF'
-import json, os, sys, time
-tmp, a_ids, b_ids = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+python3 - "$TMP" "${A_IDS[*]}" "${B_IDS[*]}" "$LIB" <<'PYEOF'
+import json, os, subprocess, sys, time
+tmp, a_ids, b_ids, lib = sys.argv[1], sys.argv[2].split(), sys.argv[3].split(), sys.argv[4]
 ev = []
 n = [0]
 def ts():
     n[0] += 1
     return "2026-10-02T10:%02d:%02dZ" % (n[0] // 60, n[0] % 60)
-def run(bead, arm, result, reason, admitted=True, trigger="none", lines="300", extra=None):
+# The e5_admit fields are what the REAL gate_e5_admit_decision writes, never invented here (gate attempt 3, blocking issue 2): this fixture
+# used to fabricate a line count for every arm-A run, which production never emitted (arm A logged size_state=no with raw_lines="") — so a
+# stratified comparison with no measured control arm passed this suite. lines="fail" = the diff cannot be read (git fails).
+_admit = {}
+def real_admit(bead, lines):
+    key = (bead, lines)
+    if key not in _admit:
+        script = ('set -euo pipefail; warn() { :; }; '
+                  'git_rig() { if [ "$N" = fail ]; then return 128; fi; i=0; while [ "$i" -lt "$N" ]; do echo "+l"; i=$((i+1)); done; }; '
+                  'BEAD_ID="$B"; DEFAULT_BRANCH=main; BRANCH=x; REQUIRED_REVIEWERS=1; source "$LIB"; gate_e5_admit_decision; '
+                  'printf "%s|%s|%s|%s" "$GATE_E5_ARM" "$GATE_E5_TRIGGER" "$GATE_E5_SIZE_STATE" "${GATE_E5_RAW_LINES:-}"')
+        out = subprocess.run(["/bin/bash", "-c", script], env={"PATH": os.environ["PATH"], "LIB": lib, "B": bead, "N": str(lines)},
+                             capture_output=True, text=True, check=True).stdout
+        _admit[key] = out.split("|")
+    return _admit[key]
+def run(bead, arm, result, reason, admitted=True, lines="300", extra=None):
     g = "ga-run-%s-%d" % (bead, n[0] + 1)
     t = ts()
     if admitted:
+        real_arm, trigger, size_state, raw = real_admit(bead, lines)
+        assert real_arm == arm, "fixture bead %s is arm %s in the live lib, not %s" % (bead, real_arm, arm)
         ev.append({"ts": t, "event": "e5_admit", "gate_run": g, "bead": bead, "arm": arm, "trigger": trigger,
-                   "size_state": "yes" if int(lines) >= 800 else "no", "raw_lines": lines, "rig": "whatsapp_automation", "tier": "CODE"})
+                   "size_state": size_state, "raw_lines": raw, "rig": "whatsapp_automation", "tier": "CODE"})
         ev.append({"ts": t, "event": "e5_session", "gate_run": g, "bead": bead, "slot": "1", "verdict_bead": "ga-r1%s" % format(abs(hash(g)) % 10**6, "06d")})
     ev.append({"ts": ts(), "event": "dispatcher_complete", "gate_run": g, "bead": bead, "result": result, "reason": reason})
     if extra:
@@ -59,26 +76,30 @@ def run(bead, arm, result, reason, admitted=True, trigger="none", lines="300", e
     return g
 FAILJ = "Reviewer 1 FAIL: VERDICT: FAIL"
 # arm A: 4 beads 1st-FAIL -> 2nd FAIL ; 4 -> FAIL then PASS ; 2 -> FAIL, nothing after yet ; 1 timeout-only (not a reviewer FAIL) ; 1 clean PASS
+# sizes (the stratification key): default 300 lines; one arm-A bead with a 1200-line diff and one whose diff could not be read ("fail"),
+# and the same pair on arm B further down — every size stratum has BOTH arms measured, and the unmeasured one is symmetric.
 for b in a_ids[0:4]:
-    run(b, "A", "FAIL", FAILJ); run(b, "A", "FAIL", FAILJ); run(b, "A", "PASS", "quorum_1_of_1_independent_sessions")
+    lines = "1200" if b == a_ids[0] else "300"
+    run(b, "A", "FAIL", FAILJ, lines=lines); run(b, "A", "FAIL", FAILJ); run(b, "A", "PASS", "quorum_1_of_1_independent_sessions")
 for b in a_ids[4:8]:
-    run(b, "A", "FAIL", FAILJ); run(b, "A", "PASS", "quorum")
+    run(b, "A", "FAIL", FAILJ, lines="fail" if b == a_ids[4] else "300"); run(b, "A", "PASS", "quorum")
 for b in a_ids[8:10]:
     run(b, "A", "FAIL", FAILJ)
 run(a_ids[10], "A", "FAIL", "TIMEOUT: reviewers did not submit verdicts within 25 minutes."); run(a_ids[10], "A", "PASS", "quorum")
 run(a_ids[11], "A", "PASS", "quorum")
 # arm B: 2 beads 1st-FAIL -> 2nd FAIL ; 6 -> FAIL then PASS ; 2 pending ; 1 prior-to-flag FAIL ; 1 clean PASS
 for b in b_ids[0:2]:
-    run(b, "B", "FAIL", FAILJ, trigger="none"); run(b, "B", "FAIL", FAILJ); run(b, "B", "PASS", "quorum")
+    run(b, "B", "FAIL", FAILJ); run(b, "B", "FAIL", FAILJ); run(b, "B", "PASS", "quorum")
 for b in b_ids[2:8]:
-    run(b, "B", "FAIL", FAILJ); run(b, "B", "PASS", "quorum")
+    lines = {b_ids[2]: "fail", b_ids[3]: "900"}.get(b, "300")
+    run(b, "B", "FAIL", FAILJ, lines=lines); run(b, "B", "PASS", "quorum")
 for b in b_ids[8:10]:
     run(b, "B", "FAIL", FAILJ)
 # 1st FAIL BEFORE the flag (no e5_admit for it), then a flagged PASS -> must stay out of the primary metric
-run(b_ids[10], "B", "FAIL", FAILJ, admitted=False); run(b_ids[10], "B", "PASS", "quorum")
-run(b_ids[11], "B", "PASS", "quorum")
+run(b_ids[10], "B", "FAIL", FAILJ, admitted=False); g10 = run(b_ids[10], "B", "PASS", "quorum")
+g11 = run(b_ids[11], "B", "PASS", "quorum")
 # treatment delivery on B, each on its OWN bead so the primary metric stays exactly as counted above
-g = run(b_ids[12], "B", "FAIL", FAILJ, trigger="none", lines="1200")            # 1st FAIL, big diff, extra delivered a FAIL
+g = run(b_ids[12], "B", "FAIL", FAILJ, lines="1200")                            # 1st FAIL, big diff, extra delivered a FAIL
 ev.append({"ts": ts(), "event": "e5_extra_spawn", "gate_run": g, "bead": b_ids[12], "trigger": "big-diff", "extra_vb": "ga-exkn01", "session_id": "s", "session_key": ""})
 ev.append({"ts": ts(), "event": "e5_run_end", "gate_run": g, "bead": b_ids[12], "result": "FAIL", "extra_verdict": "FAIL"})
 run(b_ids[12], "B", "PASS", "quorum")                                           # -> resolved
@@ -89,6 +110,11 @@ g = run(b_ids[14], "B", "PASS", "quorum")                                       
 ev.append({"ts": ts(), "event": "e5_extra_declined", "gate_run": g, "bead": b_ids[14], "trigger": "first-fail", "reason": "daily-cap-reached"})
 g = run(b_ids[15], "B", "PASS", "quorum")                                       # spawned, no run_end, no transcript anywhere
 ev.append({"ts": ts(), "event": "e5_extra_spawn", "gate_run": g, "bead": b_ids[15], "trigger": "first-fail", "extra_vb": "ga-exms03", "session_id": "s3", "session_key": ""})
+# the two other states of an extra that ended without delivering (the log says which; "no record at all" is the b_ids[15] case above)
+ev.append({"ts": ts(), "event": "e5_extra_spawn", "gate_run": g11, "bead": b_ids[11], "trigger": "first-fail", "extra_vb": "ga-exno04", "session_id": "s4", "session_key": ""})
+ev.append({"ts": ts(), "event": "e5_run_end", "gate_run": g11, "bead": b_ids[11], "result": "PASS", "extra_verdict": "NONE"})           # closed with no verdict
+ev.append({"ts": ts(), "event": "e5_extra_spawn", "gate_run": g10, "bead": b_ids[10], "trigger": "first-fail", "extra_vb": "ga-exun05", "session_id": "s5", "session_key": ""})
+ev.append({"ts": ts(), "event": "e5_run_end", "gate_run": g10, "bead": b_ids[10], "result": "PASS", "extra_verdict": "UNREADABLE"})     # its comments could not be read
 with open(os.path.join(tmp, "qg.jsonl"), "w") as fh:
     fh.write("not json at all\n")
     for e in ev:
@@ -127,10 +153,30 @@ case "$T" in *"AINDA NÃO CONCLUSIVO"*) ok "underpowered result says so" ;; *) b
 case "$T" in *"1 linha(s) ilegíveis"*) ok "a garbage line in the log is counted, not fatal" ;; *) bad "garbage line not reported" ;; esac
 
 echo "── treatment delivery ──"
-check "B: 3 extras spawned" 3 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento.extra_disparado')"
+check "B: 5 extras spawned" 5 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento.extra_disparado')"
 check "B: one extra delivered a FAIL" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento["extra_entregou:FAIL"]')"
 check "B: one extra abandoned (reason kept)" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento["extra_abandonado:extra-timeout"]')"
 check "B: one run declined for the daily cap (ran as arm A)" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento["recusado:daily-cap-reached"]')"
+# gate attempt 3: an extra that ended without delivering is filed by WHAT the log says happened — "closed with no verdict" and "its comments
+# could not be read" and "no run-end line at all" are three different facts, not one "no verdict recorded" bucket.
+check "B: an extra that closed with NO verdict is its own state" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento.extra_fechou_sem_veredito')"
+check "B: an extra whose comments could not be read is its own state" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento.extra_comentarios_ilegiveis')"
+check "B: an extra with no e5_run_end line at all stays 'no record' (unknown, not 'delivered nothing')" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento.extra_sem_veredito_registrado')"
+check "B: a big-diff run whose extra never spawned is counted apart" 1 "$(printf '%s' "$J" | jq -r '.entrega_do_tratamento["big-diff_sem_extra_registrado"]')"
+
+echo "── size stratification: the diff is measured for BOTH arms ──"
+# gate attempt 3, blocking issue 2. The admit records above come from the REAL gate_e5_admit_decision. Before the fix arm A logged
+# size_state=no with raw_lines="" for every run, so all of arm A fell into 'tamanho desconhecido' while arm B had real buckets: a table
+# with "<800 A: 0/0 B: 0/2", ">=800 A: 0/0 B: 1/2", "desconhecido A: 0/4 B: 0/0" — no control arm in the strata that matter.
+S() { printf '%s' "$J" | jq -r "$1"; }
+check "tamanho=<800, arm A: 3 second-FAIL / 3 resolved / 2 unknown" "3,3,2" "$(S '.strata["tamanho=<800"].A | "\(.segunda_fail),\(.resolveu_sem_segunda_fail),\(.ainda_nao_se_sabe)"')"
+check "tamanho=<800, arm B: 2 second-FAIL / 4 resolved / 2 unknown" "2,4,2" "$(S '.strata["tamanho=<800"].B | "\(.segunda_fail),\(.resolveu_sem_segunda_fail),\(.ainda_nao_se_sabe)"')"
+check "tamanho=>=800, arm A has its OWN measured bead (1 second-FAIL)" 1 "$(S '.strata["tamanho=>=800"].A.segunda_fail')"
+check "tamanho=>=800, arm B: 2 resolved" 2 "$(S '.strata["tamanho=>=800"].B.resolveu_sem_segunda_fail')"
+check "a diff that could not be read: one bead per arm in 'tamanho desconhecido' — symmetric, and only those" "1,1" "$(S '.strata["tamanho=tamanho desconhecido"] | "\(.A.resolveu_sem_segunda_fail),\(.B.resolveu_sem_segunda_fail)"')"
+check "EVERY size stratum has a bead of BOTH arms (a stratified comparison needs a control in each cell)" true "$(S '[.strata | to_entries[] | select(.key | startswith("tamanho=")) | ((.value.A | length) > 0 and (.value.B | length) > 0)] | all')"
+check "beads with no measured size, per arm" "1,1" "$(S '.tamanho_nao_medido | "\(.A),\(.B)"')"
+case "$T" in *"NÃO medido em A: 1 de 12"*"B: 1 de 16"*) ok "the report says how many beads per arm have no measured size" ;; *) bad "no size-coverage line in the report: $(printf '%s' "$T" | grep -i 'medido' | head -2)" ;; esac
 
 echo "── cost: three states ──"
 check "sessions by state, arm B: known=1 unknown=1 no-record=1 + every reviewer-1 session has no transcript" \
@@ -177,8 +223,48 @@ for line in open(sys.argv[1]):
 PYEOF
 python3 "$SCRIPT" --qg-log "$TMP/qg-noarm.jsonl" --lib "$LIB" --no-cost --json >"$TMP/noarm.json" 2>"$TMP/err.txt"; RC=$?
 [ "$RC" = "0" ] && ok "an admit record with no arm field does not abort the audit (read as ?, not as A)" || bad "an admit record with no arm field aborted the analysis (rc=$RC): $(head -1 "$TMP/err.txt")"
+check "...and that bead is counted as 'sem braço' (in neither arm), not silently dropped" 1 "$(jq -r '.beads_sem_braco' "$TMP/noarm.json")"
 python3 "$SCRIPT" --qg-log "$QG" --lib /nonexistent/lib.sh --no-cost >/dev/null 2>"$TMP/err.txt"; RC=$?
 [ "$RC" -ne 0 ] && ok "a missing lib aborts (no guessed arm rule), rc=$RC" || bad "missing lib did not abort"
+# gate attempt 3 (non-blocking): an audit that comes back EMPTY is not an audit that found no divergence. Both ways it can come back empty
+# must abort, each under its own message: the live function gave no arm (no sha tool), and the bash that runs it died.
+printf 'gate_e5_arm_for_bead() {\n  return 3\n}\n' > "$TMP/fake-lib-noarm.sh"
+python3 "$SCRIPT" --qg-log "$QG" --lib "$TMP/fake-lib-noarm.sh" --no-cost >/dev/null 2>"$TMP/err.txt"; RC=$?
+[ "$RC" -ne 0 ] && grep -q "FATAL: a auditoria do braço não recalculou" "$TMP/err.txt" && ok "the live lib returning NO arm for the recorded beads aborts (was: 'ok (0 beads recalculadas, 0 divergências)'), rc=$RC" || bad "an audit that recalculated nothing passed (rc=$RC): $(head -1 "$TMP/err.txt")"
+printf 'gate_e5_arm_for_bead() {\n  kill -9 $$\n}\n' > "$TMP/fake-lib-crash.sh"
+python3 "$SCRIPT" --qg-log "$QG" --lib "$TMP/fake-lib-crash.sh" --no-cost >/dev/null 2>"$TMP/err.txt"; RC=$?
+[ "$RC" -ne 0 ] && grep -q "FATAL: a auditoria do braço não rodou" "$TMP/err.txt" && ok "the audit's bash dying aborts under its own message, rc=$RC" || bad "a crashed audit passed (rc=$RC): $(head -1 "$TMP/err.txt")"
+# every admit record with no arm: nothing to audit — and the header must SAY so instead of claiming an audit passed
+python3 - "$QG" "$TMP/qg-allnoarm.jsonl" <<'PYEOF'
+import json, sys
+out = open(sys.argv[2], "w")
+for line in open(sys.argv[1]):
+    try: o = json.loads(line)
+    except ValueError: out.write(line); continue
+    if o.get("event") == "e5_admit":
+        o.pop("arm", None)
+    out.write(json.dumps(o) + "\n")
+PYEOF
+python3 "$SCRIPT" --qg-log "$TMP/qg-allnoarm.jsonl" --lib "$LIB" --no-cost --json >"$TMP/allnoarm.json" 2>"$TMP/err.txt"; RC=$?
+check "a log whose admit records all lack an arm: runs, no abort" "0" "$RC"
+case "$(jq -r '.braco_auditado' "$TMP/allnoarm.json")" in "NADA AUDITADO"*) ok "...and the header says NOTHING WAS AUDITED (never 'ok')" ;; *) bad "nothing-to-audit reads as a passed audit: $(jq -r '.braco_auditado' "$TMP/allnoarm.json")" ;; esac
+# the per-bead arm comes from ALL of a bead's admitted runs: a FIRST run recorded "?" (a sha tool missing for one sweep) must not drop the
+# bead from both arms when a later run of the same bead carries its arm
+python3 - "$QG" "$TMP/qg-qfirst.jsonl" "${B_IDS[4]}" <<'PYEOF'
+import json, sys
+out = open(sys.argv[2], "w")
+done = False
+for line in open(sys.argv[1]):
+    try: o = json.loads(line)
+    except ValueError: out.write(line); continue
+    if o.get("event") == "e5_admit" and o.get("bead") == sys.argv[3] and not done:
+        o.pop("arm", None); done = True
+    out.write(json.dumps(o) + "\n")
+PYEOF
+python3 "$SCRIPT" --qg-log "$TMP/qg-qfirst.jsonl" --lib "$LIB" --no-cost --json >"$TMP/qfirst.json" 2>"$TMP/err.txt"; RC=$?
+check "a bead whose FIRST admitted run has no arm but whose later run is B: rc" "0" "$RC"
+check "...stays in arm B (2 second-FAIL / 7 resolved / 2 unknown, unchanged)" "2,7,2" "$(jq -r '.primaria.B | "\(.segunda_fail),\(.resolveu_sem_segunda_fail),\(.ainda_nao_se_sabe)"' "$TMP/qfirst.json")"
+check "...and is NOT counted as 'sem braço'" 0 "$(jq -r '.beads_sem_braco' "$TMP/qfirst.json")"
 
 echo "── empty window ──"
 : > "$TMP/empty.jsonl"

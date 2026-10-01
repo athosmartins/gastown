@@ -136,7 +136,7 @@ gate_e5_prompt_fingerprint() {
 gate_e5_log_admit() {
   gate_e5_log_event e5_admit gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" branch "${BRANCH:-}" \
     rig "${RIG:-}" tier "${TIER:-}" author "${AUTHOR:-}" arm "${GATE_E5_ARM:-?}" \
-    trigger "${GATE_E5_TRIGGER:-none}" size_state "${GATE_E5_SIZE_STATE:-}" raw_lines "${GATE_E5_RAW_LINES:-}" \
+    trigger "${GATE_E5_TRIGGER:-none}" size_state "${GATE_E5_SIZE_STATE:-unknown}" raw_lines "${GATE_E5_RAW_LINES:-}" \
     base_reviewers "${REQUIRED_REVIEWERS:-}" review_prompt_cksum "$(gate_e5_prompt_fingerprint "${1:-}" "${2:-}")"
 }
 
@@ -227,11 +227,16 @@ gate_e5_cap_max() {
 }
 
 # gate_e5_cap_state — ok | capped | unknown
+# "No counter file" means "nothing spent today" ONLY when a count can be written: a spawn records its spend by writing the counter, so a
+# directory that refuses the write would leave every later call reading "no file = 0" and the cap would never bite (gate attempt 3,
+# non-blocking: spend_record only warned). An unwritable counter directory is therefore `unknown` — no extra, like every other way of not
+# knowing the cap.
 gate_e5_cap_state() {
   local _max _f _n
   _max=$(gate_e5_cap_max)
   [ -z "$_max" ] && { printf 'unknown'; return 0; }
   _f=$(gate_e5_spend_file)
+  [ -d "${_f%/*}" ] && [ -w "${_f%/*}" ] || { printf 'unknown'; return 0; }
   if [ -e "$_f" ]; then
     _n=$(cat "$_f" 2>/dev/null || echo "")
     case "$_n" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
@@ -276,24 +281,26 @@ gate_e5_spend_record() {
 # 800-line threshold — NOT the numstat sum the timeout scaler uses.
 # Unmeasured is "?", NEVER "A" (see gate_e5_arm_for_bead): the dispatcher sets this to "?" at Step 5 and only a decision made there
 # replaces it, so a run nobody admitted cannot be logged as a measured arm-A run.
-GATE_E5_ARM="?"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
+# The SIZE is measured for EVERY admitted run — arm A, arm B and an arm that could not be decided — because it is a stratification key of
+# the apuração, and a stratum needs both arms (gate attempt 3, blocking issue 2: measured only for arm B, every arm-A record read "no" with
+# no line count, so the size strata had a control arm in none of the informative cells). Only the TRIGGER — the treatment — is arm B's alone.
+# And "not measured" is "unknown", the default of every variable below: "no" means a measured diff under the threshold.
+GATE_E5_ARM="?"; GATE_E5_SIZE_STATE="unknown"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
 gate_e5_admit_decision() {
   GATE_E5_ARM=$(gate_e5_arm_for_bead "${BEAD_ID:-}") || GATE_E5_ARM="?"
-  GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
-  [ "$GATE_E5_ARM" = "B" ] || return 0
+  GATE_E5_SIZE_STATE="unknown"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"
   local _out _rc=0
   _out=$(git_rig diff "origin/${DEFAULT_BRANCH}...origin/${BRANCH}" 2>/dev/null) || _rc=$?
-  if [ "$_rc" -ne 0 ]; then
-    GATE_E5_SIZE_STATE="unknown"
-    return 0
+  if [ "$_rc" -eq 0 ]; then
+    if [ -z "$_out" ]; then
+      GATE_E5_RAW_LINES=0
+    else
+      GATE_E5_RAW_LINES=$(printf '%s\n' "$_out" | wc -l | tr -d ' ')
+    fi
+    GATE_E5_SIZE_STATE=$(gate_e5_size_state "$GATE_E5_RAW_LINES")
   fi
-  if [ -z "$_out" ]; then
-    GATE_E5_RAW_LINES=0
-  else
-    GATE_E5_RAW_LINES=$(printf '%s\n' "$_out" | wc -l | tr -d ' ')
-  fi
-  GATE_E5_SIZE_STATE=$(gate_e5_size_state "$GATE_E5_RAW_LINES")
-  if [ "$GATE_E5_SIZE_STATE" = "yes" ] && [ "${REQUIRED_REVIEWERS:-1}" = "1" ]; then
+  # A diff that could not be read leaves size_state=unknown and raw_lines="" (logged as such); it is never a trigger and never "small".
+  if [ "$GATE_E5_ARM" = "B" ] && [ "$GATE_E5_SIZE_STATE" = "yes" ] && [ "${REQUIRED_REVIEWERS:-1}" = "1" ]; then
     GATE_E5_TRIGGER="big-diff"
   fi
   return 0
@@ -305,7 +312,11 @@ gate_e5_admit_decision() {
 # task queued; returns 1 and sets GATE_E5_DECLINE_REASON otherwise (and logs the decline).
 # Order matters: the SESSION is created first, the verdict bead second — so a failure at
 # either step leaves at most one thing to clean up, and a bead that Phase C would wait on
-# never exists without a session behind it.
+# never exists without a session behind it. "Never" holds only if a `bd create` that REPORTS failure is not taken at its word: a create can
+# fail AFTER writing (a Dolt hiccup on the way back), leaving an unassigned e5-extra verdict:pending bead that Phase C counts as a live
+# slot — so the run would wait out the extra's whole window for a reviewer that does not exist (gate attempt 3, non-blocking). A failed
+# create is therefore read back (gate_e5_find_extra_bead): found -> the bead exists, use it; not found -> there really is none; could not
+# read -> unknown, declined under its own reason so the apuração does not file it with the clean "no bead" case.
 GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
 GATE_E5_EXTRA_WINDOW_SECS=""   # set by the first-fail hook just before it spawns; logged on e5_extra_spawn
 GATE_E5_DECLINE_REASON=""
@@ -315,9 +326,18 @@ gate_e5_decline() {
   gate_e5_log_event e5_extra_declined gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" trigger "${_e5_trig:-}" reason "$1"
   return 0   # always 0: a decline is a normal outcome, never an errexit trigger; callers `return 1` themselves
 }
+# gate_e5_find_extra_bead <gate_run_id> — prints the id of the run's e5-extra verdict bead if one exists (abandoned ones included: they still
+# exist). rc 0 = the run's verdict beads were READ, and empty output then means "there is none"; rc 1 = they could not be read, which says
+# nothing about whether one exists. The same list query Phase C uses for the run (every label is AND).
+gate_e5_find_extra_bead() {
+  local _j
+  _j=$(bd -C "$GC_CITY" list --json --all --include-infra --limit 0 -l type:quality-gate-verdict -l "gate-run:${1:-}" -l e5-extra 2>/dev/null) || return 1
+  printf '%s' "$_j" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+  printf '%s' "$_j" | jq -r '[.[]? | .id] | first // empty' 2>/dev/null
+}
 gate_e5_spawn_extra() {
   local _run="$1" _vb1="$2" _task1="$3" _e5_trig="$4"
-  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _peek_out _vassign=0 _n
+  local _cap _errf _err _sjson _sid _sname _skey _vb2 _task2 _peek _peek_out _vassign=0 _n _meta _metaargs=() _found _frc
   GATE_E5_EXTRA_VB=""; GATE_E5_EXTRA_SID=""; GATE_E5_EXTRA_SNAME=""; GATE_E5_EXTRA_TASK=""; GATE_E5_EXTRA_PEEK=""
   GATE_E5_DECLINE_REASON=""
 
@@ -352,6 +372,11 @@ gate_e5_spawn_extra() {
     return 1
   fi
 
+  # The extra's session identity is written INTO the create (metadata e5.session_id / e5.session_name), not in a later write that can fail
+  # on its own: the assignee is the only other place Phase C learns a slot's session from, and when the verified assign below fails the
+  # bead has no assignee — without this the session pinned below would have no record but the e5_extra_spawn log line (gate attempt 3).
+  _meta=$(jq -c -n --arg sid "$_sid" --arg sname "${_sname:-}" '{"e5.session_id": $sid, "e5.session_name": $sname}' 2>/dev/null || echo "")
+  if [ -n "$_meta" ]; then _metaargs=(--metadata "$_meta"); fi
   _vb2=$(bd -C "$GC_CITY" create \
     "reviewer-verdict: ${BRANCH:-?} (reviewer 2/2, E5 extra)" \
     -t chore \
@@ -361,6 +386,7 @@ gate_e5_spawn_extra() {
     -l verdict:pending \
     -l e5-extra \
     -l "e5-trigger:$_e5_trig" \
+    ${_metaargs[@]+"${_metaargs[@]}"} \
     -d "E5 (ga-syxaki) extra verdict bead: reviewer 2 of 2 on branch ${BRANCH:-?}.
 gate_run: $_run
 trigger: $_e5_trig
@@ -368,9 +394,22 @@ lens: $(gate_e5_extra_lens)
 Best-effort by design: if this reviewer does not deliver, the run is decided by reviewer 1 alone." \
     --json 2>/dev/null | jq -r '.id // empty' 2>/dev/null || echo "")
   if [ -z "$_vb2" ]; then
-    gc --city "$GC_CITY" session close "$_sid" 2>/dev/null || true
-    gate_e5_decline "verdict-bead-create-failed"
-    return 1
+    # The create said "failed" (or printed no id). Three states, not two: the bead is there / it is not / we could not look.
+    _frc=0
+    _found=$(gate_e5_find_extra_bead "$_run") || _frc=$?
+    if [ "$_frc" -ne 0 ]; then
+      gc --city "$GC_CITY" session close "$_sid" 2>/dev/null || true
+      warn "  E5: the verdict-bead create failed AND the run's verdict beads could not be read back — an e5-extra bead may exist without a session; Phase C retires it on the extra's own clock."
+      gate_e5_decline "verdict-bead-create-unverified"
+      return 1
+    elif [ -n "$_found" ]; then
+      _vb2="$_found"
+      warn "  E5: the verdict-bead create reported failure but the bead EXISTS ($_vb2) — using it, not declaring 'no bead'."
+    else
+      gc --city "$GC_CITY" session close "$_sid" 2>/dev/null || true
+      gate_e5_decline "verdict-bead-create-failed"
+      return 1
+    fi
   fi
 
   _task2=$(gate_e5_extra_task "$_task1" "$_vb1" "$_vb2") || _task2=""
@@ -624,6 +663,22 @@ gate_e5_phase_c_hook() {
     for _i in "${!VERDICT_BEAD_IDS[@]}"; do
       [ "${VERDICT_BEAD_IDS[$_i]}" = "$_extra_vb" ] && _extra_sid="${SESSION_IDS[$_i]:-}"
     done
+    # The slot's session, as Phase C reads it, is the verdict bead's ASSIGNEE. That is EMPTY when the extra's verified assign failed at
+    # spawn (its session was pinned before the assign, so nothing else would ever close it) and "__UNKNOWN__" when the read failed — neither
+    # means "no session". The spawn also wrote the session into the bead's own metadata; recover it from there (gate attempt 3, non-blocking).
+    # An empty slot is filled back in, so the classifier below and the EXIT cleanup see the real session; "__UNKNOWN__" keeps its sentinel
+    # meaning for the closed-session check and is only replaced for the closing itself.
+    local _close_sid="$_extra_sid" _meta_sid=""
+    case "$_extra_sid" in ''|__UNKNOWN__)
+      _meta_sid=$(printf '%s' "$_runvb" | jq -r --arg v "$_extra_vb" '[.[]? | select(.id==$v)] | first | (.metadata["e5.session_name"] // .metadata["e5.session_id"] // empty)' 2>/dev/null || echo "")
+      _close_sid="$_meta_sid"
+      if [ -n "$_meta_sid" ] && [ -z "$_extra_sid" ]; then
+        _extra_sid="$_meta_sid"
+        for _i in "${!VERDICT_BEAD_IDS[@]}"; do
+          [ "${VERDICT_BEAD_IDS[$_i]}" = "$_extra_vb" ] && SESSION_IDS[$_i]="$_meta_sid"
+        done
+      fi ;;
+    esac
     # The extra's own clock (see "the extra reviewer's OWN window" above): its age, when it was born (offset into the run) and the
     # window it was granted. Any of the three unreadable leaves _window empty = "cannot tell" — no own deadline, no extension.
     local _age="" _offset="" _window="" _run_past=0 _others_done=0
@@ -658,7 +713,7 @@ gate_e5_phase_c_hook() {
     fi
     if [ -n "$_why" ]; then
       warn "  E5: retiring the extra reviewer of gate-run ${GATE_RUN_ID:-?} ($_why) — deciding on the reviewer(s) that delivered, as arm A does."
-      gate_e5_abandon_bead "$_extra_vb" "$_extra_sid" "$_why"
+      gate_e5_abandon_bead "$_extra_vb" "$_close_sid" "$_why"
       gate_e5_log_event e5_extra_abandoned gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" extra_vb "$_extra_vb" reason "$_why"
       gate_e5_drop_slot "$_extra_vb"
       gate_collect_verdicts
