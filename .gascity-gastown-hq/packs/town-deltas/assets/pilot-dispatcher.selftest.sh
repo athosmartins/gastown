@@ -6849,9 +6849,13 @@ _nc_claimed=0
 for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
   [ "$(capq_n "label add $_nc_id pilot:dispatching")" -ge 1 ] && _nc_claimed=$((_nc_claimed + 1))
 done
-[ "$_nc_claimed" = "1" ] && [ "$(capq_n "label add wa-nc4 pilot:dispatching")" -ge 1 ] \
-  && ok "CAPQ-I2: with the pre-claim skip OFF only the FIRST candidate (wa-nc4) reached dispatch_one() and found the count unreadable — the other 2 were never claimed (ga-5je3zv halt; was: all 3)" \
-  || bad "CAPQ-I2: $_nc_claimed of 3 candidates were claimed with the pre-claim skip OFF (first: $(capq_n "label add wa-nc4 pilot:dispatching")) — expected exactly the first; the dispatch phase should halt on the first unreadable count"
+# WHICH candidate is the one is not asserted: _top_candidate() ranks equal-priority beads NEWEST-first
+# (_PILOT_SORT_JQ, created_at DESC), so it is wa-nc6 here — an earlier draft of this assertion hard-coded the
+# oldest (wa-nc4) and failed against the real dispatcher (measured: "Lane picks — small: wa-nc6"). The tiebreak
+# is a product policy that can change; the property under test is "ONE claim, then the phase halts".
+[ "$_nc_claimed" = "1" ] \
+  && ok "CAPQ-I2: with the pre-claim skip OFF exactly ONE candidate reached dispatch_one() and found the count unreadable — the other 2 were never claimed (ga-5je3zv halt; was: all 3)" \
+  || bad "CAPQ-I2: $_nc_claimed of 3 candidates were claimed with the pre-claim skip OFF — expected exactly 1; the dispatch phase should halt on the first unreadable count"
 _nc_on_claimed=0
 run_capq_dispatch "$CAPQ_NC3" "" "" "session-list-is-not-json" 0 1 >/dev/null
 for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
@@ -7242,8 +7246,15 @@ echo "$LOG_HC" | grep 'dispatch phase HALTED' >/dev/null \
   || ok "HALT-C: no halt line"
 sweep_expect '.halted' 'null'                        "HALT-C: the event says halted=null for a sweep that ran to the end"
 
-echo "Scenario HALT-D (ga-5je3zv): the dispatch phase has a TIME BUDGET — PILOT_DISPATCH_MAX_SECS=1 with a 2 s spawn: the first bead spawns, the budget is spent, the other 2 are not started"
-LOG_HD="$(PILOT_DISPATCH_MAX_SECS=1 CAPQ_SPAWN_SLEEP=2 run_capq_dispatch "$HALT_B_FX" "" "" '{"sessions":[]}')"
+echo "Scenario HALT-D (ga-5je3zv): the dispatch phase has a TIME BUDGET — PILOT_DISPATCH_MAX_SECS=15 with a 16 s spawn: the first bead spawns, the budget is spent, the other 2 are not started"
+# The budget is wall-clock ($SECONDS, whole seconds that tick on clock boundaries), so the numbers must leave room for
+# scheduler jitter: the first bead has to start BEFORE the budget is spent, the spawn has to outlast it. An earlier
+# draft used 1 s / 2 s and was a coin flip — a ~50 ms gap between the phase clock starting and the first check reads as
+# >= 1 s in ~10% of trials on an idle shell (measured 4 of 40), and on a loaded box the gap is seconds, so the budget
+# expired BEFORE the first candidate (claimed=0 spawned=0) instead of after it. 15 s leaves ~12 s of margin; 16 s > 15 s
+# keeps the "spent by the end of the first dispatch" half. The deterministic budget cases (T4a-e) live in
+# pilot-dispatcher.count-unreadable-halt.selftest.sh, on a stubbed clock; this scenario only proves the real wiring.
+LOG_HD="$(PILOT_DISPATCH_MAX_SECS=15 CAPQ_SPAWN_SLEEP=16 run_capq_dispatch "$HALT_B_FX" "" "" '{"sessions":[]}')"
 [ "$(halt_spawns)" = "1" ] && [ "$(halt_claimed wa-hb1 wa-hb2 wa-hb3)" = "1" ] \
   && ok "HALT-D: 1 bead claimed and spawned, then the budget stopped the loop (was: all 3, with no bound on how long)" \
   || bad "HALT-D: claimed=$(halt_claimed wa-hb1 wa-hb2 wa-hb3) spawned=$(halt_spawns) — expected 1/1; nothing bounds the dispatch phase"
