@@ -1179,8 +1179,26 @@ if [ ! -x "$SW" ]; then bad "switch script missing or not executable: $SW"; else
   echo "not-a-number" > "$SWC/.gc/gate-e5-spend-$(date +%Y-%m-%d).count"
   SW_ARGS=(status); OUT="$(sw)"
   case "$OUT" in *"US\$ 0.00"*) bad "status renders an unreadable counter as zero spend: $OUT" ;; *"ilegível"*"desconhecid"*) ok "status: an unreadable spend counter is reported as unknown, not as US\$ 0.00" ;; *) bad "status for an unreadable counter: $OUT" ;; esac
+  # gate attempt 3 (same class, the switch): "cannot be read" is its own state — never "absent", never "zero spend", never "no bound".
+  CNT="$SWC/.gc/gate-e5-spend-$(date +%Y-%m-%d).count"
+  echo 4 > "$CNT"; chmod 000 "$CNT"
+  SW_ARGS=(status); OUT="$(sw)"
+  case "$OUT" in *"US\$ 0.00"*|*"extras pagos hoje: 0"*) bad "status renders a counter that EXISTS but cannot be read as zero spend: $OUT" ;; *"ilegível"*) ok "status: a counter that exists but cannot be read is 'ilegível', not US\$ 0.00" ;; *) bad "status for an unreadable (chmod 000) counter: $OUT" ;; esac
+  chmod 600 "$CNT"; echo 3 > "$CNT"
+  chmod 000 "$SWC/.gc/gate-e5-second-reviewer.on"
+  SW_ARGS=(status); OUT="$(sw)"
+  case "$OUT" in *"DESLIGADO (arquivo"*) bad "status calls a flag file that EXISTS but cannot be read 'ausente': $OUT" ;; *"ILEGÍVEL"*"DESLIGADO (inerte)"*|*"ILEGÍVEL"*"inerte"*) ok "status: a flag file that exists but cannot be read is 'ILEGÍVEL' (the dispatcher reads it as off), not 'ausente'" ;; *) bad "status for an unreadable flag file: $OUT" ;; esac
+  chmod 600 "$SWC/.gc/gate-e5-second-reviewer.on"
+  rm -f "$CNT"; chmod 555 "$SWC/.gc"
+  SW_ARGS=(status); OUT="$(sw)"
+  chmod 755 "$SWC/.gc"
+  case "$OUT" in *"não gravável"*"nenhum extra nasce"*) ok "status: no counter yet and none can be written is 'não gravável' (the dispatcher's cap reads it as unknown too), not '0 extras'" ;; *) bad "status for an unwritable counter directory: $OUT" ;; esac
+  echo 3 > "$CNT"; : > "$CNT.alerted"
   SW_ARGS=(off); sw >/dev/null 2>&1; RC=$?
   [ "$RC" = "0" ] && [ ! -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && check "off removes the flag; the reader sees 0" 0 "$(env -i PATH="$PATH" GC_CITY="$SWC" "$BASH32" -c "source '$LIB'; gate_e5_enabled")" || bad "off failed: rc=$RC"
+  # a not-before bound that is not a number is not "no bound": the date guard would otherwise be skipped in silence
+  SW_ARGS=(on "Mayor, bead ga-syxaki #3, 2026-10-01T21:05-03"); sw GATE_E5_NOT_BEFORE_EPOCH=abc >/dev/null 2>"$TMP/sw-bound.err"; RC=$?
+  [ "$RC" = "2" ] && [ ! -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && grep -q "não é um número" "$TMP/sw-bound.err" && ok "on with an unreadable date bound: refused (rc 2, flag NOT written) — a bound that cannot be read is not 'no bound'" || bad "garbage GATE_E5_NOT_BEFORE_EPOCH let 'on' through or failed oddly: rc=$RC flag=$([ -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && echo written || echo absent) err=$(head -1 "$TMP/sw-bound.err")"
   SW_ARGS=(on "urgent: Athos asked in bead ga-syxaki #9"); sw GATE_E5_NOT_BEFORE_EPOCH=99999999999 GATE_E5_FORCE_EARLY=1 >/dev/null 2>&1; RC=$?
   [ "$RC" = "0" ] && [ -e "$SWC/.gc/gate-e5-second-reviewer.on" ] && ok "GATE_E5_FORCE_EARLY=1 is the explicit override for an early start" || bad "force-early failed: rc=$RC"
   SW_ARGS=(bogus); sw >/dev/null 2>&1; check "unknown subcommand: usage error (rc 2)" 2 "$?"
