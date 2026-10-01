@@ -35,6 +35,11 @@
 # unreadable bead — degrades to "arm A behaviour": the gate answers with reviewer 1's
 # verdict alone, exactly as it does today. Three states, never collapsed: delivered /
 # not-delivered / could-not-tell-(=not-delivered, logged with its reason).
+# That invariant is about OUTCOMES. TIME is a separate guarantee, and it is a construction rule, not a
+# degrade path: the dispatcher runs this lib under the gate lock, so a slow step here delays every run, and
+# nothing in it can decline a step that is merely slow. Hence no bash pattern operation (${v#*pat},
+# ${v/pat/rep}) on a reviewer TASK — it is up to ~400KB and those are quadratic under bash 3.2 — only
+# single linear awk passes; the selftest pins it with a >= 300KB task under a wall-clock bound.
 #
 # Observability: every decision is a line in quality-gate.jsonl (events e5_admit,
 # e5_session, e5_extra_spawn, e5_extra_declined, e5_extra_abandoned, e5_run_end) — the
@@ -145,13 +150,30 @@ _e5_warn() {
 }
 
 # gate_e5_prompt_fingerprint <review_task> <verdict_bead> — cksum of the instruction part of
-# a reviewer task (everything after "--- YOUR TASK ---"), with the per-run ids normalised, so
-# the apuração can tell which prompt a run's reviewers were given (the E4 design asks for it).
+# a reviewer task (everything after the FIRST "--- YOUR TASK ---"; the whole task if the marker is absent),
+# with the per-run ids normalised, so the apuração can tell which prompt a run's reviewers were given (the
+# E4 design asks for it).
+# ONE awk pass over the task, never a bash pattern operation on it: the task carries up to GATE_DIFF_BYTE_BUDGET
+# (400KB) of diff and this marker sits AFTER the diff, and under bash 3.2 ${v#*pat} and ${v/pat/rep} are
+# QUADRATIC in the length of $v (measured: 80KB 10s; the real 333KB task of this bead had not returned after
+# 7m40s). This runs on the dispatcher's main path for every admitted run, under the gate lock — a stall here
+# delays every other run. The ids go in through ENVIRON (awk -v would process backslash escapes) and are
+# replaced as LITERAL text (index(), not a pattern). Output is byte-for-byte what the old
+# ${1#*marker} / ${_t//id/<VB>} form produced: the input gets one extra "\n" so awk sees the last line,
+# and the lines are joined by "\n" with none after the last one.
 gate_e5_prompt_fingerprint() {
-  local _t="${1#*--- YOUR TASK ---}" _vb="${2:-}"
-  [ -n "$_vb" ] && _t="${_t//$_vb/<VB>}"
-  [ -n "${AUTHOR:-}" ] && _t="${_t//$AUTHOR/<AUTHOR>}"
-  printf '%s' "$_t" | cksum 2>/dev/null | awk '{print $1}'
+  printf '%s\n' "${1:-}" | E5_VB="${2:-}" E5_AUTHOR="${AUTHOR:-}" LC_ALL=C awk '
+    function rep(s, from, to,    out, i, n) {
+      if (from == "") return s
+      n = length(from); out = ""
+      while ((i = index(s, from)) > 0) { out = out substr(s, 1, i - 1) to; s = substr(s, i + n) }
+      return out s
+    }
+    function emit(s) { s = rep(s, vb, "<VB>"); s = rep(s, au, "<AUTHOR>"); printf "%s%s", (n++ ? "\n" : ""), s }
+    BEGIN { m = "--- YOUR TASK ---"; vb = ENVIRON["E5_VB"]; au = ENVIRON["E5_AUTHOR"] }
+    found { emit($0); next }
+    { i = index($0, m); if (i) { found = 1; emit(substr($0, i + length(m))); next } buf[++nb] = $0 }
+    END { if (!found) for (k = 1; k <= nb; k++) emit(buf[k]) }' | cksum 2>/dev/null | awk '{print $1}'
 }
 
 # gate_e5_log_admit <review_task_1> <verdict_bead_1> — the per-run record of the experiment
@@ -218,22 +240,44 @@ gate_e5_extra_lens() {
 # diff and the instructions and NOTHING of reviewer 1's verdict, so the 2nd review is
 # independent by construction. Returns 1 (and prints nothing) when any anchor is missing —
 # the prompt template changed under us; the caller then declines, never guesses.
+# ONE awk pass over the task does the whole job — the three swaps AND the anchor checks — and no bash pattern
+# operation touches the task (see gate_e5_prompt_fingerprint: ${v/pat/rep} is quadratic under bash 3.2, and a 333KB
+# task took 109s here, TWICE per spawn, with the dispatcher holding the gate lock). Order is the old one: slot (the
+# FIRST "reviewer 1 of 1" anywhere), then the lens (the first line that STARTS with "YOUR REVIEW LENS:"), then
+# every verdict-bead id. Ids and lens go in through ENVIRON (awk -v would process backslash escapes) and ids are
+# replaced as LITERAL text. The anchor checks are the old ones, on the same two sides: what the INPUT must carry
+# (slot, a lens marker anywhere, reviewer 1's id) and what the OUTPUT must carry (slot 2, the full-coverage lens
+# line, reviewer 2's id, and no trace of reviewer 1's id). awk exits 1 when any fails — nothing is printed then.
 gate_e5_extra_task() {
   local t1="${1:-}" vb1="${2:-}" vb2="${3:-}" lens t2
   [ -n "$t1" ] && [ -n "$vb1" ] && [ -n "$vb2" ] || return 1
-  case "$t1" in *"You are reviewer 1 of 1 for branch:"*) : ;; *) return 1 ;; esac
-  case "$t1" in *"YOUR REVIEW LENS:"*) : ;; *) return 1 ;; esac
-  case "$t1" in *"$vb1"*) : ;; *) return 1 ;; esac
   lens="$(gate_e5_extra_lens)"
-  t2="${t1/You are reviewer 1 of 1 for branch:/You are reviewer 2 of 2 for branch:}"
-  t2=$(printf '%s\n' "$t2" | awk -v lens="$lens" '
-      !done && /^YOUR REVIEW LENS:/ { print "YOUR REVIEW LENS: " lens; done = 1; next }
-      { print }') || return 1
-  t2="${t2//$vb1/$vb2}"
-  case "$t2" in *"You are reviewer 2 of 2 for branch:"*) : ;; *) return 1 ;; esac
-  case "$t2" in *"YOUR REVIEW LENS: CORRECTNESS — INDEPENDENT FULL-COVERAGE PASS"*) : ;; *) return 1 ;; esac
-  case "$t2" in *"$vb2"*) : ;; *) return 1 ;; esac
-  case "$t2" in *"$vb1"*) return 1 ;; esac
+  t2=$(printf '%s\n' "$t1" | E5_VB1="$vb1" E5_VB2="$vb2" E5_LENS="$lens" LC_ALL=C awk '
+      function rep(s, from, to,    out, i, n) {
+        n = length(from); out = ""
+        while ((i = index(s, from)) > 0) { out = out substr(s, 1, i - 1) to; s = substr(s, i + n) }
+        return out s
+      }
+      BEGIN {
+        s1 = "You are reviewer 1 of 1 for branch:"; s2 = "You are reviewer 2 of 2 for branch:"
+        lm = "YOUR REVIEW LENS:"; lit = "YOUR REVIEW LENS: CORRECTNESS — INDEPENDENT FULL-COVERAGE PASS"
+        vb1 = ENVIRON["E5_VB1"]; vb2 = ENVIRON["E5_VB2"]; lens = ENVIRON["E5_LENS"]
+      }
+      {
+        if (index($0, s1)) in_slot = 1
+        if (index($0, lm)) in_lens = 1
+        if (index($0, vb1)) in_vb = 1
+        line = $0
+        if (!slot_done && (i = index(line, s1))) { line = substr(line, 1, i - 1) s2 substr(line, i + length(s1)); slot_done = 1 }
+        if (!lens_done && index(line, lm) == 1) { line = lm " " lens; lens_done = 1 }
+        line = rep(line, vb1, vb2)
+        if (index(line, s2)) out_slot = 1
+        if (index(line, lit)) out_lens = 1
+        if (index(line, vb2)) out_vb2 = 1
+        if (index(line, vb1)) out_vb1 = 1
+        print line
+      }
+      END { exit !(in_slot && in_lens && in_vb && out_slot && out_lens && out_vb2 && !out_vb1) }') || return 1
   printf '%s' "$t2"
 }
 

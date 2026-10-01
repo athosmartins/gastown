@@ -21,6 +21,9 @@
 #      legacy text; extra present + 2 judged FAILs -> the union; union broken -> legacy text.
 #   9. The daily spend cap, including its "unknown" state.
 #  10. Every E5 call site in the dispatcher sits behind the GATE_E5_LIB_OK guard.
+#  11. TIME: the dispatcher runs the fingerprint and the extra-task builder under the gate lock on the WHOLE
+#      reviewer task (up to 400KB); a >= 300KB task is handled in < 5s under bash 3.2 and the answer equals an
+#      independent oracle's (no bash ${v#*pat} / ${v/pat/rep} on the task — they are quadratic).
 # Mutation checks at the end prove the suite is not vacuous.
 #
 # Exit 0 iff every assertion holds.
@@ -189,6 +192,93 @@ for mut in 's/You are reviewer 1 of 1 for branch:/You are the first reviewer of 
   [ "$RC" != "0" ] && ok "drifted template refused (rc=$RC): $mut" || bad "drifted template was ACCEPTED: $mut"
 done
 check "empty task refused" 1 "$(run_lib -- <<<'set +e; gate_e5_extra_task "" a b >/dev/null; echo $?')"
+
+# ── 4b. TIME is part of the contract: a real-size task must not stall the gate (gate ga-qprxlk) ──
+# The dispatcher runs gate_e5_prompt_fingerprint (every admitted run, both arms) and gate_e5_extra_task (twice per
+# spawn) UNDER THE GATE LOCK on the WHOLE reviewer task, which carries up to GATE_DIFF_BYTE_BUDGET (400KB) of diff.
+# Under bash 3.2 ${v#*pat} and ${v/pat/rep} are quadratic in the length of $v (80KB: 4-10s; the real 333KB task of
+# this bead: minutes), and every case above is a few-KB task — so the suite was green while a routine large-diff run
+# would have stalled every other run behind it. The answer is also checked against an oracle that shares no code
+# with the lib (python), so a fast-but-wrong rewrite does not pass either.
+echo "── 4b. A real-size task (>= 300KB, the marker AFTER the diff) is handled in well under 5s — and the answer is still right ──"
+E5_BIG_LIMIT=5
+cat > "$TMP/e5_oracle.py" <<'PY'
+import sys
+# e5_oracle.py <fp|xt> <task-file> <vb1> <vb2-or-author> [lens] — the old documented behaviour, byte for byte.
+mode, path, a, b = sys.argv[1:5]
+s = open(path, "rb").read().rstrip(b"\n")          # what "$(cat file)" hands the lib
+a, b = a.encode(), b.encode()
+if mode == "fp":                                    # a = verdict-bead id, b = AUTHOR
+    mk = b"--- YOUR TASK ---"
+    i = s.find(mk)
+    rem = s[i + len(mk):] if i >= 0 else s
+    if a: rem = rem.replace(a, b"<VB>")
+    if b: rem = rem.replace(b, b"<AUTHOR>")
+    sys.stdout.buffer.write(rem)
+else:                                               # a = reviewer 1's id, b = reviewer 2's id
+    lens = sys.argv[5].encode()
+    s1, s2 = b"You are reviewer 1 of 1 for branch:", b"You are reviewer 2 of 2 for branch:"
+    if s1 not in s or b"YOUR REVIEW LENS:" not in s or a not in s: sys.exit(3)
+    lines = s.replace(s1, s2, 1).split(b"\n")
+    for k, l in enumerate(lines):
+        if l.startswith(b"YOUR REVIEW LENS:"):
+            lines[k] = b"YOUR REVIEW LENS: " + lens
+            break
+    sys.stdout.buffer.write(b"\n".join(lines).replace(a, b))
+PY
+timed_lib() { # timed_lib <lib> <task-file> <out-file> <body>  -> "<rc|TIMEOUT> <secs>"; the child is KILLED at the bound
+  local script="set -uo pipefail; source '$1'; t=\"\$(cat \"\$TASK_FILE\")\"; $4"
+  python3 - "$E5_BIG_LIMIT" "$3" env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" GC_CITY="$TMP/city" TASK_FILE="$2" "$BASH32" -c "$script" <<'PY'
+import os, signal, subprocess, sys, time
+limit, outf, cmd = float(sys.argv[1]), sys.argv[2], sys.argv[3:]
+t0 = time.time()
+with open(outf, "wb") as o:
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=o, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        rc = str(p.wait(timeout=limit))
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL); p.wait(); rc = "TIMEOUT"
+print(rc, "%.2f" % (time.time() - t0))
+PY
+}
+E5_FP_BODY='AUTHOR=crew/x gate_e5_prompt_fingerprint "$t" ga-vb0001'
+E5_XT_BODY='gate_e5_extra_task "$t" ga-vb0001 ga-vb0002'
+E5_LENS="$(run_lib -- <<<'gate_e5_extra_lens')"
+fp_oracle() { python3 "$TMP/e5_oracle.py" fp "$1" ga-vb0001 crew/x | cksum | awk '{print $1}'; }
+within_bound() { awk -v s="$1" -v l="$E5_BIG_LIMIT" 'BEGIN { exit !(s < l) }'; }
+
+# the fingerprint had no direct case at all: small task, marker present / absent / twice, ids normalised
+for kind in real two-markers no-marker; do
+  case "$kind" in
+    real)        cp "$TMP/task.on" "$TMP/fp.task" ;;
+    two-markers) { cat "$TMP/task.on"; printf '\nga-vb0001 crew/x tail\n--- YOUR TASK ---\nsecond ga-vb0001\n'; } > "$TMP/fp.task" ;;
+    no-marker)   grep -v -- '--- YOUR TASK ---' "$TMP/task.on" > "$TMP/fp.task" ;;
+  esac
+  GOT="$(timed_lib "$LIB" "$TMP/fp.task" "$TMP/fp.out" "$E5_FP_BODY")"
+  check "fingerprint ($kind task) == the oracle's (rc, cksum)" "0 $(fp_oracle "$TMP/fp.task")" "${GOT%% *} $(tr -d '\n' < "$TMP/fp.out")"
+done
+sed 's/ga-vb0001/ga-vb7777/g' "$TMP/task.on" > "$TMP/fp.task7"
+FP1="$(timed_lib "$LIB" "$TMP/task.on" "$TMP/fp.o1" 'gate_e5_prompt_fingerprint "$t" ga-vb0001' >/dev/null; cat "$TMP/fp.o1")"
+FP7="$(timed_lib "$LIB" "$TMP/fp.task7" "$TMP/fp.o7" 'gate_e5_prompt_fingerprint "$t" ga-vb7777' >/dev/null; cat "$TMP/fp.o7")"
+[ -n "$FP1" ] && [ "$FP1" = "$FP7" ] && ok "two runs of the same prompt with different verdict-bead ids share one fingerprint ($FP1)" || bad "the per-run id leaks into the fingerprint ($FP1 vs $FP7)"
+
+# the real-size task: ~320KB of diff BETWEEN the template head and the "--- YOUR TASK ---" marker, like the live one
+awk 'BEGIN { while (n < 320000) { l = sprintf("+filler diff line %06d the quick brown fox jumps over the lazy dog 0123456789", ++i); if (i % 10 == 0) l = l " ga-vb0001"; print l; n += length(l) + 1 } }' > "$TMP/filler.txt"
+awk -v ff="$TMP/filler.txt" '{ print } $0 == "-line two" { while ((getline l < ff) > 0) print l }' "$TMP/task.on" > "$TMP/task.big"
+BIG_BYTES="$(wc -c < "$TMP/task.big" | tr -d ' ')"
+[ "$BIG_BYTES" -ge 300000 ] && ok "the big task is >= 300KB ($BIG_BYTES bytes)" || bad "the big task is only $BIG_BYTES bytes"
+FILLER_LAST="$(grep -n '^+filler diff line' "$TMP/task.big" | tail -1 | cut -d: -f1)"; MARKER_AT="$(grep -n -- '^--- YOUR TASK ---$' "$TMP/task.big" | head -1 | cut -d: -f1)"
+[ -n "$FILLER_LAST" ] && [ -n "$MARKER_AT" ] && [ "$MARKER_AT" -gt "$FILLER_LAST" ] && ok "in the big task the marker sits AFTER the diff (line $MARKER_AT > $FILLER_LAST) — the shape that made the shortest-prefix match walk the whole task" || bad "the big task does not have the marker after the diff"
+
+GOT="$(timed_lib "$LIB" "$TMP/task.big" "$TMP/big.fp" "$E5_FP_BODY")"; FP_RC="${GOT%% *}"; FP_SECS="${GOT#* }"
+if [ "$FP_RC" = "0" ] && within_bound "$FP_SECS"; then ok "fingerprint of the $BIG_BYTES-byte task: rc=0 in ${FP_SECS}s (bound ${E5_BIG_LIMIT}s)"; else bad "fingerprint of the $BIG_BYTES-byte task: rc=$FP_RC after ${FP_SECS}s (bound ${E5_BIG_LIMIT}s) — a quadratic pattern operation on the task is back"; fi
+check "fingerprint of the big task == the oracle's" "$(fp_oracle "$TMP/task.big")" "$(tr -d '\n' < "$TMP/big.fp")"
+
+GOT="$(timed_lib "$LIB" "$TMP/task.big" "$TMP/big.xt" "$E5_XT_BODY")"; XT_RC="${GOT%% *}"; XT_SECS="${GOT#* }"
+if [ "$XT_RC" = "0" ] && within_bound "$XT_SECS"; then ok "extra task from the $BIG_BYTES-byte task: rc=0 in ${XT_SECS}s (bound ${E5_BIG_LIMIT}s)"; else bad "extra task from the $BIG_BYTES-byte task: rc=$XT_RC after ${XT_SECS}s (bound ${E5_BIG_LIMIT}s) — a quadratic pattern operation on the task is back"; fi
+python3 "$TMP/e5_oracle.py" xt "$TMP/task.big" ga-vb0001 ga-vb0002 "$E5_LENS" > "$TMP/big.xt.want"; ORC=$?
+[ "$ORC" -eq 0 ] && [ -s "$TMP/big.xt.want" ] && cmp -s "$TMP/big.xt" "$TMP/big.xt.want" && ok "the big extra task equals the oracle's, byte for byte (slot, lens, every id, the whole diff)" || bad "the big extra task differs from the oracle's (oracle rc=$ORC; got $(wc -c < "$TMP/big.xt" | tr -d ' ') bytes, want $(wc -c < "$TMP/big.xt.want" | tr -d ' '))"
+check "no line of the big extra task still carries reviewer 1's id, and every one of the $(grep -c 'ga-vb0001' "$TMP/task.big") lines that had it now carries reviewer 2's" "0 $(grep -c 'ga-vb0001' "$TMP/task.big")" "$(grep -c 'ga-vb0001' "$TMP/big.xt") $(grep -c 'ga-vb0002' "$TMP/big.xt")"
 
 # ── 6. the union ────────────────────────────────────────────────────────────────
 echo "── 6. The union (gate-e5-union.py) ──"
@@ -1584,6 +1674,37 @@ EOF
     chmod 755 "$TMP/ro-city/.gc"
     [ "$R" = "ok" ] && ok "mutation 'no writable-directory check on the cap' is caught: an uncountable spend reads 'ok' ($R)" || bad "cap mutant survived (got '$R')"
   fi
+  # the two functions exactly as they were at 700c090 (bash pattern operations on the whole task) appended over the real ones:
+  # the 4b cases must catch EACH of them on the big task (a mutant here is KILLED at the bound, so this costs ~5s, not minutes)
+  cp "$LIB" "$TMP/lib.mutq1"; cp "$LIB" "$TMP/lib.mutq2"
+  cat >> "$TMP/lib.mutq1" <<'EOF'
+gate_e5_prompt_fingerprint() {
+  local _t="${1#*--- YOUR TASK ---}" _vb="${2:-}"
+  [ -n "$_vb" ] && _t="${_t//$_vb/<VB>}"
+  [ -n "${AUTHOR:-}" ] && _t="${_t//$AUTHOR/<AUTHOR>}"
+  printf '%s' "$_t" | cksum 2>/dev/null | awk '{print $1}'
+}
+EOF
+  cat >> "$TMP/lib.mutq2" <<'EOF'
+gate_e5_extra_task() {
+  local t1="${1:-}" vb1="${2:-}" vb2="${3:-}" lens t2
+  [ -n "$t1" ] && [ -n "$vb1" ] && [ -n "$vb2" ] || return 1
+  lens="$(gate_e5_extra_lens)"
+  t2="${t1/You are reviewer 1 of 1 for branch:/You are reviewer 2 of 2 for branch:}"
+  t2=$(printf '%s\n' "$t2" | awk -v lens="$lens" '
+      !done && /^YOUR REVIEW LENS:/ { print "YOUR REVIEW LENS: " lens; done = 1; next }
+      { print }') || return 1
+  t2="${t2//$vb1/$vb2}"
+  printf '%s' "$t2"
+}
+EOF
+  ( timed_lib "$TMP/lib.mutq1" "$TMP/task.big" "$TMP/mutq1.out" "$E5_FP_BODY" > "$TMP/mutq1.res" ) &
+  ( timed_lib "$TMP/lib.mutq2" "$TMP/task.big" "$TMP/mutq2.out" "$E5_XT_BODY" > "$TMP/mutq2.res" ) &
+  wait
+  for m in "mutq1:fingerprint:\${1#*--- YOUR TASK ---}" "mutq2:extra task:\${t1/pat/rep}"; do
+    id="${m%%:*}"; rest="${m#*:}"; what="${rest%%:*}"; form="${rest#*:}"; GOT="$(cat "$TMP/$id.res")"
+    if [ "${GOT%% *}" = "TIMEOUT" ] || ! within_bound "${GOT#* }"; then ok "mutation 'bash pattern operation on the whole task' ($form, $what) is caught: the $BIG_BYTES-byte task is not done in ${E5_BIG_LIMIT}s ($GOT)"; else bad "quadratic-form mutant ($what) survived: $GOT"; fi
+  done
 fi
 
 echo "== gate-e5-second-reviewer.selftest: PASS=$PASS FAIL=$FAIL =="
