@@ -15897,10 +15897,20 @@ fi
 # spawn and wait for reviewers; this lane has none, so it must not enter them — and it must NOT rely on a zero
 # count to skip them: BSD `seq 1 0` counts DOWN (prints "1 0"), so `for i in $(seq 1 $REQUIRED_REVIEWERS)` with 0
 # would silently spawn two reviewers. Hence an explicit branch, not a reviewer count of 0.
-# gate_finalize_run does the rest exactly as for a reviewed run: branch-content coherence, the rig's full-suite
+# gate_finalize_run does the rest as for a reviewed run: branch-content coherence, the rig's full-suite
 # regression check, merge-time rebase+retry, direct FF merge, bead/marker close, jsonl record. Its only
 # reviewer-array loops are in the quota/dead-reviewer re-queue branches, which this path never enters
 # (QUOTA_REQUEUE=0) — an empty array there would be an "unbound variable" under bash 3.2 `set -u`.
+# The citywide gate lock is the one thing that would NOT be as for a reviewed run if this block did nothing about it:
+# finalize's Step 9 calls cleanup_reviewer_sessions, which frees the lock unless GATE_SWEEP_HAS_MORE_WORK=1, and the
+# full-suite check and the merge both come AFTER Step 9. A reviewed run is finalized by Phase C, which sets that flag
+# around every finalize for exactly this reason; so does this block. Without it, the heavy check (<=600s, twice if red)
+# and the merge would overlap other sweeps — the very thing gate_full_suite_check's "holds the citywide gate lock until
+# END" says cannot happen — and a second sweep's Phase C would read THIS live run (status running, zero verdict beads)
+# as one that "likely died before Step 7". Step 9 also consumes _gate_cleanup_done, which turns the cleanup EXIT trap
+# into a no-op afterwards, so whoever keeps the lock must also release it: _fastlane_exit re-arms the cleanup (there
+# are no sessions to close) with the flag cleared, and it is what frees the lock when finalize fails under `set -e`
+# or a signal ends the sweep. gate-fastlane.selftest.sh §5c'' pins all of it.
 # Crash safety: if this process dies before finalize, the run bead is left gate-status:running with ZERO verdict
 # beads. Phase C refuses to finalize such a run (its zero-verdict `continue` runs BEFORE the
 # `VERDICTS_RECEIVED -eq REQUIRED_REVIEWERS` test, so 0-of-0 can never read as "all passed" — pinned by
@@ -15909,6 +15919,10 @@ fi
 # reconcile_zero_verdict_run_action: a running run with ZERO verdicts whose marker is still `dispatching` ->
 # supersede:requeue-marker), which closes the run and re-queues the marker — so the lane decision is redone from
 # scratch on the next sweep, and the diff is judged again, never merged on the strength of the dead run.
+# That reconcile asks how long the MARKER has been in `dispatching` (against GATE_ZERO_VERDICT_GRACE_MINUTES, 15), not
+# whether this process is alive. A LIVE fast run whose finalize (full-suite check + up to 3 merge attempts) outlasts
+# that grace on a loaded host can therefore be closed and its marker re-queued while it is still merging. The lock above
+# keeps another SWEEP off it; Vector B is the guard, not a sweep, so it is not stopped by the lock.
 # SELFTEST-EXTRACT fastlane-bypass: BEGIN
 if [ "$GATE_LANE" = "fast" ]; then
   VERDICT_BEAD_IDS=()
@@ -15917,7 +15931,9 @@ if [ "$GATE_LANE" = "fast" ]; then
   REVIEWER_PEEK_BASELINE=()
   REVIEWER_ACKED=()
   _gate_cleanup_done=0
-  trap cleanup_reviewer_sessions EXIT
+  GATE_SWEEP_HAS_MORE_WORK=1   # Step 9's cleanup leaves the lock held, as under Phase C (see above)
+  _fastlane_exit() { GATE_SWEEP_HAS_MORE_WORK=0; _gate_cleanup_done=0; cleanup_reviewer_sessions; }
+  trap _fastlane_exit EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
   trap 'exit 129' HUP
@@ -15928,6 +15944,9 @@ if [ "$GATE_LANE" = "fast" ]; then
   VERDICTS_RECEIVED=0
   ANY_FAIL=0
   log "Fast lane (ga-atsahv): branch=$BRANCH — ${GATE_LANE_REASON}. Finalizing with ZERO reviewers; the merge-side checks still run."
+  # Phase C refreshes the lock heartbeat at the top of each run it finalizes: a held lock with a stale heartbeat is
+  # reclaimed by a second sweep, and the part below (full-suite check, up to 3 merge attempts) is the slow part.
+  if [ "$GATE_LOCK_ENABLED" = "1" ]; then _gate_lock_write_hb; fi
   gate_finalize_run
   exit 0
 fi
