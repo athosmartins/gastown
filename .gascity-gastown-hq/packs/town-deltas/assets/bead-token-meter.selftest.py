@@ -15,7 +15,10 @@ Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 tra
   * ledger: idempotente, crescente, sobrevive à remoção do transcrito, "o registro com mais mensagens vence", lock de instância única
   * backfill-s3: erro do aws != lista vazia; falha de download é contada e devolvida (nunca silenciosa); guarda de disco; fora de escopo
   * terceiro estado: sem ledger / sem log do gate = "SEM DADO" (exit 2), nunca zeros
-  * controles de mutação: 9 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
+  * varredura do terceiro estado (gate-done): spawn ocioso em modelo sem preço mostra os tokens sem preço em vez de US$ 0; revisor sem ramo
+    conta SESSÕES; veredito do gate sem bead é linha ilegível contada (não derruba o relatório); claim sem timestamp é contado; linha
+    ilegível do ledger é guardada antes da reescrita
+  * controles de mutação: 14 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
 """
 import contextlib
 import fcntl
@@ -525,6 +528,63 @@ def t_backfill(m, W):
     ck(code == 0 and "a trazer" in out, "dry-run só lista")
 
 
+def harvest(m, w):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+    return out.getvalue()
+
+
+def t_sweep_unknowns(m, W):
+    """Varredura do 'terceiro estado' no diff inteiro (gate-done): cada leitura que pode faltar tem que aparecer como DESCONHECIDA,
+    nunca como o mesmo valor de 'achei e vale zero'."""
+    w, _ = setup(m, W)
+    P = w["projects"]
+    # (a) spawn ocioso em modelo SEM preço: os tokens aparecem, o US$ não é "0" calado
+    write_session(P, "-proj", "ps2", [beacon("ps-worker", D + "08:10:00.000Z")] + asst("p2u", D + "08:10:05.000Z", model="claude-sonnet-5", cmd="bd ready --assignee x"))
+    # (b) revisor SEM ramo conhecido do gate, com DOIS modelos (dois buckets): é UMA sessão
+    recs = [beacon("gate-reviewer-adhoc-two", D + "11:10:00.000Z")]
+    recs += [tool_result("tu_u", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: feat/ga-unk9\nBranch SHA: def", D + "11:10:01.000Z")]
+    recs += asst("ra", D + "11:10:05.000Z") + asst("rb", D + "11:10:10.000Z", model="claude-opus-5-5")
+    write_session(P, "-proj", "rev2", recs)
+    # (c) veredito do gate SEM bead: não derruba o relatório, é contado como linha ilegível
+    with open(w["gate"], "a") as fh:
+        fh.write(json.dumps({"ts": D + "11:05:00Z", "event": "dispatcher_complete", "branch": "feat/ga-nb", "result": "PASS", "dry_run": "0"}) + "\n")
+    # (d) claim COM resultado ok mas SEM timestamp: não dá para posicioná-lo; é contado, não some
+    ut = asst("ut1", D + "10:00:10Z", cmd="bd update ga-uuu1 --claim", tid="tu_ut")
+    for r in ut:
+        del r["timestamp"]
+    write_session(P, "-proj", "untimed1", [beacon("gastown.dog-6", D + "10:00:00Z")] + ut + [tool_result("tu_ut", "✓ Updated issue: ga-uuu1", D + "10:00:11Z")] + asst("ut2", D + "10:01:00Z"))
+    out = harvest(m, w)
+    rec = ledger_rows(m, w)["untimed1"]
+    ck(rec["claims_untimed"] == 1, f"claim sem timestamp é CONTADO (1), achei {rec['claims_untimed']}")
+    ck(all(c["via"] == "ref" and c["ok"] is None for c in rec["claims"]), f"e não vira claim firme: no máximo a atribuição por referência (menos firme), achei {rec['claims']}")
+    ck("1 claims sem timestamp" in out, f"a colheita avisa do claim sem timestamp: {out}")
+    code, r = report(m, w)
+    ck(code == 0, f"veredito sem bead não derruba o relatório (exit {code})")
+    idle = r["idle"]["ps-worker"]
+    ck(idle["sessions"] == 2 and idle["unpriced_tokens"] == 100, f"ocioso: 2 sessões, 100 tokens SEM preço visíveis; achei {idle}")
+    ck(approx(idle["usd"], USD_SMALL, 5e-5), f"o US$ ocioso é só o dos tokens COM preço (~{USD_SMALL:.6f}; o JSON arredonda a 4 casas), achei {idle['usd']}")
+    ck(r["coverage"]["unmapped_reviewer_sessions"] == 1, f"revisor sem ramo conhecido = 1 SESSÃO (2 buckets), achei {r['coverage']['unmapped_reviewer_sessions']}")
+    ck(r["coverage"]["gate_unreadable_lines"] == 2, f"o log do gate tem 1 linha ilegível + 1 veredito sem bead = 2, achei {r['coverage']['gate_unreadable_lines']}")
+    g2 = W / "g2.jsonl"
+    g2.write_text(json.dumps({"ts": D + "11:00:00Z", "event": "dispatcher_complete", "branch": "feat/ga-nb", "result": "PASS", "dry_run": "0"})
+                  + "\n{ilegível\n" + json.dumps(GATE_EVENTS[1]) + "\n")
+    runs, _bridge, bad = m.load_gate(g2)
+    ck(len(runs) == 1 and runs[0]["bead"] == "ga-aaa1" and bad == 2, f"load_gate: só o veredito com bead entra; 2 linhas contadas como ilegíveis; achei {len(runs)} runs, bad={bad}")
+    # (e) linha ilegível no ledger: a reescrita a descartaria — o arquivo como estava é guardado antes
+    led = w["ledger"]
+    ck(not list(led.parent.glob("sessions.jsonl.unreadable-*")), "ledger sem linha ilegível não gera cópia")
+    with open(led, "a") as fh:
+        fh.write("{isto não é json\n")
+    out = harvest(m, w)
+    copies = list(led.parent.glob("sessions.jsonl.unreadable-*"))
+    ck(len(copies) == 1 and "{isto não é json" in copies[0].read_text(), f"a cópia pré-reescrita guarda a linha ilegível: {copies}")
+    ck("{isto não é json" not in led.read_text() and "1 linhas ilegíveis no ledger" in out, "o ledger novo sai limpo e a colheita avisa")
+    harvest(m, w)
+    ck(len(list(led.parent.glob("sessions.jsonl.unreadable-*"))) == 1, "ledger já limpo: a colheita seguinte não cria outra cópia")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
@@ -535,6 +595,11 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "excesso acima do teto vira o cache-read inteiro": ('+= max(0, m["use"]["cr"] - cap)', '+= m["use"]["cr"]', t_context_caps),
     "prefiltro depende do espaçamento": ('is_asst = \'"assistant"\' in line', 'is_asst = \'"type":"assistant"\' in line', t_json_spacing_and_canary),
     "id do preâmbulo vira bead": ("if not live and role in POOL_BUILDERS and refs:", "if not live and role in POOL_BUILDERS + ('crew',) and refs:", t_noise_idle_ref_crew),
+    "ocioso sem preço some do relatório": ('idle[s["role"]][2] += total_tokens(c)', 'idle[s["role"]][2] += 0', t_sweep_unknowns),
+    "revisor sem ramo conta por bucket": ('unmapped_review.add(s["sid"])', 'unmapped_review.add((s["sid"], key))', t_sweep_unknowns),
+    "veredito sem bead entra nas contas": ('if not r.get("bead"):', "if False:", t_sweep_unknowns),
+    "claim sem timestamp some calado": ('untimed = sum(1 for c in claims if c["ok"] is not False and not c["ts"])', "untimed = 0", t_sweep_unknowns),
+    "linha ilegível do ledger é descartada sem cópia": ("shutil.copy2(path, keep)", "pass", t_sweep_unknowns),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -543,7 +608,8 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("JSON espaçado lido igual + alarme de formato", t_json_spacing_and_canary), ("desconhecido ≠ zero: resposta sem usage e linha ilegível aparecem", t_unknown_is_not_zero), ("subagente entra na sessão-mãe sem duplicar", t_subagent), ("revisor: ramo certo entre citações", t_reviewer),
          ("janela por dia da mensagem", t_window_by_message_day), ("gate: 1ª rodada, coorte, US$/bead aprovada, dry_run fora", t_gate_cohort), ("aprovada em qualquer rodada + poder do A/B", t_approved_and_power), ("teto de contexto: excesso exato + registro antigo reescaneado", t_context_caps),
          ("ledger: idempotente, cresce, sobrevive ao reaper, mais completo vence", t_ledger), ("lock de instância única", t_lock),
-         ("terceiro estado: SEM DADO", t_no_data), ("backfill-s3: erro≠vazio, falha contada, disco, escopo", t_backfill)]
+         ("terceiro estado: SEM DADO", t_no_data), ("backfill-s3: erro≠vazio, falha contada, disco, escopo", t_backfill),
+         ("varredura do 3º estado: ocioso sem preço, revisor por sessão, veredito sem bead, claim sem timestamp, ledger ilegível", t_sweep_unknowns)]
 
 
 def run(name, fn, m):
