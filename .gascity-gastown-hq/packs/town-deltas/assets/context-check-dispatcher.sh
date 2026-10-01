@@ -1128,6 +1128,19 @@ TASK
 
 log "Context-check sweep start (actor=$CONTEXT_CHECK_ACTOR, max/sweep=$CONTEXT_CHECK_MAX_PER_SWEEP, max-sonnet/sweep=$CONTEXT_CHECK_MAX_SONNET_PER_SWEEP, dry_run=$DRY_RUN)"
 
+# ── ga-a2v0bz: drain window — no NEW classification admitted from 23:00 until the nightly reboot ─
+# The whole sweep is new-work admission (the inconclusive-heuristic path can spawn a real Sonnet
+# classification session), so the gate sits at the top, same as the quiet-hours gate below.
+# Dispatch nothing, mutate no label. FAIL-OPEN via
+# _drain_window_blocks/_drain_window_unreadable — see quiet-hours-check.sh.
+if [ "$(_drain_window_blocks)" = "1" ]; then
+  warn "Drain window (nightly-reboot.sh, ~/.gastown/run/city-drain.level: $(_drain_window_detail)) — PAUSING classification this sweep so the nightly reboot finds the city idle. Unclassified beads stay as-is; resumes on its own once the reboot clears the signal (ga-a2v0bz)."
+  log "Context-check sweep deferred (drain window, ga-a2v0bz). No mutation."
+  exit 0
+elif [ "$(_drain_window_unreadable)" = "1" ]; then
+  log "Drain-window signal UNREADABLE (corrupt or unprovable ${DRAIN_WINDOW_FILE:-unset}) — fail-open, classification proceeding normally this sweep (ga-a2v0bz)."
+fi
+
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new classification 00h-08h ───
 # This daemon has no in-flight/long-held claims to protect (each bead is
 # classified fresh, one pass, no multi-minute review state) — the whole sweep

@@ -616,6 +616,18 @@ echo "$STUCK_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
   fi
 done
 
+# ── ga-a2v0bz: drain window — no NEW review admitted from 23:00 until the nightly reboot ─
+# Same placement as the quiet-hours gate below: after Step 0's TTL recovery, before a NEW story
+# is claimed. Dispatch nothing, mutate no marker. FAIL-OPEN via
+# _drain_window_blocks/_drain_window_unreadable — see quiet-hours-check.sh.
+if [ "$(_drain_window_blocks)" = "1" ]; then
+  warn "Drain window (nightly-reboot.sh, ~/.gastown/run/city-drain.level: $(_drain_window_detail)) — PAUSING refino-gate admission this sweep so the nightly reboot finds the city idle. Queue stays as-is; resumes on its own once the reboot clears the signal (ga-a2v0bz)."
+  log "Refino gate sweep deferred (drain window, ga-a2v0bz). No mutation."
+  exit 0
+elif [ "$(_drain_window_unreadable)" = "1" ]; then
+  log "Drain-window signal UNREADABLE (corrupt or unprovable ${DRAIN_WINDOW_FILE:-unset}) — fail-open, refino-gate proceeding normally this sweep (ga-a2v0bz)."
+fi
+
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new review admission 00h-08h ─
 # Probed AFTER Step 0's TTL recovery above (repairs EXISTING stuck claims —
 # safe/expected every sweep, quiet hours or not) and BEFORE Step 1 finds/claims

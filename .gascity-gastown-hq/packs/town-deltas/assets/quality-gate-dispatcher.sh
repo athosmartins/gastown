@@ -11904,6 +11904,20 @@ else
 fi
 gate_exile_watchdog_sweep "$WATCHDOG_MARKERS_JSON" "$GATE_EXILE_ESCALATE_AFTER_SECONDS" "$(date -u +%s)"
 
+# ── ga-a2v0bz: drain window — no NEW gate run admitted from 23:00 until the nightly reboot ─
+# Placed right before the quiet-hours gate, for the same reason it documents: AFTER Phase C
+# and the Step 0a janitors (they finalize/repair EXISTING state) and BEFORE the atomic claim,
+# so a deferred sweep never strands a marker in gate-status:dispatching. In-flight reviews
+# finish; queued markers stay queued and resume after the reboot. FAIL-OPEN via
+# _drain_window_blocks/_drain_window_unreadable — see quiet-hours-check.sh. Log-only (no
+# notify), like every other admission pause in this script.
+if [ "$(_drain_window_blocks)" = "1" ]; then
+  log "Drain window (nightly-reboot.sh, ~/.gastown/run/city-drain.level: $(_drain_window_detail)) — PAUSING new-run admission this sweep so the nightly reboot finds the gate idle, leaving $COUNT marker(s) queued; in-flight reviews finish and queued markers resume after the reboot (ga-a2v0bz)."
+  exit 0
+elif [ "$(_drain_window_unreadable)" = "1" ]; then
+  log "Drain-window signal UNREADABLE (corrupt or unprovable ${DRAIN_WINDOW_FILE:-unset}) — fail-open, admission proceeding normally this sweep (ga-a2v0bz)."
+fi
+
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new-run admission 00h-08h ────
 # There IS queued work (COUNT>0 above), but Athos's quiet-hours decision
 # (2026-08-16) says the city pauses admission of NEW work overnight. Runs

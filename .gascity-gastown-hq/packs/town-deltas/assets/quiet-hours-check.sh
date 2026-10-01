@@ -201,3 +201,128 @@ _quiet_elapsed_adjustment() {
   fi
   printf '%s' "$raw"
 }
+
+# ── drain window (ga-a2v0bz) ────────────────────────────────────────────────
+# O reboot noturno nao acontecia ha 13 noites: a cidade nunca para de trabalhar
+# de madrugada, entao sempre havia um construtor/revisor vivo quando o guard
+# olhava. Desenho (Athos opcao (a), 01/10): das 23:00 ate o reboot (23:40) a
+# cidade DRENA — os despachantes deixam de ADMITIR trabalho novo, e o que ja
+# esta em voo termina (ou e morto e retomado no reboot).
+#
+# O sinal e GRAVADO por scripts/nightly-reboot.sh (LaunchDaemon root) e LIDO
+# aqui, pelos mesmos 5 despachantes que ja fazem `source` deste arquivo. Nao e o
+# sinal de quiet-hours (city-quiet-hours.level) de proposito: aquele pertence ao
+# city-night-window.sh (hoje DESLIGADO), diz "00h-08h, retoma as 08h", e quem o
+# reativasse sobrescreveria o dreno. Dois escritores, dois arquivos.
+#
+# Arquivo, 4 linhas:  DRAIN | <epoch gravado> | <boot-epoch> | <epoch limite>
+#
+# FAIL-OPEN, mesmo motivo do quiet-hours: um dreno que trava a cidade por engano
+# e pior que um reboot que pula uma noite. So drena quando TUDO abaixo vale:
+#   - o arquivo existe, tem 4 campos legiveis e a linha 1 e DRAIN;
+#   - foi gravado ha <= DRAIN_WINDOW_MAX_AGE_SECS (escritor vivo; o nightly
+#     regrava a cada <= 5min — um escritor morto solta a cidade em 30min);
+#   - agora < epoch limite (teto duro, o escritor nunca o estende);
+#   - o boot-epoch gravado == o boot-epoch atual. ESTE e o ponto central: o
+#     reboot invalida o dreno sozinho. Nao ha passo "limpar a flag no pos-boot"
+#     que possa falhar e deixar a cidade drenada de manha.
+# Terceiro estado: um arquivo ILEGIVEL (ou valido mas sem como provar o boot)
+# nao drena E _drain_window_unreadable devolve "1" — o log do despachante diz
+# "nao consegui ler", nunca o mesmo silencio de "nao ha dreno".
+#
+# Quem precisar soltar a cidade a mao: `rm ~/.gastown/run/city-drain.level`
+# (o arquivo e gravado por root, mas o diretorio e do athos — remover funciona).
+DRAIN_WINDOW_FILE="${DRAIN_WINDOW_FILE:-${HOME}/.gastown/run/city-drain.level}"
+DRAIN_WINDOW_MAX_AGE_SECS="${DRAIN_WINDOW_MAX_AGE_SECS:-1800}"
+DRAIN_WINDOW_CLOCK_SKEW_SECS="${DRAIN_WINDOW_CLOCK_SKEW_SECS:-300}"
+
+# _drain_window_boot_epoch -> epoch do boot atual, ou NADA se nao der pra ler.
+# Token EXATO de `sec`, nunca regex guloso: `sysctl -n kern.boottime` imprime
+#   { sec = 1789579812, usec = 958892 } Wed Sep 16 14:30:12 2026
+# e `.*sec = ([0-9]+)` casa com o "sec" de **u**sec e devolve os microssegundos.
+# Mesmo bug do ram-pressure-monitor (ga-rc7tz) e do Guard 4 do nightly
+# (ga-ljncyt) — terceira vez, por isso a comparacao e por token.
+_drain_window_boot_epoch() {
+  local v
+  if [ -n "${DRAIN_WINDOW_BOOT_EPOCH_OVERRIDE:-}" ]; then
+    v="$DRAIN_WINDOW_BOOT_EPOCH_OVERRIDE"
+  else
+    v=$(sysctl -n kern.boottime 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }')
+  fi
+  case "$v" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$v"
+}
+
+# _drain_window_read: preenche _DW_* e _DW_PARSE (absent|ok|bad). Chamado dentro
+# de cada funcao publica — elas rodam em $(...), entao nada vaza entre chamadas.
+_drain_window_read() {
+  local f v
+  _DW_STATE=""; _DW_WRITTEN=""; _DW_BOOT=""; _DW_UNTIL=""
+  f="$DRAIN_WINDOW_FILE"
+  [ -f "$f" ] || { _DW_PARSE="absent"; return 0; }
+  _DW_STATE=$(sed -n '1p' "$f" 2>/dev/null | tr -d '[:space:]')
+  _DW_WRITTEN=$(sed -n '2p' "$f" 2>/dev/null | tr -d '[:space:]')
+  _DW_BOOT=$(sed -n '3p' "$f" 2>/dev/null | tr -d '[:space:]')
+  _DW_UNTIL=$(sed -n '4p' "$f" 2>/dev/null | tr -d '[:space:]')
+  _DW_PARSE="ok"
+  case "$_DW_STATE" in DRAIN|OPEN) ;; *) _DW_PARSE="bad"; return 0 ;; esac
+  for v in "$_DW_WRITTEN" "$_DW_BOOT" "$_DW_UNTIL"; do
+    case "$v" in ''|*[!0-9]*) _DW_PARSE="bad"; return 0 ;; esac
+  done
+}
+
+# _drain_window_blocks -> "1" sse a cidade deve DRENAR agora, senao "0".
+# Costura de teste: DRAIN_WINDOW_OVERRIDE=DRAIN forca "1", qualquer outro valor "0".
+_drain_window_blocks() {
+  if [ -n "${DRAIN_WINDOW_OVERRIDE:-}" ]; then
+    case "$DRAIN_WINDOW_OVERRIDE" in DRAIN) printf '1' ;; *) printf '0' ;; esac
+    return 0
+  fi
+  _drain_window_read
+  [ "$_DW_PARSE" = "ok" ] && [ "$_DW_STATE" = "DRAIN" ] || { printf '0'; return 0; }
+  local now cur
+  now=$(date +%s)
+  [ $(( now - 10#$_DW_WRITTEN )) -gt "$DRAIN_WINDOW_MAX_AGE_SECS" ] && { printf '0'; return 0; }
+  [ $(( 10#$_DW_WRITTEN - now )) -gt "$DRAIN_WINDOW_CLOCK_SKEW_SECS" ] && { printf '0'; return 0; }
+  [ "$now" -lt $(( 10#$_DW_UNTIL )) ] || { printf '0'; return 0; }
+  cur=$(_drain_window_boot_epoch)
+  [ -n "$cur" ] || { printf '0'; return 0; }
+  [ "$cur" = "$(( 10#$_DW_BOOT ))" ] || { printf '0'; return 0; }
+  printf '1'
+}
+
+# _drain_window_state -> estado cru ("DRAIN"/"OPEN"/"") so p/ LOG; nao decide nada.
+_drain_window_state() {
+  [ -n "${DRAIN_WINDOW_OVERRIDE:-}" ] && { printf '%s' "$DRAIN_WINDOW_OVERRIDE"; return 0; }
+  [ -f "$DRAIN_WINDOW_FILE" ] || { printf ''; return 0; }
+  sed -n '1p' "$DRAIN_WINDOW_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+# _drain_window_unreadable -> "1" sse o sinal EXISTE mas nao da pra confiar nele
+# (lixo, campos faltando, ou um DRAIN valido sem como provar de que boot e).
+# "0" para ausente (estado normal fora da janela), legivel-e-expirado
+# (velho / outro boot — esperado: o arquivo sobrevive ao reboot) e legivel-ativo.
+# So LOG: a decisao de drenar e _drain_window_blocks, que ja falha aberto.
+_drain_window_unreadable() {
+  [ -n "${DRAIN_WINDOW_OVERRIDE:-}" ] && { printf '0'; return 0; }
+  _drain_window_read
+  case "$_DW_PARSE" in
+    absent) printf '0' ;;
+    bad) printf '1' ;;
+    *)
+      if [ "$_DW_STATE" = "DRAIN" ] && [ -z "$(_drain_window_boot_epoch)" ]; then printf '1'; else printf '0'; fi
+      ;;
+  esac
+}
+
+# _drain_window_detail -> frase curta p/ o LOG do despachante ("ate 23:59, gravado ha 3min").
+# Nunca decide nada.
+_drain_window_detail() {
+  _drain_window_read
+  if [ "$_DW_PARSE" != "ok" ]; then printf 'sinal %s' "$_DW_PARSE"; return 0; fi
+  local now until_hm
+  now=$(date +%s)
+  until_hm=$(date -r "$(( 10#$_DW_UNTIL ))" +%H:%M 2>/dev/null)
+  printf 'ate %s, gravado ha %smin' "${until_hm:-?}" "$(( (now - 10#$_DW_WRITTEN) / 60 ))"
+}

@@ -5047,6 +5047,24 @@ elif [ "$(_pilot_ram_pressure_unreadable)" = "1" ]; then
   log "RAM-pressure signal UNREADABLE (stale/corrupt ${PILOT_RAM_LEVEL_FILE}) — fail-open, dispatch proceeding normally this sweep (ga-m2gqb)."
 fi
 
+# ── ga-a2v0bz: drain window — no NEW dispatch admitted from 23:00 until the nightly reboot ─
+# The nightly reboot skipped 13 nights running because the city never stops working at
+# night; scripts/nightly-reboot.sh now opens a DRAIN window (23:00 until the reboot) by
+# writing ~/.gastown/run/city-drain.level, and every dispatcher stops admitting new work.
+# Same full-PAUSE shape as the quiet-hours gate below (dispatch nothing, mutate no marker;
+# candidates are re-picked by a later sweep), but its own text and NO per-sweep push: the
+# quiet-hours push says "retoma as 08h", which would be false here. In-flight builds are
+# untouched. FAIL-OPEN via _drain_window_blocks/_drain_window_unreadable — see
+# quiet-hours-check.sh (a stale signal, or one from before the last boot, never pauses).
+if [ "$(_drain_window_blocks)" = "1" ]; then
+  warn "Drain window (nightly-reboot.sh, ~/.gastown/run/city-drain.level: $(_drain_window_detail)) — PAUSING all dispatch this sweep so the nightly reboot finds the city idle. In-flight builds are untouched; dispatch resumes on its own once the reboot clears the signal (ga-a2v0bz)."
+  _pilot_write_sweep_pause_state 1 "drain-window" "Drain window before the nightly reboot"
+  log "=== Pilot sweep complete: dispatched=0 (paused: drain window) ==="
+  exit 0
+elif [ "$(_drain_window_unreadable)" = "1" ]; then
+  log "Drain-window signal UNREADABLE (corrupt or unprovable ${DRAIN_WINDOW_FILE:-unset}) — fail-open, dispatch proceeding normally this sweep (ga-a2v0bz)."
+fi
+
 # ── ga-dxyvxr: quiet-hours back-off — PAUSE dispatch 00h-08h (Athos, 2026-08-16)
 # Same full-PAUSE shape as the two gates immediately above: dispatch nothing,
 # mutate no marker, let candidates be re-picked automatically once a later

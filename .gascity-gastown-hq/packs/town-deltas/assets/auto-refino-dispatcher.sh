@@ -1067,6 +1067,18 @@ echo "$RECONCILE_JSON" | jq -c '.[]?' 2>/dev/null | while IFS= read -r row; do
 done
 done  # end maintenance per-store loop (Step 0 + 0c)
 
+# ── ga-a2v0bz: drain window — no NEW refine admitted from 23:00 until the nightly reboot ─
+# Same placement as the quiet-hours gate below: after the self-healing maintenance passes,
+# before any candidate query / claim / spawn. Dispatch nothing, mutate no marker. FAIL-OPEN via
+# _drain_window_blocks/_drain_window_unreadable — see quiet-hours-check.sh.
+if [ "$(_drain_window_blocks)" = "1" ]; then
+  warn "Drain window (nightly-reboot.sh, ~/.gastown/run/city-drain.level: $(_drain_window_detail)) — PAUSING refino admission this sweep so the nightly reboot finds the city idle. Triagem stays queued; resumes on its own once the reboot clears the signal (ga-a2v0bz)."
+  log "Auto-refino sweep deferred (drain window, ga-a2v0bz). No mutation."
+  exit 0
+elif [ "$(_drain_window_unreadable)" = "1" ]; then
+  log "Drain-window signal UNREADABLE (corrupt or unprovable ${DRAIN_WINDOW_FILE:-unset}) — fail-open, refino proceeding normally this sweep (ga-a2v0bz)."
+fi
+
 # ── ga-dxyvxr: quiet-hours admission gate — PAUSE new refine admission 00h-08h ─
 # Probed AFTER the cheap self-healing maintenance passes above (which repair
 # EXISTING stuck claims and are safe/expected to run every sweep, quiet hours
