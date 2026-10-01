@@ -56,19 +56,34 @@ _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
 unset _QHC_SCRIPT
 
 # ga-syxaki (E5): 2nd independent reviewer, as an A/B experiment — OFF by default. The lib is
-# sourced fail-soft (same [ -r ] convention as the libs above: a bare `source` of a missing
-# file kills this set -e daemon). Every call site below is guarded by GATE_E5_LIB_OK=1 AND
-# the flag (touch $GC_CITY/.gc/gate-e5-second-reviewer.on), so with the flag off — or the lib
-# absent — none of it runs and the reviewer prompt is byte-identical to before. The
-# GATE_E5_COV_* prompt pieces default to "" here; gate-review-task.lib.sh reads them as ${VAR:-}
-# (see its header), so they are empty — and the prompt byte-identical — unless gate_e5_task_vars ran.
+# sourced behind the same [ -r ] convention as the libs above (a bare `source` of a missing
+# file kills this set -e daemon). MEASURED under /bin/bash 3.2.57 (launchd's) with set -euo pipefail,
+# the `{ source ... && ...; } || true` idiom survives exactly two things: a lib that is MISSING or
+# UNREADABLE, and one that does an explicit top-level `return N`; both leave GATE_E5_LIB_OK=0 and the
+# gate runs as before. It does NOT survive a PARSE error, and it does NOT survive a failing command at
+# the lib's top level — the last one or any other (the `||` list does not shield the body of a sourced
+# file in 3.2): either exits this whole daemon at the `source`, silently, flag on or off. Do not read
+# "fail-soft" into it. The protection is not here but in the suite (gate-e5-second-reviewer.selftest.sh
+# section 0 runs `bash -n` on the lib, and the lib is sourced under these same strict flags there), so
+# edit the lib with that suite green. Every call site below is guarded by GATE_E5_LIB_OK=1 AND the flag
+# (touch $GC_CITY/.gc/gate-e5-second-reviewer.on), so with the flag off — or the lib absent — none of it
+# runs and the reviewer prompt is byte-identical to before. When the flag EXISTS but the lib did not
+# load, Step 5 says so (a warning in this log and an e5_lib_not_loaded event): a flag that is on while
+# the E5 is not running must not look like a flag that is off. The GATE_E5_COV_* prompt pieces default
+# to "" here; gate-review-task.lib.sh reads them as ${VAR:-} (see its header), so they are empty — and
+# the prompt byte-identical — unless gate_e5_task_vars ran.
 GATE_E5_LIB_OK=0
+GATE_E5_LIB_WHY=""
 GATE_E5_COV_RULES=""; GATE_E5_COV_PASS_LINE=""
 GATE_E5_EXTRA_SEEN=0; GATE_E5_EXTRA_VERDICT="-"; GATE_E5_ACTIVE=0
 GATE_E5_RUN_VB_JSON=""
 GATE_E5_RUN_ARM=""; GATE_E5_RUN_DESC_LINE=""
 _E5_LIB="${GC_CITY}/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
-if [ -r "$_E5_LIB" ]; then { source "$_E5_LIB" 2>/dev/null && GATE_E5_LIB_OK=1; } || true; fi
+GATE_E5_LIB_WHY="the lib file is missing or unreadable: $_E5_LIB"
+if [ -r "$_E5_LIB" ]; then
+  GATE_E5_LIB_WHY="sourcing $_E5_LIB returned non-zero (e.g. a top-level return)"
+  { source "$_E5_LIB" 2>/dev/null && GATE_E5_LIB_OK=1 && GATE_E5_LIB_WHY=""; } || true
+fi
 unset _E5_LIB
 
 # ga-0bjqix: canonical Dolt-server PID resolution (dolt.pid + basename+LISTEN
@@ -15412,14 +15427,22 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # the flag for this run's admission. GATE_E5_ACTIVE (the admit log, the prompt pieces, the big-diff extra) is derived from it
 # here, and Step 6 writes the arm into the run record for Phase C to read back; neither Step 7 nor Phase C reads the flag again
 # to decide what this run IS (gate attempt 1, blocking issue 3: a second read plus an arm that defaulted to "A" let a flip
-# between the two log an unmeasured run as a measured arm-A run). An arm nobody measured is "?", never "A". Flag off ->
-# this block is one string test and nothing else.
+# between the two log an unmeasured run as a measured arm-A run). An arm nobody measured is "?", never "A". Flag off with the
+# lib loaded -> this block is two string tests and nothing else; with the lib NOT loaded it adds one file test (the flag) and,
+# only if the flag is readable, the warning below — it still decides nothing from the flag.
 # SELFTEST-EXTRACT e5-admit-step5: BEGIN
 GATE_E5_ARM="?"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="unknown"; GATE_E5_RAW_LINES=""; GATE_E5_ACTIVE=0   # "not measured" is "unknown", never "no" (= measured small)
 if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
   GATE_E5_ACTIVE=1
   gate_e5_admit_decision || true
   log "E5: bead=$BEAD_ID arm=$GATE_E5_ARM trigger=$GATE_E5_TRIGGER size=$GATE_E5_SIZE_STATE (${GATE_E5_RAW_LINES:-?} lines)"
+elif [ "${GATE_E5_LIB_OK:-0}" != "1" ] && [ -r "${GATE_E5_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e5-second-reviewer.on}" ]; then
+  # The flag is ON and the lib that acts on it is not loaded: the E5 is NOT running, and nothing else in the log would say so
+  # (no e5_admit is not an error line). Say it here, once per run, and leave an event the apuração reads (the lib is not loaded,
+  # so this cannot go through gate_e5_log_event). Nothing is decided from the flag here — the run proceeds exactly as with the flag off.
+  warn "E5: the flag file exists but the E5 lib is NOT loaded (${GATE_E5_LIB_WHY:-reason unknown}) — NO second reviewer and NO e5_admit for bead ${BEAD_ID:-?}; the experiment is not running although the flag is on."
+  jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg bead "${BEAD_ID:-}" --arg why "${GATE_E5_LIB_WHY:-}" \
+    '{ts:$ts,event:"e5_lib_not_loaded",bead:$bead,why:$why}' >> "${QG_LOG:-/dev/null}" 2>/dev/null || true
 fi
 # SELFTEST-EXTRACT e5-admit-step5: END
 

@@ -285,6 +285,43 @@ printf 'VERDICT: FAIL — reviewed at SHA 9f3c2ab over the FULL diff\nBlocking i
 printf 'VERDICT: FAIL\nBlocking issue 1: other_file_name.py:7 echo foxtrot golf hotel\n' > "$TMP/up2.txt"
 check "text after 'VERDICT: FAIL' on the verdict line is kept in the merged notes" 1 \
   "$(mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .text | grep -c 'reviewed at SHA 9f3c2ab over the FULL diff')"
+# gate attempt 4 (ga-syxaki), blocking issue 1 — a MERGE must not lose what the OTHER wording carries. The reviewer's repro: reviewer 2
+# says the same defect in shorter words and ALSO cites the sibling site; the dedupe kept the longer text, REPLACED the citations, and the
+# sibling site (dispatcher.sh:15499) vanished while the output said "independently confirmed". The reverse also lost reviewer 1's
+# unique clause whenever reviewer 2's wording happened to be longer. Every fixture here is a pair that STILL merges: the fix must not
+# turn the dedupe off, only stop it from throwing content away.
+U4_R1='Blocking issue 1: scripts/lib.sh:100-110 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails, so the caller waits until the extra window ends and the run is held.'
+U4_R2='Blocking issue 1: scripts/lib.sh:102 — gate_e5_spawn_extra takes an empty verdict bead id for success after bd create fails. Same at scripts/lib.sh:102 and scripts/dispatcher.sh:15499.'
+u4_text() { # u4_text <issue of reviewer 1> <issue of reviewer 2> -> merged text
+  printf 'VERDICT: FAIL\n%s\n' "$1" > "$TMP/up1.txt"; printf 'VERDICT: FAIL\n%s\n' "$2" > "$TMP/up2.txt"
+  mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .text
+}
+u4_appended() { printf 'VERDICT: FAIL\n%s\n' "$1" > "$TMP/up1.txt"; printf 'VERDICT: FAIL\n%s\n' "$2" > "$TMP/up2.txt"; mk_payload "1=$TMP/up1.txt" "2=$TMP/up2.txt" | union | jq -r .stats.sentences_appended; }
+check "the reviewer's repro pair is still ONE merged issue (the fix keeps the dedupe on)" "1,1" "$(u_pair "$U4_R1" "$U4_R2")"
+check "the SHORTER wording's extra citation (scripts/dispatcher.sh:15499) reaches the builder" 1 "$(u4_text "$U4_R1" "$U4_R2" | grep -c 'scripts/dispatcher.sh:15499')"
+check "...under the loser's name, not passed off as the headline's own words" 1 "$(u4_text "$U4_R1" "$U4_R2" | grep -c '^  also from reviewer 2 ')"
+check "...and the merged issue is still tagged as found by both" 1 "$(u4_text "$U4_R1" "$U4_R2" | grep -c 'found by reviewer 1 and reviewer 2 — independently confirmed')"
+# the reverse: reviewer 2's wording is the LONGER one (the headline), reviewer 1 is the loser and carries a clause of its own
+U4_R1_SHORT='Blocking issue 1: scripts/lib.sh:101 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails. The run record is written before the bead exists.'
+check "reverse: the loser's own clause ('the run record is written before the bead exists') survives when the OTHER wording is longer" 1 \
+  "$(u4_text "$U4_R1_SHORT" "$U4_R1 It then logs nothing about the abandoned attempt, so the apuração cannot count it." | grep -c 'run record is written before the bead exists')"
+# only the CITATION test can keep this one: every significant word of the shorter wording is already in the kept text, one cited site is not
+U4_CITE_ONLY='Blocking issue 1: scripts/lib.sh:104 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails (also scripts/dispatcher.sh:15499).'
+check "a wording that adds NOTHING but a file:line the kept text lacks still contributes that citation" 1 "$(u4_text "$U4_R1" "$U4_CITE_ONLY" | grep -c 'scripts/dispatcher.sh:15499')"
+# a loser whose every point is already in the kept text appends NOTHING (a duplicate is not copied twice)
+U4_COVERED='Blocking issue 1: scripts/lib.sh:101 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails.'
+check "a wording fully covered by the kept one appends nothing (0 sentences, no 'also from' line)" "0,0" \
+  "$(u4_appended "$U4_R1" "$U4_COVERED"),$(u4_text "$U4_R1" "$U4_COVERED" | grep -c '^  also from reviewer')"
+check "the stats say how much was appended (>0 for the repro pair)" true "$([ "$(u4_appended "$U4_R1" "$U4_R2")" -gt 0 ] 2>/dev/null && echo true || echo false)"
+check "the header no longer says the other wording is simply dropped" 0 "$(u4_text "$U4_R1" "$U4_R2" | head -1 | grep -c 'the more detailed wording is shown)')"
+# three reviewers: the LONGEST wording (reviewer 3) takes the headline over from the first; the clauses of 1 and 2 must both survive
+printf 'VERDICT: FAIL\n%s\n' 'Blocking issue 1: scripts/lib.sh:101 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails. The run record is written before the bead exists.' > "$TMP/t1.txt"
+printf 'VERDICT: FAIL\n%s\n' 'Blocking issue 1: scripts/lib.sh:103 — gate_e5_spawn_extra treats an empty verdict bead id as success after bd create fails. Same at scripts/dispatcher.sh:15499.' > "$TMP/t2.txt"
+printf 'VERDICT: FAIL\n%s\n' "$U4_R1 The caller waits until the extra window ends, and the run is held until then." > "$TMP/t3.txt"   # longest, same defect in more of the same words (Jaccard ~0.44 against the merged item, well above the bar)
+mk_payload "1=$TMP/t1.txt" "2=$TMP/t2.txt" "3=$TMP/t3.txt" | union | jq -r '.text, (.stats | "STATS \(.duplicates_merged),\(.distinct_issues)")' > "$TMP/t.out"
+check "three reviewers, one defect: merged into ONE issue (2 duplicates, 1 distinct)" "STATS 2,1" "$(grep '^STATS' "$TMP/t.out")"
+check "three reviewers: reviewer 1's clause survives although reviewer 3's wording took the headline" 1 "$(grep -c 'run record is written before the bead exists' "$TMP/t.out")"
+check "three reviewers: reviewer 2's extra citation survives too" 1 "$(grep -c 'scripts/dispatcher.sh:15499' "$TMP/t.out")"
 # explicit, DIFFERENT class tags decide it even when the text overlaps
 cat > "$TMP/c1.txt" <<'EOF'
 VERDICT: FAIL
@@ -1262,6 +1299,93 @@ $AFTER5"
 N_DESC="$(awk '/^GATE_RUN_ID=\$\(bd -C "\$GC_CITY" create/ {f=1} f && /GATE_E5_RUN_DESC_LINE/ {n++} f && /--json/ {exit} END {print n+0}' "$DISPATCHER")"
 check "the gate-run bead is created with the run-record line in its description" 1 "$N_DESC"
 
+# ── 13. gate attempt 4, blocking issue 2: a flag that is ON while the E5 is not running must not be silent ──────
+echo "── 13. Flag ON + lib NOT loaded, and an E5 event that could not be written, are SAID ──"
+# The verdict's three silent paths to the same empty apuração: (a) quality-gate-dispatcher.sh sources the lib with 2>/dev/null and a failure just
+# leaves GATE_E5_LIB_OK=0 — no line anywhere when the flag file exists; (b) gate_e5_log_event swallowed a failed append (|| true, no warn), so a lost
+# e5_admit silently left a run out of the denominators. The apuração now reads the flag (its own suite); here the dispatcher and the lib speak.
+s5_case() { # s5_case <step5-block> <flag path> <qg log> <lib_ok 0|1> -> output of the block run under bash 3.2 (WARN lines, ACTIVE=, DONE)
+  cat > "$TMP/s5w.sh" <<EOF
+set -euo pipefail
+log() { :; }; warn() { echo "WARN: \$*"; }
+gate_e5_enabled() { printf '0'; }
+BEAD_ID=ga-demo; QG_LOG="$3"; GC_CITY="$TMP/city"; GATE_E5_FLAG_FILE="$2"
+GATE_E5_LIB_OK=$4; GATE_E5_LIB_WHY="the lib file is missing or unreadable: /x/lib.sh"; GATE_E5_ACTIVE=0
+$1
+echo "ACTIVE=\$GATE_E5_ACTIVE"
+echo DONE
+EOF
+  env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" "$BASH32" "$TMP/s5w.sh" 2>&1
+}
+printf 'ligado em 2026-10-02T09:00:00Z — teste\n' > "$TMP/s5w.flag.on"
+printf 'ligado em 2026-10-02T09:00:00Z — teste\n' > "$TMP/s5w.flag.locked"; chmod 000 "$TMP/s5w.flag.locked"
+if [ -n "$S5" ]; then
+  : > "$TMP/s5w.q1.jsonl"
+  OUT="$(s5_case "$S5" "$TMP/s5w.flag.on" "$TMP/s5w.q1.jsonl" 0)"
+  case "$OUT" in *"WARN: E5: the flag file exists but the E5 lib is NOT loaded (the lib file is missing or unreadable: /x/lib.sh)"*"bead ga-demo"*"ACTIVE=0"*DONE*) ok "flag file readable + lib NOT loaded: the dispatcher WARNS, with the reason and the bead, and the run stays inert (ACTIVE=0)" ;; *) bad "flag on + lib not loaded was silent or wrong: $OUT" ;; esac
+  check "...and leaves ONE e5_lib_not_loaded event with the reason, for the apuração" "e5_lib_not_loaded|ga-demo|the lib file is missing or unreadable: /x/lib.sh|1" \
+    "$(jq -r '[.event, .bead, .why] | join("|")' "$TMP/s5w.q1.jsonl" | head -1)|$(grep -c . "$TMP/s5w.q1.jsonl")"
+  : > "$TMP/s5w.q2.jsonl"
+  OUT="$(s5_case "$S5" "$TMP/s5w.flag.absent" "$TMP/s5w.q2.jsonl" 0)"
+  case "$OUT" in *WARN*) bad "lib not loaded but the flag is ABSENT: must be silent (nothing is supposed to run), got: $OUT" ;; *"ACTIVE=0"*DONE*) ok "lib not loaded + flag ABSENT: silent (the E5 is off, and says nothing)" ;; *) bad "flag-absent case did not finish: $OUT" ;; esac
+  check "...and writes no event" 0 "$(grep -c . "$TMP/s5w.q2.jsonl")"
+  OUT="$(s5_case "$S5" "$TMP/s5w.flag.locked" "$TMP/s5w.q2.jsonl" 0)"
+  case "$OUT" in *WARN*) bad "an UNREADABLE flag file reads as off for the dispatcher: no 'lib not loaded' warning expected, got: $OUT" ;; *DONE*) ok "lib not loaded + flag file UNREADABLE: silent here (the lib's own reader reads it as off; the apuração reports the unreadable flag as its own state)" ;; *) bad "unreadable-flag case did not finish: $OUT" ;; esac
+  OUT="$(s5_case "$S5" "$TMP/s5w.flag.on" "$TMP/s5w.q2.jsonl" 1)"
+  case "$OUT" in *WARN*) bad "lib LOADED + flag readable must not trigger the lib-not-loaded warning: $OUT" ;; *DONE*) ok "lib LOADED: no 'lib not loaded' warning even with a readable flag" ;; *) bad "lib-loaded case did not finish: $OUT" ;; esac
+  OUT="$(s5_case "$S5" "$TMP/s5w.flag.on" /nonexistent-dir-13/qg.jsonl 0)"
+  case "$OUT" in *"WARN: E5: the flag file exists but the E5 lib is NOT loaded"*"ACTIVE=0"*DONE*) ok "an event log that cannot be written does not abort the dispatcher (set -e): the warning is still printed and the run proceeds" ;; *) bad "unwritable QG_LOG broke the Step 5 warning path: $OUT" ;; esac
+  # mutation: take the warning branch out
+  S5_MUT="$(printf '%s\n' "$S5" | sed 's/^elif \[ "\${GATE_E5_LIB_OK:-0}" != "1" \].*; then$/elif false; then/')"
+  if [ "$S5_MUT" = "$S5" ]; then bad "Step 5 mutation did not apply (the elif anchor changed)"; else
+    OUT="$(s5_case "$S5_MUT" "$TMP/s5w.flag.on" "$TMP/s5w.q2.jsonl" 0)"
+    case "$OUT" in *WARN*) bad "mutant (no lib-not-loaded branch) still warned: $OUT" ;; *) ok "mutation 'no warning when the flag is on and the lib is not loaded' is caught by the case above (the mutant is silent)" ;; esac
+  fi
+fi
+chmod 600 "$TMP/s5w.flag.locked"
+# the sourcing site itself (top of the dispatcher): WHY the lib did not load, run as the dispatcher runs it
+SRC13="$(sed -n '/^GATE_E5_LIB_OK=0$/,/^unset _E5_LIB$/p' "$DISPATCHER")"
+mkdir -p "$TMP/c13-nolib" "$TMP/c13-ok/packs/town-deltas/assets" "$TMP/c13-ret/packs/town-deltas/assets" "$TMP/c13-locked/packs/town-deltas/assets" "$TMP/c13-fail/packs/town-deltas/assets"
+cp "$LIB" "$TMP/c13-ok/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+printf 'return 1\n' > "$TMP/c13-ret/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+printf 'X=1\n' > "$TMP/c13-locked/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"; chmod 000 "$TMP/c13-locked/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+printf 'false\n' > "$TMP/c13-fail/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+src_case() { env -i HOME="$HOME" PATH="$PATH" GC_CITY="$1" "$BASH32" -c "set -euo pipefail; $SRC13; echo \"OK=\$GATE_E5_LIB_OK WHY=[\$GATE_E5_LIB_WHY]\"" 2>&1; }
+if [ -n "$SRC13" ]; then
+  check "lib file missing: LIB_OK=0 and the reason names the path" "OK=0 WHY=[the lib file is missing or unreadable: $TMP/c13-nolib/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh]" "$(src_case "$TMP/c13-nolib")"
+  check "lib present and loads: LIB_OK=1 and no stale reason left behind" "OK=1 WHY=[]" "$(src_case "$TMP/c13-ok")"
+  check "lib whose top level does an explicit 'return 1': survived, LIB_OK=0, and the reason says the source returned non-zero (not 'missing')" "OK=0 WHY=[sourcing $TMP/c13-ret/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh returned non-zero (e.g. a top-level return)]" "$(src_case "$TMP/c13-ret")"
+  check "lib file present but UNREADABLE: LIB_OK=0 with the missing-or-unreadable reason" "OK=0 WHY=[the lib file is missing or unreadable: $TMP/c13-locked/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh]" "$(src_case "$TMP/c13-locked")"
+  chmod 600 "$TMP/c13-locked/packs/town-deltas/assets/gate-e5-second-reviewer.lib.sh"
+  # What the idiom does NOT survive, MEASURED on this host: a failing top-level command in the lib takes the shell down at the `source` under
+  # bash 3.2 (launchd's), so the dispatcher's comment must not promise "fail-soft". This line records the outcome; it is informational because the
+  # fact belongs to the host's bash, not to this code — if it ever reads "survived", the comment in the dispatcher is stale and can be loosened.
+  R="$(src_case "$TMP/c13-fail")"
+  case "$R" in "") ok "(info) a lib whose top-level command FAILS exits the shell at the source under $BASH32 — NOT fail-soft; the dispatcher's comment says so, and the protection is this suite (bash -n + the lib sourced under strict flags)" ;; OK=*) ok "(info) a failing top-level command did NOT kill the shell under $BASH32 here ($R) — the dispatcher's comment about it is now stale" ;; *) ok "(info) a failing top-level command under $BASH32: $R" ;; esac
+else bad "could not extract the lib-sourcing block from the dispatcher"; fi
+
+# gate_e5_log_event: every way of NOT writing the line says so
+OUT="$(run_lib QG_LOG="$TMP/city/.gc" -- <<<'gate_e5_log_event e5_probe k v; echo "AFTER rc=$?"' 2>&1)"
+case "$OUT" in *"E5: could not append the e5_probe event to $TMP/city/.gc"*"AFTER rc=0"*) ok "a failed append (target is a directory) WARNS on stderr when the lib runs without the dispatcher's warn(), and still returns 0" ;; *) bad "failed append was silent or failed the caller: $OUT" ;; esac
+OUT="$(run_lib QG_LOG="$TMP/city/.gc" -- <<<'warn() { echo "WARN-FN: $*"; }; gate_e5_log_event e5_probe k v; echo "AFTER rc=$?"' 2>&1)"
+case "$OUT" in "WARN-FN: E5: could not append the e5_probe event"*"AFTER rc=0") ok "...and goes through the dispatcher's warn() when there is one (so it lands in the dispatcher log)" ;; *) bad "append warning did not use warn(): $OUT" ;; esac
+OUT="$(run_lib QG_LOG= -- <<<'gate_e5_log_event e5_probe k v; echo "AFTER rc=$?"' 2>&1)"
+case "$OUT" in *"E5: no event log is configured (QG_LOG is empty) — the e5_probe event was NOT written"*"AFTER rc=0") ok "an EMPTY QG_LOG (was: return 0 in silence) warns too" ;; *) bad "empty QG_LOG was silent: $OUT" ;; esac
+: > "$TMP/s13.jsonl"
+OUT="$(run_lib QG_LOG="$TMP/s13.jsonl" -- <<<'gate_e5_log_event e5_probe k v; echo "AFTER rc=$?"' 2>&1)"
+check "a SUCCESSFUL append prints nothing and writes the line" "AFTER rc=0|e5_probe" "$(printf '%s' "$OUT" | tr '\n' ' ' | sed 's/ $//')|$(jq -r .event "$TMP/s13.jsonl")"
+LIB_SAVE13="$LIB"; python3 - "$LIB" "$TMP/lib.mut13" <<'PYMUT'
+import sys
+s = open(sys.argv[1]).read()
+old = '    _e5_warn "E5: could not append the $_ev event to $_file (disk full? permission? jq failed?) — the apuração will be missing this line."\n'
+assert old in s, "mutation anchor missing"
+open(sys.argv[2], "w").write(s.replace(old, "    :\n"))
+PYMUT
+LIB="$TMP/lib.mut13"
+OUT="$(run_lib QG_LOG="$TMP/city/.gc" -- <<<'gate_e5_log_event e5_probe k v; echo "AFTER rc=$?"' 2>&1)"
+LIB="$LIB_SAVE13"
+[ "$OUT" = "AFTER rc=0" ] && ok "mutation 'a failed append is swallowed again' (the old '|| true') is caught: the mutant prints nothing where the real lib warns" || bad "swallowed-append mutant survived: $OUT"
+
 # ── 10. wiring ──────────────────────────────────────────────────────────────────
 echo "── 10. Every E5 call site in the dispatcher is behind the GATE_E5_LIB_OK guard ──"
 UNGUARDED="$(awk '
@@ -1272,7 +1396,7 @@ UNGUARDED="$(awk '
 [ -z "$UNGUARDED" ] && ok "no gate_e5_* call sits more than 10 lines below a GATE_E5_LIB_OK guard" || bad "unguarded E5 call(s):
 $UNGUARDED"
 check "GATE_E5_ACTIVE=1 is assigned only right under a LIB_OK test" 0 "$(awk '/^[[:space:]]*GATE_E5_ACTIVE=1/ { if (NR - last > 2) bad++ } /GATE_E5_LIB_OK/ { last = NR } END { print bad + 0 }' "$DISPATCHER")"
-grep -q '\[ -r "\$_E5_LIB" \]' "$DISPATCHER" && ok "lib is sourced only when readable (fail-soft)" || bad "lib source is not guarded by [ -r ]"
+grep -q '\[ -r "\$_E5_LIB" \]' "$DISPATCHER" && ok "lib is sourced only when readable (a missing or unreadable lib cannot kill the daemon; a parse error or failing top-level command still would — see section 13)" || bad "lib source is not guarded by [ -r ]"
 check "flag defaults: GATE_E5_LIB_OK=0 before sourcing" 1 "$(grep -c '^GATE_E5_LIB_OK=0$' "$DISPATCHER")"
 
 # ── mutation checks (is this suite vacuous?) ─────────────────────────────────────
@@ -1333,6 +1457,33 @@ PYMUT_EOF
   [ "$R0" = "0" ] && [ "$R" = "1" ] && ok "mutation 'overlap over the smaller side' is caught by the terse-in-long pair (real: $R0 merged, mutant: $R)" || bad "symmetric-measure mutant survived (real=$R0 mutant=$R)"
   mutate_union "$TMP/union.path.py" path && R="$(merged_count "$TMP/union.path.py" "$P_REPRO1_A" "$P_REPRO1_B")"
   ok "(info) restoring path tokens alone: repro merged=$R — the other two defences overlap with it by design"
+  # gate attempt 4, blocking issue 1 — what a merge keeps. (1) revert to the old behaviour (the longer wording replaces the other,
+  # nothing is appended) and the reviewer's repro must lose the sibling citation again; (2) drop ONLY the citation test and the pair
+  # whose shorter wording adds nothing but a file:line must lose it.
+  mutate_keep() { # mutate_keep <out> <which: drop|cites>
+    python3 - "$UNION" "$1" "$2" <<'PYMUT_EOF'
+import sys
+src, out, which = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+def sub(old, new):
+    global s
+    assert old in s, "mutation anchor missing: %r" % old
+    s = s.replace(old, new)
+if which == "drop":
+    sub("notes.append((rev, novel))", "pass")
+if which == "cites":
+    sub("if any(not cite_covered(c, kept_cites) for c in cites_of(sent)):", "if False:")
+open(out, "w").write(s)
+PYMUT_EOF
+  }
+  kept_count() { # kept_count <union-script> <issue1> <issue2> <needle> -> occurrences of the needle in the merged text
+    printf 'VERDICT: FAIL\n%s\n' "$2" > "$TMP/m1.txt"; printf 'VERDICT: FAIL\n%s\n' "$3" > "$TMP/m2.txt"
+    mk_payload "1=$TMP/m1.txt" "2=$TMP/m2.txt" | python3 "$1" | jq -r .text | grep -c "$4"
+  }
+  mutate_keep "$TMP/union.drop.py" drop && R0="$(kept_count "$UNION" "$U4_R1" "$U4_R2" 'scripts/dispatcher.sh:15499')" && R="$(kept_count "$TMP/union.drop.py" "$U4_R1" "$U4_R2" 'scripts/dispatcher.sh:15499')"
+  [ "$R0" = "1" ] && [ "$R" = "0" ] && ok "mutation 'the other wording is dropped on a merge' (the old behaviour) is caught by the repro (real keeps the citation: $R0, mutant: $R)" || bad "drop-the-loser mutant survived (real=$R0 mutant=$R)"
+  mutate_keep "$TMP/union.cites.py" cites && R0="$(kept_count "$UNION" "$U4_R1" "$U4_CITE_ONLY" 'scripts/dispatcher.sh:15499')" && R="$(kept_count "$TMP/union.cites.py" "$U4_R1" "$U4_CITE_ONLY" 'scripts/dispatcher.sh:15499')"
+  [ "$R0" = "1" ] && [ "$R" = "0" ] && ok "mutation 'no citation test' is caught by the cite-only pair (real: $R0, mutant: $R)" || bad "citation-test mutant survived (real=$R0 mutant=$R)"
   # gate attempt 1, blocking issue 3 — the new defences must be noticed too.
   # (1) the hook obeys the arm PERSISTED at admission: drop that requirement and a run that was never admitted as arm B gets an extra.
   LIB_SAVE="$LIB"; cp "$LIB" "$TMP/lib.mut2"; sed -i.bak 's/\[ "\${GATE_E5_RUN_ARM:-}" != "B" \]/false/' "$TMP/lib.mut2"

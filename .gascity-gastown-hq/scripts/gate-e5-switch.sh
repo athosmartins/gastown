@@ -29,6 +29,8 @@ status() {
   # dispatcher reads it as off (inert) — and that is not the same fact as "absent", so it is said as what it is
   if [ -r "$FLAG" ]; then
     echo "E5 (2º revisor): LIGADO — $(head -n1 "$FLAG" 2>/dev/null || echo '?')"
+    # this is the FILE, not the effect: whether the dispatcher is honoring it (lib loaded, events written) is a different fact, answered by the apuração
+    echo "  (isto é o ARQUIVO da chave; se o dispatcher o está honrando, quem responde é scripts/gate-e5-apuracao.py — bloco 'estado do E5', rc≠0 se ligado e sem admitir.)"
   elif [ -e "$FLAG" ]; then
     echo "E5 (2º revisor): ILEGÍVEL (o arquivo $FLAG existe mas não pode ser lido) — o dispatcher o lê como DESLIGADO (inerte); corrija a permissão ou rode 'off'."
   else
