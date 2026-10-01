@@ -1,0 +1,12 @@
+# ga-5c3msy (E8 of P0 ga-ufskhy): standing harvest of per-session token usage into the ledger that "tokens per approved
+# bead" is computed from. transcript-reaper.sh removes a dead session's transcript 24h after its last write, so the numbers
+# must be copied out before then; 30 min is far inside that window and far outside one run (measured: first full scan of
+# 1.8k transcripts ~8 s, incremental a few seconds), and the tool holds its own flock, so two ticks can never overlap.
+# Read-only on transcripts and the gate log; the only thing written is $GC_CITY_PATH/.gc/token-ledger/sessions.jsonl.
+# Report:  python3 packs/town-deltas/assets/bead-token-meter.py report --from <YYYY-MM-DD>   (docs/reports/token-por-bead-e8.md)
+[order]
+description = "Copy per-session token usage from Claude transcripts into the tokens-per-bead ledger before the transcript reaper deletes them"
+trigger = "cooldown"
+interval = "30m"
+timeout = "300s"
+exec = "$PACK_DIR/assets/scripts/token-ledger-harvest.sh"

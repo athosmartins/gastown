@@ -42,6 +42,25 @@
 #                                 stopgap, which measured supervisor demand 1795 s -> 315 s, load 64 -> 34.
 #   GC_LOWPRIO_CLAUDE_BIN=PATH    the real claude (test seam). Default: `claude` from PATH, exactly what
 #                                 the builtin provider would have run.
+#
+# EFFORT A/B (ga-5c3msy, E8 of P0 ga-ufskhy) — a second job of this wrapper, INERT unless
+# $GC_CITY_PATH/.gc/effort-ab.conf exists. The metric is tokens per APPROVED bead, and the open question is
+# whether the builders (dog / wa-worker / ps-worker, all `--effort xhigh`) can run at `high` without the
+# gate approving less. Effort is a per-TEMPLATE setting in city.toml, so a per-session arm has to be decided
+# where the session is born: here, before exec, from a hash of the session name (SHA-256, salted). The
+# arm is fixed BEFORE the session sees any bead and the bead a pool session picks up is the oldest ready
+# one, so arm and bead are independent — the same property the E3 pre-gate A/B gets from hashing the bead id.
+# Only sessions launched with exactly `control_effort` are enrolled; a role set to anything else on purpose
+# is never touched. The conf is `key=value` lines (# comments):
+#     salt=ga-5c3msy-1             changes the split when a new experiment starts
+#     enroll=gastown.dog wa-worker ps-worker     GC_TEMPLATE values (or GC_AGENT prefixes) that are enrolled
+#     control_effort=xhigh         the effort an enrolled session is launched with today
+#     treat_effort=high            what the treated arm gets
+#     treat_pct=50                 0-100, share of sessions in the treated arm
+# FAIL-OPEN like everything else here: a bad conf, a missing shasum, an odd argv -> claude starts with its
+# argv untouched and the log says why (EFFORT-AB WARN). The decision is logged per launch with the claude
+# --session-id, so "did the arm actually reach the process" is a join against the transcript's own `effort`.
+# KNOBS: GC_EFFORT_AB=0 (this launch) / touch $GC_CITY_PATH/.gc/no-effort-ab (every new launch, no reload).
 set -u
 
 target="${GC_LOWPRIO_NICE:-15}"
@@ -104,4 +123,74 @@ else
   fi
 fi
 
-exec "$claude_bin" "$@"
+# ---- EFFORT A/B (see header). Everything below only ever rewrites the VALUE after --effort, and only for an
+# enrolled session still on control_effort; any doubt leaves argv exactly as received.
+argv=("$@")
+ab_conf=""
+[ -n "$city" ] && ab_conf="$city/.gc/effort-ab.conf"
+if [ -n "$ab_conf" ] && [ -f "$ab_conf" ] && [ "${GC_EFFORT_AB:-}" != "0" ] && [ ! -e "$city/.gc/no-effort-ab" ]; then
+  ab_salt=""; ab_enroll=""; ab_ctl=""; ab_trt=""; ab_pct=""; ab_bad=""
+  while IFS='=' read -r ab_k ab_v || [ -n "$ab_k" ]; do
+    ab_k="${ab_k//[[:space:]]/}"
+    case "$ab_k" in ''|'#'*) continue ;; esac
+    ab_v="${ab_v%%#*}"; ab_v="${ab_v#"${ab_v%%[![:space:]]*}"}"; ab_v="${ab_v%"${ab_v##*[![:space:]]}"}"
+    case "$ab_v" in *[!A-Za-z0-9._\ -]*) ab_bad="$ab_k has characters outside [A-Za-z0-9._ -]"; break ;; esac
+    case "$ab_k" in
+      salt) ab_salt="$ab_v" ;; enroll) ab_enroll="$ab_v" ;; control_effort) ab_ctl="$ab_v" ;;
+      treat_effort) ab_trt="$ab_v" ;; treat_pct) ab_pct="$ab_v" ;;
+      *) ab_bad="unknown key '$ab_k'"; break ;;
+    esac
+  done < "$ab_conf"
+  case "$ab_ctl" in low|medium|high|xhigh|max) ;; *) ab_bad="${ab_bad:-control_effort '$ab_ctl' invalid}" ;; esac
+  case "$ab_trt" in low|medium|high|xhigh|max) ;; *) ab_bad="${ab_bad:-treat_effort '$ab_trt' invalid}" ;; esac
+  case "$ab_pct" in ''|*[!0-9]*) ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}" ;; *) [ "$ab_pct" -gt 100 ] && ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}" ;; esac
+  [ -n "$ab_salt" ] && [ -n "$ab_enroll" ] || ab_bad="${ab_bad:-salt/enroll missing}"
+  if [ -n "$ab_bad" ]; then
+    note "EFFORT-AB WARN conf $ab_conf ignored: $ab_bad"
+  else
+    ab_tpl="${GC_TEMPLATE:-}"; ab_in=""
+    for ab_t in $ab_enroll; do
+      if [ "$ab_tpl" = "$ab_t" ]; then ab_in=1; break; fi
+      case "${GC_AGENT:-}" in "$ab_t"|"$ab_t"-*) ab_in=1; break ;; esac
+    done
+    if [ -n "$ab_in" ]; then
+      ab_sn="${GC_SESSION_NAME:-}"
+      ab_idx=-1; ab_uuid="?"
+      for ((ab_i = 0; ab_i < ${#argv[@]}; ab_i++)); do
+        case "${argv[$ab_i]}" in
+          --effort) ab_idx=$ab_i ;;
+          --effort=*) ab_idx=$ab_i ;;
+          --session-id) ab_uuid="${argv[$((ab_i + 1))]:-?}" ;;
+        esac
+      done
+      ab_h=""
+      if [ -z "$ab_sn" ]; then
+        note "EFFORT-AB WARN template=$ab_tpl has no GC_SESSION_NAME - left alone"
+      elif [ "$ab_idx" -lt 0 ]; then
+        note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn launched without --effort - left alone"
+      elif ! ab_out="$(printf '%s' "effort-ab:$ab_salt:$ab_sn" | shasum -a 256 2>/dev/null)" || [ -z "$ab_out" ]; then
+        note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn shasum failed - left alone"
+      else
+        ab_h="${ab_out%% *}"
+        ab_n=$(( 16#${ab_h:0:8} % 100 ))
+        case "${argv[$ab_idx]}" in
+          --effort=*) ab_cur="${argv[$ab_idx]#--effort=}" ;;
+          *)          ab_cur="${argv[$((ab_idx + 1))]:-}" ;;
+        esac
+        if [ "$ab_cur" != "$ab_ctl" ]; then
+          note "EFFORT-AB SKIP template=$ab_tpl session=$ab_sn uuid=$ab_uuid launched with effort=$ab_cur, not control $ab_ctl - left alone"
+        elif [ "$ab_n" -lt "$ab_pct" ]; then
+          case "${argv[$ab_idx]}" in
+            --effort=*) argv[$ab_idx]="--effort=$ab_trt" ;;
+            *)          argv[$((ab_idx + 1))]="$ab_trt" ;;
+          esac
+          note "EFFORT-AB arm=treat template=$ab_tpl session=$ab_sn uuid=$ab_uuid effort=$ab_ctl->$ab_trt n=$ab_n pct=$ab_pct salt=$ab_salt"
+        else
+          note "EFFORT-AB arm=control template=$ab_tpl session=$ab_sn uuid=$ab_uuid effort=$ab_ctl n=$ab_n pct=$ab_pct salt=$ab_salt"
+        fi
+      fi
+    fi
+  fi
+fi
+
+exec "$claude_bin" ${argv[@]+"${argv[@]}"}
