@@ -8389,9 +8389,14 @@ _topup_note_spawn() {
     warn "ga-653ilw: could not record top-up spawn #$_new for $_id in $_store — the brake count is behind by one (fail-open)."
   fi
   [ "$_new" -ge "$_cap" ] || return 0
-  warn "ga-653ilw: top-up BRAKED $_id — $_new consecutive $_pool spawns for it, none claimed it (cap $_cap). Labelling pilot:topup-braked; top-up skips it from now on. Release: bd -C $_store label remove $_id pilot:topup-braked"
-  timeout 15 bd -C "$_store" label add "$_id" "pilot:topup-braked" -q >/dev/null 2>&1 \
-    || warn "ga-653ilw: FAILED to label $_id pilot:topup-braked — the brake is NOT durable; the next sweep will count again and retry the label."
+  warn "ga-653ilw: top-up BRAKED $_id — $_new consecutive $_pool spawns for it, none claimed it (cap $_cap). Labelling pilot:topup-braked (top-up skips a bead that carries it). Release: bd -C $_store label remove $_id pilot:topup-braked"
+  # The comment below says the bead IS braked, so it is posted only once the label has actually landed: on a failed
+  # write the bead is not braked yet, and a comment claiming otherwise would be false on the bead itself. The next
+  # sweep counts again (the count is already >= the cap), retries the label, and leaves the comment then.
+  if ! timeout 15 bd -C "$_store" label add "$_id" "pilot:topup-braked" -q >/dev/null 2>&1; then
+    warn "ga-653ilw: FAILED to label $_id pilot:topup-braked — the brake is NOT durable and no comment was left (the bead is not braked yet); the next sweep will count again and retry the label."
+    return 0
+  fi
   timeout 15 bd -C "$_store" comment "$_id" "Freio do top-up (ga-653ilw): o Pilot ja abriu $_new sessoes de $_pool SEGUIDAS para este bead e nenhuma o reivindicou — parando o top-up para ele (label pilot:topup-braked) em vez de gastar mais uma sessao (~188k WTE cada) por sweep. Causas provaveis: o bead vive num store que o pool $_pool nao le (ele so le o store do rig dono do pool), ou o worker o recusa. Para liberar: bd -C $_store label remove $_id pilot:topup-braked (a contagem nao e zerada: se continuar sem ser reivindicado, freia de novo na proxima sessao; para recomecar do zero, tambem rode: bd -C $_store update $_id --unset-metadata pilot.topup_spawn_count)." >/dev/null 2>&1 || true
   return 0
 }

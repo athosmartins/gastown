@@ -153,6 +153,8 @@ case "$sub" in
   label)
     if [ "${1:-}" = add ]; then
       id="$2"; l="$3"; f="$dir/$id.json"
+      # FAKE_LABEL_FAIL=1: every `label add` fails without writing (a Dolt hiccup on the one call C8 targets).
+      if [ "${FAKE_LABEL_FAIL:-0}" = "1" ]; then echo "Error: connection lost" >&2; exit 1; fi
       [ -f "$f" ] && jq --arg l "$l" '.labels=((.labels//[])+[$l]|unique)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       echo "✓ Added label '$l' to $id"
     fi
@@ -195,7 +197,7 @@ exit 0
 BD
 chmod +x "$WORK/bin/bd"
 
-reset_world() { rm -rf "$WORK/stores"; mkdir -p "$WORK/stores"; : > "$WORK/bd.calls"; : > "$WORK/comments.log"; : > "$WORK/spawns.log"; : > "$WORK/warns.log"; rm -f "$WORK/gc_fail" "$WORK/show.n"; unset FAKE_SHOW_FAIL_FROM; write_rigs; }
+reset_world() { rm -rf "$WORK/stores"; mkdir -p "$WORK/stores"; : > "$WORK/bd.calls"; : > "$WORK/comments.log"; : > "$WORK/spawns.log"; : > "$WORK/warns.log"; rm -f "$WORK/gc_fail" "$WORK/show.n"; unset FAKE_SHOW_FAIL_FROM FAKE_LABEL_FAIL; write_rigs; }
 
 # mkbead <store> <id> <routed_to> [labels-json] [metadata-extra-json]
 mkbead() {
@@ -449,6 +451,31 @@ if [ "$_cnt" = "4" ] && ! bead_field property_scrapers ps-unread '(.labels // []
   ok "C7: an UNREADABLE count is not 'zero': nothing was written (count still 4), no brake set, and the skipped bookkeeping is announced"
 else
   bad "C7: unreadable count -> count='$_cnt' (expected 4 untouched), warns: $(tr '\n' '|' < "$WORK/warns.log" | cut -c1-200)"
+fi
+
+# C8 — the comment must not promise more than the code did: when the brake LABEL could not be written, the bead is
+# NOT braked, so a comment saying "stopping top-up for this bead (label pilot:topup-braked)" would be false on the
+# bead itself — the next reader would stop looking for why it keeps spawning. The failure is warned, and the next
+# sweep (which counts again and retries) is the one that labels AND comments, exactly once.
+reset_world
+_recent=$(( $(date +%s) - 600 ))
+mkbead property_scrapers ps-nolabel ps-worker '[]' "{\"pilot.topup_spawn_count\":\"4\",\"pilot.topup_last_spawn_at\":\"$_recent\"}"
+export FAKE_LABEL_FAIL=1
+run_sweeps ps-worker 1 1
+unset FAKE_LABEL_FAIL
+_cm="$(grep -c "^COMMENT	property_scrapers/ps-nolabel	" "$WORK/comments.log" 2>/dev/null || true)"
+if [ "$_cm" = "0" ] && grep -q 'FAILED to label' "$WORK/warns.log" \
+   && ! bead_field property_scrapers ps-nolabel '(.labels // []) | index("pilot:topup-braked") != null' | grep -qx true; then
+  ok "C8: the brake label could not be written -> NO 'braked' comment on the bead (it is not braked), and the failure is warned"
+else
+  bad "C8: label write failed -> $_cm brake comment(s) on a bead that is not braked (expected 0), warns: $(tr '\n' '|' < "$WORK/warns.log" | cut -c1-200)"
+fi
+run_sweeps ps-worker 1 1
+_cm="$(grep -c "^COMMENT	property_scrapers/ps-nolabel	" "$WORK/comments.log" 2>/dev/null || true)"
+if [ "$_cm" = "1" ] && bead_field property_scrapers ps-nolabel '(.labels // []) | index("pilot:topup-braked") != null' | grep -qx true; then
+  ok "C8b: the next sweep retries — the label lands and the ONE comment is posted then, not before"
+else
+  bad "C8b: after the retry sweep -> $_cm comment(s), label present=$(bead_field property_scrapers ps-nolabel '(.labels // []) | index("pilot:topup-braked") != null') — expected 1 comment and the label"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
