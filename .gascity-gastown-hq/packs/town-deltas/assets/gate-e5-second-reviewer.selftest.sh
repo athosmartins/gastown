@@ -350,6 +350,13 @@ check "the cap pages exactly once (notify called once)" 1 "$(wc -l < "$TMP/notif
 echo "x" > "$(ls "$TMP"/city/.gc/gate-e5-spend-*.count | head -1)"
 check "a corrupt counter -> unknown (never 'ok')" unknown "$(run_lib GATE_E5_DAILY_CAP_USD=2 GATE_E5_EST_COST_USD=1 -- <<<'gate_e5_cap_state')"
 rm -f "$TMP"/city/.gc/gate-e5-spend-*
+# gate attempt 3 (non-blocking): "no counter file" reads as "nothing spent today" ONLY when a count can be written. A directory that refuses the
+# write would make every later call read "no file = 0" and the cap would never bite — the same value for "none spent" and "cannot count".
+mkdir -p "$TMP/ro-city/.gc"; chmod 555 "$TMP/ro-city/.gc"
+check "a counter directory that cannot be written -> unknown, not 'ok' (a spend that cannot be counted is a cap that cannot bite)" unknown "$(env -i PATH="$PATH" GC_CITY="$TMP/ro-city" "$BASH32" -c "set -euo pipefail; source '$LIB'; gate_e5_cap_state")"
+chmod 755 "$TMP/ro-city/.gc"
+check "...and the same directory, writable, with no counter yet -> ok" ok "$(env -i PATH="$PATH" GC_CITY="$TMP/ro-city" "$BASH32" -c "set -euo pipefail; source '$LIB'; gate_e5_cap_state")"
+check "no city at all (no counter directory exists) -> unknown, not 'ok'" unknown "$(env -i PATH="$PATH" "$BASH32" -c "set -euo pipefail; source '$LIB'; gate_e5_cap_state")"
 
 # ── 7. Phase C hook + spawn (mocked bd/gc) ──────────────────────────────────────
 echo "── 7. The Phase C hook and the extra-reviewer spawn (mocked bd / gc) ──"
@@ -369,6 +376,7 @@ bd() {
     *" show "*)     local id; id=$(printf '%s\n' "$@" | awk '/^show$/ {getline; print; exit}'); [ -f "$FIX/show-$id.json" ] && { cat "$FIX/show-$id.json"; return 0; }; return 1 ;;
     *" comments "*) local id; id=$(printf '%s\n' "$@" | awk '/^comments$/ {getline; print; exit}'); [ -f "$FIX/comments-$id.json" ] && cat "$FIX/comments-$id.json" || echo "[]"; return 0 ;;
     *" create "*)   echo "create $*" >> "$CALLS"; [ -f "$FIX/create-fail" ] && return 1; echo '{"id":"ga-newvb1"}'; return 0 ;;
+    *" list "*)     echo "bd $*" >> "$CALLS"; [ -f "$FIX/list-fail" ] && return 1; [ -f "$FIX/list.json" ] && cat "$FIX/list.json" || echo '[]'; return 0 ;;
     *)              echo "bd $*" >> "$CALLS"; return 0 ;;
   esac
 }
@@ -425,6 +433,9 @@ EOF
 check "spawns: REQUIRED 1->2, extra slot appended" "REQ=2 N=2 LAST=ga-newvb1 SID=gate-reviewer-adhoc-new1" "$OUT"
 C="$(cat "$F/calls.log")"
 case "$C" in *"create"*"-l gate-run:ga-run001"*"-l reviewer-index:2"*"-l verdict:pending"*"-l e5-extra"*"-l e5-trigger:first-fail"*) ok "extra verdict bead carries gate-run, reviewer-index:2, verdict:pending, e5-extra, e5-trigger:first-fail" ;; *) bad "verdict bead labels wrong: $(grep create "$F/calls.log")" ;; esac
+# gate attempt 3 (non-blocking): the session's identity is written INTO the create, so it exists exactly when the bead does — the later
+# verified assign can fail and leave the bead with no assignee, and the pinned session would then have no record but a log line.
+case "$C" in *'--metadata {"e5.session_id":"ga-wisp-new1","e5.session_name":"gate-reviewer-adhoc-new1"}'*) ok "the extra's session id and name are written into the bead's own metadata at create" ;; *) bad "create carries no session metadata: $(grep create "$F/calls.log" | cut -c1-300)" ;; esac
 case "$C" in *"assign ga-newvb1 gate-reviewer-adhoc-new1"*) ok "durable pull: verdict bead assigned to the new session" ;; *) bad "verdict bead not assigned" ;; esac
 case "$C" in *"comment ga-newvb1 QUALITY GATE REVIEW — You are reviewer 2 of 2"*) ok "the extra reviewer's task is embedded on its verdict bead" ;; *) bad "task not embedded: $(grep 'bd comment' "$F/calls.log" | cut -c1-150)" ;; esac
 case "$C" in *"nudge ga-wisp-new1"*) ok "task queued to the new session" ;; *) bad "task not delivered" ;; esac
@@ -521,6 +532,42 @@ EOF
 check "verdict-bead create failed: run untouched" "REQ=1 N=1" "$OUT"
 grep -q 'gc --city .* session close ga-wisp-new1' "$F/calls.log" && ok "verdict-bead create failed: the just-opened session was closed (no orphan)" || bad "orphan session left behind: $(cat "$F/calls.log")"
 check "verdict-bead create failed: nothing counted against the cap" "" "$(cat "$TMP"/city/.gc/gate-e5-spend-*.count 2>/dev/null | head -1)"
+check "verdict-bead create failed and the run's beads READ BACK empty: the clean 'no bead' reason" verdict-bead-create-failed "$(jq -r 'select(.event=="e5_extra_declined") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+grep -q 'bd -C .* list .*-l gate-run:ga-run001 -l e5-extra' "$F/calls.log" && ok "a failed create is read back with the run's own verdict-bead query (gate-run label + e5-extra)" || bad "a failed create was taken at its word: no readback query in $(cat "$F/calls.log" | cut -c1-200)"
+# gate attempt 3 (non-blocking), the third state of "the create failed": the write LANDED and only the answer was lost (a Dolt hiccup on
+# the way back). Declaring "no bead" there leaves an unassigned e5-extra verdict:pending bead that Phase C counts as a live slot, so the run
+# would wait out the extra's whole window for a reviewer that does not exist.
+F="$(new_fix createfail-exists)"; show_bead "$F" "$ARM_B_ID" '[]'; touch "$F/create-fail"
+echo '[{"id":"ga-orphan1","labels":["type:quality-gate-verdict","gate-run:ga-run001","e5-extra"]}]' > "$F/list.json"
+OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]} LAST=\${VERDICT_BEAD_IDS[1]:-none} SID=\${SESSION_IDS[1]:-none}"
+EOF
+)"
+check "create reported failure but the bead EXISTS: it is adopted (slot appended, REQUIRED 2), not declared 'no bead'" "REQ=2 N=2 LAST=ga-orphan1 SID=gate-reviewer-adhoc-new1" "$OUT"
+grep -q 'session close ga-wisp-new1' "$F/calls.log" && bad "the session of an adopted bead was closed" || ok "the session behind an adopted bead is kept"
+case "$(cat "$F/calls.log")" in *"assign ga-orphan1 gate-reviewer-adhoc-new1"*"comment ga-orphan1 QUALITY GATE REVIEW — You are reviewer 2 of 2"*) ok "the adopted bead gets the durable assign and the task, like a clean create" ;; *) bad "adopted bead not wired: $(cut -c1-160 "$F/calls.log")" ;; esac
+check "...and the spawn event names the adopted bead" ga-orphan1 "$(jq -r 'select(.event=="e5_extra_spawn") | .extra_vb' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+F="$(new_fix createfail-unreadable)"; show_bead "$F" "$ARM_B_ID" '[]'; touch "$F/create-fail" "$F/list-fail"
+OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+check "create failed AND the readback failed: the run is untouched (arm-A behaviour)" "REQ=1 N=1" "$OUT"
+check "...declined under its OWN reason — 'could not look' is not the clean 'no bead'" verdict-bead-create-unverified "$(jq -r 'select(.event=="e5_extra_declined") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
+grep -q 'gc --city .* session close ga-wisp-new1' "$F/calls.log" && ok "...and the session that has no bead behind it is closed" || bad "orphan session left behind an unverified create"
+F="$(new_fix createfail-notarray)"; show_bead "$F" "$ARM_B_ID" '[]'; touch "$F/create-fail"; echo '{"error":"not a list"}' > "$F/list.json"
+scn "$F" GATE_E5_ENABLED=1 -- >/dev/null <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+gate_e5_phase_c_hook
+EOF
+check "a readback that is not a JSON array is unreadable too (never 'no bead')" verdict-bead-create-unverified "$(jq -r 'select(.event=="e5_extra_declined") | .reason' "$TMP/city/.gc/quality-gate.jsonl" | head -1)"
 
 echo "  · one attempt per run, and retiring an extra that cannot help:"
 EXTRA_OPEN='[{"id":"ga-vb0001","status":"closed","created_at":"2026-09-30T17:00:00Z","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"]},{"id":"ga-newvb1","status":"open","created_at":"__CREATED__","labels":["type:quality-gate-verdict","reviewer-index:2","verdict:pending","e5-extra","e5-trigger:first-fail"]}]'
@@ -564,7 +611,19 @@ EOF
   else
     check "$label: extra kept, run still waiting" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "$out"
     grep -q 'e5-extra-abandoned' "$f/calls.log" && bad "$label: abandoned although it can still deliver" || ok "$label: not abandoned"
-    check "$label: the run's deadline is the extra's own (PC_TIMEOUT_SECS, and PC_TIMEOUT_MIN for the messages)" "PT=$want_pt PM=$(( (want_pt + 59) / 60 ))" "$pt"
+    if [ "$want_pt" = "$tmo" ]; then
+      check "$label: the run's deadline is untouched" "PT=$want_pt PM=$(( (want_pt + 59) / 60 ))" "$pt"
+    else
+      # Raised to the extra's own deadline = birth offset + window, where the offset is (elapsed - the extra's age) and the age is read off the
+      # WALL CLOCK when the hook runs. The fixture's iso_ago truncates to the second and the hook runs later, so the deadline comes out at
+      # (expected - the seconds that passed): 1s on an idle machine, more under load. Never above expected; a wrong rule is a minute or more off.
+      ptv="${pt#PT=}"; ptv="${ptv%% *}"; pmv="${pt##*PM=}"
+      if [ -n "$ptv" ] && [ "$ptv" -le "$want_pt" ] && [ "$ptv" -ge $((want_pt - 60)) ] && [ "$pmv" = "$(( (ptv + 59) / 60 ))" ]; then
+        ok "$label: the run's deadline is the extra's own (PT=$ptv, expected $want_pt less clock drift; PM=$pmv)"
+      else
+        bad "$label: the run's deadline is not the extra's own — expected PT in [$((want_pt - 60)), $want_pt] with PM=ceil(PT/60), got '$pt'"
+      fi
+    fi
   fi
 }
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -589,6 +648,41 @@ retire_case "ceiling: the same extra 1950s old (ceiling window 1900s spent)" "ex
 # it cannot be measured against (the run timeout and a confirmed-closed session still retire it, as they do when the age is known)
 retire_case "extra age unreadable (no created_at), run young, session alive" "" "" 300 0
 retire_case "extra age unreadable, but the run timed out" "run-timeout" "" 4000 0
+# gate attempt 3 (non-blocking): the slot's session, as Phase C reads it, is the verdict bead's ASSIGNEE — EMPTY when the extra's verified
+# assign failed at spawn (its session had already been pinned) and "__UNKNOWN__" when the read failed. Neither means "no session": the
+# spawn also wrote the session into the bead's metadata, and the hook recovers it from there so the pinned session is closed, not leaked.
+EXTRA_OPEN_META='[{"id":"ga-vb0001","status":"closed","created_at":"2026-09-30T17:00:00Z","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"]},{"id":"ga-newvb1","status":"open","created_at":"__CREATED__","labels":["type:quality-gate-verdict","reviewer-index:2","verdict:pending","e5-extra","e5-trigger:first-fail"],"metadata":{"e5.session_id":"ga-wisp-new1","e5.session_name":"gate-reviewer-adhoc-new1"}}]'
+# sess_case <label> <SESSION_IDS slot for the extra> <metadata yes|no> <extra age s> <pc_elapsed> <expect: "closed:<sid>" | "noclose" | "kept:<slot after the hook>">
+sess_case() {
+  local label="$1" slot="$2" meta="$3" age="$4" elapsed="$5" want="$6" f vbj out
+  f="$(new_fix "s-$label")"; show_bead "$f" "$ARM_B_ID" '[]'
+  jq -n '[{id:"ga-newvb1",status:"open",labels:["e5-extra"]}]' > "$f/show-ga-newvb1.json"
+  vbj="${EXTRA_OPEN_META/__CREATED__/$(iso_ago "$age")}"
+  [ "$meta" = "yes" ] || vbj="$(printf '%s' "$vbj" | jq -c 'map(del(.metadata))')"
+  out="$(scn "$f" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+GATE_E5_RUN_VB_JSON='$vbj'; VB_JSON="\$CLOBBERED_VB_JSON"
+VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(rev-sess-1 "$slot"); REQUIRED_REVIEWERS=2
+VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
+PC_ELAPSED=$elapsed; PC_TIMEOUT_SECS=1800; PC_TIMEOUT_MIN=30
+gate_e5_phase_c_hook
+echo "N=\${#VERDICT_BEAD_IDS[@]} SLOT1=[\${SESSION_IDS[1]:-}]"
+EOF
+)"
+  case "$want" in
+    closed:*) grep -q "session close ${want#closed:}\$" "$f/calls.log" && ok "$label: the retired extra's session (${want#closed:}) was closed" || bad "$label: the pinned extra session was NOT closed: $(grep 'session close' "$f/calls.log" | tr '\n' ' ')" ;;
+    noclose)  grep -q 'session close' "$f/calls.log" && bad "$label: a session close was attempted with no session known: $(grep 'session close' "$f/calls.log" | tr '\n' ' ')" || ok "$label: no session known, none closed (and no bogus close either)" ;;
+    kept:*)   check "$label: extra kept; the slot's session after the hook" "N=2 SLOT1=[${want#kept:}]" "$out" ;;
+  esac
+}
+sess_case "empty assignee, retired: closed from the metadata"  ""              yes 1850 2850 "closed:gate-reviewer-adhoc-new1"
+sess_case "unreadable assignee, retired: closed from the metadata" "__UNKNOWN__" yes 1850 2850 "closed:gate-reviewer-adhoc-new1"
+sess_case "empty assignee and NO metadata, retired: nothing to close" ""         no  1850 2850 "noclose"
+sess_case "unreadable assignee and NO metadata, retired: no bogus close of the sentinel" "__UNKNOWN__" no 1850 2850 "noclose"
+sess_case "empty assignee, kept: the slot is filled in from the metadata (classifier and EXIT cleanup see the real session)" "" yes 100 300 "kept:gate-reviewer-adhoc-new1"
+sess_case "unreadable assignee, kept: the sentinel stays (a failed read is not a session)" "__UNKNOWN__" yes 100 300 "kept:__UNKNOWN__"
+sess_case "real assignee, kept: untouched" "gate-reviewer-adhoc-other" yes 100 300 "kept:gate-reviewer-adhoc-other"
+sess_case "real assignee, retired: its own session is the one closed, not the metadata's" "gate-reviewer-adhoc-other" yes 1850 2850 "closed:gate-reviewer-adhoc-other"
 # extra already delivered (bead closed) -> nothing to do, not retired
 F="$(new_fix delivered)"; jq -n '[{id:"ga-newvb1",status:"closed",labels:["e5-extra","verdict:FAIL"]}]' > "$F/show-ga-newvb1.json"
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
@@ -741,7 +835,15 @@ check "REAL chain: the old extra's retirement reason is extra-timeout" extra-tim
 F="$(flow_fix "live-ownwindow" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$(iso_ago 1500)}]")"
 printf '%s' '[{"id":"ga-newvb1","status":"open","labels":["type:quality-gate-verdict","gate-run:ga-run001","reviewer-index:2","verdict:pending","e5-extra"],"assignee":"gate-reviewer-adhoc-new1"}]' > "$F/show-ga-newvb1.json"
 OUT="$(flow_case "$F" GATE_E5_ENABLED=1 ARM_ID="$ARM_B_ID" FLOW_ELAPSED=2500 RUN_DESC=$'required_reviewers: 1\ne5_arm: B' -- <<<"$FLOW_TAIL_PT")"
-check "REAL chain: a first-fail extra inside its own window survives the shared run clock, and the run's deadline moves to it" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1 PT=2800 PM=47" "$(printf '%s' "$OUT" | tr '\n' ' ' | sed 's/ $//')"
+OUTL="$(printf '%s' "$OUT" | tr '\n' ' ' | sed 's/ $//')"
+PTV="$(printf '%s' "$OUTL" | sed -n 's/.* PT=\([0-9]*\) PM=.*/\1/p')"; PMV="$(printf '%s' "$OUTL" | sed -n 's/.* PM=\([0-9]*\)$/\1/p')"
+check "REAL chain: a first-fail extra inside its own window survives the shared run clock — slot kept, REQUIRED stays 2" "REQ=2 N=2 IDS=ga-vb0001 ga-newvb1" "${OUTL%% PT=*}"
+# The run's deadline is the extra's: its birth offset (elapsed 2500 - the extra's age) + its 1800s window = 2800. The age is measured against
+# the WALL CLOCK when the hook runs, not when this fixture was built, and the real chain runs several python3 `_ts_to_epoch` calls in between —
+# so on a loaded machine the deadline is 2800 minus the seconds that passed (measured: 2791 at load 45-60). It can never be ABOVE 2800, and a
+# wrong rule lands far outside this minute: the run's own 1800s clock, or the old 2500+1800.
+if [ -n "$PTV" ] && [ "$PTV" -le 2800 ] && [ "$PTV" -ge 2740 ] && [ "$PMV" = "$(( (PTV + 59) / 60 ))" ]; then ok "REAL chain: ...and the run's deadline moves to the extra's: PT=$PTV (2800 minus the load-time drift), PM=$PMV is its own ceiling in minutes"
+else bad "REAL chain: the run's deadline did not move to the extra's own (1000+1800=2800, allowing 60s of drift): PT='$PTV' PM='$PMV'"; fi
 grep -q 'e5-extra-abandoned' "$F/calls.log" && bad "REAL chain: the extra was retired although it is inside its own window" || ok "REAL chain: not retired"
 # (d) the extra's own `bd show` failing inside the collect must not blind the hook to it: the hook decides from the run list
 F="$(flow_fix "live-showfail" "[$R1_FAIL,${EXTRA_LIVE/__CREATED__/$(iso_ago 3000)}]")"   # no show-ga-newvb1.json -> every `bd show` of it fails (and the extra is past its window: still nothing retired on a guess)
@@ -814,10 +916,14 @@ check "no E5 beads: untouched" "REQ=1 IDS=a" "$(printf '%s' "$OUT" | sed -n 3p)"
 
 echo "  · admission (big-diff) and the Step 7 glue:"
 F="$(new_fix admit)"
-mk_git() { # git_rig override returning N diff lines
-  echo "git_rig() { echo \"git_rig \$*\" >> \"\$CALLS\"; if [ -f \"\$FIX/git-fail\" ]; then return 128; fi; seq 1 $1 | sed 's/^/+line /'; }"
+mk_git() { # git_rig override returning N diff lines (BSD `seq 1 0` counts DOWN, so zero is spelled out)
+  echo "git_rig() { echo \"git_rig \$*\" >> \"\$CALLS\"; if [ -f \"\$FIX/git-fail\" ]; then return 128; fi; if [ $1 -gt 0 ]; then seq 1 $1 | sed 's/^/+line /'; fi; }"
 }
-for spec in "$ARM_B_ID:799:none" "$ARM_B_ID:800:big-diff" "$ARM_A_ID:5000:none"; do
+# gate attempt 3, blocking issue 2: the size is a stratification key for BOTH arms, so the admit decision measures the diff for every
+# admitted run — arm A as much as arm B. The trigger (the treatment) stays arm B's alone. Every line below asserts the WHOLE record
+# (arm, trigger, size_state, raw_lines): the old check looked only at the arm and the trigger, and arm A's "size_state=no, raw_lines=''"
+# — an unmeasured diff logged as a measured small one — went through it.
+for spec in "$ARM_B_ID:0:none" "$ARM_B_ID:799:none" "$ARM_B_ID:800:big-diff" "$ARM_B_ID:5000:big-diff" "$ARM_A_ID:0:none" "$ARM_A_ID:799:none" "$ARM_A_ID:800:none" "$ARM_A_ID:5000:none"; do
   IFS=: read -r bead n want <<<"$spec"
   OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 $(mk_git "$n")
@@ -827,18 +933,34 @@ echo "\$GATE_E5_ARM \$GATE_E5_TRIGGER \$GATE_E5_SIZE_STATE \${GATE_E5_RAW_LINES:
 EOF
 )"
   case "$bead" in "$ARM_A_ID") wantarm=A ;; *) wantarm=B ;; esac
-  case "$OUT" in "$wantarm $want "*) ok "admit: $bead ($wantarm) with $n diff lines -> trigger=$want" ;; *) bad "admit: $bead/$n expected trigger $want, got '$OUT'" ;; esac
+  if [ "$n" -ge 800 ]; then wantsize=yes; else wantsize=no; fi
+  check "admit: $bead ($wantarm) with $n diff lines -> arm, trigger, size_state, raw_lines" "$wantarm $want $wantsize $n" "$OUT"
 done
-touch "$F/git-fail"
+# no arm at all (an empty bead id): still measured — the size belongs to the RUN, the arm only to the bead — and never a trigger
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 $(mk_git 900)
-BEAD_ID="$ARM_B_ID"; DEFAULT_BRANCH=main; REQUIRED_REVIEWERS=1
+BEAD_ID=""; DEFAULT_BRANCH=main; REQUIRED_REVIEWERS=1
 gate_e5_admit_decision
-echo "\$GATE_E5_ARM \$GATE_E5_TRIGGER \$GATE_E5_SIZE_STATE"
+echo "\$GATE_E5_ARM \$GATE_E5_TRIGGER \$GATE_E5_SIZE_STATE \${GATE_E5_RAW_LINES:-}"
 EOF
 )"
-check "admit: git diff failing is 'unknown', never 'small' and never a trigger" "B none unknown" "$OUT"
+check "admit: a run whose arm cannot be decided (?) is still measured, and never triggers" "? none yes 900" "$OUT"
+touch "$F/git-fail"
+for bead in "$ARM_B_ID" "$ARM_A_ID"; do
+  OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+$(mk_git 900)
+BEAD_ID="$bead"; DEFAULT_BRANCH=main; REQUIRED_REVIEWERS=1
+gate_e5_admit_decision
+echo "\$GATE_E5_ARM \$GATE_E5_TRIGGER \$GATE_E5_SIZE_STATE [\${GATE_E5_RAW_LINES:-}]"
+EOF
+)"
+  case "$bead" in "$ARM_A_ID") wantarm=A ;; *) wantarm=B ;; esac
+  check "admit: git diff failing is 'unknown' with NO line count (arm $wantarm) — never 'small' and never a trigger" "$wantarm none unknown []" "$OUT"
+done
 rm -f "$F/git-fail"
+check "admit: a run nobody measured is 'unknown' by default, never 'no' (= measured small)" "unknown" "$(run_lib -- <<<'printf "%s" "$GATE_E5_SIZE_STATE"')"
+OUT="$(run_lib GATE_E5_ENABLED=1 QG_LOG="$TMP/city/.gc/quality-gate.jsonl" -- <<<'unset GATE_E5_SIZE_STATE; GATE_RUN_ID=ga-run-u; BEAD_ID=ga-x; BRANCH=b; gate_e5_log_admit "task text" ga-vb0001; jq -r "select(.event==\"e5_admit\" and .gate_run==\"ga-run-u\") | .size_state" "$QG_LOG" | tail -1')"
+check "an admit record written with no size decision logs size_state unknown (not 'no' and not empty)" "unknown" "$OUT"
 OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
 $(mk_git 900)
 BEAD_ID="$ARM_B_ID"; DEFAULT_BRANCH=main; REQUIRED_REVIEWERS=2
@@ -939,6 +1061,12 @@ EOF
 VERDICT_BEAD_IDS=(vb1 vb2)
 gate_collect_verdicts
 printf 'VR=%s ANY=%s NOEVAL=%s JUDGED=%s UNDELIVERED=%s UNREAD=%s EXTRAV=%s\n' "$VERDICTS_RECEIVED" "$ANY_FAIL" "$GATE_FAIL_NO_EVAL" "$GATE_COLLECT_JUDGED_FAILS" "$GATE_E5_EXTRA_UNDELIVERED" "$GATE_E5_EXTRA_UNREADABLE" "$GATE_E5_EXTRA_VERDICT"
+# What the run LOGS must be what it ACTED on (gate attempt 3, blocking issue 1): the e5_run_end line the finalize step writes, read back
+# out of the log, goes to a side file so the one-line output above stays what every check below compares.
+QG_LOG="$CITYDIR/collect2-qg.jsonl"; rm -f "$QG_LOG"
+GATE_RUN_ID=ga-run-x; BEAD_ID=ga-b; OVERALL_VERDICT=$([ "$ANY_FAIL" = "1" ] && echo FAIL || echo PASS); REQUIRED_REVIEWERS=2
+gate_e5_log_run_end
+{ [ -s "$QG_LOG" ] && jq -r 'select(.event=="e5_run_end") | .extra_verdict' "$QG_LOG" | tail -1; } > "$CITYDIR/collect2.logged" || true
 EOF
   } > "$f"
   env -i HOME="$HOME" PATH="$PATH" CITYDIR="$TMP/city" LIBFILE="$LIB" VB1="$1" VB2="$2" VB2C="$3" "$BASH32" "$f" 2>"$TMP/collect.err"
@@ -955,7 +1083,24 @@ OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" FAILREAD)"
 check "R1 PASS + extra closed, its comments UNREADABLE: not a FAIL, not counted, and NOT 'undelivered' (unknown — the hook must not retire it on this)" "VR=1 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=0 UNREAD=1 EXTRAV=UNREADABLE" "$OUT"
 # (the same extra read fine on the next sweep is the label-race case two checks below: its FAIL comment counts — nothing was erased)
 OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[{"text":"VERDICT: FAIL\nBlocking issue 1: real defect in a.sh:3"}]')"
-check "R1 PASS + extra closed with a FAIL *comment* but no label (label race): the delivered FAIL counts" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 UNREAD=0 EXTRAV=NONE" "$OUT"
+# gate attempt 3, blocking issue 1: this case PASSED with EXTRAV=NONE — the test's own title said "the delivered FAIL counts", and the
+# run did count it (ANY=1 JUDGED=1, its text goes to the builder) while the variable the log and the apuração read said it delivered nothing.
+check "R1 PASS + extra closed with a FAIL *comment* but no label (label race): the delivered FAIL counts — and is recorded as FAIL, not NONE" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 UNREAD=0 EXTRAV=FAIL" "$OUT"
+check "...and the e5_run_end line the finalize step WRITES says FAIL (what the run acted on is what it logged)" FAIL "$(cat "$TMP/city/collect2.logged")"
+OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[{"text":"VERDICT: PASS\nSummary: fine"}]')"
+check "R1 PASS + extra closed with a PASS *comment* but no label (label race): a delivered PASS, recorded as PASS" "VR=2 ANY=0 NOEVAL=0 JUDGED=0 UNDELIVERED=0 UNREAD=0 EXTRAV=PASS" "$OUT"
+check "...and the e5_run_end line says PASS" PASS "$(cat "$TMP/city/collect2.logged")"
+# the label/comment combinations, each against what the run acted on: the log must agree in EVERY one of them
+logged_case() { # logged_case <label> <vb2 json> <vb2 comments> <expected EXTRAV and logged value>
+  local o; o="$(collect_case2 "$V1P" "$2" "$3")"
+  check "$1: the verdict the run acted on" "$4" "$(printf '%s' "$o" | sed 's/.*EXTRAV=//')"
+  check "$1: the verdict the log records" "$4" "$(cat "$TMP/city/collect2.logged")"
+}
+logged_case "label FAIL, PASS comment (the label wins, as it does for the run)" "$V2_FAIL" '[{"text":"VERDICT: PASS\nSummary: fine"}]' FAIL
+logged_case "label PASS, FAIL comment (the label wins)" "$V2_PASS" '[{"text":"VERDICT: FAIL\nBlocking issue 1: x"}]' PASS
+logged_case "no label, no comment" "$V2_NOVERDICT" '[]' NONE
+logged_case "no label, comments unreadable" "$V2_NOVERDICT" FAILREAD UNREADABLE
+logged_case "no label, an unrelated comment only" "$V2_NOVERDICT" '[{"text":"working on it"}]' NONE
 OUT="$(collect_case2 "$V1P" "$V2_FAIL" '[{"text":"VERDICT: FAIL\nBlocking issue 1: real defect in a.sh:3"}]')"
 check "R1 PASS + extra delivered FAIL: the run FAILs (an extra can add a rejection)" "VR=2 ANY=1 NOEVAL=0 JUDGED=1 UNDELIVERED=0 UNREAD=0 EXTRAV=FAIL" "$OUT"
 OUT="$(collect_case2 "$V1P" "$V2_PASS" '[]')"
@@ -1062,22 +1207,28 @@ EOF
   printf '%s\n' "$S6"; printf '%s\n' "$S7"
   cat <<'EOF'
 echo "ACTIVE=$GATE_E5_ACTIVE ARM=$GATE_E5_ARM TRIGGER=$GATE_E5_TRIGGER COV=${#GATE_E5_COV_RULES} RUNDESC=[${GATE_E5_RUN_DESC_LINE//$'\n'/|}]"
+echo "SIZE=$GATE_E5_SIZE_STATE RAW=${GATE_E5_RAW_LINES:-}"
 EOF
 } > "$TMP/step.sh"
 }
 build_step_sh
-step_run() { # step_run <flag at Step 5> <flag at Step 7> <bead>
-  env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" GC_CITY="$TMP/city" LIBFILE="$LIB" F5="$1" F7="$2" BEAD="$3" "$BASH32" "$TMP/step.sh" 2>&1
+step_run() { # step_run <flag at Step 5> <flag at Step 7> <bead> — prints the run's record line; step_size then prints the size line of the LAST run
+  env -i HOME="$HOME" PATH="$PATH" TMPDIR="$TMP" GC_CITY="$TMP/city" LIBFILE="$LIB" F5="$1" F7="$2" BEAD="$3" "$BASH32" "$TMP/step.sh" > "$TMP/step.out" 2>&1
+  grep -v '^SIZE=' "$TMP/step.out"
 }
+step_size() { grep '^SIZE=' "$TMP/step.out" || echo "SIZE=<none: $(head -1 "$TMP/step.out")>"; }
 if [ -n "$S5" ] && [ -n "$S6" ] && [ -n "$S7" ]; then
   OUT="$(step_run 0 0 "$ARM_B_ID")"
   check "flag off throughout: inert — not active, the arm is UNMEASURED (?), no prompt pieces, nothing added to the run record" "ACTIVE=0 ARM=? TRIGGER=none COV=0 RUNDESC=[]" "$OUT"
+  check "flag off: the size was never measured, and the dispatcher's own default says so (unknown — not 'no', which means measured small)" "SIZE=unknown RAW=" "$(step_size)"
   OUT="$(step_run 0 1 "$ARM_B_ID")"
   check "THE RACE: flag off at Step 5, the Mayor turns it on before Step 7 -> the run stays OUT of the experiment (not active, arm ?, nothing logged as arm A)" "ACTIVE=0 ARM=? TRIGGER=none COV=0 RUNDESC=[]" "$OUT"
   OUT="$(step_run 1 1 "$ARM_B_ID")"
   case "$OUT" in "ACTIVE=1 ARM=B TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: B]") ok "flag on at Step 5, arm-B bead: active, arm B measured, prompt pieces set, the run record carries 'e5_arm: B'" ;; *) bad "flag on, arm B: $OUT" ;; esac
+  check "flag on, arm B: the diff (10 lines from the mocked git) is measured at Step 5" "SIZE=no RAW=10" "$(step_size)"
   OUT="$(step_run 1 1 "$ARM_A_ID")"
   case "$OUT" in "ACTIVE=1 ARM=A TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: A]") ok "flag on at Step 5, arm-A bead: active, arm A MEASURED (the only way to read A), record carries 'e5_arm: A'" ;; *) bad "flag on, arm A: $OUT" ;; esac
+  check "flag on, arm A: the diff is measured too — through the dispatcher's real Step 5 block, not 'no' with no line count" "SIZE=no RAW=10" "$(step_size)"
   OUT="$(step_run 1 0 "$ARM_B_ID")"
   case "$OUT" in "ACTIVE=1 ARM=B TRIGGER=none COV="[1-9]*"RUNDESC=[|e5_arm: B]") ok "the inverse race: flag on at Step 5, off before Step 7 -> the run was ADMITTED, so it stays active and gets the same prompt pieces it was logged with" ;; *) bad "inverse race: $OUT" ;; esac
 fi
@@ -1196,6 +1347,73 @@ fi'
   if cmp -s "$TASKLIB" "$TMP/tasklib.mut.sh"; then bad "task-lib mutation did not apply"; else
     M_OFF="$(render_task off bead "$TMP/tasklib.mut.sh")"
     [ "$M_OFF" != "$TASK_STRIPPED" ] && ok "mutation 'token leaves a stray line when empty' is caught by the byte-identity assertion" || bad "stray-newline mutation survived the byte-identity assertion"
+  fi
+
+  # gate attempt 3 — each of these re-introduces ONE of the defects the gate found (or one of its siblings), and the suite must go red.
+  # (1) blocking issue 1: the comment-rescue branches stop recording the verdict they acted on.
+  FN_COLLECT_SAVE="$FN_COLLECT"
+  FN_COLLECT="$(printf '%s\n' "$FN_COLLECT_SAVE" | grep -v 'a rescued FAIL is a DELIVERED FAIL')"
+  if [ "$FN_COLLECT" = "$FN_COLLECT_SAVE" ]; then bad "rescued-FAIL mutation did not apply (the anchor comment moved)"; else
+    OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[{"text":"VERDICT: FAIL\nBlocking issue 1: real defect in a.sh:3"}]')"
+    case "$OUT" in *"ANY=1"*"EXTRAV=FAIL") bad "mutation 'the rescued FAIL is not recorded' survived" ;; *"ANY=1"*) ok "mutation 'the rescued FAIL is not recorded' is caught: the run still FAILs on it (ANY=1) but logs EXTRAV=${OUT##*EXTRAV=}" ;; *) bad "rescued-FAIL mutant: unexpected output '$OUT'" ;; esac
+  fi
+  FN_COLLECT="$(printf '%s\n' "$FN_COLLECT_SAVE" | grep -v 'a rescued PASS is a DELIVERED PASS')"
+  if [ "$FN_COLLECT" = "$FN_COLLECT_SAVE" ]; then bad "rescued-PASS mutation did not apply (the anchor comment moved)"; else
+    OUT="$(collect_case2 "$V1P" "$V2_NOVERDICT" '[{"text":"VERDICT: PASS\nSummary: fine"}]')"
+    case "$OUT" in *"EXTRAV=PASS") bad "mutation 'the rescued PASS is not recorded' survived" ;; *) ok "mutation 'the rescued PASS is not recorded' is caught (EXTRAV=${OUT##*EXTRAV=})" ;; esac
+  fi
+  FN_COLLECT="$FN_COLLECT_SAVE"
+  # (2) blocking issue 2: the admit decision returns before measuring unless the bead is arm B / "not measured" is read as "no".
+  admit_with() { # admit_with <lib> <bead> <diff lines> -> "ARM TRIGGER SIZE [RAW]"
+    env -i PATH="$PATH" GC_CITY="$TMP/city" "$BASH32" -c "set -euo pipefail; warn() { :; }; git_rig() { if [ -f '$TMP/git-fail-m' ]; then return 128; fi; seq 1 $3 | sed 's/^/+l /'; }; BEAD_ID='$2'; DEFAULT_BRANCH=main; BRANCH=crew/x/ga-demo; REQUIRED_REVIEWERS=1; source '$1'; gate_e5_admit_decision; echo \"\$GATE_E5_ARM \$GATE_E5_TRIGGER \$GATE_E5_SIZE_STATE [\${GATE_E5_RAW_LINES:-}]\""
+  }
+  check "control: the real admit measures an arm-A run (5000 lines)" "A none yes [5000]" "$(admit_with "$LIB" "$ARM_A_ID" 5000)"
+  awk '{ print } /^  GATE_E5_SIZE_STATE="unknown"; GATE_E5_RAW_LINES=""; GATE_E5_TRIGGER="none"$/ { print "  [ \"$GATE_E5_ARM\" = \"B\" ] || return 0" }' "$LIB" > "$TMP/lib.mut3"
+  if cmp -s "$LIB" "$TMP/lib.mut3"; then bad "measure-only-arm-B mutation did not apply"; else
+    R="$(admit_with "$TMP/lib.mut3" "$ARM_A_ID" 5000)"
+    [ "$R" != "A none yes [5000]" ] && ok "mutation 'measure the diff only for arm B' is caught: arm A then logs '$R'" || bad "measure-only-arm-B mutant survived"
+  fi
+  cp "$LIB" "$TMP/lib.mut3"; sed -i.bak 's/GATE_E5_SIZE_STATE="unknown"/GATE_E5_SIZE_STATE="no"/' "$TMP/lib.mut3"
+  touch "$TMP/git-fail-m"; R="$(admit_with "$TMP/lib.mut3" "$ARM_A_ID" 5000)"; R0="$(admit_with "$LIB" "$ARM_A_ID" 5000)"; rm -f "$TMP/git-fail-m"
+  [ "$R0" = "A none unknown []" ] && [ "$R" != "$R0" ] && ok "mutation 'an unmeasured size defaults to no' is caught: a failed diff then logs '$R' instead of '$R0'" || bad "unmeasured-defaults-to-no mutant survived (real='$R0' mutant='$R')"
+  # (3) the failed-create readback, the session recovery and the cap's writable-directory check.
+  cp "$LIB" "$TMP/lib.mut4"; sed -i.bak 's/_found=\$(gate_e5_find_extra_bead "\$_run") || _frc=\$?/_found=""; _frc=0/' "$TMP/lib.mut4"
+  if cmp -s "$LIB" "$TMP/lib.mut4"; then bad "no-readback mutation did not apply"; else
+    F="$(new_fix mutreadback)"; show_bead "$F" "$ARM_B_ID" '[]'; touch "$F/create-fail"
+    echo '[{"id":"ga-orphan1","labels":["e5-extra"]}]' > "$F/list.json"
+    LIB="$TMP/lib.mut4"
+    OUT="$(scn "$F" GATE_E5_ENABLED=1 -- <<EOF
+BEAD_ID="$ARM_B_ID"
+$HOOK_COMMON
+gate_e5_phase_c_hook
+echo "REQ=\$REQUIRED_REVIEWERS N=\${#VERDICT_BEAD_IDS[@]}"
+EOF
+)"
+    LIB="$LIB_SAVE"
+    [ "$OUT" = "REQ=1 N=1" ] && ok "mutation 'take a failed create at its word' is caught: the existing bead is declared absent and the run is left with an orphan slot" || bad "no-readback mutant survived (got '$OUT')"
+  fi
+  cp "$LIB" "$TMP/lib.mut5"; sed -i.bak 's/_close_sid="\$_meta_sid"/_close_sid=""/' "$TMP/lib.mut5"
+  if cmp -s "$LIB" "$TMP/lib.mut5"; then bad "no-session-recovery mutation did not apply"; else
+    F="$(new_fix mutsess)"; show_bead "$F" "$ARM_B_ID" '[]'; jq -n '[{id:"ga-newvb1",status:"open",labels:["e5-extra"]}]' > "$F/show-ga-newvb1.json"
+    vbj="${EXTRA_OPEN_META/__CREATED__/$(iso_ago 1850)}"
+    LIB="$TMP/lib.mut5"
+    scn "$F" GATE_E5_ENABLED=1 -- >/dev/null <<EOF
+BEAD_ID="$ARM_B_ID"
+GATE_E5_RUN_VB_JSON='$vbj'; VB_JSON="\$CLOBBERED_VB_JSON"
+VERDICT_BEAD_IDS=(ga-vb0001 ga-newvb1); SESSION_IDS=(rev-sess-1 ""); REQUIRED_REVIEWERS=2
+VERDICTS_RECEIVED=1; ANY_FAIL=1; GATE_FAIL_NO_EVAL=0; GATE_COLLECT_JUDGED_FAILS=1
+PC_ELAPSED=2850; PC_TIMEOUT_SECS=1800; PC_TIMEOUT_MIN=30
+gate_e5_phase_c_hook
+EOF
+    LIB="$LIB_SAVE"
+    grep -q 'session close gate-reviewer-adhoc-new1' "$F/calls.log" && bad "no-session-recovery mutant survived" || ok "mutation 'ignore the session recorded on the bead' is caught: the pinned extra session is left open"
+  fi
+  cp "$LIB" "$TMP/lib.mut6"; sed -i.bak '/^gate_e5_cap_state()/,/^}/ { /-w "\${_f%\/\*}"/d; }' "$TMP/lib.mut6"
+  if cmp -s "$LIB" "$TMP/lib.mut6"; then bad "cap writable-check mutation did not apply"; else
+    chmod 555 "$TMP/ro-city/.gc"
+    R="$(env -i PATH="$PATH" GC_CITY="$TMP/ro-city" "$BASH32" -c "set -euo pipefail; source '$TMP/lib.mut6'; gate_e5_cap_state")"
+    chmod 755 "$TMP/ro-city/.gc"
+    [ "$R" = "ok" ] && ok "mutation 'no writable-directory check on the cap' is caught: an uncountable spend reads 'ok' ($R)" || bad "cap mutant survived (got '$R')"
   fi
 fi
 

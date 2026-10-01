@@ -10364,17 +10364,17 @@ gate_collect_verdicts() {
     if [ "$VB_STATUS" = "closed" ]; then
       VERDICTS_RECEIVED=$((VERDICTS_RECEIVED + 1))
       gate_check_verdict_identity_link "$VB"
-      case " $VB_LABELS " in
-        *" e5-extra "*)
-          case " $VB_LABELS " in
-            *" verdict:PASS "*) GATE_E5_EXTRA_VERDICT="PASS" ;;
-            *" verdict:FAIL "*) GATE_E5_EXTRA_VERDICT="FAIL" ;;
-            *)                  GATE_E5_EXTRA_VERDICT="NONE" ;;
-          esac ;;
-      esac
+      # ga-syxaki (E5, gate attempt 3, blocking issue 1): GATE_E5_EXTRA_VERDICT — what e5_run_end logs and the apuração files the run
+      # under — is set INSIDE every branch below that decides what the extra's verdict WAS (label PASS / label FAIL / PASS comment /
+      # FAIL comment / no verdict / unreadable), at the exact place ANY_FAIL, VERDICTS_RECEIVED and FAIL_REASONS are decided. It used to be
+      # derived from the label alone in a separate `case` above, so the two comment-rescue branches (label lost the race, comment landed)
+      # counted a delivered FAIL and sent its text to the builder while the log said NONE: the variable decided on was not the variable
+      # acted on. Only ever written for the extra slot (_e5x=1); a normal reviewer leaves it "-".
       if echo "$VB_LABELS" | grep "verdict:PASS" >/dev/null; then
+        if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="PASS"; fi
         : # explicit PASS — continue
       elif echo "$VB_LABELS" | grep "verdict:FAIL" >/dev/null; then
+        if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="FAIL"; fi
         ANY_FAIL=1
         _judged_fails=$((_judged_fails + 1))  # ga-w7pm55: an explicit verdict:FAIL is a judgment, even with an empty reason
         # Collect the fail reason from the reviewer's verdict comment.
@@ -10438,6 +10438,7 @@ gate_collect_verdicts() {
         if [ -n "$PASS_COMMENT" ]; then
           VERDICTS_RECEIVED=$VERDICTS_RECEIVED  # already counted at the closed branch
           log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:PASS label but its verdict COMMENT is an explicit PASS — rescuing as PASS (ga-86l90a8 label-race). comment=$(printf '%s' "$PASS_COMMENT" | tr '\n' ' ' | cut -c1-200)"
+          if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="PASS"; fi   # ga-syxaki (E5): a rescued PASS is a DELIVERED PASS (see the note at the closed branch)
           : # treat as PASS — do NOT set ANY_FAIL
         else
           # Any other label (TIMEOUT, ABORTED, or missing verdict label) → FAIL.
@@ -10488,6 +10489,7 @@ gate_collect_verdicts() {
           elif [ -n "$FAIL_COMMENT" ]; then
             ANY_FAIL=1
             _judged_fails=$((_judged_fails + 1))
+            if [ "$_e5x" = "1" ]; then GATE_E5_EXTRA_VERDICT="FAIL"; fi   # ga-syxaki (E5): a rescued FAIL is a DELIVERED FAIL — it is in FAIL_REASONS and in the union below, so the log must say so
             log "  Reviewer $((j+1)) (bead $VB) closed WITHOUT a verdict:FAIL label but its verdict COMMENT is an explicit FAIL — counting as a real reviewer rejection (ga-w7pm55, mirror of the ga-86l90a8 PASS rescue). comment=$(printf '%s' "$FAIL_COMMENT" | tr '\n' ' ' | cut -c1-200)"
             FAIL_REASONS="${FAIL_REASONS}Reviewer $((j+1)) FAIL: $FAIL_COMMENT\n"
             GATE_E5_FAIL_IDX+=("$((j+1))"); GATE_E5_FAIL_TXT+=("$FAIL_COMMENT")
@@ -15413,7 +15415,7 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # between the two log an unmeasured run as a measured arm-A run). An arm nobody measured is "?", never "A". Flag off ->
 # this block is one string test and nothing else.
 # SELFTEST-EXTRACT e5-admit-step5: BEGIN
-GATE_E5_ARM="?"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="no"; GATE_E5_RAW_LINES=""; GATE_E5_ACTIVE=0
+GATE_E5_ARM="?"; GATE_E5_TRIGGER="none"; GATE_E5_SIZE_STATE="unknown"; GATE_E5_RAW_LINES=""; GATE_E5_ACTIVE=0   # "not measured" is "unknown", never "no" (= measured small)
 if [ "${GATE_E5_LIB_OK:-0}" = "1" ] && [ "$(gate_e5_enabled)" = "1" ]; then
   GATE_E5_ACTIVE=1
   gate_e5_admit_decision || true
