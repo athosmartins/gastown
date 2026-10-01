@@ -47,7 +47,7 @@ for a in sorted(per_alias):
 print(f"    crew-members with ZERO sessions in the window: {sorted(a for a in ('batista-wa','digo-wa','mila-wa','oracle-wa','peter-wa','thies-wa') if a not in per_alias)}")
 
 # ---- (2) ceiling on the branch sample, straight from the gate log
-first_event, first_verdict, bad = {}, {}, 0
+first_event, first_verdict, bad, no_dry = {}, {}, 0, 0
 for line in GATE.read_text(errors="replace").splitlines():
     try:
         r = json.loads(line)
@@ -58,10 +58,13 @@ for line in GATE.read_text(errors="replace").splitlines():
     if not b.startswith("crew/") or not r.get("ts"):
         continue
     first_event.setdefault(b, r["ts"])
-    if r.get("event") == "dispatcher_complete" and str(r.get("dry_run")) in ("0", "false", "False", "") \
-            and r.get("result") in ("PASS", "FAIL"):
-        first_verdict.setdefault(b, (r["ts"], r["result"]))
-print(f"\n(2) gate log: {len(first_event)} crew/* branches ever seen, {bad} unreadable lines (ignored, counted)")
+    if r.get("event") == "dispatcher_complete" and r.get("result") in ("PASS", "FAIL"):
+        if r.get("dry_run") is None:
+            no_dry += 1       # field absent (or null): real run or rehearsal is UNKNOWN - not a real verdict, and not dropped silently either
+        elif str(r.get("dry_run")) in ("0", "false", "False", ""):
+            first_verdict.setdefault(b, (r["ts"], r["result"]))
+print(f"\n(2) gate log: {len(first_event)} crew/* branches ever seen, {bad} unreadable lines (ignored, counted), "
+      f"{no_dry} verdicts without dry_run (real run or rehearsal UNKNOWN: kept out of the sample, counted)")
 rows = []
 for b, ts in first_event.items():
     who = b.split("/")[1]

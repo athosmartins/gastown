@@ -29,8 +29,17 @@ Como uma sessão vira bead (tentativas, em ordem de confiança):
   * sessão de pool sem nenhum claim = SPAWN OCIOSO (achou a fila vazia e saiu). É custo real e fica numa linha própria; não é
     "custo de bead zero".
 
-Três estados, nunca colapsados: claim com resultado ok / claim que FALHOU (não conta) / claim sem resultado visível (conta e é
-sinalizado); modelo SEM preço = tokens contados, US$ "não precificado" (nunca US$ 0); bead sem sessão de construtor no ledger =
+Quatro estados de um claim, nunca colapsados — o que o RESULTADO do comando diz sobre CADA id que ele reivindicou:
+  ok            o bd confirma ESTE id ("Updated issue: <id>"): é o bead.
+  failed        erro e nenhuma confirmação deste id: não conta (`claims_failed`).
+  unconfirmed   resultado VISÍVEL que não confirma nada (comando que só CITA `bd update <id> --claim`: heredoc, echo, mensagem de commit;
+                saída cortada por `| head`; formato novo): NÃO é claim e não abre bucket (`claims_unconfirmed`). Antes virava claim vivo e a
+                sessão inteira passava para o bead fantasma (real: 75 de 103 respostas da sessão aa9cc819).
+  noresult      NENHUM resultado no transcrito (cortado, ou sessão em curso): conta, sinalizado (ok=None).
+Dois claims num comando (`bd update A --claim && bd update B --claim`) têm UM tool_use id e um resultado só: cada um recebe o seu estado
+pelo id que o resultado nomeia, e as respostas depois deles (mesmo instante) vão para um bucket de GRUPO, rateado igual — nenhum fica
+com custo 0 por ter sido pedido junto com outro. Um comando de claim NÃO é "referência" a bead (um claim perdido não atribui a sessão).
+Modelo SEM preço = tokens contados, US$ "não precificado" (nunca US$ 0); bead sem sessão de construtor no ledger =
 "construtor não medido" (nunca custo zero).
 Isso vale em TODAS as seções do relatório, não só na 1: um bead com QUALQUER token de modelo sem preço (construtor, revisor ou
 pré-revisão) tem custo n/p — a soma dos tokens que TÊM preço é um piso, não o custo, e nunca entra numa média, num CV nem num
@@ -66,7 +75,7 @@ CITY = Path(os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-
 LEDGER = Path(os.environ.get("BTM_LEDGER") or CITY / ".gc" / "token-ledger" / "sessions.jsonl")
 GATE_LOG = Path(os.environ.get("BTM_GATE_LOG") or CITY / ".gc" / "quality-gate.jsonl")
 PROJECTS = [Path(p) for p in (os.environ.get("BTM_PROJECTS") or os.path.expanduser("~/.claude/projects")).split(":") if p]
-SCHEMA = 2
+SCHEMA = 3     # 3 = claims revalidados contra o resultado visível (unconfirmed/failed fora), 1 pending por (tool_use, bead), bucket de grupo; linha v<3 é reescaneada
 AWS = os.environ.get("BTM_AWS") or "aws"
 S3_BUCKET = os.environ.get("BTM_S3_BUCKET") or "urblink-claude-history-backup"
 
@@ -99,6 +108,10 @@ REVIEW_HEADER = re.compile(r"QUALITY GATE REVIEW\s+—\s+You are reviewer \d+ of
 ID_TOKEN = re.compile(r"^[a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*$")
 REF_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?(?:show|comments?|heartbeat|close|label|update|reopen)\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)\b")
 UPDATE_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?update\b([^;&|\n]*)")
+UPDATED_ISSUE = re.compile(r"Updated issue:?\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)(?![A-Za-z0-9-]|\.\d)")   # o bd imprime "✓ Updated issue: <id> — <título>"
+CLAIM_ERR = re.compile(r"(?i)\b(error|already|failed|not found)\b")
+RC_FORMAT_ALARM = 5   # exit do `harvest` quando o transcrito parece ter mudado de formato (o ledger foi escrito)
+GROUP = "_grp:"       # bucket de claims no MESMO instante: "_grp:<id>,<id>" (rateio igual entre eles, como o `_pre`)
 USAGE_KEYS = ("inp", "out", "cw5", "cw1", "cr", "think", "msgs")
 CTX_CAPS = (150_000, 250_000, 350_000)   # tetos hipotéticos de contexto por turno (tokens): quanto da leitura de cache está ACIMA deles
 
@@ -199,6 +212,26 @@ def claim_target(cmd):
     return out
 
 
+def claim_spans(cmd):
+    """(início, fim) de cada `bd update ... --claim` num comando: o que está dentro é CLAIM, não referência a bead."""
+    return [(m.start(), m.end()) for m in UPDATE_CMD.finditer(cmd) if "--claim" in m.group(1)]
+
+
+def claim_outcome(bead, n_claims, txt, is_error):
+    """O que o RESULTADO VISÍVEL de um comando diz sobre UM dos claims dele -> "ok" | "failed" | "unconfirmed".
+    ok: o bd confirma ESTE id — vale mesmo que outro claim do mesmo comando tenha falhado (`A && B`: A foi feito) e vale antes da regex de
+    erro (o título do bead pode ter a palavra "error"). failed: erro e nenhuma confirmação deste id. unconfirmed: resultado visível que não
+    confirma nada — o comando só CITOU o claim, ou a saída veio cortada. Resultado AUSENTE não passa por aqui (é "noresult", no scan)."""
+    named = UPDATED_ISSUE.findall(txt)
+    if bead in named:
+        return "ok"
+    if not named and "Updated issue" in txt and n_claims == 1 and not is_error:
+        return "ok"           # formato sem o id: só dá para atribuir quando o comando tinha UM claim só
+    if is_error or CLAIM_ERR.search(txt):
+        return "failed"
+    return "unconfirmed"
+
+
 def all_strings(obj, depth=0):
     """Todas as strings de um registro JSON (o cabeçalho da revisão chega dentro de um tool_result ou de um nudge, não só no 1º prompt)."""
     if depth > 6:
@@ -252,8 +285,9 @@ def scan_session(main):
     cwd = None
     msgs = {}                 # message.id -> dict(ts, model, effort, use)
     dup_lines = 0
-    pending = {}              # tool_use id -> (bead, ts) esperando o resultado do claim
-    claims = []               # dict(bead, ts, ok)
+    pending = {}              # tool_use id -> [(bead, ts), ...]: os claims de UM comando Bash, à espera do resultado dele (um id, vários claims)
+    noid = 0                  # tool_use sem id: chave própria e crescente (len(pending) colide depois que um resultado libera uma chave)
+    claims = []               # dict(bead, ts, state): ok | failed | unconfirmed | noresult
     refs, ref_first = Counter(), {}   # bead -> nº de comandos `bd <verbo> <id>`; fallback p/ worker com bead JÁ atribuído (sem --claim)
     bad = 0
     no_usage = set()
@@ -303,23 +337,27 @@ def scan_session(main):
                     if isinstance(c, list) and pending:
                         for b in c:
                             if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in pending:
-                                bead, ts = pending.pop(b["tool_use_id"])
-                                txt = tool_text(b)
-                                if "Updated issue" in txt and not b.get("is_error"):
-                                    ok = True
-                                elif b.get("is_error") or re.search(r"(?i)\b(error|already|failed|not found)\b", txt):
-                                    ok = False
-                                else:
-                                    ok = None
-                                claims.append(dict(bead=bead, ts=ts, ok=ok))
+                                items = pending.pop(b["tool_use_id"])
+                                txt, is_err = tool_text(b), bool(b.get("is_error"))
+                                for bead, ts in items:          # um resultado, um estado POR claim do comando
+                                    claims.append(dict(bead=bead, ts=ts, state=claim_outcome(bead, len(items), txt, is_err)))
                 elif t == "assistant":
                     msg = r.get("message") or {}
                     for b in msg.get("content") or []:
                         if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Bash":
                             cmd = (b.get("input") or {}).get("command") or ""
-                            for bead in claim_target(cmd):
-                                pending[b.get("id") or f"noid-{len(pending)}"] = (bead, r.get("timestamp") or "")
+                            targets = list(dict.fromkeys(claim_target(cmd)))
+                            if targets:
+                                tid = b.get("id")
+                                if not tid:
+                                    noid += 1
+                                    tid = f"noid-{noid}"
+                                have = pending.setdefault(tid, [])       # o mesmo tool_use repetido ENQUANTO espera o resultado não duplica o claim
+                                have += [(bead, r.get("timestamp") or "") for bead in targets if bead not in [x[0] for x in have]]
+                            spans = claim_spans(cmd)
                             for rm in REF_CMD.finditer(cmd):
+                                if any(a <= rm.start() < z for a, z in spans):
+                                    continue                              # o claim é atribuição POR CLAIM (com resultado), nunca referência
                                 refs[rm.group(1)] += 1
                                 ref_first.setdefault(rm.group(1), r.get("timestamp") or "")
                     mid = msg.get("id")
@@ -337,25 +375,35 @@ def scan_session(main):
                         for k, v in use.items():     # mesma resposta repetida por bloco: o uso é monotônico, vale o maior
                             if v > rec["use"][k]:
                                 rec["use"][k] = v
-    for bead, ts in pending.values():               # claim sem resultado visível: conta, sinalizado (ok=None)
-        claims.append(dict(bead=bead, ts=ts, ok=None))
-    for c in claims:
-        c["via"] = "claim"
-    live = sorted((c for c in claims if c["ok"] is not False and c["ts"]), key=lambda c: c["ts"])
+    for items in pending.values():                  # NENHUM resultado no transcrito (cortado / sessão em curso): conta, sinalizado (ok=None)
+        for bead, ts in items:
+            claims.append(dict(bead=bead, ts=ts, state="noresult"))
+    # só `ok` (resultado confirma) e `noresult` (não há resultado para contradizer) são claims. Resultado VISÍVEL que não confirma
+    # (`unconfirmed`) e o que falhou (`failed`) ficam de fora, cada um com a sua contagem: nenhum dos dois toma o bucket de ninguém.
+    eligible = [dict(c, ok=True if c["state"] == "ok" else None, via="claim") for c in claims if c["state"] in ("ok", "noresult")]
+    live = sorted((c for c in eligible if c["ts"]), key=lambda c: c["ts"])
     # um claim sem timestamp não dá para ordenar entre as mensagens: fica de fora de `live`, mas CONTADO. Um worker de pool cai então
     # no fallback por referência logo abaixo (atribuição menos firme, via=ref — `bd update <id>` também casa REF_CMD); crew não tem
     # fallback e fica sem bead. Sem a contagem, "não achei claim" e "achei mas não consegui posicionar" seriam indistinguíveis.
-    untimed = sum(1 for c in claims if c["ok"] is not False and not c["ts"])
+    untimed = sum(1 for c in eligible if not c["ts"])
     role = role_of(alias, first_text, bool(REVIEW_HEADER.search(first_text)))
     if not live and role in POOL_BUILDERS and refs:
         # worker com bead JÁ atribuído (sling/Pilot): não há claim. O bead é o mais citado em `bd show|comment|heartbeat|close…`.
         top = sorted(refs, key=lambda b: (-refs[b], ref_first[b]))[0]
         live = [dict(bead=top, ts=ref_first[top], ok=None, via="ref")]
-    failed = sum(1 for c in claims if c["ok"] is False)
+    failed = sum(1 for c in claims if c["state"] == "failed")
+    unconfirmed = sum(1 for c in claims if c["state"] == "unconfirmed")
     ordered = sorted(((m["ts"], mid, m) for mid, m in msgs.items()), key=lambda x: (x[0], x[1]))
     buckets = defaultdict(lambda: defaultdict(lambda: {k: 0 for k in USAGE_KEYS}))
     days = defaultdict(lambda: defaultdict(lambda: {k: 0 for k in USAGE_KEYS}))   # dia UTC da MENSAGEM x modelo|effort (janela exata)
     days_ctx = defaultdict(lambda: defaultdict(lambda: {str(c): 0 for c in CTX_CAPS}))   # dia -> modelo -> teto -> tokens de cache-read ACIMA do teto
+    slots = []                # (instante, [beads]) em ordem: claims no MESMO instante (um comando com 2 claims) dividem o bucket
+    for c in live:
+        if slots and slots[-1][0] == c["ts"]:
+            if c["bead"] not in slots[-1][1]:
+                slots[-1][1].append(c["bead"])
+        else:
+            slots.append((c["ts"], [c["bead"]]))
     synthetic = 0
     untimed_msgs = 0
     for ts, mid, m in ordered:
@@ -365,9 +413,9 @@ def scan_session(main):
         if not ts:
             untimed_msgs += 1                        # sem timestamp não dá para posicioná-la entre os claims: cai no `_pre` (overhead de partida) e no dia "?"; CONTADA, não calada
         key = "_pre"
-        for c in live:
-            if c["ts"] <= ts:
-                key = c["bead"]
+        for sts, sbeads in slots:
+            if sts <= ts:
+                key = sbeads[0] if len(sbeads) == 1 else GROUP + ",".join(sorted(sbeads))
             else:
                 break
         for cap in CTX_CAPS:
@@ -387,7 +435,7 @@ def scan_session(main):
                 size=size, mtime_ns=mtime_ns, fp=fingerprint(main), msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
                 bad_lines=bad, no_usage=len(no_usage), claims_untimed=untimed, msgs_untimed=untimed_msgs, lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
-                refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed,
+                refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed, claims_unconfirmed=unconfirmed,
                 buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
                 days_ctx={d: {mo: dict(cc) for mo, cc in v.items()} for d, v in days_ctx.items()})
 
@@ -460,7 +508,7 @@ def cmd_harvest(a):
     rows, bad_ledger = load_ledger(path)
     preserve_unreadable(path, bad_ledger)
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
-    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = 0
+    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = unconfirmed = 0
     for proj in PROJECTS:
         for f in sorted(proj.glob("*/*.jsonl")):
             try:
@@ -482,6 +530,7 @@ def cmd_harvest(a):
             no_usage += rec["no_usage"]
             untimed += rec["claims_untimed"]
             untimed_msgs += rec["msgs_untimed"]
+            unconfirmed += rec["claims_unconfirmed"]
             if rec["lines"] >= 30:
                 big += 1
                 if rec["msgs"] == 0:
@@ -491,6 +540,13 @@ def cmd_harvest(a):
             else:
                 unchanged += 1
     write_ledger(rows, path)
+    # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
+    # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
+    # O wrapper do order corta a linha de log em 500 caracteres: o alarme é a PRIMEIRA linha (o corte joga fora o fim, não o começo) e o
+    # exit é ≠ 0 (o order e o teste de produção enxergam). O ledger já foi escrito: o alarme não perde a colheita.
+    alarm = suspect >= 2 and suspect * 4 >= big
+    if alarm:
+        print(f"⚠ ALARME: {suspect} de {big} sessões com ≥30 linhas vieram com 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
     print(f"harvest: {scanned} sessões (re)escaneadas, {unchanged} inalteradas, {skipped_old} fora da janela, "
           f"{vanished} sumiram no meio; ledger={len(rows)} sessões (linhas ilegíveis no ledger: {bad_ledger}) "
           f"em {time.time() - t0:.1f}s -> {path}")
@@ -500,14 +556,13 @@ def cmd_harvest(a):
     if untimed:
         print(f"⚠ {untimed} claims sem timestamp nas sessões escaneadas: não dá para posicioná-los entre as mensagens, então ficam FORA da "
               f"atribuição por claim (worker de pool cai na referência mais citada — menos firme; crew fica sem bead)")
+    if unconfirmed:
+        print(f"⚠ {unconfirmed} claims com resultado visível que NÃO confirma nas sessões escaneadas (comando que só citou `bd update --claim`, ou saída "
+              f"cortada): ficam FORA da atribuição por claim")
     if untimed_msgs:
         print(f"⚠ {untimed_msgs} respostas sem timestamp nas sessões escaneadas: não dá para posicioná-las entre os claims (entram no overhead de "
               f"partida da sessão) nem num dia — o `report` as conta em TODAS as janelas e avisa")
-    # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
-    # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
-    if suspect >= 2 and suspect * 4 >= big:
-        print(f"⚠ {suspect} de {big} sessões com ≥30 linhas vieram com 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
-    return 0
+    return RC_FORMAT_ALARM if alarm else 0
 
 
 def s3_list(since_day):
@@ -716,12 +771,32 @@ def _report(a, result):
         return 2, {"error": "sem sessões na janela", "from_day": since_day}
     oldest = min(parse_ts(s["first_ts"]) for s in rows.values() if s.get("first_ts"))
     gate_runs, bridge, gate_bad = load_gate(a.gate_log)
-    result.update(from_day=since_day, ledger_oldest=oldest.isoformat(), sessions=len(sess))
+    result.update(from_day=since_day, ledger_oldest=oldest.isoformat(), sessions=len(sess), ledger_unreadable_lines=bad_ledger)
     pool_floor = min((s["first_ts"] for s in rows.values() if s["role"] in POOL_BUILDERS and s.get("first_ts")), default=None)
-    if pool_floor and since_day <= pool_floor[:10]:
+    window_incomplete = bool(pool_floor and since_day <= pool_floor[:10])
+    result.update(pool_floor=pool_floor, window_incomplete=window_incomplete)       # o --json não pode ter menos avisos que o texto
+    if window_incomplete:
         print(f"⚠ JANELA INCOMPLETA: começa em {since_day} mas o 1º transcrito de pool no ledger é de {pool_floor[:16]}Z — os dias antes de "
               f"{(parse_ts(pool_floor) + dt.timedelta(days=1)).strftime('%Y-%m-%d')} subestimam o gasto de pool/revisor (o reaper apaga transcrito "
               f"morto após 24h). Rode `backfill-s3 --since {since_day}` ou comece a janela depois.\n")
+    # DESCONHECIDOS que a colheita grava por sessão: o `harvest` os imprime uma vez, quem lê o relatório (texto OU --json) os vê na janela
+    unk = dict(usage_msgs=sum(s.get("no_usage", 0) for s in sess), transcript_lines_unreadable=sum(s.get("bad_lines", 0) for s in sess),
+               claims_untimed=sum(s.get("claims_untimed", 0) for s in sess), msgs_untimed=sum(s.get("msgs_untimed", 0) for s in sess),
+               claims_unconfirmed=sum(s.get("claims_unconfirmed", 0) for s in sess), claims_failed=sum(s.get("claims_failed", 0) for s in sess),
+               rows_old_schema=sum(1 for s in sess if s.get("v") != SCHEMA))
+    result["unknown"] = unk
+    if unk["usage_msgs"] or unk["transcript_lines_unreadable"]:
+        print(f"⚠ na janela: {unk['usage_msgs']} respostas SEM usage (tokens DESCONHECIDOS, contados como 0 só no total — o gasto real é maior) e "
+              f"{unk['transcript_lines_unreadable']} linhas de transcrito ilegíveis.\n")
+    if unk["claims_unconfirmed"]:
+        print(f"⚠ na janela: {unk['claims_unconfirmed']} claims com resultado visível que NÃO confirma (comando que só citou `bd update --claim`, ou "
+              f"saída cortada): ficam FORA da atribuição por claim — não viram bead e não tomam as respostas de ninguém.\n")
+    if unk["claims_untimed"]:
+        print(f"⚠ na janela: {unk['claims_untimed']} claims sem timestamp: não dá para posicioná-los entre as respostas (worker de pool cai na "
+              f"referência mais citada — menos firme; crew fica sem bead).\n")
+    if unk["rows_old_schema"]:
+        print(f"⚠ {unk['rows_old_schema']} sessões da janela estão no ledger com schema antigo (< v{SCHEMA}): a regra de claim delas é a anterior e "
+              f"pode ter claim FANTASMA (comando que só citou o claim). Rode `harvest` (se o transcrito ainda existe) ou `backfill-s3 --since {since_day}`.\n")
     # resposta sem timestamp vive no dia "?", que `flatten` não consegue comparar com a janela: entra em TODAS (o dia dela é desconhecido)
     undated = sum(c["msgs"] for _s, day, _m, _e, c, _u in flat if day == "?")
     result["undated_msgs"] = undated
@@ -835,9 +910,12 @@ def _report(a, result):
         print("   ⚠ a leitura de cache de modelo SEM preço (ver a nota de 1b) não entra em 1c: os US$ acima são piso, não o teto completo.")
 
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
-    idle = defaultdict(lambda: [0, 0.0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço
+    idle = defaultdict(lambda: [0, 0.0, 0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço, sessões com claim SEM timestamp
     for s in sess:
         if s["role"] in POOL_BUILDERS and not s.get("claims"):
+            if s.get("claims_untimed"):
+                idle[s["role"]][3] += 1       # reivindicou, mas sem timestamp não dá para posicionar: nem ocioso (achou bead) nem de bead (não dá para atribuir)
+                continue
             idle[s["role"]][0] += 1
             for keys in (s.get("buckets") or {}).values():
                 for key, c in keys.items():
@@ -849,11 +927,12 @@ def _report(a, result):
     print("\n== 2. spawn OCIOSO (sessão de pool que não reivindicou nenhum bead e saiu) — custo real, fora do custo por bead")
     for role in POOL_BUILDERS:
         n_all = sum(1 for s in sess if s["role"] == role)
-        n, u, unp = idle.get(role, [0, 0.0, 0])
+        n, u, unp, nut = idle.get(role, [0, 0.0, 0, 0])
         print(f"  {role:10s} {n:4d} de {n_all:4d} sessões ociosas ({100 * n / n_all if n_all else 0:3.0f}%)  US$ {u:7.2f}"
               f"  ({u / n if n else 0:.3f}/spawn)"
-              + (f"  ⚠ + {unp / 1e6:.2f} Mtok de modelo SEM preço: o US$ acima NÃO os inclui (use --assume-price)" if unp else ""))
-    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4), unpriced_tokens=v[2]) for r, v in idle.items()}
+              + (f"  ⚠ + {unp / 1e6:.2f} Mtok de modelo SEM preço: o US$ acima NÃO os inclui (use --assume-price)" if unp else "")
+              + (f"  ⚠ + {nut} sessões com claim SEM timestamp (nem ociosas nem de bead: tokens fora desta seção e das por-bead)" if nut else ""))
+    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4), unpriced_tokens=v[2], claim_untimed_sessions=v[3]) for r, v in idle.items()}
 
     # ---- 3. custo por bead (construtor + revisão) e 4. por bead APROVADA
     if gate_runs is None:
@@ -897,7 +976,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 model, _, effort = key.partition("|")
                 usd, tt = usd_of(model, c), total_tokens(c)
                 if role in BUILDERS:
-                    targets = beads if bucket == "_pre" else [bucket]
+                    targets = beads if bucket == "_pre" else bucket[len(GROUP):].split(",") if bucket.startswith(GROUP) else [bucket]
                     if bucket == "_pre" and not beads:
                         continue                                  # spawn ocioso: seção 2
                     for b in targets:
@@ -977,7 +1056,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
     n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)   # claim sem resultado visível: conta, mas não é "verificado"
     n_claim = len(measured) - n_ref - n_noresult
     print(f"   atribuição dos {len(measured)} medidos: {n_claim} por `bd update --claim` com resultado verificado, {n_noresult} por claim SEM "
-          f"resultado visível (transcrito cortado — menos firme), {n_ref} por referência a `bd show|comment|heartbeat|close` (worker com "
+          f"resultado visível (transcrito cortado ou sessão em curso — menos firme), {n_ref} por referência a `bd show|comment|heartbeat|close` (worker com "
           f"bead já atribuído — menos firme)")
     result["coverage"]["attribution"] = dict(claim_verified=n_claim, claim_no_result=n_noresult, ref=n_ref)
     cohorts = defaultdict(list)

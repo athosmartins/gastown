@@ -4,7 +4,7 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 
 **Em 8 linhas**
 
-1. **O medidor existe e está certo**: `bead-token-meter.py` dá tokens e US$ por papel × modelo × effort, por bead e por bead aprovada, a partir dos transcritos. Conferido contra uma recontagem independente (8/8 sessões idênticas) e contra o ramo do gate (81/81 atribuições batem). Os transcritos são apagados pelo reaper 24h depois da morte da sessão; um **ledger durável** + uma order a cada 30 min impedem que o histórico evapore (o histórico de 7 dias foi recuperado do S3).
+1. **O medidor existe e foi conferido onde dá para conferir**: `bead-token-meter.py` dá tokens e US$ por papel × modelo × effort, por bead e por bead aprovada, a partir dos transcritos. Conferido contra uma recontagem independente (8/8 sessões idênticas) e contra o ramo do gate (81/81 atribuições batem). **Limite conhecido**: linhas do ledger de schema antigo (v2) podem ter *claim fantasma* (um comando que só citou `bd update <id> --claim` virava claim e levava as respostas da sessão inteira); o `report` conta e avisa quantas há na janela, e `harvest` (transcrito ainda existe) ou `backfill-s3` (S3) as refazem em v3. Os transcritos são apagados pelo reaper 24h depois da morte da sessão; um **ledger durável** + uma order a cada 30 min impedem que o histórico evapore (o histórico de 7 dias foi recuperado do S3).
 2. **Linha de base (7 dias): ≈ US$ 12,6 mil a preço de lista, 404 beads aprovadas → US$ 31 por bead aprovada, sistema inteiro** (US$ 1,5–2,0 mil/dia). **51% desse total depende de um preço ASSUMIDO**: o Sonnet 5 (anterior ao 5.5) não tem preço na tabela da bead; assumi o do 5.5. Os tokens são exatos; o US$ não.
 3. **Onde o custo está**: nos builders 53–72% do US$ é *leitura de cache* (o wa-worker roda a ~330 mil tokens de contexto por turno, ~90 turnos por sessão), 16–30% é escrita de cache e só **12–17% é saída** — a única parte em que o effort age. **Effort é alavanca de 2ª ordem** (teto ≈ 2–4% do gasto do wa-worker); o **tamanho do contexto × nº de turnos** é a de 1ª.
 4. **O critério "1ª aprovação não cai mais que 3 pp" não é verificável**: pede ~4.200 beads por braço (≈ 333 dias no volume do wa-worker). Custo/bead −30% se vê em 14 dias; −10% pede 126. Um A/B por bead só enxerga efeitos grandes — a métrica primária tem que ser por mensagem.
@@ -23,14 +23,14 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 | Ledger | `.gc/token-ledger/sessions.jsonl` (5.655 sessões) | uma linha por sessão; sobrevive à remoção do transcrito pelo reaper; idempotente, incremental, com `flock` |
 | Colheita periódica | `orders/token-ledger-harvest.toml` + `assets/scripts/token-ledger-harvest.sh` | a cada 30 min (medido: 1 s incremental, ~10 s a varredura completa de 1,8 mil transcritos); log em `.gc/logs/token-ledger-harvest.log` |
 | Braço de effort | `assets/scripts/claude-lowprio.sh` (bloco "EFFORT A/B") | decide o braço por SHA-256 do nome da sessão e reescreve só o valor depois de `--effort`; **inerte sem conf**; fail-open |
-| Testes | `bead-token-meter.selftest.py` (19 casos + 14 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
+| Testes | `bead-token-meter.selftest.py` (30 casos + 47 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
 
 **Como o medidor conta (as armadilhas medidas)**
 
 * O Claude Code grava **um registro por bloco** (thinking/text/tool_use) e todos repetem o `usage` da mesma resposta: 512 registros para 187 respostas num worker. Somar linhas inflaria o gasto ~2,7×. Conta-se por `message.id`, entre o transcrito e os de subagente.
 * O **effort de cada turno está gravado** no transcrito (`effort`), assim como o modelo: o baseline não infere nada da config.
 * Preço: escrita de cache 5 min = 1,25× a entrada, 1 h = 2×, leitura = 0,1×. Modelo sem preço = "n/p" (nunca US$ 0).
-* **Bead de um worker = `bd update <id> --claim` com resultado "Updated issue"**. Id citado na 1ª mensagem NÃO conta: o preâmbulo do papel cita ~93 beads de doutrina. Worker com bead já atribuído (sem claim) cai na referência mais citada em `bd show|comment|heartbeat|close` (3 de 294 beads). Crew e Mayor (sessões conversacionais) não ganham bead.
+* **Bead de um worker = `bd update <id> --claim` cujo resultado confirma ESSE id ("Updated issue: <id>")**. Quatro estados, nunca colapsados: *ok* (confirmado: é o bead), *failed* (erro: não conta), *unconfirmed* (resultado VISÍVEL que não confirma nada — heredoc, `echo` ou mensagem de commit que só cita o claim, saída cortada: NÃO é claim e não abre bucket; fica contado) e *noresult* (nenhum resultado no transcrito: conta, sinalizado como menos firme). Dois claims num comando (`A && B`) têm um tool_use id e um resultado: cada um recebe o seu estado pelo id que o resultado nomeia, e as respostas depois deles vão para um bucket de grupo, rateado igual. Id citado na 1ª mensagem NÃO conta: o preâmbulo do papel cita ~93 beads de doutrina. Worker com bead já atribuído (sem claim) cai na referência mais citada em `bd show|comment|heartbeat|close|label|update|reopen` — um comando de claim nunca é referência (3 de 294 beads). Crew e Mayor (sessões conversacionais) não ganham bead.
 * Revisor: o cabeçalho `QUALITY GATE REVIEW — … for branch: X` chega **dentro de um tool_result**, e pode vir antes um *exemplo* de doutrina; o medidor guarda todos os ramos citados e fica com o que o log do gate conhece.
 * Sessão de pool sem claim e sem referência = **spawn ocioso**, linha própria (12/12 amostradas de fato só sondaram a fila e saíram).
 
@@ -144,7 +144,7 @@ Os números deste relatório são um retrato de 01/10 ~03h (ledger de 5.655 sess
 ```
 python3 packs/town-deltas/assets/bead-token-meter.py harvest                 # ledger (a order faz isso sozinha)
 python3 packs/town-deltas/assets/bead-token-meter.py report --from 2026-09-24 --assume-price claude-sonnet-5=claude-sonnet-5-5 [--json]
-python3 packs/town-deltas/assets/bead-token-meter.py backfill-s3 --since 2026-09-24   # histórico que o reaper já apagou (lotes de 400 MB, guarda de disco)
+python3 packs/town-deltas/assets/bead-token-meter.py backfill-s3 --since 2026-09-24   # histórico que o reaper já apagou (lotes de 400 MB, guarda de disco); também refaz em v3 as linhas v2 sem transcrito local
 python3 packs/town-deltas/assets/bead-token-meter.selftest.py ; bash packs/town-deltas/assets/claude-effort-ab.selftest.sh ; bash packs/town-deltas/assets/token-ledger-harvest.selftest.sh
 python3 docs/reports/token-por-bead-e8/e2-readout.py                          # seção 5: mistura de effort e amostra de branches do E2 (saída arquivada ao lado)
 ```

@@ -773,11 +773,213 @@ def t_lows(m, W):
     ck("1 respostas SEM timestamp" in txt and "TODAS as janelas" in txt, "o texto do relatório avisa que elas entram em todas as janelas")
 
 
+def asst_noid(mid, ts, cmd):
+    """Resposta cujo tool_use NÃO traz id (nenhum resultado consegue apontar para ele)."""
+    return [{"type": "assistant", "timestamp": ts, "effort": "xhigh", "message": {"id": mid, "model": "claude-sonnet-5-5", "usage": dict(U_SMALL),
+             "content": [{"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]}}]
+
+
+def scan_recs(m, w, sid, recs):
+    write_session(w["projects"], "-proj", sid, recs)
+    return m.scan_session(w["projects"] / "-proj" / f"{sid}.jsonl")
+
+
+def bucket_msgs(rec):
+    return {k: sum(c["msgs"] for c in v.values()) for k, v in rec["buckets"].items()}
+
+
+def t_claim_states(m, W):
+    """Gate (tentativa 2, bloqueantes 1 e 2): o RESULTADO VISÍVEL de um claim e a AUSÊNCIA de resultado são dois estados. Um comando que só
+    CITA `bd update <id> --claim` (heredoc, echo, mensagem de commit) tem resultado visível que não confirma nada: não é claim e não abre
+    bucket — antes virava claim vivo (ok=None) e a sessão inteira passava para o bead fantasma (real: 75 de 103 msgs da sessão aa9cc819).
+    Dois claims num comando compartilham UM tool_use id: cada um tem o seu resultado e o seu estado."""
+    w, _ = setup(m, W)
+    head = lambda alias="gastown.dog-5": [beacon(alias, D + "10:00:00Z")]
+    real = lambda tid="tu_r": (asst("a1", D + "10:00:10Z", cmd="gc bd update ga-real11 --claim", tid=tid)
+                               + [tool_result(tid, "warning: pack differs\n✓ Updated issue: ga-real11 — build", D + "10:00:11Z")] + asst("a2", D + "10:01:00Z"))
+    more = lambda n0, n: sum((asst(f"a{i}", D + f"10:{i:02d}:00Z") for i in range(n0, n0 + n)), [])
+    # (1) heredoc que cita o claim, resultado VISÍVEL e vazio
+    rec = scan_recs(m, w, "ph1", head() + real() + asst("a3", D + "10:02:00Z", cmd="cat > fx.sh <<'EOF'\nbd update ga-fake11 --claim\nEOF", tid="tu_f")
+                    + [tool_result("tu_f", "", D + "10:02:01Z")] + more(4, 5))
+    ck([c["bead"] for c in rec["claims"]] == ["ga-real11"] and rec["claims"][0]["ok"] is True, f"(1) só o claim real, verificado; achei {rec['claims']}")
+    ck(bucket_msgs(rec) == {"ga-real11": 8}, f"(1) todas as 8 respostas ficam no bead real (o fantasma não toma a sessão); achei {bucket_msgs(rec)}")
+    ck(rec["claims_unconfirmed"] == 1 and rec["claims_failed"] == 0, f"(1) o comando que só citou o claim é contado como 'resultado visível que não confirma'; achei unconfirmed={rec.get('claims_unconfirmed')} failed={rec['claims_failed']}")
+    # (2) echo: o resultado visível REPETE o texto do comando, sem palavra de erro
+    rec = scan_recs(m, w, "ph2", head() + real() + asst("a3", D + "10:02:00Z", cmd='echo "bd update ga-fake22 --claim"', tid="tu_e")
+                    + [tool_result("tu_e", "bd update ga-fake22 --claim", D + "10:02:01Z")] + more(4, 2))
+    ck([c["bead"] for c in rec["claims"]] == ["ga-real11"] and rec["claims_unconfirmed"] == 1, f"(2) echo não é claim; achei {rec['claims']} unc={rec.get('claims_unconfirmed')}")
+    # (3) o resultado confirma OUTRO id: não confirma este
+    rec = scan_recs(m, w, "ph3", head() + asst("b1", D + "10:00:10Z", cmd="bd update ga-aaa9 --claim", tid="tu_x")
+                    + [tool_result("tu_x", "✓ Updated issue: ga-zzz9 — outro", D + "10:00:11Z")] + more(2, 2))
+    ck(rec["claims"] == [] and rec["claims_unconfirmed"] == 1, f"(3) 'Updated issue' de outro id não confirma ga-aaa9; achei {rec['claims']} unc={rec.get('claims_unconfirmed')}")
+    # (4) SEM resultado nenhum (transcrito cortado / sessão em curso): continua claim vivo, ok None, e NÃO é 'não confirmado'
+    rec = scan_recs(m, w, "ph4", head() + asst("c1", D + "10:00:10Z", cmd="bd update ga-nores1 --claim", tid="tu_n") + more(2, 2))
+    ck([(c["bead"], c["ok"]) for c in rec["claims"]] == [("ga-nores1", None)] and rec["claims_unconfirmed"] == 0, f"(4) sem resultado = ok None vivo, não 'não confirmado'; achei {rec['claims']}")
+    # (5) o TÍTULO do bead tem palavra de erro: a confirmação do id vence a regex de erro (um claim real não vira 'falhou')
+    rec = scan_recs(m, w, "ph5", head() + asst("d1", D + "10:00:10Z", cmd="bd update ga-title1 --claim", tid="tu_t")
+                    + [tool_result("tu_t", "✓ Updated issue: ga-title1 — fix error already failed not found", D + "10:00:11Z")] + more(2, 1))
+    ck([(c["bead"], c["ok"]) for c in rec["claims"]] == [("ga-title1", True)] and rec["claims_failed"] == 0, f"(5) título com 'error' não derruba o claim confirmado; achei {rec['claims']} failed={rec['claims_failed']}")
+    # (6) DOIS claims num comando, um resultado que confirma os dois: cada um é um claim; o bucket é compartilhado (rateio igual)
+    both = (asst("e0", D + "10:00:00.500Z") + asst("e1", D + "10:00:10Z", cmd="bd update ga-mm01 --claim && bd update ga-mm02 --claim", tid="tu_m")
+            + [tool_result("tu_m", "✓ Updated issue: ga-mm01 — a\n✓ Updated issue: ga-mm02 — b", D + "10:00:11Z")] + more(2, 4))
+    rec = scan_recs(m, w, "ph6", head() + both)
+    ck(sorted((c["bead"], c["ok"]) for c in rec["claims"]) == [("ga-mm01", True), ("ga-mm02", True)], f"(6) os DOIS claims do comando existem e estão verificados; achei {rec['claims']}")
+    ck(bucket_msgs(rec) == {"_pre": 1, "_grp:ga-mm01,ga-mm02": 5}, f"(6) as respostas depois dos dois claims (mesmo instante) vão para UM bucket do grupo; achei {bucket_msgs(rec)}")
+    for b in ("ga-mm01", "ga-mm02"):
+        with open(w["gate"], "a") as fh:
+            fh.write(json.dumps({"ts": D + "13:00:00Z", "event": "dispatcher_complete", "branch": f"feat/{b}", "bead": b, "rig": "gascity", "result": "PASS", "dry_run": "0"}) + "\n")
+    harvest(m, w)
+    code, r = report(m, w)
+    ck(r["beads"]["ga-mm01"]["build_tokens"] == 300 and r["beads"]["ga-mm02"]["build_tokens"] == 300,
+       f"(6) cada bead leva metade do grupo (250) + metade do pré (50) = 300; achei {r['beads'].get('ga-mm01', {}).get('build_tokens')} / {r['beads'].get('ga-mm02', {}).get('build_tokens')} (nenhum fica com custo 0 só por ter sido pedido no mesmo instante)")
+    # (7) dois claims num comando, o 2º falha: o 1º foi feito (o texto o confirma, mesmo com is_error), o 2º falhou
+    rec = scan_recs(m, w, "ph7", head() + asst("f1", D + "10:00:10Z", cmd="bd update ga-nn01 --claim && bd update ga-nn02 --claim", tid="tu_k")
+                    + [tool_result("tu_k", "✓ Updated issue: ga-nn01 — a\nError: issue ga-nn02 already claimed", D + "10:00:11Z", is_error=True)] + more(2, 3))
+    ck([(c["bead"], c["ok"]) for c in rec["claims"]] == [("ga-nn01", True)] and rec["claims_failed"] == 1 and bucket_msgs(rec) == {"ga-nn01": 4},
+       f"(7) ga-nn01 verificado, ga-nn02 falhou; achei {rec['claims']} failed={rec['claims_failed']} {bucket_msgs(rec)}")
+    # (9) formato do resultado SEM o id ("Updated issue" puro): dá para atribuir quando o comando tinha UM claim; com dois, não dá — nenhum vira claim
+    rec = scan_recs(m, w, "ph9a", head() + asst("h1", D + "10:00:10Z", cmd="bd update ga-old01 --claim", tid="tu_o1")
+                    + [tool_result("tu_o1", "✓ Updated issue", D + "10:00:11Z")] + more(2, 2))
+    ck([(c["bead"], c["ok"]) for c in rec["claims"]] == [("ga-old01", True)], f"(9a) formato sem id + UM claim = confirmado; achei {rec['claims']}")
+    rec = scan_recs(m, w, "ph9b", head() + asst("h1", D + "10:00:10Z", cmd="bd update ga-old02 --claim && bd update ga-old03 --claim", tid="tu_o2")
+                    + [tool_result("tu_o2", "✓ Updated issue\n✓ Updated issue", D + "10:00:11Z")] + more(2, 2))
+    ck(rec["claims"] == [] and rec["claims_unconfirmed"] == 2, f"(9b) formato sem id + DOIS claims: não dá para dizer qual é qual, nenhum vira bead; achei {rec['claims']} unc={rec.get('claims_unconfirmed')}")
+    # (8) tool_use SEM id entre claims: a chave de espera não pode colidir depois que um resultado a liberou
+    rec = scan_recs(m, w, "ph8", head() + asst("g1", D + "10:00:10Z", cmd="bd update ga-q001 --claim", tid="tu_q1") + asst_noid("g2", D + "10:00:20Z", "bd update ga-q002 --claim")
+                    + [tool_result("tu_q1", "✓ Updated issue: ga-q001 — a", D + "10:00:21Z")] + asst_noid("g3", D + "10:00:30Z", "bd update ga-q003 --claim") + more(4, 2))
+    ck(sorted(c["bead"] for c in rec["claims"]) == ["ga-q001", "ga-q002", "ga-q003"], f"(8) nenhum claim some por colisão de chave; achei {sorted(c['bead'] for c in rec['claims'])}")
+
+
+def t_claim_not_a_reference(m, W):
+    """Um claim que FALHOU não pode virar atribuição por referência: `bd update <id> --claim` casa REF_CMD, e o perdedor da corrida pelo
+    bead (3 sessões pequenas de dog nos dados reais) ficava com a sessão inteira atribuída a um bead que ele nunca construiu."""
+    w, _ = setup(m, W)
+    recs = [beacon("wa-worker-adhoc-lose1", D + "15:00:00Z")] + asst("l1", D + "15:00:10Z", cmd="bd update wa-lose1 --claim", tid="tu_l")
+    recs += [tool_result("tu_l", "Error: issue wa-lose1 already claimed by someone", D + "15:00:11Z", is_error=True)] + asst("l2", D + "15:01:00Z")
+    rec = scan_recs(m, w, "loser", recs)
+    ck(rec["claims"] == [] and rec["claims_failed"] == 1 and rec["refs"] == [], f"claim perdido: sem bead, sem referência; achei claims={rec['claims']} refs={rec['refs']}")
+    # a referência de verdade (bd show/comment de um bead já atribuído) continua valendo, mesmo no comando que também reivindica
+    recs = [beacon("wa-worker-adhoc-keep1", D + "15:00:00Z")] + asst("k1", D + "15:00:10Z", cmd="bd show wa-keep1 && bd update wa-keep1 --claim", tid="tu_k1")
+    recs += [tool_result("tu_k1", "warning\n(no output)", D + "15:00:11Z")] + asst("k2", D + "15:01:00Z", cmd="bd comment wa-keep1 'x'", tid="tu_k2")
+    rec = scan_recs(m, w, "keeper", recs)
+    ck(rec["claims"] and rec["claims"][0]["bead"] == "wa-keep1" and rec["claims"][0]["via"] == "ref", f"`bd show`/`bd comment` seguem sendo referência; achei {rec['claims']}")
+
+
+def t_idle_vs_untimed_claim(m, W):
+    """Seção 2: sessão de pool que reivindicou mas sem timestamp (não dá para posicionar) NÃO é ociosa — é um desconhecido com linha própria."""
+    w, _ = setup(m, W)
+    ut = asst("u1", D + "17:00:10Z", cmd="bd update wa-unt01 --claim", tid="tu_u") + [tool_result("tu_u", "✓ Updated issue: wa-unt01 — x", D + "17:00:11Z")]
+    for x in ut[:3]:
+        del x["timestamp"]
+    write_session(w["projects"], "-proj", "untimed_claim", [beacon("wa-worker-adhoc-unt01", D + "17:00:00Z")] + ut + asst("u2", D + "17:01:00Z"))
+    harvest(m, w)
+    s = ledger_rows(m, w)["untimed_claim"]
+    ck(s["claims"] == [] and s["claims_untimed"] == 1, f"o claim sem timestamp fica fora de `claims` e é contado; achei {s['claims']} untimed={s['claims_untimed']}")
+    code, r = report(m, w)
+    ck(r["idle"].get("wa-worker", {}).get("sessions", 0) == 0, f"sessão com claim sem timestamp NÃO é spawn ocioso; achei {r['idle'].get('wa-worker')}")
+    ck(r["idle"].get("wa-worker", {}).get("claim_untimed_sessions") == 1, f"…e tem contagem própria; achei {r['idle'].get('wa-worker')}")
+    code, txt = report_text(m, w)
+    ck("1 sessões com claim SEM timestamp" in txt, f"o texto da seção 2 avisa; achei {[ln for ln in txt.splitlines() if 'sem timestamp' in ln.lower()]}")
+
+
+def t_report_unknown_counters(m, W):
+    """O --json não pode ter MENOS avisos que o texto: janela incompleta, linhas ilegíveis do ledger e os desconhecidos que a colheita grava
+    por sessão (resposta sem usage, claim sem timestamp, claim que não confirmou) vão para o resultado, e o texto os imprime."""
+    w, _ = setup(m, W)
+    nu = asst("nu1", D + "18:00:10Z")
+    for x in nu:
+        del x["message"]["usage"]
+    recs = [beacon("gastown.dog-6", D + "18:00:00Z")] + nu + asst("nu2", D + "18:01:00Z", cmd="echo 'bd update ga-cit01 --claim'", tid="tu_c1") + [tool_result("tu_c1", "bd update ga-cit01 --claim", D + "18:01:01Z")]
+    write_session(w["projects"], "-proj", "unk1", recs)
+    harvest(m, w)
+    with open(w["ledger"], "a") as fh:
+        fh.write("{linha ilegível do ledger\n")
+    code, r = report(m, w)
+    ck(r.get("ledger_unreadable_lines") == 1, f"linhas ilegíveis do ledger no JSON; achei {r.get('ledger_unreadable_lines')}")
+    ck(r.get("window_incomplete") is True and (r.get("pool_floor") or "").startswith("2026-09-30"), f"JANELA INCOMPLETA no JSON (o 1º transcrito de pool é de 30/09, a janela começa em 30/09); achei {r.get('window_incomplete')} {r.get('pool_floor')}")
+    u = r.get("unknown") or {}
+    ck(u.get("usage_msgs") == 1 and u.get("claims_unconfirmed") == 1, f"respostas sem usage e claims não confirmados no JSON; achei {u}")
+    for k in ("claims_untimed", "msgs_untimed", "transcript_lines_unreadable", "claims_failed", "rows_old_schema"):
+        ck(k in u, f"o objeto `unknown` tem a chave {k}; achei {sorted(u)}")
+    code, txt = report_text(m, w)
+    ck("1 respostas SEM usage" in txt and "1 claims com resultado visível que NÃO confirma" in txt, f"o texto imprime os mesmos avisos; achei {[ln for ln in txt.splitlines() if '⚠' in ln]}")
+    # janela que COMEÇA depois do 1º transcrito de pool: completa
+    write_session(w["projects"], "-proj", "early", [beacon("gastown.dog-2", "2026-09-29T08:00:00Z")] + asst("e1", "2026-09-29T08:00:10Z"))
+    harvest(m, w)
+    code, r = report(m, w)
+    ck(r.get("window_incomplete") is False, f"com um transcrito de pool ANTES da janela ela está completa; achei {r.get('window_incomplete')}")
+
+
+def t_schema_rescan(m, W):
+    """A regra de claim mudou (SCHEMA 3): uma linha escrita pela regra antiga (v=2) pode ter claim fantasma e NÃO pode ser mantida só porque o
+    transcrito não mudou — a colheita a reescaneia; e enquanto ela existir no ledger (transcrito já apagado) o relatório diz quantas há."""
+    w, _ = setup(m, W)
+    rows = ledger_rows(m, w)
+    s = rows["dog1"]
+    s["v"] = 2
+    s["claims"] = s["claims"] + [dict(bead="ga-phantom", ts=D + "10:03:30.000Z", ok=None, via="claim")]
+    m.write_ledger(rows, w["ledger"])
+    code, r = report(m, w)
+    ck((r.get("unknown") or {}).get("rows_old_schema", 0) >= 1, f"o relatório conta as linhas de schema antigo na janela; achei {r.get('unknown')}")
+    code, txt = report_text(m, w)
+    ck("schema antigo" in txt, f"o texto avisa que há claims não revalidados; achei {[ln for ln in txt.splitlines() if '⚠' in ln]}")
+    harvest(m, w)
+    s = ledger_rows(m, w)["dog1"]
+    ck(s["v"] == m.SCHEMA and m.SCHEMA >= 3 and all(c["bead"] != "ga-phantom" for c in s["claims"]), f"a colheita reescaneou a linha v=2 (transcrito intacto); v={s['v']} claims={s['claims']}")
+    code, r = report(m, w)
+    ck((r.get("unknown") or {}).get("rows_old_schema") == 0, f"depois do rescan não resta linha antiga; achei {r.get('unknown')}")
+
+
+def t_harvest_alarm_first_and_nonzero(m, W):
+    """Alarme de formato do transcrito (todas as sessões grandes voltaram com 0 respostas): o wrapper do order corta a linha de log em 500
+    caracteres e o alarme era o ÚLTIMO texto com exit 0 — a 1ª coisa que o corte joga fora. Agora é a PRIMEIRA linha e o exit é ≠ 0."""
+    w, _ = setup(m, W)
+    big = [{"type": "attachment", "timestamp": D + "10:00:00Z", "attachment": {"n": i}} for i in range(40)]
+    for i in range(3):
+        write_session(w["projects"], "-proj", f"weird{i}", [{"type": "msg-v9", "n": j} for j in range(40)] + big)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+    lines = out.getvalue().splitlines()
+    ck(rc not in (0, None), f"formato do transcrito mudou -> exit ≠ 0 (o order enxerga); achei rc={rc}")
+    ck(lines and "formato do transcrito mudou" in lines[0], f"o alarme é a 1ª linha; achei {lines[:1]}")
+    ck(any(ln.startswith("harvest:") for ln in lines[1:]), "a linha-resumo da colheita continua lá, depois do alarme")
+    ck(w["ledger"].exists() and len(ledger_rows(m, w)) >= 9, "o ledger foi escrito mesmo com o alarme (o alarme não perde a colheita)")
+    # sem alarme: exit 0 e a linha-resumo é a 1ª
+    W2 = W / "calm"
+    W2.mkdir()
+    w2 = setup(m, W2)[0]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.cmd_harvest(type("A", (), dict(ledger=str(w2["ledger"]), since_hours=0))())
+    ck(rc == 0 and out.getvalue().startswith("harvest:"), f"sem alarme: exit 0 e o resumo abre a saída; rc={rc} {out.getvalue()[:60]!r}")
+
+
+def t_e2_readout_missing_dry_run(m, W):
+    """e2-readout.py (mesma família do load_gate): um veredito do gate SEM dry_run não pode sumir como 'ensaio' — é contado e impresso."""
+    script = HERE.parents[2] / "docs" / "reports" / "token-por-bead-e8" / "e2-readout.py"
+    ck(script.exists(), f"o script do E2 existe em {script}")
+    city = W / "city"
+    (city / ".gc" / "token-ledger").mkdir(parents=True)
+    (city / ".gc" / "token-ledger" / "sessions.jsonl").write_text(json.dumps(dict(sid="c1", role="crew", alias="peter-wa", first_ts="2026-09-30T10:00:00Z", days={})) + "\n")
+    ev = [{"ts": "2026-09-30T11:00:00Z", "event": "guard_queued", "branch": "crew/peter/wa-aaa", "bead": "wa-aaa"},
+          {"ts": "2026-09-30T12:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-aaa", "bead": "wa-aaa", "result": "PASS", "dry_run": "0"},
+          {"ts": "2026-09-30T11:00:00Z", "event": "guard_queued", "branch": "crew/peter/wa-bbb", "bead": "wa-bbb"},
+          {"ts": "2026-09-30T12:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-bbb", "bead": "wa-bbb", "result": "FAIL"},
+          {"ts": "2026-09-30T13:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-ccc", "bead": "wa-ccc", "result": "PASS", "dry_run": None}]
+    (city / ".gc" / "quality-gate.jsonl").write_text("\n".join(json.dumps(e) for e in ev) + "\n")
+    import subprocess
+    p = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=dict(os.environ, GC_CITY_PATH=str(city)))
+    ck(p.returncode == 0, f"o script roda no fixture; rc={p.returncode} {p.stderr[-300:]}")
+    ck("2 verdicts without dry_run" in p.stdout, f"os 2 vereditos sem dry_run são contados e impressos; achei {[ln for ln in p.stdout.splitlines() if 'dry_run' in ln]}")
+    ck("with a real verdict: 1 " in p.stdout, f"só o veredito real (dry_run '0') entra na amostra; achei {[ln for ln in p.stdout.splitlines() if 'verdict' in ln]}")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
     "sem preço vira US$ 0": ('        return None\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', '        return 0.0\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', t_price),
-    "claim que falhou conta": ('if c["ok"] is not False and c["ts"]', 'if c["ts"]', t_claims),
+    "claim que falhou conta": ('for c in claims if c["state"] in ("ok", "noresult")]', 'for c in claims if c["state"] != "unconfirmed"]', t_claims),
     "só o 1º ramo do revisor": ("len(branches) < 6", "len(branches) < 1", t_reviewer),
     "janela por início de sessão": ('(s.get("days") or {}).items():\n            if day < since_day:\n                continue\n', '(s.get("days") or {}).items():\n', t_window_by_message_day),
     "excesso acima do teto vira o cache-read inteiro": ('+= max(0, m["use"]["cr"] - cap)', '+= m["use"]["cr"]', t_context_caps),
@@ -786,7 +988,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "ocioso sem preço some do relatório": ('idle[s["role"]][2] += total_tokens(c)', 'idle[s["role"]][2] += 0', t_sweep_unknowns),
     "revisor sem ramo conta por bucket": ('unmapped_review.add(s["sid"])', 'unmapped_review.add((s["sid"], key))', t_sweep_unknowns),
     "veredito sem bead entra nas contas": ('if not r.get("bead"):', "if False:", t_sweep_unknowns),
-    "claim sem timestamp some calado": ('untimed = sum(1 for c in claims if c["ok"] is not False and not c["ts"])', "untimed = 0", t_sweep_unknowns),
+    "claim sem timestamp some calado": ('untimed = sum(1 for c in eligible if not c["ts"])', "untimed = 0", t_sweep_unknowns),
     "linha ilegível do ledger é descartada sem cópia": ("shutil.copy2(path, keep)", "pass", t_sweep_unknowns),
     # ---- gate-fix 1 (ga-5c3msy): o terceiro estado "sem preço" nas seções 3-6, 1b, e o relatório que estoura
     "bead com token sem preço vira soma parcial": ('    if p["unpriced"]:\n        return None\n    return p["build_usd"] + p["review_usd"] + p["pregate_usd"]',
@@ -804,6 +1006,27 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
                                                   '        cv = statistics.pstdev(tot) / mean if mean else float("nan")', t_power_unpriced),
     "seção que estoura leva as prontas junto": ("    except Exception as e:  # noqa: BLE001 — qualquer seção pode estourar; as já prontas não podem ser jogadas fora",
                                                 "    except KeyboardInterrupt as e:  # noqa: BLE001", t_report_survives_crash),
+    # ---- gate-fix 2 (ga-5c3msy): resultado visível que não confirma ≠ sem resultado; dois claims num comando; claim ≠ referência
+    "resultado visível que não confirma vira claim vivo": ('for c in claims if c["state"] in ("ok", "noresult")]', 'for c in claims if c["state"] != "failed"]', t_claim_states),
+    "confirmação não olha o id": ("    if bead in named:\n        return \"ok\"", "    if named:\n        return \"ok\"", t_claim_states),
+    "regex de erro antes da confirmação do id": ("    if bead in named:\n        return \"ok\"", "    if False:\n        return \"ok\"", t_claim_states),
+    "formato sem id confirma com vários claims": ('if not named and "Updated issue" in txt and n_claims == 1 and not is_error:', 'if not named and "Updated issue" in txt and not is_error:', t_claim_states),
+    "formato sem id nunca confirma": ('if not named and "Updated issue" in txt and n_claims == 1 and not is_error:', "if False:", t_claim_states),
+    "dois claims do comando: o último vence": ('have += [(bead, r.get("timestamp") or "") for bead in targets if bead not in [x[0] for x in have]]',
+                                               'have[:] = [(targets[-1], r.get("timestamp") or "")]', t_claim_states),
+    "grupo: o último claim leva tudo": ('key = sbeads[0] if len(sbeads) == 1 else GROUP + ",".join(sorted(sbeads))', "key = sbeads[-1]", t_claim_states),
+    "relatório não divide o bucket do grupo": ('bucket[len(GROUP):].split(",") if bucket.startswith(GROUP) else [bucket]', "[bucket]", t_claim_states),
+    "comando de claim vira referência": ("if any(a <= rm.start() < z for a, z in spans):", "if False:", t_claim_not_a_reference),
+    "ocioso conta sessão com claim sem timestamp": ('            if s.get("claims_untimed"):\n                idle[s["role"]][3] += 1', '            if False:\n                idle[s["role"]][3] += 1', t_idle_vs_untimed_claim),
+    "JSON sem janela incompleta": ("    result.update(pool_floor=pool_floor, window_incomplete=window_incomplete)", "    pass", t_report_unknown_counters),
+    "JSON sem os desconhecidos": ('    result["unknown"] = unk\n', '    result["unknown"] = {}\n', t_report_unknown_counters),
+    "JSON sem linhas ilegíveis do ledger": ("sessions=len(sess), ledger_unreadable_lines=bad_ledger)", "sessions=len(sess))", t_report_unknown_counters),
+    "desconhecido 'não confirmou' não é somado": ('claims_unconfirmed=sum(s.get("claims_unconfirmed", 0) for s in sess)', "claims_unconfirmed=0", t_report_unknown_counters),
+    "linha de schema antigo não é contada": ('rows_old_schema=sum(1 for s in sess if s.get("v") != SCHEMA))', "rows_old_schema=0)", t_schema_rescan),
+    "colheita mantém linha de schema antigo": ('old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA and "days_ctx" in old', 'old.get("fp") == fingerprint(f) and "days_ctx" in old', t_schema_rescan),
+    "schema não foi aumentado": ("SCHEMA = 3     # 3 = claims revalidados", "SCHEMA = 2     # 3 = claims revalidados", t_schema_rescan),
+    "alarme de formato sem exit ≠ 0": ("    return RC_FORMAT_ALARM if alarm else 0", "    return 0", t_harvest_alarm_first_and_nonzero),
+    "alarme de formato não impresso": ("    alarm = suspect >= 2 and suspect * 4 >= big\n    if alarm:\n", "    alarm = suspect >= 2 and suspect * 4 >= big\n    if False:\n", t_harvest_alarm_first_and_nonzero),
     # ---- gate-fix 1: os achados baixos da mesma família
     "claim sem resultado conta como verificado": ('    n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)', "    n_noresult = 0", t_lows),
     "veredito sem dry_run vira ensaio calado": ("                if dry is None:\n                    bad += 1", "                if False:\n                    bad += 1", t_lows),
@@ -822,7 +1045,14 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("3º estado nas seções 3-5 e 1b: bead/coorte/sistema com token sem preço = n/p ou piso rotulado, nunca 0", t_unpriced_report),
          ("seção 6: bead sem preço fora do CV (quantos), todos sem preço = n/p e não estoura", t_power_unpriced),
          ("seção que estoura não joga fora as prontas (texto e --json, exit 1)", t_report_survives_crash),
-         ("claim sem resultado ≠ verificado, veredito sem dry_run ≠ ensaio, resposta sem timestamp avisada", t_lows)]
+         ("claim sem resultado ≠ verificado, veredito sem dry_run ≠ ensaio, resposta sem timestamp avisada", t_lows),
+         ("claim: resultado visível que não confirma ≠ sem resultado; dois claims num comando; tool_use sem id", t_claim_states),
+         ("claim que falhou não vira atribuição por referência", t_claim_not_a_reference),
+         ("seção 2: claim sem timestamp não é spawn ocioso", t_idle_vs_untimed_claim),
+         ("JSON e texto com os mesmos avisos: janela incompleta, ledger ilegível, desconhecidos da colheita", t_report_unknown_counters),
+         ("schema novo: linha escrita pela regra antiga é reescaneada e contada", t_schema_rescan),
+         ("alarme de formato: 1ª linha e exit ≠ 0", t_harvest_alarm_first_and_nonzero),
+         ("e2-readout: veredito sem dry_run contado, não calado", t_e2_readout_missing_dry_run)]
 
 
 def run(name, fn, m):
