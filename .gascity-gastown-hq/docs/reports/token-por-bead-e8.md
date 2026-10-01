@@ -23,7 +23,7 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 | Ledger | `.gc/token-ledger/sessions.jsonl` (5.655 sessões) | uma linha por sessão; sobrevive à remoção do transcrito pelo reaper; idempotente, incremental, com `flock` |
 | Colheita periódica | `orders/token-ledger-harvest.toml` + `assets/scripts/token-ledger-harvest.sh` | a cada 30 min (medido: 1 s incremental, ~10 s a varredura completa de 1,8 mil transcritos); log em `.gc/logs/token-ledger-harvest.log` |
 | Braço de effort | `assets/scripts/claude-lowprio.sh` (bloco "EFFORT A/B") | decide o braço por SHA-256 do nome da sessão e reescreve só o valor depois de `--effort`; **inerte sem conf**; fail-open |
-| Testes | `bead-token-meter.selftest.py` (18 casos + 9 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
+| Testes | `bead-token-meter.selftest.py` (19 casos + 14 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
 
 **Como o medidor conta (as armadilhas medidas)**
 

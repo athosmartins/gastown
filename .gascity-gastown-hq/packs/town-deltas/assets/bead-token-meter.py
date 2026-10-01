@@ -337,6 +337,10 @@ def scan_session(main):
     for c in claims:
         c["via"] = "claim"
     live = sorted((c for c in claims if c["ok"] is not False and c["ts"]), key=lambda c: c["ts"])
+    # um claim sem timestamp não dá para ordenar entre as mensagens: fica de fora de `live`, mas CONTADO. Um worker de pool cai então
+    # no fallback por referência logo abaixo (atribuição menos firme, via=ref — `bd update <id>` também casa REF_CMD); crew não tem
+    # fallback e fica sem bead. Sem a contagem, "não achei claim" e "achei mas não consegui posicionar" seriam indistinguíveis.
+    untimed = sum(1 for c in claims if c["ok"] is not False and not c["ts"])
     role = role_of(alias, first_text, bool(REVIEW_HEADER.search(first_text)))
     if not live and role in POOL_BUILDERS and refs:
         # worker com bead JÁ atribuído (sling/Pilot): não há claim. O bead é o mais citado em `bd show|comment|heartbeat|close…`.
@@ -373,7 +377,7 @@ def scan_session(main):
     return dict(v=SCHEMA, sid=sid, alias=alias or None, role=role, project=main.parent.name,
                 cwd=cwd, first_ts=min(stamps) if stamps else None, last_ts=max(stamps) if stamps else None,
                 size=size, mtime_ns=mtime_ns, fp=fingerprint(main), msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
-                bad_lines=bad, no_usage=len(no_usage), lines=nlines, branches=branches,
+                bad_lines=bad, no_usage=len(no_usage), claims_untimed=untimed, lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
                 refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed,
                 buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
@@ -397,6 +401,17 @@ def load_ledger(path=None):
                 if r.get("sid"):
                     rows[r["sid"]] = r                  # a última linha de uma sessão vale
     return rows, bad
+
+
+def preserve_unreadable(path, bad):
+    """O ledger é REESCRITO a partir de `rows`, e uma linha que não leu não está em `rows`: reescrever a descartaria. Antes disso,
+    guarda o arquivo como estava (só quando há linha ilegível). -> caminho da cópia, ou None."""
+    if not bad or not Path(path).exists():
+        return None
+    keep = Path(f"{path}.unreadable-{int(time.time())}")
+    shutil.copy2(path, keep)
+    print(f"⚠ {bad} linhas ilegíveis no ledger: o arquivo como estava ANTES da reescrita foi guardado em {keep}")
+    return keep
 
 
 def write_ledger(rows, path):
@@ -435,8 +450,9 @@ def cmd_harvest(a):
         return 0
     t0 = time.time()
     rows, bad_ledger = load_ledger(path)
+    preserve_unreadable(path, bad_ledger)
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
-    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = 0
+    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = 0
     for proj in PROJECTS:
         for f in sorted(proj.glob("*/*.jsonl")):
             try:
@@ -456,6 +472,7 @@ def cmd_harvest(a):
                 continue
             bad_lines += rec["bad_lines"]
             no_usage += rec["no_usage"]
+            untimed += rec["claims_untimed"]
             if rec["lines"] >= 30:
                 big += 1
                 if rec["msgs"] == 0:
@@ -471,6 +488,9 @@ def cmd_harvest(a):
     if bad_lines or no_usage:
         print(f"⚠ nas sessões escaneadas: {bad_lines} linhas de transcrito ilegíveis e {no_usage} respostas SEM usage (tokens DESCONHECIDOS, "
               f"contados como 0 só no total — o gasto real é maior)")
+    if untimed:
+        print(f"⚠ {untimed} claims sem timestamp nas sessões escaneadas: não dá para posicioná-los entre as mensagens, então ficam FORA da "
+              f"atribuição por claim (worker de pool cai na referência mais citada — menos firme; crew fica sem bead)")
     # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
     # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
     if suspect >= 2 and suspect * 4 >= big:
@@ -519,7 +539,8 @@ def cmd_backfill_s3(a):
     except RuntimeError as e:
         print(f"backfill-s3: ERRO — {e}\n  (lista vazia NÃO é o que aconteceu: o aws falhou; nada foi alterado)")
         return 2
-    rows, _ = load_ledger(path)
+    rows, bad_ledger = load_ledger(path)
+    preserve_unreadable(path, bad_ledger)
     todo, skipped_scope, skipped_have = [], 0, 0
     for key, size in sorted(top):
         proj, sid = key.split("/")[1], key.split("/")[2][:-6]
@@ -609,6 +630,9 @@ def load_gate(path=None):
                 bridge[r["branch"]] = r["bead"]
             if r.get("event") == "dispatcher_complete" and str(r.get("dry_run")) in ("0", "false", "False", "") \
                     and r.get("result") in ("PASS", "FAIL"):
+                if not r.get("bead"):
+                    bad += 1          # um veredito sem bead não entra em nenhuma conta por bead: conta como ilegível, não derruba o relatório
+                    continue
                 try:
                     r["_ts"] = parse_ts(r["ts"])
                 except Exception:
@@ -771,21 +795,25 @@ def _report(a):
     result["context_caps"] = cap_out
 
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
-    idle = defaultdict(lambda: [0, 0.0])
+    idle = defaultdict(lambda: [0, 0.0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço
     for s in sess:
         if s["role"] in POOL_BUILDERS and not s.get("claims"):
             idle[s["role"]][0] += 1
             for keys in (s.get("buckets") or {}).values():
                 for key, c in keys.items():
                     u = usd_of(key.partition("|")[0], c)
-                    idle[s["role"]][1] += u or 0.0
+                    if u is None:
+                        idle[s["role"]][2] += total_tokens(c)     # modelo sem preço: o US$ é DESCONHECIDO, não zero
+                    else:
+                        idle[s["role"]][1] += u
     print("\n== 2. spawn OCIOSO (sessão de pool que não reivindicou nenhum bead e saiu) — custo real, fora do custo por bead")
     for role in POOL_BUILDERS:
         n_all = sum(1 for s in sess if s["role"] == role)
-        n, u = idle.get(role, [0, 0.0])
+        n, u, unp = idle.get(role, [0, 0.0, 0])
         print(f"  {role:10s} {n:4d} de {n_all:4d} sessões ociosas ({100 * n / n_all if n_all else 0:3.0f}%)  US$ {u:7.2f}"
-              f"  ({u / n if n else 0:.3f}/spawn)")
-    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4)) for r, v in idle.items()}
+              f"  ({u / n if n else 0:.3f}/spawn)"
+              + (f"  ⚠ + {unp / 1e6:.2f} Mtok de modelo SEM preço: o US$ acima NÃO os inclui (use --assume-price)" if unp else ""))
+    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4), unpriced_tokens=v[2]) for r, v in idle.items()}
 
     # ---- 3. custo por bead (construtor + revisão) e 4. por bead APROVADA
     if gate_runs is None:
@@ -797,7 +825,7 @@ def _report(a):
 def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result):
     per = defaultdict(lambda: dict(build_usd=0.0, build_tok=0, review_usd=0.0, review_tok=0, pregate_usd=0.0, pregate_tok=0,
                                    unpriced=0, builders=[], first_builder=None))
-    unmapped_review = 0
+    unmapped_review = set()          # SESSÕES de revisor sem ramo conhecido (um set: uma sessão com 2 modelos/efforts é UMA, não duas)
     all_sess = list(rows.values())         # o custo do bead conta mesmo que a sessão tenha começado ANTES da janela
     for s in all_sess:
         role = s["role"]
@@ -821,7 +849,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 elif role in REVIEWERS:
                     b = next((bridge[x] for x in s.get("branches") or [] if x in bridge), None)
                     if not b:
-                        unmapped_review += 1
+                        unmapped_review.add(s["sid"])
                         continue
                     p = per[b]
                     fld = "pregate" if role == "pregate-review" else "review"
@@ -876,8 +904,9 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
     for k, n in why.most_common():
         print(f"     {n:4d}  {k}")
     print(f"   1º transcrito de pool no ledger: {pool_floor}; linhas ilegíveis do log do gate: {gate_bad}; "
-          f"sessões de revisor sem ramo conhecido do gate: {unmapped_review}")
-    result["coverage"] = dict(beads_in_window=len(in_win), measured=len(measured), unmeasured_by_reason=dict(why))
+          f"sessões de revisor sem ramo conhecido do gate: {len(unmapped_review)}")
+    result["coverage"] = dict(beads_in_window=len(in_win), measured=len(measured), unmeasured_by_reason=dict(why),
+                              unmapped_reviewer_sessions=len(unmapped_review), gate_unreadable_lines=gate_bad)
     n_ref = sum(1 for b in measured if first_session[b][3] == "ref")
     print(f"   atribuição dos {len(measured)} medidos: {len(measured) - n_ref} por `bd update --claim` verificado, {n_ref} por referência "
           f"a `bd show|comment|heartbeat|close` (worker com bead já atribuído — menos firme)")
