@@ -15833,7 +15833,8 @@ else
   # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the weekly tally
   # must be able to see. Without this line no gate_lane event exists for those diffs, they are simply absent from
   # "decisions", and the tally's "lib not loaded" bucket can never fill. Same fields as gate_fastlane_record's event.
-  _FL_WOULD="${GATE_LANE_WOULD_REVIEWERS:-0}"; case "$_FL_WOULD" in ''|*[!0-9]*) _FL_WOULD=0 ;; esac   # --argjson dies on non-numeric
+  # --argjson dies on non-numeric, so a count that is not a number is written as null — UNKNOWN, which the tally credits as an assumed 1 and says so (0 would be a measured zero)
+  _FL_WOULD="${GATE_LANE_WOULD_REVIEWERS:-}"; case "$_FL_WOULD" in ''|*[!0-9]*) _FL_WOULD=null ;; esac
   jq -c -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
     --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
