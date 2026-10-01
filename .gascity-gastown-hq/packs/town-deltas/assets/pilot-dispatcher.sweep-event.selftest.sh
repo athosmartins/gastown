@@ -148,18 +148,22 @@ b14 1 inflight_unconfirmed
 b15 1
 b16 1 some_future_result
 b17 1 rig_native_dog_store_migrated
-b18 1 rig_native_spawn_deferred_slow'
+b18 1 rig_native_spawn_deferred_slow
+b19 1 rig_native_pool_store_blind
+b20 1 rig_native_pool_store_migrated'
 run_sweep "$BATCH" >/dev/null 2>&1
 echo "=== A2: one bead per real exit ==="
-expect '.candidates' '18'          "A2: 18 candidates evaluated"
+expect '.candidates' '20'          "A2: 20 candidates evaluated"
 expect '.dispatched' '2'           "A2: rc=0 → dispatched (rig_native_ok, sling_ok)"
 expect '.queued_pool_cap' '2'      "A2: pool session cap → queued_pool_cap, counted per bead"
 expect '.queued_global_cap' '1'    "A2: global (ga-jezvn) cap → queued_global_cap, SEPARATE from the pool cap (different causes)"
 expect '.spawn_failed' '1'         "A2: rig_native_spawn_failed → spawn_failed"
-expect '.refused_by_guard' '{"pool_ownership_refuse":1,"rig_dedup_skip":1,"rig_native_dog_store_blind":1,"rig_native_dog_store_migrated":1,"rig_native_pool_target_only":1,"rig_native_spawn_deferred_slow":1}' \
+expect '.refused_by_guard' '{"pool_ownership_refuse":1,"rig_dedup_skip":1,"rig_native_dog_store_blind":1,"rig_native_dog_store_migrated":1,"rig_native_pool_store_blind":1,"rig_native_pool_store_migrated":1,"rig_native_pool_target_only":1,"rig_native_spawn_deferred_slow":1}' \
                                    "A2: each guard refusal is counted UNDER THE GUARD'S NAME (incl. ga-6u64fm's migrated: the guard RESOLVED the refusal; ga-6hr8p7's spawn_deferred_slow)"
 expect '.refused_by_guard.rig_native_spawn_deferred_slow' '1' "A2: a spawn DEFERRED because an earlier spawn this sweep was slow (ga-6hr8p7) is a deliberate deferral, NOT a Pilot fault — it must not land in failed_other"
 expect '.refused_by_guard.rig_native_dog_store_migrated' '1' "A2: a successful auto-migration (ga-6u64fm) is a guard outcome, NOT a Pilot fault (B4 caught it landing in failed_other)"
+expect '.refused_by_guard.rig_native_pool_store_blind' '1' "A2: a rig-native bead refused because the target pool cannot read its store (ga-653ilw) is a guard outcome, NOT a Pilot fault"
+expect '.refused_by_guard.rig_native_pool_store_migrated' '1' "A2: ...and so is its benign end: the bead auto-migrated into the store the pool reads (ga-653ilw) — must not land in failed_other"
 expect '.failed_other' '5'         "A2: assign/sling/inflight failures and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
 expect '.unclassified' '1'         "A2: non-zero exit with NO named result → unclassified (not dropped, not called a success)"
 expect '.results.some_future_result' '1' "A2: an unknown result still shows up BY NAME in results (the next vocabulary drift explains itself)"
@@ -280,7 +284,7 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)

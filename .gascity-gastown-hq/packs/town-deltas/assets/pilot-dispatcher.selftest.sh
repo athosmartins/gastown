@@ -7956,6 +7956,99 @@ has "$DISPATCHER" 'PILOT_SPAWN_PS_WORKER'             "PILOT_SPAWN_PS_WORKER tog
 has "$DISPATCHER" 'gc\.routed_to=ps-worker'           "gc.routed_to=ps-worker stamped before spawn"
 has "$DISPATCHER" 'session new ps-worker --no-attach' "spawn arm uses gc session new ps-worker --no-attach"
 
+# ── Scenario POOL-STORE (ga-653ilw): a bead in a store the target pool cannot read must NOT be dispatched to it ──
+# The lx-b5q incident, end to end through the REAL dispatcher in DRY_RUN. lx-b5q lives in the LEXBH store; its text
+# ("terreno") makes bead_content_rig call it a property_scrapers domain build, and with batista-ps suspended the
+# ga-wnojmm fallback reroutes it to the ps-worker pool — reassigning STORY_RIG but leaving STORY_BEAD_CITY on the
+# lexbh store (the log said "assigning lx-b5q -> ps-worker ... in /Users/athos/gt/lexbh"). ps-worker's probe runs
+# from property_scrapers/crew/worker, so it can never find a lexbh bead: the top-up then opened 251 workers for it.
+# Pre-fix this dry run logged "WOULD: gc ... session new ps-worker --no-attach" for the lexbh bead; now it refuses.
+# The gc shim registers BOTH rigs at distinct fake dirs, so STORY_BEAD_CITY (lexbh dir) != the pool's store (ps dir).
+LX_FAKE_RIG_DIR="$WORK/fake-lx-rig"
+mkdir -p "$LX_FAKE_RIG_DIR"
+LX_SHIMBIN="$WORK/lx-bin"
+mkdir -p "$LX_SHIMBIN"
+cat > "$LX_SHIMBIN/gc" <<LX_GC_EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"rig list"*)      printf '{"rigs":[{"name":"lexbh","path":"$LX_FAKE_RIG_DIR","hq":false},{"name":"property_scrapers","path":"$PS_FAKE_RIG_DIR","hq":false}]}' ;;
+  *sling*)           printf '{"bead_id":"tt-lx-sling-1"}' ;;
+  *"session list"*)  printf '{"sessions":[]}' ;;
+  *) : ;;
+esac
+exit 0
+LX_GC_EOF
+chmod +x "$LX_SHIMBIN/gc"
+ln -sf "$SHIMBIN/bd"     "$LX_SHIMBIN/bd"
+ln -sf "$SHIMBIN/notify" "$LX_SHIMBIN/notify"
+
+# $1=PILOT_WA_RIG_TIER2_OVERRIDE (candidate JSON)  $2=PILOT_TEST_PS_WORKER_LIVE_COUNT  $3=PILOT_POOL_STORE_GUARD (default on)
+run_lx_pool_dispatch() {
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
+  reset_state
+  env -i \
+    PATH="$LX_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN=1 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    DISPATCH_TO_CAPACITY=1 \
+    FAKE_BUGS_JSON="[]" \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_SUSPENDED_CREWS_OVERRIDE="batista-ps" \
+    PILOT_WA_RIG_APPROVED_QUERIES=1 \
+    PILOT_WA_RIG_TIER2_OVERRIDE="${1:-[]}" \
+    PILOT_TEST_PS_WORKER_LIVE_COUNT="${2:-0}" \
+    PILOT_POOL_STORE_GUARD="${3:-1}" \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+
+echo "Scenario POOL-STORE-A (ga-653ilw): the lx-b5q shape — lexbh-store bead rerouted to ps-worker is REFUSED, no worker is spawned for it"
+LOG_PSB_A="$(run_lx_pool_dispatch "$LX_TERRENO" "0")"
+if echo "$LOG_PSB_A" | grep -F "ga-wnojmm: lx-dnwtest is a property_scrapers domain build" >/dev/null \
+   && echo "$LOG_PSB_A" | grep -F "bead_city=$LX_FAKE_RIG_DIR" >/dev/null; then
+  ok "precondition: the fixture is the real lx-b5q shape (rerouted to the ps-worker pool by ga-wnojmm while its bead_city is still the lexbh store)"
+else
+  bad "precondition failed: the fixture did not reproduce 'ga-wnojmm reroute + bead_city=lexbh' — the result below is not trustworthy (log: $(echo "$LOG_PSB_A" | tr '\n' '|' | cut -c1-600))"
+fi
+if echo "$LOG_PSB_A" | grep -E "session new ps-worker --no-attach" >/dev/null; then
+  bad "REGRESSION (ga-653ilw): the dispatcher would spawn a ps-worker for a bead living in the LEXBH store — a worker that can never see it (the 251-session loop)"
+else
+  ok "ga-653ilw: NO ps-worker spawn is planned for the lexbh-store bead"
+fi
+if echo "$LOG_PSB_A" | grep -F "WOULD REFUSE (ga-653ilw): lx-dnwtest" >/dev/null; then
+  ok "ga-653ilw: the dry run reports the refusal (and names the bead)"
+else
+  bad "ga-653ilw: no 'WOULD REFUSE (ga-653ilw)' line for lx-dnwtest in the log"
+fi
+if echo "$LOG_PSB_A" | grep -E "RIG-NATIVE path \(ga-mfeip\)|WOULD DISPATCH" >/dev/null; then
+  bad "ga-653ilw: the lexbh-store bead still reached the rig-native dispatch path"
+else
+  ok "ga-653ilw: the lexbh-store bead never reached the rig-native dispatch path"
+fi
+
+echo "Scenario POOL-STORE-B (ga-653ilw): kill switch PILOT_POOL_STORE_GUARD=0 restores the old behaviour (proves A exercised the guard, not something else)"
+LOG_PSB_B="$(run_lx_pool_dispatch "$LX_TERRENO" "0" "0")"
+if echo "$LOG_PSB_B" | grep -E "session new ps-worker --no-attach" >/dev/null; then
+  ok "kill switch: with the guard off the old behaviour returns (a ps-worker is planned for the lexbh bead)"
+else
+  bad "kill switch: PILOT_POOL_STORE_GUARD=0 did not restore the old dispatch — scenario A may be passing for the wrong reason (log: $(echo "$LOG_PSB_B" | tr '\n' '|' | cut -c1-500))"
+fi
+
+echo "Scenario POOL-STORE-C (ga-653ilw, control): a bead in the pool's OWN store still dispatches to ps-worker with the guard on"
+LOG_PSB_C="$(run_lx_pool_dispatch "$PS_WORKER_FX" "0")"
+if echo "$LOG_PSB_C" | grep -E "session new ps-worker --no-attach" >/dev/null && ! echo "$LOG_PSB_C" | grep -F "WOULD REFUSE (ga-653ilw)" >/dev/null; then
+  ok "control: ps-test1 (property_scrapers store -> ps-worker) is untouched by the guard"
+else
+  bad "control: the guard interfered with a bead in the pool's own store (log: $(echo "$LOG_PSB_C" | tr '\n' '|' | cut -c1-500))"
+fi
+
 # Helper: same as run_ps_worker_dispatch but also injects the ga-htjni ownership-
 # guard test seams (ga-sndpm), so a scenario can simulate the routed candidate
 # already having a crew branch (signal a) or an active gate marker (signal d).
