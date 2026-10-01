@@ -82,15 +82,17 @@ scan_case() { # name body want_rc
 scan_case "clean prose"                 '+Este documento descreve o gate.'                       0
 scan_case "formatted CPF"               '+cliente 529.982.247-25 ligou'                         1
 scan_case "bare 11 digits, valid DV"    '+cpf 52998224725 fim'                                   1
-scan_case "11 digits, invalid DV"       '+id 12345678901 fim'                                    0
-scan_case "epoch-ms timestamp"          '+ts 1790815326123'                                      0
+# ONE rule (gate round 4): any run of 8+ digits is a finding, whatever it is. These two used to be 'clean' under the
+# per-notation list; they are the accepted false positives — one ordinary review, which is the status quo.
+scan_case "11 digits, invalid DV (accepted false positive)"  '+id 12345678901 fim'               1
+scan_case "epoch-ms timestamp (accepted false positive)"     '+ts 1790815326123'                 1
 scan_case "phone +55"                   '+fone +55 31 99999-8888'                                1
 scan_case "phone (DDD) landline"        '+fone (31) 3333-4444'                                   1
 scan_case "WhatsApp-style id"           '+jid 5531999998888@s.whatsapp.net'                      1
 scan_case "AWS key"                     '+AKIAIOSFODNN7EXAMPLE'                                  1
 scan_case "private key header"          '+-----BEGIN RSA PRIVATE KEY-----'                       1
 scan_case "secret assignment"           '+API_TOKEN = "a1b2c3d4e5f6g7h8i9j0k1l2"'                1
-scan_case "placeholder assignment"      '+API_TOKEN = "<your-token-here-0123456789>"'            0
+scan_case "placeholder assignment"      '+API_TOKEN = "<your-token-here-0123>"'                  0
 scan_case "word-like value"             '+token_refresh_policy = some_descriptive_name_value'    0
 scan_case "credentials in a URL"        '+mysql://root:hunter2pass@db.local/x'                   1
 scan_case "bead id / short sha"         '+commit f8fa11ee6 fix(ga-gnr3tw) bd ga-atsahv'          0
@@ -143,13 +145,38 @@ raw_scan "a mode-only change with a clean name" 0 < <(printf 'diff --git a/docs/
 raw_scan "an empty deleted file with a clean name" 0 < <(printf 'diff --git a/docs/ok.md b/docs/ok.md\ndeleted file mode 100644\nindex e69de29..0000000\n')
 raw_scan "a content finding in a file whose NAME also matches" 1 < <(printf 'diff --git a/docs/529.982.247-25.md b/docs/529.982.247-25.md\n--- a/docs/529.982.247-25.md\n+++ b/docs/529.982.247-25.md\n@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n')
 case "$SCAN_OUT" in *529.982*) bad "a path that matched was printed: $SCAN_OUT" ;; *) ok "…the path that matched is withheld in every line of the output" ;; esac
-# (e) bare, unformatted numbers (the shape of a CSV export in reports/): the docstring says every pattern errs wide
-for n in 31999998888 11987654321 3133334444 2133334444; do
-  raw_scan "bare Brazilian number ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+joao,${n}\n")
+# (e) personal numbers — ONE rule, not a list of notations (gate round 4: four rounds, four new notations). Once the characters
+# between digits are ignored, 8+ digits in a row is a finding. Each notation below is a row the PREVIOUS (per-notation) scanner
+# read as clean or only partly covered; the first six are the reviewer's own, verbatim.
+for n in '(31) 9 9999-8888' '31 9 9999-8888' '+55 31 9 9999-8888' '529 982 247 25' '529.982.247/25' '3333-4444'; do
+  raw_scan "reviewer's notation: ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+lead ${n} fim\n")
 done
-for n in 1790828057 12345678901 1790815326123 98765432 9999; do
-  raw_scan "control: ${n} is not a phone" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+valor,${n}\n")
+# the notation does not matter: any non-letter non-digit between the digits is ignored
+for n in '31_99999_8888' '31,99999,8888' '31|99999|8888' '31 / 99999 / 8888' '(**31**) **99999-8888**' '(**31**) **9999**-**8888**' '`31` `99999-8888`' '31 · 99999 · 8888'; do
+  raw_scan "other separator: ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+lead ${n} fim\n")
 done
+raw_scan "en dash between the groups"          1 < <(printf "${H1}@@ -0,0 +1 @@\n+fone 31\xe2\x80\x9399999\xe2\x80\x938888\n")
+raw_scan "non-breaking spaces between the groups" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+fone (31)\xc2\xa099999\xc2\xa08888\n")
+raw_scan "zero-width spaces between the groups" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+fone 31\xe2\x80\x8b99999\xe2\x80\x8b8888\n")
+raw_scan "fullwidth digits"                    1 < <(printf "${H1}@@ -0,0 +1 @@\n+fone \xef\xbc\x93\xef\xbc\x91\xef\xbc\x99\xef\xbc\x99\xef\xbc\x99\xef\xbc\x99\xef\xbc\x99\xef\xbc\x98\xef\xbc\x98\xef\xbc\x98\xef\xbc\x98\n")
+for n in 31999998888 11987654321 3133334444 2133334444 5531999998888@s.whatsapp.net 12345678; do
+  raw_scan "bare number ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+joao,${n}\n")
+done
+# a number wrapped across a line break is ONE number (a hard-wrapped document); the finding names the line it STARTS on
+raw_scan "a phone wrapped across two added lines" 1 < <(printf "${H1}@@ -0,0 +1,2 @@\n+ligar (31) 99999-\n+8888 amanha\n")
+[ "$(printf "${H1}@@ -4,0 +5,2 @@\n+ligar (31) 99999-\n+8888 amanha\n" | python3 "$SCAN" 2>&1)" = "$(printf 'numero-longo\tdocs/x.md\t5')" ] && ok "…and is reported on its first line (docs/x.md:5), once" || bad "wrapped-number finding wrong: $(printf "${H1}@@ -4,0 +5,2 @@\n+ligar (31) 99999-\n+8888 amanha\n" | python3 "$SCAN" 2>&1)"
+raw_scan "a CPF wrapped across three added lines" 1 < <(printf "${H1}@@ -0,0 +1,3 @@\n+cpf 529.982\n+.247\n+-25\n")
+raw_scan "…but two halves in SEPARATE hunks are not adjacent in the new file (documented: not covered)" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+ligar 31 9999\n@@ -5,0 +7 @@\n+8888 amanha\n")
+# the price of the rule, said out loud: dates, long ids and numeric rows are findings too (one ordinary review, the status quo)
+for n in 2026-10-01 20261001 '2026-10-01 10:56' '1.234.567.890'; do
+  raw_scan "accepted false positive: ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+em ${n} fim\n")
+done
+raw_scan "a date-stamped FILE NAME is a finding (the name is scanned like content)" 1 < <(printf 'diff --git a/docs/runbooks/reboot-20260929-0645-pre.txt b/docs/runbooks/reboot-20260929-0645-pre.txt\nnew file mode 100644\nindex 0000000..e69de29\n')
+# controls: under 8 digits, or a LETTER between the digits, or no digit at all
+for n in 9999 1234567 '31 99999' 'v1.2.3' '2026-10' 'f8fa11ee6' '31x99999x8888' 'ga-atsahv' 'trinta e um'; do
+  raw_scan "control: ${n} is not a long number" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+valor,${n}\n")
+done
+raw_scan "control: short numbers on adjacent lines separated by prose" 0 < <(printf "${H1}@@ -0,0 +1,3 @@\n+item 1234\n+texto corrido\n+item 5678\n")
 # (f) the scan runs while the dispatcher holds the citywide gate lock: no input may make it hang
 LONG="$T/long.diff"
 python3 - "$LONG" <<'PYGEN'
@@ -157,11 +184,14 @@ import sys
 n = 1_500_000
 hdr = "diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n"
 with open(sys.argv[1], "w") as f:
-    for i, body in enumerate(("a" * n, "token" * (n // 5), "ab12." * (n // 5), "x" * 1000 + "://" + "u" * n), 1):
+    # the last three stress the long-number rule: a digit followed by a huge separator run, seven-digit near misses by the
+    # million, and seven digits joined by 1000-long separator runs (the worst case for a regex that backtracks over them)
+    for i, body in enumerate(("a" * n, "token" * (n // 5), "ab12." * (n // 5), "x" * 1000 + "://" + "u" * n,
+                              "1" + "-" * n + "x", "1234567a" * (n // 8), (("1" + "-" * 1000) * 7 + "x") * (n // 8000)), 1):
         f.write(hdr.replace("x.md", f"x{i}.md") + "@@ -0,0 +1 @@\n+" + body + "\n")
 PYGEN
 SECONDS=0; rc=0; timeout 90 python3 "$SCAN" --max-bytes 20000000 < "$LONG" >/dev/null 2>&1 || rc=$?
-{ [ "$rc" = "0" ] && [ "$SECONDS" -lt 60 ]; } && ok "four 1.5 MB single-line adds (word run, repeated keyword, dotted run, scheme run) scan clean in ${SECONDS}s — no quadratic regex" || bad "long-line scan: rc=$rc after ${SECONDS}s (124 = hung; this was 18 s per 32 KB before)"
+{ [ "$rc" = "0" ] && [ "$SECONDS" -lt 60 ]; } && ok "seven 1.5 MB single-line adds (word run, repeated keyword, dotted run, scheme run, separator run, 7-digit near misses, 7 digits over 1000-long separator runs) scan clean in ${SECONDS}s — no quadratic regex" || bad "long-line scan: rc=$rc after ${SECONDS}s (124 = hung; this was 18 s per 32 KB before)"
 
 # ── 2. path classes ───────────────────────────────────────────────────────────────────────────────────────────
 echo "── 2. path classes (the story's DOC / TEST / PROMPT / CODE) ──"
@@ -297,32 +327,48 @@ S=$(mkbr s-unkmd2 'docs/ok.md=hello\n' 'daemons/README.md=nested readme\n');  de
 S=$(mkbr s-readme 'README.md=hello\n' 'CHANGELOG.md=- entry\n');             decide "$S" "";  check "control: top-level README.md + CHANGELOG.md is still fast" fast "DOC or TEST"
 S=$(mkbr s-rep 'reports/2026-10/a.md=r\n' 'runbooks/b.md=r\n' 'docs/c.txt=r\n');  decide "$S" "";  check "control: reports/ + runbooks/ + docs/ text is still fast" fast "DOC or TEST"
 # 4b. mechanical scan
-S=$(mkbr s-cpf 'docs/c.md=cliente 529.982.247-25 ligou\n');                  decide "$S" "";  check "a CPF on an added line" normal "cpf"
+S=$(mkbr s-cpf 'docs/c.md=cliente 529.982.247-25 ligou\n');                  decide "$S" "";  check "a CPF on an added line" normal "numero-longo"
 case "$D_REASON $D_FILES" in *529.982*|*52998224725*) bad "the lane output echoes the CPF value" ;; *) ok "the lane output never echoes the matched value" ;; esac
-S=$(mkbr s-phone 'docs/p.md=ligar +55 31 99999-8888\n');                     decide "$S" "";  check "a phone number on an added line" normal "telefone"
+S=$(mkbr s-phone 'docs/p.md=ligar +55 31 99999-8888\n');                     decide "$S" "";  check "a phone number on an added line" normal "numero-longo"
+# gate round 4, blocking issue 1, END TO END through the lane (main + ONE appended line in docs/lead-notes.md): the spaced mobile notation
+# merged with zero reviewers; the unspaced one went to the gate. Both go to the gate now, and so does every notation the single rule covers.
+S=$(mkbr s-ph-spaced 'docs/lead-notes.md=ligar (31) 9 9999-8888\n');          decide "$S" "";  check "a spaced mobile '(31) 9 9999-8888' (was: content scan clean → fast)" normal "numero-longo"
+S=$(mkbr s-ph-plain  'docs/lead-notes.md=ligar (31) 99999-8888\n');           decide "$S" "";  check "…and the unspaced '(31) 99999-8888' (control, was already normal)" normal "numero-longo"
+S=$(mkbr s-cpf-sp    'docs/lead-notes.md=cpf 529 982 247 25\n');               decide "$S" "";  check "a CPF with spaces '529 982 247 25' (was: fast)" normal "numero-longo"
+S=$(mkbr s-cpf-sl    'docs/lead-notes.md=cpf 529.982.247/25\n');               decide "$S" "";  check "a CPF with a slash '529.982.247/25' (was: fast)" normal "numero-longo"
+S=$(mkbr s-landline  'docs/lead-notes.md=fixo 3333-4444\n');                   decide "$S" "";  check "a landline without DDD '3333-4444' (was: fast)" normal "numero-longo"
+S=$(mkbr s-wrapped   'docs/lead-notes.md=ligar (31) 99999-\n8888 amanha\n');   decide "$S" "";  check "a phone wrapped across two added lines" normal "numero-longo"
+S=$(mkbr s-datefile  'docs/runbooks/reboot-20260929-0645-pre.txt=x\n');        decide "$S" "";  check "accepted false positive: a date-stamped file NAME goes to the ordinary gate (status quo)" normal "numero-longo"
+S=$(mkbr s-prose7    'docs/lead-notes.md=versao 1.2.3, ligar ate 31 99999, item 1234567\n');   decide "$S" "";  check "control: prose with numbers under 8 digits stays fast" fast "DOC or TEST"
 S=$(mkbr s-key 'docs/k.md=chave AKIAIOSFODNN7EXAMPLE\n');                    decide "$S" "";  check "a credential on an added line" normal "aws-key"
 # the gate's round-1 reproductions, end to end with real git: text pasted from a web page / PDF carries U+2028, NEL, FF
 S=$(mkbr s-u2028 'docs/leak.md=nota chave AKIAIOSFODNN7EXAMPLE e cliente 529.982.247-25\n' $'docs/leak2.md=pagina 1\xe2\x80\xa8fone +55 31 99999-8888\n')
-decide "$S" "";  check "a secret and a phone after a U+2028 are found (was: 'content scan clean' → fast)" normal "telefone"
+decide "$S" "";  check "a secret and a phone after a U+2028 are found (was: 'content scan clean' → fast)" normal "numero-longo"
 S=$(mkbr s-u2028b $'docs/leak.md=nota\xe2\x80\xa8chave AKIAIOSFODNN7EXAMPLE e cliente 529.982.247-25\n');   decide "$S" "";  check "a secret after a U+2028 inside ONE line" normal "aws-key"
 S=$(mkbr s-ff $'docs/ff.md=pagina 1\x0cchave AKIAIOSFODNN7EXAMPLE\n');       decide "$S" "";  check "a secret after a form feed" normal "aws-key"
 S=$(mkbr s-nel $'docs/nel.md=linha\xc2\x85chave AKIAIOSFODNN7EXAMPLE\n');    decide "$S" "";  check "a secret after a NEL (U+0085)" normal "aws-key"
 S=$(mkbr s-plusplus 'docs/pp.md=ok\n++ x AKIAIOSFODNN7EXAMPLE and key sk-abcdefghijklmnopqrstuvwx\n');   decide "$S" "";  check "an added line that starts with '++ ' (a '+++ ' line on the wire)" normal "aws-key"
 case "$D_REASON $D_FILES" in *AKIA*|*sk-abc*) bad "the lane output published the secret value: $D_REASON | $D_FILES" ;; *) ok "…and the lane output (reason + files, which go to bead comments) never carries the value" ;; esac
-S=$(mkbr s-bare 'reports/leads.csv=joao,31999998888\nmaria,11987654321\njoao,3133334444\n');   decide "$S" "";  check "a CSV in reports/ with bare, unformatted phone numbers" normal "telefone"
-S=$(mkbr s-cpfname 'docs/529.982.247-25.md=');                                decide "$S" "";  check "an EMPTY file whose NAME is a CPF" normal "cpf"
+S=$(mkbr s-bare 'reports/leads.csv=joao,31999998888\nmaria,11987654321\njoao,3133334444\n');   decide "$S" "";  check "a CSV in reports/ with bare, unformatted phone numbers" normal "numero-longo"
+S=$(mkbr s-cpfname 'docs/529.982.247-25.md=');                                decide "$S" "";  check "an EMPTY file whose NAME is a CPF" normal "numero-longo"
 case "$D_REASON $D_FILES" in *529.982*) bad "the lane output published the CPF found in a file name: $D_REASON | $D_FILES" ;; *) ok "…and the file name that matched is withheld from the lane output" ;; esac
 # 4c. tests: run, env scrubbed, stdin closed, bounded
 S=$(mkbr s-testok 'docs/n.md=x\n' 'tests/ok.selftest.sh=exit 0\n');          decide "$S" "";  check "docs + a new green test" fast "ran green"; no_leftovers "green test"
 S=$(mkbr s-testbad 'tests/bad.selftest.sh=exit 3\n');                        decide "$S" "";  check "a new test that FAILS stays in the gate (never a FAIL verdict)" normal "rc=3"; no_leftovers "failing test"
 S=$(mkbr s-scrub 'tests/scrub.selftest.sh=[ -z "${FL_SECRET:-}" ] || exit 1\ncase "$HOME" in */gc-gate-fs-fastlane-*) ;; *) exit 1 ;; esac\n')
 decide "$S" "" FL_SECRET=hunter2;  check "tests run with a scrubbed env (inherited secret absent, HOME inside the worktree)" fast "ran green"
-# the tests' PATH must not reach user bin dirs (the vault CLI `secret`, `notify`, `bd`, `gc` live under $HOME)
+# the tests' PATH must not reach tools installed under $HOME (`secret`, `notify` in ~/.local/bin). This is ALL the PATH filter does: bd, gc, dolt, gh, aws,
+# gcloud and bw live in /opt/homebrew/bin and stay reachable (gate round 4, blocking issue 2) — the credential shield is the throwaway HOME (§4c scrub case)
 mkdir -p "$T/fakehome/.local/bin"; printf '#!/bin/sh\necho VAULT-REACHED\n' > "$T/fakehome/.local/bin/secret"; chmod +x "$T/fakehome/.local/bin/secret"
 [ "$(PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" command -v secret)" = "$T/fakehome/.local/bin/secret" ] && ok "premise: a stub 'secret' IS on the caller's PATH under \$HOME" || bad "premise broken: the stub 'secret' is not findable"
 S=$(mkbr s-nosecret 'tests/nosecret.selftest.sh=if command -v secret >/dev/null 2>&1; then exit 12; fi\ncommand -v git >/dev/null || exit 13\ncommand -v jq >/dev/null || exit 14\nexit 0\n')
 # a controlled PATH: the stub dir under the (fake) HOME first, then only system/Homebrew dirs — so the REAL ~/.local/bin cannot leak in
-decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin";  check "tests run WITHOUT user bin dirs on PATH (no vault CLI) but with git/jq" fast "ran green"
+decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin";  check "tests run WITHOUT the tools under \$HOME on PATH (no 'secret') but with git/jq" fast "ran green"
+# …and it is NOT a boundary around the city (gate round 4, blocking issue 2): a control-plane tool installed OUTSIDE $HOME (bd, gc, dolt in /opt/homebrew/bin on the
+# real host) survives the filter. Pinned here so the comment in the lib cannot drift back to claiming otherwise.
+mkdir -p "$T/sysbin"; printf '#!/bin/sh\necho CITY-REACHED\n' > "$T/sysbin/bd"; chmod +x "$T/sysbin/bd"
+S=$(mkbr s-ctlplane 'tests/ctl.selftest.sh=[ "$(command -v bd)" = "'"$T"'/sysbin/bd" ] || exit 15\n')
+decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:$T/sysbin:/opt/homebrew/bin:/usr/bin:/bin";  check "a tool outside \$HOME ('bd') STAYS reachable from the tests: the PATH filter is no boundary around the city" fast "ran green"
 RAN="$T/ran.log"; : > "$RAN"
 S=$(mkbr s-stdin 'tests/a.selftest.sh=cat >/dev/null\n' "tests/b.selftest.sh=echo b >> $RAN\n")
 decide "$S" "";  check "two tests; the first reads stdin" fast "2 test file(s) ran green"
@@ -997,13 +1043,13 @@ else
   S=$(git -C "$REPO" rev-parse s-bin); FL_LIB_OVERRIDE="$T/mut-scanclean.lib.sh" decide "$S" ""
   [ "$D_LANE" = "fast" ] && ok "if 'could not scan' read as clean, a binary .md WOULD be granted fast — the real code refuses" || bad "mutant that reads unscannable as clean still read $D_LANE — assertion not load-bearing"
 fi
-# 8d. a lib that hands the tests the caller's full PATH would let an unreviewed test reach the vault CLI
+# 8d. a lib that hands the tests the caller's full PATH would let an unreviewed test find the tools installed under $HOME (the stub 'secret')
 sed 's/PATH="\$tpath"/PATH="$PATH"/' "$LIB" > "$T/mut-fullpath.lib.sh"
 cp "$SCAN" "$T/"
 if cmp -s "$LIB" "$T/mut-fullpath.lib.sh"; then bad "mutation 8d did not change the lib (sed pattern drifted)"; else
   S=$(git -C "$REPO" rev-parse s-nosecret)
   FL_LIB_OVERRIDE="$T/mut-fullpath.lib.sh" decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
-  [ "$D_LANE" = "normal" ] && ok "without the PATH filter the stub vault CLI IS reachable and the scenario goes red — the filter is what holds it" || bad "mutant with the full PATH still read $D_LANE — the PATH assertion is not load-bearing"
+  [ "$D_LANE" = "normal" ] && ok "without the PATH filter the stub 'secret' (a tool under $HOME) IS reachable and the scenario goes red — the filter is what drops $HOME tools" || bad "mutant with the full PATH still read $D_LANE — the PATH assertion is not load-bearing"
 fi
 # 8e. a producer whose code the tally does not bucket — the exact shape of the gate's blocking issue 2 — must turn §4e red
 sed 's/_gate_fastlane_normal "code-or-prompt"/_gate_fastlane_normal "made-up-code"/' "$LIB" > "$T/mut-badcode.lib.sh"
@@ -1072,6 +1118,22 @@ if cmp -s "$LIB" "$T/mut-nonull.lib.sh"; then bad "mutation 8n did not change th
   M8N=$(null_scan "$(head_of s-docs)" "$T/mut-nonull.lib.sh")
   case "$M8N" in fast\|*) ok "without the guard, a diff whose text was never read WOULD be granted fast ('$M8N') — the guard is what keeps it in the gate" ;; *) bad "mutant lib without the guard still read '$M8N' — §4e' is not load-bearing" ;; esac
 fi
+# 8o-8q. the SCANNER's single rule is load-bearing (gate round 4): a scanner that backs off any one of its three decisions must read the reviewer's formats as clean
+mut_scan() { # name sed-expr diff-printf-format want-mutant-rc — runs the real rule's diff through a scanner mutated by the sed expression
+  local f="$T/mut-scan-$1.py" real mut
+  sed "$2" "$SCAN" > "$f"
+  if cmp -s "$SCAN" "$f" || ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$f" 2>/dev/null; then bad "mutation $1 did not produce a valid, different scanner (sed pattern drifted)"; return; fi
+  real=0; printf "$3" | python3 "$SCAN" >/dev/null 2>&1 || real=$?
+  mut=0;  printf "$3" | python3 "$f"    >/dev/null 2>&1 || mut=$?
+  if [ "$real" = "1" ] && [ "$mut" = "0" ]; then ok "mutant '$1': the real scanner flags the case (rc=1) and the mutant reads it clean (rc=0) — the decision is what holds it"
+  else bad "mutant '$1': real rc=$real, mutant rc=$mut — the assertion is not load-bearing"; fi
+}
+# 8o. a threshold one digit too high (9+): the 8-digit landline '3333-4444' goes through
+mut_scan threshold 's/{7,}")/{8,}")/' "${H1}@@ -0,0 +1 @@\n+fixo 3333-4444\n"
+# 8p. the separator class back to a LIST (space . - / ( ) +): markdown emphasis between groups that are each under 8 digits goes through
+mut_scan separators 's/\[\\W_\]\*/[\\s.()\/+-]*/' "${H1}@@ -0,0 +1 @@\n+fone (**31**) **9999**-**8888**\n"
+# 8q. no adjacent-line join (each added line replaces the run): a phone wrapped across two lines goes through
+mut_scan crossline 's/run.append((lineno, line\[1:\]))/run = [(lineno, line[1:])]/' "${H1}@@ -0,0 +1,2 @@\n+ligar (31) 99999-\n+8888 amanha\n"
 echo
 echo "== gate-fastlane.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

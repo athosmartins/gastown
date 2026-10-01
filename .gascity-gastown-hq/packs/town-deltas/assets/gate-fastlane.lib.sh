@@ -19,7 +19,8 @@
 #   CODE    everything else (JSON/TOML/YAML config and deploy_deps.json included; so is a README nested below the
 #           top level, a SECRETS.md, a notes.md — anything the DOC list does not name)
 # The fast lane is granted ONLY when EVERY file is DOC or TEST AND the mechanical checks pass: the added lines
-# carry no CPF / phone / credential (gate-fastlane-scan.py), and each new or changed test that has a known
+# carry no run of 8+ digits (CPF, phone, any long id — a deliberately wide rule) and no credential shape
+# (gate-fastlane-scan.py states what it does NOT cover), and each new or changed test that has a known
 # runner runs and passes. Then the dispatcher merges through the SAME gate_finalize_run (content coherence,
 # full-suite regression, merge-time rebase) with zero reviewers.
 #
@@ -295,9 +296,13 @@ gate_fastlane_scan() {
 }
 
 # _gate_fastlane_test_path — PATH for the tests: the caller's PATH minus every entry under $HOME. The tests need
-# git/jq/python3/bash (system + Homebrew); they do not need ~/.local/bin (`secret`, `notify`, `bd`, `gc`) or
-# ~/go/bin, and a test no reviewer has read must not be able to call the vault CLI. A test that needs one of
-# those fails, and a failing test sends the diff to the normal gate — the inert outcome.
+# git/jq/python3/bash (system + Homebrew). This drops the tools installed under $HOME — on this host `secret` and
+# `notify` (~/.local/bin) — so a test no reviewer has read does not find them by name. It is NOT what keeps
+# credentials away, and it does NOT cut the test off from the city: bd, gc, dolt, gh, aws, gcloud and bw live in
+# /opt/homebrew/bin and stay on this PATH (measured under the exact env the lane builds: `bd -C <city> list` returns
+# the live city's beads, `gc --city <city>` runs). The credential shield is the throwaway HOME that
+# gate_fastlane_run_tests sets: `bw` finds no vault there and `gh` is logged out. A test that needs a dropped tool
+# fails, and a failing test sends the diff to the normal gate — the inert outcome.
 _gate_fastlane_test_path() {
   local out="" entry IFS=:
   for entry in $PATH; do
@@ -312,12 +317,15 @@ _gate_fastlane_test_path() {
 # gate_fastlane_run_tests <git_fn> <head_sha> <paths_nl> — runs each new/changed test entry in a throwaway
 # detached worktree, env scrubbed (HOME inside the worktree, no inherited credentials, no user bin dirs on
 # PATH), each under `timeout`, the whole under one budget: this runs while the dispatcher holds the citywide
-# gate lock. NOT a sandbox, and NOT the same as the full-suite check: .gate-full-suite.sh also runs branch code,
-# but only after reviewers have read it, whereas here nobody has. What bounds the exposure is that the branch
-# author already runs this same code, as the same user, in its own session — the gate's threat model is a
-# worker's mistake, not a hostile worker — plus the scrubbed env/PATH, the timeouts and the budget. A stricter
-# boundary (e.g. sandbox-exec denying network and writes outside the worktree) is a possible hardening, not
-# present here. Sets GATE_FL_TEST_RC (0 all green | 1 a test failed | 2 could not run) and GATE_FL_TEST_OUT.
+# gate lock. NOT a sandbox: the control plane (bd, gc, dolt) is reachable from PATH, and nothing stops a test from
+# using the network or writing outside the worktree. NOT the same as the full-suite check either:
+# .gate-full-suite.sh also runs branch code, but only after reviewers have read it, whereas here nobody has. What
+# bounds the exposure is that the branch author already runs this same code, as the same user, in its own session —
+# the gate's threat model is a worker's mistake, not a hostile worker — plus the throwaway HOME (the credential
+# shield; see _gate_fastlane_test_path for what PATH does and does not do), the timeouts and the budget. A
+# stricter boundary (sandbox-exec denying network and writes outside the worktree, or a PATH allowlist without
+# bd/gc/dolt/bw/gh/aws/gcloud) is a possible hardening, not present here. Sets GATE_FL_TEST_RC (0 all green | 1 a
+# test failed | 2 could not run) and GATE_FL_TEST_OUT.
 gate_fastlane_run_tests() {
   local git_fn="$1" sha="$2" paths="$3" tmp wt log f runner rc t0 now spent n=0 max budget per_file ok_n=0 tpath
   GATE_FL_TEST_RC=2; GATE_FL_TEST_OUT=""
