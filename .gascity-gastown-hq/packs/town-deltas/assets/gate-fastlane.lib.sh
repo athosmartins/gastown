@@ -282,6 +282,11 @@ gate_fastlane_scan() {
     rm -f "$tmp" 2>/dev/null || true
     return 0
   fi
+  # gate_fastlane_decide gets here only after `diff --raw` listed files, and gate_fastlane_confirm only with a fast decision on record (which listed
+  # files); a real `git diff -U0` prints a `diff --git` header for every listed file. No text at all means nothing was read — not that there was
+  # nothing to flag — so it stays the inert "could not scan" (RC 2, no fingerprint). The scanner itself still answers empty input with clean: that is
+  # its contract as a pure function; the lib knows a file list exists, the scanner does not.
+  [ -s "$tmp" ] || { GATE_FL_SCAN_OUT="git diff -U0 returned no text for a range whose file list is not empty — nothing was read"; rm -f "$tmp" 2>/dev/null || true; return 0; }
   GATE_FL_DIFF_DIGEST=$(_gate_fastlane_digest_file "$git_fn" "$tmp") || GATE_FL_DIFF_DIGEST=""
   GATE_FL_SCAN_OUT=$(python3 "$GATE_FASTLANE_DIR/gate-fastlane-scan.py" --max-bytes "${GATE_FASTLANE_SCAN_MAX_BYTES:-2097152}" < "$tmp" 2>&1) || scan_rc=$?
   GATE_FL_SCAN_RC="$scan_rc"
