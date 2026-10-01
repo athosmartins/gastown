@@ -105,16 +105,18 @@ newdir() {   # sets D, SD; copies the real siblings unless told otherwise (calle
   unset SHIM_TIMEOUT_EXPIRE
 }
 conf_on()  { printf '%s' "$CONF" > "$SD/e9-ab.conf"; }
-# run <function-text> <bead> <store> → OUT (stdout), RC
+# run <function-text> <bead> <store> → OUT (stdout), RC, WARNS (what the hook logged through warn(); the real one is the dispatcher's)
 run() {
-  printf '%s\n_e9_dispatch_line "$1" "$2"\n' "$1" > "$D/harness.sh"
-  OUT="$(PATH="$SANDBOX_PATH" E9_STATE_DIR="$SD" bash "$D/harness.sh" "$2" "$3" 2>/dev/null)"; RC=$?
+  { printf '%s\n' 'warn() { printf "%s\n" "$*" >> "$WARNLOG"; }'; printf '%s\n' "$1"; printf '%s\n' '_e9_dispatch_line "$1" "$2"'; } > "$D/harness.sh"
+  : > "$D/warn.log"
+  OUT="$(PATH="$SANDBOX_PATH" E9_STATE_DIR="$SD" WARNLOG="$D/warn.log" bash "$D/harness.sh" "$2" "$3" 2>/dev/null)"; RC=$?
+  WARNS="$(cat "$D/warn.log" 2>/dev/null)"
 }
 roster_rows() { if [ -r "$SD/e9-roster.jsonl" ]; then wc -l < "$SD/e9-roster.jsonl" | tr -d ' '; else echo 0; fi; }
 
 echo "== 1. inert by default =="
 newdir; run "$FN" "$ID_ON" /store
-[ -z "$OUT" ] && [ "$RC" = 0 ] && ok "no conf → no line, exit 0" || bad "no conf: out='$OUT' rc=$RC"
+[ -z "$OUT" ] && [ "$RC" = 0 ] && [ -z "$WARNS" ] && ok "no conf → no line, exit 0, nothing logged (an inactive experiment is not a failure)" || bad "no conf: out='$OUT' rc=$RC warns='$WARNS'"
 [ "$(roster_rows)" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "no conf → no roster row (an absent experiment records nothing)" || bad "no conf wrote a roster"
 
 newdir; conf_on; : > "$SD/no-e9-ab"; run "$FN" "$ID_ON" /store
@@ -134,6 +136,7 @@ row="$(jq -c 'select(.event=="assign")' "$SD/e9-roster.jsonl" 2>/dev/null | head
 newdir; conf_on; run "$FN" "$ID_ON" /store
 nl="$(printf '%s' "$OUT" | wc -l | tr -d ' ')"
 [ -n "$OUT" ] && [ "$RC" = 0 ] && [ "$nl" = 0 ] && ok "plan arm → exactly one line (no embedded newline)" || bad "plan arm: lines=$nl rc=$RC out='$OUT'"
+[ -z "$WARNS" ] && ok "the normal path logs nothing (a warning is for a FAILED assign only)" || bad "plan arm logged: '$WARNS'"
 case "$OUT" in *"bash $D/e9-plan.sh run $ID_ON --store /store"*) ok "the line carries the runnable command: sibling e9-plan.sh, this bead, this store" ;; *) bad "command missing from: $OUT" ;; esac
 case "$OUT" in *ga-798p6w*) ok "the line names the experiment (ga-798p6w)" ;; *) bad "experiment id missing: $OUT" ;; esac
 case "$OUT" in *"Exit 3"*"build as you always do"*) ok "the line says exit 3 (no plan) is not a verdict on the bead" ;; *) bad "exit-3 guidance missing: $OUT" ;; esac
@@ -152,6 +155,19 @@ newdir; conf_on; rm -f "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
 
 newdir; conf_on; printf '#!/bin/bash\necho on\nexit 1\n' > "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
 [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "assign prints 'on' but FAILS (exit 1) → no line (a failed write is not an assignment)" || bad "failing assign: out='$OUT' rc=$RC"
+
+# A failed assign was SILENT: the hook drops assign's stderr (its stdout is the comment line), so a roster that stopped being writable
+# switched the experiment off for every bead with nobody the wiser (gate ga-uu4y5m, non-blocking finding). The exit code is the signal.
+newdir; conf_on; printf '#!/bin/bash\necho "e9: WARN: assignment for x NOT recorded" >&2\nexit 5\n' > "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
+[ -z "$OUT" ] && [ "$RC" = 0 ] && ok "assign exits 5 (arm decided, NOT recorded) → no line, the sweep carries on" || bad "exit 5: out='$OUT' rc=$RC"
+case "$WARNS" in *"$ID_ON"*"exited 5"*"not recorded"*) ok "and it is LOGGED, naming the bead and the exit code" ;; *) bad "exit 5 not logged: '$WARNS'" ;; esac
+newdir; conf_on; printf '#!/bin/bash\nexit 3\n' > "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
+[ -z "$OUT" ] && case "$WARNS" in *"$ID_ON"*"exited 3"*) true ;; *) false ;; esac && ok "assign exits 3 (no arm could be determined) → no line, logged" || bad "exit 3: out='$OUT' warns='$WARNS'"
+if [ "$(id -u)" != 0 ]; then
+  newdir; conf_on; : > "$SD/e9-roster.jsonl"; chmod 444 "$SD/e9-roster.jsonl"; run "$FN" "$ID_ON" /store; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && [ "$RC" = 0 ] && case "$WARNS" in *"$ID_ON"*"exited 5"*) true ;; *) false ;; esac \
+    && ok "the REAL assign on a roster that cannot be written: no line (a bead with no roster row is not sent to the planner) and the failure is logged" || bad "real unwritable roster: out='$OUT' rc=$RC warns='$WARNS'"
+fi
 
 newdir; conf_on; printf '#!/bin/bash\necho maybe\nexit 0\n' > "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
 [ -z "$OUT" ] && ok "assign prints something that is not on|off → no line" || bad "garbled assign: out='$OUT'"
@@ -206,9 +222,15 @@ mutant_emits() {   # <name> <function-text> <arms-script-body> → 0 iff the mut
 M1="$(printf '%s\n' "$FN" | grep -v '^  \[ "\$_e9_arm" = "on" \] || return 0$')"
 [ "$M1" != "$FN" ] || { bad "mutation 1 did not change the function — the control is void (the 'only exact on counts' line moved?)"; }
 mutant_emits m1 "$M1" $'#!/bin/bash\necho maybe\nexit 0\n' && ok "mutation 1 (drop the exact-'on' check) is CAUGHT: a garbled arm now yields a line" || bad "mutation 1 NOT caught — the 'garbled arm' scenario cannot tell"
-M2="$(printf '%s\n' "$FN" | sed '/_e9_arm="\$(timeout 10 bash/s/ || return 0$//')"
-[ "$M2" != "$FN" ] || { bad "mutation 2 did not change the function — the control is void (the assign line moved?)"; }
+M2="$(printf '%s\n' "$FN" | sed 's/\[ "\$_e9_rc" -ne 0 \]/false/')"
+[ "$M2" != "$FN" ] || { bad "mutation 2 did not change the function — the control is void (the exit-code test moved?)"; }
 mutant_emits m2 "$M2" $'#!/bin/bash\necho on\nexit 1\n' && ok "mutation 2 (ignore the assign exit code) is CAUGHT: a failed assign now yields a line" || bad "mutation 2 NOT caught — the 'failing assign' scenario cannot tell"
+M4="$(printf '%s\n' "$FN" | grep -v '^    warn "E9: no plan hint')"
+[ "$M4" != "$FN" ] || { bad "mutation 4 did not change the function — the control is void (the warn line moved?)"; }
+newdir; conf_on; printf '#!/bin/bash\nexit 5\n' > "$D/e9-arms.sh"; run "$M4" "$ID_ON" /store
+[ -z "$WARNS" ] && [ -z "$OUT" ] && ok "mutation 4 (drop the log line) is CAUGHT: a failed assign leaves no trace, which the exit-5 scenario above detects" || bad "mutation 4 NOT caught — warns='$WARNS'"
+newdir; conf_on; printf '#!/bin/bash\nexit 5\n' > "$D/e9-arms.sh"; run "$FN" "$ID_ON" /store
+[ -n "$WARNS" ] && ok "(control for mutation 4: the unmutated hook does log that same failure)" || bad "the unmutated hook logged nothing for exit 5"
 M3="$(printf '%s\n' "$FN" | sed 's/timeout 10 bash/bash/')"
 [ "$M3" != "$FN" ] || { bad "mutation 3 did not change the function — the control is void"; }
 newdir; conf_on; : > "$TLOG"; run "$M3" "$ID_ON" /store

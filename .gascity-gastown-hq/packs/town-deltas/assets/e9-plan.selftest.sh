@@ -31,6 +31,12 @@ check() { [ "$3" = "$2" ] && ok "$1" || bad "$1 (got '$3', wanted '$2')"; }   # 
 FIX="$W/fix"; BIN="$W/bin"; REPO="$W/repo"
 mkdir -p "$FIX" "$BIN" "$REPO/lib" "$REPO/daemons"
 : > "$REPO/lib/a.py"; : > "$REPO/daemons/b.sh"
+# Paths whose FIRST characters are the ones a list marker is made of: the gascity repo root really has `.gascity-gastown-hq/`, and
+# `.github/`, `2fa/` are the shapes the path check used to eat (gate ga-uu4y5m, blocking issue 1).
+mkdir -p "$REPO/.gascity-gastown-hq/packs" "$REPO/.github/workflows" "$REPO/2fa"
+: > "$REPO/.gascity-gastown-hq/packs/foo.sh"; : > "$REPO/.github/workflows/ci.yml"; : > "$REPO/2fa/handler.py"
+: > "$W/outside.txt"                     # a real file NEXT TO the repo, not in it
+ln -s "$REPO" "$W/repo-link"             # the same checkout under another name (macOS /tmp vs /private/tmp)
 
 # ── the fakes ─────────────────────────────────────────────────────────────────────────────────────────────────
 # fake bd: `bd -C <store> show <id> --json` prints $FIX/bead-<id>.json (or `[]`, which is what the real one prints for an id it cannot
@@ -67,6 +73,19 @@ if [ -r "$roster" ]; then grep -c '"verdict":"PENDING"' "$roster" > "$fix/pendin
 exit "$(cat "$fix/claude.rc" 2>/dev/null || echo 0)"
 EOF
 chmod +x "$BIN/bd" "$BIN/claude"
+# python3 shim (put first on PATH by the cases that want it): with $E9T_FIX/break-pathcheck present, the program that checks the plan's
+# paths exits 1 — "the check could not run" — and every other python3 call is the real one. Recognised by its own MARKER regex.
+REALPY="$(command -v python3)"; PYSHIM="$W/pyshim"; mkdir -p "$PYSHIM"
+cat > "$PYSHIM/python3" <<SHIMEOF
+#!/bin/bash
+if [ "\${1:-}" = "-" ] && [ -e "\${E9T_FIX:-/nonexistent}/break-pathcheck" ]; then
+  prog="\$(mktemp "\${TMPDIR:-/tmp}/pyshim.XXXXXX")"; cat > "\$prog"
+  if grep -q 'MARKER = re.compile' "\$prog"; then rm -f "\$prog"; exit 1; fi
+  "$REALPY" "\$prog" "\${@:2}"; rc=\$?; rm -f "\$prog"; exit \$rc
+fi
+exec "$REALPY" "\$@"
+SHIMEOF
+chmod +x "$PYSHIM/python3"
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────────────────────────────
 C=0; SD=""
@@ -218,6 +237,77 @@ check "the missing path is on the FINAL row for the readout" "lib/ghost.py" "$(r
 newcase; bead_json ga-n8; claude_ok 0.5 "$(good_plan | sed -e 's#^lib/a.py.*#the parser module and the guard that calls it#' -e '/^lib\/new_guard/d')";                                                  inc "ARQUIVOS with no file in it" "plan-names-no-files" ga-n8
 newcase; bead_json ga-n9; claude_ok 0.5 "";                                                                                    inc "an empty answer" "empty-answer" ga-n9
 
+echo "== 5b. the path check does not mangle the paths it checks (gate ga-uu4y5m, blocking issue 1) =="
+pathcheck() {   # pathcheck <plan-text> [repo] → the function's own output (TOTAL=, MISSING=)
+  printf '%s\n' "$1" > "$W/pc.txt"
+  E9P_DIR="$HERE" bash -c 'source "$1"; e9p_check_paths "$2" "$3"' _ "${PLAN_UNDER_TEST:-$PLAN}" "$W/pc.txt" "${2:-$REPO}"
+}
+pcres() { printf '%s\n' "$1" | tr '\n' ' ' | sed 's/ $//'; }
+# The three shapes from the verdict, un-backticked: the first characters of the path are marker characters.
+check "a path that starts with a dot (.gascity-gastown-hq/ is a real directory of this repo root) is checked as written" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .gascity-gastown-hq/packs/foo.sh — change foo')")"
+check "a path under .github/ is checked as written" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .github/workflows/ci.yml — change ci')")"
+check "a path that starts with a digit (2fa/) is checked as written" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- 2fa/handler.py — change it')")"
+check "a MISSING dotted path is reported as the planner wrote it (not with its first characters eaten)" "TOTAL=1 MISSING=.ghost/x.py" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .ghost/x.py — change it')")"
+check "a MISSING digit-led path is reported as written" "TOTAL=1 MISSING=2ghost/x.py" "$(pcres "$(pathcheck $'ARQUIVOS:\n- 2ghost/x.py — change it')")"
+# every list-marker style the planner may use is stripped, and ONLY the marker
+for style in '- lib/a.py' '* lib/a.py' '• lib/a.py' '1. lib/a.py' '12) lib/a.py' '**lib/a.py**' '`lib/a.py`' '- `lib/a.py`' '- **lib/a.py**' '1. 2fa/handler.py' '  - lib/a.py' 'lib/a.py'; do
+  check "marker style '$style' → the file is found" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"$style — x")")"
+done
+check "ARQUIVOS: with the first path on the heading line itself" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck 'ARQUIVOS: .github/workflows/ci.yml — x')")"
+# (novo) is still exempt, and a directory still counts as present
+check "(novo) exempts a file to create, also with a dotted path" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .github/new.yml (novo) — x')")"
+check "a directory counts as present" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .github/workflows/ — x')")"
+# inside the checkout, not merely "exists on this machine" (non-blocking finding: another checkout of the same repo passes as present)
+check "../outside.txt exists NEXT TO the repo, not in it → missing" "TOTAL=1 MISSING=../outside.txt" "$(pcres "$(pathcheck $'ARQUIVOS:\n- ../outside.txt — x')")"
+check "an absolute path to a real file outside the repo → missing" "TOTAL=1 MISSING=$W/outside.txt" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"- $W/outside.txt — x")")"
+check "lib/../../outside.txt (a walk out through a real directory) → missing" "TOTAL=1 MISSING=lib/../../outside.txt" "$(pcres "$(pathcheck $'ARQUIVOS:\n- lib/../../outside.txt — x')")"
+check "lib/../lib/a.py (a ../ that stays inside) → present" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- lib/../lib/a.py — x')")"
+check "an absolute path INSIDE the checkout → present" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"- $REPO/lib/a.py — x")")"
+check "the checkout under another name (symlink): its real path is still 'inside'" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"- $REPO/lib/a.py — x" "$W/repo-link")")"
+# the third state: a check that could not RUN prints no TOTAL — it must not be readable as "nothing missing"
+OUTP="$(E9P_DIR="$HERE" bash -c 'source "$1"; e9p_check_paths "$2" "$3"' _ "$PLAN" "$W/no-such-plan.txt" "$REPO" 2>/dev/null)"; RCP=$?
+[ -z "$OUTP" ] && [ "$RCP" -ne 0 ] && ok "an unreadable plan file: no TOTAL line and a non-zero exit (the check did not run)" || bad "unreadable plan: out='$OUTP' rc=$RCP"
+check "the plan can come on stdin ('-'), for a plan stored on the bead" "TOTAL=2 MISSING=lib/ghost.py" "$(pcres "$(printf 'ARQUIVOS:\n- lib/a.py — x\n- lib/ghost.py — y\n' | E9P_DIR="$HERE" bash -c 'source "$1"; e9p_check_paths - "$2"' _ "$PLAN" "$REPO")")"
+
+# end to end: a plan that lists real dotted files un-backticked is HANDED OVER (the verdict's impact: it was thrown away after the Opus run was paid)
+plan_with_files() {   # plan_with_files <line>... → the good plan with exactly these lines under ARQUIVOS
+  printf 'FATOS: arquivos=2 superficies=1 externo=0 migracao=0\nARQUIVOS:\n'
+  printf '%s\n' "$@"
+  good_plan | sed -n '/^ABORDAGEM:/,$p'
+}
+newcase; bead_json ga-dot1; claude_ok 0.2 "$(plan_with_files '- .gascity-gastown-hq/packs/foo.sh — change foo()' '- .github/workflows/ci.yml — change ci' '- 2fa/handler.py — change handler')"
+runplan ga-dot1
+check "a plan listing .gascity-gastown-hq/, .github/ and 2fa/ files un-backticked: PLANNED, 3 paths seen, none missing" "PLANNED/3/" \
+  "$(rf verdict)/$(runrows | jq -s -r '[.[]|select(.verdict!="PENDING")][0] | "\(.paths_total)/\(.paths_missing)"')"
+[ "$(bd_updates)" = 1 ] && ok "and the plan was written to the bead" || bad "plan not persisted"
+
+echo "== 5c. a plan already on the bead is reused only if its files are still there =="
+stored_plan() { jq -nc --arg p "$1" '{"story.plano_tecnico":$p,"story.complexidade":"S"}'; }
+newcase; bead_json ga-ru1 "$(stored_plan "$(good_plan | sed 1d)")"; claude_ok 0.2 "$(good_plan)"
+runplan ga-ru1
+check "a stored plan whose files exist: REUSED, nothing spent" "REUSED/0/0" "$(rf verdict)/$(claude_calls)/$(bd_updates)"
+newcase; bead_json ga-ru2 "$(stored_plan "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')")"; claude_ok 0.2 "$(good_plan)"
+runplan ga-ru2
+check "a stored plan naming a file that is gone: NOT reused, a new plan is made and written" "PLANNED/1/1" "$(rf verdict)/$(claude_calls)/$(bd_updates)"
+case "$ERR" in *"not reused (it names missing paths: lib/ghost.py)"*) ok "and the log says why" ;; *) bad "no reason logged: $ERR" ;; esac
+newcase; bead_json ga-ru3 "$(stored_plan "$(good_plan | sed 1d | sed -e 's#^lib/a.py.*#the parser module#' -e '/^lib\/new_guard/d')")"; claude_ok 0.2 "$(good_plan)"
+runplan ga-ru3
+check "a stored plan that names no files at all is not reused either" "PLANNED/1" "$(rf verdict)/$(claude_calls)"
+newcase; bead_json ga-ru4 "$(stored_plan "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')")"; claude_ok 0.2 "$(good_plan | sed 's#^lib/a.py#lib/ghost2.py#')"
+runplan ga-ru4
+check "a stale stored plan replaced by a new plan that is ALSO wrong: INCONCLUSIVE (the bead's old plan is not handed over)" "INCONCLUSIVE/3" "$(rf verdict)/$RC"
+pending_run() { jq -nc --arg b "$1" --arg id "$2" '{ts:"2026-10-01T00:00:00Z",event:"plan_run",bead:$b,run_id:$id,verdict:"PENDING",launched:"true"}' >> "$(roster)"; }
+newcase; bead_json ga-ru5 "$(stored_plan "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')")"; claude_ok 0.2 "$(good_plan)"; pending_run ga-ru5 r1; pending_run ga-ru5 r2
+runplan ga-ru5
+check "a stale plan does not lift the per-bead run cap" "INCONCLUSIVE/run-cap:2>=2/0" "$(rf verdict)/$(rf reason)/$(claude_calls)"
+
+echo "== 5d. a path check that could not RUN is its own outcome (neither 'nothing missing' nor 'no files') =="
+newcase; bead_json ga-pf1; claude_ok 0.5 "$(good_plan)"; : > "$FIX/break-pathcheck"
+PATH="$PYSHIM:$PATH" inc "the path check cannot run (fresh plan)" "path-check-failed" ga-pf1
+newcase; bead_json ga-pf2 "$(stored_plan "$(good_plan | sed 1d)")"; claude_ok 0.5 "$(good_plan)"; : > "$FIX/break-pathcheck"
+PATH="$PYSHIM:$PATH" runplan ga-pf2
+check "the path check cannot run on a STORED plan: INCONCLUSIVE/plan-check-failed, nothing spent, nothing written" "INCONCLUSIVE/plan-check-failed/0/0" "$(rf verdict)/$(rf reason)/$(claude_calls)/$(bd_updates)"
+
 echo "== 6. what claude itself can do wrong =="
 newcase; bead_json ga-e1
 jq -nc '{type:"result",subtype:"error_max_budget_usd",is_error:true,num_turns:1,total_cost_usd:0.100102}' > "$FIX/claude.out"; echo 1 > "$FIX/claude.rc"
@@ -280,7 +370,13 @@ seed ga-cap4 r1 PENDING; chmod 000 "$(roster)"
 runplan ga-cap4
 chmod 600 "$(roster)"
 check "an unreadable roster = unknown spend: refuse to launch (never 'zero runs')" "INCONCLUSIVE/0" "$(rf verdict)/$(claude_calls)"
-case "$(rf reason)" in roster-unreadable*) ok "roster unreadable: reason named" ;; *) bad "roster unreadable: reason='$(rf reason)'" ;; esac
+# The assignment reads the same roster the cap does, so an unreadable one is now refused THERE (no arm — never a recomputed one) before the
+# cap is asked; the cap's own third state stays as a second line of defence and is asked directly below.
+case "$(rf reason)" in no-arm) ok "roster unreadable: refused at the assignment, reason 'no-arm'" ;; *) bad "roster unreadable: reason='$(rf reason)'" ;; esac
+newcase; seed ga-cap4b r1 PENDING; chmod 000 "$(roster)"
+OUTP="$(E9P_DIR="$HERE" bash -c 'source "$1"; e9p_prior_runs "$2"' _ "$PLAN" ga-cap4b 2>/dev/null)"; RCP=$?
+chmod 600 "$(roster)"
+[ -z "$OUTP" ] && [ "$RCP" = 1 ] && ok "e9p_prior_runs on an unreadable roster: prints nothing, exit 1 (cannot tell is not 'zero runs')" || bad "e9p_prior_runs unreadable: out='$OUTP' rc=$RCP"
 newcase; bead_json ga-cap5; claude_ok 0.2 "$(good_plan)"; export E9_PLAN_MAX_RUNS=1; seed ga-cap5 r1 PENDING
 runplan ga-cap5
 check "E9_PLAN_MAX_RUNS is honoured" "run-cap:1>=1" "$(rf reason)"; unset E9_PLAN_MAX_RUNS
@@ -374,6 +470,43 @@ for id in ga-p1 ga-p2 ga-p3 ga-p4 ga-p5 ga-p6 ga-p7 ga-p8; do bead_json "$id"; c
 ok "e9-plan.sh and e9-arms.sh agree on the arm of 8 beads (one assignment, readable by the readout)"
 check "50%: planned beads == assigned-on beads (every on-arm bead got a plan or an INCONCLUSIVE row; no off-arm bead was charged)" "$(jq -s '[.[]|select(.event=="assign" and .planner_arm=="on")]|length' "$(roster)")" "$(runrows | jq -s '[.[]|select(.verdict=="PLANNED")]|length')"
 
+echo "== 13b. the arm acted on is the arm RECORDED; looking at a bead does not enrol it (gate ga-uu4y5m, blocking issues 2 and 3) =="
+roster_lines() { if [ -e "$(roster)" ] && [ -f "$(roster)" ]; then wc -l < "$(roster)" | tr -d ' '; else echo 0; fi; }
+newcase; bead_json ga-dr1; claude_ok 0.2 "$(good_plan)"
+runplan ga-dr1 --dry-run
+check "--dry-run: the roster gets NO row of any kind (it used to leave an 'assign' row — the experiment's denominator)" "DRYRUN/0" "$(rf verdict)/$(roster_lines)"
+runplan ga-dr1 --print-task
+check "--print-task: the roster gets NO row either" "DRYRUN/0" "$(rf verdict)/$(roster_lines)"
+[ ! -e "$SD/e9-roster.jsonl" ] && ok "the roster file does not even exist after two inspections" || bad "an inspection created the roster"
+check "an inspection still reports the arm the bead would get" "on" "$(rf arm)"
+runplan ga-dr1
+check "a REAL run after the inspections records the assignment exactly once" "1" "$(jq -s '[.[]|select(.event=="assign")]|length' "$(roster)")"
+
+# the ramp: pct 0 -> 100 between the Pilot's assignment and the builder's run (a re-dispatch after a gate FAIL is the normal case)
+newcase; printf 'planner_pct=0\ncomplexity=on\nsalt=t1\n' > "$SD/e9-ab.conf"; bead_json ga-fl1; claude_ok 0.2 "$(good_plan)"
+runplan ga-fl1
+check "pct=0: the bead is in the control arm (SKIPPED, nothing spent)" "SKIPPED/off/0" "$(rf verdict)/$(rf arm)/$(claude_calls)"
+printf 'planner_pct=100\ncomplexity=on\nsalt=t1\n' > "$SD/e9-ab.conf"
+runplan ga-fl1
+check "the conf ramps to 100% afterwards: the RECORDED arm (off) still rules — nothing is spent on a bead the roster counts as control" "SKIPPED/off/0" "$(rf verdict)/$(rf arm)/$(claude_calls)"
+runplan ga-fl1 --dry-run
+check "--dry-run after the ramp reports the recorded arm too" "off" "$(rf arm)"
+check "one assign row, still planner_arm=off planner_pct=0" "1/off/0" "$(jq -s -r '[.[]|select(.event=="assign")] | "\(length)/\(.[0].planner_arm)/\(.[0].planner_pct)"' "$(roster)")"
+newcase; bead_json ga-fl2; claude_ok 0.2 "$(good_plan)"
+runplan ga-fl2 --dry-run; printf 'planner_pct=0\ncomplexity=on\nsalt=t1\n' > "$SD/e9-ab.conf"
+runplan ga-fl2
+check "a dry look at 100% followed by a ramp DOWN to 0%: the look did not lock the arm, the real run is control" "SKIPPED/off" "$(rf verdict)/$(rf arm)"
+
+# a roster that cannot record the assignment, or cannot be read: no arm — the bead gets no plan and costs nothing
+if [ "$(id -u)" != 0 ]; then
+  newcase; bead_json ga-nr1; claude_ok 0.2 "$(good_plan)"; : > "$(roster)"; chmod 444 "$(roster)"
+  runplan ga-nr1; chmod 600 "$(roster)"
+  check "a roster that cannot record the assignment: INCONCLUSIVE/assign-not-recorded, exit 3, claude never called" "INCONCLUSIVE/assign-not-recorded/3/0" "$(rf verdict)/$(rf reason)/$RC/$(claude_calls)"
+fi
+newcase; bead_json ga-nr2; claude_ok 0.2 "$(good_plan)"; mkdir "$(roster)"
+runplan ga-nr2
+check "a roster that cannot be READ: INCONCLUSIVE/no-arm (not a recomputed arm), claude never called" "INCONCLUSIVE/no-arm/3/0" "$(rf verdict)/$(rf reason)/$RC/$(claude_calls)"
+
 echo "== 14. mutation controls — the invariants above, broken on purpose, must be noticed =="
 MUT="$W/mut"; mkdir -p "$MUT"
 mutant() {   # mutant <name> <python-old> <python-new> <invariant-fn>   (the invariant fn returns 0 when it HOLDS)
@@ -420,6 +553,19 @@ mutant "the planner gets Bash"                  '--tools "Read,Grep,Glob"' '--to
 mutant "the planner inherits the builder's identity" '-u GC_SESSION_NAME -u GC_ALIAS -u GC_AGENT -u GC_SESSION_ID -u GC_TEMPLATE -u GC_CITY_PATH' '-u GC_ALIAS' inv_identity
 mutant "a plan already on the bead is re-bought" 'if [ "$(e9_plan_status)" = ok ]; then' 'if false; then' inv_reuse_free
 mutant "TERM is not handled"                    "trap 'e9p_on_signal TERM 143' TERM" 'true' inv_kill_settles
+# — added with the gate-ga-uu4y5m fixes: each of them is guarded by a mutant that puts the old behaviour back —
+inv_dotted_paths() { newcase; bead_json ga-m; claude_ok 0.2 "$(plan_with_files '- .gascity-gastown-hq/packs/foo.sh — x' '- .github/workflows/ci.yml — y' '- 2fa/handler.py — z')"; runplan ga-m; [ "$(rf verdict)" = PLANNED ]; }
+inv_outside_paths() { newcase; bead_json ga-m; claude_ok 0.2 "$(plan_with_files '- lib/a.py — x' "- $W/outside.txt — y")"; runplan ga-m; [ "$RC" = 3 ] && [ "$(bd_updates)" = 0 ]; }
+inv_dry_no_enrol() { newcase; bead_json ga-m; claude_ok 0.2 "$(good_plan)"; runplan ga-m --dry-run; runplan ga-m --print-task; [ "$(roster_lines)" = 0 ]; }
+inv_reuse_stale() { newcase; bead_json ga-m "$(stored_plan "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')")"; claude_ok 0.2 "$(good_plan)"; runplan ga-m; [ "$(rf verdict)" = PLANNED ] && [ "$(claude_calls)" = 1 ]; }
+inv_check_cannot_run() { newcase; bead_json ga-m; claude_ok 0.2 "$(good_plan)"; : > "$FIX/break-pathcheck"; PATH="$PYSHIM:$PATH" runplan ga-m; [ "$(rf reason)" = path-check-failed ] && [ "$(bd_updates)" = 0 ]; }
+inv_not_recorded() { [ "$(id -u)" = 0 ] && return 0; newcase; bead_json ga-m; claude_ok 0.2 "$(good_plan)"; : > "$(roster)"; chmod 444 "$(roster)"; runplan ga-m; chmod 600 "$(roster)"; [ "$(rf reason)" = assign-not-recorded ] && [ "$(claude_calls)" = 0 ]; }
+mutant "the list-marker regex eats the first characters of a path" 'MARKER = re.compile(r"^(?:(?:[-*\u2022]|\d+[.)])\s+|\*\*)+")' 'MARKER = re.compile(r"^[-*\d.)\s]+")' inv_dotted_paths
+mutant "a path outside the checkout counts as present" 'if not inside(full) or not os.path.exists(full):' 'if not os.path.exists(full):' inv_outside_paths
+mutant "--dry-run / --print-task enrol the bead" 'arm="$(e9_cmd_peek "$bead")"; assign_rc=$?' 'arm="$(e9_cmd_assign "$bead" "${store:-$(e9_city)}" builder-start)"; assign_rc=$?' inv_dry_no_enrol
+mutant "a stored plan is reused without the file check" 'if [ -z "$rmissing" ] && [ "$rtotal" -ge 1 ]; then' 'if true; then' inv_reuse_stale
+mutant "a path check that could not run counts as clean" 'if [ -z "$ptotal" ]; then   # the check itself' 'if false; then   # the check itself' inv_check_cannot_run
+mutant "an assignment that was not recorded still gets a plan" '5:*) E9P_ARM="none"; e9p_inconclusive "assign-not-recorded"; return $? ;;' '5:*) ;;' inv_not_recorded
 
 echo
 echo "e9-plan selftest: $PASS passed, $FAILN failed"

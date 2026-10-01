@@ -420,7 +420,9 @@ def main():
             continue
         rs = runs_by_bead.get(b, [])
         if not rs:
-            classes["nunca rodou o planejador (nenhum run lançado)"] += 1
+            # the roster only records LAUNCHED runs: a refusal before launch (machine guard, busy, cap, bd unreadable) and a builder that ignored
+            # the hint both leave nothing, and this label must not claim to know which one it was
+            classes["sem run lançado (recusa antes de lançar OU dica ignorada — o roster não distingue)"] += 1
             continue
         cl = [run_class(r, now, a.pending_grace_min * 60) for r in rs]
         classes["planejado" if "planejado" in cl else cl[-1]] += 1

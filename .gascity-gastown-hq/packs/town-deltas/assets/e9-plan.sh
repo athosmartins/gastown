@@ -373,14 +373,37 @@ sys.exit(1)
 PY
 }
 
-# e9p_check_paths <plan-file> <repo> — the ARQUIVOS section's paths against the checkout. Prints TOTAL=<n> and MISSING=<p1,p2,..>.
+# e9p_check_paths <plan-file|-> <repo> — the ARQUIVOS section's paths against the checkout ("-" reads the plan from stdin, for a plan
+# that is on the bead rather than in a file). Prints TOTAL=<n> and MISSING=<p1,p2,..>; prints NOTHING and fails when it could not run,
+# which is not the same as "nothing is missing" — callers must look for the TOTAL line.
 # A path marked (novo) is a file to create and is exempt; a path that is a directory counts as present. A line whose first token
-# does not look like a path is not counted (the heading's own prose is not a file).
+# does not look like a path is not counted (the heading's own prose is not a file). A path counts as present only if it is INSIDE the
+# checkout: an absolute path or a ../ walk to a file that exists elsewhere (another checkout of this repo, /etc/hosts) is missing —
+# the builder works in this checkout, and the planner is told that other checkouts are out of scope.
 e9p_check_paths() {
-  python3 - "$1" "$2" <<'PY'
+  # python3 reads ITS PROGRAM from the heredoc below, so its stdin is not available for the plan: "-" is spooled to a file here.
+  local src="$1" spool="" rc
+  if [ "$src" = "-" ]; then
+    spool="$(mktemp "${TMPDIR:-/tmp}/e9-paths.XXXXXX")" || return 1
+    cat > "$spool" || { rm -f "$spool"; return 1; }
+    src="$spool"
+  fi
+  python3 - "$src" "$2" <<'PY'
 import os, re, sys
 plan, repo = sys.argv[1:3]
-text = open(plan, encoding="utf-8", errors="replace").read().splitlines()
+try:
+    text = open(plan, encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    sys.exit(1)
+bases = {os.path.normpath(repo), os.path.realpath(repo)}   # the checkout as given and with symlinks resolved (/tmp vs /private/tmp)
+def _under(full):
+    return any(full == b or full.startswith(b.rstrip(os.sep) + os.sep) for b in bases)
+def inside(full):   # lexically inside, or resolving inside (the checkout under an alias, e.g. /tmp vs /private/tmp)
+    return _under(full) or _under(os.path.realpath(full))
+# A list marker is a bullet or a number followed by whitespace ("- ", "* ", "1. ", "2) ") or a bold "**"; markers may stack ("- **x**").
+# What is stripped is only ever a marker, never a bare character of the path: ".github/x", ".gascity-gastown-hq/x" and "2fa/x" start
+# with the very characters a marker is made of.
+MARKER = re.compile(r"^(?:(?:[-*\u2022]|\d+[.)])\s+|\*\*)+")
 in_files, total, missing = False, 0, []
 for raw in text:
     line = raw.strip()
@@ -389,7 +412,7 @@ for raw in text:
         line = line[len("ARQUIVOS:"):].strip() if in_files else ""
     if not in_files or not line:
         continue
-    line = re.sub(r"^[-*\d.)\s]+", "", line)
+    line = MARKER.sub("", line)
     m = re.match(r"^`?([A-Za-z0-9_./@+-]+(?:/[A-Za-z0-9_./@+-]+|\.[A-Za-z0-9]+))`?", line)
     if not m:
         continue
@@ -397,11 +420,15 @@ for raw in text:
     total += 1
     if re.search(r"\((?:novo|new)\)", line):
         continue
-    if not os.path.exists(os.path.join(repo, path)):
+    full = os.path.normpath(os.path.join(repo, path))   # join leaves an absolute path alone; normpath folds the ../ steps
+    if not inside(full) or not os.path.exists(full):
         missing.append(path)
 print("TOTAL=%d" % total)
 print("MISSING=" + ",".join(missing))
 PY
+  rc=$?
+  [ -n "$spool" ] && rm -f "$spool"
+  return "$rc"
 }
 
 # ── main: run ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -440,12 +467,20 @@ e9p_run_inner() {
        e9p_finish INERT "$E9_STATE" 0; return $? ;;
   esac
 
-  # ── the arm: recorded once per bead per salt, whoever sees the bead first ──
+  # ── the arm: recorded once per bead per salt, whoever sees the bead first; every later look reads THAT record ──
+  # --dry-run / --print-task only LOOK: they read the recorded arm (or compute the pure one) and write nothing. The roster is the
+  # experiment's denominator and the first assignment fixes the arm at the pct of that moment, so an inspection that enrolled the bead
+  # would put a never-dispatched bead into the analysis and could lock its arm before the Pilot saw it.
   local arm assign_rc
-  arm="$(e9_cmd_assign "$bead" "${store:-$(e9_city)}" builder-start)"; assign_rc=$?
+  if [ "$dry" -eq 1 ] || [ "$printtask" -eq 1 ]; then
+    arm="$(e9_cmd_peek "$bead")"; assign_rc=$?
+  else
+    arm="$(e9_cmd_assign "$bead" "${store:-$(e9_city)}" builder-start)"; assign_rc=$?
+  fi
   case "$assign_rc:$arm" in
     0:on|0:off) ;;
-    *) E9P_ARM="none"; e9p_inconclusive "no-arm"; return $? ;;   # no arm is neither "off" (would join the control) nor "on"
+    5:*) E9P_ARM="none"; e9p_inconclusive "assign-not-recorded"; return $? ;;   # the arm exists but has no roster row: no denominator slot, no treatment
+    *)   E9P_ARM="none"; e9p_inconclusive "no-arm"; return $? ;;                # no arm is neither "off" (would join the control) nor "on"
   esac
   E9P_ARM="$arm"
   [ "$arm" = on ] || { e9p_finish SKIPPED "control-arm" 0; return $?; }
@@ -463,10 +498,22 @@ e9p_run_inner() {
   json="$(e9p_with_timeout 60 "$bd" -C "$store" show "$bead" --json 2>/dev/null)" || json=""
   # `bd show` of an id it cannot find prints [] — "could not read the bead", never "the bead has no plan".
   e9_bead_load "$json" || { e9p_inconclusive "bead-unreadable"; return $?; }
+  # A stored plan passed the structure check when it was written, but the checkout may have moved since (an earlier attempt on another
+  # base, a refiner that never saw this tree): the file check that gates a FRESH plan gates a reused one too. A plan that fails it is not
+  # handed over and is replaced by a new one (the run cap below still applies); a check that could not RUN is neither — it is refused
+  # without spending, because "could not tell" is not "stale".
   if [ "$(e9_plan_status)" = ok ]; then
-    case "$E9_J_LEVEL_META" in S|M|L) E9P_LEVEL="$E9_J_LEVEL_META" ;; *) E9P_LEVEL="unknown" ;; esac
-    e9p_emit_plan "already on the bead — nothing spent" "$E9_J_PLAN"
-    e9p_finish REUSED "plan-on-bead" 0; return $?
+    local rpaths rtotal rmissing
+    rpaths="$(printf '%s\n' "$E9_J_PLAN" | e9p_check_paths - "$repo")"
+    rtotal="$(printf '%s\n' "$rpaths" | sed -n 's/^TOTAL=//p')"; rmissing="$(printf '%s\n' "$rpaths" | sed -n 's/^MISSING=//p')"
+    if [ -z "$rtotal" ]; then e9p_inconclusive "plan-check-failed"; return $?; fi
+    if [ -z "$rmissing" ] && [ "$rtotal" -ge 1 ]; then
+      case "$E9_J_LEVEL_META" in S|M|L) E9P_LEVEL="$E9_J_LEVEL_META" ;; *) E9P_LEVEL="unknown" ;; esac
+      e9p_emit_plan "already on the bead — nothing spent" "$E9_J_PLAN"
+      e9p_finish REUSED "plan-on-bead" 0; return $?
+    fi
+    if [ -n "$rmissing" ]; then e9p_log "the plan already on $bead is not reused (it names missing paths: $rmissing) — planning again"
+    else e9p_log "the plan already on $bead is not reused (it names no files) — planning again"; fi
   fi
 
   local task
@@ -588,6 +635,11 @@ e9p_run_inner() {
   local paths ptotal pmissing
   paths="$(e9p_check_paths "$work/body.txt" "$repo")"
   ptotal="$(printf '%s\n' "$paths" | sed -n 's/^TOTAL=//p')"; pmissing="$(printf '%s\n' "$paths" | sed -n 's/^MISSING=//p')"
+  if [ -z "$ptotal" ]; then   # the check itself did not run: not "no files named" and not "none missing"
+    E9P_LEVEL="-"
+    e9p_settle INCONCLUSIVE "path-check-failed" "${cost_kv[@]}" || true
+    e9p_inconclusive "path-check-failed"; return $?
+  fi
   if [ -n "$pmissing" ]; then
     E9P_LEVEL="-"
     e9p_settle INCONCLUSIVE "plan-names-missing-paths:$pmissing" paths_total="$ptotal" paths_missing="$pmissing" "${cost_kv[@]}" || true

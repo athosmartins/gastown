@@ -50,9 +50,17 @@ Garantias que valem para o conjunto:
   Conf malformado é um estado próprio (`invalid`), não "sem conf": um typo não pode rodar o experimento a 0%.
 - **Três estados, nunca dois.** Braço `on` / `off` / "não sei dizer" nunca imprimem a mesma coisa. Um `assign` que falha, estoura o tempo ou imprime lixo
   NÃO vira `on` (apontaria um construtor para uma execução Opus paga de uma bead que não está no braço). Custo desconhecido é "desconhecido", nunca US$ 0.
+- **O braço de uma bead é o que o ROSTER gravou, não o que o conf diz agora.** `assign` grava uma linha por bead e salt; toda chamada seguinte (outro estágio,
+  re-despacho depois de reprovar no gate) devolve o braço DESSA linha. Subir `planner_pct` depois (canário → 50%) só vale para beads ainda não atribuídas —
+  recalcular faria uma bead gravada como controle rodar o planejador pago enquanto o roster a conta como controle. Roster que não dá para LER = sem braço
+  (exit 3, nunca recalcula); braço decidido mas que não deu para GRAVAR = sem braço e sem tratamento (exit 5; o Pilot loga o código, porque descarta o stderr).
+- **Olhar não matricula.** `e9-plan.sh run <bead> --dry-run` / `--print-task` e `e9-arms.sh peek <bead>` leem o braço gravado (ou o puro, se não há) e não escrevem nada no roster.
 - **Braço controle = o fluxo de hoje**, byte a byte; mas é REGISTRADO no roster (um controle sem denominador não é controle).
 - **O planejador não age.** Sem Bash, sem rede, sem edição, sem identidade de sessão; o texto da bead entra cercado como DADO. O plano nomeia
-  arquivos: se algum não existe, o plano NÃO é entregue (plano errado é pior que nenhum).
+  arquivos: se algum não existe NO CHECKOUT (caminho absoluto ou `../` que cai fora dele não conta, mesmo que o arquivo exista na máquina), o plano NÃO é entregue
+  (plano errado é pior que nenhum). Só marcadores de lista (`- `, `* `, `1. `, `2) `, `**`) são removidos antes da checagem — nunca o começo do caminho (`.github/`, `2fa/`).
+  O mesmo vale para um plano já gravado na bead: ele só é reusado se os arquivos ainda existem; senão é refeito (o teto de execuções por bead continua valendo).
+  Se a checagem em si não roda, o resultado é `INCONCLUSIVE` com razão própria (`path-check-failed` / `plan-check-failed`) — não é "nada faltando" nem "nenhum arquivo".
 - **Todo gasto deixa linha.** Duas linhas `plan_run` por execução (PENDING antes de gastar, FINAL depois); se a PENDING não pode ser escrita, a execução não começa.
 - **Teto de gasto:** US$ 4 por execução, 2 execuções por bead, 900 s, 2 concorrentes, e a guarda de máquina (disco/swap) recusa em vez de somar carga.
 - **Intenção de tratar.** Uma bead `on` cujo planejador falhou (exit 3, INCONCLUSIVE) continua no braço `on` na análise; a aderência sai em separado.
@@ -108,7 +116,8 @@ Desligar: `touch "$GC_CITY_PATH/.gc/no-e9-ab"` (ou remover o conf) — vale no p
 (`.gc/e9-roster.jsonl`) e os planos guardados (`.gc/e9-plans/`) ficam para a apuração.
 
 Estado e braço de uma bead: `bash e9-arms.sh state` · `bash e9-arms.sh arm planner <bead-id>` (receita recomputável por qualquer um:
-`printf '%s' "e9-planner:e9a:<bead-id>" | shasum -a 256 | cut -c1-8`, em decimal módulo 100, `< planner_pct` ⇒ `on`).
+`printf '%s' "e9-planner:e9a:<bead-id>" | shasum -a 256 | cut -c1-8`, em decimal módulo 100, `< planner_pct` ⇒ `on`). Essa é a receita da PRIMEIRA atribuição;
+depois dela vale o braço gravado no roster (`bash e9-arms.sh peek <bead-id>` mostra o que valerá, sem gravar).
 O prefixo `e9-planner:` não é enfeite: o braço do E3 é a paridade de SHA-256("pregate:<id>"); dois experimentos sobre as mesmas beads não podem ser a mesma moeda.
 
 Ler o resultado (read-only, a qualquer hora):
@@ -134,3 +143,7 @@ O que o construtor vê (braço `on`): uma linha no comentário de despacho manda
 ## 7. Fora deste slice
 
 Roteamento modelo × effort por nível (§3) · ligar o gancho do refino (`e9-arms.sh block|finalize`) · decisão de ligar o experimento e de qual `planner_pct` (Mayor).
+
+**Limite conhecido, deixado de fora de propósito:** uma recusa ANTES de lançar o planejador (guarda de máquina, slots ocupados, teto, `bd` ilegível) não grava linha no roster
+(só run lançado grava). Por isso a apuração junta, em "sem run lançado", "a guarda recusou" e "o construtor ignorou a dica" — o rótulo diz isso em vez de afirmar um dos dois.
+Não afeta o veredito (intenção de tratar); só a leitura da aderência. Separar exige uma linha de recusa no roster e uma classe nova na apuração.

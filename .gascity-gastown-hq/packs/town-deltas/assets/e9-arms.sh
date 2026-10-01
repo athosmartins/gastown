@@ -44,6 +44,11 @@
 #   arms planner                           ids on stdin → "<id> on|off" lines (the readout's recompute; stops at the first id with no arm)
 #   assign <bead-id> [store]               WRITES the roster. While the experiment is active prints on|off and records who was
 #                                          assigned (the control arm needs a denominator); inert/invalid prints nothing, exit 0.
+#                                          ONE assignment per bead per salt: a bead that already has a row gets THAT row's arm back,
+#                                          whatever the conf says now (a pct ramp must not flip a re-dispatched bead).
+#                                          exit 3 = no arm (bad id, no sha tool, roster unreadable), 5 = arm decided but NOT recorded
+#                                          (roster unwritable); both print nothing — a bead with no roster row gets no treatment.
+#   peek <bead-id>                         assign without the write: the recorded arm, else the pure arm of the current conf.
 #   block <bead-id> <store>                the text spliced into the refiner's prompt ('' when inert); records the assignment.
 #   complexity <files> <surfaces> <external:0|1> <migration:0|1>   prints S | M | L. exit 2 on any bad argument — never a default.
 #   finalize                               reads the bead's `bd show --json` on stdin, prints the writes to apply (see below)
@@ -180,25 +185,69 @@ e9_record() {
     '{ts:$ts,event:$event} + ($ARGS.named | del(.ts,.event))' >> "$(e9_roster)" 2>/dev/null || return 3
 }
 
-# Has this bead already been assigned under this salt? (one assignment per bead per experiment — a re-attempt keeps its arm)
-e9_already_assigned() {
-  local r; r="$(e9_roster)"
-  [ -r "$r" ] || return 1
-  jq -e --arg b "$1" --arg s "$2" -s 'any(.[]; .event=="assign" and .bead==$b and .salt==$s)' "$r" >/dev/null 2>&1
+# e9_recorded_arm <bead> <salt> — the arm the ROSTER holds for this bead under this salt (the first assignment wins). Three answers:
+#   rc 0  prints on|off    the roster has a row for it
+#   rc 1  prints nothing   there is no row (no roster file, or a readable roster without one) — the only case where an arm may be COMPUTED
+#   rc 3  prints nothing   it cannot be told: the roster exists but cannot be read, jq is missing, or the row's arm is not on|off
+# A line that is not a JSON object (a truncated write) is skipped, not fatal: one bad line must not make every bead look unassigned —
+# that is how a bead used to collect a fresh assign row per re-dispatch. The ROW: prefix is what tells "a row without an arm" from "no row".
+e9_recorded_arm() {
+  local r out rc first; r="$(e9_roster)"
+  [ -e "$r" ] || return 1
+  { [ -f "$r" ] && [ -r "$r" ]; } || return 3
+  command -v jq >/dev/null 2>&1 || return 3
+  out="$(jq -R -r --arg b "$1" --arg s "$2" \
+    'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b and .salt==$s) | "ROW:" + ((.planner_arm // "") | tostring)' "$r" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 3
+  [ -n "$out" ] || return 1
+  first="${out%%$'\n'*}"; first="${first#ROW:}"
+  case "$first" in on|off) printf '%s' "$first"; return 0 ;; *) return 3 ;; esac
 }
 
+e9_bad_bead_id() { case "${1:-}" in ''|*[[:space:]]*) return 0 ;; esac; return 1; }
+
+# assign <bead> [store] [stage] — the arm the bead is IN, recorded once per (bead, salt); every later call, from any stage, prints
+# THAT recorded arm. Recomputing it from the current conf instead would let a pct ramp (canary -> 50%) tell a re-dispatched bead to run
+# the paid planner while the roster counts it as control — the variable decided on must be the variable acted on.
+#   exit 0  the arm is printed (on|off), or nothing is printed because the experiment is not active
+#   exit 3  no arm could be determined (bad id, no sha tool, roster unreadable): prints nothing — "no arm" is neither on nor off
+#   exit 5  the arm was determined but could NOT be recorded: prints nothing. A bead with no roster row has no denominator slot, so it
+#           gets no treatment and no hint; the exit code (not only stderr) lets a caller that discards stderr notice and log it.
 e9_cmd_assign() {
-  local bead="${1:-}" store="${2:-}" stage="${3:-}" arm
+  local bead="${1:-}" store="${2:-}" stage="${3:-}" arm rec rrc
   e9_conf_load
   [ "$E9_STATE" = active ] || return 0
+  e9_bad_bead_id "$bead" && { echo "e9: cannot assign an arm to '$bead'" >&2; return 3; }
+  rec="$(e9_recorded_arm "$bead" "$E9_SALT")"; rrc=$?
+  case "$rrc" in
+    0) printf '%s\n' "$rec"; return 0 ;;
+    1) ;;
+    *) echo "e9: the roster cannot be read, so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
+  esac
   arm="$(e9_arm_for "$bead")" || { echo "e9: cannot assign an arm to '$bead' (rc=$?)" >&2; return 3; }
   # `stage` (optional) says which stage first saw the bead — refiner | pilot-dispatch | builder-start. The arm does not depend on it:
   # one assignment per bead per salt, whoever asks first records it, and every later stage reads the same answer.
-  if ! e9_already_assigned "$bead" "$E9_SALT"; then
-    e9_record assign bead="$bead" store="$store" salt="$E9_SALT" planner_arm="$arm" planner_pct="$E9_PCT" complexity="$E9_COMPLEXITY" \
-      ${stage:+stage="$stage"} \
-      || echo "e9: WARN: assignment for $bead NOT recorded (roster unwritable)" >&2
-  fi
+  e9_record assign bead="$bead" store="$store" salt="$E9_SALT" planner_arm="$arm" planner_pct="$E9_PCT" complexity="$E9_COMPLEXITY" \
+    ${stage:+stage="$stage"} \
+    || { echo "e9: WARN: assignment for $bead NOT recorded (roster unwritable) — no arm handed out" >&2; return 5; }
+  printf '%s\n' "$arm"
+}
+
+# peek <bead> — the arm assign WOULD print, without writing anything: the recorded arm if the roster has one, else the pure arm of
+# the current conf. For inspection (`e9-plan.sh run --dry-run / --print-task`): looking at a bead must not enrol it — the roster is the
+# experiment's denominator, and the first assignment fixes the arm at the pct of that moment. Same exits as assign minus 5.
+e9_cmd_peek() {
+  local bead="${1:-}" arm rec rrc
+  e9_conf_load
+  [ "$E9_STATE" = active ] || return 0
+  e9_bad_bead_id "$bead" && { echo "e9: cannot peek an arm for '$bead'" >&2; return 3; }
+  rec="$(e9_recorded_arm "$bead" "$E9_SALT")"; rrc=$?
+  case "$rrc" in
+    0) printf '%s\n' "$rec"; return 0 ;;
+    1) ;;
+    *) echo "e9: the roster cannot be read, so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
+  esac
+  arm="$(e9_arm_for "$bead")" || { echo "e9: cannot determine an arm for '$bead' (rc=$?)" >&2; return 3; }
   printf '%s\n' "$arm"
 }
 
@@ -388,12 +437,13 @@ e9_main() {
     arm)        e9_cmd_arm "$@" ;;
     arms)       e9_cmd_arms "$@" ;;
     assign)     e9_cmd_assign "$@" ;;
+    peek)       e9_cmd_peek "$@" ;;
     block)      e9_cmd_block "$@" ;;
     complexity) e9_complexity "$@" || { echo "e9: bad complexity arguments: $*" >&2; return 2; } ;;
     finalize)   e9_cmd_finalize ;;
     check)      e9_cmd_check ;;
     plancheck)  e9_cmd_plancheck ;;
-    *) echo "usage: e9-arms.sh state | arm planner <id> | arms planner (ids on stdin) | assign <id> [store] | block <id> <store> | complexity <f> <s> <ext> <mig> | finalize | check | plancheck" >&2; return 2 ;;
+    *) echo "usage: e9-arms.sh state | arm planner <id> | arms planner (ids on stdin) | assign <id> [store] | peek <id> | block <id> <store> | complexity <f> <s> <ext> <mig> | finalize | check | plancheck" >&2; return 2 ;;
   esac
 }
 

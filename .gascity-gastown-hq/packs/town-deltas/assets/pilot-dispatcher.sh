@@ -9588,13 +9588,20 @@ _pilot_release_count_unreadable() {
 # every failure path falls through to the comment exactly as it was. `assign` also runs for the control arm on purpose: it is what
 # records who was assigned, and a control arm with no denominator is not a control. It makes no bd call (jq, a hash, one roster
 # append), so the 10s bound is generous even at load 50.
+# A FAILED assign is logged (to stderr — stdout is captured as the comment line): its own stderr is dropped here because the hook has
+# one channel, so the exit code is what makes the failure visible. Without the log, a roster that stopped being writable would turn
+# the experiment off for every bead with nobody noticing (the bead would just be missing from the readout).
 _e9_dispatch_line() {
-  local _e9_bid="$1" _e9_store="$2" _e9_sd _e9_arms _e9_plan _e9_arm
+  local _e9_bid="$1" _e9_store="$2" _e9_sd _e9_arms _e9_plan _e9_arm _e9_rc=0
   _e9_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
   [ -n "$_e9_sd" ] || return 0
   _e9_arms="$_e9_sd/e9-arms.sh"; _e9_plan="$_e9_sd/e9-plan.sh"
   { [ -r "$_e9_arms" ] && [ -r "$_e9_plan" ]; } || return 0
-  _e9_arm="$(timeout 10 bash "$_e9_arms" assign "$_e9_bid" "$_e9_store" pilot-dispatch 2>/dev/null)" || return 0
+  _e9_arm="$(timeout 10 bash "$_e9_arms" assign "$_e9_bid" "$_e9_store" pilot-dispatch 2>/dev/null)" || _e9_rc=$?
+  if [ "$_e9_rc" -ne 0 ]; then
+    warn "E9: no plan hint for $_e9_bid — e9-arms.sh assign exited $_e9_rc (5 = arm not recorded, roster unwritable; 3 = no arm could be determined; 124 = timed out)" >&2
+    return 0
+  fi
   [ "$_e9_arm" = "on" ] || return 0
   printf 'Experiment E9 (planner A/B, ga-798p6w): this bead is in the PLAN arm. Before reading code or editing, run `bash %s run %s --store %s` and start from the plan it prints. Exit 3 (no plan could be made) is not a verdict on the bead: build as you always do.' \
     "$_e9_plan" "$_e9_bid" "$_e9_store"

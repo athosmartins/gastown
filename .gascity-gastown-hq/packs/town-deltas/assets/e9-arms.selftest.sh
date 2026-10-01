@@ -156,10 +156,69 @@ newstate; conf planner_pct=50 salt=t1
 run assign 'ga-"q' $'/st/with "quote"\\and\nnewline'
 bl=0; while IFS= read -r l; do printf '%s' "$l" | jq -e . >/dev/null 2>&1 || bl=$((bl+1)); done < "$SD/e9-roster.jsonl"
 [ "$bl" = 0 ] && [ "$(wc -l < "$SD/e9-roster.jsonl" | tr -d ' ')" = 1 ] && ok "quotes, backslash and a newline in a store path cannot corrupt the roster (jq builds the line)" || bad "roster corrupted ($bl bad lines)"
-# a roster that cannot be written must be LOUD, but must not take the arm away (the bead label is the second record)
+# THE ARM A BEAD IS IN IS THE ONE THE ROSTER RECORDED, not whatever the conf says now (gate ga-uu4y5m, blocking issue 2). The pct ramp
+# (canary -> 50%) is the expected way to run this experiment; a re-dispatched bead (the normal case after a gate FAIL) must not be told
+# to run the paid planner while the roster counts it as control — the readout recomputes from the row's own pct and could not see it.
+newstate; conf planner_pct=0 complexity=on salt=r1
+run assign ga-flip1 /st/a; [ "$OUT" = off ] || bad "setup: pct=0 must give off, got '$OUT'"
+conf planner_pct=100 complexity=on salt=r1
+run assign ga-flip1 /st/a
+[ "$OUT" = off ] && [ "$RC" = 0 ] && ok "pct ramped 0 -> 100 after the assignment: assign still prints the RECORDED arm (off), not the recomputed one" || bad "recorded off, conf now 100%: assign printed '$OUT' rc=$RC"
+run peek ga-flip1;  [ "$OUT" = off ] && ok "peek reads the same recorded arm" || bad "peek after the ramp: '$OUT'"
+run block ga-flip1 /st/a
+case "$OUT" in *"TECHNICAL PLAN"*) bad "the refiner block hands the plan to a bead recorded as control" ;; *) ok "block follows the recorded arm too: a control bead gets no plan after the ramp" ;; esac
+[ "$(grep -c '"bead":"ga-flip1"' "$SD/e9-roster.jsonl")" = 1 ] && ok "still ONE roster row for the bead" || bad "rows: $(grep -c '"bead":"ga-flip1"' "$SD/e9-roster.jsonl")"
+newstate; conf planner_pct=100 complexity=on salt=r1
+run assign ga-flip2 /st/a; conf planner_pct=0 complexity=on salt=r1; run assign ga-flip2 /st/a
+[ "$OUT" = on ] && ok "ramped DOWN 100 -> 0: a bead recorded as treated stays treated" || bad "recorded on, conf now 0%: '$OUT'"
+
+# peek never writes: looking at a bead must not enrol it
+newstate; conf planner_pct=100 complexity=on salt=r1
+run peek ga-pk1; [ "$OUT" = on ] && [ "$RC" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "peek of an unassigned bead prints the pure arm and writes NO roster" || bad "peek: out='$OUT' rc=$RC roster=$([ -e "$SD/e9-roster.jsonl" ] && echo written || echo none)"
+run assign ga-pk1 /s; conf planner_pct=0 complexity=on salt=r1; run peek ga-pk1
+[ "$OUT" = on ] && ok "peek after assign reports the recorded arm, not the new conf's" || bad "peek after assign: '$OUT'"
+newstate; run peek ga-pk2; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "peek with no conf: nothing, exit 0 (inert)" || bad "peek no conf: out='$OUT' rc=$RC"
+newstate; conf planner_pct=50 salt=t1; run peek "ga bad"; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "peek with a bad id: nothing, exit 3" || bad "peek bad id: out='$OUT' rc=$RC"
+
+# a truncated line in the roster must not make every bead look unassigned (the first draft: one bad line => `jq -s` failed => "not
+# assigned" => one more assign row per re-dispatch, with the arm recomputed each time)
+newstate; conf planner_pct=0 complexity=on salt=r1
+run assign ga-tr1 /s; printf '{"ts":"x","event":"assign","bead":"ga-tr' >> "$SD/e9-roster.jsonl"; printf '\n' >> "$SD/e9-roster.jsonl"
+conf planner_pct=100 complexity=on salt=r1
+run assign ga-tr1 /s; run assign ga-tr1 /s; run assign ga-tr1 /s
+[ "$(grep -c '"bead":"ga-tr1"' "$SD/e9-roster.jsonl")" = 1 ] && [ "$OUT" = off ] && ok "a truncated roster line is skipped: still ONE row for the bead and the recorded arm after 3 re-dispatches" || bad "truncated line: rows=$(grep -c '"bead":"ga-tr1"' "$SD/e9-roster.jsonl") out='$OUT'"
+printf '7\nnull\n[1]\n"x"\n' >> "$SD/e9-roster.jsonl"; run assign ga-tr1 /s
+[ "$OUT" = off ] && [ "$RC" = 0 ] && ok "rows that are valid JSON but not records (7, null, [1], \"x\") are skipped without an error" || bad "non-record rows: out='$OUT' rc=$RC"
+
+# THREE states for "what does the roster say": a row / no row / cannot tell. The last one must not become "no row" (which recomputes).
 newstate; conf planner_pct=100 salt=t1; mkdir "$SD/e9-roster.jsonl"
 run assign ga-w1 /s
-[ "$OUT" = on ] && case "$ERR" in *"NOT recorded"*) true ;; *) false ;; esac && ok "unwritable roster: the arm is still printed and stderr says the assignment was NOT recorded" || bad "unwritable roster: out='$OUT' err='$ERR'"
+[ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a roster that cannot be READ (here: a directory): no arm, exit 3 — never a recompute" || bad "unreadable roster: out='$OUT' rc=$RC"
+run peek ga-w1; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "peek on an unreadable roster: no arm, exit 3" || bad "peek unreadable: out='$OUT' rc=$RC"
+run block ga-w1 /s; [ -z "$OUT" ] && ok "block on an unreadable roster adds nothing to the prompt" || bad "block unreadable: printed ${#OUT} bytes"
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w2","salt":"t1","planner_arm":"off"}\n' > "$SD/e9-roster.jsonl"; chmod 000 "$SD/e9-roster.jsonl"
+  run assign ga-w2 /s; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a roster with no read permission: no arm, exit 3 (the recorded 'off' is not replaced by a fresh 'on')" || bad "chmod 000 roster: out='$OUT' rc=$RC"
+fi
+newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w3","salt":"t1","planner_arm":"maybe"}\n' > "$SD/e9-roster.jsonl"
+run assign ga-w3 /s; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a row whose arm is not on|off: no arm, exit 3 (a row with no usable arm is not 'no row')" || bad "garbled arm: out='$OUT' rc=$RC"
+newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w4","salt":"t1"}\n' > "$SD/e9-roster.jsonl"
+run assign ga-w4 /s; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a row with no arm at all: no arm, exit 3" || bad "row without arm: out='$OUT' rc=$RC"
+newstate; conf planner_pct=100 salt=t1; printf '{"event":"assign","bead":"ga-w5","salt":"OTHER","planner_arm":"off"}\n' > "$SD/e9-roster.jsonl"
+run assign ga-w5 /s; [ "$OUT" = on ] && ok "a row under ANOTHER salt is not this experiment's assignment: assigned afresh" || bad "other-salt row: out='$OUT'"
+
+# A roster that can be read but not WRITTEN: the arm was decided but cannot be recorded. It is not handed out — a bead with no row has
+# no denominator slot — and the exit code (5) says so, because the one real caller drops stderr (gate ga-uu4y5m, non-blocking finding).
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf planner_pct=100 salt=t1; : > "$SD/e9-roster.jsonl"; chmod 444 "$SD/e9-roster.jsonl"
+  run assign ga-w6 /s; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && [ "$RC" = 5 ] && case "$ERR" in *"NOT recorded"*) true ;; *) false ;; esac \
+    && ok "roster readable but unwritable: nothing printed, exit 5, stderr says the assignment was NOT recorded" || bad "unwritable roster: out='$OUT' rc=$RC err='$ERR'"
+  chmod 444 "$SD/e9-roster.jsonl"; run block ga-w6 /s; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && ok "block for a bead that could not be recorded adds nothing (no recorded arm, no treatment)" || bad "block on unwritable roster printed ${#OUT} bytes"
+  codes="$(printf '0 3 5' | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')"; [ "$codes" = 3 ] && ok "assign's exits: 0 (answer), 3 (no arm), 5 (not recorded) are three different codes" || bad "assign exit codes collide"
+fi
 
 echo "== 4. complexity (computed from facts) =="
 cx() { run complexity "$@"; }

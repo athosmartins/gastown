@@ -280,8 +280,8 @@ with open(rp, "w") as f:
     for r in kept:
         f.write(json.dumps(r) + "\n")
 rc, out, err = run(rp, mp)
-ok("an on bead with no run row is 'nunca rodou' (10) — and its planner cost is a KNOWN zero, so it is not an unknown-cost bead") \
-    if "nunca rodou o planejador (nenhum run lançado)" in out and "SEM custo" not in out else bad("no-row handling wrong:\n" + out[:900])
+ok("an on bead with no run row is 'sem run lançado' (10), NOT claimed to be a builder that ignored the hint — and its planner cost is a KNOWN zero, so it is not an unknown-cost bead") \
+    if "sem run lançado (recusa antes de lançar OU dica ignorada" in out and "nunca rodou" not in out and "SEM custo" not in out else bad("no-row handling wrong:\n" + out[:900])
 
 print("== 5. realized size, calibration, PLAN-DEVIATION (git) ==")
 REPO = os.path.join(W, "repo")
