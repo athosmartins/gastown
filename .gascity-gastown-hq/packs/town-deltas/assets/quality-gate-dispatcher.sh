@@ -5048,9 +5048,10 @@ rebase_union_paths_verdict() {
       *) rm -f "$fb" "$fm" "$fo" "$fa"; echo "unknown:union-unreadable"; return 0 ;;
     esac
     # Tag every line with its source (1=B 2=M 3=O 4=A) so ONE awk sees all four — an EMPTY blob has no first
-    # line, so counting files by FNR==1 would silently renumber the rest.
-    if ! detail=$( { awk '{ print 1 "\t" $0 }' "$fb"; awk '{ print 2 "\t" $0 }' "$fm"
-                     awk '{ print 3 "\t" $0 }' "$fo"; awk '{ print 4 "\t" $0 }' "$fa"; } | awk '
+    # line, so counting files by FNR==1 would silently renumber the rest. A group's exit status is its LAST command's, so each tagger
+    # is `|| exit 1`: a failed one would otherwise only SHRINK the arithmetic (no branch lines, nothing needed) and a loss read yes.
+    if ! detail=$( { awk '{ print 1 "\t" $0 }' "$fb" || exit 1; awk '{ print 2 "\t" $0 }' "$fm" || exit 1
+                     awk '{ print 3 "\t" $0 }' "$fo" || exit 1; awk '{ print 4 "\t" $0 }' "$fa" || exit 1; } | awk '
         { i = index($0, "\t"); t = substr($0, 1, i - 1); l = substr($0, i + 1)
           if (l ~ /^[ \t\r]*$/) next
           c[t SUBSEP l]++; seen[l] = 1 }

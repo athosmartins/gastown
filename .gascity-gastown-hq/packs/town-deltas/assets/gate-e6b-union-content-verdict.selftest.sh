@@ -251,6 +251,20 @@ Q_TIP="$(git -C "$SC_REPO" rev-parse HEAD)"
 eq "a quoted name that IS declared union → unknown:union-quoted-path (the caller maps it to no)" \
    "$( . "$TMP/block.sh"; rebase_union_paths_verdict "$Q_GD" "$MAIN" "$FEAT" "$Q_TIP" "$(ref_tree "$SC_REPO")" "$(git -C "$SC_REPO" rev-parse "${Q_TIP}^{tree}")" 2>&1 )" "unknown:union-quoted-path"
 
+# ── 7. a line-tagger that FAILS is not "nothing to compare" ──
+# A command group's exit status is its LAST command's, so a failed tagger of B, M or O only SHRANK the arithmetic (no branch lines
+# → nothing "needed" from the branch) and a real loss read yes. The shim fails ONLY the tagger of the branch-tip blob (tag 3).
+echo "── 7. a failing line-tagger reads unknown:union-awk-failed, never a clean yes ──"
+SHIM="$TMP/shim"; mkdir -p "$SHIM"; REAL_AWK="$(command -v awk)"
+printf '#!/bin/sh\ncase "$1" in *"print 3 "*) exit 1 ;; esac\nexec "%s" "$@"\n' "$REAL_AWK" > "$SHIM/awk"; chmod +x "$SHIM/awk"
+build_hist tagfail "H|t1|t2|t3|t4|M0;H|t1|t2|t3|t4|M0|M1" "H|t1|t2|t3|B0;H|t1|t2|t3|B1"
+git -C "$SC_REPO" checkout -q --detach "$NEW"
+grep -v '^B1$' "$SC_REPO/$DDFILE" > "$SC_REPO/$DDFILE.n"; mv "$SC_REPO/$DDFILE.n" "$SC_REPO/$DDFILE"
+git -C "$SC_REPO" add -A; git -C "$SC_REPO" commit -q --amend --no-edit --allow-empty; TF_TIP="$(git -C "$SC_REPO" rev-parse HEAD)"
+[ "$(git -C "$SC_REPO" rev-parse "${TF_TIP}^{tree}")" != "$(git -C "$SC_REPO" rev-parse "${NEW}^{tree}")" ] && ok "fixture: the mutation changed the tree" || bad "fixture: the mutation changed NOTHING — this case would pass for the wrong reason"
+eq "control, real awk: a line the branch added is gone → no" "$(verdict "$SC_REPO" "$TF_TIP")" "no"
+eq "the branch-tip tagger fails on the same history → unknown:union-awk-failed (was a false yes)" "$( PATH="$SHIM:$PATH"; verdict "$SC_REPO" "$TF_TIP" )" "unknown:union-awk-failed"
+
 # ── 5. wiring: the existing behaviour is untouched where union does not apply ──
 echo "── 5. wiring ──"
 grep -q 'rebase_union_paths_verdict' "$TMP/block.sh" && ok "rebase_union_paths_verdict is inside the live gate-rebase-content-verdict extract block" || bad "rebase_union_paths_verdict is not in the extract block"
