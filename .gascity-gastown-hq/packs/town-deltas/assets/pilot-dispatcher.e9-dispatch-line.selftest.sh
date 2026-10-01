@@ -121,9 +121,18 @@ newdir; run "$FN" "$ID_ON" /store
 
 newdir; conf_on; : > "$SD/no-e9-ab"; run "$FN" "$ID_ON" /store
 [ -z "$OUT" ] && [ "$RC" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "kill switch beats an active conf → no line, no roster row" || bad "kill switch: out='$OUT' rc=$RC rows=$(roster_rows)"
+[ -z "$WARNS" ] && ok "kill switch → nothing logged (switching the experiment off on purpose is not a failure)" || bad "kill switch logged: '$WARNS'"
 
 newdir; printf 'planner_pct=abc\n' > "$SD/e9-ab.conf"; run "$FN" "$ID_ON" /store
 [ -z "$OUT" ] && [ "$RC" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "malformed conf → no line (a typo'd conf is not an experiment at some default)" || bad "malformed conf: out='$OUT' rc=$RC"
+# ...but it must not be SILENT: an invalid conf used to answer exactly like "no conf" (exit 0, empty), so a typo at turn-on ran the experiment
+# at 0% with no roster row and no log line (gate ga-shag3i, blocking issue 2). Absent/killed stay silent above; invalid says so, by exit code.
+case "$WARNS" in *"$ID_ON"*"exited 6"*"INVALID"*"NOT running"*) ok "malformed conf → LOGGED: names the bead, exit 6, says the config is invalid and the experiment is not running" ;; *) bad "malformed conf not logged (silent fail-open): '$WARNS'" ;; esac
+for bc in 'planner_pct=5O' 'plannr_pct=50' 'planner_pct=101' 'salt='; do
+  newdir; printf '%s\n' "$bc" > "$SD/e9-ab.conf"; run "$FN" "$ID_ON" /store
+  [ -z "$OUT" ] && [ "$RC" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && case "$WARNS" in *"exited 6"*) true ;; *) false ;; esac \
+    && ok "invalid conf '$bc' → no line, no roster row, logged (exit 6)" || bad "invalid conf '$bc': out='$OUT' rc=$RC warns='$WARNS'"
+done
 
 echo "== 2/3. the two arms =="
 newdir; conf_on; run "$FN" "$ID_OFF" /store

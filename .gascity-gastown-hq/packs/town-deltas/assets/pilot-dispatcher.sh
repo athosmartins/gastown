@@ -9590,7 +9590,9 @@ _pilot_release_count_unreadable() {
 # append), so the 10s bound is generous even at load 50.
 # A FAILED assign is logged (to stderr — stdout is captured as the comment line): its own stderr is dropped here because the hook has
 # one channel, so the exit code is what makes the failure visible. Without the log, a roster that stopped being writable would turn
-# the experiment off for every bead with nobody noticing (the bead would just be missing from the readout).
+# the experiment off for every bead with nobody noticing (the bead would just be missing from the readout). The same goes for a conf
+# that is INVALID (exit 6, a typo'd key at turn-on): it must not look like "no conf" (exit 0, silent, legitimately off) — it would run
+# the experiment at 0% with no roster row and no log line (gate ga-shag3i, blocking issue 2).
 _e9_dispatch_line() {
   local _e9_bid="$1" _e9_store="$2" _e9_sd _e9_arms _e9_plan _e9_arm _e9_rc=0
   _e9_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
@@ -9599,7 +9601,7 @@ _e9_dispatch_line() {
   { [ -r "$_e9_arms" ] && [ -r "$_e9_plan" ]; } || return 0
   _e9_arm="$(timeout 10 bash "$_e9_arms" assign "$_e9_bid" "$_e9_store" pilot-dispatch 2>/dev/null)" || _e9_rc=$?
   if [ "$_e9_rc" -ne 0 ]; then
-    warn "E9: no plan hint for $_e9_bid — e9-arms.sh assign exited $_e9_rc (5 = arm not recorded, roster unwritable; 3 = no arm could be determined; 124 = timed out)" >&2
+    warn "E9: no plan hint for $_e9_bid — e9-arms.sh assign exited $_e9_rc (6 = the experiment config .gc/e9-ab.conf is INVALID, the experiment is NOT running — run 'e9-arms.sh state'; 5 = arm not recorded, roster unwritable; 3 = no arm could be determined; 124 = timed out)" >&2
     return 0
   fi
   [ "$_e9_arm" = "on" ] || return 0

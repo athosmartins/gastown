@@ -218,6 +218,50 @@ newcase; bead_json ga-fence; claude_ok 0.2 "$(printf '```\n**FATOS:** arquivos=2
 runplan ga-fence
 check "a code fence and **bold** around the answer are tolerated (formatting, not a contract breach)" "PLANNED/S" "$(rf verdict)/$(rf level)"
 
+echo "== 4b. the third state survives a re-plan and a re-dispatch (gate ga-shag3i, blocking issue 1) =="
+# "desconhecido" (could not tell) used to remove only the complexity LABEL; story.complexidade kept the old level, and the reuse path read the
+# level from that metadata — so the next dispatch printed "level=S" for a bead whose recorded facts say "desconhecido".
+meta_with() {   # meta_with <facts> <recorded-level-or-empty> [plan-edit-sed]  — a stored plan whose files exist, plus facts and a recorded level
+  jq -nc --arg p "$(good_plan | sed 1d | sed "${3:-s/^//}")" --arg f "$1" --arg l "$2" \
+    '{"story.plano_tecnico":$p,"story.complexidade_fatos":$f} + (if $l=="" then {} else {"story.complexidade":$l} end)'
+}
+DESC='desconhecido: could not tell how many daemons read this table'
+# (a) a stale plan is re-planned and the planner answers desconhecido, on a bead that carries level S
+newcase; bead_json ga-us1 "$(meta_with 'arquivos=2 superficies=1 externo=0 migracao=0' S 's#^lib/a.py#lib/ghost.py#')" "complexity:S"
+claude_ok 0.2 "$(good_plan | sed "s/^FATOS:.*/FATOS: $DESC/")"
+runplan ga-us1
+check "re-plan answers desconhecido on a bead carrying S: PLANNED, level=unknown" "PLANNED/unknown" "$(rf verdict)/$(rf level)"
+U="$FIX/bd-update.args"
+grep -A1 -x -- '--unset-metadata' "$U" | grep -qx 'story.complexidade' && ok "the bead write UNSETS the recorded story.complexidade (the old S cannot outlive its facts)" || bad "story.complexidade not unset: $(tr '\n' '|' < "$U")"
+grep -A1 -x -- '--remove-label' "$U" | grep -qx 'complexity:S' && ok "and removes the old complexity label" || bad "stale label not removed"
+grep -qx 'story.complexidade_fatos='"$DESC" "$U" && ok "and records the desconhecido facts" || bad "desconhecido facts not recorded"
+# (b) the very next dispatch — a bead in the state older code left behind (facts say desconhecido, level S still recorded)
+newcase; bead_json ga-us2 "$(meta_with "$DESC" S)" "complexity:S"; claude_ok 0.2 "$(good_plan)"
+runplan ga-us2
+check "bead with facts=desconhecido that still carries level S: REUSED prints level=unknown, never S" "REUSED/unknown/0" "$(rf verdict)/$(rf level)/$(claude_calls)"
+case "$OUT" in *"level=S"*) bad "the plan header still says level=S: $(printf '%s' "$OUT" | grep 'E9 PLAN')" ;; *) ok "the plan header the builder reads says level=unknown too" ;; esac
+case "$ERR" in *"records level S but its facts compute unknown"*) ok "and the disagreement is logged" ;; *) bad "disagreement not logged: $ERR" ;; esac
+# (c) facts and recorded level disagree: the facts win (the level is computed, never asserted)
+newcase; bead_json ga-us3 "$(meta_with 'arquivos=3 superficies=1 externo=0 migracao=0' S)" "complexity:S"; claude_ok 0.2 "$(good_plan)"
+runplan ga-us3
+check "facts compute M, metadata says S: REUSED prints M" "REUSED/M" "$(rf verdict)/$(rf level)"
+case "$ERR" in *"records level S but its facts compute M"*) ok "and the disagreement is logged" ;; *) bad "disagreement not logged: $ERR" ;; esac
+# (d) a level with NO facts behind it is asserted, not computed
+newcase; bead_json ga-us4 "$(jq -nc --arg p "$(good_plan | sed 1d)" '{"story.plano_tecnico":$p,"story.complexidade":"S"}')" "complexity:S"; claude_ok 0.2 "$(good_plan)"
+runplan ga-us4
+check "a recorded level with no facts behind it: REUSED prints level=unknown" "REUSED/unknown" "$(rf verdict)/$(rf level)"
+# (e) no write for a key the bead never had
+newcase; bead_json ga-us5 "$(jq -nc --arg p "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')" '{"story.plano_tecnico":$p}')"
+claude_ok 0.2 "$(good_plan | sed "s/^FATOS:.*/FATOS: $DESC/")"
+runplan ga-us5
+grep -q -- '--unset-metadata' "$FIX/bd-update.args" && bad "unset a story.complexidade the bead never had: $(tr '\n' '|' < "$FIX/bd-update.args")" || ok "desconhecido on a bead with no recorded level: no unset (no write for a key that was never there)"
+# (f) a good level overwrites; it is never unset
+newcase; bead_json ga-us6 "$(meta_with 'arquivos=3 superficies=1 externo=0 migracao=0' M 's#^lib/a.py#lib/ghost.py#')" "complexity:M"; claude_ok 0.2 "$(good_plan)"
+runplan ga-us6
+check "a re-plan with real facts on a bead carrying M: PLANNED, level S" "PLANNED/S" "$(rf verdict)/$(rf level)"
+grep -q -- '--unset-metadata' "$FIX/bd-update.args" && bad "a known level was unset: $(tr '\n' '|' < "$FIX/bd-update.args")" || ok "a known level is SET (overwritten), never unset"
+grep -qx 'story.complexidade=S' "$FIX/bd-update.args" && ok "and the new level lands on the bead" || bad "new level not written"
+
 echo "== 5. INCONCLUSIVE: every way a plan can fail has its own reason, exit 3, the bead is untouched =="
 inc() {   # inc <name> <reason-prefix> <bead> — expects exit 3, no bead write, FINAL row INCONCLUSIVE arm=on (the fixtures are already set)
   runplan "$3"
@@ -242,7 +286,8 @@ pathcheck() {   # pathcheck <plan-text> [repo] → the function's own output (TO
   printf '%s\n' "$1" > "$W/pc.txt"
   E9P_DIR="$HERE" bash -c 'source "$1"; e9p_check_paths "$2" "$3"' _ "${PLAN_UNDER_TEST:-$PLAN}" "$W/pc.txt" "${2:-$REPO}"
 }
-pcres() { printf '%s\n' "$1" | tr '\n' ' ' | sed 's/ $//'; }
+pcres() { printf '%s\n' "$1" | tr '\n' ' ' | sed 's/ $//; s/ UNPARSED=0$//'; }   # the cases below that say nothing about UNPARSED expect 0 of it
+rawres() { printf '%s\n' "$1" | tr '\n' ' ' | sed 's/ $//'; }                         # ...and the ones about UNPARSED read the whole output
 # The three shapes from the verdict, un-backticked: the first characters of the path are marker characters.
 check "a path that starts with a dot (.gascity-gastown-hq/ is a real directory of this repo root) is checked as written" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .gascity-gastown-hq/packs/foo.sh — change foo')")"
 check "a path under .github/ is checked as written" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- .github/workflows/ci.yml — change ci')")"
@@ -264,6 +309,18 @@ check "lib/../../outside.txt (a walk out through a real directory) → missing" 
 check "lib/../lib/a.py (a ../ that stays inside) → present" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck $'ARQUIVOS:\n- lib/../lib/a.py — x')")"
 check "an absolute path INSIDE the checkout → present" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"- $REPO/lib/a.py — x")")"
 check "the checkout under another name (symlink): its real path is still 'inside'" "TOTAL=1 MISSING=" "$(pcres "$(pathcheck "ARQUIVOS:"$'\n'"- $REPO/lib/a.py — x" "$W/repo-link")")"
+# What the check did NOT verify is counted, not dropped (gate ga-shag3i, non-blocking finding): only the LEADING path of a line is checked, so
+# "-> lib/missing.py", "see lib/a.py:12" and the second path of "lib/a.py, lib/zzz.py" used to vanish from TOTAL — "verified" and "never looked
+# at" landed in the same bucket. And "e.g. something" matched the path shape and was reported as a MISSING file "e.g", throwing a paid plan away.
+check "a clean plan says UNPARSED=0 explicitly (a counter that is absent is not a counter that is zero)" "TOTAL=1 MISSING= UNPARSED=0" "$(rawres "$(pathcheck $'ARQUIVOS:\n- lib/a.py — x')")"
+check "'-> lib/missing.py — x' is not verified and is COUNTED: UNPARSED=1" "TOTAL=0 MISSING= UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n-> lib/missing.py — x')")"
+check "'see lib/a.py:12' is not verified and is COUNTED: UNPARSED=1" "TOTAL=0 MISSING= UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n- see lib/a.py:12')")"
+check "'lib/a.py, lib/zzz.py — x': the leading path is verified, the second is COUNTED as unverified" "TOTAL=1 MISSING= UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n- lib/a.py, lib/zzz.py — x')")"
+check "'e.g. something' is prose: not a missing file 'e.g', counted as UNPARSED" "TOTAL=0 MISSING= UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n- e.g. something')")"
+check "'i.e. something' likewise" "TOTAL=0 MISSING= UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n- i.e. something')")"
+check "a mix: one verified file, one arrow line, one e.g. line" "TOTAL=1 MISSING= UNPARSED=2" "$(rawres "$(pathcheck $'ARQUIVOS:\n- lib/a.py — x\n-> lib/b.py — y\n- e.g. z')")"
+check "a description that mentions 'read/write' (no file extension) does not count as an unverified path" "TOTAL=1 MISSING= UNPARSED=0" "$(rawres "$(pathcheck $'ARQUIVOS:\n- lib/a.py — read/write the state')")"
+check "a MISSING file is still reported as missing next to the new counter" "TOTAL=1 MISSING=lib/ghost.py UNPARSED=1" "$(rawres "$(pathcheck $'ARQUIVOS:\n- lib/ghost.py — x\n-> lib/b.py')")"
 # the third state: a check that could not RUN prints no TOTAL — it must not be readable as "nothing missing"
 OUTP="$(E9P_DIR="$HERE" bash -c 'source "$1"; e9p_check_paths "$2" "$3"' _ "$PLAN" "$W/no-such-plan.txt" "$REPO" 2>/dev/null)"; RCP=$?
 [ -z "$OUTP" ] && [ "$RCP" -ne 0 ] && ok "an unreadable plan file: no TOTAL line and a non-zero exit (the check did not run)" || bad "unreadable plan: out='$OUTP' rc=$RCP"
@@ -280,12 +337,18 @@ runplan ga-dot1
 check "a plan listing .gascity-gastown-hq/, .github/ and 2fa/ files un-backticked: PLANNED, 3 paths seen, none missing" "PLANNED/3/" \
   "$(rf verdict)/$(runrows | jq -s -r '[.[]|select(.verdict!="PENDING")][0] | "\(.paths_total)/\(.paths_missing)"')"
 [ "$(bd_updates)" = 1 ] && ok "and the plan was written to the bead" || bad "plan not persisted"
+check "its FINAL row says nothing was left unverified (paths_unparsed=0)" "0" "$(runrows | jq -s -r '[.[]|select(.verdict!="PENDING")][0].paths_unparsed')"
+newcase; bead_json ga-unp1; claude_ok 0.2 "$(plan_with_files '- lib/a.py — change parse()' '- see lib/b.py:12 — also relevant' '- e.g. whatever the guard needs')"
+runplan ga-unp1
+check "a plan with 2 lines the check could not verify is still handed over (they are not missing files)" "PLANNED" "$(rf verdict)"
+check "...and the FINAL row records paths_total=1 paths_unparsed=2 (the readout can tell verified from never-looked-at)" "1/2" "$(runrows | jq -s -r '[.[]|select(.verdict!="PENDING")][0] | "\(.paths_total)/\(.paths_unparsed)"')"
 
 echo "== 5c. a plan already on the bead is reused only if its files are still there =="
-stored_plan() { jq -nc --arg p "$1" '{"story.plano_tecnico":$p,"story.complexidade":"S"}'; }
+stored_plan() { jq -nc --arg p "$1" '{"story.plano_tecnico":$p,"story.complexidade_fatos":"arquivos=2 superficies=1 externo=0 migracao=0","story.complexidade":"S"}'; }
 newcase; bead_json ga-ru1 "$(stored_plan "$(good_plan | sed 1d)")"; claude_ok 0.2 "$(good_plan)"
 runplan ga-ru1
 check "a stored plan whose files exist: REUSED, nothing spent" "REUSED/0/0" "$(rf verdict)/$(claude_calls)/$(bd_updates)"
+check "...and its level is the one the stored FACTS compute (S)" "S" "$(rf level)"
 newcase; bead_json ga-ru2 "$(stored_plan "$(good_plan | sed 1d | sed 's#^lib/a.py#lib/ghost.py#')")"; claude_ok 0.2 "$(good_plan)"
 runplan ga-ru2
 check "a stored plan naming a file that is gone: NOT reused, a new plan is made and written" "PLANNED/1/1" "$(rf verdict)/$(claude_calls)/$(bd_updates)"
@@ -565,6 +628,11 @@ mutant "a path outside the checkout counts as present" 'if not inside(full) or n
 mutant "--dry-run / --print-task enrol the bead" 'arm="$(e9_cmd_peek "$bead")"; assign_rc=$?' 'arm="$(e9_cmd_assign "$bead" "${store:-$(e9_city)}" builder-start)"; assign_rc=$?' inv_dry_no_enrol
 mutant "a stored plan is reused without the file check" 'if [ -z "$rmissing" ] && [ "$rtotal" -ge 1 ]; then' 'if true; then' inv_reuse_stale
 mutant "a path check that could not run counts as clean" 'if [ -z "$ptotal" ]; then   # the check itself' 'if false; then   # the check itself' inv_check_cannot_run
+# — added with the gate-ga-shag3i fixes (blocking issue 1): a level that outlives its facts —
+inv_unset_level() { newcase; bead_json ga-m "$(meta_with 'arquivos=2 superficies=1 externo=0 migracao=0' S 's#^lib/a.py#lib/ghost.py#')" "complexity:S"; claude_ok 0.2 "$(good_plan | sed "s/^FATOS:.*/FATOS: $DESC/")"; runplan ga-m; grep -A1 -x -- '--unset-metadata' "$FIX/bd-update.args" | grep -qx 'story.complexidade'; }
+inv_reuse_level() { newcase; bead_json ga-m "$(meta_with "$DESC" S)" "complexity:S"; claude_ok 0.2 "$(good_plan)"; runplan ga-m; [ "$(rf verdict)" = REUSED ] && [ "$(rf level)" = unknown ]; }
+mutant "desconhecido leaves the recorded level behind" '[ -z "${E9_J_LEVEL_META:-}" ] || upd+=(--unset-metadata "story.complexidade") ;;' 'true ;;' inv_unset_level
+mutant "the reuse path reads the level from the metadata, not the facts" 'E9P_LEVEL="$(e9_level_of_facts "$E9_J_FACTS")"' 'case "$E9_J_LEVEL_META" in S|M|L) E9P_LEVEL="$E9_J_LEVEL_META" ;; *) E9P_LEVEL="unknown" ;; esac' inv_reuse_level
 mutant "an assignment that was not recorded still gets a plan" '5:*) E9P_ARM="none"; e9p_inconclusive "assign-not-recorded"; return $? ;;' '5:*) ;;' inv_not_recorded
 
 echo

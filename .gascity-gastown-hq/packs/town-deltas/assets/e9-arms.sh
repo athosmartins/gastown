@@ -43,16 +43,22 @@
 #                                          exit 2 = empty id / bad conf, 3 = no sha256 tool (prints NOTHING: "no arm" is not "off")
 #   arms planner                           ids on stdin → "<id> on|off" lines (the readout's recompute; stops at the first id with no arm)
 #   assign <bead-id> [store]               WRITES the roster. While the experiment is active prints on|off and records who was
-#                                          assigned (the control arm needs a denominator); inert/invalid prints nothing, exit 0.
+#                                          assigned (the control arm needs a denominator); with no conf / the kill switch prints
+#                                          nothing, exit 0 (the experiment is legitimately OFF).
 #                                          ONE assignment per bead per salt: a bead that already has a row gets THAT row's arm back,
 #                                          whatever the conf says now (a pct ramp must not flip a re-dispatched bead).
 #                                          exit 3 = no arm (bad id, no sha tool, roster unreadable), 5 = arm decided but NOT recorded
-#                                          (roster unwritable); both print nothing — a bead with no roster row gets no treatment.
-#   peek <bead-id>                         assign without the write: the recorded arm, else the pure arm of the current conf.
-#   block <bead-id> <store>                the text spliced into the refiner's prompt ('' when inert); records the assignment.
+#                                          (roster unwritable), 6 = the conf is INVALID (a typo'd key: the experiment is NOT running and
+#                                          nobody asked for that); all three print nothing — a bead with no roster row gets no treatment.
+#                                          6 is its own code because the one real caller (the Pilot) drops stderr and logs only a
+#                                          non-zero exit: with the same silent 0 as "off", a typo at turn-on ran at 0% unseen.
+#   peek <bead-id>                         assign without the write: the recorded arm, else the pure arm of the current conf. Exits 0|3|6.
+#   block <bead-id> <store>                the text spliced into the refiner's prompt ('' when inert); records the assignment. Exit 6
+#                                          on an invalid conf, like assign.
 #   complexity <files> <surfaces> <external:0|1> <migration:0|1>   prints S | M | L. exit 2 on any bad argument — never a default.
 #   finalize                               reads the bead's `bd show --json` on stdin, prints the writes to apply (see below)
 #   check                                  reads `bd show --json` on stdin: ok | absent | unknown | malformed | mismatch
+#                                          (a level still recorded next to facts that say "desconhecido" is a mismatch, not "unknown")
 #
 # Arm recipe (recomputable by anyone):  bucket = first 32 bits of SHA-256("e9-planner:<salt>:<bead-id>") mod 100;
 #   on <=> bucket < planner_pct.   e.g.  printf '%s' "e9-planner:e9a:ga-abc123" | shasum -a 256 | cut -c1-8
@@ -154,21 +160,49 @@ e9_cmd_arm() {
   e9_arm_for "$bead"
 }
 
-# arms planner — bead ids on stdin, one per line → "<id> on|off" per line. The readout recomputes hundreds of arms; one process
-# per id is how a selftest took two minutes. Stops with exit 3 (and says which id) rather than skip one: a missing row is not "off".
+# arms planner — bead ids on stdin, one per line → "<id> on|off" per line. Stops with exit 3 (and says which id) rather than skip one:
+# a missing row is not "off". The readout recomputes thousands of arms and the loop below costs a handful of forks per id (~50 ms each at
+# load 60: the readout selftest took 10+ minutes), so a batch is computed by ONE python3 process with the same recipe as e9_arm_for.
+# The shell rule (e9_arm_for) stays the reference: the selftest compares the batch against the documented recipe computed independently
+# AND against the shell loop, including the refusal cases. The loop is used when python3 is missing, when E9_SHA_TOOLS is set (the
+# selftest takes hash tools away to see the third state, and that has to reach this command too), and when python3 fails for any reason
+# other than "an id has no arm" — a crash in the fast path must never turn into a missing or partial table.
 e9_cmd_arms() {
-  local kind="${1:-}" id arm
+  local kind="${1:-}" id arm input out rc prog
   [ "$kind" = planner ] || { echo "usage: e9-arms.sh arms planner < ids" >&2; return 2; }
   e9_conf_load
   case "$E9_PARSE" in
     absent)    echo "e9: no e9-ab.conf — there is no experiment, so no arm (not 'off')" >&2; return 4 ;;
     invalid:*) echo "e9: $E9_PARSE" >&2; return 2 ;;
   esac
+  input="$(cat)"
+  if [ -z "${E9_SHA_TOOLS:-}" ] && command -v python3 >/dev/null 2>&1; then
+    prog="$(cat <<'E9PYBATCH'
+import hashlib, sys
+salt, pct = sys.argv[1].encode(), int(sys.argv[2])
+out = sys.stdout.buffer
+for raw in sys.stdin.buffer.read().split(b"\n"):
+    if not raw:
+        continue
+    if any(c in raw for c in b" \t\v\f\r"):          # the shell rule refuses an id with whitespace (it is not an id)
+        out.flush()
+        sys.stderr.write("e9: no arm for '%s'\n" % raw.decode("utf-8", "replace"))
+        sys.exit(3)
+    d = hashlib.sha256(b"e9-planner:" + salt + b":" + raw).hexdigest()[:8]
+    out.write(raw + (b" on\n" if int(d, 16) % 100 < pct else b" off\n"))
+E9PYBATCH
+)"
+    out="$(printf '%s\n' "$input" | python3 -c "$prog" "$E9_SALT" "$E9_PCT")"; rc=$?
+    case "$rc" in
+      0) [ -z "$out" ] || printf '%s\n' "$out"; return 0 ;;
+      3) [ -z "$out" ] || printf '%s\n' "$out"; return 3 ;;   # an id with no arm: the table so far, then stop — same as the loop
+    esac
+  fi
   while IFS= read -r id || [ -n "$id" ]; do
     [ -n "$id" ] || continue
     arm="$(e9_arm_for "$id")" || { echo "e9: no arm for '$id'" >&2; return 3; }
     printf '%s %s\n' "$id" "$arm"
-  done
+  done <<< "$input"
 }
 
 # ── roster ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -206,6 +240,20 @@ e9_recorded_arm() {
 
 e9_bad_bead_id() { case "${1:-}" in ''|*[[:space:]]*) return 0 ;; esac; return 1; }
 
+# e9_state_gate — what a command that hands out an arm does with the conf's state (call after e9_conf_load). Three states, three answers:
+#   0  active                      carry on
+#   1  absent | killed             the experiment is legitimately OFF: the caller prints nothing and exits 0
+#   6  invalid:*                   the conf exists but cannot be read (a typo'd key): the experiment is NOT running and nobody chose that.
+#                                  Said on stderr AND by the exit code — the one real caller discards stderr and logs only a non-zero exit.
+e9_state_gate() {
+  case "$E9_STATE" in
+    active)        return 0 ;;
+    absent|killed) return 1 ;;
+    *)             echo "e9: the experiment config is unusable ($E9_STATE) — no arm is handed out, the experiment is NOT running; fix or remove $(e9_state_dir)/e9-ab.conf" >&2
+                   return 6 ;;
+  esac
+}
+
 # assign <bead> [store] [stage] — the arm the bead is IN, recorded once per (bead, salt); every later call, from any stage, prints
 # THAT recorded arm. Recomputing it from the current conf instead would let a pct ramp (canary -> 50%) tell a re-dispatched bead to run
 # the paid planner while the roster counts it as control — the variable decided on must be the variable acted on.
@@ -214,9 +262,10 @@ e9_bad_bead_id() { case "${1:-}" in ''|*[[:space:]]*) return 0 ;; esac; return 1
 #   exit 5  the arm was determined but could NOT be recorded: prints nothing. A bead with no roster row has no denominator slot, so it
 #           gets no treatment and no hint; the exit code (not only stderr) lets a caller that discards stderr notice and log it.
 e9_cmd_assign() {
-  local bead="${1:-}" store="${2:-}" stage="${3:-}" arm rec rrc
+  local bead="${1:-}" store="${2:-}" stage="${3:-}" arm rec rrc g=0
   e9_conf_load
-  [ "$E9_STATE" = active ] || return 0
+  e9_state_gate || g=$?
+  case "$g" in 0) ;; 1) return 0 ;; *) return "$g" ;; esac
   e9_bad_bead_id "$bead" && { echo "e9: cannot assign an arm to '$bead'" >&2; return 3; }
   rec="$(e9_recorded_arm "$bead" "$E9_SALT")"; rrc=$?
   case "$rrc" in
@@ -237,9 +286,10 @@ e9_cmd_assign() {
 # the current conf. For inspection (`e9-plan.sh run --dry-run / --print-task`): looking at a bead must not enrol it — the roster is the
 # experiment's denominator, and the first assignment fixes the arm at the pct of that moment. Same exits as assign minus 5.
 e9_cmd_peek() {
-  local bead="${1:-}" arm rec rrc
+  local bead="${1:-}" arm rec rrc g=0
   e9_conf_load
-  [ "$E9_STATE" = active ] || return 0
+  e9_state_gate || g=$?
+  case "$g" in 0) ;; 1) return 0 ;; *) return "$g" ;; esac
   e9_bad_bead_id "$bead" && { echo "e9: cannot peek an arm for '$bead'" >&2; return 3; }
   rec="$(e9_recorded_arm "$bead" "$E9_SALT")"; rrc=$?
   case "$rrc" in
@@ -289,6 +339,17 @@ e9_parse_facts() {
   return 0
 }
 
+# e9_level_of_facts "<facts text>" → prints S | M | L when the facts parse, else `unknown`. Absent facts, "desconhecido: …" and malformed
+# facts all read as unknown: a level that no recorded fact supports is not a level. Always exit 0 — callers branch on the printed word.
+# This (not the recorded story.complexidade) is what a re-dispatch reads: the metadata can outlive the facts it was computed from.
+e9_level_of_facts() {
+  local t lvl
+  t="$(printf '%s' "${1:-}" | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
+  case "$t" in ''|desconhecido*) echo unknown; return 0 ;; esac
+  if e9_parse_facts "$t" && lvl="$(e9_complexity "$F_FILES" "$F_SURF" "$F_EXT" "$F_MIG")"; then echo "$lvl"; else echo unknown; fi
+  return 0
+}
+
 # bd show --json → the one object (bd prints an array for `show`); metadata may be missing or not an object.
 e9_bead_field() {   # <json> <jq-filter>
   printf '%s' "$1" | jq -r "(if type==\"array\" then .[0] else . end) | $2" 2>/dev/null
@@ -307,15 +368,15 @@ e9_bead_load() {
 }
 
 # finalize: the refiner wrote the FACTS; this decides what the dispatcher writes — the level is computed here, in code.
-# Prints one directive per line:  SET <key>=<value> | LABEL <l> | UNLABEL <l> | STATUS <word>=<value>
+# Prints one directive per line:  SET <key>=<value> | UNSET <key> | LABEL <l> | UNLABEL <l> | STATUS <word>=<value>
 e9_cmd_finalize() {
   local json lvl old trimmed keep=""
   json="$(cat)"
   e9_bead_load "$json" || { echo "STATUS complexity=unreadable"; return 0; }
   trimmed="$(printf '%s' "$E9_J_FACTS" | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
   case "$trimmed" in
-    '')            e9_unlabel_stale ""; echo "STATUS complexity=absent"; return 0 ;;
-    desconhecido*) e9_unlabel_stale ""; echo "STATUS complexity=unknown"; return 0 ;;
+    '')            e9_unlabel_stale ""; e9_unset_stale; echo "STATUS complexity=absent"; return 0 ;;
+    desconhecido*) e9_unlabel_stale ""; e9_unset_stale; echo "STATUS complexity=unknown"; return 0 ;;
   esac
   if e9_parse_facts "$trimmed"; then
     lvl="$(e9_complexity "$F_FILES" "$F_SURF" "$F_EXT" "$F_MIG")"
@@ -324,10 +385,15 @@ e9_cmd_finalize() {
     echo "LABEL complexity:$lvl"
     echo "STATUS complexity=ok:$lvl"
   else
-    e9_unlabel_stale ""
+    e9_unlabel_stale ""; e9_unset_stale
     echo "STATUS complexity=malformed:$E9_WHY"
   fi
 }
+
+# The level RECORDED in the metadata of a bead whose facts no longer support one has to go with its label: the reuse path and `check` read
+# the metadata, so a label-only cleanup leaves "could not tell" rendering as the previous known level (gate ga-shag3i, blocking issue 1).
+# Nothing is emitted when no level is recorded, so a bead that never had one gets no pointless write.
+e9_unset_stale() { [ -z "$E9_J_LEVEL_META" ] || echo "UNSET story.complexidade"; }
 
 # A level left by an earlier attempt whose facts have since changed must not survive (keep = the label that stays, if any).
 e9_unlabel_stale() {
@@ -343,7 +409,11 @@ e9_cmd_check() {
   e9_bead_load "$json" || { echo unreadable; return 13; }
   trimmed="$(printf '%s' "$E9_J_FACTS" | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
   if [ -z "$trimmed" ] && [ -z "$E9_J_LEVEL_META" ] && [ -z "$E9_J_LABELS" ]; then echo absent; return 10; fi
-  case "$trimmed" in desconhecido*) echo unknown; return 14 ;; esac
+  case "$trimmed" in desconhecido*)
+    # "could not tell" with a level still recorded next to it: the level is a leftover from facts that are gone, not a measurement
+    if [ -n "$E9_J_LEVEL_META" ] || [ -n "$E9_J_LABELS" ]; then echo "mismatch recorded=${E9_J_LEVEL_META:-$E9_J_LABELS} recomputed=unknown"; return 12; fi
+    echo unknown; return 14 ;;
+  esac
   if [ -z "$trimmed" ]; then echo "malformed:nivel-sem-fatos"; return 11; fi
   e9_parse_facts "$trimmed" || { echo "malformed:$E9_WHY"; return 11; }
   lvl="$(e9_complexity "$F_FILES" "$F_SURF" "$F_EXT" "$F_MIG")"
@@ -416,10 +486,11 @@ e9_block_text() {   # <bead> <store> <with_plan:0|1> <with_complexity:0|1>
 }
 
 e9_cmd_block() {
-  local bead="${1:-}" store="${2:-}" arm plan=0 cx=0
+  local bead="${1:-}" store="${2:-}" arm plan=0 cx=0 g=0
   [ -n "$bead" ] || return 2
   e9_conf_load
-  [ "$E9_STATE" = active ] || return 0
+  e9_state_gate || g=$?
+  case "$g" in 0) ;; 1) return 0 ;; *) return "$g" ;; esac
   arm="$(e9_cmd_assign "$bead" "$store")" || return 0   # cannot assign → no block at all: no arm is not "off", and not "on"
   [ "$arm" = on ] && plan=1
   [ "$E9_COMPLEXITY" = on ] && cx=1

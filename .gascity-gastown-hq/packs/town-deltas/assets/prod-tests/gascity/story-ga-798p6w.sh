@@ -79,8 +79,12 @@ res="$(bash "$PLAN" run ga-t1 --store "$CITY")"; rc=$?
 rm -f "$S/no-e9-ab"
 printf 'planner_pct=abc\n' > "$S/e9-ab.conf"
 case "$(bash "$ARMS" state)" in invalid:*) ;; *) fail "a malformed conf must read invalid:*, got '$(bash "$ARMS" state)'" ;; esac
+# the Pilot drops assign's stderr and logs only a non-zero exit: an invalid conf must not answer like "no conf" (exit 0, silent) or a typo
+# at turn-on runs the experiment at 0% with nobody told (gate ga-shag3i, blocking issue 2)
+rc=0; out="$(bash "$ARMS" assign ga-prodtest "$CITY" prod-test 2>/dev/null)" || rc=$?
+[[ "$rc" -eq 6 && -z "$out" ]] || fail "assign under a malformed conf must print nothing and exit 6, got rc=$rc out='$out'"
 [[ ! -e "$S/e9-roster.jsonl" ]] || fail "the kill-switch / malformed-conf checks wrote a roster row"
-log "kill switch → killed/INERT; malformed conf → invalid (not 'no conf'), nothing recorded ✓"
+log "kill switch → killed/INERT; malformed conf → invalid (not 'no conf'), assign exits 6, nothing recorded ✓"
 
 # ── 5. the complexity scale: computed from facts, refuses what it cannot size ────────────────────────────────────
 declare -a CASES=("1 1 0 0:S" "2 1 0 0:S" "3 1 0 0:M" "2 2 0 0:M" "1 3 0 0:L" "8 1 0 0:L" "1 1 1 0:L" "1 1 0 1:L")

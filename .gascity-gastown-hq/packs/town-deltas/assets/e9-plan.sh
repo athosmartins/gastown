@@ -88,9 +88,12 @@ e9p_usage() { sed -n '/^# Usage:/,/^# Every `run`/p' "$E9P_SELF" | sed '$d; s/^#
 # ── roster: the per-bead run count ────────────────────────────────────────────────────────────────────────────
 # e9p_prior_runs <bead> — how many runs that actually launched claude were already made for it. PENDING and FINAL rows of one
 # run share a run_id and count ONCE; a PENDING that never got its FINAL is a run too (the money was spent). No file = 0 (true).
-# A file that EXISTS but cannot be read, or that jq cannot parse, returns 1 with nothing printed: we cannot know what was already
-# spent, "0" would silently lift the cap on a spending path, and the caller refuses to launch. A corrupt line (truncated JSON, or
-# valid JSON that is not a record) is skipped, not fatal: the cap is a brake, not a ledger.
+# A file that EXISTS but cannot be read, or that jq cannot run on at all (no jq, jq crashing), returns 1 with nothing printed: we cannot
+# know what was already spent, "0" would silently lift the cap on a spending path, and the caller refuses to launch. A corrupt LINE
+# (truncated JSON, or valid JSON that is not a record) is skipped, not fatal — so a roster made only of corrupt lines would read as 0
+# runs; that cannot happen on the way here, because the bead's own `assign` row is appended before this check. The cap is a brake, not a
+# ledger: it is also not atomic with the PENDING write, so two concurrent runs of one bead can both read the same count before either
+# writes PENDING — bounded by E9_PLAN_MAX_CONCURRENT (at most one extra paid run per extra slot).
 e9p_prior_runs() {
   local file; file="$(e9_roster)"
   [ -e "$file" ] || { printf '0'; return 0; }
@@ -374,10 +377,14 @@ PY
 }
 
 # e9p_check_paths <plan-file|-> <repo> — the ARQUIVOS section's paths against the checkout ("-" reads the plan from stdin, for a plan
-# that is on the bead rather than in a file). Prints TOTAL=<n> and MISSING=<p1,p2,..>; prints NOTHING and fails when it could not run,
-# which is not the same as "nothing is missing" — callers must look for the TOTAL line.
+# that is on the bead rather than in a file). Prints TOTAL=<n>, MISSING=<p1,p2,..> and UNPARSED=<n>; prints NOTHING and fails when it
+# could not run, which is not the same as "nothing is missing" — callers must look for the TOTAL line.
+# Only the LEADING path of each ARQUIVOS line is verified, so what that does not cover
+# is counted instead of dropped: UNPARSED = lines whose first token is not a path ("-> x", "see x:12", prose such as "e.g. …"), plus
+# lines that carry a second path-like token ("a.py, b.py — x"). An UPPER BOUND ("— see lib/b.py" in a description counts), recorded as
+# paths_unparsed on the roster row so the readout can tell "verified" from "never looked at" (both used to vanish from TOTAL).
 # A path marked (novo) is a file to create and is exempt; a path that is a directory counts as present. A line whose first token
-# does not look like a path is not counted (the heading's own prose is not a file). A path counts as present only if it is INSIDE the
+# does not look like a path is not a missing file (the heading's own prose is not one). A path counts as present only if it is INSIDE the
 # checkout: an absolute path or a ../ walk to a file that exists elsewhere (another checkout of this repo, /etc/hosts) is missing —
 # the builder works in this checkout, and the planner is told that other checkouts are out of scope.
 e9p_check_paths() {
@@ -404,7 +411,9 @@ def inside(full):   # lexically inside, or resolving inside (the checkout under 
 # What is stripped is only ever a marker, never a bare character of the path: ".github/x", ".gascity-gastown-hq/x" and "2fa/x" start
 # with the very characters a marker is made of.
 MARKER = re.compile(r"^(?:(?:[-*\u2022]|\d+[.)])\s+|\*\*)+")
-in_files, total, missing = False, 0, []
+PROSE = {"e.g", "i.e"}   # "e.g. something" matches the path shape (name + ".ext"); it is an abbreviation, not a file that is missing
+SECOND = re.compile(r"(?<![\w./@+-])(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_@+-]+\.[A-Za-z0-9]+")   # a further dir/file.ext on the same line
+in_files, total, missing, unparsed = False, 0, [], 0
 for raw in text:
     line = raw.strip()
     if re.match(r"^(ARQUIVOS|ABORDAGEM|CASOS-LIMITE|TESTE QUE REPROVA|NAO VERIFIQUEI):", line):
@@ -414,10 +423,13 @@ for raw in text:
         continue
     line = MARKER.sub("", line)
     m = re.match(r"^`?([A-Za-z0-9_./@+-]+(?:/[A-Za-z0-9_./@+-]+|\.[A-Za-z0-9]+))`?", line)
-    if not m:
+    if not m or m.group(1).lower() in PROSE:
+        unparsed += 1
         continue
     path = m.group(1)
     total += 1
+    if SECOND.search(line[m.end():]):
+        unparsed += 1
     if re.search(r"\((?:novo|new)\)", line):
         continue
     full = os.path.normpath(os.path.join(repo, path))   # join leaves an absolute path alone; normpath folds the ../ steps
@@ -425,6 +437,7 @@ for raw in text:
         missing.append(path)
 print("TOTAL=%d" % total)
 print("MISSING=" + ",".join(missing))
+print("UNPARSED=%d" % unparsed)
 PY
   rc=$?
   [ -n "$spool" ] && rm -f "$spool"
@@ -508,7 +521,13 @@ e9p_run_inner() {
     rtotal="$(printf '%s\n' "$rpaths" | sed -n 's/^TOTAL=//p')"; rmissing="$(printf '%s\n' "$rpaths" | sed -n 's/^MISSING=//p')"
     if [ -z "$rtotal" ]; then e9p_inconclusive "plan-check-failed"; return $?; fi
     if [ -z "$rmissing" ] && [ "$rtotal" -ge 1 ]; then
-      case "$E9_J_LEVEL_META" in S|M|L) E9P_LEVEL="$E9_J_LEVEL_META" ;; *) E9P_LEVEL="unknown" ;; esac
+      # The level a re-dispatch prints is what the FACTS compute, not what story.complexidade says: the metadata can outlive the facts it
+      # came from (a re-plan that answered "desconhecido" used to leave the old level behind, and the next dispatch printed it as known —
+      # "could not tell" and "S" looked the same; gate ga-shag3i, blocking issue 1). No usable facts => unknown, whatever the metadata holds.
+      E9P_LEVEL="$(e9_level_of_facts "$E9_J_FACTS")"
+      if [ -n "$E9_J_LEVEL_META" ] && [ "$E9_J_LEVEL_META" != "$E9P_LEVEL" ]; then
+        e9p_log "WARN: $bead records level $E9_J_LEVEL_META but its facts compute $E9P_LEVEL — the computed one is printed"
+      fi
       e9p_emit_plan "already on the bead — nothing spent" "$E9_J_PLAN"
       e9p_finish REUSED "plan-on-bead" 0; return $?
     fi
@@ -632,9 +651,10 @@ e9p_run_inner() {
   if [ -n "$why" ]; then E9P_LEVEL="-"; e9p_settle INCONCLUSIVE "$why" "${cost_kv[@]}" || true; e9p_inconclusive "$why"; return $?; fi
 
   # a plan that names a file that is not there is worse than no plan — the builder is not handed one we know is wrong
-  local paths ptotal pmissing
+  local paths ptotal pmissing punparsed
   paths="$(e9p_check_paths "$work/body.txt" "$repo")"
   ptotal="$(printf '%s\n' "$paths" | sed -n 's/^TOTAL=//p')"; pmissing="$(printf '%s\n' "$paths" | sed -n 's/^MISSING=//p')"
+  punparsed="$(printf '%s\n' "$paths" | sed -n 's/^UNPARSED=//p')"; punparsed="${punparsed:-0}"
   if [ -z "$ptotal" ]; then   # the check itself did not run: not "no files named" and not "none missing"
     E9P_LEVEL="-"
     e9p_settle INCONCLUSIVE "path-check-failed" "${cost_kv[@]}" || true
@@ -642,12 +662,12 @@ e9p_run_inner() {
   fi
   if [ -n "$pmissing" ]; then
     E9P_LEVEL="-"
-    e9p_settle INCONCLUSIVE "plan-names-missing-paths:$pmissing" paths_total="$ptotal" paths_missing="$pmissing" "${cost_kv[@]}" || true
+    e9p_settle INCONCLUSIVE "plan-names-missing-paths:$pmissing" paths_total="$ptotal" paths_missing="$pmissing" paths_unparsed="$punparsed" "${cost_kv[@]}" || true
     e9p_inconclusive "plan-names-missing-paths:$(printf '%s' "$pmissing" | cut -c1-120)"; return $?
   fi
   if [ "${ptotal:-0}" -lt 1 ]; then
     E9P_LEVEL="-"
-    e9p_settle INCONCLUSIVE "plan-names-no-files" paths_total=0 "${cost_kv[@]}" || true
+    e9p_settle INCONCLUSIVE "plan-names-no-files" paths_total=0 paths_unparsed="$punparsed" "${cost_kv[@]}" || true
     e9p_inconclusive "plan-names-no-files"; return $?
   fi
 
@@ -660,12 +680,16 @@ e9p_run_inner() {
     S|M|L)
       upd+=(--set-metadata "story.complexidade=$E9P_LEVEL" --add-label "complexity:$E9P_LEVEL")
       for old in $(printf '%s' "${E9_J_LABELS:-}" | tr ',' ' '); do [ "$old" = "complexity:$E9P_LEVEL" ] || upd+=(--remove-label "$old"); done ;;
-    *) for old in $(printf '%s' "${E9_J_LABELS:-}" | tr ',' ' '); do upd+=(--remove-label "$old"); done ;;
+    # unknown: the labels go, and so does a level RECORDED by an earlier plan — the facts written above no longer support it, and the reuse
+    # path / `e9-arms.sh check` would otherwise show the old level for a bead whose facts say "desconhecido". Only when one is recorded:
+    # no write for a key the bead never had.
+    *) for old in $(printf '%s' "${E9_J_LABELS:-}" | tr ',' ' '); do upd+=(--remove-label "$old"); done
+       [ -z "${E9_J_LEVEL_META:-}" ] || upd+=(--unset-metadata "story.complexidade") ;;
   esac
   local persisted=true
   e9p_with_timeout 60 "$bd" -C "$store" "${upd[@]}" >/dev/null 2>"$work/bd.err" || { persisted=false; e9p_log "WARN: the plan could NOT be written to $bead ($(head -c 160 "$work/bd.err" | tr '\n' ' ')) — it is printed below but a re-dispatch will plan again"; }
 
-  e9p_settle PLANNED "$([ "$persisted" = true ] && echo ok || echo not-persisted)" level="$E9P_LEVEL" facts="$fatos" paths_total="$ptotal" paths_missing="" persisted="$persisted" "${cost_kv[@]}" || true
+  e9p_settle PLANNED "$([ "$persisted" = true ] && echo ok || echo not-persisted)" level="$E9P_LEVEL" facts="$fatos" paths_total="$ptotal" paths_missing="" paths_unparsed="$punparsed" persisted="$persisted" "${cost_kv[@]}" || true
   e9p_emit_plan "arm=on, planner=$model/$effort, cost=\$${cost:-unknown}" "$E9_J_PLAN"
   e9p_finish PLANNED "$([ "$persisted" = true ] && echo ok || echo not-persisted)" 0; return $?
 }

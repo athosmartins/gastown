@@ -70,6 +70,27 @@ done
 newstate; : > "$SD/e9-ab.conf"; run state; case "$OUT" in invalid:*) ok "empty conf → $OUT (not absent, not active)" ;; *) bad "empty conf → '$OUT'" ;; esac
 newstate; conf "salt=$(printf 'x%.0s' $(seq 1 40))" "planner_pct=50"; run state; case "$OUT" in invalid:*) ok "40-char salt → invalid" ;; *) bad "40-char salt accepted: '$OUT'" ;; esac
 newstate; printf 'planner_pct=50\r\ncomplexity=on\r\n' > "$SD/e9-ab.conf"; run state; case "$OUT" in active*) ok "CRLF conf parses (trailing \\r trimmed)" ;; *) bad "CRLF conf → '$OUT'" ;; esac
+
+# An INVALID conf is not "no conf": the one real caller (the Pilot) drops stderr and logs only a non-zero exit, and assign/peek used to answer
+# an invalid conf exactly like an absent one (exit 0, empty stdout, empty stderr) — so a typo'd key at turn-on ran the experiment at 0% with
+# no roster row and no log line (gate ga-shag3i, blocking issue 2). Exit 0 stays reserved for the two legitimate "off" states.
+for bc in "planner_pct=5O" "plannr_pct=50" "planner_pct=101" "complexity=yes" "salt=" "just-a-line"; do
+  newstate; conf "$bc"
+  for sub in assign peek block; do
+    run "$sub" ga-inv1 /store
+    [ -z "$OUT" ] && [ "$RC" = 6 ] && case "$ERR" in *"unusable (invalid:"*"NOT running"*) true ;; *) false ;; esac \
+      && ok "invalid conf '$bc': $sub prints nothing, exit 6, and stderr says the experiment is NOT running" || bad "invalid conf '$bc': $sub out='$OUT' rc=$RC err='$ERR'"
+  done
+  [ ! -e "$SD/e9-roster.jsonl" ] && ok "invalid conf '$bc': no roster row from any of them" || bad "invalid conf '$bc' wrote a roster"
+done
+newstate; : > "$SD/e9-ab.conf"; run assign ga-inv2 /store
+[ "$RC" = 6 ] && ok "an EMPTY conf file is invalid too (exit 6), not absent" || bad "empty conf: assign rc=$RC"
+newstate; conf planner_pct=100 salt=k1; touch "$SD/no-e9-ab"
+for sub in assign peek block; do run "$sub" ga-inv3 /store; [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] && ok "kill switch: $sub silent, exit 0 (legitimately off)" || bad "kill switch $sub: out='$OUT' rc=$RC err='$ERR'"; done
+newstate
+for sub in assign peek block; do run "$sub" ga-inv4 /store; [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] && ok "no conf: $sub silent, exit 0 (legitimately off)" || bad "no conf $sub: out='$OUT' rc=$RC err='$ERR'"; done
+newstate; conf planner_pct=5O; touch "$SD/no-e9-ab"; run assign ga-inv5 /store
+[ -z "$OUT" ] && [ "$RC" = 0 ] && ok "kill switch beats an invalid conf: switching it off on purpose is not an error" || bad "kill switch + invalid conf: out='$OUT' rc=$RC"
 newstate; printf '# comment\n\nplanner_pct=007  # inline\ncomplexity=off\n' > "$SD/e9-ab.conf"; run state
 [ "$OUT" = "active planner_pct=7 complexity=off salt=e9a" ] && ok "comments, blanks, leading zeros (007 is 7, not an octal error), default salt" || bad "lenient-parse conf → '$OUT'"
 # the state line must carry the REAL values — the first draft read them back through $(...) and printed empty ones
@@ -123,6 +144,42 @@ OUT="$(printf 'ga-a1\nga bad\nga-b2\n' | e9 arms planner 2>/dev/null)"; RC=$?
 [ "$RC" = 3 ] && ok "arms stops (exit 3) at an id with no arm instead of skipping it — a missing row is not 'off'" || bad "arms skipped a bad id: rc=$RC out='$OUT'"
 newstate; OUT="$(printf 'ga-a1\n' | e9 arms planner 2>/dev/null)"; RC=$?
 [ -z "$OUT" ] && [ "$RC" = 4 ] && ok "arms with no conf: nothing, exit 4" || bad "arms no conf: out='$OUT' rc=$RC"
+
+# `arms planner` computes a whole batch in ONE python3 process (the readout recomputes thousands of arms; the shell loop made its selftest take
+# 10+ minutes). That makes two implementations of one rule, so they are held together here: against the documented recipe computed
+# independently (above), against the shell loop on the same input, and on every way the input can be odd. E9_SHA_TOOLS=openssl forces the loop.
+if command -v python3 >/dev/null 2>&1; then
+  for cfg in "50 t1" "20 x-y_z" "100 e9a" "1 s9"; do
+    set -- $cfg; newstate; conf planner_pct="$1" complexity=on salt="$2"
+    mism=0; n_ref=0; while read -r b a; do n_ref=$((n_ref+1)); [ "$a" = "$(recipe "$b" "$2" "$1")" ] || mism=$((mism+1)); done < <(armsof 40 q)
+    [ "$mism" = 0 ] && [ "$n_ref" = 40 ] && ok "batch arms (pct=$1 salt=$2): all 40 equal the documented recipe" || bad "batch arms (pct=$1 salt=$2): $mism/$n_ref differ from the recipe"
+  done
+  newstate; conf planner_pct=50 complexity=on salt=t1
+  fast="$(ids 60 z | e9 arms planner)"; loop="$(ids 60 z | E9_SHA_TOOLS=openssl /bin/bash "$E9" arms planner)"
+  [ -n "$fast" ] && [ "$fast" = "$loop" ] && ok "batch == the shell loop on 60 ids (byte for byte)" || bad "batch and loop disagree on 60 ids"
+  # every odd input: both paths must say the same thing on stdout, stderr and exit code
+  odd() {   # odd <name> <printf-format>
+    local f_out f_err f_rc l_out l_err l_rc
+    f_out="$(printf "$2" | /bin/bash "$E9" arms planner 2>"$W/f.err")"; f_rc=$?; f_err="$(cat "$W/f.err")"
+    l_out="$(printf "$2" | E9_SHA_TOOLS=openssl /bin/bash "$E9" arms planner 2>"$W/l.err")"; l_rc=$?; l_err="$(cat "$W/l.err")"
+    [ "$f_out" = "$l_out" ] && [ "$f_err" = "$l_err" ] && [ "$f_rc" = "$l_rc" ] && ok "batch == loop for: $1 (rc=$f_rc)" || bad "batch/loop differ for $1: fast rc=$f_rc out=[$f_out] err=[$f_err] vs loop rc=$l_rc out=[$l_out] err=[$l_err]"
+  }
+  odd "no input at all" ''
+  odd "blank lines are skipped" 'ga-a1\n\n\nga-b2\n'
+  odd "no trailing newline" 'ga-a1\nga-b2'
+  odd "an id with a space refuses at that id" 'ga-a1\nga bad\nga-b2\n'
+  odd "an id with a tab refuses" 'ga-a1\nga\tbad\nga-b2\n'
+  odd "an id with a trailing CR refuses (CRLF input)" 'ga-a1\r\nga-b2\r\n'
+  odd "a non-ASCII id is hashed as its bytes" 'ga-caf\303\251\nga-b2\n'
+  odd "a very long id" "$(printf 'ga-%0300d\\n' 7)"
+  # the third state reaches the batch command too: no hash tool => no table, exit 3 — never a table of guesses
+  OUT="$(ids 3 | E9_SHA_TOOLS=none /bin/bash "$E9" arms planner 2>/dev/null)"; RC=$?
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "no sha tool: arms prints nothing, exit 3 (the fast path does not bypass the third state)" || bad "no sha tool: arms out='$OUT' rc=$RC"
+  # a python3 that crashes must not turn into a missing or partial table: the shell loop answers
+  mkdir -p "$W/badpy"; printf '#!/bin/bash\necho "python3: simulated crash" >&2\nexit 1\n' > "$W/badpy/python3"; chmod +x "$W/badpy/python3"
+  OUT="$(ids 20 z | PATH="$W/badpy:$PATH" /bin/bash "$E9" arms planner 2>/dev/null)"; RC=$?
+  [ "$RC" = 0 ] && [ "$OUT" = "$(printf '%s\n' "$fast" | head -20)" ] && ok "a crashing python3: the shell loop produces the SAME full table (no partial output, no gap)" || bad "crashing python3: rc=$RC lines=$(printf '%s\n' "$OUT" | grep -c .)"
+fi
 newstate; conf planner_pct=50 salt=t1
 
 # third state: no sha256 tool at all → NO arm. Not "off" (that silently joins the control), not "on".
@@ -217,7 +274,7 @@ if [ "$(id -u)" != 0 ]; then
     && ok "roster readable but unwritable: nothing printed, exit 5, stderr says the assignment was NOT recorded" || bad "unwritable roster: out='$OUT' rc=$RC err='$ERR'"
   chmod 444 "$SD/e9-roster.jsonl"; run block ga-w6 /s; chmod 600 "$SD/e9-roster.jsonl"
   [ -z "$OUT" ] && ok "block for a bead that could not be recorded adds nothing (no recorded arm, no treatment)" || bad "block on unwritable roster printed ${#OUT} bytes"
-  codes="$(printf '0 3 5' | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')"; [ "$codes" = 3 ] && ok "assign's exits: 0 (answer), 3 (no arm), 5 (not recorded) are three different codes" || bad "assign exit codes collide"
+  codes="$(printf '0 3 5 6' | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')"; [ "$codes" = 4 ] && ok "assign's exits: 0 (answer), 3 (no arm), 5 (not recorded), 6 (invalid conf) are four different codes" || bad "assign exit codes collide"
 fi
 
 echo "== 4. complexity (computed from facts) =="
@@ -249,6 +306,21 @@ runin "$(bead "complexity:M" '{"story.complexidade_fatos":"desconhecido: o modul
 [ "$OUT" = $'UNLABEL complexity:M\nSTATUS complexity=unknown' ] && ok "\"desconhecido\" is its own state — no level, stale level removed, NOT counted as S" || bad "finalize unknown: '$OUT'"
 runin "$(bead "" '{}')" finalize
 [ "$OUT" = "STATUS complexity=absent" ] && ok "refiner wrote nothing → absent" || bad "finalize absent: '$OUT'"
+# THE THIRD STATE (gate ga-shag3i, blocking issue 1): the label was removed but story.complexidade was not, so "could not tell" kept
+# rendering as the previous known level wherever the metadata is read. All three non-ok branches unset the recorded level — and only
+# when one is recorded, so a bead that never had one gets no pointless write.
+runin "$(bead "complexity:S" '{"story.complexidade_fatos":"desconhecido: sem acesso ao modulo","story.complexidade":"S"}')" finalize
+[ "$OUT" = $'UNLABEL complexity:S\nUNSET story.complexidade\nSTATUS complexity=unknown' ] && ok "desconhecido + a recorded level S → label AND metadata level removed (the stale S cannot survive)" || bad "finalize unknown+level: '$OUT'"
+runin "$(bead "" '{"story.complexidade_fatos":"desconhecido: x","story.complexidade":"M"}')" finalize
+[ "$OUT" = $'UNSET story.complexidade\nSTATUS complexity=unknown' ] && ok "desconhecido + a recorded level but no label → the metadata level is still removed" || bad "finalize unknown, metadata only: '$OUT'"
+runin "$(bead "complexity:L" '{"story.complexidade":"L"}')" finalize
+[ "$OUT" = $'UNLABEL complexity:L\nUNSET story.complexidade\nSTATUS complexity=absent' ] && ok "no facts at all + a recorded level → both removed (a level nobody computed is not kept)" || bad "finalize absent+level: '$OUT'"
+runin "$(bead "complexity:S" '{"story.complexidade_fatos":"arquivos=dois superficies=1 externo=0 migracao=0","story.complexidade":"S"}')" finalize
+case "$OUT" in *"UNLABEL complexity:S"*"UNSET story.complexidade"*"STATUS complexity=malformed:"*) ok "malformed facts + a recorded level → both removed" ;; *) bad "finalize malformed+level: '$OUT'" ;; esac
+runin "$(bead "" '{"story.complexidade_fatos":"desconhecido: x"}')" finalize
+[ "$OUT" = "STATUS complexity=unknown" ] && ok "desconhecido and nothing recorded → no UNSET (no write for a key the bead never had)" || bad "finalize unknown, nothing recorded: '$OUT'"
+runin "$(bead "complexity:S" "$(jq -nc --arg f "$F" '{"story.complexidade_fatos":$f,"story.complexidade":"S"}')")" finalize
+case "$OUT" in *UNSET*) bad "good facts must SET the level, not unset it: '$OUT'" ;; *) ok "good facts: the level is SET (overwritten), never unset" ;; esac
 for badf in "arquivos=2 superficies=1 externo=0" "arquivos=2 superficies=1 externo=0 migracao=0 extra=1" "arquivos=2 arquivos=3 superficies=1 externo=0 migracao=0" \
             "arquivos=dois superficies=1 externo=0 migracao=0" "arquivos=0 superficies=1 externo=0 migracao=0" "arquivos=2 superficies=1 externo=talvez migracao=0" \
             "pequena, mexe em um arquivo" "arquivos 2 superficies 1"; do
@@ -286,6 +358,12 @@ chk "$(bead "" '{}')";              [ "$RC" = 10 ] && [ "$OUT" = absent ] && ok 
 chk '[]';                           [ "$RC" = 13 ] && [ "$OUT" = unreadable ] && ok "bd show → [] → unreadable (exit 13), distinct from absent" || bad "check []: '$OUT' rc=$RC"
 chk "$(bead "" '{"story.complexidade_fatos":"desconhecido: sem acesso"}')"
 [ "$RC" = 14 ] && [ "$OUT" = unknown ] && ok "desconhecido → unknown (exit 14), distinct from absent and from ok" || bad "check unknown: '$OUT' rc=$RC"
+chk "$(bead "complexity:S" '{"story.complexidade_fatos":"desconhecido: sem acesso","story.complexidade":"S"}')"
+[ "$RC" = 12 ] && [ "$OUT" = "mismatch recorded=S recomputed=unknown" ] && ok "desconhecido next to a recorded level S → MISMATCH (12): the leftover is visible, not read as 'unknown'" || bad "check unknown+level: '$OUT' rc=$RC"
+chk "$(bead "complexity:M" '{"story.complexidade_fatos":"desconhecido: sem acesso"}')"
+[ "$RC" = 12 ] && ok "desconhecido next to a leftover LABEL alone is a mismatch too" || bad "check unknown+label: '$OUT' rc=$RC"
+chk "$(bead "" '{"story.complexidade_fatos":"desconhecido: sem acesso","story.complexidade":"L"}')"
+[ "$RC" = 12 ] && ok "desconhecido next to a leftover metadata level alone is a mismatch too" || bad "check unknown+meta: '$OUT' rc=$RC"
 codes="$(printf '0 10 11 12 13 14' | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')"; [ "$codes" = 6 ] && ok "the six outcomes have six different exit codes" || bad "exit codes collide"
 
 echo "== 7. plancheck =="
