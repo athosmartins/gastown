@@ -51,10 +51,11 @@ trap cleanup EXIT
 
 # ── 1. Structural ────────────────────────────────────────────────────────────
 for fn in gate_base_test_kind gate_base_test_is_support gate_base_test_file_state gate_base_test_sandbox_ok \
-          gate_base_test_run_table gate_base_test_pyjs_measure gate_base_test_pyjs_scan gate_base_test_totals_field; do
+          gate_base_test_run_table gate_base_test_pyjs_measure gate_base_test_pyjs_scan gate_base_test_totals_field \
+          _gate_base_test_write_stays_inside; do
   grep -q "^${fn}()" "$GUARD" || fail "$fn() missing from the deployed guard — the feature is not deployed"
 done
-log "all eight functions present in the deployed guard ✓"
+log "all nine functions present in the deployed guard (incl. the symlink-write guard) ✓"
 
 BLOCK=$(awk '/Step 5b-pre2 \(ga-rstae\)/,/^fi$/' "$GUARD")
 [[ -n "$BLOCK" ]] || fail "could not extract the arm-B block from the deployed guard"

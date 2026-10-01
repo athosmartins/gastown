@@ -183,6 +183,14 @@ if need_fn gate_base_test_decisive && need_fn gate_base_test_file_state; then
     "$(st "$OKT" "$(tsv t.py collect-error)" "$(tsv t::a pass)" "$(tsv t.py collect-error)")" "fails-on-base"
   eq "skipped at tip AND base does not stop the passing tests from deciding -> passes-on-base" \
     "$(st "$(tsv t::a pass t::b skip)" "$(tsv t::a pass t::b skip)")" "passes-on-base"
+  # gate attempt 1 (ga-kisvqp): a test RED at tip is not one of "the tests that pass at tip", so the old rule dropped it
+  # and let its siblings decide the whole file. Red at tip + green at base is flaky, or broken by the fix.
+  eq "a sibling RED at tip but GREEN at base is not dropped: tip {a pass, b fail}, base {a pass, b pass} -> unmeasured, not passes-on-base" \
+    "$(st "$(tsv t::a pass t::b fail)" "$(tsv t::a pass t::b pass)")" "unmeasured"
+  eq "red at tip AND at base is unmeasured too (it used to read passes-on-base on the strength of the one green test)" \
+    "$(st "$(tsv t::a pass t::b fail)" "$(tsv t::a pass t::b fail)")" "unmeasured"
+  eq "a tip-red test does NOT stop a decisive pair from proving the file needs the fix (that direction is unchanged)" \
+    "$(st "$(tsv t::a pass t::b fail)" "$(tsv t::a fail t::b fail)" "$(tsv t::a pass)" "$(tsv t::a fail)")" "fails-on-base"
   eq "a garbled outcome word poisons the table -> unmeasured" \
     "$(st "$OKT" "$(tsv t::a pass t::b maybe)")" "unmeasured"
   # The two cases above would answer 'unmeasured' even if a bad row were silently DROPPED.
@@ -194,6 +202,36 @@ if need_fn gate_base_test_decisive && need_fn gate_base_test_file_state; then
     "$(st "$(printf '#ok\nt::a\tpass\nt::z\tmaybe\n')" "$(tsv t::a pass)")" "unmeasured"
   eq "a bad row in the ALONE-base table must not be dropped: confirmation needs a READABLE table -> unmeasured, not fails-on-base" \
     "$(st "$OKT" "$(tsv t::a pass t::b fail)" "$(tsv t::b pass)" "$(printf '#ok\nt::b\tfail\nt::q\n')")" "unmeasured"
+fi
+
+if need_fn gate_base_test_control_state; then
+  echo "  -- gate_base_test_control_state (is the tip run a usable control?) --"
+  eq "every test green -> usable" "$(gate_base_test_control_state "$(tsv t::a pass t::b pass)")" "usable"
+  eq "a red SIBLING does not make the control unusable: the passing tests are still a control (the refusal rule is file_state's)" \
+    "$(gate_base_test_control_state "$(tsv t::a pass t::b fail)")" "usable"
+  eq "a skipped sibling likewise" "$(gate_base_test_control_state "$(tsv t::a pass t::b skip)")" "usable"
+  eq "nothing passes -> unmeasured" "$(gate_base_test_control_state "$(tsv t::a fail)")" "unmeasured"
+  eq "a collection error -> unmeasured" "$(gate_base_test_control_state "$(tsv t.py collect-error)")" "unmeasured"
+  eq "a collection error next to passing tests -> unmeasured (the file did not load)" \
+    "$(gate_base_test_control_state "$(tsv t::a pass t.py collect-error)")" "unmeasured"
+  eq "read cleanly, ZERO tests -> no-tests" "$(gate_base_test_control_state "$(tsv)")" "no-tests"
+  eq "unread (empty string) -> unmeasured, never usable and never no-tests" "$(gate_base_test_control_state "")" "unmeasured"
+  eq "a malformed row poisons the table -> unmeasured" "$(gate_base_test_control_state "$(printf '#ok\nt::a\tpass\nzzz\n')")" "unmeasured"
+fi
+
+if need_fn _gate_base_test_untsv; then
+  echo "  -- _gate_base_test_untsv (an id read back from a table, as the run needs it) --"
+  eq "a plain id is unchanged" "$(_gate_base_test_untsv 'tests/t.py::test_a[x y]')" 'tests/t.py::test_a[x y]'
+  eq "a doubled backslash is one backslash" "$(_gate_base_test_untsv 'tests/t.py::t[a\\b]')" 'tests/t.py::t[a\b]'
+  eq "\\t is a TAB" "$(_gate_base_test_untsv 'a\tb')" "$(printf 'a\tb')"
+  eq "\\n is a newline" "$(_gate_base_test_untsv 'a\nb')" "$(printf 'a\nb')"
+  eq "an escaped backslash followed by n is a backslash and an n, not a newline" "$(_gate_base_test_untsv 'a\\nb')" 'a\nb'
+  eq "a lone trailing backslash is kept" "$(_gate_base_test_untsv 'a\')" 'a\'
+  eq "an escape it does not know is kept as written" "$(_gate_base_test_untsv 'a\xb')" 'a\xb'
+  eq "empty -> empty" "$(_gate_base_test_untsv '')" ""
+  RT=$(printf 'a\\b\tc"d')
+  eq "round trip through the real jq @tsv: what the table holds decodes to the original id" \
+    "$(_gate_base_test_untsv "$(jq -rn --arg v "$RT" '[$v] | @tsv')")" "$RT"
 fi
 
 if need_fn gate_base_test_old_form_state; then
@@ -892,6 +930,84 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     eq "...counted but not materialised: counted=2 copy_ok=1 ran=1 failed=1" \
       "$(tot counted)/$(tot copy_ok)/$(tot ran)/$(tot failed)" "2/1/1/1"
 
+    echo "  -- a sibling RED at tip but green at base must not be dropped: the file is not 'every test passes on both' --"
+    C8D="$H_SCRATCH/case8d"; mk_case "$C8D" ""; BASE8D=$(git -C "$C8D" rev-parse HEAD); fix_code "$C8D" ""
+    printf 'from lib.mod import double\n\ndef test_exists():\n    assert callable(double)\n\ndef test_old_behaviour():\n    assert double(2) == 2\n' > "$C8D/tests/test_mixed_red.py"
+    TIP8D=$(commit_all "$C8D" "fix + one test that proves nothing and one the fix turns red")
+    OUT=$(measure "$C8D" "" "$BASE8D" "$TIP8D" tests/test_mixed_red.py)
+    eq "one test passes on both, its sibling is green on base and RED at tip -> unmeasured (it used to read passes-on-base and be refused)" \
+      "$(fstate tests/test_mixed_red.py)/$(fwhy tests/test_mixed_red.py)" "unmeasured/not-conclusive"
+    eq "...so it cannot be refused: ran=0" "$(tot ran)" "0"
+
+    echo "  -- a tracked symlink on the overlay path never makes the guard write outside the scratch --"
+    OVO="$H_SCRATCH/ovl-outside"; mkdir -p "$OVO"
+    C11="$H_SCRATCH/case11"; mk_case "$C11" ""
+    ln -s "$OVO" "$C11/tests/linked"          # base: tests/linked is a tracked link to a directory OUTSIDE the checkout
+    BASE11=$(commit_all "$C11" "base with a tracked link")
+    rm "$C11/tests/linked"; mkdir "$C11/tests/linked"; fix_code "$C11" ""
+    printf 'from lib.mod import double\n\ndef test_double():\n    assert double(2) == 4\n' > "$C11/tests/linked/test_in_linked.py"
+    TIP11=$(commit_all "$C11" "tip: the link became a real directory holding a test")
+    rm -f "$H_SCRATCH/trace-ovl"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-ovl" measure "$C11" "" "$BASE11" "$TIP11" tests/linked/test_in_linked.py)
+    eq "the overlay path goes through a link on base -> unmeasured, why=overlay (inert), not a write through the link" \
+      "$(fstate tests/linked/test_in_linked.py)/$(fwhy tests/linked/test_in_linked.py)" "unmeasured/overlay"
+    eq "...nothing was written into the directory the link points at" "$(ls -A "$OVO" | wc -l | tr -d ' ')" "0"
+    eq "...and not one test was run" "$(runs_in "$H_SCRATCH/trace-ovl")" "0"
+
+    echo "  -- a test that swaps its own file for a symlink while the old form runs cannot steer the restore outside --"
+    VIC="$H_SCRATCH/restore-victim"; printf 'SENTINEL\n' > "$VIC"
+    C12="$H_SCRATCH/case12"; mk_case "$C12" ""
+    printf 'import os\n\ndef test_plant():\n    p = os.path.abspath(__file__)\n    os.unlink(p)\n    os.symlink("%s", p)\n' "$VIC" > "$C12/tests/test_plant.py"
+    BASE12=$(commit_all "$C12" "base: a test that replaces its own file with a symlink once it has run")
+    fix_code "$C12" ""
+    printf 'from lib.mod import double\n\ndef test_plant():\n    assert callable(double)\n' > "$C12/tests/test_plant.py"
+    TIP12=$(commit_all "$C12" "tip: a plain passing test")
+    OUT=$(GATE_ABT_RUN_TIMEOUT=60 measure "$C12" "" "$BASE12" "$TIP12" tests/test_plant.py)
+    eq "the file is still answered: passes-on-base, and base's own copy was measured (old-passes)" \
+      "$(fstate tests/test_plant.py)/$(fold tests/test_plant.py)" "passes-on-base/old-passes"
+    eq "...and the file the swapped-in link pointed at was NOT overwritten with the tip's test" "$(cat "$VIC")" "SENTINEL"
+
+    echo "  -- the rig's own directory turned into a symlink by the branch: nothing is made through it --"
+    C13="$H_SCRATCH/case13"; mk_case "$C13" "rig"; BASE13=$(git -C "$C13" rev-parse HEAD)
+    OUT13="$H_SCRATCH/rigdir-outside"; mkdir -p "$OUT13"
+    git -C "$C13" checkout -q -b tip13
+    mv "$C13/rig" "$OUT13/rigcopy"; ln -s "$OUT13/rigcopy" "$C13/rig"
+    TIP13=$(commit_all "$C13" "tip: the rig directory is a symlink to somewhere else")
+    git -C "$C13" checkout -q "$BASE13"
+    mkdir -p "$C13/rig/logs"                   # the LIVE rig has a runtime dir the checkouts lack: it would be mirrored
+    rm -f "$H_SCRATCH/trace-rigdir"
+    OUT=$(GATE_ABT_TRACE="$H_SCRATCH/trace-rigdir" measure "$C13" "rig" "$BASE13" "$TIP13" rig/tests/test_keep.py)
+    eq "the rig directory is a link at tip -> unmeasured, why=worktree (inert)" "$(fstate rig/tests/test_keep.py)/$(fwhy rig/tests/test_keep.py)" "unmeasured/worktree"
+    eq "...no runtime directory was created through the link" "$([ -e "$OUT13/rigcopy/logs" ] && echo created || echo absent)" "absent"
+    eq "...and not one test was run" "$(runs_in "$H_SCRATCH/trace-rigdir")" "0"
+
+    echo "  -- the alone table: stops at the first unreadable run, and starts nothing once the budget is gone --"
+    AS="$H_SCRATCH/alone-scr"; mkdir -p "$AS"
+    IDS3=$(printf 'tests/test_nope_a.py::t\ntests/test_nope_b.py::t\ntests/test_nope_c.py::t')
+    rm -f "$H_SCRATCH/trace-al1"
+    GATE_ABT_TRACE="$H_SCRATCH/trace-al1" _gate_base_test_alone_table py "$C" "$C" "$AS" tests/test_nope.py "$IDS3" >/dev/null 2>&1; RC=$?
+    eq "three ids that cannot be run -> status 1 (the table is lost)" "$RC" "1"
+    eq "...after ONE run, not three: the first unreadable run settles it" "$(runs_in "$H_SCRATCH/trace-al1")" "1"
+    rm -f "$H_SCRATCH/trace-al2"
+    ( t0=$SECONDS; budget=0; GATE_ABT_TRACE="$H_SCRATCH/trace-al2" _gate_base_test_alone_table py "$C" "$C" "$AS" tests/test_passes.py "tests/test_passes.py::test_exists" >/dev/null 2>&1 ); RC=$?
+    eq "the budget already spent -> status 1 (an unread table, not an empty one)" "$RC" "1"
+    eq "...and not one run was started" "$(runs_in "$H_SCRATCH/trace-al2")" "0"
+    rm -f "$H_SCRATCH/trace-al3"
+    ( t0=$SECONDS; budget=3600; GATE_ABT_TRACE="$H_SCRATCH/trace-al3" _gate_base_test_alone_table py "$C" "$C" "$AS" tests/test_passes.py "tests/test_passes.py::test_exists" >/dev/null 2>&1 ); RC=$?
+    eq "control: with budget left the same call runs and reads (status 0, one run)" "$RC/$(runs_in "$H_SCRATCH/trace-al3")" "0/1"
+
+    echo "  -- an id with a backslash in it is handed back to pytest as the real id --"
+    RIGBS="$H_SCRATCH/rig-bs"; mk_rig "$RIGBS"
+    printf 'import pytest\n\n@pytest.mark.parametrize("v", ["a\\\\b"])\ndef test_bs(v):\n    assert v\n' > "$RIGBS/tests/test_bs.py"
+    BSS="$H_SCRATCH/bs-scr"; mkdir -p "$BSS"
+    TBS=$(gate_base_test_run_table py "$RIGBS" "$RIGBS" "$BSS" tests/test_bs.py)
+    BSID=$(printf '%s\n' "$TBS" | awk -F'\t' 'NR == 2 { print $1 }')
+    eq "premise: the id in the table is the @tsv-escaped form (it differs from the real id)" \
+      "$([ -n "$BSID" ] && [ "$BSID" != "$(_gate_base_test_untsv "$BSID")" ] && echo escaped)" "escaped"
+    ATBS=$(_gate_base_test_alone_table py "$RIGBS" "$RIGBS" "$BSS" tests/test_bs.py "$BSID"); RC=$?
+    eq "the alone run of that id is READ (status 0), not lost as 'absent'" "$RC" "0"
+    eq "...and its row is a pass" "$(printf '%s\n' "$ATBS" | GATE_TID="$BSID" awk -F'\t' '$1 == ENVIRON["GATE_TID"] && $2 == "pass"' | wc -l | tr -d ' ')" "1"
+
     echo "  -- the guard runs under set -euo pipefail --"
     OUT=$(bash -c 'set -euo pipefail; GATE_GUARD_LIB_ONLY=1 . "$1"; O=$(gate_base_test_pyjs_measure "$2" "$3" "$4" "tests/test_env.py"); echo "survived:$(printf "%s\n" "$O" | grep -c "^TOTALS ")"' _ "$GUARD" "$C" "$BASE" "$TIP" 2>&1 | tail -1)
     eq "an unmeasured file (non-zero runs inside) does not abort the sweep under set -e" "$OUT" "survived:1"
@@ -973,6 +1089,61 @@ if need_fn gate_base_test_materialize_links; then
   eq "not a git checkout -> 0, no error" "$(gate_base_test_materialize_links "$H_SCRATCH/no-such-dir")" "0"
   eq "empty argument -> 0" "$(gate_base_test_materialize_links "")" "0"
   git -C "$L" worktree remove --force "$H_SCRATCH/links-wt" >/dev/null 2>&1
+fi
+
+if need_fn _gate_base_test_write_stays_inside; then
+  echo "  -- _gate_base_test_write_stays_inside (the filesystem is asked, not the string) --"
+  W="$H_SCRATCH/wsi"; OUTW="$H_SCRATCH/wsi-outside"; mkdir -p "$W/real/sub" "$OUTW"; : > "$W/real/file"
+  ln -s "$OUTW" "$W/abs"                 # a link to an ABSOLUTE path outside the tree
+  ln -s ../wsi-outside "$W/climb"        # a RELATIVE link that climbs out of the tree
+  ln -s real "$W/inlink"                 # a link that points back INSIDE the tree
+  ln -s real/file "$W/flink"             # a link to a file
+  ln -s "$W" "$H_SCRATCH/wsi-rootlink"   # the ROOT reached through a link is fine: only what is under it is judged
+  wsi() { _gate_base_test_write_stays_inside "$@" >/dev/null 2>&1 && echo yes || echo no; }
+  eq "a new directory under a real directory -> yes" "$(wsi "$W" real/new/deeper)" "yes"
+  eq "a new top-level path -> yes (the WA shape: shared/logs)" "$(wsi "$W" shared/logs)" "yes"
+  eq "overwriting an existing plain file -> yes" "$(wsi "$W" real/file)" "yes"
+  eq "through an ABSOLUTE link to the outside -> no (this is the case that wrote outside)" "$(wsi "$W" abs/created_outside)" "no"
+  eq "...deeper too" "$(wsi "$W" abs/a/b/c)" "no"
+  eq "through a RELATIVE link that climbs out -> no" "$(wsi "$W" climb/x)" "no"
+  eq "through a link that points back inside -> no (conservative: a path through a link is never 'probably fine')" "$(wsi "$W" inlink/x)" "no"
+  eq "the LAST component being a link -> no (> follows it)" "$(wsi "$W" flink)" "no"
+  eq "...and a link to a directory as the last component -> no" "$(wsi "$W" abs)" "no"
+  eq "the root reached through a symlink is fine" "$(wsi "$H_SCRATCH/wsi-rootlink" real/new)" "yes"
+  eq "an empty path -> no" "$(wsi "$W" "")" "no"
+  eq "an absolute path -> no" "$(wsi "$W" /etc/passwd)" "no"
+  eq "a path that climbs above the root -> no" "$(wsi "$W" ../x)" "no"
+  eq "a missing root -> no" "$(wsi "$H_SCRATCH/no-such-root" a/b)" "no"
+  eq "an empty root -> no" "$(wsi "" a/b)" "no"
+  eq "asking never creates anything (shared/ and real/new are still absent)" \
+    "$([ -e "$W/shared" ] || [ -e "$W/real/new" ] && echo created || echo absent)" "absent"
+  eq "...and nothing appeared in the outside directory" "$(ls -A "$OUTW" | wc -l | tr -d ' ')" "0"
+fi
+
+if need_fn gate_base_test_materialize_links; then
+  echo "  -- gate_base_test_materialize_links: a path THROUGH a second tracked link must not write outside (gate attempt 1) --"
+  # The reviewer's repro: `abs` is a tracked absolute link to a directory outside the checkout, `via` is a relative link
+  # whose target "abs/created_outside" is lexically inside the tree — the lexical check passes it, and `mkdir -p` then
+  # creates the directory in the OUTSIDE location. The second shape climbs with a relative link (`up -> ../..`).
+  L2="$H_SCRATCH/links2"; OUT2="$H_SCRATCH/links2-outside"; mkdir -p "$L2" "$OUT2"
+  git -C "$L2" init -q . && git -C "$L2" config user.email t@t && git -C "$L2" config user.name t
+  ln -s "$OUT2" "$L2/abs"
+  ln -s abs/created_outside "$L2/via"
+  ln -s ../.. "$L2/up"
+  ln -s up/escaped "$L2/via2"
+  ln -s shared/logs "$L2/logs"           # the legitimate one in the same checkout must still be made
+  git -C "$L2" add -A; git -C "$L2" commit -q -m chained
+  mkdir -p "$H_SCRATCH/l2d/l2e"
+  git -C "$L2" worktree add --detach -q "$H_SCRATCH/l2d/l2e/links2-wt" HEAD
+  N=$(gate_base_test_materialize_links "$H_SCRATCH/l2d/l2e/links2-wt")
+  eq "a link whose path goes through an absolute link to the outside creates NOTHING outside" \
+    "$([ -e "$OUT2/created_outside" ] && echo created-outside || echo absent)" "absent"
+  eq "...and the outside directory is still empty" "$(ls -A "$OUT2" | wc -l | tr -d ' ')" "0"
+  eq "a link whose path goes through a RELATIVE climbing link creates nothing outside either" \
+    "$([ -e "$H_SCRATCH/l2d/escaped" ] && echo created-outside || echo absent)" "absent"
+  eq "only the legitimate link was materialised (logs -> shared/logs): count 1" "$N" "1"
+  eq "...and it is a directory inside the checkout" "$([ -d "$H_SCRATCH/l2d/l2e/links2-wt/shared/logs" ] && echo dir)" "dir"
+  git -C "$L2" worktree remove --force "$H_SCRATCH/l2d/l2e/links2-wt" >/dev/null 2>&1
 fi
 
 if need_fn gate_base_test_mirror_runtime_dirs; then
@@ -1088,6 +1259,8 @@ if want 7 && [ "$HAVE_PYTEST" = yes ]; then
     eq "UNREAD -> verdict nao-consegui-medir (NOT sem-teste-novo: that is the claim 'I looked and there is nothing')" \
       "$(logged 'AB-BASE-TEST bead=ga-pj5va arm=B verdict=nao-consegui-medir ')" "1"
     eq "UNREAD is recorded, on the PYJS line" "$(logged 'AB-BASE-TEST-PYJS bead=ga-pj5va arm=B .*pyjs=unread')" "1"
+    eq "...and py/js read 'unknown' there, never a 0 that says 'I looked and found none'" \
+      "$(logged 'AB-BASE-TEST-PYJS bead=ga-pj5va arm=B sh=0 py=unknown js=unknown pyjs=unread')" "1"
 
     echo "  -- arm B, bash selftest + pytest together: counts add up --"
     E6="$H_SCRATCH/e2e6"; mk_remote "$E6"; branch "$E6/rig" feat/e6; fix_code "$E6/rig" ""
@@ -1120,6 +1293,24 @@ if want 7 && [ "$HAVE_PYTEST" = yes ]; then
     eq "a passing test plus a zero-test script -> refused (the script is not a test, so it is not counted)" "$RC" "1"
     eq "...the comment names the file that passed on base" "$(logged 'BD .*comment mk-e2e .*Files: .*tests/test_passes\.py')" "1"
     eq "...and does NOT name the zero-test script: it holds no test, so it passed nothing" "$(logged 'BD .*comment mk-e2e .*tests/test_script\.py')" "0"
+    eq "...the refusal text says 'test file(s)', not 'selftest(s)': it counts pytest/js files too" \
+      "$(logged 'ERR .*test file\(s\) \(selftest, pytest, js\)')" "1"
+    eq "...and the Files: line has ONE space before the name (an empty selftest list used to leave a double space)" \
+      "$(logged 'Files: tests/test_passes\.py \(For a test file you MODIFIED')" "1"
+    LOGF="$H_SCRATCH/e11.log"; : > "$LOGF"
+    RC=$(run_block "$E9/rig" $BEAD_B feat/e9 "$(printf 'FILE tests/dir with space/test_a.py kind=py state=passes-on-base why=- old=added\nTOTALS files=1 counted=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 py=1 js=0')")
+    eq "a path with a space in it is named WHOLE in the refusal (a [^ ]* match cut it at the first space)" \
+      "$(logged 'Files: tests/dir with space/test_a\.py \(For a test file')" "1"
+
+    echo "  -- arm B, more than 15 selftests: the py/js half was never looked at, so its counts are unknown (not 0) --"
+    E10="$H_SCRATCH/e2e10"; mk_remote "$E10"; branch "$E10/rig" feat/e10
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do printf '#!/bin/bash\nexit 0\n' > "$E10/rig/c$_i.selftest.sh"; done
+    push_branch "$E10/rig" feat/e10
+    LOGF="$H_SCRATCH/e10.log"; : > "$LOGF"
+    RC=$(run_block "$E10/rig" $BEAD_B feat/e10 "TOTALS files=0 counted=0 copy_ok=0 ran=0 failed=0 repaired=0 unclassified=0 py=0 js=0")
+    eq "the cap case completes without a refusal" "$RC" "0"
+    eq "...pyjs=skipped-sh-cap with py=unknown js=unknown" \
+      "$(logged 'AB-BASE-TEST-PYJS bead=ga-pj5va arm=B sh=16 py=unknown js=unknown pyjs=skipped-sh-cap')" "1"
 
     echo "  -- arm B, a rig with no venv: the pytest file is unmeasured, never refused --"
     E8="$H_SCRATCH/e2e8"; mk_remote "$E8"; branch "$E8/rig" feat/e8; fix_code "$E8/rig" ""

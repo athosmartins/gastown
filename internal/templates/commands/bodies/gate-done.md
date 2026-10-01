@@ -72,11 +72,17 @@ against pre-fix code. Your test files, their `conftest.py` and anything under
 base; every OTHER file you
 changed stays pre-fix, because that is the fix. Your branch is the control: a
 test counts as "failing on base" only if it passes ALONE on your branch and
-fails ALONE on base, and a file is refused only after each of its tests has
-also been run ALONE on base (a file with too many tests to do that is "could
-not measure"). So a test that only passes (or only fails) because of state
-another test left behind never decides the outcome. Anything the check cannot measure (the rig has no
-venv/node_modules, a timeout, a test that needs the network or the clock)
+fails ALONE on base. A file is refused only when it is clean on your branch (no
+failing test and no collection error there: a sibling that is red on your
+branch but green on base is "could not measure", never left to the other tests
+to decide) and every test that PASSES on your branch has also been run ALONE on
+base and passed there too (a file with too many tests to do that is "could not
+measure"). A test that is skipped on both sides is neither evidence nor counted,
+so an env-gated `skipif` in the sandbox lets the remaining tests decide. A test
+that only passes (or only fails) because of state another test left behind
+never decides the outcome. Anything the check cannot measure (the rig has no
+venv/node_modules, a timeout, a test that needs the network or the clock, a
+symlink in the checkout that would send a write outside the scratch directory)
 is recorded as "could not measure" and never refused. Write tests that do not
 depend on order, wall-clock time or the network and you will never notice the
 check exists.
@@ -1109,12 +1115,13 @@ Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
 lost.
 
 **Marker rejected with "base-commit-test-check (ga-rstae, arm B)" / gate-status:error
-saying your selftest(s) pass unmodified against base**: you're in arm B of a
+saying your test file(s) pass unmodified against base**: you're in arm B of a
 running A/B experiment (arm is a deterministic hash of your bead id — you
-don't choose it and can't avoid it by resubmitting). Every `*.selftest.sh`
-file you added or changed was extracted, unmodified, into a throwaway
-worktree checked out at the commit your branch is based on (none of your
-fix applied there), and run — and ALL of them still passed. That means the
+don't choose it and can't avoid it by resubmitting). Every `*.selftest.sh`,
+pytest and JS test file you added or changed was put, unmodified, into a
+throwaway worktree checked out at the commit your branch is based on (none of
+your fix applied there; pytest and JS inside a sandbox), and run — and ALL of
+them still passed. That means the
 test doesn't actually depend on your fix, so it proves nothing (the same
 thing test-driven-development's Iron Law already asks you to avoid). Fix:
 strengthen the assertion so it genuinely fails without your fix — e.g. call
@@ -1124,9 +1131,11 @@ base code already satisfies — then push again:
 git push origin HEAD
 ```
 Then re-run `/gate-done`. The marker is fixable + re-submittable, nothing is
-lost. If your submission touches no `*.selftest.sh` files, or uses a
-different test convention (pytest/jest/go test/...), this check does not
-apply to you at all — it only measures shell selftest files today.
+lost. If your submission touches no `*.selftest.sh`, pytest (`test_*.py`,
+`*_test.py`) or JS (`*.test.*`, `*.spec.*`, run with vitest) files, or uses a
+different test convention (go test, jest, ...), this check does not apply to
+you — those are not measured. The Files: line of the comment names exactly the
+files that passed on base.
 
 **Found a third-state bug during the Pre-flight Self-Audit**: Fix it, commit,
 and `git push origin HEAD` again before continuing, then re-run the sequence

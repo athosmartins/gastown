@@ -2676,8 +2676,8 @@ gate_base_test_is_support() {
 }
 
 # _gate_base_test_classify <mode> <tip> <base> <alone-tip> <alone-base>  (ga-kisvqp)
-#   The ONE classifier behind gate_base_test_decisive / _file_state / _old_form_state, so
-#   the three can never disagree about what "decisive" means. Each table argument is an
+#   The ONE classifier behind gate_base_test_decisive / _file_state / _old_form_state / _control_state, so
+#   they can never disagree about what "decisive" or "green" means. Each table argument is an
 #   OUTCOME TABLE: a "#ok" header line (the run was READ and parsed) then one
 #   "<id><TAB><outcome>" row per test, outcome in pass | fail | skip | collect-error.
 #   The header is what keeps "unreadable" from looking like "empty": a table with no
@@ -2725,6 +2725,12 @@ END {
     if (readable("tip") && readable("base")) { decisive(); for (i = 1; i <= lim; i++) print dec[i] }
     exit 0
   }
+  if (mode == "control") {
+    if (!readable("tip")) { print "unmeasured"; exit 0 }
+    if (cnt["tip"] == 0) { print "no-tests"; exit 0 }
+    if (cerr["tip"] || npass["tip"] == 0) { print "unmeasured"; exit 0 }
+    print "usable"; exit 0
+  }
   if (!readable("tip") || !readable("base")) { print "unmeasured"; exit 0 }
   if (cnt["tip"] == 0) { print "no-tests"; exit 0 }
   if (cerr["tip"] || npass["tip"] == 0) { print "unmeasured"; exit 0 }
@@ -2741,6 +2747,11 @@ END {
     id = ord["tip", i]
     if (get("tip", id) == "pass" && get("base", id) != "pass") { print "unmeasured"; exit 0 }
   }
+  # A test that is RED at tip is not in the loop above (it did not pass there), so it would be dropped and its
+  # siblings left to decide the file. Red at tip but green at base is a flaky test, or one the fix itself breaks:
+  # either way the file is not "every test passes on both", and calling it passes-on-base would refuse on a
+  # partial picture. Red at tip AND at base is the sandbox/env case and was already unmeasured on its way here.
+  if (nred["tip"] > 0) { print "unmeasured"; exit 0 }
   print "passes-on-base"
 }'
 }
@@ -2759,8 +2770,11 @@ gate_base_test_decisive() { _gate_base_test_classify decisive "${1-}" "${2-}" ""
 #   One file's answer, from its outcome tables (see _gate_base_test_classify):
 #     fails-on-base  — a decisive test (passes at tip, fails at base) ALSO passes alone at tip
 #                      and fails alone at base. Evidence the test depends on the fix.
-#     passes-on-base — readable tables, at least one test passes at tip, and EVERY test that
-#                      passes at tip also passes at base. Evidence the test proves nothing.
+#     passes-on-base — readable tables, at least one test passes at tip, NO test at tip is red (a
+#                      failing test or a collection error: a tip-red sibling that is green at base
+#                      is flaky or broken by the fix, and the others must not decide for it), and
+#                      EVERY test that passes at tip also passes at base. Evidence the test proves
+#                      nothing.
 #     no-tests       — the tip run was read cleanly and held zero tests (a test_*.py that is a
 #                      script). Not a test file; not counted.
 #     unmeasured     — everything else: an unreadable table, a control that is not green, a
@@ -2769,6 +2783,17 @@ gate_base_test_decisive() { _gate_base_test_classify decisive "${1-}" "${2-}" ""
 #                      wa-u4bdpn). Never evidence in either direction.
 #   Only passes-on-base can lead to a refusal, and only when every other file agrees.
 gate_base_test_file_state() { _gate_base_test_classify state "${1-}" "${2-}" "${3-}" "${4-}"; }
+
+# gate_base_test_control_state <tip>  (ga-kisvqp)
+#   Can this tip run serve as the CONTROL for a file (is the test sound in this environment with the fix
+#   applied)? Asked of the tip table alone, so it does not depend on what base did:
+#     usable     — read cleanly, at least one test passes and nothing failed to LOAD. A sibling that is
+#                  red at tip does not make the table unusable: the tests that pass are still a control
+#                  (whether red siblings may be ignored when judging "proves nothing" is
+#                  gate_base_test_file_state's rule, not this one).
+#     no-tests   — read cleanly and held zero tests (a test_*.py script).
+#     unmeasured — unreadable, a collection error, or nothing passes.
+gate_base_test_control_state() { _gate_base_test_classify control "${1-}" "" "" ""; }
 
 # gate_base_test_old_form_state <old-table>  (ga-kisvqp)
 #   ga-yl1k3w for pytest/js: what does base's OWN copy of a changed test file do on base?
@@ -2832,6 +2857,51 @@ _gate_base_test_norm_path() {
   return 0
 }
 
+# _gate_base_test_write_stays_inside <root> <relative-path>  (ga-kisvqp)
+#   May the guard CREATE or OVERWRITE <root>/<relative-path>? Status 0 only when that write lands inside
+#   <root> on the filesystem AS IT IS NOW — not merely on paper. Why it exists: the builder's branch
+#   decides what is in a checkout, and a tracked symlink can send a path that READS as inside the tree
+#   anywhere: with `abs -> /outside` and `via -> abs/made`, "abs/made" is lexically inside, and
+#   `mkdir -p root/abs/made` (or `git show > root/abs/f`) happens in /outside. _gate_base_test_norm_path
+#   judges the string; the write acts on what the filesystem resolves, and the two are different
+#   variables. This asks the filesystem, about the SAME path the write is about to use:
+#     1. every component of <relative-path> that already EXISTS must be a real entry, not a symlink —
+#        the last one included, because `>` follows a link at the end too. A link that points back
+#        inside the tree is refused as well: for a path that goes through a link the answer is
+#        "do not write", never "probably fine".
+#     2. the deepest component that exists, resolved physically (pwd -P), must be <root> (resolved
+#        the same way) or below it.
+#   Status 1 (do not write) for a missing root, an empty / absolute / climbing path, a symlink on the
+#   way, an ancestor that resolves outside <root>, or anything it cannot resolve. Creates nothing.
+#   It judges the tree at the moment it is asked, so the caller asks right before each write; a tree that
+#   a sandboxed test can write into (the scratch) must be asked again after every run.
+_gate_base_test_write_stays_inside() {
+  local root="${1-}" rel="${2-}" rootp="" anc="" cur="" comp="" ancp="" old_ifs="$IFS" had_f=1 rc=0
+  if [ -z "$root" ] || [ ! -d "$root" ]; then return 1; fi
+  rel=$(_gate_base_test_norm_path "$rel") || return 1
+  if [ -z "$rel" ]; then return 1; fi
+  rootp=$(cd "$root" 2>/dev/null && pwd -P) || return 1
+  if [ -z "$rootp" ]; then return 1; fi
+  anc="$rootp"
+  case "$-" in (*f*) had_f=0 ;; esac
+  set -f
+  IFS=/
+  for comp in $rel; do
+    cur="$anc/$comp"
+    if [ -L "$cur" ]; then rc=1; break; fi
+    if [ -d "$cur" ]; then anc="$cur"; continue; fi
+    break   # missing (so is everything below it) or a plain file: the write happens in $anc
+  done
+  IFS="$old_ifs"
+  if [ "$had_f" -eq 1 ]; then set +f; fi
+  if [ "$rc" -ne 0 ]; then return 1; fi
+  ancp=$(cd "$anc" 2>/dev/null && pwd -P) || return 1
+  case "$ancp" in
+    ("$rootp"|"$rootp"/*) return 0 ;;
+  esac
+  return 1
+}
+
 # gate_base_test_materialize_links <checkout>  (ga-kisvqp)
 #   A fresh checkout of a commit has none of a live rig's untracked runtime state, and any tracked
 #   SYMLINK into it dangles. Real case (whatsapp_automation): `logs -> shared/logs` and
@@ -2840,7 +2910,10 @@ _gate_base_test_norm_path() {
 #   every such test is unmeasurable for a reason that has nothing to do with the fix. For each tracked
 #   symlink whose RELATIVE target (resolved from the link's own directory) lies inside the checkout and
 #   does not exist, this creates it as an empty directory. Never followed: absolute targets, targets
-#   that climb out of the tree, targets that already exist. Nothing is linked to the live rig's real
+#   that climb out of the tree, targets that already exist, and a target whose path goes THROUGH another
+#   symlink of the checkout (a second tracked link can turn a path that reads as inside into a write
+#   outside — see _gate_base_test_write_stays_inside, which is asked about the whole target path right
+#   before `mkdir -p` creates it, so every directory that call would make is covered). Nothing is linked to the live rig's real
 #   state: tests get an empty directory inside the sandbox scratch, where they may write, and never the
 #   production data. Prints the number of directories created (0 when the argument is not a checkout).
 #   ALWAYS returns 0. A target that is really a FILE becomes an empty directory and the test that wanted
@@ -2858,7 +2931,7 @@ gate_base_test_materialize_links() {
     dir="${p%/*}"; [ "$dir" = "$p" ] && dir=""
     res=$(_gate_base_test_norm_path "${dir:+$dir/}$tgt") || continue
     [ -z "$res" ] && continue
-    if [ ! -e "$root/$res" ] && [ ! -L "$root/$res" ]; then
+    if [ ! -e "$root/$res" ] && [ ! -L "$root/$res" ] && _gate_base_test_write_stays_inside "$root" "$res"; then
       if mkdir -p "$root/$res" 2>/dev/null; then echo "$res"; fi
     fi
   done) || made=""
@@ -3070,6 +3143,10 @@ gate_base_test_sandbox_exec() {
   prof=$(gate_base_test_sandbox_profile "$real" "${HOME:-}") || return 97
   tbin=$(_gate_base_test_timeout_bin) || return 97
   mkdir -p "$real/home" "$real/tmp" "$real/plugin" 2>/dev/null || return 97
+  # run.log is opened by THIS process (the redirect below), in a directory the previous sandboxed run could
+  # write to: a test that left a symlink under that name would make the redirect truncate whatever it points
+  # at. Removing the name first removes the link itself, never its target.
+  rm -f "$real/run.log" 2>/dev/null || true
   ( cd "$cwd" 2>/dev/null && exec "$tbin" -k 5 "$secs" env -i \
       PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
       HOME="$real/home" TMPDIR="$real/tmp" LANG=en_US.UTF-8 \
@@ -3119,7 +3196,12 @@ gate_base_test_run_table() {
     (py)
       interp=$(gate_base_test_py_interp "$rig") || return 1
       here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      # plugin/ lives in the scratch a sandboxed test can write to: a directory or file there that was swapped
+      # for a symlink would make the cp below write through it. Drop the names first (removes the link, not its
+      # target), then copy into what this process just made.
+      if [ -L "$real/plugin" ]; then rm -f "$real/plugin" 2>/dev/null || return 1; fi
       mkdir -p "$real/plugin" 2>/dev/null || return 1
+      rm -f "$real/plugin/gate_basetest_outcomes.py" 2>/dev/null || true
       cp "$here/gate_basetest_outcomes.py" "$real/plugin/" 2>/dev/null || return 1
       gate_base_test_sandbox_exec "$real" "$secs" "$cwd" "$interp" -m pytest \
         -p gate_basetest_outcomes -p no:cacheprovider -p no:randomly -p no:xdist -o addopts= \
@@ -3192,6 +3274,42 @@ gate_base_test_collect_ids() {
   return 0
 }
 
+# _gate_base_test_over_budget  (ga-kisvqp)
+#   Status 0 when the measurement's time budget is spent. Reads its caller's locals (dynamic scope): t0 (when
+#   the measurement started) and budget (seconds). With either unset — a unit test calling an inner function
+#   directly — there is no budget to be over, so status 1. Asked BEFORE each sandboxed run that is not a file's
+#   first, so a run already started finishes (<= GATE_ABT_RUN_TIMEOUT + 5s) and the overrun is one run, never
+#   the dozen a long table of alone-runs could add.
+_gate_base_test_over_budget() {
+  if [ -z "${budget-}" ] || [ -z "${t0-}" ]; then return 1; fi
+  [ $((SECONDS - t0)) -ge "$budget" ] 2>/dev/null
+}
+
+# _gate_base_test_untsv <field>  (ga-kisvqp)
+#   Undoes the escaping `jq @tsv` applies to a field: \\ -> \, \t -> TAB, \n -> NL, \r -> CR. The outcome
+#   tables carry ids in that escaped form (so a TAB or newline inside an id cannot split a row), and an id
+#   that is handed BACK to pytest/vitest as a node id or a test name must be the real string: with a
+#   backslash in a parametrize id, the escaped form names a test that does not exist, and the alone-run reads
+#   as "absent" — a lost measurement. Table lookups keep using the escaped form; only a run argument is
+#   decoded. Prints the decoded string without a trailing newline.
+_gate_base_test_untsv() {
+  printf '%s' "${1-}" | awk '{
+    out = ""; n = length($0)
+    for (i = 1; i <= n; i++) {
+      c = substr($0, i, 1)
+      if (c == "\\" && i < n) {
+        d = substr($0, i + 1, 1)
+        if (d == "\\") { out = out "\\"; i++ }
+        else if (d == "t") { out = out "\t"; i++ }
+        else if (d == "n") { out = out "\n"; i++ }
+        else if (d == "r") { out = out "\r"; i++ }
+        else out = out c
+      } else out = out c
+    }
+    printf "%s", out
+  }'
+}
+
 # _gate_base_test_alone_table <kind> <rig> <cwd> <scratch> <relfile> <ids> [file]  (ga-kisvqp)
 #   Runs each id in <ids> (one per line) ALONE and prints ONE outcome table holding, for each run,
 #   only the row of the test that was asked for (plus any collect-error row: the file never loaded).
@@ -3199,6 +3317,9 @@ gate_base_test_collect_ids() {
 #   would overwrite the real answer of a sibling when tables are merged — the asked-for row is the
 #   only one a single-test run can vouch for. Status 1, nothing printed, if ANY of the runs is
 #   unreadable: a missing answer must not be dropped from the merge and leave the rest looking whole.
+#   It STOPS at the first unreadable run (the table is lost either way; the rest would be paid for
+#   nothing) and before any run once the measurement budget is spent (_gate_base_test_over_budget): a
+#   table of GATE_ABT_ALONE_PASS_MAX runs can no longer carry the whole measurement past its budget.
 #   py ids are pytest node ids; js ids are "<relfile>::<full name>" (the full name is what -t needs).
 #   With a 7th argument "file" each id is run as the WHOLE file instead: used when the file-run at
 #   base was a collection error, where no single test can run (pytest answers a node id inside a
@@ -3209,6 +3330,9 @@ _gate_base_test_alone_table() {
   local kind="$1" rig="$2" cwd="$3" scratch="$4" relf="$5" ids="$6" level="${7-}" out=""
   out=$(printf '%s\n' "$ids" | while IFS= read -r id; do
     [ -z "$id" ] && continue
+    # Over budget BEFORE a run is an unreadable answer, not a short table: the runs that did not happen are
+    # not "no result", and the loop stops here rather than paying for the rest.
+    if _gate_base_test_over_budget; then printf '\001UNREADABLE\n'; break; fi
     only="$id"
     if [ "$level" = "file" ]; then
       only=""
@@ -3218,10 +3342,14 @@ _gate_base_test_alone_table() {
         (*) only="" ;;
       esac
     fi
+    # The id is in the table's escaped form (see _gate_base_test_untsv); the run needs the real string.
+    if [ -n "$only" ]; then only=$(_gate_base_test_untsv "$only"); fi
     if t=$(gate_base_test_run_table "$kind" "$rig" "$cwd" "$scratch" "$relf" "$only"); then
       printf '%s\n' "$t" | GATE_TID="$id" awk -F'\t' 'NR > 1 && ($1 == ENVIRON["GATE_TID"] || $2 == "collect-error")'
     else
-      printf '\001UNREADABLE\n'
+      # One unreadable run makes the whole table unreadable (see above), so the remaining runs could change
+      # nothing: stop instead of running up to GATE_ABT_ALONE_PASS_MAX more.
+      printf '\001UNREADABLE\n'; break
     fi
   done) || return 1
   case "$out" in
@@ -3272,7 +3400,8 @@ _gate_base_test_first_confirmed() {
 #     (c) a collection error on base (pytest): the tip's node ids are LISTED without running them and a few
 #         run alone at tip are the control; the confirmation is the whole file failing to load on base again.
 #     (b) no failure on base (a full run), or a collection error that (c) could not sample (js): a FULL run
-#         at tip is the control (a file that is not green there measures nothing). If EVERY tip-passing test passes at base, each
+#         at tip is the control (a file that is not usable there measures nothing). If EVERY tip-passing test passes at base
+#         — and no test at tip is red: a red sibling makes the file unmeasured, see gate_base_test_file_state — each
 #         is then run ALONE at base before the file may be called passes-on-base: a test that passes in the
 #         file run only on state a sibling leaked — and fails on its own — does depend on the fix, and
 #         refusing it would be refusing a good test. More tip-passing tests than
@@ -3295,7 +3424,7 @@ _gate_base_test_measure_one() {
     # pass there (environment, clock, order) is never counted. The classifier is unchanged: it is handed a tip
     # table that holds exactly the candidates.
     st=$(_gate_base_test_first_confirmed "$kind" "$relf" "$B" "$F" "")
-  elif [ -n "$lvl" ] && [ "$kind" = "py" ] && F=$(gate_base_test_collect_ids "$kind" "$rig" "$tipdir" "$scratch" "$relf") && [ -n "$F" ]; then
+  elif [ -n "$lvl" ] && [ "$kind" = "py" ] && ! _gate_base_test_over_budget && F=$(gate_base_test_collect_ids "$kind" "$rig" "$tipdir" "$scratch" "$relf") && [ -n "$F" ]; then
     # (c) The file cannot even be collected on base (typically: it imports a symbol the fix adds — the classic
     # TDD red). The control is a few of ITS tests, listed without running anything and then run ALONE at tip;
     # the confirmation is the whole file failing to load on base again. Same shape as (a), and for the same
@@ -3306,12 +3435,13 @@ _gate_base_test_measure_one() {
     # unreadable listing): a FULL tip run is the control.
     if [ $((SECONDS - t0)) -ge "$budget" ]; then echo "unmeasured budget -"; return 0; fi
     T=$(gate_base_test_run_table "$kind" "$rig" "$tipdir" "$scratch" "$relf") || { echo "unmeasured tip-unreadable -"; return 0; }
-    # A control that is not green (nothing passes, or the file did not load) cannot support either answer, and a
-    # file with no tests at all is not a test. Judging the tip table against ITSELF is the cheap way to ask exactly
-    # that — only a green control reads passes-on-base here.
-    case "$(gate_base_test_file_state "$T" "$T")" in
+    # A control that is not usable (nothing passes, or the file did not load) cannot support either answer, and a
+    # file with no tests at all is not a test. Anything but a clean "usable" stops here: an unreadable control is
+    # not a green one.
+    case "$(gate_base_test_control_state "$T")" in
       (no-tests) echo "no-tests - -"; return 0 ;;
-      (unmeasured) echo "unmeasured tip-not-green -"; return 0 ;;
+      (usable) ;;
+      (*) echo "unmeasured tip-not-green -"; return 0 ;;
     esac
     D=$(gate_base_test_decisive "$T" "$B")
     if [ -n "$D" ]; then
@@ -3351,14 +3481,19 @@ _gate_base_test_measure_one() {
         old="added"
       elif [ $((SECONDS - t0)) -ge "$budget" ]; then
         old="unknown"
-      elif git -C "$rig" show "${base}:${full}" > "$basewt/$full" 2>/dev/null; then
+      elif _gate_base_test_write_stays_inside "$basewt" "$full" && git -C "$rig" show "${base}:${full}" > "$basewt/$full" 2>/dev/null; then
         if O=$(gate_base_test_run_table "$kind" "$rig" "$basedir" "$scratch" "$relf"); then
           old=$(gate_base_test_old_form_state "$O")
         else
           old="unknown"
         fi
-        # put the branch's version back: the overlay must hold for whatever runs next on this tree
-        git -C "$rig" show "${tip}:${full}" > "$basewt/$full" 2>/dev/null || true
+        # Put the branch's version back: the overlay must hold for whatever runs next on this tree. The write
+        # is asked about AGAIN — a sandboxed test may write inside the scratch, and the run above is exactly
+        # when a path in this tree could have been swapped for a symlink. A refusal leaves base's copy in
+        # place: this file's answer is already settled, and nothing is written outside.
+        if _gate_base_test_write_stays_inside "$basewt" "$full"; then
+          git -C "$rig" show "${tip}:${full}" > "$basewt/$full" 2>/dev/null || true
+        fi
       else
         old="unknown"
       fi
@@ -3387,7 +3522,9 @@ _gate_base_test_measure_one() {
 #   _gate_base_test_measure_one). Every run is sandboxed (gate_base_test_sandbox_exec); with no
 #   working sandbox nothing runs at all.
 #   Bounds: GATE_ABT_PYJS_MAX files (default 8; more -> all unmeasured, why=cap), GATE_ABT_PYJS_BUDGET
-#   seconds for the whole measurement (default 240; then the rest is unmeasured, why=budget),
+#   seconds for the whole measurement (default 240; then the rest is unmeasured, why=budget — asked before
+#   every file and before every follow-up run, so a run already started finishes and the overrun is at most
+#   that one run),
 #   GATE_ABT_RUN_TIMEOUT per run (default 90), GATE_ABT_ALONE_PASS_MAX alone checks (default 8).
 gate_base_test_pyjs_measure() {
   local rig="${1-}" base="${2-}" tip="${3-}" files="${4-}"
@@ -3424,6 +3561,14 @@ gate_base_test_pyjs_measure() {
     elif ! git -C "$rig" worktree add --detach --quiet "$tipwt" "$tip" >/dev/null 2>&1; then fail_why="worktree"
     fi
   fi
+  if [ -z "$fail_why" ] && [ -n "$prefix" ]; then
+    # The rig's directory INSIDE each checkout is where runtime dirs are made and where the tests run. It must be
+    # real directories of that checkout: if the branch turned it (or a parent of it) into a symlink, every write
+    # below lands wherever the link points. Asked of both trees; a refusal is the inert answer (nothing run).
+    if ! _gate_base_test_write_stays_inside "$basewt" "${prefix%/}/.gate-probe" || ! _gate_base_test_write_stays_inside "$tipwt" "${prefix%/}/.gate-probe"; then
+      fail_why="worktree"
+    fi
+  fi
   if [ -z "$fail_why" ]; then
     # Tracked symlinks into untracked runtime dirs (WA: logs -> shared/logs) dangle in a fresh checkout and
     # fail the control for reasons unrelated to the fix: give them empty directories inside the scratch.
@@ -3447,7 +3592,10 @@ gate_base_test_pyjs_measure() {
       local oldifs="$IFS"; IFS=$'\n'
       for f in $sup; do
         if [ "$(gate_base_test_is_support "$f")" = "yes" ]; then
-          if ! { mkdir -p "$(dirname "$basewt/$f")" && git -C "$rig" show "${tip}:${f}" > "$basewt/$f"; } 2>/dev/null; then
+          # The write is asked about first: base's tree may hold a tracked symlink on this path (or above it) that
+          # sends it outside the scratch, and `git show >` / `mkdir -p` would follow it. A refusal is "overlay":
+          # every file unmeasured, nothing run — the inert answer.
+          if ! { _gate_base_test_write_stays_inside "$basewt" "$f" && mkdir -p "$(dirname "$basewt/$f")" && git -C "$rig" show "${tip}:${f}" > "$basewt/$f"; } 2>/dev/null; then
             fail_why="overlay"; break
           fi
           if [ "$(gate_base_test_is_code_helper "$f")" = "yes" ]; then supcode=$((supcode + 1)); fi
@@ -6601,7 +6749,9 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
     _ABT_REPAIRED=0; _ABT_UNCLASSIFIED=0   # ga-yl1k3w: see gate_base_test_old_state
     _ABT_OUTSIDE="unknown"                 # ga-x4mkk2: "never measured" must not read as 0
     _ABT_BASE=""; _ABT_TEST_FILES=""
-    _ABT_SH_N=0; _ABT_NPY=0; _ABT_NJS=0; _ABT_PYJS_OUT=""; _ABT_PYJS_FILE_LIST=""   # ga-kisvqp: pytest/js half
+    # ga-kisvqp: pytest/js half. py/js are "unknown" until a TOTALS line has actually been READ: a count that was never
+    # taken (sh-cap, no base, an unreadable scan) must not print as the zero of "I looked and there were none".
+    _ABT_SH_N=0; _ABT_NPY=unknown; _ABT_NJS=unknown; _ABT_PYJS_OUT=""; _ABT_PYJS_FILE_LIST=""
     _ABT_PYJS_STATE="none"                 # none | measured | unread | skipped-sh-cap (never a bare 0 for "could not look")
     _ABT_PYJS_DET=0; _ABT_PYJS_COPY=0; _ABT_PYJS_RAN=0; _ABT_PYJS_FAILED=0; _ABT_PYJS_REP=0; _ABT_PYJS_UNC=0
 
@@ -6638,14 +6788,16 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
           _ABT_PYJS_DET=$_abt_n; _ABT_PYJS_COPY=$_abt_c; _ABT_PYJS_RAN=$_abt_r
           _ABT_PYJS_FAILED=$_abt_f; _ABT_PYJS_REP=$_abt_p; _ABT_PYJS_UNC=$_abt_u
         else
-          _ABT_PYJS_STATE="unread"; _ABT_NPY=0; _ABT_NJS=0     # a TOTALS line we cannot read is not a zero
+          _ABT_PYJS_STATE="unread"; _ABT_NPY=unknown; _ABT_NJS=unknown   # a TOTALS line we cannot read is not a zero
         fi
         # "Could not read" is one phantom test file that was never measured: detected > copy_ok, so the
         # verdict is nao-consegui-medir — never sem-teste-novo (which says "I looked and found none") and
         # never a refusal. The same accounting gate_base_test_verdict already uses for a partial measurement.
         if [ "$_ABT_PYJS_STATE" = "unread" ]; then _ABT_PYJS_DET=1; fi
         # only the files that PASSED on base are named in a refusal: a zero-test script (no-tests) passed nothing
-        _ABT_PYJS_FILE_LIST=$(printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE \([^ ]*\) .* state=passes-on-base .*/\1/p' | tr '\n' ' ')
+        # (newline-separated, and the path is everything between "FILE " and the LAST " kind=": a path with a space
+        # in it is kept whole, where a [^ ]* match cut it at the first space)
+        _ABT_PYJS_FILE_LIST=$(printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE \(.*\) kind=[a-z]* state=passes-on-base why=.*/\1/p')
       else
         _ABT_PYJS_STATE="skipped-sh-cap"
       fi
@@ -6724,12 +6876,12 @@ ABT_TEST_FILES_EOF
     printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE /AB-BASE-TEST-FILE bead='"$BEAD_ID"' /p' | while IFS= read -r _abt_l; do log "$_abt_l"; done
 
     if [ "$_ABT_VERDICT" = "passou-na-base" ]; then
-      err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed selftest(s) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
+      err "  base-commit-test-check (ga-rstae, arm B): $_ABT_DETECTED new/changed test file(s) (selftest, pytest, js) on $BRANCH ALL pass unmodified against pre-fix base $_ABT_BASE — proves nothing about this branch's own diff. Refusing at submission."
       set_gate_status "$MARKER_ID" "error"
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
-$_ABT_DETECTED new/changed selftest file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
-Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ') $_ABT_PYJS_FILE_LIST
-(For a selftest you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
+$_ABT_DETECTED new/changed test file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
+Files: $(printf '%s\n%s\n' "$_ABT_TEST_FILES" "$_ABT_PYJS_FILE_LIST" | grep -v '^$' | paste -sd ' ' -)
+(For a test file you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
 Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
   git push origin $BRANCH
 Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittable, not lost).
