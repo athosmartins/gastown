@@ -1,8 +1,8 @@
 # E8 — tokens por bead aprovada: o medidor, o baseline de 7 dias e o que o dado diz sobre modelo e effort
 
-Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC inteiros), transcritos locais + arquivo permanente do S3 (`s3://urblink-claude-history-backup`), log do gate. Somente leitura sobre transcritos e gate; o que a bead entrega e o que ficou para o Mayor decidir estão nas seções 1 e 5.
+Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC inteiros), transcritos locais + arquivo permanente do S3 (`s3://urblink-claude-history-backup`), log do gate. Somente leitura sobre transcritos e gate; o que a bead entrega e o que ficou para o Mayor decidir estão nas seções 1 e 4; o encerramento do E2, na 5.
 
-**Em 7 linhas**
+**Em 8 linhas**
 
 1. **O medidor existe e está certo**: `bead-token-meter.py` dá tokens e US$ por papel × modelo × effort, por bead e por bead aprovada, a partir dos transcritos. Conferido contra uma recontagem independente (8/8 sessões idênticas) e contra o ramo do gate (81/81 atribuições batem). Os transcritos são apagados pelo reaper 24h depois da morte da sessão; um **ledger durável** + uma order a cada 30 min impedem que o histórico evapore (o histórico de 7 dias foi recuperado do S3).
 2. **Linha de base (7 dias): ≈ US$ 12,6 mil a preço de lista, 404 beads aprovadas → US$ 31 por bead aprovada, sistema inteiro** (US$ 1,5–2,0 mil/dia). **51% desse total depende de um preço ASSUMIDO**: o Sonnet 5 (anterior ao 5.5) não tem preço na tabela da bead; assumi o do 5.5. Os tokens são exatos; o US$ não.
@@ -11,6 +11,7 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 5. **A aprovação caiu quando o modelo mudou, e o custo por aprovada triplicou** (wa-worker: 62% → 38% na 1ª tentativa; US$ 33 → US$ 104 por bead aprovada na 1ª), no mesmo dia em que o revisor também foi de Sonnet 5 → 5.5. Observacional; não separa construtor de revisor.
 6. **O mecanismo do A/B de effort está pronto e INERTE** (`claude-lowprio.sh`, só age se existir `.gc/effort-ab.conf`; kill-switch sem reload). **Não ativei**: a decisão de ligar é do Mayor, com os números da seção 4 na mão.
 7. **Maior alavanca medida, fora do escopo desta bead**: um teto de contexto de ~250 mil nos wa-workers mexe em até **22% do gasto deles** (US$ 825 em 7 dias), contra 2–4% do effort. Mas a janela de compactação tem uma decisão do Athos (31/08) que só ele reabre — seção 4.
+8. **E2 (crews de `medium` para `high`) encerrado sem conclusão**: das mensagens de crew em sessões iniciadas depois da mudança, só 32% rodaram em `high` (o peter-wa, 47% do volume, 3%); mila e digo não tiveram sessão; só 20 branches de crew nomeado receberam veredito, e ver +10 pp pede ≈ 378 por braço. Nenhuma config de crew foi alterada — seção 5.
 
 ---
 
@@ -116,7 +117,18 @@ Desligar: `rm .gc/effort-ab.conf` (ou `touch .gc/no-effort-ab`); vale na próxim
 2. **O de maior retorno é o teto de contexto nos wa-workers** (até 22% do gasto deles, ≈ US$ 110/dia). A janela de compactação foi decidida pelo Athos em 31/08 ("900k em todos os 7"; reabrir só com decisão dele) por causa de um *loop de compactação* nos papéis de vida longa, cuja base é ~260 mil tokens. O contexto do 1º turno do wa-worker é **110 mil** — um teto de 300 mil deixaria ~190 mil de folga, contra os ~40 mil da época do loop. Mas o loop de 31/08 foi medido *na volta da compactação* (260 mil, com resumo e releitura), e a nota do próprio config diz que "o piso seguro tem que ser ≫ o contexto base medido na hora, não um palpite": a base pós-compactação do wa-worker não está medida aqui. É decisão de risco do Athos, não minha. O mesmo mecanismo do braço serve (acrescentar uma chave de variável de ambiente por braço). Não implementei: precisa do "sim" dele.
 3. **ps-worker ocioso** (US$ 16/dia): corrigir quando alguém mexer no reconciler do pool; o do dog já se resolveu sozinho em 28/09.
 
-## 5. Limites e o que NÃO foi medido
+## 5. E2 (crews de `medium` para `high`): encerrado sem conclusão
+
+**Não dá para dizer se `high` ajuda os crews, e esta bead não altera config de crew**: manter `high` ou voltar a `medium` segue com o Mayor. A regra original do E2 era reverter "se não subir" — e "não subir" não pôde ser medido.
+
+O E2 (Athos, 29/09: "testar alto por 48h"; commit `b473ff267`; leitura marcada para 01/10 ~21h) comparava a 1ª aprovação das branches de crew construídas por sessões iniciadas depois de 29/09 21:00 com a linha de base de 37%. Medido em 01/10 ~03h, do ledger e do log do gate (`token-por-bead-e8/e2-readout.py`; saída arquivada em `e2-readout.out.txt`):
+
+* **O braço `high` quase não existiu.** Das 2.969 mensagens Opus de sessões de crew iniciadas depois do começo do E2, só **32% rodaram em `high`**; 39% em `medium` e 29% em `xhigh`. O peter-wa, que gerou 47% dessas mensagens, rodou 3% em `high` (62% `xhigh`, 35% `medium`). Batista, oracle e thies ficaram em 54–59% `high` e o resto em `medium` — dentro da mesma sessão. Não investiguei por que há `medium` em sessão nova; o dado só mostra que a mudança de config não valeu de modo uniforme.
+* **Poucas sessões, poucas branches.** 7 sessões de crew (batista 2, oracle 3, peter 1, thies 1); mila-wa e digo-wa não tiveram nenhuma. Só **20 branches de crew nomeado** tiveram 1º veredito do gate depois do começo do E2 (9 PASS = 45%, IC95% 26–66%), e o dado não separa o effort de cada construtor. Enxergar 37% → 47% pede ≈ 378 branches por braço.
+* O comentário do Mayor em ga-ufskhy (01/10) dizia que o E2 "perdeu amostra com as crews suspensas". O dado confirma e acrescenta: mesmo onde houve sessão, o effort não foi uniforme.
+* Cuidado ao reler: `crew/wa-worker/*` e `crew/ps-worker/*` são branches de **construtores de pool** com o prefixo `crew/`; entram na contagem do gate (dezenas por dia) mas não são crews nomeados. A medição acima exclui os dois.
+
+## 6. Limites e o que NÃO foi medido
 
 * **US$ = preço de lista da API**, não fatura. **US$ 6,4 mil de 12,6 mil usam o preço do Sonnet 5.5 para o Sonnet 5** (`--assume-price`, rotulado com `~` na saída). Sem a suposição o relatório mostra "n/p" e deixa esses tokens fora do total. Tokens/Mtok por bead não dependem de preço. Haiku 4.5, Opus 4.7 e Sonnet 4.6 não têm preço na tabela (196 Mtok, fora do total).
 * **Sessões de subagente de crew/Mayor restauradas do S3 não foram baixadas** (1.970 objetos, 451 MB): o gasto de crew/Mayor está *subestimado* no S3; nos transcritos locais entram. Não afeta os builders de pool (não usam subagente).
@@ -125,12 +137,15 @@ Desligar: `rm .gc/effort-ab.conf` (ou `touch .gc/no-effort-ab`); vale na próxim
 * **O custo da pré-revisão do E3 não aparece aqui**: `pre-gate-review.sh` roda `claude -p --no-session-persistence` (0 sessões `pregate-review` no ledger), então não deixa transcrito; o custo exato está nas linhas próprias dela (`pre-gate-apuracao.py`). O `rev US$/bead` da tabela é só de revisores do gate.
 * **A integridade do histórico restaurado**: o backup do S3 rodou todo dia às 04:00 (88 execuções, 0 erro no log), sem `--delete`; o reaper só apaga transcrito morto há > 24 h, então sempre há um backup no meio. Nenhum buraco de dia na janela.
 
-## 6. Reproduzir e verificar
+## 7. Reproduzir e verificar
+
+Os números deste relatório são um retrato de 01/10 ~03h (ledger de 5.655 sessões). Repetir o `report` algumas horas depois deu US$ 12.688 ÷ 409 = US$ 31,02 (eram 12.591 ÷ 404 = US$ 31): +0,8% por mais dados, sem mudar nenhuma conclusão. A janela é aberta (`--from`), então o total só cresce.
 
 ```
 python3 packs/town-deltas/assets/bead-token-meter.py harvest                 # ledger (a order faz isso sozinha)
 python3 packs/town-deltas/assets/bead-token-meter.py report --from 2026-09-24 --assume-price claude-sonnet-5=claude-sonnet-5-5 [--json]
 python3 packs/town-deltas/assets/bead-token-meter.py backfill-s3 --since 2026-09-24   # histórico que o reaper já apagou (lotes de 400 MB, guarda de disco)
 python3 packs/town-deltas/assets/bead-token-meter.selftest.py ; bash packs/town-deltas/assets/claude-effort-ab.selftest.sh ; bash packs/town-deltas/assets/token-ledger-harvest.selftest.sh
+python3 docs/reports/token-por-bead-e8/e2-readout.py                          # seção 5: mistura de effort e amostra de branches do E2 (saída arquivada ao lado)
 ```
 Cobertura de teste que a 1ª versão do medidor não tinha e o teste achou: o pré-filtro de linhas dependia do espaçamento do JSON (formato novo = zero mensagens lidas, silenciosamente) — hoje lê igual e há um alarme quando ≥ 25% das sessões grandes de uma colheita voltam com 0 respostas.

@@ -1,0 +1,24 @@
+/* estudo-tabelas.css — ga-5c3msy: look of the canonical table behaviour (wa-6qnv9); pairs with estudo-tabelas.js.
+   The wrapper (.estudo-tw) is the ONLY scrolling ancestor: overflow:hidden on any ancestor of a sticky header kills it.
+   pandoc's default makes every table display:block and the body 36em wide; both are overridden here because these tables are wide. */
+body { max-width: 74em; }
+.estudo-dica { font-size: .85em; color: #606060; margin: 1.2em 0 .2em; }
+.estudo-tw { overflow: auto; max-height: 75vh; margin: .4em 0 1em; border: 1px solid #ddd; }
+table.estudo-t { display: table; overflow: visible; width: 100%; margin: 0; border-collapse: separate; border-spacing: 0; font-size: .88em; }
+table.estudo-t thead th { position: sticky; top: 0; z-index: 1; background: #f4f4f4; border-top: 0; border-bottom: 1px solid #1a1a1a;
+  cursor: pointer; user-select: none; -webkit-user-select: none; white-space: nowrap; text-align: left; }
+table.estudo-t thead th[data-sort="asc"]::after  { content: " \25B2"; font-size: .7em; }
+table.estudo-t thead th[data-sort="desc"]::after { content: " \25BC"; font-size: .7em; }
+table.estudo-t thead th.estudo-filtered { background: #fff3cd; }
+table.estudo-t thead th.estudo-filtered::before { content: "\25BE "; }
+table.estudo-t tbody { border: 0; }
+table.estudo-t td { border-bottom: 1px solid #eee; vertical-align: top; }
+.estudo-n { font-size: .85em; color: #7a5c00; margin: -.6em 0 1em; }
+.estudo-pop { position: absolute; z-index: 20; background: #fff; border: 1px solid #888; border-radius: 4px; padding: .6em;
+  box-shadow: 0 4px 14px rgba(0,0,0,.25); max-width: 22em; min-width: 12em; font-size: .85em; }
+.estudo-pop-t { font-weight: 600; margin-bottom: .4em; }
+.estudo-pop input[type="search"], .estudo-pop-r input { width: 100%; box-sizing: border-box; margin-bottom: .4em; }
+.estudo-pop-r { display: flex; gap: .4em; }
+.estudo-pop-l { max-height: 14em; overflow: auto; margin-bottom: .4em; }
+.estudo-pop-l label { display: block; white-space: nowrap; }
+.estudo-pop-b { display: flex; justify-content: flex-end; gap: .4em; }
