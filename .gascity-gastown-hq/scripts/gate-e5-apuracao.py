@@ -109,15 +109,19 @@ def read_events(path):
 
 
 def audit_arms(lib, beads):
-    """Recalcula o braço com a função VIVA da lib. Devolve {bead: arm}; aborta se a função sumiu."""
+    """Recalcula o braço com a função VIVA da lib. Devolve {bead: arm} (arm "" = a função não deu braço);
+    aborta se a função sumiu ou se o bash que a roda falhou — uma auditoria que não rodou não é uma que passou."""
     src = subprocess.run(["sed", "-n", "/^gate_e5_arm_for_bead()/,/^}/p", lib], capture_output=True, text=True).stdout
     if not src.strip():
         sys.exit("FATAL: gate_e5_arm_for_bead() não encontrada em %s — sem a regra de atribuição real o "
                  "experimento não pode ser apurado (um braço adivinhado não mede nada)." % lib)
     script = src + '\nwhile IFS= read -r b; do printf "%s %s\\n" "$b" "$(gate_e5_arm_for_bead "$b")"; done\n'
-    out = subprocess.run(["/bin/bash", "-c", script], input="\n".join(sorted(beads)) + "\n",
-                         capture_output=True, text=True).stdout
-    return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+    proc = subprocess.run(["/bin/bash", "-c", script], input="\n".join(sorted(beads)) + "\n",
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit("FATAL: a auditoria do braço não rodou (bash rc=%d: %s) — sem recalcular o braço pela lib viva "
+                 "a apuração não é confiável." % (proc.returncode, (proc.stderr or "").strip()[:200]))
+    return dict(line.split(" ", 1) for line in proc.stdout.splitlines() if " " in line)
 
 
 # ── custo ─────────────────────────────────────────────────────────────────────
@@ -272,10 +276,18 @@ def per_bead(runs, history):
     1ª tentativa / cujo 1º FAIL foi uma run ADMITIDA SOB A FLAG (a flag pode ter sido ligada com a
     bead já em andamento: essas ficam de fora e são contadas)."""
     flagged = set(runs)
+    # A bead's arm is read from ALL its admitted runs, not from whichever came first: the arm is a pure function of the bead id, so a run
+    # recorded "?" (a sha tool that was missing for one sweep) says nothing about the bead — taking the first run's "?" dropped the whole
+    # bead from A and B (gate attempt 3, non-blocking). Known arms win over "?"; two different known arms cannot be told apart from a
+    # broken rule, so that bead stays "?" (the audit in analyse() already aborts on any recorded arm the live lib disagrees with).
+    by_bead = collections.defaultdict(list)
+    for r in sorted(runs.values(), key=lambda x: x["ts"]):
+        by_bead[r["bead"]].append(r)
     arm_of, meta = {}, {}
-    for r in runs.values():
-        arm_of.setdefault(r["bead"], r["arm"])
-        meta.setdefault(r["bead"], r)
+    for bead, rs in by_bead.items():
+        known = {r["arm"] for r in rs if r["arm"] in ("A", "B")}
+        arm_of[bead] = next(iter(known)) if len(known) == 1 else "?"
+        meta[bead] = next((r for r in rs if r["arm"] == arm_of[bead]), rs[0])   # the size it was admitted with, under the arm it is filed under
     out, excluded_prior = {}, 0
     for bead, arm in arm_of.items():
         hist = history.get(bead, [])
@@ -301,11 +313,14 @@ def per_bead(runs, history):
     return out, excluded_prior
 
 
+SIZE_UNKNOWN = "tamanho desconhecido"
+
+
 def size_bucket(b):
     try:
         return ">=800" if int(b["raw_lines"]) >= 800 else "<800"
     except (TypeError, ValueError):
-        return "tamanho desconhecido"
+        return SIZE_UNKNOWN
 
 
 def analyse(events, args):
@@ -313,16 +328,29 @@ def analyse(events, args):
     res = {"runs_admitidas": len(runs)}
     if not runs:
         return res, runs, {}
-    audited = audit_arms(args.lib, {r["bead"] for r in runs.values() if r["bead"]})
-    # runs recorded with arm "?" (no bead id / no sha tool at admission) have no arm to audit and stay out of A/B
-    mism = sorted(b for b, arm in audited.items()
-                  if any(r["arm"] in ("A", "B") and r["arm"] != arm for r in runs.values() if r["bead"] == b))
+    # runs recorded with arm "?" (no bead id / no sha tool at admission) have no arm to audit and stay out of A/B: the audit covers exactly
+    # the beads that have a recorded A or B, and every one of them must come back with an arm from the live lib.
+    recorded = collections.defaultdict(set)
+    for r in runs.values():
+        if r["bead"] and r["arm"] in ("A", "B"):
+            recorded[r["bead"]].add(r["arm"])
+    audited = audit_arms(args.lib, set(recorded)) if recorded else {}
+    # An audit that came back EMPTY (or short) is not an audit that found no divergence: a bead the live lib gave no arm for was not checked.
+    unchecked = sorted(b for b in recorded if audited.get(b) not in ("A", "B"))
+    if unchecked:
+        sys.exit("FATAL: a auditoria do braço não recalculou %d de %d bead(s) com braço gravado, ex.: %s — o recálculo pela lib viva "
+                 "não devolveu braço (sem ferramenta sha256? bash falhou?); sem ele a apuração não é confiável."
+                 % (len(unchecked), len(recorded), ", ".join(unchecked[:5])))
+    mism = sorted(b for b, arms in recorded.items() if arms - {audited[b]})
     if mism:
         sys.exit("FATAL: braço gravado ≠ braço recalculado pela lib viva em %d bead(s), ex.: %s — a regra de "
                  "atribuição mudou no meio do experimento; a apuração não é confiável." % (len(mism), ", ".join(mism[:5])))
     beads, excluded_prior = per_bead(runs, history_of(events))
     res["beads_com_1o_fail_anterior_a_flag_fora"] = excluded_prior
-    res["braco_auditado"] = "ok (%d beads recalculadas pela lib viva, 0 divergências)" % len(audited)
+    if recorded:
+        res["braco_auditado"] = "ok (%d beads com braço gravado recalculadas pela lib viva, 0 divergências)" % len(recorded)
+    else:
+        res["braco_auditado"] = "NADA AUDITADO (nenhuma run admitida tem braço A/B gravado — todas estão sem braço atribuível)"
 
     arms = {"A": collections.Counter(), "B": collections.Counter()}
     first_pass = {"A": [0, 0], "B": [0, 0]}
@@ -341,6 +369,9 @@ def analyse(events, args):
             first_pass[a][1] += 1
             first_pass[a][0] += 1 if b["first_result"] == "PASS" else 0
     res["beads_sem_braco"] = no_arm
+    # the size stratification needs the diff MEASURED in both arms: how many beads per arm have no size (not measured = its own cell)
+    res["tamanho_nao_medido"] = {a: sum(1 for b in beads.values() if b["arm"] == a and size_bucket(b) == SIZE_UNKNOWN) for a in ("A", "B")}
+    res["beads_por_braco"] = {a: sum(1 for b in beads.values() if b["arm"] == a) for a in ("A", "B")}
     res["primaria"] = {a: dict(c) for a, c in arms.items()}
     res["primeira_tentativa"] = first_pass
     res["strata"] = {"%s=%s" % k: {a: dict(c) for a, c in v.items()} for k, v in sorted(strata.items())}
@@ -356,7 +387,14 @@ def analyse(events, args):
                 delivery["B"]["extra_abandonado:" + r["abandoned"]] += 1
             elif r["extra_verdict"] in ("PASS", "FAIL"):
                 delivery["B"]["extra_entregou:" + r["extra_verdict"]] += 1
+            elif r["extra_verdict"] == "NONE":
+                delivery["B"]["extra_fechou_sem_veredito"] += 1
+            elif r["extra_verdict"] == "UNREADABLE":
+                delivery["B"]["extra_comentarios_ilegiveis"] += 1
+            elif r["extra_verdict"] == "-":
+                delivery["B"]["extra_ainda_pendente_no_fim_da_run"] += 1
             else:
+                # no e5_run_end line for this run at all (still running, or the line was lost): unknown, not "delivered nothing"
                 delivery["B"]["extra_sem_veredito_registrado"] += 1
         elif r["declined"]:
             delivery["B"]["recusado:" + re.sub(r":.*", "", r["declined"])] += 1
@@ -437,6 +475,10 @@ def render(res, args, bad_lines):
     L.append("   onde o 2º revisor roda em paralelo e pode reprovar o que 1 revisor aprovaria — é custo esperado, não defeito) ──")
     L.append("  A: %d/%d (%s)   B: %d/%d (%s)" % (fa[0], fa[1], pct(fa[0] / fa[1] if fa[1] else None), fb[0], fb[1], pct(fb[0] / fb[1] if fb[1] else None)))
     L.append("\n── estratos (tamanho do diff, rig): 2ª-FAIL / resolveu por braço ──")
+    nm, nb_ = res["tamanho_nao_medido"], res["beads_por_braco"]
+    if nm["A"] or nm["B"]:
+        L.append("  ⚠ tamanho do diff NÃO medido em A: %d de %d bead(s), B: %d de %d — ficam na linha 'tamanho desconhecido'; "
+                 "um braço sem tamanho medido não pode ser comparado por estrato de tamanho." % (nm["A"], nb_["A"], nm["B"], nb_["B"]))
     for k, v in res["strata"].items():
         sa, sb = v["A"], v["B"]
         L.append("  %-28s A: %d/%d   B: %d/%d" % (k, sa.get("segunda_fail", 0), sa.get("segunda_fail", 0) + sa.get("resolveu_sem_segunda_fail", 0),
