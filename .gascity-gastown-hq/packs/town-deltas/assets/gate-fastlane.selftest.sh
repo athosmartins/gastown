@@ -18,7 +18,12 @@
 #   6. drift guards on facts the safety argument depends on (Phase C refuses a zero-verdict run BEFORE it asks
 #      whether "all verdicts are in", so 0-of-0 can never read as PASS);
 #   7. mutation checks of THIS harness: a lib that loses its symlink guard / that reads "could not scan" as
-#      "clean" / whose reason code the tally does not bucket must turn the matching assertion red.
+#      "clean" / whose reason code the tally does not bucket / that has no default arm for an empty runner lookup /
+#      that believes a dead scanner's exit code must turn the matching assertion red;
+#   8. (§4g) the third state of EVERY lookup the lane makes — the runner and class lookups, the scanner's exit code
+#      and output shape, the digest, the PATH filter without HOME, the clock, the kill switch without a location:
+#      each is made to answer nothing / garbage / an error and must end in the normal gate with a reason that says
+#      it could not tell.
 #
 # Lines the scanner cannot classify are exit 2, never "adds nothing" (§1, §4b); and every lane decision is run
 # through the REAL record and the REAL tally (§4e), so a reason the producer emits and the tally does not bucket
@@ -43,8 +48,18 @@ for f in "$LIB" "$SCAN" "$DISPATCHER"; do
 done
 [ -x "$B32" ] || { echo "FATAL: $B32 not found"; exit 2; }
 
+# The fixtures write absolute paths under $T INTO test files and docs that the lane then scans (and the scan flags any run of 8+ digits, separators
+# ignored). A caller whose TMPDIR holds such a run (the gate's reviewer reproduced it with …/506252929262/…: five assertions went red) would turn the
+# selftest red for a reason that has nothing to do with the lane — and prod-tests/gascity/story-ga-atsahv.sh runs this file under whatever TMPDIR the
+# deploy has. So the fixture base dir is checked against the scanner's OWN rule and moved to /tmp when it would trip it.
+has_long_number() { python3 -c 'import re,sys; sys.exit(0 if re.search(r"\d(?:[\W_]*\d){7,}", sys.argv[1]) else 1)' "$1"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/gate-fastlane.XXXXXX")" || { echo "mktemp failed"; exit 2; }
 trap 'rm -rf "$T"' EXIT
+if has_long_number "$T"; then
+  rm -rf "$T"
+  T="$(mktemp -d /tmp/gate-fastlane.XXXXXX)" || { echo "mktemp failed"; exit 2; }
+fi
+if has_long_number "$T"; then bad "fixture base dir $T carries an 8+ digit run — fixtures that embed it would trip the lane's own scan"; else ok "fixture base dir carries no 8+ digit run — the fixtures that embed absolute paths cannot trip the lane's own scan, whatever the caller's TMPDIR"; fi
 mkdir -p "$T/tmp" "$T/bin"
 TAB=$'\t'
 TALLY="$SELF_DIR/gate-lane-tally.py"
@@ -463,7 +478,7 @@ e2e_case "no head to decide on"                               no-input        ""
 e2e_probe "$(head_of s-mdpy)" ""
 [ "$E_BUCKET" != "$(label_of policy)" ] && [ "$E_BUCKET" = "$(label_of code-or-prompt)" ] && ok "a diff that went to the gate because of a .py file is bucketed as code/prompt — not as the gate's own policy" || bad "the cited misbucketing is back: '$E_BUCKET'"
 # and every code the lib can set is one the harness above exercised or the tally lists (no producer/consumer drift)
-EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file diff-raw-failed no-input"
+EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file switch-unreadable diff-raw-failed no-input"
 for c in $(grep -o '_gate_fastlane_normal "[a-z-]*"' "$LIB" | sed 's/.*"\(.*\)"/\1/' | sort -u); do
   case " $EXERCISED " in *" $c "*) ok "lib code '$c' is exercised end to end above" ;; *) bad "lib emits code '$c' that §4e never ran through the tally" ;; esac
 done
@@ -588,6 +603,131 @@ dconf "$FB_PY" main "$FB_PY";   # a decision that was NORMAL (code) leaves nothi
 conf_check "confirming after a NORMAL decision is refused" 1 cannot-confirm
 REPO="$REPO_MAIN"
 
+# ── 4g. a read that cannot answer is "could not tell" — the inert arm — never "none", "clean" or "on" ──────────────
+# Gate round 6. The reviewer's blocker: gate_fastlane_classify_raw asked gate_fastlane_test_runner what to do with a changed test and had arms for
+# bash|pytest and unknown ONLY, so an EMPTY answer (the substitution failing) fell through exactly like the real answer "none" (an inert fixture): the test
+# landed in neither RUN nor UNRUNNABLE, run_tests said "no test entry to run", and the lane was granted on a test nobody ran. The re-arm asked for the CLASS,
+# not the instance, so every lookup the lane makes is exercised the same way: ONE lookup (or the tool under it) is made to answer nothing / garbage / an error,
+# through the REAL decision on REAL git, and the outcome must be the normal gate WITH a reason that says it could not tell. Each case goes red against the
+# lib of 49addf4ad (the round-5 head) — the claim is "these fail before", not "these pass after".
+echo "── 4g. every lookup that cannot answer lands in the inert arm (gate round 6: the class, not the instance) ──"
+stub_decide() { # <head> <stub shell code, run after the lib is sourced> [ENV=VAL ...] -> "<lane>|<reason code>|<reason>" (or ABORTED|aborted|… when the decision died)
+  local head="$1" stub="$2" out rc=0; shift 2
+  out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_HEAD="$head" FL_STUB="$stub" "$@" "$B32" -c '
+    set -euo pipefail
+    source "$FL_LIB"
+    eval "$FL_STUB"
+    gfn() { git -C "$FL_REPO" "$@"; }
+    gate_fastlane_decide gfn main "$FL_HEAD" ""
+    printf "%s|%s|%s\n" "$GATE_LANE" "$GATE_LANE_REASON_CODE" "$GATE_LANE_REASON"
+  ' 2>&1) || rc=$?
+  if [ "$rc" != "0" ]; then printf 'ABORTED|aborted|rc=%s: %s\n' "$rc" "$(printf '%s' "$out" | tail -2 | tr '\n' ' ')"; return 0; fi
+  printf '%s\n' "$out" | tail -1
+}
+sd_case() { # <name> <head> <stub> <want_lane> <want_code> <needle-in-reason|""> [ENV=VAL ...]
+  local name="$1" head="$2" stub="$3" wl="$4" wc="$5" needle="$6" out lane rest code reason; shift 6
+  out=$(stub_decide "$head" "$stub" "$@")
+  lane="${out%%|*}"; rest="${out#*|}"; code="${rest%%|*}"; reason="${rest#*|}"
+  if [ "$lane" = "$wl" ] && [ "$code" = "$wc" ]; then ok "$name → $wl/$wc"; else bad "$name → lane=$lane code=$code, want $wl/$wc — $reason"; fi
+  if [ -n "$needle" ]; then case "$reason" in *"$needle"*) ok "$name: the reason says '$needle'" ;; *) bad "$name: expected '$needle' in: $reason" ;; esac; fi
+}
+chk_code() { # <name> <want_lane> <want_code> [needle-in-reason] — on the last decide()
+  if [ "$D_LANE" = "$2" ] && [ "$D_CODE" = "$3" ]; then ok "$1 → $2/$3"; else bad "$1: lane=$D_LANE code=$D_CODE, want $2/$3 — $D_REASON"; fi
+  if [ -n "${4:-}" ]; then case "$D_REASON" in *"$4"*) ok "$1: the reason says '$4'" ;; *) bad "$1: expected '$4' in: $D_REASON" ;; esac; fi
+}
+S_D=$(head_of s-docs); S_TO=$(head_of s-testok)
+S_T2=$(mkbr s-g6-tests 'tests/test_core.py=x = 1\n' 'tests/foo.test.js=x\n')    # the reviewer's own pair: a python test and a js test
+S_FX=$(mkbr s-g6-fixture 'tests/fixtures/data.json={}\n')                        # an inert fixture: the real lookup says `none`
+# (a) the runner lookup — the blocker itself
+sd_case "runner lookup answers NOTHING (the reviewer's tests/test_core.py + tests/foo.test.js)" "$S_T2" 'gate_fastlane_test_runner() { :; }' normal unclassifiable "could not tell how to run"
+sd_case "runner lookup answers NOTHING (one changed test)"        "$S_TO" 'gate_fastlane_test_runner() { :; }'        normal unclassifiable "could not tell how to run"
+sd_case "runner lookup answers GARBAGE"                           "$S_TO" 'gate_fastlane_test_runner() { echo banana; }' normal unclassifiable "'banana'"
+sd_case "runner lookup FAILS (rc 7, no answer)"                   "$S_TO" 'gate_fastlane_test_runner() { return 7; }' normal unclassifiable "could not tell how to run"
+sd_case "control: a fixture whose lookup SAYS 'none' is still granted — 'none' is an answer, an empty one is not" "$S_FX" '' fast fast "DOC or TEST"
+sd_case "control: the same two tests with the REAL lookup go to the gate because the js one has no runner" "$S_T2" '' normal test-unrunnable "cannot run"
+# (a') the lookup's OWN default. `none` (nothing to run, still granted) is a POSITIVE list of data extensions; the first version listed the executable
+# languages it knew and answered `none` for the rest, so a test in a language nobody listed — or a helper script — was granted without being run.
+rn() { "$B32" -c 'source "$1"; gate_fastlane_test_runner "$2"' _ "$LIB" "$1"; }
+runner_case() { # <want> <path>...
+  local want="$1" p got; shift
+  for p in "$@"; do got=$(rn "$p"); if [ "$got" = "$want" ]; then ok "runner: $want  $p"; else bad "runner: $p → '$got', want $want"; fi; done
+}
+runner_case bash    tests/x.selftest.sh tests/run.test.sh tests/test_a.sh tests/a_test.sh
+runner_case pytest  tests/test_a.py tests/a_test.py tests/x.selftest.py
+runner_case none    tests/fixtures/data.json tests/fixtures/a.YML tests/golden/out.txt tests/x.snap tests/img/a.png tests/f.csv
+runner_case unknown web/app.test.ts tests/test_widget.lua tests/helpers/setup.sh tests/conftest.py tests/run.pl tests/fixtures/NOEXT tests/Makefile tests/foo.test.R tests/e2e.spec.zsh
+S_LUA=$(mkbr s-g6-lua 'tests/test_widget.lua=print(1)\n');           sd_case "a changed test in a language nobody listed (lua) is not 'none': it goes to the gate, unrun" "$S_LUA" '' normal test-unrunnable "cannot run"
+S_HLP=$(mkbr s-g6-helper 'tests/helpers/setup.sh=echo hi\n');       sd_case "a helper script under tests/ is not an inert fixture" "$S_HLP" '' normal test-unrunnable "cannot run"
+RS="$T/runner-state"; rm -f "$RS"
+# classify asks once and run_tests asks again, for the same file: an answer that vanishes the second time must not be a pass (pins run_tests' own default arm)
+sd_case "runner lookup answers in classify and then NOTHING in run_tests: rc=99, not a pass" "$S_TO" "gate_fastlane_test_runner() { if [ -e '$RS' ]; then return 0; fi; : > '$RS'; echo bash; }" normal test-failed "rc=99"
+rm -f "$RS"
+# (b) the class lookup — the sibling two lines above it, which the reviewer called correct: it defaulted to CODE, i.e. to normal, but silently
+sd_case "classifier answers NOTHING"     "$S_D" 'gate_fastlane_path_class() { :; }'         normal unclassifiable "could not classify"
+sd_case "classifier answers GARBAGE"     "$S_D" 'gate_fastlane_path_class() { echo MAYBE; }' normal unclassifiable "'MAYBE'"
+sd_case "classifier FAILS (rc 3)"        "$S_D" 'gate_fastlane_path_class() { return 3; }'   normal unclassifiable "could not classify"
+# (c) a non-empty diff list from which nothing was classified: "every file is DOC or TEST" is vacuously true of zero files
+raw_case "a non-empty list of blank records (nothing classified)" unclassifiable any $'\n\n'
+# the mode `case` named the two BAD modes and let everything else through: an unknown mode passed as "a regular file"
+raw_case "an unknown file mode (100664)"                    unclassifiable any "$(rec 000000 100664 A docs/a.md)"
+raw_case "a tree entry (mode 040000)"                       unclassifiable any "$(rec 000000 040000 A docs/sub)"
+raw_case "control: a 100755 test among docs is still classified" ok 0 "$(rec 000000 100644 A docs/a.md)"$'\n'"$(rec 000000 100755 A tests/x.selftest.sh)"
+# (d) the success path's record of the files that decided the grant
+sd_case "the success path cannot render the files that decided: a grant that cannot name them is not a grant" "$S_D" '_gate_fastlane_cap_lines() { :; }' normal unclassifiable "could not render"
+FO_BAD=$("$B32" -c 'source "$1"; tr() { return 1; }; GATE_LANE_FILES=$(printf "DOC\tdocs/a.md\n"); gate_fastlane_files_oneline' _ "$LIB")
+case "$FO_BAD" in *"could not be rendered"*) ok "files_oneline: a rendering that failed says so — it does not read as 'no file decided this lane'" ;; *) bad "files_oneline with a failing tr answered '$FO_BAD'" ;; esac
+FO_OK=$("$B32" -c 'source "$1"; GATE_LANE_FILES=$(printf "DOC\tdocs/a.md\n"); gate_fastlane_files_oneline' _ "$LIB")
+[ "$FO_OK" = "DOC:docs/a.md" ] && ok "control: files_oneline renders the list when tr works" || bad "files_oneline control answered '$FO_OK'"
+# (e) the scanner: a python that dies at IMPORT time exits 1, which is the contract's "findings" (blocker 2)
+SCANLIB=""
+mk_scan_lib() { # <name> <python source> -> SCANLIB: a copy of the lib with a scanner of our own next to it
+  local d="$T/scanlib-$1"; mkdir -p "$d"; cp "$LIB" "$d/gate-fastlane.lib.sh"; printf '%s\n' "$2" > "$d/gate-fastlane-scan.py"; SCANLIB="$d/gate-fastlane.lib.sh"
+}
+# the reviewer's own repro: the REAL scanner with one line in front of it that raises at module level
+mk_scan_lib import-raise "$(printf 'raise RuntimeError("boom at import")\n'; cat "$SCAN")"; SL_IMPORT="$SCANLIB"
+FL_LIB_OVERRIDE="$SL_IMPORT" decide "$S_D" "";  chk_code "a scanner that raises at import time (python exits 1)" normal scan-failed "it crashed"
+case "$D_REASON $D_FILES" in *Traceback*|*'File "'*|*"$T"*) bad "a traceback / an absolute path reached the lane's reason or files (marker metadata): $D_REASON | $D_FILES" ;; *) ok "…and no traceback or absolute path reaches the reason or the files (they are written into marker metadata)" ;; esac
+case "$D_REASON" in *"found personal data"*) bad "a dead scanner was reported as 'found personal data': $D_REASON" ;; *) ok "…and a dead scanner is NOT reported as 'found personal data'" ;; esac
+mk_scan_lib import-syntax $'def (:\n';                                                        FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "a scanner with a syntax error (python exits 1)" normal scan-failed "it crashed"
+mk_scan_lib rc1-garbage $'import sys\nprint("hello world")\nsys.exit(1)\n';                     FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "exit 1 with a line that is not a finding" normal scan-failed "it crashed"
+mk_scan_lib rc1-empty $'import sys\nsys.exit(1)\n';                                            FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "exit 1 with NO findings (an empty list is not a list of findings)" normal scan-failed "it crashed"
+mk_scan_lib rc1-mixed $'import sys\nprint("numero-longo\\tdocs/x.md\\t3")\nprint("Traceback junk")\nsys.exit(1)\n'; FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "exit 1 with one finding and one stray line (every line must be a finding)" normal scan-failed "it crashed"
+mk_scan_lib rc0-output $'import sys\nprint("numero-longo\\tdocs/x.md\\t1")\nsys.exit(0)\n';  FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "exit 0 that printed output is not a clean answer" normal scan-failed "not a clean answer"
+mk_scan_lib rc2-msg $'import sys\nprint("diff is not valid UTF-8", file=sys.stderr)\nsys.exit(2)\n'; FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "control: exit 2 is 'could not scan', with the scanner's own message" normal scan-failed "not valid UTF-8"
+mk_scan_lib rc1-valid $'import sys\nprint("numero-longo\\tdocs/x.md\\t3")\nsys.exit(1)\n';    FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "control: exit 1 with a well-formed finding IS scan-findings" normal scan-findings "numero-longo×1"
+mk_scan_lib rc0-clean $'import sys\nsys.exit(0)\n';                                           FL_LIB_OVERRIDE="$SCANLIB" decide "$S_D" "";  chk_code "control: exit 0 with no output IS a clean scan" fast fast
+e2e_case "a scanner that dies at import is booked as scan-failed, not as personal data (was: scan-findings)" scan-failed "$S_D" "" FL_LIB_OVERRIDE="$SL_IMPORT"
+# (f) the digest: a `sed` that failed must not hand back the digest of an empty stream
+DGF="$T/dg.diff"; printf 'diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n@@ -0,0 +1 @@\n+hello\n' > "$DGF"
+cp "$DGF" "$T/dg-unreadable.diff"; chmod 000 "$T/dg-unreadable.diff"
+dg_out() { FL_REPO="$REPO" "$B32" -c 'set -u; source "$1"; gfn() { git -C "$FL_REPO" "$@"; }; if out=$(_gate_fastlane_digest_file gfn "$2"); then echo "rc=0 digest=[$out]"; else echo "rc=1 digest=[]"; fi' _ "$LIB" "$1"; }
+case "$(dg_out "$DGF")" in "rc=0 digest=["????????*) ok "control: a readable diff has a digest" ;; *) bad "control: digest of a readable diff: $(dg_out "$DGF")" ;; esac
+if [ -r "$T/dg-unreadable.diff" ]; then ok "(skipped: this user can read a mode-000 file, so the unreadable-diff case cannot be staged)"
+else
+  [ "$(dg_out "$T/dg-unreadable.diff")" = "rc=1 digest=[]" ] && ok "a diff file that cannot be READ has NO digest — not the digest of an empty stream (the caller here has no pipefail)" || bad "an unreadable diff produced: $(dg_out "$T/dg-unreadable.diff")"
+fi
+chmod 600 "$T/dg-unreadable.diff"
+# (g) the PATH filter with HOME unknown, and the clock
+TP_UNSET=$(env -i PATH="$T/fakehome/.local/bin:/usr/bin:/bin" "$B32" -c 'source "$1"; _gate_fastlane_test_path' _ "$LIB")
+case "$TP_UNSET" in *fakehome*) bad "HOME unset: the PATH filter passed every entry through ($TP_UNSET) — 'cannot tell where HOME is' read as 'nothing is under it'" ;; *) ok "HOME unset: the tests' PATH is the system dirs alone, not the caller's whole PATH ($TP_UNSET)" ;; esac
+TP_SET=$(env -i HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/usr/bin:/bin" "$B32" -c 'source "$1"; _gate_fastlane_test_path' _ "$LIB")
+[ "$TP_SET" = "/usr/bin:/bin" ] && ok "control: HOME set → the entry under it is dropped and the rest kept" || bad "PATH filter with HOME set answered '$TP_SET'"
+mkdir -p "$T/baddate"; printf '#!/bin/sh\nexit 1\n' > "$T/baddate/date"; chmod +x "$T/baddate/date"
+decide "$S_TO" "" PATH="$T/baddate:$PATH";  chk_code "the clock cannot be read (date fails): the test budget cannot be enforced, so no test runs and the lane is not granted" normal test-failed "could not read the clock"
+mkdir -p "$T/flakydate"; rm -f "$T/date-state"
+printf '#!/bin/sh\nif [ -e "%s" ]; then exit 1; fi\n: > "%s"\nexec /bin/date "$@"\n' "$T/date-state" "$T/date-state" > "$T/flakydate/date"; chmod +x "$T/flakydate/date"
+decide "$(head_of s-stdin)" "" PATH="$T/flakydate:$PATH";  chk_code "the clock reads once and then fails: that is the budget SPENT, not 'no time has passed'" normal test-failed "budget"
+rm -f "$T/date-state"
+# (h) the kill switch whose LOCATION is unknown: neither GC_CITY nor GATE_FASTLANE_OFF_FILE
+S_D2=$(head_of s-docs2)
+decide "$S_D2" "" GATE_FASTLANE_OFF_FILE=;  chk_code "no GC_CITY and no off-file path: the kill switch cannot be found, so the lane is off" normal switch-unreadable "kill switch"
+mkdir -p "$T/city-ok/.gc"
+decide "$S_D2" "" GATE_FASTLANE_OFF_FILE= GC_CITY="$T/city-ok";  chk_code "control: GC_CITY set and no flag file in it → the lane is on" fast fast
+: > "$T/city-ok/.gc/gate-fastlane.off"
+decide "$S_D2" "" GATE_FASTLANE_OFF_FILE= GC_CITY="$T/city-ok";  chk_code "control: GC_CITY set and the flag file there → off, as before" normal flag-file
+rm -f "$T/city-ok/.gc/gate-fastlane.off"
+e2e_case "kill switch whose location is unknown" switch-unreadable "$S_D2" "" GATE_FASTLANE_OFF_FILE=
+
 # ── 5. the dispatcher's live blocks, under bash 3.2 + set -euo pipefail ───────────────────────────────────────
 echo "── 5. dispatcher wiring (extracted, executed under $B32 + set -euo pipefail) ──"
 LOADBLK="$(extract_block "$DISPATCHER" fastlane-lib-load)"
@@ -683,7 +823,14 @@ case "$RFOUT" in *RECORD-DONE*) ok "lib not loaded: the record block survives se
 [ "$(jq -r '[.event,.lane,.reason_code,.would_have_reviewers,.dry_run,.marker]|join("|")' "$RFLOG" 2>/dev/null)" = "gate_lane|normal|lib-not-loaded|3|0|mk-9" ] && ok "lib not loaded: ONE gate_lane event is written by the dispatcher itself (code lib-not-loaded, the reviewers a normal run uses, the marker)" || bad "fallback event: $(cat "$RFLOG" 2>/dev/null)"
 [ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.normal_reasons["lib da fast-lane não carregou"] // 0')" = "1" ] && ok "…and the tally buckets it as 'lib da fast-lane não carregou' (was: unreachable, the diff was simply absent)" || bad "the tally does not see the broken-lib decision"
 rm -f "$RFLOG"; recfb "$RFLOG" "not-a-number" >/dev/null
-[ "$(jq -r '.would_have_reviewers' "$RFLOG" 2>/dev/null)" = "0" ] && ok "a non-numeric reviewer count is written as 0, not an event lost to a jq error" || bad "non-numeric would-have-reviewers lost the event: $(cat "$RFLOG" 2>/dev/null)"
+[ "$(jq -r '.would_have_reviewers' "$RFLOG" 2>/dev/null)" = "null" ] && ok "a non-numeric reviewer count is written as null (UNKNOWN) — not as a measured 0, and not as an event lost to a jq error" || bad "non-numeric would-have-reviewers lost the event or became a number: $(cat "$RFLOG" 2>/dev/null)"
+# …and the chain: a passed fast run on such a decision is credited the assumed 1 and the report SAYS so, instead of crediting a silent 0
+jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{ts: $ts, event: "dispatcher_complete", lane: "fast", marker: "mk-9", result: "PASS", dry_run: "0"}' >> "$RFLOG"
+RFJ=$(python3 "$TALLY" --log "$RFLOG" --days 1 --json 2>/dev/null || echo '{}')
+[ "$(printf '%s' "$RFJ" | jq -r '[.reviewer_runs_saved, .saved_unmatched_assumed_1] | join("|")' 2>/dev/null)" = "1|1" ] && ok "…and the tally credits that run the assumed 1 AND counts it as assumed (saved_unmatched_assumed_1), where a written 0 would have been a quiet zero" || bad "tally on an unknown reviewer count: $RFJ"
+rm -f "$T/qg-would.jsonl"
+PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE=normal "$B32" -c 'set -euo pipefail; source "$1"; GATE_LANE=normal; GATE_LANE_REASON=r; GATE_LANE_REASON_CODE=code-or-prompt; GATE_LANE_COUNTS=c; GATE_LANE_FILES=f; gate_fastlane_record /city mk-1 ga-x b gascity "x7" "$2"' _ "$LIB" "$T/qg-would.jsonl" >/dev/null 2>&1
+[ "$(jq -r '.would_have_reviewers' "$T/qg-would.jsonl" 2>/dev/null)" = "null" ] && ok "gate_fastlane_record writes an unknown reviewer count as null too (same rule as the dispatcher's fallback)" || bad "record with a non-numeric count: $(cat "$T/qg-would.jsonl" 2>/dev/null)"
 rm -f "$RFLOG"; recfb "$RFLOG" 1 1 >/dev/null
 [ "$(jq -r '.dry_run' "$RFLOG" 2>/dev/null)" = "1" ] && [ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.decisions')" = "0" ] && ok "a DRY_RUN=1 sweep's event carries dry_run=1 and the tally leaves it out" || bad "dry-run event: $(cat "$RFLOG" 2>/dev/null)"
 RFOUT=$(recfb "/nonexistent-dir-$$/qg.jsonl" 1)
@@ -1117,6 +1264,19 @@ cp "$SCAN" "$T/"
 if cmp -s "$LIB" "$T/mut-nonull.lib.sh"; then bad "mutation 8n did not change the lib (sed pattern drifted)"; else
   M8N=$(null_scan "$(head_of s-docs)" "$T/mut-nonull.lib.sh")
   case "$M8N" in fast\|*) ok "without the guard, a diff whose text was never read WOULD be granted fast ('$M8N') — the guard is what keeps it in the gate" ;; *) bad "mutant lib without the guard still read '$M8N' — §4e' is not load-bearing" ;; esac
+fi
+# 8r. a lib without the runner lookup's inert default (gate round 6, blocking issue 1) must turn §4g red: the empty answer would be granted fast again
+sed '/could not tell how to run the changed test/d' "$LIB" > "$T/mut-norunnerdefault.lib.sh"
+if cmp -s "$LIB" "$T/mut-norunnerdefault.lib.sh" || ! "$B32" -n "$T/mut-norunnerdefault.lib.sh" 2>/dev/null; then bad "mutation 8r did not produce a valid, different lib (sed pattern drifted)"; else
+  M8R=$(FL_LIB_OVERRIDE="$T/mut-norunnerdefault.lib.sh" stub_decide "$S_T2" 'gate_fastlane_test_runner() { :; }')
+  case "$M8R" in fast\|*) ok "without the default arm an EMPTY runner answer WOULD grant the lane on tests nobody ran ('$M8R') — the default arm is what holds it back" ;; *) bad "mutant lib without the runner default still read '$M8R' — §4g (a) is not load-bearing" ;; esac
+fi
+# 8s. a lib that believes the scanner's exit code without checking its output shape (gate round 6, blocking issue 2) must read a dead scanner as findings again
+sed 's/if ! _gate_fastlane_is_finding_list "\$out_s"; then/if false; then/' "$LIB" > "$T/mut-noshape.lib.sh"
+if cmp -s "$LIB" "$T/mut-noshape.lib.sh" || ! "$B32" -n "$T/mut-noshape.lib.sh" 2>/dev/null; then bad "mutation 8s did not produce a valid, different lib (sed pattern drifted)"; else
+  mkdir -p "$T/mut-noshape"; cp "$T/mut-noshape.lib.sh" "$T/mut-noshape/gate-fastlane.lib.sh"; cp "$T/scanlib-import-raise/gate-fastlane-scan.py" "$T/mut-noshape/"
+  FL_LIB_OVERRIDE="$T/mut-noshape/gate-fastlane.lib.sh" decide "$S_D" ""
+  [ "$D_CODE" = "scan-findings" ] && ok "without the shape check a scanner that crashed at import WOULD be booked as scan-findings ('found personal data') — the shape check is what tells a crash from a finding" || bad "mutant lib without the shape check still read code '$D_CODE' — §4g (e) is not load-bearing"
 fi
 # 8o-8q. the SCANNER's single rule is load-bearing (gate round 4): a scanner that backs off any one of its three decisions must read the reviewer's formats as clean
 mut_scan() { # name sed-expr diff-printf-format want-mutant-rc — runs the real rule's diff through a scanner mutated by the sed expression

@@ -31,6 +31,13 @@
 # tell), and the last one is the inert one. GATE_LANE is reset to "normal" on entry and becomes "fast" on the
 # very last line of the only success path, so an early return can never leave a stale "fast" behind.
 #
+# The same rule at every READ (gate round 6 swept the whole lib for it, after a reviewer found one `case` over a lookup that had
+# no default arm, so an EMPTY answer fell through exactly like the real answer "none"): a lookup whose answer is anything the
+# code did not name — empty, garbage, a failed command substitution — lands in the inert arm (unclassifiable / unrunnable /
+# scan-failed / normal), and that arm SAYS it was "could not tell" in its reason, so the log and the tally can tell a blind lane
+# from a lane that looked and said no. Every `$(...)` that feeds a decision is `|| var=""`-guarded for the same reason it is
+# errexit-guarded below. The list of the points reviewed is in the bead comment of the round that did the sweep.
+#
 # Source-only: this file defines functions and runs NOTHING at source time. The dispatcher is
 # `set -euo pipefail` on macOS bash 3.2, so: no arrays (an empty array is an "unbound variable" error there),
 # no ${v,,}, and every command that may fail is guarded — a failing command inside these functions must not be
@@ -73,7 +80,9 @@ GATE_FASTLANE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || GATE_FASTLA
 # positive DOC list is.
 gate_fastlane_path_class() {
   local p="${1#./}" lc base ext stem
-  lc=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+  # `|| lc=""`: a lowercase that failed leaves nothing for any pattern below to match, and "matched nothing" ends in CODE — the
+  # inert class — so a failed read cannot be a DOC or a TEST
+  lc=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]') || lc=""
   base="${lc##*/}"
   ext=""
   case "$base" in *.*) ext="${base##*.}" ;; esac
@@ -121,11 +130,17 @@ gate_fastlane_path_class() {
 # gate_fastlane_test_runner <path> — pure. For a path already classed TEST, how the fast lane runs it:
 #   bash     *.selftest.sh *.test.sh test_*.sh *_test.sh
 #   pytest   test_*.py *_test.py *.selftest.py
-#   unknown  an executable test in a language with no runner here (js/ts/go/...) — cannot be run => normal gate
-#   none     a fixture / helper / data file under tests/ — inert, nothing to run
+#   none     a DATA file under tests/ — a fixture whose extension is on the positive list below: inert, nothing to run
+#   unknown  everything else: an executable test in a language with no runner here (js/ts/go/lua/...), a helper script or module
+#            (setup.sh, conftest.py), a file with no extension — cannot be run, so it goes to the normal gate
+# `none` is the ONLY answer that lets a changed test pass without running, so it is a POSITIVE list, like the DOC class: the first
+# version listed the executable languages it knew (js ts go ...) and answered `none` for the rest, so "nobody listed it" read as
+# "known harmless" — a tests/test_widget.lua or a tests/helpers/setup.sh was granted unrun. A lowercase that failed (lc empty)
+# answers `unknown` too: "could not tell" is never `none`.
 gate_fastlane_test_runner() {
   local lc base ext
-  lc=$(printf '%s' "${1#./}" | tr '[:upper:]' '[:lower:]')
+  lc=$(printf '%s' "${1#./}" | tr '[:upper:]' '[:lower:]') || lc=""
+  [ -n "$lc" ] || { echo unknown; return 0; }
   base="${lc##*/}"
   ext=""
   case "$base" in *.*) ext="${base##*.}" ;; esac
@@ -134,9 +149,9 @@ gate_fastlane_test_runner() {
     test_*.py|*_test.py|*.selftest.py) echo pytest; return 0 ;;
   esac
   case "$ext" in
-    js|mjs|cjs|jsx|ts|tsx|go|rb|java|kt|rs|php|swift|cs|c|cc|cpp) echo unknown; return 0 ;;
+    json|yaml|yml|toml|txt|md|csv|tsv|xml|html|ini|cfg|snap|golden|expected|diff|patch|sql|svg|png|jpg|jpeg|gif) echo none; return 0 ;;
   esac
-  echo none
+  echo unknown
   return 0
 }
 
@@ -185,11 +200,22 @@ gate_fastlane_classify_raw() {
       *) GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="change type '$status' on $path (type change / unmerged / unknown)"; return 0 ;;
     esac
     eff="$newmode"; [ "$status" = "D" ] && eff="$oldmode"
+    # Only a REGULAR file is classified. The case used to name the two bad modes (symlink, submodule) and let everything else
+    # through, so an empty or unknown mode field passed as "a regular file" — the same collapse as everywhere else in this lane.
     case "$eff" in
+      100644|100755) ;;
       120000|160000) GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="$path is a symlink or submodule — what it points at is not in this diff"; return 0 ;;
+      *) GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="$path has a file mode this lane does not know ('${eff:0:12}') — only regular files are classified"; return 0 ;;
     esac
 
-    cls=$(gate_fastlane_path_class "$path")
+    # A classifier that answered anything but one of the four classes (nothing at all, when its command substitution failed) is
+    # "could not tell", and says so — it is not quietly counted as CODE, which would give the same normal-gate outcome with the
+    # blind lane and the looking lane indistinguishable in the log.
+    cls=$(gate_fastlane_path_class "$path") || cls=""
+    case "$cls" in
+      DOC|TEST|PROMPT|CODE) ;;
+      *) GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="could not classify $path (the classifier answered '${cls:0:40}')"; return 0 ;;
+    esac
     # Self-protection, read from THIS diff's own file list (not from a variable the caller derived and may have
     # collapsed to "" on a git error): the gate's policy/classifier files and the fast lane's own files are never
     # fast-laned, even when they are "tests". The first two alternatives are the dispatcher's own POLICY_FILES
@@ -202,10 +228,16 @@ gate_fastlane_classify_raw() {
       DOC)    GATE_FL_N_DOC=$((GATE_FL_N_DOC + 1)) ;;
       TEST)   GATE_FL_N_TEST=$((GATE_FL_N_TEST + 1))
               if [ "$status" != "D" ]; then
-                runner=$(gate_fastlane_test_runner "$path")
+                # The gate's round-6 blocker: this `case` had arms for bash|pytest and unknown ONLY. An EMPTY answer (the lookup's
+                # command substitution failing) matched none of them, so the changed test landed neither in RUN nor in UNRUNNABLE,
+                # and run_tests answered "no test entry to run" -> the lane was granted on a test nobody ran. `none` is now an
+                # arm of its own — the lookup SAYING "an inert fixture" — and everything else is "could not tell", the inert state.
+                runner=$(gate_fastlane_test_runner "$path") || runner=""
                 case "$runner" in
                   bash|pytest) GATE_FL_RUN="${GATE_FL_RUN}${path}"$'\n' ;;
                   unknown)     GATE_FL_UNRUNNABLE="${GATE_FL_UNRUNNABLE}${path}"$'\n' ;;
+                  none)        ;;
+                  *) GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="could not tell how to run the changed test $path (the runner lookup answered '${runner:0:40}')"; return 0 ;;
                 esac
               fi ;;
       POLICY) GATE_FL_N_POLICY=$((GATE_FL_N_POLICY + 1)); GATE_FL_BLOCKERS="${GATE_FL_BLOCKERS}POLICY"$'\t'"${path}"$'\n' ;;
@@ -215,6 +247,11 @@ gate_fastlane_classify_raw() {
   done <<EOF
 $raw
 EOF
+  # "every file is a DOC or a TEST" is vacuously true of ZERO files. A non-empty list whose records were all skipped would reach
+  # here with nothing classified, and the decision would read the empty BLOCKERS/UNRUNNABLE as "nothing stands in the way".
+  if [ "$GATE_FL_STATE" = "ok" ] && [ -z "$GATE_FL_ALLFILES" ]; then
+    GATE_FL_STATE="unclassifiable"; GATE_FL_WHY="the diff list was not empty but no record in it was classified — nothing was read"
+  fi
   return 0
 }
 
@@ -235,8 +272,10 @@ _gate_fastlane_cap_lines() {
 # gate_fastlane_files_oneline — GATE_LANE_FILES as one metadata-safe line ("CLASS:path; CLASS:path; ..."), <= 480 chars.
 gate_fastlane_files_oneline() {
   local s
-  s=$(printf '%s' "${GATE_LANE_FILES:-}" | tr '\t' ':' | tr '\n' ';' | sed 's/;/; /g')
-  if [ "${#s}" -gt 480 ]; then s="$(printf '%s' "$s" | cut -c1-470)…"; fi
+  s=$(printf '%s' "${GATE_LANE_FILES:-}" | tr '\t' ':' | tr '\n' ';' | sed 's/;/; /g') || s=""
+  # a rendering that failed must not read as "no file decided this lane": the line is non-empty exactly when the list is
+  if [ -z "$s" ] && [ -n "${GATE_LANE_FILES:-}" ]; then s="(the list of files that decided could not be rendered)"; fi
+  if [ "${#s}" -gt 480 ]; then s="$(printf '%s' "$s" | cut -c1-470)…" || s="${s:0:470}…"; fi
   printf '%s' "$s"
   return 0
 }
@@ -260,17 +299,40 @@ _gate_fastlane_normal() {
 # line — a whitespace change inside a test included, which `git patch-id` would call equal — does not.
 _gate_fastlane_digest_file() {
   local git_fn="$1" f="$2" out
-  out=$(sed -e '/^@@/d' -e 's/^index [0-9a-f]*\.\.[0-9a-f]*/index/' "$f" | "$git_fn" hash-object --stdin 2>/dev/null) || return 1
+  # pipefail INSIDE the substitution, not inherited from the caller: a `sed` that failed would otherwise hand `hash-object` an
+  # empty stream, and the pipeline's status is the LAST command's — so "could not read the diff" would come back as a perfectly
+  # valid digest (of nothing), and a later confirm could "match" it. Whoever sources this lib, the digest is either of the text
+  # or absent.
+  out=$(set -o pipefail; sed -e '/^@@/d' -e 's/^index [0-9a-f]*\.\.[0-9a-f]*/index/' "$f" | "$git_fn" hash-object --stdin 2>/dev/null) || return 1
   [ -n "$out" ] || return 1
   printf '%s' "$out"
   return 0
 }
 
+# _gate_fastlane_is_finding_list <text> — 0 iff <text> is a scanner's list of findings: at least one line, EVERY line of the
+# shape `label<TAB>path<TAB>line-number`. Anything else — empty, a traceback, a stray message — is not a list of findings. Reads
+# nothing that can fail (awk over a here-string), so a doubt is "no".
+_gate_fastlane_is_finding_list() {
+  printf '%s\n' "$1" | awk -F'\t' '
+    { n++; if (NF != 3 || $1 !~ /^[a-z][a-z0-9-]*$/ || $3 !~ /^[0-9]+$/) bad = 1 }
+    END { exit ((n > 0 && !bad) ? 0 : 1) }'
+}
+
 # gate_fastlane_scan <git_fn> <base_ref> <head_ref> — runs the content scan over the ADDED lines. Sets
 # GATE_FL_SCAN_RC (0 clean | 1 findings | other = could not scan), GATE_FL_SCAN_OUT (label/path/line, no values) and
 # GATE_FL_DIFF_DIGEST (the fingerprint of the very diff text that was handed to the scanner; "" when it could not be read).
+#
+# The scanner's exit code is a contract (0 clean / 1 findings / 2 could not scan), and python breaks it: an uncaught exception
+# exits 1, and anything that dies at IMPORT time (a syntax error, a module-level exception, a regex that does not compile) never
+# reaches the scanner's own "any bug here must read as could not scan" guard, which wraps only main(). So a dead scanner used to
+# read as "found personal data" — every doc diff bounced, the weekly tally blamed data hygiene, and the traceback (absolute
+# paths) went into the marker metadata. Two rules close it: stdout and stderr are KEPT APART (a traceback is never the findings),
+# and an answer is believed only when it has the shape its exit code promises — rc 1 needs a list of
+# `label<TAB>path<TAB>line` lines (an empty one is not a list), rc 0 needs no output. A scanner that does not answer in its own
+# contract is rc 2 with a reason that says so ("it crashed, it did not find anything"), which decide() books as scan-failed, not
+# scan-findings.
 gate_fastlane_scan() {
-  local git_fn="$1" base="$2" head="$3" tmp diff_rc=0 scan_rc=0
+  local git_fn="$1" base="$2" head="$3" tmp errf="" diff_rc=0 scan_rc=0 out_s="" err_s=""
   GATE_FL_SCAN_RC=2; GATE_FL_SCAN_OUT=""; GATE_FL_DIFF_DIGEST=""
   if [ ! -r "${GATE_FASTLANE_DIR:-}/gate-fastlane-scan.py" ]; then
     GATE_FL_SCAN_OUT="scanner gate-fastlane-scan.py is missing or unreadable"
@@ -289,9 +351,27 @@ gate_fastlane_scan() {
   # its contract as a pure function; the lib knows a file list exists, the scanner does not.
   [ -s "$tmp" ] || { GATE_FL_SCAN_OUT="git diff -U0 returned no text for a range whose file list is not empty — nothing was read"; rm -f "$tmp" 2>/dev/null || true; return 0; }
   GATE_FL_DIFF_DIGEST=$(_gate_fastlane_digest_file "$git_fn" "$tmp") || GATE_FL_DIFF_DIGEST=""
-  GATE_FL_SCAN_OUT=$(python3 "$GATE_FASTLANE_DIR/gate-fastlane-scan.py" --max-bytes "${GATE_FASTLANE_SCAN_MAX_BYTES:-2097152}" < "$tmp" 2>&1) || scan_rc=$?
+  # the scanner's stderr goes to its own file (named so the dispatcher's gc-gate-fl-diff-* reaper sweeps a leak); with no file it is
+  # discarded, and the reason below then says "no stderr" — the exit code and the shape check do not depend on it
+  errf=$(mktemp "${GATE_FS_TMPDIR:-/tmp}/gc-gate-fl-diff-err-XXXXXX" 2>/dev/null) || errf=""
+  out_s=$(python3 "$GATE_FASTLANE_DIR/gate-fastlane-scan.py" --max-bytes "${GATE_FASTLANE_SCAN_MAX_BYTES:-2097152}" < "$tmp" 2>"${errf:-/dev/null}") || scan_rc=$?
+  # the LAST stderr line, capped: for a traceback it is the exception ("RuntimeError: ..."), not the file paths above it
+  if [ -n "$errf" ]; then err_s=$(tail -n 1 "$errf" 2>/dev/null | cut -c1-160) || err_s=""; fi
+  rm -f "$tmp" "$errf" 2>/dev/null || true
+  case "$scan_rc" in
+    0) if [ -n "$out_s" ]; then
+         scan_rc=2; GATE_FL_SCAN_OUT="scanner exited 0 but printed output — not a clean answer (stderr: ${err_s:-none})"
+       fi ;;
+    1) if ! _gate_fastlane_is_finding_list "$out_s"; then
+         scan_rc=2; GATE_FL_SCAN_OUT="scanner exited 1 with no label/path/line findings — it crashed, it found nothing (stderr: ${err_s:-none})"
+       fi ;;
+  esac
+  if [ "$scan_rc" = "0" ] || [ "$scan_rc" = "1" ]; then
+    GATE_FL_SCAN_OUT="$out_s"
+  elif [ -z "$GATE_FL_SCAN_OUT" ]; then
+    GATE_FL_SCAN_OUT="${err_s:-scanner exited rc=$scan_rc with no message}"
+  fi
   GATE_FL_SCAN_RC="$scan_rc"
-  rm -f "$tmp" 2>/dev/null || true
   return 0
 }
 
@@ -303,14 +383,28 @@ gate_fastlane_scan() {
 # the live city's beads, `gc --city <city>` runs). The credential shield is the throwaway HOME that
 # gate_fastlane_run_tests sets: `bw` finds no vault there and `gh` is logged out. A test that needs a dropped tool
 # fails, and a failing test sends the diff to the normal gate — the inert outcome.
+# With HOME unset the filter has no way to tell which entries are "under $HOME", and passing every entry through would read
+# that as "none of them is". It falls back to the system and Homebrew directories alone: a test that needs a tool outside
+# them fails, and a failing test sends the diff to the normal gate (the inert outcome).
 _gate_fastlane_test_path() {
   local out="" entry IFS=:
+  if [ -z "${HOME:-}" ]; then printf '%s' "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"; return 0; fi
   for entry in $PATH; do
     [ -z "$entry" ] && continue
-    case "$entry" in "${HOME:-/nonexistent-home}"|"${HOME:-/nonexistent-home}"/*) continue ;; esac
+    case "$entry" in "$HOME"|"$HOME"/*) continue ;; esac
     out="${out:+$out:}$entry"
   done
   printf '%s' "${out:-/usr/bin:/bin}"
+  return 0
+}
+
+# _gate_fastlane_now — the clock, as epoch seconds, or return 1 when it cannot be read (no output then). The test budget is
+# measured against it; an unreadable clock must not read as "no time has passed", so callers treat 1 as "budget gone".
+_gate_fastlane_now() {
+  local n
+  n=$(date +%s 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
   return 0
 }
 
@@ -336,7 +430,9 @@ gate_fastlane_run_tests() {
 
   # `[ -z ]` has no failure mode. The count was `grep -c . || n=0`, which turned a grep that FAILED into "no test entry
   # to run" -> rc 0 -> the lane granted without running the changed tests (an error read as empty). The count below is a
-  # shell loop over the same list, with no command that can fail.
+  # shell loop over the same list, with no command that can fail. An empty list is a real "nothing to run" ONLY because
+  # classify_raw files every changed test it could not place under UNRUNNABLE or unclassifiable (its runner `case` has an inert
+  # default), never under "empty" — that is the invariant this early return leans on.
   if [ -z "$paths" ]; then GATE_FL_TEST_RC=0; GATE_FL_TEST_OUT="no test entry to run"; return 0; fi
   n=0
   while IFS= read -r f; do
@@ -355,6 +451,13 @@ EOF
   # an earlier interrupted sweep may have leaked a worktree of this family (the reaper also matches gc-gate-fs-fastlane-*)
   if declare -F gate_full_suite_reap_stale >/dev/null 2>&1; then gate_full_suite_reap_stale || true; fi
 
+  # the two reads the run cannot go on without — the PATH the tests get and the clock the budget is measured on — come BEFORE the
+  # worktree exists, so a failure of either leaves nothing to clean up
+  tpath=$(_gate_fastlane_test_path) || tpath=""
+  if [ -z "$tpath" ]; then GATE_FL_TEST_OUT="could not build a PATH for the tests"; return 0; fi
+  t0=$(_gate_fastlane_now) || t0=""
+  if [ -z "$t0" ]; then GATE_FL_TEST_OUT="could not read the clock — the test budget cannot be enforced"; return 0; fi
+
   tmp="${GATE_FS_TMPDIR:-/tmp}"
   wt="$tmp/gc-gate-fs-fastlane-$$"
   log=$(mktemp "$tmp/gc-gate-fs-fastlane-log-XXXXXX" 2>/dev/null) || { GATE_FL_TEST_OUT="could not create a temp log"; return 0; }
@@ -364,11 +467,10 @@ EOF
     return 0
   fi
 
-  tpath=$(_gate_fastlane_test_path)
-  t0=$(date +%s)
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    now=$(date +%s); spent=$((now - t0))
+    # a clock that cannot be read mid-run reads as the budget being spent (spent = budget), never as "no time has passed"
+    now=$(_gate_fastlane_now) || now=$((t0 + budget)); spent=$((now - t0))
     if [ "$spent" -ge "$budget" ]; then
       GATE_FL_TEST_OUT="test budget of ${budget}s exhausted after $ok_n of $n test file(s)"
       GATE_FL_TEST_RC=2
@@ -376,7 +478,7 @@ EOF
       rm -f "$log" 2>/dev/null || true
       return 0
     fi
-    runner=$(gate_fastlane_test_runner "$f")
+    runner=$(gate_fastlane_test_runner "$f") || runner=""
     rc=0
     # </dev/null: this loop reads its own file list from a heredoc, and a test that reads stdin would eat it.
     case "$runner" in
@@ -384,13 +486,14 @@ EOF
         ( cd "$wt" && env -i HOME="$wt" PATH="$tpath" LC_ALL=C TMPDIR="$wt" timeout "$per_file" bash "$f" ) </dev/null >"$log" 2>&1 || rc=$? ;;
       pytest)
         ( cd "$wt" && env -i HOME="$wt" PATH="$tpath" LC_ALL=C TMPDIR="$wt" timeout "$per_file" python3 -m pytest -q -x -p no:cacheprovider "$f" ) </dev/null >"$log" 2>&1 || rc=$? ;;
-      *) rc=99 ;;
+      *) rc=99 ;;   # no runner for it (the lookup answered anything but bash/pytest, an empty answer included): not a pass
     esac
     if [ "$rc" != "0" ]; then
-      # rc 124 = timeout; 1 = a real failure OR a missing dependency in the scrubbed env. The fast lane cannot
-      # tell which, and it does not need to: either way the diff goes to the normal gate, never to a FAIL.
+      # rc 124 = timeout; 99 = no runner for it; 1 = a real failure OR a missing dependency in the scrubbed env. The fast
+      # lane cannot tell which, and it does not need to: either way the diff goes to the normal gate, never to a FAIL.
       GATE_FL_TEST_RC=1
-      GATE_FL_TEST_OUT="test $f exited rc=$rc (124 = timed out after ${per_file}s) — tail: $(tail -3 "$log" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+      # `|| true`: a substitution inside an assignment is an errexit trigger, and this one only decorates the message
+      GATE_FL_TEST_OUT="test $f exited rc=$rc (124 = timed out after ${per_file}s, 99 = no runner) — tail: $(tail -3 "$log" 2>/dev/null | tr '\n' ' ' | cut -c1-240)" || true
       "$git_fn" worktree remove --force "$wt" >/dev/null 2>&1 || true
       rm -f "$log" 2>/dev/null || true
       return 0
@@ -424,8 +527,9 @@ gate_fastlane_decide() {
   if _gate_fastlane_is_off; then
     # (two literal calls, not one with a variable: the tally selftest finds the codes a producer emits by grepping for them)
     case "$GATE_FL_OFF_CODE" in
-      flag-file) _gate_fastlane_normal "flag-file" "$GATE_FL_OFF_WHY" ;;
-      *)         _gate_fastlane_normal "disabled" "$GATE_FL_OFF_WHY" ;;
+      flag-file)         _gate_fastlane_normal "flag-file" "$GATE_FL_OFF_WHY" ;;
+      switch-unreadable) _gate_fastlane_normal "switch-unreadable" "$GATE_FL_OFF_WHY" ;;
+      *)                 _gate_fastlane_normal "disabled" "$GATE_FL_OFF_WHY" ;;
     esac
     return 0
   fi
@@ -453,14 +557,16 @@ gate_fastlane_decide() {
   if [ "$GATE_FL_STATE" != "ok" ]; then
     _gate_fastlane_normal "unclassifiable" "unclassifiable diff: ${GATE_FL_WHY}"; return 0
   fi
-  blockers=$(printf '%s' "$GATE_FL_BLOCKERS" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}")
+  # (the two list renderings below only DECORATE the outcome — whether the lane stays normal is decided by GATE_FL_BLOCKERS /
+  # GATE_FL_UNRUNNABLE themselves, never by their rendering — so a rendering that fails just leaves the file list empty)
+  blockers=$(printf '%s' "$GATE_FL_BLOCKERS" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}") || blockers=""
   if [ -n "$GATE_FL_BLOCKERS" ]; then
     _gate_fastlane_normal "code-or-prompt" "$((GATE_FL_N_CODE + GATE_FL_N_PROMPT + GATE_FL_N_POLICY)) file(s) are production code, prompt/doctrine or the gate's own policy (code=${GATE_FL_N_CODE} prompt=${GATE_FL_N_PROMPT} policy=${GATE_FL_N_POLICY}) — normal gate" "$blockers"
     return 0
   fi
-  uncls=$(printf '%s' "$GATE_FL_UNRUNNABLE" | _gate_fastlane_cap_lines 10)
+  uncls=$(printf '%s' "$GATE_FL_UNRUNNABLE" | _gate_fastlane_cap_lines 10) || uncls=""
   if [ -n "$GATE_FL_UNRUNNABLE" ]; then
-    _gate_fastlane_normal "test-unrunnable" "changed test(s) in a language the fast lane cannot run — normal gate" "$(printf '%s' "$uncls" | sed 's/^/TEST-UNRUNNABLE\t/')"
+    _gate_fastlane_normal "test-unrunnable" "changed test(s) the fast lane cannot run (a language with no runner, a helper script, a file type not on its data list) — normal gate" "$(printf '%s' "$uncls" | sed 's/^/TEST-UNRUNNABLE\t/')"
     return 0
   fi
 
@@ -483,8 +589,14 @@ gate_fastlane_decide() {
     return 0
   fi
 
-  # The only success path. Everything above returned.
-  GATE_LANE_FILES=$(printf '%s' "$GATE_FL_ALLFILES" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}")
+  # The only success path. Everything above returned. Unlike the two renderings above, THIS list is part of the grant: it is the
+  # record of the files that decided it. A list that cannot be produced — or is empty although files were classified — is not a
+  # grant with the record missing; it is a lane that could not account for itself, and stays normal.
+  GATE_LANE_FILES=$(printf '%s' "$GATE_FL_ALLFILES" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}") || GATE_LANE_FILES=""
+  if [ -z "$GATE_LANE_FILES" ]; then
+    _gate_fastlane_normal "unclassifiable" "could not render the list of files that decided the lane — a grant that cannot name its files is not a grant, normal gate"
+    return 0
+  fi
   GATE_LANE_REASON="every file is DOC or TEST (${GATE_LANE_COUNTS}); content scan clean; ${GATE_FL_TEST_OUT} — merged without an LLM reviewer"
   GATE_LANE_REASON_CODE="fast"
   GATE_LANE_DIGEST="$GATE_FL_DIFF_DIGEST"
@@ -498,12 +610,25 @@ gate_fastlane_decide() {
 # when it is on. An operator can stop the lane instantly with `touch <city>/.gc/gate-fastlane.off` (and re-enable it by
 # removing the file): the dispatcher is a fresh process every sweep, so a flag file needs no launchd reload, unlike an env
 # var. Asked at the decision AND again at the push, so that "off" also stops a run that was granted a minute ago.
+# Three states, like everything here: the switch is ON, OFF, or its location is UNKNOWN. Neither GATE_FASTLANE_OFF_FILE nor GC_CITY
+# set used to read as a path under a made-up city that never exists — i.e. "the switch is not thrown" — so a process that could
+# not even find the switch ran the lane as if the operator had left it on. That is the one reading that must not be the default
+# for a control whose whole job is to stop the lane: the unknown location answers "off" (code switch-unreadable). The dispatcher
+# always has GC_CITY (it sets it at the top), so this only ever fires for a lib sourced somewhere that does not.
+# What it does NOT cover: `[ -e ]` is false both for "absent" and for "cannot stat" (a permission error on the city's own .gc/),
+# so an unreadable directory still reads as "not thrown".
 _gate_fastlane_is_off() {
+  local flag
   GATE_FL_OFF_CODE=""; GATE_FL_OFF_WHY=""
   if [ "${GATE_FASTLANE_ENABLED:-1}" != "1" ]; then
     GATE_FL_OFF_CODE="disabled"; GATE_FL_OFF_WHY="fast lane disabled (GATE_FASTLANE_ENABLED=0)"; return 0
   fi
-  if [ -e "${GATE_FASTLANE_OFF_FILE:-${GC_CITY:-/nonexistent-city}/.gc/gate-fastlane.off}" ]; then
+  flag="${GATE_FASTLANE_OFF_FILE:-}"
+  if [ -z "$flag" ] && [ -n "${GC_CITY:-}" ]; then flag="$GC_CITY/.gc/gate-fastlane.off"; fi
+  if [ -z "$flag" ]; then
+    GATE_FL_OFF_CODE="switch-unreadable"; GATE_FL_OFF_WHY="fast lane cannot find its kill switch (GC_CITY and GATE_FASTLANE_OFF_FILE are both unset) — a switch that cannot be read is not a switch that is off, normal gate"; return 0
+  fi
+  if [ -e "$flag" ]; then
     GATE_FL_OFF_CODE="flag-file"; GATE_FL_OFF_WHY="fast lane switched off by the flag file (.gc/gate-fastlane.off) — normal gate"; return 0
   fi
   return 1
@@ -575,7 +700,10 @@ gate_fastlane_confirm() {
 # not "the field is there".
 gate_fastlane_record() {
   local city="$1" marker="$2" bead="$3" branch="$4" rig="$5" would="$6" qg_log="$7" back=""
-  case "$would" in ''|*[!0-9]*) would=0 ;; esac
+  # a reviewer count that is not a number is UNKNOWN, and is written as JSON null: the tally credits a passed fast run whose
+  # decision carries no integer with an assumed 1 and says so in its report (saved_unmatched_assumed_1). Written as 0 it would
+  # read as "this run saved no reviewer" — a measured zero where nothing was measured.
+  case "$would" in ''|*[!0-9]*) would=null ;; esac
   if [ -n "$marker" ]; then
     bd -C "$city" update "$marker" --set-metadata "gate.lane=${GATE_LANE}" -q >/dev/null 2>&1 || true
     bd -C "$city" update "$marker" --set-metadata "gate.lane_reason=$(printf '%s' "$GATE_LANE_REASON" | cut -c1-300)" -q >/dev/null 2>&1 || true

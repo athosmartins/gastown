@@ -54,6 +54,7 @@ REASON_CODES = {
     "policy":           ("mexe na política do próprio gate", False),
     "disabled":         ("fast-lane desligado (variável de ambiente)", False),
     "flag-file":        ("fast-lane desligado (arquivo .gc/gate-fastlane.off)", False),
+    "switch-unreadable": ("fast-lane sem como achar o interruptor (GC_CITY e GATE_FASTLANE_OFF_FILE vazios)", False),
     "no-input":         ("fast-lane sem runner/base/head para decidir", False),
     "no-changed-files": ("lista de arquivos do dispatcher vazia (erro de git ou diff vazio)", False),
     "decision-errored": ("decisão da fast-lane deu erro", False),
@@ -174,7 +175,7 @@ def render(r):
         out.append(f"  fast-lane concedida e revogada(s) no push: {r['lane_revoked_at_push']} "
                    "(o diff mudou ou deixou de ser elegível entre a decisão e o merge; o marker voltou ao gate normal)")
     if r["saved_unmatched_assumed_1"]:
-        out.append(f"  ({r['saved_unmatched_assumed_1']} run(s) fast sem decisão pareada no log: contados como 1 revisor cada)")
+        out.append(f"  ({r['saved_unmatched_assumed_1']} run(s) fast sem decisão pareada no log, ou com a decisão sem contagem de revisores: contados como 1 revisor cada)")
     if r["normal"]:
         out.append(f"  dos {r['normal']} que foram ao gate normal — {r['doc_test_only_bounced_by_check']} eram só doc/teste mas barrados por checagem mecânica:")
         for name, n in sorted(r["normal_reasons"].items(), key=lambda kv: -kv[1]):
