@@ -6,7 +6,7 @@
 # without a standing harvest the history evaporates and every A/B reads "no data" a day later. bead-token-meter.py
 # `harvest` copies the per-session numbers into $GC_CITY_PATH/.gc/token-ledger/sessions.jsonl (idempotent, incremental,
 # single-instance flock inside the tool). Run every 30 min by orders/token-ledger-harvest.toml — comfortably inside the
-# reaper's 24h window, comfortably outside one run (first full scan of 1.8k transcripts: ~8 s; incremental: seconds).
+# reaper's 24h window, comfortably outside one run (first full scan of 1.8k transcripts: ~10 s; incremental: ~1 s).
 # A gap is not data loss: `bead-token-meter.py backfill-s3 --since <day>` restores it from the permanent S3 archive.
 #
 # This wrapper only adds what an order needs around the tool: a sane PATH (orders do not run in a login shell), low

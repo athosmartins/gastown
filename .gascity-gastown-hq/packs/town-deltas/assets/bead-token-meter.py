@@ -23,8 +23,9 @@ Como uma sessão vira bead (tentativas, em ordem de confiança):
   * construtor (dog / wa-worker / ps-worker / crew): `bd update <id> --claim` COM resultado "Updated issue". Mensagens depois do
     claim k e antes do claim k+1 são do bead k; mensagens ANTES do 1º claim são o overhead de partida (`_pre`), rateado igual entre
     os beads da sessão. NÃO se usa "id citado na 1ª mensagem": o preâmbulo do papel cita ~93 beads de doutrina (medido).
-  * revisor do gate / pré-revisão do construtor: o cabeçalho "QUALITY GATE REVIEW — … for branch: <ramo>" + a ponte ramo -> bead
-    do log do gate (o log tem os dois campos).
+  * revisor do gate: o cabeçalho "QUALITY GATE REVIEW — … for branch: <ramo>" + a ponte ramo -> bead do log do gate (o log tem os
+    dois campos). A pré-revisão do construtor (E3) usa o mesmo cabeçalho mas roda `claude -p --no-session-persistence`: NÃO deixa
+    transcrito, então o custo dela não aparece aqui (está nas linhas próprias dela); o caminho `pregate-review` só vale se isso mudar.
   * sessão de pool sem nenhum claim = SPAWN OCIOSO (achou a fila vazia e saiu). É custo real e fica numa linha própria; não é
     "custo de bead zero".
 
@@ -250,6 +251,7 @@ def scan_session(main):
     claims = []               # dict(bead, ts, ok)
     refs, ref_first = Counter(), {}   # bead -> nº de comandos `bd <verbo> <id>`; fallback p/ worker com bead JÁ atribuído (sem --claim)
     bad = 0
+    no_usage = set()
     nlines = 0
     user_seen = 0
     for f in session_files(main):
@@ -318,6 +320,8 @@ def scan_session(main):
                     mid = msg.get("id")
                     if not mid:
                         continue
+                    if not msg.get("usage") and msg.get("model") != "<synthetic>":
+                        no_usage.add(mid)                    # resposta real SEM usage: os tokens dela são DESCONHECIDOS, não zero
                     use = msg_usage(msg)
                     rec = msgs.get(mid)
                     if rec is None:
@@ -369,7 +373,7 @@ def scan_session(main):
     return dict(v=SCHEMA, sid=sid, alias=alias or None, role=role, project=main.parent.name,
                 cwd=cwd, first_ts=min(stamps) if stamps else None, last_ts=max(stamps) if stamps else None,
                 size=size, mtime_ns=mtime_ns, fp=fingerprint(main), msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
-                bad_lines=bad, lines=nlines, branches=branches,
+                bad_lines=bad, no_usage=len(no_usage), lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
                 refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed,
                 buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
@@ -432,7 +436,7 @@ def cmd_harvest(a):
     t0 = time.time()
     rows, bad_ledger = load_ledger(path)
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
-    scanned = unchanged = skipped_old = vanished = suspect = 0
+    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = 0
     for proj in PROJECTS:
         for f in sorted(proj.glob("*/*.jsonl")):
             try:
@@ -450,8 +454,12 @@ def cmd_harvest(a):
             if rec is None:
                 vanished += 1
                 continue
-            if rec["lines"] >= 30 and rec["msgs"] == 0:
-                suspect += 1
+            bad_lines += rec["bad_lines"]
+            no_usage += rec["no_usage"]
+            if rec["lines"] >= 30:
+                big += 1
+                if rec["msgs"] == 0:
+                    suspect += 1
             if merge_session(rows, rec):
                 scanned += 1
             else:
@@ -460,8 +468,13 @@ def cmd_harvest(a):
     print(f"harvest: {scanned} sessões (re)escaneadas, {unchanged} inalteradas, {skipped_old} fora da janela, "
           f"{vanished} sumiram no meio; ledger={len(rows)} sessões (linhas ilegíveis no ledger: {bad_ledger}) "
           f"em {time.time() - t0:.1f}s -> {path}")
-    if suspect:
-        print(f"⚠ {suspect} sessões com ≥30 linhas e 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
+    if bad_lines or no_usage:
+        print(f"⚠ nas sessões escaneadas: {bad_lines} linhas de transcrito ilegíveis e {no_usage} respostas SEM usage (tokens DESCONHECIDOS, "
+              f"contados como 0 só no total — o gasto real é maior)")
+    # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
+    # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
+    if suspect >= 2 and suspect * 4 >= big:
+        print(f"⚠ {suspect} de {big} sessões com ≥30 linhas vieram com 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
     return 0
 
 
@@ -472,10 +485,12 @@ def s3_list(since_day):
                        capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"aws s3api list-objects-v2 falhou (rc={p.returncode}): {p.stderr.strip()[:300]}")
-    top, nested = [], [0, 0]
+    top, nested, odd = [], [0, 0], 0
     for line in p.stdout.splitlines():
         if "\t" not in line:
-            continue                                   # "None" (nenhum objeto) ou ruído
+            if line.strip() not in ("", "None"):           # "None" = a consulta não casou nada; qualquer outra coisa é listagem que não entendi
+                odd += 1
+            continue
         key, _, size = line.partition("\t")
         parts = key.split("/")
         if len(parts) == 3 and parts[2].endswith(".jsonl"):
@@ -483,6 +498,8 @@ def s3_list(since_day):
         else:
             nested[0] += 1
             nested[1] += int(size or 0)
+    if odd:
+        print(f"backfill-s3: ⚠ {odd} linhas da listagem do aws que não consegui interpretar (ignoradas — a listagem pode estar incompleta)")
     return top, nested
 
 
@@ -557,7 +574,10 @@ def cmd_backfill_s3(a):
                     failures.append((key, sync_err.get(proj, "objeto não veio no sync")))
                     continue
                 rec = scan_session(dest)
-                if rec is not None and merge_session(rows, rec):
+                if rec is None:
+                    failed += 1                          # baixou mas não consegui abrir: falha, não "já tinha registro mais completo"
+                    failures.append((key, "transcrito baixado e ilegível"))
+                elif merge_session(rows, rec):
                     merged += 1
                 else:
                     kept += 1
