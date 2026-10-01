@@ -23,8 +23,26 @@ O braço gravado em cada e5_admit é auditado: recalculado pela MESMA função d
 (gate_e5_arm_for_bead, extraída da lib viva — nunca reimplementada). Divergência = aborta
 alto, porque um braço calculado por outra regra não mede nada.
 
+"SEM e5_admit NA JANELA" TAMBÉM TEM TRÊS ESTADOS (gate ga-syxaki, tentativa 4): o mesmo vazio sai
+de "o experimento ainda não começou" e de "a flag está ligada e o E5 não está rodando" (lib que
+não carregou, log que não grava) — e só o ARQUIVO DA FLAG diz qual dos dois é. Por isso a
+apuração o lê (o mesmo arquivo que o dispatcher lê a cada varredura):
+  * flag ausente  e nenhum e5_admit no log       -> "não começou"                      (rc 0)
+  * flag ausente  e e5_admit fora da janela      -> "janela sem admissões"             (rc 0)
+  * flag ligada desde T, e ≥ 1 run JULGADA que COMEÇOU depois de T + 10 min, zero e5_admit
+                                                  -> ERRO ALTO: o E5 não está rodando   (rc 3)
+  * flag ligada, mas nenhuma run julgada começou depois disso -> "ainda não dá para dizer" (rc 0)
+  * flag existe e não pode ser lida              -> "não consigo saber"                 (rc 4)
+"Run julgada" = PASS por quórum ou FAIL que um revisor emitiu: uma run que passou por aí
+CERTAMENTE spawnou revisor e, com o E5 sano, CERTAMENTE escreveu e5_admit (o admit sai no spawn
+do revisor 1; uma run que aborta antes dele legitimamente não tem). A margem de 10 min cobre a
+varredura que leu a flag ANTES de ela ligar e só criou a run depois. Com e5_admit na janela, o
+mesmo cruzamento vira aviso: runs julgadas sob a flag SEM e5_admit ficam fora do denominador.
+
 Uso:  gate-e5-apuracao.py [--since YYYY-MM-DD] [--qg-log PATH] [--transcripts DIR]
-                          [--lib PATH] [--price-json PATH] [--no-cost] [--json]
+                          [--lib PATH] [--flag-file PATH] [--price-json PATH] [--no-cost] [--json]
+Saída: rc 0 = nada de errado achado; rc 1 = FATAL (auditoria/leitura); rc 3 = E5 ligado e sem
+admitir; rc 4 = estado da flag ilegível.
 """
 import argparse
 import collections
@@ -45,6 +63,16 @@ DEFAULT_TRANSCRIPTS = os.path.expanduser(
 JUDGED_RE = re.compile(r"^Reviewer \d+ FAIL:")
 BEAD_TOKEN_RE = re.compile(r"\bga-(?:wisp-)?[a-z0-9]{4,12}\b")
 SESSION_DONE_AGE_S = 15 * 60
+
+# The flag the dispatcher reads on every sweep (gate_e5_enabled: readable file -> on). Same default and same
+# override variable as gate-e5-switch.sh and the lib, so the three always look at the same file.
+DEFAULT_FLAG = os.environ.get("GATE_E5_FLAG_FILE") or os.path.join(HQ, ".gc", "gate-e5-second-reviewer.on")
+FLAG_STAMP_RE = re.compile(r"ligado em (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)")
+# A sweep reads the flag at Step 5 and creates the run (the clock behind elapsed_s) a minute or two later: a run that
+# started within this margin after the flag flipped may legitimately have read it as off.
+FLAG_GRACE_S = 10 * 60
+RC_NOT_ADMITTING = 3     # flag on, runs judged since, none admitted: the E5 is not running
+RC_UNKNOWN = 4           # the flag file exists and cannot be read: no way to tell
 
 # USD por 1M de tokens. PREÇOS DE LISTA ASSUMIDOS (Sonnet-classe) — confira e sobrescreva com
 # --price-json {"<substring do modelo>": {"in":..,"out":..,"cache_read":..,"cache_write_5m":..,"cache_write_1h":..}}.
@@ -313,6 +341,136 @@ def per_bead(runs, history):
     return out, excluded_prior
 
 
+# ── saúde do E5: o que um log SEM e5_admit pode (e não pode) querer dizer ──────────
+def parse_ts(s):
+    try:
+        return datetime.datetime.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def read_flag(path):
+    """The flag file as the apuração must see it — three states, like the dispatcher's reader and the switch's status:
+    ausente (does not exist) / ligada (readable; since when) / ilegivel (EXISTS but cannot be read — the dispatcher reads
+    that as off, which is not the same fact as 'absent')."""
+    if not os.path.exists(path):
+        return {"estado": "ausente", "arquivo": path}
+    try:
+        with open(path, errors="replace") as fh:
+            first = fh.readline().strip()
+    except OSError as exc:
+        return {"estado": "ilegivel", "arquivo": path, "motivo": str(exc)}
+    since, src = None, None
+    m = FLAG_STAMP_RE.search(first)
+    if m:
+        since, src = parse_ts(m.group(1)), "carimbo 'ligado em' do arquivo"
+    if since is None:
+        try:
+            since, src = os.stat(path).st_mtime, "mtime do arquivo (o carimbo 'ligado em <ts>' não pôde ser lido)"
+        except OSError as exc:
+            return {"estado": "ilegivel", "arquivo": path, "motivo": "sem como saber desde quando: %s" % exc}
+    return {"estado": "ligada", "arquivo": path, "desde": since, "desde_fonte": src, "linha": first[:160]}
+
+
+def judged_complete(ev):
+    """A completed run that CERTAINLY spawned a reviewer — a PASS by quorum, or a FAIL a reviewer judged — and so, with the E5
+    healthy, certainly wrote an e5_admit (it is written when reviewer 1 is spawned). A run that aborted before spawning
+    (no reviewer, source bead closed, merge failure after the verdict...) legitimately has none, so it is no evidence."""
+    res, reason = ev.get("result"), ev.get("reason", "") or ""
+    return (res == "PASS" and reason.startswith("quorum_")) or (res == "FAIL" and bool(JUDGED_RE.match(reason)))
+
+
+def judged_runs_since(events, t0, since):
+    """gate_run ids of the judged runs that STARTED at/after t0 (start = completion ts − elapsed_s) and, if --since is given,
+    completed inside that window. A completion whose duration or timestamp cannot be read cannot be shown to have started
+    after t0, so it is left out — absence of evidence, never evidence of a fault."""
+    out = []
+    for ev in events:
+        g = ev.get("gate_run")
+        if ev["event"] != "dispatcher_complete" or not g or g == "unknown" or str(ev.get("dry_run", "0")) == "1":
+            continue
+        if since and str(ev.get("ts", ""))[:10] < since:
+            continue
+        end = parse_ts(ev.get("ts"))
+        try:
+            dur = float(ev.get("elapsed_s"))
+        except (TypeError, ValueError):
+            continue
+        if end is None or end - dur < t0 or not judged_complete(ev):
+            continue
+        out.append(g)
+    return out
+
+
+def e5_health(events, runs, flag, since):
+    """Classify an apuração by what the FLAG says next to what the log holds. 'No e5_admit in the window' alone is ambiguous:
+    it is what an experiment that has not started looks like, and also what a flag that is ON while the lib failed to load
+    (quality-gate-dispatcher.sh: GATE_E5_LIB_OK=0) or a log that cannot be appended to looks like."""
+    h = {"flag": flag, "admits_no_log": sum(1 for ev in events if ev["event"] == "e5_admit"),
+         "admits_na_janela": len(runs), "estado": "ok", "rc": 0}
+    if flag["estado"] == "ilegivel":
+        h.update(estado="flag_ilegivel", rc=RC_UNKNOWN)
+        return h
+    if flag["estado"] == "ligada":
+        t0 = flag["desde"] + FLAG_GRACE_S
+        judged = judged_runs_since(events, t0, since)
+        h["runs_julgadas_apos_a_flag"] = len(judged)
+        h["runs_julgadas_sem_admit"] = sum(1 for g in judged if g not in runs)
+        h["lib_nao_carregou_avisos"] = sum(1 for ev in events if ev["event"] == "e5_lib_not_loaded"
+                                           and (parse_ts(ev.get("ts")) or 0) >= flag["desde"])
+        if not runs:
+            if judged:
+                h.update(estado="ligado_sem_admitir", rc=RC_NOT_ADMITTING)
+            else:
+                h["estado"] = "ligado_sem_evidencia"
+        return h
+    if not runs:
+        h["estado"] = "janela_sem_admissoes" if h["admits_no_log"] else "nao_comecou"
+    return h
+
+
+def age_txt(seconds):
+    s = max(0, int(seconds))
+    return "%dh%02dmin" % (s // 3600, (s % 3600) // 60) if s >= 3600 else "%dmin" % (s // 60)
+
+
+def health_lines(h):
+    """The flag/health part of the report. Every state says what it IS; none borrows another's wording."""
+    f = h["flag"]
+    now = datetime.datetime.now().timestamp()
+    if f["estado"] == "ilegivel":
+        return ["  ✗ NÃO CONSIGO SABER SE O E5 ESTÁ RODANDO: o arquivo da flag (%s) EXISTE e não pode ser lido (%s)." % (f["arquivo"], f.get("motivo", "?")),
+                "    O dispatcher o lê como DESLIGADO (inerte), então o E5 pode estar parado sem que o log tenha como mostrar isso.",
+                "    Corrija a permissão do arquivo, ou rode gate-e5-switch.sh off. (rc=%d)" % RC_UNKNOWN]
+    on = ("  flag: LIGADA desde %s (%s) — há %s" % (datetime.datetime.fromtimestamp(f["desde"], datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                                    f["desde_fonte"], age_txt(now - f["desde"]))) if f["estado"] == "ligada" else None
+    off = "  flag: DESLIGADA (arquivo %s ausente)" % f["arquivo"]
+    st = h["estado"]
+    if st == "ligado_sem_admitir":
+        return [on,
+                "  ✗ ERRO — O E5 ESTÁ LIGADO E NÃO ESTÁ ADMITINDO NADA: %d run(s) julgada(s) COMEÇARAM mais de %d min depois de a flag ligar e NENHUMA tem e5_admit." % (
+                    h["runs_julgadas_apos_a_flag"], FLAG_GRACE_S // 60),
+                "    Isto NÃO é 'o experimento ainda não começou'. Causas a olhar, nesta ordem:",
+                "      · a lib não carregou no dispatcher (GATE_E5_LIB_OK=0 — erro de sintaxe/arquivo ilegível; avisos e5_lib_not_loaded no log desde a flag: %d);" % h["lib_nao_carregou_avisos"],
+                "      · o log não grava (procure 'could not append' no log do dispatcher: disco cheio? permissão do quality-gate.jsonl?);",
+                "      · o launchd roda outro dispatcher que não é este checkout (confira com ps/launchctl, não com o arquivo). (rc=%d)" % RC_NOT_ADMITTING]
+    if st == "ligado_sem_evidencia":
+        return [on,
+                "  Sem e5_admit na janela, e NENHUMA run julgada começou depois da margem de %d min da flag — ainda não dá para dizer se o E5 está admitindo." % (FLAG_GRACE_S // 60),
+                "  (isto não é 'sem problema' nem 'com problema': rode de novo depois que uma run concluir.)"]
+    if st == "nao_comecou":
+        return [off,
+                "  Nenhum e5_admit no log inteiro e a flag está desligada: o experimento ainda não começou. Não há taxa nem custo para ler — isto é a ausência do experimento, não uma medição."]
+    if st == "janela_sem_admissoes":
+        return [off,
+                "  Nenhum e5_admit NA JANELA (há %d no log, fora dela) e a flag está desligada agora — alargue a janela (--since) para ver as admissões anteriores." % h["admits_no_log"]]
+    lines = [on or off]
+    if h.get("runs_julgadas_sem_admit"):
+        lines.append("  ⚠ %d das %d run(s) julgada(s) que começaram depois da flag NÃO têm e5_admit: ficam FORA de A e de B (denominador incompleto) — o E5 perdeu runs "
+                     "(lib que falhou numa varredura? append que falhou? veja o log do dispatcher)." % (h["runs_julgadas_sem_admit"], h["runs_julgadas_apos_a_flag"]))
+    return lines
+
+
 SIZE_UNKNOWN = "tamanho desconhecido"
 
 
@@ -326,6 +484,7 @@ def size_bucket(b):
 def analyse(events, args):
     runs = build_runs(events, args.since)
     res = {"runs_admitidas": len(runs)}
+    res["saude"] = e5_health(events, runs, read_flag(args.flag_file), args.since)
     if not runs:
         return res, runs, {}
     # runs recorded with arm "?" (no bead id / no sha tool at admission) have no arm to audit and stay out of A/B: the audit covers exactly
@@ -443,11 +602,11 @@ def render(res, args, bad_lines):
     L.append("  janela: %s · fonte: %s" % ("a partir de " + args.since if args.since else "log inteiro", args.qg_log))
     if bad_lines:
         L.append("  ⚠ %d linha(s) ilegíveis no log foram ignoradas" % bad_lines)
+    L.append("\n── estado do E5 (a flag que o dispatcher lê, cruzada com o que o log tem) ──")
+    L.extend(health_lines(res["saude"]))
     if not res.get("runs_admitidas"):
-        L.append("\n  Nenhuma run com evento e5_admit na janela — a flag ainda não foi ligada (ou a janela é anterior).")
-        L.append("  (vazio aqui NÃO é erro nem resultado: é o experimento ainda não ter começado.)")
         return "\n".join(L)
-    L.append("  runs admitidas sob a flag: %d · braço: %s" % (res["runs_admitidas"], res["braco_auditado"]))
+    L.append("\n  runs admitidas sob a flag: %d · braço: %s" % (res["runs_admitidas"], res["braco_auditado"]))
     if res.get("beads_sem_braco"):
         L.append("  ⚠ %d bead(s) sem braço atribuível (sem id ou sem ferramenta sha256 na admissão): fora de A e de B." % res["beads_sem_braco"])
     if res.get("beads_com_1o_fail_anterior_a_flag_fora"):
@@ -508,6 +667,7 @@ def main():
     ap.add_argument("--since", default="")
     ap.add_argument("--qg-log", default=DEFAULT_LOG)
     ap.add_argument("--lib", default=DEFAULT_LIB)
+    ap.add_argument("--flag-file", default=DEFAULT_FLAG, help="the E5 flag file the dispatcher reads (default: GATE_E5_FLAG_FILE or $GC_CITY/.gc/gate-e5-second-reviewer.on)")
     ap.add_argument("--transcripts", default=DEFAULT_TRANSCRIPTS)
     ap.add_argument("--price-json", default="")
     ap.add_argument("--no-cost", action="store_true")
@@ -522,6 +682,8 @@ def main():
         print()
     else:
         print(render(res, args, bad))
+    # the exit status carries the third state too: 0 only when nothing wrong was found (see the docstring)
+    sys.exit(res["saude"]["rc"])
 
 
 if __name__ == "__main__":

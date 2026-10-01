@@ -10,7 +10,8 @@
 #   * cost has three states per session (sabido / desconhecido / sem registro), dedupes the
 #     streamed repeats of one message, and never reports an exact per-bead cost while any of
 #     that bead's sessions is unknown;
-#   * an empty window says "flag not on yet", not "0%".
+#   * a window with no e5_admit is read against the FLAG FILE (gate attempt 4): flag off -> "not started"; flag ON and judged runs
+#     that started after it but no admit -> a loud error (rc 3), never the benign reading; flag unreadable -> "cannot tell" (rc 4).
 # Exit 0 iff every assertion holds.
 
 set -uo pipefail
@@ -26,6 +27,8 @@ check() { if [ "$2" = "$3" ]; then ok "$1 (=$3)"; else bad "$1 — expected '$2'
 echo "== gate-e5-apuracao.selftest =="
 [ -r "$SCRIPT" ] && [ -r "$LIB" ] || { echo "FATAL: missing script or lib" >&2; exit 2; }
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/gate-e5-apur.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
+# the apuração reads the E5 flag file; a suite must not depend on (or be moved by) the live one. Absent unless a case builds its own.
+export GATE_E5_FLAG_FILE="$TMP/flag.absent"
 
 # bead ids of each arm, from the REAL lib function
 arm() { env -i PATH="$PATH" GC_CITY=/x /bin/bash -c "set -euo pipefail; source '$LIB'; gate_e5_arm_for_bead '$1'"; }
@@ -266,12 +269,116 @@ check "a bead whose FIRST admitted run has no arm but whose later run is B: rc" 
 check "...stays in arm B (2 second-FAIL / 7 resolved / 2 unknown, unchanged)" "2,7,2" "$(jq -r '.primaria.B | "\(.segunda_fail),\(.resolveu_sem_segunda_fail),\(.ainda_nao_se_sabe)"' "$TMP/qfirst.json")"
 check "...and is NOT counted as 'sem braço'" 0 "$(jq -r '.beads_sem_braco' "$TMP/qfirst.json")"
 
-echo "── empty window ──"
+echo "── what 'no e5_admit' means: the FLAG decides (gate attempt 4, blocking issue 2) ──"
+# The old report printed "a flag ainda não foi ligada ... (vazio aqui NÃO é erro...)" for ANY window without an e5_admit — also when the
+# flag IS on and the E5 is not admitting (lib not loaded, log not written). Same output for two different worlds. REPRO from the verdict:
+# a log with 40 dispatcher_complete lines and zero e5_admit exited 0 with exactly that text.
+python3 - "$TMP" <<'PYEOF2'
+import json, os, sys, calendar, time
+tmp = sys.argv[1]
+T = "2026-10-02T09:00:00Z"                                  # the flag is turned on here
+def comp(ts, g, result="PASS", reason="quorum_1_of_1_independent_sessions", elapsed=600, dry="0", with_elapsed=True):
+    e = {"ts": ts, "event": "dispatcher_complete", "gate_run": g, "bead": "ga-b-" + g, "result": result, "reason": reason, "dry_run": dry}
+    if with_elapsed:
+        e["elapsed_s"] = elapsed
+    return e
+def write(name, evs):
+    with open(os.path.join(tmp, name), "w") as fh:
+        for e in evs:
+            fh.write(json.dumps(e) + "\n")
+# 40 judged runs, all started well after T+10min, none admitted (the verdict's repro)
+write("h-broken.jsonl", [comp("2026-10-02T%02d:%02d:00Z" % (10 + i // 30, (i * 2) % 60), "ga-r%03d" % i,
+                              *(("FAIL", "Reviewer 1 FAIL: VERDICT: FAIL") if i % 4 == 0 else ())) for i in range(40)]
+      + [{"ts": "2026-10-02T09:30:00Z", "event": "e5_lib_not_loaded", "bead": "ga-x", "why": "the lib file is missing"},
+         {"ts": "2026-10-02T09:31:00Z", "event": "e5_lib_not_loaded", "bead": "ga-y", "why": "the lib file is missing"},
+         {"ts": "2026-10-02T08:00:00Z", "event": "e5_lib_not_loaded", "bead": "ga-old", "why": "BEFORE the flag: not counted"}])
+# only runs that were already in flight when the flag flipped, or started inside the 10 min margin
+write("h-inflight.jsonl", [comp("2026-10-02T09:05:00Z", "ga-if1", elapsed=1800),      # started 08:35, before the flip
+                           comp("2026-10-02T09:12:00Z", "ga-if2", elapsed=420)])      # started 09:05: inside the margin
+# runs that prove NOTHING: no reviewer judged, a dry run, a duration that cannot be read
+write("h-unjudged.jsonl", [comp("2026-10-02T10:00:00Z", "ga-u1", "FAIL", "TIMEOUT: reviewers did not submit verdicts within 25 minutes."),
+                           comp("2026-10-02T10:05:00Z", "ga-u2", "FAIL", "Merge failed after all-PASS verdict."),
+                           comp("2026-10-02T10:10:00Z", "ga-u3", dry="1"),
+                           comp("2026-10-02T10:15:00Z", "ga-u4", with_elapsed=False),
+                           comp("2026-10-02T10:20:00Z", "ga-unknown", elapsed=600)])
+evs = [json.loads(l) for l in open(os.path.join(tmp, "h-unjudged.jsonl"))]; evs[-1]["gate_run"] = "unknown"; write("h-unjudged.jsonl", evs)
+with open(os.path.join(tmp, "flag.on"), "w") as fh: fh.write("ligado em %s — Mayor, bead ga-syxaki #1, teste\n" % T)
+with open(os.path.join(tmp, "flag.nostamp"), "w") as fh: fh.write("ligado\n")
+t_epoch = calendar.timegm(time.strptime(T, "%Y-%m-%dT%H:%M:%SZ")); os.utime(os.path.join(tmp, "flag.nostamp"), (t_epoch, t_epoch))
+with open(os.path.join(tmp, "flag.unreadable"), "w") as fh: fh.write("ligado em %s — x\n" % T)
+os.chmod(os.path.join(tmp, "flag.unreadable"), 0)
+PYEOF2
+hl() { python3 "$SCRIPT" --qg-log "$1" --lib "$LIB" --no-cost --flag-file "$2" "${@:3}"; }
 : > "$TMP/empty.jsonl"
-OUT="$(python3 "$SCRIPT" --qg-log "$TMP/empty.jsonl" --lib "$LIB")"; RC=$?
-check "empty log: exit 0" 0 "$RC"
-case "$OUT" in *"flag ainda não foi ligada"*"NÃO é erro"*) ok "empty log says 'the flag is not on yet', not 0%" ;; *) bad "empty log message wrong: $OUT" ;; esac
-check "--since after every event: same (no runs in the window)" 1 "$(python3 "$SCRIPT" --qg-log "$QG" --lib "$LIB" --since 2027-01-01 | grep -c 'flag ainda não foi ligada')"
+OUT="$(hl "$TMP/empty.jsonl" "$TMP/flag.absent")"; RC=$?
+check "empty log + flag absent: exit 0" 0 "$RC"
+case "$OUT" in *"o experimento ainda não começou"*) ok "...says the experiment has NOT STARTED (flag off and nothing in the log — both facts, not one)" ;; *) bad "empty log + flag off message wrong: $OUT" ;; esac
+check "...and the old absolute ('vazio aqui NÃO é erro') is gone from the output" 0 "$(printf '%s' "$OUT" | grep -c 'NÃO é erro')"
+check "--since after every event, flag off, admits exist OUTSIDE the window: its own state ('janela sem admissões'), rc 0" "1,0" \
+  "$(hl "$QG" "$TMP/flag.absent" --since 2027-01-01 | grep -c 'Nenhum e5_admit NA JANELA'),$(hl "$QG" "$TMP/flag.absent" --since 2027-01-01 >/dev/null; echo $?)"
+# the verdict's repro: flag ON, 40 judged runs, zero admits
+OUT="$(hl "$TMP/h-broken.jsonl" "$TMP/flag.on")"; RC=$?
+check "flag ON + 40 judged runs that started after it + ZERO e5_admit: exit 3 (not 0)" 3 "$RC"
+case "$OUT" in *"O E5 ESTÁ LIGADO E NÃO ESTÁ ADMITINDO NADA"*"40 run(s) julgada(s)"*) ok "...with a loud error that counts the judged runs" ;; *) bad "flag ON + no admits did not say so: $OUT" ;; esac
+check "...and it does NOT print the benign 'not started' line for the same empty (the error may QUOTE the phrase to deny it)" 0 "$(printf '%s' "$OUT" | grep -c 'a flag está desligada: o experimento ainda não começou')"
+case "$OUT" in *"e5_lib_not_loaded no log desde a flag: 2"*) ok "...and names the lib-not-loaded warnings the dispatcher left since the flag (2; the one BEFORE the flag is not counted)" ;; *) bad "lib-not-loaded warnings not surfaced/counted: $(printf '%s' "$OUT" | grep -i 'lib não')" ;; esac
+check "the same state through --json: estado + rc" "ligado_sem_admitir,3" "$(hl "$TMP/h-broken.jsonl" "$TMP/flag.on" --json | jq -r '.saude | "\(.estado),\(.rc)"')"
+hl "$TMP/h-broken.jsonl" "$TMP/flag.on" --json >/dev/null; check "--json exits 3 too (the status is not a text-mode privilege)" 3 "$?"
+# the other side of the same rule: no false alarm
+OUT="$(hl "$TMP/h-inflight.jsonl" "$TMP/flag.on")"; RC=$?
+check "flag ON, only runs in flight at the flip / inside the 10-min margin: exit 0 (they read the flag as off, legitimately)" 0 "$RC"
+case "$OUT" in *"ainda não dá para dizer se o E5 está admitindo"*) ok "...and says it cannot tell yet — neither 'fine' nor 'broken'" ;; *) bad "in-flight-only log not reported as 'cannot tell yet': $OUT" ;; esac
+OUT="$(hl "$TMP/h-unjudged.jsonl" "$TMP/flag.on")"; RC=$?
+check "flag ON, runs that prove nothing (timeout / merge failure / dry run / unreadable duration / run id 'unknown'): exit 0" 0 "$RC"
+case "$OUT" in *"ainda não dá para dizer"*) ok "...cannot tell yet (a run that never spawned a reviewer has no e5_admit, legitimately)" ;; *) bad "unjudged-only log misread: $OUT" ;; esac
+# a flag file with no readable stamp: dated by its mtime, and the report says that is what it did
+OUT="$(hl "$TMP/h-broken.jsonl" "$TMP/flag.nostamp")"; RC=$?
+check "flag without a 'ligado em' stamp: dated by mtime, still exit 3" 3 "$RC"
+case "$OUT" in *"mtime do arquivo"*) ok "...and the report says the date came from the mtime, not from the stamp" ;; *) bad "mtime fallback not disclosed: $(printf '%s' "$OUT" | grep 'flag:')" ;; esac
+# unreadable flag: the dispatcher reads it as OFF (inert), the apuração cannot say which world this is
+OUT="$(hl "$TMP/h-broken.jsonl" "$TMP/flag.unreadable")"; RC=$?
+check "flag file EXISTS but cannot be read: exit 4" 4 "$RC"
+case "$OUT" in *"NÃO CONSIGO SABER"*"EXISTE e não pode ser lido"*) ok "...says it cannot tell, and why" ;; *) bad "unreadable flag not reported as such: $OUT" ;; esac
+check "...and it is not reported as 'not started' either" 0 "$(printf '%s' "$OUT" | grep -c 'a flag está desligada: o experimento ainda não começou')"
+chmod 600 "$TMP/flag.unreadable"
+# admits present, but judged runs after the flag that have none: the denominator is incomplete — a warning, not a silent pass
+python3 - "$QG" "$TMP/h-partial.jsonl" <<'PYEOF2'
+import json, sys
+out = open(sys.argv[2], "w")
+for line in open(sys.argv[1]):
+    out.write(line)
+for i in range(3):
+    out.write(json.dumps({"ts": "2026-10-02T11:%02d:00Z" % i, "event": "dispatcher_complete", "gate_run": "ga-lost%d" % i, "bead": "ga-lost%d" % i,
+                          "result": "PASS", "reason": "quorum_1_of_1_independent_sessions", "elapsed_s": 600, "dry_run": "0"}) + "\n")
+PYEOF2
+OUT="$(hl "$TMP/h-partial.jsonl" "$TMP/flag.on" --json)"; RC=$?
+check "admits present, 3 judged runs after the flag WITHOUT one: exit 0 (the experiment runs) but the gap is counted" "0,3" "$RC,$(printf '%s' "$OUT" | jq -r '.saude.runs_julgadas_sem_admit')"
+case "$(hl "$TMP/h-partial.jsonl" "$TMP/flag.on")" in *"3 das 3 run(s) julgada(s)"*"NÃO têm e5_admit"*) ok "...and the text warns that those runs are OUTSIDE A and B" ;; *) bad "incomplete denominator not warned about" ;; esac
+check "the normal fixture (flag absent) is unchanged: no 'estado' error, exit 0" "ok,0" "$(run_ap --json | jq -r '.saude | "\(.estado),\(.rc)"')"
+
+# mutations: is this section vacuous?
+echo "── Mutations: the apuração suite must notice each of these ──"
+mut() { # mut <out> <sed-expression>
+  sed -e "$2" "$SCRIPT" > "$1"; cmp -s "$SCRIPT" "$1" && { bad "mutation did not apply: $2"; return 1; }; return 0
+}
+if mut "$TMP/apur.nojudge.py" 's/            if judged:$/            if False:/'; then
+  python3 "$TMP/apur.nojudge.py" --qg-log "$TMP/h-broken.jsonl" --lib "$LIB" --no-cost --flag-file "$TMP/flag.on" >/dev/null 2>&1; R=$?
+  [ "$R" = "0" ] && ok "mutation 'flag on + judged runs + no admits is NOT an error' (the old behaviour) is caught: it exits 0 where the real script exits 3" || bad "no-error mutant survived (rc=$R)"
+fi
+if mut "$TMP/apur.nograce.py" 's/^FLAG_GRACE_S = .*/FLAG_GRACE_S = 0/'; then
+  python3 "$TMP/apur.nograce.py" --qg-log "$TMP/h-inflight.jsonl" --lib "$LIB" --no-cost --flag-file "$TMP/flag.on" >/dev/null 2>&1; R=$?
+  [ "$R" = "3" ] && ok "mutation 'no 10-min margin' is caught: the run that began 09:05, before the flag could be read as on, becomes a false alarm (rc 3, real 0)" || bad "no-margin mutant survived (rc=$R)"
+fi
+if mut "$TMP/apur.alljudged.py" 's/    return (res == "PASS" and reason.startswith("quorum_")) or (res == "FAIL" and bool(JUDGED_RE.match(reason)))/    return True/'; then
+  python3 "$TMP/apur.alljudged.py" --qg-log "$TMP/h-unjudged.jsonl" --lib "$LIB" --no-cost --flag-file "$TMP/flag.on" >/dev/null 2>&1; R=$?
+  [ "$R" = "3" ] && ok "mutation 'any completion is evidence' is caught: a timeout / merge failure (no e5_admit, legitimately) becomes a false alarm (rc 3, real 0)" || bad "any-completion mutant survived (rc=$R)"
+fi
+if mut "$TMP/apur.unreadable.py" 's/        h.update(estado="flag_ilegivel", rc=RC_UNKNOWN)/        h.update(estado="nao_comecou", rc=0)/'; then
+  chmod 000 "$TMP/flag.unreadable"
+  python3 "$TMP/apur.unreadable.py" --qg-log "$TMP/h-broken.jsonl" --lib "$LIB" --no-cost --flag-file "$TMP/flag.unreadable" >/dev/null 2>&1; R=$?
+  chmod 600 "$TMP/flag.unreadable"
+  [ "$R" = "0" ] && ok "mutation 'an unreadable flag reads as not-started' is caught: it exits 0 where the real script exits 4" || bad "unreadable-flag mutant survived (rc=$R)"
+fi
 
 echo "== gate-e5-apuracao.selftest: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]

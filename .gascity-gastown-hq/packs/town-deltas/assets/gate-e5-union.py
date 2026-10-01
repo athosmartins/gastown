@@ -30,8 +30,14 @@ DEDUPE — what counts as "the same issue" (the bead says "por arquivo+linha+cla
   * issues of the SAME reviewer are never merged with each other.
 
 What a merge keeps: the more detailed wording of the two issues (tagged with every reviewer that
-found it). Each reviewer's preamble — including any text on its "VERDICT: FAIL" line — and its
-non-blocking findings / coverage tail are kept verbatim under "other notes".
+found it) PLUS whatever the other wording carries that the kept one lacks — a file:line citation
+the kept text does not cover, a sentence that says something the kept text does not — appended
+under "also from reviewer N". Two reviewers describing ONE defect do not necessarily cite the same
+sites or make the same point (the second one often names the sibling call site), and the builder
+reads the merged text as the whole finding: a duplicate is noise, a lost finding is a defect. The
+other wording is dropped only when everything in it is already in the kept text. Each reviewer's
+preamble — including any text on its "VERDICT: FAIL" line — and its non-blocking findings /
+coverage tail are kept verbatim under "other notes".
 
 Stdlib only; safe on the python3 that launchd's PATH finds. Any failure is the CALLER's cue
 to fall back to the legacy concatenation — this script never guesses a partial answer.
@@ -206,11 +212,84 @@ def is_duplicate(a, b):
 
 def prepare(body, reviewer):
     return {"body": body, "cites": cites_of(body), "tokens": tokens_of(body),
-            "norm": norm_text(body), "reviewers": [reviewer]}
+            "norm": norm_text(body), "reviewers": [reviewer],
+            "parts": [(reviewer, body)], "notes": []}
 
 
 def renumber(body, n):
     return re.sub(r'(Blocking[ \t]+issue[ \t]+)\d+', lambda m: m.group(1) + str(n), body, count=1, flags=re.I)
+
+
+# ── what a merge must not lose ────────────────────────────────────────────────
+SENTENCE_SPLIT_RE = re.compile(r'(?<=[.;!?])[ \t]+|\n+')
+
+
+def cite_covered(c, kept_cites):
+    """True when the kept text already says where citation c points: the same file and — if c names
+    a line — a kept citation of that file whose line range overlaps it (±LINE_SLACK). A line number
+    the kept text lacks (it cites the file bare, or another line) is information it does not have."""
+    fc, loc, hic = c
+    for fk, lok, hik in kept_cites:
+        if not same_file(fc, fk):
+            continue
+        if loc is None:
+            return True
+        if lok is not None and loc - LINE_SLACK <= hik and lok - LINE_SLACK <= hic:
+            return True
+    return False
+
+
+def squash(text):
+    return re.sub(r'\s+', ' ', text).strip().lower().rstrip('.;!? ')
+
+
+def sentences_of(body):
+    """The issue's own sentences / clauses, its 'Blocking issue N' header removed (the merged text
+    numbers its issues itself). File citations stay inside the sentence that carries them."""
+    text = ISSUE_RE.sub("", body, count=1)
+    text = re.sub(r'^[\s:*—–-]+', '', text)
+    return [p.strip() for p in SENTENCE_SPLIT_RE.split(text) if p.strip()]
+
+
+def sentence_covered(sent, kept_norm, kept_cites, kept_tokens):
+    """The kept text already says everything this sentence says: every citation it makes is covered,
+    and either its wording occurs in the kept text or every significant word of it does. Under any
+    doubt the answer is False — the sentence is kept (a repeated sentence is noise, a lost one is a
+    lost finding)."""
+    if any(not cite_covered(c, kept_cites) for c in cites_of(sent)):
+        return False
+    s = squash(sent)
+    if s and s in kept_norm:
+        return True
+    toks = tokens_of(sent)
+    return bool(toks) and toks <= kept_tokens
+
+
+def settle(item):
+    """(Re)compute what is SHOWN for an issue found by several reviewers: the most detailed wording
+    (longest; the earliest on a tie) plus, for every other wording, the sentences the shown text does
+    not already contain — tagged with the reviewer who wrote them. Recomputed from item["parts"] on
+    every merge, so a later and longer wording that takes over the headline pushes the previous one
+    into 'also from' instead of dropping it."""
+    parts = item["parts"]
+    keep = max(range(len(parts)), key=lambda i: (len(parts[i][1]), -i))
+    body = parts[keep][1]
+    cites, tokens, norm = list(cites_of(body)), set(tokens_of(body)), squash(body)
+    notes = []
+    for i, (rev, text) in enumerate(parts):
+        if i == keep:
+            continue
+        novel = []
+        for s in sentences_of(text):
+            if sentence_covered(s, norm, cites, tokens):
+                continue
+            novel.append(s)
+            cites += cites_of(s)
+            tokens |= tokens_of(s)
+            norm += " " + squash(s)
+        if novel:
+            notes.append((rev, novel))
+    item["body"], item["notes"], item["cites"], item["tokens"] = body, notes, cites, tokens
 
 
 def union(reviewers):
@@ -253,19 +332,21 @@ def union(reviewers):
             else:
                 duplicates += 1
                 hit["reviewers"].append(idx)
-                if len(cand["body"]) > len(hit["body"]):   # keep the more informative wording
-                    hit["body"] = cand["body"]
-                    hit["cites"] = cand["cites"]
-                    hit["tokens"] = hit["tokens"] | cand["tokens"]
+                hit["parts"].append((idx, body))
+                settle(hit)       # the longest wording is shown; what the other adds is appended, not dropped
     first = order[0]
     counts = ", ".join("reviewer %d: %d" % (i, per_reviewer[i]) for i in order)
+    appended = sum(len(sents) for m in merged for _, sents in m["notes"])
     head = ("Reviewer %d FAIL: VERDICT: FAIL — E5: union of %d independent reviews (%s blocking issue(s)); "
-            "%d duplicate(s) merged (same file:line and same defect description; the more detailed wording is shown), "
+            "%d duplicate(s) merged (same file:line and same defect description; the more detailed wording is shown and "
+            "anything the other wording adds — another citation, another point — is appended as 'also from reviewer N'), "
             "%d distinct issue(s) below. Each reviewer's other notes follow verbatim." % (first, len(order), counts, duplicates, len(merged)))
     parts = [head, ""]
     for n, m in enumerate(merged, 1):
         who = " and ".join("reviewer %d" % i for i in m["reviewers"])
         parts.append(renumber(m["body"], n))
+        for rev, sents in m["notes"]:
+            parts.append("  also from reviewer %d (not in the wording above): %s" % (rev, " ".join(sents)))
         parts.append("  [found by %s%s]" % (who, " — independently confirmed" if len(m["reviewers"]) > 1 else ""))
         parts.append("")
     for idx, pre, tail in notes:
@@ -277,7 +358,7 @@ def union(reviewers):
         parts.append("")
     text = "\n".join(parts).rstrip() + "\n"
     stats = {"reviewers": len(order), "issues_by_reviewer": {str(i): per_reviewer[i] for i in order},
-             "duplicates_merged": duplicates, "distinct_issues": len(merged)}
+             "duplicates_merged": duplicates, "distinct_issues": len(merged), "sentences_appended": appended}
     return text, stats
 
 
