@@ -1,0 +1,19 @@
+(1) Opus crew messages in sessions STARTED on/after 2026-09-30T00:00:00Z: 2969
+    effort=medium    1159   39.0%
+    effort=high       950   32.0%
+    effort=xhigh      860   29.0%
+    by crew (sessions touching the window; msgs by effort):
+      batista-wa sessions=2  msgs=931   high=549 (59%), medium=382 (41%)
+      oracle-wa  sessions=3  msgs=380   high=209 (55%), medium=171 (45%)
+      peter-wa   sessions=1  msgs=1388  xhigh=860 (62%), medium=483 (35%), high=45 (3%)
+      thies-wa   sessions=1  msgs=270   high=147 (54%), medium=123 (46%)
+    crew-members with ZERO sessions in the window: ['digo-wa', 'mila-wa']
+
+(2) gate log: 3856 crew/* branches ever seen, 20 unreadable lines (ignored, counted)
+    NAMED-crew branches first seen by the gate on/after the E2 start AND with a real verdict: 20  (1st-round PASS 9)
+      batista  n=6   pass=3
+      oracle   n=5   pass=4
+      peter    n=8   pass=2
+      thies    n=1   pass=0
+    1st-round pass 45%, Wilson 95% CI 26%-66%
+    for scale: detecting 37% -> 47% needs ~378 branches per arm; this sample is 20 and is NOT split by the effort each branch's builder ran at
