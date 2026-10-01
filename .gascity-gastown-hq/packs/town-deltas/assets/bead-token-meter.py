@@ -94,6 +94,7 @@ ID_TOKEN = re.compile(r"^[a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*$")
 REF_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?(?:show|comments?|heartbeat|close|label|update|reopen)\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)\b")
 UPDATE_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?update\b([^;&|\n]*)")
 USAGE_KEYS = ("inp", "out", "cw5", "cw1", "cr", "think", "msgs")
+CTX_CAPS = (150_000, 250_000, 350_000)   # tetos hipotéticos de contexto por turno (tokens): quanto da leitura de cache está ACIMA deles
 
 
 # ----------------------------------------------------------------------------- pequenos utilitários
@@ -341,6 +342,7 @@ def scan_session(main):
     ordered = sorted(((m["ts"], mid, m) for mid, m in msgs.items()), key=lambda x: (x[0], x[1]))
     buckets = defaultdict(lambda: defaultdict(lambda: {k: 0 for k in USAGE_KEYS}))
     days = defaultdict(lambda: defaultdict(lambda: {k: 0 for k in USAGE_KEYS}))   # dia UTC da MENSAGEM x modelo|effort (janela exata)
+    days_ctx = defaultdict(lambda: defaultdict(lambda: {str(c): 0 for c in CTX_CAPS}))   # dia -> modelo -> teto -> tokens de cache-read ACIMA do teto
     synthetic = 0
     for ts, mid, m in ordered:
         if m["model"] == "<synthetic>":
@@ -352,6 +354,8 @@ def scan_session(main):
                 key = c["bead"]
             else:
                 break
+        for cap in CTX_CAPS:
+            days_ctx[ts[:10] or "?"][m["model"]][str(cap)] += max(0, m["use"]["cr"] - cap)
         for agg in (buckets[key][f"{m['model']}|{m['effort']}"], days[ts[:10] or "?"][f"{m['model']}|{m['effort']}"]):
             for k in USAGE_KEYS[:-1]:
                 agg[k] += m["use"][k]
@@ -368,7 +372,8 @@ def scan_session(main):
                 bad_lines=bad, lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
                 refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed,
-                buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()})
+                buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
+                days_ctx={d: {mo: dict(cc) for mo, cc in v.items()} for d, v in days_ctx.items()})
 
 
 # ----------------------------------------------------------------------------- ledger
@@ -438,7 +443,7 @@ def cmd_harvest(a):
                 vanished += 1
                 continue
             old = rows.get(f.stem)
-            if old and old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA:
+            if old and old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA and "days_ctx" in old:
                 unchanged += 1
                 continue
             rec = scan_session(f)
@@ -505,7 +510,7 @@ def cmd_backfill_s3(a):
             skipped_scope += 1                          # LLM de produto / experimentos de scratch: não são trabalho de bead
             continue
         have = rows.get(sid)
-        if have and have.get("v") == SCHEMA and have.get("size", 0) >= size:
+        if have and have.get("v") == SCHEMA and "days_ctx" in have and have.get("size", 0) >= size:
             skipped_have += 1                           # a cópia que o ledger já viu é pelo menos tão completa quanto a do S3
             continue
         todo.append((key, size, proj, sid))
@@ -715,6 +720,36 @@ def _report(a):
                               ctx_per_msg=round(g["ctx"] / g["msgs"]), output_per_msg=round(g["out"] / g["msgs"]))
     result["composition"] = comp_out
 
+    # ---- 1c. teto de contexto: quanto da leitura de cache vive ACIMA de um teto (limite superior da economia de uma janela de compactação menor)
+    cap_rows = defaultdict(lambda: dict(total_read_usd=0.0, above={str(c): 0.0 for c in CTX_CAPS}, covered=0, sessions=0))
+    for s in rows.values():
+        if not s.get("days_ctx"):
+            continue
+        g = cap_rows[s["role"]]
+        g["sessions"] += 1
+        for day, models in s["days_ctx"].items():
+            if day < since_day:
+                continue
+            for model, caps in models.items():
+                p_ = PRICES.get(model) or PRICES.get(ASSUMED.get(model, ""))
+                if p_:
+                    for cap, tokens in caps.items():
+                        g["above"][cap] += tokens * p_[0] * CACHE_MULT["cr"] / 1e6
+    for role, g in cap_rows.items():
+        g["total_read_usd"] = comp[role]["parts"][3] if role in comp else 0.0
+    print(f"\n== 1c. TETO DE CONTEXTO — US$ de LEITURA de cache acima de um teto por turno (limite SUPERIOR da economia de compactar mais cedo; ignora o custo da compactação e o risco de qualidade)")
+    print(f"{'papel':14s} {'leitura US$':>11s} {'% do gasto':>10s}   " + "   ".join(f"acima de {c // 1000}k: US$ (% gasto do papel)" for c in CTX_CAPS))
+    cap_out = {}
+    for role, g in sorted(cap_rows.items(), key=lambda kv: -kv[1]["total_read_usd"]):
+        if g["total_read_usd"] <= 0 or role not in comp:
+            continue
+        role_tot = sum(comp[role]["parts"])
+        cells = "   ".join(f"{g['above'][str(c)]:9.2f} ({100 * g['above'][str(c)] / role_tot:4.1f}%)         " for c in CTX_CAPS)
+        print(f"{role:14s} {g['total_read_usd']:11.2f} {100 * g['total_read_usd'] / role_tot:9.1f}%   {cells}")
+        cap_out[role] = dict(read_usd=round(g["total_read_usd"], 2), role_usd=round(role_tot, 2),
+                             above={str(c): round(g["above"][str(c)], 2) for c in CTX_CAPS})
+    result["context_caps"] = cap_out
+
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
     idle = defaultdict(lambda: [0, 0.0])
     for s in sess:
@@ -833,7 +868,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
         cohorts[(role, model, effort)].append(b)
     print(f"\n== 4. por COORTE do construtor (papel × modelo × effort da 1ª sessão do bead)")
     print(f"{'coorte':40s} {'beads':>5s} {'1ª-PASS':>9s} {'taxa 1ª [IC95%]':>20s} {'build$/bead':>11s} {'rev$/bead':>9s} "
-          f"{'tot$/bead':>9s} {'Mtok/bead':>9s} {'$/bead 1ª-aprov.':>16s}")
+          f"{'tot$/bead':>9s} {'Mtok/bead':>9s} {'$/bead 1ª-aprov.':>16s} {'aprov.(any)':>11s} {'$/bead aprov.':>13s}")
     out_c = []
     for coh, beads in sorted(cohorts.items(), key=lambda kv: -len(kv[1])):
         n = len(beads)
@@ -845,13 +880,18 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
         unp = sum(1 for b in beads if per[b]["unpriced"])
         tot = sum(bu) + sum(ru)
         per_ok = tot / k if k else None
+        n_ever = sum(1 for b in beads if b in ever_pass)
+        per_ever = tot / n_ever if n_ever else None
         label = f"{coh[0]} {coh[1].replace('claude-', '')} {coh[2]}"
         print(f"{label:40s} {n:5d} {k:4d}/{n:<4d} {100 * k / n:6.1f}% [{100 * lo:3.0f},{100 * hi:3.0f}] "
               f"{statistics.mean(bu):11.3f} {statistics.mean(ru):9.3f} {statistics.mean(bu) + statistics.mean(ru):9.3f} "
-              f"{statistics.mean(tt) / 1e6:9.2f} {('n/a (0 aprov.)' if per_ok is None else f'{per_ok:.3f}'):>16s}"
+              f"{statistics.mean(tt) / 1e6:9.2f} {('n/a (0 aprov.)' if per_ok is None else f'{per_ok:.3f}'):>16s} "
+              f"{n_ever:5d}/{n:<5d} {('n/a' if per_ever is None else f'{per_ever:.3f}'):>13s}"
               + (f"  [{unp} bead(s) com token SEM preço]" if unp else ""))
         out_c.append(dict(cohort=label, beads=n, first_pass=k, rate=k / n, ci95=[lo, hi], build_usd_mean=statistics.mean(bu),
                           review_usd_mean=statistics.mean(ru), tokens_mean=statistics.mean(tt), usd_per_first_pass=per_ok,
+                          ever_pass=n_ever, usd_per_approved=per_ever,
+                          usd_total_sd=(statistics.pstdev([a + b for a, b in zip(bu, ru)]) if n > 1 else None),
                           build_usd_median=statistics.median(bu), beads_unpriced=unp))
     result["cohorts"] = out_c
     result["beads"] = {b: dict(role=first_session[b][1], arm=first_session[b][2], via=first_session[b][3],
@@ -868,9 +908,53 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
           (f"US$ {sys_usd / len(approved_win):.2f} por bead aprovada" if approved_win else "n/a (nenhum PASS na janela)"))
     print("   inclui produto (LLM de WhatsApp etc.), crews, Mayor, revisores, refino e spawns ociosos — é o teto da métrica-norte.")
     result["system"] = dict(approved_beads=len(approved_win), usd_per_approved=(sys_usd / len(approved_win) if approved_win else None))
+    result["power"] = power_section(first_session, first_run, per, ever_pass, measured)
     print("\nLeitura: 'aprovada' = 1ª rodada real do gate (PASS) por coorte; custo de rework (sessões extras do mesmo bead) entra no "
           "build$/bead. A coorte atribui ao braço da 1ª sessão — intenção de tratar.")
     return 0, result
+
+
+def n_per_arm_mean(cv, delta):
+    """beads por braço p/ detectar uma redução relativa `delta` da média (alfa 5% bilateral, poder 80%), dado o coeficiente de variação."""
+    return 2 * (1.96 + 0.8416) ** 2 * cv ** 2 / delta ** 2
+
+
+def n_per_arm_prop(p, diff):
+    p2 = max(0.0, p - diff)
+    return (1.96 * math.sqrt(2 * ((p + p2) / 2) * (1 - (p + p2) / 2)) + 0.8416 * math.sqrt(p * (1 - p) + p2 * (1 - p2))) ** 2 / diff ** 2
+
+
+def power_section(first_session, first_run, per, ever_pass, measured):
+    """Quanto um A/B POR BEAD enxerga com o volume que existe? O custo por bead tem cauda longa (CV >> 1): o critério 'não cair mais
+    que 3 pp' precisa de milhares de beads por braço — sem esta conta o experimento 'inconclusivo' é só falta de poder."""
+    out = {}
+    print("\n== 6. PODER de um A/B por bead (alfa 5%, poder 80%, braços 50/50) — o que o volume atual permite enxergar")
+    print(f"{'papel':10s} {'beads':>6s} {'beads/dia':>9s} {'CV US$/bead':>11s} {'1ª-aprov.':>9s}   n/braço p/ detectar custo −10% / −20% / −30%   |   1ª-aprov. ±10pp / ±5pp / ±3pp   (dias a 50/50)")
+    for role in ("wa-worker", "dog"):
+        beads = [b for b in measured if first_session[b][1] == role]
+        if len(beads) < 20:
+            print(f"{role:10s} {len(beads):6d}   (menos de 20 beads medidos: sem poder estatístico para estimar nada)")
+            continue
+        tot = [per[b]["build_usd"] + per[b]["review_usd"] + per[b]["pregate_usd"] for b in beads]
+        mean = statistics.mean(tot)
+        cv = statistics.pstdev(tot) / mean if mean else float("nan")
+        ts = sorted(first_run[b]["_ts"] for b in beads)
+        span = max((ts[-1] - ts[0]).total_seconds() / 86400, 1.0)
+        rate = len(beads) / span
+        p = sum(1 for b in beads if first_run[b]["result"] == "PASS") / len(beads)
+        nm = [n_per_arm_mean(cv, d) for d in (0.10, 0.20, 0.30)]
+        npp = [n_per_arm_prop(p, d) for d in (0.10, 0.05, 0.03)]
+        days = lambda n: 2 * n / rate
+        print(f"{role:10s} {len(beads):6d} {rate:9.1f} {cv:11.2f} {100 * p:8.0f}%   {nm[0]:6.0f} ({days(nm[0]):4.0f}d) / {nm[1]:5.0f} ({days(nm[1]):3.0f}d) / {nm[2]:5.0f} ({days(nm[2]):3.0f}d)"
+              f"   |   {npp[0]:5.0f} ({days(npp[0]):3.0f}d) / {npp[1]:5.0f} ({days(npp[1]):4.0f}d) / {npp[2]:6.0f} ({days(npp[2]):4.0f}d)")
+        out[role] = dict(beads=len(beads), beads_per_day=round(rate, 2), cv_usd_per_bead=round(cv, 3), first_pass=round(p, 3),
+                         n_per_arm_cost=dict(zip(("-10%", "-20%", "-30%"), (round(x) for x in nm))),
+                         n_per_arm_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(x) for x in npp))),
+                         days_cost=dict(zip(("-10%", "-20%", "-30%"), (round(days(x)) for x in nm))),
+                         days_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(days(x)) for x in npp))))
+    print("   Leitura: dias = 2 × n/braço ÷ beads/dia (todos os beads do papel entrando no A/B). Onde 'dias' passa de ~30, o experimento por bead não fecha\n"
+          "   nesse efeito: use métrica por MENSAGEM/turno (milhares de amostras) como primária e a aprovação só como trava de segurança.")
+    return out
 
 
 def cmd_prices(a):

@@ -15,7 +15,7 @@ Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 tra
   * ledger: idempotente, crescente, sobrevive à remoção do transcrito, "o registro com mais mensagens vence", lock de instância única
   * backfill-s3: erro do aws != lista vazia; falha de download é contada e devolvida (nunca silenciosa); guarda de disco; fora de escopo
   * terceiro estado: sem ledger / sem log do gate = "SEM DADO" (exit 2), nunca zeros
-  * controles de mutação: 8 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
+  * controles de mutação: 9 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
 """
 import contextlib
 import fcntl
@@ -337,6 +337,45 @@ def t_gate_cohort(m, W):
     ck(r["system"]["approved_beads"] == 3, f"3 beads com PASS real na janela (dry_run fora), achei {r['system']}")
 
 
+def t_context_caps(m, W):
+    w, _ = setup(m, W)
+    recs = [beacon("gastown.dog-5", D + "10:00:00Z")]
+    for i, cr in enumerate((100_000, 300_000, 600_000)):
+        recs += asst(f"cx{i}", D + f"10:0{i + 1}:00Z", usage=dict(input_tokens=1, output_tokens=1, cache_creation_input_tokens=0, cache_read_input_tokens=cr))
+    write_session(w["projects"], "-proj", "ctx1", recs)
+    rec = m.scan_session(w["projects"] / "-proj" / "ctx1.jsonl")
+    got = rec["days_ctx"][D[:-1]]["claude-sonnet-5-5"]
+    ck(got == {"150000": 600_000, "250000": 400_000, "350000": 250_000},
+       f"excesso de cache-read acima de cada teto: (0+150k+450k, 0+50k+350k, 0+0+250k); achei {got}")
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+    code, r = report(m, w)
+    ck(approx(r["context_caps"]["dog"]["above"]["250000"], 400_000 * 2 * 0.1 / 1e6 + 0.0, 1e-6) or r["context_caps"]["dog"]["above"]["250000"] > 0,
+       f"US$ acima do teto de 250k aparece no report, achei {r['context_caps'].get('dog')}")
+    ck(r["context_caps"]["dog"]["above"]["150000"] > r["context_caps"]["dog"]["above"]["250000"] > r["context_caps"]["dog"]["above"]["350000"],
+       "o excesso só pode CAIR quando o teto sobe")
+    # registro antigo (sem days_ctx) é reescaneado pela colheita, não fica sem o campo
+    rows = ledger_rows(m, w); old = dict(rows["ctx1"]); old.pop("days_ctx")
+    rows["ctx1"] = old; m.write_ledger(rows, w["ledger"])
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+    ck("days_ctx" in ledger_rows(m, w)["ctx1"], "registro sem days_ctx é reescaneado pela próxima colheita")
+
+
+def t_approved_and_power(m, W):
+    w, _ = setup(m, W)
+    code, r = report(m, w)
+    dog = [c for c in r["cohorts"] if c["cohort"].startswith("dog ")][0]
+    ck(dog["ever_pass"] == 2, f"A (1ª PASS) e B (FAIL e depois PASS) estão aprovadas em alguma rodada: 2, achei {dog['ever_pass']}")
+    tot = sum(r["beads"][b]["build_usd"] + r["beads"][b]["review_usd"] for b in ("ga-aaa1", "ga-bbb2"))
+    ck(approx(dog["usd_per_approved"], tot / 2, 1e-6) and approx(dog["usd_per_first_pass"], tot / 1, 1e-6),
+       f"US$/bead aprovada (qualquer rodada) = custo ÷ 2; por 1ª-PASS = custo ÷ 1; achei {dog['usd_per_approved']} / {dog['usd_per_first_pass']}")
+    ck(r["power"] == {}, f"com <20 beads por papel não se estima poder (vazio, não um número inventado), achei {r['power']}")
+    ck(approx(m.n_per_arm_mean(1.0, 0.2), 392.4, 0.5), f"n/braço p/ -20% com CV 1 = 2(1,96+0,8416)²/0,04 = 392,4, achei {m.n_per_arm_mean(1.0, 0.2)}")
+    ck(approx(m.n_per_arm_prop(0.5, 0.1), 387, 2), f"n/braço p/ 50% -> 40% = ~387, achei {m.n_per_arm_prop(0.5, 0.1)}")
+    ck(m.n_per_arm_prop(0.5, 0.03) > 4000, "detectar 3pp pede milhares por braço (o critério do bead não fecha em semanas)")
+
+
 def t_ledger(m, W):
     w, first = setup(m, W)
     ck("0 inalteradas" in first and "(re)escaneadas" in first, f"1ª colheita escaneia tudo: {first}")
@@ -461,7 +500,8 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "sem preço vira US$ 0": ('        return None\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', '        return 0.0\n    pin, pout = p\n    return (c["inp"] * pin + c["out"] * pout', t_price),
     "claim que falhou conta": ('if c["ok"] is not False and c["ts"]', 'if c["ts"]', t_claims),
     "só o 1º ramo do revisor": ("len(branches) < 6", "len(branches) < 1", t_reviewer),
-    "janela por início de sessão": ("            if day < since_day:\n                continue\n", "", t_window_by_message_day),
+    "janela por início de sessão": ('(s.get("days") or {}).items():\n            if day < since_day:\n                continue\n', '(s.get("days") or {}).items():\n', t_window_by_message_day),
+    "excesso acima do teto vira o cache-read inteiro": ('+= max(0, m["use"]["cr"] - cap)', '+= m["use"]["cr"]', t_context_caps),
     "prefiltro depende do espaçamento": ('is_asst = \'"assistant"\' in line', 'is_asst = \'"type":"assistant"\' in line', t_json_spacing_and_canary),
     "id do preâmbulo vira bead": ("if not live and role in POOL_BUILDERS and refs:", "if not live and role in POOL_BUILDERS + ('crew',) and refs:", t_noise_idle_ref_crew),
 }
@@ -470,7 +510,7 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("composição do custo: uma fórmula só", t_composition), ("<synthetic> fora, modelo sem preço = n/p, --assume-price rotulado", t_synthetic_unpriced),
          ("claim ok / falho / sem resultado; pré-claim rateado", t_claims), ("preâmbulo ≠ bead; ocioso; referência; crew", t_noise_idle_ref_crew),
          ("JSON espaçado lido igual + alarme de formato", t_json_spacing_and_canary), ("subagente entra na sessão-mãe sem duplicar", t_subagent), ("revisor: ramo certo entre citações", t_reviewer),
-         ("janela por dia da mensagem", t_window_by_message_day), ("gate: 1ª rodada, coorte, US$/bead aprovada, dry_run fora", t_gate_cohort),
+         ("janela por dia da mensagem", t_window_by_message_day), ("gate: 1ª rodada, coorte, US$/bead aprovada, dry_run fora", t_gate_cohort), ("aprovada em qualquer rodada + poder do A/B", t_approved_and_power), ("teto de contexto: excesso exato + registro antigo reescaneado", t_context_caps),
          ("ledger: idempotente, cresce, sobrevive ao reaper, mais completo vence", t_ledger), ("lock de instância única", t_lock),
          ("terceiro estado: SEM DADO", t_no_data), ("backfill-s3: erro≠vazio, falha contada, disco, escopo", t_backfill)]
 
