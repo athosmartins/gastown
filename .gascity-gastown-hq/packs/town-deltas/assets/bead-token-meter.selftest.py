@@ -18,7 +18,12 @@ Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 tra
   * varredura do terceiro estado (gate-done): spawn ocioso em modelo sem preço mostra os tokens sem preço em vez de US$ 0; revisor sem ramo
     conta SESSÕES; veredito do gate sem bead é linha ilegível contada (não derruba o relatório); claim sem timestamp é contado; linha
     ilegível do ledger é guardada antes da reescrita
-  * controles de mutação: 14 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
+  * 3º estado "sem preço" no relatório TODO, não só nas seções 1-2 (gate-fix 1): bead com qualquer token sem preço = custo n/p (nunca a
+    soma parcial, que é um piso); coorte só sobre os beads com preço e razão por aprovada n/p; sistema inteiro = piso rotulado com o
+    US$ por aprovada null no JSON; CV da seção 6 só sobre beads com preço (quantos, impresso) e n/p — não nan — quando não há; e uma
+    seção que estoura não leva embora as já prontas (exit 1, texto e --json). Mais os achados baixos da mesma família: claim sem
+    resultado ≠ verificado, veredito sem dry_run ≠ ensaio, resposta sem timestamp contada e avisada
+  * controles de mutação: 28 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
 """
 import contextlib
 import fcntl
@@ -28,6 +33,7 @@ import json
 import os
 import shutil
 import stat
+import statistics
 import sys
 import tempfile
 from pathlib import Path
@@ -585,6 +591,188 @@ def t_sweep_unknowns(m, W):
     ck(len(list(led.parent.glob("sessions.jsonl.unreadable-*"))) == 1, "ledger já limpo: a colheita seguinte não cria outra cópia")
 
 
+def dog_session(P, sid, bead, model, k, hhmm, alias="gastown.dog-1", effort="xhigh"):
+    """Sessão de dog que reivindica `bead` na 1ª resposta e tem `k` respostas no total (cada uma = 100 tokens de `model`)."""
+    t = lambda sec: f"{D}{hhmm}:{sec:02d}.000Z"
+    recs = [beacon(alias, t(0))]
+    recs += asst(f"{sid}-1", t(10), model=model, effort=effort, cmd=f"bd update {bead} --claim", tid=f"tu_{sid}")
+    recs += [tool_result(f"tu_{sid}", f"✓ Updated issue: {bead}", t(11))]
+    for j in range(2, k + 1):
+        recs += asst(f"{sid}-{j}", t(10 + j), model=model, effort=effort)
+    write_session(P, "-proj", sid, recs)
+
+
+def mini_world(m, W, beads):
+    """Mundo mínimo para o relatório por bead: 1 sessão de dog por bead (claim + k respostas) e 1 veredito PASS por bead no gate."""
+    W.mkdir(parents=True, exist_ok=True)
+    P = W / "projects"
+    events = []
+    for i, b in enumerate(beads):
+        dog_session(P, f"mw{i:03d}", b["bead"], b["model"], b["k"], f"10:{i % 60:02d}")
+        events.append({"ts": f"{D}12:{i % 60:02d}:00Z", "event": "dispatcher_complete", "branch": f"feat/{b['bead']}", "bead": b["bead"],
+                       "rig": "gascity", "result": "PASS", "dry_run": "0"})
+    gate = W / "gate.jsonl"
+    gate.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    w = dict(projects=P, gate=gate, ledger=W / "ledger" / "sessions.jsonl")
+    m.PROJECTS, m.GATE_LOG, m.LEDGER = [P], gate, w["ledger"]
+    harvest(m, w)
+    return w
+
+
+def report_text(m, w, *extra):
+    out = io.StringIO()
+    argv = ["report", "--ledger", str(w["ledger"]), "--gate-log", str(w["gate"]), "--from", "2026-09-30", *extra]
+    with contextlib.redirect_stdout(out):
+        code = m.main(argv)
+    return code, out.getvalue()
+
+
+def t_unpriced_report(m, W):
+    """Terceiro estado nas seções 3-5 e na 1b: um bead com QUALQUER token sem preço tem custo n/p — a soma parcial é um PISO e não
+    entra em média, razão por aprovada, JSON por bead nem no 'US$ por bead aprovada' do sistema (reprovação do gate: a coorte
+    'wa-worker sonnet-5 max' saía com 0.000 e o sistema inteiro com metade do custo, sem aviso na seção)."""
+    w, _ = setup(m, W)
+    code, r0 = report(m, w)
+    ba, bb = r0["beads"]["ga-aaa1"], r0["beads"]["ga-bbb2"]
+    exp_build, exp_rev = (ba["build_usd"] + bb["build_usd"]) / 2, (ba["review_usd"] + bb["review_usd"]) / 2
+    P = w["projects"]
+    dog_session(P, "uu1", "ga-uu01", "claude-sonnet-5", 4, "14:00")          # construtor SEM preço
+    dog_session(P, "uu2", "ga-uu02", "claude-sonnet-5", 4, "14:10")
+    dog_session(P, "mx1", "ga-mix1", "claude-sonnet-5-5", 4, "14:20")        # construtor COM preço, mas o REVISOR dele não tem
+    recs = [beacon("gate-reviewer-adhoc-mix", D + "15:00:00.000Z")]
+    recs += [tool_result("tu_mx", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: feat/ga-mix1\nBranch SHA: abc", D + "15:00:01.000Z")]
+    recs += asst("mxr1", D + "15:00:05.000Z", model="claude-sonnet-5")
+    write_session(P, "-proj", "revmix", recs)
+    with open(w["gate"], "a") as fh:
+        for bead, res, hh in (("ga-uu01", "PASS", "14:30"), ("ga-uu02", "FAIL", "14:40"), ("ga-mix1", "PASS", "14:50")):
+            fh.write(json.dumps({"ts": f"{D}{hh}:00Z", "event": "dispatcher_complete", "branch": f"feat/{bead}", "bead": bead, "rig": "gascity",
+                                 "result": res, "dry_run": "0"}) + "\n")
+    harvest(m, w)
+    code, r = report(m, w)
+    ck(code == 0, f"report saiu {code}")
+    coh = {c["cohort"]: c for c in r["cohorts"]}
+    u = coh["dog sonnet-5 xhigh"]
+    ck(u["beads"] == 2 and u["beads_unpriced"] == 2 and u["beads_priced"] == 0, f"coorte sem preço: 2 beads, os 2 n/p; achei {u}")
+    ck(all(u[k] is None for k in ("build_usd_mean", "review_usd_mean", "build_usd_median", "usd_per_first_pass", "usd_per_approved", "usd_total_sd")),
+       f"coorte sem nenhum bead precificado = n/p (null), NUNCA 0.0 nem soma parcial; achei {u}")
+    ck(u["tokens_mean"] == 400 and u["first_pass"] == 1, f"os tokens (exatos) e a aprovação continuam medidos; achei {u}")
+    mx = coh["dog sonnet-5-5 xhigh"]
+    ck(mx["beads"] == 3 and mx["beads_unpriced"] == 1 and mx["beads_priced"] == 2, f"coorte mista: A, B com preço; ga-mix1 n/p (revisor sem preço); achei {mx}")
+    ck(approx(mx["build_usd_mean"], exp_build, 2e-6) and approx(mx["review_usd_mean"], exp_rev, 2e-6),
+       f"as médias da coorte mista são SÓ sobre A e B ({exp_build:.6f}/{exp_rev:.6f}), sem o piso do ga-mix1; achei {mx['build_usd_mean']}/{mx['review_usd_mean']}")
+    ck(mx["usd_per_first_pass"] is None and mx["usd_per_approved"] is None,
+       f"'US$ por aprovada' de coorte com bead n/p é n/p: o numerador não cobre os mesmos beads que o denominador conta; achei {mx}")
+    bd = r["beads"]
+    ck(bd["ga-uu01"]["build_usd"] is None and bd["ga-uu01"]["unpriced_tokens"] == 400, f"JSON por bead: construtor sem preço = null, tokens contados; achei {bd['ga-uu01']}")
+    ck(approx(bd["ga-mix1"]["build_usd"], 4 * USD_SMALL, 1e-6) and bd["ga-mix1"]["review_usd"] is None and bd["ga-mix1"]["unpriced_tokens"] == 100,
+       f"JSON por bead, por PARTE: o construtor tem US$, o revisor (sem preço) é null; achei {bd['ga-mix1']}")
+    ck(approx(bd["ga-aaa1"]["build_usd"], ba["build_usd"], 1e-9), "bead totalmente precificado continua numérico")
+    s = r["system"]
+    ck(s["usd_complete"] is False and s["usd_per_approved"] is None and s["unpriced_tokens"] > 0,
+       f"sistema com token sem preço: usd_per_approved é null (não o piso com cara de medida); achei {s}")
+    ck(approx(s["usd_per_approved_floor"], r["total_usd_priced"] / s["approved_beads"], 1e-9), f"o piso vai em campo próprio = total com preço ÷ aprovadas; achei {s}")
+    ck(r["composition_unpriced_tokens"] == r["unpriced_tokens"] > 0, f"1b/1c contam os tokens sem preço que deixaram de fora; achei {r['composition_unpriced_tokens']} x {r['unpriced_tokens']}")
+    code, r2 = report(m, w, "--assume-price", "claude-sonnet-5=claude-sonnet-5-5")
+    s2 = r2["system"]
+    ck(s2["usd_complete"] and s2["unpriced_tokens"] == 0 and approx(s2["usd_per_approved"], r2["total_usd_priced"] / s2["approved_beads"], 1e-9),
+       f"com preço para todo modelo o número COMPLETO volta (null só quando falta preço de verdade); achei {s2}")
+    u2 = {c["cohort"]: c for c in r2["cohorts"]}["dog sonnet-5 xhigh"]
+    ck(u2["beads_unpriced"] == 0 and u2["build_usd_mean"] > 0 and u2["usd_per_approved"] is not None, f"com --assume-price a coorte tem custo; achei {u2}")
+    code, txt = report_text(m, w)
+    row = [ln for ln in txt.splitlines() if ln.startswith("dog sonnet-5 xhigh")]
+    ck(row and "n/p" in row[0] and "0.000" not in row[0] and "2 de 2 beads com token SEM preço" in row[0], f"texto da seção 4: n/p com aviso, sem 0.000; achei {row}")
+    ck("PISO" in txt and "US$ ≥" in txt and "(piso)" in txt, "texto da seção 5 diz que é piso e quanto ficou de fora")
+    ck("ficam FORA de 1b e 1c" in txt, "texto da 1b avisa dos tokens sem preço que ela deixou de fora")
+
+
+def t_power_unpriced(m, W):
+    """Seção 6 com bead sem preço: o CV é do US$ por bead e só um bead com preço tem US$. Antes: bead sem preço entrava como US$ 0
+    (CV 3,06 num papel que mede 1,00) e, com TODOS sem preço, mean=0 -> CV nan -> ValueError que jogava fora o relatório inteiro."""
+    # (a) todos os 24 beads do papel sem preço: não estoura; a metade do poder que não depende de preço (aprovação) continua
+    w = mini_world(m, W / "a", [dict(bead=f"ga-pa{i:02d}", model="claude-sonnet-5", k=3 + i % 5) for i in range(24)])
+    code, r = report(m, w)
+    ck(code == 0 and "error" not in r, f"report com TODOS os beads sem preço não pode estourar (exit {code}): {r.get('error')}")
+    pw = r["power"]["dog"]
+    ck(pw["beads"] == 24 and pw["beads_priced"] == 0 and pw["cv_usd_per_bead"] is None and pw["n_per_arm_cost"] is None and pw["days_cost"] is None,
+       f"CV do US$ sem nenhum bead com preço = n/p (null); achei {pw}")
+    ck(pw["n_per_arm_first_pass"]["3pp"] > 0, "a aprovação não depende de preço: o poder dela continua calculado")
+    code, txt = report_text(m, w)
+    ck(code == 0 and "== 6." in txt and "n/p (US$ por bead desconhecido)" in txt and "CV só sobre 0 de 24 beads com preço" in txt, f"texto: n/p e quantos ficaram fora; achei {txt[-700:]}")
+    # (b) misto: 24 com preço + 6 sem — o CV é o dos 24 (calculado aqui, de forma independente), não o de 30 com 6 zeros
+    beads = [dict(bead=f"ga-pm{i:02d}", model="claude-sonnet-5-5", k=3 + i % 5) for i in range(24)] + \
+            [dict(bead=f"ga-pu{i:02d}", model="claude-sonnet-5", k=3 + i % 5) for i in range(6)]
+    w = mini_world(m, W / "b", beads)
+    code, r = report(m, w)
+    costs = [(3 + i % 5) * USD_SMALL for i in range(24)]
+    cv = statistics.pstdev(costs) / statistics.mean(costs)
+    pw = r["power"]["dog"]
+    ck(code == 0 and pw["beads"] == 30 and pw["beads_priced"] == 24, f"30 beads medidos, 24 com preço; achei {pw}")
+    ck(abs(pw["cv_usd_per_bead"] - cv) <= 6e-4, f"CV = o dos 24 beads com preço ({cv:.4f}); com os 6 sem preço contados como US$ 0 sairia outro; achei {pw['cv_usd_per_bead']}")
+    ck(pw["n_per_arm_cost"] and pw["n_per_arm_cost"]["-20%"] > 0, f"com >= 20 beads com preço o poder do custo é calculado; achei {pw}")
+    code, txt = report_text(m, w)
+    ck("CV só sobre 24 de 30 beads com preço" in txt, "texto da seção 6 diz quantos beads ficaram fora do CV")
+
+
+def t_report_survives_crash(m, W):
+    """Uma seção que estoura não pode levar junto as que já estavam prontas (antes: o buffer inteiro era descartado e só sobrava o traceback)."""
+    w = mini_world(m, W, [dict(bead=f"ga-sc{i}", model="claude-sonnet-5-5", k=3 + i) for i in range(3)])
+    m.power_section = lambda *a, **k: 1 / 0               # a última seção (6) estoura
+    argv = ["report", "--ledger", str(w["ledger"]), "--gate-log", str(w["gate"]), "--from", "2026-09-30"]
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = m.main(argv)
+    txt = out.getvalue()
+    ck(code == 1, f"seção que estoura = exit 1, nunca 0; saiu {code}")
+    for sec in ("== 1.", "== 2.", "== 3.", "== 4.", "== 5."):
+        ck(sec in txt, f"a seção '{sec}' já estava pronta e tem que continuar na saída; saída: {txt[-400:]}")
+    ck("RELATÓRIO INCOMPLETO" in txt and "ZeroDivisionError" in txt, f"a saída diz que ficou incompleto e por quê; achei {txt[-300:]}")
+    ck("Traceback" in err.getvalue() and "ZeroDivisionError" in err.getvalue(), "o traceback vai para o stderr")
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = m.main(argv + ["--json"])
+    r = json.loads(out.getvalue())
+    ck(code == 1 and r["exit_code"] == 1 and r["error_type"] == "ZeroDivisionError" and r["by_role"] and r["cohorts"] and r["system"]["approved_beads"] == 3,
+       f"--json: o que já foi calculado (by_role, cohorts, system) sobrevive, com error e exit 1; achei chaves {sorted(r)}")
+
+
+def t_lows(m, W):
+    """Achados não-bloqueantes do gate, mesma família (desconhecido lido como valor): claim sem resultado chamado de 'verificado';
+    veredito sem dry_run lido como ensaio; resposta sem timestamp caindo calada no overhead de partida e em todas as janelas."""
+    w, _ = setup(m, W)
+    P = w["projects"]
+    # (1) claim SEM resultado visível: conta, mas a linha de atribuição não o chama de 'verificado'
+    recs = [beacon("gastown.dog-8", D + "16:00:00Z")] + asst("n1", D + "16:00:10Z", cmd="bd update ga-nnn1 --claim", tid="tu_nn") + asst("n2", D + "16:01:00Z")
+    write_session(P, "-proj", "noresult2", recs)
+    with open(w["gate"], "a") as fh:
+        fh.write(json.dumps({"ts": D + "16:10:00Z", "event": "dispatcher_complete", "branch": "feat/ga-nnn1", "bead": "ga-nnn1", "rig": "gascity", "result": "PASS", "dry_run": "0"}) + "\n")
+    harvest(m, w)
+    code, r = report(m, w)
+    ck(r["coverage"]["attribution"] == dict(claim_verified=2, claim_no_result=1, ref=1),
+       f"A e B por claim verificado, ga-nnn1 por claim SEM resultado, wa-zzz1 por referência; achei {r['coverage'].get('attribution')}")
+    code, txt = report_text(m, w)
+    ck("1 por claim SEM resultado visível" in txt and "2 por `bd update --claim` com resultado verificado" in txt, f"texto da atribuição: {[ln for ln in txt.splitlines() if 'atribuição' in ln]}")
+    # (2) veredito do gate SEM dry_run (ausente ou null): não sei se foi real ou ensaio — conta como ilegível, não some como ensaio
+    g3 = W / "g3.jsonl"
+    g3.write_text("\n".join(json.dumps(e) for e in [
+        {"ts": D + "11:00:00Z", "event": "dispatcher_complete", "branch": "feat/ga-nd1", "bead": "ga-nd1", "result": "PASS"},
+        {"ts": D + "11:01:00Z", "event": "dispatcher_complete", "branch": "feat/ga-nd2", "bead": "ga-nd2", "result": "FAIL", "dry_run": None},
+        GATE_EVENTS[1], GATE_EVENTS[5]]) + "\n")                       # [1] = real PASS; [5] = ensaio (dry_run "1"): fora, sem ser 'ilegível'
+    runs, _bridge, bad = m.load_gate(g3)
+    ck([x["bead"] for x in runs] == ["ga-aaa1"] and bad == 2, f"load_gate: só o real entra; sem dry_run e dry_run null = 2 ilegíveis; o ensaio fica de fora; achei {[x['bead'] for x in runs]} bad={bad}")
+    # (3) resposta SEM timestamp: contada na colheita, avisada, e o relatório diz que ela está em todas as janelas
+    ut = asst("nt1", D + "10:00:10Z")
+    for x in ut:
+        del x["timestamp"]
+    write_session(P, "-proj", "untimed_msg", [beacon("gastown.dog-6", D + "10:00:00Z")] + ut + asst("nt2", D + "10:01:00Z"))
+    out = harvest(m, w)
+    ck(ledger_rows(m, w)["untimed_msg"]["msgs_untimed"] == 1, f"resposta sem timestamp é contada no registro; achei {ledger_rows(m, w)['untimed_msg'].get('msgs_untimed')}")
+    ck("1 respostas sem timestamp" in out, f"a colheita avisa: {out}")
+    code, r = report(m, w)
+    ck(r["undated_msgs"] == 1, f"o relatório conta as respostas de dia desconhecido; achei {r.get('undated_msgs')}")
+    code, txt = report_text(m, w)
+    ck("1 respostas SEM timestamp" in txt and "TODAS as janelas" in txt, "o texto do relatório avisa que elas entram em todas as janelas")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
@@ -600,6 +788,27 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "veredito sem bead entra nas contas": ('if not r.get("bead"):', "if False:", t_sweep_unknowns),
     "claim sem timestamp some calado": ('untimed = sum(1 for c in claims if c["ok"] is not False and not c["ts"])', "untimed = 0", t_sweep_unknowns),
     "linha ilegível do ledger é descartada sem cópia": ("shutil.copy2(path, keep)", "pass", t_sweep_unknowns),
+    # ---- gate-fix 1 (ga-5c3msy): o terceiro estado "sem preço" nas seções 3-6, 1b, e o relatório que estoura
+    "bead com token sem preço vira soma parcial": ('    if p["unpriced"]:\n        return None\n    return p["build_usd"] + p["review_usd"] + p["pregate_usd"]',
+                                                   '    return p["build_usd"] + p["review_usd"] + p["pregate_usd"]', t_unpriced_report),
+    "coorte conta bead sem preço nas médias": ('        costed = [b for b in beads if bead_usd(per[b]) is not None]\n        unp = n - len(costed)',
+                                               '        costed = list(beads)\n        unp = n - len(costed)', t_unpriced_report),
+    "US$ por aprovada da coorte ignora bead n/p": ("        tot = None if unp else sum(bu) + sum(ru)", "        tot = sum(bu) + sum(ru)", t_unpriced_report),
+    "US$ por aprovada do sistema é o piso sem aviso": ("usd_per_approved=(None if unp_tok else per_sys)", "usd_per_approved=per_sys", t_unpriced_report),
+    "JSON por bead: parte do construtor sem preço vira 0": ('                            p["unp_build"] += tt * share', "                            pass", t_unpriced_report),
+    "JSON por bead: parte do revisor sem preço vira 0": ('                        p["unp_" + fld] += tt', "                        pass", t_unpriced_report),
+    "1b esquece os tokens sem preço que deixou de fora": ("            comp_unpriced += total_tokens(c)", "            comp_unpriced += 0", t_unpriced_report),
+    "CV conta bead sem preço como US$ 0": ("        tot = [bead_usd(per[b]) for b in priced]",
+                                           '        tot = [per[b]["build_usd"] + per[b]["review_usd"] + per[b]["pregate_usd"] for b in beads]', t_power_unpriced),
+    "CV sem guarda: média 0 vira nan e estoura": ("        cv = statistics.pstdev(tot) / mean if (len(priced) >= 20 and mean > 0) else None",
+                                                  '        cv = statistics.pstdev(tot) / mean if mean else float("nan")', t_power_unpriced),
+    "seção que estoura leva as prontas junto": ("    except Exception as e:  # noqa: BLE001 — qualquer seção pode estourar; as já prontas não podem ser jogadas fora",
+                                                "    except KeyboardInterrupt as e:  # noqa: BLE001", t_report_survives_crash),
+    # ---- gate-fix 1: os achados baixos da mesma família
+    "claim sem resultado conta como verificado": ('    n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)', "    n_noresult = 0", t_lows),
+    "veredito sem dry_run vira ensaio calado": ("                if dry is None:\n                    bad += 1", "                if False:\n                    bad += 1", t_lows),
+    "resposta sem timestamp some calada": ("            untimed_msgs += 1", "            untimed_msgs += 0", t_lows),
+    "dia desconhecido entra nas janelas sem aviso": ('    undated = sum(c["msgs"] for _s, day, _m, _e, c, _u in flat if day == "?")', "    undated = 0", t_lows),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -609,7 +818,11 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("janela por dia da mensagem", t_window_by_message_day), ("gate: 1ª rodada, coorte, US$/bead aprovada, dry_run fora", t_gate_cohort), ("aprovada em qualquer rodada + poder do A/B", t_approved_and_power), ("teto de contexto: excesso exato + registro antigo reescaneado", t_context_caps),
          ("ledger: idempotente, cresce, sobrevive ao reaper, mais completo vence", t_ledger), ("lock de instância única", t_lock),
          ("terceiro estado: SEM DADO", t_no_data), ("backfill-s3: erro≠vazio, falha contada, disco, escopo", t_backfill),
-         ("varredura do 3º estado: ocioso sem preço, revisor por sessão, veredito sem bead, claim sem timestamp, ledger ilegível", t_sweep_unknowns)]
+         ("varredura do 3º estado: ocioso sem preço, revisor por sessão, veredito sem bead, claim sem timestamp, ledger ilegível", t_sweep_unknowns),
+         ("3º estado nas seções 3-5 e 1b: bead/coorte/sistema com token sem preço = n/p ou piso rotulado, nunca 0", t_unpriced_report),
+         ("seção 6: bead sem preço fora do CV (quantos), todos sem preço = n/p e não estoura", t_power_unpriced),
+         ("seção que estoura não joga fora as prontas (texto e --json, exit 1)", t_report_survives_crash),
+         ("claim sem resultado ≠ verificado, veredito sem dry_run ≠ ensaio, resposta sem timestamp avisada", t_lows)]
 
 
 def run(name, fn, m):
@@ -649,7 +862,8 @@ def main():
         W = Path(tempfile.mkdtemp(prefix="btm-mut."))
         try:
             try:
-                case(mut, W)
+                with contextlib.redirect_stderr(io.StringIO()):     # um mutante que estoura o relatório imprime o traceback dele: ruído, não resultado
+                    case(mut, W)
                 print(f"  ✗ mutante '{name}' SOBREVIVEU (o caso passou com o script quebrado)")
                 FAIL += 1
             except (Fail, Exception):  # noqa: BLE001

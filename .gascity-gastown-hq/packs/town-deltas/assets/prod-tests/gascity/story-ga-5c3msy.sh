@@ -12,7 +12,9 @@
 #   3. selftests   — the three selftests, run against the deployed code (all use throwaway dirs); a selftest that
 #                    reports zero checks is a failure, not a pass;
 #   4. live data   — the meter reads the REAL ledger and reports non-empty, priced numbers, and a report never
-#                    writes to the ledger (a report that mutates what it measures would corrupt every later A/B);
+#                    writes to the ledger (a report that mutates what it measures would corrupt every later A/B); and a
+#                    second run WITHOUT --assume-price proves the unpriced path: it finishes, and an unknown never reads
+#                    as a number (cohort/system US$-per-approved null, floor in its own field, no CV from < 20 priced beads);
 #   5. the order   — `gc order list` resolves it (CLI-side scan: proves the file parses, NOT that the controller loaded
 #                    it) and `gc order history` says whether the controller has fired it (the only proof it did);
 #                    once it has fired, its own log must show a recent rc=0 run;
@@ -140,6 +142,24 @@ jq -e '.exit_code == 0 and (.sessions > 0) and (.total_usd_priced > 0) and ((.by
 mt_after="$(stat -f %m "$LEDGER" 2>/dev/null || stat -c %Y "$LEDGER" 2>/dev/null)"
 [[ "$mt_before" == "$mt_after" ]] || fail "'report' changed the ledger (mtime $mt_before -> $mt_after) — a report must be read-only"
 log "live ledger: $rows rows; report since $since: $(jq -r '"\(.sessions) sessions, US$ \(.total_usd_priced | floor) priced"' "$rep") ✓ (ledger untouched)"
+
+# The same report WITHOUT --assume-price. The live ledger holds tokens of models the price table does not cover, so THIS is the run
+# that exercises the third state (n/p / floor); the run above prices everything it can and never touches that path. It must finish
+# (a report that hit an unpriced model once crashed and threw away every section) and must never show a floor as a measurement:
+# no US$-per-approved figure for a cohort that holds an unpriced bead, system usd_per_approved null while unpriced tokens exist
+# (the floor lives in its own field), and no cost CV computed from fewer than 20 priced beads. Invariants, not numbers: the live
+# figures drift every harvest.
+rep2="$TMPROOT/report-noassume.json"
+_to 200 python3 "$METER" report --from "$since" --json > "$rep2" 2> "$TMPROOT/report2.err"; rrc2=$?
+[[ "$rrc2" -eq 0 ]] || { head -c 400 "$TMPROOT/report2.err" >&2; fail "meter report --from $since WITHOUT --assume-price exited $rrc2 — an unpriced model must read as n/p, not crash the report"; }
+jq -e '.exit_code == 0
+       and (.system | has("usd_per_approved") and has("usd_per_approved_floor") and has("unpriced_tokens"))
+       and (if .unpriced_tokens > 0 then (.system.usd_per_approved == null and (.system.usd_per_approved_floor | type == "number")) else true end)
+       and ([.cohorts[] | select(.beads_unpriced > 0 and (.usd_per_approved != null or .usd_per_first_pass != null))] | length == 0)
+       and ([.power[]? | select(.beads_priced < 20 and .cv_usd_per_bead != null)] | length == 0)' "$rep2" >/dev/null 2>&1 \
+  || fail "report WITHOUT --assume-price shows an unknown as a number (system/cohorts/power): $(jq -c '{exit_code, unpriced_tokens, system, unpriced_cohorts_with_usd: [.cohorts[]? | select(.beads_unpriced > 0 and (.usd_per_approved != null or .usd_per_first_pass != null)) | .cohort]}' "$rep2" 2>/dev/null | head -c 500)"
+sys_s="$(jq -r 'if .system.usd_per_approved == null then "n/p, floor US$ \((.system.usd_per_approved_floor // 0) | floor)" else "US$ \(.system.usd_per_approved | floor)" end' "$rep2" 2>/dev/null)"
+log "live ledger WITHOUT --assume-price: finished; $(jq -r '(.unpriced_tokens / 1e6) | floor' "$rep2" 2>/dev/null) Mtok unpriced; per approved bead: ${sys_s:-?} ✓ (a floor is never shown as a measurement)"
 
 # ── 5. the order: resolves, has the CONTROLLER fired it, and is its harvest healthy ──
 orders="$(_to 60 gc --city "$CITY" order list --json 2>/dev/null)" || fail "gc order list failed (or timed out)"

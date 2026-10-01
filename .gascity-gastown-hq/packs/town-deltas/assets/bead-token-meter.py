@@ -32,6 +32,10 @@ Como uma sessão vira bead (tentativas, em ordem de confiança):
 Três estados, nunca colapsados: claim com resultado ok / claim que FALHOU (não conta) / claim sem resultado visível (conta e é
 sinalizado); modelo SEM preço = tokens contados, US$ "não precificado" (nunca US$ 0); bead sem sessão de construtor no ledger =
 "construtor não medido" (nunca custo zero).
+Isso vale em TODAS as seções do relatório, não só na 1: um bead com QUALQUER token de modelo sem preço (construtor, revisor ou
+pré-revisão) tem custo n/p — a soma dos tokens que TÊM preço é um piso, não o custo, e nunca entra numa média, num CV nem num
+"US$ por bead aprovada" como se fosse medida. Coorte com bead assim: colunas US$ só sobre os beads com preço (quantos, impresso) e
+razões por aprovada = n/p. Sistema inteiro com token sem preço = PISO rotulado, e o JSON dá `usd_per_approved` null + o piso à parte.
 
 Exemplos:
     bead-token-meter.py harvest
@@ -54,6 +58,7 @@ import statistics
 import sys
 import tempfile
 import time
+import traceback
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -352,10 +357,13 @@ def scan_session(main):
     days = defaultdict(lambda: defaultdict(lambda: {k: 0 for k in USAGE_KEYS}))   # dia UTC da MENSAGEM x modelo|effort (janela exata)
     days_ctx = defaultdict(lambda: defaultdict(lambda: {str(c): 0 for c in CTX_CAPS}))   # dia -> modelo -> teto -> tokens de cache-read ACIMA do teto
     synthetic = 0
+    untimed_msgs = 0
     for ts, mid, m in ordered:
         if m["model"] == "<synthetic>":
             synthetic += 1                           # resposta sintética do cliente (erro/placeholder): não é chamada de modelo
             continue
+        if not ts:
+            untimed_msgs += 1                        # sem timestamp não dá para posicioná-la entre os claims: cai no `_pre` (overhead de partida) e no dia "?"; CONTADA, não calada
         key = "_pre"
         for c in live:
             if c["ts"] <= ts:
@@ -377,7 +385,7 @@ def scan_session(main):
     return dict(v=SCHEMA, sid=sid, alias=alias or None, role=role, project=main.parent.name,
                 cwd=cwd, first_ts=min(stamps) if stamps else None, last_ts=max(stamps) if stamps else None,
                 size=size, mtime_ns=mtime_ns, fp=fingerprint(main), msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
-                bad_lines=bad, no_usage=len(no_usage), claims_untimed=untimed, lines=nlines, branches=branches,
+                bad_lines=bad, no_usage=len(no_usage), claims_untimed=untimed, msgs_untimed=untimed_msgs, lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
                 refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed,
                 buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
@@ -452,7 +460,7 @@ def cmd_harvest(a):
     rows, bad_ledger = load_ledger(path)
     preserve_unreadable(path, bad_ledger)
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
-    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = 0
+    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = 0
     for proj in PROJECTS:
         for f in sorted(proj.glob("*/*.jsonl")):
             try:
@@ -473,6 +481,7 @@ def cmd_harvest(a):
             bad_lines += rec["bad_lines"]
             no_usage += rec["no_usage"]
             untimed += rec["claims_untimed"]
+            untimed_msgs += rec["msgs_untimed"]
             if rec["lines"] >= 30:
                 big += 1
                 if rec["msgs"] == 0:
@@ -491,6 +500,9 @@ def cmd_harvest(a):
     if untimed:
         print(f"⚠ {untimed} claims sem timestamp nas sessões escaneadas: não dá para posicioná-los entre as mensagens, então ficam FORA da "
               f"atribuição por claim (worker de pool cai na referência mais citada — menos firme; crew fica sem bead)")
+    if untimed_msgs:
+        print(f"⚠ {untimed_msgs} respostas sem timestamp nas sessões escaneadas: não dá para posicioná-las entre os claims (entram no overhead de "
+              f"partida da sessão) nem num dia — o `report` as conta em TODAS as janelas e avisa")
     # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
     # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
     if suspect >= 2 and suspect * 4 >= big:
@@ -614,7 +626,8 @@ def cmd_backfill_s3(a):
 
 # ----------------------------------------------------------------------------- log do gate
 def load_gate(path=None):
-    """-> (runs reais PASS/FAIL ordenadas, ponte ramo->bead, linhas ilegíveis). dry_run fora."""
+    """-> (runs reais PASS/FAIL ordenadas, ponte ramo->bead, linhas ilegíveis). dry_run verdadeiro fora; veredito SEM dry_run (ou null) e
+    veredito sem bead contam como ilegíveis: não dá para saber se é real, então nem entra nem some calado."""
     path = Path(path or GATE_LOG)
     runs, bridge, bad = [], {}, 0
     if not path.exists():
@@ -628,8 +641,13 @@ def load_gate(path=None):
                 continue
             if r.get("branch") and r.get("bead"):
                 bridge[r["branch"]] = r["bead"]
-            if r.get("event") == "dispatcher_complete" and str(r.get("dry_run")) in ("0", "false", "False", "") \
-                    and r.get("result") in ("PASS", "FAIL"):
+            if r.get("event") == "dispatcher_complete" and r.get("result") in ("PASS", "FAIL"):
+                dry = r.get("dry_run")
+                if dry is None:
+                    bad += 1          # sem o campo (ou null) não sei se foi rodada real ou ensaio: nem entra nem some calado — conta como ilegível
+                    continue
+                if str(dry) not in ("0", "false", "False", ""):
+                    continue          # ensaio (dry_run verdadeiro): fora
                 if not r.get("bead"):
                     bad += 1          # um veredito sem bead não entra em nenhuma conta por bead: conta como ilegível, não derruba o relatório
                     continue
@@ -662,10 +680,20 @@ def fmt_usd(x, unpriced=False):
 
 
 def cmd_report(a):
-    """Texto por padrão; --json imprime SÓ o JSON (o texto das seções vai para o descarte)."""
+    """Texto por padrão; --json imprime SÓ o JSON (o texto das seções vai para o descarte).
+    O relatório é montado seção a seção num buffer; se UMA seção estoura, o que as anteriores já calcularam NÃO pode ir junto: o texto
+    pronto é impresso, o traceback vai para o stderr, a saída diz que o relatório ficou incompleto e o exit é 1 (nunca 0)."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        code, result = _report(a)
+    partial = {}                  # _report preenche no lugar: o que já foi calculado sobrevive a uma seção que estoura
+    try:
+        with contextlib.redirect_stdout(buf):
+            code, result = _report(a, partial)
+    except Exception as e:  # noqa: BLE001 — qualquer seção pode estourar; as já prontas não podem ser jogadas fora
+        sys.stderr.write(traceback.format_exc())
+        code = 1
+        result = dict(partial, error=f"o relatório estourou numa seção: {type(e).__name__}: {e}", error_type=type(e).__name__)
+        buf.write(f"\n⚠ RELATÓRIO INCOMPLETO — uma seção estourou ({type(e).__name__}: {e}). As seções acima são o que foi calculado até aqui; "
+                  f"as seguintes NÃO foram geradas (traceback no stderr). exit 1\n")
     if a.json:
         print(json.dumps(dict(result, exit_code=code), indent=1, default=str))
     else:
@@ -673,7 +701,7 @@ def cmd_report(a):
     return code
 
 
-def _report(a):
+def _report(a, result):
     rows, bad_ledger = load_ledger(a.ledger)
     if not rows:
         print(f"SEM DADO: ledger vazio ou ausente ({a.ledger or LEDGER}). Rode `harvest` primeiro — vazio não é 'custo zero'.")
@@ -688,12 +716,17 @@ def _report(a):
         return 2, {"error": "sem sessões na janela", "from_day": since_day}
     oldest = min(parse_ts(s["first_ts"]) for s in rows.values() if s.get("first_ts"))
     gate_runs, bridge, gate_bad = load_gate(a.gate_log)
-    result = {"from_day": since_day, "ledger_oldest": oldest.isoformat(), "sessions": len(sess)}
+    result.update(from_day=since_day, ledger_oldest=oldest.isoformat(), sessions=len(sess))
     pool_floor = min((s["first_ts"] for s in rows.values() if s["role"] in POOL_BUILDERS and s.get("first_ts")), default=None)
     if pool_floor and since_day <= pool_floor[:10]:
         print(f"⚠ JANELA INCOMPLETA: começa em {since_day} mas o 1º transcrito de pool no ledger é de {pool_floor[:16]}Z — os dias antes de "
               f"{(parse_ts(pool_floor) + dt.timedelta(days=1)).strftime('%Y-%m-%d')} subestimam o gasto de pool/revisor (o reaper apaga transcrito "
               f"morto após 24h). Rode `backfill-s3 --since {since_day}` ou comece a janela depois.\n")
+    # resposta sem timestamp vive no dia "?", que `flatten` não consegue comparar com a janela: entra em TODAS (o dia dela é desconhecido)
+    undated = sum(c["msgs"] for _s, day, _m, _e, c, _u in flat if day == "?")
+    result["undated_msgs"] = undated
+    if undated:
+        print(f"⚠ {undated} respostas SEM timestamp (dia desconhecido) estão contadas em TODAS as janelas — o gasto delas não é desta janela com certeza.\n")
 
     # ---- 1. gasto por papel x modelo x effort
     agg = defaultdict(lambda: dict({k: 0 for k in USAGE_KEYS}, usd=0.0, unpriced=0, sessions=set()))
@@ -736,9 +769,11 @@ def _report(a):
 
     # ---- 1b. composição do custo: ONDE o gasto está (decide qual alavanca vale testar)
     comp = defaultdict(lambda: dict(parts=[0.0, 0.0, 0.0, 0.0], msgs=0, ctx=0, out=0, think=0, sessions=set()))
+    comp_unpriced = 0            # tokens de modelo SEM preço: ficam fora de 1b e 1c (um papel só com esse modelo nem aparece)
     for s, _day, model, effort, c, usd in flat:
         pr = usd_parts(model, c)
         if pr is None:
+            comp_unpriced += total_tokens(c)
             continue
         g = comp[s["role"]]
         for i in range(4):
@@ -763,6 +798,9 @@ def _report(a):
                               pct_cache_read=round(pct[3], 2), msgs_per_session=round(g["msgs"] / ns, 2),
                               ctx_per_msg=round(g["ctx"] / g["msgs"]), output_per_msg=round(g["out"] / g["msgs"]))
     result["composition"] = comp_out
+    result["composition_unpriced_tokens"] = comp_unpriced
+    if comp_unpriced:
+        print(f"   ⚠ + {comp_unpriced / 1e6:.2f} Mtok de modelo SEM preço ficam FORA de 1b e 1c (papel só com esse modelo nem aparece; os US$ aqui são piso) — use --assume-price")
 
     # ---- 1c. teto de contexto: quanto da leitura de cache vive ACIMA de um teto (limite superior da economia de uma janela de compactação menor)
     cap_rows = defaultdict(lambda: dict(total_read_usd=0.0, above={str(c): 0.0 for c in CTX_CAPS}, covered=0, sessions=0))
@@ -793,6 +831,8 @@ def _report(a):
         cap_out[role] = dict(read_usd=round(g["total_read_usd"], 2), role_usd=round(role_tot, 2),
                              above={str(c): round(g["above"][str(c)], 2) for c in CTX_CAPS})
     result["context_caps"] = cap_out
+    if comp_unpriced:
+        print("   ⚠ a leitura de cache de modelo SEM preço (ver a nota de 1b) não entra em 1c: os US$ acima são piso, não o teto completo.")
 
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
     idle = defaultdict(lambda: [0, 0.0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço
@@ -822,9 +862,31 @@ def _report(a):
     return report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result)
 
 
+def bead_usd(p):
+    """US$ de UM bead (construtor + revisão + pré-revisão), ou None se QUALQUER parte dele tem token de modelo SEM preço.
+    A soma dos tokens que têm preço é um PISO, não o custo: devolvê-la como número faria o bead parecer mais barato do que é."""
+    if p["unpriced"]:
+        return None
+    return p["build_usd"] + p["review_usd"] + p["pregate_usd"]
+
+
+def part_usd(p, fld):
+    """US$ de uma parte do bead (fld = build | review | pregate), ou None se aquela parte tem token sem preço."""
+    return None if p["unp_" + fld] else p[fld + "_usd"]
+
+
+def rnd(x, nd):
+    return None if x is None else round(x, nd)
+
+
+def cell(x, w, nd=3):
+    """Número com `nd` casas alinhado em `w` colunas, ou `n/p` (US$ desconhecido: nunca 0.000)."""
+    return f"{'n/p' if x is None else format(x, f'.{nd}f'):>{w}s}"
+
+
 def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result):
     per = defaultdict(lambda: dict(build_usd=0.0, build_tok=0, review_usd=0.0, review_tok=0, pregate_usd=0.0, pregate_tok=0,
-                                   unpriced=0, builders=[], first_builder=None))
+                                   unpriced=0, unp_build=0, unp_review=0, unp_pregate=0, builders=[], first_builder=None))
     unmapped_review = set()          # SESSÕES de revisor sem ramo conhecido (um set: uma sessão com 2 modelos/efforts é UMA, não duas)
     all_sess = list(rows.values())         # o custo do bead conta mesmo que a sessão tenha começado ANTES da janela
     for s in all_sess:
@@ -843,6 +905,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                         p = per[b]
                         if usd is None:
                             p["unpriced"] += tt * share
+                            p["unp_build"] += tt * share
                         else:
                             p["build_usd"] += usd * share
                         p["build_tok"] += tt * share
@@ -855,6 +918,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                     fld = "pregate" if role == "pregate-review" else "review"
                     if usd is None:
                         p["unpriced"] += tt
+                        p["unp_" + fld] += tt
                     else:
                         p[fld + "_usd"] += usd
                     p[fld + "_tok"] += tt
@@ -863,6 +927,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 per[b]["builders"].append((s["first_ts"] or "", role, s["alias"]))
     # arm do construtor = 1ª sessão de construtor do bead (intenção de tratar): papel + effort dominante dessa sessão
     first_session = {}
+    first_ok = {}                      # bead -> `ok` do claim que o atribuiu (True = resultado visível; None = transcrito cortado, ou via=ref)
     for s in all_sess:
         if s["role"] in BUILDERS:
             eff = Counter()
@@ -875,6 +940,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 cur = first_session.get(b)
                 if cur is None or (s["first_ts"] or "") < cur[0]:
                     first_session[b] = (s["first_ts"] or "", s["role"], top, c.get("via") or "claim")
+                    first_ok[b] = c.get("ok")
     first_run, ever_pass, nruns = {}, set(), Counter()
     for r in gate_runs:
         first_run.setdefault(r["bead"], r)
@@ -908,8 +974,12 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
     result["coverage"] = dict(beads_in_window=len(in_win), measured=len(measured), unmeasured_by_reason=dict(why),
                               unmapped_reviewer_sessions=len(unmapped_review), gate_unreadable_lines=gate_bad)
     n_ref = sum(1 for b in measured if first_session[b][3] == "ref")
-    print(f"   atribuição dos {len(measured)} medidos: {len(measured) - n_ref} por `bd update --claim` verificado, {n_ref} por referência "
-          f"a `bd show|comment|heartbeat|close` (worker com bead já atribuído — menos firme)")
+    n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)   # claim sem resultado visível: conta, mas não é "verificado"
+    n_claim = len(measured) - n_ref - n_noresult
+    print(f"   atribuição dos {len(measured)} medidos: {n_claim} por `bd update --claim` com resultado verificado, {n_noresult} por claim SEM "
+          f"resultado visível (transcrito cortado — menos firme), {n_ref} por referência a `bd show|comment|heartbeat|close` (worker com "
+          f"bead já atribuído — menos firme)")
+    result["coverage"]["attribution"] = dict(claim_verified=n_claim, claim_no_result=n_noresult, ref=n_ref)
     cohorts = defaultdict(list)
     for b in measured:
         _, role, key, _ = first_session[b]
@@ -923,40 +993,59 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
         n = len(beads)
         k = sum(1 for b in beads if first_run[b]["result"] == "PASS")
         lo, hi = wilson(k, n)
-        bu = [per[b]["build_usd"] for b in beads]
-        ru = [per[b]["review_usd"] + per[b]["pregate_usd"] for b in beads]
-        tt = [(per[b]["build_tok"] + per[b]["review_tok"] + per[b]["pregate_tok"]) for b in beads]
-        unp = sum(1 for b in beads if per[b]["unpriced"])
-        tot = sum(bu) + sum(ru)
-        per_ok = tot / k if k else None
+        # só um bead com TODAS as partes precificadas tem custo; os demais são n/p (a soma parcial deles é um piso e NÃO entra em média nenhuma)
+        costed = [b for b in beads if bead_usd(per[b]) is not None]
+        unp = n - len(costed)
+        bu = [per[b]["build_usd"] for b in costed]
+        ru = [per[b]["review_usd"] + per[b]["pregate_usd"] for b in costed]
+        tt = [(per[b]["build_tok"] + per[b]["review_tok"] + per[b]["pregate_tok"]) for b in beads]   # tokens são exatos: valem para todos os beads
+        mbu = statistics.mean(bu) if bu else None
+        mru = statistics.mean(ru) if ru else None
+        # razão "custo ÷ aprovadas": o numerador tem que cobrir os MESMOS beads que o denominador conta — com um bead n/p na coorte, é n/p
+        tot = None if unp else sum(bu) + sum(ru)
+        per_ok = tot / k if (tot is not None and k) else None
         n_ever = sum(1 for b in beads if b in ever_pass)
-        per_ever = tot / n_ever if n_ever else None
+        per_ever = tot / n_ever if (tot is not None and n_ever) else None
         label = f"{coh[0]} {coh[1].replace('claude-', '')} {coh[2]}"
+        ok_s = "n/p" if unp else ("n/a (0 aprov.)" if per_ok is None else f"{per_ok:.3f}")
+        ever_s = "n/p" if unp else ("n/a" if per_ever is None else f"{per_ever:.3f}")
+        tag = ""
+        if unp:
+            tag = (f"  [{unp} de {n} beads com token SEM preço: "
+                   + ("nenhum tem custo (n/p)" if not costed else f"colunas US$ só sobre os {len(costed)} com preço")
+                   + "; US$/aprovada n/p — use --assume-price]")
         print(f"{label:40s} {n:5d} {k:4d}/{n:<4d} {100 * k / n:6.1f}% [{100 * lo:3.0f},{100 * hi:3.0f}] "
-              f"{statistics.mean(bu):11.3f} {statistics.mean(ru):9.3f} {statistics.mean(bu) + statistics.mean(ru):9.3f} "
-              f"{statistics.mean(tt) / 1e6:9.2f} {('n/a (0 aprov.)' if per_ok is None else f'{per_ok:.3f}'):>16s} "
-              f"{n_ever:5d}/{n:<5d} {('n/a' if per_ever is None else f'{per_ever:.3f}'):>13s}"
-              + (f"  [{unp} bead(s) com token SEM preço]" if unp else ""))
-        out_c.append(dict(cohort=label, beads=n, first_pass=k, rate=k / n, ci95=[lo, hi], build_usd_mean=statistics.mean(bu),
-                          review_usd_mean=statistics.mean(ru), tokens_mean=statistics.mean(tt), usd_per_first_pass=per_ok,
+              f"{cell(mbu, 11)} {cell(mru, 9)} {cell(None if mbu is None else mbu + mru, 9)} "
+              f"{statistics.mean(tt) / 1e6:9.2f} {ok_s:>16s} {n_ever:5d}/{n:<5d} {ever_s:>13s}" + tag)
+        out_c.append(dict(cohort=label, beads=n, first_pass=k, rate=k / n, ci95=[lo, hi], build_usd_mean=mbu,
+                          review_usd_mean=mru, tokens_mean=statistics.mean(tt), usd_per_first_pass=per_ok,
                           ever_pass=n_ever, usd_per_approved=per_ever,
-                          usd_total_sd=(statistics.pstdev([a + b for a, b in zip(bu, ru)]) if n > 1 else None),
-                          build_usd_median=statistics.median(bu), beads_unpriced=unp))
+                          usd_total_sd=(statistics.pstdev([a + b for a, b in zip(bu, ru)]) if len(bu) > 1 else None),
+                          build_usd_median=(statistics.median(bu) if bu else None), beads_unpriced=unp, beads_priced=len(costed)))
     result["cohorts"] = out_c
     result["beads"] = {b: dict(role=first_session[b][1], arm=first_session[b][2], via=first_session[b][3],
                                first_gate=first_run[b]["result"], ever_pass=b in ever_pass, gate_runs=nruns[b],
-                               build_usd=round(per[b]["build_usd"], 6), build_tokens=round(per[b]["build_tok"]),
-                               review_usd=round(per[b]["review_usd"], 6), review_tokens=round(per[b]["review_tok"]),
-                               pregate_usd=round(per[b]["pregate_usd"], 6), unpriced_tokens=round(per[b]["unpriced"]))
+                               build_usd=rnd(part_usd(per[b], "build"), 6), build_tokens=round(per[b]["build_tok"]),
+                               review_usd=rnd(part_usd(per[b], "review"), 6), review_tokens=round(per[b]["review_tok"]),
+                               pregate_usd=rnd(part_usd(per[b], "pregate"), 6), unpriced_tokens=round(per[b]["unpriced"]))
                        for b in measured}
     # sistema inteiro: US$ da janela / beads aprovadas na janela (não depende de nenhuma ponte sessão->bead)
     approved_win = {r["bead"] for r in gate_runs if r["result"] == "PASS" and r["_ts"] >= since}
-    sys_usd = result["total_usd_priced"]
-    print(f"\n== 5. SISTEMA INTEIRO (sem ponte sessão→bead): US$ {sys_usd:.2f} (todas as sessões, todos os papéis) ÷ "
-          f"{len(approved_win)} beads com PASS no gate na janela = " +
-          (f"US$ {sys_usd / len(approved_win):.2f} por bead aprovada" if approved_win else "n/a (nenhum PASS na janela)"))
+    n_ok = len(approved_win)
+    sys_usd = result["total_usd_priced"]            # só os tokens COM preço (seção 1)
+    unp_tok = result["unpriced_tokens"]             # os SEM preço ficam fora dessa soma: com eles, o número abaixo é um PISO
+    per_sys = sys_usd / n_ok if n_ok else None
+    floor = "≥ " if unp_tok else ""
+    head = (f"US$ {floor}{sys_usd:.2f} "
+            + (f"(PISO: só os tokens com preço; + {unp_tok / 1e6:.2f} Mtok de modelo SEM preço FORA da conta — o custo real é maior)"
+               if unp_tok else "(todas as sessões, todos os papéis)")
+            + (f" [inclui US$ {result['assumed_usd']:.2f} de preço ASSUMIDO]" if ASSUMED else ""))
+    tail = (f"US$ {floor}{per_sys:.2f} por bead aprovada" + (" (piso)" if unp_tok else "")) if n_ok else "n/a (nenhum PASS na janela)"
+    print(f"\n== 5. SISTEMA INTEIRO (sem ponte sessão→bead): {head} ÷ {n_ok} beads com PASS no gate na janela = {tail}")
     print("   inclui produto (LLM de WhatsApp etc.), crews, Mayor, revisores, refino e spawns ociosos — é o teto da métrica-norte.")
-    result["system"] = dict(approved_beads=len(approved_win), usd_per_approved=(sys_usd / len(approved_win) if approved_win else None))
+    # com token sem preço o número completo NÃO existe: usd_per_approved é null e o piso vai em campo próprio (nunca o piso com cara de medida)
+    result["system"] = dict(approved_beads=n_ok, usd_per_approved=(None if unp_tok else per_sys), usd_per_approved_floor=per_sys,
+                            unpriced_tokens=unp_tok, usd_complete=not unp_tok)
     result["power"] = power_section(first_session, first_run, per, ever_pass, measured)
     print("\nLeitura: 'aprovada' = 1ª rodada real do gate (PASS) por coorte; custo de rework (sessões extras do mesmo bead) entra no "
           "build$/bead. A coorte atribui ao braço da 1ª sessão — intenção de tratar.")
@@ -984,22 +1073,28 @@ def power_section(first_session, first_run, per, ever_pass, measured):
         if len(beads) < 20:
             print(f"{role:10s} {len(beads):6d}   (menos de 20 beads medidos: sem poder estatístico para estimar nada)")
             continue
-        tot = [per[b]["build_usd"] + per[b]["review_usd"] + per[b]["pregate_usd"] for b in beads]
-        mean = statistics.mean(tot)
-        cv = statistics.pstdev(tot) / mean if mean else float("nan")
+        # o CV é do US$ por bead, e só um bead com TODAS as partes precificadas tem US$ (o resto é n/p, não "US$ 0"): bead sem preço fica
+        # FORA da média e do desvio, e quantos ficaram fora é impresso. Sem >= 20 beads com preço e média > 0 o CV é n/p — nunca nan.
+        priced = [b for b in beads if bead_usd(per[b]) is not None]
+        tot = [bead_usd(per[b]) for b in priced]
+        mean = statistics.mean(tot) if tot else 0.0
+        cv = statistics.pstdev(tot) / mean if (len(priced) >= 20 and mean > 0) else None
         ts = sorted(first_run[b]["_ts"] for b in beads)
         span = max((ts[-1] - ts[0]).total_seconds() / 86400, 1.0)
         rate = len(beads) / span
         p = sum(1 for b in beads if first_run[b]["result"] == "PASS") / len(beads)
-        nm = [n_per_arm_mean(cv, d) for d in (0.10, 0.20, 0.30)]
+        nm = [n_per_arm_mean(cv, d) for d in (0.10, 0.20, 0.30)] if cv is not None else None
         npp = [n_per_arm_prop(p, d) for d in (0.10, 0.05, 0.03)]
         days = lambda n: 2 * n / rate
-        print(f"{role:10s} {len(beads):6d} {rate:9.1f} {cv:11.2f} {100 * p:8.0f}%   {nm[0]:6.0f} ({days(nm[0]):4.0f}d) / {nm[1]:5.0f} ({days(nm[1]):3.0f}d) / {nm[2]:5.0f} ({days(nm[2]):3.0f}d)"
-              f"   |   {npp[0]:5.0f} ({days(npp[0]):3.0f}d) / {npp[1]:5.0f} ({days(npp[1]):4.0f}d) / {npp[2]:6.0f} ({days(npp[2]):4.0f}d)")
-        out[role] = dict(beads=len(beads), beads_per_day=round(rate, 2), cv_usd_per_bead=round(cv, 3), first_pass=round(p, 3),
-                         n_per_arm_cost=dict(zip(("-10%", "-20%", "-30%"), (round(x) for x in nm))),
+        cost_s = (f"{nm[0]:6.0f} ({days(nm[0]):4.0f}d) / {nm[1]:5.0f} ({days(nm[1]):3.0f}d) / {nm[2]:5.0f} ({days(nm[2]):3.0f}d)" if nm
+                  else f"{'n/p (US$ por bead desconhecido)':>44s}")
+        print(f"{role:10s} {len(beads):6d} {rate:9.1f} {cell(cv, 11, 2)} {100 * p:8.0f}%   {cost_s}"
+              f"   |   {npp[0]:5.0f} ({days(npp[0]):3.0f}d) / {npp[1]:5.0f} ({days(npp[1]):4.0f}d) / {npp[2]:6.0f} ({days(npp[2]):4.0f}d)"
+              + (f"   ⚠ CV só sobre {len(priced)} de {len(beads)} beads com preço (use --assume-price)" if len(priced) < len(beads) else ""))
+        out[role] = dict(beads=len(beads), beads_priced=len(priced), beads_per_day=round(rate, 2), cv_usd_per_bead=rnd(cv, 3), first_pass=round(p, 3),
+                         n_per_arm_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(x) for x in nm))) if nm else None),
                          n_per_arm_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(x) for x in npp))),
-                         days_cost=dict(zip(("-10%", "-20%", "-30%"), (round(days(x)) for x in nm))),
+                         days_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(days(x)) for x in nm))) if nm else None),
                          days_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(days(x)) for x in npp))))
     print("   Leitura: dias = 2 × n/braço ÷ beads/dia (todos os beads do papel entrando no A/B). Onde 'dias' passa de ~30, o experimento por bead não fecha\n"
           "   nesse efeito: use métrica por MENSAGEM/turno (milhares de amostras) como primária e a aprovação só como trava de segurança.")
@@ -1030,6 +1125,7 @@ def main(argv=None):
     b.add_argument("--min-free-gb", type=float, default=3.0); b.add_argument("--tmp-dir"); b.add_argument("--dry-run", action="store_true")
     sub.add_parser("prices")
     a = p.parse_args(argv)
+    ASSUMED.clear()               # main() é chamado várias vezes no mesmo processo (selftests): a suposição de preço de uma chamada não vaza para a seguinte
     for kv in getattr(a, "assume_price", []):
         old, _, new = kv.partition("=")
         if not old or new not in PRICES:
