@@ -6289,7 +6289,7 @@ unset _GATE_TASK_LIB
 
 # ── ga-atsahv: the DOC/TEST fast lane lives in ONE sibling lib (gate-fastlane.lib.sh) ────────────────────────
 # Unlike the task lib above, its absence is NOT fatal: the fast lane is only ever GRANTED, so without it every
-# diff simply takes the normal gate (today's behavior). Step 5 checks `declare -F gate_fastlane_decide` before
+# diff simply takes the normal gate (today's behavior). The lane decision (just before Step 6) checks `declare -F gate_fastlane_decide` before
 # calling, so a missing/unreadable lib reads as "normal lane", never as an unbound function under `set -e`.
 # `[ -r ]` + `|| true` for the same reasons as the sibling libs (ga-q4sadt: a bare `source` of a bad file kills
 # this daemon with no log line; a failed `cd` in the substitution is a live errexit trigger).
@@ -7521,6 +7521,27 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
           ;;
       esac
 
+      # ── ga-atsahv: the fast lane was granted for a DIFF — this is the last moment it can be asked about the commit that lands ──
+      # The lane was decided minutes ago on $BRANCH_SHA; the push below sends $CUR_BRANCH, which is whatever origin/$BRANCH is NOW,
+      # after the merge-time rebase and every git round-trip above (branches do move mid-run: see ga-l7mvtw). With zero
+      # reviewers the lane's decision is the ONLY control, so it is asked again here, about the very variable the push sends, with
+      # nothing executable between this block and the push. A clean yes needs the same diff — same files, same added lines, same
+      # tests — or the same change rebased/merged onto a newer main. Anything else (the tip moved, the content changed, the
+      # operator switched the lane off, or it could not be read) does NOT push: the run ends as failed_lane_revoked, which
+      # gate_finalize_run turns into a re-queue to the normal gate and never into a FAIL (the lane only ever grants).
+      # Non-retryable: the same push would be refused again. A normal-lane (reviewed) run never enters this block.
+      # SELFTEST-EXTRACT fastlane-push-confirm: BEGIN
+      if [ "${GATE_LANE:-normal}" = "fast" ]; then
+        GATE_LANE_CONFIRM_CODE=""; GATE_LANE_CONFIRM_WHY=""   # a missing/erroring confirm must not be explained by a previous round's cause
+        if ! { declare -F gate_fastlane_confirm >/dev/null 2>&1 && gate_fastlane_confirm git_rig "$CUR_MAIN" "$CUR_BRANCH"; }; then
+          err "  Fast lane revoked at the push (ga-atsahv, attempt $((MERGE_ATTEMPT+1))): ${GATE_LANE_CONFIRM_WHY:-the confirmation could not run (gate_fastlane_confirm missing or errored)} [${GATE_LANE_CONFIRM_CODE:-unknown}] — NOT pushing $CUR_BRANCH; the marker goes back to the normal gate."
+          GATE_LANE="normal"
+          MERGE_RESULT="failed_lane_revoked"
+          return 1
+        fi
+      fi
+      # SELFTEST-EXTRACT fastlane-push-confirm: END
+
       # FF push
       if git_rig push origin "${CUR_BRANCH}:refs/heads/$DEFAULT_BRANCH" 2>/dev/null; then
         git_rig fetch origin 2>/dev/null || warn "Post-FF-push fetch failed"
@@ -7641,6 +7662,7 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
          [ "$MERGE_RESULT" = "failed_merge_time_rebase" ] || \
          [ "$MERGE_RESULT" = "failed_sha_resolution" ] || \
          [ "$MERGE_RESULT" = "failed_branch_content_mismatch" ] || \
+         [ "$MERGE_RESULT" = "failed_lane_revoked" ] || \
          [ "$MERGE_RESULT" = "failed_bead_blocked_late" ]; then
         log "  Non-retryable failure ($MERGE_RESULT). Stopping retry loop."
         break
@@ -7664,6 +7686,44 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
       return 0
     fi
     # SELFTEST-EXTRACT bead-closed-late: END
+
+    # ── ga-atsahv: the fast lane was REVOKED at the push — a re-queue, never a FAIL ─────────────────────────────────
+    # do_merge_ff's last look at the commit about to land (gate_fastlane_confirm) found it is no longer the diff the lane checked,
+    # or could not tell. NOTHING was pushed. The lane only ever GRANTS, so this is not a verdict on the author's code: no
+    # GATE-FEEDBACK, no gate:needs-fix, no fix-attempt spent. The marker goes back to queued — the same mechanism as the
+    # dead-reviewer re-queue above, minus verdict beads (a fast run has none) — and the next sweep decides the lane afresh on
+    # the branch as it is NOW, usually the normal gate. It converges: with the branch and main unchanged the decision and this
+    # confirmation read the same diff and cannot disagree, so a second revocation needs the branch or main to have moved again.
+    # The revocation is recorded as a NORMAL decision (marker metadata + a gate_lane event, reason_code revoked-at-push), so
+    # neither the marker nor the weekly tally keeps saying "fast" for a run that merged nothing.
+    # SELFTEST-EXTRACT fastlane-lane-revoked: BEGIN
+    if [ "${MERGE_RESULT:-}" = "failed_lane_revoked" ]; then
+      GATE_LANE="normal"
+      GATE_LANE_REASON_CODE="revoked-at-push"
+      GATE_LANE_REASON="fast lane granted, then revoked at the push (${GATE_LANE_CONFIRM_CODE:-unknown}): ${GATE_LANE_CONFIRM_WHY:-no reason recorded} — nothing was pushed; the normal gate decides"
+      GATE_LANE_FILES=""
+      warn "ga-atsahv: ${GATE_LANE_REASON}"
+      if declare -F gate_fastlane_record >/dev/null 2>&1; then
+        gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "${GATE_LANE_WOULD_REVIEWERS:-0}" "$QG_LOG" || true
+      fi
+      _RQ_RC=0
+      gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?
+      _RQ_NOTE="re-queued for the normal gate"
+      gate_requeue_narrate "$_RQ_RC"
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state
+      if [ "$_RQ_SKIPPED" = "1" ]; then
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Fast lane revoked at the push (ga-atsahv): ${GATE_LANE_CONFIRM_WHY:-no reason recorded} — NOT a code FAIL, and nothing was pushed. The marker was NOT re-queued: ${_RQ_WHY}." 2>/dev/null || true
+      else
+        bd -C "$GC_CITY" comment "$MARKER_ID" "Fast lane revoked at the push (ga-atsahv): ${GATE_LANE_CONFIRM_WHY:-no reason recorded} — NOT a code FAIL, and nothing was pushed. Marker re-queued for the normal gate (the lane is decided afresh on the branch as it is now)." 2>/dev/null || true
+      fi
+      if [ "$GATE_RUN_ID" != "unknown" ]; then
+        bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run ended without a verdict (fast lane revoked at the push, ga-atsahv): marker $MARKER_ID ${_RQ_NOTE}. NOT a FAIL." 2>/dev/null || true
+        set_gate_status "$GATE_RUN_ID" "superseded"
+        bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — fast lane revoked at the push (ga-atsahv), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher." 2>/dev/null || true
+      fi
+      return 0
+    fi
+    # SELFTEST-EXTRACT fastlane-lane-revoked: END
 
     if [[ "$MERGE_RESULT" = failed* ]]; then
       # Merge failed despite all-PASS verdict — degrade to FAIL
@@ -15540,61 +15600,9 @@ esac
 
 log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 
-# ── ga-atsahv: DOC/TEST fast lane — "o gate só é necessário quando a gente vai colocar código novo em produção" ──
-# (Athos, 2026-09-30.) A diff whose EVERY file is DOC or TEST, whose added lines carry no CPF/phone/credential, and
-# whose new tests run green, skips the LLM reviewer and goes straight to gate_finalize_run (content coherence,
-# full-suite regression, merge-time rebase — all of the merge-side checks still apply). PROMPT/doctrine text and
-# every other file stay in the normal gate. The lane is only ever GRANTED, never a verdict: anything unreadable,
-# unclassifiable, failing or merely unverified leaves GATE_LANE=normal. See gate-fastlane.lib.sh for the rules.
-# The reviewer count a NORMAL run would have used is kept for the weekly tally of rounds saved.
-GATE_LANE="normal"; GATE_LANE_REASON=""; GATE_LANE_REASON_CODE=""; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
-GATE_LANE_WOULD_REVIEWERS="$REQUIRED_REVIEWERS"
-# SELFTEST-EXTRACT fastlane-decide: BEGIN
-if [ -z "${CHANGED_FILES:-}" ]; then
-  # the dispatcher's own file list is empty — it falls back to "" when its git call fails, and an error must not
-  # read as "this diff touches no gate-policy file": nothing to cross-check against, so the normal gate decides
-  GATE_LANE="normal"
-  GATE_LANE_REASON_CODE="no-changed-files"
-  GATE_LANE_REASON="the dispatcher's own changed-file list is empty (git error or empty diff) — cannot cross-check, normal gate"
-elif declare -F gate_fastlane_decide >/dev/null 2>&1; then
-  _FL_RC=0
-  gate_fastlane_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$POLICY_FILES" || _FL_RC=$?
-  if [ "$_FL_RC" != "0" ]; then
-    # fail closed: a decision that errored is not a decision, whatever it had already written
-    GATE_LANE="normal"
-    GATE_LANE_REASON_CODE="decision-errored"
-    GATE_LANE_REASON="fast-lane decision errored (rc=$_FL_RC) — normal gate"
-  fi
-else
-  GATE_LANE="normal"
-  GATE_LANE_REASON_CODE="lib-not-loaded"
-  GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"
-fi
-# Anything that is not exactly "fast" is "normal" — a lib bug must not be able to produce a third lane.
-case "${GATE_LANE:-}" in fast) ;; *) GATE_LANE="normal" ;; esac
-if [ "$GATE_LANE" = "fast" ]; then
-  TIER="FAST-LANE"
-  REQUIRED_REVIEWERS=0
-fi
-# SELFTEST-EXTRACT fastlane-decide: END
-log "Lane: $GATE_LANE — ${GATE_LANE_REASON:-no reason recorded}"
-# SELFTEST-EXTRACT fastlane-record: BEGIN
-if declare -F gate_fastlane_record >/dev/null 2>&1; then
-  gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$GATE_LANE_WOULD_REVIEWERS" "$QG_LOG" || true
-else
-  # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the weekly tally
-  # must be able to see. Without this line no gate_lane event exists for those diffs, they are simply absent from
-  # "decisions", and the tally's "lib not loaded" bucket can never fill. Same fields as gate_fastlane_record's event.
-  _FL_WOULD="${GATE_LANE_WOULD_REVIEWERS:-0}"; case "$_FL_WOULD" in ''|*[!0-9]*) _FL_WOULD=0 ;; esac   # --argjson dies on non-numeric
-  jq -c -n \
-    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
-    --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
-    --arg dry_run "${DRY_RUN:-0}" --argjson would "$_FL_WOULD" \
-    '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
-      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run}' \
-    >> "$QG_LOG" 2>/dev/null || true
-fi
-# SELFTEST-EXTRACT fastlane-record: END
+# ga-atsahv: the DOC/TEST fast-lane decision is taken further down — after the Step 5b yield and the Step 5c park, right
+# before Step 6 — so the tests it may run under the gate lock are never spent on a marker that then yields or parks, and
+# no gate_lane event is written for a decision that never ran.
 
 # ga-syxaki (E5): arm + big-diff trigger, decided BEFORE the run record exists — and decided ONCE: this is the only read of
 # the flag for this run's admission. GATE_E5_ACTIVE (the admit log, the prompt pieces, the big-diff extra) is derived from it
@@ -15773,6 +15781,69 @@ if [ -n "$_DP_KIND" ]; then
 fi
 # SELFTEST-EXTRACT gate-diff-park: END
 
+# ── ga-atsahv: DOC/TEST fast lane — "o gate só é necessário quando a gente vai colocar código novo em produção" ──
+# (Athos, 2026-09-30.) A diff whose EVERY file is DOC or TEST, whose added lines carry no CPF/phone/credential, and
+# whose new tests run green, skips the LLM reviewer and goes straight to gate_finalize_run (content coherence,
+# full-suite regression, merge-time rebase — all of the merge-side checks still apply). PROMPT/doctrine text and
+# every other file stay in the normal gate. The lane is only ever GRANTED, never a verdict: anything unreadable,
+# unclassifiable, failing or merely unverified leaves GATE_LANE=normal. See gate-fastlane.lib.sh for the rules.
+# The reviewer count a NORMAL run would have used is kept for the weekly tally of rounds saved.
+# Decided HERE, not at the top of Step 5: it needs the run to be real (a yield or a park returns before this line). It still
+# decides on $BRANCH_SHA, the commit this run claimed — which is NOT assumed to be what lands. The merge pushes whatever
+# origin/$BRANCH is at push time, so do_merge_ff re-asks gate_fastlane_confirm about the exact commit it is about to push
+# (SELFTEST-EXTRACT fastlane-push-confirm) and a lane that cannot be confirmed is revoked, not merged.
+GATE_LANE="normal"; GATE_LANE_REASON=""; GATE_LANE_REASON_CODE=""; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
+# nothing from an earlier round of this process (gate_continue_or_exit re-enters) may be read as this round's: the fingerprint of a
+# previous fast decision, or the cause of a previous revocation, would otherwise outlive the diff it described
+GATE_LANE_DIGEST=""; GATE_LANE_CONFIRM_CODE=""; GATE_LANE_CONFIRM_WHY=""
+GATE_LANE_WOULD_REVIEWERS="$REQUIRED_REVIEWERS"
+# SELFTEST-EXTRACT fastlane-decide: BEGIN
+if [ -z "${CHANGED_FILES:-}" ]; then
+  # the dispatcher's own file list is empty — it falls back to "" when its git call fails, and an error must not
+  # read as "this diff touches no gate-policy file": nothing to cross-check against, so the normal gate decides
+  GATE_LANE="normal"
+  GATE_LANE_REASON_CODE="no-changed-files"
+  GATE_LANE_REASON="the dispatcher's own changed-file list is empty (git error or empty diff) — cannot cross-check, normal gate"
+elif declare -F gate_fastlane_decide >/dev/null 2>&1; then
+  _FL_RC=0
+  gate_fastlane_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$POLICY_FILES" || _FL_RC=$?
+  if [ "$_FL_RC" != "0" ]; then
+    # fail closed: a decision that errored is not a decision, whatever it had already written
+    GATE_LANE="normal"
+    GATE_LANE_REASON_CODE="decision-errored"
+    GATE_LANE_REASON="fast-lane decision errored (rc=$_FL_RC) — normal gate"
+  fi
+else
+  GATE_LANE="normal"
+  GATE_LANE_REASON_CODE="lib-not-loaded"
+  GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"
+fi
+# Anything that is not exactly "fast" is "normal" — a lib bug must not be able to produce a third lane.
+case "${GATE_LANE:-}" in fast) ;; *) GATE_LANE="normal" ;; esac
+if [ "$GATE_LANE" = "fast" ]; then
+  TIER="FAST-LANE"
+  REQUIRED_REVIEWERS=0
+fi
+# SELFTEST-EXTRACT fastlane-decide: END
+log "Lane: $GATE_LANE — ${GATE_LANE_REASON:-no reason recorded}"
+# SELFTEST-EXTRACT fastlane-record: BEGIN
+if declare -F gate_fastlane_record >/dev/null 2>&1; then
+  gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$GATE_LANE_WOULD_REVIEWERS" "$QG_LOG" || true
+else
+  # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the weekly tally
+  # must be able to see. Without this line no gate_lane event exists for those diffs, they are simply absent from
+  # "decisions", and the tally's "lib not loaded" bucket can never fill. Same fields as gate_fastlane_record's event.
+  _FL_WOULD="${GATE_LANE_WOULD_REVIEWERS:-0}"; case "$_FL_WOULD" in ''|*[!0-9]*) _FL_WOULD=0 ;; esac   # --argjson dies on non-numeric
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
+    --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
+    --arg dry_run "${DRY_RUN:-0}" --argjson would "$_FL_WOULD" \
+    '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
+      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run}' \
+    >> "$QG_LOG" 2>/dev/null || true
+fi
+# SELFTEST-EXTRACT fastlane-record: END
+
 # ── Step 6: Create gate-run tracking bead ────────────────────────────────────
 
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -15822,7 +15893,7 @@ if [ "$GATE_RUN_ID" != "unknown" ]; then
 fi
 
 # ── ga-atsahv: fast lane — NO reviewer. The same finalize, with zero verdicts. ────────────────────────────────
-# Reached only when Step 5 granted the lane (every file DOC/TEST, scan clean, new tests green). Steps 7-8 below
+# Reached only when the lane decision above (after Step 5c) granted the lane (every file DOC/TEST, scan clean, new tests green). Steps 7-8 below
 # spawn and wait for reviewers; this lane has none, so it must not enter them — and it must NOT rely on a zero
 # count to skip them: BSD `seq 1 0` counts DOWN (prints "1 0"), so `for i in $(seq 1 $REQUIRED_REVIEWERS)` with 0
 # would silently spawn two reviewers. Hence an explicit branch, not a reviewer count of 0.

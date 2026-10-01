@@ -49,10 +49,14 @@ log "  syntax OK ✓"
 
 # ── 2. the wiring is in the DEPLOYED dispatcher ────────────────────────────────────────────────────────────
 log "Checking the dispatcher wiring..."
-for s in fastlane-lib-load fastlane-decide fastlane-record fastlane-bypass; do
+for s in fastlane-lib-load fastlane-decide fastlane-record fastlane-bypass fastlane-push-confirm fastlane-lane-revoked; do
   grep -q "SELFTEST-EXTRACT $s: BEGIN" "$DISPATCHER" || fail "dispatcher block '$s' missing"
 done
 grep -q 'fast_lane_mechanical_checks_no_llm_review' "$DISPATCHER" || fail "a fast-lane PASS would still be recorded as a reviewer quorum"
+# merged != live: the push-time confirmation is what stops a commit that landed AFTER the lane decision from merging with zero
+# reviewers — the dispatcher must call it, and the deployed lib must define it
+grep -q '^gate_fastlane_confirm() {' "$LIB" || fail "the deployed fast-lane lib has no gate_fastlane_confirm — a moved branch tip would merge unreviewed"
+grep -q 'gate_fastlane_confirm git_rig "\$CUR_MAIN" "\$CUR_BRANCH"' "$DISPATCHER" || fail "the deployed dispatcher does not confirm the lane at the push"
 grep -q 'lane: \$lane' "$DISPATCHER" || fail "dispatcher_complete lost its lane field"
 log "  wired ✓"
 
