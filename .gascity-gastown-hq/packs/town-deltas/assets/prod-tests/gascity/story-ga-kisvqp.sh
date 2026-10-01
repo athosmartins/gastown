@@ -34,6 +34,13 @@ WA_RIG="${WA_RIG:-/Users/athos/gt/whatsapp_automation}"
 log()  { echo "[prod-test:gascity ga-kisvqp] $*"; }
 fail() { echo "[prod-test:gascity ga-kisvqp] FAIL: $*" >&2; exit 1; }
 
+# has <extended-regex> <text>: status 0 when the text has a line matching it. NEVER `printf text | grep -q`:
+# under pipefail, grep -q exits at its first match while printf is still writing a text bigger than the pipe
+# buffer, printf dies of SIGPIPE, and a correct deploy reads as "not wired" (measured: ~1 run in 10 against the
+# 18KB arm-B block). grep -c reads ALL of its input, so there is no early exit to race against.
+# An empty pattern matches every line, so it is refused (status 1) rather than answered "yes".
+has() { [ -n "$1" ] && [ "$(printf '%s\n' "$2" | grep -c -E -- "$1")" -gt 0 ]; }
+
 TMPROOT=""
 cleanup() { [ -n "$TMPROOT" ] && [ -d "$TMPROOT" ] && rm -rf "$TMPROOT"; }
 trap cleanup EXIT
@@ -56,9 +63,9 @@ SCAN_LINE=$(printf '%s\n' "$BLOCK" | grep -n 'gate_base_test_pyjs_scan "\$RIG_PA
 [[ -n "$ARM_LINE" && -n "$SCAN_LINE" ]] || fail "call site not wired (arm gate line='${ARM_LINE:-}', scan call line='${SCAN_LINE:-}')"
 [[ "$ARM_LINE" -lt "$SCAN_LINE" ]] || fail "the py/js scan (block line $SCAN_LINE) is NOT after the arm-B gate (line $ARM_LINE) — arm A would run it"
 log "py/js scan is wired after the arm-B gate (block lines $ARM_LINE < $SCAN_LINE) ✓"
-printf '%s\n' "$BLOCK" | grep -q 'AB-BASE-TEST-PYJS bead=' \
+has 'AB-BASE-TEST-PYJS bead=' "$BLOCK" \
   || fail "the AB-BASE-TEST-PYJS breakdown line is not wired — the apuração could not split py/js from sh"
-printf '%s\n' "$BLOCK" | grep -E 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED outside-subtree=\$_ABT_OUTSIDE"$' >/dev/null \
+has 'AB-BASE-TEST bead=.*unclassified=\$_ABT_UNCLASSIFIED outside-subtree=\$_ABT_OUTSIDE"$' "$BLOCK" \
   || fail "the AB-BASE-TEST line no longer ends with outside-subtree= — gate-ab-apuracao.sh / ga-x4mkk2 would break"
 log "AB-BASE-TEST keeps its shape; py/js breakdown rides on its own line ✓"
 
@@ -67,7 +74,7 @@ OUT=$(GATE_SELFTEST_ONLY=none bash "$SELFTEST" 2>&1) || {
   printf '%s\n' "$OUT" | grep -E '^  FAIL' | head -10 >&2
   fail "the selftest's fast sections fail against the deployed guard"
 }
-printf '%s\n' "$OUT" | grep -q 'RESULT: PASS' || fail "selftest did not report PASS"
+has 'RESULT: PASS' "$OUT" || fail "selftest did not report PASS"
 log "selftest fast sections pass: $(printf '%s\n' "$OUT" | grep 'PASS=') ✓"
 
 # ── 3. One real measurement through the deployed code ────────────────────────
