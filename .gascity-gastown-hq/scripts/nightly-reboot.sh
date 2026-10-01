@@ -134,13 +134,94 @@ NOTIFY_BIN="${NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 # redirect instead of the diagnostic it's there to capture.
 GATE_ERR="$(mktemp -t nightly-reboot-gate-err)"
 HQ_ERR="$(mktemp -t nightly-reboot-hq-err)"
-trap 'rm -f "${GATE_ERR}" "${HQ_ERR}"' EXIT
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}" 2>/dev/null; }
 notify_athos() {
   # Root can sudo to another user with no password — same trick
   # reboot_once_0700.sh used for its pre-reboot heads-up.
   sudo -u "${NOTIFY_AS_USER}" "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+}
+
+# --- DRAIN MODE: signal helpers (ga-a2v0bz) --------------------------------
+# From 23:00 the city DRAINS: this script writes DRAIN_FILE, which pilot,
+# quality-gate, refino-gate, auto-refino and context-check read (via
+# quiet-hours-check.sh, _drain_window_blocks) to stop ADMITTING new work. It
+# carries the boot-epoch it was written under, so the reboot itself invalidates
+# it — nothing needs to clear it after boot. Everything here is best-effort and
+# FAILS TOWARD "the city keeps working": if the signal cannot be written the
+# reboot still proceeds on the safety guards alone, and if this script dies the
+# EXIT trap removes the signal (a hard kill is bounded by the reader's
+# staleness window, 30min, and by DRAIN_MAX_SECS below).
+DRAIN_REBOOT_AT="${NIGHTLY_REBOOT_REBOOT_AT:-23:40}"
+DRAIN_FILE="${NIGHTLY_REBOOT_DRAIN_FILE:-/Users/athos/.gastown/run/city-drain.level}"
+DRAIN_MAX_SECS="${NIGHTLY_REBOOT_DRAIN_MAX_SECS:-5400}"          # hard ceiling: 23:00 + 90min covers wait + safety budget + a macOS install
+DRAIN_STAMP_INTERVAL="${NIGHTLY_REBOOT_DRAIN_STAMP_INTERVAL:-300}"
+PENDING_FILE="${NIGHTLY_REBOOT_PENDING_FILE:-${CITY}/.gc/logs/nightly-reboot.pending}"
+DRAIN_ACTIVE=0
+DRAIN_STARTED=""
+DRAIN_SLEEP_PID=""
+
+# boot_epoch: kern.boottime's `sec` by EXACT TOKEN. `sysctl -n kern.boottime`
+# prints `{ sec = 1789579812, usec = 958892 } Wed Sep 16 ...` and a greedy
+# `.*sec = ([0-9]+)` matches the "sec" inside "usec" and returns the
+# microseconds (ga-ljncyt, ga-rc7tz: third time this city hit it).
+boot_epoch() {
+  sysctl -n kern.boottime 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }'
+}
+
+# drain_stamp: (re)write the signal atomically: DRAIN | written | boot | until.
+# `until` is fixed at DRAIN_STARTED + DRAIN_MAX_SECS and never extended.
+drain_stamp() {
+  local boot tmp
+  boot="$(boot_epoch)"
+  case "${boot}" in ''|*[!0-9]*)
+    log "ERROR: drain: kern.boottime unreadable — NOT writing the drain signal (it could not be tied to this boot, and an unprovable signal is ignored by the readers anyway)"
+    return 1 ;;
+  esac
+  tmp="${DRAIN_FILE}.tmp.$$"
+  if { printf 'DRAIN\n%s\n%s\n%s\n' "$(date +%s)" "${boot}" "$(( DRAIN_STARTED + DRAIN_MAX_SECS ))" > "${tmp}" \
+       && chmod 644 "${tmp}" && mv -f "${tmp}" "${DRAIN_FILE}"; } 2>/dev/null; then
+    DRAIN_ACTIVE=1
+    return 0
+  fi
+  rm -f "${tmp}" 2>/dev/null
+  log "ERROR: drain: could not write ${DRAIN_FILE} — the drain is INERT tonight; the reboot proceeds on the safety guards alone"
+  return 1
+}
+
+# drain_end: release the city NOW (a skipped night must not keep it frozen).
+drain_end() {
+  rm -f "${DRAIN_FILE}" 2>/dev/null
+  if [ -e "${DRAIN_FILE}" ]; then
+    log "ERROR: drain: could not remove ${DRAIN_FILE} — it will expire on its own (<=30min stale window, hard ceiling DRAIN_MAX_SECS)"
+  else
+    log "drain: signal removed — the city admits new work again"
+  fi
+  DRAIN_ACTIVE=0
+}
+
+# EXIT trap target: any way out of this script releases the drain (the reboot
+# path included — the readers also ignore a signal from a previous boot).
+drain_cleanup() {
+  [ -n "${DRAIN_SLEEP_PID:-}" ] && kill "${DRAIN_SLEEP_PID}" 2>/dev/null
+  if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then
+    rm -f "${DRAIN_FILE}" 2>/dev/null
+    DRAIN_ACTIVE=0
+  fi
+  return 0
+}
+trap 'drain_cleanup; rm -f "${GATE_ERR}" "${HQ_ERR}"' EXIT
+
+# drain_sleep <secs>: sleep that a TERM/INT/HUP can interrupt AT ONCE. A bare
+# foreground `sleep` defers the trap until it returns, so a kill during the
+# 40-minute wait would leave the drain on the disk for the whole stretch.
+drain_sleep() {
+  sleep "$1" &
+  DRAIN_SLEEP_PID=$!
+  wait "${DRAIN_SLEEP_PID}" 2>/dev/null
+  DRAIN_SLEEP_PID=""
+  return 0
 }
 
 # --- Consecutive-skip streak (ga-nnp5b item 4) ----------------------------
@@ -319,7 +400,9 @@ macos_update_install_if_ready() {
 [ "${CHECK_GUARDS_ONLY}" -eq 1 ] || log "=== fired (uptime: $(uptime | sed 's/.*up //; s/,.*users.*//') ) ==="
 
 # --- Guard 1: window sanity ---------------------------------------------
-# Only fire inside 01:00-01:19. Catches a late replay if the box was
+# Only fire inside 23:00-23:19 (DRAIN mode, ga-a2v0bz) or 01:00-01:19 (the
+# legacy slot, still honored so this script is safe to merge BEFORE the root
+# LaunchDaemon is moved to 23:00). Catches a late replay if the box was
 # down/asleep at the scheduled StartCalendarInterval hit (this mini runs
 # sleep=0, but a power loss or panic can still cause a late catch-up fire).
 # This window is INDEPENDENT of the retry budget below: it only gates
@@ -327,9 +410,16 @@ macos_update_install_if_ready() {
 # long that run may then spend retrying once accepted.
 HOUR=$(date +%-H)
 MINUTE=$(date +%-M)
-if [ "${CHECK_GUARDS_ONLY}" -eq 0 ] && { [ "${HOUR}" -ne 1 ] || [ "${MINUTE}" -ge 20 ]; }; then
-    log "SKIP: fired at ${HOUR}:$(printf '%02d' "${MINUTE}") — outside the 01:00-01:19 firing window, likely a late replay. Not rebooting."
-    exit 0
+DRAIN_MODE=0
+if [ "${CHECK_GUARDS_ONLY}" -eq 0 ]; then
+    if [ "${HOUR}" -eq 23 ] && [ "${MINUTE}" -lt 20 ]; then
+        DRAIN_MODE=1
+    elif [ "${HOUR}" -eq 1 ] && [ "${MINUTE}" -lt 20 ]; then
+        DRAIN_MODE=0   # legacy flow below, unchanged
+    else
+        log "SKIP: fired at ${HOUR}:$(printf '%02d' "${MINUTE}") — outside the 23:00-23:19 (drain) and 01:00-01:19 (legacy) firing windows, likely a late replay. Not rebooting."
+        exit 0
+    fi
 fi
 
 # --- Guards 2+3, retried together as one unit (ga-nnp5b) ------------------
@@ -751,8 +841,264 @@ check_guards_report() {
 }
 # nightly-reboot.selftest.sh:GUARDS-FUNCTIONS-END
 
+# =========================================================================
+# DRAIN MODE (ga-a2v0bz) — why the reboot finally happens
+# =========================================================================
+# 13 nights in a row this script skipped. The dominant blocker was not the
+# scraper but Guard 3: the city never stops working at night (gate reviewers,
+# pool dogs, builders), so "no live builder on an hq bead" never held for the
+# ~85 minutes the legacy flow waited. Athos (01/10): reboot BEFORE the scraper
+# starts at 00:01. So the LaunchDaemon fires at 23:00 and this script:
+#   1. opens a DRAIN (DRAIN_FILE): pilot / gate / refino / auto-refino /
+#      context-check stop ADMITTING new work; what is in flight finishes;
+#   2. waits until DRAIN_REBOOT_AT (23:40), re-stamping the signal;
+#   3. at 23:40 only the SAFETY guards decide, retrying until ~23:55:
+#        - a send in flight (central_sender_restart_safe.py — a cut send is a
+#          lead who may get two messages), and
+#        - Dolt maintenance (compact/gc/backup/table-swap) mid-run;
+#      "could not look" (script missing, rc>1, pgrep error) is NOT safe;
+#   4. gate markers, hq in_progress beads and the scraper rodada are now
+#      INFORMATIVE: they are logged (and snapshotted) as "what this reboot
+#      cuts". The gate re-queues its markers, inflight-reclaim-guard hands
+#      beads back, and the scraper's catch-up (--skip-done-today) resumes;
+#   5. reboots, leaving PENDING_FILE so the post-boot check knows this boot
+#      was ours.
+# A night that cannot reboot by ~23:55 lifts the drain at once and SKIPs
+# (streak/alarm as before) — a failed night must never freeze the city.
+#
+# LIMIT of guard_dolt_maintenance: it sees maintenance WRAPPERS and the dolt
+# CLI by process, not a bare `CALL dolt_gc()` typed into an interactive SQL
+# session. The wrappers are what this city runs.
+SAFETY_RETRY_INTERVAL="${NIGHTLY_REBOOT_SAFETY_RETRY_INTERVAL:-60}"
+SAFETY_MAX_ATTEMPTS="${NIGHTLY_REBOOT_SAFETY_MAX_ATTEMPTS:-16}"      # 16 x 60s: 23:40 -> ~23:55
+DRAIN_FALLBACK_WAIT_SECS="${NIGHTLY_REBOOT_DRAIN_FALLBACK_WAIT_SECS:-2400}"
+SENDER_SAFE_PY="${NIGHTLY_REBOOT_SENDER_SAFE_PY:-/Users/athos/gt/whatsapp_automation/scripts/central_sender_restart_safe.py}"
+PYTHON3_BIN="${NIGHTLY_REBOOT_PYTHON:-/usr/bin/python3}"
+PGREP_BIN="${NIGHTLY_REBOOT_PGREP_BIN:-/usr/bin/pgrep}"
+SCRAPER_CUT_FILE="${CITY}/.gc/logs/nightly-reboot.scraper-cut.streak"
+SCRAPER_CUT_ALARM_THRESHOLD="${NIGHTLY_REBOOT_SCRAPER_CUT_ALARM_THRESHOLD:-2}"
+
+# nightly-reboot.drain.selftest.sh:DRAIN-SCHEDULE-START — pure, extracted by the selftest
+# secs_until_hhmm HH:MM [now_epoch] -> seconds from now until HH:MM TODAY (the day of
+# now_epoch); 0 if that moment has passed (never negative); "ERR" if it cannot be
+# computed. ERR is its own answer on purpose: collapsing "cannot tell" into 0 would
+# read as "it is already time" and reboot early.
+secs_until_hhmm() {
+    local hhmm="$1" now="${2:-$(date +%s)}" hh mm day target
+    case "${hhmm}" in [0-9][0-9]:[0-9][0-9]) ;; *) printf 'ERR'; return 0 ;; esac
+    case "${now}" in ''|*[!0-9]*) printf 'ERR'; return 0 ;; esac
+    hh="${hhmm%%:*}"; mm="${hhmm##*:}"
+    { [ "$(( 10#${hh} ))" -le 23 ] && [ "$(( 10#${mm} ))" -le 59 ]; } || { printf 'ERR'; return 0; }
+    day="$(date -j -f %s "${now}" +%Y-%m-%d 2>/dev/null)" || { printf 'ERR'; return 0; }
+    target="$(date -j -f '%Y-%m-%d %H:%M:%S' "${day} ${hh}:${mm}:00" +%s 2>/dev/null)" || { printf 'ERR'; return 0; }
+    if [ "${target}" -gt "${now}" ]; then printf '%s' $(( target - now )); else printf '0'; fi
+}
+# nightly-reboot.drain.selftest.sh:DRAIN-SCHEDULE-END
+
+# nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-START — extracted by the selftest
+# Matches the maintenance WRAPPERS and mutating dolt CLI verbs, anchored at argv[0]
+# (pgrep -f sees "argv0 argv1 ..."): a Claude session whose prompt merely MENTIONS
+# "dolt-compact-routine" does not match, and `dolt sql-server` never does.
+DOLT_MAINT_PATTERN_DEFAULT='^(/bin/bash|/bin/sh|bash|sh)( -[A-Za-z]+)* ([^ ]*/)?(dolt-compact-routine|dolt-gc-maintenance|dolt-gc-release-trigger|dolt-backup-reseed|dolt-backup-swap-repair|dolt-backup-residue-reclaim|dolt-offline-backup-sync)\.sh( |$)|^([^ ]*/)?dolt (gc|backup|push|pull|fetch|table)( |$)'
+# nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-END
+DOLT_MAINT_PATTERN="${NIGHTLY_REBOOT_DOLT_MAINT_PATTERN:-${DOLT_MAINT_PATTERN_DEFAULT}}"
+
+# Safety guard 1: a send in flight. Same contract as central_sender_restart_safe.py:
+# exit 0 = safe, 1 = in flight, anything else (2 = "could not read the queue", or the
+# script missing / not runnable) = unknown -> NOT safe. Cutting a send mid-sequence
+# can make a lead receive two messages; waiting costs a retry.
+guard_sender_in_flight() {
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
+    local out rc
+    if [ ! -r "${SENDER_SAFE_PY}" ]; then
+        GUARD_REASON="central_sender_restart_safe.py not readable at ${SENDER_SAFE_PY} — cannot tell whether a send is in flight, unknown treated as NOT safe"
+        return 1
+    fi
+    out=$("${PYTHON3_BIN}" "${SENDER_SAFE_PY}" 2>&1); rc=$?
+    case "${rc}" in
+        0) GUARD_STATE="ok"; GUARD_NOTE="${out}"; return 0 ;;
+        1) GUARD_STATE="block"; GUARD_REASON="central_sender send in flight: $(printf '%s' "${out}" | tr '\n' ' ')" ;;
+        *) GUARD_REASON="central_sender_restart_safe.py rc=${rc}: $(printf '%s' "${out}" | tr '\n' ' ') — unknown treated as NOT safe" ;;
+    esac
+    return 1
+}
+
+# Safety guard 2: Dolt maintenance mid-run. pgrep rc 0 = running, 1 = none, other = could not look.
+guard_dolt_maintenance() {
+    GUARD_STATE="unknown"; GUARD_REASON=""; GUARD_NOTE=""
+    local out rc
+    out=$("${PGREP_BIN}" -fl "${DOLT_MAINT_PATTERN}" 2>&1); rc=$?
+    case "${rc}" in
+        1) GUARD_STATE="ok"; return 0 ;;
+        0) GUARD_STATE="block"; GUARD_REASON="Dolt maintenance process running: $(printf '%s' "${out}" | tr '\n' ';')" ;;
+        *) GUARD_REASON="pgrep failed (rc=${rc}: $(printf '%s' "${out}" | tr '\n' ' ')) — cannot tell whether Dolt maintenance is running, unknown treated as NOT safe" ;;
+    esac
+    return 1
+}
+
+check_safety_guards_once() {
+    guard_sender_in_flight || { BLOCK_REASON="${GUARD_REASON}"; return 1; }
+    guard_dolt_maintenance || { BLOCK_REASON="${GUARD_REASON}"; return 1; }
+    return 0
+}
+
+# What this reboot is about to cut. Guards 2/3/4 do not hold the reboot in drain
+# mode, but their verdicts are the only record of what was in flight, so each one
+# lands in the log ("informational: ...") and in a per-night snapshot.
+drain_informational_report() {
+    local snap tmp line
+    snap="${CITY}/.gc/logs/nightly-reboot-pre-$(date +%Y%m%d-%H%M).txt"
+    tmp="$(mktemp -t nightly-reboot-info)"
+    check_guards_report > "${tmp}" 2>/dev/null || true    # rc ignored: informative only
+    {
+        printf 'Pre-reboot snapshot, nightly reboot in DRAIN mode (ga-a2v0bz) - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'These guards do NOT hold the reboot. What they show is what it cuts: the gate re-queues its markers, inflight-reclaim-guard hands beads back, the scraper catch-up resumes its rodada.\n'
+        cat "${tmp}"
+    } > "${snap}" 2>/dev/null || log "WARN: could not write the pre-reboot snapshot ${snap}"
+    while IFS= read -r line; do
+        log "informational: ${line}"
+    done < "${tmp}"
+    rm -f "${tmp}"
+}
+
+# Scraper cut counter: how many nights in a row the reboot found a rodada running.
+# "unknown" leaves the counter alone (could-not-look is neither a cut nor a clean night).
+record_scraper_cut() {
+    local state="$1" reason="$2" n
+    n=$(cat "${SCRAPER_CUT_FILE}" 2>/dev/null)
+    case "${n}" in (''|*[!0-9]*) n=0 ;; esac
+    case "${state}" in
+        running)
+            n=$(( n + 1 ))
+            printf '%s\n' "${n}" > "${SCRAPER_CUT_FILE}" 2>/dev/null || true
+            log "scraper: the rodada in flight WILL BE CUT by this reboot and resumed by the daily catch-up at boot (night ${n} in a row): ${reason}"
+            if [ "${n}" -ge "${SCRAPER_CUT_ALARM_THRESHOLD}" ] && [ $(( n % SCRAPER_CUT_ALARM_THRESHOLD )) -eq 0 ]; then
+                log "ALARM: the scraper was cut ${n} nights in a row — mailing mayor (property_scrapers owner)"
+                "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
+                  -s "nightly-reboot: scraper cortado ${n} noites seguidas (ga-a2v0bz)" \
+                  -m "$(printf 'O reboot noturno das 23:40 encontrou uma rodada do scraper em andamento %s noites seguidas e a cortou (o catch-up retoma no boot).\nUltima: %s\nSe a rodada leva horas a cada noite, o ps precisa saber: o corte vira rotina.\nLog: %s' "${n}" "${reason}" "${LOG}")" \
+                  >/dev/null 2>&1 || true
+            fi
+            ;;
+        clear) printf '0\n' > "${SCRAPER_CUT_FILE}" 2>/dev/null || true ;;
+        *) log "scraper: state unknown (${reason}) — cut counter left at ${n}" ;;
+    esac
+}
+
+# Handoff to the post-boot check (scripts/nightly-reboot-postcheck.sh): "this boot is ours".
+write_pending_file() {
+    local mode="$1" tmp="${PENDING_FILE}.tmp.$$"
+    if { printf 'issued=%s\nboot_before=%s\nmode=%s\n' "$(date +%s)" "$(boot_epoch)" "${mode}" > "${tmp}" \
+         && chmod 644 "${tmp}" && mv -f "${tmp}" "${PENDING_FILE}"; } 2>/dev/null; then
+        return 0
+    fi
+    rm -f "${tmp}" 2>/dev/null
+    log "WARN: could not write ${PENDING_FILE} — the post-boot check will not know this reboot was the nightly one"
+    return 0
+}
+
+# The shared tail: both modes end here (legacy at 01:00, drain at 23:40). Unindented
+# lines inside are a python -c string; do not re-indent them.
+reboot_now_sequence() {
+REBOOT_MODE="$1"
+# --- Informational only: other rigs' in_progress count (not a gate) ------
+# Precedent (2026-08-29 runbook) treated non-hq in-progress as non-blocking —
+# inflight-reclaim-guard reclaims stale crew claims regardless of reboot.
+for RIG_DIR in "${CITY%/.gascity-gastown-hq}"/*/; do
+    RIG_NAME=$(basename "${RIG_DIR}")
+    [ -d "${RIG_DIR}/.beads" ] || continue
+    CNT=$("${BD}" -C "${RIG_DIR}" list --status in_progress --json --limit 0 2>/dev/null | /usr/bin/python3 -c 'import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print("?")' 2>/dev/null)
+    log "info: ${RIG_NAME} in_progress = ${CNT} (non-blocking, logged only)"
+done
+
+# --- macOS update: install before reboot if one is ready (ga-l5m50) -------
+# (an install can take long: keep the drain signal fresh while it runs)
+if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then drain_stamp || true; fi
+macos_update_install_if_ready
+
+# --- All clear: record pre-reboot state, then reboot ----------------------
+reset_streak
+log "disk before: $(df -h /System/Volumes/Data | tail -1 | awk '{print $4" free ("$5" used)"}')"
+log "swap before: $(sysctl -n vm.swapusage 2>/dev/null)"
+log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
+
+notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
+
+write_pending_file "${REBOOT_MODE}"
+log "rebooting now"
+sync
+"${SHUTDOWN_BIN}" -r now >>"${LOG}" 2>&1
+RC=$?
+log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
+exit 1
+}
+
+# Drain mode, start to finish. Never returns: it ends in the reboot sequence (which
+# exits) or in a SKIP.
+drain_main() {
+    local wait remaining chunk
+    DRAIN_STARTED="$(date +%s)"
+    # a kill must reach drain_cleanup NOW; the legacy path never installs these
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    log "drain mode: the city stops admitting new work until the reboot at ${DRAIN_REBOOT_AT} (signal ${DRAIN_FILE}); at that time only the SAFETY guards decide — agent work in flight does not hold the reboot"
+    drain_stamp || true
+
+    wait="${NIGHTLY_REBOOT_DRAIN_WAIT_SECS:-$(secs_until_hhmm "${DRAIN_REBOOT_AT}")}"
+    case "${wait}" in ''|*[!0-9]*)
+        log "ERROR: could not work out how long to wait for ${DRAIN_REBOOT_AT} (got '${wait}') — waiting the default ${DRAIN_FALLBACK_WAIT_SECS}s from the fire instead"
+        wait="${DRAIN_FALLBACK_WAIT_SECS}" ;;
+    esac
+    case "${DRAIN_STAMP_INTERVAL}" in ''|*[!0-9]*|0) DRAIN_STAMP_INTERVAL=300 ;; esac
+    remaining="${wait}"
+    log "drain: waiting ${remaining}s until ${DRAIN_REBOOT_AT} (re-stamping the signal every ${DRAIN_STAMP_INTERVAL}s)"
+    while [ "${remaining}" -gt 0 ]; do
+        chunk="${DRAIN_STAMP_INTERVAL}"
+        [ "${remaining}" -lt "${chunk}" ] && chunk="${remaining}"
+        drain_sleep "${chunk}"
+        remaining=$(( remaining - chunk ))
+        drain_stamp || true
+    done
+
+    ATTEMPT=1
+    while true; do
+        drain_stamp || true
+        if check_safety_guards_once; then
+            break
+        fi
+        if [ "${ATTEMPT}" -ge "${SAFETY_MAX_ATTEMPTS}" ]; then
+            log "SKIP: safety guards still blocked after ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * SAFETY_RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting; lifting the drain."
+            drain_end
+            notify_athos "Reboot noturno pulado" "guard de segurança ainda bloqueando após ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Dreno encerrado. Ver ${LOG}."
+            record_skip "${BLOCK_REASON}"
+            exit 0
+        fi
+        log "attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} blocked by a safety guard (${BLOCK_REASON}) — retrying in ${SAFETY_RETRY_INTERVAL}s."
+        drain_sleep "${SAFETY_RETRY_INTERVAL}"
+        ATTEMPT=$((ATTEMPT+1))
+    done
+    log "safety guards OK on attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS}: no send in flight, no Dolt maintenance running — rebooting with agent work possibly in flight (drain mode, ga-a2v0bz)"
+
+    drain_informational_report
+    guard_scraper_daily || true                    # sets SCRAPER_DAILY_STATE/REASON in THIS shell
+    record_scraper_cut "${SCRAPER_DAILY_STATE:-unknown}" "${SCRAPER_DAILY_REASON:-no reason}"
+    reboot_now_sequence drain
+}
+
 if [ "${CHECK_GUARDS_ONLY}" -eq 1 ]; then
     check_guards_report
+    exit $?
+fi
+
+# Drain mode (fired 23:00-23:19) never reaches the legacy loop below: drain_main
+# ends in the reboot sequence or in a SKIP.
+if [ "${DRAIN_MODE}" -eq 1 ]; then
+    drain_main
     exit $?
 fi
 
@@ -773,34 +1119,4 @@ while true; do
 done
 log "guards OK on attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS}: 0 real gate markers, no recently-active live builder on any hq in_progress bead, no scraper daily running${HQ_IGNORED_NOTE:+ (${HQ_IGNORED_NOTE})}"
 
-# --- Informational only: other rigs' in_progress count (not a gate) ------
-# Precedent (2026-08-29 runbook) treated non-hq in-progress as non-blocking —
-# inflight-reclaim-guard reclaims stale crew claims regardless of reboot.
-for RIG_DIR in "${CITY%/.gascity-gastown-hq}"/*/; do
-    RIG_NAME=$(basename "${RIG_DIR}")
-    [ -d "${RIG_DIR}/.beads" ] || continue
-    CNT=$("${BD}" -C "${RIG_DIR}" list --status in_progress --json --limit 0 2>/dev/null | /usr/bin/python3 -c 'import json,sys
-try:
-    print(len(json.load(sys.stdin)))
-except Exception:
-    print("?")' 2>/dev/null)
-    log "info: ${RIG_NAME} in_progress = ${CNT} (non-blocking, logged only)"
-done
-
-# --- macOS update: install before reboot if one is ready (ga-l5m50) -------
-macos_update_install_if_ready
-
-# --- All clear: record pre-reboot state, then reboot ----------------------
-reset_streak
-log "disk before: $(df -h /System/Volumes/Data | tail -1 | awk '{print $4" free ("$5" used)"}')"
-log "swap before: $(sysctl -n vm.swapusage 2>/dev/null)"
-log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
-
-notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
-
-log "rebooting now"
-sync
-"${SHUTDOWN_BIN}" -r now >>"${LOG}" 2>&1
-RC=$?
-log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
-exit 1
+reboot_now_sequence legacy
