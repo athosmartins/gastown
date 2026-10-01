@@ -71,6 +71,11 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/auto-refino-dispatcher.sh"
+# ga-a2v0bz: the drain signal (~/.gastown/run/city-drain.level, rewritten by nightly-reboot.sh 23:00-23:55) is AMBIENT
+# state and the e2e blocks below keep the caller's real HOME. Pinned OPEN so this suite's outcome never depends on the
+# time of day. Until the pin it was immune only BY ACCIDENT: its PATH has no /usr/sbin, `sysctl` is not found, the
+# boot cannot be proven and the gate fails open — put /usr/sbin on that PATH and the e2e blocks fail at night.
+export DRAIN_WINDOW_OVERRIDE=OPEN
 
 PASS=0
 FAIL=0

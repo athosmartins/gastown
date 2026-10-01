@@ -25,6 +25,11 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/context-check-dispatcher.sh"
+# ga-a2v0bz: the drain signal (~/.gastown/run/city-drain.level, rewritten by nightly-reboot.sh 23:00-23:55) is AMBIENT
+# state and the e2e blocks below keep the caller's real HOME. Pinned OPEN so this suite's outcome never depends on the
+# time of day — unpinned, a run inside the drain window fails 7 e2e assertions (reproduced, gate run ga-y0fst4). The
+# sandbox PATH below has /usr/sbin, so `sysctl` resolves and the signal is provable: nothing here fails open by luck.
+export DRAIN_WINDOW_OVERRIDE=OPEN
 # ga-ck3sz7: every e2e block runs the dispatcher on a PATH with NO real gc/bd (selftest-sandbox-path.lib.sh). They used to
 # run it with "...:/usr/local/bin:/opt/homebrew/bin" — the dir the real gc and bd live in — so "with no live bd" (section 8)
 # was false on this box, and the `bd` stub of section 11 (first on that PATH) fell through to the REAL bd the moment its

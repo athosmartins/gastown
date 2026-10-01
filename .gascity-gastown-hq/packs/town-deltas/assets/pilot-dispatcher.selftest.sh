@@ -495,12 +495,18 @@ chmod +x "$SHIMBIN/notify"
 # ── Runner ────────────────────────────────────────────────────────────────────
 reset_state() { rm -rf "$STATE"; mkdir -p "$STATE"; }
 
+# ga-a2v0bz: every real-dispatcher run in this file pins DRAIN_WINDOW_OVERRIDE=OPEN, next to the RAM-level pin.
+# The drain signal is AMBIENT state (~/.gastown/run/city-drain.level, rewritten by nightly-reboot.sh 23:00-23:55)
+# and these runs keep the caller's real HOME. Until the pin this suite was immune only BY ACCIDENT: its PATH has no
+# /usr/sbin, so `sysctl` is not found, the boot cannot be proven and the gate fails open — add /usr/sbin and every
+# assertion fails at night. selftest-drain-pin-class.selftest.sh fails when a run site loses the pin.
 # Runs the real dispatcher in DRY_RUN with the shims on PATH, returns the log.
 run_dispatch() { # $1=FAKE_BLOCKED_IDS  $2=FAKE_INCLUDE_ENGWIN(0|1)  $3=FAKE_DEP_BEAD (optional)  $4=FAKE_INCLUDE_EPIC(0|1)  $5=FAKE_INCLUDE_PREAPPROVAL(0|1)  $6=FAKE_INCLUDE_ENGSIGNAL(0|1)
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -523,6 +529,7 @@ run_step0() { # FAKE_STALE_JSON
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -551,6 +558,7 @@ run_neverstarted() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -582,6 +590,7 @@ run_real_dispatch() { # FAKE_SUPPRESS_INFLIGHT FAKE_SUPPRESS_LANE
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -609,6 +618,7 @@ run_real_dispatch_escalate() { # FAKE_ESCALATE_AFTER_SHOWS
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -642,6 +652,7 @@ run_real_dispatch_noauto() { # FAKE_NOAUTO_AFTER_SHOWS [FAKE_NOAUTO_LABEL]
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -691,6 +702,7 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
   local _mh_labels='[]'
   [ "$_mh_needsfix" = "1" ] && _mh_labels='["gate:needs-fix"]'
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -724,6 +736,7 @@ run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS  $3=PILOT_TEST_
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -747,6 +760,7 @@ run_dispatch_remerge_with_feedback() { # $1=label
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -772,6 +786,7 @@ run_sling_retry() { # $1=FAKE_SLING_FAIL_TIMES  $2=FAKE_SLING_ALWAYS_FAIL(0|1)  
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -808,6 +823,7 @@ run_capacity() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -845,6 +861,7 @@ run_lanefull() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -883,6 +900,7 @@ run_ctxready() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -917,6 +935,7 @@ run_emit() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$EMIT_FILE"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -2583,6 +2602,7 @@ reset_state
 # "dolt health" case (falls to its `*)` no-op), so it prints nothing and exits 0,
 # reproducing the exact ga-hzt7 field symptom (probe returns no signal) end-to-end.
 LOG10C="$(env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -2822,6 +2842,7 @@ run_quota() { # $1=PILOT_QUOTA_OVERRIDE  $2=PILOT_QUOTA_ETA_OVERRIDE
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -3440,6 +3461,7 @@ fi
 echo "Scenario 16i: PILOT_NEVERSTARTED_MINUTES=0 disables the detector"
 : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"; reset_state
 env -i PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
+DRAIN_WINDOW_OVERRIDE="OPEN" \
 PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
   PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
@@ -3733,6 +3755,7 @@ run_capacity_reuse() { # $1=PILOT_REUSE_SESSION  $2=FAKE_BUGS_JSON  $3=FAKE_SESS
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -4915,6 +4938,7 @@ echo "Scenario 19f: a failed emit does NOT abort the dispatch sweep (fail-open)"
 : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 reset_state
 env -i \
+  DRAIN_WINDOW_OVERRIDE="OPEN" \
   PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" HOME="$HOME" DRY_RUN=1 \
   PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
   PILOT_CITY_OVERRIDE="$FIXCITY" PILOT_TEST_STATE="$STATE" \
@@ -6206,6 +6230,7 @@ run_wa_rig_tier2() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -6295,6 +6320,7 @@ run_rig_tier1() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -6445,6 +6471,7 @@ run_hq_tier2() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -6754,6 +6781,7 @@ run_capq_dispatch() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$FIXCITY/.gc/pilot-dispatcher-stall.count"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$CAPQ_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -7557,6 +7585,7 @@ run_topup_scenario() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -7673,6 +7702,7 @@ run_topup_candidates_scenario() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -7859,6 +7889,7 @@ run_topup_rig_scenario() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -8043,6 +8074,7 @@ run_ps_worker_dispatch() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -8119,6 +8151,7 @@ run_lx_pool_dispatch() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$LX_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -8189,6 +8222,7 @@ run_ps_worker_dispatch_own_guard() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$PS_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -8869,6 +8903,7 @@ run_y1m40() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -8898,6 +8933,7 @@ run_y1m40_stall() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
@@ -9512,6 +9548,7 @@ run_ram() { # $1=PILOT_RAM_PRESSURE_OVERRIDE
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     DRY_RUN=1 \
@@ -9798,6 +9835,7 @@ run_lanefull_topup() {
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \

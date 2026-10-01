@@ -40,6 +40,10 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/refino-gate-dispatcher.sh"
+# ga-a2v0bz: the drain signal (~/.gastown/run/city-drain.level, rewritten by nightly-reboot.sh 23:00-23:55) is AMBIENT
+# state. Section 7 runs the dispatcher with the caller's real HOME; the ga-owlmfj B3 block sandboxes HOME and ALSO carries
+# the pin itself (an `env -i` drops this export). Pinned OPEN so the outcome never depends on the time of day.
+export DRAIN_WINDOW_OVERRIDE=OPEN
 # ga-ck3sz7: the two blocks that run the dispatcher (section 7 and the ga-owlmfj B3 end-to-end) run it on a PATH with NO real
 # gc/bd (selftest-sandbox-path.lib.sh). Both used to put /opt/homebrew/bin on the PATH (section 7 literally, B3 through
 # dirname-of-jq) — the dir the real gc, bd and jq all live in — so a fixture shim that vanished, or was never there, fell
@@ -975,7 +979,7 @@ SHIM
   # `|| OW_RC=$?` — a bare `OW_RC=$?` on the next line is never reached.
   OW_RC=0
   ( cd / && $_to env -i HOME="$OW_SB/home" PATH="$SANDBOX_PATH" \
-      REFINO_CITY_OVERRIDE="$OW_SB/city" REFINO_GATE_STORES="$OW_SB/city" QUIET_HOURS_OVERRIDE=OPEN \
+      REFINO_CITY_OVERRIDE="$OW_SB/city" REFINO_GATE_STORES="$OW_SB/city" QUIET_HOURS_OVERRIDE=OPEN DRAIN_WINDOW_OVERRIDE=OPEN \
       REFINO_START_FAIL_STREAK_FILE="$spath" \
       OW_CALLS="$OW_SB/calls" OW_SPAWN="$spawn" OW_CREATE="$create" \
       OW_QUEUE_JSON='[{"id":"zz-fx1","title":"Fixture story","created_at":"2026-09-19T00:00:00Z","assignee":"","created_by":"auto-refino","issue_type":"feature","metadata":{},"labels":["story:refino-review"]}]' \

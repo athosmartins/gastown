@@ -149,6 +149,7 @@ run_dispatch() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     DRY_RUN=1 \

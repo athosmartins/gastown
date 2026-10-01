@@ -85,6 +85,7 @@ clear_lock() { rm -rf "$LOCK_DIR" "$LOCK_DIR".reaping.* 2>/dev/null || true; }
 run_dispatch() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     TMPDIR="$FIXTMP" \
@@ -161,6 +162,7 @@ SHARED_LOG="$FIXCITY/.gc/logs/pilot-dispatcher.log"
 : > "$SHARED_LOG"
 run_race() {
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" TMPDIR="$FIXTMP" DRY_RUN=1 \
     PILOT_CITY_OVERRIDE="$FIXCITY" \
