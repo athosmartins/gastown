@@ -474,6 +474,15 @@ else
       SCENARIO="$1"
       VB1_JSON='"'"'{"status":"open","assignee":"sess-1"}'"'"'
       VB2_JSON='"'"'{"status":"open","assignee":"sess-2"}'"'"'
+      PC_SESS_JSON_FIXTURE="[]"
+      # ga-8wec8c: assignee ABSENT, the reviewer known only via
+      # metadata.gc.session_name, and that session is genuinely ALIVE in the
+      # roster — the capture must still find it (an empty capture reads as a
+      # confirmed-dead reviewer and manufactures a false dead-reviewer requeue).
+      if [ "$SCENARIO" = "name_only_alive" ]; then
+        VB1_JSON='"'"'{"status":"open","metadata":{"gc.session_name":"sess-1"}}'"'"'
+        PC_SESS_JSON_FIXTURE='"'"'[{"session_name":"sess-1","state":"active","closed":false}]'"'"'
+      fi
       VERDICT_LIST='"'"'[{"id":"pc-vb-1"},{"id":"pc-vb-2"}]'"'"'
       # A call-COUNT variable does not work here: bd() is invoked via
       # `$(...)` command substitution, which forks a subshell, so any
@@ -505,7 +514,7 @@ else
       warn() { echo "WARN: $*" >&2; }
       '"$FN_SID3"'
       '"$FN_REVALIVE_P7"'
-      PC_SESS_JSON="[]"
+      PC_SESS_JSON="$PC_SESS_JSON_FIXTURE"
       PC_ANY_PENDING=0
       PC_ALL_PENDING_DEAD=1
       for _dummy_loop in 1; do
@@ -535,6 +544,20 @@ else
   case "$OUT7_FAIL" in
     *"assignee capture was unreadable"*) ok "unreadable assignee capture is named in the diagnostic log" ;;
     *) bad "no diagnostic log line distinguishing the unreadable assignee capture from a confirmed-absent session" ;;
+  esac
+
+  # ga-8wec8c: same class, other direction — the read SUCCEEDED but the assignee
+  # column is empty while metadata.gc.session_name names a live reviewer.
+  OUT7_NAME="$(run_rehydrate_classify name_only_alive 2>&1)"; RC7_NAME=$?
+  RES7_NAME="$(printf '%s\n' "$OUT7_NAME" | grep '^RESULT|' || true)"
+  if [ "$RC7_NAME" -eq 0 ] && printf '%s' "$RES7_NAME" | grep "PC_ALL_PENDING_DEAD=0" >/dev/null; then
+    ok "pc-vb-1 assignee empty, metadata.gc.session_name=sess-1 ALIVE: PC_ALL_PENDING_DEAD=0 (live reviewer not misread as dead) — got: $RES7_NAME"
+  else
+    bad "assignee-empty + live session_name reviewer was classified DEAD (rc=$RC7_NAME) — the capture only reads .assignee, so a live reviewer whose assignee write was lost gets a false dead-reviewer requeue: $OUT7_NAME"
+  fi
+  case "$RES7_NAME" in
+    *"SESSION_IDS=sess-1 sess-2"*) ok "SESSION_IDS captured the reviewer via metadata.gc.session_name fallback (sess-1 sess-2)" ;;
+    *) bad "SESSION_IDS did not capture the session_name fallback identity — got: $RES7_NAME" ;;
   esac
 fi
 

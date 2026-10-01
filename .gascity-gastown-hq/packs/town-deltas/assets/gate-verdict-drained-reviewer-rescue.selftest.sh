@@ -258,6 +258,180 @@ else
 fi
 rm -f "$MUT"
 
+# ── 8. ga-8wec8c: the reviewer's identity is .assignee, else metadata.gc.session_name ──
+#
+# MEASURED LIVE 2026-10-01 (gate-run ga-jpktmq): verdict bead ga-vvo64u was open
+# + verdict:FAIL with its reviewer long gone (`gc session peek` -> "session not
+# found"), but .assignee was NULL while metadata.gc.session_name still named the
+# reviewer. The rescue above only looked at .assignee, so it never fired (0 of
+# ~296k log lines) and the run sat 0/1 until the 50min timeout, whose dead-
+# reviewer requeue then discarded a complete, real review. The assignee write
+# can be lost (ga-590nx class) or cleared at teardown; the metadata link is the
+# fallback channel ga-qqtoo/ga-mo7q already established for exactly this.
+#
+# Fixture (ONE gate_collect_verdicts() call, same shape as part 1):
+#   vb-name-dead     open verdict:FAIL  assignee ABSENT, session_name=dead-n1  (drained) -> rescue, ANY_FAIL=1
+#   vb-name-alive    open verdict:PASS  assignee null,   session_name=alive-n2 (ALIVE)   -> guard holds: not rescued
+#   vb-no-identity   open verdict:PASS  assignee "",     session_name ""                  -> inert: never peeked, never closed
+#   vb-both-differ   open verdict:PASS  assignee=dead-n4a, session_name=alive-n4b          -> assignee wins: dead-n4a peeked, alive-n4b NEVER
+run_collect_name_fallback() {
+  local file="$1" bd_log="$2" peek_log="$3"
+  local fn_collect fn_peek_dead fn_identity_link
+  fn_collect="$(extract_block "$file" "gate-collect-verdicts-fn")"
+  fn_peek_dead="$(extract_block "$file" "session-peek-reports-dead-fn")"
+  fn_identity_link="$(extract_block "$file" "gate-verdict-identity-link-fn")"
+  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ]; then
+    echo "COULD_NOT_EXTRACT_BLOCK" >&2
+    return 99
+  fi
+  : > "$bd_log"; : > "$peek_log"
+  bash -c '
+    set -euo pipefail
+    GC_CITY="/fake/city"
+    BD_LOG="$1"; PEEK_LOG="$2"
+
+    VBN1='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:1","verdict:FAIL"],"metadata":{"gc.session_name":"dead-n1"}}'"'"'
+    VBN2='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:2","verdict:PASS"],"assignee":null,"metadata":{"gc.session_name":"alive-n2"}}'"'"'
+    VBN3='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:3","verdict:PASS"],"assignee":"","metadata":{"gc.session_name":""}}'"'"'
+    VBN4='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:4","verdict:PASS"],"assignee":"dead-n4a","metadata":{"gc.session_name":"alive-n4b"}}'"'"'
+    VBN1_COMMENTS='"'"'[{"text":"VERDICT: FAIL — stale lock on retry"}]'"'"'
+
+    VERDICT_BEAD_IDS=(vb-name-dead vb-name-alive vb-no-identity vb-both-differ)
+
+    bd() {
+      case " $* " in
+        *" show vb-name-dead "*)    echo "$VBN1"; return 0 ;;
+        *" show vb-name-alive "*)   echo "$VBN2"; return 0 ;;
+        *" show vb-no-identity "*)  echo "$VBN3"; return 0 ;;
+        *" show vb-both-differ "*)  echo "$VBN4"; return 0 ;;
+        *" comments vb-name-dead "*) echo "$VBN1_COMMENTS"; return 0 ;;
+        *" comments "*)             echo "[]"; return 0 ;;
+        *" close "*)                echo "$*" >> "$BD_LOG"; return 0 ;;
+      esac
+      echo "UNEXPECTED:$*" >> "$BD_LOG"
+      return 0
+    }
+    gc() {
+      case " $* " in
+        *" session peek "*)
+          local pid="$5"
+          echo "$pid" >> "$PEEK_LOG"
+          case "$pid" in
+            alive-n2|alive-n4b) echo "fake scrollback (reviewer still working)"; return 0 ;;
+            *)                  echo "gc session peek: session not found: $pid" >&2; return 1 ;;
+          esac
+          ;;
+      esac
+      return 0
+    }
+    log()  { echo "LOG: $*" >&2; }
+    warn() { echo "WARN: $*" >&2; }
+
+    '"$fn_peek_dead"'
+    '"$fn_identity_link"'
+    '"$fn_collect"'
+
+    gate_collect_verdicts
+    printf "RESULT|VERDICTS_RECEIVED=%s|ANY_FAIL=%s|FAIL_REASONS=%s\n" \
+      "$VERDICTS_RECEIVED" "$ANY_FAIL" "$FAIL_REASONS"
+  ' _ "$bd_log" "$peek_log"
+  return $?
+}
+
+echo "── 8. ga-8wec8c: assignee empty + metadata.gc.session_name set -> the rescue still fires ──"
+BD_LOG8="$(mktemp)"; PEEK_LOG8="$(mktemp)"; STDERR_LOG8="$(mktemp)"
+OUT8="$(run_collect_name_fallback "$DISPATCHER" "$BD_LOG8" "$PEEK_LOG8" 2>"$STDERR_LOG8")"
+RC8=$?
+sed 's/^/    [name-fallback] /' "$STDERR_LOG8"
+rm -f "$STDERR_LOG8"
+RES8="$(printf '%s\n' "$OUT8" | grep '^RESULT|' || true)"
+if [ "$RC8" -ne 0 ] || [ -z "$RES8" ]; then
+  bad "name-fallback fixture did not run to completion (rc=$RC8, out='$OUT8')"
+else
+  VR8=$(printf '%s' "$RES8" | sed -n 's/.*VERDICTS_RECEIVED=\([0-9]*\).*/\1/p')
+  AF8=$(printf '%s' "$RES8" | sed -n 's/.*ANY_FAIL=\([0-9]*\).*/\1/p')
+  [ "$VR8" = "2" ] \
+    && ok "VERDICTS_RECEIVED=2 (name-only drained + assignee-wins drained) — got $VR8" \
+    || bad "VERDICTS_RECEIVED expected 2, got '$VR8' — a drained reviewer known only by metadata.gc.session_name was not rescued: $RES8"
+  [ "$AF8" = "1" ] \
+    && ok "ANY_FAIL=1 (the name-only rescued FAIL still blocks the merge)" \
+    || bad "ANY_FAIL expected 1, got '$AF8' — $RES8"
+  case "$RES8" in
+    *"stale lock on retry"*) ok "name-only rescued FAIL's real reviewer comment survives into FAIL_REASONS" ;;
+    *) bad "name-only rescued FAIL's comment did not reach FAIL_REASONS — $RES8" ;;
+  esac
+  grep -q "close vb-name-dead" "$BD_LOG8" \
+    && ok "vb-name-dead (assignee absent, session_name drained) was closed" \
+    || bad "vb-name-dead was NOT closed — bd_log: $(tr '\n' ';' < "$BD_LOG8")"
+  grep -q "close vb-both-differ" "$BD_LOG8" \
+    && ok "vb-both-differ was closed (assignee dead-n4a is the identity that is peeked)" \
+    || bad "vb-both-differ was NOT closed — bd_log: $(tr '\n' ';' < "$BD_LOG8")"
+  if grep -q "close vb-name-alive" "$BD_LOG8"; then
+    bad "vb-name-alive was closed even though its reviewer (known only by session_name) is ALIVE — the mid-write guard must hold on the fallback channel too"
+  else
+    ok "vb-name-alive was NOT closed (peek of the session_name reviewer answered with live scrollback)"
+  fi
+  if grep -q "close vb-no-identity" "$BD_LOG8"; then
+    bad "vb-no-identity was closed with NO reviewer identity at all — nothing confirms death, so it must stay inert"
+  else
+    ok "vb-no-identity was NOT closed (assignee and session_name both empty -> inert, as before)"
+  fi
+  if grep -q '^$' "$PEEK_LOG8"; then
+    bad "gc session peek was called with an EMPTY id (vb-no-identity) — an empty identity must never be peeked"
+  else
+    ok "no peek with an empty id"
+  fi
+  if grep -q '^alive-n4b$' "$PEEK_LOG8"; then
+    bad "vb-both-differ: session_name (alive-n4b) was peeked although .assignee (dead-n4a) is set — assignee must take precedence"
+  else
+    ok "vb-both-differ: .assignee takes precedence over metadata.gc.session_name (alive-n4b never peeked)"
+  fi
+  grep -q '^dead-n1$' "$PEEK_LOG8" \
+    && ok "the session_name reviewer (dead-n1) was peeked — the fallback identity is what gets probed" \
+    || bad "dead-n1 was never peeked — peek log: $(tr '\n' ';' < "$PEEK_LOG8")"
+fi
+rm -f "$BD_LOG8" "$PEEK_LOG8"
+
+echo "── 9. MUTATION TEST: reverting the identity to assignee-only must reproduce ga-8wec8c ──"
+MUT8="$(mktemp "${TMPDIR:-/tmp}/gate-verdict-rescue-name-mutant-XXXXXX.sh" 2>/dev/null || echo "/tmp/gate-verdict-rescue-name-mutant-$$.sh")"
+cp "$DISPATCHER" "$MUT8"
+MUTATE8_OK=0
+python3 - "$MUT8" <<'PYEOF' && MUTATE8_OK=1
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    c = f.read()
+# Anchored on the rescue site's assignment (not the jq alone: the identical
+# expression also lives in Phase C's SESSION_IDS capture, which this mutant
+# must leave alone).
+anchor = '''VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""')'''
+n = c.count(anchor)
+if n != 1:
+    print("ANCHOR_NOT_UNIQUE count=%d" % n, file=sys.stderr)
+    sys.exit(1)
+mutant = '''VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""')'''
+c2 = c.replace(anchor, mutant, 1)
+if c2 == c:
+    print("SWAP_NO_OP", file=sys.stderr)
+    sys.exit(1)
+with open(path, "w") as f:
+    f.write(c2)
+PYEOF
+if [ "$MUTATE8_OK" != "1" ]; then
+  bad "mutation-test (8wec8c): could not construct the mutant (anchor not found exactly once — source shape changed?) — INCONCLUSIVE, treat as FAIL"
+else
+  BD_LOG_M8="$(mktemp)"; PEEK_LOG_M8="$(mktemp)"
+  OUT_M8="$(run_collect_name_fallback "$MUT8" "$BD_LOG_M8" "$PEEK_LOG_M8" 2>&1)"
+  VR_M8=$(printf '%s' "$OUT_M8" | grep '^RESULT|' | sed -n 's/.*VERDICTS_RECEIVED=\([0-9]*\).*/\1/p')
+  if [ "$VR_M8" = "1" ] && ! grep -q "close vb-name-dead" "$BD_LOG_M8"; then
+    ok "mutant (assignee-only identity): the name-only drained reviewer is NOT rescued (VERDICTS_RECEIVED=1) — proves part 8 catches ga-8wec8c"
+  else
+    bad "mutant (assignee-only) did NOT reproduce ga-8wec8c — part 8 may be vacuous. VERDICTS_RECEIVED=$VR_M8, bd_log: $(tr '\n' ';' < "$BD_LOG_M8")"
+  fi
+  rm -f "$BD_LOG_M8" "$PEEK_LOG_M8"
+fi
+rm -f "$MUT8"
+
 echo ""
 echo "== gate-verdict-drained-reviewer-rescue: PASS=$PASS FAIL=$FAIL =="
 [ "$FAIL" -eq 0 ]

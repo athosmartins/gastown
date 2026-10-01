@@ -10312,11 +10312,21 @@ gate_collect_verdicts() {
     # above in this file): a drained session answers "session not found" on
     # stderr; a genuinely alive-but-slow one answers with real scrollback.
     if [ "$VB_STATUS" != "closed" ] && echo "$VB_LABELS" | grep -E "verdict:(PASS|FAIL)" >/dev/null; then
-      VB_ASSIGNEE=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""')
-      if [ -n "$VB_ASSIGNEE" ]; then
-        VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_ASSIGNEE" --lines 1 2>&1 >/dev/null || true)
+      # ga-8wec8c: the reviewer's identity is .assignee, else
+      # metadata.gc.session_name — the same fallback channel the reviewer itself
+      # uses (ga-mo7q/ga-qqtoo). Measured 2026-10-01 (ga-vvo64u): assignee null
+      # while metadata.gc.session_name still named the reviewer (whether the
+      # assignee was cleared at teardown or never persisted, ga-590nx, is not
+      # established — the fix holds for both). Reading only .assignee made this
+      # rescue skip that bead, so the run sat 0/1 to the full timeout and the
+      # dead-reviewer requeue discarded a real verdict. Both empty -> VB_REVIEWER_ID stays ""
+      # and the rescue stays inert exactly as before: no identity, nothing to
+      # confirm dead. An empty string counts as absent (select != "").
+      VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""')
+      if [ -n "$VB_REVIEWER_ID" ]; then
+        VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_REVIEWER_ID" --lines 1 2>&1 >/dev/null || true)
         if [ "$(session_peek_reports_dead "$VB_PEEK_ERR")" = "1" ]; then
-          log "  Verdict bead $VB has a verdict label but is still OPEN and its reviewer ($VB_ASSIGNEE) is confirmed drained — rescuing as delivered and closing it (ga-7lz1)."
+          log "  Verdict bead $VB has a verdict label but is still OPEN and its reviewer ($VB_REVIEWER_ID) is confirmed drained — rescuing as delivered and closing it (ga-7lz1)."
           bd -C "$GC_CITY" close "$VB" -r "auto-closed by dispatcher: verdict label delivered, reviewer session drained before its own close (ga-7lz1)" 2>/dev/null || true
           VB_STATUS="closed"
         fi
@@ -10843,8 +10853,13 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         # vb_status_action already establishes for this file's status reads
         # so the classifier can distinguish "confirmed absent" from
         # "couldn't check" instead of conflating them.
+        # ga-8wec8c: a READABLE bead whose .assignee is empty is the same
+        # empty-reads-as-dead trap (reviewer_session_alive "" answers 0): fall
+        # back to metadata.gc.session_name, as the ga-7lz1 rescue in
+        # gate_collect_verdicts does, so a live reviewer whose assignee write
+        # was lost is not requeued as dead. Both empty stays "" (unchanged).
         if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
-          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || true)
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
         else
           PC_SID="__UNKNOWN__"
         fi

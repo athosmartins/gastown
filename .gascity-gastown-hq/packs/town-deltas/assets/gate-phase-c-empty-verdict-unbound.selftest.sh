@@ -202,8 +202,13 @@ loop = '''      SESSION_IDS=()
         # vb_status_action already establishes for this file's status reads
         # so the classifier can distinguish "confirmed absent" from
         # "couldn't check" instead of conflating them.
+        # ga-8wec8c: a READABLE bead whose .assignee is empty is the same
+        # empty-reads-as-dead trap (reviewer_session_alive "" answers 0): fall
+        # back to metadata.gc.session_name, as the ga-7lz1 rescue in
+        # gate_collect_verdicts does, so a live reviewer whose assignee write
+        # was lost is not requeued as dead. Both empty stays "" (unchanged).
         if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
-          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || true)
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
         else
           PC_SID="__UNKNOWN__"
         fi
