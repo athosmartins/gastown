@@ -1,0 +1,296 @@
+{
+ "dog": {
+  "D": 44132,
+  "cut": 19871.042623533223,
+  "Dp": 24260.957376466777,
+  "trim": 11389928.583492087,
+  "l1": 6093010.988874786,
+  "both": 14739477.207969448,
+  "items": [
+   [
+    "near-duplicate work_query scripts (measured)",
+    9845,
+    1.0
+   ],
+   [
+    "engine-window-patch",
+    2856,
+    0.85
+   ],
+   [
+    "rule-3 athos.acao (guard exists)",
+    1752,
+    0.85
+   ],
+   [
+    "next-action-mayor-waiting",
+    1900,
+    0.75
+   ],
+   [
+    "research-only-channels",
+    1653,
+    0.75
+   ],
+   [
+    "models",
+    2589,
+    0.65
+   ],
+   [
+    "rule-1 + rule-2 (headless never asks Athos)",
+    1555,
+    0.7
+   ],
+   [
+    "nudge-permission-dialog (rm -rf/sudo denied)",
+    840,
+    0.8
+   ]
+  ]
+ },
+ "wa-worker": {
+  "D": 39477,
+  "cut": 10234.654542197775,
+  "Dp": 29242.345457802225,
+  "trim": 4927045.508101879,
+  "l1": 1848565.173236087,
+  "both": 6296358.814508941,
+  "items": [
+   [
+    "near-duplicate scripts (measured)",
+    2207,
+    1.0
+   ],
+   [
+    "engine-window-patch",
+    2826,
+    0.85
+   ],
+   [
+    "rule-3 athos.acao",
+    1734,
+    0.85
+   ],
+   [
+    "next-action-mayor-waiting",
+    1880,
+    0.75
+   ],
+   [
+    "models",
+    2562,
+    0.65
+   ],
+   [
+    "rule-1 + rule-2",
+    1539,
+    0.7
+   ]
+  ]
+ },
+ "ps-worker": {
+  "D": 52877,
+  "cut": 16406.617440554204,
+  "Dp": 36470.382559445796,
+  "trim": 1836755.356139849,
+  "l1": 3980482.1810906855,
+  "both": 4582177.901205463,
+  "items": [
+   [
+    "near-duplicate scripts (measured)",
+    7156,
+    1.0
+   ],
+   [
+    "engine-window-patch",
+    2787,
+    0.85
+   ],
+   [
+    "rule-3 athos.acao",
+    1710,
+    0.85
+   ],
+   [
+    "next-action-mayor-waiting",
+    1854,
+    0.75
+   ],
+   [
+    "models",
+    2527,
+    0.65
+   ],
+   [
+    "rule-1 + rule-2",
+    1518,
+    0.7
+   ],
+   [
+    "mockup-s3 (0% use in sample)",
+    1665,
+    0.8
+   ]
+  ]
+ },
+ "gate-reviewer": {
+  "D": 26988,
+  "cut": 9970.896593464744,
+  "Dp": 17017.103406535258,
+  "trim": 7878373.402426748,
+  "l1": 6861134.506121734,
+  "both": 12204616.005688224,
+  "items": [
+   [
+    "near-duplicate script (measured)",
+    1835,
+    1.0
+   ],
+   [
+    "rule-1",
+    856,
+    0.8
+   ],
+   [
+    "rule-2",
+    649,
+    0.8
+   ],
+   [
+    "rule-3 athos.acao",
+    1696,
+    0.9
+   ],
+   [
+    "rule-4 outward actions (reviewer is read-only)",
+    1387,
+    0.7
+   ],
+   [
+    "models",
+    2506,
+    0.7
+   ],
+   [
+    "secrets",
+    449,
+    0.8
+   ],
+   [
+    "native Dolt-hang + mail lifecycle + architecture (~6.5k chars)",
+    2901,
+    0.8
+   ]
+  ]
+ },
+ "refino-gate-reviewer": {
+  "D": 25757,
+  "cut": 10281.855414718188,
+  "Dp": 15475.144585281812,
+  "trim": 558505.7162016256,
+  "l1": 646116.0972452419,
+  "both": 946700.7708954223,
+  "items": [
+   [
+    "near-duplicate script (measured)",
+    2027,
+    1.0
+   ],
+   [
+    "rule-1",
+    868,
+    0.8
+   ],
+   [
+    "rule-2",
+    659,
+    0.8
+   ],
+   [
+    "rule-3 athos.acao",
+    1721,
+    0.9
+   ],
+   [
+    "rule-4",
+    1407,
+    0.7
+   ],
+   [
+    "models",
+    2543,
+    0.7
+   ],
+   [
+    "secrets",
+    456,
+    0.8
+   ],
+   [
+    "native Dolt-hang + mail + architecture",
+    2943,
+    0.8
+   ]
+  ]
+ },
+ "auto-refiner": {
+  "D": 36567,
+  "cut": 14667.322245516545,
+  "Dp": 21899.677754483455,
+  "trim": 180949.1180417493,
+  "l1": 117148.11364856258,
+  "both": 251108.16686853647,
+  "items": [
+   [
+    "near-duplicate scripts (measured)",
+    2731,
+    1.0
+   ],
+   [
+    "witness-startup (no witness runs)",
+    2387,
+    1.0
+   ],
+   [
+    "engine-window-patch",
+    2861,
+    0.85
+   ],
+   [
+    "mockup-s3",
+    1709,
+    0.8
+   ],
+   [
+    "research-only-channels",
+    1655,
+    0.75
+   ],
+   [
+    "next-action-mayor-waiting",
+    1903,
+    0.75
+   ],
+   [
+    "nudge-permission-dialog",
+    841,
+    0.8
+   ],
+   [
+    "assignee-when-building",
+    905,
+    0.8
+   ],
+   [
+    "models",
+    2593,
+    0.65
+   ]
+  ]
+ },
+ "_combined": {
+  "wte_day": 42592240.384129286,
+  "pct_pool": 7.875984153765854
+ }
+}

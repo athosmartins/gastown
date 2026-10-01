@@ -1,0 +1,58 @@
+{
+ "dog": {
+  "chars": 95703,
+  "bytes": 97461,
+  "tokens": 44132,
+  "chars_per_token": 2.169,
+  "bytes_per_token": 2.208
+ },
+ "wa-worker": {
+  "chars": 86533,
+  "bytes": 88449,
+  "tokens": 39477,
+  "chars_per_token": 2.192,
+  "bytes_per_token": 2.241
+ },
+ "ps-worker": {
+  "chars": 117502,
+  "bytes": 119544,
+  "tokens": 52877,
+  "chars_per_token": 2.222,
+  "bytes_per_token": 2.261
+ },
+ "gate-reviewer": {
+  "chars": 60472,
+  "bytes": 61661,
+  "tokens": 26988,
+  "chars_per_token": 2.241,
+  "bytes_per_token": 2.285
+ },
+ "refino-gate-reviewer": {
+  "chars": 56882,
+  "bytes": 58031,
+  "tokens": 25757,
+  "chars_per_token": 2.208,
+  "bytes_per_token": 2.253
+ },
+ "auto-refiner": {
+  "chars": 79180,
+  "bytes": 81067,
+  "tokens": 36567,
+  "chars_per_token": 2.165,
+  "bytes_per_token": 2.217
+ },
+ "mayor": {
+  "chars": 90591,
+  "bytes": 92519,
+  "tokens": 41233,
+  "chars_per_token": 2.197,
+  "bytes_per_token": 2.244
+ },
+ "peter-wa": {
+  "chars": 71174,
+  "bytes": 73177,
+  "tokens": 32988,
+  "chars_per_token": 2.158,
+  "bytes_per_token": 2.218
+ }
+}
