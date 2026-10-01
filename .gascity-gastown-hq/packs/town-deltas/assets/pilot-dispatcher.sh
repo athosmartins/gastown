@@ -116,8 +116,10 @@ PILOT_TEST_PS_WORKER_LIVE_COUNT="${PILOT_TEST_PS_WORKER_LIVE_COUNT:-}"
 # pool-arm attempt) whose pool is positively at its per-pool cap cannot dispatch this sweep, so
 # dispatch_lane() skips it BEFORE the atomic claim — otherwise every sweep would
 # claim + release (~5 Dolt writes) every queued bead of a saturated pool. Only a
-# positive "pool is full" reading skips; an unreadable probe falls through to
-# dispatch_one(), which re-checks fresh. Set PILOT_POOL_CAP_PRECLAIM_SKIP=0 to
+# positive "pool is full" reading skips. An unreadable probe never skips a bead on a
+# guess — it HALTS the sweep's dispatch phase instead (ga-5je3zv): dispatch_one() would
+# read the same sticky unreadable flag and spawn nothing, after a claim it then has to
+# undo. Set PILOT_POOL_CAP_PRECLAIM_SKIP=0 to
 # disable (falls back to claim→cap→release per sweep; the bead is still queued
 # correctly, just with the churn).
 PILOT_POOL_CAP_PRECLAIM_SKIP="${PILOT_POOL_CAP_PRECLAIM_SKIP:-1}"
@@ -9150,11 +9152,13 @@ fi
 #   2. _pilot_pool_cap_full_for — dispatch_lane()'s PRE-claim skip for a bead ALREADY
 #      committed (gc.routed_to) to a pool that is positively at cap: zero writes.
 # Only a positive "pool is full" reading skips. Every "cannot tell" path (probe failed,
-# non-numeric, unknown pool, kill switch) returns 1 = proceed to the claim, so an unreadable
-# session list never makes THIS pre-claim skip fire on a guess. That is all this function
-# decides: dispatch_one() then re-probes fresh and, if it cannot read the count either, spawns
-# NOTHING and releases the claim (ga-oa004t, fail-closed) — this pre-claim step being
-# permissive is not what lets a worker past the cap. The per-sweep
+# non-numeric, unknown pool, kill switch) returns 1 = this function does not skip the bead, so
+# an unreadable session list never makes THIS pre-claim skip fire on a guess. A probe that
+# FAILED for a pool-committed candidate is additionally reported through _PCAP_COUNT_UNREADABLE
+# (the other "cannot tell" paths are not): dispatch_lane() halts the dispatch phase on it
+# (ga-5je3zv) instead of proceeding to the claim, because dispatch_one() would read the same
+# sticky unreadable flag and spawn NOTHING (ga-oa004t, fail-closed — unchanged), only after a
+# claim + prompt assembly it then has to undo. Nothing here lets a worker past the cap. The per-sweep
 # count cache can be stale (sweeps run ~5min apart and it is only ever bumped UP after this
 # script's own spawns), which can defer a bead by at most one sweep — never strand it.
 _PCAP_LIVE_WA=""   # per-sweep cache of the live wa-worker count ("" = not probed yet)
@@ -9177,7 +9181,8 @@ _pilot_pool_live_count() {
       _n="${_PCAP_LIVE_WA:-}"
       if [ -z "$_n" ] && [ -n "${PILOT_TEST_WA_WORKER_LIVE_COUNT:-}" ]; then _n="$PILOT_TEST_WA_WORKER_LIVE_COUNT"; fi
       # A probe already failed for this pool this sweep: do not pay another failing (up to 10s)
-      # probe per routed candidate — dispatch_one() re-checks fresh for the ones that get that far.
+      # probe. (dispatch_lane() halts on the first failure, ga-5je3zv, so a second call here means a
+      # caller that did not — this stays as the defence in depth it was.)
       if [ -z "$_n" ] && [ -n "${_PCAP_WARNED_WA:-}" ]; then return 1; fi ;;
     ps-worker)
       _n="${_PCAP_LIVE_PS:-}"
@@ -9197,20 +9202,21 @@ _pilot_pool_live_count() {
   fi
   case "$_n" in
     ''|*[!0-9]*)
-      # Third state — the count could not be read. Not skipping is the deliberate default
-      # (only a POSITIVE "pool is full" may suppress a dispatch, and dispatch_one() re-probes
-      # fresh), but it must not be SILENT: once per pool per sweep, so a dead probe shows up
-      # here instead of as unexplained claim→cap→release churn quietly coming back.
+      # Third state — the count could not be read. Never skipping a bead on a guess is deliberate
+      # (only a POSITIVE "pool is full" may suppress a dispatch), and the caller is told through
+      # the return code: _pilot_pool_cap_full_for flags it and dispatch_lane() HALTS the dispatch
+      # phase (ga-5je3zv). It must not be SILENT either: once per pool per sweep, so a dead probe
+      # shows up here, next to the halt line, instead of as unexplained claim→cap→release churn.
       case "$_pool" in
         wa-worker)
           if [ -z "${_PCAP_WARNED_WA:-}" ]; then
             _PCAP_WARNED_WA=1
-            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for wa-worker this sweep; dispatch_one() re-checks fresh and, if it cannot read the count either, spawns NOTHING (ga-oa004t fail-closed)."
+            warn "ga-in9ebr: cannot read the wa-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for wa-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
           fi ;;
         ps-worker)
           if [ -z "${_PCAP_WARNED_PS:-}" ]; then
             _PCAP_WARNED_PS=1
-            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — pre-claim pool-cap skip is OFF for ps-worker this sweep; dispatch_one() re-checks fresh and, if it cannot read the count either, spawns NOTHING (ga-oa004t fail-closed)."
+            warn "ga-in9ebr: cannot read the ps-worker live session count (session list unreadable) — the pre-claim pool-cap skip cannot tell full from free for ps-worker this sweep, so the dispatch phase is HALTED rather than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned without the count (ga-oa004t fail-closed)."
           fi ;;
       esac
       return 1 ;;
