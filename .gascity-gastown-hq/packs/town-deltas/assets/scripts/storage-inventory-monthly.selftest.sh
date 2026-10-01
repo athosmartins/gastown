@@ -387,5 +387,81 @@ RC=$?
 [ "$RC" -eq 0 ] && ok "mac-mini back to 100.00 (same as the preserved baseline) -> healthy, exit 0" || bad "expected exit 0 once mac-mini recovers at the same value, got $RC"
 grep -q "Mac mini:.*status=✅" "$STORAGE_INVENTORY_LOG" && ok "recovery run compares against the PRESERVED real baseline (status=✅), not a reset 'novo'" || bad "expected status=✅ against preserved baseline: $(grep 'Mac mini:' "$STORAGE_INVENTORY_LOG")"
 
+# ════════════════════════════════════════════════════════════════════════════
+# 5. Header/legend duplication (ga-hdab26). The block file used to be written
+#    as [### header, '', legend, '', BEGIN, data..., END]; the replace path
+#    swapped the whole file in at BEGIN but left the OLD header/legend (which
+#    sit BEFORE BEGIN in the doc) untouched -> +1 copy per run (4 copies by
+#    2026-10-01). Every fixture above starts its block at BEGIN, so none of
+#    them could see it. The header+legend now live INSIDE the markers.
+# ════════════════════════════════════════════════════════════════════════════
+HDR_RE='Última medição automatizada'
+LEGEND_FIXED='Gerado por `storage-inventory-monthly.sh`'
+_run_main_ok() {
+  FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+    FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+    FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+}
+
+echo "── main: 3 runs over the same doc -> exactly ONE header and ONE legend (ga-hdab26) ──"
+cat > "$DOC_PATH" <<'EOF'
+# Intro
+
+## Parte 0: Mapa
+
+| # | Local |
+|---|---|
+| 1 | Mac mini |
+
+---
+
+## Parte 1: SQLite — shared/data/
+EOF
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+_run_main_ok; _run_main_ok; _run_main_ok
+N_HDR="$(grep -c "$HDR_RE" "$DOC_PATH")"
+N_LEGEND="$(grep -cF "$LEGEND_FIXED" "$DOC_PATH")"
+[ "$N_HDR" -eq 1 ] && ok "3 runs -> exactly 1 'Última medição automatizada' header" || bad "expected 1 header after 3 runs, found $N_HDR"
+[ "$N_LEGEND" -eq 1 ] && ok "3 runs -> exactly 1 legend line" || bad "expected 1 legend after 3 runs, found $N_LEGEND"
+[ "$(grep -cF "$BEGIN_MARK" "$DOC_PATH")" -eq 1 ] && [ "$(grep -cF "$END_MARK" "$DOC_PATH")" -eq 1 ] && ok "still exactly one marker pair" || bad "marker pair duplicated or lost"
+B="$(grep -nF "$BEGIN_MARK" "$DOC_PATH" | cut -d: -f1)"; E="$(grep -nF "$END_MARK" "$DOC_PATH" | cut -d: -f1)"; H="$(grep -n "$HDR_RE" "$DOC_PATH" | cut -d: -f1)"
+{ [ "$H" -gt "$B" ] && [ "$H" -lt "$E" ]; } && ok "header lives INSIDE the markers (so a replace owns it)" || bad "header at line $H is outside markers ($B..$E)"
+
+echo "── _update_doc_block: legacy doc with 4 stacked header/legend copies BEFORE begin -> heals to exactly one (ga-hdab26) ──"
+LEGACY="$SCRATCH/legacy.md"
+LEG_HDR='### Última medição automatizada (script mensal, ga-z297h)'
+LEG_LEGEND='> Gerado por `storage-inventory-monthly.sh` (launchd `com.gascity.storage-inventory-monthly`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±20% da rodada anterior.'
+{
+  printf '%s\n' "# Intro" "" "## Parte 0: Mapa" "" "| # | Local |" "|---|---|" "| 1 | Mac mini |" ""
+  for _i in 1 2 3 4; do printf '%s\n' "$LEG_HDR" "" "$LEG_LEGEND" ""; done
+  printf '%s\n' "$BEGIN_MARK" "<!-- storage-inventory:data mac_mini_used_gb=192.55 -->" "| old | row |" "$END_MARK" "" \
+    "## Parte 1: SQLite — shared/data/" "" "### classifications.db" "Content here."
+} > "$LEGACY"
+cp "$LEGACY" "$SCRATCH/legacy-before.md"
+NEWBLOCK="$SCRATCH/newblock.txt"
+printf '%s\n' "$BEGIN_MARK" "$LEG_HDR" "" "$LEG_LEGEND" "" "<!-- storage-inventory:data mac_mini_used_gb=200 -->" "| new | row |" "$END_MARK" > "$NEWBLOCK"
+RESULT="$(_update_doc_block "$LEGACY" "$NEWBLOCK")"; RC=$?
+[ "$RC" -eq 0 ] && [ "$RESULT" = "replaced" ] && ok "legacy doc -> 'replaced'" || bad "expected rc=0/'replaced', got rc=$RC/'$RESULT'"
+[ "$(grep -c "$HDR_RE" "$LEGACY")" -eq 1 ] && ok "4 stacked legacy headers collapse to exactly 1" || bad "expected 1 header, found $(grep -c "$HDR_RE" "$LEGACY")"
+[ "$(grep -cF "$LEGEND_FIXED" "$LEGACY")" -eq 1 ] && ok "4 stacked legacy legends collapse to exactly 1" || bad "expected 1 legend, found $(grep -cF "$LEGEND_FIXED" "$LEGACY")"
+grep -q "mac_mini_used_gb=200" "$LEGACY" && ! grep -q "mac_mini_used_gb=192.55" "$LEGACY" && ok "block data replaced as before" || bad "block data not replaced"
+diff <(sed -n '/## Parte 1: SQLite/,$p' "$SCRATCH/legacy-before.md") <(sed -n '/## Parte 1: SQLite/,$p' "$LEGACY") >/dev/null \
+  && ok "content from the anchor heading onward is byte-identical" || bad "migration mutated content after the block"
+diff <(sed -n '1,/^| 1 | Mac mini |$/p' "$SCRATCH/legacy-before.md") <(sed -n '1,/^| 1 | Mac mini |$/p' "$LEGACY") >/dev/null \
+  && ok "Part 0 (everything before the stale headers) is byte-identical" || bad "migration mutated Part 0"
+cp "$LEGACY" "$SCRATCH/legacy-healed.md"
+RESULT="$(_update_doc_block "$LEGACY" "$NEWBLOCK")"
+diff "$SCRATCH/legacy-healed.md" "$LEGACY" >/dev/null && ok "re-running on the healed doc is a no-op (idempotent)" || bad "second replace changed an already-healed doc"
+
+echo "── _update_doc_block: a header-like line NOT directly before begin is human content -> never touched (SAFE-EDIT) ──"
+KEEP="$SCRATCH/keep.md"
+{
+  printf '%s\n' "# Intro" "" "$LEG_HDR" "" "Prosa escrita por um humano que NAO faz parte do bloco gerado." ""
+  printf '%s\n' "$BEGIN_MARK" "<!-- storage-inventory:data mac_mini_used_gb=1 -->" "$END_MARK" "" "## Parte 1: SQLite — shared/data/"
+} > "$KEEP"
+RESULT="$(_update_doc_block "$KEEP" "$NEWBLOCK")"; RC=$?
+[ "$RC" -eq 0 ] && grep -q "Prosa escrita por um humano" "$KEEP" && ok "human prose next to a header-like line survives" || bad "human prose was removed"
+[ "$(grep -c "$HDR_RE" "$KEEP")" -eq 2 ] && ok "the header-like line outside the contiguous run is left alone (2 = human's + the block's own)" || bad "expected 2 headers (human + block), found $(grep -c "$HDR_RE" "$KEEP")"
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -21,14 +21,18 @@
 #
 # SAFE-EDIT DESIGN: never rewrites Part 0's own hand-maintained table cells.
 # Writes only inside a delimited block (storage-inventory:begin/end HTML
-# comments) so a bug here can never corrupt content outside that block. The
-# block's own embedded data comment is the script's ONLY state — no separate
-# state file, so the doc stays self-contained and portable. First run (no
-# markers yet) inserts the block right before the unique "## Parte 1:
-# SQLite" heading; every later run replaces only the content between its own
-# markers. If neither the markers nor that anchor heading exist (doc
-# restructured), fails closed — logs and skips the doc write rather than
-# guessing a new location.
+# comments) so a bug here can never corrupt content outside that block — the
+# block's own heading and legend live inside the markers too (ga-hdab26). The
+# one exception is a legacy migration: stale copies of that same generated
+# heading/legend left directly above BEGIN by the old layout are removed on
+# replace (see _update_doc_block; nothing else outside the markers is
+# touched). The block's own embedded data comment is the script's ONLY
+# state — no separate state file, so the doc stays self-contained and
+# portable. First run (no markers yet) inserts the block right before the
+# unique "## Parte 1: SQLite" heading; every later run replaces only the
+# content between its own markers. If neither the markers nor that anchor
+# heading exist (doc restructured), fails closed — logs and skips the doc
+# write rather than guessing a new location.
 #
 # Read-only against everything except: (a) the delimited block in
 # data_dictionary.md, committed+pushed narrowly (this file only, never -A),
@@ -55,6 +59,12 @@ DATA_DIR="${STORAGE_INVENTORY_DATA_DIR:-/System/Volumes/Data}"
 NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 BEGIN_MARK='<!-- storage-inventory:begin -->'
 END_MARK='<!-- storage-inventory:end -->'
+# The block's own heading + legend. main() builds them from these prefixes and
+# _update_doc_block matches on the same prefixes to recognise stale copies
+# left OUTSIDE the markers by the pre-ga-hdab26 layout — one source of truth,
+# so the two can never drift apart.
+HDR_PREFIX='### Última medição automatizada'
+LEGEND_PREFIX='> Gerado por `storage-inventory-monthly.sh`'
 ANCHOR_RE='^## Parte 1: SQLite'
 SKIP_GIT="${STORAGE_INVENTORY_SKIP_GIT:-0}"
 
@@ -220,16 +230,30 @@ _extract_field() {
 # _update_doc_block <doc> <new_block_file> — SAFE-EDIT: replaces content
 # between existing markers, or inserts before the anchor heading on first
 # run. Fails closed (no write) if neither markers nor anchor are found.
+#
+# The new block file starts at BEGIN_MARK and carries its own heading +
+# legend. Docs written by the pre-ga-hdab26 layout have those generated lines
+# OUTSIDE (above) the markers, one more copy per run; on replace, the
+# contiguous run of such lines (heading/legend prefixes + the blank lines
+# between them) sitting DIRECTLY above BEGIN_MARK is dropped, since the new
+# block re-emits them inside the markers. Only that adjacent run, only those
+# exact generated prefixes: a run followed by anything else is flushed back
+# unchanged, so human content is never removed.
 _update_doc_block() {
   local doc="$1" blockfile="$2" tmp
   [ -f "$doc" ] || { echo "doc-missing"; return 1; }
   tmp="$(mktemp "${doc}.tmp.XXXXXX")" || { echo "mktemp-falhou"; return 1; }
   if grep -qF "$BEGIN_MARK" "$doc" && grep -qF "$END_MARK" "$doc"; then
-    awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v blockfile="$blockfile" '
-      $0 == begin { while ((getline line < blockfile) > 0) print line; close(blockfile); skip=1; next }
+    awk -v begin="$BEGIN_MARK" -v end="$END_MARK" -v blockfile="$blockfile" \
+        -v hdr="$HDR_PREFIX" -v legend="$LEGEND_PREFIX" '
+      function flush_held(   i) { for (i = 1; i <= nheld; i++) print held[i]; nheld = 0 }
+      $0 == begin { nheld = 0; while ((getline line < blockfile) > 0) print line; close(blockfile); skip=1; next }
       $0 == end { skip=0; next }
       skip { next }
-      { print }
+      index($0, hdr) == 1 || index($0, legend) == 1 { held[++nheld] = $0; next }
+      nheld > 0 && $0 == "" { held[++nheld] = $0; next }
+      { flush_held(); print }
+      END { flush_held() }
     ' "$doc" > "$tmp" && mv "$tmp" "$doc" && { echo "replaced"; return 0; }
     rm -f "$tmp" 2>/dev/null
     echo "write-falhou"; return 1
@@ -394,11 +418,15 @@ main() {
   local block_file
   block_file="$(mktemp)" || { log "mktemp falhou para o bloco do doc"; _file_summary_bead "$table_md" 1; return 1; }
   {
-    echo "### Última medição automatizada (script mensal, ga-z297h)"
-    echo ""
-    echo "> Gerado por \`storage-inventory-monthly.sh\` (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior."
-    echo ""
+    # BEGIN_MARK must be the FIRST line: the heading and legend live INSIDE
+    # the markers so a replace owns (and rewrites) them. Written before the
+    # markers they were never replaced, and every run stacked one more copy
+    # above the block (ga-hdab26: 4 copies by 2026-10-01).
     echo "$BEGIN_MARK"
+    echo "${HDR_PREFIX} (script mensal, ga-z297h)"
+    echo ""
+    echo "${LEGEND_PREFIX} (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior."
+    echo ""
     # On a failed measurement (mm_used/s3_total/drv_used empty), carry the
     # PREVIOUS recorded value forward instead of writing 0 — a literal 0
     # here becomes next month's baseline, and _pct_delta's own zero-case
