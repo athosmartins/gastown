@@ -46,7 +46,14 @@ ready_delay_ms = 0
 # normal, gate stalled). path_check keeps the engine's "is it installed" probe on the REAL claude, not
 # on the wrapper. The Mayor and attended crews ("claude" / "claude-rc") are deliberately NOT wrapped.
 # Kill switch, for NEW launches and with no config reload: touch <city>/.gc/no-lowprio (script header).
-command = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-lowprio.sh"
+# ga-55vrxw (E10 of P0 ga-ufskhy): the command is claude-ctxcap-ab.sh, a pass-through IN FRONT of
+# claude-lowprio.sh. It does nothing unless <city>/.gc/context-ab.conf exists; with it, enrolled roles get
+# `--autocompact <window>` on a hash-of-session-name split (pool cost is context size x turns: ~281k tokens/turn
+# measured on wa-worker, 2026-10-01). It execs claude-lowprio.sh, which execs claude: same pid, same low
+# priority, argv untouched but for that one flag. It is a separate file rather than a block in
+# claude-lowprio.sh so it cannot collide with the effort A/B (ga-5c3msy) that is changing that file.
+# Kill switch, for NEW launches and with no config reload: touch <city>/.gc/no-ctx-ab (script header).
+command = "/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-ctxcap-ab.sh"
 path_check = "claude"
 
 [imports]

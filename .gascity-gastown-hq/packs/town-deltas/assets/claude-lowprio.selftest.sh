@@ -68,7 +68,7 @@ run_wrapper() {
   while [ "$#" -gt 0 ]; do a="$1"; shift; [ "$a" = "--" ] && break; envs+=("$a"); done
   local out="$W/out.$$.$RANDOM"
   env -i PATH="${SHIM_PATH:-$PATH}" HOME="$W" TMPDIR="$W" GC_LOWPRIO_CLAUDE_BIN="$FAKE" ${envs[@]+"${envs[@]}"} \
-    ${NICE_PREFIX:-} "$WRAPPER" "$@" > "$out" 2>"$out.err" &
+    ${NICE_PREFIX:-} "${LAUNCHER:-$WRAPPER}" "$@" > "$out" 2>"$out.err" &
   LAST_PID=$!
   wait "$LAST_PID"; LAST_RC=$?
   OUT="$(cat "$out")"; ERR="$(cat "$out.err")"
@@ -203,9 +203,13 @@ cmd_val="$(printf '%s' "$cmd_line" | sed -n 's/^command[[:space:]]*=[[:space:]]*
 if [ -z "$cmd_val" ]; then
   bad "[providers.claude-headless] has no command = \"…/claude-lowprio.sh\" — pool sessions are NOT launched low-priority"
 else
+  # ga-55vrxw: the provider may point at claude-ctxcap-ab.sh, a pass-through that only ever adds one flag and
+  # then execs claude-lowprio.sh. That is accepted ONLY if the chain is proven below to still end low-priority.
+  launcher_kind=other
   case "$cmd_val" in
-    */scripts/claude-lowprio.sh) ok "claude-headless.command launches the wrapper ($cmd_val)" ;;
-    *) bad "claude-headless.command is '$cmd_val', not …/scripts/claude-lowprio.sh" ;;
+    */scripts/claude-lowprio.sh) launcher_kind=direct; ok "claude-headless.command launches the wrapper ($cmd_val)" ;;
+    */scripts/claude-ctxcap-ab.sh) launcher_kind=chain; ok "claude-headless.command launches the context-cap front wrapper, which must hand over to claude-lowprio.sh ($cmd_val)" ;;
+    *) bad "claude-headless.command is '$cmd_val', not …/scripts/claude-lowprio.sh (nor the …/scripts/claude-ctxcap-ab.sh front that execs it)" ;;
   esac
   case "$cmd_val" in /*) ok "the command is an absolute path (the engine execs it as-is; same convention as the pre_start scripts)" ;; *) bad "command '$cmd_val' is not absolute" ;; esac
   # The command is an absolute path into the LIVE city; the same file must exist, executable, at the same
@@ -218,7 +222,24 @@ else
   else
     bad "$rel is missing or not executable under $CITY_DIR — city.toml would point at a launcher that does not exist"
   fi
-  [ "$CITY_DIR/$rel" -ef "$WRAPPER" ] && ok "…and it is the very file this selftest exercises" || bad "the configured launcher ($CITY_DIR/$rel) is not the wrapper under test ($WRAPPER)"
+  if [ "$launcher_kind" = chain ]; then
+    front="$CITY_DIR/$rel"
+    [ "$(dirname "$front")/claude-lowprio.sh" -ef "$WRAPPER" ] \
+      && ok "…its sibling next hop claude-lowprio.sh is the very file this selftest exercises" \
+      || bad "the front wrapper's sibling claude-lowprio.sh is not the wrapper under test ($WRAPPER)"
+    # The wiring above is text; this is the behaviour: launched THROUGH the front wrapper, the real claude must
+    # still inherit the raised niceness, keep the pid, and receive its argv untouched (no conf => inert).
+    if [ "$HEADROOM" -eq 1 ]; then
+      LAUNCHER="$front" run_wrapper GC_LOWPRIO_NICE="$T" -- --model sonnet --session-id 5a5a5a5a-0000-4000-8000-000000000001
+      [ "$(field ni "$OUT")" = "$T" ] && ok "launched through the front wrapper the claude process still has ni=$T" || bad "through the front wrapper ni='$(field ni "$OUT")' (want $T) — pool sessions would NOT be low-priority"
+      [ "$(field pid "$OUT")" = "$LAST_PID" ] && ok "…and the pid survived both exec hops (the tmux pane still runs claude)" || bad "pid changed across the front wrapper: claude=$(field pid "$OUT") launched=$LAST_PID"
+      [ "$(field argc "$OUT")" = "4" ] && [ "$(field arg1 "$OUT")" = "[--model]" ] && ok "…with argv untouched when no context-ab.conf exists" || bad "argv changed by the front wrapper with no conf: argc=$(field argc "$OUT") arg1=$(field arg1 "$OUT")"
+    else
+      skip "no niceness headroom (ambient ni=$AMB): cannot prove the front wrapper still ends low-priority"
+    fi
+  else
+    [ "$CITY_DIR/$rel" -ef "$WRAPPER" ] && ok "…and it is the very file this selftest exercises" || bad "the configured launcher ($CITY_DIR/$rel) is not the wrapper under test ($WRAPPER)"
+  fi
 fi
 [ "$(key_of claude-headless path_check)" = 'path_check = "claude"' ] \
   && ok "path_check = \"claude\": the engine still verifies the REAL binary, not the wrapper" \
