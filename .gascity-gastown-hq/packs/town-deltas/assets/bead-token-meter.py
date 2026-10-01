@@ -26,7 +26,9 @@ Como uma sessão vira bead (tentativas, em ordem de confiança):
     claim k e antes do claim k+1 são do bead k; mensagens ANTES do 1º claim são o overhead de partida (`_pre`), rateado igual entre
     os beads da sessão. NÃO se usa "id citado na 1ª mensagem": o preâmbulo do papel cita ~93 beads de doutrina (medido).
   * revisor do gate: o cabeçalho "QUALITY GATE REVIEW — … for branch: <ramo>" + a ponte ramo -> bead do log do gate (o log tem os
-    dois campos). A pré-revisão do construtor (E3) usa o mesmo cabeçalho mas roda `claude -p --no-session-persistence`: NÃO deixa
+    dois campos). `gc bd show` quebra o cabeçalho em ~80 colunas depois de um hífen do ramo (`crew/wa-worker/wa-` ⏎ `x5g89`): o ramo é
+    juntado com a linha de continuação (`review_branches`); sem isso o ramo truncado não está na ponte e o custo da revisão não chega ao
+    bead. A pré-revisão do construtor (E3) usa o mesmo cabeçalho mas roda `claude -p --no-session-persistence`: NÃO deixa
     transcrito, então o custo dela não aparece aqui (está nas linhas próprias dela); o caminho `pregate-review` só vale se isso mudar.
   * sessão de pool sem nenhum claim = SPAWN OCIOSO (achou a fila vazia e saiu). É custo real e fica numa linha própria; não é
     "custo de bead zero".
@@ -77,7 +79,7 @@ CITY = Path(os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-
 LEDGER = Path(os.environ.get("BTM_LEDGER") or CITY / ".gc" / "token-ledger" / "sessions.jsonl")
 GATE_LOG = Path(os.environ.get("BTM_GATE_LOG") or CITY / ".gc" / "quality-gate.jsonl")
 PROJECTS = [Path(p) for p in (os.environ.get("BTM_PROJECTS") or os.path.expanduser("~/.claude/projects")).split(":") if p]
-SCHEMA = 3     # 3 = claims revalidados contra o resultado visível (unconfirmed/failed fora), 1 pending por (tool_use, bead), bucket de grupo; linha v<3 é reescaneada
+SCHEMA = 4     # 4 = ramo do revisor juntado com a continuação do cabeçalho quebrado em ~80 colunas; 3 = claims revalidados contra o resultado visível (unconfirmed/failed fora), 1 pending por (tool_use, bead), bucket de grupo; linha v<4 é reescaneada
 AWS = os.environ.get("BTM_AWS") or "aws"
 S3_BUCKET = os.environ.get("BTM_S3_BUCKET") or "urblink-claude-history-backup"
 
@@ -107,16 +109,22 @@ BUILDERS = POOL_BUILDERS + ("crew",)
 REVIEWERS = ("gate-reviewer", "pregate-review")
 BEACON = re.compile(r"^\[gascity\]\s+(\S+)")
 REVIEW_HEADER = re.compile(r"QUALITY GATE REVIEW\s+—\s+You are reviewer \d+ of \d+ for branch:\s*(\S+)")
+BRANCH_CONT = re.compile(r"[ \t]*\r?\n[ \t]*(?:\d+\t[ \t]*)?(\S*[A-Za-z0-9]\S*)[ \t]*(?:\r?\n|\Z)")   # linha de continuação do ramo: UMA palavra só, com algum caractere alfanumérico (uma linha `----` de separador não é resto de ramo), e com o `<n>\t` do `cat -n` se foi lido por ele
 ID_TOKEN = re.compile(r"^[a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*$")
 REF_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?(?:show|comments?|heartbeat|close|label|update|reopen)\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)\b")
 UPDATE_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?update\b([^;&|\n]*)")
 UPDATED_ISSUE = re.compile(r"Updated issue:?\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)(?![A-Za-z0-9-]|\.\d)")   # o bd imprime "✓ Updated issue: <id> — <título>"
 CLAIM_ERR = re.compile(r"(?i)\b(error|already|failed|not found)\b")
 RC_FORMAT_ALARM = 5   # exit do `harvest` quando o transcrito parece ter mudado de formato (o ledger foi escrito)
-RC_NO_INPUT = 6       # exit do `harvest` quando NÃO deu para ler os transcritos (raiz ausente/ilegível, projeto ilegível, ou zero transcritos): "não sei" ≠ "nada a colher"
+RC_NO_INPUT = 6       # exit do `harvest` quando NÃO deu para ler os transcritos (raiz ausente/ilegível, projeto ilegível, transcrito que existe mas não abre, ou zero transcritos): "não sei" ≠ "nada a colher"
 GROUP = "_grp:"       # bucket de claims no MESMO instante: "_grp:<id>,<id>" (rateio igual entre eles, como o `_pre`)
 USAGE_KEYS = ("inp", "out", "cw5", "cw1", "cr", "think", "msgs")
 CTX_CAPS = (150_000, 250_000, 350_000)   # tetos hipotéticos de contexto por turno (tokens): quanto da leitura de cache está ACIMA deles
+
+
+class TranscriptUnreadable(Exception):
+    """O transcrito de topo EXISTE mas não abre (permissão, I/O). É "não consegui ler" — nunca "sumiu": só FileNotFoundError (o reaper o
+    apagou entre a listagem e a abertura) é "sumiu"; este vira entrada ilegível (alarme + exit RC_NO_INPUT) e a colheita segue."""
 
 
 # ----------------------------------------------------------------------------- pequenos utilitários
@@ -249,6 +257,32 @@ def all_strings(obj, depth=0):
             yield from all_strings(v, depth + 1)
 
 
+def review_branches(txt):
+    """Ramos citados nos cabeçalhos "QUALITY GATE REVIEW — … for branch: <ramo>" de UMA string, sem repetir.
+    O `gc bd show` quebra o comentário em ~80 colunas e a quebra cai logo depois de um hífen do ramo: a 1ª linha termina em
+    `crew/wa-worker/wa-` e o resto (`x5g89`) vem numa linha de continuação indentada (com o `<n>\\t` do `cat -n`, se foi lido por ele).
+    O `(\\S+)` sozinho guardava o ramo TRUNCADO, que não está na ponte do gate: o custo da revisão nunca chegava ao bead.
+    A continuação é UMA palavra sozinha na linha, com algum caractere alfanumérico (a linha seguinte de um cabeçalho de verdade,
+    `Author (EXCLUDED …`, tem várias; a de uma saída cortada pode ser um separador `----`, que não é resto de ramo). Cópia do cabeçalho
+    CORTADA no fim da string (`| head`, `grep -n` que mostra só a linha casada): não há continuação a juntar e o ramo fica como veio —
+    a sessão o resolve por outra cópia intacta, ou fica sem ramo conhecido (contada), nunca com um ramo adivinhado.
+    Ramo que termina em `-` ou `/` está truncado com certeza (medido em 01/10: nenhum dos 16.141 eventos do log do gate tem ramo assim): vale só o juntado.
+    Terminando em outro caractere não dá para saber se a palavra seguinte é o resto do ramo (palavra longa partida no meio): guarda os
+    DOIS e a ponte do gate escolhe — nenhum é descartado por palpite."""
+    out = []
+    for hm in REVIEW_HEADER.finditer(txt):
+        raw = hm.group(1)
+        cands = [raw]
+        cm = BRANCH_CONT.match(txt, hm.end())
+        if cm:
+            joined = raw + cm.group(1)
+            cands = [joined] if raw[-1] in "-/" else [raw, joined]
+        for c in cands:
+            if c not in out:
+                out.append(c)
+    return out
+
+
 def tool_text(block):
     t = block.get("content")
     if isinstance(t, str):
@@ -306,7 +340,8 @@ def fingerprint(main):
 
 
 def scan_session(main):
-    """-> dict (registro do ledger) ou None se o transcrito sumiu. Contagem por message.id ENTRE todos os arquivos da sessão."""
+    """-> dict (registro do ledger), ou None se o transcrito SUMIU (FileNotFoundError); levanta TranscriptUnreadable se existe e não abre.
+    Contagem por message.id ENTRE todos os arquivos da sessão."""
     sid = main.stem
     # O que o ledger vai jurar sobre este transcrito (fingerprint, tamanho, mtime) é tirado ANTES de lê-lo: uma escrita que entre depois
     # disto muda o fingerprint real, e a próxima colheita reescaneia. Tirado DEPOIS, ele atestaria um conteúdo que nunca foi lido (a mensagem
@@ -338,9 +373,11 @@ def scan_session(main):
     for f in session_files(main):
         try:
             fh = open(f, errors="replace")
-        except OSError:
+        except OSError as e:
             if f == main:
-                return None
+                if isinstance(e, FileNotFoundError):
+                    return None          # sumiu entre a listagem e a abertura (o reaper): o ÚNICO caso que é "sumiu"
+                raise TranscriptUnreadable(e.strerror or str(e)) from e
             files_unreadable += 1
             continue
         with fh:
@@ -348,9 +385,9 @@ def scan_session(main):
                 if len(branches) < 6 and "You are reviewer" in line:
                     try:    # várias citações possíveis (exemplo de doutrina lido pelo revisor): guarda todas, o report fica com a que o gate conhece
                         for txt in all_strings(json.loads(line)):
-                            for hm in REVIEW_HEADER.finditer(txt):
-                                if hm.group(1) not in branches:
-                                    branches.append(hm.group(1))
+                            for b in review_branches(txt):
+                                if b not in branches:
+                                    branches.append(b)
                     except Exception:
                         pass
                 nlines += 1
@@ -564,14 +601,21 @@ def cmd_harvest(a):
                 if cutoff and f.stat().st_mtime < cutoff:
                     skipped_old += 1
                     continue
-            except OSError:
-                vanished += 1
+            except FileNotFoundError:
+                vanished += 1                  # apagado entre a listagem e o stat (o reaper): o ÚNICO "sumiu"
+                continue
+            except OSError as e:
+                input_problems.append((f, f"transcrito ilegível ({e.strerror or e})"))   # EACCES/EIO: existe e não deu para ver — "não sei" ≠ "sumiu"
                 continue
             old = rows.get(f.stem)
             if old and old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA and "days_ctx" in old:
                 unchanged += 1
                 continue
-            rec = scan_session(f)
+            try:
+                rec = scan_session(f)
+            except TranscriptUnreadable as e:
+                input_problems.append((f, f"transcrito ilegível ({e})"))
+                continue
             if rec is None:
                 vanished += 1
                 continue
@@ -602,10 +646,12 @@ def cmd_harvest(a):
     # Entrada ilegível é o alarme MAIS fundamental (a colheita não colheu nada de lá) e vem antes do de formato: cada um é uma linha só, e o
     # corte do wrapper jogaria fora o que está no fim. O exit é RC_NO_INPUT mesmo que o de formato também acenda.
     if input_problems:
-        shown = "; ".join(f"{r}: {why}" for r, why in input_problems[:3]) + (f" (+{len(input_problems) - 3})" if len(input_problems) > 3 else "")
-        print(f"⚠ SEM ENTRADA: não consegui ler os transcritos — {shown}. 'Nada a colher' NÃO é o que aconteceu (HOME/CLAUDE_CONFIG_DIR do order "
-              f"diferente? o Claude Code mudou o diretório?): o reaper apaga o transcrito de sessão morta em 24h e o ledger deixa de ser alimentado. "
-              f"exit {RC_NO_INPUT}")
+        # caminho de transcrito é longo (~110 caracteres): mostra os 2 primeiros e corta em 220: o pior caso da linha (contador de 3 dígitos) tem ~480 caracteres e cabe inteira no corte de 500 do wrapper
+        shown = "; ".join(f"{r}: {why}" for r, why in input_problems[:2]) + (f" (+{len(input_problems) - 2})" if len(input_problems) > 2 else "")
+        shown = shown if len(shown) <= 220 else shown[:219] + "…"
+        print(f"⚠ SEM ENTRADA: {len(input_problems)} entrada(s) que NÃO deu para ler — {shown}. 'Nada a colher' NÃO é o que aconteceu "
+              f"(HOME/CLAUDE_CONFIG_DIR do order? permissão? o Claude Code mudou o diretório?): o reaper apaga o transcrito de sessão morta em 24h e o "
+              f"ledger deixa de recebê-lo. exit {RC_NO_INPUT}")
     alarm = suspect >= 2 and suspect * 4 >= big
     if alarm:
         print(f"⚠ ALARME: {suspect} de {big} sessões com ≥30 linhas vieram com 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
@@ -726,10 +772,15 @@ def cmd_backfill_s3(a):
                     failed += 1                          # nunca silencioso: cada objeto que não chegou é contado e listado
                     failures.append((key, sync_err.get(proj, "objeto não veio no sync")))
                     continue
-                rec = scan_session(dest)
-                if rec is None:
+                try:
+                    rec = scan_session(dest)
+                except TranscriptUnreadable as e:
                     failed += 1                          # baixou mas não consegui abrir: falha, não "já tinha registro mais completo"
-                    failures.append((key, "transcrito baixado e ilegível"))
+                    failures.append((key, f"transcrito baixado e ilegível ({e})"))
+                    continue
+                if rec is None:
+                    failed += 1                          # existia no `dest.exists()` acima e sumiu antes de abrir
+                    failures.append((key, "transcrito baixado e sumiu antes de abrir"))
                 elif merge_session(rows, rec):
                     merged += 1
                 else:
@@ -867,8 +918,9 @@ def _report(a, result):
         print(f"⚠ na janela: {unk['claims_untimed']} claims sem timestamp: não dá para posicioná-los entre as respostas (worker de pool cai na "
               f"referência mais citada — menos firme; crew fica sem bead).\n")
     if unk["rows_old_schema"]:
-        print(f"⚠ {unk['rows_old_schema']} sessões da janela estão no ledger com schema antigo (< v{SCHEMA}): a regra de claim delas é a anterior e "
-              f"pode ter claim FANTASMA (comando que só citou o claim). Rode `harvest` (se o transcrito ainda existe) ou `backfill-s3 --since {since_day}`.\n")
+        print(f"⚠ {unk['rows_old_schema']} sessões da janela estão no ledger com schema antigo (< v{SCHEMA}): a regra delas é a anterior — pode ter "
+              f"claim FANTASMA (comando que só citou o claim; v<3) e ramo de revisor TRUNCADO (cabeçalho quebrado em ~80 colunas: o custo da revisão "
+              f"não chega ao bead; v<4). Rode `harvest` (se o transcrito ainda existe) ou `backfill-s3 --since {since_day}`.\n")
     # resposta sem timestamp vive no dia "?", que `flatten` não consegue comparar com a janela: entra em TODAS (o dia dela é desconhecido)
     undated = sum(c["msgs"] for _s, day, _m, _e, c, _u in flat if day == "?")
     result["undated_msgs"] = undated

@@ -16,8 +16,9 @@
 # long does it take" is one tail away — and the tool's exit code, UNCHANGED, to the order runner:
 #   0  harvested (or another harvest holds the ledger lock: nothing to do — the log line says "outra colheita em curso")
 #   5  the transcript FORMAT looks changed (sessions read, 0 responses); the ledger was written
-#   6  the transcripts could not be READ (root missing / unreadable / empty, project unreadable); the ledger is untouched.
-#      "Nothing to harvest" is not something the tool can know in that case, so it never exits 0 for it.
+#   6  something could not be READ: root missing / unreadable / empty, project unreadable, or a transcript that exists but will not
+#      open (only ENOENT counts as "vanished"). Whatever WAS readable is still harvested and the ledger is written — nothing already
+#      in it is lost. "Nothing to harvest" is not something the tool can know in that case, so it never exits 0 for it.
 #   else  the tool crashed
 # The alarm text is the FIRST line of the tool's output, so the 500-char cut of the log line below never throws it away.
 set -u

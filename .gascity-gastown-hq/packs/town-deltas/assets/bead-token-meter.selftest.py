@@ -28,6 +28,11 @@ Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 tra
   * irmãos da mesma classe achados na varredura do diff inteiro (gate-fix 2): sessão de pool com claim NÃO confirmado não é spawn ocioso (como a sem
     timestamp); JSON válido que não é registro (`null`, string, lista) é linha ilegível CONTADA, não AttributeError; queda maior que a taxa na
     seção 6 é n/a, não '0 beads por braço'; o texto da atribuição lista todos os verbos de REF_CMD
+  * ramo do revisor no cabeçalho QUEBRADO em ~80 colunas pelo `gc bd show` (gate-fix 4): as fixtures são o formato real (continuação indentada e
+    preenchida, e a leitura por `cat -n`), não o cabeçalho de uma linha só que os casos antigos usavam; quebra ambígua guarda os dois candidatos
+    e a ponte do gate escolhe; uma linha v=3 com o ramo truncado é reescaneada (SCHEMA 4)
+  * transcrito que EXISTE mas não abre (gate-fix 4): só FileNotFoundError é "sumiu no meio"; permissão/I-O é entrada ilegível (alarme + exit 6),
+    no `stat` do filtro de janela e na abertura, e a colheita segue com as outras sessões; o backfill-s3 conta e nomeia a falha
   * controles de mutação: cada mutante do script (tabela MUTANTS) tem que ser reprovado por pelo menos um caso (o teste que só passa não prova nada);
     o número de casos e de mutantes vem da própria saída — não é repetido aqui para não envelhecer
 """
@@ -1212,6 +1217,133 @@ def t_power_json_and_sessions(m, W):
     ck("agrupamento pequeno" in txt and "agrupamento grande" not in txt, f"1,04 beads/sessão é agrupamento pequeno: o texto diz isso, e não 'grande'; achei {[ln for ln in txt.splitlines() if 'sessões construíram' in ln]}")
 
 
+def pad80(s):
+    return s + " " * max(0, 80 - len(s))
+
+
+def wrapped_header(head, tail, numbered=False):
+    """O cabeçalho da tarefa do revisor como o `gc bd show` o entrega: o comentário é quebrado em ~80 colunas, a quebra cai logo depois de um
+    hífen do ramo, e o resto do ramo vem numa linha de continuação indentada e preenchida com espaços até a coluna 80. `numbered` = a mesma
+    coisa lida por `cat -n` (cada linha ganha `<n>\\t`). Formato COPIADO do transcrito real do revisor 5cbf7a1b (01/10) — não inventado."""
+    lines = [f"QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: {head}", pad80("    " + tail),
+             pad80("    Author (EXCLUDED from reviewing): peter-wa-gawisp95ct49"), pad80("    Rig: whatsapp_automation"), "    Branch SHA: abc123"]
+    return "\n".join(f"{7 + i}\t{ln}" for i, ln in enumerate(lines)) if numbered else "\n".join(lines)
+
+
+def t_reviewer_wrapped_header(m, W):
+    """Gate (tentativa 4, bloqueante 1): `gc bd show` quebra o cabeçalho "… for branch: <ramo>" em ~80 colunas logo depois de um hífen, e o
+    REVIEW_HEADER capturava só `crew/wa-worker/wa-`: o ramo truncado não está na ponte do gate, então o custo da revisão NUNCA chegava ao bead
+    (real: 46 sessões de revisor com ramo que o gate não conhece = 11% dos tokens de revisor; +109 sem ramo) e a coluna rev$/bead saía menor
+    sem aviso. Os 106 checks verdes não diziam nada porque as fixtures só tinham cabeçalho de UMA linha. Aqui as fixtures são o formato real
+    quebrado; o ramo é juntado com a linha de continuação e o custo chega ao bead."""
+    w, _ = setup(m, W)
+    P = w["projects"]
+    cases = [   # sid, ramo, bead, cabeçalho, ramos que a sessão tem que guardar
+        ("rvA", "crew/wa-worker/wa-x5g89", "wa-x5g89", wrapped_header("crew/wa-worker/wa-", "x5g89"), ["crew/wa-worker/wa-x5g89"]),
+        ("rvB", "feat/ga-5c3msy-token-meter", "ga-5c3msy", wrapped_header("feat/ga-5c3msy-", "token-meter", numbered=True), ["feat/ga-5c3msy-token-meter"]),
+        # quebra que NÃO cai depois de hífen (palavra longa partida no meio): não dá para saber se `name1` é o resto do ramo -> guarda os DOIS
+        # candidatos e deixa a ponte do gate escolher (a decisão certa sob dúvida: nenhum dos dois é descartado por palpite)
+        ("rvC", "feat/ga-longbranchname1", "ga-lng1", wrapped_header("feat/ga-longbranch", "name1"), ["feat/ga-longbranch", "feat/ga-longbranchname1"]),
+        # controle: cabeçalho de uma linha só, seguido de linha com várias palavras -> nada a juntar, nenhum candidato extra
+        ("rvD", "feat/ga-ctl1", "ga-ctl1", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: feat/ga-ctl1\n    Author (EXCLUDED from reviewing): x\n    Rig: y", ["feat/ga-ctl1"]),
+    ]
+    with open(w["gate"], "a") as fh:
+        for sid, branch, bead, _hdr, _want in cases:
+            fh.write(json.dumps({"ts": D + "13:00:00Z", "event": "dispatcher_complete", "branch": branch, "bead": bead, "rig": "gascity", "result": "PASS", "dry_run": "0"}) + "\n")
+    def write_reviewer(sid, hdr):
+        recs = [beacon(f"gate-reviewer-adhoc-{sid}", D + "13:10:00.000Z")]
+        recs += asst(f"{sid}-r1", D + "13:10:05.000Z", cmd="gc bd show x", tid=f"tu_{sid}_r")
+        recs += [tool_result(f"tu_{sid}_r", hdr, D + "13:10:06.000Z")]
+        recs += asst(f"{sid}-r2", D + "13:10:30.000Z")
+        write_session(P, "-proj", sid, recs)
+
+    for sid, branch, bead, hdr, _want in cases:
+        recs = [beacon("gastown.dog-7", D + "12:00:00.000Z")]
+        recs += asst(f"{sid}-b1", D + "12:00:10.000Z", cmd=f"bd update {bead} --claim", tid=f"tu_{sid}_b") + [tool_result(f"tu_{sid}_b", f"✓ Updated issue: {bead}", D + "12:00:11.000Z")]
+        recs += asst(f"{sid}-b2", D + "12:00:20.000Z")
+        write_session(P, "-proj", f"b{sid}", recs)
+        write_reviewer(sid, hdr)
+    harvest(m, w)
+    rows = ledger_rows(m, w)
+    for sid, branch, bead, _hdr, want in cases:
+        ck(rows[sid]["role"] == "gate-reviewer", f"{sid}: papel pelo beacon; achei {rows[sid]['role']}")
+        ck(rows[sid]["branches"] == want, f"{sid}: o ramo do cabeçalho quebrado é juntado com a continuação; esperava {want}, achei {rows[sid]['branches']}")
+    code, r = report(m, w)
+    ck(r["coverage"]["unmapped_reviewer_sessions"] == 0, f"nenhuma sessão de revisor fica sem ramo conhecido (o truncado não estava na ponte do gate); achei {r['coverage']['unmapped_reviewer_sessions']}")
+    for sid, branch, bead, _hdr, _want in cases:
+        ck(approx(r["beads"][bead]["review_usd"], 2 * USD_SMALL, 1e-9), f"{bead}: as 2 respostas do revisor viram custo de revisão do bead; achei {r['beads'][bead]}")
+    # cópia do cabeçalho CORTADA (sem a continuação): o ramo fica como veio — nada a juntar, nada adivinhado. Formas reais do transcrito local (01/10):
+    # uma linha `----` de separador depois do cabeçalho (virava o ramo-lixo 'crew/oracle/wa-----'), a string que termina logo depois do ramo
+    # (`| head`), e o `grep -n` que mostra só a linha casada e pula para a próxima linha casada (`53:`)
+    cut = [("rvE", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: crew/oracle/wa-   \n----\n/Users/athos/gt/whatsapp_automation\ncommit abc1", ["crew/oracle/wa-"]),
+           ("rvF", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: fix/ga-mv896u-", ["fix/ga-mv896u-"]),
+           ("rvG", "QUALITY GATE REVIEW — You are reviewer 1 of 1 for branch: crew/ps-worker/ps-\n53:      FULL DIFF (complete — 625 lines)", ["crew/ps-worker/ps-"])]
+    for sid, hdr, _want in cut:
+        write_reviewer(sid, hdr)
+    harvest(m, w)
+    rows = ledger_rows(m, w)
+    for sid, _hdr, want in cut:
+        ck(rows[sid]["branches"] == want, f"{sid}: cópia cortada — o ramo fica como veio, sem juntar separador nem linha de outra saída; esperava {want}, achei {rows[sid]['branches']}")
+    # uma linha do ledger escrita pela regra antiga (ramo truncado, schema anterior) é reescaneada, e o ramo sai certo — o transcrito ainda existe
+    rows["rvA"]["v"] = 3
+    rows["rvA"]["branches"] = ["crew/wa-worker/wa-"]
+    m.write_ledger(rows, w["ledger"])
+    harvest(m, w)
+    s = ledger_rows(m, w)["rvA"]
+    ck(s["v"] == m.SCHEMA and m.SCHEMA >= 4 and s["branches"] == ["crew/wa-worker/wa-x5g89"], f"a linha v=3 (ramo truncado) é reescaneada pela colheita; v={s['v']} branches={s['branches']}")
+
+
+def t_harvest_unreadable_transcript(m, W):
+    """Gate (tentativa 4, bloqueante 2): um transcrito que EXISTE mas não abre (permissão, I/O) caía no mesmo balde de "sumiu no meio" — a linha
+    "N sumiram no meio" é a de um transcrito apagado pelo reaper entre a listagem e a abertura (ENOENT: legítimo), mas EACCES/EIO não sumiram,
+    e a colheita saía com 0 e sem alarme: o reaper apaga esse transcrito 24h depois e o ledger nunca o recebeu. "Não consegui ler" ≠ "sumiu":
+    só FileNotFoundError é "sumiu"; o resto é entrada ilegível (alarme na 1ª linha, exit 6) e a colheita segue com as demais sessões."""
+    w, _ = setup(m, W)
+    good = ledger_rows(m, w)
+    P = w["projects"]
+    snap = set(good)
+    write_session(P, "-proj", "locked1", [beacon("gastown.dog-9", D + "23:00:00Z")] + asst("k1", D + "23:00:10Z"))
+    # (a) o arquivo de topo existe mas não abre: a reprodução do revisor (2 transcritos, chmod 000, ledger novo)
+    wa = dict(w, ledger=W / "lA" / "sessions.jsonl")
+    with denied(P / "-proj" / "locked1.jsonl"):
+        rc, out = harvest_rc(m, wa)
+    lines = out.splitlines()
+    ck(rc == m.RC_NO_INPUT == 6, f"transcrito que existe mas não abre: exit 6, achei {rc}")
+    ck(lines and lines[0].startswith("⚠ SEM ENTRADA") and "locked1" in lines[0] and "ilegível" in lines[0], f"o alarme é a 1ª linha e nomeia o transcrito; achei {lines[:1]}")
+    ck("0 sumiram no meio" in out, f"não abriu ≠ sumiu: o balde 'sumiram no meio' fica em 0; achei {[ln for ln in lines if ln.startswith('harvest:')]}")
+    ck(set(ledger_rows(m, wa)) == snap, f"as demais sessões são colhidas mesmo assim; achei {sorted(set(ledger_rows(m, wa)) ^ snap)}")
+    ck(len(lines[0]) <= 400, f"o alarme com o caminho do transcrito cabe no corte de 500 caracteres do log do wrapper; {len(lines[0])}")
+    # (b) o mesmo, com a janela --since-hours: o `stat` do filtro falha com EACCES (não ENOENT) num diretório que lista mas não deixa entrar
+    (P / "-semx").mkdir()
+    write_session(P, "-semx", "semx1", [beacon("gastown.dog-9", D + "23:10:00Z")] + asst("k2", D + "23:10:10Z"))
+    (P / "-semx").chmod(0o444)
+    try:
+        ck(not os.access(P / "-semx", os.X_OK), "este ambiente ignora permissão de diretório (root?): o caso não prova nada")
+        wb = dict(w, ledger=W / "lB" / "sessions.jsonl")
+        out_b = io.StringIO()
+        with contextlib.redirect_stdout(out_b):
+            rc_b = m.cmd_harvest(type("A", (), dict(ledger=str(wb["ledger"]), since_hours=24))())
+        rc_c, out_c = harvest_rc(m, dict(w, ledger=W / "lC" / "sessions.jsonl"))      # e sem janela
+    finally:
+        (P / "-semx").chmod(0o755)
+    for label, rc_x, txt in (("com --since-hours", rc_b, out_b.getvalue()), ("sem janela", rc_c, out_c)):
+        ck(rc_x == 6 and txt.startswith("⚠ SEM ENTRADA") and "semx1" in txt.splitlines()[0], f"{label}: transcrito inacessível = alarme + exit 6, não 'sumiu'; achei rc={rc_x} {txt[:120]!r}")
+        ck("0 sumiram no meio" in txt, f"{label}: 'sumiram no meio' continua 0; achei {[ln for ln in txt.splitlines() if ln.startswith('harvest:')]}")
+    # (c) o que de fato sumiu entre a listagem e a abertura (ENOENT: o reaper) continua sendo "sumiu", sem alarme e com exit 0
+    real = m.list_transcripts
+    m.list_transcripts = lambda root: (real(root)[0] + [P / "-proj" / "gone1.jsonl"], real(root)[1])
+    try:
+        (P / "-proj" / "locked1.jsonl").unlink()
+        rc_d, out_d = harvest_rc(m, dict(w, ledger=W / "lD" / "sessions.jsonl"))
+    finally:
+        m.list_transcripts = real
+    ck(rc_d == 0 and "SEM ENTRADA" not in out_d and "1 sumiram no meio" in out_d, f"transcrito que sumiu de verdade (ENOENT): 'sumiram no meio', sem alarme, exit 0; achei rc={rc_d} {[ln for ln in out_d.splitlines() if ln.startswith('harvest:')]}")
+    # (d) o transcrito baixado do S3 que não abre: a falha é contada e nomeada (o backfill não pode estourar com a exceção nova)
+    stub_world(W, m)
+    code, out = bf(m, W)
+    ck("FALHOU projects/-projA/sid3.jsonl: transcrito baixado e ilegível" in out and code == 4, f"backfill-s3 com transcrito ilegível: falha contada, exit 4; achei {code} {out[-300:]!r}")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
@@ -1261,7 +1393,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "desconhecido 'não confirmou' não é somado": ('claims_unconfirmed=sum(s.get("claims_unconfirmed", 0) for s in sess)', "claims_unconfirmed=0", t_report_unknown_counters),
     "linha de schema antigo não é contada": ('rows_old_schema=sum(1 for s in sess if s.get("v") != SCHEMA))', "rows_old_schema=0)", t_schema_rescan),
     "colheita mantém linha de schema antigo": ('old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA and "days_ctx" in old', 'old.get("fp") == fingerprint(f) and "days_ctx" in old', t_schema_rescan),
-    "schema não foi aumentado": ("SCHEMA = 3     # 3 = claims revalidados", "SCHEMA = 2     # 3 = claims revalidados", t_schema_rescan),
+    "schema não foi aumentado": ("SCHEMA = 4     # 4 = ramo do revisor", "SCHEMA = 2     # 4 = ramo do revisor", t_schema_rescan),
     "alarme de formato sem exit ≠ 0": ("    return RC_NO_INPUT if input_problems else (RC_FORMAT_ALARM if alarm else 0)", "    return RC_NO_INPUT if input_problems else 0", t_harvest_alarm_first_and_nonzero),
     "alarme de formato não impresso": ("    alarm = suspect >= 2 and suspect * 4 >= big\n    if alarm:\n", "    alarm = suspect >= 2 and suspect * 4 >= big\n    if False:\n", t_harvest_alarm_first_and_nonzero),
     # ---- gate-fix 1: os achados baixos da mesma família
@@ -1286,7 +1418,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "raiz sem permissão vira 'nada a colher'": ('    except OSError as e:\n        return files, [(root, f"ilegível ({e.strerror or e})")]', "    except OSError as e:\n        return files, []", t_harvest_input_unreadable),
     "projeto ilegível é pulado calado": ('            problems.append((Path(d.path), f"projeto ilegível ({e.strerror or e})"))', "            pass", t_harvest_input_unreadable),
     "entrada ilegível sem exit ≠ 0": ("    return RC_NO_INPUT if input_problems else (RC_FORMAT_ALARM if alarm else 0)", "    return RC_FORMAT_ALARM if alarm else 0", t_harvest_input_unreadable),
-    "alarme de entrada não impresso": ("    if input_problems:\n        shown =", "    if False:\n        shown =", t_harvest_input_unreadable),
+    "alarme de entrada não impresso": ("    if input_problems:\n        # caminho de transcrito é longo", "    if False:\n        # caminho de transcrito é longo", t_harvest_input_unreadable),
     "zero transcritos não acende": ("    elif not seen and not input_problems:", "    elif False:", t_harvest_input_unreadable),
     "lista de raízes vazia não acende": ("    if not PROJECTS:\n        input_problems.append", "    if False:\n        input_problems.append", t_harvest_input_unreadable),
     "fingerprint tirado depois da leitura": (("    fp = fingerprint(main)\n    try:\n        st = main.stat()", "mtime_ns=mtime_ns, fp=fp,"),
@@ -1298,6 +1430,19 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "JSON omite o papel com poucos beads": ("            out[role] = dict(beads=len(beads), insufficient=True, min_beads=20)", "            pass", t_power_json_and_sessions),
     "beads por sessão = beads (sessão não medida)": ("        n_sess = len({first_sid[b] for b in beads if first_sid.get(b)})", "        n_sess = len(beads)", t_power_json_and_sessions),
     "sessão do bead não gravada": ('                    first_sid[b] = s["sid"]', "                    pass", t_power_json_and_sessions),
+    # ---- gate-fix 4 (ga-5c3msy): ramo do revisor quebrado em ~80 colunas; transcrito que existe mas não abre
+    "ramo do cabeçalho quebrado não é juntado": ("            joined = raw + cm.group(1)", "            joined = raw", t_reviewer_wrapped_header),
+    "continuação com `<n>\\t` do cat -n não é reconhecida": (r"(?:\d+\t[ \t]*)?", "", t_reviewer_wrapped_header),
+    "junta a linha seguinte mesmo com várias palavras": (r"(\S*[A-Za-z0-9]\S*)[ \t]*(?:\r?\n|\Z)", r"(\S*[A-Za-z0-9]\S*)", t_reviewer_wrapped_header),
+    "linha `----` de separador é juntada como resto do ramo": (r"(\S*[A-Za-z0-9]\S*)", r"(\S+)", t_reviewer_wrapped_header),
+    "ramo truncado (termina em - ou /) fica junto do juntado": ('cands = [joined] if raw[-1] in "-/" else [raw, joined]', "cands = [raw, joined]", t_reviewer_wrapped_header),
+    "quebra ambígua guarda só o juntado": ('cands = [joined] if raw[-1] in "-/" else [raw, joined]', "cands = [joined]", t_reviewer_wrapped_header),
+    "schema não subiu para 4 (linha v=3 de ramo truncado não é reescaneada)": ("SCHEMA = 4     # 4 = ramo do revisor", "SCHEMA = 3     # 4 = ramo do revisor", t_reviewer_wrapped_header),
+    "transcrito que não abre vira 'sumiu'": ("                raise TranscriptUnreadable(e.strerror or str(e)) from e", "                return None", t_harvest_unreadable_transcript),
+    "colheita trata TranscriptUnreadable como 'sumiu'": ("            except TranscriptUnreadable as e:\n                input_problems.append((f, f\"transcrito ilegível ({e})\"))\n                continue",
+                                                          "            except TranscriptUnreadable:\n                vanished += 1\n                continue", t_harvest_unreadable_transcript),
+    "stat que falha com EACCES vira 'sumiu'": ("            except FileNotFoundError:\n                vanished += 1", "            except OSError:\n                vanished += 1", t_harvest_unreadable_transcript),
+    "backfill não trata TranscriptUnreadable": ("                except TranscriptUnreadable as e:\n                    failed += 1", "                except KeyError as e:\n                    failed += 1", t_harvest_unreadable_transcript),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -1325,7 +1470,9 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("harvest: raiz de transcritos ausente/ilegível/vazia, projeto ilegível = alarme + exit 6, não 'nada a colher'", t_harvest_input_unreadable),
          ("fingerprint tirado antes da leitura: a escrita do meio não é atestada sem ter sido lida", t_fingerprint_before_read),
          ("subagente que não abre (arquivo ou diretório) é contado, no ledger, na colheita e no relatório", t_unreadable_subagent_files),
-         ("seção 6: papel com poucos beads no --json; sessões e beads/sessão medidos (o braço é por sessão)", t_power_json_and_sessions)]
+         ("seção 6: papel com poucos beads no --json; sessões e beads/sessão medidos (o braço é por sessão)", t_power_json_and_sessions),
+         ("revisor: cabeçalho quebrado em ~80 colunas (formato real, também `cat -n`) é juntado e o custo chega ao bead", t_reviewer_wrapped_header),
+         ("transcrito que existe mas não abre = alarme + exit 6, nunca 'sumiu no meio'; ENOENT continua 'sumiu'", t_harvest_unreadable_transcript)]
 
 
 def run(name, fn, m):
