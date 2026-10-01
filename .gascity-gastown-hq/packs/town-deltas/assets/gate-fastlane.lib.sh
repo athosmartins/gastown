@@ -32,7 +32,11 @@
 #
 # Outputs of gate_fastlane_decide (globals):
 #   GATE_LANE         fast | normal
-#   GATE_LANE_REASON  one line — why (the clean yes names what was checked)
+#   GATE_LANE_REASON  one line — why (the clean yes names what was checked). FREE TEXT: for people, free to be reworded.
+#   GATE_LANE_REASON_CODE  a short stable token for the SAME decision — what gate-lane-tally.py buckets on, so rewording
+#                     a sentence above can never silently move diffs between buckets (the tally once matched on the
+#                     sentence, and every code/prompt diff landed in "touches the gate's own policy"). Every code is
+#                     listed in gate-lane-tally.py's REASON_CODES; gate-fastlane.selftest.sh fails when one is missing.
 #   GATE_LANE_FILES   "CLASS path" lines — the files that DECIDED (all of them for fast; the blockers for normal)
 #   GATE_LANE_COUNTS  "doc=N test=N prompt=N code=N"
 
@@ -202,11 +206,12 @@ gate_fastlane_files_oneline() {
   return 0
 }
 
-# _gate_fastlane_normal <reason> [files] — the inert outcome. Always returns 0.
+# _gate_fastlane_normal <code> <reason> [files] — the inert outcome. Always returns 0.
 _gate_fastlane_normal() {
   GATE_LANE="normal"
-  GATE_LANE_REASON="$1"
-  GATE_LANE_FILES="${2:-}"
+  GATE_LANE_REASON_CODE="$1"
+  GATE_LANE_REASON="$2"
+  GATE_LANE_FILES="${3:-}"
   return 0
 }
 
@@ -339,63 +344,64 @@ EOF
 #                 once for its own self-protection; the fast lane honors the SAME answer)
 gate_fastlane_decide() {
   local git_fn="$1" base="$2" head="$3" policy="${4:-}" raw raw_rc=0 blockers uncls
-  GATE_LANE="normal"; GATE_LANE_REASON="not evaluated"; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
+  GATE_LANE="normal"; GATE_LANE_REASON="not evaluated"; GATE_LANE_REASON_CODE="not-evaluated"; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
 
   if [ "${GATE_FASTLANE_ENABLED:-1}" != "1" ]; then
-    _gate_fastlane_normal "fast lane disabled (GATE_FASTLANE_ENABLED=0)"; return 0
+    _gate_fastlane_normal "disabled" "fast lane disabled (GATE_FASTLANE_ENABLED=0)"; return 0
   fi
   # An operator can stop the lane instantly with `touch <city>/.gc/gate-fastlane.off` (and re-enable it by removing
   # the file): the dispatcher is a fresh process every sweep, so a flag file needs no launchd reload, unlike an env var.
   if [ -e "${GATE_FASTLANE_OFF_FILE:-${GC_CITY:-/nonexistent-city}/.gc/gate-fastlane.off}" ]; then
-    _gate_fastlane_normal "fast lane switched off by the flag file (.gc/gate-fastlane.off) — normal gate"; return 0
+    _gate_fastlane_normal "flag-file" "fast lane switched off by the flag file (.gc/gate-fastlane.off) — normal gate"; return 0
   fi
   if [ -z "$git_fn" ] || [ -z "$base" ] || [ -z "$head" ]; then
-    _gate_fastlane_normal "fast lane could not decide: missing git runner / base / head"; return 0
+    _gate_fastlane_normal "no-input" "fast lane could not decide: missing git runner / base / head"; return 0
   fi
   if [ -n "$policy" ]; then
-    _gate_fastlane_normal "the diff touches the gate's own policy/classifier — self-protection keeps it in the normal gate" "$(printf '%s\n' "$policy" | sed 's/^/POLICY\t/')"
+    _gate_fastlane_normal "policy" "the diff touches the gate's own policy/classifier — self-protection keeps it in the normal gate" "$(printf '%s\n' "$policy" | sed 's/^/POLICY\t/')"
     return 0
   fi
 
   raw=$("$git_fn" -c core.quotepath=off diff --raw --no-renames "$base...$head" 2>/dev/null) || raw_rc=$?
   if [ "$raw_rc" != "0" ]; then
-    _gate_fastlane_normal "git diff --raw failed (rc=$raw_rc) — cannot classify, normal gate"; return 0
+    _gate_fastlane_normal "diff-raw-failed" "git diff --raw failed (rc=$raw_rc) — cannot classify, normal gate"; return 0
   fi
 
   gate_fastlane_classify_raw "$raw"
   GATE_LANE_COUNTS="doc=${GATE_FL_N_DOC} test=${GATE_FL_N_TEST} prompt=${GATE_FL_N_PROMPT} code=${GATE_FL_N_CODE} policy=${GATE_FL_N_POLICY}"
   if [ "$GATE_FL_STATE" != "ok" ]; then
-    _gate_fastlane_normal "unclassifiable diff: ${GATE_FL_WHY}"; return 0
+    _gate_fastlane_normal "unclassifiable" "unclassifiable diff: ${GATE_FL_WHY}"; return 0
   fi
   blockers=$(printf '%s' "$GATE_FL_BLOCKERS" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}")
   if [ -n "$GATE_FL_BLOCKERS" ]; then
-    _gate_fastlane_normal "$((GATE_FL_N_CODE + GATE_FL_N_PROMPT + GATE_FL_N_POLICY)) file(s) are production code, prompt/doctrine or the gate's own policy (code=${GATE_FL_N_CODE} prompt=${GATE_FL_N_PROMPT} policy=${GATE_FL_N_POLICY}) — normal gate" "$blockers"
+    _gate_fastlane_normal "code-or-prompt" "$((GATE_FL_N_CODE + GATE_FL_N_PROMPT + GATE_FL_N_POLICY)) file(s) are production code, prompt/doctrine or the gate's own policy (code=${GATE_FL_N_CODE} prompt=${GATE_FL_N_PROMPT} policy=${GATE_FL_N_POLICY}) — normal gate" "$blockers"
     return 0
   fi
   uncls=$(printf '%s' "$GATE_FL_UNRUNNABLE" | _gate_fastlane_cap_lines 10)
   if [ -n "$GATE_FL_UNRUNNABLE" ]; then
-    _gate_fastlane_normal "changed test(s) in a language the fast lane cannot run — normal gate" "$(printf '%s' "$uncls" | sed 's/^/TEST-UNRUNNABLE\t/')"
+    _gate_fastlane_normal "test-unrunnable" "changed test(s) in a language the fast lane cannot run — normal gate" "$(printf '%s' "$uncls" | sed 's/^/TEST-UNRUNNABLE\t/')"
     return 0
   fi
 
   gate_fastlane_scan "$git_fn" "$base" "$head"
   case "$GATE_FL_SCAN_RC" in
     0) ;;
-    1) _gate_fastlane_normal "content scan found personal data / a credential on added lines ($(printf '%s' "$GATE_FL_SCAN_OUT" | cut -f1 | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $2, $1}')) — normal gate" "$(printf '%s\n' "$GATE_FL_SCAN_OUT" | head -10 | awk -F'\t' '{printf "SCAN\t%s %s:%s\n", $1, $2, $3}')"
+    1) _gate_fastlane_normal "scan-findings" "content scan found personal data / a credential on added lines ($(printf '%s' "$GATE_FL_SCAN_OUT" | cut -f1 | sort | uniq -c | awk '{printf "%s%s×%s", (NR>1?", ":""), $2, $1}')) — normal gate" "$(printf '%s\n' "$GATE_FL_SCAN_OUT" | head -10 | awk -F'\t' '{printf "SCAN\t%s %s:%s\n", $1, $2, $3}')"
        return 0 ;;
-    *) _gate_fastlane_normal "content scan could not run (rc=${GATE_FL_SCAN_RC}: $(printf '%s' "$GATE_FL_SCAN_OUT" | head -1 | cut -c1-160)) — unverified is not clean, normal gate"
+    *) _gate_fastlane_normal "scan-failed" "content scan could not run (rc=${GATE_FL_SCAN_RC}: $(printf '%s' "$GATE_FL_SCAN_OUT" | head -1 | cut -c1-160)) — unverified is not clean, normal gate"
        return 0 ;;
   esac
 
   gate_fastlane_run_tests "$git_fn" "$head" "$GATE_FL_RUN"
   if [ "$GATE_FL_TEST_RC" != "0" ]; then
-    _gate_fastlane_normal "fast-lane test check did not pass: ${GATE_FL_TEST_OUT} — normal gate decides" "$(printf '%s' "$GATE_FL_RUN" | _gate_fastlane_cap_lines 10 | sed 's/^/TEST\t/')"
+    _gate_fastlane_normal "test-failed" "fast-lane test check did not pass: ${GATE_FL_TEST_OUT} — normal gate decides" "$(printf '%s' "$GATE_FL_RUN" | _gate_fastlane_cap_lines 10 | sed 's/^/TEST\t/')"
     return 0
   fi
 
   # The only success path. Everything above returned.
   GATE_LANE_FILES=$(printf '%s' "$GATE_FL_ALLFILES" | _gate_fastlane_cap_lines "${GATE_FASTLANE_LIST_MAX:-30}")
   GATE_LANE_REASON="every file is DOC or TEST (${GATE_LANE_COUNTS}); content scan clean; ${GATE_FL_TEST_OUT} — merged without an LLM reviewer"
+  GATE_LANE_REASON_CODE="fast"
   GATE_LANE="fast"
   return 0
 }
@@ -404,7 +410,8 @@ gate_fastlane_decide() {
 
 # gate_fastlane_record <city> <marker_id> <bead> <branch> <rig> <would_have_reviewers> <qg_log>
 # Writes the lane and the files that decided it on the MARKER (metadata gate.lane / gate.lane_reason /
-# gate.lane_files) and appends a `gate_lane` event to the jsonl the weekly tally reads. Observability only: a
+# gate.lane_files) and appends a `gate_lane` event (with reason_code, and dry_run so the tally can leave a DRY_RUN=1
+# sweep out of its counts) to the jsonl the weekly tally reads. Observability only: a
 # failed write is logged and never changes the lane. The marker write is READ BACK, because "the command ran" is
 # not "the field is there".
 gate_fastlane_record() {
@@ -424,10 +431,12 @@ gate_fastlane_record() {
     jq -c -n \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --arg branch "$branch" --arg bead "$bead" --arg rig "${rig:-unknown}" --arg marker "$marker" \
-      --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg counts "$GATE_LANE_COUNTS" \
+      --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "${GATE_LANE_REASON_CODE:-}" \
+      --arg counts "$GATE_LANE_COUNTS" --arg dry_run "${DRY_RUN:-0}" \
       --arg files "$(gate_fastlane_files_oneline)" --argjson would "$would" \
       '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
-        counts: $counts, reason: $reason, files: $files, would_have_reviewers: $would}' \
+        counts: $counts, reason: $reason, reason_code: $code, files: $files, would_have_reviewers: $would,
+        dry_run: $dry_run}' \
       >> "$qg_log" 2>/dev/null \
       || echo "[gate-fastlane] WARN: could not append the gate_lane event to $qg_log — the weekly tally will under-count this decision" >&2
   fi
