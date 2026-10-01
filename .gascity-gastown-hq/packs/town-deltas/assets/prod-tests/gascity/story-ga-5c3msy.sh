@@ -17,7 +17,9 @@
 #                    as a number (cohort/system US$-per-approved null, floor in its own field, no CV from < 20 priced beads);
 #   5. the order   — `gc order list` resolves it (CLI-side scan: proves the file parses, NOT that the controller loaded
 #                    it) and `gc order history` says whether the controller has fired it (the only proof it did);
-#                    once it has fired, its own log must show a recent rc=0 run;
+#                    once it has fired, its own log must show a recent rc=0 run THAT READ TRANSCRIPTS (an rc=0 harvest of
+#                    zero transcripts is the silent failure: the root moved, the reaper deletes what was never copied), and the
+#                    ledger must keep up with the newest transcript ON DISK (the log can lie by omission; the files cannot);
 #   6. the study   — the 📚 Estudos entry exists once, is INTERNAL (a truthy `publico` would serve it on a host with
 #                    no login), points at a real file, and the admin daemon serves it.
 #
@@ -43,6 +45,7 @@ REPORT="${REPORT:-$CITY/docs/reports/token-por-bead-e8.md}"
 E2_SCRIPT="${E2_SCRIPT:-$CITY/docs/reports/token-por-bead-e8/e2-readout.py}"
 LEDGER="$CITY/.gc/token-ledger/sessions.jsonl"
 HLOG="${HLOG:-$CITY/.gc/logs/token-ledger-harvest.log}"
+TRANSCRIPTS_ROOT="${TRANSCRIPTS_ROOT:-$HOME/.claude/projects}"
 ESTUDOS_DIR="${ESTUDOS_DIR:-/Users/athos/gt/whatsapp_automation/shared/data/estudos}"
 SLUG="tokens-por-bead-aprovada-ga-5c3msy"
 ESTUDOS_PORT="${ESTUDOS_PORT:-8097}"
@@ -195,8 +198,60 @@ if [[ "$FIRED" =~ ^[0-9]+$ && "$FIRED" -gt 0 ]]; then
   [[ "$lrc" -eq 0 ]] || fail "the last scheduled harvest FAILED (rc=$lrc): ${last:0:300}"
   age="$(python3 -c 'import sys, datetime as d; t = d.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc); print(int((d.datetime.now(d.timezone.utc) - t).total_seconds()))' "$lts" 2>/dev/null)"
   [[ "$age" =~ ^[0-9]+$ ]] || fail "cannot read the timestamp of the harvest log's last line ('$lts')"
-  [[ "$age" -le 14400 ]] || fail "the order has fired but its last harvest is $((age / 60)) min old (> 240 min) — the ledger has stopped advancing and transcripts the reaper deletes are lost"
-  log "last scheduled harvest: rc=0, $((age / 60)) min ago ✓"
+  [[ "$age" -le 14400 ]] || fail "the order has fired but the harvest log's last line is $((age / 60)) min old (> 240 min) — the harvest has stopped running and transcripts the reaper deletes are lost"
+  # rc=0 is not "it harvested": a root that moved used to print the normal summary and exit 0. The summary must show transcripts READ.
+  sum_re='harvest: ([0-9]+) [^,]*, ([0-9]+) inalteradas'
+  if [[ "$last" =~ $sum_re ]]; then
+    seen_n=$(( BASH_REMATCH[1] + BASH_REMATCH[2] ))
+    [[ "$seen_n" -gt 0 ]] || fail "the last scheduled harvest exited 0 but read ZERO transcripts (0 scanned + 0 unchanged): ${last:0:300}"
+    log "last scheduled harvest: rc=0, $((age / 60)) min ago, $seen_n transcripts read ✓"
+  elif [[ "$last" == *"outra colheita em curso"* ]]; then
+    log "WARN: the last harvest tick was skipped by the ledger lock (another harvest/backfill held it) — it read nothing itself"
+    _unproven "last harvest tick was a lock skip (no transcript count to check)"
+  else
+    fail "the last scheduled harvest exited 0 but its line has no 'harvest: <n> … <m> inalteradas' summary: ${last:0:300}"
+  fi
+  # the log can lie by omission; the files cannot. The ledger's newest transcript mtime (stored per row at scan time) must not trail the newest
+  # transcript on disk by more than 2 harvest intervals + slack. Compared against the transcripts root a human shell sees: a harvest whose own
+  # root drifted (HOME/CLAUDE_CONFIG_DIR of the order) keeps logging rc=0 while this lag grows.
+  lag="$(_to 120 python3 - "$LEDGER" "$TRANSCRIPTS_ROOT" <<'PY'
+import json, os, sys
+ledger, root = sys.argv[1], sys.argv[2]
+newest_ledger = None
+for line in open(ledger, errors="replace"):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(r, dict) and isinstance(r.get("mtime_ns"), int) and r["mtime_ns"] > 0:
+        newest_ledger = r["mtime_ns"] if newest_ledger is None else max(newest_ledger, r["mtime_ns"])
+newest_disk = None
+try:
+    for proj in os.scandir(root):
+        if not proj.is_dir():
+            continue
+        for f in os.scandir(proj.path):
+            if f.name.endswith(".jsonl"):
+                t = f.stat().st_mtime_ns
+                newest_disk = t if newest_disk is None else max(newest_disk, t)
+except OSError as e:
+    print("unreadable-root:", e.strerror or e)
+    sys.exit(0)
+if newest_ledger is None:
+    print("no-mtime-in-ledger")
+elif newest_disk is None:
+    print("no-transcripts-on-disk")
+else:
+    print((newest_disk - newest_ledger) // 10**9)
+PY
+)"
+  if [[ "$lag" =~ ^-?[0-9]+$ ]]; then
+    [[ "$lag" -le 7200 ]] || fail "the ledger trails the newest transcript on disk ($TRANSCRIPTS_ROOT) by $((lag / 60)) min (> 120 min) although the harvest logs rc=0 — it is not harvesting where the transcripts are"
+    log "ledger keeps up with the transcripts on disk (newest transcript is ${lag}s newer than the newest the ledger scanned) ✓"
+  else
+    log "WARN: could not compare the ledger with the transcripts on disk ('${lag:-nothing}')"
+    _unproven "ledger vs transcripts-on-disk freshness UNKNOWN (${lag:-nothing})"
+  fi
 elif [[ -f "$HLOG" ]]; then
   log "harvest log present (a manual or earlier run): $(tail -n 1 "$HLOG" | cut -c1-160)"
 else

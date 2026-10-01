@@ -10,7 +10,9 @@ modelo/effort é decidível — esta ferramenta é o pré-requisito (passo 0 do 
     report    ledger + log do gate -> tokens e US$ por papel/modelo/effort, por bead, e por bead APROVADA.
     prices    a tabela de preços em uso (e de onde veio cada número).
 
-Somente leitura sobre os transcritos e o log do gate; só escreve o ledger. Só stdlib.
+Somente leitura sobre os transcritos e o log do gate. Só escreve ao lado do ledger (o diretório dele): `sessions.jsonl`, `sessions.jsonl.lock`
+(o flock), `sessions.jsonl.unreadable-<ts>` (cópia do arquivo ANTES da reescrita, só quando há linha ilegível) e o temporário `.sessions.*`
+da troca atômica. Só stdlib.
 
 O que um transcrito conta (medido em 01/10 nos 1.786 transcritos locais):
   * O Claude Code grava UM registro JSONL por bloco de conteúdo (thinking / text / tool_use) e TODOS repetem o `usage` da mesma
@@ -111,6 +113,7 @@ UPDATE_CMD = re.compile(r"\bbd\s+(?:-C\s+\S+\s+)?update\b([^;&|\n]*)")
 UPDATED_ISSUE = re.compile(r"Updated issue:?\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d+)*)(?![A-Za-z0-9-]|\.\d)")   # o bd imprime "✓ Updated issue: <id> — <título>"
 CLAIM_ERR = re.compile(r"(?i)\b(error|already|failed|not found)\b")
 RC_FORMAT_ALARM = 5   # exit do `harvest` quando o transcrito parece ter mudado de formato (o ledger foi escrito)
+RC_NO_INPUT = 6       # exit do `harvest` quando NÃO deu para ler os transcritos (raiz ausente/ilegível, projeto ilegível, ou zero transcritos): "não sei" ≠ "nada a colher"
 GROUP = "_grp:"       # bucket de claims no MESMO instante: "_grp:<id>,<id>" (rateio igual entre eles, como o `_pre`)
 USAGE_KEYS = ("inp", "out", "cw5", "cw1", "cr", "think", "msgs")
 CTX_CAPS = (150_000, 250_000, 350_000)   # tetos hipotéticos de contexto por turno (tokens): quanto da leitura de cache está ACIMA deles
@@ -264,6 +267,32 @@ def session_files(main):
     return files
 
 
+def list_transcripts(root):
+    """Todo `<raiz>/<projeto>/<sessão>.jsonl` -> (arquivos, problemas). Problema = (caminho, motivo). Existem TRÊS estados, e o glob que isto
+    substitui só enxergava dois: achei transcritos / não há transcritos / NÃO CONSEGUI LER (raiz que não existe, que não é diretório, sem
+    permissão; projeto cuja listagem falha). O `Path.glob` devolve vazio nos três últimos — "nada a colher" — e o harvest saía com 0 e uma
+    linha-resumo de aparência normal enquanto o reaper apagava os transcritos 24h depois."""
+    files, problems = [], []
+    try:
+        tops = sorted(os.scandir(root), key=lambda e: e.name)
+    except FileNotFoundError:
+        return files, [(root, "não existe")]
+    except NotADirectoryError:
+        return files, [(root, "não é um diretório")]
+    except OSError as e:
+        return files, [(root, f"ilegível ({e.strerror or e})")]
+    for d in tops:
+        try:
+            if not d.is_dir():
+                continue
+            for f in sorted(os.scandir(d.path), key=lambda e: e.name):
+                if f.name.endswith(".jsonl") and f.is_file():
+                    files.append(Path(f.path))
+        except OSError as e:
+            problems.append((Path(d.path), f"projeto ilegível ({e.strerror or e})"))
+    return files, problems
+
+
 def fingerprint(main):
     """(size, mtime_ns) do transcrito + resumo dos de subagente: mudou -> reescaneia a sessão."""
     parts = []
@@ -279,6 +308,15 @@ def fingerprint(main):
 def scan_session(main):
     """-> dict (registro do ledger) ou None se o transcrito sumiu. Contagem por message.id ENTRE todos os arquivos da sessão."""
     sid = main.stem
+    # O que o ledger vai jurar sobre este transcrito (fingerprint, tamanho, mtime) é tirado ANTES de lê-lo: uma escrita que entre depois
+    # disto muda o fingerprint real, e a próxima colheita reescaneia. Tirado DEPOIS, ele atestaria um conteúdo que nunca foi lido (a mensagem
+    # entrada no meio) e a sessão ficaria "inalterada" para sempre — a variável decidida != a variável usada.
+    fp = fingerprint(main)
+    try:
+        st = main.stat()
+        size, mtime_ns = st.st_size, st.st_mtime_ns
+    except OSError:
+        size = mtime_ns = 0
     alias = None
     first_text = ""
     branches = []
@@ -293,12 +331,17 @@ def scan_session(main):
     no_usage = set()
     nlines = 0
     user_seen = 0
+    files_unreadable = 0      # arquivo de subagente (ou o diretório deles) que existe mas não abre: os tokens dele NÃO entraram — contado, não calado
+    sub_dir = main.with_suffix("") / "subagents"
+    if sub_dir.is_dir() and not os.access(sub_dir, os.R_OK | os.X_OK):
+        files_unreadable += 1      # `Path.glob` devolve vazio para um diretório sem permissão: sem isto "sem subagentes" e "não consegui listar" são a mesma coisa
     for f in session_files(main):
         try:
             fh = open(f, errors="replace")
         except OSError:
             if f == main:
                 return None
+            files_unreadable += 1
             continue
         with fh:
             for line in fh:
@@ -428,15 +471,10 @@ def scan_session(main):
                 agg[k] += m["use"][k]
             agg["msgs"] += 1
     stamps = [m["ts"] for m in msgs.values() if m["ts"]]
-    try:
-        st = main.stat()
-        size, mtime_ns = st.st_size, st.st_mtime_ns
-    except OSError:
-        size = mtime_ns = 0
     return dict(v=SCHEMA, sid=sid, alias=alias or None, role=role, project=main.parent.name,
                 cwd=cwd, first_ts=min(stamps) if stamps else None, last_ts=max(stamps) if stamps else None,
-                size=size, mtime_ns=mtime_ns, fp=fingerprint(main), msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
-                bad_lines=bad, no_usage=len(no_usage), claims_untimed=untimed, msgs_untimed=untimed_msgs, lines=nlines, branches=branches,
+                size=size, mtime_ns=mtime_ns, fp=fp, msgs=len(msgs), dup_lines=dup_lines, synthetic=synthetic,
+                bad_lines=bad, files_unreadable=files_unreadable, no_usage=len(no_usage), claims_untimed=untimed, msgs_untimed=untimed_msgs, lines=nlines, branches=branches,
                 claims=[dict(bead=c["bead"], ts=c["ts"], ok=c["ok"], via=c["via"]) for c in live],
                 refs=[[b, n] for b, n in refs.most_common(3)], claims_failed=failed, claims_unconfirmed=unconfirmed,
                 buckets={k: dict(v) for k, v in buckets.items()}, days={k: dict(v) for k, v in days.items()},
@@ -462,6 +500,8 @@ def load_ledger(path=None):
                     continue
                 if r.get("sid"):
                     rows[r["sid"]] = r                  # a última linha de uma sessão vale
+                else:
+                    bad += 1                            # objeto JSON sem `sid` não é uma linha de sessão: ilegível e CONTADO (a reescrita a descartaria calada)
     return rows, bad
 
 
@@ -514,9 +554,12 @@ def cmd_harvest(a):
     rows, bad_ledger = load_ledger(path)
     preserve_unreadable(path, bad_ledger)
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
-    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = unconfirmed = 0
+    scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = unconfirmed = files_unreadable = 0
+    input_problems = []       # (raiz ou projeto, motivo): entrada que NÃO deu para ler — "não sei" não é "nada a colher"
     for proj in PROJECTS:
-        for f in sorted(proj.glob("*/*.jsonl")):
+        files, problems = list_transcripts(proj)
+        input_problems += problems
+        for f in files:
             try:
                 if cutoff and f.stat().st_mtime < cutoff:
                     skipped_old += 1
@@ -537,6 +580,7 @@ def cmd_harvest(a):
             untimed += rec["claims_untimed"]
             untimed_msgs += rec["msgs_untimed"]
             unconfirmed += rec["claims_unconfirmed"]
+            files_unreadable += rec["files_unreadable"]
             if rec["lines"] >= 30:
                 big += 1
                 if rec["msgs"] == 0:
@@ -545,11 +589,23 @@ def cmd_harvest(a):
                 scanned += 1
             else:
                 unchanged += 1
+    seen = scanned + unchanged + skipped_old + vanished
+    if not PROJECTS:
+        input_problems.append((Path("(BTM_PROJECTS)"), "nenhuma raiz de transcritos configurada"))
+    elif not seen and not input_problems:
+        input_problems.append((Path(":".join(str(r) for r in PROJECTS)), "0 transcritos `<projeto>/<sessão>.jsonl`"))
     write_ledger(rows, path)
     # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
     # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
     # O wrapper do order corta a linha de log em 500 caracteres: o alarme é a PRIMEIRA linha (o corte joga fora o fim, não o começo) e o
     # exit é ≠ 0 (o order e o teste de produção enxergam). O ledger já foi escrito: o alarme não perde a colheita.
+    # Entrada ilegível é o alarme MAIS fundamental (a colheita não colheu nada de lá) e vem antes do de formato: cada um é uma linha só, e o
+    # corte do wrapper jogaria fora o que está no fim. O exit é RC_NO_INPUT mesmo que o de formato também acenda.
+    if input_problems:
+        shown = "; ".join(f"{r}: {why}" for r, why in input_problems[:3]) + (f" (+{len(input_problems) - 3})" if len(input_problems) > 3 else "")
+        print(f"⚠ SEM ENTRADA: não consegui ler os transcritos — {shown}. 'Nada a colher' NÃO é o que aconteceu (HOME/CLAUDE_CONFIG_DIR do order "
+              f"diferente? o Claude Code mudou o diretório?): o reaper apaga o transcrito de sessão morta em 24h e o ledger deixa de ser alimentado. "
+              f"exit {RC_NO_INPUT}")
     alarm = suspect >= 2 and suspect * 4 >= big
     if alarm:
         print(f"⚠ ALARME: {suspect} de {big} sessões com ≥30 linhas vieram com 0 respostas lidas: formato do transcrito mudou? (0 respostas NÃO significa 0 gasto)")
@@ -559,6 +615,9 @@ def cmd_harvest(a):
     if bad_lines or no_usage:
         print(f"⚠ nas sessões escaneadas: {bad_lines} linhas de transcrito ilegíveis e {no_usage} respostas SEM usage (tokens DESCONHECIDOS, "
               f"contados como 0 só no total — o gasto real é maior)")
+    if files_unreadable:
+        print(f"⚠ {files_unreadable} arquivos/diretórios de subagente que existem mas NÃO abrem nas sessões escaneadas: os tokens deles não entraram "
+              f"(o gasto real é maior)")
     if untimed:
         print(f"⚠ {untimed} claims sem timestamp nas sessões escaneadas: não dá para posicioná-los entre as mensagens, então ficam FORA da "
               f"atribuição por claim (worker de pool cai na referência mais citada — menos firme; crew fica sem bead)")
@@ -568,7 +627,7 @@ def cmd_harvest(a):
     if untimed_msgs:
         print(f"⚠ {untimed_msgs} respostas sem timestamp nas sessões escaneadas: não dá para posicioná-las entre os claims (entram no overhead de "
               f"partida da sessão) nem num dia — o `report` as conta em TODAS as janelas e avisa")
-    return RC_FORMAT_ALARM if alarm else 0
+    return RC_NO_INPUT if input_problems else (RC_FORMAT_ALARM if alarm else 0)
 
 
 def s3_list(since_day):
@@ -790,6 +849,7 @@ def _report(a, result):
               f"morto após 24h). Rode `backfill-s3 --since {since_day}` ou comece a janela depois.\n")
     # DESCONHECIDOS que a colheita grava por sessão: o `harvest` os imprime uma vez, quem lê o relatório (texto OU --json) os vê na janela
     unk = dict(usage_msgs=sum(s.get("no_usage", 0) for s in sess), transcript_lines_unreadable=sum(s.get("bad_lines", 0) for s in sess),
+               transcript_files_unreadable=sum(s.get("files_unreadable", 0) for s in sess),
                claims_untimed=sum(s.get("claims_untimed", 0) for s in sess), msgs_untimed=sum(s.get("msgs_untimed", 0) for s in sess),
                claims_unconfirmed=sum(s.get("claims_unconfirmed", 0) for s in sess), claims_failed=sum(s.get("claims_failed", 0) for s in sess),
                rows_old_schema=sum(1 for s in sess if s.get("v") != SCHEMA))
@@ -797,6 +857,9 @@ def _report(a, result):
     if unk["usage_msgs"] or unk["transcript_lines_unreadable"]:
         print(f"⚠ na janela: {unk['usage_msgs']} respostas SEM usage (tokens DESCONHECIDOS, contados como 0 só no total — o gasto real é maior) e "
               f"{unk['transcript_lines_unreadable']} linhas de transcrito ilegíveis.\n")
+    if unk["transcript_files_unreadable"]:
+        print(f"⚠ na janela: {unk['transcript_files_unreadable']} arquivos/diretórios de subagente que existem mas NÃO abrem: os tokens deles não entraram "
+              f"(o gasto real dessas sessões é maior).\n")
     if unk["claims_unconfirmed"]:
         print(f"⚠ na janela: {unk['claims_unconfirmed']} claims com resultado visível que NÃO confirma (comando que só citou `bd update --claim`, ou "
               f"saída cortada): ficam FORA da atribuição por claim — não viram bead e não tomam as respostas de ninguém.\n")
@@ -1020,6 +1083,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 per[b]["builders"].append((s["first_ts"] or "", role, s["alias"]))
     # arm do construtor = 1ª sessão de construtor do bead (intenção de tratar): papel + effort dominante dessa sessão
     first_session = {}
+    first_sid = {}                     # bead -> sid da 1ª sessão de construtor (o A/B de effort sorteia o braço por SESSÃO, não por bead)
     first_ok = {}                      # bead -> `ok` do claim que o atribuiu (True = resultado visível; None = transcrito cortado, ou via=ref)
     for s in all_sess:
         if s["role"] in BUILDERS:
@@ -1033,6 +1097,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
                 cur = first_session.get(b)
                 if cur is None or (s["first_ts"] or "") < cur[0]:
                     first_session[b] = (s["first_ts"] or "", s["role"], top, c.get("via") or "claim")
+                    first_sid[b] = s["sid"]
                     first_ok[b] = c.get("ok")
     first_run, ever_pass, nruns = {}, set(), Counter()
     for r in gate_runs:
@@ -1139,7 +1204,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
     # com token sem preço o número completo NÃO existe: usd_per_approved é null e o piso vai em campo próprio (nunca o piso com cara de medida)
     result["system"] = dict(approved_beads=n_ok, usd_per_approved=(None if unp_tok else per_sys), usd_per_approved_floor=per_sys,
                             unpriced_tokens=unp_tok, usd_complete=not unp_tok)
-    result["power"] = power_section(first_session, first_run, per, ever_pass, measured)
+    result["power"] = power_section(first_session, first_run, per, ever_pass, measured, first_sid)
     print("\nLeitura: 'aprovada' = 1ª rodada real do gate (PASS) por coorte; custo de rework (sessões extras do mesmo bead) entra no "
           "build$/bead. A coorte atribui ao braço da 1ª sessão — intenção de tratar.")
     return 0, result
@@ -1159,7 +1224,7 @@ def n_per_arm_prop(p, diff):
     return (1.96 * math.sqrt(2 * ((p + p2) / 2) * (1 - (p + p2) / 2)) + 0.8416 * math.sqrt(p * (1 - p) + p2 * (1 - p2))) ** 2 / diff ** 2
 
 
-def power_section(first_session, first_run, per, ever_pass, measured):
+def power_section(first_session, first_run, per, ever_pass, measured, first_sid):
     """Quanto um A/B POR BEAD enxerga com o volume que existe? O custo por bead tem cauda longa (CV >> 1): o critério 'não cair mais
     que 3 pp' precisa de milhares de beads por braço — sem esta conta o experimento 'inconclusivo' é só falta de poder."""
     out = {}
@@ -1169,6 +1234,7 @@ def power_section(first_session, first_run, per, ever_pass, measured):
         beads = [b for b in measured if first_session[b][1] == role]
         if len(beads) < 20:
             print(f"{role:10s} {len(beads):6d}   (menos de 20 beads medidos: sem poder estatístico para estimar nada)")
+            out[role] = dict(beads=len(beads), insufficient=True, min_beads=20)     # o --json diz "poucos beads"; ausente seria indistinguível de "papel que não existe"
             continue
         # o CV é do US$ por bead, e só um bead com TODAS as partes precificadas tem US$ (o resto é n/p, não "US$ 0"): bead sem preço fica
         # FORA da média e do desvio, e quantos ficaram fora é impresso. Sem >= 20 beads com preço e média > 0 o CV é n/p — nunca nan.
@@ -1190,7 +1256,22 @@ def power_section(first_session, first_run, per, ever_pass, measured):
               f"   |   {pp_s}"
               + (f"   ⚠ CV só sobre {len(priced)} de {len(beads)} beads com preço (use --assume-price)" if len(priced) < len(beads) else "")
               + ("   ⚠ n/a = a taxa de 1ª aprovação é menor que a queda a detectar: uma queda desse tamanho não existe" if None in npp else ""))
-        out[role] = dict(beads=len(beads), beads_priced=len(priced), beads_per_day=round(rate, 2), cv_usd_per_bead=rnd(cv, 3), first_pass=round(p, 3),
+        # o braço do A/B de effort é sorteado por SESSÃO (claude-lowprio.sh): beads da mesma sessão dividem o braço e não são amostras independentes.
+        # A conta acima trata cada bead como unidade; quanto isso importa é o nº de beads por sessão — impresso, não suposto.
+        n_sess = len({first_sid[b] for b in beads if first_sid.get(b)})
+        bps = len(beads) / n_sess if n_sess else None
+        if bps is None:
+            design = " (sessão não identificada: não sei quanto o n efetivo encolhe)"
+        else:
+            if bps <= 1.0:
+                eff = "igual ao n/braço acima (um bead por sessão)"
+            elif bps <= 1.25:
+                eff = "um pouco MENOR que o n/braço acima (agrupamento pequeno)"
+            else:
+                eff = "MENOR que o n/braço acima, e muito (agrupamento grande): leia o n/braço como um teto"
+            design = f" = {bps:.2f} beads/sessão: o braço do A/B é por SESSÃO, então beads da mesma sessão dividem o braço e o n efetivo é {eff}"
+        print(f"{'':10s} ↳ {n_sess} sessões construíram esses {len(beads)} beads" + design)
+        out[role] = dict(beads=len(beads), sessions=n_sess, beads_per_session=rnd(bps, 3), beads_priced=len(priced), beads_per_day=round(rate, 2), cv_usd_per_bead=rnd(cv, 3), first_pass=round(p, 3),
                          n_per_arm_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(x) for x in nm))) if nm else None),
                          n_per_arm_first_pass=dict(zip(("10pp", "5pp", "3pp"), (None if x is None else round(x) for x in npp))),
                          days_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(days(x)) for x in nm))) if nm else None),

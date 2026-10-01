@@ -7,11 +7,19 @@
 # `harvest` copies the per-session numbers into $GC_CITY_PATH/.gc/token-ledger/sessions.jsonl (idempotent, incremental,
 # single-instance flock inside the tool). Run every 30 min by orders/token-ledger-harvest.toml — comfortably inside the
 # reaper's 24h window, comfortably outside one run (first full scan of 1.8k transcripts: ~10 s; incremental: ~1 s).
-# A gap is not data loss: `bead-token-meter.py backfill-s3 --since <day>` restores it from the permanent S3 archive.
+# A gap is only PARTLY recoverable: `bead-token-meter.py backfill-s3 --since <day>` restores the top-level transcripts from the
+# permanent S3 archive, but not the nested objects (subagents, tool results) — its own output says the restored spend is
+# UNDERESTIMATED. A harvest that quietly stops is the failure to prevent, which is why the exit codes below reach the order runner.
 #
 # This wrapper only adds what an order needs around the tool: a sane PATH (orders do not run in a login shell), low
 # priority (the box saturates: load 47 measured), one log line per run with rc and duration — "is the harvest alive and how
-# long does it take" is one tail away — and a non-zero exit that reaches the order runner when the tool failed.
+# long does it take" is one tail away — and the tool's exit code, UNCHANGED, to the order runner:
+#   0  harvested (or another harvest holds the ledger lock: nothing to do — the log line says "outra colheita em curso")
+#   5  the transcript FORMAT looks changed (sessions read, 0 responses); the ledger was written
+#   6  the transcripts could not be READ (root missing / unreadable / empty, project unreadable); the ledger is untouched.
+#      "Nothing to harvest" is not something the tool can know in that case, so it never exits 0 for it.
+#   else  the tool crashed
+# The alarm text is the FIRST line of the tool's output, so the 500-char cut of the log line below never throws it away.
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
