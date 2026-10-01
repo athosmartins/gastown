@@ -32,7 +32,9 @@
 # "unknown" is not "ok": it is reported, and exits 1 like FAIL — read the label.
 #
 # REPORT: notify (primary, no Dolt dependency) always; a mail to the mayor
-# (secondary, best-effort, needs Dolt) only when something is not ok.
+# (secondary, best-effort, needs Dolt) only when something is not ok. The failure
+# notifications go out with route=push (NOTIFY_FORCE_PUSH): notify's default route is the
+# silent digest and -p 4 does not change that. The routine OK is left on the digest.
 #
 # NOT CHECKED HERE (by design): the property_scrapers rodada the reboot cut. It is
 # resumed by the scraper's own catch-up (--skip-done-today), owned by that rig; the
@@ -217,22 +219,39 @@ fi
 # One instance at a time (the plist can be loaded and kicked at once). mkdir is
 # atomic; a lock whose owner is dead is taken over, so a crash or a power loss
 # mid-run cannot wedge the check forever. No `rm -rf` (see ga-gkap9p).
+# The lock records the BOOT it was taken in beside the pid. Pids are reused after a reboot, so a
+# lock left by a postcheck that was killed mid-run could name a pid that now belongs to some
+# unrelated process: `kill -0` alone would call it live and every later login would log
+# "another instance holds..." and exit without checking anything. A lock from another boot is
+# dead, whatever its pid says. A lock without a boot (older format) or a boot we cannot read
+# falls back to the pid test alone, as before.
+take_lock() { echo "$$" > "${LOCK_DIR}/pid" 2>/dev/null; boot_epoch > "${LOCK_DIR}/boot" 2>/dev/null; return 0; }
 acquire_lock() {
-    local pid
+    local pid lock_boot now_boot
     if mkdir "${LOCK_DIR}" 2>/dev/null; then
-        echo "$$" > "${LOCK_DIR}/pid" 2>/dev/null
+        take_lock
         return 0
     fi
     pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null)"
-    case "${pid}" in ''|*[!0-9]*) ;; *) kill -0 "${pid}" 2>/dev/null && return 1 ;; esac
-    rm -f "${LOCK_DIR}/pid" 2>/dev/null; rmdir "${LOCK_DIR}" 2>/dev/null
+    lock_boot="$(cat "${LOCK_DIR}/boot" 2>/dev/null)"
+    now_boot="$(boot_epoch)"
+    # each side on its own: a boot we can read on one side only proves nothing, and
+    # "I could not read my own boot" must never read as "the lock is from another boot"
+    case "${lock_boot}" in ''|*[!0-9]*) lock_boot="" ;; esac
+    case "${now_boot}" in ''|*[!0-9]*) lock_boot="" ;; esac
+    if [ -n "${lock_boot}" ] && [ "${lock_boot}" != "${now_boot}" ]; then
+        log "stale lock ${LOCK_DIR}: taken in boot ${lock_boot}, this is boot ${now_boot} — pid ${pid:-?} may have been reused; taking it over"
+    else
+        case "${pid}" in ''|*[!0-9]*) ;; *) kill -0 "${pid}" 2>/dev/null && return 1 ;; esac
+    fi
+    rm -f "${LOCK_DIR}/pid" "${LOCK_DIR}/boot" 2>/dev/null; rmdir "${LOCK_DIR}" 2>/dev/null
     if mkdir "${LOCK_DIR}" 2>/dev/null; then
-        echo "$$" > "${LOCK_DIR}/pid" 2>/dev/null
+        take_lock
         return 0
     fi
     return 1
 }
-release_lock() { rm -f "${LOCK_DIR}/pid" 2>/dev/null; rmdir "${LOCK_DIR}" 2>/dev/null; return 0; }
+release_lock() { rm -f "${LOCK_DIR}/pid" "${LOCK_DIR}/boot" 2>/dev/null; rmdir "${LOCK_DIR}" 2>/dev/null; return 0; }
 
 if ! acquire_lock; then
     log "another postcheck instance holds ${LOCK_DIR} — leaving it to that one"
@@ -249,7 +268,19 @@ BOOT_BEFORE="$(pending_field boot_before)"
 MODE="$(pending_field mode)"
 BOOT_NOW="$(boot_epoch)"
 
-notify_athos() { "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true; }
+# notify_athos <title> <body> [priority] [route]. `notify` sends to the silent digest unless
+# the message is on its allowlist or NOTIFY_FORCE_PUSH is set — -p 4 and the title do NOT force
+# a push (measured with NOTIFY_ROUTE_TEST=1: every message below lands on the digest without
+# it). route=push is for the two that mean "the city may not be up": without it the primary
+# alert of this script is the one nobody sees, and the mail to the mayor needs the Dolt that
+# may be the thing that did not come back. The routine "OK" stays on the digest.
+notify_athos() {
+    if [ "${4:-}" = "push" ]; then
+        NOTIFY_FORCE_PUSH=1 "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+    else
+        "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+    fi
+}
 # mail_mayor <subject> <body>: best-effort, but the OUTCOME is logged. `mail send` writes a
 # bead, so it hangs when Dolt is wedged — and this mail goes out in exactly the branch where
 # Dolt may be the thing that did not come back. Without a deadline the check would sit here
@@ -293,7 +324,7 @@ case "${ISSUED}" in ''|*[!0-9]*) ISSUED="" ;; esac
 case "${BOOT_BEFORE}" in ''|*[!0-9]*) BOOT_BEFORE="" ;; esac
 if [ -z "${ISSUED}" ] || [ -z "${BOOT_BEFORE}" ]; then
     log "ERROR: ${PENDING_FILE} is unreadable (issued='${ISSUED}' boot_before='${BOOT_BEFORE}') — cannot tell whether this boot is the nightly one; dropping it"
-    notify_athos "Reboot noturno: pós-boot não conferido" "o arquivo de pendência estava ilegível — não sei se este boot foi o do reboot noturno. Confira a cidade à mão: nightly-reboot-postcheck.sh --now" 4
+    notify_athos "Reboot noturno: pós-boot não conferido" "o arquivo de pendência estava ilegível — não sei se este boot foi o do reboot noturno. Confira a cidade à mão: nightly-reboot-postcheck.sh --now" 4 push
     drop_pending
     exit 1
 fi
@@ -359,7 +390,7 @@ fi
 
 PROBLEMS="$(print_round | grep -v ' ok: ' | tr '\n' ';')"
 log "RESULT: NOT all ok after ${ATTEMPT} round(s) — ${PROBLEMS}"
-notify_athos "Reboot noturno: pós-boot COM PROBLEMA" "${PROBLEMS} (FAIL = caiu; unknown = não consegui olhar). ${INFO}. Rode: nightly-reboot-postcheck.sh --now" 4
+notify_athos "Reboot noturno: pós-boot COM PROBLEMA" "${PROBLEMS} (FAIL = caiu; unknown = não consegui olhar). ${INFO}. Rode: nightly-reboot-postcheck.sh --now" 4 push
 mail_mayor "nightly-reboot: pós-boot com problema (ga-a2v0bz)" "$(printf 'O reboot noturno terminou mas a conferência pós-boot não fechou limpa depois de %s rodada(s):\n%s\n%s\nLog: %s' "${ATTEMPT}" "$(print_round)" "${INFO}" "${LOG}")"
 drop_pending
 exit 1

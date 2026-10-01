@@ -25,20 +25,29 @@
 #   P9  mapa: 2xx/3xx ok, 5xx FAIL, 000/4xx unknown
 #   P10 dreno: vivo neste boot = FAIL; de outro boot = ok; ilegivel = unknown; NUNCA removido
 #   P11 pendencia ilegivel -> avisa e descarta; kern.boottime ilegivel -> mantem a pendencia
-#   P12 trava: dono vivo -> sai; dono morto -> assume
+#   P12 trava: dono vivo -> sai; dono morto -> assume; trava de OUTRO boot com pid reaproveitado
+#       (vivo, mas de outro processo) -> assume; boot ilegivel do nosso lado -> NAO assume
 #   P13 --now: 4 linhas, sem notify, sem log, sem tocar na pendencia; arg ruim -> exit 2
 #   P14 estatico: nunca faz `source` da sonda, nunca chama o goroutine dump (kill -QUIT)
 #   P15 contrato com nightly-reboot.sh: mesmas chaves da pendencia, mesmos caminhos, mesmo formato do dreno
+#
+# ROTEAMENTO (gate FAIL 2/3): o `notify` manda pro digest SILENCIOSO por padrao; -p 4 e o titulo nao
+# mudam isso. P4/P5/P6/P11 perguntam ao notify DE VERDADE (NOTIFY_ROUTE_TEST=1, nao envia nada) onde cai
+# a chamada exata que o script fez: os avisos de falha tem que cair no PUSH, o "OK" de rotina nao.
+# Antes, estes testes trocavam o notify por um fake que so gravava argv — e passavam sem exercitar isso.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SELF_DIR/nightly-reboot-postcheck.sh"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIPPED=0
 ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
+# skipped: uma checagem que NAO PODE rodar aqui (nao e passe, nem falha) — dita em voz alta
+skipped() { echo "  - SKIP $*"; SKIPPED=$((SKIPPED+1)); }
+REAL_NOTIFY="${NIGHTLY_REBOOT_SELFTEST_REAL_NOTIFY:-/Users/athos/.local/bin/notify}"
 
 if [ ! -f "$SCRIPT" ]; then
   bad "nightly-reboot-postcheck.sh nao existe ao lado deste selftest — nada a testar"
-  echo ""; echo "nightly-reboot-postcheck selftest: PASS=$PASS FAIL=$FAIL"; exit 1
+  echo ""; echo "nightly-reboot-postcheck selftest: PASS=$PASS FAIL=$FAIL SKIPPED=$SKIPPED"; exit 1
 fi
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -61,12 +70,17 @@ new_world() {
   PENDING="$W/city/.gc/logs/nightly-reboot.pending"
   DRAIN="$W/run/city-drain.level"
   NOTIFY_CALLS="$W/notify.calls"; GC_CALLS="$W/gc.calls"; PROBE_ARGS="$W/probe.args"
-  : > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$PROBE_ARGS"
+  NOTIFY_FORCE="$W/notify.force"; NOTIFY_ROUTES="$W/notify.routes"
+  : > "$NOTIFY_CALLS"; : > "$GC_CALLS"; : > "$PROBE_ARGS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"
   touch "$W/vm/swapfile0" "$W/vm/swapfile1" "$W/vm/notaswap"
 
+  # grava os argumentos, se veio NOTIFY_FORCE_PUSH, e pra onde o notify DE VERDADE mandaria esta chamada exata
   cat > "$W/notify" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$NOTIFY_CALLS"
+echo "force=\${NOTIFY_FORCE_PUSH:-} :: \$*" >> "$NOTIFY_FORCE"
+if [ -x "$REAL_NOTIFY" ]; then r="\$(NOTIFY_ROUTE_TEST=1 "$REAL_NOTIFY" "\$@" 2>/dev/null | head -1)"; [ -n "\$r" ] || r="unreadable"; else r="n/a"; fi
+echo "\$r :: \$*" >> "$NOTIFY_ROUTES"
 EOF
   cat > "$W/gc" <<EOF
 #!/usr/bin/env bash
@@ -129,6 +143,24 @@ run_pc() {
 n_lines() { local n; n="$(grep -c . "$1" 2>/dev/null)"; echo "${n:-0}"; }
 log_has() { grep -qF -- "$1" "$LOGF" 2>/dev/null; }
 notify_has() { grep -qF -- "$1" "$NOTIFY_CALLS"; }
+# force_of <trecho>: "1" se o script mandou com NOTIFY_FORCE_PUSH, "" se nao, "NONE" se nao mandou
+force_of() { local l; l="$(grep -F -- "$1" "$NOTIFY_FORCE" 2>/dev/null | head -1)"; [ -n "$l" ] || { echo NONE; return; }; l="${l#force=}"; echo "${l%% ::*}"; }
+route_of() { local l; l="$(grep -F -- "$1" "$NOTIFY_ROUTES" 2>/dev/null | head -1)"; [ -n "$l" ] || { echo NONE; return; }; echo "${l%% ::*}"; }
+# assert_push <rotulo> <trecho>: mandado COM o override E o notify de verdade o poe no push
+assert_push() {
+  local label="$1" frag="$2" f r
+  f="$(force_of "$frag")"; r="$(route_of "$frag")"
+  case "$f" in
+    NONE) bad "$label: o aviso '$frag' nem foi mandado. chamadas: $(tr '\n' '|' < "$NOTIFY_CALLS")"; return ;;
+    1) ok "$label: mandado com NOTIFY_FORCE_PUSH" ;;
+    *) bad "$label: mandado SEM NOTIFY_FORCE_PUSH — cai no digest silencioso (o alerta primario ninguem ve)" ;;
+  esac
+  case "$r" in
+    push*) ok "$label: o notify de verdade o poe no PUSH ($r)" ;;
+    n/a) skipped "$label: notify de verdade ausente em $REAL_NOTIFY — so o override foi provado, nao a rota" ;;
+    *) bad "$label: o notify de verdade o poe em '$r' — o aviso nao chega" ;;
+  esac
+}
 
 # ── P1: sem pendencia -> silencio total ─────────────────────────────────────
 echo "P1: sem pendencia (todo login que nao e do reboot)"
@@ -169,6 +201,7 @@ notify_has "swap: 2 arquivo(s)" && ok "P4 notify traz o swap pos-boot (2 swapfil
 [ "$(n_lines "$GC_CALLS")" = "0" ] && ok "P4 sem mail ao mayor numa noite limpa" || bad "P4 mandou mail numa noite limpa: $(cat "$GC_CALLS")"
 [ "$(cat "$PROBE_ARGS")" = "--robust" ] && ok "P4 sonda chamada com --robust (nao a bare, que le Dolt lento como caido)" || bad "P4 args da sonda = '$(cat "$PROBE_ARGS")' (esperado --robust)"
 log_has "all four checks ok" && ok "P4 log RESULT" || bad "P4 sem RESULT no log"
+[ "$(force_of "Reboot noturno OK")" = "" ] && ok "P4 o 'OK' de rotina NAO e forcado — fica no digest, de proposito" || bad "P4 o OK de rotina saiu com NOTIFY_FORCE_PUSH='$(force_of "Reboot noturno OK")' (NONE = nem foi mandado)"
 
 # ── P5: Dolt caido em todas as rodadas ───────────────────────────────────────
 echo "P5: Dolt unreachable em todas as rodadas"
@@ -177,6 +210,7 @@ W_DOLT_RC=1 new_world p5; write_pending "$(( $(now_s) - 300 ))"; run_pc
 notify_has "COM PROBLEMA" && ok "P5 notify COM PROBLEMA" || bad "P5 notify: $(cat "$NOTIFY_CALLS")"
 notify_has "-p 4" && ok "P5 prioridade 4 (alta)" || bad "P5 prioridade: $(cat "$NOTIFY_CALLS")"
 notify_has "dolt FAIL" && ok "P5 o notify diz QUAL check caiu e como (dolt FAIL)" || bad "P5 notify sem 'dolt FAIL': $(cat "$NOTIFY_CALLS")"
+assert_push "P5 COM PROBLEMA (Dolt caido)" "COM PROBLEMA"
 grep -qF "mail send mayor" "$GC_CALLS" && ok "P5 mail ao mayor (best-effort, secundario)" || bad "P5 sem mail ao mayor: $(cat "$GC_CALLS")"
 [ "$(cat "$W/n.probe")" = "3" ] && ok "P5 esgotou as 3 rodadas (MAX_ATTEMPTS) antes de desistir" || bad "P5 rodadas=$(cat "$W/n.probe") (esperado 3)"
 [ ! -e "$PENDING" ] && ok "P5 pendencia removida mesmo com problema" || bad "P5 pendencia ficou"
@@ -217,6 +251,7 @@ W_DOLT_RC=2 new_world p6a; write_pending "$(( $(now_s) - 300 ))"; run_pc
 [ "$RC" = "1" ] && ok "P6 dolt unknown: exit 1 (unknown NAO e ok)" || bad "P6 dolt unknown: exit=$RC (colapsou em ok?)"
 notify_has "dolt unknown" && ok "P6 dolt rotulado 'unknown'" || bad "P6 dolt rotulo: $(cat "$NOTIFY_CALLS")"
 notify_has "dolt FAIL" && bad "P6 dolt unknown virou FAIL (colapsou 'nao sei' em 'caiu')" || ok "P6 dolt unknown NAO virou FAIL"
+assert_push "P6 COM PROBLEMA (nao consegui olhar)" "COM PROBLEMA"
 W_SENDER=error new_world p6b; write_pending "$(( $(now_s) - 300 ))"; run_pc
 notify_has "sender unknown" && ok "P6 launchctl com erro -> sender unknown" || bad "P6 sender: $(cat "$NOTIFY_CALLS")"
 W_MAP_CODE=000 W_MAP_RC=28 new_world p6c; write_pending "$(( $(now_s) - 300 ))"; run_pc
@@ -296,6 +331,7 @@ new_world p11a; printf 'issued=abc\nboot_before=\n' > "$PENDING"; run_pc
 [ "$RC" = "1" ] && ok "P11 pendencia ilegivel: exit 1" || bad "P11 pendencia ilegivel exit=$RC"
 [ ! -e "$PENDING" ] && ok "P11 pendencia ilegivel descartada" || bad "P11 deixou a pendencia ilegivel"
 notify_has "não conferido" && ok "P11 AVISA que nao conferiu (silencio seria 'tudo certo')" || bad "P11 sem aviso: $(cat "$NOTIFY_CALLS")"
+assert_push "P11 'nao conferido'" "não conferido"
 [ "$(n_lines "$PROBE_ARGS")" = "0" ] && ok "P11 nao conferiu servicos sem saber se o boot e nosso" || bad "P11 conferiu"
 W_BOOT=garbage new_world p11b; write_pending "$(( $(now_s) - 300 ))"; run_pc
 [ "$RC" = "1" ] && ok "P11 kern.boottime ilegivel: exit 1" || bad "P11 boottime exit=$RC"
@@ -316,6 +352,31 @@ sleep 0 & DEAD=$!; wait "$DEAD" 2>/dev/null
 mkdir "$PENDING.lock.d"; echo "$DEAD" > "$PENDING.lock.d/pid"; run_pc
 [ "$RC" = "0" ] && notify_has "Reboot noturno OK" && ok "P12 dono MORTO: assume a trava e conclui (queda/power loss nao trava a conferencia)" || bad "P12 dono morto exit=$RC. $(cat "$NOTIFY_CALLS")"
 [ ! -e "$PENDING.lock.d" ] && ok "P12 trava liberada no fim" || bad "P12 trava ficou"
+# c) trava de OUTRO boot cujo pid hoje e de um processo VIVO e alheio (pids sao reaproveitados depois de
+#    um reboot): sem o boot na trava, `kill -0` diria "instancia viva" e TODO login dali em diante sairia
+#    mudo sem conferir nada
+new_world p12c; write_pending "$(( $(now_s) - 300 ))"
+sleep 30 & LIVE=$!
+mkdir "$PENDING.lock.d"; echo "$LIVE" > "$PENDING.lock.d/pid"; echo "$((BOOT_BEFORE - 7))" > "$PENDING.lock.d/boot"; run_pc
+kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+[ "$RC" = "0" ] && notify_has "Reboot noturno OK" && ok "P12 trava de OUTRO boot com pid vivo e alheio: assume e conclui (nao fica mudo)" || bad "P12 trava de outro boot: exit=$RC, notify=$(cat "$NOTIFY_CALLS"), out=$OUT"
+log_has "stale lock" && ok "P12 o log diz que a trava era de outro boot" || bad "P12 sem 'stale lock' no log"
+[ ! -e "$PENDING.lock.d" ] && ok "P12 trava liberada no fim (pid E boot removidos)" || bad "P12 trava ficou: $(ls "$PENDING.lock.d" 2>/dev/null | tr '\n' ' ')"
+# d) trava do MESMO boot com dono vivo: continua valendo
+new_world p12d; write_pending "$(( $(now_s) - 300 ))"
+sleep 30 & LIVE=$!
+mkdir "$PENDING.lock.d"; echo "$LIVE" > "$PENDING.lock.d/pid"; echo "$BOOT_NOW" > "$PENDING.lock.d/boot"; run_pc
+kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+[ "$(n_lines "$PROBE_ARGS")" = "0" ] && ok "P12 trava do MESMO boot, dono vivo: nao conferiu em duplicidade" || bad "P12 duas instancias conferiram (trava do mesmo boot ignorada)"
+log_has "another postcheck instance" && ok "P12 o log diz que outra instancia segura a trava" || bad "P12 sem a linha 'another postcheck instance'"
+# e) NAO consegui ler o meu proprio boot: "nao sei" nao pode virar "a trava e de outro boot" —
+#    estado inerte (respeita a trava), nunca o destrutivo (tomar uma trava que pode ser viva)
+W_BOOT=garbage new_world p12e; write_pending "$(( $(now_s) - 300 ))"
+sleep 30 & LIVE=$!
+mkdir "$PENDING.lock.d"; echo "$LIVE" > "$PENDING.lock.d/pid"; echo "$BOOT_BEFORE" > "$PENDING.lock.d/boot"; run_pc
+kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+log_has "stale lock" && bad "P12 boot ilegivel do nosso lado virou 'trava de outro boot' (colapsou 'nao sei' em 'sim')" || ok "P12 boot ilegivel do nosso lado: NAO toma a trava"
+[ -e "$PENDING.lock.d/pid" ] && ok "P12 a trava do dono vivo ficou intacta" || bad "P12 tomou/desfez uma trava de dono vivo sem saber o boot"
 
 # ── P13: --now ───────────────────────────────────────────────────────────────
 echo "P13: --now (sem efeito colateral)"
@@ -367,5 +428,5 @@ else
 fi
 
 echo ""
-echo "nightly-reboot-postcheck selftest: PASS=$PASS FAIL=$FAIL"
+echo "nightly-reboot-postcheck selftest: PASS=$PASS FAIL=$FAIL SKIPPED=$SKIPPED"
 [ "$FAIL" -eq 0 ]

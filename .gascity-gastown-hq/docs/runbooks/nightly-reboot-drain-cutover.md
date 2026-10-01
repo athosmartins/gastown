@@ -22,11 +22,11 @@ Pedido do Athos (01/10, P0): reiniciar **antes** do scraper. Desenho no bead ga-
 | 23:00–23:40 | Espera, re-carimbando o sinal a cada 5 min. |
 | 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
 | 23:40 | Gate com marker, bead em `in_progress` e rodada do scraper viram **informativos**: vão pro log e pro snapshot `.gc/logs/nightly-reboot-pre-<data>.txt` como "o que este reboot corta". O gate re-enfileira, o reclaim devolve o bead, o scraper retoma pelo catch-up. |
-| ~23:42 | `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. |
-| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** ou **"pós-boot COM PROBLEMA"** (neste caso também mail ao mayor). |
+| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. |
+| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). |
 
-Noite que não consegue reiniciar até ~23:55: **solta o dreno na hora**, registra SKIP e segue o
-streak/alarme de sempre. Uma noite falha nunca deixa a cidade congelada. Rodada do scraper
+Noite que não consegue reiniciar até ~23:55: **solta o dreno na hora**, registra SKIP (aviso **"Reboot noturno pulado"** por push) e segue o
+streak/alarme de sempre (o alarme de N noites seguidas também vai por push). Uma noite falha nunca deixa a cidade congelada. Rodada do scraper
 cortada 2 noites seguidas → mail ao mayor (o ps precisa saber que o corte virou rotina).
 
 ## Ordem OBRIGATÓRIA
@@ -57,7 +57,7 @@ está fora da sua janela 01:00–01:19 e pula: noites perdidas, em silêncio.
 
 - 23:00 `drain mode: the city stops admitting new work until the reboot at 23:40`
 - 23:40 `safety guards OK on attempt 1/16 ... rebooting with agent work possibly in flight`
-- depois do boot, `postcheck: RESULT: all four checks ok` + push **"Reboot noturno OK"**
+- depois do boot, `postcheck: RESULT: all four checks ok` + aviso **"Reboot noturno OK"** (digest, não vibra)
 - `informational: guardN ...: unknown TIMED OUT` ou `info: other rigs' in_progress counts TIMED OUT`:
   o bd/Dolt não respondeu a tempo (cada sonda ≤30 s, todas juntas ≤75 s). O reboot **sai mesmo
   assim** — um Dolt doente de madrugada é justamente quando o reboot mais importa — e o snapshot
@@ -84,9 +84,19 @@ teto de 90 min).
 - O guard de manutenção de Dolt enxerga os **wrappers** (`dolt-compact-routine.sh` etc.) e o
   CLI `dolt gc|backup|push|pull|fetch|table` por processo — não um `CALL dolt_gc()` digitado
   num SQL interativo.
-- Dois passos ficam **sem prazo**, de propósito: `softwareupdate --install` (a instalação do
-  update do macOS é longa por desenho e não pode ser cortada no meio) e o `notify` (já tem limites
-  próprios: curl 6 s, e-mail 45 s). Tudo que fala com bd/Dolt entre o disparo e o `shutdown` tem prazo.
+- Ficam **sem prazo**, de propósito: `softwareupdate --install` (a instalação do update do macOS é
+  longa por desenho e não pode ser cortada no meio), `softwareupdate --list --no-scan` (cache
+  local), o `notify` (já tem limites próprios: curl 6 s, e-mail 45 s), `sync` e `sudo`. Tudo que fala
+  com bd/Dolt entre o disparo e o `shutdown` tem prazo.
+- O sinal de dreno é carimbado uma vez antes do update do macOS. Se a instalação passar de 30 min,
+  os leitores o consideram velho e os despachantes voltam a admitir trabalho (falha aberta, por
+  desenho): o que entrar nesse intervalo é cortado pelo reboot como qualquer trabalho em voo.
+- **Roteamento do `notify`:** o padrão dele é o **digest silencioso**; `-p 4`/`-p 5` e "🚨" no
+  título não mudam isso (medido com `NOTIFY_ROUTE_TEST=1`). Por isso os avisos de alarme — noite
+  pulada, N noites seguidas, pós-boot COM PROBLEMA / não conferido — saem com `NOTIFY_FORCE_PUSH=1`,
+  e os de rotina (reiniciando, OK, update) ficam no digest. Medido no `history.db` do próprio
+  notify (04/09–01/10): dos 47 avisos "Reboot noturno…" que este script mandou, **47 foram pro
+  digest e nenhum pro push** — inclusive os seis alarmes "🚨 N noites seguidas" (N = 2…12).
 - O corte da rodada do scraper depende do catch-up do próprio rig (`--skip-done-today`) retomar
   no boot; a conferência pós-boot **não** verifica isso (é do dono do property_scrapers).
 - A porta usada pelo `SELECT 1` de confirmação do Dolt vem de `BEADS_DOLT_PORT` (default no

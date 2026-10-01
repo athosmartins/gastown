@@ -87,8 +87,16 @@
 # and does NOT hold the reboot — and every bd/Dolt call between the fire and the
 # shutdown, the SKIP bookkeeping included, has a deadline (run_bounded), because a
 # call that can veto the reboot by hanging is the same silent failure this mode
-# exists to end. Not bounded, on purpose: `softwareupdate --install` (an install is
-# long by design and must not be cut), and notify (its own curl/mail limits).
+# exists to end. Not bounded (none of them is a bd/Dolt call, which is the class this
+# deadline covers): `softwareupdate --install` (an install is long by design and must
+# not be cut), `softwareupdate --list --no-scan` (macos_update_check_state, local cache),
+# notify (its own curl/mail limits), `sync` and `sudo`.
+#
+# NOTIFY ROUTING: `notify` sends to the silent digest unless the message is on its
+# allowlist or NOTIFY_FORCE_PUSH is set (-p 4/5 and a "🚨" do not force it). Alarm-grade
+# messages — a skipped night, the N-in-a-row alarm — are sent with route=push; progress
+# notes stay on the digest. nightly-reboot.drain.selftest.sh asks the REAL notify
+# (NOTIFY_ROUTE_TEST=1) where each of them lands.
 #
 # MANUAL REBOOTS (the Mayor's, or anyone's, ga-7e3fwa): run
 #     scripts/nightly-reboot.sh --check-guards
@@ -145,10 +153,23 @@ GATE_ERR="$(mktemp -t nightly-reboot-gate-err)"
 HQ_ERR="$(mktemp -t nightly-reboot-hq-err)"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "${LOG}" 2>/dev/null; }
+# notify_athos <title> <body> [priority] [route]
+# `notify` ROUTES by an allowlist whose DEFAULT is the silent hourly digest: -p 4/-p 5 and
+# a "🚨" in the title do not change that. Measured (ga-a2v0bz) in notify's own history.db,
+# 2026-09-04..10-01: 47 of 47 "Reboot noturno…" messages this script sent were routed to the
+# digest, none to the push — the per-night SKIP (22x) and the six "🚨 N noites seguidas"
+# alarms (N=2..12) included. route=push sets
+# NOTIFY_FORCE_PUSH=1 for the alarm-grade ones (a skipped night, a streak). `env` carries the
+# variable across sudo's env_reset, which would drop a plain `VAR=1 sudo ...`. Routine
+# progress ("Reiniciando às…", the update notes) stays on the digest on purpose.
 notify_athos() {
   # Root can sudo to another user with no password — same trick
   # reboot_once_0700.sh used for its pre-reboot heads-up.
-  sudo -u "${NOTIFY_AS_USER}" "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+  if [ "${4:-}" = "push" ]; then
+    sudo -u "${NOTIFY_AS_USER}" /usr/bin/env NOTIFY_FORCE_PUSH=1 "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+  else
+    sudo -u "${NOTIFY_AS_USER}" "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true
+  fi
 }
 
 # --- DRAIN MODE: signal helpers (ga-a2v0bz) --------------------------------
@@ -329,8 +350,11 @@ info_probe_secs() {
 }
 
 # --- Consecutive-skip streak (ga-nnp5b item 4) ----------------------------
-# Every SKIP below already pushes a per-night notify — but two nights of
-# exactly that went unnoticed while swap climbed to ENOSPC (ga-nnp5b). This
+# Every SKIP below sends a per-night notify — it only LOOKED like a push until
+# ga-a2v0bz: notify routes to the digest by default (history.db: 0 of 47 of this script's
+# messages ever pushed), so the notify that was meant to catch a run of skipped nights
+# (ga-nnp5b: two nights went unnoticed while swap climbed to ENOSPC) could not. The SKIP
+# and the alarm below now ask for route=push. This
 # tracks how many nights IN A ROW ended in a skip (any guard, any reason —
 # the swap ratchet does not care WHY the reboot didn't happen) and escalates
 # louder + durably once that streak is long enough to matter, instead of
@@ -362,7 +386,7 @@ record_skip() {
   log "skip streak: ${n} consecutive night(s) without a reboot (reason: ${reason})"
   if [ "${n}" -gt 0 ] && [ $((n % ALARM_THRESHOLD)) -eq 0 ]; then
     log "ALARM: ${n} consecutive skipped nights (threshold ${ALARM_THRESHOLD}) — escalating to mayor"
-    notify_athos "🚨 Reboot noturno: ${n} noites seguidas sem reiniciar" "Motivo mais recente: ${reason}. Swap pode estar acumulando sem alívio. Ver ${LOG}." 5
+    notify_athos "🚨 Reboot noturno: ${n} noites seguidas sem reiniciar" "Motivo mais recente: ${reason}. Swap pode estar acumulando sem alívio. Ver ${LOG}." 5 push
     "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
       -s "nightly-reboot: ${n} noites seguidas sem reiniciar (ga-nnp5b)" \
       -m "$(printf 'O reboot noturno pulou %s noites seguidas (fail-closed, correto por si so, mas nunca chega a aliviar o swap).\nMotivo mais recente: %s\nLog: %s\nSe isto continuar, investigar se a causa e estrutural (nao so um hiccup transiente) antes que vire ENOSPC de novo.' "${n}" "${reason}" "${LOG}")" \
@@ -1046,6 +1070,40 @@ check_safety_guards_once() {
     return 0
 }
 
+# safety_gate_wait: the safety guards must be clear before the machine is cut. Tries up
+# to SAFETY_MAX_ATTEMPTS times, SAFETY_RETRY_INTERVAL apart. Returns 0 = clear (ATTEMPT is
+# the attempt that cleared) or 1 = still blocked (BLOCK_REASON says why, ATTEMPT is how
+# many were made). Run TWICE in drain mode: to decide, and again just before the shutdown.
+# The central sender is not gated by the drain, so a send can start in the minutes between
+# the two (informational probes, the macOS install, the notify) — a verdict is only good
+# for the moment it was read.
+safety_gate_wait() {
+    ATTEMPT=1
+    while true; do
+        drain_stamp || true
+        if check_safety_guards_once; then
+            return 0
+        fi
+        if [ "${ATTEMPT}" -ge "${SAFETY_MAX_ATTEMPTS}" ]; then
+            return 1
+        fi
+        log "attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} blocked by a safety guard (${BLOCK_REASON}) — retrying in ${SAFETY_RETRY_INTERVAL}s."
+        drain_sleep "${SAFETY_RETRY_INTERVAL}"
+        ATTEMPT=$((ATTEMPT+1))
+    done
+}
+
+# drain_skip_night: a safety guard held the reboot. Release the city, say so where a human
+# will SEE it (route=push: the digest is where the 13 silent nights went), count the night,
+# and leave. Never returns.
+drain_skip_night() {
+    log "SKIP: safety guards still blocked after ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * SAFETY_RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting; lifting the drain."
+    drain_end
+    notify_athos "Reboot noturno pulado" "guard de segurança ainda bloqueando após ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Dreno encerrado. Ver ${LOG}." 3 push
+    record_skip_bounded "${BLOCK_REASON}"
+    exit 0
+}
+
 # What this reboot is about to cut. Guards 2/3/4 do not hold the reboot in drain
 # mode, but their verdicts are the only record of what was in flight, so each one
 # lands in the log ("informational: ...") and in a per-night snapshot.
@@ -1184,17 +1242,31 @@ else
 fi
 
 # --- macOS update: install before reboot if one is ready (ga-l5m50) -------
-# (an install can take long: keep the drain signal fresh while it runs)
+# The drain signal is stamped once here, not kept alive: the readers ignore a signal older
+# than 30min, so an install that outlasts that lets the dispatchers admit work again
+# (fail-open by design). Work admitted then is cut by the reboot like any work in flight.
 if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then drain_stamp || true; fi
 macos_update_install_if_ready
 
 # --- All clear: record pre-reboot state, then reboot ----------------------
-reset_streak
 log "disk before: $(df -h /System/Volumes/Data | tail -1 | awk '{print $4" free ("$5" used)"}')"
 log "swap before: $(sysctl -n vm.swapusage 2>/dev/null)"
 log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 
 notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
+
+# Drain mode: the safety verdict was read before the informational probes, the macOS
+# install and the notify above, and none of them stops the central sender. Read it again
+# as late as possible; a send that started in the gap holds the reboot like one that was
+# there at 23:40. The streak is reset only after this, so a night that ends here as a
+# SKIP keeps counting. What is left between this read and the shutdown is the
+# scraper-cut bookkeeping (a local file; the alarm mail only from the 2nd night in a row,
+# bounded by INFO_PROBE_TIMEOUT), the pending file and `sync` — seconds, not minutes.
+if [ "${REBOOT_MODE}" = "drain" ]; then
+    log "final safety re-check, just before the shutdown (the 23:40 verdict is minutes old)"
+    safety_gate_wait || drain_skip_night
+fi
+reset_streak
 
 # The scraper-cut counter is bumped HERE, as late as it can be: it counts nights the
 # scraper was cut, so it must not move on a night that dies before the shutdown call
@@ -1215,7 +1287,11 @@ RC=$?
 # rc 0 is the opposite case — the machine is going down while this line runs — and
 # the file MUST survive it: it is the only thing telling the post-boot check this
 # boot was ours.
-[ "${RC}" -ne 0 ] && rm -f "${PENDING_FILE}" 2>/dev/null
+if [ "${RC}" -eq 0 ]; then
+    log "shutdown accepted (rc 0) — the machine is going down; the post-boot check takes over"
+    exit 0
+fi
+rm -f "${PENDING_FILE}" 2>/dev/null
 log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
 exit 1
 }
@@ -1259,23 +1335,7 @@ drain_main() {
         fi
     done
 
-    ATTEMPT=1
-    while true; do
-        drain_stamp || true
-        if check_safety_guards_once; then
-            break
-        fi
-        if [ "${ATTEMPT}" -ge "${SAFETY_MAX_ATTEMPTS}" ]; then
-            log "SKIP: safety guards still blocked after ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * SAFETY_RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting; lifting the drain."
-            drain_end
-            notify_athos "Reboot noturno pulado" "guard de segurança ainda bloqueando após ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Dreno encerrado. Ver ${LOG}."
-            record_skip_bounded "${BLOCK_REASON}"
-            exit 0
-        fi
-        log "attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} blocked by a safety guard (${BLOCK_REASON}) — retrying in ${SAFETY_RETRY_INTERVAL}s."
-        drain_sleep "${SAFETY_RETRY_INTERVAL}"
-        ATTEMPT=$((ATTEMPT+1))
-    done
+    safety_gate_wait || drain_skip_night
     log "safety guards OK on attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS}: no send in flight, no Dolt maintenance running — rebooting with agent work possibly in flight (drain mode, ga-a2v0bz)"
 
     drain_informational_report
@@ -1302,7 +1362,7 @@ while true; do
     fi
     if [ "${ATTEMPT}" -ge "${RETRY_MAX_ATTEMPTS}" ]; then
         log "SKIP: guards still blocked after ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting."
-        notify_athos "Reboot noturno pulado" "bloqueado após ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Ver ${LOG}."
+        notify_athos "Reboot noturno pulado" "bloqueado após ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Ver ${LOG}." 3 push
         record_skip_bounded "${BLOCK_REASON}"
         exit 0
     fi
