@@ -1,0 +1,10 @@
+# ga-atsahv (item 4): "apuração semanal de quantas rodadas foram poupadas" by the gate's DOC/TEST fast lane.
+# Read-only over .gc/quality-gate.jsonl; appends one line to .gc/gate-lane-tally.jsonl and sends ONE notify line
+# (only when the week held at least one lane decision). Deliberately no mail and no bead reference: the previous
+# weekly gate report (gate-review-size-report) was disabled for mailing a settled question to a bead that no
+# longer existed. Exit 2 = the log could not be read (an error, never a "0 saved" tally).
+[order]
+description = "Semanal: rodadas de revisor que a fast-lane do gate (diff só doc/teste, sem revisor LLM) poupou — escreve .gc/gate-lane-tally.jsonl e manda uma linha de notify (ga-atsahv)"
+trigger = "cooldown"
+interval = "168h"
+exec = "$PACK_DIR/assets/scripts/gate-lane-weekly.sh"
