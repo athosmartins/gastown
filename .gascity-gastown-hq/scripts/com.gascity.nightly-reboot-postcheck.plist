@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.nightly-reboot-postcheck</string>
+
+  <!-- The conferencia pos-boot do reboot noturno (ga-a2v0bz): depois que a maquina volta,
+       confere Dolt / envio / mapa / dreno e avisa o Athos com o resultado. USER LaunchAgent
+       (nao precisa de sudo): sobe no auto-login que vem logo apos o boot.
+
+       RunAtLoad e TRUE de proposito (os plists irmaos usam false): o gatilho e justamente
+       o login pos-boot. Disparar sem necessidade e inofensivo: o script so age quando
+       nightly-reboot.sh deixou o arquivo de pendencia E o boot atual e mais novo que o do
+       pedido de reboot; qualquer outro disparo (instalar este plist, logout/login) sai
+       em silencio. Sem StartInterval/KeepAlive: uma conferencia por login, que ela mesma
+       re-tenta ate ~20min enquanto os servicos sobem.
+
+       Mora em scripts/ (e nao em docs/) para o PRESENCE-DRIFT do daemon-presence-watchdog
+       alarmar se for mergeado e nunca carregado: uma conferencia nao instalada nao pode
+       parecer uma noite limpa. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/scripts/nightly-reboot-postcheck.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <key>RunAtLoad</key><true/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/nightly-reboot-postcheck.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/nightly-reboot-postcheck.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/go/bin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+  </dict>
+</dict>
+</plist>

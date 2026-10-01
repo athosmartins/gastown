@@ -146,15 +146,15 @@ for d in pilot-dispatcher.sh quality-gate-dispatcher.sh auto-refino-dispatcher.s
   if [ -n "$QL" ] && [ "$DL" -lt "$QL" ]; then ok "D7 $d: gate do dreno (L$DL) vem antes do quiet-hours (L$QL)"; else bad "D7 $d: gate do dreno (L$DL) deveria vir ANTES do quiet-hours (L${QL:-?})"; fi
   # o bloco do dreno (do `if` ate o `fi` mais proximo) nao pode herdar a mentira do quiet-hours
   BLK=$(sed -n "${DL},$((DL+12))p" "$DF" | sed '/^fi$/q')
-  if printf '%s' "$BLK" | grep -q -i "00h-08h\|retoma as 08h\|janela noturna"; then bad "D7 $d: texto do dreno reaproveita a mensagem do quiet-hours (00h-08h/08h seria FALSO)"; else ok "D7 $d: texto proprio do dreno"; fi
-  printf '%s' "$BLK" | grep -q -i "dreno\|drain" && ok "D7 $d: o log cita dreno/drain" || bad "D7 $d: o log do gate nao cita dreno/drain"
+  if grep -q -i "00h-08h\|retoma as 08h\|janela noturna" <<<"$BLK"; then bad "D7 $d: texto do dreno reaproveita a mensagem do quiet-hours (00h-08h/08h seria FALSO)"; else ok "D7 $d: texto proprio do dreno"; fi
+  grep -q -i "dreno\|drain" <<<"$BLK" && ok "D7 $d: o log cita dreno/drain" || bad "D7 $d: o log do gate nao cita dreno/drain"
 done
 # Pilot: sem push a cada sweep (o do quiet-hours diz 'retoma as 08h'), mas grava o pause-state p/ o reconciler
 PL=$(grep -n '"$(_drain_window_blocks)" = "1"' "$SELF_DIR/pilot-dispatcher.sh" | head -1 | cut -d: -f1)
 if [ -n "$PL" ]; then
   PBLK=$(sed -n "${PL},$((PL+12))p" "$SELF_DIR/pilot-dispatcher.sh" | sed '/^fi$/q')
-  printf '%s' "$PBLK" | grep -q "notify " && bad "D7 pilot: o dreno NAO pode mandar push a cada sweep" || ok "D7 pilot: sem push no dreno"
-  printf '%s' "$PBLK" | grep -q '_pilot_write_sweep_pause_state 1 "drain-window"' && ok "D7 pilot: grava sweep-pause-state (reconciler nao le como falha)" || bad "D7 pilot: deveria gravar _pilot_write_sweep_pause_state 1 \"drain-window\""
+  grep -q "notify " <<<"$PBLK" && bad "D7 pilot: o dreno NAO pode mandar push a cada sweep" || ok "D7 pilot: sem push no dreno"
+  grep -q '_pilot_write_sweep_pause_state 1 "drain-window"' <<<"$PBLK" && ok "D7 pilot: grava sweep-pause-state (reconciler nao le como falha)" || bad "D7 pilot: deveria gravar _pilot_write_sweep_pause_state 1 \"drain-window\""
 else
   bad "D7 pilot: gate do dreno ausente"
 fi
