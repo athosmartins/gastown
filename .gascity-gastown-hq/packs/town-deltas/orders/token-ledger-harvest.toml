@@ -2,7 +2,9 @@
 # bead" is computed from. transcript-reaper.sh removes a dead session's transcript 24h after its last write, so the numbers
 # must be copied out before then; 30 min is far inside that window and far outside one run (measured: first full scan of
 # 1.8k transcripts ~10 s, incremental ~1 s), and the tool holds its own flock, so two ticks can never overlap.
-# Read-only on transcripts and the gate log; the only thing written is $GC_CITY_PATH/.gc/token-ledger/sessions.jsonl.
+# Read-only on transcripts and the gate log; it writes only next to the ledger, in $GC_CITY_PATH/.gc/token-ledger/: sessions.jsonl, its
+# .lock, a sessions.jsonl.unreadable-<ts> copy (only when a line was unreadable, taken BEFORE the rewrite) and the .sessions.* temp file.
+# Exit codes reach this runner unchanged: 5 = transcript format looks changed, 6 = transcripts could not be read (never "nothing to do").
 # Report:  python3 packs/town-deltas/assets/bead-token-meter.py report --from <YYYY-MM-DD>   (docs/reports/token-por-bead-e8.md)
 [order]
 description = "Copy per-session token usage from Claude transcripts into the tokens-per-bead ledger before the transcript reaper deletes them"

@@ -47,9 +47,20 @@
 # $GC_CITY_PATH/.gc/effort-ab.conf exists. The metric is tokens per APPROVED bead, and the open question is
 # whether the builders (dog / wa-worker / ps-worker, all `--effort xhigh`) can run at `high` without the
 # gate approving less. Effort is a per-TEMPLATE setting in city.toml, so a per-session arm has to be decided
-# where the session is born: here, before exec, from a hash of the session name (SHA-256, salted). The
-# arm is fixed BEFORE the session sees any bead and the bead a pool session picks up is the oldest ready
-# one, so arm and bead are independent — the same property the E3 pre-gate A/B gets from hashing the bead id.
+# where the session is born: here, before exec, from a salted SHA-256.
+#
+# UNIT OF RANDOMIZATION = the claude SESSION, identified by its OWN uuid: the `--session-id` it is launched
+# with (or the `--resume` of that same session). That uuid is the transcript's file name and the token
+# ledger's `sid`, so the unit the arm is drawn on is the unit the meter reads. It is deliberately NOT
+# GC_SESSION_NAME: the dogs measured on 01/10 get a name unique per launch (alias gastown.dog-4, session name
+# dog-gan6flz6), but that is a convention of the pool, not a promise, and the alias that repeats (gastown.dog-N,
+# wa-worker-adhoc-*) is what the ledger shows. Hashing a name that repeats would make the SLOT the unit — a few
+# clusters, each stuck in one arm for good and confounded with its load regime — and every launch would still
+# log a clean arm=treat|control. A launch with no usable uuid is left alone, and the log says so.
+# The arm depends on nothing but that random uuid and is fixed BEFORE the session sees any bead, so it is
+# independent of WHICH bead the session picks up (the oldest ready one). It is still per SESSION, not per bead:
+# a session that builds several beads gives them all one arm (01/10 ledger: 1.12-1.17 beads per builder
+# session), which the meter's section 6 prints. The E3 pre-gate A/B hashes the bead id, so its unit is the bead.
 # Only sessions launched with exactly `control_effort` are enrolled; a role set to anything else on purpose
 # is never touched. The conf is `key=value` lines (# comments):
 #     salt=ga-5c3msy-1             changes the split when a new experiment starts
@@ -57,9 +68,10 @@
 #     control_effort=xhigh         the effort an enrolled session is launched with today
 #     treat_effort=high            what the treated arm gets
 #     treat_pct=50                 0-100, share of sessions in the treated arm
-# FAIL-OPEN like everything else here: a bad conf, a missing shasum, an odd argv -> claude starts with its
-# argv untouched and the log says why (EFFORT-AB WARN). The decision is logged per launch with the claude
-# --session-id, so "did the arm actually reach the process" is a join against the transcript's own `effort`.
+# FAIL-OPEN like everything else here: a bad conf, a missing shasum, an odd argv, no usable session uuid ->
+# claude starts with its argv untouched and the log says why (EFFORT-AB WARN). The decision is logged per
+# launch with the claude session uuid, so "did the arm actually reach the process" is a join against the
+# transcript's own `effort`.
 # KNOBS: GC_EFFORT_AB=0 (this launch) / touch $GC_CITY_PATH/.gc/no-effort-ab (every new launch, no reload).
 set -u
 
@@ -87,6 +99,19 @@ is_int() {
   case "$1" in
     ''|-|*[!0-9-]*|?*-*) return 1 ;;
   esac
+  return 0
+}
+
+# A claude session uuid (8-4-4-4-12 hex): the only shape `claude --session-id` accepts. Used by the effort A/B, which
+# refuses to draw an arm from anything else — a prompt that happens to follow a flag must never become a "session id".
+is_uuid() {
+  case "$1" in
+    ????????-????-????-????-????????????) ;;
+    *) return 1 ;;
+  esac
+  local hex="${1//-/}"          # the 4 dashes are positional above; what is left must be exactly 32 hex digits (36 dashes are not a uuid)
+  [ "${#hex}" -eq 32 ] || return 1
+  case "$hex" in *[!0-9a-fA-F]*) return 1 ;; esac
   return 0
 }
 
@@ -154,22 +179,25 @@ if [ -n "$ab_conf" ] && [ -f "$ab_conf" ] && [ "${GC_EFFORT_AB:-}" != "0" ] && [
       case "${GC_AGENT:-}" in "$ab_t"|"$ab_t"-*) ab_in=1; break ;; esac
     done
     if [ -n "$ab_in" ]; then
-      ab_sn="${GC_SESSION_NAME:-}"
-      ab_idx=-1; ab_uuid="?"
+      ab_sn="${GC_SESSION_NAME:-?}"          # logged only: it is NOT an input of the draw (see the header)
+      ab_idx=-1; ab_uuid=""
       for ((ab_i = 0; ab_i < ${#argv[@]}; ab_i++)); do
         case "${argv[$ab_i]}" in
           --effort) ab_idx=$ab_i ;;
           --effort=*) ab_idx=$ab_i ;;
-          --session-id) ab_uuid="${argv[$((ab_i + 1))]:-?}" ;;
+          --session-id|--resume) ab_uuid="${argv[$((ab_i + 1))]:-}" ;;
+          --session-id=*) ab_uuid="${argv[$ab_i]#--session-id=}" ;;
+          --resume=*) ab_uuid="${argv[$ab_i]#--resume=}" ;;
         esac
       done
       ab_h=""
-      if [ -z "$ab_sn" ]; then
-        note "EFFORT-AB WARN template=$ab_tpl has no GC_SESSION_NAME - left alone"
-      elif [ "$ab_idx" -lt 0 ]; then
+      if [ "$ab_idx" -lt 0 ]; then
         note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn launched without --effort - left alone"
-      elif ! ab_out="$(printf '%s' "effort-ab:$ab_salt:$ab_sn" | shasum -a 256 2>/dev/null)" || [ -z "$ab_out" ]; then
-        note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn shasum failed - left alone"
+      elif ! is_uuid "$ab_uuid"; then
+        # never echo the value: when a flag is the last argv element before the prompt, "its value" is the prompt text
+        note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn has no usable --session-id/--resume uuid (value of ${#ab_uuid} chars) - left alone: the arm is drawn per claude session, and a session NAME can repeat"
+      elif ! ab_out="$(printf '%s' "effort-ab:$ab_salt:$ab_uuid" | shasum -a 256 2>/dev/null)" || [ -z "$ab_out" ]; then
+        note "EFFORT-AB WARN template=$ab_tpl session=$ab_sn uuid=$ab_uuid shasum failed - left alone"
       else
         ab_h="${ab_out%% *}"
         ab_n=$(( 16#${ab_h:0:8} % 100 ))

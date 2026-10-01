@@ -412,7 +412,8 @@ def t_approved_and_power(m, W):
     tot = sum(r["beads"][b]["build_usd"] + r["beads"][b]["review_usd"] for b in ("ga-aaa1", "ga-bbb2"))
     ck(approx(dog["usd_per_approved"], tot / 2, 1e-6) and approx(dog["usd_per_first_pass"], tot / 1, 1e-6),
        f"US$/bead aprovada (qualquer rodada) = custo ÷ 2; por 1ª-PASS = custo ÷ 1; achei {dog['usd_per_approved']} / {dog['usd_per_first_pass']}")
-    ck(r["power"] == {}, f"com <20 beads por papel não se estima poder (vazio, não um número inventado), achei {r['power']}")
+    ck(all(v.get("insufficient") is True and set(v) == {"beads", "insufficient", "min_beads"} for v in r["power"].values()) and r["power"],
+       f"com <20 beads por papel não se estima poder: o papel aparece como `insufficient` (não ausente, não um número inventado), achei {r['power']}")
     ck(approx(m.n_per_arm_mean(1.0, 0.2), 392.4, 0.5), f"n/braço p/ -20% com CV 1 = 2(1,96+0,8416)²/0,04 = 392,4, achei {m.n_per_arm_mean(1.0, 0.2)}")
     ck(approx(m.n_per_arm_prop(0.5, 0.1), 387, 2), f"n/braço p/ 50% -> 40% = ~387, achei {m.n_per_arm_prop(0.5, 0.1)}")
     ck(m.n_per_arm_prop(0.5, 0.03) > 4000, "detectar 3pp pede milhares por braço (o critério do bead não fecha em semanas)")
@@ -1017,9 +1018,9 @@ def t_non_record_json_lines(m, W):
     # ledger: linhas que não são sessão
     n_before = len(ledger_rows(m, w))
     with open(w["ledger"], "a") as fh:
-        fh.write("null\n[1]\n\"x\"\n")
+        fh.write("null\n[1]\n\"x\"\n{\"role\": \"dog\"}\n")      # + um objeto JSON SEM `sid`: também não é uma linha de sessão
     rows, bad = m.load_ledger(w["ledger"])
-    ck(bad == 3 and len(rows) == n_before, f"3 linhas do ledger que não são sessão contadas, as sessões intactas; achei bad={bad} rows={len(rows)}/{n_before}")
+    ck(bad == 4 and len(rows) == n_before, f"4 linhas do ledger que não são sessão contadas (3 que não são objeto + 1 objeto sem sid), as sessões intactas; achei bad={bad} rows={len(rows)}/{n_before}")
     # log do gate: linhas que não são evento (o mundo-base já tem 1 linha ilegível de propósito: compara com ela, não com um número solto)
     runs0, _b0, gbad0 = m.load_gate(w["gate"])
     with open(w["gate"], "a") as fh:
@@ -1047,6 +1048,168 @@ def t_power_unreachable_drop(m, W):
     ck(pw["n_per_arm_first_pass"]["3pp"] and pw["n_per_arm_first_pass"]["3pp"] > 0, f"a de 3 pp existe e é calculada; achei {pw['n_per_arm_first_pass']}")
     code, txt = report_text(m, w)
     ck("n/a (taxa<Δ)" in txt and "uma queda desse tamanho não existe" in txt, f"o texto diz n/a e por quê; achei {[ln for ln in txt.splitlines() if 'dog' in ln and '|' in ln]}")
+
+
+@contextlib.contextmanager
+def denied(path):
+    """Tira TODA permissão de `path` (arquivo ou diretório) e prova que a negação vale neste ambiente; restaura ao sair (senão o rmtree do
+    selftest não consegue limpar). Em root a negação não vale: o caso falha com a razão, em vez de passar sem provar nada."""
+    path = Path(path)
+    old = path.stat().st_mode
+    path.chmod(0)
+    try:
+        ck(not os.access(path, os.R_OK), f"este ambiente ignora permissão de arquivo (root?): o caso não prova nada sobre {path.name}")
+        yield
+    finally:
+        path.chmod(stat.S_IMODE(old))
+
+
+def harvest_rc(m, w):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+    return rc, out.getvalue()
+
+
+def t_harvest_input_unreadable(m, W):
+    """Gate (tentativa 3, bloqueante 2): uma raiz de transcritos ausente/ilegível era "nada a colher" — o harvest imprimia o resumo normal
+    ('0 sessões (re)escaneadas, 0 inalteradas'), saía com 0, o order ficava verde, e o reaper apagava os transcritos 24h depois. São TRÊS
+    estados (achei / não há / NÃO CONSEGUI LER); o terceiro tem alarme próprio, 1ª linha e exit ≠ 0 — e o ledger continua intacto."""
+    w, _ = setup(m, W)
+    good = ledger_rows(m, w)
+    ck(len(good) >= 5, f"mundo-base com sessões; achei {len(good)}")
+    snap = w["ledger"].read_bytes()
+    P = w["projects"]
+
+    def alarm(roots, label, why, rc_want=6):
+        m.PROJECTS = roots
+        rc, out = harvest_rc(m, w)
+        lines = out.splitlines()
+        ck(rc == rc_want == m.RC_NO_INPUT, f"{label}: exit {rc_want} (entrada que não deu para ler), achei {rc}")
+        ck(lines and lines[0].startswith("⚠ SEM ENTRADA") and why in lines[0], f"{label}: o alarme é a 1ª linha e diz '{why}'; achei {lines[:1]}")
+        ck(any(ln.startswith("harvest:") for ln in lines[1:]), f"{label}: a linha-resumo continua, depois do alarme")
+        return out
+
+    # (a) raiz que não existe — a reprodução do revisor (BTM_PROJECTS=<diretório inexistente>)
+    alarm([W / "nao-existe"], "raiz inexistente", "não existe")
+    ck(w["ledger"].read_bytes() == snap, "o ledger não perde nem muda nada quando a entrada falta (a colheita anterior continua valendo)")
+    # (b) a "raiz" é um arquivo
+    (W / "arquivo").write_text("x")
+    alarm([W / "arquivo"], "raiz que é arquivo", "não é um diretório")
+    # (c) raiz existe mas está vazia: zero transcritos num city vivo não é "nada a colher"
+    (W / "vazia").mkdir()
+    alarm([W / "vazia"], "raiz vazia", "0 transcritos")
+    # (d) nenhuma raiz configurada
+    alarm([], "lista de raízes vazia", "nenhuma raiz de transcritos configurada")
+    # (e) uma raiz boa e uma ausente: o que dá para ler é colhido (ledger novo), e ainda assim o exit é ≠ 0
+    w2 = dict(w, ledger=W / "l2" / "sessions.jsonl")
+    m.PROJECTS = [P, W / "nao-existe"]
+    rc, out = harvest_rc(m, w2)
+    ck(rc == 6 and "não existe" in out.splitlines()[0] and len(ledger_rows(m, w2)) == len(good), f"raiz boa + raiz ausente: colhe a boa ({len(good)} sessões) e sai com 6; achei rc={rc} rows={len(ledger_rows(m, w2))}")
+    # (f) uma raiz sem permissão
+    (W / "fechada").mkdir()
+    with denied(W / "fechada"):
+        alarm([W / "fechada"], "raiz sem permissão", "ilegível")
+    # (g) um PROJETO ilegível dentro de uma raiz boa: o glob o pulava calado; as sessões dos outros projetos são colhidas mesmo assim
+    write_session(P, "-trancado", "lk1", [beacon("gastown.dog-4", D + "22:00:00Z")] + asst("l1", D + "22:00:10Z"))
+    w3 = dict(w, ledger=W / "l3" / "sessions.jsonl")
+    with denied(P / "-trancado"):
+        m.PROJECTS = [P]
+        rc, out = harvest_rc(m, w3)
+    ck(rc == 6 and "projeto ilegível" in out.splitlines()[0], f"projeto ilegível: alarme + exit 6; achei rc={rc} {out.splitlines()[:1]}")
+    ck(len(ledger_rows(m, w3)) == len(good) and "lk1" not in ledger_rows(m, w3), f"os outros projetos continuam sendo colhidos; achei {len(ledger_rows(m, w3))} sessões")
+    # (h) o caso saudável não acende nada
+    m.PROJECTS = [P]
+    (P / "-trancado" / "lk1.jsonl").unlink()
+    (P / "-trancado").rmdir()
+    rc, out = harvest_rc(m, w)
+    ck(rc == 0 and "SEM ENTRADA" not in out, f"entrada boa: exit 0 e nenhum alarme de entrada; achei rc={rc} {out[:80]!r}")
+    # (i) pela linha de comando, como o wrapper do order a chama (a reprodução do revisor, de ponta a ponta)
+    import subprocess
+    p = subprocess.run([sys.executable, str(TOOL), "harvest", "--ledger", str(W / "l4" / "sessions.jsonl")], capture_output=True, text=True,
+                       env=dict(os.environ, BTM_PROJECTS=str(W / "nao-existe-cli")))
+    ck(p.returncode == 6 and p.stdout.startswith("⚠ SEM ENTRADA"), f"CLI com BTM_PROJECTS inexistente: exit 6 e o alarme abre a saída; achei rc={p.returncode} {p.stdout[:90]!r}")
+    ck(len(p.stdout.splitlines()[0]) <= 400, "o alarme cabe inteiro no corte de 500 caracteres do log do wrapper (não some junto com o resto)")
+
+
+def t_fingerprint_before_read(m, W):
+    """Achado médio-baixo da tentativa 3: o fingerprint era tirado DEPOIS de ler o transcrito, então uma escrita no meio era atestada por um
+    fingerprint de conteúdo que nunca foi lido ('1 inalteradas' para sempre). Reprodução do revisor: injeta um append no instante do
+    fingerprint. Invariante: se o fingerprint do ledger bate com o do arquivo agora, a linha cobre o arquivo INTEIRO."""
+    w, _ = setup(m, W)
+    f = w["projects"] / "-proj" / "racey.jsonl"
+    write_session(w["projects"], "-proj", "racey", [beacon("gastown.dog-7", D + "20:00:00Z")] + asst("rc1", D + "20:00:10Z"))
+    real_fp, calls = m.fingerprint, []
+
+    def appending_fp(main):
+        if not calls:                       # uma escrita cai no instante em que o fingerprint é tirado
+            with open(f, "a") as fh:
+                for r in asst("rc2", D + "20:00:20Z"):
+                    fh.write(json.dumps(r, separators=(",", ":")) + "\n")
+        calls.append(1)
+        return real_fp(main)
+
+    m.fingerprint = appending_fp
+    try:
+        rec = m.scan_session(f)
+    finally:
+        m.fingerprint = real_fp
+    covers_all = rec["msgs"] == 2
+    attests_now = rec["fp"] == real_fp(f)
+    ck(not attests_now or covers_all, f"o ledger atesta o arquivo de agora (fp bate) mas leu {rec['msgs']} de 2 mensagens: uma sessão 'inalterada' que nunca foi lida por inteiro")
+    ck(covers_all, f"com o fingerprint tirado ANTES da leitura, a escrita do meio é lida junto; achei {rec['msgs']} mensagens")
+
+
+def t_unreadable_subagent_files(m, W):
+    """Irmão da entrada ilegível: um arquivo de subagente que existe mas não abre (ou o diretório deles sem permissão) era pulado calado — os
+    tokens dele sumiam do gasto da sessão e 'sem subagente' e 'não consegui ler o subagente' eram a mesma coisa."""
+    w, _ = setup(m, W)
+    P = w["projects"]
+    write_session(P, "-proj", "subs", [beacon("gastown.dog-8", D + "21:00:00Z")] + asst("u1", D + "21:00:10Z"),
+                  subagents={"agent-ok": asst("u_ok", D + "21:00:20Z"), "agent-bad": asst("u_bad", D + "21:00:30Z")})
+    with denied(P / "-proj" / "subs" / "subagents" / "agent-bad.jsonl"):
+        out = harvest(m, w)
+    rec = ledger_rows(m, w)["subs"]
+    ck(rec["files_unreadable"] == 1 and rec["msgs"] == 2, f"o subagente que não abre é CONTADO e as respostas dos outros arquivos entram (2); achei files_unreadable={rec['files_unreadable']} msgs={rec['msgs']}")
+    ck("1 arquivos/diretórios de subagente" in out, f"a colheita avisa; achei {[ln for ln in out.splitlines() if 'subagente' in ln]}")
+    write_session(P, "-proj", "subs2", [beacon("gastown.dog-8", D + "21:10:00Z")] + asst("v1", D + "21:10:10Z"), subagents={"agent-1": asst("v2", D + "21:10:20Z")})
+    with denied(P / "-proj" / "subs2" / "subagents"):
+        harvest(m, w)
+    rec2 = ledger_rows(m, w)["subs2"]
+    ck(rec2["files_unreadable"] == 1, f"diretório de subagentes sem permissão: o glob devolvia vazio ('sem subagentes'); agora é contado; achei {rec2['files_unreadable']}")
+    code, r = report(m, w)
+    ck(r["unknown"]["transcript_files_unreadable"] == 2, f"o --json traz o desconhecido na janela; achei {r['unknown']}")
+    code, txt = report_text(m, w)
+    ck("NÃO abrem" in txt, f"o texto do relatório avisa; achei {[ln for ln in txt.splitlines() if '⚠' in ln]}")
+
+
+def t_power_json_and_sessions(m, W):
+    """Seção 6: (1) papel com poucos beads aparece no --json como `insufficient` (ausente era indistinguível de 'papel que não existe');
+    (2) o A/B de effort sorteia o braço por SESSÃO, e a conta de poder trata cada bead como unidade: o nº de sessões por trás dos beads e
+    os beads por sessão são MEDIDOS e impressos (texto e JSON), não supostos."""
+    w, _ = setup(m, W)
+    code, r = report(m, w)
+    ck(r["power"].get("dog") == dict(beads=2, insufficient=True, min_beads=20) and "cv_usd_per_bead" not in r["power"]["dog"],
+       f"<20 beads: o JSON diz 'insufficient' e não traz número nenhum; achei {r['power']}")
+    beads = [dict(bead=f"ga-ps{i:02d}", model="claude-sonnet-5-5", k=3 + i % 5) for i in range(22)]
+    w = mini_world(m, W / "ps", beads)
+    t = lambda sec: f"{D}18:00:{sec:02d}.000Z"
+    recs = [beacon("gastown.dog-1", t(0))]
+    recs += asst("tb-1", t(10), cmd="bd update ga-tb01 --claim", tid="tu_tb1") + [tool_result("tu_tb1", "✓ Updated issue: ga-tb01", t(11))]
+    recs += asst("tb-2", t(20))
+    recs += asst("tb-3", t(30), cmd="bd update ga-tb02 --claim", tid="tu_tb2") + [tool_result("tu_tb2", "✓ Updated issue: ga-tb02", t(31))]
+    recs += asst("tb-4", t(40))
+    write_session(w["projects"], "-proj", "twobeads", recs)
+    with open(w["gate"], "a") as fh:
+        for b in ("ga-tb01", "ga-tb02"):
+            fh.write(json.dumps({"ts": f"{D}19:00:00Z", "event": "dispatcher_complete", "branch": f"feat/{b}", "bead": b, "rig": "gascity", "result": "PASS", "dry_run": "0"}) + "\n")
+    harvest(m, w)
+    code, r = report(m, w)
+    pw = r["power"]["dog"]
+    ck(pw["beads"] == 24 and pw["sessions"] == 23 and approx(pw["beads_per_session"], 24 / 23, 1e-3), f"24 beads em 23 sessões (uma construiu 2): beads/sessão = 1,043; achei {pw}")
+    code, txt = report_text(m, w)
+    ck("23 sessões construíram esses 24 beads = 1.04 beads/sessão" in txt and "o braço do A/B é por SESSÃO" in txt, f"o texto da seção 6 diz o design; achei {[ln for ln in txt.splitlines() if 'sessões construíram' in ln]}")
+    ck("agrupamento pequeno" in txt and "agrupamento grande" not in txt, f"1,04 beads/sessão é agrupamento pequeno: o texto diz isso, e não 'grande'; achei {[ln for ln in txt.splitlines() if 'sessões construíram' in ln]}")
 
 
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
@@ -1099,7 +1262,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "linha de schema antigo não é contada": ('rows_old_schema=sum(1 for s in sess if s.get("v") != SCHEMA))', "rows_old_schema=0)", t_schema_rescan),
     "colheita mantém linha de schema antigo": ('old.get("fp") == fingerprint(f) and old.get("v") == SCHEMA and "days_ctx" in old', 'old.get("fp") == fingerprint(f) and "days_ctx" in old', t_schema_rescan),
     "schema não foi aumentado": ("SCHEMA = 3     # 3 = claims revalidados", "SCHEMA = 2     # 3 = claims revalidados", t_schema_rescan),
-    "alarme de formato sem exit ≠ 0": ("    return RC_FORMAT_ALARM if alarm else 0", "    return 0", t_harvest_alarm_first_and_nonzero),
+    "alarme de formato sem exit ≠ 0": ("    return RC_NO_INPUT if input_problems else (RC_FORMAT_ALARM if alarm else 0)", "    return RC_NO_INPUT if input_problems else 0", t_harvest_alarm_first_and_nonzero),
     "alarme de formato não impresso": ("    alarm = suspect >= 2 and suspect * 4 >= big\n    if alarm:\n", "    alarm = suspect >= 2 and suspect * 4 >= big\n    if False:\n", t_harvest_alarm_first_and_nonzero),
     # ---- gate-fix 1: os achados baixos da mesma família
     "claim sem resultado conta como verificado": ('    n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)', "    n_noresult = 0", t_lows),
@@ -1117,6 +1280,24 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "gate: linha que não é evento estoura": ("if not isinstance(r, dict):\n                bad += 1                                # JSON válido que não é um evento do gate",
                                              "if False:\n                bad += 1                                # JSON válido que não é um evento do gate", t_non_record_json_lines),
     "queda impossível vira 0 beads por braço": ("    if p < diff:\n        return None\n    p2 = p - diff\n", "    p2 = max(0.0, p - diff)\n", t_power_unreachable_drop),
+    # ---- gate-fix 3 (ga-5c3msy): entrada ilegível ≠ "nada a colher"; fingerprint antes da leitura; subagente que não abre; poder por sessão
+    "raiz ausente vira 'nada a colher'": ('    except FileNotFoundError:\n        return files, [(root, "não existe")]', "    except FileNotFoundError:\n        return files, []", t_harvest_input_unreadable),
+    "raiz que é arquivo vira 'nada a colher'": ('    except NotADirectoryError:\n        return files, [(root, "não é um diretório")]', "    except NotADirectoryError:\n        return files, []", t_harvest_input_unreadable),
+    "raiz sem permissão vira 'nada a colher'": ('    except OSError as e:\n        return files, [(root, f"ilegível ({e.strerror or e})")]', "    except OSError as e:\n        return files, []", t_harvest_input_unreadable),
+    "projeto ilegível é pulado calado": ('            problems.append((Path(d.path), f"projeto ilegível ({e.strerror or e})"))', "            pass", t_harvest_input_unreadable),
+    "entrada ilegível sem exit ≠ 0": ("    return RC_NO_INPUT if input_problems else (RC_FORMAT_ALARM if alarm else 0)", "    return RC_FORMAT_ALARM if alarm else 0", t_harvest_input_unreadable),
+    "alarme de entrada não impresso": ("    if input_problems:\n        shown =", "    if False:\n        shown =", t_harvest_input_unreadable),
+    "zero transcritos não acende": ("    elif not seen and not input_problems:", "    elif False:", t_harvest_input_unreadable),
+    "lista de raízes vazia não acende": ("    if not PROJECTS:\n        input_problems.append", "    if False:\n        input_problems.append", t_harvest_input_unreadable),
+    "fingerprint tirado depois da leitura": (("    fp = fingerprint(main)\n    try:\n        st = main.stat()", "mtime_ns=mtime_ns, fp=fp,"),
+                                             ("    try:\n        st = main.stat()", "mtime_ns=mtime_ns, fp=fingerprint(main),"), t_fingerprint_before_read),
+    "subagente que não abre é pulado calado": ("            files_unreadable += 1\n            continue", "            continue", t_unreadable_subagent_files),
+    "diretório de subagentes sem permissão é 'sem subagentes'": ("    if sub_dir.is_dir() and not os.access(sub_dir, os.R_OK | os.X_OK):", "    if False:", t_unreadable_subagent_files),
+    "relatório não traz os subagentes que não abrem": ("               transcript_files_unreadable=sum(s.get(\"files_unreadable\", 0) for s in sess),", "               transcript_files_unreadable=0,", t_unreadable_subagent_files),
+    "ledger: objeto sem sid some calado": ("                else:\n                    bad += 1                            # objeto JSON sem `sid`", "                else:\n                    pass                                # objeto JSON sem `sid`", t_non_record_json_lines),
+    "JSON omite o papel com poucos beads": ("            out[role] = dict(beads=len(beads), insufficient=True, min_beads=20)", "            pass", t_power_json_and_sessions),
+    "beads por sessão = beads (sessão não medida)": ("        n_sess = len({first_sid[b] for b in beads if first_sid.get(b)})", "        n_sess = len(beads)", t_power_json_and_sessions),
+    "sessão do bead não gravada": ('                    first_sid[b] = s["sid"]', "                    pass", t_power_json_and_sessions),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -1140,7 +1321,11 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("e2-readout: veredito sem dry_run e linha que não é registro contados, não calados", t_e2_readout_missing_dry_run),
          ("seção 2: claim não confirmado não é spawn ocioso; atribuição por referência lista todos os verbos", t_idle_vs_unconfirmed_claim),
          ("JSON válido que não é registro (null, string, lista) é linha ilegível contada, não exceção", t_non_record_json_lines),
-         ("seção 6: queda maior que a taxa é n/a, não '0 beads por braço'", t_power_unreachable_drop)]
+         ("seção 6: queda maior que a taxa é n/a, não '0 beads por braço'", t_power_unreachable_drop),
+         ("harvest: raiz de transcritos ausente/ilegível/vazia, projeto ilegível = alarme + exit 6, não 'nada a colher'", t_harvest_input_unreadable),
+         ("fingerprint tirado antes da leitura: a escrita do meio não é atestada sem ter sido lida", t_fingerprint_before_read),
+         ("subagente que não abre (arquivo ou diretório) é contado, no ledger, na colheita e no relatório", t_unreadable_subagent_files),
+         ("seção 6: papel com poucos beads no --json; sessões e beads/sessão medidos (o braço é por sessão)", t_power_json_and_sessions)]
 
 
 def run(name, fn, m):
@@ -1172,11 +1357,16 @@ def main():
         run(name, fn, load(source=src))
     print("== controles de mutação (cada mutante TEM que ser reprovado por pelo menos um caso)")
     for name, (old, new, case) in MUTANTS.items():
-        if src.count(old) != 1:
-            print(f"  ✗ mutante '{name}': o trecho a mutar não existe exatamente 1x no script ({src.count(old)}) — o controle ficou cego")
+        olds, news = (old, new) if isinstance(old, tuple) else ((old,), (new,))      # um mutante pode ser UMA troca ou várias (ex.: mover uma linha)
+        blind = [o for o in olds if src.count(o) != 1]
+        if blind:
+            print(f"  ✗ mutante '{name}': o trecho a mutar não existe exatamente 1x no script ({src.count(blind[0])}) — o controle ficou cego")
             FAIL += 1
             continue
-        mut = load(source=src.replace(old, new), name="btm_mut")
+        mut_src = src
+        for o, n in zip(olds, news):
+            mut_src = mut_src.replace(o, n)
+        mut = load(source=mut_src, name="btm_mut")
         W = Path(tempfile.mkdtemp(prefix="btm-mut."))
         try:
             try:
