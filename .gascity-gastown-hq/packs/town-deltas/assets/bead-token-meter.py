@@ -322,6 +322,9 @@ def scan_session(main):
                 except Exception:
                     bad += 1
                     continue
+                if not isinstance(r, dict):
+                    bad += 1          # JSON válido que não é um registro (`"user"`, `null`, lista): ilegível e CONTADO — o `.get` abaixo derrubaria a colheita inteira
+                    continue
                 t = r.get("type")
                 if cwd is None and r.get("cwd"):
                     cwd = r["cwd"]
@@ -388,7 +391,7 @@ def scan_session(main):
     untimed = sum(1 for c in eligible if not c["ts"])
     role = role_of(alias, first_text, bool(REVIEW_HEADER.search(first_text)))
     if not live and role in POOL_BUILDERS and refs:
-        # worker com bead JÁ atribuído (sling/Pilot): não há claim. O bead é o mais citado em `bd show|comment|heartbeat|close…`.
+        # worker com bead JÁ atribuído (sling/Pilot): não há claim. O bead é o mais citado em `bd show|comment|heartbeat|close|label|update|reopen` (REF_CMD; um comando de claim nunca conta).
         top = sorted(refs, key=lambda b: (-refs[b], ref_first[b]))[0]
         live = [dict(bead=top, ts=ref_first[top], ok=None, via="ref")]
     failed = sum(1 for c in claims if c["state"] == "failed")
@@ -453,6 +456,9 @@ def load_ledger(path=None):
                     r = json.loads(line)
                 except Exception:
                     bad += 1
+                    continue
+                if not isinstance(r, dict):
+                    bad += 1                            # JSON válido que não é uma linha de sessão: ilegível e contado (e guardado antes da reescrita)
                     continue
                 if r.get("sid"):
                     rows[r["sid"]] = r                  # a última linha de uma sessão vale
@@ -694,6 +700,9 @@ def load_gate(path=None):
             except Exception:
                 bad += 1
                 continue
+            if not isinstance(r, dict):
+                bad += 1                                # JSON válido que não é um evento do gate: ilegível e contado, não derruba o relatório
+                continue
             if r.get("branch") and r.get("bead"):
                 bridge[r["branch"]] = r["bead"]
             if r.get("event") == "dispatcher_complete" and r.get("result") in ("PASS", "FAIL"):
@@ -910,11 +919,14 @@ def _report(a, result):
         print("   ⚠ a leitura de cache de modelo SEM preço (ver a nota de 1b) não entra em 1c: os US$ acima são piso, não o teto completo.")
 
     # ---- 2. spawn ocioso (sessão de pool sem nenhum claim)
-    idle = defaultdict(lambda: [0, 0.0, 0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço, sessões com claim SEM timestamp
+    idle = defaultdict(lambda: [0, 0.0, 0, 0, 0])     # sessões, US$ dos tokens COM preço, tokens SEM preço, sessões com claim SEM timestamp, sessões com claim NÃO confirmado
     for s in sess:
         if s["role"] in POOL_BUILDERS and not s.get("claims"):
             if s.get("claims_untimed"):
                 idle[s["role"]][3] += 1       # reivindicou, mas sem timestamp não dá para posicionar: nem ocioso (achou bead) nem de bead (não dá para atribuir)
+                continue
+            if s.get("claims_unconfirmed"):
+                idle[s["role"]][4] += 1       # o claim teve resultado visível que não confirma: NÃO SEI se pegou bead — "não vi o claim dar certo" não é "não reivindicou"
                 continue
             idle[s["role"]][0] += 1
             for keys in (s.get("buckets") or {}).values():
@@ -927,12 +939,14 @@ def _report(a, result):
     print("\n== 2. spawn OCIOSO (sessão de pool que não reivindicou nenhum bead e saiu) — custo real, fora do custo por bead")
     for role in POOL_BUILDERS:
         n_all = sum(1 for s in sess if s["role"] == role)
-        n, u, unp, nut = idle.get(role, [0, 0.0, 0, 0])
+        n, u, unp, nut, nuc = idle.get(role, [0, 0.0, 0, 0, 0])
         print(f"  {role:10s} {n:4d} de {n_all:4d} sessões ociosas ({100 * n / n_all if n_all else 0:3.0f}%)  US$ {u:7.2f}"
               f"  ({u / n if n else 0:.3f}/spawn)"
               + (f"  ⚠ + {unp / 1e6:.2f} Mtok de modelo SEM preço: o US$ acima NÃO os inclui (use --assume-price)" if unp else "")
-              + (f"  ⚠ + {nut} sessões com claim SEM timestamp (nem ociosas nem de bead: tokens fora desta seção e das por-bead)" if nut else ""))
-    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4), unpriced_tokens=v[2], claim_untimed_sessions=v[3]) for r, v in idle.items()}
+              + (f"  ⚠ + {nut} sessões com claim SEM timestamp (nem ociosas nem de bead: tokens fora desta seção e das por-bead)" if nut else "")
+              + (f"  ⚠ + {nuc} sessões com claim NÃO confirmado (nem ociosas nem de bead: não sei se pegaram bead; tokens fora desta seção e das por-bead)" if nuc else ""))
+    result["idle"] = {r: dict(sessions=v[0], usd=round(v[1], 4), unpriced_tokens=v[2], claim_untimed_sessions=v[3], claim_unconfirmed_sessions=v[4])
+                      for r, v in idle.items()}
 
     # ---- 3. custo por bead (construtor + revisão) e 4. por bead APROVADA
     if gate_runs is None:
@@ -1056,7 +1070,7 @@ def report_beads(a, rows, sess, flat, gate_runs, bridge, gate_bad, since, result
     n_noresult = sum(1 for b in measured if first_session[b][3] == "claim" and first_ok.get(b) is None)   # claim sem resultado visível: conta, mas não é "verificado"
     n_claim = len(measured) - n_ref - n_noresult
     print(f"   atribuição dos {len(measured)} medidos: {n_claim} por `bd update --claim` com resultado verificado, {n_noresult} por claim SEM "
-          f"resultado visível (transcrito cortado ou sessão em curso — menos firme), {n_ref} por referência a `bd show|comment|heartbeat|close` (worker com "
+          f"resultado visível (transcrito cortado ou sessão em curso — menos firme), {n_ref} por referência a `bd show|comment|heartbeat|close|label|update|reopen` (worker com "
           f"bead já atribuído — menos firme)")
     result["coverage"]["attribution"] = dict(claim_verified=n_claim, claim_no_result=n_noresult, ref=n_ref)
     cohorts = defaultdict(list)
@@ -1137,7 +1151,11 @@ def n_per_arm_mean(cv, delta):
 
 
 def n_per_arm_prop(p, diff):
-    p2 = max(0.0, p - diff)
+    """beads por braço p/ detectar uma QUEDA de `diff` na taxa `p`. None se p < diff: uma queda desse tamanho não existe (a taxa não passa
+    de 0) — isso é 'sem resposta', não '0 beads bastam'."""
+    if p < diff:
+        return None
+    p2 = p - diff
     return (1.96 * math.sqrt(2 * ((p + p2) / 2) * (1 - (p + p2) / 2)) + 0.8416 * math.sqrt(p * (1 - p) + p2 * (1 - p2))) ** 2 / diff ** 2
 
 
@@ -1167,14 +1185,16 @@ def power_section(first_session, first_run, per, ever_pass, measured):
         days = lambda n: 2 * n / rate
         cost_s = (f"{nm[0]:6.0f} ({days(nm[0]):4.0f}d) / {nm[1]:5.0f} ({days(nm[1]):3.0f}d) / {nm[2]:5.0f} ({days(nm[2]):3.0f}d)" if nm
                   else f"{'n/p (US$ por bead desconhecido)':>44s}")
+        pp_s = " / ".join((f"{x:{w}.0f} ({days(x):{dw}.0f}d)" if x is not None else f"{'n/a (taxa<Δ)':>{w + dw + 4}s}") for x, w, dw in zip(npp, (5, 5, 6), (3, 4, 4)))
         print(f"{role:10s} {len(beads):6d} {rate:9.1f} {cell(cv, 11, 2)} {100 * p:8.0f}%   {cost_s}"
-              f"   |   {npp[0]:5.0f} ({days(npp[0]):3.0f}d) / {npp[1]:5.0f} ({days(npp[1]):4.0f}d) / {npp[2]:6.0f} ({days(npp[2]):4.0f}d)"
-              + (f"   ⚠ CV só sobre {len(priced)} de {len(beads)} beads com preço (use --assume-price)" if len(priced) < len(beads) else ""))
+              f"   |   {pp_s}"
+              + (f"   ⚠ CV só sobre {len(priced)} de {len(beads)} beads com preço (use --assume-price)" if len(priced) < len(beads) else "")
+              + ("   ⚠ n/a = a taxa de 1ª aprovação é menor que a queda a detectar: uma queda desse tamanho não existe" if None in npp else ""))
         out[role] = dict(beads=len(beads), beads_priced=len(priced), beads_per_day=round(rate, 2), cv_usd_per_bead=rnd(cv, 3), first_pass=round(p, 3),
                          n_per_arm_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(x) for x in nm))) if nm else None),
-                         n_per_arm_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(x) for x in npp))),
+                         n_per_arm_first_pass=dict(zip(("10pp", "5pp", "3pp"), (None if x is None else round(x) for x in npp))),
                          days_cost=(dict(zip(("-10%", "-20%", "-30%"), (round(days(x)) for x in nm))) if nm else None),
-                         days_first_pass=dict(zip(("10pp", "5pp", "3pp"), (round(days(x)) for x in npp))))
+                         days_first_pass=dict(zip(("10pp", "5pp", "3pp"), (None if x is None else round(days(x)) for x in npp))))
     print("   Leitura: dias = 2 × n/braço ÷ beads/dia (todos os beads do papel entrando no A/B). Onde 'dias' passa de ~30, o experimento por bead não fecha\n"
           "   nesse efeito: use métrica por MENSAGEM/turno (milhares de amostras) como primária e a aprovação só como trava de segurança.")
     return out

@@ -15,10 +15,16 @@ NAMED = {"peter", "batista", "oracle", "mila", "thies", "digo"}   # crew/<name>/
 
 # ---- (1) effort mix of crew messages on/after the E2 start (by message day, as the meter sums it)
 eff = collections.Counter(); per_alias = collections.defaultdict(collections.Counter); nsess = collections.Counter()
-for line in LEDGER.read_text().splitlines():
+bad_ledger = 0
+for line in LEDGER.read_text(errors="replace").splitlines():
+    if not line.strip():
+        continue
     try:
         s = json.loads(line)
     except Exception:
+        s = None
+    if not isinstance(s, dict):
+        bad_ledger += 1                       # unreadable (or valid JSON that is not a session row): counted - a session we could not read is not "no crew session"
         continue
     if s.get("role") != "crew" or (s.get("first_ts") or "") < E2_START:
         continue                              # only sessions STARTED after the change: an older long-running one still carries the old effort
@@ -36,7 +42,8 @@ for line in LEDGER.read_text().splitlines():
     if touched:
         nsess[s["alias"]] += 1
 tot = sum(eff.values())
-print(f"(1) Opus crew messages in sessions STARTED on/after {E2_START}Z: {tot}")
+print(f"(1) Opus crew messages in sessions STARTED on/after {E2_START}Z: {tot}"
+      + (f"   [{bad_ledger} unreadable ledger lines: sessions we could not read are NOT counted as zero]" if bad_ledger else ""))
 for e, n in eff.most_common():
     print(f"    effort={e:<7} {n:>6}  {n / tot:6.1%}")
 print("    by crew (sessions touching the window; msgs by effort):")
@@ -52,7 +59,9 @@ for line in GATE.read_text(errors="replace").splitlines():
     try:
         r = json.loads(line)
     except Exception:
-        bad += 1
+        r = None
+    if not isinstance(r, dict):
+        bad += 1                              # unreadable or valid JSON that is not a gate event: counted, never dropped silently
         continue
     b = r.get("branch") or ""
     if not b.startswith("crew/") or not r.get("ts"):

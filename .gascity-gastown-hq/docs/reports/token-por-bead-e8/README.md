@@ -4,7 +4,7 @@ Relatório: `../token-por-bead-e8.md`. Esta pasta guarda o que o gera e o public
 
 | arquivo | para quê |
 |---|---|
-| `e2-readout.py` / `e2-readout.out.txt` | seção 5 do relatório: mistura de effort e amostra de branches do E2. Lê o ledger e o log do gate (`GC_CITY_PATH` muda a cidade). A saída arquivada é a de 01/10 ~03h (anterior à contagem de vereditos sem `dry_run`, que o script agora imprime; rode de novo para ver o número de hoje). |
+| `e2-readout.py` / `e2-readout.out.txt` | seção 5 do relatório: mistura de effort e amostra de branches do E2. Lê o ledger e o log do gate (`GC_CITY_PATH` muda a cidade). A saída arquivada é a de 01/10 ~03h (anterior à contagem de vereditos sem `dry_run` e de linhas ilegíveis do ledger, que o script agora imprime; rode de novo para ver o número de hoje). |
 | `estudo-tabelas.js` / `.css` | o comportamento de tabela que o Athos exige em toda tabela nova (wa-6qnv9): clique no nome da coluna ordena (número começa decrescente, texto crescente), botão direito ou segurar ~550 ms abre o filtro da coluna, cabeçalho travado ao rolar. |
 | `estudo-tabelas.test.js` | testa o comportamento na página REAL (jsdom) e prova que o teste morde: roda contra 7 mutantes do script/CSS e exige que cada um reprove. Imprime `<N> ok, 0 failed`. |
 | `build-estudo.sh` | `bash build-estudo.sh <saida.html>`: pandoc (gfm) → HTML único com o CSS e o script embutidos → roda o teste. Precisa de `pandoc`, `node` e do módulo `jsdom` (o rig WhatsApp traz um; `JSDOM_PATH` aponta outro). Não publica. |

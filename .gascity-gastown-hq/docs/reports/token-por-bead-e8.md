@@ -23,7 +23,7 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 | Ledger | `.gc/token-ledger/sessions.jsonl` (5.655 sessões) | uma linha por sessão; sobrevive à remoção do transcrito pelo reaper; idempotente, incremental, com `flock` |
 | Colheita periódica | `orders/token-ledger-harvest.toml` + `assets/scripts/token-ledger-harvest.sh` | a cada 30 min (medido: 1 s incremental, ~10 s a varredura completa de 1,8 mil transcritos); log em `.gc/logs/token-ledger-harvest.log` |
 | Braço de effort | `assets/scripts/claude-lowprio.sh` (bloco "EFFORT A/B") | decide o braço por SHA-256 do nome da sessão e reescreve só o valor depois de `--effort`; **inerte sem conf**; fail-open |
-| Testes | `bead-token-meter.selftest.py` (30 casos + 47 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
+| Testes | `bead-token-meter.selftest.py` (33 casos + 53 mutantes), `claude-effort-ab.selftest.sh` (31 checagens + 6 mutantes), `token-ledger-harvest.selftest.sh` (7) | cada caso existe por um erro real ou plausível; cada mutante do script é reprovado por pelo menos um caso |
 
 **Como o medidor conta (as armadilhas medidas)**
 
@@ -32,7 +32,7 @@ Bead ga-5c3msy (P0, filha de ga-ufskhy). Janela: 24/09–01/10/2026 (dias UTC in
 * Preço: escrita de cache 5 min = 1,25× a entrada, 1 h = 2×, leitura = 0,1×. Modelo sem preço = "n/p" (nunca US$ 0).
 * **Bead de um worker = `bd update <id> --claim` cujo resultado confirma ESSE id ("Updated issue: <id>")**. Quatro estados, nunca colapsados: *ok* (confirmado: é o bead), *failed* (erro: não conta), *unconfirmed* (resultado VISÍVEL que não confirma nada — heredoc, `echo` ou mensagem de commit que só cita o claim, saída cortada: NÃO é claim e não abre bucket; fica contado) e *noresult* (nenhum resultado no transcrito: conta, sinalizado como menos firme). Dois claims num comando (`A && B`) têm um tool_use id e um resultado: cada um recebe o seu estado pelo id que o resultado nomeia, e as respostas depois deles vão para um bucket de grupo, rateado igual. Id citado na 1ª mensagem NÃO conta: o preâmbulo do papel cita ~93 beads de doutrina. Worker com bead já atribuído (sem claim) cai na referência mais citada em `bd show|comment|heartbeat|close|label|update|reopen` — um comando de claim nunca é referência (3 de 294 beads). Crew e Mayor (sessões conversacionais) não ganham bead.
 * Revisor: o cabeçalho `QUALITY GATE REVIEW — … for branch: X` chega **dentro de um tool_result**, e pode vir antes um *exemplo* de doutrina; o medidor guarda todos os ramos citados e fica com o que o log do gate conhece.
-* Sessão de pool sem claim e sem referência = **spawn ocioso**, linha própria (12/12 amostradas de fato só sondaram a fila e saíram).
+* Sessão de pool sem claim e sem referência = **spawn ocioso**, linha própria (12/12 amostradas de fato só sondaram a fila e saíram). Sessão de pool cujo único claim não confirmou ou não tem timestamp **não** é ociosa nem de bead: não dá para saber se pegou bead, e vai para uma contagem própria (seção 2), nunca para o custo de ocioso.
 
 ## 2. Baseline de 7 dias (24/09–01/10)
 
