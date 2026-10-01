@@ -675,7 +675,11 @@ if want 5 && need_fn gate_base_test_pyjs_measure; then
     PYFILES="tests/test_fails.py tests/test_passes.py tests/test_env.py tests/test_newsym.py tests/test_zero.py tests/test_skipall.py tests/test_leak.py tests/test_old.py tests/test_keep.py"
 
     echo "  -- verdict per file --"
-    OUT=$(GATE_ABT_RUN_TIMEOUT=60 GATE_ABT_PYJS_MAX=20 measure "$C" "" "$BASE" "$TIP" $PYFILES)   # 10 files: above the default cap of 8
+    # 9 files: above the default cap of 8. The measurement budget is raised out of the way on purpose: this scenario
+    # asserts VERDICTS, and 9 files at ~5-30s each on a loaded host (load 40-65 is normal here) overran the default
+    # 240s — the LAST file then answered unmeasured/budget and the assertion failed for a reason that has nothing to
+    # do with the verdict (seen in the mutation runs). The budget has its own case below.
+    OUT=$(GATE_ABT_RUN_TIMEOUT=60 GATE_ABT_PYJS_MAX=20 GATE_ABT_PYJS_BUDGET=3600 measure "$C" "" "$BASE" "$TIP" $PYFILES)
     eq "output ends in exactly one TOTALS line" "$(printf '%s\n' "$OUT" | grep -c '^TOTALS ')" "1"
     eq "a test that needs the fix: passes at tip, FAILS at base, confirmed alone -> fails-on-base" "$(fstate tests/test_fails.py)" "fails-on-base"
     eq "a test that passes with or without the fix -> passes-on-base (the file that may be refused)" "$(fstate tests/test_passes.py)" "passes-on-base"
