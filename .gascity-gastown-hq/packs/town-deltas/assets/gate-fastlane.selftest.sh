@@ -56,6 +56,16 @@ case "$*" in *" show "*) printf '[{"metadata":{"gate.lane":"%s"}}]\n' "${FAKE_BD
 exit 0
 EOF
 chmod +x "$T/bin/bd"
+# fl_env <ENV=VAL ...> <cmd ...> — `env` for EVERY child that runs the lib. The lane's operator controls and tuning knobs are pinned to their defaults first, so a
+# case's result never depends on the caller's environment (gate round 3, blocking issue 2: with GC_CITY exported and <city>/.gc/gate-fastlane.off present — or
+# GATE_FASTLANE_ENABLED=0 exported — 102 of 435 assertions went red). Pinned by NAME PATTERN, not by a list, so a knob added later is covered too: every
+# GATE_FASTLANE_* the caller exports is unset, GC_CITY is unset (the lib falls back to it for the flag-file path), and the two controls get explicit values.
+# A case that WANTS a control (§4d, §4f) passes it as an ENV=VAL argument, which comes after the pin and wins; §5f proves both halves.
+fl_env() {
+  local a=() v
+  for v in $(compgen -e | grep '^GATE_FASTLANE_' || true); do a[${#a[@]}]="-u"; a[${#a[@]}]="$v"; done
+  env ${a[@]+"${a[@]}"} -u GC_CITY GATE_FASTLANE_ENABLED=1 GATE_FASTLANE_OFF_FILE="$T/pinned-absent.off" "$@"
+}
 
 extract_block() {
   sed -n "/# SELFTEST-EXTRACT ${2}: BEGIN/,/# SELFTEST-EXTRACT ${2}: END/p" "$1" | sed '1d;$d'
@@ -242,7 +252,7 @@ D_LANE=""; D_REASON=""; D_FILES=""; D_CODE=""
 decide() { # decide <head> <policy> [ENV=VAL ...]  -> D_LANE / D_REASON / D_FILES / D_CODE
   # FL_QG_LOG=<file> [FL_MARKER=<id>] also runs the REAL gate_fastlane_record on the decision (stub bd), as the dispatcher does
   local head="$1" policy="$2" out; shift 2
-  out=$(env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_BASE="${FL_BASE:-main}" FL_HEAD="$head" FL_POLICY="$policy" \
+  out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_BASE="${FL_BASE:-main}" FL_HEAD="$head" FL_POLICY="$policy" \
             FL_BIN="$T/bin" FAKE_BD_LOG="$T/bd.log" "$@" \
         "$B32" -c '
     set -euo pipefail
@@ -464,7 +474,7 @@ MAIN2=$(git -C "$REPO" rev-parse main)
 C_L0=""; C_DIG0=""; C_RC=""; C_CODE=""; C_L1=""; C_WHY=""
 dconf() { # dconf <decide-head|""> <confirm-base> <confirm-head> [ENV=VAL ...] -> C_L0 C_DIG0 C_RC C_CODE C_L1 C_WHY
   local dh="$1" cb="$2" ch="$3" out; shift 3
-  out=$(env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_DH="$dh" FL_CB="$cb" FL_CH="$ch" "$@" "$B32" -c '
+  out=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_DH="$dh" FL_CB="$cb" FL_CH="$ch" "$@" "$B32" -c '
     set -euo pipefail
     source "$FL_LIB"
     gfn() { git -C "$FL_REPO" "$@"; }
@@ -571,7 +581,7 @@ HDR
     printf '%s\n' "$DECBLK"
     printf 'echo "RESULT lane=$GATE_LANE tier=$TIER rev=$REQUIRED_REVIEWERS"\n'
   } > "$T/realdec.sh"
-  FL_REPO="$REPO" FL_LIB="$LIB" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/realdec.sh" 2>&1 | tail -1
+  fl_env FL_REPO="$REPO" FL_LIB="$LIB" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/realdec.sh" 2>&1 | tail -1
 }
 real_case() { # name branch want
   local got; got=$(real_dec "$(git -C "$REPO" rev-parse "$2")")
@@ -615,6 +625,8 @@ byp_case() { # name lane
 set -euo pipefail
 BRANCH="b"; GATE_LANE_REASON="r"
 log() { echo "LOG: $*"; }
+GATE_LOCK_ENABLED=0
+_gate_lock_write_hb() { :; }
 cleanup_reviewer_sessions() { :; }
 gate_finalize_run() { echo "FINALIZE overall=$OVERALL_VERDICT quota=$QUOTA_REQUEUE verdicts=${#VERDICT_BEAD_IDS[@]} sessions=${#SESSION_IDS[@]} fail=[$FAIL_REASONS]"; }
 gc() { echo "GC-CALLED $*"; }
@@ -656,6 +668,68 @@ CL_OUT=$("$B32" "$T/clean.sh" 2>&1); CL_RC=$?
 if [ "$CL_RC" = "0" ] && case "$CL_OUT" in *CLEANUP-DONE*LOCK*|*LOCK*CLEANUP-DONE*) true ;; *) false ;; esac; then ok "real cleanup with ZERO reviewer sessions: exits 0 under bash 3.2 set -u and releases the lock"; else bad "real cleanup with empty SESSION_IDS: rc=$CL_RC $CL_OUT"; fi
 case "$CL_OUT" in *GC-CALLED*) bad "cleanup closed a session that does not exist" ;; *) ok "…and closes no session (there is none)" ;; esac
 
+# 5c''. the bypass keeps the citywide gate lock through the WHOLE finalize (gate round 3, blocking issue 1).
+# gate_finalize_run's Step 9 calls cleanup_reviewer_sessions, which releases the lock unless GATE_SWEEP_HAS_MORE_WORK=1 (Phase C sets it for
+# exactly this reason) — and the rig's full-suite check and the merge both come AFTER Step 9. So a bypass that leaves the flag unset runs the
+# heavy check and the merge with the lock already gone, which the lock's own log line ("holds the citywide gate lock until END") says never happens.
+# Step 9 also consumes _gate_cleanup_done, so the EXIT trap's cleanup is a no-op afterwards: whoever keeps the lock must also release it.
+# First the invariant the bypass leans on, on the REAL function: with the flag set, cleanup closes its sessions but leaves the lock alone.
+{ cat <<'HDR'
+set -euo pipefail
+log() { echo "LOG: $*"; }
+gc() { echo "GC-CALLED $*"; }
+_release_gate_lock() { echo "LOCK-RELEASED"; }
+GC_CITY=/city; GATE_RUN_ID=r1
+_gate_cleanup_done=0
+SESSION_IDS=()
+GATE_SWEEP_HAS_MORE_WORK=1
+HDR
+  printf '%s\n' "$CLEANFN"
+  printf 'cleanup_reviewer_sessions\necho CLEANUP-DONE\n'
+} > "$T/clean-more.sh"
+CM_OUT=$("$B32" "$T/clean-more.sh" 2>&1); CM_RC=$?
+if [ "$CM_RC" = "0" ] && case "$CM_OUT" in *CLEANUP-DONE*) true ;; *) false ;; esac && case "$CM_OUT" in *LOCK-RELEASED*) false ;; *) true ;; esac; then ok "real cleanup with GATE_SWEEP_HAS_MORE_WORK=1 leaves the lock held (the property the bypass relies on)"; else bad "real cleanup with the flag set: rc=$CM_RC $CM_OUT"; fi
+# …then the bypass itself: the REAL cleanup as Step 9, then a finalize that reports whether the lock is still held at the full-suite and the merge.
+byp_lock_case() { # <finalize rc> -> BL_OUT / BL_RC
+  { cat <<'HDR'
+set -euo pipefail
+BRANCH="b"; GATE_LANE_REASON="r"; GC_CITY=/city; GATE_RUN_ID=r1; GATE_LOCK_ENABLED=1
+LOCK_HELD=1
+log() { :; }
+gc() { echo "GC-CALLED $*"; }
+bd() { echo "BD-CALLED $*"; }
+_gate_lock_write_hb() { echo "HB-REFRESHED"; }
+_release_gate_lock() { echo "LOCK-RELEASED"; LOCK_HELD=0; }
+HDR
+    printf '%s\n' "$CLEANFN"
+    cat <<'FIN'
+gate_finalize_run() {
+  cleanup_reviewer_sessions                                       # Step 9 — before the full-suite check and the merge, as in the dispatcher
+  if [ "$LOCK_HELD" = "1" ]; then echo "AT-FULL-SUITE lock=held"; else echo "AT-FULL-SUITE lock=RELEASED"; fi
+  if [ "$LOCK_HELD" = "1" ]; then echo "AT-MERGE lock=held"; else echo "AT-MERGE lock=RELEASED"; fi
+  return "$FIN_RC"
+}
+FIN
+    printf 'FIN_RC=%q\nGATE_LANE=fast\n' "$1"
+    printf '%s\n' "${BYPBLK_USE:-$BYPBLK}"
+    printf 'echo AFTER-BLOCK\n'
+  } > "$T/bypl.sh"
+  BL_OUT=$("$B32" "$T/bypl.sh" 2>&1); BL_RC=$?
+}
+bl_line() { printf '%s\n' "$BL_OUT" | grep -n -m1 -x -- "$1" | cut -d: -f1; }   # line number of an exact output line ("" when absent)
+bl_count() { printf '%s\n' "$BL_OUT" | grep -c -x -- "$1" || true; }
+byp_lock_case 0
+case "$BL_OUT" in *"AT-FULL-SUITE lock=held"*) ok "bypass: the citywide lock is still held when the full-suite check runs (after Step 9)" ;; *) bad "bypass: lock gone at the full-suite check — $BL_OUT" ;; esac
+case "$BL_OUT" in *"AT-MERGE lock=held"*) ok "bypass: …and still held at the merge" ;; *) bad "bypass: lock gone at the merge — $BL_OUT" ;; esac
+[ "$(bl_count LOCK-RELEASED)" = "1" ] && ok "bypass: the lock is released exactly once" || bad "bypass: LOCK-RELEASED seen $(bl_count LOCK-RELEASED) times — $BL_OUT"
+L_BM=$(bl_line "AT-MERGE lock=held"); L_BR=$(bl_line LOCK-RELEASED)
+if [ -n "$L_BM" ] && [ -n "$L_BR" ] && [ "$L_BM" -lt "$L_BR" ]; then ok "bypass: …and only AFTER the merge point (the release is the sweep's true end, not Step 9)"; else bad "bypass: release order wrong (merge line=$L_BM, release line=$L_BR) — $BL_OUT"; fi
+L_HB=$(bl_line HB-REFRESHED); L_FS=$(bl_line "AT-FULL-SUITE lock=held")
+if [ -n "$L_HB" ] && [ -n "$L_FS" ] && [ "$L_HB" -lt "$L_FS" ]; then ok "bypass: the lock heartbeat is refreshed before the heavy part, as Phase C does for each run (a held lock with a stale heartbeat is reclaimed by a second sweep)"; else bad "bypass: no heartbeat refresh before the full-suite check — $BL_OUT"; fi
+[ "$BL_RC" = "0" ] && case "$BL_OUT" in *AFTER-BLOCK*|*GC-CALLED*|*BD-CALLED*) false ;; *) true ;; esac && ok "bypass: exit 0, nothing after the block, no gc/bd call of its own" || bad "bypass: rc=$BL_RC — $BL_OUT"
+byp_lock_case 1   # finalize fails under set -e: the abort goes straight to the EXIT trap, and the lock must still be freed
+[ "$(bl_count LOCK-RELEASED)" = "1" ] && ok "bypass: a finalize that fails (set -e abort) still frees the lock, exactly once" || bad "bypass: after a failing finalize LOCK-RELEASED seen $(bl_count LOCK-RELEASED) times — $BL_OUT"
+
 # 5d. the BSD seq hazard this design routes around (informational on GNU userland)
 if [ "$(seq 1 0 | wc -l | tr -d ' ')" = "2" ]; then ok "this host's seq counts DOWN (seq 1 0 prints 2 lines) — hence an explicit branch, not REQUIRED_REVIEWERS=0"
 else ok "seq 1 0 prints nothing here (GNU) — the explicit bypass is still the contract"; fi
@@ -686,7 +760,7 @@ HDR
     printf 'push_step() {\n%s\n  echo PUSH-REACHED\n}\n' "${PCBLK_USE:-$PCBLK}"
     printf 'rc=0; CUR_MAIN=%q; CUR_BRANCH=%q; push_step || rc=$?\necho "STEP rc=$rc result=${MERGE_RESULT:-none} lane=$GATE_LANE"\n' "$2" "$3"
   } > "$T/pc.sh"
-  PC_OUT=$(env FL_REPO="$T/repo2" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/pc.sh" 2>&1) || true
+  PC_OUT=$(fl_env FL_REPO="$T/repo2" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" GATE_FS_TMPDIR="$T/tmp" "$B32" "$T/pc.sh" 2>&1) || true
 }
 pc_reached() { case "$PC_OUT" in *PUSH-REACHED*) return 0 ;; *) return 1 ;; esac; }
 pc_case "$FA" "$M0_R2" "$FA"
@@ -743,6 +817,37 @@ lr_has "BD -C /city comment mk-7" && lr_has "another actor" && ! lr_has "re-queu
 lr_has "FIN rc=0" && ! lr_has "FELL-THROUGH" && ok "…and it still ends cleanly, never as a FAIL" || bad "skipped-requeue run fell through — $LR_OUT"
 lr_case failed_push_race 0
 lr_has "FELL-THROUGH" && ! lr_has "REQUEUE" && ok "control: any OTHER merge failure is untouched by the revoked-run block (falls through to the existing handling)" || bad "the revoked-run block swallowed a different failure — $LR_OUT"
+
+# ── 5f. hermetic: the operator's own kill switch is ambient state ──────────────────────────────────────────────
+# (gate round 3, blocking issue 2.) `touch <city>/.gc/gate-fastlane.off` and GATE_FASTLANE_ENABLED=0 are the operator controls this very story ships,
+# and GC_CITY is exported in every agent session. Every helper above that feeds the lib hands it a child environment; one that INHERITS the caller's
+# makes every case in this file read "lane switched off" the moment the switch is on — 100+ failures that look like a lane regression, on exactly the
+# day a worker's gate-done self-audit runs this file. The class is "a case's result depends on the caller's operator controls", so each of the four
+# helpers that spawn the lib (decide — and through it e2e_probe and the mutation checks —, dconf, real_dec, pc_case) is probed with each control ON.
+# The explicit per-case overrides (§4d, §4f: GATE_FASTLANE_OFF_FILE=…, GATE_FASTLANE_ENABLED=0) are the control: they must still win over the pin.
+echo "── 5f. hermetic: the operator's kill switch in the CALLER's environment must not reach a case ──"
+HC="$T/hostile-city"; mkdir -p "$HC/.gc"; : > "$HC/.gc/gate-fastlane.off"; : > "$T/hostile.off"
+hostile_decide() { # <label> ENV=VAL... — decide(), run with that setting exported in the caller's environment
+  local label="$1" got; shift
+  # two branches: docs-only (the switch controls) and docs + a new green test (the same, and the tuning knobs that only a changed test reaches)
+  got=$( export "$@"; decide "$(head_of s-docs)" ""; printf '%s' "$D_LANE"; decide "$(head_of s-testok)" ""; printf ' %s' "$D_LANE" )
+  [ "$got" = "fast fast" ] && ok "hermetic [$label]: decide() still reads the docs-only and the docs+green-test branches as fast" || bad "hermetic [$label]: decide() inherited the caller's setting — lanes='$got' (want 'fast fast')"
+}
+hostile_probe() { # <label> ENV=VAL... — each helper, run with that operator control ON in the caller's environment; each must still read the docs-only branch as fast
+  local label="$1" got; shift
+  hostile_decide "$label" "$@"
+  got=$( export "$@"; real_dec "$(head_of s-docs)" )
+  [ "$got" = "RESULT lane=fast tier=FAST-LANE rev=0" ] && ok "hermetic [$label]: the dispatcher's Step 5 block + real lib still grants fast" || bad "hermetic [$label]: real_dec inherited the switch — '$got'"
+  got=$( export "$@"; REPO="$T/repo2"; dconf "$FA" main "$FA"; printf '%s/%s' "$C_RC" "$C_L1" )
+  [ "$got" = "0/fast" ] && ok "hermetic [$label]: the push-time confirm still says yes to the unmoved tip" || bad "hermetic [$label]: dconf inherited the switch — rc/lane='$got' (want 0/fast)"
+  got=$( export "$@"; pc_case "$FA" "$M0_R2" "$FA"; printf '%s' "$PC_OUT" )
+  case "$got" in *"STEP rc=0 result=none lane=fast"*) ok "hermetic [$label]: the dispatcher's push step still pushes the decided commit" ;; *) bad "hermetic [$label]: pc_case inherited the switch — $got" ;; esac
+}
+hostile_probe "flag file under the caller's GC_CITY" GC_CITY="$HC"
+hostile_probe "caller exported GATE_FASTLANE_ENABLED=0" GATE_FASTLANE_ENABLED=0
+hostile_probe "caller exported GATE_FASTLANE_OFF_FILE pointing at an existing file" GATE_FASTLANE_OFF_FILE="$T/hostile.off"
+# a tuning knob is the same class, but only a branch that changes a test reaches it — so only decide()'s two-branch probe says anything about it
+hostile_decide "caller exported GATE_FASTLANE_RUN_TESTS=0 (a tuning knob)" GATE_FASTLANE_RUN_TESTS=0
 
 # ── 6. drift guards: facts the safety argument depends on ─────────────────────────────────────────────────────
 echo "── 6. drift guards ──"
@@ -912,6 +1017,30 @@ if cmp -s "$LIB" "$T/mut-anymd.lib.sh" || ! "$B32" -n "$T/mut-anymd.lib.sh" 2>/d
   S=$(git -C "$REPO" rev-parse s-unkmd); FL_LIB_OVERRIDE="$T/mut-anymd.lib.sh" decide "$S" ""
   [ "$D_LANE" = "fast" ] && ok "if every .md were a doc again, an unlisted NOTES.md WOULD be granted fast — the positive DOC list is what keeps it in the gate" || bad "mutant with 'any .md is a doc' still read $D_LANE — the class assertion is not load-bearing"
 fi
+# 8j. a bypass that forgets the flag (gate round 3, blocking issue 1) must turn the lock assertions red: Step 9 would free the lock before the heavy part
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed '/^  GATE_SWEEP_HAS_MORE_WORK=1/d')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8j did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  case "$BL_OUT" in *"AT-FULL-SUITE lock=RELEASED"*) ok "a bypass without GATE_SWEEP_HAS_MORE_WORK WOULD reach the full-suite check with the lock already freed — the flag is what holds it" ;; *) bad "mutant bypass without the flag still held the lock at the full-suite check — §5c'' is not load-bearing" ;; esac
+fi
+# 8k/8l. a bypass that holds the lock but cannot release it (Step 9 consumed _gate_cleanup_done; or the flag is still set when the trap runs) leaks it until GATE_LOCK_MAX_AGE
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/ _gate_cleanup_done=0; cleanup_reviewer_sessions; }/ cleanup_reviewer_sessions; }/')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8k did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  [ "$(bl_count LOCK-RELEASED)" = "0" ] && ok "an exit trap that does not re-arm the cleanup WOULD leak the lock (Step 9 consumed the dedup flag) — the re-arm is what frees it" || bad "mutant exit trap without the re-arm still released the lock — the release assertion is not load-bearing"
+fi
+BYPBLK_USE="$(printf '%s\n' "$BYPBLK" | sed 's/_fastlane_exit() { GATE_SWEEP_HAS_MORE_WORK=0; /_fastlane_exit() { /')"
+if [ "$BYPBLK_USE" = "$BYPBLK" ]; then bad "mutation 8l did not change the bypass block (sed pattern drifted)"; else
+  byp_lock_case 0
+  [ "$(bl_count LOCK-RELEASED)" = "0" ] && ok "an exit trap that leaves the flag set WOULD leak the lock (the cleanup would skip its release) — clearing it is what frees it" || bad "mutant exit trap that keeps the flag still released the lock — the release assertion is not load-bearing"
+fi
+BYPBLK_USE=""
+# 8m. an fl_env that no longer pins (back to a bare `env`) must turn §5f red: the caller's switch would reach the lib again
+FL_ENV_DEF="$(declare -f fl_env)"
+fl_env() { env "$@"; }
+M8M=$( export GATE_FASTLANE_ENABLED=0; decide "$(head_of s-docs)" ""; printf '%s' "$D_LANE" )
+eval "$FL_ENV_DEF"
+[ "$M8M" = "normal" ] && ok "an fl_env that does not pin WOULD let the caller's GATE_FASTLANE_ENABLED=0 through (lane=normal) — the pin is what keeps the cases hermetic" || bad "mutant fl_env without the pin still read lane='$M8M' — §5f is not load-bearing"
 echo
 echo "== gate-fastlane.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
