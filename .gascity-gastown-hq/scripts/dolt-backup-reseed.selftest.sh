@@ -34,6 +34,13 @@ S3_BACKUP_SCRIPT="$HERE/dolt-s3-backup.sh"
 # reaches those paths. /usr/bin/true swallows the args.
 export DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true
 
+# ga-gqllbc: hq is an EPHEMERAL-staging db by default, and for such a db the script is a successful
+# no-op (see the section at the end). Nearly every scenario below uses "hq" as its subject and means
+# to exercise the real reseed, so they all run with the mode OFF (empty list) and no conf file; the
+# section at the end passes its own environment explicitly (env -i) to test the mode itself.
+export DOLT_BACKUP_EPHEMERAL_DBS=""
+export DOLT_BACKUP_EPHEMERAL_CONF="${TMPDIR:-/tmp}/dolt-backup-reseed-selftest-no-such-eph.env"
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -1738,6 +1745,51 @@ if [ "$N_VERIFY" = "2" ] && [ "$N_RM" = "$N_VERIFY" ]; then
 else
   bad "deletion sites ($N_RM) and proof call sites ($N_VERIFY) diverge (want 2 and 2) — a deletion path may have lost its proof"
 fi
+
+# ═══ ga-gqllbc: a reseed is a successful NO-OP for an EPHEMERAL-staging db (hq) ═══════════════════
+# Real subprocess against a throwaway city; dolt/gc/aws are stubs that LOG and FAIL, so a reseed that
+# wrongly proceeded would show up as a recorded call (or an ABORTADO line), never as a real action.
+echo "── ephemeral staging: reseed is a no-op (ga-gqllbc) ──"
+EPH_T="$(mktemp -d "${TMPDIR:-/tmp}/reseed-eph.XXXXXX")"
+mkdir -p "$EPH_T/bin" "$EPH_T/city/.gc/logs" "$EPH_T/city/.dolt-backup/hq"
+for b in dolt gc aws; do printf '#!/bin/bash\necho "%s $*" >> "%s/calls.log"\nexit 1\n' "$b" "$EPH_T" > "$EPH_T/bin/$b"; chmod +x "$EPH_T/bin/$b"; done
+printf 'sentinel' > "$EPH_T/city/.dolt-backup/hq/sentinel"
+eph_run() { # <db> [env assignments...] — runs the script for real, returns its rc, leaves the log in $EPH_T/run.log
+  local db="$1"; shift
+  : > "$EPH_T/calls.log"; : > "$EPH_T/city/.gc/logs/dolt-backup-reseed.log"
+  env -i HOME="$EPH_T" TMPDIR="$EPH_T" PATH="$EPH_T/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    GC_CITY_PATH="$EPH_T/city" DOLT_BACKUP_RESIDUE_RECLAIM_NOTIFY=/usr/bin/true "$@" \
+    timeout 60 /bin/bash "$SCRIPT" "$db" > "$EPH_T/run.log" 2>&1
+}
+eph_run hq DOLT_BACKUP_EPHEMERAL_DBS=hq; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF "staging EFÊMERO" "$EPH_T/run.log" && [ ! -s "$EPH_T/calls.log" ] && [ -f "$EPH_T/city/.dolt-backup/hq/sentinel" ]; then
+  ok "hq (ephemeral): exit 0, says why, makes NO dolt/gc/aws call, and touches nothing in .dolt-backup/hq"
+else bad "hq (ephemeral) was not a clean no-op (rc=$rc): $(tail -3 "$EPH_T/run.log" | tr '\n' '|') calls=$(tr '\n' '|' < "$EPH_T/calls.log")"; fi
+eph_run hq; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF "staging EFÊMERO" "$EPH_T/run.log" && [ ! -s "$EPH_T/calls.log" ]; then
+  ok "hq is ephemeral BY DEFAULT (no env, no conf) — the compact-routine / disk-floor-guard callers are covered without passing anything"
+else bad "default hq is not a no-op (rc=$rc): $(tail -3 "$EPH_T/run.log" | tr '\n' '|')"; fi
+eph_run hq DOLT_BACKUP_EPHEMERAL_DBS=hq RESEED_ALLOW_EPHEMERAL=1
+if ! grep -qF "staging EFÊMERO" "$EPH_T/run.log"; then ok "RESEED_ALLOW_EPHEMERAL=1 lets a human reseed an ephemeral db (the guard steps aside)"
+else bad "RESEED_ALLOW_EPHEMERAL=1 was ignored"; fi
+eph_run hq DOLT_BACKUP_EPHEMERAL_DBS=
+if ! grep -qF "staging EFÊMERO" "$EPH_T/run.log"; then ok "kill switch (empty list) → hq is reseeded as before"
+else bad "kill switch ignored — hq still a no-op with an empty list"; fi
+eph_run lexbh DOLT_BACKUP_EPHEMERAL_DBS=hq
+if ! grep -qF "staging EFÊMERO" "$EPH_T/run.log"; then ok "a db that is NOT on the list (lexbh) is reseeded as before"
+else bad "a non-ephemeral db was turned into a no-op"; fi
+printf 'DOLT_BACKUP_EPHEMERAL_DBS=lexbh\n' > "$EPH_T/eph.env"
+eph_run lexbh DOLT_BACKUP_EPHEMERAL_CONF="$EPH_T/eph.env"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF "staging EFÊMERO" "$EPH_T/run.log" && [ ! -s "$EPH_T/calls.log" ]; then ok "the conf file's list is honoured (lexbh listed → no-op)"
+else bad "conf file not honoured (rc=$rc): $(tail -2 "$EPH_T/run.log" | tr '\n' '|')"; fi
+# drift-guard: the check sits after every special mode and right before the normal flow
+ln_guard="$(grep -n '_eph_is_ephemeral "\$DB"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+ln_run="$(grep -n '^_run_reseed "\$DB"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+ln_mode="$(grep -n 'if \[ "\$DB" = "--release-stale-new" \]' "$SCRIPT" | tail -1 | cut -d: -f1)"
+if [ -n "$ln_guard" ] && [ -n "$ln_run" ] && [ -n "$ln_mode" ] && [ "$ln_mode" -lt "$ln_guard" ] && [ "$ln_guard" -lt "$ln_run" ]; then
+  ok "drift-guard: the ephemeral check comes after the explicit modes (--release-*, --promote-*) and before the normal _run_reseed"
+else bad "drift-guard: ephemeral check misplaced (mode@$ln_mode guard@$ln_guard run@$ln_run)"; fi
+/bin/rm -rf "$EPH_T" 2>/dev/null
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

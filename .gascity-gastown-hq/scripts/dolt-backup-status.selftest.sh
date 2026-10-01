@@ -121,6 +121,42 @@ printf '%s' "$out" | grep -qF "PRIMARY ausente" && ok "scenario D: reports PRIMA
 
 rm -rf "$SRD_ROOT"
 
+# ── ga-gqllbc: a db with EPHEMERAL local staging (hq) has no directory here BY DESIGN ──────────────
+# It must be reported (a db that is simply not mentioned reads as "not backed up"), must not be the
+# "PRIMARY ausente" error, and must not drive the exit code. Real subprocess against a scratch root.
+echo "── ephemeral-staging db with no local dir (ga-gqllbc) ──"
+EPH_T="$(mktemp -d "${TMPDIR:-/tmp}/status-eph.XXXXXX")"
+mkdir -p "$EPH_T/root/lexbh"; touch "$EPH_T/root/lexbh/manifest"
+eph_status() { # [env...] — runs the real script against $EPH_T/root; output in $EPH_T/out, rc in $EPH_RC
+  env -i HOME="$EPH_T" PATH="/usr/bin:/bin:/usr/sbin:/sbin" GC_BACKUP_ARTIFACT_DIR="$EPH_T/root" \
+    DOLT_BACKUP_EPHEMERAL_CONF="$EPH_T/no-such.env" "$@" /bin/bash "$SCRIPT" > "$EPH_T/out" 2>&1
+  EPH_RC=$?
+}
+out="$(_status_report_ephemeral_absent hq)"
+if printf '%s' "$out" | grep -qF "hq: SEM staging local POR DESENHO" && printf '%s' "$out" | grep -qF "s3://urblink-dolt-backups/hq/" \
+   && printf '%s' "$out" | grep -qF "nao consulta a rede"; then
+  ok "_status_report_ephemeral_absent names the db, says it is by design, says where the copy is, and admits it asked nobody (no network)"
+else bad "_status_report_ephemeral_absent output: $out"; fi
+eph_status DOLT_BACKUP_EPHEMERAL_DBS=hq
+if [ "$EPH_RC" -eq 0 ] && grep -qF "hq: SEM staging local POR DESENHO" "$EPH_T/out" && ! grep -qF "PRIMARY ausente" "$EPH_T/out" \
+   && grep -qF "lexbh: PRIMARY" "$EPH_T/out" && grep -qF "todos os backups primarios tem manifest" "$EPH_T/out"; then
+  ok "ephemeral hq with no dir: listed as by-design, NOT 'PRIMARY ausente', exit 0, and the other db is reported as usual"
+else bad "ephemeral hq report (rc=$EPH_RC): $(cat "$EPH_T/out")"; fi
+eph_status DOLT_BACKUP_EPHEMERAL_DBS=
+if [ "$EPH_RC" -eq 0 ] && ! grep -qF "hq" "$EPH_T/out"; then ok "kill switch (empty list) → hq is not mentioned at all, exactly the legacy report"
+else bad "kill switch did not restore the legacy report (rc=$EPH_RC): $(cat "$EPH_T/out")"; fi
+mkdir -p "$EPH_T/root/hq"; touch "$EPH_T/root/hq/manifest"
+eph_status DOLT_BACKUP_EPHEMERAL_DBS=hq
+if [ "$EPH_RC" -eq 0 ] && grep -qF "hq: PRIMARY" "$EPH_T/out" && ! grep -qF "POR DESENHO" "$EPH_T/out"; then
+  ok "an ephemeral db that DOES have a staging dir (mid-run, or a held-back release) gets the normal PRIMARY report, not the by-design line"
+else bad "ephemeral db with a dir (rc=$EPH_RC): $(cat "$EPH_T/out")"; fi
+rm -rf "$EPH_T/root/hq" "$EPH_T/root/lexbh"
+eph_status DOLT_BACKUP_EPHEMERAL_DBS=hq
+if [ "$EPH_RC" -eq 0 ] && grep -qF "hq: SEM staging local POR DESENHO" "$EPH_T/out" && ! grep -qF "nenhum banco encontrado" "$EPH_T/out"; then
+  ok "an otherwise EMPTY root with an ephemeral hq: hq is reported, and the report does not claim 'nenhum banco encontrado'"
+else bad "empty root + ephemeral hq (rc=$EPH_RC): $(cat "$EPH_T/out")"; fi
+rm -rf "$EPH_T"
+
 # ── drift-guard: db discovery skips .new/.old as top-level entries ──────────
 echo "── drift-guard: live script wiring ──"
 if grep -qE '\*\.new\|\*\.old\)' "$SCRIPT"; then

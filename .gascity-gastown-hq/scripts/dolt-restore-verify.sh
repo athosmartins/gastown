@@ -60,6 +60,15 @@ NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 DISK_MARGIN_PCT="${RESTORE_VERIFY_DISK_MARGIN_PCT:-200}"
 ONLY_DBS="${RESTORE_VERIFY_ONLY_DBS:-}"   # space-separated allowlist; empty = every live db + every backup dir
 
+# ga-gqllbc: a db with EPHEMERAL local staging (dolt-backup-ephemeral-lib.sh; default hq) has no local
+# backup to restore BY DESIGN — its backup is in S3, and a real restore of hq from S3 would need ~19GB
+# (pull + restore) this machine does not have. For such a db this job checks what it CAN, and says so
+# in the result word: S3-OK, never OK (see _verify_ephemeral_via_s3).
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$CITY/.gc/config/dolt-backup-ephemeral.env}"
+AWS="${RESTORE_VERIFY_AWS:-$(command -v aws || echo /opt/homebrew/bin/aws)}"
+BUCKET="${RESTORE_VERIFY_S3_BUCKET:-urblink-dolt-backups}"
+S3PROOF_TIMEOUT="${RESTORE_VERIFY_S3_TIMEOUT_S:-120}"
+
 # ── Snapshot baseline (ga-jsk5p8) ───────────────────────────────────────────
 # A backup is a snapshot of the PAST; the live db keeps growing after it. The
 # old rule ("restored < live-now => FAIL") therefore condemned a perfect backup
@@ -100,6 +109,10 @@ mkdir -p "$(dirname "$LOG")" 2>/dev/null
 # precedent for exactly this reason — a log line mixed into that channel
 # would corrupt every caller's parsed result, not just look noisy.
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [restore-verify] $*" >> "$LOG" 2>/dev/null || true; }
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-ephemeral-lib.sh"
 
 # _avail_gb — macOS: `df /` reports the sealed SYSTEM volume and lies about
 # free space; same gotcha already documented in dolt-backup-reseed.sh and
@@ -224,6 +237,52 @@ _live_counts_with_post() {
   printf '%s\n' "$row" | awk -F'|' '{gsub(/[[:space:]]/,"",$2); gsub(/[[:space:]]/,"",$3); print $2, $3}'
 }
 
+# _verify_ephemeral_via_s3 <db> — ga-gqllbc. The check for a db whose local staging is ephemeral and
+# absent. It is NOT a restore and does not pretend to be: the result word is S3-OK, which main() does
+# not count as a verified restore. Four independent facts, each fail-closed, in this order:
+#   1. S3's run fingerprint can be read at all — if not, SKIP (could not look; the network or the
+#      credentials may be down, which says nothing about the backup — error is not "broken");
+#   2. it has an entry for the db, with a known time (a good backup's, or the last good one's);
+#   3. S3's manifest CLOSES — every table it names is in the bucket (the proof that caught hq's
+#      unrestorable copy on 2026-09-25; "the manifest object exists" is not enough);
+#   4. that backup is no older than MAX_BACKUP_AGE_H.
+# Echoes one "<db>=S3-OK(..)" / "SKIP(..)" / "FAIL(..)" line like _verify_one_db and returns 0 / 0 / 1.
+# A real restore drill of such a db belongs after the hq GC (ga-txsjgj) has made the store small.
+_verify_ephemeral_via_s3() {
+  local db="$1" fp state epoch now age_s age_h note=""
+  fp="$(_eph_s3_fingerprint_state "$db")"
+  case "$fp" in
+    unknown)
+      log "'$db': staging efemero e sem copia local; nao consegui ler _meta/latest.json do S3 — sem como verificar agora (nao e falha do backup)"
+      echo "${db}=SKIP(s3-fingerprint-ilegivel)"; return 0 ;;
+    absent)
+      log "'$db': staging efemero e o S3 nao tem entrada para ele em _meta/latest.json — o banco nao esta sendo protegido"
+      echo "${db}=FAIL(s3-sem-entrada-no-fingerprint)"; return 1 ;;
+    "failed unknown")
+      log "'$db': staging efemero; a ultima noite FALHOU e o S3 nao registra qual foi a ultima boa — nao da para provar frescor"
+      echo "${db}=FAIL(s3-ultima-noite-falhou-sem-ultima-boa)"; return 1 ;;
+    "ok "[0-9]*) state=ok; epoch="${fp#ok }" ;;
+    "failed "[0-9]*) state=failed; epoch="${fp#failed }"; note=",ultima-noite-falhou" ;;
+    *)
+      log "'$db': resposta inesperada de _eph_s3_fingerprint_state ('$fp') — tratada como ilegivel"
+      echo "${db}=SKIP(s3-fingerprint-ilegivel)"; return 0 ;;
+  esac
+  if ! _s3proof_s3_closure_ok "$db"; then
+    log "'$db': staging efemero; o manifest do S3 NAO fecha (falta tabela no bucket) ou nao foi possivel provar — a copia do S3 pode nao restaurar (linhas 'closure' acima)"
+    echo "${db}=FAIL(s3-nao-restauravel)"; return 1
+  fi
+  now=$(_now_epoch)
+  age_s=$(( now - epoch )); [ "$age_s" -lt 0 ] && age_s=0
+  age_h=$(( age_s / 3600 ))
+  if [ "$age_s" -gt $(( MAX_BACKUP_AGE_H * 3600 )) ]; then
+    log "'$db': staging efemero; o backup do S3 tem ${age_h}h (limite ${MAX_BACKUP_AGE_H}h)${note:+ e a ultima noite falhou} — o job de backup nao esta acompanhando o banco"
+    echo "${db}=FAIL(defasado:${age_h}h>${MAX_BACKUP_AGE_H}h${note})"; return 1
+  fi
+  log "'$db': S3-OK (staging efemero, sem copia local): manifest do S3 fecha, backup com ${age_h}h${note:+, mas a ultima noite falhou}. NAO e um restore — so a prova do S3 (um restore real do hq exige ~19GB)"
+  echo "${db}=S3-OK(fecho-do-manifest,backup-com-${age_h}h${note})"
+  return 0
+}
+
 # _verify_one_db <db> — echoes "<db>=OK(n)" / "SKIP(reason)" / "FAIL(reason)" /
 # "NO-BACKUP(reason)" to stdout and returns 0 for OK/SKIP, 1 for FAIL, 3 for
 # NO-BACKUP. SKIP is deliberately NOT a failure: "could not check right now" (no
@@ -241,6 +300,11 @@ _verify_one_db() {
     log "pulando '$db': sem banco vivo correspondente em $DOLTDIR"
     echo "${db}=SKIP(sem-banco-vivo)"
     return 0
+  fi
+  # ga-gqllbc: no local backup is the DESIGN for an ephemeral-staging db — check S3 instead of crying NO-BACKUP.
+  if [ ! -d "$BACKUP_ROOT/$db" ] && _eph_is_ephemeral "$db"; then
+    _verify_ephemeral_via_s3 "$db"
+    return $?
   fi
   if [ ! -d "$BACKUP_ROOT/$db" ]; then
     if [ -d "$BACKUP_ROOT/$db.new" ]; then

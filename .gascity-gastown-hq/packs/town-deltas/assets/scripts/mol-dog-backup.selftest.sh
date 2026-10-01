@@ -831,5 +831,57 @@ EOF2
   rm -rf "$FB_WORK" 2>/dev/null
 fi
 
+# ═══ ga-gqllbc: ephemeral-staging dbs (hq) are the nightly's job, not this one's ═══════════════════
+echo "── ephemeral_skip_detail() (ga-gqllbc) ──"
+ELIB="$HERE/../../../../scripts/dolt-backup-ephemeral-lib.sh"
+EPH_CONF_NONE="$(mktemp -d "${TMPDIR:-/tmp}/mdb-eph.XXXXXX")/none.env"   # a conf path that does not exist → env/default decide
+eph_call() { # runs "$@" in a subshell with the script (lib mode) AND the real ephemeral lib loaded
+  (
+    export MOL_DOG_BACKUP_LIB=1 DOLT_BACKUP_EPHEMERAL_CONF="$EPH_CONF_NONE"
+    . "$SCRIPT" >/dev/null 2>&1
+    . "$ELIB"
+    "$@"
+  )
+}
+if [ -f "$ELIB" ]; then
+  out="$(eph_call ephemeral_skip_detail hq)"; rc=$?
+  if [ "$rc" -eq 0 ] && case "$out" in "hq(staging efemero"*) true ;; *) false ;; esac; then
+    ok "hq is skipped BY DEFAULT and the report text names the db and the reason: $out"
+  else bad "hq not skipped by default (rc=$rc, out='$out')"; fi
+  out="$(eph_call ephemeral_skip_detail lexbh)"; rc=$?
+  if [ "$rc" -eq 1 ] && [ -z "$out" ]; then ok "a db that is not ephemeral is NOT skipped (rc 1, prints nothing)"
+  else bad "lexbh wrongly skipped (rc=$rc, out='$out')"; fi
+  out="$(DOLT_BACKUP_EPHEMERAL_DBS="" eph_call ephemeral_skip_detail hq)"; rc=$?
+  if [ "$rc" -eq 1 ] && [ -z "$out" ]; then ok "kill switch (empty list) → hq is synced as before (not skipped)"
+  else bad "kill switch ignored (rc=$rc, out='$out')"; fi
+  out="$(DOLT_BACKUP_EPHEMERAL_DBS="hq whatsapp_automation" eph_call ephemeral_skip_detail whatsapp_automation)"; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "the list is honoured for any db on it, not just hq"
+  else bad "whatsapp_automation on the list but not skipped (rc=$rc)"; fi
+  out="$(DOLT_BACKUP_EPHEMERAL_DBS="hq" eph_call ephemeral_skip_detail hq2)"; rc=$?
+  if [ "$rc" -eq 1 ]; then ok "exact-name match: 'hq2' is not 'hq'"
+  else bad "'hq2' matched 'hq'"; fi
+else
+  bad "the ephemeral lib is missing at $ELIB — cannot test ephemeral_skip_detail"
+fi
+# the lib NOT loaded (e.g. a stale checkout): "cannot tell" is "not ephemeral" — sync it, never drop it
+out="$(lib_call ephemeral_skip_detail hq)"; rc=$?
+if [ "$rc" -eq 1 ] && [ -z "$out" ]; then ok "ephemeral lib not loaded → hq is NOT skipped (the old behaviour, never a silent drop of a db's backup)"
+else bad "without the lib hq was skipped (rc=$rc, out='$out')"; fi
+# drift-guards on the live main flow (it cannot be run here: it needs the real runtime.sh / a live server)
+ln_src="$(grep -n 'dolt-backup-ephemeral-lib.sh"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+ln_skip="$(grep -n 'ephemeral_skip_detail "\$db"' "$SCRIPT" | tail -1 | cut -d: -f1)"
+ln_sync="$(grep -n 'result=\$(sync_db_with_fallback' "$SCRIPT" | tail -1 | cut -d: -f1)"
+ln_gate="$(grep -n '^if \[ "\${MOL_DOG_BACKUP_LIB:-0}" = "1" \]' "$SCRIPT" | tail -1 | cut -d: -f1)"
+if [ -n "$ln_src" ] && [ -n "$ln_skip" ] && [ -n "$ln_sync" ] && [ -n "$ln_gate" ] && [ "$ln_gate" -lt "$ln_src" ] && [ "$ln_src" -lt "$ln_skip" ] && [ "$ln_skip" -lt "$ln_sync" ]; then
+  ok "drift-guard: the lib is sourced after the library-mode gate and the skip comes BEFORE sync_db_with_fallback in the loop"
+else bad "drift-guard: wiring out of order (gate@$ln_gate src@$ln_src skip@$ln_skip sync@$ln_sync)"; fi
+if grep -qF 'ephemeral: $EPHEMERAL' "$SCRIPT" && grep -qF 'TOTAL=$((TOTAL - EPHEMERAL))' "$SCRIPT"; then
+  ok "drift-guard: the summary names the ephemeral count and 'synced N/M' excludes it (a fourth state, not a shortfall)"
+else bad "drift-guard: summary does not report the ephemeral state"; fi
+ln_cont="$(awk '/ephemeral_skip_detail "\$db"/{f=1} f&&/continue/{print NR; exit}' "$SCRIPT")"
+if [ -n "$ln_cont" ] && [ "$ln_cont" -lt "$ln_sync" ]; then ok "drift-guard: the skip branch ends in 'continue' — an ephemeral db never reaches the sync"
+else bad "drift-guard: the skip branch does not continue before the sync"; fi
+/bin/rm -rf "$(dirname "$EPH_CONF_NONE")" 2>/dev/null
+
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -43,6 +43,15 @@
 # of the live size that dolt-s3-backup.sh's _sync_disk_preflight demands. A
 # failed server sync against a file:// staging also reports what it left there
 # (a non-file remote has no staging to look at, so its line carries no residue).
+#
+# ga-gqllbc: dbs with EPHEMERAL local staging (dolt-backup-ephemeral-lib.sh; default hq) are NOT
+# synced by this job. Their staging is built from scratch by the nightly dolt-s3-backup.sh, proven
+# against S3 and then DELETED — keeping a permanent 9.5GB copy of hq fresh every 6h is exactly what
+# made the gate's pre-review starve for disk (ga-ufskhy). Syncing hq here would also recreate that
+# staging through the SERVER-mediated path, whose cached view of an emptied directory is the
+# ga-yct7r1/ga-ypxbxm failure (writes GB, dies on "table file not found", leaves a manifest-less
+# residue). The db is reported as "ephemeral" in the summary — a fourth state, neither synced,
+# skipped nor failed — never silently dropped.
 set -euo pipefail
 
 SMALL_DB_BOUND_SECS=120
@@ -472,6 +481,18 @@ sync_db_with_fallback() {
     printf 'FAILED %s(offline fallback also failed — %s)%s\n' "$db" "$why" "$residue"
 }
 
+# ephemeral_skip_detail <db> — ga-gqllbc. Prints the report text for <db> and returns 0 iff its
+# local staging is ephemeral (dolt-backup-ephemeral-lib.sh's _eph_is_ephemeral) and this job must
+# therefore leave it alone; returns 1 and prints nothing otherwise. "Cannot tell" — the lib not
+# loaded — is "not ephemeral": the old behaviour (sync it), never a silent drop of a db's backup.
+# Defined ahead of the library-mode gate below so mol-dog-backup.selftest.sh can drive it.
+ephemeral_skip_detail() {
+    local db="$1"
+    declare -f _eph_is_ephemeral >/dev/null 2>&1 || return 1
+    _eph_is_ephemeral "$db" || return 1
+    printf '%s(staging efemero: o backup local e construido, provado no S3 e liberado pelo job noturno dolt-s3-backup.sh; este job nao o recria)' "$db"
+}
+
 # Library mode: `MOL_DOG_BACKUP_LIB=1 source mol-dog-backup.sh` defines the pure
 # functions above without resolving a live Dolt runtime or running the backup
 # flow (port resolution, real syncs, mail/nudge).
@@ -498,6 +519,9 @@ GC_PACK_DIR="${GC_SYSTEM_PACKS_DIR:-$GC_CITY_PATH/.gc/system/packs}/dolt" \
 # shellcheck disable=SC2034
 OFFLINE_SYNC_DOLT_CFG="$GC_CITY_PATH/.gc/runtime/packs/dolt/dolt-config.yaml"
 DOLT_DISK_FLOOR_GUARD_LIB=1 . "$GC_CITY_PATH/scripts/dolt-disk-floor-guard.sh"
+# ga-gqllbc: which dbs keep no permanent local staging (default hq) — see the header note.
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$GC_CITY_PATH/.gc/config/dolt-backup-ephemeral.env}"
+. "$GC_CITY_PATH/scripts/dolt-backup-ephemeral-lib.sh"
 
 PORT="$GC_DOLT_PORT"
 HOST="${GC_DOLT_HOST:-127.0.0.1}"
@@ -646,11 +670,20 @@ FAILED=0
 SKIPPED=0
 FAILED_DBS=""
 SKIPPED_DBS=""
+EPHEMERAL=0
+EPHEMERAL_DBS=""
 
 for db in $DATABASES; do
     db_dir="$DOLT_DATA_DIR/$db"
     if [ ! -d "$db_dir" ]; then
         append_failed_db "$db(not found)"
+        continue
+    fi
+
+    # ga-gqllbc: an ephemeral-staging db is the nightly's job (see the header note), not this one's.
+    if eph_detail="$(ephemeral_skip_detail "$db")"; then
+        EPHEMERAL=$((EPHEMERAL + 1))
+        EPHEMERAL_DBS="${EPHEMERAL_DBS:+$EPHEMERAL_DBS, }$eph_detail"
         continue
     fi
 
@@ -698,6 +731,13 @@ if [ "$SKIPPED" -gt 0 ]; then
     echo "backup: skipped databases:$SKIPPED_DBS"
 fi
 
-SUMMARY="backup — synced: $SYNCED/$TOTAL, skipped: $SKIPPED, offsite: $OFFSITE_STATUS"
+if [ "$EPHEMERAL" -gt 0 ]; then
+    echo "backup: ephemeral-staging databases (not synced here, by design):$EPHEMERAL_DBS"
+fi
+
+# ga-gqllbc: an ephemeral db is neither synced nor skipped nor failed — keep "synced N/M" a ratio of
+# the dbs this job is responsible for, and name the fourth state next to it.
+TOTAL=$((TOTAL - EPHEMERAL))
+SUMMARY="backup — synced: $SYNCED/$TOTAL, skipped: $SKIPPED, ephemeral: $EPHEMERAL, offsite: $OFFSITE_STATUS"
 nudge_deacon_done "DOG_DONE: $SUMMARY"
 echo "backup: $SUMMARY"

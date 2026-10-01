@@ -1220,7 +1220,18 @@ if [ "$1" = "dolt-cleanup" ]; then
 fi
 exit 0
 STUB
-chmod +x "$GA29_E2E/bin/dolt" "$GA29_E2E/bin/gc"
+cat > "$GA29_E2E/bin/aws" <<'STUB'
+#!/bin/sh
+# stub aws (ga-gqllbc): serves ONE object — s3://<bucket>/_meta/latest.json — from $STUB_FP_FILE.
+# STUB_AWS_FAIL=1 = the call itself fails (no network, expired credentials...). Anything else: exit 1.
+[ "${STUB_AWS_FAIL:-0}" = 1 ] && exit 255
+if [ "$1 $2" = "s3 cp" ]; then
+  case "$3" in s3://*/_meta/latest.json) [ -f "${STUB_FP_FILE:-/nonexistent}" ] || exit 1; cp "$STUB_FP_FILE" "$4"; exit 0 ;; esac
+fi
+exit 1
+STUB
+chmod +x "$GA29_E2E/bin/dolt" "$GA29_E2E/bin/gc" "$GA29_E2E/bin/aws"
+GA29_ELIB="$HERE/../../../../scripts/dolt-backup-ephemeral-lib.sh"   # the real lib, from this tree
 
 # ga29_new <name> [fresh] — a scratch city with two dbs whose backups are 2025 old (stale) unless "fresh".
 ga29_new() {
@@ -1240,6 +1251,7 @@ ga29_cycle() {
   env -i PATH="$GA29_E2E/bin:$PATH" HOME="$d/home" GC_CITY_PATH="$d/city" \
       GC_SYSTEM_PACKS_DIR="$GA29_E2E/packs" GC_DOLT_DATA_DIR="$d/data" \
       GC_DOCTOR_STATE_DIR="$d/state" GC_BACKUP_ARTIFACT_DIR="$d/art" \
+      DOLT_BACKUP_EPHEMERAL_LIB="$GA29_ELIB" DOLT_BACKUP_EPHEMERAL_DBS="" DOLT_BACKUP_EPHEMERAL_CONF="$d/no-such-eph.env" \
       STUB_MAILLOG="$d/mail.log" STUB_COMMIT_EPOCH="$(date +%s)" "$@" \
       bash "$GA29_DOCTOR" > "$d/last.out" 2>&1
   echo $? > "$d/last.rc"
@@ -1354,7 +1366,76 @@ sc_commit_fresh() {
   fi
 }
 
-GA29_SCENARIOS="repro control blind_dblist blind_backup_cli blind_budget blind_conn_count blind_conn_limit blind_orphans snapshot commit_stale commit_fresh"
+# ── ga-gqllbc: a db whose local staging is EPHEMERAL has no local artifacts by design. Its freshness
+# comes from S3's run fingerprint; "no artifacts" must not read as "backup missing", and "could not
+# read S3" must be a blind spot, not a warning and not a clean bill.
+ga29_iso() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+ga29_eph_new() {   # <name> <hq-entry-json> [fresh] — hq has NO local artifacts, lexbh is fresh, S3's fingerprint says <entry>
+  local d; d=$(ga29_new "eph-$1" fresh)
+  rm -rf "$d/art/hq"
+  printf '{"run_utc":"%s","databases":{"hq":%s,"lexbh":{"issues":1}}}' "$(ga29_iso "$(date +%s)")" "$2" > "$d/fp.json"
+  printf '%s\n' "$d"
+}
+sc_eph_fresh() {
+  local d; d=$(ga29_eph_new fresh "{\"issues\":5,\"run_utc\":\"$(ga29_iso $(( $(date +%s) - 7200 )))\"}")
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if [ "$(ga29_mails "$d")" = "0" ] && grep -qF 'doctor — server: ok' "$d/last.out" && ! grep -q 'MEDIUM condition\|backup missing\|Not measured' "$d/last.out"; then
+    sc_ok "ephemeral hq, no local artifacts, S3 fingerprint says a backup 2h old → NO warning, nothing unmeasured (absence of a local copy is the design, not a missing backup)"
+  else sc_bad "fresh S3 backup of an ephemeral db still warned: class=$(ga29_class "$d") mails=$(ga29_mails "$d") out=$(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_stale() {
+  local d; d=$(ga29_eph_new stale "{\"issues\":5,\"run_utc\":\"$(ga29_iso $(( $(date +%s) - 180000 )))\"}")
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup is 50h old' "$d/mail.log"; then sc_ok "ephemeral hq whose S3 backup is 50h old → the SAME age warning as a local backup would give ('hq backup is 50h old')"
+  else sc_bad "stale S3 backup of an ephemeral db did not warn: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null) | $(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_failed_recent() {
+  local d; d=$(ga29_eph_new failed-recent "{\"status\":\"failed\",\"reason\":\"disco\",\"last_ok_run_utc\":\"$(ga29_iso $(( $(date +%s) - 36000 )))\",\"last_ok\":{\"issues\":5}}")
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if [ "$(ga29_mails "$d")" = "0" ] && ! grep -q 'backup missing\|backup is' "$d/last.out"; then
+    sc_ok "ephemeral hq: last night FAILED but the last good backup is 10h old (inside the 30h limit) → judged by that age, like a local backup — no warning yet"
+  else sc_bad "failed-last-night-but-recent-good warned: $(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_failed_old() {
+  local d; d=$(ga29_eph_new failed-old "{\"status\":\"failed\",\"reason\":\"disco\",\"last_ok_run_utc\":\"$(ga29_iso $(( $(date +%s) - 259200 )))\",\"last_ok\":{\"issues\":5}}")
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup is 72h old' "$d/mail.log"; then sc_ok "ephemeral hq failing for 3 nights (last good 72h ago, the 09-29 shape) → warns with the real age: 'hq backup is 72h old'"
+  else sc_bad "hq failed 3 nights and the doctor stayed quiet: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null) | $(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_failed_unknown() {
+  local d; d=$(ga29_eph_new failed-unknown '{"status":"failed","reason":"disco","last_ok_run_utc":null,"last_ok":null}')
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup FAILED last night and S3 records no last good backup' "$d/mail.log"; then sc_ok "ephemeral hq failed with NO recorded last-good time → warns by name (cannot be judged fresh)"
+  else sc_bad "failed-with-unknown-last-good did not warn: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null) | $(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_absent() {
+  local d; d=$(ga29_eph_new absent '{"issues":1}'); printf '{"run_utc":"%s","databases":{"lexbh":{"issues":1}}}' "$(ga29_iso "$(date +%s)")" > "$d/fp.json"
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup missing (no entry for it in the S3 run fingerprint)' "$d/mail.log"; then sc_ok "ephemeral hq with no entry in S3's fingerprint → 'backup missing (no entry …)' — a real absence is still reported"
+  else sc_bad "absent fingerprint entry did not warn: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null) | $(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_unreadable() {   # MEDIUM already recorded; S3 unreadable → a blind spot: named, state kept, no mail
+  local d; d=$(ga29_eph_new unreadable '{"issues":1}'); ga29_seed_medium "$d"
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json" STUB_AWS_FAIL=1
+  if [ "$(ga29_class "$d")" = "MEDIUM" ] && [ "$(ga29_mails "$d")" = "0" ] && grep -qF 'S3 backup fingerprint of hq' "$d/last.out" && ! grep -q 'hq backup missing' "$d/last.out"; then
+    sc_ok "S3 unreadable → hq is a NAMED blind spot ('S3 backup fingerprint of hq'): the MEDIUM state is kept, no mail, and it is NOT reported as 'backup missing' (error ≠ empty)"
+  else sc_bad "unreadable S3 fingerprint mishandled: class=$(ga29_class "$d") mails=$(ga29_mails "$d") out=$(tr '\n' ' ' < "$d/last.out")"; fi
+}
+sc_eph_off() {   # kill switch: the old, louder behaviour — no local artifacts = missing
+  local d; d=$(ga29_eph_new off "{\"issues\":5,\"run_utc\":\"$(ga29_iso "$(date +%s)")\"}")
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS="" STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup missing' "$d/mail.log"; then sc_ok "mode off (empty list) → a db with no local artifacts is 'backup missing' again (legacy behaviour; S3 is not consulted)"
+  else sc_bad "kill switch did not restore the legacy check: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null)"; fi
+}
+sc_eph_local_wins() {   # local artifacts exist (first night / a held-back release) → judged by their own mtime, as always
+  local d; d=$(ga29_eph_new localwins "{\"issues\":5,\"run_utc\":\"$(ga29_iso "$(date +%s)")\"}")
+  mkdir -p "$d/art/hq"; : > "$d/art/hq/backup.bin"; touch -t 202501010101 "$d/art/hq/backup.bin"
+  ga29_cycle "$d" DOLT_BACKUP_EPHEMERAL_DBS=hq STUB_FP_FILE="$d/fp.json"
+  if grep -qF 'hq backup is' "$d/mail.log"; then sc_ok "an ephemeral db that DOES still have local artifacts is judged by their mtime (S3 is only the fallback for 'no artifacts')"
+  else sc_bad "local artifacts were ignored in favour of S3: $(tr '\n' ' ' < "$d/mail.log" 2>/dev/null)"; fi
+}
+
+GA29_SCENARIOS="eph_fresh eph_stale eph_failed_recent eph_failed_old eph_failed_unknown eph_absent eph_unreadable eph_off eph_local_wins repro control blind_dblist blind_backup_cli blind_budget blind_conn_count blind_conn_limit blind_orphans snapshot commit_stale commit_fresh"
 for GA29_N in $GA29_SCENARIOS; do ( "sc_$GA29_N" > "$GA29_E2E/res.$GA29_N" 2>&1 ) & done
 wait
 for GA29_N in $GA29_SCENARIOS; do

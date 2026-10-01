@@ -31,6 +31,11 @@ set -uo pipefail
 
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 BACKUP_ROOT="${GC_BACKUP_ARTIFACT_DIR:-$CITY/.dolt-backup}"
+# ga-gqllbc: dbs whose local staging is ephemeral (default hq) are NOT expected to have a directory
+# here — see _status_report_ephemeral_absent below.
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$CITY/.gc/config/dolt-backup-ephemeral.env}"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-ephemeral-lib.sh"
 
 # _status_now_epoch — testable clock (same pattern as
 # dolt-restore-verify.sh's _now_epoch): a real call in normal use, but
@@ -165,6 +170,16 @@ _status_report_db() {
   return "$rc"
 }
 
+# _status_report_ephemeral_absent <db> — ga-gqllbc. A db with EPHEMERAL local staging that has no
+# directory here is the DESIGN, not a missing backup — so it must not be listed as "PRIMARY ausente"
+# and must not drive the exit code. It must not vanish from the report either (a reader would take a
+# db that is simply not mentioned for a db that is not backed up): one line says where its copy is.
+# This script makes no network call, so it does NOT claim the S3 copy is fresh or restorable —
+# dolt-backup-s3-proof.sh / _meta/latest.json / dolt-restore-verify.sh are the places that know.
+_status_report_ephemeral_absent() {
+  printf '%s: SEM staging local POR DESENHO (staging efemero, ga-gqllbc) — a copia vive em S3 (s3://urblink-dolt-backups/%s/); o job noturno reconstroi o staging, prova o S3 e o libera. Frescor/restauravel: _meta/latest.json e dolt-restore-verify.sh (este relatorio nao consulta a rede)\n' "$1" "$1"
+}
+
 # Library mode: `DOLT_BACKUP_STATUS_LIB=1 source dolt-backup-status.sh`
 # defines the functions above without running the report — used by
 # dolt-backup-status.selftest.sh.
@@ -183,6 +198,14 @@ for entry in "$BACKUP_ROOT"/*/; do
   esac
   found_any=1
   _status_report_db "$name" || overall_rc=1
+done
+
+# ga-gqllbc: an ephemeral db with no directory is reported, never silently absent and never an error.
+for eph_db in $(_eph_db_list); do
+  [ -e "$BACKUP_ROOT/$eph_db" ] && continue
+  case "$eph_db" in *.new|*.old) continue ;; esac
+  found_any=1
+  _status_report_ephemeral_absent "$eph_db"
 done
 
 if [ "$found_any" -eq 0 ]; then

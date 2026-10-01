@@ -150,6 +150,9 @@ DOLT_BACKUP_RESIDUE_RECLAIM_LIB=1 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pw
 # dolt-gc-maintenance.sh (ga-btnq6h). Executa-se a lib; não se reimplementa.
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
+# ga-gqllbc: dbs whose local staging is transient (hq) — there is nothing to re-seed for them.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-ephemeral-lib.sh"
 
 # ga-6xo4r0 / ga-tyaozh: aws-cli/botocore defaults to wrapping every S3
 # PutObject/UploadPart body in botocore.httpchecksum.AwsChunkedWrapper (a
@@ -174,6 +177,7 @@ DB="${1:-}"
 CITY="${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}"
 BACKUP_ROOT="${GC_BACKUP_ARTIFACT_DIR:-$CITY/.dolt-backup}"
 LOG="${RESEED_LOG:-$CITY/.gc/logs/dolt-backup-reseed.log}"
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$CITY/.gc/config/dolt-backup-ephemeral.env}"   # ga-gqllbc
 # ⚠️ MARGEM — a conta que eu ERREI na primeira versão (pego pelo gate, ga-kawer3).
 # Eu dimensionei para UMA cópia extra ("o novo enquanto o antigo existe") e o
 # mecanismo cria DUAS ao mesmo tempo. O pico real de consumo NOVO é:
@@ -1364,6 +1368,18 @@ fi
 if [ "$DB" = "--release-stale-new" ]; then
   _release_stale_new "${2:-}"
   exit $?
+fi
+
+# ga-gqllbc: an EPHEMERAL db (dolt-backup-ephemeral-lib.sh; default hq) keeps no permanent local
+# staging — dolt-s3-backup.sh builds it from scratch each night, proves S3 and frees it. A reseed
+# would only rebuild the very 9.5GB that mode removes (and peak at ~2x the live size doing it:
+# fresh backup + verification restore), so for such a db this is a successful no-op. Every caller
+# is covered by this one check — dolt-s3-backup.sh, dolt-compact-routine.sh's post-compaction
+# hook, dolt-disk-floor-guard.sh's ad hoc trigger. A human who really wants a local copy of an
+# ephemeral db sets RESEED_ALLOW_EPHEMERAL=1.
+if _eph_is_ephemeral "$DB" && [ "${RESEED_ALLOW_EPHEMERAL:-0}" != "1" ]; then
+  log "'$DB': staging EFÊMERO (ga-gqllbc) — nada a re-semear: o backup local é transitório (reconstruído do zero a cada noite e liberado depois da prova do S3). RESEED_ALLOW_EPHEMERAL=1 força um re-seed manual."
+  exit 0
 fi
 
 _run_reseed "$DB"

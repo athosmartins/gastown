@@ -1715,9 +1715,9 @@ unset BACKUP_FAIL_STREAK_DIR BACKUP_FAIL_ALARM_THRESHOLD BACKUP_FAIL_FAKE_MAIL F
 # failure exit + the success path + the final summary, not just declares it ──
 echo "── drift-guard: escalation wiring present in live script (ga-rt7ljo) ──"
 callsites="$(grep -cF '_backup_fail_note "$db"' "$SCRIPT")"
-[ "$callsites" -eq 7 ] \
-  && ok "exactly 7 occurrences of _backup_fail_note \"\$db\" (1 per failure exit: disco x2, sync x4 — incl. the ga-qcrpxj residue recovery failing —, s3 x1; every FAILED_DBS append site has a matching streak-note call)" \
-  || bad "expected exactly 7 occurrences of _backup_fail_note \"\$db\", got $callsites — a failure exit was added/removed without updating the streak wiring"
+[ "$callsites" -eq 8 ] \
+  && ok "exactly 8 occurrences of _backup_fail_note \"\$db\" (1 per failure exit: disco x2, sync x5 — incl. the ga-qcrpxj residue recovery failing and the ga-gqllbc ephemeral offline sync failing —, s3 x1; every FAILED_DBS append site has a matching streak-note call)" \
+  || bad "expected exactly 8 occurrences of _backup_fail_note \"\$db\", got $callsites — a failure exit was added/removed without updating the streak wiring"
 if grep -qF '_backup_fail_streak_note_success "$db"' "$SCRIPT"; then
   ok "success path resets the per-db streak (_backup_fail_streak_note_success called)"
 else
@@ -2297,7 +2297,8 @@ case "$sub" in
         src="$1"; dst="$2"
         case "$src" in
           s3://*) key="${src#s3://*/}"; [ -f "$FB/$key" ] || exit 1; cp "$FB/$key" "$dst"; exit 0 ;;
-          *)      key="${dst#s3://*/}"; mkdir -p "$FB/$(dirname "$key")"; cp "$src" "$FB/$key"; exit 0 ;;
+          *)      [ "${E2E_AWS_NOOP:-0}" = 1 ] && case "$dst" in */manifest) exit 0 ;; esac
+                  key="${dst#s3://*/}"; mkdir -p "$FB/$(dirname "$key")"; cp "$src" "$FB/$key"; exit 0 ;;
         esac ;;
       sync)
         dir="${1%/}"; dst="$2"; shift 2
@@ -2310,7 +2311,7 @@ case "$sub" in
           [ -f "$f" ] || continue; n="$(basename "$f")"
           skip=0; for e in $excl; do [ "$e" = "$n" ] && skip=1; done; [ $skip = 1 ] && continue
           if [ ! -f "$FB/$key/$n" ] || [ "$(wc -c < "$f")" != "$(wc -c < "$FB/$key/$n")" ]; then
-            if [ "$dry" = 1 ]; then echo "(dryrun) upload: $f to $dst$n"; else cp "$f" "$FB/$key/$n"; fi
+            if [ "$dry" = 1 ]; then echo "(dryrun) upload: $f to $dst$n"; elif [ "${E2E_AWS_NOOP:-0}" != 1 ]; then cp "$f" "$FB/$key/$n"; fi
           fi
         done
         exit 0 ;;
@@ -2348,6 +2349,7 @@ e2e_case() {
   env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     DOLT_S3_BACKUP_CITY="$E/city" DOLT_S3_BACKUP_NOTIFY="$E/bin/notify" BACKUP_FAIL_FAKE_MAIL="$E/bin/fake_mail" \
     RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" \
+    DOLT_BACKUP_EPHEMERAL_DBS="${E2E_EPH_DBS-}" \
     E2E_STAGING="$E/city/.dolt-backup/hq" E2E_STATE="$E/state" E2E_CALLS="$E/dolt.calls" \
     E2E_NOTIFY_CALLS="$E/notify.calls" E2E_SYNC_MODE="$mode" \
     timeout 120 /bin/bash "$SCRIPT" > "$E/run.out" 2>&1
@@ -2605,7 +2607,10 @@ for a in "$@"; do [ "$prev" = "-q" ] && q="$a"; prev="$a"; done
 echo "dolt: $args" >> "$E29_CALLS"
 case "$args" in
   *"backup sync-url"*)
+    [ "${E29_SYNC_URL_FAIL:-0}" = 1 ] && { echo "sync-url exploded (stub)"; exit 1; }
     dest=""; for a in "$@"; do case "$a" in file://*) dest="${a#file://}" ;; esac; done
+    # E29_SYNC_URL_STALE=1: a staging that already holds a manifest is the ga-b5h83 stale-manifest case
+    [ "${E29_SYNC_URL_STALE:-0}" = 1 ] && [ -e "$dest/manifest" ] && { echo "error: table file not found: $dest/$(printf '%032d' 7)"; exit 1; }
     mkdir -p "$dest" && cp -R "$E29_STATE/fresh_backup/." "$dest/"; exit 0 ;;
   *"SELECT @@port"*) printf '@@port\n43999\n'; exit 0 ;;
 esac
@@ -2647,6 +2652,7 @@ e2e29_case() {
   env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
     DOLT_S3_BACKUP_CITY="$E/city" DOLT_S3_BACKUP_NOTIFY="$E/bin/notify" BACKUP_FAIL_FAKE_MAIL="$E/bin/fake_mail" \
     RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" OFFLINE_SYNC_TMP_ROOT="$E/tmp" \
+    DOLT_BACKUP_EPHEMERAL_DBS="" \
     E2E_NOTIFY_CALLS="$E/notify.calls" E2E_CALLS="$E/gc.calls" \
     E29_LIVE_KB=9265152 E29_RESIDUE_KB=6384952 E29_FREE_KB="$free_kb" E29_RECLAIM="$reclaim" \
     E29_STAGING="$st" E29_STATE="$E/state" E29_CALLS="$E/dolt.calls" \
@@ -2717,6 +2723,156 @@ if [ "$E2E_RC" -eq 0 ] && [ "$(e29_count 'hq: sync preflight REFUSED' "$E2E_LOG"
    && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" && ! grep -qF 'hq: OK' "$E2E_LOG"; then
   ok "e2e R5: the credit is a hypothesis, not trusted — the post-delete gate re-measured (still 9600MB), REFUSED, and NOTHING was written; alert hq(sync)"
 else bad "e2e R5: the sync ran (or was hidden) although the disk never freed (rc=$E2E_RC): $(grep 'hq:' "$E2E_LOG" | tail -5 | tr '\n' '|')"; fi
+
+# ═══ ga-gqllbc: EPHEMERAL STAGING (hq) — the staging is built, proven in S3, then released ═══════
+# MEASURED 2026-10-01: .dolt-backup/hq = 9.5GB, free 7.4GB, the nightly's gate wanted 14.4GB and
+# refused on 09-22..25 and 09-28..10-01 — for the space the staging itself held. Real subprocess,
+# stubbed dolt/df/aws/ps, the real city and the real process list NEVER touched.
+echo "── end-to-end: ephemeral staging (ga-gqllbc) — real subprocess, stubbed dolt/df/aws/ps ──"
+# e2eE_case <name> <staging: none|closed|residue> <free_kb>   (knobs: E2EE_PS_OUT, E2EE_SYNC_FAIL, E2EE_AWS_NOOP, E2EE_EPH_DBS)
+e2eE_case() {
+  local name="$1" kind="$2" free_kb="$3" E i st
+  E="$E2E_ROOT/$name"; E2E_DIR="$E"
+  if ! grep -qF 'CITY="${DOLT_S3_BACKUP_CITY:-' "$SCRIPT" || ! grep -qF 'NOTIFY="${DOLT_S3_BACKUP_NOTIFY:-' "$SCRIPT"; then
+    mkdir -p "$E"; E2E_LOG="$E/never-ran.log"; E2E_RC=99
+    bad "e2eE $name: the script under test has no DOLT_S3_BACKUP_CITY/NOTIFY override — running it would touch the REAL city; NOT run"
+    return 0
+  fi
+  mkdir -p "$E/state" "$E/tmp" "$E/home" "$E/city/.gc/logs" "$E/city/.gc/runtime/packs/dolt" "$E/city/.beads/dolt/hq" "$E/bucket"
+  e2e29_write_stubs "$E/bin"
+  printf '#!/bin/bash\nprintf "%%s\\n" "${E2EE_PS_OUT-bash /x/scripts/dolt-s3-backup.sh}"\n' > "$E/bin/ps"; chmod +x "$E/bin/ps"
+  printf 'listener:\n  port: 43210\ndata_dir: "%s"\n' "$E/city/.beads/dolt" > "$E/city/.gc/runtime/packs/dolt/dolt-config.yaml"
+  echo live > "$E/city/.beads/dolt/hq/blob"
+  st="$E/city/.dolt-backup/hq"; mkdir -p "$E/city/.dolt-backup"
+  case "$kind" in
+    closed)  e2e_mkbackup "$st" 3 ;;                                    # a valid staging from an earlier night
+    residue) mkdir -p "$st"; for i in 1 2; do printf 'partial%s' "$i" > "$st/$(e2e_tid "$i").darc"; done
+             touch -t 202609281800 "$st"/* "$st" ;;                     # manifest-less, quiet for 30+ min
+  esac
+  e2e_mkbackup "$E/bucket/hq" 2                                          # S3: the older closed copy
+  e2e_mkbackup "$E/state/fresh_backup" 4                                 # what the offline sync-url writes
+  E2E_LOG="$E/city/.gc/logs/dolt-s3-backup.log"
+  env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOLT_S3_BACKUP_CITY="$E/city" DOLT_S3_BACKUP_NOTIFY="$E/bin/notify" BACKUP_FAIL_FAKE_MAIL="$E/bin/fake_mail" \
+    RESEED_AFTER_UPLOAD=0 FB="$E/bucket" CALLS="$E/aws.calls" OFFLINE_SYNC_TMP_ROOT="$E/tmp" \
+    DOLT_BACKUP_EPHEMERAL_DBS="${E2EE_EPH_DBS-hq}" E2EE_PS_OUT="${E2EE_PS_OUT-bash /x/scripts/dolt-s3-backup.sh}" \
+    E2E_AWS_NOOP="${E2EE_AWS_NOOP:-0}" E29_SYNC_URL_FAIL="${E2EE_SYNC_FAIL:-0}" E29_SYNC_URL_STALE="${E2EE_SYNC_STALE:-0}" \
+    E2E_NOTIFY_CALLS="$E/notify.calls" E2E_CALLS="$E/gc.calls" \
+    E29_LIVE_KB=9265152 E29_RESIDUE_KB=6384952 E29_FREE_KB="$free_kb" E29_RECLAIM=no \
+    E29_STAGING="$st" E29_STATE="$E/state" E29_CALLS="$E/dolt.calls" \
+    timeout 120 /bin/bash "$SCRIPT" > "$E/run.out" 2>&1
+  E2E_RC=$?
+  : >> "$E/notify.calls"; : >> "$E/aws.calls"; : >> "$E/dolt.calls"
+}
+e2eE_s3_closed_fresh() { # S3 holds the fresh 4-table backup, manifest included
+  local i; e2e_same "$E2E_DIR/bucket/hq/manifest" "$E2E_DIR/state/fresh_backup/manifest" || return 1
+  for i in 1 2 3 4; do [ -f "$E2E_DIR/bucket/hq/$(e2e_tid "$i").darc" ] || return 1; done
+}
+
+# ── EA: the steady state — NO staging, enough room → built offline, uploaded, proven, RELEASED ──
+e2eE_case ea-steady none 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'ephemeral staging mode: on(hq)' "$E2E_LOG" && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && e2eE_s3_closed_fresh; then
+  ok "e2e EA: no staging + room → the night SUCCEEDS from scratch and S3 holds the fresh closed backup"
+else bad "e2e EA: steady-state night failed (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|')"; fi
+[ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && grep -qF 'ephemeral staging: released' "$E2E_LOG" \
+  && ok "e2e EA: …and the local staging is GONE afterwards (that is the whole point: +9.5GB for the rest of the day)" \
+  || bad "e2e EA: the staging is still there: $(ls "$E2E_DIR/city/.dolt-backup" 2>&1 | tr '\n' ' ')"
+[ "$(e29_count "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" = 0 ] && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 1 ] \
+  && ok "e2e EA: the SERVER was never asked to sync (an emptied staging + the server's cached view is the ga-yct7r1 failure) — one offline sync-url" \
+  || bad "e2e EA: wrong dolt calls: $(grep -E 'sync' "$E2E_DIR/dolt.calls" | tr '\n' '|')"
+[ ! -s "$E2E_DIR/notify.calls" ] && ok "e2e EA: silent on success (no alert)" || bad "e2e EA: an alert fired: $(cat "$E2E_DIR/notify.calls")"
+[ ! -e "$E2E_DIR/city/.gc/logs/.dolt-eph-unreleased/hq" ] && ok "e2e EA: the not-released streak is clear" || bad "e2e EA: a streak file exists after a release"
+grep -q -- '--delete' "$E2E_DIR/aws.calls" && grep -c -- '--delete' "$E2E_DIR/aws.calls" | grep -qx 1 \
+  && ok "e2e EA: exactly one aws call used --delete — the nightly's own sync; the release proof added none" \
+  || bad "e2e EA: --delete count is not 1: $(grep -c -- '--delete' "$E2E_DIR/aws.calls")"
+
+# ── EB: first night after the change — a VALID staging exists and room is enough → incremental, then released ──
+e2eE_case eb-first-night closed 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && e2eE_s3_closed_fresh && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ]; then
+  ok "e2e EB: an existing valid staging is synced into, uploaded, proven and released"
+else bad "e2e EB: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|')"; fi
+
+# ── EC: the measured refusal (7.4GB free < 14.4GB) with the staging present → S3 proven → staging RELEASED anyway ──
+e2eE_case ec-refused-releases closed 7577600
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: sync preflight REFUSED' "$E2E_LOG" && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] \
+   && grep -qF 'ephemeral staging: released' "$E2E_LOG" && grep -q 'hq(disco)' "$E2E_DIR/notify.calls"; then
+  ok "e2e EC: refused for disk, S3 proven restorable → the staging is released ANYWAY (tonight's backup still failed and says so: hq(disco))"
+else bad "e2e EC: (rc=$E2E_RC, staging kept=$([ -e "$E2E_DIR/city/.dolt-backup/hq" ] && echo yes || echo no)): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+[ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 0 ] && [ "$(e29_count "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" = 0 ] \
+  && ok "e2e EC: nothing was synced while the disk gate refused" || bad "e2e EC: a sync ran under a refusing gate"
+
+# ── ED: refused, and there is NO staging (second night at low disk) → nothing to release, S3's own state reported ──
+e2eE_case ed-refused-nothing-to-release none 7577600
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: sync preflight REFUSED' "$E2E_LOG" && grep -q 'hq(disco)' "$E2E_DIR/notify.calls" \
+   && grep -qF 'no local staging' "$E2E_LOG" && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ]; then
+  ok "e2e ED: refused with no staging → S3's own closure is read and the alert stays hq(disco); nothing to delete, nothing created"
+else bad "e2e ED: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -5 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ── EE: S3 does NOT prove out right after the upload (the upload silently did nothing) → staging KEPT + alarm ──
+E2EE_AWS_NOOP=1 e2eE_case ee-s3-not-proven none 20971520
+if [ -d "$E2E_DIR/city/.dolt-backup/hq" ] && e2e_same "$E2E_DIR/city/.dolt-backup/hq/manifest" "$E2E_DIR/state/fresh_backup/manifest" \
+   && grep -qF 'ephemeral staging NOT released — S3 is not proven' "$E2E_LOG" && grep -q 'NÃO provou cópia idêntica' "$E2E_DIR/notify.calls"; then
+  ok "e2e EE: S3 not proven after the upload → the staging is KEPT (the only complete local copy) and the alarm says so — nothing deleted on a guess"
+else bad "e2e EE: (rc=$E2E_RC, staging=$([ -d "$E2E_DIR/city/.dolt-backup/hq" ] && echo kept || echo GONE)): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ── EF: a backup writer is running (mol-dog-backup, old code) → not released, quiet, counted; ALARM on the 3rd night ──
+E2EE_PS_OUT='bash /x/packs/town-deltas/assets/scripts/mol-dog-backup.sh' e2eE_case ef-writer-active none 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && [ -d "$E2E_DIR/city/.dolt-backup/hq" ] \
+   && grep -qF 'not releasing — a backup writer is running' "$E2E_LOG" && grep -qF '1/3 noites seguidas' "$E2E_LOG" \
+   && [ ! -s "$E2E_DIR/notify.calls" ] && [ "$(cat "$E2E_DIR/city/.gc/logs/.dolt-eph-unreleased/hq" 2>/dev/null)" = 1 ]; then
+  ok "e2e EF: a running writer → backup still OK, staging kept, streak 1/3, NO alert (benign and retried)"
+else bad "e2e EF: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+EF_DIR="$E2E_DIR"
+# two more nights with the same condition: the streak lives in the city's state dir — rerun in the SAME city
+for _n in 2 3; do
+  env -i HOME="$EF_DIR/home" TMPDIR="$EF_DIR/tmp" PATH="$EF_DIR/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    DOLT_S3_BACKUP_CITY="$EF_DIR/city" DOLT_S3_BACKUP_NOTIFY="$EF_DIR/bin/notify" BACKUP_FAIL_FAKE_MAIL="$EF_DIR/bin/fake_mail" \
+    RESEED_AFTER_UPLOAD=0 FB="$EF_DIR/bucket" CALLS="$EF_DIR/aws.calls" OFFLINE_SYNC_TMP_ROOT="$EF_DIR/tmp" \
+    DOLT_BACKUP_EPHEMERAL_DBS=hq E2EE_PS_OUT='bash /x/packs/town-deltas/assets/scripts/mol-dog-backup.sh' \
+    E2E_NOTIFY_CALLS="$EF_DIR/notify.calls" E2E_CALLS="$EF_DIR/gc.calls" \
+    E29_LIVE_KB=9265152 E29_RESIDUE_KB=6384952 E29_FREE_KB=20971520 E29_RECLAIM=no \
+    E29_STAGING="$EF_DIR/city/.dolt-backup/hq" E29_STATE="$EF_DIR/state" E29_CALLS="$EF_DIR/dolt.calls" \
+    timeout 120 /bin/bash "$SCRIPT" > "$EF_DIR/run$_n.out" 2>&1
+done
+if grep -qF 'não foi liberado por 3 noites seguidas' "$EF_DIR/notify.calls" && [ ! -e "$EF_DIR/city/.gc/logs/.dolt-eph-unreleased/hq" ]; then
+  ok "e2e EF: the 3rd night in a row without a release ALARMS (one alert per streak) and the counter resets"
+else bad "e2e EF: no streak alarm after 3 nights: $(cat "$EF_DIR/notify.calls") | $(cat "$EF_DIR/city/.gc/logs/.dolt-eph-unreleased/hq" 2>&1)"; fi
+
+# ── EG: a manifest-less residue (an aborted earlier attempt) + room → reinitialised, rebuilt, uploaded, released ──
+e2eE_case eg-residue residue 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'ephemeral staging holds a manifest-less residue — auto-reinit' "$E2E_LOG" \
+   && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && e2eE_s3_closed_fresh && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ]; then
+  ok "e2e EG: a manifest-less residue goes through the existing stale-manifest recovery, then the normal ephemeral path (rebuilt, uploaded, released)"
+else bad "e2e EG: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|')"; fi
+
+# ── EH: the offline sync itself fails → a FAILED night (hq(sync)), no release attempted, nothing uploaded over S3 ──
+E2EE_SYNC_FAIL=1 e2eE_case eh-sync-fails none 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" && ! grep -qF 'hq: OK' "$E2E_LOG" \
+   && ! grep -qF 'ephemeral staging: released' "$E2E_LOG" && [ "$(ls "$E2E_DIR/bucket/hq" | wc -l | tr -d ' ')" = 3 ]; then
+  ok "e2e EH: offline sync failed → hq(sync) alert, no 'OK', nothing released, S3 keeps its older copy untouched"
+else bad "e2e EH: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ── EI: kill switch — an EMPTY list restores the old flow byte-for-byte in behaviour (server sync, reseed path, nothing released) ──
+E2EE_EPH_DBS="" e2eE_case ei-off closed 20971520
+if grep -qF 'ephemeral staging mode: off' "$E2E_LOG" && [ -d "$E2E_DIR/city/.dolt-backup/hq" ] \
+   && [ "$(e29_count "DOLT_BACKUP('sync'" "$E2E_DIR/dolt.calls")" -ge 1 ] && ! grep -qF 'ephemeral staging: ' "$E2E_LOG"; then
+  ok "e2e EI: mode off → the staging is kept and the server-mediated sync is the path (the legacy flow, untouched)"
+else bad "e2e EI: kill switch did not restore the legacy flow (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|')"; fi
+
+# ── EJ: a RETAINED staging hits the stale-manifest failure (ga-b5h83) → wiped, rebuilt, uploaded, released (self-healing kept) ──
+E2EE_SYNC_STALE=1 e2eE_case ej-stale-manifest closed 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -qF 'ephemeral staging: the offline sync hit a stale manifest — auto-reinit' "$E2E_LOG" \
+   && grep -qF 'hq: OK (issues=5' "$E2E_LOG" && e2eE_s3_closed_fresh && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] \
+   && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 2 ]; then
+  ok "e2e EJ: a retained staging whose offline sync fails with 'table file not found' is wiped and rebuilt (2 sync-url calls), uploaded and released — the legacy self-healing survives"
+else bad "e2e EJ: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -8 | tr '\n' '|')"; fi
+
+# ── EK: the offline sync fails for a reason that is NOT a stale manifest → no wipe of a retained staging ──
+E2EE_SYNC_FAIL=1 e2eE_case ek-sync-fails-keeps closed 20971520
+if [ "$E2E_RC" -eq 0 ] && grep -q 'hq(sync)' "$E2E_DIR/notify.calls" && [ -f "$E2E_DIR/city/.dolt-backup/hq/manifest" ] \
+   && ! grep -qF 'auto-reinit' "$E2E_LOG" && [ "$(e29_count 'backup sync-url' "$E2E_DIR/dolt.calls")" = 1 ]; then
+  ok "e2e EK: a plain sync failure is a FAILED night (hq(sync)) and the retained staging is NOT wiped (only a stale manifest justifies that)"
+else bad "e2e EK: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -6 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

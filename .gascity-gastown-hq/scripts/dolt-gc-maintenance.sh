@@ -170,7 +170,11 @@ BACKUP_STAGING="${BACKUP_STAGING:-$CITY/.dolt-backup}"
 # at 7.7 GB — while free space peaks near 14 GB and swings 3–14 GB. The one large,
 # REDUNDANT block on that disk is hq's local backup staging (.dolt-backup/hq, ~8.8 GB):
 # S3 mirrors it, and a separate 6-hourly job (mol-dog-backup) rebuilds it by incremental
-# sync. MEASURED 2026-09-25: 53 consecutive headroom skips (~106 h); hq grew 3.9 → 7.7 GB
+# sync. (ga-gqllbc: that is the design BEFORE hq's staging became ephemeral — see
+# dolt-backup-ephemeral-lib.sh. With the default config the nightly dolt-s3-backup.sh builds the
+# staging only for the length of one run and releases it itself after the same S3 proof, and
+# mol-dog-backup skips hq; this lever then usually finds nothing to release, and it still
+# works as written for any db that keeps a permanent staging, or when the mode is switched off.) MEASURED 2026-09-25: 53 consecutive headroom skips (~106 h); hq grew 3.9 → 7.7 GB
 # since the last real GC (08-20), which raises the bar each cycle — a vicious circle no
 # amount of waiting resolves. So, when the skip is CHRONIC and S3 is PROVEN to hold an
 # identical, restorable copy, free the staging for the GC window (see
@@ -608,7 +612,8 @@ repeat until the streak clears (an attempted dolt_gc) and later re-crosses the t
 # "The manifest object exists" is NOT that proof — on 2026-09-25 hq's S3 manifest existed and
 # named a table the bucket lacked (see dolt-backup-s3-proof.sh).
 #
-# AFTER: mol-dog-backup (6-hourly order) rebuilds the staging by incremental sync, and the
+# AFTER: mol-dog-backup (6-hourly order) rebuilds the staging by incremental sync — unless the db is
+# an ephemeral-staging db (default hq, ga-gqllbc), which mol-dog-backup leaves to the nightly — and the
 # nightly job mirrors it; both work on a missing dir (dolt-s3-backup.sh already wipes and
 # rebuilds it on a stale manifest). Meanwhile S3 + the live store hold the data, and the
 # staging comes back SMALLER once the GC has shrunk hq.
@@ -757,14 +762,14 @@ _gc_maybe_release_staging() {
   log "staging-release: S3 proven identical + restorable — RELEASING local staging $target (${staging_mb}MB) so dolt_gc can run"
   rm -rf -- "$target"
   if [ -e "$target" ]; then
-    log "staging-release: rm of $target did not complete — staging left partially removed; S3 holds the full copy (mol-dog-backup will rebuild it)"
+    log "staging-release: rm of $target did not complete — staging left partially removed; S3 holds the full copy (the next backup run rebuilds it)"
     return 1
   fi
   mkdir -p "$(dirname "$GC_RELEASE_STATE")" 2>/dev/null || true
   printf '%s\n' "$now" > "$GC_RELEASE_STATE" 2>/dev/null || log "staging-release: WARN could not write the cooldown state $GC_RELEASE_STATE"
-  log "staging-release: released ${staging_mb}MB — hq staging is gone until mol-dog-backup rebuilds it (≤6h); S3 has the proven copy"
-  _dolt_gc_notify "Dolt GC" 3 "hq: staging local (${staging_mb}MB) liberado p/ o dolt_gc — S3 provado idêntico+restaurável; mol-dog-backup recria em ≤6h"
-  _dolt_gc_mail_mayor "Dolt GC: staging local do hq liberado para o dolt_gc" "dolt-gc-maintenance (ga-btnq6h): o dolt_gc do hq estava pulando por falta de espaço há ${streak} ciclos seguidos (size=${size_mb:-?}MB avail=${avail_mb:-?}MB required=${required_mb:-?}MB). Liberei o staging LOCAL .dolt-backup/${DB} (${staging_mb}MB) para abrir espaço, SOMENTE após provar que o S3 tem uma cópia idêntica e restaurável (fecho do manifest + nada a subir). O mol-dog-backup (a cada 6h) recria o staging; o dolt_gc tenta rodar neste mesmo ciclo, mas só se o MESMO portão de espaço passar na re-medição logo após a liberação (o portão não é afrouxado; se ainda faltar, o ciclo pula e o log diz). Cooldown de ${GC_RELEASE_COOLDOWN_H}h. Kill switch: GC_RELEASE_STAGING_ENABLED=0."
+  log "staging-release: released ${staging_mb}MB — hq staging is gone until the next backup run rebuilds it (the nightly; mol-dog-backup ≤6h only while ephemeral-staging mode is off); S3 has the proven copy"
+  _dolt_gc_notify "Dolt GC" 3 "hq: staging local (${staging_mb}MB) liberado p/ o dolt_gc — S3 provado idêntico+restaurável; o próximo backup recria (o noturno; o mol-dog-backup em ≤6h só com o modo de staging efêmero desligado)"
+  _dolt_gc_mail_mayor "Dolt GC: staging local do hq liberado para o dolt_gc" "dolt-gc-maintenance (ga-btnq6h): o dolt_gc do hq estava pulando por falta de espaço há ${streak} ciclos seguidos (size=${size_mb:-?}MB avail=${avail_mb:-?}MB required=${required_mb:-?}MB). Liberei o staging LOCAL .dolt-backup/${DB} (${staging_mb}MB) para abrir espaço, SOMENTE após provar que o S3 tem uma cópia idêntica e restaurável (fecho do manifest + nada a subir). O próximo backup recria o staging (o noturno dolt-s3-backup.sh; o mol-dog-backup, a cada 6h, só quando o modo de staging efêmero — ga-gqllbc — está desligado); o dolt_gc tenta rodar neste mesmo ciclo, mas só se o MESMO portão de espaço passar na re-medição logo após a liberação (o portão não é afrouxado; se ainda faltar, o ciclo pula e o log diz). Cooldown de ${GC_RELEASE_COOLDOWN_H}h. Kill switch: GC_RELEASE_STAGING_ENABLED=0."
   return 0
 }
 

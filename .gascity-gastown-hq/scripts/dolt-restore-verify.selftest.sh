@@ -17,6 +17,11 @@ trap cleanup EXIT
 
 export RESTORE_VERIFY_LIB=1
 export RESTORE_VERIFY_LOG="$SCRATCH/restore-verify.log"
+# ga-gqllbc: hq is an EPHEMERAL-staging db by default (no local backup by design). The legacy cases
+# below use "hq" as their example of a db whose local backup is missing / present, so they run with the
+# mode OFF; the section at the end turns it on per call. No conf file of the real city is ever read.
+export DOLT_BACKUP_EPHEMERAL_DBS=""
+export DOLT_BACKUP_EPHEMERAL_CONF="$SCRATCH/no-such-eph.env"
 # shellcheck disable=SC1090
 . "$SCRIPT"
 
@@ -549,6 +554,116 @@ mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/hq" "$BACKUP_R
 FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
 RC=$?
 [ "$RC" -eq 0 ] && grep -q "hq=OK" "$SCRATCH/fake-bd.log" && grep -q "alpha=OK" "$SCRATCH/fake-bd.log" && grep -q "BD-CALLED.*close" "$SCRATCH/fake-bd.log" && ok "live+backup for every db -> rc 0, both listed, closed chore" || bad "expected a clean run, got rc=$RC: $(cat "$SCRATCH/fake-bd.log")"
+
+# ═══ ga-gqllbc: a db with EPHEMERAL local staging (hq) has no local backup by design → S3 is checked ═══
+echo "── _verify_one_db: ephemeral-staging db → S3-OK / SKIP / FAIL from S3's own state, never NO-BACKUP (ga-gqllbc) ──"
+FB="$SCRATCH/bucket"; export FB
+FAKE_AWS="$SCRATCH/fake-aws.sh"
+cat > "$FAKE_AWS" <<'EOF'
+#!/bin/bash
+echo "aws $*" >> "${FAKE_AWS_LOG:-/dev/null}"
+sub="$1"; shift
+case "$sub" in
+  s3api)
+    prefix=""; while [ $# -gt 0 ]; do [ "$1" = "--prefix" ] && prefix="$2"; shift; done
+    d="$FB/${prefix%/}"
+    if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then echo "None"; exit 0; fi
+    out=""; for f in "$d"/*; do out="${out:+$out	}${prefix}$(basename "$f")"; done
+    echo "$out"; exit 0 ;;
+  s3)
+    op="$1"; shift
+    [ "$op" = cp ] || exit 99
+    case "$1" in s3://*) key="${1#s3://*/}"; [ -f "$FB/$key" ] || exit 1; cp "$FB/$key" "$2"; exit 0 ;; esac
+    exit 99 ;;
+esac
+exit 99
+EOF
+chmod +x "$FAKE_AWS"
+AWS="$FAKE_AWS"; BUCKET="testbucket"; S3PROOF_TIMEOUT=20
+_E_LOCKH="0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; _E_ROOTH="0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; _E_GCG="00000000000000000000000000000000"
+e_tid() { printf '%032d' "$1"; }
+e_s3_backup() { # <db> <n_tables> — a CLOSED backup under the fake bucket
+  local d="$FB/$1" n="$2" i s="5:__DOLT__:$_E_LOCKH:$_E_ROOTH:$_E_GCG"
+  mkdir -p "$d"; for i in $(seq 1 "$n"); do s="$s:$(e_tid "$i"):$((i*7))"; printf 'tbl%s' "$i" > "$d/$(e_tid "$i").darc"; done
+  printf '%s' "$s" > "$d/manifest"
+}
+e_iso() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+e_fp() { # <hq entry json> — writes S3's run fingerprint
+  mkdir -p "$FB/_meta"; printf '{"run_utc":"%s","databases":{"hq":%s}}' "$(e_iso "$(date +%s)")" "$1" > "$FB/_meta/latest.json"
+}
+e_reset() { _reset_fixture; rm -rf "$BACKUP_ROOT/hq" "$FB"; mkdir -p "$FB"; : > "$SCRATCH/fake-dolt.log"; : > "$SCRATCH/fake-gc.log"; }
+NOW="$(date +%s)"
+e_run() { DOLT_BACKUP_EPHEMERAL_DBS="${E_DBS-hq}" FAKE_DOLT_LOG="$SCRATCH/fake-dolt.log" FAKE_GC_LOG="$SCRATCH/fake-gc.log" _verify_one_db "$@"; }
+
+e_reset; e_s3_backup hq 4; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso $((NOW - 7200)))\"}"
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=S3-OK(fecho-do-manifest,backup-com-2h)" ] && [ "$RC" -eq 0 ] && ok "no local backup + closed S3 manifest + a 2h-old fingerprint → hq=S3-OK(…), rc 0" || bad "expected hq=S3-OK(fecho-do-manifest,backup-com-2h) rc 0, got '$OUT' rc=$RC"
+[ ! -s "$SCRATCH/fake-dolt.log" ] && [ ! -s "$SCRATCH/fake-gc.log" ] && ok "…without a restore and without a live query (it is not, and does not claim to be, a restore)" || bad "an S3-only check called dolt/gc: $(cat "$SCRATCH/fake-dolt.log" "$SCRATCH/fake-gc.log")"
+case "$OUT" in "hq=OK("*) bad "the S3-only check reported itself as OK(n)" ;; *) ok "…and its result word is S3-OK, never OK( — main() must not count it as a verified restore" ;; esac
+
+e_reset; e_s3_backup hq 4; rm -f "$FB/hq/$(e_tid 3).darc"; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso $((NOW - 7200)))\"}"
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=FAIL(s3-nao-restauravel)" ] && [ "$RC" -eq 1 ] && ok "S3's manifest names a table the bucket lacks (the hq 2026-09-25 shape) → FAIL(s3-nao-restauravel), rc 1" || bad "unrestorable S3 copy not failed: '$OUT' rc=$RC"
+
+e_reset; e_s3_backup hq 4   # no _meta/latest.json at all
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=SKIP(s3-fingerprint-ilegivel)" ] && [ "$RC" -eq 0 ] && ok "S3's fingerprint cannot be read → SKIP (could not look), rc 0 — an unreachable S3 is not a broken backup" || bad "unreadable fingerprint: '$OUT' rc=$RC"
+
+e_reset; e_s3_backup hq 4; mkdir -p "$FB/_meta"; printf '{"run_utc":"%s","databases":{"lexbh":{"issues":1}}}' "$(e_iso "$NOW")" > "$FB/_meta/latest.json"
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=FAIL(s3-sem-entrada-no-fingerprint)" ] && [ "$RC" -eq 1 ] && ok "the fingerprint has no entry for hq → FAIL (a real absence is reported)" || bad "absent entry: '$OUT' rc=$RC"
+
+e_reset; e_s3_backup hq 4; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso $((NOW - 180000)))\"}"
+OUT="$(e_run hq)"; RC=$?
+case "$OUT" in "hq=FAIL(defasado:50h>36h)") [ "$RC" -eq 1 ] && ok "a 50h-old S3 backup (limit 36h) → FAIL(defasado:50h>36h): the backup job is not keeping up" || bad "stale: rc=$RC" ;; *) bad "stale S3 backup: '$OUT' rc=$RC" ;; esac
+
+e_reset; e_s3_backup hq 4; e_fp "{\"status\":\"failed\",\"reason\":\"disco\",\"last_ok_run_utc\":\"$(e_iso $((NOW - 36000)))\",\"last_ok\":{\"issues\":9}}"
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=S3-OK(fecho-do-manifest,backup-com-10h,ultima-noite-falhou)" ] && [ "$RC" -eq 0 ] && ok "last night failed but the last good backup is 10h old and S3 closes → S3-OK, with 'ultima-noite-falhou' in the word (not hidden)" || bad "failed-recent: '$OUT' rc=$RC"
+
+e_reset; e_s3_backup hq 4; e_fp '{"status":"failed","reason":"disco","last_ok_run_utc":null,"last_ok":null}'
+OUT="$(e_run hq)"; RC=$?
+[ "$OUT" = "hq=FAIL(s3-ultima-noite-falhou-sem-ultima-boa)" ] && [ "$RC" -eq 1 ] && ok "failed last night and no recorded last-good time → FAIL (freshness cannot be proven)" || bad "failed-unknown: '$OUT' rc=$RC"
+
+# the kill switch and the other dbs keep the legacy behaviour
+e_reset; e_s3_backup hq 4; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso "$NOW")\"}"
+OUT="$(E_DBS="" e_run hq)"; RC=$?
+[ "$OUT" = "hq=NO-BACKUP(sem-backup-local)" ] && [ "$RC" -eq 3 ] && ok "mode off (empty list) → NO-BACKUP(sem-backup-local), rc 3, exactly as before (S3 is not even asked)" || bad "kill switch: '$OUT' rc=$RC"
+e_reset; mkdir -p "$DOLTDIR/lexbh"; e_s3_backup lexbh 3
+OUT="$(E_DBS=hq e_run lexbh)"; RC=$?
+[ "$OUT" = "lexbh=NO-BACKUP(sem-backup-local)" ] && [ "$RC" -eq 3 ] && ok "a db that is NOT on the list keeps the NO-BACKUP verdict even if S3 happens to hold a copy" || bad "non-ephemeral db: '$OUT' rc=$RC"
+e_reset; mkdir -p "$BACKUP_ROOT/hq"
+OUT="$(FAKE_GC_SQL_OUTPUT='| 500' FAKE_DOLT_SQL_OUTPUT='| 500' e_run hq)"; RC=$?
+[ "$OUT" = "hq=OK(500)" ] && [ "$RC" -eq 0 ] && ok "an ephemeral db that DOES have a local backup dir (first night / a held-back release) is restored and verified as always" || bad "local copy of an ephemeral db: '$OUT' rc=$RC"
+
+echo "── main: ephemeral hq alongside a really-verified db → clean run; hq is listed as S3-OK ──"
+rm -rf "$SCRATCH/city12" "$FB"; mkdir -p "$FB"
+DOLTDIR="$SCRATCH/city12/doltdir"; BACKUP_ROOT="$SCRATCH/city12/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/alpha"
+e_s3_backup hq 4; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso $((NOW - 7200)))\"}"
+: > "$SCRATCH/fake-bd.log"; : > "$RESTORE_VERIFY_LOG"
+DOLT_BACKUP_EPHEMERAL_DBS=hq FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+if [ "$RC" -eq 0 ] && grep -q 'alpha=OK' "$SCRATCH/fake-bd.log" && grep -q 'hq=S3-OK(' "$SCRATCH/fake-bd.log" && grep -q 'BD-CALLED.*close' "$SCRATCH/fake-bd.log"; then
+  ok "rc 0, closed chore, alpha=OK(real restore) and hq=S3-OK(…) side by side — the weaker check is visible in the summary"
+else bad "expected a clean run listing both (rc=$RC): $(cat "$SCRATCH/fake-bd.log")"; fi
+
+echo "── main: ephemeral hq ALONE is S3-OK → nothing was RESTORED → rc 2, not a clean 'restore OK' (a documented consequence) ──"
+rm -rf "$SCRATCH/city13"; DOLTDIR="$SCRATCH/city13/doltdir"; BACKUP_ROOT="$SCRATCH/city13/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$BACKUP_ROOT"
+: > "$SCRATCH/fake-bd.log"
+DOLT_BACKUP_EPHEMERAL_DBS=hq FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 2 ] && grep -q 'hq=S3-OK(' "$SCRATCH/fake-bd.log" && ok "only an S3-only check ran → rc 2 (SEM VERIFICACAO), never filed as a clean restore-verify" || bad "S3-OK alone was counted as a verified restore (rc=$RC): $(cat "$SCRATCH/fake-bd.log")"
+
+echo "── main: ephemeral hq whose S3 copy does not close → the WHOLE run fails (rc 1, open bug) ──"
+rm -rf "$SCRATCH/city14" "$FB"; mkdir -p "$FB"; DOLTDIR="$SCRATCH/city14/doltdir"; BACKUP_ROOT="$SCRATCH/city14/backup"
+mkdir -p "$DOLTDIR/hq/.dolt" "$DOLTDIR/alpha/.dolt" "$BACKUP_ROOT/alpha"
+e_s3_backup hq 4; rm -f "$FB/hq/$(e_tid 2).darc"; e_fp "{\"issues\":9,\"run_utc\":\"$(e_iso "$NOW")\"}"
+: > "$SCRATCH/fake-bd.log"
+DOLT_BACKUP_EPHEMERAL_DBS=hq FAKE_GC_SQL_OUTPUT='| 10' FAKE_DOLT_SQL_OUTPUT='| 10' FAKE_BD_LOG="$SCRATCH/fake-bd.log" main
+RC=$?
+[ "$RC" -eq 1 ] && grep -q 'hq=FAIL(s3-nao-restauravel)' "$SCRATCH/fake-bd.log" && grep -q 'BD-CALLED.*create.*--type=bug' "$SCRATCH/fake-bd.log" && ok "an unrestorable S3 copy of an ephemeral db fails the run and files an open bug naming hq" || bad "unrestorable S3 copy did not fail the run (rc=$RC): $(cat "$SCRATCH/fake-bd.log")"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

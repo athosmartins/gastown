@@ -81,6 +81,7 @@
 |-------|-------|
 | **What** | Dolt "backup sync" archives (.darc files) for all Gas City production databases. Breakdown: `hq/` 2.4G (dominant: one 2.3G base .darc from Jul 2 + smaller incrementals), `whatsapp_automation/` 38M, `gastown/` 26M, `property_scrapers/` 21M, `lexbh/` 640K, `marketing/` 136K, `dc/` 120K. |
 | **Writer** | `plugins/dolt-backup/run.sh` + `.gc/system/packs/dolt/assets/scripts/mol-dog-backup.sh` — runs every 6h via `mol-dog-backup` exec order |
+| **UPDATE 2026-10-01 (ga-gqllbc)** | The figures in this section are from the original audit. `hq/` is now **EPHEMERAL**: built by the nightly `dolt-s3-backup.sh`, proven against S3, then deleted — normally absent from this directory. See `docs/dolt-backup-ephemeral-staging.md`. |
 | **Readers** | Disaster recovery only (manual `dolt backup restore`) |
 | **Source of truth** | Live Dolt server at `~/.dolt-data/` (port 3307) |
 | **Regenerable?** | Can re-sync from live DB (but that means the backup is the live DB, losing the safety net) |

@@ -90,6 +90,22 @@ reviewer, WAITING for the task IS the work.
    task almost always arrives within the first 30–45s. Do NOT exit during this
    window — the assigned bead lands deterministically; just keep polling for it.
 3. Once the task arrives, perform the review using ONLY your assigned lens.
+   **When your analysis is done and BEFORE you run the verdict commands of step 4,
+   free your scratch (ga-gqllbc).** Whatever you exported for the review — a branch
+   copy or `git archive` output, a `git worktree` you added, fixtures and test
+   files you generated (one was a 342 MiB CSV) — lives in your scratchpad
+   (`/private/tmp/claude-501/<project>/<session>/scratchpad`, the path your
+   environment names) and costs ~1 GB per review. The sweeper only collects it
+   30+ minutes after you exit, this machine runs at 7-10 GB free, and the gate's
+   pre-review has been blocked for lack of disk. So: (a) for each worktree you
+   added, `git -C <repo> worktree remove --force <path>` (deleting its directory
+   directly would leave a dangling worktree record in the repo); (b) then
+   `safe-clean` each remaining top-level entry of your scratchpad (absolute paths;
+   `safe-clean` is the deletion command that never stops at an approval prompt —
+   do not use `rm -rf`). Keep nothing on disk: the evidence belongs in your
+   verdict comment. If a removal fails or `safe-clean` refuses, do NOT work around
+   it and do NOT stop — put one line about it in your verdict comment and go on
+   to step 4; the sweeper collects what is left.
 4. Submit your verdict using the EXACT `bd` commands from the task, then close
    the verdict bead as the task instructs.
 5. **Exit immediately: `gc runtime drain-ack && exit`. Do this as your very

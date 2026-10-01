@@ -107,6 +107,20 @@ CONN_MAX="${GC_DOCTOR_CONN_MAX:-}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-108000}"  # 30h: this city's backup runs once/day at 04:00 (dolt-s3-backup.sh), not every 6h — see override comment above (ga-3wdlv)
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+# ga-gqllbc: a db with EPHEMERAL local staging (dolt-backup-ephemeral-lib.sh; default hq) has no
+# local artifacts BY DESIGN — its backup lives in S3 — so "no artifacts under BACKUP_ARTIFACT_DIR"
+# must not read as "backup missing". Its freshness is read from S3's run fingerprint instead (see the
+# freshness loop below). A missing lib is "nothing is ephemeral": the old, louder behaviour (hq would
+# warn as missing), never a silently skipped db.
+EPH_LIB="${DOLT_BACKUP_EPHEMERAL_LIB:-$GC_CITY_PATH/scripts/dolt-backup-ephemeral-lib.sh}"
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$GC_CITY_PATH/.gc/config/dolt-backup-ephemeral.env}"
+AWS="${GC_DOCTOR_AWS:-$(command -v aws || echo /opt/homebrew/bin/aws)}"
+BUCKET="${GC_DOCTOR_S3_BUCKET:-urblink-dolt-backups}"
+S3PROOF_TIMEOUT="${GC_DOCTOR_S3_TIMEOUT_S:-20}"   # one small `aws s3 cp` of _meta/latest.json, bounded well under DOCTOR_BUDGET_S
+if [ -r "$EPH_LIB" ]; then
+    # shellcheck disable=SC1090
+    . "$EPH_LIB"
+fi
 # ga-2uz59: the MEDIUM advisory below used to mail on every single 5-minute
 # cycle the condition held, with no dedup at all — 85 identical "Dolt health
 # advisory [MEDIUM]" mails landed in the Mayor's inbox in ~10h30, burying 8
@@ -629,6 +643,30 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
                 continue
             fi
             NEWEST_BACKUP_MTIME=$(newest_backup_mtime_for_db "$db")
+            # ga-gqllbc: no local artifacts for a db whose staging is ephemeral = the normal state, not a
+            # missing backup. Ask S3's run fingerprint (five answers that must not collapse — see
+            # _eph_s3_fingerprint_state): a good backup's time, or the last good one's, goes through the
+            # SAME age/idle logic below; "could not read it" is NOT-MEASURED, never a warning and never fine.
+            if [ "$NEWEST_BACKUP_MTIME" -le 0 ] && declare -f _eph_is_ephemeral >/dev/null 2>&1 && _eph_is_ephemeral "$db"; then
+                EPH_FP_STATE="$(_eph_s3_fingerprint_state "$db")"
+                case "$EPH_FP_STATE" in
+                    "ok "[0-9]*|"failed "[0-9]*)
+                        NEWEST_BACKUP_MTIME="${EPH_FP_STATE#* }"
+                        ;;
+                    "failed unknown")
+                        append_backup_stale "$db backup FAILED last night and S3 records no last good backup"
+                        continue
+                        ;;
+                    absent)
+                        append_backup_stale "$db backup missing (no entry for it in the S3 run fingerprint)"
+                        continue
+                        ;;
+                    *)
+                        append_unmeasured "S3 backup fingerprint of $db (ephemeral staging: no local artifacts to fall back on)"
+                        continue
+                        ;;
+                esac
+            fi
             if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
                 append_backup_stale "$db backup missing"
                 continue

@@ -21,6 +21,16 @@
 #        ever grows. Measured 2026-09-16: hq alone was 13G local vs 6.9G live (~2x),
 #        gastown ~3x, whatsapp_automation ~2.6x — and it crashed Dolt twice that day on
 #        "no space left on device". See _reseed_staging_if_enabled below for the fix.
+#        ⚠️ EPHEMERAL STAGING (ga-gqllbc, 2026-10-01): for the dbs listed by
+#        dolt-backup-ephemeral-lib.sh (default: hq) stage 1 is NOT permanent. hq's 9.5GB staging
+#        was the difference between the gate's pre-review running or starving for disk, and the
+#        nightly's own 150% disk gate refused for the space that staging itself held. For such a
+#        db this script (a) skips the server-mediated sync and builds the staging with the
+#        server-free offline sync, (b) uploads it as in stage 2, (c) PROVES S3 holds an identical,
+#        restorable copy (dolt-backup-s3-proof.sh), and only then (d) deletes the staging
+#        (_eph_release_after_success) — also after a night refused for disk, when the existing
+#        staging is mirrored to S3 first. mol-dog-backup skips such a db; reseed is a no-op for it.
+#        Kill switch: an empty DOLT_BACKUP_EPHEMERAL_DBS (see the lib's header).
 #     2. aws s3 sync .dolt-backup/<db>/ -> s3://<bucket>/<db>/  (incremental; --delete
 #        prunes orphans; bucket VERSIONING retains history so a stable prefix gives
 #        point-in-time recovery without a full copy per day).
@@ -38,11 +48,16 @@ set -uo pipefail
 # ga-btnq6h: manifest-closure proof + additive mirror, shared with dolt-gc-maintenance.sh.
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-s3-proof.sh"
+# ga-gqllbc: which dbs (hq) keep NO permanent local staging, and the guarded release of it.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dolt-backup-ephemeral-lib.sh"
 
 # ga-ua269q: DOLT_S3_BACKUP_CITY / DOLT_S3_BACKUP_NOTIFY exist so the selftest can run this
 # whole script as a subprocess against a throwaway city with stub binaries (the nightly's
 # real failure sequence cannot be reproduced any other way). launchd never sets them.
 CITY="${DOLT_S3_BACKUP_CITY:-/Users/athos/gt/.gascity-gastown-hq}"
+# ga-gqllbc: the ephemeral-staging conf lives in THIS city (a selftest's throwaway city has its own).
+export DOLT_BACKUP_EPHEMERAL_CONF="${DOLT_BACKUP_EPHEMERAL_CONF:-$CITY/.gc/config/dolt-backup-ephemeral.env}"
 DOLT_CFG="$CITY/.gc/runtime/packs/dolt/dolt-config.yaml"
 BACKUP_ROOT="$CITY/.dolt-backup"          # local staging (incremental; gc-doctor expects it)
 # ga-7gfd34: mol-dog-jsonl's archive — a LOCAL-only git repo (no push remote
@@ -116,6 +131,15 @@ RESEED_HQ_MIN_BUDGET_SECS="${RESEED_HQ_MIN_BUDGET_SECS:-300}"
 RESEED_HQ_DEADLINE_SKIP_STATE_DIR="${RESEED_HQ_DEADLINE_SKIP_STATE_DIR:-$CITY/.gc/logs/.dolt-reseed-hq-deadline-skips}"
 RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD="${RESEED_HQ_DEADLINE_SKIP_ALARM_THRESHOLD:-3}"
 RESEED_AFTER_UPLOAD="${RESEED_AFTER_UPLOAD:-1}"
+# ga-gqllbc: an EPHEMERAL db (dolt-backup-ephemeral-lib.sh; default hq) never keeps its local staging.
+# It is built from scratch by the server-free offline sync each night, uploaded, S3 is PROVEN
+# identical + restorable, and only then is the staging deleted (_eph_release_after_success). Its
+# sync gets its own budget: a first full backup of hq (9+ GB) is not the ~20s incremental append
+# SYNC_TIMEOUT (600s) was sized for. The reseed step does not apply to such a db (nothing is kept
+# to reseed). Streak state mirrors MARGIN_REFUSAL_*: one alarm per N nights the staging stayed.
+EPH_SYNC_TIMEOUT="${DOLT_S3_BACKUP_EPH_SYNC_TIMEOUT:-1800}"
+EPH_UNRELEASED_STATE_DIR="${EPH_UNRELEASED_STATE_DIR:-$CITY/.gc/logs/.dolt-eph-unreleased}"
+EPH_UNRELEASED_ALARM_THRESHOLD="${EPH_UNRELEASED_ALARM_THRESHOLD:-3}"
 # ga-i99qsp: dolt-backup-reseed.sh's own disk-margin refusal used to be purely
 # "expected; retried next run" forever — for a db whose disk is CONSISTENTLY
 # too tight (even for reseed's own low-disk fallback), that meant permanent
@@ -803,6 +827,90 @@ _sync_with_stale_manifest_recovery() {
   return 1
 }
 
+# ── ga-gqllbc: ephemeral staging (dolt-backup-ephemeral-lib.sh) ────────────────────────────────
+# _sync_ephemeral <db> <dest> — the local-staging step for an ephemeral db. Straight to the
+# server-free offline sync, NEVER the server-mediated CALL DOLT_BACKUP: with the staging emptied
+# the server keeps a cached view of the old directory, writes several GB, dies on "table file not
+# found" and leaves a manifest-less residue (ga-yct7r1/ga-ypxbxm — 6.4GB of it on 2026-09-29), and
+# on hq the 30s read timeout would cut it anyway (ga-o3nqy2). A staging that still holds a valid
+# manifest (the first night after this change, or a night whose release was held back) is synced
+# INCREMENTALLY, as always. A manifest-less residue is reinitialised through the existing
+# stale-manifest recovery (same guards, same disk gate). Returns 0 iff a verified sync landed.
+_sync_ephemeral() {
+  local db="$1" dest="$2"
+  if [ -d "$dest" ] && [ "$(_staging_manifest_fp "$dest")" = absent ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
+    _sync_with_stale_manifest_recovery "$db" "$dest" "ephemeral staging holds a manifest-less residue"
+    return $?
+  fi
+  local off new_out
+  off="$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')"
+  case "$off" in ''|*[!0-9]*) off=0 ;; esac
+  if OFFLINE_SYNC_TIMEOUT="$EPH_SYNC_TIMEOUT" _offline_backup_sync "$db" "$dest"; then
+    log "$db: ephemeral staging: offline sync OK (server-free, budget ${EPH_SYNC_TIMEOUT}s)"
+    return 0
+  fi
+  # A retained staging whose manifest names a table the files no longer match (ga-b5h83: Dolt's own GC
+  # conjoined a raw table into a .darc under a stale local manifest) fails the same way every night; the
+  # legacy flow wipes and rebuilds it (is_stale_manifest_error → _sync_with_stale_manifest_recovery), and
+  # an ephemeral db must not lose that self-healing. What the offline sync just wrote to the log is the
+  # evidence; nothing else (not "the sync failed", not "a manifest exists") is taken as one.
+  new_out="$(tail -c +"$((off + 1))" "$LOG" 2>/dev/null)"
+  if [ -d "$dest" ] && is_stale_manifest_error "$new_out"; then
+    _sync_with_stale_manifest_recovery "$db" "$dest" "ephemeral staging: the offline sync hit a stale manifest"
+    return $?
+  fi
+  log "$db: ephemeral staging: offline sync FAILED — see the offline-sync lines above"
+  return 1
+}
+
+# _eph_unreleased_count_after_increment / _eph_unreleased_reset — consecutive nights an ephemeral
+# db's staging was NOT released, same fail-soft shape as _margin_refusal_count_after_increment
+# (a state dir that cannot be written echoes the threshold, so bookkeeping trouble alarms
+# instead of silently disabling the escalation).
+_eph_unreleased_count_after_increment() {
+  local db="$1" f n
+  if ! mkdir -p "$EPH_UNRELEASED_STATE_DIR" 2>/dev/null; then echo "$EPH_UNRELEASED_ALARM_THRESHOLD"; return; fi
+  f="$EPH_UNRELEASED_STATE_DIR/$db"
+  n="$(cat "$f" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n+1))
+  echo "$n" > "$f" 2>/dev/null
+  echo "$n"
+}
+_eph_unreleased_reset() { rm -f "$EPH_UNRELEASED_STATE_DIR/$1" 2>/dev/null || true; }
+
+# _eph_release_after_success <db> <dest> — the ephemeral db's counterpart of
+# _reseed_staging_if_enabled: called AFTER the db's backup landed (counters already final), it
+# proves S3 and frees the staging. Its own outcome never changes $ok/$failed. Not releasing is
+# not a backup failure — the staging is merely still there — but it must not stay silent forever:
+#   s3-not-proven  → the S3 copy we JUST uploaded does not prove out: notify now (a real signal);
+#   dryrun         → the operator asked for it: nothing;
+#   anything else  → counted per night; one alarm per EPH_UNRELEASED_ALARM_THRESHOLD nights.
+# Released / nothing-to-release resets the streak.
+_eph_release_after_success() {
+  local db="$1" dest="$2" rc n
+  _eph_release_staging "$db" "$dest"; rc=$?
+  case "$rc" in
+    0|2) _eph_unreleased_reset "$db"; return 0 ;;
+  esac
+  case "$_EPH_RELEASE_WHY" in
+    s3-not-proven)
+      log "$db: ephemeral staging NOT released — S3 is not proven identical + restorable right after the upload — ALARME"
+      notify_fail "backup off-box: $db — o S3 NÃO provou cópia idêntica e restaurável logo após o upload; o staging local ($dest) foi MANTIDO (nada apagado). Ver $LOG."
+      return 1 ;;
+    dryrun) return 0 ;;
+  esac
+  n="$(_eph_unreleased_count_after_increment "$db")"
+  if [ "$n" -ge "$EPH_UNRELEASED_ALARM_THRESHOLD" ]; then
+    log "$db: ephemeral staging NOT released for ${n} noites seguidas (motivo: ${_EPH_RELEASE_WHY:-?}) — ALARME"
+    notify_fail "backup off-box: o staging local de $db (efêmero) não foi liberado por ${n} noites seguidas (motivo: ${_EPH_RELEASE_WHY:-?}) — o disco segue segurando a cópia que deveria ser transitória. Ver $LOG."
+    _eph_unreleased_reset "$db"
+  else
+    log "$db: ephemeral staging not released tonight (motivo: ${_EPH_RELEASE_WHY:-?}; ${n}/${EPH_UNRELEASED_ALARM_THRESHOLD} noites seguidas)"
+  fi
+  return 1
+}
+
 # _reseed_staging_if_enabled <db> — ga-8f1uh0: called AFTER this db's S3 sync
 # above already succeeded. .dolt-backup/<db> is APPEND-ONLY (see the corrected
 # header doctrine at the top of this file) so it only ever grows, independent
@@ -1238,6 +1346,9 @@ DBS="$(dsql -q "SHOW DATABASES" --result-format csv 2>/dev/null | tail -n +2 \
 if [ -z "$DBS" ]; then log "FATAL: no databases discovered"; notify_fail "backup off-box: nenhum banco descoberto"; exit 0; fi
 
 total=0; ok=0; failed=0; FAILED_DBS=""; FAILED_DBS_STREAK=""; ESCALATE_DBS=""; UNKNOWN_STREAK_DBS=""
+# ga-gqllbc: say which dbs run in ephemeral-staging mode tonight — "off(conf-unreadable ...)" must be
+# visible, because an unreadable conf silently reverts hq to the permanent 9.5GB staging.
+log "ephemeral staging mode: $(_eph_mode_summary)"
 for db in $DBS; do
   total=$((total+1))
   dest="$BACKUP_ROOT/$db"
@@ -1254,6 +1365,8 @@ for db in $DBS; do
   # baseline _mirror_staging_after_aborted_sync compares against if a later disk refusal
   # follows an attempt that was cut. Taken per db, right before the first attempt.
   pre_fp="$(_staging_manifest_fp "$dest")"
+  # ga-gqllbc: an ephemeral db builds its staging from scratch, proves S3, then releases it.
+  eph=0; _eph_is_ephemeral "$db" && eph=1
   # 1) native consistent backup -> local staging (incremental)
   offline_done=0
   if ! _sync_disk_preflight "$db"; then
@@ -1279,11 +1392,24 @@ for db in $DBS; do
       # exists needs no local disk — do it, and say in the alert whether S3 is sound.
       if _mirror_staging_after_disk_refusal "$db" "$dest"; then
         FAILED_DBS="$FAILED_DBS ${db}(disco)"
+        # ga-gqllbc: S3 is now PROVEN restorable (and identical to the staging when one exists).
+        # Tonight's backup still failed — but an ephemeral db's staging has no reason to stay,
+        # and it is the very 9.5GB whose absence would let tomorrow's gate pass. The release
+        # re-proves S3 itself; it never trusts the proof above.
+        [ "$eph" -eq 1 ] && _eph_release_after_success "$db" "$dest"
       else
         FAILED_DBS="$FAILED_DBS ${db}(disco+s3)"
       fi
       continue
     fi
+  fi
+  # ga-gqllbc: an ephemeral db skips the server-mediated sync entirely (see _sync_ephemeral).
+  if [ "$eph" -eq 1 ] && [ "$offline_done" -eq 0 ]; then
+    if ! _sync_ephemeral "$db" "$dest"; then
+      failed=$((failed+1)); FAILED_DBS="$FAILED_DBS ${db}(sync)"
+      _backup_fail_note "$db"; continue
+    fi
+    offline_done=1
   fi
   if [ "$offline_done" -eq 0 ] && ! DOLT_CLI_PASSWORD='' timeout "$SYNC_TIMEOUT" "$DOLT" --host "$HOST" --port "$PORT" \
         --user root --no-tls sql -q "USE \`$db\`; CALL DOLT_BACKUP('sync', '${db}-backup');" > "$SYNC_OUT" 2>&1; then
@@ -1358,7 +1484,12 @@ for db in $DBS; do
   # reflect this run's real backup outcome — its own success/failure is
   # logged and (when non-disk) notified inside the helper, but never changes
   # $ok/$failed/$FAILED_DBS for the core backup that already succeeded.
-  _reseed_staging_if_enabled "$db"
+  if [ "$eph" -eq 1 ]; then
+    # ga-gqllbc: nothing to reseed — the staging is transient. Prove S3, then free it.
+    _eph_release_after_success "$db" "$dest"
+  else
+    _reseed_staging_if_enabled "$db"
+  fi
 done
 
 # --- JSONL archive offsite mirror (ga-7gfd34) --------------------------------
