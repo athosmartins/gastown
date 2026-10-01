@@ -6537,8 +6537,11 @@ fi
 #     a TIP checkout (the tip is the control — a test only counts as failing on base if
 #     it PASSES at tip), the branch's test-side files copied onto base, every run inside
 #     a sandbox (no network, writes only to scratch) because builder tests are being run
-#     against PRE-fix code, and every failure/pass re-run ALONE (lição wa-br1w4r /
-#     wa-u4bdpn). The interpreter is the rig's venv and vitest the rig's node_modules;
+#     against PRE-fix code, and nothing concluded from a test run in company with others (lição
+#     wa-br1w4r / wa-u4bdpn): a test counts as failing on base only if it passes ALONE at tip and fails
+#     ALONE on base (the first such test settles the file), and a file that passes on base is refused only
+#     after each of its tests was also run ALONE there (too many to do that -> unmeasured). The
+#     interpreter is the rig's venv and vitest the rig's node_modules;
 #     a rig without them is unmeasured, never refused. Same verdict words, same arm.
 # Other conventions (go test, ...) are still NOT run: a submission whose only new
 # tests are those file types is indistinguishable, from here, from "no new test
@@ -6641,7 +6644,8 @@ if [ -n "$RIG_PATH" ] && [ -n "$BEAD_ID" ] && [ -n "$BRANCH" ]; then
         # verdict is nao-consegui-medir — never sem-teste-novo (which says "I looked and found none") and
         # never a refusal. The same accounting gate_base_test_verdict already uses for a partial measurement.
         if [ "$_ABT_PYJS_STATE" = "unread" ]; then _ABT_PYJS_DET=1; fi
-        _ABT_PYJS_FILE_LIST=$(printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE \([^ ]*\) .*/\1/p' | tr '\n' ' ')
+        # only the files that PASSED on base are named in a refusal: a zero-test script (no-tests) passed nothing
+        _ABT_PYJS_FILE_LIST=$(printf '%s\n' "$_ABT_PYJS_OUT" | sed -n 's/^FILE \([^ ]*\) .* state=passes-on-base .*/\1/p' | tr '\n' ' ')
       else
         _ABT_PYJS_STATE="skipped-sh-cap"
       fi
@@ -6724,7 +6728,7 @@ ABT_TEST_FILES_EOF
       set_gate_status "$MARKER_ID" "error"
       bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: base-commit test check (ga-rstae, A/B experiment arm B).
 $_ABT_DETECTED new/changed selftest file(s) on $BRANCH pass UNCHANGED when run against the pre-fix base commit ($_ABT_BASE) — meaning they don't actually exercise the bug/regression this branch claims to fix (test-driven-development's own Iron Law: a test that passes before your fix exists proves nothing).
-Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ')$_ABT_PYJS_FILE_LIST
+Files: $(printf '%s' "$_ABT_TEST_FILES" | tr '\n' ' ') $_ABT_PYJS_FILE_LIST
 (For a selftest you MODIFIED, this also means base's own copy of that file PASSED on base — a repair of a test that was red on base is accepted, not refused: ga-yl1k3w.)
 Fix (this is the point of the check, not busywork): strengthen the test so it FAILS against base — i.e. it actually depends on your fix — then push again:
   git push origin $BRANCH

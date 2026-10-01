@@ -1106,7 +1106,20 @@ if want 7 && [ "$HAVE_PYTEST" = yes ]; then
     LOGF="$H_SCRATCH/e7.log"; : > "$LOGF"
     RC=$(GATE_ABT_RUN_TIMEOUT=60 run_block "$E7/rig" $BEAD_B feat/e7)
     eq "a selftest AND a pytest that both pass on base -> refused" "$RC" "1"
-    eq "...and the refusal names BOTH files" "$(logged 'BD .*comment mk-e2e .*check.selftest.sh.*tests/test_passes.py')" "1"
+    # (one literal space between the two names: with `.*` here a glued "check.selftest.shtests/test_passes.py" passed)
+    eq "...and the refusal names BOTH files, each as its own path" "$(logged 'BD .*comment mk-e2e .*check\.selftest\.sh tests/test_passes\.py ')" "1"
+
+    echo "  -- the refusal names the files that PASSED on base, not every file that was looked at --"
+    # A zero-test test_*.py is not counted (it holds no test), so it must not be listed as a test that "passes
+    # unchanged against base" either. The scan is stubbed: this is about what the call site SAYS with a given result.
+    E9="$H_SCRATCH/e2e9"; mk_remote "$E9"; branch "$E9/rig" feat/e9; fix_code "$E9/rig" ""
+    printf 'note\n' > "$E9/rig/tests/note.txt"
+    push_branch "$E9/rig" feat/e9
+    LOGF="$H_SCRATCH/e9.log"; : > "$LOGF"
+    RC=$(run_block "$E9/rig" $BEAD_B feat/e9 "$(printf 'FILE tests/test_passes.py kind=py state=passes-on-base why=- old=added\nFILE tests/test_script.py kind=py state=no-tests why=- old=-\nTOTALS files=2 counted=1 copy_ok=1 ran=1 failed=0 repaired=0 unclassified=0 py=2 js=0')")
+    eq "a passing test plus a zero-test script -> refused (the script is not a test, so it is not counted)" "$RC" "1"
+    eq "...the comment names the file that passed on base" "$(logged 'BD .*comment mk-e2e .*Files: .*tests/test_passes\.py')" "1"
+    eq "...and does NOT name the zero-test script: it holds no test, so it passed nothing" "$(logged 'BD .*comment mk-e2e .*tests/test_script\.py')" "0"
 
     echo "  -- arm B, a rig with no venv: the pytest file is unmeasured, never refused --"
     E8="$H_SCRATCH/e2e8"; mk_remote "$E8"; branch "$E8/rig" feat/e8; fix_code "$E8/rig" ""
