@@ -23,7 +23,13 @@ Cada caso existe por um erro real que a medição já teve (01/10, nos 1.783 tra
     US$ por aprovada null no JSON; CV da seção 6 só sobre beads com preço (quantos, impresso) e n/p — não nan — quando não há; e uma
     seção que estoura não leva embora as já prontas (exit 1, texto e --json). Mais os achados baixos da mesma família: claim sem
     resultado ≠ verificado, veredito sem dry_run ≠ ensaio, resposta sem timestamp contada e avisada
-  * controles de mutação: 28 mutantes do script, cada um reprovado por pelo menos um caso (o teste que só passa não prova nada)
+  * 4 estados de um claim (gate-fix 2): ok / failed / unconfirmed (resultado VISÍVEL que não confirma: heredoc, echo, saída cortada — NÃO é claim
+    e não abre bucket) / noresult (nenhum resultado: conta, sinalizado); dois claims num comando têm um tool_use id só e cada um recebe o seu estado
+  * irmãos da mesma classe achados na varredura do diff inteiro (gate-fix 2): sessão de pool com claim NÃO confirmado não é spawn ocioso (como a sem
+    timestamp); JSON válido que não é registro (`null`, string, lista) é linha ilegível CONTADA, não AttributeError; queda maior que a taxa na
+    seção 6 é n/a, não '0 beads por braço'; o texto da atribuição lista todos os verbos de REF_CMD
+  * controles de mutação: cada mutante do script (tabela MUTANTS) tem que ser reprovado por pelo menos um caso (o teste que só passa não prova nada);
+    o número de casos e de mutantes vem da própria saída — não é repetido aqui para não envelhecer
 """
 import contextlib
 import fcntl
@@ -961,18 +967,86 @@ def t_e2_readout_missing_dry_run(m, W):
     ck(script.exists(), f"o script do E2 existe em {script}")
     city = W / "city"
     (city / ".gc" / "token-ledger").mkdir(parents=True)
-    (city / ".gc" / "token-ledger" / "sessions.jsonl").write_text(json.dumps(dict(sid="c1", role="crew", alias="peter-wa", first_ts="2026-09-30T10:00:00Z", days={})) + "\n")
+    # + uma linha ilegível e um JSON válido que não é registro (`null`): o script as CONTA em vez de calar (ou de estourar no `.get`)
+    (city / ".gc" / "token-ledger" / "sessions.jsonl").write_text(json.dumps(dict(sid="c1", role="crew", alias="peter-wa", first_ts="2026-09-30T10:00:00Z", days={})) + "\n{ilegivel\nnull\n")
     ev = [{"ts": "2026-09-30T11:00:00Z", "event": "guard_queued", "branch": "crew/peter/wa-aaa", "bead": "wa-aaa"},
           {"ts": "2026-09-30T12:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-aaa", "bead": "wa-aaa", "result": "PASS", "dry_run": "0"},
           {"ts": "2026-09-30T11:00:00Z", "event": "guard_queued", "branch": "crew/peter/wa-bbb", "bead": "wa-bbb"},
           {"ts": "2026-09-30T12:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-bbb", "bead": "wa-bbb", "result": "FAIL"},
           {"ts": "2026-09-30T13:00:00Z", "event": "dispatcher_complete", "branch": "crew/peter/wa-ccc", "bead": "wa-ccc", "result": "PASS", "dry_run": None}]
-    (city / ".gc" / "quality-gate.jsonl").write_text("\n".join(json.dumps(e) for e in ev) + "\n")
+    (city / ".gc" / "quality-gate.jsonl").write_text("\n".join(json.dumps(e) for e in ev) + "\nnull\n")
     import subprocess
     p = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=dict(os.environ, GC_CITY_PATH=str(city)))
-    ck(p.returncode == 0, f"o script roda no fixture; rc={p.returncode} {p.stderr[-300:]}")
+    ck(p.returncode == 0, f"o script roda no fixture (o `null` não estoura o `.get`); rc={p.returncode} {p.stderr[-300:]}")
     ck("2 verdicts without dry_run" in p.stdout, f"os 2 vereditos sem dry_run são contados e impressos; achei {[ln for ln in p.stdout.splitlines() if 'dry_run' in ln]}")
     ck("with a real verdict: 1 " in p.stdout, f"só o veredito real (dry_run '0') entra na amostra; achei {[ln for ln in p.stdout.splitlines() if 'verdict' in ln]}")
+    ck("2 unreadable ledger lines" in p.stdout, f"as 2 linhas do ledger que não são registro são contadas; achei {[ln for ln in p.stdout.splitlines() if 'ledger' in ln]}")
+    ck("1 unreadable lines" in p.stdout, f"a linha do log do gate que não é evento é contada; achei {[ln for ln in p.stdout.splitlines() if 'gate log' in ln]}")
+
+
+def t_idle_vs_unconfirmed_claim(m, W):
+    """Seção 2, irmã do claim sem timestamp: sessão de pool cujo ÚNICO claim teve resultado VISÍVEL que não confirma não é ociosa — não sei se
+    pegou bead, e 'não vi o claim dar certo' não é 'não reivindicou'. Ela ganha linha própria; o spawn ocioso de verdade continua ocioso."""
+    w, _ = setup(m, W)
+    base = report(m, w)[1]["idle"].get("wa-worker", {}).get("sessions", 0)
+    # o claim é real mas o resultado é de um formato que o medidor não reconhece (sem "Updated issue: <id>")
+    recs = [beacon("wa-worker-adhoc-unc01", D + "17:30:00Z")] + asst("n1", D + "17:30:10Z", cmd="bd update wa-unc01 --claim", tid="tu_n")
+    recs += [tool_result("tu_n", "ok (formato novo, sem a frase de confirmação)", D + "17:30:11Z")] + asst("n2", D + "17:31:00Z")
+    write_session(w["projects"], "-proj", "unconf_only", recs)
+    write_session(w["projects"], "-proj", "really_idle", [beacon("wa-worker-adhoc-idle01", D + "17:40:00Z")] + asst("i1", D + "17:40:10Z"))
+    harvest(m, w)
+    s = ledger_rows(m, w)["unconf_only"]
+    ck(s["claims"] == [] and s["claims_unconfirmed"] == 1, f"o claim não confirmado fica fora de `claims` e é contado; achei {s['claims']} unconfirmed={s['claims_unconfirmed']}")
+    code, r = report(m, w)
+    idle = r["idle"]["wa-worker"]
+    ck(idle["sessions"] == base + 1, f"só o spawn ocioso de verdade (sem claim nenhum) é ocioso: {base} + 1; achei {idle['sessions']} ({idle})")
+    ck(idle["claim_unconfirmed_sessions"] == 1, f"a sessão com claim não confirmado tem contagem própria; achei {idle}")
+    code, txt = report_text(m, w)
+    ck("1 sessões com claim NÃO confirmado" in txt, f"o texto da seção 2 avisa; achei {[ln for ln in txt.splitlines() if 'NÃO confirmado' in ln]}")
+    ck("`bd show|comment|heartbeat|close|label|update|reopen`" in txt, f"o texto da atribuição lista TODOS os verbos que contam como referência; achei {[ln for ln in txt.splitlines() if 'por referência' in ln]}")
+
+
+def t_non_record_json_lines(m, W):
+    """JSON válido que não é um registro (`null`, `"user"`, `["assistant", 1]`) não derruba nada: é uma linha ilegível, CONTADA. Antes o `.get`
+    estourava com AttributeError e levava a colheita (ou o relatório) inteira embora."""
+    w, _ = setup(m, W)
+    # transcrito: as linhas passam do pré-filtro (têm "user"/"assistant") mas não são registros
+    recs = [beacon("gastown.dog-9", D + "19:00:00Z"), "user", ["assistant", 1]] + asst("z1", D + "19:00:10Z")
+    rec = scan_recs(m, w, "weird_lines", recs)
+    ck(rec["bad_lines"] == 2 and rec["msgs"] == 1, f"2 linhas que não são registro contadas e a resposta real lida; achei bad={rec['bad_lines']} msgs={rec['msgs']}")
+    # ledger: linhas que não são sessão
+    n_before = len(ledger_rows(m, w))
+    with open(w["ledger"], "a") as fh:
+        fh.write("null\n[1]\n\"x\"\n")
+    rows, bad = m.load_ledger(w["ledger"])
+    ck(bad == 3 and len(rows) == n_before, f"3 linhas do ledger que não são sessão contadas, as sessões intactas; achei bad={bad} rows={len(rows)}/{n_before}")
+    # log do gate: linhas que não são evento (o mundo-base já tem 1 linha ilegível de propósito: compara com ela, não com um número solto)
+    runs0, _b0, gbad0 = m.load_gate(w["gate"])
+    with open(w["gate"], "a") as fh:
+        fh.write("null\n[1]\n")
+    runs, bridge, gbad = m.load_gate(w["gate"])
+    ck(gbad == gbad0 + 2 and len(runs) == len(runs0), f"2 linhas do log do gate que não são evento contadas ({gbad0} + 2), os vereditos reais intactos; achei bad={gbad} runs={len(runs or [])}/{len(runs0)}")
+    code, r = report(m, w)
+    ck(code == 0 and r["coverage"]["gate_unreadable_lines"] == gbad0 + 2, f"o relatório inteiro roda e mostra as linhas do gate; exit {code} {r.get('coverage')}")
+
+
+def t_power_unreachable_drop(m, W):
+    """Seção 6: com taxa de 1ª aprovação MENOR que a queda a detectar, uma queda desse tamanho não existe (a taxa não passa de 0). Antes saía
+    '0 beads por braço' (max(0, p-diff)) — lido como 'não precisa de amostra'. Agora é n/a, no texto e no JSON."""
+    ck(m.n_per_arm_prop(0.0, 0.03) is None and m.n_per_arm_prop(0.02, 0.03) is None, "p < queda -> None (não 0)")
+    ck(m.n_per_arm_prop(0.03, 0.03) and m.n_per_arm_prop(0.5, 0.03) > 1000, "p == queda ainda é calculável (p2 = 0); p = 50% pede milhares para 3 pp")
+    beads = [dict(bead=f"ga-pp{i:02d}", model="claude-sonnet-5-5", k=3 + i % 5) for i in range(24)]
+    w = mini_world(m, W, beads)
+    ev = [{"ts": f"{D}12:{i % 60:02d}:00Z", "event": "dispatcher_complete", "branch": f"feat/{b['bead']}", "bead": b["bead"], "rig": "gascity",
+           "result": "PASS" if i == 0 else "FAIL", "dry_run": "0"} for i, b in enumerate(beads)]
+    w["gate"].write_text("\n".join(json.dumps(e) for e in ev) + "\n")          # 1 de 24 na 1ª rodada: p = 4,2%
+    code, r = report(m, w)
+    pw = r["power"]["dog"]
+    ck(code == 0 and pw["n_per_arm_first_pass"]["10pp"] is None and pw["n_per_arm_first_pass"]["5pp"] is None and pw["days_first_pass"]["10pp"] is None,
+       f"queda de 10 pp e de 5 pp com p = 4,2%: n/a (null) no JSON; achei {pw}")
+    ck(pw["n_per_arm_first_pass"]["3pp"] and pw["n_per_arm_first_pass"]["3pp"] > 0, f"a de 3 pp existe e é calculada; achei {pw['n_per_arm_first_pass']}")
+    code, txt = report_text(m, w)
+    ck("n/a (taxa<Δ)" in txt and "uma queda desse tamanho não existe" in txt, f"o texto diz n/a e por quê; achei {[ln for ln in txt.splitlines() if 'dog' in ln and '|' in ln]}")
 
 
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
@@ -1032,6 +1106,17 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "veredito sem dry_run vira ensaio calado": ("                if dry is None:\n                    bad += 1", "                if False:\n                    bad += 1", t_lows),
     "resposta sem timestamp some calada": ("            untimed_msgs += 1", "            untimed_msgs += 0", t_lows),
     "dia desconhecido entra nas janelas sem aviso": ('    undated = sum(c["msgs"] for _s, day, _m, _e, c, _u in flat if day == "?")', "    undated = 0", t_lows),
+    # ---- gate-fix 2 (ga-5c3msy): a varredura do diff inteiro achou irmãos da mesma classe (desconhecido lido como resposta definida)
+    "ocioso conta sessão com claim não confirmado": ('            if s.get("claims_unconfirmed"):\n                idle[s["role"]][4] += 1', '            if False:\n                idle[s["role"]][4] += 1', t_idle_vs_unconfirmed_claim),
+    "atribuição por referência lista só 4 verbos": ("por referência a `bd show|comment|heartbeat|close|label|update|reopen` (worker com ",
+                                                    "por referência a `bd show|comment|heartbeat|close` (worker com ", t_idle_vs_unconfirmed_claim),
+    "transcrito: linha que não é registro estoura": ("if not isinstance(r, dict):\n                    bad += 1          # JSON válido que não é um registro",
+                                                     "if False:\n                    bad += 1          # JSON válido que não é um registro", t_non_record_json_lines),
+    "ledger: linha que não é sessão estoura": ("if not isinstance(r, dict):\n                    bad += 1                            # JSON válido que não é uma linha de sessão",
+                                               "if False:\n                    bad += 1                            # JSON válido que não é uma linha de sessão", t_non_record_json_lines),
+    "gate: linha que não é evento estoura": ("if not isinstance(r, dict):\n                bad += 1                                # JSON válido que não é um evento do gate",
+                                             "if False:\n                bad += 1                                # JSON válido que não é um evento do gate", t_non_record_json_lines),
+    "queda impossível vira 0 beads por braço": ("    if p < diff:\n        return None\n    p2 = p - diff\n", "    p2 = max(0.0, p - diff)\n", t_power_unreachable_drop),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -1052,7 +1137,10 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("JSON e texto com os mesmos avisos: janela incompleta, ledger ilegível, desconhecidos da colheita", t_report_unknown_counters),
          ("schema novo: linha escrita pela regra antiga é reescaneada e contada", t_schema_rescan),
          ("alarme de formato: 1ª linha e exit ≠ 0", t_harvest_alarm_first_and_nonzero),
-         ("e2-readout: veredito sem dry_run contado, não calado", t_e2_readout_missing_dry_run)]
+         ("e2-readout: veredito sem dry_run e linha que não é registro contados, não calados", t_e2_readout_missing_dry_run),
+         ("seção 2: claim não confirmado não é spawn ocioso; atribuição por referência lista todos os verbos", t_idle_vs_unconfirmed_claim),
+         ("JSON válido que não é registro (null, string, lista) é linha ilegível contada, não exceção", t_non_record_json_lines),
+         ("seção 6: queda maior que a taxa é n/a, não '0 beads por braço'", t_power_unreachable_drop)]
 
 
 def run(name, fn, m):
