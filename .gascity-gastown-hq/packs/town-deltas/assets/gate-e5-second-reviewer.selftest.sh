@@ -24,6 +24,9 @@
 #  11. TIME: the dispatcher runs the fingerprint and the extra-task builder under the gate lock on the WHOLE
 #      reviewer task (up to 400KB); a >= 300KB task is handled in < 5s under bash 3.2 and the answer equals an
 #      independent oracle's (no bash ${v#*pat} / ${v/pat/rep} on the task — they are quadratic).
+#      The fingerprint splits at the template's OWN marker line (the LAST line that is exactly the marker; a diff
+#      that quotes it must not move the split), and an awk/cksum that FAILS is 'unknown', never the checksum of
+#      an empty stream (gate ga-4fbmfz).
 # Mutation checks at the end prove the suite is not vacuous.
 #
 # Exit 0 iff every assertion holds.
@@ -209,9 +212,10 @@ mode, path, a, b = sys.argv[1:5]
 s = open(path, "rb").read().rstrip(b"\n")          # what "$(cat file)" hands the lib
 a, b = a.encode(), b.encode()
 if mode == "fp":                                    # a = verdict-bead id, b = AUTHOR
-    mk = b"--- YOUR TASK ---"
-    i = s.find(mk)
-    rem = s[i + len(mk):] if i >= 0 else s
+    mk = b"--- YOUR TASK ---"                     # the template's own line: the LAST line that IS the marker
+    lines = s.split(b"\n")                          # (a diff may quote it mid-line or after a +/- — those are not it)
+    k = max((j for j, l in enumerate(lines) if l == mk), default=-1)
+    rem = b"\n".join([b""] + lines[k + 1:]) if k >= 0 else s   # nothing standalone: the whole task
     if a: rem = rem.replace(a, b"<VB>")
     if b: rem = rem.replace(b, b"<AUTHOR>")
     sys.stdout.buffer.write(rem)
@@ -261,6 +265,59 @@ sed 's/ga-vb0001/ga-vb7777/g' "$TMP/task.on" > "$TMP/fp.task7"
 FP1="$(timed_lib "$LIB" "$TMP/task.on" "$TMP/fp.o1" 'gate_e5_prompt_fingerprint "$t" ga-vb0001' >/dev/null; cat "$TMP/fp.o1")"
 FP7="$(timed_lib "$LIB" "$TMP/fp.task7" "$TMP/fp.o7" 'gate_e5_prompt_fingerprint "$t" ga-vb7777' >/dev/null; cat "$TMP/fp.o7")"
 [ -n "$FP1" ] && [ "$FP1" = "$FP7" ] && ok "two runs of the same prompt with different verdict-bead ids share one fingerprint ($FP1)" || bad "the per-run id leaks into the fingerprint ($FP1 vs $FP7)"
+
+# gate ga-4fbmfz, issue 1: the split is at the template's OWN marker line — the LAST line that is exactly the marker —
+# not at the first place the text occurs. A diff can quote the marker (the diff of this very feature does, ten times:
+# mid-line, after a "+", and as a removed "-- YOUR TASK ---" line that renders as the bare marker), and the diff sits BEFORE
+# the template's marker, so the first occurrence is inside the DIFF: the logged fingerprint then identified the diff, and
+# two runs with the identical prompt and different diffs got different fingerprints.
+awk '{ print } $0 == "-line two" {
+  print "+# the marker, quoted mid-line: --- YOUR TASK ---"
+  print "+--- YOUR TASK ---"
+  print "+  m = \"--- YOUR TASK ---\"   # ga-vb0001 crew/x"
+  print "--- YOUR TASK ---" }' "$TMP/task.on" > "$TMP/fp.taskq"
+[ "$(grep -c -- '--- YOUR TASK ---' "$TMP/fp.taskq")" -ge 5 ] && ok "the quoting task carries the marker $(grep -c -- '--- YOUR TASK ---' "$TMP/fp.taskq") times (3 quotes + a bare-marker line in the diff, then the template's own)" || bad "the quoting task was not built"
+GOT="$(timed_lib "$LIB" "$TMP/fp.taskq" "$TMP/fp.outq" "$E5_FP_BODY")"
+check "fingerprint (a diff that quotes the marker) == the oracle's (rc, cksum)" "0 $(fp_oracle "$TMP/fp.taskq")" "${GOT%% *} $(tr -d '\n' < "$TMP/fp.outq")"
+check "the same instructions fingerprint the same whatever the diff quotes (quoting task == plain task)" "$(tr -d '\n' < "$TMP/fp.o1")" "$(tr -d '\n' < "$TMP/fp.outq")"
+# a standalone marker with trailing text, or with a leading character, is NOT the template's line; with no standalone line
+# at all the whole task is fingerprinted (the template drifted, and the value then says so by being a different number)
+{ grep -v -- '--- YOUR TASK ---' "$TMP/task.on"; printf '%s\n' '+--- YOUR TASK ---' 'x --- YOUR TASK --- y' '--- YOUR TASK --- trailing'; } > "$TMP/fp.taskn"
+GOT="$(timed_lib "$LIB" "$TMP/fp.taskn" "$TMP/fp.outn" "$E5_FP_BODY")"
+check "fingerprint (only non-standalone markers) == the oracle's: the WHOLE task, not a split inside a line" "0 $(fp_oracle "$TMP/fp.taskn")" "${GOT%% *} $(tr -d '\n' < "$TMP/fp.outn")"
+
+# gate ga-4fbmfz, issue 2: error and empty must not print the same number. A genuinely EMPTY instruction part checksums to
+# 4294967295 (cksum of nothing); an awk that FAILS (fork failure / OOM-kill at load ~76 on a 350KB input) used to feed cksum an
+# empty stream and print that very value, which the caller logs as a measurement. Now it is "unknown". The shim fails ONLY the
+# fingerprint's program (rc 2) and passes every other awk through, like the reviewer's reproduction.
+mkdir -p "$TMP/shim-awk" "$TMP/shim-cksum"
+REAL_AWK="$(command -v awk)"; REAL_CKSUM="$(command -v cksum)"
+printf '#!/bin/sh\ncase "$*" in *"YOUR TASK"*) exit 2 ;; esac\nexec %s "$@"\n' "$REAL_AWK" > "$TMP/shim-awk/awk"
+printf '#!/bin/sh\ncat >/dev/null\nexit 1\n' > "$TMP/shim-cksum/cksum"
+chmod +x "$TMP/shim-awk/awk" "$TMP/shim-cksum/cksum"
+FP_TASK='head ga-vb0001 crew/x
+--- YOUR TASK ---
+the instructions ga-vb0001'
+FP_CALL='printf "%s" "$(gate_e5_prompt_fingerprint "$FPT" ga-vb0001)"'
+HEALTHY="$(run_lib AUTHOR=crew/x FPT="$FP_TASK" -- <<<"$FP_CALL")"
+case "$HEALTHY" in ''|*[!0-9]*|4294967295) bad "healthy fingerprint is not a real checksum ('$HEALTHY')" ;; *) ok "healthy: the fingerprint is a real checksum ($HEALTHY)" ;; esac
+check "a REALLY empty instruction part (the marker is the last line) is the checksum of nothing" "4294967295" "$(run_lib AUTHOR=crew/x FPT='head
+--- YOUR TASK ---' -- <<<"$FP_CALL")"
+check "an awk that FAILS is 'unknown' — not the checksum of an empty stream" "unknown" "$(run_lib PATH="$TMP/shim-awk:$PATH" AUTHOR=crew/x FPT="$FP_TASK" -- <<<"$FP_CALL")"
+check "a cksum that FAILS is 'unknown' too" "unknown" "$(run_lib PATH="$TMP/shim-cksum:$PATH" AUTHOR=crew/x FPT="$FP_TASK" -- <<<"$FP_CALL")"
+check "the failing fingerprint returns 0 (the dispatcher's admission path must go on) and prints nothing but the value" "unknown 0" "$(run_lib PATH="$TMP/shim-awk:$PATH" AUTHOR=crew/x FPT="$FP_TASK" -- <<<'v="$(gate_e5_prompt_fingerprint "$FPT" ga-vb0001)"; echo "$v $?"')"
+# ... and the record: warn() in the dispatcher writes to STDOUT, so a warning raised inside the $(...) would BE the logged
+# value. The record carries exactly "unknown", the loss is said in the dispatcher log once, and a healthy run says nothing.
+ADMIT_BODY='warn() { echo "WARN: $*"; }
+unset GATE_E5_SIZE_STATE; GATE_RUN_ID=ga-run-fp; BEAD_ID=ga-x; BRANCH=b
+gate_e5_log_admit "$FPT" ga-vb0001 | sed "s/^/STDOUT> /"
+jq -r "select(.event==\"e5_admit\" and .gate_run==\"ga-run-fp\") | \"LOGGED> \" + .review_prompt_cksum" "$QG_LOG" | tail -1'
+OUT="$(run_lib PATH="$TMP/shim-awk:$PATH" GATE_E5_ENABLED=1 QG_LOG="$TMP/city/.gc/fp-admit1.jsonl" AUTHOR=crew/x FPT="$FP_TASK" -- <<<"$ADMIT_BODY")"
+check "admit with a failing awk: the record says exactly 'unknown'" "LOGGED> unknown" "$(printf '%s\n' "$OUT" | grep '^LOGGED> ')"
+[ "$(printf '%s\n' "$OUT" | grep -c '^STDOUT> .*WARN: .*unknown')" = "1" ] && ok "admit with a failing awk: the loss is warned ONCE, by the caller, outside the command substitution" || bad "admit with a failing awk: expected exactly one warning naming 'unknown', got: $(printf '%s' "$OUT" | tr '\n' '|')"
+OUT="$(run_lib GATE_E5_ENABLED=1 QG_LOG="$TMP/city/.gc/fp-admit2.jsonl" AUTHOR=crew/x FPT="$FP_TASK" -- <<<"$ADMIT_BODY")"
+check "admit with a healthy awk: a numeric record and NO warning" "LOGGED> $HEALTHY" "$(printf '%s\n' "$OUT" | grep '^LOGGED> ')"
+check "admit with a healthy awk: nothing was warned" "0" "$(printf '%s\n' "$OUT" | grep -c '^STDOUT> ')"
 
 # the real-size task: ~320KB of diff BETWEEN the template head and the "--- YOUR TASK ---" marker, like the live one
 awk 'BEGIN { while (n < 320000) { l = sprintf("+filler diff line %06d the quick brown fox jumps over the lazy dog 0123456789", ++i); if (i % 10 == 0) l = l " ga-vb0001"; print l; n += length(l) + 1 } }' > "$TMP/filler.txt"

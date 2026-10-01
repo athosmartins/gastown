@@ -150,19 +150,30 @@ _e5_warn() {
 }
 
 # gate_e5_prompt_fingerprint <review_task> <verdict_bead> — cksum of the instruction part of
-# a reviewer task (everything after the FIRST "--- YOUR TASK ---"; the whole task if the marker is absent),
-# with the per-run ids normalised, so the apuração can tell which prompt a run's reviewers were given (the
-# E4 design asks for it).
+# a reviewer task: everything after the template's OWN "--- YOUR TASK ---" line, with the per-run ids normalised,
+# so the apuração can tell which prompt a run's reviewers were given (the E4 design asks for it).
+# The split is at the LAST line that is exactly the marker, not at the first place the text occurs: the diff sits
+# BEFORE the template's marker and can quote it (mid-line, after a "+", or as a removed "-- YOUR TASK ---" line,
+# which renders as the bare marker), and a split inside the diff fingerprints the DIFF — two runs with the identical
+# prompt and different diffs would get different numbers. With no standalone marker line (the template drifted) the
+# whole task is fingerprinted, which gives a different number from any run that has one.
+# Three states, never two: a checksum, or "unknown" when the awk or the cksum FAILED. A failed first stage used to
+# hand cksum an empty stream and print 4294967295 — the checksum of nothing, which is also what a genuinely EMPTY
+# instruction part gives — and the caller logged it as a measurement. The exit status of every stage comes out of
+# the pipeline with its result (PIPESTATUS, read inside the substitution), and the answer must be a well-formed
+# "<sum> <bytes>" line from a pipeline that exited 0 all the way. "unknown" is only the VALUE: the warning is the
+# caller's (gate_e5_log_admit), because warn() writes to STDOUT and this runs inside a $(...).
 # ONE awk pass over the task, never a bash pattern operation on it: the task carries up to GATE_DIFF_BYTE_BUDGET
 # (400KB) of diff and this marker sits AFTER the diff, and under bash 3.2 ${v#*pat} and ${v/pat/rep} are
 # QUADRATIC in the length of $v (measured: 80KB 10s; the real 333KB task of this bead had not returned after
 # 7m40s). This runs on the dispatcher's main path for every admitted run, under the gate lock — a stall here
 # delays every other run. The ids go in through ENVIRON (awk -v would process backslash escapes) and are
-# replaced as LITERAL text (index(), not a pattern). Output is byte-for-byte what the old
-# ${1#*marker} / ${_t//id/<VB>} form produced: the input gets one extra "\n" so awk sees the last line,
-# and the lines are joined by "\n" with none after the last one.
+# replaced as LITERAL text (index(), not a pattern: the old ${_t//$AUTHOR/..} read an AUTHOR with glob characters
+# as a pattern). The input gets one extra "\n" so awk sees the last line, the lines are joined by "\n" with none
+# after the last one, and the remainder of the marker line itself (empty) leads, as it always did.
 gate_e5_prompt_fingerprint() {
-  printf '%s\n' "${1:-}" | E5_VB="${2:-}" E5_AUTHOR="${AUTHOR:-}" LC_ALL=C awk '
+  local _res _sum _st _re='^[0-9]+ [0-9]+$'
+  _res="$(printf '%s\n' "${1:-}" | E5_VB="${2:-}" E5_AUTHOR="${AUTHOR:-}" LC_ALL=C awk '
     function rep(s, from, to,    out, i, n) {
       if (from == "") return s
       n = length(from); out = ""
@@ -171,19 +182,33 @@ gate_e5_prompt_fingerprint() {
     }
     function emit(s) { s = rep(s, vb, "<VB>"); s = rep(s, au, "<AUTHOR>"); printf "%s%s", (n++ ? "\n" : ""), s }
     BEGIN { m = "--- YOUR TASK ---"; vb = ENVIRON["E5_VB"]; au = ENVIRON["E5_AUTHOR"] }
-    found { emit($0); next }
-    { i = index($0, m); if (i) { found = 1; emit(substr($0, i + length(m))); next } buf[++nb] = $0 }
-    END { if (!found) for (k = 1; k <= nb; k++) emit(buf[k]) }' | cksum 2>/dev/null | awk '{print $1}'
+    $0 == m { last = NR }
+    { buf[NR] = $0 }
+    END { if (last) emit(""); for (k = last + 1; k <= NR; k++) emit(buf[k]) }' | cksum 2>/dev/null
+    echo "rc=${PIPESTATUS[*]}")"
+  _sum="${_res%%$'\n'*}"
+  _st="${_res##*$'\n'}"
+  if [ "$_st" = "rc=0 0 0" ] && [[ "$_sum" =~ $_re ]]; then
+    printf '%s\n' "${_sum%% *}"
+  else
+    printf 'unknown\n'
+  fi
+  return 0
 }
 
 # gate_e5_log_admit <review_task_1> <verdict_bead_1> — the per-run record of the experiment
 # (one line per run admitted while the flag is on, BOTH arms): the denominators of the
 # apuração and the stratification keys (size, rig, tier), written before any reviewer runs.
 gate_e5_log_admit() {
+  local _fp
+  _fp="$(gate_e5_prompt_fingerprint "${1:-}" "${2:-}")"
+  if [ "$_fp" = "unknown" ]; then
+    _e5_warn "E5: could not fingerprint the reviewer prompt of run ${GATE_RUN_ID:-?} (an awk or cksum stage failed) — review_prompt_cksum is logged as unknown, not as a checksum."
+  fi
   gate_e5_log_event e5_admit gate_run "${GATE_RUN_ID:-}" bead "${BEAD_ID:-}" branch "${BRANCH:-}" \
     rig "${RIG:-}" tier "${TIER:-}" author "${AUTHOR:-}" arm "${GATE_E5_ARM:-?}" \
     trigger "${GATE_E5_TRIGGER:-none}" size_state "${GATE_E5_SIZE_STATE:-unknown}" raw_lines "${GATE_E5_RAW_LINES:-}" \
-    base_reviewers "${REQUIRED_REVIEWERS:-}" review_prompt_cksum "$(gate_e5_prompt_fingerprint "${1:-}" "${2:-}")"
+    base_reviewers "${REQUIRED_REVIEWERS:-}" review_prompt_cksum "$_fp"
 }
 
 # gate_e5_log_session <slot> <session_id> <session_name> <session_key> <verdict_bead> — which
