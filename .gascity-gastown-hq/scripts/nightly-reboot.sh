@@ -85,9 +85,10 @@
 # flight, Dolt maintenance) are fail-closed. Gate / hq / scraper are
 # informational there: an unreadable one is logged as "unknown" or "TIMED OUT"
 # and does NOT hold the reboot — and every bd/Dolt call between the fire and the
-# shutdown, the SKIP bookkeeping included, has a deadline (run_bounded), because a
-# call that can veto the reboot by hanging is the same silent failure this mode
-# exists to end. Not bounded (none of them is a bd/Dolt call, which is the class this
+# shutdown, the SKIP bookkeeping included, has a deadline (run_bounded: TERM at the
+# deadline, KILL after a short grace — a call that ignores TERM does not outlive it),
+# because a call that can veto the reboot by hanging is the same silent failure this
+# mode exists to end. Not bounded (none of them is a bd/Dolt call, which is the class this
 # deadline covers): `softwareupdate --install` (an install is long by design and must
 # not be cut), `softwareupdate --list --no-scan` (macos_update_check_state, local cache),
 # notify (its own curl/mail limits), `sync` and `sudo`.
@@ -203,19 +204,26 @@ boot_epoch() {
 # drain_stamp: (re)write the signal atomically: DRAIN | written | boot | until.
 # `until` is fixed at DRAIN_STARTED + DRAIN_MAX_SECS and never extended.
 drain_stamp() {
-  local boot tmp
+  local boot tmp prev
   boot="$(boot_epoch)"
   case "${boot}" in ''|*[!0-9]*)
     log "ERROR: drain: kern.boottime unreadable — NOT writing the drain signal (it could not be tied to this boot, and an unprovable signal is ignored by the readers anyway)"
     return 1 ;;
   esac
   tmp="${DRAIN_FILE}.tmp.$$"
+  # Take over the cleanup duty BEFORE the file can exist. This flag used to be set after the
+  # `mv`: a TERM that landed between the two (the trap runs as soon as `mv` returns) ran the
+  # EXIT trap with DRAIN_ACTIVE still 0, which then removed nothing — the city stayed drained
+  # until the reader's 30min staleness window. A cleanup that finds no file removes nothing,
+  # so claiming early is harmless; the flag goes back only if the write failed.
+  prev="${DRAIN_ACTIVE:-0}"
+  DRAIN_ACTIVE=1
   if { printf 'DRAIN\n%s\n%s\n%s\n' "$(date +%s)" "${boot}" "$(( DRAIN_STARTED + DRAIN_MAX_SECS ))" > "${tmp}" \
        && chmod 644 "${tmp}" && mv -f "${tmp}" "${DRAIN_FILE}"; } 2>/dev/null; then
-    DRAIN_ACTIVE=1
     return 0
   fi
   rm -f "${tmp}" 2>/dev/null
+  DRAIN_ACTIVE="${prev}"
   log "ERROR: drain: could not write ${DRAIN_FILE} — the drain is INERT tonight; the reboot proceeds on the safety guards alone"
   return 1
 }
@@ -231,18 +239,24 @@ drain_end() {
   DRAIN_ACTIVE=0
 }
 
-# EXIT trap target: any way out of this script releases the drain (the reboot
-# path included — the readers also ignore a signal from a previous boot).
+# EXIT trap target: any way out of this script releases the drain, EXCEPT a shutdown
+# the OS accepted (rc 0): that path sets DRAIN_ACTIVE=0 first, so the signal is left on
+# disk until the reboot invalidates it (see reboot_now_sequence) — releasing the gates
+# seconds before the machine goes down would let work start that the reboot then kills.
+# A failed shutdown (rc != 0) and every skip, kill or error DO release it.
 drain_cleanup() {
   [ -n "${DRAIN_SLEEP_PID:-}" ] && kill "${DRAIN_SLEEP_PID}" 2>/dev/null
+  # Release the city FIRST: taking a probe's process tree down can cost a TERM -> KILL grace
+  # (seconds), and the dispatchers should not stay paused behind it. The temp file is this
+  # shell's own ($$): a kill that lands mid-write must not leave it behind either.
+  if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then
+    rm -f "${DRAIN_FILE}" "${DRAIN_FILE}.tmp.$$" 2>/dev/null
+    DRAIN_ACTIVE=0
+  fi
   # a kill that lands while run_bounded waits must take the probe (bd, and whatever
   # bd started) down with it, not leave it running past this script
   [ -n "${BOUNDED_WD:-}" ] && kill "${BOUNDED_WD}" 2>/dev/null
-  [ -n "${BOUNDED_PID:-}" ] && _kill_tree "${BOUNDED_PID}"
-  if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then
-    rm -f "${DRAIN_FILE}" 2>/dev/null
-    DRAIN_ACTIVE=0
-  fi
+  [ -n "${BOUNDED_PID:-}" ] && _kill_tree_escalate "${BOUNDED_PID}"
   return 0
 }
 trap 'drain_cleanup; rm -f "${GATE_ERR}" "${HQ_ERR}"' EXIT
@@ -275,12 +289,35 @@ case "${INFO_PROBE_TIMEOUT}" in ''|*[!0-9]*|0) INFO_PROBE_TIMEOUT=30 ;; esac
 case "${INFO_BUDGET_SECS}" in ''|*[!0-9]*|0) INFO_BUDGET_SECS=75 ;; esac
 INFO_DEADLINE=0
 
-# _kill_tree <pid>: TERM <pid> and everything below it, leaves first (a parent
-# killed first re-parents its children and pgrep -P can no longer find them).
-_kill_tree() {
+# _tree_pids <pid>: <pid> and everything below it, one per line, leaves first. The
+# list is taken BEFORE anything is signalled: a parent killed first re-parents its
+# children to launchd and `pgrep -P` can no longer find them.
+_tree_pids() {
   local c
-  for c in $(/usr/bin/pgrep -P "$1" 2>/dev/null); do _kill_tree "${c}"; done
-  kill -TERM "$1" 2>/dev/null
+  for c in $(/usr/bin/pgrep -P "$1" 2>/dev/null); do _tree_pids "${c}"; done
+  echo "$1"
+}
+
+# _kill_tree_escalate <pid>: TERM the tree, give it KILL_GRACE seconds, then KILL
+# whatever is still alive (gate FAIL 3/3). A deadline that is one TERM is only a deadline
+# for children that honor TERM: `trap '' TERM; while :; do sleep 1; done` ignores it, and
+# run_bounded, which `wait`s for the child, then never returned — the silent hang the
+# deadlines exist to end. The survivors are looked up in the snapshot taken before the
+# TERM, so a child its parent's death re-parented is still found. Counted with $SECONDS
+# and `kill -0` (builtins), like the rest of the deadline code.
+_kill_tree_escalate() {
+  local pids p alive end
+  pids="$(_tree_pids "$1")"
+  for p in ${pids}; do kill -TERM "${p}" 2>/dev/null; done
+  end=$(( SECONDS + ${NIGHTLY_REBOOT_KILL_GRACE_SECS:-2} ))
+  while :; do
+    alive=""
+    for p in ${pids}; do kill -0 "${p}" 2>/dev/null && alive="${alive} ${p}"; done
+    [ -z "${alive}" ] && return 0
+    [ "${SECONDS}" -ge "${end}" ] && break
+    sleep 1 2>/dev/null || :
+  done
+  for p in ${alive}; do kill -KILL "${p}" 2>/dev/null; done
   return 0
 }
 
@@ -304,7 +341,7 @@ run_bounded() {
     while kill -0 "${BOUNDED_PID}" 2>/dev/null; do
       if [ "${SECONDS}" -ge "${end}" ]; then
         : > "${out}.deadline"
-        _kill_tree "${BOUNDED_PID}"
+        _kill_tree_escalate "${BOUNDED_PID}"
         break
       fi
       sleep 1 2>/dev/null || :
@@ -312,8 +349,17 @@ run_bounded() {
   ) >/dev/null 2>&1 &
   BOUNDED_WD=$!
   wait "${BOUNDED_PID}" 2>/dev/null; rc=$?
-  kill "${BOUNDED_WD}" 2>/dev/null
-  wait "${BOUNDED_WD}" 2>/dev/null
+  if [ -e "${out}.deadline" ]; then
+    # The deadline fired, so the watchdog is escalating TERM -> KILL on the tree. <cmd> (a
+    # function in a subshell) dies at the TERM and ends the `wait` above at once — but what IT
+    # started (bd) may ignore TERM, and only the watchdog's KILL stage reaches it. Killing the
+    # watchdog here, as the normal path does, left exactly those orphans alive (E18). Bounded:
+    # one KILL_GRACE and a poll.
+    wait "${BOUNDED_WD}" 2>/dev/null
+  else
+    kill "${BOUNDED_WD}" 2>/dev/null
+    wait "${BOUNDED_WD}" 2>/dev/null
+  fi
   BOUNDED_PID=""; BOUNDED_WD=""
   if [ -e "${out}.deadline" ]; then rm -f "${out}.deadline"; return 124; fi
   return "${rc}"
@@ -1024,10 +1070,21 @@ secs_until_hhmm() {
 # nightly-reboot.drain.selftest.sh:DRAIN-SCHEDULE-END
 
 # nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-START — extracted by the selftest
-# Matches the maintenance WRAPPERS and mutating dolt CLI verbs, anchored at argv[0]
-# (pgrep -f sees "argv0 argv1 ..."): a Claude session whose prompt merely MENTIONS
-# "dolt-compact-routine" does not match, and `dolt sql-server` never does.
-DOLT_MAINT_PATTERN_DEFAULT='^(/bin/bash|/bin/sh|bash|sh)( -[A-Za-z]+)* ([^ ]*/)?(dolt-compact-routine|dolt-gc-maintenance|dolt-gc-release-trigger|dolt-backup-reseed|dolt-backup-swap-repair|dolt-backup-residue-reclaim|dolt-offline-backup-sync)\.sh( |$)|^([^ ]*/)?dolt (gc|backup|push|pull|fetch|table)( |$)'
+# Matches the maintenance WRAPPERS and the mutating dolt CLI, anchored at argv[0] (pgrep -f
+# sees "argv0 argv1 ..."): a Claude session whose prompt merely MENTIONS "dolt-compact-routine"
+# does not match, and `dolt sql-server` never does. Three arms:
+#   1. a shell (any path: /bin/bash, /opt/homebrew/bin/bash, bare bash...) running one of the
+#      wrapper scripts. The list is every scripts/dolt-*.sh that can be running at 23:40 and
+#      that a kill would leave half-done: the maintenance wrappers, the backup/restore
+#      wrappers (dolt-s3-backup.sh is scheduled 04:00 by com.gascity.dolt-s3-backup; an
+#      overrunning or re-kicked run is invisible to arm 2 because the wrapper's sync is a
+#      `dolt ... sql -q` child, arm 3) and dolt-restore-verify. The selftest (E12) lists
+#      scripts/dolt-*.sh and fails on one that is neither here nor in its explicit
+#      "not a hazard" list — a new wrapper has to be classified, not forgotten.
+#   2. the dolt CLI verbs that mutate or move data (`dolt gc`, `dolt backup`, ...).
+#   3. `dolt [flags] sql ... CALL DOLT_GC / DOLT_BACKUP` — the same operations through the
+#      SQL procedures (a CLI client; a long-lived `dolt sql-server` never matches).
+DOLT_MAINT_PATTERN_DEFAULT='^([^ ]*/)?(bash|sh)( -[A-Za-z]+)* ([^ ]*/)?(dolt-compact-routine|dolt-gc-maintenance|dolt-gc-release-trigger|dolt-backup-reseed|dolt-backup-swap-repair|dolt-backup-residue-reclaim|dolt-offline-backup-sync|dolt-s3-backup|dolt-restore-verify)\.sh( |$)|^([^ ]*/)?dolt (gc|backup|push|pull|fetch|table)( |$)|^([^ ]*/)?dolt( [^ ]+)* sql .*[Cc][Aa][Ll][Ll] +[Dd][Oo][Ll][Tt]_([Gg][Cc]|[Bb][Aa][Cc][Kk][Uu][Pp])'
 # nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-END
 DOLT_MAINT_PATTERN="${NIGHTLY_REBOOT_DOLT_MAINT_PATTERN:-${DOLT_MAINT_PATTERN_DEFAULT}}"
 
@@ -1253,19 +1310,25 @@ log "disk before: $(df -h /System/Volumes/Data | tail -1 | awk '{print $4" free 
 log "swap before: $(sysctl -n vm.swapusage 2>/dev/null)"
 log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 
-notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
-
-# Drain mode: the safety verdict was read before the informational probes, the macOS
-# install and the notify above, and none of them stops the central sender. Read it again
-# as late as possible; a send that started in the gap holds the reboot like one that was
-# there at 23:40. The streak is reset only after this, so a night that ends here as a
-# SKIP keeps counting. What is left between this read and the shutdown is the
-# scraper-cut bookkeeping (a local file; the alarm mail only from the 2nd night in a row,
-# bounded by INFO_PROBE_TIMEOUT), the pending file and `sync` — seconds, not minutes.
+# Drain mode: the safety verdict was read before the informational probes and the macOS
+# install above, and none of them stops the central sender. Read it again as late as
+# possible; a send that started in the gap holds the reboot like one that was there at
+# 23:40. The streak is reset only after this, so a night that ends here as a SKIP keeps
+# counting. What is left between this read and the shutdown is the routine note below,
+# the scraper-cut bookkeeping (a local file; the alarm mail only from the 2nd night in a
+# row, bounded by INFO_PROBE_TIMEOUT), the pending file and `sync` — seconds, not minutes.
 if [ "${REBOOT_MODE}" = "drain" ]; then
     log "final safety re-check, just before the shutdown (the 23:40 verdict is minutes old)"
     safety_gate_wait || drain_skip_night
 fi
+
+# The routine "Reiniciando" note is sent AFTER the re-check (gate FAIL 3/3): the re-check
+# can still turn the night into a SKIP — up to ~16 min later — and a "reiniciando às HH:MM"
+# that is followed by "pulado" is a message that said something that did not happen. The
+# price is that notify's own time now sits between the re-check and the shutdown: notify is
+# one of the calls this script does not bound (see the header), and that time was not
+# measured here — it is a routine note on the digest route, not an alarm push.
+notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
 reset_streak
 
 # The scraper-cut counter is bumped HERE, as late as it can be: it counts nights the
@@ -1288,7 +1351,14 @@ RC=$?
 # the file MUST survive it: it is the only thing telling the post-boot check this
 # boot was ours.
 if [ "${RC}" -eq 0 ]; then
-    log "shutdown accepted (rc 0) — the machine is going down; the post-boot check takes over"
+    # The drain signal STAYS: this exit would otherwise run drain_cleanup and release the
+    # city's admission gates seconds before the machine is down, so a dispatcher could start
+    # work the reboot is about to kill — the very thing the drain exists to prevent. The
+    # signal carries this boot's epoch, so every reader ignores it after the reboot (nothing
+    # has to clear it), and if the machine somehow does not go down it expires on its own
+    # (30min staleness, DRAIN_MAX_SECS ceiling).
+    DRAIN_ACTIVE=0
+    log "shutdown accepted (rc 0) — the machine is going down; the drain signal is left in place (the reboot invalidates it) and the post-boot check takes over"
     exit 0
 fi
 rm -f "${PENDING_FILE}" 2>/dev/null

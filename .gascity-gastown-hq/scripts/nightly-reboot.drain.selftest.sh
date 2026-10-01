@@ -30,6 +30,7 @@
 #   E6  arquivo de pendencia pro pos-boot; janela do Guard 1 (23:00-23:19 dreno,
 #       01:00-01:19 legado, o resto SKIP sem tocar em nada)
 #   E7  morte no meio da espera (SIGTERM) nao deixa a cidade drenada
+#   E7b o mesmo SIGTERM, caindo DETERMINISTICAMENTE entre criar o sinal e registra-lo pro cleanup (mv lento)
 #   E8  o calculo de "quantos segundos ate 23:40" (funcao pura, extraida)
 #   E9  bd/Dolt PENDURADO (gate-fix 1): as chamadas "informativas" tem prazo —
 #       o reboot sai mesmo assim, o log diz "TIMED OUT (unknown)", nada fica vivo
@@ -42,6 +43,8 @@
 #   E15 a noite PULADA tambem tem prazo: gc pendurado no registro do skip nao prende a instancia
 #   E16 gate-fix 2: os guards de SEGURANCA sao lidos de novo logo antes do shutdown — um envio que
 #       comecou no intervalo segura o reboot (e uma noite pulada ali NAO zera o streak)
+#   E18 gate-fix 3: um bd que IGNORA o TERM (`trap '' TERM`) — o prazo e TERM, folga, KILL; o reboot sai,
+#       a arvore morre, e um SIGTERM no script tambem leva o bd que ignora TERM (nada fica vivo)
 #   E17 o ROTEAMENTO: o notify de verdade (NOTIFY_ROUTE_TEST=1) diz onde cai cada aviso. O padrao do
 #       notify e o digest SILENCIOSO; so o aviso de alarme (noite pulada, N noites seguidas) vai com
 #       NOTIFY_FORCE_PUSH, o aviso de rotina nao. (Nas rodadas E3/E15 tambem.)
@@ -85,7 +88,15 @@ cat > "$FAKEBIN/sleep" <<'EOF'
 [ -n "${FAKE_SLEEP_EARLY:-}" ] && exit 0
 exec /bin/sleep "$@"
 EOF
-chmod +x "$FAKEBIN/date" "$FAKEBIN/sudo" "$FAKEBIN/sleep"
+# mv que, com FAKE_MV_SLOW=N, demora N segundos DEPOIS de mover. E o E7b: abre, de forma deterministica, a janela
+# entre o `mv` que CRIA o sinal de dreno e a atribuicao que o registra pro EXIT trap (sem FAKE_MV_SLOW e um mv normal)
+cat > "$FAKEBIN/mv" <<'EOF'
+#!/usr/bin/env bash
+/bin/mv "$@"; rc=$?
+[ -n "${FAKE_MV_SLOW:-}" ] && /bin/sleep "$FAKE_MV_SLOW"
+exit $rc
+EOF
+chmod +x "$FAKEBIN/date" "$FAKEBIN/sudo" "$FAKEBIN/sleep" "$FAKEBIN/mv"
 
 real_boot_epoch() {
   /usr/sbin/sysctl -n kern.boottime | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }'
@@ -101,6 +112,7 @@ REAL_BOOT="$(real_boot_epoch)"
 #   W_SENDER_OK_AT 1-based: a chamada em que o fake passa a devolver 0 (default: nunca muda)
 #   W_PGREP_RC     rc do fake de pgrep               (default 1 = nada rodando)
 #   W_BD_HANG      1 = todo `bd` pendura (Dolt wedged): grava o pid e dorme 600s  (default 0)
+#                  2 = o `bd` pendura IGNORANDO o TERM (trap '' TERM + laco): so o KILL o derruba
 #   W_GC_HANG      1 = todo `gc` pendura                                          (default 0)
 #   W_BD_HANG_RIG  1 = so o `bd -C <rig>` pendura (o do HQ responde): garante que a sonda por rig RODA
 #   W_SENDER_SEQ   "0 1 0" = rc do fake de envio por NUMERO DA CHAMADA (a ultima repete)
@@ -124,6 +136,7 @@ EOF
   cat > "$W/bd" <<EOF
 #!/usr/bin/env bash
 if [ "${W_BD_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/bd.pids"; exec /bin/sleep 600; fi
+if [ "${W_BD_HANG:-0}" = "2" ]; then echo \$\$ >> "$W/bd.pids"; trap '' TERM; while :; do /bin/sleep 1; done; fi
 if [ "${W_BD_HANG_RIG:-0}" = "1" ] && [ "\$1" = "-C" ] && [ "\$2" != "$CITY" ]; then echo \$\$ >> "$W/bd.pids"; exec /bin/sleep 600; fi
 case "\$3" in
   list)
@@ -390,6 +403,33 @@ else
 fi
 wait "$NRPID" 2>/dev/null
 
+# E7b: o E7 manda o SIGTERM quando o arquivo APARECE e, sob carga (load 70), as vezes o pegava no intervalo entre o
+# `mv` que cria o sinal e o `DRAIN_ACTIVE=1` que vinha DEPOIS dele: o trap rodava com a flag ainda em 0 e o EXIT
+# trap nao removia nada — a cidade ficava drenada ate o sinal expirar (30min). Aqui a janela e aberta de proposito
+# (mv lento): o resultado nao depende de carga.
+echo "E7b: SIGTERM entre criar o sinal e registra-lo pro cleanup (mv lento) -> o sinal e removido do mesmo jeito"
+new_world e7b
+env PATH="$FAKEBIN:$PATH" CITY="$CITY" GC_BIN="$W/gc" BD_BIN="$W/bd" NOTIFY_BIN="$W/notify" NOTIFY_AS_USER="$USER" \
+    SHUTDOWN_BIN="$W/shutdown" SOFTWAREUPDATE_BIN="$W/softwareupdate" SCRAPER_RODADA_DIR="$W/rodada" \
+    NIGHTLY_REBOOT_DRAIN_FILE="$DRAIN" NIGHTLY_REBOOT_DRAIN_WAIT_SECS=60 NIGHTLY_REBOOT_DRAIN_STAMP_INTERVAL=60 \
+    NIGHTLY_REBOOT_SENDER_SAFE_PY="$SENDER" NIGHTLY_REBOOT_PGREP_BIN="$W/pgrep" FAKE_HOUR=23 FAKE_MV_SLOW=3 \
+    /bin/bash "$SCRIPT" > "$W/stdout" 2> "$W/stderr" &
+NRPID=$!
+for _ in $(seq 1 80); do [ -f "$DRAIN" ] && break; sleep 0.25; done
+if [ -f "$DRAIN" ]; then
+  ok "E7b o sinal apareceu e o script esta dentro da janela (o mv lento ainda nao voltou)"
+  kill -TERM "$NRPID" 2>/dev/null
+  for _ in $(seq 1 60); do kill -0 "$NRPID" 2>/dev/null || break; sleep 0.25; done
+  kill -0 "$NRPID" 2>/dev/null && { bad "E7b o script nao morreu com SIGTERM"; kill -KILL "$NRPID" 2>/dev/null; } || ok "E7b o script morreu com SIGTERM"
+  [ ! -f "$DRAIN" ] && ok "E7b sinal REMOVIDO mesmo com o SIGTERM caindo entre o mv e a flag (a cidade nao fica drenada ate expirar)" || bad "E7b o sinal ficou no disco: o cleanup nao sabia que o arquivo existia"
+  ls "$DRAIN".tmp.* >/dev/null 2>&1 && bad "E7b sobrou o arquivo temporario $(ls "$DRAIN".tmp.* | head -1)" || ok "E7b nenhum arquivo temporario do sinal sobrou"
+  ! rebooted && ok "E7b morrer na janela nao reinicia" || bad "E7b reiniciou apesar do SIGTERM"
+else
+  bad "E7b inconclusivo: o sinal nunca apareceu"
+  kill -KILL "$NRPID" 2>/dev/null
+fi
+wait "$NRPID" 2>/dev/null
+
 # ═══ E8: calculo do horario (funcao pura, extraida por sentinela) ════════════
 echo "E8: segundos ate HH:MM (funcao pura)"
 BLOCK="$(sed -n '/nightly-reboot.drain.selftest.sh:DRAIN-SCHEDULE-START/,/nightly-reboot.drain.selftest.sh:DRAIN-SCHEDULE-END/p' "$SCRIPT")"
@@ -431,7 +471,8 @@ log_has "informational: guard2 gate-markers: ok" && ok "E9 guard2 (o gate respon
 log_has "other rigs' in_progress counts (TIMED OUT|NOT ATTEMPTED)" && ok "E9 o laco de contagem por rig diz o que aconteceu (TIMED OUT ou NOT ATTEMPTED) — nao some e nao pendura" || bad "E9 laco por rig mudo. info: $(grep 'info:' "$LOGF" 2>/dev/null | tr '\n' '|')"
 SNAP="$(ls "$CITY"/.gc/logs/nightly-reboot-pre-*.txt 2>/dev/null | head -1)"
 if [ -n "$SNAP" ]; then grep -q "TIMED OUT" "$SNAP" && ok "E9 o snapshot registra que NAO deu pra ler (unknown), em vez de omitir" || bad "E9 snapshot sem a linha TIMED OUT"; else bad "E9 snapshot nao gerado"; fi
-[ ! -f "$DRAIN" ] && ok "E9 sinal de dreno removido no fim" || bad "E9 sinal de dreno ficou no disco"
+# o shutdown "pegou" (rc 0): o sinal FICA — o boot-epoch dele e o que invalida depois do reboot (E13)
+[ -f "$DRAIN" ] && [ "$(sed -n 3p "$DRAIN" 2>/dev/null)" = "$REAL_BOOT" ] && ok "E9 reboot aceito (rc 0): o sinal de dreno ficou no disco com o boot-epoch deste boot (o reboot e quem o invalida)" || bad "E9 depois de um shutdown aceito o sinal deveria estar no disco com o boot $REAL_BOOT: '$(cat "$DRAIN" 2>/dev/null | tr '\n' '|')'"
 [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E9 nenhum bd pendurado sobrou vivo (a arvore inteira foi morta no prazo)" || bad "E9 sobraram $(pids_alive "$W/bd.pids") bd pendurados vivos"
 kill_pids "$W/bd.pids"
 
@@ -519,7 +560,7 @@ else
   /usr/bin/pgrep -f "$PAT" >/dev/null 2>&1; PRC=$?
   [ "$PRC" = "0" ] || [ "$PRC" = "1" ] && ok "E12 o pgrep real ACEITA o padrao (rc=$PRC, nao 2): o guard nao fica 'nao sei' toda noite" || bad "E12 o pgrep real rejeitou o padrao (rc=$PRC) — o guard viraria 'unknown => NAO e seguro' toda noite"
   MD="$TMP/maint"; mkdir -p "$MD"
-  for n in dolt-compact-routine dolt-gc-maintenance dolt-gc-release-trigger dolt-backup-reseed dolt-backup-swap-repair dolt-backup-residue-reclaim dolt-offline-backup-sync; do
+  for n in dolt-compact-routine dolt-gc-maintenance dolt-gc-release-trigger dolt-backup-reseed dolt-backup-swap-repair dolt-backup-residue-reclaim dolt-offline-backup-sync dolt-s3-backup dolt-restore-verify; do
     printf '#!/bin/bash\n/bin/sleep 25\n' > "$MD/$n.sh"; chmod +x "$MD/$n.sh"
   done
   SPAWNED=""
@@ -540,20 +581,62 @@ else
   spawn envbash    "dolt-gc-release-trigger.sh"   env bash "$MD/dolt-gc-release-trigger.sh"
   spawn nice       "dolt-backup-reseed.sh"        nice -n 5 /bin/bash "$MD/dolt-backup-reseed.sh"
   spawn doltgc     "dolt gc"                      /bin/bash -c 'exec -a "dolt gc" /bin/sleep 25'
+  # gate-fix 3: o backup que roda as 04:00 e o verify semanal ficavam invisiveis ao guard; o sync do
+  # dolt-s3-backup.sh e um `dolt ... sql -q 'CALL DOLT_BACKUP(...)'` (nao um verbo da CLI); e o
+  # interpretador nao e sempre /bin/bash
+  spawn s3backup   "dolt-s3-backup.sh"            /bin/bash "$MD/dolt-s3-backup.sh"
+  spawn restoreverify "dolt-restore-verify.sh"    /bin/bash "$MD/dolt-restore-verify.sh"
+  spawn homebrew   "/opt/homebrew/bin/bash"       /bin/bash -c 'exec -a /opt/homebrew/bin/bash /bin/bash "$0"' "$MD/dolt-gc-maintenance.sh"
+  spawn sqlbackup  "CALL DOLT_BACKUP"             /bin/bash -c 'exec -a "dolt --user root --no-tls sql -q USE hq; CALL DOLT_BACKUP(sync hq-backup)" /bin/sleep 25'
+  spawn sqlgclower "call dolt_gc"                 /bin/bash -c 'exec -a "dolt sql -q call dolt_gc()" /bin/sleep 25'
   spawn mention    "dolt-compact-routine.sh"      /bin/bash -c '/bin/sleep 25' dolt-compact-routine.sh
+  spawn mentionbk  "dolt-s3-backup.sh"            /bin/bash -c '/bin/sleep 25' dolt-s3-backup.sh
   spawn sqlserver  "dolt sql-server"              /bin/bash -c 'exec -a "dolt sql-server" /bin/sleep 25'
+  spawn sqlselect  "dolt sql -q SELECT"           /bin/bash -c 'exec -a "dolt sql -q SELECT count(*) FROM issues" /bin/sleep 25'
   MATCHED=" $(/usr/bin/pgrep -f "$PAT" 2>/dev/null | tr '\n' ' ') "
   matches() { case "$MATCHED" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-  for nm in explicit shebang envbash nice doltgc; do
+  for nm in explicit shebang envbash nice doltgc s3backup restoreverify homebrew sqlbackup sqlgclower; do
     eval "p=\$PID_$nm"
     matches "$p" && ok "E12 positivo '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) casa" || bad "E12 FALSO-NEGATIVO '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) NAO casou — o guard deixaria rebootar no meio da manutencao"
   done
-  for nm in mention sqlserver; do
+  for nm in mention mentionbk sqlserver sqlselect; do
     eval "p=\$PID_$nm"
     matches "$p" && bad "E12 FALSO-POSITIVO '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) casou — o guard seguraria o reboot sem manutencao nenhuma" || ok "E12 negativo '$nm' (pid $p) NAO casa"
   done
   # (the group's own 2>/dev/null is what hides bash's "Killed: 9" job notices)
   { for p in $SPAWNED; do /usr/bin/pkill -KILL -P "$p"; kill -KILL "$p"; done; wait; } 2>/dev/null
+
+  # A CLASSE, nao so os exemplos: todo scripts/dolt-*.sh tem que estar COBERTO pelo padrao ou numa lista
+  # explicita de "nao e risco" com o motivo. Um wrapper novo que ninguem classificou reprova aqui — foi assim
+  # que dolt-s3-backup e dolt-restore-verify ficaram de fora ate o gate pegar. (O teste do argv montado como
+  # "/bin/bash <script>" e o formato que o launchd usa em todos os plists atuais.)
+  echo "E12b: todo scripts/dolt-*.sh esta coberto pelo padrao ou classificado como 'nao e risco'"
+  not_a_hazard() {
+    case "$1" in
+      dolt-backup-s3-proof|dolt-pid-lib) echo "biblioteca (so e carregada com source, nunca executada)" ;;
+      dolt-backup-status) echo "relatorio de diagnostico, so le" ;;
+      dolt-latency-alarm) echo "alarme: so notifica, nunca age" ;;
+      dolt-disk-floor-guard) echo "vigia periodico e curto, nao-invasivo: um kill no meio nao deixa nada pela metade" ;;
+      dolt-hang-watchdog) echo "reinicia o Dolt travado — o reboot e, ele mesmo, um restart do Dolt" ;;
+      dolt-s3-lifecycle-apply) echo "chamada a API do S3, idempotente: nao toca no Dolt local" ;;
+      *) return 1 ;;
+    esac
+  }
+  N_DOLT=0
+  for f in "$SELF_DIR"/dolt-*.sh; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f" .sh)"
+    case "$b" in *.selftest) continue ;; esac
+    N_DOLT=$((N_DOLT+1))
+    if printf '%s\n' "/bin/bash /x/$b.sh" | grep -qE -- "$PAT"; then
+      ok "E12b $b: coberto pelo padrao"
+    elif why="$(not_a_hazard "$b")"; then
+      ok "E12b $b: fora do padrao, de proposito ($why)"
+    else
+      bad "E12b $b.sh e NOVO e nao esta no padrao nem na lista de 'nao e risco': se ele pode estar rodando as 23:40 e um kill o deixa pela metade, ponha no DOLT_MAINT_PATTERN; senao, classifique-o em not_a_hazard"
+    fi
+  done
+  [ "$N_DOLT" -ge 10 ] && ok "E12b enumerou $N_DOLT scripts dolt-* (o glob achou os scripts)" || bad "E12b so achou $N_DOLT scripts dolt-*: o glob nao esta enxergando scripts/ — o teste nao prova nada"
 fi
 
 # ═══ E13: o hand-off pro pos-boot ════════════════════════════════════════════
@@ -561,11 +644,17 @@ echo "E13: shutdown que falha apaga a pendencia; shutdown que 'pega' (rc 0) a ma
 W_SHUTDOWN_RC=1 new_world e13a; run_nr FAKE_HOUR=23
 log_has "shutdown returned 1" && ok "E13 o log registra o shutdown que falhou" || bad "E13 sem 'shutdown returned 1' no log"
 [ ! -f "$PENDING" ] && ok "E13 shutdown rc=1 -> pendencia REMOVIDA (nenhum reboot em andamento; outro reboot em <3h nao vira 'Reboot noturno OK')" || bad "E13 pendencia ficou no disco apos um shutdown que falhou"
+[ ! -f "$DRAIN" ] && ok "E13 shutdown rc=1 -> sinal de dreno REMOVIDO (nada esta reiniciando: a cidade volta a trabalhar)" || bad "E13 o sinal de dreno ficou no disco depois de um shutdown que FALHOU — a cidade ficaria pausada sem reboot"
 log_has "ERROR: shutdown returned 1 — reboot did NOT happen" && ok "E13 rc=1: o log diz ERROR 'reboot did NOT happen' (e verdade)" || bad "E13 rc=1 sem a linha de ERROR no log"
 new_world e13b; run_nr FAKE_HOUR=23
 log_has "shutdown accepted \(rc 0\)" && ok "E13 rc=0: o log diz que o shutdown foi aceito" || bad "E13 rc=0 sem 'shutdown accepted (rc 0)' no log"
 log_has "reboot did NOT happen" && bad "E13 rc=0: o log diz ERROR 'reboot did NOT happen' com a maquina caindo (mentira no log)" || ok "E13 rc=0: nenhum 'reboot did NOT happen' falso no log"
 [ -f "$PENDING" ] && ok "E13 shutdown rc=0 -> pendencia FICA (a maquina esta caindo; e o que avisa o pos-boot que este boot e nosso)" || bad "E13 a pendencia sumiu num shutdown que pegou: o pos-boot nao saberia que o boot foi do noturno"
+# gate-fix 3: o EXIT trap soltava o dreno tambem no rc 0, segundos antes da maquina cair — um despachante
+# podia admitir trabalho que o reboot mata. O sinal fica; o boot-epoch dele e o que o invalida depois.
+[ -f "$DRAIN" ] && ok "E13 shutdown rc=0 -> sinal de dreno FICA (a cidade nao volta a admitir trabalho segundos antes de cair)" || bad "E13 o sinal de dreno foi removido num shutdown aceito (rc 0): os despachantes voltariam a admitir trabalho que o reboot mata"
+[ "$(sed -n 3p "$DRAIN" 2>/dev/null)" = "$REAL_BOOT" ] && ok "E13 rc=0: o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13 rc=0: boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado $REAL_BOOT)"
+log_has "drain signal is left in place" && ok "E13 rc=0: o log diz que o sinal foi deixado de proposito" || bad "E13 rc=0: o log nao diz o que aconteceu com o sinal"
 
 # ═══ E14: contador do scraper + mail pendurado ═══════════════════════════════
 echo "E14: o contador de scraper cortado so move perto do shutdown; mail pendurado tem prazo"
@@ -638,6 +727,7 @@ rebooted && ok "E16a o envio terminou durante a re-checagem -> reinicia" || bad 
 log_has "final safety re-check" && ok "E16a o log registra a re-checagem final" || bad "E16a sem a re-checagem final no log (o veredito das 23:40 foi usado como esta)"
 [ "$(wc -l < "$SENDER_N" | tr -d ' ')" = "3" ] && ok "E16a o guard de envio foi consultado 3x (decisao, re-checagem bloqueada, re-checagem livre)" || bad "E16a o guard de envio foi consultado $(wc -l < "$SENDER_N" | tr -d ' ')x, esperado 3"
 log_has "attempt 1/3 blocked by a safety guard" && ok "E16a a tentativa bloqueada da re-checagem ficou no log" || bad "E16a sem a tentativa bloqueada no log"
+[ "$(grep -c -F 'Reiniciando' "$NOTIFY_CALLS")" = "1" ] && ok "E16a o aviso de rotina 'Reiniciando...' saiu 1x (a noite reinicia)" || bad "E16a 'Reiniciando' mandado $(grep -c -F 'Reiniciando' "$NOTIFY_CALLS")x, esperado 1"
 # b) o envio fica em voo ate o fim -> SKIP; nada foi cortado, nada foi contado
 W_SENDER_SEQ="0 1" W_SCRAPER=1 new_world e16b; printf '13\n' > "$STREAK"
 run_nr FAKE_HOUR=23
@@ -650,6 +740,46 @@ log_has "SKIP: safety guards still blocked" && ok "E16b SKIP do guard de seguran
 SCUT="$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
 { [ ! -s "$SCUT" ] || [ "$(cat "$SCUT" 2>/dev/null)" = "0" ]; } && ok "E16b o contador de scraper cortado nao andou (o scraper nao foi cortado)" || bad "E16b contador de scraper cortado = '$(cat "$SCUT" 2>/dev/null)' numa noite sem reboot"
 assert_push "E16b aviso de noite pulada" "Reboot noturno pulado"
+# gate-fix 3: a nota "Reiniciando as HH:MM" saia ANTES da re-checagem final — uma noite que a re-checagem
+# transformava em SKIP (ate ~16min depois) mandava "reiniciando" e em seguida "pulado": um aviso que dizia
+# o que nao aconteceu. Agora a nota so sai depois que a re-checagem liberou.
+[ "$(force_of "Reiniciando")" = "NONE" ] && ok "E16b a noite foi PULADA na re-checagem: o aviso 'Reiniciando...' NAO foi mandado (nunca disse 'reiniciando' numa noite que nao reiniciou)" || bad "E16b mandou 'Reiniciando...' numa noite que a re-checagem pulou: $(grep -F 'Reiniciando' "$NOTIFY_CALLS" | head -1)"
+
+# ═══ E18: um bd que IGNORA o TERM ═════════════════════════════════════════════
+# O prazo do run_bounded era UM `kill -TERM`, e depois o script fazia `wait` no filho. Pra quem respeita o
+# TERM (o bd e Go e provavelmente respeita) tanto faz — mas `trap '' TERM; while :; do sleep 1; done` o
+# ignora, e o `wait` nunca voltava: o mesmo silencio que o prazo existe pra acabar (gate FAIL 3/3).
+echo "E18: bd que IGNORA o TERM -> TERM, folga, KILL; o reboot sai e a arvore morre"
+W_BD_HANG=2 W_RIG=1 new_world e18a
+T0=$(/bin/date +%s)
+NR_LIMIT=90 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=40 NIGHTLY_REBOOT_KILL_GRACE_SECS=1
+T1=$(/bin/date +%s)
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E18 o script terminou sozinho em $((T1-T0))s com um bd que ignora o TERM (nao pendurou)" || bad "E18 o script PENDUROU ate o limite de 90s: o prazo era um TERM so, e o bd o ignora. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
+rebooted && ok "E18 reboot emitido com o bd que ignora o TERM" || bad "E18 NAO reiniciou. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ $((T1-T0)) -le 60 ] && ok "E18 dentro do limite ($((T1-T0))s <= 60s)" || bad "E18 demorou $((T1-T0))s"
+log_has "informational: guard3 hq-in-progress: unknown TIMED OUT" && ok "E18 o log diz 'unknown TIMED OUT' (nem 'ok', nem silencio)" || bad "E18 sem a linha TIMED OUT. informational: $(grep 'informational' "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E18 o bd que ignorava o TERM foi KILLed (nenhum sobrou vivo)" || bad "E18 sobraram $(pids_alive "$W/bd.pids") bd que ignoram o TERM vivos"
+kill_pids "$W/bd.pids"
+
+echo "E18b: SIGTERM no script parado num bd que ignora o TERM -> o script morre, o dreno solta, o bd leva KILL"
+W_BD_HANG=2 W_RIG=1 new_world e18b
+start_nr_bg FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=60 NIGHTLY_REBOOT_INFO_BUDGET_SECS=120 NIGHTLY_REBOOT_KILL_GRACE_SECS=1
+for _ in $(seq 1 80); do [ -s "$W/bd.pids" ] && break; /bin/sleep 0.25; done
+if [ -s "$W/bd.pids" ]; then
+  ok "E18b o script esta parado dentro de um bd que ignora o TERM"
+  kill -TERM "$NRPID" 2>/dev/null
+  for _ in $(seq 1 40); do kill -0 "$NRPID" 2>/dev/null || break; /bin/sleep 0.25; done
+  if kill -0 "$NRPID" 2>/dev/null; then bad "E18b o script NAO morreu em 10s com SIGTERM"; kill -KILL "$NRPID" 2>/dev/null; else ok "E18b o script morreu com SIGTERM"; fi
+  [ ! -f "$DRAIN" ] && ok "E18b sinal de dreno REMOVIDO na morte" || bad "E18b o dreno ficou no disco depois do SIGTERM"
+  for _ in $(seq 1 16); do [ "$(pids_alive "$W/bd.pids")" = "0" ] && break; /bin/sleep 0.25; done
+  [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E18b o bd que ignora o TERM levou KILL junto (nao sobreviveu ao script)" || bad "E18b o bd que ignora o TERM sobreviveu ao script ($(pids_alive "$W/bd.pids") vivos)"
+  ! rebooted && ok "E18b morrer na chamada nao reinicia" || bad "E18b reiniciou apesar do SIGTERM"
+else
+  bad "E18b inconclusivo: o bd nunca foi chamado"
+  kill -KILL "$NRPID" 2>/dev/null
+fi
+wait "$NRPID" 2>/dev/null
+kill_pids "$W/bd.pids"
 
 echo ""
 echo "nightly-reboot drain selftest: PASS=$PASS FAIL=$FAIL SKIPPED=$SKIPPED"

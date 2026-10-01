@@ -22,8 +22,8 @@ Pedido do Athos (01/10, P0): reiniciar **antes** do scraper. Desenho no bead ga-
 | 23:00–23:40 | Espera, re-carimbando o sinal a cada 5 min. |
 | 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
 | 23:40 | Gate com marker, bead em `in_progress` e rodada do scraper viram **informativos**: vão pro log e pro snapshot `.gc/logs/nightly-reboot-pre-<data>.txt` como "o que este reboot corta". O gate re-enfileira, o reclaim devolve o bead, o scraper retoma pelo catch-up. |
-| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. |
-| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). |
+| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. Com o shutdown **aceito** (rc 0) o sinal **fica** no disco (soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair); se o shutdown falhar (rc ≠ 0) ele é solto na hora. |
+| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (**mapa** = a ORIGEM em `127.0.0.1:8099` **e** o túnel cloudflared: job com PID + o `/ready` dele com ≥ 1 conexão de borda; o pior dos dois vale. A URL pública `mapa.urblink.com.br` **não** entra: o Cloudflare Access responde 302 na borda, com o mapa de pé ou não) (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). |
 
 Noite que não consegue reiniciar até ~23:55: **solta o dreno na hora**, registra SKIP (aviso **"Reboot noturno pulado"** por push) e segue o
 streak/alarme de sempre (o alarme de N noites seguidas também vai por push). Uma noite falha nunca deixa a cidade congelada. Rodada do scraper
@@ -41,6 +41,7 @@ está fora da sua janela 01:00–01:19 e pula: noites perdidas, em silêncio.
    cp /Users/athos/gt/.gascity-gastown-hq/scripts/com.gascity.nightly-reboot-postcheck.plist ~/Library/LaunchAgents/
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gascity.nightly-reboot-postcheck.plist
    bash /Users/athos/gt/.gascity-gastown-hq/scripts/nightly-reboot-postcheck.sh --now   # 4 linhas: dolt / sender / map / drain
+   # esperado: `map ok: origin ok (http://127.0.0.1:8099/ answers HTTP 200); tunnel ok (... N edge connection(s) ready ...)`
    ```
 3. **Mover o horário** (privilegiado — um dog não roda `sudo`; quem tem sudo roda):
    ```bash
@@ -81,13 +82,18 @@ teto de 90 min).
 
 ## Limites conhecidos (não escondidos)
 
-- O guard de manutenção de Dolt enxerga os **wrappers** (`dolt-compact-routine.sh` etc.) e o
-  CLI `dolt gc|backup|push|pull|fetch|table` por processo — não um `CALL dolt_gc()` digitado
-  num SQL interativo.
+- O guard de manutenção de Dolt enxerga, por processo: os **wrappers** (`dolt-compact-routine`,
+  `dolt-gc-maintenance`, `dolt-gc-release-trigger`, `dolt-backup-reseed`, `dolt-backup-swap-repair`,
+  `dolt-backup-residue-reclaim`, `dolt-offline-backup-sync`, `dolt-s3-backup` — o backup das 04:00 —
+  e `dolt-restore-verify`) rodando em qualquer shell (`/bin/bash`, `/opt/homebrew/bin/bash`...), o CLI
+  `dolt gc|backup|push|pull|fetch|table` e o `dolt ... sql -q '... CALL DOLT_GC/DOLT_BACKUP ...'`. **Não**
+  enxerga um `CALL` digitado numa sessão SQL interativa já aberta, nem feito por outro cliente (`mysql`).
+  O selftest (E12b) enumera todo `scripts/dolt-*.sh` e reprova um que não esteja no padrão nem numa lista
+  explícita de "não é risco" — um wrapper novo tem que ser classificado.
 - Ficam **sem prazo**, de propósito: `softwareupdate --install` (a instalação do update do macOS é
   longa por desenho e não pode ser cortada no meio), `softwareupdate --list --no-scan` (cache
   local), o `notify` (já tem limites próprios: curl 6 s, e-mail 45 s), `sync` e `sudo`. Tudo que fala
-  com bd/Dolt entre o disparo e o `shutdown` tem prazo.
+  com bd/Dolt entre o disparo e o `shutdown` tem prazo: TERM no prazo, ~2 s de folga e **KILL** (um processo que ignora o TERM não segura o reboot).
 - O sinal de dreno é carimbado uma vez antes do update do macOS. Se a instalação passar de 30 min,
   os leitores o consideram velho e os despachantes voltam a admitir trabalho (falha aberta, por
   desenho): o que entrar nesse intervalo é cortado pelo reboot como qualquer trabalho em voo.
@@ -97,6 +103,11 @@ teto de 90 min).
   e os de rotina (reiniciando, OK, update) ficam no digest. Medido no `history.db` do próprio
   notify (04/09–01/10): dos 47 avisos "Reboot noturno…" que este script mandou, **47 foram pro
   digest e nenhum pro push** — inclusive os seis alarmes "🚨 N noites seguidas" (N = 2…12).
+- Os checks do pós-boot dizem o que olham, e nada além: **envio** = o job do launchd
+  (`com.whatsapp.central-sender`) tem PID — prova que o processo está de pé, **não** que está
+  enviando (o daemon é um laço sem porta nem heartbeat consumível daqui); **mapa** = a origem
+  responde e o túnel tem conexão de borda — prova que o caminho existe, **não** que o Cloudflare
+  Access deixa o Athos entrar (esse é o login dele). "Cidade de pé" é isso, não "tudo funcionando".
 - O corte da rodada do scraper depende do catch-up do próprio rig (`--skip-done-today`) retomar
   no boot; a conferência pós-boot **não** verifica isso (é do dono do property_scrapers).
 - A porta usada pelo `SELECT 1` de confirmação do Dolt vem de `BEADS_DOLT_PORT` (default no

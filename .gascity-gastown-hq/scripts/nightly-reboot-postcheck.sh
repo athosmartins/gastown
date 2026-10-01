@@ -24,7 +24,16 @@
 # CHECKS — three states each, never collapsed (ok / FAIL / unknown):
 #   dolt    gc-dolt-probe.sh --robust: 0 healthy | 1 unreachable | 2 or anything else unknown
 #   sender  launchd job com.whatsapp.central-sender has a PID
-#   map     mapa.urblink.com.br answers (HTTP < 400 ok, 5xx FAIL, else unknown)
+#   map     the map ORIGIN answers on loopback (http://127.0.0.1:8099/: 2xx/3xx ok, 5xx or
+#           connection refused FAIL, else unknown) AND the cloudflared tunnel that carries it
+#           is up (launchd PID + its own /ready reports >= 1 edge connection; 0 = FAIL; cannot
+#           read = unknown). The worst of the two wins (FAIL > unknown > ok).
+#           NOT the public URL: https://mapa.urblink.com.br/ sits behind Cloudflare Access, which
+#           answers an unauthenticated request with a 302 to its login FROM THE EDGE, before any
+#           origin fetch (measured 01/10: 302, server: cloudflare, www-authenticate: Cloudflare-
+#           Access). That 302 is the same whether the map and the tunnel are up or both are dead,
+#           so "mapa ok" built on it could never be anything but ok — the ruler of a check is
+#           that it must be able to FAIL for the thing it names (gate FAIL 3/3).
 #   drain   no drain signal live for THIS boot
 # Services come up staggered after a boot, so the checks are retried as one round
 # (every INTERVAL seconds, for up to MAX_WAIT seconds of wall-clock, 20min by default)
@@ -64,9 +73,15 @@ NOTIFY_BIN="${NOTIFY_BIN:-/Users/athos/.local/bin/notify}"
 SYSCTL_BIN="${SYSCTL_BIN:-/usr/sbin/sysctl}"
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-/bin/launchctl}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
+LSOF_BIN="${LSOF_BIN:-/usr/sbin/lsof}"
 DOLT_PROBE="${NIGHTLY_REBOOT_POSTCHECK_DOLT_PROBE:-${CITY}/scripts/gc-dolt-probe.sh}"
 SENDER_LABEL="${NIGHTLY_REBOOT_POSTCHECK_SENDER_LABEL:-com.whatsapp.central-sender}"
-MAP_URL="${NIGHTLY_REBOOT_POSTCHECK_MAP_URL:-https://mapa.urblink.com.br/}"
+# The map's ORIGIN (com.whatsapp.map-viewer -> map_viewer_dashboard.py; cloudflared maps
+# mapa.urblink.com.br to it, ~/.cloudflared/urblink-ops.yml) and the launchd job of the
+# tunnel in front of it. Loopback ONLY: a connection refused there is a definite "nothing is
+# listening", which is what lets the probe call it FAIL instead of "cannot tell".
+MAP_ORIGIN_URL="${NIGHTLY_REBOOT_POSTCHECK_MAP_ORIGIN_URL:-http://127.0.0.1:8099/}"
+TUNNEL_LABEL="${NIGHTLY_REBOOT_POSTCHECK_TUNNEL_LABEL:-br.urblink.cloudflared.urblink-ops}"
 VM_DIR="${NIGHTLY_REBOOT_POSTCHECK_VM_DIR:-/System/Volumes/VM}"
 INTERVAL="${NIGHTLY_REBOOT_POSTCHECK_INTERVAL:-30}"
 # The retry budget is WALL-CLOCK, not a count of rounds: a failing round is not instant
@@ -115,42 +130,109 @@ check_dolt() {
     return 1
 }
 
-check_sender() {
-    CHECK_STATE="unknown"; CHECK_DETAIL=""
-    local out rc pid
-    out=$("${LAUNCHCTL_BIN}" list "${SENDER_LABEL}" 2>&1); rc=$?
+# launchd_job_check <label>: is the launchd job loaded AND running? ok = has a PID; FAIL = not
+# loaded, or loaded with no PID; unknown = launchctl itself gave an answer we cannot read.
+# Sets CHECK_STATE / CHECK_DETAIL and JOB_PID (empty unless ok). Shared by the sender and the
+# map's tunnel so both read the three states the same way.
+launchd_job_check() {
+    local label="$1" out rc pid
+    CHECK_STATE="unknown"; CHECK_DETAIL=""; JOB_PID=""
+    out=$("${LAUNCHCTL_BIN}" list "${label}" 2>&1); rc=$?
     if [ "${rc}" -ne 0 ]; then
         case "${out}" in
-            *"Could not find service"*) CHECK_STATE="FAIL"; CHECK_DETAIL="${SENDER_LABEL} is not loaded in launchd" ;;
+            *"Could not find service"*) CHECK_STATE="FAIL"; CHECK_DETAIL="${label} is not loaded in launchd" ;;
             *) CHECK_DETAIL="launchctl list rc=${rc}: $(printf '%s' "${out}" | tr '\n' ' ') — cannot tell" ;;
         esac
         return 1
     fi
     case "${out}" in
         *'"Label"'*) ;;
-        *) CHECK_DETAIL="launchctl list ${SENDER_LABEL} exited 0 but printed no job dictionary ('$(printf '%s' "${out}" | tr '\n' ' ' | cut -c1-80)') — cannot tell"
+        *) CHECK_DETAIL="launchctl list ${label} exited 0 but printed no job dictionary ('$(printf '%s' "${out}" | tr '\n' ' ' | cut -c1-80)') — cannot tell"
            return 1 ;;
     esac
     pid=$(printf '%s\n' "${out}" | sed -n 's/.*"PID" = \([0-9][0-9]*\);.*/\1/p' | head -1)
     if [ -n "${pid}" ]; then
-        CHECK_STATE="ok"; CHECK_DETAIL="${SENDER_LABEL} running (pid ${pid})"
+        CHECK_STATE="ok"; CHECK_DETAIL="${label} running (pid ${pid})"; JOB_PID="${pid}"
         return 0
     fi
     CHECK_STATE="FAIL"
-    CHECK_DETAIL="${SENDER_LABEL} is loaded but has no PID ($(printf '%s\n' "${out}" | sed -n 's/.*"LastExitStatus" = \([-0-9]*\);.*/last exit \1/p' | head -1))"
+    CHECK_DETAIL="${label} is loaded but has no PID ($(printf '%s\n' "${out}" | sed -n 's/.*"LastExitStatus" = \([-0-9]*\);.*/last exit \1/p' | head -1))"
     return 1
 }
 
-check_map() {
+check_sender() {
+    launchd_job_check "${SENDER_LABEL}"
+}
+
+# map, half 1: the ORIGIN, asked directly on loopback. There is no edge in front of it, so
+# the status code is the app's own answer.
+#   2xx/3xx  the app served            -> ok
+#   5xx      the app is up but broken  -> FAIL
+#   curl rc 7 (could not connect)      -> FAIL: on loopback that is "nothing is listening"
+#   anything else (timeout on a saturated box, 4xx, garbage, no curl output) -> unknown
+map_origin_probe() {
     CHECK_STATE="unknown"; CHECK_DETAIL=""
     local code rc
-    code=$("${CURL_BIN}" -sS -o /dev/null -w '%{http_code}' --max-time 15 "${MAP_URL}" 2>/dev/null); rc=$?
+    code=$("${CURL_BIN}" -sS -o /dev/null -w '%{http_code}' --max-time 15 "${MAP_ORIGIN_URL}" 2>/dev/null); rc=$?
     case "${code}" in
-        [23][0-9][0-9]) CHECK_STATE="ok"; CHECK_DETAIL="${MAP_URL} answers HTTP ${code}"; return 0 ;;
-        5[0-9][0-9]) CHECK_STATE="FAIL"; CHECK_DETAIL="${MAP_URL} answers HTTP ${code}" ;;
-        *) CHECK_DETAIL="${MAP_URL}: no clear answer (curl rc=${rc}, HTTP '${code}') — cannot tell if the map is down or this host cannot reach it" ;;
+        [23][0-9][0-9]) CHECK_STATE="ok"; CHECK_DETAIL="${MAP_ORIGIN_URL} answers HTTP ${code}"; return 0 ;;
+        5[0-9][0-9]) CHECK_STATE="FAIL"; CHECK_DETAIL="${MAP_ORIGIN_URL} answers HTTP ${code}"; return 1 ;;
     esac
+    if [ "${rc}" -eq 7 ]; then
+        CHECK_STATE="FAIL"; CHECK_DETAIL="${MAP_ORIGIN_URL}: connection refused — nothing is listening"
+    else
+        CHECK_DETAIL="${MAP_ORIGIN_URL}: no clear answer (curl rc=${rc}, HTTP '${code}') — cannot tell if the map is down or this host cannot reach it"
+    fi
     return 1
+}
+
+# map, half 2: the cloudflared TUNNEL in front of it. A running process is not a connected
+# tunnel (right after a boot the network may not be up yet), so once the launchd job has a PID
+# we ask cloudflared itself: its metrics listener serves /ready = {"readyConnections":N}, 200
+# when N >= 1 and 503 when 0. The listener port is NOT hardcoded (the config pins no `metrics:`,
+# so cloudflared takes the first free port from 20241 up): it is read off the live PID, the
+# same "derive it from the process" rule the city applies to Dolt.
+#   no PID / not loaded                 -> FAIL (launchd_job_check)
+#   /ready says readyConnections >= 1   -> ok
+#   /ready says readyConnections 0      -> FAIL (alive, but not connected to the edge)
+#   no listener / no /ready answer / unreadable JSON / no lsof -> unknown, NEVER ok: a PID alone
+#   does not prove the tunnel carries traffic, and "could not look" must not read as "looked".
+map_tunnel_probe() {
+    local job_detail pid ports port body conns
+    launchd_job_check "${TUNNEL_LABEL}" || return 1
+    job_detail="${CHECK_DETAIL}"; pid="${JOB_PID}"
+    CHECK_STATE="unknown"
+    ports=$("${LSOF_BIN}" -nP -a -p "${pid}" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9][0-9]*\)$/\1/p')
+    for port in ${ports}; do
+        body=$("${CURL_BIN}" -sS --max-time 5 "http://127.0.0.1:${port}/ready" 2>/dev/null)
+        conns=$(printf '%s' "${body}" | sed -n 's/.*"readyConnections":\([0-9][0-9]*\).*/\1/p')
+        [ -n "${conns}" ] || continue   # not the /ready JSON (another listener of the same pid): try the next
+        if [ "${conns}" -ge 1 ]; then
+            CHECK_STATE="ok"; CHECK_DETAIL="${job_detail}; ${conns} edge connection(s) ready (127.0.0.1:${port}/ready)"
+            return 0
+        fi
+        CHECK_STATE="FAIL"; CHECK_DETAIL="${job_detail}, but 0 edge connections ready (127.0.0.1:${port}/ready) — the tunnel is not connected"
+        return 1
+    done
+    CHECK_DETAIL="${job_detail}, but its /ready did not answer (pid ${pid} listening on: ${ports:-nothing found}) — cannot tell whether the tunnel is connected to the edge"
+    return 1
+}
+
+# map = origin AND tunnel; the WORST of the two wins (FAIL > unknown > ok), and only both-ok is
+# ok. The detail always names both halves, so a FAIL that is "the tunnel" is not read as "the map".
+check_map() {
+    local o_state o_detail t_state t_detail
+    map_origin_probe || true; o_state="${CHECK_STATE}"; o_detail="${CHECK_DETAIL}"
+    map_tunnel_probe || true; t_state="${CHECK_STATE}"; t_detail="${CHECK_DETAIL}"
+    if [ "${o_state}" = "FAIL" ] || [ "${t_state}" = "FAIL" ]; then
+        CHECK_STATE="FAIL"
+    elif [ "${o_state}" = "ok" ] && [ "${t_state}" = "ok" ]; then
+        CHECK_STATE="ok"
+    else
+        CHECK_STATE="unknown"
+    fi
+    CHECK_DETAIL="origin ${o_state} (${o_detail}); tunnel ${t_state} (${t_detail})"
+    [ "${CHECK_STATE}" = "ok" ]
 }
 
 # The drain signal is DRAIN | written | boot | until. Live for this boot = the
@@ -201,6 +283,18 @@ print_round() {
     for name in dolt sender map drain; do
         eval "state=\"\${R_${name}_STATE}\"; detail=\"\${R_${name}_DETAIL}\""
         printf '%s %s: %s\n' "${name}" "${state}" "${detail}"
+    done
+}
+
+# print_round_problems: the same lines as print_round, only for the checks whose STATE is not ok.
+# Selected by the state variable, NOT by filtering the rendered text with grep: a detail is free
+# text (the Dolt probe's own output, the map's "tunnel ok (...)"), and a FAILing line that merely
+# CONTAINS " ok: " would be filtered out as if it were ok and vanish from the alert.
+print_round_problems() {
+    local name state detail
+    for name in dolt sender map drain; do
+        eval "state=\"\${R_${name}_STATE}\"; detail=\"\${R_${name}_DETAIL}\""
+        [ "${state}" = "ok" ] || printf '%s %s: %s\n' "${name}" "${state}" "${detail}"
     done
 }
 
@@ -298,6 +392,14 @@ mail_mayor() {
                 : > "${out}.deadline"
                 /usr/bin/pkill -TERM -P "${pid}" 2>/dev/null
                 kill -TERM "${pid}" 2>/dev/null
+                # TERM is a request: a process that ignores it would keep the `wait` below
+                # (and the lock) for as long as it lives. A short grace, then KILL.
+                grace=$(( SECONDS + 2 ))
+                while kill -0 "${pid}" 2>/dev/null && [ "${SECONDS}" -lt "${grace}" ]; do sleep 1 2>/dev/null || :; done
+                if kill -0 "${pid}" 2>/dev/null; then
+                    /usr/bin/pkill -KILL -P "${pid}" 2>/dev/null
+                    kill -KILL "${pid}" 2>/dev/null
+                fi
                 break
             fi
             sleep 1 2>/dev/null || :
@@ -363,7 +465,7 @@ while true; do
     if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ] || [ $(( $(date +%s) - START_TS )) -ge "${MAX_WAIT}" ]; then
         break
     fi
-    log "round ${ATTEMPT}/${MAX_ATTEMPTS} not all ok ($(print_round | grep -v ' ok: ' | tr '\n' ';')) — retrying in ${INTERVAL}s"
+    log "round ${ATTEMPT}/${MAX_ATTEMPTS} not all ok ($(print_round_problems | tr '\n' ';')) — retrying in ${INTERVAL}s"
     sleep "${INTERVAL}"
     ATTEMPT=$((ATTEMPT+1))
 done
@@ -388,7 +490,7 @@ if [ "${ROUND_OK}" -eq 1 ]; then
     exit 0
 fi
 
-PROBLEMS="$(print_round | grep -v ' ok: ' | tr '\n' ';')"
+PROBLEMS="$(print_round_problems | tr '\n' ';')"
 log "RESULT: NOT all ok after ${ATTEMPT} round(s) — ${PROBLEMS}"
 notify_athos "Reboot noturno: pós-boot COM PROBLEMA" "${PROBLEMS} (FAIL = caiu; unknown = não consegui olhar). ${INFO}. Rode: nightly-reboot-postcheck.sh --now" 4 push
 mail_mayor "nightly-reboot: pós-boot com problema (ga-a2v0bz)" "$(printf 'O reboot noturno terminou mas a conferência pós-boot não fechou limpa depois de %s rodada(s):\n%s\n%s\nLog: %s' "${ATTEMPT}" "$(print_round)" "${INFO}" "${LOG}")"

@@ -18,11 +18,14 @@
 #   P4  tudo ok -> notify OK, pendencia removida, SEM mail; sonda chamada com --robust
 #   P5  Dolt caido em todas as rodadas -> COM PROBLEMA + mail, esgota as rodadas
 #   P5c o mail ao mayor que FALHA ou PENDURA e registrado (rc / TIMED OUT) — nunca parece enviado
+#   P5e o prazo do mail vale tambem pra um gc que IGNORA o TERM: folga curta e KILL
 #   P5b o orcamento e em SEGUNDOS (relogio), nao so em rodadas
 #   P6  tres estados: probe rc 2 / launchctl com erro / curl sem resposta = unknown
 #   P7  um servico sobe na 2a rodada -> re-confere TUDO e fecha ok
 #   P8  envio: ausente / carregado sem PID = FAIL; rodando = ok
-#   P9  mapa: 2xx/3xx ok, 5xx FAIL, 000/4xx unknown
+#   P9  mapa = ORIGEM (loopback) + TUNEL (cloudflared): o pior dos dois vence (FAIL > unknown > ok); a URL
+#       publica (Cloudflare Access responde 302 na BORDA, com o mapa de pe ou nao) NUNCA entra no veredito
+#   P16 o filtro de problemas olha o ESTADO, nao o texto: um FAIL cujo detalhe contem ' ok: ' nao some do aviso
 #   P10 dreno: vivo neste boot = FAIL; de outro boot = ok; ilegivel = unknown; NUNCA removido
 #   P11 pendencia ilegivel -> avisa e descarta; kern.boottime ilegivel -> mantem a pendencia
 #   P12 trava: dono vivo -> sai; dono morto -> assume; trava de OUTRO boot com pid reaproveitado
@@ -61,7 +64,12 @@ BOOT_NOW=1790000500
 #   W_DOLT_OK_AT   a partir de qual chamada a sonda passa a dar 0
 #   W_SENDER       running | nopid | absent | error             (default running)
 #   W_SENDER_OK_AT a partir de qual chamada o launchctl passa a "running"
-#   W_MAP_CODE / W_MAP_RC   resposta do fake de curl            (default 302 / 0)
+#   W_MAP_CODE / W_MAP_RC   resposta da ORIGEM do mapa (127.0.0.1:8099) no fake de curl  (default 200 / 0)
+#   W_EDGE_CODE    resposta de QUALQUER outra URL (a borda publica)  (default 302 — o que o Cloudflare Access da)
+#   W_TUNNEL       running | nopid | absent | error | weird  (job do cloudflared; default running)
+#   W_READY_BODY / W_READY_RC   resposta do /ready do cloudflared  (default readyConnections=4 / 0)
+#   W_LSOF         ok | none | error | ipv6 | multi | missing  (listeners do pid do tunel; default ok = :20241)
+#   W_DOLT_OUT     texto que a sonda imprime quando rc=1  (default 'unhealthy')
 #   W_GC_RC        rc do fake de gc (mail send)                (default 0)
 #   W_GC_HANG      1 = o gc pendura (Dolt wedged): grava o pid e dorme 600s
 new_world() {
@@ -86,6 +94,7 @@ EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$GC_CALLS"
 if [ "${W_GC_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/gc.pids"; exec /bin/sleep 600; fi
+if [ "${W_GC_HANG:-0}" = "2" ]; then echo \$\$ >> "$W/gc.pids"; trap '' TERM; while :; do /bin/sleep 1; done; fi
 echo "gc: simulated output"
 exit ${W_GC_RC:-0}
 EOF
@@ -101,14 +110,17 @@ echo "\$*" >> "$PROBE_ARGS"
 n=\$(( \$(cat "$W/n.probe" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$W/n.probe"
 rc=${W_DOLT_RC:-0}
 if [ -n "${W_DOLT_OK_AT:-}" ] && [ "\$n" -ge "${W_DOLT_OK_AT:-0}" ]; then rc=0; fi
-case "\$rc" in 0) echo healthy ;; 1) echo unhealthy ;; *) echo unknown ;; esac
+case "\$rc" in 0) echo healthy ;; 1) echo "${W_DOLT_OUT:-unhealthy}" ;; *) echo unknown ;; esac
 exit "\$rc"
 EOF
+  # launchctl: o MESMO fake atende o job do envio e o do tunel, escolhido pelo rotulo ($2); o contador
+  # e por rotulo, pra "sobe na 2a rodada" continuar querendo dizer 2a rodada
   cat > "$W/launchctl" <<EOF
 #!/usr/bin/env bash
-n=\$(( \$(cat "$W/n.launchctl" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$W/n.launchctl"
-mode="${W_SENDER:-running}"
-if [ -n "${W_SENDER_OK_AT:-}" ] && [ "\$n" -ge "${W_SENDER_OK_AT:-0}" ]; then mode=running; fi
+cf="$W/n.launchctl.\$2"
+n=\$(( \$(cat "\$cf" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "\$cf"
+if [ "\$2" = "br.urblink.cloudflared.urblink-ops" ]; then mode="${W_TUNNEL:-running}"; else mode="${W_SENDER:-running}"; fi
+if [ "\$2" != "br.urblink.cloudflared.urblink-ops" ] && [ -n "${W_SENDER_OK_AT:-}" ] && [ "\$n" -ge "${W_SENDER_OK_AT:-0}" ]; then mode=running; fi
 case "\$mode" in
   running) printf '{\n\t"Label" = "%s";\n\t"LastExitStatus" = 0;\n\t"PID" = 42650;\n};\n' "\$2" ;;
   nopid)   printf '{\n\t"Label" = "%s";\n\t"LastExitStatus" = 256;\n};\n' "\$2" ;;
@@ -117,12 +129,39 @@ case "\$mode" in
   weird)   echo "something else entirely" ;;
 esac
 EOF
+  # curl: responde conforme a URL — e GRAVA toda URL chamada. A origem do mapa e o /ready do tunel tem
+  # respostas proprias; qualquer outra URL e "a borda publica", que o Cloudflare Access responde com 302
+  # estando o mapa de pe ou nao. Um fake que respondesse igual pra tudo (como o antigo) nao distingue um
+  # script que olha a origem de um que olha a borda — foi exatamente o que deixou esse furo passar.
+  # (default numa variavel a parte: `${V:-{...}}` com JSON dentro fecha a expansao na 1a chave e, com V
+  #  definida, devolve "valor}" — corpo corrompido sem ninguem ver)
+  READY_DEFAULT='{"status":200,"readyConnections":4,"connectorId":"fake"}'
+  # (sem os dois pontos: W_READY_BODY="" e um corpo VAZIO de verdade, nao "use o default")
+  printf '%s' "${W_READY_BODY-$READY_DEFAULT}" > "$W/ready.body"
   cat > "$W/curl" <<EOF
 #!/usr/bin/env bash
-printf '%s' "${W_MAP_CODE:-302}"
-exit ${W_MAP_RC:-0}
+for a in "\$@"; do url="\$a"; done
+echo "\$url" >> "$W/curl.urls"
+case "\$url" in
+  *:20240/ready) printf 'not the ready json'; exit 0 ;;
+  */ready) cat "$W/ready.body"; exit ${W_READY_RC:-0} ;;
+  http://127.0.0.1:8099/) printf '%s' "${W_MAP_CODE:-200}"; exit ${W_MAP_RC:-0} ;;
+  *) printf '%s' "${W_EDGE_CODE:-302}"; exit 0 ;;
+esac
 EOF
-  chmod +x "$W/notify" "$W/gc" "$W/sysctl" "$W/probe.sh" "$W/launchctl" "$W/curl"
+  # lsof: so o que o script pergunta — os listeners TCP do pid do tunel, em formato -F n
+  cat > "$W/lsof" <<EOF
+#!/usr/bin/env bash
+case "${W_LSOF:-ok}" in
+  ok)    printf 'p42650\nf9\nn127.0.0.1:20241\n' ;;
+  ipv6)  printf 'p42650\nf9\nn[::1]:20241\n' ;;
+  multi) printf 'p42650\nf8\nn127.0.0.1:20240\nf9\nn127.0.0.1:20241\n' ;;
+  none)  : ;;
+  error) echo "lsof: WARNING: can't stat() fs" >&2; exit 1 ;;
+esac
+EOF
+  [ "${W_LSOF:-ok}" = "missing" ] && rm -f "$W/lsof"
+  chmod +x "$W/notify" "$W/gc" "$W/sysctl" "$W/probe.sh" "$W/launchctl" "$W/curl" "$W/lsof" 2>/dev/null
 }
 
 write_pending() {  # $1 = issued epoch   $2 = boot_before (default BOOT_BEFORE)
@@ -133,7 +172,7 @@ now_s() { /bin/date +%s; }
 # run_pc [args...] -> RC, OUT (stdout+stderr)
 run_pc() {
   OUT="$(env CITY="$W/city" GC_BIN="$W/gc" NOTIFY_BIN="$W/notify" SYSCTL_BIN="$W/sysctl" \
-      LAUNCHCTL_BIN="$W/launchctl" CURL_BIN="$W/curl" \
+      LAUNCHCTL_BIN="$W/launchctl" CURL_BIN="$W/curl" LSOF_BIN="$W/lsof" \
       NIGHTLY_REBOOT_LOG="$LOGF" NIGHTLY_REBOOT_PENDING_FILE="$PENDING" NIGHTLY_REBOOT_DRAIN_FILE="$DRAIN" \
       NIGHTLY_REBOOT_POSTCHECK_DOLT_PROBE="$W/probe.sh" NIGHTLY_REBOOT_POSTCHECK_VM_DIR="$W/vm" \
       NIGHTLY_REBOOT_POSTCHECK_INTERVAL=0 NIGHTLY_REBOOT_POSTCHECK_MAX_ATTEMPTS="${MAXA:-3}" \
@@ -245,6 +284,22 @@ n_alive=0; for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null
 [ "$n_alive" = "0" ] && ok "P5c o gc pendurado foi morto" || bad "P5c sobrou gc pendurado vivo"
 for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
 
+# P5e: o prazo do mail tambem vale pra um gc que IGNORA o TERM. Um unico TERM so e prazo pra quem o respeita:
+# `trap '' TERM; while :; do sleep 1; done` sobrevive a ele, e o `wait` do script ficava preso (com a trava
+# na mao) pelo tempo que o gc vivesse — o mesmo silencio que o prazo existe pra acabar. Depois de uma
+# folga curta o script manda KILL.
+echo "P5e: gc que ignora TERM -> TERM, folga, KILL; o pos-boot termina"
+W_DOLT_RC=1 W_GC_HANG=2 new_world p5e; write_pending "$(( $(now_s) - 300 ))"
+( /bin/sleep 60; for p in $(cat "$W/gc.pids" 2>/dev/null); do /usr/bin/pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done ) >/dev/null 2>&1 &
+HG_WD=$!
+T0=$(now_s); NIGHTLY_REBOOT_POSTCHECK_MAIL_TIMEOUT_SECS=2 run_pc; T1=$(now_s)
+kill "$HG_WD" 2>/dev/null; wait "$HG_WD" 2>/dev/null
+[ $((T1-T0)) -le 30 ] && ok "P5e gc que ignora TERM: o pos-boot terminou em $((T1-T0))s (sem o KILL ficava preso ate o limite do teste)" || bad "P5e o pos-boot ficou $((T1-T0))s preso num gc que ignora TERM"
+log_has "mail to mayor TIMED OUT" && ok "P5e o log diz que o mail NAO foi enviado (TIMED OUT)" || bad "P5e sem 'TIMED OUT' no log. mail: $(grep -i mail "$LOGF" | tr '\n' '|')"
+n_alive=0; for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && n_alive=$((n_alive+1)); done
+[ "$n_alive" = "0" ] && ok "P5e o gc que ignorava TERM foi morto (KILL)" || bad "P5e sobrou gc vivo que ignora TERM"
+for p in $(cat "$W/gc.pids" 2>/dev/null); do /usr/bin/pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; done
+
 # ── P6: tres estados, nunca colapsados ───────────────────────────────────────
 echo "P6: 'nao consegui olhar' e unknown, nao ok e nao FAIL"
 W_DOLT_RC=2 new_world p6a; write_pending "$(( $(now_s) - 300 ))"; run_pc
@@ -255,7 +310,7 @@ assert_push "P6 COM PROBLEMA (nao consegui olhar)" "COM PROBLEMA"
 W_SENDER=error new_world p6b; write_pending "$(( $(now_s) - 300 ))"; run_pc
 notify_has "sender unknown" && ok "P6 launchctl com erro -> sender unknown" || bad "P6 sender: $(cat "$NOTIFY_CALLS")"
 W_MAP_CODE=000 W_MAP_RC=28 new_world p6c; write_pending "$(( $(now_s) - 300 ))"; run_pc
-notify_has "map unknown" && ok "P6 curl sem resposta (rc 28, HTTP 000) -> map unknown" || bad "P6 map: $(cat "$NOTIFY_CALLS")"
+notify_has "map unknown" && ok "P6 origem do mapa sem resposta (rc 28, HTTP 000) -> map unknown" || bad "P6 map: $(cat "$NOTIFY_CALLS")"
 W_DOLT_RC=127 new_world p6d; write_pending "$(( $(now_s) - 300 ))"; run_pc
 notify_has "dolt unknown" && ok "P6 sonda com rc inesperado (127) -> unknown" || bad "P6 rc 127: $(cat "$NOTIFY_CALLS")"
 new_world p6e; write_pending "$(( $(now_s) - 300 ))"; rm -f "$W/probe.sh"; run_pc
@@ -288,20 +343,97 @@ notify_has "swap: ?" && ok "P8b diretorio de swap ilegivel -> 'swap: ?'" || bad 
 notify_has "swap: 0" && bad "P8b disse 'swap: 0' sem ter olhado" || ok "P8b nao diz 'swap: 0' sem ter olhado"
 [ "$RC" = "0" ] && ok "P8b o swap e informativo: nao muda o veredito" || bad "P8b exit=$RC"
 
-# ── P9: mapa ─────────────────────────────────────────────────────────────────
-echo "P9: mapa"
-for c in 200 302; do
-  W_MAP_CODE=$c new_world p9; write_pending "$(( $(now_s) - 300 ))"; run_pc
-  [ "$RC" = "0" ] && ok "P9 HTTP $c -> ok" || bad "P9 HTTP $c exit=$RC. $(cat "$NOTIFY_CALLS")"
+# ── P9: mapa = origem + tunel ────────────────────────────────────────────────
+# O veredito antigo vinha de https://mapa.urblink.com.br/, que fica atras do Cloudflare Access: sem
+# credencial a BORDA responde 302 pro login antes de olhar a origem (medido 01/10: 302, server:
+# cloudflare). Era 302 com o mapa de pe E com o mapa e o tunel mortos — "mapa ok" nunca podia ser
+# outra coisa. O fake de curl agora responde 302 pra qualquer URL que nao seja a origem/o /ready,
+# e grava toda URL chamada: o teste e se o veredito SEGUE a origem e o tunel, nao a borda.
+echo "P9: mapa (origem + tunel; a borda publica nao entra)"
+mapline() { grep -F -- 'map ' <<<"$OUT" | head -1; }
+# a) origem respondendo (2xx/3xx) + tunel conectado -> ok
+for c in 200 301 302; do
+  W_MAP_CODE=$c new_world p9a; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  [ "$RC" = "0" ] && ok "P9 origem HTTP $c + tunel conectado -> ok" || bad "P9 origem HTTP $c exit=$RC. $(cat "$NOTIFY_CALLS")"
 done
-for c in 502 503 521; do
-  W_MAP_CODE=$c new_world p9; write_pending "$(( $(now_s) - 300 ))"; run_pc
-  notify_has "map FAIL" && ok "P9 HTTP $c -> FAIL" || bad "P9 HTTP $c: $(cat "$NOTIFY_CALLS")"
+# b) o caso do bug: a ORIGEM esta fora (conexao recusada, rc 7) e a borda continua dando 302
+W_MAP_CODE=000 W_MAP_RC=7 new_world p9b; write_pending "$(( $(now_s) - 300 ))"; run_pc
+[ "$RC" = "1" ] && ok "P9 origem RECUSANDO conexao com a borda dando 302: exit 1 (o script antigo dava ok aqui)" || bad "P9 origem fora mas exit=$RC — o veredito segue a borda?"
+notify_has "map FAIL" && ok "P9 origem recusando -> map FAIL" || bad "P9 origem recusando: $(cat "$NOTIFY_CALLS")"
+notify_has "connection refused" && ok "P9 o aviso diz POR QUE (connection refused — nada escutando)" || bad "P9 sem o motivo: $(cat "$NOTIFY_CALLS")"
+if grep -qvE '^(http://127\.0\.0\.1:8099/|http://127\.0\.0\.1:[0-9]+/ready)$' "$W/curl.urls" 2>/dev/null; then
+  bad "P9 o script chamou uma URL que nao e a origem nem o /ready: $(grep -vE '^(http://127\.0\.0\.1:8099/|http://127\.0\.0\.1:[0-9]+/ready)$' "$W/curl.urls" | tr '\n' ' ')"
+else
+  ok "P9 so a origem e o /ready foram consultados — a URL publica nunca e chamada"
+fi
+# c) a origem fala 5xx
+for c in 500 502 503; do
+  W_MAP_CODE=$c new_world p9c; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  notify_has "map FAIL" && ok "P9 origem HTTP $c -> FAIL" || bad "P9 origem HTTP $c: $(cat "$NOTIFY_CALLS")"
 done
-for c in 404 403 000 garbage; do
-  W_MAP_CODE=$c new_world p9; write_pending "$(( $(now_s) - 300 ))"; run_pc
-  notify_has "map unknown" && ok "P9 HTTP '$c' -> unknown (nao ok, nao FAIL)" || bad "P9 HTTP '$c': $(cat "$NOTIFY_CALLS")"
+# d) a origem nao deu uma resposta clara -> unknown (nao ok, nao FAIL)
+for spec in "404:0" "403:0" "000:28" "garbage:0" "000:6"; do
+  c="${spec%%:*}"; r="${spec##*:}"
+  W_MAP_CODE=$c W_MAP_RC=$r new_world p9d; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  notify_has "map unknown" && ok "P9 origem HTTP '$c' curl rc $r -> unknown" || bad "P9 origem HTTP '$c' rc $r: $(cat "$NOTIFY_CALLS")"
+  notify_has "map FAIL" && bad "P9 origem HTTP '$c' rc $r virou FAIL (colapsou 'nao sei' em 'caiu')" || ok "P9 origem HTTP '$c' rc $r NAO virou FAIL"
 done
+# e) tunel: o job do cloudflared
+W_TUNNEL=absent new_world p9e; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map FAIL" && ok "P9 tunel ausente no launchd -> map FAIL (origem ok nao salva)" || bad "P9 tunel ausente: $(cat "$NOTIFY_CALLS")"
+notify_has "tunnel FAIL (br.urblink.cloudflared.urblink-ops is not loaded" && ok "P9 o aviso nomeia a METADE que caiu (tunnel) e o job" || bad "P9 sem a metade/o job: $(cat "$NOTIFY_CALLS")"
+W_TUNNEL=nopid new_world p9e2; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map FAIL" && ok "P9 tunel carregado sem PID -> map FAIL" || bad "P9 tunel sem PID: $(cat "$NOTIFY_CALLS")"
+for m in error weird; do
+  W_TUNNEL=$m new_world p9e3; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  notify_has "map unknown" && ok "P9 launchctl do tunel '$m' -> map unknown" || bad "P9 tunel '$m': $(cat "$NOTIFY_CALLS")"
+done
+# f) tunel com PID: quem decide e o /ready do proprio cloudflared (processo vivo != tunel conectado)
+W_READY_BODY='{"status":503,"readyConnections":0}' new_world p9f; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map FAIL" && ok "P9 tunel vivo mas readyConnections=0 -> map FAIL (um PID nao prova que o tunel carrega trafego)" || bad "P9 0 conexoes: $(cat "$NOTIFY_CALLS")"
+notify_has "0 edge connections" && ok "P9 o aviso diz '0 edge connections'" || bad "P9 sem '0 edge connections': $(cat "$NOTIFY_CALLS")"
+W_READY_BODY='{"status":200,"readyConnections":1}' new_world p9f2; write_pending "$(( $(now_s) - 300 ))"; run_pc
+[ "$RC" = "0" ] && ok "P9 readyConnections=1 basta -> ok" || bad "P9 1 conexao exit=$RC. $(cat "$NOTIFY_CALLS")"
+for spec in "refused:{}:7" "garbage:html-nao-json:0" "empty::0"; do
+  IFS=: read -r nm body r <<<"$spec"; [ "$nm" = "refused" ] && body=""
+  W_READY_BODY="$body" W_READY_RC=$r new_world p9g; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  notify_has "map unknown" && ok "P9 /ready sem resposta legivel ($nm) -> map unknown (nao ok: so o PID nao prova o tunel)" || bad "P9 /ready $nm: $(cat "$NOTIFY_CALLS")"
+  notify_has "map FAIL" && bad "P9 /ready $nm virou FAIL (nao sei != caiu)" || ok "P9 /ready $nm NAO virou FAIL"
+done
+for m in none error missing; do
+  W_LSOF=$m new_world p9h; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  notify_has "map unknown" && ok "P9 lsof '$m' (porta do /ready indescobrivel) -> map unknown" || bad "P9 lsof '$m': $(cat "$NOTIFY_CALLS")"
+  notify_has "pid 42650 listening on" && ok "P9 lsof '$m': o aviso diz o que foi/nao foi achado" || bad "P9 lsof '$m' sem o detalhe: $(cat "$NOTIFY_CALLS")"
+done
+# a porta vem do PID vivo, nao de um numero escrito: 2 listeners (o 1o nao e o /ready) e IPv6 acham a certa
+for m in multi ipv6; do
+  W_LSOF=$m new_world p9i; write_pending "$(( $(now_s) - 300 ))"; run_pc
+  [ "$RC" = "0" ] && ok "P9 lsof '$m' -> acha o /ready no listener certo -> ok" || bad "P9 lsof '$m' exit=$RC. $(cat "$NOTIFY_CALLS")"
+done
+# g) o pior dos dois vence, e o detalhe nomeia as duas metades
+W_MAP_CODE=000 W_MAP_RC=7 W_TUNNEL=error new_world p9j; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map FAIL" && ok "P9 origem FAIL + tunel unknown -> FAIL (FAIL vence unknown)" || bad "P9 FAIL+unknown: $(cat "$NOTIFY_CALLS")"
+notify_has "origin FAIL (" && notify_has "tunnel unknown (" && ok "P9 o detalhe traz as DUAS metades com o estado de cada uma" || bad "P9 detalhe sem as duas metades: $(cat "$NOTIFY_CALLS")"
+W_MAP_CODE=000 W_MAP_RC=28 W_TUNNEL=absent new_world p9k; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map FAIL" && ok "P9 origem unknown + tunel FAIL -> FAIL" || bad "P9 unknown+FAIL: $(cat "$NOTIFY_CALLS")"
+W_MAP_CODE=000 W_MAP_RC=28 new_world p9l; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map unknown" && ok "P9 origem unknown + tunel ok -> unknown (so os DOIS ok dao ok)" || bad "P9 unknown+ok: $(cat "$NOTIFY_CALLS")"
+W_TUNNEL=error new_world p9m; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "map unknown" && ok "P9 origem ok + tunel unknown -> unknown" || bad "P9 ok+unknown: $(cat "$NOTIFY_CALLS")"
+# h) --now mostra a linha do mapa com as duas metades
+new_world p9n; run_pc --now
+grep -q '^map ok: origin ok (' <<<"$OUT" && grep -q 'tunnel ok (' <<<"$OUT" && ok "P9 --now: 'map ok: origin ok (...); tunnel ok (...)' (4 conexoes de borda no fake)" || bad "P9 --now: $(mapline)"
+grep -q '4 edge connection(s) ready' <<<"$OUT" && ok "P9 --now: diz quantas conexoes de borda o tunel tem" || bad "P9 --now sem as conexoes: $(mapline)"
+
+# ── P16: o filtro de problemas olha o ESTADO, nao o texto ────────────────────
+# O aviso de problema lista so os checks que nao estao ok. Antes isso era `print_round | grep -v ' ok: '`:
+# um check que FALHOU mas cujo detalhe (texto livre — a saida da sonda, "tunnel ok: ...") contem " ok: "
+# era descartado como se estivesse ok, e o aviso saia sem a linha que explicava o problema.
+echo "P16: um FAIL cujo detalhe contem ' ok: ' continua no aviso"
+W_DOLT_RC=1 W_DOLT_OUT='unhealthy (the sender ok: fine, the map ok: fine — only dolt is down)' new_world p16; write_pending "$(( $(now_s) - 300 ))"; run_pc
+notify_has "dolt FAIL" && ok "P16 'dolt FAIL' esta no aviso mesmo com ' ok: ' no detalhe" || bad "P16 a linha do dolt sumiu do aviso (filtro por texto?): $(cat "$NOTIFY_CALLS")"
+notify_has "only dolt is down" && ok "P16 e o detalhe veio inteiro" || bad "P16 detalhe cortado: $(cat "$NOTIFY_CALLS")"
+log_has "retrying" && grep -F 'retrying' "$LOGF" | grep -qF 'dolt FAIL' && ok "P16 a linha de 'retrying' do log tambem lista o dolt" || bad "P16 'retrying' sem o dolt: $(grep -F retrying "$LOGF" | head -1)"
 
 # ── P10: dreno ───────────────────────────────────────────────────────────────
 echo "P10: sinal de dreno"
@@ -403,6 +535,9 @@ grep -qE 'goroutine_dump|kill -QUIT|kill -3' <<<"$CODE" \
   && bad "P14 o script chama o goroutine dump / SIGQUIT (derruba um Dolt vivo)" || ok "P14 nenhum caminho de codigo chama SIGQUIT"
 grep -qF -- '--robust' <<<"$CODE" && ok "P14 usa --robust" || bad "P14 nao usa --robust"
 grep -qE 'rm -rf' <<<"$CODE" && bad "P14 usa rm -rf (ga-gkap9p)" || ok "P14 sem rm -rf"
+grep -qiE 'mapa\.urblink|cloudflareaccess|https?://[a-z0-9.-]+\.com' <<<"$CODE" \
+  && bad "P14 o codigo menciona a URL publica do mapa / um host externo — o veredito do mapa nao pode vir da borda (Cloudflare Access responde 302 la, com o mapa de pe ou nao)" \
+  || ok "P14 nenhuma URL externa no codigo: o mapa e julgado pela origem (loopback) e pelo tunel"
 
 # ── P15: contrato com o nightly-reboot.sh (quem ESCREVE a pendencia e o dreno) ──
 # Dois scripts escritos em separado concordam em chaves e caminhos por convencao. Se um
