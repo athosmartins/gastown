@@ -286,11 +286,38 @@ def t_json_spacing_and_canary(m, W):
     rec = m.scan_session(p)
     ck(rec["msgs"] == 2 and rec["role"] == "dog", f"JSON espaçado lê igual ao compacto (2 respostas, papel dog): {rec['msgs']} {rec['role']}")
     big = [{"type": "attachment", "timestamp": D + "10:00:00Z", "attachment": {"n": i}} for i in range(40)]
-    write_session(w["projects"], "-proj", "weird", [{"type": "msg-v9", "n": i} for i in range(40)] + big)
+    def harvest_out():
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
+        return out.getvalue()
+    # 1 sessão morta no nascimento entre sessões normais: NÃO é alarme (existem ~0,7% delas)
+    write_session(w["projects"], "-proj", "stillborn", [{"type": "msg-v9", "n": i} for i in range(40)] + big)
+    for i in range(3):
+        write_session(w["projects"], "-proj", f"normal{i}", [beacon("gastown.dog-6", D + "10:00:00Z")] + sum((asst(f"nm{i}{j}", D + f"10:0{j}:00Z") for j in range(1, 6)), []) + big)
+    quiet = harvest_out()
+    ck("0 respostas lidas" not in quiet, f"uma sessão natimorta entre normais não acende o alarme: {quiet}")
+    # formato novo: TODAS as sessões grandes da colheita voltam com 0 respostas -> alarme
+    for i in range(3):
+        write_session(w["projects"], "-proj", f"weird{i}", [{"type": "msg-v9", "n": j} for j in range(40)] + big)
+    loud = harvest_out()
+    ck("3 de 3 sessões com ≥30 linhas vieram com 0 respostas lidas" in loud, f"sessões grandes sem nenhuma resposta lida acendem o alarme de formato: {loud}")
+
+
+def t_unknown_is_not_zero(m, W):
+    w, _ = setup(m, W)
+    recs = [beacon("gastown.dog-4", D + "10:00:00Z")] + asst("ok1", D + "10:00:10Z")
+    nu = asst("nou1", D + "10:00:20Z", blocks=1)
+    for r in nu:
+        r["message"].pop("usage")                                   # resposta real sem usage
+    p = w["projects"] / "-proj" / "nousage.jsonl"
+    p.write_text("\n".join(json.dumps(r, separators=(",", ":")) for r in recs + nu) + '\n{"type":"assistant","message":{"id":"cortada","usage":{"input_tokens":5\n')   # resposta TRUNCADA no meio (escrita cortada)
+    rec = m.scan_session(p)
+    ck(rec["no_usage"] == 1 and rec["bad_lines"] == 1, f"resposta sem usage e linha quebrada são CONTADAS no registro: no_usage={rec['no_usage']} bad_lines={rec['bad_lines']}")
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         m.cmd_harvest(type("A", (), dict(ledger=str(w["ledger"]), since_hours=0))())
-    ck("0 respostas lidas" in out.getvalue(), f"sessão grande sem nenhuma resposta lida acende o alarme de formato: {out.getvalue()}")
+    ck("1 linhas de transcrito ilegíveis e 1 respostas SEM usage" in out.getvalue(), f"a colheita avisa (não fica quieta): {out.getvalue()}")
 
 
 def t_subagent(m, W):
@@ -440,7 +467,7 @@ case "$1 $2" in
   "s3api list-objects-v2") [ -f "$BTM_STUB_DIR/fail" ] && { echo "AccessDenied" >&2; exit 255; }; cat "$BTM_STUB_DIR/list.tsv" ;;
   "s3 sync") src="${3#s3://*/}"; dest="$4"; shift 4; incl=()
     while [ $# -gt 0 ]; do [ "$1" = "--include" ] && incl+=("$2"); shift; done
-    for f in "${incl[@]}"; do [ -f "$BTM_STUB_DIR/objects/$src$f" ] && cp "$BTM_STUB_DIR/objects/$src$f" "$dest/$f"; done ;;
+    for f in "${incl[@]}"; do [ -f "$BTM_STUB_DIR/objects/$src$f" ] && cp "$BTM_STUB_DIR/objects/$src$f" "$dest/$f"; [ "$f" = "sid3.jsonl" ] && chmod 000 "$dest/$f"; done ;;
   *) echo "stub: comando inesperado $*" >&2; exit 9 ;;
 esac
 '''
@@ -452,8 +479,9 @@ def stub_world(W, m):
     ok = [beacon("gastown.dog-1", D + "10:00:00Z")] + asst("s1", D + "10:00:10Z", cmd="bd update ga-s3s3 --claim", tid="tu_s") + [tool_result("tu_s", "✓ Updated issue: ga-s3s3", D + "10:00:11Z")]
     (stub / "objects" / "projects" / "-projA" / "sid1.jsonl").write_text("\n".join(json.dumps(r) for r in ok) + "\n")
     size = (stub / "objects" / "projects" / "-projA" / "sid1.jsonl").stat().st_size
+    (stub / "objects" / "projects" / "-projA" / "sid3.jsonl").write_text('{"type":"user"}\n')
     (stub / "list.tsv").write_text(
-        f"projects/-projA/sid1.jsonl\t{size}\nprojects/-projA/sid2.jsonl\t500\n"
+        f"projects/-projA/sid1.jsonl\t{size}\nprojects/-projA/sid2.jsonl\t500\nprojects/-projA/sid3.jsonl\t17\nlinha estranha sem tab\n"
         f"projects/-Users-athos-gt-whatsapp-automation/p1.jsonl\t900\nprojects/-private-tmp-x/t1.jsonl\t10\nprojects/-projA/sid1/subagents/a.jsonl\t77\n")
     aws = W / "aws-stub.sh"
     aws.write_text(STUB)
@@ -475,7 +503,10 @@ def t_backfill(m, W):
     led = W / "bf" / "sessions.jsonl"
     code, out = bf(m, W)
     ck(code == 4, f"download que falha (sid2 não existe) => exit 4, não 0 silencioso; saiu {code}: {out}")
-    ck("FALHOU projects/-projA/sid2.jsonl" in out and "1 downloads FALHARAM" in out, f"a falha é listada: {out}")
+    ck("FALHOU projects/-projA/sid2.jsonl" in out and "2 downloads FALHARAM" in out, f"as falhas são listadas (sid2 não veio; sid3 veio ilegível): {out}")
+    ck("FALHOU projects/-projA/sid3.jsonl: transcrito baixado e ilegível" in out and "0 já tinham registro mais completo" in out,
+       f"transcrito baixado e ilegível é FALHA, não 'já tinha registro mais completo': {out}")
+    ck("1 linhas da listagem do aws que não consegui interpretar" in out, f"linha estranha na listagem é contada, não engolida: {out}")
     rows, _ = m.load_ledger(led)
     ck(list(rows) == ["sid1"] and rows["sid1"]["claims"][0]["bead"] == "ga-s3s3", f"só sid1 entrou (produto/scratch/aninhados ficam de fora): {list(rows)}")
     ck("2 fora de escopo" in out and "1 objetos aninhados" in out, f"escopo e aninhados reportados: {out}")
@@ -509,7 +540,7 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
          ("composição do custo: uma fórmula só", t_composition), ("<synthetic> fora, modelo sem preço = n/p, --assume-price rotulado", t_synthetic_unpriced),
          ("claim ok / falho / sem resultado; pré-claim rateado", t_claims), ("preâmbulo ≠ bead; ocioso; referência; crew", t_noise_idle_ref_crew),
-         ("JSON espaçado lido igual + alarme de formato", t_json_spacing_and_canary), ("subagente entra na sessão-mãe sem duplicar", t_subagent), ("revisor: ramo certo entre citações", t_reviewer),
+         ("JSON espaçado lido igual + alarme de formato", t_json_spacing_and_canary), ("desconhecido ≠ zero: resposta sem usage e linha ilegível aparecem", t_unknown_is_not_zero), ("subagente entra na sessão-mãe sem duplicar", t_subagent), ("revisor: ramo certo entre citações", t_reviewer),
          ("janela por dia da mensagem", t_window_by_message_day), ("gate: 1ª rodada, coorte, US$/bead aprovada, dry_run fora", t_gate_cohort), ("aprovada em qualquer rodada + poder do A/B", t_approved_and_power), ("teto de contexto: excesso exato + registro antigo reescaneado", t_context_caps),
          ("ledger: idempotente, cresce, sobrevive ao reaper, mais completo vence", t_ledger), ("lock de instância única", t_lock),
          ("terceiro estado: SEM DADO", t_no_data), ("backfill-s3: erro≠vazio, falha contada, disco, escopo", t_backfill)]
