@@ -33,10 +33,11 @@ import sys
 DEFAULT_CITY = os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-hq"
 
 # reason_code -> (bucket, bounced_by_a_mechanical_check). The CODES are the contract with the producers
-# (gate-fastlane.lib.sh sets GATE_LANE_REASON_CODE on every decision; the dispatcher sets the last three itself).
+# (gate-fastlane.lib.sh sets GATE_LANE_REASON_CODE on every decision; the dispatcher sets no-changed-files, decision-errored and lib-not-loaded itself).
 # This used to match a substring of the free-text reason — and drifted: the lib's sentence changed, the needle
 # never matched again, and every code/prompt diff (~96% of decisions) was reported as "touches the gate's own
-# policy". gate-fastlane.selftest.sh runs the REAL decision and fails when a code the producer can emit is not here.
+# policy". gate-lane-tally.selftest.sh fails when a code a producer emits is not here (or a code here has no producer);
+# gate-fastlane.selftest.sh §4e runs the REAL decision through the REAL tally and fails on a wrong bucket.
 REASON_CODES = {
     "code-or-prompt":   ("tem arquivo de código ou prompt/doutrina", False),
     "scan-findings":    ("só doc/teste, barrado pelo scan (dado pessoal/segredo)", True),

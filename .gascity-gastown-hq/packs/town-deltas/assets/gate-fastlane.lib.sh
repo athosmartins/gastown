@@ -36,7 +36,9 @@
 #   GATE_LANE_REASON_CODE  a short stable token for the SAME decision — what gate-lane-tally.py buckets on, so rewording
 #                     a sentence above can never silently move diffs between buckets (the tally once matched on the
 #                     sentence, and every code/prompt diff landed in "touches the gate's own policy"). Every code is
-#                     listed in gate-lane-tally.py's REASON_CODES; gate-fastlane.selftest.sh fails when one is missing.
+#                     listed in gate-lane-tally.py's REASON_CODES: gate-lane-tally.selftest.sh fails when a code emitted here has no
+#                     bucket (or a bucket has no producer), and gate-fastlane.selftest.sh §4e runs each decision through the real
+#                     tally and fails when its bucket is not the one its code names.
 #   GATE_LANE_FILES   "CLASS path" lines — the files that DECIDED (all of them for fast; the blockers for normal)
 #   GATE_LANE_COUNTS  "doc=N test=N prompt=N code=N"
 
