@@ -9581,6 +9581,25 @@ _pilot_release_count_unreadable() {
   return 0
 }
 
+# _e9_dispatch_line <bead_id> <bead_store> — ga-798p6w (E9, the planner A/B): the one extra line for the builder's dispatch
+# comment, or NOTHING. Nothing (empty stdout, exit 0) is the normal answer: no .gc/e9-ab.conf or the kill switch (the experiment is
+# off), the bead is in the control arm, a sibling script is missing, `assign` timed out or failed, or the arm could not be
+# determined. "Could not tell" must never read as "on" — it would point a builder at an Opus planner run for the wrong bead — so
+# every failure path falls through to the comment exactly as it was. `assign` also runs for the control arm on purpose: it is what
+# records who was assigned, and a control arm with no denominator is not a control. It makes no bd call (jq, a hash, one roster
+# append), so the 10s bound is generous even at load 50.
+_e9_dispatch_line() {
+  local _e9_bid="$1" _e9_store="$2" _e9_sd _e9_arms _e9_plan _e9_arm
+  _e9_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  [ -n "$_e9_sd" ] || return 0
+  _e9_arms="$_e9_sd/e9-arms.sh"; _e9_plan="$_e9_sd/e9-plan.sh"
+  { [ -r "$_e9_arms" ] && [ -r "$_e9_plan" ]; } || return 0
+  _e9_arm="$(timeout 10 bash "$_e9_arms" assign "$_e9_bid" "$_e9_store" pilot-dispatch 2>/dev/null)" || return 0
+  [ "$_e9_arm" = "on" ] || return 0
+  printf 'Experiment E9 (planner A/B, ga-798p6w): this bead is in the PLAN arm. Before reading code or editing, run `bash %s run %s --store %s` and start from the plan it prints. Exit 3 (no plan could be made) is not a verdict on the bead: build as you always do.' \
+    "$_e9_plan" "$_e9_bid" "$_e9_store"
+}
+
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
 # Handles: claim, verify, builder routing, sling, bead transitions, logging, ntfy.
@@ -11968,6 +11987,17 @@ Sling task bead: $SLING_BEAD_ID
 Builder doctrine: implement → /gate-done → autonomous gate+delivery → story:done.
 No human review required.
 No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)? Never exit with the bead in_progress: acceptance already met by the artifact itself → bd close --reason citing it. Missing an Athos decision → park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
+    fi
+
+    # ga-798p6w (E9): empty unless the planner experiment is on AND this bead is in the plan arm — the comment is then unchanged.
+    # Not for the beads-repo branch (an upstream PR, no gate, no builder doctrine for a plan to attach to).
+    if [ -z "$IS_BEADS_REPO_FIX" ]; then
+      local _e9_line
+      _e9_line="$(_e9_dispatch_line "$STORY_ID" "$STORY_BEAD_CITY")"
+      if [ -n "$_e9_line" ]; then
+        DISPATCH_COMMENT="$DISPATCH_COMMENT
+$_e9_line"
+      fi
     fi
 
     bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "$DISPATCH_COMMENT" \
