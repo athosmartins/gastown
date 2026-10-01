@@ -594,6 +594,15 @@ dir = ""
 name = "auto-refiner"
 option_defaults = { effort = "high" }
 
+# Mayor 01/10: the 60s default rolled back a batista-wa start ("resuming session: context
+# deadline exceeded", start_call=1m11s) with load 70-88 on 10 cores. A claude-rc crew
+# loads the full MCP roster plus remote-control, and under that load it needs more than a
+# minute to show its prompt; a gate reviewer (no MCP) already took 47s. The engine's own
+# error text says to raise this for cities with slow-starting sessions. Cost: a start that
+# really hangs is given up 2 minutes later than before.
+[session]
+startup_timeout = "180s"
+
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
 # O modo runtime (socket wake) e melhor no papel: o poll `gc nudge poll` por sessao
