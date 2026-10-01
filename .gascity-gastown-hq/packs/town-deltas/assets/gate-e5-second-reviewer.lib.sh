@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # gate-e5-second-reviewer.lib.sh — E5 (ga-syxaki, P0 ga-ufskhy): a 2nd independent gate
-# reviewer, as an A/B experiment. Sourced (fail-soft) by quality-gate-dispatcher.sh;
+# reviewer, as an A/B experiment. Sourced by quality-gate-dispatcher.sh behind an [ -r ] guard — which survives
+# a MISSING or UNREADABLE file, NOT a parse error or a failing top-level command (under bash 3.2 either exits the whole
+# daemon at the `source`; see the comment at the sourcing site in the dispatcher), so this file must stay parseable and
+# free of top-level commands that can fail;
 # every function is bash 3.2 safe (the only bash on this host: no associative arrays, no
 # ${x,,}, and "${arr[@]}" on an EMPTY array aborts under `set -u`).
 #
@@ -35,7 +38,11 @@
 #
 # Observability: every decision is a line in quality-gate.jsonl (events e5_admit,
 # e5_session, e5_extra_spawn, e5_extra_declined, e5_extra_abandoned, e5_run_end) — the
-# apuração (scripts/gate-e5-apuracao.py) is a pure function of those lines.
+# apuração (scripts/gate-e5-apuracao.py) is a pure function of those lines, read against the
+# flag file (flag on + judged runs + no e5_admit is an error there, not "not started"). One event is
+# written by the DISPATCHER, not this lib, because this lib is the thing that did not load:
+# e5_lib_not_loaded (flag file readable, GATE_E5_LIB_OK=0). A line that cannot be written
+# (gate_e5_log_event) is a warning in the dispatcher log, not silence.
 
 GATE_E5_SIZE_THRESHOLD_LINES="${GATE_E5_SIZE_THRESHOLD_LINES:-800}"
 case "$GATE_E5_SIZE_THRESHOLD_LINES" in ''|*[!0-9]*) GATE_E5_SIZE_THRESHOLD_LINES=800 ;; esac
@@ -103,11 +110,17 @@ gate_e5_size_state() {
 # ── structured events ─────────────────────────────────────────────────────────
 # gate_e5_log_event <event> [key value]... — one compact JSON line appended to
 # quality-gate.jsonl. All values are strings (the apuração parses numbers). Never fails
-# the caller: a lost event is an observability gap, not a gate failure.
+# the caller: a lost event is an observability gap, not a gate failure — but it is not a
+# SILENT one: a line that is not written removes a run from the apuração's denominators (an
+# e5_admit) or a session from its cost, and nothing in the log would show the hole, so each
+# way of losing it says so in the dispatcher log (warn), once per lost line.
 gate_e5_log_event() {
   local _ev="$1"; shift
   local _file="${QG_LOG:-}"
-  [ -z "$_file" ] && return 0
+  if [ -z "$_file" ]; then
+    _e5_warn "E5: no event log is configured (QG_LOG is empty) — the $_ev event was NOT written; the apuração will be missing it."
+    return 0
+  fi
   local _args=() _prog='{ts:$ts,event:$event' _k _v
   while [ "$#" -ge 2 ]; do
     _k="$1"; _v="$2"; shift 2
@@ -115,8 +128,19 @@ gate_e5_log_event() {
     _prog="${_prog},${_k}:\$${_k}"
   done
   _prog="${_prog}}"
-  jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$_ev" \
-    ${_args[@]+"${_args[@]}"} "$_prog" >> "$_file" 2>/dev/null || true
+  # (2>/dev/null BEFORE the >>: redirections run left to right, so a failing open of $_file is silenced here and
+  # reported once, by the warning below — not also as a bare shell error line)
+  if ! jq -c -n --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$_ev" \
+      ${_args[@]+"${_args[@]}"} "$_prog" 2>/dev/null >> "$_file"; then
+    _e5_warn "E5: could not append the $_ev event to $_file (disk full? permission? jq failed?) — the apuração will be missing this line."
+  fi
+  return 0
+}
+
+# _e5_warn <message> — the dispatcher's warn() when it exists (the lib is also sourced by selftests and
+# tools that have none), else stderr. Never fails.
+_e5_warn() {
+  if declare -F warn >/dev/null 2>&1; then warn "$*"; else printf '%s\n' "$*" >&2; fi
   return 0
 }
 
