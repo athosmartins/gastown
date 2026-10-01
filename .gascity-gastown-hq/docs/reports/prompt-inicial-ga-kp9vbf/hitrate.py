@@ -28,6 +28,9 @@ rows = {}
 for r in POOL:
     v = sorted(by[r], key=ts)
     if len(v) < 2:
+        # a role with < 2 sessions has no gap to measure: say so, and leave it OUT of hitrate.json (cost2/projection then fail loudly on it
+        # instead of reading a made-up rate)
+        print(f"{r:22s} {len(v):4d}  sem amostra (< 2 sessões: não há intervalo para medir)")
         continue
     gaps = [(ts(b) - ts(a)).total_seconds() / 60 for a, b in zip(v, v[1:])]
     span_h = (ts(v[-1]) - ts(v[0])).total_seconds() / 3600

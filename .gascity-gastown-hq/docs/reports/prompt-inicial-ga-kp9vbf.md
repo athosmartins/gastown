@@ -152,5 +152,6 @@ Padrão E3 (braço = paridade de SHA-256 do bead-id, **com sal próprio** `ga-kp
 - **Seções:** tokens = chars × razão do papel (medida no papel, não por seção); as frações cortadas são hipótese de projeto.
 - **Detectores validados por amostra e dois estavam errados na 1ª versão:** `git add .` casava caminhos que começam com ponto (falsos 36,6% → 9,6% depois de apertar) e `next-action:` casava o filtro de startup (100% → 0%). São violação da **letra**; o `bd list` sem limite do revisor é benigno. n do ps-worker = 44.
 - **Observacional.** Tamanho, modelo, effort e regime do gate estão entrelaçados; o corte de 26/09 não se separa do prompt v2 do revisor.
+- **Transcritos descartados:** 989 dos 1.783 transcritos da janela não têm nenhum turno de modelo com uso (o `usage_scan.py` agora imprime isso): 922 são chamadas automáticas sem beacon, fora do pool, e **67 são sessões de gate-reviewer sem uso faturável** (não investiguei: podem ser falhas de spawn). Não custam tokens, então o WTE não muda, mas as 136 sessões/dia do revisor **não** as contam.
 - **Render com `GC_ALIAS` do dog-2:** vaza em 2–3 linhas dos primes de revisor (não muda tamanho).
-- **Custo do estudo:** ≈ 650 mil tokens em 16 sondas (≈ 1,3 M WTE, 0,24% de um dia do pool); 0 mensagens e 0 nudges; 1 bead criada (ga-653ilw).
+- **Custo do estudo:** ≈ 650 mil tokens em 16 sondas (≈ 1,3 M WTE, 0,24% de um dia do pool); 0 mensagens e 0 nudges; 1 bead criada (ga-653ilw); 1 entrada no índice interno de Estudos (`publico` ausente).

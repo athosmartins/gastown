@@ -56,3 +56,6 @@ for _, p in cands:
     shown += 1
     if shown >= 2:
         break
+if shown == 0:
+    # nothing printed would read as "the structure is fine": say that no transcript was inspected
+    print(f"prefix_probe: no usable '{want}' transcript found under ~/.claude/projects — nothing was inspected")

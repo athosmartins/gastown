@@ -46,6 +46,7 @@ PROC = {
     "recall_cli":         r"(^|[\s;&|(])recall\s",
 }
 PROC_RE = {k: re.compile(v) for k, v in PROC.items()}
+SKIPPED = Counter()   # everything dropped on the way, reported at the end (stderr)
 BDLIST = re.compile(r"\b(?:gc )?bd (?:-C \S+ )?list\b")
 LIMIT_OK = re.compile(r"--limit(?:[ =]\d+)?|-n\s*\d+|--all\b|--limit\s*0")
 HOME_SCAN = re.compile(r"(du|find|ls -R|tree|ncdu|fd)\s[^|;&]*(?:\s~/?\s|\s/Users/athos/?\s|\$HOME/?\s|\s~/\*)")
@@ -63,12 +64,14 @@ def scan(path):
     try:
         fh = open(path, errors="replace")
     except OSError:
+        SKIPPED["transcript vanished before it was read"] += 1
         return None
     with fh:
         for line in fh:
             try:
                 r = json.loads(line)
             except Exception:
+                SKIPPED["unparseable JSONL line"] += 1
                 continue
             if r.get("isSidechain"):
                 continue
@@ -76,7 +79,7 @@ def scan(path):
                 try:
                     start = ppm.parse_ts(r["timestamp"])
                 except Exception:
-                    pass
+                    SKIPPED["unreadable timestamp (session start left null)"] += 1
             t = r.get("type")
             if t == "user" and alias is None:
                 m = ppm.BEACON.match(ppm.first_text(r).lstrip())
@@ -131,6 +134,7 @@ def scan(path):
                 turns += 1
                 tok["input"] += i; tok["cache_write"] += cw; tok["cache_read"] += cr; tok["output"] += o
     if first is None:
+        SKIPPED["session with no model turn (no usage)"] += 1
         return None
     return dict(role=ppm.role_of(alias), alias=alias, start=start.isoformat() if start else None, first=first,
                 first_split=first_split, turns=turns, tok=dict(tok), tools=dict(tools), proc=dict(proc), viol=dict(viol),
@@ -146,11 +150,14 @@ def main():
             if os.path.getmtime(p) < cut:
                 continue
         except OSError:
+            SKIPPED["transcript vanished before it was read"] += 1
             continue
         s = scan(p)
         if s:
             out.append(s)
     json.dump(out, sys.stdout)
+    # what was NOT counted is part of the result: print it, never leave "no data" looking like "nothing happened"
+    print(f"usage_scan: {len(out)} sessions kept; skipped: " + (", ".join(f"{n} x {why}" for why, n in SKIPPED.items()) or "nothing"), file=sys.stderr)
 
 
 main()

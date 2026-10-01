@@ -23,6 +23,13 @@ for x in d:
     if x["role"] in ROLES and keep(x):
         by[x["role"]].append(x)
 
+def pct(v, key, field, nd=0):
+    """% of sessions in v whose `field` has `key`. An EMPTY sample is 'sem amostra', never 0% (no sessions != no use)."""
+    if not v:
+        return f"{'sem amostra':>12s}"
+    return f"{100 * sum(1 for x in v if x[field].get(key)) / len(v):11.{nd}f}%"
+
+
 keys = sorted({k for x in d for k in x["proc"]})
 print("\nPROCEDURE USE — % of sessions with >=1 Bash call matching (n in header)")
 hdr = f"{'procedure':18s}" + "".join(f"{r[:11]:>12s}" for r in ROLES)
@@ -32,7 +39,7 @@ for k in keys:
     row = f"{k:18s}"
     for r in ROLES:
         v = by[r]
-        row += f"{(100*sum(1 for x in v if x['proc'].get(k))/max(1,len(v))):11.0f}%"
+        row += pct(v, k, "proc")
     print(row)
 
 vk = sorted({k for x in d for k in x["viol"]})
@@ -41,7 +48,7 @@ for k in vk:
     row = f"{k:24s}"
     for r in ROLES:
         v = by[r]
-        row += f"{(100*sum(1 for x in v if x['viol'].get(k))/max(1,len(v))):11.1f}%"
+        row += pct(v, k, "viol", 1)
     print(row)
 
 print("\nTOOLS used (top, % of sessions)")
@@ -53,7 +60,7 @@ for t, _ in alltools.most_common(25):
     row = f"{t[:28]:28s}"
     for r in ROLES:
         v = by[r]
-        row += f"{(100*sum(1 for x in v if x['tools'].get(t))/max(1,len(v))):11.0f}%"
+        row += pct(v, t, "tools")
     print(row)
 
 print("\nSKILLS invoked (sessions)")

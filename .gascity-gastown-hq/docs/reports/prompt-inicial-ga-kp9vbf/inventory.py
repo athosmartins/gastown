@@ -30,6 +30,9 @@ for r in ROLES:
 # --- 3) town-deltas sections (from template markers)
 T = open(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "..", "..", "..", "packs", "town-deltas", "template-fragments", "town-deltas.template.md")).read()
 marks = [(m.start(), m.group(1)) for m in re.finditer(r"\{\{/\* td:(?:core:)?([a-z0-9-]+) \*/", T)]
+if not marks:
+    # no marker found = the template format changed (or the path is wrong); a TOTAL of 0 chars would read as "no sections"
+    raise SystemExit("inventory.py: no `{{/* td:<id> */}}` marker found in town-deltas.template.md — refusing to print an empty section table")
 sections = {}
 for i, (pos, name) in enumerate(marks):
     # section starts at the beginning of the line holding the marker (guard `{{ if ...}}` shares that line)
