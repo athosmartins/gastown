@@ -17,6 +17,7 @@
 #   P3  pendencia velha (>3h) -> nao atribui este boot ao reboot noturno; descarta
 #   P4  tudo ok -> notify OK, pendencia removida, SEM mail; sonda chamada com --robust
 #   P5  Dolt caido em todas as rodadas -> COM PROBLEMA + mail, esgota as rodadas
+#   P5c o mail ao mayor que FALHA ou PENDURA e registrado (rc / TIMED OUT) — nunca parece enviado
 #   P5b o orcamento e em SEGUNDOS (relogio), nao so em rodadas
 #   P6  tres estados: probe rc 2 / launchctl com erro / curl sem resposta = unknown
 #   P7  um servico sobe na 2a rodada -> re-confere TUDO e fecha ok
@@ -52,6 +53,8 @@ BOOT_NOW=1790000500
 #   W_SENDER       running | nopid | absent | error             (default running)
 #   W_SENDER_OK_AT a partir de qual chamada o launchctl passa a "running"
 #   W_MAP_CODE / W_MAP_RC   resposta do fake de curl            (default 302 / 0)
+#   W_GC_RC        rc do fake de gc (mail send)                (default 0)
+#   W_GC_HANG      1 = o gc pendura (Dolt wedged): grava o pid e dorme 600s
 new_world() {
   W="$TMP/$1"; rm -rf "$W"; mkdir -p "$W/city/.gc/logs" "$W/run" "$W/vm"
   LOGF="$W/city/.gc/logs/nightly-reboot.log"
@@ -68,6 +71,9 @@ EOF
   cat > "$W/gc" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$GC_CALLS"
+if [ "${W_GC_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/gc.pids"; exec /bin/sleep 600; fi
+echo "gc: simulated output"
+exit ${W_GC_RC:-0}
 EOF
   # kern.boottime REAL tem usec: um parse guloso (.*sec = N) devolveria o usec.
   cat > "$W/sysctl" <<EOF
@@ -183,6 +189,27 @@ W_DOLT_RC=1 new_world p5b; write_pending "$(( $(now_s) - 300 ))"; MAXA=40 MAXW=0
 [ "$(cat "$W/n.probe")" = "1" ] && ok "P5b prazo estourado -> 1 rodada so (nao as 40 do teto)" || bad "P5b rodadas=$(cat "$W/n.probe") com MAX_WAIT=0 (o prazo em segundos nao esta valendo: com Dolt fora cada rodada leva ~1min e 40 delas ~1h)"
 notify_has "COM PROBLEMA" && ok "P5b o aviso de problema sai no prazo" || bad "P5b sem aviso: $(cat "$NOTIFY_CALLS")"
 log_has "up to 0s" && ok "P5b o log declara o prazo" || bad "P5b log sem o prazo"
+
+# ── P5c: o desfecho do mail ao mayor fica no log ─────────────────────────────
+# O mail terminava em `>/dev/null 2>&1 || true` depois de logar "mailing mayor": um envio que
+# falhou (ou que nunca voltou) era indistinguivel de um que saiu.
+echo "P5c: mail ao mayor que falha / pendura e registrado, e nao prende o pos-boot"
+W_DOLT_RC=1 W_GC_RC=1 new_world p5c; write_pending "$(( $(now_s) - 300 ))"; run_pc
+log_has "mail to mayor FAILED (rc=1" && ok "P5c mail que falhou: 'FAILED (rc=1' no log, com a saida do gc" || bad "P5c sem registro do mail que falhou. log: $(grep -i mail "$LOGF" | tr '\n' '|')"
+[ "$RC" = "1" ] && [ ! -e "$PENDING" ] && ok "P5c o mail falho nao muda o desfecho (exit 1, pendencia removida)" || bad "P5c exit=$RC pendencia=$([ -e "$PENDING" ] && echo ficou || echo removida)"
+W_DOLT_RC=1 new_world p5c-ok; write_pending "$(( $(now_s) - 300 ))"; run_pc
+log_has "mail to mayor: sent" && ok "P5c mail que saiu: 'sent' no log" || bad "P5c sem 'mail to mayor: sent'"
+W_DOLT_RC=1 W_GC_HANG=1 new_world p5d; write_pending "$(( $(now_s) - 300 ))"
+( /bin/sleep 40; for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done ) >/dev/null 2>&1 &
+HG_WD=$!
+T0=$(now_s); NIGHTLY_REBOOT_POSTCHECK_MAIL_TIMEOUT_SECS=2 run_pc; T1=$(now_s)
+kill "$HG_WD" 2>/dev/null; wait "$HG_WD" 2>/dev/null
+[ $((T1-T0)) -le 25 ] && ok "P5c gc pendurado: o pos-boot terminou em $((T1-T0))s (sem prazo ficava parado ate o gc voltar)" || bad "P5c o pos-boot ficou $((T1-T0))s preso no mail"
+log_has "mail to mayor TIMED OUT" && ok "P5c o log diz que o mail NAO foi enviado (TIMED OUT)" || bad "P5c sem 'TIMED OUT' no log. mail: $(grep -i mail "$LOGF" | tr '\n' '|')"
+[ "$RC" = "1" ] && [ ! -e "$PENDING" ] && ok "P5c gc pendurado: exit 1 e pendencia removida" || bad "P5c exit=$RC pendencia=$([ -e "$PENDING" ] && echo ficou || echo removida)"
+n_alive=0; for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -0 "$p" 2>/dev/null && n_alive=$((n_alive+1)); done
+[ "$n_alive" = "0" ] && ok "P5c o gc pendurado foi morto" || bad "P5c sobrou gc pendurado vivo"
+for p in $(cat "$W/gc.pids" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
 
 # ── P6: tres estados, nunca colapsados ───────────────────────────────────────
 echo "P6: 'nao consegui olhar' e unknown, nao ok e nao FAIL"

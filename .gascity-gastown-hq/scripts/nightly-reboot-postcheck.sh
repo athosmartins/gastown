@@ -74,6 +74,8 @@ MAX_WAIT="${NIGHTLY_REBOOT_POSTCHECK_MAX_WAIT_SECS:-1200}"
 MAX_ATTEMPTS="${NIGHTLY_REBOOT_POSTCHECK_MAX_ATTEMPTS:-40}"
 MAX_PENDING_AGE="${NIGHTLY_REBOOT_POSTCHECK_MAX_PENDING_AGE:-10800}" # 3h: a macOS install can make the boot slow
 LOCK_DIR="${PENDING_FILE}.lock.d"
+MAIL_TIMEOUT="${NIGHTLY_REBOOT_POSTCHECK_MAIL_TIMEOUT_SECS:-30}"
+case "${MAIL_TIMEOUT}" in ''|*[!0-9]*|0) MAIL_TIMEOUT=30 ;; esac
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] postcheck: $*" >> "${LOG}" 2>/dev/null; }
 
@@ -248,8 +250,40 @@ MODE="$(pending_field mode)"
 BOOT_NOW="$(boot_epoch)"
 
 notify_athos() { "${NOTIFY_BIN}" -t "$1" -p "${3:-3}" "$2" >/dev/null 2>&1 || true; }
+# mail_mayor <subject> <body>: best-effort, but the OUTCOME is logged. `mail send` writes a
+# bead, so it hangs when Dolt is wedged — and this mail goes out in exactly the branch where
+# Dolt may be the thing that did not come back. Without a deadline the check would sit here
+# with its lock held, never run again, and say nothing. The deadline is counted with $SECONDS
+# and `kill -0` (builtins: no fork needed), not timeout(1), which macOS does not ship.
 mail_mayor() {
-    "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot-postcheck.sh -s "$1" -m "$2" >/dev/null 2>&1 || true
+    local out rc pid wd
+    out="$(mktemp -t nightly-reboot-postcheck-mail)"
+    "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot-postcheck.sh -s "$1" -m "$2" >"${out}" 2>&1 &
+    pid=$!
+    (
+        end=$(( SECONDS + MAIL_TIMEOUT ))
+        while kill -0 "${pid}" 2>/dev/null; do
+            if [ "${SECONDS}" -ge "${end}" ]; then
+                : > "${out}.deadline"
+                /usr/bin/pkill -TERM -P "${pid}" 2>/dev/null
+                kill -TERM "${pid}" 2>/dev/null
+                break
+            fi
+            sleep 1 2>/dev/null || :
+        done
+    ) >/dev/null 2>&1 &
+    wd=$!
+    wait "${pid}" 2>/dev/null; rc=$?
+    kill "${wd}" 2>/dev/null; wait "${wd}" 2>/dev/null
+    if [ -e "${out}.deadline" ]; then
+        log "ERROR: mail to mayor TIMED OUT after ${MAIL_TIMEOUT}s — NOT sent (Dolt not answering?)"
+    elif [ "${rc}" -eq 0 ]; then
+        log "mail to mayor: sent"
+    else
+        log "ERROR: mail to mayor FAILED (rc=${rc}: $(head -c 300 "${out}" 2>/dev/null | tr '\n' ' '))"
+    fi
+    rm -f "${out}" "${out}.deadline"
+    return 0
 }
 drop_pending() { rm -f "${PENDING_FILE}" 2>/dev/null; return 0; }
 

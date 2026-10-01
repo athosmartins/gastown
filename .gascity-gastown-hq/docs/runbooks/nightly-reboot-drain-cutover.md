@@ -35,7 +35,7 @@ O plist root executa o script **do checkout principal** (`/Users/athos/gt/.gasci
 Se o horário for movido para 23:00 **antes** do merge, o script antigo acorda às 23:00, vê que
 está fora da sua janela 01:00–01:19 e pula: noites perdidas, em silêncio.
 
-1. **Merge** (gate). Conferir: `bash -n scripts/nightly-reboot.sh && bash scripts/nightly-reboot.selftest.sh | tail -1`
+1. **Merge** (gate). Conferir (com o bash do launchd, `/bin/bash` 3.2): `/bin/bash -n scripts/nightly-reboot.sh && /bin/bash scripts/nightly-reboot.selftest.sh | tail -1 && /bin/bash scripts/nightly-reboot.drain.selftest.sh | tail -1`
 2. **Instalar a conferência pós-boot** (usuário, sem sudo; seguro a qualquer hora — sem pendência é no-op):
    ```bash
    cp /Users/athos/gt/.gascity-gastown-hq/scripts/com.gascity.nightly-reboot-postcheck.plist ~/Library/LaunchAgents/
@@ -58,6 +58,13 @@ está fora da sua janela 01:00–01:19 e pula: noites perdidas, em silêncio.
 - 23:00 `drain mode: the city stops admitting new work until the reboot at 23:40`
 - 23:40 `safety guards OK on attempt 1/16 ... rebooting with agent work possibly in flight`
 - depois do boot, `postcheck: RESULT: all four checks ok` + push **"Reboot noturno OK"**
+- `informational: guardN ...: unknown TIMED OUT` ou `info: other rigs' in_progress counts TIMED OUT`:
+  o bd/Dolt não respondeu a tempo (cada sonda ≤30 s, todas juntas ≤75 s). O reboot **sai mesmo
+  assim** — um Dolt doente de madrugada é justamente quando o reboot mais importa — e o snapshot
+  `nightly-reboot-pre-<data>.txt` registra a linha como `unknown`, não como `ok`. Se aparecer
+  várias noites seguidas, o Dolt está lento de madrugada: investigar à parte (`gc dolt health`).
+- `ERROR: alarm mail to mayor TIMED OUT` / `FAILED` e `ERROR: recording the skip ... TIMED OUT`: o
+  aviso ao mayor não saiu (o contador/streak já estava gravado). Antes isso era silencioso.
 - se algo ficou de pé: push **"pós-boot COM PROBLEMA"** com o check e o rótulo (`FAIL` = caiu,
   `unknown` = não consegui olhar). `nightly-reboot-postcheck.sh --now` repete a conferência a qualquer hora.
 
@@ -77,6 +84,9 @@ teto de 90 min).
 - O guard de manutenção de Dolt enxerga os **wrappers** (`dolt-compact-routine.sh` etc.) e o
   CLI `dolt gc|backup|push|pull|fetch|table` por processo — não um `CALL dolt_gc()` digitado
   num SQL interativo.
+- Dois passos ficam **sem prazo**, de propósito: `softwareupdate --install` (a instalação do
+  update do macOS é longa por desenho e não pode ser cortada no meio) e o `notify` (já tem limites
+  próprios: curl 6 s, e-mail 45 s). Tudo que fala com bd/Dolt entre o disparo e o `shutdown` tem prazo.
 - O corte da rodada do scraper depende do catch-up do próprio rig (`--skip-done-today`) retomar
   no boot; a conferência pós-boot **não** verifica isso (é do dono do property_scrapers).
 - A porta usada pelo `SELECT 1` de confirmação do Dolt vem de `BEADS_DOLT_PORT` (default no

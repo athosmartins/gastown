@@ -34,8 +34,9 @@
 # 6-way pileup at 04:00). Net effect is the same as moving the fire time —
 # the actual reboot decision lands wherever the night turns out to be quiet
 # — without touching a root-owned file this session has no way to safely
-# change. Guard 1's 01:00-01:19 window is UNCHANGED: it only gates the
-# initial fire (rejecting a late launchd replay), not how long the retry
+# change. Guard 1's 01:00-01:19 window for the LEGACY flow is unchanged (ga-a2v0bz
+# adds a 23:00-23:19 DRAIN window beside it — see DRAIN MODE below): it only gates
+# the initial fire (rejecting a late launchd replay), not how long the retry
 # loop below may then run once that initial fire is accepted.
 #
 # A separate, additive fix for item 4 of ga-nnp5b ("alarme quando o job
@@ -74,12 +75,20 @@
 # reboot_once_0700.sh precedent — this sidesteps any TCC/GUI-session
 # ambiguity an osascript-from-a-LaunchAgent approach would carry.
 #
-# FAIL-CLOSED: any check this script cannot complete (bd/gc unreachable, gate
-# composition script errors) is treated as "unknown → do not reboot", never
-# as "zero → safe". An error and an empty result must not collapse to the
-# same value (see [[error-empty-must-not-produce-same-value]]). The retry
-# loop only buys TIME for a transient condition to clear — the LAST attempt
-# in the budget still fail-closes exactly like before if nothing ever clears.
+# FAIL-CLOSED (the LEGACY 01:00 flow): any check this script cannot complete
+# (bd/gc unreachable, gate composition script errors) is treated as "unknown →
+# do not reboot", never as "zero → safe". An error and an empty result must not
+# collapse to the same value (see [[error-empty-must-not-produce-same-value]]).
+# The retry loop only buys TIME for a transient condition to clear — the LAST
+# attempt in the budget still fail-closes exactly like before if nothing ever
+# clears. In DRAIN mode (23:00, ga-a2v0bz) only the two SAFETY guards (a send in
+# flight, Dolt maintenance) are fail-closed. Gate / hq / scraper are
+# informational there: an unreadable one is logged as "unknown" or "TIMED OUT"
+# and does NOT hold the reboot — and every bd/Dolt call between the fire and the
+# shutdown, the SKIP bookkeeping included, has a deadline (run_bounded), because a
+# call that can veto the reboot by hanging is the same silent failure this mode
+# exists to end. Not bounded, on purpose: `softwareupdate --install` (an install is
+# long by design and must not be cut), and notify (its own curl/mail limits).
 #
 # MANUAL REBOOTS (the Mayor's, or anyone's, ga-7e3fwa): run
 #     scripts/nightly-reboot.sh --check-guards
@@ -205,6 +214,10 @@ drain_end() {
 # path included — the readers also ignore a signal from a previous boot).
 drain_cleanup() {
   [ -n "${DRAIN_SLEEP_PID:-}" ] && kill "${DRAIN_SLEEP_PID}" 2>/dev/null
+  # a kill that lands while run_bounded waits must take the probe (bd, and whatever
+  # bd started) down with it, not leave it running past this script
+  [ -n "${BOUNDED_WD:-}" ] && kill "${BOUNDED_WD}" 2>/dev/null
+  [ -n "${BOUNDED_PID:-}" ] && _kill_tree "${BOUNDED_PID}"
   if [ "${DRAIN_ACTIVE:-0}" = "1" ]; then
     rm -f "${DRAIN_FILE}" 2>/dev/null
     DRAIN_ACTIVE=0
@@ -222,6 +235,97 @@ drain_sleep() {
   wait "${DRAIN_SLEEP_PID}" 2>/dev/null
   DRAIN_SLEEP_PID=""
   return 0
+}
+
+# --- Deadlines for calls that can hang (ga-a2v0bz, gate fix 1) -------------
+# bd / gc / gate-queue-composition.sh talk to Dolt, and a wedged Dolt does not
+# fail, it WAITS (ga-nnp5b: the night swap relief mattered most was the night Dolt
+# was sick). In the legacy flow bd had already answered before any reboot step
+# ran, so a call after that point could trust it. In drain mode the safety
+# guards never touch bd, so the FIRST bd contact is an "informational" one — and
+# with no deadline it vetoes the reboot by hanging, with the log's last line
+# saying "rebooting". run_bounded gives such a call a deadline; the caller turns
+# a missed deadline into an explicit "unknown" and goes on.
+BOUNDED_PID=""
+BOUNDED_WD=""
+INFO_PROBE_TIMEOUT="${NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS:-30}"   # one informational probe
+INFO_BUDGET_SECS="${NIGHTLY_REBOOT_INFO_BUDGET_SECS:-75}"            # all of them together
+case "${INFO_PROBE_TIMEOUT}" in ''|*[!0-9]*|0) INFO_PROBE_TIMEOUT=30 ;; esac
+case "${INFO_BUDGET_SECS}" in ''|*[!0-9]*|0) INFO_BUDGET_SECS=75 ;; esac
+INFO_DEADLINE=0
+
+# _kill_tree <pid>: TERM <pid> and everything below it, leaves first (a parent
+# killed first re-parents its children and pgrep -P can no longer find them).
+_kill_tree() {
+  local c
+  for c in $(/usr/bin/pgrep -P "$1" 2>/dev/null); do _kill_tree "${c}"; done
+  kill -TERM "$1" 2>/dev/null
+  return 0
+}
+
+# run_bounded <secs> <outfile> <cmd...>: run <cmd> with stdout+stderr in <outfile>;
+# if it has not finished in <secs>, kill it and everything it started. Returns
+# the command's own rc, or 124 when the deadline fired. <cmd> may be a shell
+# function (it runs in a subshell, so it cannot set variables here — print what
+# the caller needs). macOS has no timeout(1), and the nightly must not gain a
+# dependency on one. The deadline is counted with $SECONDS and `kill -0`, which
+# are builtins: it does not need a fork to succeed, and a box at load 60-88 is
+# exactly where a fork may not. `wait` returns the moment a trapped TERM arrives,
+# so a kill is never deferred behind a hung call (the foreground-call hazard).
+run_bounded() {
+  local secs="$1" out="$2" rc
+  shift 2
+  rm -f "${out}.deadline"
+  "$@" > "${out}" 2>&1 &
+  BOUNDED_PID=$!
+  (
+    end=$(( SECONDS + secs ))
+    while kill -0 "${BOUNDED_PID}" 2>/dev/null; do
+      if [ "${SECONDS}" -ge "${end}" ]; then
+        : > "${out}.deadline"
+        _kill_tree "${BOUNDED_PID}"
+        break
+      fi
+      sleep 1 2>/dev/null || :
+    done
+  ) >/dev/null 2>&1 &
+  BOUNDED_WD=$!
+  wait "${BOUNDED_PID}" 2>/dev/null; rc=$?
+  kill "${BOUNDED_WD}" 2>/dev/null
+  wait "${BOUNDED_WD}" 2>/dev/null
+  BOUNDED_PID=""; BOUNDED_WD=""
+  if [ -e "${out}.deadline" ]; then rm -f "${out}.deadline"; return 124; fi
+  return "${rc}"
+}
+
+# record_skip with a deadline. record_skip (the streak + alarm block below, which the legacy
+# selftest extracts verbatim, so it stays as it is) ends in `gc mail send`, and that writes a
+# bead: with Dolt wedged it hangs, the instance never exits, and launchd does not start the
+# next night while this one is still "running" — a SKIP that silently becomes every night's
+# SKIP. The streak file is written FIRST inside record_skip, so a timeout keeps the count.
+SKIP_RECORD_TIMEOUT="${NIGHTLY_REBOOT_SKIP_RECORD_TIMEOUT_SECS:-120}"   # notify can use ~75s of it, the mail the rest
+case "${SKIP_RECORD_TIMEOUT}" in ''|*[!0-9]*|0) SKIP_RECORD_TIMEOUT=120 ;; esac
+record_skip_bounded() {
+  local out rc
+  out="$(mktemp -t nightly-reboot-skip)"
+  run_bounded "${SKIP_RECORD_TIMEOUT}" "${out}" record_skip "$1"; rc=$?
+  if [ "${rc}" -eq 124 ]; then
+    log "ERROR: recording the skip (notify + alarm mail) TIMED OUT after ${SKIP_RECORD_TIMEOUT}s — the streak count is already on disk, but the alarm may not have gone out (Dolt not answering?)"
+  fi
+  rm -f "${out}" "${out}.deadline"
+  return 0
+}
+
+# The informational phase (guard report + rig counts) shares ONE time budget, so a
+# bad night costs at most INFO_BUDGET_SECS before the reboot, not N x timeout.
+info_begin() { INFO_DEADLINE=$(( SECONDS + INFO_BUDGET_SECS )); }
+# info_probe_secs: how long the next probe may run — INFO_PROBE_TIMEOUT, but never
+# past the shared deadline. 0 = the budget is spent.
+info_probe_secs() {
+  local left=$(( INFO_DEADLINE - SECONDS ))
+  [ "${left}" -gt "${INFO_PROBE_TIMEOUT}" ] && left="${INFO_PROBE_TIMEOUT}"
+  [ "${left}" -lt 0 ] && left=0
+  printf '%s' "${left}"
 }
 
 # --- Consecutive-skip streak (ga-nnp5b item 4) ----------------------------
@@ -945,11 +1049,41 @@ check_safety_guards_once() {
 # What this reboot is about to cut. Guards 2/3/4 do not hold the reboot in drain
 # mode, but their verdicts are the only record of what was in flight, so each one
 # lands in the log ("informational: ...") and in a per-night snapshot.
+#
+# Every probe here has a deadline. These calls are what first touches bd/Dolt in
+# drain mode (the safety guards never do), so without one a wedged Dolt turns an
+# "informational" line into a veto that nobody sees. A probe that misses its
+# deadline is written as "unknown ... TIMED OUT" — not "ok", not silence — and
+# the reboot goes on.
+info_guard() {
+    local label="$1" fn="$2" into="$3" secs rc gtmp
+    secs="$(info_probe_secs)"
+    if [ "${secs}" -le 0 ]; then
+        printf '%s: unknown NOT ATTEMPTED — the %ss informational time budget was already spent (informational only: the reboot proceeds)\n' "${label}" "${INFO_BUDGET_SECS}" >> "${into}"
+        return 0
+    fi
+    gtmp="$(mktemp -t nightly-reboot-info-guard)"
+    run_bounded "${secs}" "${gtmp}" report_guard "${label}" "${fn}"; rc=$?
+    if [ "${rc}" -eq 124 ]; then
+        printf '%s: unknown TIMED OUT after %ss — the probe did not answer, bd/Dolt wedged? (informational only: the reboot proceeds)\n' "${label}" "${secs}" >> "${into}"
+    elif [ -s "${gtmp}" ]; then
+        cat "${gtmp}" >> "${into}"
+    else
+        printf '%s: unknown the probe printed nothing (rc=%s)\n' "${label}" "${rc}" >> "${into}"
+    fi
+    rm -f "${gtmp}" "${gtmp}.deadline"
+    return 0
+}
+
 drain_informational_report() {
     local snap tmp line
     snap="${CITY}/.gc/logs/nightly-reboot-pre-$(date +%Y%m%d-%H%M).txt"
     tmp="$(mktemp -t nightly-reboot-info)"
-    check_guards_report > "${tmp}" 2>/dev/null || true    # rc ignored: informative only
+    info_begin
+    : > "${tmp}"
+    info_guard "guard2 gate-markers" guard_gate_markers "${tmp}"          # rc ignored: informative only
+    info_guard "guard3 hq-in-progress" guard_hq_in_progress "${tmp}"
+    info_guard "guard4 scraper-daily" guard_scraper_daily "${tmp}"
     {
         printf 'Pre-reboot snapshot, nightly reboot in DRAIN mode (ga-a2v0bz) - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
         printf 'These guards do NOT hold the reboot. What they show is what it cuts: the gate re-queues its markers, inflight-reclaim-guard hands beads back, the scraper catch-up resumes its rodada.\n'
@@ -974,10 +1108,21 @@ record_scraper_cut() {
             log "scraper: the rodada in flight WILL BE CUT by this reboot and resumed by the daily catch-up at boot (night ${n} in a row): ${reason}"
             if [ "${n}" -ge "${SCRAPER_CUT_ALARM_THRESHOLD}" ] && [ $(( n % SCRAPER_CUT_ALARM_THRESHOLD )) -eq 0 ]; then
                 log "ALARM: the scraper was cut ${n} nights in a row — mailing mayor (property_scrapers owner)"
-                "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
+                # `mail send` writes a bead, so a wedged Dolt hangs it: bounded, and the
+                # outcome is logged — a send that failed must not read like one that went.
+                local mail_out mail_rc
+                mail_out="$(mktemp -t nightly-reboot-mail)"
+                run_bounded "${INFO_PROBE_TIMEOUT}" "${mail_out}" \
+                  "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
                   -s "nightly-reboot: scraper cortado ${n} noites seguidas (ga-a2v0bz)" \
-                  -m "$(printf 'O reboot noturno das 23:40 encontrou uma rodada do scraper em andamento %s noites seguidas e a cortou (o catch-up retoma no boot).\nUltima: %s\nSe a rodada leva horas a cada noite, o ps precisa saber: o corte vira rotina.\nLog: %s' "${n}" "${reason}" "${LOG}")" \
-                  >/dev/null 2>&1 || true
+                  -m "$(printf 'O reboot noturno das 23:40 encontrou uma rodada do scraper em andamento %s noites seguidas e a cortou (o catch-up retoma no boot).\nUltima: %s\nSe a rodada leva horas a cada noite, o ps precisa saber: o corte vira rotina.\nLog: %s' "${n}" "${reason}" "${LOG}")"
+                mail_rc=$?
+                case "${mail_rc}" in
+                    0)   log "alarm mail to mayor: sent" ;;
+                    124) log "ERROR: alarm mail to mayor TIMED OUT after ${INFO_PROBE_TIMEOUT}s — NOT sent (Dolt not answering?); the reboot proceeds" ;;
+                    *)   log "ERROR: alarm mail to mayor FAILED (rc=${mail_rc}: $(head -c 300 "${mail_out}" 2>/dev/null | tr '\n' ' ')); the reboot proceeds" ;;
+                esac
+                rm -f "${mail_out}" "${mail_out}.deadline"
             fi
             ;;
         clear) printf '0\n' > "${SCRAPER_CUT_FILE}" 2>/dev/null || true ;;
@@ -997,13 +1142,14 @@ write_pending_file() {
     return 0
 }
 
-# The shared tail: both modes end here (legacy at 01:00, drain at 23:40). Unindented
-# lines inside are a python -c string; do not re-indent them.
-reboot_now_sequence() {
-REBOOT_MODE="$1"
-# --- Informational only: other rigs' in_progress count (not a gate) ------
+# Informational only: other rigs' in_progress count (not a gate).
 # Precedent (2026-08-29 runbook) treated non-hq in-progress as non-blocking —
 # inflight-reclaim-guard reclaims stale crew claims regardless of reboot.
+# Runs under run_bounded (one bd call per rig, any of which can hang on a wedged
+# Dolt), so it logs each rig as it goes: a deadline mid-loop keeps what was read.
+# Unindented lines inside are a python -c string; do not re-indent them.
+info_rig_in_progress() {
+local RIG_DIR RIG_NAME CNT
 for RIG_DIR in "${CITY%/.gascity-gastown-hq}"/*/; do
     RIG_NAME=$(basename "${RIG_DIR}")
     [ -d "${RIG_DIR}/.beads" ] || continue
@@ -1014,6 +1160,28 @@ except Exception:
     print("?")' 2>/dev/null)
     log "info: ${RIG_NAME} in_progress = ${CNT} (non-blocking, logged only)"
 done
+}
+
+# The shared tail: both modes end here (legacy at 01:00, drain at 23:40). Unindented
+# lines inside are a python -c string; do not re-indent them.
+reboot_now_sequence() {
+REBOOT_MODE="$1"
+# --- Informational only: other rigs' in_progress count (not a gate) ------
+# In drain mode drain_informational_report already opened the shared time budget;
+# the legacy flow opens it here (bd answered during its guards, but the cost of
+# asking again must still be bounded).
+[ "${REBOOT_MODE}" = "drain" ] || info_begin
+RIG_SECS="$(info_probe_secs)"
+if [ "${RIG_SECS}" -le 0 ]; then
+    log "info: other rigs' in_progress counts NOT ATTEMPTED — the ${INFO_BUDGET_SECS}s informational time budget was already spent (unknown; the reboot proceeds)"
+else
+    RIG_OUT="$(mktemp -t nightly-reboot-rigs)"
+    run_bounded "${RIG_SECS}" "${RIG_OUT}" info_rig_in_progress; RIG_RC=$?
+    if [ "${RIG_RC}" -eq 124 ]; then
+        log "info: other rigs' in_progress counts TIMED OUT after ${RIG_SECS}s — bd/Dolt did not answer, wedged? (unknown; the reboot proceeds)"
+    fi
+    rm -f "${RIG_OUT}" "${RIG_OUT}.deadline"
+fi
 
 # --- macOS update: install before reboot if one is ready (ga-l5m50) -------
 # (an install can take long: keep the drain signal fresh while it runs)
@@ -1028,11 +1196,26 @@ log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 
 notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
 
+# The scraper-cut counter is bumped HERE, as late as it can be: it counts nights the
+# scraper was cut, so it must not move on a night that dies before the shutdown call
+# (the macOS install or the notify above can take the whole budget). drain_main
+# stored the verdict in SCRAPER_DAILY_STATE / SCRAPER_DAILY_REASON.
+if [ "${REBOOT_MODE}" = "drain" ]; then
+    record_scraper_cut "${SCRAPER_DAILY_STATE:-unknown}" "${SCRAPER_DAILY_REASON:-no reason}"
+fi
+
 write_pending_file "${REBOOT_MODE}"
 log "rebooting now"
 sync
 "${SHUTDOWN_BIN}" -r now >>"${LOG}" 2>&1
 RC=$?
+# A NON-ZERO return means shutdown did not take: nothing is rebooting, so the hand-off
+# to the post-boot check is a lie, and left on disk a DIFFERENT reboot inside the
+# check's 3h window would be credited to the nightly (a false "Reboot noturno OK").
+# rc 0 is the opposite case — the machine is going down while this line runs — and
+# the file MUST survive it: it is the only thing telling the post-boot check this
+# boot was ours.
+[ "${RC}" -ne 0 ] && rm -f "${PENDING_FILE}" 2>/dev/null
 log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
 exit 1
 }
@@ -1040,7 +1223,7 @@ exit 1
 # Drain mode, start to finish. Never returns: it ends in the reboot sequence (which
 # exits) or in a SKIP.
 drain_main() {
-    local wait remaining chunk
+    local wait remaining chunk deadline now
     DRAIN_STARTED="$(date +%s)"
     # a kill must reach drain_cleanup NOW; the legacy path never installs these
     trap 'exit 143' TERM
@@ -1057,12 +1240,23 @@ drain_main() {
     case "${DRAIN_STAMP_INTERVAL}" in ''|*[!0-9]*|0) DRAIN_STAMP_INTERVAL=300 ;; esac
     remaining="${wait}"
     log "drain: waiting ${remaining}s until ${DRAIN_REBOOT_AT} (re-stamping the signal every ${DRAIN_STAMP_INTERVAL}s)"
+    # The wait is decided by the WALL CLOCK, not by a counter of the seconds we asked
+    # to sleep: a sleep that cannot start or returns early (this host runs load 60-88)
+    # must not shrink 40 minutes into none and put the safety guards at ~23:00 with the
+    # city barely drained. `remaining` is re-derived from the clock after every chunk;
+    # the countdown is only the fallback for when the clock itself cannot be read.
+    deadline="$(date +%s)"
+    case "${deadline}" in ''|*[!0-9]*) deadline="" ;; *) deadline=$(( deadline + remaining )) ;; esac
     while [ "${remaining}" -gt 0 ]; do
         chunk="${DRAIN_STAMP_INTERVAL}"
         [ "${remaining}" -lt "${chunk}" ] && chunk="${remaining}"
         drain_sleep "${chunk}"
         remaining=$(( remaining - chunk ))
         drain_stamp || true
+        if [ -n "${deadline}" ]; then
+            now="$(date +%s)"
+            case "${now}" in ''|*[!0-9]*) ;; *) remaining=$(( deadline - now )) ;; esac
+        fi
     done
 
     ATTEMPT=1
@@ -1075,7 +1269,7 @@ drain_main() {
             log "SKIP: safety guards still blocked after ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * SAFETY_RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting; lifting the drain."
             drain_end
             notify_athos "Reboot noturno pulado" "guard de segurança ainda bloqueando após ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Dreno encerrado. Ver ${LOG}."
-            record_skip "${BLOCK_REASON}"
+            record_skip_bounded "${BLOCK_REASON}"
             exit 0
         fi
         log "attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS} blocked by a safety guard (${BLOCK_REASON}) — retrying in ${SAFETY_RETRY_INTERVAL}s."
@@ -1085,9 +1279,8 @@ drain_main() {
     log "safety guards OK on attempt ${ATTEMPT}/${SAFETY_MAX_ATTEMPTS}: no send in flight, no Dolt maintenance running — rebooting with agent work possibly in flight (drain mode, ga-a2v0bz)"
 
     drain_informational_report
-    guard_scraper_daily || true                    # sets SCRAPER_DAILY_STATE/REASON in THIS shell
-    record_scraper_cut "${SCRAPER_DAILY_STATE:-unknown}" "${SCRAPER_DAILY_REASON:-no reason}"
-    reboot_now_sequence drain
+    guard_scraper_daily || true                    # sets SCRAPER_DAILY_STATE/REASON in THIS shell (local files only: no bd, no Dolt)
+    reboot_now_sequence drain                      # bumps the scraper-cut counter from that verdict, just before shutdown
 }
 
 if [ "${CHECK_GUARDS_ONLY}" -eq 1 ]; then
@@ -1110,7 +1303,7 @@ while true; do
     if [ "${ATTEMPT}" -ge "${RETRY_MAX_ATTEMPTS}" ]; then
         log "SKIP: guards still blocked after ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} attempts over ~$(( (ATTEMPT-1) * RETRY_INTERVAL / 60 ))min (last: ${BLOCK_REASON}). Not rebooting."
         notify_athos "Reboot noturno pulado" "bloqueado após ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} tentativas às $(date '+%H:%M') — ${BLOCK_REASON}. Ver ${LOG}."
-        record_skip "${BLOCK_REASON}"
+        record_skip_bounded "${BLOCK_REASON}"
         exit 0
     fi
     log "attempt ${ATTEMPT}/${RETRY_MAX_ATTEMPTS} blocked (${BLOCK_REASON}) — retrying in ${RETRY_INTERVAL}s."

@@ -31,6 +31,15 @@
 #       01:00-01:19 legado, o resto SKIP sem tocar em nada)
 #   E7  morte no meio da espera (SIGTERM) nao deixa a cidade drenada
 #   E8  o calculo de "quantos segundos ate 23:40" (funcao pura, extraida)
+#   E9  bd/Dolt PENDURADO (gate-fix 1): as chamadas "informativas" tem prazo —
+#       o reboot sai mesmo assim, o log diz "TIMED OUT (unknown)", nada fica vivo
+#   E10 SIGTERM com o script BLOQUEADO numa chamada bd: morre na hora e solta o dreno
+#   E11 a espera ate 23:40 e decidida pelo RELOGIO: um sleep que volta cedo nao a encurta
+#   E12 o padrao de manutencao do Dolt (guard de seguranca) contra o pgrep REAL,
+#       com processos de mentira (positivos E negativos)
+#   E13 shutdown que falha apaga a pendencia; shutdown que "pega" a mantem
+#   E14 o contador de scraper cortado so move perto do shutdown; mail pendurado tem prazo
+#   E15 a noite PULADA tambem tem prazo: gc pendurado no registro do skip nao prende a instancia
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SELF_DIR/nightly-reboot.sh"
@@ -55,7 +64,14 @@ cat > "$FAKEBIN/sudo" <<'EOF'
 [ "$1" = "-u" ] && shift 2
 exec "$@"
 EOF
-chmod +x "$FAKEBIN/date" "$FAKEBIN/sudo"
+# sleep que pode "voltar cedo" (FAKE_SLEEP_EARLY=1): o que um sleep que nao consegue
+# dar fork faz num host em load 60-88 — o E11 prova que isso nao encurta a espera
+cat > "$FAKEBIN/sleep" <<'EOF'
+#!/usr/bin/env bash
+[ -n "${FAKE_SLEEP_EARLY:-}" ] && exit 0
+exec /bin/sleep "$@"
+EOF
+chmod +x "$FAKEBIN/date" "$FAKEBIN/sudo" "$FAKEBIN/sleep"
 
 real_boot_epoch() {
   /usr/sbin/sysctl -n kern.boottime | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }'
@@ -70,6 +86,10 @@ REAL_BOOT="$(real_boot_epoch)"
 #   W_SENDER_RC    rc do fake de envio em voo        (default 0; "missing" = sem o script)
 #   W_SENDER_OK_AT 1-based: a chamada em que o fake passa a devolver 0 (default: nunca muda)
 #   W_PGREP_RC     rc do fake de pgrep               (default 1 = nada rodando)
+#   W_BD_HANG      1 = todo `bd` pendura (Dolt wedged): grava o pid e dorme 600s  (default 0)
+#   W_GC_HANG      1 = todo `gc` pendura                                          (default 0)
+#   W_RIG          1 = cria um rig com .beads em $CITY, pro laco de contagem por rig (default 0)
+#   W_SHUTDOWN_RC  rc do fake de shutdown            (default 0)
 new_world() {
   W="$TMP/$1"; rm -rf "$W"; mkdir -p "$W/city/.gc/logs" "$W/city/scripts" "$W/rodada" "$W/run"
   CITY="$W/city"; LOGF="$CITY/.gc/logs/nightly-reboot.log"
@@ -78,6 +98,7 @@ new_world() {
   SHUT="$W/shutdown.calls"; DRAIN_AT_SHUT="$W/drain-at-shutdown"; PEND_AT_SHUT="$W/pending-at-shutdown"
   DRAIN_AT_SENDER="$W/drain-at-sender"; GC_CALLS="$W/gc.calls"; NOTIFY_CALLS="$W/notify.calls"
   : > "$SHUT"; : > "$GC_CALLS"; : > "$NOTIFY_CALLS"
+  [ "${W_RIG:-0}" = "1" ] && mkdir -p "$CITY/rigx/.beads"
 
   cat > "$CITY/scripts/gate-queue-composition.sh" <<EOF
 #!/usr/bin/env bash
@@ -85,6 +106,7 @@ echo '{"total":${W_GATE_REAL:-0},"real":${W_GATE_REAL:-0},"phantom":0,"unknown":
 EOF
   cat > "$W/bd" <<EOF
 #!/usr/bin/env bash
+if [ "${W_BD_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/bd.pids"; exec /bin/sleep 600; fi
 case "\$3" in
   list)
     if [ "${W_HQ_BUSY:-0}" = "1" ]; then
@@ -97,6 +119,7 @@ EOF
   cat > "$W/gc" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$GC_CALLS"
+if [ "${W_GC_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/gc.pids"; exec /bin/sleep 600; fi
 EOF
   cat > "$W/notify" <<EOF
 #!/usr/bin/env bash
@@ -107,7 +130,8 @@ EOF
 echo "\$*" >> "$SHUT"
 cp "$DRAIN" "$DRAIN_AT_SHUT" 2>/dev/null
 cp "$PENDING" "$PEND_AT_SHUT" 2>/dev/null
-exit 0
+cp "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" "$W/cut-at-shutdown" 2>/dev/null
+exit ${W_SHUTDOWN_RC:-0}
 EOF
   cat > "$W/softwareupdate" <<'EOF'
 #!/usr/bin/env bash
@@ -142,16 +166,47 @@ EOF
   fi
 }
 
-# run_nr [VAR=val ...] — roda o script de verdade, tudo faked e a hora pinada.
-run_nr() {
-  env PATH="$FAKEBIN:$PATH" CITY="$CITY" GC_BIN="$W/gc" BD_BIN="$W/bd" NOTIFY_BIN="$W/notify" NOTIFY_AS_USER="$USER" \
-      SHUTDOWN_BIN="$W/shutdown" SOFTWAREUPDATE_BIN="$W/softwareupdate" SCRAPER_RODADA_DIR="$W/rodada" \
-      NIGHTLY_REBOOT_DRAIN_FILE="$DRAIN" NIGHTLY_REBOOT_DRAIN_WAIT_SECS=0 \
-      NIGHTLY_REBOOT_SAFETY_RETRY_INTERVAL=0 NIGHTLY_REBOOT_SAFETY_MAX_ATTEMPTS=3 \
-      NIGHTLY_REBOOT_SENDER_SAFE_PY="$SENDER" NIGHTLY_REBOOT_PGREP_BIN="$W/pgrep" \
-      NIGHTLY_REBOOT_RETRY_INTERVAL=0 NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=2 \
-      "$@" /bin/bash "$SCRIPT" > "$W/stdout" 2> "$W/stderr"
+# nr_env: o ambiente do script de verdade (tudo faked, hora pinada). Num array pra que
+# run_nr e start_nr_bg nunca divirjam.
+nr_env() {
+  NRENV=( PATH="$FAKEBIN:$PATH" CITY="$CITY" GC_BIN="$W/gc" BD_BIN="$W/bd" NOTIFY_BIN="$W/notify" NOTIFY_AS_USER="$USER"
+          SHUTDOWN_BIN="$W/shutdown" SOFTWAREUPDATE_BIN="$W/softwareupdate" SCRAPER_RODADA_DIR="$W/rodada"
+          NIGHTLY_REBOOT_DRAIN_FILE="$DRAIN" NIGHTLY_REBOOT_DRAIN_WAIT_SECS=0
+          NIGHTLY_REBOOT_SAFETY_RETRY_INTERVAL=0 NIGHTLY_REBOOT_SAFETY_MAX_ATTEMPTS=3
+          NIGHTLY_REBOOT_SENDER_SAFE_PY="$SENDER" NIGHTLY_REBOOT_PGREP_BIN="$W/pgrep"
+          NIGHTLY_REBOOT_RETRY_INTERVAL=0 NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=2 )
 }
+# run_nr [VAR=val ...] — roda o script de verdade, tudo faked e a hora pinada. Tem um limite
+# de tempo (NR_LIMIT, default 120s): um script que PENDURA reprova o cenario em vez de
+# pendurar a suite inteira — e e exatamente o defeito que o E9/E10 existem pra pegar.
+# NR_TIMED_OUT=1 depois de um estouro.
+run_nr() {
+  nr_env
+  NR_TIMED_OUT=0
+  env "${NRENV[@]}" "$@" /bin/bash "$SCRIPT" > "$W/stdout" 2> "$W/stderr" &
+  local pid=$! ticks=0 max=$(( ${NR_LIMIT:-120} * 4 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$ticks" -ge "$max" ]; then
+      kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; NR_TIMED_OUT=1; return 124
+    fi
+    /bin/sleep 0.25; ticks=$((ticks+1))
+  done
+  wait "$pid"
+}
+# start_nr_bg [VAR=val ...] — mesmo ambiente, em background; o pid fica em NRPID.
+start_nr_bg() {
+  nr_env
+  env "${NRENV[@]}" "$@" /bin/bash "$SCRIPT" > "$W/stdout" 2> "$W/stderr" &
+  NRPID=$!
+}
+# pids_alive <arquivo de pids>: quantos dos pids gravados ainda estao vivos
+pids_alive() {
+  local f="$1" p n=0
+  [ -f "$f" ] || { echo 0; return; }
+  for p in $(cat "$f"); do kill -0 "$p" 2>/dev/null && n=$((n+1)); done
+  echo "$n"
+}
+kill_pids() { local p; [ -f "$1" ] && for p in $(cat "$1"); do kill -KILL "$p" 2>/dev/null; done; return 0; }
 rebooted()   { [ -s "$SHUT" ] && grep -q -- '-r now' "$SHUT"; }
 log_has()    { grep -q -E -- "$1" "$LOGF" 2>/dev/null; }
 
@@ -301,6 +356,186 @@ else
   [ "$(secs 23:40 "$(at 23:40:00)")" = "0" ] && ok "E8 exatamente no alvo -> 0" || bad "E8 no alvo deveria dar 0"
   [ "$(secs lixo "$(at 23:00:00)")" = "ERR" ] && ok "E8 HH:MM invalido -> ERR (nao 0: nao colapsa erro em 'ja e hora')" || bad "E8 HH:MM invalido deveria dar ERR, deu '$(secs lixo "$(at 23:00:00)")'"
 fi
+
+# ═══ E9: bd/Dolt pendurado ═══════════════════════════════════════════════════
+# O defeito (gate-fix 1): no modo dreno os guards de seguranca nunca tocam o bd, entao o
+# PRIMEIRO contato com ele era uma chamada "informativa" sem prazo. Dolt wedged = o script
+# ficava parado pra sempre, com a ultima linha do log dizendo "rebooting" — e o launchd
+# nao dispara a proxima noite enquanto esta instancia "roda". Os fakes de bd responderem
+# na hora (E1/E4) escondia isto: aqui o bd PENDURA.
+echo "E9: bd pendurado (Dolt wedged) -> as chamadas informativas tem prazo e o reboot sai assim mesmo"
+W_BD_HANG=1 W_RIG=1 new_world e9
+T0=$(/bin/date +%s)
+NR_LIMIT=40 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=6
+T1=$(/bin/date +%s)
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E9 o script terminou sozinho em $((T1-T0))s (nao pendurou)" || bad "E9 o script PENDUROU ate o limite de 40s — com Dolt wedged o reboot nunca sai. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
+rebooted && ok "E9 reboot emitido (shutdown -r now) com o bd pendurado" || bad "E9 NAO reiniciou com o bd pendurado. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ $((T1-T0)) -le 25 ] && ok "E9 dentro do limite (${T0}->${T1} = $((T1-T0))s <= 25s; sem prazo seriam 600s)" || bad "E9 demorou $((T1-T0))s"
+log_has "safety guards OK" && ok "E9 os guards de seguranca decidiram (nao foi o bd)" || bad "E9 sem 'safety guards OK' no log"
+log_has "informational: guard3 hq-in-progress: unknown TIMED OUT" && ok "E9 guard3 (usa bd): 'unknown TIMED OUT' no log — nem 'ok', nem silencio" || bad "E9 guard3 sem a linha TIMED OUT. informational: $(grep 'informational' "$LOGF" 2>/dev/null | tr '\n' '|')"
+log_has "informational: guard2 gate-markers: ok" && ok "E9 guard2 (o gate respondeu): continua 'ok' — os tres estados nao colapsam" || bad "E9 guard2 deveria dizer ok, o gate respondeu"
+log_has "info: other rigs' in_progress counts TIMED OUT" && ok "E9 o laco de contagem por rig tambem tem prazo (TIMED OUT no log)" || bad "E9 laco por rig sem prazo. info: $(grep 'info:' "$LOGF" 2>/dev/null | tr '\n' '|')"
+SNAP="$(ls "$CITY"/.gc/logs/nightly-reboot-pre-*.txt 2>/dev/null | head -1)"
+if [ -n "$SNAP" ]; then grep -q "TIMED OUT" "$SNAP" && ok "E9 o snapshot registra que NAO deu pra ler (unknown), em vez de omitir" || bad "E9 snapshot sem a linha TIMED OUT"; else bad "E9 snapshot nao gerado"; fi
+[ ! -f "$DRAIN" ] && ok "E9 sinal de dreno removido no fim" || bad "E9 sinal de dreno ficou no disco"
+[ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E9 nenhum bd pendurado sobrou vivo (a arvore inteira foi morta no prazo)" || bad "E9 sobraram $(pids_alive "$W/bd.pids") bd pendurados vivos"
+kill_pids "$W/bd.pids"
+
+# ═══ E10: SIGTERM bloqueado numa chamada ═════════════════════════════════════
+# Efeito secundario do mesmo defeito: bash adia o trap enquanto um filho em primeiro plano
+# nao volta, entao o E7 ("a morte solta a cidade") so valia DENTRO do drain_sleep.
+echo "E10: SIGTERM com o script parado numa chamada bd -> morre na hora, solta o dreno, nao deixa o bd"
+W_BD_HANG=1 W_RIG=1 new_world e10
+start_nr_bg FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=60 NIGHTLY_REBOOT_INFO_BUDGET_SECS=120
+for _ in $(seq 1 80); do [ -s "$W/bd.pids" ] && break; /bin/sleep 0.25; done
+if [ -s "$W/bd.pids" ]; then
+  ok "E10 o script esta parado dentro de uma chamada bd"
+  [ -f "$DRAIN" ] && ok "E10 o dreno esta no disco (a morte vai ter o que soltar)" || bad "E10 sem dreno no disco: o cenario nao prova nada"
+  kill -TERM "$NRPID" 2>/dev/null
+  for _ in $(seq 1 24); do kill -0 "$NRPID" 2>/dev/null || break; /bin/sleep 0.25; done
+  if kill -0 "$NRPID" 2>/dev/null; then bad "E10 o script NAO morreu em 6s com SIGTERM (o trap ficou adiado atras da chamada)"; kill -KILL "$NRPID" 2>/dev/null; else ok "E10 o script morreu com SIGTERM em <6s"; fi
+  [ ! -f "$DRAIN" ] && ok "E10 sinal de dreno REMOVIDO na morte" || bad "E10 o dreno ficou no disco depois do SIGTERM"
+  for _ in 1 2 3 4 5 6 7 8; do [ "$(pids_alive "$W/bd.pids")" = "0" ] && break; /bin/sleep 0.25; done
+  [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E10 o bd pendurado morreu junto" || bad "E10 o bd pendurado sobreviveu ao script ($(pids_alive "$W/bd.pids") vivos)"
+  ! rebooted && ok "E10 morrer na chamada nao reinicia" || bad "E10 reiniciou apesar do SIGTERM"
+else
+  bad "E10 inconclusivo: o bd nunca foi chamado, nao ha chamada bloqueada pra interromper"
+  kill -KILL "$NRPID" 2>/dev/null
+fi
+wait "$NRPID" 2>/dev/null
+kill_pids "$W/bd.pids"
+
+# ═══ E11: a espera e do RELOGIO ══════════════════════════════════════════════
+# A espera de 40min era um contador regressivo do que PEDIMOS pra dormir. Se o sleep nao
+# consegue dar fork (host em load 60-88) ou volta cedo, o contador zera e os guards
+# rodam as ~23:00 com a cidade mal drenada. O relogio manda; o contador e so o plano B.
+echo "E11: um sleep que volta cedo nao encurta a espera (decide o relogio de parede)"
+new_world e11
+NR_LIMIT=120 run_nr FAKE_HOUR=23 FAKE_SLEEP_EARLY=1 NIGHTLY_REBOOT_DRAIN_WAIT_SECS=10
+# Mede a ESPERA em si, pelos carimbos do proprio log (da linha "drain: waiting" ate o
+# "safety guards OK"), e nao o tempo total: num host em load 70 o script antigo gasta ~10s
+# so em forks lentos, e um limite de tempo total passava por acaso (medido ao provar este
+# teste contra o script antigo). Sem STAMP_INTERVAL curto, o laco antigo e UMA volta so.
+log_ts() { /bin/date -j -f '%Y-%m-%d %H:%M:%S' "$(grep -m1 -- "$1" "$LOGF" 2>/dev/null | sed -n 's/^\[\([^]]*\)\].*/\1/p')" +%s 2>/dev/null; }
+TW="$(log_ts 'drain: waiting')"; TG="$(log_ts 'safety guards OK')"
+rebooted && ok "E11 o reboot saiu" || bad "E11 nao reiniciou. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
+case "$TW$TG" in ''|*[!0-9]*) bad "E11 inconclusivo: faltou 'drain: waiting' ou 'safety guards OK' no log (TW='$TW' TG='$TG')" ;;
+  *) [ $((TG-TW)) -ge 10 ] && ok "E11 a espera durou >= 10s de RELOGIO ($((TG-TW))s) apesar de todo sleep voltar na hora" || bad "E11 a espera encolheu pra $((TG-TW))s (pedido: 10s): o contador de sleeps decidiu, nao o relogio" ;;
+esac
+
+# ═══ E12: o padrao de manutencao do Dolt, contra o pgrep REAL ════════════════════
+# O guard de seguranca "Dolt em manutencao" usa um regex. O E3 troca o pgrep por um fake
+# que devolve rc 0/1/2 SEM olhar o padrao — entao um regex quebrado (pgrep rc=2 => "nao sei
+# => NAO e seguro" => SKIP toda noite) ou com falso-negativo passaria a suite inteira.
+# Aqui o padrao e extraido do script e passa pelo pgrep do sistema, contra processos de mentira.
+echo "E12: padrao DOLT_MAINT_PATTERN contra o pgrep real (positivos e negativos)"
+PBLOCK="$(sed -n '/nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-START/,/nightly-reboot.drain.selftest.sh:DOLT-MAINT-PATTERN-END/p' "$SCRIPT")"
+if [ -z "$PBLOCK" ]; then
+  bad "E12 bloco DOLT-MAINT-PATTERN-START/END ausente em nightly-reboot.sh"
+else
+  eval "$PBLOCK"
+  PAT="${DOLT_MAINT_PATTERN_DEFAULT:-}"
+  [ -n "$PAT" ] && ok "E12 padrao extraido do script" || bad "E12 DOLT_MAINT_PATTERN_DEFAULT vazio depois de extrair"
+  /usr/bin/pgrep -f "$PAT" >/dev/null 2>&1; PRC=$?
+  [ "$PRC" = "0" ] || [ "$PRC" = "1" ] && ok "E12 o pgrep real ACEITA o padrao (rc=$PRC, nao 2): o guard nao fica 'nao sei' toda noite" || bad "E12 o pgrep real rejeitou o padrao (rc=$PRC) — o guard viraria 'unknown => NAO e seguro' toda noite"
+  MD="$TMP/maint"; mkdir -p "$MD"
+  for n in dolt-compact-routine dolt-gc-maintenance dolt-gc-release-trigger dolt-backup-reseed dolt-backup-swap-repair dolt-backup-residue-reclaim dolt-offline-backup-sync; do
+    printf '#!/bin/bash\n/bin/sleep 25\n' > "$MD/$n.sh"; chmod +x "$MD/$n.sh"
+  done
+  SPAWNED=""
+  # spawn <nome> <esperado no argv> <cmd...>: sobe o processo de mentira e espera o argv final aparecer
+  spawn() {
+    local name="$1" want="$2" pid i; shift 2
+    "$@" >/dev/null 2>&1 &
+    pid=$!
+    SPAWNED="$SPAWNED $pid"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      /bin/ps -o command= -p "$pid" 2>/dev/null | grep -q -- "$want" && break
+      /bin/sleep 0.25
+    done
+    eval "PID_$name=$pid"
+  }
+  spawn explicit   "dolt-compact-routine.sh"      /bin/bash "$MD/dolt-compact-routine.sh"
+  spawn shebang    "dolt-gc-maintenance.sh"       "$MD/dolt-gc-maintenance.sh"
+  spawn envbash    "dolt-gc-release-trigger.sh"   env bash "$MD/dolt-gc-release-trigger.sh"
+  spawn nice       "dolt-backup-reseed.sh"        nice -n 5 /bin/bash "$MD/dolt-backup-reseed.sh"
+  spawn doltgc     "dolt gc"                      /bin/bash -c 'exec -a "dolt gc" /bin/sleep 25'
+  spawn mention    "dolt-compact-routine.sh"      /bin/bash -c '/bin/sleep 25' dolt-compact-routine.sh
+  spawn sqlserver  "dolt sql-server"              /bin/bash -c 'exec -a "dolt sql-server" /bin/sleep 25'
+  MATCHED=" $(/usr/bin/pgrep -f "$PAT" 2>/dev/null | tr '\n' ' ') "
+  matches() { case "$MATCHED" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+  for nm in explicit shebang envbash nice doltgc; do
+    eval "p=\$PID_$nm"
+    matches "$p" && ok "E12 positivo '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) casa" || bad "E12 FALSO-NEGATIVO '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) NAO casou — o guard deixaria rebootar no meio da manutencao"
+  done
+  for nm in mention sqlserver; do
+    eval "p=\$PID_$nm"
+    matches "$p" && bad "E12 FALSO-POSITIVO '$nm' (pid $p: $(/bin/ps -o command= -p "$p" 2>/dev/null | cut -c1-70)) casou — o guard seguraria o reboot sem manutencao nenhuma" || ok "E12 negativo '$nm' (pid $p) NAO casa"
+  done
+  # (the group's own 2>/dev/null is what hides bash's "Killed: 9" job notices)
+  { for p in $SPAWNED; do /usr/bin/pkill -KILL -P "$p"; kill -KILL "$p"; done; wait; } 2>/dev/null
+fi
+
+# ═══ E13: o hand-off pro pos-boot ════════════════════════════════════════════
+echo "E13: shutdown que falha apaga a pendencia; shutdown que 'pega' (rc 0) a mantem"
+W_SHUTDOWN_RC=1 new_world e13a; run_nr FAKE_HOUR=23
+log_has "shutdown returned 1" && ok "E13 o log registra o shutdown que falhou" || bad "E13 sem 'shutdown returned 1' no log"
+[ ! -f "$PENDING" ] && ok "E13 shutdown rc=1 -> pendencia REMOVIDA (nenhum reboot em andamento; outro reboot em <3h nao vira 'Reboot noturno OK')" || bad "E13 pendencia ficou no disco apos um shutdown que falhou"
+new_world e13b; run_nr FAKE_HOUR=23
+[ -f "$PENDING" ] && ok "E13 shutdown rc=0 -> pendencia FICA (a maquina esta caindo; e o que avisa o pos-boot que este boot e nosso)" || bad "E13 a pendencia sumiu num shutdown que pegou: o pos-boot nao saberia que o boot foi do noturno"
+
+# ═══ E14: contador do scraper + mail pendurado ═══════════════════════════════
+echo "E14: o contador de scraper cortado so move perto do shutdown; mail pendurado tem prazo"
+W_SCRAPER=1 new_world e14a; run_nr FAKE_HOUR=23
+LN_UPD="$(grep -n 'macOS update' "$LOGF" | head -1 | cut -d: -f1)"; LN_CUT="$(grep -n 'WILL BE CUT' "$LOGF" | head -1 | cut -d: -f1)"
+LN_REB="$(grep -n 'rebooting now' "$LOGF" | head -1 | cut -d: -f1)"
+if [ -n "$LN_UPD" ] && [ -n "$LN_CUT" ] && [ -n "$LN_REB" ]; then
+  [ "$LN_CUT" -gt "$LN_UPD" ] && [ "$LN_CUT" -lt "$LN_REB" ] && ok "E14 'WILL BE CUT' vem DEPOIS do passo de update do macOS e ANTES do shutdown (linhas $LN_UPD < $LN_CUT < $LN_REB)" || bad "E14 contador movido na hora errada (update=$LN_UPD cut=$LN_CUT reboot=$LN_REB)"
+else
+  bad "E14 faltou linha no log (update='$LN_UPD' cut='$LN_CUT' reboot='$LN_REB')"
+fi
+[ "$(cat "$W/cut-at-shutdown" 2>/dev/null)" = "1" ] && ok "E14 o contador ja valia 1 quando o shutdown foi chamado" || bad "E14 contador no shutdown = '$(cat "$W/cut-at-shutdown" 2>/dev/null)', esperado 1"
+# 2a noite seguida + gc que PENDURA: o mail tem prazo, o reboot sai, o log diz que NAO foi enviado
+W_SCRAPER=1 W_GC_HANG=1 new_world e14b; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
+T0=$(/bin/date +%s)
+NR_LIMIT=40 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=6
+T1=$(/bin/date +%s)
+[ "${NR_TIMED_OUT:-0}" = "0" ] && rebooted && ok "E14 gc pendurado: o reboot saiu mesmo assim ($((T1-T0))s)" || bad "E14 gc pendurado travou o reboot (timed_out=${NR_TIMED_OUT:-0})"
+log_has "alarm mail to mayor TIMED OUT" && ok "E14 o log diz que o aviso NAO foi enviado (TIMED OUT)" || bad "E14 sem registro do mail que estourou o prazo. alarm: $(grep -i 'alarm' "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ "$(pids_alive "$W/gc.pids")" = "0" ] && ok "E14 o gc pendurado foi morto" || bad "E14 sobrou gc pendurado vivo"
+kill_pids "$W/gc.pids"
+# mail que funciona: o desfecho tambem e registrado
+W_SCRAPER=1 new_world e14c; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"; run_nr FAKE_HOUR=23
+log_has "alarm mail to mayor: sent" && ok "E14 mail enviado: registrado como 'sent'" || bad "E14 sem 'alarm mail to mayor: sent' no log"
+
+# ═══ E15: o SKIP tambem tem prazo ════════════════════════════════════════════
+# record_skip termina em `gc mail send` (escreve uma bead). Com o Dolt wedged ele pendura, a
+# instancia nunca sai e o launchd nao dispara a noite seguinte enquanto esta "roda": um SKIP
+# que vira o SKIP de toda noite, em silencio. O streak e gravado ANTES, entao o prazo preserva a conta.
+echo "E15: noite PULADA com gc pendurado -> a instancia sai e o streak fica (dreno e legado)"
+# dreno: o guard de seguranca bloqueia sempre; streak 1 -> este skip e o 2o e dispara o alarme
+W_SENDER_RC=1 W_GC_HANG=1 new_world e15a; printf '1\n' > "$STREAK"
+T0=$(/bin/date +%s)
+NR_LIMIT=60 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_SKIP_RECORD_TIMEOUT_SECS=3
+T1=$(/bin/date +%s)
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E15 dreno: o script terminou sozinho em $((T1-T0))s com o gc pendurado" || bad "E15 dreno: o script PENDUROU no registro do skip (limite 60s) — a proxima noite nao dispara"
+log_has "SKIP: safety guards still blocked" && ok "E15 dreno: o SKIP veio do guard de seguranca" || bad "E15 dreno: sem o SKIP do guard de seguranca"
+log_has "recording the skip .*TIMED OUT" && ok "E15 dreno: o log diz que o alarme pode nao ter saido (TIMED OUT)" || bad "E15 dreno: sem registro do prazo estourado. log: $(tail -3 "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ "$(cat "$STREAK" 2>/dev/null)" = "2" ] && ok "E15 dreno: streak 1 -> 2 (a conta foi gravada antes do mail)" || bad "E15 dreno: streak = '$(cat "$STREAK" 2>/dev/null)', esperado 2"
+[ ! -f "$DRAIN" ] && ok "E15 dreno: cidade solta" || bad "E15 dreno: sinal de dreno ficou"
+[ "$(pids_alive "$W/gc.pids")" = "0" ] && ok "E15 dreno: o gc pendurado foi morto" || bad "E15 dreno: sobrou gc pendurado vivo"
+kill_pids "$W/gc.pids"
+# legado (01:05): um construtor vivo bloqueia pra sempre — nenhuma versao do script chega ao reboot
+W_HQ_BUSY=1 W_GC_HANG=1 new_world e15b; printf '1\n' > "$STREAK"
+T0=$(/bin/date +%s)
+NR_LIMIT=60 run_nr FAKE_HOUR=1 FAKE_MIN=5 NIGHTLY_REBOOT_SKIP_RECORD_TIMEOUT_SECS=3
+T1=$(/bin/date +%s)
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E15 legado: o script terminou sozinho em $((T1-T0))s com o gc pendurado" || bad "E15 legado: o script PENDUROU no registro do skip (limite 60s)"
+! rebooted && ok "E15 legado: nao reiniciou" || bad "E15 legado: reiniciou com o guard hq bloqueando"
+[ "$(cat "$STREAK" 2>/dev/null)" = "2" ] && ok "E15 legado: streak 1 -> 2" || bad "E15 legado: streak = '$(cat "$STREAK" 2>/dev/null)', esperado 2"
+log_has "recording the skip .*TIMED OUT" && ok "E15 legado: TIMED OUT registrado" || bad "E15 legado: sem registro do prazo estourado"
+[ "$(pids_alive "$W/gc.pids")" = "0" ] && ok "E15 legado: o gc pendurado foi morto" || bad "E15 legado: sobrou gc pendurado vivo"
+kill_pids "$W/gc.pids"
 
 echo ""
 echo "nightly-reboot drain selftest: PASS=$PASS FAIL=$FAIL"
