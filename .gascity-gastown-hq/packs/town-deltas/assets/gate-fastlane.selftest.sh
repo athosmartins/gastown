@@ -428,6 +428,30 @@ done
 # scan, and the old selftest line that claimed otherwise only grepped the call's argument text. gate_fastlane_confirm is
 # asked, immediately before the push, about the exact commit being pushed. Every case below takes a REAL decision first,
 # then moves the tip / rebases / merges / flips the kill-switch / swaps a file for a symlink, and asks again.
+# ── 4e'. an EMPTY diff text for a non-empty file list is "read nothing", not "clean" (gate round 3, low finding) ────────
+# The scanner is a pure function and rightly calls empty input clean (§1). The lib is not: it only scans after `diff --raw` listed files, and a real
+# `git diff -U0` prints a `diff --git` header for every one of them. A runner that returns 0 with NO text for that range read nothing — and "nothing
+# read" must not share a value with "nothing to flag" (error and empty are different states; the inert one is the normal gate).
+echo "── 4e'. empty diff text for a non-empty file list = read nothing, never clean ──"
+null_scan() { # <head> [lib] -> "<lane>|<reason code>" from the real decide, with a git runner that answers `diff -U0` with success and NO output
+  fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${2:-$LIB}" FL_REPO="$REPO" FL_HEAD="$1" "$B32" -c '
+    set -euo pipefail
+    source "$FL_LIB"
+    nogit() { case " $* " in *" -U0 "*) return 0 ;; esac; git -C "$FL_REPO" "$@"; }
+    gate_fastlane_decide nogit main "$FL_HEAD" ""
+    printf "%s|%s\n" "$GATE_LANE" "$GATE_LANE_REASON_CODE"
+  ' 2>&1 | tail -1
+}
+NS_OUT=$(null_scan "$(head_of s-docs)")
+[ "$NS_OUT" = "normal|scan-failed" ] && ok "a diff -U0 that succeeds with no text for a docs-only branch → normal gate, scan-failed (not a clean scan)" || bad "empty diff text for a listed file read as '$NS_OUT' (want normal|scan-failed)"
+NS_CTL=$(fl_env GATE_FS_TMPDIR="$T/tmp" FL_LIB="$LIB" FL_REPO="$REPO" FL_HEAD="$(head_of s-docs)" "$B32" -c '
+  set -euo pipefail
+  source "$FL_LIB"
+  realgit() { git -C "$FL_REPO" "$@"; }
+  gate_fastlane_decide realgit main "$FL_HEAD" ""
+  printf "%s|%s\n" "$GATE_LANE" "$GATE_LANE_REASON_CODE"' 2>&1 | tail -1)
+case "$NS_CTL" in fast\|*) ok "control: the same branch with the real git is still fast" ;; *) bad "control: the docs-only branch with the real git read '$NS_CTL'" ;; esac
+
 echo "── 4f. gate_fastlane_confirm: what lands is what was decided ──"
 REPO_MAIN="$REPO"; REPO="$T/repo2"
 git init -q -b main "$REPO" 2>/dev/null || { git init -q "$REPO"; git -C "$REPO" checkout -q -b main; }
@@ -1041,6 +1065,13 @@ fl_env() { env "$@"; }
 M8M=$( export GATE_FASTLANE_ENABLED=0; decide "$(head_of s-docs)" ""; printf '%s' "$D_LANE" )
 eval "$FL_ENV_DEF"
 [ "$M8M" = "normal" ] && ok "an fl_env that does not pin WOULD let the caller's GATE_FASTLANE_ENABLED=0 through (lane=normal) — the pin is what keeps the cases hermetic" || bad "mutant fl_env without the pin still read lane='$M8M' — §5f is not load-bearing"
+# 8n. a lib without the "no diff text = nothing read" guard (gate round 3, low finding) must turn §4e' red: the unread diff would be granted fast
+sed '/^  \[ -s "\$tmp" \] || { GATE_FL_SCAN_OUT=/d' "$LIB" > "$T/mut-nonull.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-nonull.lib.sh"; then bad "mutation 8n did not change the lib (sed pattern drifted)"; else
+  M8N=$(null_scan "$(head_of s-docs)" "$T/mut-nonull.lib.sh")
+  case "$M8N" in fast\|*) ok "without the guard, a diff whose text was never read WOULD be granted fast ('$M8N') — the guard is what keeps it in the gate" ;; *) bad "mutant lib without the guard still read '$M8N' — §4e' is not load-bearing" ;; esac
+fi
 echo
 echo "== gate-fastlane.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]
