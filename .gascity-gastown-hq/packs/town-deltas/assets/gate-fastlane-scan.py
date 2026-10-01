@@ -18,36 +18,44 @@ exit 2  could not scan (binary file in the diff, input over --max-bytes, unreada
         every line it may meet and consumes exactly the line counts each `@@` header declares; a line it cannot
         classify, or a hunk that ends early, is exit 2 — never "adds nothing".
 
-A false positive costs one ordinary review; a false negative publishes data. So every pattern errs wide.
+WHAT IT COVERS, AND WHAT IT DOES NOT. Where a choice exists it errs toward a finding (a false positive costs one
+ordinary review; a false negative publishes data), but it is a net for the ACCIDENTAL paste of a lead's number or
+a token into a document, not proof that a document is clean.
+  covered
+    * personal numbers — CPF, phone (with or without DDD / country code), WhatsApp id, RG, CNPJ and any other long
+      identifier — by ONE rule, not a list of notations (four gate rounds each found one more notation a list did
+      not hold): once the characters between digits are ignored, ANY run of 8 or more digits is a finding. "Ignored"
+      means every character that is neither a letter nor a digit: space, . - / ( ) + _ , | * ` quotes, markdown
+      emphasis, zero-width marks, a line break between two ADJACENT added lines (a number wrapped across lines). The
+      price is accepted: a date (2026-10-01), a timestamp, a long id or a numeric table row is a finding too, and
+      costs one ordinary review, which is the status quo.
+    * credentials — the shapes in _SECRET_SHAPES (private-key header, AWS / GitHub / Slack / Google / sk- keys, JWT,
+      bearer token, credentials inside a URL) and `name = value` where the name says secret and the value is 20+
+      token characters mixing letters and digits.
+  NOT covered
+    * an e-mail address; a name; an address; any personal data that carries no long number
+    * a password that is letters-only or digits-only, or whose symbols end the value run (`Hunter2!Hunter2!Hunter2!`)
+    * a number a LETTER interrupts (`31x99999x8888`) or one written in words
+    * a number wrapped across lines that are not adjacent in the new file (separate hunks, or an unchanged line
+      between them) — only a run of consecutive ADDED lines is joined
+    * a secret in a shape _SECRET_SHAPES does not list
 The patterns are defined here, once. (The story cites "the same patterns as publicar-estudo"; no copy of that
 skill is reachable from the gate, so this is an independent set — keep it as the single place to unify them.)
 """
+import bisect
 import re
 import sys
 
 MAX_BYTES_DEFAULT = 2 * 1024 * 1024
 
-# --- personal data (Brazil) -------------------------------------------------------------------------------
-_CPF_FORMATTED = re.compile(r"(?<![0-9.])\d{3}\.\d{3}\.\d{3}-\d{2}(?![0-9])")
-_ELEVEN_DIGITS = re.compile(r"(?<![0-9])\d{11}(?![0-9])")
-_PHONE_SHAPES = [
-    # country code + DDD + number:  +55 31 99999-8888, +5531999998888, +55 (31) 3333-4444
-    re.compile(r"(?<![0-9])\+55[\s.-]?\(?\d{2}\)?[\s.-]?9?\d{4}[\s.-]?\d{4}(?![0-9])"),
-    # DDD in parentheses:  (31) 99999-8888, (31)3333-4444
-    re.compile(r"\(\d{2}\)[\s.-]?9?\d{4}[\s.-]?\d{4}(?![0-9])"),
-    # DDD + separator + number:  31 99999-8888, 31 3333-4444
-    re.compile(r"(?<![0-9])\d{2}[\s.-]9\d{4}[\s.-]?\d{4}(?![0-9])"),
-    re.compile(r"(?<![0-9])\d{2}\s\d{4}-\d{4}(?![0-9])"),
-    # mobile without DDD:  99999-8888
-    re.compile(r"(?<![0-9])9\d{4}-\d{4}(?![0-9])"),
-    # bare WhatsApp-style id:  5531999998888 (@s.whatsapp.net / @c.us), 12-13 digits, country 55 + valid DDD
-    re.compile(r"(?<![0-9])55[1-9]\d9?\d{8}(?![0-9])"),
-    # bare, unformatted national number — the shape a CSV export in reports/ carries:
-    #   mobile   31999998888  (DDD 11-99, then 9, then 8 digits)
-    #   landline 3133334444   (DDD 11-99, then 2-5, then 7 digits)
-    re.compile(r"(?<![0-9])[1-9][1-9]9\d{8}(?![0-9])"),
-    re.compile(r"(?<![0-9])[1-9][1-9][2-5]\d{7}(?![0-9])"),
-]
+# --- personal numbers -------------------------------------------------------------------------------------
+# One digit, then seven or more of (any run of non-letter-non-digit characters, one digit). \d and \W are Unicode-aware
+# (fullwidth digits count as digits; NBSP, U+2028 and zero-width marks count as separators); \W leaves out "_", hence it.
+# `[\W_]*` and `\d` are disjoint, so there is no nesting ambiguity: a start position costs the length of the (at most
+# eight) separator runs it walks, and the scan stays linear overall. It holds the citywide gate lock, so that matters;
+# selftest §1f feeds it the worst shapes (a digit followed by a 1.5 MB separator run, 7-digit near misses, 7 digits
+# over 1000-long separator runs).
+_LONG_NUMBER = re.compile(r"\d(?:[\W_]*\d){7,}")
 
 # --- credentials ------------------------------------------------------------------------------------------
 _SECRET_SHAPES = [
@@ -75,26 +83,13 @@ _ASSIGN = re.compile(
 _PLACEHOLDER = re.compile(r"(?i)x{4,}|\*{3,}|<[^>]*>|\$\{|\$\(|^\$|example|placeholder|your[_-]|changeme|dummy|redacted|\.\.\.")
 
 
-def _cpf_valid(d: str) -> bool:
-    """True when `d` (11 digits) carries valid CPF check digits and is not a repeated digit."""
-    if len(d) != 11 or d == d[0] * 11:
-        return False
-    for n in (9, 10):
-        s = sum(int(d[i]) * (n + 1 - i) for i in range(n))
-        if (s * 10 % 11) % 10 != int(d[n]):
-            return False
-    return True
-
-
-def scan_text(text: str):
-    """Labels found in ONE piece of text (no positions, no values)."""
+def scan_text(text: str, numbers: bool = True):
+    """Labels found in ONE piece of text (no positions, no values). `numbers=False` leaves the long-number rule to
+    the caller: for ADDED lines scan_diff applies it to the whole run of adjacent added lines instead (a number
+    wrapped across a line break), so a line is not asked the same question twice."""
     labels = []
-    if _CPF_FORMATTED.search(text):
-        labels.append("cpf")
-    elif any(_cpf_valid(m.group(0)) for m in _ELEVEN_DIGITS.finditer(text)):
-        labels.append("cpf")
-    if any(p.search(text) for p in _PHONE_SHAPES):
-        labels.append("telefone")
+    if numbers and _LONG_NUMBER.search(text):
+        labels.append("numero-longo")
     for label, pat in _SECRET_SHAPES:
         if pat.search(text):
             labels.append(label)
@@ -136,12 +131,28 @@ def scan_diff(lines):
     old_left = new_left = 0
     lineno = 0
     last_was_body = False
+    run = []             # (lineno, text) of the added lines seen since the last line that is not an added one
 
     def name_findings(text):
         for label in scan_text(text):
             if label not in name_seen:
                 name_seen.add(label)
                 yield (label, f"<redacted-name#{nfile}>", 0)
+
+    def number_findings():
+        """The long-number rule over one run of ADJACENT added lines (consecutive lines of the new file), joined with
+        a line break — a number wrapped across the break is one number. One finding per line a number starts on."""
+        joined = "\n".join(t for _, t in run)
+        starts, pos = [], 0
+        for _, t in run:
+            starts.append(pos)
+            pos += len(t) + 1
+        seen = set()
+        for m in _LONG_NUMBER.finditer(joined):
+            ln = run[bisect.bisect_right(starts, m.start()) - 1][0]
+            if ln not in seen:
+                seen.add(ln)
+                yield ("numero-longo", shown, ln)
 
     for line in lines:
         in_hunk = old_left > 0 or new_left > 0
@@ -151,24 +162,32 @@ def scan_diff(lines):
                 if new_left <= 0 or path is None:
                     raise ValueError("added line that its hunk header does not account for")
                 new_left -= 1
-                for label in scan_text(line[1:]):
+                for label in scan_text(line[1:], numbers=False):
                     yield (label, shown, lineno)
+                run.append((lineno, line[1:]))
                 lineno += 1
-            elif c == "-":
-                if old_left <= 0:
-                    raise ValueError("removed line that its hunk header does not account for")
-                old_left -= 1
-            elif c == " ":
-                if old_left <= 0 or new_left <= 0:
-                    raise ValueError("context line that its hunk header does not account for")
-                old_left -= 1
-                new_left -= 1
-                lineno += 1
-            elif line.startswith(_NO_NEWLINE):
-                pass
             else:
-                raise ValueError("unrecognized line inside a hunk — cannot be classified")
+                if run:   # the run of adjacent added lines ends here
+                    yield from number_findings()
+                    run = []
+                if c == "-":
+                    if old_left <= 0:
+                        raise ValueError("removed line that its hunk header does not account for")
+                    old_left -= 1
+                elif c == " ":
+                    if old_left <= 0 or new_left <= 0:
+                        raise ValueError("context line that its hunk header does not account for")
+                    old_left -= 1
+                    new_left -= 1
+                    lineno += 1
+                elif line.startswith(_NO_NEWLINE):
+                    pass
+                else:
+                    raise ValueError("unrecognized line inside a hunk — cannot be classified")
             last_was_body = c in ("+", "-", " ")
+            if run and old_left <= 0 and new_left <= 0:   # the hunk's last line was an added one
+                yield from number_findings()
+                run = []
             continue
 
         if line.startswith(_NO_NEWLINE) and last_was_body:   # the marker follows the hunk's last line
