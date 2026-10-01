@@ -11,6 +11,20 @@
 # run's own recorded value" is the only real baseline available to diff
 # against.
 #
+# WHAT EACH VECTOR MEASURES (ga-utr9qf — the first version measured the wrong
+# proxy for two of them and reported ✅ on a critical state):
+#   - Mac mini: the status is driven by the APFS container's FREE space (the
+#     `df` Avail column, which equals diskutil's "Container Free Space" — the
+#     exact number dolt-disk-floor-guard.sh reads), against that guard's own
+#     floors (WARN 8 GB / CRITICAL 3 GB). "Used of the Data volume / total" is
+#     NOT the free space: the container is shared with the VM/swap, system and
+#     other volumes, so Data can read 84% while the container has 3 GB left.
+#     The Data-volume "used" delta is still tracked, but as its own row.
+#   - S3: `aws s3 ls --recursive --summarize` counts CURRENT object versions
+#     only; noncurrent versions are billed too (measured 2026-10-01: 280 GB
+#     reported vs ~1.9 TB billed). The billed total here = current + the sum of
+#     noncurrent version sizes (`s3api list-object-versions`).
+#
 # MotherDuck: Part 0's row 6 names motherduck_invoice_usage_check.py as its
 # "Medir" command, but that script measures COMPUTE hours only (the
 # invoice/throttle metric) — it has no storage-bytes field, and row 6 itself
@@ -50,12 +64,21 @@ BD_BIN="${BD_BIN:-bd}"
 AWS_BIN="${AWS_BIN:-aws}"
 DU_BIN="${DU_BIN:-du}"
 DF_BIN="${DF_BIN:-df}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
 GIT_BIN="${GIT_BIN:-git}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DRIVE_CREDS_PATH="${DRIVE_CREDS_PATH:-$WA_ROOT/data/google_credentials.json}"
 MOTHERDUCK_CHECK_SCRIPT="${MOTHERDUCK_CHECK_SCRIPT:-$WA_ROOT/scripts/motherduck_invoice_usage_check.py}"
 DEVIATION_PCT="${STORAGE_INVENTORY_DEVIATION_PCT:-20}"
 DATA_DIR="${STORAGE_INVENTORY_DATA_DIR:-/System/Volumes/Data}"
+# Free-space floors, integer GB — same names and defaults as dolt-disk-floor-guard.sh
+# (DOLT_DISK_FLOOR_WARN_GB=8 / DOLT_DISK_FLOOR_CRITICAL_GB=3) so this report and the
+# guard never disagree about what "low" means.
+FLOOR_WARN_GB="${STORAGE_INVENTORY_FLOOR_WARN_GB:-${DOLT_DISK_FLOOR_WARN_GB:-8}}"
+FLOOR_CRITICAL_GB="${STORAGE_INVENTORY_FLOOR_CRITICAL_GB:-${DOLT_DISK_FLOOR_CRITICAL_GB:-3}}"
+# list-object-versions pages through EVERY version (77k versions took 67s live,
+# 2026-10-01), so it gets more headroom than the plain `s3 ls` call.
+S3_VERSIONS_TIMEOUT="${STORAGE_INVENTORY_S3_VERSIONS_TIMEOUT:-900}"
 NOTIFY="${NOTIFY:-/Users/athos/.local/bin/notify}"
 BEGIN_MARK='<!-- storage-inventory:begin -->'
 END_MARK='<!-- storage-inventory:end -->'
@@ -121,6 +144,52 @@ _df_data_gb() {
   awk -v t="$total_kb" -v u="$used_kb" 'BEGIN{printf "%.2f %.2f", u/1024/1024, t/1024/1024}'
 }
 
+# _df_data_free_gb — echoes the FREE GB (2 decimals) of the APFS container that
+# hosts $DATA_DIR: the `df` Avail column, the same one dolt-disk-floor-guard.sh
+# reads (checked live 2026-10-01: df Avail == diskutil "Container Free Space",
+# 5.293 GiB both). Empty on failure — never 0, which would read as "disk full".
+# TRUNCATED to 2 decimals, not rounded: _status_for_free_gb floors this value
+# against integer-GB floors, and rounding 3.999999 up to 4.00 would call it
+# WARN where the guard (which floors the true value to 3) calls it CRITICAL.
+_df_data_free_gb() {
+  local avail_kb
+  avail_kb=$("$DF_BIN" -k "$DATA_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+  case "$avail_kb" in ''|*[!0-9]*) echo ""; return 1 ;; esac
+  awk -v a="$avail_kb" 'BEGIN{printf "%.2f", int(a / 1024 / 1024 * 100) / 100}'
+}
+
+# _status_for_free_gb <free_gb> — "🔴" (at/below the CRITICAL floor), "⚠️" (at/
+# below WARN), "✅", or "N/A" when the free space is unknown. Mirrors the
+# guard's _floor_class exactly: integer GB (the fraction is floored) compared
+# with -le, so 3.1 GB free is CRITICAL here just as it is for the guard. A
+# missing/garbled reading or a non-numeric floor is N/A, never ✅: "could not
+# measure" must not read the same as "measured and healthy".
+_status_for_free_gb() {
+  local free="$1" whole
+  case "$free" in *[0-9]*) ;; *) echo "N/A"; return ;; esac
+  case "$free" in *[!0-9.]*) echo "N/A"; return ;; esac
+  case "$FLOOR_WARN_GB" in ''|*[!0-9]*) echo "N/A"; return ;; esac
+  case "$FLOOR_CRITICAL_GB" in ''|*[!0-9]*) echo "N/A"; return ;; esac
+  whole=$(awk -v f="$free" 'BEGIN{printf "%d", f}')
+  if [ "$whole" -le "$FLOOR_CRITICAL_GB" ]; then echo "🔴"; return; fi
+  if [ "$whole" -le "$FLOOR_WARN_GB" ]; then echo "⚠️"; return; fi
+  echo "✅"
+}
+
+# _swap_used_gb — echoes "<used_gb> <total_gb>" of macOS swap (vm.swapusage).
+# Swap lives in the same APFS container as the data, so swap growth is part of
+# why the container fills while the Data volume does not. Empty (N/A) if
+# sysctl fails or its line does not parse — never a fabricated 0.
+_swap_used_gb() {
+  local line used_m total_m
+  line=$("$SYSCTL_BIN" vm.swapusage 2>/dev/null) || { echo ""; return 1; }
+  total_m=$(echo "$line" | sed -n 's/.*total = \([0-9.]*\)M.*/\1/p')
+  used_m=$(echo "$line" | sed -n 's/.*used = \([0-9.]*\)M.*/\1/p')
+  case "$total_m" in ''|*[!0-9.]*) echo ""; return 1 ;; esac
+  case "$used_m" in ''|*[!0-9.]*) echo ""; return 1 ;; esac
+  awk -v u="$used_m" -v t="$total_m" 'BEGIN{printf "%.2f %.2f", u/1024, t/1024}'
+}
+
 # _du_gb <path> — GB (2 decimals) via du -sk, empty on missing path/failure.
 _du_gb() {
   local path="$1" kb
@@ -141,23 +210,54 @@ _s3_bucket_gb() {
   awk -v b="$bytes" 'BEGIN{printf "%.2f", b/1024/1024/1024}'
 }
 
-# _s3_total_gb — sums every bucket in $BUCKETS; a bucket that fails is
-# skipped individually (not fatal to the total) but named, so a partial sum
-# is never silently indistinguishable from a complete one.
+# _s3_bucket_noncurrent_gb <bucket> — GB (2 decimals) held in NONCURRENT object
+# versions. They are billed like any other byte but `s3 ls --recursive` never
+# lists them (ga-utr9qf: 1552 GB in one bucket, 105 GB in another, against a
+# reported 280 GB total). `--query sum(...)` makes the CLI print ONE number PER
+# PAGE (156 lines for a 77k-version bucket, live 2026-10-01), so the pages are
+# summed here. Empty (SKIP) on every doubt, never 0:
+#   - aws failed — and that includes failing MID-pagination, after some pages
+#     already printed: a partial sum must not pass for the total;
+#   - exit 0 but no output at all (even an empty bucket prints one page, "0");
+#   - any page that is not a plain integer.
+# A bucket that was measured and holds none returns "0.00" — a real value.
+_s3_bucket_noncurrent_gb() {
+  local bucket="$1" out rc
+  out=$(timeout "$S3_VERSIONS_TIMEOUT" "$AWS_BIN" s3api list-object-versions --bucket "$bucket" \
+    --query 'sum(Versions[?IsLatest==`false`].Size || `[]`)' --output text 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo ""; return 1; }
+  echo "$out" | awk '
+    { for (i = 1; i <= NF; i++) { if ($i ~ /^[0-9]+$/) { s += $i; n++ } else bad = 1 } }
+    END { if (bad || n == 0) exit 1; printf "%.2f", s / 1024 / 1024 / 1024 }'
+}
+
+# _s3_total_gb — sums every bucket in $BUCKETS and echoes
+# "<billed> <ok> <count> <current> <noncurrent>" (GB; billed = current +
+# noncurrent). A bucket counts only if BOTH its current and its noncurrent
+# bytes were measured: a bucket with only the current half would put a
+# current-only number into a "billed" total. A bucket that fails is skipped
+# individually (not fatal to the total) but named, so a partial sum is never
+# silently indistinguishable from a complete one.
 _s3_total_gb() {
-  local bucket gb total=0 ok=0 count=0 skipped=""
+  local bucket cur nc total=0 cur_total=0 nc_total=0 ok=0 count=0 skipped=""
   for bucket in $BUCKETS; do
     count=$((count + 1))
-    gb=$(_s3_bucket_gb "$bucket")
-    if [ -n "$gb" ]; then
-      total=$(awk -v t="$total" -v g="$gb" 'BEGIN{printf "%.2f", t+g}')
+    cur=$(_s3_bucket_gb "$bucket")
+    nc=""
+    [ -n "$cur" ] && nc=$(_s3_bucket_noncurrent_gb "$bucket")
+    if [ -n "$cur" ] && [ -n "$nc" ]; then
+      cur_total=$(awk -v t="$cur_total" -v g="$cur" 'BEGIN{printf "%.2f", t+g}')
+      nc_total=$(awk -v t="$nc_total" -v g="$nc" 'BEGIN{printf "%.2f", t+g}')
+      total=$(awk -v t="$total" -v c="$cur" -v n="$nc" 'BEGIN{printf "%.2f", t+c+n}')
       ok=$((ok + 1))
+      log "S3: $bucket corrente=${cur}GB nao-corrente=${nc}GB"
     else
       skipped="${skipped}${bucket} "
     fi
   done
   if [ "$ok" -eq 0 ]; then echo ""; return 1; fi
-  echo "$total $ok $count"
+  echo "$total $ok $count $cur_total $nc_total"
   [ -n "$skipped" ] && log "S3: buckets pulados (falha/timeout): $skipped"
   return 0
 }
@@ -350,6 +450,18 @@ main() {
   mm_status=$([ -n "$mm_used" ] && _status_for_delta "$mm_delta" || echo "N/A")
   log "Mac mini: used=${mm_used:-?}GB total=${mm_total:-?}GB prev=${mm_prev:-none} delta=${mm_delta:-?} status=$mm_status"
 
+  # Mac mini free space — the number that actually decides whether the disk is
+  # in trouble (ga-utr9qf). The "used" delta above only sees the Data volume.
+  local mm_free mm_free_status mm_cpct="" mm_swap_out mm_swap_used="" mm_swap_total=""
+  mm_free=$(_df_data_free_gb) || true
+  mm_free_status=$(_status_for_free_gb "$mm_free")
+  if [ -n "$mm_free" ] && [ -n "$mm_total" ]; then
+    mm_cpct=$(awk -v t="$mm_total" -v f="$mm_free" 'BEGIN{if (t > 0) printf "%.1f", (t - f) / t * 100}')
+  fi
+  mm_swap_out=$(_swap_used_gb) || true
+  [ -n "$mm_swap_out" ] && { mm_swap_used=$(echo "$mm_swap_out" | awk '{print $1}'); mm_swap_total=$(echo "$mm_swap_out" | awk '{print $2}'); }
+  log "Mac mini livre: free=${mm_free:-?}GB container=${mm_cpct:-?}% cheio swap=${mm_swap_used:-?}/${mm_swap_total:-?}GB status=$mm_free_status (pisos: warn<=${FLOOR_WARN_GB}GB crit<=${FLOOR_CRITICAL_GB}GB)"
+
   # Diretorios-chave (informativo, sem alerta individual — o total do Mac
   # mini acima ja carrega o sinal de desvio agregado).
   local key_dirs_md="" path label gb
@@ -361,17 +473,26 @@ main() {
   done <<< "$KEY_DIRS"
 
   # S3
-  local s3_out s3_total="" s3_ok="" s3_count="" s3_prev s3_delta s3_status
+  # The status/baseline is the BILLED total (current + noncurrent versions).
+  # s3_total_gb keeps its old meaning (current versions only) as its own data
+  # key, so the pre-ga-utr9qf baseline stays comparable; s3_billed_gb is new,
+  # so the first run after this change has no billed baseline ("novo").
+  local s3_out s3_billed="" s3_ok="" s3_count="" s3_cur="" s3_nc=""
+  local s3_prev s3_delta s3_status s3_cur_prev s3_cur_delta
   s3_out=$(_s3_total_gb) || true
   if [ -n "$s3_out" ]; then
-    s3_total=$(echo "$s3_out" | awk '{print $1}')
+    s3_billed=$(echo "$s3_out" | awk '{print $1}')
     s3_ok=$(echo "$s3_out" | awk '{print $2}')
     s3_count=$(echo "$s3_out" | awk '{print $3}')
+    s3_cur=$(echo "$s3_out" | awk '{print $4}')
+    s3_nc=$(echo "$s3_out" | awk '{print $5}')
   fi
-  s3_prev=$(_extract_field "$prev_line" "s3_total_gb")
-  s3_delta=$([ -n "$s3_total" ] && _pct_delta "$s3_prev" "$s3_total" || echo "")
-  s3_status=$([ -n "$s3_total" ] && _status_for_delta "$s3_delta" || echo "N/A")
-  log "S3: total=${s3_total:-?}GB (${s3_ok:-0}/${s3_count:-0} buckets) prev=${s3_prev:-none} delta=${s3_delta:-?} status=$s3_status"
+  s3_prev=$(_extract_field "$prev_line" "s3_billed_gb")
+  s3_delta=$([ -n "$s3_billed" ] && _pct_delta "$s3_prev" "$s3_billed" || echo "")
+  s3_status=$([ -n "$s3_billed" ] && _status_for_delta "$s3_delta" || echo "N/A")
+  s3_cur_prev=$(_extract_field "$prev_line" "s3_total_gb")
+  s3_cur_delta=$([ -n "$s3_cur" ] && _pct_delta "$s3_cur_prev" "$s3_cur" || echo "")
+  log "S3: faturado=${s3_billed:-?}GB (corrente=${s3_cur:-?}GB + nao-corrente=${s3_nc:-?}GB; ${s3_ok:-0}/${s3_count:-0} buckets) prev=${s3_prev:-none} delta=${s3_delta:-?} status=$s3_status"
 
   # Drive SA
   local drv_out drv_used="" drv_limit="" drv_pct="" drv_prev drv_delta drv_status
@@ -398,20 +519,25 @@ main() {
 
   # Overall verdict — plain equality checks (not a case pattern) so this
   # never depends on none of the status strings containing glob metachars.
+  # Only ✅ and "novo" (first run, nothing to compare against) are healthy;
+  # EVERYTHING else trips it — ⚠️, 🔴, N/A, and any status string added later.
   # N/A (measurement failed) must trip this exactly like ⚠️: "couldn't
   # measure" and "measured and healthy" are different outcomes, and
   # collapsing them let a failed vector auto-close this run as OK
-  # (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 1).
-  if [ "$mm_status" = "⚠️" ] || [ "$s3_status" = "⚠️" ] || [ "$drv_status" = "⚠️" ] || [ "$md_status" = "⚠️" ] \
-    || [ "$mm_status" = "N/A" ] || [ "$s3_status" = "N/A" ] || [ "$drv_status" = "N/A" ] || [ "$md_status" = "N/A" ]; then
-    overall_rc=1
-  fi
+  # (GATE-FEEDBACK ga-z297h attempt 1, blocking issue 1). Listing the BAD
+  # statuses instead is how 🔴 would have slipped through as "not ⚠️".
+  local st
+  for st in "$mm_free_status" "$mm_status" "$s3_status" "$drv_status" "$md_status"; do
+    if [ "$st" != "✅" ] && [ "$st" != "novo" ]; then overall_rc=1; fi
+  done
 
   local table_md
   table_md="| Vetor | Medido em | Valor atual | Rodada anterior | Δ | Status |
 |---|---|---|---|---|---|
-| Mac mini \`$DATA_DIR\` usado | $now_date | ${mm_used:-N/A} Gi (de ${mm_total:-N/A} Gi) | ${mm_prev:-—} Gi | ${mm_delta:-—}% | $mm_status |
-| S3 total (${s3_ok:-0}/${s3_count:-0} buckets) | $now_date | ${s3_total:-N/A} GB | ${s3_prev:-—} GB | ${s3_delta:-—}% | $s3_status |
+| Mac mini \`$DATA_DIR\` container livre | $now_date | ${mm_free:-N/A} Gi livres de ${mm_total:-N/A} Gi (container ${mm_cpct:-N/A}% cheio; swap ${mm_swap_used:-N/A}/${mm_swap_total:-N/A} Gi) | — | — | $mm_free_status |
+| Mac mini \`$DATA_DIR\` usado (só o volume Data, NÃO é o espaço livre) | $now_date | ${mm_used:-N/A} Gi (de ${mm_total:-N/A} Gi) | ${mm_prev:-—} Gi | ${mm_delta:-—}% | $mm_status |
+| S3 faturado: correntes + não-correntes (${s3_ok:-0}/${s3_count:-0} buckets) | $now_date | ${s3_billed:-N/A} GB (${s3_nc:-N/A} GB são versões não-correntes) | ${s3_prev:-—} GB | ${s3_delta:-—}% | $s3_status |
+| S3 só versões correntes (o que \`s3 ls --recursive\` enxerga) | $now_date | ${s3_cur:-N/A} GB | ${s3_cur_prev:-—} GB | ${s3_cur_delta:-—}% | — |
 | Drive SA (service account) | $now_date | ${drv_used:-N/A} Gi (${drv_pct:-N/A}%) | ${drv_prev:-—} Gi | ${drv_delta:-—}% | $drv_status |
 | MotherDuck compute | $now_date | $md_verdict | — | — | $md_status |"
 
@@ -425,7 +551,7 @@ main() {
     echo "$BEGIN_MARK"
     echo "${HDR_PREFIX} (script mensal, ga-z297h)"
     echo ""
-    echo "${LEGEND_PREFIX} (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior."
+    echo "${LEGEND_PREFIX} (launchd \`com.gascity.storage-inventory-monthly\`, mensal). Não edite manualmente entre os marcadores — a próxima rodada sobrescreve. ⚠️ = vetor saiu de ±${DEVIATION_PCT}% da rodada anterior. No espaço livre do Mac mini, ⚠️/🔴 = abaixo dos pisos do dolt-disk-floor-guard (≤${FLOOR_WARN_GB} GB / ≤${FLOOR_CRITICAL_GB} GB), não variação."
     echo ""
     # On a failed measurement (mm_used/s3_total/drv_used empty), carry the
     # PREVIOUS recorded value forward instead of writing 0 — a literal 0
@@ -433,7 +559,7 @@ main() {
     # then reads that fabricated 0 as "no baseline", silently erasing the
     # last real measurement (GATE-FEEDBACK ga-z297h attempt 1, blocking
     # issue 2).
-    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-$mm_prev} s3_total_gb=${s3_total:-$s3_prev} drive_sa_used_gb=${drv_used:-$drv_prev} ts=$now_date -->"
+    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-$mm_prev} s3_total_gb=${s3_cur:-$s3_cur_prev} s3_billed_gb=${s3_billed:-$s3_prev} drive_sa_used_gb=${drv_used:-$drv_prev} ts=$now_date -->"
     echo "$table_md"
     echo ""
     echo "**Diretórios-chave (\`~/gt\` e afins), medidos $now_date:**"

@@ -38,14 +38,32 @@ cat > "$DF_BIN" <<'EOF'
 #!/bin/bash
 [ "${FAKE_DF_FAIL:-0}" = "1" ] && exit 1
 echo "Filesystem 1024-blocks Used Available Capacity Mounted"
-echo "dummy ${FAKE_DF_TOTAL_KB:-1000000} ${FAKE_DF_USED_KB:-500000} 1 1% /"
+echo "dummy ${FAKE_DF_TOTAL_KB:-1000000} ${FAKE_DF_USED_KB:-500000} ${FAKE_DF_AVAIL_KB:-104857600} 1% /"
 EOF
 chmod +x "$DF_BIN"
+
+SYSCTL_BIN="$SCRATCH/fake-sysctl.sh"
+cat > "$SYSCTL_BIN" <<'EOF'
+#!/bin/bash
+[ "${FAKE_SYSCTL_FAIL:-0}" = "1" ] && exit 1
+echo "${FAKE_SWAP_LINE:-vm.swapusage: total = 8192.00M  used = 7514.25M  free = 677.75M  (encrypted)}"
+EOF
+chmod +x "$SYSCTL_BIN"
 
 AWS_BIN="$SCRATCH/fake-aws.sh"
 cat > "$AWS_BIN" <<'EOF'
 #!/bin/bash
 echo "AWS-CALLED $*" >> "${FAKE_AWS_LOG:-/dev/null}"
+if [ "$1" = "s3api" ] && [ "$2" = "list-object-versions" ]; then
+  # `aws s3api list-object-versions --bucket <b> --query 'sum(...)' --output text`
+  # prints ONE number PER PAGE (live-measured: 156 lines for a 77k-version bucket).
+  [ "${FAKE_AWS_NC_FAIL:-0}" = "1" ] && exit 1
+  [ "$4" = "bucket-fail" ] && exit 1
+  [ "${FAKE_AWS_NC_EMPTY:-0}" = "1" ] && exit 0
+  for page in ${FAKE_AWS_NONCURRENT_PAGES-0}; do echo "$page"; done
+  [ "${FAKE_AWS_NC_PARTIAL_FAIL:-0}" = "1" ] && exit 1   # throttled/timed out MID-pagination
+  exit 0
+fi
 bucket="$3"
 case "$bucket" in
   s3://bucket-fail) exit 1 ;;
@@ -151,6 +169,42 @@ echo "── _df_data_gb (fake df) ──"
 OUT="$(FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 _df_data_gb)"
 [ "$OUT" = "100.00 200.00" ] && ok "200GB total/100GB used parsed correctly" || bad "expected '100.00 200.00', got '$OUT'"
 
+echo "── _df_data_free_gb (ga-utr9qf: the APFS container's FREE space — the Avail column the dolt-disk-floor-guard reads) ──"
+OUT="$(FAKE_DF_AVAIL_KB=3145728 _df_data_free_gb)"
+[ "$OUT" = "3.00" ] && ok "3GiB Avail parsed as 3.00 free" || bad "expected '3.00', got '$OUT'"
+[ -z "$(FAKE_DF_FAIL=1 _df_data_free_gb)" ] && ok "df failure -> empty (N/A), never 0 free" || bad "failed df must give empty, got '$(FAKE_DF_FAIL=1 _df_data_free_gb)'"
+# 4194303 KB = 3.999999 GiB. ROUNDING it to 4.00 would make the status WARN where the
+# guard — which floors the true value to 3 — says CRITICAL. The reading must be
+# TRUNCATED to 2 decimals so the floor taken from it is the guard's floor.
+OUT="$(FAKE_DF_AVAIL_KB=4194303 _df_data_free_gb)"
+[ "$OUT" = "3.99" ] && ok "3.999999 GiB -> 3.99 (truncated, never rounded up across an integer-GB floor)" || bad "expected '3.99', got '$OUT'"
+[ "$(_status_for_free_gb "$OUT")" = "🔴" ] && ok "...and that reading is 🔴, exactly as the guard classifies it" || bad "expected 🔴 for 3.999999 GiB free, got '$(_status_for_free_gb "$OUT")'"
+
+echo "── _status_for_free_gb <free_gb> (floors mirror dolt-disk-floor-guard: WARN 8 / CRITICAL 3, integer GB, -le) ──"
+[ "$(_status_for_free_gb 100.00)" = "✅" ] && ok "100GB free -> ✅" || bad "expected ✅, got '$(_status_for_free_gb 100.00)'"
+[ "$(_status_for_free_gb 9.00)" = "✅" ] && ok "9.00GB free -> ✅ (above the 8GB warn floor)" || bad "expected ✅ at 9.00, got '$(_status_for_free_gb 9.00)'"
+[ "$(_status_for_free_gb 8.99)" = "⚠️" ] && ok "8.99GB free -> ⚠️ (guard floors to 8, 8 -le 8 = WARN)" || bad "expected ⚠️ at 8.99, got '$(_status_for_free_gb 8.99)'"
+[ "$(_status_for_free_gb 4.00)" = "⚠️" ] && ok "4.00GB free -> ⚠️ (WARN, not yet CRITICAL)" || bad "expected ⚠️ at 4.00, got '$(_status_for_free_gb 4.00)'"
+[ "$(_status_for_free_gb 3.99)" = "🔴" ] && ok "3.99GB free -> 🔴 (guard floors to 3, 3 -le 3 = CRITICAL)" || bad "expected 🔴 at 3.99, got '$(_status_for_free_gb 3.99)'"
+[ "$(_status_for_free_gb 3.10)" = "🔴" ] && ok "3.1GB free (the ga-utr9qf incident) -> 🔴, never ✅" || bad "expected 🔴 at 3.10, got '$(_status_for_free_gb 3.10)'"
+[ "$(_status_for_free_gb '')" = "N/A" ] && ok "unmeasured free space -> N/A, not ✅ (error and healthy are different outcomes)" || bad "expected N/A for empty, got '$(_status_for_free_gb '')'"
+[ "$(_status_for_free_gb abc)" = "N/A" ] && ok "non-numeric free space -> N/A" || bad "expected N/A for non-numeric, got '$(_status_for_free_gb abc)'"
+# The floors are resolved when the script is SOURCED, so the override has to be
+# exercised through a fresh shell that sources it with the env already set.
+floor_in_fresh_shell() {  # <free_gb> [ENV=VAL ...] — the status a fresh shell computes
+  local free="$1"; shift
+  env "$@" STORAGE_INVENTORY_LIB=1 bash -c '. "$1"; _status_for_free_gb "$2"' _ "$SCRIPT" "$free"
+}
+[ "$(floor_in_fresh_shell 15.00 STORAGE_INVENTORY_FLOOR_WARN_GB=20)" = "⚠️" ] && ok "warn floor overridable (STORAGE_INVENTORY_FLOOR_WARN_GB=20: 15GB free -> ⚠️)" || bad "expected ⚠️ at 15GB with a 20GB warn floor, got '$(floor_in_fresh_shell 15.00 STORAGE_INVENTORY_FLOOR_WARN_GB=20)'"
+[ "$(floor_in_fresh_shell 15.00 DOLT_DISK_FLOOR_WARN_GB=20)" = "⚠️" ] && ok "falls back to the guard's own DOLT_DISK_FLOOR_WARN_GB, so the two never disagree" || bad "expected the guard's env var to be honoured, got '$(floor_in_fresh_shell 15.00 DOLT_DISK_FLOOR_WARN_GB=20)'"
+[ "$(floor_in_fresh_shell 100.00 STORAGE_INVENTORY_FLOOR_WARN_GB=lots)" = "N/A" ] && ok "a junk floor value -> N/A, never a silent ✅" || bad "expected N/A for a non-numeric floor, got '$(floor_in_fresh_shell 100.00 STORAGE_INVENTORY_FLOOR_WARN_GB=lots)'"
+
+echo "── _swap_used_gb (fake sysctl vm.swapusage) ──"
+OUT="$(_swap_used_gb)"
+[ "$OUT" = "7.34 8.00" ] && ok "7514.25M used / 8192.00M total -> '7.34 8.00'" || bad "expected '7.34 8.00', got '$OUT'"
+[ -z "$(FAKE_SYSCTL_FAIL=1 _swap_used_gb)" ] && ok "sysctl failure -> empty (N/A)" || bad "failed sysctl must give empty"
+[ -z "$(FAKE_SWAP_LINE='garbage' _swap_used_gb)" ] && ok "unparseable sysctl line -> empty, never 0 swap" || bad "garbage line must give empty"
+
 echo "── _du_gb <path> ──"
 GB="$(_du_gb "$SCRATCH/dirA")"
 case "$GB" in ''|*[!0-9.]*) bad "expected numeric GB for real dir, got '$GB'" ;; *) ok "real directory -> numeric GB ($GB)" ;; esac
@@ -165,6 +219,26 @@ echo "── _s3_total_gb (mixed success/failure across buckets) ──"
 OUT="$(FAKE_AWS_BYTES=1073741824 _s3_total_gb)"
 TOTAL="$(echo "$OUT" | awk '{print $1}')"; OKCOUNT="$(echo "$OUT" | awk '{print $2}')"; CNT="$(echo "$OUT" | awk '{print $3}')"
 [ "$TOTAL" = "1.00" ] && [ "$OKCOUNT" = "1" ] && [ "$CNT" = "2" ] && ok "1/2 buckets measured -> total reflects only the successful one, count shows 1/2 (partial sum never looks complete)" || bad "expected '1.00 1 2', got '$OUT'"
+
+echo "── _s3_bucket_noncurrent_gb (ga-utr9qf: noncurrent versions are BILLED but invisible to 's3 ls --recursive') ──"
+GB="$(FAKE_AWS_NONCURRENT_PAGES="1073741824 1073741824 1073741824" _s3_bucket_noncurrent_gb bucket-ok)"
+[ "$GB" = "3.00" ] && ok "one number per page is SUMMED across pages (3 x 1GiB -> 3.00)" || bad "expected 3.00, got '$GB'"
+GB="$(FAKE_AWS_NONCURRENT_PAGES="0" _s3_bucket_noncurrent_gb bucket-ok)"
+[ "$GB" = "0.00" ] && ok "measured-and-zero -> 0.00 (a real value, distinct from 'could not measure')" || bad "expected 0.00, got '$GB'"
+[ -z "$(_s3_bucket_noncurrent_gb bucket-fail)" ] && ok "aws failure -> empty (SKIP, never a fabricated 0)" || bad "failed bucket should give empty"
+[ -z "$(FAKE_AWS_NC_FAIL=1 _s3_bucket_noncurrent_gb bucket-ok)" ] && ok "s3api failure -> empty" || bad "s3api failure should give empty"
+[ -z "$(FAKE_AWS_NC_EMPTY=1 _s3_bucket_noncurrent_gb bucket-ok)" ] && ok "exit 0 with NO output -> empty (cannot tell 'zero' from 'nothing came back')" || bad "silent success must give empty, got '$(FAKE_AWS_NC_EMPTY=1 _s3_bucket_noncurrent_gb bucket-ok)'"
+[ -z "$(FAKE_AWS_NONCURRENT_PAGES="1073741824 None" _s3_bucket_noncurrent_gb bucket-ok)" ] && ok "a non-numeric page -> empty (fail-closed, not a silently dropped page)" || bad "non-numeric page must give empty"
+GB="$(FAKE_AWS_NONCURRENT_PAGES="1073741824 1073741824" FAKE_AWS_NC_PARTIAL_FAIL=1 _s3_bucket_noncurrent_gb bucket-ok)"
+[ -z "$GB" ] && ok "failure MID-pagination -> empty, a partial sum never passes for the total" || bad "mid-pagination failure must give empty, got partial sum '$GB'"
+
+echo "── _s3_total_gb: billed = current + noncurrent ──"
+OUT="$(FAKE_AWS_BYTES=1073741824 FAKE_AWS_NONCURRENT_PAGES="2147483648" _s3_total_gb)"
+BILLED="$(echo "$OUT" | awk '{print $1}')"; CUR="$(echo "$OUT" | awk '{print $4}')"; NC="$(echo "$OUT" | awk '{print $5}')"
+[ "$BILLED" = "3.00" ] && ok "1GiB current + 2GiB noncurrent -> billed 3.00 (the noncurrent bytes ARE in the reported total)" || bad "expected billed 3.00, got '$OUT'"
+[ "$CUR" = "1.00" ] && [ "$NC" = "2.00" ] && ok "current (1.00) and noncurrent (2.00) are reported separately too" || bad "expected current 1.00 / noncurrent 2.00, got '$OUT'"
+OUT="$(FAKE_AWS_BYTES=1073741824 FAKE_AWS_NC_FAIL=1 _s3_total_gb)"
+[ -z "$OUT" ] && ok "current measured but noncurrent unmeasurable -> NO total (a current-only number must never pass for the billed one)" || bad "expected empty when noncurrent cannot be measured, got '$OUT'"
 
 echo "── _drive_sa_quota (creds presence + fake python) ──"
 [ -z "$(DRIVE_CREDS_PATH="$SCRATCH/no-such-creds.json" _drive_sa_quota)" ] && ok "missing creds file -> empty (SKIP, no fabricated quota)" || bad "missing creds should give empty"
@@ -462,6 +536,90 @@ KEEP="$SCRATCH/keep.md"
 RESULT="$(_update_doc_block "$KEEP" "$NEWBLOCK")"; RC=$?
 [ "$RC" -eq 0 ] && grep -q "Prosa escrita por um humano" "$KEEP" && ok "human prose next to a header-like line survives" || bad "human prose was removed"
 [ "$(grep -c "$HDR_RE" "$KEEP")" -eq 2 ] && ok "the header-like line outside the contiguous run is left alone (2 = human's + the block's own)" || bad "expected 2 headers (human + block), found $(grep -c "$HDR_RE" "$KEEP")"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6. ga-utr9qf — the inventory measured the WRONG PROXY and reported ✅ on a
+#    critical state. Mac mini: 'Used of the Data volume / total' said 84% ✅
+#    while the APFS container had 3.1 GB free. S3: `s3 ls --recursive` counts
+#    CURRENT versions only (280 GB) while billing was ~1.9 TB.
+# ════════════════════════════════════════════════════════════════════════════
+fresh_doc() {
+  cat > "$DOC_PATH" <<'EOF'
+# Intro
+
+## Parte 0: Mapa
+
+| # | Local |
+|---|---|
+| 1 | Mac mini |
+
+---
+
+## Parte 1: SQLite — shared/data/
+EOF
+}
+
+echo "── main (ga-utr9qf): Data 'used' ~84% of the container and UNCHANGED, but only ~3 GB FREE -> must NOT be ✅ / OK ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+# 228.27 GiB container, 192.55 GiB used by the Data volume (the literal ga-utr9qf numbers), plenty free.
+FAKE_DF_TOTAL_KB=239366144 FAKE_DF_USED_KB=201900000 FAKE_DF_AVAIL_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+[ $? -eq 0 ] && ok "healthy baseline (100 GiB free) -> exit 0" || bad "baseline run unexpectedly failed"
+: > "$SCRATCH/fake-bd.log"
+# Same Data usage (delta 0% -> the OLD script said ✅), but the container is down to ~2.9 GiB free.
+FAKE_DF_TOTAL_KB=239366144 FAKE_DF_USED_KB=201900000 FAKE_DF_AVAIL_KB=3041280 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+RC=$?
+[ "$RC" -ne 0 ] && ok "2.9 GiB free -> nonzero exit even though Data 'used' did not move" || bad "expected nonzero exit with ~3GB free, got $RC (the false-OK of ga-utr9qf)"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "files an OPEN bug, not an auto-closed chore" || bad "expected a bug-type summary bead: $(cat "$SCRATCH/fake-bd.log")"
+FREE_ROW="$(grep -m1 'container livre' "$DOC_PATH")"
+case "$FREE_ROW" in *"🔴"*) ok "the doc's container-free row is 🔴" ;; *) bad "expected 🔴 on the container-free row, got: '$FREE_ROW'" ;; esac
+case "$FREE_ROW" in *"✅"*) bad "container-free row must not carry ✅ at 2.9 GiB free: '$FREE_ROW'" ;; *) ok "no ✅ on the container-free row" ;; esac
+case "$FREE_ROW" in *"2.90"*) ok "row shows the FREE space (2.90 Gi), the number that matters" ;; *) bad "expected 2.90 in the row, got: '$FREE_ROW'" ;; esac
+case "$FREE_ROW" in *"swap"*"7.34"*) ok "row also shows swap pressure (7.34 of 8.00 Gi)" ;; *) bad "expected swap usage in the row, got: '$FREE_ROW'" ;; esac
+
+echo "── main (ga-utr9qf): container free space unmeasurable -> N/A and nonzero, never silently healthy ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"
+FAKE_DF_FAIL=1 FAKE_AWS_BYTES=1073741824 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+[ $? -ne 0 ] && ok "df failure -> nonzero" || bad "expected nonzero when free space cannot be measured"
+FREE_ROW="$(grep -m1 'container livre' "$DOC_PATH")"
+case "$FREE_ROW" in *"N/A"*) ok "container-free row says N/A" ;; *) bad "expected N/A in the container-free row, got '$FREE_ROW'" ;; esac
+
+echo "── main (ga-utr9qf): noncurrent S3 versions swell the BILLED total -> reported, and trips the deviation band ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 FAKE_AWS_NONCURRENT_PAGES="0" \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+[ $? -eq 0 ] && ok "baseline (1 GiB current, 0 noncurrent) -> exit 0" || bad "S3 baseline run unexpectedly failed"
+: > "$SCRATCH/fake-bd.log"
+# current stays 1 GiB (the OLD script's number -> delta 0%), but 5 GiB of noncurrent versions appear: billed 1 -> 6.
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 FAKE_AWS_NONCURRENT_PAGES="5368709120" \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+RC=$?
+[ "$RC" -ne 0 ] && ok "5 GiB of noncurrent versions (billed 1.00 -> 6.00) -> nonzero exit" || bad "expected nonzero exit when billed storage jumps +500% behind an unchanged 'current' total, got $RC"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "files an OPEN bug" || bad "expected a bug-type summary bead: $(cat "$SCRATCH/fake-bd.log")"
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+[ "$(_extract_field "$DATA_LINE" s3_billed_gb)" = "6.00" ] && ok "data line records s3_billed_gb=6.00 as the new baseline" || bad "expected s3_billed_gb=6.00, data line: $DATA_LINE"
+[ "$(_extract_field "$DATA_LINE" s3_total_gb)" = "1.00" ] && ok "s3_total_gb keeps its meaning (current versions only) for baseline continuity" || bad "expected s3_total_gb=1.00, data line: $DATA_LINE"
+grep -q "S3 faturado" "$DOC_PATH" && ok "doc table names the billed total" || bad "expected an 'S3 faturado' row in the doc"
+grep -q "S3 só versões correntes" "$DOC_PATH" && ok "doc table still shows the current-versions-only total next to it" || bad "expected an 'S3 só versões correntes' row in the doc"
+
+echo "── main (ga-utr9qf): noncurrent versions unmeasurable on every bucket -> S3 is N/A, run is NOT OK ──"
+: > "$SCRATCH/fake-bd.log"
+FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 FAKE_AWS_NC_FAIL=1 \
+  FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+  FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+[ $? -ne 0 ] && ok "billed total unknown -> nonzero (a current-only number is not a substitute)" || bad "expected nonzero when noncurrent bytes cannot be measured"
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+[ "$(_extract_field "$DATA_LINE" s3_billed_gb)" = "6.00" ] && ok "failed S3 round carries the last REAL billed baseline (6.00) forward, not 0" || bad "expected s3_billed_gb=6.00 preserved, data line: $DATA_LINE"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]
