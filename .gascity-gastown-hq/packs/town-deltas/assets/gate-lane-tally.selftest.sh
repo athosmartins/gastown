@@ -56,7 +56,7 @@ chk "normal-lane diffs"                                              "['normal']
 chk "completed fast runs (dry-run and non-fast excluded)"            "['fast_runs_completed']" 3
 chk "fast PASS"                                                      "['fast_pass']" 2
 chk "fast FAIL (the safety signal: a fast-lane run that did not merge)" "['fast_fail']" 1
-chk "reviewer runs saved = Σ would_have_reviewers (2 + 1) + 1 assumed for the unmatched run" "['reviewer_runs_saved']" 4
+chk "reviewer runs saved = Σ would_have_reviewers of the runs that PASSED (m-f1: 2) + 1 assumed for the unmatched PASS — the FAIL run (m-r) saved nothing" "['reviewer_runs_saved']" 3
 chk "the unmatched fast run is flagged, not hidden"                  "['saved_unmatched_assumed_1']" 1
 chk "doc/test-only diffs bounced by a mechanical check (test fail + no-runner)" "['doc_test_only_bounced_by_check']" 2
 chk "unreadable lines are counted, not silently dropped"             "['unreadable_lines']" 2
@@ -70,6 +70,37 @@ TXT=$(python3 "$TALLY" --log "$L" --now "$NOW")
 case "$TXT" in *"fast-lane 2 (22%)"*) ok "text report shows the share (2 of 9 = 22%)" ;; *) bad "text report: $TXT" ;; esac
 case "$TXT" in *"ATENÇÃO: 2 linha(s)"*) ok "text report warns about skipped lines" ;; *) bad "no warning about skipped lines: $TXT" ;; esac
 case "$TXT" in *"contados como 1 revisor"*) ok "text report discloses the assumption for the unmatched run" ;; *) bad "assumption not disclosed" ;; esac
+
+# a lane that was GRANTED and then REVOKED at the push (gate round 2, blocking issue 2) — and the two crediting rules
+# (a run that did not PASS saved nothing; a completion is paired with the decision in effect WHEN IT RAN)
+L2="$T/qg2.jsonl"
+cat > "$L2" <<'EOF'
+{"ts":"2026-10-02T10:00:00Z","event":"gate_lane","lane":"fast","marker":"m-rv1","would_have_reviewers":2,"reason_code":"fast","dry_run":"0"}
+{"ts":"2026-10-02T10:05:00Z","event":"gate_lane","lane":"normal","marker":"m-rv1","would_have_reviewers":2,"reason":"revoked at the push","reason_code":"revoked-at-push","dry_run":"0"}
+{"ts":"2026-10-02T10:30:00Z","event":"gate_lane","lane":"fast","marker":"m-rv1","would_have_reviewers":2,"reason_code":"fast","dry_run":"0"}
+{"ts":"2026-10-02T10:31:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-rv1","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-03T09:00:00Z","event":"gate_lane","lane":"fast","marker":"m-rv2","would_have_reviewers":1,"reason_code":"fast","dry_run":"0"}
+{"ts":"2026-10-03T09:05:00Z","event":"gate_lane","lane":"normal","marker":"m-rv2","would_have_reviewers":1,"reason":"revoked at the push","reason_code":"revoked-at-push","dry_run":"0"}
+{"ts":"2026-10-04T09:00:00Z","event":"gate_lane","lane":"fast","marker":"m-tp","would_have_reviewers":3,"reason_code":"fast","dry_run":"0"}
+{"ts":"2026-10-04T09:01:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-tp","result":"PASS","dry_run":"0"}
+{"ts":"2026-10-04T09:30:00Z","event":"gate_lane","lane":"normal","marker":"m-tp","would_have_reviewers":1,"reason_code":"code-or-prompt","dry_run":"0"}
+{"ts":"2026-10-05T09:00:00Z","event":"gate_lane","lane":"fast","marker":"m-fl","would_have_reviewers":8,"reason_code":"fast","dry_run":"0"}
+{"ts":"2026-10-05T09:01:00Z","event":"dispatcher_complete","lane":"fast","marker":"m-fl","result":"FAIL","dry_run":"0"}
+{"ts":"2026-10-05T10:00:00Z","event":"gate_lane","lane":"normal","marker":"m-dry","would_have_reviewers":2,"reason_code":"revoked-at-push","dry_run":"1"}
+EOF
+J2=$(python3 "$TALLY" --log "$L2" --now "$NOW" --json)
+get2() { printf '%s' "$J2" | python3 -c "import sys,json; print(json.load(sys.stdin)$1)"; }
+chk2() { local got; got=$(get2 "$2"); [ "$got" = "$3" ] && ok "$1 = $3" || bad "$1: got '$got', want '$3'"; }
+chk2 "revocations are counted per EVENT, so a marker revoked and then re-decided still shows it (m-rv1, m-rv2; the dry run is left out)" "['lane_revoked_at_push']" 2
+chk2 "a re-decided marker is still ONE diff, its last decision wins (4 markers, the dry-run one excluded)" "['decisions']" 4
+chk2 "…m-rv1 ended fast, m-rv2 ended revoked (normal), m-tp ended normal, m-fl ended fast" "['fast']" 2
+chk2 "a revoked decision is bucketed under its own code, not as 'outro'" "['normal_reasons']['fast-lane concedida e revogada no push (o diff mudou ou deixou de ser elegível)']" 1
+# the magnitudes are chosen so each rule moves the total on its own: right on both = 5; credits the FAIL (+8) = 13;
+# pairs with the LAST decision (m-tp's later normal: 1, not 3) = 3; wrong on both = 11 — a single number tells them apart
+chk2 "reviewer runs saved: m-rv1 PASS (2) + m-tp PASS paired with the decision in effect WHEN IT RAN (3, not the later normal's 1); the m-fl FAIL (8 would-have) saved nothing" "['reviewer_runs_saved']" 5
+chk2 "no PASS completion went unmatched here" "['saved_unmatched_assumed_1']" 0
+TXT2=$(python3 "$TALLY" --log "$L2" --now "$NOW")
+case "$TXT2" in *"revogada(s) no push: 2"*) ok "text report says how many lanes were revoked at the push" ;; *) bad "the report hides the revocations: $TXT2" ;; esac
 
 # empty vs error are different outcomes
 python3 "$TALLY" --log "$T/does-not-exist.jsonl" --now "$NOW" >"$T/o" 2>"$T/e"; rc=$?
@@ -87,7 +118,7 @@ chmod +x "$T/bin/notify"
 OUT="$T/history.jsonl"; NL="$T/notify.log"; : > "$NL"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$L" --now "$NOW" --weekly --out "$OUT" >/dev/null; rc=$?
 [ "$rc" = "0" ] && [ "$(wc -l < "$OUT" | tr -d ' ')" = "1" ] && ok "--weekly appends exactly one history line" || bad "--weekly history: rc=$rc lines=$(wc -l < "$OUT" 2>/dev/null)"
-[ "$(wc -l < "$NL" | tr -d ' ')" = "1" ] && grep -q -- '-k info' "$NL" && ! grep -q 'gate-lane-weekly' "$NL" && grep -q '2/9 diffs na fast-lane, 4 rodada' "$NL" && ok "--weekly sends ONE notify line with the headline numbers, kind 'info' (a kind outside notify's catalog warns every week)" || bad "notify: $(cat "$NL")"
+[ "$(wc -l < "$NL" | tr -d ' ')" = "1" ] && grep -q -- '-k info' "$NL" && ! grep -q 'gate-lane-weekly' "$NL" && grep -q '2/9 diffs na fast-lane, 3 rodada' "$NL" && ok "--weekly sends ONE notify line with the headline numbers, kind 'info' (a kind outside notify's catalog warns every week)" || bad "notify: $(cat "$NL")"
 : > "$NL"; rm -f "$OUT"
 PATH="$T/bin:$PATH" FAKE_NOTIFY_LOG="$NL" python3 "$TALLY" --log "$T/empty.jsonl" --now "$NOW" --weekly --out "$OUT" >/dev/null
 [ ! -s "$NL" ] && [ ! -e "$OUT" ] && ok "--weekly on an empty window: no notify, no history line (no noise)" || bad "empty window still wrote/notified"

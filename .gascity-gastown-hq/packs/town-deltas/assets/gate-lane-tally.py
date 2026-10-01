@@ -4,14 +4,19 @@
 Reads .gc/quality-gate.jsonl (read-only). Two event kinds matter:
   gate_lane            one per lane decision (lane fast|normal, reason, reason_code, counts, the files that
                        decided, would_have_reviewers = what a normal run of that diff would have spent) —
-                       written by gate-fastlane.lib.sh at Step 5 (or by the dispatcher itself when that lib is
+                       written by gate-fastlane.lib.sh at the lane decision (or by the dispatcher itself when that lib is
                        not loaded). A DRY_RUN=1 sweep writes the event too, with dry_run=1; it is not counted.
   dispatcher_complete  one per finished run; carries `lane` and the PASS/FAIL result
 
 Headline numbers (window = last --days):
   * diffs evaluated (the LAST decision per marker — a marker re-claimed three times is one diff, not three)
   * how many took the fast lane vs the normal gate
-  * reviewer runs saved = for each COMPLETED fast run, the reviewers a normal run would have used
+  * reviewer runs saved = for each fast run that COMPLETED AND PASSED, the reviewers a normal run would have used,
+    taken from the decision that was in effect when that run happened (a fast run that did not merge saved nothing —
+    its diff is gated again — and a marker re-decided later does not rewrite what an earlier run saved)
+  * lanes granted and then REVOKED at the push (gate_lane events with reason_code revoked-at-push): the diff that was
+    about to land was not the diff the lane had checked, so the marker went back to the normal gate. Counted per
+    event, not per marker — the re-decision that follows replaces the marker's last lane, and must not hide this
   * of the diffs that went to the normal gate: how many were doc/test-only but bounced by a mechanical check
     (scan finding / test failed / test with no runner / unscannable) — the number that says whether the lane's
     checks are too tight
@@ -53,6 +58,7 @@ REASON_CODES = {
     "no-changed-files": ("lista de arquivos do dispatcher vazia (erro de git ou diff vazio)", False),
     "decision-errored": ("decisão da fast-lane deu erro", False),
     "lib-not-loaded":   ("lib da fast-lane não carregou", False),
+    "revoked-at-push":  ("fast-lane concedida e revogada no push (o diff mudou ou deixou de ser elegível)", False),
     "not-evaluated":    ("fast-lane não chegou a avaliar", False),
 }
 _NO_CODE = "sem reason_code no evento"
@@ -71,8 +77,9 @@ def _is_dry(ev):
 def tally(log_path, days, now):
     since = now - dt.timedelta(days=days)
     since_s = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-    last_decision = {}   # marker -> gate_lane event (the last one wins)
-    completes = []       # dispatcher_complete events with lane == fast
+    decisions = {}       # marker -> [(ts, gate_lane event)] in time order; the LAST one is the marker's current lane
+    completes = []       # (ts, dispatcher_complete event) with lane == fast
+    revoked = 0          # gate_lane events whose reason_code is revoked-at-push (per event, see the docstring)
     bad = 0
     with open(log_path, errors="replace") as fh:   # OSError propagates: unreadable != empty
         for line in fh:
@@ -96,9 +103,25 @@ def tally(log_path, days, now):
             if _is_dry(ev):   # a DRY_RUN=1 sweep merges nothing and must not move any number
                 continue
             if ev.get("event") == "gate_lane":
-                last_decision[ev.get("marker") or ev.get("branch") or "?"] = ev
+                decisions.setdefault(ev.get("marker") or ev.get("branch") or "?", []).append((t, ev))
+                if ev.get("reason_code") == "revoked-at-push":
+                    revoked += 1
             elif ev.get("event") == "dispatcher_complete" and ev.get("lane") == "fast":
-                completes.append(ev)
+                completes.append((t, ev))
+
+    for lst in decisions.values():
+        lst.sort(key=lambda te: te[0])   # a stable sort: events with the same second keep their log order
+    last_decision = {m: lst[-1][1] for m, lst in decisions.items()}
+
+    def decision_in_effect(marker, when):
+        """The marker's last decision made at or before `when` (the run's own), or None — never a LATER one."""
+        found = None
+        for t, e in decisions.get(marker or "", []):
+            if t <= when:
+                found = e
+            else:
+                break
+        return found
 
     fast = sum(1 for e in last_decision.values() if e.get("lane") == "fast")
     normal = len(last_decision) - fast
@@ -117,22 +140,23 @@ def tally(log_path, days, now):
         bounced += 1 if mech else 0
 
     saved, unmatched, passed, failed = 0, 0, 0, 0
-    for c in completes:
-        dec = last_decision.get(c.get("marker") or "")
-        if dec is not None and isinstance(dec.get("would_have_reviewers"), int):
-            saved += dec["would_have_reviewers"]
-        else:
-            saved += 1
-            unmatched += 1
+    for t, c in completes:
         if c.get("result") == "PASS":
             passed += 1
+            dec = decision_in_effect(c.get("marker"), t)
+            if dec is not None and isinstance(dec.get("would_have_reviewers"), int):
+                saved += dec["would_have_reviewers"]
+            else:
+                saved += 1
+                unmatched += 1
         elif c.get("result") == "FAIL":
-            failed += 1
+            failed += 1   # did not merge: its diff is gated again, so nothing was saved
     return {
         "since": since_s, "days": days, "decisions": len(last_decision), "fast": fast, "normal": normal,
         "fast_runs_completed": len(completes), "fast_pass": passed, "fast_fail": failed,
         "reviewer_runs_saved": saved, "saved_unmatched_assumed_1": unmatched,
-        "doc_test_only_bounced_by_check": bounced, "normal_reasons": buckets, "unreadable_lines": bad,
+        "doc_test_only_bounced_by_check": bounced, "normal_reasons": buckets, "lane_revoked_at_push": revoked,
+        "unreadable_lines": bad,
     }
 
 
@@ -146,6 +170,9 @@ def render(r):
         f"  rodadas de revisor poupadas: {r['reviewer_runs_saved']} "
         f"(runs fast concluídos: {r['fast_runs_completed']} → PASS {r['fast_pass']}, FAIL {r['fast_fail']})",
     ]
+    if r["lane_revoked_at_push"]:
+        out.append(f"  fast-lane concedida e revogada(s) no push: {r['lane_revoked_at_push']} "
+                   "(o diff mudou ou deixou de ser elegível entre a decisão e o merge; o marker voltou ao gate normal)")
     if r["saved_unmatched_assumed_1"]:
         out.append(f"  ({r['saved_unmatched_assumed_1']} run(s) fast sem decisão pareada no log: contados como 1 revisor cada)")
     if r["normal"]:
@@ -192,6 +219,8 @@ def main(argv):
             if not a.no_notify and shutil.which("notify"):
                 line = (f"{r['fast']}/{r['decisions']} diffs na fast-lane, {r['reviewer_runs_saved']} rodada(s) de revisor poupada(s) "
                         f"em {r['days']}d ({r['doc_test_only_bounced_by_check']} só-doc/teste barrados por checagem)")
+                if r["lane_revoked_at_push"]:
+                    line += f"; {r['lane_revoked_at_push']} lane(s) revogada(s) no push"
                 try:
                     subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
                 except Exception as e:  # a failed notification must not fail the tally
