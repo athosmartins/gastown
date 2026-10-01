@@ -1,0 +1,176 @@
+# E9 — refino como PLANEJADOR + nível de COMPLEXIDADE (ga-798p6w, filho do P0 ga-ufskhy)
+
+**Estado em 01/10/2026: construído e INERTE.** Sem `.gc/e9-ab.conf` nada muda no fluxo de ninguém. Ligar é decisão do Mayor (§5).
+**Dependência que ainda falta:** o veredito de custo e de aprovação usa o medidor do E8 (`bead-token-meter.py`, ga-5c3msy). Hoje ele
+existe só num commit WIP (`f67779821`) numa branch não mergeada. Sem `--meter` a apuração diz "CUSTO E APROVAÇÃO — NÃO MEDIDOS" e
+não decide nada. Braços, roster e custo do planejador já funcionam.
+
+O que o Athos pediu (01/10 06:56): (a) todo refino atribui um nível de complexidade, e o nível escolhe modelo × effort do construtor;
+(b) o refino entrega "mais mastigado" — não só o QUÊ, mas o COMO (arquivos, funções, casos-limite, teste que reprova). E que se avalie
+de forma **científica** se isso cumpre o objetivo: mais beads em DONE, menos tokens por bead DONE.
+
+## 1. Onde o plano é feito — e por que NÃO só no refino
+
+Medido em 01/10/2026 14:00Z, HQ + whatsapp_automation, beads que passaram o gate (`close_reason` começa com "Quality gate PASSED")
+nos últimos 7 dias exatos (`closed_at >= 24/09 14:00Z`):
+
+| tipo | beads | % |
+|---|---|---|
+| bug | 117 | 69% |
+| task | 37 | 22% |
+| chore | 8 | 5% |
+| feature | 8 | 5% |
+| **total** | **170** | |
+
+O auto-refino só pega `feature`/`story` (`auto-refino-dispatcher.sh:16,251`: "bug/chore/task SKIP the funnel", ga-flxp6). Logo, **no máximo
+8 de 170 (4,7%)** das beads entregues passaram ou poderiam ter passado pelo refino. Um planejador que mora só no refino planeja ~5% do que
+se constrói: não move "tokens por bead DONE" e não chega a uma amostra. (A primeira medição do construtor anterior deu 5 de 134, 3,7%, numa janela
+e contagem ligeiramente diferentes; a conclusão é a mesma e esta tabela a substitui.)
+
+Reproduzir: `bd -C <store> list --status closed --closed-after 2026-09-24 --limit 0 --json`, filtrar `close_reason`, agrupar por `issue_type`,
+para os dois stores (HQ e `whatsapp_automation`). `--limit 0` é obrigatório (o default trunca em 50 sem avisar no JSON).
+
+O ponto por onde TODA construção passa é o **início do build**. É aí que o plano é feito (`e9-plan.sh`), disparado pela linha extra que o Pilot
+põe no comentário de despacho — só para bead do braço `on`. O gancho do refino (`e9-arms.sh block|finalize|check|plancheck`) existe, é testado e
+continua DESLIGADO: ninguém o chama ainda. Uma bead que já traz plano válido (de qualquer um dos dois estágios) é REUSADA, nunca replanejada.
+
+## 2. O que existe (todos em `packs/town-deltas/assets/`, salvo indicação)
+
+| arquivo | papel |
+|---|---|
+| `e9-arms.sh` | biblioteca: braço (SHA-256 do id, salt, % do conf), roster, nível-a-partir-dos-fatos, checagem de estrutura do plano, estado do conf |
+| `e9-plan.sh` | o planejador de início de build: uma execução `claude -p` Opus SOMENTE-LEITURA (Read/Grep/Glob), devolve FATOS + plano de 5 seções |
+| `pilot-dispatcher.sh` (`_e9_dispatch_line`) | a linha no comentário de despacho; vazia em todo caminho de dúvida |
+| `scripts/e9-apuracao.py` | a apuração (READ-ONLY): compara os braços pelo critério do §4 |
+| `*.selftest.sh` (4) | contratos de cada peça, com controles de mutação |
+
+Garantias que valem para o conjunto:
+
+- **Inerte por padrão.** Sem conf, com a chave-kill `.gc/no-e9-ab`, ou com conf malformado: nenhuma linha no despacho, nenhum gasto, nenhuma linha no roster.
+  Conf malformado é um estado próprio (`invalid`), não "sem conf": um typo não pode rodar o experimento a 0%.
+- **Três estados, nunca dois.** Braço `on` / `off` / "não sei dizer" nunca imprimem a mesma coisa. Um `assign` que falha, estoura o tempo ou imprime lixo
+  NÃO vira `on` (apontaria um construtor para uma execução Opus paga de uma bead que não está no braço). Custo desconhecido é "desconhecido", nunca US$ 0.
+- **O braço de uma bead é o que o ROSTER gravou, não o que o conf diz agora.** `assign` grava uma linha por bead e salt; toda chamada seguinte (outro estágio,
+  re-despacho depois de reprovar no gate) devolve o braço DESSA linha. Subir `planner_pct` depois (canário → 50%) só vale para beads ainda não atribuídas —
+  recalcular faria uma bead gravada como controle rodar o planejador pago enquanto o roster a conta como controle. Roster que não dá para LER = sem braço
+  (exit 3, nunca recalcula); braço decidido mas que não deu para GRAVAR = sem braço e sem tratamento (exit 5; o Pilot loga o código, porque descarta o stderr).
+- **Olhar não matricula.** `e9-plan.sh run <bead> --dry-run` / `--print-task` e `e9-arms.sh peek <bead>` leem o braço gravado (ou o puro, se não há) e não escrevem nada no roster.
+- **Braço controle = o fluxo de hoje**, byte a byte; mas é REGISTRADO no roster (um controle sem denominador não é controle).
+- **O planejador não age.** Sem Bash, sem rede, sem edição, sem identidade de sessão; o texto da bead entra cercado como DADO. O plano nomeia
+  arquivos: se algum não existe NO CHECKOUT (caminho absoluto ou `../` que cai fora dele não conta, mesmo que o arquivo exista na máquina), o plano NÃO é entregue
+  (plano errado é pior que nenhum). Só marcadores de lista (`- `, `* `, `1. `, `2) `, `**`) são removidos antes da checagem — nunca o começo do caminho (`.github/`, `2fa/`).
+  O mesmo vale para um plano já gravado na bead: ele só é reusado se os arquivos ainda existem; senão é refeito (o teto de execuções por bead continua valendo).
+  Se a checagem em si não roda, o resultado é `INCONCLUSIVE` com razão própria (`path-check-failed` / `plan-check-failed`) — não é "nada faltando" nem "nenhum arquivo".
+  A checagem verifica só o PRIMEIRO caminho de cada linha de `ARQUIVOS:`; o que ela não cobre é CONTADO, não descartado: `paths_unparsed` na linha FINAL do roster
+  = linhas cujo primeiro token não é caminho (`-> x`, `see x:12`, prosa como `e.g. …`, que não vira "arquivo `e.g` faltando") + linhas com um segundo `dir/arquivo.ext`
+  (`a.py, b.py — x`). É um limite superior (uma menção a `lib/b.py` na descrição conta) e separa "verificado" de "nunca olhado".
+- **Todo gasto deixa linha.** Duas linhas `plan_run` por execução (PENDING antes de gastar, FINAL depois); se a PENDING não pode ser escrita, a execução não começa.
+- **Teto de gasto:** US$ 4 por execução, 2 execuções por bead, 900 s, 2 concorrentes, e a guarda de máquina (disco/swap) recusa em vez de somar carga.
+- **Intenção de tratar.** Uma bead `on` cujo planejador falhou (exit 3, INCONCLUSIVE) continua no braço `on` na análise; a aderência sai em separado.
+
+## 3. Complexidade: campo de MEDIÇÃO primeiro; o roteamento NÃO foi construído aqui
+
+O nível (S/M/L) é **calculado, nunca declarado**: o planejador registra FATOS (arquivos, superfícies, externo, migração) e o código os transforma
+em nível. L se envia algo para fora do sistema, exige migração, toca ≥ 3 superfícies ou ≥ 8 arquivos; S se ≤ 2 arquivos em ≤ 1 superfície sem nada
+disso; M o resto. `check` recalcula e acusa nível que discorda dos próprios fatos. Fato que o planejador não consegue estabelecer vira
+"desconhecido", que não é S.
+
+Gravado na bead: `story.complexidade_fatos`, `story.complexidade`, `story.plano_tecnico`, label `complexity:<nível>`.
+
+**"Desconhecido" nunca vira um nível antigo.** Quando um novo plano (ou o `finalize` do refino) fica com fatos `desconhecido: …`, ausentes ou malformados, o label E o
+`story.complexidade` gravado são removidos (`--unset-metadata` / diretiva `UNSET`; só se havia um nível gravado). E o nível que um novo despacho imprime vem dos FATOS
+(`e9_level_of_facts`), não do metadado: sem fatos que o sustentem, imprime `unknown`, e se o metadado discorda dos fatos o log avisa e vale o calculado.
+`check` acusa (código 12) um nível que sobrou ao lado de fatos `desconhecido`.
+
+**Por que o roteamento (S → Sonnet high, M → xhigh, L → Opus high) não entra neste slice:**
+
+1. O próprio pedido diz que a tabela é "ponto de partida, não a resposta" e que, sem amostra para um fatorial, se testa **um fator de cada vez, começando pelo planejador**.
+2. Amostra: o critério do §4 pede 174 beads com custo conhecido por braço. A ~170 beads entregues por semana e 50% no `on`, isso é ~85 por braço por semana, ~2 semanas
+   para UM fator. O 2×2 (planejador × roteamento) precisa de 4 células: ~4 semanas, com o planejador confundido com a mudança de modelo se rodarem juntos.
+3. O roteamento por bead depende de o construtor receber modelo × effort por bead, que é a infraestrutura do E8 (ga-5c3msy, ainda em andamento). Construir uma segunda cópia aqui criaria duas fontes de verdade.
+
+A tabela de roteamento fica como hipótese para o slice seguinte, que só começa depois do veredito do planejador (ou em paralelo se o E8 já entregar o gancho).
+**Limite assumido:** hoje o nível é registrado só para beads do braço `on` (é o planejador que o calcula). O controle não tem nível gravado; a apuração
+estratifica pelos dois braços usando o tamanho REALIZADO (arquivos no git), não o nível previsto.
+
+## 4. Critério PRÉ-REGISTRADO (a regra de veredito; decisão é do Mayor, o script nunca age)
+
+Escrito antes de haver dado, e implementado como padrão de `scripts/e9-apuracao.py` (flags entre parênteses). Mudar um número depois de ver o resultado invalida o experimento.
+
+- **Amostra:** n ≥ 174 beads **com custo conhecido por braço** (`--min-n`; vem do E8: −30% de custo com CV 1,0). Abaixo disso o veredito é **INCONCLUSIVO**,
+  qualquer que seja a estimativa. Não se para o experimento quando o número agrada.
+- **Métrica primária:** custo (US$) por bead APROVADA = construtor + planejador + revisor × rodadas. **O custo do próprio planejador entra na conta** — um plano que
+  economiza o que custa não é vitória.
+- **ADOTAR** só se: o custo por bead aprovada do `on` é pelo menos **30%** menor (`--min-effect`) com o limite superior do IC de 95% abaixo de 0, **e** a aprovação na
+  1ª tentativa não cai: estimativa da diferença on−off ≥ **−3 pp** (`--max-fp-drop`) **e** limite inferior do IC ≥ **−10 pp** (`--fp-ci-floor`).
+  Por que não "IC ≥ −3 pp": provar não-inferioridade de 3 pp exige ~4.200 beads por braço; a regra nunca chegaria a ADOTAR. O que a guarda NÃO prova
+  (uma queda real entre 3 e 10 pp) é dito no veredito.
+- **NÃO ADOTAR** se mesmo o melhor extremo do IC não alcança os 30%, **ou** a queda de aprovação já passa de 3 pp com confiança (limite superior do IC < −3 pp).
+- **INDETERMINADO** em todo o resto, e quando mais de **10%** das beads de um braço ficam sem custo conhecido (`--max-unknown-share`).
+- **Sinal de que o plano erra:** o construtor põe `PLAN-DEVIATION: <por quê>` no corpo do commit quando o código contradiz o plano; a apuração conta.
+
+## 5. Operação
+
+Ligar (decisão do Mayor — afeta o custo do pool, cada plano é uma execução Opus):
+
+```bash
+cat > "$GC_CITY_PATH/.gc/e9-ab.conf" <<'EOF'
+planner_pct=50
+salt=e9a
+EOF
+```
+
+**Confirme que o conf foi LIDO antes de dar o experimento por ligado** — um conf com erro de digitação não é "sem experimento", é um experimento que roda a 0% sem ninguém ver:
+
+```bash
+bash packs/town-deltas/assets/e9-arms.sh state     # esperado: active planner_pct=50 complexity=off salt=e9a
+```
+
+`absent` (sem conf) e `killed` (chave de desligar) são o "desligado" legítimo: `assign`/`peek`/`block` saem com 0 e em silêncio. `invalid:<motivo>` (ex.: `planner_pct=5O`)
+significa que o conf existe mas não pôde ser lido e o experimento **não está rodando**: `assign`/`peek`/`block` saem com **código 6** (e dizem isso no stderr), e o Pilot, que descarta o
+stderr do `assign`, registra em cada despacho `E9: no plan hint for <bead> — e9-arms.sh assign exited 6 (…INVALID…)`. Nenhuma linha de roster é gravada enquanto o conf estiver inválido.
+
+Desligar: `touch "$GC_CITY_PATH/.gc/no-e9-ab"` (ou remover o conf) — vale no próximo despacho, sem reload. O roster
+(`.gc/e9-roster.jsonl`) e os planos guardados (`.gc/e9-plans/`) ficam para a apuração.
+
+Estado e braço de uma bead: `bash e9-arms.sh state` · `bash e9-arms.sh arm planner <bead-id>` (receita recomputável por qualquer um:
+`printf '%s' "e9-planner:e9a:<bead-id>" | shasum -a 256 | cut -c1-8`, em decimal módulo 100, `< planner_pct` ⇒ `on`). Essa é a receita da PRIMEIRA atribuição;
+depois dela vale o braço gravado no roster (`bash e9-arms.sh peek <bead-id>` mostra o que valerá, sem gravar).
+O prefixo `e9-planner:` não é enfeite: o braço do E3 é a paridade de SHA-256("pregate:<id>"); dois experimentos sobre as mesmas beads não podem ser a mesma moeda.
+
+`bash e9-arms.sh arms planner` (ids no stdin) é o lote que a apuração usa para recomputar milhares de braços. Ele roda num único `python3` com a MESMA receita; o laço de shell
+(`arm planner`, uma chamada por id) é a referência e o fallback (sem `python3`, ou se ele falhar, ou com `E9_SHA_TOOLS` definido). O selftest segura as duas implementações juntas:
+o lote contra a receita documentada calculada à parte, e contra o laço, byte a byte, inclusive nos casos de recusa.
+
+Ler o resultado (read-only, a qualquer hora):
+
+```bash
+python3 scripts/e9-apuracao.py --meter <saída de bead-token-meter.py report --json> --repo /Users/athos/gt
+```
+
+Sem `--meter` (hoje, até o E8 ser mergeado) a parte de custo e aprovação sai "NÃO MEDIDOS", e a de roster/execuções do planejador sai normalmente.
+
+O que o construtor vê (braço `on`): uma linha no comentário de despacho mandando rodar `bash e9-plan.sh run <bead> --store <store>` e partir do plano impresso.
+`exit 3` (nenhum plano pôde ser feito) **não é veredito sobre a bead**: constrói-se como sempre.
+
+## 6. Riscos e o que a medição vai dizer
+
+- O planejador gasta tokens (Opus) e pode errar o COMO; o construtor segue um plano errado. Mitigação: o plano com arquivo inexistente é descartado, `PLAN-DEVIATION` é contado,
+  e o custo do planejador está na métrica primária.
+- O ganho esperado vem do COMO técnico, não de mais texto de produto: no E4, 53% das reprovações do gate são caso-limite / 3º estado e "história ambígua" é só 1,3%.
+- Beads de bug/chore/task (95% do que se entrega, 162 de 170) agora podem receber plano: o estágio de início de build não tem o filtro de tipo do refino. O roster **não grava o tipo**
+  da bead (a linha `assign` tem bead, store, salt, braço, pct, complexity e stage), e a apuração estratifica por **tamanho realizado** (arquivos no git), não por tipo. Se o efeito por
+  tipo importar, o tipo precisa entrar na linha `assign` — fora deste slice.
+
+## 7. Fora deste slice
+
+Roteamento modelo × effort por nível (§3) · ligar o gancho do refino (`e9-arms.sh block|finalize`) · decisão de ligar o experimento e de qual `planner_pct` (Mayor).
+
+**Limite conhecido, deixado de fora de propósito:** uma recusa ANTES de lançar o planejador (guarda de máquina, slots ocupados, teto, `bd` ilegível) não grava linha no roster
+(só run lançado grava). Por isso a apuração junta, em "sem run lançado", "a guarda recusou" e "o construtor ignorou a dica" — o rótulo diz isso em vez de afirmar um dos dois.
+Não afeta o veredito (intenção de tratar); só a leitura da aderência. Separar exige uma linha de recusa no roster e uma classe nova na apuração.
+
+**Limite conhecido #2 — a dica chega depois do sling.** A linha do braço `on` é postada como comentário de despacho DEPOIS do `gc sling` (entre os dois há tentativas de label/inflight com
+`sleep`). Um construtor que rode `bd show` logo ao nascer pode começar antes de a linha existir e construir sem o plano. A intenção de tratar mantém a bead no braço `on` e a classe "sem run
+lançado" a absorve, mas o efeito é sistemático: dilui a diferença medida entre os braços na direção de ZERO. Um efeito pequeno ou nulo da leitura deve ser lido com essa ressalva; o efeito
+grande pré-registrado (§4) resiste a ela.

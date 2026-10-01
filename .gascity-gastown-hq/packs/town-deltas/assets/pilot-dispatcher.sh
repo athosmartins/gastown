@@ -6674,6 +6674,115 @@ _pilot_dog_store_blind_guard() {
   return 1
 }
 
+# ── ga-653ilw: the POOL-store-blind class ────────────────────────────────────────────────────────────
+# A wa-worker / ps-worker session reads exactly ONE store: the rig clone it runs in (agents/ps-worker's
+# work_dir is property_scrapers/crew/worker, agents/wa-worker's is whatsapp_automation/crew/worker, and `bd`
+# resolves to that rig's store from there). A bead that lives in ANY other store and is routed to the pool
+# can therefore never be claimed — the worker's probe (`bd ready --metadata-field gc.routed_to=<pool>`) does
+# not see it. gastown.dog had a guard for its own version of this (ga-cszxcf, above); the pools had none.
+# Measured 27/09-01/10: lx-b5q (lexbh store) was rerouted to ps-worker by ga-wnojmm — which reassigns
+# STORY_RIG but leaves STORY_BEAD_CITY on lexbh — and the top-up then opened 251 ps-worker sessions that
+# each found nothing and drained (~188k WTE apiece).
+#
+# The rig a pool serves is DERIVED from rig_to_builders (the routing table), never from a second list that
+# could drift from it: the rig whose own builder pool contains <pool>. Today: ps-worker -> property_scrapers,
+# wa-worker -> whatsapp_automation.
+
+# _pilot_rig_builds_pool <rig_name> <pool> — exit 0 iff <rig_name>'s own builder pool (rig_to_builders)
+# contains <pool> (a wa-worker-N slot counts as the wa-worker template). Pure: no bd/gc calls.
+_pilot_rig_builds_pool() {
+  local _rig="${1:-}" _pool="${2:-}" _b
+  [ -n "$_rig" ] && [ -n "$_pool" ] || return 1
+  for _b in $(rig_to_builders "$_rig"); do
+    [ "$(wa_worker_template "$_b")" = "$_pool" ] && return 0
+  done
+  return 1
+}
+
+# _pilot_pool_rig <pool> — print the NAME of the one registered rig whose own pool IS <pool>; print nothing
+# (still exit 0) when <pool> is not an ephemeral rig pool, the rig list could not be read, or the mapping is
+# ambiguous (0 or >1 rigs). "Nothing" means CANNOT TELL — never "no such rig" — and every caller treats it as
+# such. Reads the sweep's rig-list memo (PILOT_RIG_PATHS_JSON); warms it when empty, but a `$(...)` call site
+# throws that warm-up away, so the guard below warms it in the caller's shell first.
+_pilot_pool_rig() {
+  local _pool="${1:-}" _names _n _match="" _count=0
+  case "$_pool" in
+    wa-worker*) _pool="wa-worker" ;;
+    ps-worker*) _pool="ps-worker" ;;
+    *) return 0 ;;
+  esac
+  [ -n "${PILOT_RIG_PATHS_JSON:-}" ] || rig_root_path "gascity" >/dev/null 2>&1 || true
+  _names=$(printf '%s' "${PILOT_RIG_PATHS_JSON:-}" | jq -r '.rigs[]? | select(.hq != true) | .name' 2>/dev/null) || _names=""
+  while IFS= read -r _n; do
+    [ -n "$_n" ] || continue
+    if _pilot_rig_builds_pool "$_n" "$_pool"; then
+      _match="$_n"
+      _count=$((_count + 1))
+    fi
+  done <<EOF_POOLRIGS
+$_names
+EOF_POOLRIGS
+  [ "$_count" -eq 1 ] && printf '%s' "$_match"
+  return 0
+}
+
+# _pilot_rig_name_for_path <path> — print the registered rig NAME whose path is <path> (trailing slash ignored);
+# nothing when unknown. Used only to label a migration's source accurately: STORY_RIG may already have been
+# reassigned by a reroute (ga-wnojmm), so it does not name the store the bead is actually in.
+_pilot_rig_name_for_path() {
+  local _p="${1:-}"
+  _p="${_p%/}"
+  [ -n "$_p" ] || return 0
+  printf '%s' "${PILOT_RIG_PATHS_JSON:-}" \
+    | jq -r --arg p "$_p" '[.rigs[]? | select((.path | rtrimstr("/")) == $p) | .name][0] // empty' 2>/dev/null || true
+}
+
+# _pilot_same_dir <a> <b> — exit 0 iff <a> and <b> name the same directory (trailing slash and symlinks
+# ignored). Exit 1 otherwise — including "one of them cannot be resolved", so a caller that needs the third
+# state (cannot tell) must check -d itself first.
+_pilot_same_dir() {
+  local _a="${1:-}" _b="${2:-}" _ra _rb
+  _a="${_a%/}"; _b="${_b%/}"
+  [ -n "$_a" ] && [ -n "$_b" ] || return 1
+  [ "$_a" = "$_b" ] && return 0
+  _ra=$(cd -P "$_a" 2>/dev/null && pwd -P) || return 1
+  _rb=$(cd -P "$_b" 2>/dev/null && pwd -P) || return 1
+  [ -n "$_ra" ] && [ "$_ra" = "$_rb" ]
+}
+
+# _pilot_pool_store_blind_guard <sling_target> <bead_city> — exit 0 (REFUSE) iff <sling_target> is a wa-worker /
+# ps-worker pool, the store that pool reads is KNOWN, and <bead_city> (the store the bead lives in) is a
+# different one. Exit 1 (PROCEED) in every other case, deliberately including every "cannot tell":
+#   - not a rig pool (gastown.dog has its own guard above; named crews read their own rig);
+#   - no <bead_city>;
+#   - the rig list could not be read, or the pool maps to no/several rigs, or the pool's rig path is not a
+#     directory on disk.
+# Three states, not two: "I could not find out" must not read as "different store". A refusal here writes to
+# beads (migrate or park), so under doubt the inert answer is to leave dispatch exactly as it was; the top-up
+# scan (_topup_rig_pending) and its brake (_topup_note_spawn) bound the cost of whatever slips through.
+# Must be called from the caller's own shell (not inside `$(...)`): it warms the rig-list memo there.
+_pilot_pool_store_blind_guard() {
+  local _target="${1:-}" _bead_city="${2:-}" _rig _pool_path
+  case "$_target" in
+    wa-worker*|ps-worker*) ;;
+    *) return 1 ;;
+  esac
+  [ -n "$_bead_city" ] || return 1
+  [ -n "${PILOT_RIG_PATHS_JSON:-}" ] || rig_root_path "gascity" >/dev/null 2>&1 || true
+  _rig=$(_pilot_pool_rig "$_target") || _rig=""
+  if [ -z "$_rig" ]; then
+    warn "ga-653ilw: cannot tell which store pool $_target reads (rig list unreadable, or the pool maps to no or several rigs) — NOT applying the pool-store guard to this dispatch."
+    return 1
+  fi
+  _pool_path=$(rig_root_path "$_rig")
+  if [ -z "$_pool_path" ] || [ ! -d "$_pool_path" ]; then
+    warn "ga-653ilw: pool $_target's rig '$_rig' has no usable path on disk ('${_pool_path:-<none>}') — NOT applying the pool-store guard to this dispatch."
+    return 1
+  fi
+  _pilot_same_dir "$_bead_city" "$_pool_path" && return 1
+  return 0
+}
+
 # _pilot_text_names_rig_path <text> <rig> — ga-6u64fm: exit 0 iff <text> holds a
 # literal PATH TOKEN that names <rig> as a directory component
 # ("whatsapp_automation/scripts/x.py", "~/gt/whatsapp_automation/x",
@@ -6930,12 +7039,16 @@ _pilot_migration_original_state() {
 }
 
 # _pilot_migrate_dog_store_blind_bead <story_id> <story_json> <src_city>
-# <src_rig> <story_labels_csv> — ga-6u64fm: auto-migrate a rig-native bead
+# <src_rig> <story_labels_csv> [<dest_rig>] — ga-6u64fm: auto-migrate a rig-native bead
 # the dog pool can never see (per _pilot_dog_store_blind_guard) into a store
 # some REAL builder actually reads, instead of only parking + asking a human
 # to do it by hand (the pre-existing ga-cszxcf behavior, which remains the
 # fallback on any abort/failure below: every `return 1` leaves the caller to
 # park the original, exactly as before this function existed).
+#
+# ga-653ilw: the optional <dest_rig> forces the destination (the pool-store guard passes the rig the target pool
+# reads). Without it the destination is picked from the bead's text as before; with it, an unresolvable
+# destination aborts instead of defaulting to HQ.
 #
 # Destination: _pilot_dog_store_blind_migrate_dest above (only ever a store some
 # builder can read: HQ, or a rig whose own builder is not the dog).
@@ -6985,7 +7098,7 @@ _pilot_migration_original_state() {
 # depend on this alone: _pilot_dog_store_try_migrate decides on the exit status
 # and validates the id's shape.
 _pilot_migrate_dog_store_blind_bead() {
-  local _story_id="$1" _story_json="$2" _src_city="$3" _src_rig="$4" _story_labels="${5:-}"
+  local _story_id="$1" _story_json="$2" _src_city="$3" _src_rig="$4" _story_labels="${5:-}" _dest_override="${6:-}"
 
   # One hop only (gate-review ga-tguml6): a story that is ITSELF an earlier
   # migration's copy — it carries gc.migrated_from — and is dog-store-blind
@@ -7022,9 +7135,21 @@ _pilot_migrate_dog_store_blind_bead() {
   fi
 
   local _dest_rig _dest_city
-  _dest_rig=$(_pilot_dog_store_blind_migrate_dest "$_story_json" "$_src_rig")
+  # ga-653ilw: a caller that already KNOWS the destination (the pool-store guard: the pool's own rig) passes it
+  # as the 6th argument and the text-based pick is skipped. A forced destination never falls back to HQ — HQ is
+  # exactly as unreadable to a rig pool as the source store was, so an unresolvable forced destination aborts
+  # (the caller parks) instead of "migrating" the bead somewhere the pool still cannot see.
+  if [ -n "$_dest_override" ]; then
+    _dest_rig="$_dest_override"
+  else
+    _dest_rig=$(_pilot_dog_store_blind_migrate_dest "$_story_json" "$_src_rig")
+  fi
   _dest_city=$(rig_root_path "$_dest_rig")
   if [ -z "$_dest_city" ] || [ ! -d "$_dest_city" ]; then
+    if [ -n "$_dest_override" ]; then
+      warn "ga-653ilw: the required destination rig '$_dest_rig' for $_story_id has no usable path ('${_dest_city:-<none>}') — refusing to fall back to HQ (the pool cannot read it either), falling back to park." >&2
+      return 1
+    fi
     _dest_city="$GC_CITY"
     _dest_rig="gascity"
   fi
@@ -7040,7 +7165,12 @@ _pilot_migrate_dog_store_blind_bead() {
   _priority=$(printf '%s' "$_story_json" | jq -r '.priority // 2')
   _itype=$(printf '%s' "$_story_json" | jq -r '.issue_type // "task"')
   _desc=$(printf '%s' "$_story_json" | jq -r '.description // ""')
-  _new_desc="Movida de $_story_id (store $_src_rig, que nenhum builder le -- ga-cszxcf, automatico). Thread antiga: bd -C $_src_city comments $_story_id.
+  local _why_desc="que nenhum builder le -- ga-cszxcf, automatico" _why_close="ga-cszxcf, automatico: $_src_city nao e lido pelo probe de nenhum builder."
+  if [ -n "$_dest_override" ]; then
+    _why_desc="que o pool de destino nao le -- ga-653ilw, automatico"
+    _why_close="ga-653ilw, automatico: $_src_city nao e o store que o pool $_dest_rig le."
+  fi
+  _new_desc="Movida de $_story_id (store $_src_rig, $_why_desc). Thread antiga: bd -C $_src_city comments $_story_id.
 
 == Descricao original ==
 $_desc"
@@ -7091,7 +7221,7 @@ $_desc"
 
   local _close_rc=0 _orig_state="ours"
   bd -C "$_src_city" close "$_story_id" --reason \
-      "Movida para $_new_id ($_dest_rig, $_dest_city) -- ga-cszxcf, automatico: $_src_city nao e lido pelo probe de nenhum builder." \
+      "Movida para $_new_id ($_dest_rig, $_dest_city) -- $_why_close" \
       -q >/dev/null 2>&1 || _close_rc=$?
   if [ "$_close_rc" -ne 0 ]; then
     # A non-zero exit does not prove the close had no effect: re-read the original (three states + closed-by-us).
@@ -7133,7 +7263,7 @@ $_desc"
   esac
 }
 
-# _pilot_dog_store_try_migrate <story_id> <story_json> <src_city> <src_rig> <story_labels_csv> —
+# _pilot_dog_store_try_migrate <story_id> <story_json> <src_city> <src_rig> <story_labels_csv> [<dest_rig>] —
 # ga-6u64fm (gate-review ga-pvdwtc): the dispatch call site's ONE decision point. Exit 0 with the new
 # bead id on stdout iff the story was really migrated; exit 1 with NOTHING on stdout otherwise.
 #
@@ -7971,15 +8101,50 @@ _TOPUP_WORKER_EXCLUDE_LABELS=(
   --exclude-label "delivery:pending-restart"
 )
 _TOPUP_EPIC_TITLE_RE='^(EPIC|ÉPICO)[:\s]'
+
+# ── ga-653ilw: top-up must only chase beads the pool's worker can actually SEE, and must stop respawning for
+# one it never claims. Measured 27/09-01/10: lx-b5q (lexbh store, gc.routed_to=ps-worker) made this top-up open
+# a ps-worker every ~23 min — 251 sessions, each ~188k WTE, each finding nothing (ps-worker reads only the
+# property_scrapers store). See _pilot_pool_store_blind_guard for the dispatch-side half of the same fix.
+
+# _topup_rig_serves_pool <rig_path> <pool> — exit 0 iff <rig_path> is a REGISTERED rig (looked up in this
+# sweep's _TOPUP_RIG_PATHS_JSON) whose own builder pool is <pool> (_pilot_rig_builds_pool: derived from
+# rig_to_builders, not a second list). Exit 1 otherwise — including "the path is not a registered rig" and "the
+# rig list was unreadable": nothing proves the pool reads that store, and a top-up spawn is a cost, so the inert
+# answer under doubt is to scan nothing.
+_topup_rig_serves_pool() {
+  local _rp="${1:-}" _pool="${2:-}" _name
+  [ -n "$_rp" ] && [ -n "$_pool" ] || return 1
+  _rp="${_rp%/}"
+  _name=$(printf '%s' "${_TOPUP_RIG_PATHS_JSON:-}" \
+    | jq -r --arg p "$_rp" '[.rigs[]? | select(.hq != true) | select((.path | rtrimstr("/")) == $p) | .name][0] // empty' 2>/dev/null) || _name=""
+  [ -n "$_name" ] || return 1
+  _pilot_rig_builds_pool "$_name" "$_pool"
+}
+
+# _topup_exclude_braked — stdin: a JSON array of candidate beads; stdout: the same array minus every bead
+# labelled pilot:topup-braked (see _topup_note_spawn). The LABEL is the single source of truth for "braked": it
+# is durable, visible on the bead, and removing it is the release. Dropping the bead from the candidate list
+# (rather than stopping top-up for the pool) is what keeps one stuck bead from blocking the eligible beads
+# queued behind it. Non-array input passes through untouched, so a bd error envelope still ends up as "no
+# pending bead" at the final jq (inert), exactly as before this stage existed.
+_topup_exclude_braked() {
+  jq -c 'if type == "array" then [ .[] | select(((.labels // []) | index("pilot:topup-braked")) == null) ] else . end'
+}
+
 _topup_rig_pending() {
   local _pool="$1" _rp _rig_pending
   while IFS= read -r _rp; do
     [ -z "$_rp" ] || [ ! -d "$_rp" ] && continue
     [ "$_rp" = "$GC_CITY" ] && continue
+    # ga-653ilw: scan ONLY the store(s) this pool's worker reads. Every other rig's `gc.routed_to=<pool>` bead is
+    # invisible to the worker's probe, so spawning "for" it just burns a session that finds nothing.
+    _topup_rig_serves_pool "$_rp" "$_pool" || continue
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
       --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
       "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
       | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+      | _topup_exclude_braked 2>/dev/null \
       | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
         '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     if [ -n "$_rig_pending" ]; then
@@ -8143,6 +8308,99 @@ _pilot_topup_spawn() {
   return 1
 }
 
+# _topup_pending_store <pool> <bead_id> — print the store (HQ, or a rig path) that actually holds <bead_id>,
+# looking only where top-up itself looks: HQ, then the rig store(s) <pool> serves. Prints nothing and exits 1
+# when it cannot be found (not there, or every `bd show` failed) — "cannot tell", never a guess.
+_topup_pending_store() {
+  local _pool="${1:-}" _id="${2:-}" _cands _c
+  [ -n "$_id" ] || return 1
+  _cands="$GC_CITY
+${_TOPUP_RIG_PATHS:-}"
+  while IFS= read -r _c; do
+    [ -n "$_c" ] && [ -d "$_c" ] || continue
+    if [ "$_c" != "$GC_CITY" ] && ! _topup_rig_serves_pool "$_c" "$_pool"; then
+      continue
+    fi
+    if timeout 15 bd -C "$_c" show "$_id" --json 2>/dev/null \
+         | jq -e --arg id "$_id" 'if type == "array" then .[0] else . end | (.id // "") == $id' >/dev/null 2>&1; then
+      printf '%s' "$_c"
+      return 0
+    fi
+  done <<EOF_TOPUP_CANDS
+$_cands
+EOF_TOPUP_CANDS
+  return 1
+}
+
+# _topup_note_spawn <pool> <bead_id> — ga-653ilw: the respawn BRAKE. Call right after a top-up spawn SUCCEEDED
+# "for" <bead_id>. Counts CONSECUTIVE top-up spawns for the same bead in the bead's own metadata
+# (pilot.topup_spawn_count, pilot.topup_last_spawn_at) and, when the count reaches the cap, labels it
+# pilot:topup-braked (which _topup_exclude_braked then drops from every top-up candidate list) and leaves ONE
+# comment saying why and how to release it. A bead the worker claims leaves the unassigned set and costs nothing;
+# one it never claims used to cost a ~188k-WTE session every sweep, without limit (251 in 4 days).
+#
+#   PILOT_TOPUP_BRAKE=0              no-op (kill switch; existing pilot:topup-braked labels still exclude)
+#   PILOT_TOPUP_BRAKE_SPAWNS         cap, default 5. Invalid values fall back to 5, never to "off".
+#   PILOT_TOPUP_BRAKE_RESET_SECS     a gap this long since the last spawn restarts the count at 1 (default 21600
+#                                    = 6h): spawns hours apart are not "consecutive", so a slow-but-healthy bead
+#                                    is not punished for a busy afternoon.
+# Release: `bd -C <store> label remove <id> pilot:topup-braked`. The count is NOT cleared by that, so the bead
+# gets one more spawn and is braked again if it still is not claimed; to give it a full fresh budget also run
+# `bd -C <store> update <id> --unset-metadata pilot.topup_spawn_count`.
+#
+# FAIL-OPEN, and only for the bookkeeping: this runs AFTER the spawn already happened, so no failure here may
+# undo or block anything. A store that cannot be found or read means the spawn is not counted (warned, not
+# braked); the same store failure would equally keep the worker from finding the bead, and the next sweeps retry.
+# Always exits 0.
+_topup_note_spawn() {
+  local _pool="${1:-}" _id="${2:-}" _cap _reset _store _json _cnt _last _now _new
+  [ "${PILOT_TOPUP_BRAKE:-1}" = "1" ] || return 0
+  [ -n "$_id" ] || return 0
+  _cap="${PILOT_TOPUP_BRAKE_SPAWNS:-5}"
+  case "$_cap" in ''|*[!0-9]*) _cap=5 ;; esac
+  [ "$_cap" -ge 1 ] || _cap=5
+  _reset="${PILOT_TOPUP_BRAKE_RESET_SECS:-21600}"
+  case "$_reset" in ''|*[!0-9]*) _reset=21600 ;; esac
+  _now=$(date +%s)
+  _store=$(_topup_pending_store "$_pool" "$_id") || _store=""
+  if [ -z "$_store" ]; then
+    warn "ga-653ilw: top-up spawned $_pool for $_id but could not find which store holds it — this spawn is NOT counted toward the brake (fail-open)."
+    return 0
+  fi
+  _json=$(timeout 15 bd -C "$_store" show "$_id" --json 2>/dev/null) || _json=""
+  # Three states for the current count: absent on a READABLE bead (= 0, the first spawn), present, and UNREADABLE.
+  # The third must not read as "0": it would write count=1 over a real 4 and silently reset the brake exactly when
+  # Dolt is struggling. Unreadable -> warn, write nothing, count nothing (fail-open: the spawn already happened).
+  if ! printf '%s' "$_json" | jq -e 'if type == "array" then .[0] else . end | type == "object"' >/dev/null 2>&1; then
+    warn "ga-653ilw: top-up spawned $_pool for $_id but its current brake count could not be READ from $_store — this spawn is NOT counted and nothing was written (fail-open; the next sweep re-reads)."
+    return 0
+  fi
+  _cnt=$(printf '%s' "$_json" | jq -r 'if type == "array" then .[0] else . end | (.metadata // {}) | if type == "object" then (.["pilot.topup_spawn_count"] // "0") else "0" end | tostring' 2>/dev/null) || _cnt=0
+  _last=$(printf '%s' "$_json" | jq -r 'if type == "array" then .[0] else . end | (.metadata // {}) | if type == "object" then (.["pilot.topup_last_spawn_at"] // "0") else "0" end | tostring' 2>/dev/null) || _last=0
+  case "$_cnt" in ''|*[!0-9]*) _cnt=0 ;; esac
+  case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+  if [ $((_now - _last)) -ge "$_reset" ]; then
+    _new=1
+  else
+    _new=$((_cnt + 1))
+  fi
+  if ! timeout 15 bd -C "$_store" update "$_id" \
+         --set-metadata "pilot.topup_spawn_count=$_new" --set-metadata "pilot.topup_last_spawn_at=$_now" -q >/dev/null 2>&1; then
+    warn "ga-653ilw: could not record top-up spawn #$_new for $_id in $_store — the brake count is behind by one (fail-open)."
+  fi
+  [ "$_new" -ge "$_cap" ] || return 0
+  warn "ga-653ilw: top-up BRAKED $_id — $_new consecutive $_pool spawns for it, none claimed it (cap $_cap). Labelling pilot:topup-braked (top-up skips a bead that carries it). Release: bd -C $_store label remove $_id pilot:topup-braked"
+  # The comment below says the bead IS braked, so it is posted only once the label has actually landed: on a failed
+  # write the bead is not braked yet, and a comment claiming otherwise would be false on the bead itself. The next
+  # sweep counts again (the count is already >= the cap), retries the label, and leaves the comment then.
+  if ! timeout 15 bd -C "$_store" label add "$_id" "pilot:topup-braked" -q >/dev/null 2>&1; then
+    warn "ga-653ilw: FAILED to label $_id pilot:topup-braked — the brake is NOT durable and no comment was left (the bead is not braked yet); the next sweep will count again and retry the label."
+    return 0
+  fi
+  timeout 15 bd -C "$_store" comment "$_id" "Freio do top-up (ga-653ilw): o Pilot ja abriu $_new sessoes de $_pool SEGUIDAS para este bead e nenhuma o reivindicou — parando o top-up para ele (label pilot:topup-braked) em vez de gastar mais uma sessao (~188k WTE cada) por sweep. Causas provaveis: o bead vive num store que o pool $_pool nao le (ele so le o store do rig dono do pool), ou o worker o recusa. Para liberar: bd -C $_store label remove $_id pilot:topup-braked (a contagem nao e zerada: se continuar sem ser reivindicado, freia de novo na proxima sessao; para recomecar do zero, tambem rode: bd -C $_store update $_id --unset-metadata pilot.topup_spawn_count)." >/dev/null 2>&1 || true
+  return 0
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
   local _live _global _pending
@@ -8205,9 +8463,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -8220,6 +8478,7 @@ _pilot_pool_topup() {
         --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
         "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
         | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
+        | _topup_exclude_braked 2>/dev/null \
         | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
           '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
       if [ -z "$_pending" ]; then
@@ -8243,6 +8502,9 @@ _pilot_pool_topup() {
     log "  ga-93yxc: pool top-up — $_pool has free capacity (live=$_live < $_max) and $_pending is routed+unassigned with no worker from a prior sweep — spawning."
     if _pilot_topup_spawn "$_pool" "$_pending"; then
       log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending. [ga-oa004t path=pool-topup pool_live=$((_live + 1))/$_max global=$((_global + 1))/$GC_VARIABLE_SESSION_MAX]"
+      # ga-653ilw: count this spawn toward the per-bead brake — AFTER a successful spawn only, so a failed one never
+      # burns the budget. Fail-open and always exit 0 (see _topup_note_spawn); `|| true` keeps `set -e` out of it.
+      _topup_note_spawn "$_pool" "$_pending" || true
       _live=$((_live + 1))
       _global=$((_global + 1))
     else
@@ -9317,6 +9579,34 @@ _pilot_release_count_unreadable() {
   bd -C "$_city" update "$_bid" --unset-metadata "pilot.sling_bead" -q 2>/dev/null || true
   if [ -n "${3:-}" ]; then unmark_pool_builder "$3"; fi
   return 0
+}
+
+# _e9_dispatch_line <bead_id> <bead_store> — ga-798p6w (E9, the planner A/B): the one extra line for the builder's dispatch
+# comment, or NOTHING. Nothing (empty stdout, exit 0) is the normal answer: no .gc/e9-ab.conf or the kill switch (the experiment is
+# off), the bead is in the control arm, a sibling script is missing, `assign` timed out or failed, or the arm could not be
+# determined. "Could not tell" must never read as "on" — it would point a builder at an Opus planner run for the wrong bead — so
+# every failure path falls through to the comment exactly as it was. `assign` also runs for the control arm on purpose: it is what
+# records who was assigned, and a control arm with no denominator is not a control. It makes no bd call (jq, a hash, one roster
+# append), so the 10s bound is generous even at load 50.
+# A FAILED assign is logged (to stderr — stdout is captured as the comment line): its own stderr is dropped here because the hook has
+# one channel, so the exit code is what makes the failure visible. Without the log, a roster that stopped being writable would turn
+# the experiment off for every bead with nobody noticing (the bead would just be missing from the readout). The same goes for a conf
+# that is INVALID (exit 6, a typo'd key at turn-on): it must not look like "no conf" (exit 0, silent, legitimately off) — it would run
+# the experiment at 0% with no roster row and no log line (gate ga-shag3i, blocking issue 2).
+_e9_dispatch_line() {
+  local _e9_bid="$1" _e9_store="$2" _e9_sd _e9_arms _e9_plan _e9_arm _e9_rc=0
+  _e9_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  [ -n "$_e9_sd" ] || return 0
+  _e9_arms="$_e9_sd/e9-arms.sh"; _e9_plan="$_e9_sd/e9-plan.sh"
+  { [ -r "$_e9_arms" ] && [ -r "$_e9_plan" ]; } || return 0
+  _e9_arm="$(timeout 10 bash "$_e9_arms" assign "$_e9_bid" "$_e9_store" pilot-dispatch 2>/dev/null)" || _e9_rc=$?
+  if [ "$_e9_rc" -ne 0 ]; then
+    warn "E9: no plan hint for $_e9_bid — e9-arms.sh assign exited $_e9_rc (6 = the experiment config .gc/e9-ab.conf is INVALID, the experiment is NOT running — run 'e9-arms.sh state'; 5 = arm not recorded, roster unwritable; 3 = no arm could be determined; 124 = timed out)" >&2
+    return 0
+  fi
+  [ "$_e9_arm" = "on" ] || return 0
+  printf 'Experiment E9 (planner A/B, ga-798p6w): this bead is in the PLAN arm. Before reading code or editing, run `bash %s run %s --store %s` and start from the plan it prints. Exit 3 (no plan could be made) is not a verdict on the bead: build as you always do.' \
+    "$_e9_plan" "$_e9_bid" "$_e9_store"
 }
 
 # ── Dispatch helper ───────────────────────────────────────────────────────────
@@ -10810,6 +11100,53 @@ TASK
     fi
   fi
 
+  # ── ga-653ilw: pool-store-blind guard — a wa-worker/ps-worker can only claim a bead in ITS OWN store ───────
+  # The rig-native pool arm below leaves the bead "unassigned + routed" and trusts the ephemeral worker to find
+  # it with `bd ready --metadata-field gc.routed_to=<pool>`. That probe runs from the pool's work_dir, i.e. it
+  # reads ONE store (ps-worker: property_scrapers, wa-worker: whatsapp_automation). A bead living anywhere else
+  # is invisible to it forever — and every spawn "for" it is a ~188k-WTE session that finds nothing and drains.
+  # Measured 27/09-01/10: lx-b5q (lexbh store), rerouted to ps-worker by the ga-wnojmm domain fallback — which
+  # reassigns STORY_RIG but leaves STORY_BEAD_CITY on lexbh — burned 251 sessions in 4 days.
+  # This sits BEFORE the DRY_RUN branch on purpose: a dry run then reports the refusal instead of "WOULD spawn a
+  # worker that can never see the bead", and before the pool arm below stamps gc.routed_to.
+  # Same two-step remedy as the dog guard (ga-cszxcf / ga-6u64fm): first MIGRATE the bead into the store the
+  # pool reads (the destination is forced to that rig and never falls back to HQ, which the pool cannot read
+  # either), and only when that is not possible PARK it visibly (pilot:no-auto-dispatch + next-action:mayor + a
+  # comment) instead of dispatching into a store the worker cannot see. Kill switches (both default on):
+  # PILOT_POOL_STORE_GUARD=0 disables the whole guard, PILOT_POOL_STORE_AUTOMIGRATE=0 skips just the migration.
+  # "Cannot tell" (rig list unreadable, pool's rig unknown) is a PROCEED — see _pilot_pool_store_blind_guard.
+  if [ "$_IS_RIG_NATIVE" = "1" ] && [ "${PILOT_POOL_STORE_GUARD:-1}" = "1" ] \
+     && _pilot_pool_store_blind_guard "$_SLING_TARGET" "$STORY_BEAD_CITY"; then
+    local _PSB_POOL_RIG _PSB_SRC_RIG _PSB_MIGRATED_ID=""
+    _PSB_POOL_RIG=$(_pilot_pool_rig "$_SLING_TARGET")
+    _PSB_SRC_RIG=$(_pilot_rig_name_for_path "$STORY_BEAD_CITY")
+    [ -n "$_PSB_SRC_RIG" ] || _PSB_SRC_RIG="$STORY_RIG"
+    if [ "$DRY_RUN" = "1" ]; then
+      log "DRY_RUN=1 — WOULD REFUSE (ga-653ilw): $STORY_ID lives in $STORY_BEAD_CITY ($_PSB_SRC_RIG) but $_SLING_TARGET reads only the $_PSB_POOL_RIG store — WOULD auto-migrate it there (or park it: pilot:no-auto-dispatch + next-action:mayor), NOT spawn a worker that can never see it."
+      DISPATCH_RESULT="rig_native_pool_store_blind"
+      return 1
+    fi
+    if [ "${PILOT_POOL_STORE_AUTOMIGRATE:-1}" = "1" ] && [ -n "$_PSB_POOL_RIG" ] \
+       && _PSB_MIGRATED_ID=$(_pilot_dog_store_try_migrate "$STORY_ID" "$STORY" "$STORY_BEAD_CITY" "$_PSB_SRC_RIG" "$STORY_LABELS" "$_PSB_POOL_RIG"); then
+      log "  ga-653ilw: $STORY_ID auto-migrated to $_PSB_MIGRATED_ID ($_PSB_POOL_RIG store, the one $_SLING_TARGET reads) — original closed, no park needed (set PILOT_POOL_STORE_AUTOMIGRATE=0 to disable)."
+      bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+      # Classified as refused_by_guard in _pilot_sweep_emit (a success is NOT a Pilot fault); still `return 1`
+      # and counted in NONQUEUE_FAILS on purpose, exactly like rig_native_dog_store_migrated: nothing was
+      # DISPATCHED, and the Step 5 "estagnado" streak is what would notice a migration loop.
+      DISPATCH_RESULT="rig_native_pool_store_migrated"
+      return 1
+    fi
+    warn "ga-653ilw: REFUSING rig-native dispatch of $STORY_ID to $_SLING_TARGET — $STORY_BEAD_CITY ($_PSB_SRC_RIG) is not the store that pool reads (${_PSB_POOL_RIG:-unknown}), so its worker's probe could never find the bead. Could not auto-migrate it; parking with pilot:no-auto-dispatch + next-action:mayor instead of spawning workers that find nothing (set PILOT_POOL_STORE_GUARD=0 to disable)."
+    bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "pilot:no-auto-dispatch" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label add "$STORY_ID" "next-action:mayor" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "Pergunta (ga-653ilw): este bead vive em '$STORY_BEAD_CITY' ($_PSB_SRC_RIG) mas foi roteado para $_SLING_TARGET, e o worker desse pool so le o store de '${_PSB_POOL_RIG:-?}' — o probe dele nunca vai achar este bead, e cada sessao aberta a toa custa ~188k WTE. A migracao automatica para o store do pool nao foi possivel. Mova o bead para o store de '${_PSB_POOL_RIG:-?}' (bd -C <rig> create ...) ou de a este store um builder cujo probe o leia." 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "pilot:dispatching" -q 2>/dev/null || true
+    bd -C "$STORY_BEAD_CITY" update "$STORY_ID" --unset-metadata "pilot.dispatching_at" -q 2>/dev/null || true
+    DISPATCH_RESULT="rig_native_pool_store_blind"
+    return 1
+  fi
+
   # ── Dispatch via gc sling (HQ beads) or bd assign (rig-native beads) ─────────
   # ga-ov3gow: DISPATCH_RESULT is NOT local (it used to be): every `DISPATCH_RESULT=...; return 1` below
   # is a reason the caller never saw, so a queue / failed spawn / guard refusal left no trace anywhere.
@@ -11661,6 +11998,17 @@ No human review required.
 No-diff deliverable (mockup, report, data-op, verified-live/no-changes finding)? Never exit with the bead in_progress: acceptance already met by the artifact itself → bd close --reason citing it. Missing an Athos decision → park it (next-action:athos-decide label + athos.acao metadata) and release the claim."
     fi
 
+    # ga-798p6w (E9): empty unless the planner experiment is on AND this bead is in the plan arm — the comment is then unchanged.
+    # Not for the beads-repo branch (an upstream PR, no gate, no builder doctrine for a plan to attach to).
+    if [ -z "$IS_BEADS_REPO_FIX" ]; then
+      local _e9_line
+      _e9_line="$(_e9_dispatch_line "$STORY_ID" "$STORY_BEAD_CITY")"
+      if [ -n "$_e9_line" ]; then
+        DISPATCH_COMMENT="$DISPATCH_COMMENT
+$_e9_line"
+      fi
+    fi
+
     bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "$DISPATCH_COMMENT" \
       2>/dev/null || warn "Could not post dispatch comment to $STORY_ID"
   fi
@@ -11766,6 +12114,9 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       rig_native_dog_store_migrated (ga-6u64fm): the dog-store guard REFUSED the dispatch and
 #                       RESOLVED it by moving the bead to a store a builder reads — the benign end of the same
 #                       guard whose park end is rig_native_dog_store_blind; the tally key tells the two apart.
+#                       The same pair exists for the rig pools (ga-653ilw): rig_native_pool_store_migrated (the bead
+#                       was moved into the store the wa-worker/ps-worker reads) and rig_native_pool_store_blind
+#                       (could not be moved, parked) — a bead the pool could never have found, refused, not a fault.
 #                       Also rig_native_spawn_deferred_slow (ga-6hr8p7): the spawn was DEFERRED because an
 #                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
@@ -11820,7 +12171,7 @@ _pilot_sweep_emit() {
       elif $o.r == "rig_native_pool_session_cap_queued" then "queued_pool_cap"
       elif $o.r == "rig_native_global_session_cap_queued" then "queued_global_cap"
       elif $o.r == "rig_native_spawn_failed" then "spawn_failed"
-      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
+      elif ["pool_ownership_refuse", "rig_native_dog_store_blind", "rig_native_dog_store_migrated", "rig_native_pool_store_blind", "rig_native_pool_store_migrated", "rig_native_pool_target_only", "rig_dedup_skip", "rig_native_spawn_deferred_slow"]
            | any(.[]; . == $o.r) then "refused_by_guard"
       elif $o.r == "" then "unclassified"
       else "failed_other" end;
