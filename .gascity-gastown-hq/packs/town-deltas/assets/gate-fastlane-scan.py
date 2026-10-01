@@ -14,7 +14,9 @@ exit 0  clean.
 exit 1  at least one finding  -> the caller sends the diff to the NORMAL gate.
 exit 2  could not scan (binary file in the diff, input over --max-bytes, unreadable/garbled diff, bug) ->
         the caller ALSO sends it to the normal gate. "Could not scan" must never read as "clean": that is the
-        third state, and under doubt the lane stays the inert (normal-gate) one.
+        third state, and under doubt the lane stays the inert (normal-gate) one. The parser therefore knows
+        every line it may meet and consumes exactly the line counts each `@@` header declares; a line it cannot
+        classify, or a hunk that ends early, is exit 2 — never "adds nothing".
 
 A false positive costs one ordinary review; a false negative publishes data. So every pattern errs wide.
 The patterns are defined here, once. (The story cites "the same patterns as publicar-estudo"; no copy of that
@@ -40,6 +42,11 @@ _PHONE_SHAPES = [
     re.compile(r"(?<![0-9])9\d{4}-\d{4}(?![0-9])"),
     # bare WhatsApp-style id:  5531999998888 (@s.whatsapp.net / @c.us), 12-13 digits, country 55 + valid DDD
     re.compile(r"(?<![0-9])55[1-9]\d9?\d{8}(?![0-9])"),
+    # bare, unformatted national number — the shape a CSV export in reports/ carries:
+    #   mobile   31999998888  (DDD 11-99, then 9, then 8 digits)
+    #   landline 3133334444   (DDD 11-99, then 2-5, then 7 digits)
+    re.compile(r"(?<![0-9])[1-9][1-9]9\d{8}(?![0-9])"),
+    re.compile(r"(?<![0-9])[1-9][1-9][2-5]\d{7}(?![0-9])"),
 ]
 
 # --- credentials ------------------------------------------------------------------------------------------
@@ -53,11 +60,16 @@ _SECRET_SHAPES = [
     ("google-key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}")),
     ("bearer", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}")),
-    ("url-credentials", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]{3,}@")),
+    # the lookbehind lets a scheme start only at the beginning of a run: without it every position of a long
+    # alphanumeric line is a fresh start and the match is quadratic (64 000 chars took 3.6 s)
+    ("url-credentials", re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:[^\s/@]{3,}@")),
 ]
 # name = value, where the NAME says secret and the VALUE is long and token-shaped.
+# No leading `[\w.-]*` (finditer already finds the keyword anywhere) and the trailing run is capped: both made the
+# match quadratic on a long line of word characters (32 000 chars took 18 s; "token" x 400 000 never finished) —
+# a scan that holds the citywide gate lock must not hang. No credential NAME runs 64 characters past its keyword.
 _ASSIGN = re.compile(
-    r"(?i)[\w.-]*(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|private[_-]?key)[\w.-]*"
+    r"(?i)(?:api[_-]?key|secret|token|passw(?:or)?d|pwd|credential|private[_-]?key)[\w.-]{0,64}"
     r"\s*[:=]\s*[\"']?([A-Za-z0-9/+_=.-]{20,})[\"']?"
 )
 _PLACEHOLDER = re.compile(r"(?i)x{4,}|\*{3,}|<[^>]*>|\$\{|\$\(|^\$|example|placeholder|your[_-]|changeme|dummy|redacted|\.\.\.")
@@ -97,39 +109,102 @@ def scan_text(text: str):
     return labels
 
 
+_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?")
+# the extended-header lines git prints between `diff --git` and the first hunk; none of them adds content
+_FILE_HEADERS = ("index ", "--- ", "new file mode ", "deleted file mode ", "old mode ", "new mode ",
+                 "similarity index ", "dissimilarity index ", "rename from ", "rename to ", "copy from ", "copy to ")
+_NO_NEWLINE = "\\ "   # "\ No newline at end of file" (any wording): a content line starts with + - or a space, never "\"
+
+
 def scan_diff(lines):
-    """Yield (label, path, lineno) for every ADDED line of a `-U0` unified diff. Raises ValueError on a diff it
-    cannot trust (binary file, an added line before any file header)."""
-    path = None
+    """Yield (label, path, lineno) for every ADDED line of a unified diff. `lines` are split on "\\n" ONLY (never
+    str.splitlines(): U+2028, U+0085, form feed... are routine in pasted text and would cut an added line in two,
+    leaving a tail that no longer starts with "+").
+
+    Raises ValueError on a diff it cannot trust: a binary file, an added line before any file header, a line that is
+    none of the shapes git emits, a hunk whose lines do not match the counts its `@@` header declares, or a diff
+    that ends inside a hunk. The parser tracks those counts so that what counts as CONTENT is decided by the hunk
+    header, never by what the line looks like — an added line whose text starts with "++ " is a `+++ ` line on
+    the wire, and is still content.
+
+    A path that itself carries a CPF/phone/credential is never yielded as a path (the caller prints it): it is
+    reported as <redacted-name#N>, N being the file's position in the diff."""
+    path = None          # the b-side path of the current file (None for /dev/null)
+    shown = None         # what a finding may call that file
+    nfile = 0
+    name_seen = set()    # labels already reported for the current file's NAME
+    old_left = new_left = 0
     lineno = 0
-    for raw in lines:
-        line = raw.rstrip("\n")
+    last_was_body = False
+
+    def name_findings(text):
+        for label in scan_text(text):
+            if label not in name_seen:
+                name_seen.add(label)
+                yield (label, f"<redacted-name#{nfile}>", 0)
+
+    for line in lines:
+        in_hunk = old_left > 0 or new_left > 0
+        if in_hunk:
+            c = line[:1]
+            if c == "+":
+                if new_left <= 0 or path is None:
+                    raise ValueError("added line that its hunk header does not account for")
+                new_left -= 1
+                for label in scan_text(line[1:]):
+                    yield (label, shown, lineno)
+                lineno += 1
+            elif c == "-":
+                if old_left <= 0:
+                    raise ValueError("removed line that its hunk header does not account for")
+                old_left -= 1
+            elif c == " ":
+                if old_left <= 0 or new_left <= 0:
+                    raise ValueError("context line that its hunk header does not account for")
+                old_left -= 1
+                new_left -= 1
+                lineno += 1
+            elif line.startswith(_NO_NEWLINE):
+                pass
+            else:
+                raise ValueError("unrecognized line inside a hunk — cannot be classified")
+            last_was_body = c in ("+", "-", " ")
+            continue
+
+        if line.startswith(_NO_NEWLINE) and last_was_body:   # the marker follows the hunk's last line
+            last_was_body = False
+            continue
+        last_was_body = False
         if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             raise ValueError("binary content in the diff — cannot be scanned")
+        if line.startswith("diff --git "):
+            nfile += 1
+            path = shown = None
+            name_seen = set()
+            yield from name_findings(line[len("diff --git "):])   # an empty/mode-only/deleted file has no +++ line
+            continue
         if line.startswith("+++ "):
             tgt = line[4:]
             path = tgt[2:] if tgt.startswith("b/") else tgt
             if path == "/dev/null":
-                path = None
+                path = shown = None
             else:
-                for label in scan_text(path):  # the file NAME can carry a CPF/phone too
-                    yield (label, path, 0)
+                yield from name_findings(path)
+                shown = f"<redacted-name#{nfile}>" if name_seen else path
             continue
-        if line.startswith("--- ") or line.startswith("diff --git") or line.startswith("index "):
+        if line.startswith(_FILE_HEADERS):
             continue
         if line.startswith("@@"):
-            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            m = _HUNK.fullmatch(line)
             if not m:
                 raise ValueError("unparseable hunk header")
-            lineno = int(m.group(1))
+            old_left = int(m.group(2)) if m.group(2) is not None else 1
+            new_left = int(m.group(4)) if m.group(4) is not None else 1
+            lineno = int(m.group(3))
             continue
-        if line.startswith("+"):
-            if path is None:
-                raise ValueError("added line outside any file header")
-            for label in scan_text(line[1:]):
-                yield (label, path, lineno)
-            lineno += 1
-        # '-' lines and '\ No newline' markers add nothing
+        raise ValueError("unrecognized diff line — cannot be classified")
+    if old_left > 0 or new_left > 0:
+        raise ValueError("diff ends inside a hunk — truncated, cannot be scanned in full")
 
 
 def main(argv):
@@ -149,8 +224,11 @@ def main(argv):
     except UnicodeDecodeError:
         print("diff is not valid UTF-8 — cannot be scanned reliably", file=sys.stderr)
         return 2
+    lines = text.split("\n")
+    if lines and lines[-1] == "":   # git ends every line, the last one included, with "\n"
+        lines.pop()
     try:
-        findings = list(scan_diff(text.splitlines()))
+        findings = list(scan_diff(lines))
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2

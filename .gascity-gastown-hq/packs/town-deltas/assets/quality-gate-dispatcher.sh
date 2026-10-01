@@ -15547,13 +15547,14 @@ log "Tier: $TIER  required_reviewers: $REQUIRED_REVIEWERS"
 # every other file stay in the normal gate. The lane is only ever GRANTED, never a verdict: anything unreadable,
 # unclassifiable, failing or merely unverified leaves GATE_LANE=normal. See gate-fastlane.lib.sh for the rules.
 # The reviewer count a NORMAL run would have used is kept for the weekly tally of rounds saved.
-GATE_LANE="normal"; GATE_LANE_REASON=""; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
+GATE_LANE="normal"; GATE_LANE_REASON=""; GATE_LANE_REASON_CODE=""; GATE_LANE_FILES=""; GATE_LANE_COUNTS=""
 GATE_LANE_WOULD_REVIEWERS="$REQUIRED_REVIEWERS"
 # SELFTEST-EXTRACT fastlane-decide: BEGIN
 if [ -z "${CHANGED_FILES:-}" ]; then
   # the dispatcher's own file list is empty — it falls back to "" when its git call fails, and an error must not
   # read as "this diff touches no gate-policy file": nothing to cross-check against, so the normal gate decides
   GATE_LANE="normal"
+  GATE_LANE_REASON_CODE="no-changed-files"
   GATE_LANE_REASON="the dispatcher's own changed-file list is empty (git error or empty diff) — cannot cross-check, normal gate"
 elif declare -F gate_fastlane_decide >/dev/null 2>&1; then
   _FL_RC=0
@@ -15561,10 +15562,12 @@ elif declare -F gate_fastlane_decide >/dev/null 2>&1; then
   if [ "$_FL_RC" != "0" ]; then
     # fail closed: a decision that errored is not a decision, whatever it had already written
     GATE_LANE="normal"
+    GATE_LANE_REASON_CODE="decision-errored"
     GATE_LANE_REASON="fast-lane decision errored (rc=$_FL_RC) — normal gate"
   fi
 else
   GATE_LANE="normal"
+  GATE_LANE_REASON_CODE="lib-not-loaded"
   GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"
 fi
 # Anything that is not exactly "fast" is "normal" — a lib bug must not be able to produce a third lane.
@@ -15575,9 +15578,23 @@ if [ "$GATE_LANE" = "fast" ]; then
 fi
 # SELFTEST-EXTRACT fastlane-decide: END
 log "Lane: $GATE_LANE — ${GATE_LANE_REASON:-no reason recorded}"
+# SELFTEST-EXTRACT fastlane-record: BEGIN
 if declare -F gate_fastlane_record >/dev/null 2>&1; then
   gate_fastlane_record "$GC_CITY" "$MARKER_ID" "$BEAD_ID" "$BRANCH" "${RIG:-unknown}" "$GATE_LANE_WOULD_REVIEWERS" "$QG_LOG" || true
+else
+  # The recorder lives in the lib that did not load — and a period with a broken lib is exactly what the weekly tally
+  # must be able to see. Without this line no gate_lane event exists for those diffs, they are simply absent from
+  # "decisions", and the tally's "lib not loaded" bucket can never fill. Same fields as gate_fastlane_record's event.
+  _FL_WOULD="${GATE_LANE_WOULD_REVIEWERS:-0}"; case "$_FL_WOULD" in ''|*[!0-9]*) _FL_WOULD=0 ;; esac   # --argjson dies on non-numeric
+  jq -c -n \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg branch "$BRANCH" --arg bead "${BEAD_ID:-}" --arg rig "${RIG:-unknown}" \
+    --arg marker "${MARKER_ID:-}" --arg lane "$GATE_LANE" --arg reason "$GATE_LANE_REASON" --arg code "$GATE_LANE_REASON_CODE" \
+    --arg dry_run "${DRY_RUN:-0}" --argjson would "$_FL_WOULD" \
+    '{ts: $ts, event: "gate_lane", lane: $lane, branch: $branch, bead: $bead, rig: $rig, marker: $marker,
+      counts: "", reason: $reason, reason_code: $code, files: "", would_have_reviewers: $would, dry_run: $dry_run}' \
+    >> "$QG_LOG" 2>/dev/null || true
 fi
+# SELFTEST-EXTRACT fastlane-record: END
 
 # ga-syxaki (E5): arm + big-diff trigger, decided BEFORE the run record exists — and decided ONCE: this is the only read of
 # the flag for this run's admission. GATE_E5_ACTIVE (the admit log, the prompt pieces, the big-diff extra) is derived from it

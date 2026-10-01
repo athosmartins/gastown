@@ -18,7 +18,11 @@
 #   6. drift guards on facts the safety argument depends on (Phase C refuses a zero-verdict run BEFORE it asks
 #      whether "all verdicts are in", so 0-of-0 can never read as PASS);
 #   7. mutation checks of THIS harness: a lib that loses its symlink guard / that reads "could not scan" as
-#      "clean" must turn the matching assertion red.
+#      "clean" / whose reason code the tally does not bucket must turn the matching assertion red.
+#
+# Lines the scanner cannot classify are exit 2, never "adds nothing" (§1, §4b); and every lane decision is run
+# through the REAL record and the REAL tally (§4e), so a reason the producer emits and the tally does not bucket
+# cannot hide behind a hand-written fixture.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
@@ -43,6 +47,15 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/gate-fastlane.XXXXXX")" || { echo "mktemp failed
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/tmp" "$T/bin"
 TAB=$'\t'
+TALLY="$SELF_DIR/gate-lane-tally.py"
+# a stub `bd` for gate_fastlane_record (§4e, §7): logs its argv, answers `show` with the lane FAKE_BD_LANE
+cat > "$T/bin/bd" <<'EOF'
+#!/bin/bash
+echo "$@" >> "$FAKE_BD_LOG"
+case "$*" in *" show "*) printf '[{"metadata":{"gate.lane":"%s"}}]\n' "${FAKE_BD_LANE:-}" ;; esac
+exit 0
+EOF
+chmod +x "$T/bin/bd"
 
 extract_block() {
   sed -n "/# SELFTEST-EXTRACT ${2}: BEGIN/,/# SELFTEST-EXTRACT ${2}: END/p" "$1" | sed '1d;$d'
@@ -50,7 +63,7 @@ extract_block() {
 
 # ── 1. the scanner ────────────────────────────────────────────────────────────────────────────────────────────
 echo "── 1. scanner: findings, clean, and 'could not scan' ──"
-mkdiff() { printf 'diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n@@ -0,0 +1,3 @@\n%s\n' "$1"; }
+mkdiff() { printf 'diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n@@ -0,0 +1,1 @@\n%s\n' "$1"; }
 scan_case() { # name body want_rc
   local out rc=0
   out=$(mkdiff "$2" | python3 "$SCAN" 2>&1) || rc=$?
@@ -81,6 +94,64 @@ head -c 300 /dev/zero | tr '\0' 'a' | python3 "$SCAN" --max-bytes 100 >/dev/null
 [ "$rc" = "2" ] && ok "input over --max-bytes → rc=2" || bad "oversize → rc=$rc, want 2"
 printf 'diff --git a/docs/12345678909 b/x\n+++ b/docs/529.982.247-25.md\n@@ -0,0 +1 @@\n+hello\n' | python3 "$SCAN" >/dev/null 2>&1; rc=$?
 [ "$rc" = "1" ] && ok "a CPF in the FILE NAME is a finding too" || bad "CPF in a path → rc=$rc, want 1"
+
+# 1b. the parser must never read a line it cannot classify as "adds nothing" (gate round 1, blocking issue 1)
+SCAN_OUT=""
+raw_scan() { # name want_rc — the diff on stdin; leaves stdout+stderr in SCAN_OUT
+  local rc=0; SCAN_OUT=$(python3 "$SCAN" 2>&1) || rc=$?
+  if [ "$rc" = "$2" ]; then ok "scan: $1 → rc=$2"; else bad "scan: $1 → rc=$rc, want $2 ($SCAN_OUT)"; fi
+}
+H1='diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n'
+# (a) str.splitlines() also splits on these; the tail of the cut line no longer starts with "+" and was never scanned
+for sep in '\xe2\x80\xa8:U+2028' '\xe2\x80\xa9:U+2029' '\xc2\x85:U+0085 NEL' '\x0c:form feed' '\x0b:vertical tab' '\x1c:file separator' '\x1e:record separator'; do
+  raw_scan "a secret after ${sep#*:} inside one added line" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+nota${sep%%:*}chave AKIAIOSFODNN7EXAMPLE e mais\n")
+done
+raw_scan "a phone after U+2028" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+pagina 1\xe2\x80\xa8fone +55 31 99999-8888\n")
+raw_scan "U+2028 in clean prose stays clean" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+nota\xe2\x80\xa8so prosa\n")
+# (b) an added line whose TEXT starts with "++ " is a "+++ " line on the wire — content, never a file header, never echoed
+raw_scan "an added line shaped like a '+++ ' header is scanned as content" 1 < <(printf "${H1}@@ -0,0 +1,2 @@\n+ok\n+++ x AKIAIOSFODNN7EXAMPLE and key sk-abcdefghijklmnopqrstuvwx\n")
+case "$SCAN_OUT" in *AKIA*|*sk-abc*) bad "the finding output published the secret value: $SCAN_OUT" ;; *) ok "…and the output carries only label/path/line ($SCAN_OUT)" ;; esac
+[ "$SCAN_OUT" = "$(printf 'aws-key\tdocs/x.md\t2\napi-key\tdocs/x.md\t2')" ] && ok "…with the right path and line (docs/x.md:2), not the line's own text as a path" || bad "path/line wrong: $SCAN_OUT"
+raw_scan "a removed line shaped like a '--- ' header is not a header" 0 < <(printf "${H1}@@ -1 +0,0 @@\n---- gone\n")
+raw_scan "…and a secret on the added line after such removed lines is still found" 1 < <(printf "${H1}@@ -1,2 +1 @@\n--- first\n-- second\n+kept AKIAIOSFODNN7EXAMPLE\n")
+# (c) anything the parser cannot place is rc=2: the hunk header is the authority on how many lines follow
+raw_scan "a hunk that ends early (truncated diff)" 2 < <(printf "${H1}@@ -0,0 +1,3 @@\n+only one\n")
+raw_scan "an added line the hunk header does not account for" 2 < <(printf "${H1}@@ -0,0 +1 @@\n+one\n+two beyond the declared count\n")
+raw_scan "a line that is none of the shapes git emits" 2 < <(printf "${H1}@@ -0,0 +1 @@\n+ok\nGARBAGE LINE\n")
+raw_scan "an unknown prefix inside a hunk" 2 < <(printf "${H1}@@ -0,0 +1,2 @@\n+ok\n!what\n")
+raw_scan "an unparseable hunk header" 2 < <(printf "${H1}@@ nonsense @@\n+ok\n")
+raw_scan "a combined-diff header (never produced by a two-ref diff)" 2 < <(printf "${H1}@@@ -1 -1 +1 @@@\n++ok\n")
+raw_scan "a blank line where git would print a prefix" 2 < <(printf "${H1}@@ -0,0 +1 @@\n+ok\n\n")
+raw_scan "the 'No newline' marker is understood — and does not hide the finding before it" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n\\ No newline at end of file\n")
+raw_scan "the 'No newline' marker after clean prose" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+prose only\n\\ No newline at end of file\n")
+raw_scan "CRLF content (the CR is content, the secret is found)" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\r\n")
+raw_scan "an empty diff is clean (nothing added)" 0 < <(printf '')
+# (d) a file with no +++ line (empty / mode-only / deleted) still gets its NAME scanned — and the name is never printed
+raw_scan "a CPF in the name of an EMPTY new file" 1 < <(printf 'diff --git a/docs/529.982.247-25.md b/docs/529.982.247-25.md\nnew file mode 100644\nindex 0000000..e69de29\n')
+case "$SCAN_OUT" in *529.982*) bad "the name finding published the CPF: $SCAN_OUT" ;; *) ok "…reported as $(printf '%s' "$SCAN_OUT" | cut -f2), never as the name itself" ;; esac
+raw_scan "a mode-only change with a clean name" 0 < <(printf 'diff --git a/docs/ok.md b/docs/ok.md\nold mode 100644\nnew mode 100755\n')
+raw_scan "an empty deleted file with a clean name" 0 < <(printf 'diff --git a/docs/ok.md b/docs/ok.md\ndeleted file mode 100644\nindex e69de29..0000000\n')
+raw_scan "a content finding in a file whose NAME also matches" 1 < <(printf 'diff --git a/docs/529.982.247-25.md b/docs/529.982.247-25.md\n--- a/docs/529.982.247-25.md\n+++ b/docs/529.982.247-25.md\n@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n')
+case "$SCAN_OUT" in *529.982*) bad "a path that matched was printed: $SCAN_OUT" ;; *) ok "…the path that matched is withheld in every line of the output" ;; esac
+# (e) bare, unformatted numbers (the shape of a CSV export in reports/): the docstring says every pattern errs wide
+for n in 31999998888 11987654321 3133334444 2133334444; do
+  raw_scan "bare Brazilian number ${n}" 1 < <(printf "${H1}@@ -0,0 +1 @@\n+joao,${n}\n")
+done
+for n in 1790828057 12345678901 1790815326123 98765432 9999; do
+  raw_scan "control: ${n} is not a phone" 0 < <(printf "${H1}@@ -0,0 +1 @@\n+valor,${n}\n")
+done
+# (f) the scan runs while the dispatcher holds the citywide gate lock: no input may make it hang
+LONG="$T/long.diff"
+python3 - "$LONG" <<'PYGEN'
+import sys
+n = 1_500_000
+hdr = "diff --git a/docs/x.md b/docs/x.md\n--- a/docs/x.md\n+++ b/docs/x.md\n"
+with open(sys.argv[1], "w") as f:
+    for i, body in enumerate(("a" * n, "token" * (n // 5), "ab12." * (n // 5), "x" * 1000 + "://" + "u" * n), 1):
+        f.write(hdr.replace("x.md", f"x{i}.md") + "@@ -0,0 +1 @@\n+" + body + "\n")
+PYGEN
+SECONDS=0; rc=0; timeout 90 python3 "$SCAN" --max-bytes 20000000 < "$LONG" >/dev/null 2>&1 || rc=$?
+{ [ "$rc" = "0" ] && [ "$SECONDS" -lt 60 ]; } && ok "four 1.5 MB single-line adds (word run, repeated keyword, dotted run, scheme run) scan clean in ${SECONDS}s — no quadratic regex" || bad "long-line scan: rc=$rc after ${SECONDS}s (124 = hung; this was 18 s per 32 KB before)"
 
 # ── 2. path classes ───────────────────────────────────────────────────────────────────────────────────────────
 echo "── 2. path classes (the story's DOC / TEST / PROMPT / CODE) ──"
@@ -157,18 +228,23 @@ mkbr() { # mkbr <branch> <spec>...  spec: path=content (printf %b) | -path (dele
   git -C "$REPO" checkout -q main
 }
 
-D_LANE=""; D_REASON=""; D_FILES=""
-decide() { # decide <head> <policy> [ENV=VAL ...]  -> D_LANE / D_REASON / D_FILES
+D_LANE=""; D_REASON=""; D_FILES=""; D_CODE=""
+decide() { # decide <head> <policy> [ENV=VAL ...]  -> D_LANE / D_REASON / D_FILES / D_CODE
+  # FL_QG_LOG=<file> [FL_MARKER=<id>] also runs the REAL gate_fastlane_record on the decision (stub bd), as the dispatcher does
   local head="$1" policy="$2" out; shift 2
-  out=$(env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_BASE="${FL_BASE:-main}" FL_HEAD="$head" FL_POLICY="$policy" "$@" \
+  out=$(env GATE_FS_TMPDIR="$T/tmp" FL_LIB="${FL_LIB_OVERRIDE:-$LIB}" FL_REPO="$REPO" FL_BASE="${FL_BASE:-main}" FL_HEAD="$head" FL_POLICY="$policy" \
+            FL_BIN="$T/bin" FAKE_BD_LOG="$T/bd.log" "$@" \
         "$B32" -c '
     set -euo pipefail
-    source "$FL_LIB"
+    source "${FL_LIB_OVERRIDE:-$FL_LIB}"   # an override may arrive as a prefix assignment or as an env arg
     gfn() { git -C "$FL_REPO" "$@"; }
     gate_fastlane_decide gfn "$FL_BASE" "$FL_HEAD" "$FL_POLICY"
-    printf "%s\n%s\n%s\n" "$GATE_LANE" "$GATE_LANE_REASON" "$(gate_fastlane_files_oneline)"
-  ' 2>"$T/decide.err") || { D_LANE="ABORTED"; D_REASON="decide() aborted under set -euo pipefail: $(cat "$T/decide.err")"; D_FILES=""; return; }
-  D_LANE=$(printf '%s\n' "$out" | sed -n 1p); D_REASON=$(printf '%s\n' "$out" | sed -n 2p); D_FILES=$(printf '%s\n' "$out" | sed -n 3p)
+    printf "%s\n%s\n%s\n%s\n" "$GATE_LANE" "$GATE_LANE_REASON" "$(gate_fastlane_files_oneline)" "$GATE_LANE_REASON_CODE"
+    if [ -n "${FL_QG_LOG:-}" ]; then
+      PATH="$FL_BIN:$PATH" gate_fastlane_record /city "${FL_MARKER:-m-e2e}" ga-e2e feat/e2e gascity 1 "$FL_QG_LOG" >/dev/null 2>&1 || true
+    fi
+  ' 2>"$T/decide.err") || { D_LANE="ABORTED"; D_REASON="decide() aborted under set -euo pipefail: $(cat "$T/decide.err")"; D_FILES=""; D_CODE=""; return; }
+  D_LANE=$(printf '%s\n' "$out" | sed -n 1p); D_REASON=$(printf '%s\n' "$out" | sed -n 2p); D_FILES=$(printf '%s\n' "$out" | sed -n 3p); D_CODE=$(printf '%s\n' "$out" | sed -n 4p)
 }
 check() { # name want_lane [needle-in-reason-or-files]
   if [ "$D_LANE" = "$2" ]; then ok "$1 → $2"; else bad "$1: lane=$D_LANE, want $2 — $D_REASON"; fi
@@ -193,6 +269,17 @@ S=$(mkbr s-cpf 'docs/c.md=cliente 529.982.247-25 ligou\n');                  dec
 case "$D_REASON $D_FILES" in *529.982*|*52998224725*) bad "the lane output echoes the CPF value" ;; *) ok "the lane output never echoes the matched value" ;; esac
 S=$(mkbr s-phone 'docs/p.md=ligar +55 31 99999-8888\n');                     decide "$S" "";  check "a phone number on an added line" normal "telefone"
 S=$(mkbr s-key 'docs/k.md=chave AKIAIOSFODNN7EXAMPLE\n');                    decide "$S" "";  check "a credential on an added line" normal "aws-key"
+# the gate's round-1 reproductions, end to end with real git: text pasted from a web page / PDF carries U+2028, NEL, FF
+S=$(mkbr s-u2028 'docs/leak.md=nota chave AKIAIOSFODNN7EXAMPLE e cliente 529.982.247-25\n' $'docs/leak2.md=pagina 1\xe2\x80\xa8fone +55 31 99999-8888\n')
+decide "$S" "";  check "a secret and a phone after a U+2028 are found (was: 'content scan clean' → fast)" normal "telefone"
+S=$(mkbr s-u2028b $'docs/leak.md=nota\xe2\x80\xa8chave AKIAIOSFODNN7EXAMPLE e cliente 529.982.247-25\n');   decide "$S" "";  check "a secret after a U+2028 inside ONE line" normal "aws-key"
+S=$(mkbr s-ff $'docs/ff.md=pagina 1\x0cchave AKIAIOSFODNN7EXAMPLE\n');       decide "$S" "";  check "a secret after a form feed" normal "aws-key"
+S=$(mkbr s-nel $'docs/nel.md=linha\xc2\x85chave AKIAIOSFODNN7EXAMPLE\n');    decide "$S" "";  check "a secret after a NEL (U+0085)" normal "aws-key"
+S=$(mkbr s-plusplus 'docs/pp.md=ok\n++ x AKIAIOSFODNN7EXAMPLE and key sk-abcdefghijklmnopqrstuvwx\n');   decide "$S" "";  check "an added line that starts with '++ ' (a '+++ ' line on the wire)" normal "aws-key"
+case "$D_REASON $D_FILES" in *AKIA*|*sk-abc*) bad "the lane output published the secret value: $D_REASON | $D_FILES" ;; *) ok "…and the lane output (reason + files, which go to bead comments) never carries the value" ;; esac
+S=$(mkbr s-bare 'reports/leads.csv=joao,31999998888\nmaria,11987654321\njoao,3133334444\n');   decide "$S" "";  check "a CSV in reports/ with bare, unformatted phone numbers" normal "telefone"
+S=$(mkbr s-cpfname 'docs/529.982.247-25.md=');                                decide "$S" "";  check "an EMPTY file whose NAME is a CPF" normal "cpf"
+case "$D_REASON $D_FILES" in *529.982*) bad "the lane output published the CPF found in a file name: $D_REASON | $D_FILES" ;; *) ok "…and the file name that matched is withheld from the lane output" ;; esac
 # 4c. tests: run, env scrubbed, stdin closed, bounded
 S=$(mkbr s-testok 'docs/n.md=x\n' 'tests/ok.selftest.sh=exit 0\n');          decide "$S" "";  check "docs + a new green test" fast "ran green"; no_leftovers "green test"
 S=$(mkbr s-testbad 'tests/bad.selftest.sh=exit 3\n');                        decide "$S" "";  check "a new test that FAILS stays in the gate (never a FAIL verdict)" normal "rc=3"; no_leftovers "failing test"
@@ -244,6 +331,62 @@ S=$(git -C "$REPO" rev-parse HEAD); git -C "$REPO" checkout -q main
 decide "$S" "";                                                              check "renaming a code file into a doc is still the code file" normal "CODE"
 S=$(mkbr s-accent 'docs/relatório final.md=ok\n');                           decide "$S" "";  check "an accented file name is classified, not mistaken for 'quoted'" fast
 S=$(mkbr s-tabname $'docs/a\tb.md=ok\n');                                    decide "$S" "";  check "a file name with a real TAB (git must quote it) is not vouched for" normal "quoting"
+
+# ── 4e. every decision, run through the REAL record and the REAL tally ──────────────────────────────────────────
+# Gate round 1, blocking issue 2: the tally matched a sentence the lib never emitted, so ~96% of decisions landed in
+# the wrong bucket — and its selftest was green because its fixture was hand-written to match. Here nothing is
+# hand-written: the decision is the lib's, the event is gate_fastlane_record's, the bucket is the tally's.
+echo "── 4e. decision → gate_lane event → tally, all real ──"
+label_of() { python3 "$TALLY" --list-codes | awk -F'\t' -v c="$1" '$1==c{print $2}'; }
+E_BUCKET=""; E_FAST=""
+e2e_probe() { # <head> <policy> [ENV=VAL ...] — decides, records, tallies ONE decision -> D_CODE / E_BUCKET / E_FAST
+  local head="$1" policy="$2" log="$T/e2e-$RANDOM$RANDOM.jsonl" j; shift 2
+  decide "$head" "$policy" FL_QG_LOG="$log" FL_MARKER="m-e2e" "$@"
+  j=$(python3 "$TALLY" --log "$log" --days 1 --json 2>/dev/null) || j='{}'
+  E_FAST=$(printf '%s' "$j" | jq -r '.fast // "?"' 2>/dev/null)
+  E_BUCKET=$(printf '%s' "$j" | jq -r '(.normal_reasons // {}) | keys | if length == 1 then .[0] elif length == 0 then "none" else "MANY" end' 2>/dev/null)
+  rm -f "$log"
+}
+e2e_ok() { # <want_code> — 0 iff the last probe produced that code AND the tally put it in that code's bucket
+  local want="$1" label
+  [ "$D_CODE" = "$want" ] || return 1
+  if [ "$want" = "fast" ]; then [ "$E_FAST" = "1" ] && [ "$E_BUCKET" = "none" ]; return; fi
+  label=$(label_of "$want"); [ -n "$label" ] && [ "$E_BUCKET" = "$label" ]
+}
+e2e_case() { # <name> <want_code> <head> <policy> [ENV=VAL ...]
+  local name="$1" want="$2" head="$3" policy="$4"; shift 4
+  e2e_probe "$head" "$policy" "$@"
+  if e2e_ok "$want"; then ok "e2e: $name → code=$want, tally bucket '$(label_of "$want")'"
+  else bad "e2e: $name → code='$D_CODE' bucket='$E_BUCKET' fast=$E_FAST; want code=$want / bucket '$(label_of "$want")' (reason: $D_REASON)"; fi
+}
+head_of() { git -C "$REPO" rev-parse "$1"; }
+e2e_case "docs-only branch (the fast lane itself)"           fast             "$(head_of s-docs)"    ""
+e2e_case "a .py file (the case the gate cited: ~96% of diffs)" code-or-prompt  "$(head_of s-mdpy)"    ""
+e2e_case "a skill .md (prompt/doctrine)"                      code-or-prompt  "$(head_of s-skill)"   ""
+e2e_case "CLAUDE.md alone"                                    code-or-prompt  "$(head_of s-claude)"  ""
+e2e_case "deploy_deps.json (config is code)"                  code-or-prompt  "$(head_of s-config)"  ""
+e2e_case "a CPF on an added line"                             scan-findings   "$(head_of s-cpf)"     ""
+e2e_case "a secret after a U+2028"                            scan-findings   "$(head_of s-u2028b)"  ""
+e2e_case "scanner missing next to the lib"                    scan-failed     "$(head_of s-docs)"    "" FL_LIB_OVERRIDE="$T/libonly/gate-fastlane.lib.sh"
+e2e_case "a binary file named .md"                            scan-failed     "$(head_of s-bin)"     ""
+e2e_case "a new test that fails"                              test-failed     "$(head_of s-testbad)" ""
+e2e_case "tests changed but running them is disabled"         test-failed     "$(head_of s-notests)" "" GATE_FASTLANE_RUN_TESTS=0
+e2e_case "a changed test with no runner (ts)"                 test-unrunnable "$(head_of s-js)"      ""
+e2e_case "a symlink named .md"                                unclassifiable  "$(head_of s-link)"    ""
+e2e_case "an empty diff (head == base)"                       unclassifiable  "$BASE_SHA"            ""
+e2e_case "a gate policy file in the diff"                     policy          "$(head_of s-docs2)"   "packs/x/quality-gate-foo.sh"
+e2e_case "kill-switch env GATE_FASTLANE_ENABLED=0"            disabled        "$(head_of s-docs2)"   "" GATE_FASTLANE_ENABLED=0
+e2e_case "kill-switch flag file"                              flag-file       "$(head_of s-docs2)"   "" GATE_FASTLANE_OFF_FILE="$T/fastlane.off"
+e2e_case "git cannot diff (bad base ref)"                     diff-raw-failed "$(head_of s-docs2)"   "" FL_BASE=no-such-ref
+e2e_case "no head to decide on"                               no-input        ""                     ""
+# the cited bug, said directly: a code diff must NOT read as "touches the gate's own policy"
+e2e_probe "$(head_of s-mdpy)" ""
+[ "$E_BUCKET" != "$(label_of policy)" ] && [ "$E_BUCKET" = "$(label_of code-or-prompt)" ] && ok "a diff that went to the gate because of a .py file is bucketed as code/prompt — not as the gate's own policy" || bad "the cited misbucketing is back: '$E_BUCKET'"
+# and every code the lib can set is one the harness above exercised or the tally lists (no producer/consumer drift)
+EXERCISED="fast code-or-prompt scan-findings scan-failed test-failed test-unrunnable unclassifiable policy disabled flag-file diff-raw-failed no-input"
+for c in $(grep -o '_gate_fastlane_normal "[a-z-]*"' "$LIB" | sed 's/.*"\(.*\)"/\1/' | sort -u); do
+  case " $EXERCISED " in *" $c "*) ok "lib code '$c' is exercised end to end above" ;; *) bad "lib emits code '$c' that §4e never ran through the tally" ;; esac
+done
 
 # ── 5. the dispatcher's live blocks, under bash 3.2 + set -euo pipefail ───────────────────────────────────────
 echo "── 5. dispatcher wiring (extracted, executed under $B32 + set -euo pipefail) ──"
@@ -319,6 +462,33 @@ real_case "control: a skill .md stays in the normal gate"                  s-ski
 real_case "control: .md + one .py stays in the normal gate"                s-mdpy   "RESULT lane=normal tier=NON-CODE rev=1"
 real_case "docs with a CPF stays in the normal gate"                       s-cpf    "RESULT lane=normal tier=NON-CODE rev=1"
 
+# 5b''. the lib did not load, so there is no recorder: the dispatcher must still leave the tally ONE event for that diff
+RECBLK="$(extract_block "$DISPATCHER" fastlane-record)"
+[ -n "$RECBLK" ] && ok "located the dispatcher block RECBLK ($(printf '%s\n' "$RECBLK" | wc -l | tr -d ' ') lines)" || bad "dispatcher block fastlane-record not found (sentinels missing/renamed)"
+recfb() { # <qg_log> <would> [DRY_RUN] — the block exactly as the dispatcher runs it, lib NOT sourced
+  { cat <<'HDR'
+set -euo pipefail
+GC_CITY=/city; MARKER_ID=mk-9; BEAD_ID=ga-x; BRANCH=feat/x; RIG=gascity
+GATE_LANE=normal; GATE_LANE_REASON="fast-lane lib not loaded (gate-fastlane.lib.sh missing or unreadable) — normal gate"; GATE_LANE_REASON_CODE=lib-not-loaded
+HDR
+    printf 'QG_LOG=%q; GATE_LANE_WOULD_REVIEWERS=%q; DRY_RUN=%q\n' "$1" "$2" "${3:-0}"
+    printf '%s\n' "$RECBLK"
+    printf 'echo RECORD-DONE\n'
+  } > "$T/recfb.sh"
+  "$B32" "$T/recfb.sh" 2>&1
+}
+RFLOG="$T/rf.jsonl"; rm -f "$RFLOG"
+RFOUT=$(recfb "$RFLOG" 3)
+case "$RFOUT" in *RECORD-DONE*) ok "lib not loaded: the record block survives set -euo pipefail under bash 3.2" ;; *) bad "record block died: $RFOUT" ;; esac
+[ "$(jq -r '[.event,.lane,.reason_code,.would_have_reviewers,.dry_run,.marker]|join("|")' "$RFLOG" 2>/dev/null)" = "gate_lane|normal|lib-not-loaded|3|0|mk-9" ] && ok "lib not loaded: ONE gate_lane event is written by the dispatcher itself (code lib-not-loaded, the reviewers a normal run uses, the marker)" || bad "fallback event: $(cat "$RFLOG" 2>/dev/null)"
+[ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.normal_reasons["lib da fast-lane não carregou"] // 0')" = "1" ] && ok "…and the tally buckets it as 'lib da fast-lane não carregou' (was: unreachable, the diff was simply absent)" || bad "the tally does not see the broken-lib decision"
+rm -f "$RFLOG"; recfb "$RFLOG" "not-a-number" >/dev/null
+[ "$(jq -r '.would_have_reviewers' "$RFLOG" 2>/dev/null)" = "0" ] && ok "a non-numeric reviewer count is written as 0, not an event lost to a jq error" || bad "non-numeric would-have-reviewers lost the event: $(cat "$RFLOG" 2>/dev/null)"
+rm -f "$RFLOG"; recfb "$RFLOG" 1 1 >/dev/null
+[ "$(jq -r '.dry_run' "$RFLOG" 2>/dev/null)" = "1" ] && [ "$(python3 "$TALLY" --log "$RFLOG" --days 1 --json | jq -r '.decisions')" = "0" ] && ok "a DRY_RUN=1 sweep's event carries dry_run=1 and the tally leaves it out" || bad "dry-run event: $(cat "$RFLOG" 2>/dev/null)"
+RFOUT=$(recfb "/nonexistent-dir-$$/qg.jsonl" 1)
+case "$RFOUT" in *RECORD-DONE*) ok "an unwritable log does not kill the daemon (the line is lost, the sweep goes on)" ;; *) bad "unwritable QG_LOG killed the block: $RFOUT" ;; esac
+
 # 5c. the Step 7 bypass
 byp_case() { # name lane
   { cat <<'HDR'
@@ -380,17 +550,24 @@ L_ZERO=$(ln_of 'has ZERO verdict beads')
 L_DEC=$(grep -n 'SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$L_ZERO" ] && [ -n "$L_DEC" ] && [ "$L_ZERO" -lt "$L_DEC" ]; then ok "Phase C refuses a ZERO-verdict run (line $L_ZERO) BEFORE it asks 'all verdicts in?' (line $L_DEC) — a 0-of-0 fast-lane orphan can never be PASS-finalized"
 else bad "Phase C ordering broke: zero-verdict guard=$L_ZERO verdict-decision=$L_DEC — a crashed fast-lane run could now read as 'all passed'"; fi
-sed -n "${L_ZERO:-1},$((${L_ZERO:-1}+1))p" "$DISPATCHER" | grep -q 'continue' && ok "…and that guard really does \`continue\` past the run" || bad "the zero-verdict guard no longer continues"
+# (captured, not piped into `grep -q`: under pipefail `grep -q` exits at its first match and the writer can die of SIGPIPE — a flaky red)
+ZG=$(sed -n "${L_ZERO:-1},$((${L_ZERO:-1}+1))p" "$DISPATCHER")
+case "$ZG" in *continue*) true ;; *) false ;; esac && ok "…and that guard really does \`continue\` past the run" || bad "the zero-verdict guard no longer continues"
 L_POL=$(grep -n -E '^POLICY_FILES=' "$DISPATCHER" | head -1 | cut -d: -f1)
 L_DECBLK=$(grep -n 'SELFTEST-EXTRACT fastlane-decide: BEGIN' "$DISPATCHER" | head -1 | cut -d: -f1)
 if [ -n "$L_POL" ] && [ -n "$L_DECBLK" ] && [ "$L_POL" -lt "$L_DECBLK" ]; then ok "POLICY_FILES (line $L_POL) is computed before the lane decision (line $L_DECBLK)"; else bad "POLICY_FILES is not defined before the lane decision ($L_POL / $L_DECBLK)"; fi
 POLRE=$(grep -m1 -E '^POLICY_FILES=' "$DISPATCHER" | sed -n 's/.*grep -E "(\(.*\))".*/\1/p')
 case "$POLRE" in "review-merge-policy|quality-gate") ok "the dispatcher's own policy regex is still $POLRE" ;; *) bad "the dispatcher's policy regex changed to '$POLRE' — update the lib's case list in gate_fastlane_classify_raw to match" ;; esac
 grep -q '\*review-merge-policy\*|\*quality-gate\*|\*gate-fastlane\*|\*gate-lane\*) cls="POLICY"' "$LIB" && ok "the lib's policy case list carries both of the dispatcher's alternatives plus the lane's own two" || bad "lib policy case list drifted from the dispatcher's regex"
-printf '%s\n' "$DECBLK" | grep -q 'gate_fastlane_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$POLICY_FILES"' && ok "the decision classifies the exact commit the gate merges (\$BRANCH_SHA) and honors the policy self-protection answer" || bad "decide call no longer passes BRANCH_SHA / POLICY_FILES"
+# a here-string, not `printf | grep -q`: the block outgrew one stdio buffer, and under pipefail the early-exiting `grep -q`
+# then made the writer die of SIGPIPE — this assertion went red on a dispatcher that was correct
+grep -q 'gate_fastlane_decide git_rig "origin/$DEFAULT_BRANCH" "$BRANCH_SHA" "$POLICY_FILES"' <<< "$DECBLK" && ok "the decision classifies the exact commit the gate merges (\$BRANCH_SHA) and honors the policy self-protection answer" || bad "decide call no longer passes BRANCH_SHA / POLICY_FILES"
 grep -q 'fast_lane_mechanical_checks_no_llm_review' "$DISPATCHER" && grep -q 'GATE_LANE:-normal}" = "fast"' "$DISPATCHER" && ok "a fast-lane PASS never records 'quorum_0_of_0_independent_sessions'" || bad "the PASS reason is not lane-aware"
 grep -q 'reviewers: \$reviewers, dry_run: \$dry_run, lane: \$lane' "$DISPATCHER" && ok "dispatcher_complete carries a lane field (consumers can filter fast-lane runs)" || bad "dispatcher_complete lost its lane field"
 grep -q '^lane: \$GATE_LANE$' "$DISPATCHER" && ok "the gate-run bead records its lane" || bad "run bead description has no lane: line"
+for c in no-changed-files decision-errored lib-not-loaded; do
+  grep -q "GATE_LANE_REASON_CODE=\"$c\"" "$DISPATCHER" && ok "the dispatcher sets reason code '$c' on its own fallback path" || bad "the dispatcher lost reason code '$c' (its fallback would read as 'sem reason_code')"
+done
 grep -q 'gc-gate-fs-fastlane-\*' "$DISPATCHER" && ok "the stale-worktree reaper covers the fast lane's test worktree" || bad "reaper does not match gc-gate-fs-fastlane-*"
 grep -q 'gc-gate-fl-diff-\*' "$DISPATCHER" && ok "the reaper also sweeps a leaked scan diff" || bad "reaper does not sweep gc-gate-fl-diff-*"
 # the recovery the bypass comment relies on is real: the guard's Vector B reconcile, run on the REAL function
@@ -409,13 +586,6 @@ grep -q 'gc-gate-fs-fastlane-\$\$' "$LIB" && grep -q 'gc-gate-fl-diff-XXXXXX' "$
 
 # ── 7. record: marker metadata written AND read back; jsonl event; a failed write is said out loud ────────────
 echo "── 7. gate_fastlane_record ──"
-cat > "$T/bin/bd" <<'EOF'
-#!/bin/bash
-echo "$@" >> "$FAKE_BD_LOG"
-case "$*" in *" show "*) printf '[{"metadata":{"gate.lane":"%s"}}]\n' "${FAKE_BD_LANE:-}" ;; esac
-exit 0
-EOF
-chmod +x "$T/bin/bd"
 rec_case() { # lane-written lane-read-back
   : > "$T/bd.log"; rm -f "$T/qg.jsonl"
   REC_ERR=$(PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE="$2" "$B32" -c '
@@ -430,6 +600,10 @@ grep -q 'gate.lane=fast' "$T/bd.log" && grep -q 'gate.lane_reason=' "$T/bd.log" 
 [ -z "$REC_ERR" ] && ok "read-back matched → no warning" || bad "unexpected stderr: $REC_ERR"
 J=$(tail -1 "$T/qg.jsonl" 2>/dev/null)
 [ "$(printf '%s' "$J" | jq -r '[.event,.lane,.would_have_reviewers,.counts]|join("|")' 2>/dev/null)" = "gate_lane|fast|1|doc=2 test=0 prompt=0 code=0" ] && ok "jsonl gate_lane event carries lane, counts and the reviewers a normal run would have used (for the weekly tally)" || bad "jsonl event: $J"
+[ "$(printf '%s' "$J" | jq -r '[.reason_code,.dry_run]|join("|")' 2>/dev/null)" = "|0" ] && ok "jsonl event carries reason_code (empty when the caller set none) and dry_run=0 by default" || bad "jsonl reason_code/dry_run: $J"
+: > "$T/bd.log"; rm -f "$T/qg-code.jsonl"
+PATH="$T/bin:$PATH" FAKE_BD_LOG="$T/bd.log" FAKE_BD_LANE=normal DRY_RUN=1 "$B32" -c 'set -euo pipefail; source "$1"; GATE_LANE=normal; GATE_LANE_REASON=r; GATE_LANE_REASON_CODE=code-or-prompt; GATE_LANE_COUNTS=c; GATE_LANE_FILES=f; gate_fastlane_record /city mk-1 ga-x b gascity 1 "$2"' _ "$LIB" "$T/qg-code.jsonl" >/dev/null 2>&1
+[ "$(jq -r '[.reason_code,.dry_run]|join("|")' "$T/qg-code.jsonl" 2>/dev/null)" = "code-or-prompt|1" ] && ok "jsonl event carries the reason_code the decision set, and dry_run=1 under DRY_RUN=1" || bad "jsonl event: $(cat "$T/qg-code.jsonl" 2>/dev/null)"
 rec_case fast normal
 case "$REC_ERR" in *"NOT confirmed"*) ok "a write the read-back does not confirm is reported, not assumed" ;; *) bad "unconfirmed write was silent: '$REC_ERR'" ;; esac
 [ -s "$T/qg.jsonl" ] && ok "…and the jsonl event is still written" || bad "jsonl event lost when the marker write was unconfirmed"
@@ -458,7 +632,7 @@ if cmp -s "$LIB" "$T/mut-nosymlink.lib.sh"; then bad "mutation 8b did not change
   [ "$D_LANE" = "fast" ] && ok "without the symlink guard a symlinked 'doc' WOULD be granted fast — the real guard is what holds it back" || bad "mutant without the symlink guard still read $D_LANE — the symlink assertion is not load-bearing"
 fi
 # 8c. a lib that reads 'could not scan' as clean would grant fast to a binary .md
-perl -0pe 's/\*\) _gate_fastlane_normal "content scan could not run.*?\n\s*return 0 ;;/*) ;;/s' "$LIB" > "$T/mut-scanclean.lib.sh"
+perl -0pe 's/\*\) _gate_fastlane_normal "scan-failed" "content scan could not run.*?\n\s*return 0 ;;/*) ;;/s' "$LIB" > "$T/mut-scanclean.lib.sh"
 cp "$SCAN" "$T/"
 if cmp -s "$LIB" "$T/mut-scanclean.lib.sh" || ! "$B32" -n "$T/mut-scanclean.lib.sh" 2>/dev/null; then
   # the sed mutant must still be valid bash; if my sed drifted, say so rather than pass vacuously
@@ -475,7 +649,21 @@ if cmp -s "$LIB" "$T/mut-fullpath.lib.sh"; then bad "mutation 8d did not change 
   FL_LIB_OVERRIDE="$T/mut-fullpath.lib.sh" decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin"
   [ "$D_LANE" = "normal" ] && ok "without the PATH filter the stub vault CLI IS reachable and the scenario goes red — the filter is what holds it" || bad "mutant with the full PATH still read $D_LANE — the PATH assertion is not load-bearing"
 fi
-
+# 8e. a producer whose code the tally does not bucket — the exact shape of the gate's blocking issue 2 — must turn §4e red
+sed 's/_gate_fastlane_normal "code-or-prompt"/_gate_fastlane_normal "made-up-code"/' "$LIB" > "$T/mut-badcode.lib.sh"
+cp "$SCAN" "$T/"
+if cmp -s "$LIB" "$T/mut-badcode.lib.sh"; then bad "mutation 8e did not change the lib (sed pattern drifted)"; else
+  e2e_probe "$(head_of s-mdpy)" "" FL_LIB_OVERRIDE="$T/mut-badcode.lib.sh"
+  if e2e_ok code-or-prompt; then bad "a lib emitting a code the tally does not know still passed §4e — the end-to-end check is blind"
+  else ok "a lib emitting a code the tally does not bucket turns §4e RED (code='$D_CODE' → bucket '$E_BUCKET')"; fi
+fi
+# 8f. a producer that swaps two codes (code diffs reported as policy) must turn §4e red too — a bucket that EXISTS is not enough
+sed 's/_gate_fastlane_normal "code-or-prompt"/_gate_fastlane_normal "policy"/' "$LIB" > "$T/mut-swapcode.lib.sh"
+if cmp -s "$LIB" "$T/mut-swapcode.lib.sh"; then bad "mutation 8f did not change the lib (sed pattern drifted)"; else
+  e2e_probe "$(head_of s-mdpy)" "" FL_LIB_OVERRIDE="$T/mut-swapcode.lib.sh"
+  if e2e_ok code-or-prompt; then bad "a lib reporting code diffs as 'policy' still passed §4e"
+  else ok "a lib that reports code diffs as the gate's own policy turns §4e RED (the cited misbucketing)"; fi
+fi
 echo
 echo "== gate-fastlane.selftest: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

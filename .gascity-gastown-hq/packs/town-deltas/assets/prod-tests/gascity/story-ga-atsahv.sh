@@ -49,7 +49,7 @@ log "  syntax OK ✓"
 
 # ── 2. the wiring is in the DEPLOYED dispatcher ────────────────────────────────────────────────────────────
 log "Checking the dispatcher wiring..."
-for s in fastlane-lib-load fastlane-decide fastlane-bypass; do
+for s in fastlane-lib-load fastlane-decide fastlane-record fastlane-bypass; do
   grep -q "SELFTEST-EXTRACT $s: BEGIN" "$DISPATCHER" || fail "dispatcher block '$s' missing"
 done
 grep -q 'fast_lane_mechanical_checks_no_llm_review' "$DISPATCHER" || fail "a fast-lane PASS would still be recorded as a reviewer quorum"

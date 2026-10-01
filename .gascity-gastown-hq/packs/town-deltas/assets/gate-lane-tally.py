@@ -2,9 +2,10 @@
 """gate-lane-tally.py — ga-atsahv item 4: how many gate rounds the DOC/TEST fast lane saved.
 
 Reads .gc/quality-gate.jsonl (read-only). Two event kinds matter:
-  gate_lane            one per lane decision (lane fast|normal, reason, counts, the files that decided,
-                       would_have_reviewers = what a normal run of that diff would have spent) — written by
-                       gate-fastlane.lib.sh at Step 5
+  gate_lane            one per lane decision (lane fast|normal, reason, reason_code, counts, the files that
+                       decided, would_have_reviewers = what a normal run of that diff would have spent) —
+                       written by gate-fastlane.lib.sh at Step 5 (or by the dispatcher itself when that lib is
+                       not loaded). A DRY_RUN=1 sweep writes the event too, with dry_run=1; it is not counted.
   dispatcher_complete  one per finished run; carries `lane` and the PASS/FAIL result
 
 Headline numbers (window = last --days):
@@ -31,23 +32,39 @@ import sys
 
 DEFAULT_CITY = os.environ.get("GC_CITY_PATH") or "/Users/athos/gt/.gascity-gastown-hq"
 
-# (substring of the reason, bucket, bounced_by_a_mechanical_check)
-_REASONS = [
-    ("production code or prompt/doctrine", "tem arquivo de código ou prompt/doutrina", False),
-    ("content scan found", "só doc/teste, barrado pelo scan (dado pessoal/segredo)", True),
-    ("content scan could not run", "só doc/teste, scan não rodou", True),
-    ("fast-lane test check did not pass", "só doc/teste, teste novo não passou/não rodou", True),
-    ("cannot run", "só doc/teste, teste sem runner (js/ts/go...)", True),
-    ("unclassifiable diff", "diff inclassificável (symlink, caminho com aspas, vazio...)", False),
-    ("gate's own policy", "mexe na política do próprio gate", False),
-    ("disabled", "fast-lane desligado", False),
-    ("lib not loaded", "lib da fast-lane não carregou", False),
-    ("decision errored", "decisão da fast-lane deu erro", False),
-]
+# reason_code -> (bucket, bounced_by_a_mechanical_check). The CODES are the contract with the producers
+# (gate-fastlane.lib.sh sets GATE_LANE_REASON_CODE on every decision; the dispatcher sets the last three itself).
+# This used to match a substring of the free-text reason — and drifted: the lib's sentence changed, the needle
+# never matched again, and every code/prompt diff (~96% of decisions) was reported as "touches the gate's own
+# policy". gate-fastlane.selftest.sh runs the REAL decision and fails when a code the producer can emit is not here.
+REASON_CODES = {
+    "code-or-prompt":   ("tem arquivo de código ou prompt/doutrina", False),
+    "scan-findings":    ("só doc/teste, barrado pelo scan (dado pessoal/segredo)", True),
+    "scan-failed":      ("só doc/teste, scan não rodou", True),
+    "test-failed":      ("só doc/teste, teste novo não passou/não rodou", True),
+    "test-unrunnable":  ("só doc/teste, teste sem runner (js/ts/go...)", True),
+    "unclassifiable":   ("diff inclassificável (symlink, caminho com aspas, vazio...)", False),
+    "diff-raw-failed":  ("git não conseguiu listar o diff", False),
+    "policy":           ("mexe na política do próprio gate", False),
+    "disabled":         ("fast-lane desligado (variável de ambiente)", False),
+    "flag-file":        ("fast-lane desligado (arquivo .gc/gate-fastlane.off)", False),
+    "no-input":         ("fast-lane sem runner/base/head para decidir", False),
+    "no-changed-files": ("lista de arquivos do dispatcher vazia (erro de git ou diff vazio)", False),
+    "decision-errored": ("decisão da fast-lane deu erro", False),
+    "lib-not-loaded":   ("lib da fast-lane não carregou", False),
+    "not-evaluated":    ("fast-lane não chegou a avaliar", False),
+}
+_NO_CODE = "sem reason_code no evento"
+_UNKNOWN_CODE = "outro (reason_code desconhecido)"
 
 
 def _ts(s):
     return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def _is_dry(ev):
+    """True only when the event says it came from a DRY_RUN=1 sweep. A missing field is NOT a dry run."""
+    return str(ev.get("dry_run", "0")).strip().lower() in ("1", "true")
 
 
 def tally(log_path, days, now):
@@ -75,9 +92,11 @@ def tally(log_path, days, now):
                 continue
             if t < since:
                 continue
+            if _is_dry(ev):   # a DRY_RUN=1 sweep merges nothing and must not move any number
+                continue
             if ev.get("event") == "gate_lane":
                 last_decision[ev.get("marker") or ev.get("branch") or "?"] = ev
-            elif ev.get("event") == "dispatcher_complete" and ev.get("lane") == "fast" and str(ev.get("dry_run")) in ("0", "false", "False", ""):
+            elif ev.get("event") == "dispatcher_complete" and ev.get("lane") == "fast":
                 completes.append(ev)
 
     fast = sum(1 for e in last_decision.values() if e.get("lane") == "fast")
@@ -86,12 +105,13 @@ def tally(log_path, days, now):
     for e in last_decision.values():
         if e.get("lane") == "fast":
             continue
-        reason = e.get("reason") or ""
-        name, mech = "outro", False
-        for needle, b, m in _REASONS:
-            if needle in reason:
-                name, mech = b, m
-                break
+        code = e.get("reason_code") or ""
+        if not code:
+            name, mech = _NO_CODE, False
+        elif code in REASON_CODES:
+            name, mech = REASON_CODES[code]
+        else:
+            name, mech = _UNKNOWN_CODE, False
         buckets[name] = buckets.get(name, 0) + 1
         bounced += 1 if mech else 0
 
@@ -145,7 +165,12 @@ def main(argv):
     ap.add_argument("--weekly", action="store_true", help="append the tally to --out and send one notify line")
     ap.add_argument("--out", default=os.path.join(DEFAULT_CITY, ".gc/gate-lane-tally.jsonl"))
     ap.add_argument("--no-notify", action="store_true")
+    ap.add_argument("--list-codes", action="store_true", help="print the reason codes this tally knows, then exit")
     a = ap.parse_args(argv)
+    if a.list_codes:
+        for code, (label, mech) in REASON_CODES.items():
+            print(f"{code}\t{label}\t{1 if mech else 0}")
+        return 0
     now = _ts(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
     try:
         r = tally(a.log, a.days, now)
@@ -167,7 +192,7 @@ def main(argv):
                 line = (f"{r['fast']}/{r['decisions']} diffs na fast-lane, {r['reviewer_runs_saved']} rodada(s) de revisor poupada(s) "
                         f"em {r['days']}d ({r['doc_test_only_bounced_by_check']} só-doc/teste barrados por checagem)")
                 try:
-                    subprocess.run(["notify", "-k", "gate-lane-weekly", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
+                    subprocess.run(["notify", "-k", "info", "-t", "Gate fast-lane (semana)", "-p", "2", line], timeout=30, check=False)
                 except Exception as e:  # a failed notification must not fail the tally
                     print(f"gate-lane-tally: notify failed: {e!r}", file=sys.stderr)
     return 0
