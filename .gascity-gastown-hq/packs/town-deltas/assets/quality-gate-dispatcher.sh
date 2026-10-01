@@ -573,6 +573,19 @@ case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
 case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
 case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
 case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
+# ── ga-uywvsc: DYNAMIC ceiling for GATE_MAX_REVIEWERS ─────────────────────────
+# GATE_MAX_REVIEWERS above is the FIXED ceiling (and what the dynamic one starts from and
+# falls back to). When switched on (pool_ceiling_enabled) the headroom step (Step 0b-1) recomputes it
+# once per step from the queued markers + machine slack — pool-ceiling.sh has the rules and
+# the kill switch. The lib is OPTIONAL: missing/unloadable -> _POOL_CEILING_OK=0 and the
+# fixed ceiling stays in force (the gate is the town's critical path and must never die for
+# lack of an optimisation). POOL_CEILING_LIB is a test seam.
+_POOL_CEILING_OK=0
+_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pool-ceiling.sh}"
+if [ -r "$_POOL_CEILING_LIB" ]; then
+  # shellcheck disable=SC1090
+  if . "$_POOL_CEILING_LIB" 2>/dev/null && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; fi
+fi
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
 case "$GATE_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) GATE_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
@@ -11984,6 +11997,29 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   #     created on demand) — these two are what make it one; see § 1b.
   HR_MEM_PRESSURE=$(gate_mem_pressure_level)
   HR_DISK_FREE=$(gate_disk_free_mb)
+  # 2d. ga-uywvsc: dynamic ceiling. Only when switched on — pool_ceiling_enabled (inert otherwise: the
+  #     fixed GATE_MAX_REVIEWERS stays). Sized from the queued markers ($COUNT — this step is
+  #     only reached with markers waiting: the gate ceiling falls only on a hard squeeze and
+  #     climbs back when saturated + slack) and the live
+  #     reviewers. The Dolt class reuses THIS step's own readings (no second probe); an
+  #     all-empty reading is "unknown", never "ok". gate_headroom_decision below keeps every
+  #     one of its own brakes — this only moves the "calm" ceiling it scales up to.
+  #     The re-exec of a multi-admit round (ga-309v3) must see the ORIGINAL fixed value, not
+  #     the previous round's dynamic one: kept in GATE_MAX_REVIEWERS_FIXED and exported.
+  if [ "${_POOL_CEILING_OK:-0}" = "1" ] && pool_ceiling_enabled; then
+    GATE_MAX_REVIEWERS_FIXED="${GATE_MAX_REVIEWERS_FIXED:-$GATE_MAX_REVIEWERS}"; export GATE_MAX_REVIEWERS_FIXED
+    _pc_dolt=$(pool_ceiling_dolt_class "${HR_CPU:-}" "${HR_LAT:-}" "$GATE_DOLT_CPU_HOT" "$GATE_DOLT_LATENCY_HOT_MS")
+    # gate_quota_limited is fail-open (an erroring checker reads as ok, there is no "unknown"):
+    # harmless here, because a limited window is deferred by gate_headroom_decision itself.
+    _pc_quota=ok; [ "$HR_QLIM" = "1" ] && _pc_quota=limited
+    # The ceiling never goes under the reviewers of a single run — unless the engine's own cap is
+    # lower than that (the step bounds max by agents/gate-reviewer/agent.toml): then no run could
+    # be spawned in full anyway, and the "motor N" in the log line shows why.
+    pool_ceiling_bounds gate-reviewer "$GATE_REVIEWERS_PER_RUN"
+    POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step gate-reviewer "$GATE_MAX_REVIEWERS_FIXED" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$LIVE_REVIEWERS" "${COUNT:-}" "$_pc_dolt" "$_pc_quota"
+    [ -z "$POOL_CEILING_LOGLINE" ] || log "$POOL_CEILING_LOGLINE"
+    [ -z "$POOL_CEILING_RESULT" ] || GATE_MAX_REVIEWERS="$POOL_CEILING_RESULT"
+  fi
   # 3. Pure dynamic-concurrency decision.
   HR_DECISION=$(gate_headroom_decision \
     "${HR_CPU:-}" "${HR_LAT:-}" "$HR_QLIM" "$LIVE_REVIEWERS" \

@@ -155,6 +155,23 @@ case "$GC_VARIABLE_SESSION_MAX" in ''|*[!0-9]*) GC_VARIABLE_SESSION_MAX=6 ;; esa
 # combined wa-worker+ps-worker+gate-reviewer count. Never set in prod.
 GC_VARIABLE_SESSION_COUNT_OVERRIDE="${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}"
 
+# ── ga-uywvsc: DYNAMIC per-pool ceiling (wa-worker / ps-worker) ───────────────
+# PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX above are the FIXED caps (and the value
+# the dynamic ceiling starts from and falls back to). When switched on (pool_ceiling_enabled:
+# the file .gc/pool-ceiling.on, or POOL_CEILING_DYNAMIC=1) the sweep recomputes both once, from
+# the ready queue + machine slack, one step per sweep inside [min,max] — max never above the
+# engine's own agent.toml cap, which the controller enforces on its own (ga-o3o09z) — see
+# pool-ceiling.sh for the rules and the kill switch (.gc/pool-ceiling.off). The lib is
+# OPTIONAL: if it is missing or fails to load, _POOL_CEILING_OK stays 0 and the fixed
+# caps stay in force (a dispatcher must never die for lack of an optimisation).
+# POOL_CEILING_LIB is a test seam. GC_VARIABLE_SESSION_MAX stays a fixed outer bound.
+_POOL_CEILING_OK=0
+_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pool-ceiling.sh}"
+if [ -r "$_POOL_CEILING_LIB" ]; then
+  # shellcheck disable=SC1090
+  if . "$_POOL_CEILING_LIB" 2>/dev/null && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; fi
+fi
+
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
 
@@ -5137,6 +5154,48 @@ _ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
   | jq -r '[.sessions[]? | select(.closed != true) | select(.state == "asleep")
            | (.session_name, .name, .alias, .id, .agent_name)]
           | map(select(. != null and . != "")) | unique | .[]' 2>/dev/null || echo "")
+
+# ── ga-uywvsc: dynamic per-pool ceiling — decided ONCE per sweep, right here ───
+# After every whole-sweep exit (quota / RAM / quiet-hours / cross-stage: a paused sweep
+# opens nothing, so there is nothing to size) and after the roster snapshot above, but
+# BEFORE the first use of the caps (the pool top-up and dispatch_one() both read
+# PILOT_WA_WORKER_MAX / PILOT_PS_WORKER_MAX at call time, so reassigning them here is
+# the whole wiring). Inputs, each with a third "unreadable" state that never raises:
+#   queue — the Pilot's own dispatchable emit (_pilot_emit_dispatchable, already computed
+#           at sweep start; stale/corrupt -> unreadable, not 0), counted per rig store;
+#   live  — this sweep's roster snapshot (active+creating+start-pending, same definition
+#           as _pilot_live_session_count); an unreadable roster -> unreadable;
+#   dolt  — the sweep-start probe (an UNREADABLE probe is "unknown", a measured hot one is
+#           "hot": the two must not collapse, DOLT_SAT_REASON tells them apart);
+#   quota — "ok": a limited window already exited this sweep above. The checker is fail-open
+#           (an erroring checker also reads as ok); that cannot open anything, because a limited
+#           window pauses every spawn whatever the ceiling says.
+# Inert unless switched on (pool_ceiling_enabled: .gc/pool-ceiling.on or POOL_CEILING_DYNAMIC=1);
+# DRY_RUN=1 computes but persists nothing.
+# SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: BEGIN
+_pilot_apply_dynamic_pool_ceilings() {
+  [ "${_POOL_CEILING_OK:-0}" = "1" ] || return 0
+  pool_ceiling_enabled || return 0
+  local _pc_dolt=ok _pc_live _pc_queue
+  if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then
+    if [ "${DOLT_SAT_REASON:-}" = "unreadable" ]; then _pc_dolt=unknown; else _pc_dolt=hot; fi
+  fi
+  _pc_live=$(printf '%s' "${_SESSIONS_JSON:-}" | jq -r 'if (.sessions | type) == "array" then ([.sessions[] | select((.template // "") == "wa-worker") | select(.state == "active" or .state == "creating" or .state == "start-pending")] | length) else empty end' 2>/dev/null) || _pc_live=""
+  _pc_queue=$(pool_ceiling_queue_from_dispatchable "$PILOT_DISPATCHABLE_FILE" whatsapp_automation)
+  pool_ceiling_bounds wa-worker
+  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step wa-worker "${PILOT_WA_WORKER_MAX:-4}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" ok
+  [ -z "$POOL_CEILING_LOGLINE" ] || log "  $POOL_CEILING_LOGLINE"
+  [ -z "$POOL_CEILING_RESULT" ] || PILOT_WA_WORKER_MAX="$POOL_CEILING_RESULT"
+  _pc_live=$(printf '%s' "${_SESSIONS_JSON:-}" | jq -r 'if (.sessions | type) == "array" then ([.sessions[] | select((.template // "") == "ps-worker") | select(.state == "active" or .state == "creating" or .state == "start-pending")] | length) else empty end' 2>/dev/null) || _pc_live=""
+  _pc_queue=$(pool_ceiling_queue_from_dispatchable "$PILOT_DISPATCHABLE_FILE" property_scrapers)
+  pool_ceiling_bounds ps-worker
+  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step ps-worker "${PILOT_PS_WORKER_MAX:-2}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" ok
+  [ -z "$POOL_CEILING_LOGLINE" ] || log "  $POOL_CEILING_LOGLINE"
+  [ -z "$POOL_CEILING_RESULT" ] || PILOT_PS_WORKER_MAX="$POOL_CEILING_RESULT"
+  return 0
+}
+# SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END
+_pilot_apply_dynamic_pool_ceilings
 
 # _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
 _session_is_live() {
