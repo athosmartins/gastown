@@ -8,7 +8,7 @@
 # TWO STAGES SHARE THIS LIBRARY. The arm, the roster, the level-from-facts rule and the plan-structure check live here and are
 # the same wherever a bead is first seen:
 #   * builder-start  — e9-plan.sh (WIRED: the Pilot's dispatch comment points the builder at it). It reaches every build, which
-#                      is the reason it is the stage that carries the experiment: only ~4% of built beads ever pass the refiner
+#                      is the reason it is the stage that carries the experiment: at most ~5% of built beads could pass the refiner
 #                      (docs/e9-planner-complexity.md section 1).
 #   * refiner        — `block` / `finalize` / `check` / `plancheck` below, for the autonomous refiner of stories. NOT wired into
 #                      auto-refino-dispatcher.sh in this slice; kept, tested, and inert until a follow-up connects it. A bead that

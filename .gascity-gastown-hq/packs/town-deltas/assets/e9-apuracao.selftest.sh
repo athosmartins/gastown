@@ -259,6 +259,19 @@ mt["beads"]["ga-ghost2"] = meter_rec(5.0, False)
 json.dump(mt, open(mp, "w"))
 rc, out, err = run(rp, mp)
 ok("meter beads that were never on the roster are COUNTED as fora do roster (2) and excluded") if "fora do roster (não receberam a dica; não entram): 2" in out else bad("ghosts not counted:\n" + out[:700])
+# a roster bead the meter HAS but the gate has not ruled on (first_gate missing, or null) is out of the comparison and COUNTED per arm —
+# before this was counted nowhere: the report said "N with a verdict, 0 not yet measured" while those beads simply vanished, and if
+# beads stalled more in one arm the comparison would have dropped them without a trace
+mt = json.load(open(mp))
+for b in ON_IDS[:3]:
+    mt["beads"][b].pop("first_gate", None)
+mt["beads"][OFF_IDS[0]]["first_gate"] = None
+json.dump(mt, open(mp, "w"))
+rc, out, err = run(rp, mp)
+ok("meter beads with no gate verdict yet are COUNTED per arm (on 3 / off 1), not silently dropped") \
+    if "SEM veredito do gate ainda (fora da conta; contadas): on 3 / off 1" in out else bad("no-verdict beads not counted:\n" + out[:900])
+ok("... and they are out of the comparison (the verdict population shrank by 4)") \
+    if "beads do medidor com veredito do gate: 396" in out else bad("no-verdict beads leaked into the population:\n" + out[:900])
 # on beads with NO plan_run row at all = nothing spent
 rp, mp = scenario(30, 0.9, 1.0, 55, 55, tag="norow")
 rows = [json.loads(l) for l in open(rp)]

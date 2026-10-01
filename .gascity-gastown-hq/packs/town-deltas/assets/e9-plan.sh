@@ -2,8 +2,9 @@
 # e9-plan.sh — ga-798p6w (E9 of the P0 ga-ufskhy): the BUILDER-START planner, as an A/B.
 #
 # WHY HERE AND NOT IN THE REFINER. Athos's idea (01/10) was "the refiner hands the builder a plan of HOW". Measured the same day
-# (docs/e9-planner-complexity.md §1): of the 134 beads that passed the gate in the last 7 days only 5 (3.7%) went through refino — 97
-# are bugs and 25 tasks that auto-refino never takes (it takes feature/story only). A planner that lives in the refiner plans ~4% of
+# (docs/e9-planner-complexity.md §1): of the 170 beads that passed the gate in the last 7 days (HQ + WA, measured 01/10) only 8 (4.7%)
+# were even eligible for refino — 117 are bugs, 37 tasks and 8 chores, which auto-refino never takes (it takes feature/story only).
+# A planner that lives in the refiner plans ~5% of
 # what gets built; it cannot move "tokens per bead DONE" and it cannot reach a sample. The one point every build passes is the START
 # OF THE BUILD, so that is where the plan is made. Same hypothesis (a plan that names files, functions, edge cases and the failing
 # test cuts the builder's exploration turns and the third-state rejections), put where the beads are. e9-arms.sh keeps the

@@ -451,15 +451,20 @@ def main():
         why.append("sem --meter")
     else:
         pop, off_roster = {}, 0
+        no_verdict = {"on": 0, "off": 0}
         for b, rec in meter.items():
             if b not in assigns:
                 off_roster += 1
             elif b in arm and rec.get("first_gate") in ("PASS", "FAIL"):
                 pop[b] = rec
+            elif b in arm:
+                no_verdict[arm[b]] += 1   # measured, but the gate has not ruled (key missing or null): out of the comparison, never out of the count
         not_in_meter = sum(1 for b in arm if b not in meter)
         P("\n3. POPULAÇÃO COM DESFECHO (intenção de tratar)")
         P(f"   beads do medidor com veredito do gate: {len(pop)}  |  fora do roster (não receberam a dica; não entram): {off_roster}"
           f"  |  no roster sem medição ainda: {not_in_meter}")
+        P(f"   no medidor mas SEM veredito do gate ainda (fora da conta; contadas): on {no_verdict['on']} / off {no_verdict['off']}")
+        out["no_gate_verdict"] = no_verdict
         cost_rows = {"on": [], "off": []}
         unknown = {"on": 0, "off": 0}
         fp = {"on": [0, 0], "off": [0, 0]}
