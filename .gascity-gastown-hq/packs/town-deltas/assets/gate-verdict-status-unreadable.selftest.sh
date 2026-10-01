@@ -483,6 +483,14 @@ else
         VB1_JSON='"'"'{"status":"open","metadata":{"gc.session_name":"sess-1"}}'"'"'
         PC_SESS_JSON_FIXTURE='"'"'[{"session_name":"sess-1","state":"active","closed":false}]'"'"'
       fi
+      # ga-8wec8c: the fallback read must never be WORSE than the old
+      # assignee-only read — a readable .assignee beside a non-object
+      # .metadata must still be captured (a jq error here would collapse to
+      # an empty capture, i.e. a false dead-reviewer verdict).
+      if [ "$SCENARIO" = "bad_metadata_alive" ]; then
+        VB1_JSON='"'"'{"status":"open","assignee":"sess-1","metadata":"junk"}'"'"'
+        PC_SESS_JSON_FIXTURE='"'"'[{"session_name":"sess-1","state":"active","closed":false}]'"'"'
+      fi
       VERDICT_LIST='"'"'[{"id":"pc-vb-1"},{"id":"pc-vb-2"}]'"'"'
       # A call-COUNT variable does not work here: bd() is invoked via
       # `$(...)` command substitution, which forks a subshell, so any
@@ -559,6 +567,14 @@ else
     *"SESSION_IDS=sess-1 sess-2"*) ok "SESSION_IDS captured the reviewer via metadata.gc.session_name fallback (sess-1 sess-2)" ;;
     *) bad "SESSION_IDS did not capture the session_name fallback identity — got: $RES7_NAME" ;;
   esac
+
+  OUT7_BADMD="$(run_rehydrate_classify bad_metadata_alive 2>&1)"; RC7_BADMD=$?
+  RES7_BADMD="$(printf '%s\n' "$OUT7_BADMD" | grep '^RESULT|' || true)"
+  if [ "$RC7_BADMD" -eq 0 ] && printf '%s' "$RES7_BADMD" | grep "PC_ALL_PENDING_DEAD=0" >/dev/null && printf '%s' "$RES7_BADMD" | grep "SESSION_IDS=sess-1 sess-2" >/dev/null; then
+    ok "pc-vb-1 assignee=sess-1 beside a NON-OBJECT metadata: still captured and classified alive (the fallback read is never worse than the old read)"
+  else
+    bad "assignee + non-object metadata: capture collapsed to empty / reviewer read dead (rc=$RC7_BADMD) — the new metadata read broke the assignee read it was meant to back up: $OUT7_BADMD"
+  fi
 fi
 
 echo ""

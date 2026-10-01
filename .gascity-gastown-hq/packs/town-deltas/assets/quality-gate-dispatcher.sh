@@ -10321,8 +10321,11 @@ gate_collect_verdicts() {
       # rescue skip that bead, so the run sat 0/1 to the full timeout and the
       # dead-reviewer requeue discarded a real verdict. Both empty -> VB_REVIEWER_ID stays ""
       # and the rescue stays inert exactly as before: no identity, nothing to
-      # confirm dead. An empty string counts as absent (select != "").
-      VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""')
+      # confirm dead. An empty string counts as absent (select != ""). The `?` on
+      # the metadata read keeps a malformed (non-object) metadata from raising a
+      # jq error that, under set -e, would abort the whole collect instead of just
+      # falling back to .assignee.
+      VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]?] | map(select(. != null and . != "")) | first) // ""')
       if [ -n "$VB_REVIEWER_ID" ]; then
         VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_REVIEWER_ID" --lines 1 2>&1 >/dev/null || true)
         if [ "$(session_peek_reports_dead "$VB_PEEK_ERR")" = "1" ]; then
@@ -10857,9 +10860,10 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         # empty-reads-as-dead trap (reviewer_session_alive "" answers 0): fall
         # back to metadata.gc.session_name, as the ga-7lz1 rescue in
         # gate_collect_verdicts does, so a live reviewer whose assignee write
-        # was lost is not requeued as dead. Both empty stays "" (unchanged).
+        # was lost is not requeued as dead. Both empty stays "" (unchanged). The `?`
+        # keeps a non-object metadata from erroring the read into an empty capture.
         if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
-          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]?] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
         else
           PC_SID="__UNKNOWN__"
         fi

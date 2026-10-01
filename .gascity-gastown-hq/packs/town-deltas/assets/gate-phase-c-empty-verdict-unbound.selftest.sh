@@ -206,9 +206,10 @@ loop = '''      SESSION_IDS=()
         # empty-reads-as-dead trap (reviewer_session_alive "" answers 0): fall
         # back to metadata.gc.session_name, as the ga-7lz1 rescue in
         # gate_collect_verdicts does, so a live reviewer whose assignee write
-        # was lost is not requeued as dead. Both empty stays "" (unchanged).
+        # was lost is not requeued as dead. Both empty stays "" (unchanged). The `?`
+        # keeps a non-object metadata from erroring the read into an empty capture.
         if PC_SID_JSON=$(bd -C "$GC_CITY" show "$PC_VBID" --json 2>/dev/null); then
-          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
+          PC_SID=$(printf '%s' "$PC_SID_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]?] | map(select(. != null and . != "")) | first) // ""' 2>/dev/null || true)
         else
           PC_SID="__UNKNOWN__"
         fi

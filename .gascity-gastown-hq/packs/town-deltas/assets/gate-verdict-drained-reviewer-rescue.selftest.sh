@@ -274,6 +274,7 @@ rm -f "$MUT"
 #   vb-name-alive    open verdict:PASS  assignee null,   session_name=alive-n2 (ALIVE)   -> guard holds: not rescued
 #   vb-no-identity   open verdict:PASS  assignee "",     session_name ""                  -> inert: never peeked, never closed
 #   vb-both-differ   open verdict:PASS  assignee=dead-n4a, session_name=alive-n4b          -> assignee wins: dead-n4a peeked, alive-n4b NEVER
+#   vb-bad-metadata  open verdict:PASS  assignee=dead-n5,  metadata is a STRING ("junk")   -> the fallback read must not blow up: assignee still found, rescued
 run_collect_name_fallback() {
   local file="$1" bd_log="$2" peek_log="$3"
   local fn_collect fn_peek_dead fn_identity_link
@@ -294,9 +295,10 @@ run_collect_name_fallback() {
     VBN2='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:2","verdict:PASS"],"assignee":null,"metadata":{"gc.session_name":"alive-n2"}}'"'"'
     VBN3='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:3","verdict:PASS"],"assignee":"","metadata":{"gc.session_name":""}}'"'"'
     VBN4='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:4","verdict:PASS"],"assignee":"dead-n4a","metadata":{"gc.session_name":"alive-n4b"}}'"'"'
+    VBN5='"'"'{"status":"open","labels":["type:quality-gate-verdict","reviewer-index:5","verdict:PASS"],"assignee":"dead-n5","metadata":"junk"}'"'"'
     VBN1_COMMENTS='"'"'[{"text":"VERDICT: FAIL — stale lock on retry"}]'"'"'
 
-    VERDICT_BEAD_IDS=(vb-name-dead vb-name-alive vb-no-identity vb-both-differ)
+    VERDICT_BEAD_IDS=(vb-name-dead vb-name-alive vb-no-identity vb-both-differ vb-bad-metadata)
 
     bd() {
       case " $* " in
@@ -304,6 +306,7 @@ run_collect_name_fallback() {
         *" show vb-name-alive "*)   echo "$VBN2"; return 0 ;;
         *" show vb-no-identity "*)  echo "$VBN3"; return 0 ;;
         *" show vb-both-differ "*)  echo "$VBN4"; return 0 ;;
+        *" show vb-bad-metadata "*) echo "$VBN5"; return 0 ;;
         *" comments vb-name-dead "*) echo "$VBN1_COMMENTS"; return 0 ;;
         *" comments "*)             echo "[]"; return 0 ;;
         *" close "*)                echo "$*" >> "$BD_LOG"; return 0 ;;
@@ -350,9 +353,9 @@ if [ "$RC8" -ne 0 ] || [ -z "$RES8" ]; then
 else
   VR8=$(printf '%s' "$RES8" | sed -n 's/.*VERDICTS_RECEIVED=\([0-9]*\).*/\1/p')
   AF8=$(printf '%s' "$RES8" | sed -n 's/.*ANY_FAIL=\([0-9]*\).*/\1/p')
-  [ "$VR8" = "2" ] \
-    && ok "VERDICTS_RECEIVED=2 (name-only drained + assignee-wins drained) — got $VR8" \
-    || bad "VERDICTS_RECEIVED expected 2, got '$VR8' — a drained reviewer known only by metadata.gc.session_name was not rescued: $RES8"
+  [ "$VR8" = "3" ] \
+    && ok "VERDICTS_RECEIVED=3 (name-only drained + assignee-wins drained + bad-metadata drained) — got $VR8" \
+    || bad "VERDICTS_RECEIVED expected 3, got '$VR8' — a drained reviewer known only by metadata.gc.session_name was not rescued: $RES8"
   [ "$AF8" = "1" ] \
     && ok "ANY_FAIL=1 (the name-only rescued FAIL still blocks the merge)" \
     || bad "ANY_FAIL expected 1, got '$AF8' — $RES8"
@@ -366,6 +369,9 @@ else
   grep -q "close vb-both-differ" "$BD_LOG8" \
     && ok "vb-both-differ was closed (assignee dead-n4a is the identity that is peeked)" \
     || bad "vb-both-differ was NOT closed — bd_log: $(tr '\n' ';' < "$BD_LOG8")"
+  grep -q "close vb-bad-metadata" "$BD_LOG8" \
+    && ok "vb-bad-metadata (assignee set, metadata not an object) was closed — the fallback read cannot turn a readable assignee into 'no identity'" \
+    || bad "vb-bad-metadata was NOT closed — a non-object metadata made the identity read fail and collapse to empty (inert): bd_log: $(tr '\n' ';' < "$BD_LOG8")"
   if grep -q "close vb-name-alive" "$BD_LOG8"; then
     bad "vb-name-alive was closed even though its reviewer (known only by session_name) is ALIVE — the mid-write guard must hold on the fallback channel too"
   else
@@ -404,7 +410,7 @@ with open(path) as f:
 # Anchored on the rescue site's assignment (not the jq alone: the identical
 # expression also lives in Phase C's SESSION_IDS capture, which this mutant
 # must leave alone).
-anchor = '''VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]] | map(select(. != null and . != "")) | first) // ""')'''
+anchor = '''VB_REVIEWER_ID=$(echo "$VB_JSON" | jq -r 'if type=="array" then .[0] else . end | ([.assignee, .metadata["gc.session_name"]?] | map(select(. != null and . != "")) | first) // ""')'''
 n = c.count(anchor)
 if n != 1:
     print("ANCHOR_NOT_UNIQUE count=%d" % n, file=sys.stderr)
@@ -423,8 +429,8 @@ else
   BD_LOG_M8="$(mktemp)"; PEEK_LOG_M8="$(mktemp)"
   OUT_M8="$(run_collect_name_fallback "$MUT8" "$BD_LOG_M8" "$PEEK_LOG_M8" 2>&1)"
   VR_M8=$(printf '%s' "$OUT_M8" | grep '^RESULT|' | sed -n 's/.*VERDICTS_RECEIVED=\([0-9]*\).*/\1/p')
-  if [ "$VR_M8" = "1" ] && ! grep -q "close vb-name-dead" "$BD_LOG_M8"; then
-    ok "mutant (assignee-only identity): the name-only drained reviewer is NOT rescued (VERDICTS_RECEIVED=1) — proves part 8 catches ga-8wec8c"
+  if [ "$VR_M8" = "2" ] && ! grep -q "close vb-name-dead" "$BD_LOG_M8"; then
+    ok "mutant (assignee-only identity): the name-only drained reviewer is NOT rescued (VERDICTS_RECEIVED=2: only the beads with a real .assignee) — proves part 8 catches ga-8wec8c"
   else
     bad "mutant (assignee-only) did NOT reproduce ga-8wec8c — part 8 may be vacuous. VERDICTS_RECEIVED=$VR_M8, bd_log: $(tr '\n' ';' < "$BD_LOG_M8")"
   fi
