@@ -99,6 +99,18 @@ reinicia no fixo). Para recomeçar do fixo, apague `$GC_CITY/.gc/pool-ceiling/<p
 - **Gate:** fila = markers na fila (`$COUNT`); vivos = `LIVE_REVIEWERS`. Esse passo só roda com
   marker esperando; o teto do gate cai só por squeeze e volta quando há fila + saturação + folga.
 
+## Limites conhecidos (a registrar no bead que levantar o teto do motor)
+
+Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele subir.
+
+- **Saturação do gate em unidades de run.** O gate chama o pool de "saturado" quando `vivos >= teto`, mas
+  `gate_headroom_decision` admite em unidades de `GATE_REVIEWERS_PER_RUN` (`em-voo + por-run <= teto`). Com `por-run > 1` e um teto que não
+  é múltiplo dele, o pool pode ficar em `vivos < teto` e nunca subir. Com `por-run = 1` o critério é exato; com a faixa atual 2..3 o efeito é desprezível.
+- **Dolt do gate sem faixa "morna".** `pool_ceiling_dolt_class` só distingue ok/hot (cpu > 180 ou latência > 2500 ms); o freio do próprio gate já
+  limita a 1 run na faixa 101–180% de cpu, e o teto lê essa faixa como `ok` (grow). Inofensivo — o freio do gate continua valendo — mas o teto pode
+  subir com o Dolt morno.
+- **`.off` e a biblioteca ausente.** Com `.on`, `.off` e a lib ausente, a linha "LIGADO … vale o teto FIXO" ainda aparece; a conclusão (teto fixo) está certa.
+
 ## Fora do escopo (próximo passo, outro bead)
 
 - `gastown.dog` e `refino-gate-reviewer`: não passam por estes dois dispatchers; o teto deles é
@@ -119,7 +131,7 @@ reinicia no fixo). Para recomeçar do fixo, apague `$GC_CITY/.gc/pool-ceiling/<p
 
 ## Verificação
 
-`bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (286 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
+`bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (292 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
 e sem a fiação nos dois dispatchers; inclui a função de cola REAL do Pilot e o bloco REAL do teto do gate
 (duas passadas, a 2ª emulando o re-exec do multi-admit ga-309v3, sob `set -euo pipefail`) extraídos dos
 arquivos e rodados contra fixtures, e os produtores de cota dos dois dispatchers rodados contra um checker
@@ -130,8 +142,11 @@ DRY_RUN ignorado, sombra aplicando o teto, sombra gravando o estado real, relóg
 **cota ilegível (checker ausente/com erro/estourou o tempo) entregue ao teto como `ok`** (o teste novo reprova no código anterior com o
 sintoma literal `wa-worker 2→3 (up, queue+slack)`), limiar de swap/load com lixo lido como "não apertou", **sinalizador de Dolt do Pilot ausente/lixo lido como `ok`** (o padrão é "ilegível"),
 **ligado + lib que não carrega = silêncio** (o loader REAL de cada dispatcher roda sob `set -euo pipefail` contra lib boa, corrompida, ausente e vazia),
-fila carimbada no futuro lida como fresca, e **o próprio selftest escrevendo no log de produção** — a seção 11 compara o log e o diretório de estado reais
-antes/depois da execução inteira e fica vermelha se qualquer seção esquecer de se isolar (sem isso, 57 execuções deixaram 114 linhas falsas na série de 24h).
+fila carimbada no futuro lida como fresca, e **o próprio selftest escrevendo no log de produção** — a seção 11 conta, no log e no diretório de estado reais, as linhas/arquivos com
+carimbo de tempo FALSO (os `POOL_CEILING_NOW` do teste, 100..3000; um passo real leva a época, ~1,79e9) antes e depois da execução inteira e fica
+vermelha se qualquer seção esquecer de se isolar (sem isso, 57 execuções deixaram 114 linhas falsas na série de 24h). Conta só o que um TESTE
+poderia ter escrito, não bytes: com o teto ligado em sombra, uma varredura real do dispatcher acrescenta linhas ao mesmo log durante a execução e isso não pode
+deixar o teste vermelho (o próprio teste cobre o detector: a linha falsa conta, a de época real não).
 
 Antes de ligar: `pool-ceiling.sh status` mostra o sinal agora. Ligue em SOMBRA e deixe 24h; confira em
 `.gc/logs/pool-ceiling.log` quanto tempo cada sinal ficou em grow/hold/squeeze antes de tirar a sombra.

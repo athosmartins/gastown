@@ -399,6 +399,9 @@ pool_ceiling_step() {
     POOL_CEILING_RESULT="$cur"
     [ "$shadow" != "1" ] || POOL_CEILING_RESULT="$fixed"
     POOL_CEILING_LOGLINE="pool-ceiling: $pool teto $cur mantido (ritmo: ultimo passo ha $((now - at))s < ${step}s; fila ${queue:-?}, vivos ${live:-?}) (ga-uywvsc)"
+    # in shadow $cur is the SIMULATED ceiling and what applies is the fixed one: label it like every other shadow line,
+    # or a reader calibrating from the log (a gate multi-admit re-exec lands here within 60s) takes the simulation for real
+    [ "$shadow" != "1" ] || POOL_CEILING_LOGLINE="pool-ceiling [sombra: NAO aplicado, fica o fixo $fixed]${POOL_CEILING_LOGLINE#pool-ceiling:}"
     return 0
   fi
 

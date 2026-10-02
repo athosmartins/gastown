@@ -42,10 +42,20 @@ unset POOL_CEILING_SHADOW
 export POOL_CEILING_LOG="$TMPROOT/pool-ceiling.default.log"
 # The production paths the lib would fall back to, snapshotted now and compared at the very end (section 11): a section that
 # forgets to isolate itself is a RED test, not silent pollution of the series the doc tells the operator to calibrate from.
+# It counts only what a TEST could have written — rows / state files stamped with a FAKE time (this file's POOL_CEILING_NOW
+# values are 100..3000; a real step is stamped with the epoch, ~1.79e9) — and NOT bytes or entries: once the ceiling runs in
+# shadow in production, a real dispatcher sweep appends to that same log while this suite runs, and that must not turn it red.
 PROD_LOG="${GC_CITY:+$GC_CITY/.gc/logs/pool-ceiling.log}"; PROD_STATE="${GC_CITY:+$GC_CITY/.gc/pool-ceiling}"
-prod_snapshot() { # → "log=<bytes|absent> state=<entries|absent>", or "no-GC_CITY" when there is no fallback to pollute
+prod_snapshot() { # → "fake-log-rows=<n> fake-state-files=<n>", or "no-GC_CITY" when there is no fallback to pollute
   [ -n "$PROD_LOG" ] || { printf 'no-GC_CITY'; return 0; }
-  printf 'log=%s state=%s' "$([ -e "$PROD_LOG" ] && wc -c < "$PROD_LOG" | tr -d ' ' || echo absent)" "$([ -e "$PROD_STATE" ] && ls -A "$PROD_STATE" 2>/dev/null | wc -l | tr -d ' ' || echo absent)"
+  local rows=0 st=0 f at
+  if [ -r "$PROD_LOG" ]; then rows=$(awk -F'\t' '{ split($1, a, "="); if (a[2] + 0 < 1000000000) n++ } END { print n + 0 }' "$PROD_LOG" 2>/dev/null) || rows="?"; fi
+  for f in "$PROD_STATE"/*.state; do
+    [ -r "$f" ] || continue
+    at=$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)
+    case "$at" in ''|*[!0-9]*) ;; *) [ "$at" -lt 1000000000 ] && st=$((st + 1)) ;; esac
+  done
+  printf 'fake-log-rows=%s fake-state-files=%s' "$rows" "$st"
 }
 PROD_BEFORE="$(prod_snapshot)"
 # Engine caps (agents/<pool>/agent.toml): the controller obeys THESE on its own (ga-o3o09z, 25/09:
@@ -295,12 +305,17 @@ eq "$POOL_CEILING_RESULT" "2" "shadow: a squeeze does NOT lower the real ceiling
 has "$POOL_CEILING_LOGLINE" "wa-worker 4→3" "shadow: the simulated brake is still logged"
 POOL_CEILING_NOW=3250 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok
 eq "$POOL_CEILING_RESULT" "2" "shadow + rate-limited call: still the fixed value"
+has "$POOL_CEILING_LOGLINE" "mantido (ritmo" "shadow + rate-limited call: it is the rate-limit line"
+has "$POOL_CEILING_LOGLINE" "sombra" "shadow + rate-limited call: and it says NOT applied (its 'teto N' is the SIMULATED ceiling, not the real one)"
 has "$(cat "$LS")" "applied=0" "shadow: the calibration log marks every row applied=0"
 unset POOL_CEILING_SHADOW; export POOL_CEILING_T_MEM=1
 POOL_CEILING_NOW=3400 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok
 eq "$POOL_CEILING_RESULT" "3" "leaving shadow: starts from the FIXED 2 (never from the simulation) and takes its first real step"
 has "$POOL_CEILING_LOGLINE" "wa-worker 2→3" "leaving shadow: the first applied line starts at the fixed value"
 has "$(tail -1 "$LS")" "applied=1" "and the log marks the row applied=1"
+POOL_CEILING_NOW=3410 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok
+has "$POOL_CEILING_LOGLINE" "mantido (ritmo" "control: a rate-limited call outside shadow is the same rate-limit line..."
+case "$POOL_CEILING_LOGLINE" in *sombra*) bad "...but it must NOT carry the shadow label when it is really applied" ;; *) ok "...and carries no shadow label (it IS the real ceiling)" ;; esac
 touch "$POOL_CEILING_SHADOW_FILE"
 POOL_CEILING_NOW=3500 pool_ceiling_step wa-worker 2 1 4 2 63 ok ok
 eq "$POOL_CEILING_RESULT" "2" "the shadow FILE also puts it in shadow (instant, no plist edit)"
@@ -492,6 +507,10 @@ mkqc() { # <name> <exit-code|ABSENT|NOEXEC|SIGKILL> → a GC_CITY dir whose scri
 }
 if [ -z "$PQ_EXTRACT" ] || [ -z "$GQ_EXTRACT" ]; then
   bad "missing SELFTEST-EXTRACT pilot-quota-state / gate-quota-state block (pilot: ${#PQ_EXTRACT} bytes, gate: ${#GQ_EXTRACT} bytes)"
+elif ! command -v timeout >/dev/null 2>&1; then
+  # Both producers run the checker under `timeout 15`; with no such binary every read is exit 127 -> unknown, which is the
+  # CORRECT answer (and not a property of the code under test). Say so instead of failing on this host.
+  ok "SKIPPED 9b (no \`timeout\` binary on this host): the ok/limited mapping needs it; absent -> unknown is the designed result"
 else
   # prints "<state> <limited-flag>" from the dispatcher's real functions, under set -euo pipefail
   pq() { # <GC_CITY> [override] [PATH]
@@ -672,7 +691,12 @@ st="$(POOL_CEILING_STATE_DIR="$TMPROOT/st.status" POOL_CEILING_SHADOW=0 pool_cei
 has "$st" "modo: APLICANDO" "shadow off -> 'modo: APLICANDO'"
 
 echo "== 11. hermetic: this run did not touch the real city's calibration log or state dir"
-eq "$(prod_snapshot)" "$PROD_BEFORE" "production pool-ceiling.log / pool-ceiling/ unchanged by the whole run (before: $PROD_BEFORE)"
+eq "$(prod_snapshot)" "$PROD_BEFORE" "no fake-stamped row/state written to the real pool-ceiling.log / pool-ceiling/ by this run (before: $PROD_BEFORE; real sweeps appending meanwhile do not count)"
+# the detector itself: a fake-stamped row in a log it watches IS seen, a real-epoch row is NOT
+printf 'ts=100\tpool=x\n' > "$TMPROOT/det.log"; printf 'ts=1790000000\tpool=x\n' >> "$TMPROOT/det.log"
+eq "$(PROD_LOG="$TMPROOT/det.log" PROD_STATE="$TMPROOT/det.nostate" prod_snapshot)" "fake-log-rows=1 fake-state-files=0" "the detector counts the fake-stamped row and ignores the real-epoch one"
+mkdir -p "$TMPROOT/det.state"; printf 'ceiling=2\nat=100\n' > "$TMPROOT/det.state/wa-worker.state"; printf 'ceiling=2\nat=1790000000\n' > "$TMPROOT/det.state/ps-worker.state"
+eq "$(PROD_LOG="$TMPROOT/det.log" PROD_STATE="$TMPROOT/det.state" prod_snapshot)" "fake-log-rows=1 fake-state-files=1" "...and a fake-stamped state file, but not a real-epoch one"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
