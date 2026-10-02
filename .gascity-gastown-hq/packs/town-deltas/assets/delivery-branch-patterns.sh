@@ -17,10 +17,13 @@
 # framework-marker-labels.sh (ga-vmn7kv).
 #
 # Add a prefix HERE and every consumer of this file sees it. Space-separated,
-# in PRIORITY order: when a bead has branches under more than one prefix, the
-# earliest one wins (fix/ is the documented dispatch_one() convention, so it
-# stays first). crew/*/<bead> is not listed — its glob has a different shape —
-# and is always appended last by gc_delivery_branch_globs.
+# in PRIORITY order: when ONE set of refs holds branches under more than one
+# prefix, the earliest prefix wins (fix/ is the documented dispatch_one()
+# convention, so it stays first). The Pilot's lookup applies that order within
+# each source it reads (local + fetched refs, then origin), not across them —
+# see _beadid_needs_remerge_branch.
+# crew/*/<bead> is not listed — its glob has a different shape — and is always
+# appended last by gc_delivery_branch_globs.
 GC_DELIVERY_BRANCH_PREFIXES="fix feat feature refactor docs chore test"
 
 # gc_delivery_branch_globs <bead_id>

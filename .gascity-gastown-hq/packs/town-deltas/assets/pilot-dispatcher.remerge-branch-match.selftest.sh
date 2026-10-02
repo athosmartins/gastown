@@ -234,6 +234,40 @@ _OWNERSHIP_GUARD_REPOS="$NOTGIT"
 expect "ONLY non-git paths (looked nowhere) -> rc 2" rmg-truly-nothing 2 ""
 _OWNERSHIP_GUARD_REPOS="$SANDBOX"
 
+# ── ga-x7m5rg gate feedback (attempt 1, both reviewers): "git could not OPEN it" ≠ "not a repo" ──
+# A repo whose .git is damaged (truncated HEAD — plausible on a machine that runs near disk-full)
+# answers `git rev-parse --git-dir` with the SAME rc 128 "not a git repository" as a plain directory.
+# The first version skipped both identically and did not count either, so with one healthy repo read
+# cleanly the result was rc 1 → gate:needs-human: the exact false escalation this bead removes, one
+# level down. Only the presence of .git tells the two apart; a registered path that no longer exists
+# is likewise unreadable, not "cannot hold the branch".
+echo "-- a repo git could not OPEN (present .git, rev-parse fails) is UNKNOWN, not 'cannot hold the branch' --"
+CORRUPT="$(mktemp -d)"
+git -C "$CORRUPT" init -q .
+: > "$CORRUPT/.git/HEAD"
+if git -C "$CORRUPT" rev-parse --git-dir >/dev/null 2>&1; then
+  bad "PRECONDITION: the corrupt sandbox repo still opens — the cases below would prove nothing"
+elif [ ! -e "$CORRUPT/.git" ]; then
+  bad "PRECONDITION: the corrupt sandbox has no .git — it is a plain directory, not a damaged repo"
+else
+  ok "precondition: sandbox repo has a .git but git cannot open it (rc 128, same as a plain dir)"
+fi
+_OWNERSHIP_GUARD_REPOS="$CORRUPT
+$SANDBOX"
+expect "corrupt repo + healthy repo, nothing found -> rc 2 (was rc 1: false gate:needs-human)" rmg-truly-nothing 2 ""
+expect "corrupt repo + healthy repo, branch found -> rc 0 (positive evidence still wins)"      rmg-feat-bare 0 "feat/rmg-feat-bare"
+_OWNERSHIP_GUARD_REPOS="$SANDBOX
+$CORRUPT"
+expect "corrupt repo listed AFTER the healthy one, nothing found -> rc 2 (order must not matter)" rmg-truly-nothing 2 ""
+
+echo "-- a registered path that no longer exists is UNKNOWN, not 'cannot hold the branch' --"
+MISSING="$(mktemp -d)/gone-rig"   # parent exists, the rig dir itself was never created
+_OWNERSHIP_GUARD_REPOS="$MISSING
+$SANDBOX"
+expect "missing registered path + healthy repo, nothing found -> rc 2" rmg-truly-nothing 2 ""
+expect "missing registered path + healthy repo, branch found -> rc 0"  rmg-feat-bare 0 "feat/rmg-feat-bare"
+_OWNERSHIP_GUARD_REPOS="$SANDBOX"
+
 echo "-- shared lib missing at runtime -> rc 2 (deploy fault must not escalate beads) --"
 (
   unset -f gc_delivery_branch_globs gc_delivery_branch_pick
@@ -248,7 +282,7 @@ echo "-- test seam: PILOT_TEST_REMERGE_UNKNOWN_BEADS yields rc 2 --"
   _beadid_needs_remerge_branch "rmg-seam" >/dev/null 2>&1; [ $? -eq 2 ]
 ) && ok "UNKNOWN seam -> rc 2" || bad "UNKNOWN seam did not return rc 2"
 
-rm -rf "$SANDBOX" "$DEADREMOTE" "$ORIGIN" "$CLONE" "$NOTGIT" 2>/dev/null || true
+rm -rf "$SANDBOX" "$DEADREMOTE" "$ORIGIN" "$CLONE" "$NOTGIT" "$CORRUPT" "${MISSING%/*}" 2>/dev/null || true
 
 echo ""
 if [ "$F" -eq 0 ]; then echo "SELFTEST PASS ($P ok)"; exit 0

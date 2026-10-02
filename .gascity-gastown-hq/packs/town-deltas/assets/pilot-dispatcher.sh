@@ -6057,13 +6057,18 @@ unset _GC_DBP_SIBLING
 # (ga-x7m5rg — the old two-valued version turned a failed lookup into "no
 # branch" and escalated a good commit to gate:needs-human):
 #   rc 0  a branch was found                       → resubmit it to the gate
-#   rc 1  every repo was READ and none has one     → escalate (genuine none)
+#   rc 1  every git repo among the paths was READ and none has one
+#                                                  → escalate (genuine none)
 #   rc 2  could not tell                           → touch NOTHING this sweep
-# rc 2 is: no git; the shared prefix lib is missing/unreadable (a deploy fault
-# is not evidence of absence); `gc rig list` failed so only the HQ repo was
-# searched (ga-07rb3 — that caller-side degrade is fine for the defense-in-depth
-# probes, not for one that ESCALATES on "none"); a repo whose refs git could not
-# read; `git ls-remote origin` failing or timing out; or no repo checked at all.
+# "Every git repo" is literal: a registered path that is a plain directory (no
+# .git at all) cannot hold a branch and is skipped without counting as read, so
+# rc 1 never rests on it. rc 2 is: no git; the shared prefix lib is
+# missing/unreadable (a deploy fault is not evidence of absence); `gc rig list`
+# failed so only the HQ repo was searched (ga-07rb3 — that caller-side degrade
+# is fine for the defense-in-depth probes, not for one that ESCALATES on
+# "none"); a registered path that no longer exists; a repo that has a .git but
+# git could not open, or whose refs it could not read; `git ls-remote origin`
+# failing or timing out; or no repo checked at all.
 # A match found anywhere still wins over a failure elsewhere — positive
 # evidence beats an unreadable probe. Callers must treat any rc other than 0/1
 # as "unknown" too (a crash is not an answer).
@@ -6075,8 +6080,12 @@ unset _GC_DBP_SIBLING
 # knew fix/, so a bead delivered on feat/<bead> — ga-atsahv, measured 2x —
 # armed by GAP-2 was escalated here as "no branch"). The earlier narrowing to
 # fix/ ("a re-merge candidate is a bug/task bead, never a crew assignment")
-# is gone: GAP-2's own evidence list is the contract. When a bead has
-# branches under several prefixes the earliest in that list wins (fix/ first).
+# is gone: GAP-2's own evidence list is the contract. Priority (fix/ first) is
+# applied within ONE source, not across them: per repo the local branches and
+# the origin refs this clone already fetched are consulted first, in list order,
+# and origin itself is asked only when they hold no match; the first repo with
+# any match wins. So a stale local docs/<bead> beats a fix/<bead>-slug that
+# exists only on origin — both are the bead's delivery, and either resubmits.
 # The bare <bead> and "<bead>-*" are separate globs (ga-r7uec: a slug-less
 # fix/ga-y9a1d reached the gate in the wild), and neither can match a LONGER id
 # that merely starts with this one — gc_delivery_branch_pick re-checks every
@@ -6120,11 +6129,28 @@ _beadid_needs_remerge_branch() {
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 2
   while IFS= read -r _repo; do
-    # A registered path that is not a git repo cannot hold this bead's branch —
-    # skipped, and NOT counted as checked (so "every path was a non-repo" is
-    # still "looked nowhere" = unknown, below).
-    [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    git -C "$_repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+    [ -n "$_repo" ] || continue
+    # A registered path that is GONE could not be read, which is not the same as
+    # "cannot hold the branch" — unknown (a rig whose directory vanished is a
+    # fault somebody should see, and it must not turn into a gate:needs-human).
+    if [ ! -d "$_repo" ]; then
+      _unknown=1
+      continue
+    fi
+    # `git rev-parse --git-dir` answers rc 128 "not a git repository" for a plain
+    # directory AND for a repo whose .git is damaged (a truncated HEAD — plausible
+    # on a machine that runs near disk-full), so the rc alone cannot tell "nothing
+    # to read" from "could not read". The presence of .git can: a path that has
+    # one but will not open is unknown; a path with no .git at all is a plain
+    # directory, cannot hold this bead's branch, and is skipped — NOT counted as
+    # checked (so "every path was a non-repo" is still "looked nowhere" =
+    # unknown, below).
+    if ! git -C "$_repo" rev-parse --git-dir >/dev/null 2>&1 </dev/null; then
+      if [ -e "$_repo/.git" ]; then
+        _unknown=1
+      fi
+      continue
+    fi
     # 1) local branches + the remote-tracking refs this clone already fetched,
     # one bounded probe per glob in PRIORITY order (the first glob that hits is
     # the answer). A probe that errors makes the whole repo unreadable — a miss
@@ -9833,7 +9859,7 @@ FIXSEC
     log "  ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with ZERO feedback — will NOT dispatch a builder with an empty brief. Searching for an existing branch to resubmit..."
 
     # ga-x7m5rg: three outcomes (see _beadid_needs_remerge_branch). Anything but a
-    # clean rc 0 (found) / rc 1 (every repo read, none has one) is "could not
+    # clean rc 0 (found) / rc 1 (every git repo read, none has one) is "could not
     # tell": escalating to a human, or dispatching a builder with an empty brief,
     # on a lookup that never actually looked is the false gate:needs-human this
     # fix exists to stop — so touch nothing; the labels stay and the next sweep
@@ -9850,7 +9876,7 @@ FIXSEC
         ;;
       1) ;;
       *)
-        warn "ga-x7m5rg: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback but the branch lookup could not be completed (rc=$REMERGE_RC: origin unreachable / rig list failed / refs unreadable / prefix lib missing) — NOT escalating to gate:needs-human and NOT dispatching a builder; labels untouched, will retry next sweep."
+        warn "ga-x7m5rg: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback but the branch lookup could not be completed (rc=$REMERGE_RC: origin unreachable / rig list failed / a repo or rig path unreadable / prefix lib missing) — NOT escalating to gate:needs-human and NOT dispatching a builder; labels untouched, will retry next sweep."
         DISPATCH_RESULT="remerge_branch_lookup_unknown"
         return 1
         ;;
@@ -9895,11 +9921,11 @@ submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         warn "ga-e2n96: found branch $REMERGE_REF for $STORY_ID but FAILED to create gate marker — leaving labels as-is for next sweep to retry."
       fi
     else
-      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing delivery branch found (checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*], local+remote refs, every repo read) — escalating to human instead of blind-dispatching a builder."
+      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing delivery branch found (checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*], local+remote refs, every git repo among the registered paths read) — escalating to human instead of blind-dispatching a builder."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-fix"     -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-remerge" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "gate:needs-human"   -q 2>/dev/null || true
-      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing delivery branch to resubmit (ga-x7m5rg: checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*] — the same list the GAP-2 reconciler uses — bare id and id+slug shapes, local and remote, every repo read successfully) — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing delivery branch to resubmit (ga-x7m5rg: checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*] — the same list the GAP-2 reconciler uses — bare id and id+slug shapes, local and remote, in every git repo among the registered paths — a path that is not a git repo cannot hold a branch and was skipped) — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
     fi
     return 1
   fi
@@ -12222,8 +12248,12 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       earlier spawn this sweep was slow — a deliberate deferral, not a fault; it is still
 #                       counted in NONQUEUE_FAILS so the Step 5 stall streak sees a sweep that spawned nothing.
 #   failed_other        any other NAMED failure (assign / sling / in-flight / rig_native_pool_count_unreadable —
-#                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t) and
-#                       any name not classified here
+#                       the session count could not be read, so the spawn was NOT attempted, ga-oa004t — and
+#                       remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could
+#                       not READ, so the bead was left untouched and retried next sweep) and any name not
+#                       classified here. Both "could not read" names are in this bucket ON PURPOSE: it is the
+#                       only place a permanent unknown stays visible — a guard bucket would call it a policy
+#                       refusal and hide a broken lookup.
 #   unclassified        dispatch_one() returned non-zero WITHOUT naming a result (its early guards, a lost
 #                       claim, a hold): counted so the accounting closes — never read as a success
 #   pool_saturated      the ga-in9ebr predicate (_pool_saturated_sweep); consumers must not re-derive it

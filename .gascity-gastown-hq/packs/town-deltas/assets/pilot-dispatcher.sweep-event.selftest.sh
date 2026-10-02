@@ -150,10 +150,11 @@ b16 1 some_future_result
 b17 1 rig_native_dog_store_migrated
 b18 1 rig_native_spawn_deferred_slow
 b19 1 rig_native_pool_store_blind
-b20 1 rig_native_pool_store_migrated'
+b20 1 rig_native_pool_store_migrated
+b21 1 remerge_branch_lookup_unknown'
 run_sweep "$BATCH" >/dev/null 2>&1
 echo "=== A2: one bead per real exit ==="
-expect '.candidates' '20'          "A2: 20 candidates evaluated"
+expect '.candidates' '21'          "A2: 21 candidates evaluated"
 expect '.dispatched' '2'           "A2: rc=0 → dispatched (rig_native_ok, sling_ok)"
 expect '.queued_pool_cap' '2'      "A2: pool session cap → queued_pool_cap, counted per bead"
 expect '.queued_global_cap' '1'    "A2: global (ga-jezvn) cap → queued_global_cap, SEPARATE from the pool cap (different causes)"
@@ -164,7 +165,9 @@ expect '.refused_by_guard.rig_native_spawn_deferred_slow' '1' "A2: a spawn DEFER
 expect '.refused_by_guard.rig_native_dog_store_migrated' '1' "A2: a successful auto-migration (ga-6u64fm) is a guard outcome, NOT a Pilot fault (B4 caught it landing in failed_other)"
 expect '.refused_by_guard.rig_native_pool_store_blind' '1' "A2: a rig-native bead refused because the target pool cannot read its store (ga-653ilw) is a guard outcome, NOT a Pilot fault"
 expect '.refused_by_guard.rig_native_pool_store_migrated' '1' "A2: ...and so is its benign end: the bead auto-migrated into the store the pool reads (ga-653ilw) — must not land in failed_other"
-expect '.failed_other' '5'         "A2: assign/sling/inflight failures and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
+expect '.results.remerge_branch_lookup_unknown' '1' "A2: a gate:needs-remerge branch lookup that could not READ (ga-x7m5rg) shows up BY NAME in results"
+expect '.refused_by_guard | has("remerge_branch_lookup_unknown")' 'false' "A2: ...and it is NOT a guard refusal: nothing was decided, git/origin could not be read — a fault, not a policy outcome (same call as rig_native_pool_count_unreadable, ga-oa004t)"
+expect '.failed_other' '6'         "A2: assign/sling/inflight failures, an unreadable remerge lookup and an UNKNOWN name → failed_other (unknown is never a success; rig_native_dog_store_migrated is NOT in it)"
 expect '.unclassified' '1'         "A2: non-zero exit with NO named result → unclassified (not dropped, not called a success)"
 expect '.results.some_future_result' '1' "A2: an unknown result still shows up BY NAME in results (the next vocabulary drift explains itself)"
 expect '.results.rig_native_pool_session_cap_queued' '2' "A2: results is the per-name ground truth (same vocabulary as pilot_dispatch.result)"
@@ -284,10 +287,15 @@ fi
 # B4 — drift guard. A new DISPATCH_RESULT literal that is not classified would silently land in
 # failed_other: a BENIGN new state (e.g. another kind of queue) would then read as a Pilot failure on
 # the painel. Adding a result now means classifying it in _pilot_sweep_emit AND listing it here.
-KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow "
+KNOWN_RESULTS=" sling_ok rig_native_ok dry_run rig_native_pool_session_cap_queued rig_native_global_session_cap_queued rig_native_spawn_failed pool_ownership_refuse rig_native_dog_store_blind rig_native_dog_store_migrated rig_native_pool_store_blind rig_native_pool_store_migrated rig_native_pool_target_only rig_dedup_skip rig_assign_failed sling_no_bead_id sling_phantom_bead inflight_unconfirmed rig_native_pool_count_unreadable rig_native_spawn_deferred_slow remerge_branch_lookup_unknown "
 # (rig_native_pool_count_unreadable, ga-oa004t: the session count could not be READ, so the spawn was not
 #  attempted — a FAULT, deliberately left in failed_other and NOT in a *_queued bucket: a dead `session list`
 #  is not a busy pool, and filing it as saturation would hide it from the Step 5 stall gate.)
+# (remerge_branch_lookup_unknown, ga-x7m5rg: the gate:needs-remerge branch lookup could not READ — origin
+#  unreachable, `gc rig list` failed, a repo git could not open, the prefix lib missing — so the Pilot touched
+#  NOTHING and the sweep moved on. Same call as above, on purpose: it stays in failed_other, because that is
+#  the ONLY place a PERMANENT unknown is visible (the bead keeps its labels and is retried every sweep, with no
+#  label/comment of its own). A guard bucket would read as "a policy refused it" and hide a broken lookup.)
 unclassified_names=""
 for _lit in $(grep -oE 'DISPATCH_RESULT="[a-z_0-9]+"' "$DISPATCHER" | sed 's/.*="//; s/"$//' | sort -u); do
   case "$KNOWN_RESULTS" in *" $_lit "*) : ;; *) unclassified_names="$unclassified_names $_lit" ;; esac

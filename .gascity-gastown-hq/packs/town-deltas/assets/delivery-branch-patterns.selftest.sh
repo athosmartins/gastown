@@ -8,11 +8,15 @@
 # divergence: GAP-2 knew feat/, the Pilot knew only fix/, and a bead delivered
 # on feat/ga-atsahv was falsely escalated to gate:needs-human (2x).
 #
-#  1. gc_delivery_branch_globs / gc_delivery_branch_pick behave (order, decoys,
-#     the ls-remote tail-match hazard, degenerate input → rc 1, never "none").
-#  2. DRIFT GUARD: the prefix set at each of quality-gate-guard.sh's three PAT
+#  1. gc_delivery_branch_globs behaves (2 globs per prefix + the crew globs,
+#     priority order, degenerate input → rc 1, never "none").
+#  2. gc_delivery_branch_pick behaves (priority, decoys, the ls-remote
+#     tail-match hazard, degenerate input → rc 1).
+#  3. DRIFT GUARD: the prefix set at each of quality-gate-guard.sh's three PAT
 #     sites equals the shared list in BOTH directions — a prefix added to one
 #     side and not the other fails here, whichever side it was added on.
+#  4. The Pilot consumes the shared list: pilot-dispatcher.sh carries no second
+#     copy of it.
 #
 # Exit 0 iff every assertion holds.
 set -uo pipefail
