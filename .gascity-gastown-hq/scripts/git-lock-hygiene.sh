@@ -542,15 +542,6 @@ _remove_stale_lock() {
   fi
 }
 
-# Report — do not remove — an in-progress operation (merge / cherry-pick / revert / rebase) that
-# has passed the same age + no-live-process gates as a stale lock (ga-892qy1; see the header for why
-# those gates cannot prove it was abandoned rather than paused for a human). Reached from _glh_reap,
-# which removes instead only under GIT_LOCK_STATE_REMOVE=1.
-# $1 = path, $2 = repo root, $3 = label, $4 = the abort command to name in the notification.
-# "Reported" ends at the hand-off to notify; whether that reaches a person is notify's routing (see
-# the header). Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
-# it as the removed-count, and the real notify prints "Logged for digest ..." on stdout (ga-kimlod
-# measured that leak), so the notify call below discards both streams.
 # Run the notifier under a deadline, so one that hangs (a slow secret lookup, a locked sqlite) cannot
 # stall the sweep. Without timeout(1) it runs unbounded rather than not at all: the item must still
 # be handed over. $@ = the notifier's own arguments.
@@ -562,6 +553,15 @@ _glh_notify_send() {
   fi
 }
 
+# Report — do not remove — an in-progress operation (merge / cherry-pick / revert / rebase) that
+# has passed the same age + no-live-process gates as a stale lock (ga-892qy1; see the header for why
+# those gates cannot prove it was abandoned rather than paused for a human). Reached from _glh_reap,
+# which removes instead only under GIT_LOCK_STATE_REMOVE=1.
+# $1 = path, $2 = repo root, $3 = label, $4 = the abort command to name in the notification.
+# "Reported" ends at the hand-off to notify; whether that reaches a person is notify's routing (see
+# the header). Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
+# it as the removed-count, and the real notify prints "Logged for digest ..." on stdout (ga-kimlod
+# measured that leak), so the notify call below discards both streams.
 _report_stale_state() {
   local path="$1" repo="$2" label="$3" hint="$4" age mt key marker prev age_json age_txt cmds _h _ifs _nrc
   # Three states for the item, never two. Gone (finished or aborted between _is_stale and here):
@@ -1797,7 +1797,7 @@ print(n)
   T55_LOG="$TMP/t55.jsonl"; : > "$T55_LOG"; : > "$NOTIFY_CALLS"
   env -u GIT_LOCK_PROCESS_CHECK_FN GIT_LOCK_RIG_ROOTS="$R23" GIT_LOCK_LOG="$T55_LOG" \
       NOTIFY_BIN="$NOTIFY_BIN" GIT_LOCK_STATE_DIR="$TMP/t55-state" GC_CITY_PATH="$TMP/t55-city" \
-      bash "$_GLH_SELF" >/dev/null 2>"$TMP/t55.err"
+      /bin/bash "$_GLH_SELF" >/dev/null 2>"$TMP/t55.err"
   _t55_rc=$?
   [ "$_t55_rc" -eq 0 ] && ok "T55: sweep exited 0" || bad "T55: sweep exited $_t55_rc — stderr: $(head -c 400 "$TMP/t55.err")"
   [ ! -f "$R23/.git/index.lock" ] && [ -f "$R23/.git/MERGE_HEAD" ] && [ -d "$R23/.git/rebase-merge" ] \
