@@ -7693,7 +7693,9 @@ if [ "$OVERALL_VERDICT" = "PASS" ]; then
     # GATE-FEEDBACK, no gate:needs-fix, no fix-attempt spent. The marker goes back to queued — the same mechanism as the
     # dead-reviewer re-queue above, minus verdict beads (a fast run has none) — and the next sweep decides the lane afresh on
     # the branch as it is NOW, usually the normal gate. It converges: with the branch and main unchanged the decision and this
-    # confirmation read the same diff and cannot disagree, so a second revocation needs the branch or main to have moved again.
+    # confirmation read the same diff, so a repeat revocation needs the branch or main to have moved again — or a read to have
+    # failed this time (cannot-confirm: a transient git/mktemp/scanner error) or the switch to have been flipped off
+    # (switched-off). Neither loops: the next sweep reads again (a transient error), or finds the switch off and decides "normal".
     # The revocation is recorded as a NORMAL decision (marker metadata + a gate_lane event, reason_code revoked-at-push), so
     # neither the marker nor the weekly tally keeps saying "fast" for a run that merged nothing.
     # SELFTEST-EXTRACT fastlane-lane-revoked: BEGIN
