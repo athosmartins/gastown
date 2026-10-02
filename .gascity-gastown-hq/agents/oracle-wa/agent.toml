@@ -3,6 +3,6 @@ min_active_sessions = 1
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/oracle"
 provider = "claude-rc"
 
-option_defaults = { effort = "high" }  # ga-ufskhy E2: teste 48h (Athos 29/09 20:5x), voltar a "medium" se não subir a aprovação
+option_defaults = { effort = "medium" }  # ga-ufskhy E2 ENCERRADO 01/10 21h: aprovação de 1ª não subiu (77%→35-43%), crews high = US$762/48h (19%) — de volta a medium pela regra do teste
 
 suspended = true
