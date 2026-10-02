@@ -26,7 +26,8 @@
 #       Dolt em manutencao -> SKIP depois do orcamento, sinal REMOVIDO (a cidade
 #       volta a trabalhar), streak incrementa. "Nao consegui olhar" nao e "livre".
 #   E4  o que passaria a ser morto fica registrado: log + snapshot pre-reboot
-#   E5  scraper cortado: contador de noites seguidas, aviso so a partir da 2a
+#   E5  scraper cortado: contador de noites seguidas; o aviso (devido a partir da 2a) NAO sai daqui:
+#       vai na pendencia pro pos-boot mandar (so la se sabe que o corte aconteceu)
 #   E6  arquivo de pendencia pro pos-boot; janela do Guard 1 (23:00-23:19 dreno,
 #       01:00-01:19 legado, o resto SKIP sem tocar em nada)
 #   E7  morte no meio da espera (SIGTERM) nao deixa a cidade drenada
@@ -38,8 +39,11 @@
 #   E11 a espera ate 23:40 e decidida pelo RELOGIO: um sleep que volta cedo nao a encurta
 #   E12 o padrao de manutencao do Dolt (guard de seguranca) contra o pgrep REAL,
 #       com processos de mentira (positivos E negativos)
-#   E13 shutdown que falha apaga a pendencia; shutdown que "pega" a mantem — e o log nao mente em nenhum dos dois
-#   E14 o contador de scraper cortado so move perto do shutdown; mail pendurado tem prazo
+#   E13 shutdown que falha apaga a pendencia; shutdown que "pega" a mantem — e o log nao mente em nenhum dos dois.
+#       gate ga-f9ks5v: o shutdown que NAO pega e uma noite SEM reboot — streak e contador do scraper voltam ao
+#       que eram (ausente continua ausente), a noite conta como pulada, sai o push "FALHOU", e nenhum mail
+#       "scraper cortado" sai por um corte que nao aconteceu
+#   E14 o contador de scraper cortado so move perto do shutdown; o nightly nao chama o gc por causa dele
 #   E15 a noite PULADA tambem tem prazo: gc pendurado no registro do skip nao prende a instancia
 #   E16 gate-fix 2: os guards de SEGURANCA sao lidos de novo logo antes do shutdown — um envio que
 #       comecou no intervalo segura o reboot (e uma noite pulada ali NAO zera o streak)
@@ -388,10 +392,16 @@ W_SCRAPER=1 new_world e5; run_nr FAKE_HOUR=23
 SC="$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
 [ "$(cat "$SC" 2>/dev/null)" = "1" ] && ok "E5 1a noite cortada: contador = 1" || bad "E5 contador deveria ser 1 ('$(cat "$SC" 2>/dev/null)')"
 grep -q "mail send" "$GC_CALLS" && bad "E5 avisou ja na 1a noite (so a partir da 2a)" || ok "E5 sem aviso na 1a noite"
+[ -s "$PEND_AT_SHUT" ] && grep -q '^issued=' "$PEND_AT_SHUT" && ! grep -q '^scraper_cut_alarm=' "$PEND_AT_SHUT" && ok "E5 1a noite: a pendencia existe e nao carrega aviso de scraper (so a partir da 2a)" || bad "E5 1a noite: pendencia ausente ou ja com aviso de scraper: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
 # 2a noite seguida: pre-semeia o contador em 1
 W_SCRAPER=1 new_world e5b; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"; run_nr FAKE_HOUR=23
 [ "$(cat "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" 2>/dev/null)" = "2" ] && ok "E5 2a noite: contador = 2" || bad "E5 contador deveria ser 2"
-grep -q "mail send" "$GC_CALLS" && ok "E5 2a noite seguida: avisa (mail)" || bad "E5 2a noite seguida deveria avisar"
+# gate ga-f9ks5v: o mail NAO sai daqui. Nesta altura nada foi cortado (o shutdown ainda nem voltou) e, depois dele,
+# o log vivo mostra que nada escrito sobrevive. O aviso devido viaja na pendencia; quem manda e o pos-boot.
+grep -q "mail send" "$GC_CALLS" && bad "E5 2a noite: o reboot mandou o mail do scraper ANTES do shutdown ($(grep 'mail send' "$GC_CALLS" | head -1 | cut -c1-90)) — se o shutdown falhar, o aviso anuncia um corte que nao houve" || ok "E5 2a noite: o reboot NAO manda o mail do scraper (nada foi cortado ainda)"
+[ "$(sed -n 's/^scraper_cut_alarm=//p' "$PEND_AT_SHUT" 2>/dev/null | head -1)" = "2" ] && ok "E5 2a noite: a pendencia deixada pro pos-boot carrega scraper_cut_alarm=2" || bad "E5 2a noite: a pendencia nao carrega o aviso devido. pendencia: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
+sed -n 's/^scraper_cut_reason=//p' "$PEND_AT_SHUT" 2>/dev/null | head -1 | grep -q . && ok "E5 2a noite: a pendencia carrega o motivo (scraper_cut_reason)" || bad "E5 2a noite: pendencia sem scraper_cut_reason"
+log_has "ALARM due: the scraper would be cut 2 nights" && ok "E5 2a noite: o log diz que o aviso e DEVIDO (e quem o manda)" || bad "E5 2a noite: sem 'ALARM due' no log"
 # noite sem scraper rodando zera
 new_world e5c; printf '2\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"; run_nr FAKE_HOUR=23
 [ "$(cat "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" 2>/dev/null)" = "0" ] && ok "E5 noite sem corte zera o contador" || bad "E5 contador deveria zerar"
@@ -667,7 +677,7 @@ else
   echo "E12b: todo scripts/dolt-*.sh esta coberto pelo padrao ou classificado como 'nao e risco'"
   not_a_hazard() {
     case "$1" in
-      dolt-backup-s3-proof|dolt-pid-lib) echo "biblioteca (so e carregada com source, nunca executada)" ;;
+      dolt-backup-s3-proof|dolt-pid-lib|dolt-backup-ephemeral-lib) echo "biblioteca (so e carregada com source, nunca executada)" ;;
       dolt-backup-status) echo "relatorio de diagnostico, so le" ;;
       dolt-latency-alarm) echo "alarme: so notifica, nunca age" ;;
       dolt-disk-floor-guard) echo "vigia periodico e curto, nao-invasivo: um kill no meio nao deixa nada pela metade" ;;
@@ -695,11 +705,34 @@ fi
 
 # ═══ E13: o hand-off pro pos-boot ════════════════════════════════════════════
 echo "E13: shutdown que falha apaga a pendencia; shutdown que 'pega' (rc 0) a mantem"
-W_SHUTDOWN_RC=1 new_world e13a; run_nr FAKE_HOUR=23
+# gate ga-f9ks5v: a noite do shutdown que falha, com tudo que o reboot "assumia": streak 13 (a cadeia de noites
+# puladas que o ga-nnp5b existe pra pegar), contador de scraper em 1 (esta noite seria a 2a: o aviso estaria devido)
+W_SHUTDOWN_RC=1 W_SCRAPER=1 new_world e13a; printf '13\n' > "$STREAK"; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
+run_nr FAKE_HOUR=23; RC13=$?
+SC13="$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
+[ -s "$SHUT" ] && grep -q -- '-r now' "$SHUT" && ok "E13 o shutdown FOI chamado (e devolveu 1): o cenario exercita o ramo que falha" || bad "E13 o shutdown nem foi chamado — o cenario nao prova nada sobre o ramo que falha"
+[ "$RC13" = "1" ] && ok "E13 shutdown rc=1 -> o script sai com 1" || bad "E13 shutdown rc=1 -> exit=$RC13 (esperado 1)"
 log_has "shutdown returned 1" && ok "E13 o log registra o shutdown que falhou" || bad "E13 sem 'shutdown returned 1' no log"
+# o bookkeeping que o reboot "assumia" volta ao que era; a noite SEM reboot conta como pulada (+1), nunca zera
+[ "$(cat "$STREAK" 2>/dev/null)" = "14" ] && ok "E13 rc=1: streak 13 -> 14 (voltou a 13 e a noite conta como PULADA; a pre-correcao deixava 0 — apagava a cadeia na noite sem reboot)" || bad "E13 rc=1: streak = '$(cat "$STREAK" 2>/dev/null)', esperado 14 (0 = a cadeia de noites puladas foi apagada numa noite sem reboot)"
+[ "$(cat "$SC13" 2>/dev/null)" = "1" ] && ok "E13 rc=1: contador de scraper cortado volta a 1 (nenhum corte aconteceu)" || bad "E13 rc=1: contador do scraper = '$(cat "$SC13" 2>/dev/null)', esperado 1 (2 = um corte que nao houve foi contado)"
+[ "$(cat "$W/cut-at-shutdown" 2>/dev/null)" = "2" ] && ok "E13 o contador valia 2 na hora do shutdown (o ramo de falha desfez de verdade, nao so nunca moveu)" || bad "E13 contador no shutdown = '$(cat "$W/cut-at-shutdown" 2>/dev/null)', esperado 2"
+grep -q "scraper cortado" "$GC_CALLS" && bad "E13 rc=1: saiu o mail 'scraper cortado' por um corte que NAO aconteceu: $(grep 'scraper cortado' "$GC_CALLS" | head -1 | cut -c1-110)" || ok "E13 rc=1: nenhum mail 'scraper cortado' (nao houve corte)"
+[ "$(grep -c 'mail send' "$GC_CALLS")" = "1" ] && grep 'mail send' "$GC_CALLS" | grep -q "14 noites seguidas sem reiniciar" && ok "E13 rc=1: o unico mail e o da CADEIA de noites puladas (14 sem reiniciar) — verdadeiro: esta noite nao reiniciou" || bad "E13 rc=1: mails inesperados: $(grep 'mail send' "$GC_CALLS" | cut -c1-110 | tr '\n' '|')"
+grep -q '^scraper_cut_alarm=' "$PEND_AT_SHUT" 2>/dev/null && ok "E13 (o aviso do scraper ESTAVA devido na hora do shutdown: sem o ramo de falha ele sairia)" || bad "E13 o aviso do scraper nao estava devido na hora do shutdown — o cenario nao prova a ausencia do mail. pendencia: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
+assert_push "E13 rc=1: o aviso de que o reboot FALHOU" "Reboot noturno FALHOU"
+log_has "counters: skip streak put back to 13" && ok "E13 rc=1: o log diz que o streak voltou a 13" || bad "E13 rc=1: sem 'skip streak put back to 13' no log"
+log_has "counters: scraper-cut counter put back to 1" && ok "E13 rc=1: o log diz que o contador do scraper voltou a 1" || bad "E13 rc=1: sem 'scraper-cut counter put back to 1' no log"
+log_has "skip streak: 14 consecutive night" && ok "E13 rc=1: a noite foi registrada como pulada (streak 14)" || bad "E13 rc=1: a noite nao foi registrada como pulada"
 [ ! -f "$PENDING" ] && ok "E13 shutdown rc=1 -> pendencia REMOVIDA (nenhum reboot em andamento; outro reboot em <3h nao vira 'Reboot noturno OK')" || bad "E13 pendencia ficou no disco apos um shutdown que falhou"
 [ ! -f "$DRAIN" ] && ok "E13 shutdown rc=1 -> sinal de dreno REMOVIDO (nada esta reiniciando: a cidade volta a trabalhar)" || bad "E13 o sinal de dreno ficou no disco depois de um shutdown que FALHOU — a cidade ficaria pausada sem reboot"
 log_has "ERROR: shutdown returned 1 — reboot did NOT happen" && ok "E13 rc=1: o log diz ERROR 'reboot did NOT happen' (e verdade)" || bad "E13 rc=1 sem a linha de ERROR no log"
+# E13c: o que nao existia continua nao existindo — "voltou a 0" seria um arquivo que nunca houve
+W_SHUTDOWN_RC=1 W_SCRAPER=1 new_world e13c; rm -f "$STREAK" "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
+run_nr FAKE_HOUR=23
+[ ! -e "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" ] && ok "E13c rc=1: o contador do scraper nao existia e continua ausente (nao virou 1, nem 0)" || bad "E13c rc=1: o contador do scraper ficou no disco com '$(cat "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" 2>/dev/null)' — nao existia antes"
+[ "$(cat "$STREAK" 2>/dev/null)" = "1" ] && ok "E13c rc=1: streak ausente -> 1 (a noite sem reboot e a 1a pulada)" || bad "E13c rc=1: streak = '$(cat "$STREAK" 2>/dev/null)', esperado 1"
+log_has "counters: scraper-cut counter put back to absent" && ok "E13c rc=1: o log diz 'put back to absent'" || bad "E13c rc=1: sem 'put back to absent' no log"
 new_world e13b; run_nr FAKE_HOUR=23
 log_has "shutdown accepted \(rc 0\)" && ok "E13 rc=0: o log diz que o shutdown foi aceito" || bad "E13 rc=0 sem 'shutdown accepted (rc 0)' no log"
 log_has "reboot did NOT happen" && bad "E13 rc=0: o log diz ERROR 'reboot did NOT happen' com a maquina caindo (mentira no log)" || ok "E13 rc=0: nenhum 'reboot did NOT happen' falso no log"
@@ -710,29 +743,39 @@ log_has "reboot did NOT happen" && bad "E13 rc=0: o log diz ERROR 'reboot did NO
 boot_matches "$(sed -n 3p "$DRAIN" 2>/dev/null)" && ok "E13 rc=0: o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13 rc=0: boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado ~$(real_boot_epoch))"
 log_has "drain signal is left in place" && ok "E13 rc=0: o log diz que o sinal foi deixado de proposito" || bad "E13 rc=0: o log nao diz o que aconteceu com o sinal"
 
-# ═══ E14: contador do scraper + mail pendurado ═══════════════════════════════
-echo "E14: o contador de scraper cortado so move perto do shutdown; mail pendurado tem prazo"
+# ═══ E14: contador do scraper; o aviso devido NAO e mandado daqui ═════════════════════════════════════
+echo "E14: o contador de scraper cortado so move perto do shutdown; o aviso vai na pendencia, nao no gc"
 W_SCRAPER=1 new_world e14a; run_nr FAKE_HOUR=23
-LN_UPD="$(grep -n 'macOS update' "$LOGF" | head -1 | cut -d: -f1)"; LN_CUT="$(grep -n 'WILL BE CUT' "$LOGF" | head -1 | cut -d: -f1)"
+LN_UPD="$(grep -n 'macOS update' "$LOGF" | head -1 | cut -d: -f1)"; LN_CUT="$(grep -n 'scraper: a rodada is in flight' "$LOGF" | head -1 | cut -d: -f1)"
 LN_REB="$(grep -n 'rebooting now' "$LOGF" | head -1 | cut -d: -f1)"
 if [ -n "$LN_UPD" ] && [ -n "$LN_CUT" ] && [ -n "$LN_REB" ]; then
-  [ "$LN_CUT" -gt "$LN_UPD" ] && [ "$LN_CUT" -lt "$LN_REB" ] && ok "E14 'WILL BE CUT' vem DEPOIS do passo de update do macOS e ANTES do shutdown (linhas $LN_UPD < $LN_CUT < $LN_REB)" || bad "E14 contador movido na hora errada (update=$LN_UPD cut=$LN_CUT reboot=$LN_REB)"
+  [ "$LN_CUT" -gt "$LN_UPD" ] && [ "$LN_CUT" -lt "$LN_REB" ] && ok "E14 a linha do scraper vem DEPOIS do passo de update do macOS e ANTES do shutdown (linhas $LN_UPD < $LN_CUT < $LN_REB)" || bad "E14 contador movido na hora errada (update=$LN_UPD cut=$LN_CUT reboot=$LN_REB)"
 else
   bad "E14 faltou linha no log (update='$LN_UPD' cut='$LN_CUT' reboot='$LN_REB')"
 fi
 [ "$(cat "$W/cut-at-shutdown" 2>/dev/null)" = "1" ] && ok "E14 o contador ja valia 1 quando o shutdown foi chamado" || bad "E14 contador no shutdown = '$(cat "$W/cut-at-shutdown" 2>/dev/null)', esperado 1"
-# 2a noite seguida + gc que PENDURA: o mail tem prazo, o reboot sai, o log diz que NAO foi enviado
+# a linha do log nao pode afirmar um corte que ainda nao aconteceu (gate ga-f9ks5v): condicional ate o shutdown voltar
+log_has "WILL BE CUT" && bad "E14 o log afirma 'WILL BE CUT' antes do shutdown voltar — numa noite de shutdown que falha isso e falso" || ok "E14 o log nao afirma um corte antes do shutdown (diz 'IF the shutdown below is accepted')"
+log_has "IF the shutdown below is accepted" && ok "E14 a linha do scraper e condicional ao shutdown aceito" || bad "E14 a linha do scraper nao e condicional"
+# 2a noite seguida + gc que PENDURA (as sondas informativas chamam o gc, por isso os prazos curtos): o aviso do
+# scraper nao e um mail do nightly, entao nao ha 'mail send' pra estourar prazo — o reboot sai, e o gc que as
+# sondas penduraram morre
 W_SCRAPER=1 W_GC_HANG=1 new_world e14b; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
 T0=$(/bin/date +%s)
 NR_LIMIT=120 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=6   # 18s medido em load 55-67; o limite so decide quando um script PENDURADO e reprovado
 T1=$(/bin/date +%s)
-[ "${NR_TIMED_OUT:-0}" = "0" ] && rebooted && ok "E14 gc pendurado: o reboot saiu mesmo assim ($((T1-T0))s)" || bad "E14 gc pendurado travou o reboot (timed_out=${NR_TIMED_OUT:-0})"
-log_has "alarm mail to mayor TIMED OUT" && ok "E14 o log diz que o aviso NAO foi enviado (TIMED OUT)" || bad "E14 sem registro do mail que estourou o prazo. alarm: $(grep -i 'alarm' "$LOGF" 2>/dev/null | tr '\n' '|')"
+[ "${NR_TIMED_OUT:-0}" = "0" ] && rebooted && ok "E14 gc pendurado: o reboot saiu ($((T1-T0))s)" || bad "E14 gc pendurado travou o reboot (timed_out=${NR_TIMED_OUT:-0})"
+grep -q "mail send" "$GC_CALLS" && bad "E14 o nightly tentou mandar mail ao mayor: $(grep 'mail send' "$GC_CALLS" | head -1 | cut -c1-100)" || ok "E14 nenhum 'mail send' tentado pelo nightly (o aviso do scraper vai na pendencia)"
 [ "$(pids_alive "$W/gc.pids")" = "0" ] && ok "E14 o gc pendurado foi morto" || bad "E14 sobrou gc pendurado vivo"
 kill_pids "$W/gc.pids"
-# mail que funciona: o desfecho tambem e registrado
+[ "$(sed -n 's/^scraper_cut_alarm=//p' "$PEND_AT_SHUT" 2>/dev/null | head -1)" = "2" ] && ok "E14 o aviso devido (noite 2) viajou na pendencia" || bad "E14 o aviso devido nao esta na pendencia: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
+# noite em que o aviso e devido e o shutdown PEGA: nem 'alarm mail' no log nem 'mail send' no gc
 W_SCRAPER=1 new_world e14c; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"; run_nr FAKE_HOUR=23
-log_has "alarm mail to mayor: sent" && ok "E14 mail enviado: registrado como 'sent'" || bad "E14 sem 'alarm mail to mayor: sent' no log"
+log_has "alarm mail to mayor" && bad "E14 o log do nightly fala de 'alarm mail to mayor' — quem manda e o pos-boot" || ok "E14 nenhum 'alarm mail to mayor' no log do nightly"
+grep -q "mail send" "$GC_CALLS" && bad "E14 o nightly mandou mail ao mayor numa noite de shutdown aceito: $(grep 'mail send' "$GC_CALLS" | head -1 | cut -c1-100)" || ok "E14 o nightly nao manda mail (o pos-boot manda, depois de confirmar o boot)"
+# a razao com quebra de linha nao vira chave falsa na pendencia (uma linha por campo)
+printf '%s\n' "$(sed -n 's/^scraper_cut_reason=//p' "$PEND_AT_SHUT" 2>/dev/null)" | grep -q 'rod-test' && ok "E14 o motivo (rodada rod-test) chegou na pendencia" || bad "E14 o motivo nao chegou na pendencia: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
+[ "$(grep -c -v -E '^(issued|boot_before|mode|scraper_cut_alarm|scraper_cut_reason)=' "$PEND_AT_SHUT" 2>/dev/null)" = "0" ] && ok "E14 a pendencia so tem as chaves conhecidas (nenhuma linha solta)" || bad "E14 a pendencia tem linha que nao e chave=valor conhecida: $(tr '\n' '|' < "$PEND_AT_SHUT" 2>/dev/null)"
 
 # ═══ E15: o SKIP tambem tem prazo ════════════════════════════════════════════
 # record_skip termina em `gc mail send` (escreve uma bead). Com o Dolt wedged ele pendura, a

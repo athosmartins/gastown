@@ -10,8 +10,9 @@
 #
 # TRIGGER: a user LaunchAgent (scripts/com.gascity.nightly-reboot-postcheck.plist,
 # RunAtLoad, once per login). It fires on EVERY login, so the script acts only when
-# nightly-reboot.sh left PENDING_FILE (issued=, boot_before=, mode=) AND this boot
-# is newer than boot_before. Every other fire is a silent no-op. The plist lives in
+# nightly-reboot.sh left PENDING_FILE (issued=, boot_before=, mode=, and optionally
+# scraper_cut_alarm= / scraper_cut_reason=) AND this boot is newer than boot_before.
+# Every other fire is a silent no-op. The plist lives in
 # scripts/, so daemon-presence-watchdog's PRESENCE-DRIFT sweep alerts if it is
 # merged but never loaded — an unloaded postcheck must not look like a clean night.
 #
@@ -46,8 +47,12 @@
 # silent digest and -p 4 does not change that. The routine OK is left on the digest.
 #
 # NOT CHECKED HERE (by design): the property_scrapers rodada the reboot cut. It is
-# resumed by the scraper's own catch-up (--skip-done-today), owned by that rig; the
-# reboot script already counts nights in a row it was cut and mails the mayor.
+# resumed by the scraper's own catch-up (--skip-done-today), owned by that rig. The reboot
+# script counts the nights in a row it was cut and, from the 2nd, leaves the alarm for the
+# mayor in the pending file; THIS script sends it (send_owed_scraper_alarm), because only
+# here is it known that the cut happened: a mail sent before the shutdown would announce a
+# cut that a failed shutdown never made, and nothing written after `shutdown -r now`
+# returns can be counted on.
 #
 # MODES:
 #   nightly-reboot-postcheck.sh          the LaunchAgent entry (acts only when pending)
@@ -420,6 +425,23 @@ mail_mayor() {
 }
 drop_pending() { rm -f "${PENDING_FILE}" 2>/dev/null; return 0; }
 
+# The scraper-cut alarm nightly-reboot.sh decided on before the shutdown (the counter reached
+# the alarm threshold) and left in the pending file. Absent = nothing is owed (the normal
+# night). Present but not a number = the file is damaged: say so, never mail a guess. Called
+# only past the point where this boot was attributed to the nightly, i.e. after the cut.
+send_owed_scraper_alarm() {
+    local n reason
+    n="$(pending_field scraper_cut_alarm)"
+    [ -n "${n}" ] || return 0
+    case "${n}" in
+        *[!0-9]*) log "ERROR: ${PENDING_FILE} carries scraper_cut_alarm='${n}' (not a number) — the scraper-cut alarm is NOT sent"; return 0 ;;
+    esac
+    reason="$(pending_field scraper_cut_reason)"
+    log "ALARM: the scraper was cut ${n} nights in a row — mailing mayor (property_scrapers owner)"
+    mail_mayor "nightly-reboot: scraper cortado ${n} noites seguidas (ga-a2v0bz)" \
+      "$(printf 'O reboot noturno das 23:40 encontrou uma rodada do scraper em andamento %s noites seguidas e a cortou (o catch-up retoma no boot).\nUltima: %s\nSe a rodada leva horas a cada noite, o ps precisa saber: o corte vira rotina.\nLog: %s' "${n}" "${reason:-<sem motivo registrado>}" "${LOG}")"
+}
+
 # A pending file we cannot read is reported once and dropped: the nightly rewrites it
 # every night, and leaving it would re-report on every login.
 case "${ISSUED}" in ''|*[!0-9]*) ISSUED="" ;; esac
@@ -486,6 +508,7 @@ log "${INFO}"
 if [ "${ROUND_OK}" -eq 1 ]; then
     log "RESULT: all four checks ok after ${ATTEMPT} round(s) — the city is back"
     notify_athos "Reboot noturno OK" "Cidade de pé após o reboot (${ATTEMPT} rodada(s) de conferência): Dolt ok, envio ok, mapa ok, dreno fora. ${INFO}." 3
+    send_owed_scraper_alarm
     drop_pending
     exit 0
 fi
@@ -494,5 +517,6 @@ PROBLEMS="$(print_round_problems | tr '\n' ';')"
 log "RESULT: NOT all ok after ${ATTEMPT} round(s) — ${PROBLEMS}"
 notify_athos "Reboot noturno: pós-boot COM PROBLEMA" "${PROBLEMS} (FAIL = caiu; unknown = não consegui olhar). ${INFO}. Rode: nightly-reboot-postcheck.sh --now" 4 push
 mail_mayor "nightly-reboot: pós-boot com problema (ga-a2v0bz)" "$(printf 'O reboot noturno terminou mas a conferência pós-boot não fechou limpa depois de %s rodada(s):\n%s\n%s\nLog: %s' "${ATTEMPT}" "$(print_round)" "${INFO}" "${LOG}")"
+send_owed_scraper_alarm
 drop_pending
 exit 1

@@ -33,6 +33,9 @@
 #   P13 --now: 4 linhas, sem notify, sem log, sem tocar na pendencia; arg ruim -> exit 2
 #   P14 estatico: nunca faz `source` da sonda, nunca chama o goroutine dump (kill -QUIT)
 #   P15 contrato com nightly-reboot.sh: mesmas chaves da pendencia, mesmos caminhos, mesmo formato do dreno
+#   P17 o aviso "scraper cortado N noites" que o reboot deixa DEVIDO na pendencia (gate ga-f9ks5v): sai daqui,
+#       so num boot confirmado como do noturno (o corte aconteceu); nunca num boot que nao e, nunca com campo
+#       danificado (dito no log), e o desfecho do mail (sent / FAILED) fica registrado
 #
 # ROTEAMENTO (gate FAIL 2/3): o `notify` manda pro digest SILENCIOSO por padrao; -p 4 e o titulo nao
 # mudam isso. P4/P5/P6/P11 perguntam ao notify DE VERDADE (NOTIFY_ROUTE_TEST=1, nao envia nada) onde cai
@@ -539,6 +542,48 @@ grep -qiE 'mapa\.urblink|cloudflareaccess|https?://[a-z0-9.-]+\.com' <<<"$CODE" 
   && bad "P14 o codigo menciona a URL publica do mapa / um host externo — o veredito do mapa nao pode vir da borda (Cloudflare Access responde 302 la, com o mapa de pe ou nao)" \
   || ok "P14 nenhuma URL externa no codigo: o mapa e julgado pela origem (loopback) e pelo tunel"
 
+# ── P17: o aviso do scraper que o reboot deixou devido ───────────────────────
+# O reboot decide ANTES do shutdown (o contador chegou ao limite) mas nao pode mandar: nada escrito depois do
+# `shutdown -r now` sobrevive, e um mail mandado antes anunciaria um corte que um shutdown falho nunca fez. Fica
+# na pendencia; esta conferencia so age num boot que e do noturno — ou seja, depois do corte.
+echo "P17: aviso do scraper devido na pendencia"
+write_pending_alarm() {  # $1 = issued epoch   $2 = N (noites)   $3 = motivo   $4 = boot_before (default BOOT_BEFORE)
+  printf 'issued=%s\nboot_before=%s\nmode=drain\nscraper_cut_alarm=%s\nscraper_cut_reason=%s\n' "$1" "${4:-$BOOT_BEFORE}" "$2" "$3" > "$PENDING"
+}
+new_world p17a; write_pending_alarm "$(( $(now_s) - 300 ))" 2 "rodada rod-test (scraping) em andamento"; run_pc
+[ "$RC" = "0" ] && ok "P17a noite limpa + aviso devido: exit 0 (o aviso nao muda o veredito da cidade)" || bad "P17a exit=$RC. out: $OUT"
+[ "$(grep -c 'mail send mayor' "$GC_CALLS")" = "1" ] && ok "P17a exatamente 1 mail ao mayor" || bad "P17a mails ao mayor: $(grep -c 'mail send mayor' "$GC_CALLS") (esperado 1): $(cut -c1-100 "$GC_CALLS" | tr '\n' '|')"
+grep -F 'mail send mayor' "$GC_CALLS" | grep -qF "scraper cortado 2 noites seguidas" && ok "P17a o assunto diz 'scraper cortado 2 noites seguidas'" || bad "P17a assunto errado: $(grep 'mail send' "$GC_CALLS" | cut -c1-140)"
+grep -qF "rodada rod-test (scraping) em andamento" "$GC_CALLS" && ok "P17a o corpo traz o motivo registrado pelo reboot" || bad "P17a o corpo nao traz o motivo: $(cut -c1-140 "$GC_CALLS" | tr '\n' '|')"
+log_has "ALARM: the scraper was cut 2 nights in a row" && ok "P17a o log diz que o aviso esta sendo mandado" || bad "P17a sem 'ALARM: the scraper was cut 2 nights' no log"
+log_has "mail to mayor: sent" && ok "P17a o desfecho do mail e registrado ('sent')" || bad "P17a sem 'mail to mayor: sent' no log"
+notify_has "Reboot noturno OK" && ok "P17a o 'Reboot noturno OK' de rotina saiu tambem" || bad "P17a sem o notify de OK: $(cat "$NOTIFY_CALLS")"
+[ ! -e "$PENDING" ] && ok "P17a pendencia removida" || bad "P17a pendencia ficou (reenviaria o aviso a cada login)"
+
+W_DOLT_RC=1 new_world p17b; write_pending_alarm "$(( $(now_s) - 300 ))" 4 "rodada rod-test"; run_pc
+[ "$RC" = "1" ] && ok "P17b noite com problema + aviso devido: exit 1" || bad "P17b exit=$RC"
+[ "$(grep -c 'mail send mayor' "$GC_CALLS")" = "2" ] && ok "P17b 2 mails: o do problema E o do scraper (um nao come o outro)" || bad "P17b mails: $(grep -c 'mail send mayor' "$GC_CALLS") (esperado 2): $(cut -c1-100 "$GC_CALLS" | tr '\n' '|')"
+grep -F 'mail send mayor' "$GC_CALLS" | grep -qF "scraper cortado 4 noites seguidas" && ok "P17b o mail do scraper diz 4 noites" || bad "P17b sem o mail do scraper de 4 noites"
+[ ! -e "$PENDING" ] && ok "P17b pendencia removida" || bad "P17b pendencia ficou"
+
+new_world p17c; write_pending_alarm "$(( $(now_s) - 300 ))" "abc" "x"; run_pc
+[ "$RC" = "0" ] && ok "P17c campo danificado: a conferencia segue (exit 0)" || bad "P17c exit=$RC"
+grep -q 'mail send' "$GC_CALLS" && bad "P17c mandou mail com scraper_cut_alarm='abc' (um chute)" || ok "P17c NAO manda mail com um campo que nao e numero"
+log_has "scraper_cut_alarm='abc' (not a number)" && ok "P17c o log diz que o campo esta danificado e o aviso NAO foi mandado (nao some em silencio)" || bad "P17c sem registro do campo danificado: $(grep -i alarm "$LOGF" | tr '\n' '|')"
+
+W_GC_RC=1 new_world p17d; write_pending_alarm "$(( $(now_s) - 300 ))" 2 "rodada rod-test"; run_pc
+[ "$RC" = "0" ] && ok "P17d mail que FALHA: o veredito da cidade nao muda (exit 0)" || bad "P17d exit=$RC"
+log_has "mail to mayor FAILED (rc=1" && ok "P17d o mail que falhou e registrado ('FAILED (rc=1') — nao parece enviado" || bad "P17d sem registro do mail que falhou: $(grep -i mail "$LOGF" | tr '\n' '|')"
+log_has "mail to mayor: sent" && bad "P17d o log diz 'sent' pra um mail que falhou" || ok "P17d nenhum 'sent' falso no log"
+
+# o boot NAO e do noturno: o corte nao aconteceu (ou nao da pra atribuir) -> nenhum mail
+W_BOOT="$BOOT_BEFORE" new_world p17e; write_pending_alarm "$(( $(now_s) - 300 ))" 2 "rodada rod-test"; run_pc
+grep -q 'mail send' "$GC_CALLS" && bad "P17e mesmo boot (o reboot nem aconteceu): mandou o aviso de um corte que nao houve" || ok "P17e mesmo boot: NENHUM mail (o reboot ainda nao aconteceu)"
+[ -e "$PENDING" ] && grep -q '^scraper_cut_alarm=2' "$PENDING" && ok "P17e mesmo boot: a pendencia e o aviso ficam pra quando o boot chegar" || bad "P17e a pendencia (ou o aviso) sumiu antes do boot"
+new_world p17f; write_pending_alarm "$(( $(now_s) - 14400 ))" 2 "rodada rod-test"; run_pc
+grep -q 'mail send' "$GC_CALLS" && bad "P17f pendencia de 4h: mandou o aviso de um boot que nao se atribui ao noturno" || ok "P17f pendencia de 4h: NENHUM mail (o boot nao e atribuido ao noturno)"
+[ ! -e "$PENDING" ] && ok "P17f pendencia velha descartada" || bad "P17f pendencia velha ficou"
+
 # ── P15: contrato com o nightly-reboot.sh (quem ESCREVE a pendencia e o dreno) ──
 # Dois scripts escritos em separado concordam em chaves e caminhos por convencao. Se um
 # renomear uma chave, a conferencia veria "pendencia ilegivel" toda noite — silenciosamente.
@@ -549,6 +594,11 @@ if [ -f "$NIGHTLY" ]; then
   for k in issued boot_before mode; do
     case "$W_FMT" in *"$k=%s"*) ok "P15 o reboot escreve a chave '$k'" ;; *) bad "P15 o reboot nao escreve '$k=' (linha: $W_FMT)" ;; esac
     grep -qE "pending_field $k\b" "$SCRIPT" && ok "P15 a conferencia le a chave '$k'" || bad "P15 a conferencia nao le '$k'"
+  done
+  # as chaves do aviso do scraper (opcionais): o reboot escreve, a conferencia le — sao as mesmas?
+  for k in scraper_cut_alarm scraper_cut_reason; do
+    grep -qF "${k}=%s" "$NIGHTLY" && ok "P15 o reboot escreve a chave opcional '$k'" || bad "P15 o reboot nao escreve '$k=%s'"
+    grep -qE "pending_field $k\b" "$SCRIPT" && ok "P15 a conferencia le a chave opcional '$k'" || bad "P15 a conferencia nao le '$k'"
   done
   d_pending="$(sed -n 's/^PENDING_FILE="\${NIGHTLY_REBOOT_PENDING_FILE:-\(.*\)}"$/\1/p' "$NIGHTLY" | head -1)"
   p_pending="$(sed -n 's/^PENDING_FILE="\${NIGHTLY_REBOOT_PENDING_FILE:-\(.*\)}"$/\1/p' "$SCRIPT" | head -1)"

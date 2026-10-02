@@ -1227,48 +1227,87 @@ drain_informational_report() {
 
 # Scraper cut counter: how many nights in a row the reboot found a rodada running.
 # "unknown" leaves the counter alone (could-not-look is neither a cut nor a clean night).
+#
+# This function only BUMPS the counter and decides whether the alarm is DUE. It does not
+# send it: the alarm tells the mayor "the scraper was cut N nights in a row", and at this
+# point in the night nothing has been cut yet. A mail sent here would be wrong on every night
+# whose shutdown fails (gate ga-f9ks5v), and it cannot be taken back. Nor can it wait for
+# the shutdown to return: the live log shows nothing written after `shutdown -r now` on any
+# night that rebooted. The verdict goes into the pending file (write_pending_file) and the
+# post-boot check — which only acts on a boot that IS the nightly's, i.e. after the cut — sends it.
+SCRAPER_ALARM_N=""
+SCRAPER_ALARM_REASON=""
 record_scraper_cut() {
     local state="$1" reason="$2" n
+    SCRAPER_ALARM_N=""; SCRAPER_ALARM_REASON=""
     n=$(cat "${SCRAPER_CUT_FILE}" 2>/dev/null)
     case "${n}" in (''|*[!0-9]*) n=0 ;; esac
     case "${state}" in
         running)
             n=$(( n + 1 ))
-            printf '%s\n' "${n}" > "${SCRAPER_CUT_FILE}" 2>/dev/null || true
-            log "scraper: the rodada in flight WILL BE CUT by this reboot and resumed by the daily catch-up at boot (night ${n} in a row): ${reason}"
+            if printf '%s\n' "${n}" > "${SCRAPER_CUT_FILE}" 2>/dev/null; then
+                log "scraper: a rodada is in flight — IF the shutdown below is accepted this reboot cuts it and the daily catch-up resumes it at boot (counter -> ${n}; put back if the shutdown fails): ${reason}"
+            else
+                log "ERROR: scraper: a rodada is in flight but the cut counter ${SCRAPER_CUT_FILE} could not be written — the count is NOT kept (tonight would be night ${n}): ${reason}"
+            fi
             if [ "${n}" -ge "${SCRAPER_CUT_ALARM_THRESHOLD}" ] && [ $(( n % SCRAPER_CUT_ALARM_THRESHOLD )) -eq 0 ]; then
-                log "ALARM: the scraper was cut ${n} nights in a row — mailing mayor (property_scrapers owner)"
-                # `mail send` writes a bead, so a wedged Dolt hangs it: bounded, and the
-                # outcome is logged — a send that failed must not read like one that went.
-                local mail_out mail_rc
-                mail_out="$(mktemp -t nightly-reboot-mail)"
-                run_bounded "${INFO_PROBE_TIMEOUT}" "${mail_out}" \
-                  "${GC}" --city "${CITY}" mail send mayor --from nightly-reboot.sh \
-                  -s "nightly-reboot: scraper cortado ${n} noites seguidas (ga-a2v0bz)" \
-                  -m "$(printf 'O reboot noturno das 23:40 encontrou uma rodada do scraper em andamento %s noites seguidas e a cortou (o catch-up retoma no boot).\nUltima: %s\nSe a rodada leva horas a cada noite, o ps precisa saber: o corte vira rotina.\nLog: %s' "${n}" "${reason}" "${LOG}")"
-                mail_rc=$?
-                case "${mail_rc}" in
-                    0)   log "alarm mail to mayor: sent" ;;
-                    124) log "ERROR: alarm mail to mayor TIMED OUT after ${INFO_PROBE_TIMEOUT}s — NOT sent (Dolt not answering?); the reboot proceeds" ;;
-                    *)   log "ERROR: alarm mail to mayor FAILED (rc=${mail_rc}: $(head -c 300 "${mail_out}" 2>/dev/null | tr '\n' ' ')); the reboot proceeds" ;;
-                esac
-                rm -f "${mail_out}" "${mail_out}.deadline"
+                SCRAPER_ALARM_N="${n}"
+                SCRAPER_ALARM_REASON="${reason}"
+                log "ALARM due: the scraper would be cut ${n} nights in a row — the mail to the mayor goes from the post-boot check, once the boot is confirmed as the nightly's (not before: a failed shutdown cuts nothing)"
             fi
             ;;
-        clear) printf '0\n' > "${SCRAPER_CUT_FILE}" 2>/dev/null || true ;;
+        clear) printf '0\n' > "${SCRAPER_CUT_FILE}" 2>/dev/null || log "ERROR: scraper: could not reset the cut counter ${SCRAPER_CUT_FILE} — it keeps the old count" ;;
         *) log "scraper: state unknown (${reason}) — cut counter left at ${n}" ;;
     esac
 }
 
+# The night's two counters (the skip streak and the scraper-cut counter) are written BEFORE
+# the shutdown call, because nothing written after it is reliable (see record_scraper_cut).
+# So a shutdown that does not take has to put them back, and exactly: a file that did not
+# exist stays absent, one that held 13 holds 13 again. "Could not read it" is its own state —
+# it is reported and the file is left as it is now, never "restored" to a guess.
+STREAK_PREV_STATE=""; STREAK_PREV=""
+CUT_PREV_STATE="";    CUT_PREV=""
+night_counters_save() {
+    if [ -e "${STREAK_FILE}" ]; then
+        if STREAK_PREV="$(cat "${STREAK_FILE}" 2>/dev/null)"; then STREAK_PREV_STATE="present"; else STREAK_PREV_STATE="unreadable"; fi
+    else STREAK_PREV_STATE="absent"; fi
+    if [ -e "${SCRAPER_CUT_FILE}" ]; then
+        if CUT_PREV="$(cat "${SCRAPER_CUT_FILE}" 2>/dev/null)"; then CUT_PREV_STATE="present"; else CUT_PREV_STATE="unreadable"; fi
+    else CUT_PREV_STATE="absent"; fi
+}
+# restore_counter <file> <state> <value> <label>
+restore_counter() {
+    case "$2" in
+        present)
+            if printf '%s\n' "$3" > "$1" 2>/dev/null; then log "counters: $4 put back to ${3:-<empty>}"
+            else log "ERROR: counters: could not put the $4 back to ${3:-<empty>} (write to $1 failed) — it holds tonight's value"; fi ;;
+        absent)
+            rm -f "$1" 2>/dev/null
+            if [ -e "$1" ]; then log "ERROR: counters: could not remove $1 — the $4 holds tonight's value, it was absent before"
+            else log "counters: $4 put back to absent"; fi ;;
+        *) log "WARN: counters: the $4 file was unreadable before tonight's write — left as it is now, not restored from a guess" ;;
+    esac
+}
+night_counters_restore() {
+    restore_counter "${STREAK_FILE}" "${STREAK_PREV_STATE}" "${STREAK_PREV}" "skip streak"
+    restore_counter "${SCRAPER_CUT_FILE}" "${CUT_PREV_STATE}" "${CUT_PREV}" "scraper-cut counter"
+}
+
 # Handoff to the post-boot check (scripts/nightly-reboot-postcheck.sh): "this boot is ours".
 write_pending_file() {
-    local mode="$1" tmp="${PENDING_FILE}.tmp.$$"
+    local mode="$1" tmp="${PENDING_FILE}.tmp.$$" reason
+    # The scraper-cut alarm owed to the mayor (record_scraper_cut) rides in the same file: the
+    # post-boot check sends it only once it has confirmed this boot is the nightly's. One line
+    # per field — a newline in the reason would become a bogus extra key.
+    reason="$(printf '%s' "${SCRAPER_ALARM_REASON}" | tr '\n\r' '  ')"
     if { printf 'issued=%s\nboot_before=%s\nmode=%s\n' "$(date +%s)" "$(boot_epoch)" "${mode}" > "${tmp}" \
+         && { [ -z "${SCRAPER_ALARM_N}" ] || printf 'scraper_cut_alarm=%s\nscraper_cut_reason=%s\n' "${SCRAPER_ALARM_N}" "${reason}" >> "${tmp}"; } \
          && chmod 644 "${tmp}" && mv -f "${tmp}" "${PENDING_FILE}"; } 2>/dev/null; then
         return 0
     fi
     rm -f "${tmp}" 2>/dev/null
-    log "WARN: could not write ${PENDING_FILE} — the post-boot check will not know this reboot was the nightly one"
+    log "WARN: could not write ${PENDING_FILE} — the post-boot check will not know this reboot was the nightly one${SCRAPER_ALARM_N:+, and the scraper-cut alarm owed to the mayor (night ${SCRAPER_ALARM_N}) will NOT be sent}"
     return 0
 }
 
@@ -1329,9 +1368,10 @@ log "swapfiles before: $(ls /System/Volumes/VM/ 2>/dev/null | grep -c swapfile)"
 # install above, and none of them stops the central sender. Read it again as late as
 # possible; a send that started in the gap holds the reboot like one that was there at
 # 23:40. The streak is reset only after this, so a night that ends here as a SKIP keeps
-# counting. What is left between this read and the shutdown is the routine note below,
-# the scraper-cut bookkeeping (a local file; the alarm mail only from the 2nd night in a
-# row, bounded by INFO_PROBE_TIMEOUT), the pending file and `sync` — seconds, not minutes.
+# counting. What is left between this read and the shutdown is the routine note below
+# (notify: not bounded here, see the header), the counters' bookkeeping (two local files;
+# the scraper-cut alarm mail is NOT sent from here, it rides in the pending file), the
+# pending file itself and `sync` — seconds, not minutes.
 if [ "${REBOOT_MODE}" = "drain" ]; then
     log "final safety re-check, just before the shutdown (the 23:40 verdict is minutes old)"
     safety_gate_wait || drain_skip_night
@@ -1344,12 +1384,22 @@ fi
 # one of the calls this script does not bound (see the header), and that time was not
 # measured here — it is a routine note on the digest route, not an alarm push.
 notify_athos "Reboot noturno" "Reiniciando às $(date '+%H:%M') pra liberar swap acumulado. Volto em ~2min (auto-login)." 3
-reset_streak
 
-# The scraper-cut counter is bumped HERE, as late as it can be: it counts nights the
-# scraper was cut, so it must not move on a night that dies before the shutdown call
-# (the macOS install or the notify above can take the whole budget). drain_main
-# stored the verdict in SCRAPER_DAILY_STATE / SCRAPER_DAILY_REASON.
+# The night's bookkeeping — the skip streak back to 0, the scraper-cut counter — is written
+# HERE, right before the shutdown call and not earlier, so nothing slow sits between it and
+# the shutdown; and it is written BEFORE the call because nothing written after it can be
+# counted on (the live log shows no line after `shutdown -r now` on any night that rebooted:
+# the machine takes the script down). The price is the failure branch below, which has to put
+# it back: a shutdown that does not take is a night WITHOUT a reboot — the streak must keep
+# counting it, not erase it. The scraper-cut alarm mail is not sent from here at all (see
+# record_scraper_cut); drain_main stored the verdict in SCRAPER_DAILY_STATE / SCRAPER_DAILY_REASON.
+# LIMIT: only a shutdown that RETURNS non-zero is undone. A TERM/KILL that lands between this
+# write and the shutdown call is not: from inside the script it cannot be told apart from the
+# reboot taking the script down (the normal end of a good night), so an EXIT-trap "restore"
+# would undo the counters on every night that works. The window is a few local file writes
+# and `sync`.
+night_counters_save
+reset_streak
 if [ "${REBOOT_MODE}" = "drain" ]; then
     record_scraper_cut "${SCRAPER_DAILY_STATE:-unknown}" "${SCRAPER_DAILY_REASON:-no reason}"
 fi
@@ -1376,8 +1426,19 @@ if [ "${RC}" -eq 0 ]; then
     log "shutdown accepted (rc 0) — the machine is going down; the drain signal is left in place (the reboot invalidates it) and the post-boot check takes over"
     exit 0
 fi
+# The shutdown did not take: tonight is a SKIP that the "Reiniciando" note above got wrong.
+# Everything tonight wrote on the assumption that the reboot would happen is undone — the
+# pending file, the streak reset, the scraper-cut counter and the alarm owed for it (it
+# was only ever in the pending file, now gone, so no "scraper cortado" mail goes out for a
+# cut that did not happen) — and the night is counted as a skipped one, with the push that
+# the digest-routed "Reiniciando" cannot be. The drain signal is released by the EXIT trap
+# (DRAIN_ACTIVE is still 1).
 rm -f "${PENDING_FILE}" 2>/dev/null
+SCRAPER_ALARM_N=""; SCRAPER_ALARM_REASON=""
 log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
+night_counters_restore
+notify_athos "Reboot noturno FALHOU" "o shutdown devolveu rc=${RC} às $(date '+%H:%M') — a máquina NÃO reiniciou (o 'Reiniciando às…' de antes não aconteceu). A noite conta como pulada. Ver ${LOG}." 4 push
+record_skip_bounded "shutdown returned ${RC}"
 exit 1
 }
 

@@ -2,7 +2,28 @@
 
 **Estado:** código pronto e testado; falta (1) o merge pelo gate, (2) instalar a conferência
 pós-boot, (3) UM comando `sudo` que move o horário do LaunchDaemon. Enquanto o passo 3 não
-roda, nada muda: o reboot segue às 01:00 no fluxo legado, que esta entrega não alterou.
+roda, o reboot segue às 01:00 e os **guards e a espera do fluxo legado são os de sempre**. Mas o
+merge (passo 1) **muda o que o script faz nessa noite das 01:00** — a lista real, conferida contra o
+script de antes (`eae3207a8`), é esta:
+
+1. **SKIP e alarme "N noites seguidas" vão por push** ("Reboot noturno pulado", "🚨 … noites seguidas
+   sem reiniciar"). Antes iam pro digest silencioso (0 de 47 avisos deste script chegaram ao push).
+   Uma noite pulada às ~02:27 passa a avisar na hora.
+2. **O registro do skip tem prazo** (`record_skip_bounded`, 120 s): um `gc mail send` pendurado
+   (Dolt doente) não prende mais a instância e a noite seguinte dispara.
+3. **A contagem de `in_progress` por rig (informativa) tem prazo** (≤30 s por sonda, ≤75 s no total).
+4. **Escreve o arquivo de pendência** `.gc/logs/nightly-reboot.pending` (`mode=legacy`): a conferência
+   pós-boot passa a agir também depois do reboot das 01:00 e manda o "Reboot noturno OK" (isso, depois do passo 2).
+5. **O streak é zerado logo antes do `shutdown`**, depois do aviso "Reiniciando" (antes: antes dos
+   logs de disco/swap e do aviso).
+6. **Shutdown aceito (rc 0): sai com 0** e registra `shutdown accepted`. Antes registrava sempre
+   `ERROR: shutdown returned … reboot did NOT happen` e saía com 1, mesmo com a máquina caindo
+   (essa linha nunca aparece nos logs das 12 noites que reiniciaram: o script morre antes de escrevê-la).
+7. **Shutdown que falha (rc ≠ 0): a noite vira SKIP.** O streak e o contador de scraper cortado
+   **voltam ao que eram** (arquivo ausente continua ausente), a noite entra no streak como pulada
+   (+1: o streak **não** é zerado numa noite sem reboot), sai o push **"Reboot noturno FALHOU"**, a
+   pendência e o sinal de dreno são removidos e o script sai com 1. Antes: só a linha de ERROR, com o
+   streak já zerado.
 
 ## Por que existe
 
@@ -22,12 +43,16 @@ Pedido do Athos (01/10, P0): reiniciar **antes** do scraper. Desenho no bead ga-
 | 23:00–23:40 | Espera, re-carimbando o sinal a cada 5 min. |
 | 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`, rodado como o usuário via `sudo -u`, como o `notify` — como root ele poderia deixar `-shm`/`-wal` de root ao lado da fila do sender) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
 | 23:40 | Gate com marker, bead em `in_progress` e rodada do scraper viram **informativos**: vão pro log e pro snapshot `.gc/logs/nightly-reboot-pre-<data>.txt` como "o que este reboot corta". O gate re-enfileira, o reclaim devolve o bead, o scraper retoma pelo catch-up. |
-| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. Com o shutdown **aceito** (rc 0) o sinal **fica** no disco (soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair); se o shutdown falhar (rc ≠ 0) ele é solto na hora. |
-| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (**mapa** = a ORIGEM em `127.0.0.1:8099` **e** o túnel cloudflared: job com PID + o `/ready` dele com ≥ 1 conexão de borda; o pior dos dois vale. A URL pública `mapa.urblink.com.br` **não** entra: o Cloudflare Access responde 302 na borda, com o mapa de pé ou não) (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). |
+| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. Com o shutdown **aceito** (rc 0) o sinal **fica** no disco (soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair); se o shutdown falhar (rc ≠ 0) ele é solto na hora, o streak e o contador do scraper voltam ao que eram, a noite conta como pulada e sai o push **"Reboot noturno FALHOU"**. |
+| pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (**mapa** = a ORIGEM em `127.0.0.1:8099` **e** o túnel cloudflared: job com PID + o `/ready` dele com ≥ 1 conexão de borda; o pior dos dois vale. A URL pública `mapa.urblink.com.br` **não** entra: o Cloudflare Access responde 302 na borda, com o mapa de pé ou não) (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). É também **daqui** que sai o mail "scraper cortado N noites seguidas" (abaixo). |
 
 Noite que não consegue reiniciar até ~23:55: **solta o dreno na hora**, registra SKIP (aviso **"Reboot noturno pulado"** por push) e segue o
 streak/alarme de sempre (o alarme de N noites seguidas também vai por push). Uma noite falha nunca deixa a cidade congelada. Rodada do scraper
-cortada 2 noites seguidas → mail ao mayor (o ps precisa saber que o corte virou rotina).
+cortada 2 noites seguidas → mail ao mayor (o ps precisa saber que o corte virou rotina). **Quem manda é a conferência pós-boot, não o
+reboot:** na hora de decidir nada foi cortado ainda (um shutdown que falha não corta nada, e o mail não se desfaz), e depois do
+`shutdown -r now` nada que o script escreve sobrevive. O reboot só deixa o aviso devido na pendência (`scraper_cut_alarm=` e
+`scraper_cut_reason=`); a conferência o manda ao confirmar que este boot é o do noturno. Um shutdown que falha **desfaz** o contador e
+descarta o aviso junto com a pendência: não sai mail por corte que não houve.
 
 ## Ordem OBRIGATÓRIA
 
@@ -64,8 +89,12 @@ está fora da sua janela 01:00–01:19 e pula: noites perdidas, em silêncio.
   assim** — um Dolt doente de madrugada é justamente quando o reboot mais importa — e o snapshot
   `nightly-reboot-pre-<data>.txt` registra a linha como `unknown`, não como `ok`. Se aparecer
   várias noites seguidas, o Dolt está lento de madrugada: investigar à parte (`gc dolt health`).
-- `ERROR: alarm mail to mayor TIMED OUT` / `FAILED` e `ERROR: recording the skip ... TIMED OUT`: o
-  aviso ao mayor não saiu (o contador/streak já estava gravado). Antes isso era silencioso.
+- `postcheck: ERROR: mail to mayor TIMED OUT` / `FAILED` (no mesmo log) e `ERROR: recording the skip ... TIMED OUT`: o
+  aviso ao mayor não saiu (o contador/streak já estava gravado). Antes isso era silencioso. Se o campo
+  `scraper_cut_alarm` da pendência vier danificado, o log diz `... (not a number) — the scraper-cut alarm is NOT sent`.
+- Noite em que o shutdown **falhou**: `ERROR: shutdown returned N — reboot did NOT happen`, depois
+  `counters: skip streak put back to …` / `scraper-cut counter put back to …`, o push **"Reboot noturno FALHOU"**
+  e `skip streak: N consecutive night(s)`. A cidade volta a admitir trabalho (dreno solto). Nenhum mail "scraper cortado".
 - se algo ficou de pé: push **"pós-boot COM PROBLEMA"** com o check e o rótulo (`FAIL` = caiu,
   `unknown` = não consegui olhar). `nightly-reboot-postcheck.sh --now` repete a conferência a qualquer hora.
 
@@ -76,7 +105,8 @@ sudo /usr/libexec/PlistBuddy -c 'Set :StartCalendarInterval:Hour 1' /Library/Lau
 sudo launchctl bootout system/com.gascity.nightly-reboot
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.gascity.nightly-reboot.plist
 ```
-O fluxo legado das 01:00 continua no script, intacto.
+O fluxo legado das 01:00 continua no script, **com as 7 mudanças listadas no topo** (o rollback devolve o horário, não o
+comportamento de antes do merge).
 
 ## Soltar uma cidade drenada à mão
 
