@@ -6251,13 +6251,19 @@ _beadid_branch_signal() {
 # to turn into an escalation: _beadid_needs_remerge_branch checks for the
 # functions and returns rc 2 ("could not tell" → the caller touches nothing),
 # and the warn below makes the fault loud once per process instead of silent.
+# ga-3ebneo: the four already-built probes (_filter_built, _target_has_real_branch,
+# _beadid_has_crew_branch, _beadid_matched_crew_branch_ref) read the same lib through
+# _delivery_branch_local_ref / _delivery_branch_remote_hit and degrade the same way:
+# a missing lib is "could not tell", which each of them maps to the value it already
+# used for "don't know" (KEEP the candidate / "no branch") — so without the lib the
+# Pilot loses its already-built veto and its in-flight signal, and the warn says so.
 # stderr of the source itself is deliberately NOT suppressed (a corrupt sibling
 # should be loud).
 _GC_DBP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/delivery-branch-patterns.sh"
 if [ -r "$_GC_DBP_SIBLING" ]; then
   source "$_GC_DBP_SIBLING"
 else
-  warn "ga-x7m5rg: delivery-branch-patterns.sh missing/unreadable next to pilot-dispatcher.sh ($_GC_DBP_SIBLING) — the gate:needs-remerge branch lookup returns 'unknown' (no resubmit, no escalation) until it is restored."
+  warn "ga-x7m5rg/ga-3ebneo: delivery-branch-patterns.sh missing/unreadable next to pilot-dispatcher.sh ($_GC_DBP_SIBLING) — the gate:needs-remerge branch lookup returns 'unknown' (no resubmit, no escalation) AND the already-built probes (_filter_built, _target_has_real_branch, _beadid_has_crew_branch, _beadid_matched_crew_branch_ref) see no branch (candidates are kept, the in-flight ownership signal is off) until it is restored."
 fi
 unset _GC_DBP_SIBLING
 

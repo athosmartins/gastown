@@ -1,8 +1,11 @@
 # delivery-branch-patterns.sh — single source of truth for "which branch names
 # can carry a bead's delivery" (ga-x7m5rg). Sourced, never executed.
 #
-# Consumed by pilot-dispatcher.sh (_beadid_needs_remerge_branch, the ga-e2n96
-# resubmit-or-escalate decision). quality-gate-guard.sh's GAP-1/GAP-2 reconcilers
+# Consumed by pilot-dispatcher.sh: _beadid_needs_remerge_branch (the ga-e2n96
+# resubmit-or-escalate decision, ga-x7m5rg) and — through _delivery_branch_local_ref /
+# _delivery_branch_remote_hit — the four "does this bead already have a branch?" probes
+# _filter_built, _target_has_real_branch, _beadid_has_crew_branch and
+# _beadid_matched_crew_branch_ref (ga-3ebneo). quality-gate-guard.sh's GAP-1/GAP-2 reconcilers
 # (ga-pa36, ga-g3g72, ga-tconzw) still carry their own literal copies of this
 # list; delivery-branch-patterns.selftest.sh drift-guards them against it, so a
 # prefix added in one place and not the other fails a test instead of shipping.

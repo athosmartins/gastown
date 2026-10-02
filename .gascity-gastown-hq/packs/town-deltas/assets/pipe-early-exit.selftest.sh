@@ -97,7 +97,7 @@ A_SHA=$(git -C "$A_REPO" rev-parse HEAD)
 } | git -C "$A_REPO" update-ref --stdin
 
 echo ""
-echo "── A1. _filter_built's exact for-each-ref idiom (~L4279): --count=1 removes the SIGPIPE race the old head-1-only shape had ──"
+echo "── A1. the for-each-ref idiom _filter_built used before ga-3ebneo moved it into _delivery_branch_local_ref (A4 runs the real helper): --count=1 removes the SIGPIPE race the old head-1-only shape had ──"
 OLD_RC=0
 ( set -euo pipefail
   git -C "$A_REPO" for-each-ref --format='%(refname)' \
@@ -175,6 +175,29 @@ else
     ok "A3: _beadid_needs_remerge_branch matched on $NRB_OK/$RUNS_A runs against 15000 fix/* refs"
   else
     bad "A3: _beadid_needs_remerge_branch only matched $NRB_OK/$RUNS_A runs — race still present"
+  fi
+fi
+
+echo ""
+echo "── A4. _delivery_branch_local_ref (ga-3ebneo), the REAL helper behind _filter_built / _target_has_real_branch / _beadid_has_crew_branch / _beadid_matched_crew_branch_ref: finds the branch on every run, no SIGPIPE false-negative ──"
+FN_DBP="$(extract_fn "$PD" _delivery_branch_patterns_ready)"
+FN_DBL="$(extract_fn "$PD" _delivery_branch_local_ref)"
+if [ -z "$FN_DBP" ] || [ -z "$FN_DBL" ]; then
+  bad "A4: _delivery_branch_local_ref / _delivery_branch_patterns_ready not found in $PD"
+else
+  DBL_OK=0
+  for _ in $(seq 1 "$RUNS_A"); do
+    _r=$( ( set -euo pipefail
+            . "$SELF_DIR/delivery-branch-patterns.sh"
+            eval "$FN_DBP"
+            eval "$FN_DBL"
+            _delivery_branch_local_ref "$A_REPO" "$A_ID"
+          ) 2>/dev/null ) && case "$_r" in refs/heads/fix/"$A_ID"-*) DBL_OK=$((DBL_OK+1)) ;; esac
+  done
+  if [ "$DBL_OK" -eq "$RUNS_A" ]; then
+    ok "A4: _delivery_branch_local_ref returned the fix/<id>-* branch on $DBL_OK/$RUNS_A runs against 15000 matching refs"
+  else
+    bad "A4: _delivery_branch_local_ref only returned the branch on $DBL_OK/$RUNS_A runs — race (or a lookup regression) present"
   fi
 fi
 
