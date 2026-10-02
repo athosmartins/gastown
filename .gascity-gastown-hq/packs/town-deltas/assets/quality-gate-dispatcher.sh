@@ -10674,6 +10674,19 @@ reviewer_session_bead_state() {
 # phase-c-verdict-rehydrate block above gate_collect_verdicts — the same
 # state contract that function itself relies on.
 #
+# ga-uk0km5: every path that answers "keep waiting" SAYS WHY, in one log line
+# naming the slot and the reviewer. It used to answer 1 in silence on six
+# different paths (roster unreadable, verdict bead unreadable, assignee capture
+# unreadable, reviewer not nameable, reviewer in the roster, session bead
+# open/not found), so a run that
+# sat at "still in flight (0/2 ...)" gave no hint which of them held it — and
+# the first reading of the 02/10 reboot incident (run ga-jb52od) blamed the
+# wrong one: the dead reviewer's verdict bead had lost its assignee, but the
+# capture already falls back to metadata.gc.session_name (ga-8wec8c), so that
+# slot was classified closed on the first sweep; what held the run was the
+# OTHER slot, whose session name had been re-created by the engine and was in
+# the roster. A name that is listed counts as live, whoever created it.
+#
 # ga-s4potx: this is the DEBOUNCE-FREE counterpart to the timeout-gated
 # dead-reviewer classify loop in the caller. That loop only runs once
 # PC_ELAPSED > PC_TIMEOUT_SECS — by design, per ga-eqjo's scope reduction
@@ -10686,7 +10699,10 @@ reviewer_session_bead_state() {
 gate_phase_c_all_pending_closed() {
   local _pcc_sess_json _pcc_any_pending=0 _pcc_all_closed=1 _pcc_j _pcc_vb _pcc_vb_json _pcc_vb_st _pcc_sid _pcc_hours _pcc_bst
   _pcc_sess_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
-  [ -z "$_pcc_sess_json" ] && return 1
+  if [ -z "$_pcc_sess_json" ]; then
+    warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: 'gc session list' unreadable this sweep — not confirming any reviewer dead; run keeps waiting (root-class:error-vs-empty, ga-uk0km5)."
+    return 1
+  fi
   # ga-oj7bzs: bound the session-bead lookup to the run's age (+3h margin); an
   # unknown age falls back to 24h rather than 0h or unbounded.
   case "${PC_ELAPSED:-}" in
@@ -10696,14 +10712,24 @@ gate_phase_c_all_pending_closed() {
   for _pcc_j in "${!VERDICT_BEAD_IDS[@]}"; do
     _pcc_vb="${VERDICT_BEAD_IDS[$_pcc_j]}"
     if ! _pcc_vb_json=$(bd -C "$GC_CITY" show "$_pcc_vb" --json 2>/dev/null); then
-      return 1   # unreadable -- can't confirm, don't guess (root-class:error-vs-empty)
+      # unreadable -- can't confirm, don't guess (root-class:error-vs-empty)
+      warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb unreadable this sweep (bd show failed) — not confirming its reviewer dead; run keeps waiting (root-class:error-vs-empty, ga-uk0km5)."
+      return 1
     fi
     _pcc_vb_st=$(printf '%s' "$_pcc_vb_json" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || true)
     [ "$_pcc_vb_st" = "closed" ] && continue
     _pcc_any_pending=1
     _pcc_sid="${SESSION_IDS[$_pcc_j]:-}"
-    if [ "$_pcc_sid" = "__UNKNOWN__" ] || [ -z "$_pcc_sid" ]; then
-      return 1   # unreadable assignee capture -- can't confirm either (mirrors ga-i5s5)
+    if [ "$_pcc_sid" = "__UNKNOWN__" ]; then
+      # unreadable assignee capture -- can't confirm either (mirrors ga-i5s5)
+      warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: the reviewer of verdict bead $_pcc_vb could not be read at the start of this sweep (bd show failed) — not confirming it dead; run keeps waiting (root-class:error-vs-empty, ga-i5s5, ga-uk0km5)."
+      return 1
+    fi
+    if [ -z "$_pcc_sid" ]; then
+      # The bead WAS read, but neither its assignee nor metadata.gc.session_name names a reviewer (the capture already falls back from
+      # one to the other, ga-8wec8c). Not "unreadable": nobody can tell dead from alive from here, so it waits for the timeout.
+      warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb is pending but neither its assignee nor metadata.gc.session_name names a reviewer — cannot tell dead from alive; run keeps waiting for the timeout (ga-uk0km5)."
+      return 1
     fi
     if [ "$(reviewer_session_confirmed_closed "$_pcc_sid" "$_pcc_sess_json")" != "1" ]; then
       # ga-oj7bzs: a session that died (e.g. a reboot) is ABSENT from the
@@ -10715,7 +10741,12 @@ gate_phase_c_all_pending_closed() {
         case "$_pcc_bst" in
           closed) continue ;;
           unknown) warn "  Phase C: reviewer $_pcc_sid is absent from 'gc session list' and its session bead could not be read this sweep — not confirming it dead; run keeps waiting (root-class:error-vs-empty, ga-oj7bzs)." ;;
+          *) log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is absent from 'gc session list' but its session bead is '$_pcc_bst' (a live or not-yet-created incarnation of that name) — run keeps waiting (ga-uk0km5)." ;;
         esac
+      else
+        # Listed means live for this purpose even when the engine, not the dispatcher, re-created the session under the same name after
+        # a reboot (02/10, ga-5jn3qy: assignee cleared, name re-used by ga-99c4i4): the name is the slot's identity.
+        log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is in 'gc session list' (alive, booting or re-created under the same name) — run keeps waiting; it is not confirmed dead (ga-uk0km5)."
       fi
       _pcc_all_closed=0
       break
