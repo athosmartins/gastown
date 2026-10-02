@@ -16,8 +16,8 @@
 #      required;
 #   4. a LISTED reviewer's line carries the roster's .state and never calls the
 #      session "alive": a listed session can be drained / quarantined /
-#      failed-create (dead states that only the run timeout classifies,
-#      reviewer_session_alive), and this check reads .closed only.
+#      failed-create / archived (dead states that only the run timeout
+#      classifies, reviewer_session_alive), and this check reads .closed only.
 #
 # WHY THIS TEST EXISTS. ga-uk0km5 was filed reading that incident as "empty
 # assignee -> `return 1` -> the dead reviewer is never classified". Run against
@@ -89,7 +89,8 @@ ROSTER_NEITHER='{"sessions":[{"session_name":"unrelated","closed":false}]}'
 #            SHOW_FAIL_CAPTURE=1 (show fails while the capture runs, then recovers),
 #            SHOW_FAIL_PREDICATE=1 (show works for the capture, then fails inside the predicate),
 #            SESS_JSON (the roster; empty = unreadable), CLOSED_OUT/OPEN_OUT (session-bead queries),
-#            REQUIRED_V (REQUIRED_REVIEWERS; default = the number of verdict beads)
+#            REQUIRED_V (REQUIRED_REVIEWERS; default = the number of verdict beads),
+#            VR_V (VERDICTS_RECEIVED as gate_collect_verdicts would have counted it; default 0)
 #   out:     $WORK/case.log (log:/warn:/bdquery:/finalize_called: lines), $WORK/case.out (stdout+stderr)
 run_case() {
   local f="$WORK/case.sh"
@@ -147,7 +148,7 @@ COMMON
     echo 'GATE_RUN_ID="ga-jb52od"'
     printf '%s\n' "$REHYDRATE"
     echo 'done'
-    echo 'REQUIRED_REVIEWERS=${REQUIRED_V:-${#VERDICT_BEAD_IDS[@]}}; VERDICTS_RECEIVED=0; ANY_FAIL=0; PC_ELAPSED=${PC_ELAPSED_V-2616}'
+    echo 'REQUIRED_REVIEWERS=${REQUIRED_V:-${#VERDICT_BEAD_IDS[@]}}; VERDICTS_RECEIVED=${VR_V:-0}; ANY_FAIL=0; PC_ELAPSED=${PC_ELAPSED_V-2616}'
     echo 'for _dummy in 1; do'
     printf '%s\n' "$DECISION"
     echo 'done'
@@ -181,7 +182,7 @@ has_line "^bdquery:.*status=closed" && ok "the absent slot 1 was looked up throu
 echo "── 3. reviewer not nameable: assignee AND metadata.gc.session_name empty (bead read fine) -> wait, and say it is not 'unreadable' ──"
 VBS_JSON="[$VB1_EMPTY]" VB_SHOW_1="$VB1_EMPTY" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
 finalized && bad "finalized a run whose reviewer cannot be named: $(dump)" || ok "left in flight"
-has_line "^warn:.*ga-e7yxde.*neither its assignee nor metadata.gc.session_name names a reviewer.*re-queued.*ga-uk0km5" && ok "warn names the bead, says the reviewer cannot be named, and says what the timeout concludes (re-queue)" || bad "silent / wrong reason for an unnameable reviewer: $(dump)"
+has_line "^warn:.*ga-e7yxde.*neither its assignee nor metadata.gc.session_name names a reviewer.*re-queued only if every pending reviewer reads dead.*TIMED OUT.*ga-uk0km5" && ok "warn names the bead, says the reviewer cannot be named, and states the timeout outcome truthfully (re-queue ONLY if every pending reviewer reads dead, else TIMED OUT)" || bad "silent / wrong reason for an unnameable reviewer: $(dump)"
 
 echo "── 4. roster unreadable -> wait, and say so ──"
 VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON="" CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
@@ -213,7 +214,7 @@ finalized && bad "re-queued a run whose slot name is alive in the roster: $(dump
 has_line "^bdquery:" && bad "queried session beads for a reviewer that is present in the roster (needless per-sweep cost)" || ok "no session-bead query for a listed reviewer"
 
 echo "── 9. listed but in a DEAD state (drained) / with no state field: the line says the state, never 'alive' ──"
-for ST in drained quarantined failed-create; do
+for ST in drained quarantined failed-create archived; do
   VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON='{"sessions":[{"session_name":"'"$N1"'","id":"ga-x9","state":"'"$ST"'","closed":false}]}' CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
   finalized && bad "$ST: finalized (this check reads .closed only; the timeout classifies a $ST session): $(dump)" || ok "$ST: left in flight (unchanged decision)"
   has_line "^log:.*ga-e7yxde's reviewer $N1 is in 'gc session list' with state '$ST'.*ga-uk0km5" && ok "$ST: the line carries state '$ST'" || bad "$ST: state missing from the line: $(dump)"
@@ -221,14 +222,18 @@ for ST in drained quarantined failed-create; do
 done
 VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON='{"sessions":[{"session_name":"'"$N1"'","id":"ga-x9","closed":false}]}' CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
 has_line "^log:.*is in 'gc session list' with state 'none'" && ok "a roster row without .state reads 'none', not an empty gloss" || bad "no-state row: $(dump)"
+VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON='{"sessions":[{"session_name":"'"$N1"'","id":"ga-x9","state":"","closed":false}]}' CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[]' run_case
+has_line "^log:.*is in 'gc session list' with state 'none'" && ok "a row with state \"\" reads 'none' too (not 'unreadable')" || bad "empty-state row: $(dump)"
 
-echo "── 10. nothing pending but fewer verdicts than required -> wait, and say it with the counts (not silent, not 'all delivered') ──"
-VB1_CLOSED='{"id":"ga-e7yxde","status":"closed","assignee":null,"labels":["gate-run:ga-jb52od","reviewer-index:1","type:quality-gate-verdict","verdict:pass"],"metadata":{"gc.session_name":"'"$N1"'"}}'
-VBS_JSON="[$VB1_CLOSED]" VB_SHOW_1="$VB1_CLOSED" VB_SHOW_2="$VB2" REQUIRED_V=2 SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT='[]' OPEN_OUT='[]' run_case
+echo "── 10. nothing pending but fewer verdicts than required (ONE verdict bead exists, closed and counted; 2 required) -> wait, with the counts ──"
+VB1_CLOSED='{"id":"ga-e7yxde","status":"closed","assignee":null,"labels":["gate-run:ga-jb52od","reviewer-index:1","type:quality-gate-verdict","verdict:PASS"],"metadata":{"gc.session_name":"'"$N1"'"}}'
+VBS_JSON="[$VB1_CLOSED]" VB_SHOW_1="$VB1_CLOSED" VB_SHOW_2="$VB2" REQUIRED_V=2 VR_V=1 SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT='[]' OPEN_OUT='[]' run_case
 has_line "REACHED_END" && ok "block ran to the end" || bad "block aborted: $(dump)"
-finalized && bad "finalized a run with no pending bead and 0 of 2 verdicts counted: $(dump)" || ok "left in flight"
-has_line "^warn:.*no pending verdict bead among 1 read, but verdicts received 0 of 2 required.*ga-uk0km5" && ok "warn gives the counts (1 bead read, 0 of 2 verdicts)" || bad "zero-pending path was silent: $(dump)"
+finalized && bad "finalized a run with no pending bead and 1 of 2 verdicts counted: $(dump)" || ok "left in flight"
+has_line "^warn:.*no pending verdict bead among 1 read, but verdicts received 1 of 2 required.*ga-uk0km5" && ok "warn gives the counts (1 bead read, 1 of 2 verdicts)" || bad "zero-pending path was silent: $(dump)"
 has_line "^bdquery:" && bad "queried session beads with nothing pending" || ok "no session-bead query with nothing pending"
+VBS_JSON="[$VB1_CLOSED]" VB_SHOW_1="$VB1_CLOSED" VB_SHOW_2="$VB2" REQUIRED_V=1 VR_V=1 SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT='[]' OPEN_OUT='[]' run_case
+has_line "^warn:.*no pending verdict bead" && bad "the all-delivered case (1 of 1) reached the predicate's warn: $(dump)" || ok "all delivered (1 of 1) is the caller's branch: the predicate is never asked, nothing logged"
 
 echo ""
 echo "== gate-uk0km5-phase-c-wait-reason: PASS=$PASS FAIL=$FAIL =="
