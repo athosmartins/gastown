@@ -23,6 +23,9 @@
 # THREE STATES everywhere: found / not-found / could-not-find-out. An unreadable
 # signal, queue or live count NEVER raises the ceiling (it is not "infinite
 # slack"); an unreadable queue is not "queue 0" either (its own reason, never "idle").
+# The one thing that lifts the ceiling without reading a signal is the MIN FLOOR: a stored or fixed
+# value below the pool's min is clamped up to it (e.g. GATE_MAX_REVIEWERS=1 against the gate's min 2)
+# — a bound, not a decision. EXCEPT a fixed ceiling of 0, the operator's pause: passed through as is.
 # The Claude quota is a signal like the others: the dispatchers pass it as ok | limited |
 # unknown (a checker that is absent, errored or timed out is "unknown", never "ok"), and
 # only "ok" lets the ceiling grow. An unparseable threshold knob (env) falls back to its
@@ -306,7 +309,9 @@ pool_ceiling_engine_cap() {
 # (env: POOL_CEILING_<POOL>_MIN / _MAX, pool upper-cased, '-' -> '_'). Defaults:
 # wa-worker 1..4 (4 = Athos' 19/09 decision "WA 4"), ps-worker 1..2, gate-reviewer 2..6
 # [min_floor] raises the min (and the max with it, if needed): the gate passes its
-# reviewers-per-run so that one run always fits under the ceiling.
+# reviewers-per-run so that one run fits under the ceiling. Two cases it does NOT cover:
+# pool_ceiling_step then clamps max to the engine cap (a cap below the floor wins), and a fixed
+# ceiling of 0 (the operator's pause) never reaches the floor at all.
 pool_ceiling_bounds() {
   local pool="${1:-}" floor="${2:-}" up dmin dmax vmin vmax
   up=$(printf '%s' "$pool" | tr 'a-z-' 'A-Z_')
@@ -345,6 +350,13 @@ pool_ceiling_step() {
   fi
   if ! _pc_int "$fixed"; then
     POOL_CEILING_LOGLINE="pool-ceiling: $pool teto fixo ilegivel ('${fixed}') — nada alterado (ga-uywvsc)"
+    return 0
+  fi
+  # A fixed ceiling of 0 is the operator's PAUSE ("open nothing": a live count >= 0 always fills it). It is not a
+  # value to ramp: the min floor below would lift it to 1 and OPEN a session, and the persisted state would then
+  # carry that on. A pause stays a pause with the ceiling applying — RESULT is already "0", no state, no step.
+  if [ "$fixed" -eq 0 ]; then
+    POOL_CEILING_LOGLINE="pool-ceiling: $pool teto fixo 0 (pausa do operador) — nada alterado, sem passo, sem estado (ga-uywvsc)"
     return 0
   fi
   _pc_int "$min" || min=1

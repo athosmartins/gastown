@@ -63,8 +63,8 @@ gate: salvo se `POOL_CEILING_SWAP_*` for definido explicitamente, o teto do gate
 `GATE_SWAP_GROW_DISK_MIN_MB` (os mesmos números do freio `gate_headroom_decision`), então ajustar um ajusta
 o outro. **`GATE_HEADROOM_ENABLED=0` também deixa o teto do gate sem avaliar** (ele roda dentro do bloco de
 headroom); o gate loga uma linha dizendo isso em vez de ficar "ligado" sem rastro. `POOL_CEILING_DYNAMIC=0` é um
-desligamento duro que nem o `.on` sobrepõe. Começa sempre do teto **fixo** (estado ausente/corrompido
-→ reinicia no fixo). A sombra grava a simulação em `<pool>.shadow.state`, nunca no estado real, e marca
+desligamento duro que nem o `.on` sobrepõe. A **primeira** vez (estado ausente ou corrompido) parte do teto **fixo**;
+com estado gravado, **retoma o último teto** (ver "Estado depois de um desligamento longo", abaixo). A sombra grava a simulação em `<pool>.shadow.state`, nunca no estado real, e marca
 `applied=0` no TSV. Limite por construção: a simulação só enxerga sessões reais, então mostra "subiria
 1 passo" mas não escala além do que `vivos` permite.
 
@@ -121,7 +121,14 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
 - **Swap recém-criado.** `vm.swapusage` pode mostrar total 0 logo depois de um reboot (o macOS cria o swapfile sob demanda); "swap livre < 512 MB" lê como baixo mesmo
   assim. Com disco ≥ 4 GB isso dá `hold`, não `grow`: uma máquina calma e recém-iniciada só cresce depois que o swap existir (direção conservadora).
 - **Teto fixo abaixo do mínimo do pool.** Se o teto fixo for menor que o mínimo (ex.: `GATE_MAX_REVIEWERS=1` contra o mínimo 2 do gate), o primeiro passo aplicado
-  sobe `cur` até o mínimo, sem olhar fila nem folga.
+  sobe `cur` até o mínimo, sem olhar fila nem folga. **Exceção: teto fixo `0`** — é a pausa do operador (com `vivos >= 0` o pool está sempre cheio) e passa
+  intocado: sem passo, sem estado, sem linha na série de calibração; a linha de log diz `pausa do operador`. O estado gravado antes da pausa fica como estava
+  e é retomado quando o fixo voltar a ser ≥ 1.
+- **Com o teto APLICADO, o número do plist deixa de ser freio.** Depois que existe estado (`<pool>.state`), baixar `PILOT_*_WORKER_MAX` / `GATE_MAX_REVIEWERS`
+  para um valor ≥ 1 **não** derruba o teto em vigor enquanto o teto do motor (agent.toml) é legível, que é o normal: o fixo só decide o ponto de partida quando não há
+  estado, e o `fixo N` da linha de log é informativo. (Com o agent.toml ilegível o `max` é limitado ao fixo, e aí baixar o fixo derruba de fato.)
+  Os freios que funcionam aplicando são `touch $GC_CITY/.gc/pool-ceiling.off` (volta ao fixo na hora), `.shadow` (para de aplicar) e o teto fixo `0` (pausa).
+  Baixar o fixo continua certo ao desligar o teto dinâmico.
 - **Fila só por store de rig.** O Pilot conta a fila pelo store do rig do pool; um bead guardado no HQ e roteado para um worker via `story.rig` não é contado
   para aquele pool — subestima a fila e portanto só inibe o crescimento.
 - **Pilot sem rastro de cota ilegível com o teto desligado.** O gate loga `cota=ilegivel(fail-open)`; o freio de cota do próprio Pilot segue silencioso quando o

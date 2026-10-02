@@ -9,9 +9,12 @@
 # disk, Dolt, quota), between a per-pool min and max:
 #   up 1 per step while there is a queue AND slack AND the pool is saturated;
 #   down 1 per step when a hard resource signal squeezes (never kills a session —
-#   it only stops OPENING new ones) or when nothing is queued (so the next burst
-#   ramps from low again, one session per sweep, never all at once);
+#   it only stops OPENING new ones);
+#   HOLD otherwise, an empty queue included: the ceiling does NOT decay when nothing is
+#   queued (a decayed ceiling only costs a sweep to regain and, inside the engine cap, buys
+#   no burst protection — see pool-ceiling.sh, pool_ceiling_decide, reason `idle`);
 #   an unreadable signal NEVER raises (third state: not-found != found-and-zero);
+#   a fixed ceiling of 0 (the operator's "pause this pool") is passed through untouched;
 #   POOL_CEILING_DYNAMIC=0 or the kill file restores the fixed ceiling.
 #
 # Run against the pre-patch tree to confirm RED (lib absent, wiring absent) or the
@@ -327,6 +330,31 @@ out="$(PATH=/nonexistent /bin/bash -c '. "$1"; export POOL_CEILING_DYNAMIC=1 POO
 has "$out" "R=2 " "no clock (no \`date\` on PATH): the FIXED ceiling, no step"
 has "$out" "relogio" "and the line says the clock was unreadable"
 [ ! -e "$TMPROOT/clk/wa-worker.state" ] && ok "and nothing was written under a clock it could not read" || bad "state written without a readable clock"
+
+echo "== 5d. a fixed ceiling of 0 is the operator's PAUSE: the ceiling must not open a session under it (gate attempt 2, non-blocking 'medium')"
+# Measured by the reviewer: with the ceiling APPLYING, fixed=0 came back as 1 — the min floor lifted it and a session opened,
+# and the persisted state carried it on. Every probe below has queue + slack + room, i.e. every reason to open.
+SD5="$TMPROOT/state-pause"; mkdir -p "$SD5"; L5="$TMPROOT/pause.log"
+setsig 31 10 1 5700 412 14336
+POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD5" POOL_CEILING_LOG="$L5" POOL_CEILING_NOW=4000 pool_ceiling_step wa-worker 0 1 4 0 63 ok ok
+eq "$POOL_CEILING_RESULT" "0" "applying + fixed 0 + queue 63 + slack: stays 0 (the pause is honoured, not lifted to the min 1)"
+has "$POOL_CEILING_LOGLINE" "pausa do operador" "and the line says why it did nothing"
+[ ! -e "$SD5/wa-worker.state" ] && ok "a paused pool gets no state file (nothing to resume later)" || bad "fixed 0 still persisted a state file"
+[ ! -e "$L5" ] && ok "and no calibration row (a pause is not a decision the series should learn from)" || bad "fixed 0 still wrote a calibration row"
+printf 'ceiling=3\nat=1\n' > "$SD5/wa-worker.state"
+POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD5" POOL_CEILING_LOG="$L5" POOL_CEILING_NOW=4100 pool_ceiling_step wa-worker 0 1 4 0 63 ok ok
+eq "$POOL_CEILING_RESULT" "0" "a state file from before the pause (ceiling 3) does not override the operator's 0"
+eq "$(sed -n 's/^ceiling=//p' "$SD5/wa-worker.state")" "3" "...and the stored ceiling is left exactly as it was (the pause ends, the ramp resumes from it)"
+rm -f "$SD5/wa-worker.state"
+POOL_CEILING_DYNAMIC=1 POOL_CEILING_SHADOW=1 POOL_CEILING_STATE_DIR="$SD5" POOL_CEILING_LOG="$L5" POOL_CEILING_NOW=4200 pool_ceiling_step wa-worker 0 1 4 0 63 ok ok
+eq "$POOL_CEILING_RESULT" "0" "shadow + fixed 0: 0 as well"
+[ ! -e "$SD5/wa-worker.shadow.state" ] && ok "shadow does not simulate a ramp under a pause either" || bad "shadow simulated a ramp under fixed 0"
+POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD5" POOL_CEILING_LOG="$L5" POOL_CEILING_NOW=4300 pool_ceiling_step gate-reviewer 0 3 6 0 9 ok ok
+eq "$POOL_CEILING_RESULT" "0" "gate-reviewer with a min floor of 3 (one run) and fixed 0: still 0 — the floor is a bound, not a way out of a pause"
+# Control: the floor still does what the header says for fixed >= 1 (documented: 'Teto fixo abaixo do minimo do pool').
+POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$SD5" POOL_CEILING_LOG="$L5" POOL_CEILING_NOW=4400 pool_ceiling_step gate-reviewer 1 2 6 0 0 ok ok
+eq "$POOL_CEILING_RESULT" "2" "control: fixed 1 against a min of 2 is still lifted to the min (the one non-signal raise, named in the lib header)"
+export POOL_CEILING_LOG="$TMPROOT/pool-ceiling.log"
 
 echo "== 6. real readers return an integer or empty, never garbage (smoke, live machine)"
 unset POOL_CEILING_T_LOAD5 POOL_CEILING_T_NCPU POOL_CEILING_T_MEM POOL_CEILING_T_SWAP_FREE_MB POOL_CEILING_T_SWAP_USED_MB POOL_CEILING_T_DISK_FREE_MB

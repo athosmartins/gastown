@@ -12057,7 +12057,9 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
     _pc_quota="${HR_QSTATE:-unknown}"
     # The ceiling never goes under the reviewers of a single run — unless the engine's own cap is
     # lower than that (the step bounds max by agents/gate-reviewer/agent.toml): then no run could
-    # be spawned in full anyway, and the "motor N" in the log line shows why.
+    # be spawned in full anyway, and the "motor N" in the log line shows why. The other exception is
+    # GATE_MAX_REVIEWERS=0, the operator's pause: the step hands the 0 back untouched (no floor, no state),
+    # so gate_headroom_decision sees the same 0 it saw before the dynamic ceiling existed.
     pool_ceiling_bounds gate-reviewer "$GATE_REVIEWERS_PER_RUN"
     # The swap floors are the SAME two numbers gate_headroom_decision brakes on: unless the lib's own knob is
     # set explicitly, the ceiling reads the gate's, so tuning GATE_SWAP_* moves both and cannot leave one behind.
