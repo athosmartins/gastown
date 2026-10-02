@@ -620,3 +620,45 @@ def test_a_corrupt_or_empty_lib_is_could_not_tell(tmp_path, monkeypatch, body):
     monkeypatch.setattr(asr, "_bd_delivery_branch_prefixes", None, raising=False)
     assert asr._delivery_branch_prefixes() is None
     assert asr._delivery_branch_globs("ga-x") is None
+
+
+@pytest.mark.parametrize("body", [
+    None,                                            # the file is not there at all
+    "",                                              # empty file
+    "GC_DELIVERY_BRANCH_PREFIXES=\"\"\n",             # empty list
+    "GC_DELIVERY_BRANCH_PREFIXES=\"fix Feat/x\"\n",   # corrupt token
+])
+def test_an_unusable_lib_is_logged_once_and_still_could_not_tell(tmp_path, monkeypatch, capsys, body):
+    """Fail-open is allowed to be an answer, not to be silent: an unusable list makes every built
+    bead read NOT built here, which the reconciler then reports as a failing dispatch. One line,
+    naming the file, once per process — and the answer itself stays None (never [] / a fallback)."""
+    lib = tmp_path / "delivery-branch-patterns.sh"
+    if body is not None:
+        lib.write_text(body)
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(lib))
+    monkeypatch.setattr(asr, "_DELIVERY_PREFIXES", None, raising=False)
+    monkeypatch.setattr(asr, "_bd_delivery_branch_prefixes", None, raising=False)
+    monkeypatch.setattr(asr, "_DELIVERY_LIB_WARNED", False)
+    assert asr._delivery_branch_prefixes() is None
+    assert asr._delivery_branch_prefixes() is None
+    assert asr._delivery_branch_globs("ga-x") is None
+    out = capsys.readouterr().out
+    assert out.count("WARN ga-3ebneo") == 1, out
+    assert str(lib) in out, out
+
+
+def test_a_missing_lib_warns_once_across_many_probes(work_repo, monkeypatch, capsys):
+    monkeypatch.setattr(asr, "_DELIVERY_LIB_WARNED", False)
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(work_repo / "gone.sh"))
+    for bead in ("ga-a", "ga-b", "ga-c"):
+        assert asr._real_has_built_branch(bead) is False
+        assert asr._matched_built_branch_ref(bead) is None
+    out = capsys.readouterr().out
+    assert out.count("WARN ga-3ebneo") == 1, out
+
+
+def test_a_usable_lib_logs_nothing(work_repo, monkeypatch, capsys):
+    monkeypatch.setattr(asr, "_DELIVERY_LIB_WARNED", False)
+    assert asr._delivery_branch_prefixes()
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-nothing") == ""
+    assert "WARN ga-3ebneo" not in capsys.readouterr().out

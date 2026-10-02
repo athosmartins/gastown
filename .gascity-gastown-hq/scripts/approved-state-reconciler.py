@@ -2814,10 +2814,28 @@ def _delivery_branch_lib_path():
     return os.path.join(os.path.dirname(_pilot_dispatcher_sh_path()), "delivery-branch-patterns.sh")
 
 
+_DELIVERY_LIB_WARNED = False  # the "list unusable" line below is logged once per process
+
+
+def _delivery_lib_unusable(why):
+    """Log (once per process) that the shared list cannot be used, and answer None ("could not
+    tell"). The answer stays fail-open — the callers end in NOT built — but not quiet: with the list
+    gone, a bead the Pilot skips as already built stops being recognised as built here, so
+    _built_branch_reason stops suppressing it and this run can report it as a failing dispatch.
+    Without this line the only visible symptom would be those reports, with nothing pointing at why."""
+    global _DELIVERY_LIB_WARNED
+    if not _DELIVERY_LIB_WARNED:
+        _DELIVERY_LIB_WARNED = True
+        _log("WARN ga-3ebneo: the shared delivery-branch list (%s) is unusable: %s — every "
+             "'already built?' probe answers NOT built until it is restored"
+             % (_delivery_branch_lib_path(), why))
+    return None
+
+
 def _delivery_branch_prefixes():
     """The shared prefix list in priority order (fix first), or None when it cannot be read —
-    a missing/unreadable/corrupt lib is "could not tell", never an empty list that would read as
-    "no branch counts as a delivery"."""
+    a missing/unreadable/corrupt lib is "could not tell" (logged once, see _delivery_lib_unusable),
+    never an empty list that would read as "no branch counts as a delivery"."""
     global _DELIVERY_PREFIXES
     if _bd_delivery_branch_prefixes is not None:
         return _bd_delivery_branch_prefixes()
@@ -2826,14 +2844,14 @@ def _delivery_branch_prefixes():
     try:
         with open(_delivery_branch_lib_path(), encoding="utf-8") as fh:
             text = fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        return _delivery_lib_unusable("cannot read it (%s)" % type(exc).__name__)
     m = re.search(r'^GC_DELIVERY_BRANCH_PREFIXES="([^"\n]*)"[ \t]*$', text, re.MULTILINE)
     if not m:
-        return None
+        return _delivery_lib_unusable("no GC_DELIVERY_BRANCH_PREFIXES line")
     prefixes = m.group(1).split()
     if not prefixes or not all(re.fullmatch(r"[a-z0-9._-]+", x) for x in prefixes):
-        return None
+        return _delivery_lib_unusable("the prefix list is empty or has a malformed token")
     _DELIVERY_PREFIXES = prefixes
     return prefixes
 
