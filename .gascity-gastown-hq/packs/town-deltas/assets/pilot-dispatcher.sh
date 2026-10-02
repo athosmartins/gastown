@@ -5673,16 +5673,24 @@ _iso_to_epoch() {
     || date -u -d "$1" +%s 2>/dev/null || echo ""
 }
 
-# _target_has_real_branch <bead_id> — return 0 ONLY if a delivery branch for the bead
-# actually exists (ga-6jqr: was crew/*/<id>-only, blind to the fix/<id>-* shape dog
-# builders push; ga-3ebneo: and to feat/<id>, fix/<id> without a slug, ... — the name
-# list now comes from delivery-branch-patterns.sh via _delivery_branch_local_ref).
-# Self-contained repo list. Any uncertainty → return 1 (assert NO branch) so this only
-# ever ADDS a keep-signal, never forces a release — that includes the helper's rc 2
-# ("could not tell"), which is deliberately NOT told apart from "none" here.
+# _target_has_real_branch <bead_id> — THREE states (ga-6jqr: was crew/*/<id>-only, blind to
+# the fix/<id>-* shape dog builders push; ga-3ebneo: and to feat/<id>, fix/<id> without a
+# slug, ... — the name list now comes from delivery-branch-patterns.sh via
+# _delivery_branch_local_ref):
+#   rc 0  a delivery branch for the bead exists
+#   rc 1  looked at every repo and found none — and the older "no git / the repo list is
+#         unavailable or empty" exits, the ga-07rb3 header's accepted trade-off (a failed
+#         `gc rig list` degrades the scan to the town root)
+#   rc 2  could not tell: nothing found AND at least one repo's lookup could not be
+#         answered (delivery-branch-patterns.sh missing/unusable, git could not read the
+#         refs). A new way of not knowing that ga-3ebneo introduced; it must not read as
+#         "none".
+# Its one release-type caller is _sling_is_live (an idle sling with no branch is declared
+# DEAD and its bead released for another builder), which reads rc 2 as LIVE — so an
+# unanswerable lookup can no longer release a bead that has a delivery branch.
 _target_has_real_branch() {
   command -v git >/dev/null 2>&1 || return 1
-  local _repos _r _rc
+  local _repos _r _rc _unk=0
   _ownership_guard_repos >/dev/null 2>&1 || return 1
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
@@ -5691,7 +5699,9 @@ _target_has_real_branch() {
     _rc=0
     _delivery_branch_local_ref "$_r" "$1" >/dev/null || _rc=$?
     [ "$_rc" -eq 0 ] && return 0
+    [ "$_rc" -eq 1 ] || _unk=1
   done <<< "$_repos"
+  [ "$_unk" -eq 0 ] || return 2
   return 1
 }
 
@@ -5701,12 +5711,26 @@ _target_has_real_branch() {
 # live, so a genuine active builder is NEVER false-released; only a provably-idle, branch-less
 # sling is declared dead. Test seam: PILOT_TEST_DEAD_SLINGS (space-sep ids treated as dead).
 _sling_is_live() {
-  local _sid="${1:-}" _sdb="${2:-$GC_CITY}" _tid="${3:-}" _upd _epoch _nowts
+  local _sid="${1:-}" _sdb="${2:-$GC_CITY}" _tid="${3:-}" _upd _epoch _nowts _sl_rc
   [ -n "$_sid" ] || return 0
   if [ -n "${PILOT_TEST_DEAD_SLINGS+x}" ]; then
     case " $PILOT_TEST_DEAD_SLINGS " in *" $_sid "*) return 1 ;; *) return 0 ;; esac
   fi
-  [ -n "$_tid" ] && _target_has_real_branch "$_tid" && return 0
+  # ga-3ebneo: _target_has_real_branch answers in three states. Only rc 1 ("looked, there is
+  # none") lets this sling be judged by its idle time below; rc 0 (a branch) and rc 2 (could not
+  # tell: lib missing, git could not read a repo) both keep it LIVE — "cannot prove dead" is
+  # this function's own contract, and the idle-window release below would otherwise free a
+  # bead that HAS a delivery branch for a second builder. Anything else is also LIVE.
+  if [ -n "$_tid" ]; then
+    _sl_rc=0
+    _target_has_real_branch "$_tid" || _sl_rc=$?
+    if [ "$_sl_rc" -ne 1 ]; then
+      if [ "$_sl_rc" -eq 2 ]; then
+        warn "ga-3ebneo: sling $_sid kept LIVE — could not check whether its target $_tid has a delivery branch (delivery-branch-patterns.sh missing/unusable, or git could not read a repo)" >&2 || true
+      fi
+      return 0
+    fi
+  fi
   _upd=$(bd -C "$_sdb" show "$_sid" --json 2>/dev/null \
     | jq -r 'if type=="array" then .[0] else . end | (.updated_at // "")' 2>/dev/null || echo "")
   _epoch="$(_iso_to_epoch "$_upd")"
@@ -5834,15 +5858,26 @@ print(holder_is_alive(p["assignee"], p["session_meta"]))
   # rig-side branch must not be read as "confirmed no branch" (double-dispatch
   # risk) — a failed fetch skips this guard (falls through to "not phantom,
   # keep") instead of trusting a town-root-only search.
-  local _og_repos _og_rig_list_ok
+  local _og_repos _og_rig_list_ok _og_hb_rc
   _ownership_guard_repos >/dev/null 2>&1; _og_rig_list_ok=$?
   _og_repos="${_OWNERSHIP_GUARD_REPOS:-}"
   if [ "$_is_stale" = "1" ] \
      && command -v git >/dev/null 2>&1 \
      && [ -n "$_og_repos" ] \
-     && [ "$_og_rig_list_ok" -eq 0 ] \
-     && ! _beadid_has_crew_branch "$_bid"; then
-    return 1   # phantom: stale + no branch → release for wa-worker re-dispatch
+     && [ "$_og_rig_list_ok" -eq 0 ]; then
+    # ga-3ebneo: _beadid_has_crew_branch answers in THREE states, and `! cmd` would fold the
+    # third into a release (any non-zero rc → "no branch"). Only rc 1 — every repo was
+    # looked at and none has a delivery branch — is a confirmed "no branch"; rc 2 (could
+    # not tell: delivery-branch-patterns.sh missing/unusable, git/ls-remote could not
+    # answer) is the same unverifiable search the ga-07rb3 note above refuses to trust, so
+    # it KEEPS the owner, loudly (this header: "git/repos undecidable → KEEP").
+    _og_hb_rc=0
+    _beadid_has_crew_branch "$_bid" || _og_hb_rc=$?
+    if [ "$_og_hb_rc" -eq 1 ]; then
+      return 1   # phantom: stale + no branch → release for wa-worker re-dispatch
+    elif [ "$_og_hb_rc" -ne 0 ]; then
+      warn "ga-3ebneo: phantom-claim guard KEEPS crew owner of $_bid — could not verify there is no delivery branch (rc=$_og_hb_rc: delivery-branch-patterns.sh missing/unusable, or git/ls-remote could not answer)" >&2 || true
+    fi
   fi
   # ── end phantom-claim guard ─────────────────────────────────────────────────
 
@@ -6103,21 +6138,32 @@ done <<< "$_ttl_rig_paths"
 # through origin. Measured 2026-10-02 on the HQ repo, which has fork/gastown/upstream: 1192
 # distinct delivery-shaped names live there, 0 of them absent from origin + local heads, so no
 # bead loses its branch signal today — a branch that only a second remote knew would). One
-# shape is WIDER than the old regex: the shared <prefix>/<id>-* and crew/*/<id>-* globs let
-# the `*` span a `/`, so fix/<id>-foo/bar counts as <id>'s delivery where the old
-# fix/<id>-[^/]+$ did not — the same reading GAP-2 and _beadid_needs_remerge_branch have, and
-# the safe direction here (one more "this bead has a branch", never one fewer).
+# shape is WIDER than the old regex, but ONLY in the ls-remote step: there git matches the
+# shared <prefix>/<id>-* and crew/*/<id>-* globs with a `*` that spans a `/`, so
+# fix/<id>-foo/bar counts as <id>'s delivery where the old fix/<id>-[^/]+$ did not — the same
+# reading GAP-2 and _beadid_needs_remerge_branch have, and the safe direction (one more "this
+# bead has a branch", never one fewer). In the local + fetched-ref lookup
+# (_delivery_branch_local_ref → git for-each-ref, measured on git 2.54: `refs/heads/fix/ga-x-*`
+# does NOT return `fix/ga-x-foo/bar`) the `*` stays inside one path segment, exactly like the
+# old regex's [^/]+; that is also what the Python mirror sees, since it asks git first. No branch
+# of that shape exists today (0 in HQ's origin + local heads).
 #
 # Test seam: PILOT_TEST_CREW_BRANCH_BEADS (space-list), consulted when DEFINED,
 # keeps the selftest hermetic (no real git / network). When undefined we probe
 # real git read-only. FAIL-OPEN: no git OR no resolvable repos → return 1 (NOT
 # "assume branch") so the guard never blocks on an unprobable environment; the
 # distinct dead-worker/never-started reclaim paths still own true-orphan recovery.
-# The same holds for the helpers' rc 2 ("could not tell": lib not loaded, git could not
-# read the refs, ls-remote failed/timed out): no evidence of a branch is not a branch,
-# so it falls through to the next probe/repo and ends in return 1 like "none".
+#
+# THREE states (ga-3ebneo, the pre-gate reviewer's blocking finding): rc 0 a delivery branch
+# exists; rc 1 every repo was looked at and none has one (plus the early exits above); rc 2
+# COULD NOT TELL — nothing found AND some repo's lookup could not be answered (the helpers'
+# rc 2: delivery-branch-patterns.sh missing/unusable, git could not read the refs, ls-remote
+# failed or timed out). "No evidence of a branch" is not "no branch": its one forcing caller,
+# the phantom-claim guard in _beadid_live_crew_owner, RELEASES a bead on "no branch", so it
+# reads only rc 1 as confirmed and keeps the owner on rc 2. Positive evidence still wins — a
+# branch found in any repo is rc 0 even if another repo could not be read.
 _beadid_has_crew_branch() {
-  local _bid="${1:-}" _repo _rc
+  local _bid="${1:-}" _repo _rc _unk=0
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_CREW_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
@@ -6135,13 +6181,17 @@ _beadid_has_crew_branch() {
     _rc=0
     _delivery_branch_local_ref "$_repo" "$_bid" >/dev/null || _rc=$?
     [ "$_rc" -eq 0 ] && return 0
+    [ "$_rc" -eq 1 ] || _unk=1
     # 2. Best-effort authoritative remote probe (bounded; the live origin branch
     #    ga-htjni hit may not be fetched locally). A timeout / offline remote is NOT
-    #    evidence of a branch → fall through (fail-open), never block.
+    #    evidence of a branch → keep looking, never block — but it is not evidence of
+    #    NO branch either: it makes the final answer rc 2 instead of rc 1 (see above).
     _rc=0
     _delivery_branch_remote_hit "$_repo" "$_bid" >/dev/null || _rc=$?
     [ "$_rc" -eq 0 ] && return 0
+    [ "$_rc" -eq 1 ] || _unk=1
   done <<< "$_repos"
+  [ "$_unk" -eq 0 ] || return 2
   return 1
 }
 
@@ -6154,7 +6204,8 @@ _beadid_has_crew_branch() {
 # existing selftest coverage of _beadid_has_crew_branch's exact source shape.
 # Prints "<repo>\t<ref>" on a match (ref is EMPTY when the match came only from
 # the ls-remote fallback — no local ref object exists to inspect further, e.g.
-# for merge/staleness below); exit 0/1 exactly like _beadid_has_crew_branch.
+# for merge/staleness below); exit 0/1/2 exactly like _beadid_has_crew_branch (2 = could
+# not tell — see there; ga-3ebneo).
 # Lets a caller report the REAL matched ref (e.g. "fix/ga-8jxe1-slug") instead
 # of a hardcoded "crew/*/<bead>" guess — the old WARN message lied about the
 # evidence whenever a dog's fix/* branch, not a crew/* branch, was what
@@ -6165,9 +6216,12 @@ _beadid_has_crew_branch() {
 # `%(refname:short)` form — a bare name for a local branch, `origin/<name>` for a
 # remote-tracking one — because _beadid_branch_signal runs merge-base/log on it. When
 # several branches match, the shared list's priority decides (fix/ first), where the old
-# grep took whichever sorted first. "Could not tell" (rc 2 of the helpers) is not a match.
+# grep took whichever sorted first. "Could not tell" (rc 2 of the helpers) is not a match —
+# and, when nothing is found anywhere, it is not "no branch" either: it makes this return 2
+# (not 1), which _beadid_branch_signal passes on so its release-type caller
+# (_pilot_crew_stale_reclaim, "NO branch found anywhere") can tell the two apart.
 _beadid_matched_crew_branch_ref() {
-  local _bid="${1:-}" _repo
+  local _bid="${1:-}" _repo _unk=0
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_CREW_BRANCH_BEADS " in
@@ -6199,14 +6253,20 @@ _beadid_matched_crew_branch_ref() {
         printf '%s\t%s' "$_repo" "$_match"
         return 0
       fi
+      _unk=1   # a ref in a shape the helper never produces: unreadable, not "none"
+    elif [ "$_rc" -ne 1 ]; then
+      _unk=1   # could not tell (rc 2), or an rc 0 with no ref: never "none"
     fi
     _rc=0
     _delivery_branch_remote_hit "$_repo" "$_bid" >/dev/null || _rc=$?
     if [ "$_rc" -eq 0 ]; then
       printf '%s\t' "$_repo"   # repo known, ref unresolved locally (ls-remote-only)
       return 0
+    elif [ "$_rc" -ne 1 ]; then
+      _unk=1
     fi
   done <<< "$_repos"
+  [ "$_unk" -eq 0 ] || return 2
   return 1
 }
 
@@ -6224,7 +6284,12 @@ _beadid_matched_crew_branch_ref() {
 #
 # Prints "<class>\t<detail>" to stdout, exit 0 iff a branch matched at all
 # (exit 1 = no branch — identical to _beadid_has_crew_branch's original
-# "no signal" case):
+# "no signal" case; exit 2 = COULD NOT TELL, ga-3ebneo: no branch found AND some lookup
+# could not be answered — an empty stdout like exit 1, but a different statement, so the
+# release-type caller _pilot_crew_stale_reclaim can keep the bead instead of reading it as
+# "NO branch anywhere". The two non-releasing callers — _filter_built (a match was already
+# found) and _ownership_guard_should_refuse (dispatch-time, fail-open) — treat any non-zero
+# exit as "no signal", exactly as before):
 #   block  \t <real ref>                 — unmerged and NOT stale (or matched
 #                                           only via ls-remote, no local ref to
 #                                           inspect) → preserve the EXACT
@@ -6244,9 +6309,11 @@ _beadid_matched_crew_branch_ref() {
 #   PILOT_TEST_BRANCH_MERGED_BEADS  — force the "merged" classification.
 #   PILOT_TEST_ORPHAN_BRANCH_BEADS  — force "orphan" (else falls to "block").
 _beadid_branch_signal() {
-  local _bid="${1:-}" _json="${2:-}" _repo _ref _rt
+  local _bid="${1:-}" _json="${2:-}" _repo _ref _rt _mrc
   [ -n "$_bid" ] || return 1
-  _rt="$(_beadid_matched_crew_branch_ref "$_bid")" || return 1
+  _mrc=0
+  _rt="$(_beadid_matched_crew_branch_ref "$_bid")" || _mrc=$?
+  [ "$_mrc" -eq 0 ] || return "$_mrc"   # 1 = none, 2 = could not tell (ga-3ebneo)
   _repo="${_rt%%$'\t'*}"
   _ref="${_rt#*$'\t'}"
   if [ -z "$_ref" ]; then
@@ -6793,6 +6860,11 @@ _ownership_guard_should_refuse() {
       # (a) crew branch — strongest, evaluated first and standalone. ga-8jxe1:
       # "branch exists" alone is no longer treated as an unconditional
       # in-flight signal — classify it first (see _beadid_branch_signal doc).
+      # ga-3ebneo: exit 2 ("could not tell") reads here as "no signal", like exit 1 — this is
+      # the dispatch-time guard, fail-open by design (it refuses a dispatch, it releases
+      # nothing), and it cannot log: this chain is captured by `_OWN_REASON=$(...)`. The
+      # unverifiable case is not silent overall: delivery-branch-patterns.sh missing warns at
+      # startup, and _filter_built counts + logs every candidate it could not check.
       _bs="$(_beadid_branch_signal "$_bid" "$_json")"
       if [ -n "$_bs" ]; then
         _bs_class="${_bs%%$'\t'*}"
@@ -8126,7 +8198,7 @@ _pilot_crew_stale_reclaim() {
       | ( ((.updated_at // "") | if . == "" then null else (try fromdateiso8601 catch null) end) ) as $e
       | select($e != null and $e <= $cutoff)
       | select((.assignee // "") != "") ]' 2>/dev/null || echo "[]")
-  local _cs_row _cs_id _cs_city _cs_assignee _cs_bs
+  local _cs_row _cs_id _cs_city _cs_assignee _cs_bs _cs_rc
   while IFS= read -r _cs_row; do
     [ -z "$_cs_row" ] && continue
     _cs_id=$(printf '%s' "$_cs_row" | jq -r '.id // ""' 2>/dev/null)
@@ -8148,10 +8220,21 @@ _pilot_crew_stale_reclaim() {
     # Same bug class as ga-8w22n's fix a few hundred lines up in this same
     # file (`_match=$(grep ...) || true`) — that one was missed here because
     # this call site (Stage 1.5) was added later (ga-c9qj8, 2026-09-10).
-    # `|| true` only neutralizes the exit code; $_cs_bs is unaffected either
-    # way (empty on "no branch", exit 1 or not) — see
+    # `|| _cs_rc=$?` only neutralizes the exit code (same as the old `|| true`); $_cs_bs is
+    # unaffected either way (empty on "no branch", exit 1 or not) — see
     # pilot-dispatcher.crew-stale-reclaim-no-branch.selftest.sh AC1/AC2.
-    _cs_bs="$(_beadid_branch_signal "$_cs_id" "$_cs_row")" || true
+    # ga-3ebneo: ...but the exit code now also says WHICH empty it is. rc 1 = every repo was
+    # looked at and none has a delivery branch (the case this reclaim acts on); rc 2 = could
+    # not tell (delivery-branch-patterns.sh missing/unusable, git/ls-remote could not answer).
+    # The ga-c9qj8 note above refuses to reclaim on an unverifiable scan; the rc-2 cause is a
+    # per-repo one that the sweep-level `_ownership_guard_repos` check cannot see, so it is
+    # checked here per bead: KEEP it untouched, loudly, and retry next sweep.
+    _cs_rc=0
+    _cs_bs="$(_beadid_branch_signal "$_cs_id" "$_cs_row")" || _cs_rc=$?
+    if [ -z "$_cs_bs" ] && [ "$_cs_rc" -eq 2 ]; then
+      warn "ga-3ebneo: NOT reclaiming stale in-flight $_cs_id — could not verify there is no delivery branch (delivery-branch-patterns.sh missing/unusable, or git/ls-remote could not answer); retrying next sweep"
+      continue
+    fi
     if [ -z "$_cs_bs" ]; then
       warn "ga-c9qj8: reclaiming stale in-flight $_cs_id — crew assignee '$_cs_assignee' untouched > ${PILOT_STUCK_INFLIGHT_HOURS}h with NO crew/fix branch found anywhere (never engaged). Unassigning + clearing story:in-flight so it returns to the pool instead of staying wedged (set PILOT_CREW_STALE_RECLAIM=0 to disable)."
       bd -C "$_cs_city" label  remove "$_cs_id" "story:in-flight"   -q 2>/dev/null || true
