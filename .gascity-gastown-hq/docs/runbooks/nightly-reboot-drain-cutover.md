@@ -18,7 +18,8 @@ script de antes (`eae3207a8`), é esta:
    logs de disco/swap e do aviso).
 6. **Shutdown aceito (rc 0): sai com 0** e registra `shutdown accepted`. Antes registrava sempre
    `ERROR: shutdown returned … reboot did NOT happen` e saía com 1, mesmo com a máquina caindo
-   (essa linha nunca aparece nos logs das 12 noites que reiniciaram: o script morre antes de escrevê-la).
+   (essa linha nunca aparece nos logs das 12 noites que reiniciaram: o script morre antes de escrevê-la —
+   o sistema manda TERM enquanto o shutdown roda; ver a linha das ~23:42 abaixo sobre o que isso faz com o sinal).
 7. **Shutdown que falha (rc ≠ 0): a noite vira SKIP.** O streak e o contador de scraper cortado
    **voltam ao que eram** (arquivo ausente continua ausente), a noite entra no streak como pulada
    (+1: o streak **não** é zerado numa noite sem reboot), sai o push **"Reboot noturno FALHOU"**, a
@@ -43,7 +44,7 @@ Pedido do Athos (01/10, P0): reiniciar **antes** do scraper. Desenho no bead ga-
 | 23:00–23:40 | Espera, re-carimbando o sinal a cada 5 min. |
 | 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`, rodado como o usuário via `sudo -u`, como o `notify` — como root ele poderia deixar `-shm`/`-wal` de root ao lado da fila do sender) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
 | 23:40 | Gate com marker, bead em `in_progress` e rodada do scraper viram **informativos**: vão pro log e pro snapshot `.gc/logs/nightly-reboot-pre-<data>.txt` como "o que este reboot corta". O gate re-enfileira, o reclaim devolve o bead, o scraper retoma pelo catch-up. |
-| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. Com o shutdown **aceito** (rc 0) o sinal **fica** no disco (soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair); se o shutdown falhar (rc ≠ 0) ele é solto na hora, o streak e o contador do scraper voltam ao que eram, a noite conta como pulada e sai o push **"Reboot noturno FALHOU"**. |
+| ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. O script larga a posse do sinal (`DRAIN_ACTIVE=0`) **imediatamente antes** de chamar o shutdown, então o sinal **fica** no disco nos dois jeitos de sair da chamada: o rc 0 e o **TERM que o sistema manda ao script enquanto desliga** (o caminho que de fato roda numa noite que reinicia — o log não tem nenhuma linha depois do `shutdown -r now`; o trap de TERM vira `exit 143` e o trap de saída já não tem o que soltar). Soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair. Se o shutdown **voltar** com rc ≠ 0 o sinal é solto na hora — antes do push e do registro do skip, que podem levar ~2 min —, o streak e o contador do scraper voltam ao que eram, a noite conta como pulada e sai o push **"Reboot noturno FALHOU"**. |
 | pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (**mapa** = a ORIGEM em `127.0.0.1:8099` **e** o túnel cloudflared: job com PID + o `/ready` dele com ≥ 1 conexão de borda; o pior dos dois vale. A URL pública `mapa.urblink.com.br` **não** entra: o Cloudflare Access responde 302 na borda, com o mapa de pé ou não) (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). É também **daqui** que sai o mail "scraper cortado N noites seguidas" (abaixo). |
 
 Noite que não consegue reiniciar até ~23:55: **solta o dreno na hora**, registra SKIP (aviso **"Reboot noturno pulado"** por push) e segue o
@@ -121,7 +122,9 @@ Depende de o `nightly-reboot.sh` (quem grava o sinal) estar vivo — do disparo,
   ```
   O trap de saída dele (`drain_cleanup`) remove o sinal e o script sai: **a noite não reinicia**. Na espera das
   23:00–23:40 e nas sondas com prazo o TERM age na hora; numa chamada sem prazo (update do macOS, `notify`) só
-  quando ela volta.
+  quando ela volta. **Exceção:** a partir do `shutdown -r now` (~23:42) o script já largou a posse do sinal, e
+  um TERM nessa hora **não o remove** — a máquina está caindo e o boot-epoch o invalida; só um shutdown que
+  volta com erro faz o próprio script soltá-lo.
 - **Script já morto** (saiu, ou levou KILL e o trap não rodou — o `launchctl kill` acima responde
   `No process to signal.`): aí `rm ~/.gastown/run/city-drain.level` solta na hora, porque nada mais o regrava.
   Sem o `rm` o sinal expira sozinho: ≤30 min depois do último carimbo, teto de 90 min.
@@ -140,6 +143,11 @@ Depende de o `nightly-reboot.sh` (quem grava o sinal) estar vivo — do disparo,
   longa por desenho e não pode ser cortada no meio), `softwareupdate --list --no-scan` (cache
   local), o `notify` (já tem limites próprios: curl 6 s, e-mail 45 s), `sync` e `sudo`. Tudo que fala
   com bd/Dolt entre o disparo e o `shutdown` tem prazo: TERM no prazo, ~2 s de folga e **KILL** (um processo que ignora o TERM não segura o reboot).
+- Um TERM/KILL que caia entre a gravação dos contadores e a chamada do `shutdown` (escritas locais, a
+  pendência e um `sync`: segundos) **não** desfaz os contadores da noite: de dentro do script isso é
+  indistinguível do reboot derrubando o script. Quanto ao sinal: um TERM antes de `DRAIN_ACTIVE=0` o
+  solta (o trap de saída roda); um TERM depois dele (é uma atribuição: instantes) o deixa no disco, e um
+  KILL em qualquer ponto também, porque o trap não roda. Nos dois casos ele expira sozinho (≤30 min, teto 90 min).
 - O sinal de dreno é carimbado uma vez antes do update do macOS. Se a instalação passar de 30 min,
   os leitores o consideram velho e os despachantes voltam a admitir trabalho (falha aberta, por
   desenho): o que entrar nesse intervalo é cortado pelo reboot como qualquer trabalho em voo.

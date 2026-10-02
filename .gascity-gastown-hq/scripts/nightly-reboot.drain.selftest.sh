@@ -43,6 +43,9 @@
 #       gate ga-f9ks5v: o shutdown que NAO pega e uma noite SEM reboot — streak e contador do scraper voltam ao
 #       que eram (ausente continua ausente), a noite conta como pulada, sai o push "FALHOU", e nenhum mail
 #       "scraper cortado" sai por um corte que nao aconteceu
+#       gate ga-sk4hlp: o sinal de dreno sobrevive ao caminho que RODA em producao — o TERM que o sistema manda
+#       ao script enquanto o shutdown roda (E13d) — e, no shutdown que falha, a cidade e solta ANTES do push
+#       "FALHOU" e do record_skip_bounded (nao pelo EXIT trap depois deles)
 #   E14 o contador de scraper cortado so move perto do shutdown; o nightly nao chama o gc por causa dele
 #   E15 a noite PULADA tambem tem prazo: gc pendurado no registro do skip nao prende a instancia
 #   E16 gate-fix 2: os guards de SEGURANCA sao lidos de novo logo antes do shutdown — um envio que
@@ -151,6 +154,9 @@ boot_matches() {
 #   W_SENDER_SEQ   "0 1 0" = rc do fake de envio por NUMERO DA CHAMADA (a ultima repete)
 #   W_RIG          1 = cria um rig com .beads em $CITY, pro laco de contagem por rig (default 0)
 #   W_SHUTDOWN_RC  rc do fake de shutdown            (default 0)
+#   W_SHUTDOWN_TERM_PARENT  1 = o fake manda TERM ao script (o pai) e fica vivo 1s antes de voltar: o que o
+#                  sistema faz numa noite que reinicia (o log vivo nao tem NENHUMA linha depois do `shutdown -r now`)
+#                  — o script nunca chega na linha seguinte; quem roda e o trap de TERM -> exit 143 -> EXIT trap
 #   W_PROBE_SLOW   N = toda sonda que RESPONDE (o gate-queue-composition do guard 2, cada chamada de bd que nao
 #                  pendura) demora N segundos antes de responder (default 0). E o que uma maquina em load 60-99
 #                  faz com a sonda, so que DETERMINISTICO: a suite deixa de depender de a maquina estar lenta
@@ -198,6 +204,7 @@ EOF
   cat > "$W/notify" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$NOTIFY_CALLS"
+[ -e "$DRAIN" ] && echo "\$*" >> "$W/drain-at-notify"
 echo "force=\${NOTIFY_FORCE_PUSH:-} :: \$*" >> "$NOTIFY_FORCE"
 if [ -x "$REAL_NOTIFY" ]; then r="\$(NOTIFY_ROUTE_TEST=1 "$REAL_NOTIFY" "\$@" 2>/dev/null | head -1)"; [ -n "\$r" ] || r="unreadable"; else r="n/a"; fi
 echo "\$r :: \$*" >> "$NOTIFY_ROUTES"
@@ -208,6 +215,7 @@ echo "\$*" >> "$SHUT"
 cp "$DRAIN" "$DRAIN_AT_SHUT" 2>/dev/null
 cp "$PENDING" "$PEND_AT_SHUT" 2>/dev/null
 cp "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak" "$W/cut-at-shutdown" 2>/dev/null
+if [ "${W_SHUTDOWN_TERM_PARENT:-0}" = "1" ]; then kill -TERM \$PPID; /bin/sleep 1; fi
 exit ${W_SHUTDOWN_RC:-0}
 EOF
   cat > "$W/softwareupdate" <<'EOF'
@@ -726,6 +734,10 @@ log_has "counters: scraper-cut counter put back to 1" && ok "E13 rc=1: o log diz
 log_has "skip streak: 14 consecutive night" && ok "E13 rc=1: a noite foi registrada como pulada (streak 14)" || bad "E13 rc=1: a noite nao foi registrada como pulada"
 [ ! -f "$PENDING" ] && ok "E13 shutdown rc=1 -> pendencia REMOVIDA (nenhum reboot em andamento; outro reboot em <3h nao vira 'Reboot noturno OK')" || bad "E13 pendencia ficou no disco apos um shutdown que falhou"
 [ ! -f "$DRAIN" ] && ok "E13 shutdown rc=1 -> sinal de dreno REMOVIDO (nada esta reiniciando: a cidade volta a trabalhar)" || bad "E13 o sinal de dreno ficou no disco depois de um shutdown que FALHOU — a cidade ficaria pausada sem reboot"
+# gate ga-sk4hlp: a cidade e solta ANTES do push e do record_skip_bounded (ate ~2min), nao pelo EXIT trap depois deles.
+# Controle primeiro: o fake de notify enxerga o sinal (o "Reiniciando" saiu com ele no disco), senao a asserção abaixo nunca poderia reprovar.
+grep -q "Reiniciando" "$W/drain-at-notify" 2>/dev/null && ok "E13 (controle: o fake de notify ve o sinal — o 'Reiniciando' saiu com ele no disco)" || bad "E13 o fake de notify nao registrou o sinal no 'Reiniciando' — a checagem de ordem abaixo nao prova nada"
+grep -q "Reboot noturno FALHOU" "$W/drain-at-notify" 2>/dev/null && bad "E13 rc=1: o sinal de dreno AINDA estava no disco quando o push 'FALHOU' saiu — a cidade ficou pausada atras do push e do record_skip_bounded (ate ~2min)" || ok "E13 rc=1: o sinal ja tinha sido solto quando o push 'FALHOU' saiu (a cidade nao espera pelo bookkeeping)"
 log_has "ERROR: shutdown returned 1 — reboot did NOT happen" && ok "E13 rc=1: o log diz ERROR 'reboot did NOT happen' (e verdade)" || bad "E13 rc=1 sem a linha de ERROR no log"
 # E13c: o que nao existia continua nao existindo — "voltou a 0" seria um arquivo que nunca houve
 W_SHUTDOWN_RC=1 W_SCRAPER=1 new_world e13c; rm -f "$STREAK" "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
@@ -742,6 +754,18 @@ log_has "reboot did NOT happen" && bad "E13 rc=0: o log diz ERROR 'reboot did NO
 [ -f "$DRAIN" ] && ok "E13 shutdown rc=0 -> sinal de dreno FICA (a cidade nao volta a admitir trabalho segundos antes de cair)" || bad "E13 o sinal de dreno foi removido num shutdown aceito (rc 0): os despachantes voltariam a admitir trabalho que o reboot mata"
 boot_matches "$(sed -n 3p "$DRAIN" 2>/dev/null)" && ok "E13 rc=0: o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13 rc=0: boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado ~$(real_boot_epoch))"
 log_has "drain signal is left in place" && ok "E13 rc=0: o log diz que o sinal foi deixado de proposito" || bad "E13 rc=0: o log nao diz o que aconteceu com o sinal"
+# E13d (gate ga-sk4hlp): o caminho que RODA em producao. Numa noite que reinicia o sistema manda TERM ao script
+# enquanto o shutdown roda (o log vivo nao tem nenhuma linha depois do `shutdown -r now`, nas 12 noites): o trap de
+# TERM faz exit 143 e o EXIT trap roda — com o sinal ainda "do script" ele o apagava segundos antes de cair. O E13 de
+# cima usa um shutdown que volta rc 0 na hora, sem TERM: so exercita o ramo que o log vivo diz que nunca roda.
+W_SHUTDOWN_TERM_PARENT=1 new_world e13d; run_nr FAKE_HOUR=23; RC13D=$?
+rebooted && ok "E13d o shutdown FOI chamado" || bad "E13d o shutdown nem foi chamado — o cenario nao prova nada"
+[ "$RC13D" = "143" ] && ok "E13d o script morreu de TERM durante o shutdown (exit 143) — o caminho que roda numa noite que reinicia" || bad "E13d exit=$RC13D (esperado 143): o TERM do fake nao chegou no script — o cenario nao exercita o caminho"
+log_has "shutdown accepted \(rc 0\)" && bad "E13d o script chegou na linha DEPOIS do shutdown — o TERM nao o interrompeu, o cenario nao reproduz o caminho vivo" || ok "E13d o script nao chegou na linha depois do shutdown (como no log vivo)"
+[ -f "$DRAIN_AT_SHUT" ] && ok "E13d (controle: o sinal estava no disco na hora do shutdown)" || bad "E13d o sinal nem estava no disco na hora do shutdown — a asserção abaixo nao prova nada"
+[ -f "$DRAIN" ] && ok "E13d TERM durante o shutdown -> sinal de dreno FICA (o EXIT trap nao o apaga segundos antes de a maquina cair)" || bad "E13d o EXIT trap APAGOU o sinal de dreno depois do TERM do shutdown — a cidade voltaria a admitir trabalho segundos antes de cair"
+boot_matches "$(sed -n 3p "$DRAIN" 2>/dev/null)" && ok "E13d o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13d boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado ~$(real_boot_epoch))"
+[ -f "$PENDING" ] && ok "E13d TERM durante o shutdown -> pendencia FICA (e o que diz ao pos-boot que este boot e nosso)" || bad "E13d a pendencia sumiu depois do TERM durante o shutdown"
 
 # ═══ E14: contador do scraper; o aviso devido NAO e mandado daqui ═════════════════════════════════════
 echo "E14: o contador de scraper cortado so move perto do shutdown; o aviso vai na pendencia, nao no gc"

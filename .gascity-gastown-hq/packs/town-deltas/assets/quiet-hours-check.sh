@@ -240,7 +240,9 @@ _quiet_elapsed_adjustment() {
 #     escritor com TERM: `sudo launchctl kill TERM system/com.gascity.nightly-reboot`.
 #     O trap de saida dele (drain_cleanup) remove o sinal e o script sai: a noite NAO
 #     reinicia. (Numa chamada sem prazo — update do macOS, notify — o TERM so age
-#     quando ela volta.)
+#     quando ela volta. Da chamada do `shutdown -r now` em diante o script ja largou a
+#     posse do sinal: um TERM ai nao o remove — a maquina esta caindo e o boot-epoch
+#     o invalida.)
 #   - MORTO (saiu, ou levou KILL e o trap nao rodou — `launchctl kill` responde "No
 #     process to signal."): `rm ~/.gastown/run/city-drain.level` solta na hora, nada o
 #     regrava (o arquivo e gravado por root, mas o diretorio e do athos — remover

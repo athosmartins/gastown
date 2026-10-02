@@ -2384,6 +2384,7 @@ run_remerge_real() { # $1=PILOT_TEST_REMERGE_BEADS  $2=PILOT_TEST_REMERGE_UNKNOW
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$FIXCITY/.gc/pilot-dispatcher-stall.count"
   reset_state
   env -i \
+    DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$RMG_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \

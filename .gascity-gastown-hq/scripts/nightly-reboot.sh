@@ -182,7 +182,8 @@ notify_athos() {
 # FAILS TOWARD "the city keeps working": if the signal cannot be written the
 # reboot still proceeds on the safety guards alone, and if this script dies the
 # EXIT trap removes the signal (a hard kill is bounded by the reader's
-# staleness window, 30min, and by DRAIN_MAX_SECS below).
+# staleness window, 30min, and by DRAIN_MAX_SECS below). The one exception is a
+# death inside the shutdown call itself: see drain_cleanup.
 DRAIN_REBOOT_AT="${NIGHTLY_REBOOT_REBOOT_AT:-23:40}"
 DRAIN_FILE="${NIGHTLY_REBOOT_DRAIN_FILE:-/Users/athos/.gastown/run/city-drain.level}"
 DRAIN_MAX_SECS="${NIGHTLY_REBOOT_DRAIN_MAX_SECS:-5400}"          # hard ceiling: 23:00 + 90min covers wait + safety budget + a macOS install
@@ -239,11 +240,15 @@ drain_end() {
   DRAIN_ACTIVE=0
 }
 
-# EXIT trap target: any way out of this script releases the drain, EXCEPT a shutdown
-# the OS accepted (rc 0): that path sets DRAIN_ACTIVE=0 first, so the signal is left on
-# disk until the reboot invalidates it (see reboot_now_sequence) — releasing the gates
-# seconds before the machine goes down would let work start that the reboot then kills.
-# A failed shutdown (rc != 0) and every skip, kill or error DO release it.
+# EXIT trap target: any way out of this script releases the drain, EXCEPT the shutdown call
+# itself: reboot_now_sequence sets DRAIN_ACTIVE=0 right BEFORE it invokes shutdown, so this
+# trap finds nothing to release on either way out of that call — the rc 0 return, or the TERM
+# the OS sends the script while the shutdown runs (trap 'exit 143' -> here; on the nights
+# that reboot this is the path that runs, the line after `shutdown -r now` is never reached).
+# The signal is left on disk until the reboot invalidates it: releasing the gates seconds
+# before the machine goes down would let work start that the reboot then kills. A failed
+# shutdown (rc != 0) releases it explicitly (drain_end) and so does every skip, kill or
+# error before the call.
 drain_cleanup() {
   [ -n "${DRAIN_SLEEP_PID:-}" ] && kill "${DRAIN_SLEEP_PID}" 2>/dev/null
   # Release the city FIRST: taking a probe's process tree down can cost a TERM -> KILL grace
@@ -1407,6 +1412,16 @@ fi
 write_pending_file "${REBOOT_MODE}"
 log "rebooting now"
 sync
+# The drain signal must outlive this call, so the EXIT trap is told to leave it alone BEFORE
+# the call, not after it: on a night that reboots the OS TERMs this script while the shutdown
+# runs (the live log has no line after `shutdown -r now` on any of those nights), drain_main's
+# TERM trap turns that into exit 143, and the EXIT trap -> drain_cleanup runs with whatever
+# DRAIN_ACTIVE holds at that moment. Cleared only on the rc 0 line below, that was still 1 and
+# the TERM path (the one that actually runs) removed the signal seconds before power-off.
+# The price, same as the counters' window below: a TERM/KILL that lands between this line and
+# the shutdown call leaves the signal on disk; it expires on its own (30min staleness,
+# DRAIN_MAX_SECS ceiling). A shutdown that RETURNS non-zero releases it explicitly, below.
+DRAIN_ACTIVE=0
 "${SHUTDOWN_BIN}" -r now >>"${LOG}" 2>&1
 RC=$?
 # A NON-ZERO return means shutdown did not take: nothing is rebooting, so the hand-off
@@ -1416,23 +1431,24 @@ RC=$?
 # the file MUST survive it: it is the only thing telling the post-boot check this
 # boot was ours.
 if [ "${RC}" -eq 0 ]; then
-    # The drain signal STAYS: this exit would otherwise run drain_cleanup and release the
-    # city's admission gates seconds before the machine is down, so a dispatcher could start
-    # work the reboot is about to kill — the very thing the drain exists to prevent. The
-    # signal carries this boot's epoch, so every reader ignores it after the reboot (nothing
-    # has to clear it), and if the machine somehow does not go down it expires on its own
-    # (30min staleness, DRAIN_MAX_SECS ceiling).
-    DRAIN_ACTIVE=0
+    # The drain signal STAYS (DRAIN_ACTIVE was cleared before the call): releasing the city's
+    # admission gates seconds before the machine is down would let a dispatcher start work the
+    # reboot is about to kill — the very thing the drain exists to prevent. The signal carries
+    # this boot's epoch, so every reader ignores it after the reboot (nothing has to clear it),
+    # and if the machine somehow does not go down it expires on its own (30min staleness,
+    # DRAIN_MAX_SECS ceiling).
     log "shutdown accepted (rc 0) — the machine is going down; the drain signal is left in place (the reboot invalidates it) and the post-boot check takes over"
     exit 0
 fi
 # The shutdown did not take: tonight is a SKIP that the "Reiniciando" note above got wrong.
-# Everything tonight wrote on the assumption that the reboot would happen is undone — the
-# pending file, the streak reset, the scraper-cut counter and the alarm owed for it (it
-# was only ever in the pending file, now gone, so no "scraper cortado" mail goes out for a
-# cut that did not happen) — and the night is counted as a skipped one, with the push that
-# the digest-routed "Reiniciando" cannot be. The drain signal is released by the EXIT trap
-# (DRAIN_ACTIVE is still 1).
+# The city is released FIRST (drain_end, as drain_skip_night does): the push and the skip
+# bookkeeping below take up to ~2min (record_skip_bounded), and the dispatchers should not stay
+# paused behind a reboot that is not coming. Then everything tonight wrote on the assumption
+# that the reboot would happen is undone — the pending file, the streak reset, the scraper-cut
+# counter and the alarm owed for it (it was only ever in the pending file, now gone, so no
+# "scraper cortado" mail goes out for a cut that did not happen) — and the night is counted
+# as a skipped one, with the push that the digest-routed "Reiniciando" cannot be.
+if [ "${REBOOT_MODE}" = "drain" ]; then drain_end; fi
 rm -f "${PENDING_FILE}" 2>/dev/null
 SCRAPER_ALARM_N=""; SCRAPER_ALARM_REASON=""
 log "ERROR: shutdown returned ${RC} — reboot did NOT happen"
