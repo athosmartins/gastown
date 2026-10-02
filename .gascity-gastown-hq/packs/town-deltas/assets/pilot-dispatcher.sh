@@ -6094,10 +6094,15 @@ done <<< "$_ttl_rig_paths"
 # ga-3ebneo: and still blind to feat/<id>, feature/ refactor/ docs/ chore/ test/ and to
 # fix/<id> without a slug — the shapes now come from delivery-branch-patterns.sh (the
 # same list GAP-2 and _beadid_needs_remerge_branch use) via _delivery_branch_local_ref /
-# _delivery_branch_remote_hit, not from a regex of its own. Two shapes of the OLD regex
+# _delivery_branch_remote_hit, not from a regex of its own. Three shapes of the OLD regex
 # are gone on purpose: a bare crew/<id> with no owner segment ("defensive", no producer
-# and zero such refs in any repo when measured), and the case-insensitive match (bead ids
-# and the branches built from them are lowercase; the shared list is case-sensitive). One
+# and zero such refs in any repo when measured), the case-insensitive match (bead ids
+# and the branches built from them are lowercase; the shared list is case-sensitive), and
+# remote-tracking refs of a remote OTHER than origin (the old scan took every refs/remotes/*;
+# the helpers read origin only, like the ls-remote step and the gate, which push and merge
+# through origin. Measured 2026-10-02 on the HQ repo, which has fork/gastown/upstream: 1192
+# distinct delivery-shaped names live there, 0 of them absent from origin + local heads, so no
+# bead loses its branch signal today — a branch that only a second remote knew would). One
 # shape is WIDER than the old regex: the shared <prefix>/<id>-* and crew/*/<id>-* globs let
 # the `*` span a `/`, so fix/<id>-foo/bar counts as <id>'s delivery where the old
 # fix/<id>-[^/]+$ did not — the same reading GAP-2 and _beadid_needs_remerge_branch have, and
