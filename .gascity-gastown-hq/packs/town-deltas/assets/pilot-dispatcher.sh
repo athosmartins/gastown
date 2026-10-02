@@ -4565,7 +4565,7 @@ _delivery_branch_remote_hit() {
 _filter_built() {
   local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
   local built_reasons="" ingate_reasons="" _matched_ref _out _kept_sp _bid _breason
-  local _bf_json _bf_signal _bf_rc
+  local _bf_json _bf_signal _bf_rc _bf_id_unk _bf_found _bf_unverified=0
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -4641,6 +4641,8 @@ _filter_built() {
     if [ -n "$repos" ]; then
       while IFS= read -r id; do
         [ -z "$id" ] && continue
+        _bf_id_unk=0
+        _bf_found=0
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
           # ga-3ebneo: the lookup (and which branch names count as a delivery) lives in
@@ -4649,7 +4651,8 @@ _filter_built() {
           # fix/<id> without a slug, etc. (ga-ebuj6c's --count=1 live-pipe removal
           # moved into the helper with it.) rc 1 = looked, none; rc 2 (or 127: this
           # filter can run before the helper is defined — see ga-2wcz6 above) = could
-          # not tell. Both leave the candidate in: FAIL-OPEN to KEEP, as before.
+          # not tell. Both leave the candidate in: FAIL-OPEN to KEEP, as before — but a
+          # "could not tell" no repo settles is COUNTED and logged once per call (below).
           _matched_ref=""
           _bf_rc=0
           _matched_ref=$(_delivery_branch_local_ref "$r" "$id") || _bf_rc=$?
@@ -4673,10 +4676,22 @@ _filter_built() {
               built_ids="${built_ids:+$built_ids }$id"
               built_reasons="${built_reasons}${id}"$'\t'"branch $_matched_ref exists"$'\n'
             fi
+            _bf_found=1
             break
+          elif [ "$_bf_rc" -ne 1 ]; then
+            _bf_id_unk=1
           fi
         done <<< "$repos"
+        # ga-3ebneo: "could not tell" keeps the candidate (fail-open) but must not be QUIET about it:
+        # count the candidates that no repo could vouch for either way. A repo that did find a branch
+        # settles it (positive evidence beats an unreadable probe elsewhere), so only the unsettled count.
+        if [ "$_bf_found" -eq 0 ] && [ "$_bf_id_unk" -eq 1 ]; then
+          _bf_unverified=$((_bf_unverified + 1))
+        fi
       done < <(printf '%s' "$arr" | jq -r '.[]?.id // empty' 2>/dev/null)
+      if [ "$_bf_unverified" -gt 0 ]; then
+        log "[pilot] _filter_built: $_bf_unverified candidate(s) could not be checked for an existing delivery branch (delivery-branch-patterns.sh missing/unreadable, or git could not read a repo) — KEPT, not cleared: they may already be built (ga-3ebneo)" >&2
+      fi
     fi
   fi
 

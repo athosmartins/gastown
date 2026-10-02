@@ -224,6 +224,28 @@ GOT="$(fb lib "$BROKEN"$'\n'"$R" "$ALL")"
 GOT="$(fb lib "$R" '[{"id":"ga-none","labels":[]}]')"
 [ "$GOT" = '["ga-none"]' ] && ok "a lone no-branch candidate passes through untouched" || bad "lone candidate wrong: '$GOT'"
 
+# "could not tell" keeps the candidate — but must be VISIBLE and COUNTED, not quiet (one line per call).
+fberr() { # <lib|nolib> <repos> <json-array>  → _filter_built's stderr
+  local _mode="$1" _repos="$2" _json="$3"
+  printf '%s' "$_json" | FNS="$FNS" LIB="$LIB" bash -c '
+    set -euo pipefail
+    mode="$1"; repos="$2"
+    . "$FNS"
+    if [ "$mode" = lib ]; then . "$LIB"; fi
+    _OWNERSHIP_GUARD_REPOS="$repos"
+    _filter_built 2>&1 >/dev/null
+  ' _ "$_mode" "$_repos" 2>/dev/null
+}
+GOT="$(fberr nolib "$R" "$ALL")"
+case "$GOT" in *"10 candidate(s) could not be checked"*"KEPT"*) ok "lib NOT loaded → ONE line counts the 10 unverifiable candidates (kept, not cleared)" ;; *) bad "no-lib: missing/wrong unverified-count line — got '$GOT'" ;; esac
+[ "$(printf '%s\n' "$GOT" | grep -c 'could not be checked')" = "1" ] && ok "…and it is ONE line per call, not one per candidate" || bad "unverified line repeated: '$GOT'"
+GOT="$(fberr lib "$BROKEN" "$ALL")"
+case "$GOT" in *"10 candidate(s) could not be checked"*) ok "repo git cannot open → the same count" ;; *) bad "broken-repo: missing unverified-count line — got '$GOT'" ;; esac
+GOT="$(fberr lib "$BROKEN"$'\n'"$R" "$ALL")"
+case "$GOT" in *"3 candidate(s) could not be checked"*) ok "unreadable repo + good repo: the 7 found in the good repo are SETTLED, only the 3 with no branch stay unverified" ;; *) bad "mixed repos: want 3 unverified — got '$GOT'" ;; esac
+GOT="$(fberr lib "$R" "$ALL")"
+case "$GOT" in *"could not be checked"*) bad "all repos readable: no unverified line expected — got '$GOT'" ;; *) ok "every lookup ran → no unverified line (silence means checked)" ;; esac
+
 echo "── 7. drift guard: the four probes carry no list of their own ──"
 for _fn in _filter_built _target_has_real_branch _beadid_has_crew_branch _beadid_matched_crew_branch_ref; do
   _body="$(awk -v n="$_fn" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$PD" | grep -v '^[[:space:]]*#')"
