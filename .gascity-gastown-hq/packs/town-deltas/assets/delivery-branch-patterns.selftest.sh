@@ -134,6 +134,23 @@ else
   bad "pilot-dispatcher.sh does not source/use delivery-branch-patterns.sh"
 fi
 
+echo "── 5. gate-auto-unblock.sh's branch_for consumes the shared list too (ga-hi28wr) ──"
+# branch_for had its own hand-typed namespace list (crew/fix, then feat/ added by
+# ga-rdx5h as a one-line instance fix) — a bead delivered on refactor/ docs/ chore/
+# test/ feature/ read as "no branch" → R1 → gate:needs-human removed. Any literal
+# refs/remotes/origin/<namespace>/ in the script is a second copy of this list.
+GAU="$SELF_DIR/gate-auto-unblock.sh"
+if grep -v '^[[:space:]]*#' "$GAU" | grep -Eq "refs/remotes/origin/(fix|feat|feature|refactor|docs|chore|test|crew)/"; then
+  bad "gate-auto-unblock.sh hard-codes a refs/remotes/origin/<namespace>/ pattern again — branch_for must read delivery-branch-patterns.sh (ga-hi28wr)"
+else
+  ok "gate-auto-unblock.sh carries no literal refs/remotes/origin/<namespace>/ pattern in code"
+fi
+if grep -Fq 'delivery-branch-patterns.sh' "$GAU" && grep -Fq 'gc_delivery_branch_globs "$id"' "$GAU"; then
+  ok "gate-auto-unblock.sh sources the shared lib and builds branch_for's patterns from it"
+else
+  bad "gate-auto-unblock.sh does not source/use delivery-branch-patterns.sh"
+fi
+
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]
