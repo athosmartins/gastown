@@ -28,11 +28,24 @@
 # extract_fn-based harnesses (e.g. pilot-dispatcher.ns-rig-list-gc-failure
 # .selftest.sh).
 #
-# Exit 0 iff every assertion holds.
+# ga-x7m5rg (second bug in the same helper, same family): it only knew
+# fix/<bead>[-*], while the GAP-2 reconciler that ARMS this path also accepts
+# feat/ feature/ refactor/ docs/ chore/ test/ crew/*/. A bead delivered on
+# feat/ga-atsahv was found by GAP-2, re-armed gate:needs-remerge, then called
+# "no existing fix/ branch" here → false gate:needs-human (measured 2x). The
+# prefix list now lives in delivery-branch-patterns.sh (sourced below, and
+# drift-guarded against quality-gate-guard.sh by its own selftest). The helper
+# is also THREE-state now: rc 0 found / rc 1 looked everywhere, nothing /
+# rc 2 could not look (ls-remote failed, rig list failed, no git, no lib) —
+# a lookup that could not read must never be mistaken for "no branch".
+#
+# PILOT_DISPATCHER_UNDER_TEST overrides the dispatcher file (used to prove
+# these cases fail against the pre-fix helper). Exit 0 iff every assertion holds.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DISPATCHER="$HERE/pilot-dispatcher.sh"
+DISPATCHER="${PILOT_DISPATCHER_UNDER_TEST:-$HERE/pilot-dispatcher.sh}"
+LIB="$HERE/delivery-branch-patterns.sh"
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
 
 # extract_fn <name> <file> — prints a top-level `name() { ... }` function
@@ -65,6 +78,12 @@ for fn in _ownership_guard_repos _beadid_needs_remerge_branch; do
   fi
 done
 
+# The helper depends on the shared prefix list; a missing lib must fail LOUDLY
+# here (the production caller degrades to rc 2 "unknown" instead — see below).
+[ -r "$LIB" ] || { echo "FATAL: $LIB missing — shared prefix list not found" >&2; exit 2; }
+# shellcheck disable=SC1090
+. "$LIB"
+
 # ── Build a real, disposable git sandbox repo with crafted branches ────────
 SANDBOX="$(mktemp -d)"
 git -C "$SANDBOX" init -q .
@@ -83,6 +102,23 @@ git -C "$SANDBOX" branch fix/rmg-bare-caseXYZ-decoy-belongs-to-other-bead
 # rmg-no-branch-case: deliberately nothing created — the genuine no-branch
 # control (must still report "no match" so the caller still escalates to
 # gate:needs-human; ga-r7uec ACEITE #2).
+
+# ── ga-x7m5rg: every non-fix delivery prefix GAP-2 recognises ──
+git -C "$SANDBOX" branch feat/rmg-feat-bare                    # THE ga-atsahv shape (no slug)
+git -C "$SANDBOX" branch feat/rmg-feat-slug-real-slug
+git -C "$SANDBOX" branch feature/rmg-feature-case
+git -C "$SANDBOX" branch refactor/rmg-refactor-case
+git -C "$SANDBOX" branch docs/rmg-docs-case
+git -C "$SANDBOX" branch chore/rmg-chore-case
+git -C "$SANDBOX" branch test/rmg-test-case
+git -C "$SANDBOX" branch crew/some-agent/rmg-crew-case
+git -C "$SANDBOX" branch crew/some-agent/rmg-crew-slug-real-slug
+# priority: a bead with BOTH a fix/ and a feat/ branch resolves to fix/ (the
+# documented dispatch_one() convention, first in the shared list).
+git -C "$SANDBOX" branch fix/rmg-prio-case
+git -C "$SANDBOX" branch feat/rmg-prio-case
+# decoy under a non-fix prefix: a longer id that merely starts with rmg-feat-bare
+git -C "$SANDBOX" branch feat/rmg-feat-bareXYZ-decoy-belongs-to-other-bead
 
 _OWNERSHIP_GUARD_REPOS="$SANDBOX"
 _OWNERSHIP_GUARD_REPOS_DONE=1
@@ -118,6 +154,101 @@ case "$_rt" in
   *decoy*) bad "REGRESSION: bare-id exact match against fix/rmg-bare-case picked up the unrelated decoy branch fix/rmg-bare-caseXYZ-decoy-belongs-to-other-bead" ;;
   *) ok "decoy branch correctly ignored — exact-match pattern has no prefix-collision" ;;
 esac
+
+# expect <label> <bead> <want_rc> <want_ref> — run the REAL helper, compare rc and ref.
+expect() {
+  local _label="$1" _id="$2" _want_rc="$3" _want_ref="$4" _got _rc
+  _got="$(_beadid_needs_remerge_branch "$_id" 2>/dev/null)"; _rc=$?
+  if [ "$_rc" -eq "$_want_rc" ] && [ "${_got#*$'\t'}" = "$_want_ref" ] \
+     && { [ "$_want_rc" -ne 0 ] || [ "${_got%%$'\t'*}" != "$_got" ]; }; then
+    ok "$_label (rc=$_rc ref='${_got#*$'\t'}')"
+  else
+    bad "$_label: want rc=$_want_rc ref='$_want_ref', got rc=$_rc out='$_got'"
+  fi
+}
+
+echo "-- ga-x7m5rg: every non-fix prefix GAP-2 accepts must resolve (feat/ is THE ga-atsahv bug) --"
+expect "feat/<bead> (bare, no slug) — THE ga-atsahv REGRESSION CASE" rmg-feat-bare   0 "feat/rmg-feat-bare"
+expect "feat/<bead>-<slug>"                                           rmg-feat-slug   0 "feat/rmg-feat-slug-real-slug"
+expect "feature/<bead>"                                               rmg-feature-case 0 "feature/rmg-feature-case"
+expect "refactor/<bead>"                                              rmg-refactor-case 0 "refactor/rmg-refactor-case"
+expect "docs/<bead>"                                                  rmg-docs-case   0 "docs/rmg-docs-case"
+expect "chore/<bead>"                                                 rmg-chore-case  0 "chore/rmg-chore-case"
+expect "test/<bead>"                                                  rmg-test-case   0 "test/rmg-test-case"
+expect "crew/<agent>/<bead>"                                          rmg-crew-case   0 "crew/some-agent/rmg-crew-case"
+expect "crew/<agent>/<bead>-<slug>"                                   rmg-crew-slug   0 "crew/some-agent/rmg-crew-slug-real-slug"
+
+echo "-- priority: fix/ beats feat/ when a bead has both --"
+expect "fix/<bead> wins over feat/<bead>" rmg-prio-case 0 "fix/rmg-prio-case"
+
+echo "-- decoy under feat/: a longer id sharing the bare id as a prefix must NOT match --"
+expect "feat/<longer-id>-... does not match the shorter bead id" rmg-feat-bare 0 "feat/rmg-feat-bare"
+_rt="$(_beadid_needs_remerge_branch "rmg-feat-ba" 2>/dev/null)"; _rc=$?
+if [ "$_rc" -eq 1 ] && [ -z "$_rt" ]; then
+  ok "id that is only a PREFIX of existing branch ids matches nothing (rc=1)"
+else
+  bad "prefix-only id false-matched: rc=$_rc out='$_rt'"
+fi
+
+echo "-- no branch under ANY prefix -> rc 1 (genuine none: the caller still escalates) --"
+expect "no branch anywhere" rmg-truly-nothing 1 ""
+
+# ── three-state: a lookup that could not READ is rc 2, never rc 1 ──────────
+echo "-- origin unreachable (ls-remote fails) + no local match -> rc 2 UNKNOWN, not 'no branch' --"
+DEADREMOTE="$(mktemp -d)"
+git -C "$DEADREMOTE" init -q .
+git -C "$DEADREMOTE" -c user.email=test@test.local -c user.name=test commit -q --allow-empty -m init
+git -C "$DEADREMOTE" remote add origin "$DEADREMOTE/does-not-exist.git"
+_OWNERSHIP_GUARD_REPOS="$DEADREMOTE"
+expect "ls-remote failing, nothing local" rmg-anything 2 ""
+git -C "$DEADREMOTE" branch feat/rmg-local-wins
+expect "ls-remote failing BUT the branch is local -> found (positive evidence beats a failed probe)" rmg-local-wins 0 "feat/rmg-local-wins"
+
+echo "-- branch only on origin (never fetched locally) is found via ls-remote --"
+ORIGIN="$(mktemp -d)"; git init -q --bare "$ORIGIN"
+CLONE="$(mktemp -d)"; git -C "$CLONE" init -q .
+git -C "$CLONE" -c user.email=test@test.local -c user.name=test commit -q --allow-empty -m init
+git -C "$CLONE" remote add origin "$ORIGIN"
+git -C "$CLONE" push -q origin HEAD:refs/heads/feat/rmg-remote-only
+git -C "$CLONE" push -q origin HEAD:refs/heads/crew/some-agent/rmg-remote-crew
+git -C "$CLONE" push -q origin HEAD:refs/heads/feat/rmg-remote-onlyXYZ-decoy
+_OWNERSHIP_GUARD_REPOS="$CLONE"
+expect "remote-only feat/<bead>"        rmg-remote-only 0 "feat/rmg-remote-only"
+expect "remote-only crew/<agent>/<bead>" rmg-remote-crew 0 "crew/some-agent/rmg-remote-crew"
+expect "remote reachable, nothing there -> rc 1 (a READABLE miss is a real none)" rmg-remote-missing 1 ""
+
+echo "-- rig list failed (only HQ was searched) + no match -> rc 2; a match is still honoured --"
+_OWNERSHIP_GUARD_REPOS="$SANDBOX"
+_OWNERSHIP_GUARD_REPOS_FAILED=1
+expect "degraded repo list, nothing found" rmg-truly-nothing 2 ""
+expect "degraded repo list, but the branch is right there" rmg-feat-bare 0 "feat/rmg-feat-bare"
+_OWNERSHIP_GUARD_REPOS_FAILED=""
+
+echo "-- a path that is not a git repo is skipped, not treated as unreadable --"
+NOTGIT="$(mktemp -d)"
+_OWNERSHIP_GUARD_REPOS="$NOTGIT
+$SANDBOX"
+expect "non-git rig dir + real repo, nothing found -> rc 1" rmg-truly-nothing 1 ""
+expect "non-git rig dir + real repo, branch found"          rmg-feat-bare 0 "feat/rmg-feat-bare"
+_OWNERSHIP_GUARD_REPOS="$NOTGIT"
+expect "ONLY non-git paths (looked nowhere) -> rc 2" rmg-truly-nothing 2 ""
+_OWNERSHIP_GUARD_REPOS="$SANDBOX"
+
+echo "-- shared lib missing at runtime -> rc 2 (deploy fault must not escalate beads) --"
+(
+  unset -f gc_delivery_branch_globs gc_delivery_branch_pick
+  _rt="$(_beadid_needs_remerge_branch "rmg-feat-bare" 2>/dev/null)"; _rc=$?
+  [ "$_rc" -eq 2 ] && [ -z "$_rt" ]
+) && ok "no gc_delivery_branch_globs -> rc 2, no output" \
+  || bad "missing lib did not degrade to rc 2"
+
+echo "-- test seam: PILOT_TEST_REMERGE_UNKNOWN_BEADS yields rc 2 --"
+(
+  PILOT_TEST_REMERGE_BEADS="x"; PILOT_TEST_REMERGE_UNKNOWN_BEADS="rmg-seam"
+  _beadid_needs_remerge_branch "rmg-seam" >/dev/null 2>&1; [ $? -eq 2 ]
+) && ok "UNKNOWN seam -> rc 2" || bad "UNKNOWN seam did not return rc 2"
+
+rm -rf "$SANDBOX" "$DEADREMOTE" "$ORIGIN" "$CLONE" "$NOTGIT" 2>/dev/null || true
 
 echo ""
 if [ "$F" -eq 0 ]; then echo "SELFTEST PASS ($P ok)"; exit 0

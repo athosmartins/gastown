@@ -159,6 +159,11 @@ else
   for _ in $(seq 1 "$RUNS_A"); do
     if ( set -euo pipefail
          _ownership_guard_repos() { :; }
+         # ga-x7m5rg: the helper's prefix list lives in a sibling lib the real
+         # dispatcher sources at load time; this harness evals the function in
+         # isolation, so it must load the same lib or the helper (correctly)
+         # reports "could not tell" (rc 2).
+         . "$SELF_DIR/delivery-branch-patterns.sh"
          eval "$FN_NRB"
          _OWNERSHIP_GUARD_REPOS="$A_REPO"
          _beadid_needs_remerge_branch "$A_ID" >/dev/null

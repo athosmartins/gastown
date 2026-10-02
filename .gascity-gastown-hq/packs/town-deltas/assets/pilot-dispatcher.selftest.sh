@@ -702,7 +702,8 @@ run_real_dispatch_mayorhold() { # FAKE_STORY_COMMENTS_JSON [PILOT_MAYOR_HOLD_GRA
 #   $1 = extra label(s) on the candidate, comma-joined (e.g. "gate:needs-remerge"
 #        or "gate:needs-fix")
 #   $2 = PILOT_TEST_REMERGE_BEADS (space-list; "tt-remerge" → branch found, "" → not found)
-run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS
+#   $3 = PILOT_TEST_REMERGE_UNKNOWN_BEADS (ga-x7m5rg; "tt-remerge" → lookup could not be completed, rc 2)
+run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS  $3=PILOT_TEST_REMERGE_UNKNOWN_BEADS
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
@@ -716,6 +717,7 @@ run_dispatch_remerge() { # $1=label  $2=PILOT_TEST_REMERGE_BEADS
     PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
     FAKE_BLOCKED_IDS="" \
     PILOT_TEST_REMERGE_BEADS="${2:-}" \
+    PILOT_TEST_REMERGE_UNKNOWN_BEADS="${3:-}" \
     FAKE_BUGS_JSON='[{"id":"tt-remerge","title":"Remerge fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["'"$1"'"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
@@ -2300,6 +2302,100 @@ if echo "$LOGE2N96D" | grep "injecting reviewer feedback (6[0-9] chars)\|injecti
   ok "ga-e2n96(d): real feedback still gets injected into the builder brief, as before"
 else
   bad "ga-e2n96(d) REGRESSION: real feedback was not injected (chars count wrong or missing)"
+fi
+
+# ── Scenario ga-x7m5rg: the branch lookup is THREE-state — "could not tell" must not escalate ──
+# Bug (same helper, same family as ga-r7uec): _beadid_needs_remerge_branch returned
+# 1 both for "every repo read, no branch" and for "could not read" (ls-remote
+# failed/timed out, `gc rig list` failed, no git). The caller escalated on 1, so a
+# flaky origin read stamped a good bead gate:needs-human and stopped it until the
+# Mayor re-armed it. Now rc 2 = unknown → the caller touches NOTHING and skips the
+# candidate (the sweep moves on). The helper's own matrix (every prefix, priority,
+# decoys, ls-remote/rig-list failure) is in pilot-dispatcher.remerge-branch-match
+# .selftest.sh; this proves the CALLER's reaction, including the writes it must NOT make.
+echo "Scenario ga-x7m5rg(a): lookup could not be completed → no escalation, no resubmit, no builder (DRY_RUN log)"
+LOGX7A="$(run_dispatch_remerge "gate:needs-remerge" "tt-remerge" "tt-remerge")"
+if echo "$LOGX7A" | grep "ga-x7m5rg:.*tt-remerge.*could not be completed" >/dev/null; then
+  ok "ga-x7m5rg(a): unknown lookup logged, naming the bead"
+else
+  bad "ga-x7m5rg(a): no 'could not be completed' warning for tt-remerge when the branch lookup was unreadable"
+fi
+if echo "$LOGX7A" | grep "ga-e2n96:.*WOULD:" >/dev/null; then
+  bad "ga-x7m5rg(a) REGRESSION: an unreadable lookup was still turned into a resubmit/escalate decision"
+else
+  ok "ga-x7m5rg(a): neither 'WOULD: escalate' nor 'WOULD: resubmit' — an unreadable lookup decides nothing"
+fi
+if echo "$LOGX7A" | grep "Dispatch complete:" >/dev/null; then
+  bad "ga-x7m5rg(a) REGRESSION: a builder was dispatched on an unreadable lookup"
+else
+  ok "ga-x7m5rg(a): no builder dispatched"
+fi
+
+# Real (non-dry) runs with a recording bd wrapper over the stateful shim, so the WRITES
+# can be asserted (the base shim swallows label ops). The genuine-none run is the
+# control: it must reach the escalation, or "no label written" below proves nothing.
+RMG_SHIMBIN="$WORK/x7m5rg-bin"
+mkdir -p "$RMG_SHIMBIN"
+cat > "$RMG_SHIMBIN/bd" <<RMG_BD_EOF
+#!/usr/bin/env bash
+echo "\$*" >> "\${PILOT_TEST_STATE:-/tmp/pilot-selftest-state}/bd-calls.log"
+exec "$SHIMBIN/bd" "\$@"
+RMG_BD_EOF
+chmod +x "$RMG_SHIMBIN/bd"
+ln -sf "$SHIMBIN/gc" "$RMG_SHIMBIN/gc"
+ln -sf "$SHIMBIN/notify" "$RMG_SHIMBIN/notify"
+run_remerge_real() { # $1=PILOT_TEST_REMERGE_BEADS  $2=PILOT_TEST_REMERGE_UNKNOWN_BEADS
+  : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+  rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl" "$FIXCITY/.gc/pilot-dispatcher-stall.count"
+  reset_state
+  env -i \
+    PATH="$RMG_SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    HOME="$HOME" \
+    PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
+    DRY_RUN=0 \
+    PILOT_CITY_OVERRIDE="$FIXCITY" \
+    PILOT_TEST_STATE="$STATE" \
+    PILOT_DISPATCHABLE_FILE="$FIXCITY/.gc/pilot-dispatchable.json" \
+    PILOT_DOLT_LATENCY_OVERRIDE_MS=100 \
+    PILOT_DOLT_CPU_OVERRIDE=10 \
+    PILOT_INFLIGHT_RETRIES=3 \
+    PILOT_INFLIGHT_SLEEP=0 \
+    FAKE_BLOCKED_IDS="" \
+    PILOT_TEST_REMERGE_BEADS="${1:-}" \
+    PILOT_TEST_REMERGE_UNKNOWN_BEADS="${2:-}" \
+    FAKE_BUGS_JSON='[{"id":"tt-remerge","title":"Remerge fixture","priority":0,"issue_type":"bug","description":"fixture body — context for veto test","status":"open","labels":["gate:needs-fix","gate:needs-remerge"],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]' \
+    bash "$DISPATCHER" >/dev/null 2>&1 || true
+  cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
+}
+rmg_n() { local _c; _c=$(grep -cE "$1" "$STATE/bd-calls.log" 2>/dev/null) || _c=0; printf '%s' "${_c:-0}"; }
+
+echo "Scenario ga-x7m5rg(b) CONTROL: lookup READ everything and found no branch → still escalates to gate:needs-human (real run)"
+LOGX7B="$(run_remerge_real "" "")"
+if [ "$(rmg_n 'label add tt-remerge gate:needs-human')" -ge 1 ] \
+   && [ "$(rmg_n 'label remove tt-remerge gate:needs-fix')" -ge 1 ]; then
+  ok "ga-x7m5rg(b): genuine none still escalates (gate:needs-human added, gate:needs-fix removed) — the harness reaches the write path"
+else
+  bad "ga-x7m5rg(b): genuine none did NOT escalate — harness broken or the escalation regressed; (c) below proves nothing. log tail: $(printf '%s' "$LOGX7B" | tail -3 | tr '\n' ' ' | cut -c1-300)"
+fi
+
+echo "Scenario ga-x7m5rg(c): lookup could not be completed → the bead's labels are NOT touched (real run)"
+LOGX7C="$(run_remerge_real "tt-remerge" "tt-remerge")"
+if echo "$LOGX7C" | grep "ga-x7m5rg:.*tt-remerge.*could not be completed" >/dev/null; then
+  ok "ga-x7m5rg(c): harness reached the unknown-lookup branch in a real run (not a vacuous pass)"
+else
+  bad "ga-x7m5rg(c): the unknown-lookup branch was NEVER reached — the assertions below prove nothing. log tail: $(printf '%s' "$LOGX7C" | tail -3 | tr '\n' ' ' | cut -c1-300)"
+fi
+for _lbl in 'label add tt-remerge gate:needs-human' 'label remove tt-remerge gate:needs-fix' 'label remove tt-remerge gate:needs-remerge' 'label add tt-remerge gate:queued'; do
+  if [ "$(rmg_n "$_lbl")" = "0" ]; then
+    ok "ga-x7m5rg(c): no '$_lbl' written on an unreadable lookup"
+  else
+    bad "ga-x7m5rg(c) REGRESSION: '$_lbl' WAS written although the branch lookup could not be completed — a flaky origin read would strand or mis-route the bead"
+  fi
+done
+if [ "$(rmg_n 'create ready-for-gate')" = "0" ]; then
+  ok "ga-x7m5rg(c): no gate marker created"
+else
+  bad "ga-x7m5rg(c) REGRESSION: a gate marker was created on an unreadable lookup"
 fi
 
 # ── Scenario 6: source bead never carries dog routing (ga-ms1jm) ──────────────

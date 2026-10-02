@@ -6021,77 +6021,160 @@ _beadid_branch_signal() {
   return 0
 }
 
+# ga-x7m5rg: the list of branch prefixes that count as a bead's delivery lives
+# in a sibling file shared with the GAP-2 reconciler's drift guard (see that
+# file's header) — same sibling-source idiom, and the same degradation, as
+# framework-marker-labels.sh above. `[ -r ]`, not `[ -f ]`: an existing-but-
+# unreadable file would still kill `source` under `set -e`. A MISSING lib is a
+# deploy fault, not evidence that no branch exists, so it must never be allowed
+# to turn into an escalation: _beadid_needs_remerge_branch checks for the
+# functions and returns rc 2 ("could not tell" → the caller touches nothing),
+# and the warn below makes the fault loud once per process instead of silent.
+# stderr of the source itself is deliberately NOT suppressed (a corrupt sibling
+# should be loud).
+_GC_DBP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/delivery-branch-patterns.sh"
+if [ -r "$_GC_DBP_SIBLING" ]; then
+  source "$_GC_DBP_SIBLING"
+else
+  warn "ga-x7m5rg: delivery-branch-patterns.sh missing/unreadable next to pilot-dispatcher.sh ($_GC_DBP_SIBLING) — the gate:needs-remerge branch lookup returns 'unknown' (no resubmit, no escalation) until it is restored."
+fi
+unset _GC_DBP_SIBLING
+
 # _beadid_needs_remerge_branch <bead_id> — ga-e2n96 companion to
 # _beadid_matched_crew_branch_ref above: the gate-fix re-dispatch path (a bead
 # carrying gate:needs-fix/gate:needs-remerge with ZERO reviewer feedback) needs
 # an ACTUAL branch name to resubmit to the gate, not just a repo+existence
 # signal — that function's own ref can be EMPTY on an ls-remote-only match (see
-# its doc comment), which isn't enough to build a gate marker. Scoped ONLY to
-# the bug-tier convention dispatch_one() itself tells builders to use
-# (fix/<bead>-<slug>, see the "Steps" section of DISPATCH_TASK below) — narrower
-# than the crew-branch checker's crew/*/<bead> OR fix/<bead>-* union, since a
-# re-merge candidate is by definition a bug/task bead (GAP-2's own "bugtask"
-# verdict), never a fresh crew assignment. A 4th sibling function rather than a
-# refactor of the existing three, following this file's established pattern
-# (ga-8jxe1's own comment) of several independently-testable functions with
-# overlapping probe logic, rather than risking their existing selftest coverage.
+# its doc comment), which isn't enough to build a gate marker. A 4th sibling
+# function rather than a refactor of the existing three, following this file's
+# established pattern (ga-8jxe1's own comment) of several independently-testable
+# functions with overlapping probe logic, rather than risking their existing
+# selftest coverage.
 #
 # Prints "<repo>\t<ref>" on a match (ref is ALWAYS populated — the whole reason
-# for a dedicated helper); exit 0/1. Test seam: PILOT_TEST_REMERGE_BEADS
-# (space-list), PILOT_TEST_REMERGE_REPO, PILOT_TEST_REMERGE_REF — consulted
-# when PILOT_TEST_REMERGE_BEADS is DEFINED, keeps the selftest hermetic (no
-# real git/network). FAIL-OPEN when undecidable: no git / no repos / no match
-# → return 1 (caller falls back to human escalation, never a silent re-dispatch).
+# for a dedicated helper). THREE outcomes, because "found", "looked and found
+# nothing" and "could not look" lead the caller to three different actions
+# (ga-x7m5rg — the old two-valued version turned a failed lookup into "no
+# branch" and escalated a good commit to gate:needs-human):
+#   rc 0  a branch was found                       → resubmit it to the gate
+#   rc 1  every repo was READ and none has one     → escalate (genuine none)
+#   rc 2  could not tell                           → touch NOTHING this sweep
+# rc 2 is: no git; the shared prefix lib is missing/unreadable (a deploy fault
+# is not evidence of absence); `gc rig list` failed so only the HQ repo was
+# searched (ga-07rb3 — that caller-side degrade is fine for the defense-in-depth
+# probes, not for one that ESCALATES on "none"); a repo whose refs git could not
+# read; `git ls-remote origin` failing or timing out; or no repo checked at all.
+# A match found anywhere still wins over a failure elsewhere — positive
+# evidence beats an unreadable probe. Callers must treat any rc other than 0/1
+# as "unknown" too (a crash is not an answer).
 #
-# ga-r7uec: matches BOTH fix/<bead>-<slug> (the documented convention above)
-# AND the bare fix/<bead> shape (no slug) — a branch has reached the gate
-# without a slug at least once in the wild (ga-y9a1d: origin/fix/ga-y9a1d,
-# tip 48a365ae, 2 commits, already reviewed) despite the convention, and the
-# old suffix-only glob (refs/heads/fix/<bead>-*, requiring a literal "-"
-# right after the id) never matched it — this guard concluded "no branch"
-# for a bead that had one and escalated a good commit to gate:needs-human.
-# The added exact-id pattern cannot collide with an unrelated LONGER id:
-# `git for-each-ref "refs/heads/fix/<bead>"` (no trailing glob) matches only
-# that literal ref, never one merely prefixed by it — verified empirically
-# and covered by pilot-dispatcher.remerge-branch-match.selftest.sh's decoy
-# case, so this stays as safe as the pre-existing suffix pattern.
+# Which branches count: the SAME list GAP-2 (quality-gate-guard.sh) uses to
+# decide a delivery exists — fix feat feature refactor docs chore test, each as
+# <prefix>/<bead> and <prefix>/<bead>-*, plus crew/*/<bead>[-*] — read from
+# delivery-branch-patterns.sh, never retyped here (ga-x7m5rg: this helper alone
+# knew fix/, so a bead delivered on feat/<bead> — ga-atsahv, measured 2x —
+# armed by GAP-2 was escalated here as "no branch"). The earlier narrowing to
+# fix/ ("a re-merge candidate is a bug/task bead, never a crew assignment")
+# is gone: GAP-2's own evidence list is the contract. When a bead has
+# branches under several prefixes the earliest in that list wins (fix/ first).
+# The bare <bead> and "<bead>-*" are separate globs (ga-r7uec: a slug-less
+# fix/ga-y9a1d reached the gate in the wild), and neither can match a LONGER id
+# that merely starts with this one — gc_delivery_branch_pick re-checks every
+# ref git returned with an anchored match, since `git ls-remote` matches
+# patterns against the TAIL of a ref.
+#
+# Test seam: PILOT_TEST_REMERGE_BEADS (space-list), PILOT_TEST_REMERGE_REPO,
+# PILOT_TEST_REMERGE_REF — consulted when PILOT_TEST_REMERGE_BEADS is DEFINED,
+# keeps the selftest hermetic (no real git/network); PILOT_TEST_REMERGE_UNKNOWN_BEADS
+# (space-list, honoured under the same condition) makes those beads return rc 2.
+#
+# Written to survive the caller's `set -euo pipefail` and bash 3.2: no pipe in
+# front of a git call (the ga-ebuj6c SIGPIPE class — the local lookup is one
+# for-each-ref call per glob, each bounded at the source with --count=1 like the
+# other two sites in this file, which pipe-early-exit.selftest.sh counts), every
+# git/rc read captured with `|| rc=$?`, no empty-array expansion.
 _beadid_needs_remerge_branch() {
-  local _bid="${1:-}" _repo _match
+  local _bid="${1:-}" _repos _repo _globs _g _refs _pick _rc _unreadable
+  local _rpats=() _checked=0 _unknown=0 _og_rc=0
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_REMERGE_BEADS+x}" ]; then
+    case " ${PILOT_TEST_REMERGE_UNKNOWN_BEADS:-} " in
+      *" $_bid "*) return 2 ;;
+    esac
     case " $PILOT_TEST_REMERGE_BEADS " in
       *" $_bid "*) printf '%s\t%s' "${PILOT_TEST_REMERGE_REPO:-.}" "${PILOT_TEST_REMERGE_REF:-fix/${_bid}-test}"; return 0 ;;
       *) return 1 ;;
     esac
   fi
-  command -v git >/dev/null 2>&1 || return 1
-  local _repos
-  _ownership_guard_repos >/dev/null
+  command -v git >/dev/null 2>&1 || return 2
+  type gc_delivery_branch_globs >/dev/null 2>&1 || return 2
+  type gc_delivery_branch_pick >/dev/null 2>&1 || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    _rpats+=("refs/heads/$_g")
+  done <<< "$_globs"
+  [ "${#_rpats[@]}" -gt 0 ] || return 2
+  _ownership_guard_repos >/dev/null || _og_rc=$?
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
-  [ -n "$_repos" ] || return 1
+  [ -n "$_repos" ] || return 2
   while IFS= read -r _repo; do
+    # A registered path that is not a git repo cannot hold this bead's branch —
+    # skipped, and NOT counted as checked (so "every path was a non-repo" is
+    # still "looked nowhere" = unknown, below).
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    # ga-ebuj6c: --count=1 limits at the source instead of relying on the
-    # trailing `| head -1` to close the pipe early under set -e (same
-    # rationale as the _filter_built fix above, ~L4276).
-    _match=$(git -C "$_repo" for-each-ref --count=1 --format='%(refname:short)' \
-      "refs/heads/fix/${_bid}" "refs/heads/fix/${_bid}-*" \
-      "refs/remotes/origin/fix/${_bid}" "refs/remotes/origin/fix/${_bid}-*" \
-      2>/dev/null | head -1)
-    if [ -n "$_match" ]; then
-      printf '%s\t%s' "$_repo" "${_match#origin/}"
-      return 0
-    fi
-    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
-      _match=$(timeout 8 git -C "$_repo" ls-remote --heads origin "fix/${_bid}" "fix/${_bid}-*" 2>/dev/null | head -1 | awk '{print $2}')
-      if [ -n "$_match" ]; then
-        printf '%s\t%s' "$_repo" "${_match#refs/heads/}"
+    git -C "$_repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+    # 1) local branches + the remote-tracking refs this clone already fetched,
+    # one bounded probe per glob in PRIORITY order (the first glob that hits is
+    # the answer). A probe that errors makes the whole repo unreadable — a miss
+    # on the later globs would not mean "no branch" any more.
+    _unreadable=0
+    while IFS= read -r _g; do
+      [ -n "$_g" ] || continue
+      _rc=0
+      _refs=$(git -C "$_repo" for-each-ref --count=1 --format='%(refname)' \
+        "refs/heads/$_g" "refs/remotes/origin/$_g" 2>/dev/null </dev/null) || _rc=$?
+      if [ "$_rc" -ne 0 ]; then
+        _unreadable=1
+        break
+      fi
+      if [ -n "$_refs" ] && _pick=$(gc_delivery_branch_pick "$_bid" <<< "$_refs"); then
+        printf '%s\t%s' "$_repo" "$_pick"
         return 0
       fi
+    done <<< "$_globs"
+    if [ "$_unreadable" -ne 0 ]; then
+      _unknown=1
+      continue
+    fi
+    _checked=$((_checked + 1))
+    # 2) origin itself: authoritative for a branch this clone has not fetched.
+    # `git config --get` tells "no origin configured" (rc 1: nothing to ask, the
+    # local refs above were the whole answer) from "could not read the config"
+    # (any other rc: unknown). An ls-remote that fails or times out says nothing
+    # about the branch — unknown, not "absent". Every git call in this loop gets
+    # </dev/null: the loops are fed by here-strings, and a command that read
+    # stdin would swallow the rest of the repo list and end the scan early, which
+    # would then read as a clean "none" for repos that were never looked at.
+    _rc=0
+    git -C "$_repo" config --get remote.origin.url >/dev/null 2>&1 </dev/null || _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+      _refs=$(timeout 8 git -C "$_repo" ls-remote --heads origin "${_rpats[@]}" 2>/dev/null </dev/null) || _rc=$?
+      if [ "$_rc" -ne 0 ]; then
+        _unknown=1
+      elif [ -n "$_refs" ] && _pick=$(gc_delivery_branch_pick "$_bid" <<< "$_refs"); then
+        printf '%s\t%s' "$_repo" "$_pick"
+        return 0
+      fi
+    elif [ "$_rc" -ne 1 ]; then
+      _unknown=1
     fi
   done <<< "$_repos"
-  return 1
+  if [ "$_unknown" -eq 0 ] && [ "$_checked" -gt 0 ] && [ "$_og_rc" -eq 0 ]; then
+    return 1
+  fi
+  return 2
 }
 
 # _ownership_guard_flag_orphan_branch <bead_id> <bead_city> <detail> — ga-8jxe1
@@ -9749,11 +9832,29 @@ FIXSEC
      || { echo "$STORY_LABELS" | grep "gate:needs-fix" >/dev/null && [ -z "$STORY_GATE_FEEDBACK" ]; }; then
     log "  ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with ZERO feedback — will NOT dispatch a builder with an empty brief. Searching for an existing branch to resubmit..."
 
-    local REMERGE_MATCH="" REMERGE_REPO="" REMERGE_REF=""
-    if REMERGE_MATCH=$(_beadid_needs_remerge_branch "$STORY_ID"); then
-      REMERGE_REPO="${REMERGE_MATCH%%$'\t'*}"
-      REMERGE_REF="${REMERGE_MATCH#*$'\t'}"
-    fi
+    # ga-x7m5rg: three outcomes (see _beadid_needs_remerge_branch). Anything but a
+    # clean rc 0 (found) / rc 1 (every repo read, none has one) is "could not
+    # tell": escalating to a human, or dispatching a builder with an empty brief,
+    # on a lookup that never actually looked is the false gate:needs-human this
+    # fix exists to stop — so touch nothing; the labels stay and the next sweep
+    # retries. dispatch_one() returning 1 only skips THIS candidate (the sweep
+    # moves on), so this cannot head-of-line-block the lane.
+    local REMERGE_MATCH="" REMERGE_REPO="" REMERGE_REF="" REMERGE_RC=0
+    local REMERGE_PFX="${GC_DELIVERY_BRANCH_PREFIXES:-?}"   # display only (messages below)
+    REMERGE_PFX="${REMERGE_PFX// /|}"
+    REMERGE_MATCH=$(_beadid_needs_remerge_branch "$STORY_ID") || REMERGE_RC=$?
+    case "$REMERGE_RC" in
+      0)
+        REMERGE_REPO="${REMERGE_MATCH%%$'\t'*}"
+        REMERGE_REF="${REMERGE_MATCH#*$'\t'}"
+        ;;
+      1) ;;
+      *)
+        warn "ga-x7m5rg: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback but the branch lookup could not be completed (rc=$REMERGE_RC: origin unreachable / rig list failed / refs unreadable / prefix lib missing) — NOT escalating to gate:needs-human and NOT dispatching a builder; labels untouched, will retry next sweep."
+        DISPATCH_RESULT="remerge_branch_lookup_unknown"
+        return 1
+        ;;
+    esac
 
     if [ "$DRY_RUN" = "1" ]; then
       if [ -n "$REMERGE_REF" ]; then
@@ -9794,11 +9895,11 @@ submitted_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         warn "ga-e2n96: found branch $REMERGE_REF for $STORY_ID but FAILED to create gate marker — leaving labels as-is for next sweep to retry."
       fi
     else
-      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing fix/$STORY_ID or fix/$STORY_ID-* branch found (checked local+remote refs, both the bare id and the id+slug shape) — escalating to human instead of blind-dispatching a builder."
+      warn "ga-e2n96: $STORY_ID carries gate:needs-fix/needs-remerge with zero feedback and NO existing delivery branch found (checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*], local+remote refs, every repo read) — escalating to human instead of blind-dispatching a builder."
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-fix"     -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label remove "$STORY_ID" "gate:needs-remerge" -q 2>/dev/null || true
       bd -C "$STORY_BEAD_CITY" label add    "$STORY_ID" "gate:needs-human"   -q 2>/dev/null || true
-      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing fix/$STORY_ID or fix/$STORY_ID-* branch to resubmit (ga-r7uec: checked both the bare-id and id+slug branch shapes, local and remote) — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
+      bd -C "$STORY_BEAD_CITY" comment "$STORY_ID" "ga-e2n96: Pilot found gate:needs-fix/needs-remerge with zero reviewer feedback and no existing delivery branch to resubmit (ga-x7m5rg: checked {$REMERGE_PFX}/$STORY_ID[-*] and crew/*/$STORY_ID[-*] — the same list the GAP-2 reconciler uses — bare id and id+slug shapes, local and remote, every repo read successfully) — escalating to gate:needs-human rather than dispatching a builder with an empty brief." 2>/dev/null || true
     fi
     return 1
   fi
