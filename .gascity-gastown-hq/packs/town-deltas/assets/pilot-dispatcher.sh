@@ -1852,23 +1852,40 @@ DOLT_LATENCY_MS=""
 DOLT_SAT_REASON=""
 
 # ── ga-x3nmz: Claude 5h-quota probe (mirrors gate's gate_quota_limited) ───────
-# _pilot_quota_limited → "1" iff the Claude 5h window is exhausted right now, else
-# "0". Uses the ga-wjlv9 ground-truth checker (claude-quota-check.sh --quiet,
-# exit 2 = LIMITED) when deployed; FAIL-OPEN ("0") when the checker is absent or
-# errors, so an unmerged/flaky dependency never wedges dispatch. Honors the
-# PILOT_QUOTA_OVERRIDE test seam ("2"=limited). Bounded by `timeout`. No mutation.
-_pilot_quota_limited() {
+# _pilot_quota_state → "ok" | "limited" | "unknown": the THREE-state read of the Claude
+# 5h window (ga-uywvsc). Uses the ga-wjlv9 ground-truth checker (claude-quota-check.sh
+# --quiet): exit 0 = ok, exit 2 = LIMITED, anything else — checker absent, its own
+# internal error (exit 1), a timeout (124), no `timeout` binary (127) — is "unknown":
+# the read FAILED, which is not the same as "not limited". Honors the
+# PILOT_QUOTA_OVERRIDE test seam ("2"=limited, anything else=ok: an operator override is
+# a stated fact, not a failed read). Bounded by `timeout`. No mutation.
+# SELFTEST-EXTRACT pilot-quota-state: BEGIN
+_pilot_quota_state() {
   if [ -n "$PILOT_QUOTA_OVERRIDE" ]; then
-    [ "$PILOT_QUOTA_OVERRIDE" = "2" ] && { printf '1'; return 0; }
-    printf '0'; return 0
+    [ "$PILOT_QUOTA_OVERRIDE" = "2" ] && { printf 'limited'; return 0; }
+    printf 'ok'; return 0
   fi
   local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
-  [ -x "$_qc" ] || { printf '0'; return 0; }
+  [ -x "$_qc" ] || { printf 'unknown'; return 0; }
   local _rc=0
   timeout 15 bash "$_qc" --quiet >/dev/null 2>&1 || _rc=$?
-  [ "$_rc" = "2" ] && { printf '1'; return 0; }
+  case "$_rc" in
+    0) printf 'ok' ;;
+    2) printf 'limited' ;;
+    *) printf 'unknown' ;;
+  esac
+  return 0
+}
+
+# _pilot_quota_limited → "1" iff the Claude 5h window is exhausted right now, else
+# "0". The dispatch back-off reads this one, and it stays FAIL-OPEN ("0" also for
+# "unknown"), so an unmerged/flaky checker never wedges dispatch. Only the dynamic
+# pool ceiling needs the third state, and it reads _pilot_quota_state directly.
+_pilot_quota_limited() {
+  [ "$(_pilot_quota_state)" = "limited" ] && { printf '1'; return 0; }
   printf '0'; return 0
 }
+# SELFTEST-EXTRACT pilot-quota-state: END
 
 # _pilot_quota_eta → short human ETA ("resets 4:50pm (in 37min)") or "" if
 # unknown. Reads the checker JSON (reset_time_text + reset_in_minutes). Honors
@@ -4824,8 +4841,12 @@ _pilot_emit_dispatchable
 # mid-build, so PAUSE the whole sweep: dispatch nothing, mutate no marker, and let
 # the candidate stories be re-picked automatically once the window resets. This is
 # a full pause (not a throttle): under exhaustion every new builder dies, so there
-# is no safe non-zero dispatch level. FAIL-OPEN via _pilot_quota_limited.
-if [ "$(_pilot_quota_limited)" = "1" ]; then
+# is no safe non-zero dispatch level. FAIL-OPEN: only "limited" pauses; an unreadable
+# checker ("unknown") dispatches as before. The state is kept in _PILOT_QUOTA_STATE because
+# the checker costs ~10s a run: the dynamic pool ceiling (ga-uywvsc) reads THIS probe and
+# treats "unknown" as unknown, instead of probing a second time or assuming "ok".
+_PILOT_QUOTA_STATE="$(_pilot_quota_state)"
+if [ "$_PILOT_QUOTA_STATE" = "limited" ]; then
   _q_eta=$(_pilot_quota_eta)
   warn "Claude 5h quota LIMITED — PAUSING all dispatch this sweep (builders would die mid-build). Stories stay queued; auto-resumes when the window resets${_q_eta:+ ($_q_eta)} (ga-x3nmz)."
   notify -t "⏸️ Pilot pausado: cota 5h" -p 3 "Pilot pausado — cota 5h do Claude esgotada; nenhum builder despachado, retoma quando resetar${_q_eta:+ ($_q_eta)} (ga-x3nmz)." 2>/dev/null || true
@@ -5167,29 +5188,34 @@ _ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
 #           as _pilot_live_session_count); an unreadable roster -> unreadable;
 #   dolt  — the sweep-start probe (an UNREADABLE probe is "unknown", a measured hot one is
 #           "hot": the two must not collapse, DOLT_SAT_REASON tells them apart);
-#   quota — "ok": a limited window already exited this sweep above. The checker is fail-open
-#           (an erroring checker also reads as ok); that cannot open anything, because a limited
-#           window pauses every spawn whatever the ceiling says.
+#   quota — _PILOT_QUOTA_STATE, the sweep's own probe (the whole sweep already exited above if it
+#           read "limited"): "ok", or "unknown" when the checker is absent / errored / timed out.
+#           The back-off itself is fail-open (unknown dispatches as before) — but the ceiling is
+#           not allowed to GROW on a quota it could not read, so unknown holds it. An unset
+#           _PILOT_QUOTA_STATE reads as unknown as well, never as ok.
 # Inert unless switched on (pool_ceiling_enabled: .gc/pool-ceiling.on or POOL_CEILING_DYNAMIC=1);
 # DRY_RUN=1 computes but persists nothing.
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: BEGIN
 _pilot_apply_dynamic_pool_ceilings() {
   [ "${_POOL_CEILING_OK:-0}" = "1" ] || return 0
   pool_ceiling_enabled || return 0
-  local _pc_dolt=ok _pc_live _pc_queue
-  if [ "${PILOT_DOLT_SATURATED_AT_START:-0}" = "1" ]; then
-    if [ "${DOLT_SAT_REASON:-}" = "unreadable" ]; then _pc_dolt=unknown; else _pc_dolt=hot; fi
-  fi
+  local _pc_dolt=unknown _pc_live _pc_queue
+  # Only a probe that RAN says "ok": 0 = measured calm, 1 = saturated (hot, or unreadable -> unknown).
+  # An unset / garbage flag stays "unknown" and holds the ceiling — the default must not be "ok".
+  case "${PILOT_DOLT_SATURATED_AT_START:-}" in
+    0) _pc_dolt=ok ;;
+    1) if [ "${DOLT_SAT_REASON:-}" = "unreadable" ]; then _pc_dolt=unknown; else _pc_dolt=hot; fi ;;
+  esac
   _pc_live=$(printf '%s' "${_SESSIONS_JSON:-}" | jq -r 'if (.sessions | type) == "array" then ([.sessions[] | select((.template // "") == "wa-worker") | select(.state == "active" or .state == "creating" or .state == "start-pending")] | length) else empty end' 2>/dev/null) || _pc_live=""
   _pc_queue=$(pool_ceiling_queue_from_dispatchable "$PILOT_DISPATCHABLE_FILE" whatsapp_automation)
   pool_ceiling_bounds wa-worker
-  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step wa-worker "${PILOT_WA_WORKER_MAX:-4}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" ok
+  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step wa-worker "${PILOT_WA_WORKER_MAX:-4}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" "${_PILOT_QUOTA_STATE:-unknown}"
   [ -z "$POOL_CEILING_LOGLINE" ] || log "  $POOL_CEILING_LOGLINE"
   [ -z "$POOL_CEILING_RESULT" ] || PILOT_WA_WORKER_MAX="$POOL_CEILING_RESULT"
   _pc_live=$(printf '%s' "${_SESSIONS_JSON:-}" | jq -r 'if (.sessions | type) == "array" then ([.sessions[] | select((.template // "") == "ps-worker") | select(.state == "active" or .state == "creating" or .state == "start-pending")] | length) else empty end' 2>/dev/null) || _pc_live=""
   _pc_queue=$(pool_ceiling_queue_from_dispatchable "$PILOT_DISPATCHABLE_FILE" property_scrapers)
   pool_ceiling_bounds ps-worker
-  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step ps-worker "${PILOT_PS_WORKER_MAX:-2}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" ok
+  POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step ps-worker "${PILOT_PS_WORKER_MAX:-2}" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$_pc_live" "$_pc_queue" "$_pc_dolt" "${_PILOT_QUOTA_STATE:-unknown}"
   [ -z "$POOL_CEILING_LOGLINE" ] || log "  $POOL_CEILING_LOGLINE"
   [ -z "$POOL_CEILING_RESULT" ] || PILOT_PS_WORKER_MAX="$POOL_CEILING_RESULT"
   return 0

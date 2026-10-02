@@ -23,6 +23,10 @@
 # THREE STATES everywhere: found / not-found / could-not-find-out. An unreadable
 # signal, queue or live count NEVER raises the ceiling (it is not "infinite
 # slack"); an unreadable queue is not "queue 0" either (its own reason, never "idle").
+# The Claude quota is a signal like the others: the dispatchers pass it as ok | limited |
+# unknown (a checker that is absent, errored or timed out is "unknown", never "ok"), and
+# only "ok" lets the ceiling grow. An unparseable threshold knob (env) falls back to its
+# default instead of silently reading as "not squeezed".
 #
 # STATE. One file per pool, $GC_CITY/.gc/pool-ceiling/<pool>.state (ceiling=, at=),
 # written atomically. A missing/corrupt file re-initialises at the FIXED ceiling the
@@ -129,9 +133,11 @@ pool_ceiling_decide() {
 # load5 per core: grow <= GROW, squeeze >= SQUEEZE, hold between. Measured 01/10:
 # 6.9/core with the machine saturated but working; 19/09 notes: 5.6-6.4/core.
 pool_ceiling_class_load() {
-  local l="${1:-}" n="${2:-}"
+  local l="${1:-}" n="${2:-}" g="${POOL_CEILING_LOAD_GROW_PER_CORE:-5.0}" s="${POOL_CEILING_LOAD_SQUEEZE_PER_CORE:-8.0}"
   if ! _pc_num "$l" || ! _pc_int "$n" || [ "$n" -le 0 ]; then echo unknown; return 0; fi
-  awk -v l="$l" -v n="$n" -v g="${POOL_CEILING_LOAD_GROW_PER_CORE:-5.0}" -v s="${POOL_CEILING_LOAD_SQUEEZE_PER_CORE:-8.0}" \
+  _pc_num "$g" || g=5.0   # a non-numeric -v is a STRING to awk, so "r <= g" turns lexical ("6.2" <= "banana" is true -> grow)
+  _pc_num "$s" || s=8.0
+  awk -v l="$l" -v n="$n" -v g="$g" -v s="$s" \
     'BEGIN { r = l / n; if (r >= s) print "squeeze"; else if (r <= g) print "grow"; else print "hold" }'
   return 0
 }
@@ -149,13 +155,17 @@ pool_ceiling_class_mem() {
 # the next swapfile on demand, so a low reading is normal right before it grows.
 pool_ceiling_class_swap() {
   local f="${1:-}" u="${2:-}" d="${3:-}"
+  local floor="${POOL_CEILING_SWAP_FREE_FLOOR_MB:-512}" dmin="${POOL_CEILING_SWAP_GROW_DISK_MIN_MB:-4096}" umax="${POOL_CEILING_SWAP_GROW_MAX_USED_MB:-4096}"
+  _pc_int "$floor" || floor=512   # a garbage knob must not turn "[ -lt ]" into an error that reads as "not low"
+  _pc_int "$dmin" || dmin=4096
+  _pc_int "$umax" || umax=4096
   if ! _pc_int "$f" || ! _pc_int "$u"; then echo unknown; return 0; fi
-  if [ "$f" -lt "${POOL_CEILING_SWAP_FREE_FLOOR_MB:-512}" ]; then
+  if [ "$f" -lt "$floor" ]; then
     if ! _pc_int "$d"; then echo unknown; return 0; fi
-    if [ "$d" -lt "${POOL_CEILING_SWAP_GROW_DISK_MIN_MB:-4096}" ]; then echo squeeze; return 0; fi
+    if [ "$d" -lt "$dmin" ]; then echo squeeze; return 0; fi
     echo hold; return 0
   fi
-  if [ "$u" -gt "${POOL_CEILING_SWAP_GROW_MAX_USED_MB:-4096}" ]; then echo hold; return 0; fi
+  if [ "$u" -gt "$umax" ]; then echo hold; return 0; fi
   echo grow
   return 0
 }
@@ -255,7 +265,10 @@ pool_ceiling_read_disk_free_mb() {
 # The Pilot already emits its full eligible queue every sweep (PILOT_DISPATCHABLE_FILE,
 # wa-u5r1): count the items of the pool's rig store. Prints the count, or NOTHING when
 # the file is missing / corrupt / older than its own ttl_seconds — an unreadable queue
-# must never read as an empty one.
+# must never read as an empty one. What this reader CANNOT see is a store the emit itself
+# failed to read: the emit writes a fresh file with 0 items for it (its `|| echo "[]"`), which
+# reads here as a real "queue 0" (reason `idle`: holds, never raises — inert, but not labelled
+# "unreadable"). docs/pool-ceiling-dynamic.md, "Fonte da fila", states the same limit.
 pool_ceiling_queue_from_dispatchable() {
   local f="${1:-}" store="${2:-}" now="${3:-}" out=""
   [ -r "$f" ] || return 0

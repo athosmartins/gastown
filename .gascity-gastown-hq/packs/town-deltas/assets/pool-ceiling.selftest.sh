@@ -342,7 +342,8 @@ else
   }
   gsig() { export POOL_CEILING_T_LOAD5=31 POOL_CEILING_T_NCPU=10 POOL_CEILING_T_MEM=1 POOL_CEILING_T_SWAP_FREE_MB=5700 POOL_CEILING_T_SWAP_USED_MB=412 POOL_CEILING_T_DISK_FREE_MB=14336; }
   Q="$(mkq "$NOWISO" 3 0)"
-  base() { export _POOL_CEILING_OK=1 POOL_CEILING_DYNAMIC=1 PILOT_DISPATCHABLE_FILE="$Q" _SESSIONS_JSON="$SESS2" PILOT_DOLT_SATURATED_AT_START=0 DOLT_SAT_REASON="" DRY_RUN=0 POOL_CEILING_STATE_DIR="$TMPROOT/g.$RANDOM" POOL_CEILING_LOG="$TMPROOT/g.log"; unset POOL_CEILING_NOW; gsig; }
+  # _PILOT_QUOTA_STATE is the sweep's own quota probe (ok | limited | unknown); the glue must not assume "ok".
+  base() { export _POOL_CEILING_OK=1 POOL_CEILING_DYNAMIC=1 PILOT_DISPATCHABLE_FILE="$Q" _SESSIONS_JSON="$SESS2" PILOT_DOLT_SATURATED_AT_START=0 DOLT_SAT_REASON="" DRY_RUN=0 _PILOT_QUOTA_STATE=ok POOL_CEILING_STATE_DIR="$TMPROOT/g.$RANDOM" POOL_CEILING_LOG="$TMPROOT/g.log"; unset POOL_CEILING_NOW; gsig; }
   base; out="$(glue)"
   has "$out" "WA=3 PS=1" "queue 3 + 2 live (active+creating, asleep NOT counted) + slack -> wa-worker 2->3; ps-worker (queue 0, at min) untouched"
   has "$out" "LOG:  pool-ceiling: wa-worker 2→3" "the sweep log shows the transition"
@@ -350,6 +351,27 @@ else
   has "$out" "WA=2 PS=1" "Dolt probe UNREADABLE -> unknown -> the ceiling does not rise"
   base; PILOT_DOLT_SATURATED_AT_START=1 DOLT_SAT_REASON=latency out="$(glue)"
   has "$out" "WA=2 PS=1" "Dolt measured hot -> hold (no growth into a hot data plane)"
+  # Same class as the quota (gate-fix 1): the Dolt default must not be "ok" either. Only a probe that RAN (flag 0) says ok.
+  base; unset PILOT_DOLT_SATURATED_AT_START; out="$(glue)"
+  has "$out" "WA=2 PS=1" "Dolt probe flag never set (glue called without the sweep's probe) -> unknown, NOT ok -> no raise"
+  base; PILOT_DOLT_SATURATED_AT_START=banana out="$(glue)"
+  has "$out" "WA=2 PS=1" "a garbage Dolt flag is unknown, not ok"
+  base; PILOT_DOLT_SATURATED_AT_START=0 out="$(glue)"
+  has "$out" "WA=3 PS=1" "control: a probe that RAN and read calm (flag 0) still raises"
+  # ga-uywvsc gate-fix 1: the quota is a THREE-state signal. A checker that is absent / errored / timed out
+  # is "unknown", and unknown must hold the ceiling exactly like an unreadable roster or Dolt probe does.
+  base; _PILOT_QUOTA_STATE=unknown out="$(glue)"
+  has "$out" "WA=2 PS=1" "quota UNKNOWN (checker could not be read) + queue + slack -> the ceiling does not rise"
+  has "$out" "unreadable:quota" "and the reason says the quota was unreadable, not 'idle' or 'ok'"
+  has "$out" "cota unknown [unknown]" "and the log line prints 'cota unknown', never 'cota ok [grow]'"
+  base; unset _PILOT_QUOTA_STATE; out="$(glue)"
+  has "$out" "WA=2 PS=1" "quota state never set (glue called without the sweep's probe) -> unknown, NOT ok"
+  base; _PILOT_QUOTA_STATE=limited out="$(glue)"
+  has "$out" "WA=2 PS=1" "quota limited -> hold (the window resets; shrinking would only slow the recovery)"
+  base; _PILOT_QUOTA_STATE=banana out="$(glue)"
+  has "$out" "WA=2 PS=1" "a garbage quota state is unknown, not ok"
+  base; _PILOT_QUOTA_STATE=ok out="$(glue)"
+  has "$out" "WA=3 PS=1" "control: the SAME fixtures with quota ok DO raise (the cases above differ only in the quota)"
   base; _SESSIONS_JSON="" out="$(glue)"
   has "$out" "WA=2 PS=1" "roster unreadable -> live unknown -> no raise"
   base; PILOT_DISPATCHABLE_FILE="$(mkq "$OLDISO" 3 0)" out="$(glue)"
@@ -408,6 +430,151 @@ if [ -r "$GATE" ]; then
   grep -q '_POOL_CEILING_OK:-0}" = "1" \] && pool_ceiling_enabled' "$GATE" && ok "gate gates the block on the shared pool_ceiling_enabled predicate" || bad "gate does not use pool_ceiling_enabled"
 else
   bad "quality-gate-dispatcher.sh not readable at $GATE"
+fi
+
+echo "== 9. the quota is a THREE-state signal end to end (gate-fix 1: an unreadable checker was fed to the ceiling as 'ok')"
+# 9a. step level: only quota=ok lets the ceiling grow. Same slack, same queue; the cases differ ONLY in the quota.
+export POOL_CEILING_T_LOAD5=31 POOL_CEILING_T_NCPU=10 POOL_CEILING_T_MEM=1 POOL_CEILING_T_SWAP_FREE_MB=5700 POOL_CEILING_T_SWAP_USED_MB=412 POOL_CEILING_T_DISK_FREE_MB=14336
+printf 'work_dir = "/x"\nmax_active_sessions = 4\n' > "$AG/wa-worker/agent.toml"
+qstep() { # <quota-arg|OMIT> → "<result>|<logline>"
+  local sd="$TMPROOT/qs.$RANDOM"; mkdir -p "$sd"
+  if [ "$1" = OMIT ]; then
+    POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$sd" POOL_CEILING_LOG="$TMPROOT/qs.log" POOL_CEILING_NOW=1000 bash -c '. "$1"; pool_ceiling_step wa-worker 2 1 4 2 63 ok; echo "$POOL_CEILING_RESULT|$POOL_CEILING_LOGLINE"' _ "$LIB"
+  else
+    POOL_CEILING_DYNAMIC=1 POOL_CEILING_STATE_DIR="$sd" POOL_CEILING_LOG="$TMPROOT/qs.log" POOL_CEILING_NOW=1000 bash -c '. "$1"; pool_ceiling_step wa-worker 2 1 4 2 63 ok "$2"; echo "$POOL_CEILING_RESULT|$POOL_CEILING_LOGLINE"' _ "$LIB" "$1"
+  fi
+}
+r="$(qstep ok)";        eq "${r%%|*}" "3" "control: queue 63 + slack + quota ok -> 2->3"
+r="$(qstep unknown)";   eq "${r%%|*}" "2" "quota unknown + queue + slack -> HOLD (does not raise)"
+has "$r" "unreadable:quota" "  reason is unreadable:quota"
+has "$r" "cota unknown [unknown]" "  and the log says 'cota unknown', not 'cota ok [grow]'"
+r="$(qstep limited)";   eq "${r%%|*}" "2" "quota limited + queue + slack -> hold"
+has "$r" "soft:quota" "  reason is soft:quota"
+r="$(qstep '')";        eq "${r%%|*}" "2" "quota passed as an EMPTY string -> unknown -> hold"
+r="$(qstep OMIT)";      eq "${r%%|*}" "2" "quota argument OMITTED -> unknown -> hold (the default is the safe state)"
+eq "$(pool_ceiling_decide 2 1 4 2 63 load=grow mem=grow swap=grow disk=grow dolt=grow quota=unknown)" "2|hold|unreadable:quota" "decide: quota=unknown -> hold, named"
+
+# 9b. the producers, EXECUTED (not grepped) against a fake checker. Both dispatchers' own functions are
+# extracted from the file between SELFTEST-EXTRACT markers. rc 0 -> ok, rc 2 -> limited, EVERYTHING else
+# (checker's own error 1, timeout 124, no `timeout` 127, killed by a signal, absent, not executable) -> unknown.
+PQ_EXTRACT="$(sed -n '/SELFTEST-EXTRACT pilot-quota-state: BEGIN/,/SELFTEST-EXTRACT pilot-quota-state: END/p' "$PILOT" 2>/dev/null)"
+GQ_EXTRACT="$(sed -n '/SELFTEST-EXTRACT gate-quota-state: BEGIN/,/SELFTEST-EXTRACT gate-quota-state: END/p' "$GATE" 2>/dev/null)"
+mkqc() { # <name> <exit-code|ABSENT|NOEXEC|SIGKILL> → a GC_CITY dir whose scripts/claude-quota-check.sh behaves so
+  local d="$TMPROOT/qc.$1" f; mkdir -p "$d/scripts"; f="$d/scripts/claude-quota-check.sh"
+  case "$2" in
+    ABSENT) ;;
+    NOEXEC) printf '#!/bin/bash\nexit 0\n' > "$f"; chmod -x "$f" ;;
+    SIGKILL) printf '#!/bin/bash\nkill -9 $$\n' > "$f"; chmod +x "$f" ;;
+    *) printf '#!/bin/bash\nexit %s\n' "$2" > "$f"; chmod +x "$f" ;;
+  esac
+  echo "$d"
+}
+if [ -z "$PQ_EXTRACT" ] || [ -z "$GQ_EXTRACT" ]; then
+  bad "missing SELFTEST-EXTRACT pilot-quota-state / gate-quota-state block (pilot: ${#PQ_EXTRACT} bytes, gate: ${#GQ_EXTRACT} bytes)"
+else
+  # prints "<state> <limited-flag>" from the dispatcher's real functions, under set -euo pipefail
+  pq() { # <GC_CITY> [override] [PATH]
+    PATH="${3:-$PATH}" bash -c 'set -euo pipefail; PILOT_QUOTA_OVERRIDE="${3:-}"; GC_CITY="$2"; eval "$1"; printf "%s %s" "$(_pilot_quota_state)" "$(_pilot_quota_limited)"' _ "$PQ_EXTRACT" "$1" "${2:-}" 2>&1
+  }
+  gq() {
+    PATH="${3:-$PATH}" bash -c 'set -euo pipefail; GC_CITY="$2"; if [ -n "${3:-}" ]; then GATE_QUOTA_OVERRIDE="$3"; fi; eval "$1"; printf "%s %s" "$(gate_quota_state)" "$(gate_quota_limited)"' _ "$GQ_EXTRACT" "$1" "${2:-}" 2>&1
+  }
+  for who in pq gq; do
+    nm="pilot"; [ "$who" = gq ] && nm="gate"
+    eq "$($who "$(mkqc c0 0)")"         "ok 0"        "$nm: checker exit 0 -> ok (limited flag 0)"
+    eq "$($who "$(mkqc c2 2)")"         "limited 1"   "$nm: checker exit 2 -> limited (flag 1)"
+    eq "$($who "$(mkqc c1 1)")"         "unknown 0"   "$nm: checker's own error (exit 1) -> UNKNOWN; the legacy 0/1 flag stays fail-open (0)"
+    eq "$($who "$(mkqc c124 124)")"     "unknown 0"   "$nm: checker timed out (exit 124) -> unknown"
+    eq "$($who "$(mkqc c3 3)")"         "unknown 0"   "$nm: any other exit code -> unknown"
+    eq "$($who "$(mkqc ck SIGKILL)")"   "unknown 0"   "$nm: checker killed by a signal -> unknown"
+    eq "$($who "$(mkqc cn NOEXEC)")"    "unknown 0"   "$nm: checker not executable -> unknown"
+    eq "$($who "$(mkqc ca ABSENT)")"    "unknown 0"   "$nm: checker absent -> unknown (this was 'ok' before)"
+    eq "$($who "$(mkqc c1b 1)" 2)"      "limited 1"   "$nm: operator override '2' -> limited, whatever the checker says"
+    eq "$($who "$(mkqc c1c 1)" 0)"      "ok 0"        "$nm: operator override (not 2) -> ok: a stated fact, not a failed read"
+  done
+  if ! PATH=/usr/bin:/bin command -v timeout >/dev/null 2>&1; then
+    eq "$(pq "$(mkqc c0t 0)" "" /usr/bin:/bin)" "unknown 0" "pilot: no \`timeout\` binary at all (exit 127) -> unknown, not ok"
+    eq "$(gq "$(mkqc c0u 0)" "" /usr/bin:/bin)" "unknown 0" "gate: no \`timeout\` binary at all (exit 127) -> unknown, not ok"
+  fi
+fi
+
+# 9c. the gate's REAL ceiling block (extracted from quality-gate-dispatcher.sh), executed under set -euo pipefail,
+# twice — the second pass emulates the ga-309v3 multi-admit re-exec, which must still see the ORIGINAL fixed value.
+GE_EXTRACT="$(sed -n '/SELFTEST-EXTRACT gate-apply-dynamic-ceiling: BEGIN/,/SELFTEST-EXTRACT gate-apply-dynamic-ceiling: END/p' "$GATE" 2>/dev/null)"
+if [ -z "$GE_EXTRACT" ]; then
+  bad "no SELFTEST-EXTRACT gate-apply-dynamic-ceiling block in $GATE"
+else
+  printf 'max_active_sessions = 6\n' > "$AG/gate-reviewer/agent.toml"
+  gglue() { # env from caller: HR_QSTATE LIVE_REVIEWERS COUNT ... ; prints LOG lines then "MAX=<n> FIXED=<n>" per pass
+    bash -c '
+      set -euo pipefail
+      . "$1"
+      log() { echo "LOG:$*"; }
+      GATE_MAX_REVIEWERS="${GATE_MAX_REVIEWERS:-4}"; GATE_REVIEWERS_PER_RUN="${GATE_REVIEWERS_PER_RUN:-3}"
+      GATE_DOLT_CPU_HOT=180; GATE_DOLT_LATENCY_HOT_MS=2500
+      GATE_SWAP_FREE_FLOOR_MB="${GATE_SWAP_FREE_FLOOR_MB:-512}"; GATE_SWAP_GROW_DISK_MIN_MB="${GATE_SWAP_GROW_DISK_MIN_MB:-4096}"
+      HR_CPU=95; HR_LAT=300
+      # what the gate sets just before this block (HR_QLIM = the fail-open 0/1 the headroom decision eats): a block that
+      # collapses the quota back to ok/limited from HR_QLIM must FAIL here on its behaviour (MAX=5 on an unknown quota),
+      # not crash on an unbound variable and fail for the wrong reason
+      if [ "${HR_QSTATE:-}" = "limited" ]; then HR_QLIM=1; else HR_QLIM=0; fi
+      unset GATE_MAX_REVIEWERS_FIXED || true
+      eval "$2"; echo "PASS1 MAX=$GATE_MAX_REVIEWERS FIXED=${GATE_MAX_REVIEWERS_FIXED:-none}"
+      # pass 2 = the ga-309v3 multi-admit re-exec: GATE_MAX_REVIEWERS still carries pass 1'"'"'s dynamic value, and
+      # only the exported GATE_MAX_REVIEWERS_FIXED can tell the block what the real fixed ceiling is
+      export POOL_CEILING_NOW=$((POOL_CEILING_NOW + 120))
+      eval "$2"; echo "PASS2 MAX=$GATE_MAX_REVIEWERS FIXED=${GATE_MAX_REVIEWERS_FIXED:-none}"
+    ' _ "$LIB" "$GE_EXTRACT" 2>&1
+  }
+  gbase() { export _POOL_CEILING_OK=1 POOL_CEILING_DYNAMIC=1 HR_QSTATE=ok LIVE_REVIEWERS=4 COUNT=5 DRY_RUN=0 POOL_CEILING_NOW=2000 \
+                   POOL_CEILING_STATE_DIR="$TMPROOT/ge.$RANDOM" POOL_CEILING_LOG="$TMPROOT/ge.log" \
+                   POOL_CEILING_T_LOAD5=31 POOL_CEILING_T_NCPU=10 POOL_CEILING_T_MEM=1 POOL_CEILING_T_SWAP_FREE_MB=5700 POOL_CEILING_T_SWAP_USED_MB=412 POOL_CEILING_T_DISK_FREE_MB=14336
+            unset POOL_CEILING_SWAP_FREE_FLOOR_MB POOL_CEILING_SWAP_GROW_DISK_MIN_MB GATE_SWAP_FREE_FLOOR_MB GATE_SWAP_GROW_DISK_MIN_MB; }
+  gbase; out="$(gglue)"
+  has "$out" "PASS1 MAX=5 FIXED=4" "gate, quota ok + queue 5 + 4 live (saturated at 4) + slack -> GATE_MAX_REVIEWERS 4->5, fixed value remembered"
+  has "$out" "PASS2 MAX=" "the block survives set -euo pipefail and a second pass"
+  has "${out#*PASS1}" "(fixo 4," "the second pass (multi-admit re-exec; GATE_MAX_REVIEWERS already 5) still passes the ORIGINAL fixed value 4"
+  case "${out#*PASS1}" in *"(fixo 5,"*) bad "the second pass took the previous round's dynamic value 5 as the fixed one" ;; *) ok "and never 5 as the fixed value" ;; esac
+  gbase; HR_QSTATE=unknown out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota UNKNOWN + queue + slack -> the ceiling does not rise"
+  has "$out" "cota unknown [unknown]" "and the gate's log line says the quota was unknown"
+  gbase; HR_QSTATE=limited out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota limited -> hold"
+  gbase; HR_QSTATE="" out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota state EMPTY -> unknown -> the ceiling does not rise"
+  gbase; export GATE_SWAP_FREE_FLOOR_MB=9000 GATE_SWAP_GROW_DISK_MIN_MB=20000; out="$(gglue)"
+  has "$out" "PASS1 MAX=3" "the gate's ceiling follows the GATE_SWAP_* knobs (free 5700MB < floor 9000 + disk 14GB < 20GB -> swap cannot grow -> squeeze 4->3)"
+  gbase; export GATE_SWAP_FREE_FLOOR_MB=9000 GATE_SWAP_GROW_DISK_MIN_MB=20000 POOL_CEILING_SWAP_FREE_FLOOR_MB=100; out="$(gglue)"
+  has "$out" "PASS1 MAX=5" "but an explicit POOL_CEILING_SWAP_FREE_FLOOR_MB wins over the gate's knob (and the ceiling climbs again)"
+  gbase   # also clears the exported GATE_SWAP_* / POOL_CEILING_SWAP_* knobs so nothing leaks into the sections below
+  gbase; _POOL_CEILING_OK=0 out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=none" "lib not loaded -> the fixed ceiling, nothing exported"
+  gbase; unset POOL_CEILING_DYNAMIC; out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=none" "not switched on -> inert: fixed ceiling, no log line"
+  case "$out" in *LOG:*) bad "an inert gate sweep must not log" ;; *) ok "an inert gate sweep logs nothing" ;; esac
+  unset HR_QSTATE LIVE_REVIEWERS COUNT DRY_RUN POOL_CEILING_NOW POOL_CEILING_DYNAMIC _POOL_CEILING_OK
+  printf 'max_active_sessions = 6\n' > "$AG/gate-reviewer/agent.toml"
+fi
+
+# 9d. an unparseable threshold knob falls back to its default instead of silently reading as 'not squeezed'
+eq "$(POOL_CEILING_SWAP_FREE_FLOOR_MB=banana pool_ceiling_class_swap 100 100 2000)" "squeeze" "garbage swap floor knob -> default 512 (free 100 + disk 2 GB: swap cannot grow -> squeeze), not 'not low'"
+eq "$(POOL_CEILING_SWAP_GROW_DISK_MIN_MB=banana pool_ceiling_class_swap 100 100 2000)" "squeeze" "garbage swap-disk knob -> default 4096"
+eq "$(POOL_CEILING_SWAP_GROW_MAX_USED_MB=banana pool_ceiling_class_swap 5000 5000 20000)" "hold" "garbage swap-used knob -> default 4096 (5000 MB used -> hold)"
+eq "$(POOL_CEILING_LOAD_GROW_PER_CORE=banana pool_ceiling_class_load 62 10)"    "hold" "garbage load-grow knob -> default 5.0 (6.2/core -> hold; a string compare would have said grow)"
+eq "$(POOL_CEILING_LOAD_SQUEEZE_PER_CORE=banana pool_ceiling_class_load 90 10)" "squeeze" "garbage load-squeeze knob -> default 8.0 (9/core -> squeeze)"
+
+# 9e. wiring drift-guards for the quota (the executed cases above are the proof; these catch a regression of the call sites)
+if [ -r "$PILOT" ]; then
+  l_qs=$(grep -n '^_PILOT_QUOTA_STATE="\$(_pilot_quota_state)"' "$PILOT" | head -1 | cut -d: -f1)
+  l_ap=$(grep -n '^_pilot_apply_dynamic_pool_ceilings$' "$PILOT" | head -1 | cut -d: -f1)
+  if [ -n "$l_qs" ] && [ -n "$l_ap" ] && [ "$l_qs" -lt "$l_ap" ]; then ok "pilot takes the sweep's quota probe (_PILOT_QUOTA_STATE) BEFORE applying the ceilings"; else bad "pilot quota-state ordering wrong: probe@${l_qs:-none} apply@${l_ap:-none}"; fi
+  if grep -E 'pool_ceiling_step (wa|ps)-worker .* ok$' "$PILOT" >/dev/null; then bad "pilot still passes the literal 'ok' as the quota"; else ok "pilot passes no literal 'ok' as the quota"; fi
+  [ "$(grep -c 'pool_ceiling_step [wp][as]-worker .*"${_PILOT_QUOTA_STATE:-unknown}"$' "$PILOT")" = "2" ] && ok "both pilot pools pass \${_PILOT_QUOTA_STATE:-unknown}" || bad "pilot pools do not both pass \${_PILOT_QUOTA_STATE:-unknown}"
+fi
+if [ -r "$GATE" ]; then
+  grep -q '^  HR_QSTATE=\$(gate_quota_state)$' "$GATE" && ok "gate probes the quota once, as three states (gate_quota_state)" || bad "gate does not probe gate_quota_state"
+  grep -q '_pc_quota="\$HR_QSTATE"' "$GATE" && ok "gate feeds the ceiling the three-state HR_QSTATE" || bad "gate does not feed the ceiling HR_QSTATE"
+  if grep -qE '_pc_quota=ok|_pc_quota=limited' "$GATE"; then bad "gate re-collapses the quota to ok/limited before the ceiling"; else ok "gate never collapses the quota to ok/limited before the ceiling"; fi
 fi
 
 echo

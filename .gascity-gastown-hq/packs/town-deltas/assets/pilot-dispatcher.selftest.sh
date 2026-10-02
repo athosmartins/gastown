@@ -2860,11 +2860,26 @@ has "$DISPATCHER" '_pilot_quota_limited\(\)'        "quota probe helper is defin
 has "$DISPATCHER" '_pilot_quota_eta\(\)'            "reset-ETA helper is defined"
 has "$DISPATCHER" 'PILOT_QUOTA_OVERRIDE'            "quota override seam wired"
 has "$DISPATCHER" 'PAUSING all dispatch this sweep' "pause gate present in the sweep"
-# FAIL-OPEN: an absent checker (and no override) must return '0' (never block).
-if grep -qE '\[ -x "\$_qc" \] \|\| \{ printf .0.; return 0; \}' "$DISPATCHER"; then
-  ok "quota probe fail-opens when the checker is absent"
+# FAIL-OPEN: an absent (or erroring) checker with no override must return '0' (never block dispatch).
+# EXECUTED, not grepped (ga-uywvsc): this used to grep the literal `printf '0'` inside the probe body, which
+# pinned HOW it was written. The probe now reads the checker as three states (_pilot_quota_state: ok | limited |
+# unknown) and _pilot_quota_limited keeps the 0/1 contract on top of it — so the behaviour is what is pinned.
+PQ_X="$(sed -n '/SELFTEST-EXTRACT pilot-quota-state: BEGIN/,/SELFTEST-EXTRACT pilot-quota-state: END/p' "$DISPATCHER")"
+q14c() { # <checker exit code | ABSENT> -> what _pilot_quota_limited prints
+  local d; d="$(mktemp -d)"; mkdir -p "$d/scripts"
+  [ "$1" = ABSENT ] || { printf '#!/bin/bash\nexit %s\n' "$1" > "$d/scripts/claude-quota-check.sh"; chmod +x "$d/scripts/claude-quota-check.sh"; }
+  bash -c 'set -euo pipefail; PILOT_QUOTA_OVERRIDE=""; GC_CITY="$2"; eval "$1"; _pilot_quota_limited' _ "$PQ_X" "$d" 2>&1
+  rm -rf "$d"
+}
+if [ -n "$PQ_X" ] && [ "$(q14c ABSENT)" = "0" ] && [ "$(q14c 1)" = "0" ]; then
+  ok "quota probe fail-opens when the checker is absent or errors (executed: _pilot_quota_limited -> 0)"
 else
-  bad "quota probe missing the fail-open guard (absent checker must not block dispatch)"
+  bad "quota probe is not fail-open (absent checker must not block dispatch): absent='$(q14c ABSENT)' exit1='$(q14c 1)' extract=${#PQ_X}B"
+fi
+if [ -n "$PQ_X" ] && [ "$(q14c 2)" = "1" ] && [ "$(q14c 0)" = "0" ]; then
+  ok "quota probe still reads exit 2 as LIMITED (1) and exit 0 as ok (0)"
+else
+  bad "quota probe no longer maps the checker's exit 2 -> 1 / exit 0 -> 0: exit2='$(q14c 2)' exit0='$(q14c 0)'"
 fi
 
 # ── Scenario 15: pooled-rig crew distribution (ga-mtlm6) ──────────────────────

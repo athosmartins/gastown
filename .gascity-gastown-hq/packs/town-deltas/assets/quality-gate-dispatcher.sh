@@ -1728,26 +1728,40 @@ gate_effective_headroom_cpu() {
   printf '%s' "$_now"
 }
 
-# gate_quota_limited → "1" iff Claude quota is exhausted (a new run would burn
-# into a hard limit), else "0". Uses the ga-wjlv9 ground-truth checker
-# (claude-quota-check.sh --quiet, exit 2 = LIMITED) when it is deployed;
-# FAIL-OPEN ("0") when the checker is absent or errors, so an unmerged dependency
-# never wedges the gate. Honors GATE_QUOTA_OVERRIDE (selftest seam: "2"=limited,
-# anything else=ok). Bounded by `timeout`. No mutation of gate state.
-gate_quota_limited() {
+# gate_quota_state → "ok" | "limited" | "unknown": the THREE-state read of the Claude
+# quota (ga-uywvsc). Uses the ga-wjlv9 ground-truth checker (claude-quota-check.sh
+# --quiet): exit 0 = ok, exit 2 = LIMITED, anything else — checker absent, its own
+# internal error (exit 1), a timeout (124), no `timeout` binary (127) — is "unknown":
+# the read FAILED, which is not the same as "not limited". Honors GATE_QUOTA_OVERRIDE
+# (selftest seam: "2"=limited, anything else=ok — an operator override is a stated
+# fact, not a failed read). Bounded by `timeout`. No mutation of gate state.
+# SELFTEST-EXTRACT gate-quota-state: BEGIN
+gate_quota_state() {
   if [ -n "${GATE_QUOTA_OVERRIDE:-}" ]; then
-    [ "$GATE_QUOTA_OVERRIDE" = "2" ] && { printf '1'; return 0; }
-    printf '0'; return 0
+    [ "$GATE_QUOTA_OVERRIDE" = "2" ] && { printf 'limited'; return 0; }
+    printf 'ok'; return 0
   fi
   local _qc="${GC_CITY}/scripts/claude-quota-check.sh"
-  [ -x "$_qc" ] || { printf '0'; return 0; }
+  [ -x "$_qc" ] || { printf 'unknown'; return 0; }
   local _rc=0
   timeout 15 bash "$_qc" --quiet >/dev/null 2>&1 || _rc=$?
-  # 2 = LIMITED (active exhaustion). 0 = ok. 1/other = the checker's own internal
-  # error → fail-open (never block the gate on a flaky checker).
-  [ "$_rc" = "2" ] && { printf '1'; return 0; }
+  case "$_rc" in
+    0) printf 'ok' ;;
+    2) printf 'limited' ;;
+    *) printf 'unknown' ;;
+  esac
+  return 0
+}
+
+# gate_quota_limited → "1" iff Claude quota is exhausted (a new run would burn
+# into a hard limit), else "0". The headroom decision reads this one, and it stays
+# FAIL-OPEN ("0" also for "unknown"), so an unmerged/flaky checker never wedges the
+# gate. Only the dynamic pool ceiling needs the third state (gate_quota_state).
+gate_quota_limited() {
+  [ "$(gate_quota_state)" = "limited" ] && { printf '1'; return 0; }
   printf '0'; return 0
 }
+# SELFTEST-EXTRACT gate-quota-state: END
 
 # gate_swap_free_mb → integer MB of free swap, or "" if unreadable. The Gas
 # Town host fleet is macOS-only, so this reads `sysctl vm.swapusage` directly
@@ -11987,8 +12001,12 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   # back to the post-janitor reading when the ambient snapshot is absent.
   HR_CPU_POSTJANITOR=$(gate_dolt_cpu "${HR_PID:-}")
   HR_CPU=$(gate_effective_headroom_cpu "${GATE_AMBIENT_DOLT_CPU:-}" "${HR_CPU_POSTJANITOR:-}")
-  # 2. Claude quota (optional ga-wjlv9 dep; fail-open when the checker is absent).
-  HR_QLIM=$(gate_quota_limited)
+  # 2. Claude quota (optional ga-wjlv9 dep; fail-open when the checker is absent). ONE probe (the
+  #    checker costs ~10s a run), read as three states: HR_QLIM stays the fail-open 0/1 the headroom
+  #    decision consumes (only "limited" is 1), and HR_QSTATE keeps "unknown" distinct for the
+  #    dynamic ceiling (2d) and the log label below.
+  HR_QSTATE=$(gate_quota_state)
+  if [ "$HR_QSTATE" = "limited" ]; then HR_QLIM=1; else HR_QLIM=0; fi
   # 2b. Free swap (ga-92azu resource brake) — independent of Dolt/quota; see
   #     gate_headroom_decision § 1b for why this cannot piggyback on either.
   HR_SWAP_FREE=$(gate_swap_free_mb)
@@ -12006,20 +12024,26 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   #     one of its own brakes — this only moves the "calm" ceiling it scales up to.
   #     The re-exec of a multi-admit round (ga-309v3) must see the ORIGINAL fixed value, not
   #     the previous round's dynamic one: kept in GATE_MAX_REVIEWERS_FIXED and exported.
+  # SELFTEST-EXTRACT gate-apply-dynamic-ceiling: BEGIN
   if [ "${_POOL_CEILING_OK:-0}" = "1" ] && pool_ceiling_enabled; then
     GATE_MAX_REVIEWERS_FIXED="${GATE_MAX_REVIEWERS_FIXED:-$GATE_MAX_REVIEWERS}"; export GATE_MAX_REVIEWERS_FIXED
     _pc_dolt=$(pool_ceiling_dolt_class "${HR_CPU:-}" "${HR_LAT:-}" "$GATE_DOLT_CPU_HOT" "$GATE_DOLT_LATENCY_HOT_MS")
-    # gate_quota_limited is fail-open (an erroring checker reads as ok, there is no "unknown"):
-    # harmless here, because a limited window is deferred by gate_headroom_decision itself.
-    _pc_quota=ok; [ "$HR_QLIM" = "1" ] && _pc_quota=limited
+    # The ceiling gets the THREE-state quota. gate_headroom_decision is fail-open on it (an erroring
+    # checker defers nothing), so that brake cannot vouch for a quota nobody could read: an
+    # "unknown" holds the ceiling instead of letting it grow.
+    _pc_quota="$HR_QSTATE"
     # The ceiling never goes under the reviewers of a single run — unless the engine's own cap is
     # lower than that (the step bounds max by agents/gate-reviewer/agent.toml): then no run could
     # be spawned in full anyway, and the "motor N" in the log line shows why.
     pool_ceiling_bounds gate-reviewer "$GATE_REVIEWERS_PER_RUN"
-    POOL_CEILING_DRY="${DRY_RUN:-0}" pool_ceiling_step gate-reviewer "$GATE_MAX_REVIEWERS_FIXED" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$LIVE_REVIEWERS" "${COUNT:-}" "$_pc_dolt" "$_pc_quota"
+    # The swap floors are the SAME two numbers gate_headroom_decision brakes on: unless the lib's own knob is
+    # set explicitly, the ceiling reads the gate's, so tuning GATE_SWAP_* moves both and cannot leave one behind.
+    POOL_CEILING_DRY="${DRY_RUN:-0}" POOL_CEILING_SWAP_FREE_FLOOR_MB="${POOL_CEILING_SWAP_FREE_FLOOR_MB:-$GATE_SWAP_FREE_FLOOR_MB}" POOL_CEILING_SWAP_GROW_DISK_MIN_MB="${POOL_CEILING_SWAP_GROW_DISK_MIN_MB:-$GATE_SWAP_GROW_DISK_MIN_MB}" \
+      pool_ceiling_step gate-reviewer "$GATE_MAX_REVIEWERS_FIXED" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$LIVE_REVIEWERS" "${COUNT:-}" "$_pc_dolt" "$_pc_quota"
     [ -z "$POOL_CEILING_LOGLINE" ] || log "$POOL_CEILING_LOGLINE"
     [ -z "$POOL_CEILING_RESULT" ] || GATE_MAX_REVIEWERS="$POOL_CEILING_RESULT"
   fi
+  # SELFTEST-EXTRACT gate-apply-dynamic-ceiling: END
   # 3. Pure dynamic-concurrency decision.
   HR_DECISION=$(gate_headroom_decision \
     "${HR_CPU:-}" "${HR_LAT:-}" "$HR_QLIM" "$LIVE_REVIEWERS" \
@@ -12032,12 +12056,19 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
   HR_REASON=$(printf '%s' "$HR_DECISION" | cut -d' ' -f3-)
   # N in-flight runs for the log line = ceil(LIVE_REVIEWERS / reviewers-per-run).
   HR_RUNS=$(( ( LIVE_REVIEWERS + GATE_REVIEWERS_PER_RUN - 1 ) / GATE_REVIEWERS_PER_RUN ))
-  if [ "$HR_QLIM" = "1" ]; then HR_COTA="LIMITED"; else HR_COTA="ok"; fi
+  case "$HR_QSTATE" in ok) HR_COTA="ok" ;; limited) HR_COTA="LIMITED" ;; *) HR_COTA="ilegivel(fail-open)" ;; esac
   if [ "$HR_VERDICT" = "defer" ]; then
     log "Headroom DEFER: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB mem_pressure=${HR_MEM_PRESSURE:-?} disk_free=${HR_DISK_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, leaving $COUNT marker(s) queued (ga-cw4pm)."
     exit 0
   fi
   log "Headroom OK: gate em $HR_RUNS runs (Dolt cpu=${HR_CPU:-?}% [ambient; post-janitor=${HR_CPU_POSTJANITOR:-?}%] lat=${HR_LAT:-?}ms / cota=${HR_COTA} / swap_free=${HR_SWAP_FREE:-?}MB mem_pressure=${HR_MEM_PRESSURE:-?} disk_free=${HR_DISK_FREE:-?}MB) — ${HR_REASON}; ceiling=${HR_CEILING} reviewers, admitting a new run (ga-cw4pm)."
+else
+  # ga-uywvsc: the dynamic ceiling is evaluated INSIDE this block (it moves the ceiling that
+  # gate_headroom_decision scales up to), so GATE_HEADROOM_ENABLED=0 leaves it unevaluated even
+  # when it is switched on. Say so, rather than "on" doing nothing without a trace.
+  if [ "${_POOL_CEILING_OK:-0}" = "1" ] && pool_ceiling_enabled; then
+    log "pool-ceiling: gate-reviewer — GATE_HEADROOM_ENABLED=0: teto dinamico NAO avaliado, vale o fixo ${GATE_MAX_REVIEWERS} (ga-uywvsc)"
+  fi
 fi
 
 # QUEUE ORDER: newest-first tiebreak (4cae0a2c49, 2026-06-24 — Athos: gate>
