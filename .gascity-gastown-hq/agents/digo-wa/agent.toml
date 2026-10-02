@@ -5,4 +5,3 @@ provider = "claude-rc"
 
 option_defaults = { effort = "medium" }  # ga-ufskhy E2 ENCERRADO 01/10 21h: aprovação de 1ª não subiu (77%→35-43%), crews high = US$762/48h (19%) — de volta a medium pela regra do teste
 
-suspended = true
