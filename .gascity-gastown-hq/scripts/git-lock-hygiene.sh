@@ -20,16 +20,12 @@
 #         ps line (ga-hl3xlw: crew/* clones nested under a rig root kept its index.lock alive
 #         forever) — AND, for *.lock files, nobody has the file open.
 #         When ps/lsof cannot answer, the lock is kept. Each skip is logged (skipped_live).
-#   Files cleaned:
+#   Files cleaned (LOCKS — a lock has no "paused for a human" reading, so age + no
+#   process is proof enough):
 #     .git/index.lock         — always a temp file (git crashes leave this behind)
-#     .git/MERGE_HEAD         — in-progress merge, stale after crash
-#     .git/CHERRY_PICK_HEAD   — in-progress cherry-pick, stale after crash
-#     .git/REVERT_HEAD        — in-progress revert, stale after crash
 #     .git/packed-refs.lock   — in-progress pack-refs, stale after crash
 #     .git/shallow.lock       — in-progress shallow fetch, stale after crash
 #     .git/config.lock        — in-progress config write, stale after crash
-#     .git/rebase-merge/      — in-progress rebase (merge strategy), entire dir
-#     .git/rebase-apply/      — in-progress rebase (apply strategy) / git-am, entire dir
 #     .git/index.<word>.<pid>.lock — PID-tagged custom index lock (e.g.
 #                             index.stash.15909.lock), left behind by a script
 #                             that stashes via its own GIT_INDEX_FILE=<path>.$$
@@ -41,15 +37,34 @@
 #                             a stale lock here is removed even while OTHER git
 #                             activity is ongoing in the same repo, but NEVER
 #                             while its own owning PID is still alive (ga-2xorq).
+#   REPORTED, NOT REMOVED (OPERATION STATE — ga-892qy1; opt-in removal: GIT_LOCK_STATE_REMOVE=1):
+#     .git/MERGE_HEAD         — in-progress merge
+#     .git/CHERRY_PICK_HEAD   — in-progress cherry-pick
+#     .git/REVERT_HEAD        — in-progress revert
+#     .git/rebase-merge/      — in-progress rebase (merge strategy)
+#     .git/rebase-apply/      — in-progress rebase (apply strategy) / git-am
+#   These used to be removed on the same age + no-process rule as the locks. That rule
+#   cannot tell a CRASHED operation from one PAUSED FOR A HUMAN (a conflict waiting to be
+#   resolved, an editor open, a ten-minute break): both have no git process. Removing the
+#   state of a paused operation is silent data loss — without MERGE_HEAD the next commit
+#   comes out with ONE parent (the merge becomes an ordinary commit); without rebase-merge/
+#   the rebase in flight is gone. It was latent while the liveness check was "always alive"
+#   by accident on the roots with nested crew clones (HQ, WA); ga-hl3xlw made the check
+#   exact and so made the removal reachable there. Measured 2026-10-02 over the whole log
+#   (40k lines): the janitor had removed only index/PID locks on the real roots, never one of
+#   these — the hazard was latent, not realised.
+#   Now an item past the same two gates is LOGGED (event stale_state_found: label, path, repo,
+#   age_sec — every sweep, counted in the sweep summary as stale_state) and NOTIFIED (once per
+#   item, again after GIT_LOCK_STATE_RENOTIFY_SEC, again if a new operation replaces it at the
+#   same path), with the abort command in the text. A human or crew decides. Only
+#   GIT_LOCK_STATE_REMOVE=1 restores the old removal (explicit opt-in; the item is then removed
+#   and logged as 'removed', not reported). Cost of the default: a genuinely crashed merge/rebase in a shared root is no
+#   longer healed automatically. While MERGE_HEAD / CHERRY_PICK_HEAD / rebase-merge/ /
+#   rebase-apply/ sit there, the gate dispatcher's clean-tree guard (quality-gate-dispatcher.sh,
+#   "Clean-tree guard") skips its AUTO-REBASE in that repo and records the attempt as a
+#   transient out-of-envelope conflict (it does not look at REVERT_HEAD); it does not stop the
+#   repo being used any other way. Someone has to abort it, which the notification asks for.
 #   NOT touched: ORIG_HEAD, FETCH_HEAD, HEAD — valid post-op artifacts.
-#   The in-progress-OPERATION items (MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, rebase-merge/,
-#   rebase-apply/) are REPORTED, NOT REMOVED, unless GIT_LOCK_STATE_REMOVE=1 (ga-hl3xlw/ga-892qy1).
-#   Age + "no live git process" cannot tell a CRASHED operation from one PAUSED for a human (a
-#   conflict being resolved has no process either): deleting it turns a merge into a one-parent
-#   commit and loses a rebase. They were safe on the roots only by accident — the old substring
-#   liveness check was "always live" there — and an exact check removes that accident. Measured
-#   2026-10-02 over the whole log (40k lines): the janitor removed only index/PID locks on the real
-#   roots, never one of these. Each one found is logged as stale_state_found and counted in the sweep.
 #
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
 #   POSIX-atomic mkdir-based locking that serializes git mutations per repository.
@@ -74,9 +89,16 @@
 #   GIT_LOCK_RIG_ROOTS         colon-separated repo roots to scan (see default below)
 #   GIT_LOCK_STALE_AGE_SEC     min age (s) before a lock is considered stale (def 300)
 #   GIT_LOCK_ENABLED           0 = skip janitor (kill-switch, def 1)
-#   GIT_LOCK_DRY_RUN           1 = log what would be removed, don't remove (def 0)
+#   GIT_LOCK_DRY_RUN           1 = log what would be removed, don't remove (def 0).
+#                              Operation-state items are reported, not removed (unless
+#                              GIT_LOCK_STATE_REMOVE=1); under dry run the report is still LOGGED
+#                              (stale_state_found) but not notified.
 #   GIT_LOCK_STATE_REMOVE      1 = also remove in-progress-operation state (MERGE_HEAD, rebase-*, ...)
 #                              when aged and no live git (def 0: report only, see ga-892qy1)
+#   GIT_LOCK_STATE_DIR         where the once-per-item notify markers live (def
+#                              $CITY/.gc/state/git-lock-hygiene-state-notified)
+#   GIT_LOCK_STATE_RENOTIFY_SEC  re-announce a still-present operation-state item after this
+#                              many seconds (def 43200 = 12 h)
 #   GIT_REPO_MUTEX_ENABLED     0 = mutex is a no-op (def 1)
 #   GIT_REPO_MUTEX_MAX_AGE     age (s) before a held mutex is reclaimed as stale (def 600)
 #   GIT_LOCK_PROCESS_CHECK_FN  fn override for process-liveness check (tests only)
@@ -89,6 +111,8 @@ LOG="${GIT_LOCK_LOG:-${CITY}/.gc/logs/git-lock-hygiene.jsonl}"
 ENABLED="${GIT_LOCK_ENABLED:-1}"
 DRY_RUN="${GIT_LOCK_DRY_RUN:-0}"
 STALE_AGE="${GIT_LOCK_STALE_AGE_SEC:-300}"
+GIT_LOCK_STATE_DIR="${GIT_LOCK_STATE_DIR:-${CITY}/.gc/state/git-lock-hygiene-state-notified}"
+GIT_LOCK_STATE_RENOTIFY_SEC="${GIT_LOCK_STATE_RENOTIFY_SEC:-43200}"
 GIT_REPO_MUTEX_ENABLED="${GIT_REPO_MUTEX_ENABLED:-1}"
 GIT_REPO_MUTEX_MAX_AGE="${GIT_REPO_MUTEX_MAX_AGE:-600}"
 GIT_REPO_MUTEX_BASE="${GIT_REPO_MUTEX_BASE:-/tmp/gc-git-repo-mutex}"
@@ -215,6 +239,12 @@ _path_age() {
   mt=$(stat -f %m "$p" 2>/dev/null || stat -c %Y "$p" 2>/dev/null || echo "")
   [ -z "$mt" ] && echo 999999999 && return
   echo $(( now - mt ))
+}
+
+# mtime (epoch s) of a path; empty if it cannot be read. Unlike _path_age this never invents a
+# value for "missing" — the caller uses it as an identity, not a duration.
+_path_mtime() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true
 }
 
 # Run <cmd...> under `timeout <secs>`: rc 124 = deadline hit. Without `timeout` there is no way to
@@ -445,17 +475,15 @@ _is_stale() {
 }
 
 # Stale item found: remove it — except in-progress-OPERATION state, which is reported (see the
-# header: a paused merge/rebase looks exactly like a crashed one). Returns 0 if removed (or would
-# be, under DRY_RUN), 1 if it was left in place on purpose.
+# header: a paused merge/rebase looks exactly like a crashed one) unless GIT_LOCK_STATE_REMOVE=1.
+# $4 = the abort command to name in the report's notification (state items only). Returns 0 if
+# removed (or would be, under DRY_RUN), 1 if it was left in place on purpose.
 _glh_reap() {
-  local path="$1" repo="$2" label="$3" age
+  local path="$1" repo="$2" label="$3" hint="${4:-}"
   case "${path##*/}" in
     MERGE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|rebase-merge|rebase-apply)
       if [ "${GIT_LOCK_STATE_REMOVE:-0}" != "1" ]; then
-        age=$(_path_age "$path")
-        echo "[git-lock-hygiene] FOUND stale ${label} (age=${age}s), NOT removing (GIT_LOCK_STATE_REMOVE!=1): ${path}" >&2
-        _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_found\",\"label\":\"${label}\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"age_sec\":${age}}"
-        _glh_count stale_state
+        _report_stale_state "$path" "$repo" "$label" "$hint"
         return 1
       fi ;;
   esac
@@ -502,8 +530,72 @@ _remove_stale_lock() {
   fi
 }
 
+# Report — do not remove — an in-progress operation (merge / cherry-pick / revert / rebase) that
+# has passed the same age + no-live-process gates as a stale lock (ga-892qy1; see the header for why
+# those gates cannot prove it was abandoned rather than paused for a human). Reached from _glh_reap,
+# which removes instead only under GIT_LOCK_STATE_REMOVE=1.
+# $1 = path, $2 = repo root, $3 = label, $4 = the abort command to name in the notification.
+# Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
+# it as the removed-count, and the real notify prints "Logged for digest ..." on stdout (ga-kimlod
+# measured that leak), so the notify call below discards both streams.
+_report_stale_state() {
+  local path="$1" repo="$2" label="$3" hint="$4" age mt key marker prev age_json age_txt
+  # Three states for the item, never two. Gone (finished or aborted between _is_stale and here):
+  # nothing left to report — and, above all, not a report with an invented age (_path_age answers
+  # 999999999 for "cannot stat", which would read as a very old stuck operation). Present with a
+  # readable mtime: report its age. Present but mtime unreadable: still report it — it is there —
+  # with the age stated as UNKNOWN (null in the log), never as a number.
+  [ -e "$path" ] || return 0
+  _glh_count stale_state     # the sweep summary's tally: items present and left alone (not the vanished)
+  mt=$(_path_mtime "$path")
+  if [ -n "$mt" ]; then
+    age=$(( $(date +%s) - mt )); age_json="$age"; age_txt="${age}s"
+  else
+    age=""; mt="unknown"; age_json="null"; age_txt="unknown"
+  fi
+  local _dry="${GIT_LOCK_DRY_RUN:-${DRY_RUN:-0}}"
+  echo "[git-lock-hygiene] STALE STATE, NOT removed (may be paused for a human) — ${label} (age=${age_txt}): ${path}" >&2
+  # Logged on EVERY sweep, not just the first: the state over time stays reconstructable and
+  # the sweep already writes a line per run. Only the notification is deduped.
+  _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_found\",\"label\":\"${label}\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"age_sec\":${age_json},\"dry_run\":\"${_dry}\"}"
+  [ "$_dry" = "1" ] && return 0            # same rule as the sweep: no notify under dry run
+  if [ ! -x "$NOTIFY_BIN" ]; then
+    # Without a notifier the detection exists only in the log and this stderr line: say so, so a
+    # missing binary is not mistaken for "nobody was told because there was nothing to tell".
+    echo "[git-lock-hygiene] NOT announced — NOTIFY_BIN is not executable (${NOTIFY_BIN}); the item above is only in ${LOG}" >&2
+    return 0
+  fi
+
+  # Dedupe. A paused merge can sit for an afternoon and the sweep runs every ~5.5 min. The marker
+  # holds the item's mtime ("unknown" when it could not be read): same value + inside the window =
+  # already announced; a different value is a NEW operation at the same path and is announced at
+  # once.
+  key=$(printf '%s' "$path" | tr '/ :' '___')
+  marker="${GIT_LOCK_STATE_DIR}/${key}"
+  if [ -f "$marker" ]; then
+    prev=$(head -n1 "$marker" 2>/dev/null || true)
+    if [ "$prev" = "$mt" ] && [ "$(_path_age "$marker")" -lt "$GIT_LOCK_STATE_RENOTIFY_SEC" ]; then
+      return 0
+    fi
+  fi
+  # The marker is written only AFTER a notify that succeeded: a failed notify is retried next sweep
+  # rather than recorded as delivered. If the marker cannot be written, the cost is a repeat notice
+  # per sweep — loud, never silent.
+  if [ -n "$age" ]; then age_txt="ha $(( age / 60 ))min"; else age_txt="ha tempo desconhecido"; fi
+  if "$NOTIFY_BIN" -t "Git-lock hygiene" -p 3 \
+       "Operacao git parada ${age_txt} em ${repo}: ${label} ($(basename "$path")). NAO removido — pode ser pausa humana ou crash. Se abandonado: git -C ${repo} ${hint}" \
+       >/dev/null 2>&1; then
+    mkdir -p "$GIT_LOCK_STATE_DIR" 2>/dev/null && printf '%s\n' "$mt" > "$marker" 2>/dev/null || true
+  else
+    echo "[git-lock-hygiene] notify FAILED for ${path} — not recorded as announced, retried next sweep" >&2
+  fi
+  return 0
+}
+
 # Scan one git repo root for stale lock files.
-# Returns the count of files removed/would-remove.
+# Returns the count of files REMOVED/would-remove: the locks, plus operation-state items only under
+# GIT_LOCK_STATE_REMOVE=1. By default those are reported through _report_stale_state (via _glh_reap)
+# and are not counted here — a detection is not a removal.
 _scan_repo() {
   local repo="$1" git_dir removed=0 git_link
   git_dir="${repo}/.git"
@@ -525,9 +617,6 @@ _scan_repo() {
   local f label
   for f_label in \
     "index.lock:index lock" \
-    "MERGE_HEAD:in-progress merge" \
-    "CHERRY_PICK_HEAD:in-progress cherry-pick" \
-    "REVERT_HEAD:in-progress revert" \
     "packed-refs.lock:packed-refs lock" \
     "shallow.lock:shallow lock" \
     "config.lock:config lock"
@@ -539,15 +628,23 @@ _scan_repo() {
     fi
   done
 
-  # Directory lock candidates (rebase state dirs)
-  local d
-  for d_label in \
-    "rebase-merge:in-progress rebase (merge strategy)" \
-    "rebase-apply:in-progress rebase/am (apply strategy)"
+  # Operation state — DETECT-ONLY by default (ga-892qy1). The state of a merge / cherry-pick /
+  # revert / rebase that may be paused for a human is not a lock and is not removed here, whatever
+  # its age: "no git process" does not distinguish paused from crashed. The same two gates as a lock
+  # (age, no live process) decide whether it is worth REPORTING; _glh_reap reports it, or removes it
+  # only when GIT_LOCK_STATE_REMOVE=1. Fields: name | label | the abort command to put in the
+  # notification. rebase-merge/rebase-apply are directories, the rest files.
+  local s_entry s_name s_label s_hint s_path
+  for s_entry in \
+    "MERGE_HEAD|in-progress merge|merge --abort" \
+    "CHERRY_PICK_HEAD|in-progress cherry-pick|cherry-pick --abort" \
+    "REVERT_HEAD|in-progress revert|revert --abort" \
+    "rebase-merge|in-progress rebase (merge strategy)|rebase --abort" \
+    "rebase-apply|in-progress rebase/am (apply strategy)|rebase --abort (ou am --abort)"
   do
-    d="${git_dir}/${d_label%%:*}"
-    label="${d_label#*:}"
-    if [ -d "$d" ] && _is_stale "$d" "$repo" && _glh_reap "$d" "$repo" "$label"; then
+    IFS='|' read -r s_name s_label s_hint <<< "$s_entry"
+    s_path="${git_dir}/${s_name}"
+    if _is_stale "$s_path" "$repo" && _glh_reap "$s_path" "$repo" "$s_label" "$s_hint"; then
       removed=$(( removed + 1 ))
     fi
   done
@@ -699,9 +796,9 @@ if [ "${1:-}" = "--selftest" ]; then
   bad() { FAIL=$((FAIL+1)); echo "  FAIL $*"; }
 
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/git-lock-hygiene-selftest.XXXXXX")"
-  trap 'rm -rf "$TMP"' EXIT
+  trap 'rm -rf "$TMP" "${T55_BASE:-}"' EXIT
 
-  # ga-d8zeli: _log_json appends every removed/would_remove event to $LOG, which
+  # ga-d8zeli: _log_json appends every removed/would_remove/stale_state_found event to $LOG, which
   # defaults to the LIVE sweeps log — and the fixture repos below fire those events
   # for real (8 per run; measured 2026-09-20: 746 of the 36791 lines in the live
   # git-lock-hygiene.jsonl were selftest fixtures). Point $LOG at scratch for the
@@ -710,6 +807,28 @@ if [ "${1:-}" = "--selftest" ]; then
   # than one caller runs this block (scripts/git-lock-hygiene.selftest.sh,
   # gate-git-lock-hygiene.selftest.sh, a bare `--selftest`); the wrapper pins it.
   LOG="$TMP/git-lock-hygiene.jsonl"
+
+  # ga-892qy1: the same hermeticity for the two new side channels. A stale MERGE_HEAD /
+  # rebase-* fixture now fires a REAL notify (ntfy to the Athos topic) and writes a dedupe
+  # marker under $CITY/.gc/state — so NOTIFY_BIN and the marker dir are pinned to scratch here,
+  # unconditionally, for the same reason as $LOG above: an inherited value must not be able to
+  # aim a selftest at production. The fake notify counts its calls and prints to STDOUT like the
+  # real one does ("Logged for digest ..."), which is what makes a leak into the
+  # `count=$(_scan_repo ...)` capture observable.
+  NOTIFY_CALLS="$TMP/notify.calls"
+  export NOTIFY_CALLS
+  NOTIFY_BIN="$TMP/fake-notify"
+  cat > "$NOTIFY_BIN" <<'FAKE'
+#!/bin/sh
+echo "$*" >> "$NOTIFY_CALLS"
+echo "Logged for digest (selftest fake): $*"
+exit 0
+FAKE
+  chmod +x "$NOTIFY_BIN"
+  GIT_LOCK_STATE_DIR="$TMP/state-notified"
+  # Lines in a file, 0 when it does not exist (grep -c exits 1 on zero matches).
+  _lines() { local n; n="$(grep -c . "$1" 2>/dev/null || true)"; echo "${n:-0}"; }
+  _events() { local n; n="$(grep -c "\"event\":\"$1\"" "$LOG" 2>/dev/null || true)"; echo "${n:-0}"; }
 
   # Absolute path to this script itself — needed by T23-T25 below, which
   # extract the SELFTEST-EXTRACT root-resolve-loop block from this exact
@@ -810,6 +929,12 @@ if [ "${1:-}" = "--selftest" ]; then
     || bad "T4: removed count=$count (expected 0)"
   _state_logged "$R4/.git/rebase-merge" && ok "T4: the kept state is logged as stale_state_found" \
     || bad "T4: no stale_state_found event for $R4/.git/rebase-merge — a skipped item left no trace"
+  [ "$(_events stale_state_found)" = "1" ] && ok "T4: one stale_state_found event logged" \
+    || bad "T4: expected 1 stale_state_found event, got $(_events stale_state_found)"
+  grep -q "\"event\":\"stale_state_found\".*\"path\":\"$R4/.git/rebase-merge\".*\"repo\":\"$R4\".*\"age_sec\":[0-9]" "$LOG" \
+    && ok "T4: event carries path, repo and age_sec" \
+    || bad "T4: event missing path/repo/age_sec — log: $(head -c 300 "$LOG")"
+  [ "$(_events removed)" = "0" ] && ok "T4: no 'removed' event" || bad "T4: a 'removed' event was logged for a state item"
   count=$(GIT_LOCK_STATE_REMOVE=1 _scan_repo "$R4" 2>/dev/null)
   [ ! -d "$R4/.git/rebase-merge" ] && ok "T4: GIT_LOCK_STATE_REMOVE=1 removes it (the opt-in still works)" \
     || bad "T4: GIT_LOCK_STATE_REMOVE=1 did not remove the stale rebase-merge/"
@@ -832,6 +957,8 @@ if [ "${1:-}" = "--selftest" ]; then
     || bad "T5: no stale_state_found event for $R5/.git/MERGE_HEAD"
   [ -f "$R5/.git/ORIG_HEAD" ] && ok "T5: ORIG_HEAD left untouched" \
     || bad "T5: ORIG_HEAD was removed (should NOT be)"
+  [ "$(_events stale_state_found)" = "1" ] && ok "T5: one stale_state_found event for MERGE_HEAD" \
+    || bad "T5: expected 1 stale_state_found event, got $(_events stale_state_found)"
   count=$(GIT_LOCK_STATE_REMOVE=1 _scan_repo "$R5" 2>/dev/null)
   [ ! -f "$R5/.git/MERGE_HEAD" ] && ok "T5: GIT_LOCK_STATE_REMOVE=1 removes MERGE_HEAD (opt-in)" \
     || bad "T5: GIT_LOCK_STATE_REMOVE=1 did not remove MERGE_HEAD"
@@ -1496,6 +1623,222 @@ print(n)
   [ ! -f "$R46B/.git/index.lock" ] && [ -f "$R46B/.git/MERGE_HEAD" ] \
     && ok "T46: lock removed, MERGE_HEAD left in place" || bad "T46: wrong files survived the healthy sweep"
   export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"   # restore the stub the mutex tests below expect
+
+  # ── In-progress OPERATION state is detect-only (ga-892qy1) ──────────────────
+  # MERGE_HEAD / CHERRY_PICK_HEAD / REVERT_HEAD / rebase-merge/ / rebase-apply/ are the state of
+  # an operation that may be PAUSED FOR A HUMAN (conflict, editor, a 10-minute break) — and a
+  # paused operation has no git process, exactly like a crashed one. Age + no-process cannot tell
+  # them apart, so those five are reported, never removed. The *.lock files and the PID-tagged
+  # index locks keep their removal: a lock has no "paused for a human" reading.
+  export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
+  export GIT_LOCK_STALE_AGE_SEC=300
+  GIT_LOCK_STATE_RENOTIFY_SEC=43200
+
+  # T47: the whole class — every one of the five items survives and is reported once, not just the
+  # two T4/T5 happen to cite (the story's own bead named MERGE_HEAD and rebase-merge in the title
+  # but the code carries five).
+  echo "T47: CHERRY_PICK_HEAD, REVERT_HEAD, rebase-apply/ — the rest of the class — survive and are reported"
+  R17="$TMP/repo17"; make_repo "$R17"
+  touch -t 200001010000 "$R17/.git/CHERRY_PICK_HEAD" "$R17/.git/REVERT_HEAD"
+  mkdir -p "$R17/.git/rebase-apply"; touch -t 200001010000 "$R17/.git/rebase-apply"
+  : > "$LOG"; rm -rf "$GIT_LOCK_STATE_DIR"
+  count=$(_scan_repo "$R17")
+  [ -f "$R17/.git/CHERRY_PICK_HEAD" ] && ok "T47: CHERRY_PICK_HEAD kept" || bad "T47: CHERRY_PICK_HEAD removed"
+  [ -f "$R17/.git/REVERT_HEAD" ] && ok "T47: REVERT_HEAD kept" || bad "T47: REVERT_HEAD removed"
+  [ -d "$R17/.git/rebase-apply" ] && ok "T47: rebase-apply/ kept" || bad "T47: rebase-apply/ removed"
+  [ "$(_events stale_state_found)" = "3" ] && ok "T47: 3 stale_state_found events (one per item)" \
+    || bad "T47: expected 3 stale_state_found events, got $(_events stale_state_found)"
+  [ "$count" = "0" ] && ok "T47: removed count=0" || bad "T47: removed count='$count' (expected 0)"
+
+  # T48: a FRESH state item (< STALE_AGE) is a live operation by definition — no event, no notify.
+  echo "T48: fresh MERGE_HEAD (<STALE_AGE) → silent"
+  R18="$TMP/repo18"; make_repo "$R18"
+  touch "$R18/.git/MERGE_HEAD"   # just created
+  : > "$LOG"; : > "$NOTIFY_CALLS"
+  count=$(_scan_repo "$R18")
+  [ -f "$R18/.git/MERGE_HEAD" ] && ok "T48: fresh MERGE_HEAD untouched" || bad "T48: fresh MERGE_HEAD removed"
+  [ "$(_events stale_state_found)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ] \
+    && ok "T48: no event, no notify for a fresh item" \
+    || bad "T48: fresh item reported (events=$(_events stale_state_found) notify=$(_lines "$NOTIFY_CALLS"))"
+
+  # T49: old state item BUT a live git process in the repo → the operation is running, say nothing.
+  echo "T49: old MERGE_HEAD + live git process → silent"
+  R19="$TMP/repo19"; make_repo "$R19"
+  touch -t 200001010000 "$R19/.git/MERGE_HEAD"
+  export GIT_LOCK_PROCESS_CHECK_FN="_yes_git_process"
+  : > "$LOG"; : > "$NOTIFY_CALLS"
+  count=$(_scan_repo "$R19")
+  export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
+  [ -f "$R19/.git/MERGE_HEAD" ] && [ "$(_events stale_state_found)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ] \
+    && ok "T49: live process → kept, no event, no notify" \
+    || bad "T49: live-process repo reported or touched (events=$(_events stale_state_found) notify=$(_lines "$NOTIFY_CALLS"))"
+
+  # T50: notify dedupe. The janitor sweeps every ~5.5 min; a merge left paused for an afternoon
+  # must NOT page 40 times. Event is logged EVERY sweep (state over time stays reconstructable,
+  # and the existing log already carries a `sweep` line per run); notify only on first sight.
+  echo "T50: same paused item across sweeps → event every sweep, notify once"
+  R20="$TMP/repo20"; make_repo "$R20"
+  touch -t 200001010000 "$R20/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  count=$(_scan_repo "$R20"); count2=$(_scan_repo "$R20"); count3=$(_scan_repo "$R20")
+  [ "$(_events stale_state_found)" = "3" ] && ok "T50: event logged on each of 3 sweeps" \
+    || bad "T50: expected 3 events, got $(_events stale_state_found)"
+  [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && ok "T50: notified exactly once across 3 sweeps" \
+    || bad "T50: notify called $(_lines "$NOTIFY_CALLS") times across 3 sweeps (expected 1)"
+  # The fake notify prints to STDOUT like the real one. If that reaches the capture, the sweep's
+  # `total_removed + n` arithmetic dies on "Logged for digest ...".
+  [ "$count" = "0" ] && [ "$count2" = "0" ] && [ "$count3" = "0" ] \
+    && ok "T50: notify stdout does not leak into the captured count" \
+    || bad "T50: notify stdout leaked into the count capture: '$count' '$count2' '$count3'"
+  grep -qE 'MERGE_HEAD|merge' "$NOTIFY_CALLS" && ok "T50: notify text names the item" \
+    || bad "T50: notify text does not name the item: $(cat "$NOTIFY_CALLS")"
+
+  # T51: a NEW operation at the same path (different mtime) is a new thing — notify again, even
+  # inside the renotify window. Otherwise finishing a merge and starting another within 12 h
+  # would be silent.
+  echo "T51: same path, new operation (mtime changed) → notified again"
+  touch -t 200002020000 "$R20/.git/MERGE_HEAD"
+  count=$(_scan_repo "$R20")
+  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T51: second operation notified" \
+    || bad "T51: notify count $(_lines "$NOTIFY_CALLS") after a new operation (expected 2)"
+
+  # T52: and the SAME item is re-announced after the renotify window, so a forgotten paused
+  # operation does not stay silent forever.
+  echo "T52: same item after the renotify window → notified again"
+  GIT_LOCK_STATE_RENOTIFY_SEC=0
+  count=$(_scan_repo "$R20")
+  [ "$(_lines "$NOTIFY_CALLS")" = "3" ] && ok "T52: re-announced once the window elapsed" \
+    || bad "T52: notify count $(_lines "$NOTIFY_CALLS") with RENOTIFY=0 (expected 3)"
+  GIT_LOCK_STATE_RENOTIFY_SEC=43200
+
+  # T53: DRY_RUN=1 — the event is still logged (detection is the whole point), nothing is
+  # notified, nothing is touched. Matches the sweep's own "no notify under dry run".
+  echo "T53: DRY_RUN=1 → event logged, no notify"
+  R21="$TMP/repo21"; make_repo "$R21"
+  touch -t 200001010000 "$R21/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  DRY_RUN=1 _scan_repo "$R21" > /dev/null
+  DRY_RUN=0
+  [ "$(_events stale_state_found)" = "1" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ] && [ -f "$R21/.git/MERGE_HEAD" ] \
+    && ok "T53: dry-run logs the detection, does not notify, keeps the file" \
+    || bad "T53: dry-run misbehaved (events=$(_events stale_state_found) notify=$(_lines "$NOTIFY_CALLS"))"
+
+  # T54: the lock half of the contract is UNCHANGED — in the same repo a stale index.lock is still
+  # removed (and counted) while the stale MERGE_HEAD beside it is kept (and not counted).
+  echo "T54: stale index.lock removed, stale MERGE_HEAD beside it kept"
+  R22="$TMP/repo22"; make_repo "$R22"
+  touch -t 200001010000 "$R22/.git/index.lock" "$R22/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  count=$(_scan_repo "$R22")
+  [ ! -f "$R22/.git/index.lock" ] && ok "T54: stale index.lock still removed" || bad "T54: stale index.lock NOT removed"
+  [ -f "$R22/.git/MERGE_HEAD" ] && ok "T54: MERGE_HEAD beside it kept" || bad "T54: MERGE_HEAD removed"
+  [ "$count" = "1" ] && ok "T54: removed count=1 (the lock only)" || bad "T54: removed count='$count' (expected 1)"
+
+  # T55: END-TO-END through the real sweep entrypoint, not just _scan_repo. The sweep does
+  # `total_removed + n` on the captured count and notifies on removals; this is the path that
+  # breaks if a state notice ever leaks onto stdout. `env -u GIT_LOCK_PROCESS_CHECK_FN`: the
+  # parent exported a FUNCTION NAME that does not exist in the child shell.
+  #
+  # The fixture lives under a dir whose name has no "git" in it, on purpose. This is the one test
+  # that runs the REAL _git_repo_has_live_process (`ps aux | grep '[g]it' | grep -F "$repo"`), and
+  # that pipeline's last grep appears in the ps listing carrying the repo path in its own argv: if
+  # the path itself contains "git" (this selftest's $TMP is git-lock-hygiene-selftest.*), the line
+  # survives the first grep and the check matches ITSELF — a permanent false "live process", so
+  # nothing is ever judged stale. No real rig root has "git" in its path, which is why production is
+  # unaffected; the stubbed tests above never reach that code.
+  echo "T55: real sweep — lock removed, state kept + reported, summary line sane"
+  T55_BASE="$(mktemp -d "${TMPDIR:-/tmp}/glh-e2e.XXXXXX")"
+  R23="$T55_BASE/repo23"; make_repo "$R23"
+  touch -t 200001010000 "$R23/.git/index.lock" "$R23/.git/MERGE_HEAD"
+  mkdir -p "$R23/.git/rebase-merge"; touch -t 200001010000 "$R23/.git/rebase-merge"
+  T55_LOG="$TMP/t55.jsonl"; : > "$T55_LOG"; : > "$NOTIFY_CALLS"
+  env -u GIT_LOCK_PROCESS_CHECK_FN GIT_LOCK_RIG_ROOTS="$R23" GIT_LOCK_LOG="$T55_LOG" \
+      NOTIFY_BIN="$NOTIFY_BIN" GIT_LOCK_STATE_DIR="$TMP/t55-state" GC_CITY_PATH="$TMP/t55-city" \
+      bash "$_GLH_SELF" >/dev/null 2>"$TMP/t55.err"
+  _t55_rc=$?
+  [ "$_t55_rc" -eq 0 ] && ok "T55: sweep exited 0" || bad "T55: sweep exited $_t55_rc — stderr: $(head -c 400 "$TMP/t55.err")"
+  [ ! -f "$R23/.git/index.lock" ] && [ -f "$R23/.git/MERGE_HEAD" ] && [ -d "$R23/.git/rebase-merge" ] \
+    && ok "T55: lock gone, MERGE_HEAD and rebase-merge/ intact" \
+    || bad "T55: wrong survivors after the sweep"
+  [ "$(grep -c '"event":"stale_state_found"' "$T55_LOG")" = "2" ] \
+    && ok "T55: 2 stale_state_found events (MERGE_HEAD, rebase-merge)" \
+    || bad "T55: expected 2 stale_state_found events: $(cat "$T55_LOG" | cut -c1-200)"
+  grep -q '"event":"sweep".*"removed":1,' "$T55_LOG" && ok "T55: sweep summary says removed=1" \
+    || bad "T55: sweep summary wrong: $(grep '"event":"sweep"' "$T55_LOG")"
+  [ "$(_lines "$NOTIFY_CALLS")" = "3" ] && ok "T55: 3 notifications (2 state items + 1 removal summary)" \
+    || bad "T55: notify calls $(_lines "$NOTIFY_CALLS") (expected 3): $(cat "$NOTIFY_CALLS")"
+
+  # T56-T59: the three-state contract of _report_stale_state — what it does when it CANNOT know.
+  # T56: the item is gone by the time it is reported. _path_age answers 999999999 for "cannot stat";
+  # logging that as an age would record a very old stuck operation that does not exist.
+  echo "T56: item vanished before the report → nothing logged, nothing notified"
+  R24="$TMP/repo24"; make_repo "$R24"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  _report_stale_state "$R24/.git/MERGE_HEAD" "$R24" "in-progress merge" "merge --abort" 2>"$TMP/t56.err" >/dev/null
+  { [ "$(_events stale_state_found)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ] \
+      && ! grep -q 999999999 "$LOG" "$TMP/t56.err"; } \
+    && ok "T56: a vanished item is not reported (no event, no notify, no sentinel age)" \
+    || bad "T56: vanished item was reported — events=$(_events stale_state_found) notify=$(_lines "$NOTIFY_CALLS") log: $(head -c 240 "$LOG")"
+  # Same, through the real call site: _glh_reap is what the sweep calls, and the sentinel-age hole
+  # (an event with age_sec=999999999 for an item that is not there) lived in ITS inline log block.
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  _glh_reap "$R24/.git/MERGE_HEAD" "$R24" "in-progress merge" "merge --abort" 2>"$TMP/t56b.err" >/dev/null
+  _t56_rc=$?
+  { [ "$_t56_rc" = "1" ] && [ "$(_events stale_state_found)" = "0" ] && [ "$(_lines "$NOTIFY_CALLS")" = "0" ] \
+      && ! grep -q 999999999 "$LOG" "$TMP/t56b.err"; } \
+    && ok "T56: through _glh_reap too — vanished item: not reported, not counted removed, no sentinel age" \
+    || bad "T56: _glh_reap on a vanished item — rc=$_t56_rc events=$(_events stale_state_found) notify=$(_lines "$NOTIFY_CALLS") log: $(head -c 240 "$LOG")"
+
+  # T57: the item exists but its mtime cannot be read. It is still reported — it is there — with
+  # the age as null, never as a number; and it is announced once (the marker identity is "unknown").
+  echo "T57: mtime unreadable → reported with age_sec=null, notified once"
+  R25="$TMP/repo25"; make_repo "$R25"
+  touch -t 200001010000 "$R25/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  _T57_SAVED_MTIME="$(declare -f _path_mtime)"
+  _path_mtime() { :; }
+  _report_stale_state "$R25/.git/MERGE_HEAD" "$R25" "in-progress merge" "merge --abort" 2>"$TMP/t57.err" >/dev/null
+  _report_stale_state "$R25/.git/MERGE_HEAD" "$R25" "in-progress merge" "merge --abort" 2>>"$TMP/t57.err" >/dev/null
+  eval "$_T57_SAVED_MTIME"
+  { [ "$(_events stale_state_found)" = "2" ] && grep -q '"age_sec":null' "$LOG" && ! grep -q '"age_sec":[0-9]' "$LOG"; } \
+    && ok "T57: event logged with age_sec=null on each sweep" \
+    || bad "T57: expected 2 events with age_sec=null — log: $(head -c 300 "$LOG")"
+  [ "$(_lines "$NOTIFY_CALLS")" = "1" ] && grep -q 'tempo desconhecido' "$NOTIFY_CALLS" \
+    && ok "T57: announced once, the text says the time is unknown" \
+    || bad "T57: notify calls=$(_lines "$NOTIFY_CALLS") text: $(cat "$NOTIFY_CALLS")"
+
+  # T58: the notifier FAILS. The failure must be visible on stderr and must NOT be recorded as
+  # delivered (no marker), so the next sweep tries again; once it works, the marker is written.
+  echo "T58: notify fails → visible, not recorded as announced, retried next sweep"
+  R26="$TMP/repo26"; make_repo "$R26"
+  touch -t 200001010000 "$R26/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  _T58_REAL_NOTIFY="$NOTIFY_BIN"
+  NOTIFY_BIN="$TMP/failing-notify"
+  printf '#!/bin/sh\necho "$*" >> "$NOTIFY_CALLS"\nexit 1\n' > "$NOTIFY_BIN"; chmod +x "$NOTIFY_BIN"
+  count=$(_scan_repo "$R26" 2>"$TMP/t58.err")
+  grep -q 'notify FAILED' "$TMP/t58.err" && ok "T58: the failed notify is visible on stderr" \
+    || bad "T58: a failed notify was silent — stderr: $(head -c 300 "$TMP/t58.err")"
+  [ -z "$(ls -A "$GIT_LOCK_STATE_DIR" 2>/dev/null)" ] && ok "T58: nothing recorded as announced" \
+    || bad "T58: a marker was written for a notify that failed: $(ls "$GIT_LOCK_STATE_DIR")"
+  count=$(_scan_repo "$R26" 2>/dev/null)
+  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T58: retried on the next sweep" \
+    || bad "T58: notify attempts=$(_lines "$NOTIFY_CALLS") after 2 sweeps (expected 2)"
+  NOTIFY_BIN="$_T58_REAL_NOTIFY"
+
+  # T59: there is NO notifier. The detection stays in the log, and stderr says it was not announced
+  # — a missing binary must not look like "nothing to tell anyone".
+  echo "T59: NOTIFY_BIN not executable → event logged, stderr says not announced"
+  R27="$TMP/repo27"; make_repo "$R27"
+  touch -t 200001010000 "$R27/.git/MERGE_HEAD"
+  : > "$LOG"; rm -rf "$GIT_LOCK_STATE_DIR"
+  NOTIFY_BIN="$TMP/no-such-notify"
+  count=$(_scan_repo "$R27" 2>"$TMP/t59.err")
+  NOTIFY_BIN="$_T58_REAL_NOTIFY"
+  [ "$(_events stale_state_found)" = "1" ] && ok "T59: the event is logged without a notifier" \
+    || bad "T59: expected 1 event, got $(_events stale_state_found)"
+  grep -q 'NOT announced' "$TMP/t59.err" && ok "T59: stderr says the item was not announced" \
+    || bad "T59: missing notifier was silent — stderr: $(head -c 300 "$TMP/t59.err")"
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""
