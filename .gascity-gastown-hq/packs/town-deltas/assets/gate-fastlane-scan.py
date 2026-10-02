@@ -203,7 +203,11 @@ def scan_diff(lines):
             yield from name_findings(line[len("diff --git "):])   # an empty/mode-only/deleted file has no +++ line
             continue
         if line.startswith("+++ "):
-            tgt = line[4:]
+            # git ends this line with a TAB when the path holds a space (`+++ b/docs/a b.md<TAB>`). The TAB is the
+            # separator, never part of the name: a real TAB in a path is C-quoted, so an unquoted name cannot end in one.
+            # Left in, it made the finding line `label<TAB>path<TAB><TAB>line` (4 fields), and the caller read the
+            # scanner's own output as malformed — a real finding reported as "the scanner crashed".
+            tgt = line[4:].rstrip("\t")
             path = tgt[2:] if tgt.startswith("b/") else tgt
             if path == "/dev/null":
                 path = shown = None

@@ -382,10 +382,14 @@ gate_fastlane_scan() {
 # /opt/homebrew/bin and stay on this PATH (measured under the exact env the lane builds: `bd -C <city> list` returns
 # the live city's beads, `gc --city <city>` runs). The credential shield is the throwaway HOME that
 # gate_fastlane_run_tests sets: `bw` finds no vault there and `gh` is logged out. A test that needs a dropped tool
-# fails, and a failing test sends the diff to the normal gate — the inert outcome.
+# usually fails, and a failing test sends the diff to the normal gate — the inert outcome. Not always: a test that guards
+# itself (`command -v secret >/dev/null || { echo "SKIP: ..."; exit 0; }`, an idiom this repo already uses) exits 0 without
+# running anything, and the lane reads only the exit code, so it counts that as passed. The reason text therefore says
+# "exited 0", not "ran green". What bounds it: the diff is doc/test-only, and the fast lane still goes through
+# gate_finalize_run, whose full-suite check (ga-3wgx8) runs at the merge in a rig that has opted in with a .gate-full-suite.sh.
 # With HOME unset the filter has no way to tell which entries are "under $HOME", and passing every entry through would read
 # that as "none of them is". It falls back to the system and Homebrew directories alone: a test that needs a tool outside
-# them fails, and a failing test sends the diff to the normal gate (the inert outcome).
+# them usually fails (and a failing test sends the diff to the normal gate, the inert outcome), unless it skips itself as above.
 _gate_fastlane_test_path() {
   local out="" entry IFS=:
   if [ -z "${HOME:-}" ]; then printf '%s' "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"; return 0; fi
@@ -503,7 +507,7 @@ EOF
 $paths
 EOF
   GATE_FL_TEST_RC=0
-  GATE_FL_TEST_OUT="$ok_n test file(s) ran green"
+  GATE_FL_TEST_OUT="$ok_n test file(s) exited 0"   # exit 0 is all the lane can see: a test that skips itself exits 0 too
   "$git_fn" worktree remove --force "$wt" >/dev/null 2>&1 || true
   rm -f "$log" 2>/dev/null || true
   return 0
