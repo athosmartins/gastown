@@ -42,14 +42,14 @@
 #                             activity is ongoing in the same repo, but NEVER
 #                             while its own owning PID is still alive (ga-2xorq).
 #   NOT touched: ORIG_HEAD, FETCH_HEAD, HEAD — valid post-op artifacts.
-#   KNOWN HAZARD (ga-892qy1, open decision): the in-progress-OPERATION items above (MERGE_HEAD,
-#   CHERRY_PICK_HEAD, REVERT_HEAD, rebase-merge/, rebase-apply/) are removed on age + "no live git
-#   process" alone, but an operation PAUSED for a human has no process either: after 300 s its state
-#   is deleted (a merge becomes a one-parent commit, a rebase is lost). Roots with crew/* clones
-#   nested under them (HQ, whatsapp_automation) never reached that code before ga-hl3xlw made the
-#   liveness check exact — the old substring match was "always live" there. Unchanged here on
-#   purpose (a separate decision from the index.lock fix); nothing of that kind exists on the
-#   real roots today (checked 2026-10-02).
+#   The in-progress-OPERATION items (MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, rebase-merge/,
+#   rebase-apply/) are REPORTED, NOT REMOVED, unless GIT_LOCK_STATE_REMOVE=1 (ga-hl3xlw/ga-892qy1).
+#   Age + "no live git process" cannot tell a CRASHED operation from one PAUSED for a human (a
+#   conflict being resolved has no process either): deleting it turns a merge into a one-parent
+#   commit and loses a rebase. They were safe on the roots only by accident — the old substring
+#   liveness check was "always live" there — and an exact check removes that accident. Measured
+#   2026-10-02 over the whole log (40k lines): the janitor removed only index/PID locks on the real
+#   roots, never one of these. Each one found is logged as stale_state_found and counted in the sweep.
 #
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
 #   POSIX-atomic mkdir-based locking that serializes git mutations per repository.
@@ -75,6 +75,8 @@
 #   GIT_LOCK_STALE_AGE_SEC     min age (s) before a lock is considered stale (def 300)
 #   GIT_LOCK_ENABLED           0 = skip janitor (kill-switch, def 1)
 #   GIT_LOCK_DRY_RUN           1 = log what would be removed, don't remove (def 0)
+#   GIT_LOCK_STATE_REMOVE      1 = also remove in-progress-operation state (MERGE_HEAD, rebase-*, ...)
+#                              when aged and no live git (def 0: report only, see ga-892qy1)
 #   GIT_REPO_MUTEX_ENABLED     0 = mutex is a no-op (def 1)
 #   GIT_REPO_MUTEX_MAX_AGE     age (s) before a held mutex is reclaimed as stale (def 600)
 #   GIT_LOCK_PROCESS_CHECK_FN  fn override for process-liveness check (tests only)
@@ -249,6 +251,22 @@ _glh_enclosing_repo() {
 # Why the last liveness question answered "live / cannot tell" — read by _is_stale to log the skip.
 # Plain words and pids only: it is spliced into a JSON line.
 _GLH_LIVE_REASON=""
+# 1 when the answer "keep it" is a "could not find out" rather than "found a live one". Set by
+# _glh_unknown at every could-not-tell site and counted from this flag — never by matching the
+# wording of the reason, which drifts (a reason that said "cannot list processes" matched none of
+# the phrases a text match looked for, so the broken-ps case, the one that keeps EVERY lock, would
+# have read undetermined=0).
+_GLH_LIVE_UNKNOWN=0
+_glh_unknown() { _GLH_LIVE_REASON="$1"; _GLH_LIVE_UNKNOWN=1; }
+
+# Per-sweep tally. _scan_repo runs inside $(...), so a variable would die with that subshell; the
+# sweep points this at a scratch file and reads it back for its summary line. Unset (lib mode,
+# selftest) = counting is off, and every caller must work exactly the same.
+_GLH_COUNT_FILE=""
+_glh_count() {
+  if [ -n "${_GLH_COUNT_FILE:-}" ]; then printf '%s\n' "$1" >> "$_GLH_COUNT_FILE" 2>/dev/null || true; fi
+  return 0
+}
 
 # Returns 0 if a live git process is working on repo_path, OR if we could not find out.
 # Returns 1 only when we looked and there is none. Three states, and "cannot tell" must not
@@ -267,8 +285,9 @@ _GLH_LIVE_REASON=""
 # tmux/claude/zsh lines mentioning the path, a sibling whose path shares a prefix, and the grep's
 # own command line (ga-hl3xlw: a 0-byte index.lock sat for ~3h because something always matched).
 # Conservative where it cannot be exact, on purpose: a git dir we cannot resolve falls back to
-# (2); a `-C` token that is really a verb option (`git commit -C <rev>`) is read as a chdir and
-# can only add attribution, never remove it. Both can only KEEP a lock a moment longer.
+# (2); a `-C` token that is really a verb option (`git commit -C <rev>`) is read as a chdir, which
+# adds attribution (it is a path under the cwd) — and can drop a process only in the contrived case
+# of ALSO passing a relative --git-dir and naming a revision that is a directory with its own .git.
 # Limits, stated so nobody assumes more: ps flattens argv, so a repo path containing spaces is not
 # matched from argv (this city has none); GIT_DIR is read with `ps -E`, which macOS hides for
 # SIP-protected binaries — measured readable for Homebrew git, NOT measured for other gits, and
@@ -281,11 +300,11 @@ _GLH_LIVE_REASON=""
 # Tests may override via GIT_LOCK_PROCESS_CHECK_FN.
 _git_repo_has_live_process() {
   local repo="$1" want wantgd gl psout gitpids pidlist cwdmap lrc pid cwd args toks tok cand gd nxt cgd eff
-  _GLH_LIVE_REASON=""
+  _GLH_LIVE_REASON=""; _GLH_LIVE_UNKNOWN=0
   if [ -n "${GIT_LOCK_PROCESS_CHECK_FN:-}" ]; then
     "$GIT_LOCK_PROCESS_CHECK_FN" "$repo"; return $?
   fi
-  want=$(_glh_canon_dir "$repo") || { _GLH_LIVE_REASON="cannot resolve the repo path"; return 0; }
+  want=$(_glh_canon_dir "$repo") || { _glh_unknown "cannot resolve the repo path"; return 0; }
   # This repo's own git dir: <root>/.git, or what a gitlink .git FILE points at (bare containers).
   wantgd=""
   if [ -d "$want/.git" ]; then
@@ -295,9 +314,9 @@ _git_repo_has_live_process() {
     case "$gl" in /*|"") ;; *) gl="$want/$gl" ;; esac
     [ -n "$gl" ] && { wantgd=$(_glh_canon_dir "$gl") || wantgd=""; }
   fi
-  psout=$(ps -axo pid=,comm= 2>/dev/null) || { _GLH_LIVE_REASON="ps failed - cannot list processes"; return 0; }
+  psout=$(ps -axo pid=,comm= 2>/dev/null) || { _glh_unknown "ps failed - cannot list processes"; return 0; }
   # A process table with no processes in it (not even this shell) is a broken ps, not an empty machine.
-  [ -n "$psout" ] || { _GLH_LIVE_REASON="ps listed no processes at all - cannot tell"; return 0; }
+  [ -n "$psout" ] || { _glh_unknown "ps listed no processes at all - cannot tell"; return 0; }
   gitpids=$(printf '%s\n' "$psout" | awk '
     { pid = $1; sub(/^[ \t]*[0-9]+[ \t]+/, ""); n = $0; sub(/.*\//, "", n)
       if (n == "git" || n ~ /^git-/) print pid }')
@@ -310,7 +329,7 @@ _git_repo_has_live_process() {
   cwdmap=$(_glh_bounded 10 lsof -a -d cwd -Fpn -p "$pidlist" 2>/dev/null) && lrc=0 || lrc=$?
   case "$lrc" in
     0|1) ;;
-    *) _GLH_LIVE_REASON="lsof failed or timed out (rc=${lrc}) - cannot read cwds"; return 0 ;;
+    *) _glh_unknown "lsof failed or timed out (rc=${lrc}) - cannot read cwds"; return 0 ;;
   esac
 
   while IFS= read -r pid; do
@@ -321,7 +340,7 @@ _git_repo_has_live_process() {
       # No cwd reported: the process exited since ps listed it (fine) — or it is alive and its
       # cwd is unreadable (not fine: we cannot tell where it works).
       ps -p "$pid" -o pid= >/dev/null 2>&1 || continue
-      _GLH_LIVE_REASON="git pid ${pid} cwd unreadable - cannot tell which repo it works on"; return 0
+      _glh_unknown "git pid ${pid} cwd unreadable - cannot tell which repo it works on"; return 0
     fi
     args=$(ps -p "$pid" -o args= 2>/dev/null) || continue   # exited meanwhile
     toks=$(printf '%s' "$args" | tr -s ' \t' '\n')
@@ -396,7 +415,7 @@ _glh_lock_held_open() {
     _GLH_LIVE_REASON="lock held open by pid ${out%%$'\n'*}"; return 0
   fi
   [ "$rc" -eq 1 ] && [ -z "$out" ] && return 1
-  _GLH_LIVE_REASON="lsof failed or timed out (rc=${rc}) - cannot tell who holds the lock"; return 0
+  _glh_unknown "lsof failed or timed out (rc=${rc}) - cannot tell who holds the lock"; return 0
 }
 
 # Determine if a lock file or directory is stale:
@@ -409,12 +428,38 @@ _is_stale() {
   local age
   age=$(_path_age "$path")
   [ "$age" -lt "$STALE_AGE" ] && return 1   # too young
-  _GLH_LIVE_REASON=""
+  _GLH_LIVE_REASON=""; _GLH_LIVE_UNKNOWN=0
   if _git_repo_has_live_process "$repo" || _glh_lock_held_open "$path"; then
     _log_json "{\"ts\":\"$(ts)\",\"event\":\"skipped_live\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"age_sec\":${age},\"reason\":\"${_GLH_LIVE_REASON:-live git process}\"}"
+    _glh_count skipped_live
+    [ "$_GLH_LIVE_UNKNOWN" = 1 ] && _glh_count undetermined
     return 1   # live process / lock held / cannot tell → skip
   fi
+  # The probe above can take seconds (ps, lsof up to 10 s, per-pid ps): what we measured at the
+  # top may have been replaced since — a lock removed and re-created by a NEW git is young again.
+  # Re-read before anyone deletes; a path that vanished or got younger is not ours to remove.
+  [ -e "$path" ] || return 1
+  age=$(_path_age "$path")
+  [ "$age" -lt "$STALE_AGE" ] && return 1
   return 0   # stale
+}
+
+# Stale item found: remove it — except in-progress-OPERATION state, which is reported (see the
+# header: a paused merge/rebase looks exactly like a crashed one). Returns 0 if removed (or would
+# be, under DRY_RUN), 1 if it was left in place on purpose.
+_glh_reap() {
+  local path="$1" repo="$2" label="$3" age
+  case "${path##*/}" in
+    MERGE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|rebase-merge|rebase-apply)
+      if [ "${GIT_LOCK_STATE_REMOVE:-0}" != "1" ]; then
+        age=$(_path_age "$path")
+        echo "[git-lock-hygiene] FOUND stale ${label} (age=${age}s), NOT removing (GIT_LOCK_STATE_REMOVE!=1): ${path}" >&2
+        _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_found\",\"label\":\"${label}\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"age_sec\":${age}}"
+        _glh_count stale_state
+        return 1
+      fi ;;
+  esac
+  _remove_stale_lock "$path" "$repo" "$label"
 }
 
 # Returns 0 if pid is confirmed dead (kill -0 fails with no-such-process),
@@ -489,8 +534,7 @@ _scan_repo() {
   do
     f="${git_dir}/${f_label%%:*}"
     label="${f_label#*:}"
-    if _is_stale "$f" "$repo"; then
-      _remove_stale_lock "$f" "$repo" "$label"
+    if _is_stale "$f" "$repo" && _glh_reap "$f" "$repo" "$label"; then
       removed=$(( removed + 1 ))
     fi
   done
@@ -503,8 +547,7 @@ _scan_repo() {
   do
     d="${git_dir}/${d_label%%:*}"
     label="${d_label#*:}"
-    if [ -d "$d" ] && _is_stale "$d" "$repo"; then
-      _remove_stale_lock "$d" "$repo" "$label"
+    if [ -d "$d" ] && _is_stale "$d" "$repo" && _glh_reap "$d" "$repo" "$label"; then
       removed=$(( removed + 1 ))
     fi
   done
@@ -744,25 +787,75 @@ if [ "${1:-}" = "--selftest" ]; then
     || bad "T3: lock removed despite live process (should NOT be)"
   export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"
 
-  # T4: stale rebase-merge/ directory → removed
-  echo "T4: stale rebase-merge/ dir → removed"
+  # In-progress-OPERATION state (MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, rebase-merge/,
+  # rebase-apply/) is REPORTED, not removed (ga-hl3xlw / ga-892qy1): an operation paused on a
+  # conflict for a human has no process either, so age + "no git process" cannot tell it from a
+  # crashed one, and deleting it turns a merge into a one-parent commit / loses a rebase. Only
+  # GIT_LOCK_STATE_REMOVE=1 restores the old removal. *.lock files are unaffected.
+  # _state_logged <path> — was a stale_state_found event written for exactly that path?
+  _state_logged() {
+    awk -v p="$1" 'index($0, "\"path\":\"" p "\"") && /"event":"stale_state_found"/ { f = 1 } END { exit !f }' "$LOG" 2>/dev/null
+  }
+
+  # T4: stale rebase-merge/ directory → reported and kept; removed only on opt-in
+  echo "T4: stale rebase-merge/ dir → reported, NOT removed (a paused rebase looks like a crashed one)"
   R4="$TMP/repo4"; make_repo "$R4"
   mkdir -p "$R4/.git/rebase-merge"
   touch -t 200001010000 "$R4/.git/rebase-merge"
-  count=$(_scan_repo "$R4")
-  [ ! -d "$R4/.git/rebase-merge" ] && ok "T4: stale rebase-merge/ removed" \
-    || bad "T4: stale rebase-merge/ NOT removed"
+  : > "$LOG"
+  count=$(_scan_repo "$R4" 2>/dev/null)
+  [ -d "$R4/.git/rebase-merge" ] && ok "T4: stale rebase-merge/ kept" \
+    || bad "T4: stale rebase-merge/ was REMOVED (a paused rebase would be lost)"
+  [ "$count" = "0" ] && ok "T4: removed count=0 (nothing was removed, so none is claimed)" \
+    || bad "T4: removed count=$count (expected 0)"
+  _state_logged "$R4/.git/rebase-merge" && ok "T4: the kept state is logged as stale_state_found" \
+    || bad "T4: no stale_state_found event for $R4/.git/rebase-merge — a skipped item left no trace"
+  count=$(GIT_LOCK_STATE_REMOVE=1 _scan_repo "$R4" 2>/dev/null)
+  [ ! -d "$R4/.git/rebase-merge" ] && ok "T4: GIT_LOCK_STATE_REMOVE=1 removes it (the opt-in still works)" \
+    || bad "T4: GIT_LOCK_STATE_REMOVE=1 did not remove the stale rebase-merge/"
 
-  # T5: stale MERGE_HEAD → removed; ORIG_HEAD → left untouched
-  echo "T5: stale MERGE_HEAD removed; ORIG_HEAD untouched"
+  # T5: stale MERGE_HEAD → reported and kept, while an aged index.lock beside it IS removed (the
+  # actual ga-hl3xlw bug must not be held hostage by the state items); ORIG_HEAD → untouched
+  echo "T5: stale MERGE_HEAD reported+kept, index.lock beside it removed; ORIG_HEAD untouched"
   R5="$TMP/repo5"; make_repo "$R5"
   touch -t 200001010000 "$R5/.git/MERGE_HEAD"
+  touch -t 200001010000 "$R5/.git/index.lock"
   touch -t 200001010000 "$R5/.git/ORIG_HEAD"   # valid artifact — must NOT be removed
-  count=$(_scan_repo "$R5")
-  [ ! -f "$R5/.git/MERGE_HEAD" ] && ok "T5: stale MERGE_HEAD removed" \
-    || bad "T5: stale MERGE_HEAD NOT removed"
+  : > "$LOG"
+  count=$(_scan_repo "$R5" 2>/dev/null)
+  [ -f "$R5/.git/MERGE_HEAD" ] && ok "T5: stale MERGE_HEAD kept" \
+    || bad "T5: stale MERGE_HEAD was REMOVED (a paused merge would become a one-parent commit)"
+  [ ! -f "$R5/.git/index.lock" ] && ok "T5: the aged index.lock beside it was still removed" \
+    || bad "T5: index.lock kept — the state-item guard must not shield lock files"
+  [ "$count" = "1" ] && ok "T5: removed count=1 (the lock only)" || bad "T5: removed count=$count (expected 1)"
+  _state_logged "$R5/.git/MERGE_HEAD" && ok "T5: MERGE_HEAD logged as stale_state_found" \
+    || bad "T5: no stale_state_found event for $R5/.git/MERGE_HEAD"
   [ -f "$R5/.git/ORIG_HEAD" ] && ok "T5: ORIG_HEAD left untouched" \
     || bad "T5: ORIG_HEAD was removed (should NOT be)"
+  count=$(GIT_LOCK_STATE_REMOVE=1 _scan_repo "$R5" 2>/dev/null)
+  [ ! -f "$R5/.git/MERGE_HEAD" ] && ok "T5: GIT_LOCK_STATE_REMOVE=1 removes MERGE_HEAD (opt-in)" \
+    || bad "T5: GIT_LOCK_STATE_REMOVE=1 did not remove MERGE_HEAD"
+  [ -f "$R5/.git/ORIG_HEAD" ] && ok "T5: ORIG_HEAD still untouched under the opt-in" \
+    || bad "T5: ORIG_HEAD removed under GIT_LOCK_STATE_REMOVE=1"
+
+  # T5b: the whole class, not the two names T4/T5 happened to use — every state item `_scan_repo`
+  # knows is kept by default and removed only under the opt-in.
+  echo "T5b: every in-progress-operation item is kept by default, removed only on opt-in"
+  for _st in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    R5B="$TMP/repo5b-$_st"; make_repo "$R5B"
+    case "$_st" in rebase-*) mkdir -p "$R5B/.git/$_st" ;; *) : > "$R5B/.git/$_st" ;; esac
+    touch -t 200001010000 "$R5B/.git/$_st"
+    : > "$LOG"
+    count=$(_scan_repo "$R5B" 2>/dev/null)
+    if [ -e "$R5B/.git/$_st" ] && [ "$count" = "0" ] && _state_logged "$R5B/.git/$_st"; then
+      ok "T5b: $_st kept, counted as 0 removed, logged"
+    else
+      bad "T5b: $_st — removed, miscounted (count=$count) or not logged"
+    fi
+    count=$(GIT_LOCK_STATE_REMOVE=1 _scan_repo "$R5B" 2>/dev/null)
+    [ ! -e "$R5B/.git/$_st" ] && ok "T5b: $_st removed under GIT_LOCK_STATE_REMOVE=1" \
+      || bad "T5b: $_st survived GIT_LOCK_STATE_REMOVE=1"
+  done
 
   # T6: DRY_RUN=1 → stale lock logged but not removed
   echo "T6: DRY_RUN=1 → stale lock NOT removed"
@@ -1054,6 +1147,9 @@ print(n)
   count=$(_scan_repo "$L4"); lv_cleanup
   [ -f "$L4/.git/index.lock" ] && ok "T29: lock kept — live git -C <root>" \
     || bad "T29: lock REMOVED under a live 'git -C <root>'"
+  lv_logged "$L4/.git/index.lock" 'git pid [0-9]+ argv names repo' \
+    && ok "T29: kept by ITS branch (the argv names the repo — cwd is '/', so no other branch can explain it)" \
+    || bad "T29: no skipped_live event with reason 'argv names repo' for $L4/.git/index.lock"
 
   echo "T30: stale index.lock + 'git --git-dir=<root>/.git --work-tree=<root>' → kept"
   L5="$LVR/lv5"; make_repo "$L5"
@@ -1062,6 +1158,9 @@ print(n)
   count=$(_scan_repo "$L5"); lv_cleanup
   [ -f "$L5/.git/index.lock" ] && ok "T30: lock kept — live git --git-dir=<root>/.git" \
     || bad "T30: lock REMOVED under a live 'git --git-dir=<root>/.git'"
+  lv_logged "$L5/.git/index.lock" 'git pid [0-9]+ git-dir is this repo' \
+    && ok "T30: kept by ITS branch (the explicit git dir)" \
+    || bad "T30: no skipped_live event with reason 'git-dir is this repo' for $L5/.git/index.lock"
 
   echo "T31: stale index.lock + a git whose cwd is a SUBDIRECTORY of the root (no own .git) → kept"
   L6="$LVR/lv6"; make_repo "$L6"; mkdir -p "$L6/sub/deep"
@@ -1070,6 +1169,9 @@ print(n)
   count=$(_scan_repo "$L6"); lv_cleanup
   [ -f "$L6/.git/index.lock" ] && ok "T31: lock kept — git in a subdirectory still works on the root's index" \
     || bad "T31: lock REMOVED under a live git running in a subdirectory of the root"
+  lv_logged "$L6/.git/index.lock" 'git pid [0-9]+ cwd in repo' \
+    && ok "T31: kept by ITS branch (cwd resolves to the enclosing repo)" \
+    || bad "T31: no skipped_live event with reason 'cwd in repo' for $L6/.git/index.lock"
 
   echo "T32: stale index.lock + a git in a linked worktree (<root>/.wt-feat, .git is a FILE) → removed"
   L7="$LVR/lv7"; make_repo "$L7"; mkdir -p "$L7/.wt-feat"
@@ -1097,6 +1199,9 @@ print(n)
     count=$(_scan_repo "$L9")
     [ -f "$L9/.git/$_lk" ] && ok "T34: $_lk kept while another process has it open" \
       || bad "T34: $_lk REMOVED while a live process holds it open"
+    lv_logged "$L9/.git/$_lk" 'lock held open by pid' \
+      && ok "T34: $_lk kept by ITS signal (the open fd), not by a git-process guess" \
+      || bad "T34: no skipped_live event with reason 'lock held open by pid' for $L9/.git/$_lk"
     lv_cleanup
     count=$(_scan_repo "$L9")
     [ ! -f "$L9/.git/$_lk" ] && ok "T34: $_lk removed once nobody holds it (proves the fd, not something else, protected it)" \
@@ -1162,6 +1267,14 @@ print(n)
   count=$(_scan_repo "$L12"); lv_cleanup
   [ ! -f "$L12/.git/index.lock" ] && ok "T37: lock removed — an explicit foreign git dir beats the cwd" \
     || bad "T37: lock kept because a git on ANOTHER git dir stands in this repo's directory"
+  # The separate-argument form. Standing in the root, a git whose '--git-dir <p>' is not parsed would
+  # be attributed by its cwd and KEEP the lock — so a removal here is only possible if the space
+  # form is read as the explicit git dir it is.
+  lv_old "$L12/.git/index.lock"   # touch re-creates the lock T37 just removed, aged
+  lv_proc git "$L12" --git-dir "$LVR/lv12-other/.git" gc
+  count=$(_scan_repo "$L12"); lv_cleanup
+  [ ! -f "$L12/.git/index.lock" ] && ok "T37: lock removed — '--git-dir <OTHER>/.git' in the separate-argument form too" \
+    || bad "T37: lock kept under 'git --git-dir <OTHER>/.git' (space form) standing in the root — the form is not parsed"
 
   echo "T38: stale index.lock + 'git --git-dir=<root>/.repo.git' (a separate bare repo beside .git) → removed"
   L13="$LVR/lv13"; make_repo "$L13"; mkdir -p "$L13/.repo.git"
@@ -1241,6 +1354,9 @@ print(n)
     _t41_alive=0; ps -axo pid=,comm=,args= | awk '$2 == "git" && /commit f1/ { f = 1 } END { exit !f }' && _t41_alive=1
     if [ -f "$L16/.git/index.lock" ]; then
       ok "T41: lock kept — live 'git commit f1' in the repo"
+      lv_logged "$L16/.git/index.lock" 'git pid [0-9]+ cwd in repo' \
+        && ok "T41: kept by the process check (cwd in repo), the only signal that covers a parked editor" \
+        || bad "T41: kept, but not by 'git pid N cwd in repo' — the process check did not own this lock"
     elif [ "$_t41_alive" = 1 ]; then
       bad "T41: lock REMOVED under a live parked 'git commit <path>'"
     else
@@ -1262,10 +1378,17 @@ print(n)
   count=$(_scan_repo "$L17"); lv_cleanup
   [ -f "$L17/.git/index.lock" ] && ok "T42: lock kept — relative -C resolved against the cwd lands in the repo" \
     || bad "T42: lock REMOVED under a live 'git -C <relative>' that works in the repo"
+  lv_logged "$L17/.git/index.lock" 'git pid [0-9]+ -C resolves into repo' \
+    && ok "T42: kept by ITS branch (-C resolves into the repo; cwd and argv name nothing)" \
+    || bad "T42: no skipped_live event with reason '-C resolves into repo' for $L17/.git/index.lock"
+  : > "$LOG"
   lv_proc git "$LVR" -C lv17 -C sub status
   count=$(_scan_repo "$L17"); lv_cleanup
   [ -f "$L17/.git/index.lock" ] && ok "T42: lock kept — chained relative -C (-C lv17 -C sub) composes" \
     || bad "T42: lock REMOVED under a live 'git -C lv17 -C sub'"
+  lv_logged "$L17/.git/index.lock" 'git pid [0-9]+ -C resolves into repo' \
+    && ok "T42: chained form kept by ITS branch too" \
+    || bad "T42: chained -C kept, but not by '-C resolves into repo'"
 
   # T43: git applies -C BEFORE it reads a relative git dir, so `git -C <root> --git-dir=.git ...`
   # started from ANOTHER repo works on <root>/.git. Resolving the relative path against the process
@@ -1280,10 +1403,98 @@ print(n)
   else
     bad "T43: lock removed (or kept for another reason) under a live 'git -C <root> --git-dir=.git' run from another repo"
   fi
+  # The space form must be kept BY THE git-dir BRANCH. Without the `--git-dir <p>` parse the lock is
+  # still kept (-C <root> is an absolute argv token → "argv names repo"), so keeping alone proves
+  # nothing about the form — the reason is what shows the parse ran.
+  : > "$LOG"
   lv_proc git "$LVR/lv18-other" -C "$L18" --git-dir .git status
   count=$(_scan_repo "$L18"); lv_cleanup
-  [ -f "$L18/.git/index.lock" ] && ok "T43: lock kept — separate-argument form '--git-dir .git' too" \
-    || bad "T43: lock removed under a live 'git -C <root> --git-dir .git' run from another repo"
+  if [ -f "$L18/.git/index.lock" ] && lv_logged "$L18/.git/index.lock" 'git-dir is this repo'; then
+    ok "T43: lock kept by the git-dir branch — separate-argument form '--git-dir .git' too"
+  else
+    bad "T43: lock removed (or kept by another branch) under a live 'git -C <root> --git-dir .git' run from another repo"
+  fi
+
+  # T44: _is_stale reads the age, THEN probes (ps, lsof up to 10 s, per-pid ps), THEN the caller
+  # deletes. A lock removed and re-created by a new git while the probe ran is young again, and a
+  # lock that vanished is not ours to remove or to count. The probe stubs below do exactly that:
+  # they change the lock mid-probe and answer "no live process".
+  echo "T44: the lock is replaced (fresh) or gone by the time the probe finishes → not removed, not counted"
+  T44_LOCK=""
+  _t44_replace() { : > "$T44_LOCK"; return 1; }                  # a NEW git took the lock: age ~0
+  _t44_vanish()  { rm -f "$T44_LOCK"; return 1; }                # its owner finished and removed it
+  R44="$LVR/lv44"; make_repo "$R44"; T44_LOCK="$R44/.git/index.lock"
+  lv_old "$T44_LOCK"; : > "$LOG"
+  count=$(GIT_LOCK_PROCESS_CHECK_FN=_t44_replace _scan_repo "$R44" 2>/dev/null)
+  [ -f "$T44_LOCK" ] && ok "T44: the replaced (now fresh) lock was kept" \
+    || bad "T44: a lock that became FRESH during the probe was removed on the strength of the old age"
+  [ "$count" = "0" ] && ok "T44: removed count=0" || bad "T44: removed count=$count (expected 0)"
+  ! grep -qF '"event":"removed"' "$LOG" && ok "T44: no 'removed' event was written for it" \
+    || bad "T44: a 'removed' event was logged for a lock that was not stale any more"
+  lv_old "$T44_LOCK"; : > "$LOG"
+  count=$(GIT_LOCK_PROCESS_CHECK_FN=_t44_vanish _scan_repo "$R44" 2>/dev/null)
+  [ "$count" = "0" ] && ok "T44: a lock that vanished during the probe is not counted as removed" \
+    || bad "T44: removed count=$count for a lock that vanished during the probe (expected 0)"
+  ! grep -qF '"event":"removed"' "$LOG" && ok "T44: no 'removed' event for the vanished lock" \
+    || bad "T44: a 'removed' event was logged for a lock that vanished on its own"
+
+  # T45: what a sweep leaves alone is COUNTED, by its cause — the review's "fail-open must be visible
+  # AND counted". skipped_live = every aged item left alone; undetermined = the could-not-tell subset
+  # (a broken ps/lsof/timeout keeps EVERY aged lock, so it is the number to watch); stale_state =
+  # operation state reported but not removed. Counted from a flag, not from the reason's wording.
+  echo "T45: items left alone are tallied by cause (skipped_live / undetermined / stale_state)"
+  CF="$LVR/tally.txt"
+  _tally() { awk -v k="$1" '$0 == k { n++ } END { print n + 0 }' "$CF"; }
+  _t45() {   # _t45 <label> <skipped_live> <undetermined> <stale_state>
+    if [ "$(_tally skipped_live)" = "$2" ] && [ "$(_tally undetermined)" = "$3" ] && [ "$(_tally stale_state)" = "$4" ]; then
+      ok "T45: $1 → skipped_live=$2 undetermined=$3 stale_state=$4"
+    else
+      bad "T45: $1 → got skipped_live=$(_tally skipped_live) undetermined=$(_tally undetermined) stale_state=$(_tally stale_state); expected $2/$3/$4"
+    fi
+  }
+  R45="$LVR/lv45"; make_repo "$R45"; lv_old "$R45/.git/index.lock"
+  _GLH_COUNT_FILE="$CF"
+  : > "$CF"; count=$(GIT_LOCK_PROCESS_CHECK_FN=_yes_git_process _scan_repo "$R45" 2>/dev/null)
+  _t45 "a KNOWN live git (not a guess)" 1 0 0
+  : > "$CF"; count=$(PATH="$LVR/shim-ps-fail:$PATH" _scan_repo "$R45" 2>/dev/null)
+  _t45 "ps fails — the broken-ps case that keeps every lock" 1 1 0
+  : > "$CF"; count=$(GIT_LOCK_PROCESS_CHECK_FN=_no_git_process PATH="$LVR/shim-lsof-124:$PATH" _scan_repo "$R45" 2>/dev/null)
+  _t45 "lsof times out asking who holds the lock" 1 1 0
+  lv_proc git / -C "$LVR/somewhere-else" status
+  : > "$CF"; count=$(PATH="$LVR/shim-lsof-124:$PATH" _scan_repo "$R45" 2>/dev/null); lv_cleanup
+  _t45 "a git is alive and lsof times out reading cwds" 1 1 0
+  R45S="$LVR/lv45s"; make_repo "$R45S"; lv_old "$R45S/.git/MERGE_HEAD"
+  : > "$CF"; count=$(GIT_LOCK_PROCESS_CHECK_FN=_no_git_process _scan_repo "$R45S" 2>/dev/null)
+  _t45 "an aged MERGE_HEAD on a quiet repo" 0 0 1
+  : > "$CF"; count=$(_scan_repo "$R45" 2>/dev/null)
+  _t45 "control — healthy ps/lsof, the lock is removed, nothing tallied" 0 0 0
+  _GLH_COUNT_FILE=""
+
+  # T46: the sweep's own summary line carries the tallies — the one place an operator or a watchdog
+  # looks. Run the real script as a sweep over scratch roots (caller-set GIT_LOCK_RIG_ROOTS: no gc).
+  echo "T46: the sweep summary event reports removed / skipped_live / undetermined / stale_state"
+  SW_LOG="$LVR/sweep.jsonl"
+  _sweep_line() {   # _sweep_line <root> [PATH prefix] — the last sweep event the script wrote
+    : > "$SW_LOG"
+    env -u GIT_LOCK_PROCESS_CHECK_FN GIT_LOCK_LOG="$SW_LOG" GIT_LOCK_RIG_ROOTS="$1" GIT_LOCK_ENABLED=1 \
+        GIT_LOCK_DRY_RUN=0 NOTIFY_BIN=/nonexistent PATH="${2:+$2:}$PATH" bash "$_GLH_SELF" >/dev/null 2>&1
+    grep -F '"event":"sweep"' "$SW_LOG" | tail -1
+  }
+  R46="$LVR/lv46"; make_repo "$R46"; lv_old "$R46/.git/index.lock"
+  line=$(_sweep_line "$R46" "$LVR/shim-ps-fail")
+  case "$line" in
+    *'"removed":0,"skipped_live":1,"undetermined":1,"stale_state":0,'*) ok "T46: broken ps → removed=0 skipped_live=1 undetermined=1 (the lock was kept, and the sweep says why)" ;;
+    *) bad "T46: broken-ps sweep summary lacks the tallies: ${line:-<no sweep event>}" ;;
+  esac
+  [ -f "$R46/.git/index.lock" ] && ok "T46: the lock survived the blind sweep" || bad "T46: the lock was removed by a sweep that could not tell"
+  R46B="$LVR/lv46b"; make_repo "$R46B"; lv_old "$R46B/.git/index.lock"; lv_old "$R46B/.git/MERGE_HEAD"
+  line=$(_sweep_line "$R46B")
+  case "$line" in
+    *'"removed":1,"skipped_live":0,"undetermined":0,"stale_state":1,'*) ok "T46: healthy sweep → removed=1 (the lock) stale_state=1 (the MERGE_HEAD, reported)" ;;
+    *) bad "T46: healthy sweep summary wrong: ${line:-<no sweep event>}" ;;
+  esac
+  [ ! -f "$R46B/.git/index.lock" ] && [ -f "$R46B/.git/MERGE_HEAD" ] \
+    && ok "T46: lock removed, MERGE_HEAD left in place" || bad "T46: wrong files survived the healthy sweep"
   export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"   # restore the stub the mutex tests below expect
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
@@ -1358,8 +1569,8 @@ if [ "$ENABLED" != "1" ]; then
 fi
 
 total_removed=0
-total_skipped=0
 repos_scanned=0
+_GLH_COUNT_FILE="$(mktemp "${TMPDIR:-/tmp}/glh-sweep-counts.XXXXXX" 2>/dev/null)" || _GLH_COUNT_FILE=""
 
 IFS=':' read -ra ROOTS <<< "$GIT_LOCK_RIG_ROOTS"
 for root in "${ROOTS[@]}"; do
@@ -1370,7 +1581,19 @@ for root in "${ROOTS[@]}"; do
   total_removed=$(( total_removed + n ))
 done
 
-_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
+# How many aged items were left alone, and why: "skipped_live" = a live git / held lock / could not
+# tell; "undetermined" = the could-not-tell subset (a broken ps/lsof/timeout keeps EVERY aged lock, so
+# this is the number to watch); "stale_state" = operation state reported but not removed. null =
+# the tally file could not be made, i.e. unknown — never 0.
+_glh_tally() {
+  if [ -n "$_GLH_COUNT_FILE" ] && [ -e "$_GLH_COUNT_FILE" ]; then
+    awk -v k="$1" '$0 == k { n++ } END { print n + 0 }' "$_GLH_COUNT_FILE" 2>/dev/null || echo null
+  else
+    echo null
+  fi
+}
+_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"skipped_live\":$(_glh_tally skipped_live),\"undetermined\":$(_glh_tally undetermined),\"stale_state\":$(_glh_tally stale_state),\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
+[ -n "$_GLH_COUNT_FILE" ] && rm -f "$_GLH_COUNT_FILE"
 
 # Notify only when locks were actually removed (signals a real heal event)
 if [ "$total_removed" -gt 0 ] && [ "$DRY_RUN" = "0" ] && [ -x "$NOTIFY_BIN" ]; then
