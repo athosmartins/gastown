@@ -48,11 +48,20 @@
 #   E17 o ROTEAMENTO: o notify de verdade (NOTIFY_ROUTE_TEST=1) diz onde cai cada aviso. O padrao do
 #       notify e o digest SILENCIOSO; so o aviso de alarme (noite pulada, N noites seguidas) vai com
 #       NOTIFY_FORCE_PUSH, o aviso de rotina nao. (Nas rodadas E3/E15 tambem.)
+#   E19 o guard de envio em voo roda como o USUARIO (`sudo -u`, igual ao notify_athos), nao como root (gate
+#       ga-iwyczc); um sudo que nao consegue rodar o guard e "nao deu pra olhar", nunca "envio em voo"
+#   E20 soltar a cidade a mao (gate ga-iwyczc): com o script VIVO o `rm` do sinal e desfeito pelo proximo
+#       carimbo; o que solta e o TERM (e o runbook/quiet-hours-check.sh dizem exatamente isso — este cenario
+#       e o que impede essa frase de virar mentira de novo)
 #
-# CARGA: este arquivo roda no gate, numa maquina com load 56-88. Nenhuma asserção pode depender de
-# um orcamento de tempo "folgado o bastante": onde o resultado depende do relogio, ou o cenario da
-# folga de verdade (E9: orcamento 40s para ~10s de uso) ou ele e montado para dar o MESMO resultado
-# com qualquer carga (E9c: orcamento == prazo da sonda; E9d: so o bd do rig pendura).
+# CARGA: este arquivo roda no gate, numa maquina com load 56-99. Nenhuma asserção pode depender de
+# a maquina estar quieta ou lenta naquele minuto. Duas regras, e a segunda e a que falhou duas vezes:
+#   1. onde o resultado depende do relogio, o cenario e montado pra dar o MESMO resultado com qualquer
+#      carga (E9c: orcamento == prazo da sonda, carga so atrasa o relogio; E9d: so o bd do rig pendura);
+#   2. toda sonda que o cenario AFIRMA ter respondido ("guard2: ok", "guard3: ok") roda com um prazo MUITO
+#      acima do que ela leva sob carga (PROBE_OK_SECS=15; a sonda leva 1-2s em load ~95) E o fake dela
+#      demora W_PROBE_SLOW=3s de proposito — o dobro do prazo que reprovou o gate. So quem deve PENDURAR
+#      fica com prazo curto, e so se nenhuma asserção do cenario exigir resposta de uma sonda (E9c).
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$SELF_DIR/nightly-reboot.sh"
@@ -76,8 +85,15 @@ case "$1" in
   *) exec /bin/date "$@" ;;
 esac
 EOF
+# sudo de mentira (nunca escala): registra cada chamada em $FAKE_SUDO_LOG (E19 le dai QUEM o script
+# disse que rodaria o guard de envio) e, com FAKE_SUDO_FAIL_MATCH=<trecho>, falha com a mensagem e o rc 1
+# do sudo de verdade pra qualquer chamada que contenha o trecho (E19b: sudo que nao consegue rodar)
 cat > "$FAKEBIN/sudo" <<'EOF'
 #!/usr/bin/env bash
+[ -n "${FAKE_SUDO_LOG:-}" ] && echo "$*" >> "$FAKE_SUDO_LOG"
+if [ -n "${FAKE_SUDO_FAIL_MATCH:-}" ]; then
+  case "$*" in *"$FAKE_SUDO_FAIL_MATCH"*) echo "sudo: unknown user: ${2:-?}" >&2; exit 1 ;; esac
+fi
 [ "$1" = "-u" ] && shift 2
 exec "$@"
 EOF
@@ -101,7 +117,20 @@ chmod +x "$FAKEBIN/date" "$FAKEBIN/sudo" "$FAKEBIN/sleep" "$FAKEBIN/mv"
 real_boot_epoch() {
   /usr/sbin/sysctl -n kern.boottime | awk '{for (i = 1; i <= NF; i++) if ($i == "sec") { v = $(i+2); gsub(/[^0-9]/, "", v); print v; exit } }'
 }
-REAL_BOOT="$(real_boot_epoch)"
+# boot_matches <valor lido do arquivo do script>: o boot-epoch gravado e o DESTE boot? A comparacao e feita
+# com o kern.boottime lido AGORA, com 2s de tolerancia — nao com um valor guardado no inicio da suite: o `sec`
+# do kern.boottime NAO e constante (nesta maquina andou 1s ~25min depois de um boot, ajuste de relogio), e
+# uma suite de 5-12min sob carga comparava o carimbo do script com um valor ja velho (E6/E9/E13 reprovaram
+# com nada errado no script — uma asserção que depende do ambiente, a mesma classe do E9). Um boot ERRADO
+# (0, os microssegundos do bug do `usec`, o boot anterior) erra por muito mais que 2s e continua reprovando.
+boot_matches() {
+  local got="$1" now d
+  now="$(real_boot_epoch)"
+  case "$got" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  d=$(( got - now )); [ "$d" -lt 0 ] && d=$(( -d ))
+  [ "$d" -le 2 ]
+}
 
 # ── world: um diretorio novo por cenario, com todos os fakes ────────────────
 # Variaveis de ambiente do cenario (todas opcionais, default = "tudo livre"):
@@ -118,6 +147,10 @@ REAL_BOOT="$(real_boot_epoch)"
 #   W_SENDER_SEQ   "0 1 0" = rc do fake de envio por NUMERO DA CHAMADA (a ultima repete)
 #   W_RIG          1 = cria um rig com .beads em $CITY, pro laco de contagem por rig (default 0)
 #   W_SHUTDOWN_RC  rc do fake de shutdown            (default 0)
+#   W_PROBE_SLOW   N = toda sonda que RESPONDE (o gate-queue-composition do guard 2, cada chamada de bd que nao
+#                  pendura) demora N segundos antes de responder (default 0). E o que uma maquina em load 60-99
+#                  faz com a sonda, so que DETERMINISTICO: a suite deixa de depender de a maquina estar lenta
+#                  naquele minuto pra provar que "respondeu devagar" nao vira "TIMED OUT" (E9/E9d).
 new_world() {
   W="$TMP/$1"; rm -rf "$W"; mkdir -p "$W/city/.gc/logs" "$W/city/scripts" "$W/rodada" "$W/run"
   CITY="$W/city"; LOGF="$CITY/.gc/logs/nightly-reboot.log"
@@ -125,12 +158,15 @@ new_world() {
   DRAIN="$W/run/city-drain.level"; PENDING="$CITY/.gc/logs/nightly-reboot.pending"
   SHUT="$W/shutdown.calls"; DRAIN_AT_SHUT="$W/drain-at-shutdown"; PEND_AT_SHUT="$W/pending-at-shutdown"
   DRAIN_AT_SENDER="$W/drain-at-sender"; GC_CALLS="$W/gc.calls"; NOTIFY_CALLS="$W/notify.calls"
-  NOTIFY_FORCE="$W/notify.force"; NOTIFY_ROUTES="$W/notify.routes"
-  : > "$SHUT"; : > "$GC_CALLS"; : > "$NOTIFY_CALLS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"
+  NOTIFY_FORCE="$W/notify.force"; NOTIFY_ROUTES="$W/notify.routes"; SUDO_CALLS="$W/sudo.calls"
+  : > "$SHUT"; : > "$GC_CALLS"; : > "$NOTIFY_CALLS"; : > "$NOTIFY_FORCE"; : > "$NOTIFY_ROUTES"; : > "$SUDO_CALLS"
   [ "${W_RIG:-0}" = "1" ] && mkdir -p "$CITY/rigx/.beads"
 
+  # a linha de "demora" so existe quando o cenario pediu (W_PROBE_SLOW): nenhum fork a mais nos outros
+  SLOWLINE=""; [ "${W_PROBE_SLOW:-0}" -gt 0 ] && SLOWLINE="/bin/sleep ${W_PROBE_SLOW}"
   cat > "$CITY/scripts/gate-queue-composition.sh" <<EOF
 #!/usr/bin/env bash
+${SLOWLINE}
 echo '{"total":${W_GATE_REAL:-0},"real":${W_GATE_REAL:-0},"phantom":0,"unknown":0}'
 EOF
   cat > "$W/bd" <<EOF
@@ -138,6 +174,7 @@ EOF
 if [ "${W_BD_HANG:-0}" = "1" ]; then echo \$\$ >> "$W/bd.pids"; exec /bin/sleep 600; fi
 if [ "${W_BD_HANG:-0}" = "2" ]; then echo \$\$ >> "$W/bd.pids"; trap '' TERM; while :; do /bin/sleep 1; done; fi
 if [ "${W_BD_HANG_RIG:-0}" = "1" ] && [ "\$1" = "-C" ] && [ "\$2" != "$CITY" ]; then echo \$\$ >> "$W/bd.pids"; exec /bin/sleep 600; fi
+${SLOWLINE}
 case "\$3" in
   list)
     if [ "${W_HQ_BUSY:-0}" = "1" ]; then
@@ -212,7 +249,7 @@ nr_env() {
           SHUTDOWN_BIN="$W/shutdown" SOFTWAREUPDATE_BIN="$W/softwareupdate" SCRAPER_RODADA_DIR="$W/rodada"
           NIGHTLY_REBOOT_DRAIN_FILE="$DRAIN" NIGHTLY_REBOOT_DRAIN_WAIT_SECS=0
           NIGHTLY_REBOOT_SAFETY_RETRY_INTERVAL=0 NIGHTLY_REBOOT_SAFETY_MAX_ATTEMPTS=3
-          NIGHTLY_REBOOT_SENDER_SAFE_PY="$SENDER" NIGHTLY_REBOOT_PGREP_BIN="$W/pgrep"
+          NIGHTLY_REBOOT_SENDER_SAFE_PY="$SENDER" NIGHTLY_REBOOT_PGREP_BIN="$W/pgrep" FAKE_SUDO_LOG="$SUDO_CALLS"
           NIGHTLY_REBOOT_RETRY_INTERVAL=0 NIGHTLY_REBOOT_RETRY_MAX_ATTEMPTS=2 )
 }
 # run_nr [VAR=val ...] — roda o script de verdade, tudo faked e a hora pinada. Tem um limite
@@ -288,7 +325,7 @@ run_nr FAKE_HOUR=23
 if [ -f "$DRAIN_AT_SHUT" ]; then
   S="$(sed -n 1p "$DRAIN_AT_SHUT")"; WR="$(sed -n 2p "$DRAIN_AT_SHUT")"; BT="$(sed -n 3p "$DRAIN_AT_SHUT")"; UN="$(sed -n 4p "$DRAIN_AT_SHUT")"
   [ "$S" = "DRAIN" ] && ok "E2 linha 1 = DRAIN" || bad "E2 linha 1 deveria ser DRAIN, veio '$S'"
-  [ "$BT" = "$REAL_BOOT" ] && ok "E2 boot-epoch = kern.boottime real ($BT)" || bad "E2 boot-epoch deveria ser $REAL_BOOT, veio '$BT'"
+  boot_matches "$BT" && ok "E2 boot-epoch = kern.boottime real ($BT)" || bad "E2 boot-epoch deveria ser ~$(real_boot_epoch), veio '$BT'"
   NOWE=$(/bin/date +%s)
   [ "$UN" -gt "$NOWE" ] 2>/dev/null && ok "E2 teto (until) no futuro" || bad "E2 until deveria estar no futuro: '$UN'"
 else
@@ -364,7 +401,7 @@ echo "E6: arquivo de pendencia + janelas do Guard 1"
 new_world e6; run_nr FAKE_HOUR=23
 if [ -f "$PEND_AT_SHUT" ]; then
   grep -q '^mode=drain' "$PEND_AT_SHUT" && ok "E6 pendencia: mode=drain" || bad "E6 pendencia sem mode=drain"
-  grep -q "^boot_before=$REAL_BOOT" "$PEND_AT_SHUT" && ok "E6 pendencia: boot_before = boot real" || bad "E6 pendencia sem boot_before correto"
+  boot_matches "$(sed -n 's/^boot_before=//p' "$PEND_AT_SHUT" | head -1)" && ok "E6 pendencia: boot_before = boot real" || bad "E6 pendencia sem boot_before correto: '$(grep '^boot_before=' "$PEND_AT_SHUT" | head -1)' (boot real ~$(real_boot_epoch))"
   grep -q '^issued=[0-9]\{10\}' "$PEND_AT_SHUT" && ok "E6 pendencia: issued=<epoch>" || bad "E6 pendencia sem issued"
 else
   bad "E6 pendencia ausente quando o shutdown foi chamado (precisa existir ANTES)"
@@ -452,19 +489,30 @@ fi
 # nao dispara a proxima noite enquanto esta instancia "roda". Os fakes de bd responderem
 # na hora (E1/E4) escondia isto: aqui o bd PENDURA.
 echo "E9: bd pendurado (Dolt wedged) -> as chamadas informativas tem prazo e o reboot sai assim mesmo"
-# Orcamento de 40s para ~10s de uso (sonda de 2s): a folga e REAL mesmo em load 60-90. A versao anterior
-# dava 6s ao orcamento; em load 58 so os guards 2/3/4 ja o gastavam, a linha do laco por rig saia
-# "NOT ATTEMPTED" e o teste reportava "laco sem prazo" — o script estava certo, o TESTE dependia da carga
-# (gate FAIL 2/3). Por isso a linha do rig aceita TIMED OUT ou NOT ATTEMPTED aqui (o que nao pode e
-# faltar, nem pendurar); os dois estados exatos tem cenario proprio, montado pra nao depender da carga:
-# E9c (NOT ATTEMPTED) e E9d (TIMED OUT).
-W_BD_HANG=1 W_RIG=1 new_world e9
+# PRAZO DE QUEM DEVE RESPONDER (gate FAIL 2/3 e 4/4 — a mesma classe, duas vezes). Este cenario afirma que a
+# sonda do guard 2 (o gate respondeu) diz "ok" enquanto a do guard 3 (bd pendurado) diz "TIMED OUT". Uma
+# afirmacao dessas so e sobre o SCRIPT se a sonda que responde tem um prazo MUITO acima do tempo de parede
+# que ela leva na maquina mais carregada onde a suite roda. Com prazo de 2s ela nao tinha: a sonda do guard 2
+# (um script + dois python3) leva 1-2s em load ~95, o gate a matava e o log dizia "unknown TIMED OUT after 2s"
+# em vez de "ok" — uma asserção diferente reprovava a cada rodada (E9 guard2, depois E9d guard3), e um
+# verde nao distinguia "a sonda respondeu" de "a maquina estava quieta". Agora o prazo e PROBE_OK_SECS (15s)
+# e a sonda que responde demora W_PROBE_SLOW=3s DE PROPOSITO — o dobro do prazo antigo: o cenario so passa se
+# uma resposta lenta continuar "ok", com a maquina quieta ou nao, e reprova se alguem voltar o prazo a 2s.
+# Quem PENDURA (o bd, 600s) gasta o prazo inteiro, entao cada sonda pendurada custa PROBE_OK_SECS: por isso
+# o orcamento (PROBE_OK_BUDGET, 100s) e o limite de tempo abaixo sao medidos em prazos, nao em segundos magicos.
+# O limite de tempo e LARGO de proposito (orcamento + 150s, bem abaixo dos 600s de um bd sem prazo): uma sonda
+# pendurada custa o prazo MAIS o atraso de cada `sleep 1`/fork do laco de vigia, e sob load 55-67 o E9 levou 89s
+# contra 49s com a maquina em load ~35. Um limite apertado aqui reprovaria por carga, nao por defeito.
+# A linha do laco por rig aceita TIMED OUT ou NOT ATTEMPTED aqui (o que nao pode e faltar, nem pendurar); os
+# dois estados exatos tem cenario proprio: E9c (NOT ATTEMPTED) e E9d (TIMED OUT).
+PROBE_OK_SECS=15; PROBE_OK_BUDGET=100
+W_BD_HANG=1 W_RIG=1 W_PROBE_SLOW=3 new_world e9
 T0=$(/bin/date +%s)
-NR_LIMIT=90 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=40
+NR_LIMIT=300 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=$PROBE_OK_SECS NIGHTLY_REBOOT_INFO_BUDGET_SECS=$PROBE_OK_BUDGET
 T1=$(/bin/date +%s)
-[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E9 o script terminou sozinho em $((T1-T0))s (nao pendurou)" || bad "E9 o script PENDUROU ate o limite de 90s — com Dolt wedged o reboot nunca sai. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E9 o script terminou sozinho em $((T1-T0))s (nao pendurou)" || bad "E9 o script PENDUROU ate o limite de 300s — com Dolt wedged o reboot nunca sai. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
 rebooted && ok "E9 reboot emitido (shutdown -r now) com o bd pendurado" || bad "E9 NAO reiniciou com o bd pendurado. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
-[ $((T1-T0)) -le 60 ] && ok "E9 dentro do limite (${T0}->${T1} = $((T1-T0))s <= 60s; sem prazo seriam 600s)" || bad "E9 demorou $((T1-T0))s"
+[ $((T1-T0)) -le $((PROBE_OK_BUDGET+150)) ] && ok "E9 dentro do limite (${T0}->${T1} = $((T1-T0))s <= $((PROBE_OK_BUDGET+150))s; sem prazo seriam 600s — medido: 49s com a maquina em load ~35, 89s em load 55-67)" || bad "E9 demorou $((T1-T0))s (> $((PROBE_OK_BUDGET+150))s: o orcamento informativo nao esta limitando)"
 log_has "safety guards OK" && ok "E9 os guards de seguranca decidiram (nao foi o bd)" || bad "E9 sem 'safety guards OK' no log"
 log_has "informational: guard3 hq-in-progress: unknown TIMED OUT" && ok "E9 guard3 (usa bd): 'unknown TIMED OUT' no log — nem 'ok', nem silencio" || bad "E9 guard3 sem a linha TIMED OUT. informational: $(grep 'informational' "$LOGF" 2>/dev/null | tr '\n' '|')"
 log_has "informational: guard2 gate-markers: ok" && ok "E9 guard2 (o gate respondeu): continua 'ok' — os tres estados nao colapsam" || bad "E9 guard2 deveria dizer ok, o gate respondeu"
@@ -472,13 +520,17 @@ log_has "other rigs' in_progress counts (TIMED OUT|NOT ATTEMPTED)" && ok "E9 o l
 SNAP="$(ls "$CITY"/.gc/logs/nightly-reboot-pre-*.txt 2>/dev/null | head -1)"
 if [ -n "$SNAP" ]; then grep -q "TIMED OUT" "$SNAP" && ok "E9 o snapshot registra que NAO deu pra ler (unknown), em vez de omitir" || bad "E9 snapshot sem a linha TIMED OUT"; else bad "E9 snapshot nao gerado"; fi
 # o shutdown "pegou" (rc 0): o sinal FICA — o boot-epoch dele e o que invalida depois do reboot (E13)
-[ -f "$DRAIN" ] && [ "$(sed -n 3p "$DRAIN" 2>/dev/null)" = "$REAL_BOOT" ] && ok "E9 reboot aceito (rc 0): o sinal de dreno ficou no disco com o boot-epoch deste boot (o reboot e quem o invalida)" || bad "E9 depois de um shutdown aceito o sinal deveria estar no disco com o boot $REAL_BOOT: '$(cat "$DRAIN" 2>/dev/null | tr '\n' '|')'"
+[ -f "$DRAIN" ] && boot_matches "$(sed -n 3p "$DRAIN" 2>/dev/null)" && ok "E9 reboot aceito (rc 0): o sinal de dreno ficou no disco com o boot-epoch deste boot (o reboot e quem o invalida)" || bad "E9 depois de um shutdown aceito o sinal deveria estar no disco com o boot ~$(real_boot_epoch): '$(cat "$DRAIN" 2>/dev/null | tr '\n' '|')'"
 [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E9 nenhum bd pendurado sobrou vivo (a arvore inteira foi morta no prazo)" || bad "E9 sobraram $(pids_alive "$W/bd.pids") bd pendurados vivos"
 kill_pids "$W/bd.pids"
 
 # E9c: orcamento == prazo da sonda e todo bd pendura. A 1a sonda que toca o bd gasta o orcamento INTEIRO
 # (o prazo dela e min(sonda, o que resta) e ela so volta quando o relogio chega la), entao o que vem
 # depois nao cabe — com QUALQUER carga: carga so atrasa o relogio, nunca o adianta.
+# E o unico cenario que mantem o prazo CURTO (2s) — de proposito, e e seguro porque NENHUMA asserção daqui
+# exige que uma sonda RESPONDA: o guard 2 pode sair "ok" ou "TIMED OUT" e o cenario nao olha; o que ele olha
+# (guard 3 com motivo, guard 4/rig "NOT ATTEMPTED", nada vivo) vale com a maquina quieta ou saturada. Prazo
+# curto so e pra quem deve PENDURAR; quem deve responder usa PROBE_OK_SECS (E9, E9d).
 echo "E9c: orcamento informativo esgotado -> o que nao coube e dito 'NOT ATTEMPTED' (unknown), nunca omitido"
 W_BD_HANG=1 W_RIG=1 new_world e9c
 NR_LIMIT=90 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=2
@@ -490,15 +542,17 @@ log_has "other rigs' in_progress counts NOT ATTEMPTED" && ok "E9c contagem por r
 [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E9c nenhum bd pendurado sobrou vivo" || bad "E9c sobraram bd pendurados vivos"
 kill_pids "$W/bd.pids"
 
-# E9d: so o `bd -C <rig>` pendura; o do HQ responde. A sonda por rig RODA (ha folga de sobra no orcamento)
-# e estoura o prazo: este e o cenario que prova o prazo do laco por rig sem depender de sorte.
+# E9d: so o `bd -C <rig>` pendura; o do HQ responde (devagar, W_PROBE_SLOW=3s por chamada: o guard 3 faz duas).
+# A sonda por rig RODA e estoura o prazo: este e o cenario que prova o prazo do laco por rig sem depender de
+# sorte. Quem responde (guard 2, guard 3) tem PROBE_OK_SECS de prazo — a classe do E9 — e o orcamento (120s) e
+# folgado o bastante (as que respondem gastam ~12s) pra o laco por rig SEMPRE ter o prazo cheio.
 echo "E9d: so o bd do RIG pendura -> a sonda por rig roda e estoura o prazo (TIMED OUT)"
-W_BD_HANG_RIG=1 W_RIG=1 new_world e9d
-NR_LIMIT=90 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=40
+W_BD_HANG_RIG=1 W_RIG=1 W_PROBE_SLOW=3 new_world e9d
+NR_LIMIT=300 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=$PROBE_OK_SECS NIGHTLY_REBOOT_INFO_BUDGET_SECS=120
 [ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E9d o script terminou sozinho" || bad "E9d o script pendurou no bd do rig"
 rebooted && ok "E9d reboot emitido com o bd do rig pendurado" || bad "E9d NAO reiniciou. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
 log_has "informational: guard3 hq-in-progress: ok" && ok "E9d o bd do HQ respondeu: guard3 'ok' (so o rig esta mudo)" || bad "E9d guard3 deveria dizer ok. informational: $(grep 'informational' "$LOGF" 2>/dev/null | tr '\n' '|')"
-log_has "other rigs' in_progress counts TIMED OUT after 2s" && ok "E9d o laco por rig RODOU e estourou o prazo de 2s (TIMED OUT no log)" || bad "E9d laco por rig sem TIMED OUT. info: $(grep 'info:' "$LOGF" 2>/dev/null | tr '\n' '|')"
+log_has "other rigs' in_progress counts TIMED OUT after ${PROBE_OK_SECS}s" && ok "E9d o laco por rig RODOU e estourou o prazo de ${PROBE_OK_SECS}s (TIMED OUT no log)" || bad "E9d laco por rig sem TIMED OUT after ${PROBE_OK_SECS}s. info: $(grep 'info:' "$LOGF" 2>/dev/null | tr '\n' '|')"
 [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E9d o bd do rig pendurado foi morto no prazo" || bad "E9d sobraram bd do rig vivos"
 kill_pids "$W/bd.pids"
 
@@ -653,7 +707,7 @@ log_has "reboot did NOT happen" && bad "E13 rc=0: o log diz ERROR 'reboot did NO
 # gate-fix 3: o EXIT trap soltava o dreno tambem no rc 0, segundos antes da maquina cair — um despachante
 # podia admitir trabalho que o reboot mata. O sinal fica; o boot-epoch dele e o que o invalida depois.
 [ -f "$DRAIN" ] && ok "E13 shutdown rc=0 -> sinal de dreno FICA (a cidade nao volta a admitir trabalho segundos antes de cair)" || bad "E13 o sinal de dreno foi removido num shutdown aceito (rc 0): os despachantes voltariam a admitir trabalho que o reboot mata"
-[ "$(sed -n 3p "$DRAIN" 2>/dev/null)" = "$REAL_BOOT" ] && ok "E13 rc=0: o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13 rc=0: boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado $REAL_BOOT)"
+boot_matches "$(sed -n 3p "$DRAIN" 2>/dev/null)" && ok "E13 rc=0: o sinal que ficou leva o boot-epoch DESTE boot (no proximo boot os leitores o ignoram)" || bad "E13 rc=0: boot-epoch do sinal = '$(sed -n 3p "$DRAIN" 2>/dev/null)' (esperado ~$(real_boot_epoch))"
 log_has "drain signal is left in place" && ok "E13 rc=0: o log diz que o sinal foi deixado de proposito" || bad "E13 rc=0: o log nao diz o que aconteceu com o sinal"
 
 # ═══ E14: contador do scraper + mail pendurado ═══════════════════════════════
@@ -670,7 +724,7 @@ fi
 # 2a noite seguida + gc que PENDURA: o mail tem prazo, o reboot sai, o log diz que NAO foi enviado
 W_SCRAPER=1 W_GC_HANG=1 new_world e14b; printf '1\n' > "$CITY/.gc/logs/nightly-reboot.scraper-cut.streak"
 T0=$(/bin/date +%s)
-NR_LIMIT=40 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=6
+NR_LIMIT=120 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=6   # 18s medido em load 55-67; o limite so decide quando um script PENDURADO e reprovado
 T1=$(/bin/date +%s)
 [ "${NR_TIMED_OUT:-0}" = "0" ] && rebooted && ok "E14 gc pendurado: o reboot saiu mesmo assim ($((T1-T0))s)" || bad "E14 gc pendurado travou o reboot (timed_out=${NR_TIMED_OUT:-0})"
 log_has "alarm mail to mayor TIMED OUT" && ok "E14 o log diz que o aviso NAO foi enviado (TIMED OUT)" || bad "E14 sem registro do mail que estourou o prazo. alarm: $(grep -i 'alarm' "$LOGF" 2>/dev/null | tr '\n' '|')"
@@ -752,11 +806,11 @@ assert_push "E16b aviso de noite pulada" "Reboot noturno pulado"
 echo "E18: bd que IGNORA o TERM -> TERM, folga, KILL; o reboot sai e a arvore morre"
 W_BD_HANG=2 W_RIG=1 new_world e18a
 T0=$(/bin/date +%s)
-NR_LIMIT=90 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=40 NIGHTLY_REBOOT_KILL_GRACE_SECS=1
+NR_LIMIT=200 run_nr FAKE_HOUR=23 NIGHTLY_REBOOT_INFO_PROBE_TIMEOUT_SECS=2 NIGHTLY_REBOOT_INFO_BUDGET_SECS=40 NIGHTLY_REBOOT_KILL_GRACE_SECS=1
 T1=$(/bin/date +%s)
-[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E18 o script terminou sozinho em $((T1-T0))s com um bd que ignora o TERM (nao pendurou)" || bad "E18 o script PENDUROU ate o limite de 90s: o prazo era um TERM so, e o bd o ignora. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
+[ "${NR_TIMED_OUT:-0}" = "0" ] && ok "E18 o script terminou sozinho em $((T1-T0))s com um bd que ignora o TERM (nao pendurou)" || bad "E18 o script PENDUROU ate o limite de 200s: o prazo era um TERM so, e o bd o ignora. ultimo log: $(tail -1 "$LOGF" 2>/dev/null)"
 rebooted && ok "E18 reboot emitido com o bd que ignora o TERM" || bad "E18 NAO reiniciou. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
-[ $((T1-T0)) -le 60 ] && ok "E18 dentro do limite ($((T1-T0))s <= 60s)" || bad "E18 demorou $((T1-T0))s"
+[ $((T1-T0)) -le 150 ] && ok "E18 dentro do limite ($((T1-T0))s <= 150s; sem KILL seria pra sempre — medido: 20s em load 55-67, 36s em load 81)" || bad "E18 demorou $((T1-T0))s (> 150s)"
 log_has "informational: guard3 hq-in-progress: unknown TIMED OUT" && ok "E18 o log diz 'unknown TIMED OUT' (nem 'ok', nem silencio)" || bad "E18 sem a linha TIMED OUT. informational: $(grep 'informational' "$LOGF" 2>/dev/null | tr '\n' '|')"
 [ "$(pids_alive "$W/bd.pids")" = "0" ] && ok "E18 o bd que ignorava o TERM foi KILLed (nenhum sobrou vivo)" || bad "E18 sobraram $(pids_alive "$W/bd.pids") bd que ignoram o TERM vivos"
 kill_pids "$W/bd.pids"
@@ -780,6 +834,59 @@ else
 fi
 wait "$NRPID" 2>/dev/null
 kill_pids "$W/bd.pids"
+
+# ═══ E19: o guard de envio roda como o USUARIO, nao como root ═════════════════
+# nightly-reboot.sh e um LaunchDaemon root. central_sender_restart_safe.py abre a fila SQLite do sender (WAL,
+# mode=ro) e importa modulos irmaos: como root pode deixar -shm/-wal e .pyc de root ao lado de arquivos do athos
+# (gate ga-iwyczc, achado medio — risco nao reproduzido la, entao aqui prova-se o que o SCRIPT faz: chama o guard
+# por `sudo -u <usuario>`, como o notify_athos). O sudo de mentira registra cada chamada, entao da pra provar QUEM
+# o script disse que rodaria o guard sem ser root de verdade.
+echo "E19: o guard de envio em voo roda via sudo -u <usuario>; sudo que falha NAO vira 'envio em voo'"
+new_world e19a
+run_nr FAKE_HOUR=23
+rebooted && ok "E19 envio livre: o reboot sai (o caminho por sudo nao mudou o veredito 0 = seguro)" || bad "E19 envio livre mas NAO reiniciou. ultimo log: $(tail -2 "$LOGF" 2>/dev/null | tr '\n' '|')"
+grep -qF -- "-u ${USER} /usr/bin/python3 ${SENDER}" "$SUDO_CALLS" && ok "E19 o guard de envio foi chamado por 'sudo -u ${USER}' (nao direto, como root)" || bad "E19 o guard de envio NAO passou por sudo -u ${USER}. chamadas de sudo: $(tr '\n' '|' < "$SUDO_CALLS")"
+
+# um envio de verdade em voo (rc 1 do script) continua sendo dito 'envio em voo' pelo caminho novo
+W_SENDER_RC=1 new_world e19c
+run_nr FAKE_HOUR=23
+! rebooted && ok "E19 envio em voo (rc 1 atraves do sudo): NAO reinicia" || bad "E19 reiniciou com um envio em voo"
+log_has "central_sender send in flight" && ok "E19 envio em voo: o log diz 'send in flight'" || bad "E19 envio em voo sem a linha 'send in flight'. log: $(tail -3 "$LOGF" 2>/dev/null | tr '\n' '|')"
+
+# o proprio sudo falha (usuario desconhecido, sem regra no sudoers): sai com rc 1 — o MESMO rc do "envio em voo".
+# Os dois seguram o reboot, mas so um e um envio: o outro e "nao consegui olhar".
+new_world e19b
+run_nr FAKE_HOUR=23 FAKE_SUDO_FAIL_MATCH=sender_safe
+! rebooted && ok "E19 sudo que nao roda o guard: NAO reinicia (nao deu pra olhar = nao seguro)" || bad "E19 reiniciou sem conseguir rodar o guard de envio"
+log_has "could not run central_sender_restart_safe.py as ${USER}" && ok "E19 o log diz que nao deu pra RODAR o guard (o texto do sudo vai junto)" || bad "E19 sudo falhou mas o log nao diz 'could not run ... as ${USER}'. log: $(tail -3 "$LOGF" 2>/dev/null | tr '\n' '|')"
+! log_has "central_sender send in flight" && ok "E19 sudo que falha NAO e rotulado 'envio em voo' (terceiro estado: nao consegui olhar)" || bad "E19 um sudo que falhou foi lido como 'envio em voo': $(grep 'central_sender send in flight' "$LOGF" | head -1)"
+
+# ═══ E20: soltar a cidade a mao — rm com o script VIVO e desfeito; o TERM solta ═══
+# O runbook e o cabecalho do quiet-hours-check.sh diziam que `rm city-drain.level` solta a cidade. Com o script
+# vivo (23:00 ate o shutdown) nao solta: drain_stamp regrava o arquivo sem olhar se alguem o tirou (a cada carimbo
+# da espera e a cada tentativa dos guards de seguranca). A documentacao agora diz isso e manda matar o script com
+# TERM; este cenario trava as duas metades da frase — se alguem fizer o carimbo respeitar o `rm`, o 1o assert
+# reprova e obriga a reescrever a doc, em vez de a doc voltar a prometer o que o codigo nao faz.
+echo "E20: rm do sinal com o script vivo e desfeito no proximo carimbo; o TERM e o que solta a cidade"
+new_world e20
+start_nr_bg FAKE_HOUR=23 NIGHTLY_REBOOT_DRAIN_WAIT_SECS=120 NIGHTLY_REBOOT_DRAIN_STAMP_INTERVAL=2
+for _ in $(seq 1 80); do [ -f "$DRAIN" ] && break; /bin/sleep 0.25; done
+if [ -f "$DRAIN" ]; then
+  ok "E20 sinal gravado, script vivo na espera"
+  rm -f "$DRAIN"      # o que o runbook antigo mandava o operador fazer
+  # carimbo a cada 2s; 30s de espera cobrem uma maquina muito lenta (carga so atrasa o carimbo, nunca o cancela)
+  for _ in $(seq 1 120); do [ -f "$DRAIN" ] && break; /bin/sleep 0.25; done
+  [ -f "$DRAIN" ] && ok "E20 rm com o script vivo: o sinal VOLTOU no proximo carimbo (por isso a doc manda matar o script, nao dar rm)" || bad "E20 o sinal NAO voltou depois do rm: o carimbo passou a respeitar o rm — reescreva o runbook e o quiet-hours-check.sh (eles dizem que rm nao basta)"
+  kill -TERM "$NRPID" 2>/dev/null
+  for _ in $(seq 1 40); do kill -0 "$NRPID" 2>/dev/null || break; /bin/sleep 0.25; done
+  if kill -0 "$NRPID" 2>/dev/null; then bad "E20 o script NAO morreu em 10s com TERM"; kill -KILL "$NRPID" 2>/dev/null; else ok "E20 TERM: o script saiu"; fi
+  [ ! -f "$DRAIN" ] && ok "E20 TERM: o sinal foi REMOVIDO (o caminho que a doc manda usar solta a cidade)" || bad "E20 depois do TERM o sinal continua no disco"
+  ! rebooted && ok "E20 TERM: a noite nao reinicia (a doc diz isso)" || bad "E20 reiniciou apesar do TERM"
+else
+  bad "E20 inconclusivo: o sinal nunca apareceu, entao nao houve script vivo pra testar"
+  kill -KILL "$NRPID" 2>/dev/null
+fi
+wait "$NRPID" 2>/dev/null
 
 echo ""
 echo "nightly-reboot drain selftest: PASS=$PASS FAIL=$FAIL SKIPPED=$SKIPPED"

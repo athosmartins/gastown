@@ -1099,10 +1099,25 @@ guard_sender_in_flight() {
         GUARD_REASON="central_sender_restart_safe.py not readable at ${SENDER_SAFE_PY} — cannot tell whether a send is in flight, unknown treated as NOT safe"
         return 1
     fi
-    out=$("${PYTHON3_BIN}" "${SENDER_SAFE_PY}" 2>&1); rc=$?
+    # Run as the user, not as root (this script is a root LaunchDaemon): the check opens the
+    # sender's SQLite queue (WAL mode, mode=ro) and imports its sibling modules, and as root that
+    # CAN leave root-owned -shm/-wal files next to queue.db (the athos sender could then no longer
+    # write them) and root-owned .pyc files in the athos-owned scripts/__pycache__. Gate review
+    # ga-iwyczc raised this as a risk it did not reproduce, so "can", not "does". Same trick as
+    # notify_athos: root sudoes to another user with no password.
+    out=$(sudo -u "${NOTIFY_AS_USER}" "${PYTHON3_BIN}" "${SENDER_SAFE_PY}" 2>&1); rc=$?
     case "${rc}" in
         0) GUARD_STATE="ok"; GUARD_NOTE="${out}"; return 0 ;;
-        1) GUARD_STATE="block"; GUARD_REASON="central_sender send in flight: $(printf '%s' "${out}" | tr '\n' ' ')" ;;
+        1)
+            # rc 1 is the script's "send in flight" — and also what sudo itself exits with when it
+            # cannot run the command (unknown user, no sudoers rule). Both hold the reboot, but only
+            # one is a send: a sudo that could not run it is "could not look", never "in flight"
+            # (the SKIP push would otherwise send the operator hunting a send that does not exist).
+            # The script's own rc-1 text starts with "central_sender_restart_safe:", never "sudo:".
+            case "${out}" in
+                "sudo: "*) GUARD_REASON="could not run central_sender_restart_safe.py as ${NOTIFY_AS_USER} ($(printf '%s' "${out}" | tr '\n' ' ')) — cannot tell whether a send is in flight, unknown treated as NOT safe" ;;
+                *) GUARD_STATE="block"; GUARD_REASON="central_sender send in flight: $(printf '%s' "${out}" | tr '\n' ' ')" ;;
+            esac ;;
         *) GUARD_REASON="central_sender_restart_safe.py rc=${rc}: $(printf '%s' "${out}" | tr '\n' ' ') — unknown treated as NOT safe" ;;
     esac
     return 1

@@ -20,7 +20,7 @@ Pedido do Athos (01/10, P0): reiniciar **antes** do scraper. Desenho no bead ga-
 |---|---|
 | 23:00 | O LaunchDaemon dispara `nightly-reboot.sh`. Ele grava o sinal de **dreno** (`~/.gastown/run/city-drain.level`); pilot, gate, refino-gate, auto-refino e context-check **param de admitir trabalho novo** (o que já está em curso termina). |
 | 23:00–23:40 | Espera, re-carimbando o sinal a cada 5 min. |
-| 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
+| 23:40 | Só os guards de **SEGURANÇA** seguram o reboot, esperando até ~23:55: envio em voo (`central_sender_restart_safe.py`, rodado como o usuário via `sudo -u`, como o `notify` — como root ele poderia deixar `-shm`/`-wal` de root ao lado da fila do sender) e manutenção de Dolt (compact/gc/backup/table-swap). "Não consegui olhar" conta como **não seguro**. |
 | 23:40 | Gate com marker, bead em `in_progress` e rodada do scraper viram **informativos**: vão pro log e pro snapshot `.gc/logs/nightly-reboot-pre-<data>.txt` como "o que este reboot corta". O gate re-enfileira, o reclaim devolve o bead, o scraper retoma pelo catch-up. |
 | ~23:42 | **Re-checagem final** dos guards de segurança, logo antes do `shutdown -r now` (o veredito das 23:40 já tem minutos: sondas informativas, update do macOS e notify passam no meio, e o envio central não é travado pelo dreno). Um envio que começou nesse intervalo segura o reboot como um que já estava lá; se não liberar, é SKIP — e o streak continua contando. Só depois da re-checagem sai o aviso de rotina "Reiniciando às HH:MM" (digest) — uma noite pulada ali nunca disse "reiniciando". Depois `shutdown -r now`. O sinal de dreno carrega o boot-epoch: o próprio reboot o invalida, não há passo de limpeza que possa falhar. Com o shutdown **aceito** (rc 0) o sinal **fica** no disco (soltá-lo seguraria a cidade a admitir trabalho segundos antes de cair); se o shutdown falhar (rc ≠ 0) ele é solto na hora. |
 | pós-boot | `nightly-reboot-postcheck.sh` confere Dolt / envio / mapa / dreno (**mapa** = a ORIGEM em `127.0.0.1:8099` **e** o túnel cloudflared: job com PID + o `/ready` dele com ≥ 1 conexão de borda; o pior dos dois vale. A URL pública `mapa.urblink.com.br` **não** entra: o Cloudflare Access responde 302 na borda, com o mapa de pé ou não) (re-tenta ~20 min enquanto os serviços sobem) e manda `notify`: **"Reboot noturno OK"** (rotina: vai pro digest) ou **"pós-boot COM PROBLEMA"** (vai por **push**; também mail ao mayor, que depende do Dolt). |
@@ -76,9 +76,25 @@ sudo /usr/libexec/PlistBuddy -c 'Set :StartCalendarInterval:Hour 1' /Library/Lau
 sudo launchctl bootout system/com.gascity.nightly-reboot
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.gascity.nightly-reboot.plist
 ```
-O fluxo legado das 01:00 continua no script, intacto. Para soltar uma cidade drenada à mão:
-`rm ~/.gastown/run/city-drain.level` (o sinal também expira sozinho: ≤30 min sem re-carimbo,
-teto de 90 min).
+O fluxo legado das 01:00 continua no script, intacto.
+
+## Soltar uma cidade drenada à mão
+
+Depende de o `nightly-reboot.sh` (quem grava o sinal) estar vivo — do disparo, 23:00, até o `shutdown`:
+
+- **Script vivo** (o caso em que alguém quer soltar): `rm ~/.gastown/run/city-drain.level` **não basta**. O script
+  regrava o sinal sem olhar se alguém o tirou — a cada ≤5 min na espera até 23:40 e a cada tentativa dos guards
+  de segurança (60 s) — e não deixa linha no log dizendo que o `rm` foi desfeito: a cidade fica solta só até o
+  próximo carimbo. O que funciona é matar o script com TERM:
+  ```bash
+  sudo launchctl kill TERM system/com.gascity.nightly-reboot
+  ```
+  O trap de saída dele (`drain_cleanup`) remove o sinal e o script sai: **a noite não reinicia**. Na espera das
+  23:00–23:40 e nas sondas com prazo o TERM age na hora; numa chamada sem prazo (update do macOS, `notify`) só
+  quando ela volta.
+- **Script já morto** (saiu, ou levou KILL e o trap não rodou — o `launchctl kill` acima responde
+  `No process to signal.`): aí `rm ~/.gastown/run/city-drain.level` solta na hora, porque nada mais o regrava.
+  Sem o `rm` o sinal expira sozinho: ≤30 min depois do último carimbo, teto de 90 min.
 
 ## Limites conhecidos (não escondidos)
 

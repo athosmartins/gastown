@@ -221,7 +221,9 @@ _quiet_elapsed_adjustment() {
 # e pior que um reboot que pula uma noite. So drena quando TUDO abaixo vale:
 #   - o arquivo existe, tem 4 campos legiveis e a linha 1 e DRAIN;
 #   - foi gravado ha <= DRAIN_WINDOW_MAX_AGE_SECS (escritor vivo; o nightly
-#     regrava a cada <= 5min — um escritor morto solta a cidade em 30min);
+#     regrava a cada <= 5min enquanto espera e a cada tentativa dos guards de
+#     seguranca — nao durante as sondas informativas nem o update do macOS —
+#     e um escritor morto solta a cidade em 30min);
 #   - agora < epoch limite (teto duro, o escritor nunca o estende);
 #   - o boot-epoch gravado == o boot-epoch atual. ESTE e o ponto central: o
 #     reboot invalida o dreno sozinho. Nao ha passo "limpar a flag no pos-boot"
@@ -230,8 +232,19 @@ _quiet_elapsed_adjustment() {
 # nao drena E _drain_window_unreadable devolve "1" — o log do despachante diz
 # "nao consegui ler", nunca o mesmo silencio de "nao ha dreno".
 #
-# Quem precisar soltar a cidade a mao: `rm ~/.gastown/run/city-drain.level`
-# (o arquivo e gravado por root, mas o diretorio e do athos — remover funciona).
+# Soltar a cidade a mao depende de o escritor (nightly-reboot.sh) estar vivo:
+#   - VIVO (do disparo, 23:00, ate o shutdown): `rm` NAO basta. O escritor regrava o
+#     arquivo sem olhar se alguem o tirou — a cada <= 5min na espera ate 23:40 e a cada
+#     tentativa dos guards de seguranca (60s) — e nao registra no log que o `rm` foi
+#     desfeito: a cidade fica solta so ate o proximo carimbo. O que funciona e matar o
+#     escritor com TERM: `sudo launchctl kill TERM system/com.gascity.nightly-reboot`.
+#     O trap de saida dele (drain_cleanup) remove o sinal e o script sai: a noite NAO
+#     reinicia. (Numa chamada sem prazo — update do macOS, notify — o TERM so age
+#     quando ela volta.)
+#   - MORTO (saiu, ou levou KILL e o trap nao rodou — `launchctl kill` responde "No
+#     process to signal."): `rm ~/.gastown/run/city-drain.level` solta na hora, nada o
+#     regrava (o arquivo e gravado por root, mas o diretorio e do athos — remover
+#     funciona). Sem o `rm` ele expira sozinho: <= 30min do ultimo carimbo, teto de 90min.
 DRAIN_WINDOW_FILE="${DRAIN_WINDOW_FILE:-${HOME}/.gastown/run/city-drain.level}"
 DRAIN_WINDOW_MAX_AGE_SECS="${DRAIN_WINDOW_MAX_AGE_SECS:-1800}"
 DRAIN_WINDOW_CLOCK_SKEW_SECS="${DRAIN_WINDOW_CLOCK_SKEW_SECS:-300}"
