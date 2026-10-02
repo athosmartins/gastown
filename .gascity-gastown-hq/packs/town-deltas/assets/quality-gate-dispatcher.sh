@@ -579,13 +579,35 @@ case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
 # once per step from the queued markers + machine slack — pool-ceiling.sh has the rules and
 # the kill switch. The lib is OPTIONAL: missing/unloadable -> _POOL_CEILING_OK=0 and the
 # fixed ceiling stays in force (the gate is the town's critical path and must never die for
-# lack of an optimisation). POOL_CEILING_LIB is a test seam.
+# lack of an optimisation) — but NOT silently when the operator switched the ceiling on: "on, but
+# the lib did not load" must not look like "off" (_pool_ceiling_lib_failed_note, logged by Step
+# 0b-1). POOL_CEILING_LIB is a test seam.
+# SELFTEST-EXTRACT pool-ceiling-loader: BEGIN
 _POOL_CEILING_OK=0
-_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pool-ceiling.sh}"
+_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/pool-ceiling.sh}"
+_POOL_CEILING_WHY="biblioteca ausente ou ilegivel: $_POOL_CEILING_LIB"
 if [ -r "$_POOL_CEILING_LIB" ]; then
+  _POOL_CEILING_WHY="a biblioteca nao carregou (o erro esta no stderr deste processo): $_POOL_CEILING_LIB"
+  # stderr is NOT suppressed: a corrupt sibling (syntax error) is a deploy fault and must be loud.
   # shellcheck disable=SC1090
-  if . "$_POOL_CEILING_LIB" 2>/dev/null && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; fi
+  if . "$_POOL_CEILING_LIB" && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; _POOL_CEILING_WHY=""; fi
 fi
+# SELFTEST-EXTRACT pool-ceiling-loader: END
+# SELFTEST-EXTRACT pool-ceiling-note: BEGIN
+# _pool_ceiling_lib_failed_note — prints ONE line iff the ceiling is switched ON (the lib's own
+# predicate, repeated inline because the lib is exactly what is missing: POOL_CEILING_DYNAMIC=1, or
+# the .on file unless POOL_CEILING_DYNAMIC=0) while the lib is NOT loaded; prints nothing otherwise.
+_pool_ceiling_lib_failed_note() {
+  [ "${_POOL_CEILING_OK:-0}" = "1" ] && return 0
+  case "${POOL_CEILING_DYNAMIC:-}" in
+    0) return 0 ;;
+    1) ;;
+    *) [ -e "${POOL_CEILING_ON_FILE:-${GC_CITY:-/nonexistent}/.gc/pool-ceiling.on}" ] || return 0 ;;
+  esac
+  printf 'pool-ceiling: LIGADO (POOL_CEILING_DYNAMIC=1 ou .gc/pool-ceiling.on) mas %s — vale o teto FIXO (ga-uywvsc)' "${_POOL_CEILING_WHY:-biblioteca nao carregada}"
+  return 0
+}
+# SELFTEST-EXTRACT pool-ceiling-note: END
 case "$GATE_CODE_REVIEWERS"      in ''|*[!0-9]*) GATE_CODE_REVIEWERS=2 ;; esac
 case "$GATE_SWAP_FREE_FLOOR_MB"  in ''|*[!0-9]*) GATE_SWAP_FREE_FLOOR_MB=512 ;; esac
 case "$GATE_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) GATE_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
@@ -12031,7 +12053,8 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
     # The ceiling gets the THREE-state quota. gate_headroom_decision is fail-open on it (an erroring
     # checker defers nothing), so that brake cannot vouch for a quota nobody could read: an
     # "unknown" holds the ceiling instead of letting it grow.
-    _pc_quota="$HR_QSTATE"
+    # (an unset/empty HR_QSTATE is "unknown" — never ok, and never a `set -u` abort of the gate's critical path)
+    _pc_quota="${HR_QSTATE:-unknown}"
     # The ceiling never goes under the reviewers of a single run — unless the engine's own cap is
     # lower than that (the step bounds max by agents/gate-reviewer/agent.toml): then no run could
     # be spawned in full anyway, and the "motor N" in the log line shows why.
@@ -12042,6 +12065,10 @@ if [ "${GATE_HEADROOM_ENABLED:-1}" = "1" ]; then
       pool_ceiling_step gate-reviewer "$GATE_MAX_REVIEWERS_FIXED" "$POOL_CEILING_MIN" "$POOL_CEILING_MAX" "$LIVE_REVIEWERS" "${COUNT:-}" "$_pc_dolt" "$_pc_quota"
     [ -z "$POOL_CEILING_LOGLINE" ] || log "$POOL_CEILING_LOGLINE"
     [ -z "$POOL_CEILING_RESULT" ] || GATE_MAX_REVIEWERS="$POOL_CEILING_RESULT"
+  elif [ "${_POOL_CEILING_OK:-0}" != "1" ]; then
+    # lib not loaded: the fixed ceiling stays — but if the ceiling was switched ON, say so (never silently "off")
+    _pc_note=$(_pool_ceiling_lib_failed_note) || _pc_note=""
+    [ -z "$_pc_note" ] || log "$_pc_note"
   fi
   # SELFTEST-EXTRACT gate-apply-dynamic-ceiling: END
   # 3. Pure dynamic-concurrency decision.
@@ -12068,6 +12095,9 @@ else
   # when it is switched on. Say so, rather than "on" doing nothing without a trace.
   if [ "${_POOL_CEILING_OK:-0}" = "1" ] && pool_ceiling_enabled; then
     log "pool-ceiling: gate-reviewer — GATE_HEADROOM_ENABLED=0: teto dinamico NAO avaliado, vale o fixo ${GATE_MAX_REVIEWERS} (ga-uywvsc)"
+  elif [ "${_POOL_CEILING_OK:-0}" != "1" ]; then
+    _pc_note=$(_pool_ceiling_lib_failed_note) || _pc_note=""
+    [ -z "$_pc_note" ] || log "$_pc_note"
   fi
 fi
 

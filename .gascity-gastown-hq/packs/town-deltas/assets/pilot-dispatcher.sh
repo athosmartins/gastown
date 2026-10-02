@@ -163,14 +163,36 @@ GC_VARIABLE_SESSION_COUNT_OVERRIDE="${GC_VARIABLE_SESSION_COUNT_OVERRIDE:-}"
 # engine's own agent.toml cap, which the controller enforces on its own (ga-o3o09z) — see
 # pool-ceiling.sh for the rules and the kill switch (.gc/pool-ceiling.off). The lib is
 # OPTIONAL: if it is missing or fails to load, _POOL_CEILING_OK stays 0 and the fixed
-# caps stay in force (a dispatcher must never die for lack of an optimisation).
+# caps stay in force (a dispatcher must never die for lack of an optimisation) — but NOT
+# silently when the operator switched the ceiling on: "on, but the lib did not load" must not
+# look like "off" (_pool_ceiling_lib_failed_note, said once per sweep by the apply function).
 # POOL_CEILING_LIB is a test seam. GC_VARIABLE_SESSION_MAX stays a fixed outer bound.
+# SELFTEST-EXTRACT pool-ceiling-loader: BEGIN
 _POOL_CEILING_OK=0
-_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pool-ceiling.sh}"
+_POOL_CEILING_LIB="${POOL_CEILING_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)/pool-ceiling.sh}"
+_POOL_CEILING_WHY="biblioteca ausente ou ilegivel: $_POOL_CEILING_LIB"
 if [ -r "$_POOL_CEILING_LIB" ]; then
+  _POOL_CEILING_WHY="a biblioteca nao carregou (o erro esta no stderr deste processo): $_POOL_CEILING_LIB"
+  # stderr is NOT suppressed: a corrupt sibling (syntax error) is a deploy fault and must be loud.
   # shellcheck disable=SC1090
-  if . "$_POOL_CEILING_LIB" 2>/dev/null && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; fi
+  if . "$_POOL_CEILING_LIB" && type pool_ceiling_step >/dev/null 2>&1; then _POOL_CEILING_OK=1; _POOL_CEILING_WHY=""; fi
 fi
+# SELFTEST-EXTRACT pool-ceiling-loader: END
+# SELFTEST-EXTRACT pool-ceiling-note: BEGIN
+# _pool_ceiling_lib_failed_note — prints ONE line iff the ceiling is switched ON (the lib's own
+# predicate, repeated inline because the lib is exactly what is missing: POOL_CEILING_DYNAMIC=1, or
+# the .on file unless POOL_CEILING_DYNAMIC=0) while the lib is NOT loaded; prints nothing otherwise.
+_pool_ceiling_lib_failed_note() {
+  [ "${_POOL_CEILING_OK:-0}" = "1" ] && return 0
+  case "${POOL_CEILING_DYNAMIC:-}" in
+    0) return 0 ;;
+    1) ;;
+    *) [ -e "${POOL_CEILING_ON_FILE:-${GC_CITY:-/nonexistent}/.gc/pool-ceiling.on}" ] || return 0 ;;
+  esac
+  printf 'pool-ceiling: LIGADO (POOL_CEILING_DYNAMIC=1 ou .gc/pool-ceiling.on) mas %s — vale o teto FIXO (ga-uywvsc)' "${_POOL_CEILING_WHY:-biblioteca nao carregada}"
+  return 0
+}
+# SELFTEST-EXTRACT pool-ceiling-note: END
 
 # Acceptance-criteria count threshold for auto-classifying a story as BIG.
 BIG_CRITERIA_THRESHOLD="${BIG_CRITERIA_THRESHOLD:-5}"
@@ -5197,7 +5219,13 @@ _ASLEEP_SESSION_IDS=$(echo "$_SESSIONS_JSON" \
 # DRY_RUN=1 computes but persists nothing.
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: BEGIN
 _pilot_apply_dynamic_pool_ceilings() {
-  [ "${_POOL_CEILING_OK:-0}" = "1" ] || return 0
+  local _pc_note=""
+  if [ "${_POOL_CEILING_OK:-0}" != "1" ]; then
+    # Lib not loaded: the fixed caps stay — but if the ceiling was switched ON, say so (once per sweep).
+    _pc_note=$(_pool_ceiling_lib_failed_note) || _pc_note=""
+    [ -z "$_pc_note" ] || warn "$_pc_note"
+    return 0
+  fi
   pool_ceiling_enabled || return 0
   local _pc_dolt=unknown _pc_live _pc_queue
   # Only a probe that RAN says "ok": 0 = measured calm, 1 = saturated (hot, or unreadable -> unknown).

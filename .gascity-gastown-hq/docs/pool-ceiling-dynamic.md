@@ -35,7 +35,7 @@ Override: `POOL_CEILING_<POOL>_MIN` / `_MAX` (pool em maiúsculas, `-` vira `_`)
 | swap (livre, usado, disco livre) | usado ≤ 4 GB | usado > 4 GB, ou swap baixo mas o disco deixa crescer | swap livre < 512 MB **e** disco < 4 GB (swap não pode crescer — ga-q4fkxa) |
 | disco livre | ≥ 12 GB | 3–12 GB | < 3 GB (pisos do `dolt-disk-floor-guard`: WARN 8 + margem 4, CRITICAL 3) |
 | Dolt (leitura do próprio dispatcher) | ok | hot | — (cada dispatcher já tem freio próprio) |
-| cota Claude | ok | limited | — (e **ilegível** = checker ausente, com erro ou estourou o tempo → "unknown": não sobe) |
+| cota Claude | ok | limited | — (e **ilegível** = checker ausente, com erro ou estourou o tempo → "unknown": não sobe). O checker sai 0 também num limite só *semanal* de aviso, que portanto lê como `ok`: por desenho do checker, não detectado aqui |
 
 **Catraca:** depois de um squeeze, voltar a subir exige que TODO sinal esteja em grow, e as faixas hold
 (load 5–8/núcleo, disco 3–12 GB, swap usado > 4 GB) são onde a máquina vive hoje. Um teto que desceu pode
@@ -68,6 +68,17 @@ desligamento duro que nem o `.on` sobrepõe. Começa sempre do teto **fixo** (es
 `applied=0` no TSV. Limite por construção: a simulação só enxerga sessões reais, então mostra "subiria
 1 passo" mas não escala além do que `vivos` permite.
 
+**Ligado mas a biblioteca não carregou não é "desligado".** A lib (`pool-ceiling.sh`) é opcional: ausente, ilegível ou
+com erro de sintaxe, os dois dispatchers seguem no teto fixo (nunca morrem por falta de uma otimização). Mas, se o
+teto está LIGADO (`.on` ou `POOL_CEILING_DYNAMIC=1`), cada varredura loga uma linha
+`pool-ceiling: LIGADO … mas <motivo> — vale o teto FIXO` (a lib ausente e a lib que não carrega têm motivos distintos), e o
+erro de sintaxe vai para o stderr do processo (não é suprimido: lib corrompida é falha de deploy). Desligado, fica silencioso como antes.
+
+**Estado depois de um desligamento longo.** O estado (`<pool>.state`) guarda o último teto escolhido; ao religar depois de
+um `.off`/`POOL_CEILING_DYNAMIC=0` longo, o teto **retoma esse valor gravado**, não o fixo (só estado ausente ou corrompido
+reinicia no fixo). Para recomeçar do fixo, apague `$GC_CITY/.gc/pool-ceiling/<pool>.state` antes de religar. O `status` mostra
+`modo: SOMBRA` ou `modo: APLICANDO` na primeira linha: "ligado: SIM" sozinho não diz se está agindo.
+
 ## Como ler
 
 - Linha por varredura no log do dispatcher, ex.:
@@ -79,7 +90,8 @@ desligamento duro que nem o `.on` sobrepõe. Começa sempre do teto **fixo** (es
 ## Fonte da fila e da contagem
 
 - **Pilot:** fila = itens por rig do `~/.gc/pilot-dispatchable.json` (já emitido a cada varredura;
-  arquivo ausente, corrompido ou mais velho que o próprio `ttl_seconds` → "ilegível", não zero).
+  arquivo ausente, corrompido, mais velho que o próprio `ttl_seconds` **ou carimbado no futuro** (>60 s: relógio fora do
+  lugar) → "ilegível", não zero).
   **Limite honesto:** se o próprio emit falha ao ler um rig (ex.: `gc rig list` caiu → emit só do HQ), ele grava
   um arquivo FRESCO com 0 itens para aquele store, e isso lê como "fila 0" conhecido (razão `idle`, que
   mantém — a direção é inerte: nunca sobe). Na série de 24h, essas varreduras contam como `idle`. Vivos = snapshot do `session list`
@@ -107,7 +119,7 @@ desligamento duro que nem o `.on` sobrepõe. Começa sempre do teto **fixo** (es
 
 ## Verificação
 
-`bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (240 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
+`bash packs/town-deltas/assets/pool-ceiling.selftest.sh` (286 asserts; passa em `/bin/bash` 3.2 e bash 5) — reprova sem a lib
 e sem a fiação nos dois dispatchers; inclui a função de cola REAL do Pilot e o bloco REAL do teto do gate
 (duas passadas, a 2ª emulando o re-exec do multi-admit ga-309v3, sob `set -euo pipefail`) extraídos dos
 arquivos e rodados contra fixtures, e os produtores de cota dos dois dispatchers rodados contra um checker
@@ -116,7 +128,10 @@ fila ilegível lida como 0, squeeze não encolhe, sem limite de ritmo, ligado po
 confiada, teto do motor ignorado, decaimento por fila vazia de volta, Dolt ilegível lido como ok,
 DRY_RUN ignorado, sombra aplicando o teto, sombra gravando o estado real, relógio ilegível lido como época 0, estado corrompido reiniciado em silêncio,
 **cota ilegível (checker ausente/com erro/estourou o tempo) entregue ao teto como `ok`** (o teste novo reprova no código anterior com o
-sintoma literal `wa-worker 2→3 (up, queue+slack)`), limiar de swap/load com lixo lido como "não apertou", **sinalizador de Dolt do Pilot ausente/lixo lido como `ok`** (o padrão é "ilegível").
+sintoma literal `wa-worker 2→3 (up, queue+slack)`), limiar de swap/load com lixo lido como "não apertou", **sinalizador de Dolt do Pilot ausente/lixo lido como `ok`** (o padrão é "ilegível"),
+**ligado + lib que não carrega = silêncio** (o loader REAL de cada dispatcher roda sob `set -euo pipefail` contra lib boa, corrompida, ausente e vazia),
+fila carimbada no futuro lida como fresca, e **o próprio selftest escrevendo no log de produção** — a seção 11 compara o log e o diretório de estado reais
+antes/depois da execução inteira e fica vermelha se qualquer seção esquecer de se isolar (sem isso, 57 execuções deixaram 114 linhas falsas na série de 24h).
 
 Antes de ligar: `pool-ceiling.sh status` mostra o sinal agora. Ligue em SOMBRA e deixe 24h; confira em
 `.gc/logs/pool-ceiling.log` quanto tempo cada sinal ficou em grow/hold/squeeze antes de tirar a sombra.

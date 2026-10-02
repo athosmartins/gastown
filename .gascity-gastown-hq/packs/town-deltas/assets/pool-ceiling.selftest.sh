@@ -36,6 +36,18 @@ trap 'rm -rf "$TMPROOT"' EXIT
 # Never let a LIVE .gc/pool-ceiling.on/.off of the real city leak into this hermetic test.
 export POOL_CEILING_ON_FILE="$TMPROOT/on.flag" POOL_CEILING_KILL_FILE="$TMPROOT/kill.off" POOL_CEILING_SHADOW_FILE="$TMPROOT/shadow.flag"
 unset POOL_CEILING_SHADOW
+# ...and never let it WRITE the real city's calibration log either: when POOL_CEILING_LOG is unset the lib falls back to
+# $GC_CITY/.gc/logs/pool-ceiling.log, and every agent/gate session has GC_CITY exported. Section 2c used to call
+# pool_ceiling_step before section 4 exported a log of its own: 57 runs left 114 fake rows (ts=100/200) in the real 24h series.
+export POOL_CEILING_LOG="$TMPROOT/pool-ceiling.default.log"
+# The production paths the lib would fall back to, snapshotted now and compared at the very end (section 11): a section that
+# forgets to isolate itself is a RED test, not silent pollution of the series the doc tells the operator to calibrate from.
+PROD_LOG="${GC_CITY:+$GC_CITY/.gc/logs/pool-ceiling.log}"; PROD_STATE="${GC_CITY:+$GC_CITY/.gc/pool-ceiling}"
+prod_snapshot() { # → "log=<bytes|absent> state=<entries|absent>", or "no-GC_CITY" when there is no fallback to pollute
+  [ -n "$PROD_LOG" ] || { printf 'no-GC_CITY'; return 0; }
+  printf 'log=%s state=%s' "$([ -e "$PROD_LOG" ] && wc -c < "$PROD_LOG" | tr -d ' ' || echo absent)" "$([ -e "$PROD_STATE" ] && ls -A "$PROD_STATE" 2>/dev/null | wc -l | tr -d ' ' || echo absent)"
+}
+PROD_BEFORE="$(prod_snapshot)"
 # Engine caps (agents/<pool>/agent.toml): the controller obeys THESE on its own (ga-o3o09z, 25/09:
 # agent.toml=4 vs Pilot plist=2 -> 4 workers active), so the dynamic ceiling may never exceed them.
 AG="$TMPROOT/agents"; mkdir -p "$AG/wa-worker" "$AG/ps-worker" "$AG/gate-reviewer"
@@ -317,6 +329,8 @@ has "$out" "SURVIVED=" "step + decide with garbage/empty args survive set -euo p
 
 echo "== 8. the Pilot's REAL glue function, extracted from pilot-dispatcher.sh and run against fixtures"
 EXTRACT="$(sed -n '/SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: BEGIN/,/SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END/p' "$PILOT" 2>/dev/null)"
+PNOTE_X="$(sed -n '/SELFTEST-EXTRACT pool-ceiling-note: BEGIN/,/SELFTEST-EXTRACT pool-ceiling-note: END/p' "$PILOT" 2>/dev/null)"
+GNOTE_X="$(sed -n '/SELFTEST-EXTRACT pool-ceiling-note: BEGIN/,/SELFTEST-EXTRACT pool-ceiling-note: END/p' "$GATE" 2>/dev/null)"
 if [ -z "$EXTRACT" ]; then
   bad "no SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings block in $PILOT"
 else
@@ -334,11 +348,12 @@ else
       set -uo pipefail
       . "$1"
       log() { echo "LOG:$*"; }
-      eval "$2"
+      warn() { echo "WARN:$*"; }
+      eval "$2"; eval "$3"
       PILOT_WA_WORKER_MAX=2; PILOT_PS_WORKER_MAX=1
       _pilot_apply_dynamic_pool_ceilings
       echo "WA=$PILOT_WA_WORKER_MAX PS=$PILOT_PS_WORKER_MAX"
-    ' _ "$LIB" "$EXTRACT" 2>&1
+    ' _ "$LIB" "$EXTRACT" "$PNOTE_X" 2>&1
   }
   gsig() { export POOL_CEILING_T_LOAD5=31 POOL_CEILING_T_NCPU=10 POOL_CEILING_T_MEM=1 POOL_CEILING_T_SWAP_FREE_MB=5700 POOL_CEILING_T_SWAP_USED_MB=412 POOL_CEILING_T_DISK_FREE_MB=14336; }
   Q="$(mkq "$NOWISO" 3 0)"
@@ -383,6 +398,12 @@ else
   case "$out" in *LOG:*) bad "an inert sweep must not log" ;; *) ok "an inert sweep logs nothing" ;; esac
   base; _POOL_CEILING_OK=0 out="$(glue)"
   has "$out" "WA=2 PS=1" "lib not loaded (_POOL_CEILING_OK=0) -> fixed caps even with DYNAMIC=1"
+  has "$out" "WARN:pool-ceiling: LIGADO" "...and the sweep SAYS the ceiling is on but the lib is not loaded (it used to look exactly like 'off')"
+  base; _POOL_CEILING_OK=0; unset POOL_CEILING_DYNAMIC; out="$(glue)"
+  has "$out" "WA=2 PS=1" "lib not loaded and not switched on -> fixed caps"
+  case "$out" in *WARN:*|*LOG:*) bad "lib not loaded but the ceiling is OFF: must stay silent (nothing was asked for)" ;; *) ok "lib not loaded but the ceiling is OFF -> silent" ;; esac
+  base; _POOL_CEILING_OK=0 POOL_CEILING_DYNAMIC=0 out="$(glue)"
+  case "$out" in *WARN:*) bad "POOL_CEILING_DYNAMIC=0 is a hard off: no warning" ;; *) ok "POOL_CEILING_DYNAMIC=0 + lib not loaded -> silent" ;; esac
   base; DRY_RUN=1; SDRY="$POOL_CEILING_STATE_DIR"; out="$(glue)"
   has "$out" "WA=3 PS=1" "DRY_RUN=1 still computes the decision"
   [ -z "$(ls "$SDRY" 2>/dev/null)" ] && ok "DRY_RUN=1 persisted nothing" || bad "DRY_RUN=1 wrote state"
@@ -514,6 +535,7 @@ else
       GATE_DOLT_CPU_HOT=180; GATE_DOLT_LATENCY_HOT_MS=2500
       GATE_SWAP_FREE_FLOOR_MB="${GATE_SWAP_FREE_FLOOR_MB:-512}"; GATE_SWAP_GROW_DISK_MIN_MB="${GATE_SWAP_GROW_DISK_MIN_MB:-4096}"
       HR_CPU=95; HR_LAT=300
+      eval "$3"
       # what the gate sets just before this block (HR_QLIM = the fail-open 0/1 the headroom decision eats): a block that
       # collapses the quota back to ok/limited from HR_QLIM must FAIL here on its behaviour (MAX=5 on an unknown quota),
       # not crash on an unbound variable and fail for the wrong reason
@@ -524,7 +546,7 @@ else
       # only the exported GATE_MAX_REVIEWERS_FIXED can tell the block what the real fixed ceiling is
       export POOL_CEILING_NOW=$((POOL_CEILING_NOW + 120))
       eval "$2"; echo "PASS2 MAX=$GATE_MAX_REVIEWERS FIXED=${GATE_MAX_REVIEWERS_FIXED:-none}"
-    ' _ "$LIB" "$GE_EXTRACT" 2>&1
+    ' _ "$LIB" "$GE_EXTRACT" "$GNOTE_X" 2>&1
   }
   gbase() { export _POOL_CEILING_OK=1 POOL_CEILING_DYNAMIC=1 HR_QSTATE=ok LIVE_REVIEWERS=4 COUNT=5 DRY_RUN=0 POOL_CEILING_NOW=2000 \
                    POOL_CEILING_STATE_DIR="$TMPROOT/ge.$RANDOM" POOL_CEILING_LOG="$TMPROOT/ge.log" \
@@ -542,6 +564,8 @@ else
   has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota limited -> hold"
   gbase; HR_QSTATE="" out="$(gglue)"
   has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota state EMPTY -> unknown -> the ceiling does not rise"
+  gbase; unset HR_QSTATE; out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=4" "gate, quota state UNSET -> unknown -> the ceiling does not rise, and the gate (set -u) does not abort"
   gbase; export GATE_SWAP_FREE_FLOOR_MB=9000 GATE_SWAP_GROW_DISK_MIN_MB=20000; out="$(gglue)"
   has "$out" "PASS1 MAX=3" "the gate's ceiling follows the GATE_SWAP_* knobs (free 5700MB < floor 9000 + disk 14GB < 20GB -> swap cannot grow -> squeeze 4->3)"
   gbase; export GATE_SWAP_FREE_FLOOR_MB=9000 GATE_SWAP_GROW_DISK_MIN_MB=20000 POOL_CEILING_SWAP_FREE_FLOOR_MB=100; out="$(gglue)"
@@ -549,6 +573,10 @@ else
   gbase   # also clears the exported GATE_SWAP_* / POOL_CEILING_SWAP_* knobs so nothing leaks into the sections below
   gbase; _POOL_CEILING_OK=0 out="$(gglue)"
   has "$out" "PASS1 MAX=4 FIXED=none" "lib not loaded -> the fixed ceiling, nothing exported"
+  has "$out" "LOG:pool-ceiling: LIGADO" "...and the gate SAYS the ceiling is on but the lib is not loaded (it used to look exactly like 'off')"
+  gbase; _POOL_CEILING_OK=0; unset POOL_CEILING_DYNAMIC; out="$(gglue)"
+  has "$out" "PASS1 MAX=4 FIXED=none" "lib not loaded and not switched on -> fixed ceiling"
+  case "$out" in *LOG:*) bad "lib not loaded but the ceiling is OFF: the gate must stay silent" ;; *) ok "lib not loaded but the ceiling is OFF -> silent" ;; esac
   gbase; unset POOL_CEILING_DYNAMIC; out="$(gglue)"
   has "$out" "PASS1 MAX=4 FIXED=none" "not switched on -> inert: fixed ceiling, no log line"
   case "$out" in *LOG:*) bad "an inert gate sweep must not log" ;; *) ok "an inert gate sweep logs nothing" ;; esac
@@ -573,9 +601,78 @@ if [ -r "$PILOT" ]; then
 fi
 if [ -r "$GATE" ]; then
   grep -q '^  HR_QSTATE=\$(gate_quota_state)$' "$GATE" && ok "gate probes the quota once, as three states (gate_quota_state)" || bad "gate does not probe gate_quota_state"
-  grep -q '_pc_quota="\$HR_QSTATE"' "$GATE" && ok "gate feeds the ceiling the three-state HR_QSTATE" || bad "gate does not feed the ceiling HR_QSTATE"
+  grep -q '_pc_quota="\${HR_QSTATE:-unknown}"' "$GATE" && ok "gate feeds the ceiling the three-state HR_QSTATE (unset -> unknown)" || bad "gate does not feed the ceiling HR_QSTATE (with an unknown default)"
   if grep -qE '_pc_quota=ok|_pc_quota=limited' "$GATE"; then bad "gate re-collapses the quota to ok/limited before the ceiling"; else ok "gate never collapses the quota to ok/limited before the ceiling"; fi
 fi
+
+echo "== 10. a lib that FAILS TO LOAD is not 'off' (pre-gate review: switched on + unloadable was silent)"
+# The dispatchers' REAL loader (what makes _POOL_CEILING_OK) and REAL note function, extracted from each file and run under
+# set -euo pipefail — the strict mode both dispatchers run in — against a good lib, a corrupt one, a missing one and one that
+# loads but defines nothing. stderr goes to a file on purpose: a corrupt sibling is a deploy fault and must be LOUD.
+printf 'if [ 1 = 1 ]; then\n  echo unterminated\n' > "$TMPROOT/lib.corrupt.sh"
+printf ': # loads fine, defines nothing\n' > "$TMPROOT/lib.empty.sh"
+: > "$TMPROOT/on.present"
+loadcase() { # <loader-extract> <note-extract> <lib-path> <DYNAMIC: 0|1|UNSET> <ON-file: path|NONE> -> OK=.. / SURVIVED / NOTE=.. on stdout; stderr -> $TMPROOT/load.err
+  bash -c '
+    set -euo pipefail
+    [ "$4" = UNSET ] && unset POOL_CEILING_DYNAMIC || export POOL_CEILING_DYNAMIC="$4"
+    export POOL_CEILING_LIB="$3" POOL_CEILING_ON_FILE="$5"
+    unset GC_CITY
+    eval "$1"; eval "$2"
+    echo "OK=$_POOL_CEILING_OK"
+    echo "SURVIVED"
+    echo "NOTE=$(_pool_ceiling_lib_failed_note)"
+  ' _ "$1" "$2" "$3" "$4" "$5" 2>"$TMPROOT/load.err"
+}
+for who in PILOT GATE; do
+  if [ "$who" = PILOT ]; then F="$PILOT"; else F="$GATE"; fi
+  LX="$(sed -n '/SELFTEST-EXTRACT pool-ceiling-loader: BEGIN/,/SELFTEST-EXTRACT pool-ceiling-loader: END/p' "$F" 2>/dev/null)"
+  NX="$(sed -n '/SELFTEST-EXTRACT pool-ceiling-note: BEGIN/,/SELFTEST-EXTRACT pool-ceiling-note: END/p' "$F" 2>/dev/null)"
+  nm="$(printf '%s' "$who" | tr 'A-Z' 'a-z')"
+  if [ -z "$LX" ] || [ -z "$NX" ]; then bad "$nm: missing SELFTEST-EXTRACT pool-ceiling-loader / pool-ceiling-note (loader ${#LX}B, note ${#NX}B)"; continue; fi
+  out="$(loadcase "$LX" "$NX" "$LIB" 1 NONE)"
+  has "$out" "OK=1" "$nm: a good lib loads (_POOL_CEILING_OK=1)"
+  eq "${out##*NOTE=}" "" "$nm: ...and says nothing"
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/lib.corrupt.sh" 1 NONE)"
+  has "$out" "SURVIVED" "$nm: a CORRUPT lib does not kill the dispatcher under set -euo pipefail"
+  has "$out" "OK=0" "$nm: a corrupt lib -> _POOL_CEILING_OK=0 (fixed caps)"
+  has "$out" "NOTE=pool-ceiling: LIGADO" "$nm: switched ON + corrupt lib -> the note says so (was silent)"
+  has "$out" "teto FIXO" "$nm: ...and that the fixed ceiling is what applies"
+  has "$out" "nao carregou" "$nm: ...and why (the lib did not load, as opposed to missing)"
+  if [ -s "$TMPROOT/load.err" ]; then ok "$nm: the syntax error is on stderr, not suppressed ($(head -c 70 "$TMPROOT/load.err" | tr '\n' ' '))"; else bad "$nm: a corrupt lib printed nothing on stderr (the load error is being swallowed)"; fi
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/does-not-exist.sh" 1 NONE)"
+  has "$out" "SURVIVED" "$nm: a MISSING lib does not kill the dispatcher either"
+  has "$out" "ausente ou ilegivel" "$nm: switched ON + missing lib -> the note says it is missing/unreadable"
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/lib.empty.sh" 1 NONE)"
+  has "$out" "OK=0" "$nm: a lib that loads but defines no pool_ceiling_step is NOT 'ok'"
+  has "$out" "NOTE=pool-ceiling: LIGADO" "$nm: ...and is reported"
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/lib.corrupt.sh" UNSET NONE)"
+  eq "${out##*NOTE=}" "" "$nm: corrupt lib but the ceiling is NOT switched on -> silent (nothing was asked for)"
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/lib.corrupt.sh" UNSET "$TMPROOT/on.present")"
+  has "$out" "NOTE=pool-ceiling: LIGADO" "$nm: switched on by the .on file (not the env) + corrupt lib -> reported"
+  out="$(loadcase "$LX" "$NX" "$TMPROOT/lib.corrupt.sh" 0 "$TMPROOT/on.present")"
+  eq "${out##*NOTE=}" "" "$nm: POOL_CEILING_DYNAMIC=0 is a hard off even with the .on file -> silent"
+  # the default lib path must survive a failing cd (set -e): empty dirname -> a path that does not exist, never an abort
+  out="$(bash -c 'set -euo pipefail; unset POOL_CEILING_LIB GC_CITY; export POOL_CEILING_DYNAMIC=1; cd() { return 1; }; eval "$1"; eval "$2"; echo "OK=$_POOL_CEILING_OK SURVIVED"; echo "NOTE=$(_pool_ceiling_lib_failed_note)"' _ "$LX" "$NX" 2>/dev/null)"
+  has "$out" "SURVIVED" "$nm: even a failing cd while locating the lib does not abort the dispatcher (set -e)"
+done
+
+echo "== 10b. a queue file stamped in the FUTURE is unreadable, not 'fresh' (clock skew must not be trusted)"
+iso_at() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+mkqf() { printf '{"generated_at":"%s","ttl_seconds":1800,"items":[{"id":"w1","store":"whatsapp_automation"},{"id":"w2","store":"whatsapp_automation"}]}' "$1" > "$TMPROOT/qf.json"; echo "$TMPROOT/qf.json"; }
+NOWE="$(date +%s)"
+eq "$(pool_ceiling_queue_from_dispatchable "$(mkqf "$(iso_at $((NOWE + 3600)))")" whatsapp_automation)" "" "an emit stamped an hour in the future -> unreadable (empty)"
+eq "$(pool_ceiling_queue_from_dispatchable "$(mkqf "$(iso_at $((NOWE + 20)))")" whatsapp_automation)" "2" "20s of skew is tolerated (the emit and this read are on the same host)"
+eq "$(pool_ceiling_queue_from_dispatchable "$(mkqf "$(iso_at $((NOWE - 60)))")" whatsapp_automation)" "2" "control: a normal recent emit still counts"
+
+echo "== 10c. 'status' says whether the ceiling is APPLYING or only in shadow"
+st="$(POOL_CEILING_STATE_DIR="$TMPROOT/st.status" POOL_CEILING_SHADOW=1 pool_ceiling_status 2>&1 | head -1)"
+has "$st" "modo: SOMBRA" "shadow on -> 'modo: SOMBRA (decide e loga, NAO aplica)'"
+st="$(POOL_CEILING_STATE_DIR="$TMPROOT/st.status" POOL_CEILING_SHADOW=0 pool_ceiling_status 2>&1 | head -1)"
+has "$st" "modo: APLICANDO" "shadow off -> 'modo: APLICANDO'"
+
+echo "== 11. hermetic: this run did not touch the real city's calibration log or state dir"
+eq "$(prod_snapshot)" "$PROD_BEFORE" "production pool-ceiling.log / pool-ceiling/ unchanged by the whole run (before: $PROD_BEFORE)"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

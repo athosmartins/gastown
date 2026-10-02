@@ -2876,7 +2876,11 @@ if [ -n "$PQ_X" ] && [ "$(q14c ABSENT)" = "0" ] && [ "$(q14c 1)" = "0" ]; then
 else
   bad "quota probe is not fail-open (absent checker must not block dispatch): absent='$(q14c ABSENT)' exit1='$(q14c 1)' extract=${#PQ_X}B"
 fi
-if [ -n "$PQ_X" ] && [ "$(q14c 2)" = "1" ] && [ "$(q14c 0)" = "0" ]; then
+if ! command -v timeout >/dev/null 2>&1; then
+  # The probe runs the checker under `timeout 15`; with no such binary it reads exit 127 -> unknown, by design (that
+  # case is asserted in pool-ceiling.selftest.sh 9b). Say so instead of failing on a property of this host.
+  ok "SKIPPED (no \`timeout\` binary on this host): exit 2 -> LIMITED / exit 0 -> ok is asserted by pool-ceiling.selftest.sh 9b"
+elif [ -n "$PQ_X" ] && [ "$(q14c 2)" = "1" ] && [ "$(q14c 0)" = "0" ]; then
   ok "quota probe still reads exit 2 as LIMITED (1) and exit 0 as ok (0)"
 else
   bad "quota probe no longer maps the checker's exit 2 -> 1 / exit 0 -> 0: exit2='$(q14c 2)' exit0='$(q14c 0)'"

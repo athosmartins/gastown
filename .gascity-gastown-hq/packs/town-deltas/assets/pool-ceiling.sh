@@ -277,7 +277,7 @@ pool_ceiling_queue_from_dispatchable() {
   out=$(jq -r --arg s "$store" --argjson now "$now" '
       if ((.generated_at | type) == "string") and ((.items | type) == "array") then
         ((.ttl_seconds // 1800) as $ttl | (.generated_at | fromdateiso8601) as $g
-         | if ($now - $g) > $ttl then empty
+         | if ($now - $g) > $ttl or ($now - $g) < -60 then empty   # too old, or stamped in the FUTURE (clock skew): cannot be trusted as fresh
            else ([.items[] | select(.store == $s)] | length) end)
       else empty end' "$f" 2>/dev/null) || out=""
   _pc_int "$out" && printf '%s' "$out"
@@ -457,7 +457,7 @@ _pc_log_append() {
 
 pool_ceiling_status() {
   local sd="${POOL_CEILING_STATE_DIR:-${GC_CITY:+$GC_CITY/.gc/pool-ceiling}}" f n c a
-  echo "ligado: $(pool_ceiling_enabled && echo SIM || echo nao)  kill-file: $([ -e "${POOL_CEILING_KILL_FILE:-${GC_CITY:-/nonexistent}/.gc/pool-ceiling.off}" ] && echo PRESENTE || echo ausente)"
+  echo "ligado: $(pool_ceiling_enabled && echo SIM || echo nao)  kill-file: $([ -e "${POOL_CEILING_KILL_FILE:-${GC_CITY:-/nonexistent}/.gc/pool-ceiling.off}" ] && echo PRESENTE || echo ausente)  modo: $(pool_ceiling_shadow && echo 'SOMBRA (decide e loga, NAO aplica)' || echo 'APLICANDO')"
   for f in "$sd"/*.state; do
     [ -r "$f" ] || continue
     n=$(basename "$f" .state); c=$(sed -n 's/^ceiling=//p' "$f"); a=$(sed -n 's/^at=//p' "$f")
