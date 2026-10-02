@@ -193,6 +193,26 @@ say() { printf '%s\n' "$*"; log "$*"; }
 
 [ "$ENABLED" = "1" ] || { say "gate-auto-unblock: DESLIGADO (GATE_AUTO_UNBLOCK_ENABLED=0)"; exit 0; }
 
+# ga-hi28wr: a lista do que conta como "branch de entrega" de um bead mora num
+# lugar só — delivery-branch-patterns.sh, irmão deste arquivo (ga-x7m5rg).
+# branch_for() lê dela em vez de ter a cópia própria que tinha (e que o
+# ga-rdx5h remendou por INSTÂNCIA, só feat/). Sem a lib NENHUMA regra R1-R4 tem
+# base — R1 apaga o label de verdade com base em "não achei branch", e sem a lib
+# isso seria dado nunca lido. Falha de deploy, então para ALTO (rc 2, visível no
+# `launchctl list`), em vez de rc 0 como as saídas fail-safe abaixo, que são
+# estados legítimos. Checa as FUNÇÕES, não só `[ -r ]`: uma lib corrompida
+# também não define nada. O stderr do `source` fica de propósito (lib corrompida
+# tem que ser barulhenta).
+_GAU_DBP="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/delivery-branch-patterns.sh"
+if [ -r "$_GAU_DBP" ]; then
+  source "$_GAU_DBP"
+fi
+if ! { type gc_delivery_branch_globs >/dev/null 2>&1 && type gc_delivery_branch_pick >/dev/null 2>&1; }; then
+  say "gate-auto-unblock: delivery-branch-patterns.sh ausente/ilegível/corrompido ao lado do script ($_GAU_DBP) — sem a lista de branches de entrega não há como distinguir 'sem branch' de 'não sei'; saindo SEM tocar em nenhum bead (ga-hi28wr)"
+  exit 2
+fi
+unset _GAU_DBP
+
 # ⚠️ (revisor, gate-run ga-2ywzoo): trava de instância única — SEM ela,
 # este guard é exatamente o precedente já documentado nesta cidade
 # (ga-y0g5x): StartInterval sem lock, um run que ultrapassa o próprio
@@ -220,49 +240,61 @@ rig_dir() {
   esac
 }
 
-# branch_for <rig> <bead> → nome da branch no REMOTO, ou vazio.
-# Casa o id exato E variantes com sufixo (-r2, -v2, -fix…), com a mesma
-# regra literal do lifecycle-auditor (ga-luyz48): o hífen ancora a
-# fronteira, então wa-v89e3 não casa a branch de wa-v89e3.9.
+# branch_for <rig> <bead> → nome da branch no REMOTO ("origin/<branch>") em
+# stdout. TRÊS desfechos, porque "achei", "olhei e não há" e "não consegui olhar"
+# levam a ações diferentes — e R1, que APAGA o label de verdade, só pode rodar
+# sobre o segundo (ga-hi28wr):
+#   rc 0 + nome   achou      → has_own_work decide
+#   rc 0 + vazio  olhei e não há branch de entrega (R1 genuíno)
+#   rc 2          não sei    → quem chama NÃO conclui "sem branch"
+# Antes, `for-each-ref | awk` engolia o rc do git: um 128 (repo ilegível, lock,
+# disco cheio) saía como vazio, idêntico a "não há", e disparava R1.
 #
-# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 2): busca TRÊS
-# namespaces (crew/*/*, fix/* e feat/*) numa só chamada, e for-each-ref
-# devolve tudo ORDENADO ALFABETICAMENTE — "crew" < "feat" < "fix"
-# sempre. A versão antiga pegava o PRIMEIRO match ({print; exit}), então
-# se o MESMO bead tivesse ref em mais de uma (crew abandonada + fix
-# real, ou vice-versa — a branch ativa de um bead pode legitimamente
-# migrar de namespace ao longo da vida dele), a escolha era um acidente
-# alfabético, nunca a mais recente — podendo apagar a trava da branch
-# ERRADA e deixar o trabalho real sem exame e sem lock. Agora coleta
-# TODOS os matches e escolhe pelo commit TIP mais recente. Se a busca de
-# epoch falhar pra algum candidato (raro — a ref acabou de ser listada),
-# ainda devolve o PRIMEIRO candidato visto como fallback, nunca vazio
-# quando existe pelo menos um match — vazio só quando não há match
-# nenhum (R1 genuíno).
+# QUAIS refs são candidatas vem de delivery-branch-patterns.sh (a mesma lista do
+# GAP-2 e do Pilot): <prefixo>/<id> e <prefixo>/<id>-* pra fix feat feature
+# refactor docs chore test, mais crew/*/<id>[-*]. O bare <id> e o "<id>-*" são
+# globs separados, então wa-v89e3 não casa a branch de wa-v89e3.9 nem de um id
+# MAIS LONGO que só começa igual (regra literal do lifecycle-auditor, ga-luyz48);
+# gc_delivery_branch_pick revalida cada ref que o git devolveu. Uma só chamada de
+# for-each-ref com todos os globs: ~25 ms contra ~270 ms uma por glob (medido no
+# pilot-dispatcher, ga-3ebneo).
 #
-# 🚨 (ga-rdx5h, evidência ao vivo ga-06mt3k): 'refs/remotes/origin/feat/*'
-# faltava desta lista. feat/* é o prefixo OBRIGATÓRIO pra branch de
-# story/feature nesta cidade (o push guard rejeita story/* e exige
-# feat/*) — sem esse namespace, TODO bead cujo trabalho vive numa branch
-# feat/<id>-... fazia branch_for() devolver vazio incondicionalmente,
-# disparando R1 ("sem branch no remoto e sem commit próprio") mesmo com
-# a branch existindo com commits reais, e apply_and_report removia o
-# gate:needs-human de verdade — derrotando o circuit breaker (ga-stu930)
-# silenciosamente pra essa classe inteira de branch.
+# ⚠️ (ga-rdx5h → ga-hi28wr) esta função já teve lista PRÓPRIA de namespaces. O
+# ga-rdx5h acrescentou feat/ — conserto de INSTÂNCIA — e a lacuna voltou em
+# feature/ refactor/ docs/ chore/ test/: bead entregue ali lia como "sem branch"
+# → R1 → gate:needs-human removido, derrotando o circuit breaker (ga-stu930) em
+# silêncio. Prefixo novo entra na lib e vale aqui sem tocar nesta função.
+#
+# ⚠️ (revisor, gate-run ga-oaqy39, blocking issue 2): a ESCOLHA entre vários
+# candidatos continua sendo o commit TIP mais recente, NÃO a prioridade da lib
+# ("fix/ primeiro"). A branch ativa de um bead pode migrar de namespace ao longo
+# da vida dele; escolher por prefixo (ou pela ordem alfabética do for-each-ref)
+# podia apagar a trava da branch ERRADA e deixar o trabalho real sem exame. A lib
+# só decide quais refs entram na disputa. Se a busca de epoch falhar pra algum
+# candidato (raro — a ref acabou de ser listada), devolve o PRIMEIRO candidato
+# visto como fallback, nunca vazio quando existe pelo menos um match.
 branch_for() {
-  local rig="$1" id="$2" ref best="" best_epoch=-1 epoch first=""
+  local rig="$1" id="$2" globs g refs ref name rc=0 best="" best_epoch=-1 epoch first=""
+  local pats=()
+  globs="$(gc_delivery_branch_globs "$id")" || return 2
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    pats+=("refs/remotes/origin/$g")
+  done <<< "$globs"
+  [ "${#pats[@]}" -gt 0 ] || return 2
+  refs="$("$GIT" -C "$rig" for-each-ref --format='%(refname)' "${pats[@]}" 2>/dev/null </dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 2
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
+    name="$(gc_delivery_branch_pick "$id" <<< "$ref")" || continue
+    ref="origin/$name"
     [ -n "$first" ] || first="$ref"
-    epoch="$("$GIT" -C "$rig" log -1 --format='%ct' "$ref" 2>/dev/null)"
+    epoch="$("$GIT" -C "$rig" log -1 --format='%ct' "$ref" 2>/dev/null </dev/null)"
     if [ -n "${epoch:-}" ] && [ "$epoch" -gt "$best_epoch" ] 2>/dev/null; then
       best="$ref"
       best_epoch="$epoch"
     fi
-  done < <("$GIT" -C "$rig" for-each-ref --format='%(refname:short)' \
-      'refs/remotes/origin/crew/*/*' 'refs/remotes/origin/fix/*' \
-      'refs/remotes/origin/feat/*' 2>/dev/null \
-    | awk -F/ -v id="$id" '$NF==id || substr($NF,1,length(id)+1)==id"-"')
+  done <<< "$refs"
   printf '%s' "${best:-$first}"
 }
 
@@ -544,9 +576,17 @@ mark_r4_acted() {
 # fetch_labels) — reusada aqui pra contar gate-sha-failed:* sem mais uma
 # chamada bd show.
 decide() {
-  local rig="$1" id="$2" labels="$3" br tip last_fail_epoch verdict
+  local rig="$1" id="$2" labels="$3" br br_rc=0 tip last_fail_epoch verdict
 
-  br="$(branch_for "$rig" "$id")"
+  br="$(branch_for "$rig" "$id")" || br_rc=$?
+
+  # "Não consegui olhar" (ga-hi28wr) não é "olhei e não há": o R1 abaixo APAGA o
+  # label de verdade. Mesmo estado que has_own_work usa pro seu "unknown" (R5 —
+  # a única regra que não muta label), nunca R1.
+  if [ "$br_rc" -ne 0 ]; then
+    printf 'R5|não consegui listar as refs de entrega de %s no repo %s (git for-each-ref falhou ou a lista de delivery-branch-patterns.sh está inutilizável) — não dá pra confirmar se existe branch, não é seguro tratar como órfã' "$id" "$rig"
+    return 0
+  fi
 
   # R1 — sem trabalho: trava órfã.
   if [ -z "$br" ]; then
@@ -745,7 +785,17 @@ main() {
         rule="R5"
         why="bead carrega gate:fix-attempt:N com N >= ${GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP} (circuit-breaker de quality-gate-dispatcher.sh esgotado e VERIFICADO, ga-55syh) — R1-R4 pulados incondicionalmente: R1 leria 'sem commit novo' como trava órfã e R4 leria as reprovações repetidas como caso pra redespachar com teste mais forte; nenhuma das duas pode decidir por um bead onde outro subsistema já determinou que o auto-retry tem que parar (ga-3pkhtc)"
       else
-        IFS='|' read -r rule why <<< "$(decide "$rig" "$id" "$labels")"
+        # ⚠️ (ga-hi28wr) decide() roda ANTES do `IFS='|' read`, não dentro da
+        # here-string dele: no bash 3.2 de /bin/bash (o que o plist usa) a
+        # atribuição temporária de IFS já está valendo quando o `$(decide …)` da
+        # here-string é expandido, e decide() inteira rodava com IFS='|'. Isso
+        # nunca importou enquanto nada ali dependia de word splitting — até
+        # branch_for passar a ler GC_DELIVERY_BRANCH_PREFIXES da lib com
+        # `for _p in $LISTA`: com IFS='|' vira UMA palavra, nenhum glob casa,
+        # branch_for devolve vazio com rc 0 e TODO bead lia como R1.
+        local decided
+        decided="$(decide "$rig" "$id" "$labels")"
+        IFS='|' read -r rule why <<< "$decided"
       fi
       case "$rule" in
         R1)
@@ -772,6 +822,9 @@ main() {
           # Recalcula br/tip aqui (decide() não expõe: contrato "rule|why"
           # continua puro para R1/R2/R3/R5) — chamadas locais de git,
           # baratas, só neste ramo.
+          # Se este segundo lookup falhar (rc 2, stdout vazio) o tip fica vazio:
+          # r4_already_acted não suprime e nada é carimbado — o mesmo fallback de
+          # sempre pra tip ilegível, agora também pra lookup ilegível.
           local r4_br r4_tip
           r4_br="$(branch_for "$rig" "$id")"
           r4_tip="$(branch_tip_epoch "$rig" "$r4_br")"

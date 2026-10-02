@@ -105,10 +105,16 @@ case "$SUBCMD" in
     # branch_for não buscava refs/remotes/origin/feat/*, e um mock que
     # ignora os padrões mascararia esse bug pra sempre — qualquer teste
     # passaria com ou sem o fix).
+    # for_each_ref_fail (arquivo-gatilho, ga-hi28wr): o git real sai !=0
+    # (128 "not a git repository", lock, disco cheio) SEM listar nada — o
+    # terceiro estado "não consegui olhar", distinto de "olhei e não há".
+    [ -f "$FX/for_each_ref_fail" ] && exit 128
     shift 3
     patterns=()
+    fmt="refname:short"
     for a in "$@"; do
       case "$a" in
+        --format=%\(refname\)) fmt="refname" ;;
         --format=*) ;;
         *) patterns+=("$a") ;;
       esac
@@ -121,7 +127,11 @@ case "$SUBCMD" in
       full="refs/remotes/$ln"
       for p in "${patterns[@]}"; do
         case "$full" in
-          $p) printf '%s\n' "$ln"; break ;;
+          $p)
+            # --format=%(refname) imprime a ref inteira; o default do shim
+            # continua o short form, como o git real com refname:short.
+            if [ "$fmt" = "refname" ]; then printf '%s\n' "$full"; else printf '%s\n' "$ln"; fi
+            break ;;
         esac
       done
     done < "$FX/branches.txt" 2>/dev/null
@@ -440,6 +450,102 @@ case "$OUT" in
     ok "ga-rdx5h: branch feat/* agora é resolvida por branch_for — não vira mais órfão falso (ga-06mt3k, evidência ao vivo do bug)";;
   *) bad "ga-rdx5h: resultado inesperado para branch feat/*" "$OUT";;
 esac
+
+# ── ga-hi28wr: branch_for tinha a PRÓPRIA lista de namespaces ──────────
+# ga-rdx5h consertou a INSTÂNCIA (uma linha a mais, feat/*) e a lacuna voltou
+# nos outros cinco prefixos que a lista única (delivery-branch-patterns.sh,
+# ga-x7m5rg) já conhece: feature/ refactor/ docs/ chore/ test/. Bead entregue
+# numa dessas fazia branch_for() devolver vazio → R1 → gate:needs-human
+# REMOVIDO de verdade. O conserto é de CLASSE: a lista vem da lib, e este
+# teste percorre a lib (não uma cópia dos prefixos) — prefixo novo na lib
+# entra aqui sozinho. Cada caso afere o EFEITO (nenhum label removido), não só
+# o texto da saída.
+LIB_PREFIXES="$(. "$HERE/delivery-branch-patterns.sh" && printf '%s' "$GC_DELIVERY_BRANCH_PREFIXES")"
+n=0
+for pfx in $LIB_PREFIXES; do
+  n=$((n+1)); id="ga-hb$n"
+  setup "$id" '["gate:needs-human"]' "origin/$pfx/$id-slug" '+ 173b5ffc5' '1755000000'
+  OUT="$(run)"
+  if [ -s "$TMP/fx.$id/removed.log" ] || case "$OUT" in *"R1 $id"*) true;; *) false;; esac; then
+    bad "ga-hi28wr: branch $pfx/$id-slug com trabalho único foi lida como órfã (R1) — branch_for não enxerga o namespace $pfx/ e o gate:needs-human foi removido" "$OUT | removed: $(cat "$TMP/fx.$id/removed.log")"
+  else
+    case "$OUT" in
+      *"$id"*"$pfx/$id-slug"*) ok "ga-hi28wr: $pfx/<id>-slug resolve em branch_for e preserva o gate:needs-human";;
+      *) bad "ga-hi28wr: resultado inesperado para $pfx/$id-slug" "$OUT";;
+    esac
+  fi
+done
+# A forma SEM slug (<prefix>/<id> pelado) é um glob separado na lib (ga-r7uec).
+for pfx in refactor docs; do
+  id="ga-hbb-$pfx"
+  setup "$id" '["gate:needs-human"]' "origin/$pfx/$id" '+ 173b5ffc5' '1755000000'
+  OUT="$(run)"
+  if [ -s "$TMP/fx.$id/removed.log" ] || case "$OUT" in *"R1 $id"*) true;; *) false;; esac; then
+    bad "ga-hi28wr: branch $pfx/$id (sem slug) lida como órfã — gate:needs-human removido" "$OUT | removed: $(cat "$TMP/fx.$id/removed.log")"
+  else
+    ok "ga-hi28wr: $pfx/<id> pelado (sem slug) também resolve em branch_for"
+  fi
+done
+
+# A escolha entre namespaces continua sendo o commit TIP mais recente (revisor
+# ga-oaqy39, blocking issue 2) — a lib só decide QUAIS refs são candidatas. A
+# prioridade da lib é "fix/ primeiro"; se alguém trocasse a escolha por ela,
+# a fix/ ANTIGA e sem trabalho único (dispararia R1 destrutivo) ganharia da
+# refactor/ NOVA com trabalho de verdade.
+setup ga-hbmix '["gate:needs-human"]' \
+  "$(printf 'origin/fix/ga-hbmix-old\norigin/refactor/ga-hbmix-new')" '' ''
+echo '-' > "$TMP/fx.ga-hbmix/cherry.origin_fix_ga-hbmix-old.txt"
+echo '1000000000' > "$TMP/fx.ga-hbmix/tip_epoch.origin_fix_ga-hbmix-old.txt"
+echo '+ abcdef01' > "$TMP/fx.ga-hbmix/cherry.origin_refactor_ga-hbmix-new.txt"
+echo '1900000000' > "$TMP/fx.ga-hbmix/tip_epoch.origin_refactor_ga-hbmix-new.txt"
+OUT="$(run)"
+case "$OUT" in
+  *"R5 ga-hbmix"*"origin/refactor/ga-hbmix-new"*)
+    ok "ga-hi28wr: entre namespaces vale o tip mais recente (refactor/ novo), não a prioridade fix/-primeiro da lib";;
+  *"R1 ga-hbmix"*)
+    bad "ga-hi28wr: escolheu a fix/ ANTIGA por prioridade de prefixo e disparou R1 — a refactor/ real ficaria sem lock e sem exame" "$OUT";;
+  *) bad "ga-hi28wr: resultado inesperado na escolha entre namespaces" "$OUT";;
+esac
+
+# Id MAIS LONGO que apenas começa com o id do bead não é a entrega dele.
+setup ga-hbd1 '["gate:needs-human"]' \
+  "$(printf 'origin/refactor/ga-hbd12\norigin/docs/ga-hbd1x-foo')" '+ 173b5ffc5' '1755000000'
+OUT="$(run)"
+case "$OUT" in
+  *"R1 ga-hbd1 "*) ok "ga-hi28wr: refs de OUTRO bead (id mais longo com o mesmo começo) não contam como entrega — segue R1 genuíno";;
+  *) bad "ga-hi28wr: ref de bead diferente foi tomada como entrega de ga-hbd1" "$OUT";;
+esac
+
+# Terceiro estado: o git NÃO conseguiu listar as refs (128, lock, disco). Isso
+# não é "olhei e não há branch" — e R1 APAGA o label de verdade. Tem que cair no
+# mesmo estado que has_own_work usa para "não sei" (R5), sem remover nada.
+setup ga-hbfail '["gate:needs-human"]' 'origin/refactor/ga-hbfail-x' '+ 173b5ffc5' '1755000000'
+: > "$TMP/fx.ga-hbfail/for_each_ref_fail"
+OUT="$(run)"
+if [ -s "$TMP/fx.ga-hbfail/removed.log" ] || case "$OUT" in *"R1 ga-hbfail"*) true;; *) false;; esac; then
+  bad "ga-hi28wr: for-each-ref FALHOU e foi lido como 'sem branch' (R1) — gate:needs-human removido sobre dado que nunca foi lido" "$OUT | removed: $(cat "$TMP/fx.ga-hbfail/removed.log")"
+else
+  case "$OUT" in
+    *"R5 ga-hbfail"*) ok "ga-hi28wr: for-each-ref falhando escala via R5 ('não sei'), não vira R1 (falso órfão)";;
+    *) bad "ga-hi28wr: for-each-ref falhando deveria cair em R5" "$OUT";;
+  esac
+fi
+
+# Lib compartilhada ausente/ilegível = falha de DEPLOY, não evidência de que não
+# há branch: sem ela nenhuma regra R1-R4 tem base. O script para ALTO (rc != 0,
+# visível no launchctl list) e não toca em bead nenhum.
+mkdir -p "$TMP/nolib"; cp "$SCRIPT" "$TMP/nolib/gate-auto-unblock.sh"
+setup ga-hbnolib '["gate:needs-human"]' 'origin/refactor/ga-hbnolib-x' '+ 173b5ffc5' '1755000000'
+OUT="$(GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
+  GATE_AUTO_UNBLOCK_LOG="$TMP/log" GATE_AUTO_UNBLOCK_LOCK="$TMP/gate-auto-unblock-nolib.lock" \
+  BD=bd GIT=git bash "$TMP/nolib/gate-auto-unblock.sh" 2>&1)"; NOLIB_RC=$?
+if [ "$NOLIB_RC" -ne 0 ] && ! [ -s "$TMP/fx.ga-hbnolib/removed.log" ] \
+   && case "$OUT" in *"delivery-branch-patterns.sh"*) true;; *) false;; esac \
+   && case "$OUT" in *"R1 ga-hbnolib"*) false;; *) true;; esac; then
+  ok "ga-hi28wr: sem delivery-branch-patterns.sh o script para ALTO (rc=$NOLIB_RC), nomeia a lib e não toca em bead (falha de deploy ≠ 'sem branch')"
+else
+  bad "ga-hi28wr: lib ausente deveria parar com rc != 0, nomear a lib e não mutar nada (rc=$NOLIB_RC)" "$OUT | removed: $(cat "$TMP/fx.ga-hbnolib/removed.log" 2>/dev/null)"
+fi
 
 # ── armadilha D: label "failed" sem veredito FAIL (ga-xt8zrf) ──────────
 # O marker dizia "failed", o revisor tinha dado PASS — quem falhou foi
