@@ -208,6 +208,11 @@ VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_NEITHER" 
 finalized && bad "finalized a run whose reviewer has no session bead yet: $(dump)" || ok "notfound: left in flight"
 has_line "^log:.*ga-e7yxde's reviewer $N1 is absent.*session bead is 'notfound'.*ga-uk0km5" && ok "notfound: reason says the bead is 'notfound'" || bad "notfound: silent: $(dump)"
 
+echo "── 7b. absent from the roster and the session-bead lookup yields NOTHING USABLE (empty output) -> wait; the warn names the run and the verdict bead ──"
+VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON="$ROSTER_NEITHER" CLOSED_OUT='' OPEN_OUT='[]' run_case
+finalized && bad "requeued on an unusable session-bead lookup: $(dump)" || ok "left in flight"
+has_line "^warn:.*gate-run ga-jb52od: verdict bead ga-e7yxde's reviewer $N1 is absent.*could not be read.*ga-oj7bzs" && ok "the unknown arm's warn names the run (ga-jb52od), the verdict bead (ga-e7yxde) and the reviewer, and keeps its ga-oj7bzs tag" || bad "unknown arm does not name the run/bead: $(dump)"
+
 echo "── 8. the dead slot's name re-used by a LIVE session must not be re-queued as dead (slot 1 itself listed) ──"
 VBS_JSON="[$VB1]" VB_SHOW_1="$VB1" VB_SHOW_2="$VB2" SESS_JSON='{"sessions":[{"session_name":"'"$N1"'","id":"ga-new1","state":"active","closed":false}]}' CLOSED_OUT="$CLOSED_BEAD1" OPEN_OUT='[{"id":"ga-new1","status":"open","metadata":{"session_name":"'"$N1"'"}}]' run_case
 finalized && bad "re-queued a run whose slot name is alive in the roster: $(dump)" || ok "left in flight"

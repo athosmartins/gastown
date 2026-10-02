@@ -10733,8 +10733,9 @@ gate_phase_c_all_pending_closed() {
       return 1
     fi
     if [ -z "$_pcc_sid" ]; then
-      # The bead WAS read, but neither its assignee nor metadata.gc.session_name names a reviewer (the capture already falls back
-      # from one to the other, ga-8wec8c). Not "unreadable". This check cannot confirm anything about a reviewer it cannot name,
+      # The capture found no name: neither the assignee nor metadata.gc.session_name (it already falls back from one to the other,
+      # ga-8wec8c). A failed bd show would have captured __UNKNOWN__ instead, so this is not the "unreadable" state as far as the
+      # capture can tell (a show that succeeded with output jq could not parse also lands here). This check cannot confirm anything about a reviewer it cannot name,
       # so it waits. At the run timeout the dead-reviewer classifier reads an unnameable reviewer as dead (reviewer_session_alive ""
       # answers 0), but the run is re-queued only if EVERY pending slot reads dead; any live pending reviewer sends it to TIMED OUT.
       warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb is pending but neither its assignee nor metadata.gc.session_name names a reviewer — not confirming anything here; run keeps waiting. At the timeout an unnameable reviewer reads as dead: the run is re-queued only if every pending reviewer reads dead, and otherwise TIMED OUT as a FAIL (ga-uk0km5)."
@@ -10749,7 +10750,7 @@ gate_phase_c_all_pending_closed() {
         _pcc_bst=$(reviewer_session_bead_state "$_pcc_sid" "$_pcc_hours")
         case "$_pcc_bst" in
           closed) continue ;;
-          unknown) warn "  Phase C: reviewer $_pcc_sid is absent from 'gc session list' and its session bead could not be read this sweep — not confirming it dead; run keeps waiting (root-class:error-vs-empty, ga-oj7bzs)." ;;
+          unknown) warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is absent from 'gc session list' and its session bead could not be read this sweep — not confirming it dead; run keeps waiting (root-class:error-vs-empty, ga-oj7bzs, ga-uk0km5)." ;;
           *) log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is absent from 'gc session list' but its session bead is '$_pcc_bst' (a live or not-yet-created incarnation of that name) — run keeps waiting (ga-uk0km5)." ;;
         esac
       else
