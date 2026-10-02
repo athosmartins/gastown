@@ -1,0 +1,175 @@
+diff --git a/cmd/gc/template_resolve_phase2_test.go b/cmd/gc/template_resolve_phase2_test.go
+index 5cd711676..f0b49e423 100644
+--- a/cmd/gc/template_resolve_phase2_test.go
++++ b/cmd/gc/template_resolve_phase2_test.go
+@@ -65,7 +65,7 @@ func selectedPhase2ProviderCases(t *testing.T) []phase2ProviderCase {
+ 			wantProcessNames:      []string{"node", "claude"},
+ 			wantEmitsPermission:   true,
+ 			wantModelOverride:     "sonnet",
+-			wantModelOverrideArgs: []string{"--model", "claude-sonnet-4-6"},
++			wantModelOverrideArgs: []string{"--model", "claude-sonnet-5-5"},
+ 		},
+ 		{
+ 			profileID:             "codex/tmux-cli",
+diff --git a/cmd/gc/template_resolve_t3bridge.go b/cmd/gc/template_resolve_t3bridge.go
+index fc1be5787..799424d0e 100644
+--- a/cmd/gc/template_resolve_t3bridge.go
++++ b/cmd/gc/template_resolve_t3bridge.go
+@@ -124,5 +124,5 @@ func t3BridgeStartupEnvelopeModel(provider string, tp TemplateParams) string {
+ 	if provider == "codex" {
+ 		return "gpt-5-codex"
+ 	}
+-	return "claude-opus-4-6"
++	return "claude-opus-5-5"
+ }
+diff --git a/cmd/gc/template_resolve_test.go b/cmd/gc/template_resolve_test.go
+index 3211007e1..8c8708061 100644
+--- a/cmd/gc/template_resolve_test.go
++++ b/cmd/gc/template_resolve_test.go
+@@ -29,12 +29,12 @@ func TestT3BridgeStartupEnvelopeModel_UsesCurrentProviderDefaults(t *testing.T)
+ 		{
+ 			name: "codex-mini",
+ 			tp:   TemplateParams{Env: map[string]string{"GC_PROVIDER": "codex-mini"}},
+-			want: "claude-opus-4-6",
++			want: "claude-opus-5-5",
+ 		},
+ 		{
+ 			name: "claude",
+ 			tp:   TemplateParams{Env: map[string]string{"GC_PROVIDER": "claude"}},
+-			want: "claude-opus-4-6",
++			want: "claude-opus-5-5",
+ 		},
+ 	}
+ 
+diff --git a/internal/config/provider_test.go b/internal/config/provider_test.go
+index 66c14edca..7b568b2ad 100644
+--- a/internal/config/provider_test.go
++++ b/internal/config/provider_test.go
+@@ -73,6 +73,7 @@ func TestBuiltinProvidersClaude(t *testing.T) {
+ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
+ 	p := BuiltinProviders()["claude"]
+ 	var model OptionChoice
++	var sonnet OptionChoice
+ 	var oldOpus OptionChoice
+ 	for _, opt := range p.OptionsSchema {
+ 		if opt.Key != "model" {
+@@ -82,13 +83,27 @@ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
+ 			switch choice.Value {
+ 			case "opus":
+ 				model = choice
++			case "sonnet":
++				sonnet = choice
+ 			case "opus-4-7":
+ 				oldOpus = choice
+ 			}
+ 		}
+ 	}
+-	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
+-		t.Fatalf("opus FlagArgs = %v, want Opus 4.8", model.FlagArgs)
++	// "opus" and "sonnet" are the tier choices an agent gets from
++	// option_defaults.model; they must land on the 5.5 models, not on
++	// whatever the table last pinned (ga-3dhb91).
++	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-5-5"}) {
++		t.Fatalf("opus FlagArgs = %v, want Opus 5.5", model.FlagArgs)
++	}
++	if !reflect.DeepEqual(model.FlagAliases, [][]string{{"-m", "claude-opus-5-5"}}) {
++		t.Fatalf("opus FlagAliases = %v, want -m Opus 5.5", model.FlagAliases)
++	}
++	if !reflect.DeepEqual(sonnet.FlagArgs, []string{"--model", "claude-sonnet-5-5"}) {
++		t.Fatalf("sonnet FlagArgs = %v, want Sonnet 5.5", sonnet.FlagArgs)
++	}
++	if !reflect.DeepEqual(sonnet.FlagAliases, [][]string{{"-m", "claude-sonnet-5-5"}}) {
++		t.Fatalf("sonnet FlagAliases = %v, want -m Sonnet 5.5", sonnet.FlagAliases)
+ 	}
+ 	if !reflect.DeepEqual(oldOpus.FlagArgs, []string{"--model", "claude-opus-4-7"}) {
+ 		t.Fatalf("opus-4-7 FlagArgs = %v, want Opus 4.7 preserved", oldOpus.FlagArgs)
+diff --git a/internal/runtime/t3bridge/provider.go b/internal/runtime/t3bridge/provider.go
+index f3233e9fb..36fea78ca 100644
+--- a/internal/runtime/t3bridge/provider.go
++++ b/internal/runtime/t3bridge/provider.go
+@@ -1596,6 +1596,10 @@ func deriveProjectTitle(name, workspaceRoot string, envelope StartupEnvelope) st
+ 
+ const defaultCodexModel = "gpt-5.4"
+ 
++// defaultClaudeModel is what a claude thread lands on when nothing chose a
++// model. The two fallbacks below share it so they cannot drift apart.
++const defaultClaudeModel = "claude-sonnet-5-5"
++
+ func resolveProviderModel(cfg runtime.Config, envelope StartupEnvelope) (string, string) {
+ 	provider := normalizeT3Provider(cfg.Env["GC_PROVIDER"])
+ 	model := strings.TrimSpace(cfg.Env["GC_MODEL"])
+@@ -1618,7 +1622,7 @@ func resolveProviderModel(cfg runtime.Config, envelope StartupEnvelope) (string,
+ 		if provider == "codex" {
+ 			model = defaultCodexModel
+ 		} else {
+-			model = "claude-sonnet-4-6"
++			model = defaultClaudeModel
+ 		}
+ 	}
+ 	return provider, model
+@@ -1665,7 +1669,7 @@ func resolveBindingProviderModel(binding threadBinding, env map[string]string) (
+ 		if provider == "codex" {
+ 			model = defaultCodexModel
+ 		} else {
+-			model = "claude-sonnet-4-6"
++			model = defaultClaudeModel
+ 		}
+ 	}
+ 	return provider, model
+diff --git a/internal/runtime/t3bridge/provider_test.go b/internal/runtime/t3bridge/provider_test.go
+index e48b4dde4..c13fd1dcd 100644
+--- a/internal/runtime/t3bridge/provider_test.go
++++ b/internal/runtime/t3bridge/provider_test.go
+@@ -87,6 +87,36 @@ func TestResolveProviderModel_DefaultsCodexToGPT54WhenModelMissing(t *testing.T)
+ 	}
+ }
+ 
++// The claude fallback is asserted as a literal on purpose: it is the model an
++// agent silently lands on when nothing chose one, so a change to it must be a
++// deliberate edit to this test too (ga-3dhb91: it sat on claude-sonnet-4-6).
++func TestResolveProviderModel_DefaultsClaudeToSonnet55WhenModelMissing(t *testing.T) {
++	cfg := runtime.Config{
++		Command: "claude --dangerously-skip-permissions",
++	}
++
++	provider, model := resolveProviderModel(cfg, StartupEnvelope{})
++	if provider != "claudeAgent" {
++		t.Fatalf("provider = %q, want claudeAgent", provider)
++	}
++	if model != "claude-sonnet-5-5" {
++		t.Fatalf("model = %q, want claude-sonnet-5-5", model)
++	}
++}
++
++func TestResolveBindingProviderModel_DefaultsClaudeToSonnet55WhenModelMissing(t *testing.T) {
++	provider, model := resolveBindingProviderModel(threadBinding{
++		Provider: "claudeAgent",
++		Model:    "",
++	}, nil)
++	if provider != "claudeAgent" {
++		t.Fatalf("provider = %q, want claudeAgent", provider)
++	}
++	if model != "claude-sonnet-5-5" {
++		t.Fatalf("model = %q, want claude-sonnet-5-5", model)
++	}
++}
++
+ func TestDecodeIssuedBearerSessionToken(t *testing.T) {
+ 	token, err := decodeIssuedBearerSessionToken([]byte(`{"sessionId":"session-1","token":"test-bearer","role":"owner"}`))
+ 	if err != nil {
+diff --git a/internal/worker/builtin/profiles.go b/internal/worker/builtin/profiles.go
+index 7e30c256f..a2b3ba399 100644
+--- a/internal/worker/builtin/profiles.go
++++ b/internal/worker/builtin/profiles.go
+@@ -152,9 +152,9 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
+ 				Type:  "select",
+ 				Choices: []BuiltinOptionChoice{
+ 					{Value: "", Label: "Default"},
+-					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
++					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-5-5"}, FlagAliases: [][]string{{"-m", "claude-opus-5-5"}}},
+ 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
+-					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
++					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-5-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5-5"}}},
+ 					{Value: "haiku", Label: "Haiku", FlagArgs: []string{"--model", "claude-haiku-4-5-20251001"}, FlagAliases: [][]string{{"-m", "claude-haiku-4-5-20251001"}}},
+ 				},
+ 			},
