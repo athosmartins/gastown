@@ -45,6 +45,7 @@ LAUNCHD: one-shot, StartInterval=600 — launchd controls cadence, not internal 
 DPW: add com.gascity.approved-state-reconciler to DPW_CRITICAL after Mayor deploys.
 """
 import datetime
+import fnmatch
 import json
 import os
 import plistlib
@@ -356,8 +357,11 @@ _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
 _bd_gate_markers = None     # () -> list[dict]|None; OPEN quality-gate-markers in the HQ store
 _bd_blocked = None          # (rig_root) -> list[dict]|None; None return = query error
-_bd_has_built_branch = None  # (bead_id) -> bool; True iff a crew/*/<id> or fix/<id>-*
-                              # branch exists (local or origin remote-tracking) anywhere
+_bd_has_built_branch = None  # (bead_id) -> bool; True iff a delivery branch for the bead
+                              # (the shared delivery-branch-patterns.sh list) exists (local or
+                              # origin remote-tracking) anywhere
+_bd_delivery_branch_prefixes = None  # () -> list[str]|None; ga-3ebneo — the shared prefix list;
+                                      # None return = "could not read it"
 _bd_branch_stranded = None  # (bead_id) -> (repo, ref, age_days)|None; ga-32u6s orphan-branch probe
 # _bd_gate_queue_markers/_read_gate_log_lines moved to gate_queue_backlog.py (ga-ahn3v) —
 # selftest scenarios below stub them as gate_queue_backlog.<name>, not a local global.
@@ -2789,25 +2793,120 @@ def _ownership_guard_repos():
     return out
 
 
+# ── ga-3ebneo: which branch names count as "this bead's delivery" ───────────────────
+# _real_has_built_branch and _matched_built_branch_ref MIRROR pilot-dispatcher.sh's
+# _filter_built and _beadid_matched_crew_branch_ref: the reconciler uses them to tell "the
+# Pilot is skipping this bead because it is already built" from "the dispatch path is
+# failing". Both sides used to carry their own hand-written crew/*/<id> + fix/<id>-* list,
+# so they agreed. ga-3ebneo made the Pilot read delivery-branch-patterns.sh (fix feat feature
+# refactor docs chore test, then crew/*/<id>[-*]); a mirror that kept the old list would page
+# the Mayor "dispatch failing" for every bead the Pilot now, correctly, skips because it was
+# delivered on feat/<id>. So the mirror reads the SAME file — parsed from the live Pilot's own
+# directory, the way _pilot_static_exact_veto_labels reads the Pilot's label vetoes — never a
+# copy of the list. Every helper answers in three states (found / looked and none / could
+# not tell); "could not tell" ends as NOT built (this file's fail-open direction here), never as
+# a delivery.
+_DELIVERY_PREFIXES = None  # memo for this process (one-shot per launchd tick); None = not read yet
+
+
+def _delivery_branch_lib_path():
+    """delivery-branch-patterns.sh next to the LIVE pilot-dispatcher.sh — the file the Pilot sources."""
+    return os.path.join(os.path.dirname(_pilot_dispatcher_sh_path()), "delivery-branch-patterns.sh")
+
+
+def _delivery_branch_prefixes():
+    """The shared prefix list in priority order (fix first), or None when it cannot be read —
+    a missing/unreadable/corrupt lib is "could not tell", never an empty list that would read as
+    "no branch counts as a delivery"."""
+    global _DELIVERY_PREFIXES
+    if _bd_delivery_branch_prefixes is not None:
+        return _bd_delivery_branch_prefixes()
+    if _DELIVERY_PREFIXES is not None:
+        return _DELIVERY_PREFIXES
+    try:
+        with open(_delivery_branch_lib_path(), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.search(r'^GC_DELIVERY_BRANCH_PREFIXES="([^"\n]*)"[ \t]*$', text, re.MULTILINE)
+    if not m:
+        return None
+    prefixes = m.group(1).split()
+    if not prefixes or not all(re.fullmatch(r"[a-z0-9._-]+", x) for x in prefixes):
+        return None
+    _DELIVERY_PREFIXES = prefixes
+    return prefixes
+
+
+def _delivery_branch_globs(bead_id):
+    """Branch-NAME globs that count as bead_id's delivery, priority order — the same shape as
+    gc_delivery_branch_globs: <prefix>/<id> and <prefix>/<id>-* per prefix, then crew/*/<id>[-*].
+    None = could not tell. The bare <id> and "<id>-" forms stay separate: <id>* would also match a
+    DIFFERENT, longer bead id that merely starts with this one."""
+    prefixes = _delivery_branch_prefixes()
+    if not bead_id or not prefixes:
+        return None
+    out = []
+    for p in prefixes:
+        out.append("%s/%s" % (p, bead_id))
+        out.append("%s/%s-*" % (p, bead_id))
+    out.append("crew/*/%s" % bead_id)
+    out.append("crew/*/%s-*" % bead_id)
+    return out
+
+
+def _delivery_branch_pick(bead_id, refs):
+    """First ref (full refname) in priority order whose branch name REALLY is bead_id's delivery.
+    git for-each-ref also matches a literal pattern as a path prefix (x/<id>/child), so every line
+    is re-checked with an anchored match — a decoy can neither be taken for the delivery nor hide
+    the real branch. None = no ref qualifies (or no usable glob list)."""
+    globs = _delivery_branch_globs(bead_id)
+    if not globs:
+        return None
+    for g in globs:
+        for ref in refs:
+            if ref.startswith("refs/heads/"):
+                name = ref[len("refs/heads/"):]
+            elif ref.startswith("refs/remotes/origin/"):
+                name = ref[len("refs/remotes/origin/"):]
+            else:
+                continue
+            if fnmatch.fnmatchcase(name, g):
+                return ref
+    return None
+
+
+def _delivery_branch_in_repo(repo, bead_id):
+    """bead_id's delivery branch among repo's local branches and the origin refs it has fetched:
+    the full refname when found, "" when looked and there is none, None when it could not tell
+    (no globs, git failed or timed out)."""
+    globs = _delivery_branch_globs(bead_id)
+    if globs is None:
+        return None
+    pats = []
+    for g in globs:
+        pats.append("refs/heads/%s" % g)
+        pats.append("refs/remotes/origin/%s" % g)
+    r = _sh(["git", "-C", repo, "for-each-ref", "--format=%(refname)"] + pats, timeout=10)
+    if r is None or r.returncode != 0:
+        return None
+    refs = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return _delivery_branch_pick(bead_id, refs) or ""
+
+
 def _real_has_built_branch(bead_id):
-    """True iff a crew/<owner>/<id> or fix/<id>-<slug> branch (local or origin
-    remote-tracking) exists in any known repo. Mirrors the branch consultation
-    in pilot-dispatcher.sh's _filter_built (packs/town-deltas/assets/
-    pilot-dispatcher.sh:1900-1902) — same ref patterns, same fail-open-to-False
-    direction (no git / no repos / probe error → NOT built; never invent a
-    false suppression signal)."""
+    """True iff a delivery branch for the bead (the shared delivery-branch-patterns.sh list: <prefix>/<id>
+    and <prefix>/<id>-* for fix feat feature refactor docs chore test, plus crew/*/<id>[-*]) exists,
+    local or origin remote-tracking, in any known repo. Mirrors the branch consultation in
+    pilot-dispatcher.sh's _filter_built (through its _delivery_branch_local_ref) — same list, same
+    fail-open-to-False direction (no git / no repos / probe error / list unreadable → NOT built;
+    never invent a false suppression signal)."""
     if not bead_id:
         return False
     for repo in _ownership_guard_repos():
         if not repo or not os.path.isdir(repo):
             continue
-        r = _sh(["git", "-C", repo, "for-each-ref", "--format=%(refname)",
-                  "refs/remotes/origin/crew/*/%s" % bead_id,
-                  "refs/heads/crew/*/%s" % bead_id,
-                  "refs/remotes/origin/fix/%s-*" % bead_id,
-                  "refs/heads/fix/%s-*" % bead_id],
-                 timeout=10)
-        if r is not None and r.returncode == 0 and (r.stdout or "").strip():
+        if _delivery_branch_in_repo(repo, bead_id):
             return True
     return False
 
@@ -2819,7 +2918,7 @@ def _has_built_branch(bead_id):
 
 
 def _built_branch_reason(bead_id):
-    """Suppress reason if a matching crew/fix branch exists for this bead, else None.
+    """Suppress reason if a delivery branch (shared list) exists for this bead, else None.
 
     Mirrors pilot-dispatcher.sh's _filter_built EXACTLY (ga-lzxhi): _filter_built's
     branch probe (packs/town-deltas/assets/pilot-dispatcher.sh:2164-2166) is keyed
@@ -2849,8 +2948,9 @@ def _built_branch_reason(bead_id):
 
 def _matched_built_branch_ref(bead_id):
     """Like _real_has_built_branch but also returns WHICH (repo, ref) matched —
-    needed to name the specific stranded branch in an alert. Same ref shapes,
-    same repos, same fail-open (no match) direction; deliberately a separate
+    needed to name the specific stranded branch in an alert. Same shared branch
+    list (the highest-priority branch wins: fix/ first), same repos, same
+    fail-open (no match) direction; deliberately a separate
     probe rather than a refactor of _real_has_built_branch, matching this
     file's established pattern of several independently-testable branch-probe
     functions (mirrors pilot-dispatcher.sh's _beadid_has_crew_branch vs.
@@ -2860,16 +2960,9 @@ def _matched_built_branch_ref(bead_id):
     for repo in _ownership_guard_repos():
         if not repo or not os.path.isdir(repo):
             continue
-        r = _sh(["git", "-C", repo, "for-each-ref", "--format=%(refname)",
-                  "refs/remotes/origin/crew/*/%s" % bead_id,
-                  "refs/heads/crew/*/%s" % bead_id,
-                  "refs/remotes/origin/fix/%s-*" % bead_id,
-                  "refs/heads/fix/%s-*" % bead_id],
-                 timeout=10)
-        if r is not None and r.returncode == 0 and (r.stdout or "").strip():
-            ref = (r.stdout or "").strip().splitlines()[0].strip()
-            if ref:
-                return (repo, ref)
+        ref = _delivery_branch_in_repo(repo, bead_id)
+        if ref:
+            return (repo, ref)
     return None
 
 
@@ -3846,7 +3939,7 @@ def _selftest():
     global _pilot_dispatchable_reason_file
     global _arc_ledger, _write_flow_authority
     global DRY_RUN, STARVE_MIN, FLOW_GRACE_MIN, ROUTE_COOLDOWN_SEC, ALARM_COOLDOWN_SEC
-    global _OWNERSHIP_REPOS
+    global _OWNERSHIP_REPOS, _bd_delivery_branch_prefixes
 
     ok_count = [0]
     fail_count = [0]
@@ -6031,6 +6124,10 @@ def _selftest():
     _real_sh = _sh
     _real_ownership_repos = _OWNERSHIP_REPOS
     _OWNERSHIP_REPOS = ["/tmp"]  # any real dir — _sh is faked below, no real git runs
+    # ga-3ebneo: the probe reads the shared branch list; pin it so this scenario does not depend on
+    # whether the live Pilot's delivery-branch-patterns.sh resolves in the environment it runs in.
+    _real_dbp = _bd_delivery_branch_prefixes
+    _bd_delivery_branch_prefixes = lambda: ["fix", "feat", "feature", "refactor", "docs", "chore", "test"]
     OLD_EPOCH_E = int(NOW) - 30 * 86400  # 30d old — well past BRANCH_STRANDED_STALE_HOURS,
                                           # so a code path that WRONGLY proceeds past the
                                           # merge-base check reaches a "stranded" verdict
@@ -6048,6 +6145,9 @@ def _selftest():
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="")
 
     _sh = _fake_sh_e_none
+    # Non-vacuity guard (ga-3ebneo): "returns None" below only proves fail-OPEN if the probe really
+    # matched the fake's ref first — an unreadable branch list would also end in None.
+    matched_e = _matched_built_branch_ref("ga-eee1")
     res_e_none = _real_branch_stranded_reason("ga-eee1")
 
     def _fake_sh_e_128(args, timeout=20):
@@ -6067,6 +6167,10 @@ def _selftest():
 
     _sh = _real_sh
     _OWNERSHIP_REPOS = _real_ownership_repos
+    _bd_delivery_branch_prefixes = _real_dbp
+    if matched_e != ("/tmp", "refs/heads/fix/ga-eee1-slug"):
+        _bad("(ga-32u6s-e)", "VACUOUS — the probe did not match the fake's ref (%r), so the "
+             "fail-open assertion below proves nothing" % (matched_e,))
     if res_e_none is None and res_e_128 is None:
         _ok("(ga-32u6s-e): unresolvable merge-base (r=None / returncode=128) fails "
             "OPEN — returns None instead of misreporting stranded")

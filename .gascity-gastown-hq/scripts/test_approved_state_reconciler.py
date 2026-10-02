@@ -11,7 +11,9 @@ Run: python3 -m pytest scripts/test_approved_state_reconciler.py -q
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -485,3 +487,136 @@ def test_capacity_wait_names_the_pools_newest_cap_whatever_the_iteration_order(m
         assert "teto 2" in mails[0][0] and "teto 4" not in mails[0][0], order
         assert "3 bead(s) na fila" in mails[0][0], order
         assert state["capacity_wait"]["wa-worker"]["fp"] == "wa-worker:2", order
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ga-3ebneo — the built-branch mirrors (_real_has_built_branch / _matched_built_branch_ref)
+# read the Pilot's ONE branch list (delivery-branch-patterns.sh) instead of a copy.
+#
+# They mirror pilot-dispatcher.sh's _filter_built: the reconciler tells "the Pilot skips this bead
+# because it is already built" from "the dispatch path is failing". The Pilot now counts
+# feat/<id>, fix/<id> (no slug), refactor/ ... too; a mirror stuck on crew/*/<id> + fix/<id>-*
+# would page the Mayor "dispatch failing" for each of those. REAL git against throwaway repos.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DELIVERY_LIB = Path(os.environ.get(
+    "DELIVERY_LIB_UNDER_TEST",
+    str(MOD_PATH.parent.parent / "packs" / "town-deltas" / "assets" / "delivery-branch-patterns.sh")))
+
+
+def _bash_lib(snippet):
+    return subprocess.run(["bash", "-c", '. "$1"; ' + snippet, "_", str(DELIVERY_LIB)],
+                          capture_output=True, text=True, check=True).stdout
+
+
+@pytest.fixture
+def work_repo(tmp_path, monkeypatch):
+    r = tmp_path / "work"
+    r.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@t.invalid"], ["config", "user.name", "t"],
+                 ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", str(r)] + args, check=True, capture_output=True)
+    monkeypatch.setattr(asr, "_ownership_guard_repos", lambda: [str(r)])
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(DELIVERY_LIB), raising=False)
+    monkeypatch.setattr(asr, "_DELIVERY_PREFIXES", None, raising=False)
+    monkeypatch.setattr(asr, "_bd_delivery_branch_prefixes", None, raising=False)
+    return r
+
+
+def _mkref(repo, ref):
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "update-ref", ref, sha], check=True, capture_output=True)
+
+
+def test_delivery_prefixes_and_globs_equal_the_bash_lib_exactly():
+    """DRIFT GUARD: the Python parse of the lib and the globs it builds must equal what the lib itself
+    prints, in the same priority order — the mirror is only a mirror while this holds."""
+    asr._DELIVERY_PREFIXES = None
+    asr._bd_delivery_branch_prefixes = None
+    orig = asr._delivery_branch_lib_path
+    asr._delivery_branch_lib_path = lambda: str(DELIVERY_LIB)
+    try:
+        assert asr._delivery_branch_prefixes() == _bash_lib('printf "%s" "$GC_DELIVERY_BRANCH_PREFIXES"').split()
+        for bead in ("ga-abc", "ga-05604.2"):
+            want = _bash_lib('gc_delivery_branch_globs "$2"'.replace("$2", bead)).split()
+            assert asr._delivery_branch_globs(bead) == want, bead
+    finally:
+        asr._delivery_branch_lib_path = orig
+        asr._DELIVERY_PREFIXES = None
+
+
+@pytest.mark.parametrize("ref,bead", [
+    ("refs/heads/feat/ga-feat", "ga-feat"),                    # NEW: feat/<id>
+    ("refs/heads/fix/ga-bare", "ga-bare"),                     # NEW: fix/<id> with no slug
+    ("refs/heads/crew/alice/ga-crewslug-wip", "ga-crewslug"),  # NEW: crew/<owner>/<id>-<slug>
+    ("refs/remotes/origin/refactor/ga-trk-x", "ga-trk"),       # NEW: fetched origin ref, refactor/
+    ("refs/heads/fix/ga-slug-fixture", "ga-slug"),             # old shape
+    ("refs/heads/crew/alice/ga-crew", "ga-crew"),              # old shape
+])
+def test_a_delivery_branch_on_any_shared_shape_is_seen_and_named(work_repo, ref, bead):
+    _mkref(work_repo, ref)
+    assert asr._real_has_built_branch(bead) is True
+    assert asr._matched_built_branch_ref(bead) == (str(work_repo), ref)
+
+
+@pytest.mark.parametrize("refs,bead", [
+    ([], "ga-none"),                                                    # nothing at all
+    (["refs/heads/feat/ga-longer", "refs/heads/fix/ga-long2-x"], "ga-long"),  # LONGER ids sharing the prefix
+    (["refs/heads/chore/ga-ovr/child"], "ga-ovr"),                      # path-prefix decoy only
+    (["refs/tags/feat/ga-tag", "refs/remotes/upstream/feat/ga-tag"], "ga-tag"),  # not branches of ours
+])
+def test_no_delivery_branch_means_not_built(work_repo, refs, bead):
+    for r in refs:
+        _mkref(work_repo, r)
+    assert asr._real_has_built_branch(bead) is False
+    assert asr._matched_built_branch_ref(bead) is None
+
+
+def test_a_decoy_that_sorts_first_does_not_hide_the_real_branch(work_repo):
+    _mkref(work_repo, "refs/heads/chore/ga-nest/child")   # for-each-ref matches it as a path prefix of chore/ga-nest
+    _mkref(work_repo, "refs/heads/feat/ga-nest")
+    assert asr._matched_built_branch_ref("ga-nest") == (str(work_repo), "refs/heads/feat/ga-nest")
+
+
+def test_priority_fix_beats_feat_whichever_sorts_first(work_repo):
+    _mkref(work_repo, "refs/heads/feat/ga-prio")
+    _mkref(work_repo, "refs/heads/fix/ga-prio-b")
+    assert asr._matched_built_branch_ref("ga-prio") == (str(work_repo), "refs/heads/fix/ga-prio-b")
+
+
+def test_could_not_tell_is_never_a_delivery_and_never_the_same_value_as_none(work_repo, monkeypatch):
+    _mkref(work_repo, "refs/heads/feat/ga-feat")
+    # (a) the shared list cannot be read → "could not tell" (None), which ends as NOT built — it must
+    # not fall back to a private list, and must not read as "looked and found none" ("").
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(work_repo / "does-not-exist.sh"))
+    assert asr._delivery_branch_prefixes() is None
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-feat") is None
+    assert asr._real_has_built_branch("ga-feat") is False
+    assert asr._matched_built_branch_ref("ga-feat") is None
+    # (b) lib present again → the failure above was not memoized.
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(DELIVERY_LIB))
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-feat") == "refs/heads/feat/ga-feat"
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-nothing") == ""
+    # (c) git fails → None (could not tell), not "".
+    monkeypatch.setattr(asr, "_sh", lambda args, timeout=20: subprocess.CompletedProcess(args, 128, "", "fatal"))
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-feat") is None
+    assert asr._real_has_built_branch("ga-feat") is False
+    monkeypatch.setattr(asr, "_sh", lambda args, timeout=20: None)   # _sh's own timeout/exception shape
+    assert asr._delivery_branch_in_repo(str(work_repo), "ga-feat") is None
+
+
+@pytest.mark.parametrize("body", [
+    "",                                              # empty file
+    "GC_DELIVERY_BRANCH_PREFIXES=\"\"\n",             # empty list must not read as "no prefix counts"
+    "GC_DELIVERY_BRANCH_PREFIXES=\"fix Feat/x\"\n",   # corrupt token
+    "# GC_DELIVERY_BRANCH_PREFIXES=\"fix\"\n",        # only a comment
+])
+def test_a_corrupt_or_empty_lib_is_could_not_tell(tmp_path, monkeypatch, body):
+    lib = tmp_path / "delivery-branch-patterns.sh"
+    lib.write_text(body)
+    monkeypatch.setattr(asr, "_delivery_branch_lib_path", lambda: str(lib))
+    monkeypatch.setattr(asr, "_DELIVERY_PREFIXES", None, raising=False)
+    monkeypatch.setattr(asr, "_bd_delivery_branch_prefixes", None, raising=False)
+    assert asr._delivery_branch_prefixes() is None
+    assert asr._delivery_branch_globs("ga-x") is None

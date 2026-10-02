@@ -81,6 +81,22 @@ if [ ! -f "$DISPATCHER" ]; then
   exit 2
 fi
 
+# ga-3ebneo: _filter_built / _target_has_real_branch / _beadid_has_crew_branch /
+# _beadid_matched_crew_branch_ref delegate their git lookup to three helpers and read the
+# branch-name list from delivery-branch-patterns.sh. Scenarios ga-8jxe1-b, ga-rcees and
+# ga-6jqr below awk-extract those probes and eval them in isolation against REAL git repos,
+# where the dispatcher's own load-time `source` never ran — without the lib and the helpers
+# loaded here they would read "could not tell" and go red for a harness reason. Plain
+# definitions (no `export -f`): subshells and $(...) inherit them, but a spawned
+# `pilot-dispatcher.sh` does not, so a scenario that simulates a missing lib still sees one.
+. "$SELF_DIR/delivery-branch-patterns.sh" || { echo "FATAL: cannot source $SELF_DIR/delivery-branch-patterns.sh" >&2; exit 2; }
+for _dbh in _delivery_branch_patterns_ready _delivery_branch_local_ref _delivery_branch_remote_hit; do
+  _dbh_src="$(awk -v n="$_dbh" '$0 ~ "^"n"\\(\\) *\\{" {f=1} f {print} f && /^}$/ {exit}' "$DISPATCHER")"
+  [ -n "$_dbh_src" ] || { echo "FATAL: $_dbh not found in $DISPATCHER" >&2; exit 2; }
+  eval "$_dbh_src"
+done
+unset _dbh _dbh_src
+
 # ── Heavy suite: low priority + one full run per machine (ga-rj7b1a) ──────────
 # Taken BEFORE any fixture exists: a second run waits here (or exits 75 = NOT RUN)
 # instead of adding another ~90-process tree to a box that Dolt and the supervisor
