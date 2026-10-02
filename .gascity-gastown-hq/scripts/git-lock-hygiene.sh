@@ -56,7 +56,9 @@
 #   Now an item past the same two gates is LOGGED (event stale_state_found: label, path, repo,
 #   age_sec — every sweep, counted in the sweep summary as stale_state) and NOTIFIED (once per
 #   item, again after GIT_LOCK_STATE_RENOTIFY_SEC, again if a new operation replaces it at the
-#   same path), with the abort command in the text. A human or crew decides. Only
+#   same path), with the abort command in the text. The notification goes to the notify topic
+#   (ntfy) only: nothing is filed on a bead or routed to a crew, so a person has to read it and
+#   decide. Only
 #   GIT_LOCK_STATE_REMOVE=1 restores the old removal (explicit opt-in; the item is then removed
 #   and logged as 'removed', not reported). Cost of the default: a genuinely crashed merge/rebase in a shared root is no
 #   longer healed automatically. While MERGE_HEAD / CHERRY_PICK_HEAD / rebase-merge/ /
@@ -580,12 +582,15 @@ _report_stale_state() {
   fi
   # The marker is written only AFTER a notify that succeeded: a failed notify is retried next sweep
   # rather than recorded as delivered. If the marker cannot be written, the cost is a repeat notice
-  # per sweep — loud, never silent.
+  # per sweep, and the stderr line below says why — a page that repeats with no stated cause would
+  # be loud only as spam.
   if [ -n "$age" ]; then age_txt="ha $(( age / 60 ))min"; else age_txt="ha tempo desconhecido"; fi
   if "$NOTIFY_BIN" -t "Git-lock hygiene" -p 3 \
        "Operacao git parada ${age_txt} em ${repo}: ${label} ($(basename "$path")). NAO removido — pode ser pausa humana ou crash. Se abandonado: git -C ${repo} ${hint}" \
        >/dev/null 2>&1; then
-    mkdir -p "$GIT_LOCK_STATE_DIR" 2>/dev/null && printf '%s\n' "$mt" > "$marker" 2>/dev/null || true
+    if ! { mkdir -p "$GIT_LOCK_STATE_DIR" 2>/dev/null && printf '%s\n' "$mt" > "$marker" 2>/dev/null; }; then
+      echo "[git-lock-hygiene] could not record the announcement of ${path} (state dir ${GIT_LOCK_STATE_DIR} not writable) — it will be announced again on the next sweep" >&2
+    fi
   else
     echo "[git-lock-hygiene] notify FAILED for ${path} — not recorded as announced, retried next sweep" >&2
   fi
@@ -796,7 +801,7 @@ if [ "${1:-}" = "--selftest" ]; then
   bad() { FAIL=$((FAIL+1)); echo "  FAIL $*"; }
 
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/git-lock-hygiene-selftest.XXXXXX")"
-  trap 'rm -rf "$TMP" "${T55_BASE:-}"' EXIT
+  trap 'rm -rf "$TMP"' EXIT
 
   # ga-d8zeli: _log_json appends every removed/would_remove/stale_state_found event to $LOG, which
   # defaults to the LIVE sweeps log — and the fixture repos below fire those events
@@ -1208,7 +1213,9 @@ print(n)
     for p in $LV_PIDS; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
     LV_PIDS=""
   }
-  trap 'lv_cleanup; rm -rf "$TMP" "$LVR"' EXIT
+  # T55_BASE (the end-to-end fixture, made further down) is removed here too: this trap REPLACES the
+  # one set above, so a name added only there would never be cleaned.
+  trap 'lv_cleanup; rm -rf "$TMP" "$LVR" "${T55_BASE:-}"' EXIT
   # lv_proc <argv0> <cwd> [args...] — returns only once ps sees the process under that name.
   lv_proc() {
     local name="$1" cwd="$2" pid i; shift 2
@@ -1739,13 +1746,13 @@ print(n)
   # breaks if a state notice ever leaks onto stdout. `env -u GIT_LOCK_PROCESS_CHECK_FN`: the
   # parent exported a FUNCTION NAME that does not exist in the child shell.
   #
-  # The fixture lives under a dir whose name has no "git" in it, on purpose. This is the one test
-  # that runs the REAL _git_repo_has_live_process (`ps aux | grep '[g]it' | grep -F "$repo"`), and
-  # that pipeline's last grep appears in the ps listing carrying the repo path in its own argv: if
-  # the path itself contains "git" (this selftest's $TMP is git-lock-hygiene-selftest.*), the line
-  # survives the first grep and the check matches ITSELF — a permanent false "live process", so
-  # nothing is ever judged stale. No real rig root has "git" in its path, which is why production is
-  # unaffected; the stubbed tests above never reach that code.
+  # This runs the REAL _git_repo_has_live_process, like T26-T46, but through the whole sweep
+  # entrypoint under /bin/bash — what launchd runs. The fixture lives under a dir whose name has no
+  # "git" in it, a leftover from before ga-hl3xlw: the check then matched the repo path as a
+  # SUBSTRING of the ps line, so a path containing "git" (this selftest's $TMP is
+  # git-lock-hygiene-selftest.*) made it match its own grep — a permanent false "live process". The
+  # check is exact now (per process, by git dir / cwd), so the constraint is no longer required; it
+  # only keeps this fixture independent of that history.
   echo "T55: real sweep — lock removed, state kept + reported, summary line sane"
   T55_BASE="$(mktemp -d "${TMPDIR:-/tmp}/glh-e2e.XXXXXX")"
   R23="$T55_BASE/repo23"; make_repo "$R23"
@@ -1839,6 +1846,23 @@ print(n)
     || bad "T59: expected 1 event, got $(_events stale_state_found)"
   grep -q 'NOT announced' "$TMP/t59.err" && ok "T59: stderr says the item was not announced" \
     || bad "T59: missing notifier was silent — stderr: $(head -c 300 "$TMP/t59.err")"
+
+  # T60: the announcement went out but its marker cannot be written (state dir unwritable). The cost
+  # is a repeat notice on every sweep; the stderr line must say WHY, or the repeat is only spam.
+  echo "T60: marker unwritable → announced each sweep, stderr names the state dir"
+  R28="$TMP/repo28"; make_repo "$R28"
+  touch -t 200001010000 "$R28/.git/MERGE_HEAD"
+  : > "$LOG"; : > "$NOTIFY_CALLS"
+  _T60_REAL_STATE_DIR="$GIT_LOCK_STATE_DIR"
+  GIT_LOCK_STATE_DIR="/dev/null/no-such-state-dir"
+  count=$(_scan_repo "$R28" 2>"$TMP/t60.err")
+  count=$(_scan_repo "$R28" 2>>"$TMP/t60.err")
+  GIT_LOCK_STATE_DIR="$_T60_REAL_STATE_DIR"
+  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T60: announced on both sweeps (no marker to dedupe on)" \
+    || bad "T60: notify calls=$(_lines "$NOTIFY_CALLS") (expected 2)"
+  [ "$(grep -c 'could not record the announcement' "$TMP/t60.err")" = "2" ] && grep -q '/dev/null/no-such-state-dir' "$TMP/t60.err" \
+    && ok "T60: stderr says the announcement could not be recorded, and names the state dir" \
+    || bad "T60: the repeat was silent about its cause — stderr: $(head -c 300 "$TMP/t60.err")"
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""

@@ -86,14 +86,17 @@ SWEEP_LOG="$BASE/sweep.jsonl"; : > "$SWEEP_LOG"
 # /bin/bash on purpose: it is what com.gascity.git-lock-hygiene's plist runs (bash 3.2 on macOS).
 # env -u GIT_LOCK_PROCESS_CHECK_FN: the real liveness check, not a stub.
 env -u GIT_LOCK_PROCESS_CHECK_FN -u GIT_LOCK_DRY_RUN -u GIT_LOCK_ENABLED -u GIT_LOCK_STALE_AGE_SEC \
+    -u GIT_LOCK_STATE_REMOVE -u GIT_LOCK_STATE_RENOTIFY_SEC -u GIT_LOCK_HYGIENE_LIB \
     GC_CITY_PATH="$BASE/city" GIT_LOCK_RIG_ROOTS="$REPO" GIT_LOCK_LOG="$SWEEP_LOG" \
     NOTIFY_BIN="$FAKE_NOTIFY" NOTIFY_CALLS="$NOTIFY_CALLS" GIT_LOCK_STATE_DIR="$BASE/state-notified" \
     /bin/bash "$GLH" >/dev/null 2>"$BASE/sweep.err"
 rc=$?
 [[ $rc -eq 0 ]] || fail "deployed sweep exited $rc under /bin/bash — stderr: $(head -c 400 "$BASE/sweep.err")"
 
+# On the live machine the real ps/lsof can legitimately answer "cannot tell" and keep the lock, which is
+# not the lock half regressing. The sweep summary says which one this is: skipped_live / undetermined.
 [[ ! -e "$REPO/.git/index.lock" ]] \
-  || fail "stale index.lock was NOT removed — the lock half of the janitor regressed"
+  || fail "stale index.lock was NOT removed — the lock half regressed, OR the real ps/lsof could not tell (see skipped_live/undetermined in the sweep line): $(grep '"event":"sweep"' "$SWEEP_LOG" | cut -c1-300); skips: $(grep '"event":"skipped_live"' "$SWEEP_LOG" | cut -c1-200 | head -3)"
 [[ -f "$REPO/.git/MERGE_HEAD" ]] \
   || fail "stale MERGE_HEAD was REMOVED — a merge paused for a human would lose its second parent"
 [[ -d "$REPO/.git/rebase-merge" ]] \
@@ -121,8 +124,13 @@ grep -Eq '^PASS=[0-9]+  FAIL=0$' "$ST_OUT" \
 log "deployed selftest: $(grep -E '^PASS=' "$ST_OUT") ✓"
 
 # ── 4. Merged != running: the live janitor job is loaded ──────────────────────
-launchctl list 2>/dev/null | grep -q 'com\.gascity\.git-lock-hygiene' \
-  || fail "com.gascity.git-lock-hygiene is not loaded in launchd — the janitor is not running at all"
+# Captured, then matched with case: `launchctl list | grep -q` under pipefail can read as a failure (SIGPIPE, 141)
+# when grep exits early (ga-5bxuam).
+_LAUNCHD_LIST=$(launchctl list 2>/dev/null) || fail "launchctl list failed — cannot tell whether the janitor is loaded"
+case "$_LAUNCHD_LIST" in
+  *com.gascity.git-lock-hygiene*) ;;
+  *) fail "com.gascity.git-lock-hygiene is not loaded in launchd — the janitor is not running at all" ;;
+esac
 log "launchd job com.gascity.git-lock-hygiene is loaded ✓"
 
 log "PASS — stale merge/cherry-pick/revert/rebase state is reported, not removed by default; stale locks are still removed"
