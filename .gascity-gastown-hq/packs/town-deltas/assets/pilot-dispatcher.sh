@@ -4452,9 +4452,35 @@ _ownership_guard_repos() {
 # value it already used (KEEP for _filter_built, "no branch" for the other three);
 # none of them may turn "could not tell" into a veto or into a delivery.
 #
-# The lib is sourced further down this file (next to _beadid_needs_remerge_branch);
-# a missing/unreadable lib or a call that runs before it is loaded is "could not
-# tell" (rc 2), never an empty list read as "no branch".
+# The lib is sourced RIGHT HERE, above its first reader and — which is the point — before
+# any top-level statement that can reach one. bash runs top-level code in file order, and
+# this file used to source the lib at the bottom: _pilot_emit_dispatchable (queue emit →
+# _filter_built) and _ttl_recover_db (→ _sling_is_live → _target_has_real_branch) ran
+# first, saw "lib not loaded" = "could not tell" = "no branch" on every sweep, and the TTL
+# path released a claim whose bead HAD a delivery branch (a second builder on work that
+# exists). pilot-dispatcher.delivery-probes.selftest.sh §8 now checks the order on this
+# very file: the source line must precede every top-level line that can reach the lib.
+#
+# ga-x7m5rg: the list of branch prefixes that count as a bead's delivery lives in a
+# sibling file shared with the GAP-2 reconciler's drift guard (see that file's header) —
+# same sibling-source idiom, and the same degradation, as framework-marker-labels.sh
+# above. `[ -r ]`, not `[ -f ]`: an existing-but-unreadable file would still kill `source`
+# under `set -e`. A MISSING lib is a deploy fault, not evidence that no branch exists, so
+# it must never turn into an escalation or a delivery: _beadid_needs_remerge_branch and
+# the helpers below check for the functions and answer rc 2 ("could not tell" → the caller
+# touches nothing / keeps the candidate), and the warn makes the fault loud once per
+# process instead of silent. stderr of the source itself is deliberately NOT suppressed (a
+# corrupt sibling should be loud). With the lib loaded, "could not tell" is only a missing
+# or unreadable file (the warn below fires) or git failing on a repo; the helpers still
+# guard on _delivery_branch_patterns_ready for a harness that extracts a function alone.
+_GC_DBP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/delivery-branch-patterns.sh"
+if [ -r "$_GC_DBP_SIBLING" ]; then
+  source "$_GC_DBP_SIBLING"
+else
+  warn "ga-x7m5rg/ga-3ebneo: delivery-branch-patterns.sh missing/unreadable next to pilot-dispatcher.sh ($_GC_DBP_SIBLING) — the gate:needs-remerge branch lookup returns 'unknown' (no resubmit, no escalation) AND the already-built probes (_filter_built, _target_has_real_branch, _beadid_has_crew_branch, _beadid_matched_crew_branch_ref) see no branch (candidates are kept, the in-flight ownership signal is off) until it is restored."
+fi
+unset _GC_DBP_SIBLING
+
 _delivery_branch_patterns_ready() {
   type gc_delivery_branch_globs >/dev/null 2>&1 && type gc_delivery_branch_pick >/dev/null 2>&1
 }
@@ -4649,10 +4675,11 @@ _filter_built() {
           # _delivery_branch_local_ref + delivery-branch-patterns.sh — it used to be a
           # hand-written crew/*/<id> + fix/<id>-* list here, blind to feat/<id>,
           # fix/<id> without a slug, etc. (ga-ebuj6c's --count=1 live-pipe removal
-          # moved into the helper with it.) rc 1 = looked, none; rc 2 (or 127: this
-          # filter can run before the helper is defined — see ga-2wcz6 above) = could
-          # not tell. Both leave the candidate in: FAIL-OPEN to KEEP, as before — but a
-          # "could not tell" no repo settles is COUNTED and logged once per call (below).
+          # moved into the helper with it.) rc 1 = looked, none; rc 2 (or 127: the helper
+          # itself is not defined — a harness that extracted this function alone, see
+          # ga-2wcz6 above) = could not tell. Both leave the candidate in: FAIL-OPEN to
+          # KEEP, as before — but a "could not tell" no repo settles is COUNTED and logged
+          # once per call (below).
           _matched_ref=""
           _bf_rc=0
           _matched_ref=$(_delivery_branch_local_ref "$r" "$id") || _bf_rc=$?
@@ -6070,7 +6097,11 @@ done <<< "$_ttl_rig_paths"
 # _delivery_branch_remote_hit, not from a regex of its own. Two shapes of the OLD regex
 # are gone on purpose: a bare crew/<id> with no owner segment ("defensive", no producer
 # and zero such refs in any repo when measured), and the case-insensitive match (bead ids
-# and the branches built from them are lowercase; the shared list is case-sensitive).
+# and the branches built from them are lowercase; the shared list is case-sensitive). One
+# shape is WIDER than the old regex: the shared <prefix>/<id>-* and crew/*/<id>-* globs let
+# the `*` span a `/`, so fix/<id>-foo/bar counts as <id>'s delivery where the old
+# fix/<id>-[^/]+$ did not — the same reading GAP-2 and _beadid_needs_remerge_branch have, and
+# the safe direction here (one more "this bead has a branch", never one fewer).
 #
 # Test seam: PILOT_TEST_CREW_BRANCH_BEADS (space-list), consulted when DEFINED,
 # keeps the selftest hermetic (no real git / network). When undefined we probe
@@ -6257,30 +6288,9 @@ _beadid_branch_signal() {
   return 0
 }
 
-# ga-x7m5rg: the list of branch prefixes that count as a bead's delivery lives
-# in a sibling file shared with the GAP-2 reconciler's drift guard (see that
-# file's header) — same sibling-source idiom, and the same degradation, as
-# framework-marker-labels.sh above. `[ -r ]`, not `[ -f ]`: an existing-but-
-# unreadable file would still kill `source` under `set -e`. A MISSING lib is a
-# deploy fault, not evidence that no branch exists, so it must never be allowed
-# to turn into an escalation: _beadid_needs_remerge_branch checks for the
-# functions and returns rc 2 ("could not tell" → the caller touches nothing),
-# and the warn below makes the fault loud once per process instead of silent.
-# ga-3ebneo: the four already-built probes (_filter_built, _target_has_real_branch,
-# _beadid_has_crew_branch, _beadid_matched_crew_branch_ref) read the same lib through
-# _delivery_branch_local_ref / _delivery_branch_remote_hit and degrade the same way:
-# a missing lib is "could not tell", which each of them maps to the value it already
-# used for "don't know" (KEEP the candidate / "no branch") — so without the lib the
-# Pilot loses its already-built veto and its in-flight signal, and the warn says so.
-# stderr of the source itself is deliberately NOT suppressed (a corrupt sibling
-# should be loud).
-_GC_DBP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/delivery-branch-patterns.sh"
-if [ -r "$_GC_DBP_SIBLING" ]; then
-  source "$_GC_DBP_SIBLING"
-else
-  warn "ga-x7m5rg/ga-3ebneo: delivery-branch-patterns.sh missing/unreadable next to pilot-dispatcher.sh ($_GC_DBP_SIBLING) — the gate:needs-remerge branch lookup returns 'unknown' (no resubmit, no escalation) AND the already-built probes (_filter_built, _target_has_real_branch, _beadid_has_crew_branch, _beadid_matched_crew_branch_ref) see no branch (candidates are kept, the in-flight ownership signal is off) until it is restored."
-fi
-unset _GC_DBP_SIBLING
+# delivery-branch-patterns.sh (ga-x7m5rg) is sourced much earlier in this file, just above
+# _delivery_branch_patterns_ready (ga-3ebneo moved it there): top-level statements run in
+# file order, and the ones that reach the already-built probes run long before this point.
 
 # _beadid_needs_remerge_branch <bead_id> — ga-e2n96 companion to
 # _beadid_matched_crew_branch_ref above: the gate-fix re-dispatch path (a bead

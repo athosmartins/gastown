@@ -260,6 +260,99 @@ for _fn in _filter_built _target_has_real_branch _beadid_has_crew_branch _beadid
   fi
 done
 
+# ── 8. ordering on the REAL file ────────────────────────────────────────────────────────
+# Every assertion above loads the lib up front, so none of them can see WHEN the real script
+# loads it. pilot-dispatcher.sh runs top-level statements in file order, and the lib used to be
+# sourced at the bottom — after _pilot_emit_dispatchable (queue emit → _filter_built) and
+# _ttl_recover_db (→ _sling_is_live → _target_has_real_branch) had already run. In production
+# both saw "lib not loaded" = "could not tell" = "no branch" on EVERY sweep: the TTL path then
+# released a claim whose bead had a delivery branch (a second builder on work that exists), and
+# the already-built veto went quiet. The check is structural, on the real file: build the call
+# graph of its functions, take everything that can reach the lib (directly or through callers),
+# and require the `source` line to come before the first top-level line that names any of them.
+echo "── 8. ordering: the lib is sourced BEFORE any top-level statement that can reach a probe ──"
+cat > "$TMP/order.py" <<'PY'
+import re, sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+FN_OPEN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{")
+defs = {}   # name -> text of its body, comments dropped
+top = []    # (lineno, text) outside every function body, comments dropped
+cur = None
+for no, ln in enumerate(lines, 1):
+    code = "" if ln.lstrip().startswith("#") else ln
+    if cur is None:
+        m = FN_OPEN.match(ln)
+        if m:
+            if ln.rstrip().endswith("}") and ln.count("{") == ln.count("}"):
+                defs[m.group(1)] = ln          # one-line function
+            else:
+                cur = m.group(1)
+                defs[cur] = code
+        elif code.strip():
+            top.append((no, code))
+    else:
+        defs[cur] += "\n" + code
+        if re.match(r"^\}\s*$", ln):
+            cur = None
+
+lib_fns = {"gc_delivery_branch_globs", "gc_delivery_branch_pick",
+           "_delivery_branch_local_ref", "_delivery_branch_remote_hit"}
+changed = True
+while changed:
+    changed = False
+    for name, body in defs.items():
+        if name in lib_fns:
+            continue
+        if any(re.search(r"(?<![A-Za-z0-9_])" + re.escape(f) + r"(?![A-Za-z0-9_])", body) for f in lib_fns):
+            lib_fns.add(name)
+            changed = True
+
+# Non-vacuity: the analysis must see the two known consumers as lib-dependent, or it proves nothing.
+missing = [f for f in ("_filter_built", "_target_has_real_branch", "_pilot_emit_dispatchable", "_ttl_recover_db")
+           if f not in lib_fns]
+if missing:
+    print("VACUOUS: not seen as reaching the lib: " + ", ".join(missing))
+    sys.exit(2)
+
+src = [no for no, code in top if re.match(r'\s*source\s+"\$_GC_DBP_SIBLING"', code)]
+if not src:
+    print("NO-SOURCE: no top-level `source \"$_GC_DBP_SIBLING\"` line found")
+    sys.exit(2)
+src_no = src[0]
+
+hits = []
+for no, code in top:
+    for f in sorted(lib_fns):
+        if f.startswith("gc_delivery_branch_"):
+            continue
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(f) + r"(?![A-Za-z0-9_])", code):
+            hits.append((no, f))
+            break
+if not hits:
+    print("VACUOUS: no top-level line names a lib-dependent function")
+    sys.exit(2)
+first_no, first_fn = min(hits)
+if src_no < first_no:
+    print("source at L%d, first top-level reference L%d (%s)" % (src_no, first_no, first_fn))
+    sys.exit(0)
+early = [h for h in hits if h[0] < src_no]
+print("source at L%d but %d top-level line(s) run before it, first L%d (%s)%s" % (
+    src_no, len(early), first_no, first_fn,
+    "; also " + ", ".join("L%d %s" % h for h in early[1:4]) if len(early) > 1 else ""))
+sys.exit(1)
+PY
+if ! command -v python3 >/dev/null 2>&1; then
+  bad "python3 missing — the lib/consumer ordering was NOT checked"
+else
+  ORD_OUT="$(python3 "$TMP/order.py" "$PD" 2>&1)"; ORD_RC=$?
+  case "$ORD_RC" in
+    0) ok "the lib is sourced before any top-level statement that can reach a probe ($ORD_OUT)" ;;
+    1) bad "lib sourced TOO LATE — a top-level consumer runs first and sees 'could not tell' = 'no branch' on every sweep: $ORD_OUT" ;;
+    *) bad "ordering analysis could not run: $ORD_OUT" ;;
+  esac
+fi
+
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]
