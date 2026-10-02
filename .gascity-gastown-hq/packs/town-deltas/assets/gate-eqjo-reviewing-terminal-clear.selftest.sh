@@ -149,11 +149,20 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # wa-qq33j, same convention — 15 wa-qq33j-tagged (9 pre-existing + 1
 # ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1
 # ga-3bp42c) + 2 ga-n2cpe-tagged = 17.
+# ga-atsahv (2026-10-01) added an 18th site: the fast lane's "revoked at the push"
+# branch (SELFTEST-EXTRACT fastlane-lane-revoked). The lane was granted for one
+# commit, the branch moved before the push, so nothing is pushed and the marker is
+# re-queued for the NORMAL gate — the same shape as every other re-queue/park site
+# above, and it leaves the bead out of review the same way, so it clears
+# gate:reviewing too (tagged wa-qq33j, same convention; without it the bead would
+# wear a pool-probe veto while it waits for the normal gate) — 16 wa-qq33j-tagged
+# (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1
+# ga-hwzzou + 1 ga-3bp42c + 1 ga-atsahv) + 2 ga-n2cpe-tagged = 18.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "17" ]; then
-  ok "total gate:reviewing clear call sites = 17 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "18" ]; then
+  ok "total gate:reviewing clear call sites = 18 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-atsahv + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 17 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 18 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-atsahv + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"
