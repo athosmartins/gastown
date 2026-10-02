@@ -4439,6 +4439,112 @@ _ownership_guard_repos() {
   [ -z "$_OWNERSHIP_GUARD_REPOS_FAILED" ]
 }
 
+# ── ga-3ebneo: ONE vocabulary for "does this bead already have a delivery branch?" ──
+# _filter_built, _target_has_real_branch, _beadid_has_crew_branch and
+# _beadid_matched_crew_branch_ref each carried their own hand-written prefix list
+# (fix/<id>-* and crew/*/<id>), so a bead delivered on feat/<id>, feature/ refactor/
+# docs/ chore/ test/ — or on fix/<id> with no slug — read "no branch" to the
+# already-built filter and to the ownership guard, and the Pilot could dispatch a
+# builder onto work that already exists (same drift class as ga-x7m5rg, which fixed
+# only the needs-remerge lookup). They now read delivery-branch-patterns.sh through
+# the two helpers below. Each helper answers in THREE states — found / looked and
+# found none / could not tell — and every caller maps the third to the "don't know"
+# value it already used (KEEP for _filter_built, "no branch" for the other three);
+# none of them may turn "could not tell" into a veto or into a delivery.
+#
+# The lib is sourced further down this file (next to _beadid_needs_remerge_branch);
+# a missing/unreadable lib or a call that runs before it is loaded is "could not
+# tell" (rc 2), never an empty list read as "no branch".
+_delivery_branch_patterns_ready() {
+  type gc_delivery_branch_globs >/dev/null 2>&1 && type gc_delivery_branch_pick >/dev/null 2>&1
+}
+
+# _delivery_branch_local_ref <repo> <bead_id> — the bead's delivery branch among <repo>'s
+# LOCAL branches and the origin refs this clone already fetched (no network).
+#   rc 0  found     stdout = the full refname (refs/heads/X or refs/remotes/origin/X)
+#   rc 1  looked, none
+#   rc 2  could not tell (no git, lib not loaded/usable, git could not read the refs)
+# Cost: ONE for-each-ref over every glob answers the common "no branch" case (measured
+# 25 ms on a 5.9k-ref repo, the same as the old 4-pattern call; a call per glob was
+# ~270 ms and this runs per candidate per repo every sweep). Only when something
+# matched do the globs get walked one by one in priority order (fix/ first), because
+# for-each-ref also matches a literal pattern as a path PREFIX (fix/<id>/child) — the
+# anchored gc_delivery_branch_pick has the last word on every line, so such a decoy
+# can neither be taken for the delivery nor hide the real one. The `--count=1` on the
+# first call removes the live pipe at the source (ga-ebuj6c, pipe-early-exit.selftest.sh);
+# nothing here pipes a git call, and every git rc is read with `|| _rc=$?` so a failure
+# cannot abort a caller running under set -e.
+_delivery_branch_local_ref() {
+  local _repo="${1:-}" _bid="${2:-}" _globs _g _rc _first _refs _line
+  local _pats=()
+  [ -n "$_repo" ] && [ -n "$_bid" ] || return 2
+  command -v git >/dev/null 2>&1 || return 2
+  _delivery_branch_patterns_ready || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    _pats+=("refs/heads/$_g" "refs/remotes/origin/$_g")
+  done <<< "$_globs"
+  [ "${#_pats[@]}" -gt 0 ] || return 2
+  _rc=0
+  _first=$(git -C "$_repo" for-each-ref --count=1 --format='%(refname)' "${_pats[@]}" 2>/dev/null </dev/null) || _rc=$?
+  [ "$_rc" -eq 0 ] || return 2
+  [ -n "$_first" ] || return 1
+  while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    _rc=0
+    _refs=$(git -C "$_repo" for-each-ref --format='%(refname)' "refs/heads/$_g" "refs/remotes/origin/$_g" 2>/dev/null </dev/null) || _rc=$?
+    [ "$_rc" -eq 0 ] || return 2
+    [ -n "$_refs" ] || continue
+    while IFS= read -r _line; do
+      [ -n "$_line" ] || continue
+      if gc_delivery_branch_pick "$_bid" <<< "$_line" >/dev/null; then
+        printf '%s' "$_line"
+        return 0
+      fi
+    done <<< "$_refs"
+  done <<< "$_globs"
+  return 1
+}
+
+# _delivery_branch_remote_hit <repo> <bead_id> — ask origin ITSELF (authoritative for a
+# branch this clone has not fetched; bounded at 8s) for the bead's delivery branch.
+#   rc 0  found     stdout = the branch name
+#   rc 1  looked, none — or no remote configured (nothing to ask)
+#   rc 2  could not tell (no git, lib not loaded/usable, ls-remote failed or timed out)
+# A timeout / offline remote says nothing about the branch, so callers must read rc 2
+# as "no evidence", never as "no branch". `git ls-remote` matches a pattern against the
+# TAIL of a ref; the anchored gc_delivery_branch_pick rejects a foreign ref that merely
+# ends the same way. The git calls take </dev/null: the callers' repo loops are fed by
+# a here-string, and a command that read stdin would swallow the rest of the list.
+_delivery_branch_remote_hit() {
+  local _repo="${1:-}" _bid="${2:-}" _globs _g _rc _out _pick
+  local _rpats=()
+  [ -n "$_repo" ] && [ -n "$_bid" ] || return 2
+  command -v git >/dev/null 2>&1 || return 2
+  _delivery_branch_patterns_ready || return 2
+  _globs=$(gc_delivery_branch_globs "$_bid") || return 2
+  [ -n "$_globs" ] || return 2
+  while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    _rpats+=("refs/heads/$_g")
+  done <<< "$_globs"
+  [ "${#_rpats[@]}" -gt 0 ] || return 2
+  # `git config --get` tells "no origin configured" (rc 1: nothing to ask) from "could
+  # not read the config" (any other rc: could not tell).
+  _rc=0
+  git -C "$_repo" config --get remote.origin.url >/dev/null 2>&1 </dev/null || _rc=$?
+  [ "$_rc" -eq 0 ] || { [ "$_rc" -eq 1 ] && return 1 || return 2; }
+  _rc=0
+  _out=$(timeout 8 git -C "$_repo" ls-remote --heads origin "${_rpats[@]}" 2>/dev/null </dev/null) || _rc=$?
+  [ "$_rc" -eq 0 ] || return 2
+  [ -n "$_out" ] || return 1
+  _pick=$(gc_delivery_branch_pick "$_bid" <<< "$_out") || return 1
+  printf '%s' "$_pick"
+  return 0
+}
+
 # _filter_built — drop ctx:ready candidates that ALREADY have a crew OR dog fix/ branch
 # (built work awaiting gate/delivery, NOT a fresh dispatch candidate; ga-6jqr: the branch
 # probe used to match ONLY crew/*/<id>, blind to the fix/<id>-* shape dog builders push —
@@ -4459,7 +4565,7 @@ _ownership_guard_repos() {
 _filter_built() {
   local repos arr id r built_ids="" ingate_ids="" _bounced _glabel
   local built_reasons="" ingate_reasons="" _matched_ref _out _kept_sp _bid _breason
-  local _bf_json _bf_signal
+  local _bf_json _bf_signal _bf_rc
   arr=$(cat)
 
   # ── (wa-8y45 leak) GATE-MARKER + GATE-LABEL consultation ─────────────────────
@@ -4537,15 +4643,17 @@ _filter_built() {
         [ -z "$id" ] && continue
         while IFS= read -r r; do
           [ -n "$r" ] && [ -d "$r" ] || continue
-          # ga-ebuj6c: --count=1 limits at the SOURCE instead of relying on
-          # `| head -1` to close the pipe early — under set -e this family can
-          # SIGPIPE the writer and abort the script (sister bug to ga-8w22n's
-          # unscoped for-each-ref). Scoped-by-id already keeps output tiny in
-          # practice; --count=1 removes the live pipe entirely, for free.
-          _matched_ref=$(git -C "$r" for-each-ref --count=1 --format='%(refname)' \
-               "refs/remotes/origin/crew/*/$id" "refs/heads/crew/*/$id" \
-               "refs/remotes/origin/fix/$id-*" "refs/heads/fix/$id-*" 2>/dev/null | head -1)
-          if [ -n "$_matched_ref" ]; then
+          # ga-3ebneo: the lookup (and which branch names count as a delivery) lives in
+          # _delivery_branch_local_ref + delivery-branch-patterns.sh — it used to be a
+          # hand-written crew/*/<id> + fix/<id>-* list here, blind to feat/<id>,
+          # fix/<id> without a slug, etc. (ga-ebuj6c's --count=1 live-pipe removal
+          # moved into the helper with it.) rc 1 = looked, none; rc 2 (or 127: this
+          # filter can run before the helper is defined — see ga-2wcz6 above) = could
+          # not tell. Both leave the candidate in: FAIL-OPEN to KEEP, as before.
+          _matched_ref=""
+          _bf_rc=0
+          _matched_ref=$(_delivery_branch_local_ref "$r" "$id") || _bf_rc=$?
+          if [ "$_bf_rc" -eq 0 ] && [ -n "$_matched_ref" ]; then
             # ga-rcees: a matched ref is no longer an UNCONDITIONAL veto. Classify
             # it via _beadid_branch_signal (ga-8jxe1) and let "orphan" (unmerged +
             # stale + unassigned) fall through instead of vetoing forever — the same
@@ -5523,21 +5631,24 @@ _iso_to_epoch() {
     || date -u -d "$1" +%s 2>/dev/null || echo ""
 }
 
-# _target_has_real_branch <bead_id> — return 0 ONLY if a crew or dog fix/ branch for the
-# bead actually exists (ga-6jqr: was crew/*/<id>-only, blind to the fix/<id>-* shape dog
-# builders push). Self-contained repo list. Any uncertainty → return 1 (assert NO branch)
-# so this only ever ADDS a keep-signal, never forces a release.
+# _target_has_real_branch <bead_id> — return 0 ONLY if a delivery branch for the bead
+# actually exists (ga-6jqr: was crew/*/<id>-only, blind to the fix/<id>-* shape dog
+# builders push; ga-3ebneo: and to feat/<id>, fix/<id> without a slug, ... — the name
+# list now comes from delivery-branch-patterns.sh via _delivery_branch_local_ref).
+# Self-contained repo list. Any uncertainty → return 1 (assert NO branch) so this only
+# ever ADDS a keep-signal, never forces a release — that includes the helper's rc 2
+# ("could not tell"), which is deliberately NOT told apart from "none" here.
 _target_has_real_branch() {
   command -v git >/dev/null 2>&1 || return 1
-  local _repos _r
+  local _repos _r _rc
   _ownership_guard_repos >/dev/null 2>&1 || return 1
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
   while IFS= read -r _r; do
     [ -n "$_r" ] && [ -d "$_r" ] || continue
-    git -C "$_r" for-each-ref --format='%(refname)' \
-        "refs/remotes/origin/crew/*/$1" "refs/heads/crew/*/$1" \
-        "refs/remotes/origin/fix/$1-*" "refs/heads/fix/$1-*" 2>/dev/null | grep . >/dev/null && return 0
+    _rc=0
+    _delivery_branch_local_ref "$_r" "$1" >/dev/null || _rc=$?
+    [ "$_rc" -eq 0 ] && return 0
   done <<< "$_repos"
   return 1
 }
@@ -5929,61 +6040,56 @@ while IFS= read -r _ttl_rig; do
   _ttl_recover_db "$_ttl_rig" "$TTL_NOW_EPOCH" "$TTL_SECS"
 done <<< "$_ttl_rig_paths"
 
-# _beadid_has_crew_branch <bead_id> — exit 0 iff a branch named like
-# `crew/<owner>/<bead-id>` OR `fix/<bead-id>-<slug>` exists in ANY town/rig repo,
-# local OR remote-tracking, AND (best-effort) directly on the rig remote via a
-# bounded `ls-remote`. This is the ga-htjni signal-(a): a pushed crew/fix branch
-# means a build is real/in-flight. It is STRICTER than _beadid_has_branch (which
-# matches the id anywhere in any ref) — here we require one of the two KNOWN
-# builder-branch shapes so a stray tag/note never false-fires; the end-anchor
-# avoids matching a longer id that merely contains this one as a prefix.
+# _beadid_has_crew_branch <bead_id> — exit 0 iff a delivery branch for the bead exists in
+# ANY town/rig repo, local OR remote-tracking, AND (best-effort) directly on the rig
+# remote via a bounded `ls-remote`. This is the ga-htjni signal-(a): a pushed builder
+# branch means a build is real/in-flight. It is STRICTER than _beadid_has_branch (which
+# matches the id anywhere in any ref) — here we require one of the KNOWN delivery-branch
+# shapes so a stray tag/note never false-fires; the anchored match avoids matching a
+# longer id that merely contains this one as a prefix.
 # ga-6jqr: originally crew/-only, blind to the fix/<id>-* shape dog builders
 # push — a dog-built bead read "no branch" here and got double-dispatched.
+# ga-3ebneo: and still blind to feat/<id>, feature/ refactor/ docs/ chore/ test/ and to
+# fix/<id> without a slug — the shapes now come from delivery-branch-patterns.sh (the
+# same list GAP-2 and _beadid_needs_remerge_branch use) via _delivery_branch_local_ref /
+# _delivery_branch_remote_hit, not from a regex of its own. Two shapes of the OLD regex
+# are gone on purpose: a bare crew/<id> with no owner segment ("defensive", no producer
+# and zero such refs in any repo when measured), and the case-insensitive match (bead ids
+# and the branches built from them are lowercase; the shared list is case-sensitive).
 #
 # Test seam: PILOT_TEST_CREW_BRANCH_BEADS (space-list), consulted when DEFINED,
 # keeps the selftest hermetic (no real git / network). When undefined we probe
 # real git read-only. FAIL-OPEN: no git OR no resolvable repos → return 1 (NOT
 # "assume branch") so the guard never blocks on an unprobable environment; the
 # distinct dead-worker/never-started reclaim paths still own true-orphan recovery.
+# The same holds for the helpers' rc 2 ("could not tell": lib not loaded, git could not
+# read the refs, ls-remote failed/timed out): no evidence of a branch is not a branch,
+# so it falls through to the next probe/repo and ends in return 1 like "none".
 _beadid_has_crew_branch() {
-  local _bid="${1:-}" _repo _refs
+  local _bid="${1:-}" _repo _rc
   [ -n "$_bid" ] || return 1
   if [ -n "${PILOT_TEST_CREW_BRANCH_BEADS+x}" ]; then
     case " $PILOT_TEST_CREW_BRANCH_BEADS " in *" $_bid "*) return 0 ;; *) return 1 ;; esac
   fi
   command -v git >/dev/null 2>&1 || return 1
-  local _repos _re
+  local _repos
   _ownership_guard_repos >/dev/null
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
-  # crew/<anything>/<bead> at a ref tail, OR a bare crew/<bead> (defensive), OR
-  # a dog-built fix/<bead>-<slug> (ga-6jqr — the DOG builder branch shape; the
-  # trailing "-" requires a real slug so a longer id sharing this one as a
-  # prefix, e.g. "${_bid}2", never false-matches).
-  _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    # 1. Already-fetched local + remote-tracking refs (cheap, offline).
-    # ga-8w22n: same SIGPIPE-under-pipefail race as _beadid_has_branch above
-    # (this file's set -euo pipefail + grep -q's early exit racing
-    # for-each-ref's write on an active checkout) — reproduced live at
-    # 100% with 1500 refs. Capture first, match via a herestring: removes
-    # the live pipe, not just the race's window.
-    _refs=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
-    if grep -qiE "$_re" <<< "$_refs"; then
-      return 0
-    fi
-    # 2. Best-effort authoritative remote probe (bounded; the live origin/crew/*
-    #    or origin/fix/* branch ga-htjni hit may not be fetched locally). A
-    #    timeout / offline remote is NOT evidence of a branch → fall through
-    #    (fail-open), never block.
-    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
-      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
-          | grep -iE "refs/heads/${_re}" >/dev/null; then
-        return 0
-      fi
-    fi
+    # 1. Already-fetched local + remote-tracking refs (cheap, offline). ga-8w22n's
+    # live-pipe SIGPIPE race (grep -q closing the pipe on for-each-ref) cannot recur:
+    # the helper captures git's output and never pipes it.
+    _rc=0
+    _delivery_branch_local_ref "$_repo" "$_bid" >/dev/null || _rc=$?
+    [ "$_rc" -eq 0 ] && return 0
+    # 2. Best-effort authoritative remote probe (bounded; the live origin branch
+    #    ga-htjni hit may not be fetched locally). A timeout / offline remote is NOT
+    #    evidence of a branch → fall through (fail-open), never block.
+    _rc=0
+    _delivery_branch_remote_hit "$_repo" "$_bid" >/dev/null || _rc=$?
+    [ "$_rc" -eq 0 ] && return 0
   done <<< "$_repos"
   return 1
 }
@@ -6002,6 +6108,13 @@ _beadid_has_crew_branch() {
 # of a hardcoded "crew/*/<bead>" guess — the old WARN message lied about the
 # evidence whenever a dog's fix/* branch, not a crew/* branch, was what
 # actually matched (cost real diagnosis time on ga-8jxe1 itself).
+# ga-3ebneo: which branch names count now comes from delivery-branch-patterns.sh via
+# _delivery_branch_local_ref / _delivery_branch_remote_hit (see _beadid_has_crew_branch for
+# the two old-regex shapes that are gone on purpose). The ref is still returned in
+# `%(refname:short)` form — a bare name for a local branch, `origin/<name>` for a
+# remote-tracking one — because _beadid_branch_signal runs merge-base/log on it. When
+# several branches match, the shared list's priority decides (fix/ first), where the old
+# grep took whichever sorted first. "Could not tell" (rc 2 of the helpers) is not a match.
 _beadid_matched_crew_branch_ref() {
   local _bid="${1:-}" _repo
   [ -n "$_bid" ] || return 1
@@ -6012,40 +6125,35 @@ _beadid_matched_crew_branch_ref() {
     esac
   fi
   command -v git >/dev/null 2>&1 || return 1
-  local _repos _re _match _refs
+  local _repos _full _match _rc
   _ownership_guard_repos >/dev/null
   _repos="${_OWNERSHIP_GUARD_REPOS:-}"
   [ -n "$_repos" ] || return 1
-  _re="(crew/([^/]+/)?${_bid}|fix/${_bid}-[^/]+)\$"
   while IFS= read -r _repo; do
     [ -n "$_repo" ] && [ -d "$_repo" ] || continue
-    # ga-8w22n: worse than the sibling functions' false-negative shape — this
-    # 3-stage pipe (for-each-ref | grep | head -1) could SIGPIPE either
-    # producer (for-each-ref cut off by grep, or grep itself cut off by
-    # head -1 once it has its one line) under this file's set -euo pipefail,
-    # and the bare `_match=$(...)` assignment then propagates that nonzero
-    # status to ABORT THE WHOLE SCRIPT, not just misreport a boolean —
-    # reproduced live: 15/15 runs died with exit 141 (SIGPIPE) against a
-    # checkout with thousands of matching refs. Capture for-each-ref's
-    # output first (removing the live pipe to it entirely), then use grep's
-    # own `-m 1` to stop after the first match instead of piping to `head`
-    # — grep reading a herestring has no live producer to SIGPIPE, so this
-    # removes both failure mechanisms, not just narrows them. `|| true`
-    # guards the ordinary "no match in this repo" case (grep exit 1, ALSO a
-    # bare assignment) from tripping set -e on a normal, expected outcome.
-    _refs=$(git -C "$_repo" for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
-    _match=$(grep -m 1 -iE "$_re" <<< "$_refs") || true
-    if [ -n "$_match" ]; then
-      printf '%s\t%s' "$_repo" "$_match"
-      return 0
-    fi
-    if git -C "$_repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 \
-       || git -C "$_repo" remote 2>/dev/null | grep . >/dev/null; then
-      if timeout 8 git -C "$_repo" ls-remote --heads origin "crew/*/${_bid}" "crew/${_bid}" "fix/${_bid}-*" 2>/dev/null \
-          | grep -iE "refs/heads/${_re}" >/dev/null; then
-        printf '%s\t' "$_repo"   # repo known, ref unresolved locally (ls-remote-only)
+    # ga-8w22n: the old 3-stage pipe here (for-each-ref | grep | head -1) could SIGPIPE
+    # a producer under this file's set -euo pipefail and ABORT THE WHOLE SCRIPT
+    # (reproduced live: 15/15 runs died with exit 141 against thousands of matching
+    # refs). _delivery_branch_local_ref captures git's output and never pipes it, and
+    # every rc is read with `|| _rc=$?`, so neither mechanism can come back.
+    _rc=0
+    _full=$(_delivery_branch_local_ref "$_repo" "$_bid") || _rc=$?
+    if [ "$_rc" -eq 0 ] && [ -n "$_full" ]; then
+      _match=""
+      case "$_full" in
+        refs/heads/*)          _match="${_full#refs/heads/}" ;;
+        refs/remotes/origin/*) _match="origin/${_full#refs/remotes/origin/}" ;;
+      esac
+      if [ -n "$_match" ]; then
+        printf '%s\t%s' "$_repo" "$_match"
         return 0
       fi
+    fi
+    _rc=0
+    _delivery_branch_remote_hit "$_repo" "$_bid" >/dev/null || _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+      printf '%s\t' "$_repo"   # repo known, ref unresolved locally (ls-remote-only)
+      return 0
     fi
   done <<< "$_repos"
   return 1

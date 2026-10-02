@@ -159,7 +159,11 @@ _PDC_R5="$(_pdc_og "ga-fp" '{"id":"ga-fp","assignee":"","status":"open","labels"
 # at least one other, unrelated function in this file
 # (_pilot_pool_target_has_live_session and others), so a naive re-scan of
 # $DISPATCHER risks anchoring on the wrong occurrence.
-if printf '%s' "$_PDC_OG_FN" | grep -q '_DEADWORKER_OK:-0.*&& _session_is_active_owner "\$_asg"'; then
+# Herestring, not `printf | grep -q`: the extracted text is ~16 KB, right at the pipe
+# size, so under `set -o pipefail` grep -q's early exit could SIGPIPE printf and flip
+# this to a false FAIL (measured on an unmodified tree: 4/24 runs failed under load,
+# while the same text matched 600/600 in an idle loop). No live producer, no race.
+if grep -q '_DEADWORKER_OK:-0.*&& _session_is_active_owner "\$_asg"' <<< "$_PDC_OG_FN"; then
   ok "structural: pool-prefix case arm consults _session_is_active_owner (fail-open on roster) before allowing"
 else
   bad "structural: pool-prefix case arm no longer consults liveness — ga-uirg32 regression risk"

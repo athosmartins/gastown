@@ -19,6 +19,13 @@
 # matching top-level closing brace), never by hardcoded line numbers — this
 # file is edited constantly and a hardcoded range would silently go stale.
 #
+# ga-3ebneo: _beadid_has_crew_branch and _beadid_matched_crew_branch_ref no longer run
+# git themselves — they delegate to _delivery_branch_local_ref / _delivery_branch_remote_hit
+# and read the branch-name list from delivery-branch-patterns.sh. Scenarios 3-4 therefore
+# load those helpers + the lib alongside the extracted function (the same isolation
+# harness idiom pipe-early-exit.selftest.sh A3 uses), and Scenario 5 guards the helpers,
+# where the for-each-ref call now lives, as well as the two functions.
+#
 # Run: bash pilot-dispatcher-branch-detection-race.selftest.sh
 # Exit: 0 = all pass, 1 = any failure.
 
@@ -26,6 +33,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PILOT="$SCRIPT_DIR/pilot-dispatcher.sh"
+LIB="$SCRIPT_DIR/delivery-branch-patterns.sh"
+[ -r "$LIB" ] || { echo "FATAL: $LIB missing" >&2; exit 2; }
 
 PASS=0; FAIL=0
 _pass() { PASS=$((PASS+1)); printf "[PASS] %s\n" "$1"; }
@@ -50,9 +59,14 @@ trap 'rm -rf "$TMP"' EXIT
 extract_fn _beadid_has_branch "$TMP/fn1.sh"
 extract_fn _beadid_has_crew_branch "$TMP/fn2.sh"
 extract_fn _beadid_matched_crew_branch_ref "$TMP/fn3.sh"
+# ga-3ebneo: the shared lookup helpers the two functions above delegate to.
+extract_fn _delivery_branch_patterns_ready "$TMP/fn4.sh"
+extract_fn _delivery_branch_local_ref "$TMP/fn5.sh"
+extract_fn _delivery_branch_remote_hit "$TMP/fn6.sh"
+cat "$TMP/fn4.sh" "$TMP/fn5.sh" "$TMP/fn6.sh" > "$TMP/helpers.sh"
 
 echo "Scenario 1: extracted function bodies are non-empty and syntactically valid"
-for f in fn1 fn2 fn3; do
+for f in fn1 fn2 fn3 fn4 fn5 fn6; do
   if bash -n "$TMP/$f.sh" 2>/dev/null; then
     _pass "$f.sh: valid bash syntax"
   else
@@ -85,7 +99,7 @@ SHA=$(git -C "$REPO" rev-parse HEAD)
   # finish instantly, never triggering it. Confirmed live while building the
   # fix: 40 matches never reproduced the crash; 3000 did, reliably (15/15).
   for i in $(seq 1 3000); do
-    printf 'create refs/heads/0000-crew/owner%04d/ga-racetarget1 %s\n' "$i" "$SHA"
+    printf 'create refs/heads/crew/owner%04d/ga-racetarget1 %s\n' "$i" "$SHA"
   done
   for i in $(seq 1 500); do
     printf 'create refs/heads/zzzz-filler-%05d %s\n' "$i" "$SHA"
@@ -119,10 +133,10 @@ for _ in $(seq 1 "$RUNS"); do
   if bash -c '
     set -euo pipefail
     _ownership_guard_repos() { :; }
-    source "$1"
+    source "$3"; source "$4"; source "$1"
     _OWNERSHIP_GUARD_REPOS="$2"
     _beadid_has_crew_branch "ga-racetarget1"
-  ' _ "$TMP/fn2.sh" "$REPO" >/dev/null 2>&1; then
+  ' _ "$TMP/fn2.sh" "$REPO" "$TMP/helpers.sh" "$LIB" >/dev/null 2>&1; then
     _ok=$((_ok+1))
   fi
 done
@@ -147,10 +161,10 @@ for _ in $(seq 1 "$RUNS"); do
   _out=$(bash -c '
     set -euo pipefail
     _ownership_guard_repos() { :; }
-    source "$1"
+    source "$3"; source "$4"; source "$1"
     _OWNERSHIP_GUARD_REPOS="$2"
     _beadid_matched_crew_branch_ref "ga-racetarget1"
-  ' _ "$TMP/fn3.sh" "$REPO" 2>&1)
+  ' _ "$TMP/fn3.sh" "$REPO" "$TMP/helpers.sh" "$LIB" 2>&1)
   _rc=$?
   set -e
   if [ "$_rc" -eq 141 ]; then
@@ -167,7 +181,7 @@ done
   || _fail "_beadid_matched_crew_branch_ref: only $_ok/$RUNS runs returned a real match"
 
 echo ""
-echo "Scenario 5 (ga-8w22n): no live pipe remains into any early-exiting consumer for these three functions"
+echo "Scenario 5 (ga-8w22n): no live pipe remains into any early-exiting consumer for these functions (+ the ga-3ebneo helpers)"
 # Static regression guard, complementary to the dynamic scenarios above: the
 # dynamic tests prove CORRECT BEHAVIOR on this machine right now, but a
 # future edit could reintroduce the live-pipe shape and still pass them by
@@ -176,7 +190,7 @@ echo "Scenario 5 (ga-8w22n): no live pipe remains into any early-exiting consume
 # for these three functions specifically — bounded to their own extracted
 # bodies, so this can never accidentally match a DIFFERENT, already-safe
 # for-each-ref call elsewhere in the file (e.g. the bead-scoped-glob ones).
-for f in fn1 fn2 fn3; do
+for f in fn1 fn2 fn3 fn5 fn6; do
   # Join backslash line-continuations first — this file's own style wraps
   # the `for-each-ref ... \` / `| grep ...` shape across two physical
   # lines, so a plain single-line grep never matched either the buggy OR
@@ -193,6 +207,15 @@ for f in fn1 fn2 fn3; do
     _fail "$f.sh: still pipes for-each-ref directly into grep — regression"
   else
     _pass "$f.sh: for-each-ref output is captured before matching, not piped live"
+  fi
+done
+# fn2/fn3 passing the loop above is only meaningful because the git call moved: prove
+# they still reach it through the helper instead of regrowing a lookup of their own.
+for f in fn2 fn3; do
+  if grep -q '_delivery_branch_local_ref' "$TMP/$f.sh" && ! grep -qE '^[^#]*for-each-ref' "$TMP/$f.sh"; then
+    _pass "$f.sh: delegates the ref lookup to _delivery_branch_local_ref (no for-each-ref of its own)"
+  else
+    _fail "$f.sh: no longer delegates to _delivery_branch_local_ref, or runs its own for-each-ref again"
   fi
 done
 
