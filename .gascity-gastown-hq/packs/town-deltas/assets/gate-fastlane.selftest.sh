@@ -160,6 +160,15 @@ raw_scan "a mode-only change with a clean name" 0 < <(printf 'diff --git a/docs/
 raw_scan "an empty deleted file with a clean name" 0 < <(printf 'diff --git a/docs/ok.md b/docs/ok.md\ndeleted file mode 100644\nindex e69de29..0000000\n')
 raw_scan "a content finding in a file whose NAME also matches" 1 < <(printf 'diff --git a/docs/529.982.247-25.md b/docs/529.982.247-25.md\n--- a/docs/529.982.247-25.md\n+++ b/docs/529.982.247-25.md\n@@ -0,0 +1 @@\n+key AKIAIOSFODNN7EXAMPLE\n')
 case "$SCAN_OUT" in *529.982*) bad "a path that matched was printed: $SCAN_OUT" ;; *) ok "…the path that matched is withheld in every line of the output" ;; esac
+# (d2) a path that holds a space: git ends the `---` and `+++` lines with a TAB (checked with real git, `cat -vte`: `+++ b/docs/a b.md^I`). The TAB is the
+# separator, not part of the name — left in, the finding line had 4 TAB-separated fields instead of the 3 of the scanner's contract, and the caller
+# read a REAL finding as "the scanner crashed" (gate round ga-oqugor, blocking issue 1: a finding collapsed into an error).
+SP='diff --git a/docs/a b.md b/docs/a b.md\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/docs/a b.md\t\n'
+raw_scan "a credential in a file whose path holds a space (git's trailing TAB on the '+++ ' line)" 1 < <(printf "${SP}@@ -0,0 +1 @@\n+chave AKIAIOSFODNN7EXAMPLE\n")
+[ "$SCAN_OUT" = "$(printf 'aws-key\tdocs/a b.md\t1')" ] && ok "…as exactly 3 TAB-separated fields, the path without git's TAB (docs/a b.md:1)" || bad "finding line for a spaced path is not label<TAB>path<TAB>line: $(printf '%s' "$SCAN_OUT" | cat -vte)"
+raw_scan "a clean doc whose path holds a space" 0 < <(printf "${SP}@@ -0,0 +1 @@\n+so prosa\n")
+raw_scan "a number finding in a path with a space is reported on the right line" 1 < <(printf "${SP}@@ -0,0 +1,2 @@\n+ok\n+fone 31 99999 8888\n")
+[ "$SCAN_OUT" = "$(printf 'numero-longo\tdocs/a b.md\t2')" ] && ok "…docs/a b.md:2, 3 fields" || bad "number finding for a spaced path: $(printf '%s' "$SCAN_OUT" | cat -vte)"
 # (e) personal numbers — ONE rule, not a list of notations (gate round 4: four rounds, four new notations). Once the characters
 # between digits are ignored, 8+ digits in a row is a finding. Each notation below is a row the PREVIOUS (per-notation) scanner
 # read as clean or only partly covered; the first six are the reviewer's own, verbatim.
@@ -367,26 +376,37 @@ case "$D_REASON $D_FILES" in *AKIA*|*sk-abc*) bad "the lane output published the
 S=$(mkbr s-bare 'reports/leads.csv=joao,31999998888\nmaria,11987654321\njoao,3133334444\n');   decide "$S" "";  check "a CSV in reports/ with bare, unformatted phone numbers" normal "numero-longo"
 S=$(mkbr s-cpfname 'docs/529.982.247-25.md=');                                decide "$S" "";  check "an EMPTY file whose NAME is a CPF" normal "numero-longo"
 case "$D_REASON $D_FILES" in *529.982*) bad "the lane output published the CPF found in a file name: $D_REASON | $D_FILES" ;; *) ok "…and the file name that matched is withheld from the lane output" ;; esac
+# gate round ga-oqugor, blocking issue 1, END TO END with real git: a REAL finding in a path with a space was booked as "the scanner crashed"
+# (scan-failed, rc=2) — the outcome was still the normal gate, but the reason and the tally bucket said the checks were broken, not that they caught something
+S=$(mkbr s-sp-find 'docs/a b.md=chave AKIAIOSFODNN7EXAMPLE\n');               decide "$S" "";  check "a credential in 'docs/a b.md' (a path with a space) is a FINDING" normal "aws-key"
+[ "$D_CODE" = "scan-findings" ] && ok "…booked as scan-findings" || bad "…booked as '$D_CODE', want scan-findings ($D_REASON)"
+case "$D_REASON" in *crash*|*"rc=2"*|*"could not run"*) bad "…the reason calls a finding a crash: $D_REASON" ;; *) ok "…and the reason does not say the scanner crashed" ;; esac
+S=$(mkbr s-sp-clean 'docs/My Notes/x y.md=hello\n');                           decide "$S" "";  check "control: a clean doc under 'docs/My Notes/x y.md' stays fast" fast "DOC or TEST"
 # 4c. tests: run, env scrubbed, stdin closed, bounded
-S=$(mkbr s-testok 'docs/n.md=x\n' 'tests/ok.selftest.sh=exit 0\n');          decide "$S" "";  check "docs + a new green test" fast "ran green"; no_leftovers "green test"
+S=$(mkbr s-testok 'docs/n.md=x\n' 'tests/ok.selftest.sh=exit 0\n');          decide "$S" "";  check "docs + a new green test" fast "exited 0"; no_leftovers "green test"
 S=$(mkbr s-testbad 'tests/bad.selftest.sh=exit 3\n');                        decide "$S" "";  check "a new test that FAILS stays in the gate (never a FAIL verdict)" normal "rc=3"; no_leftovers "failing test"
 S=$(mkbr s-scrub 'tests/scrub.selftest.sh=[ -z "${FL_SECRET:-}" ] || exit 1\ncase "$HOME" in */gc-gate-fs-fastlane-*) ;; *) exit 1 ;; esac\n')
-decide "$S" "" FL_SECRET=hunter2;  check "tests run with a scrubbed env (inherited secret absent, HOME inside the worktree)" fast "ran green"
+decide "$S" "" FL_SECRET=hunter2;  check "tests run with a scrubbed env (inherited secret absent, HOME inside the worktree)" fast "exited 0"
 # the tests' PATH must not reach tools installed under $HOME (`secret`, `notify` in ~/.local/bin). This is ALL the PATH filter does: bd, gc, dolt, gh, aws,
 # gcloud and bw live in /opt/homebrew/bin and stay reachable (gate round 4, blocking issue 2) — the credential shield is the throwaway HOME (§4c scrub case)
 mkdir -p "$T/fakehome/.local/bin"; printf '#!/bin/sh\necho VAULT-REACHED\n' > "$T/fakehome/.local/bin/secret"; chmod +x "$T/fakehome/.local/bin/secret"
 [ "$(PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" command -v secret)" = "$T/fakehome/.local/bin/secret" ] && ok "premise: a stub 'secret' IS on the caller's PATH under \$HOME" || bad "premise broken: the stub 'secret' is not findable"
 S=$(mkbr s-nosecret 'tests/nosecret.selftest.sh=if command -v secret >/dev/null 2>&1; then exit 12; fi\ncommand -v git >/dev/null || exit 13\ncommand -v jq >/dev/null || exit 14\nexit 0\n')
 # a controlled PATH: the stub dir under the (fake) HOME first, then only system/Homebrew dirs — so the REAL ~/.local/bin cannot leak in
-decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin";  check "tests run WITHOUT the tools under \$HOME on PATH (no 'secret') but with git/jq" fast "ran green"
+decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:/opt/homebrew/bin:/usr/bin:/bin";  check "tests run WITHOUT the tools under \$HOME on PATH (no 'secret') but with git/jq" fast "exited 0"
 # …and it is NOT a boundary around the city (gate round 4, blocking issue 2): a control-plane tool installed OUTSIDE $HOME (bd, gc, dolt in /opt/homebrew/bin on the
 # real host) survives the filter. Pinned here so the comment in the lib cannot drift back to claiming otherwise.
 mkdir -p "$T/sysbin"; printf '#!/bin/sh\necho CITY-REACHED\n' > "$T/sysbin/bd"; chmod +x "$T/sysbin/bd"
 S=$(mkbr s-ctlplane 'tests/ctl.selftest.sh=[ "$(command -v bd)" = "'"$T"'/sysbin/bd" ] || exit 15\n')
-decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:$T/sysbin:/opt/homebrew/bin:/usr/bin:/bin";  check "a tool outside \$HOME ('bd') STAYS reachable from the tests: the PATH filter is no boundary around the city" fast "ran green"
+decide "$S" "" HOME="$T/fakehome" PATH="$T/fakehome/.local/bin:$T/sysbin:/opt/homebrew/bin:/usr/bin:/bin";  check "a tool outside \$HOME ('bd') STAYS reachable from the tests: the PATH filter is no boundary around the city" fast "exited 0"
+# a test that SKIPS ITSELF exits 0 (this repo's own idiom: `command -v jq ... || { echo "SKIP: ..."; exit 0; }`). The lane reads only the exit code, so it cannot
+# tell a skip from a pass — and must not SAY the test "ran green" (gate round ga-oqugor, non-blocking medium). The reason says what it saw: exit 0.
+S=$(mkbr s-skip 'tests/skip.selftest.sh=command -v no-such-tool-xyz >/dev/null 2>&1 || { echo "SKIP: no-such-tool-xyz missing"; exit 0; }\nfalse\n')
+decide "$S" "";  check "a test that skips itself exits 0, and the lane says exactly that" fast "1 test file(s) exited 0"
+case "$D_REASON" in *"ran green"*) bad "the reason claims a skipping test 'ran green': $D_REASON" ;; *) ok "…and never claims it 'ran green'" ;; esac
 RAN="$T/ran.log"; : > "$RAN"
 S=$(mkbr s-stdin 'tests/a.selftest.sh=cat >/dev/null\n' "tests/b.selftest.sh=echo b >> $RAN\n")
-decide "$S" "";  check "two tests; the first reads stdin" fast "2 test file(s) ran green"
+decide "$S" "";  check "two tests; the first reads stdin" fast "2 test file(s) exited 0"
 grep -q '^b$' "$RAN" 2>/dev/null && ok "the second test RAN — a stdin-reading test cannot swallow the file list" || bad "the second test never ran: the first ate the file list"
 S=$(mkbr s-slow 'tests/slow.selftest.sh=sleep 30\n'); SECONDS=0
 decide "$S" "" GATE_FASTLANE_TEST_TIMEOUT_SECS=1;  check "a test that outruns its timeout stays in the gate" normal "124"
@@ -462,6 +482,7 @@ e2e_case "a go:embed'd agent template (*-CLAUDE.md)"          code-or-prompt  "$
 e2e_case "an .md outside every known doc place"               code-or-prompt  "$(head_of s-unkmd)"   ""
 e2e_case "a CPF on an added line"                             scan-findings   "$(head_of s-cpf)"     ""
 e2e_case "a secret after a U+2028"                            scan-findings   "$(head_of s-u2028b)"  ""
+e2e_case "a secret in a path with a space (was: scan-failed)"  scan-findings   "$(head_of s-sp-find)"  ""
 e2e_case "scanner missing next to the lib"                    scan-failed     "$(head_of s-docs)"    "" FL_LIB_OVERRIDE="$T/libonly/gate-fastlane.lib.sh"
 e2e_case "a binary file named .md"                            scan-failed     "$(head_of s-bin)"     ""
 e2e_case "a new test that fails"                              test-failed     "$(head_of s-testbad)" ""
