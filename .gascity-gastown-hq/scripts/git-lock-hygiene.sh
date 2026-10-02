@@ -42,6 +42,14 @@
 #                             activity is ongoing in the same repo, but NEVER
 #                             while its own owning PID is still alive (ga-2xorq).
 #   NOT touched: ORIG_HEAD, FETCH_HEAD, HEAD — valid post-op artifacts.
+#   KNOWN HAZARD (ga-892qy1, open decision): the in-progress-OPERATION items above (MERGE_HEAD,
+#   CHERRY_PICK_HEAD, REVERT_HEAD, rebase-merge/, rebase-apply/) are removed on age + "no live git
+#   process" alone, but an operation PAUSED for a human has no process either: after 300 s its state
+#   is deleted (a merge becomes a one-parent commit, a rebase is lost). Roots with crew/* clones
+#   nested under them (HQ, whatsapp_automation) never reached that code before ga-hl3xlw made the
+#   liveness check exact — the old substring match was "always live" there. Unchanged here on
+#   purpose (a separate decision from the index.lock fix); nothing of that kind exists on the
+#   real roots today (checked 2026-10-02).
 #
 # PART 2 — Per-repo git mutation mutex (lib, source with GIT_LOCK_HYGIENE_LIB=1)
 #   POSIX-atomic mkdir-based locking that serializes git mutations per repository.
@@ -207,10 +215,14 @@ _path_age() {
   echo $(( now - mt ))
 }
 
-# Run <cmd...> under `timeout <secs>` when we have it (rc 124 = deadline hit).
+# Run <cmd...> under `timeout <secs>`: rc 124 = deadline hit. Without `timeout` there is no way to
+# enforce the deadline, and running lsof unbounded would let one hung on a stale mount stall the
+# whole sweep with no signal — so rc 127, which every caller reads as "cannot tell" (lock kept,
+# skip logged with the rc).
 _glh_bounded() {
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+  command -v timeout >/dev/null 2>&1 || return 127
+  timeout "$secs" "$@"
 }
 
 # Canonical form (symlinks resolved, no `..`) of a directory; fails if it isn't one.
@@ -264,9 +276,11 @@ _GLH_LIVE_REASON=""
 # for lock FILES the open-file check in _glh_lock_held_open adds a second, independent signal.
 # A git that really is working on the root — even a read-only for-each-ref/fetch poll — still
 # defers that sweep; the next one retries, and the skip is logged (skipped_live) with its pid.
+# The same goes for a PERSISTENT git (an fsmonitor--daemon standing in the root): it would defer
+# every sweep, visibly — nothing here enables fsmonitor (measured 2026-10-02), and the log names it.
 # Tests may override via GIT_LOCK_PROCESS_CHECK_FN.
 _git_repo_has_live_process() {
-  local repo="$1" want wantgd gl psout gitpids pidlist cwdmap lrc pid cwd args tok cand gd nxt cgd eff
+  local repo="$1" want wantgd gl psout gitpids pidlist cwdmap lrc pid cwd args toks tok cand gd nxt cgd eff
   _GLH_LIVE_REASON=""
   if [ -n "${GIT_LOCK_PROCESS_CHECK_FN:-}" ]; then
     "$GIT_LOCK_PROCESS_CHECK_FN" "$repo"; return $?
@@ -282,6 +296,8 @@ _git_repo_has_live_process() {
     [ -n "$gl" ] && { wantgd=$(_glh_canon_dir "$gl") || wantgd=""; }
   fi
   psout=$(ps -axo pid=,comm= 2>/dev/null) || { _GLH_LIVE_REASON="ps failed - cannot list processes"; return 0; }
+  # A process table with no processes in it (not even this shell) is a broken ps, not an empty machine.
+  [ -n "$psout" ] || { _GLH_LIVE_REASON="ps listed no processes at all - cannot tell"; return 0; }
   gitpids=$(printf '%s\n' "$psout" | awk '
     { pid = $1; sub(/^[ \t]*[0-9]+[ \t]+/, ""); n = $0; sub(/.*\//, "", n)
       if (n == "git" || n ~ /^git-/) print pid }')
@@ -308,14 +324,23 @@ _git_repo_has_live_process() {
       _GLH_LIVE_REASON="git pid ${pid} cwd unreadable - cannot tell which repo it works on"; return 0
     fi
     args=$(ps -p "$pid" -o args= 2>/dev/null) || continue   # exited meanwhile
+    toks=$(printf '%s' "$args" | tr -s ' \t' '\n')
 
-    # (1) explicit git dir: decisive. argv first (`--git-dir=<p>` / `--git-dir <p>`), then env.
-    gd=""; nxt=0
+    # Where git really works: its cwd with the `-C <p>` chain applied (relative ones compose onto
+    # the cwd, as git does), and an explicit `--git-dir=<p>` / `--git-dir <p>` from argv (last wins).
+    eff="$cwd"; gd=""; nxt=""
     while IFS= read -r tok; do
       [ -n "$tok" ] || continue
-      if [ "$nxt" = 1 ]; then gd="$tok"; break; fi
-      case "$tok" in --git-dir=*) gd="${tok#--git-dir=}"; break ;; --git-dir) nxt=1 ;; esac
-    done <<< "$(printf '%s' "$args" | tr -s ' \t' '\n')"
+      if [ "$nxt" = C ]; then
+        case "$tok" in /*) eff="$tok" ;; *) eff="$eff/$tok" ;; esac; nxt=""
+      elif [ "$nxt" = G ]; then
+        gd="$tok"; nxt=""
+      else
+        case "$tok" in -C) nxt=C ;; --git-dir) nxt=G ;; --git-dir=*) gd="${tok#--git-dir=}" ;; esac
+      fi
+    done <<< "$toks"
+
+    # (1) explicit git dir: decisive. argv first, then GIT_DIR from the environment.
     if [ -z "$gd" ]; then
       # awk reads to EOF on purpose: an early-exit reader (grep -m1 / awk exit) SIGPIPEs ps/tr and
       # turns the pipeline's status into 141 under pipefail (ga-5bxuam).
@@ -323,7 +348,7 @@ _git_repo_has_live_process() {
            | awk '/^GIT_DIR=/ && !s { print substr($0, 9); s = 1 }') || gd=""
     fi
     if [ -n "$gd" ] && [ -n "$wantgd" ]; then
-      case "$gd" in /*) ;; *) gd="$cwd/$gd" ;; esac
+      case "$gd" in /*) ;; *) gd="$eff/$gd" ;; esac   # git applies -C before it reads a relative git dir
       cgd=$(_glh_canon_dir "$gd") || cgd=""
       if [ -n "$cgd" ]; then
         if [ "$cgd" = "$wantgd" ]; then
@@ -338,21 +363,14 @@ _git_repo_has_live_process() {
     if [ "$(_glh_enclosing_repo "$cwd")" = "$want" ]; then
       _GLH_LIVE_REASON="git pid ${pid} cwd in repo"; return 0
     fi
-    eff="$cwd"; nxt=0   # eff = the directory git really works in once its `-C <p>` chain is applied
     while IFS= read -r tok; do
       [ -n "$tok" ] || continue
-      if [ "$nxt" = 1 ]; then
-        nxt=0
-        case "$tok" in /*) eff="$tok" ;; *) eff="$eff/$tok" ;; esac   # relative -C composes onto the cwd
-      elif [ "$tok" = "-C" ]; then
-        nxt=1
-      fi
       cand="$tok"; case "$tok" in *=*) cand="${tok#*=}" ;; esac   # --git-dir=<p>, -c core.x=<p>
       case "$cand" in /*) ;; *) continue ;; esac
       if [ "$(_glh_enclosing_repo "$cand")" = "$want" ]; then
         _GLH_LIVE_REASON="git pid ${pid} argv names repo"; return 0
       fi
-    done <<< "$(printf '%s' "$args" | tr -s ' \t' '\n')"
+    done <<< "$toks"
     if [ "$eff" != "$cwd" ] && [ "$(_glh_enclosing_repo "$eff")" = "$want" ]; then
       _GLH_LIVE_REASON="git pid ${pid} -C resolves into repo"; return 0
     fi
@@ -367,6 +385,7 @@ _git_repo_has_live_process() {
 # It is NOT sufficient on its own, and no comment may suggest otherwise: measured 2026-10-02 with
 # `GIT_EDITOR='sleep 7; :' git commit <path>`, a git parked in its editor leaves .git/index.lock in
 # place with NO open fd (lsof empty) — only the process check protects that lock.
+# lsof run as this user sees this user's descriptors only: "nobody" means nobody I can see.
 # Returns 0 if held OR if we could not tell, 1 only when lsof answered "nobody" (rc 1, no output).
 _glh_lock_held_open() {
   local f="$1" out rc
@@ -994,6 +1013,11 @@ print(n)
     bad "lv_hold: nothing ever opened $f"
   }
   lv_old() { touch -t 200001010000 "$1"; }
+  # lv_logged <lock path> <reason regex> — is there a skipped_live event for that path whose reason matches?
+  # A kept lock proves nothing about WHY it was kept; the reason is what names the branch that decided.
+  lv_logged() {
+    awk -v p="$1" -v r="$2" 'index($0, p) && /"event":"skipped_live"/ && $0 ~ r { f = 1 } END { exit !f }' "$LOG" 2>/dev/null
+  }
 
   echo "T26: stale index.lock + a git in a NESTED clone (<root>/crew/x) → removed (a different repo)"
   L1="$LVR/lv1"; make_repo "$L1"; make_repo "$L1/crew/x"
@@ -1019,9 +1043,9 @@ print(n)
   count=$(_scan_repo "$L3"); lv_cleanup
   [ -f "$L3/.git/index.lock" ] && ok "T28: lock kept — live git in the root (cwd)" \
     || bad "T28: lock REMOVED under a live git whose cwd is the root (old check was blind to cwd)"
-  grep '"event":"skipped_live"' "$LOG" 2>/dev/null | grep -F "$L3/.git/index.lock" | grep -q 'cwd' \
-    && ok "T28: the skip is logged with its reason (a lock kept for a live process is no longer silent)" \
-    || bad "T28: no skipped_live event naming the cwd reason for $L3/.git/index.lock"
+  lv_logged "$L3/.git/index.lock" 'git pid [0-9]+ cwd in repo' \
+    && ok "T28: the skip is logged with ITS reason (cwd in repo — not 'cwd unreadable')" \
+    || bad "T28: no skipped_live event with reason 'cwd in repo' for $L3/.git/index.lock"
 
   echo "T29: stale index.lock + 'git -C <root> ...' started from elsewhere → kept"
   L4="$LVR/lv4"; make_repo "$L4"
@@ -1086,29 +1110,44 @@ print(n)
   [ ! -f "$L10/.git/index.lock" ] && ok "T35: lock removed when nothing is running on the repo" \
     || bad "T35: lock kept although nothing runs on the repo"
 
-  # T36: three states, not two. When the janitor CANNOT find out (ps/lsof broken or timing out),
-  # that is not "no live process" — the destructive path defaults to inert: keep the lock.
-  echo "T36: ps / lsof failing → 'cannot tell' keeps the lock"
-  SHIM_PS="$LVR/shim-ps"; mkdir -p "$SHIM_PS"; printf '#!/bin/sh\nexit 1\n' > "$SHIM_PS/ps"; chmod +x "$SHIM_PS/ps"
-  SHIM_LSOF="$LVR/shim-lsof"; mkdir -p "$SHIM_LSOF"; printf '#!/bin/sh\nexit 124\n' > "$SHIM_LSOF/lsof"; chmod +x "$SHIM_LSOF/lsof"
+  # T36: three states, not two. When the janitor CANNOT find out (ps/lsof broken, empty, timing out
+  # or unboundable), that is not "no live process" — the destructive path defaults to inert: keep
+  # the lock, and log WHY. Every case asserts the logged reason as well as the surviving file, and
+  # runs where the branch it names is the only one that can decide: with a real git process about
+  # (the city always has some) a broken lsof is caught by the cwd lookup first and the holder
+  # check never runs, so the holder check's own fallback is driven under the _no_git_process stub.
+  echo "T36: ps / lsof failing, empty or unboundable → 'cannot tell' keeps the lock, and says why"
+  _mk_shim() { mkdir -p "$LVR/shim-$1"; printf '#!/bin/sh\n%s\n' "$3" > "$LVR/shim-$1/$2"; chmod +x "$LVR/shim-$1/$2"; }
+  _mk_shim ps-fail ps 'exit 1'
+  _mk_shim ps-empty ps 'exit 0'
+  _mk_shim lsof-124 lsof 'exit 124'
+  _mk_shim lsof-1 lsof 'exit 1'
   L11="$LVR/lv11"; make_repo "$L11"; lv_old "$L11/.git/index.lock"
-  count=$(PATH="$SHIM_PS:$PATH" _scan_repo "$L11")
-  [ -f "$L11/.git/index.lock" ] && ok "T36: ps unavailable → lock kept" || bad "T36: lock removed although ps could not list processes"
-  count=$(PATH="$SHIM_LSOF:$PATH" _scan_repo "$L11")
-  [ -f "$L11/.git/index.lock" ] && ok "T36: lsof timing out (cannot tell who holds the lock) → lock kept" \
-    || bad "T36: lock removed although lsof timed out"
+  # t36 <label> <reason regex> — judge the state the caller just produced
+  t36() {
+    if [ -f "$L11/.git/index.lock" ] && lv_logged "$L11/.git/index.lock" "$2"; then ok "T36: $1 → kept, reason logged"
+    else bad "T36: $1 — lock gone, or reason /$2/ not logged"; fi
+  }
+  : > "$LOG"; count=$(PATH="$LVR/shim-ps-fail:$PATH" _scan_repo "$L11")
+  t36 "ps fails" 'ps failed'
+  : > "$LOG"; count=$(PATH="$LVR/shim-ps-empty:$PATH" _scan_repo "$L11")
+  t36 "ps answers with no processes at all (a broken ps, not an empty machine)" 'ps listed no processes'
   lv_proc git / -C "$LVR/somewhere-else" status
-  count=$(PATH="$SHIM_LSOF:$PATH" _scan_repo "$L11"); lv_cleanup
-  [ -f "$L11/.git/index.lock" ] && ok "T36: a git process exists but its cwd cannot be read → lock kept" \
-    || bad "T36: lock removed although a git process's cwd could not be read"
-  # lsof answering rc 1 with NO output for a git pid that is still alive = its cwd is unreadable
-  # (the per-process guard; the rc 124 above is caught earlier, before any pid is looked at).
-  SHIM_LSOF1="$LVR/shim-lsof1"; mkdir -p "$SHIM_LSOF1"; printf '#!/bin/sh\nexit 1\n' > "$SHIM_LSOF1/lsof"; chmod +x "$SHIM_LSOF1/lsof"
-  lv_proc git / -C "$LVR/somewhere-else" status
-  count=$(PATH="$SHIM_LSOF1:$PATH" _scan_repo "$L11"); lv_cleanup
-  [ -f "$L11/.git/index.lock" ] && ok "T36: a live git whose cwd lsof cannot report (rc 1, no output) → lock kept" \
-    || bad "T36: lock removed although a live git's cwd was unreadable (rc 1, empty)"
-  count=$(_scan_repo "$L11")
+  : > "$LOG"; count=$(PATH="$LVR/shim-lsof-124:$PATH" _scan_repo "$L11")
+  t36 "a git is alive and lsof times out reading cwds" 'rc=124.*cannot read cwds'
+  # lsof answering rc 1 with NO output for a live git pid = its cwd is unreadable (the per-process guard)
+  : > "$LOG"; count=$(PATH="$LVR/shim-lsof-1:$PATH" _scan_repo "$L11"); lv_cleanup
+  t36 "a live git whose cwd lsof cannot report (rc 1, no output)" 'git pid [0-9]+ cwd unreadable'
+  # the HOLDER check on its own: the stub says "no git process", so only lsof-on-the-lock can decide
+  : > "$LOG"; count=$(GIT_LOCK_PROCESS_CHECK_FN=_no_git_process PATH="$LVR/shim-lsof-124:$PATH" _scan_repo "$L11")
+  t36 "no git process, lsof times out asking who holds the lock" 'cannot tell who holds the lock'
+  if PATH="/usr/bin:/bin:/usr/sbin:/sbin" command -v timeout >/dev/null 2>&1; then
+    echo "  skip T36 (no timeout): this host has timeout in the base PATH"
+  else
+    : > "$LOG"; count=$(GIT_LOCK_PROCESS_CHECK_FN=_no_git_process PATH="/usr/bin:/bin:/usr/sbin:/sbin" _scan_repo "$L11")
+    t36 "no timeout binary (a deadline cannot be enforced, so lsof is not run unbounded)" 'rc=127.*cannot tell who holds the lock'
+  fi
+  : > "$LOG"; count=$(_scan_repo "$L11")
   [ ! -f "$L11/.git/index.lock" ] && ok "T36: control — same lock, healthy ps/lsof → removed" \
     || bad "T36: control failed — lock still there with healthy ps/lsof"
 
@@ -1172,8 +1211,11 @@ print(n)
       echo "  skip T40: ps -E does not show the env of $_lv_bash here"; lv_cleanup
     else
       count=$(_scan_repo "$L15"); lv_cleanup
-      [ -f "$L15/.git/index.lock" ] && ok "T40: lock kept — relative GIT_DIR resolves against the cwd to this repo" \
-        || bad "T40: lock REMOVED under a live git whose GIT_DIR=.git resolves to this repo"
+      if [ -f "$L15/.git/index.lock" ] && lv_logged "$L15/.git/index.lock" 'git-dir is this repo'; then
+        ok "T40: lock kept BY the git-dir rule — relative GIT_DIR resolved to this repo (not the cwd fallback)"
+      else
+        bad "T40: lock gone, or kept by something other than the relative-GIT_DIR resolution"
+      fi
     fi
   fi
 
@@ -1224,6 +1266,24 @@ print(n)
   count=$(_scan_repo "$L17"); lv_cleanup
   [ -f "$L17/.git/index.lock" ] && ok "T42: lock kept — chained relative -C (-C lv17 -C sub) composes" \
     || bad "T42: lock REMOVED under a live 'git -C lv17 -C sub'"
+
+  # T43: git applies -C BEFORE it reads a relative git dir, so `git -C <root> --git-dir=.git ...`
+  # started from ANOTHER repo works on <root>/.git. Resolving the relative path against the process
+  # cwd instead reads it as the other repo's git dir and drops the lock under a live git.
+  echo "T43: stale index.lock + 'git -C <root> --git-dir=.git' started from ANOTHER repo → kept"
+  L18="$LVR/lv18"; make_repo "$L18"; make_repo "$LVR/lv18-other"
+  lv_old "$L18/.git/index.lock"
+  lv_proc git "$LVR/lv18-other" -C "$L18" --git-dir=.git status
+  count=$(_scan_repo "$L18"); lv_cleanup
+  if [ -f "$L18/.git/index.lock" ] && lv_logged "$L18/.git/index.lock" 'git-dir is this repo'; then
+    ok "T43: lock kept — relative --git-dir resolved against the -C directory"
+  else
+    bad "T43: lock removed (or kept for another reason) under a live 'git -C <root> --git-dir=.git' run from another repo"
+  fi
+  lv_proc git "$LVR/lv18-other" -C "$L18" --git-dir .git status
+  count=$(_scan_repo "$L18"); lv_cleanup
+  [ -f "$L18/.git/index.lock" ] && ok "T43: lock kept — separate-argument form '--git-dir .git' too" \
+    || bad "T43: lock removed under a live 'git -C <root> --git-dir .git' run from another repo"
   export GIT_LOCK_PROCESS_CHECK_FN="_no_git_process"   # restore the stub the mutex tests below expect
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
