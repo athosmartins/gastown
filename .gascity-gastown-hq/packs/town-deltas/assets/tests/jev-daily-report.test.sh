@@ -271,12 +271,14 @@ EOF
 mkdir -p "$T/pack-state"
 run() {  # run [date-arg...] with the sandboxed env; sets RC
   : >"$T/notify.log"
-  rm -f "$T/out/gate-verdict-join.log" "$T/pack-state/portaria-shadow.disabled"
+  rm -f "$T/out/gate-verdict-join.log" "$T/pack-state/portaria-shadow.disabled" "$T/pack-state/jev-gate-verdict.disabled"
+  [ -z "${RUN_GVDISABLED:-}" ] || : >"$T/pack-state/jev-gate-verdict.disabled"
   [ -n "${RUN_PLOG:-}" ] || printf '%s rc=0 portaria-shadow: {"new": 0, "pending": 0}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$T/portaria-shadow.log"
   [ -z "${RUN_PDISABLED:-}" ] || : >"$T/pack-state/portaria-shadow.disabled"
   env -u NOTIFY_FORCE_PUSH PATH="$T/bin:$PATH" NOTIFY_LOG="$T/notify.log" JEV_EXPERIMENT_LOG="${RUN_LOG:-$T/log.jsonl}" \
       PORTARIA_LOG_FILE="${RUN_PLOG:-$T/portaria-shadow.log}" PORTARIA_STATE_FILE="$T/pack-state/portaria-shadow-state.json" \
       JEV_DAILY_OUT_DIR="$T/out" JEV_REPORT="${RUN_REPORT:-$REPORT}" JEV_GATE_VERDICT_JOIN="${RUN_JOIN:-$T/join-ok.py}" \
+      JEV_GATE_VERDICT_DISABLED_FILE="$T/pack-state/jev-gate-verdict.disabled" \
       JEV_GATE_VERDICT_JOIN_TIMEOUT="${RUN_JOIN_TIMEOUT:-600}" \
       JEV_QUEM_PENSA_REPORT="${RUN_QP:-$T/qp-ok.py}" JEV_QUEM_PENSA_REPORT_TIMEOUT="${RUN_QP_TIMEOUT:-120}" \
       JEV_PREAMBULO_REPORT="${RUN_PB:-$T/pb-ok.py}" JEV_PREAMBULO_REPORT_TIMEOUT="${RUN_PB_TIMEOUT:-300}" \
@@ -679,6 +681,16 @@ grep -q 'TIMED OUT after 1s' "$T/out/cut-output-join.log" 2>/dev/null && ok "T25
 [ "$E25" -lt $((B25 + 15)) ] && ok "T25f the hung join was killed at its bound (took ${E25}s against a plain run of ${B25}s)" || nok "T25f bound" "took ${E25}s against a plain run of ${B25}s: not killed"
 grep -q 'CLO-JOIN-HANG-SHOULD-NEVER' "$T/out/cut-output-join.log" 2>/dev/null \
   && nok "T25f process actually killed" "the hung stub's post-sleep line ran" || ok "T25f the hung join was killed before finishing its sleep"
+
+# T26 (ga-cyryl1): gate-verdict front OFF -> the join (the step that CALLS Jev) must not run,
+# and the report still goes out. Positive control first: without the switch the stub runs.
+printf '#!/usr/bin/env python3\nprint("GV-JOIN-RAN")\n' >"$T/join-sentinel.py"
+RUN_JOIN="$T/join-sentinel.py" run 2026-09-20
+grep -q 'GV-JOIN-RAN' "$T/out/gate-verdict-join.log" 2>/dev/null && ok "T26 control: switch absent -> the join runs" || nok "T26 control" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
+RUN_JOIN="$T/join-sentinel.py" RUN_GVDISABLED=1 run 2026-09-20
+grep -q 'GV-JOIN-RAN' "$T/out/gate-verdict-join.log" 2>/dev/null && nok "T26 switch" "the join ran with the front disabled" || ok "T26 switch present -> the join does not run"
+grep -q 'gate-verdict join skipped: front disabled' "$T/out/gate-verdict-join.log" 2>/dev/null && ok "T26 the skip is logged" || nok "T26 skip note" "$(cat "$T/out/gate-verdict-join.log" 2>&1)"
+if [ "$RC" -eq 0 ] && [ "$(calls)" -eq 1 ]; then ok "T26 the report still goes out (rc=0, one ntfy)"; else nok "T26 report" "rc=$RC calls=$(calls)"; fi
 
 echo ""
 echo "jev-daily-report tests: $PASS passed, $FAIL failed"

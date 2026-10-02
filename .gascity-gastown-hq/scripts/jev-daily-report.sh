@@ -47,7 +47,16 @@ JOIN_SCRIPT="${JEV_GATE_VERDICT_JOIN:-$HQ/scripts/jev_gate_verdict_experiment.py
 # the test suite can exercise a real hang without waiting 600s.
 JOIN_TIMEOUT="${JEV_GATE_VERDICT_JOIN_TIMEOUT:-600}"
 JOIN_RC=0
-timeout "$JOIN_TIMEOUT" python3 "$JOIN_SCRIPT" run >>"$OUT_DIR/gate-verdict-join.log" 2>&1 || JOIN_RC=$?
+# ga-cyryl1: off switch, same shape as the other Jev fronts. The join is the step that
+# CALLS Jev (it predicts each gate run after the fact), so while the front is off it must
+# not run at all; the report below still shows the numbers already recorded. Athos turned
+# this front off on 02/10 (58.5% accuracy, 7.2M Jev input tokens).
+GATE_VERDICT_DISABLED_FILE="${JEV_GATE_VERDICT_DISABLED_FILE:-$HQ/.gc/runtime/packs/town-deltas/jev-gate-verdict.disabled}"
+if [ "${JEV_GATE_VERDICT_ENABLED:-1}" = "0" ] || [ -f "$GATE_VERDICT_DISABLED_FILE" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) gate-verdict join skipped: front disabled ($GATE_VERDICT_DISABLED_FILE)" >>"$OUT_DIR/gate-verdict-join.log"
+else
+  timeout "$JOIN_TIMEOUT" python3 "$JOIN_SCRIPT" run >>"$OUT_DIR/gate-verdict-join.log" 2>&1 || JOIN_RC=$?
+fi
 if [ "$JOIN_RC" -eq 124 ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) jev_gate_verdict_experiment.py run TIMED OUT after ${JOIN_TIMEOUT}s, see $OUT_DIR/gate-verdict-join.log" >>"$OUT_DIR/gate-verdict-join.log"
 elif [ "$JOIN_RC" -ne 0 ]; then
