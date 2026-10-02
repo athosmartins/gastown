@@ -637,6 +637,30 @@ reviewer_session_confirmed_closed() {
     echo 0
   fi
 }
+
+# reviewer_session_listed <assignee> <sessions_json> → echoes 1 iff <assignee>
+# appears in <sessions_json> at all (closed or not); 0 if absent, if the
+# assignee is empty, or if the JSON does not parse. Pure; no I/O. Same match
+# fields as reviewer_session_confirmed_closed, so the two agree on what
+# "present" means.
+#
+# ga-oj7bzs: a session that DIED (e.g. in a reboot) is not listed as
+# closed=true — a closed session drops out of `gc session list` entirely.
+# reviewer_session_confirmed_closed() answers 0 for that ("absent"), so the
+# caller needs to tell "absent" apart from "present and alive/booting" to know
+# when it is worth asking the session BEAD (reviewer_session_bead_state).
+reviewer_session_listed() {
+  local assignee="${1:-}" sessions_json="${2:-}"
+  [ -z "$assignee" ] && { echo 0; return 0; }
+  if printf '%s' "$sessions_json" | jq -e --arg a "$assignee" \
+       '[(if type=="array" then . else (.sessions // []) end)[]
+        | select((.session_name==$a) or (.name==$a) or (.alias==$a) or (.id==$a) or (.agent_name==$a))]
+       | length > 0' >/dev/null 2>&1; then
+    echo 1
+  else
+    echo 0
+  fi
+}
 # SELFTEST-EXTRACT reviewer-session-confirmed-closed-fn: END
 
 # classify_slot_action <bead_closed 0|1> <session_dead 0|1> <budget_remaining int>
@@ -10543,10 +10567,54 @@ gate_collect_verdicts() {
 }
 # SELFTEST-EXTRACT gate-collect-verdicts-fn: END
 
+# reviewer_session_bead_state <session-name> [window-hours] → echoes one of
+#   closed    ≥1 session bead of that name is closed AND none is still open
+#   open      some session bead of that name is not closed (a live or booting
+#             incarnation of the name exists)
+#   notfound  both queries answered and no session bead of that name was
+#             created inside the window
+#   unknown   a query failed, or answered with something that is not a list,
+#             or <session-name> is empty
+# Only `closed` is a statement that the session is dead; the caller must treat
+# the other three as "keep waiting". Always returns 0 (state is in the output).
+#
+# ga-oj7bzs: a reviewer's assignee is its session NAME (gate-reviewer-adhoc-
+# <hash>), not the session bead id (ga-wisp-xxxx), so `bd show <assignee>`
+# finds nothing. The bead is found by the metadata.session_name (or alias /
+# agent_name / id) it carries. bd list/query cannot filter on metadata, and
+# scanning every session bead (~5400) on every sweep is far too heavy, so the
+# two queries are bounded by creation time: a reviewer's session is created
+# after the run starts, so [run age + margin] hours covers it. Two queries
+# (closed / not-closed) so a REUSED name — an old closed bead plus a live new
+# one — reads `open`, not `closed`. bash 3.2 only (this host's bash).
+# SELFTEST-EXTRACT phase-c-closed-reviewer-classify-fn: BEGIN
+reviewer_session_bead_state() {
+  local name="${1:-}" hours="${2:-24}" closed_json open_json n_closed n_open
+  local jq_count='if type=="array"
+    then [ .[] | select(.id == $n or ((.metadata | if type=="object" then [.session_name, .alias, .agent_name] else [] end) | map(. == $n) | any)) ] | length
+    else error("not a list") end'
+  [ -z "$name" ] && { echo unknown; return 0; }
+  case "$hours" in ''|*[!0-9]*) hours=24 ;; esac
+  [ "$hours" -ge 1 ] 2>/dev/null || hours=24
+  closed_json=$(bd -C "$GC_CITY" query --json "type=session AND status=closed AND created>${hours}h" --limit=0 2>/dev/null) || { echo unknown; return 0; }
+  open_json=$(bd -C "$GC_CITY" query --json "type=session AND status!=closed AND created>${hours}h" --limit=0 2>/dev/null) || { echo unknown; return 0; }
+  n_closed=$(printf '%s' "$closed_json" | jq -e --arg n "$name" "$jq_count" 2>/dev/null) || { echo unknown; return 0; }
+  n_open=$(printf '%s' "$open_json" | jq -e --arg n "$name" "$jq_count" 2>/dev/null) || { echo unknown; return 0; }
+  if [ "$n_open" -gt 0 ] 2>/dev/null; then echo open
+  elif [ "$n_closed" -gt 0 ] 2>/dev/null; then echo closed
+  else echo notfound
+  fi
+}
+
 # gate_phase_c_all_pending_closed — true (exit 0) iff this run has at least
 # one still-pending (non-closed) verdict bead AND EVERY still-pending verdict
-# bead's reviewer session is CONFIRMED CLOSED (reviewer_session_confirmed_closed,
-# above). False (exit 1) if there are no pending slots (nothing to requeue —
+# bead's reviewer session is CONFIRMED CLOSED: either PRESENT in the roster
+# with .closed==true (reviewer_session_confirmed_closed, above), or ABSENT
+# from the roster while its session bead is closed (reviewer_session_bead_state
+# → `closed`, ga-oj7bzs — how a session that died in a reboot looks). A session
+# that is absent and whose bead is open / not found / unreadable is NOT
+# confirmed: it keeps waiting.
+# False (exit 1) if there are no pending slots (nothing to requeue —
 # the caller's own VERDICTS_RECEIVED==REQUIRED_REVIEWERS branch already
 # handles an all-delivered run), if any pending slot's session is not
 # confirmed closed, or if any read this needs is unreadable this sweep (fails
@@ -10566,11 +10634,16 @@ gate_collect_verdicts() {
 # bead's body). A session bead closed=true can never reopen, so THIS check
 # carries no such tradeoff and can safely run every sweep, independent of
 # elapsed time.
-# SELFTEST-EXTRACT phase-c-closed-reviewer-classify-fn: BEGIN
 gate_phase_c_all_pending_closed() {
-  local _pcc_sess_json _pcc_any_pending=0 _pcc_all_closed=1 _pcc_j _pcc_vb _pcc_vb_json _pcc_vb_st _pcc_sid
+  local _pcc_sess_json _pcc_any_pending=0 _pcc_all_closed=1 _pcc_j _pcc_vb _pcc_vb_json _pcc_vb_st _pcc_sid _pcc_hours _pcc_bst
   _pcc_sess_json=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
   [ -z "$_pcc_sess_json" ] && return 1
+  # ga-oj7bzs: bound the session-bead lookup to the run's age (+3h margin); an
+  # unknown age falls back to 24h rather than 0h or unbounded.
+  case "${PC_ELAPSED:-}" in
+    ''|*[!0-9]*) _pcc_hours=24 ;;
+    *) _pcc_hours=$(( PC_ELAPSED / 3600 + 3 )) ;;
+  esac
   for _pcc_j in "${!VERDICT_BEAD_IDS[@]}"; do
     _pcc_vb="${VERDICT_BEAD_IDS[$_pcc_j]}"
     if ! _pcc_vb_json=$(bd -C "$GC_CITY" show "$_pcc_vb" --json 2>/dev/null); then
@@ -10584,6 +10657,17 @@ gate_phase_c_all_pending_closed() {
       return 1   # unreadable assignee capture -- can't confirm either (mirrors ga-i5s5)
     fi
     if [ "$(reviewer_session_confirmed_closed "$_pcc_sid" "$_pcc_sess_json")" != "1" ]; then
+      # ga-oj7bzs: a session that died (e.g. a reboot) is ABSENT from the
+      # roster, not listed closed=true. Only for an absent one, ask its
+      # session bead; a session still in the roster (alive, asleep or booting)
+      # is not asked about and keeps the run waiting.
+      if [ "$(reviewer_session_listed "$_pcc_sid" "$_pcc_sess_json")" != "1" ]; then
+        _pcc_bst=$(reviewer_session_bead_state "$_pcc_sid" "$_pcc_hours")
+        case "$_pcc_bst" in
+          closed) continue ;;
+          unknown) warn "  Phase C: reviewer $_pcc_sid is absent from 'gc session list' and its session bead could not be read this sweep — not confirming it dead; run keeps waiting (root-class:error-vs-empty, ga-oj7bzs)." ;;
+        esac
+      fi
       _pcc_all_closed=0
       break
     fi
