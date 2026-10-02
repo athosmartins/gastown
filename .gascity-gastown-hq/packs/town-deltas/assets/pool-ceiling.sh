@@ -59,9 +59,11 @@
 # three. NOT covered: gastown.dog and refino-gate-reviewer — they only have an engine cap and
 # do not go through these two dispatchers; auto-refiner runs under a single-instance lock.
 #
-# Sourceable: defines functions only, no side effects, never `exit`s, every function
-# returns 0 (the dispatchers may run under `set -e`). Executable: `pool-ceiling.sh
-# status` prints each pool's state and the live signal classification.
+# Sourceable: defines functions only, no side effects, never `exit`s, and every function
+# returns 0 EXCEPT the predicates pool_ceiling_enabled / pool_ceiling_shadow and the
+# parsers _pc_int / _pc_num, which return non-zero BY DESIGN (like `[`): call those only in an
+# `if` / `||` / `&&` context, because the dispatchers run under `set -e`. Executable:
+# `pool-ceiling.sh status` prints each pool's state and the live signal classification.
 # bash 3.2 compatible (macOS /bin/bash): no associative arrays, no ${x,,}.
 
 _pc_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }

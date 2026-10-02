@@ -110,6 +110,22 @@ Hoje o teto do motor (2/1/3) esconde estes dois pontos; viram reais quando ele s
   limita a 1 run na faixa 101–180% de cpu, e o teto lê essa faixa como `ok` (grow). Inofensivo — o freio do gate continua valendo — mas o teto pode
   subir com o Dolt morno.
 - **`.off` e a biblioteca ausente.** Com `.on`, `.off` e a lib ausente, a linha "LIGADO … vale o teto FIXO" ainda aparece; a conclusão (teto fixo) está certa.
+- **O `approved-state-reconciler` não conhece este teto.** `scripts/approved-state-reconciler.py` (`_pool_cap`) lê o cap do Pilot do plist instalado
+  e usa a linha "pool at session cap … max=M" do log só como conferência. **Com o teto APLICADO (fora da sombra)**, `PILOT_*_WORKER_MAX` passa a ter uma segunda
+  fonte que ele ignora: enquanto o teto estiver abaixo do valor do plist ele loga "DIVERGED … plist edited without reloading the Pilot job?" (enganoso) e,
+  sem linha de cap fresca, pode ler um pool freado como "tem folga" e levantar alarme falso de fome (classe wa-ho1ol). A direção é conservadora (alarme a mais,
+  nada escondido) e só aparece aplicando — **na sombra não há efeito**, que é mais uma razão para a sombra vir primeiro. Ensinar o reconciler a ler o teto
+  efetivo (`.gc/pool-ceiling/<pool>.state`) é trabalho do bead que ligar o teto de verdade.
+- **`POOL_CEILING_DYNAMIC` só aceita `0` ou `1`.** Qualquer outro valor (ex.: `true`) é tratado como não definido e cai no teste do arquivo `.on` — sem aviso.
+  Use `0`/`1` (ou o arquivo `.on`).
+- **Swap recém-criado.** `vm.swapusage` pode mostrar total 0 logo depois de um reboot (o macOS cria o swapfile sob demanda); "swap livre < 512 MB" lê como baixo mesmo
+  assim. Com disco ≥ 4 GB isso dá `hold`, não `grow`: uma máquina calma e recém-iniciada só cresce depois que o swap existir (direção conservadora).
+- **Teto fixo abaixo do mínimo do pool.** Se o teto fixo for menor que o mínimo (ex.: `GATE_MAX_REVIEWERS=1` contra o mínimo 2 do gate), o primeiro passo aplicado
+  sobe `cur` até o mínimo, sem olhar fila nem folga.
+- **Fila só por store de rig.** O Pilot conta a fila pelo store do rig do pool; um bead guardado no HQ e roteado para um worker via `story.rig` não é contado
+  para aquele pool — subestima a fila e portanto só inibe o crescimento.
+- **Pilot sem rastro de cota ilegível com o teto desligado.** O gate loga `cota=ilegivel(fail-open)`; o freio de cota do próprio Pilot segue silencioso quando o
+  checker está "unknown" e o teto está desligado (comportamento anterior, inalterado).
 
 ## Fora do escopo (próximo passo, outro bead)
 
