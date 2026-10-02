@@ -89,7 +89,7 @@ log() { echo "$*" >> "$LOGF"; }
 
 echo "=== dolt-backup-ephemeral-lib.selftest.sh ==="
 
-for fn in _eph_db_list _eph_is_ephemeral _eph_mode_summary _eph_release_target _eph_writer_active _eph_release_staging _eph_s3_fingerprint_state; do
+for fn in _eph_db_list _eph_is_ephemeral _eph_mode_summary _eph_release_target _eph_writer_active _eph_release_staging _eph_s3_fingerprint_state _eph_drop_empty_staging _eph_epoch_utc _eph_s3_last_backup_text; do
   type "$fn" >/dev/null 2>&1 && ok "$fn defined" || { bad "$fn NOT defined"; echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="; exit 1; }
 done
 
@@ -347,6 +347,80 @@ putfp '{"run_utc":"2026-10-01T07:05:12Z","databases":{"hq":{"issues":1}}}'
 [ "$(AWS="" _eph_s3_fingerprint_state hq)" = "unknown" ] && ok "AWS unset → unknown" || bad "AWS unset: $(AWS="" _eph_s3_fingerprint_state hq)"
 [ "$(_eph_s3_fingerprint_state 'h q')" = "unknown" ] && ok "invalid db name → unknown" || bad "invalid db: $(_eph_s3_fingerprint_state 'h q')"
 _eph_s3_fingerprint_state hq >/dev/null; [ $? -eq 0 ] && ok "always rc 0 — the answer is the word" || bad "non-zero rc"
+
+# ═══ _eph_drop_empty_staging (ga-94vxdw) ════════════════════════════════════════════════════
+# The old nightly's `DOLT_BACKUP('add', …, 'file://<dest>')` re-made an EMPTY .dolt-backup/hq every night. An empty
+# dir is not a staging; this removes exactly that and nothing else (rmdir — it cannot remove a non-empty dir).
+echo "── _eph_drop_empty_staging (ga-94vxdw) ──"
+unset DOLT_BACKUP_EPHEMERAL_DBS; rm -f "$T/eph.env"
+fresh_root; : > "$LOGF"
+mkdir "$BACKUP_ROOT/hq"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 0 ] && [ ! -e "$BACKUP_ROOT/hq" ] && [ -d "$BACKUP_ROOT" ] && grep -qF 'removed an EMPTY' "$LOGF" \
+  && ok "an EMPTY staging dir of an ephemeral db → removed (rc 0), announced in the log, the root stays" || bad "empty dir not removed (rc=$rc): $(cat "$LOGF")"
+: > "$LOGF"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 2 ] && [ ! -s "$LOGF" ] && ok "already absent → rc 2 ('nothing to do'), silent" || bad "absent dir gave rc $rc, log: $(cat "$LOGF")"
+mkdir "$BACKUP_ROOT/hq"; printf 'x' > "$BACKUP_ROOT/hq/anything"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -f "$BACKUP_ROOT/hq/anything" ] \
+  && ok "a dir with ANY content (even a stray file, no manifest) → left alone, rc 1: only a truly empty dir is ever removed" || bad "non-empty dir was touched (rc=$rc)"
+rm -f "$BACKUP_ROOT/hq/anything"; mkdir "$BACKUP_ROOT/hq/sub"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq/sub" ] && ok "a dir holding only an (empty) subdirectory → left alone" || bad "dir with a subdir was touched (rc=$rc)"
+rmdir "$BACKUP_ROOT/hq/sub"; rmdir "$BACKUP_ROOT/hq"
+mkdir "$BACKUP_ROOT/lexbh"
+_eph_drop_empty_staging lexbh "$BACKUP_ROOT/lexbh"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/lexbh" ] && ok "an empty dir of a db that is NOT ephemeral → left alone (rc 1)" || bad "non-ephemeral db's dir was touched (rc=$rc)"
+mkdir "$BACKUP_ROOT/hq.new"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq.new"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq.new" ] && ok "dest that is not exactly <root>/<db> (hq.new) → refused, nothing removed" || bad "dest mismatch was not refused (rc=$rc)"
+rmdir "$BACKUP_ROOT/hq.new" "$BACKUP_ROOT/lexbh"
+mkdir "$T/elsewhere"; ln -s "$T/elsewhere" "$BACKUP_ROOT/hq"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -L "$BACKUP_ROOT/hq" ] && [ -d "$T/elsewhere" ] && ok "a SYMLINK at .dolt-backup/hq (to an empty dir) → never followed, never removed" || bad "symlink was touched (rc=$rc)"
+rm -f "$BACKUP_ROOT/hq"; rmdir "$T/elsewhere"
+OLD_BR="$BACKUP_ROOT"
+BACKUP_ROOT="$T/city/not-a-backup-root"; mkdir -p "$BACKUP_ROOT/hq"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && ok "a root not literally named .dolt-backup → refused" || bad "wrong root was accepted (rc=$rc)"
+rmdir "$BACKUP_ROOT/hq" "$BACKUP_ROOT"
+BACKUP_ROOT=""; _eph_drop_empty_staging hq "/hq"; rc=$?
+[ "$rc" -eq 1 ] && ok "BACKUP_ROOT unset → refused (never builds a path from nothing)" || bad "unset root gave rc $rc"
+BACKUP_ROOT="$OLD_BR"
+mkdir "$BACKUP_ROOT/hq"; chmod 000 "$BACKUP_ROOT"
+if [ "$(id -u)" != "0" ]; then
+  _eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+  chmod 755 "$BACKUP_ROOT"
+  [ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && ok "an UNSEARCHABLE root → rc 1 ('cannot tell'), never rc 2 ('absent'), nothing removed" || bad "unsearchable root gave rc $rc"
+else chmod 755 "$BACKUP_ROOT"; ok "(running as root — skipped)"; fi
+rmdir "$BACKUP_ROOT/hq" 2>/dev/null
+printf 'DOLT_BACKUP_EPHEMERAL_DBS=\n' > "$T/eph.env"; mkdir "$BACKUP_ROOT/hq"
+_eph_drop_empty_staging hq "$BACKUP_ROOT/hq"; rc=$?
+[ "$rc" -eq 1 ] && [ -d "$BACKUP_ROOT/hq" ] && ok "kill switch (conf line with an empty value) → hq is not ephemeral → left alone" || bad "removed under the kill switch (rc=$rc)"
+rmdir "$BACKUP_ROOT/hq"; rm -f "$T/eph.env"
+grep -qE '(^|[^a-z])rm -rf|rm -r ' <(sed -n '/^_eph_drop_empty_staging()/,/^}/p' "$LIB") \
+  && bad "_eph_drop_empty_staging contains an rm -r — it must only ever rmdir" || ok "_eph_drop_empty_staging uses rmdir only (no rm -r anywhere in its body)"
+
+# ═══ _eph_epoch_utc / _eph_s3_last_backup_text (ga-94vxdw) ══════════════════════════════════
+echo "── _eph_epoch_utc / _eph_s3_last_backup_text (ga-94vxdw) ──"
+[ "$(_eph_epoch_utc "$(epoch_of 2026-10-01T23:38:00Z)")" = "2026-10-01T23:38:00Z" ] && ok "_eph_epoch_utc round-trips an epoch to its UTC timestamp" || bad "epoch→utc: $(_eph_epoch_utc "$(epoch_of 2026-10-01T23:38:00Z)")"
+[ "$(_eph_epoch_utc abc)" = "?" ] && [ "$(_eph_epoch_utc '')" = "?" ] && ok "_eph_epoch_utc: a non-number → '?' (never a made-up time)" || bad "epoch junk: '$(_eph_epoch_utc abc)' '$(_eph_epoch_utc '')'"
+reset_bucket
+putfp '{"run_utc":"2026-10-01T23:50:00Z","databases":{"hq":{"status":"ok","run_utc":"2026-10-01T23:38:00Z"},"lexbh":{"status":"failed","last_ok_run_utc":"2026-09-29T09:09:49Z"},"beads":{"status":"failed","last_ok_run_utc":null}}}'
+out="$(_eph_s3_last_backup_text hq)"
+case "$out" in *"last good backup of hq at 2026-10-01T23:38:00Z"*) ok "ok entry → 'last good backup of hq at <UTC time>'" ;; *) bad "ok text: $out" ;; esac
+out="$(_eph_s3_last_backup_text lexbh)"
+case "$out" in *"last night FAILED for lexbh"*"2026-09-29T09:09:49Z"*) ok "failed entry with a last-good time → says FAILED and gives the last good time" ;; *) bad "failed text: $out" ;; esac
+out="$(_eph_s3_last_backup_text beads)"
+case "$out" in *"last night FAILED for beads"*"does not record"*) ok "failed entry with no last-good time → says so" ;; *) bad "failed-unknown text: $out" ;; esac
+out="$(_eph_s3_last_backup_text nosuchdb)"
+case "$out" in *"has no entry for nosuchdb"*) ok "no entry for the db → 'has no entry'" ;; *) bad "absent text: $out" ;; esac
+reset_bucket
+out="$(_eph_s3_last_backup_text hq)"
+case "$out" in *"could not be read"*"says nothing about whether the S3 copy restores"*) ok "fingerprint missing from the bucket → 'could not be read … says nothing about whether the S3 copy restores' (unknown, not 'not proven')" ;; *) bad "unknown text: $out" ;; esac
+case "$out" in *"NOT proven"*|*"not proven"*) bad "the unknown state was worded as 'not proven': $out" ;; *) ok "…and the unknown state never says 'not proven'" ;; esac
+_eph_s3_last_backup_text hq >/dev/null; [ $? -eq 0 ] && ok "_eph_s3_last_backup_text always rc 0" || bad "_eph_s3_last_backup_text non-zero rc"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

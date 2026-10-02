@@ -168,6 +168,41 @@ _eph_release_target() {
   printf '%s' "$t"
 }
 
+# _eph_drop_empty_staging <db> <dest> — ga-94vxdw. An EMPTY directory is not a staging. For an
+# ephemeral db the old nightly made exactly that, every night: its `CALL DOLT_BACKUP('add', …,
+# 'file://<dest>')` CREATES <dest> (real Dolt does, even for a name that is already registered — measured on
+# 2.3.1), so a staging released on purpose at night N came back, empty, at night N+1 — and every reader
+# then took "a directory with no manifest" for a broken backup, not for "no staging, by design"
+# (2026-10-02 04:01: "local closure: no manifest … NOT proven", about a dir that had not existed when the
+# night began). The loop no longer registers a remote for a staging that is absent; this clears the
+# leftovers the old behaviour already made.
+# Removes <dest> only if ALL hold: the db is ephemeral; the path is what _eph_release_target demands
+# (absolute root literally named .dolt-backup, plain identifier, a real directory — never a symlink —
+# directly under that root; here without the manifest, whose absence is the point); and `rmdir`
+# succeeds, which it does ONLY for a directory with nothing in it. Anything inside it, an unreadable
+# directory, a busy one: rmdir fails and nothing changes. It never uses rm -rf, so it cannot delete data.
+# Return codes (three states that must not collapse):
+#   0  an empty <dest> was removed;
+#   2  nothing to do — <dest> does not exist (and its parent can be searched, so "absent" is not a guess);
+#   1  left as it is: not ephemeral, path-safety, or not removable (non-empty / unreadable / busy).
+_eph_drop_empty_staging() {
+  local db="$1" dest="$2" root t
+  _eph_is_ephemeral "$db" || return 1
+  case "$db" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  root="${BACKUP_ROOT:-}"
+  case "$root" in /*) ;; *) return 1 ;; esac
+  [ "$(basename "$root")" = ".dolt-backup" ] || return 1
+  [ -d "$root" ] && [ -x "$root" ] || return 1
+  t="$root/$db"
+  [ "$dest" = "$t" ] || return 1
+  [ -e "$t" ] || [ -L "$t" ] || return 2
+  [ -d "$t" ] && [ ! -L "$t" ] || return 1
+  [ "$(cd "$root" 2>/dev/null && pwd -P)" = "$(cd "$(dirname "$t")" 2>/dev/null && pwd -P)" ] || return 1
+  rmdir "$t" 2>/dev/null || return 1
+  _eph_log "$db: ephemeral staging: removed an EMPTY $t — a directory with nothing in it is not a staging; an earlier DOLT_BACKUP add left it behind (ga-94vxdw)"
+  return 0
+}
+
 # _eph_writer_active — 0 iff a process that writes or reads the staging is running, OR we cannot
 # tell (no ps output): only a clean "no such process" (grep rc 1) is "not active".
 _eph_writer_active() {
@@ -319,6 +354,38 @@ _eph_s3_fingerprint_state() {
   case "$out" in
     "ok "[0-9]*|"failed "[0-9]*|"failed unknown"|absent|unknown) echo "$out" ;;
     *) echo unknown ;;
+  esac
+  return 0
+}
+
+# _eph_epoch_utc <epoch> — "2026-10-01T23:38:00Z" for an epoch (BSD `date -r`, GNU `date -d` as the
+# fallback); "epoch <n>" if neither date can format it, "?" if <epoch> is not a number.
+_eph_epoch_utc() {
+  local ep="$1" out
+  case "$ep" in ''|*[!0-9]*) echo "?"; return 0 ;; esac
+  out="$(date -u -r "$ep" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+  [ -n "$out" ] || out="$(date -u -d "@$ep" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+  [ -n "$out" ] || out="epoch $ep"
+  echo "$out"
+}
+
+# _eph_s3_last_backup_text <db> — ga-94vxdw. ONE phrase for a log line: what S3's run fingerprint
+# (_eph_s3_fingerprint_state) says about the last backup of <db>. For a night refused for disk with
+# the staging absent BY DESIGN the log can no longer point at a local manifest, so it points here —
+# the proof that is still valid is the one S3 carries. Five states, each worded for what it IS:
+# "could not be read" is the unknown, and it says that it says nothing about the S3 copy — never
+# "not proven". Always rc 0.
+_eph_s3_last_backup_text() {
+  local db="$1" st ep
+  st="$(_eph_s3_fingerprint_state "$db")"
+  case "$st" in
+    "ok "[0-9]*)     ep="${st#ok }"
+                     printf "S3's fingerprint (_meta/latest.json) puts the last good backup of %s at %s" "$db" "$(_eph_epoch_utc "$ep")" ;;
+    "failed "[0-9]*) ep="${st#failed }"
+                     printf "S3's fingerprint (_meta/latest.json) says the last night FAILED for %s; its last good backup was at %s" "$db" "$(_eph_epoch_utc "$ep")" ;;
+    "failed unknown") printf "S3's fingerprint (_meta/latest.json) says the last night FAILED for %s and does not record its last good backup" "$db" ;;
+    absent)          printf "S3's fingerprint (_meta/latest.json) has no entry for %s" "$db" ;;
+    *)               printf "S3's fingerprint (_meta/latest.json) could not be read (unknown — that says nothing about whether the S3 copy restores)" ;;
   esac
   return 0
 }

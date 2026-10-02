@@ -591,14 +591,30 @@ _sync_disk_preflight_credit() {
 # window, ga-btnq6h) the only honest report is S3's own closure, read without writing
 # anything. Never changes the ok/failed counters — the db's backup for today still
 # failed; this only reports what state S3 is left in.
+#
+# ga-94vxdw: for an EPHEMERAL db the missing staging is the design, not a finding — the line says
+# so when the directory is positively known to be absent (parent searchable, nothing at <dest>; if
+# that cannot be established it says only "no local staging"), and it carries S3's last good backup
+# from its own fingerprint (the proof that is still valid once the local manifest is gone). Whether S3
+# itself restores is still read live, and "NOT proven" stays reserved for S3 failing that read; an
+# unreadable fingerprint says "could not be read", nothing more.
 _mirror_staging_after_disk_refusal() {
-  local db="$1" dest="$2"
+  local db="$1" dest="$2" by_design="" last=""
   if [ ! -d "$dest" ]; then
+    if _eph_is_ephemeral "$db"; then
+      last="; $(_eph_s3_last_backup_text "$db")"
+      # "by design" says the directory is ABSENT, which is only known when its parent can be searched and
+      # nothing — not even a dangling symlink — sits at <dest>. `! -d` alone is also true when the directory
+      # cannot be examined at all; then the line stays the plain "no local staging" (don't know ≠ by design).
+      if [ -d "${dest%/*}" ] && [ -x "${dest%/*}" ] && [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+        by_design=" — by design (ephemeral staging: built, proven in S3, then released)"
+      fi
+    fi
     if _s3proof_s3_closure_ok "$db"; then
-      log "$db: disk refusal — no local staging at $dest to mirror; the S3 copy of $db is proven restorable (manifest closure)"
+      log "$db: disk refusal — no local staging at $dest to mirror${by_design}; the S3 copy of $db is proven restorable (manifest closure)${last}"
       return 0
     fi
-    log "$db: disk refusal — no local staging at $dest to mirror AND the S3 copy of $db is NOT proven restorable (see line above)"
+    log "$db: disk refusal — no local staging at $dest to mirror${by_design} AND the S3 copy of $db is NOT proven restorable (see line above)${last}"
     return 1
   fi
   if _s3proof_repair_then_prove "$dest" "$db"; then
@@ -1352,8 +1368,25 @@ log "ephemeral staging mode: $(_eph_mode_summary)"
 for db in $DBS; do
   total=$((total+1))
   dest="$BACKUP_ROOT/$db"
-  # ensure the backup remote is registered (idempotent — tolerate "already exists")
-  dsql -q "USE \`$db\`; CALL DOLT_BACKUP('add', '${db}-backup', 'file://${dest}');" >/dev/null 2>&1 || true
+  # ga-gqllbc: an ephemeral db builds its staging from scratch, proves S3, then releases it.
+  eph=0; _eph_is_ephemeral "$db" && eph=1
+  # ga-94vxdw: `DOLT_BACKUP('add', …, 'file://<dest>')` CREATES <dest> when it is absent — and again for a
+  # name that is already registered ("already exists"; measured on Dolt 2.3.1). For an ephemeral db whose
+  # staging was released on purpose that re-made an EMPTY .dolt-backup/<db> every night, before the disk
+  # gate had even run: the refusal then proved a directory that was never a backup ("local closure: no
+  # manifest … NOT proven", 2026-10-02 04:01) and the log said S3 was unproven when it was not. So an
+  # ephemeral db's staging is never created here: an empty leftover from the old behaviour is removed
+  # (rmdir — only ever an EMPTY dir), and the remote is not registered for a staging that is not there.
+  # Nothing needs the registration: the ephemeral flow never syncs through the server (_sync_ephemeral →
+  # the offline sync-url, which creates the dir itself when a night really builds one). A staging that
+  # IS there — and every non-ephemeral db, and any doubt about the conf — keeps the idempotent add as before.
+  [ "$eph" -eq 1 ] && { _eph_drop_empty_staging "$db" "$dest" || true; }
+  if [ "$eph" -eq 1 ] && [ ! -e "$dest" ]; then
+    :
+  else
+    # ensure the backup remote is registered (idempotent — tolerate "already exists")
+    dsql -q "USE \`$db\`; CALL DOLT_BACKUP('add', '${db}-backup', 'file://${dest}');" >/dev/null 2>&1 || true
+  fi
   # capture the commit we are about to back up BEFORE syncing. On an append-only beads
   # store this pre-sync HEAD is always an ancestor of (or equal to) what the sync
   # captures, so it is GUARANTEED present in the backup — which makes the recorded
@@ -1365,8 +1398,6 @@ for db in $DBS; do
   # baseline _mirror_staging_after_aborted_sync compares against if a later disk refusal
   # follows an attempt that was cut. Taken per db, right before the first attempt.
   pre_fp="$(_staging_manifest_fp "$dest")"
-  # ga-gqllbc: an ephemeral db builds its staging from scratch, proves S3, then releases it.
-  eph=0; _eph_is_ephemeral "$db" && eph=1
   # 1) native consistent backup -> local staging (incremental)
   offline_done=0
   if ! _sync_disk_preflight "$db"; then

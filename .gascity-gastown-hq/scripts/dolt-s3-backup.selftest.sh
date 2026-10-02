@@ -1771,6 +1771,12 @@ _s3proof_repair_then_prove() { echo "prove $1 $2" >> "$MR_CALLS"; return "${MR_S
 # window) the alert must still report S3's real state, so S3's own closure is read (read-only).
 MR_CLOSURE="$(mktemp)"
 _s3proof_s3_closure_ok() { echo "closure $1" >> "$MR_CLOSURE"; return "${MR_S3_RC:-0}"; }
+# ga-94vxdw: for an ephemeral db the absent-dir branch also reads S3's run fingerprint
+# (_eph_s3_fingerprint_state → `aws s3 cp s3://$BUCKET/_meta/latest.json`). In lib mode $AWS and $BUCKET are the
+# PRODUCTION values, so without this stub the cases below would read the real bucket (measured: 2 calls with a
+# logging aws shim in PATH). Restored right after the by-design cases.
+_MR_REAL_FPS="$(declare -f _eph_s3_fingerprint_state)"
+_eph_s3_fingerprint_state() { echo "${MR_FP:-unknown}"; }
 
 : > "$MR_CALLS"; : > "$MR_CLOSURE"; : > "$MR_LOG"
 MR_S3_RC=0 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
@@ -1783,6 +1789,46 @@ MR_S3_RC=1 LOG="$MR_LOG" _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not
 [ "$rc" -eq 1 ] && ok "no staging + S3 closure NOT proven → returns 1 (alert says disco+s3, never a blind 'disco')" || bad "no staging + closure failing returned $rc (unverified S3 reported as fine)"
 grep -q 'NOT proven restorable' "$MR_LOG" && ok "…and the log says S3 is NOT proven restorable" || bad "missing-staging failure not logged: $(cat "$MR_LOG")"
 [ ! -s "$MR_CALLS" ] && ok "…without attempting an upload from a dir that does not exist" || bad "repair attempted for a missing dir"
+
+# ga-94vxdw: "by design" is a claim that the directory is ABSENT. It is made only when that is positively known
+# (parent searchable, nothing at <dest> — not even a dangling symlink); where the directory cannot be examined the
+# line stays the plain "no local staging" (don't know ≠ by design). The ephemeral list is pinned per call: in lib
+# mode _eph_is_ephemeral would otherwise read the host's real dolt-backup-ephemeral.env.
+MR_NOCONF="$MR_DIR/no-such.env"
+: > "$MR_CLOSURE"; : > "$MR_LOG"
+DOLT_BACKUP_EPHEMERAL_CONF="$MR_NOCONF" DOLT_BACKUP_EPHEMERAL_DBS=hq MR_FP="ok $(date +%s)" MR_S3_RC=0 LOG="$MR_LOG" \
+  _mirror_staging_after_disk_refusal hq "$MR_DIR/does-not-exist"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF 'by design' "$MR_LOG" && grep -qF 'last good backup of hq at' "$MR_LOG"; then
+  ok "ephemeral db, dir positively absent (parent searchable) → 'by design' + S3's last good backup (rc 0)"
+else bad "positively absent dir did not read 'by design' (rc=$rc): $(cat "$MR_LOG")"; fi
+
+mkdir "$MR_DIR/locked"; chmod 000 "$MR_DIR/locked"
+if [ "$(id -u)" != "0" ]; then
+  : > "$MR_LOG"
+  DOLT_BACKUP_EPHEMERAL_CONF="$MR_NOCONF" DOLT_BACKUP_EPHEMERAL_DBS=hq MR_FP=unknown MR_S3_RC=0 LOG="$MR_LOG" \
+    _mirror_staging_after_disk_refusal hq "$MR_DIR/locked/hq"; rc=$?
+  chmod 755 "$MR_DIR/locked"
+  if [ "$rc" -eq 0 ] && grep -qF 'no local staging' "$MR_LOG" && ! grep -qF 'by design' "$MR_LOG"; then
+    ok "an UNSEARCHABLE parent → the line says only 'no local staging', never 'by design' (could not tell ≠ absent by design)"
+  else bad "unsearchable parent read as by-design (rc=$rc): $(cat "$MR_LOG")"; fi
+else chmod 755 "$MR_DIR/locked"; ok "(running as root — unsearchable-parent case skipped)"; fi
+rmdir "$MR_DIR/locked"
+
+ln -s "$MR_DIR/nowhere" "$MR_DIR/dangling"; : > "$MR_LOG"
+DOLT_BACKUP_EPHEMERAL_CONF="$MR_NOCONF" DOLT_BACKUP_EPHEMERAL_DBS=hq MR_FP=unknown MR_S3_RC=0 LOG="$MR_LOG" \
+  _mirror_staging_after_disk_refusal hq "$MR_DIR/dangling"; rc=$?
+rm -f "$MR_DIR/dangling"
+if [ "$rc" -eq 0 ] && grep -qF 'no local staging' "$MR_LOG" && ! grep -qF 'by design' "$MR_LOG"; then
+  ok "a dangling symlink at <dest> → not 'absent by design' (something IS there)"
+else bad "dangling symlink read as by-design (rc=$rc): $(cat "$MR_LOG")"; fi
+
+: > "$MR_LOG"
+DOLT_BACKUP_EPHEMERAL_CONF="$MR_NOCONF" DOLT_BACKUP_EPHEMERAL_DBS=hq MR_FP="ok $(date +%s)" MR_S3_RC=0 LOG="$MR_LOG" \
+  _mirror_staging_after_disk_refusal lexbh "$MR_DIR/does-not-exist"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF 'no local staging' "$MR_LOG" && ! grep -qF 'by design' "$MR_LOG" && ! grep -qF 'last good backup' "$MR_LOG"; then
+  ok "a db that is NOT ephemeral → the old line, no 'by design', no S3 fingerprint text"
+else bad "non-ephemeral db got the by-design wording (rc=$rc): $(cat "$MR_LOG")"; fi
+eval "$_MR_REAL_FPS"
 
 # the closure probe must NOT be consulted when a staging exists — the strong proof covers it
 mkdir -p "$MR_DIR/hq"; : > "$MR_CLOSURE"; : > "$MR_CALLS"
@@ -1807,13 +1853,13 @@ echo "── drift-guard: the refusal branch is wired to the mirror (ga-btnq6h) 
 # the FIRST (pre-write) preflight in the per-db loop — the block between the step-1 marker
 # and the native sync call.
 BLOCK="$(awk '/# 1\) native consistent backup/{f=1} f{print} /SYNC_OUT" 2>&1; then/{if(f) exit}' "$SCRIPT")"
-printf '%s' "$BLOCK" | grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' \
+grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' <<<"$BLOCK" \
   && ok "step-1 refusal branch calls _mirror_staging_after_disk_refusal \"\$db\" \"\$dest\"" \
   || bad "step-1 refusal branch does NOT call the mirror — S3 repair is skipped on a disk refusal again"
-printf '%s' "$BLOCK" | grep -qF 'failed=$((failed+1))' \
+grep -qF 'failed=$((failed+1))' <<<"$BLOCK" \
   && ok "…and still counts the db as failed (its own backup did not run today)" \
   || bad "refusal branch no longer counts the db as failed"
-printf '%s' "$BLOCK" | grep -qF '(disco+s3)' && printf '%s' "$BLOCK" | grep -qF '(disco)' \
+grep -qF '(disco+s3)' <<<"$BLOCK" && grep -qF '(disco)' <<<"$BLOCK" \
   && ok "…and the alert distinguishes disco (S3 sound) from disco+s3 (S3 NOT proven)" \
   || bad "alert text no longer distinguishes S3 state"
 M_LN="$(printf '%s\n' "$BLOCK" | grep -nF '_mirror_staging_after_disk_refusal "$db" "$dest"' | head -1 | cut -d: -f1)"
@@ -1837,10 +1883,10 @@ N_CALLS="$(grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"' "$SCRIPT"
 H_CALL="$(awk '/^_mirror_staging_after_aborted_sync\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT" | grep -cF '_mirror_staging_after_disk_refusal "$db" "$dest"')"
 [ "$H_CALL" -eq 1 ] && ok "…and one of the two is inside _mirror_staging_after_aborted_sync, after its fingerprint checks" || bad "the gated helper does not call the mirror exactly once (found $H_CALL)"
 FBODY="$(awk '/^_mirror_staging_after_disk_refusal\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
-printf '%s' "$FBODY" | grep -qF -- '--delete' \
+grep -qF -- '--delete' <<<"$FBODY" \
   && bad "the refusal mirror uses --delete (must be additive on a night with no fresh sync)" \
   || ok "the refusal mirror body never uses --delete"
-printf '%s' "$FBODY" | grep -qF '_s3proof_repair_then_prove' \
+grep -qF '_s3proof_repair_then_prove' <<<"$FBODY" \
   && ok "the refusal mirror goes through the shared proof lib (closure-guarded, manifest-last)" \
   || bad "the refusal mirror bypasses the shared proof lib"
 grep -qF 'dolt-backup-s3-proof.sh' "$SCRIPT" && ok "the proof lib is sourced by the script" || bad "proof lib not sourced"
@@ -1924,10 +1970,10 @@ PREFP_LN="$(grep -nF 'pre_fp="$(_staging_manifest_fp "$dest")"' "$SCRIPT" | head
   && ok "the baseline fingerprint is taken inside the per-db loop, BEFORE the first preflight/sync attempt" \
   || bad "baseline fingerprint not taken before the first attempt (loop@${LOOP_LN:-?} pre_fp@${PREFP_LN:-?} first-preflight@${FIRST_PF_LN:-?})"
 FB_BLOCK="$(awk '/connection-timeout retries exhausted — falling back/{f=1} f{print} /_offline_backup_sync "\$db" "\$dest"; then/{if(f) exit}' "$SCRIPT")"
-printf '%s' "$FB_BLOCK" | grep -qF '_mirror_staging_after_aborted_sync "$db" "$dest" "$pre_fp"' \
+grep -qF '_mirror_staging_after_aborted_sync "$db" "$dest" "$pre_fp"' <<<"$FB_BLOCK" \
   && ok "the offline-fallback refusal (where the hq chain ends) calls the fingerprint-gated mirror with the baseline" \
   || bad "the offline-fallback refusal does not call _mirror_staging_after_aborted_sync with \$pre_fp — S3 stays unrepaired on this path"
-printf '%s' "$FB_BLOCK" | grep -qF '_mirror_staging_after_disk_refusal' \
+grep -qF '_mirror_staging_after_disk_refusal' <<<"$FB_BLOCK" \
   && bad "the post-attempt refusal calls the UNGUARDED mirror directly — the fingerprint gate is bypassed" \
   || ok "…and it never calls the unguarded mirror directly"
 FA_LN="$(printf '%s\n' "$FB_BLOCK" | grep -nF 'failed=$((failed+1))' | head -1 | cut -d: -f1)"
@@ -1936,16 +1982,16 @@ FM_LN="$(printf '%s\n' "$FB_BLOCK" | grep -nF '_mirror_staging_after_aborted_syn
 [ -n "$FA_LN" ] && [ -n "$FN_LN" ] && [ -n "$FM_LN" ] && [ "$FA_LN" -lt "$FN_LN" ] && [ "$FN_LN" -lt "$FM_LN" ] \
   && ok "…it still counts the db failed and notes the streak (ga-rt7ljo) BEFORE the slow mirror" \
   || bad "fallback refusal order wrong (failed@${FA_LN:-?} streak-note@${FN_LN:-?} mirror@${FM_LN:-?})"
-printf '%s' "$FB_BLOCK" | grep -qF '(disco+s3)' && printf '%s' "$FB_BLOCK" | grep -qF '(disco)' \
+grep -qF '(disco+s3)' <<<"$FB_BLOCK" && grep -qF '(disco)' <<<"$FB_BLOCK" \
   && ok "…and its alert distinguishes disco (S3 sound) from disco+s3 (S3 NOT proven)" \
   || bad "fallback refusal no longer distinguishes S3 state in the alert"
 SM_BODY="$(awk '/^_sync_with_stale_manifest_recovery\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
-printf '%s' "$SM_BODY" | grep -qF '_mirror_staging_after' \
+grep -qF '_mirror_staging_after' <<<"$SM_BODY" \
   && bad "_sync_with_stale_manifest_recovery mirrors — but it wipes the staging first, so there is nothing valid to mirror" \
   || ok "the stale-manifest recovery (which wipes the staging) stays out of the mirror, by design"
 GA_BODY="$(awk '/^_mirror_staging_after_aborted_sync\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT")"
-printf '%s' "$GA_BODY" | grep -qF -- '--delete' && bad "the gated mirror mentions --delete (must stay additive)" || ok "the gated mirror never uses --delete"
-printf '%s' "$GA_BODY" | grep -qF '_staging_manifest_fp "$dest"' && ok "…and it re-reads the manifest fingerprint itself (does not trust the caller's word)" || bad "the gated mirror does not re-read the staging manifest"
+grep -qF -- '--delete' <<<"$GA_BODY" && bad "the gated mirror mentions --delete (must stay additive)" || ok "the gated mirror never uses --delete"
+grep -qF '_staging_manifest_fp "$dest"' <<<"$GA_BODY" && ok "…and it re-reads the manifest fingerprint itself (does not trust the caller's word)" || bad "the gated mirror does not re-read the staging manifest"
 
 echo "── _build_run_fingerprint() — a db that FAILED stays in _meta/latest.json (ga-gjfe78) ──"
 # The nightly fingerprint used to be rebuilt from scratch from the dbs that
@@ -2252,7 +2298,10 @@ echo "dolt: $q" >> "$E2E_CALLS"
 case "$q" in
   "SHOW DATABASES") printf 'Database\nhq\ninformation_schema\n' ;;
   "SELECT 1") echo 1 ;;
-  *"CALL DOLT_BACKUP('add'"*) : ;;
+  # Real Dolt (2.3.1, measured for ga-94vxdw): `backup add <name> file://<dir>` CREATES <dir> when it is
+  # absent, and a repeat add of a registered name ("already exists") creates it again. A stub that did
+  # nothing here is what hid the empty .dolt-backup/hq the nightly re-made every night.
+  *"CALL DOLT_BACKUP('add'"*) d="$(printf '%s' "$q" | sed -n "s#.*'file://\([^']*\)'.*#\1#p")"; [ -n "$d" ] && mkdir -p "$d" ;;
   *"dolt_log ORDER BY date"*) printf 'commit_hash\nabc123\n' ;;
   *"SELECT COUNT(*)"*) printf 'COUNT(*)\n5\n' ;;
   *"CALL DOLT_BACKUP('sync'"*)
@@ -2566,9 +2615,9 @@ rm -rf "$RQ_ROOT" "$RQ_OUTSIDE" "$RQ_LOG" "$RQ_CITY" "$RQ_WRAP_LOG"
 
 echo "── drift-guard: the first refusal site asks the residue question BEFORE it refuses (ga-qcrpxj) ──"
 RQ_FIRST_BLOCK="$(awk '/^for db in \$DBS; do/{l=1} l&&/if ! _sync_disk_preflight "\$db"; then/{f=1} f{print} f&&/if \[ "\$offline_done" -eq 0 \] && ! DOLT_CLI_PASSWORD/{exit}' "$SCRIPT")"
-printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_residue_reinit_would_unblock "$db" "$dest"' \
-  && printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_sync_with_stale_manifest_recovery "$db" "$dest"' \
-  && printf '%s' "$RQ_FIRST_BLOCK" | grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' \
+grep -qF '_residue_reinit_would_unblock "$db" "$dest"' <<<"$RQ_FIRST_BLOCK" \
+  && grep -qF '_sync_with_stale_manifest_recovery "$db" "$dest"' <<<"$RQ_FIRST_BLOCK" \
+  && grep -qF '_mirror_staging_after_disk_refusal "$db" "$dest"' <<<"$RQ_FIRST_BLOCK" \
   && ok "the first site: residue question → reinit+offline recovery; otherwise the ga-btnq6h mirror-and-report refusal, unchanged" \
   || bad "the first refusal site lost the residue branch, the recovery call, or the original mirror-and-report refusal"
 RQ_ORD_Q="$(printf '%s\n' "$RQ_FIRST_BLOCK" | grep -nF '_residue_reinit_would_unblock' | head -1 | cut -d: -f1)"
@@ -2617,7 +2666,8 @@ esac
 case "$q" in
   "SHOW DATABASES") printf 'Database\nhq\ninformation_schema\n' ;;
   "SELECT 1") echo 1 ;;
-  *"CALL DOLT_BACKUP('add'"*) : ;;
+  # same as e2e_write_stubs' stub: real `backup add file://<dir>` creates <dir> (ga-94vxdw)
+  *"CALL DOLT_BACKUP('add'"*) d="$(printf '%s' "$q" | sed -n "s#.*'file://\([^']*\)'.*#\1#p")"; [ -n "$d" ] && mkdir -p "$d" ;;
   *"dolt_log ORDER BY date"*) printf 'commit_hash\nabc123\n' ;;
   *"SELECT COUNT(*)"*) printf 'COUNT(*)\n5\n' ;;
   *"CALL DOLT_BACKUP('sync'"*) echo "error opening table file: table file not found: /fake"; exit 1 ;;
@@ -2729,7 +2779,11 @@ else bad "e2e R5: the sync ran (or was hidden) although the disk never freed (rc
 # refused on 09-22..25 and 09-28..10-01 — for the space the staging itself held. Real subprocess,
 # stubbed dolt/df/aws/ps, the real city and the real process list NEVER touched.
 echo "── end-to-end: ephemeral staging (ga-gqllbc) — real subprocess, stubbed dolt/df/aws/ps ──"
-# e2eE_case <name> <staging: none|closed|residue> <free_kb>   (knobs: E2EE_PS_OUT, E2EE_SYNC_FAIL, E2EE_AWS_NOOP, E2EE_EPH_DBS)
+# e2eE_case <name> <staging: none|closed|residue|empty|recent> <free_kb>
+#   (knobs: E2EE_PS_OUT, E2EE_SYNC_FAIL, E2EE_AWS_NOOP, E2EE_EPH_DBS,
+#    E2EE_FP — the JSON body of S3's _meta/latest.json before the night (ga-94vxdw), E2EE_S3_BROKEN=1 — S3's hq manifest is gone)
+#   empty  = an EMPTY dir, the leftover the old nightly's `backup add` made every night (ga-94vxdw)
+#   recent = a manifest-less staging written to just now (a writer may still be there: never treated as residue)
 e2eE_case() {
   local name="$1" kind="$2" free_kb="$3" E i st
   E="$E2E_ROOT/$name"; E2E_DIR="$E"
@@ -2748,8 +2802,12 @@ e2eE_case() {
     closed)  e2e_mkbackup "$st" 3 ;;                                    # a valid staging from an earlier night
     residue) mkdir -p "$st"; for i in 1 2; do printf 'partial%s' "$i" > "$st/$(e2e_tid "$i").darc"; done
              touch -t 202609281800 "$st"/* "$st" ;;                     # manifest-less, quiet for 30+ min
+    empty)   mkdir -p "$st" ;;
+    recent)  mkdir -p "$st"; printf 'partial1' > "$st/$(e2e_tid 1).darc" ;;
   esac
   e2e_mkbackup "$E/bucket/hq" 2                                          # S3: the older closed copy
+  [ "${E2EE_S3_BROKEN:-0}" = 1 ] && rm -f "$E/bucket/hq/manifest"
+  if [ -n "${E2EE_FP:-}" ]; then mkdir -p "$E/bucket/_meta"; printf '%s' "$E2EE_FP" > "$E/bucket/_meta/latest.json"; fi
   e2e_mkbackup "$E/state/fresh_backup" 4                                 # what the offline sync-url writes
   E2E_LOG="$E/city/.gc/logs/dolt-s3-backup.log"
   env -i HOME="$E/home" TMPDIR="$E/tmp" PATH="$E/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -2807,6 +2865,64 @@ if [ "$E2E_RC" -eq 0 ] && grep -qF 'hq: sync preflight REFUSED' "$E2E_LOG" && gr
    && grep -qF 'no local staging' "$E2E_LOG" && [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ]; then
   ok "e2e ED: refused with no staging → S3's own closure is read and the alert stays hq(disco); nothing to delete, nothing created"
 else bad "e2e ED: (rc=$E2E_RC): $(grep 'hq' "$E2E_LOG" | tail -5 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ═══ ga-94vxdw: a night refused for disk, with the ephemeral staging ABSENT BY DESIGN ═══════════════
+# MEASURED 2026-10-02 04:01 (dolt-s3-backup.log): the staging of hq had been released on purpose at 23:38 (S3 proven,
+# 252/252 tables). The nightly refused hq for disk and then logged "local closure: no manifest in .dolt-backup/hq —
+# NOT proven" and "S3 copy of hq is NOT proven restorable/identical" — about a directory that did not exist when the
+# night began: the loop's `DOLT_BACKUP('add', …, 'file://<dest>')` had just created it, EMPTY (real Dolt creates the dir
+# on `backup add`, even for an already-registered name — the stub above now does the same). "No staging, by design"
+# was read as "S3 not proven": the three states (staging there / staging absent by design / could not tell) collapsed.
+# The stub used to do nothing on `add`, which is why ED above passed while production did the opposite.
+H_FP_OK='{"run_utc":"2026-10-01T23:50:00Z","databases":{"hq":{"status":"ok","run_utc":"2026-10-01T23:38:00Z"}}}'
+
+# ── EL1: the incident — refused, NO staging, S3 healthy. Nothing may be created, and the log says what is true ──
+E2EE_FP="$H_FP_OK" e2eE_case el1-by-design none 7577600
+[ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] \
+  && ok "e2e EL1: refused with the staging absent by design → NO .dolt-backup/hq is left behind (the old nightly's 'backup add' re-made it empty every night)" \
+  || bad "e2e EL1: .dolt-backup/hq exists after the run: $(ls -A "$E2E_DIR/city/.dolt-backup/hq" 2>&1 | head -3 | tr '\n' ' ')"
+[ "$(e29_count "DOLT_BACKUP('add'" "$E2E_DIR/dolt.calls")" = 0 ] \
+  && ok "e2e EL1: …because the backup remote is not (re-)registered for a staging that does not exist (the ephemeral flow never syncs through the server)" \
+  || bad "e2e EL1: DOLT_BACKUP('add') ran for an ephemeral db with no staging"
+if grep -qF 'no local staging' "$E2E_LOG" && grep -qF 'by design' "$E2E_LOG" && grep -qF '2026-10-01T23:38:00Z' "$E2E_LOG" \
+   && grep -qF 'proven restorable' "$E2E_LOG"; then
+  ok "e2e EL1: the log says 'no staging, by design', that S3 is proven restorable now, and when S3's last good backup was (2026-10-01T23:38:00Z, from the fingerprint)"
+else bad "e2e EL1: the refusal line does not carry design + S3 state + last-backup time: $(grep 'hq' "$E2E_LOG" | head -4 | tr '\n' '|')"; fi
+! grep -qF 'NOT proven' "$E2E_LOG" && ! grep -qF 'local closure' "$E2E_LOG" \
+  && ok "e2e EL1: …and NOTHING says 'NOT proven' / 'local closure' — S3 is fine, and an absent staging is not a broken one" \
+  || bad "e2e EL1: a 'NOT proven' line is back: $(grep -F -e 'NOT proven' -e 'local closure' "$E2E_LOG" | head -3 | tr '\n' '|')"
+grep -q 'hq(disco)' "$E2E_DIR/notify.calls" && ! grep -q 'disco+s3' "$E2E_DIR/notify.calls" \
+  && ok "e2e EL1: tonight still FAILED for disk, and the alert says (disco) — not (disco+s3): the S3 copy is sound" \
+  || bad "e2e EL1: wrong alert: $(cat "$E2E_DIR/notify.calls")"
+
+# ── EL2: the leftover — an EMPTY .dolt-backup/hq from the old behaviour is not a staging; it is cleared, then same as EL1 ──
+E2EE_FP="$H_FP_OK" e2eE_case el2-leftover-empty empty 7577600
+[ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && grep -qF 'EMPTY' "$E2E_LOG" \
+  && ok "e2e EL2: an empty leftover dir is removed (rmdir — it can only ever remove an EMPTY directory) and the log says so" \
+  || bad "e2e EL2: the empty leftover is still there / not announced: $(grep 'hq' "$E2E_LOG" | head -3 | tr '\n' '|')"
+grep -qF 'by design' "$E2E_LOG" && ! grep -qF 'NOT proven' "$E2E_LOG" && grep -q 'hq(disco)' "$E2E_DIR/notify.calls" && ! grep -q 'disco+s3' "$E2E_DIR/notify.calls" \
+  && ok "e2e EL2: after the clean-up the night reads exactly like EL1 — by design, S3 sound, (disco)" \
+  || bad "e2e EL2: $(grep 'hq' "$E2E_LOG" | head -5 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"
+
+# ── EL3: the fingerprint cannot be read → 'could not find out', never 'not proven' (S3's own closure is still proven live) ──
+e2eE_case el3-fp-unreadable none 7577600
+if [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && grep -qF 'by design' "$E2E_LOG" && grep -qF 'could not be read' "$E2E_LOG" \
+   && ! grep -qF 'NOT proven' "$E2E_LOG" && grep -q 'hq(disco)' "$E2E_DIR/notify.calls"; then
+  ok "e2e EL3: no readable fingerprint → the line says so ('could not be read' — unknown) and does NOT turn it into 'NOT proven'"
+else bad "e2e EL3: $(grep 'hq' "$E2E_LOG" | head -4 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ── EL4: S3 itself is NOT sound and there is no staging → that IS a real alarm, and it still says NOT proven ──
+E2EE_FP="$H_FP_OK" E2EE_S3_BROKEN=1 e2eE_case el4-s3-broken none 7577600
+if [ ! -e "$E2E_DIR/city/.dolt-backup/hq" ] && grep -qF 'NOT proven' "$E2E_LOG" && grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls"; then
+  ok "e2e EL4: no staging AND S3's manifest unreadable → 'NOT proven' + (disco+s3): the honest alarm survives the fix"
+else bad "e2e EL4: $(grep 'hq' "$E2E_LOG" | head -4 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
+
+# ── EL5: a staging that IS there but has no manifest (and may have a writer) keeps today's verdict: NOT proven, nothing deleted ──
+E2EE_FP="$H_FP_OK" e2eE_case el5-present-no-manifest recent 7577600
+if [ -f "$E2E_DIR/city/.dolt-backup/hq/$(e2e_tid 1).darc" ] && grep -qF 'local closure: no manifest' "$E2E_LOG" \
+   && grep -qF 'NOT proven' "$E2E_LOG" && grep -q 'hq(disco+s3)' "$E2E_DIR/notify.calls" && ! grep -qF 'by design' "$E2E_LOG"; then
+  ok "e2e EL5: a present, manifest-less, recently-written staging → still 'NOT proven' (disco+s3), not called 'by design', and not touched"
+else bad "e2e EL5: $(grep 'hq' "$E2E_LOG" | head -5 | tr '\n' '|') | $(cat "$E2E_DIR/notify.calls")"; fi
 
 # ── EE: S3 does NOT prove out right after the upload (the upload silently did nothing) → staging KEPT + alarm ──
 E2EE_AWS_NOOP=1 e2eE_case ee-s3-not-proven none 20971520

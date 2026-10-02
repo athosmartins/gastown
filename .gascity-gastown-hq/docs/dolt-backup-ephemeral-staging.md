@@ -18,7 +18,7 @@ então apaga o staging. Quem apaga é o próprio sistema (o job das 04:00), nunc
 
 | Script | Para um db efêmero (default: `hq`) |
 |---|---|
-| `dolt-s3-backup.sh` (noturno) | pula o sync via servidor (o servidor guarda uma visão em cache do dir esvaziado → `table file not found`, ga-yct7r1), usa o sync offline; sobe ao S3; prova; **libera**. Também libera depois de uma noite recusada por disco, se o S3 estiver provado. |
+| `dolt-s3-backup.sh` (noturno) | pula o sync via servidor (o servidor guarda uma visão em cache do dir esvaziado → `table file not found`, ga-yct7r1), usa o sync offline; sobe ao S3; prova; **libera**. Também libera depois de uma noite recusada por disco, se o S3 estiver provado. Numa noite recusada por disco **sem** staging, não cria o diretório: o `DOLT_BACKUP('add', …, 'file://<dir>')` do início do laço cria `<dir>` (até para um nome já registrado), então para db efêmero sem staging ele não é chamado, e um `<dir>` vazio herdado do comportamento antigo é removido com `rmdir` (só remove dir VAZIO). O log diz `no local staging … by design` — só quando a ausência é CONHECIDA (pai pesquisável e nada em `<dir>`, nem symlink pendurado; se não dá para examinar, diz apenas `no local staging`) — e traz a última prova do S3 (fingerprint); `NOT proven` fica reservado para o S3 de fato não provar (ga-94vxdw). |
 | `mol-dog-backup.sh` (6h) | **pula** o db (aparece como `ephemeral: N` no resumo, um quarto estado) — recriar o staging seria desfazer tudo. |
 | `dolt-backup-reseed.sh` | no-op bem-sucedido (não há o que re-semear). `RESEED_ALLOW_EPHEMERAL=1` força, à mão. |
 | `dolt-restore-verify.sh` | sem backup local, confere o S3: fingerprint legível + manifest **fecha** + idade ≤ 36 h. Resultado `S3-OK`, **nunca** `OK` (não é um restore). |
@@ -45,6 +45,7 @@ dúvida, o staging fica). O noturno loga `ephemeral staging mode: on(hq)` / `off
 
 ```bash
 grep -E 'ephemeral staging' ~/gt/.gascity-gastown-hq/.gc/logs/dolt-s3-backup.log | tail     # released / REFUSED / not released
+grep -E 'by design' ~/gt/.gascity-gastown-hq/.gc/logs/dolt-s3-backup.log | tail             # noite recusada sem staging: S3 lido ao vivo + última prova
 bash ~/gt/.gascity-gastown-hq/scripts/dolt-backup-status.sh                                  # hq: SEM staging local POR DESENHO
 df -h /System/Volumes/Data                                                                  # o ganho: ~9,5 GB livres de forma permanente
 ```
