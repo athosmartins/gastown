@@ -10675,17 +10675,24 @@ reviewer_session_bead_state() {
 # state contract that function itself relies on.
 #
 # ga-uk0km5: every path that answers "keep waiting" SAYS WHY, in one log line
-# naming the slot and the reviewer. It used to answer 1 in silence on six
-# different paths (roster unreadable, verdict bead unreadable, assignee capture
-# unreadable, reviewer not nameable, reviewer in the roster, session bead
-# open/not found), so a run that
-# sat at "still in flight (0/2 ...)" gave no hint which of them held it — and
-# the first reading of the 02/10 reboot incident (run ga-jb52od) blamed the
-# wrong one: the dead reviewer's verdict bead had lost its assignee, but the
+# naming the run (and, where there is one, the verdict bead and the reviewer).
+# It used to answer 1 in silence on seven paths: roster unreadable, verdict bead
+# unreadable, assignee capture unreadable, reviewer not nameable, reviewer in the
+# roster, session bead open / not found, and NO pending verdict bead at all (the
+# caller handles "all delivered" before it gets here, so reaching this with
+# nothing pending and VERDICTS_RECEIVED < REQUIRED_REVIEWERS means the verdicts
+# counted fall short of what the run requires -- logged with the counts).
+# A run that sat at "still in flight (0/2 ...)" gave no hint which of them held
+# it, and the first reading of the 02/10 reboot incident (run ga-jb52od) blamed
+# the wrong one: the dead reviewer's verdict bead had lost its assignee, but the
 # capture already falls back to metadata.gc.session_name (ga-8wec8c), so that
-# slot was classified closed on the first sweep; what held the run was the
-# OTHER slot, whose session name had been re-created by the engine and was in
-# the roster. A name that is listed counts as live, whoever created it.
+# slot was classified closed on the first sweep; what held the run was the OTHER
+# slot, whose session name had been re-created by the engine and was in the
+# roster. A listed name is "not confirmed dead" here, nothing more: this check
+# reads .closed only, so a listed session in a dead state (drained, quarantined,
+# failed-create) also waits, and is judged at the run timeout by
+# reviewer_session_alive -- the log line carries the roster's .state so the
+# operator can tell those apart.
 #
 # ga-s4potx: this is the DEBOUNCE-FREE counterpart to the timeout-gated
 # dead-reviewer classify loop in the caller. That loop only runs once
@@ -10726,9 +10733,10 @@ gate_phase_c_all_pending_closed() {
       return 1
     fi
     if [ -z "$_pcc_sid" ]; then
-      # The bead WAS read, but neither its assignee nor metadata.gc.session_name names a reviewer (the capture already falls back from
-      # one to the other, ga-8wec8c). Not "unreadable": nobody can tell dead from alive from here, so it waits for the timeout.
-      warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb is pending but neither its assignee nor metadata.gc.session_name names a reviewer — cannot tell dead from alive; run keeps waiting for the timeout (ga-uk0km5)."
+      # The bead WAS read, but neither its assignee nor metadata.gc.session_name names a reviewer (the capture already falls back
+      # from one to the other, ga-8wec8c). Not "unreadable". This check cannot confirm anything about a reviewer it cannot name,
+      # so it waits; the run timeout then reads an unnameable reviewer as dead (reviewer_session_alive "" answers 0) and re-queues.
+      warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb is pending but neither its assignee nor metadata.gc.session_name names a reviewer — not confirming anything here; run keeps waiting, and at the timeout an unnameable reviewer reads as dead and the run is re-queued (ga-uk0km5)."
       return 1
     fi
     if [ "$(reviewer_session_confirmed_closed "$_pcc_sid" "$_pcc_sess_json")" != "1" ]; then
@@ -10744,15 +10752,29 @@ gate_phase_c_all_pending_closed() {
           *) log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is absent from 'gc session list' but its session bead is '$_pcc_bst' (a live or not-yet-created incarnation of that name) — run keeps waiting (ga-uk0km5)." ;;
         esac
       else
-        # Listed means live for this purpose even when the engine, not the dispatcher, re-created the session under the same name after
-        # a reboot (02/10, ga-5jn3qy: assignee cleared, name re-used by ga-99c4i4): the name is the slot's identity.
-        log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is in 'gc session list' (alive, booting or re-created under the same name) — run keeps waiting; it is not confirmed dead (ga-uk0km5)."
+        # Listed is "not confirmed dead", not "alive": this check reads .closed only. The name is the slot's identity, so a session
+        # the engine re-created under it after a reboot (02/10, ga-5jn3qy: assignee cleared, name re-used by ga-99c4i4) holds the slot
+        # too. The roster's .state goes in the line because a listed session can be in a dead state (drained, quarantined,
+        # failed-create) that only the run timeout classifies (reviewer_session_alive).
+        _pcc_lstate=$(printf '%s' "$_pcc_sess_json" | jq -r --arg a "$_pcc_sid" \
+          '[(if type=="array" then . else (.sessions // []) end)[]
+            | select((.session_name==$a) or (.name==$a) or (.alias==$a) or (.id==$a) or (.agent_name==$a))
+            | (.state // "none")] | join(",")' 2>/dev/null || true)
+        log "  Phase C: gate-run ${GATE_RUN_ID:-?}: verdict bead $_pcc_vb's reviewer $_pcc_sid is in 'gc session list' with state '${_pcc_lstate:-unreadable}' and is not confirmed dead by this check (it reads .closed only; drained/quarantined/failed-create are classified at the run timeout) — run keeps waiting (ga-uk0km5)."
       fi
       _pcc_all_closed=0
       break
     fi
   done
-  [ "$_pcc_any_pending" = "1" ] && [ "$_pcc_all_closed" = "1" ]
+  if [ "$_pcc_any_pending" != "1" ]; then
+    # Nothing pending: the caller already handled VERDICTS_RECEIVED == REQUIRED_REVIEWERS, so getting here means the verdicts counted
+    # fall short of what the run requires although no bead is open. Three ways in (gate_collect_verdicts): fewer verdict beads exist
+    # than are required (a crash between spawns); it skipped a bead whose bd show failed there while this loop read it as closed; or a
+    # CLOSED bead delivered no verdict it could see and was un-counted. Nothing to confirm dead, and not "all delivered" either.
+    warn "  Phase C: gate-run ${GATE_RUN_ID:-?}: no pending verdict bead among ${#VERDICT_BEAD_IDS[@]} read, but verdicts received ${VERDICTS_RECEIVED:-?} of ${REQUIRED_REVIEWERS:-?} required — nothing to confirm dead; run keeps waiting (ga-uk0km5)."
+    return 1
+  fi
+  [ "$_pcc_all_closed" = "1" ]
 }
 # SELFTEST-EXTRACT phase-c-closed-reviewer-classify-fn: END
 
