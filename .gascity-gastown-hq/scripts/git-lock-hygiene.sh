@@ -108,8 +108,10 @@
 #                              $CITY/.gc/state/git-lock-hygiene-state-notified)
 #   GIT_LOCK_STATE_RENOTIFY_SEC  hand a still-present operation-state item to notify again after
 #                              this many seconds (def 43200 = 12 h)
-#   GIT_LOCK_NOTIFY_TIMEOUT_SEC  deadline for that hand-off (def 30); a notify that hangs counts as
-#                              failed (rc 124), is retried next sweep and is counted as unannounced
+#   GIT_LOCK_NOTIFY_TIMEOUT_SEC  deadline for that hand-off (def 30); with timeout(1), a notify that
+#                              hangs counts as failed (rc 124), is retried next sweep and is counted
+#                              as unannounced. Without timeout(1) there is no deadline: the call runs
+#                              unbounded rather than not at all
 #   GIT_REPO_MUTEX_ENABLED     0 = mutex is a no-op (def 1)
 #   GIT_REPO_MUTEX_MAX_AGE     age (s) before a held mutex is reclaimed as stale (def 600)
 #   GIT_LOCK_PROCESS_CHECK_FN  fn override for process-liveness check (tests only)
@@ -488,8 +490,9 @@ _is_stale() {
 
 # Stale item found: remove it — except in-progress-OPERATION state, which is reported (see the
 # header: a paused merge/rebase looks exactly like a crashed one) unless GIT_LOCK_STATE_REMOVE=1.
-# $4 = the abort command to name in the report's notification (state items only). Returns 0 if
-# removed (or would be, under DRY_RUN), 1 if it was left in place on purpose.
+# $4 = the abort verb(s) to name in the report's notification (state items only; ';'-separated when
+# there is more than one, e.g. "rebase --abort;am --abort"). Returns 0 if removed (or would be, under
+# DRY_RUN), 1 if it was left in place on purpose.
 _glh_reap() {
   local path="$1" repo="$2" label="$3" hint="${4:-}"
   case "${path##*/}" in
@@ -557,7 +560,8 @@ _glh_notify_send() {
 # has passed the same age + no-live-process gates as a stale lock (ga-892qy1; see the header for why
 # those gates cannot prove it was abandoned rather than paused for a human). Reached from _glh_reap,
 # which removes instead only under GIT_LOCK_STATE_REMOVE=1.
-# $1 = path, $2 = repo root, $3 = label, $4 = the abort command to name in the notification.
+# $1 = path, $2 = repo root, $3 = label, $4 = the abort verb(s), ';'-separated; each is expanded below
+# into a complete `git -C <repo> <verb>` command in the notification.
 # "Reported" ends at the hand-off to notify; whether that reaches a person is notify's routing (see
 # the header). Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
 # it as the removed-count, and the real notify prints "Logged for digest ..." on stdout (ga-kimlod
