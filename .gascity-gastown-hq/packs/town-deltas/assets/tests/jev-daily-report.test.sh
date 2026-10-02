@@ -308,7 +308,10 @@ grep -q 'Jev experiment report — 2026-09-20' "$T/out/2026-09-20.txt" 2>/dev/nu
 case "$N" in *"Jev — fim do dia 2026-09-20 (UTC)"*) ok "T1 ntfy title names the UTC day" ;; *) nok "T1 title" "$N" ;; esac
 case "$N" in *"controle 2 alerta(s); experimento 2, dos quais 1 silenciado(s) pelo Jev."*) ok "T1 arm counts" ;; *) nok "T1 arm counts" "$N" ;; esac
 case "$N" in *"Redução de alertas (medida): 50,0%."*) ok "T1 measured reduction 50,0%" ;; *) nok "T1 reduction" "$N" ;; esac
-case "$N" in *"~3680 = 46,0%."*) ok "T1 estimated tokens ~3680 = 46,0% (1x4000 - 320 Jev tokens, vs 2x4000)" ;; *) nok "T1 estimate" "$N" ;; esac
+# ga-hpdgst: this used to pin "~3680 = 46,0%" (1x4000 - 320 Jev tokens, vs 2x4000) -- a figure built on a guessed 4000
+# tokens per alert that nobody ever measured. With 1 alert silenced and no measured cost per alert the saving is UNKNOWN.
+case "$N" in *"Tokens economizados: NÃO SEI — 1 silenciado(s)"*) ok "T1 tokens saved is NÃO SEI: 1 silenced alert, no measured cost per alert" ;; *) nok "T1 estimate" "$N" ;; esac
+case "$N" in *"3680"*|*"46,0%"*|*"4000"*) nok "T1 invented baseline" "a figure built on the guessed per-alert cost is back: $N" ;; *) ok "T1 no figure built on a guessed per-alert cost (no 3680 / 46,0% / 4000)" ;; esac
 case "$N" in *"Custo do Jev (medido): 300 + 20 tokens."*) ok "T1 measured Jev cost" ;; *) nok "T1 cost" "$N" ;; esac
 case "$N" in *"Jev indisponível em 1 de 2 alerta(s)"*) ok "T1 warns the day's number is understated (Jev unavailable 1/2)" ;; *) nok "T1 unavailable warning" "$N" ;; esac
 case "$N" in *"2026-09-21"*) nok "T1 day filter" "another day's event leaked: $N" ;; *) ok "T1 only the requested UTC day is counted" ;; esac
@@ -457,7 +460,7 @@ case "$N" in *"reusou o contexto antigo em 1 de 1 julgadas (100,0%)"*) ok "T14 n
 case "$N" in *"~34.993.980 tokens (bruta 35.000.000, menos redescoberta 5.000 e Jev 1.020)"*) ok "T14 ntfy: savings = gross - rediscovery - Jev tokens, pt-BR thousands" ;; *) nok "T14 savings" "$N" ;; esac
 case "$N" in *"⚠️ Jev indisponível/inutilizável em 1 troca(s)"*) ok "T14 ntfy: the Jev-unavailable boundary is called out, not counted as a restart" ;; *) nok "T14 unavailable" "$N" ;; esac
 case "$N" in *"Recomeçar, acumulado 7 dias até 2026-09-20: 2 trocas"*) ok "T14 ntfy: one-line 7-day rollup" ;; *) nok "T14 rollup" "$N" ;; esac
-case "$N" in *"controle 2 alerta(s); experimento 2, dos quais 1 silenciado(s) pelo Jev."*"Redução de alertas (medida): 50,0%."*"~3680 = 46,0%."*) ok "T14 the suppression numbers are EXACTLY T1's — recomecar rows did not leak into them" ;; *) nok "T14 pollution" "$N" ;; esac
+case "$N" in *"controle 2 alerta(s); experimento 2, dos quais 1 silenciado(s) pelo Jev."*"Redução de alertas (medida): 50,0%."*"Tokens economizados: NÃO SEI — 1 silenciado(s)"*) ok "T14 the suppression numbers are EXACTLY T1's — recomecar rows did not leak into them" ;; *) nok "T14 pollution" "$N" ;; esac
 case "$N" in *"recomecar: controle"*|*"recomecar (sombra)"*) nok "T14 pollution" "an experiment named recomecar was summarized as a suppression/shadow experiment: $N" ;; *) ok "T14 no suppression/shadow line for the recomecar experiment" ;; esac
 GEN="$(awk '/^== recomecar/{exit} {print}' "$F")"
 case "$GEN" in *recomecar*|*Recomecar*|*recomeçar*|*Recomeçar*) nok "T14 pollution in the full report" "the generic part of the file mentions recomecar: $GEN" ;; *) ok "T14 the generic part of the full report does not mention recomecar at all" ;; esac

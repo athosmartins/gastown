@@ -15,11 +15,10 @@ jev_experiment.py's --heuristic-would-escalate gate) and reports, for a given da
     - escalation-count reduction: experiment's fire rate vs control's fire rate, as a
       plain percentage. This needs no cost model at all — it's a headcount, not tokens.
 
-  ESTIMATED (always labeled as such, never blended into the measured numbers above):
-    - tokens "saved" by each suppression, using BASELINE_TOKENS_PER_ESCALATION — a
-      provisional placeholder (see the constant below), not something derived from
-      real per-escalation session-transcript measurement yet. Until that measurement
-      exists, treat this number as an order-of-magnitude sketch, not a fact.
+  TOKENS SAVED (ga-hpdgst): NOT estimated for the suppression experiment. Nothing in the log measures what one
+  escalation costs (the rows carry only Jev's own tokens), and a guessed baseline used to turn this line into
+  negative "savings" of up to ~-1.2M tokens. It prints "none yet" when nothing was suppressed (the saving is exactly
+  zero) and "NÃO SEI" when something was — no figure, no %, until a measured cost per escalation exists.
 
 SHADOW MODE (ga-aijm2v.1/F0): a separate event shape (mode=="shadow", from
 jev_experiment.py's evaluate_shadow()/`evaluate-shadow` CLI) where the real decisor's
@@ -39,8 +38,9 @@ silently pollute the suppression-experiment counts) and get their OWN report sec
 
   ESTIMATED (always labeled as such, never blended into the measured numbers above):
     - tokens the real decisor would have saved on the would-dispense cases: the
-      caller's OWN real token count when it supplied one (decisao_atual_tokens), else
-      the same PROVISIONAL baseline used for the suppression experiment above.
+      caller's OWN real token count (decisao_atual_tokens), minus Jev's cost. Only when EVERY would-dispense case
+      carries that count; if any lacks it the figure is "NÃO SEI" (never priced with a guess), and with no
+      would-dispense case at all it is "none yet" (never "0 - Jev's cost" printed as a saving).
 
 PORTARIA (ga-aijm2v.4): rows (mode=="portaria") are filed under the day their OUTCOME WAS MEASURED
 (`resolved_at`), not the day of delivery. The outcome needs a window that closes ~60 min after the
@@ -76,17 +76,13 @@ from pathlib import Path
 
 JEV_LOG = Path(os.environ.get("JEV_EXPERIMENT_LOG", "/Users/athos/gt/.gascity-gastown-hq/.gc/logs/jev-experiment.jsonl"))
 
-# ── PROVISIONAL baseline, not measured (wa-dln9g) ──────────────────────────────────
-# What a single "wake Mayor for one mail-triage item" cycle plausibly costs in tokens,
-# ballparked from this session's own observed pattern of a few thousand tokens for a
-# simple few-tool-call triage turn, riding on an already-warm/cached system prompt —
-# NOT from an automated measurement of real session transcripts (that would require
-# correlating mail timestamps to session-transcript spans, deliberately deferred out
-# of v1 as its own follow-up rather than rushed here — see wa-dln9g comments).
-# Replace this constant (and mark it MEASURED instead of PROVISIONAL in the report
-# below) once that correlation exists. Until then every "tokens saved" figure in this
-# report is explicitly an estimate built on a guess, not a fact — say so, every time.
-BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL = 4000
+# ga-hpdgst: there used to be a constant here, BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL = 4000, a ballpark for what one
+# escalation costs that nobody had measured. Every "tokens saved" figure was built on it, and on 02/10 the daily ntfy
+# printed negative savings of up to ~-1.2M tokens (and a "-52,6%" divided by control x 4000). It is gone: a saving is
+# stated only from a count somebody MEASURED (the decisor's own `decisao_atual_tokens`), is "NÃO SEI" when a case
+# needs a price nobody measured, and is "none yet" when nothing was silenced/dispensable. To get a suppression-experiment
+# saving back, log a measured cost per escalation on the row (correlating mail timestamps to session-transcript spans,
+# the follow-up wa-dln9g deferred) and price from that -- do not put a guess back here.
 
 
 # the experiment names of the cut-large-output front (cut-output-shadow.py); its rows are mode "cut-output".
@@ -189,17 +185,15 @@ def _metrics(s: dict) -> dict:
         control_rate = control_total / control_total  # trivially 1.0, kept explicit for readability
         exp_rate = s["experiment_fired"] / exp_total
         reduction_pct = (1 - exp_rate / control_rate) * 100
-    avoided_estimate = s["experiment_suppressed"] * BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL
-    net_estimate = avoided_estimate - s["jev_tokens_in"] - s["jev_tokens_out"]
-    pct_of_control_estimate = None
-    if control_total > 0:
-        pct_of_control_estimate = 100 * net_estimate / (control_total * BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL)
+    # ga-hpdgst: the log rows carry only Jev's OWN tokens, nothing measures what a silenced alert would have cost, so a
+    # saving can be stated in exactly one case: nothing was silenced and it is exactly zero ("none"). Otherwise it is
+    # "unknown" -- no figure and no % (the % was divided by control x a guessed cost per alert).
+    tokens_state = "none" if s["experiment_suppressed"] == 0 else "unknown"
     return {
         "control_total": control_total,
         "exp_total": exp_total,
         "reduction_pct": reduction_pct,
-        "net_estimate": net_estimate,
-        "pct_of_control_estimate": pct_of_control_estimate,
+        "tokens_state": tokens_state,
     }
 
 
@@ -247,19 +241,23 @@ def _shadow_metrics(s: dict) -> dict:
     in ONE place so format_report()/format_resumo_pt() can never drift from each other."""
     compared = s["agree"] + s["disagree"]  # excludes "unknown" -- third state never folded in
     concordance_pct = (100 * s["agree"] / compared) if compared > 0 else None
-    # ESTIMATED: real decisao_atual_tokens where the caller supplied them, PROVISIONAL
-    # baseline for the would-dispense cases that didn't -- same estimate discipline as
-    # BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL above, never blended into a MEASURED number.
-    estimated_saved = (
-        s["decisao_atual_tokens_would_save"]
-        + s["would_dispense_missing_real_tokens"] * BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL
-        - s["jev_tokens_in"]
-        - s["jev_tokens_out"]
-    )
+    # ga-hpdgst: three states, never collapsed into one number. "none": nothing was dispensable, so the saving is
+    # exactly zero -- and "0 - Jev's cost" is not a saving, it is just Jev's cost, which has its own measured line.
+    # "unknown": some dispensable case came without the decisor's real token count and nothing else measures it, so
+    # it is NOT priced with a guess. "known": every dispensable case carries the decisor's real count; the balance is
+    # real - Jev's cost and may legitimately be negative (both terms measured).
+    if s["would_dispense"] == 0:
+        tokens_state, estimated_saved = "none", None
+    elif s["would_dispense_missing_real_tokens"] > 0:
+        tokens_state, estimated_saved = "unknown", None
+    else:
+        tokens_state = "known"
+        estimated_saved = s["decisao_atual_tokens_would_save"] - s["jev_tokens_in"] - s["jev_tokens_out"]
     return {
         "compared": compared,
         "concordance_pct": concordance_pct,
         "would_dispense": s["would_dispense"],
+        "tokens_state": tokens_state,
         "estimated_tokens_saved": estimated_saved,
     }
 
@@ -584,13 +582,13 @@ def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria
         else:
             lines.append("  MEASURED escalation-count reduction: n/a (need >=1 candidate in both arms same day)")
         lines.append(f"  Jev cost (MEASURED, from real API usage): {s['jev_tokens_in']} input + {s['jev_tokens_out']} output tokens")
-        lines.append(
-            f"  Tokens avoided (ESTIMATED, PROVISIONAL baseline={BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL}/escalation, "
-            f"NOT yet measured from real session transcripts): "
-            f"{s['experiment_suppressed']} suppressed x baseline - Jev cost = ~{m['net_estimate']} tokens"
-        )
-        if m["pct_of_control_estimate"] is not None:
-            lines.append(f"  ESTIMATED % tokens saved vs an all-control baseline: {m['pct_of_control_estimate']:.1f}%")
+        if m["tokens_state"] == "none":
+            lines.append("  Tokens avoided: none yet -- no alert was suppressed")
+        else:
+            lines.append(
+                f"  Tokens avoided: UNKNOWN -- {s['experiment_suppressed']} suppressed, but nothing measures what one escalation "
+                "costs (the log carries only Jev's own tokens), so no figure and no % is given"
+            )
         lines.append("")
     for name, s in sorted(shadow_summary.items()):
         m = _shadow_metrics(s)
@@ -605,11 +603,18 @@ def format_report(summary: dict, shadow_summary: dict, date_label: str, portaria
             lines.append("  MEASURED concordance: n/a (no comparable evaluations — Jev was unavailable every time)")
         lines.append(f"  Would-dispense cases (Jev >= confidence threshold either way): {m['would_dispense']}")
         lines.append(f"  Jev cost (MEASURED, from real API usage): {s['jev_tokens_in']} input + {s['jev_tokens_out']} output tokens")
-        lines.append(
-            f"  Tokens the current decisor would have saved on those cases (ESTIMATED — real counts where the "
-            f"caller supplied them, PROVISIONAL baseline={BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL} for the "
-            f"{s['would_dispense_missing_real_tokens']} that didn't): ~{m['estimated_tokens_saved']} tokens"
-        )
+        if m["tokens_state"] == "none":
+            lines.append("  Tokens the current decisor would have saved: none yet -- no dispensable case")
+        elif m["tokens_state"] == "unknown":
+            lines.append(
+                f"  Tokens the current decisor would have saved: UNKNOWN -- {s['would_dispense_missing_real_tokens']} of the "
+                f"{m['would_dispense']} dispensable case(s) came without the decisor's real token count, and nothing else measures it"
+            )
+        else:
+            lines.append(
+                f"  Tokens the current decisor would have saved (ESTIMATED from the decisor's real counts on all "
+                f"{m['would_dispense']} dispensable case(s), minus Jev's cost): ~{m['estimated_tokens_saved']} tokens"
+            )
         lines.append("")
     for name, s in sorted(portaria_summary.items()):
         lines.extend(_format_portaria_block(name, s, _portaria_metrics(s, cache_read_by_recipient)))
@@ -652,13 +657,12 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, porta
             linhas.append("Redução de alertas (medida): sem dado — faltou alerta num dos grupos.")
         else:
             linhas.append(f"Redução de alertas (medida): {_pct_pt(m['reduction_pct'])}.")
-        if m["pct_of_control_estimate"] is None:
-            linhas.append(f"Tokens economizados (estimativa): ~{m['net_estimate']} — sem grupo controle no dia pra comparar.")
+        if m["tokens_state"] == "none":
+            linhas.append("Tokens economizados: nenhum alerta silenciado ainda.")
         else:
             linhas.append(
-                f"Tokens economizados (estimativa, base provisória "
-                f"{BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL}/alerta): ~{m['net_estimate']} "
-                f"= {_pct_pt(m['pct_of_control_estimate'])}."
+                f"Tokens economizados: NÃO SEI — {s['experiment_suppressed']} silenciado(s), mas ninguém mediu quanto custa "
+                "um alerta (o log só tem os tokens do próprio Jev); sem número e sem % por enquanto."
             )
         linhas.append(f"Custo do Jev (medido): {s['jev_tokens_in']} + {s['jev_tokens_out']} tokens.")
         if s["experiment_jev_unavailable"]:
@@ -679,11 +683,18 @@ def format_resumo_pt(summary: dict, shadow_summary: dict, date_label: str, porta
         else:
             linhas.append(f"Concordância (medida): {_pct_pt(m['concordance_pct'])} ({s['agree']}/{m['compared']}).")
         linhas.append(f"Casos que dispensariam o decisor atual (Jev confiante): {m['would_dispense']}.")
-        linhas.append(
-            f"Tokens que o decisor atual teria poupado (estimativa, real quando informado, "
-            f"base provisória {BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL} para os "
-            f"{s['would_dispense_missing_real_tokens']} sem número real): ~{m['estimated_tokens_saved']}."
-        )
+        if m["tokens_state"] == "none":
+            linhas.append("Tokens que o decisor atual teria poupado: nenhum caso dispensável ainda.")
+        elif m["tokens_state"] == "unknown":
+            linhas.append(
+                f"Tokens que o decisor atual teria poupado: NÃO SEI — {s['would_dispense_missing_real_tokens']} de "
+                f"{m['would_dispense']} caso(s) dispensável(is) sem a contagem real de tokens do decisor atual."
+            )
+        else:
+            linhas.append(
+                f"Tokens que o decisor atual teria poupado (estimativa a partir da contagem real do decisor atual nos "
+                f"{m['would_dispense']} caso(s) dispensável(is), menos o custo do Jev): ~{m['estimated_tokens_saved']}."
+            )
         linhas.append(f"Custo do Jev (medido): {s['jev_tokens_in']} + {s['jev_tokens_out']} tokens.")
         blocos.append("\n".join(linhas))
     if portaria_summary:
@@ -738,11 +749,11 @@ def _selftest() -> int:
     # compared = agree + disagree = 4 (unknown excluded); concordance = 3/4 = 75.0%
     ok("shadow metrics: concordance computed over comparable evaluations only (75.0%, excludes the 1 unknown)",
        m["compared"] == 4 and m["concordance_pct"] == 75.0)
-    # estimated_saved = 500 (real) + 1*4000 (provisional, the missing-real-tokens case)
-    # - jev cost (4 of the 5 events carry 10in/2out each; the 5th, jev_ok=False, carries 0)
-    expected_estimate = 500 + BASELINE_TOKENS_PER_ESCALATION_PROVISIONAL - (4 * 10 + 4 * 2)
-    ok(f"shadow metrics: estimated tokens saved blends real + provisional correctly ({expected_estimate})",
-       m["estimated_tokens_saved"] == expected_estimate)
+    # ga-hpdgst: F-synthetic has 2 would-dispense cases, one with a real decisor token count (500) and one
+    # WITHOUT. The second one cannot be priced without inventing a number, so the saving is UNKNOWN (None) --
+    # not 500 + a guessed 4000 - Jev cost (= 4452), which is what this assertion used to pin.
+    ok("shadow metrics: a would-dispense case with no real token count makes the saving unknown (None), never a guessed number",
+       m["estimated_tokens_saved"] is None and m["tokens_state"] == "unknown")
 
     # The plain suppression-mode event in the SAME log must not leak into shadow's counts,
     # and the shadow events must not leak into summarize()'s suppression counts.
@@ -799,6 +810,76 @@ def _selftest() -> int:
         ok("load_events: asking for a cut-output experiment by name does not resurrect its legacy shadow rows",
            [e.get("entity_id") for e in loaded_only_cut] == ["toolu_x"])
         ok("summarize_shadow over the loaded events holds only the genuine F0 front", sorted(summarize_shadow(loaded_cut)) == ["F-synthetic"])
+
+    # ga-hpdgst: no tokens-saved figure may rest on an invented per-escalation cost. Measured on the live log (02/10),
+    # the 21:07 ntfy printed "~-6311 = -52,6%" (gate-orphaned-label), "~-37323" (autoresp-review) and "~-1234053"
+    # (gate-verdict). Two causes: (1) every figure that needed "what one escalation costs" multiplied by a guessed 4000,
+    # and the % was even divided by control x 4000; (2) with nothing silenced/dispensable the saving is exactly 0, and
+    # "0 - Jev cost" was printed as "tokens saved" -- a negative number in a savings line. A saving is now MEASURED,
+    # UNKNOWN ("NÃO SEI") or NONE yet; a negative balance is only ever printed when both terms were measured.
+    def shadow_ev(n, *, dispense=False, real=None, tin=0, tout=0):
+        return [{"mode": "shadow", "experiment": "F-t", "agree": True, "would_dispense": dispense,
+                 "decisao_atual_tokens": real, "jev_tokens_in": tin, "jev_tokens_out": tout} for _ in range(n)]
+
+    def supp_events(control, fired, suppressed, tin, tout):
+        rows = [{"experiment": "S-t", "arm": "control", "suppress": False} for _ in range(control)]
+        exp = [{"experiment": "S-t", "arm": "experiment", "suppress": False, "jev_ok": True} for _ in range(fired)]
+        exp += [{"experiment": "S-t", "arm": "experiment", "suppress": True, "jev_ok": True} for _ in range(suppressed)]
+        exp[0]["jev_tokens_in"], exp[0]["jev_tokens_out"] = tin, tout
+        return rows + exp
+
+    def render(evs):
+        sup, sh = summarize(evs), summarize_shadow(evs)
+        return format_report(sup, sh, "t"), format_resumo_pt(sup, sh, "t")
+
+    # shadow, nothing dispensable (gate-verdict's live shape): the saving is exactly zero, and the report says so
+    ev = shadow_ev(10, tin=8000, tout=20)  # Jev cost 80000 + 200
+    mm = _shadow_metrics(summarize_shadow(ev)["F-t"])
+    en, pt = render(ev)
+    ok("shadow, no dispensable case: state 'none' and no number in the savings slot",
+       mm.get("tokens_state") == "none" and mm["estimated_tokens_saved"] is None)
+    ok("shadow, no dispensable case: Jev's cost is never printed as a negative 'saved' figure",
+       "-80200" not in en + pt and "~-" not in en + pt and "nenhum caso dispensável" in pt and "no dispensable case" in en)
+    ok("shadow, no dispensable case: Jev's measured cost is still reported", "80000 + 200 tokens" in pt)
+
+    # shadow, every dispensable case has the decisor's real count: a MEASURED balance
+    ev = (shadow_ev(1, dispense=True, real=3000, tin=10, tout=2) + shadow_ev(1, dispense=True, real=2000, tin=10, tout=2)
+          + shadow_ev(1, tin=10, tout=2))  # Jev cost 30 + 6
+    mm = _shadow_metrics(summarize_shadow(ev)["F-t"])
+    en, pt = render(ev)
+    ok("shadow, every dispensable case has a real count: saving = sum(real) - Jev cost = 4964",
+       mm.get("tokens_state") == "known" and mm["estimated_tokens_saved"] == 4964)
+    ok("shadow, measured saving: printed in both renderings, no NÃO SEI", "~4964" in pt and "4964" in en and "NÃO SEI" not in pt)
+
+    # ...and when both terms are measured, a negative balance is the truth and stays visible
+    ev = shadow_ev(1, dispense=True, real=100, tin=1000, tout=0)
+    en, pt = render(ev)
+    ok("shadow, measured saving smaller than Jev's cost: the negative balance (-900) is printed", "~-900" in pt)
+
+    # shadow, one dispensable case has no real count: UNKNOWN -- not 500 + a guessed 4000 - 24 (= 4476)
+    ev = shadow_ev(1, dispense=True, real=500, tin=10, tout=2) + shadow_ev(1, dispense=True, real=None, tin=10, tout=2)
+    en, pt = render(ev)
+    ok("shadow, a dispensable case without a real count: NÃO SEI / UNKNOWN, no figure built on a guess",
+       "NÃO SEI" in pt and "UNKNOWN" in en and "4476" not in en + pt and "4000" not in en + pt)
+
+    # suppression, nothing silenced (gate-orphaned-label's live shape): no saving yet, and no % built on control x 4000
+    ev = supp_events(control=3, fired=12, suppressed=0, tin=6059, tout=252)
+    mm = _metrics(summarize(ev)["S-t"])
+    en, pt = render(ev)
+    ok("suppression, nothing silenced: state 'none'", mm.get("tokens_state") == "none")
+    ok("suppression, nothing silenced: no negative 'saved' figure and no invented %",
+       "-6311" not in en + pt and "52,6" not in en + pt and "52.6" not in en + pt and "~-" not in en + pt
+       and "nenhum alerta silenciado" in pt and "no alert was suppressed" in en)
+
+    # suppression, something silenced: pricing it needs a MEASURED cost per alert, which the log does not carry
+    ev = supp_events(control=2, fired=1, suppressed=1, tin=300, tout=20)
+    mm = _metrics(summarize(ev)["S-t"])
+    en, pt = render(ev)
+    ok("suppression, something silenced: state 'unknown' -- nothing measures what one alert costs", mm.get("tokens_state") == "unknown")
+    ok("suppression, something silenced: NÃO SEI / UNKNOWN, no 3680 / 46,0% / 4000 anywhere",
+       "NÃO SEI" in pt and "UNKNOWN" in en and all(bad not in en + pt for bad in ("3680", "46,0", "46.0", "4000")))
+    ok("suppression, something silenced: the MEASURED lines are untouched (reduction 50,0%, Jev cost 300 + 20)",
+       "Redução de alertas (medida): 50,0%." in pt and "Custo do Jev (medido): 300 + 20 tokens." in pt)
 
     print(f"\njev_experiment_report selftest: PASS={passed} FAIL={failed}")
     return 1 if failed else 0
