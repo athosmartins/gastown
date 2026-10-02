@@ -7,8 +7,9 @@
 # process" cannot tell a CRASHED operation from one PAUSED FOR A HUMAN (a conflict waiting to be
 # resolved, an editor open, a break): deleting the state of the second loses work silently
 # (no MERGE_HEAD = the next commit has one parent). Locks (index.lock, ...) are unchanged:
-# there, age + no process IS proof. State items are now logged (stale_state_found) and notified
-# once, and are removed only under the explicit GIT_LOCK_STATE_REMOVE=1 opt-in (ga-hl3xlw; the
+# there, age + no process IS proof. State items are now logged (stale_state_found) and handed to notify
+# once (notify's own routing decides push vs digest: for this message it is the digest, so "handed over"
+# is what the script can claim, not "a person was told"), and are removed only under the explicit GIT_LOCK_STATE_REMOVE=1 opt-in (ga-hl3xlw; the
 # selftest covers the opt-in, this test covers the default path the janitor actually runs).
 #
 # Called by run.sh after deploy (STORY_ID=ga-892qy1). Exits 0 on pass.
@@ -109,7 +110,12 @@ grep -q '"event":"sweep".*"removed":1,' "$SWEEP_LOG" \
 n_notify=$(grep -c . "$NOTIFY_CALLS" || true)
 [[ "${n_notify:-0}" == "3" ]] \
   || fail "expected 3 notifications (2 state items + 1 removal summary), got ${n_notify:-0}: $(cat "$NOTIFY_CALLS")"
-log "end-to-end under /bin/bash: lock removed, MERGE_HEAD + rebase-merge/ kept, 2 stale_state_found, removed=1, 3 notifies ✓"
+n_handed=$(grep -c '"event":"stale_state_notify".*"outcome":"handed_to_notify"' "$SWEEP_LOG" || true)
+[[ "${n_handed:-0}" == "2" ]] \
+  || fail "expected 2 stale_state_notify outcome=handed_to_notify events, got ${n_handed:-0}: $(grep stale_state_notify "$SWEEP_LOG" | cut -c1-200)"
+grep -q '"event":"sweep".*"stale_state":2,"unannounced":0,' "$SWEEP_LOG" \
+  || fail "sweep summary should say stale_state=2 unannounced=0 (a working notifier): $(grep '"event":"sweep"' "$SWEEP_LOG")"
+log "end-to-end under /bin/bash: lock removed, MERGE_HEAD + rebase-merge/ kept, 2 stale_state_found, removed=1, 3 notifies, 2 handed_to_notify, unannounced=0 ✓"
 
 # ── 3. The deployed script's own hermetic selftest ────────────────────────────
 ST_OUT="$BASE/selftest.out"

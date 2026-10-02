@@ -54,11 +54,18 @@
 #   (40k lines): the janitor had removed only index/PID locks on the real roots, never one of
 #   these — the hazard was latent, not realised.
 #   Now an item past the same two gates is LOGGED (event stale_state_found: label, path, repo,
-#   age_sec — every sweep, counted in the sweep summary as stale_state) and NOTIFIED (once per
-#   item, again after GIT_LOCK_STATE_RENOTIFY_SEC, again if a new operation replaces it at the
-#   same path), with the abort command in the text. The notification goes to the notify topic
-#   (ntfy) only: nothing is filed on a bead or routed to a crew, so a person has to read it and
-#   decide. Only
+#   age_sec — every sweep, counted in the sweep summary as stale_state) and HANDED TO notify (once
+#   per item, again after GIT_LOCK_STATE_RENOTIFY_SEC, again if a new operation replaces it at the
+#   same path), with the abort command(s) in the text. What a hand-off achieves is notify's call,
+#   not this script's: its routing is an allowlist whose default is the digest, and this message is
+#   not on it (measured 2026-10-02 with NOTIFY_ROUTE_TEST=1: route=digest) — so it lands in the
+#   notify digest and does NOT page the phone. notify exiting 0 means "accepted", never "a person
+#   was told", so the log says only what is known: event stale_state_notify with outcome
+#   handed_to_notify / notify_failed / no_notifier, and the sweep summary counts the last two as
+#   unannounced. Nothing is filed on a bead or routed to a crew: a person has to read the digest
+#   (or this log) and decide. Forcing a push (NOTIFY_FORCE_PUSH) was left out on purpose — it would
+#   override the owner's standing routing policy for infra scripts, which is a product call, not
+#   this script's. Only
 #   GIT_LOCK_STATE_REMOVE=1 restores the old removal (explicit opt-in; the item is then removed
 #   and logged as 'removed', not reported). Cost of the default: a genuinely crashed merge/rebase in a shared root is no
 #   longer healed automatically. While MERGE_HEAD / CHERRY_PICK_HEAD / rebase-merge/ /
@@ -99,8 +106,10 @@
 #                              when aged and no live git (def 0: report only, see ga-892qy1)
 #   GIT_LOCK_STATE_DIR         where the once-per-item notify markers live (def
 #                              $CITY/.gc/state/git-lock-hygiene-state-notified)
-#   GIT_LOCK_STATE_RENOTIFY_SEC  re-announce a still-present operation-state item after this
-#                              many seconds (def 43200 = 12 h)
+#   GIT_LOCK_STATE_RENOTIFY_SEC  hand a still-present operation-state item to notify again after
+#                              this many seconds (def 43200 = 12 h)
+#   GIT_LOCK_NOTIFY_TIMEOUT_SEC  deadline for that hand-off (def 30); a notify that hangs counts as
+#                              failed (rc 124), is retried next sweep and is counted as unannounced
 #   GIT_REPO_MUTEX_ENABLED     0 = mutex is a no-op (def 1)
 #   GIT_REPO_MUTEX_MAX_AGE     age (s) before a held mutex is reclaimed as stale (def 600)
 #   GIT_LOCK_PROCESS_CHECK_FN  fn override for process-liveness check (tests only)
@@ -115,6 +124,7 @@ DRY_RUN="${GIT_LOCK_DRY_RUN:-0}"
 STALE_AGE="${GIT_LOCK_STALE_AGE_SEC:-300}"
 GIT_LOCK_STATE_DIR="${GIT_LOCK_STATE_DIR:-${CITY}/.gc/state/git-lock-hygiene-state-notified}"
 GIT_LOCK_STATE_RENOTIFY_SEC="${GIT_LOCK_STATE_RENOTIFY_SEC:-43200}"
+GIT_LOCK_NOTIFY_TIMEOUT_SEC="${GIT_LOCK_NOTIFY_TIMEOUT_SEC:-30}"
 GIT_REPO_MUTEX_ENABLED="${GIT_REPO_MUTEX_ENABLED:-1}"
 GIT_REPO_MUTEX_MAX_AGE="${GIT_REPO_MUTEX_MAX_AGE:-600}"
 GIT_REPO_MUTEX_BASE="${GIT_REPO_MUTEX_BASE:-/tmp/gc-git-repo-mutex}"
@@ -537,11 +547,23 @@ _remove_stale_lock() {
 # those gates cannot prove it was abandoned rather than paused for a human). Reached from _glh_reap,
 # which removes instead only under GIT_LOCK_STATE_REMOVE=1.
 # $1 = path, $2 = repo root, $3 = label, $4 = the abort command to name in the notification.
-# Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
+# "Reported" ends at the hand-off to notify; whether that reaches a person is notify's routing (see
+# the header). Output contract: stderr + $LOG + NOTIFY_BIN only. STDOUT is empty — _scan_repo's caller captures
 # it as the removed-count, and the real notify prints "Logged for digest ..." on stdout (ga-kimlod
 # measured that leak), so the notify call below discards both streams.
+# Run the notifier under a deadline, so one that hangs (a slow secret lookup, a locked sqlite) cannot
+# stall the sweep. Without timeout(1) it runs unbounded rather than not at all: the item must still
+# be handed over. $@ = the notifier's own arguments.
+_glh_notify_send() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$GIT_LOCK_NOTIFY_TIMEOUT_SEC" "$NOTIFY_BIN" "$@"
+  else
+    "$NOTIFY_BIN" "$@"
+  fi
+}
+
 _report_stale_state() {
-  local path="$1" repo="$2" label="$3" hint="$4" age mt key marker prev age_json age_txt
+  local path="$1" repo="$2" label="$3" hint="$4" age mt key marker prev age_json age_txt cmds _h _ifs _nrc
   # Three states for the item, never two. Gone (finished or aborted between _is_stale and here):
   # nothing left to report — and, above all, not a report with an invented age (_path_age answers
   # 999999999 for "cannot stat", which would read as a very old stuck operation). Present with a
@@ -562,16 +584,18 @@ _report_stale_state() {
   _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_found\",\"label\":\"${label}\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"age_sec\":${age_json},\"dry_run\":\"${_dry}\"}"
   [ "$_dry" = "1" ] && return 0            # same rule as the sweep: no notify under dry run
   if [ ! -x "$NOTIFY_BIN" ]; then
-    # Without a notifier the detection exists only in the log and this stderr line: say so, so a
-    # missing binary is not mistaken for "nobody was told because there was nothing to tell".
-    echo "[git-lock-hygiene] NOT announced — NOTIFY_BIN is not executable (${NOTIFY_BIN}); the item above is only in ${LOG}" >&2
+    # Without a notifier the detection exists only in the log and this stderr line, and the sweep
+    # counts it as unannounced: a missing binary must not read as "nothing to tell anyone".
+    echo "[git-lock-hygiene] NOT sent to notify — NOTIFY_BIN is not executable (${NOTIFY_BIN}); the item above is only in ${LOG}" >&2
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_notify\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"outcome\":\"no_notifier\"}"
+    _glh_count unannounced
     return 0
   fi
 
   # Dedupe. A paused merge can sit for an afternoon and the sweep runs every ~5.5 min. The marker
   # holds the item's mtime ("unknown" when it could not be read): same value + inside the window =
-  # already announced; a different value is a NEW operation at the same path and is announced at
-  # once.
+  # already handed to notify; a different value is a NEW operation at the same path and is handed
+  # over at once.
   key=$(printf '%s' "$path" | tr '/ :' '___')
   marker="${GIT_LOCK_STATE_DIR}/${key}"
   if [ -f "$marker" ]; then
@@ -580,19 +604,31 @@ _report_stale_state() {
       return 0
     fi
   fi
-  # The marker is written only AFTER a notify that succeeded: a failed notify is retried next sweep
-  # rather than recorded as delivered. If the marker cannot be written, the cost is a repeat notice
-  # per sweep, and the stderr line below says why — a page that repeats with no stated cause would
-  # be loud only as spam.
+  # The marker is written only AFTER notify accepted the message (exit 0): a failed or timed-out
+  # notify is retried next sweep rather than recorded as handed over. Exit 0 is "accepted", not
+  # "delivered to a person" (see the header: the digest route). If the marker cannot be written, the
+  # cost is a repeat hand-off per sweep, and the stderr line below says why — a repeat with no stated
+  # cause would be loud only as spam.
   if [ -n "$age" ]; then age_txt="ha $(( age / 60 ))min"; else age_txt="ha tempo desconhecido"; fi
-  if "$NOTIFY_BIN" -t "Git-lock hygiene" -p 3 \
-       "Operacao git parada ${age_txt} em ${repo}: ${label} ($(basename "$path")). NAO removido — pode ser pausa humana ou crash. Se abandonado: git -C ${repo} ${hint}" \
-       >/dev/null 2>&1; then
+  # $hint = one or more abort verbs separated by ';' (rebase-apply is a rebase OR a git am, and the
+  # two have different abort commands); each becomes a complete, pasteable command.
+  cmds=""; _ifs="$IFS"; IFS=';'
+  for _h in $hint; do cmds="${cmds:+${cmds}  OU  }git -C ${repo} ${_h}"; done
+  IFS="$_ifs"
+  [ -n "$cmds" ] || cmds="abortar a operacao manualmente"
+  _nrc=0
+  _glh_notify_send -t "Git-lock hygiene" -p 3 \
+       "Operacao git parada ${age_txt} em ${repo}: ${label} ($(basename "$path")). NAO removido — pode ser pausa humana ou crash. Se abandonado: ${cmds}" \
+       >/dev/null 2>&1 || _nrc=$?
+  if [ "$_nrc" -eq 0 ]; then
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_notify\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"outcome\":\"handed_to_notify\"}"
     if ! { mkdir -p "$GIT_LOCK_STATE_DIR" 2>/dev/null && printf '%s\n' "$mt" > "$marker" 2>/dev/null; }; then
-      echo "[git-lock-hygiene] could not record the announcement of ${path} (state dir ${GIT_LOCK_STATE_DIR} not writable) — it will be announced again on the next sweep" >&2
+      echo "[git-lock-hygiene] could not record that ${path} was sent to notify (state dir ${GIT_LOCK_STATE_DIR} not writable) — it will be sent again on the next sweep" >&2
     fi
   else
-    echo "[git-lock-hygiene] notify FAILED for ${path} — not recorded as announced, retried next sweep" >&2
+    echo "[git-lock-hygiene] notify FAILED (rc=${_nrc}) for ${path} — not recorded as sent, retried next sweep" >&2
+    _log_json "{\"ts\":\"$(ts)\",\"event\":\"stale_state_notify\",\"path\":\"${path}\",\"repo\":\"${repo}\",\"outcome\":\"notify_failed\",\"rc\":${_nrc}}"
+    _glh_count unannounced
   fi
   return 0
 }
@@ -637,15 +673,15 @@ _scan_repo() {
   # revert / rebase that may be paused for a human is not a lock and is not removed here, whatever
   # its age: "no git process" does not distinguish paused from crashed. The same two gates as a lock
   # (age, no live process) decide whether it is worth REPORTING; _glh_reap reports it, or removes it
-  # only when GIT_LOCK_STATE_REMOVE=1. Fields: name | label | the abort command to put in the
-  # notification. rebase-merge/rebase-apply are directories, the rest files.
+  # only when GIT_LOCK_STATE_REMOVE=1. Fields: name | label | the abort verb(s) to put in the
+  # notification, ';'-separated when there is more than one. rebase-merge/rebase-apply are directories, the rest files.
   local s_entry s_name s_label s_hint s_path
   for s_entry in \
     "MERGE_HEAD|in-progress merge|merge --abort" \
     "CHERRY_PICK_HEAD|in-progress cherry-pick|cherry-pick --abort" \
     "REVERT_HEAD|in-progress revert|revert --abort" \
     "rebase-merge|in-progress rebase (merge strategy)|rebase --abort" \
-    "rebase-apply|in-progress rebase/am (apply strategy)|rebase --abort (ou am --abort)"
+    "rebase-apply|in-progress rebase/am (apply strategy)|rebase --abort;am --abort"
   do
     IFS='|' read -r s_name s_label s_hint <<< "$s_entry"
     s_path="${git_dir}/${s_name}"
@@ -1624,7 +1660,7 @@ print(n)
   R46B="$LVR/lv46b"; make_repo "$R46B"; lv_old "$R46B/.git/index.lock"; lv_old "$R46B/.git/MERGE_HEAD"
   line=$(_sweep_line "$R46B")
   case "$line" in
-    *'"removed":1,"skipped_live":0,"undetermined":0,"stale_state":1,'*) ok "T46: healthy sweep → removed=1 (the lock) stale_state=1 (the MERGE_HEAD, reported)" ;;
+    *'"removed":1,"skipped_live":0,"undetermined":0,"stale_state":1,"unannounced":1,'*) ok "T46: healthy sweep → removed=1 (the lock) stale_state=1 (the MERGE_HEAD, reported) unannounced=1 (no notifier here)" ;;
     *) bad "T46: healthy sweep summary wrong: ${line:-<no sweep event>}" ;;
   esac
   [ ! -f "$R46B/.git/index.lock" ] && [ -f "$R46B/.git/MERGE_HEAD" ] \
@@ -1816,7 +1852,7 @@ print(n)
 
   # T58: the notifier FAILS. The failure must be visible on stderr and must NOT be recorded as
   # delivered (no marker), so the next sweep tries again; once it works, the marker is written.
-  echo "T58: notify fails → visible, not recorded as announced, retried next sweep"
+  echo "T58: notify fails → visible, not recorded as sent, retried next sweep"
   R26="$TMP/repo26"; make_repo "$R26"
   touch -t 200001010000 "$R26/.git/MERGE_HEAD"
   : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
@@ -1826,16 +1862,16 @@ print(n)
   count=$(_scan_repo "$R26" 2>"$TMP/t58.err")
   grep -q 'notify FAILED' "$TMP/t58.err" && ok "T58: the failed notify is visible on stderr" \
     || bad "T58: a failed notify was silent — stderr: $(head -c 300 "$TMP/t58.err")"
-  [ -z "$(ls -A "$GIT_LOCK_STATE_DIR" 2>/dev/null)" ] && ok "T58: nothing recorded as announced" \
+  [ -z "$(ls -A "$GIT_LOCK_STATE_DIR" 2>/dev/null)" ] && ok "T58: nothing recorded as sent" \
     || bad "T58: a marker was written for a notify that failed: $(ls "$GIT_LOCK_STATE_DIR")"
   count=$(_scan_repo "$R26" 2>/dev/null)
   [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T58: retried on the next sweep" \
     || bad "T58: notify attempts=$(_lines "$NOTIFY_CALLS") after 2 sweeps (expected 2)"
   NOTIFY_BIN="$_T58_REAL_NOTIFY"
 
-  # T59: there is NO notifier. The detection stays in the log, and stderr says it was not announced
+  # T59: there is NO notifier. The detection stays in the log, and stderr says it was not sent to notify
   # — a missing binary must not look like "nothing to tell anyone".
-  echo "T59: NOTIFY_BIN not executable → event logged, stderr says not announced"
+  echo "T59: NOTIFY_BIN not executable → event logged, stderr says not sent to notify"
   R27="$TMP/repo27"; make_repo "$R27"
   touch -t 200001010000 "$R27/.git/MERGE_HEAD"
   : > "$LOG"; rm -rf "$GIT_LOCK_STATE_DIR"
@@ -1844,12 +1880,12 @@ print(n)
   NOTIFY_BIN="$_T58_REAL_NOTIFY"
   [ "$(_events stale_state_found)" = "1" ] && ok "T59: the event is logged without a notifier" \
     || bad "T59: expected 1 event, got $(_events stale_state_found)"
-  grep -q 'NOT announced' "$TMP/t59.err" && ok "T59: stderr says the item was not announced" \
+  grep -q 'NOT sent to notify' "$TMP/t59.err" && ok "T59: stderr says the item was not sent to notify" \
     || bad "T59: missing notifier was silent — stderr: $(head -c 300 "$TMP/t59.err")"
 
-  # T60: the announcement went out but its marker cannot be written (state dir unwritable). The cost
+  # T60: notify accepted the message but its marker cannot be written (state dir unwritable). The cost
   # is a repeat notice on every sweep; the stderr line must say WHY, or the repeat is only spam.
-  echo "T60: marker unwritable → announced each sweep, stderr names the state dir"
+  echo "T60: marker unwritable → handed to notify each sweep, stderr names the state dir"
   R28="$TMP/repo28"; make_repo "$R28"
   touch -t 200001010000 "$R28/.git/MERGE_HEAD"
   : > "$LOG"; : > "$NOTIFY_CALLS"
@@ -1858,11 +1894,86 @@ print(n)
   count=$(_scan_repo "$R28" 2>"$TMP/t60.err")
   count=$(_scan_repo "$R28" 2>>"$TMP/t60.err")
   GIT_LOCK_STATE_DIR="$_T60_REAL_STATE_DIR"
-  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T60: announced on both sweeps (no marker to dedupe on)" \
+  [ "$(_lines "$NOTIFY_CALLS")" = "2" ] && ok "T60: handed to notify on both sweeps (no marker to dedupe on)" \
     || bad "T60: notify calls=$(_lines "$NOTIFY_CALLS") (expected 2)"
-  [ "$(grep -c 'could not record the announcement' "$TMP/t60.err")" = "2" ] && grep -q '/dev/null/no-such-state-dir' "$TMP/t60.err" \
-    && ok "T60: stderr says the announcement could not be recorded, and names the state dir" \
+  [ "$(grep -c 'could not record that' "$TMP/t60.err")" = "2" ] && grep -q '/dev/null/no-such-state-dir' "$TMP/t60.err" \
+    && ok "T60: stderr says the hand-off could not be recorded, and names the state dir" \
     || bad "T60: the repeat was silent about its cause — stderr: $(head -c 300 "$TMP/t60.err")"
+
+  # T61: notify HANGS. Unbounded, one hung notifier (a slow secret lookup, a locked sqlite) stalls the
+  # whole sweep. It must be cut at GIT_LOCK_NOTIFY_TIMEOUT_SEC, reported as a failure with rc 124,
+  # left unrecorded (retried next sweep) and counted as unannounced.
+  echo "T61: notify hangs → cut at the deadline, rc 124 on stderr, not recorded, counted unannounced"
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "T61: SKIPPED — no timeout(1) on this host (the hand-off then runs unbounded by design)"
+  else
+    R29="$TMP/repo29"; make_repo "$R29"
+    touch -t 200001010000 "$R29/.git/MERGE_HEAD"
+    : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+    _T61_REAL_NOTIFY="$NOTIFY_BIN"; _T61_REAL_COUNT="${_GLH_COUNT_FILE:-}"
+    NOTIFY_BIN="$TMP/hanging-notify"
+    printf '#!/bin/sh\necho "$*" >> "$NOTIFY_CALLS"\nexec sleep 20\n' > "$NOTIFY_BIN"; chmod +x "$NOTIFY_BIN"
+    _GLH_COUNT_FILE="$TMP/t61.cnt"; : > "$_GLH_COUNT_FILE"
+    _t61_start=$SECONDS
+    count=$(GIT_LOCK_NOTIFY_TIMEOUT_SEC=1 _scan_repo "$R29" 2>"$TMP/t61.err")
+    _t61_took=$(( SECONDS - _t61_start ))
+    NOTIFY_BIN="$_T61_REAL_NOTIFY"
+    [ "$_t61_took" -lt 10 ] && ok "T61: the sweep was not held by the hung notifier (${_t61_took}s, deadline 1s)" \
+      || bad "T61: the sweep took ${_t61_took}s — a hung notifier is stalling it"
+    grep -q 'notify FAILED (rc=124)' "$TMP/t61.err" && ok "T61: stderr says notify FAILED with rc=124 (the deadline)" \
+      || bad "T61: a timed-out notify was not reported as such — stderr: $(head -c 300 "$TMP/t61.err")"
+    [ -z "$(ls -A "$GIT_LOCK_STATE_DIR" 2>/dev/null)" ] && ok "T61: nothing recorded as sent (retried next sweep)" \
+      || bad "T61: a marker was written for a notify that timed out"
+    [ "$(grep -c -x unannounced "$_GLH_COUNT_FILE")" = "1" ] && ok "T61: counted as unannounced" \
+      || bad "T61: unannounced tally=$(grep -c -x unannounced "$_GLH_COUNT_FILE") (expected 1)"
+    _GLH_COUNT_FILE="$_T61_REAL_COUNT"
+  fi
+
+  # T62: what the log says about each hand-off. notify exiting 0 is "accepted" (the route is the
+  # digest), so the three outcomes are logged as what is KNOWN — and only the two that did not go out
+  # are tallied as unannounced.
+  echo "T62: stale_state_notify outcomes — handed_to_notify / notify_failed / no_notifier, last two tallied"
+  _T62_REAL_NOTIFY="$NOTIFY_BIN"; _T62_REAL_COUNT="${_GLH_COUNT_FILE:-}"
+  for _t62 in ok fail none; do
+    R30="$TMP/repo30-$_t62"; make_repo "$R30"
+    touch -t 200001010000 "$R30/.git/MERGE_HEAD"
+    : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+    _GLH_COUNT_FILE="$TMP/t62-$_t62.cnt"; : > "$_GLH_COUNT_FILE"
+    case "$_t62" in
+      ok)   NOTIFY_BIN="$_T62_REAL_NOTIFY"; _want="handed_to_notify"; _want_un=0 ;;
+      fail) NOTIFY_BIN="$TMP/failing-notify-62"; printf '#!/bin/sh\nexit 1\n' > "$NOTIFY_BIN"; chmod +x "$NOTIFY_BIN"
+            _want="notify_failed"; _want_un=1 ;;
+      none) NOTIFY_BIN="$TMP/no-such-notify-62"; _want="no_notifier"; _want_un=1 ;;
+    esac
+    count=$(_scan_repo "$R30" 2>/dev/null)
+    n_ev=$(grep -c "\"event\":\"stale_state_notify\".*\"outcome\":\"${_want}\"" "$LOG")
+    n_ev_all=$(grep -c '"event":"stale_state_notify"' "$LOG")
+    n_un=$(grep -c -x unannounced "$_GLH_COUNT_FILE")
+    { [ "$n_ev" = "1" ] && [ "$n_ev_all" = "1" ]; } && ok "T62: $_t62 → exactly one stale_state_notify, outcome=$_want" \
+      || bad "T62: $_t62 → expected one outcome=$_want event, got $n_ev of $n_ev_all: $(grep stale_state_notify "$LOG" | head -c 300)"
+    [ "$n_un" = "$_want_un" ] && ok "T62: $_t62 → unannounced tally=$n_un" \
+      || bad "T62: $_t62 → unannounced tally=$n_un (expected $_want_un)"
+  done
+  NOTIFY_BIN="$_T62_REAL_NOTIFY"; _GLH_COUNT_FILE="$_T62_REAL_COUNT"
+
+  # T63: the abort command in the notification must be PASTEABLE. rebase-apply is a rebase OR a git am
+  # and the two abort differently; the text used to carry "rebase --abort (ou am --abort)", whose
+  # parentheses are a shell syntax error when pasted.
+  echo "T63: rebase-apply → two complete runnable abort commands, no '(ou ...)' suffix"
+  R31="$TMP/repo31"; make_repo "$R31"
+  mkdir -p "$R31/.git/rebase-apply"; touch -t 200001010000 "$R31/.git/rebase-apply"
+  : > "$LOG"; : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  count=$(_scan_repo "$R31" 2>/dev/null)
+  { grep -qF "git -C $R31 rebase --abort" "$NOTIFY_CALLS" && grep -qF "git -C $R31 am --abort" "$NOTIFY_CALLS" \
+      && ! grep -qF '(ou ' "$NOTIFY_CALLS"; } \
+    && ok "T63: both 'git -C <repo> rebase --abort' and 'git -C <repo> am --abort' are in the text" \
+    || bad "T63: the abort commands are not two pasteable ones: $(cat "$NOTIFY_CALLS")"
+  R32="$TMP/repo32"; make_repo "$R32"; touch -t 200001010000 "$R32/.git/MERGE_HEAD"
+  : > "$NOTIFY_CALLS"; rm -rf "$GIT_LOCK_STATE_DIR"
+  count=$(_scan_repo "$R32" 2>/dev/null)
+  grep -qF "Se abandonado: git -C $R32 merge --abort" "$NOTIFY_CALLS" \
+    && ok "T63: a single-verb item still reads 'git -C <repo> merge --abort'" \
+    || bad "T63: single-verb text changed: $(cat "$NOTIFY_CALLS")"
 
   # ── Mutex tests ─────────────────────────────────────────────────────────────
   echo ""
@@ -1950,7 +2061,9 @@ done
 
 # How many aged items were left alone, and why: "skipped_live" = a live git / held lock / could not
 # tell; "undetermined" = the could-not-tell subset (a broken ps/lsof/timeout keeps EVERY aged lock, so
-# this is the number to watch); "stale_state" = operation state reported but not removed. null =
+# this is the number to watch); "stale_state" = operation state reported but not removed;
+# "unannounced" = of those, the ones whose hand-off to notify did not happen or failed (no notifier,
+# non-zero exit, deadline) — so "someone may have been told" is never read off a silent log. null =
 # the tally file could not be made, i.e. unknown — never 0.
 _glh_tally() {
   if [ -n "$_GLH_COUNT_FILE" ] && [ -e "$_GLH_COUNT_FILE" ]; then
@@ -1959,7 +2072,7 @@ _glh_tally() {
     echo null
   fi
 }
-_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"skipped_live\":$(_glh_tally skipped_live),\"undetermined\":$(_glh_tally undetermined),\"stale_state\":$(_glh_tally stale_state),\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
+_log_json "{\"ts\":\"$(ts)\",\"event\":\"sweep\",\"repos_scanned\":${repos_scanned},\"removed\":${total_removed},\"skipped_live\":$(_glh_tally skipped_live),\"undetermined\":$(_glh_tally undetermined),\"stale_state\":$(_glh_tally stale_state),\"unannounced\":$(_glh_tally unannounced),\"dry_run\":\"${DRY_RUN}\",\"stale_age_sec\":${STALE_AGE}}"
 [ -n "$_GLH_COUNT_FILE" ] && rm -f "$_GLH_COUNT_FILE"
 
 # Notify only when locks were actually removed (signals a real heal event)
