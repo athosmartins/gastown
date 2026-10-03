@@ -3463,6 +3463,9 @@ echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   || ok "T91 viewer/index.html does not mark processo (renders processo_lookup/templates/index.html) affected"
 [ "$V" = "OK" ] && ok "T91 verdict OK (gate not held by a template the daemon never loads)" || nok "T91 verdict" "got '$V' (want OK, not NEEDS_GUARDED_RESTART) out=[$OUT]"
 [ -z "$(field GUARDED "$OUT")" ] && ok "T91 GUARDED empty" || nok "T91 guarded" "$(field GUARDED "$OUT")"
+# the dismissal is visible: the log says which file the daemon loads and which same-named change it set aside
+echo "$OUT" | grep -q 'processo is NOT affected by the changed template' && echo "$OUT" | grep -q 'viewer/index.html' \
+  && ok "T91 the dismissal is logged (not a silent 'clear')" || nok "T91 clear log" "$OUT"
 
 SENSITIVE_DAEMONS="processo"
 new_case t92
@@ -3582,7 +3585,8 @@ t91_default_app
 sleep 1; git -C "$RUNTIME" update-index --really-refresh -q >/dev/null 2>&1
 chmod 000 "$RUNTIME/processo_lookup/app.py"
 if cat "$RUNTIME/processo_lookup/app.py" >/dev/null 2>&1; then
-  ok "T98 skipped: this user can read a mode-000 file (root?), so an unreadable entrypoint cannot be staged here"
+  # a skip is not a pass: announced, but kept out of the PASS total
+  echo "  skip - T98: this user can read a mode-000 file (root?), so an unreadable entrypoint cannot be staged here"
 else
   OUT=$(run_helper_stderr viewer/index.html); RC=$?
   echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
@@ -3592,6 +3596,130 @@ else
     && ok "T98 ...and marked as a by-name match" || nok "T98 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
 fi
 chmod 644 "$RUNTIME/processo_lookup/app.py"
+
+# T99-T106: "clear" (a same-named changed file is dismissed) needs POSITIVE proof;
+# everything else stays flagged. The pre-gate review of the first version found
+# two ways a clear was wrong while looking certain:
+#   T99/T100  templates/ is a tracked SYMLINK to ../shared/templates: an edit made
+#             through the real path was invisible to the literal-path compare
+#   T101      the entrypoint swaps the Jinja loader (app.jinja_loader = ...): the
+#             "app folder first" assumption behind a clear no longer holds
+# and the matcher's remaining uncovered third states:
+#   T102 syntax error  T103 two Flask() apps  T104 root_path=  T105 matcher crash
+#   T106 two entries: a by-name hit on the first must not mislabel a path hit on
+#        the second
+t99_symlinked_templates() {  # processo_lookup/templates -> ../shared/templates, one real index.html
+  t91_default_app
+  mkdir -p "$RUNTIME/shared/templates"
+  mv "$RUNTIME/processo_lookup/templates/index.html" "$RUNTIME/shared/templates/index.html"
+  rmdir "$RUNTIME/processo_lookup/templates"
+  ln -s ../shared/templates "$RUNTIME/processo_lookup/templates"
+}
+t_by_name_case() {  # t_by_name_case <tag> <changed-relpath>: label affected AND listed as a by-name match
+  OUT=$(run_helper_stderr "$2"); RC=$?
+  echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+    && ok "$1 kept affected (could not prove the file it loads)" || nok "$1 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
+  echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+    && ok "$1 listed in AFFECTED_TEMPLATE_BY_NAME" || nok "$1 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+}
+
+SENSITIVE_DAEMONS=""
+new_case t99
+t99_symlinked_templates
+OUT=$(run_helper_stderr shared/templates/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T99 an edit through the symlink's real path marks the daemon affected" \
+  || nok "T99 a symlinked templates/ hid the edit (silent 'clear')" "AFFECTED=[$(field AFFECTED "$OUT")]"
+[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T99 matched by (real) path, not by name" || nok "T99 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+
+SENSITIVE_DAEMONS=""
+new_case t100
+t99_symlinked_templates
+t_by_name_case T100 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t101
+t91_fixture <<'PYEOF'
+from jinja2 import FileSystemLoader
+app = Flask(__name__)
+app.jinja_loader = FileSystemLoader("/srv/shared-templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T101 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t102
+t91_fixture <<'PYEOF'
+app = Flask(__name__
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T102 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t103
+t91_fixture <<'PYEOF'
+app = Flask(__name__)
+admin = Flask(__name__, template_folder="admin_templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T103 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t104
+t91_fixture <<'PYEOF'
+app = Flask(__name__, root_path="/srv/elsewhere")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T104 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t105
+t91_default_app
+# a python3 that fails ONLY for the template matcher (the one call that sets CHANGED_TPL_FOR_MATCH)
+T105_SHIM="$CASE_DIR/shim"; mkdir -p "$T105_SHIM"
+T105_REAL_PY="$(command -v python3)"
+cat > "$T105_SHIM/python3" <<SHIMEOF
+#!/usr/bin/env bash
+[ -n "\${CHANGED_TPL_FOR_MATCH:-}" ] && exit 1
+exec "$T105_REAL_PY" "\$@"
+SHIMEOF
+chmod +x "$T105_SHIM/python3"
+OUT=$(PATH="$T105_SHIM:$PATH" run_helper_stderr viewer/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T105 a crashing template matcher keeps the daemon affected (not a silent miss)" || nok "T105 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
+echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T105 ...and listed as a by-name match" || nok "T105 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+echo "$OUT" | grep -q 'template matcher failed on' && ok "T105 the log names the failed matcher" || nok "T105 log" "$OUT"
+
+SENSITIVE_DAEMONS=""
+new_case t106
+t91_default_app            # processo_lookup/app.py: default templates/ folder, path-resolvable
+mkdir -p "$RUNTIME/aa"
+cat > "$RUNTIME/aa/app.py" <<'PYEOF'
+import os
+from flask import Flask, render_template
+app = Flask(__name__, template_folder=os.environ["TPL_DIR"])
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+# ONE label, TWO entrypoints. Discovery sorts them (sort -u), so aa/app.py (unresolvable -> by name) is
+# examined BEFORE processo_lookup/app.py (by path): a loop that stops at the first hit mislabels the verdict.
+make_plist "$AGENTS" com.test.processo "$RUNTIME/venv/bin/python3" "$RUNTIME/aa/app.py" "$RUNTIME/processo_lookup/app.py"
+OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T106 label affected" || nok "T106 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
+[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] \
+  && ok "T106 a path hit on a later entry wins over a by-name hit on an earlier one" \
+  || nok "T106 label wrongly reported as by-name only" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
