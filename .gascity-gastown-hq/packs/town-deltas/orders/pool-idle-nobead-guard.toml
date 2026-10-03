@@ -2,16 +2,28 @@
 # (72 approved beads, 0 in flight). The engine's own idle_timeout on wa-worker/ps-worker is 2h, and every
 # other watchdog is keyed on a bead or on named crews — see the script's header for the full list.
 #
-# Conjunctive on purpose (idle pane AND no bead in the city or rig DB AND every read succeeded): "quiet
-# for N minutes" alone would also catch long silent test runs. Nudge (drain-ack + exit) first, kill only
-# after a grace period and only a session that still holds no work. DRY_RUN=1, a kill-switch file and
-# per-pass caps are documented in the script. A gc order (fresh exec each tick, flock'd), never a raw plist.
+# Conjunctive on purpose (pane-activity clock idle AND no activity marker in the pane AND no bead in the city
+# or rig DB AND every read succeeded): "quiet for N minutes" alone would also catch long silent test runs.
+# Nudge (drain-ack + exit) first; only after a grace period, and only for a session that still holds no work,
+# `gc session close` it — NOT `kill`, which leaves the session active for the reconciler to restart and so
+# frees no slot — and then verify from the session list that the slot really was released. DRY_RUN=1, a
+# kill-switch file and per-pass caps are documented in the script. A gc order (fresh exec each tick,
+# flock'd), never a raw plist.
 #
-# Measured: a pass with 2 pool sessions took ~7 s (session list + rig list); each session that is actually
-# idle adds 6 bounded bd calls (3 per DB: the list plus two wisp queries, for the city DB and its rig DB). With the defaults (idle 10 min, grace 10 min) a slot stuck on a misfire is
-# released in ~10-15 min if the worker obeys the nudge, and in at most ~30 min if it has to be killed.
+# Cost, MEASURED 03/10 at load ~45: a DRY_RUN pass over 3 pool sessions took 38 s — ~11 s for the session
+# list, then ~27 s for the one candidate that got as far as the bead check (a pane peek, the rig list and
+# 6 bounded bd calls: the list plus two wisp queries for each of the city DB and the rig DB). Individual gc
+# calls are bounded at 40 s. With the defaults (idle 10 min, grace 10 min) a slot stuck on a misfire is freed
+# in ~10-15 min if the worker obeys the nudge, and in at most ~30 min if it has to be closed.
+#
+# interval 5m / timeout 600s: the script stops starting new candidates after a 240 s budget, but the one in
+# flight can still make several bounded calls, so the timeout is declared (not left to the engine default)
+# with room above the budget; selftest W fails if it ever drops under budget + 60 s. A run the timeout
+# cuts short is harmless by construction — a nudge is recorded as "nudging" BEFORE it is sent and only
+# "nudged" can lead to a close — and the script's flock keeps the next tick from stacking on it.
 [order]
-description = "Nudge, then (if still idle and bead-less) kill, a pool worker that holds no bead and sits idle at its prompt, so it releases its pool slot"
+description = "Nudge, then (if still idle and bead-less) close, a pool worker that holds no bead and sits idle at its prompt, so it releases its pool slot"
 trigger = "cooldown"
 interval = "5m"
+timeout = "600s"
 exec = "$PACK_DIR/assets/scripts/pool-idle-nobead-guard.sh"

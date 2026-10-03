@@ -16,15 +16,22 @@
 # THREE parts, because a detector that was never shown to catch anything proves nothing:
 #   A. CONTROLS on synthetic text: the detector flags every shape that mentions a skill and spares paths,
 #      URLs and the replacement wording. If A fails, B's "no hits" would be vacuous.
-#   B. NAMES: the set of skill/command names is derived from this repo, never hard-coded alone, and an
-#      empty set is FATAL (no names => nothing could be flagged => a silent pass).
+#   B. NAMES: the set of skill/command names is derived from this repo (.claude/commands, .claude/skills,
+#      the city's own skills/ and commands/), plus a short list of names that live OUTSIDE the repo (gate-done,
+#      the core gc-* skills). The derived part is checked on its own — a hard-coded name can never make the
+#      "names found" check pass — and an empty derived set, or a missing city skills/ dir, is FATAL (no names
+#      => nothing could be flagged => a silent pass).
 #   C. TEMPLATES: every agents/*/prompt.template.md has no UNQUOTED skill token (the measured trigger);
 #      the unattended POOL templates are held to the stricter rule — no token at all, backticks included —
-#      so they do not depend on an undocumented parser detail of one Claude Code version.
+#      so they do not depend on an undocumented parser detail of one Claude Code version. The city.toml
+#      global_fragments are appended to EVERY boot prompt, pool workers' included, so the ones that live in
+#      this repo are scanned under the strict rule too; the ones that ship inside the gc binary cannot be
+#      read from here and are reported as NOT SCANNED, out loud.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${POOL_PROMPT_REPO_ROOT:-$SELF_DIR/../../../..}"
+CITY_DIR="${POOL_PROMPT_CITY_DIR:-$ROOT/.gascity-gastown-hq}"
 AGENTS_DIR="${POOL_PROMPT_AGENTS_DIR:-$SELF_DIR/../../../agents}"
 # Unattended pool agents: nobody is at the keyboard to notice a misfire, and each one holds a slot.
 POOL_TEMPLATES="${POOL_PROMPT_POOL_TEMPLATES:-wa-worker ps-worker gemini-worker}"
@@ -39,17 +46,28 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 # ---- B. names ---------------------------------------------------------------------------------------
 echo "B. skill/command names derived from the repo"
 NAMES_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-prompt-names.XXXXXX")"
-trap 'rm -f "$NAMES_FILE" "${FIX:-}"' EXIT
+DERIVED_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-prompt-derived.XXXXXX")"
+CITYSK_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-prompt-citysk.XXXXXX")"
+trap 'rm -f "$NAMES_FILE" "$DERIVED_FILE" "$CITYSK_FILE" "${FIX:-}"' EXIT
+# Names that live OUTSIDE this repo, so they cannot be derived: the incident's skill (its source file moved
+# once already) and the core gc-* skills the gc binary materialises into every session.
+EXTRA_NAMES="gate-done gc-work gc-dispatch gc-agents gc-rigs gc-mail gc-city gc-dashboard"
+# the city's own skills (recall, refino, wa-worker-session-protocol, browser-control...) — measured 03/10 to be
+# missing from the first version of this set, so a future unquoted "/recall" in a pool template passed.
+{ [ -d "$CITY_DIR/skills" ] && for s in "$CITY_DIR/skills"/*/; do [ -f "${s}SKILL.md" ] && basename "$s"; done; } 2>/dev/null | grep -E '^[A-Za-z][A-Za-z0-9._-]*$' | sort -u > "$CITYSK_FILE"
 {
-  echo gate-done   # the incident's skill: stays flagged even if its source file moves
-  for d in "$ROOT/.claude/commands" "$ROOT/.gascity-gastown-hq/commands"; do
+  cat "$CITYSK_FILE"
+  for d in "$ROOT/.claude/commands" "$CITY_DIR/commands"; do
     [ -d "$d" ] && for f in "$d"/*.md; do [ -f "$f" ] && basename "$f" .md; done
   done
   [ -d "$ROOT/.claude/skills" ] && for s in "$ROOT/.claude/skills"/*/; do [ -f "${s}SKILL.md" ] && basename "$s"; done
-} 2>/dev/null | grep -E '^[A-Za-z][A-Za-z0-9._-]*$' | sort -u > "$NAMES_FILE"
-NNAMES="$(wc -l < "$NAMES_FILE" | tr -d ' ')"
-if [ "$NNAMES" -ge 1 ] && grep -qx 'gate-done' "$NAMES_FILE"; then ok "derived $NNAMES name(s), gate-done among them"
-else bad "name set is empty or lacks gate-done (n=$NNAMES): detector would be vacuous"; fi
+} 2>/dev/null | grep -E '^[A-Za-z][A-Za-z0-9._-]*$' | sort -u > "$DERIVED_FILE"
+{ cat "$DERIVED_FILE"; for n in $EXTRA_NAMES; do echo "$n"; done; } | sort -u > "$NAMES_FILE"
+NDERIVED="$(wc -l < "$DERIVED_FILE" | tr -d ' ')"; NCITYSK="$(wc -l < "$CITYSK_FILE" | tr -d ' ')"; NNAMES="$(wc -l < "$NAMES_FILE" | tr -d ' ')"
+if [ "$NDERIVED" -ge 1 ]; then ok "$NDERIVED name(s) derived from files in the repo (+ ${EXTRA_NAMES// /,} from outside it = $NNAMES)"
+else bad "no name could be derived from the repo: the detector would only know the hard-coded extras"; fi
+if [ "$NCITYSK" -ge 1 ]; then ok "the city's own skills/ contributed $NCITYSK name(s)"
+else bad "no skill found under $CITY_DIR/skills: the city's skills would silently drop out of the detector"; fi
 ALT="$(sed 's/\./\\./g' "$NAMES_FILE" | paste -sd'|' -)"
 
 # Token = "/<name>" not glued to a path/word on the left, and not continued into a path/extension on the
@@ -78,6 +96,8 @@ expect trigger flag  'then run /gate-done.'                                    '
 expect trigger clear 'use `/gate-done` to submit'                              'backticked (measured non-trigger)'
 expect strict  flag  'use `/gate-done` to submit'                              'backticked, pool rule'
 expect strict  flag  '2. Rodar `/gate-done` → cria o marker'                   'backticked, Portuguese step'
+expect trigger flag  'first run /recall to look for prior art'                'a city skill (from the city skills/ dir)'
+expect trigger flag  'use /gc-work to find beads'                             'a core gc-* skill (outside the repo)'
 expect strict  clear 'commit → the gate-done skill → exit.'                    'replacement wording'
 expect strict  clear 'use a skill `gate-done` (NUNCA `gt mq submit`)'          'replacement wording, backticked name'
 expect strict  clear 'see .claude/commands/gate-done.md for details'           'path ending in the skill file'
@@ -110,6 +130,30 @@ done
 for p in $POOL_TEMPLATES; do
   [ -f "$AGENTS_DIR/$p/prompt.template.md" ] || bad "pool template listed but missing: $p (a renamed pool would silently escape the strict rule)"
 done
+
+# ---- C2. global fragments: appended to EVERY boot prompt, the pool workers' included ----------------------
+echo "C2. city.toml global_fragments"
+FRAGS="$(python3 -c 'import sys, tomllib; print(*tomllib.load(open(sys.argv[1], "rb"))["workspace"]["global_fragments"])' "$CITY_DIR/city.toml" 2>/dev/null)"; frc=$?
+if [ "$frc" -ne 0 ] || [ -z "$FRAGS" ]; then
+  bad "cannot read global_fragments from $CITY_DIR/city.toml (rc=$frc): the fragments appended to every boot prompt were not checked"
+else
+  NSCAN=0
+  for fr in $FRAGS; do
+    ff="$(ls "$CITY_DIR"/packs/*/template-fragments/"$fr".template.md 2>/dev/null | head -1)"
+    if [ -z "$ff" ]; then
+      echo "  ~ NOT SCANNED: fragment '$fr' is not in this repo (it ships inside the gc binary); a skill token there cannot be seen from here"
+      continue
+    fi
+    NSCAN=$((NSCAN+1))
+    h="$(hits strict "$ff")"; rc=$?
+    case "$rc" in
+      1) ok "fragment $fr: no skill token (strict)" ;;
+      0) bad "fragment $fr: skill token present (strict) — it is appended to every pool worker's boot prompt:"; echo "$h" | sed 's/^/      /' | cut -c1-170 ;;
+      *) bad "fragment $fr: could not be read (grep exit $rc)" ;;
+    esac
+  done
+  [ "$NSCAN" -ge 1 ] && ok "scanned $NSCAN fragment(s) from the repo" || bad "no global fragment lives in this repo: nothing was checked"
+fi
 
 echo
 echo "pool-prompt-skill-mention selftest: $PASS passed, $FAIL failed"

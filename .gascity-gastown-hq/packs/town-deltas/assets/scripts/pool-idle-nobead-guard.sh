@@ -15,23 +15,41 @@
 #   2. `last_active` is older than IDLE_SEC. MEASURED 03/10: last_active is a PANE-ACTIVITY clock — it
 #      stayed 0-1 s old for a whole silent 105 s tool call (the spinner timer repaints the pane) — so a
 #      long test run is NOT idle by this clock; only a session sitting still at the prompt is;
-#   3. the pane is classifiable AND idle (no spinner/elapsed timer; a prompt or a past-tense summary is
-#      showing). A frozen mid-turn pane is a HANG, which is crew-hang-detector's job, not this one's;
+#   3. the pane shows NO sign of a running turn: no spinner timer (any of "(12s", "(3m 4s", "(1h 31m 47s"),
+#      no "esc to interrupt", and no spinner-shaped line whose timer we cannot read (that is UNKNOWN, not
+#      idle) — and it is a Claude Code pane we recognise (its prompt box, or a past-tense "<Verb> for <dur>"
+#      summary). Be exact about what this leg is: "no activity marker found", NOT "idle proven". The prompt
+#      glyph is drawn on busy panes too (measured 03/10 on 3 live panes), so it only says "this is a TUI";
+#      the independent evidence of idleness is leg 2 (the pane-activity clock) and leg 4 (no bead). Leg 3
+#      is what fails safe (UNKNOWN) when the TUI changes its look. A frozen mid-turn pane is a HANG, which
+#      is crew-hang-detector's job, not this one's;
 #   4. NO bead belongs to the session in the city DB or the session's own rig DB: open/in_progress/blocked/
 #      hooked/deferred beads and open/in_progress wisps, matched by assignee (session id, name, alias or
 #      session_name) or by the gc.session_name in the bead's metadata. A session that holds a bead is never
 #      touched (agent-stuck-escalation owns that case). "Idle for N minutes" alone is exactly the weak
 #      signal the city refuses to act on. A bead recorded under some OTHER identifier would not be seen —
-#      which is why the kill needs a nudge, a grace period and a second idle pane first.
+#      which is why the close needs a nudge, a grace period and a second idle pane first.
 # THREE STATES, never collapsed: for the bead check and the pane check "could not tell" (timeout, bad
 # JSON, empty pane, rig not found) is UNKNOWN and means DO NOTHING — it never reads as "no bead".
 #
 # THE ACTION, with due process: first a NUDGE asking the worker to drain-ack and exit (the graceful
 # path the engine already honours: "drain acknowledged by agent"). Only if it is still bead-less and idle
-# GRACE_SEC later is the session killed — safe because it holds no work. Caps per pass (nudges, kills)
-# bound the damage of any bug in this script; kill can be turned off with POOL_IDLE_KILL=0.
+# GRACE_SEC later is the session CLOSED (`gc session close`: stops the runtime and closes the session bead
+# — the verb the city already uses to free a session: crew-capacity-containment.sh, the gate reviewers) —
+# safe because it holds no work. NOT `gc session kill`: per its own help, kill leaves the session marked
+# active so the reconciler restarts it, i.e. it frees nothing and the slot stays counted against the pool
+# cap. And an exit code is only "asked", never "done": after a close the session list is re-read and the
+# outcome is logged as RELEASED / STILL ACTIVE / UNVERIFIED — the log never says "slot released" on faith.
+# Caps per pass (nudges, closes) bound the damage of any bug in this script; the close stage can be turned
+# off with POOL_IDLE_CLOSE=0.
 #
-# SAFETY VALVES: DRY_RUN=1 (decide + log; sends no nudge, kills nothing, writes/removes no nudge state —
+# STATE (one file per nudged session, $SESS_STATE/<name>.nudged) is written BEFORE the nudge is sent and
+# the nudge is sent only if that write verifiably landed: an unrecorded nudge would be re-sent every pass
+# (an agent turn each time) and the grace period would never start. The file reads "nudging <ts>" while the
+# nudge is unconfirmed and "nudged <ts>" once it is; only "nudged" can ever lead to a close. A state that
+# cannot be written or removed is logged loudly as STATE-ERROR and counted in the pass summary.
+#
+# SAFETY VALVES: DRY_RUN=1 (decide + log; sends no nudge, closes nothing, writes/removes no nudge state —
 # it still creates the empty state dir and the lock file); kill-switch file
 # $STATE_ROOT/pool-idle-nobead-guard.disabled; single instance via flock; every gc/bd call is bounded by
 # `timeout`; always exits 0 (an order tick must not page anyone because gc was briefly unavailable).
@@ -51,17 +69,18 @@ LOCK_FILE="${POOL_IDLE_LOCK:-$CITY/.gc/runtime/pool-idle-nobead-guard.lock}"
 
 POOL_TEMPLATES="${POOL_IDLE_TEMPLATES:-wa-worker ps-worker}"
 IDLE_SEC="${POOL_IDLE_SEC:-600}"            # idle this long (and bead-less) => nudge
-GRACE_SEC="${POOL_IDLE_GRACE_SEC:-600}"     # still bead-less + idle this long after the nudge => kill
-KILL_ENABLED="${POOL_IDLE_KILL:-1}"
+GRACE_SEC="${POOL_IDLE_GRACE_SEC:-600}"     # still bead-less + idle this long after the nudge => close
+CLOSE_ENABLED="${POOL_IDLE_CLOSE:-1}"
 MAX_NUDGES="${POOL_IDLE_MAX_NUDGES:-3}"
-MAX_KILLS="${POOL_IDLE_MAX_KILLS:-1}"
+MAX_CLOSES="${POOL_IDLE_MAX_CLOSES:-1}"
 PEEK_LINES="${POOL_IDLE_PEEK_LINES:-40}"
 CALL_TIMEOUT="${POOL_IDLE_CALL_TIMEOUT:-40}"
 PASS_BUDGET_SEC="${POOL_IDLE_PASS_BUDGET_SEC:-240}"   # a wedged bd must not stretch one order tick indefinitely
 DRY_RUN="${DRY_RUN:-0}"
 NOW="${POOL_IDLE_NOW:-$(date +%s)}"         # overridable so the selftest is deterministic
 
-mkdir -p "$(dirname "$LOG")" "$SESS_STATE" "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+mkdir -p "$(dirname "$LOG")" "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+mkdir -p "$SESS_STATE" 2>/dev/null || true       # a failure here is NOT swallowed: see the dir check below
 if [ "$DRY_RUN" != "1" ]; then exec >> "$LOG" 2>&1; fi
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pool-idle] $*"; }
 
@@ -70,7 +89,12 @@ if [ -f "$KILL_SWITCH" ]; then log "kill-switch present ($KILL_SWITCH) — no-op
 exec 9>"$LOCK_FILE" || { log "cannot open lock $LOCK_FILE — exiting (no single-instance guarantee)"; exit 0; }
 flock -n 9 || { log "another instance holds $LOCK_FILE — exiting"; exit 0; }
 
-log "=== pass start (IDLE_SEC=$IDLE_SEC GRACE_SEC=$GRACE_SEC KILL=$KILL_ENABLED DRY_RUN=$DRY_RUN templates=[$POOL_TEMPLATES]) ==="
+log "=== pass start (IDLE_SEC=$IDLE_SEC GRACE_SEC=$GRACE_SEC CLOSE=$CLOSE_ENABLED DRY_RUN=$DRY_RUN templates=[$POOL_TEMPLATES]) ==="
+# Unusable state dir => every nudge would go unrecorded. Say so once up front; the per-session write check
+# below is what actually stops the nudge (this line only makes the cause obvious in the log).
+if [ "$DRY_RUN" != "1" ] && { [ ! -d "$SESS_STATE" ] || [ ! -w "$SESS_STATE" ]; }; then
+  log "STATE-ERROR: state dir $SESS_STATE is missing or not writable — no nudge will be sent this pass"
+fi
 
 SESS_JSON="$(timeout "$CALL_TIMEOUT" "$GC" session list --json 2>/dev/null || true)"
 if [ -z "$SESS_JSON" ]; then log "WARN: empty/failed session list — skipping pass (UNKNOWN, no action)"; exit 0; fi
@@ -79,7 +103,8 @@ if [ -z "$SESS_JSON" ]; then log "WARN: empty/failed session list — skipping p
 # (non-whitespace delimiter on purpose: `read` would collapse empty tab-separated fields)
 CAND_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-idle-cand.XXXXXX")"
 RIGS_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-idle-rigs.XXXXXX")"
-trap 'rm -f "$CAND_FILE" "$RIGS_FILE"' EXIT
+SKIP_FILE="$(mktemp "${TMPDIR:-/tmp}/pool-idle-skip.XXXXXX")"
+trap 'rm -f "$CAND_FILE" "$RIGS_FILE" "$SKIP_FILE"' EXIT
 printf '%s' "$SESS_JSON" | POOL_TEMPLATES="$POOL_TEMPLATES" NOW="$NOW" python3 -c '
 import json, sys, os, datetime
 pools = os.environ["POOL_TEMPLATES"].split()
@@ -101,35 +126,67 @@ for s in sessions:
         continue
     if (s.get("template") or "") not in pools:
         continue
-    base = ts(s.get("last_active") or "") or ts(s.get("created_at") or "")
-    if base is None:
-        continue                                 # cannot date it -> UNKNOWN -> not a candidate
     f = [s.get(k) or "" for k in ("name", "id", "alias", "session_name", "template", "work_dir")]
+    base = ts(s.get("last_active") or "") or ts(s.get("created_at") or "")
+    # A session we cannot date or cannot safely serialise is UNKNOWN => not a candidate. It is COUNTED and
+    # named (stderr -> $SKIP_FILE), never dropped silently: if gc ever changes its timestamp format every
+    # session would vanish here and "0 candidates" would read as "nothing is idle".
+    if base is None:
+        sys.stderr.write("skip:undatable:%s\n" % (f[0] or "?")); continue
     if not f[0] or any("|" in x for x in f):
-        continue
+        sys.stderr.write("skip:unsafe-field:%s\n" % (f[0] or "?")); continue
     print("|".join(f + [str(int(now - base))]))
-' > "$CAND_FILE" 2>/dev/null
+' > "$CAND_FILE" 2> "$SKIP_FILE"
 PY_RC=$?
 if [ "$PY_RC" -ne 0 ]; then log "WARN: session list could not be parsed (python exit $PY_RC) — skipping pass (UNKNOWN, no action)"; exit 0; fi
 NCAND="$(wc -l < "$CAND_FILE" | tr -d ' ')"
+# grep -c: rc 0 = some, 1 = none, >=2 = could not read the report. The last must not read as "none skipped".
+NSKIP="$(grep -c '^skip:' "$SKIP_FILE" 2>/dev/null)"; SKIP_RC=$?
+case "$SKIP_RC" in 0|1) ;; *) NSKIP="?"; log "WARN: the skip report $SKIP_FILE could not be read (grep exit $SKIP_RC) — how many sessions were skipped is UNKNOWN" ;; esac
 log "pool candidates (active, unattached, pool template): $NCAND"
+case "$NSKIP" in ''|*[!0-9]*) ;; *)
+  if [ "$NSKIP" -gt 0 ]; then
+    log "WARN: $NSKIP pool session(s) skipped as UNKNOWN (cannot be dated or serialised): $(grep '^skip:' "$SKIP_FILE" | tr '\n' ' ')"
+  fi ;;
+esac
 
-# Same busy test crew-hang-detector uses: a running turn shows "<Gerund>… (<elapsed>s ·" or
-# "esc to interrupt"; an idle pane shows a past-tense summary / the prompt instead.
+# What a Claude Code pane looks like (MEASURED 03/10 on the live wa-workers):
+#   running:  "✢ Kneading… (1h 31m 47s · ↓ 298.6k tokens)"   <- the elapsed timer has an HOURS unit
+#   finished: "✻ Cooked for 1h 1m 30s · done 10:22 AM · 3 shells, 1 monitor still running"
+#   and the prompt box "❯" is drawn on BOTH — it says "this is a Claude Code pane", not "this pane is idle".
+# The first version of this test had no hours unit: a turn past 1 h read as idle (and so did "1h" summaries).
+DUR='([0-9]+h[[:space:]]+)?([0-9]+m[[:space:]]+)?[0-9]+s'
+SPIN_GLYPH='(✻|✽|✳|✶|✢|✺|✹|·|\*)'
+# Same busy test as crew-hang-detector.sh (which still lacks the hours unit — ga-lozfor): a running turn
+# shows "<Verb>… (<elapsed>" or, on older builds, "esc to interrupt".
 is_active_work() {
-  printf '%s' "$1" | grep -E '(…|\.\.\.)[^(]*\(([0-9]+m[[:space:]]+)?[0-9]+s' >/dev/null && return 0
+  printf '%s' "$1" | grep -E "(…|\.\.\.)[^(]*\\(${DUR}" >/dev/null && return 0
   printf '%s' "$1" | grep 'esc to interrupt' >/dev/null && return 0
   return 1
 }
+# A spinner-shaped line ("<glyph> <Verb>…") whose timer is_active_work could not read: something is probably
+# running in a shape we do not know. That is UNKNOWN — it must never fall through to IDLE.
+has_unreadable_spinner() {
+  printf '%s' "$1" | grep -E "^[[:space:]]*${SPIN_GLYPH}[[:space:]]+[^[:space:]]+(…|\.\.\.)" >/dev/null
+}
+# A finished turn's summary line: "<glyph> <Verb> for <dur>".
+has_turn_summary() {
+  printf '%s' "$1" | grep -E "^[[:space:]]*${SPIN_GLYPH}[[:space:]]+[^[:space:]]+ for ${DUR}" >/dev/null
+}
 
 # pane_state <session>  -> IDLE | BUSY | UNKNOWN
+#   BUSY    a timer / "esc to interrupt" is showing
+#   UNKNOWN empty or unreadable pane; a spinner-shaped line we cannot read; or nothing we recognise as a
+#           Claude Code pane (neither its prompt box nor a turn summary)
+#   IDLE    a recognised pane with NO activity marker in view. That is "nothing found", not "idle proven" —
+#           see leg 3 in the header for what carries the rest.
 pane_state() {
   local pane
   pane="$(timeout "$CALL_TIMEOUT" "$GC" session peek "$1" --lines "$PEEK_LINES" 2>/dev/null)" || { echo UNKNOWN; return; }
   [ -z "$pane" ] && { echo UNKNOWN; return; }
   if is_active_work "$pane"; then echo BUSY; return; fi
-  # idle must be POSITIVELY recognised: the prompt glyph or a "<Verb>ed for <duration>" summary
-  if printf '%s' "$pane" | grep -E '❯|[A-Za-z]+ for ([0-9]+m )?[0-9]+s' >/dev/null; then echo IDLE; else echo UNKNOWN; fi
+  if has_unreadable_spinner "$pane"; then echo UNKNOWN; return; fi
+  if printf '%s' "$pane" | grep '❯' >/dev/null || has_turn_summary "$pane"; then echo IDLE; else echo UNKNOWN; fi
 }
 
 # rig_db_for <work_dir> -> the longest rig path that is a prefix of work_dir; empty if none/unreadable
@@ -187,10 +244,57 @@ bead_state() {
   if [ "$total" -gt 0 ]; then echo "HAS:$total"; else echo NONE; fi
 }
 
-# state is only ever written/removed on a real pass: DRY_RUN must leave the world exactly as it found it
-forget() { [ "$DRY_RUN" = "1" ] || rm -f "$1"; }
+# ---- state ------------------------------------------------------------------------------------------------
+# State is only ever written/removed on a real pass: DRY_RUN must leave the world exactly as it found it.
+# A write or a removal that did not happen is NEVER swallowed: it is logged as STATE-ERROR and counted in the
+# pass summary. A write that did not land makes the caller abstain from the nudge (a nudge whose record is
+# lost would repeat every pass). A removal that did not happen leaves the old record in place; every close
+# decision still re-checks pane and beads first, so the worst a stale "nudged" record can do is skip the
+# second warning for a session that is idle and provably bead-less right now.
+STATE_ERRORS=0
+state_err() { STATE_ERRORS=$((STATE_ERRORS + 1)); log "STATE-ERROR: $*"; }
 
-NUDGES=0; KILLS=0; SEEN=""
+# write_state <file> <content> -> 0 only if <content> is verifiably on disk (temp file + mv, then read back).
+# The braces keep bash's own redirection error ("Permission denied") out of the log.
+write_state() {
+  local f="$1" want="$2" tmp="$1.tmp.$$"
+  { printf '%s\n' "$want" > "$tmp"; } 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null && [ "$(cat "$f" 2>/dev/null)" = "$want" ] && return 0
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# forget <file> -> 0 if the file is gone afterwards (or DRY_RUN), 1 + STATE-ERROR if it is still there
+forget() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  [ -e "$1" ] || return 0
+  rm -f "$1" 2>/dev/null
+  if [ -e "$1" ]; then state_err "cannot remove $1 — it will keep steering later passes until it is removed by hand"; return 1; fi
+  return 0
+}
+
+# ---- outcome of a close ------------------------------------------------------------------------------------
+# slot_state <session-name> -> RELEASED | HELD | UNKNOWN. Re-reads the session list (default view = active and
+# suspended sessions; a closed one drops out). "active" and "creating" are what the pool cap counts
+# (pilot: "pool at session cap (N active/creating >= max)"), so those two mean the slot is still HELD.
+# An unreadable list is UNKNOWN: it must not turn into either answer.
+slot_state() {
+  local json out
+  json="$(timeout "$CALL_TIMEOUT" "$GC" session list --json 2>/dev/null)" || { echo UNKNOWN; return; }
+  [ -z "$json" ] && { echo UNKNOWN; return; }
+  out="$(printf '%s' "$json" | WHO="$1" python3 -c '
+import json, os, sys
+try:
+    sessions = json.load(sys.stdin)["sessions"]
+    assert isinstance(sessions, list)
+except Exception:
+    print("UNKNOWN"); sys.exit(0)
+mine = [s for s in sessions if s.get("name") == os.environ["WHO"]]
+print("HELD" if any(s.get("state") in ("active", "creating") for s in mine) else "RELEASED")
+' 2>/dev/null)" || out=UNKNOWN
+  case "$out" in HELD|RELEASED) echo "$out" ;; *) echo UNKNOWN ;; esac
+}
+
+NUDGES=0; CLOSES=0; RELEASED=0; HELD=0; UNVERIFIED=0; SEEN=""
 NUDGE_MSG="pool-idle-nobead-guard (ga-7nxfa1): no bead is assigned to this session and its pane has been idle for a while. If you have nothing to work on, run gc runtime drain-ack and then exit so the pool slot is released. If you do have work, claim it now (bd update <id> --claim) and continue."
 
 PASS_START="$(date +%s)"   # real clock on purpose (NOW is overridable): the budget bounds wall time
@@ -205,8 +309,15 @@ while IFS='|' read -r name sid alias sname tmpl wdir idle; do
   stf="$SESS_STATE/$name.nudged"
   nudged_at=""
   if [ -f "$stf" ]; then
-    nudged_at="$(cat "$stf" 2>/dev/null)"
-    case "$nudged_at" in ''|*[!0-9]*) nudged_at="" ;; esac
+    # Only "nudged <ts>" (a CONFIRMED nudge) can ever lead to a close. "nudging <ts>" (sent, not confirmed)
+    # and anything unreadable/garbled count as "not nudged yet": the cycle restarts with a nudge, never with
+    # a close the worker was not warned about.
+    st="$(cat "$stf" 2>/dev/null)"
+    case "$st" in
+      "nudged "*) nudged_at="${st#nudged }"; case "$nudged_at" in ''|*[!0-9]*) nudged_at="" ;; esac ;;
+      "nudging "*) ;;
+      *) log "$name: state file $stf is unreadable or garbled ('$st') — treated as not nudged" ;;
+    esac
     # our own state is stale (the session went on to do other things): start the cycle over
     if [ -n "$nudged_at" ] && [ $((NOW - nudged_at)) -gt $((3 * GRACE_SEC)) ]; then forget "$stf"; nudged_at=""; fi
   fi
@@ -231,25 +342,53 @@ while IFS='|' read -r name sid alias sname tmpl wdir idle; do
     if [ "$NUDGES" -ge "$MAX_NUDGES" ]; then log "$name: eligible for nudge but MAX_NUDGES=$MAX_NUDGES reached this pass"; continue; fi
     NUDGES=$((NUDGES + 1))
     if [ "$DRY_RUN" = "1" ]; then log "$name ($tmpl): DRY_RUN would NUDGE — idle ${idle}s, no bead"; continue; fi
-    if timeout "$CALL_TIMEOUT" "$GC" session nudge "$name" "$NUDGE_MSG" >/dev/null 2>&1; then
-      echo "$NOW" > "$stf"; log "$name ($tmpl): NUDGED — idle ${idle}s, no bead assigned, drain requested"
+    # Record the attempt FIRST and nudge only if that write verifiably landed. The other order (nudge, then
+    # `echo > state`) re-sent the same nudge every pass when the state dir was unwritable — one agent turn
+    # per pass — while the log kept saying NUDGED, and stage 2 could never start.
+    if ! write_state "$stf" "nudging $NOW"; then
+      state_err "$name ($tmpl): cannot record state in $SESS_STATE — NOT nudging (an unrecorded nudge would repeat every pass)"
+      continue
+    fi
+    timeout "$CALL_TIMEOUT" "$GC" session nudge "$name" "$NUDGE_MSG" >/dev/null 2>&1; nrc=$?
+    if [ "$nrc" -eq 0 ]; then
+      if write_state "$stf" "nudged $NOW"; then
+        log "$name ($tmpl): NUDGED — idle ${idle}s, no bead assigned, drain requested"
+      else
+        state_err "$name ($tmpl): nudge was DELIVERED but its confirmation could not be recorded — it will be nudged again next pass"
+      fi
     else
-      log "$name ($tmpl): nudge FAILED — will retry next pass"
+      # rc 124 = our timeout cut the call: the nudge may still have been delivered. We do not know, so it
+      # stays "nudging" (= not nudged) and is retried; the worst case is one duplicate nudge.
+      log "$name ($tmpl): nudge NOT CONFIRMED (rc=$nrc; 124 = timed out, may still have been delivered) — will retry next pass"
     fi
   else
     waited=$((NOW - nudged_at))
     if [ "$waited" -lt "$GRACE_SEC" ] || [ "$idle" -lt $((GRACE_SEC / 2)) ]; then
       log "$name: nudged ${waited}s ago, idle ${idle}s — within grace"; continue
     fi
-    if [ "$KILL_ENABLED" != "1" ]; then log "$name: still idle + bead-less ${waited}s after nudge — KILL disabled (POOL_IDLE_KILL=0), no action"; continue; fi
-    if [ "$KILLS" -ge "$MAX_KILLS" ]; then log "$name: eligible for kill but MAX_KILLS=$MAX_KILLS reached this pass"; continue; fi
-    KILLS=$((KILLS + 1))
-    if [ "$DRY_RUN" = "1" ]; then log "$name ($tmpl): DRY_RUN would KILL — ${waited}s after nudge, still idle, no bead"; continue; fi
-    if timeout "$CALL_TIMEOUT" "$GC" session kill "$name" >/dev/null 2>&1; then
-      forget "$stf"; log "$name ($tmpl): KILLED — ${waited}s after nudge, still idle at the prompt with no bead; pool slot released"
-    else
-      log "$name ($tmpl): kill FAILED — will retry next pass"
+    if [ "$CLOSE_ENABLED" != "1" ]; then log "$name: still idle + bead-less ${waited}s after nudge — close stage disabled (POOL_IDLE_CLOSE=0), no action"; continue; fi
+    if [ "$CLOSES" -ge "$MAX_CLOSES" ]; then log "$name: eligible for close but MAX_CLOSES=$MAX_CLOSES reached this pass"; continue; fi
+    CLOSES=$((CLOSES + 1))
+    if [ "$DRY_RUN" = "1" ]; then log "$name ($tmpl): DRY_RUN would CLOSE — ${waited}s after nudge, still idle, no bead"; continue; fi
+    timeout "$CALL_TIMEOUT" "$GC" session close "$name" >/dev/null 2>&1; crc=$?
+    if [ "$crc" -ne 0 ]; then
+      # rc 124 = timed out, the close may have taken effect. State is kept, so the next pass looks again
+      # (and the bead/pane legs are re-checked before anything else is done).
+      log "$name ($tmpl): close NOT CONFIRMED (rc=$crc; 124 = timed out, may still have taken effect) — will look again next pass"
+      continue
     fi
+    # rc 0 only means gc accepted the request. What matters is whether the slot is free, so look.
+    case "$(slot_state "$name")" in
+      RELEASED)
+        RELEASED=$((RELEASED + 1)); forget "$stf"
+        log "$name ($tmpl): CLOSED — ${waited}s after nudge, still idle with no bead; slot RELEASED (verified: no longer active in the session list)" ;;
+      HELD)
+        HELD=$((HELD + 1))
+        log "$name ($tmpl): CLOSE-INEFFECTIVE — gc session close returned 0 but the session is STILL ACTIVE; the pool slot is NOT released. State kept: it will be retried next pass, and this line repeats until something else frees the slot" ;;
+      *)
+        UNVERIFIED=$((UNVERIFIED + 1))
+        log "$name ($tmpl): CLOSE-UNVERIFIED — gc session close returned 0 but the session list could not be re-read; slot release NOT confirmed. State kept; next pass will look again" ;;
+    esac
   fi
 done < "$CAND_FILE"
 
@@ -260,5 +399,5 @@ for f in "$SESS_STATE"/*.nudged; do
   case "$SEEN" in *" $n "*) ;; *) forget "$f" ;; esac
 done
 
-log "=== pass end (nudged=$NUDGES killed=$KILLS) ==="
+log "=== pass end (nudged=$NUDGES closes_attempted=$CLOSES released=$RELEASED still_active=$HELD unverified=$UNVERIFIED state_errors=$STATE_ERRORS skipped_unknown=$NSKIP) ==="
 exit 0

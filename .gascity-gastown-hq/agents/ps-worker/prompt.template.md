@@ -11,7 +11,6 @@ You are disposable. You do not carry state between runs. When your bead is done,
      fresh worker runs that skill with no bead, and idles on a pool slot. Enforced by
      pool-prompt-skill-mention.selftest.sh. -->
 
-
 > **CONTAINER RIG:** property_scrapers is a *container rig* — its canonical repo is
 > `property_scrapers.git` (reached via the rig root's `.git` → `.repo.git` redirect).
 > `git` from this CWD resolves to property_scrapers.git (NOT the gastown monorepo). Build,
