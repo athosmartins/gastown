@@ -3513,6 +3513,10 @@ OUT=$(run_helper_stderr viewer/index.html); RC=$?
 echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   && nok "T94 viewer/index.html must not flag a daemon whose template_folder is ../shared_templates" "AFFECTED=[$(field AFFECTED "$OUT")]" \
   || ok "T94 literal template_folder resolved: same-named viewer/index.html is not a hit"
+# the negative above also holds if the helper emitted nothing at all: pin the dismissal itself
+[ "$(field VERDICT "$OUT")" = "OK" ] && ok "T94 verdict OK" || nok "T94 verdict" "got '$(field VERDICT "$OUT")' out=[$OUT]"
+echo "$OUT" | grep -q 'processo is NOT affected by the changed template' && echo "$OUT" | grep -q 'viewer/index.html' \
+  && ok "T94 the dismissal is logged, naming the set-aside file" || nok "T94 clear log" "$OUT"
 
 SENSITIVE_DAEMONS=""
 new_case t95
@@ -3912,6 +3916,132 @@ echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   && nok "T116 a file OUTSIDE the rig with the same toplevel-relative spelling was read as the daemon's own template" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]" \
   || ok "T116 outside files are different files: processo not affected"
 [ "$V" = "OK" ] && ok "T116 verdict OK" || nok "T116 verdict" "got '$V' out=[$OUT]"
+
+# ════════════════════════════════════════════════════════════════════════════
+# T117-T122 (ga-0bw1ic, gate FAIL 2, reviewer 2): OWN-FILE-CHANGED must not state a
+# by-NAME template guess as fact. The own_hit pass runs for every AFFECTED label,
+# but Step 3's tpl_by_name is only recorded for a label flagged BY THE TEMPLATE
+# ALONE — so a label flagged through an import, whose own-file class was then set
+# by a name-matched template, reported "OWN-FILE-CHANGED ... restart THESE first"
+# with AFFECTED_TEMPLATE_BY_NAME empty: the one field meant to expose the guess was
+# silent. Reviewer's shape: the daemon imports a changed module, its template_folder
+# cannot be read, and the only changed template is a same-named viewer/index.html.
+#   T117  that shape: still OWN (a guess never moves a label into CLOSURE_ONLY) but
+#         listed in OWN_TEMPLATE_BY_NAME, logged, and worded as a guess in REASON
+#   T118  control, default folder (resolvable): the same diff is CLOSURE_ONLY, nothing flagged
+#   T119  control, unresolvable folder AND its own entrypoint .py is in the diff:
+#         OWN is PROVEN by the .py, so the by-name template is not what holds it
+#   T120  control, resolvable folder and its own template changed: OWN by PATH
+#   T121  two entries: a by-name hit on the first must not mark a label whose later
+#         entry is a path hit (same rule as T106, for the own_hit pass)
+#   T122  the field is trimmed to the FINAL GUARDED_OWN: a by-name label that is
+#         restarted instead of guarded is not listed
+# ════════════════════════════════════════════════════════════════════════════
+t117_app() {  # t117_app unresolvable|default  — processo imports lib/shared_helper.py and renders index.html
+  local folder=""
+  [ "$1" = "unresolvable" ] && folder=', template_folder=os.environ["TPL_DIR"]'
+  t91_fixture <<PYEOF
+from lib.shared_helper import helper
+app = Flask(__name__${folder})
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+}
+
+SENSITIVE_DAEMONS="processo"
+new_case t117
+t117_app unresolvable
+OUT=$(run_helper_stderr lib/shared_helper.py viewer/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T117 verdict NEEDS_GUARDED_RESTART" || nok "T117 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T117 still classed OWN (a guess must not move it into the CLOSURE_ONLY bucket the symbol check may downgrade)" \
+  || nok "T117 guarded_own" "GUARDED_OWN=[$(field GUARDED_OWN "$OUT")] CLOSURE_ONLY=[$(field GUARDED_CLOSURE_ONLY "$OUT")]"
+echo "$(field OWN_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T117 ...and listed in OWN_TEMPLATE_BY_NAME (the class rests on a name guess)" \
+  || nok "T117 own_template_by_name" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")] out=[$OUT]"
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" \
+  && ok "T117 AFFECTED_TEMPLATE_BY_NAME stays empty: the label is affected through the import, not through the template alone" \
+  || nok "T117 affected_template_by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+field REASON "$OUT" | grep -q 'OWN-FILE-CHANGED (1)' \
+  && ok "T117 REASON keeps the OWN-FILE-CHANGED sentence" || nok "T117 reason sentence" "$(field REASON "$OUT")"
+field REASON "$OUT" | grep -q 'ONLY a template matched BY FILE NAME.*com.test.processo' \
+  && ok "T117 REASON says the class rests on a template matched BY FILE NAME, naming the label" \
+  || nok "T117 reason qualifier" "$(field REASON "$OUT")"
+echo "$OUT" | grep -q 'com.test.processo is classed OWN-FILE-CHANGED ONLY through a template matched BY NAME' \
+  && ok "T117 the guess is logged" || nok "T117 log" "$OUT"
+echo "$OUT" | grep '^JSON=' | grep -q '"own_template_by_name": \["com.test.processo"\]' \
+  && ok "T117 the trailing JSON carries own_template_by_name" || nok "T117 json" "$(echo "$OUT" | grep '^JSON=')"
+
+SENSITIVE_DAEMONS="processo"
+new_case t118
+t117_app default
+OUT=$(run_helper_stderr lib/shared_helper.py viewer/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T118 verdict NEEDS_GUARDED_RESTART (flagged through the import)" || nok "T118 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_CLOSURE_ONLY "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T118 resolvable folder: viewer/index.html is dismissed by path, the label is CLOSURE_ONLY" \
+  || nok "T118 closure_only" "GUARDED_OWN=[$(field GUARDED_OWN "$OUT")] CLOSURE_ONLY=[$(field GUARDED_CLOSURE_ONLY "$OUT")]"
+field_is_empty GUARDED_OWN "$OUT" && ok "T118 GUARDED_OWN empty" || nok "T118 guarded_own" "[$(field GUARDED_OWN "$OUT")]"
+field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" && ok "T118 OWN_TEMPLATE_BY_NAME empty (line present)" || nok "T118 own_template_by_name" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
+field REASON "$OUT" | grep -q 'BY FILE NAME' && nok "T118 the qualifier must not appear" "$(field REASON "$OUT")" || ok "T118 REASON carries no by-name qualifier"
+
+SENSITIVE_DAEMONS="processo"
+new_case t119
+t117_app unresolvable
+OUT=$(run_helper_stderr processo_lookup/app.py viewer/index.html); RC=$?
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T119 its own entrypoint is in the diff: GUARDED_OWN" || nok "T119 guarded_own" "GUARDED_OWN=[$(field GUARDED_OWN "$OUT")] out=[$OUT]"
+field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" \
+  && ok "T119 OWN is proven by the .py, so it is not reported as resting on the name guess" \
+  || nok "T119 own_template_by_name" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
+field REASON "$OUT" | grep -q 'BY FILE NAME' && nok "T119 the qualifier must not appear" "$(field REASON "$OUT")" || ok "T119 REASON carries no by-name qualifier"
+
+SENSITIVE_DAEMONS="processo"
+new_case t120
+t117_app default
+OUT=$(run_helper_stderr lib/shared_helper.py processo_lookup/templates/index.html); RC=$?
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T120 its own template changed: GUARDED_OWN" || nok "T120 guarded_own" "GUARDED_OWN=[$(field GUARDED_OWN "$OUT")] out=[$OUT]"
+field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" \
+  && ok "T120 matched by PATH, not reported as a name guess" || nok "T120 own_template_by_name" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
+
+SENSITIVE_DAEMONS="processo"
+new_case t121
+t91_default_app            # processo_lookup/app.py: default templates/ folder, path-resolvable
+mkdir -p "$RUNTIME/aa"
+cat > "$RUNTIME/aa/app.py" <<'PYEOF'
+import os
+from flask import Flask, render_template
+app = Flask(__name__, template_folder=os.environ["TPL_DIR"])
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+# ONE label, TWO entrypoints; discovery sorts them, so aa/app.py (by name) is examined BEFORE
+# processo_lookup/app.py (by path): a loop that stops at the first hit would mislabel the class.
+make_plist "$AGENTS" com.test.processo "$RUNTIME/venv/bin/python3" "$RUNTIME/aa/app.py" "$RUNTIME/processo_lookup/app.py"
+OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T121 label is GUARDED_OWN" || nok "T121 guarded_own" "GUARDED_OWN=[$(field GUARDED_OWN "$OUT")] out=[$OUT]"
+field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" \
+  && ok "T121 a path hit on a later entry wins over a by-name hit on an earlier one (own_hit pass)" \
+  || nok "T121 label wrongly reported as by-name only" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
+
+# T122: OWN_TEMPLATE_BY_NAME is reported against the GUARDED_OWN this run FINAL decided,
+# like AFFECTED_TEMPLATE_BY_NAME against AFFECTED. A daemon that is NOT sensitive is
+# restarted instead of guarded: the by-name note was recorded at Step 3 (the log proves
+# it), but the label is not in GUARDED_OWN, so the field must not list it.
+SENSITIVE_DAEMONS=""
+new_case t122
+t117_app unresolvable
+OUT=$(run_helper_stderr lib/shared_helper.py viewer/index.html); RC=$?
+echo "$OUT" | grep -q 'com.test.processo is classed OWN-FILE-CHANGED ONLY through a template matched BY NAME' \
+  && ok "T122 fixture: the by-name own_hit note was recorded at Step 3" || nok "T122 fixture" "$OUT"
+field_is_empty GUARDED_OWN "$OUT" && ok "T122 the label is not guarded (restarted)" || nok "T122 guarded_own" "[$(field GUARDED_OWN "$OUT")] out=[$OUT]"
+field_is_empty OWN_TEMPLATE_BY_NAME "$OUT" \
+  && ok "T122 OWN_TEMPLATE_BY_NAME is trimmed to the final GUARDED_OWN" || nok "T122 own_template_by_name not trimmed" "[$(field OWN_TEMPLATE_BY_NAME "$OUT")]"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

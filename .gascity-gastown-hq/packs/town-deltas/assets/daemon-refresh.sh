@@ -587,8 +587,9 @@
 #      the app's template folder before any blueprint's). A dismissal that
 #      actually set a same-named changed file aside is logged at every place it
 #      can take a label out of AFFECTED (Step 3, the rig-detector cosmetic
-#      check, the ga-0fawwr narrowing window); own_hit's OWN/CLOSURE_ONLY split
-#      only reads the result and logs nothing of its own.
+#      check, the ga-0fawwr narrowing window). own_hit's OWN/CLOSURE_ONLY split
+#      never dismisses anything, but when it keeps OWN on a by-name match alone
+#      it says so (OWN_TEMPLATE_BY_NAME, a log line, a qualifier in REASON).
 #      Anything not proven keeps the old name match — "could not tell" stays
 #      flagged: no or several Flask(...) calls, a computed template_folder,
 #      root_path=, **kwargs, jinja_options=, an assigned app.jinja_loader /
@@ -601,16 +602,24 @@
 #      as a guess ("MAY have changed ... matched by file name only"), never as
 #      fact. Such a label is listed in
 #      AFFECTED_TEMPLATE_BY_NAME with a log line naming the files, so the count
-#      of verdicts resting on a name guess is visible. A python3 failure in the
+#      of verdicts resting on a name guess is visible; a label whose OWN-FILE-
+#      CHANGED class (not its AFFECTED status) rests on that guess is listed in
+#      OWN_TEMPLATE_BY_NAME. A python3 failure in the
 #      matcher is the same third state. Does NOT loosen ga-jkj0: a template the
 #      process cached still needs a restart; only name -> path changed. All
 #      four template call sites (Step 3 affected and own_hit,
 #      rig_detector_cosmetic_only, ga0fawwr_label_hits) share ONE function,
 #      daemon_renders_changed_template(), so they cannot disagree.
 #      Accepted residuals (named so a "clear" is not read as more than it is):
-#      - own_hit (OWN-FILE-CHANGED) is still set for a by-name match, since it
-#        cannot be told apart from a real one; AFFECTED_TEMPLATE_BY_NAME is what
-#        separates them.
+#      - own_hit (OWN-FILE-CHANGED) is still set for a by-name match: a guess must
+#        not move a label into CLOSURE_ONLY, the bucket the symbol-reachability
+#        check may downgrade. It is not silent any more (gate FAIL 2, ga-0bw1ic):
+#        a label whose own_hit rests ONLY on a name-matched template (no
+#        entrypoint .py of its own in the diff, no template matched by path) is
+#        listed in OWN_TEMPLATE_BY_NAME, logged, and worded in REASON as a guess.
+#        This is separate from AFFECTED_TEMPLATE_BY_NAME, which covers only a label
+#        whose whole AFFECTED verdict is the template: Step 3 does not look at a
+#        template once another mechanism (an import, say) has flagged the label.
 #      - "The entrypoint configures no loader" is proven from the entrypoint's own
 #        AST only (same single-hop reach as the render_template match). A loader
 #        swapped in by an IMPORTED module (init_app(app) setting app.jinja_loader),
@@ -727,6 +736,18 @@
 #     its entries: the very file it loads changed. Later stages (narrowing
 #     window, downgrades) decide independently, so a listed label can stay in
 #     AFFECTED for another reason; the list only over-reports, never hides.)
+#   OWN_TEMPLATE_BY_NAME=<labels>   (ga-0bw1ic, header point 22, gate FAIL 2:
+#     always present, even empty. The subset of GUARDED_OWN whose OWN-FILE-CHANGED
+#     class rests ONLY on a changed template matched by file name — no
+#     entrypoint .py of the label is in the diff and no template matched by
+#     path — because the folder/file the daemon loads could not be proven. It is
+#     independent of AFFECTED_TEMPLATE_BY_NAME: a label flagged through an import
+#     is never in that one, yet can be here. A label in GUARDED_OWN and NOT listed
+#     here either has its own entrypoint .py or a template matched by path in the
+#     diff, or is a FORCE_RESTART_LABELS entry (OWN by construction: own_hit is
+#     never evaluated for it, so this field has nothing to say about it). The
+#     class is kept (never moved to CLOSURE_ONLY on a guess); this field and the
+#     REASON qualifier say it is one.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -960,7 +981,7 @@ fi
 
 # ── emit result + exit ────────────────────────────────────────────────────────
 emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
-  local verdict="$1" reason="$2" proof="${3:-not_verified}" tbn="" tbn_l
+  local verdict="$1" reason="$2" proof="${3:-not_verified}" tbn="" tbn_l otbn="" otbn_l
   # ga-0bw1ic (header point 22): AFFECTED_TEMPLATE_BY_NAME is reported as a
   # subset of the AFFECTED this run FINAL decided — a later downgrade (cosmetic,
   # narrowing window) takes a label out of AFFECTED, and it must leave here too.
@@ -968,6 +989,12 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
     case " ${AFFECTED:-} " in *" $tbn_l "*) tbn="$tbn $tbn_l" ;; esac
   done
   tbn="${tbn# }"
+  # Same for OWN_TEMPLATE_BY_NAME, against the GUARDED_OWN this run FINAL
+  # decided: the class is only shown to the operator for a guarded label.
+  for otbn_l in ${OWN_TEMPLATE_BY_NAME:-}; do
+    case " ${GUARDED_OWN:-} " in *" $otbn_l "*) otbn="$otbn $otbn_l" ;; esac
+  done
+  otbn="${otbn# }"
   # gate ga-ax0t9: Step 1b USED TO call emit directly, and emit exits (see the
   # bottom of this function). That foreclosed Step 2 entirely: a deploy that both
   # shipped an uninstalled scheduled-job plist AND changed a SENSITIVE daemon
@@ -1040,6 +1067,10 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # sees such a label flagged can tell "a file this daemon loads changed" (not
   # listed here) from "a same-named file changed and we could not rule it out".
   echo "AFFECTED_TEMPLATE_BY_NAME=$tbn"
+  # ga-0bw1ic (gate FAIL 2): always present, even empty. The labels in
+  # GUARDED_OWN whose OWN-FILE-CHANGED class rests ONLY on a template matched by
+  # file NAME — see the field doc in the header.
+  echo "OWN_TEMPLATE_BY_NAME=$otbn"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -1057,9 +1088,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" "$tbn" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" "$tbn" "$otbn" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu, tbn = sys.argv[1:24]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu, tbn, otbn = sys.argv[1:25]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -1072,6 +1103,7 @@ print("JSON=" + json.dumps({
     "affected_rig_detector": sp(afr_rig), "guarded_rig_detector": sp(gd_rig),
     "rig_detector_used": rdu == "1",
     "affected_template_by_name": sp(tbn),
+    "own_template_by_name": sp(otbn),
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -1101,8 +1133,10 @@ GUARDED_LOCKED_COSMETIC=""
 AFFECTED_RIG_DETECTOR=""; GUARDED_RIG_DETECTOR=""; RIG_DETECTOR_USED=0
 # ga-0bw1ic (header point 22): labels whose AFFECTED status rests only on a
 # template matched by file name (set at Step 3, trimmed to the final AFFECTED
-# in emit()).
-AFFECTED_TEMPLATE_BY_NAME=""
+# in emit()). OWN_TEMPLATE_BY_NAME: labels whose own_hit (OWN-FILE-CHANGED)
+# rests only on such a by-name template (set at Step 3, trimmed to the final
+# GUARDED_OWN in emit()).
+AFFECTED_TEMPLATE_BY_NAME=""; OWN_TEMPLATE_BY_NAME=""
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -2672,18 +2706,34 @@ for label in $DAEMON_LABELS; do
   # branches above — those are exactly-tuned and heavily bug-fixed on their
   # CURRENT shape (ga-dn9ye, ga-q617u, ga-9lsuq0); a fully separate read-only
   # pass here can never perturb them.
-  own_hit=0
+  own_hit=0; own_tpl_by_name=0; own_tpl_by_name_why=""
   for e in $entries; do
     if echo "$CHANGED_PY" | grep -xF "$e" >/dev/null; then own_hit=1; break; fi
     eb="$(basename "$e")"
     if echo "$CHANGED_BASENAMES" | grep -xF "$eb" >/dev/null; then own_hit=1; break; fi
   done
+  # Template pass (ga-0bw1ic gate FAIL 2): only runs when no entrypoint .py of
+  # this label is in the diff, so a by-name hit here is the ONLY thing holding
+  # OWN-FILE-CHANGED up. A guess must not read as fact: it keeps own_hit=1 (a
+  # name match is never moved into the CLOSURE_ONLY bucket the symbol-
+  # reachability check can downgrade) but is remembered, like Step 3's
+  # tpl_by_name, so it can be listed, logged and worded as a guess. Every entry
+  # is consulted until one matches by PATH — a path hit on a later entry
+  # outranks a by-name hit on an earlier one.
   if [ "$own_hit" -eq 0 ] && [ -n "${CHANGED_TEMPLATES//[[:space:]]/}" ]; then
     for e in $entries; do
-      if daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES"; then own_hit=1; break; fi
+      if daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES"; then
+        own_hit=1
+        if [ "$TEMPLATE_HIT_MODE" = "path" ]; then own_tpl_by_name=0; own_tpl_by_name_why=""; break; fi
+        own_tpl_by_name=1; [ -n "$own_tpl_by_name_why" ] || own_tpl_by_name_why="$TEMPLATE_HIT_DETAIL"
+      fi
     done
   fi
   [ "$own_hit" -eq 1 ] && AFFECTED_OWN="$AFFECTED_OWN $label"
+  if [ "$own_tpl_by_name" -eq 1 ]; then
+    OWN_TEMPLATE_BY_NAME="$OWN_TEMPLATE_BY_NAME $label"
+    log "NOTE: $label is classed OWN-FILE-CHANGED ONLY through a template matched BY NAME ($own_tpl_by_name_why) — kept conservatively; it may be a same-named file this daemon never loads (ga-0bw1ic)."
+  fi
 done
 
 AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
@@ -3527,6 +3577,17 @@ elif [ -n "${GUARDED// /}" ]; then
   NGR_RANKED=""
   if [ -n "${GUARDED_OWN// /}" ]; then
     NGR_RANKED="${NGR_RANKED} || OWN-FILE-CHANGED ($(echo "$GUARDED_OWN" | wc -w | tr -d ' ')) -- its own entrypoint/template is in THIS diff, the deployer should have restarted these and didn't, restart THESE first:${GUARDED_OWN}"
+    # ga-0bw1ic (gate FAIL 2): the sentence above reads as fact. For a label whose
+    # OWN class rests only on a template matched by file NAME it is a guess, and
+    # the line must say so — the qualifier is appended, never substituted, so the
+    # sentence every existing reader and test already matches stays as it was.
+    ngr_own_name=""
+    for ngr_l in $GUARDED_OWN; do
+      case " ${OWN_TEMPLATE_BY_NAME:-} " in *" $ngr_l "*) ngr_own_name="$ngr_own_name $ngr_l" ;; esac
+    done
+    if [ -n "${ngr_own_name// /}" ]; then
+      NGR_RANKED="${NGR_RANKED} (of those, ONLY a template matched BY FILE NAME puts these in this group -- a same-named file this daemon may never load, not proof its own file changed; check before treating as own-file-changed:${ngr_own_name})"
+    fi
   fi
   if [ -n "${GUARDED_CLOSURE_ONLY// /}" ]; then
     NGR_RANKED="${NGR_RANKED} || CLOSURE-ONLY ($(echo "$GUARDED_CLOSURE_ONLY" | wc -w | tr -d ' ')) -- only imports something that changed, its own code is untouched (known noise -- verify reachability by hand before restarting):${GUARDED_CLOSURE_ONLY}"
