@@ -172,7 +172,7 @@ esac
 # The first version of this test had no hours unit: a turn past 1 h read as idle (and so did "1h" summaries).
 DUR='([0-9]+h[[:space:]]+)?([0-9]+m[[:space:]]+)?[0-9]+s'
 SPIN_GLYPH='(✻|✽|✳|✶|✢|✺|✹|·|\*)'
-# Same busy test as crew-hang-detector.sh (which still lacks the hours unit — ga-lozfor): a running turn
+# Same busy test as crew-hang-detector.sh (which carries the same hours unit since ga-lozfor): a running turn
 # shows "<Verb>… (<elapsed>" or, on older builds, "esc to interrupt".
 is_active_work() {
   printf '%s' "$1" | grep -E "(…|\.\.\.)[^(]*\\(${DUR}" >/dev/null && return 0
