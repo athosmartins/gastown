@@ -178,13 +178,17 @@ rm -f "$TMP_SESS"
 
 # Is this pane in the active-work state (a turn is running)? The signature is the
 # spinner line: a present-continuous gerund + ellipsis + a parenthesized elapsed
-# timer, e.g. "✳ Gitifying… (15m 49s · ↓ 61.3k tokens)". Idle panes show a
-# past-tense summary ("✻ Cooked for 6s") with no ellipsis/elapsed. "esc to
-# interrupt" is accepted as a belt-and-suspenders active marker. Anything else
-# (idle, waiting-for-input, unclassifiable, empty) returns non-zero -> NOT a
-# candidate -> no action (fail-safe toward inaction).
+# timer, e.g. "✳ Gitifying… (15m 49s · ↓ 61.3k tokens)". The timer is seconds,
+# minutes+seconds, or — once a turn passes 1 h — hours+minutes+seconds, e.g.
+# "✢ Kneading… (1h 31m 47s · ↓ 298.6k tokens)" (ga-lozfor: without the hours group
+# a 1h+ turn was never seen as active work, so a hung one was never reported).
+# Idle panes show a past-tense summary ("✻ Cooked for 6s", "✻ Cooked for 1h 1m 30s")
+# with no ellipsis/parenthesized timer. "esc to interrupt" is accepted as a
+# belt-and-suspenders active marker. Anything else (idle, waiting-for-input,
+# unclassifiable, empty) returns non-zero -> NOT a candidate -> no action
+# (fail-safe toward inaction).
 is_active_work() {
-    printf '%s' "$1" | grep -E '(…|\.\.\.)[^(]*\(([0-9]+m[[:space:]]+)?[0-9]+s' >/dev/null && return 0
+    printf '%s' "$1" | grep -E '(…|\.\.\.)[^(]*\(([0-9]+h[[:space:]]+)?([0-9]+m[[:space:]]+)?[0-9]+s' >/dev/null && return 0
     printf '%s' "$1" | grep 'esc to interrupt' >/dev/null && return 0
     return 1
 }

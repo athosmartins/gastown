@@ -238,6 +238,45 @@ clear_panes; set_pane mila-wa "$IDLE_PANE"
 city="$(fresh_city)"; pass "$city"
 if [ -s "$city/.gc/state/crew-hang-detector.startup" ]; then ok "startup marker written"; else bad "no startup marker"; fi
 
+# ga-lozfor: a turn past 1 h renders its spinner timer WITH an hours unit — "(1h 31m 47s". The detector's timer
+# regex had no hours group, so such a pane was "not active work" and a genuinely hung 1h+ crew turn could never be
+# reported. REAL panes, copied from live sessions on 03/10 (gc session peek), trimmed. Both carry the "❯" prompt box,
+# which is on EVERY pane busy or idle, so it can never be what tells them apart.
+REAL_BUSY_PANE_1H=$'⏺ Re-running the real-data E2E with a fresh oracle · 1m 5s\n  ⎿  (ctrl+b ctrl+b (twice) to run in background)\n\n✢ Kneading… (1h 31m 47s · ↓ 298.6k tokens)\n  ⎿  Tip: Use /clear to start fresh when switching topics and free up context\n\n────────\n❯ \n────────\n  [Sonnet 5.5] ctx: 68.0% (680k/1000k)\n  ⏵⏵ bypass permissions on · 2 shells · ← 1 agent'
+REAL_IDLE_PANE_1H=$'⏺ Status: tudo commitado localmente (c9475d8c0, 2 commits sobre o tip da origin).\n\n✻ Cooked for 1h 1m 30s · done 10:22 AM · 3 shells, 1 monitor still running\n\n────────\n❯ \n────────\n  [Sonnet 5.5] ctx: 38.0% (380k/1000k)'
+
+echo "== test 15: REAL busy pane past 1h (hours unit), frozen past STALE -> nudged =="
+build_fixture "thies-wa|thies-wa|active|false"
+clear_panes; set_pane thies-wa "$REAL_BUSY_PANE_1H"
+city="$(fresh_city)"; : > "$ACTIONS"
+pass "$city"                       # first seen
+backdate "$city" thies-wa 700 2>/dev/null   # (no state file to backdate == the pane was NOT seen as active work)
+: > "$ACTIONS"; pass "$city"
+if grep -qx "nudge thies-wa" "$ACTIONS"; then ok "a frozen 1h+ turn is seen as active work and nudged"; else bad "1h+ turn invisible to hang detection (expected 'nudge thies-wa'), got: [$(cat "$ACTIONS")]"; fi
+
+echo "== test 16: REAL idle pane past 1h ('Cooked for 1h 1m 30s') -> still idle, no action =="
+build_fixture "thies-wa|thies-wa|active|false"
+clear_panes; set_pane thies-wa "$REAL_IDLE_PANE_1H"
+city="$(fresh_city)"; : > "$ACTIONS"
+pass "$city"; backdate "$city" thies-wa 1500 2>/dev/null; : > "$ACTIONS"; pass "$city"
+if [ ! -s "$ACTIONS" ]; then ok "hours unit does not turn a finished-turn summary into active work"; else bad "acted on an idle 1h+ summary pane: $(cat "$ACTIONS")"; fi
+
+echo "== test 17: is_active_work classifies every elapsed-timer shape (seconds / minutes / hours) =="
+# Load the function from the PRODUCTION file (same trick as pipefail-grepq.selftest.sh), never a copy, so this
+# cannot pass against a regex that is not the one the detector runs. Through a file, not $( ): bash 3.2 parsing.
+sed -n '/^is_active_work() {/,/^}/p' "$DETECTOR" > "$WORK/is_active_work.fn"
+if [ -s "$WORK/is_active_work.fn" ]; then
+    . "$WORK/is_active_work.fn"
+    for dur in '45s' '15m 49s' '1h 6m 3s' '2h 0m 3s' '1h 10m 44s' '1h 5s'; do
+        if is_active_work "✢ Kneading… ($dur · ↓ 1.2k tokens)"; then ok "spinner timer '($dur' -> active work"; else bad "spinner timer '($dur' not seen as active work"; fi
+    done
+    if is_active_work "✢ Kneading... (1h 31m 47s · ↓ 1.2k tokens)"; then ok "ASCII '...' ellipsis with an hours timer -> active work"; else bad "ASCII '...' + hours timer not seen as active work"; fi
+    if is_active_work "✻ Cooked for 1h 1m 30s · done 10:22 AM"; then bad "finished-turn summary read as active work"; else ok "finished-turn summary 'Cooked for 1h 1m 30s' -> not active work"; fi
+    if is_active_work "just a quiet prompt (1h 31m 47s)"; then bad "a timer-looking string with no ellipsis read as active work"; else ok "timer without a spinner ellipsis -> not active work"; fi
+else
+    bad "could not extract is_active_work from $DETECTOR"
+fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
