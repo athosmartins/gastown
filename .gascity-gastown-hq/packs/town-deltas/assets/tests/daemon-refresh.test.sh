@@ -3564,7 +3564,10 @@ OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
   DAEMON_BASELINE_OVERRIDES="com.test.adash $SHA_C1" \
   LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
   VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
-  bash "$HELPER" 2>/dev/null); RC=$?
+  bash "$HELPER" 2>&1); RC=$?
+echo "$OUT" | grep -q 'a changed template was set aside (narrowing window)' \
+  && ok "T97 the dismissal is logged at the narrowing window (it is what takes adash out of AFFECTED)" \
+  || nok "T97 clear log" "$OUT"
 echo "$(field AFFECTED "$OUT")" | grep "com.test.adash" >/dev/null \
   && nok "T97 adash is clean since C1 (only b/index.html changed after): must be downgraded out of AFFECTED" "AFFECTED=[$(field AFFECTED "$OUT")]" \
   || ok "T97 narrowing window matches the template by path: same-named b/index.html does not keep adash affected"
@@ -3720,6 +3723,92 @@ echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
 [ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] \
   && ok "T106 a path hit on a later entry wins over a by-name hit on an earlier one" \
   || nok "T106 label wrongly reported as by-name only" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+
+# T107-T111: more ways to leave the default loader, the case-insensitive filesystem, and bash 3.2
+#   T107 app.template_folder = ...   T108 app.jinja_env.loader = ...   T109 jinja_options=
+#   T110 app.jinja_env.loader.searchpath mutated
+#   T111 template_folder="Templates" against a templates/ directory (a case-insensitive
+#        filesystem resolves it to the SAME file: the edit must still be seen)
+#   T112 the script PARSES under the SYSTEM bash (`bash -n`; macOS /bin/bash is 3.2). The
+#        first version of the matcher had its python in a heredoc inside $( ): bash 3.2
+#        pairs quotes inside a command substitution before it honours the heredoc, so the
+#        whole file was a syntax error there while every test (run under a newer bash)
+#        stayed green. This is a PARSE check only: `bash -n` does not re-parse $( ) bodies,
+#        and main already has one construct that bash 3.2 rejects when it RUNS (a `case`
+#        pattern `*)` inside $( ), the AFFECTED_OWN narrowing line) - a separate, older
+#        incompatibility that this check deliberately does not claim to cover.
+SENSITIVE_DAEMONS=""
+new_case t107
+t91_fixture <<'PYEOF'
+app = Flask(__name__)
+app.template_folder = "/srv/other-templates"
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T107 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t108
+t91_fixture <<'PYEOF'
+from jinja2 import ChoiceLoader as CL
+app = Flask(__name__)
+app.jinja_env.loader = CL([app.jinja_loader])
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T108 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t109
+t91_fixture <<'PYEOF'
+app = Flask(__name__, jinja_options={"extensions": ["jinja2.ext.do"]})
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T109 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t110
+t91_fixture <<'PYEOF'
+app = Flask(__name__)
+app.jinja_env.loader.searchpath.insert(0, "/srv/shared-templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+t_by_name_case T110 viewer/index.html
+
+SENSITIVE_DAEMONS=""
+new_case t111
+t91_fixture <<'PYEOF'
+app = Flask(__name__, template_folder="Templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+# does THIS filesystem fold case? (the default APFS/HFS+ volume does; a case-sensitive one cannot stage the case)
+mkdir -p "$CASE_DIR/casefold-probe/probe-dir"
+if [ -d "$CASE_DIR/casefold-probe/PROBE-DIR" ]; then
+  OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
+  echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+    && ok "T111 template_folder=\"Templates\" reaching templates/ on a case-folding filesystem: the edit is seen" \
+    || nok "T111 a case-folded path hid the edit" "AFFECTED=[$(field AFFECTED "$OUT")]"
+  [ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T111 matched as the same FILE (inode), not by name" || nok "T111 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+else
+  # a skip is not a pass: announced, but kept out of the PASS total
+  echo "  skip - T111: this filesystem is case-sensitive, so a case-folded template path cannot be staged here"
+fi
+
+# T112: the system bash must be able to PARSE the script (parse only - see the note above)
+if [ -x /bin/bash ]; then
+  T112_ERR=$(/bin/bash -n "$HELPER" 2>&1) && ok "T112 daemon-refresh.sh parses (bash -n) under /bin/bash ($(/bin/bash -c 'echo ${BASH_VERSION%%(*}'))" \
+    || nok "T112 daemon-refresh.sh does not parse under /bin/bash" "$T112_ERR"
+else
+  echo "  skip - T112: no /bin/bash on this machine"
+fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

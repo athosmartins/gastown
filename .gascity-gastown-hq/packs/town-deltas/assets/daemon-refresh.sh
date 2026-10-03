@@ -576,21 +576,29 @@
 #      render_template("index.html"), from its own processo_lookup/templates/.
 #      Now the name is resolved to the PATH its daemon loads it from — the Flask
 #      app's template_folder (default <entrypoint dir>/templates, or a literal
-#      template_folder=) — and compared with the changed files on REAL paths
-#      (realpath on both sides, so a tracked symlink such as templates ->
-#      ../shared/templates cannot hide an edit made through its real path). A
+#      template_folder=) — and compared with the changed files as FILES, not as
+#      spellings of a path (device+inode when both exist, else real path, else
+#      literal path for a file this deploy deleted), so neither a tracked
+#      symlink such as templates -> ../shared/templates nor a case-insensitive
+#      filesystem ("Templates/" vs "templates/") can hide an edit. A
 #      same-named file elsewhere is dismissed ONLY when all of this is proven:
 #      the resolved file exists at its own real path, did not change, and the
 #      entrypoint configures no loader of its own (Flask's default loader reads
 #      the app's template folder before any blueprint's). A dismissal that
-#      actually set a same-named changed file aside is logged, never silent.
+#      actually set a same-named changed file aside is logged at every place it
+#      can take a label out of AFFECTED (Step 3, the rig-detector cosmetic
+#      check, the ga-0fawwr narrowing window); own_hit's OWN/CLOSURE_ONLY split
+#      only reads the result and logs nothing of its own.
 #      Anything not proven keeps the old name match — "could not tell" stays
 #      flagged: no or several Flask(...) calls, a computed template_folder,
 #      root_path=, **kwargs, jinja_options=, an assigned app.jinja_loader /
-#      template_folder / jinja_env, any jinja2 *Loader class, an entrypoint that
+#      template_folder / jinja_env, jinja_env.loader or .searchpath touched, one
+#      of the jinja2 loader classes in LOADER_CLASSES, an entrypoint that
 #      does not parse or cannot be read, a resolved file not on disk (a
 #      blueprint's loader may serve it) or reachable only through a symlink that
-#      matched no changed file. Such a label is listed in
+#      matched no changed file. The rig-detector cosmetic check words such a hit
+#      as a guess ("MAY have changed ... matched by file name only"), never as
+#      fact. Such a label is listed in
 #      AFFECTED_TEMPLATE_BY_NAME with a log line naming the files, so the count
 #      of verdicts resting on a name guess is visible. A python3 failure in the
 #      matcher is the same third state. Does NOT loosen ga-jkj0: a template the
@@ -1954,38 +1962,44 @@ guard_allows_restart() {
 # that renders "index.html", and a SENSITIVE one held the gate.
 # Three outcomes per rendered name, never collapsed into two:
 #   path  the file the daemon loads is itself changed -> hit, TEMPLATE_HIT_MODE=path.
-#         "Is itself changed" is decided on REAL paths: the resolved file and each
-#         changed file are both realpath()'d, so a tracked symlink (templates ->
-#         ../shared/templates) cannot hide an edit made through its real path.
+#         "Is itself changed" is decided on the file, not the spelling of its
+#         path: device+inode when both exist, else real path, else literal path
+#         (a file this deploy deleted has no inode). So a tracked symlink
+#         (templates -> ../shared/templates) or a case-insensitive filesystem
+#         ("Templates/" vs "templates/") cannot hide an edit.
 #   clear the resolved file exists, sits at its own real path (no symlink in the
 #         way), is NOT changed, and the entrypoint configures no template loader
 #         of its own -> no hit. Only with ALL of that proven is a same-named file
 #         elsewhere irrelevant: Flask's default loader consults the app's own
 #         template folder before any blueprint's. A "clear" that actually
 #         dismissed a same-named changed file is reported in
-#         TEMPLATE_CLEAR_DETAIL, so the dismissal is visible, not silent.
+#         TEMPLATE_CLEAR_DETAIL; the sites where a clear can take a label out of
+#         AFFECTED (Step 3, rig_detector_cosmetic_only, ga0fawwr_label_hits)
+#         each log it.
 #   name  anything else -> keep the old name match, TEMPLATE_HIT_MODE=name: the
 #         folder cannot be read statically (no/many Flask(...) calls, a computed
 #         template_folder, root_path=, **kwargs, a syntax error), a loader is
 #         overridden (app.jinja_loader / template_folder / jinja_env assigned,
-#         jinja_options=, any jinja2 *Loader class used), the resolved file is
+#         jinja_env.loader or .searchpath touched, jinja_options=, or one of the
+#         jinja2 loader classes in LOADER_CLASSES used), the resolved file is
 #         not on disk (a blueprint's loader may serve it) or only reachable
 #         through a symlink that matched no changed file.
 #         "Could not tell" must stay flagged: a stale cached template is the
-#         failure this guards.
+#         failure this guards. A by-name hit is a GUESS: a caller must say so
+#         (TEMPLATE_HIT_DETAIL does), never present it as fact.
 # A python3 failure, or an entrypoint that exists but cannot be read, is the same
 # third state (fail toward flagging), not a miss.
 # On a hit TEMPLATE_HIT_MODE is path|name and TEMPLATE_HIT_DETAIL says which
 # file; both are "" on a miss. Every template call site below goes through
 # here — Step 3's affected/own_hit, rig_detector_cosmetic_only and
 # ga0fawwr_label_hits must never disagree about what "renders it" means.
-TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
-daemon_renders_changed_template() {  # daemon_renders_changed_template <entry-relpath> <changed-templates>
-  local entry="$1" tpls="$2" out rc line mode name path
-  TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
-  [ -n "${tpls//[[:space:]]/}" ] || return 1
-  [ -f "$RUNTIME_DIR/$entry" ] || return 1
-  out="$(CHANGED_TPL_FOR_MATCH="$tpls" python3 - "$RUNTIME_DIR" "$entry" <<'PY' 2>/dev/null
+#
+# The python source lives in a VARIABLE loaded by a top-level `read -d ''`, not in
+# a heredoc inside $( ): macOS /bin/bash 3.2 pairs quotes and parens inside a
+# command substitution BEFORE it honours the heredoc, so the odd quotes in this
+# source ("unexpected EOF while looking for matching `)'") broke parsing there
+# (gate review, ga-0bw1ic attempt 2). `bash -n` under /bin/bash is the check.
+IFS= read -r -d '' TEMPLATE_MATCHER_PY <<'PY'
 import ast, os, re, sys
 
 runtime, entry = sys.argv[1], sys.argv[2]
@@ -2002,9 +2016,19 @@ def real(rel):
     return os.path.realpath(os.path.join(runtime, rel))
 
 
+# A changed file is identified three ways, strongest first: its device+inode when
+# it still exists (immune to symlinks AND to a case-insensitive filesystem that
+# resolves "Templates/" and "templates/" to the same directory), its real path,
+# and its literal path (a file this deploy deleted has no inode to stat).
 changed_real = {}
+changed_inode = {}
 for p in changed:
     changed_real.setdefault(real(p), p)
+    try:
+        st = os.stat(os.path.join(runtime, p))
+        changed_inode.setdefault((st.st_dev, st.st_ino), p)
+    except OSError:
+        pass
 runtime_real = os.path.realpath(runtime)
 try:
     src = open(os.path.join(runtime, entry), encoding="utf-8", errors="replace").read()
@@ -2014,10 +2038,9 @@ names = list(dict.fromkeys(re.findall(r'render_template\(\s*[\'"]([^\'"]+)[\'"]'
 if not names:
     sys.exit(0)
 
-
 LOADER_CLASSES = {"BaseLoader", "FileSystemLoader", "PackageLoader", "DictLoader", "FunctionLoader",
                   "PrefixLoader", "ChoiceLoader", "ModuleLoader"}
-LOADER_ATTRS = {"jinja_loader", "jinja_options"}
+LOADER_ATTRS = {"jinja_loader", "jinja_options", "searchpath"}
 LOADER_STRINGS = {"jinja_loader", "jinja_env", "jinja_options", "template_folder"}  # e.g. setattr(app, "jinja_loader", ...)
 
 
@@ -2027,7 +2050,9 @@ def configures_own_loader(tree):
     for n in ast.walk(tree):
         if isinstance(n, ast.Name) and n.id in LOADER_CLASSES:
             return True
-        if isinstance(n, ast.Attribute) and (n.attr in LOADER_CLASSES or n.attr in LOADER_ATTRS):
+        if isinstance(n, ast.Attribute) and (
+                n.attr in LOADER_CLASSES or n.attr in LOADER_ATTRS
+                or (n.attr == "loader" and isinstance(n.value, ast.Attribute) and n.value.attr == "jinja_env")):
             return True
         if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in LOADER_STRINGS:
             return True
@@ -2035,9 +2060,7 @@ def configures_own_loader(tree):
             return True
         targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
         for t in targets:
-            if isinstance(t, ast.Attribute) and (
-                    t.attr in ("jinja_env", "template_folder")
-                    or (t.attr == "loader" and isinstance(t.value, ast.Attribute) and t.value.attr == "jinja_env")):
+            if isinstance(t, ast.Attribute) and t.attr in ("jinja_env", "template_folder"):
                 return True
     return False
 
@@ -2082,8 +2105,15 @@ for name in names:
         p = os.path.normpath(os.path.join(entry_dir, folder, name))
         if p != ".." and not p.startswith("../"):
             rp = real(p)
-            if p in changed_set or rp in changed_real:
-                hits.append(("path", name, p if p in changed_set else changed_real[rp]))
+            hit = p if p in changed_set else changed_real.get(rp)
+            if hit is None:
+                try:
+                    st = os.stat(rp)
+                    hit = changed_inode.get((st.st_dev, st.st_ino))
+                except OSError:
+                    pass
+            if hit is not None:
+                hits.append(("path", name, hit))
                 continue
             if os.path.isfile(rp) and rp == os.path.join(runtime_real, p):
                 # positively resolved: exists at its own real path (no symlink
@@ -2101,7 +2131,13 @@ for mode in ("path", "name"):
 for c in clears:
     print("\t".join(c))
 PY
-)"
+TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
+daemon_renders_changed_template() {  # daemon_renders_changed_template <entry-relpath> <changed-templates>
+  local entry="$1" tpls="$2" out rc line mode name path
+  TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
+  [ -n "${tpls//[[:space:]]/}" ] || return 1
+  [ -f "$RUNTIME_DIR/$entry" ] || return 1
+  out="$(CHANGED_TPL_FOR_MATCH="$tpls" python3 -c "$TEMPLATE_MATCHER_PY" "$RUNTIME_DIR" "$entry" 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     TEMPLATE_HIT_MODE="name"
@@ -2119,6 +2155,21 @@ PY
     TEMPLATE_HIT_DETAIL="$entry renders \"$name\" and $path changed, but the file this daemon loads could not be pinned down"
   fi
   return 0
+}
+
+# log_template_clear <label> <where> <detail> — say, at most once per (label,
+# detail), that a template "clear" set a same-named changed file aside at a site
+# where that can take <label> out of AFFECTED. Step 3, rig_detector_cosmetic_only
+# and ga0fawwr_label_hits all go through here, so the dismissal reads the same
+# everywhere and is never silent at the place it matters (ga-0bw1ic gate review,
+# attempt 2: it used to be logged at Step 3 only).
+TEMPLATE_CLEAR_LOGGED=""
+log_template_clear() {  # log_template_clear <label> <where> <detail>
+  local key="$1|$3"
+  if printf '%s\n' "$TEMPLATE_CLEAR_LOGGED" | grep -qxF -- "$key"; then return 0; fi
+  TEMPLATE_CLEAR_LOGGED="$TEMPLATE_CLEAR_LOGGED
+$key"
+  log "NOTE: $1 — a changed template was set aside ($2): $3 (ga-0bw1ic)."
 }
 
 # does <file> genuinely IMPORT <stem> — via the file's own AST, not a text
@@ -2633,11 +2684,19 @@ rig_detector_cosmetic_only() {  # rig_detector_cosmetic_only <label> -> 0 ONLY o
   # Step 3's template matcher runs for EVERY entry, covered or not: a changed
   # template it renders is an independent reason the detector's verdict cannot
   # explain away.
+  # A by-name match is a GUESS (the file this daemon loads could not be proven),
+  # and the log must not state it as fact; a path match is.
   if [ -n "${CHANGED_TEMPLATES//[[:space:]]/}" ]; then
     for e in $entries; do
       if daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES"; then
-        RIG_COSMETIC_WHY="a template it renders changed in this deploy"
+        if [ "$TEMPLATE_HIT_MODE" = "path" ]; then
+          RIG_COSMETIC_WHY="a template it renders changed in this deploy ($TEMPLATE_HIT_DETAIL)"
+        else
+          RIG_COSMETIC_WHY="a template it renders MAY have changed in this deploy (matched by file name only: $TEMPLATE_HIT_DETAIL)"
+        fi
         return 1
+      elif [ -n "$TEMPLATE_CLEAR_DETAIL" ]; then
+        log_template_clear "$label" "rig-detector cosmetic check" "$e: $TEMPLATE_CLEAR_DETAIL"
       fi
     done
   fi
@@ -2911,6 +2970,9 @@ PY
   if [ -n "${c_tpls//[[:space:]]/}" ]; then
     for e in $adhoc_entries; do
       daemon_renders_changed_template "$e" "$c_tpls" && return 0
+      if [ -n "$TEMPLATE_CLEAR_DETAIL" ]; then
+        log_template_clear "$label" "narrowing window" "$e: $TEMPLATE_CLEAR_DETAIL"
+      fi
     done
   fi
   return 1

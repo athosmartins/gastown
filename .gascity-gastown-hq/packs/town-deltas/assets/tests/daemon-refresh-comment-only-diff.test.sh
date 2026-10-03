@@ -855,8 +855,43 @@ commit_at "$CHANGE_EPOCH" "comment-only lib + real template"; C1=$(git -C "$RUNT
 premise T25 daemons/central_sender.py
 rsd_run "$C0" "$C1"
 in_list "$CS" "$G" && ok "T25 the label stays flagged when a template it renders changed" || nok "T25 guarded" "[$G] out=[$OUT]"
-log_has "a template it renders changed in this deploy" && ok "T25 the reason is logged" \
+# ga-0bw1ic: this entrypoint has no Flask(...) app, so the daemon is matched to the template by FILE NAME
+# only — a guess. The log must say so, not state "changed" as a fact.
+log_has "a template it renders MAY have changed in this deploy (matched by file name only" && ok "T25 the reason is logged, worded as a name-only guess" \
   || nok "T25 log" "$(grep 'rig-detector' "$CASE_DIR/stderr.log" | tail -3)"
+
+# ── T25b (ga-0bw1ic): same, but the daemon's Flask app resolves the template to a path ──
+#   A path match IS a fact about this daemon: the log states it as one.
+rsd_two_daemons t25b
+printf 'from flask import Flask, render_template\nfrom lib.cosmetic_guard import guard\napp = Flask(__name__)\nrender_template("page.html")\nprint(guard())\n' > "$RUNTIME/daemons/central_sender.py"
+mkdir -p "$RUNTIME/daemons/templates"; echo '<p>v1</p>' > "$RUNTIME/daemons/templates/page.html"
+commit_at $((CHANGE_EPOCH - 7100)) "daemon renders its own template"; C0=$(git -C "$RUNTIME" rev-parse HEAD)
+edit_cosmetic; echo '<p>v2</p>' > "$RUNTIME/daemons/templates/page.html"
+commit_at "$CHANGE_EPOCH" "comment-only lib + the template it loads"; C1=$(git -C "$RUNTIME" rev-parse HEAD)
+premise T25b daemons/central_sender.py
+rsd_run "$C0" "$C1"
+in_list "$CS" "$G" && ok "T25b the label stays flagged when the template it loads changed" || nok "T25b guarded" "[$G] out=[$OUT]"
+log_has "a template it renders changed in this deploy (" && ok "T25b the reason is stated as fact (path match)" \
+  || nok "T25b log" "$(grep 'rig-detector' "$CASE_DIR/stderr.log" | tail -3)"
+log_has "MAY have changed" && nok "T25b a path match must not be worded as a guess" "$(grep 'rig-detector' "$CASE_DIR/stderr.log" | tail -3)" \
+  || ok "T25b ...and not worded as a guess"
+
+# ── T25c (ga-0bw1ic): a SAME-NAMED template elsewhere changed; the one it loads did not ──
+#   The template check must not keep the label flagged, and the dismissal must be
+#   visible HERE (this site can take the label out of AFFECTED), not only at Step 3.
+rsd_two_daemons t25c
+printf 'from flask import Flask, render_template\nfrom lib.cosmetic_guard import guard\napp = Flask(__name__)\nrender_template("page.html")\nprint(guard())\n' > "$RUNTIME/daemons/central_sender.py"
+mkdir -p "$RUNTIME/daemons/templates" "$RUNTIME/templates"
+echo '<p>own</p>' > "$RUNTIME/daemons/templates/page.html"; echo '<p>other v1</p>' > "$RUNTIME/templates/page.html"
+commit_at $((CHANGE_EPOCH - 7100)) "daemon renders its own template"; C0=$(git -C "$RUNTIME" rev-parse HEAD)
+edit_cosmetic; echo '<p>other v2</p>' > "$RUNTIME/templates/page.html"
+commit_at "$CHANGE_EPOCH" "comment-only lib + a same-named template elsewhere"; C1=$(git -C "$RUNTIME" rev-parse HEAD)
+premise T25c daemons/central_sender.py
+rsd_run "$C0" "$C1"
+log_has "a changed template was set aside (rig-detector cosmetic check)" && ok "T25c the dismissal is logged at the cosmetic check" \
+  || nok "T25c log" "$(grep -E 'rig-detector|set aside' "$CASE_DIR/stderr.log" | tail -4)"
+in_list "$CS" "$G" && nok "T25c the same-named template elsewhere must not keep the label flagged" "[$G] out=[$OUT]" \
+  || ok "T25c the label is NOT kept flagged by a same-named template it does not load"
 
 # ── T26: loaded but no live pid -> keep ───────────────────────────────────────
 rsd_two_daemons t26
