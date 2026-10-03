@@ -154,6 +154,12 @@ bump_file() {
 # field <name> <stdout>  →  echoes the value of "name=..." line from helper output
 field() { echo "$2" | grep "^$1=" | head -1 | sed "s/^$1=//"; }
 
+# field_is_empty <name> <stdout>: the "name=" line IS in the output and carries no
+# value. `[ -z "$(field ...)" ]` is ALSO true when the line is missing altogether,
+# so a negative assertion written that way passes vacuously against a helper that
+# never emits the field at all (gate review of ga-0bw1ic: T92/T95/T99/T106/T111).
+field_is_empty() { echo "$2" | grep -qx "$1="; }
+
 # ── fixture builders ──────────────────────────────────────────────────────────
 # epoch→lstart string in the exact format `ps -o lstart=` emits on macOS.
 lstart_of() { date -r "$1" "+%a %b %e %T %Y"; }
@@ -3475,7 +3481,7 @@ V=$(field VERDICT "$OUT")
 echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null && ok "T92 its own templates/index.html marks it affected" || nok "T92 affected" "$(field AFFECTED "$OUT")"
 [ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T92 sensitive daemon is guarded, not auto-bounced" || nok "T92 verdict" "got '$V' out=[$OUT]"
 echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null && ok "T92 classified OWN-FILE-CHANGED (its own template)" || nok "T92 guarded_own" "$(field GUARDED_OWN "$OUT")"
-[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T92 a path match is not reported as a by-name match" || nok "T92 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" && ok "T92 a path match is not reported as a by-name match" || nok "T92 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
 
 SENSITIVE_DAEMONS=""
 new_case t93
@@ -3519,7 +3525,7 @@ PYEOF
 OUT=$(run_helper_stderr shared_templates/index.html); RC=$?
 echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   && ok "T95 the exact file its template_folder points at marks it affected" || nok "T95 affected" "$(field AFFECTED "$OUT")"
-[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T95 matched by path, not by name" || nok "T95 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" && ok "T95 matched by path, not by name" || nok "T95 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
 
 SENSITIVE_DAEMONS=""
 new_case t96
@@ -3633,7 +3639,7 @@ OUT=$(run_helper_stderr shared/templates/index.html); RC=$?
 echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   && ok "T99 an edit through the symlink's real path marks the daemon affected" \
   || nok "T99 a symlinked templates/ hid the edit (silent 'clear')" "AFFECTED=[$(field AFFECTED "$OUT")]"
-[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T99 matched by (real) path, not by name" || nok "T99 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" && ok "T99 matched by (real) path, not by name" || nok "T99 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
 
 SENSITIVE_DAEMONS=""
 new_case t100
@@ -3720,7 +3726,7 @@ make_plist "$AGENTS" com.test.processo "$RUNTIME/venv/bin/python3" "$RUNTIME/aa/
 OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
 echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
   && ok "T106 label affected" || nok "T106 affected" "AFFECTED=[$(field AFFECTED "$OUT")]"
-[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] \
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" \
   && ok "T106 a path hit on a later entry wins over a by-name hit on an earlier one" \
   || nok "T106 label wrongly reported as by-name only" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
 
@@ -3796,7 +3802,7 @@ if [ -d "$CASE_DIR/casefold-probe/PROBE-DIR" ]; then
   echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
     && ok "T111 template_folder=\"Templates\" reaching templates/ on a case-folding filesystem: the edit is seen" \
     || nok "T111 a case-folded path hid the edit" "AFFECTED=[$(field AFFECTED "$OUT")]"
-  [ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T111 matched as the same FILE (inode), not by name" || nok "T111 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+  field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" && ok "T111 matched as the same FILE (inode), not by name" || nok "T111 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
 else
   # a skip is not a pass: announced, but kept out of the PASS total
   echo "  skip - T111: this filesystem is case-sensitive, so a case-folded template path cannot be staged here"
@@ -3809,6 +3815,103 @@ if [ -x /bin/bash ]; then
 else
   echo "  skip - T112: no /bin/bash on this machine"
 fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# T113-T116 (ga-0bw1ic, gate FAIL on 47aa86223): RUNTIME_DIR BELOW the git toplevel.
+# `git diff --name-only` prints paths relative to the git TOPLEVEL; the template
+# matcher resolves everything relative to RUNTIME_DIR. The first version compared
+# the two as if they were the same root, so with RUNTIME_DIR a subdirectory a REAL
+# edit to the daemon's own template found no match, fell into the "clear" branch
+# and was dismissed - the stale-cached-template case ga-jkj0 guards, hidden. That
+# layout is production: rig "gascity" has runtime_dir=.gascity-gastown-hq inside
+# git_repo=/Users/athos/gt. The fix roots the changed paths at RUNTIME_DIR
+# (git rev-parse --show-prefix) and treats "could not read the prefix" as a third
+# state that never clears.
+#   T113  nested: its OWN templates/index.html changed -> affected + OWN, by PATH
+#   T114  nested: only viewer/index.html changed -> NOT affected (the incident,
+#         still resolved below the toplevel), dismissal logged rig-relative
+#   T115  the prefix cannot be read -> no path match and no clear: the name match
+#         is kept, marked BY NAME, and the log says why
+#   T116  nested two levels: a changed file OUTSIDE the rig whose toplevel-relative
+#         spelling equals the daemon's own template path is a different file ->
+#         not affected (and a sibling dir that merely starts with the same letters
+#         is not mistaken for being inside the rig)
+# ════════════════════════════════════════════════════════════════════════════
+nest_runtime() {  # nest_runtime <subdir>  -> RUNTIME becomes <git toplevel>/<subdir> (call right after new_case)
+  TOPLEVEL="$RUNTIME"
+  RUNTIME="$TOPLEVEL/$1"
+  mkdir -p "$RUNTIME/daemons" "$RUNTIME/routes" "$RUNTIME/launchd"
+}
+
+SENSITIVE_DAEMONS="processo"
+new_case t113
+nest_runtime sub
+t91_default_app
+OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+[ "$(git -C "$RUNTIME" rev-parse --show-prefix)" = "sub/" ] && ok "T113 fixture: RUNTIME_DIR sits one level below the git toplevel" || nok "T113 fixture" "prefix=[$(git -C "$RUNTIME" rev-parse --show-prefix)]"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T113 below the toplevel, an edit to the daemon's OWN template marks it affected" \
+  || nok "T113 a real edit to the daemon's own template was dismissed" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T113 sensitive daemon is guarded, not waved through" || nok "T113 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null && ok "T113 classified OWN-FILE-CHANGED" || nok "T113 guarded_own" "$(field GUARDED_OWN "$OUT")"
+field_is_empty AFFECTED_TEMPLATE_BY_NAME "$OUT" && ok "T113 matched by PATH (rooted at RUNTIME_DIR), not by name" || nok "T113 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+echo "$OUT" | grep -q 'is NOT affected by the changed template' && nok "T113 the log claims a dismissal for a file that really changed" "$OUT" || ok "T113 no dismissal is logged for the changed file"
+
+SENSITIVE_DAEMONS="processo"
+new_case t114
+nest_runtime sub
+t91_default_app
+OUT=$(run_helper_stderr viewer/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && nok "T114 below the toplevel, a same-named template elsewhere must not mark the daemon affected" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]" \
+  || ok "T114 viewer/index.html does not mark processo affected (incident still fixed below the toplevel)"
+[ "$V" = "OK" ] && ok "T114 verdict OK" || nok "T114 verdict" "got '$V' (want OK) out=[$OUT]"
+# the dismissal names the file the way the RIG knows it (viewer/index.html), not as git's toplevel-relative sub/viewer/index.html
+echo "$OUT" | grep -q 'same-named changed file(s) viewer/index.html do not apply' \
+  && ok "T114 the dismissal names the changed file rig-relative" || nok "T114 dismissal wording" "$OUT"
+
+SENSITIVE_DAEMONS="processo"
+new_case t115
+nest_runtime sub
+t91_default_app
+T115_REAL_GIT="$(command -v git)"
+mkdir -p "$CASE_DIR/gitshim"
+cat > "$CASE_DIR/gitshim/git" <<GITSHIM
+#!/bin/sh
+# delegates to the real git, except that it cannot say where RUNTIME_DIR sits in its repo
+for a in "\$@"; do
+  if [ "\$a" = "--show-prefix" ]; then echo "fatal: simulated failure" >&2; exit 128; fi
+done
+exec "$T115_REAL_GIT" "\$@"
+GITSHIM
+chmod +x "$CASE_DIR/gitshim/git"
+OUT=$(PATH="$CASE_DIR/gitshim:$PATH" run_helper_stderr viewer/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T115 prefix unreadable: a same-named changed template is NOT dismissed (could not tell = flagged)" \
+  || nok "T115 a clear was issued although the changed paths could not be rooted" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]"
+echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T115 ...and visibly marked as resting on a BY-NAME guess" || nok "T115 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T115 sensitive daemon is guarded" || nok "T115 verdict" "got '$V' out=[$OUT]"
+echo "$OUT" | grep -q 'show-prefix' && ok "T115 the log says WHY (git rev-parse --show-prefix failed)" || nok "T115 the log hides the reason" "$OUT"
+
+SENSITIVE_DAEMONS="processo"
+new_case t116
+nest_runtime rigs/hq
+t91_default_app
+mkdir -p "$TOPLEVEL/rigs/hq2"
+# `rigs/hq2/index.html` shares the string prefix `rigs/hq` with the rig dir but is not inside it
+OUT=$(run_helper_stderr ../../processo_lookup/templates/index.html ../hq2/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+git -C "$TOPLEVEL" diff --name-only HEAD~1 HEAD | grep -qx 'processo_lookup/templates/index.html' \
+  && ok "T116 fixture: git lists the outside file as processo_lookup/templates/index.html (same spelling as the daemon's own path)" \
+  || nok "T116 fixture" "$(git -C "$TOPLEVEL" diff --name-only HEAD~1 HEAD | tr '\n' ' ')"
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && nok "T116 a file OUTSIDE the rig with the same toplevel-relative spelling was read as the daemon's own template" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]" \
+  || ok "T116 outside files are different files: processo not affected"
+[ "$V" = "OK" ] && ok "T116 verdict OK" || nok "T116 verdict" "got '$V' out=[$OUT]"
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""

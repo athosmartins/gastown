@@ -595,8 +595,9 @@
 #      template_folder / jinja_env, jinja_env.loader or .searchpath touched, one
 #      of the jinja2 loader classes in LOADER_CLASSES, an entrypoint that
 #      does not parse or cannot be read, a resolved file not on disk (a
-#      blueprint's loader may serve it) or reachable only through a symlink that
-#      matched no changed file. The rig-detector cosmetic check words such a hit
+#      blueprint's loader may serve it), reachable only through a symlink that
+#      matched no changed file, or a RUNTIME_DIR whose place in its git repo
+#      cannot be read (see the "Changed paths" residual below). The rig-detector cosmetic check words such a hit
 #      as a guess ("MAY have changed ... matched by file name only"), never as
 #      fact. Such a label is listed in
 #      AFFECTED_TEMPLATE_BY_NAME with a log line naming the files, so the count
@@ -616,10 +617,31 @@
 #        through an aliased handle (env = app.jinja_env; env.loader = ...), or by
 #        a loader class bound under another name is invisible: absence of evidence
 #        there is read as a clear.
-#      - Changed paths are repo-relative (git diff --name-only) and are compared
-#        with <entrypoint dir>/<folder>/<name> relative to RUNTIME_DIR, so this
-#        assumes RUNTIME_DIR is the git toplevel - as the rig is today and as the
-#        no_restart_paths / deploy_deps / entrypoint matchers above already assume.
+#      - Changed paths come from git (diff --name-only) relative to the git
+#        TOPLEVEL, while <entrypoint dir>/<folder>/<name> is relative to
+#        RUNTIME_DIR. The first version compared the two as one root, which is
+#        wrong for rig "gascity" (runtime_dir .gascity-gastown-hq inside git_repo
+#        /Users/athos/gt): a real edit to the daemon's own template found no
+#        match and was DISMISSED (gate FAIL on 47aa86223). The matcher now roots
+#        every changed path at RUNTIME_DIR with `git rev-parse --show-prefix`,
+#        asked once per RUNTIME_DIR (template_git_prefix): "" means RUNTIME_DIR is
+#        the toplevel, "sub/" means it sits below it, and a changed file outside
+#        RUNTIME_DIR becomes a ../-path (a different file, never equal to one
+#        inside). If git cannot say, there is no path comparison and no clear: the
+#        name match is kept, marked BY NAME, and the log says why. The .py
+#        entrypoint matchers are unchanged by this bead: they try the exact path
+#        first and fall back to the basename, so below the toplevel they fail
+#        toward flagging; the no_restart_paths and deploy_deps matchers were not
+#        re-examined here.
+#      - git prints a path with non-ASCII characters in its quoted form
+#        ("caf\303\251.html") unless core.quotepath is off, and the
+#        `git diff --name-only` calls that feed $CHANGED use the default. A
+#        changed template with such a name matches nothing, by path or by name,
+#        and is read as unchanged with no log line (measured with a template
+#        named café.html). Not changed by this bead: the fix is
+#        `-c core.quotepath=off` on every call that feeds $CHANGED, which touches
+#        every matcher, not just this one. No tracked template in ~/gt or the
+#        rig repos has a non-ASCII name today (measured 03/10: 154 templates, 0).
 #      - render_template("/abs/x.html") makes os.path.join drop the folder; Flask
 #        does not load absolute names, so this is not a realistic input.
 #      - rig_detector_cosmetic_only looks at this deploy's templates only, as the
@@ -1965,8 +1987,10 @@ guard_allows_restart() {
 }
 
 # does <entry-relpath> render a template that is in <changed-templates> (a
-# newline-separated list of rig-relative paths)? 0 = yes, 1 = no. (ga-0bw1ic,
-# header point 22.) Reads the literal render_template("...") / ('...') first-arg
+# newline-separated list of paths AS GIT PRINTS THEM, i.e. relative to the git
+# TOPLEVEL — not to RUNTIME_DIR, which is a subdirectory of it for rig "gascity";
+# the matcher roots them at RUNTIME_DIR first, see template_git_prefix)? 0 = yes,
+# 1 = no. (ga-0bw1ic, header point 22.) Reads the literal render_template("...") / ('...') first-arg
 # names of the daemon's own entrypoint — same single-hop precision as the
 # import-level .py match below (not its full transitive closure) — and matches
 # each one against the changed files by the PATH the daemon loads it from:
@@ -1998,8 +2022,10 @@ guard_allows_restart() {
 #         overridden (app.jinja_loader / template_folder / jinja_env assigned,
 #         jinja_env.loader or .searchpath touched, jinja_options=, or one of the
 #         jinja2 loader classes in LOADER_CLASSES used), the resolved file is
-#         not on disk (a blueprint's loader may serve it) or only reachable
-#         through a symlink that matched no changed file.
+#         not on disk (a blueprint's loader may serve it), only reachable
+#         through a symlink that matched no changed file, or git could not say
+#         where RUNTIME_DIR sits in its repo (template_git_prefix: unknown), so
+#         the changed paths cannot be rooted and no path comparison means anything.
 #         "Could not tell" must stay flagged: a stale cached template is the
 #         failure this guards. A by-name hit is a GUESS: a caller must say so
 #         (TEMPLATE_HIT_DETAIL does), never present it as fact.
@@ -2019,7 +2045,22 @@ IFS= read -r -d '' TEMPLATE_MATCHER_PY <<'PY'
 import ast, os, re, sys
 
 runtime, entry = sys.argv[1], sys.argv[2]
-changed = [ln for ln in os.environ.get("CHANGED_TPL_FOR_MATCH", "").splitlines() if ln]
+# git prints changed paths relative to the git TOPLEVEL; every comparison below is
+# relative to the runtime dir. The shell passes where the runtime dir sits in its
+# repo ("" at the toplevel, "sub/" below it) so both share one root. A changed
+# file OUTSIDE the runtime dir becomes a ../-path: it still resolves to its real
+# file (a symlink into the rig is seen) and can never equal a path inside the rig.
+prefix = os.environ.get("TPL_GIT_PREFIX", "")
+prefix_unknown = os.environ.get("TPL_GIT_PREFIX_UNKNOWN") == "1"
+
+
+def rooted(p):
+    if not prefix or p.startswith(prefix):
+        return p[len(prefix):]
+    return "../" * prefix.count("/") + p
+
+
+changed = [rooted(ln) for ln in os.environ.get("CHANGED_TPL_FOR_MATCH", "").splitlines() if ln]
 if not changed:
     sys.exit(0)
 changed_set = set(changed)
@@ -2112,7 +2153,10 @@ def template_folder():
     return folder
 
 
-folder = template_folder()
+# Could not root the changed paths (git could not say where the runtime dir sits):
+# no path comparison below means anything, so none is made - not a hit, and above
+# all not a "clear". Every name falls through to the by-name match, which flags.
+folder = None if prefix_unknown else template_folder()
 entry_dir = os.path.dirname(entry)
 hits = []
 clears = []
@@ -2147,13 +2191,41 @@ for mode in ("path", "name"):
 for c in clears:
     print("\t".join(c))
 PY
+# Where RUNTIME_DIR sits inside its git repo, asked once per RUNTIME_DIR. THREE
+# states, never two (gate review of ga-0bw1ic, class error-vs-empty):
+#   ok, ""      RUNTIME_DIR is the git toplevel (git printed an empty prefix)
+#   ok, "sub/"  RUNTIME_DIR is a directory below it. Rig "gascity" is: runtime_dir
+#               .gascity-gastown-hq inside git_repo /Users/athos/gt
+#   unknown     git could not say (not a repo, the command failed, or it printed
+#               something that is not a "dir/" prefix). The changed paths cannot be
+#               rooted, so the matcher makes no path comparison and clears nothing.
+# An empty prefix and a failed lookup both leave TEMPLATE_GIT_PREFIX empty — only
+# TEMPLATE_GIT_PREFIX_STATE tells them apart, which is the point of having it.
+TEMPLATE_GIT_PREFIX=""; TEMPLATE_GIT_PREFIX_STATE=""; TEMPLATE_GIT_PREFIX_FOR=""
+template_git_prefix() {
+  [ -n "$TEMPLATE_GIT_PREFIX_STATE" ] && [ "$TEMPLATE_GIT_PREFIX_FOR" = "$RUNTIME_DIR" ] && return 0
+  local pfx
+  TEMPLATE_GIT_PREFIX_FOR="$RUNTIME_DIR"; TEMPLATE_GIT_PREFIX=""; TEMPLATE_GIT_PREFIX_STATE="unknown"
+  if pfx="$(git -C "$RUNTIME_DIR" rev-parse --show-prefix 2>/dev/null)"; then
+    if [ -z "$pfx" ]; then
+      TEMPLATE_GIT_PREFIX_STATE="ok"
+    elif [ "${pfx%/}" != "$pfx" ] && [ "${pfx#/}" = "$pfx" ]; then
+      TEMPLATE_GIT_PREFIX="$pfx"; TEMPLATE_GIT_PREFIX_STATE="ok"
+    fi
+  fi
+  return 0
+}
+
 TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
 daemon_renders_changed_template() {  # daemon_renders_changed_template <entry-relpath> <changed-templates>
-  local entry="$1" tpls="$2" out rc line mode name path
+  local entry="$1" tpls="$2" out rc line mode name path unk=0 why
   TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""; TEMPLATE_CLEAR_DETAIL=""
   [ -n "${tpls//[[:space:]]/}" ] || return 1
   [ -f "$RUNTIME_DIR/$entry" ] || return 1
-  out="$(CHANGED_TPL_FOR_MATCH="$tpls" python3 -c "$TEMPLATE_MATCHER_PY" "$RUNTIME_DIR" "$entry" 2>/dev/null)"
+  template_git_prefix
+  [ "$TEMPLATE_GIT_PREFIX_STATE" = "ok" ] || unk=1
+  out="$(CHANGED_TPL_FOR_MATCH="$tpls" TPL_GIT_PREFIX="$TEMPLATE_GIT_PREFIX" TPL_GIT_PREFIX_UNKNOWN="$unk" \
+         python3 -c "$TEMPLATE_MATCHER_PY" "$RUNTIME_DIR" "$entry" 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
     TEMPLATE_HIT_MODE="name"
@@ -2168,7 +2240,9 @@ daemon_renders_changed_template() {  # daemon_renders_changed_template <entry-re
   if [ "$mode" = "path" ]; then
     TEMPLATE_HIT_DETAIL="$entry renders \"$name\" from $path, which changed"
   else
-    TEMPLATE_HIT_DETAIL="$entry renders \"$name\" and $path changed, but the file this daemon loads could not be pinned down"
+    why="the file this daemon loads could not be pinned down"
+    [ "$unk" -eq 0 ] || why="git could not say where $RUNTIME_DIR sits in its repo (git rev-parse --show-prefix failed), so the changed paths cannot be compared with the files this daemon loads"
+    TEMPLATE_HIT_DETAIL="$entry renders \"$name\" and $path changed, but $why"
   fi
   return 0
 }
