@@ -781,6 +781,104 @@ mv "$T/bin/gc.orig" "$T/bin/gc"; rm -f "$T/bin/bd"
 if grep -vE '^\s*#' "$PG" | grep -qE 'quality-gate-marker|gate-status|type:quality-gate|label add|comment "'; then bad "the script names gate state (marker/status/label/comment)"; else ok "the script names no gate state (marker / gate-status / label / comment)"; fi
 eq "$(git -C "$T/origin.git" for-each-ref --format='%(refname)' | grep -c 'gate\|marker')" "0" "nothing gate-shaped appeared in the fixture origin"
 
+echo "── 10. THE PROGRAM SWITCH: <city>/.gc/pregate.off ends the A/B (ga-ufskhy.1) ──"
+# With the file, `run` starts no claude and `roster` writes no row; without it nothing changes; a file the script cannot tell
+# present from absent is read as SET (the inert state). Every "nothing" is checked on the artifact — the claude stub's call
+# log and the run log itself — never on what the script says about itself. The stub FAILS the test by being called at all.
+OFFF="$T/city/.gc/pregate.off"
+roster_pg() {   # roster_pg <city> <bead> — stdout is the arm; stderr goes to $T/roster.err; the exit status is roster's
+  ( cd "$T/work" && env PATH="$T/bin:$PATH" PRE_GATE_CITY="$1" PRE_GATE_LOG_DIR="$T/logs" bash "$PG" roster "$2" feat/x 2>"$T/roster.err" )
+}
+log_state() { if [ -e "$T/logs/runs.jsonl" ]; then cksum < "$T/logs/runs.jsonl"; else echo "no-log"; fi; }
+
+# A. the switch is absent: roster records, run launches — the behaviour every earlier section already pins, here beside the set case
+reset_state; rm -f "$OFFF"
+OUT="$(roster_pg "$T/city" "$ON_BEAD")"; rc=$?
+eq "$rc" "0" "switch absent → roster exit 0"; eq "$OUT" "on" "switch absent → roster prints the arm"
+has_str "$(cat "$T/logs/runs.jsonl" 2>/dev/null)" '"event": "assign"' "switch absent → roster writes its row"
+
+# B. the switch is set: an on-arm bead — the one that would have cost ~US\$3
+reset_state; : > "$OFFF"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "0" "switch set → run exits 0 (the builder goes to Step 3)"
+eq "$(field "$L" verdict)" "SKIPPED" "switch set → verdict=SKIPPED"; eq "$(field "$L" reason)" "program-off" "switch set → reason=program-off"
+eq "$(field "$L" arm)" "on" "…and the result line still names the arm the bead has ($ON_BEAD → on)"
+eq "$(ncalls)" "0" "switch set → claude was never launched (an on-arm bead)"
+[ ! -e "$T/logs/runs.jsonl" ] && ok "switch set → NO row of any kind (no assign, no run, no PENDING)" || bad "switch set → run wrote to the log: $(cat "$T/logs/runs.jsonl")"
+[ ! -e "$T/logs/slots" ] && ok "switch set → no concurrency slot was taken" || bad "switch set → a slot directory appeared"
+has_str "$(cat "$T/last.err")" "program is over" "switch set → stderr says the program is over (the builder is told why nothing ran)"
+
+# C. a control-arm bead says program-off, not control-arm, and writes no assign row either
+reset_state
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$OFF_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$(field "$L" reason)" "program-off" "control-arm bead → reason=program-off (not control-arm)"; eq "$(field "$L" arm)" "off" "…arm=off"
+[ ! -e "$T/logs/runs.jsonl" ] && ok "control-arm bead → no assign row after the end" || bad "control-arm bead → the roster grew: $(cat "$T/logs/runs.jsonl")"
+
+# D. manual mode (no --bead), --dry-run and --print-task all stop at the switch; --force does not get past it
+reset_state
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --no-fetch)"; L="$(last_line "$OUT")"
+eq "$(field "$L" verdict)" "SKIPPED" "manual run (no --bead) → SKIPPED"; eq "$(field "$L" arm)" "manual" "…arm=manual"; eq "$(ncalls)" "0" "…no claude"
+OUT="$(run_pg -- run feat/x --bead "$ON_BEAD" --no-fetch --dry-run)"
+eq "$(field "$(last_line "$OUT")" reason)" "program-off" "--dry-run → program-off"; not_str "$OUT" "PREGATE_DRYRUN" "--dry-run prints no PREGATE_DRYRUN line"
+OUT="$(run_pg -- run feat/x --no-fetch --print-task)"
+eq "$(field "$(last_line "$OUT")" reason)" "program-off" "--print-task → program-off"; not_str "$OUT" "QUALITY GATE REVIEW" "--print-task prints no task"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$OFF_BEAD" --no-fetch --force)"; rc=$?
+eq "$(field "$(last_line "$OUT")" reason)" "program-off" "--force does not get past the switch"; eq "$(ncalls)" "0" "…and still launches no claude"
+
+# E. a malformed call is still a malformed call
+run_pg STUB_MODE=pass -- run feat/x --bead "" --no-fetch >/dev/null; eq "$?" "2" "switch set + --bead \"\" → still exit 2"
+run_pg STUB_MODE=pass -- run --no-fetch >/dev/null; eq "$?" "2" "switch set + no <branch> → still exit 2"
+
+# F. roster: no row, no arm, exit 5 — and the history already on the log is left byte-for-byte alone
+reset_state; mkdir -p "$T/logs"; printf '%s\n' '{"arm": "on", "bead": "ga-old", "event": "assign"}' > "$T/logs/runs.jsonl"
+BEFORE="$(log_state)"
+OUT="$(roster_pg "$T/city" "$ON_BEAD")"; rc=$?
+eq "$rc" "5" "switch set → roster exit 5 (no arm assigned, nothing recorded)"; eq "$OUT" "" "…and NO arm on stdout (Step 3 would stamp a pregate:<arm> label on it)"
+has_str "$(cat "$T/roster.err")" "program is over" "…and stderr names the reason"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"
+eq "$(log_state)" "$BEFORE" "run + roster after the end leave the existing log byte-for-byte unchanged (the measurement does not grow)"
+roster_pg "$T/city" "" >/dev/null; eq "$?" "2" "switch set + roster with an empty bead id → still exit 2 (usage)"
+roster_pg "$T/city" "$OFF_BEAD" >/dev/null; eq "$?" "5" "switch set → a control-arm bead is not rostered either (exit 5)"
+
+# G. take the switch away and everything is back — the file is the whole state
+rm -f "$OFFF"; reset_state
+OUT="$(roster_pg "$T/city" "$ON_BEAD")"; rc=$?; eq "$rc" "0" "switch removed → roster exit 0 again"; eq "$OUT" "on" "…and prints the arm again"
+reset_state
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$(field "$L" verdict)" "PASS" "switch removed → an on-arm run reviews again (verdict=PASS)"; eq "$(ncalls)" "1" "…and launches claude"
+
+# H. what counts as "set": any entry at that path, a dangling symlink too
+reset_state; ln -s "$T/does-not-exist" "$OFFF"
+OUT="$(run_pg STUB_MODE=pass -- run feat/x --bead "$ON_BEAD" --no-fetch)"
+eq "$(field "$(last_line "$OUT")" reason)" "program-off" "a dangling symlink at the switch path counts as set"; eq "$(ncalls)" "0" "…no claude"
+rm -f "$OFFF"
+
+# I. "could not look" is not "absent": the inert state wins, with the reason on the line
+CITY_ND="$T/city-notdir"; mkdir -p "$CITY_ND"; : > "$CITY_ND/.gc"          # .gc is a FILE: stat of .gc/pregate.off is ENOTDIR
+reset_state
+OUT="$(run_pg STUB_MODE=pass PRE_GATE_CITY="$CITY_ND" -- run feat/x --bead "$ON_BEAD" --no-fetch)"; rc=$?; L="$(last_line "$OUT")"
+eq "$rc" "0" "switch path unverifiable (ENOTDIR) → run exit 0"; eq "$(field "$L" verdict)" "SKIPPED" "…SKIPPED"
+eq "$(field "$L" reason)" "program-off-unverifiable:not-a-directory" "…with the reason named, distinct from program-off"
+eq "$(ncalls)" "0" "…and no claude"; [ ! -e "$T/logs/runs.jsonl" ] && ok "…and no row" || bad "unverifiable switch → a row was written"
+roster_pg "$CITY_ND" "$ON_BEAD" >/dev/null; eq "$?" "5" "switch path unverifiable → roster exit 5 as well"
+if [ "$(id -u)" != "0" ]; then
+  CITY_NP="$T/city-noperm"; mkdir -p "$CITY_NP/.gc"; chmod 000 "$CITY_NP/.gc"      # EACCES (root ignores mode bits, so not run as root)
+  reset_state
+  OUT="$(run_pg STUB_MODE=pass PRE_GATE_CITY="$CITY_NP" -- run feat/x --bead "$ON_BEAD" --no-fetch)"; L="$(last_line "$OUT")"
+  chmod 755 "$CITY_NP/.gc"
+  eq "$(field "$L" reason)" "program-off-unverifiable:permission-denied" "switch path unverifiable (EACCES) → reason names permission-denied"; eq "$(ncalls)" "0" "…and no claude"
+else
+  echo "  - EACCES case skipped (running as root: mode bits do not stop root)"
+fi
+
+# J. the other direction must hold too: a city with NO .gc at all (stamp selftest layout) is ABSENT — not "could not look"
+mkdir -p "$T/city-nogc"
+OUT="$(PRE_GATE_CITY="$T/city-nogc" pg_program_off)"; rc=$?
+eq "$rc" "1" "city without .gc → switch absent (rc 1)"; eq "$OUT" "" "…and nothing printed"
+OUT="$(PRE_GATE_CITY="$T/city" pg_program_off)"; rc=$?; eq "$rc" "1" "city with .gc but no pregate.off → absent (rc 1)"
+: > "$OFFF"; OUT="$(PRE_GATE_CITY="$T/city" pg_program_off)"; rc=$?
+eq "$rc" "0" "pregate.off present → rc 0"; eq "$OUT" "program-off" "…prints program-off"; rm -f "$OFFF"
+
 echo
 echo "── RESULT: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ]

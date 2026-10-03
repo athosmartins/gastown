@@ -15,9 +15,21 @@
 # on a control-arm bead prints SKIPPED and exits 0 without spending anything. Every assignment and every run is
 # appended to <city>/.gc/logs/pre-gate-review/runs.jsonl for pre-gate-apuracao.py, which reports approval on x off.
 #
+# The program is OVER (ga-ufskhy.1): the apuracao of 2026-10-03 closed it with the criterion NOT met (first-attempt approval on 49%
+# x off 43%, a difference inside chance; cost per approved bead on at least double off). The off-switch is a FILE, <city>/.gc/pregate.off
+# (the city, not PRE_GATE_LOG_DIR: moving the log must not move the switch). While it is there:
+#   `run`    (--dry-run and --print-task included) prints `PREGATE_RESULT arm=<arm> verdict=SKIPPED reason=program-off ...` and exits 0, having
+#            started no claude, taken no slot and written no row — not even the assignment row: the log is the measurement, and after the
+#            end it must not grow.
+#   `roster` writes no row, prints no arm and exits 5 (its stderr says why).
+# An ABSENT file is everything this header describes. A file the script cannot tell present from absent — stat fails with anything but
+# "no such file": permission denied, a path component that is not a directory — counts as SET, reason=program-off-unverifiable:<why>:
+# when the script cannot look, the inert state (spend nothing) is the one it takes. Nothing is deleted: this script, the roster and
+# runs.jsonl stay, because pre-gate-apuracao.py keeps reading the history.
+#
 # THREE outcomes, never two (a check that cannot run must not read as a check that passed):
 #   exit 0   PASS         no blocking defect found IN A DIFF THE REVIEWER SAW WHOLE (coverage=full)
-#                         (also exit 0: SKIPPED — control arm, or the per-bead run cap)
+#                         (also exit 0: SKIPPED — control arm, the per-bead run cap, or the program being over)
 #   exit 10  FAIL         blocking defect(s) — printed; fix, commit, re-run (the cap is PRE_GATE_MAX_RUNS runs per bead).
 #                         A FAIL stands on partial coverage too (a defect found is a defect found); the files the reviewer
 #                         was NOT shown are printed under it.
@@ -55,7 +67,8 @@
 #                                     [--no-fetch] [--dry-run] [--print-task]
 #   pre-gate-review.sh arm <bead-id>          prints "on" or "off" (pure; no side effects)
 #   pre-gate-review.sh roster <bead-id> <branch>   /gate-done Step 3: records the assignment, prints "on" or "off"
-#                                     (exit 0 = printed and recorded; 4 = printed, roster row NOT written; 3 = no arm; 2 = usage)
+#                                     (exit 0 = printed and recorded; 4 = printed, roster row NOT written; 3 = no arm; 2 = usage;
+#                                      5 = the program is over (.gc/pregate.off): nothing printed, nothing recorded)
 # Run it from inside the builder's checkout, with HEAD on the branch under review and a clean tree.
 # The file can also be `source`d (the functions are reused by pre-gate-apuracao.py and the selftest).
 #
@@ -116,6 +129,30 @@ pg_city() {
   (cd "$c" 2>/dev/null && pwd) || printf '%s' "$c"
 }
 pg_log_dir() { printf '%s' "${PRE_GATE_LOG_DIR:-$(pg_city)/.gc/logs/pre-gate-review}"; }
+
+# ── the program switch (ga-ufskhy.1) ──────────────────────────────────────────────────────────────────────────
+pg_off_file() { printf '%s' "$(pg_city)/.gc/pregate.off"; }
+
+# pg_program_off — has the program been ended? THREE answers, because "no file" and "could not look" must not read the same:
+#   returns 0, prints "program-off"                       the switch is there (any kind of entry; a dangling symlink counts)
+#   returns 0, prints "program-off-unverifiable:<why>"    stat failed with something other than "no such file": we cannot tell, and
+#                                                         the answer that spends nothing is the one to give
+#   returns 1, prints nothing                             the entry is absent (ENOENT — which includes a city with no .gc at all)
+# `test -e` cannot tell these apart: it is false for ENOENT and for EACCES / ENOTDIR / EIO alike. Only stat's error text can, and
+# LC_ALL=C pins its wording. A missing `stat` binary lands in the unverifiable branch, never in "absent".
+pg_program_off() {
+  local f err
+  f="$(pg_off_file)"
+  if [ -e "$f" ] || [ -L "$f" ]; then printf 'program-off'; return 0; fi
+  if err="$(LC_ALL=C stat -- "$f" 2>&1 >/dev/null)"; then printf 'program-off'; return 0; fi   # it appeared between the two looks
+  case "$err" in
+    *"No such file or directory"*) return 1 ;;
+    *"Permission denied"*)         printf 'program-off-unverifiable:permission-denied' ;;
+    *"Not a directory"*)           printf 'program-off-unverifiable:not-a-directory' ;;
+    *)                             printf 'program-off-unverifiable:stat-failed' ;;
+  esac
+  return 0
+}
 
 PG_PY=""
 pg_python() {
@@ -552,6 +589,17 @@ pg_run_inner() {
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
 
+  # ── the program switch (ga-ufskhy.1) ──
+  # After the call is validated (a malformed call is still exit 2, switch or not) and BEFORE anything is recorded or spent. The
+  # arm is computed only to be shown on the result line; nothing below this block runs — no assign row, no cap bookkeeping, no
+  # claude. SKIPPED is exit 0, the code the control arm gets, so /gate-done Step 2b reads it as "go to Step 3".
+  local off_reason
+  if off_reason="$(pg_program_off)"; then
+    if [ -n "$bead" ]; then PG_ARM="$(pregate_arm_for_bead "$bead")" || PG_ARM="unknown"; else PG_ARM="manual"; fi
+    pg_log "the pre-gate program is over ($(pg_off_file): $off_reason) — not running, nothing recorded"
+    pg_finish SKIPPED "$off_reason" 0; return $?
+  fi
+
   # ── arm ──
   if [ -n "$bead" ]; then
     local arm_rc
@@ -811,9 +859,18 @@ pg_main() {
       # caller needs: 0 = arm printed AND on the roster; 4 = arm printed but the roster row was NOT written (WARN on
       # stderr; the arm is still printed so the label goes on and the two then disagree, visibly); 2 = usage; 3 = no arm
       # (nothing printed). /gate-done Step 3 leaves this stderr attached and reports every non-zero outcome.
+      # 5 = the program is over (.gc/pregate.off, ga-ufskhy.1): no arm is assigned and no row written, because the roster IS the
+      # measurement and it must not grow after the end. Nothing is printed on purpose: Step 3 stamps a pregate:<arm> label on
+      # whatever arm it is given, and a marker whose bead was never pre-reviewed must not carry one. Step 3 reaches its "anything
+      # else = no arm, no label" branch for 5; the line it prints there says "no arm could be determined" — the stderr line below
+      # carries the real reason.
       shift
-      local rbead="${1:-}" rbranch="${2:-}" rarm rrc rec_rc=0
+      local rbead="${1:-}" rbranch="${2:-}" rarm rrc rec_rc=0 roff_reason
       [ -n "$rbead" ] && [ -n "$rbranch" ] || { pg_log "usage: pre-gate-review.sh roster <bead-id> <branch>"; return 2; }
+      if roff_reason="$(pg_program_off)"; then
+        pg_log "roster: the pre-gate program is over ($(pg_off_file): $roff_reason) — $rbead is NOT put on the roster and gets no arm"
+        return 5
+      fi
       rarm="$(pregate_arm_for_bead "$rbead")"; rrc=$?
       [ "$rrc" -eq 0 ] || return "$rrc"
       pg_record assign bead="$rbead" branch="$rbranch" sha="$(git rev-parse HEAD 2>/dev/null || true)" arm="$rarm" source=gate-done >/dev/null \
