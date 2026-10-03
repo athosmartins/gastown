@@ -17,13 +17,15 @@
 # only because template-fragment-lint-guard.sh now exists and gc lint
 # actually parses fragments before the gate can call tests green.
 #
-# ga-7x28kl added cases 4-12, for the known-artifact list. 4 is the only one
-# that expects exit 0 on a lint failure; 5-12 are the ways that tolerance must
-# NOT apply (a new error beside the known ones, the same message in another
-# file, the same file with another message, unparseable / empty / miscounted
-# / unexplained gc output). 4-7 run the real `gc lint` on a fixture pack;
-# 8-12 use a stub `gc` so the report shape is exact. 12 also covers the
-# stdout/stderr split (a loader warning on stderr must not break parsing).
+# ga-7x28kl added cases 4-14, for the known-artifact list. Cases 4 and 12 are
+# the only ones that expect exit 0 on a lint failure; 5-11, 13 and 14 are the
+# ways that tolerance must NOT apply (a new error beside the known ones, the
+# same message in another file, the same file with another message,
+# unparseable / empty / miscounted / unexplained gc output, jq missing, the
+# same path+message under another pack). 4-7 run the real `gc lint` on a
+# fixture pack; 8-14 use a stub `gc` so the report shape is exact. 12 also
+# covers the stdout/stderr split (a loader warning on stderr must not break
+# parsing).
 #
 # GUARD_UNDER_TEST overrides the guard script, to prove cases 4 and 12 FAIL
 # against the pre-ga-7x28kl guard:
@@ -137,11 +139,11 @@ set -e
 check_exit "historical bug reintroduced -> exit 1" "1" "$EXIT3"
 check_contains "historical bug -> gc lint's own diagnostic surfaces" "$OUT3" 'rig_root.*not defined'
 
-# ── Cases 4-13 (ga-7x28kl): the known-artifact list. ────────────────────
+# ── Cases 4-14 (ga-7x28kl): the known-artifact list. ────────────────────
 if ! command -v jq >/dev/null 2>&1; then
   echo "SKIP: 'jq' not on PATH -- cannot exercise the known-artifact cases (4-13)."
   echo
-  echo "template-fragment-lint-guard.selftest.sh: $PASS passed, $FAIL failed (cases 4-13 SKIPPED)."
+  echo "template-fragment-lint-guard.selftest.sh: $PASS passed, $FAIL failed (cases 4-14 SKIPPED)."
   [ "$FAIL" -eq 0 ]
   exit
 fi
@@ -160,7 +162,7 @@ make_hq_fixture() {
   mkdir -p "$d/.gascity-gastown-hq/agents/gate-reviewer" \
            "$d/.gascity-gastown-hq/agents/refino-gate-reviewer" \
            "$d/internal/templates/messages"
-  printf '[pack]\nname = "fixture-hq"\nschema = 2\n' > "$d/pack.toml"
+  printf '[pack]\nname = "gastown-hq"\nschema = 2\n' > "$d/pack.toml"
   printf '# Gate Reviewer\n\n{{ template "propulsion-dog" . }}\n' \
     > "$d/.gascity-gastown-hq/agents/gate-reviewer/prompt.template.md"
   printf '# Refino Gate Reviewer\n\n{{ template "propulsion-dog" . }}\n' \
@@ -184,7 +186,7 @@ mkdir -p "$WORK/fx5/.gascity-gastown-hq/agents/newbie"
 printf 'prose with {{rig_root}} in it\n' > "$WORK/fx5/.gascity-gastown-hq/agents/newbie/prompt.template.md"
 run_guard "$WORK/fx5" "$CHANGED_PROMPT" ".gascity-gastown-hq/agents/newbie/prompt.template.md"
 check_exit "known four + a new error -> exit 1" "1" "$EXIT"
-check_contains "the new error is flagged NEW, with its file" "$OUT" 'NEW \(not on the known list\): \.gascity-gastown-hq/agents/newbie/prompt\.template\.md'
+check_contains "the new error is flagged NEW, with its file" "$OUT" 'NEW \(not on the known list\): \[gastown-hq\] \.gascity-gastown-hq/agents/newbie/prompt\.template\.md'
 
 # ── Case 6: the SAME message in a file that is not on the list -> exit 1.
 # The list is path-bound on purpose: a new agent prompt that calls a
@@ -194,14 +196,14 @@ mkdir -p "$WORK/fx6/.gascity-gastown-hq/agents/newbie"
 printf '{{ template "propulsion-dog" . }}\n' > "$WORK/fx6/.gascity-gastown-hq/agents/newbie/prompt.template.md"
 run_guard "$WORK/fx6" "$CHANGED_PROMPT" ".gascity-gastown-hq/agents/newbie/prompt.template.md"
 check_exit "known message in an unlisted file -> exit 1" "1" "$EXIT"
-check_contains "unlisted file is flagged NEW" "$OUT" 'NEW \(not on the known list\): \.gascity-gastown-hq/agents/newbie/'
+check_contains "unlisted file is flagged NEW" "$OUT" 'NEW \(not on the known list\): \[gastown-hq\] \.gascity-gastown-hq/agents/newbie/'
 
 # ── Case 7: a listed file, but a DIFFERENT message -> exit 1. ────────────
 make_hq_fixture "$WORK/fx7"
 printf '{{ range .Suggestionz }}\n- {{ . }}\n{{ end }}\n' > "$WORK/fx7/internal/templates/messages/escalation.md.tmpl"
 run_guard "$WORK/fx7" "$CHANGED_PROMPT"
 check_exit "listed file with a different message -> exit 1" "1" "$EXIT"
-check_contains "changed message is flagged NEW" "$OUT" 'NEW \(not on the known list\): internal/templates/messages/escalation\.md\.tmpl'
+check_contains "changed message is flagged NEW" "$OUT" 'NEW \(not on the known list\): \[gastown-hq\] internal/templates/messages/escalation\.md\.tmpl'
 
 # Stub `gc`: prints $STUB_GC_JSON_FILE on stdout, $STUB_GC_STDERR on stderr,
 # exits $STUB_GC_EXIT. Lets cases 8-12 control the report shape exactly.
@@ -216,7 +218,7 @@ STUB
 chmod +x "$WORK/stub/gc"
 
 cat > "$WORK/known4.json" <<'JSON'
-{"schema_version":"2","ok":true,"passed":false,"error_count":4,"packs":[{"path":"/p","name":"p","ok":false,"diagnostics":[
+{"schema_version":"2","ok":true,"passed":false,"error_count":4,"packs":[{"path":"/p","name":"gastown-hq","ok":false,"diagnostics":[
  {"severity":"error","path":"/p/.gascity-gastown-hq/agents/gate-reviewer/prompt.template.md","line":5,"message":"template: prompt:5:12: executing \"prompt\" at <{{template \"propulsion-dog\" .}}>: template \"propulsion-dog\" not defined"},
  {"severity":"error","path":"/p/.gascity-gastown-hq/agents/refino-gate-reviewer/prompt.template.md","line":5,"message":"template: prompt:5:12: executing \"prompt\" at <{{template \"propulsion-dog\" .}}>: template \"propulsion-dog\" not defined"},
  {"severity":"error","path":"/p/internal/templates/messages/escalation.md.tmpl","line":16,"message":"template: prompt:16:9: executing \"prompt\" at <.Suggestions>: range can't iterate over"},
@@ -280,6 +282,14 @@ else
   check_exit "jq missing -> exit 1" "1" "$EXIT"
   check_contains "missing jq is named as the reason" "$OUT" 'not tolerated: jq not on PATH'
 fi
+
+# ── Case 14: the known path + message, reported under a DIFFERENT pack
+# (e.g. the nested town-deltas pack, whose relative paths are its own) ->
+# exit 1. The list is scoped to the pack, not just to a relative path. ───
+jq '.packs[0].name = "town-deltas"' "$WORK/known4.json" > "$WORK/other-pack.json"
+run_stub "$WORK/other-pack.json" 1
+check_exit "known path+message under a different pack -> exit 1" "1" "$EXIT"
+check_contains "other-pack error is flagged NEW, naming the pack" "$OUT" 'NEW \(not on the known list\): \[town-deltas\]'
 
 echo
 echo "template-fragment-lint-guard.selftest.sh: $PASS passed, $FAIL failed."

@@ -80,9 +80,11 @@ fi
 #     .Suggestions / .NextSteps. The lint renders with no data, so the range
 #     has nothing to iterate. No reference to either file was found in this
 #     repo's go/sh/py/toml sources.
-# The list is keyed on (path relative to the pack, message with gc's
-# "template: prompt:LINE:COL:" position prefix stripped), so a line shift is
-# tolerated but a different file or a different message is not. What this
+# The list is keyed on (pack name, path relative to that pack, message with
+# gc's "template: prompt:LINE:COL:" position prefix stripped), so a line shift
+# is tolerated but a different pack, file or message is not. The pack name
+# matters: `gc lint` on the repo root also reports the nested town-deltas
+# pack, whose relative paths are its own. What this
 # does NOT do: it cannot tell a real runtime break of one of these four from
 # the artifact -- e.g. propulsion-dog genuinely disappearing from the system
 # pack still reads as "not defined" here, exactly as it did before this list.
@@ -90,13 +92,13 @@ fi
 # error and must be added here on purpose; that friction is intended.
 KNOWN_LINT_ARTIFACTS_JSON=$(cat <<'JSON'
 [
-  {"rel": ".gascity-gastown-hq/agents/gate-reviewer/prompt.template.md",
+  {"pack": "gastown-hq", "rel": ".gascity-gastown-hq/agents/gate-reviewer/prompt.template.md",
    "msg": "executing \"prompt\" at <{{template \"propulsion-dog\" .}}>: template \"propulsion-dog\" not defined"},
-  {"rel": ".gascity-gastown-hq/agents/refino-gate-reviewer/prompt.template.md",
+  {"pack": "gastown-hq", "rel": ".gascity-gastown-hq/agents/refino-gate-reviewer/prompt.template.md",
    "msg": "executing \"prompt\" at <{{template \"propulsion-dog\" .}}>: template \"propulsion-dog\" not defined"},
-  {"rel": "internal/templates/messages/escalation.md.tmpl",
+  {"pack": "gastown-hq", "rel": "internal/templates/messages/escalation.md.tmpl",
    "msg": "executing \"prompt\" at <.Suggestions>: range can't iterate over"},
-  {"rel": "internal/templates/messages/handoff.md.tmpl",
+  {"pack": "gastown-hq", "rel": "internal/templates/messages/handoff.md.tmpl",
    "msg": "executing \"prompt\" at <.NextSteps>: range can't iterate over"}
 ]
 JSON
@@ -123,9 +125,9 @@ classify_lint_failure() {
       [ (.packs // [])[] as $p
         | ($p.diagnostics // [])[]
         | select(.severity == "error")
-        | {rel: (.path | ltrimstr($p.path + "/")), msg: (.message | norm)} ] as $errs
-      | ($errs | map(. as $e | select($known | any(.rel == $e.rel and .msg == $e.msg)))) as $isknown
-      | ($errs | map(. as $e | select($known | any(.rel == $e.rel and .msg == $e.msg) | not))) as $isnew
+        | {pack: $p.name, rel: (.path | ltrimstr($p.path + "/")), msg: (.message | norm)} ] as $errs
+      | ($errs | map(. as $e | select($known | any(.pack == $e.pack and .rel == $e.rel and .msg == $e.msg)))) as $isknown
+      | ($errs | map(. as $e | select($known | any(.pack == $e.pack and .rel == $e.rel and .msg == $e.msg) | not))) as $isnew
       | { declared: .error_count,
           found: ($errs | length),
           silent_packs: ([ (.packs // [])[] | select(.ok == false)
@@ -140,8 +142,8 @@ classify_lint_failure() {
     return 1
   fi
   CLASSIFY_REPORT=$(printf '%s' "$verdict" | jq -r '
-      (.known[]   | "  tolerated (known lint-context artifact, ga-7x28kl): \(.rel) -- \(.msg)"),
-      (.unknown[] | "  NEW (not on the known list): \(.rel) -- \(.msg)")')
+      (.known[]   | "  tolerated (known lint-context artifact, ga-7x28kl): [\(.pack)] \(.rel) -- \(.msg)"),
+      (.unknown[] | "  NEW (not on the known list): [\(.pack)] \(.rel) -- \(.msg)")')
   if printf '%s' "$verdict" | jq -e '.tolerable' >/dev/null 2>&1; then
     return 0
   fi
