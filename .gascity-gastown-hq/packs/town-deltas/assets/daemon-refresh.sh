@@ -568,6 +568,32 @@
 #      commit per label is not worth it. Not applied to *.sh — a shell "#"
 #      line can be data (heredoc body, multi-line quoted string) and there is
 #      no parser here to tell the two apart.
+#  22. (ga-0bw1ic) Point 3's template match compared FILE NAMES only, and
+#      `index.html` is the most common template name in the rig. MEDIDO 03/10
+#      (wa-5wnpjt.1): a diff touching only viewer/index.html (a static page
+#      served from S3, rendered by no daemon) marked br.urblink.processo
+#      OWN-FILE-CHANGED and held the gate — because processo_lookup/app.py does
+#      render_template("index.html"), from its own processo_lookup/templates/.
+#      Now the name is resolved to the PATH its daemon loads it from — the Flask
+#      app's template_folder (default <entrypoint dir>/templates, or a literal
+#      template_folder=) — and compared with the changed file's rig-relative
+#      path. If the resolved file exists and did not change, a same-named file
+#      elsewhere is irrelevant: the app's own loader serves it first. If the
+#      folder cannot be read statically (no or several Flask(...) calls, a
+#      computed template_folder, root_path=, **kwargs, an entrypoint that does
+#      not parse or cannot be read) or the resolved file is not on disk (a blueprint's loader may
+#      serve it), the old name match is KEPT — "could not tell" stays flagged,
+#      never a silent "not affected" — and the label is listed in
+#      AFFECTED_TEMPLATE_BY_NAME with a log line naming the files, so the count
+#      of verdicts resting on a name guess is visible. A python3 failure in the
+#      matcher is the same third state. Does NOT loosen ga-jkj0: a template the
+#      process cached still needs a restart; only name -> path changed. All
+#      four template call sites (Step 3 affected and own_hit,
+#      rig_detector_cosmetic_only, ga0fawwr_label_hits) share ONE function,
+#      daemon_renders_changed_template(), so they cannot disagree.
+#      Accepted residual: own_hit (OWN-FILE-CHANGED) is still set for a by-name
+#      match, since it cannot be told apart from a real one; AFFECTED_TEMPLATE_
+#      BY_NAME is what separates them.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
@@ -640,6 +666,11 @@
 #     membership), these mark labels whose AFFECTED/GUARDED membership itself
 #     was DECIDED by the rig detector — this layer suppresses false positives,
 #     it does not just describe them.)
+#   AFFECTED_TEMPLATE_BY_NAME=<labels>   (ga-0bw1ic, header point 22: always
+#     present, even empty. The subset of AFFECTED whose ONLY reason is a changed
+#     template matched by file name, because the folder/file the daemon loads
+#     it from could not be resolved. A label NOT listed here and flagged for a
+#     template was matched by path: the very file it loads changed.)
 #   WOULD_RESTART=<labels>   (ga-omfwe: DRY_RUN=1 only — labels that would be
 #     restarted for real; RESTARTED is always empty under DRY_RUN=1, so the
 #     two never collapse into the same string)
@@ -873,7 +904,14 @@ fi
 
 # ── emit result + exit ────────────────────────────────────────────────────────
 emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified — fail closed)
-  local verdict="$1" reason="$2" proof="${3:-not_verified}"
+  local verdict="$1" reason="$2" proof="${3:-not_verified}" tbn="" tbn_l
+  # ga-0bw1ic (header point 22): AFFECTED_TEMPLATE_BY_NAME is reported as a
+  # subset of the AFFECTED this run FINAL decided — a later downgrade (cosmetic,
+  # narrowing window) takes a label out of AFFECTED, and it must leave here too.
+  for tbn_l in ${AFFECTED_TEMPLATE_BY_NAME:-}; do
+    case " ${AFFECTED:-} " in *" $tbn_l "*) tbn="$tbn $tbn_l" ;; esac
+  done
+  tbn="${tbn# }"
   # gate ga-ax0t9: Step 1b USED TO call emit directly, and emit exits (see the
   # bottom of this function). That foreclosed Step 2 entirely: a deploy that both
   # shipped an uninstalled scheduled-job plist AND changed a SENSITIVE daemon
@@ -940,6 +978,12 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "RIG_DETECTOR_USED=${RIG_DETECTOR_USED:-0}"
   echo "AFFECTED_RIG_DETECTOR=${AFFECTED_RIG_DETECTOR:-}"
   echo "GUARDED_RIG_DETECTOR=${GUARDED_RIG_DETECTOR:-}"
+  # ga-0bw1ic (header point 22): always present, even empty. The labels whose
+  # AFFECTED status rests ONLY on a template matched by file NAME, because the
+  # folder/file the daemon loads it from could not be resolved. A reader who
+  # sees such a label flagged can tell "a file this daemon loads changed" (not
+  # listed here) from "a same-named file changed and we could not rule it out".
+  echo "AFFECTED_TEMPLATE_BY_NAME=$tbn"
   echo "ALREADY_FRESH=${ALREADY_FRESH:-}"
   echo "WOULD_RESTART=${WOULD_RESTART:-}"
   # ga-tdzsh: always present (even on the early-precondition emits above,
@@ -957,9 +1001,9 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" "$tbn" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu = sys.argv[1:23]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu, tbn = sys.argv[1:24]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
@@ -971,6 +1015,7 @@ print("JSON=" + json.dumps({
     "guarded_locked_cosmetic": sp(gd_lc),
     "affected_rig_detector": sp(afr_rig), "guarded_rig_detector": sp(gd_rig),
     "rig_detector_used": rdu == "1",
+    "affected_template_by_name": sp(tbn),
     "already_fresh": sp(afr), "would_restart": sp(wr),
     "parse_error_loaded": sp(pel), "parse_error_unloaded": sp(peu),
     "unattributed_job_gap": ujg,
@@ -998,6 +1043,10 @@ GUARDED_LOCKED_COSMETIC=""
 # is built from it at Step 4 via classify_guarded(), same shape as GUARDED_OWN/
 # GUARDED_CLOSURE_ONLY. RIG_DETECTOR_USED is rig-level, set once at Step 3.
 AFFECTED_RIG_DETECTOR=""; GUARDED_RIG_DETECTOR=""; RIG_DETECTOR_USED=0
+# ga-0bw1ic (header point 22): labels whose AFFECTED status rests only on a
+# template matched by file name (set at Step 3, trimmed to the final AFFECTED
+# in emit()).
+AFFECTED_TEMPLATE_BY_NAME=""
 # wa-xokje: subset of AFFECTED that Step 4 below finds has no live PID at all
 # (a scheduled/one-shot job or an already-down daemon) — never kickstarted,
 # never a restart candidate, and — unlike a live daemon — cannot be made
@@ -1756,7 +1805,6 @@ CHANGED_BASENAMES="$(echo "$CHANGED_PY" | while read -r f; do [ -n "$f" ] && bas
 # discovers, so the earlier computation is identical to what this line used
 # to produce itself.
 CHANGED_STEMS="$(echo "$CHANGED_PY_FOR_STEMS" | while read -r f; do [ -n "$f" ] && basename "$f"; done | sed 's/\.py$//' | grep -v '^$' || true)"
-CHANGED_TEMPLATE_BASENAMES="$(echo "$CHANGED_TEMPLATES" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
 
 # is_sensitive <label>
 is_sensitive() {
@@ -1882,22 +1930,124 @@ guard_allows_restart() {
   return 0
 }
 
-# extract literal render_template("...") / render_template('...') first-arg
-# names referenced in a file — same single-hop precision as the import-level
-# .py match below (checks the daemon's own entrypoint, not its full transitive
-# closure).
-daemon_template_names() {  # daemon_template_names <file>
-  local f="$1"
-  [ -f "$f" ] || return 0
-  python3 - "$f" <<'PY' 2>/dev/null
-import re, sys
-try:
-    src = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-except Exception:
+# does <entry-relpath> render a template that is in <changed-templates> (a
+# newline-separated list of rig-relative paths)? 0 = yes, 1 = no. (ga-0bw1ic,
+# header point 22.) Reads the literal render_template("...") / ('...') first-arg
+# names of the daemon's own entrypoint — same single-hop precision as the
+# import-level .py match below (not its full transitive closure) — and matches
+# each one against the changed files by the PATH the daemon loads it from:
+#   Flask(__name__)                  -> <entrypoint dir>/templates/<name>
+#   Flask(__name__, template_folder="<literal>")
+#                                    -> <entrypoint dir>/<literal>/<name>
+# Matching by file NAME alone (the pre-ga-0bw1ic rule) let any changed
+# index.html — the most common template name in the rig — flag every daemon
+# that renders "index.html", and a SENSITIVE one held the gate.
+# Three outcomes per rendered name, never collapsed into two:
+#   path  the resolved file is itself changed          -> hit, TEMPLATE_HIT_MODE=path
+#   clear the resolved file exists and is NOT changed  -> no hit (the app's own
+#         loader serves it first, so a same-named file elsewhere is irrelevant)
+#   name  the folder cannot be read statically (no/many Flask(...) calls, a
+#         computed template_folder, root_path=, **kwargs, a syntax error) or
+#         the resolved file is not on disk (a blueprint's loader may serve it)
+#         -> keep the old name match, TEMPLATE_HIT_MODE=name. "Could not tell"
+#         must stay flagged: a stale cached template is the failure this guards.
+# A python3 failure, or an entrypoint that exists but cannot be read, is the same
+# third state (fail toward flagging), not a miss.
+# On a hit TEMPLATE_HIT_MODE is path|name and TEMPLATE_HIT_DETAIL says which
+# file; both are "" on a miss. Every template call site below goes through
+# here — Step 3's affected/own_hit, rig_detector_cosmetic_only and
+# ga0fawwr_label_hits must never disagree about what "renders it" means.
+TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""
+daemon_renders_changed_template() {  # daemon_renders_changed_template <entry-relpath> <changed-templates>
+  local entry="$1" tpls="$2" out rc line mode name path
+  TEMPLATE_HIT_MODE=""; TEMPLATE_HIT_DETAIL=""
+  [ -n "${tpls//[[:space:]]/}" ] || return 1
+  [ -f "$RUNTIME_DIR/$entry" ] || return 1
+  out="$(CHANGED_TPL_FOR_MATCH="$tpls" python3 - "$RUNTIME_DIR" "$entry" <<'PY' 2>/dev/null
+import ast, os, re, sys
+
+runtime, entry = sys.argv[1], sys.argv[2]
+changed = [ln for ln in os.environ.get("CHANGED_TPL_FOR_MATCH", "").splitlines() if ln]
+if not changed:
     sys.exit(0)
-for m in re.findall(r'render_template\(\s*[\'"]([^\'"]+)[\'"]', src):
-    print(m)
+changed_set = set(changed)
+by_base = {}
+for p in changed:
+    by_base.setdefault(os.path.basename(p), []).append(p)
+try:
+    src = open(os.path.join(runtime, entry), encoding="utf-8", errors="replace").read()
+except Exception:
+    sys.exit(3)  # could not read it: not "renders nothing" — the shell keeps it flagged
+names = list(dict.fromkeys(re.findall(r'render_template\(\s*[\'"]([^\'"]+)[\'"]', src)))
+if not names:
+    sys.exit(0)
+
+
+def template_folder():
+    """Folder (relative to the entrypoint's dir) its Flask app loads templates
+    from, or None when that cannot be pinned down statically."""
+    try:
+        tree = ast.parse(src)
+    except Exception:
+        return None
+    apps = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and (
+        (isinstance(n.func, ast.Name) and n.func.id == "Flask")
+        or (isinstance(n.func, ast.Attribute) and n.func.attr == "Flask"))]
+    if len(apps) != 1:
+        return None
+    call = apps[0]
+    if len(call.args) > 1 or any(k.arg is None or k.arg == "root_path" for k in call.keywords):
+        return None
+    imp = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == "import_name"), None)
+    if not (isinstance(imp, ast.Name) and imp.id == "__name__"):
+        return None
+    folder = "templates"
+    for k in call.keywords:
+        if k.arg == "template_folder":
+            v = k.value
+            if isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value and not os.path.isabs(v.value):
+                folder = v.value
+            else:
+                return None
+    return folder
+
+
+folder = template_folder()
+entry_dir = os.path.dirname(entry)
+hits = []
+for name in names:
+    if folder is not None:
+        p = os.path.normpath(os.path.join(entry_dir, folder, name))
+        if p != ".." and not p.startswith("../"):
+            if p in changed_set:
+                hits.append(("path", name, p))
+                continue
+            if os.path.isfile(os.path.join(runtime, p)):
+                continue
+    for p in by_base.get(os.path.basename(name), []):
+        hits.append(("name", name, p))
+for mode in ("path", "name"):
+    for h in hits:
+        if h[0] == mode:
+            print("\t".join(h))
 PY
+)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    TEMPLATE_HIT_MODE="name"
+    TEMPLATE_HIT_DETAIL="the template matcher failed on $entry (exit $rc), so it is kept as affected"
+    return 0
+  fi
+  [ -n "$out" ] || return 1
+  line="$(printf '%s\n' "$out" | head -1)"
+  IFS=$'\t' read -r mode name path <<< "$line"
+  TEMPLATE_HIT_MODE="$mode"
+  if [ "$mode" = "path" ]; then
+    TEMPLATE_HIT_DETAIL="$entry renders \"$name\" from $path, which changed"
+  else
+    TEMPLATE_HIT_DETAIL="$entry renders \"$name\" and $path changed, but the file this daemon loads could not be pinned down"
+  fi
+  return 0
 }
 
 # does <file> genuinely IMPORT <stem> — via the file's own AST, not a text
@@ -1911,9 +2061,12 @@ PY
 # line with the stem doesn't itself start with import/from. Real AST parsing
 # has neither problem: comments/docstrings/strings are never Import nodes,
 # and multi-line/backslash-continued/aliased forms all parse the same as a
-# single-line one. On a genuine parse failure, exits 1 (not affected) — same
-# fail-soft shape as daemon_template_names() above; every entrypoint here is
-# a live, running production daemon, so in practice it always parses.
+# single-line one. On a genuine parse failure, exits 1 (not affected) — the
+# same fail-soft shape the pre-ga-0bw1ic template matcher had; every
+# entrypoint here is a live, running production daemon, so in practice it
+# always parses. (daemon_renders_changed_template() above deliberately does
+# NOT copy that: for a template an unparsable entrypoint means "could not
+# tell", which stays flagged.)
 #
 # ga-pntex: Step 3 below (and daemon_imports_stem_via_routes() further down,
 # which also calls this) checks this per (daemon, changed-stem) pair — for N
@@ -1925,8 +2078,9 @@ PY
 # process-SPAWN overhead, not computation). Now backed by a cache (below):
 # the AST is parsed ONCE per unique file, and every subsequent stem check
 # against that SAME file is an in-memory `grep -qxF` — zero additional
-# python3 spawns. Mirrors daemon_template_names() above (extract once,
-# membership-check in bash) instead of a fresh subprocess per candidate. The
+# python3 spawns. Same idea as the template matcher above (one python3 per
+# entrypoint, the per-name decision made inside it) instead of a fresh
+# subprocess per candidate. The
 # function's own signature/contract (call with <file> <stem>, get exit 0/1)
 # is unchanged, so every call site benefits without modification.
 IMPORTS_CACHE_DIR="$DISCO_DIR/.imports-cache"
@@ -2257,23 +2411,27 @@ for label in $DAEMON_LABELS; do
   # $entries, not $ad_hoc_entries: deploy_deps.json's "closure" key is
   # import-only (ga-9lsuq0) — template coverage stays on this mechanism
   # regardless of closure coverage (see the header point 14 "assets" note).
-  if [ "$affected" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+  # Matched by the PATH the daemon loads the template from, not by file name
+  # (ga-0bw1ic, header point 22) — see daemon_renders_changed_template(). When
+  # only a by-NAME match could be made, tpl_by_name records that this label's
+  # whole AFFECTED verdict rests on it, so the report can say so.
+  tpl_by_name=0; tpl_by_name_why=""
+  if [ "$affected" -eq 0 ] && [ -n "${CHANGED_TEMPLATES//[[:space:]]/}" ]; then
     for e in $entries; do
-      [ -f "$RUNTIME_DIR/$e" ] || continue
-      while IFS= read -r tmpl; do
-        [ -n "$tmpl" ] || continue
-        tb="$(basename "$tmpl")"
-        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$tb" >/dev/null; then
-          affected=1; break
-        fi
-      done < <(daemon_template_names "$RUNTIME_DIR/$e")
-      [ "$affected" -eq 1 ] && break
+      daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES" || continue
+      affected=1
+      if [ "$TEMPLATE_HIT_MODE" = "name" ]; then tpl_by_name=1; tpl_by_name_why="$TEMPLATE_HIT_DETAIL"; fi
+      break
     done
   fi
 
   [ "$affected" -eq 1 ] || continue
   AFFECTED="$AFFECTED $label"
   log "AFFECTED: $label (entrypoints:$entries)"
+  if [ "$tpl_by_name" -eq 1 ]; then
+    AFFECTED_TEMPLATE_BY_NAME="$AFFECTED_TEMPLATE_BY_NAME $label"
+    log "NOTE: $label is affected ONLY through a template matched BY NAME ($tpl_by_name_why) — kept conservatively; it may be a same-named file this daemon never loads (ga-0bw1ic)."
+  fi
   # (ga-abofl6, header point 20) did the rig's own detector decide THIS
   # label's affected=1, for at least one of its entries? Independent of
   # own_hit below (own_hit asks "is the entrypoint's OWN file in the diff",
@@ -2287,7 +2445,7 @@ for label in $DAEMON_LABELS; do
   # specifically — not a transitively-imported sibling module — is itself in
   # the changed set. A SECOND, fully independent pass over $entries (not
   # $ad_hoc_entries — a JSON-covered entry's own file counts too) against
-  # $CHANGED_PY/$CHANGED_BASENAMES/$CHANGED_TEMPLATE_BASENAMES directly,
+  # $CHANGED_PY/$CHANGED_BASENAMES/$CHANGED_TEMPLATES directly,
   # deliberately NOT threaded through the five short-circuited affected=1
   # branches above — those are exactly-tuned and heavily bug-fixed on their
   # CURRENT shape (ga-dn9ye, ga-q617u, ga-9lsuq0); a fully separate read-only
@@ -2298,17 +2456,9 @@ for label in $DAEMON_LABELS; do
     eb="$(basename "$e")"
     if echo "$CHANGED_BASENAMES" | grep -xF "$eb" >/dev/null; then own_hit=1; break; fi
   done
-  if [ "$own_hit" -eq 0 ] && [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+  if [ "$own_hit" -eq 0 ] && [ -n "${CHANGED_TEMPLATES//[[:space:]]/}" ]; then
     for e in $entries; do
-      [ -f "$RUNTIME_DIR/$e" ] || continue
-      while IFS= read -r tmpl; do
-        [ -n "$tmpl" ] || continue
-        tb="$(basename "$tmpl")"
-        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$tb" >/dev/null; then
-          own_hit=1; break
-        fi
-      done < <(daemon_template_names "$RUNTIME_DIR/$e")
-      [ "$own_hit" -eq 1 ] && break
+      if daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES"; then own_hit=1; break; fi
     done
   fi
   [ "$own_hit" -eq 1 ] && AFFECTED_OWN="$AFFECTED_OWN $label"
@@ -2389,7 +2539,7 @@ AFFECTED="$(echo "$AFFECTED" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' 
 # restarts here); FORCE_RESTART_LABELS is never reconsidered.
 RIG_COSMETIC_WHY=""
 rig_detector_cosmetic_only() {  # rig_detector_cosmetic_only <label> -> 0 ONLY on positive proof
-  local label="$1" entries e tmpl pid start base raw rel cls first
+  local label="$1" entries e pid start base raw rel cls first
   RIG_COSMETIC_WHY=""
   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
   if [ -z "${entries// /}" ]; then RIG_COSMETIC_WHY="its entrypoints could not be read"; return 1; fi
@@ -2402,16 +2552,12 @@ rig_detector_cosmetic_only() {  # rig_detector_cosmetic_only <label> -> 0 ONLY o
   # Step 3's template matcher runs for EVERY entry, covered or not: a changed
   # template it renders is an independent reason the detector's verdict cannot
   # explain away.
-  if [ -n "${CHANGED_TEMPLATE_BASENAMES// /}" ]; then
+  if [ -n "${CHANGED_TEMPLATES//[[:space:]]/}" ]; then
     for e in $entries; do
-      [ -f "$RUNTIME_DIR/$e" ] || continue
-      while IFS= read -r tmpl; do
-        [ -n "$tmpl" ] || continue
-        if echo "$CHANGED_TEMPLATE_BASENAMES" | grep -xF "$(basename "$tmpl")" >/dev/null; then
-          RIG_COSMETIC_WHY="a template it renders changed in this deploy"
-          return 1
-        fi
-      done < <(daemon_template_names "$RUNTIME_DIR/$e")
+      if daemon_renders_changed_template "$e" "$CHANGED_TEMPLATES"; then
+        RIG_COSMETIC_WHY="a template it renders changed in this deploy"
+        return 1
+      fi
     done
   fi
   pid="$(daemon_pid "$label")"
@@ -2600,7 +2746,7 @@ ga0fawwr_narrow_changed() {  # ga0fawwr_narrow_changed <sha> -> prints multiline
 # smaller implementation is the lower-risk choice over threading a second
 # changed-set through the shared one.
 ga0fawwr_label_hits() {  # ga0fawwr_label_hits <label> <changed-multiline> -> 0 if still affected
-  local label="$1" changed="$2" e eb stem tmpl tb pat covered=0
+  local label="$1" changed="$2" e eb stem pat covered=0
   local entries json_entries="" adhoc_entries=""
   entries="$(cat "$DISCO_DIR/$label" 2>/dev/null || true)"
   # third-state: an entries file we can't read/find here is "don't know",
@@ -2652,9 +2798,9 @@ PY
   fi
   [ -n "${adhoc_entries// /}" ] || return 1
 
-  local c_py c_stems="" c_tpl_basenames py_basenames
+  local c_py c_stems="" c_tpls py_basenames
   c_py="$(echo "$changed" | grep -E '\.py$' || true)"
-  c_tpl_basenames="$(echo "$changed" | grep -E '\.(html|htm|jinja2?|j2)$' | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
+  c_tpls="$(echo "$changed" | grep -E '\.(html|htm|jinja2?|j2)$' || true)"
   py_basenames="$(echo "$c_py" | while read -r f; do [ -n "$f" ] && basename "$f"; done)"
   # tests/**, docs/**, *.md never contribute a stem — same universal claim
   # DEFAULT_NO_RESTART_PATTERNS already establishes for the wide computation.
@@ -2681,14 +2827,9 @@ PY
       daemon_imports_stem_via_routes "$e" "$stem" && return 0
     done
   done
-  if [ -n "${c_tpl_basenames// /}" ]; then
+  if [ -n "${c_tpls//[[:space:]]/}" ]; then
     for e in $adhoc_entries; do
-      [ -f "$RUNTIME_DIR/$e" ] || continue
-      while IFS= read -r tmpl; do
-        [ -n "$tmpl" ] || continue
-        tb="$(basename "$tmpl")"
-        echo "$c_tpl_basenames" | grep -xF "$tb" >/dev/null && return 0
-      done < <(daemon_template_names "$RUNTIME_DIR/$e")
+      daemon_renders_changed_template "$e" "$c_tpls" && return 0
     done
   fi
   return 1

@@ -3412,6 +3412,187 @@ echo "$(field GUARDED_SYMBOL_CONFIRMED "$OUT")" | grep "com.test.central-sender"
 [ -z "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")" ] && ok "T90 GUARDED_SYMBOL_NOT_COMPUTED empty" || nok "T90 guarded_symbol_not_computed" "$(field GUARDED_SYMBOL_NOT_COMPUTED "$OUT")"
 [ "$(ls "$T90_TMP" | wc -l | tr -d ' ')" = "1" ] && ok "T90 the helper leaves no new temp file behind in \$TMPDIR" || nok "T90 tmpdir litter" "$(ls "$T90_TMP")"
 
+# ════════════════════════════════════════════════════════════════════════════
+# T91-T97 (ga-0bw1ic): a template is matched by the PATH its daemon loads it
+# from, not by its file name. MEDIDO 03/10 (wa-5wnpjt.1): a diff that touched
+# only viewer/index.html (a static S3 page no daemon renders) marked
+# br.urblink.processo OWN-FILE-CHANGED and held the gate, because
+# processo_lookup/app.py does render_template("index.html") and `index.html` is
+# the most common template name in the rig. The Flask app resolves that name
+# against <entrypoint dir>/templates (or its literal template_folder=), so only
+# a change to THAT file can be stale in the process.
+#   T91  the incident: only viewer/index.html changed -> daemon NOT affected
+#   T92  control: its own templates/index.html changed -> affected + OWN
+#   T93  template_folder not statically readable -> still affected (never a
+#        silent "not affected"), and visibly marked as a BY-NAME match
+#   T94  literal template_folder="../shared_templates": a same-named file
+#        elsewhere does not flag it
+#   T95  ...and a change to that exact file does, by path (not by name)
+#   T96  the resolved file does not exist (served by a blueprint/other loader)
+#        -> cannot be pinned down, so the name match is kept and marked
+#   T97  the per-label narrowing window (ga0fawwr_label_hits) resolves the
+#        template the same way: a stale label is downgraded when only a
+#        same-named file elsewhere changed since its last clean point
+# ════════════════════════════════════════════════════════════════════════════
+t91_fixture() {  # t91_fixture <app.py body after the imports>  (viewer + processo both ship an index.html)
+  mkdir -p "$RUNTIME/processo_lookup/templates" "$RUNTIME/viewer" "$RUNTIME/shared_templates"
+  { echo 'import os'; echo 'from flask import Flask, render_template'; cat; } > "$RUNTIME/processo_lookup/app.py"
+  echo '<p>processo</p>' > "$RUNTIME/processo_lookup/templates/index.html"
+  echo '<p>viewer</p>' > "$RUNTIME/viewer/index.html"
+  echo '<p>shared</p>' > "$RUNTIME/shared_templates/index.html"
+  make_plist "$AGENTS" com.test.processo "$RUNTIME/venv/bin/python3" "$RUNTIME/processo_lookup/app.py"
+  seed_running com.test.processo 91001 "$STALE_LSTART"
+  seed_restart com.test.processo 91099 "$FRESH_LSTART"
+}
+t91_default_app() {
+  t91_fixture <<'PYEOF'
+app = Flask(__name__)
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+}
+
+SENSITIVE_DAEMONS="processo"
+new_case t91
+t91_default_app
+OUT=$(run_helper_stderr viewer/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && nok "T91 a same-named template elsewhere must not mark the daemon affected" "AFFECTED=[$(field AFFECTED "$OUT")] out=[$OUT]" \
+  || ok "T91 viewer/index.html does not mark processo (renders processo_lookup/templates/index.html) affected"
+[ "$V" = "OK" ] && ok "T91 verdict OK (gate not held by a template the daemon never loads)" || nok "T91 verdict" "got '$V' (want OK, not NEEDS_GUARDED_RESTART) out=[$OUT]"
+[ -z "$(field GUARDED "$OUT")" ] && ok "T91 GUARDED empty" || nok "T91 guarded" "$(field GUARDED "$OUT")"
+
+SENSITIVE_DAEMONS="processo"
+new_case t92
+t91_default_app
+OUT=$(run_helper_stderr processo_lookup/templates/index.html); RC=$?
+V=$(field VERDICT "$OUT")
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null && ok "T92 its own templates/index.html marks it affected" || nok "T92 affected" "$(field AFFECTED "$OUT")"
+[ "$V" = "NEEDS_GUARDED_RESTART" ] && ok "T92 sensitive daemon is guarded, not auto-bounced" || nok "T92 verdict" "got '$V' out=[$OUT]"
+echo "$(field GUARDED_OWN "$OUT")" | grep "com.test.processo" >/dev/null && ok "T92 classified OWN-FILE-CHANGED (its own template)" || nok "T92 guarded_own" "$(field GUARDED_OWN "$OUT")"
+[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T92 a path match is not reported as a by-name match" || nok "T92 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+
+SENSITIVE_DAEMONS=""
+new_case t93
+t91_fixture <<'PYEOF'
+app = Flask(__name__, template_folder=os.environ["TPL_DIR"])
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+OUT=$(run_helper_stderr viewer/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T93 template_folder unreadable -> kept affected (never a silent 'not affected')" \
+  || nok "T93 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T93 the label is listed in AFFECTED_TEMPLATE_BY_NAME" || nok "T93 by_name field" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+echo "$OUT" | grep -q "BY NAME" && ok "T93 the log says the match is by name only" || nok "T93 log" "$OUT"
+echo "$OUT" | grep '^JSON=' | grep -q '"affected_template_by_name": \["com.test.processo"\]' \
+  && ok "T93 the trailing JSON carries affected_template_by_name" || nok "T93 json" "$(echo "$OUT" | grep '^JSON=')"
+
+SENSITIVE_DAEMONS=""
+new_case t94
+t91_fixture <<'PYEOF'
+app = Flask(__name__, template_folder="../shared_templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+OUT=$(run_helper_stderr viewer/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && nok "T94 viewer/index.html must not flag a daemon whose template_folder is ../shared_templates" "AFFECTED=[$(field AFFECTED "$OUT")]" \
+  || ok "T94 literal template_folder resolved: same-named viewer/index.html is not a hit"
+
+SENSITIVE_DAEMONS=""
+new_case t95
+t91_fixture <<'PYEOF'
+app = Flask(__name__, template_folder="../shared_templates")
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+OUT=$(run_helper_stderr shared_templates/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T95 the exact file its template_folder points at marks it affected" || nok "T95 affected" "$(field AFFECTED "$OUT")"
+[ -z "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" ] && ok "T95 matched by path, not by name" || nok "T95 by_name" "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")"
+
+SENSITIVE_DAEMONS=""
+new_case t96
+t91_default_app
+# the default <entry dir>/templates/index.html is gone: the template is served
+# by a loader this script cannot see (e.g. a blueprint's own template_folder)
+rm -f "$RUNTIME/processo_lookup/templates/index.html"
+mkdir -p "$RUNTIME/processo_lookup/bp/templates"; echo '<p>bp</p>' > "$RUNTIME/processo_lookup/bp/templates/index.html"
+OUT=$(run_helper_stderr processo_lookup/bp/templates/index.html); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T96 unresolvable template file -> name match kept (no false negative)" || nok "T96 affected" "$(field AFFECTED "$OUT")"
+echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+  && ok "T96 ...and marked as a by-name match" || nok "T96 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+
+SENSITIVE_DAEMONS=""
+new_case t97
+mkdir -p "$RUNTIME/a/templates" "$RUNTIME/b"
+cat > "$RUNTIME/a/app.py" <<'PYEOF'
+from flask import Flask, render_template
+app = Flask(__name__)
+@app.route("/")
+def index():
+    return render_template("index.html")
+PYEOF
+echo '<p>a v1</p>' > "$RUNTIME/a/templates/index.html"
+echo '<p>b v1</p>' > "$RUNTIME/b/index.html"
+make_plist "$AGENTS" com.test.adash "$RUNTIME/venv/bin/python3" "$RUNTIME/a/app.py"
+seed_running com.test.adash 97001 "$STALE_LSTART"
+seed_restart com.test.adash 97099 "$FRESH_LSTART"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t97-base --allow-empty )
+SHA_C0=$(git -C "$RUNTIME" rev-parse HEAD)
+echo '<p>a v2</p>' > "$RUNTIME/a/templates/index.html"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && git commit -q -m t97-c1 --allow-empty )
+SHA_C1=$(git -C "$RUNTIME" rev-parse HEAD)
+echo '<p>b v2</p>' > "$RUNTIME/b/index.html"
+( cd "$RUNTIME" && git add -A >/dev/null 2>&1 && GIT_AUTHOR_DATE="@$POST_COMMIT_EPOCH" GIT_COMMITTER_DATE="@$POST_COMMIT_EPOCH" git commit -q -m t97-c2 --allow-empty )
+SHA_C2=$(git -C "$RUNTIME" rev-parse HEAD)
+OUT=$(MOCK_DIR="$MOCK" RUNTIME_DIR="$RUNTIME" \
+  PRE_DEPLOY_SHA="$SHA_C0" POST_DEPLOY_SHA="$SHA_C2" \
+  DEPLOY_EPOCH="$DEPLOY_EPOCH" SENSITIVE_DAEMONS="" EXTRA_RUNTIME_ROOTS="" \
+  FORCE_RESTART_LABELS="" \
+  DAEMON_BASELINE_OVERRIDES="com.test.adash $SHA_C1" \
+  LAUNCH_AGENTS_DIR="$AGENTS" LAUNCHCTL_BIN="$BIN/launchctl" PS_BIN="$BIN/ps" \
+  VERIFY_TIMEOUT=2 VERIFY_INTERVAL=0.2 DRY_RUN=0 \
+  bash "$HELPER" 2>/dev/null); RC=$?
+echo "$(field AFFECTED "$OUT")" | grep "com.test.adash" >/dev/null \
+  && nok "T97 adash is clean since C1 (only b/index.html changed after): must be downgraded out of AFFECTED" "AFFECTED=[$(field AFFECTED "$OUT")]" \
+  || ok "T97 narrowing window matches the template by path: same-named b/index.html does not keep adash affected"
+grep -q "com.test.adash" "$MOCK/kicks.log" 2>/dev/null \
+  && nok "T97 adash must not be kickstarted" "log: $(cat "$MOCK/kicks.log")" \
+  || ok "T97 adash never kickstarted"
+
+#   T98  an entrypoint that exists but cannot be read is "could not tell", not
+#        "renders nothing": it stays affected, marked as a by-name match
+SENSITIVE_DAEMONS=""
+new_case t98
+t91_default_app
+# run_helper's `git add -A` must not have to READ the mode-000 file, or it aborts
+# before staging the template edit: commit the fixture first, have git ignore the
+# ctime the chmod bumps, and let a second pass so the index entry is not "racily
+# clean" (git re-hashes those) before refreshing it.
+( cd "$RUNTIME" && git config core.trustctime false && git add -A >/dev/null 2>&1 && git commit -q -m t98-fixture --allow-empty )
+sleep 1; git -C "$RUNTIME" update-index --really-refresh -q >/dev/null 2>&1
+chmod 000 "$RUNTIME/processo_lookup/app.py"
+if cat "$RUNTIME/processo_lookup/app.py" >/dev/null 2>&1; then
+  ok "T98 skipped: this user can read a mode-000 file (root?), so an unreadable entrypoint cannot be staged here"
+else
+  OUT=$(run_helper_stderr viewer/index.html); RC=$?
+  echo "$(field AFFECTED "$OUT")" | grep "com.test.processo" >/dev/null \
+    && ok "T98 unreadable entrypoint -> kept affected (never a silent 'renders nothing')" \
+    || nok "T98 affected" "$(field AFFECTED "$OUT")"
+  echo "$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")" | grep "com.test.processo" >/dev/null \
+    && ok "T98 ...and marked as a by-name match" || nok "T98 by_name" "[$(field AFFECTED_TEMPLATE_BY_NAME "$OUT")]"
+fi
+chmod 644 "$RUNTIME/processo_lookup/app.py"
+
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "daemon-refresh tests: $PASS passed, $FAIL failed"
