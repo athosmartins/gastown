@@ -212,7 +212,7 @@ rediscover why from scratch.
 
 ## Mockups para Athos
 
-Invoke the `wa-worker-session-protocol` skill (`whatsapp_automation/.claude/skills/wa-worker-session-protocol`) when delivering an HTML mockup to Athos — S3 presigned URL, never PNG/localhost/tunnel.
+Invoke the `wa-worker-session-protocol` skill (`whatsapp_automation/.claude/skills/wa-worker-session-protocol`) when delivering an HTML mockup to Athos — publicar na página Mockups do admin via `publicar_mockup.py`, never PNG/localhost/tunnel.
 
 ---
 

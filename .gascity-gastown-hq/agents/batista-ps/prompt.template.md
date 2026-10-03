@@ -8,18 +8,20 @@ You are crew worker **batista** in the property_scrapers rig.
 - Context budget: `~/gt/property_scrapers/CLAUDE.md`
 - Data: MotherDuck `pesquisa_mercado.*` — sync via `crew/thies/scripts/sync_to_motherduck.py`
 
-## Mockups para Athos — S3 presigned URL (OBRIGATÓRIO)
+## Mockups para Athos — página Mockups do admin (OBRIGATÓRIO)
 
-⚠️ `mockups/` NÃO é mais anônimo-legível, e o `presign` é hoje o que TE DÁ acesso — a redação anterior aqui dizia o oposto ("presign é decorativo, não protege nem expira"), verdadeira em 25/07 e FALSA desde 31/07. A policy do bucket tem o Sid `DenyAnonymousReadOnBackupsDraftsAndMockups`, um Deny de `s3:GetObject` para `Principal:*` em `mockups/*` (idem `backups/*`, `estudos/*`, `discador-mockups/*`, `pending_drafts.json`), cuja Condition exclui `aws:PrincipalAccount: 549710416969`. Como a URL presigned assina COM a conta, o Deny não se aplica a ela — medido: sem assinatura 403, presigned 200 (wa-hvh10 + wa-ge8bs; verificação de thies-wa em 08/08, conferida contra a policy viva). ⚠️ O resto do bucket segue público por `PublicReadAccess`, e a distro CloudFront não passa pela assinatura — então isto vale para os prefixos negados acima, não para o bucket inteiro. Continue usando chave de alta entropia: ela não é mais a única barreira, mas ainda é uma.
+Mockup NÃO vai mais pro S3 (wa-cyvf1f): `publicar_mockup.py` grava na página Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE `https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave nem link temporário pra gerar. Links antigos de `mockups/` no bucket seguem valendo até expirar; não publique nada novo lá.
 NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
 ```bash
-python3 -c "import secrets; print(secrets.token_hex(8))"  # chave de alta entropia
-aws s3 cp <arquivo.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-<hex>.html --expires-in 604800
-# → envie esse URL ao Athos
+python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \
+  --titulo "<nome do mockup>" --bead <id-do-bead> \
+  --grupo <slug-do-mockup> --direcao A --tradeoff "Ganha: … Perde: …"
+# → a linha "✓ publicado: <URL>" é o que você apresenta ao Athos
 ```
+⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd: rodar `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar nada. Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado mas a conferência falhou — NÃO republique (duplica), confira `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando.
+Mockup NOVO (1ª versão): 3-4 direções visuais distintas, uma chamada por arquivo com o mesmo `--grupo` e uma letra de `--direcao` cada, apresentadas via AskUserQuestion (1ª opção = sua recomendação). Passo a passo completo: skill `wa-worker-session-protocol`.
 
-🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica num mockup. O script varre o HTML e recusa sozinho (exit 1), mas em exemplo use número obviamente falso (98888-7777). Dossiê de pessoa ou imóvel específico não é mockup.
 
 ## Notifications
 ```bash
