@@ -1,0 +1,17 @@
+# ga-7nxfa1 (item 2): a pool worker that has NO bead and sits idle at its prompt held a pool slot for ~30 min
+# (72 approved beads, 0 in flight). The engine's own idle_timeout on wa-worker/ps-worker is 2h, and every
+# other watchdog is keyed on a bead or on named crews — see the script's header for the full list.
+#
+# Conjunctive on purpose (idle pane AND no bead in the city or rig DB AND every read succeeded): "quiet
+# for N minutes" alone would also catch long silent test runs. Nudge (drain-ack + exit) first, kill only
+# after a grace period and only a session that still holds no work. DRY_RUN=1, a kill-switch file and
+# per-pass caps are documented in the script. A gc order (fresh exec each tick, flock'd), never a raw plist.
+#
+# Measured: a pass with 2 pool sessions took ~7 s (session list + rig list); each session that is actually
+# idle adds ~12 bounded bd calls. With the defaults (idle 10 min, grace 10 min) a slot stuck on a misfire is
+# released in ~10-15 min if the worker obeys the nudge, and in at most ~30 min if it has to be killed.
+[order]
+description = "Nudge, then (if still idle and bead-less) kill, a pool worker that holds no bead and sits idle at its prompt, so it releases its pool slot"
+trigger = "cooldown"
+interval = "5m"
+exec = "$PACK_DIR/assets/scripts/pool-idle-nobead-guard.sh"
