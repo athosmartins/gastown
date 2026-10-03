@@ -365,25 +365,14 @@ mail-bridge, nunca spawnar worker no WA" está OBSOLETA — o Overseer decidiu a
 migração COMPLETA de todos os rigs pro Gas City.)
 
 {{ if or (not .TD_ROLE) (eq .TD_ROLE "ps-worker") (eq .TD_ROLE "wa-worker") -}}{{/* td:mockup-s3 */ -}}
-**Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: S3 presigned URL + 3-4
-direções em múltipla escolha antes de construir a versão final (ga-g7x0si).**
-⚠️ `mockups/*` (idem `backups/*`/`estudos/*`/`discador-mockups/*`/
-`pending_drafts.json`) tem Deny explícito de leitura anônima na policy do
-bucket (`DenyAnonymousReadOnBackupsDraftsAndMockups`) — verificado direto na
-policy viva, não só no relato: GET sem assinatura dá 403, GET presigned dá
-200, porque a assinatura carrega `aws:PrincipalAccount` e o Deny só bate
-quando essa conta DIFERE da dona (549710416969). Ou seja, hoje `presign`
-PROTEGE de verdade — a redação anterior aqui ("presign é decorativo") ficou
-stale e está corrigida. A distro CloudFront (`dnroc49bwlbis.cloudfront.net`)
-TAMBÉM ficou stale na direção oposta: a redação anterior dizia que ela
-"serve sem gate" — testado ao vivo (2026-09-25, objeto novo E um objeto
-antigo de junho, pelos dois caminhos) e CloudFront hoje dá 403 sem
-assinatura, igual ao S3 direto. Ou seja, CloudFront não é mais um vazamento
-conhecido pra esses prefixos, mas também não serve como link de entrega —
-use SEMPRE a URL presigned do S3, nunca a de CloudFront (ela não vai
-funcionar sem assinatura, e presign não se aplica a domínio de CDN).
-Continue gerando chave de alta entropia por arquivo: é defesa em
-profundidade, não a única barreira.
+**Mockups / web-UI para aprovação do Athos — OBRIGATÓRIO: publicar na página
+Mockups do admin + 3-4 direções em múltipla escolha antes de construir a versão
+final (ga-g7x0si, wa-cyvf1f).**
+Mockup NÃO vai mais pro S3: `publicar_mockup.py` (abaixo) grava na página
+Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE
+`https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave
+nem link temporário pra gerar. (Links antigos de `mockups/` no bucket S3 seguem
+valendo até expirar; não publique mais nada novo lá.)
 
 NUNCA entregue mockup como PNG, localhost URL ou servidor local/tunnel. O
 Athos DECIDE VENDO no celular — e decide em MÚLTIPLA ESCOLHA (Regra Nº 1),
@@ -400,12 +389,24 @@ distintas antes da versão final, nunca construa direto uma só:**
    como ícone, sombra difusa em tudo, tipografia default do framework sem
    hierarquia. (Guia mais fundo, com o porquê de cada um: skill
    `frontend-design`.)
-3. Publique as 3-4 direções, uma chave de alta entropia por arquivo:
+3. Publique as 3-4 direções — UMA chamada por arquivo, mesmo `--grupo`, uma
+   letra de `--direcao` cada, com o tradeoff da frase do passo 1:
    ```bash
-   python3 -c "import secrets; print(secrets.token_hex(8))"   # uma por direção
-   aws s3 cp <dirN.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --content-type "text/html; charset=utf-8"
-   aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --expires-in 604800
+   python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \
+     --titulo "<nome do mockup>" --bead <id-do-bead> \
+     --grupo <slug-do-mockup> --direcao A --tradeoff "Ganha: … Perde: …"
    ```
+   ⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd — inclusive no
+   ps-worker (property_scrapers), que não tem o script no próprio repo. Rodar
+   `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar
+   nada: `shared/data` é gitignored no whatsapp_automation, e o worktree de
+   worker não o tem. A saída `✓ publicado: <URL>` é a URL que vai na opção do
+   passo 4. O HTML roda isolado no admin: `localStorage`/`sessionStorage`/
+   cookie falham lá — proteja com try/catch (o script avisa).
+   Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada
+   inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado
+   mas a conferência falhou — NÃO republique (duplica), confira a página
+   `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando.
 4. Pergunte via **AskUserQuestion** qual direção seguir: uma opção por
    direção (URL + o tradeoff da frase acima na descrição), 1ª opção = SUA
    recomendação (Regra Nº 1). Nunca mande os 3-4 links soltos pedindo "qual
@@ -414,13 +415,17 @@ distintas antes da versão final, nunca construa direto uma só:**
 
 **Ajuste incremental num mockup JÁ aprovado** (mudar texto, corrigir bug
 visual, adicionar uma seção): não repita as 3-4 direções — publique só a
-versão atualizada pelo mesmo fluxo de chave+presign. Se o ajuste for decisão
-de produto (não visual), pergunta múltipla-escolha normal serve; não precisa
-reconstruir alternativas visuais pra isso.
+versão atualizada pelo mesmo comando, com o mesmo `--grupo` e `--direcao v2`
+(depois `v3`…). Se o ajuste for decisão de produto (não visual), pergunta
+múltipla-escolha normal serve; não precisa reconstruir alternativas visuais
+pra isso.
 
-🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado
-que identifique uma pessoa específica nesse bucket — o link é público pra
-quem tiver a URL, pra sempre.
+🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer
+dado que identifique uma pessoa específica num mockup. O script varre o HTML e
+recusa sozinho (exit 1), mas não conte só com ele: em exemplo use número
+obviamente falso (98888-7777). Dossiê de pessoa ou imóvel específico não é
+mockup — o lugar é `shared/data/estudos` (também no admin, atrás do Cloudflare
+Access).
 
 {{ end -}}
 {{/* td:core:cloudstorage-hang */ -}}

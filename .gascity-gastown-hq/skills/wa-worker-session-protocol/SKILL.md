@@ -1,13 +1,13 @@
 ---
 name: wa-worker-session-protocol
-description: Use this when you (a crew worker in whatsapp_automation — batista, mila, oracle, thies, digo, peter, or a wa-worker pool session) need to deliver an HTML mockup to Athos for review, OR when you're wrapping up work and ending a session (mid-session handoff, or work fully done and ready for the quality gate). Covers the S3 presigned-URL mockup delivery procedure and the commit-identity + gate-done completion flow.
+description: Use this when you (a crew worker in whatsapp_automation — batista, mila, oracle, thies, digo, peter, or a wa-worker pool session) need to deliver an HTML mockup to Athos for review, OR when you're wrapping up work and ending a session (mid-session handoff, or work fully done and ready for the quality gate). Covers the mockup publishing procedure (admin Mockups page, permanent URL) and the commit-identity + gate-done completion flow.
 ---
 
 # wa-worker session protocol — mockups + session end
 
-## Mockups para Athos — S3 presigned URL + 3-4 direções (OBRIGATÓRIO)
+## Mockups para Athos — publicar na página Mockups do admin + 3-4 direções (OBRIGATÓRIO)
 
-⚠️ `mockups/` NÃO é mais anônimo-legível, e o `presign` é hoje o que TE DÁ acesso — a redação anterior aqui dizia o oposto ("presign é decorativo, não protege nem expira"), verdadeira em 25/07 e FALSA desde 31/07. A policy do bucket tem o Sid `DenyAnonymousReadOnBackupsDraftsAndMockups`, um Deny de `s3:GetObject` para `Principal:*` em `mockups/*` (idem `backups/*`, `estudos/*`, `discador-mockups/*`, `pending_drafts.json`), cuja Condition exclui `aws:PrincipalAccount: 549710416969`. Como a URL presigned assina COM a conta, o Deny não se aplica a ela — medido: sem assinatura 403, presigned 200 (wa-hvh10 + wa-ge8bs; verificação de thies-wa em 08/08, conferida contra a policy viva). ⚠️ O resto do bucket segue público por `PublicReadAccess`, e a distro CloudFront não passa pela assinatura — então isto vale para os prefixos negados acima, não para o bucket inteiro. Continue usando chave de alta entropia: ela não é mais a única barreira, mas ainda é uma.
+Mockup NÃO vai mais pro S3 (wa-cyvf1f): `publicar_mockup.py` grava na página Mockups do admin, atrás do Cloudflare Access, e imprime a URL PERMANENTE `https://admin.urblink.com.br/mockups/<slug>` — não expira, então não há chave nem link temporário pra gerar. (Links antigos de `mockups/` no bucket S3 seguem valendo até expirar; não publique mais nada novo lá.)
 
 NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). Athos decide VENDO no celular.
 
@@ -15,22 +15,25 @@ NUNCA entregue mockup como PNG, localhost ou tunnel (cloudflared já deu 404). A
 construir a definitiva** — paleta/tipografia/densidade diferentes, cada uma
 com 1 frase de tradeoff, nomeando no prompt de geração os padrões de "visual
 padrão de IA" a evitar (gradiente genérico, cards idênticos em grade, emoji
-como ícone — guia mais fundo: skill `frontend-design`). Publique as 3-4,
-uma chave por arquivo, e apresente via **AskUserQuestion** (1ª opção = sua
-recomendação, nunca links soltos pedindo escolha em texto livre). Protocolo
-completo, com o passo a passo numerado: `whatsapp_automation/CLAUDE.md` →
-"Mockups de UI/UX — protocolo obrigatório" (ga-g7x0si). Ajuste incremental
-num mockup já aprovado NÃO repete as 3-4 direções — publique só a versão
-atualizada.
+como ícone — guia mais fundo: skill `frontend-design`). Publique as 3-4 — uma
+chamada por arquivo, mesmo `--grupo`, uma letra de `--direcao` cada — e
+apresente via **AskUserQuestion** (1ª opção = sua recomendação, nunca links
+soltos pedindo escolha em texto livre). Protocolo completo, com o passo a
+passo numerado: `whatsapp_automation/CLAUDE.md` → "Mockups de UI/UX —
+protocolo obrigatório" (ga-g7x0si). Ajuste incremental num mockup já aprovado
+NÃO repete as 3-4 direções — publique só a versão atualizada, com o mesmo
+`--grupo` e `--direcao v2` (depois `v3`…).
 
 ```bash
-python3 -c "import secrets; print(secrets.token_hex(8))"  # uma chave por direção
-aws s3 cp <dirN.html> s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --content-type "text/html; charset=utf-8"
-aws s3 presign s3://whatsapp-viewer-549710416969/mockups/<nome>-dirN-<hex>.html --expires-in 604800
-# → uma opção por direção no AskUserQuestion, não um envio solto
+python3 /Users/athos/gt/whatsapp_automation/scripts/publicar_mockup.py dirA.html \
+  --titulo "<nome do mockup>" --bead <id-do-bead> \
+  --grupo <slug-do-mockup> --direcao A --tradeoff "Ganha: … Perde: …"
+# → a linha "✓ publicado: <URL>" vira uma opção por direção no AskUserQuestion, não um envio solto
 ```
 
-🚨 NUNCA suba CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica nesse bucket — o link é público pra sempre.
+⚠️ Use SEMPRE esse caminho ABSOLUTO, de qualquer cwd: rodar `scripts/publicar_mockup.py` de dentro de um worktree sai 3 sem publicar nada (`shared/data` é gitignored no whatsapp_automation e o worktree de worker não o tem). Códigos de saída: 0 publicado; 1 recusado (dado pessoal ou entrada inválida); 3 erro de infraestrutura — NADA foi publicado; 4 FICOU gravado mas a conferência falhou — NÃO republique (duplica), confira `https://admin.urblink.com.br/mockups`; 2 é uso errado da linha de comando. O HTML roda isolado no admin: `localStorage`/`sessionStorage`/cookie falham lá — proteja com try/catch (o script avisa).
+
+🚨 NUNCA publique CPF, telefone, endereço, situação sucessória/óbito ou qualquer dado que identifique uma pessoa específica num mockup. O script varre o HTML e recusa sozinho (exit 1), mas em exemplo use número obviamente falso (98888-7777). Dossiê de pessoa ou imóvel específico não é mockup: o lugar é `shared/data/estudos` (também no admin, atrás do Cloudflare Access).
 
 ## Notifications
 
