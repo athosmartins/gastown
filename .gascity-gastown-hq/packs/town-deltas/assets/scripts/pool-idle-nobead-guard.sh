@@ -21,8 +21,10 @@
 #      summary). Be exact about what this leg is: "no activity marker found", NOT "idle proven". The prompt
 #      glyph is drawn on busy panes too (measured 03/10 on 3 live panes), so it only says "this is a TUI";
 #      the independent evidence of idleness is leg 2 (the pane-activity clock) and leg 4 (no bead). Leg 3
-#      is what fails safe (UNKNOWN) when the TUI changes its look. A frozen mid-turn pane is a HANG, which
-#      is crew-hang-detector's job, not this one's;
+#      is what fails safe (UNKNOWN) when the TUI changes its look. A frozen mid-turn pane is a HANG, and this
+#      guard leaves it alone (BUSY => no action). It is NOT covered by crew-hang-detector either: that
+#      detector skips every "adhoc" instance, and every session this guard can see is one. The only net
+#      under a frozen adhoc pool pane is the engine's 2h idle_timeout (wa-worker/ps-worker agent.toml);
 #   4. NO bead belongs to the session in the city DB or the session's own rig DB: open/in_progress/blocked/
 #      hooked/deferred beads and open/in_progress wisps, matched by assignee (session id, name, alias or
 #      session_name) or by the gc.session_name in the bead's metadata. A session that holds a bead is never
@@ -33,8 +35,16 @@
 # JSON, empty pane, rig not found) is UNKNOWN and means DO NOTHING — it never reads as "no bead".
 #
 # THE ACTION, with due process: first a NUDGE asking the worker to drain-ack and exit (the graceful
-# path the engine already honours: "drain acknowledged by agent"). Only if it is still bead-less and idle
-# GRACE_SEC later is the session CLOSED (`gc session close`: stops the runtime and closes the session bead
+# path the engine already honours: "drain acknowledged by agent"). A nudge has THREE outcomes, never two:
+# `gc session nudge` defaults to --delivery wait-idle, which degrades to a QUEUE when the target is not at
+# a safe boundary — still exit 0, and the text is only drained by the target's next prompt. So the guard
+# asks for --json and reads `.outcome`: "delivered" => the worker was warned; "queued" (or an outcome we
+# cannot read) => it may never have seen it. A queued nudge does NOT arm the close stage and is NOT
+# re-enqueued every pass (duplicates would all drain at once): it waits QUEUE_WAIT_SEC, then — after the
+# pane and bead legs have just been re-checked — is re-sent once with --delivery immediate. Nothing is
+# ever closed on the strength of a warning that was not confirmed delivered.
+# Only if it is still bead-less and idle GRACE_SEC after a DELIVERED nudge is the session
+# CLOSED (`gc session close`: stops the runtime and closes the session bead
 # — the verb the city already uses to free a session: crew-capacity-containment.sh, the gate reviewers) —
 # safe because it holds no work. NOT `gc session kill`: per its own help, kill leaves the session marked
 # active so the reconciler restarts it, i.e. it frees nothing and the slot stays counted against the pool
@@ -46,8 +56,9 @@
 # STATE (one file per nudged session, $SESS_STATE/<name>.nudged) is written BEFORE the nudge is sent and
 # the nudge is sent only if that write verifiably landed: an unrecorded nudge would be re-sent every pass
 # (an agent turn each time) and the grace period would never start. The file reads "nudging <ts>" while the
-# nudge is unconfirmed and "nudged <ts>" once it is; only "nudged" can ever lead to a close. A state that
-# cannot be written or removed is logged loudly as STATE-ERROR and counted in the pass summary.
+# send is unconfirmed, "queued <ts>" when gc queued it instead of delivering it (or gave an unreadable
+# answer), and "nudged <ts>" only once gc reported it DELIVERED; only "nudged" can ever lead to a close. A
+# state that cannot be written or removed is logged loudly as STATE-ERROR and counted in the pass summary.
 #
 # SAFETY VALVES: DRY_RUN=1 (decide + log; sends no nudge, closes nothing, writes/removes no nudge state —
 # it still creates the empty state dir and the lock file); kill-switch file
@@ -69,7 +80,8 @@ LOCK_FILE="${POOL_IDLE_LOCK:-$CITY/.gc/runtime/pool-idle-nobead-guard.lock}"
 
 POOL_TEMPLATES="${POOL_IDLE_TEMPLATES:-wa-worker ps-worker}"
 IDLE_SEC="${POOL_IDLE_SEC:-600}"            # idle this long (and bead-less) => nudge
-GRACE_SEC="${POOL_IDLE_GRACE_SEC:-600}"     # still bead-less + idle this long after the nudge => close
+GRACE_SEC="${POOL_IDLE_GRACE_SEC:-600}"     # still bead-less + idle this long after a DELIVERED nudge => close
+QUEUE_WAIT_SEC="${POOL_IDLE_QUEUE_WAIT_SEC:-600}"   # a QUEUED (not delivered) nudge waits this long, then is re-sent --delivery immediate
 CLOSE_ENABLED="${POOL_IDLE_CLOSE:-1}"
 MAX_NUDGES="${POOL_IDLE_MAX_NUDGES:-3}"
 MAX_CLOSES="${POOL_IDLE_MAX_CLOSES:-1}"
@@ -87,6 +99,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [pool-idle] $*"; }
 if [ -f "$KILL_SWITCH" ]; then log "kill-switch present ($KILL_SWITCH) — no-op"; exit 0; fi
 
 exec 9>"$LOCK_FILE" || { log "cannot open lock $LOCK_FILE — exiting (no single-instance guarantee)"; exit 0; }
+# three states: lock taken / lock held by someone else / flock itself missing (rc 127 from a PATH without
+# /opt/homebrew/bin) — the last must not read as "held", or the guard would silently never run
+command -v flock >/dev/null 2>&1 || { log "ERROR: flock not found on PATH ($PATH) — cannot take the single-instance lock, exiting WITHOUT running (this is not 'another instance holds it')"; exit 0; }
 flock -n 9 || { log "another instance holds $LOCK_FILE — exiting"; exit 0; }
 
 log "=== pass start (IDLE_SEC=$IDLE_SEC GRACE_SEC=$GRACE_SEC CLOSE=$CLOSE_ENABLED DRY_RUN=$DRY_RUN templates=[$POOL_TEMPLATES]) ==="
@@ -294,8 +309,60 @@ print("HELD" if any(s.get("state") in ("active", "creating") for s in mine) else
   case "$out" in HELD|RELEASED) echo "$out" ;; *) echo UNKNOWN ;; esac
 }
 
-NUDGES=0; CLOSES=0; RELEASED=0; HELD=0; UNVERIFIED=0; SEEN=""
+NUDGES=0; CLOSES=0; RELEASED=0; HELD=0; UNVERIFIED=0; QUEUED=0; QWAIT=0; SEEN=""
 NUDGE_MSG="pool-idle-nobead-guard (ga-7nxfa1): no bead is assigned to this session and its pane has been idle for a while. If you have nothing to work on, run gc runtime drain-ack and then exit so the pool slot is released. If you do have work, claim it now (bd update <id> --claim) and continue."
+
+# send_nudge <session> <delivery-mode> -> DELIVERED | QUEUED | UNREADABLE | FAILED:<rc>
+# rc 0 only means "gc accepted the request": under wait-idle it also exits 0 when it merely QUEUED the text
+# (measured: {"ok":true,"delivery":"wait-idle","queued":true,"outcome":"queued"}, same rc 0 without --json).
+# `gc session nudge --json-schema=result` => outcome in {delivered, queued}. Anything else (rc 0 with output we
+# cannot parse, ok != true, an outcome outside the enum) is UNREADABLE and is treated like QUEUED by the
+# caller — "I cannot tell that the worker saw it" is not "the worker was warned".
+send_nudge() {
+  local out rc oc
+  out="$(timeout "$CALL_TIMEOUT" "$GC" session nudge "$1" "$NUDGE_MSG" --delivery "$2" --json 2>/dev/null)"; rc=$?
+  [ "$rc" -ne 0 ] && { echo "FAILED:$rc"; return; }
+  oc="$(printf '%s' "$out" | jq -er 'select(.ok == true) | .outcome' 2>/dev/null)" || oc=""
+  case "$oc" in delivered) echo DELIVERED ;; queued) echo QUEUED ;; *) echo UNREADABLE ;; esac
+}
+
+# nudge_session <session> <template> <delivery-mode> <idle-sec> <state-file>
+# Records the attempt FIRST ("nudging <ts>") and sends only if that write verifiably landed. Then, by outcome:
+#   DELIVERED            => "nudged <ts>"   (the only state that arms the close stage)
+#   QUEUED / UNREADABLE  => "queued <ts>"   (worker may not have seen it: no close, no re-enqueue for QUEUE_WAIT_SEC)
+#   FAILED:<rc>          => stays "nudging" (not nudged; retried next pass; rc 124 = may still have gone out)
+nudge_session() {
+  local name="$1" tmpl="$2" mode="$3" idle="$4" f="$5" res why
+  if ! write_state "$f" "nudging $NOW"; then
+    state_err "$name ($tmpl): cannot record state in $SESS_STATE — NOT nudging (an unrecorded nudge would repeat every pass)"
+    return
+  fi
+  res="$(send_nudge "$name" "$mode")"
+  case "$res" in
+    DELIVERED)
+      if write_state "$f" "nudged $NOW"; then
+        log "$name ($tmpl): NUDGED (delivered, --delivery $mode) — idle ${idle}s, no bead assigned, drain requested"
+      else
+        state_err "$name ($tmpl): nudge was DELIVERED but its confirmation could not be recorded — it will be nudged again next pass"
+      fi ;;
+    QUEUED|UNREADABLE)
+      QUEUED=$((QUEUED + 1))
+      if [ "$res" = QUEUED ]; then
+        why="gc QUEUED the nudge instead of delivering it (target not at a safe boundary; it drains at the worker's next prompt)"
+      else
+        why="gc returned 0 but no readable delivery outcome (cannot tell it was delivered)"
+      fi
+      if write_state "$f" "queued $NOW"; then
+        log "$name ($tmpl): QUEUED, not delivered (--delivery $mode) — $why. The worker may never have seen the warning, so the close stage is NOT armed; waiting ${QUEUE_WAIT_SEC}s before one --delivery immediate re-send"
+      else
+        state_err "$name ($tmpl): nudge was QUEUED but that could not be recorded — it stays 'nudging' and will be re-sent next pass"
+      fi ;;
+    *)
+      # rc 124 = our timeout cut the call: the nudge may still have been delivered. We do not know, so it
+      # stays "nudging" (= not nudged) and is retried; the worst case is one duplicate nudge.
+      log "$name ($tmpl): nudge NOT CONFIRMED (rc=${res#FAILED:}; 124 = timed out, may still have been delivered or queued) — will retry next pass" ;;
+  esac
+}
 
 PASS_START="$(date +%s)"   # real clock on purpose (NOW is overridable): the budget bounds wall time
 while IFS='|' read -r name sid alias sname tmpl wdir idle; do
@@ -307,27 +374,33 @@ while IFS='|' read -r name sid alias sname tmpl wdir idle; do
     log "pass budget ${PASS_BUDGET_SEC}s spent — leaving $name and the rest for the next pass"; continue
   fi
   stf="$SESS_STATE/$name.nudged"
-  nudged_at=""
+  kind=""; rec_at=""
   if [ -f "$stf" ]; then
-    # Only "nudged <ts>" (a CONFIRMED nudge) can ever lead to a close. "nudging <ts>" (sent, not confirmed)
-    # and anything unreadable/garbled count as "not nudged yet": the cycle restarts with a nudge, never with
-    # a close the worker was not warned about.
+    # Only "nudged <ts>" (gc reported the nudge DELIVERED) can ever lead to a close. "queued <ts>" (gc queued
+    # it / answered unreadably), "nudging <ts>" (sent, not confirmed) and anything unreadable/garbled count
+    # as "not warned yet": the cycle goes on with a nudge, never with a close the worker was not warned about.
     st="$(cat "$stf" 2>/dev/null)"
     case "$st" in
-      "nudged "*) nudged_at="${st#nudged }"; case "$nudged_at" in ''|*[!0-9]*) nudged_at="" ;; esac ;;
+      "nudged "*) kind=nudged; rec_at="${st#nudged }" ;;
+      "queued "*) kind=queued; rec_at="${st#queued }" ;;
       "nudging "*) ;;
       *) log "$name: state file $stf is unreadable or garbled ('$st') — treated as not nudged" ;;
     esac
+    if [ -n "$kind" ]; then
+      case "$rec_at" in
+        ''|*[!0-9]*) log "$name: state file $stf has an unreadable timestamp ('$st') — treated as not nudged"; kind=""; rec_at="" ;;
+      esac
+    fi
     # our own state is stale (the session went on to do other things): start the cycle over
-    if [ -n "$nudged_at" ] && [ $((NOW - nudged_at)) -gt $((3 * GRACE_SEC)) ]; then forget "$stf"; nudged_at=""; fi
+    if [ -n "$kind" ] && [ $((NOW - rec_at)) -gt $((3 * GRACE_SEC)) ]; then forget "$stf"; kind=""; rec_at=""; fi
   fi
   # not idle long enough, and we have not already nudged it => nothing to look at
-  if [ -z "$nudged_at" ] && [ "$idle" -lt "$IDLE_SEC" ]; then continue; fi
+  if [ -z "$kind" ] && [ "$idle" -lt "$IDLE_SEC" ]; then continue; fi
 
   pstate="$(pane_state "$name")"
   case "$pstate" in
     IDLE) ;;
-    BUSY) log "$name: pane busy (turn running) — leave to crew-hang-detector if it freezes"; continue ;;
+    BUSY) log "$name: pane busy (turn running) — no action; if it is frozen NO watchdog covers it (crew-hang-detector skips adhoc), only the engine idle_timeout (2h)"; continue ;;
     *)    log "$name: pane UNKNOWN (empty/unreadable/unclassifiable) — no action"; continue ;;
   esac
   bs="$(bead_state "$sid" "$name" "$alias" "$sname" "$wdir")"
@@ -338,31 +411,30 @@ while IFS='|' read -r name sid alias sname tmpl wdir idle; do
   esac
 
   # idle pane + provably no bead
-  if [ -z "$nudged_at" ]; then
+  if [ "$kind" = "queued" ]; then
+    # A nudge gc only QUEUED. Do not close (the worker was never confirmed warned) and do not enqueue another
+    # one every pass (they would all drain at once). Wait QUEUE_WAIT_SEC; then, because the pane and bead legs
+    # above were JUST re-checked (idle pane, provably no bead), send one --delivery immediate. If gc still does
+    # not report it delivered the record is renewed as "queued" — the slot stays held, nothing is ever closed.
+    qwaited=$((NOW - rec_at))
+    if [ "$qwaited" -lt "$QUEUE_WAIT_SEC" ] || [ "$idle" -lt "$IDLE_SEC" ]; then
+      QWAIT=$((QWAIT + 1))
+      log "$name: nudge was QUEUED ${qwaited}s ago and never confirmed delivered; idle ${idle}s — waiting (not re-enqueuing, close stage NOT armed)"; continue
+    fi
+    if [ "$NUDGES" -ge "$MAX_NUDGES" ]; then log "$name: eligible for an immediate re-nudge but MAX_NUDGES=$MAX_NUDGES reached this pass"; continue; fi
+    NUDGES=$((NUDGES + 1))
+    if [ "$DRY_RUN" = "1" ]; then log "$name ($tmpl): DRY_RUN would re-NUDGE --delivery immediate — queued ${qwaited}s ago, idle ${idle}s, no bead"; continue; fi
+    nudge_session "$name" "$tmpl" immediate "$idle" "$stf"
+  elif [ -z "$kind" ]; then
     if [ "$NUDGES" -ge "$MAX_NUDGES" ]; then log "$name: eligible for nudge but MAX_NUDGES=$MAX_NUDGES reached this pass"; continue; fi
     NUDGES=$((NUDGES + 1))
     if [ "$DRY_RUN" = "1" ]; then log "$name ($tmpl): DRY_RUN would NUDGE — idle ${idle}s, no bead"; continue; fi
-    # Record the attempt FIRST and nudge only if that write verifiably landed. The other order (nudge, then
-    # `echo > state`) re-sent the same nudge every pass when the state dir was unwritable — one agent turn
-    # per pass — while the log kept saying NUDGED, and stage 2 could never start.
-    if ! write_state "$stf" "nudging $NOW"; then
-      state_err "$name ($tmpl): cannot record state in $SESS_STATE — NOT nudging (an unrecorded nudge would repeat every pass)"
-      continue
-    fi
-    timeout "$CALL_TIMEOUT" "$GC" session nudge "$name" "$NUDGE_MSG" >/dev/null 2>&1; nrc=$?
-    if [ "$nrc" -eq 0 ]; then
-      if write_state "$stf" "nudged $NOW"; then
-        log "$name ($tmpl): NUDGED — idle ${idle}s, no bead assigned, drain requested"
-      else
-        state_err "$name ($tmpl): nudge was DELIVERED but its confirmation could not be recorded — it will be nudged again next pass"
-      fi
-    else
-      # rc 124 = our timeout cut the call: the nudge may still have been delivered. We do not know, so it
-      # stays "nudging" (= not nudged) and is retried; the worst case is one duplicate nudge.
-      log "$name ($tmpl): nudge NOT CONFIRMED (rc=$nrc; 124 = timed out, may still have been delivered) — will retry next pass"
-    fi
+    # nudge_session records the attempt FIRST and sends only if that write verifiably landed. The other order
+    # (nudge, then `echo > state`) re-sent the same nudge every pass when the state dir was unwritable — one
+    # agent turn per pass — while the log kept saying NUDGED, and stage 2 could never start.
+    nudge_session "$name" "$tmpl" wait-idle "$idle" "$stf"
   else
-    waited=$((NOW - nudged_at))
+    waited=$((NOW - rec_at))
     if [ "$waited" -lt "$GRACE_SEC" ] || [ "$idle" -lt $((GRACE_SEC / 2)) ]; then
       log "$name: nudged ${waited}s ago, idle ${idle}s — within grace"; continue
     fi
@@ -399,5 +471,5 @@ for f in "$SESS_STATE"/*.nudged; do
   case "$SEEN" in *" $n "*) ;; *) forget "$f" ;; esac
 done
 
-log "=== pass end (nudged=$NUDGES closes_attempted=$CLOSES released=$RELEASED still_active=$HELD unverified=$UNVERIFIED state_errors=$STATE_ERRORS skipped_unknown=$NSKIP) ==="
+log "=== pass end (nudge_attempts=$NUDGES queued_not_delivered=$QUEUED still_queued_waiting=$QWAIT closes_attempted=$CLOSES released=$RELEASED still_active=$HELD unverified=$UNVERIFIED state_errors=$STATE_ERRORS skipped_unknown=$NSKIP) ==="
 exit 0

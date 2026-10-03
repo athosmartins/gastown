@@ -45,6 +45,7 @@ case "$1 $2" in
   "session list") [ -n "${FAKE_LIST_FAIL:-}" ] && exit 1
                   if ls "$FAKE_DIR"/closed.* >/dev/null 2>&1; then
                     [ -n "${FAKE_LIST_FAIL_AFTER_CLOSE:-}" ] && exit 1
+                    [ -n "${FAKE_LIST_ERRENV_AFTER_CLOSE:-}" ] && { echo '{"error":"boom"}'; exit 0; }   # rc 0 but no "sessions" list
                     if [ -z "${FAKE_CLOSE_KEEPS:-}" ] && [ -f "$FAKE_DIR/sessions.json" ]; then
                       python3 -c '
 import json, os, glob
@@ -59,9 +60,24 @@ print(json.dumps(data))'
                   if [ -f "$FAKE_DIR/sessions.raw" ]; then cat "$FAKE_DIR/sessions.raw"; else cat "$FAKE_DIR/sessions.json"; fi ;;
   "rig list")     [ -n "${FAKE_RIG_FAIL:-}" ] && exit 1; cat "$FAKE_DIR/rigs.json" ;;
   "session peek") [ -f "$FAKE_DIR/pane.$3" ] && cat "$FAKE_DIR/pane.$3"; exit 0 ;;
-  "session nudge") echo "nudge $3" >> "$FAKE_CALLS"; printf '%s' "$4" > "$FAKE_DIR/last_nudge.txt"
+  "session nudge") # models the REAL CLI: default --delivery wait-idle; exit 0 whether it delivered or only queued;
+                   # the difference is visible ONLY in the --json result ({"outcome":"delivered"|"queued"}).
+                   mode=wait-idle; json=""; prev=""
+                   for a in "$@"; do
+                     [ "$prev" = "--delivery" ] && mode="$a"; [ "$a" = "--json" ] && json=1; prev="$a"
+                   done
+                   echo "nudge $3 $mode" >> "$FAKE_CALLS"; printf '%s' "$4" > "$FAKE_DIR/last_nudge.txt"
                    [ -n "${FAKE_NUDGE_SLEEP:-}" ] && sleep "$FAKE_NUDGE_SLEEP"
-                   [ -n "${FAKE_NUDGE_FAIL:-}" ] && exit 1; exit 0 ;;
+                   [ -n "${FAKE_NUDGE_FAIL:-}" ] && exit 1
+                   # FAKE_NUDGE_QUEUES=1: only wait-idle degrades to a queue (immediate delivers);
+                   # FAKE_NUDGE_QUEUES=always: even immediate is queued; FAKE_NUDGE_GARBAGE=1: rc 0, unparsable output
+                   outcome=delivered
+                   case "${FAKE_NUDGE_QUEUES:-}" in 1) [ "$mode" = wait-idle ] && outcome=queued ;; always) outcome=queued ;; esac
+                   [ -n "$json" ] || exit 0
+                   [ -n "${FAKE_NUDGE_GARBAGE:-}" ] && { echo "nudge accepted"; exit 0; }
+                   printf '{"schema_version":"1","ok":true,"target":"%s","delivery":"%s","queued":%s,"outcome":"%s"}\n' \
+                     "$3" "$mode" "$([ "$outcome" = queued ] && echo true || echo false)" "$outcome"
+                   exit 0 ;;
   "session close") echo "close $3" >> "$FAKE_CALLS"
                    [ -n "${FAKE_CLOSE_FAIL:-}" ] && exit 1
                    : > "$FAKE_DIR/closed.$3"; exit 0 ;;
@@ -372,6 +388,95 @@ else
   expect "...and nothing is closed meanwhile" 0 0
 fi
 chmod 755 "$T/state/pool-idle-nobead" 2>/dev/null
+
+# ---- a nudge has THREE outcomes: delivered, queued, unknown (gate FAIL 2, blocking issue 1) -------------------
+# `gc session nudge` defaults to --delivery wait-idle and exits 0 even when it only QUEUED the text (drained at the
+# worker's next prompt — an idle pane that gets no prompt never sees it). The first guard read rc 0 as "warned",
+# armed the close stage on it, and so could close a worker that had never seen the warning. The fake gc now models
+# that: FAKE_NUDGE_QUEUES=1 queues wait-idle only, =always queues even --delivery immediate, FAKE_NUDGE_GARBAGE=1
+# answers rc 0 with output nobody can parse.
+echo "Q. a queued (not delivered) nudge never arms the close"
+called() { grep -qx -- "$1" "$T/calls" 2>/dev/null; }
+baseline; run FAKE_NUDGE_QUEUES=1
+expect "wait-idle nudge that gc only QUEUED => attempted once, NOT closed" 1 0
+called "nudge wa-worker-adhoc-aaa wait-idle" && ok "...first attempt is --delivery wait-idle (the polite default)" || bad "first nudge was not sent as --delivery wait-idle: $(tr '\n' ';' < "$T/calls")"
+[ "$(cat "$SF" 2>/dev/null)" = "queued $NOW" ] && ok "...state is 'queued <ts>', NOT 'nudged <ts>'" || bad "state after a QUEUED nudge: '$(cat "$SF" 2>/dev/null)' (must be 'queued $NOW')"
+said   "...logged as QUEUED, not delivered" 'QUEUED, not delivered'
+unsaid "...never as NUDGED" 'NUDGED'
+said   "...and counted in the pass summary" 'queued_not_delivered=1'
+baseline; run FAKE_NUDGE_QUEUES=1; run FAKE_NUDGE_QUEUES=1; run FAKE_NUDGE_QUEUES=1
+expect "3 passes over a queued nudge => still ONE nudge (no re-enqueue every pass: duplicates would all drain at once)" 1 0
+said   "...the later passes say they are waiting" 'still_queued_waiting=1'
+# the reviewer's scenario, verbatim: queued nudge + 700s idle + no bead => zero closes
+baseline; stage "queued $((NOW - 700))"; run FAKE_NUDGE_QUEUES=always; run FAKE_NUDGE_QUEUES=always; run FAKE_NUDGE_QUEUES=always
+expect "queued 700s ago, idle 700s, no bead, gc queues EVERYTHING => one --delivery immediate re-send over 3 passes, ZERO closes" 1 0
+called "nudge wa-worker-adhoc-aaa immediate" && ok "...the re-send is --delivery immediate" || bad "re-send was not --delivery immediate: $(tr '\n' ';' < "$T/calls")"
+[ "$(cat "$SF" 2>/dev/null)" = "queued $NOW" ] && ok "...still not delivered => record renewed as 'queued', the close stage stays unarmed" || bad "state after a still-queued re-send: '$(cat "$SF" 2>/dev/null)'"
+baseline; stage "queued $((NOW - 700))"; run FAKE_NUDGE_QUEUES=1
+expect "queued 700s ago, the --delivery immediate re-send IS delivered => one nudge, no close yet" 1 0
+called "nudge wa-worker-adhoc-aaa immediate" && ok "...it went out as --delivery immediate" || bad "re-send was not --delivery immediate: $(tr '\n' ';' < "$T/calls")"
+[ "$(cat "$SF" 2>/dev/null)" = "nudged $NOW" ] && ok "...state becomes 'nudged <ts>' only now (grace starts from the DELIVERED nudge)" || bad "state after the delivered re-send: '$(cat "$SF" 2>/dev/null)'"
+said   "...logged as NUDGED (delivered, --delivery immediate)" 'NUDGED (delivered, --delivery immediate)'
+baseline; stage "queued $((NOW - 300))"; run
+expect "queued only 300s ago (< QUEUE_WAIT 600) => wait, send nothing" 0 0
+said   "...says it is waiting and not re-enqueuing" 'waiting (not re-enqueuing'
+[ "$(cat "$SF" 2>/dev/null)" = "queued $((NOW - 300))" ] && ok "...and the record is left untouched" || bad "queued record changed while waiting: '$(cat "$SF" 2>/dev/null)'"
+baseline; stage "queued $((NOW - 700))"; SESS_LINES=""; sess wa-worker-adhoc-aaa wa-worker 100; run
+expect "queued long ago but the worker spoke 100s ago (it is mid-conversation) => wait" 0 0
+baseline; stage "queued $((NOW - 700))"; bead_json in_progress wa-worker-adhoc-aaa whatsapp_automation list; run
+c="$(calls_n close)"; n="$(calls_n nudge)"; if [ "$c" = 0 ] && [ "$n" = 0 ] && [ ! -f "$SF" ]; then ok "it picked up a bead while the nudge sat in the queue => nothing sent, nothing closed, record cleared"; else bad "worker with a bead after a queued nudge (closes=$c nudges=$n state=$([ -f "$SF" ] && echo kept || echo cleared))"; fi
+baseline; stage "queued $((NOW - 700))"; pane wa-worker-adhoc-aaa "$BUSY_PANE"; run;          expect "queued long ago but the pane is busy now => no action" 0 0
+baseline; stage "queued $((NOW - 2500))"; run FAKE_NUDGE_QUEUES=1
+expect "our own queued record is stale (> 3x grace) => start over with a polite wait-idle nudge, not a close" 1 0
+called "nudge wa-worker-adhoc-aaa wait-idle" && ok "...the restart is --delivery wait-idle again" || bad "stale restart was not wait-idle: $(tr '\n' ';' < "$T/calls")"
+baseline; stage "queued not-a-number"; run
+expect "a 'queued' record with an unreadable timestamp counts as 'not warned' => nudge, never close" 1 0
+said   "...and says the timestamp was unreadable" 'unreadable timestamp'
+baseline; run FAKE_NUDGE_GARBAGE=1
+expect "rc 0 but an answer nobody can parse => attempted once, NOT closed" 1 0
+[ "$(cat "$SF" 2>/dev/null)" = "queued $NOW" ] && ok "...treated as queued ('I cannot tell it was seen' is not 'warned')" || bad "state after an unparsable nudge answer: '$(cat "$SF" 2>/dev/null)'"
+said   "...logged as such" 'no readable delivery outcome'
+unsaid "...never as NUDGED" 'NUDGED'
+baseline; stage "queued $((NOW - 700))"; run DRY_RUN=1
+expect "DRY_RUN over a queued record sends nothing" 0 0
+if grep -q 'DRY_RUN would re-NUDGE --delivery immediate' "$T/stdout"; then ok "...and says it would re-send immediately (DRY_RUN logs to stdout, like the other DRY_RUN checks)"; else bad "...DRY_RUN did not say it would re-send immediately"; fi
+[ "$(cat "$SF" 2>/dev/null)" = "queued $((NOW - 700))" ] && ok "...and leaves the record untouched" || bad "DRY_RUN changed the queued record: '$(cat "$SF" 2>/dev/null)'"
+# the whole timeline with a moving clock: queued -> (600s) immediate re-send delivered -> (600s grace) close
+baseline; NOW0=$NOW
+run FAKE_NUDGE_QUEUES=1
+NOW=$((NOW0 + 700)); run FAKE_NUDGE_QUEUES=1
+NOW=$((NOW0 + 1400)); run FAKE_NUDGE_QUEUES=1
+sq="$(tr '\n' ';' < "$T/calls")"
+NOW=$NOW0
+if [ "$sq" = "nudge wa-worker-adhoc-aaa wait-idle;nudge wa-worker-adhoc-aaa immediate;close wa-worker-adhoc-aaa;" ]; then ok "timeline: wait-idle (queued) -> immediate (delivered) -> close, in that order, one of each"; else bad "timeline calls were: $sq"; fi
+
+# ---- the close-verification fallthrough the mutation run found unpinned (gate FAIL 1, reviewer 2) -------------
+baseline; nudged_ago 700; run FAKE_LIST_ERRENV_AFTER_CLOSE=1
+said   "session list answers rc 0 but with an error envelope (no 'sessions' list) after the close => CLOSE-UNVERIFIED" 'CLOSE-UNVERIFIED'
+unsaid "...never claimed as released" 'slot RELEASED'
+[ -f "$SF" ] && ok "...state kept" || bad "state forgotten although the close outcome is unknown"
+
+# ---- a missing flock is not 'another instance holds the lock' (gate FAIL 1, non-blocking, both reviewers) ------
+mkdir -p "$T/nofl"; for b in bash date mkdir dirname; do ln -sf "$(command -v $b)" "$T/nofl/$b"; done
+baseline; run PATH="$T/nofl"
+expect "flock not on PATH => the guard does nothing" 0 0
+said   "...and says flock is MISSING" 'flock not found on PATH'
+# match the real held-lock line ("another instance holds <lock path> — exiting"), not the phrase inside the
+# missing-flock message, which quotes it on purpose ("this is not 'another instance holds it'")
+unsaid "...not that another instance holds the lock" "another instance holds $T/lock"
+
+# ---- comments and log lines must not hand a frozen pane to a watchdog that skips it (blocking issue 2) --------
+# crew-hang-detector skips every "adhoc" instance, and every session this guard sees IS one. The earlier wording
+# ("leave to crew-hang-detector if it freezes") crossed the frozen-pool-pane hole off the list. Pin the FACT the
+# new wording rests on, so the comment cannot silently go stale if the detector starts covering adhoc panes.
+echo "H. frozen mid-turn pane: no false claim that crew-hang-detector covers it"
+DETECTOR="$SELF_DIR/../../crew-hang-detector.sh"
+if [ -f "$DETECTOR" ] && grep -q '"adhoc" in name' "$DETECTOR"; then ok "crew-hang-detector.sh still skips adhoc instances (the fact the guard's wording rests on)"
+else bad "cannot confirm crew-hang-detector skips adhoc ($DETECTOR) — the guard's 'no watchdog covers it' wording must be revisited"; fi
+baseline; pane wa-worker-adhoc-aaa "$BUSY_PANE"; run
+said   "BUSY pane log says crew-hang-detector skips adhoc and names the real net (engine idle_timeout)" 'crew-hang-detector skips adhoc'
+unsaid "...and no longer sends the operator to a detector that never acts" 'leave to crew-hang-detector'
+if grep -n -E "crew-hang-detector's job|leave to crew-hang-detector" "$SCRIPT" >/dev/null; then bad "guard still says a frozen pane is crew-hang-detector's job: $(grep -n -E "crew-hang-detector's job|leave to crew-hang-detector" "$SCRIPT" | head -2 | tr '\n' ' ')"; else ok "guard source no longer claims a frozen pane is crew-hang-detector's job"; fi
 
 # ---- caps -----------------------------------------------------------------------------------------------------
 echo "E. caps bound the blast radius"

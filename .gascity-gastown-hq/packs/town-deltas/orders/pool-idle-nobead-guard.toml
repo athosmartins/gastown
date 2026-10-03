@@ -19,8 +19,11 @@
 # interval 5m / timeout 600s: the script stops starting new candidates after a 240 s budget, but the one in
 # flight can still make several bounded calls, so the timeout is declared (not left to the engine default)
 # with room above the budget; selftest W fails if it ever drops under budget + 60 s. A run the timeout
-# cuts short is harmless by construction — a nudge is recorded as "nudging" BEFORE it is sent and only
-# "nudged" can lead to a close — and the script's flock keeps the next tick from stacking on it.
+# cuts short is harmless by construction — a nudge is recorded as "nudging" BEFORE it is sent; it becomes
+# "nudged" only when `gc session nudge --json` reports outcome=delivered (rc 0 alone is not enough: wait-idle
+# exits 0 when it merely QUEUED the text, which a pane that gets no prompt never sees — that is recorded as
+# "queued", re-sent once as --delivery immediate after QUEUE_WAIT_SEC, and never arms the close) — and only
+# "nudged" can lead to a close. The script's flock keeps the next tick from stacking on a cut-short run.
 [order]
 description = "Nudge, then (if still idle and bead-less) close, a pool worker that holds no bead and sits idle at its prompt, so it releases its pool slot"
 trigger = "cooldown"
