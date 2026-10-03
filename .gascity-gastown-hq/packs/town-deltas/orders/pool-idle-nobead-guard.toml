@@ -8,7 +8,7 @@
 # per-pass caps are documented in the script. A gc order (fresh exec each tick, flock'd), never a raw plist.
 #
 # Measured: a pass with 2 pool sessions took ~7 s (session list + rig list); each session that is actually
-# idle adds ~12 bounded bd calls. With the defaults (idle 10 min, grace 10 min) a slot stuck on a misfire is
+# idle adds 6 bounded bd calls (3 per DB: the list plus two wisp queries, for the city DB and its rig DB). With the defaults (idle 10 min, grace 10 min) a slot stuck on a misfire is
 # released in ~10-15 min if the worker obeys the nudge, and in at most ~30 min if it has to be killed.
 [order]
 description = "Nudge, then (if still idle and bead-less) kill, a pool worker that holds no bead and sits idle at its prompt, so it releases its pool slot"

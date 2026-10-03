@@ -17,9 +17,12 @@
 #      long test run is NOT idle by this clock; only a session sitting still at the prompt is;
 #   3. the pane is classifiable AND idle (no spinner/elapsed timer; a prompt or a past-tense summary is
 #      showing). A frozen mid-turn pane is a HANG, which is crew-hang-detector's job, not this one's;
-#   4. NO bead is assigned to the session in the city DB or the session's own rig DB, in any open-ish
-#      status, wisps included. A session that holds a bead is never touched (agent-stuck-escalation
-#      owns that case). "Idle for N minutes" alone is exactly the weak signal the city refuses to act on.
+#   4. NO bead belongs to the session in the city DB or the session's own rig DB: open/in_progress/blocked/
+#      hooked/deferred beads and open/in_progress wisps, matched by assignee (session id, name, alias or
+#      session_name) or by the gc.session_name in the bead's metadata. A session that holds a bead is never
+#      touched (agent-stuck-escalation owns that case). "Idle for N minutes" alone is exactly the weak
+#      signal the city refuses to act on. A bead recorded under some OTHER identifier would not be seen —
+#      which is why the kill needs a nudge, a grace period and a second idle pane first.
 # THREE STATES, never collapsed: for the bead check and the pane check "could not tell" (timeout, bad
 # JSON, empty pane, rig not found) is UNKNOWN and means DO NOTHING — it never reads as "no bead".
 #
@@ -28,7 +31,8 @@
 # GRACE_SEC later is the session killed — safe because it holds no work. Caps per pass (nudges, kills)
 # bound the damage of any bug in this script; kill can be turned off with POOL_IDLE_KILL=0.
 #
-# SAFETY VALVES: DRY_RUN=1 (decide + log, change nothing, write no state); kill-switch file
+# SAFETY VALVES: DRY_RUN=1 (decide + log; sends no nudge, kills nothing, writes/removes no nudge state —
+# it still creates the empty state dir and the lock file); kill-switch file
 # $STATE_ROOT/pool-idle-nobead-guard.disabled; single instance via flock; every gc/bd call is bounded by
 # `timeout`; always exits 0 (an order tick must not page anyone because gc was briefly unavailable).
 # Runs as a gc order (see orders/pool-idle-nobead-guard.toml), never a raw plist.
@@ -88,9 +92,11 @@ def ts(v):
     return t if t > 86400 * 365 else None      # "0001-01-01..." = never active
 try:
     data = json.load(sys.stdin)
+    sessions = data["sessions"]
+    assert isinstance(sessions, list)
 except Exception:
-    sys.exit(0)
-for s in data.get("sessions", []):
+    sys.exit(3)          # unparseable / no "sessions" list: NOT the same as "zero sessions"
+for s in sessions:
     if s.get("state") != "active" or s.get("attached"):
         continue
     if (s.get("template") or "") not in pools:
@@ -103,6 +109,8 @@ for s in data.get("sessions", []):
         continue
     print("|".join(f + [str(int(now - base))]))
 ' > "$CAND_FILE" 2>/dev/null
+PY_RC=$?
+if [ "$PY_RC" -ne 0 ]; then log "WARN: session list could not be parsed (python exit $PY_RC) — skipping pass (UNKNOWN, no action)"; exit 0; fi
 NCAND="$(wc -l < "$CAND_FILE" | tr -d ' ')"
 log "pool candidates (active, unattached, pool template): $NCAND"
 
@@ -145,8 +153,10 @@ print(best)
 PY
 }
 
-# count_assigned <db> <ids...>: prints the number of non-closed beads (wisps included) assigned to any id;
-# returns non-zero if ANY read failed (=> UNKNOWN, never "zero").
+# count_assigned <db> <ids>: prints how many beads in <db> belong to the session: open/in_progress/blocked/
+# hooked/deferred beads, plus OPEN and IN_PROGRESS wisps (other wisp statuses are not read). A bead belongs
+# to it when its assignee, or the gc.session_name the engine stamps in its metadata, is one of <ids>.
+# Returns non-zero if ANY read failed (=> UNKNOWN, never "zero").
 count_assigned() {
   local db="$1" ids="$2" out n total=0 step
   for step in list wisp_in_progress wisp_open; do
@@ -155,7 +165,7 @@ count_assigned() {
       wisp_in_progress) out="$(timeout "$CALL_TIMEOUT" "$BD" -C "$db" query --json 'ephemeral=true AND status=in_progress' --limit=0 2>/dev/null)" || return 1 ;;
       wisp_open)      out="$(timeout "$CALL_TIMEOUT" "$BD" -C "$db" query --json 'ephemeral=true AND status=open' --limit=0 2>/dev/null)" || return 1 ;;
     esac
-    n="$(printf '%s' "$out" | jq -e --arg ids "$ids" '[.[] | select(((.assignee // "") as $a | ($ids | split(" ")) | index($a)) != null)] | length' 2>/dev/null)" || return 1
+    n="$(printf '%s' "$out" | jq -e --arg ids "$ids" '($ids | split(" ")) as $mine | [.[] | select((((.assignee // "") as $a | $mine | index($a)) != null) or ((((.metadata // {})["gc.session_name"] // "") as $s | $mine | index($s)) != null))] | length' 2>/dev/null)" || return 1
     case "$n" in ''|*[!0-9]*) return 1 ;; esac
     total=$((total + n))
   done
@@ -187,6 +197,8 @@ PASS_START="$(date +%s)"   # real clock on purpose (NOW is overridable): the bud
 while IFS='|' read -r name sid alias sname tmpl wdir idle; do
   [ -z "$name" ] && continue
   SEEN="$SEEN $name "
+  # a malformed candidate line must not fall through as "idle": `[ "" -lt 600 ]` errors, which tests false
+  case "$idle" in ''|-|*[!0-9-]*) log "$name: candidate line has a non-numeric idle age ('$idle') — UNKNOWN, skipping"; continue ;; esac
   if [ $(( $(date +%s) - PASS_START )) -gt "$PASS_BUDGET_SEC" ]; then
     log "pass budget ${PASS_BUDGET_SEC}s spent — leaving $name and the rest for the next pass"; continue
   fi

@@ -59,7 +59,7 @@ PRE_TRIGGER='(^|[^[:alnum:]_/.~`-])'
 POST='([^[:alnum:]_/.-]|\.([^[:alnum:]]|$)|$)'
 hits() { # hits <strict|trigger> <file>  -> matching lines, "N:text"
   local pre="$PRE_TRIGGER"; [ "$1" = strict ] && pre="$PRE_STRICT"
-  grep -nE "${pre}/(${ALT})${POST}" "$2" 2>/dev/null
+  grep -nE "${pre}/(${ALT})${POST}" "$2" 2>/dev/null   # exit: 0 = token found, 1 = clean, >=2 = could not read
 }
 
 # ---- A. controls ------------------------------------------------------------------------------------
@@ -86,6 +86,12 @@ expect strict  clear 'https://example.com/docs/gate-done'                      '
 expect strict  clear 'the gate-done-marker file'                               'longer hyphenated word'
 expect strict  clear '/gate-done/x is a directory'                             'path continuing after the name'
 
+UNR="$(mktemp "${TMPDIR:-/tmp}/pool-prompt-unreadable.XXXXXX")"; printf '/gate-done\n' > "$UNR"; chmod 000 "$UNR"
+if [ -r "$UNR" ]; then echo "  ~ SKIP: cannot make a file unreadable here (running as a user that reads everything)"
+else hits strict "$UNR" >/dev/null; r=$?
+  [ "$r" -ge 2 ] && ok "unreadable file => grep exit $r, distinguishable from 'clean' (1)" || bad "unreadable file gave grep exit $r: it would pass as a clean template"; fi
+chmod 600 "$UNR"; rm -f "$UNR"
+
 # ---- C. templates -----------------------------------------------------------------------------------
 echo "C. agents/*/prompt.template.md"
 SCANNED=0
@@ -93,9 +99,12 @@ for f in "$AGENTS_DIR"/*/prompt.template.md; do
   [ -f "$f" ] || continue
   SCANNED=$((SCANNED+1)); agent="$(basename "$(dirname "$f")")"
   mode=trigger; case " $POOL_TEMPLATES " in *" $agent "*) mode=strict ;; esac
-  h="$(hits "$mode" "$f")"
-  if [ -z "$h" ]; then ok "$agent: no skill token ($mode)"
-  else bad "$agent: skill token present ($mode) — Claude Code will attach a skill_mention at boot:"; echo "$h" | sed 's/^/      /' | cut -c1-170; fi
+  h="$(hits "$mode" "$f")"; rc=$?
+  case "$rc" in
+    1) ok "$agent: no skill token ($mode)" ;;
+    0) bad "$agent: skill token present ($mode) — Claude Code will attach a skill_mention at boot:"; echo "$h" | sed 's/^/      /' | cut -c1-170 ;;
+    *) bad "$agent: template could not be read (grep exit $rc) — an unreadable template is not a clean one" ;;
+  esac
 done
 [ "$SCANNED" -ge 1 ] && ok "scanned $SCANNED template(s)" || bad "scanned 0 templates under $AGENTS_DIR: nothing was checked"
 for p in $POOL_TEMPLATES; do

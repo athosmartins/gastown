@@ -30,7 +30,8 @@ cat > "$T/fake/gc" <<'EOF'
 #!/usr/bin/env bash
 # fake gc: driven entirely by files under $FAKE_DIR; every state-changing call is appended to $FAKE_CALLS
 case "$1 $2" in
-  "session list") [ -n "${FAKE_LIST_FAIL:-}" ] && exit 1; cat "$FAKE_DIR/sessions.json" ;;
+  "session list") [ -n "${FAKE_LIST_FAIL:-}" ] && exit 1
+                  if [ -f "$FAKE_DIR/sessions.raw" ]; then cat "$FAKE_DIR/sessions.raw"; else cat "$FAKE_DIR/sessions.json"; fi ;;
   "rig list")     [ -n "${FAKE_RIG_FAIL:-}" ] && exit 1; cat "$FAKE_DIR/rigs.json" ;;
   "session peek") [ -f "$FAKE_DIR/pane.$3" ] && cat "$FAKE_DIR/pane.$3"; exit 0 ;;
   "session nudge") echo "nudge $3" >> "$FAKE_CALLS"; printf '%s' "$4" > "$FAKE_DIR/last_nudge.txt"; [ -n "${FAKE_NUDGE_FAIL:-}" ] && exit 1; exit 0 ;;
@@ -58,7 +59,7 @@ BUSY_PANE=$'✳ Gitifying… (15m 49s · ↓ 61.3k tokens)\n  esc to interrupt'
 
 reset() {
   # find, not a glob: the city DB fixture is a dot-file ('.gascity-gastown-hq.list.json') that '*.json' skips
-  find "$T/fake" -maxdepth 1 \( -name '*.json' -o -name 'pane.*' -o -name 'last_nudge.txt' \) -delete
+  find "$T/fake" -maxdepth 1 \( -name '*.json' -o -name 'sessions.raw' -o -name 'pane.*' -o -name 'last_nudge.txt' \) -delete
   rm -rf "$T/state" "$T/log" "$T/calls"; : > "$T/calls"; mkdir -p "$T/state"
   rigs_ok; }
 rigs_ok() { printf '{"rigs":[{"name":"gascity","path":"%s"},{"name":"whatsapp_automation","path":"%s"}]}' "$CITYDIR" "$RIGDIR" > "$T/fake/rigs.json"; }
@@ -136,6 +137,12 @@ baseline; SESS_LINES=""; sess batista-wa batista-wa 700; pane batista-wa "$IDLE_
 baseline; SESS_LINES=""; sess wa-worker-adhoc-aaa wa-worker 700 active true; run;         expect "human-attached session" 0 0
 baseline; SESS_LINES=""; sess wa-worker-adhoc-aaa wa-worker 700 asleep; run;              expect "session not active (asleep)" 0 0
 baseline; run FAKE_LIST_FAIL=1;                                                           expect "session list unreadable -> skip pass" 0 0
+baseline; printf '[{"id":"wa-1","status":"in_progress","assignee":"someone-else","metadata":{"gc.session_name":"wa-worker-gawispaaa"}}]' > "$T/fake/whatsapp_automation.list.json"; run
+                                                                                          expect "bead attributed ONLY via metadata gc.session_name" 0 0
+baseline; printf 'this is not json' > "$T/fake/sessions.raw"; run;                           expect "session list is not JSON -> skip pass" 0 0
+grep -q 'could not be parsed' "$T/log" && ok "...and says so (not a silent '0 candidates')" || bad "unparseable session list was logged as if it were zero sessions"
+baseline; printf '{"error":"boom"}' > "$T/fake/sessions.raw"; run;                        expect "session list is an error envelope (no 'sessions' key) -> skip pass" 0 0
+grep -q 'could not be parsed' "$T/log" && ok "...and says so" || bad "error-envelope session list read as zero sessions"
 baseline; bead_json in_progress someone-else whatsapp_automation list; run;              expect "ANOTHER session's bead does not shield this one (exact assignee match)" 1 0
 
 # ---- safety valves -----------------------------------------------------------------------------------------
