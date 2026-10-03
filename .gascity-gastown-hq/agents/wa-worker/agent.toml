@@ -99,6 +99,14 @@
 # E disco > 15 GB livre por periodo sustentado - subir de volta tambem e
 # executar a regra dele, sem precisar perguntar de novo.
 #
+# Raised 2 -> 3 on 2026-10-03 (~08:15 BRT, Athos, AskUserQuestion in the Mayor's
+# session: "Subir para 3 (Recomendado)"). Why: 72 beads approved and 0 in flight
+# (story:approved=72, fila_pool_cap=68). Machine at the time: load5 ~36-39/10
+# cores, swap used 3.2 GB, disk free 13 GB, memory free 53% (25/09, when the cap
+# went to 2: swap 9 GB, disk 4.4 GB). The Pilot plist PILOT_WA_WORKER_MAX went to 3
+# in the same step (story-ga-o3o09z.sh: plist <= agent.toml). WAY BACK TO 2, part
+# of the same decision, no need to ask again: swap used > 6 GB, OR disk free < 6 GB.
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -107,7 +115,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
