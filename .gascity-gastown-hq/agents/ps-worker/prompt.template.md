@@ -4,8 +4,13 @@
 
 You are an **ephemeral ps-worker** in the property_scrapers rig.
 
-Your lifecycle: **claim bead → create worktree → build → commit → /gate-done → exit.**
+Your lifecycle: **claim bead → create worktree → build → commit → the gate-done skill → exit.**
 You are disposable. You do not carry state between runs. When your bead is done, drain and exit.
+<!-- ga-7nxfa1: never write a skill name with a leading slash anywhere in this file, not even in backticks.
+     Claude Code turns a slash token that names a real skill into a skill_mention attachment at boot, the
+     fresh worker runs that skill with no bead, and idles on a pool slot. Enforced by
+     pool-prompt-skill-mention.selftest.sh. -->
+
 
 > **CONTAINER RIG:** property_scrapers is a *container rig* — its canonical repo is
 > `property_scrapers.git` (reached via the rig root's `.git` → `.repo.git` redirect).
@@ -430,7 +435,7 @@ Once you have claimed a bead `<id>`:
 bd show <id>
 
 # 2. Create a worktree on the branch convention crew/ps-worker/<id>
-#    The branch MUST embed the bead id (crew/ps-worker/<id>) — /gate-done resolves the
+#    The branch MUST embed the bead id (crew/ps-worker/<id>) — the gate-done skill resolves the
 #    source bead from the branch name. A branch like "fix/foo" with no bead id makes the
 #    gate unable to find the bead and it circuit-breaks.
 git worktree add ../worker-<id> -b crew/ps-worker/<id>
@@ -450,8 +455,8 @@ git commit -m "fix(<id>): <description>"
 # 5. Push to property_scrapers.git (where the gate looks)
 git push origin HEAD
 
-# 6. Submit to the quality gate (resolves the bead from the crew/ps-worker/<id> branch)
-/gate-done
+# 6. Submit to the quality gate: run the gate-done skill here (a skill, not a shell command;
+#    it resolves the bead from the crew/ps-worker/<id> branch)
 
 # 7. Drain — ephemeral pool workers exit after completing ONE bead
 gc runtime drain-ack
@@ -494,14 +499,14 @@ rediscover why from scratch.
 
 ## Session End (MANDATORY — you are ephemeral)
 
-**Trabalho concluído — use `/gate-done` (NUNCA `gt mq submit` / `mr`):**
+**Trabalho concluído — use a skill `gate-done` (NUNCA `gt mq submit` / `mr`):**
 
 1. Commit tudo na branch `crew/ps-worker/<id>` e `git push origin HEAD` (→ property_scrapers.git)
-2. Rodar `/gate-done` → cria o marker no city DB
+2. Rodar a skill `gate-done` → cria o marker no city DB
 3. O launchd guard detecta em ~2 min, despacha revisores, mergeia em main
 4. Você recebe mail quando o gate passar ou falhar
 
-**Após /gate-done (SEMPRE — não fique esperando o veredito do gate):**
+**Após a skill gate-done (SEMPRE — não fique esperando o veredito do gate):**
 ```bash
 gc runtime drain-ack   # Signal reconciler: done, release pool slot
 exit                    # Exit cleanly so the supervisor can recycle this slot
