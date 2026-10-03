@@ -41,6 +41,12 @@
 #                   data loss on EACH prior occurrence. See
 #                   _survival_content_equivalent for the exact (conservative,
 #                   fails closed to plain divergent on any ambiguity) check.
+#                   ga-cqnm73: ALSO reached by PATCH equivalence — `git cherry
+#                   <main_ref> <sha>` finding a patch-id twin on main for every
+#                   commit the sha carries — because the byte check stops
+#                   matching once a later commit touches the same file (the same
+#                   wa-k8l0m sha, 12 days on). See _survival_patch_equivalent.
+#                   A git failure there is `unresolved`, never `divergent`.
 #       divergent — neither is an ancestor of the other AND the touched-file
 #                   content differs (or content_equivalent could not be proven,
 #                   e.g. a merge commit or a deleted/moved path): a genuine
@@ -111,6 +117,12 @@ ALERT_COOLDOWN="${SURVIVAL_ALERT_COOLDOWN:-21600}"  # 6h
 # shared-remote clobbers (ordinary runs show divergent=0) — suspend per-bead
 # reopen and send ONE aggregated alarm instead. See escalate_surge below.
 SURGE_THRESHOLD="${SURVIVAL_DIVERGENT_SURGE_THRESHOLD:-5}"
+# ga-cqnm73: bounds for the two reads that can fail or hang under load and used
+# to be silently read as an ANSWER — `bd show` (a bead's status) and `git cherry`
+# (patch-equivalence; measured 2.7s against 1255 upstream-only commits, so 60s is
+# ample headroom, not a tight budget).
+BD_TIMEOUT="${SURVIVAL_BD_TIMEOUT:-20}"
+CHERRY_TIMEOUT="${SURVIVAL_CHERRY_TIMEOUT:-60}"
 
 # DRY_RUN: 1 = report only, never mutate (no push/ref-move/bead/mail). Supports
 # --dry-run and SURVIVAL_DRY_RUN.
@@ -208,6 +220,18 @@ survival_classify() {
   if _survival_content_equivalent "$gdir" "$container" "$sha" "$mref"; then
     echo "content_equivalent"; return 0
   fi
+
+  # ga-cqnm73: the byte check above compares the file's CURRENT blob on mref, so
+  # it stops matching as soon as a later commit touches the same file (wa-k8l0m
+  # 5963c0c23, 12 days and 1255 commits after its fix landed as 5c30b3a62). The
+  # patch itself does not evolve: git cherry matches by patch-id. Three answers,
+  # not two — a git failure is NOT "not equivalent" (that is the divergent path
+  # and ends in a bead reopen + Mayor mail), it is "could not get a real answer".
+  res=$(_survival_patch_equivalent "$gdir" "$container" "$sha" "$mref")
+  case "$res" in
+    yes)   echo "content_equivalent"; return 0 ;;
+    error) echo "unresolved"; return 0 ;;
+  esac
   echo "divergent"
 }
 
@@ -261,31 +285,154 @@ EOF_CE_FILES
   return 0
 }
 
-# _bead_already_closed <beadcity> <bead> — ga-f7czjc: true (rc0) iff the bead
-# is CURRENTLY status=closed. Independent of, and complementary to,
-# _survival_content_equivalent: that check proves equivalence by diffing
-# file content against origin/main RIGHT NOW, which is structurally fragile
-# once the repo keeps evolving after a duplicate fix lands (unrelated later
-# commits touching the same files make a once-fully-matching sha look
-# "divergent" again, even though the substantive fix never moved). A CLOSED
-# bead is a different, more durable signal: a human already looked at this
-# exact concern and resolved it -- possibly this exact sha, possibly more
-# than once (wa-k8l0m: 3 separate manual closures, each re-confirming zero
-# data loss, before this function existed). Re-opening a bead a human
-# already closed, to tell them the same thing again, is the actual waste.
+# _survival_patch_equivalent <git_dir> <container> <sha> <mref> — ga-cqnm73.
+# Echoes yes | no | error: "yes" iff EVERY commit <sha> carries that <mref> lacks
+# (the range mref..sha) has a patch-id twin already in <mref>'s history, per
+# `git cherry <mref> <sha>` (every line "-"). Complements the byte check in
+# _survival_content_equivalent, which only sees the file as it is on <mref> NOW
+# and so fails the moment a later, unrelated commit touches the same file; a
+# patch-id does not move when the file around it does.
 #
-# Fails closed on missing information: an empty beadcity/bead, or a status
-# read that errors/returns nothing, is NOT treated as closed -- only an
-# explicit "status":"closed" suppresses escalation. A genuinely open bead
-# with a genuinely divergent sha must keep escalating exactly as before.
-_bead_already_closed() {
-  local beadcity="$1" bead="$2" bead_status
-  { [ -z "$beadcity" ] || [ -z "$bead" ]; } && return 1
+# What a twin in history does and does not prove: it proves the change LANDED
+# on <mref> (a clobber is a push that drops commits, so a dropped commit has no
+# twin there); it does not prove the change is still live (a later deliberate
+# revert keeps the twin). The sweep exists to catch the first, so that is the
+# right question. Conservative on everything else:
+#   • a "+" line (some commit has no twin)                       → no
+#   • zero lines (no non-merge commit to compare)                → no
+#   • a MERGE commit anywhere in mref..sha — `git cherry` skips merges silently,
+#     so conflict-resolution content could hide there             → no
+#   • git failed, timed out, or printed something that is not a "+/-  <sha>"
+#     line — NOT an answer, so NOT "no"                           → error
+# "error" matters: the caller turns "no" into a bead reopen + Mayor mail, which a
+# transient git failure must never do (same three-state rule as _is_ancestor).
+# Like _is_ancestor, warn is pinned to fd2 so it can't leak into `res=$(...)`.
+_survival_patch_equivalent() {
+  local gdir="$1" container="$2" sha="$3" mref="$4" out rc total nomerge line seen=0
+  out=$(_git_in_bounded "$CHERRY_TIMEOUT" "$gdir" "$container" cherry "$mref" "$sha" 2>&1); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "git cherry $mref $sha failed rc=$rc: $out" 1>&2; echo "error"; return 0
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      "- "[0-9a-f]*) seen=$((seen+1)) ;;
+      "+ "[0-9a-f]*) echo "no"; return 0 ;;
+      *) warn "git cherry $mref $sha printed an unrecognised line: $line" 1>&2; echo "error"; return 0 ;;
+    esac
+  done <<EOF_CHERRY
+$out
+EOF_CHERRY
+  [ "$seen" -gt 0 ] || { echo "no"; return 0; }
+
+  total=$(_git_in_bounded "$CHERRY_TIMEOUT" "$gdir" "$container" rev-list --count "${mref}..${sha}" 2>/dev/null) || total=""
+  nomerge=$(_git_in_bounded "$CHERRY_TIMEOUT" "$gdir" "$container" rev-list --count --no-merges "${mref}..${sha}" 2>/dev/null) || nomerge=""
+  # Each count on its own: concatenated, one failed (empty) count plus one good
+  # one still looks like a clean number and would fall through as a plain "no".
+  case "$total" in ""|*[!0-9]*) total="" ;; esac
+  case "$nomerge" in ""|*[!0-9]*) nomerge="" ;; esac
+  if [ -z "$total" ] || [ -z "$nomerge" ]; then
+    warn "rev-list --count ${mref}..${sha} failed — cannot rule out a merge commit hiding from git cherry" 1>&2; echo "error"; return 0
+  fi
+  [ "$total" = "$nomerge" ] || { echo "no"; return 0; }
+  echo "yes"
+}
+
+# _bead_closed_state <beadcity> <bead> — ga-f7czjc, three-state since ga-cqnm73.
+# Echoes ONE of:
+#   closed  — bd answered and the status is "closed": a human already resolved
+#             this exact concern (wa-k8l0m: 3 manual closures, each re-confirming
+#             zero data loss). Re-opening it to say the same thing again is the
+#             waste ga-f7czjc removes. Independent of, and complementary to,
+#             _survival_content_equivalent / _survival_patch_equivalent.
+#   open    — bd answered and the status is anything else.
+#   none    — there is no bead to ask: empty id/city, or bd answered "no issue
+#             found". Nothing was silenced, so the caller escalates as it always did.
+#   unknown — bd FAILED, timed out, or answered something unreadable (empty, bad
+#             JSON, no status). Not an answer: this used to collapse into "not
+#             closed" and so into a reopen + Mayor mail (wa-k8l0m, 03/10: the same
+#             sha was skipped as closed at 11:38 and escalated at 12:11, bead
+#             still closed, nothing changed but the read). The caller must treat
+#             it as INERT — no escalation this sweep, counted and logged, retried
+#             on the next sweep.
+# warn is pinned to fd2 for the same reason as in _is_ancestor.
+_bead_closed_state() {
+  local beadcity="$1" bead="$2" out rc bead_status
+  { [ -z "$beadcity" ] || [ -z "$bead" ]; } && { echo "none"; return 0; }
+  # stdout only: bd prints its JSON there, and stderr noise must not reach jq.
+  out=$(timeout "$BD_TIMEOUT" bd -C "$beadcity" show "$bead" --json 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # bd's own "no such bead" answer is {"error":"no issues found ..."} on stdout
+    # with rc=1 — a real answer (nothing to defer to), unlike a connection failure
+    # or timeout (rc 124). If that wording ever changes this falls into unknown,
+    # which is the inert direction.
+    if printf '%s' "$out" | jq -e '(.error // "") | test("no issues? found")' >/dev/null 2>&1; then
+      echo "none"; return 0
+    fi
+    warn "bd show $bead (city $beadcity) failed rc=$rc — bead state unknown" 1>&2; echo "unknown"; return 0
+  fi
   # 'status' collides with a read-only variable in some invoking shells
   # (observed live) -- use an unambiguous local name instead.
-  bead_status=$(bd -C "$beadcity" show "$bead" --json 2>/dev/null \
-    | jq -r 'if type=="array" then .[0] else . end | .status // empty' 2>/dev/null)
-  [ "$bead_status" = "closed" ]
+  bead_status=$(printf '%s' "$out" \
+    | jq -r 'if type=="array" then .[0] else . end | .status // empty' 2>/dev/null) || bead_status=""
+  case "$bead_status" in
+    closed) echo "closed" ;;
+    "")     warn "bd show $bead (city $beadcity) returned no readable status — bead state unknown" 1>&2; echo "unknown" ;;
+    *)      echo "open" ;;
+  esac
+}
+
+# _bead_snapshot <beadcity> <bead> — ga-cqnm73. Echoes "<status>|<orphan_label 0|1>|<comment_count>"
+# from a fresh `bd show`, or the single word "unknown" when the read failed, timed
+# out, or had no readable status. Used before and after the escalation writes so
+# the Mayor mail can say what the bead ACTUALLY looks like, not what the sweep
+# meant to do to it.
+_bead_snapshot() {
+  local beadcity="$1" bead="$2" out rc
+  { [ -z "$beadcity" ] || [ -z "$bead" ]; } && { echo "unknown"; return 0; }
+  out=$(timeout "$BD_TIMEOUT" bd -C "$beadcity" show "$bead" --json 2>/dev/null); rc=$?
+  [ "$rc" -eq 0 ] || { echo "unknown"; return 0; }
+  out=$(printf '%s' "$out" | jq -r 'if type=="array" then .[0] else . end
+      | select(.status != null and .status != "")
+      | "\(.status)|\(if ((.labels // []) | index("gate:merge-orphan")) != null then 1 else 0 end)|\(.comment_count // "")"' 2>/dev/null) || out=""
+  [ -n "$out" ] && echo "$out" || echo "unknown"
+}
+
+# _orphan_write_report <before> <after> — ga-cqnm73. Pure: turns two
+# _bead_snapshot results into the sentence the Mayor mail carries. The mail used
+# to state "The sweep reopened + labelled gate:merge-orphan + commented the
+# source bead" unconditionally, while the three bd writes beneath it are all
+# `2>/dev/null || true` — wa-k8l0m was still closed and unlabelled when that mail
+# arrived. Every claim here comes from the re-read AFTER the writes; anything the
+# re-read cannot show is said to be unconfirmed, never assumed done.
+_orphan_write_report() {
+  local before="$1" after="$2"
+  local bstatus bcount astatus alabel acount reopen label comment
+  if [ "$after" = "unknown" ]; then
+    echo "WRITES UNVERIFIED: the sweep tried to reopen the source bead, add gate:merge-orphan and comment, but could not re-read the bead afterwards (bd failed or timed out) — none of the three is confirmed. Check the bead by hand."
+    return 0
+  fi
+  IFS='|' read -r astatus alabel acount <<< "$after"
+  if [ "$before" = "unknown" ]; then bstatus=""; bcount=""; else IFS='|' read -r bstatus _ bcount <<< "$before"; fi
+
+  if [ "$astatus" = "closed" ]; then
+    reopen="NOT reopened (bead is still closed)"
+  elif [ "$bstatus" = "closed" ]; then
+    reopen="reopened (was closed, now $astatus)"
+  elif [ -n "$bstatus" ]; then
+    reopen="no reopen needed (bead was already $bstatus)"
+  else
+    reopen="bead is $astatus now (its state before the writes could not be read, so a reopen is not confirmed)"
+  fi
+  if [ "$alabel" = "1" ]; then label="gate:merge-orphan label present"; else label="gate:merge-orphan label NOT applied"; fi
+  if ! [[ "$acount" =~ ^[0-9]+$ && "$bcount" =~ ^[0-9]+$ ]]; then
+    comment="comment NOT confirmed (comment count unreadable before or after)"
+  elif [ "$acount" -gt "$bcount" ]; then
+    comment="comment added"
+  else
+    comment="comment NOT confirmed (comment count did not increase)"
+  fi
+  echo "Source bead re-read after the sweep's writes: $reopen; $label; $comment."
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -309,6 +456,17 @@ git_in() {
     git --git-dir="$gdir" "$@"
   else
     git -C "$gdir" "$@"
+  fi
+}
+
+# _git_in_bounded <timeout_s> <git_dir> <is_container> <git-args...> — git_in under
+# `timeout` (git_in is a shell function, so `timeout git_in ...` cannot work).
+_git_in_bounded() {
+  local t="$1" gdir="$2" container="$3"; shift 3
+  if [ "$container" = "1" ]; then
+    timeout "$t" git --git-dir="$gdir" "$@"
+  else
+    timeout "$t" git -C "$gdir" "$@"
   fi
 }
 
@@ -426,7 +584,7 @@ DEDUP_STREAM=$(printf '%s\n' "$LEDGER_DEDUP" \
   | jq -rc '.' 2>/dev/null \
   | awk 'match($0,/"merge_sha":"[0-9a-f]+"/){ k=substr($0,RSTART,RLENGTH); if(!s[k]++) print }' 2>/dev/null || true)
 
-SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0; CONTENT_EQUIV=0; CLOSED_BEAD_SKIP=0
+SURVIVED=0; HEALED=0; DIVERGED=0; UNRESOLVED=0; CHECKED=0; PRUNED=0; DOWNGRADED=0; CONTENT_EQUIV=0; CLOSED_BEAD_SKIP=0; BEAD_STATE_UNKNOWN=0
 # NOTE: macOS /bin/bash is 3.2 — NO associative arrays. Dedup fetches with an
 # indexed array + linear membership check (same pattern as merged-bead-janitor).
 declare -a KEEP_LINES=()
@@ -485,16 +643,23 @@ escalate_divergent() {
     log "WOULD-ESCALATE(divergent) $sha ($rig) — reopen+label+comment bead, mail Mayor, ntfy P4"
     return 0
   fi
+  # ga-cqnm73: the mail below used to assert the writes happened. They are all
+  # best-effort (`|| true`), so what it reports now is read back from the bead.
+  local writes_note="No source bead is recorded in the ledger entry, so nothing was reopened, labelled or commented." snap_before="" snap_after=""
   if [ -n "$bead" ]; then
+    snap_before=$(_bead_snapshot "$beadcity" "$bead")
     bd -C "$beadcity" reopen "$bead" 2>/dev/null || true   # surface lost work (no-op if open)
     bd -C "$beadcity" label add "$bead" "gate:merge-orphan" -q 2>/dev/null || true
     bd -C "$beadcity" comment "$bead" \
-      "ORPHANED (ga-lzj2e survival sweep): the gate-merged SHA $sha (branch $branch, gate_run ${gaterun:-?}) is NO LONGER an ancestor of $rig origin/$rdefault ($origin_now). An async push to the shared remote clobbered it with divergent work. The merge cannot be safely FF-re-landed (would drop the other side). Re-anchor needed: cherry-pick this branch onto current origin/$rdefault and re-merge, OR confirm the change is obsolete and close. Escalated to Mayor." 2>/dev/null || true
+      "ORPHANED (ga-lzj2e survival sweep): the gate-merged SHA $sha (branch $branch, gate_run ${gaterun:-?}) is NO LONGER an ancestor of $rig origin/$rdefault ($origin_now). An async push to the shared remote clobbered it with divergent work. The merge cannot be safely FF-re-landed (would drop the other side). Re-anchor needed: cherry-pick this branch onto current origin/$rdefault and re-merge, OR confirm the change is obsolete and close. Escalating to Mayor." 2>/dev/null || true
+    snap_after=$(_bead_snapshot "$beadcity" "$bead")
+    writes_note=$(_orphan_write_report "$snap_before" "$snap_after")
+    log "escalate_divergent $sha: $writes_note"
   fi
   gc --city "$GC_CITY" mail send mayor \
     -s "Gate survival: $rig merge $sha orphaned (shared-remote clobber)" \
-    -m "$(printf 'A gate-verified %s merge was orphaned from the shared remote AFTER the gate exited (ga-lzj2e async gap).\n\n  rig:        %s\n  merge_sha:  %s\n  branch:     %s\n  bead:       %s (city %s)\n  gate_run:   %s\n  origin/%s now: %s\n  note:       %s\n\nClassification: DIVERGENT — origin/%s and the merge each carry unique commits, so a FF re-push is impossible and a forced push would drop the other side. The sweep reopened + labelled gate:merge-orphan + commented the source bead. Re-anchor decision is yours: cherry-pick the branch onto current origin/%s and re-merge via the gate, or confirm obsolete and close.' \
-      "$rig" "$rig" "$sha" "$branch" "${bead:-<none>}" "$beadcity" "${gaterun:-<none>}" "$rdefault" "$origin_now" "${extra:-<none>}" "$rdefault" "$rdefault")" \
+    -m "$(printf 'A gate-verified %s merge was orphaned from the shared remote AFTER the gate exited (ga-lzj2e async gap).\n\n  rig:        %s\n  merge_sha:  %s\n  branch:     %s\n  bead:       %s (city %s)\n  gate_run:   %s\n  origin/%s now: %s\n  note:       %s\n\nClassification: DIVERGENT — origin/%s and the merge each carry unique commits, so a FF re-push is impossible and a forced push would drop the other side. %s Re-anchor decision is yours: cherry-pick the branch onto current origin/%s and re-merge via the gate, or confirm obsolete and close.' \
+      "$rig" "$rig" "$sha" "$branch" "${bead:-<none>}" "$beadcity" "${gaterun:-<none>}" "$rdefault" "$origin_now" "${extra:-<none>}" "$rdefault" "$writes_note" "$rdefault")" \
     2>/dev/null || warn "could not mail Mayor for orphan $sha"
   notify_athos -t "Gate survival: ORPHAN" -p 4 \
     "$rig merge $sha orphaned from origin/$rdefault by async shared-remote clobber — needs re-anchor (ga-lzj2e). Mayor notified."
@@ -595,7 +760,7 @@ while IFS= read -r entry; do
 
     content_equivalent)
       CONTENT_EQUIV=$((CONTENT_EQUIV+1))
-      log "content-equivalent $SHA ($RIG) — not an ancestor of origin/$RDEFAULT ($ORIGIN_NOW) by raw history, but every touched file already matches byte-for-byte (same fix landed under a different sha) — no-op, not escalating"
+      log "content-equivalent $SHA ($RIG) — not an ancestor of origin/$RDEFAULT ($ORIGIN_NOW) by raw history, but its change is already there under a different sha (every touched file matches byte-for-byte, or git cherry finds a patch-id twin for every commit) — no-op, not escalating"
       # Same as survived: a prior false orphan alarm on THIS exact sha (e.g.
       # wa-k8l0m re-escalating every sweep before this fix existed) is over.
       [ -f "$ALERT_DIR/$SHA" ] && rm -f "$ALERT_DIR/$SHA" 2>/dev/null || true
@@ -712,8 +877,24 @@ else
     # ga-f7czjc: an already-closed bead means a human already verified this
     # exact concern -- do not reopen/re-escalate just because content_equivalent
     # (a point-in-time file diff) can no longer prove equivalence once the repo
-    # has moved on for unrelated reasons. See _bead_already_closed's own comment.
-    if [ -n "$BEAD" ] && [ -n "$BEADCITY" ] && _bead_already_closed "$BEADCITY" "$BEAD"; then
+    # has moved on for unrelated reasons. See _bead_closed_state's own comment.
+    # ga-cqnm73: three states. A failed/timed-out/unreadable bd read is NOT
+    # "not closed" — it used to fall through to escalate_divergent (reopen + Mayor
+    # mail) on a bead that was closed all along. Any answer other than an explicit
+    # open/none is inert this sweep (default arm), visible in the summary counter,
+    # and re-tried next sweep; the sha stays in the ledger and un-stamped.
+    BEAD_STATE="none"
+    [ -n "$BEAD" ] && [ -n "$BEADCITY" ] && BEAD_STATE=$(_bead_closed_state "$BEADCITY" "$BEAD")
+    case "$BEAD_STATE" in
+      open|none) ;;   # no human closure to defer to → escalate below, exactly as before
+      closed) ;;      # handled just below
+      *)
+        BEAD_STATE_UNKNOWN=$((BEAD_STATE_UNKNOWN+1))
+        warn "$SHA ($RIG) is divergent from origin/$RDEFAULT but the state of bead $BEAD could not be read (got '${BEAD_STATE:-}') — NOT reopening/mailing this sweep, will re-check on the next one (ga-cqnm73)"
+        continue
+        ;;
+    esac
+    if [ "$BEAD_STATE" = "closed" ]; then
       CLOSED_BEAD_SKIP=$((CLOSED_BEAD_SKIP+1))
       log "$SHA ($RIG) is content-divergent from origin/$RDEFAULT but bead $BEAD is ALREADY status=closed — treating as prior human confirmation, NOT reopening/escalating (ga-f7czjc)."
       if [ "$DRY_RUN" = "1" ]; then
@@ -744,7 +925,7 @@ if [ "$PRUNED" -gt 0 ] && [ "$DRY_RUN" = "0" ]; then
   fi
 fi
 
-log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED content_equivalent=$CONTENT_EQUIV closed_bead_skip=$CLOSED_BEAD_SKIP healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
+log "=== survival-sweep complete — checked=$CHECKED survived=$SURVIVED content_equivalent=$CONTENT_EQUIV closed_bead_skip=$CLOSED_BEAD_SKIP bead_state_unknown=$BEAD_STATE_UNKNOWN healed=$HEALED divergent=$DIVERGED unresolved=$UNRESOLVED downgraded=$DOWNGRADED pruned=$PRUNED dry_run=$DRY_RUN ==="
 # Per-event notifies (heal / orphan / unresolved) already fired above — loud and
 # per-sha rate-limited; no duplicate roll-up here.
 exit 0

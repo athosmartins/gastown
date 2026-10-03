@@ -34,7 +34,8 @@ rc1() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d — expected 
 SURVIVAL_LIB_ONLY=1 source "$SWEEP" \
   || { echo "FATAL: could not source sweep in lib-only mode"; exit 1; }
 for fn in survival_classify rig_gitdir git_in iso_to_epoch entry_within_retention \
-          raw_fetch recheck_divergent divergent_surge parse_entry_fields; do
+          raw_fetch recheck_divergent divergent_surge parse_entry_fields \
+          _git_in_bounded _survival_patch_equivalent _bead_closed_state _bead_snapshot _orphan_write_report; do
   type "$fn" >/dev/null 2>&1 || { echo "FATAL: $fn not defined by sweep"; exit 1; }
 done
 
@@ -44,22 +45,58 @@ trap 'rm -rf "$T" 2>/dev/null || true' EXIT
 # ga-ck3sz7: every full-sweep child below (`bash "$SWEEP"`) runs on a PATH with NO real gc/bd
 # (selftest-sandbox-path.lib.sh). The sweep reopens/labels/comments beads and mails the Mayor; SURVIVAL_DRY_RUN=1 is
 # the only thing standing between it and the real town, and a fake bd earlier in PATH only holds while $T exists.
-# Here "command not found" is the only outcome. The fake `bd` (used by section 13) lives in $T/bin from the start,
-# so the children that never had a bd stub (surge tests) get the same answer for an unknown bead: "" = not closed.
+# Here "command not found" is the only outcome. The fake `bd` (used by sections 13/14) lives in $T/bin from the start.
+# ga-cqnm73: an UNKNOWN bead gets an EMPTY answer, which the sweep now reads as "could not tell" (inert), no longer
+# as "not closed". The surge tests (11/12) never reach it: their ledger entries carry no bead id.
 . "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
 FAKE_BD_DIR="$T/bin"; mkdir -p "$FAKE_BD_DIR"
+FAKE_BD_STATE="$T/bdstate"; mkdir -p "$FAKE_BD_STATE"; export FAKE_BD_STATE
+FAKE_GC_DIR="$T/gcmail"; mkdir -p "$FAKE_GC_DIR"; export FAKE_GC_DIR
 cat > "$FAKE_BD_DIR/bd" <<'FAKEBD'
 #!/usr/bin/env bash
-# invoked as: bd -C <city> show <bead> --json
-bead="$4"
-case "$bead" in
-  closed-story) echo '{"id":"closed-story","status":"closed"}' ;;
-  closed-story-array) echo '[{"id":"closed-story-array","status":"closed"}]' ;;
-  open-story) echo '{"id":"open-story","status":"open"}' ;;
-  *) echo "" ;;  # not found / empty response
+# invoked as: bd -C <city> show <bead> --json | reopen <bead> | comment <bead> <text> | label add <bead> <label> -q
+verb="$3"; bead="$4"; S="${FAKE_BD_STATE:-/nonexistent}"
+calls() { local f="$S/$1.calls" n=0; [ -f "$f" ] && n=$(cat "$f"); n=$((n+1)); echo "$n" > "$f"; echo "$n"; }
+case "$verb" in
+  show)
+    case "$bead" in
+      closed-story) echo '{"id":"closed-story","status":"closed"}' ;;
+      closed-story-array) echo '[{"id":"closed-story-array","status":"closed"}]' ;;
+      open-story) echo '{"id":"open-story","status":"open"}' ;;
+      failing-story) echo "Error: dolt connection refused" >&2; exit 1 ;;          # bd FAILED
+      hanging-story) sleep 5; echo '{"id":"hanging-story","status":"closed"}' ;;   # bd HUNG (caller times out)
+      garbage-story) echo "not json at all" ;;
+      nostatus-story) echo '{"id":"nostatus-story"}' ;;
+      empty-array-story) echo '[]' ;;
+      nonexistent-story)                                                          # bd's real "no such bead" answer
+        echo '{"error":"no issues found matching the provided IDs","schema_version":1}'
+        echo "Error fetching nonexistent-story: no issue found matching" >&2; exit 1 ;;
+      wr-fail) echo '{"id":"wr-fail","status":"open","labels":[],"comment_count":7}' ;;   # every write below is a silent no-op
+      wr-blind)                                                                    # readable twice, then bd drops
+        if [ "$(calls wr-blind)" -le 2 ]; then echo '{"id":"wr-blind","status":"open","labels":[],"comment_count":3}'
+        else echo "Error: connection lost" >&2; exit 1; fi ;;
+      wr-ok*)                                                                      # stateful: the writes really land
+        st="$(cat "$S/$bead.status" 2>/dev/null || echo open)"; cnt="$(cat "$S/$bead.count" 2>/dev/null || echo 7)"
+        if grep -qx 'gate:merge-orphan' "$S/$bead.labels" 2>/dev/null; then lbl='["gate:merge-orphan"]'; else lbl='[]'; fi
+        echo "{\"id\":\"$bead\",\"status\":\"$st\",\"labels\":$lbl,\"comment_count\":$cnt}" ;;
+      *) echo "" ;;  # not found / empty response
+    esac ;;
+  reopen)  case "$bead" in wr-ok*) echo open > "$S/$bead.status" ;; esac ;;
+  comment) case "$bead" in wr-ok*) c="$(cat "$S/$bead.count" 2>/dev/null || echo 7)"; echo $((c+1)) > "$S/$bead.count" ;; esac ;;
+  label)   case "$5" in wr-ok*) echo "$6" >> "$S/$5.labels" ;; esac ;;
 esac
+exit 0
 FAKEBD
 chmod +x "$FAKE_BD_DIR/bd"
+# Fake `gc`: records each `mail send` as one file of one-arg-per-line. A stub in $T/bin only (sandbox lib: gc/bd may
+# ONLY ever be stubs) — when $T goes away the child has no gc at all.
+cat > "$FAKE_BD_DIR/gc" <<'FAKEGC'
+#!/usr/bin/env bash
+n=$(ls "${FAKE_GC_DIR:-/nonexistent}" 2>/dev/null | wc -l | tr -d ' ')
+{ for a in "$@"; do printf '%s\n' "$a"; done; } > "${FAKE_GC_DIR:-/nonexistent}/call.$n" 2>/dev/null
+exit 0
+FAKEGC
+chmod +x "$FAKE_BD_DIR/gc"
 sandbox_path_init "$T" git jq timeout || exit 2   # git: the sweep's ancestry checks; jq: ledger parse; timeout: bounds fetch; bd is the fake above
 R="$T/repo"
 git init -q -b main "$R"
@@ -181,6 +218,123 @@ eq "is-ancestor rc=128 (git failure) on the FIRST direction checked -> unresolve
 echo "── 1d. ga-kj7fpt: same failure, but under the ACTUAL production config (SURVIVAL_LOG_STDOUT=1) ──"
 eq "is-ancestor rc=128 UNDER PRODUCTION LOGGING CONFIG -> still unresolved, NOT divergent" \
   "$(SURVIVAL_LOG_STDOUT=1 PATH="$FAKE_GIT_ERR_DIR:$PATH" survival_classify "$R" 0 "$C3" origin/main)" "unresolved"
+
+# ── 1e. ga-cqnm73: patch-equivalence (git cherry) — the fix landed under a
+# different sha AND a later commit then touched the same file. wa-k8l0m
+# 5963c0c23 (21/09) vs 5c30b3a62 + 1255 later commits (03/10): the byte check in
+# _survival_content_equivalent compares the file as it is on main NOW, so it can
+# no longer match, and the sweep mailed the Mayor a false "orphaned" alarm.
+# git cherry matches by patch-id, which does not move when the file does.
+echo "── 1e. ga-cqnm73: patch-equivalence when the file evolved after the patch ──"
+PE_BLOB_PATCH="PATCH-B"
+git -C "$R" checkout -q -b pe-sha "$C1"
+echo "$PE_BLOB_PATCH" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "the gate-merged sha"
+PE1=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q -b pe-main "$C1"
+echo "$PE_BLOB_PATCH" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "same patch, landed under a different sha"
+PE2=$(git -C "$R" rev-parse HEAD)
+echo "later unrelated evolution of the same file" >> "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "a later commit touches the same file"
+PE3=$(git -C "$R" rev-parse HEAD)
+# Controls: a DIFFERENT patch; a sha whose only twin is one of its two commits; a hidden merge.
+git -C "$R" checkout -q -b pe-diff "$C1"
+echo "A-GENUINELY-DIFFERENT-PATCH" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "different patch"
+PEX=$(git -C "$R" rev-parse HEAD)
+git -C "$R" checkout -q -b pe-partial "$C1"
+echo "$PE_BLOB_PATCH" > "$R/b"; git -C "$R" add .; git -C "$R" commit -q -m "twin of PE2 (patch present on main)"
+echo "z" > "$R/z"; git -C "$R" add .; git -C "$R" commit -q -m "second commit, NO twin on main"
+PEP=$(git -C "$R" rev-parse HEAD)
+# 2-parent commit whose tree is PE1's, second parent C1 (already in mref's history, so the merge adds no commit
+# to mref..sha besides itself and PE1): every non-merge commit in the range HAS a twin, only the merge could hide
+# unreviewed conflict-resolution content — `git cherry` skips merges silently.
+PEM=$(git -C "$R" commit-tree "${PE1}^{tree}" -p "$PE1" -p "$C1" -m "merge hiding from git cherry" 2>/dev/null || echo "")
+git -C "$R" checkout -q main
+
+# Prove the fixture is the real shape: neither ancestor, and the byte check CANNOT see the equivalence.
+rc1 "fixture: PE1 is not an ancestor of PE3"  git -C "$R" merge-base --is-ancestor "$PE1" "$PE3"
+rc1 "fixture: PE3 is not an ancestor of PE1"  git -C "$R" merge-base --is-ancestor "$PE3" "$PE1"
+rc1 "fixture: the BYTE check alone fails (file evolved after the patch)" _survival_content_equivalent "$R" 0 "$PE1" "$PE3"
+eq  "_survival_patch_equivalent: every commit has a patch-id twin -> yes" "$(_survival_patch_equivalent "$R" 0 "$PE1" "$PE3")" "yes"
+eq  "survival_classify: patch twin on main, file evolved since -> content_equivalent (was divergent)" \
+  "$(survival_classify "$R" 0 "$PE1" "$PE3")" "content_equivalent"
+eq  "CONTROL: a different patch has no twin -> no" "$(_survival_patch_equivalent "$R" 0 "$PEX" "$PE3")" "no"
+eq  "CONTROL: a different patch -> still plain divergent" "$(survival_classify "$R" 0 "$PEX" "$PE3")" "divergent"
+eq  "CONTROL: only ONE of the sha's two commits has a twin -> no" "$(_survival_patch_equivalent "$R" 0 "$PEP" "$PE3")" "no"
+eq  "CONTROL: partial twin -> still divergent" "$(survival_classify "$R" 0 "$PEP" "$PE3")" "divergent"
+if [ -n "$PEM" ] && [ "$(git -C "$R" rev-parse "${PEM}^@" 2>/dev/null | grep -c .)" = "2" ]; then
+  eq "merge commit in mref..sha -> no, even though every non-merge commit has a twin" "$(_survival_patch_equivalent "$R" 0 "$PEM" "$PE3")" "no"
+  eq "merge commit in mref..sha -> divergent (never takes the equivalence shortcut)" "$(survival_classify "$R" 0 "$PEM" "$PE3")" "divergent"
+else
+  bad "merge fixture did not produce 2 parents — merge guard unasserted"
+fi
+# Container layout (the rigs live in <rig>/.repo.git): same answer through --git-dir.
+BARE="$T/pe-bare.git"; git clone -q --bare "$R" "$BARE" >/dev/null 2>&1
+eq "container (bare --git-dir) layout gives the same answer" "$(_survival_patch_equivalent "$BARE" 1 "$PE1" "$PE3")" "yes"
+
+# Failure injection: git cherry (or the rev-list merge counter) FAILS. That is not "no" — "no" ends in a bead reopen and
+# a Mayor mail. It must surface as unresolved (the ga-kj7fpt rule), under the production logging config too: warn()
+# echoes to stdout there, and must not land inside the captured return value.
+FAKE_GIT_CHERRY_DIR="$T/fakegit_cherry"; mkdir -p "$FAKE_GIT_CHERRY_DIR"
+cat > "$FAKE_GIT_CHERRY_DIR/git" <<FAKEGIT
+#!/usr/bin/env bash
+case " \$* " in
+  *" cherry "*) echo "fatal: simulated git failure (cherry)" >&2; exit 128 ;;
+esac
+exec "$REAL_GIT" "\$@"
+FAKEGIT
+chmod +x "$FAKE_GIT_CHERRY_DIR/git"
+FAKE_GIT_COUNT_DIR="$T/fakegit_count"; mkdir -p "$FAKE_GIT_COUNT_DIR"
+cat > "$FAKE_GIT_COUNT_DIR/git" <<FAKEGIT
+#!/usr/bin/env bash
+case " \$* " in
+  *" rev-list --count --no-merges "*) echo "fatal: simulated git failure (rev-list)" >&2; exit 128 ;;
+esac
+exec "$REAL_GIT" "\$@"
+FAKEGIT
+chmod +x "$FAKE_GIT_COUNT_DIR/git"
+eq "git cherry fails -> patch check says error, not no" \
+  "$(PATH="$FAKE_GIT_CHERRY_DIR:$PATH" _survival_patch_equivalent "$R" 0 "$PE1" "$PE3")" "error"
+eq "git cherry fails -> classify says unresolved, NOT divergent" \
+  "$(PATH="$FAKE_GIT_CHERRY_DIR:$PATH" survival_classify "$R" 0 "$PE1" "$PE3")" "unresolved"
+eq "git cherry fails UNDER PRODUCTION LOGGING CONFIG -> still unresolved (warn must not leak into the value)" \
+  "$(SURVIVAL_LOG_STDOUT=1 PATH="$FAKE_GIT_CHERRY_DIR:$PATH" survival_classify "$R" 0 "$PE1" "$PE3")" "unresolved"
+eq "only the rev-list merge counter fails -> error, not a silent no" \
+  "$(PATH="$FAKE_GIT_COUNT_DIR:$PATH" _survival_patch_equivalent "$R" 0 "$PE1" "$PE3")" "error"
+eq "CONTROL: git cherry failing does not touch pairs decided by ancestry" \
+  "$(PATH="$FAKE_GIT_CHERRY_DIR:$PATH" survival_classify "$R" 0 "$C1" "$C3")" "survived"
+
+# ── 1f. ga-cqnm73: the same shape through the REAL sweep (dry-run) — a divergent-by-ancestry sha whose patch is on
+# main must be logged as content-equivalent, not escalated. This is the "the sha stops generating mail" proof.
+echo "── 1f. ga-cqnm73: full sweep — patch-equivalent sha is not escalated ──"
+TP="$T/ga_cqnm73_pe"; mkdir -p "$TP"
+ROP="$TP/origin.git"; git init -q --bare -b main "$ROP" >/dev/null 2>&1
+RRP="$TP/rig"; git clone -q "$ROP" "$RRP" >/dev/null 2>&1
+git -C "$RRP" config user.email t@example.com; git -C "$RRP" config user.name tester
+echo base > "$RRP/f"; git -C "$RRP" add .; git -C "$RRP" commit -q -m base; git -C "$RRP" push -q origin main
+BASEP=$(git -C "$RRP" rev-parse HEAD)
+git -C "$RRP" checkout -q -b fixbranch "$BASEP" >/dev/null 2>&1
+echo "the fix" > "$RRP/f"; git -C "$RRP" add .; git -C "$RRP" commit -q -m "fix (ledger sha)"
+SHAP=$(git -C "$RRP" rev-parse HEAD)
+git -C "$RRP" checkout -q main >/dev/null 2>&1
+echo "the fix" > "$RRP/f"; git -C "$RRP" add .; git -C "$RRP" commit -q -m "fix (re-landed under another sha)"
+echo "later change to the same file" >> "$RRP/f"; git -C "$RRP" add .; git -C "$RRP" commit -q -m "file evolves afterwards"
+git -C "$RRP" push -q origin main
+LEDGERP="$TP/ledger.jsonl"
+printf '{"ts":"%s","rig":"rigP","rig_path":"%s","default_branch":"main","branch":"fixbranch","bead":"","bead_city":"","gate_run":"","merge_sha":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RRP" "$SHAP" > "$LEDGERP"
+OUTP=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TP/city" SURVIVAL_LEDGER_FILE="$LEDGERP" SURVIVAL_ALERT_DIR="$TP/alerted" \
+  SURVIVAL_DRY_RUN=1 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
+printf '%s\n' "$OUTP" | grep -q "content-equivalent $SHAP" \
+  && ok "patch-equivalent sha is logged content-equivalent" \
+  || bad "patch-equivalent sha was not logged content-equivalent — output:
+$OUTP"
+printf '%s\n' "$OUTP" | grep -q 'WOULD-ESCALATE\|DIVERGENT\|queued for recheck' \
+  && bad "patch-equivalent sha was queued/escalated as divergent — the false alarm ga-cqnm73 removes — output:
+$OUTP" \
+  || ok "patch-equivalent sha is never queued or escalated"
+printf '%s\n' "$OUTP" | grep -q 'content_equivalent=1 .*divergent=0' \
+  && ok "summary line: content_equivalent=1 divergent=0" \
+  || bad "summary line does not show content_equivalent=1 divergent=0 — output:
+$OUTP"
 
 # ── 2. iso_to_epoch + entry_within_retention ────────────────────────────────
 echo "── 2. age / retention helpers ──"
@@ -496,18 +650,19 @@ printf '%s\n' "$OUTC" | grep 'WOULD-ESCALATE(surge)' >/dev/null \
   || ok "under threshold: surge path did not fire for only 2 confirmed-divergent"
 
 
-# ── 13. _bead_already_closed (ga-f7czjc) — unit + full-sweep integration ────
+# ── 13. _bead_closed_state (ga-f7czjc, three-state since ga-cqnm73) — unit + full-sweep ────
 # wa-k8l0m re-escalated 4 times: content_equivalent (already tested above)
 # correctly handles a FRESH rebase, but is structurally unable to prove
 # equivalence once the repo keeps evolving for unrelated reasons after the
-# duplicate fix lands. _bead_already_closed is the independent second net:
+# duplicate fix lands. _bead_closed_state is the independent second net:
 # a CLOSED bead means a human already resolved this exact concern, so the
 # sweep must not reopen it just because a point-in-time file diff no longer
-# matches. Real-world check (done live, not here): sourced this file in
-# lib-only mode in the real whatsapp_automation repo and called
-# _bead_already_closed against wa-k8l0m (real, closed) and wa-dln9g (real,
-# open) directly -- true and false respectively, as expected.
-echo "── 13. _bead_already_closed (closed-bead escalation skip) ──"
+# matches. ga-cqnm73: that net used to be rc0/rc1, so a bd that FAILED or
+# TIMED OUT read as "not closed" and fell through to a reopen + Mayor mail on
+# a bead that was closed all along (03/10 11:38 skipped, 12:11 escalated, same
+# sha, same closed bead). It now answers closed | open | none | unknown, and
+# the sweep treats anything but open/none as inert.
+echo "── 13. _bead_closed_state (closed-bead escalation skip, three states) ──"
 
 # 13a. Unit tests via a fake `bd` on PATH (this file hardcodes the `bd`
 # command name throughout, no BD_BIN-style override exists to inject
@@ -516,12 +671,23 @@ echo "── 13. _bead_already_closed (closed-bead escalation skip) ──"
 # "NO live Dolt" testing philosophy).
 OLDPATH="$PATH"; PATH="$SANDBOX_PATH"   # fake bd is $T/bin/bd (defined at the top, with the sandbox)
 
-rc0 "closed bead -> true"                       _bead_already_closed anycity closed-story
-rc0 "closed bead, array-shaped bd output -> true" _bead_already_closed anycity closed-story-array
-rc1 "open bead -> false"                        _bead_already_closed anycity open-story
-rc1 "unknown/empty bd response -> false (fail closed)" _bead_already_closed anycity nonexistent-story
-rc1 "empty bead id -> false (fail closed, no bd call needed)" _bead_already_closed anycity ""
-rc1 "empty beadcity -> false (fail closed, no bd call needed)" _bead_already_closed "" closed-story
+eq "closed bead -> closed"                          "$(_bead_closed_state anycity closed-story)" "closed"
+eq "closed bead, array-shaped bd output -> closed"  "$(_bead_closed_state anycity closed-story-array)" "closed"
+eq "open bead -> open"                              "$(_bead_closed_state anycity open-story)" "open"
+eq "bd answers 'no issue found' (rc1 + error JSON) -> none (a real answer: nothing to defer to)" \
+  "$(_bead_closed_state anycity nonexistent-story)" "none"
+eq "empty bead id -> none (no bd call needed)"      "$(_bead_closed_state anycity "")" "none"
+eq "empty beadcity -> none (no bd call needed)"     "$(_bead_closed_state "" closed-story)" "none"
+# The class this bead is about: a failed read must be a third answer, never a second one.
+eq "bd FAILS (rc1, connection refused) -> unknown, NOT open"  "$(_bead_closed_state anycity failing-story)" "unknown"
+eq "bd returns an empty answer -> unknown, NOT open"          "$(_bead_closed_state anycity empty-story)" "unknown"
+eq "bd returns non-JSON -> unknown"                           "$(_bead_closed_state anycity garbage-story)" "unknown"
+eq "bd returns JSON with no status -> unknown"                "$(_bead_closed_state anycity nostatus-story)" "unknown"
+eq "bd returns [] -> unknown"                                 "$(_bead_closed_state anycity empty-array-story)" "unknown"
+eq "bd HANGS past the timeout -> unknown (bounded, never blocks the sweep)" \
+  "$(BD_TIMEOUT=1 _bead_closed_state anycity hanging-story)" "unknown"
+eq "bd fails UNDER PRODUCTION LOGGING CONFIG -> still exactly 'unknown' (warn must not leak into the value)" \
+  "$(SURVIVAL_LOG_STDOUT=1 _bead_closed_state anycity failing-story)" "unknown"
 
 PATH="$OLDPATH"
 
@@ -542,8 +708,10 @@ LEDGERD="$TD/ledger.jsonl"; : > "$LEDGERD"
 # at bead=closed-story (fake bd says closed).
 # side2/open-story: identical shape, ledger points at bead=open-story (fake
 # bd says open) -- the control.
-declare -A STORY_FOR=( [1]="closed-story" [2]="open-story" )
-for i in 1 2; do
+# side3/failing-story (ga-cqnm73): equally divergent, but bd FAILS on the status read -> neither "closed" nor "open":
+# it must NOT be escalated this sweep (no reopen, no Mayor mail), and must be counted in the summary.
+declare -A STORY_FOR=( [1]="closed-story" [2]="open-story" [3]="failing-story" )
+for i in 1 2 3; do
   git -C "$RRD" checkout -q -b "side$i" "$BASED" >/dev/null 2>&1
   echo "s$i" > "$RRD/s$i"; git -C "$RRD" add .; git -C "$RRD" commit -q -m "S$i"
   SHAD=$(git -C "$RRD" rev-parse HEAD)
@@ -568,6 +736,92 @@ INDIV_LINES_D=$(printf '%s\n' "$OUTD" | grep -c 'WOULD-ESCALATE(divergent)')
   && ok "CONTROL: the open-bead sha still escalates normally (exactly 1 WOULD-ESCALATE)" \
   || bad "CONTROL: expected exactly 1 WOULD-ESCALATE(divergent) (the open-bead sha only), got $INDIV_LINES_D — output:
 $OUTD"
+printf '%s\n' "$OUTD" | grep 'WOULD-ESCALATE(divergent)' | grep -q 'failing-story' \
+  && bad "failing-bd sha WAS escalated — a failed bd read was read as 'not closed' (the ga-cqnm73 bug)" \
+  || ok "failing-bd sha is NOT escalated (an unreadable bead state is not 'not closed')"
+printf '%s\n' "$OUTD" | grep -q 'state of bead failing-story could not be read' \
+  && ok "failing-bd sha logs that the bead state could not be read, and that it will re-check next sweep" \
+  || bad "failing-bd sha did not log the could-not-read-state warning — output:
+$OUTD"
+printf '%s\n' "$OUTD" | grep -q 'bead_state_unknown=1' \
+  && ok "summary line carries bead_state_unknown=1 (visible counter)" \
+  || bad "summary line does not show bead_state_unknown=1 — output:
+$OUTD"
+
+# ── 14. ga-cqnm73: the Mayor mail states only what the bead re-read confirms ──
+# The mail used to say "The sweep reopened + labelled gate:merge-orphan + commented the source bead" unconditionally,
+# above three `bd` writes that are all `2>/dev/null || true`. wa-k8l0m was still closed and unlabelled when that mail
+# arrived. Now every claim comes from a bd re-read taken AFTER the writes.
+echo "── 14. ga-cqnm73: escalation mail reports verified bead state ──"
+has()  { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1 — expected to contain [$3], got: $2" ;; esac; }
+hasnt(){ case "$2" in *"$3"*) bad "$1 — must NOT contain [$3], got: $2" ;; *) ok "$1" ;; esac; }
+
+# 14a. _orphan_write_report (pure): every claim is conditional on the after-snapshot.
+R_UNK="$(_orphan_write_report "closed|0|5" "unknown")"
+has   "re-read failed -> WRITES UNVERIFIED"                    "$R_UNK" "WRITES UNVERIFIED"
+hasnt "re-read failed -> never claims a reopen"                "$R_UNK" "reopened ("
+R_OK="$(_orphan_write_report "closed|0|5" "open|1|6")"
+has   "closed->open: reopened (was closed, now open)"          "$R_OK" "reopened (was closed, now open)"
+has   "label present after the write"                          "$R_OK" "gate:merge-orphan label present"
+has   "comment count rose -> comment added"                    "$R_OK" "comment added"
+R_STILL="$(_orphan_write_report "closed|0|5" "closed|0|5")"
+has   "still closed -> NOT reopened"                           "$R_STILL" "NOT reopened (bead is still closed)"
+hasnt "still closed -> never claims it was reopened"           "$R_STILL" "reopened (was closed"
+has   "label missing -> NOT applied"                           "$R_STILL" "gate:merge-orphan label NOT applied"
+has   "comment count flat -> NOT confirmed"                    "$R_STILL" "comment NOT confirmed (comment count did not increase)"
+R_ALREADY="$(_orphan_write_report "open|0|7" "open|0|7")"
+has   "was already open -> says so instead of claiming a reopen" "$R_ALREADY" "no reopen needed (bead was already open)"
+R_BLIND="$(_orphan_write_report "unknown" "open|1|8")"
+has   "state before unreadable -> reopen not confirmed"         "$R_BLIND" "a reopen is not confirmed"
+R_BADCNT="$(_orphan_write_report "open|0|" "open|1|8")"
+has   "one unreadable comment count -> NOT confirmed (not mistaken for an increase)" "$R_BADCNT" "comment count unreadable"
+
+# 14b. _bead_snapshot against the fake bd.
+OLDPATH="$PATH"; PATH="$SANDBOX_PATH"
+eq "snapshot of a readable bead: status|label|count"   "$(_bead_snapshot anycity wr-fail)" "open|0|7"
+eq "snapshot when bd fails -> unknown"                  "$(_bead_snapshot anycity failing-story)" "unknown"
+eq "snapshot of an empty answer -> unknown"             "$(_bead_snapshot anycity empty-story)" "unknown"
+eq "snapshot with no bead id -> unknown"                "$(_bead_snapshot anycity "")" "unknown"
+PATH="$OLDPATH"
+
+# 14c. Real (NON-dry-run) sweep against stub bd/gc only: three divergent entries whose bd behaves differently.
+#   wr-fail  — every write is a silent no-op (the 03/10 shape): the mail must say so.
+#   wr-ok    — the writes land: the mail may say so.
+#   wr-blind — readable until the escalation, unreadable after it: the mail must say UNVERIFIED.
+TW="$T/ga_cqnm73_mail"; mkdir -p "$TW"
+ROW="$TW/origin.git"; git init -q --bare -b main "$ROW" >/dev/null 2>&1
+RRW="$TW/rig"; git clone -q "$ROW" "$RRW" >/dev/null 2>&1
+git -C "$RRW" config user.email t@example.com; git -C "$RRW" config user.name tester
+echo base > "$RRW/base"; git -C "$RRW" add .; git -C "$RRW" commit -q -m base; git -C "$RRW" push -q origin main
+BASEW=$(git -C "$RRW" rev-parse HEAD)
+LEDGERW="$TW/ledger.jsonl"; : > "$LEDGERW"
+declare -A WR_SHA
+for wb in wr-fail wr-ok wr-blind; do
+  git -C "$RRW" checkout -q -b "side-$wb" "$BASEW" >/dev/null 2>&1
+  echo "$wb" > "$RRW/s-$wb"; git -C "$RRW" add .; git -C "$RRW" commit -q -m "S $wb"
+  WR_SHA[$wb]=$(git -C "$RRW" rev-parse HEAD)
+  git -C "$RRW" checkout -q main >/dev/null 2>&1
+  printf '{"ts":"%s","rig":"rigW","rig_path":"%s","default_branch":"main","branch":"side-%s","bead":"%s","bead_city":"anycity","gate_run":"","merge_sha":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RRW" "$wb" "$wb" "${WR_SHA[$wb]}" >> "$LEDGERW"
+  echo "m-$wb" > "$RRW/m-$wb"; git -C "$RRW" add .; git -C "$RRW" commit -q -m "M $wb"; git -C "$RRW" push -q origin main
+done
+rm -f "$FAKE_GC_DIR"/call.* 2>/dev/null; rm -f "$FAKE_BD_STATE"/wr-* 2>/dev/null
+OUTW=$(PATH="$SANDBOX_PATH" GC_CITY_PATH="$TW/city" SURVIVAL_LEDGER_FILE="$LEDGERW" SURVIVAL_ALERT_DIR="$TW/alerted" \
+  SURVIVAL_DIVERGENT_SURGE_THRESHOLD=5 SURVIVAL_DRY_RUN=0 SURVIVAL_LOG_STDOUT=1 bash "$SWEEP" 2>&1)
+mail_for() { local f; for f in "$FAKE_GC_DIR"/call.*; do [ -f "$f" ] && grep -q "$1" "$f" && { cat "$f"; return 0; }; done; return 1; }
+MAIL_FAIL="$(mail_for "${WR_SHA[wr-fail]}")";  MAIL_OK="$(mail_for "${WR_SHA[wr-ok]}")";  MAIL_BLIND="$(mail_for "${WR_SHA[wr-blind]}")"
+[ -n "$MAIL_FAIL" ] && [ -n "$MAIL_OK" ] && [ -n "$MAIL_BLIND" ] \
+  && ok "all three confirmed-divergent entries mailed the Mayor" \
+  || bad "expected one Mayor mail per entry (fail/ok/blind) — got fail=${#MAIL_FAIL} ok=${#MAIL_OK} blind=${#MAIL_BLIND} bytes; sweep output:
+$OUTW"
+hasnt "silently-failing writes: mail never claims 'The sweep reopened + labelled'" "$MAIL_FAIL" "The sweep reopened + labelled"
+has   "silently-failing writes: mail says the label was NOT applied"          "$MAIL_FAIL" "gate:merge-orphan label NOT applied"
+has   "silently-failing writes: mail says the comment is NOT confirmed"       "$MAIL_FAIL" "comment NOT confirmed"
+has   "landed writes: mail confirms the label from the re-read"               "$MAIL_OK" "gate:merge-orphan label present"
+has   "landed writes: mail confirms the comment from the re-read"             "$MAIL_OK" "comment added"
+hasnt "landed writes: still no unconditional old sentence"                    "$MAIL_OK" "The sweep reopened + labelled"
+has   "unreadable after the writes: mail says WRITES UNVERIFIED"              "$MAIL_BLIND" "WRITES UNVERIFIED"
+hasnt "unreadable after the writes: never claims a reopen"                    "$MAIL_BLIND" "reopened ("
 
 echo ""
 echo "──────────────────────────────────────────"
