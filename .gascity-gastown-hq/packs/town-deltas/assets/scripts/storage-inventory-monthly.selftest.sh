@@ -370,6 +370,15 @@ RESULT="$(FAKE_GIT_DIFF_EMPTY=1 _commit_doc "$DOC_PATH")"
 # ════════════════════════════════════════════════════════════════════════════
 # 4. main() — end-to-end orchestration
 # ════════════════════════════════════════════════════════════════════════════
+# Every main() test from here to section 6 runs with ALL buckets measurable.
+# The file-top fixture ("bucket-ok bucket-fail") is right for the unit tests
+# above, which ARE about mixed success — but as the main-level background it
+# made every S3 assertion run at 1/2 coverage and left "one bucket
+# unmeasurable" as a permanent condition instead of an asserted outcome
+# (ga-utr9qf GATE-FEEDBACK attempt 1: a partial sum passed for the total).
+# Partial coverage is tested on purpose in section 7.
+BUCKETS="bucket-ok"
+
 echo "── main: clean run, everything within band -> exit 0, closed chore bead ──"
 cat > "$DOC_PATH" <<'EOF'
 # Intro
@@ -620,6 +629,69 @@ FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 F
 [ $? -ne 0 ] && ok "billed total unknown -> nonzero (a current-only number is not a substitute)" || bad "expected nonzero when noncurrent bytes cannot be measured"
 DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
 [ "$(_extract_field "$DATA_LINE" s3_billed_gb)" = "6.00" ] && ok "failed S3 round carries the last REAL billed baseline (6.00) forward, not 0" || bad "expected s3_billed_gb=6.00 preserved, data line: $DATA_LINE"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7. ga-utr9qf GATE-FEEDBACK attempt 1, blocking issue 1 — the THIRD STATE of
+#    the S3 total. _s3_total_gb skips a bucket it could not measure and echoes
+#    the sum over the survivors; main() used to take that partial sum as THE
+#    total: status from it, closed OK chore, and it became next month's
+#    baseline. "Could not measure one bucket" must not look like "measured, and
+#    healthy". Both gate reproductions are here: P1 (no baseline) and P3 (a
+#    baseline exists and the partial sum lands INSIDE the band — the silent one).
+# ════════════════════════════════════════════════════════════════════════════
+_run_main_s3() {
+  FAKE_DF_TOTAL_KB=209715200 FAKE_DF_USED_KB=104857600 FAKE_AWS_BYTES=1073741824 \
+    FAKE_DRIVE_OUTPUT="12.00 15.00 80.0" FAKE_MD_VERDICT="45.2h/mes projetado (abaixo do teto 92h)" \
+    FAKE_BD_LOG="$SCRATCH/fake-bd.log" main >/dev/null
+}
+S3_ALL6="bk1 bk2 bk3 bk4 bk5 bk6"
+S3_5OF6="bk1 bk2 bk3 bk4 bk5 bucket-fail"
+
+echo "── main (gate FAIL 1): all 6 buckets measurable, no baseline -> exit 0, S3 'novo', baseline recorded ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+BUCKETS="$S3_ALL6"; _run_main_s3
+RC=$?
+[ "$RC" -eq 0 ] && ok "complete coverage + everything healthy -> exit 0" || bad "expected exit 0 with 6/6 buckets measured, got $RC"
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+[ "$(_extract_field "$DATA_LINE" s3_billed_gb)" = "6.00" ] && ok "6/6 buckets -> s3_billed_gb=6.00 recorded as the baseline" || bad "expected s3_billed_gb=6.00, data line: $DATA_LINE"
+case "$(grep -m1 'S3 faturado' "$DOC_PATH")" in *"(6/6 buckets)"*) ok "row shows full coverage (6/6)" ;; *) bad "expected '(6/6 buckets)' in the S3 row" ;; esac
+
+echo "── main (gate FAIL 1, P3): baseline 6.00, then exactly ONE bucket unmeasurable and the partial sum (5.00, -16.7%) lands INSIDE the band ──"
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+BUCKETS="$S3_5OF6"; _run_main_s3
+RC=$?
+[ "$RC" -ne 0 ] && ok "1 of 6 buckets unmeasurable -> nonzero exit, even though 5.00 vs 6.00 is within the band" || bad "expected nonzero exit; got $RC (partial sum passed for the total: closed OK chore)"
+grep -q "BD-CALLED.*create.*--type=bug" "$SCRATCH/fake-bd.log" && ok "files an OPEN bug, not an auto-closed chore" || bad "expected a bug-type summary bead: $(cat "$SCRATCH/fake-bd.log")"
+S3_ROW="$(grep -m1 'S3 faturado' "$DOC_PATH")"
+case "$S3_ROW" in *"| N/A |") ok "S3 billed row status is N/A (could not measure the total)" ;; *) bad "expected the S3 billed row to end in '| N/A |', got: '$S3_ROW'" ;; esac
+case "$S3_ROW" in *"✅"*) bad "a partial S3 total must not carry ✅: '$S3_ROW'" ;; *) ok "no ✅ on the partial S3 row" ;; esac
+case "$S3_ROW" in *"PARCIAL"*"(5/6"*|*"(5/6"*"PARCIAL"*) ok "row says the sum is PARTIAL and names the coverage (5/6)" ;; *) bad "expected PARCIAL + 5/6 in the S3 row, got: '$S3_ROW'" ;; esac
+case "$(grep -m1 'S3 só versões correntes' "$DOC_PATH")" in *"PARCIAL"*) ok "the current-versions-only row is marked PARTIAL too" ;; *) bad "expected PARCIAL on the 'S3 só versões correntes' row" ;; esac
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+[ "$(_extract_field "$DATA_LINE" s3_billed_gb)" = "6.00" ] && ok "baseline s3_billed_gb stays at the last COMPLETE reading (6.00); the 5-bucket sum is not blessed into it" || bad "expected s3_billed_gb=6.00 preserved, data line: $DATA_LINE"
+[ "$(_extract_field "$DATA_LINE" s3_total_gb)" = "6.00" ] && ok "s3_total_gb (current-only baseline) is carried forward too" || bad "expected s3_total_gb=6.00 preserved, data line: $DATA_LINE"
+
+echo "── main (gate FAIL 1): the next COMPLETE round compares against the preserved baseline, not the partial sum ──"
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+BUCKETS="$S3_ALL6"; _run_main_s3
+RC=$?
+[ "$RC" -eq 0 ] && ok "all 6 buckets measurable again -> healthy, exit 0" || bad "expected exit 0 on recovery, got $RC"
+grep -q "S3: faturado=6.00GB.*prev=6.00 .*status=✅" "$STORAGE_INVENTORY_LOG" && ok "recovery round saw prev=6.00 (the complete baseline), status ✅" || bad "expected prev=6.00 status=✅; got: $(grep 'S3: faturado' "$STORAGE_INVENTORY_LOG")"
+
+echo "── main (gate FAIL 1, P1): no baseline yet and ONE bucket unmeasurable -> nonzero, and NO partial sum becomes the first baseline ──"
+fresh_doc
+: > "$SCRATCH/fake-bd.log"; : > "$STORAGE_INVENTORY_LOG"
+BUCKETS="$S3_5OF6"; _run_main_s3
+RC=$?
+[ "$RC" -ne 0 ] && ok "5/6 buckets, no baseline -> nonzero exit (was: exit 0 and a closed OK chore)" || bad "expected nonzero exit; got $RC"
+case "$(grep -m1 'S3 faturado' "$DOC_PATH")" in *"| N/A |") ok "S3 row is N/A, not 'novo'" ;; *) bad "expected N/A, got: '$(grep -m1 'S3 faturado' "$DOC_PATH")'" ;; esac
+DATA_LINE="$(grep -m1 '^<!-- storage-inventory:data ' "$DOC_PATH")"
+[ -z "$(_extract_field "$DATA_LINE" s3_billed_gb)" ] && ok "s3_billed_gb stays EMPTY — the 5-bucket sum (5.00) is not recorded as the first baseline" || bad "expected an empty s3_billed_gb, data line: $DATA_LINE"
+[ -z "$(_extract_field "$DATA_LINE" s3_total_gb)" ] && ok "s3_total_gb stays empty as well" || bad "expected an empty s3_total_gb, data line: $DATA_LINE"
+: > "$STORAGE_INVENTORY_LOG"
+BUCKETS="$S3_ALL6"; _run_main_s3
+grep -q "S3: faturado=6.00GB.*status=novo" "$STORAGE_INVENTORY_LOG" && ok "the next complete round is a clean 'novo' baseline (6.00)" || bad "expected status=novo with faturado=6.00; got: $(grep 'S3: faturado' "$STORAGE_INVENTORY_LOG")"
 
 echo "=== RESULT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" -eq 0 ]

@@ -23,7 +23,11 @@
 #   - S3: `aws s3 ls --recursive --summarize` counts CURRENT object versions
 #     only; noncurrent versions are billed too (measured 2026-10-01: 280 GB
 #     reported vs ~1.9 TB billed). The billed total here = current + the sum of
-#     noncurrent version sizes (`s3api list-object-versions`).
+#     noncurrent version sizes (`s3api list-object-versions`). It is a total
+#     only when EVERY bucket was measured: if any bucket could not be, the S3
+#     status is N/A (the run is not OK) and the recorded baseline is carried
+#     forward unchanged — the sum over the survivors is shown, marked PARCIAL,
+#     and never recorded or compared as if it were the total.
 #
 # MotherDuck: Part 0's row 6 names motherduck_invoice_usage_check.py as its
 # "Medir" command, but that script measures COMPUTE hours only (the
@@ -237,8 +241,10 @@ _s3_bucket_noncurrent_gb() {
 # noncurrent). A bucket counts only if BOTH its current and its noncurrent
 # bytes were measured: a bucket with only the current half would put a
 # current-only number into a "billed" total. A bucket that fails is skipped
-# individually (not fatal to the total) but named, so a partial sum is never
-# silently indistinguishable from a complete one.
+# individually (not fatal to this function) and named in the log. What stops
+# the sum over the survivors from passing for the total is the caller: it gets
+# <ok> and <count> here, and main() treats ok != count as "could not measure
+# the total" (status N/A, baseline untouched) — this function only reports it.
 _s3_total_gb() {
   local bucket cur nc total=0 cur_total=0 nc_total=0 ok=0 count=0 skipped=""
   for bucket in $BUCKETS; do
@@ -477,7 +483,7 @@ main() {
   # s3_total_gb keeps its old meaning (current versions only) as its own data
   # key, so the pre-ga-utr9qf baseline stays comparable; s3_billed_gb is new,
   # so the first run after this change has no billed baseline ("novo").
-  local s3_out s3_billed="" s3_ok="" s3_count="" s3_cur="" s3_nc=""
+  local s3_out s3_billed="" s3_ok="" s3_count="" s3_cur="" s3_nc="" s3_partial=0
   local s3_prev s3_delta s3_status s3_cur_prev s3_cur_delta
   s3_out=$(_s3_total_gb) || true
   if [ -n "$s3_out" ]; then
@@ -486,13 +492,38 @@ main() {
     s3_count=$(echo "$s3_out" | awk '{print $3}')
     s3_cur=$(echo "$s3_out" | awk '{print $4}')
     s3_nc=$(echo "$s3_out" | awk '{print $5}')
+    # The numbers above are sums over the buckets that WERE measured. Only
+    # proof that every bucket was measured makes them a total; a missing or
+    # malformed count counts as "not proven" (string compare, so it cannot
+    # error out into the healthy branch) — the inert state under doubt.
+    s3_partial=1
+    if [ -n "$s3_count" ] && [ "$s3_ok" = "$s3_count" ]; then s3_partial=0; fi
   fi
   s3_prev=$(_extract_field "$prev_line" "s3_billed_gb")
   s3_delta=$([ -n "$s3_billed" ] && _pct_delta "$s3_prev" "$s3_billed" || echo "")
   s3_status=$([ -n "$s3_billed" ] && _status_for_delta "$s3_delta" || echo "N/A")
   s3_cur_prev=$(_extract_field "$prev_line" "s3_total_gb")
   s3_cur_delta=$([ -n "$s3_cur" ] && _pct_delta "$s3_cur_prev" "$s3_cur" || echo "")
+  # What the data line records as next month's baselines (see the data line below).
+  local s3_billed_rec="${s3_billed:-$s3_prev}" s3_cur_rec="${s3_cur:-$s3_cur_prev}"
+  # Table cells for the two S3 rows.
+  local s3_billed_cell="${s3_billed:-N/A} GB (${s3_nc:-N/A} GB são versões não-correntes)"
+  local s3_cur_cell="${s3_cur:-N/A} GB"
+  if [ "$s3_partial" -eq 1 ]; then
+    # A bucket that could not be measured (GATE-FEEDBACK ga-utr9qf attempt 1,
+    # blocking issue 1): "couldn't measure the total" is a different outcome
+    # from "measured, and healthy". The partial sum gets no delta and no
+    # healthy status (N/A trips the overall verdict like any unmeasured
+    # vector), and neither baseline moves.
+    s3_delta=""; s3_cur_delta=""; s3_status="N/A"
+    s3_billed_rec="$s3_prev"; s3_cur_rec="$s3_cur_prev"
+    s3_billed_cell="N/A — PARCIAL: só ${s3_ok:-0}/${s3_count:-0} buckets medidos (a soma de ${s3_billed:-N/A} GB NÃO é o total faturado)"
+    s3_cur_cell="N/A — PARCIAL: só ${s3_ok:-0}/${s3_count:-0} buckets medidos (soma de ${s3_cur:-N/A} GB)"
+  fi
   log "S3: faturado=${s3_billed:-?}GB (corrente=${s3_cur:-?}GB + nao-corrente=${s3_nc:-?}GB; ${s3_ok:-0}/${s3_count:-0} buckets) prev=${s3_prev:-none} delta=${s3_delta:-?} status=$s3_status"
+  if [ "$s3_partial" -eq 1 ]; then
+    log "S3: cobertura PARCIAL (${s3_ok:-?}/${s3_count:-?} buckets) -> status N/A; s3_billed_gb/s3_total_gb mantidos em ${s3_billed_rec:-vazio}/${s3_cur_rec:-vazio} (a soma parcial nao vira baseline)"
+  fi
 
   # Drive SA
   local drv_out drv_used="" drv_limit="" drv_pct="" drv_prev drv_delta drv_status
@@ -536,8 +567,8 @@ main() {
 |---|---|---|---|---|---|
 | Mac mini \`$DATA_DIR\` container livre | $now_date | ${mm_free:-N/A} Gi livres de ${mm_total:-N/A} Gi (container ${mm_cpct:-N/A}% cheio; swap ${mm_swap_used:-N/A}/${mm_swap_total:-N/A} Gi) | — | — | $mm_free_status |
 | Mac mini \`$DATA_DIR\` usado (só o volume Data, NÃO é o espaço livre) | $now_date | ${mm_used:-N/A} Gi (de ${mm_total:-N/A} Gi) | ${mm_prev:-—} Gi | ${mm_delta:-—}% | $mm_status |
-| S3 faturado: correntes + não-correntes (${s3_ok:-0}/${s3_count:-0} buckets) | $now_date | ${s3_billed:-N/A} GB (${s3_nc:-N/A} GB são versões não-correntes) | ${s3_prev:-—} GB | ${s3_delta:-—}% | $s3_status |
-| S3 só versões correntes (o que \`s3 ls --recursive\` enxerga) | $now_date | ${s3_cur:-N/A} GB | ${s3_cur_prev:-—} GB | ${s3_cur_delta:-—}% | — |
+| S3 faturado: correntes + não-correntes (${s3_ok:-0}/${s3_count:-0} buckets) | $now_date | $s3_billed_cell | ${s3_prev:-—} GB | ${s3_delta:-—}% | $s3_status |
+| S3 só versões correntes (o que \`s3 ls --recursive\` enxerga) | $now_date | $s3_cur_cell | ${s3_cur_prev:-—} GB | ${s3_cur_delta:-—}% | — |
 | Drive SA (service account) | $now_date | ${drv_used:-N/A} Gi (${drv_pct:-N/A}%) | ${drv_prev:-—} Gi | ${drv_delta:-—}% | $drv_status |
 | MotherDuck compute | $now_date | $md_verdict | — | — | $md_status |"
 
@@ -558,8 +589,11 @@ main() {
     # here becomes next month's baseline, and _pct_delta's own zero-case
     # then reads that fabricated 0 as "no baseline", silently erasing the
     # last real measurement (GATE-FEEDBACK ga-z297h attempt 1, blocking
-    # issue 2).
-    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-$mm_prev} s3_total_gb=${s3_cur:-$s3_cur_prev} s3_billed_gb=${s3_billed:-$s3_prev} drive_sa_used_gb=${drv_used:-$drv_prev} ts=$now_date -->"
+    # issue 2). The two S3 values are the same rule applied once more: they
+    # are carried forward both when S3 failed outright and when only SOME
+    # buckets were measured (s3_*_rec above) — a sum over the survivors is
+    # not a reading of the total and must not become its baseline.
+    echo "<!-- storage-inventory:data mac_mini_used_gb=${mm_used:-$mm_prev} s3_total_gb=${s3_cur_rec} s3_billed_gb=${s3_billed_rec} drive_sa_used_gb=${drv_used:-$drv_prev} ts=$now_date -->"
     echo "$table_md"
     echo ""
     echo "**Diretórios-chave (\`~/gt\` e afins), medidos $now_date:**"
