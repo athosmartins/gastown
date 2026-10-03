@@ -606,9 +606,25 @@
 #      four template call sites (Step 3 affected and own_hit,
 #      rig_detector_cosmetic_only, ga0fawwr_label_hits) share ONE function,
 #      daemon_renders_changed_template(), so they cannot disagree.
-#      Accepted residual: own_hit (OWN-FILE-CHANGED) is still set for a by-name
-#      match, since it cannot be told apart from a real one; AFFECTED_TEMPLATE_
-#      BY_NAME is what separates them.
+#      Accepted residuals (named so a "clear" is not read as more than it is):
+#      - own_hit (OWN-FILE-CHANGED) is still set for a by-name match, since it
+#        cannot be told apart from a real one; AFFECTED_TEMPLATE_BY_NAME is what
+#        separates them.
+#      - "The entrypoint configures no loader" is proven from the entrypoint's own
+#        AST only (same single-hop reach as the render_template match). A loader
+#        swapped in by an IMPORTED module (init_app(app) setting app.jinja_loader),
+#        through an aliased handle (env = app.jinja_env; env.loader = ...), or by
+#        a loader class bound under another name is invisible: absence of evidence
+#        there is read as a clear.
+#      - Changed paths are repo-relative (git diff --name-only) and are compared
+#        with <entrypoint dir>/<folder>/<name> relative to RUNTIME_DIR, so this
+#        assumes RUNTIME_DIR is the git toplevel - as the rig is today and as the
+#        no_restart_paths / deploy_deps / entrypoint matchers above already assume.
+#      - render_template("/abs/x.html") makes os.path.join drop the folder; Flask
+#        does not load absolute names, so this is not a realistic input.
+#      - rig_detector_cosmetic_only looks at this deploy's templates only, as the
+#        name match always did; an earlier window's template is seen only if the
+#        rig registers it as an asset.
 #
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
