@@ -6023,6 +6023,41 @@ gate_requeue_note_skipped() {
   fi
 }
 
+# gate_rebase_not_attempted_requeue <marker_id> <branch> <why>   (ga-p8pg6y)
+# Disposition of a sweep whose pre-review auto-rebase was NOT ATTEMPTED (today: the
+# per-repo git mutex was not acquired, imp18). That is contention, not a failed rebase,
+# so unlike every transient-failure path this one adds NO strike: it writes no
+# gate:rebase-fail-count, no gate:exiled-tier5, no gate:retry-cooldown-until and touches
+# no source-bead label. It only puts the marker back at gate-status:queued — through the
+# compare-before-write helper, so an external transition (Mayor, watchdog) still wins —
+# and the next sweep retries it. A strike here exiled a healthy branch to tier 5 after
+# two skips (ga-u2p995).
+# What it SAYS follows what the requeue returned: the "requeued, retried next sweep"
+# comment is written only when the requeue wrote (rc 0); on any other rc the narration
+# is gate_requeue_note_skipped's, never a requeue claim.
+# The verdict deliberately starts "QUEUED (rebase NOT attempted" and NOT "QUEUED (retry":
+# gate-recovery-watchdog files the first under log-only "queued-other" (a lock held for
+# 5+ sweeps shows up in its log) and the second under "conflict-retry", which spawns a
+# repair dog for a branch that has nothing wrong with it.
+# The bound on this retry is the mutex itself, not a counter here: git_mutex_acquire
+# reclaims a holder that is dead or older than GIT_REPO_MUTEX_MAX_AGE (600s) on its next
+# call. (git-lock-hygiene's janitor sweeps git lock FILES, not this mutex dir.)
+# Always returns 0: the caller runs under `set -e`.
+gate_rebase_not_attempted_requeue() {
+  # _RQ_RC is the repo's capture idiom for this helper (gate-a6etc2 drift guard); local here so
+  # it cannot clobber the global the other requeue sites read.
+  local _id="$1" _branch="$2" _why="$3" _RQ_RC=0
+  gate_requeue_respecting_external "$_id" "queued" "dispatching" || _RQ_RC=$?
+  if [ "$_RQ_RC" = "0" ]; then
+    bd -C "$GC_CITY" comment "$_id" "Gate: the auto-rebase of $_branch was NOT attempted this sweep — ${_why}. That is contention, not a failed rebase: this skip adds no strike (gate:rebase-fail-count and gate:exiled-tier5 are not written), the marker is back at gate-status:queued and the next sweep retries it. (ga-p8pg6y)" 2>/dev/null || true
+    REBASE_EVENT="dispatcher_autorebase_not_attempted"
+    REBASE_VERDICT="QUEUED (rebase NOT attempted — ${_why}; no strike counted, retried next sweep — ga-p8pg6y)"
+  else
+    gate_requeue_note_skipped "$_RQ_RC"
+  fi
+  return 0
+}
+
 # gate_requeue_narrate <rc>   (ga-dl3x9s)
 # The sibling of gate_requeue_note_skipped for the three requeue sites that do NOT
 # sit in the rebase-retry decision: reviewer-death and quota-stop (gate_finalize_run)
@@ -13827,20 +13862,38 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
     AUTO_MERGE_FALLBACK_ERR=""
 
     # imp18: Acquire per-repo mutation mutex before any git worktree/rebase/push ops.
-    # If a live holder exists, treat as transient (next sweep retries; mutex + janitor
-    # together ensure locks never block a rig permanently). Skipped gracefully when the
+    # If a live holder exists the rebase is NOT attempted this sweep (git_mutex_acquire
+    # itself reclaims a holder that is dead or older than GIT_REPO_MUTEX_MAX_AGE, so a
+    # held mutex does not block a rig for longer than that). Skipped gracefully when the
     # mutex lib was not sourced (git_mutex_acquire not defined).
+    # ga-p8pg6y: "could not try" is a THIRD state, not a failed rebase. REBASE_NOT_ATTEMPTED
+    # carries it to the "branch is not current" block below, which requeues the marker with
+    # NO strike (no gate:rebase-fail-count, no gate:exiled-tier5) and exits. Without it this
+    # skip fell into the same bucket as "tried and failed" — two skips exiled a healthy
+    # branch to tier 5 — and the generic classifier below overwrote CONFLICT_FILES with
+    # "worktree/push error — no stderr captured". HAS_CONFLICT=1 stays: it is what keeps
+    # the rebase/merge blocks below from running.
+    # SELFTEST-EXTRACT ga-p8pg6y-mutex-skip-site: BEGIN
     _REBASE_MUTEX_HELD=0
+    REBASE_NOT_ATTEMPTED=0
+    REBASE_NOT_ATTEMPTED_WHY=""
     if type git_mutex_acquire >/dev/null 2>&1; then
       if git_mutex_acquire "$RIG_PATH" 2>/dev/null; then
         _REBASE_MUTEX_HELD=1
       else
-        warn "  Auto-rebase (imp18): per-repo mutex held for $RIG_PATH — transient skip; janitor will clear stale locks"
+        # git_mutex_acquire returns 1 for three different reasons — "a live owner holds it",
+        # "the lock dir was created but its heartbeat could not be written", and "lost the
+        # stale-reclaim race to another acquirer" — and does not say which; the wording
+        # below covers all three.
+        warn "  Auto-rebase (imp18): per-repo mutex not acquired for $RIG_PATH — rebase NOT attempted, no strike counted (ga-p8pg6y)"
         HAS_CONFLICT=1
         CONFLICT_KIND="transient"
         CONFLICT_FILES="per-repo git mutex held (imp18 — another git op in progress)"
+        REBASE_NOT_ATTEMPTED=1
+        REBASE_NOT_ATTEMPTED_WHY="per-repo git mutex (imp18) not acquired for $RIG_PATH — another git op holds it, or the lock could not be taken"
       fi
     fi
+    # SELFTEST-EXTRACT ga-p8pg6y-mutex-skip-site: END
 
     # ga-hzhn6k: human-readable reason for merging instead of rebasing,
     # shared by both the container-rig and self-repo branches below so the
@@ -14446,6 +14499,43 @@ if [ "$BRANCH_IS_CURRENT" != "1" ]; then
   fi
 
   if [ "$BRANCH_IS_CURRENT" != "1" ]; then
+    # ── ga-p8pg6y: a rebase that was never attempted is not a failed rebase ───
+    # Checked FIRST — before the author-liveness lookups, the circuit-break checks and
+    # both counter/exile writes below — because none of them has anything to judge: no
+    # rebase ran, so there is no failure, no conflict, and no evidence about the branch.
+    # The marker is requeued with no strike and the sweep ends here (see
+    # gate_rebase_not_attempted_requeue and the skip site, "imp18" above). Reads
+    # REBASE_NOT_ATTEMPTED with a default: the flag is only set when the auto-rebase
+    # block above ran at all.
+    # SELFTEST-EXTRACT ga-p8pg6y-not-attempted-intercept: BEGIN
+    if [ "${REBASE_NOT_ATTEMPTED:-0}" = "1" ]; then
+      _NA_WHY="${REBASE_NOT_ATTEMPTED_WHY:-reason not recorded}"
+      warn "Branch $BRANCH: auto-rebase NOT attempted — ${_NA_WHY}. Not a rebase failure: no strike is counted."
+      gate_rebase_not_attempted_requeue "$MARKER_ID" "$BRANCH" "$_NA_WHY"
+      log "SUPPRESSED PUSH (wa-uthi non-terminal): branch $BRANCH — $REBASE_VERDICT."
+      mkdir -p "$(dirname "$QG_LOG")"
+      jq -c -n \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg branch "$BRANCH" \
+        --arg bead "$BEAD_ID" \
+        --arg rig "${RIG:-unknown}" \
+        --arg marker "$MARKER_ID" \
+        --arg author "$AUTHOR" \
+        --arg main_sha "$MAIN_HEAD_SHA" \
+        --arg conflicts "$_NA_WHY" \
+        --arg event "$REBASE_EVENT" \
+        '{ts: $ts, event: $event, branch: $branch, bead: $bead, rig: $rig, marker: $marker, author: $author, main_sha: $main_sha, conflicts: $conflicts}' \
+        >> "$QG_LOG" 2>/dev/null || true
+      if [ "${_REQUEUE_RESPECTED:-0}" = "1" ]; then
+        log "  ga-kgtiw self-heal skipped for marker $MARKER_ID: this sweep respected an external transition on it and wrote no status."
+      elif [ "$(gate_marker_status_ensure "$MARKER_ID" "the not-attempted auto-rebase requeue")" = "repaired" ]; then
+        warn "ga-kgtiw SELF-HEAL: marker $MARKER_ID had no gate-status label after the not-attempted auto-rebase requeue — self-heal force-wrote and verified gate-status:error (see marker comment + Mayor mail for detail)."
+      fi
+      log "=== Dispatcher sweep complete: branch=$BRANCH verdict=$REBASE_VERDICT ==="
+      exit 0
+    fi
+    # SELFTEST-EXTRACT ga-p8pg6y-not-attempted-intercept: END
+
     # ── ga-ljbx: never-strand bounce ──────────────────────────────────────────
     # GENUINE conflict (or auto-rebase worktree/push failure). The old behavior
     # bounced to needs-rebase + nudged the author. For framework self-fixes the
