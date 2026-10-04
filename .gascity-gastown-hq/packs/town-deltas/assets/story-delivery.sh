@@ -2983,9 +2983,14 @@ else
           #   - only a re-probe verdict of EXACTLY NEEDS_GUARDED_RESTART;
           #   - only when the helper printed ALL FIVE classification lines
           #     (OWN, CLOSURE_ONLY, SYMBOL_CONFIRMED, SYMBOL_NO_EVIDENCE,
-          #     SYMBOL_NOT_COMPUTED). An older helper, or a truncated output, gets no
+          #     SYMBOL_NOT_COMPUTED) AND the GUARDED_LOCKED_COSMETIC line it prints
+          #     right after them. An older helper, or a truncated output, gets no
           #     split: absent != empty, and a missing OWN line cannot rule out
-          #     OWN-FILE-CHANGED;
+          #     OWN-FILE-CHANGED. The trailing line is there because the last
+          #     classification line (NOT_COMPUTED) is the one a helper killed
+          #     mid-print could leave cut short, and a label missing from a cut-off
+          #     list would read as "computed"; seeing the line that FOLLOWS it
+          #     proves the earlier ones were printed whole;
           #   - positive membership per label, in BOTH CLOSURE_ONLY and
           #     SYMBOL_NO_EVIDENCE. A stale label the helper did not NAME stays
           #     actionable;
@@ -3009,7 +3014,8 @@ else
              && [ -n "$MERGE_OWN_FRESH_CLOSURE_LINE" ] \
              && [ -n "$MERGE_OWN_FRESH_CONFIRMED_LINE" ] \
              && [ -n "$MERGE_OWN_FRESH_NOEVID_LINE" ] \
-             && [ -n "$MERGE_OWN_FRESH_NOTCOMP_LINE" ]; then
+             && [ -n "$MERGE_OWN_FRESH_NOTCOMP_LINE" ] \
+             && [ -n "$MERGE_OWN_FRESH_COSMETIC_LINE" ]; then
             _65o94h_remaining=""
             for _sl in $MERGE_OWN_ACTIONABLE_STALE; do
               _65o94h_closure=0; _65o94h_noevid=0; _65o94h_blocked=0

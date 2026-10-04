@@ -42,7 +42,7 @@
 #      (the calculator confirms them only because they instantiate a class that
 #      gained an additive method — a false positive in the rig's own
 #      compute_symbol_reachability.py, outside this script's remit)
-# C1-C8 are the fail-closed controls.
+# C1-C8 (incl. C2b/C2c) are the fail-closed controls.
 
 # No `pipefail` at file level (ga-uel7sb) — see the locked-cosmetic test for
 # why. The block under test still runs WITH pipefail (see run_block).
@@ -296,6 +296,14 @@ reset_scenario
 SC_GUARDED="$VCARD"; SC_CLOSURE="$VCARD"; SC_NOEVID="$VCARD"; SC_OMIT="OWN"
 run_block
 held && ok "C2b no GUARDED_OWN line -> HELD (cannot rule out OWN-FILE-CHANGED)" || nok "C2b released with no GUARDED_OWN line" "$BD_CALLS"
+
+# ── C2c: output cut off before the trailing GUARDED_LOCKED_COSMETIC line: the last
+#    classification line may itself be cut short, so nothing is excused ──
+reset_scenario
+SC_GUARDED="$VCARD"; SC_CLOSURE="$VCARD"; SC_NOEVID="$VCARD"; SC_OMIT="LOCKED_COSMETIC"
+run_block
+held && ok "C2c no GUARDED_LOCKED_COSMETIC line after the classification lines (possible truncation) -> HELD" \
+     || nok "C2c released though the helper's output may have been cut off mid-list" "$BD_CALLS"
 
 # ── C3: its own entrypoint changed (OWN-FILE-CHANGED): held even with NO_EVIDENCE ──
 reset_scenario
