@@ -357,7 +357,8 @@ sys.exit(0 if rl.claimant_provably_dead(assignee, sessions) else 1)
 # ── Canonical PARK vocabulary for R4/R8 (ga-8lrud) ───────────────────────────
 # scripts/bead_state.py's PARK_PREFIXES/PARK_EXACT is the city's single park
 # vocabulary (same disease/cure as _provably_dead above and production-stall-
-# watchdog.py's _canonical_is_parked, ga-qhca1/cbbc13660): R8's own park check
+# watchdog.py's _canonical_turn_is_elsewhere, née _canonical_is_parked,
+# ga-qhca1/cbbc13660, renamed in ga-teljci): R8's own park check
 # was a private 3-signal copy (needs-human exact, story:blocked, pool:refused:*
 # prefix) — measured 2026-08-10 against the live population, 14+ HQ beads and
 # 3+ whatsapp_automation beads carry ctx:ready/exec:auto together with a

@@ -29,6 +29,13 @@
 #    15c. stuck_execution: pilot:no-auto-dispatch label → None (ga-e5tn8)
 #    15d. stuck_execution: exclusion is per-bead — excluded bead skipped, a
 #         genuinely stuck sibling in the same result set still flags (ga-e5tn8)
+#    15e. stuck_execution: in_progress + next-action:athos, 9h → None — the
+#         Athos's turn is not an execution stall (ga-teljci, replay of ga-ormexj)
+#    15f. stuck_execution: negative control, 9h with no park/turn label → flags
+#    15g. stuck_execution: every bead_state.ATHOS_TURN label skipped per-bead,
+#         a plain stuck sibling in the same set still flags (ga-teljci)
+#    15h. stuck_execution: turn=external skipped by turn alone, turn=mayor not
+#    15i. stuck_execution: model unavailable/raising → label fallback preserved
 #   REGRESSION:
 #    16. mail-send failure → not counted, ntfy still fires, retry next tick
 #    17. detect() pure, returns the three dimensions when each fires
@@ -363,6 +370,124 @@ print('R=%r' % r)
 assert r is not None and 'ga-realstuck' in r and 'ga-excluded' not in r
 print('OK_MIXED_PER_BEAD')
 " "OK_MIXED_PER_BEAD"
+
+# --- 15e. stuck_execution: in_progress that is ATHOS'S TURN → None (ga-teljci) --
+# Replay of the live false alarm (04/10 11:56Z, "STALL CONFIRMADO stuck-exec:
+# ga-ormexj parado há 8h"): the bead is the Mayor's mission bead waiting for the
+# Athos to buy an SSD. bead_state.derive() says awaiting_athos/turn=athos (rule 3,
+# which runs BEFORE the park rule), NOT parked — so the old `parked is True` skip
+# missed it, and the label fallback (which would have skipped it via
+# pilot:no-auto-dispatch) is only consulted when the model is unavailable.
+# The precondition asserts pin that this is the REAL model's verdict — without
+# them the test could pass vacuously through that label fallback.
+run_test "stuck_execution: in_progress + next-action:athos, 9h → None (athos's turn, not an exec stall)" "
+$HARNESS
+import time, datetime, json
+labels = ['next-action:athos','waiting-on:athos-compra-ssd','pilot:no-auto-dispatch']
+assert m._CANONICAL_STATE_FN is not None, 'canonical model not loaded — test would pass vacuously'
+d = m._CANONICAL_STATE_FN({'status':'in_progress','labels':labels})
+assert d['state']=='awaiting_athos' and d['turn']=='athos', d
+old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
+def fake_sh(args, timeout=20):
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout=json.dumps([{'id':'ga-ormexj','assignee':'gastown.mayor','updated_at':old,'labels':labels}])
+    return r
+m.sh=fake_sh
+print('R=%r' % m.stuck_execution(time.time()))
+assert m.stuck_execution(time.time()) is None
+print('OK_ATHOS_TURN_NOT_STALL')
+" "OK_ATHOS_TURN_NOT_STALL"
+
+# --- 15f. stuck_execution: negative control — same age, no park/turn label → flagged --
+run_test "stuck_execution: in_progress with no park/turn label, 9h → flagged (negative control)" "
+$HARNESS
+import time, datetime, json
+assert m._CANONICAL_STATE_FN is not None, 'canonical model not loaded'
+old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
+def fake_sh(args, timeout=20):
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout=json.dumps([{'id':'ga-ctrl','assignee':'dog-ga3wack','updated_at':old,'labels':['lane:small','story:in-flight']}])
+    return r
+m.sh=fake_sh
+r = m.stuck_execution(time.time())
+print('R=%r' % r)
+assert r is not None and 'ga-ctrl' in r and 'parado há 9h' in r
+print('OK_CONTROL_STILL_FLAGS')
+" "OK_CONTROL_STILL_FLAGS"
+
+# --- 15g. stuck_execution: the whole ATHOS_TURN vocabulary, per-bead (ga-teljci) ---
+# The fix is the CLASS "the canonical turn is the Athos's", not the one label the
+# incident carried: iterate bead_state's OWN ATHOS_TURN set (never a hand copy, so a
+# new turn label is covered the day it lands) plus the gate:needs-human:product
+# variant, with a genuinely stuck sibling in the same result set that must still flag.
+run_test "stuck_execution: every ATHOS_TURN label skipped per-bead, plain stuck sibling still flagged" "
+$HARNESS
+import time, datetime, json, bead_state
+old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
+athos_labels = sorted(bead_state.ATHOS_TURN) + ['gate:needs-human:product']
+beads = [{'id':'ga-athos%d' % i,'assignee':'crew/foo','updated_at':old,'labels':[l]} for i,l in enumerate(athos_labels)]
+beads.append({'id':'ga-realstuck','assignee':'dog-b','updated_at':old,'labels':['lane:small']})
+def fake_sh(args, timeout=20):
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout=json.dumps(beads)
+    return r
+m.sh=fake_sh
+r = m.stuck_execution(time.time())
+print('R=%r' % r)
+assert r is not None and 'ga-realstuck' in r, r
+assert 'ga-athos' not in r, 'an Athos-turn bead was flagged as an execution stall: %s' % r
+print('OK_ATHOS_VOCAB_PER_BEAD')
+" "OK_ATHOS_VOCAB_PER_BEAD"
+
+# --- 15h. stuck_execution: turn=external skipped; an unrelated turn is NOT (ga-teljci) --
+# derive() only emits turn=external together with state=parked today, so this pins
+# the defensive half of the rule on a stubbed model: the turn alone is enough to skip,
+# and a turn that IS the executor's (mayor/crew) must not widen the skip.
+run_test "stuck_execution: turn=external skipped by turn alone; turn=mayor still flagged" "
+$HARNESS
+import time, datetime, json
+old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
+def fake_sh(args, timeout=20):
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout=json.dumps([{'id':'ga-ext','assignee':'crew/foo','updated_at':old,'labels':['x:ext']},
+                         {'id':'ga-mayor','assignee':'crew/foo','updated_at':old,'labels':['x:mayor']}])
+    return r
+m.sh=fake_sh
+m._CANONICAL_STATE_FN = lambda b: ({'state':'stub','turn':'external'} if 'x:ext' in b['labels']
+                                   else {'state':'stranded','turn':'mayor'})
+r = m.stuck_execution(time.time())
+print('R=%r' % r)
+assert r is not None and 'ga-mayor' in r and 'ga-ext' not in r, r
+print('OK_EXTERNAL_TURN')
+" "OK_EXTERNAL_TURN"
+
+# --- 15i. stuck_execution: fail-open to the label fallback is preserved (ga-teljci) --
+# Model unavailable (None) or erroring (raises) → the old STUCK_EXEC_EXCLUDE_LABELS
+# fallback decides, exactly as before this fix: an excluded label still skips, and a
+# bead with no excluded label still flags (error must not silence the alarm).
+run_test "stuck_execution: model unavailable/raising → label fallback (excluded skipped, plain flagged)" "
+$HARNESS
+import time, datetime, json
+old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
+def fake_sh(args, timeout=20):
+    class R: pass
+    r=R(); r.returncode=0
+    r.stdout=json.dumps([{'id':'ga-excl','assignee':'crew/foo','updated_at':old,'labels':['pilot:no-auto-dispatch']},
+                         {'id':'ga-plain','assignee':'crew/foo','updated_at':old,'labels':['lane:small']}])
+    return r
+m.sh=fake_sh
+def boom(b): raise RuntimeError('model exploded')
+for fn in (None, boom):
+    m._CANONICAL_STATE_FN = fn
+    r = m.stuck_execution(time.time())
+    print('FN=%r R=%r' % (fn, r))
+    assert r is not None and 'ga-plain' in r and 'ga-excl' not in r, (fn, r)
+print('OK_FAIL_OPEN_FALLBACK')
+" "OK_FAIL_OPEN_FALLBACK"
 
 # --- 16. mail-send failure → not counted, ntfy fires, retry ------------------
 run_test "mail-send failure → not counted, ntfy fires (retry next tick)" "

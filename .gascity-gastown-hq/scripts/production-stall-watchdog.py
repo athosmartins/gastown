@@ -51,9 +51,12 @@ DETECTION DIMENSIONS:
      story:approved beads). Suppressed when the queue is empty (idle ≠ stalled) or
      the dispatcher log is stale (a dead engine is the engine-stall monitors' job).
   3. STUCK-EXECUTION — a bead in_progress whose updated_at is older than
-     STUCK_EXEC_SEC (assigned but not progressing). Skips beads labeled
-     story:awaiting-external-merge or pilot:no-auto-dispatch — they already
-     declare they're not dispatchable/actionable here (ga-e5tn8).
+     STUCK_EXEC_SEC (assigned but not progressing). Skips beads whose canonical
+     state (bead_state.py) says the next move is not the executor's — parked, or
+     awaiting the Athos (ga-teljci). If that model is unavailable it falls back to
+     skipping beads labeled story:awaiting-external-merge or
+     pilot:no-auto-dispatch — they already declare they're not
+     dispatchable/actionable here (ga-e5tn8).
 
 Recovers silently; silence = healthy. Never crashes the loop.
 """
@@ -370,19 +373,34 @@ def merge_stall(now=None):
 # model (bead_state.py) is unavailable. It went stale hours after ga-e5tn8
 # created it: ga-w4k2z carried needs:engine-window, no-auto-dispatch (no
 # 'pilot:' prefix) and pool:refused:engine-rebuild-required — none in this
-# list — and still alarmed "STALL CONFIRMADO". See _canonical_is_parked().
+# list — and still alarmed "STALL CONFIRMADO". See _canonical_turn_is_elsewhere().
 STUCK_EXEC_EXCLUDE_LABELS = {"story:awaiting-external-merge", "pilot:no-auto-dispatch"}
 
+# ga-teljci: the canonical model also says "in_progress, but the next move is not
+# the executor's" for a bead that is NOT 'parked' — a bead waiting on a decision or
+# action only the Athos can take is state=awaiting_athos/turn=athos (bead_state.derive
+# rule 3, which runs BEFORE the park rule). Skipping on state=='parked' alone let it
+# through to the age check, so ga-ormexj (the Mayor's mission bead, waiting on the
+# Athos to buy an SSD) alarmed "STALL CONFIRMADO stuck-exec" every cycle and the
+# REMEDY (shutdown-dance/kill/redispatch) would have been wrong. turn=='external'
+# is the other not-the-executor turn; derive() only pairs it with state=='parked'
+# today, so listing it is defensive, not a behavior change.
+NOT_EXECUTOR_STATES = frozenset({"parked", "awaiting_athos"})
+NOT_EXECUTOR_TURNS = frozenset({"athos", "external"})
 
-def _canonical_is_parked(bead: dict):
-    """True/False via scripts/bead_state.py's canonical park vocabulary, or
-    None if the model is unavailable/erroring — the caller falls back to
-    STUCK_EXEC_EXCLUDE_LABELS on None. No live_sessions passed: this check
-    only reads park labels, never a liveness verdict."""
+
+def _canonical_turn_is_elsewhere(bead: dict):
+    """True/False via scripts/bead_state.py: does the canonical model say the next
+    move on this bead belongs to someone other than the executor holding it
+    (deliberately parked, or the Athos's / an external party's turn)? None if the
+    model is unavailable/erroring — the caller falls back to
+    STUCK_EXEC_EXCLUDE_LABELS on None. No live_sessions passed: this check only
+    reads labels, never a liveness verdict."""
     if _CANONICAL_STATE_FN is None:
         return None
     try:
-        return _CANONICAL_STATE_FN(bead).get("state") == "parked"
+        d = _CANONICAL_STATE_FN(bead)
+        return d.get("state") in NOT_EXECUTOR_STATES or d.get("turn") in NOT_EXECUTOR_TURNS
     except Exception:
         return None
 
@@ -391,8 +409,11 @@ def _canonical_is_parked(bead: dict):
 def stuck_execution(now=None):
     """Return a reason string if any in_progress bead has updated_at older than
     STUCK_EXEC_SEC (assigned but not progressing); else None. FAIL-OPEN: a failed
-    `bd list` or an unparseable timestamp yields no finding. Beads carrying a
-    STUCK_EXEC_EXCLUDE_LABELS label are skipped regardless of age — see ga-e5tn8."""
+    `bd list` or an unparseable timestamp yields no finding. Beads whose canonical
+    state is parked / awaiting_athos (or whose turn is the Athos's or external) are
+    skipped regardless of age — see ga-teljci; when the canonical model is
+    unavailable, beads carrying a STUCK_EXEC_EXCLUDE_LABELS label are skipped
+    instead — see ga-e5tn8."""
     now = now if now is not None else time.time()
     r = sh([BD, "list", "--status", "in_progress", "--json", "--limit", "0"], timeout=25)
     if not r or r.returncode != 0:
@@ -404,10 +425,10 @@ def stuck_execution(now=None):
     for b in beads:
         if not isinstance(b, dict):
             continue
-        parked = _canonical_is_parked(b)
-        if parked is True:
-            continue  # bead_state.py: deliberately parked, not an execution stall
-        if parked is None and STUCK_EXEC_EXCLUDE_LABELS.intersection(b.get("labels") or []):
+        elsewhere = _canonical_turn_is_elsewhere(b)
+        if elsewhere is True:
+            continue  # bead_state.py: parked, or the Athos's/an external turn — not an execution stall
+        if elsewhere is None and STUCK_EXEC_EXCLUDE_LABELS.intersection(b.get("labels") or []):
             continue  # canonical model unavailable — fall back to the old local list
         e = parse_iso_epoch(b.get("updated_at") or b.get("updated") or b.get("updatedAt"))
         if e is None:
