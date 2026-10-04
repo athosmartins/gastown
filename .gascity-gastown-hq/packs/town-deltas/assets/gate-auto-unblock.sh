@@ -401,6 +401,30 @@ has_reclaim_escalation() {
   return 1
 }
 
+# has_parked_by_design <labels-multilinha> → 0 se a bead carrega
+# discovery:source (ga-m8u5or). source_discovery.py (property_scrapers) cria
+# "[fonte] Avaliar scraper" com gate:needs-human,discovery:source,
+# scraper:build DE PROPÓSITO: a trava É o estacionamento até o Athos dar o
+# sign-off (story:approved). Não houve gate reprovando nem ninguém esquecido —
+# nada foi construído porque nada deveria ser antes da aprovação. R1 lê
+# exatamente essa ausência ("sem branch e sem commit") como trava órfã, tira o
+# gate:needs-human e "devolve à fila": medido 04/10, ~70s após o nascimento (68-74s), nas
+# 3 beads de uma mesma rodada (ga-t7js0e, ga-5wq3hj, ga-mpfnaf) — dali em diante
+# auto-refino, armar e o pilot-missing-route-watchdog as tratavam como trabalho
+# comum e o pool de dogs as recusava a cada ciclo.
+# Mesma família de has_reclaim_escalation(): a MESMA evidência de R1 tem outra
+# leitura legítima, dada por quem criou a bead. Diferente dela, aqui nenhuma
+# das regras tem o que decidir — a decisão é do Athos —, então main() só PULA
+# (como uma variante protegida), sem forçar R5 e sem chamar ninguém.
+has_parked_by_design() {
+  local v
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    [ "$v" = "discovery:source" ] && return 0
+  done <<< "$1"
+  return 1
+}
+
 # GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP must track quality-gate-dispatcher.sh's
 # own GATE_FIX_CAP (a hardcoded local there, not env-overridable — currently
 # 3), so both scripts agree on what "cap exhausted" means for the SAME
@@ -768,6 +792,10 @@ main() {
       variant="$(lock_variant "$labels")"
       if has_protected_variant "$labels"; then
         say "SKIP $id — carrega variante protegida (NAO TOCA) entre as labels gate:needs-human* presentes (pode coexistir com uma unblockable, ex. '$variant' — armadilha E); nenhuma label é tocada"
+        continue
+      fi
+      if has_parked_by_design "$labels"; then
+        say "SKIP $id — carrega discovery:source: parada de propósito até o sign-off do Athos, não é trava órfã (ga-m8u5or); nenhuma label é tocada"
         continue
       fi
       if has_reclaim_escalation "$labels"; then

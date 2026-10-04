@@ -198,12 +198,33 @@
 # story:approved deploy/prod-test path. See this script's own --selftest
 # scenario 53.
 #
+# FIFTEENTH exclusion (ga-m8u5or): discovery:source OR any next-action:* label →
+# excluded. Both mean "parked for a person", which a pool route contradicts.
+# Root cause on 04/10: source_discovery.py files "[fonte] Avaliar scraper"
+# proposals as gate:needs-human,discovery:source,scraper:build to wait for
+# Athos's sign-off; gate-auto-unblock R1 then stripped gate:needs-human ~70s
+# after birth (it read "never built" as an orphan lock — fixed at the source in
+# gate-auto-unblock.sh, has_parked_by_design), and the beads ended up armed and
+# unrouted with no story:* label. They survived all fourteen exclusions above,
+# this watchdog "self-healed" a route onto the HQ store default (gastown.dog),
+# and the dog pool refused them on every sweep (ga-t7js0e, ga-5wq3hj). The
+# discovery:source clause is the specific marker; next-action:* is the general
+# one (bead_state.py reads the same prefix as PARK, and next-action:mayor/athos
+# is the documented way a bead says "waiting on a decision") — together they
+# keep this watchdog from routing a bead that carries either marker, whatever
+# un-parked it first. Other park signals (pilot:held, blocked:*, ...) have their
+# own exclusions above; a park with none of these markers is NOT covered.
+# Deliberately NOT "no
+# story:approved → don't route": this watchdog's whole population is chore/
+# task/debt beads with NO story:* label (see the story:* exclusion above), so
+# that rule would disable it. See this script's own --selftest scenarios 54-55.
+#
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
 # gc.routed_to empty/absent, no story:* label, no gate:passed label,
-# unassigned, aged past grace, none of the fourteen holds/wrappers/
-# graph-steps/parks/active-gates/recent-dispatches/ownership/terminal-gate
-# above applying.
+# no discovery:source / next-action:* label, unassigned, aged past grace,
+# none of the fifteen holds/wrappers/graph-steps/parks/active-gates/
+# recent-dispatches/ownership/terminal-gate/human-parks above applying.
 #
 # GRACE PERIOD (PMRW_GRACE_MINUTES, default 10): unlike GMMSW's gate-status
 # loss (happens once, atomically, at marker creation — 5min grace), an armed
@@ -495,7 +516,8 @@ _state_load() {
 # KNOWN SCOPE LIMIT: this recheck deliberately does NOT re-test the label-
 # based exclusions added to the main sweep filter (story:*,
 # pilot:refusal-count:*, needs:engine-window, no-auto-dispatch, active-gate
-# probe, gate:passed — ga-zyzv7r) — only the core armed/routed/closed/gone
+# probe, gate:passed — ga-zyzv7r, discovery:source / next-action:* —
+# ga-m8u5or) — only the core armed/routed/closed/gone
 # signals. A bead that newly acquires one of those AFTER being tracked stays
 # in state as "present"/UNVERIFIED indefinitely rather than being pruned as
 # resolved. Harmless: cooldown already suppresses re-alerting regardless of
@@ -819,6 +841,7 @@ run_sweep() {
               | select(((.labels // []) | (index("no-auto-dispatch") or index("pilot:no-auto-dispatch"))) | not)
               | select(((.labels // []) | any(startswith("blocked-on:") or startswith("blocked-by:") or startswith("blocked:"))) | not)
               | select(((.labels // []) | index("gate:passed")) | not)
+              | select(((.labels // []) | (index("discovery:source") or any(startswith("next-action:")))) | not)
               | select(((.assignee // "") | test("\\S")) | not)
               | select( ((( .updated_at // .created_at // "") | fromdateiso8601?) // 9999999999) < $cut )
         ]
@@ -2225,6 +2248,33 @@ CRASHPY
   rc=$?
   [ "$rc" -eq 0 ] && ok "scenario 53: gate:passed excluded (return 0)" || bad "scenario 53 (ga-zyzv7r REGRESSION): a terminal gate:passed bead was flagged/repaired as if it needed dispatch, got rc=$rc"
   [ ! -s "$C53" ] && [ ! -s "$N53" ] && [ ! -s "$M53" ] && ok "scenario 53: no repair write / alert fired on a gate:passed bead" || bad "scenario 53 (ga-zyzv7r REGRESSION): gate:passed bead should never be repaired or alerted on"
+
+  # ── Scenario 54 (ga-m8u5or): discovery:source → excluded. Exact live shape of
+  # ga-t7js0e/ga-5wq3hj (04/10): armed, aged, unrouted, NO story:* label — so
+  # it survived every earlier exclusion and the self-heal handed a scraper-build
+  # proposal that waits for Athos's sign-off to the dog pool, which refused it
+  # on every sweep. ──────────────────────────────────────────────────────────
+  echo "Scenario 54 (ga-m8u5or): discovery:source + armed + no story:* → excluded (proposal awaiting Athos, not a routing gap)"
+  reset_stores
+  printf '[%s]' "$(mk ga-54 open 'ctx:ready,exec:auto,discovery:source,scraper:build,parent:ga-jazy9' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  N54="$TMP/notif54"; M54="$TMP/mail54"; C54="$TMP/comm54"; : > "$N54"; : > "$M54"; : > "$C54"
+  PMRW_TEST_NOTIFIED="$N54" PMRW_TEST_MAILED="$M54" PMRW_TEST_COMMENTS_LOG="$C54" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 54: discovery:source excluded (return 0)" || bad "scenario 54 (ga-m8u5or REGRESSION): a discovery:source proposal was flagged/repaired as if it needed dispatch, got rc=$rc"
+  [ ! -s "$C54" ] && [ ! -s "$N54" ] && [ ! -s "$M54" ] && ok "scenario 54: no repair write / alert fired on a discovery:source bead" || bad "scenario 54 (ga-m8u5or REGRESSION): discovery:source bead should never be repaired or alerted on"
+
+  # ── Scenario 55 (ga-m8u5or): next-action:* → excluded. A bead explicitly
+  # parked for a named decision-maker (next-action:athos/mayor — the same prefix
+  # bead_state.py reads as PARK) is waiting on a person; routing it to a pool
+  # worker contradicts the park. ─────────────────────────────────────────────
+  echo "Scenario 55 (ga-m8u5or): next-action:athos + armed → excluded (explicitly parked for a human)"
+  reset_stores
+  printf '[%s]' "$(mk ga-55 open 'ctx:ready,exec:auto,next-action:athos' "$OLD_TS")" > "$TMP/fixtures/store-a.json"
+  N55="$TMP/notif55"; M55="$TMP/mail55"; C55="$TMP/comm55"; : > "$N55"; : > "$M55"; : > "$C55"
+  PMRW_TEST_NOTIFIED="$N55" PMRW_TEST_MAILED="$M55" PMRW_TEST_COMMENTS_LOG="$C55" run_sweep
+  rc=$?
+  [ "$rc" -eq 0 ] && ok "scenario 55: next-action:* excluded (return 0)" || bad "scenario 55 (ga-m8u5or REGRESSION): a bead parked with next-action:athos was flagged/repaired, got rc=$rc"
+  [ ! -s "$C55" ] && [ ! -s "$N55" ] && [ ! -s "$M55" ] && ok "scenario 55: no repair write / alert fired on a next-action:* bead" || bad "scenario 55 (ga-m8u5or REGRESSION): next-action:* bead should never be repaired or alerted on"
 
   echo ""
   echo "pilot-missing-route-watchdog selftest: PASS=$PASS FAIL=$FAIL"

@@ -608,6 +608,25 @@ else
     "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-mixed/removed.log" 2>/dev/null)"
 fi
 
+# ── ga-m8u5or: bead de descoberta de fonte NASCE parada, não é trava órfã ─
+# source_discovery.py cria "[fonte] Avaliar scraper" com
+# gate:needs-human,discovery:source,scraper:build — de propósito, para esperar
+# o sign-off do Athos. Nunca teve branch nem commit, então R1 lia "sem
+# trabalho" como trava órfã e, ~70s depois do nascimento (04/10 15:03:40,
+# ga-t7js0e/ga-5wq3hj/ga-mpfnaf), tirava o gate:needs-human: a bead voltava
+# "à fila" e o resto da máquina (auto-refino, armar, repor rota) passava a
+# tratá-la como trabalho comum. Repro exato: sem branch, label genérica.
+setup ga-disc '["gate:needs-human","discovery:source","scraper:build","parent:ga-jazy9"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "SKIP ga-disc" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "R[1-5] ga-disc" >/dev/null \
+   && [ ! -s "$TMP/fx.ga-disc/removed.log" ] && [ ! -s "$TMP/fx.ga-disc/comments.log" ]; then
+  ok "ga-m8u5or: discovery:source sem branch → SKIP, gate:needs-human intacto, nenhum comentário"
+else
+  bad "ga-m8u5or: bead discovery:source parada de propósito foi tratada como trava órfã" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-disc/removed.log" 2>/dev/null) COMMENTS=$(cat "$TMP/fx.ga-disc/comments.log" 2>/dev/null)"
+fi
+
 # ── REGRESSÃO do meu erro de 15/08: prefixo vs exato ───────────────────
 # Busquei travadas por PREFIXO (^gate:needs-human) e removi por texto
 # EXATO ("gate:needs-human"). A busca achava, a remoção nunca casava, e
