@@ -559,6 +559,49 @@ r=$(reconcile_orphaned_verdict_action 100 15 1 unknown); [ "$r" = "skip" ] && ok
 r=$(reconcile_orphaned_verdict_action 100 15 0 not_found); [ "$r" = "skip" ] && ok "old, NO gate-run label at all → skip (nothing to check parent liveness against, never guess)" || bad "no-label got '$r'"
 r=$(reconcile_orphaned_verdict_action 999999 15 1 unknown); [ "$r" = "skip" ] && ok "even a VERY old verdict with unknown parent state stays skip — age alone never overrides an unconfirmed lookup" || bad "very-old+unknown got '$r'"
 
+# ── verdict_parent_state_from_show <bd-show-stdout> / reconcile_parked_verdict_action ─
+# ga-hwjrlq: Step 0b.3's pair. A verdict bead the DISPATCHER already parked
+# (verdict:REQUEUED / verdict:TIMEOUT) but whose `bd close` was lost (Dolt
+# saturated, or the dispatcher killed between label-add and close) is invisible to
+# Step 0b.1/0b.2 (both query verdict:pending) and only agent-stuck-escalation sees
+# it, paging the Mayor every 30m. Live shapes below are the three beads of
+# 2026-10-04 (ga-7dh3v1, ga-pvp2n8, ga-o1vj01): every parent gate-run was
+# closed + gate-status:superseded. The parent state is FOUR-valued — terminal /
+# active / gone / unknown — because closing a parked verdict under a run that is
+# still `running` makes Phase C read it as a received non-PASS verdict and FAIL a
+# marker that was just re-queued (dispatcher ga-fi1dh comment), and an unreadable
+# parent must never read as a gone one (root-class:error-vs-empty).
+echo "verdict_parent_state_from_show: terminal / active / gone / unknown, never a guess"
+r=$(verdict_parent_state_from_show '[{"id":"ga-owow5q","status":"closed","labels":["gate-status:superseded","source-bead:wa-ug910y","type:quality-gate-run"]}]'); [ "$r" = "terminal" ] && ok "LIVE ga-owow5q shape (closed + gate-status:superseded, bare array) → terminal" || bad "live-superseded got '$r'"
+r=$(verdict_parent_state_from_show '{"id":"x","status":"closed","labels":["gate-status:superseded"]}'); [ "$r" = "terminal" ] && ok "bare-object shape, closed + superseded → terminal" || bad "object-superseded got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"open","labels":["gate-status:aborted"]}]'); [ "$r" = "terminal" ] && ok "open + gate-status:aborted → terminal (label alone decides when the run is not closed yet)" || bad "aborted got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"closed","labels":["gate-status:running"]}]'); [ "$r" = "terminal" ] && ok "closed bead with a STALE gate-status:running label → terminal (a closed run can never produce a verdict)" || bad "closed-stale-running got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"open","labels":["gate-status:running"]}]'); [ "$r" = "active" ] && ok "open + gate-status:running → active (Phase C still owns this run)" || bad "running got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"open","labels":["gate-status:claimed"]}]'); [ "$r" = "active" ] && ok "open + gate-status:claimed → active" || bad "claimed got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"open","labels":["type:quality-gate-run"]}]'); [ "$r" = "active" ] && ok "open + NO gate-status label → active (unrecognized is never terminal, fail-safe)" || bad "no-status got '$r'"
+r=$(verdict_parent_state_from_show '[{"id":"x","status":"open","labels":["gate-status:running","gate-status:superseded"]}]'); [ "$r" = "active" ] && ok "open + TWO gate-status labels (mid-transition, ga-i0n83) → active (ambiguous never picks the terminal one)" || bad "ambiguous got '$r'"
+r=$(verdict_parent_state_from_show '{"error":"no issues found matching the provided IDs"}'); [ "$r" = "gone" ] && ok "bd show not-found envelope → gone (confirmed absent)" || bad "not-found got '$r'"
+r=$(verdict_parent_state_from_show "$(printf '{\n  "error": "no issues found matching the provided IDs",\n  "schema_version": 1\n}')"); [ "$r" = "gone" ] && ok "LIVE bd 1.1 not-found output (pretty-printed, with schema_version; captured 2026-10-04 for a nonexistent id) → gone" || bad "live-notfound got '$r'"
+r=$(verdict_parent_state_from_show '[]'); [ "$r" = "gone" ] && ok "empty array → gone (bd answered, nothing matched)" || bad "empty-array got '$r'"
+r=$(verdict_parent_state_from_show 'Error 1105 (HY000): row read wait bigger than connection timeout'); [ "$r" = "unknown" ] && ok "LIVE Dolt-overload error text (not JSON) → unknown, NOT gone" || bad "REGRESSION: dolt error got '$r' — a query failure read as a gone parent"
+r=$(verdict_parent_state_from_show ''); [ "$r" = "unknown" ] && ok "empty stdout → unknown (a failed bd call prints nothing)" || bad "empty-stdout got '$r'"
+r=$(verdict_parent_state_from_show '{"error":"database is locked"}'); [ "$r" = "unknown" ] && ok "JSON error envelope that is NOT the not-found message → unknown (only 'no issues found' proves absence)" || bad "other-json-error got '$r'"
+r=$(verdict_parent_state_from_show '{"ok":false,"error":{"code":"timeout"}}'); [ "$r" = "unknown" ] && ok "gc-style {ok:false,error:{...}} envelope → unknown" || bad "gc-envelope got '$r'"
+
+echo "reconcile_parked_verdict_action: close only past grace AND under a terminal/gone parent"
+r=$(reconcile_parked_verdict_action 100 15 terminal); [ "$r" = "close" ] && ok "old, parent terminal → close (the three 2026-10-04 beads)" || bad "old+terminal got '$r'"
+r=$(reconcile_parked_verdict_action 100 15 gone); [ "$r" = "close" ] && ok "old, parent confirmed gone → close" || bad "old+gone got '$r'"
+r=$(reconcile_parked_verdict_action 100 15 active); [ "$r" = "skip" ] && ok "old, parent still ACTIVE → skip (closing it would make Phase C FAIL a re-queued marker)" || bad "REGRESSION: old+active got '$r'"
+r=$(reconcile_parked_verdict_action 100 15 unknown); [ "$r" = "skip" ] && ok "old, parent UNKNOWN (query failed) → skip" || bad "REGRESSION: old+unknown got '$r'"
+r=$(reconcile_parked_verdict_action 100 15 ''); [ "$r" = "skip" ] && ok "old, parent state empty → skip (unrecognized never closes)" || bad "old+empty got '$r'"
+r=$(reconcile_parked_verdict_action 100 15 weird); [ "$r" = "skip" ] && ok "old, unrecognized parent word → skip" || bad "old+weird got '$r'"
+r=$(reconcile_parked_verdict_action 5 15 terminal); [ "$r" = "skip" ] && ok "young (5<=15), parent terminal → skip (the dispatcher's own label→close window is not ours to race)" || bad "young+terminal got '$r'"
+r=$(reconcile_parked_verdict_action 15 15 terminal); [ "$r" = "skip" ] && ok "exactly at grace (15<=15) → skip (inclusive, same convention as the siblings)" || bad "boundary got '$r'"
+r=$(reconcile_parked_verdict_action 16 15 terminal); [ "$r" = "close" ] && ok "just past grace (16>15), terminal → close" || bad "just-past got '$r'"
+r=$(reconcile_parked_verdict_action abc 15 terminal); [ "$r" = "skip" ] && ok "non-numeric age → skip (an unparseable age is not 'old')" || bad "REGRESSION: non-numeric age got '$r'"
+r=$(reconcile_parked_verdict_action 100 '' terminal); [ "$r" = "skip" ] && ok "non-numeric grace → skip" || bad "REGRESSION: empty grace got '$r'"
+r=$(reconcile_parked_verdict_action 999999 15 unknown); [ "$r" = "skip" ] && ok "a VERY old verdict with an unknown parent stays skip — age alone never overrides" || bad "very-old+unknown got '$r'"
+
 # ── session_alive_for_assignee <assignee> <sess_snap_json> — single-assignee liveness ─
 echo "session_alive_for_assignee: matches id/session_name/session_id, excludes closed"
 SNAP='[{"id":"gate-reviewer-adhoc-abc123","closed":false},{"session_name":"gate-reviewer-adhoc-dead999","closed":true},{"session_id":"gate-reviewer-adhoc-xyz","closed":false}]'

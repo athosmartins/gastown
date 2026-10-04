@@ -443,6 +443,67 @@ reconcile_orphaned_verdict_action() {
   echo "close"
 }
 
+# verdict_parent_state_from_show <bd-show-stdout> — pure (ga-hwjrlq). Classifies a
+# verdict bead's PARENT gate-run from the stdout of `bd show <run> --json`, for
+# Step 0b.3. Four states, never collapsed:
+#   terminal — the run is closed, or its single gate-status is superseded/aborted/
+#              passed/failed (gaterun_status_terminal): it will never read this verdict.
+#   active   — found, not closed, status running/claimed/absent/ambiguous. Anything
+#              unrecognized lands here (fail-safe: never terminal by default).
+#   gone     — bd ANSWERED and the run does not exist: an empty array, or the
+#              "no issues found" envelope. Only that message proves absence.
+#   unknown  — empty stdout, non-JSON (the Dolt-overload text), or any other JSON
+#              error envelope. A failed lookup is not evidence of absence
+#              (root-class:error-vs-empty) — stricter than Step 0b.2's "parseable and
+#              no .id", on purpose: this step's default under doubt is inert.
+verdict_parent_state_from_show() {
+  local raw="${1:-}" bead status labels st
+  printf '%s' "$raw" | jq -e 'type=="array" or type=="object"' >/dev/null 2>&1 || { echo "unknown"; return; }
+  if printf '%s' "$raw" | jq -e 'type=="array" and length==0' >/dev/null 2>&1; then
+    echo "gone"; return
+  fi
+  bead=$(printf '%s' "$raw" | jq -c 'if type=="array" then .[0] else . end' 2>/dev/null) || { echo "unknown"; return; }
+  if ! printf '%s' "$bead" | jq -e 'type=="object" and ((.id // "") != "")' >/dev/null 2>&1; then
+    if printf '%s' "$bead" | jq -e 'type=="object" and ((.error | type) == "string") and (.error | test("no issues found"; "i"))' >/dev/null 2>&1; then
+      echo "gone"
+    else
+      echo "unknown"
+    fi
+    return
+  fi
+  status=$(printf '%s' "$bead" | jq -r '.status // ""' 2>/dev/null)
+  [ "$status" = "closed" ] && { echo "terminal"; return; }
+  labels=$(printf '%s' "$bead" | jq -r '(.labels // []) | join(" ")' 2>/dev/null)
+  st=$(marker_status_from_labels "$labels")
+  if [ "$(gaterun_status_terminal "$st")" = "1" ]; then echo "terminal"; else echo "active"; fi
+}
+
+# reconcile_parked_verdict_action <age_min> <grace_min> <parent_state> — pure (ga-hwjrlq).
+# What to do with a verdict bead the dispatcher already parked (verdict:REQUEUED /
+# verdict:TIMEOUT) that is STILL not closed: its `bd close` was lost (Dolt saturated,
+# or the dispatcher died between label-add and close — the three 2026-10-04 beads:
+# parent run closed + superseded, verdict left in_progress on a dead reviewer session).
+# Step 0b.1/0b.2 select verdict:pending, so without this nothing but the 30-minute
+# agent-stuck-escalation page ever notices it.
+#   - parent_state terminal|gone → close (the run will never read it).
+#   - parent_state active        → skip. Phase C re-picks a still-running run and treats a
+#     CLOSED verdict:REQUEUED/TIMEOUT bead as a received non-PASS verdict (dispatcher
+#     ga-fi1dh), so closing under a live run could FAIL a marker that was just
+#     re-queued; Phase C re-parks and re-closes an OPEN one itself (vb_status_action).
+#   - unknown/empty/unrecognized → skip.
+# age_min is time since the bead's updated_at, so the dispatcher's own label→close window
+# is not raced. A non-numeric age or grace is not "old": skip.
+reconcile_parked_verdict_action() {
+  local age_min="${1:-}" grace_min="${2:-}" parent_state="${3:-}"
+  case "$age_min" in ''|*[!0-9]*) echo "skip"; return ;; esac
+  case "$grace_min" in ''|*[!0-9]*) echo "skip"; return ;; esac
+  [ "$age_min" -le "$grace_min" ] && { echo "skip"; return; }
+  case "$parent_state" in
+    terminal|gone) echo "close" ;;
+    *)             echo "skip" ;;
+  esac
+}
+
 # session_alive_for_assignee <assignee> <sess_snap_json> — pure given the
 # snapshot as data (ga-u07fn). Single-assignee liveness check: is <assignee> a
 # still-open (non-closed) session in <sess_snap_json>? Same snapshot shape and
@@ -5043,6 +5104,103 @@ if [ "$ORPHAN_VERDICT_COUNT" -gt 0 ]; then
     esac
   done
 fi
+
+# ── Step 0b.3 (ga-hwjrlq): parked-but-open verdict reap ──────────────────────
+# Sibling of Step 0b.1/0b.2, for the population THEY cannot see: verdict beads the
+# DISPATCHER already parked — label verdict:pending swapped for verdict:REQUEUED
+# (infra/no-eval/quota re-queue) or verdict:TIMEOUT (Phase C genuine timeout) — whose
+# following `bd close ... || true` did not land. Measured 2026-10-04 (ga-7dh3v1,
+# ga-pvp2n8, ga-o1vj01): each parent gate-run was closed + gate-status:superseded by
+# the dispatcher moments after the lost verdict close, so the verdict stayed
+# in_progress on a dead reviewer session, matched neither reaper above (both select
+# verdict:pending) and paged the Mayor through agent-stuck-escalation every 30 min.
+# These beads belong to EARLIER runs than the one that finally merged — a close at the
+# finalizing run's own Phase C would never have reached them; the sweep is by label.
+#
+# Closes only when reconcile_parked_verdict_action says so: past
+# GATE_DEAD_VERDICT_GRACE_MINUTES AND the parent run is terminal or confirmed gone.
+# A still-running parent is left alone on purpose (Phase C would read the closed bead
+# as a received non-PASS verdict). An unreadable parent is skipped — never closed on a
+# failed lookup — and warned about once the bead is past the grace window. No session-liveness check: REQUEUED/TIMEOUT is the
+# dispatcher's own "this reviewer is finished" verdict, so a live assignee is moot.
+# Must NOT add --status: an in_progress verdict is exactly the shape this catches
+# (same note as Step 0b.1). --limit 0 per ga-21kmp.
+log "Step 0b.3 (ga-hwjrlq): parked-but-open verdict reap — grace=${GATE_DEAD_VERDICT_GRACE_MINUTES}m..."
+
+# SELFTEST-EXTRACT parked-verdict-reap: BEGIN
+if PARKED_VERDICT_JSON=$(bd -C "$GC_CITY" list --json --limit 0 \
+    -l type:quality-gate-verdict --label-any verdict:REQUEUED,verdict:TIMEOUT \
+    2>/dev/null); then
+  # Not `|| echo "0"`: that would turn garbage (or a JSON error envelope) into a confirmed-empty list. A non-array stays non-numeric and reaches the warn below.
+  PARKED_VERDICT_COUNT=$(printf '%s\n' "$PARKED_VERDICT_JSON" | jq -e 'if type=="array" then length else empty end' 2>/dev/null) || PARKED_VERDICT_COUNT=""
+  case "$PARKED_VERDICT_COUNT" in
+    ''|*[!0-9]*)
+      warn "ga-hwjrlq: parked-verdict reap query returned unparseable output — skipping this sweep rather than guessing a count."
+      PARKED_VERDICT_COUNT=0
+      ;;
+  esac
+else
+  warn "ga-hwjrlq: parked-verdict reap query FAILED (Dolt timeout/contention?) — skipping this sweep; next sweep will retry. Not a confirmed-empty result."
+  PARKED_VERDICT_JSON="[]"
+  PARKED_VERDICT_COUNT=0
+fi
+
+if [ "$PARKED_VERDICT_COUNT" -gt 0 ]; then
+  NOW_EPOCH="${NOW_EPOCH:-$(date +%s)}"
+
+  for _pvi in $(seq 0 $((PARKED_VERDICT_COUNT - 1))); do
+    PV=$(printf '%s\n' "$PARKED_VERDICT_JSON" | jq ".[$_pvi]")
+    PV_ID=$(printf '%s\n' "$PV" | jq -r '.id // ""')
+    PV_STATUS=$(printf '%s\n' "$PV" | jq -r '.status // ""')
+    PV_UPDATED=$(printf '%s\n' "$PV" | jq -r '.updated_at // ""')
+    PV_LABELS=$(printf '%s\n' "$PV" | jq -r '(.labels // []) | join(" ")')
+    [ -z "$PV_ID" ] && continue
+    # The default list already excludes closed; a closed row here is a changed contract, not work.
+    [ "$PV_STATUS" = "closed" ] && continue
+
+    PV_AGE=$(age_minutes_of "$PV_UPDATED" "$NOW_EPOCH")
+    case "$PV_AGE" in ''|*[!0-9]*) PV_AGE=0 ;; esac
+    # age_minutes_of turns an unparseable timestamp into epoch 0, i.e. an age of ~29M minutes — "can't read it" would then read as "ancient". Only a timestamp that looks like one is allowed to make a bead old.
+    case "$PV_UPDATED" in
+      [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) ;;
+      *) PV_AGE=0 ;;
+    esac
+
+    # `|| true`: no gate-run: label is a handled case below, and a grep miss under pipefail would abort the sweep (ga-qtc16 gate-fix, same shape).
+    PV_GR_ID=$(printf '%s\n' "$PV_LABELS" | grep -oE 'gate-run:[A-Za-z0-9._-]+' | head -1 | sed 's/^gate-run://') || true
+    if [ -z "$PV_GR_ID" ]; then
+      if [ "$PV_AGE" -gt "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
+        warn "ga-hwjrlq: parked verdict $PV_ID (age=${PV_AGE}m) carries no gate-run:<id> label — cannot determine parent, skipping rather than guessing."
+      fi
+      continue
+    fi
+
+    # `|| true`: the failure is classified from stdout by verdict_parent_state_from_show, not from the exit code (bd show exits 1 for both not-found and a query failure).
+    PV_GR_RAW=$(bd -C "$GC_CITY" show "$PV_GR_ID" --json 2>/dev/null) || true
+    PV_PARENT=$(verdict_parent_state_from_show "$PV_GR_RAW")
+    PV_ACTION=$(reconcile_parked_verdict_action "$PV_AGE" "$GATE_DEAD_VERDICT_GRACE_MINUTES" "$PV_PARENT")
+
+    case "$PV_ACTION" in
+      close)
+        PV_VLABEL=$(printf '%s\n' "$PV_LABELS" | grep -oE 'verdict:(REQUEUED|TIMEOUT)' | head -1) || true
+        if bd -C "$GC_CITY" close "$PV_ID" -r "dispatcher parked this verdict (${PV_VLABEL:-verdict:?}) but its close was lost; parent gate-run $PV_GR_ID is ${PV_PARENT} — leftover state, not a stuck review. Closed by guard (ga-hwjrlq)." 2>/dev/null; then
+          log "ga-hwjrlq: closed parked verdict $PV_ID (age=${PV_AGE}m, parent gate-run $PV_GR_ID ${PV_PARENT})."
+        else
+          warn "ga-hwjrlq: close of parked verdict $PV_ID FAILED — it stays open; next sweep will retry."
+        fi
+        ;;
+      skip)
+        if [ "$PV_AGE" -gt "$GATE_DEAD_VERDICT_GRACE_MINUTES" ]; then
+          case "$PV_PARENT" in
+            unknown) warn "ga-hwjrlq: parent gate-run $PV_GR_ID of parked verdict $PV_ID could not be read (query failure or unrecognized answer) — skipping, not confirmed finished." ;;
+            active)  log "ga-hwjrlq: parked verdict $PV_ID (age=${PV_AGE}m) sits under a still-active gate-run $PV_GR_ID — leaving it to Phase C." ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+fi
+# SELFTEST-EXTRACT parked-verdict-reap: END
 
 # ── Step 0b (ga-bz4nsi): rig-DB sweep for orphaned story:in-flight ──────────
 # Step 0c/0c.1 below only ever scan $GC_CITY (HQ). A rig-native bead (wa-*,
