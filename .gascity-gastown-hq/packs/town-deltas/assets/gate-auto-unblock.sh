@@ -124,6 +124,22 @@
 # pior que um loop de despacho ruidoso.
 #
 # ────────────────────────────────────────────────────────────────────
+# ⚠️ UM NONO ESTADO: ESTACIONADA DE PROPÓSITO (ga-m8u5or, 2026-10-04):
+# discovery:source SEM story:approved. source_discovery.py cria a bead
+# "[fonte] Avaliar scraper" já com gate:needs-human — a trava É o
+# estacionamento até o sign-off do Athos —, e R1 lia "sem branch e sem
+# commit" como trava órfã e a soltava ~70s depois. Agora main() PULA
+# essa bead (SKIP, nenhuma label tocada) — ver has_parked_by_design().
+# Três limites, cada um com cenário no selftest:
+#   • só vale ENQUANTO story:approved está ausente: discovery:source é
+#     proveniência permanente e sobrevive ao sign-off; aprovada, a bead é
+#     trabalho comum e volta ao R1-R5 (senão aprovar a deixaria travada);
+#   • roda DEPOIS das escalações de reclaim e de fix-attempt cap: evidência
+#     de que o trabalho foi despachado e falhou é "um humano precisa olhar"
+#     (R5) e o estacionamento não a silencia;
+#   • só pula — não força R5 nem chama ninguém: a decisão é do Athos.
+#
+# ────────────────────────────────────────────────────────────────────
 # ARMADILHAS MEDIDAS que este script evita POR CONSTRUÇÃO. Todas me
 # pegaram em 2026-08-15; cada uma tem cenário no selftest:
 #
@@ -401,28 +417,41 @@ has_reclaim_escalation() {
   return 1
 }
 
-# has_parked_by_design <labels-multilinha> → 0 se a bead carrega
-# discovery:source (ga-m8u5or). source_discovery.py (property_scrapers) cria
-# "[fonte] Avaliar scraper" com gate:needs-human,discovery:source,
-# scraper:build DE PROPÓSITO: a trava É o estacionamento até o Athos dar o
-# sign-off (story:approved). Não houve gate reprovando nem ninguém esquecido —
-# nada foi construído porque nada deveria ser antes da aprovação. R1 lê
-# exatamente essa ausência ("sem branch e sem commit") como trava órfã, tira o
-# gate:needs-human e "devolve à fila": medido 04/10, ~70s após o nascimento (68-74s), nas
-# 3 beads de uma mesma rodada (ga-t7js0e, ga-5wq3hj, ga-mpfnaf) — dali em diante
-# auto-refino, armar e o pilot-missing-route-watchdog as tratavam como trabalho
-# comum e o pool de dogs as recusava a cada ciclo.
+# has_parked_by_design <labels-multilinha> → 0 se a bead está estacionada de
+# propósito: carrega discovery:source E NÃO carrega story:approved (ga-m8u5or).
+# source_discovery.py (property_scrapers) cria "[fonte] Avaliar scraper" com
+# gate:needs-human,discovery:source,scraper:build DE PROPÓSITO: a trava É o
+# estacionamento até o Athos dar o sign-off (story:approved). Não houve gate
+# reprovando nem ninguém esquecido — nada foi construído porque nada deveria
+# ser antes da aprovação. R1 lê exatamente essa ausência ("sem branch e sem
+# commit") como trava órfã, tira o gate:needs-human e "devolve à fila": medido
+# 04/10, ~70s após o nascimento (68-74s), nas 3 beads de uma mesma rodada
+# (ga-t7js0e, ga-5wq3hj, ga-mpfnaf) — dali em diante auto-refino, armar e o
+# pilot-missing-route-watchdog as tratavam como trabalho comum e o pool de dogs
+# as recusava a cada ciclo.
+# ⚠️ discovery:source sozinho NÃO é o estacionamento: é PROVENIÊNCIA permanente
+# (source_discovery.py BEAD_LABELS) e continua na bead depois do sign-off. A
+# exceção só se justifica enquanto o sign-off AINDA NÃO aconteceu — com
+# story:approved presente a bead é trabalho comum (aprovar → construir) e tem
+# que voltar ao caminho R1-R5; senão R1, a única regra que tira a trava velha
+# de uma bead nunca construída, ficaria desligada e o passo documentado de
+# aprovar ("adicionar story:approved") deixaria a bead travada pra sempre. A
+# decisão é sobre o ESTADO ATUAL (aprovada ou não), não sobre a origem.
 # Mesma família de has_reclaim_escalation(): a MESMA evidência de R1 tem outra
 # leitura legítima, dada por quem criou a bead. Diferente dela, aqui nenhuma
 # das regras tem o que decidir — a decisão é do Athos —, então main() só PULA
-# (como uma variante protegida), sem forçar R5 e sem chamar ninguém.
+# (como uma variante protegida), sem forçar R5 e sem chamar ninguém. E só pula
+# DEPOIS das duas escalações (reclaim e fix-attempt cap): evidência de que o
+# trabalho aconteceu e falhou é "um humano precisa olhar" e o estacionamento
+# não pode silenciá-la.
 has_parked_by_design() {
-  local v
+  local v source=0 approved=0
   while IFS= read -r v; do
     [ -n "$v" ] || continue
-    [ "$v" = "discovery:source" ] && return 0
+    [ "$v" = "discovery:source" ] && source=1
+    [ "$v" = "story:approved" ] && approved=1
   done <<< "$1"
-  return 1
+  [ "$source" = "1" ] && [ "$approved" = "0" ]
 }
 
 # GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP must track quality-gate-dispatcher.sh's
@@ -794,10 +823,6 @@ main() {
         say "SKIP $id — carrega variante protegida (NAO TOCA) entre as labels gate:needs-human* presentes (pode coexistir com uma unblockable, ex. '$variant' — armadilha E); nenhuma label é tocada"
         continue
       fi
-      if has_parked_by_design "$labels"; then
-        say "SKIP $id — carrega discovery:source: parada de propósito até o sign-off do Athos, não é trava órfã (ga-m8u5or); nenhuma label é tocada"
-        continue
-      fi
       if has_reclaim_escalation "$labels"; then
         # ga-18uhg0 (triagem do Mayor, Opção B): pula decide() de propósito —
         # R1-R4 tirariam conclusão OPOSTA da MESMA evidência "sem branch/
@@ -812,6 +837,15 @@ main() {
         # decide() (e portanto R1-R4) incondicionalmente; força sempre R5.
         rule="R5"
         why="bead carrega gate:fix-attempt:N com N >= ${GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP} (circuit-breaker de quality-gate-dispatcher.sh esgotado e VERIFICADO, ga-55syh) — R1-R4 pulados incondicionalmente: R1 leria 'sem commit novo' como trava órfã e R4 leria as reprovações repetidas como caso pra redespachar com teste mais forte; nenhuma das duas pode decidir por um bead onde outro subsistema já determinou que o auto-retry tem que parar (ga-3pkhtc)"
+      elif has_parked_by_design "$labels"; then
+        # ga-m8u5or: discovery:source SEM story:approved = estacionada de
+        # propósito até o sign-off do Athos. Fica DEPOIS das duas escalações
+        # acima de propósito (ver has_parked_by_design): cap/reclaim esgotado
+        # é evidência de que alguém despachou e falhou, "um humano precisa
+        # olhar" — o estacionamento não a silencia. Com story:approved o
+        # predicado é falso e a bead cai no decide() abaixo (R1-R5 normais).
+        say "SKIP $id — carrega discovery:source sem story:approved: parada de propósito até o sign-off do Athos, não é trava órfã (ga-m8u5or); nenhuma label é tocada"
+        continue
       else
         # ⚠️ (ga-hi28wr) decide() roda ANTES do `IFS='|' read`, não dentro da
         # here-string dele: no bash 3.2 de /bin/bash (o que o plist usa) a

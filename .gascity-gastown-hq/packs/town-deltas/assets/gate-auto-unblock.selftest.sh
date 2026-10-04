@@ -627,6 +627,80 @@ else
     "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-disc/removed.log" 2>/dev/null) COMMENTS=$(cat "$TMP/fx.ga-disc/comments.log" 2>/dev/null)"
 fi
 
+# ── ga-m8u5or (gate fix-attempt 1): o estacionamento acaba no sign-off ──
+# discovery:source é PROVENIÊNCIA permanente — continua na bead depois da
+# aprovação. A exceção só se justifica ("até o sign-off do Athos") enquanto
+# story:approved está AUSENTE; com ele presente a bead é trabalho comum e
+# volta ao caminho R1-R5. O teste acima só fixa o lado pré-aprovação; os
+# quatro abaixo fixam o outro lado da fronteira (e a ordem frente às
+# escalações), que o predicado largo demais deixava passar:
+#  (a) aprovada + sem branch → R1 libera a trava velha (o fluxo aprovar→
+#      construir). Antes: SKIP "até o sign-off" DEPOIS do sign-off, trava
+#      eterna até alguém tirar gate:needs-human à mão.
+#  (b) aprovada + cap de gate:fix-attempt esgotado → R5 (chamar humano).
+#  (c) aprovada + construída + 3 reprovações → R4 (escala de escopo).
+#  (d) AINDA SEM aprovação mas com evidência de escalação (cap / reclaim) →
+#      R5, não SKIP: bead "parada de propósito" nunca deveria ter sido
+#      despachada, então essa evidência é "um humano precisa olhar", e o
+#      estacionamento não pode silenciá-la.
+setup ga-appr '["gate:needs-human","discovery:source","scraper:build","parent:ga-jazy9","story:approved"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R1 ga-appr" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "SKIP ga-appr" >/dev/null \
+   && [ -s "$TMP/fx.ga-appr/removed.log" ]; then
+  ok "ga-m8u5or: discovery:source + story:approved + sem branch → R1 libera a trava (sign-off dado, estacionamento acabou)"
+else
+  bad "ga-m8u5or: bead discovery:source JÁ APROVADA continua travada com a log 'até o sign-off' — o predicado não olha story:approved" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-appr/removed.log" 2>/dev/null)"
+fi
+
+setup ga-apprcap '["gate:needs-human","discovery:source","scraper:build","story:approved","gate:fix-attempt:3"]' \
+  'origin/fix/ga-apprcap-scraper' '+ b40be47f' '1700000000' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R5 ga-apprcap" >/dev/null \
+   && ! printf '%s' "$OUT" | grep -E "SKIP ga-apprcap|R[1-4] ga-apprcap" >/dev/null \
+   && [ ! -s "$TMP/fx.ga-apprcap/removed.log" ]; then
+  ok "ga-m8u5or: discovery:source + story:approved + gate:fix-attempt:3 → R5 (chamar humano), não SKIP silencioso"
+else
+  bad "ga-m8u5or: a escalação R5 de cap-esgotado sumiu para bead discovery:source aprovada (SKIP engoliu o 'um humano precisa olhar')" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-apprcap/removed.log" 2>/dev/null)"
+fi
+
+setup ga-apprr4 '["gate:needs-human","discovery:source","scraper:build","story:approved","gate-sha-failed:a:code","gate-sha-failed:b:code","gate-sha-failed:c:code"]' \
+  'origin/fix/ga-apprr4-scraper' '+ b40be47f' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL em lib/x.py"}]'
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R4 ga-apprr4" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "SKIP ga-apprr4" >/dev/null; then
+  ok "ga-m8u5or: discovery:source + story:approved + construída + 3 reprovações → R4 (escala de escopo), não SKIP"
+else
+  bad "ga-m8u5or: R2-R4 ficaram mortas para bead discovery:source aprovada e construída (controle sem discovery:source dá R4)" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-apprr4/removed.log" 2>/dev/null)"
+fi
+
+setup ga-parkcap '["gate:needs-human","discovery:source","scraper:build","gate:fix-attempt:3"]' \
+  'origin/fix/ga-parkcap-scraper' '+ b40be47f' '1700000000' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R5 ga-parkcap" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "SKIP ga-parkcap" >/dev/null \
+   && [ ! -s "$TMP/fx.ga-parkcap/removed.log" ]; then
+  ok "ga-m8u5or: discovery:source SEM aprovação + gate:fix-attempt:3 → R5 — o estacionamento não silencia a escalação de cap"
+else
+  bad "ga-m8u5or: a checagem de estacionamento vem ANTES de has_fix_attempt_cap_escalation e engole o R5 (cap esgotado, sem aprovação)" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-parkcap/removed.log" 2>/dev/null)"
+fi
+
+setup ga-parkrecl '["gate:needs-human","discovery:source","scraper:build","pilot:reclaim-count:escalated-at-3"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R5 ga-parkrecl" >/dev/null \
+   && ! printf '%s' "$OUT" | grep "SKIP ga-parkrecl" >/dev/null \
+   && [ ! -s "$TMP/fx.ga-parkrecl/removed.log" ]; then
+  ok "ga-m8u5or: discovery:source SEM aprovação + pilot:reclaim-count:escalated-at-* → R5 — o estacionamento não silencia a escalação de reclaim"
+else
+  bad "ga-m8u5or: a checagem de estacionamento vem ANTES de has_reclaim_escalation e engole o R5 (reclaim esgotado, sem aprovação)" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-parkrecl/removed.log" 2>/dev/null)"
+fi
+
 # ── REGRESSÃO do meu erro de 15/08: prefixo vs exato ───────────────────
 # Busquei travadas por PREFIXO (^gate:needs-human) e removi por texto
 # EXATO ("gate:needs-human"). A busca achava, a remoção nunca casava, e

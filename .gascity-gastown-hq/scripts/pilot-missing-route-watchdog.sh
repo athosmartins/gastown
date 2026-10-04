@@ -214,10 +214,10 @@
 # keep this watchdog from routing a bead that carries either marker, whatever
 # un-parked it first. Other park signals (pilot:held, blocked:*, ...) have their
 # own exclusions above; a park with none of these markers is NOT covered.
-# Deliberately NOT "no
-# story:approved → don't route": this watchdog's whole population is chore/
-# task/debt beads with NO story:* label (see the story:* exclusion above), so
-# that rule would disable it. See this script's own --selftest scenarios 54-55.
+# Deliberately NOT "no story:approved → don't route": this watchdog's whole
+# population is chore/task/debt beads with NO story:* label (see the story:*
+# exclusion above), so that rule would disable it. See this script's own
+# --selftest scenarios 54-55.
 #
 # What's left: status=open, NOT epic, ctx:ready AND exec:auto BOTH present
 # (the "looks ready in the panel" signal ga-f54ui's own text uses),
