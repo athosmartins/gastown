@@ -381,10 +381,10 @@ STUCK_EXEC_EXCLUDE_LABELS = {"story:awaiting-external-merge", "pilot:no-auto-dis
 # action only the Athos can take is state=awaiting_athos/turn=athos (bead_state.derive
 # rule 3, which runs BEFORE the park rule). Skipping on state=='parked' alone let it
 # through to the age check, so ga-ormexj (the Mayor's mission bead, waiting on the
-# Athos to buy an SSD) alarmed "STALL CONFIRMADO stuck-exec" every cycle and the
-# REMEDY (shutdown-dance/kill/redispatch) would have been wrong. turn=='external'
-# is the other not-the-executor turn; derive() only pairs it with state=='parked'
-# today, so listing it is defensive, not a behavior change.
+# Athos to buy an SSD) was flagged as "STALL CONFIRMADO stuck-exec" on every cycle
+# it sat there, and the REMEDY (shutdown-dance/kill/redispatch) would be wrong.
+# turn=='external' is the other not-the-executor turn; derive() only pairs it with
+# state=='parked' today, so listing it is defensive, not a behavior change.
 NOT_EXECUTOR_STATES = frozenset({"parked", "awaiting_athos"})
 NOT_EXECUTOR_TURNS = frozenset({"athos", "external"})
 
@@ -393,14 +393,18 @@ def _canonical_turn_is_elsewhere(bead: dict):
     """True/False via scripts/bead_state.py: does the canonical model say the next
     move on this bead belongs to someone other than the executor holding it
     (deliberately parked, or the Athos's / an external party's turn)? None if the
-    model is unavailable/erroring — the caller falls back to
+    model is unavailable, erroring, or returned neither a state nor a turn (no
+    verdict is not "executing normally") — the caller falls back to
     STUCK_EXEC_EXCLUDE_LABELS on None. No live_sessions passed: this check only
     reads labels, never a liveness verdict."""
     if _CANONICAL_STATE_FN is None:
         return None
     try:
         d = _CANONICAL_STATE_FN(bead)
-        return d.get("state") in NOT_EXECUTOR_STATES or d.get("turn") in NOT_EXECUTOR_TURNS
+        state, turn = d.get("state"), d.get("turn")
+        if state is None and turn is None:
+            return None
+        return state in NOT_EXECUTOR_STATES or turn in NOT_EXECUTOR_TURNS
     except Exception:
         return None
 

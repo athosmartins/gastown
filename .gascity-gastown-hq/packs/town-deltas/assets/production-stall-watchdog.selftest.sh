@@ -35,7 +35,8 @@
 #    15g. stuck_execution: every bead_state.ATHOS_TURN label skipped per-bead,
 #         a plain stuck sibling in the same set still flags (ga-teljci)
 #    15h. stuck_execution: turn=external skipped by turn alone, turn=mayor not
-#    15i. stuck_execution: model unavailable/raising → label fallback preserved
+#    15i. stuck_execution: model unavailable/raising/verdict-less → label fallback
+#         preserved (a model with no verdict is "don't know", not "executing")
 #   REGRESSION:
 #    16. mail-send failure → not counted, ntfy still fires, retry next tick
 #    17. detect() pure, returns the three dimensions when each fires
@@ -466,10 +467,13 @@ print('OK_EXTERNAL_TURN')
 " "OK_EXTERNAL_TURN"
 
 # --- 15i. stuck_execution: fail-open to the label fallback is preserved (ga-teljci) --
-# Model unavailable (None) or erroring (raises) → the old STUCK_EXEC_EXCLUDE_LABELS
+# Model unavailable (None), erroring (raises), or answering with NO verdict (a dict
+# with neither state nor turn, or not a dict) → the old STUCK_EXEC_EXCLUDE_LABELS
 # fallback decides, exactly as before this fix: an excluded label still skips, and a
-# bead with no excluded label still flags (error must not silence the alarm).
-run_test "stuck_execution: model unavailable/raising → label fallback (excluded skipped, plain flagged)" "
+# bead with no excluded label still flags (error must not silence the alarm). The
+# no-verdict case is the third state: "the model could not say" must reach the
+# fallback, not collapse into "this bead is executing normally".
+run_test "stuck_execution: model unavailable/raising/verdict-less → label fallback (excluded skipped, plain flagged)" "
 $HARNESS
 import time, datetime, json
 old = datetime.datetime.utcfromtimestamp(time.time()-9*3600).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -481,7 +485,7 @@ def fake_sh(args, timeout=20):
     return r
 m.sh=fake_sh
 def boom(b): raise RuntimeError('model exploded')
-for fn in (None, boom):
+for fn in (None, boom, (lambda b: {}), (lambda b: None)):
     m._CANONICAL_STATE_FN = fn
     r = m.stuck_execution(time.time())
     print('FN=%r R=%r' % (fn, r))
