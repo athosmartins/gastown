@@ -107,6 +107,9 @@
 # in the same step (story-ga-o3o09z.sh: plist <= agent.toml). WAY BACK TO 2, part
 # of the same decision, no need to ask again: swap used > 6 GB, OR disk free < 6 GB.
 #
+# Back 3 -> 2 on 2026-10-03 21:19 BRT (Mayor, applying the revert rule that was PART of
+# the Athos decision above, no new question): disk free 5.9 GB < 6 GB (swap 4.8 GB).
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -115,7 +118,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 3
+max_active_sessions = 2
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
