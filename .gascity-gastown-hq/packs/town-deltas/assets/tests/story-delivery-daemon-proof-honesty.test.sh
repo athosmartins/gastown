@@ -44,6 +44,15 @@
 #      delivery:daemon-stale-locked would claim notify_only_locked status this
 #      daemon may not have (it may just be SENSITIVE with no drain path — the
 #      wa-8yfoi shape). Never "may still be dormant", never "verified in prod".
+#   H8 (ga-65o94h) REFRESH_PROOF=symbol_unreachable_closure_only → Step 5b
+#      released the story because every still-stale daemon is only CLOSURE-ONLY
+#      (a changed file sits in its import closure; its own entrypoint did not
+#      change) AND has no call-graph path to a symbol the merge changed. Same
+#      third answer as H6/H7, own label (delivery:daemon-stale-closure-only):
+#      these daemons are NOT notify_only_locked (they can be restarted — we judged
+#      it unnecessary), so reusing the locked label would assert something never
+#      checked, and delivery:daemon-unverified would say "may still be dormant"
+#      about code the system checked. Never "verified in prod".
 
 # No `pipefail` at file level (ga-uel7sb, on top of ga-j3lh6p's here-string
 # fix below): removing it here closes any OTHER pipe site the here-string
@@ -135,7 +144,7 @@ grep -qi "NOT VERIFIED" <<<"$LAST_BD" && ok "H3 close_reason says daemon livenes
 grep -q "label add ga-test story:done" <<<"$LAST_BD" && ok "H3 story:done still set (labeling honesty, not a new halt)" || nok "H3 story-done" "$LAST_BD"
 
 # H4: the literal false claim can never resurface, in any scenario this file drives.
-for p in verified not_applicable not_verified asset_served_per_request symbol_unreachable_locked symbol_unreachable_human_confirmed; do
+for p in verified not_applicable not_verified asset_served_per_request symbol_unreachable_locked symbol_unreachable_human_confirmed symbol_unreachable_closure_only; do
   run_block "$p"
   ! grep -q "verified in prod" <<<"$LAST_BD" && ok "H4 [$p] 'verified in prod' never appears" || nok "H4 [$p]" "$LAST_BD"
 done
@@ -183,6 +192,25 @@ run_block symbol_unreachable_human_confirmed
 [[ "$LAST_BD" == *"human confirmed"* ]] && ok "H7 close_reason names the human-confirmed caveat (does not overclaim)" || nok "H7 human-confirmed caveat missing from the close reason" "$LAST_BD"
 [[ "$LAST_BD" != *"NOT VERIFIED"* && "$LAST_BD" != *"may still be dormant"* ]] && ok "H7 close_reason does NOT say liveness was unverified / may be dormant" || nok "H7 alarming wording for a human-confirmed case" "$LAST_BD"
 [[ "$LAST_BD" == *"label add ga-test story:done"* ]] && ok "H7 story:done set" || nok "H7 story-done" "$LAST_BD"
+
+# H8 (ga-65o94h): REFRESH_PROOF=symbol_unreachable_closure_only — Step 5b
+# released this story because every still-stale daemon is only closure-only and
+# the helper found no call-graph path from it to a symbol the merge changed.
+# Same third-answer shape as H6/H7, on yet another evidence source. These
+# daemons are not locked (they CAN be restarted), so the locked label would
+# claim something never checked; the unverified label would say "may still be
+# dormant" about code that WAS checked. Own label, own wording — evidence, not
+# proof.
+run_block symbol_unreachable_closure_only
+[[ "$LAST_BD" == *"label add ga-test delivery:tested"* ]] && ok "H8 delivery:tested added (the rig harness passed)" || nok "H8 tested-label" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-unverified"* ]] && ok "H8 NO delivery:daemon-unverified (that label means 'could not check', which is not what happened)" || nok "H8 daemon-unverified wrongly added" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-stale-locked"* ]] && ok "H8 NO delivery:daemon-stale-locked (that label specifically claims notify_only_locked, which these daemons are not)" || nok "H8 wrongly reused the locked label" "$LAST_BD"
+[[ "$LAST_BD" != *"delivery:daemon-stale-human-confirmed"* ]] && ok "H8 NO delivery:daemon-stale-human-confirmed (no human attested anything here)" || nok "H8 wrongly reused the human-confirmed label" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test delivery:daemon-stale-closure-only"* ]] && ok "H8 delivery:daemon-stale-closure-only IS added (queryable: a daemon was left on old code, on closure-only evidence)" || nok "H8 stale-closure-only label" "$LAST_BD"
+[[ "$LAST_BD" == *"close ga-test -r"*"tested in prod"* ]] && ok "H8 close_reason says tested in prod" || nok "H8 close-reason" "$LAST_BD"
+[[ "$LAST_BD" == *"import closure"* ]] && ok "H8 close_reason names the closure-only caveat (does not overclaim)" || nok "H8 closure-only caveat missing from the close reason" "$LAST_BD"
+[[ "$LAST_BD" != *"NOT VERIFIED"* && "$LAST_BD" != *"may still be dormant"* ]] && ok "H8 close_reason does NOT say liveness was unverified / may be dormant" || nok "H8 alarming wording for a closure-only case" "$LAST_BD"
+[[ "$LAST_BD" == *"label add ga-test story:done"* ]] && ok "H8 story:done set" || nok "H8 story-done" "$LAST_BD"
 
 echo ""
 echo "story-delivery daemon-proof-honesty tests: $PASS passed, $FAIL failed"

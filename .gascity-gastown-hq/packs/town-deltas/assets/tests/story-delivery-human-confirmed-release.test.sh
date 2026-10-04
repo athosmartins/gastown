@@ -30,6 +30,17 @@
 # symbol_unreachable_locked, which specifically claims notify_only_locked status
 # this daemon may not have.
 #
+# FIXTURE NOTE (ga-65o94h): the stale daemon in the single_sensitive and
+# mixed_human_and_plain fixtures used to be classified CLOSURE_ONLY +
+# SYMBOL_NO_EVIDENCE. ga-65o94h now releases exactly that class on the helper's
+# own evidence (see story-delivery-closure-only-release.test.sh), with no label
+# needed — which would make T1-T5 stop exercising the LABEL logic this file
+# exists to test. The fixtures now carry the case where a human label is still
+# the only way out: the calculator could not evaluate the daemon
+# (GUARDED_SYMBOL_NOT_COMPUTED — timeout, crash, no resolvable entrypoint), so
+# there is no negative answer to rely on. T4's "no label -> still held" holds
+# for that class; the assertions themselves are unchanged.
+#
 # T1  (the repro — RED before the fix): the one stale daemon is SENSITIVE, NOT
 #     locked (GUARDED_LOCKED_COSMETIC empty), and carries a label naming this
 #     exact merge sha -> NOT held, evidence recorded on the bead, rig-wide
@@ -94,8 +105,8 @@ GUARDED=$SENSITIVE
 GUARDED_OWN=
 GUARDED_CLOSURE_ONLY=$SENSITIVE
 GUARDED_SYMBOL_CONFIRMED=
-GUARDED_SYMBOL_NO_EVIDENCE=$SENSITIVE
-GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_SYMBOL_NO_EVIDENCE=
+GUARDED_SYMBOL_NOT_COMPUTED=$SENSITIVE
 GUARDED_LOCKED_COSMETIC=
 REASON=freshness re-probe: still stale, SENSITIVE with no drain path, not locked
 PROOF=not_verified
@@ -113,8 +124,8 @@ GUARDED=$SENSITIVE $PLAIN
 GUARDED_OWN=$PLAIN
 GUARDED_CLOSURE_ONLY=$SENSITIVE
 GUARDED_SYMBOL_CONFIRMED=$PLAIN
-GUARDED_SYMBOL_NO_EVIDENCE=$SENSITIVE
-GUARDED_SYMBOL_NOT_COMPUTED=
+GUARDED_SYMBOL_NO_EVIDENCE=
+GUARDED_SYMBOL_NOT_COMPUTED=$SENSITIVE
 GUARDED_LOCKED_COSMETIC=
 REASON=freshness re-probe: one human-confirmed, one ordinary stale
 PROOF=not_verified
