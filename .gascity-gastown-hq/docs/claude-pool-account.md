@@ -13,8 +13,11 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
      rejected / 429  -> failover: next account of ordem_das_contas() that answers a probe; store the reset time
      answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed
                         and which outranks the active one — no probe of it on the way back
+                        (not to one whose KEY was refused, 401/403: see Known limits)
      cannot tell     -> change nothing (network, 5xx: error is not exhaustion)
-   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (sha256("~/.gastown/claude-pool-cred")[:8])
+   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"
+                             (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
+                              exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
 
  claude-lowprio.sh  (last hop of providers.claude-headless)
@@ -25,6 +28,10 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
 
  whatsapp_automation lib/claude_account_pool.py: contas_utilizaveis() puts conta_decidida() first
 ```
+
+The last line is a **separate delivery**: the whatsapp_automation branch `fix/ga-8hcnvb.1-wa-current-account` (same bead).
+Until it merges the decision file is published but the WhatsApp services do not read it and keep their own order; the
+headless pool itself follows the Keychain item either way. Merge both, or the two halves disagree.
 
 Why the daemon never starts `claude`: the account that is exhausted is the one `claude` would run on. The probe is
 plain HTTP; the switch is `security -i` with the new blob on **stdin** (hex), so no token is ever in argv, the
@@ -83,6 +90,15 @@ first, delete last, and only when restarting the pool is acceptable.
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
   unsticking such sessions is ga-8hcnvb.2.
+- The verdict comes from a 1-token **haiku** call, while the pool runs mostly on Sonnet. If a window exists that limits
+  Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens. Whether
+  such a per-model window shows up in the `anthropic-ratelimit-unified-*` headers was not measured here; the live
+  harness (`claude-pool-account.live-accept.sh`) is where to check it.
+- A key the API **refuses** (401/403) is registered for an hour like a limit, but at that time it is **not** failed back
+  to: the failback does not probe, and a key that is still refused would be written into the item and break every pool
+  session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry and probed
+  the normal way when a later failover reaches it. Consequence: after such a key is fixed the pool does not return to
+  that account on its own; it moves there the next time the account in use is rejected.
 - The daemon depends on `whatsapp_automation/lib/claude_account_pool.py` for the order and the vault read
   (`CLAUDE_POOL_ACCOUNTS_LIB` overrides the path). If it is missing or fails to import the daemon does nothing.
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just
@@ -98,5 +114,9 @@ first, delete last, and only when restarting the pool is acceptable.
 `1` = **refused or failed**: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken, the lock file
 cannot be opened, the login name is not a plain name (`USER` is also read from the passwd database when launchd
 gives none), or the state file exists but cannot be read. In every `1` case nothing was probed or written. A state
-file that is not a JSON object is moved to `claude_pool_current_account.json.corrupt.<epoch>` and the daemon starts
-from empty; an `exhausted` entry without a usable `reset_epoch` is dropped (never read as "already reset").
+file that is not a JSON object (or is not UTF-8 text, or is nested too deep to parse) is moved to
+`claude_pool_current_account.json.corrupt.<epoch>` and the daemon starts from empty. Inside a readable state, what
+cannot be trusted is dropped, never defaulted: an `exhausted` that is not an object (`null` included — present-but-null
+is not the same as absent), an entry without a usable `reset_epoch` (missing, null, not a number, non-finite, or outside
+2001–2100), a `current` that is not an account name. A reset time in a rate-limit header that is not usable (same test)
+is replaced by the 15-minute cooldown, so garbage can neither read as "already reset" nor as "exhausted for ever".

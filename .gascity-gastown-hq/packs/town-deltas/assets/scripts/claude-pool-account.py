@@ -11,10 +11,11 @@ One run (launchd StartInterval, single instance via flock):
   * no usable decision yet            -> seed with the first account of the order that answers a probe.
   * the active account is REJECTED    -> failover: first account of the order that is not known-exhausted and
     (HTTP 429 / a *-status of "rejected")   answers a probe. The rejection's reset time is stored.
-  * the active account answers        -> stay. Failback only to an account that WE saw exhausted, whose stored
-                                         reset time has passed, and which outranks the active one in the order —
-                                         with NO probe of it (Mayor 04/10: no balance probe on the way back; if it
-                                         has not really renewed, its 429 simply triggers the failover again).
+  * the active account answers        -> stay. Failback only to an account that WE saw exhausted (rate-limited, not
+                                         key-refused), whose stored reset time has passed, and which outranks the
+                                         active one in the order — with NO probe of it (Mayor 04/10: no balance
+                                         probe on the way back; if it has not really renewed, its 429 simply
+                                         triggers the failover again).
   * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> change NOTHING. Error != exhausted.
 
 The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny haiku HTTP
@@ -25,7 +26,8 @@ the probe and as the hex of a `security -i` command on STDIN. They are never in 
 accounts are named by e-mail + sha256[:8] fingerprint.
 
 KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the run does nothing at all.
-SEAMS (tests): CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR, CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW,
+SEAMS (tests): CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR (GC_POOL_CRED_DIR, the wrapper's name for it, is honoured too),
+CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW,
 CLAUDE_POOL_PROBE_URL (honoured ONLY for a loopback host — an env var must not be able to aim a token elsewhere).
 """
 from __future__ import annotations
@@ -55,6 +57,9 @@ PROBE_TIMEOUT_S = 10
 DEFAULT_COOLDOWN_S = 900          # rejected with no usable reset header
 INVALID_KEY_COOLDOWN_S = 3600     # 401/403: the key itself is refused
 EXPIRES_AT_MS = 4102444800000     # 2100-01-01: the blob carries no refresh token, so it never rotates
+MIN_EPOCH = 1_000_000_000         # 2001-09: an 'epoch' outside MIN..MAX is not a time anyone sent us, it is garbage
+MAX_EPOCH = 4_102_444_800         # 2100-01-01
+MAX_RETRY_AFTER_S = 31 * 86400
 DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py"
 DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
 
@@ -63,9 +68,30 @@ DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
 def now() -> float:
     v = os.environ.get("CLAUDE_POOL_NOW", "")
     try:
-        return float(v) if v else time.time()
+        f = _sane_epoch(float(v)) if v else None   # float("nan") parses: a NaN clock makes every comparison False
     except ValueError:
-        return time.time()
+        f = None
+    return f if f is not None else time.time()
+
+
+def _sane_epoch(v) -> Optional[float]:
+    """`v` as epoch seconds if it is a real number inside MIN_EPOCH..MAX_EPOCH, else None. Never raises: a value that is not
+    a time (None, a bool, a string, NaN, inf, 0, a negative, a 400-digit integer) is 'unknown', not a time."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)   # an int too big for a float raises OverflowError here (math.isfinite on it would too)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) and MIN_EPOCH <= f <= MAX_EPOCH else None
+
+
+def _iso(ts: float) -> str:
+    """For log lines and the published `updated`: formatting a time must never be able to crash a run."""
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):
+        return "unknown-time"
 
 
 def city() -> Optional[Path]:
@@ -74,7 +100,10 @@ def city() -> Optional[Path]:
 
 
 def cred_dir() -> str:
-    return os.environ.get("CLAUDE_POOL_CRED_DIR") or str(Path.home() / ".gastown" / "claude-pool-cred")
+    # The wrapper (claude-lowprio.sh) reads GC_POOL_CRED_DIR; CLAUDE_POOL_CRED_DIR is this daemon's own seam. Both name the
+    # item the pool reads, so the daemon honours either - otherwise it could feed an item no session looks at.
+    return (os.environ.get("CLAUDE_POOL_CRED_DIR") or os.environ.get("GC_POOL_CRED_DIR")
+            or str(Path.home() / ".gastown" / "claude-pool-cred"))
 
 
 def item_service() -> str:
@@ -128,7 +157,7 @@ def fingerprint(token: str) -> str:
 def log(level: str, msg: str) -> None:
     if "sk-ant-" in msg:
         msg = "[line withheld: token-shaped text]"
-    line = f"{datetime.fromtimestamp(now(), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} pid={os.getpid()} daemon {level} {msg}"
+    line = f"{_iso(now())} pid={os.getpid()} daemon {level} {msg}"
     c = city()
     try:
         if c and (c / ".gc" / "logs").is_dir():
@@ -165,18 +194,29 @@ class Probe:
 
 
 def _epoch(v: str) -> Optional[float]:
+    """A header value (epoch seconds, epoch ms, or ISO-8601) as epoch seconds - or None when it is not a usable time."""
     v = (v or "").strip()
     if not v:
         return None
     try:
         f = float(v)
-        return f / 1000.0 if f > 1e12 else f
     except ValueError:
-        pass
+        f = None
+    if f is not None:
+        return _sane_epoch(f / 1000.0 if f > 1e12 else f)
     try:
-        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+        return _sane_epoch(datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _seconds(v: str) -> Optional[float]:
+    """retry-after: a DURATION in seconds, or None."""
+    try:
+        f = float((v or "").strip())
     except ValueError:
         return None
+    return f if math.isfinite(f) and 0 < f <= MAX_RETRY_AFTER_S else None
 
 
 def classify(status: int, headers: Dict[str, str], t: float) -> Probe:
@@ -188,15 +228,15 @@ def classify(status: int, headers: Dict[str, str], t: float) -> Probe:
     if rejected:
         claim = h.get(pre + "representative-claim", "")
         resets = [_epoch(h.get(f"{pre}{w}-reset", "")) for w, st in windows.items() if st == "rejected"]
-        resets = [r for r in resets if r]
+        resets = [r for r in resets if r is not None]
         if not resets:
             by_claim = {"five_hour": "5h", "seven_day": "7d"}.get(claim)
             r = _epoch(h.get(f"{pre}{by_claim}-reset", "")) if by_claim else None
-            resets = [r] if r else []
+            resets = [r] if r is not None else []
         reset = max(resets) if resets else None
         if reset is None:
-            ra = _epoch(h.get("retry-after", ""))
-            reset = t + ra if ra and ra < 1e9 else t + DEFAULT_COOLDOWN_S
+            ra = _seconds(h.get("retry-after", ""))
+            reset = t + (ra if ra is not None else DEFAULT_COOLDOWN_S)
         return Probe("rejected", reset, claim, f"http={status}")
     if status in (401, 403):
         return Probe("invalid", t + INVALID_KEY_COOLDOWN_S, "", f"http={status}")
@@ -266,15 +306,15 @@ def load_state() -> Optional[dict]:
     (permissions, I/O): the caller must not act, because acting would overwrite a decision it could not see."""
     p = state_path()
     try:
-        text = p.read_text()
+        raw = p.read_bytes()
     except FileNotFoundError:
         return {}
     except OSError as e:
         log("ERROR", f"state file {p} unreadable ({type(e).__name__}) - refusing to act on a decision I cannot see")
         return None
     try:
-        d = json.loads(text)
-    except ValueError:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):   # not UTF-8 (UnicodeDecodeError is a ValueError), not JSON, or nested past the parser
         d = None
     if isinstance(d, dict):
         return d
@@ -288,26 +328,22 @@ def load_state() -> Optional[dict]:
     return {}
 
 
-def _real_number(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-
-
 def sanitize_state(st: dict) -> None:
     """Drop what cannot be trusted, never default it: a missing or garbled reset time must not read as 'already reset'
     (the failback does not probe), and a garbled `current` must not read as an account."""
     if "current" in st and not (isinstance(st["current"], str) and st["current"].strip()):
         log("WARN", "state: `current` is not an account name - ignored")
         st.pop("current")
-    ex = st.get("exhausted")
-    if ex is None:
+    if "exhausted" not in st:
         return
+    ex = st["exhausted"]   # present-but-null is NOT absent: `.get()` cannot tell them apart, and null is not an object either
     if not isinstance(ex, dict):
         log("WARN", "state: `exhausted` is not an object - dropped")
-        st.pop("exhausted")
+        del st["exhausted"]
         return
     for email in list(ex):
         v = ex[email]
-        if not (isinstance(v, dict) and _real_number(v.get("reset_epoch"))):
+        if not (isinstance(v, dict) and _sane_epoch(v.get("reset_epoch")) is not None):
             log("WARN", f"state: exhausted entry for {email} has no usable reset_epoch - dropped (it is probed again before any use)")
             del ex[email]
 
@@ -316,7 +352,7 @@ def publish_state(st: dict) -> None:
     p = state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     st["schema"] = 1
-    st["updated"] = datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    st["updated"] = _iso(now())
     tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
     tmp.write_text(json.dumps(st, indent=1, sort_keys=True) + "\n")
     os.replace(tmp, p)
@@ -348,12 +384,11 @@ def usable_accounts(lib) -> List[Tuple[str, str]]:
 
 
 def register_exhausted(st: dict, email: str, pr: Probe, t: float) -> None:
-    reset = pr.reset_epoch
+    reset = _sane_epoch(pr.reset_epoch)   # the sink checks too: whatever a parser let through, only a real time is stored
     if reset is None or reset <= t:
         reset = t + DEFAULT_COOLDOWN_S   # a reset already in the past would read as 'recovered' on the very next run
     st.setdefault("exhausted", {})[email] = {"reset_epoch": reset, "claim": pr.claim, "seen": t, "why": pr.verdict}
-    log("INFO", f"{email} {pr.verdict} ({pr.detail}{', ' + pr.claim if pr.claim else ''}) - unusable until "
-                f"{datetime.fromtimestamp(reset, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    log("INFO", f"{email} {pr.verdict} ({pr.detail}{', ' + pr.claim if pr.claim else ''}) - unusable until {_iso(reset)}")
 
 
 def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float) -> bool:
@@ -435,19 +470,25 @@ def decide(st: dict, accts: List[Tuple[str, str]], user: str, t: float) -> None:
         else:
             log("WARN", f"every account is exhausted or unreachable - staying on {cur}")
     else:
-        # active account answers. Failback: only to an account WE saw exhausted whose stored reset time has passed
-        # and which outranks the active one. No probe (the Mayor revoked the confirmation probe): if it has not
-        # really renewed, its 429 sends us right back through the branch above.
-        recovered = [e for e, v in st.get("exhausted", {}).items() if v.get("reset_epoch", math.inf) <= t and e in by_email]
+        # active account answers. What it just answered beats anything stored about it.
+        ex = st.get("exhausted", {})
+        ex.pop(cur, None)
+        # Failback: only to an account WE saw exhausted whose stored reset time has passed and which outranks the active
+        # one. No probe (the Mayor revoked the confirmation probe): if it has not really renewed, its 429 sends us right
+        # back through the branch above. A REFUSED KEY (401/403) is not a limit that renews: failing back to it unprobed
+        # would put a still-refused key into the item - every pool session broken until the next run, hourly. It is
+        # judged (dropped) at its time like the others, and is probed the normal way when a later failover reaches it.
+        expired = [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t and e in by_email]
+        recovered = [e for e in expired if ex[e].get("why") != "invalid"]
         best = next((e for e in order if e in recovered), None)
         kept = None
         if best and order.index(best) < order.index(cur):
             if not switch_to(st, user, best, by_email[best], f"failback: {best} reached its stored reset time", t):
                 kept = best   # the write failed: the failback did NOT happen, so it must be tried again next run
                 log("WARN", f"failback to {best} not done (the pool item could not be switched) - kept for the next run")
-        for e in recovered:
+        for e in expired:
             if e != kept:
-                st.get("exhausted", {}).pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
+                ex.pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
     cur = st.get("current")
     if cur in by_email:
         heal_item(st, user, by_email[cur], cur)

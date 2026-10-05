@@ -124,6 +124,19 @@ t1=$(date +%s)
 [ "$(field argc "$out")" = "1" ] && [ "$(field secstore "$out")" = "<unset>" ] && [ $((t1 - t0)) -lt 15 ] \
   && ok "A10 a hanging \`security\` is cut off by the timeout -> claude launches without the variable ($((t1 - t0))s)" \
   || bad "A10 hanging security stalled or broke the launch (${t1}-${t0}): $out"
+grep -q "POOL-ACCT SKIP.*rc=124" "$W/city/.gc/logs/claude-pool-account.log" \
+  && ok "A10b ...and the SKIP line says WHY: security timed out (rc=124), which is not 'there is no item'" \
+  || bad "A10b the SKIP line does not carry the timeout: $(tail -n 2 "$W/city/.gc/logs/claude-pool-account.log")"
+
+# A11 the SKIP line carries the exit status of `security`: 'no item' (44, expected until the daemon seeds it) must not read the same
+# as 'could not look' (locked keychain, wedged security, no binary) when someone asks why a pool session is on the ambient login.
+for rc in 44 36; do
+  new_kc; mkdir -p "$W/rc$rc"; printf '#!/bin/bash\nexit %s\n' "$rc" > "$W/rc$rc/security"; chmod +x "$W/rc$rc/security"
+  out="$(env -i HOME="$W/home" PATH="$W/rc$rc:/usr/bin:/bin" USER=athos GC_CITY_PATH="$W/city" GC_LOWPRIO=0 GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" "$WRAPPER" x 2>/dev/null)"
+  [ "$(field secstore "$out")" = "<unset>" ] && grep -q "POOL-ACCT SKIP.*rc=$rc" "$W/city/.gc/logs/claude-pool-account.log" \
+    && ok "A11 security exits $rc -> not exported, and the SKIP line says rc=$rc" \
+    || bad "A11 security exits $rc: secstore='$(field secstore "$out")' log: $(tail -n 1 "$W/city/.gc/logs/claude-pool-account.log")"
+done
 
 # ── B. daemon ──────────────────────────────────────────────────────────────────────────────────────
 echo
@@ -417,6 +430,36 @@ EOF
   seeded; edit_state 'st["current"]=["a@t.test"]'; run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B22d a garbled 'current' is not an account -> chosen again from the order" || bad "B22d rc=$rc current='$(jget "$STATE" current)'"
 
+  # B22e/f 'present but null' (and every other wrong shape) in the registry is NOT 'absent'. Gate 1/3: {"exhausted": null} slipped
+  # past the sanitizer (`.get() is None -> return` cannot tell an absent key from a null) and then every consumer crashed on it,
+  # so the pool stayed on a REJECTED account, run after run. Each shape runs twice: steady (a answers) and failing over (a rejected).
+  state_ok() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d.get("exhausted", {}), dict) else 1)' "$STATE" 2>/dev/null; }
+  no_crash() { ! grep -q "unhandled" "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null; }
+  for shape in 'None' '[]' '"x"' '5' 'True' '{"a@t.test": None}' '{"a@t.test": []}' '{"a@t.test": {"reset_epoch": None}}' \
+               '{"a@t.test": {"reset_epoch": True}}' '{"a@t.test": {"reset_epoch": float("nan")}}' '{"a@t.test": {"reset_epoch": float("inf")}}'; do
+    seeded; edit_state "st[\"exhausted\"]=$shape"; w0=$(writes); run_d -- run-once; rc=$?
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && state_ok && no_crash \
+      && ok "B22e exhausted=$shape, a answers -> handled: exit 0, stays on a, registry left well-formed" \
+      || bad "B22e exhausted=$shape steady: rc=$rc current='$(jget "$STATE" current)' $(tail -c 200 "$D/city/.gc/logs/claude-pool-account.log")"
+    seeded; edit_state "st[\"exhausted\"]=$shape"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; rc=$?
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && state_ok && no_crash \
+      && ok "B22f exhausted=$shape, a rejected -> still fails over to b" \
+      || bad "B22f exhausted=$shape failover: rc=$rc current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) $(tail -c 200 "$D/city/.gc/logs/claude-pool-account.log")"
+  done
+  seeded; edit_state 'st["current"]=None'; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && no_crash && ok "B22e2 current=null -> not an account, chosen again" || bad "B22e2 rc=$rc current='$(jget "$STATE" current)'"
+
+  # B22g a reset_epoch that is a finite number but not an epoch (0, negative, centuries away) is garbled like any other: dropped.
+  # Never read as 'already reset' (0 / -5 would fire an UNPROBED failback) nor as 'exhausted for ever' (1e30).
+  # (10**400 is a JSON integer too big for a float: math.isfinite() raises OverflowError on it.)
+  for junk in 0 -5 1e30 '10**400'; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once          # on b, a exhausted
+    edit_state "st[\"exhausted\"][\"a@t.test\"][\"reset_epoch\"]=$junk"; pa0=$(probes_of a@t.test); w0=$(writes); NOW_OVERRIDE=2000000100 run_d -- run-once
+    [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test why)" ] \
+      && ok "B22g reset_epoch=$junk -> dropped: no unprobed failback, no for-ever exclusion" \
+      || bad "B22g reset_epoch=$junk: current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)' writes $w0 -> $(writes)"
+  done
+
   # B23 a USER that is not a plain account name never reaches a security command line (exit 1: misconfigured, not 'idle')
   for hostile in 'ath"os' $'athos\nadd-generic-password -a x' 'a b' '-x' 'athos\'; do
     new_d; run_d "USER=$hostile" -- run-once; rc=$?
@@ -462,6 +505,94 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] \
     && ok "B28c next run, write allowed -> the failback to a completes" || bad "B28c current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24)"
 
+  # B29 a state file whose BYTES are not readable as text, or whose JSON nests deeper than the parser can follow, is corrupt like
+  # any other garbage: moved aside, decision re-seeded, exit 0. (read_text() raising UnicodeDecodeError, or json.loads raising
+  # RecursionError, used to escape every handler: the run crashed, run after run, and the garbage was never moved.)
+  seeded; printf '\xff\xfe\x00{"current": "b@t.test"}\x80' > "$STATE"; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(ls "$D"/current.json.corrupt.* 2>/dev/null)" ] && no_crash \
+    && ok "B29 non-UTF-8 state -> moved aside, decision re-seeded, exit 0" || bad "B29 rc=$rc current='$(jget "$STATE" current)' log: $(tail -c 160 "$D/city/.gc/logs/claude-pool-account.log")"
+  seeded; "$PY3" -c 'import sys; sys.stdout.write("[" * 300000)' > "$STATE"; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(ls "$D"/current.json.corrupt.* 2>/dev/null)" ] && no_crash \
+    && ok "B29b absurdly nested state -> moved aside, decision re-seeded, exit 0" || bad "B29b rc=$rc current='$(jget "$STATE" current)' log: $(tail -c 160 "$D/city/.gc/logs/claude-pool-account.log")"
+
+  # B30 a CLAUDE_POOL_NOW that is a number but not a time (nan, inf) is not a clock: the real one is used. float('nan') parses, so
+  # the old now() handed NaN to every comparison (all False -> 'not reset', 'not expired') and to fromtimestamp() (crash).
+  for junk in nan inf -inf NaN 1e999; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d "CLAUDE_POOL_NOW=$junk" -- run-once; rc=$?
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && no_crash \
+      && "$PY3" -c 'import sys,time; sys.exit(0 if abs(float(sys.argv[1]) - time.time()) < 300 else 1)' "$(jex a@t.test seen)" 2>/dev/null \
+      && ok "B30 CLAUDE_POOL_NOW=$junk -> ignored (real clock), the run completes and fails over" \
+      || bad "B30 CLAUDE_POOL_NOW=$junk rc=$rc current='$(jget "$STATE" current)' seen='$(jex a@t.test seen)'"
+  done
+
+  # B31 a reset header that is not a usable epoch (non-finite, absurd, far past/future) must not become the stored reset time.
+  # NaN is TRUTHY, 'nan' <= now is False and datetime.fromtimestamp(nan) raises: the old code crashed in the very run that had
+  # to fail over, and a huge one is 'exhausted for ever'. The stored time is an epoch in a sane range, else the cooldown.
+  for r in nan inf -inf 1e999 9e15 0 -5 9999-12-31T23:59:59Z 0001-01-01T00:00:00Z; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day "$r")"; run_d -- run-once; rc=$?
+    stored="$(jex a@t.test reset_epoch)"
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && no_crash \
+      && "$PY3" -c 'import math,sys,time; v=float(sys.argv[1]); n=time.time(); sys.exit(0 if math.isfinite(v) and n < v < n + 86400 * 14 else 1)' "$stored" 2>/dev/null \
+      && ok "B31 7d-reset='$r' -> failover done, stored reset is a finite near-future epoch (the cooldown)" \
+      || bad "B31 7d-reset='$r' rc=$rc current='$(jget "$STATE" current)' stored='$stored' $(tail -c 160 "$D/city/.gc/logs/claude-pool-account.log")"
+  done
+  # ...and the same through the retry-after fallback path (no *-reset header at all)
+  for r in nan inf 1e999 -5; do
+    seeded; set_srv a@t.test 429 "{\"anthropic-ratelimit-unified-status\":\"rejected\",\"retry-after\":\"$r\"}"; run_d -- run-once; rc=$?
+    stored="$(jex a@t.test reset_epoch)"
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && no_crash \
+      && "$PY3" -c 'import math,sys,time; v=float(sys.argv[1]); n=time.time(); sys.exit(0 if math.isfinite(v) and n < v < n + 86400 else 1)' "$stored" 2>/dev/null \
+      && ok "B31b retry-after='$r' -> failover done, stored reset is the cooldown" \
+      || bad "B31b retry-after='$r' rc=$rc current='$(jget "$STATE" current)' stored='$stored'"
+  done
+
+  # B32 an account whose KEY was refused (401/403) is not failed back to on its timer: the failback does not probe, so it would put a
+  # key that is STILL refused into the item and break every pool session until the next run - once an hour, for as long as the key
+  # stays bad. It is probed again the normal way (pick_next, on a later failover).
+  seeded; set_srv a@t.test 401 '{}'; run_d -- run-once                                   # a's key refused -> on b, a registered 'invalid'
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "invalid" ] || bad "B32 precondition: failover to b / a registered invalid (why='$(jex a@t.test why)')"
+  w0=$(writes); NOW_OVERRIDE=2000000000 run_d -- run-once                                 # an hour later; a still refused
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B32 invalid key past its cooldown -> NO unprobed failback (stays on b, item untouched)" \
+    || bad "B32 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes)"
+  set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again it is used the normal way: probed on the next failover (b rejected -> a)" \
+    || bad "B32b current='$(jget "$STATE" current)'"
+
+  # B33 what the active account just ANSWERED beats what was stored about it: if it is in the exhausted registry (all accounts had
+  # been rejected, the pool stayed put, then it renewed) the entry is cleared now, not left to veto it in a later failover.
+  seeded; for e in a b c; do set_srv "$e@t.test" 429 "$(hdr_rejected seven_day 2000000000)"; done; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] || bad "B33 precondition: all rejected -> stay on a, a registered"
+  set_srv a@t.test 200 "$HDR_OK"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -z "$(jex a@t.test reset_epoch)" ] && [ -n "$(jex b@t.test reset_epoch)" ] \
+    && ok "B33 the active account answers again -> its stale exhausted entry is cleared (the others are kept)" \
+    || bad "B33 current='$(jget "$STATE" current)' a-entry='$(jex a@t.test reset_epoch)' b-entry='$(jex b@t.test reset_epoch)'"
+
+  # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
+  # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).
+  new_d; run_d CLAUDE_POOL_CRED_DIR= "GC_POOL_CRED_DIR=$POOL_DIR" -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(item_token)" = "$TOKEN_a" ] \
+    && ok "B34 only GC_POOL_CRED_DIR set (as the wrapper reads it) -> the daemon writes the same item" || bad "B34 rc=$rc item=$(item_token | cut -c1-24) kc=$(ls "$D/kc/items" | tr '\n' ' ')"
+
+  # B35 the epoch parser itself, table-driven: every shape of 'not an epoch' is None - never a float that is truthy-but-wrong
+  # (nan), never an exception, never a number outside 2001..2100.
+  got="$("$PY3" - "$DAEMON" <<'EOF' 2>&1
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+bad = []
+for v in ["nan", "inf", "-inf", "1e999", "9e15", "0", "-5", "1000", "abc", "", "  ", "9999-12-31T23:59:59Z", "0001-01-01T00:00:00Z", "0001-01-01T00:00:00+14:00", "2000000000000000000"]:
+    try: r = m._epoch(v)
+    except BaseException as e: bad.append(f"{v!r} raised {type(e).__name__}"); continue
+    if r is not None: bad.append(f"{v!r} -> {r!r} (want None)")
+for v, want in [("2000000000", 2000000000.0), ("2000000000000", 2000000000.0), ("2033-05-18T03:33:20Z", 2000000000.0)]:
+    try: r = m._epoch(v)
+    except BaseException as e: bad.append(f"{v!r} raised {type(e).__name__}"); continue
+    if r != want: bad.append(f"{v!r} -> {r!r} (want {want})")
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+)"
+  [ "$got" = "OK" ] && ok "B35 _epoch: junk -> None (no exception, no nan/inf, nothing outside 2001-2100); real epochs/ms/ISO survive" || bad "B35 $got"
+
   # B24 the log itself withholds a token-shaped message (defence in depth: a future f-string that interpolates a token)
   new_d
   got="$(GC_CITY_PATH="$D/city" "$PY3" -c '
@@ -495,6 +626,19 @@ else
   iv="$(pl StartInterval)"; [ -n "$iv" ] && [ "$iv" -ge 30 ] && [ "$iv" -le 120 ] && ok "C6 StartInterval=${iv}s: frequent enough for a <2 min absorb, longer than a run" || bad "C6 StartInterval='$iv'"
   [ "$(pl RunAtLoad)" = "false" ] && ok "C7 RunAtLoad=false (loading is the human step; first run <= StartInterval later)" || bad "C7 RunAtLoad '$(pl RunAtLoad)'"
   [ "$(pl EnvironmentVariables:USER)" != "" ] && [ "$(pl EnvironmentVariables:GC_CITY_PATH)" != "" ] && ok "C8 USER and GC_CITY_PATH are set for launchd" || bad "C8 launchd env incomplete"
+fi
+
+# C9 the doc names the item and the string it is derived from: the two must agree (it once said sha256("~/...") for a hash that is
+# of the absolute path - an operator who deletes or inspects "the item" by recomputing it would have looked for the wrong one).
+DOC="${CLAUDE_POOL_DOC:-$SELF_DIR/../../../../docs/claude-pool-account.md}"
+if [ ! -f "$DOC" ]; then bad "C9 doc not found at $DOC"
+else
+  dhash="$(grep -o 'Claude Code-credentials-[0-9a-f]\{8\}' "$DOC" | head -1 | sed 's/.*-//')"
+  dpath="$(grep -o 'sha256("[^"]*")' "$DOC" | head -1 | sed 's/^sha256("//; s/")$//')"
+  case "$dpath" in /*) ;; *) dpath="" ;; esac
+  [ -n "$dhash" ] && [ -n "$dpath" ] && [ "$(printf '%s' "$dpath" | shasum -a 256 | cut -c1-8)" = "$dhash" ] \
+    && ok "C9 the doc's item name ($dhash) is the hash of the absolute path it names" \
+    || bad "C9 the doc's item name '$dhash' is not sha256 of the path it names ('$dpath')"
 fi
 
 echo

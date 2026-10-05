@@ -282,11 +282,18 @@ else
   }
   if [ -z "$pool_user" ] || [ -z "$pool_hash" ]; then
     pool_note "POOL-ACCT WARN could not derive user/hash - not exported"
-  elif pool_has_item; then
-    export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pool_dir" USER="$pool_user"
-    pool_note "POOL-ACCT SET item=Claude Code-credentials-$pool_hash"
   else
-    pool_note "POOL-ACCT SKIP no pool item (or security unavailable) - fail-open to the ambient login"
+    # Three answers, kept apart in the log: it is there (0) / it is not there (44) / I could not look (124 = timed out,
+    # 127 = no `security`, anything else = security's own status). The last two both launch claude without the variable,
+    # but only "not there" is expected (before the daemon seeds the item); "could not look" is what the line is read for.
+    pool_rc=0
+    pool_has_item || pool_rc=$?
+    if [ "$pool_rc" -eq 0 ]; then
+      export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pool_dir" USER="$pool_user"
+      pool_note "POOL-ACCT SET item=Claude Code-credentials-$pool_hash"
+    else
+      pool_note "POOL-ACCT SKIP no pool item or security unusable (security rc=$pool_rc; 44 = no such item, 124 = timed out, 127 = not found) - fail-open to the ambient login"
+    fi
   fi
 fi
 
