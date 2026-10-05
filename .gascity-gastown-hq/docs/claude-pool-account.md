@@ -119,4 +119,5 @@ file that is not a JSON object (or is not UTF-8 text, or is nested too deep to p
 cannot be trusted is dropped, never defaulted: an `exhausted` that is not an object (`null` included — present-but-null
 is not the same as absent), an entry without a usable `reset_epoch` (missing, null, not a number, non-finite, or outside
 2001–2100), a `current` that is not an account name. A reset time in a rate-limit header that is not usable (same test)
-is replaced by the 15-minute cooldown, so garbage can neither read as "already reset" nor as "exhausted for ever".
+is not stored: the `retry-after` duration is used if that is usable (a finite number of seconds, at most 31 days), else
+the 15-minute cooldown — so garbage can neither read as "already reset" nor as "exhausted for ever".
