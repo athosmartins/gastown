@@ -75,8 +75,16 @@ fi
 # Static drift guard: the flag must gate BOTH the close and the POST-MERGE
 # re-spawn exemption (a held-open bead would otherwise false-flag as a re-pick
 # vector and mail the Mayor). Exactly two conditions read it.
+#
+# ga-wye9vt: a THIRD reader was added on purpose — the dialer-VM check skips itself when an own
+# hold already applies (no second query for a bead held anyway). It reads the flag, not
+# OWN_HOLD_KIND: that variable is only reset when gate_own_hold_check runs, so after a sibling hold
+# (which skips the check) it would still carry the PREVIOUS bead's value. The count below is the
+# drift guard: a further reader is a decision, not an accident.
 _n_flag=$(grep -cF '[ "$IS_OWN_HOLD" != "1" ]' "$DISPATCHER" || true)
-eq "IS_OWN_HOLD gates exactly two conditions (the close + the POST-MERGE exemption)" "$_n_flag" "2"
+eq "IS_OWN_HOLD gates exactly three conditions (the VM-check skip + the close + the POST-MERGE exemption)" "$_n_flag" "3"
+_n_flag_vm=$(printf '%s\n' "$REGION" | grep -cF '[ "$IS_OWN_HOLD" != "1" ]' || true)
+eq "...and two of the three sit inside the extracted close-decision region (the VM-check skip + the close)" "$_n_flag_vm" "2"
 
 # ── 2. harness: mocked bd, real helpers ──────────────────────────────────────
 WORK_DIR="$(mktemp -d)"
@@ -135,6 +143,11 @@ run_region() {  # $1=SHOW_MODE  $2=SIB_MODE  $3=region text (default: the real o
   GC_CITY=city; BEAD_CITY=beadcity; BEAD_ID="$FX"; BRANCH="fix/$FX"; RIG=gascity
   DEFAULT_BRANCH=main; MERGE_SHA=abc1234; GATE_RUN_ID=run1; DAEMON_SOFT_WARN=""
   IS_SIBLING_HOLD=0; IS_OWN_HOLD=0; SIBLING_HOLD_KIND=""; OWN_HOLD_KIND=""; OWN_HOLD_LABELS=""
+  # ga-wye9vt: the region now also reads IS_VM_HOLD (initialised by the dispatcher before the region,
+  # like IS_OWN_HOLD) and DR_RUNTIME_DIR. Empty runtime dir = the dialer-VM check is skipped, so these
+  # scenarios keep exercising the own-hold path alone; the VM hold has its own selftest
+  # (gate-close-asks-voicebot-vm.selftest.sh).
+  IS_VM_HOLD=0; DR_RUNTIME_DIR=""
   eval "${3:-$REGION}" 2>"$ERR_F"
 }
 was_closed() { grep -qF "CLOSED:$FX" "$CLOSE_F"; }

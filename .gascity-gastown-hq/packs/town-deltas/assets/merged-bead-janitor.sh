@@ -141,10 +141,11 @@ notify_athos() {
 # PURE DECISION FUNCTION — the heart of the janitor; fully unit-testable.
 # janitor_decide <is_epic> <has_open_marker> <sig_commit> <sig_marker> <sig_branch_merged>
 #                <sig_commit_stale> <sig_marker_superseded> <is_delivery_partial> <is_daemon_hold>
-#                <sig_commit_docs_only> <sig_marker_stale>
+#                <sig_commit_docs_only> <sig_marker_stale> <is_vm_hold>
 # Each arg is 0|1 (sig_commit_stale/sig_marker_superseded/is_delivery_partial/is_daemon_hold/
-# sig_commit_docs_only/sig_marker_stale default to 0 when omitted — backward-compatible with
-# every pre-ga-2zp4h/pre-ga-f54ui/pre-ga-l7n3v/pre-ga-fbycg/pre-ga-tysvjp caller/test).
+# sig_commit_docs_only/sig_marker_stale/is_vm_hold default to 0 when omitted — backward-compatible
+# with every pre-ga-2zp4h/pre-ga-f54ui/pre-ga-l7n3v/pre-ga-fbycg/pre-ga-tysvjp/pre-ga-wye9vt
+# caller/test).
 # Echoes "<verdict>:<reason>" where verdict ∈ {keep,close}. Guards are evaluated FIRST (an
 # open marker, epic, unresolved partial-delivery scope, or pending daemon verification
 # always wins over signals).
@@ -228,15 +229,27 @@ notify_athos() {
 # to close ALONE — signals A (commit) and C (branch) are bead-specific and authoritative, so a
 # genuine commit or merged branch for the SAME bead still closes normally even when the marker
 # is stale.
+#
+# is_vm_hold (ga-wye9vt, 2026-10-05): the delivery:pending-vm hold from the dispatcher's PASS
+# path, the mirror of is_daemon_hold for the DIALER VM instead of the daemon. A bug/task whose
+# merge touches what runs on the dialer VM is held (label delivery:pending-vm, bead left open)
+# when the VM is not proven current. By then the dispatcher has already closed the gate marker
+# as gate-status:passed and the merge is in origin/main, so signals A, B and C all fire on the
+# next sweep and this janitor would close the bead — "done with the VM old", 15 minutes after
+# the dispatcher refused to. Same precedence tier as is_daemon_hold (the dispatcher already
+# judged the bead's true state is NOT done, whatever the merge evidence says). The story:approved
+# sweep needs no counterpart: story_delivery_owns_labels already covers the label (ga-2kaan2).
 # ═════════════════════════════════════════════════════════════════════════════
 janitor_decide() {
   local is_epic="$1" has_open_marker="$2" sig_commit="$3" sig_marker="$4" sig_branch="$5" \
         sig_commit_stale="${6:-0}" sig_marker_superseded="${7:-0}" is_delivery_partial="${8:-0}" \
-        is_daemon_hold="${9:-0}" sig_commit_docs_only="${10:-0}" sig_marker_stale="${11:-0}"
+        is_daemon_hold="${9:-0}" sig_commit_docs_only="${10:-0}" sig_marker_stale="${11:-0}" \
+        is_vm_hold="${12:-0}"
   if [ "$is_epic" = "1" ]; then            echo "keep:epic-parent-never-autoclosed"; return 0; fi
   if [ "$has_open_marker" = "1" ]; then    echo "keep:active-open-gate-marker"; return 0; fi
   if [ "$is_delivery_partial" = "1" ]; then echo "keep:delivery-partial-unresolved-scope"; return 0; fi
   if [ "$is_daemon_hold" = "1" ]; then     echo "keep:daemon-verification-pending-restart"; return 0; fi
+  if [ "$is_vm_hold" = "1" ]; then         echo "keep:dialer-vm-pending-vm-hold"; return 0; fi
   if [ "$sig_commit" = "1" ] && [ "$sig_commit_stale" != "1" ] && [ "$sig_commit_docs_only" != "1" ]; then
                                             echo "close:commit-in-origin-main"; return 0; fi
   if [ "$sig_marker" = "1" ] && [ "$sig_marker_stale" != "1" ]; then
@@ -1161,6 +1174,10 @@ while IFS= read -r rig; do
     IS_DAEMON_HOLD=0
     printf '%s' "$b" | jq -e '(.labels // []) | index("delivery:pending-restart")' >/dev/null 2>&1 \
       && IS_DAEMON_HOLD=1
+    # ga-wye9vt: the dispatcher's dialer-VM hold — see janitor_decide's is_vm_hold docstring.
+    IS_VM_HOLD=0
+    printf '%s' "$b" | jq -e '(.labels // []) | index("delivery:pending-vm")' >/dev/null 2>&1 \
+      && IS_VM_HOLD=1
 
     # Gate markers (HQ) for this bead → open-marker guard + terminal signal + branch.
     MK=$(markers_for_bead "$BID")
@@ -1254,7 +1271,7 @@ EOF
       done
     fi
 
-    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY" "$SIG_MARKER_STALE")
+    VERDICT_LINE=$(janitor_decide "$IS_EPIC" "$HAS_OPEN" "$SIG_COMMIT" "$SIG_MARKER" "$SIG_BRANCH" "$SIG_COMMIT_STALE" "$SIG_MK_SUPER" "$IS_DELIV_PARTIAL" "$IS_DAEMON_HOLD" "$SIG_COMMIT_DOCS_ONLY" "$SIG_MARKER_STALE" "$IS_VM_HOLD")
     VERDICT="${VERDICT_LINE%%:*}"; REASON="${VERDICT_LINE#*:}"
 
     if [ "$VERDICT" = "close" ]; then
@@ -1357,6 +1374,10 @@ EOF
     F_DAEMON_HOLD=0
     printf '%s' "$f" | jq -e '(.labels // []) | index("delivery:pending-restart")' >/dev/null 2>&1 \
       && F_DAEMON_HOLD=1
+    # ga-wye9vt: same dialer-VM hold guard as the in_progress sweep above.
+    F_VM_HOLD=0
+    printf '%s' "$f" | jq -e '(.labels // []) | index("delivery:pending-vm")' >/dev/null 2>&1 \
+      && F_VM_HOLD=1
 
     FMK=$(markers_for_bead "$FID")
     F_HASOPEN=0; has_open_marker "$FMK" && F_HASOPEN=1
@@ -1420,7 +1441,7 @@ EOF
       done
     fi
 
-    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY" "$F_SIGMARKER_STALE")
+    F_VERDICT_LINE=$(janitor_decide "$F_EPIC" "$F_HASOPEN" "$F_SIGCOMMIT" "$F_SIGMARKER" "$F_SIGBRANCH" "$F_SIGCOMMIT_STALE" "$F_SIGMK_SUPER" "$F_DELIV_PARTIAL" "$F_DAEMON_HOLD" "$F_SIGCOMMIT_DOCS_ONLY" "$F_SIGMARKER_STALE" "$F_VM_HOLD")
     F_VERDICT="${F_VERDICT_LINE%%:*}"; F_REASON="${F_VERDICT_LINE#*:}"
 
     # ga-vokwv: sling-bead-name fallback. FID's OWN id carried no merge

@@ -254,6 +254,42 @@ eq "open-marker beats stale marker → keep (open-marker reason)" \
 eq "stale marker + a separate superseded marker → stale-marker reason wins" \
    "$(janitor_decide 0 0 0 1 0 0 1 0 0 0 1)" "keep:marker-evidence-superseded-by-newer-comment"
 
+# ── 1a8. janitor_decide is_vm_hold — merged ≠ running on the dialer VM (ga-wye9vt) ──
+# The dispatcher's PASS path now holds a bug/task that touches the voicebot when the dialer VM
+# is not proven current: label delivery:pending-vm, bead left open. The gate marker is already
+# closed as gate-status:passed by then and the merge is in origin/main, so EVERY merge signal
+# (A commit, B marker, C branch) fires on the janitor's next sweep and it would close the bead —
+# "done with the VM old", quietly, 15 minutes after the dispatcher refused to. Same precedence
+# tier as is_delivery_partial / is_daemon_hold: the dispatcher already judged the bead is NOT done.
+echo "── 1a8. janitor_decide is_vm_hold (merged ≠ running on the dialer VM, ga-wye9vt) ──"
+eq "backward-compat: 11 args, no 12th → marker still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+eq "vm-hold=0 explicit → marker still closes" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0 0 0)" "close:terminal-gate-marker-passed"
+eq "vm-hold + terminal marker (the dispatcher's own closed marker) → KEEP" \
+   "$(janitor_decide 0 0 0 1 0 0 0 0 0 0 0 1)" "keep:dialer-vm-pending-vm-hold"
+eq "vm-hold + commit in main → KEEP" \
+   "$(janitor_decide 0 0 1 0 0 0 0 0 0 0 0 1)" "keep:dialer-vm-pending-vm-hold"
+eq "vm-hold + branch merged → KEEP" \
+   "$(janitor_decide 0 0 0 0 1 0 0 0 0 0 0 1)" "keep:dialer-vm-pending-vm-hold"
+eq "vm-hold + every signal → KEEP (a guard, not a per-signal carve-out)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 0 0 0 0 1 | cut -d: -f1)" "keep"
+eq "vm-hold with no signal at all → still names the hold (not the generic no-merge-evidence)" \
+   "$(janitor_decide 0 0 0 0 0 0 0 0 0 0 0 1)" "keep:dialer-vm-pending-vm-hold"
+# Guard precedence: the guards ahead of the hold keep their own, more specific reasons.
+eq "epic beats the vm hold → epic reason" \
+   "$(janitor_decide 1 0 1 1 1 0 0 0 0 0 0 1)" "keep:epic-parent-never-autoclosed"
+eq "open-marker beats the vm hold → open-marker reason" \
+   "$(janitor_decide 0 1 1 1 1 0 0 0 0 0 0 1)" "keep:active-open-gate-marker"
+eq "delivery:partial + vm hold → partial reason (earlier tier wins)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 1 0 0 0 1)" "keep:delivery-partial-unresolved-scope"
+eq "daemon hold + vm hold → daemon reason (earlier tier wins)" \
+   "$(janitor_decide 0 0 1 1 1 0 0 0 1 0 0 1)" "keep:daemon-verification-pending-restart"
+# The ga-vokwv sling-name fallback may only override the two "FID's own signals were empty"
+# reasons. The hold reason must stay ineligible, or a sibling wrapper's evidence closes the bead.
+eq "the vm-hold keep reason is NOT eligible for the sling-name fallback" \
+   "$(sling_fallback_eligible_reason "dialer-vm-pending-vm-hold")" "0"
+
 # ── 1b. janitor_story_decide — merged story:approved → story:done (ga-gosfs) ──
 # Args: <is_epic> <has_open_marker> <already_done> <in_flight> <has_builder>
 #       <delivery_active> <sig_commit> <sig_marker> <sig_branch>
@@ -1403,6 +1439,36 @@ if grep -qF '"$S_BUILDER" "$S_DELIV" "$S_SIGCOMMIT" "$S_SIGMK" "$S_SIGBRANCH" "$
 else
   bad "story sweep's janitor_story_decide call signature changed unexpectedly — re-check ga-l7n3v's story-sweep-exclusion rationale"
 fi
+
+# ── 16b. Drift-guard: ga-wye9vt delivery:pending-vm is a keep-guard in BOTH non-story sweeps ──
+# The pure-function tests (§1a8) prove the verdict; they say nothing about whether the live
+# sweeps read the label and pass it in. A guard that exists as a function argument nobody
+# supplies is indistinguishable from no guard — and here the failure is silent: the janitor
+# closes the VM-held bead on the next 15-minute pass. The story:approved sweep needs nothing
+# new (story_delivery_owns_labels already covers the label, ga-2kaan2).
+echo "── 16b. Drift-guard: ga-wye9vt delivery:pending-vm not a merge signal (non-story sweeps) ──"
+grep -qF 'is_vm_hold="${12:-0}"' "$JANITOR" \
+  && ok "janitor_decide accepts optional is_vm_hold (backward-compatible default)" \
+  || bad "janitor_decide missing is_vm_hold param"
+grep -qF 'keep:dialer-vm-pending-vm-hold' "$JANITOR" \
+  && ok "vm-hold keep reason is distinguishable from generic no-merge-evidence" \
+  || bad "dialer-vm-pending-vm-hold reason missing"
+grep -qF 'printf '"'"'%s'"'"' "$b" | jq -e '"'"'(.labels // []) | index("delivery:pending-vm")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "in_progress sweep computes IS_VM_HOLD from the bead's own labels" \
+  || bad "in_progress sweep not computing IS_VM_HOLD"
+grep -qF 'printf '"'"'%s'"'"' "$f" | jq -e '"'"'(.labels // []) | index("delivery:pending-vm")'"'"' >/dev/null 2>&1 \' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep computes F_VM_HOLD from the bead's own labels" \
+  || bad "ga-hcj4 sweep not computing F_VM_HOLD"
+grep -qF '"$SIG_COMMIT_DOCS_ONLY" "$SIG_MARKER_STALE" "$IS_VM_HOLD")' "$JANITOR" \
+  && ok "in_progress sweep threads is_vm_hold into janitor_decide" \
+  || bad "in_progress sweep not threading is_vm_hold"
+grep -qF '"$F_SIGCOMMIT_DOCS_ONLY" "$F_SIGMARKER_STALE" "$F_VM_HOLD")' "$JANITOR" \
+  && ok "ga-hcj4 stranded-wrapper sweep threads is_vm_hold into janitor_decide" \
+  || bad "ga-hcj4 sweep not threading is_vm_hold"
+# Unreadable rows: both sweeps take .labels off the bead JSON they already fetched, the same
+# source as the bead id. A row jq cannot parse yields an empty id and is skipped before the
+# label read (`[ -z "$BID" ] && continue`), so "could not read the labels" never reaches the
+# flag as "no hold". The story sweep's own unreadable-list case is pinned further down (ga-2kaan2).
 
 # ── 17. Drift-guard: ga-fbycg docs-only-patch guard (sig_commit_docs_only) ──────
 # The pure-function tests (§1a6/§1b4) and the real-git helper test (§3e) prove the

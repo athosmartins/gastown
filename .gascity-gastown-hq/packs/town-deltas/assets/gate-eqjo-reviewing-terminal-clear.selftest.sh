@@ -149,11 +149,18 @@ echo "── 4. Regression guard: pre-existing wa-qq33j clear sites are untouche
 # wa-qq33j, same convention — 15 wa-qq33j-tagged (9 pre-existing + 1
 # ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1
 # ga-3bp42c) + 2 ga-n2cpe-tagged = 17.
+# ga-wye9vt (2026-10-05) added an 18th site: the dialer-VM hold (IS_VM_HOLD), a
+# sibling of ga-hwzzou's — the gate PASSED and reviewing is over, but the merge
+# touches what runs on the dialer VM and the VM is not proven current (pending /
+# failed / unknown), so the CLOSE is deferred under delivery:pending-vm. It clears
+# gate:reviewing too (tagged wa-qq33j, same convention) — 16 wa-qq33j-tagged (9
+# pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou
+# + 1 ga-3bp42c + 1 ga-wye9vt) + 2 ga-n2cpe-tagged = 18.
 TOTAL_CLEARS=$(grep -cF "$CLEAR_NEEDLE" "$DISPATCHER")
-if [ "$TOTAL_CLEARS" = "17" ]; then
-  ok "total gate:reviewing clear call sites = 17 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe) — got $TOTAL_CLEARS"
+if [ "$TOTAL_CLEARS" = "18" ]; then
+  ok "total gate:reviewing clear call sites = 18 (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 2 ga-n2cpe) — got $TOTAL_CLEARS"
 else
-  bad "expected 17 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
+  bad "expected 18 total gate:reviewing clear call sites (9 pre-existing + 1 ga-k2wjn + 1 ga-l7n3v + 1 ga-39l9z2 + 1 ga-rhzbii + 1 ga-hwzzou + 1 ga-3bp42c + 1 ga-wye9vt + 2 ga-n2cpe), got $TOTAL_CLEARS — either a pre-existing site was lost or the new count drifted"
 fi
 
 echo "── 5. MUTATION TEST: stripping the ga-n2cpe clears must flip sections 1-2 to RED ──"

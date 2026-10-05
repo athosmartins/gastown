@@ -6546,6 +6546,12 @@ gate_sibling_hold_check() {
 # Held labels:
 #   delivery:pending-restart  always. No override label exists; it is released by
 #                             hand once the daemon is confirmed live.
+#   delivery:pending-vm       always (ga-wye9vt). The label this dispatcher's own VM
+#                             hold writes (gate_vm_hold_check below) when a merge
+#                             touches the voicebot and the dialer VM is not proven
+#                             current; a LATER branch's clean PASS says nothing about
+#                             that VM, so it must not close the bead over it. No
+#                             override label exists; released by hand.
 #   delivery:partial          unless scope_covered:all is ALSO on the bead. That is
 #                             the documented override — the IS_PARTIAL branch above
 #                             skips its hold for it, and merged-bead-janitor.sh's
@@ -6586,6 +6592,7 @@ gate_own_hold_check() {
       | select(type == "object" and .id == $id)
       | (.labels // []) as $l
       | [ $l[] | select(. == "delivery:pending-restart"
+                        or . == "delivery:pending-vm"
                         or (. == "delivery:partial" and ($l | index("scope_covered:all") | not))) ]
       | join(" ")') || _jrc=$?
   fi
@@ -6601,6 +6608,374 @@ gate_own_hold_check() {
   return 0
 }
 # SELFTEST-EXTRACT own-hold-check-fn: END
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ga-wye9vt: does the merge touch what the DIALER VM (jambonz-dialer) runs, and is
+# the VM on that code? story-delivery.sh asks since ga-2kaan2 (Step 6a); the PASS
+# path below closed bug/task beads without asking (12 of 21 measured by the Mayor).
+#
+# The four helpers below are a COPY of story-delivery.sh's — verbatim. The two
+# scripts are self-contained by convention (neither sources the other or a shared
+# lib; see _gl7n3v_runbook_field), so the copy is pinned instead:
+# gate-close-asks-voicebot-vm.selftest.sh section 7 fails the moment either side
+# changes alone. Change them in BOTH files, in the same commit.
+#
+# Both reading helpers return their answer in globals and ALWAYS rc 0, and every answer
+# has THREE states — "could not read it" is never allowed to collapse into the harmless one.
+# ═════════════════════════════════════════════════════════════════════════════
+# SELFTEST-EXTRACT vm-helpers: BEGIN
+VM_DELTA_VERDICT=""; VM_DELTA_WHY=""
+VM_VERDICT=""; VM_REASON=""; VM_STDOUT=""; VM_STDERR=""
+
+# voicebot_vm_delta_touched <runtime_dir> <base_sha> <merge_sha>
+# Does THIS story's own delta (<base>..<merge>: every commit its branch landed)
+# touch what the VM runs? Sets VM_DELTA_VERDICT yes|no|unknown + VM_DELTA_WHY.
+# The predicate is exactly voicebot_vm_sync.compute_manifest's, no wider: every file
+# under the package ships to the VM except *.md and the package-ROOT requirements.txt
+# (a nested requirements.txt ships, so it counts).
+# Read with --no-renames: git lists only the NEW path of a rename by default, so a
+# file moved OUT of the package would show no voicebot path while the VM still
+# holds the old copy (same trap /gate-done documents for its own diff). Read with -z
+# (+ quotePath=false): without it git prints a path with a non-ASCII byte as a
+# C-quoted string, which no pattern below matches (gate fix-attempt 2).
+#   yes     a file under lib/predictive_dialer/voicebot/ (except the two above), OR a
+#           lib/<m>.py that is in the closure scripts/voicebot_vm_lib_closure.py
+#           computes (on RUNTIME_DIR's current tree, which Step 4 has just brought to main).
+#   no      the delta was read and nothing in it reaches the VM.
+#   unknown the delta cannot be read (base not recorded / not an ancestor, as
+#           Step 5b — never a guessed MERGE_SHA^ — or `git diff` failed, or a path
+#           arrived C-quoted and cannot be matched), or the closure cannot be
+#           computed (the script refuses, is missing, times out, prints nothing, or
+#           prints something that is not a list of module names) while a lib/ file
+#           changed. In a rig WITHOUT the voicebot package there is nothing to carry,
+#           so there an unreadable delta — or a lib/ change with no closure script to
+#           ask — is "no", not "unknown". (A delta that touches package files is
+#           "yes" in every rig, even when the package is gone afterwards.) A
+#           runtime_dir that does not exist is "unknown" in every rig: there is no
+#           tree to infer "no package" from.
+voicebot_vm_delta_touched() {
+  local rt="$1" base="$2" sha="$3" pkg="lib/predictive_dialer/voicebot"
+  local base_sha="" f m cand="" closure="" closure_script cl_line cl_bad=""
+  local readable=1 saw_end=0 quoted="" unread_why=""
+  VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY=""
+  if [ -z "$rt" ]; then
+    VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="sem runtime_dir — não dá pra ler o delta do merge"; return 0
+  fi
+  if [ ! -d "$rt" ]; then
+    VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="runtime_dir '$rt' não existe — não dá pra ler o delta do merge nem saber se o rig tem o pacote"; return 0
+  fi
+  if [ -z "$base" ] || [ -z "$sha" ] \
+     || ! base_sha="$(git -C "$rt" rev-parse --verify -q "${base}^{commit}" 2>/dev/null)" || [ -z "$base_sha" ] \
+     || ! git -C "$rt" merge-base --is-ancestor "$base_sha" "$sha" 2>/dev/null; then
+    readable=0
+    unread_why="não consegui ler o delta do merge (base '${base:-<não registrada>}' ausente ou não é ancestral de '${sha:-<sem sha>}')"
+  fi
+  if [ "$readable" = "1" ]; then
+    # The list is followed by an EMPTY record, printed only if git succeeded: reaching it is
+    # how we know the list is complete — a failed `git diff` must not read as an empty delta.
+    # (No `$(...)` here: it would drop the NUL separators.)
+    while IFS= read -r -d '' f; do
+      if [ -z "$f" ]; then saw_end=1; continue; fi
+      case "$f" in
+        '"'*) quoted="$f" ;;
+        "$pkg"/*.md|"$pkg"/requirements.txt) ;;
+        "$pkg"/*) VM_DELTA_VERDICT="yes"; VM_DELTA_WHY="arquivo do pacote voicebot: $f"; return 0 ;;
+        lib/*.py) m="${f#lib/}"; case "$m" in */*) ;; *) cand="$cand ${m%.py}" ;; esac ;;
+      esac
+    done < <(git -C "$rt" -c core.quotePath=false diff -z --name-only --no-renames "$base_sha" "$sha" 2>/dev/null && printf '\0')
+    if [ "$saw_end" != "1" ]; then
+      readable=0
+      unread_why="não consegui ler o delta do merge (o git diff entre '$base_sha' e '$sha' falhou)"
+    elif [ -n "$quoted" ]; then
+      # -z never quotes, so this is belt and braces: a path that still arrived quoted cannot be
+      # matched against the package, and "could not match" is not "does not match".
+      readable=0
+      unread_why="um caminho do delta chegou entre aspas (C-quoted) e não dá pra casar com o pacote voicebot: $quoted"
+    fi
+  fi
+  if [ "$readable" != "1" ]; then
+    if [ -d "$rt/$pkg" ]; then
+      VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="$unread_why"
+    else
+      VM_DELTA_VERDICT="no"; VM_DELTA_WHY="rig sem o pacote $pkg — nada a levar pra VM"
+    fi
+    return 0
+  fi
+  if [ -z "${cand// /}" ]; then
+    VM_DELTA_VERDICT="no"; VM_DELTA_WHY="o delta do merge não toca o pacote voicebot nem arquivo de lib/"; return 0
+  fi
+  # A top-level lib/*.py changed. In a rig WITHOUT the voicebot package there is nothing
+  # to carry to the VM, and the closure script (only the rig WA has one) can never exist
+  # there — asking for it would answer "unknown" about something the code CAN know, and
+  # that "unknown" used to surface as a false "contrato ausente" comment on every
+  # property_scrapers story touching lib/ (gate fix-attempt 1). The check sits HERE, after
+  # the package-file match above, not at the top: a merge that DELETES the whole package
+  # leaves a post-pull tree with no directory while the VM still holds the old copy, and
+  # its delta already returned "yes" from the package-file arm.
+  if [ ! -d "$rt/$pkg" ]; then
+    VM_DELTA_VERDICT="no"; VM_DELTA_WHY="rig sem o pacote $pkg — nada a levar pra VM (lib/ mudou: ${cand# })"; return 0
+  fi
+  closure_script="$rt/scripts/voicebot_vm_lib_closure.py"
+  if [ -f "$closure_script" ] \
+     && closure="$(timeout "${VOICEBOT_VM_CLOSURE_TIMEOUT_S:-60}" python3 "$closure_script" 2>/dev/null)"; then
+    # exit 0 is not proof of an answer. The real closure is never empty (22 modules today; it
+    # exits 2 on any problem), so empty output is itself "could not compute" — the rule
+    # voicebot_vm_status applies to an exit 0 it cannot corroborate (gate fix-attempt 2).
+    if [ -z "${closure//[[:space:]]/}" ]; then
+      VM_DELTA_VERDICT="unknown"
+      VM_DELTA_WHY="mudou lib/ (${cand# }) e o fechamento do voicebot veio VAZIO (scripts/voicebot_vm_lib_closure.py saiu 0 sem listar módulo nenhum — o fechamento real nunca é vazio)"
+      return 0
+    fi
+    # One bare module name per line. A line with whitespace, a path separator, a dot, a colon or
+    # a quote is a message, not a module: reading it as a closure would answer "not in it".
+    while IFS= read -r cl_line; do
+      case "$cl_line" in
+        '') ;;
+        *[[:space:]]*|*:*|*/*|*.*|*\"*|*\'*) cl_bad="$cl_line"; break ;;
+      esac
+    done <<< "$closure"
+    if [ -n "$cl_bad" ]; then
+      VM_DELTA_VERDICT="unknown"
+      VM_DELTA_WHY="mudou lib/ (${cand# }) e a saída do fechamento do voicebot não é uma lista de módulos (primeira linha estranha: '${cl_bad:0:80}')"
+      return 0
+    fi
+    # No pipe into grep -q (SIGPIPE + pipefail would read a match as a miss): a
+    # newline-fenced `case` is the exact-line test.
+    for m in $cand; do
+      case $'\n'"$closure"$'\n' in
+        *$'\n'"$m"$'\n'*) VM_DELTA_VERDICT="yes"; VM_DELTA_WHY="lib/$m.py está no fechamento de lib/ do voicebot"; return 0 ;;
+      esac
+    done
+    VM_DELTA_VERDICT="no"; VM_DELTA_WHY="os arquivos de lib/ do delta (${cand# }) não estão no fechamento do voicebot"
+    return 0
+  fi
+  VM_DELTA_VERDICT="unknown"
+  VM_DELTA_WHY="mudou lib/ (${cand# }) e não consegui calcular o fechamento do voicebot (scripts/voicebot_vm_lib_closure.py ausente, recusou ou estourou o tempo)"
+  return 0
+}
+
+# voicebot_vm_status <script> [<timeout_s>]
+# Runs `python3 <script> --status` (read-only, no ssh) and sets VM_VERDICT
+# ok|pending|failed|unknown, VM_REASON (one line), VM_STDOUT and VM_STDERR (each capped).
+#   exit 0  -> ok, but ONLY with a "STATUS: em dia" line on stdout — an exit 0
+#              nobody can corroborate is "unknown", never "provado igual ao main"
+#   exit 10 -> pending      exit 20 -> failed
+#   exit 2  -> unknown ("uso errado": the contract defines it, and its stderr is the
+#              only place the cause is written — shown, not dropped)
+#   anything else (timeout 124, python crash, unknown exit, 127...) -> unknown
+#   script missing -> unknown (nobody to ask is not "em dia")
+voicebot_vm_status() {
+  local script="$1" to="${2:-30}" out="" err="" rc=0 line="" errf="" hint="" l
+  VM_VERDICT="unknown"; VM_REASON=""; VM_STDOUT=""; VM_STDERR=""
+  if [ ! -f "$script" ]; then
+    VM_REASON="não consegui ler o status da VM (o script do contrato $script não existe neste checkout)"
+    return 0
+  fi
+  # stderr goes to a file (not 2>/dev/null): it carries the cause of an unreadable status.
+  # If no temp file can be made the cause is lost, never the verdict.
+  errf="$(mktemp 2>/dev/null)" || errf=""
+  if [ -n "$errf" ]; then
+    out="$(timeout "$to" python3 "$script" --status 2>"$errf")" && rc=0 || rc=$?
+    err="$(head -c 1500 "$errf" 2>/dev/null || true)"
+    rm -f "$errf" 2>/dev/null || true
+  else
+    out="$(timeout "$to" python3 "$script" --status 2>/dev/null)" && rc=0 || rc=$?
+  fi
+  # Bash substring, not `printf | head -c`: on a runaway stdout head exits early,
+  # printf takes SIGPIPE, pipefail makes the assignment non-zero and `set -e` aborts
+  # the WHOLE sweep (every story), not just this one.
+  VM_STDOUT="${out:0:1500}"
+  VM_STDERR="${err:0:1500}"
+  while IFS= read -r l; do
+    if [ -n "$l" ]; then hint="${l:0:300}"; break; fi
+  done <<< "$err"
+  line="$(printf '%s\n' "$out" | grep -m1 '^STATUS:' || true)"
+  case "$rc" in
+    0)
+      case "$line" in
+        "STATUS: em dia"*) VM_VERDICT="ok"; VM_REASON="$line" ;;
+        *) VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (exit 0, mas sem a linha 'STATUS: em dia' no stdout${hint:+; stderr: $hint})" ;;
+      esac ;;
+    10) VM_VERDICT="pending"; VM_REASON="${line:-STATUS: pendente — o --status saiu 10 sem linha STATUS no stdout (sem saída legível)}" ;;
+    20) VM_VERDICT="failed";  VM_REASON="${line:-STATUS: falhou — o --status saiu 20 sem linha STATUS no stdout (sem saída legível)}" ;;
+    124) VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status estourou ${to}s)" ;;
+    2)  VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status saiu com exit 2 = uso errado do script${hint:+: $hint})" ;;
+    *)  VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status saiu com exit $rc, que o contrato não define${hint:+: $hint})" ;;
+  esac
+  return 0
+}
+
+# voicebot_vm_state_put <dir> <file> <fp> <since> <mailed> — rc 1 if the hold state could
+# not be written. The caller warns: without the state the 24h Mayor-mail ceiling and the
+# comment dedup cannot work, and that must not pass in silence.
+voicebot_vm_state_put() {
+  mkdir -p "$1" 2>/dev/null || return 1
+  printf 'fp=%s\nsince=%s\nmailed=%s\n' "$3" "$4" "$5" > "$2" 2>/dev/null || return 1
+}
+
+# voicebot_vm_state_get <state_file> <key> — value of key=value, empty if absent.
+voicebot_vm_state_get() {
+  [ -f "$1" ] || return 0
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 || true
+}
+# SELFTEST-EXTRACT vm-helpers: END
+
+# ── ga-wye9vt: the VM verdict the PASS path acts on ──────────────────────────
+# gate_vm_hold_check <runtime_dir> <base_sha> <merge_sha>
+#
+# Asked right before the close of a bug/task source bead (Mayor's Option A, comment
+# 2026-10-05 11:23 on ga-wye9vt). Same contract as ga-2kaan2: `voicebot_vm_sync.py
+# --status` (read-only, no ssh) exits 0 with a "STATUS: em dia" line = the VM provably
+# runs main, 10 = pending, 20 = failed, anything else = it could not be read.
+#
+# Sets VM_HOLD_KIND — FOUR outcomes, never inferred from one another:
+#   ""         close: the delta was READ and does not reach the VM, or the VM is PROVEN current
+#   "absent"   the delta does (or may) reach the VM but there is no contract script to ask
+#              (wa-y0su67 not in this checkout) → close as before, with a comment saying the
+#              VM was NOT verified
+#   "pending"  the VM is behind                                   → hold
+#   "failed"   the sync failed                                    → hold
+#   "unknown"  the status could not be read (timeout, an exit the contract does not define,
+#              exit 0 with no "STATUS: em dia" line)              → hold
+# "unknown" is the collapse this exists to prevent: it must come out as the INERT answer
+# (hold), never as "em dia". The same goes for the DELTA: "unknown" (the base is not
+# recorded, git failed, the closure cannot be computed) is "may touch" — it asks the VM,
+# it never reads as "does not touch".
+# Also sets VM_HOLD_REASON (the status reason, or the delta's reason when nothing was
+# asked), VM_HOLD_DELTA (why the delta does / may reach the VM), VM_HOLD_TOUCH
+# ("TOUCHES" | "MAY touch": "TOUCHES" only when the delta was PROVEN to reach the VM) and
+# VM_HOLD_SCRIPT. Always returns 0.
+# SELFTEST-EXTRACT vm-hold-check-fn: BEGIN
+gate_vm_hold_check() {
+  local rt="$1" base="$2" sha="$3"
+  VM_HOLD_KIND=""; VM_HOLD_REASON=""; VM_HOLD_DELTA=""; VM_HOLD_TOUCH="MAY touch"; VM_HOLD_SCRIPT=""
+  voicebot_vm_delta_touched "$rt" "$base" "$sha"
+  VM_HOLD_REASON="$VM_DELTA_WHY"
+  VM_HOLD_DELTA="$VM_DELTA_WHY"
+  if [ "$VM_DELTA_VERDICT" = "yes" ]; then VM_HOLD_TOUCH="TOUCHES"; fi
+  if [ "$VM_DELTA_VERDICT" = "no" ]; then return 0; fi
+  VM_HOLD_SCRIPT="${VOICEBOT_VM_SYNC_SCRIPT:-$rt/scripts/voicebot_vm_sync.py}"
+  if [ ! -f "$VM_HOLD_SCRIPT" ]; then
+    VM_HOLD_KIND="absent"
+    return 0
+  fi
+  voicebot_vm_status "$VM_HOLD_SCRIPT" "${VOICEBOT_VM_STATUS_TIMEOUT_S:-30}"
+  VM_HOLD_REASON="$VM_REASON"
+  case "$VM_VERDICT" in
+    ok)      VM_HOLD_KIND="" ;;
+    pending) VM_HOLD_KIND="pending" ;;
+    failed)  VM_HOLD_KIND="failed" ;;
+    *)       VM_HOLD_KIND="unknown" ;;
+  esac
+  return 0
+}
+# SELFTEST-EXTRACT vm-hold-check-fn: END
+
+# ── ga-wye9vt: the 24h ceiling of the dialer-VM hold ─────────────────────────
+# gate_vm_hold_ceiling_sweep <state_dir> <now_epoch> <after_s>
+#
+# The PASS path HOLDS a bug/task under delivery:pending-vm and never looks at it again — no
+# automatic re-query is the Mayor's Option A. Without something that DOES come back, the other
+# half of that decision ("a 24h ceiling that mails the Mayor") would be a sentence in a comment.
+# This is that something: run once per dispatcher sweep, before Step 0b's empty-queue exit (a
+# hold has to be mailed whether or not a marker is queued), it reads the hold states the PASS
+# path wrote (<state_dir>/<bead-id>.state; fp = "<kind>|<store>", since, mailed) and mails the
+# Mayor ONCE for a bead that has been held for at least <after_s> and is still open.
+#
+# It does NOT ask the VM and does NOT release the hold: the ceiling is a nag, not a retry.
+#
+# Three states for what it finds, never collapsed (the same discipline as everywhere else here):
+#   closed     → the hold is over: drop the state, mail nothing (and never inherit this clock
+#                into a later, unrelated hold of the same bead)
+#   standing   → any other status: mail once (the label being absent is said in the mail —
+#                nothing marks the hold any more)
+#   unreadable → bd failed, the payload is not this bead, no status: keep the state, mail
+#                nothing, say so, try again next sweep. NOT "closed" (it would drop a hold that
+#                still stands) and NOT "standing" (it would mail on a guess).
+# A state it cannot interpret (since not a number, no store in fp) is skipped loudly, never
+# mailed and never deleted.
+#
+# At-most-once: the claim (mailed=1) is written BEFORE the mail and released if the mail fails.
+# A state that cannot be written means no mail at all — it could not be deduplicated, and a
+# 180s sweep would re-mail the Mayor all day.
+#
+# A hold already mailed is looked at only for housekeeping — at most once an hour (the state
+# file's mtime is the "last looked" clock) — to drop the state when the bead closes.
+#
+# Keep the bd read free of 2>/dev/null: bd's own error text belongs in the dispatcher log.
+# Always returns 0 (the dispatcher runs under set -e). Honors DRY_RUN (logs, writes nothing).
+# SELFTEST-EXTRACT vm-hold-ceiling-fn: BEGIN
+gate_vm_hold_ceiling_sweep() {
+  local dir="$1" now="$2" after="$3"
+  local f id fp since mailed store kind _json _rc _jrc _row status label _since_h _win _body
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.state; do
+    [ -f "$f" ] || continue
+    id="${f##*/}"; id="${id%.state}"
+    fp="$(voicebot_vm_state_get "$f" fp)"
+    since="$(voicebot_vm_state_get "$f" since)"
+    mailed="$(voicebot_vm_state_get "$f" mailed)"
+    case "$since" in
+      ''|*[!0-9]*)
+        warn "ga-wye9vt: the VM hold state for $id ($f) is unusable (since='$since') — skipped: not mailed, not dropped."
+        continue ;;
+    esac
+    case "$fp" in
+      *\|?*) : ;;
+      *)
+        warn "ga-wye9vt: the VM hold state for $id ($f) names no store (fp='$fp') — the bead cannot be found again, so it is skipped: not mailed, not dropped."
+        continue ;;
+    esac
+    store="${fp#*|}"; kind="${fp%%|*}"
+    if [ "$mailed" = "1" ]; then
+      [ -z "$(find "$f" -mmin -60 2>/dev/null)" ] || continue
+      touch "$f" 2>/dev/null || true
+    else
+      [ $((now - since)) -ge "$after" ] || continue
+    fi
+    _rc=0; _jrc=0; _row=""
+    _json=$(bd -C "$store" show "$id" --json) || _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+      _row=$(printf '%s' "$_json" | jq -er --arg id "$id" '
+        (if type == "array" then .[0] else . end)
+        | select(type == "object" and .id == $id and ((.status // "") != ""))
+        | (.status | tostring) + " " + (if ((.labels // []) | index("delivery:pending-vm")) != null then "label" else "nolabel" end)') || _jrc=$?
+    fi
+    if [ "$_rc" -ne 0 ] || [ "$_jrc" -ne 0 ] || [ -z "$_row" ]; then
+      warn "ga-wye9vt: could not read $id in $store (bd show rc=$_rc, jq rc=$_jrc) — its VM hold state is kept and the ceiling is retried next sweep."
+      continue
+    fi
+    status="${_row%% *}"; label="${_row#* }"
+    if [ "$status" = "closed" ]; then
+      rm -f "$f" 2>/dev/null || warn "ga-wye9vt: $id is closed but its VM hold state $f could not be removed."
+      log "ga-wye9vt: $id is closed — its VM hold state is dropped, no ceiling mail."
+      continue
+    fi
+    [ "$mailed" = "1" ] && continue
+    _win="$((after / 3600))h"; [ "$after" -ge 3600 ] || _win="${after}s"
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      log "DRY_RUN=1 — WOULD mail the Mayor: $id has been held on delivery:pending-vm for over $_win (status $status, label $label)."
+      continue
+    fi
+    if ! voicebot_vm_state_put "$dir" "$f" "$fp" "$since" 1; then
+      warn "ga-wye9vt: could not record the ceiling claim in $f — NOT mailing the Mayor about $id (it could not be deduplicated and would be re-mailed every sweep)."
+      continue
+    fi
+    _since_h="$(date -u -r "$since" '+%Y-%m-%d %H:%MZ' 2>/dev/null || date -u -d "@$since" '+%Y-%m-%d %H:%MZ' 2>/dev/null || echo "epoch $since")"
+    if [ "$label" = "label" ]; then label="presente"; else label="AUSENTE (nada marca mais o hold — se já foi resolvido, feche o bead)"; fi
+    _body="$(printf 'O bug/task %s (store %s) PASSOU no gate e o merge entrou, mas está SEGURADO desde %s (delivery:pending-vm, %s): o merge toca o que roda na VM do discador e a VM não estava provada igual ao main.\n\nEstado do bead agora: %s. Label delivery:pending-vm: %s.\n\nO dispatcher NÃO reconsulta a VM sozinho e este mail não solta o hold — é só o teto de %s. O motivo está no comentário do bead.\n\nAÇÃO: python3 scripts/voicebot_vm_sync.py --status (somente leitura); quando der STATUS: em dia, `bd -C %s label remove %s delivery:pending-vm` e feche o bead à mão. Se a VM precisa do deploy, ele é manual (wa-y0su67).' \
+      "$id" "$store" "$_since_h" "$kind" "$status" "$label" "$_win" "$store" "$id")"
+    if ! gc --city "$GC_CITY" mail send mayor \
+         -s "VM do voicebot pendente há mais de $_win: $id" \
+         -m "$_body" 2>/dev/null; then
+      warn "ga-wye9vt: Could not mail the Mayor the >$_win VM-hold escalation for $id — the claim is released, the next sweep retries."
+      voicebot_vm_state_put "$dir" "$f" "$fp" "$since" 0 \
+        || warn "ga-wye9vt: could not release the ceiling claim in $f either — $id will not be mailed again until it is reset by hand."
+    fi
+  done
+  return 0
+}
+# SELFTEST-EXTRACT vm-hold-ceiling-fn: END
 
 # ── ga-eqjo: Steps 9-11 wrapped as a callable function ───────────────────────
 # No logic below changed from its historical inline form — pure relocation +
@@ -8041,6 +8416,11 @@ fi
       # EARLIER delivery (or that read could not be verified) — declared here
       # for the same reason as the two flags above.
       IS_OWN_HOLD=0
+      # ga-wye9vt: set inside the BUG/TASK close branch below when the merge
+      # touches what the dialer VM runs and the VM is not PROVEN current (or the
+      # status could not be read) — declared here for the same reason as the
+      # flags above.
+      IS_VM_HOLD=0
       if [ "$IS_STORY" != "1" ]; then
         if printf '%s' "$SRC_LABELS" | grep "scope_covered:all" >/dev/null; then
           IS_PARTIAL=0
@@ -8668,15 +9048,104 @@ $OPEN_SIBLINGS_FOR_CLOSE"
               bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
               if [ "$OWN_HOLD_KIND" = "unverified" ]; then
                 log "Source bug/task $BEAD_ID PASSED+merged but its own hold labels could NOT be read (bd show failed or returned a payload that is not this bead — see the ALERT just above) — holding, NOT closing (ga-hwzzou). Hold labels are UNKNOWN, not confirmed present."
-                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): reading this bead own labels FAILED or came back unusable (a bd or jq call failed, or the payload was not this bead; the ALERT is in the dispatcher log), so whether an earlier delivery left it a hold (delivery:pending-restart / delivery:partial) is UNKNOWN — none is confirmed. Held instead of closed because closing on a false "no hold" would silently drop a daemon-verification or scope hold.\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: run `bd -C %s show %s` (keep the -C: a bare bd from another directory reads a different store, and a missing bead there is NOT "no hold labels") and check its labels; if neither delivery:pending-restart nor delivery:partial is present, close this bead by hand; otherwise resolve that hold first.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$BEAD_CITY" "$BEAD_ID")" 2>/dev/null || true
+                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): reading this bead own labels FAILED or came back unusable (a bd or jq call failed, or the payload was not this bead; the ALERT is in the dispatcher log), so whether an earlier delivery left it a hold (delivery:pending-restart / delivery:pending-vm / delivery:partial) is UNKNOWN — none is confirmed. Held instead of closed because closing on a false "no hold" would silently drop a daemon-verification or scope hold.\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: run `bd -C %s show %s` (keep the -C: a bare bd from another directory reads a different store, and a missing bead there is NOT "no hold labels") and check its labels; if none of delivery:pending-restart, delivery:pending-vm or delivery:partial is present, close this bead by hand; otherwise resolve that hold first.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$BEAD_CITY" "$BEAD_ID")" 2>/dev/null || true
               else
                 log "Source bug/task $BEAD_ID PASSED+merged but already carries a hold from an EARLIER delivery ($OWN_HOLD_LABELS) — holding, NOT closing (ga-hwzzou)."
-                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): this bead already carries a hold from an EARLIER delivery: %s.\n\ndelivery:pending-restart means an earlier merge left a daemon unverified or needing a guarded restart. delivery:partial means the bead body looked like it enumerates more deliverables than the one diff the gate reviewed (and scope_covered:all is not set). This branch clean PASS clears neither, and nothing here re-verifies them, so closing now would silently drop the hold. The bead stays open (gate:passed keeps the Pilot from re-dispatching it).\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: read the earlier PASS comment on this bead for what is still outstanding, resolve it, then close this bead by hand. If the earlier hold is already resolved and only the label was left behind, close it by hand now.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OWN_HOLD_LABELS")" 2>/dev/null || true
+                bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-hwzzou): this bead already carries a hold from an EARLIER delivery: %s.\n\ndelivery:pending-restart means an earlier merge left a daemon unverified or needing a guarded restart. delivery:pending-vm means an earlier merge touched what the dialer VM runs and the VM was not proven to be on that code (ga-wye9vt). delivery:partial means the bead body looked like it enumerates more deliverables than the one diff the gate reviewed (and scope_covered:all is not set). This branch clean PASS clears none of them, and nothing here re-verifies them, so closing now would silently drop the hold. The bead stays open (gate:passed keeps the Pilot from re-dispatching it).\n\nNo automatic retry: this dispatcher does not revisit the bead. ACTION: read the earlier PASS comment on this bead for what is still outstanding, resolve it, then close this bead by hand. If the earlier hold is already resolved and only the label was left behind, close it by hand now.' "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$OWN_HOLD_LABELS")" 2>/dev/null || true
               fi
             fi
           fi
           # SELFTEST-EXTRACT own-hold-block: END
+          # ga-wye9vt: a merge that touches what the DIALER VM (jambonz-dialer) runs is not
+          # "delivered" until the VM runs it — the daemon check above only covers launchd
+          # daemons on THIS host, and story-delivery.sh's Step 6a (ga-2kaan2) is the only
+          # other place that asked the VM (12 of 21 bug/task closes measured by the Mayor
+          # went through here without asking; Mayor's Option A, 2026-10-05 11:23). Ask
+          # `voicebot_vm_sync.py --status` (gate_vm_hold_check keeps ok / pending / failed /
+          # unknown / absent apart): only a PROVEN-current VM, or a delta that does not
+          # reach the VM, closes. pending / failed / unknown HOLD with delivery:pending-vm
+          # + a comment carrying the reason; an ABSENT contract script (wa-y0su67 not in
+          # this checkout) closes as before, saying so. Skipped when a sibling or own hold
+          # already applies (no second read for a bead held anyway; a bead that already
+          # wears delivery:pending-vm is an own hold, see gate_own_hold_check).
+          # IS_VM_HOLD exempts the bead from the POST-MERGE re-spawn check below, like the
+          # other holds. NOT re-queried by a later sweep: the hold state written below
+          # (<kind>|<store>, since, mailed) is what gate_vm_hold_ceiling_sweep reads on every
+          # dispatcher sweep, and it mails the Mayor ONCE if the hold still stands after the 24h
+          # ceiling. The ceiling does not ask the VM and does not release the hold.
+          # Not covered here, on purpose: the already-merged short-circuits (Step 0a-4 /
+          # the superseded path) close a bead without a merge of their own, so there is no
+          # delta to read — tracked as ga-buac0o.
+          # SELFTEST-EXTRACT vm-hold-block: BEGIN
+          VM_HOLD_CLOSE_NOTE=""
           if [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ]; then
+            if [ -z "${DR_RUNTIME_DIR:-}" ]; then
+              log "ga-wye9vt: VM check skipped for $BEAD_ID — rig '$RIG' has no runtime_dir mapping, so there is no checkout to read the merge delta from or to find the VM contract script in (the daemon-liveness soft-warn above records the same gap)."
+            elif [ "$DR_RUNTIME_DIR" = "$GC_CITY" ]; then
+              log "ga-wye9vt: VM check not applicable for $BEAD_ID (framework/gascity self-fix, runtime_dir == GC_CITY — no voicebot package to carry)."
+            else
+              gate_vm_hold_check "$DR_RUNTIME_DIR" "${MERGE_PRE_MAIN_SHA:-}" "$MERGE_SHA"
+              case "$VM_HOLD_KIND" in
+                "")
+                  if [ "$VM_DELTA_VERDICT" = "no" ]; then
+                    log "ga-wye9vt: VM check for $BEAD_ID — nothing to verify: $VM_HOLD_REASON."
+                  else
+                    log "ga-wye9vt: VM check for $BEAD_ID — the dialer VM is proven current ($VM_HOLD_REASON); closing."
+                  fi
+                  ;;
+                absent)
+                  warn "VM do voicebot não verificada para $BEAD_ID: contrato ausente ($VM_HOLD_SCRIPT não existe; $VM_HOLD_DELTA) — closing as before (ga-wye9vt)."
+                  VM_HOLD_CLOSE_NOTE="ga-wye9vt: VM do voicebot NÃO verificada — contrato ausente ($VM_HOLD_SCRIPT)."
+                  bd -C "$BEAD_CITY" comment "$BEAD_ID" "VM não verificada: contrato ausente (ga-wye9vt). This merge $VM_HOLD_TOUCH what runs on the dialer VM ($VM_HOLD_DELTA), but $VM_HOLD_SCRIPT does not exist in this checkout — possibly wa-y0su67 is not in main yet (or this checkout is behind it, or VOICEBOT_VM_SYNC_SCRIPT points to the wrong place). The bead is closed as before and that does NOT prove the VM runs the new code; if the VM needs the deploy, it is manual until the contract exists." 2>/dev/null || true
+                  ;;
+                *)
+                  IS_VM_HOLD=1
+                  bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
+                  # A label that could not be written is never claimed (ga-2kaan2 gate fix-attempt 3,
+                  # same class): the bead is STILL not closed, but the comment says it is unlabeled.
+                  VM_HOLD_LABELED=0
+                  if bd -C "$BEAD_CITY" label add "$BEAD_ID" "delivery:pending-vm" -q 2>/dev/null; then
+                    VM_HOLD_LABELED=1
+                  else
+                    warn "Could not add delivery:pending-vm to $BEAD_ID — the bead is still NOT closed, but it carries no hold label: merged-bead-janitor does not know about this hold and may close it on merge evidence (ga-wye9vt)."
+                  fi
+                  case "$VM_HOLD_KIND" in
+                    pending) VM_HOLD_STATE="NOT current yet (--status: pending)" ;;
+                    failed)  VM_HOLD_STATE="NOT current (--status: failed)" ;;
+                    *)       VM_HOLD_STATE="UNKNOWN (não-sei: the status could not be read, so nothing proves it is current)" ;;
+                  esac
+                  if [ "$VM_HOLD_LABELED" = "1" ]; then
+                    VM_HOLD_LABEL_NOTE="Held as delivery:pending-vm (gate:passed keeps the Pilot from re-dispatching it)."
+                  else
+                    VM_HOLD_LABEL_NOTE="The hold label delivery:pending-vm could NOT be written (bd label add failed; see the WARN in the dispatcher log), so the bead is left open WITHOUT it — merged-bead-janitor does not know about this hold and may close the bead on merge evidence. Re-add it by hand: bd -C $BEAD_CITY label add $BEAD_ID delivery:pending-vm"
+                  fi
+                  # The hold state the 24h ceiling reads (the same fp|since|mailed file the story side
+                  # writes, in a directory of its own so story-delivery.sh never sees it). An earlier
+                  # hold's clock is kept, never restarted.
+                  VM_HOLD_DIR="$GC_CITY/.gc/runtime/voicebot-vm-hold-gate"
+                  VM_HOLD_FILE="$VM_HOLD_DIR/$BEAD_ID.state"
+                  VM_HOLD_SINCE="$(voicebot_vm_state_get "$VM_HOLD_FILE" since)"
+                  case "$VM_HOLD_SINCE" in ''|*[!0-9]*) VM_HOLD_SINCE="$(date +%s)" ;; esac
+                  VM_HOLD_MAILED="$(voicebot_vm_state_get "$VM_HOLD_FILE" mailed)"
+                  [ "$VM_HOLD_MAILED" = "1" ] || VM_HOLD_MAILED=0
+                  # fp = "<kind>|<store>": gate_vm_hold_ceiling_sweep finds the bead again from the state
+                  # alone (a rig bead does not live in the HQ store). The story side keeps a comment
+                  # fingerprint here; this directory is the gate's own, so the encoding is ours.
+                  if voicebot_vm_state_put "$VM_HOLD_DIR" "$VM_HOLD_FILE" "$VM_HOLD_KIND|$BEAD_CITY" "$VM_HOLD_SINCE" "$VM_HOLD_MAILED"; then
+                    VM_HOLD_CEILING_NOTE="The Mayor gets ONE mail if this hold still stands after the 24h ceiling (VOICEBOT_VM_PENDING_MAIL_AFTER_S, default 86400s); that mail neither re-asks the VM nor releases the hold."
+                  else
+                    warn "Could not write the VM hold state ($VM_HOLD_FILE) — the 24h Mayor-mail ceiling cannot run for $BEAD_ID (ga-wye9vt)."
+                    VM_HOLD_CEILING_NOTE="The 24h Mayor-mail ceiling is NOT armed for this bead (the hold state could not be written), so nothing will mail the Mayor if this sits — look at it yourself."
+                  fi
+                  log "Source bug/task $BEAD_ID PASSED+merged but the dialer VM is not proven current ($VM_HOLD_KIND: $VM_HOLD_REASON) — holding, NOT closing (ga-wye9vt)."
+                  bd -C "$BEAD_CITY" comment "$BEAD_ID" "$(printf 'Quality gate PASSED and branch %s merged to %s/%s (sha=%s) — but NOT closing (ga-wye9vt): this merge %s what runs on the dialer VM (%s), and the VM is %s: %s\n\n%s\n\nNo automatic re-query: this dispatcher does not ask the VM again for this bead. %s\n\nACTION: run `python3 %s --status` (read-only); once it prints STATUS: em dia, run `bd -C %s label remove %s delivery:pending-vm` and close this bead by hand. If the VM needs the deploy, that is manual (scripts/voicebot_vm_sync.py, wa-y0su67).' \
+                    "$BRANCH" "$RIG" "$DEFAULT_BRANCH" "$MERGE_SHA" "$VM_HOLD_TOUCH" "$VM_HOLD_DELTA" "$VM_HOLD_STATE" "$VM_HOLD_REASON" "$VM_HOLD_LABEL_NOTE" "$VM_HOLD_CEILING_NOTE" "$VM_HOLD_SCRIPT" "$BEAD_CITY" "$BEAD_ID")" 2>/dev/null || true
+                  ;;
+              esac
+            fi
+          fi
+          # SELFTEST-EXTRACT vm-hold-block: END
+          if [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ] && [ "$IS_VM_HOLD" != "1" ]; then
           # BUG/TASK, daemon-verified (or check skipped/not applicable/degraded)
           # → close it as before. bd list defaults to OPEN-only, so closing
           # removes the bead from EVERY open-work selector (Pilot Tier-1 bug &
@@ -8686,6 +9155,9 @@ $OPEN_SIBLINGS_FOR_CLOSE"
           log "Closing source bug/task $BEAD_ID (gate PASS + merged sha=$MERGE_SHA)."
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing" -q 2>/dev/null || true  # wa-qq33j: clear in-review state (PASS)
           _CLOSE_REASON="Quality gate PASSED — branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA, gate_run=$GATE_RUN_ID). Closed by autonomous dispatcher (ga-esbg)."
+          # ga-wye9vt: say on the close that the VM was NOT verified (contract absent). Its own line:
+          # gate-delivery-partial-scope.selftest.sh pins the literal above.
+          _CLOSE_REASON="$_CLOSE_REASON${VM_HOLD_CLOSE_NOTE:+ $VM_HOLD_CLOSE_NOTE}"
           # SELFTEST-EXTRACT daemon-soft-warn-close: BEGIN
           if [ -n "$DAEMON_SOFT_WARN" ]; then
             if [ "${DAEMON_SOFT_WARN_LABEL:-}" = "delivery:daemon-stale-locked" ]; then
@@ -8754,7 +9226,11 @@ $OPEN_SIBLINGS_FOR_CLOSE"
       #      delivery:partial from an earlier delivery (or whose labels could not
       #      be read) is exempt for the same reason — deliberately left open
       #      instead of closed over that hold, same gate:passed protection.
-      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ] && [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ]; then
+      #      ga-wye9vt: a bead held on the dialer VM (delivery:pending-vm) is
+      #      exempt for the same reason — deliberately left open instead of
+      #      closed over a VM that is not proven current, same gate:passed
+      #      protection.
+      if [ "$IS_STORY" != "1" ] && [ "$IS_PARTIAL" != "1" ] && [ "$IS_DAEMON_HOLD" != "1" ] && [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ] && [ "$IS_VM_HOLD" != "1" ]; then
         if _still_listed -t bug;        then RESPAWN_HITS="$RESPAWN_HITS pilot:open-bug"; fi
         if _still_listed -l tech-debt;  then RESPAWN_HITS="$RESPAWN_HITS pilot:open-tech-debt"; fi
       fi
@@ -11908,6 +12384,18 @@ if [ "${GATE_ADMITS_DONE:-0}" -gt 0 ] 2>/dev/null; then
   _would_be_added=$(( GATE_ADMITS_DONE * GATE_REVIEWERS_PER_RUN ))
   log "Multi-admit round ${GATE_ADMIT_ROUND} (${GATE_ADMITS_DONE} admit(s) so far): retired ga-309v3 add-back would have contributed +${_would_be_added} on top of LIVE_REVIEWERS=${LIVE_REVIEWERS} (not applied — ga-pqbn0: Step 0a-2's ga-wcd86 guard already counts this burst's own spawns correctly)."
 fi
+
+# ── ga-wye9vt: the 24h ceiling of the dialer-VM hold ──────────────────────────
+# A bug/task held on delivery:pending-vm (the PASS path's vm-hold-block) is never revisited, so
+# this is the part that comes back: it mails the Mayor ONCE for a hold that still stands after
+# the ceiling. Placed BEFORE Step 0b's "No queued markers. Exiting." on purpose — the one
+# sweep shape where nothing else runs is the empty queue, and a hold must be mailed whether or
+# not a marker is queued. It never admits work and never asks the VM; with no hold state on
+# disk it is a directory test. Same knob as the story side (ga-2kaan2).
+GATE_VM_CEILING_AFTER_S="${VOICEBOT_VM_PENDING_MAIL_AFTER_S:-86400}"
+case "$GATE_VM_CEILING_AFTER_S" in ''|*[!0-9]*) GATE_VM_CEILING_AFTER_S=86400 ;; esac
+gate_vm_hold_ceiling_sweep "$GC_CITY/.gc/runtime/voicebot-vm-hold-gate" "$(date +%s)" "$GATE_VM_CEILING_AFTER_S" \
+  || warn "gate_vm_hold_ceiling_sweep failed (non-fatal, ga-wye9vt)."
 
 # ── Step 0b: Find a queued marker ────────────────────────────────────────────
 # quality-gate-guard.sh claims, validates, derives author, and parks markers as
