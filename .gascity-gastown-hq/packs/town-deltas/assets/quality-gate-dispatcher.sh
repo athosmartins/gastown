@@ -7156,10 +7156,38 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # the literal in gate-dl3x9s-requeue-external.selftest.sh.
     # The helper returns GATE_REQUEUE_RESPECTED_RC when it respects an external
     # transition, and this file runs under `set -e`: capture the rc, never let it abort.
+    #
+    # ga-7vet0v: stamp the retry cooldown BEFORE the requeue, exactly as the FAIL path
+    # does (ga-a6etc2). Without it this marker — by now the OLDEST one, it just spent a
+    # whole verdict timeout in review — goes straight back to the head of the overdue
+    # tier (oldest-first, priority-blind, ga-ddm76) and is first in line for the next
+    # sweep: head-of-line blocking while the reviewer cannot start under load. The
+    # selection already drops a marker inside its cooldown from every tier, so the
+    # label is all that was missing. "Cooldown FIRST, requeue second": the marker is
+    # never `queued` without it, so no sweep can pick it up in the gap. The stamp only
+    # DELAYS a marker (it expires by itself, and an absent or expired label reads as "no
+    # cooldown"), so it can never park one; a stamp that cannot be written is logged by
+    # the helper and the requeue goes ahead without it — today's behaviour, never a block.
+    # The quota-stop requeue below is left alone: the ga-cw4pm headroom gate already
+    # holds the whole queue until the window resets.
+    # The words below come from what the helper RETURNED, not from the intent.
+    _CD_RC=0
+    gate_retry_cooldown_stamp "$MARKER_ID" || _CD_RC=$?
+    case "$_CD_RC" in
+      0) _CD_NOTE="It sits behind a ${GATE_RETRY_COOLDOWN_SECONDS}s retry cooldown (gate:retry-cooldown-until), so it does not return to the head of the queue and starve the other markers (ga-7vet0v)." ;;
+      2) _CD_NOTE="NO retry cooldown was applied (GATE_RETRY_COOLDOWN_SECONDS=0 disables it), so it may be picked again on the very next sweep (ga-7vet0v)." ;;
+      *) _CD_NOTE="WITHOUT a retry cooldown (the gate:retry-cooldown-until label write FAILED), so it may be picked again on the very next sweep (ga-7vet0v)." ;;
+    esac
     _RQ_RC=0
     gate_requeue_respecting_external "$MARKER_ID" "queued" "dispatching" || _RQ_RC=$?
     _RQ_NOTE="re-queued for a fresh attempt"
     gate_requeue_narrate "$_RQ_RC"
+    # Not requeued (an external transition won, or the write failed): drop the stamp just
+    # written, or it would ride along on a marker the Mayor parked and hold it out of the
+    # selection after a manual requeue — same rule as the FAIL path's else-branch.
+    if [ "$_RQ_SKIPPED" = "1" ] && [ "$_CD_RC" = "0" ]; then
+      gate_retry_cooldown_clear "$MARKER_ID"
+    fi
     # ga-n2cpe: every OTHER terminal path in this function clears gate:reviewing
     # on the source bead (wa-qq33j) — this one didn't. A reviewer that died
     # before ever ACKing (stale_async_start drain during startup, ga-flfo/
@@ -7173,7 +7201,7 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     if [ "$_RQ_SKIPPED" = "1" ]; then
       bd -C "$GC_CITY" comment "$MARKER_ID" "${_RQ_KIND} NOT applied: ${_RQ_MK_CAUSE}, but ${_RQ_WHY} (ga-dl3x9s)." 2>/dev/null || true
     else
-      bd -C "$GC_CITY" comment "$MARKER_ID" "${_RQ_KIND}: ${_RQ_MK_OK_CAUSE} Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers." 2>/dev/null || true
+      bd -C "$GC_CITY" comment "$MARKER_ID" "${_RQ_KIND}: ${_RQ_MK_OK_CAUSE} Marker re-queued; the ga-cw4pm headroom gate will admit a fresh attempt with new reviewers. ${_CD_NOTE}" 2>/dev/null || true
     fi
     if [ "$GATE_RUN_ID" != "unknown" ]; then
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate run paused (${_RQ_RUN_KIND}): ${_RQ_RUN_CAUSE}; marker $MARKER_ID ${_RQ_NOTE}. No verdict recorded; this is NOT a FAIL." 2>/dev/null || true
