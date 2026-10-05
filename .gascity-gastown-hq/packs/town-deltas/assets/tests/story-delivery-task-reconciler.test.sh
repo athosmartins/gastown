@@ -374,6 +374,37 @@ run_block "$PENDING_RESTART_JSON" 0 ""
   && ok "T13 no comment posted (already announced in full by the dispatcher when it set the label — avoids the ga-s1qb2 per-sweep comment-spam anti-pattern)" || nok "T13 spurious comment" "$LAST_BD"
 [ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T13 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T13 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
 
+# ── T14 (ga-1jv274): delivery:pending-vm → veto, NOT closed even though merge ──
+# verification WOULD succeed (same id/commit as T1) ─────────────────────────
+# ga-2kaan2's hold: the merge is in main but the dialer VM does not run the
+# voicebot code yet, so the bead must not be closed. Only the STORY pipeline sets it
+# today (Step 6a), so a non-story bead cannot carry it yet — but Step 1b closes on
+# merge proof alone, and a hold it does not know is a hold it overrides (T13 is the
+# same class, delivery:pending-restart). Step 1b still does not ASK the VM (see its
+# header: the non-story path closes in quality-gate-dispatcher.sh, not here); it only
+# refuses to close what carries the hold.
+#
+# The fixture carries the old `updated_at` on purpose (see the ga-7x7g2 block above): T13's
+# fixture has none and gets away with it because its veto runs BEFORE the freshness guard.
+# Without `updated_at` this case would `continue` at that guard and pass on a build with no
+# veto at all — for the wrong reason. With it, the bead on a build without the veto reaches
+# the close, which is what makes this test fail there.
+PENDING_VM_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","delivery:pending-vm","lane:small"]}]'
+run_block "$PENDING_VM_JSON" 0 ""
+! echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
+  && ok "T14 PENDING_VM_VETO → bd close NOT called (the VM hold wins over merge proof)" || nok "T14 spurious-close despite delivery:pending-vm" "$LAST_BD"
+! echo "$LAST_BD" | grep 'label remove ga-test-task.*delivery:pending-vm' >/dev/null \
+  && ok "T14 delivery:pending-vm label left untouched (only a proven-em-dia VM releases it, not this reconciler)" || nok "T14 label wrongly removed" "$LAST_BD"
+! echo "$LAST_BD" | grep "comment ga-test-task" >/dev/null \
+  && ok "T14 no comment posted (the hold was announced when it was set — no per-sweep comment spam, ga-s1qb2)" || nok "T14 spurious comment" "$LAST_BD"
+[ "${RUN_TASK_COUNT:-0}" = "1" ] && ok "T14 TASK_COUNT=1 (candidate found, but kept — not the same as acted)" || nok "T14 TASK_COUNT" "got=${RUN_TASK_COUNT:-UNSET}"
+# Control: the SAME bead without the hold label closes (this is what makes the veto above
+# the cause of "not closed" rather than something else in the fixture).
+PENDING_VM_CONTROL_JSON='[{"id":"ga-test-task","title":"fix cloudflared DNS reconciler","status":"in_progress","issue_type":"task","updated_at":"2020-01-01T00:00:00Z","labels":["gate:passed","lane:small"]}]'
+run_block "$PENDING_VM_CONTROL_JSON" 0 ""
+echo "$LAST_BD" | grep "close ga-test-task" >/dev/null \
+  && ok "T14 control: same bead WITHOUT delivery:pending-vm is closed (the veto, not the fixture, is what holds it)" || nok "T14 control did not close — the fixture itself is not reaching the close" "$LAST_BD"
+
 echo ""
 echo "story-delivery task-reconciler tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

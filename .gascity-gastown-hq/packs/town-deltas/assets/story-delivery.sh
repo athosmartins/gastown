@@ -1153,6 +1153,17 @@ log "Found $COUNT story/stories awaiting delivery"
 #
 # Skipped in forced single-story mode (FORCE_STORY_ID set).
 #
+# Dialer VM (ga-2kaan2, decided in ga-1jv274): this step does NOT ask the VM whether a merged
+# voicebot change is live (Step 6a does that for stories) and does not set or release
+# delivery:pending-vm — it only refuses to close a bead that already carries it (veto below).
+# Why not the full gate here: of the 21 non-story beads that touched the voicebot in 120 days,
+# 12 were closed by quality-gate-dispatcher.sh (ga-esbg), 0 by this step, 5 by hand, 4 are not
+# closed — so the gate belongs in the dispatcher (ga-wye9vt), and a gate here would have
+# protected none of them. This step also has no recorded BASE sha for
+# voicebot_vm_delta_touched (it only learns "a commit for this bead id is in origin", and the
+# helper rules out a guessed MERGE_SHA^), so it could only answer "unknown" and would hold
+# every non-story bead in the WA rig.
+#
 # IMPORTANT: uses --status open,in_progress because stranded task beads are
 # typically in_progress (builder claimed them), not open. bd list default shows
 # only open; without --status open,in_progress they are invisible.
@@ -1284,6 +1295,23 @@ if [ -z "$FORCE_STORY_ID" ]; then
       TASK_PENDING_RESTART=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:pending-restart"])) then "1" else "0" end' 2>/dev/null || echo "0")
       if [ "$TASK_PENDING_RESTART" = "1" ]; then
         log "Task reconciler: $TASK_BEAD_ID has delivery:pending-restart (daemon verification withheld closure, ga-l7n3v) — NOT closing; checking next candidate this sweep."
+        continue
+      fi
+
+      # ga-1jv274 (follow-up of ga-2kaan2): delivery:pending-vm is the dialer-VM
+      # hold (Step 6a) — the merge is in main but the VM does not run that
+      # voicebot code yet. This reconciler closes on merge proof alone, so a
+      # hold it does not know about is a hold it overrides, same as
+      # delivery:pending-restart above. Veto-only, for the same reasons: do not
+      # close, do not relabel (only a VM proven em dia releases it, and that
+      # check is not made here — see this step's header), do not comment (the
+      # hold was announced when it was set; a comment per ~5min sweep is the
+      # ga-s1qb2 anti-pattern). Unlike the pending-restart read above, a jq
+      # failure here reads as HELD ("1"), not "no hold": labels that could not
+      # be read are not evidence the hold is absent (error != empty).
+      TASK_PENDING_VM=$(echo "$TASK_BEAD" | jq -r 'if ((.labels // []) | contains(["delivery:pending-vm"])) then "1" else "0" end' 2>/dev/null || echo "1")
+      if [ "$TASK_PENDING_VM" = "1" ]; then
+        log "Task reconciler: $TASK_BEAD_ID has delivery:pending-vm (dialer VM does not run the merged voicebot code yet, ga-2kaan2) — NOT closing; checking next candidate this sweep."
         continue
       fi
 
@@ -3817,9 +3845,15 @@ fi
 # gate:passed stay), merged-bead-janitor's delivery-active guard and
 # approved-state-reconciler's delivery-retry rule both know delivery:pending-vm.
 # Consumers in the WA repo (outside this tree) that do not mention delivery:pending-vm at
-# all: painel_visibilidade.py and autoheal_escalation_watch.py (DELIVERY_LIVE /
-# DELIVERY_GAVE_UP). What a held story looks like to them is NOT established here — that is
-# the follow-up ga-1jv274, so this list of selectors is not to be read as complete.
+# all: painel_visibilidade.py and autoheal_escalation_watch.py. Checked (ga-1jv274): a held
+# story keeps only story:approved + gate:passed + delivery:pending-vm (the hold drops
+# delivery:running), so autoheal still sees it live through GATE_LIVE (gate:passed), but the
+# painel's rota-vazia allowlist (_ROTA_VAZIA_DELIVERY_ACTIVE_LABELS) does not — past its 15min
+# grace the story reads as unrouted. Fix lives in the WA repo, tracked in wa-oel78x (it has to
+# land with or before wa-y0su67, or the first held story trips the painel).
+# Non-story beads: Step 1b vetoes a close while delivery:pending-vm is on the bead, but it never
+# SETS or RELEASES the hold and never asks the VM (see its header). quality-gate-dispatcher.sh,
+# which closes most non-story beads, does not ask either: ga-wye9vt.
 VM_HOLD_DIR="$GC_CITY/.gc/runtime/voicebot-vm-hold"
 VM_HOLD_FILE="$VM_HOLD_DIR/$STORY_ID.state"
 VM_SCRIPT="${VOICEBOT_VM_SYNC_SCRIPT:-$RUNTIME_DIR/scripts/voicebot_vm_sync.py}"
