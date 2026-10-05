@@ -1,7 +1,9 @@
 # Pool Claude account as data (ga-8hcnvb.1)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
-changes Claude account by itself when the one in use hits its limit, and goes back when that account renews.
+changes Claude account by itself when the one in use hits its limit, and goes back to the account it left once that
+account has renewed **and a usage collection taken after the renewal confirms it ranks ahead** — so up to about one
+collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a fresh collection").
 No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault as
 `claude-oauth-token-<email>`). Mayor and crews are **not** touched (phase 2).
 
@@ -11,13 +13,17 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
  claude-pool-account.py  (launchd, every 60 s, single instance)
    probe the ACTIVE account (1-token haiku call, anthropic-ratelimit-unified-* headers)
      rejected / 429  -> failover: next account of ordem_das_contas() that answers a probe; store the reset time
-     answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed
-                        and which outranks the active one — no probe of it on the way back
+     answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed,
+                        whose usage reading in the usage store was taken AFTER that reset, and which that reading
+                        ranks ahead of the active one — no probe of it on the way back
                         (not to one whose KEY was refused, 401/403: see Known limits)
+                        a reading from BEFORE the reset is no evidence: the entry is kept and the log says it waits
      cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
    vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves
    a key the vault does not return for the active account is NOT "its key is gone": the item is the second witness
-   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"
+   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (the POOL's item only — never the plain
+                             "Claude Code-credentials" of Mayor and the crews: a setup-token there kills their Remote
+                             Control, so write_item refuses any service name that is not "...-<8 hex>")
                              (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
@@ -100,13 +106,39 @@ first, delete last, and only when restarting the pool is acceptable.
   harness (`claude-pool-account.live-accept.sh`) is where to check it.
 - A key the API **refuses** (401/403) is registered for an hour like a limit, but at that time it is **not** failed back
   to: the failback does not probe, and a key that is still refused would be written into the item and break every pool
-  session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry and probed
-  the normal way when a later failover reaches it. Consequence: after such a key is fixed the pool does not return to
+  session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry (with a
+  `dropped: its key was refused` log line) and probed the normal way when a later failover reaches it. Consequence: after such a key is fixed the pool does not return to
   that account on its own; it moves there the next time the account in use is rejected.
   The same rule covers an `exhausted` entry that does not say why it was registered (`why` missing or not
   `rejected`/`invalid` — the daemon always records it, so only a state file edited by hand or written by something else
   lacks it): only an entry that says `rejected` is failed back to. The other is dropped at its time, with one `WARN`
-  (`does not say why it was registered`), and probed the normal way if a later failover reaches it.
+  (`does not say why it was registered`) and a `dropped:` line, and probed the normal way if a later failover reaches it.
+- **The way back waits for a fresh collection.** The order of use comes from the usage store
+  (`claude_usage.json`), which the collector rewrites every 30 min (`com.urblink.claude-usage-collector`,
+  `StartInterval=1800`) while this daemon runs every 60 s: at the reset tick the order can be half an hour old, and a
+  reading taken *before* the reset says nothing about the account *after* it. So an expired entry — the only evidence
+  that the account renewed — is never judged by the order alone. The daemon reads each account's `last_ok_at` (the
+  time its numbers were real) from the store, **before** asking the library for the order, and acts on an entry only if
+  that account has a good reading (not `stale`, `ok` not false, a timestamp with a zone that is not ahead of the
+  clock) taken *after* its stored reset:
+  - no such reading → the entry is **kept**, one INFO line per run says so
+    (`waiting for a usage collection of <account> taken after its reset … Entry kept`, with the reason: the last good
+    reading predates the reset / the last collection failed / no row / no usable `last_ok_at` / stamped ahead of the
+    clock) and the next run asks again. The pool stays on the account in use meanwhile — the cost of not guessing;
+  - a good reading after the reset → the order decides: ranked ahead of the active account → failback; otherwise the
+    entry is dropped with a line that says it ranks behind the active one.
+  An account whose collection keeps failing is therefore never gone back to (and its entry sits in the registry, one
+  log line per run) until the collector reads it again; it is still probed the normal way if a failover reaches it. A
+  collector that stopped altogether leaves every expired entry waiting, and nothing here alerts on it: the only trace is
+  that log line (the divergence alert of ga-8hcnvb.3 is about the account in use, not about the collector). The library's `_faixa` ignores the session
+  window's own `resets_at` (that is where a stale "esgotada" comes from); it is not changed here, the daemon just does
+  not rely on the order for what the order cannot know.
+- **Nothing leaves the registry in silence.** Every removal of an exhausted entry has a `dropped:` line with the reason
+  (the active account answered; a refused key at its time; no `why`; ranked behind the active account on a fresh
+  reading; ranked behind a better recovered account that took the pool; the account became the pool's account). When the
+  Keychain write of a failback is refused, the recovered accounts that were **not tried** stay in the registry too
+  (the log counts them); when a recovered account's key does not come from the vault that run, its entry stays and the
+  next candidate is still tried.
 - The daemon depends on `whatsapp_automation/lib/claude_account_pool.py` for the order and the vault read
   (`CLAUDE_POOL_ACCOUNTS_LIB` overrides the path). If it is missing or fails to import the daemon does nothing.
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just

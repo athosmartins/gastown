@@ -12,11 +12,21 @@ One run (launchd StartInterval, single instance via flock):
   * the active account is REJECTED    -> failover: first account of the order that is not known-exhausted and
     (HTTP 429 / a *-status of "rejected")   answers a probe. The rejection's reset time is stored.
   * the active account answers        -> stay. Failback only to an account that WE saw exhausted (rate-limited, not
-                                         key-refused), whose stored reset time has passed, and which outranks the
-                                         active one in the order — with NO probe of it (Mayor 04/10: no balance
-                                         probe on the way back; if it has not really renewed, its 429 simply
+                                         key-refused), whose stored reset time has passed, whose usage reading in
+                                         the usage store was taken AFTER that reset, and which that fresh reading
+                                         ranks ahead of the active one — with NO probe of it (Mayor 04/10: no
+                                         balance probe on the way back; if it has not really renewed, its 429 simply
                                          triggers the failover again).
   * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> change NOTHING. Error != exhausted.
+
+The order of use comes from the usage store, which the collector rewrites every ~30 min while this daemon runs every
+minute: at the reset tick the order can be half an hour old, and a reading taken BEFORE the reset says nothing about the
+account AFTER it ("not known" is not "does not outrank"). So an expired entry is never judged by the order alone:
+  * no good reading of that account taken after its reset -> the entry is KEPT and the log says it is waiting for the
+    next collection; the next run asks again;
+  * a good reading taken after the reset                  -> the order decides: fail back if the account ranks ahead
+    of the active one, otherwise drop the entry - with a log line saying why.
+Every removal of an entry from the registry has a log line with its reason; nothing leaves it silently.
 
 The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny haiku HTTP
 call, and the answer is read from the anthropic-ratelimit-unified-* headers. The probe never follows a redirect (the
@@ -67,6 +77,8 @@ EXPIRES_AT_MS = 4102444800000     # 2100-01-01: the blob carries no refresh toke
 MIN_EPOCH = 1_000_000_000         # 2001-09 .. 2100-01-01: what can be an epoch AT ALL. Whether a RESET time is believed is
 MAX_EPOCH = 4_102_444_800         # decided against the clock, by _usable_reset: that is the real bound, this is only the floor.
 MAX_RETRY_AFTER_S = 31 * 86400    # the furthest ahead ANY reset time (header or retry-after) is believed, from now
+CLOCK_SKEW_S = 300                # a usage reading stamped further ahead than this has not been taken yet: it is not a reading
+POOL_ITEM_RE = re.compile(r"Claude Code-credentials-[0-9a-f]{8}")   # the POOL's item. The bare "Claude Code-credentials" is Mayor's/crews'
 DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py"
 DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
 
@@ -114,7 +126,11 @@ def cred_dir() -> str:
 
 
 def item_service() -> str:
-    # claude names the Keychain item "Claude Code-credentials-" + first 8 hex of sha256(CLAUDE_SECURESTORAGE_CONFIG_DIR)
+    # claude names the Keychain item "Claude Code-credentials-" + first 8 hex of sha256(CLAUDE_SECURESTORAGE_CONFIG_DIR).
+    # This daemon touches THAT item only - the pool's, hashed from a fixed directory only pool sessions are pointed at. The
+    # default item, plain "Claude Code-credentials" (no suffix), is Mayor's and the crews': a setup-token written there kills
+    # their Remote Control (Athos 05/10). The suffix is always appended here so the two names cannot meet, and write_item
+    # refuses any service name that is not "-<8 hex>" (POOL_ITEM_RE) on top of that.
     return "Claude Code-credentials-" + hashlib.sha256(cred_dir().encode()).hexdigest()[:8]
 
 
@@ -294,6 +310,9 @@ def write_item(user: str, token: str) -> bool:
     if not valid_user(user):   # run_once checks this first; here too because this is where the command line is built
         log("ERROR", "refusing to build a security command for an account name that is not a plain login name")
         return False
+    if not POOL_ITEM_RE.fullmatch(item_service()):   # the writer is where a wrong item would do damage: never Mayor's/crews' default one
+        log("ERROR", "refusing to write a Keychain item that is not the pool's hashed one")
+        return False
     blob ={"claudeAiOauth": {"accessToken": token, "expiresAt": EXPIRES_AT_MS,
                               "scopes": ["user:inference"], "subscriptionType": None}}
     hexdata = json.dumps(blob).encode().hex()
@@ -409,6 +428,47 @@ def order_of_use(lib) -> List[str]:
         return []
 
 
+NO_ROW = "the usage store has no row for it (or could not be read)"
+
+
+def usage_readings(lib, t: float) -> Dict[str, Tuple[Optional[float], str]]:
+    """email -> (epoch at which the usage store's numbers for that account were REAL, "")  or  (None, why there is no such time).
+
+    The order of use (e-mails only) cannot say how old the readings behind it are, and the collector that writes them runs
+    every ~30 min. `last_ok_at` is the time the numbers were real: on a good read it equals `collected_at`, and a failed read
+    carries the old numbers forward flagged `stale` / ok=false with the OLD last_ok_at (lib/claude_usage_collector.py). The
+    library bands those readings 'unknown' whatever they say, so they are no reading here either. A time with no zone, or one
+    that is still ahead of the clock, is not a time we can compare: unknown. An account missing from the dict has no row.
+
+    Read this BEFORE asking the library for the order: a collection that lands in between can only make the order newer than
+    this evidence, never older, so the mistake that remains is the cautious one (an entry waits one more run)."""
+    try:
+        accts = json.loads(Path(lib.USAGE_STORE).read_text()).get("accounts") or []
+    except (AttributeError, TypeError, OSError, ValueError, RecursionError):   # no USAGE_STORE on the library, unreadable, not JSON / too deep, not an object
+        return {}
+    out: Dict[str, Tuple[Optional[float], str]] = {}
+    for c in accts:
+        if not isinstance(c, dict) or not isinstance(c.get("email"), str) or not c["email"]:
+            continue
+        email = c["email"]
+        if c.get("stale") or c.get("ok") is False:
+            out[email] = (None, "its last collection failed (the reading is carried over from an older one)")
+            continue
+        raw = c.get("last_ok_at")
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            at = _sane_epoch(dt.timestamp()) if dt.tzinfo is not None else None
+        except (AttributeError, ValueError, OverflowError, OSError):   # not a string, not ISO-8601, out of range
+            at = None
+        if at is None:
+            out[email] = (None, "its reading has no usable last_ok_at")
+        elif at > t + CLOCK_SKEW_S:
+            out[email] = (None, f"its reading is stamped {_iso(at)}, ahead of the clock")
+        else:
+            out[email] = (at, "")
+    return out
+
+
 class Keys:
     """The vault, read lazily and at most once per account per run. `token_da_conta` returns None both for 'no key
     registered' and for 'vault unreadable just now', so a None here means 'no key came back', never 'there is no key':
@@ -455,8 +515,9 @@ def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float
         log("WARN", f"item written for {email} (security reported success) but the read-back was unreadable - switch unverified")
     prev = st.get("current")
     st.update(current=email, fingerprint=fingerprint(token), since=t, reason=reason, previous=prev)
-    st.get("exhausted", {}).pop(email, None)
     log("INFO", f"SWITCH {prev or '-'} -> {email} fp={fingerprint(token)}: {reason}")
+    if st.get("exhausted", {}).pop(email, None) is not None:
+        log("INFO", f"exhausted entry for {email} dropped: it is the pool's account now")
     return True
 
 
@@ -536,7 +597,67 @@ def current_credential(st: dict, keys: Keys, order: List[str], user: str, cur: s
     return "gone", None
 
 
-def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
+def drop_entry(ex: dict, email: str, why: str) -> None:
+    """The only way an entry leaves the exhausted registry once it is expired: with a line that says why."""
+    ex.pop(email, None)
+    log("INFO", f"exhausted entry for {email} dropped: {why}")
+
+
+def failback(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Optional[float], str]], user: str, cur: str, t: float) -> None:
+    """The active account answers. Go back to an account WE saw rate-limited ('rejected') whose stored reset time has passed -
+    but only on evidence of three things, and each of them can be 'could not tell':
+
+      1. it renewed        - the stored reset time has passed (no probe: Mayor 04/10; if it has not, its 429 sends us back);
+      2. where it ranks    - the order of use says it comes before the active account; and that order is only worth what its
+                             reading is worth, so the account needs a good usage reading taken AFTER its reset (usage_readings).
+                             A reading from before the reset, a failed collection, no row: the state AFTER the reset is not
+                             known, so the entry is KEPT, the log says what it waits for, and the next run asks again;
+      3. its key           - the vault gave it back this run (it is asked only for accounts that could be switched to).
+
+    An entry is dropped only when something is KNOWN against it, and each drop says what: a refused key (401/403) is not a limit
+    that renews (an unprobed failback would put a still-refused key in the item); an entry that does not say why it was
+    registered ('we do not know why' must not read as 'it was a limit that renews'); a fresh reading that ranks it after the
+    active account; a better ranked recovered account that took the pool. Everything not decided stays in the registry."""
+    ex = st.get("exhausted")
+    if not isinstance(ex, dict):
+        return
+    cur_pos = order.index(cur) if cur in order else len(order)   # an account missing from the order is ranked last (INFO in current_credential)
+    ready: List[str] = []
+    for e in [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t]:
+        why, reset = ex[e].get("why"), ex[e]["reset_epoch"]
+        if why == "invalid":
+            drop_entry(ex, e, "its key was refused (401/403), which is not a limit that renews - it is probed the normal way if a later failover reaches it")
+        elif why != "rejected":
+            log("WARN", f"state: exhausted entry for {e} does not say why it was registered - not failed back to")
+            drop_entry(ex, e, "it does not say why it was registered - it is probed the normal way if a later failover reaches it")
+        else:
+            at, why_not = readings.get(e, (None, NO_ROW))
+            if at is None or at <= reset:
+                log("INFO", f"waiting for a usage collection of {e} taken after its reset ({_iso(reset)}) before deciding whether to go "
+                            f"back to it: {why_not or 'the last good reading is from ' + _iso(at)}. Entry kept")
+            elif e not in order:
+                log("WARN", f"cannot tell where {e} ranks: it has a reading but is not in the order of use this run. Entry kept")
+            elif order.index(e) >= cur_pos:
+                drop_entry(ex, e, f"the usage collected {_iso(at)}, after its reset ({_iso(reset)}), ranks it behind {cur}, which is in use")
+            else:
+                ready.append(e)
+    ready.sort(key=order.index)
+    for i, e in enumerate(ready):
+        key = keys.token(e)
+        if not key:
+            log("WARN", f"failback to {e} not done: its key did not come from the vault this run - entry kept for the next run")
+            continue
+        if switch_to(st, user, e, key, f"failback: {e} passed its stored reset time and the usage collected after it ranks it ahead of {cur}", t):
+            for lower in ready[i + 1:]:
+                drop_entry(ex, lower, f"recovered, but ranks behind {e}, which took the pool - it is probed the normal way if a later failover reaches it")
+        else:
+            # The write failed, so the failback did NOT happen. A write that is refused is refused for the next account too:
+            # stop here, and every recovered account not tried (this one included) stays in the registry for the next run.
+            log("WARN", f"failback to {e} not done (the pool item could not be switched) - entry kept, and so are the {len(ready) - i - 1} not tried")
+        break
+
+
+def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Optional[float], str]], user: str, t: float) -> None:
     sanitize_state(st, t)
     cur = st.get("current")
     if not cur:
@@ -560,42 +681,9 @@ def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
     else:
         # active account answers. What it just answered beats anything stored about it.
         ex = st.get("exhausted", {})
-        ex.pop(cur, None)
-        # Failback: only to an account WE saw exhausted whose stored reset time has passed and which outranks the active
-        # one. No probe (the Mayor revoked the confirmation probe): if it has not really renewed, its 429 sends us right
-        # back through the branch above. A REFUSED KEY (401/403) is not a limit that renews: failing back to it unprobed
-        # would put a still-refused key into the item - every pool session broken until the next run, hourly. It is
-        # judged (dropped) at its time like the others, and is probed the normal way when a later failover reaches it.
-        # The same goes for an entry that does not say WHY it was registered: register_exhausted always records it
-        # ("rejected" | "invalid"), so a missing or other value means the state was edited or written by something else, and
-        # 'we do not know why' must not read as 'it was a limit that renews' - only an entry that says "rejected" is failed back to.
-        # The vault is asked only for the accounts that could be switched to; one whose key does not come back is KEPT
-        # (not judged): the failback is tried again on a run that has its key.
-        expired = [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t]
-        recovered = [e for e in expired if ex[e].get("why") == "rejected"]
-        for e in expired:
-            if ex[e].get("why") not in ("rejected", "invalid"):
-                log("WARN", f"state: exhausted entry for {e} does not say why it was registered - not failed back to "
-                            "(dropped; probed the normal way if a later failover reaches it)")
-        kept = set()
-        for e in [e for e in order[:order.index(cur) if cur in order else len(order)] if e in recovered]:
-            key = keys.token(e)
-            if not key:
-                kept.add(e)
-                log("WARN", f"failback to {e} not done: its key did not come from the vault this run - kept for the next run")
-                continue
-            if not switch_to(st, user, e, key, f"failback: {e} reached its stored reset time", t):
-                kept.add(e)   # the write failed: the failback did NOT happen, so it must be tried again next run
-                log("WARN", f"failback to {e} not done (the pool item could not be switched) - kept for the next run")
-            break
-        for e in expired:
-            if e not in kept:
-                # Every expired entry that is not in `kept` is dropped at its time - including ones nothing was done for: a
-                # refused key, an entry that does not say why it was registered, an account that does not outrank the current
-                # one, and a recovered account the loop never reached because it stops after the first switch attempt. Those
-                # are ordinary candidates again, probed the normal way if a later failover reaches them; a later rejection
-                # re-registers them with a fresh time.
-                ex.pop(e, None)
+        if ex.pop(cur, None) is not None:
+            log("INFO", f"exhausted entry for {cur} dropped: it answered the probe, which beats what was stored about it")
+        failback(st, keys, order, readings, user, cur, t)
     now_cur = st.get("current")
     if kind == "item" and now_cur == cur:
         return   # the key of the decision never came from the vault and the item IS that key: nothing to heal against
@@ -635,6 +723,7 @@ def run_once() -> int:
     lib = load_accounts_lib()
     if lib is None:
         return 0
+    readings = usage_readings(lib, now())   # BEFORE the order - see usage_readings
     order = order_of_use(lib)
     if not order:
         log("WARN", "no account in the order of use (usage store unreadable or empty) - nothing changed")
@@ -643,7 +732,7 @@ def run_once() -> int:
     if st is None:
         return 1
     before = json.dumps(st, sort_keys=True)
-    decide(st, Keys(lib), order, user, now())
+    decide(st, Keys(lib), order, readings, user, now())
     if json.dumps(st, sort_keys=True) != before:
         publish_state(st)
     return 0

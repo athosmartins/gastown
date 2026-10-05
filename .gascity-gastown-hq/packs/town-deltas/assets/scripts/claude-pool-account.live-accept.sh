@@ -52,13 +52,18 @@ TOK_EXH="$(secret "claude-oauth-token-$EMAIL_EXH")" || { echo "vault: no key for
 fp() { printf '%s' "$1" | shasum -a 256 | cut -c1-8; }
 echo "OK account fp=$(fp "$TOK_OK")   EXH account fp=$(fp "$TOK_EXH")   scratch item=$SVC"
 
-usage_fixture() { # usage_fixture <file> <first-email> <second-email>   (both with balance; first renews earlier)
-  "$PY" - "$1" "$2" "$3" <<'EOF'
+usage_fixture() { # usage_fixture <file> <first-email> <second-email> [reading-epoch]   (both with balance; first renews earlier)
+  # Both rows carry a GOOD reading stamped last_ok_at = <reading-epoch> (default: now), as the real collector writes it: the daemon
+  # fails back only on a reading taken AFTER the stored reset, so the failback step must say when its 'collection' happened.
+  "$PY" - "$1" "$2" "$3" "${4:-$(date +%s)}" <<'EOF'
 import json, sys
-f, a, b = sys.argv[1:4]
-accts = [{"email": e, "weekly_all": {"percent": 10, "resets_at": "203%d-01-01T00:00:00+00:00" % i}, "session": {"percent": 5}}
+from datetime import datetime, timezone
+f, a, b, at = sys.argv[1:5]
+iso = datetime.fromtimestamp(float(at), timezone.utc).isoformat()
+accts = [{"email": e, "ok": True, "stale": False, "collected_at": iso, "last_ok_at": iso,
+          "weekly_all": {"percent": 10, "resets_at": "203%d-01-01T00:00:00+00:00" % i}, "session": {"percent": 5}}
          for i, e in enumerate([a, b])]
-json.dump({"accounts": accts}, open(f, "w"))
+json.dump({"updated_at": iso, "accounts": accts}, open(f, "w"))
 EOF
 }
 daemon() { # daemon [ENV=val...]   (state/item are the scratch ones; probe URL only if MOCK_URL is exported)
@@ -149,7 +154,8 @@ ask "Reply with exactly: BRAVO"
 if pane 14 | grep -qiE "limit|usage"; then ok "P3.3 the SAME live session now hits the EXH account's limit error — switched with no restart"
 else bad "P3.3 no limit message after the switch"; pane 12; fi
 
-echo "   >>> stored reset time passes; daemon failback (no probe of the recovered account)"
+echo "   >>> stored reset time passes, the collector reads the usage again 30 s after it; daemon failback (no probe of the recovered account)"
+usage_fixture "$W/usage.json" "$EMAIL_OK" "$EMAIL_EXH" $((RESET + 30))
 daemon CLAUDE_POOL_NOW=$((RESET + 60)) >/dev/null 2>&1
 [ "$(jget current)" = "$EMAIL_OK" ] && ok "P3.4 daemon failed back to the OK account" || bad "P3.4 current='$(jget current)'"
 echo "   waiting 40 s"; sleep 40

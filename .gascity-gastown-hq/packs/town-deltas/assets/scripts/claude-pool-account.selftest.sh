@@ -251,20 +251,45 @@ new_d() { # fresh daemon world with all three accounts allowed
   : > "$D/probes.log"; echo '{}' > "$D/srv.json"
   local i=0 e
   for e in "${EMAILS[@]}"; do printf '%s' "$(tok_of "$e")" > "$D/vault/$e"; set_srv "$e" 200 "$HDR_OK"; done
-  "$PY3" - "$D/usage.json" <<'EOF'
+  # The default usage store: all three accounts 'com saldo' AND with a good reading stamped last_ok_at, as the real collector
+  # writes it. `_selftest_fresh` marks it as the store run_d re-stamps (see restamp_store); a store a scenario writes itself has
+  # no such key and is never touched.
+  "$PY3" - "$D/usage.json" "$NOW_BASE" <<'EOF'
 import json, sys
-accts = [{"email": e, "weekly_all": {"percent": 10, "resets_at": "203%d-01-01T00:00:00+00:00" % i}, "session": {"percent": 5}}
+from datetime import datetime, timezone
+iso = datetime.fromtimestamp(float(sys.argv[2]) - 1, timezone.utc).isoformat()
+accts = [{"email": e, "ok": True, "stale": False, "collected_at": iso, "last_ok_at": iso,
+          "weekly_all": {"percent": 10, "resets_at": "203%d-01-01T00:00:00+00:00" % i}, "session": {"percent": 5}}
          for i, e in enumerate(["a@t.test", "b@t.test", "c@t.test"])]
-json.dump({"accounts": accts}, open(sys.argv[1], "w"))
+json.dump({"_selftest_fresh": True, "updated_at": iso, "accounts": accts}, open(sys.argv[1], "w"))
 EOF
   "$PY3" "$W/mock_api.py" "$D/srv.json" "$D/probes.log" "$D/port" & SRV_PID=$!
   local n=0; while [ ! -s "$D/port" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
   export FAKE_KC="$D/kc" VAULT="$D/vault"
 }
+# The scenarios written before the usage store carried reading times all assume a store that never lags the clock. restamp_store
+# keeps that true for the DEFAULT store (the one marked `_selftest_fresh`): before every run its readings are stamped one second
+# before that run's clock, i.e. 'the collector ran just now'. The scenarios that are about a store that LAGS (B45+) write their
+# own store without the mark, and this leaves it alone.
+restamp_store() { # restamp_store <clock epoch; empty = the real clock>
+  [ -f "$D/usage.json" ] || return 0
+  "$PY3" - "$D/usage.json" "${1:-$(date +%s)}" <<'EOF'
+import json, sys
+from datetime import datetime, timezone
+try: d = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+if not (isinstance(d, dict) and d.get("_selftest_fresh")): sys.exit(0)
+iso = datetime.fromtimestamp(float(sys.argv[2]) - 1, timezone.utc).isoformat()
+d["updated_at"] = iso
+for a in d.get("accounts", []): a["collected_at"] = a["last_ok_at"] = iso
+json.dump(d, open(sys.argv[1], "w"))
+EOF
+}
 run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean environment)
   local envs=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
+  restamp_store "${NOW_OVERRIDE-$NOW_BASE}"
   env -i HOME="$D/home" USER=athos PATH="$BB:/usr/bin:/bin" GC_CITY_PATH="$D/city" FAKE_KC="$D/kc" VAULT="$D/vault" \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
@@ -310,6 +335,7 @@ st = json.load(open(p)); exec(code); json.dump(st, open(p, "w"))
 EOF
   }
   seeded() { new_d; run_d -- run-once; }   # world where a is the seeded account
+  LOG="$D/city/.gc/logs/claude-pool-account.log"   # the daemon's log (D never changes: new_d recreates the same path)
 
   # B1e: seed skips an account that is already rejected
   new_d; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
@@ -609,6 +635,9 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
     && ok "B32 invalid key past its cooldown -> NO unprobed failback (stays on b, item untouched)" \
     || bad "B32 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes)"
+  [ -z "$(jex a@t.test why)" ] && grep -q "exhausted entry for a@t.test dropped: its key was refused" "$LOG" \
+    && ok "B32d the refused key's entry leaves the registry at its time WITH a line saying why (it used to go in silence)" \
+    || bad "B32d a-entry='$(jex a@t.test why)': $(grep -E 'dropped' "$LOG" | tail -n 1)"
   set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again it is used the normal way: probed on the next failover (b rejected -> a)" \
     || bad "B32b current='$(jget "$STATE" current)'"
@@ -810,6 +839,150 @@ print("OK" if not bad else "BAD: " + "; ".join(bad))
 EOF
 )"
   [ "$got" = "OK" ] && ok "B44 reset bound: usable only if now < reset <= now+31d (edges included), else retry-after, else the cooldown; sink and sanitizer agree" || bad "B44 $got"
+
+  # ── B45..B49 (gate ga-j6393n): the order of use comes from a usage store that LAGS the clock (the collector runs every ~30 min,
+  # this daemon every minute). An expired exhausted entry is the ONLY evidence that an account renewed, so it is never consumed on
+  # the strength of that order alone: 'a reading from before the reset' is the third state, not 'does not outrank'. ───────────────
+  # usage_store <letter>:<session%>:<weekly%>:<reading> ...  - a store the scenario writes itself (no _selftest_fresh: run_d leaves
+  # it alone). reading = the epoch at which the numbers were REAL (last_ok_at) | stale@<epoch> (failed collection, old numbers carried
+  # forward, flagged) | nostamp (a good reading with no last_ok_at). An account left out of the arguments has NO ROW.
+  usage_store() {
+    "$PY3" - "$D/usage.json" "$@" <<'EOF'
+import json, sys
+from datetime import datetime, timezone
+iso = lambda e: datetime.fromtimestamp(float(e), timezone.utc).isoformat()
+accts = []; newest = 0.0
+for spec in sys.argv[2:]:
+    who, sess, week, rd = spec.split(":")
+    a = {"email": who + "@t.test", "weekly_all": {"percent": float(week), "resets_at": "203%d-01-01T00:00:00+00:00" % (ord(who) - ord("a"))},
+         "session": {"percent": float(sess)}}
+    if rd.startswith("stale@"):
+        a.update(ok=False, stale=True, last_ok_at=iso(rd[6:]), collected_at=iso(float(rd[6:]) + 1800))
+    elif rd == "nostamp":
+        a.update(ok=True, stale=False)
+    else:
+        a.update(ok=True, stale=False, last_ok_at=iso(rd), collected_at=iso(rd)); newest = max(newest, float(rd))
+    accts.append(a)
+json.dump({"updated_at": iso(newest), "accounts": accts}, open(sys.argv[1], "w"))
+EOF
+  }
+  R=2000000000
+  # onb: the world the reviewer reproduced - a seeded, then rejected on its 5h window (reset R) -> the pool is on b, a is in the registry.
+  onb() { seeded; set_srv a@t.test 429 "$(hdr_rejected five_hour $R)"; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once; }
+
+  # B45 THE REVIEWER'S SCRIPT. The store was collected while a's 5h window was exhausted (a at session 100% -> banded last, order
+  # b,c,a), 10 min BEFORE the reset. The window renews, the daemon ticks 60 s after the reset: the store cannot know that, so a's
+  # entry - the only evidence a recovered - must survive the tick (and say it is waiting). The collector then runs (a at 0%, order
+  # a,b,c) and the next tick fails back. At ad18b45 the entry was dropped in silence at the first tick and the pool never went back.
+  onb
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "rejected" ] && ok "B45a precondition: failed over to b, a registered 'rejected' (reset R)" \
+    || bad "B45a precondition: current='$(jget "$STATE" current)' a-why='$(jex a@t.test why)'"
+  usage_store a:100:10:$((R - 600)) b:5:10:$((R - 600)) c:5:10:$((R - 600))
+  set_srv a@t.test 200 "$HDR_OK"; w0=$(writes); pa0=$(probes_of a@t.test); NOW_OVERRIDE=$((R + 60)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && ok "B45 reset passed, store collected BEFORE it -> a's entry is KEPT (and a is not probed, the pool does not move)" \
+    || bad "B45 current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)' writes $w0 -> $(writes)"
+  grep -q "waiting for a usage collection of a@t.test taken after its reset" "$LOG" && ok "B45b ...and the log says what it is waiting for" || bad "B45b no 'waiting' line: $(tail -n 3 "$LOG" | tr '\n' '|')"
+  usage_store a:0:10:$((R + 600)) b:5:10:$((R + 600)) c:5:10:$((R + 600))
+  NOW_OVERRIDE=$((R + 660)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ -z "$(jex a@t.test why)" ] && grep -q "SWITCH b@t.test -> a@t.test.*failback" "$LOG" \
+    && ok "B45c the next collection (a at 0%, after the reset) -> the pool goes back to a" \
+    || bad "B45c current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) a-entry='$(jex a@t.test why)'"
+
+  # B45d the CONTROL: the same lag, but the old reading says a is healthy (it was taken before a ran out). Ranking by it would fail back
+  # at once - and be right by luck. A reading from before the reset says nothing about after it either way: it waits for a collection.
+  onb; usage_store a:5:10:$((R - 600)) b:5:10:$((R - 600)) c:5:10:$((R - 600)); set_srv a@t.test 200 "$HDR_OK"; w0=$(writes); NOW_OVERRIDE=$((R + 60)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && ok "B45d a reading from before the reset that says 'com saldo' is no evidence either: kept, no failback yet" \
+    || bad "B45d current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)'"
+
+  # B45e the store collected AFTER the reset, and it ranks a behind the account in use (a still at session 100%): known, so the entry
+  # is dropped - and the drop says why (every removal has a line).
+  onb; usage_store a:100:10:$((R + 300)) b:5:10:$((R + 300)) c:5:10:$((R + 300)); set_srv a@t.test 200 "$HDR_OK"; w0=$(writes); pa0=$(probes_of a@t.test); NOW_OVERRIDE=$((R + 360)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test why)" ] \
+    && grep -q "exhausted entry for a@t.test dropped: the usage collected .* ranks it behind b@t.test" "$LOG" \
+    && ok "B45e fresh store ranks the recovered a behind b -> entry dropped WITH a log line saying why; no move, no probe" \
+    || bad "B45e current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)': $(grep -E 'dropped|waiting' "$LOG" | tail -n 2 | tr '\n' '|')"
+
+  # B45f..h what is not a good reading of THAT account taken after its reset is not evidence, whatever the order says:
+  #   f: the collection of a failed (stale / ok=false) - the library bands it 'unknown', the numbers are carried over from before
+  #   g: the store has no row for a at all
+  #   h: a reading stamped far ahead of the clock (not taken yet: not a time we can compare)
+  #   i: a good reading with no last_ok_at
+  # In every case the entry is KEPT and the log says why; a would otherwise be failed back to by an order that is guessing.
+  for row in 'f|a:5:10:stale@'$((R + 300))' b:5:10:'$((R + 300))' c:5:10:'$((R + 300))'|its last collection failed' \
+              'g|b:5:10:'$((R + 300))' c:5:10:'$((R + 300))'|has no row for it' \
+              'h|a:5:10:'$((R + 3 * 86400))' b:5:10:'$((R + 300))' c:5:10:'$((R + 300))'|ahead of the clock' \
+              'i|a:5:10:nostamp b:5:10:'$((R + 300))' c:5:10:'$((R + 300))'|no usable last_ok_at'; do
+    id="${row%%|*}"; rest="${row#*|}"; spec="${rest%|*}"; want="${rest##*|}"
+    onb; usage_store $spec; set_srv a@t.test 200 "$HDR_OK"; w0=$(writes); NOW_OVERRIDE=$((R + 360)) run_d -- run-once
+    [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] && grep -q "waiting for a usage collection of a@t.test.*$want" "$LOG" \
+      && ok "B45$id no good post-reset reading of a ($want) -> entry kept, no failback, the log says why" \
+      || bad "B45$id current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)': $(grep -E 'waiting|dropped' "$LOG" | tail -n 1)"
+  done
+
+  # B46 two recovered accounts outrank the active one (c), and the write for the first is REFUSED. The failback did not happen, so the one
+  # that was not even tried (b) must stay in the registry like the one that failed (a): at ad18b45 b was dropped in silence, only a kept.
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once                         # a -> b
+  set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                                 # b -> c
+  [ "$(jget "$STATE" current)" = "c@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] && [ -n "$(jex b@t.test reset_epoch)" ] || bad "B46 precondition: on c, a and b registered (current='$(jget "$STATE" current)')"
+  set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 200 "$HDR_OK"; touch "$D/kc/refuse-writes"; w0=$(writes); NOW_OVERRIDE=$((R + 60)) run_d -- run-once; rm -f "$D/kc/refuse-writes"
+  [ "$(jget "$STATE" current)" = "c@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] && [ "$(jex b@t.test why)" = "rejected" ] \
+    && grep -q "failback to a@t.test not done.*the 1 not tried" "$LOG" \
+    && ok "B46 write refused for the best recovered account -> BOTH entries stay (the failed one and the one never tried), the log counts the untried" \
+    || bad "B46 current='$(jget "$STATE" current)' a='$(jex a@t.test why)' b='$(jex b@t.test why)' writes $w0 -> $(writes): $(grep -E 'failback|dropped' "$LOG" | tail -n 2 | tr '\n' '|')"
+  NOW_OVERRIDE=$((R + 120)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -z "$(jex a@t.test why)" ] && [ -z "$(jex b@t.test why)" ] \
+    && grep -q "exhausted entry for b@t.test dropped: recovered, but ranks behind a@t.test, which took the pool" "$LOG" \
+    && ok "B46b writes work again -> back on a; b, ranked behind it, is dropped WITH a line saying why" \
+    || bad "B46b current='$(jget "$STATE" current)' a='$(jex a@t.test why)' b='$(jex b@t.test why)': $(grep -E 'failback|dropped' "$LOG" | tail -n 2 | tr '\n' '|')"
+
+  # B47 a recovered account whose key does NOT come from the vault this run is kept, not judged.
+  onb; hide_key a@t.test; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=$((R + 60)) run_d -- run-once; show_key a@t.test
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "rejected" ] && grep -q "failback to a@t.test not done: its key did not come from the vault this run" "$LOG" \
+    && ok "B47 recovered a, no key from the vault this run -> entry kept for the next run (and the log says so)" \
+    || bad "B47 current='$(jget "$STATE" current)' a-entry='$(jex a@t.test why)'"
+  # B47b ...and it does not stop the failback: with a and b both recovered and ahead of c, a's missing key leaves a in the registry and the
+  # next candidate (b) is still gone back to.
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once                         # a -> b
+  set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                                 # b -> c
+  set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 200 "$HDR_OK"; hide_key a@t.test; NOW_OVERRIDE=$((R + 60)) run_d -- run-once; show_key a@t.test
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(jex a@t.test why)" = "rejected" ] && [ -z "$(jex b@t.test why)" ] \
+    && ok "B47b a (no key) is kept and the failback goes on to b" \
+    || bad "B47b current='$(jget "$STATE" current)' a='$(jex a@t.test why)' b='$(jex b@t.test why)'"
+
+  # B48 nothing leaves the registry in silence. Each way an entry is removed has its own line:
+  #  - the active account answered (B33's case)         - a refused key at its time (B32's case)
+  # (the others - ranks behind, took the pool, no why - are asserted in B45e / B46b / B32c.)
+  seeded; for e in a b c; do set_srv "$e@t.test" 429 "$(hdr_rejected seven_day $R)"; done; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once
+  set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once
+  grep -q "exhausted entry for a@t.test dropped: it answered the probe" "$LOG" && ok "B48 the active account answers -> its entry is dropped WITH a line" || bad "B48 no line: $(grep -E 'dropped' "$LOG" | tail -n 2)"
+
+  # B49 THE POOL ITEM ONLY (Athos 05/10: a setup-token in the default item kills Mayor's / the crews' Remote Control).
+  #  1. across a whole failover + failback run, every service name security was asked for - read or write - is the pool's hashed one,
+  #     and the only item that exists is that one;
+  #  2. the writer itself refuses any service name that is not "Claude Code-credentials-<8 hex>", the bare default one included.
+  onb; usage_store a:0:10:$((R + 600)) b:5:10:$((R + 600)) c:5:10:$((R + 600)); NOW_OVERRIDE=$((R + 660)) run_d -- run-once
+  svcs="$(grep -o 'Claude Code-credentials[^ ]*' "$D/kc/argv.log" | sort -u)"; wr="$(sed 's/^WRITE //' "$D/kc/writes.log" | sort -u)"; has="$(ls "$D/kc/items")"
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$svcs" = "$SVC" ] && [ "$wr" = "$SVC" ] && [ "$has" = "$SVC" ] \
+    && ok "B49 a full failover+failback: security was only ever asked for the pool's hashed item, and only that item exists" \
+    || bad "B49 current='$(jget "$STATE" current)' asked-for='$svcs' written='$wr' items='$has' (want '$SVC')"
+  new_d
+  got="$(env -i HOME="$D/home" PATH="$BB:/usr/bin:/bin" FAKE_KC="$D/kc" "$PY3" - "$DAEMON" <<'EOF' 2>&1
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+m.item_service = lambda: "Claude Code-credentials"           # Mayor's / the crews' item
+r1 = m.write_item("athos", "sk-ant-oat01-NEVERWRITTEN")
+m.item_service = lambda: "Claude Code-credentials-0123abcz"   # a suffix, but not 8 hex
+r2 = m.write_item("athos", "sk-ant-oat01-NEVERWRITTEN")
+m.item_service = lambda: "Claude Code-credentials-0123abcd"   # the pool's shape: the guard is not a blanket refusal
+r3 = m.write_item("athos", "sk-ant-oat01-ALLOWED")
+print("RESULT", r1, r2, r3)
+EOF
+)"
+  [ "$(printf '%s' "$got" | tail -n 1)" = "RESULT False False True" ] && [ "$(ls "$D/kc/items")" = "Claude Code-credentials-0123abcd" ] && [ "$(wc -l < "$D/kc/argv.log" | tr -d ' ')" = "1" ] \
+    && ok "B49b write_item refuses the default item and any non-8-hex name (security never called for them), and still writes a pool-shaped one" \
+    || bad "B49b $(printf '%s' "$got" | tail -n 3 | tr '\n' '|') items='$(ls "$D/kc/items" | tr '\n' '|')' argv-lines=$(wc -l < "$D/kc/argv.log" 2>/dev/null)"
 
   # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
   # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).
