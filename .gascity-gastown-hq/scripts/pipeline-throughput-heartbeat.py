@@ -423,7 +423,8 @@ def _admission_pause_state(lines, now):
     a pause followed by anything that got past the pause gates (_admission_resumed) is over —
     'admitting and STILL not merging' stays an alarm — and a decision older than
     FLOW_WINDOW_SEC, or one with no timestamp, never suppresses. The run length is how far back
-    the same kind of pause continues unbroken; if `lines` ends first it is a lower bound."""
+    the same kind of pause continues unbroken — no resumed line, and no hole wider than
+    FLOW_WINDOW_SEC between pause lines; if `lines` ends first it is a lower bound."""
     kind = run_start = None
     for l in reversed(lines):
         if ADMISSION_PAUSE_CONDITION_RE.search(l):
@@ -442,6 +443,8 @@ def _admission_pause_state(lines, now):
         elif this != kind:
             break  # the run ended here (admission resumed, or a different pause took over)
         elif e is not None:
+            if run_start - e > FLOW_WINDOW_SEC:
+                break  # a hole in the log, not pause time: nothing says what happened in it
             run_start = e
     return (kind, now - run_start) if kind else None
 

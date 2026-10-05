@@ -223,6 +223,18 @@ if asked >= need:
 else:
     bad("ga-wduv5z: gate_merge_stall reads only %d log lines; %d are needed to span the ceiling" % (asked, need))
 
+# ── 12: a hole in the log is not 'still paused' ─────────────────────────────────────────
+# RAM pauses 3.3h-2.8h ago, then NOTHING logged for ~2.5h (dispatcher down / sweep dead), then a
+# fresh pause run for the last 20min. Counting the silent hole as pause time would read the run as
+# ~3.3h and trip the ceiling on a pause that has really lasted 20min. The run is only as long as
+# the stretch with no gap wider than FLOW_WINDOW_SEC.
+r = run([headroom_ok(CEIL + 4800)] + run_of(ram_pause, CEIL + 4500, CEIL + 3600, step=300)
+        + [marker_line()] + run_of(ram_pause, 1200, 30, step=90))
+if r is None:
+    ok("ga-wduv5z: a >FLOW_WINDOW_SEC hole between pause lines splits the run (no premature ceiling)")
+else:
+    bad("ga-wduv5z: a silent gap was counted as pause time and tripped the ceiling: %r" % (r,))
+
 print("")
 print("RESULT: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
