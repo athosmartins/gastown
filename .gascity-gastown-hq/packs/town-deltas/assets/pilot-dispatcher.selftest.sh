@@ -2132,11 +2132,15 @@ fi
 # otherwise (no comments; an old Mayor comment; a fresh non-Mayor comment).
 echo "Scenario 5e: fresh gastown__mayor comment on a gate:needs-fix bead defers dispatch (ga-pd7j)"
 
-_MH_NOW=$(date +%s)
-_MH_RECENT=$(date -u -r $(( _MH_NOW - 30 )) +%Y-%m-%dT%H:%M:%SZ)
-_MH_OLD=$(date -u -r $(( _MH_NOW - 3600 )) +%Y-%m-%dT%H:%M:%SZ)
+# ga-8o56ie: a comment timestamp is read by the dispatcher against ITS OWN `date +%s` at dispatch time, so it has
+# to be computed when the scenario runs — never once up front and reused. These used to be two variables set
+# once here (_MH_RECENT/_MH_OLD, both derived from one `date +%s`) and read by 5e, 5g AND 5j; the six real
+# dispatches from 5e through ga-rfpm9 take tens of seconds each on a loaded box, so by 5j the "30s-old" comment
+# was past the 300s grace window and 5j failed with the exact shape of a real AC2 regression. A function, not a
+# variable: there is nothing left for a later scenario to reuse stale.
+_mh_ago() { date -u -r $(( $(date +%s) - $1 )) +%Y-%m-%dT%H:%M:%SZ; }   # ISO-8601 UTC, $1 seconds in the past
 
-LOG5E="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: engine-window disposition\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
+LOG5E="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: engine-window disposition\",\"created_at\":\"$(_mh_ago 30)\"}]" 300)"
 if echo "$LOG5E" | grep "ga-pd7j:.*tt-flight is gate:needs-fix with a gastown__mayor comment" >/dev/null; then
   ok "pre-dispatch re-check detected the fresh Mayor comment and logged it"
 else
@@ -2167,7 +2171,7 @@ else
 fi
 
 echo "Scenario 5g: control — old Mayor comment + fresh non-Mayor comment → still no false positive (ga-pd7j)"
-LOG5G="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"old disposition\",\"created_at\":\"$_MH_OLD\"},{\"author\":\"dog-abc123\",\"text\":\"status update\",\"created_at\":\"$_MH_RECENT\"}]" 300)"
+LOG5G="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"old disposition\",\"created_at\":\"$(_mh_ago 3600)\"},{\"author\":\"dog-abc123\",\"text\":\"status update\",\"created_at\":\"$(_mh_ago 30)\"}]" 300)"
 if echo "$LOG5G" | grep "ga-pd7j:" >/dev/null; then
   bad "REGRESSION: Mayor-hold re-check fired on a stale Mayor comment / fresh non-Mayor comment (false positive)"
 else
@@ -2253,7 +2257,7 @@ fi
 # ANY dispatch candidate — not just a gate-retry — must get the same one-sweep
 # deferral.
 echo "Scenario 5j: fresh gastown__mayor comment defers an ORDINARY (non gate:needs-fix) dispatch (ga-4iw15 AC2)"
-LOG5J="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: re-measure first\",\"created_at\":\"$_MH_RECENT\"}]" 300 0)"
+LOG5J="$(run_real_dispatch_mayorhold "[{\"author\":\"gastown__mayor\",\"text\":\"HOLD: re-measure first\",\"created_at\":\"$(_mh_ago 30)\"}]" 300 0)"
 if echo "$LOG5J" | grep "ga-pd7j:.*tt-flight has a gastown__mayor comment" >/dev/null; then
   ok "pre-dispatch re-check deferred an ordinary candidate on a fresh Mayor comment, independent of gate:needs-fix (AC2)"
 else
