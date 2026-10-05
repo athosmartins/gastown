@@ -124,6 +124,30 @@ for p in tests/x.sh a/tests/x.sh a/test/x.sh a/__tests__/x.js foo.selftest.sh pa
          vendor/lib/a.go a/node_modules/x/index.js a/dist/bundle.js a/generated/x.go; do
   prod "$p"; eq "NOT production: $p" "$?" "1"
 done
+# The REAL test names this repo tracks (ga-lzidpo gate round 1: a synthetic foo.selftest.sh alone let the Python
+# convention through — 910-1716 lines each, so a 40-line change plus its selftest.py read as 950 production lines).
+# Each is a path `git ls-files` returns today. A test counted as production inflates a MEASURED count and refuses
+# honest work, the one direction this feature must never err in.
+for p in .gascity-gastown-hq/scripts/jev-preambulo.selftest.py .gascity-gastown-hq/scripts/portaria-shadow.selftest.py \
+         .gascity-gastown-hq/scripts/cdp-tab-guard.selftest.py .gascity-gastown-hq/scripts/jev_recomecar_experiment.selftest.py \
+         .gascity-gastown-hq/scripts/jev-quem-pensa.selftest.py \
+         .gascity-gastown-hq/packs/town-deltas/assets/bead-token-meter.selftest.py \
+         web/app.selftest.js \
+         .gascity-gastown-hq/packs/town-deltas/assets/selftest-sandbox-path.lib.sh \
+         .gascity-gastown-hq/packs/town-deltas/assets/selftest-tmproot-tripwire.lib.sh \
+         scripts/test-gce-install.sh scripts/test-proxy-smoke.sh scripts/migration-test/test-edge-cases.sh \
+         scripts/migration-test/run-test.sh scripts/migration-test/vm-integration-test.sh \
+         npm-package/scripts/test.js; do
+  prod "$p"; eq "NOT production (real repo test name): $p" "$?" "1"
+done
+# …and the names that LOOK like tests but are product code must stay counted: only the anchored shapes above are
+# excluded, never a bare 'test'/'selftest' substring.
+for p in internal/daemon/main_branch_test_runner.go internal/doctor/testutil_symlink_check.go \
+         .gascity-gastown-hq/packs/town-deltas/assets/gate_basetest_outcomes.py \
+         .gascity-gastown-hq/packs/town-deltas/assets/heavy-selftest-guard.sh \
+         src/latest-test-run.go src/contest-runner.sh src/selftestify.py; do
+  prod "$p"; eq "still production (test-ish name, product code): $p" "$?" "0"
+done
 
 # ── 4. counting: added + deleted over production paths, three states ─────────
 echo "── 4. gate_e11_count_production_lines ──"
@@ -138,6 +162,8 @@ eq "added+deleted, tests/lock/docs out, binary row 0: 12 + 0 + 20" "$(gate_e11_c
 eq "empty numstat is a MEASURED zero" "$(gate_e11_count_production_lines "")" "0"
 eq "a path git quoted is unquoted before it is classified" "$(gate_e11_count_production_lines "4${TAB}0${TAB}\"src/q.sh\"")" "4"
 eq "a quoted TEST path is still a test" "$(gate_e11_count_production_lines "9${TAB}0${TAB}\"tests/q.sh\"")" "0"
+eq "the gate's repro: 910-line jev-preambulo.selftest.py + 40-line jev-preambulo.py counts 40, not 950" "$(gate_e11_count_production_lines "910${TAB}0${TAB}scripts/jev-preambulo.selftest.py
+40${TAB}0${TAB}scripts/jev-preambulo.py")" "40"
 eq "garbled row (no path): unknown, not 0" "$(gate_e11_count_production_lines "10${TAB}2")" "unknown"
 eq "garbled row (non-numeric count): unknown, not 0" "$(gate_e11_count_production_lines "abc${TAB}2${TAB}src/a.sh")" "unknown"
 eq "one garbled row among good ones poisons the count: unknown" "$(gate_e11_count_production_lines "10${TAB}2${TAB}src/a.sh
@@ -235,8 +261,37 @@ $GITC clone -q "$ORIGIN" "$SEED" 2>/dev/null
                      gen lib/x.selftest.sh 1000; gen api/x.pb.go 1000; gen src/small.sh 50;     fin feat/nonprod "feat(ga-e11): lots of non-production"
   mkb feat/rewrite;  gen src/mod.sh 500 new;                                                    fin feat/rewrite "feat(ga-e11): rewrite 500 lines"
   mkb feat/binary;   printf '\000\001\002\003' > src/blob.bin; gen src/ten.sh 10;               fin feat/binary "feat(ga-e11): a binary and 10 lines"
+  mkb feat/pytest;   gen scripts/jev.selftest.py 910; gen lib/selftest-sandbox.lib.sh 70; gen scripts/jev.py 40; fin feat/pytest "feat(ga-e11): 40 prod + selftest.py + selftest lib"
 ) >/dev/null 2>&1
 $GITC clone -q "$ORIGIN" "$RIG_OK" 2>/dev/null
+
+# A SECOND origin, for the stale-main case (ga-lzidpo gate round 1, blocking issue 1). main is at C1 when the rig
+# clone is made; someone else then merges 1000 lines to main (M2); a 10-line branch is cut from M2. The rig fetches
+# ONLY the branch (so origin/main stays at C1 but the branch tip carries M2) and then origin becomes unreachable, so the
+# block's own fetch fails. Against the stale C1 the three-dot diff takes in everything main gained since: 1010 lines
+# for a 10-line submission. The honest answer is "I could not tell what main is", never "too big".
+ORIGIN2="$TMPD/origin2.git"; SEED2="$TMPD/seed2"; RIG_STALE="$TMPD/rig-stale"
+$GITC init -q --bare "$ORIGIN2"
+$GITC clone -q "$ORIGIN2" "$SEED2" 2>/dev/null
+( cd "$SEED2" || exit 1
+  echo base > README; gen src/mod.sh 500 old
+  $GITC add -A && $GITC commit -q -m "chore: base"
+  $GITC push -q origin HEAD:refs/heads/main
+) >/dev/null 2>&1
+$GITC clone -q "$ORIGIN2" "$RIG_STALE" 2>/dev/null
+( cd "$SEED2" || exit 1
+  gen src/merged-by-someone-else.sh 1000
+  $GITC add -A && $GITC commit -q -m "feat: someone else merges 1000 lines to main (M2)"
+  $GITC push -q origin HEAD:refs/heads/main
+  $GITC checkout -q -b feat/small
+  gen src/ten.sh 10
+  $GITC add -A && $GITC commit -q -m "feat(ga-e11): 10 lines on top of M2"
+  $GITC push -q origin feat/small
+) >/dev/null 2>&1
+$GITC -C "$RIG_STALE" fetch -q origin feat/small 2>/dev/null   # the branch only: origin/main stays at C1
+STALE_MAIN_BEFORE=$($GITC -C "$RIG_STALE" rev-parse origin/main 2>/dev/null)
+REAL_MAIN2=$($GITC -C "$ORIGIN2" rev-parse refs/heads/main 2>/dev/null)
+$GITC -C "$RIG_STALE" remote set-url origin "$TMPD/origin-is-gone.git"   # unreachable: every fetch from here on fails
 NOT_A_REPO="$TMPD/plain-dir"; mkdir -p "$NOT_A_REPO"
 
 # Stubs for what the live block calls. Defined AFTER sourcing (the guard's own log/err sit past its lib-only cutoff).
@@ -328,7 +383,28 @@ run_e11 1 "$RIG_OK" "$BB" feat/binary; RC=$?
 eq "arm B, a binary + 10 lines: accepted" "$RC" "0"
 has "the binary row does not count: production_lines=10" "$LOGF" "production_lines=10"
 
+run_e11 1 "$RIG_OK" "$BB" feat/pytest; RC=$?
+eq "arm B, 40 prod lines + a 910-line .selftest.py + a selftest-*.lib.sh: ACCEPTED (the repo's own test names)" "$RC" "0"
+has "Python selftest and selftest lib do not count: production_lines=40" "$LOGF" "verdict=dentro-do-teto production_lines=40"
+
 echo "  — the third state: could not measure => accept + say so —"
+# Blocking issue 1 (gate round 1): the fetch's outcome used to be thrown away, so a failed fetch left origin/main
+# STALE and the block counted everything main gained since as part of the branch.
+[ "$STALE_MAIN_BEFORE" != "$REAL_MAIN2" ] && [ -n "$STALE_MAIN_BEFORE" ] \
+  && ok "fixture: the rig's origin/main (${STALE_MAIN_BEFORE:0:8}) really is behind origin's main (${REAL_MAIN2:0:8})" \
+  || bad "fixture: the stale rig is not stale (rig=${STALE_MAIN_BEFORE:-?} origin=${REAL_MAIN2:-?})"
+run_e11 1 "$RIG_STALE" "$BB" feat/small; RC=$?
+eq "origin unreachable, origin/main stale (10-line branch, 1010 lines vs the stale main): ACCEPTED (rc 0)" "$RC" "0"
+has "stale main: nao-medido, the count never arrived" "$LOGF" "verdict=nao-medido production_lines=unknown"
+has "stale main: the cause is NAMED, not why=-" "$LOGF" "why=fetch-falhou"
+lacks "stale main: no 1010 reaches the log as if it were a measurement" "$LOGF" "production_lines=1010"
+eq "stale main: nothing refused or labelled" "$(calls_n)" "0"
+# the control: same rig, origin back — the fetch works, origin/main moves to M2 and the REAL size (10) comes out
+$GITC -C "$RIG_STALE" remote set-url origin "$ORIGIN2"
+run_e11 1 "$RIG_STALE" "$BB" feat/small; RC=$?
+eq "origin reachable again: fetch moves origin/main, 10-line branch accepted" "$RC" "0"
+has "origin reachable: the REAL size is measured (10), not 1010" "$LOGF" "verdict=dentro-do-teto production_lines=10"
+lacks "origin reachable: no why= cause recorded" "$LOGF" "why=fetch-falhou"
 run_e11 1 "" "$BB" feat/prod900; RC=$?
 eq "RIG_PATH empty: accepted (rc 0)" "$RC" "0"
 has "RIG_PATH empty: logged as nao-medido with the cause" "$LOGF" "verdict=nao-medido production_lines=unknown"
@@ -382,12 +458,14 @@ set_beads "$BB" "$PLAIN" "$PLAIN"; rm -f "$TMPD/show-$BB.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "source bead unreadable (bd show fails): accepted, not refused" "$RC" "0"
 has "bd show failing: verdict nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao production_lines=900"
+has "bd show failing: the cause is NAMED (why=isencao-ilegivel), not why=-" "$LOGF" "why=isencao-ilegivel"
 lacks "bd show failing: no gate-status:error" "$CALLS" "STATUS m-e11 error"
 
 set_beads "$BB" "$EXEMPT" "$PLAIN"      # label present but its comments cannot be read (no comments file => bd fails)
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label present, comments unreadable: accepted, not refused" "$RC" "0"
 has "comments unreadable: nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao"
+has "comments unreadable: the cause is NAMED (why=isencao-ilegivel)" "$LOGF" "why=isencao-ilegivel"
 
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; fi

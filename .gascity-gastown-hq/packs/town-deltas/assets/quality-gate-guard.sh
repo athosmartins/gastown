@@ -4210,8 +4210,11 @@ close_open_run_verdicts() {
 # byte. The arm is a pure function of the bead id (SHA-256 with its own salt, the E5/E9 pattern), so a bead that
 # fails and re-submits can never change arm.
 #
-# NOT PRODUCTION (does not count): tests (tests/ test/ __tests__/ dirs, *.selftest.sh, test_*, *_test.*, *.test.*,
-# *.spec.*, conftest.py, testdata/), fixtures and snapshots (fixtures/ fixture/ __snapshots__/ *.snap *.golden),
+# NOT PRODUCTION (does not count): tests (tests/ test/ __tests__/ dirs, *.selftest.* in any language, selftest-*
+# helper libs, test.* / test_* / test-*, *_test.* / *-test.*, *.test.*, *.spec.*, conftest.py, testdata/ — the shapes this
+# repo's own tests really carry, e.g. jev-preambulo.selftest.py, selftest-sandbox-path.lib.sh, scripts/test-gce-install.sh;
+# each anchored on the base name, never a bare "test" substring, so main_branch_test_runner.go and heavy-selftest-guard.sh
+# stay production), fixtures and snapshots (fixtures/ fixture/ __snapshots__/ *.snap *.golden),
 # generated or vendored files (generated/ vendor/ node_modules/ dist/ *.pb.go *_pb2*.py *.min.js *.min.css
 # *.generated.* *_generated.* *.gen.go), lockfiles (*.lock package-lock.json pnpm-lock.yaml go.sum) and markdown
 # (*.md *.markdown *.mdx). Markdown is excluded WHOLESALE, by design, including the prompts and doctrine that are
@@ -4224,7 +4227,8 @@ close_open_run_verdicts() {
 #
 # THE THIRD STATE — what the acceptance hangs on. A refusal needs POSITIVE evidence: a count that was MEASURED, over
 # the cap, and an exemption that was READ as absent. A diff that cannot be read, a count that fails, a bead that cannot
-# be fetched, a comment list that is not JSON: none of those refuses. They are logged ("nao-medido"; the cause is in
+# be fetched, a comment list that is not JSON, a `git fetch` that failed (so origin/main may be stale and the
+# three-dot diff would take in everything main gained since): none of those refuses. They are logged ("nao-medido"; the cause is in
 # why=) and the submission goes through exactly as today. "I could not tell" is never "too big".
 #
 # EXEMPTION: label gate:size-exempt on the source bead OR on the marker, WITH a reason — a comment on that same bead
@@ -4298,7 +4302,7 @@ gate_e11_path_is_production() {
   esac
   base="${p##*/}"
   case "$base" in
-    *.selftest.sh|test_*|*_test.*|*.test.*|*.spec.*|conftest.py|*.snap|*.golden) return 1 ;;
+    *.selftest.*|selftest-*|test|test.*|test_*|test-*|*_test.*|*-test.*|*.test.*|*.spec.*|conftest.py|*.snap|*.golden) return 1 ;;
     *.lock|package-lock.json|pnpm-lock.yaml|go.sum) return 1 ;;
     *.md|*.markdown|*.mdx) return 1 ;;
     *.pb.go|*_pb2.py|*_pb2_grpc.py|*.min.js|*.min.css|*.generated.*|*_generated.*|*.gen.go) return 1 ;;
@@ -7181,10 +7185,20 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     if [ -z "$RIG_PATH" ] || [ -z "$BEAD_ID" ] || [ -z "$BRANCH" ]; then
       _E11_WHY="entrada-vazia"
     else
-      git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
-      _E11_MAIN=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/main^{commit}" 2>/dev/null || echo "")
-      _E11_TIP=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/${BRANCH}^{commit}" 2>/dev/null || echo "")
-      if [ -z "$_E11_MAIN" ] || [ -z "$_E11_TIP" ]; then
+      # The fetch's outcome is READ, not thrown away: origin/main is only the ruler if this fetch brought it up to date.
+      # A failed fetch (origin unreachable, branch not on origin, not a repo) leaves a cached origin/main of unknown age,
+      # and `main...tip` against a stale main takes in every commit main gained since — a 10-line branch reads as 1010.
+      # "I could not tell what main is" is nao-medido, never a count (ga-lzidpo gate round 1, blocking issue 1).
+      _E11_FETCH_RC=0
+      git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || _E11_FETCH_RC=$?
+      _E11_MAIN=""; _E11_TIP=""
+      if [ "$_E11_FETCH_RC" -eq 0 ]; then
+        _E11_MAIN=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/main^{commit}" 2>/dev/null || echo "")
+        _E11_TIP=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/${BRANCH}^{commit}" 2>/dev/null || echo "")
+      fi
+      if [ "$_E11_FETCH_RC" -ne 0 ]; then
+        _E11_WHY="fetch-falhou"
+      elif [ -z "$_E11_MAIN" ] || [ -z "$_E11_TIP" ]; then
         _E11_WHY="refs-ausentes"
       else
         _E11_DIFF_RC=0
@@ -7217,6 +7231,8 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
       fi
       _E11_EX_MRK=$(gate_e11_exempt_state "$_E11_LAB" "$_E11_RSN")
       _E11_EXEMPT=$(gate_e11_exempt_merge "$_E11_EX_SRC" "$_E11_EX_MRK")
+      # exempt=desconhecido means bd show / bd comments could not be read: say so in why= like every other cause.
+      [ "$_E11_EXEMPT" != "desconhecido" ] || _E11_WHY="isencao-ilegivel"
     fi
   fi
   _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_COUNT" "$_E11_EXEMPT" "$_E11_CAP")
