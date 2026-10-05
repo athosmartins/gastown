@@ -608,8 +608,26 @@ option_defaults = { effort = "high" }
 # minute to show its prompt; a gate reviewer (no MCP) already took 47s. The engine's own
 # error text says to raise this for cities with slow-starting sessions. Cost: a start that
 # really hangs is given up 2 minutes later than before.
+#
+# ga-7vet0v: setup_timeout is a DIFFERENT knob (default 10s) and it is what was killing the
+# gate-reviewer. Every pre_start runs under it (engine runSetupCommand: exec.CommandContext
+# + context.WithTimeout), and a pre_start failure is fatal for the start. The gate-reviewer
+# declares no pre_start of its own; the engine appends `gc internal materialize-skills
+# --agent <name> --workdir <dir>` to every agent at template resolution, so it is invisible
+# in `gc config show`. Under load 65-80 on 10 cores that one command ran 14-28s, was killed
+# at 10s ("signal: killed"), the reviewer never started, the run then waited out the 31m
+# verdict timeout and was re-queued as "died mid-review" (14 times on 05/10, 58 in 8 days).
+# 60s is ~2x the slowest run seen. It stays below startup_timeout, and the same bound now
+# applies to every session_setup / session_live / pre_start command, so a command that
+# really hangs is given up 50s later than before. The 10s kill is INFERRED from the
+# mechanism and the failure durations (scratch runs at lower load took 1.6-4.9s), not
+# reproduced at load. From the engine source (gc-1.1.1-engwin0919, the installed build) the
+# key is not part of the session fingerprint, so changing it should restart no session; it
+# only applies once the running supervisor re-reads city.toml, and whether it hot-reloads
+# this key was NOT tested here.
 [session]
 startup_timeout = "180s"
+setup_timeout = "60s"
 
 [daemon]
 # nudge_dispatcher: EXPLICITAMENTE "legacy" — nao remova sem MEDIR (ga-yxuab).
