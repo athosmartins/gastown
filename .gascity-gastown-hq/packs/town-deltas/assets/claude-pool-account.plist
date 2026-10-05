@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.claude-pool-account</string>
+
+  <!-- ga-8hcnvb.1 — the headless pool's Claude account as DATA. One run a minute: probe the active account with a
+       1-token haiku call; if it is rejected (429 / *-status rejected) move the pool's Keychain item to the next
+       account of the order; at the stored reset time of a previously exhausted account, move back. Live pool
+       sessions follow within ~40 s (claude re-reads the item), so an exhaustion is absorbed in well under 2 min.
+
+       A run that cannot tell (network, 5xx) changes nothing. Mayor and crews are not touched: they run the plain
+       `claude` / `claude-rc` providers, which never see the pool item.
+
+       KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-pool-account — the daemon
+       stops acting and new pool launches stop pointing at the item. See docs/claude-pool-account.md.
+
+       ACTIVATION is deliberately a separate, human step (merged != live): copy this file to ~/Library/LaunchAgents
+       and `launchctl load` it AFTER the script exists on main. The first run (<= 60 s later) creates the item.
+       Python is /usr/bin/python3 like the other city daemons (3.9: the script is tested on that interpreter). -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-pool-account.py</string>
+    <string>run-once</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 60 s > one run (a handful of ~1 s probes; the script holds a flock, so a slow run is never doubled). -->
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-pool-account-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-pool-account-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- ~/.local/bin: `secret` (the vault). /usr/bin: `security`. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <!-- claude asks the Keychain for account $USER; launchd does not always set it. -->
+    <key>USER</key>
+    <string>athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>

@@ -224,4 +224,70 @@ if [ -n "$ab_conf" ] && [ -f "$ab_conf" ] && [ "${GC_EFFORT_AB:-}" != "0" ] && [
   fi
 fi
 
+# ── ga-8hcnvb.1: the pool's Claude account is DATA, not environment ───────────────────────────────────
+# claude reads its credential from a Keychain item whose NAME derives from CLAUDE_SECURESTORAGE_CONFIG_DIR
+# ("Claude Code-credentials-" + first 8 hex of sha256(that path)); it re-reads the item every ~30 s (measured,
+# ga-2yyitx), so rewriting the item moves a LIVE session to another account with no restart and no lost
+# conversation. claude-pool-account.py is the single writer of that item. Here we only POINT this session at it:
+#   * only when the item exists — claude does NOT fall back to the ambient login when the named item is missing
+#     (it reports "not logged in"), so exporting blindly would break every launch. Anything doubtful = not exported.
+#   * existence only: no -w / -g, so the secret is never read, printed or put in argv/env.
+#   * USER is exported because claude asks Keychain for account $USER ("unknown" when it is absent).
+#   * an operator-set CLAUDE_SECURESTORAGE_CONFIG_DIR wins; the Mayor and the crews never reach this file (they
+#     run the plain `claude` / `claude-rc` providers), so their login is untouched by construction.
+# KNOBS: GC_POOL_ACCOUNT=0 (this launch) / touch $GC_CITY_PATH/.gc/no-pool-account (every new launch).
+# SEAMS (tests): GC_POOL_CRED_DIR, GC_POOL_SECURITY_TIMEOUT (seconds, default 5).
+# Its events go to claude-pool-account.log (the daemon's log), NOT to claude-lowprio.log: that file's contract is
+# exactly one line per launch (claude-lowprio.selftest.sh A9), and the pool account is a separate concern.
+pool_log=""
+if [ -n "$city" ] && [ -d "$city/.gc/logs" ]; then pool_log="$city/.gc/logs/claude-pool-account.log"; fi
+pool_note() {
+  [ -n "$pool_log" ] || return 0
+  printf '%s pid=%s agent=%s wrapper %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "${GC_AGENT:-?}" "$*" >> "$pool_log" 2>/dev/null || true
+}
+pool_dir="${GC_POOL_CRED_DIR:-${HOME:-}/.gastown/claude-pool-cred}"
+pool_off=""
+[ "${GC_POOL_ACCOUNT:-}" = "0" ] && pool_off="GC_POOL_ACCOUNT=0"
+if [ -z "$pool_off" ] && [ -n "$city" ] && [ -e "$city/.gc/no-pool-account" ]; then
+  pool_off="$city/.gc/no-pool-account"
+fi
+if [ -n "$pool_off" ]; then
+  pool_note "POOL-ACCT SKIP disabled by $pool_off"
+elif [ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" ]; then
+  pool_note "POOL-ACCT KEEP CLAUDE_SECURESTORAGE_CONFIG_DIR already set by the caller"
+elif [ -z "${HOME:-}" ] || [ "${pool_dir#/}" = "$pool_dir" ]; then
+  pool_note "POOL-ACCT SKIP no absolute pool dir (HOME unset?)"
+else
+  pool_user="${USER:-}"
+  [ -n "$pool_user" ] || pool_user="$(id -un 2>/dev/null)" || pool_user=""
+  pool_sum="$(printf '%s' "$pool_dir" | shasum -a 256 2>/dev/null)" || pool_sum=""
+  pool_hash="${pool_sum:0:8}"
+  case "$pool_hash" in
+    ????????) case "$pool_hash" in *[!0-9a-f]*) pool_hash="" ;; esac ;;
+    *) pool_hash="" ;;
+  esac
+  pool_to="${GC_POOL_SECURITY_TIMEOUT:-5}"
+  case "$pool_to" in ''|*[!0-9]*) pool_to=5 ;; esac
+  # Bounded in pure bash (no dependency on a `timeout` binary being on this session's PATH): a locked or wedged
+  # Keychain must cost a pool launch at most pool_to seconds, never hang it.
+  pool_has_item() {
+    local p i=0 max=$((pool_to * 20))
+    security find-generic-password -a "$pool_user" -s "Claude Code-credentials-$pool_hash" >/dev/null 2>&1 &
+    p=$!
+    while kill -0 "$p" 2>/dev/null; do
+      if [ "$i" -ge "$max" ]; then kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; return 124; fi
+      sleep 0.05; i=$((i + 1))
+    done
+    wait "$p"
+  }
+  if [ -z "$pool_user" ] || [ -z "$pool_hash" ]; then
+    pool_note "POOL-ACCT WARN could not derive user/hash - not exported"
+  elif pool_has_item; then
+    export CLAUDE_SECURESTORAGE_CONFIG_DIR="$pool_dir" USER="$pool_user"
+    pool_note "POOL-ACCT SET item=Claude Code-credentials-$pool_hash"
+  else
+    pool_note "POOL-ACCT SKIP no pool item (or security unavailable) - fail-open to the ambient login"
+  fi
+fi
+
 exec "$claude_bin" ${argv[@]+"${argv[@]}"}
