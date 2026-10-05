@@ -11,7 +11,9 @@
 # and an ANCIENT+IDLE-pid lock are unlock+reaped; a YOUNG/ACTIVE-pid lock and an ANCIENT-but-
 # BUSY lock are KEPT (never reap a live agent); .claude/worktrees + .gc-worktrees paths are
 # covered; an UNPARSEABLE lock (no pid, no confirmed live session) is KEPT unless the tree itself proves
-# safe (merged + clean + unused + aged → reaped, ga-vs6shu; see the LOCK CONTRACT in the reaper), and any
+# safe (merged + clean + unused + aged → reaped, ga-vs6shu; "merged" = an ancestor of main OR, for a branch
+# the gate rebased, every commit there as an equivalent patch per `git cherry`, ga-1md7na; see the LOCK
+# CONTRACT in the reaper), and any
 # verdict other than exactly 'unparseable' is KEPT; the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
 # Process probes are faked so it's hermetic. Exit 0 iff all hold.
@@ -689,7 +691,7 @@ echo "── ga-vs6shu gate-feedback 2: only the exact 'unparseable' verdict may
 # reap (locked, merged, clean, aged 3h, no process cwd) — so a keep can only come from the verdict handling itself.
 extract_reaper_fn() { awk -v n="$1" '$0 ~ "^" n "\\(\\)" {f=1} f{print} f&&/^}$/{exit}' "$REAPER"; }
 UV_FNS=""
-for _f in _json_esc _log_lock_event _worktree_head_merged _worktree_in_use delete_merged_local_branch _reap_or_log_unparseable_lock; do
+for _f in _json_esc _log_lock_event _worktree_head_merged _ref_patch_equivalent _worktree_in_use delete_merged_local_branch _reap_or_log_unparseable_lock; do
   _body="$(extract_reaper_fn "$_f")"
   [ -n "$_body" ] || { echo "FATAL: $_f() not found in $REAPER (extraction pattern drifted)" >&2; exit 2; }
   UV_FNS="$UV_FNS
@@ -1222,6 +1224,158 @@ WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 \
 r3wt() { git -C "$R3RIG" worktree list --porcelain 2>/dev/null | grep -E "^worktree .*/crew/worker-real-clean\$" >/dev/null; }
 r3wt && bad "gate-feedback: real lsof clean-exit + genuine non-match NOT reaped (over-conservative regression)" \
        || ok "gate-feedback: real lsof clean-exit + genuine non-match correctly reaped (no over-conservative regression)"
+
+# ══ ga-1md7na: a REBASED branch — content in main by PATCH, HEAD not an ancestor ═══════════
+# The gate rebases/re-anchors a branch before merging, so the worktree's HEAD is never an
+# ancestor of origin/<default> even when 100% of its content shipped (measured 05/10: 27 locked
+# worktrees of CLOSED beads, `git cherry origin/main HEAD` showing only '-' lines, kept forever
+# by the ancestry-only proof). `git cherry` (patch equivalence) is the second proof; every other
+# proof of the safety net (clean status, not in use, aged) stays mandatory. The "kept" scenarios
+# below cannot fail on pre-fix code (it keeps everything of this shape) — they pin the fix
+# against being too eager, and were checked by mutation (see the bead comment).
+echo "── ga-1md7na: rebased branch (patch-equivalent, not an ancestor) behind an unparseable lock ──"
+PE_BIN="$TMP/pe_bin"; mkdir -p "$PE_BIN"
+export PE_REAL_GIT="$(command -v git)"
+cat > "$PE_BIN/git" <<'PEGIT'
+#!/bin/sh
+# Real git, except `git cherry` which PE_CHERRY can break: fail = rc 128 and no output;
+# garbage = rc 0 and output that is not cherry's format; partial = a '-' line, THEN rc 1.
+for a in "$@"; do
+  if [ "$a" = "cherry" ]; then
+    case "${PE_CHERRY:-}" in
+      fail)    exit 128 ;;
+      garbage) echo "warning: this is not a cherry line"; exit 0 ;;
+      partial) echo "- 0123456789012345678901234567890123456789"; exit 1 ;;
+    esac
+  fi
+done
+exec "$PE_REAL_GIT" "$@"
+PEGIT
+chmod +x "$PE_BIN/git"
+: > "$TMP/pe_nolsof.txt"
+
+pe_age() { touch -t "$(date -v-"${2:-3}"H +%Y%m%d%H%M 2>/dev/null || date -d "${2:-3} hours ago" +%Y%m%d%H%M)" "$1" 2>/dev/null || true; }
+# mk_rebased_rig <name> — $TMP/<name>/rig, crew/worker-pe on branch crew/<name>/pe with ONE commit
+# that origin/main also has as a DIFFERENT commit (main moved on first, then took the same patch):
+# HEAD is not an ancestor of origin/main, `git cherry` shows only '-'. Locked with an unreadable
+# reason, 3h old. $2 = optional extra setup run inside the worktree (after the rebase shape exists).
+mk_rebased_rig() {
+  local name="$1" extra="${2:-}" root; root="$TMP/$name"; mkdir -p "$root"
+  git init -q --bare "$root/remote.git"
+  git init -q -b main "$root/rig"
+  ( cd "$root/rig" || exit 1
+    git remote add origin "$root/remote.git"
+    echo base > base.txt; echo other > other.txt; git add base.txt other.txt; git commit -qm base
+    git push -q origin main
+    mkdir -p crew
+    git worktree add -q crew/worker-pe -b "crew/$name/pe" main
+    ( cd crew/worker-pe && echo feature > feature.txt && git add feature.txt && git commit -qm "feature" )
+    echo more >> other.txt; git commit -qam "main moves on"
+    git cherry-pick "crew/$name/pe" >/dev/null
+    git push -q origin main; git fetch -q origin
+    git remote set-head origin main 2>/dev/null || true
+    git worktree lock --reason "wa-pe build (wa-worker-adhoc-gone-$name)" crew/worker-pe
+    if [ -n "$extra" ]; then ( cd crew/worker-pe && eval "$extra" ); fi
+  ) >/dev/null 2>&1
+  pe_age "$root/rig/crew/worker-pe"
+}
+run_pe() { # run_pe <name> [ENV=val ...] — log → $TMP/<name>.jsonl
+  local name="$1"; shift
+  env PATH="$PE_BIN:$PATH" WORKTREE_REAPER_GT="$TMP/$name" WORKTREE_REAPER_LOG="$TMP/$name.jsonl" \
+    WORKTREE_REAPER_STALE_HOURS=1 WORKTREE_REAPER_ENABLED=1 WORKTREE_REAPER_FAKE_LSOF="$TMP/pe_nolsof.txt" \
+    "$@" bash "$REAPER" >/dev/null 2>&1
+}
+pe_wt() { git -C "$TMP/$1/rig" worktree list --porcelain 2>/dev/null | grep -E "/crew/worker-pe\$" >/dev/null; }
+pe_br() { git -C "$TMP/$1/rig" rev-parse --verify -q "refs/heads/crew/$1/pe" >/dev/null 2>&1; }
+pe_kept() { # pe_kept <name> <label> — still registered, branch intact, kept_locked_unparseable logged, never a reap event
+  if pe_wt "$1" && pe_br "$1" && [ "$(events "$1" kept_locked_unparseable)" = "1" ] \
+     && [ "$(events "$1" reaped_locked_unparseable_patch_equivalent)" = "0" ] \
+     && [ "$(events "$1" reaped_locked_unparseable_safe)" = "0" ]; then ok "ga-1md7na: $2 → KEPT (worktree + branch intact, kept_locked_unparseable logged)"
+  else bad "ga-1md7na: $2 → NOT kept (wt=$(pe_wt "$1" && echo y || echo n) br=$(pe_br "$1" && echo y || echo n) kept_ev=$(events "$1" kept_locked_unparseable) reaped_pe=$(events "$1" reaped_locked_unparseable_patch_equivalent))"; fi
+}
+
+# fixture sanity: the shape must be a REBASE (not an ancestor) whose patch IS in main — otherwise (a)
+# would pass on the old ancestry-only code and prove nothing.
+mk_rebased_rig pe_a
+PE_HEAD="$(git -C "$TMP/pe_a/rig/crew/worker-pe" rev-parse HEAD)"
+git -C "$TMP/pe_a/rig" merge-base --is-ancestor "$PE_HEAD" refs/remotes/origin/main 2>/dev/null \
+  && bad "ga-1md7na fixture: HEAD IS an ancestor of origin/main — not a rebase shape, scenario (a) would prove nothing" \
+  || ok "ga-1md7na fixture: HEAD is NOT an ancestor of origin/main (the rebase shape)"
+PE_CH="$(git -C "$TMP/pe_a/rig" cherry refs/remotes/origin/main "$PE_HEAD" 2>/dev/null)"
+case "$PE_CH" in "- "*) ok "ga-1md7na fixture: git cherry reports the commit as already in main ('-')" ;; *) bad "ga-1md7na fixture: git cherry said '$PE_CH', expected a '- <sha>' line" ;; esac
+
+# (a) the measured bug: clean, old, no pid, patch in main → REAPED, branch gone, distinct event
+run_pe pe_a
+pe_wt pe_a && bad "ga-1md7na (a): rebased+patch-equivalent+clean+aged locked worktree NOT reaped (the measured leak)" \
+           || ok "ga-1md7na (a): rebased+patch-equivalent+clean+aged locked worktree REAPED"
+pe_br pe_a && bad "ga-1md7na (a): the patch-equivalent local branch was NOT deleted (orphan branch keeps the Pilot's _filter_built vetoing re-dispatch)" \
+           || ok "ga-1md7na (a): the patch-equivalent local branch deleted under the same proof"
+[ "$(events pe_a reaped_locked_unparseable_patch_equivalent)" = "1" ] && [ "$(events pe_a reaped_locked_unparseable_safe)" = "0" ] \
+  && ok "ga-1md7na (a): logged as reaped_locked_unparseable_patch_equivalent (distinct from the ancestry reap)" \
+  || bad "ga-1md7na (a): expected exactly 1 reaped_locked_unparseable_patch_equivalent and 0 reaped_locked_unparseable_safe, saw $(events pe_a reaped_locked_unparseable_patch_equivalent)/$(events pe_a reaped_locked_unparseable_safe)"
+
+# (b) the same, but ONE commit that main does not have → KEPT (never lose real work)
+mk_rebased_rig pe_b 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm "not in main"'
+pe_age "$TMP/pe_b/rig/crew/worker-pe"
+run_pe pe_b
+pe_kept pe_b "rebased worktree with 1 commit NOT in main"
+
+# (c) `git cherry` cannot answer → the third state, KEPT. Three ways to fail.
+for mode in fail garbage partial; do
+  mk_rebased_rig "pe_c_$mode"
+  run_pe "pe_c_$mode" PE_CHERRY="$mode"
+  pe_kept "pe_c_$mode" "git cherry unusable ($mode)"
+done
+
+# (d) a changed tracked file, and (d2) an untracked file → KEPT as today, even with every commit in main
+mk_rebased_rig pe_d 'echo edited >> feature.txt'
+pe_age "$TMP/pe_d/rig/crew/worker-pe"
+run_pe pe_d
+pe_kept pe_d "patch-equivalent HEAD but a modified tracked file"
+mk_rebased_rig pe_d2 'echo scratch > untracked.txt'
+pe_age "$TMP/pe_d2/rig/crew/worker-pe"
+run_pe pe_d2
+pe_kept pe_d2 "patch-equivalent HEAD but an untracked file"
+
+# (e) a live process has the tree as cwd → KEPT; (f) younger than the gate → KEPT
+mk_rebased_rig pe_e
+( cd "$TMP/pe_e/rig/crew/worker-pe" && pwd -P ) > "$TMP/pe_e_lsof.txt"
+run_pe pe_e WORKTREE_REAPER_FAKE_LSOF="$TMP/pe_e_lsof.txt"
+pe_kept pe_e "patch-equivalent HEAD but a live process has it as cwd"
+mk_rebased_rig pe_f
+touch "$TMP/pe_f/rig/crew/worker-pe"
+run_pe pe_f
+pe_wt pe_f && pe_br pe_f && ok "ga-1md7na (f): patch-equivalent HEAD younger than the age gate → KEPT" \
+           || bad "ga-1md7na (f): a worktree younger than the age gate was reaped"
+
+# (g) dry-run: would_reap event, nothing removed
+mk_rebased_rig pe_g
+run_pe pe_g WORKTREE_REAPER_ENABLED=0
+pe_wt pe_g && pe_br pe_g && [ "$(events pe_g would_reap_locked_unparseable_patch_equivalent)" = "1" ] \
+  && ok "ga-1md7na (g): dry-run logs would_reap_locked_unparseable_patch_equivalent and removes nothing" \
+  || bad "ga-1md7na (g): dry-run — wt=$(pe_wt pe_g && echo y || echo n) br=$(pe_br pe_g && echo y || echo n) would_ev=$(events pe_g would_reap_locked_unparseable_patch_equivalent)"
+
+# (h) loop 1 (legacy path-glob over .gc-worktrees) shares the safety net but has its own wiring
+PEL1="$TMP/pe_l1"; mkdir -p "$PEL1/.gc-worktrees"
+git init -q --bare "$TMP/pe_l1_remote.git"
+git init -q -b main "$PEL1"
+( cd "$PEL1" || exit 1
+  git remote add origin "$TMP/pe_l1_remote.git"
+  echo base > base.txt; echo other > other.txt; git add base.txt other.txt; git commit -qm base
+  git push -q origin main
+  git worktree add -q .gc-worktrees/pe-l1 -b w/pel1 main
+  ( cd .gc-worktrees/pe-l1 && echo feature > feature.txt && git add feature.txt && git commit -qm feature )
+  echo more >> other.txt; git commit -qam "main moves on"
+  git cherry-pick w/pel1 >/dev/null
+  git push -q origin main; git fetch -q origin
+  git remote set-head origin main 2>/dev/null || true
+  git worktree lock --reason "wa-pe build (wa-worker-adhoc-gone-l1)" .gc-worktrees/pe-l1
+) >/dev/null 2>&1
+pe_age "$PEL1/.gc-worktrees/pe-l1"
+run_pe pe_l1
+git -C "$PEL1" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktrees/pe-l1\$" >/dev/null \
+  && bad "ga-1md7na (h): loop-1 rebased+patch-equivalent locked worktree NOT reaped (wiring drifted from loop 2)" \
+  || ok "ga-1md7na (h): loop-1 (legacy path-glob) reaps the rebased+patch-equivalent locked worktree too"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
