@@ -61,12 +61,14 @@ VB="lib/predictive_dialer/voicebot"
 reset_scenario() {
   SC_FILES="$VB/capture_policy.py"   # files the merge's own delta changes
   SC_MOVE=""                         # "<src> <dst>": a pure rename inside the delta
+  SC_RM_PKG=0                        # the delta deletes the WHOLE voicebot package
   SC_STATUS_RC=0
   SC_STATUS_OUT="STATUS: em dia — md5 igual na VM"
   SC_STATUS_SLEEP=0
   SC_SCRIPT_PRESENT=1                # voicebot_vm_sync.py exists in the checkout
   SC_CLOSURE_OUT="pipedrive_field_ids"
   SC_CLOSURE_RC=0
+  SC_CLOSURE_PRESENT=1               # scripts/voicebot_vm_lib_closure.py exists (the rig WA has it; other rigs never do)
   SC_PRE_MAIN_KNOWN=1                # the gate comment recorded MERGE_PRE_MAIN
   SC_HAS_VOICEBOT_DIR=1              # the rig carries the voicebot package at all
   SC_LABELS=""                       # extra STORY_LABELS entries (comma-joined)
@@ -106,6 +108,7 @@ run_block() {
     set -- $SC_MOVE
     mkdir -p "$REPO/$(dirname "$2")"; git -C "$REPO" mv "$1" "$2"
   fi
+  [ "$SC_RM_PKG" = "1" ] && git -C "$REPO" rm -rq "$VB"
   git -C "$REPO" add -A; git -C "$REPO" commit -q -m C1
   local SHA_C1; SHA_C1="$(git -C "$REPO" rev-parse HEAD)"
 
@@ -123,13 +126,15 @@ if out:
 sys.exit(int(os.environ.get("STUB_RC", "0")))
 PYEOF
   fi
-  cat > "$REPO/scripts/voicebot_vm_lib_closure.py" <<'PYEOF'
+  if [ "$SC_CLOSURE_PRESENT" = "1" ]; then
+    cat > "$REPO/scripts/voicebot_vm_lib_closure.py" <<'PYEOF'
 import os, sys
 out = os.environ.get("STUB_CLOSURE_OUT", "")
 if out:
     print(out.replace(" ", "\n"))
 sys.exit(int(os.environ.get("STUB_CLOSURE_RC", "0")))
 PYEOF
+  fi
   if [ -n "$SC_STATE_DETAIL" ]; then
     mkdir -p "$REPO/shared/data"
     jq -n --arg d "$SC_STATE_DETAIL" '{status:"falhou", detail:$d}' > "$REPO/shared/data/voicebot_vm_sync_state.json"
@@ -411,6 +416,109 @@ run_block
 echo "(o) voicebot_vm_delta_touched with no runtime_dir cannot claim 'nothing to verify'"
 voicebot_vm_delta_touched "" "abc" "def"
 [ "$VM_DELTA_VERDICT" = "unknown" ] && ok "o1 no runtime_dir -> unknown" || nok "o1 no runtime_dir read as '$VM_DELTA_VERDICT'" "$VM_DELTA_WHY"
+
+# ── (p) a rig WITHOUT the voicebot package has nothing to carry — however the delta reads ──
+# Gate fix-attempt 1 (ga-t3thji). The "rig sem o pacote => no" rule used to guard only the
+# UNREADABLE-delta branch. A READABLE delta that changes a top-level lib/*.py looked for a
+# closure script that can never exist in such a rig and answered "unknown" — so every
+# property_scrapers story touching lib/*.py got a false "VM do voicebot não verificada:
+# contrato ausente ... mexe no que roda na VM" comment, forever (wa-y0su67 merging never
+# puts the script in that checkout). run_block always wrote the closure stub, which is why
+# g3/h2/h3 never reached it: SC_CLOSURE_PRESENT=0 is the rig as it really is.
+echo "(p) rig without the voicebot package: readable delta + lib/ change + no closure script -> nothing to verify"
+reset_scenario; new_city
+SC_HAS_VOICEBOT_DIR=0; SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_SCRIPT_PRESENT=0
+run_block
+[ "$RUN_RC" -eq 0 ] && reached && ok "p1 the story proceeds" || nok "p1 rc/reached" "rc=$RUN_RC $VARS_OUT out=[$BLOCK_OUT]"
+[ "$VM_CALLS" = "0" ] && ok "p1 0 calls to the contract script" || nok "p1 VM calls=$VM_CALLS" ""
+has "$BD_CALLS" "contrato ausente" && nok "p1 a rig with no voicebot got the false 'contrato ausente' comment on its story" "$BD_CALLS" || ok "p1 no 'contrato ausente' comment"
+has "$BD_CALLS" "VM do voicebot" && nok "p1 some VM comment was written on a story that cannot touch the VM" "$BD_CALLS" || ok "p1 nothing about the VM written on the bead"
+has "$LOG_OUT" "rig sem o pacote" && ok "p1 logged: rig sem o pacote" || nok "p1 the reason is not the rig-has-no-package one" "$LOG_OUT"
+[ "$STATE_AFTER" = "<none>" ] && ok "p1 no hold/absent state file written" || nok "p1 state file written for a story that is not about the VM" "$STATE_AFTER"
+reset_scenario; new_city
+SC_HAS_VOICEBOT_DIR=0; SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "0" ] && reached && ok "p2 even with the contract script present: not consulted, proceeds" || nok "p2 consulted for a rig without a voicebot (closure absent read as 'unknown')" "calls=$VM_CALLS $VARS_OUT"
+# Control (passes on HEAD too): a merge that ADDS the package must still ask. Step 4 has
+# already pulled the tree, so the directory exists when the check runs.
+reset_scenario; new_city
+SC_HAS_VOICEBOT_DIR=0; SC_FILES="$VB/capture_policy.py"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "p3 a merge that introduces the voicebot package is consulted and held" || nok "p3 the package-absent check hid a merge that ADDS the package" "calls=$VM_CALLS $VARS_OUT"
+
+# Control (passes on HEAD too): a merge that DELETES the whole package leaves a post-pull
+# tree with no package directory, yet the VM still holds the old copy — that delta is
+# "yes", so the package-absent rule must never run ahead of the package-file match.
+reset_scenario; new_city
+SC_RM_PKG=1; SC_FILES=""; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "p4 a merge that deletes the whole voicebot package is consulted and held (the VM still has it)" || nok "p4 deleting the package was read as 'rig sem o pacote'" "calls=$VM_CALLS $VARS_OUT"
+
+# ── (q) 'could not tell' is never worded as 'it touches the VM' ──
+# Same class as (p): the comments said "este merge mexe no que roda na VM" while the
+# parenthesised reason said the delta could not be read / the closure could not be
+# computed. Known (yes) keeps the assertive wording; unknown says "pode mexer".
+echo "(q) the wording follows the verdict: 'mexe' only when the delta was PROVEN to touch the VM"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_SCRIPT_PRESENT=0
+run_block
+has "$BD_CALLS" "contrato ausente" && ok "q1 (control) the contract-absent comment is still posted when the delta is unknown" || nok "q1 no contract-absent comment" "$BD_CALLS"
+has "$BD_CALLS" "pode mexer" && ok "q1 contract-absent + unknown delta says 'pode mexer'" || nok "q1 unknown delta not hedged in the contract-absent comment" "$BD_CALLS"
+has "$BD_CALLS" "Este merge mexe no que roda" && nok "q1 unknown delta stated as fact: 'Este merge mexe no que roda na VM'" "$BD_CALLS" || ok "q1 no flat 'mexe no que roda' for an unknown delta"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — VM sem resposta"
+run_block
+has "$BD_CALLS" "Delivery HELD" && has "$BD_CALLS" "pode mexer" && ok "q2 HELD comment on an unknown delta says 'pode mexer'" || nok "q2 HELD comment not hedged" "$BD_CALLS"
+has "$BD_CALLS" "este merge mexe no que roda" && nok "q2 HELD comment states an unknown delta as fact" "$BD_CALLS" || ok "q2 HELD comment has no flat 'mexe no que roda'"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5"
+run_block
+has "$BD_CALLS" "Delivery FAILED" && has "$BD_CALLS" "pode mexer" && ok "q3 FAILED comment on an unknown delta says 'pode mexer'" || nok "q3 FAILED comment not hedged" "$BD_CALLS"
+has "$BD_CALLS" "este merge mexe no que roda" && nok "q3 FAILED comment states an unknown delta as fact" "$BD_CALLS" || ok "q3 FAILED comment has no flat 'mexe no que roda'"
+reset_scenario; new_city
+SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+has "$BD_CALLS" "este merge mexe no que roda" && ok "q4 a PROVEN voicebot delta keeps the assertive 'mexe no que roda'" || nok "q4 proven delta lost its assertive wording" "$BD_CALLS"
+has "$BD_CALLS" "pode mexer" && nok "q4 a proven delta was hedged as 'pode mexer'" "$BD_CALLS" || ok "q4 proven delta is not hedged"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_PRESENT=0; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — VM sem resposta"
+run_block
+SINCE=$(( $(date +%s) - 90000 ))
+fp="$(grep '^fp=' "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state" 2>/dev/null | head -1)"
+printf '%s\nsince=%s\nmailed=0\n' "$fp" "$SINCE" > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"
+SC_LABELS="delivery:pending-vm"
+run_block
+has "$GC_CALLS" "mail send mayor" && ok "q5 (control) pending > 24h on an unknown delta still mails the Mayor" || nok "q5 no mail" "$GC_CALLS"
+has "$GC_CALLS" "o merge mexe no voicebot" && nok "q5 the Mayor mail states an unknown delta as fact: 'o merge mexe no voicebot'" "$GC_CALLS" || ok "q5 the Mayor mail does not state an unknown delta as fact"
+
+# ── (r) Step 8 sweeps every delivery label this gate can leave behind ──
+# Step 6a removes delivery:pending-vm itself, but with `-q 2>/dev/null || true`; a failed
+# removal would leave a stale hold label on a story that is already story:done. Step 8
+# is the backstop that already clears delivery:failed / delivery:deploy-pending.
+# (A text-level guard: Step 8 itself is not run by this harness.)
+echo "(r) the Step 8 terminal cleanup also drops delivery:pending-vm"
+STEP8="$(sed -n '/^# ── Step 8: Mark story:done/,$p' "$DELIVERY")"
+has "$STEP8" '"delivery:pending-vm"' && ok "r1 Step 8 removes delivery:pending-vm with the other delivery labels" || nok "r1 Step 8 leaves a stale delivery:pending-vm on a delivered story" ""
+
+# ── (s) add the hold label BEFORE releasing delivery:running ──
+# remove-then-add leaves a window in which a janitor sweep sees neither label on the story
+# (nothing says "a delivery owns this"). add-then-remove keeps one of them at every instant.
+echo "(s) the hold label lands before delivery:running is released"
+line_of() { printf '%s\n' "$1" | grep -n -F -- "$2" | head -1 | cut -d: -f1; }
+reset_scenario; new_city
+SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+add_ln="$(line_of "$BD_CALLS" "label add ga-test delivery:pending-vm")"; rm_ln="$(line_of "$BD_CALLS" "label remove ga-test delivery:running")"
+[ -n "$add_ln" ] && [ -n "$rm_ln" ] && [ "$add_ln" -lt "$rm_ln" ] \
+  && ok "s1 pending: delivery:pending-vm added (call $add_ln) before delivery:running removed (call $rm_ln)" \
+  || nok "s1 pending: running released before the hold label exists (add@${add_ln:-none} remove@${rm_ln:-none})" "$BD_CALLS"
+reset_scenario; new_city
+SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5"
+run_block
+add_ln="$(line_of "$BD_CALLS" "label add ga-test delivery:failed")"; rm_ln="$(line_of "$BD_CALLS" "label remove ga-test delivery:running")"
+[ -n "$add_ln" ] && [ -n "$rm_ln" ] && [ "$add_ln" -lt "$rm_ln" ] \
+  && ok "s2 failed: delivery:failed added (call $add_ln) before delivery:running removed (call $rm_ln)" \
+  || nok "s2 failed: running released before delivery:failed exists (add@${add_ln:-none} remove@${rm_ln:-none})" "$BD_CALLS"
 
 # ── (j) dry-run writes nothing ──
 echo "(j) DRY_RUN=1: reads the status, writes nothing"

@@ -9,7 +9,8 @@
 #   2. For each, load its rig's deploy runbook from delivery-runbooks.toml.
 #   3. Deploy: run the rig's deploy_cmd (git pull / etc.)
 #   4. Restart daemons listed in daemon_restarts (if any).
-#   4b. (ga-2kaan2) A merge that touches the voicebot must find the dialer VM
+#   4b. (ga-2kaan2; code: Step 6a, just before the prod test) A merge that touches
+#      the voicebot must find the dialer VM
 #      PROVEN equal to main (voicebot_vm_sync.py --status): pending/unreadable
 #      HOLDS the story (delivery:pending-vm, never closed), failed -> delivery:failed.
 #   5. Run the rig's prod_test_script (with STORY_ID set so story-specific
@@ -727,7 +728,9 @@ VM_VERDICT=""; VM_REASON=""; VM_STDOUT=""
 #           Step 5b — never a guessed MERGE_SHA^), or the closure cannot be
 #           computed (the script refuses, is missing or times out) while a lib/
 #           file changed. In a rig WITHOUT the voicebot package there is nothing
-#           to carry, so an unreadable delta there is "no", not "unknown".
+#           to carry, so there an unreadable delta — or a lib/ change with no closure
+#           script to ask — is "no", not "unknown". (A delta that touches package
+#           files is "yes" in every rig, even when the package is gone afterwards.)
 voicebot_vm_delta_touched() {
   local rt="$1" base="$2" sha="$3" pkg="lib/predictive_dialer/voicebot"
   local base_sha="" files="" f m cand="" closure="" closure_script
@@ -757,6 +760,17 @@ voicebot_vm_delta_touched() {
   done <<< "$files"
   if [ -z "${cand// /}" ]; then
     VM_DELTA_VERDICT="no"; VM_DELTA_WHY="o delta do merge não toca o pacote voicebot nem arquivo de lib/"; return 0
+  fi
+  # A top-level lib/*.py changed. In a rig WITHOUT the voicebot package there is nothing
+  # to carry to the VM, and the closure script (only the rig WA has one) can never exist
+  # there — asking for it would answer "unknown" about something the code CAN know, and
+  # that "unknown" used to surface as a false "contrato ausente" comment on every
+  # property_scrapers story touching lib/ (gate fix-attempt 1). The check sits HERE, after
+  # the package-file match above, not at the top: a merge that DELETES the whole package
+  # leaves a post-pull tree with no directory while the VM still holds the old copy, and
+  # its delta already returned "yes" from the package-file arm.
+  if [ ! -d "$rt/$pkg" ]; then
+    VM_DELTA_VERDICT="no"; VM_DELTA_WHY="rig sem o pacote $pkg — nada a levar pra VM (lib/ mudou: ${cand# })"; return 0
   fi
   closure_script="$rt/scripts/voicebot_vm_lib_closure.py"
   if [ -f "$closure_script" ] \
@@ -3723,6 +3737,11 @@ VM_SCRIPT="${VOICEBOT_VM_SYNC_SCRIPT:-$RUNTIME_DIR/scripts/voicebot_vm_sync.py}"
 VM_ON_BEAD=0;     case ",$STORY_LABELS," in *",delivery:pending-vm,"*) VM_ON_BEAD=1 ;; esac
 VM_FAILED_ON_BEAD=0; case ",$STORY_LABELS," in *",delivery:failed,"*) VM_FAILED_ON_BEAD=1 ;; esac
 voicebot_vm_delta_touched "$RUNTIME_DIR" "$MERGE_PRE_MAIN" "$MERGE_SHA"
+# What the comments/mail say the merge does to the VM follows the verdict: "mexe" only when
+# the delta was PROVEN to reach it. "unknown" (delta unreadable, closure not computable) is
+# "pode mexer" — a hedge, never the flat claim (root-class:error-vs-empty, gate fix-attempt 1).
+VM_TOUCH="pode mexer"
+if [ "$VM_DELTA_VERDICT" = "yes" ]; then VM_TOUCH="mexe"; fi
 if [ "$VM_DELTA_VERDICT" = "no" ] || [ ! -f "$VM_SCRIPT" ]; then
   # Nothing to ask (delta clean) or nobody to ask (contract absent). Either way an
   # old delivery:pending-vm no longer describes anything true: drop it.
@@ -3737,7 +3756,7 @@ if [ "$VM_DELTA_VERDICT" = "no" ] || [ ! -f "$VM_SCRIPT" ]; then
     if [ "$DRY_RUN" = "1" ]; then
       log "DRY_RUN=1 — WOULD: comment $STORY_ID 'VM do voicebot não verificada: contrato ausente'"
     elif [ "$(voicebot_vm_state_get "$VM_HOLD_FILE" fp)" != "$VM_FP" ]; then
-      if bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot não verificada: contrato ausente (ga-2kaan2). Este merge mexe no que roda na VM do discador ($VM_DELTA_WHY), mas $VM_SCRIPT não existe neste checkout — a wa-y0su67 ainda não entrou no main. A entrega segue como antes e NÃO prova que a VM roda o código novo; se a VM precisar do deploy, ele é manual até o contrato existir." 2>/dev/null; then
+      if bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot não verificada: contrato ausente (ga-2kaan2). Este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY), mas $VM_SCRIPT não existe neste checkout — a wa-y0su67 ainda não entrou no main. A entrega segue como antes e NÃO prova que a VM roda o código novo; se a VM precisar do deploy, ele é manual até o contrato existir." 2>/dev/null; then
         mkdir -p "$VM_HOLD_DIR" 2>/dev/null || true
         printf 'fp=%s\nsince=%s\nmailed=0\n' "$VM_FP" "$(date +%s)" > "$VM_HOLD_FILE" 2>/dev/null || true
       fi
@@ -3785,12 +3804,14 @@ else
       if [ "$DRY_RUN" = "1" ]; then
         log "DRY_RUN=1 — WOULD: delivery:failed + comment (stdout + state detail) + nudge author/Mayor; story:done WITHHELD"
       else
-        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+        # Add the hold label BEFORE releasing delivery:running: remove-then-add leaves an
+        # instant in which a janitor sweep sees neither (nothing says a delivery owns the story).
         [ "$VM_FAILED_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
+        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
         [ "$VM_ON_BEAD" = "1" ] && bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
         VM_STORE_FP="$VM_PREV_FP"
         if [ "$VM_PREV_FP" != "$VM_FP" ]; then
-          if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED (ga-2kaan2, VM do voicebot): este merge mexe no que roda na VM do discador ($VM_DELTA_WHY) e o sync da VM FALHOU.
+          if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED (ga-2kaan2, VM do voicebot): este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY) e o sync da VM FALHOU.
 Status: $VM_REASON
 Saída do voicebot_vm_sync.py --status:
 ${VM_STDOUT:-<vazia>}
@@ -3825,14 +3846,15 @@ story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega 
       if [ "$DRY_RUN" = "1" ]; then
         log "DRY_RUN=1 — WOULD: bd label add $STORY_ID delivery:pending-vm + comment ($VM_REASON); story:done WITHHELD, re-asked next cycle (Mayor mail due: $VM_MAIL_DUE)"
       else
-        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+        # Hold label first, then release delivery:running (see the failed branch above).
         [ "$VM_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
+        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
         case "$VM_PREV_FP" in failed\|*)
           bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed" -q 2>/dev/null || true ;;
         esac
         VM_STORE_FP="$VM_PREV_FP"
         if [ "$VM_PREV_FP" != "$VM_FP" ]; then
-          if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HELD (ga-2kaan2, VM do voicebot): este merge mexe no que roda na VM do discador ($VM_DELTA_WHY) e a VM NÃO está provada igual ao main.
+          if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HELD (ga-2kaan2, VM do voicebot): este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY) e a VM NÃO está provada igual ao main.
 Status: $VM_REASON
 ${VM_STDOUT:+Saída do voicebot_vm_sync.py --status:
 $VM_STDOUT
@@ -3850,7 +3872,7 @@ story:done SEGURADO — fechar agora seria declarar 'done' com a VM rodando cód
           VM_SINCE_HUMAN="$(date -u -r "$VM_SINCE" '+%Y-%m-%d %H:%MZ' 2>/dev/null || date -u -d "@$VM_SINCE" '+%Y-%m-%d %H:%MZ' 2>/dev/null || echo "epoch $VM_SINCE")"
           if gc --city "$GC_CITY" mail send mayor \
                -s "VM do voicebot pendente há mais de 24h: $STORY_ID" \
-               -m "$(printf 'A story %s (rig %s) está com story:done SEGURADO desde %s: o merge mexe no voicebot e a VM do discador não está provada igual ao main.\n\nÚltimo status: %s\n\nA entrega reconsulta voicebot_vm_sync.py --status a cada ciclo e segue sozinha quando virar exit 0. Se o sync parou de avisar, é isto que o teto de 24h pega.\n\nBead: %s   Store: %s' "$STORY_ID" "$RIG" "$VM_SINCE_HUMAN" "$VM_REASON" "$STORY_ID" "$STORY_STORE")" \
+               -m "$(printf 'A story %s (rig %s) está com story:done SEGURADO desde %s: o merge %s no voicebot e a VM do discador não está provada igual ao main.\n\nÚltimo status: %s\n\nA entrega reconsulta voicebot_vm_sync.py --status a cada ciclo e segue sozinha quando virar exit 0. Se o sync parou de avisar, é isto que o teto de 24h pega.\n\nBead: %s   Store: %s' "$STORY_ID" "$RIG" "$VM_SINCE_HUMAN" "$VM_TOUCH" "$VM_REASON" "$STORY_ID" "$STORY_STORE")" \
                2>/dev/null; then
             VM_MAILED=1
           else
@@ -4117,6 +4139,9 @@ $(refino_criteria_status_line "${MISSING_META:-}")" 2>/dev/null || true
   # now genuinely deployed; stale markers must not linger on a delivered story.
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:deploy-pending" -q 2>/dev/null || true
   bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed"          -q 2>/dev/null || true
+  # ga-2kaan2: Step 6a already dropped a stale delivery:pending-vm, but with `|| true`; a failed
+  # removal there must not leave a hold label on a story that is now delivered.
+  bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm"      -q 2>/dev/null || true
   # wa-xokje: this story is genuinely delivered now — drop its halt-dedup
   # fingerprint (see Step 5b) so a FUTURE, unrelated halt on this same
   # STORY_ID (should one ever recur) is never silently matched against a
