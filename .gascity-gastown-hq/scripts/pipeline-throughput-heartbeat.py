@@ -34,8 +34,11 @@ DESIGN (adversarially hardened — pure outcome-based is INSUFFICIENT):
         DEFER` line — Dolt protection, not a stall; ga-r1u20) AND the dispatcher's latest
         admission decision is not a deliberate pause (RAM pressure / global session cap /
         drain window / quiet hours — ga-wduv5z; a condition-driven pause stops suppressing
-        after ADMISSION_PAUSE_CEILING_SEC). The in-flight + throttle guards are what stop a
-        single honest 40-minute review, or an intentional deferral, from tripping the alarm.
+        after ADMISSION_PAUSE_CEILING_SEC) AND no run is mid-ASSEMBLY (the newest `Spawning N
+        independent reviewer session(s)` line is not yet admitted/aborted and its chain of spawn
+        attempts is under ASSEMBLY_CEILING_SEC — ga-7wcq1l; the first `still in flight` poll only
+        lands on the sweep AFTER the run is admitted). The in-flight + throttle guards are what
+        stop a single honest 40-minute review, or an intentional deferral, from tripping the alarm.
   - SPECIFIC assertion for the bare-main storm (pure-outcome cannot see it): alert on
     the `Durable-landing ... FAILED / not ancestor` log pattern within the window.
   - Per-session liveness: alert on any ephemeral worker session (gate-reviewer / dog)
@@ -194,6 +197,38 @@ ADMISSION_PAUSE_CEILING_SEC = 7200
 # tail_lines() already parses the whole file and slices; every other scan in
 # gate_merge_stall() stops at a timestamp horizon, not at a line count.
 GATE_TAIL_LINES = 3000
+# ga-7wcq1l: a run still being ASSEMBLED is not a stall either. Once a pause ends the first run
+# logs `Headroom OK` -> `Marker <id> claimed for dispatching.` -> `Spawning N independent reviewer
+# session(s)` -> `Reviewer session N spawned` -> `Verdicts requested` -> `Run <id> admitted: ...`,
+# and only the NEXT sweep's Phase C writes the first `still in flight` line — the one in-flight
+# signal _fresh_review_in_progress() reads. Measured over the whole dispatcher log (2026-09-09..
+# 10-05, 2546 claim -> admitted pairs): p50 141s, p99 438s, max 814s — often longer than a 5-min
+# tick, so CONFIRM_TICKS=2 spawned a repair dog on two healthy runs (10-04 23:55 and 10-05 15:35,
+# both right after a pause ended).
+#
+# The evidence is the `Spawning` line, NOT the bare claim. Of 3137 claims, 508 are handed straight
+# back (`=== Dispatcher sweep complete: ... verdict=QUEUED|NEEDS_REBASE|YIELDED|...`) and not one
+# of them reaches `Spawning`; every claim that really assembles does (claim -> Spawning p50 11s,
+# p99 62s, max 190s). A bare claim is assembly evidence only in the ~20s before the sweep hands it
+# back, but a retry loop is claim -> QUEUED every ~2.3min (2026-09-25 03:41-04:05, ga-r6bore), so
+# that window alone suppressed ~1 tick in 5 of a real 2-hour stall.
+#   "Spawning 1 independent reviewer session(s) ..."
+#   "Run ga-aglpqb admitted: 0/2 verdict(s) in so far — reviewers keep working independently ..."
+ASSEMBLY_SPAWNING_RE = re.compile(r"Spawning \d+ independent reviewer session")
+ASSEMBLY_ADMITTED_RE = re.compile(r"Run \S+ admitted: ")
+# What CLOSES the newest attempt without admitting it (so nothing is assembling any more): the gate
+# aborts (reviewer spawn / verdict-bead failure — 38 of 3137 claims) or a later sweep completes with
+# a verdict (a handed-back claim, which never reaches `Spawning` itself).
+#   "=== Dispatcher sweep complete: branch=B verdict=QUEUED (retry 1/3, ...) ==="
+#   "ERROR: Failed to spawn reviewer session 1 (ga-mzc3h). Aborting gate. spawn_err=..."
+ASSEMBLY_SWEEP_DONE_RE = re.compile(r"=== Dispatcher sweep complete: .*verdict=")
+ASSEMBLY_ABORT_RE = re.compile(r"Aborting gate")
+# How long a chain of spawn attempts may suppress. 900s clears the measured max (814s) and stays
+# inside the bead's 10-15min bound. It is the whole point of the guard that it has a bound: an
+# attempt that dies mid-way (reviewers spawned, then the sweep is killed or Dolt times out) IS the
+# stall the repair dog exists for. That is common, not hypothetical — 36 spawned claims never reach
+# 'admitted' and get re-claimed (one dead chain: 64 claims over 156min, 2026-09-25 01:45).
+ASSEMBLY_CEILING_SEC = 900
 # Durable-landing FAIL signatures (quality-gate-dispatcher.sh ~lines 1840/1846/1857/1863):
 #   "Durable-landing AUDIT FAILED: merge <sha> not in rig-canonical main ..."
 #   "Durable-landing AUDIT FAILED: merge <sha> not in origin/main ... shared-remote clobber"
@@ -467,6 +502,57 @@ def _admission_pause_deferring(lines, now):
     return (True, paused)
 
 
+def _assembly_chain_ended(line):
+    """True for a line after which earlier spawn attempts no longer count as one 'assembling'
+    chain (ga-7wcq1l): a run was ADMITTED (Phase C polls take over from there) or merged, or the
+    dispatcher DECLINED to admit (headroom DEFER, or one of the deliberate pauses that
+    _admission_pause_state() knows) — so an attempt logged after it is a fresh one and does not
+    inherit the minutes the gate spent throttled. 'Headroom OK', an aborted attempt and a
+    handed-back claim deliberately do NOT end a chain: none of them is progress, and a retry loop
+    must not hand out a fresh grace period per retry (error ≠ declined, same rule as
+    _admission_resumed)."""
+    if (ASSEMBLY_ADMITTED_RE.search(line) or GATE_MERGING in line or GATE_PASS in line
+            or ADMISSION_PAUSE_CONDITION_RE.search(line)
+            or ADMISSION_PAUSE_SCHEDULED_RE.search(line)):
+        return True
+    m = HEADROOM_DECISION_RE.search(line)
+    return bool(m and m.group(1) == "DEFER")
+
+
+def _run_assembling(lines, now):
+    """True if the gate is mid-ASSEMBLY of a run (ga-7wcq1l): the newest `Spawning N independent
+    reviewer session(s)` line is still OPEN (nothing after it admitted, completed or aborted it)
+    AND the chain of spawn attempts it belongs to started no more than ASSEMBLY_CEILING_SEC ago.
+
+    The chain, not just the newest attempt, is what gets bounded. An attempt that dies silently is
+    re-claimed on a later sweep, and a ceiling measured from the NEWEST attempt would restart on
+    every retry — one measured stall re-claimed 64 times over 156min — hiding exactly the stall
+    this check exists to catch. So walk back through the attempts until something ends the chain
+    (_assembly_chain_ended), the log goes quiet for longer than FLOW_WINDOW_SEC (a hole is not
+    assembly time — same rule as _admission_pause_state), or the chain outlasts the ceiling.
+    Aborted attempts and handed-back claims in between are skipped, not chain ends.
+
+    Mirrors _headroom_deferring: the latest decision is the gate's current self-assessment, so
+    when the newest relevant line is an admission, an abort or a verdict, nothing is being
+    assembled."""
+    start = None
+    for l in reversed(lines):
+        if ASSEMBLY_SPAWNING_RE.search(l):
+            e = log_ts_epoch(l)
+            if e is None:
+                continue  # an undated line cannot be aged, so it is no evidence
+            if start is not None and start - e > FLOW_WINDOW_SEC:
+                break  # a hole in the log, not assembly time: nothing says what happened in it
+            start = e
+            if now - start > ASSEMBLY_CEILING_SEC:
+                return False  # newest attempt already stale, or the chain outlasted the ceiling
+        elif _assembly_chain_ended(l):
+            break
+        elif start is None and (ASSEMBLY_SWEEP_DONE_RE.search(l) or ASSEMBLY_ABORT_RE.search(l)):
+            return False  # the newest attempt was already aborted / handed back: it is closed
+    return start is not None
+
+
 def gate_merge_stall(now=None):
     """Returns a reason string when the gate has queued work but produced no merge in
     the window and no review is legitimately running; else None. Independent of the
@@ -514,6 +600,12 @@ def gate_merge_stall(now=None):
                 "(RAM/teto de sessões) há %dmin — passou do teto de %dmin de supressão; uma "
                 "pausa que dura tanto precisa de olho humano" %
                 (backlog, paused // 60, ADMISSION_PAUSE_CEILING_SEC // 60))
+
+    if _run_assembling(lines, now):
+        return None  # ga-7wcq1l: reviewers were being spawned for a run within ASSEMBLY_CEILING_SEC
+                     # and it is neither admitted nor aborted yet → the first 'still in flight'
+                     # poll just has not been written. Bounded: a chain of spawn attempts that
+                     # outlasts the ceiling falls through to the alarm below.
 
     return ("Gate com %d marker(s) na fila e ZERO merges em %dmin, sem revisão ativa "
             "em andamento — fila não drena sob demanda" % (backlog, FLOW_WINDOW_SEC // 60))
