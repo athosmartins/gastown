@@ -183,7 +183,10 @@ fi
 # ── 3. DRIFT GUARD: guard (b) — right after the daemon-refresh subprocess ──
 echo "── 3. drift guard: post-daemon-refresh guard wired correctly ──"
 REFRESH_CALL_LN=$(grep -n 'bash "\$REFRESH_HELPER" || true)' "$SCRIPT" | head -1 | cut -d: -f1)
-GUARD_B_LN=$(grep -n 'if story_bead_closed_now "\$STORY_STORE" "\$STORY_ID"; then' "$SCRIPT" | tail -1 | cut -d: -f1)
+# Guard (b) is the FIRST call site after the REFRESH_HELPER call. (It used to be "the last
+# call site in the file"; ga-2kaan2 added re-checks in Step 6a, further down, which that
+# locator then mistook for guard (b).)
+GUARD_B_LN=$(grep -n 'if story_bead_closed_now "\$STORY_STORE" "\$STORY_ID"; then' "$SCRIPT" | awk -F: -v lo="$REFRESH_CALL_LN" '$1 > lo {print $1; exit}')
 VERDICT_CASE_LN=$(grep -n 'case "\$REFRESH_VERDICT" in' "$SCRIPT" | head -1 | cut -d: -f1)
 STEP5B_DELIVERY_FAILED_LN=$(grep -n 'label add    "\$STORY_ID" "delivery:failed"  -q 2>/dev/null || true' "$SCRIPT" | awk -F: -v lo="$VERDICT_CASE_LN" '$1 > lo {print $1; exit}')
 

@@ -25,6 +25,14 @@
 # Negative controls (c, c2, h2, g3: "must NOT consult the VM") pass on today's
 # HEAD by construction — HEAD never consults. They exist to stop an over-eager
 # implementation (always consult); they were proven against exactly such a mutant.
+#
+# Sections (p)-(s) came from gate fix-attempt 1 (ga-t3thji); (t)-(z) and o2 from fix-attempt 2
+# (ga-8xbsjh). Both rounds are the SAME class (root-class:error-vs-empty): every "could not
+# know" in the block — a rig whose tree cannot be read, a path git quoted, an empty or garbled
+# closure, an unreadable status, a failed state write, a contract script that vanished under a
+# standing hold — has to come out as the INERT answer (consult / hold / warn), never as the
+# harmless one ("no", "em dia", silence). Cases that pass on the previous HEAD by design are
+# controls or guards for the restructure: t4, t5b, t6, t6b, u2, w3, y3-y5, z3.
 
 set -u
 
@@ -76,6 +84,11 @@ reset_scenario() {
   SC_DRY_RUN=0
   SC_TIMEOUT_S=20
   SC_MAIL_AFTER_S=""                 # override of the 24h Mayor-mail threshold
+  SC_STATUS_ERR=""                   # what the contract script writes to STDERR
+  SC_CLOSED_NOW=0                    # `bd show` reports the story closed (someone closed it mid-sweep)
+  SC_BD_FAIL_COMMENT=0               # `bd comment` fails (rc 1)
+  SC_GC_FAIL_MAIL=0                  # `gc mail send` fails (rc 1)
+  SC_BREAK_STATE_DIR=0               # the hold-state directory cannot be created
 }
 
 # new_city — a fresh GC_CITY (holds the per-story hold state between cycles).
@@ -123,6 +136,9 @@ time.sleep(float(os.environ.get("STUB_SLEEP", "0")))
 out = os.environ.get("STUB_OUT", "")
 if out:
     print(out)
+err = os.environ.get("STUB_ERR", "")
+if err:
+    sys.stderr.write(err + "\n")
 sys.exit(int(os.environ.get("STUB_RC", "0")))
 PYEOF
   fi
@@ -131,7 +147,7 @@ PYEOF
 import os, sys
 out = os.environ.get("STUB_CLOSURE_OUT", "")
 if out:
-    print(out.replace(" ", "\n"))
+    sys.stdout.buffer.write(os.fsencode(out.replace(" ", "\n")) + b"\n")
 sys.exit(int(os.environ.get("STUB_CLOSURE_RC", "0")))
 PYEOF
   fi
@@ -140,14 +156,29 @@ PYEOF
     jq -n --arg d "$SC_STATE_DETAIL" '{status:"falhou", detail:$d}' > "$REPO/shared/data/voicebot_vm_sync_state.json"
   fi
   export STUB_CALLS STUB_RC="$SC_STATUS_RC" STUB_OUT="$SC_STATUS_OUT" STUB_SLEEP="$SC_STATUS_SLEEP"
-  export STUB_CLOSURE_OUT="$SC_CLOSURE_OUT" STUB_CLOSURE_RC="$SC_CLOSURE_RC"
+  export STUB_CLOSURE_OUT="$SC_CLOSURE_OUT" STUB_CLOSURE_RC="$SC_CLOSURE_RC" STUB_ERR="$SC_STATUS_ERR"
+  # A regular file where the hold-state DIRECTORY should go: mkdir -p fails, writes fail.
+  if [ "$SC_BREAK_STATE_DIR" = "1" ]; then : > "$CITY/.gc/runtime/voicebot-vm-hold"; fi
   export VOICEBOT_VM_STATUS_TIMEOUT_S="$SC_TIMEOUT_S"
   if [ -n "$SC_MAIL_AFTER_S" ]; then export VOICEBOT_VM_PENDING_MAIL_AFTER_S="$SC_MAIL_AFTER_S"
   else unset VOICEBOT_VM_PENDING_MAIL_AFTER_S; fi
 
   LOG_FILE="$T/log.log"; BD_LOG="$T/bd.log"; GC_LOG="$T/gc.log"; VARS_FILE="$T/vars.out"
-  bd()   { echo "bd $*" >> "$BD_LOG"; }
-  gc()   { echo "gc $*" >> "$GC_LOG"; }
+  # `bd -C <store> <verb> ...`: $3 is the verb. `show` answers the closed-now re-check.
+  bd()   {
+    echo "bd $*" >> "$BD_LOG"
+    if [ "${3:-}" = "show" ]; then
+      if [ "$SC_CLOSED_NOW" = "1" ]; then echo '[{"status":"closed"}]'; else echo '[{"status":"open"}]'; fi
+      return 0
+    fi
+    if [ "$SC_BD_FAIL_COMMENT" = "1" ] && [ "${3:-}" = "comment" ]; then return 1; fi
+    return 0
+  }
+  gc()   {
+    echo "gc $*" >> "$GC_LOG"
+    case "$*" in *"mail send"*) [ "$SC_GC_FAIL_MAIL" = "1" ] && return 1 ;; esac
+    return 0
+  }
   log()  { echo "$*" >> "$LOG_FILE"; }
   warn() { echo "WARN: $*" >> "$LOG_FILE"; }
   err()  { echo "ERR: $*" >> "$LOG_FILE"; }
@@ -416,6 +447,10 @@ run_block
 echo "(o) voicebot_vm_delta_touched with no runtime_dir cannot claim 'nothing to verify'"
 voicebot_vm_delta_touched "" "abc" "def"
 [ "$VM_DELTA_VERDICT" = "unknown" ] && ok "o1 no runtime_dir -> unknown" || nok "o1 no runtime_dir read as '$VM_DELTA_VERDICT'" "$VM_DELTA_WHY"
+# A runtime dir that does not exist is "could not look", not "the rig has no voicebot package":
+# the package-absent rule only holds when there IS a tree to look at (gate fix-attempt 2 sweep).
+voicebot_vm_delta_touched "$ROOT/no-such-runtime-dir" "abc" "def"
+[ "$VM_DELTA_VERDICT" = "unknown" ] && ok "o2 a runtime_dir that does not exist -> unknown, not 'rig sem o pacote'" || nok "o2 missing runtime_dir read as '$VM_DELTA_VERDICT'" "$VM_DELTA_WHY"
 
 # ── (p) a rig WITHOUT the voicebot package has nothing to carry — however the delta reads ──
 # Gate fix-attempt 1 (ga-t3thji). The "rig sem o pacote => no" rule used to guard only the
@@ -519,6 +554,225 @@ add_ln="$(line_of "$BD_CALLS" "label add ga-test delivery:failed")"; rm_ln="$(li
 [ -n "$add_ln" ] && [ -n "$rm_ln" ] && [ "$add_ln" -lt "$rm_ln" ] \
   && ok "s2 failed: delivery:failed added (call $add_ln) before delivery:running removed (call $rm_ln)" \
   || nok "s2 failed: running released before delivery:failed exists (add@${add_ln:-none} remove@${rm_ln:-none})" "$BD_CALLS"
+
+# ── (t) a path git would C-quote is still a path ──
+# Gate fix-attempt 2 (ga-8xbsjh), blocking 1 (root-class:error-vs-empty). The delta was read
+# with plain `git diff --name-only`, which prints any path with a non-ASCII byte as a C-quoted
+# string ("lib/.../liga\303\247\303\243o.py", leading double quote). No `case` arm matches
+# that, so an accented voicebot file was classified "no": the VM was never asked and the log
+# said the delta "does not touch the voicebot". The WA repo already tracks accented paths.
+# `-z` returns every path verbatim.
+echo "(t) a voicebot/lib file whose NAME git would quote is still seen"
+reset_scenario; new_city
+SC_FILES="$VB/ligação.py"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && pending_label && ok "t1 accented file inside the voicebot package -> consulted, held" || nok "t1 an accented package file was invisible (read as 'no')" "calls=$VM_CALLS $VARS_OUT"
+reset_scenario; new_city
+SC_FILES="$VB/a\"b.py"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "t2 a double quote in the name (git quotes it even with quotePath=false) -> consulted, held" || nok "t2 a name with a double quote was invisible" "calls=$VM_CALLS $VARS_OUT"
+reset_scenario; new_city
+SC_FILES="lib/açúcar.py"; SC_CLOSURE_OUT="açúcar"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "t3 accented lib/*.py that IS in the closure -> consulted, held" || nok "t3 an accented lib file was invisible" "calls=$VM_CALLS $VARS_OUT"
+# Control (passes on HEAD too): a quoted name that reaches nothing must not become a hold.
+reset_scenario; new_city
+SC_FILES="docs/ação.md"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "0" ] && reached && ok "t4 (control) an accented doc outside the package and lib/ is not consulted" || nok "t4 over-held an accented doc" "calls=$VM_CALLS $VARS_OUT"
+
+# Belt and braces: if some git still hands back a C-quoted path, "could not parse" is not "no".
+echo "(t5) a path that still arrives C-quoted cannot be matched -> unknown, never 'no'"
+SH="$(mktemp -d "$ROOT/shim.XXXXXX")"
+git init -q "$SH"; git -C "$SH" config user.email t@t.local; git -C "$SH" config user.name t
+mkdir -p "$SH/$VB"; echo x > "$SH/$VB/a.py"; git -C "$SH" add -A; git -C "$SH" commit -q -m c0
+SH0="$(git -C "$SH" rev-parse HEAD)"; echo y >> "$SH/$VB/a.py"; git -C "$SH" commit -q -am c1; SH1="$(git -C "$SH" rev-parse HEAD)"
+SHN="$(mktemp -d "$ROOT/shim.XXXXXX")"
+git init -q "$SHN"; git -C "$SHN" config user.email t@t.local; git -C "$SHN" config user.name t
+mkdir -p "$SHN/lib"; echo x > "$SHN/lib/x.py"; git -C "$SHN" add -A; git -C "$SHN" commit -q -m c0
+SHN0="$(git -C "$SHN" rev-parse HEAD)"; echo y >> "$SHN/lib/x.py"; git -C "$SHN" commit -q -am c1; SHN1="$(git -C "$SHN" rev-parse HEAD)"
+# A `git` that answers every `diff` with one quoted record + the end-of-list sentinel.
+git() { case " $* " in *" diff "*) printf '"lib/predictive_dialer/voicebot/liga\\303\\247\\303\\243o.py"\0\0'; return 0 ;; esac; command git "$@"; }
+voicebot_vm_delta_touched "$SH" "$SH0" "$SH1"
+V_PKG="$VM_DELTA_VERDICT"
+voicebot_vm_delta_touched "$SHN" "$SHN0" "$SHN1"
+V_NOPKG="$VM_DELTA_VERDICT"
+unset -f git
+[ "$V_PKG" = "unknown" ] && ok "t5a a quoted path in a rig WITH the package -> unknown (the VM gets asked)" || nok "t5a a path that could not be parsed read as '$V_PKG'" ""
+[ "$V_NOPKG" = "no" ] && ok "t5b the same in a rig WITHOUT the package -> no (nothing to carry, as everywhere else)" || nok "t5b rig without the package read as '$V_NOPKG'" ""
+# The delta list is read through a process substitution (a `$(...)` would drop the NUL
+# separators), so git's own failure has to be told apart from "git printed nothing": a diff
+# that FAILS must not read as an empty delta.
+git() { case " $* " in *" diff "*) return 1 ;; esac; command git "$@"; }
+voicebot_vm_delta_touched "$SH" "$SH0" "$SH1"
+V_FAIL="$VM_DELTA_VERDICT"; V_FAIL_WHY="$VM_DELTA_WHY"
+unset -f git
+[ "$V_FAIL" = "unknown" ] && ok "t6 a git diff that FAILS is 'could not read' (unknown), not an empty delta" || nok "t6 a failed git diff read as '$V_FAIL'" "$V_FAIL_WHY"
+# Control: git succeeding with an EMPTY list is a real "nothing changed" -> no.
+git() { case " $* " in *" diff "*) printf '\0'; return 0 ;; esac; command git "$@"; }
+voicebot_vm_delta_touched "$SH" "$SH0" "$SH1"
+V_EMPTY="$VM_DELTA_VERDICT"
+unset -f git
+[ "$V_EMPTY" = "no" ] && ok "t6b (control) git succeeding with an empty list is a real 'no'" || nok "t6b an empty-but-successful diff read as '$V_EMPTY'" ""
+
+# ── (u) the delta predicate is exactly the manifest's, no wider ──
+# voicebot_vm_sync.compute_manifest skips only *.md and the package-ROOT requirements.txt; a
+# nested requirements.txt (or any other file) ships to the VM. The predicate used to skip
+# "$pkg"/*/requirements.txt too — a file the VM receives, read as "nothing reaches the VM".
+echo "(u) only *.md and the package-ROOT requirements.txt stay home"
+reset_scenario; new_city
+SC_FILES="$VB/models/requirements.txt"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "u1 a NESTED requirements.txt ships to the VM -> consulted, held" || nok "u1 a nested requirements.txt was read as 'stays home'" "calls=$VM_CALLS $VARS_OUT"
+reset_scenario; new_city
+SC_FILES="$VB/requirements.txt"; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "0" ] && reached && ok "u2 (control) the package-ROOT requirements.txt still stays home" || nok "u2 over-held the root requirements.txt" "calls=$VM_CALLS $VARS_OUT"
+
+# ── (v) the closure answers 'no' only with a real, readable closure ──
+# Gate fix-attempt 2 (ga-8xbsjh), blocking 2. A closure script that exits 0 and prints
+# NOTHING gave closure="" — accepted as an answer, so every changed lib/*.py read "not in the
+# closure" -> no. The real closure is never empty (22 modules today), so empty output is itself
+# the "could not compute" signal — the same rule voicebot_vm_status applies to an exit 0 it
+# cannot corroborate.
+echo "(v) an empty or unreadable closure is 'could not compute', not 'not in the closure'"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_OUT=""; SC_CLOSURE_RC=0; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "v1 closure exit 0 with EMPTY output -> unknown -> consulted, held" || nok "v1 an empty closure was read as 'not in the closure'" "calls=$VM_CALLS $VARS_OUT"
+has "$BD_CALLS" "pode mexer" && ok "v1 the comment hedges ('pode mexer'), it does not claim the delta touches the VM" || nok "v1 empty closure not hedged" "$BD_CALLS"
+reset_scenario; new_city
+SC_FILES="lib/unrelated.py"; SC_CLOSURE_OUT="ERRO: fechamento incompleto"; SC_CLOSURE_RC=0; SC_STATUS_RC=10
+run_block
+[ "$VM_CALLS" = "1" ] && held && ok "v2 closure exit 0 printing something that is not module names -> unknown -> consulted, held" || nok "v2 an unreadable closure was read as 'not in the closure'" "calls=$VM_CALLS $VARS_OUT"
+
+# ── (w) the cause of an unreadable status is shown ──
+# voicebot_vm_status ran the contract with 2>/dev/null and said "exit 2, que o contrato não
+# define" — but the contract defines 2 ("uso errado"), and its stderr ("ERRO: shared/data
+# ausente (rode scripts/ensure_symlinks.sh)") is the only place the cause is written. The hold
+# was right; the comment and the 24h mail carried a false statement and no cause.
+echo "(w) the status script's stderr reaches the comment; exit 2 is worded as the contract defines it"
+reset_scenario; new_city
+SC_STATUS_RC=2; SC_STATUS_OUT=""; SC_STATUS_ERR="ERRO: shared/data ausente (rode scripts/ensure_symlinks.sh)"
+run_block
+held && pending_label && ok "w1 exit 2 holds as 'não sei'" || nok "w1 exit 2" "$VARS_OUT / $BD_CALLS"
+has "$BD_CALLS" "ensure_symlinks.sh" && ok "w1 the comment carries the script's stderr (the only place the cause is written)" || nok "w1 stderr dropped" "$BD_CALLS"
+has "$BD_CALLS" "uso errado" && ok "w1 exit 2 is called what the contract calls it: uso errado" || nok "w1 exit 2 not described as uso errado" "$BD_CALLS"
+has "$BD_CALLS" "que o contrato não define" && nok "w1 exit 2 described as undefined by the contract (it is defined)" "$BD_CALLS" || ok "w1 no false 'que o contrato não define' for exit 2"
+reset_scenario; new_city
+SC_STATUS_RC=3; SC_STATUS_OUT=""; SC_STATUS_ERR="Traceback: boom"
+run_block
+has "$BD_CALLS" "boom" && has "$BD_CALLS" "que o contrato não define" && ok "w2 an exit the contract really does not define: stderr shown AND still 'não define'" || nok "w2 exit 3" "$BD_CALLS"
+BIGERR="$(head -c 120000 /dev/zero | tr '\0' 'e')"
+reset_scenario; new_city
+SC_STATUS_RC=2; SC_STATUS_OUT=""; SC_STATUS_ERR="$BIGERR"
+run_block
+[ "$RUN_RC" -eq 0 ] && held && [ "${#BD_CALLS}" -lt 8000 ] && ok "w3 120KB of stderr: the block survives and the comment stays bounded (${#BD_CALLS} bytes)" || nok "w3 oversized stderr" "rc=$RUN_RC $VARS_OUT bytes=${#BD_CALLS}"
+
+# ── (x) a story closed while the VM was being read gets no mutation (ga-rugqks) ──
+# The last closed-now check sits before Step 5b's reprobe (up to 180s); delta + closure (<=60s)
+# and --status (<=30s) come after it. The likeliest way a hold ENDS — the Mayor deploys the
+# VM by hand and closes the story — lands in that window.
+echo "(x) closed while 6a was reading -> no label, comment, nudge or mail"
+no_mutation() {
+  local m=0 p
+  for p in "label add" "label remove" " comment "; do has "$BD_CALLS" "$p" && m=1; done
+  has "$GC_CALLS" "session nudge" && m=1
+  has "$GC_CALLS" "mail send" && m=1
+  [ "$m" = "0" ]
+}
+reset_scenario; new_city
+SC_CLOSED_NOW=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+held && no_mutation && ok "x1 pending status on a story closed meanwhile: nothing written, nobody nudged" || nok "x1 mutated a closed story" "$VARS_OUT / $BD_CALLS / $GC_CALLS"
+reset_scenario; new_city
+SC_CLOSED_NOW=1; SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5"
+run_block
+held && no_mutation && ok "x2 failed status on a story closed meanwhile: nothing written, nobody nudged" || nok "x2 mutated a closed story" "$VARS_OUT / $BD_CALLS / $GC_CALLS"
+reset_scenario; new_city
+SC_CLOSED_NOW=1; SC_FILES="docs/x.md"; SC_LABELS="delivery:pending-vm"
+run_block
+held && no_mutation && ok "x3 delta clean + stale pending-vm on a story closed meanwhile: label left alone" || nok "x3 mutated a closed story" "$VARS_OUT / $BD_CALLS / $GC_CALLS"
+reset_scenario; new_city
+SC_CLOSED_NOW=1; SC_LABELS="delivery:pending-vm"
+run_block
+held && no_mutation && ok "x4 em dia + pending-vm on a story closed meanwhile: label left alone" || nok "x4 mutated a closed story" "$VARS_OUT / $BD_CALLS / $GC_CALLS"
+
+# ── (y) the hold state is never silently lost ──
+# `mkdir -p ... || true` + `printf > file 2>/dev/null || true`: with an unwritable state dir
+# `since` was reborn as NOW every cycle, so the 24h Mayor-mail ceiling could never fire and
+# the comment dedup broke — and nothing said so.
+echo "(y) a hold-state write that fails, or a 'since' nobody can read, is a WARN"
+reset_scenario; new_city
+SC_BREAK_STATE_DIR=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+[ "$RUN_RC" -eq 0 ] && held && pending_label && ok "y1 an unwritable hold-state dir does not abort the sweep; the story is still held" || nok "y1 unwritable state dir" "rc=$RUN_RC $VARS_OUT"
+has "$LOG_OUT" "não consegui gravar o estado do hold" && ok "y1 the failed state write is a WARN (the 24h ceiling cannot fire without it)" || nok "y1 the failed state write was silent" "$LOG_OUT"
+reset_scenario; new_city
+SC_BREAK_STATE_DIR=1; SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5"
+run_block
+has "$LOG_OUT" "não consegui gravar o estado do hold" && ok "y1b same WARN on the failed branch" || nok "y1b the failed branch swallowed the state-write failure" "$LOG_OUT"
+reset_scenario; new_city
+mkdir -p "$CITY/.gc/runtime/voicebot-vm-hold"
+printf 'fp=pending|STATUS: pendente — ligação em curso\nsince=lixo\nmailed=0\n' > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"
+SC_LABELS="delivery:pending-vm"; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+has "$LOG_OUT" "since ilegível" && ok "y2 a state file whose 'since' is garbage is a WARN (the 24h clock restarts)" || nok "y2 the 24h clock was reset silently" "$LOG_OUT"
+# Controls for gaps the gate review named (they pass on HEAD too): a failed comment / mail is
+# retried next cycle because its fingerprint / mailed flag was NOT stored.
+reset_scenario; new_city
+SC_BD_FAIL_COMMENT=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+c1="$(count_of "$BD_CALLS" "Delivery HELD")"
+SC_BD_FAIL_COMMENT=0; SC_LABELS="delivery:pending-vm"
+run_block
+c2="$(count_of "$BD_CALLS" "Delivery HELD")"
+[ "$c1" = "1" ] && [ "$c2" = "1" ] && ok "y3 (control) a comment that failed is retried next cycle (fingerprint not stored)" || nok "y3 comment counts $c1 then $c2" "$BD_CALLS"
+reset_scenario; new_city
+SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+SINCE=$(( $(date +%s) - 90000 ))
+fp="$(grep '^fp=' "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state" 2>/dev/null | head -1)"
+printf '%s\nsince=%s\nmailed=0\n' "$fp" "$SINCE" > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"
+SC_LABELS="delivery:pending-vm"; SC_GC_FAIL_MAIL=1
+run_block
+m1="$(count_of "$GC_CALLS" "mail send mayor")"; mailed_after="$(grep '^mailed=' "$STATE_FILE_ABS" 2>/dev/null | head -1)"
+SC_GC_FAIL_MAIL=0
+run_block
+m2="$(count_of "$GC_CALLS" "mail send mayor")"
+[ "$m1" = "1" ] && [ "$mailed_after" = "mailed=0" ] && [ "$m2" = "1" ] && ok "y4 (control) a Mayor mail that failed is retried next cycle (mailed flag not set)" || nok "y4 mail counts $m1 then $m2, state '$mailed_after'" "$GC_CALLS"
+has "$STEP8" 'rm -f "$VM_HOLD_FILE"' && ok "y5 (control) Step 8 removes the hold-state file of a delivered story" || nok "y5 Step 8 leaves the VM hold state behind" ""
+
+# ── (z) a hold already on the bead is never released because nobody can be asked ──
+# Contract absent = "behave as before" is for a story that was NEVER held. If the contract
+# script later disappears from the checkout (revert, odd checkout) while delivery:pending-vm —
+# or a VM-originated delivery:failed — is on the story, "could not ask" used to proceed exactly
+# like "the VM is fine": the label came off and the story reached story:done.
+echo "(z) script gone while a VM hold exists -> still held (could not ask != em dia)"
+reset_scenario; new_city
+SC_SCRIPT_PRESENT=0; SC_LABELS="delivery:pending-vm"
+run_block
+held && ok "z1 pending hold + contract script gone -> still held" || nok "z1 the hold was released because the script vanished" "$VARS_OUT"
+has "$BD_CALLS" "label remove ga-test delivery:pending-vm" && nok "z1 delivery:pending-vm removed although the VM could not be asked" "$BD_CALLS" || ok "z1 delivery:pending-vm kept"
+done_written && nok "z1 story:done/close written" "$BD_CALLS" || ok "z1 no story:done and no close"
+has "$BD_CALLS" "não existe neste checkout" && ok "z1 the comment says the contract script is gone" || nok "z1 the hold was kept without saying why" "$BD_CALLS"
+reset_scenario; new_city
+mkdir -p "$CITY/.gc/runtime/voicebot-vm-hold"
+printf 'fp=failed|STATUS: falhou — md5\nsince=%s\nmailed=0\n' "$(date +%s)" > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"
+SC_SCRIPT_PRESENT=0; SC_LABELS="delivery:failed"
+run_block
+held && pending_label && ok "z2 a VM-originated failed hold + script gone -> still held (as pending-vm)" || nok "z2 a failed VM hold was released" "$VARS_OUT / $BD_CALLS"
+# Control (passes on HEAD too): delivery:failed from ANOTHER cause (prod test, deploy) has no
+# VM hold state, so a missing contract script still means "as today" for that story.
+reset_scenario; new_city
+SC_SCRIPT_PRESENT=0; SC_LABELS="delivery:failed"
+run_block
+reached && has "$BD_CALLS" "contrato ausente" && ok "z3 (control) delivery:failed from another cause + script absent -> proceeds as today, with the comment" || nok "z3 a non-VM failure got held on the VM gate" "$VARS_OUT / $BD_CALLS"
+# The comment states what the code KNOWS (the path is missing), not why it is missing.
+reset_scenario; new_city
+SC_SCRIPT_PRESENT=0
+run_block
+has "$BD_CALLS" "possivelmente a wa-y0su67" && ok "z4 the contract-absent comment hedges its cause ('possivelmente a wa-y0su67 ainda não entrou no main')" || nok "z4 cause stated as fact" "$BD_CALLS"
 
 # ── (j) dry-run writes nothing ──
 echo "(j) DRY_RUN=1: reads the status, writes nothing"

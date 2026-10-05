@@ -1489,6 +1489,40 @@ grep -qF 'if story_delivery_owns_labels "$SLABELS"; then S_DELIV=1; fi' "$JANITO
   && ok "story sweep derives S_DELIV from story_delivery_owns_labels" \
   || bad "story sweep does not call story_delivery_owns_labels — delivery:pending-vm would not be honoured"
 
+# ── ga-2kaan2 (gate fix-attempt 2): an UNREADABLE label list is not "no labels" ──
+# The sweep's `SLABELS=$(jq ... || true)` turns a jq failure into "". With "" the hold's
+# protection vanishes silently (story_delivery_owns_labels "" is rc1) and a VM-held story
+# with merge evidence is forced story:done. The sweep selects on story:approved, so a row
+# whose labels do not name it is the "could not read" signal and must be skipped.
+echo ""
+echo "── ga-2kaan2: an unreadable label list is skipped, never decided on ──"
+if type story_labels_readable >/dev/null 2>&1; then
+  rc0 story_labels_readable "ctx:ready story:approved gate:passed"
+  rc0 story_labels_readable "ctx:ready story:approved gate:passed delivery:pending-vm"
+  rc1 story_labels_readable ""
+  rc1 story_labels_readable "ctx:ready gate:passed delivery:pending-vm"
+else
+  bad "story_labels_readable is not defined — a jq failure would read as 'no delivery label' and release a VM-held story"
+fi
+# The shape that bites: what jq yields on a row it cannot parse is "" — and "" must NOT be
+# delivery-owned (that is the bug), so the only thing standing between it and story:done is
+# the readability check before the decision.
+rc1 story_delivery_owns_labels ""
+# The sweep must call it, on the labels it just read, BEFORE it derives delivery ownership
+# from them (a correct helper nobody calls guards nothing; one called after is too late).
+RL_LN=$(grep -n 'if ! story_labels_readable "\$SLABELS"; then' "$JANITOR" | head -1 | cut -d: -f1)
+OW_LN=$(grep -n 'if story_delivery_owns_labels "\$SLABELS"; then S_DELIV=1; fi' "$JANITOR" | head -1 | cut -d: -f1)
+if [ -n "$RL_LN" ] && [ -n "$OW_LN" ] && [ "$RL_LN" -lt "$OW_LN" ]; then
+  ok "story sweep checks story_labels_readable (L$RL_LN) before deriving S_DELIV (L$OW_LN)"
+else
+  bad "story sweep does not check story_labels_readable before story_delivery_owns_labels (readable=L${RL_LN:-none}, owns=L${OW_LN:-none})"
+fi
+# And the skip must be a skip: a `continue` right after the log, no S_* decision in between.
+RL_BLOCK=$(sed -n "${RL_LN:-1},$((${RL_LN:-1}+4))p" "$JANITOR" 2>/dev/null)
+printf '%s' "$RL_BLOCK" | grep -q 'continue' \
+  && ok "an unreadable story row is skipped with 'continue' (no decision, no mutation)" \
+  || bad "the unreadable-row branch does not 'continue' — it would fall through to the decision"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

@@ -359,6 +359,18 @@ story_delivery_owns_labels() {
   return 1
 }
 
+# story_labels_readable <space-joined labels> — rc0 iff the label list of a story-sweep row
+# was actually READ. The sweep selects on `-l story:approved`, so every row it iterates
+# names that label; a list that does not is the row whose labels `jq` could not parse
+# (and `|| true` turned into ""). An empty list reads as "no delivery label", i.e. "nobody
+# holds this story" — and a story held on delivery:pending-vm (ga-2kaan2) with merge evidence
+# in main would be forced story:done, the very outcome the hold exists to stop. "Could not
+# read" is a third state: the sweep skips the row instead of deciding on it (ga-2kaan2 gate
+# fix-attempt 2, reviewer's pre-existing `info`).
+story_labels_readable() {
+  printf '%s' "$1" | grep -w "story:approved" >/dev/null
+}
+
 # ga-v8ui5 (gate-feedback follow-up): is a janitor_decide/janitor_story_decide
 # "keep" reason one of the "FID's own signals came up completely empty"
 # buckets — the only case the ga-vokwv sling-bead-name fallback (below) may
@@ -1497,6 +1509,12 @@ EOF
     STYPE=$(printf '%s' "$s" | jq -r '(.issue_type // .type // "")' 2>/dev/null || true)
     STITLE=$(printf '%s' "$s" | jq -r '(.title // "")[0:60]' 2>/dev/null || true)
     SLABELS=$(printf '%s' "$s" | jq -r '(.labels // []) | join(" ")' 2>/dev/null || true)
+    # This row was selected on story:approved: labels that do not name it were not read (see
+    # story_labels_readable). Deciding on them would drop the delivery:pending-vm protection.
+    if ! story_labels_readable "$SLABELS"; then
+      log "keep-story $SID ($RNAME) — could not read its labels (jq failed or story:approved missing from the row); not deciding on an unreadable row (ga-2kaan2)"
+      continue
+    fi
     SASSIGNEE=$(printf '%s' "$s" | jq -r '.assignee // ""' 2>/dev/null || true)
 
     S_EPIC=0;     [ "$STYPE" = "epic" ] && S_EPIC=1

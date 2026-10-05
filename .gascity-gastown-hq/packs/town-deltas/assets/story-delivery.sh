@@ -705,59 +705,88 @@ runtime_arrival_epoch() {  # runtime_arrival_epoch <runtime_dir> <sha> [<cap>]
 # wa-kj0x2h, merge 95931501b: "7 daemons cosméticos e nenhum executor real", and
 # the Mayor deployed the VM by hand). Step 6a below asks it; these are its helpers.
 #
-# Both helpers return their answer in globals and ALWAYS rc 0: a command
+# The two READING helpers return their answer in globals and ALWAYS rc 0: a command
 # substitution would lose the reason, and a non-zero rc would trip `set -e`.
 # Every answer has THREE states (yes/no/unknown, ok/pending/failed/unknown) —
 # "could not read it" is never allowed to collapse into the harmless one.
 # ═════════════════════════════════════════════════════════════════════════════
 VM_DELTA_VERDICT=""; VM_DELTA_WHY=""
-VM_VERDICT=""; VM_REASON=""; VM_STDOUT=""
+VM_VERDICT=""; VM_REASON=""; VM_STDOUT=""; VM_STDERR=""
 
 # voicebot_vm_delta_touched <runtime_dir> <base_sha> <merge_sha>
 # Does THIS story's own delta (<base>..<merge>: every commit its branch landed)
 # touch what the VM runs? Sets VM_DELTA_VERDICT yes|no|unknown + VM_DELTA_WHY.
+# The predicate is exactly voicebot_vm_sync.compute_manifest's, no wider: every file
+# under the package ships to the VM except *.md and the package-ROOT requirements.txt
+# (a nested requirements.txt ships, so it counts).
 # Read with --no-renames: git lists only the NEW path of a rename by default, so a
 # file moved OUT of the package would show no voicebot path while the VM still
-# holds the old copy (same trap /gate-done documents for its own diff).
-#   yes     a file under lib/predictive_dialer/voicebot/ (except *.md and
-#           requirements.txt, which never go to the VM), OR a lib/<m>.py that is in
-#           the closure scripts/voicebot_vm_lib_closure.py computes (on
-#           RUNTIME_DIR's current tree, which Step 4 has just brought to main).
+# holds the old copy (same trap /gate-done documents for its own diff). Read with -z
+# (+ quotePath=false): without it git prints a path with a non-ASCII byte as a
+# C-quoted string, which no pattern below matches (gate fix-attempt 2).
+#   yes     a file under lib/predictive_dialer/voicebot/ (except the two above), OR a
+#           lib/<m>.py that is in the closure scripts/voicebot_vm_lib_closure.py
+#           computes (on RUNTIME_DIR's current tree, which Step 4 has just brought to main).
 #   no      the delta was read and nothing in it reaches the VM.
 #   unknown the delta cannot be read (base not recorded / not an ancestor, as
-#           Step 5b — never a guessed MERGE_SHA^), or the closure cannot be
-#           computed (the script refuses, is missing or times out) while a lib/
-#           file changed. In a rig WITHOUT the voicebot package there is nothing
-#           to carry, so there an unreadable delta — or a lib/ change with no closure
-#           script to ask — is "no", not "unknown". (A delta that touches package
-#           files is "yes" in every rig, even when the package is gone afterwards.)
+#           Step 5b — never a guessed MERGE_SHA^ — or `git diff` failed, or a path
+#           arrived C-quoted and cannot be matched), or the closure cannot be
+#           computed (the script refuses, is missing, times out, prints nothing, or
+#           prints something that is not a list of module names) while a lib/ file
+#           changed. In a rig WITHOUT the voicebot package there is nothing to carry,
+#           so there an unreadable delta — or a lib/ change with no closure script to
+#           ask — is "no", not "unknown". (A delta that touches package files is
+#           "yes" in every rig, even when the package is gone afterwards.) A
+#           runtime_dir that does not exist is "unknown" in every rig: there is no
+#           tree to infer "no package" from.
 voicebot_vm_delta_touched() {
   local rt="$1" base="$2" sha="$3" pkg="lib/predictive_dialer/voicebot"
-  local base_sha="" files="" f m cand="" closure="" closure_script
+  local base_sha="" f m cand="" closure="" closure_script cl_line cl_bad=""
+  local readable=1 saw_end=0 quoted="" unread_why=""
   VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY=""
   if [ -z "$rt" ]; then
     VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="sem runtime_dir — não dá pra ler o delta do merge"; return 0
   fi
+  if [ ! -d "$rt" ]; then
+    VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="runtime_dir '$rt' não existe — não dá pra ler o delta do merge nem saber se o rig tem o pacote"; return 0
+  fi
   if [ -z "$base" ] || [ -z "$sha" ] \
      || ! base_sha="$(git -C "$rt" rev-parse --verify -q "${base}^{commit}" 2>/dev/null)" || [ -z "$base_sha" ] \
-     || ! git -C "$rt" merge-base --is-ancestor "$base_sha" "$sha" 2>/dev/null \
-     || ! files="$(git -C "$rt" diff --name-only --no-renames "$base_sha" "$sha" 2>/dev/null)"; then
+     || ! git -C "$rt" merge-base --is-ancestor "$base_sha" "$sha" 2>/dev/null; then
+    readable=0
+    unread_why="não consegui ler o delta do merge (base '${base:-<não registrada>}' ausente ou não é ancestral de '${sha:-<sem sha>}')"
+  fi
+  if [ "$readable" = "1" ]; then
+    # The list is followed by an EMPTY record, printed only if git succeeded: reaching it is
+    # how we know the list is complete — a failed `git diff` must not read as an empty delta.
+    # (No `$(...)` here: it would drop the NUL separators.)
+    while IFS= read -r -d '' f; do
+      if [ -z "$f" ]; then saw_end=1; continue; fi
+      case "$f" in
+        '"'*) quoted="$f" ;;
+        "$pkg"/*.md|"$pkg"/requirements.txt) ;;
+        "$pkg"/*) VM_DELTA_VERDICT="yes"; VM_DELTA_WHY="arquivo do pacote voicebot: $f"; return 0 ;;
+        lib/*.py) m="${f#lib/}"; case "$m" in */*) ;; *) cand="$cand ${m%.py}" ;; esac ;;
+      esac
+    done < <(git -C "$rt" -c core.quotePath=false diff -z --name-only --no-renames "$base_sha" "$sha" 2>/dev/null && printf '\0')
+    if [ "$saw_end" != "1" ]; then
+      readable=0
+      unread_why="não consegui ler o delta do merge (o git diff entre '$base_sha' e '$sha' falhou)"
+    elif [ -n "$quoted" ]; then
+      # -z never quotes, so this is belt and braces: a path that still arrived quoted cannot be
+      # matched against the package, and "could not match" is not "does not match".
+      readable=0
+      unread_why="um caminho do delta chegou entre aspas (C-quoted) e não dá pra casar com o pacote voicebot: $quoted"
+    fi
+  fi
+  if [ "$readable" != "1" ]; then
     if [ -d "$rt/$pkg" ]; then
-      VM_DELTA_VERDICT="unknown"
-      VM_DELTA_WHY="não consegui ler o delta do merge (base '${base:-<não registrada>}' ausente ou não é ancestral de '${sha:-<sem sha>}')"
+      VM_DELTA_VERDICT="unknown"; VM_DELTA_WHY="$unread_why"
     else
       VM_DELTA_VERDICT="no"; VM_DELTA_WHY="rig sem o pacote $pkg — nada a levar pra VM"
     fi
     return 0
   fi
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    case "$f" in
-      "$pkg"/*.md|"$pkg"/requirements.txt|"$pkg"/*/requirements.txt) ;;
-      "$pkg"/*) VM_DELTA_VERDICT="yes"; VM_DELTA_WHY="arquivo do pacote voicebot: $f"; return 0 ;;
-      lib/*.py) m="${f#lib/}"; case "$m" in */*) ;; *) cand="$cand ${m%.py}" ;; esac ;;
-    esac
-  done <<< "$files"
   if [ -z "${cand// /}" ]; then
     VM_DELTA_VERDICT="no"; VM_DELTA_WHY="o delta do merge não toca o pacote voicebot nem arquivo de lib/"; return 0
   fi
@@ -775,6 +804,27 @@ voicebot_vm_delta_touched() {
   closure_script="$rt/scripts/voicebot_vm_lib_closure.py"
   if [ -f "$closure_script" ] \
      && closure="$(timeout "${VOICEBOT_VM_CLOSURE_TIMEOUT_S:-60}" python3 "$closure_script" 2>/dev/null)"; then
+    # exit 0 is not proof of an answer. The real closure is never empty (22 modules today; it
+    # exits 2 on any problem), so empty output is itself "could not compute" — the rule
+    # voicebot_vm_status applies to an exit 0 it cannot corroborate (gate fix-attempt 2).
+    if [ -z "${closure//[[:space:]]/}" ]; then
+      VM_DELTA_VERDICT="unknown"
+      VM_DELTA_WHY="mudou lib/ (${cand# }) e o fechamento do voicebot veio VAZIO (scripts/voicebot_vm_lib_closure.py saiu 0 sem listar módulo nenhum — o fechamento real nunca é vazio)"
+      return 0
+    fi
+    # One bare module name per line. A line with whitespace, a path separator, a dot, a colon or
+    # a quote is a message, not a module: reading it as a closure would answer "not in it".
+    while IFS= read -r cl_line; do
+      case "$cl_line" in
+        '') ;;
+        *[[:space:]]*|*:*|*/*|*.*|*\"*|*\'*) cl_bad="$cl_line"; break ;;
+      esac
+    done <<< "$closure"
+    if [ -n "$cl_bad" ]; then
+      VM_DELTA_VERDICT="unknown"
+      VM_DELTA_WHY="mudou lib/ (${cand# }) e a saída do fechamento do voicebot não é uma lista de módulos (primeira linha estranha: '${cl_bad:0:80}')"
+      return 0
+    fi
     # No pipe into grep -q (SIGPIPE + pipefail would read a match as a miss): a
     # newline-fenced `case` is the exact-line test.
     for m in $cand; do
@@ -792,32 +842,61 @@ voicebot_vm_delta_touched() {
 
 # voicebot_vm_status <script> [<timeout_s>]
 # Runs `python3 <script> --status` (read-only, no ssh) and sets VM_VERDICT
-# ok|pending|failed|unknown, VM_REASON (one line) and VM_STDOUT (stdout, capped).
+# ok|pending|failed|unknown, VM_REASON (one line), VM_STDOUT and VM_STDERR (each capped).
 #   exit 0  -> ok, but ONLY with a "STATUS: em dia" line on stdout — an exit 0
 #              nobody can corroborate is "unknown", never "provado igual ao main"
 #   exit 10 -> pending      exit 20 -> failed
+#   exit 2  -> unknown ("uso errado": the contract defines it, and its stderr is the
+#              only place the cause is written — shown, not dropped)
 #   anything else (timeout 124, python crash, unknown exit, 127...) -> unknown
+#   script missing -> unknown (nobody to ask is not "em dia")
 voicebot_vm_status() {
-  local script="$1" to="${2:-30}" out="" rc=0 line=""
-  VM_VERDICT="unknown"; VM_REASON=""; VM_STDOUT=""
-  out="$(timeout "$to" python3 "$script" --status 2>/dev/null)" && rc=0 || rc=$?
+  local script="$1" to="${2:-30}" out="" err="" rc=0 line="" errf="" hint="" l
+  VM_VERDICT="unknown"; VM_REASON=""; VM_STDOUT=""; VM_STDERR=""
+  if [ ! -f "$script" ]; then
+    VM_REASON="não consegui ler o status da VM (o script do contrato $script não existe neste checkout)"
+    return 0
+  fi
+  # stderr goes to a file (not 2>/dev/null): it carries the cause of an unreadable status.
+  # If no temp file can be made the cause is lost, never the verdict.
+  errf="$(mktemp 2>/dev/null)" || errf=""
+  if [ -n "$errf" ]; then
+    out="$(timeout "$to" python3 "$script" --status 2>"$errf")" && rc=0 || rc=$?
+    err="$(head -c 1500 "$errf" 2>/dev/null || true)"
+    rm -f "$errf" 2>/dev/null || true
+  else
+    out="$(timeout "$to" python3 "$script" --status 2>/dev/null)" && rc=0 || rc=$?
+  fi
   # Bash substring, not `printf | head -c`: on a runaway stdout head exits early,
   # printf takes SIGPIPE, pipefail makes the assignment non-zero and `set -e` aborts
   # the WHOLE sweep (every story), not just this one.
   VM_STDOUT="${out:0:1500}"
+  VM_STDERR="${err:0:1500}"
+  while IFS= read -r l; do
+    if [ -n "$l" ]; then hint="${l:0:300}"; break; fi
+  done <<< "$err"
   line="$(printf '%s\n' "$out" | grep -m1 '^STATUS:' || true)"
   case "$rc" in
     0)
       case "$line" in
         "STATUS: em dia"*) VM_VERDICT="ok"; VM_REASON="$line" ;;
-        *) VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (exit 0, mas sem a linha 'STATUS: em dia' no stdout)" ;;
+        *) VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (exit 0, mas sem a linha 'STATUS: em dia' no stdout${hint:+; stderr: $hint})" ;;
       esac ;;
     10) VM_VERDICT="pending"; VM_REASON="${line:-STATUS: pendente — o --status saiu 10 sem linha STATUS no stdout (sem saída legível)}" ;;
     20) VM_VERDICT="failed";  VM_REASON="${line:-STATUS: falhou — o --status saiu 20 sem linha STATUS no stdout (sem saída legível)}" ;;
     124) VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status estourou ${to}s)" ;;
-    *)  VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status saiu com exit $rc, que o contrato não define)" ;;
+    2)  VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status saiu com exit 2 = uso errado do script${hint:+: $hint})" ;;
+    *)  VM_VERDICT="unknown"; VM_REASON="não consegui ler o status da VM (o --status saiu com exit $rc, que o contrato não define${hint:+: $hint})" ;;
   esac
   return 0
+}
+
+# voicebot_vm_state_put <dir> <file> <fp> <since> <mailed> — rc 1 if the hold state could
+# not be written. The caller warns: without the state the 24h Mayor-mail ceiling and the
+# comment dedup cannot work, and that must not pass in silence.
+voicebot_vm_state_put() {
+  mkdir -p "$1" 2>/dev/null || return 1
+  printf 'fp=%s\nsince=%s\nmailed=%s\n' "$3" "$4" "$5" > "$2" 2>/dev/null || return 1
 }
 
 # voicebot_vm_state_get <state_file> <key> — value of key=value, empty if absent.
@@ -3726,6 +3805,12 @@ fi
 #   failed    -> delivery:failed (stdout + the state file's `detail` in the comment)
 #   no script -> the contract is not in this checkout yet (wa-y0su67 not in main):
 #                behave as before, with a comment — no dependency on merge order.
+#                EXCEPT for a story that already carries a VM hold (delivery:pending-vm,
+#                or a failed hold this gate recorded): there "could not ask" holds as
+#                unknown, it never releases — a vanished script is not "em dia".
+# Before any mutation the bead is re-read (story_bead_closed_now, ga-rugqks): the delta
+# and closure (<=60s) and --status (<=30s) run after Step 5b's last check, and the likeliest
+# way a hold ENDS — the Mayor deploys the VM by hand and closes the story — lands there.
 # One comment/nudge per CHANGE of state, not per cycle: the fingerprint
 # (verdict|reason) lives in $GC_CITY/.gc/runtime/voicebot-vm-hold/<story>.state.
 # Selectors that must keep seeing a held story: Step 1 (story:approved +
@@ -3736,15 +3821,27 @@ VM_HOLD_FILE="$VM_HOLD_DIR/$STORY_ID.state"
 VM_SCRIPT="${VOICEBOT_VM_SYNC_SCRIPT:-$RUNTIME_DIR/scripts/voicebot_vm_sync.py}"
 VM_ON_BEAD=0;     case ",$STORY_LABELS," in *",delivery:pending-vm,"*) VM_ON_BEAD=1 ;; esac
 VM_FAILED_ON_BEAD=0; case ",$STORY_LABELS," in *",delivery:failed,"*) VM_FAILED_ON_BEAD=1 ;; esac
+VM_PREV_FP="$(voicebot_vm_state_get "$VM_HOLD_FILE" fp)"
+# Is a VM hold ALREADY on this story? The pending label says so; a failed hold only shows in the
+# state this gate wrote (delivery:failed alone proves nothing — prod-test and deploy failures
+# carry it too, and those stories must not be held on the VM gate).
+VM_HOLDING=0
+[ "$VM_ON_BEAD" = "1" ] && VM_HOLDING=1
+case "$VM_PREV_FP" in failed\|*) VM_HOLDING=1 ;; esac
 voicebot_vm_delta_touched "$RUNTIME_DIR" "$MERGE_PRE_MAIN" "$MERGE_SHA"
 # What the comments/mail say the merge does to the VM follows the verdict: "mexe" only when
 # the delta was PROVEN to reach it. "unknown" (delta unreadable, closure not computable) is
 # "pode mexer" — a hedge, never the flat claim (root-class:error-vs-empty, gate fix-attempt 1).
 VM_TOUCH="pode mexer"
 if [ "$VM_DELTA_VERDICT" = "yes" ]; then VM_TOUCH="mexe"; fi
-if [ "$VM_DELTA_VERDICT" = "no" ] || [ ! -f "$VM_SCRIPT" ]; then
-  # Nothing to ask (delta clean) or nobody to ask (contract absent). Either way an
-  # old delivery:pending-vm no longer describes anything true: drop it.
+if [ "$VM_DELTA_VERDICT" = "no" ] || { [ ! -f "$VM_SCRIPT" ] && [ "$VM_HOLDING" != "1" ]; }; then
+  # Nothing to ask (the delta was READ and is clean) or nobody to ask and nothing held (contract
+  # absent, never held). A delta proven clean makes an old delivery:pending-vm describe nothing
+  # true: drop it. (A held story whose script vanished does NOT come here — see the else branch.)
+  if story_bead_closed_now "$STORY_STORE" "$STORY_ID"; then
+    log "Story $STORY_ID was closed while the VM check was being prepared — skipping, no mutation (ga-rugqks)."
+    continue
+  fi
   if [ "$VM_ON_BEAD" = "1" ] && [ "$DRY_RUN" != "1" ]; then
     bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
   fi
@@ -3756,22 +3853,33 @@ if [ "$VM_DELTA_VERDICT" = "no" ] || [ ! -f "$VM_SCRIPT" ]; then
     if [ "$DRY_RUN" = "1" ]; then
       log "DRY_RUN=1 — WOULD: comment $STORY_ID 'VM do voicebot não verificada: contrato ausente'"
     elif [ "$(voicebot_vm_state_get "$VM_HOLD_FILE" fp)" != "$VM_FP" ]; then
-      if bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot não verificada: contrato ausente (ga-2kaan2). Este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY), mas $VM_SCRIPT não existe neste checkout — a wa-y0su67 ainda não entrou no main. A entrega segue como antes e NÃO prova que a VM roda o código novo; se a VM precisar do deploy, ele é manual até o contrato existir." 2>/dev/null; then
-        mkdir -p "$VM_HOLD_DIR" 2>/dev/null || true
-        printf 'fp=%s\nsince=%s\nmailed=0\n' "$VM_FP" "$(date +%s)" > "$VM_HOLD_FILE" 2>/dev/null || true
+      if bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot não verificada: contrato ausente (ga-2kaan2). Este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY), mas $VM_SCRIPT não existe neste checkout — possivelmente a wa-y0su67 ainda não entrou no main (ou este checkout está atrás dele, ou VOICEBOT_VM_SYNC_SCRIPT aponta pro lugar errado). A entrega segue como antes e NÃO prova que a VM roda o código novo; se a VM precisar do deploy, ele é manual até o contrato existir." 2>/dev/null; then
+        voicebot_vm_state_put "$VM_HOLD_DIR" "$VM_HOLD_FILE" "$VM_FP" "$(date +%s)" 0 \
+          || warn "não consegui gravar o estado do hold da VM ($VM_HOLD_FILE) — o comentário 'contrato ausente' será repostado a cada ciclo (ga-2kaan2)."
       fi
     fi
   fi
 else
   voicebot_vm_status "$VM_SCRIPT" "${VOICEBOT_VM_STATUS_TIMEOUT_S:-30}"
+  if story_bead_closed_now "$STORY_STORE" "$STORY_ID"; then
+    log "Story $STORY_ID was closed while the VM status was being read — skipping, no mutation (ga-rugqks)."
+    continue
+  fi
   VM_NOW="$(date +%s)"
-  VM_PREV_FP="$(voicebot_vm_state_get "$VM_HOLD_FILE" fp)"
   VM_SINCE="$(voicebot_vm_state_get "$VM_HOLD_FILE" since)"
   VM_MAILED="$(voicebot_vm_state_get "$VM_HOLD_FILE" mailed)"
   # The 24h clock runs from the first cycle the VM was NOT proven; a contrato-ausente
   # entry is not that, so it never seeds the clock.
   case "$VM_PREV_FP" in absent\|*) VM_SINCE=""; VM_MAILED="" ;; esac
-  case "$VM_SINCE" in ''|*[!0-9]*) VM_SINCE="$VM_NOW" ;; esac
+  case "$VM_SINCE" in
+    ''|*[!0-9]*)
+      # A recorded hold whose `since` cannot be read restarts the 24h clock; say so.
+      case "$VM_PREV_FP" in
+        ''|absent\|*) ;;
+        *) warn "estado do hold da VM de $STORY_ID com since ilegível ('${VM_SINCE:-vazio}') — o relógio de 24h do mail ao Mayor recomeça agora (ga-2kaan2)." ;;
+      esac
+      VM_SINCE="$VM_NOW" ;;
+  esac
   [ "$VM_MAILED" = "1" ] || VM_MAILED=0
   # Digits are dropped from the fingerprint: a status such as "ligação em curso há
   # 3 min" changes every cycle and would otherwise re-comment (and, for failed,
@@ -3815,7 +3923,9 @@ else
 Status: $VM_REASON
 Saída do voicebot_vm_sync.py --status:
 ${VM_STDOUT:-<vazia>}
-detail (voicebot_vm_sync_state.json): ${VM_DETAIL:-<sem detail no state>}
+${VM_STDERR:+stderr do voicebot_vm_sync.py --status:
+$VM_STDERR
+}detail (voicebot_vm_sync_state.json): ${VM_DETAIL:-<sem detail no state>}
 
 story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega reconsulta a cada ciclo e segue sozinha quando o --status der exit 0. Conserte o deploy da VM (voicebot_vm_sync.py), não reverta o merge." 2>/dev/null; then
             VM_STORE_FP="$VM_FP"
@@ -3831,8 +3941,8 @@ story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega 
             warn "Could not comment VM sync failure on $STORY_ID — fingerprint not stored, the next cycle retries the comment + nudge."
           fi
         fi
-        mkdir -p "$VM_HOLD_DIR" 2>/dev/null || true
-        printf 'fp=%s\nsince=%s\nmailed=%s\n' "$VM_STORE_FP" "$VM_SINCE" "$VM_MAILED" > "$VM_HOLD_FILE" 2>/dev/null || true
+        voicebot_vm_state_put "$VM_HOLD_DIR" "$VM_HOLD_FILE" "$VM_STORE_FP" "$VM_SINCE" "$VM_MAILED" \
+          || warn "não consegui gravar o estado do hold da VM ($VM_HOLD_FILE) — sem ele o teto de 24h do mail ao Mayor e a deduplicação de comentário não funcionam neste ciclo (ga-2kaan2)."
       fi
       # wa-uthi: non-terminal (delivery:failed is re-picked every cycle) — no push.
       warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID held on a FAILED VM sync."
@@ -3847,6 +3957,9 @@ story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega 
         log "DRY_RUN=1 — WOULD: bd label add $STORY_ID delivery:pending-vm + comment ($VM_REASON); story:done WITHHELD, re-asked next cycle (Mayor mail due: $VM_MAIL_DUE)"
       else
         # Hold label first, then release delivery:running (see the failed branch above).
+        # VM_ON_BEAD is the Step-1 label SNAPSHOT: if the label was removed since, this add is
+        # skipped and the next cycle (fresh snapshot) puts it back — a one-cycle gap, accepted on
+        # purpose: re-adding every cycle would cost a bd write per held story per sweep.
         [ "$VM_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
         bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
         case "$VM_PREV_FP" in failed\|*)
@@ -3858,6 +3971,8 @@ story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega 
 Status: $VM_REASON
 ${VM_STDOUT:+Saída do voicebot_vm_sync.py --status:
 $VM_STDOUT
+}${VM_STDERR:+stderr do voicebot_vm_sync.py --status:
+$VM_STDERR
 }
 story:done SEGURADO — fechar agora seria declarar 'done' com a VM rodando código velho. NÃO-TERMINAL: o label delivery:pending-vm fica no bead e a entrega reconsulta o --status a cada ciclo; quando der exit 0 o label sai e a entrega segue sozinha. Pendente por mais de 24h, o Mayor recebe um mail." 2>/dev/null; then
             VM_STORE_FP="$VM_FP"
@@ -3879,8 +3994,8 @@ story:done SEGURADO — fechar agora seria declarar 'done' com a VM rodando cód
             warn "Could not mail Mayor the >24h VM-pending escalation for $STORY_ID — the next cycle retries."
           fi
         fi
-        mkdir -p "$VM_HOLD_DIR" 2>/dev/null || true
-        printf 'fp=%s\nsince=%s\nmailed=%s\n' "$VM_STORE_FP" "$VM_SINCE" "$VM_MAILED" > "$VM_HOLD_FILE" 2>/dev/null || true
+        voicebot_vm_state_put "$VM_HOLD_DIR" "$VM_HOLD_FILE" "$VM_STORE_FP" "$VM_SINCE" "$VM_MAILED" \
+          || warn "não consegui gravar o estado do hold da VM ($VM_HOLD_FILE) — sem ele o teto de 24h do mail ao Mayor e a deduplicação de comentário não funcionam neste ciclo (ga-2kaan2)."
       fi
       # wa-uthi: non-terminal (re-asked every cycle) — no push; the Mayor mail above is the >24h ceiling.
       warn "SUPPRESSED PUSH (wa-uthi non-terminal/retries): story $STORY_ID held on the VM do voicebot ($VM_VERDICT)."
