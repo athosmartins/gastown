@@ -5,3 +5,4 @@ provider = "claude-rc-crew"
 
 option_defaults = { effort = "high" }  # Athos 2026-10-05: crews em Sonnet + effort high (substitui ga-n56ase medium)
 
+suspended = true  # Athos 2026-10-05 18:4x: batista ociosa → fechar e manter fechada pra sobrar RAM pros revisores do gate (resume: gc agent resume batista-wa)
