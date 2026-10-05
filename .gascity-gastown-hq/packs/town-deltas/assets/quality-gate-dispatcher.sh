@@ -6982,6 +6982,195 @@ gate_vm_hold_ceiling_sweep() {
 }
 # SELFTEST-EXTRACT vm-hold-ceiling-fn: END
 
+# ── ga-buac0o: the two "already merged" short-circuits ask the dialer VM too ──
+# gate_merged_path_vm_gate <bead_city> <bead_id> <rig> <branch> <default_branch> <marker_id>
+#                          <base_commit> <via>
+#
+# ga-wye9vt made the PASS path ask the VM before it closes a bug/task source bead. Two other paths
+# close a NON-story source bead as "already merged" with no merge of their own, and did not ask:
+# Step 0a-4 (ga-88sl7: a stranded needs-rebase marker whose branch is already in main) and Step 4b
+# (ga-jhyu: the superseded short-circuit, by ancestry or by patch-id). Same question, same machinery:
+# gate_vm_hold_check, the delivery:pending-vm label, the hold state gate_vm_hold_ceiling_sweep reads,
+# merged-bead-janitor's keep-guard — so the 24h ceiling and the janitor cover what these paths hold
+# exactly as they cover the PASS path's.
+#
+# Returns 0: the caller may close the bead; MERGED_VM_NOTE (usually empty) goes on the close reason.
+# Returns 1: HELD — the bead stays open under delivery:pending-vm + gate:passed (the Pilot excludes
+# gate:passed), and the caller must NOT close it, nor mark it gate:superseded: it was not delivered.
+#
+# THE DELTA. These paths have no merge of their own, so there is no MERGE_PRE_MAIN_SHA..MERGE_SHA.
+# The delta is the marker's base_commit .. origin/<branch>: /gate-done records `git rev-parse
+# origin/main` at submit time, which is an ancestor of the branch tip, so that range is the branch's
+# own commits. NOT merge-base(branch, main)..branch: the branch is ALREADY MERGED, so that merge-base
+# is the branch tip itself, the range is empty, and an empty range reads as "does not touch" — the
+# error-vs-empty collapse this family exists to prevent. For the same reason a base_commit that is
+# not recorded, is "unknown", does not resolve, is not an ancestor of the tip (voicebot_vm_delta_touched
+# checks that itself) or EQUALS the tip (zero commits: a base that proves nothing, not a branch that
+# changes nothing) goes in as no base at all: the delta is UNKNOWN, and unknown asks the VM.
+# base_commit is self-declared and untrusted (gate_base_commit_trust, ga-iwcu23). A base that is
+# older than the real fork point widens the range (a hold the VM then clears); one newer than it that
+# is still an ancestor of the tip cannot be told from a true one by the marker alone.
+#
+# Two outcomes, each decided from what was READ, never inferred from one another:
+#   close  the delta was read and does not reach the VM; the VM is PROVEN current; the rig has no
+#          runtime to ask about; the contract script is absent (said on the close, as the PASS path
+#          does); or the runbook registry could not be read (a WARN, and said on the close — a read
+#          failure is not "this rig has no mapping").
+#   hold   the VM is pending / failed / unknown; or the bead ALREADY wears delivery:pending-vm (an
+#          earlier merge's hold, which this branch's delta says nothing about — the PASS path's
+#          gate_own_hold_check rule: a LATER branch's "does not touch" must not close the bead over
+#          it); or its labels could not be read (unknown is not "no hold").
+# Only delivery:pending-vm is honoured here. delivery:pending-restart / delivery:partial are the PASS
+# path's business and these two paths did not honour them before this change either.
+#
+# SELFTEST-EXTRACT merged-path-vm-hold-fn: BEGIN
+# gate_rig_runtime_dir <rig> — prints the rig's runtime_dir from delivery-runbooks.toml. rc 0 = the
+# registry was READ (empty output = the rig has no runtime_dir mapping); rc 1 = it could NOT be read
+# (file missing, python failed) — the two never collapse. The rig name travels as argv, never spliced
+# into the script (the PASS path's _gl7n3v_runbook_field interpolates it; it is defined inline there,
+# so it cannot be relied on from these two steps).
+gate_rig_runtime_dir() {
+  local rig="$1" toml="${GC_CITY:-}/packs/town-deltas/assets/delivery-runbooks.toml"
+  [ -f "$toml" ] || return 1
+  python3 - "$rig" "$toml" <<'PYEOF' 2>/dev/null
+import re, sys
+rig_name, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    content = f.read()
+for block in re.split(r'\[\[rig\]\]', content):
+    m = re.search(r'name\s*=\s*"([^"]+)"', block)
+    if m and m.group(1) == rig_name:
+        fm = re.search(r'runtime_dir\s*=\s*"([^"]*)"', block)
+        if fm:
+            print(fm.group(1))
+        break
+PYEOF
+}
+
+# gate_merged_path_vm_decide <bead_city> <bead_id> <rig> <branch> <base_commit>
+# Sets MERGED_VM_ACTION (close|hold), MERGED_VM_ASKED (1 iff the VM was asked), MERGED_VM_NOTE (a
+# suffix for the close reason, "" unless the VM was NOT verified), MERGED_VM_COMMENT (the bead comment
+# a close owes, "" if none) and the VM_HOLD_* globals of gate_vm_hold_check. For a hold VM_HOLD_KIND
+# is pending | failed | unknown (the VM answered or could not be read) | held (an earlier
+# delivery:pending-vm stands) | unknown with MERGED_VM_ASKED=0 (the labels could not be read).
+# Always returns 0.
+gate_merged_path_vm_decide() {
+  local bead_city="$1" bead_id="$2" rig="$3" branch="$4" base="${5:-}" rt="" rt_rc=0 tip="" n=""
+  MERGED_VM_ACTION="close"; MERGED_VM_ASKED=0; MERGED_VM_NOTE=""; MERGED_VM_COMMENT=""
+  VM_HOLD_KIND=""; VM_HOLD_REASON=""; VM_HOLD_DELTA=""; VM_HOLD_TOUCH="MAY touch"; VM_HOLD_SCRIPT=""
+  gate_own_hold_check "$bead_city" "$bead_id"
+  if [ "$OWN_HOLD_KIND" = "unverified" ]; then
+    MERGED_VM_ACTION="hold"; VM_HOLD_KIND="unknown"
+    VM_HOLD_REASON="the labels of $bead_id could not be read, so it is not known whether an earlier hold already stands on it"
+    return 0
+  fi
+  case " $OWN_HOLD_LABELS " in
+    *" delivery:pending-vm "*)
+      MERGED_VM_ACTION="hold"; VM_HOLD_KIND="held"
+      VM_HOLD_REASON="the bead already wears delivery:pending-vm (an earlier merge's VM hold), and this branch's delta says nothing about whether that VM is current"
+      return 0 ;;
+  esac
+  rt="$(gate_rig_runtime_dir "$rig")" || rt_rc=$?
+  if [ "$rt_rc" -ne 0 ]; then
+    warn "ga-buac0o: could not read ${GC_CITY:-}/packs/town-deltas/assets/delivery-runbooks.toml to find rig '$rig' runtime_dir — the dialer VM was NOT checked for $bead_id; closing as before."
+    MERGED_VM_NOTE="ga-buac0o: VM do voicebot NÃO verificada — registro de runbooks (delivery-runbooks.toml) ilegível."
+    MERGED_VM_COMMENT="VM não verificada: registro de runbooks ilegível (ga-buac0o). The already-merged path could not read delivery-runbooks.toml, so it could not tell whether branch $branch reaches the dialer VM. The bead is closed as before and that does NOT prove the VM runs the code; if the branch touches lib/predictive_dialer/voicebot/, check it by hand with python3 scripts/voicebot_vm_sync.py --status."
+    return 0
+  fi
+  if [ -z "$rt" ]; then
+    log "ga-buac0o: VM check skipped for $bead_id — rig '$rig' has no runtime_dir mapping, so there is no checkout to read the branch delta from or to find the VM contract script in."
+    return 0
+  fi
+  if [ "$rt" = "${GC_CITY:-}" ]; then
+    log "ga-buac0o: VM check not applicable for $bead_id (framework/gascity self-fix, runtime_dir == GC_CITY — no voicebot package to carry)."
+    return 0
+  fi
+  tip="$(rig_resolve_commit "origin/$branch")"
+  case "$base" in unknown) base="" ;; esac
+  if [ -n "$tip" ] && [ -n "$base" ]; then
+    n="$(git_rig rev-list --count "$base..$tip" 2>/dev/null)" || n=""
+    case "$n" in 0) base="" ;; esac
+  fi
+  MERGED_VM_ASKED=1
+  gate_vm_hold_check "$rt" "$base" "$tip"
+  case "$VM_HOLD_KIND" in
+    "")
+      if [ "$VM_DELTA_VERDICT" = "no" ]; then
+        log "ga-buac0o: VM check for $bead_id — nothing to verify: $VM_HOLD_REASON."
+      else
+        log "ga-buac0o: VM check for $bead_id — the dialer VM is proven current ($VM_HOLD_REASON); closing."
+      fi
+      ;;
+    absent)
+      warn "VM do voicebot não verificada para $bead_id: contrato ausente ($VM_HOLD_SCRIPT não existe; $VM_HOLD_DELTA) — closing as before (ga-buac0o)."
+      MERGED_VM_NOTE="ga-buac0o: VM do voicebot NÃO verificada — contrato ausente ($VM_HOLD_SCRIPT)."
+      MERGED_VM_COMMENT="VM não verificada: contrato ausente (ga-buac0o). The delta of branch $branch $VM_HOLD_TOUCH what runs on the dialer VM ($VM_HOLD_DELTA), but $VM_HOLD_SCRIPT does not exist in this checkout — possibly wa-y0su67 is not in main yet (or this checkout is behind it, or VOICEBOT_VM_SYNC_SCRIPT points to the wrong place). The bead is closed as before and that does NOT prove the VM runs the new code; if the VM needs the deploy, it is manual until the contract exists."
+      ;;
+    *)
+      MERGED_VM_ACTION="hold"
+      ;;
+  esac
+  return 0
+}
+
+gate_merged_path_vm_gate() {
+  local bead_city="$1" bead_id="$2" rig="$3" branch="$4" default_branch="$5" marker_id="$6"
+  local base="${7:-}" via="${8:-an already-merged path}"
+  local labeled=0 vm_state lead label_note ceiling_note dir file since mailed
+  gate_merged_path_vm_decide "$bead_city" "$bead_id" "$rig" "$branch" "$base"
+  if [ "$MERGED_VM_ACTION" != "hold" ]; then
+    if [ -n "$MERGED_VM_COMMENT" ]; then
+      bd -C "$bead_city" comment "$bead_id" "$MERGED_VM_COMMENT" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  bd -C "$bead_city" label remove "$bead_id" "gate:reviewing" -q 2>/dev/null || true
+  # gate:passed keeps the Pilot from re-dispatching the open bead; the story hand-off on these same
+  # two paths sets it for the same reason.
+  bd -C "$bead_city" label add "$bead_id" "gate:passed" -q 2>/dev/null \
+    || warn "Could not add gate:passed to $bead_id — the Pilot may re-dispatch the held bead (ga-buac0o)."
+  # A label that could not be written is never claimed (same rule as the PASS path's hold).
+  if bd -C "$bead_city" label add "$bead_id" "delivery:pending-vm" -q 2>/dev/null; then
+    labeled=1
+  else
+    warn "Could not add delivery:pending-vm to $bead_id — the bead is still NOT closed, but it carries no hold label: merged-bead-janitor does not know about this hold and may close it on merge evidence (ga-buac0o)."
+  fi
+  case "$VM_HOLD_KIND" in
+    pending) vm_state="NOT current yet (--status: pending)" ;;
+    failed)  vm_state="NOT current (--status: failed)" ;;
+    *)       vm_state="UNKNOWN (não-sei: the status could not be read, so nothing proves it is current)" ;;
+  esac
+  if [ "$MERGED_VM_ASKED" = "1" ]; then
+    lead="the delta of branch $branch $VM_HOLD_TOUCH what runs on the dialer VM ($VM_HOLD_DELTA), and the VM is $vm_state: $VM_HOLD_REASON"
+  else
+    lead="$VM_HOLD_REASON — the VM was not asked"
+  fi
+  if [ "$labeled" = "1" ]; then
+    label_note="Held as delivery:pending-vm (gate:passed keeps the Pilot from re-dispatching it)."
+  else
+    label_note="The hold label delivery:pending-vm could NOT be written (bd label add failed; see the WARN in the dispatcher log), so the bead is left open WITHOUT it — merged-bead-janitor does not know about this hold and may close the bead on merge evidence. Re-add it by hand: bd -C $bead_city label add $bead_id delivery:pending-vm"
+  fi
+  # The hold state the 24h ceiling reads — the same file the PASS path writes, so one bead has one
+  # clock. An earlier hold's clock is kept, never restarted.
+  dir="${GC_CITY:-}/.gc/runtime/voicebot-vm-hold-gate"
+  file="$dir/$bead_id.state"
+  since="$(voicebot_vm_state_get "$file" since)"
+  case "$since" in ''|*[!0-9]*) since="$(date +%s)" ;; esac
+  mailed="$(voicebot_vm_state_get "$file" mailed)"
+  [ "$mailed" = "1" ] || mailed=0
+  if voicebot_vm_state_put "$dir" "$file" "$VM_HOLD_KIND|$bead_city" "$since" "$mailed"; then
+    ceiling_note="The Mayor gets ONE mail if this hold still stands after the 24h ceiling (VOICEBOT_VM_PENDING_MAIL_AFTER_S, default 86400s); that mail neither re-asks the VM nor releases the hold."
+  else
+    warn "Could not write the VM hold state ($file) — the 24h Mayor-mail ceiling cannot run for $bead_id (ga-buac0o)."
+    ceiling_note="The 24h Mayor-mail ceiling is NOT armed for this bead (the hold state could not be written), so nothing will mail the Mayor if this sits — look at it yourself."
+  fi
+  log "Source bug/task $bead_id is already merged ($via) but the dialer VM is not proven current ($VM_HOLD_KIND: $VM_HOLD_REASON) — holding, NOT closing (ga-buac0o)."
+  bd -C "$bead_city" comment "$bead_id" "$(printf 'Branch %s already in %s (%s) — gate skipped, but NOT closing (ga-buac0o): %s\n\n%s\n\nNo automatic re-query: this dispatcher does not ask the VM again for this bead. %s\n\nACTION: run `python3 %s --status` (read-only); once it prints STATUS: em dia, run `bd -C %s label remove %s delivery:pending-vm` and close this bead by hand. If the VM needs the deploy, that is manual (scripts/voicebot_vm_sync.py, wa-y0su67).' \
+    "$branch" "$default_branch" "$via" "$lead" "$label_note" "$ceiling_note" "${VM_HOLD_SCRIPT:-scripts/voicebot_vm_sync.py}" "$bead_city" "$bead_id")" 2>/dev/null || true
+  return 1
+}
+# SELFTEST-EXTRACT merged-path-vm-hold-fn: END
+
 # ── ga-eqjo: Steps 9-11 wrapped as a callable function ───────────────────────
 # No logic below changed from its historical inline form — pure relocation +
 # function-wrap so it is callable from TWO places: (a) the same-sweep fast
@@ -9106,9 +9295,10 @@ $OPEN_SIBLINGS_FOR_CLOSE"
           # (<kind>|<store>, since, mailed) is what gate_vm_hold_ceiling_sweep reads on every
           # dispatcher sweep, and it mails the Mayor ONCE if the hold still stands after the 24h
           # ceiling. The ceiling does not ask the VM and does not release the hold.
-          # Not covered here, on purpose: the already-merged short-circuits (Step 0a-4 /
-          # the superseded path) close a bead without a merge of their own, so there is no
-          # delta to read — tracked as ga-buac0o.
+          # The already-merged short-circuits (Step 0a-4 / Step 4b) close a bead without a
+          # merge of their own; they ask the same question through gate_merged_path_vm_gate
+          # (ga-buac0o), reading base_commit..origin/<branch> as the delta and writing the
+          # same hold state, so one ceiling covers all three.
           # SELFTEST-EXTRACT vm-hold-block: BEGIN
           VM_HOLD_CLOSE_NOTE=""
           if [ "$IS_SIBLING_HOLD" != "1" ] && [ "$IS_OWN_HOLD" != "1" ]; then
@@ -12277,6 +12467,9 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
     NR_BEAD_ID=$(extract "bead_id")
     NR_RIG=$(extract "rig")
     NR_BEAD_RIG=$(extract "bead_rig")
+    # ga-buac0o: the delta the VM check reads is base_commit..origin/<branch> (self-declared, so
+    # untrusted — see gate_merged_path_vm_gate).
+    NR_BASE_COMMIT=$(extract "base_commit")
     [ -z "$NR_BRANCH" ] && continue
 
     # Resolve THIS candidate's rig context fresh — gate_resolve_rig_context
@@ -12303,6 +12496,7 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
     bd -C "$GC_CITY" close "$NR_MARKER_ID" -r "Gate marker terminal: SUPERSEDED (branch $NR_BRANCH already merged to $DEFAULT_BRANCH; reaped from stranded needs-rebase by Step 0a-4, ga-88sl7)." 2>/dev/null || true
 
     if [ -n "$BEAD_ID" ]; then
+      # SELFTEST-EXTRACT needs-rebase-reap-source-bead-fn: BEGIN
       if NR_BD_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null); then
         NR_BD_STATUS=$(printf '%s' "$NR_BD_JSON" | jq -r 'if type=="array" then .[0] else . end | .status // "open"' 2>/dev/null || echo "open")
       else
@@ -12341,13 +12535,19 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
             gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$NR_BRANCH"
             bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $NR_MARKER_ID superseded, reaped from stranded needs-rebase). STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped). (ga-88sl7)" 2>/dev/null || true
           else
-            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
-            bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase). story:in-flight stripped; work already merged. (ga-88sl7)" 2>/dev/null || true
-            gate_close_source_terminal "$BEAD_ID" "Branch $NR_BRANCH already merged to $DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase, ga-88sl7)." 1 \
-              || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
+            # ga-buac0o: "already merged" is not "already on the dialer VM". Ask the VM before
+            # closing; a hold leaves the bead open under delivery:pending-vm + gate:passed and
+            # is NOT gate:superseded (it was not delivered).
+            if gate_merged_path_vm_gate "$BEAD_CITY" "$BEAD_ID" "$RIG" "$NR_BRANCH" "$DEFAULT_BRANCH" "$NR_MARKER_ID" "$NR_BASE_COMMIT" "reaped from stranded needs-rebase, Step 0a-4, ga-88sl7"; then
+              bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+              bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $NR_BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase). story:in-flight stripped; work already merged. (ga-88sl7)" 2>/dev/null || true
+              gate_close_source_terminal "$BEAD_ID" "Branch $NR_BRANCH already merged to $DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $NR_MARKER_ID, reaped from stranded needs-rebase, ga-88sl7).${MERGED_VM_NOTE:+ $MERGED_VM_NOTE}" 1 \
+                || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
+            fi
           fi
           ;;
       esac
+      # SELFTEST-EXTRACT needs-rebase-reap-source-bead-fn: END
     fi
     REAPED_NEEDS_REBASE=$((REAPED_NEEDS_REBASE + 1))
   done
@@ -13929,12 +14129,16 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate skipped (marker $MARKER_ID superseded), but this is a STORY: handed off to story-delivery (gate:passed set; story:approved kept; story:in-flight stripped; builder assignee cleared). Delivery will deploy + prod-test, then mark story:done and CLOSE with a delivery reason so it reaches painel Done (ga-i53ua)." 2>/dev/null || true
           log "Already-merged STORY $BEAD_ID handed off to delivery (gate:passed set; story:approved kept for delivery pickup)."
         else
-          # BUG/TASK → superseded close-direct (unchanged behavior). Non-story beads
-          # do NOT route through story-delivery; they close terminal here.
-          bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
-          bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
-          gate_close_source_terminal "$BEAD_ID" "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal)." 1 \
-            || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
+          # BUG/TASK → superseded close-direct. Non-story beads do NOT route through
+          # story-delivery; they close terminal here — unless the dialer VM is not proven
+          # current (ga-buac0o: gate_merged_path_vm_gate holds the bead open under
+          # delivery:pending-vm + gate:passed, and says why on the bead).
+          if gate_merged_path_vm_gate "$BEAD_CITY" "$BEAD_ID" "$RIG" "$BRANCH" "$DEFAULT_BRANCH" "$MARKER_ID" "$BASE_COMMIT" "superseded short-circuit, Step 4b, ga-jhyu"; then
+            bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:superseded" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" comment "$BEAD_ID" "Branch $BRANCH already in $DEFAULT_BRANCH — gate superseded (marker $MARKER_ID). story:in-flight stripped (Pilot lane slot freed — ga-67hae pilot-cascade fix); work already merged." 2>/dev/null || true
+            gate_close_source_terminal "$BEAD_ID" "Branch $BRANCH already merged to $RIG/$DEFAULT_BRANCH — delivered via prior merge; gate superseded (marker $MARKER_ID). Closed by dispatcher (ga-i53ua: non-story already-merged terminal).${MERGED_VM_NOTE:+ $MERGED_VM_NOTE}" 1 \
+              || warn "Could not close already-merged non-story source bead $BEAD_ID even after lease-aware reclaim (non-fatal, ga-v5acl)."
+          fi
         fi
         ;;
     esac

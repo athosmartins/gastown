@@ -382,6 +382,7 @@ else
       DEFAULT_BRANCH="main"
       MARKER_ID="marker-1"
       RIG="gascity"
+      BASE_COMMIT=""
       BD_LOG="$1"
       SCENARIO="$2"
       VB_OPEN='"'"'{"status":"open","labels":[]}'"'"'
@@ -401,6 +402,11 @@ else
       }
       log()  { echo "LOG: $*" >&2; }
       warn() { echo "WARN: $*" >&2; }
+      # ga-buac0o: the non-story close now asks the dialer VM first. That gate has its own selftest
+      # (gate-merged-paths-ask-voicebot-vm.selftest.sh, real code, both already-merged paths); here it
+      # is a recording stub that lets the close through, so THIS part keeps testing what it is about —
+      # the status read — and can still prove WHEN the gate is asked and with WHICH arguments.
+      gate_merged_path_vm_gate() { echo "VMGATE-CALLED: $*" >&2; MERGED_VM_NOTE=""; return 0; }
       '"$FN_VSA3"'
       '"$FN_RELEASE"'
       '"$FN_CLOSE_TERM"'
@@ -425,6 +431,10 @@ else
     *"unreadable"*) ok "unreadable status is named in the diagnostic log (distinguishable from genuinely-open)" ;;
     *) bad "no diagnostic log line naming the source bead as unreadable" ;;
   esac
+  case "$OUT6U" in
+    *"VMGATE-CALLED"*) bad "unreadable source bead: the VM gate was asked about a bead whose status is unknown (ga-buac0o)" ;;
+    *) ok "unreadable source bead: the VM gate is not asked (nothing is being closed)" ;;
+  esac
   rm -f "$BD_LOG6"
 
   BD_LOG6C="$(mktemp)"
@@ -434,6 +444,10 @@ else
   else
     bad "already-closed source bead: cascade unexpectedly fired (rc=$RC6C): $(cat "$BD_LOG6C") / $OUT6C"
   fi
+  case "$OUT6C" in
+    *"VMGATE-CALLED"*) bad "already-closed source bead: the VM gate was asked about a bead that is already terminal (ga-buac0o)" ;;
+    *) ok "already-closed source bead: the VM gate is not asked" ;;
+  esac
   rm -f "$BD_LOG6C"
 
   BD_LOG6O="$(mktemp)"
@@ -443,6 +457,11 @@ else
   else
     bad "genuinely-open source bead: cascade did not run as expected (rc=$RC6O): $(cat "$BD_LOG6O") / $OUT6O"
   fi
+  case "$OUT6O" in
+    *"VMGATE-CALLED: /fake/city src-bead gascity fix/whatever main marker-1 "*)
+      ok "genuinely-open non-story source bead: the VM gate is asked (bead city, bead, rig, branch, default branch, marker) before the close (ga-buac0o)" ;;
+    *) bad "genuinely-open non-story source bead: the VM gate was not asked, or with the wrong arguments (ga-buac0o): $OUT6O" ;;
+  esac
   rm -f "$BD_LOG6O"
 fi
 
