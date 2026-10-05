@@ -1,0 +1,226 @@
+#!/bin/bash
+# e12-arms.selftest.sh — ga-4q2zo5 (E12 of the P0 ga-ufskhy): the contract of assets/e12-arms.sh.
+#
+# Run with the interpreter the launchd jobs use:   /bin/bash e12-arms.selftest.sh     (macOS bash 3.2)
+# E12 is an A/B on what the builder is told BEFORE it writes: treated beads get a short "write-time doctrine" (one comment line
+# before each new read — 'vazio → …; falhou/ilegível → …' — and a re-read of every comment in the diff); control beads get nothing.
+# This file holds the promises of the arm rule and the roster; the Pilot's injection point has its own selftest
+# (pilot-dispatcher.e12-doctrine-block.selftest.sh). The promises:
+#   1. INERT BY DEFAULT — no conf => nobody is treated, nothing is recorded, nothing is said. The experiment is born OFF.
+#   2. THREE STATES, NEVER TWO — "no experiment", "control arm" and "could not tell" never print the same thing. A conf that exists but
+#      cannot be read (typo'd key, unreadable, empty — an empty file is what a failed write leaves behind) is its own state and is
+#      NOT "no conf": it hands out nothing AND says so by exit code (6), because the one real caller drops stderr.
+#   3. THE ARM IS RECOMPUTABLE — first 32 bits of SHA-256("e12-write-3state:<bead-id>") mod 100 < treated_pct, checked here by an
+#      independent python hash, and it is not the coin of E3 (pre-gate) — two experiments over the same beads must not be one coin.
+#   4. THE CONTROL HAS A DENOMINATOR — every bead that gets an arm gets a roster row, control included; one row per bead; a bead keeps
+#      the arm it was first given whatever the conf says later (a pct ramp must not flip a re-dispatched bead).
+#   5. NO ROW, NO TREATMENT — if the arm could not be recorded the bead gets no block: a treated bead that is missing from the roster
+#      is a bead the readout cannot count.
+# Every case below exists because of a failure that happened here or that this city's doctrine names; the comment says which.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+E12="$HERE/e12-arms.sh"
+[ -r "$E12" ] || { echo "FAIL: $E12 not readable" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq missing" >&2; exit 0; }
+command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 missing — the arm recipe is checked by an independent hash" >&2; exit 1; }
+
+W="$(mktemp -d "${TMPDIR:-/tmp}/e12-arms-selftest.XXXXXX")"
+# A selftest that dies half-way must not exit 0 (bash 3.2 does that for several abort shapes — ga-f31s7p): the trap turns "never reached
+# the last line" into a failure of its own.
+REACHED_END=0
+finish() { local rc=$?; chmod -R u+rw "$W" 2>/dev/null; rm -rf "$W"; if [ "$REACHED_END" != 1 ] && [ "$rc" = 0 ]; then echo "FAIL: selftest aborted before its last line" >&2; exit 1; fi; }
+trap finish EXIT
+PASS=0; FAILN=0
+ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad() { FAILN=$((FAILN+1)); printf '  FAIL %s\n' "$1" >&2; }
+
+N_STATE=0; SD=""
+newstate() { N_STATE=$((N_STATE+1)); SD="$W/s$N_STATE"; mkdir -p "$SD"; export E12_STATE_DIR="$SD"; }
+conf() { printf '%s\n' "$@" > "$SD/e12-ab.conf"; }
+OUT=""; ERR=""; RC=0
+# E12 is always run as a subprocess under /bin/bash — the real CLI contract, not a sourced shortcut.
+run() { OUT="$(/bin/bash "$E12" "$@" 2>"$W/err")"; RC=$?; ERR="$(cat "$W/err")"; }
+rows() { if [ -r "$SD/e12-roster.jsonl" ]; then wc -l < "$SD/e12-roster.jsonl" | tr -d ' '; else echo 0; fi; }
+ids() { local i=0; while [ "$i" -lt "$1" ]; do printf 'ga-%s%04d\n' "${2:-t}" "$i"; i=$((i+1)); done; }
+# the documented recipe, computed by python's hashlib — never by the script under test
+expected() { # expected <pct>  (ids on stdin) → "<id> treated|control"
+  python3 -c '
+import hashlib, sys
+pct = int(sys.argv[1])
+for raw in sys.stdin.read().split("\n"):
+    if raw:
+        d = hashlib.sha256(("e12-write-3state:" + raw).encode()).hexdigest()[:8]
+        print(raw, "treated" if int(d, 16) % 100 < pct else "control")' "$1"
+}
+HEADER='## Write-time doctrine — experiment E12 (ga-4q2zo5)'
+
+echo "== 1. inert by default =="
+newstate
+run state;                      [ "$OUT" = absent ] && [ "$RC" = 0 ] && ok "no conf: state=absent" || bad "no conf: state='$OUT' rc=$RC"
+run block ga-abc /store;        [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] && ok "no conf: block adds NOTHING, says nothing, exit 0 (an experiment that is off is not a failure)" || bad "no conf: block out='$OUT' err='$ERR' rc=$RC"
+run assign ga-abc /store;       [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] && ok "no conf: assign prints nothing, exit 0" || bad "no conf: assign out='$OUT' rc=$RC"
+[ ! -e "$SD/e12-roster.jsonl" ] && ok "no conf: no roster row (an absent experiment records nothing)" || bad "no conf: a roster was written"
+run arm ga-abc;                 [ -z "$OUT" ] && [ "$RC" = 4 ] && ok "no conf: arm prints nothing, exit 4 — no experiment is NOT 'control'" || bad "no conf: arm out='$OUT' rc=$RC"
+run block ga-abc /store --no-record; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "no conf: block --no-record is inert too" || bad "no conf: block --no-record out='$OUT' rc=$RC"
+
+echo "== 2. a conf that cannot be read is its own state — never 'no conf' =="
+# The Pilot discards stderr and logs only a non-zero exit. If an invalid conf answered like "no conf" (exit 0, empty) a typo at turn-on
+# would run the experiment at 0% with no roster row and no log line — the ga-shag3i finding on E9. Not repeated here.
+for bc in "treated_pcts=50" "treated_pct=abc" "treated_pct=0" "treated_pct=101" "treated_pct=-5" "treated_pct=" "treated_pct=5 0" "treated_pct=50x" \
+          "just-a-line" "salt=x" "treated_pct=50" ; do
+  newstate
+  if [ "$bc" = "treated_pct=50" ]; then conf "treated_pct=50" "treated_pct=abc"; bc="treated_pct=50 THEN treated_pct=abc"; else conf "$bc"; fi
+  run state
+  case "$OUT" in invalid:*) ok "bad conf '$bc' → $OUT" ;; *) bad "bad conf '$bc' → state='$OUT' (must be invalid:*)" ;; esac
+  run block ga-abc /store
+  [ -z "$OUT" ] && [ "$RC" = 6 ] && ok "bad conf '$bc': block prints nothing and exits 6" || bad "bad conf '$bc': block out='$OUT' rc=$RC"
+  case "$ERR" in *"NOT running"*) ok "bad conf '$bc': stderr says the experiment is NOT running" ;; *) bad "bad conf '$bc': stderr='$ERR'" ;; esac
+  run assign ga-abc /store
+  [ -z "$OUT" ] && [ "$RC" = 6 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "bad conf '$bc': assign prints nothing, exit 6, no roster row" || bad "bad conf '$bc': assign out='$OUT' rc=$RC rows=$(rows)"
+done
+newstate; : > "$SD/e12-ab.conf"; run state
+case "$OUT" in invalid:*) ok "empty conf → $OUT (what a failed write leaves behind must not switch the experiment on)" ;; *) bad "empty conf → '$OUT'" ;; esac
+newstate; printf '# only a comment\n\n' > "$SD/e12-ab.conf"; run state
+case "$OUT" in invalid:*) ok "comment-only conf → $OUT (no treated_pct, no experiment, and not silently absent)" ;; *) bad "comment-only conf → '$OUT'" ;; esac
+newstate; mkdir "$SD/e12-ab.conf"; run state
+case "$OUT" in invalid:*) ok "conf that is a directory → $OUT" ;; *) bad "conf dir → '$OUT'" ;; esac
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf treated_pct=50; chmod 000 "$SD/e12-ab.conf"
+  run state; case "$OUT" in invalid:*) ok "unreadable conf → $OUT" ;; *) bad "unreadable conf → '$OUT'" ;; esac
+  run block ga-abc /store; [ -z "$OUT" ] && [ "$RC" = 6 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "unreadable conf: nothing handed out, exit 6, no roster" || bad "unreadable conf: out='$OUT' rc=$RC"
+  chmod 600 "$SD/e12-ab.conf"
+fi
+newstate; printf '# turn-on 05/10\n\ntreated_pct=50   # half the beads\n' > "$SD/e12-ab.conf"; run state
+[ "$OUT" = "active treated_pct=50" ] && ok "comments, blank lines and trailing blanks are fine: '$OUT'" || bad "valid conf with comments: '$OUT'"
+newstate; conf treated_pct=007; run state
+[ "$OUT" = "active treated_pct=7" ] && ok "leading zeros are decimal (007 → 7), not octal" || bad "treated_pct=007: '$OUT'"
+newstate; conf treated_pct=100; run state; [ "$OUT" = "active treated_pct=100" ] && ok "100 is accepted" || bad "treated_pct=100: '$OUT'"
+newstate; conf treated_pct=1;   run state; [ "$OUT" = "active treated_pct=1" ]   && ok "1 is accepted"   || bad "treated_pct=1: '$OUT'"
+
+echo "== 3. the arm is a recomputable function of the bead id =="
+newstate; conf treated_pct=50
+ids 100 a > "$W/ids"
+expected 50 < "$W/ids" > "$W/want"
+: > "$W/got"; while IFS= read -r id; do run arm "$id"; printf '%s %s\n' "$id" "$OUT" >> "$W/got"; done < "$W/ids"
+if cmp -s "$W/want" "$W/got"; then ok "100 beads: every arm equals the independent SHA-256 recipe at treated_pct=50"; else bad "arm differs from the recipe: $(diff "$W/want" "$W/got" | head -3 | tr '\n' ';')"; fi
+nt="$(grep -c ' treated$' "$W/got")"
+[ "$nt" -ge 30 ] && [ "$nt" -le 70 ] && ok "treated share at pct=50 over 100 beads is $nt% (a coin, not a constant)" || bad "treated share $nt of 100"
+# not E3's coin: E3's arm is the parity of SHA-256("pregate:<id>"); agreement between two independent coins is ~50%
+agree="$(python3 -c '
+import hashlib, sys
+same = n = 0
+for line in open(sys.argv[1]):
+    bead, arm = line.split()
+    e3 = int(hashlib.sha256(("pregate:" + bead).encode()).hexdigest()[:8], 16) % 2 == 0
+    same += (arm == "treated") == e3; n += 1
+print(same * 100 // n)' "$W/got")"
+[ "$agree" -ge 25 ] && [ "$agree" -le 75 ] && ok "E12's arm agrees with E3's pre-gate arm on $agree% of beads — two experiments, two coins" || bad "agreement with E3 is $agree% (a shared coin would be ~100% or ~0%)"
+newstate; conf treated_pct=100
+all="$(while IFS= read -r id; do /bin/bash "$E12" arm "$id"; done < <(head -20 "$W/ids") | sort | uniq -c | tr -s ' ')"
+[ "$all" = " 20 treated" ] && ok "treated_pct=100 → every bead treated" || bad "pct=100: '$all'"
+newstate; conf treated_pct=1
+nt1="$(while IFS= read -r id; do /bin/bash "$E12" arm "$id"; done < "$W/ids" | grep -c '^treated$')"
+[ "$nt1" -le 8 ] && ok "treated_pct=1 → $nt1 of 100 treated (a canary, not half)" || bad "pct=1 treated $nt1 of 100"
+newstate; conf treated_pct=50
+run arm "bad id";  [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "an id with whitespace has no arm (exit 2, nothing printed)" || bad "arm 'bad id': out='$OUT' rc=$RC"
+run arm "";        [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "an empty id has no arm (exit 2)" || bad "arm '': out='$OUT' rc=$RC"
+E12_SHA_TOOLS=none-such run arm ga-abc
+[ -z "$OUT" ] && [ "$RC" = 3 ] && ok "no SHA-256 tool → no arm, exit 3 — 'could not tell' is neither treated nor control" || bad "no sha tool: out='$OUT' rc=$RC"
+E12_SHA_TOOLS=none-such run assign ga-abc /store
+[ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "no SHA-256 tool: assign prints nothing, exit 3, no row" || bad "no sha tool assign: out='$OUT' rc=$RC"
+want0="$(head -1 "$W/want" | cut -d' ' -f2)"
+for tool in sha256sum openssl shasum; do
+  command -v "$tool" >/dev/null 2>&1 || continue
+  a="$(E12_SHA_TOOLS=$tool /bin/bash "$E12" arm ga-a0000 2>/dev/null)"
+  [ "$a" = "$want0" ] && ok "the $tool path yields the same arm as the recipe ($a)" || bad "$tool path gave '$a', recipe says '$want0'"
+done
+
+echo "== 4. assign and the roster =="
+# one bead id per arm, from the REAL rule at pct=50 (never invented)
+ID_T=""; ID_C=""
+newstate; conf treated_pct=50
+while IFS= read -r line; do
+  case "$line" in *" treated") [ -z "$ID_T" ] && ID_T="${line%% *}" ;; *" control") [ -z "$ID_C" ] && ID_C="${line%% *}" ;; esac
+done < "$W/want"
+[ -n "$ID_T" ] && [ -n "$ID_C" ] || { echo "FAIL: no fixture ids (t='$ID_T' c='$ID_C')" >&2; exit 1; }
+echo "  fixtures: treated id=$ID_T, control id=$ID_C"
+run assign "$ID_T" /store/x pilot-dispatch
+[ "$OUT" = treated ] && [ "$RC" = 0 ] && ok "treated bead: assign prints 'treated'" || bad "assign treated: out='$OUT' rc=$RC"
+row="$(jq -c 'select(.event=="assign")' "$SD/e12-roster.jsonl" 2>/dev/null | head -1)"
+[ "$(rows)" = 1 ] && [ "$(printf '%s' "$row" | jq -r .bead)" = "$ID_T" ] && [ "$(printf '%s' "$row" | jq -r .arm)" = treated ] \
+  && [ "$(printf '%s' "$row" | jq -r .salt)" = e12-write-3state ] && [ "$(printf '%s' "$row" | jq -r .treated_pct)" = 50 ] \
+  && [ "$(printf '%s' "$row" | jq -r .store)" = /store/x ] && [ "$(printf '%s' "$row" | jq -r .stage)" = pilot-dispatch ] \
+  && [ -n "$(printf '%s' "$row" | jq -r .ts)" ] && ok "roster row: bead, arm, salt, treated_pct (a number), store, stage, ts" || bad "roster row: '$row'"
+run assign "$ID_C" /store/x
+[ "$OUT" = control ] && [ "$RC" = 0 ] && [ "$(rows)" = 2 ] && ok "control bead: assign prints 'control' and ALSO writes a row (a control with no denominator is not a control)" || bad "assign control: out='$OUT' rc=$RC rows=$(rows)"
+conf treated_pct=100            # a ramp: the pure arm of $ID_C is now 'treated'
+run assign "$ID_C" /store/x
+[ "$OUT" = control ] && [ "$(rows)" = 2 ] && ok "a pct ramp (50 → 100) does not flip a bead that already has a row: still 'control', still 2 rows" || bad "ramp flip: out='$OUT' rows=$(rows)"
+run assign "$ID_T" /store/x;   [ "$OUT" = treated ] && [ "$(rows)" = 2 ] && ok "re-assign of the treated bead: same arm, no second row" || bad "re-assign: out='$OUT' rows=$(rows)"
+# a truncated line (a crashed write) must not make every bead look unassigned
+newstate; conf treated_pct=50
+printf '{"ts":"x","event":"assign","bea\n' > "$SD/e12-roster.jsonl"
+run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$RC" = 0 ] && ok "a truncated roster line is skipped; the next bead is assigned and recorded" || bad "truncated line: out='$OUT' rc=$RC"
+run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$(rows)" = 2 ] && ok "…and is found on the next call (still one row for it)" || bad "after truncated line: rows=$(rows)"
+newstate; conf treated_pct=50
+printf '%s\n' "{\"ts\":\"x\",\"event\":\"assign\",\"bead\":\"$ID_T\",\"salt\":\"e12-write-3state\",\"arm\":\"maybe\"}" > "$SD/e12-roster.jsonl"
+run assign "$ID_T" /store; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a row whose arm is not treated|control → no arm, exit 3 (not a recompute)" || bad "garbled row: out='$OUT' rc=$RC"
+newstate; conf treated_pct=50
+printf '%s\n' "{\"ts\":\"x\",\"event\":\"assign\",\"bead\":\"$ID_T\",\"salt\":\"another-salt\",\"arm\":\"control\"}" > "$SD/e12-roster.jsonl"
+run assign "$ID_T" /store; [ "$OUT" = treated ] && ok "a row under another salt is not this experiment's (the pure arm is used)" || bad "other salt: out='$OUT'"
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf treated_pct=50; : > "$SD/e12-roster.jsonl"; chmod 000 "$SD/e12-roster.jsonl"
+  run assign "$ID_T" /store; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "roster exists but cannot be READ → no arm, exit 3 (cannot tell whether the bead was assigned — not a recompute)" || bad "unreadable roster: out='$OUT' rc=$RC"
+  chmod 600 "$SD/e12-roster.jsonl"
+  newstate; conf treated_pct=50; : > "$SD/e12-roster.jsonl"; chmod 444 "$SD/e12-roster.jsonl"
+  run assign "$ID_T" /store; [ -z "$OUT" ] && [ "$RC" = 5 ] && ok "roster cannot be WRITTEN → prints nothing, exit 5 (arm decided, not recorded)" || bad "unwritable roster: out='$OUT' rc=$RC"
+  chmod 600 "$SD/e12-roster.jsonl"
+fi
+
+echo "== 5. block: the text the builder gets =="
+newstate; conf treated_pct=50
+run block "$ID_T" /store/x pilot-dispatch
+TB="$OUT"
+[ "$RC" = 0 ] && [ -n "$TB" ] && ok "treated bead: block prints text, exit 0" || bad "treated block: rc=$RC len=${#TB}"
+[ "$(printf '%s\n' "$TB" | head -1)" = "$HEADER" ] && ok "first line is the stable header the Pilot checks" || bad "header: '$(printf '%s\n' "$TB" | head -1)'"
+nlines="$(printf '%s\n' "$TB" | grep -c .)"
+[ "$nlines" -le 10 ] && ok "short: $nlines lines (the spec says ≤ 10)" || bad "block has $nlines lines"
+case "$TB" in *'vazio → <what the code does>; falhou/ilegível → <what the code does>'*) ok "gives the exact comment line to write: 'vazio → …; falhou/ilegível → …'" ;; *) bad "comment-line format missing" ;; esac
+case "$TB" in *"Before you write each new read"*"database"*"file"*"API"*"command"*"dict key"*) ok "says WHEN: before each new read, and names the kinds (database, file, API, command, dict key)" ;; *) bad "when/kinds missing" ;; esac
+case "$TB" in *"inert"*"never the same result as"*) ok "says 'failed' must be the inert state and not the same result as 'empty'" ;; *) bad "inert-state clause missing" ;; esac
+case "$TB" in *"Before /gate-done"*"does the code next to it do exactly this?"*) ok "says to re-read every comment in the diff before /gate-done with the question" ;; *) bad "re-read clause missing" ;; esac
+case "$TB" in *"38%"*) ok "gives the why (the measured 38%)" ;; *) bad "no why" ;; esac
+printf '%s\n' "$TB" | grep -E -q 'CRITICAL|MUST|NEVER|ALWAYS|NUNCA|SEMPRE|!!' && bad "block shouts (all-caps rule words) — the guide for these models says to give the reason instead" || ok "no shouting: reasons, not capital letters"
+case "$TB" in *'$('*|*'${'*) bad "block holds shell expansion syntax" ;; *) ok "no shell expansion syntax in the block" ;; esac
+[ "$(rows)" = 1 ] && ok "block recorded the assignment (one row)" || bad "block rows=$(rows)"
+first="$TB"; run block "$ID_T" /store/x; [ "$OUT" = "$first" ] && [ "$(rows)" = 1 ] && ok "re-dispatch: same block, still one row" || bad "re-dispatch: rows=$(rows)"
+run block "$ID_C" /store/x
+[ -z "$OUT" ] && [ "$RC" = 0 ] && [ "$(rows)" = 2 ] && ok "control bead: block prints NOTHING and the bead is recorded as control" || bad "control block: out='$OUT' rc=$RC rows=$(rows)"
+row="$(jq -c --arg b "$ID_C" 'select(.bead==$b)' "$SD/e12-roster.jsonl" | head -1)"; [ "$(printf '%s' "$row" | jq -r .arm)" = control ] && ok "…with arm=control" || bad "control row: '$row'"
+
+# --no-record is what a dry run uses: looking at a bead must not enrol it
+newstate; conf treated_pct=50
+run block "$ID_T" /store/x --no-record
+[ "$OUT" = "$TB" ] && [ "$RC" = 0 ] && ok "--no-record, treated bead: same text as a real run" || bad "--no-record treated: rc=$RC"
+run block "$ID_C" /store/x --no-record; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "--no-record, control bead: nothing" || bad "--no-record control: out='$OUT'"
+[ ! -e "$SD/e12-roster.jsonl" ] && ok "--no-record writes no roster row (the roster is the denominator; a dry run is not a dispatch)" || bad "--no-record wrote a roster"
+run assign "$ID_C" /store/x; conf treated_pct=100; run block "$ID_C" /store/x --no-record
+[ -z "$OUT" ] && ok "--no-record honours the recorded arm over the current pure arm (the variable decided on is the variable acted on)" || bad "--no-record ignored the recorded arm"
+
+# unrecorded ⇒ untreated
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf treated_pct=50; : > "$SD/e12-roster.jsonl"; chmod 444 "$SD/e12-roster.jsonl"
+  run block "$ID_T" /store/x
+  [ -z "$OUT" ] && [ "$RC" = 5 ] && ok "treated bead + unwritable roster → NO block, exit 5 (a treated bead the readout cannot count is not treated)" || bad "unwritable roster block: out='$OUT' rc=$RC"
+  chmod 600 "$SD/e12-roster.jsonl"
+fi
+
+echo "== 6. usage =="
+run;            [ -z "$OUT" ] && [ "$RC" = 2 ] && case "$ERR" in *usage*) true ;; *) false ;; esac && ok "no command → usage on stderr, exit 2" || bad "no command: out='$OUT' rc=$RC err='$ERR'"
+run frobnicate; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "unknown command → exit 2" || bad "unknown command: rc=$RC"
+
+echo
+echo "e12-arms selftest: $PASS passed, $FAILN failed"
+REACHED_END=1
+[ "$FAILN" = 0 ]

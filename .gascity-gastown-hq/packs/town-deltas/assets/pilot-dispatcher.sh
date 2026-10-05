@@ -10076,6 +10076,44 @@ _e9_dispatch_line() {
     "$_e9_plan" "$_e9_bid" "$_e9_store"
 }
 
+# _e12_doctrine_block <bead_id> <bead_store> — ga-4q2zo5 (E12, the write-time-doctrine A/B): the short block appended to the builder's
+# DOCTRINE section, or NOTHING. Nothing (empty stdout, exit 0) is the normal answer: no .gc/e12-ab.conf (the experiment is born off and
+# the Mayor turns it on), the bead is in the control arm, or a failure below. Always exit 0 — the Pilot runs under `set -e` and an
+# experiment must never be able to stop a dispatch.
+# THREE STATES, NEVER TWO: only an answer that is exit 0 AND starts with the block's own header is appended. A script that is missing,
+# fails, times out or prints something else is "could not tell", which must never read as "treated" (it would hand the doctrine to a
+# bead the roster does not count). Those paths are LOGGED, to stderr (stdout is captured as the text): the hook has one channel, so the
+# exit code is what makes the failure visible — and an INVALID conf (6, a typo'd key at turn-on) must not look like "no conf" (silent,
+# legitimately off), or the experiment would run at 0% with no roster row and no trace (the ga-shag3i finding on E9).
+# `block` assigns and records the arm — for the control arm too, which is what gives it a denominator — with no bd/gc call (jq, a hash,
+# one roster append), so the 10s bound is generous even at load 50. A dry run passes --no-record: looking at a bead must not enrol it,
+# but the block is still shown so the dry run reports what would be sent.
+_e12_doctrine_block() {
+  local _e12_bid="$1" _e12_store="$2" _e12_sd _e12_arms _e12_out _e12_rc=0 _e12_nr=""
+  _e12_sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  if [ -z "$_e12_sd" ]; then
+    warn "E12: no write-time doctrine for $_e12_bid — could not resolve the dispatcher's own directory to find e12-arms.sh; if the experiment is on it is NOT running" >&2
+    return 0
+  fi
+  _e12_arms="$_e12_sd/e12-arms.sh"
+  if [ ! -r "$_e12_arms" ]; then
+    warn "E12: no write-time doctrine for $_e12_bid — e12-arms.sh is not readable next to the dispatcher ($_e12_arms); if the experiment is on it is NOT running" >&2
+    return 0
+  fi
+  if [ "${DRY_RUN:-0}" = "1" ]; then _e12_nr="--no-record"; fi
+  _e12_out="$(timeout 10 bash "$_e12_arms" block "$_e12_bid" "$_e12_store" pilot-dispatch ${_e12_nr:+"$_e12_nr"} 2>/dev/null)" || _e12_rc=$?
+  if [ "$_e12_rc" -ne 0 ]; then
+    warn "E12: no write-time doctrine for $_e12_bid — e12-arms.sh block exited $_e12_rc (6 = the experiment config .gc/e12-ab.conf is INVALID, the experiment is NOT running — run 'e12-arms.sh state'; 5 = arm not recorded, roster unwritable; 3 = no arm could be determined; 124 = timed out)" >&2
+    return 0
+  fi
+  [ -n "$_e12_out" ] || return 0
+  case "$_e12_out" in
+    "## Write-time doctrine"*) printf '%s' "$_e12_out" ;;
+    *) warn "E12: no write-time doctrine for $_e12_bid — e12-arms.sh printed something that is not the doctrine block; nothing appended" >&2 ;;
+  esac
+  return 0
+}
+
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 # dispatch_one <story_json> <lane> <dispatch_tier>
 # Handles: claim, verify, builder routing, sling, bead transitions, logging, ntfy.
@@ -11286,6 +11324,19 @@ LIVESEC
 - Leave $STORY_ID OPEN. Comment the PR URL on it once opened, then label it: bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge --external-ref \"<PR URL>\" -q — without this, the gate/Pilot pipeline reads the open bead as untouched work and re-dispatches it (ga-ycsl9). Do NOT close the bead — it closes only after the PR merges."
     DISPATCH_STEP5="5. Commit, push to the fork remote, then gh pr create against upstream (see doctrine above for the exact remote command). Comment the PR URL on $STORY_ID, then run: bd -C \"$STORY_BEAD_CITY\" update \"$STORY_ID\" --add-label story:awaiting-external-merge --external-ref \"<PR URL>\" -q (replace <PR URL> with the real URL). Do NOT run /gate-done. Do NOT close $STORY_ID — it closes only after the PR merges."
     YOUR_JOB_LINE="Fix this completely. This work targets the beads CLI's own repo — see DOCTRINE below for the real path (upstream PR, human review required, NOT /gate-done)."
+  fi
+
+  # ga-4q2zo5 (E12): the hook returns text only if the write-time-doctrine experiment is on AND this bead is in the treated arm; when it
+  # returns nothing, DOCTRINE_BLOCK stays byte-identical. DOCTRINE_BLOCK goes into every builder prompt below (pool sling, session
+  # submit, nudge to a crew), so this one append reaches pools and crews alike. Not for the beads-repo branch: an upstream PR has no
+  # gate, so there is no approval rate to measure.
+  if [ -z "$IS_BEADS_REPO_FIX" ]; then
+    local _e12_block
+    _e12_block="$(_e12_doctrine_block "$STORY_ID" "$STORY_BEAD_CITY")"
+    if [ -n "$_e12_block" ]; then
+      DOCTRINE_BLOCK="$DOCTRINE_BLOCK
+$_e12_block"
+    fi
   fi
 
   # ── ga-c8jimk: claim TTL / lane-budget awareness (Opus 5.1 multiagent guide) ──
