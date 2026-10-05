@@ -244,8 +244,11 @@ fi
 echo "── 5. phase-c-timeout-close-fn: unreadable VB is left untouched (no false close) ──"
 FN_CLOSE="$(extract_block "$DISPATCHER" "phase-c-timeout-close-fn")"
 FN_VSA2="$(extract_block "$DISPATCHER" "vb-status-action-fn")"
-if [ -z "$FN_CLOSE" ] || [ -z "$FN_VSA2" ]; then
-  bad "could not extract phase-c-timeout-close-fn or vb-status-action-fn — aborting Part 5"
+# ga-9ophv2: the TIMEOUT park closes through close_gate_verdict (guard lib) — an extracted-block run must be given it
+# explicitly, or the call is "command not found" and the `|| true` after it hides that.
+FN_GCV5="$(extract_block "$GUARD" "close-gate-verdict-fns")"
+if [ -z "$FN_CLOSE" ] || [ -z "$FN_VSA2" ] || [ -z "$FN_GCV5" ]; then
+  bad "could not extract phase-c-timeout-close-fn, vb-status-action-fn or close-gate-verdict-fns — aborting Part 5"
 else
   run_close() {
     local file_fn="$1" bd_log="$2"
@@ -276,6 +279,7 @@ else
 
   BD_LOG5="$(mktemp)"
   OUT5="$(run_close "$FN_VSA2
+$FN_GCV5
 $FN_CLOSE" "$BD_LOG5" 2>&1)"
   RC5=$?
   if [ "$RC5" -eq 0 ]; then
@@ -337,6 +341,7 @@ PYEOF
     FN_VSA_MUT="$(extract_block "$MUT5" "vb-status-action-fn")"
     BD_LOG5M="$(mktemp)"
     OUT5M="$(run_close "$FN_VSA_MUT
+$FN_GCV5
 $FN_CLOSE_MUT" "$BD_LOG5M" 2>&1)"
     if grep -q "close pc-unreadable" "$BD_LOG5M"; then
       ok "mutant (rc-capture reverted to the pre-fix masked pipe): pc-unreadable IS falsely closed — reproduces the pre-fix ga-art5 bug, proving this test is not vacuous"

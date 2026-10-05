@@ -4107,6 +4107,76 @@ gate_pick_oldest_marker() {
   printf '%s\n' "${1:-[]}" | jq 'sort_by(.created_at) | .[0]' 2>/dev/null
 }
 
+# ── close_gate_verdict / close_open_run_verdicts (ga-9ophv2) ───────────────
+# WHY THESE EXIST. A verdict bead (type:quality-gate-verdict) gets an ASSIGNEE the
+# moment the dispatcher hands it to a reviewer session (durable pull, ga-67hae).
+# `bd close` REFUSES to close an in_progress bead whose assignee is not the caller:
+#   cannot close <id>: assignee is "gate-reviewer-adhoc-…", actor is "<caller>";
+#   reclaim or use --force to override                      (rc=1, nothing changes)
+# Every dispatcher/guard close of a parked verdict bead was `bd close … 2>/dev/null
+# || true`, so that refusal vanished: the dispatcher labeled the parecer
+# verdict:REQUEUED, "closed" it, closed its gate-run, and the parecer stayed
+# in_progress for hours. The ga-hwjrlq reaper then tried the same refused close every
+# ~5 min and failed silently the same way (WARN with no cause) — 4 beads, up to 3h50,
+# 05/10, each paging the Mayor "Agente travado". It only hit parecers that already had
+# a reviewer assigned; the ones that closed fine (ga-p3lle9, ga-txiwnn) were unassigned.
+# --force is the correct override HERE and only here: every caller has already
+# decided that reviewer is finished (REQUEUED/TIMEOUT, run closed, reviewer session
+# closed in Step 9, or confirmed drained), so a still-"live" assignee is moot — the
+# same premise ga-hwjrlq's reaper documents.
+# The failure is now NAMED (bd's own stderr) and the effect is checked, not assumed.
+# Callers supply log/warn (the dispatcher and the live guard both define them).
+# SELFTEST-EXTRACT close-gate-verdict-fns: BEGIN
+close_gate_verdict() {
+  local _vb="$1" _why="$2" _err _st
+  [ -z "$_vb" ] && return 1
+  # stdout ("✓ Closed …") dropped, stderr captured: `2>&1 >/dev/null` order matters.
+  if ! _err=$(bd -C "$GC_CITY" close "$_vb" --force -r "$_why" 2>&1 >/dev/null); then
+    _err=$(printf '%s' "$_err" | tr '\n' ' ' | cut -c1-300)
+    warn "ga-9ophv2: close of verdict bead $_vb FAILED — it stays open (bd said: ${_err:-nothing on stderr})."
+    return 1
+  fi
+  # rc=0 is a claim, not a fact (a write can report success without persisting).
+  # Three states: closed / still open / unreadable. Only a readable NOT-closed is a failure.
+  if _st=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null); then
+    if [ -n "$_st" ] && [ "$_st" != "closed" ]; then
+      warn "ga-9ophv2: bd close of verdict bead $_vb returned success but the bead reads status='$_st' — it stays open."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# close_open_run_verdicts <gate_run_id> <why> — when a gate-run is closed by ANY path,
+# close every verdict bead of that run that is still not closed. Acceptance of ga-9ophv2:
+# a closed run never leaves an open parecer behind. Returns 0 when nothing was left
+# open or everything left open was closed; 1 when a close failed OR the run's verdicts
+# could not be listed (unreadable is NOT "none" — the guard's Step 0b reapers are the
+# backstop for what this misses). No --status on the query: an in_progress verdict is
+# exactly the shape this exists for (same note as the guard's Step 0b.1). --limit 0: ga-21kmp.
+close_open_run_verdicts() {
+  local _run="$1" _why="$2" _json _ids _vb _closed=0 _failed=0
+  case "$_run" in ''|unknown) return 0 ;; esac
+  if ! _json=$(bd -C "$GC_CITY" list --json --limit 0 -l type:quality-gate-verdict -l "gate-run:$_run" 2>/dev/null); then
+    warn "ga-9ophv2: could not list the verdict beads of gate-run $_run — not assuming it has none; the guard's Step 0b reapers will pick up any leftover."
+    return 1
+  fi
+  if ! _ids=$(printf '%s' "$_json" | jq -r 'if type=="array" then .[] | select((.status // "") != "closed") | .id else error("not an array") end' 2>/dev/null); then
+    warn "ga-9ophv2: verdict list of gate-run $_run was not a JSON array — not assuming it has none."
+    return 1
+  fi
+  for _vb in $_ids; do
+    if close_gate_verdict "$_vb" "gate-run $_run closed ($_why) with this verdict still open — the run's reviewer sessions are already closed, nothing is left to finish. Closed with its run (ga-9ophv2)."; then
+      _closed=$((_closed + 1))
+    else
+      _failed=$((_failed + 1))
+    fi
+  done
+  [ "$_closed" -gt 0 ] && log "ga-9ophv2: closed $_closed verdict bead(s) still open under closed gate-run $_run ($_why)."
+  [ "$_failed" -eq 0 ]
+}
+# SELFTEST-EXTRACT close-gate-verdict-fns: END
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -4970,7 +5040,9 @@ if [ "$DEAD_VERDICT_COUNT" -gt 0 ]; then
         # claim the code didn't deliver (exactly the "comment promises more
         # than the code does" defect). Mirror the release branch's existing
         # explicit-warn-on-failure pattern instead of a bare `|| true`.
-        bd -C "$GC_CITY" close "$DV_ID" -r "gate-run $DV_GR_ID terminal (gate-status:${DV_GR_STATUS:-?}), verdict was leftover assignee state. Closed by guard (ga-u07fn)." 2>/dev/null || \
+        # ga-9ophv2: this verdict HAS an assignee (the dead reviewer) — a plain `bd close` is refused for it
+        # ("assignee is X, actor is Y; use --force"), which the old `2>/dev/null` hid. close_gate_verdict forces and names the cause.
+        close_gate_verdict "$DV_ID" "gate-run $DV_GR_ID terminal (gate-status:${DV_GR_STATUS:-?}), verdict was leftover assignee state. Closed by guard (ga-u07fn)." || \
           warn "ga-u07fn: close of $DV_ID FAILED — the comment above claims it closed but the bead is still open. Next sweep will retry."
         ;;
       skip)
@@ -5183,7 +5255,10 @@ if [ "$PARKED_VERDICT_COUNT" -gt 0 ]; then
     case "$PV_ACTION" in
       close)
         PV_VLABEL=$(printf '%s\n' "$PV_LABELS" | grep -oE 'verdict:(REQUEUED|TIMEOUT)' | head -1) || true
-        if bd -C "$GC_CITY" close "$PV_ID" -r "dispatcher parked this verdict (${PV_VLABEL:-verdict:?}) but its close was lost; parent gate-run $PV_GR_ID is ${PV_PARENT} — leftover state, not a stuck review. Closed by guard (ga-hwjrlq)." 2>/dev/null; then
+        # ga-9ophv2: was a plain `bd close … 2>/dev/null`. A parked verdict normally still carries its reviewer as ASSIGNEE, and
+        # bd refuses that close for a non-assignee caller — so this reaper failed identically every sweep (05/10: 4 beads, up to
+        # 3h50, each sweep logging only "FAILED" with no cause). close_gate_verdict forces it and puts bd's own error in the WARN.
+        if close_gate_verdict "$PV_ID" "dispatcher parked this verdict (${PV_VLABEL:-verdict:?}) but its close was lost; parent gate-run $PV_GR_ID is ${PV_PARENT} — leftover state, not a stuck review. Closed by guard (ga-hwjrlq)."; then
           log "ga-hwjrlq: closed parked verdict $PV_ID (age=${PV_AGE}m, parent gate-run $PV_GR_ID ${PV_PARENT})."
         else
           warn "ga-hwjrlq: close of parked verdict $PV_ID FAILED — it stays open; next sweep will retry."

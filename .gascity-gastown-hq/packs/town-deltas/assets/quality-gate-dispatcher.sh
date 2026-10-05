@@ -7381,7 +7381,10 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
           # ga-dl3x9s: written BEFORE the marker requeue below, so it cannot state the
           # marker's fate (an external transition may still win) — say what is true now.
           bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (${_RQ_TAG}) — ${_RQ_VB_CAUSE} Marker is re-queued for a fresh attempt unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
-          bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+          # ga-9ophv2: was `bd close "$VB" 2>/dev/null || true`. This verdict already has its reviewer as ASSIGNEE and bd refuses a
+          # close from a non-assignee ("use --force"), which that redirect hid — the parecer stayed in_progress after its run closed
+          # (4 beads, up to 3h50, "Agente travado" to the Mayor). close_gate_verdict forces it, names the cause, and checks the effect.
+          close_gate_verdict "$VB" "parked as REQUEUED (${_RQ_TAG}) — ${_RQ_VB_CAUSE} Closed by dispatcher (ga-9ophv2)." || true
           ;;
       esac
     done
@@ -7463,6 +7466,9 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
       # — before that attempt ever runs.
       set_gate_status "$GATE_RUN_ID" "superseded"
       bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — ${_RQ_CLOSE_KIND}, marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
+      # ga-9ophv2: the run is closed — so no parecer of it may stay open. The per-verdict closes above can be skipped (status
+      # unreadable → `continue`, "retry next sweep", but there is no next sweep for a closed run) or fail; this is the net.
+      close_open_run_verdicts "$GATE_RUN_ID" "${_RQ_CLOSE_KIND}" || true
     fi
     # ga-dl3x9s: "re-enfileirado" is a claim about the marker; when nothing was
     # re-queued (an external transition won, or the write failed) there is nothing
@@ -7493,7 +7499,8 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
         # ga-dl3x9s: written BEFORE the marker requeue below — see the dead-reviewer
         # branch's matching comment; it must not state the marker's fate.
         bd -C "$GC_CITY" comment "$VB" "VERDICT: REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Marker is re-queued for re-run post-reset${_eta:+ ($_eta)} unless another actor moved it first — the marker's own comment records which." 2>/dev/null || true
-        bd -C "$GC_CITY" close "$VB" 2>/dev/null || true
+        # ga-9ophv2: same refused-close-hidden-by-2>/dev/null as the dead-reviewer branch above — see the comment there.
+        close_gate_verdict "$VB" "parked as REQUEUED (ga-x3nmz) — reviewer session ended on an exhausted Claude 5h quota (quota-stop, NOT a code FAIL). Closed by dispatcher (ga-9ophv2)." || true
         ;;
     esac
   done
@@ -7530,6 +7537,8 @@ if [ "${QUOTA_REQUEUE:-0}" = "1" ]; then
     # the REQUEUED verdict bead as a FAIL).
     set_gate_status "$GATE_RUN_ID" "superseded"
     bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run superseded (terminal) — quota-stop re-queue (ga-x3nmz), marker $MARKER_ID ${_RQ_NOTE}. Closed by dispatcher (ga-fi1dh)." 2>/dev/null || true
+    # ga-9ophv2: same net as the dead-reviewer branch above — a closed run leaves no open parecer behind.
+    close_open_run_verdicts "$GATE_RUN_ID" "quota-stop re-queue (ga-x3nmz)" || true
   fi
   # ga-dl3x9s: same as the dead-reviewer notify — no "re-enfileirado" when the
   # marker was NOT re-queued.
@@ -8623,6 +8632,8 @@ fi
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
       # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
       bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: PASSED (branch $BRANCH sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+      # ga-9ophv2: a closed run leaves no open parecer behind (reviewer sessions were closed in Step 9).
+      close_open_run_verdicts "$GATE_RUN_ID" "terminal PASSED" || true
     fi
 
     # ── ga-esbg: DRIVE THE SOURCE BEAD TO ITS TERMINAL/HANDOFF STATE ──────────
@@ -9653,6 +9664,8 @@ Blocking reasons:
 $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
     bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+    # ga-9ophv2: a closed run leaves no open parecer behind (reviewer sessions were closed in Step 9).
+    close_open_run_verdicts "$GATE_RUN_ID" "terminal FAILED" || true
   fi
 
   # Notify the author (not the Mayor) via nudge. ga-409f4: NOTIFY_AUTHOR
@@ -11243,7 +11256,8 @@ gate_collect_verdicts() {
         VB_PEEK_ERR=$(gc --city "$GC_CITY" session peek "$VB_REVIEWER_ID" --lines 1 2>&1 >/dev/null || true)
         if [ "$(session_peek_reports_dead "$VB_PEEK_ERR")" = "1" ]; then
           log "  Verdict bead $VB has a verdict label but is still OPEN and its reviewer ($VB_REVIEWER_ID) is confirmed drained — rescuing as delivered and closing it (ga-7lz1)."
-          bd -C "$GC_CITY" close "$VB" -r "auto-closed by dispatcher: verdict label delivered, reviewer session drained before its own close (ga-7lz1)" 2>/dev/null || true
+          # ga-9ophv2: the reviewer ($VB_REVIEWER_ID) is still this bead's assignee, so a plain close is refused (and was hidden by 2>/dev/null).
+          close_gate_verdict "$VB" "auto-closed by dispatcher: verdict label delivered, reviewer session drained before its own close (ga-7lz1)" || true
           VB_STATUS="closed"
         fi
       fi
@@ -12170,7 +12184,8 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
                 bd -C "$GC_CITY" label remove "$PC_VB" "verdict:pending" -q 2>/dev/null || true
                 bd -C "$GC_CITY" label add    "$PC_VB" "verdict:TIMEOUT" -q 2>/dev/null || true
                 bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m" 2>/dev/null || true
-                bd -C "$GC_CITY" close "$PC_VB" 2>/dev/null || true
+                # ga-9ophv2: same refused-close-hidden-by-2>/dev/null as the requeue branches (see close_gate_verdict in the guard lib).
+                close_gate_verdict "$PC_VB" "parked as TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m. Closed by dispatcher (ga-9ophv2)." || true
                 ;;
             esac
           done

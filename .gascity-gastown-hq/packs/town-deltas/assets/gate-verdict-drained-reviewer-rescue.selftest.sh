@@ -47,6 +47,9 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
+# ga-9ophv2: the rescue close goes through close_gate_verdict (guard lib), which an extracted-block run
+# does not get for free — without it the call is "command not found" and `|| true` hides that.
+GUARD="$SELF_DIR/quality-gate-guard.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -77,7 +80,7 @@ extract_block() {
 #   vb-closed-happy    closed verdict:PASS  assignee=whoever           -> pre-existing closed path, unaffected
 run_collect_verdicts() {
   local file="$1" bd_log="$2" peek_log="$3"
-  local fn_collect fn_peek_dead fn_identity_link
+  local fn_collect fn_peek_dead fn_identity_link fn_gcv
   fn_collect="$(extract_block "$file" "gate-collect-verdicts-fn")"
   fn_peek_dead="$(extract_block "$file" "session-peek-reports-dead-fn")"
   # ga-6wel0o: gate_collect_verdicts() now calls gate_check_verdict_identity_link()
@@ -88,7 +91,8 @@ run_collect_verdicts() {
   # compare against -> returns early) — it cannot change this test's own
   # assertions, only keep the call resolvable.
   fn_identity_link="$(extract_block "$file" "gate-verdict-identity-link-fn")"
-  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ]; then
+  fn_gcv="$(extract_block "$GUARD" "close-gate-verdict-fns")"
+  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ] || [ -z "$fn_gcv" ]; then
     echo "COULD_NOT_EXTRACT_BLOCK" >&2
     return 99
   fi
@@ -142,6 +146,7 @@ run_collect_verdicts() {
     warn() { echo "WARN: $*" >&2; }
 
     '"$fn_peek_dead"'
+    '"$fn_gcv"'
     '"$fn_identity_link"'
     '"$fn_collect"'
 
@@ -277,11 +282,12 @@ rm -f "$MUT"
 #   vb-bad-metadata  open verdict:PASS  assignee=dead-n5,  metadata is a STRING ("junk")   -> the fallback read must not blow up: assignee still found, rescued
 run_collect_name_fallback() {
   local file="$1" bd_log="$2" peek_log="$3"
-  local fn_collect fn_peek_dead fn_identity_link
+  local fn_collect fn_peek_dead fn_identity_link fn_gcv
   fn_collect="$(extract_block "$file" "gate-collect-verdicts-fn")"
   fn_peek_dead="$(extract_block "$file" "session-peek-reports-dead-fn")"
   fn_identity_link="$(extract_block "$file" "gate-verdict-identity-link-fn")"
-  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ]; then
+  fn_gcv="$(extract_block "$GUARD" "close-gate-verdict-fns")"
+  if [ -z "$fn_collect" ] || [ -z "$fn_peek_dead" ] || [ -z "$fn_identity_link" ] || [ -z "$fn_gcv" ]; then
     echo "COULD_NOT_EXTRACT_BLOCK" >&2
     return 99
   fi
@@ -331,6 +337,7 @@ run_collect_name_fallback() {
     warn() { echo "WARN: $*" >&2; }
 
     '"$fn_peek_dead"'
+    '"$fn_gcv"'
     '"$fn_identity_link"'
     '"$fn_collect"'
 
