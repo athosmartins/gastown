@@ -98,8 +98,10 @@ LABEL_F="$WORK_DIR/labels"; CLOSE_F="$WORK_DIR/closes"; SHOW_F="$WORK_DIR/show-c
 # stderr pointed at $ERR_F. A region that reads a variable this harness never
 # initialised kills the shell right there; under /bin/bash 3.2 the plain
 # `trap 'rm -rf …' EXIT` this file used to have then turned that abort into exit 0
-# (no FAIL line, no summary). The lib fails the run unless the summary is reached and
-# prints $ERR_F — the cause — on the real stderr. Section 7 below proves it.
+# (no FAIL line, no summary). The lib fails the run unless the summary is reached, and
+# when the abort happened inside run_region it prints that region's stderr ($ERR_F) on the
+# real stderr; an abort outside run_region does not get $ERR_F presented as its cause (the
+# file still holds an earlier scenario's stderr). Section 7 below proves both.
 cleanup() { rm -rf "$WORK_DIR"; }
 SELFTEST_ERR_FILE="$ERR_F"
 selftest_fail_closed_arm cleanup
@@ -160,7 +162,12 @@ run_region() {  # $1=SHOW_MODE  $2=SIB_MODE  $3=region text (default: the real o
   # scenarios keep exercising the own-hold path alone; the VM hold has its own selftest
   # (gate-close-asks-voicebot-vm.selftest.sh).
   IS_VM_HOLD=0; DR_RUNTIME_DIR=""
+  # The step is open only while the region runs: $ERR_F was truncated above, so if the shell dies
+  # in here its content is that region's stderr, and the lib may say so. selftest_step_end never
+  # runs when the eval aborts, which is exactly how the lib tells the two cases apart.
+  selftest_step_begin
   eval "${3:-$REGION}" 2>"$ERR_F"
+  selftest_step_end $?
 }
 was_closed() { grep -qF "CLOSED:$FX" "$CLOSE_F"; }
 show_calls() { wc -l < "$SHOW_F" | tr -d ' '; }
@@ -334,14 +341,22 @@ if /bin/bash -n "${BASH_SOURCE[0]}"; then ok "this selftest passes /bin/bash -n"
 # variable this harness never initialised the shell dies on the spot — and under
 # /bin/bash 3.2 (what the dispatcher runs on) it used to do so with exit 0, no FAIL
 # line and no summary: every scenario after the abort silently never ran. Each probe
-# is THIS file plus ONE injected line before section 3, executed under /bin/bash.
-# SELFTEST_ABORT_PROBE keeps a probe from probing itself.
+# is THIS file plus ONE injected line before section 3 (7b also drops sections 3-6, see
+# run_probe), executed under /bin/bash. SELFTEST_ABORT_PROBE keeps a probe from probing itself.
 echo "── 7. an aborted run is red, never green (probes run under /bin/bash 3.2) ──"
-run_probe() {  # $1 = the line to inject; sets PROBE_RC; stdout/stderr -> $WORK_DIR/probe.{out,err}; rc 1 = injection did not apply
-  local ins="$1" probe="$WORK_DIR/probe.selftest.sh"
-  awk -v self="$SELF_DIR" -v ins="$ins" -v marker='echo "── 3. none' \
-    '/^SELF_DIR=/ { print "SELF_DIR=\"" self "\""; next } index($0, marker) == 1 { print ins } { print }' \
-    "${BASH_SOURCE[0]}" > "$probe"
+run_probe() {  # $1 = the line to inject; $2 = "skip" to drop sections 3-6 from the probe (it then runs only the harness, the injected line and the summary tail); sets PROBE_RC; stdout/stderr -> $WORK_DIR/probe.{out,err}; rc 1 = injection did not apply
+  local ins="$1" probe="$WORK_DIR/probe.selftest.sh" skip_to=""
+  # A probe that re-runs sections 3-6 costs as much as the whole file (7b used to: ~2.4x in total, which
+  # quality-gate-guard.sh's `timeout 30` arm can turn into "could not measure"); the abort probes die early.
+  [ "${2:-}" = "skip" ] && skip_to='echo "── 7. an aborted'
+  awk -v self="$SELF_DIR" -v ins="$ins" -v marker='echo "── 3. none' -v skip_to="$skip_to" '
+      /^SELF_DIR=/ { print "SELF_DIR=\"" self "\""; next }
+      index($0, marker) == 1 { print ins; if (skip_to != "") skipping = 1 }
+      skipping && index($0, skip_to) == 1 { skipping = 0 }
+      skipping { n++; next }
+      { print }
+      END { if (skip_to != "" && (skipping || n == 0)) exit 3 }' \
+    "${BASH_SOURCE[0]}" > "$probe" || return 1   # asked to skip but did not find where to resume / nothing to skip
   # Whole-line fixed-string matches: this section's own text also quotes the injected lines.
   [ "$(grep -cxF "$ins" "$probe")" = "1" ] && [ "$(grep -cxF "SELF_DIR=\"$SELF_DIR\"" "$probe")" = "1" ] || return 1
   PROBE_RC=0
@@ -359,12 +374,37 @@ if [ -z "${SELFTEST_ABORT_PROBE:-}" ]; then
     grep -q 'unbound variable' "$WORK_DIR/probe.err" \
       && ok "the swallowed cause (bash's own 'unbound variable' text) is surfaced, so the reader sees WHAT aborted" \
       || bad "the cause of the abort was not surfaced: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'abort happened INSIDE a captured step' "$WORK_DIR/probe.err" \
+      && ok "…and the report says it came from the step that was running (the abort was inside run_region)" \
+      || bad "an abort inside run_region was not attributed to the step in flight: [$(cat "$WORK_DIR/probe.err")]"
   else
     bad "the abort probe did not apply (SELF_DIR / section-3 marker moved?) — the fail-closed guard is unproven"
   fi
+  # 7c. the cause must not be GUESSED. $ERR_F keeps the stderr of the last run_region for the rest of
+  # the run, so an abort OUTSIDE run_region finds a stale file. The probe runs a real run_region whose
+  # region writes a marker to stderr (premise checked: the marker is in $ERR_F afterwards), then dies on
+  # an unset variable in the main shell: the report must not present the marker as the cause (it did:
+  # "stderr of the step that aborted" over a previous scenario's text), and must say why not.
+  if run_probe "run_region clean none 'echo stale-probe-text >&2'; grep -q stale-probe-text \"\$ERR_F\" || exit 7; : \"\$ABORT_PROBE_OUTSIDE\""; then
+    [ "$PROBE_RC" -ne 0 ] && ok "an abort outside run_region also exits NON-ZERO (rc=$PROBE_RC)" \
+      || bad "an abort outside run_region exited 0 — it reads as green"
+    grep -q 'FATAL: selftest ended before its summary' "$WORK_DIR/probe.err" \
+      && ok "…and is reported as ending before its summary" || bad "an abort outside run_region was not reported: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'unbound variable' "$WORK_DIR/probe.err" \
+      && ok "…bash's own 'unbound variable' text is still on the real stderr, where the reader looks" \
+      || bad "the cause of an abort outside run_region is missing from stderr: [$(cat "$WORK_DIR/probe.err")]"
+    ! grep -q 'stale-probe-text' "$WORK_DIR/probe.err" \
+      && ok "an earlier step's stderr is NOT presented as the cause of an abort that happened elsewhere" \
+      || bad "stale stderr from an earlier step was printed as if it explained the abort: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'did NOT happen inside a captured step' "$WORK_DIR/probe.err" \
+      && ok "…and the report says why it shows no step stderr" \
+      || bad "the report does not say the abort was outside any captured step: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the outside-the-step abort probe did not apply (section-3 marker moved?) — stale-stderr attribution is unproven"
+  fi
   # 7b. the guard must not disturb a run that DOES reach its summary: an ordinary failing
   # assertion stays exit 1 + RESULT: FAIL, and is not mislabelled as an abort.
-  if run_probe 'bad "probe: forced failure"'; then
+  if run_probe 'bad "probe: forced failure"' skip; then
     eq "a run that reaches its summary with a failure still exits exactly 1" "$PROBE_RC" "1"
     grep -q 'RESULT: FAIL' "$WORK_DIR/probe.out" && ok "…and prints RESULT: FAIL" || bad "a run with a failed assertion did not print RESULT: FAIL"
     ! grep -q 'ended before its summary' "$WORK_DIR/probe.err" \

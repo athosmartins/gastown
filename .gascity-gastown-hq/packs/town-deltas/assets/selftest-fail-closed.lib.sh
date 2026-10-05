@@ -16,9 +16,17 @@
 #
 # THE FIX, in three parts:
 #   1. do not trust `$?`: fail the run unless the selftest says it reached its summary;
-#   2. keep a non-zero status when there already is one (a TERM'd run stays 143);
-#   3. report on fd 3, a copy of the real stderr taken when the trap is armed, and print
-#      what the aborted step wrote to $SELFTEST_ERR_FILE (when the selftest has one).
+#   2. keep a non-zero status when there already is one (a deliberate `exit 2` after arming
+#      stays 2). A TERM'd run also ends 143, but that is bash re-raising the signal after the
+#      trap, not this step — the banner's "exit status seen" can read 0 there;
+#   3. report on fd 3, a copy of the real stderr taken when the trap is armed. The stderr that
+#      went to $SELFTEST_ERR_FILE is printed ONLY when the selftest says the abort happened
+#      inside the step that owns that file (selftest_step_begin/_end). The file keeps its
+#      content after the step returns, and the lib cannot tell from the file alone WHICH
+#      step wrote it — printing it unconditionally pointed the reader at the wrong step.
+#      The report says which case it is: inside a declared step (shows that step's stderr) /
+#      not inside one (says the file is not the cause and shows nothing) / the selftest sets no
+#      $SELFTEST_ERR_FILE (says nothing about any file).
 #
 # WHY THIS LIVES IN ITS OWN FILE and not inside the selftest: the quality gate's base-commit
 # test check (quality-gate-guard.sh, ga-rstae, A/B arm B) overlays the BRANCH's copy of each
@@ -35,6 +43,11 @@
 #     SELFTEST_ERR_FILE="$WORK_DIR/stderr"       # optional: where the selftest sends stderr of evaled code
 #     selftest_fail_closed_arm cleanup           # replaces `trap '…' EXIT`
 #     …
+#     # around EVERY evaluation whose stderr goes to $SELFTEST_ERR_FILE (truncate the file first):
+#     : > "$SELFTEST_ERR_FILE"; selftest_step_begin
+#     eval "$code" 2>"$SELFTEST_ERR_FILE"
+#     selftest_step_end $?                       # returns that status unchanged; never reached if the eval aborts
+#     …
 #     selftest_summary_reached                   # as the LAST step before the final PASS/FAIL line and exit
 # Arm it ONCE, and after any early `exit 2` precondition checks: those say why they stopped
 # themselves, and arming earlier would add a second, misleading "ended before its summary".
@@ -42,15 +55,23 @@
 SELFTEST_SUMMARY_REACHED=0
 SELFTEST_CLEANUP_FN=""
 SELFTEST_ERR_FILE="${SELFTEST_ERR_FILE:-}"
+SELFTEST_STEP_OPEN=0
 
 selftest_fail_closed_arm() {  # $1 = optional cleanup function, run on every exit
   SELFTEST_CLEANUP_FN="${1:-}"
   SELFTEST_SUMMARY_REACHED=0
+  SELFTEST_STEP_OPEN=0
   exec 3>&2
   trap _selftest_fail_closed_on_exit EXIT
 }
 
 selftest_summary_reached() { SELFTEST_SUMMARY_REACHED=1; }
+
+# A "step" is one evaluation whose stderr goes to $SELFTEST_ERR_FILE. Call selftest_step_begin right
+# after truncating the file, so that whatever the file holds while the step is open was written BY it.
+selftest_step_begin() { SELFTEST_STEP_OPEN=1; }
+# $1 = the status of the step; returned unchanged, so wrapping an eval does not change what the caller sees.
+selftest_step_end() { SELFTEST_STEP_OPEN=0; return "${1:-0}"; }
 
 _selftest_fail_closed_on_exit() {
   local rc=$?
@@ -58,9 +79,17 @@ _selftest_fail_closed_on_exit() {
     {
       echo ""
       echo "FATAL: selftest ended before its summary (exit status seen: $rc) — the run ABORTED; nothing after the last line above ran. This is not a pass."
-      if [ -n "$SELFTEST_ERR_FILE" ] && [ -s "$SELFTEST_ERR_FILE" ]; then
-        echo "  stderr of the step that aborted:"
-        sed 's/^/    /' "$SELFTEST_ERR_FILE"
+      if [ -n "$SELFTEST_ERR_FILE" ]; then
+        if [ "$SELFTEST_STEP_OPEN" = "1" ]; then
+          if [ -s "$SELFTEST_ERR_FILE" ]; then
+            echo "  the abort happened INSIDE a captured step; that step's stderr:"
+            sed 's/^/    /' "$SELFTEST_ERR_FILE"
+          else
+            echo "  the abort happened INSIDE a captured step, which had written nothing to its stderr."
+          fi
+        else
+          echo "  the abort did NOT happen inside a captured step (selftest_step_begin/_end): $SELFTEST_ERR_FILE is not shown, because anything in it predates the abort — look at the lines above."
+        fi
       fi
     } >&3
     [ "$rc" -ne 0 ] || rc=1
