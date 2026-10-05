@@ -112,9 +112,10 @@ QGE_BUFFER_SEC=1200      # ±20min around the predicted fire (drift + advisory-o
 # DOG_MAX_NORMAL is env-overridable (e.g. via this launchd job's plist
 # EnvironmentVariables) so a citywide capacity reduction (ga-xsd03) can lower
 # the outside-window baseline without hand-editing city.toml — a hand-edit
-# gets silently reverted by this guard's own next pass (ga-wdkzk). Default
-# unchanged at 3; the selftest does not set the env var, so it still exercises
-# the default.
+# gets silently reverted by this guard's own next pass (ga-wdkzk). Built-in
+# default is 3. The selftest exports DOG_MAX_NORMAL from the committed city.toml
+# (so it does not exercise the default) and checks that the committed plist
+# carries the same value (ga-14oukw).
 DOG_MAX_NORMAL="${DOG_MAX_NORMAL:-3}"; DOG_MAX_THROTTLED=1
 ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=0
 BEADS_HEALTH_NORMAL="120s";     BEADS_HEALTH_THROTTLED="300s"

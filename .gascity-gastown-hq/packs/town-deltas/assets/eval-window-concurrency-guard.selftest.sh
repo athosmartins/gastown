@@ -30,11 +30,30 @@ cp "$SELF_DIR/../orders/beads-health.toml" "$SANDBOX/packs/town-deltas/orders/be
 cp "$SELF_DIR/../orders/gate-sweep.toml" "$SANDBOX/packs/town-deltas/orders/gate-sweep.toml"
 cp "$SELF_DIR/../orders/order-tracking-sweep.toml" "$SANDBOX/packs/town-deltas/orders/order-tracking-sweep.toml"
 
+# ── Expected dog-pool size: read from the committed city.toml, never a literal ─
+# The dog pool is a capacity knob that gets retuned (it was 3, the committed file
+# says 6 now); a hardcoded number here goes stale on every such edit and turns
+# the selftest red on main (ga-14oukw). Read with an awk of its own, not with the
+# guard's get_dog_max, so section 4 still checks the guard's reader against an
+# independent one instead of comparing the reader with itself.
+COMMITTED_DOG_MAX="$(awk '
+  /^name = "gastown\.dog"$/ { f=1; next }
+  f && /^max_active_sessions = [0-9]+$/ { print $3; exit }
+  /^\[\[/ { f=0 }' "$SANDBOX/city.toml")"
+case "$COMMITTED_DOG_MAX" in
+  ''|*[!0-9]*) echo "FATAL: could not read the gastown.dog max_active_sessions from the committed city.toml"; exit 1 ;;
+esac
+
 # ── Load the REAL helpers from the guard script (lib-only = no live run) ──────
 # Plain assignments (not a prefix on `source`) so GC/GC_CITY_PATH stay set for
 # the rest of this script, not just for the duration of the source call.
 export GC_CITY_PATH="$SANDBOX"
 export EVAL_WINDOW_GUARD_LIB_ONLY=1
+# The guard's "normal" dog target comes from DOG_MAX_NORMAL (its plist sets it in
+# production). Pin it to the committed value so apply_profile(normal) in section 8
+# restores the committed city.toml byte for byte; section 9 checks that the plist
+# really carries this same value.
+export DOG_MAX_NORMAL="$COMMITTED_DOG_MAX"
 # Resolved via PATH, not hardcoded to /bin/true: on this machine (and
 # presumably others with a minimal /bin) /bin/true does not exist at all —
 # only /usr/bin/true does — so a hardcoded path silently makes every
@@ -89,7 +108,7 @@ eq "profile when window=empty" "$(desired_profile "")" "normal"
 
 # ── 4. reading current on-disk values (against the REAL committed files) ──────
 echo "── 4. get_dog_max / get_oracle_min / get_order_interval read the real files ──"
-eq "gastown.dog max_active_sessions (normal, as committed)" "$(get_dog_max)" "3"
+eq "gastown.dog max_active_sessions (normal, as committed)" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
 eq "oracle-wa min_active_sessions (normal, as committed)" "$(get_oracle_min)" "1"
 eq "beads-health interval (normal, as committed)" "$(get_order_interval "$BEADS_HEALTH_TOML")" "120s"
 eq "gate-sweep interval (normal, as committed)" "$(get_order_interval "$GATE_SWEEP_TOML")" "60s"
@@ -133,7 +152,7 @@ eq "re-applying throttled profile is a byte-identical no-op" "$SUM_THROTTLED_AGA
 # ── 8. restore path: normal profile round-trips back to the original values ───
 echo "── 8. apply_profile(normal) restores the original values ──"
 apply_profile "normal" >/dev/null
-eq "gastown.dog max_active_sessions restored" "$(get_dog_max)" "3"
+eq "gastown.dog max_active_sessions restored" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
 eq "oracle-wa min_active_sessions restored" "$(get_oracle_min)" "1"
 eq "beads-health interval restored" "$(get_order_interval "$BEADS_HEALTH_TOML")" "120s"
 eq "gate-sweep interval restored" "$(get_order_interval "$GATE_SWEEP_TOML")" "60s"
@@ -158,6 +177,15 @@ if grep -q '<integer>300</integer>' "$PLIST"; then
   ok "plist StartInterval is 300s (matches the guard's own 5-target reload assumption)"
 else
   bad "plist StartInterval changed — re-check window pre-roll margins still cover one poll cycle"
+fi
+# The deployed guard takes its "normal" dog target from this plist, not from
+# city.toml. If the two disagree the guard rewrites the committed city.toml on its
+# next pass outside a window (ga-wdkzk), so a capacity edit has to change both.
+PLIST_DOG_MAX="$(awk '/<key>DOG_MAX_NORMAL<\/key>/ { getline; gsub(/[^0-9]/, ""); print; exit }' "$PLIST")"
+if [ -z "$PLIST_DOG_MAX" ]; then
+  bad "plist sets no DOG_MAX_NORMAL — the guard would fall back to its built-in default and rewrite city.toml; pin it to the committed value ($COMMITTED_DOG_MAX)"
+else
+  eq "plist DOG_MAX_NORMAL matches the committed city.toml gastown.dog max_active_sessions" "$PLIST_DOG_MAX" "$COMMITTED_DOG_MAX"
 fi
 
 # ── 10. malformed anchor: read failure must NOT be treated as "differs" ───────
