@@ -110,6 +110,10 @@
 # Back 3 -> 2 on 2026-10-03 21:19 BRT (Mayor, applying the revert rule that was PART of
 # the Athos decision above, no new question): disk free 5.9 GB < 6 GB (swap 4.8 GB).
 #
+# Up 2 -> 3 again on 2026-10-05 04:2x BRT (Mayor, same Athos decision — 3 is the standing
+# cap and 2 only while a revert trigger holds): disk free 11 GB >= 6, swap used 4.9 GB <= 6.
+# Pool starved (wa-2a2wn waiting 4 days on fila_pool_cap). Same revert rule still applies.
+#
 # MODEL: Sonnet. Build work is well within Sonnet's capabilities. Keeps wa-worker
 # off the scarce weekly Opus budget (which is reserved for Mayor / named crew).
 #
@@ -118,7 +122,7 @@
 
 work_dir = "/Users/athos/gt/whatsapp_automation/crew/worker"
 min_active_sessions = 0
-max_active_sessions = 2
+max_active_sessions = 3
 idle_timeout = "2h"
 wake_mode = "fresh"
 model = "sonnet"
