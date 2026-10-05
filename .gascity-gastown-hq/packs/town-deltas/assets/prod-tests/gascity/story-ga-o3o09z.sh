@@ -22,13 +22,13 @@ PILOT_PLIST="${PILOT_PLIST:-$HOME/Library/LaunchAgents/com.gascity.pilot.plist}"
 log()  { echo "[prod-test:gascity ga-o3o09z] $*"; }
 fail() { echo "[prod-test:gascity ga-o3o09z] FAIL: $*" >&2; exit 1; }
 
-# ── 1. agent.toml is the source of truth: max_active_sessions = 3 ────────────
+# ── 1. agent.toml is the source of truth: max_active_sessions = 2 ────────────
 CFG="$CITY/agents/wa-worker/agent.toml"
 [[ -f "$CFG" ]] || fail "agent config missing: $CFG"
-if ! grep -qE "^max_active_sessions = 3[[:space:]]*(#.*)?$" "$CFG"; then
-    fail "wa-worker: max_active_sessions = 3 not found in $CFG (got: $(grep '^max_active_sessions' "$CFG" || echo '<missing>'))"
+if ! grep -qE "^max_active_sessions = 2[[:space:]]*(#.*)?$" "$CFG"; then
+    fail "wa-worker: max_active_sessions = 2 not found in $CFG (got: $(grep '^max_active_sessions' "$CFG" || echo '<missing>'))"
 fi
-log "wa-worker: max_active_sessions = 3 in $CFG ✓"
+log "wa-worker: max_active_sessions = 2 in $CFG ✓"
 
 # ── 2. No OTHER live source overrides the controller's view of this value ────
 # city.toml can carry [[patches.agent]] blocks for name = "wa-worker"; none of
@@ -90,14 +90,14 @@ if [[ -f "$PILOT_PLIST" ]]; then
         log "PILOT_WA_WORKER_MAX not set in $PILOT_PLIST — nothing to cross-check, skipping (soft skip)"
     elif ! [[ "$PLIST_MAX" =~ ^[0-9]+$ ]]; then
         fail "PILOT_WA_WORKER_MAX in $PILOT_PLIST is not a plain integer: '$PLIST_MAX'"
-    elif [[ "$PLIST_MAX" -gt 3 ]]; then
-        fail "PILOT_WA_WORKER_MAX=$PLIST_MAX > agent.toml's max_active_sessions=3 — Pilot would believe it can dispatch past the controller's real ceiling"
+    elif [[ "$PLIST_MAX" -gt 2 ]]; then
+        fail "PILOT_WA_WORKER_MAX=$PLIST_MAX > agent.toml's max_active_sessions=2 — Pilot would believe it can dispatch past the controller's real ceiling"
     else
-        log "PILOT_WA_WORKER_MAX=$PLIST_MAX <= agent.toml's 3 ✓ (redundant-but-consistent)"
+        log "PILOT_WA_WORKER_MAX=$PLIST_MAX <= agent.toml's 2 ✓ (redundant-but-consistent)"
     fi
 else
     log "$PILOT_PLIST not found on this host — skipping Pilot plist cross-check (soft skip, not a failure)"
 fi
 
-log "PASS — agents/wa-worker/agent.toml is the single source of truth for the controller's wa-worker ceiling (3), and the Pilot's own ceiling does not disagree"
+log "PASS — agents/wa-worker/agent.toml is the single source of truth for the controller's wa-worker ceiling (2), and the Pilot's own ceiling does not disagree"
 exit 0
