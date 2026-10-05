@@ -3816,6 +3816,10 @@ fi
 # Selectors that must keep seeing a held story: Step 1 (story:approved +
 # gate:passed stay), merged-bead-janitor's delivery-active guard and
 # approved-state-reconciler's delivery-retry rule both know delivery:pending-vm.
+# Consumers in the WA repo (outside this tree) that do not mention delivery:pending-vm at
+# all: painel_visibilidade.py and autoheal_escalation_watch.py (DELIVERY_LIVE /
+# DELIVERY_GAVE_UP). What a held story looks like to them is NOT established here — that is
+# the follow-up ga-1jv274, so this list of selectors is not to be read as complete.
 VM_HOLD_DIR="$GC_CITY/.gc/runtime/voicebot-vm-hold"
 VM_HOLD_FILE="$VM_HOLD_DIR/$STORY_ID.state"
 VM_SCRIPT="${VOICEBOT_VM_SYNC_SCRIPT:-$RUNTIME_DIR/scripts/voicebot_vm_sync.py}"
