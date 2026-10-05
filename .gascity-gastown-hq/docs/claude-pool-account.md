@@ -14,7 +14,9 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
      answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed
                         and which outranks the active one — no probe of it on the way back
                         (not to one whose KEY was refused, 401/403: see Known limits)
-     cannot tell     -> change nothing (network, 5xx: error is not exhaustion)
+     cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
+   vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves
+   a key the vault does not return for the active account is NOT "its key is gone": the item is the second witness
    writes ONE Keychain item  "Claude Code-credentials-50adeaf1"
                              (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
@@ -32,6 +34,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
 The last line is a **separate delivery**: the whatsapp_automation branch `fix/ga-8hcnvb.1-wa-current-account` (same bead).
 Until it merges the decision file is published but the WhatsApp services do not read it and keep their own order; the
 headless pool itself follows the Keychain item either way. Merge both, or the two halves disagree.
+
+The probe never follows a redirect (urllib would re-send the Bearer to wherever a 30x points): a 30x is "cannot tell".
 
 Why the daemon never starts `claude`: the account that is exhausted is the one `claude` would run on. The probe is
 plain HTTP; the switch is `security -i` with the new blob on **stdin** (hex), so no token is ever in argv, the
@@ -102,22 +106,35 @@ first, delete last, and only when restarting the pool is acceptable.
 - The daemon depends on `whatsapp_automation/lib/claude_account_pool.py` for the order and the vault read
   (`CLAUDE_POOL_ACCOUNTS_LIB` overrides the path). If it is missing or fails to import the daemon does nothing.
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just
-  now" (it logs the second). If the vault hiccups for the CURRENT account only, the daemon sees it as "no usable
-  key", picks again and may move the pool to the next probed-good account; it is a valid account and the services
-  follow the decision, but the pool then stays there until that one is exhausted (failback only goes back to an
-  account the daemon saw exhausted). A vault outage that hides every key is inert. Telling the two apart needs a
-  three-state return in the library — not done here.
+  now" (it logs the second). The daemon therefore never reads a `None` for the CURRENT account as "its key is gone":
+  it reads the Keychain item it wrote, and if the item holds a credential whose sha256[:8] equals the `fingerprint` of
+  the decision it keeps the decision and probes that very credential (answers → stay; rejected or refused → the normal
+  failover; cannot tell → nothing). If the item itself cannot be read (locked keychain) nothing changes. Only when the
+  item is missing, holds another credential, or the state has no fingerprint to compare is the pool chosen again from
+  the order (log: `nothing corroborates`). Every run in which the current key did not come from the vault logs one
+  WARN, `its key did not come from the vault this run`; a stretch of them means the vault is failing — or that the key
+  was deliberately removed, in which case the pool keeps using the copy in the item until that credential is refused.
+  While the vault is down no candidate's key can be read either, so a failover cannot complete: the rejection is
+  recorded and the pool stays where it is (the item is not touched). A three-state return in the library would still be
+  cleaner; the daemon no longer depends on it to be safe.
+- An account that is absent from `ordem_das_contas()` for a run (the usage store lacks its entry) gets the same
+  treatment: it is ranked last, not dropped, and the pool stays on it while it answers.
+- The failback target's key is read only when a failback is due; if the vault does not return it that run, the
+  failback is not done and the account stays registered as exhausted, so a later run that has its key completes it.
 
 ## Exit codes (`launchctl list` → last exit status)
 
-`0` = ran (or was legitimately idle: kill switch on, another run holds the lock, nothing usable in the vault).
+`0` = ran (or was legitimately idle: kill switch on, another run holds the lock, the usage store gave no order of use).
 `1` = **refused or failed**: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken, the lock file
 cannot be opened, the login name is not a plain name (`USER` is also read from the passwd database when launchd
 gives none), or the state file exists but cannot be read. In every `1` case nothing was probed or written. A state
 file that is not a JSON object (or is not UTF-8 text, or is nested too deep to parse) is moved to
 `claude_pool_current_account.json.corrupt.<epoch>` and the daemon starts from empty. Inside a readable state, what
 cannot be trusted is dropped, never defaulted: an `exhausted` that is not an object (`null` included — present-but-null
-is not the same as absent), an entry without a usable `reset_epoch` (missing, null, not a number, non-finite, or outside
-2001–2100), a `current` that is not an account name. A reset time in a rate-limit header that is not usable (same test)
-is not stored: the `retry-after` duration is used if that is usable (a finite number of seconds, at most 31 days), else
-the 15-minute cooldown — so garbage can neither read as "already reset" nor as "exhausted for ever".
+is not the same as absent), an entry without a usable `reset_epoch` (missing, null, not a number, non-finite, outside
+2001–2100, or more than 31 days ahead of now), a `current` that is not an account name. A reset time already behind
+now is kept: that account's time has come, and the failback is what it is for. A reset time in a rate-limit header is
+believed only if `now < reset <= now + 31 days` (the same bound is applied again where it is stored); anything else
+falls back to the `retry-after` duration if that is usable (a finite number of seconds, at most 31 days), else to the
+15-minute cooldown — so a bad header can neither read as "already reset" nor veto an account for longer than 31 days.
+(A value like year 2096 passes as an epoch; only this bound relative to now stops it.)

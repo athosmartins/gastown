@@ -168,10 +168,13 @@ if [ "${1:-}" = "-i" ]; then
   while IFS= read -r line; do eval "set -- $line"; run_cmd "$@" || exit $?; done
 else run_cmd "$@"; fi
 EOF
-# fake vault: `secret claude-oauth-token-<email>` -> $VAULT/<email>; absent -> exit 4 "Not found" (as the real one)
+# fake vault: `secret claude-oauth-token-<email>` -> $VAULT/<email>; absent -> exit 4 "Not found" (as the real one); every call is
+# logged to $VAULT/.calls (dotfile: `rm $VAULT/*` leaves it); $VAULT/.broken makes the vault UNREADABLE (exit 1, not 'Not found')
 cat > "$BB/secret" <<'EOF'
 #!/bin/bash
 e="${1#claude-oauth-token-}"
+echo "$e" >> "$VAULT/.calls"
+if [ -e "$VAULT/.broken" ]; then echo "secret: bw serve unreachable (selftest)" >&2; exit 1; fi
 if [ -s "$VAULT/$e" ]; then cat "$VAULT/$e"; exit 0; fi
 echo "secret: Not found." >&2; exit 4
 EOF
@@ -182,6 +185,7 @@ cat > "$W/mock_api.py" <<'EOF'
 import http.server, json, sys
 STATE, LOG, PORTF = sys.argv[1:4]
 class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.do_POST()   # a redirect followed by urllib arrives as a GET: log its Bearer too
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length") or 0))
         tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
@@ -203,13 +207,18 @@ tok_of() { case "$1" in a@t.test) echo "$TOKEN_a" ;; b@t.test) echo "$TOKEN_b" ;
 fp_of() { printf '%s' "$1" | shasum -a 256 | cut -c1-8; }
 
 D="$W/d"; STATE="$D/current.json"; SRV_PID=""
+# A reset time is believed only if it is ahead of NOW and at most 31 days away (the daemon's _usable_reset). The scenarios below
+# store reset times like 2000000000, so they run on a clock that makes them 11 days ahead - unless a test sets NOW_OVERRIDE itself
+# (NOW_OVERRIDE= with an empty value = the real clock).
+NOW_BASE=1999000000
 HDR_OK='{"anthropic-ratelimit-unified-status":"allowed","anthropic-ratelimit-unified-5h-status":"allowed","anthropic-ratelimit-unified-7d-status":"allowed","anthropic-ratelimit-unified-5h-reset":"1900000000","anthropic-ratelimit-unified-7d-reset":"1900500000"}'
 hdr_rejected() { # hdr_rejected <claim five_hour|seven_day> <reset-epoch>
   local w="7d"; [ "$1" = "five_hour" ] && w="5h"
   printf '{"anthropic-ratelimit-unified-status":"rejected","anthropic-ratelimit-unified-%s-status":"rejected","anthropic-ratelimit-unified-%s-reset":"%s","anthropic-ratelimit-unified-representative-claim":"%s","retry-after":"600"}' "$w" "$w" "$2" "$1"
 }
-set_srv() { # set_srv <email> <status> <headers-json>
-  "$PY3" - "$D/srv.json" "$(tok_of "$1")" "$2" "$3" <<'EOF'
+set_srv() { set_srv_in "$D/srv.json" "$(tok_of "$1")" "$2" "$3"; }   # set_srv <email> <status> <headers-json>
+set_srv_in() { # set_srv_in <state-file> <token> <status> <headers-json>
+  "$PY3" - "$1" "$2" "$3" "$4" <<'EOF'
 import json, sys
 p, tok, status, hdr = sys.argv[1:5]
 try: d = json.load(open(p))
@@ -241,7 +250,7 @@ run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean enviro
   env -i HOME="$D/home" USER=athos PATH="$BB:/usr/bin:/bin" GC_CITY_PATH="$D/city" FAKE_KC="$D/kc" VAULT="$D/vault" \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
-      CLAUDE_POOL_NOW="${NOW_OVERRIDE:-}" "${envs[@]}" "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
+      CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" "${envs[@]}" "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
 }
 jget() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); 
 for k in sys.argv[2].split("."): d=d.get(k) if isinstance(d,dict) else None
@@ -300,7 +309,7 @@ EOF
   [ -z "$leak" ] && ok "B3e no token in argv/log/state/output after a FAILOVER run either" || bad "B3e token leaked on the failover path (fingerprints:$leak)"
 
   # B4 failover skips a rejected candidate
-  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; set_srv b@t.test 429 "$(hdr_rejected five_hour 1950000000)"; run_d -- run-once
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; set_srv b@t.test 429 "$(hdr_rejected five_hour 1999500000)"; run_d -- run-once
   [ "$(item_token)" = "$TOKEN_c" ] && [ "$(jget "$STATE" current)" = "c@t.test" ] && ok "B4 the next account is probed BEFORE the item moves: rejected b is skipped, c wins" || bad "B4 current='$(jget "$STATE" current)'"
   [ -n "$(jex b@t.test reset_epoch)" ] && ok "B4b the skipped candidate's rejection is recorded too" || bad "B4b b not recorded as exhausted"
 
@@ -452,7 +461,9 @@ EOF
   # B22g a reset_epoch that is a finite number but not an epoch (0, negative, centuries away) is garbled like any other: dropped.
   # Never read as 'already reset' (0 / -5 would fire an UNPROBED failback) nor as 'exhausted for ever' (1e30).
   # (10**400 is a JSON integer too big for a float: math.isfinite() raises OverflowError on it.)
-  for junk in 0 -5 1e30 '10**400'; do
+  # 4000000000 (year 2096) and the clock-of-the-reading-run + 40 days are INSIDE 2001..2100 and pass for epochs: only the bound relative
+  # to NOW (a stored reset is believed up to 31 days ahead) drops them. Without it the account is vetoed - unprobed - for decades.
+  for junk in 0 -5 1e30 '10**400' 4000000000 '2000000100 + 40*86400'; do
     seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once          # on b, a exhausted
     edit_state "st[\"exhausted\"][\"a@t.test\"][\"reset_epoch\"]=$junk"; pa0=$(probes_of a@t.test); w0=$(writes); NOW_OVERRIDE=2000000100 run_d -- run-once
     [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test why)" ] \
@@ -528,8 +539,11 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   # B31 a reset header that is not a usable epoch (non-finite, absurd, far past/future) must not become the stored reset time.
   # NaN is TRUTHY, 'nan' <= now is False and datetime.fromtimestamp(nan) raises: the old code crashed in the very run that had
   # to fail over, and a huge one is 'exhausted for ever'. The stored time is an epoch in a sane range, else the cooldown.
-  for r in nan inf -inf 1e999 9e15 0 -5 9999-12-31T23:59:59Z 0001-01-01T00:00:00Z; do
-    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day "$r")"; run_d -- run-once; rc=$?
+  # 4000000000 (year 2096) and now+40d are valid epochs INSIDE 2001..2100 and still not believable: a reset header is usable only if
+  # now < reset <= now + 31 days. They end where an unusable header always ends: the retry-after the 429 carries (600 s).
+  R40=$(( $(date +%s) + 40 * 86400 ))
+  for r in nan inf -inf 1e999 9e15 0 -5 9999-12-31T23:59:59Z 0001-01-01T00:00:00Z 4000000000 "$R40"; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day "$r")"; NOW_OVERRIDE= run_d -- run-once; rc=$?
     stored="$(jex a@t.test reset_epoch)"
     [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && no_crash \
       && "$PY3" -c 'import math,sys,time; v=float(sys.argv[1]); n=time.time(); sys.exit(0 if math.isfinite(v) and n < v < n + 86400 * 14 else 1)' "$stored" 2>/dev/null \
@@ -538,7 +552,7 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   done
   # ...and the same through the retry-after fallback path (no *-reset header at all)
   for r in nan inf 1e999 -5; do
-    seeded; set_srv a@t.test 429 "{\"anthropic-ratelimit-unified-status\":\"rejected\",\"retry-after\":\"$r\"}"; run_d -- run-once; rc=$?
+    seeded; set_srv a@t.test 429 "{\"anthropic-ratelimit-unified-status\":\"rejected\",\"retry-after\":\"$r\"}"; NOW_OVERRIDE= run_d -- run-once; rc=$?
     stored="$(jex a@t.test reset_epoch)"
     [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && no_crash \
       && "$PY3" -c 'import math,sys,time; v=float(sys.argv[1]); n=time.time(); sys.exit(0 if math.isfinite(v) and n < v < n + 86400 else 1)' "$stored" 2>/dev/null \
@@ -567,6 +581,180 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -z "$(jex a@t.test reset_epoch)" ] && [ -n "$(jex b@t.test reset_epoch)" ] \
     && ok "B33 the active account answers again -> its stale exhausted entry is cleared (the others are kept)" \
     || bad "B33 current='$(jget "$STATE" current)' a-entry='$(jex a@t.test reset_epoch)' b-entry='$(jex b@t.test reset_epoch)'"
+
+  # ── B36..B43 (gate ga-qmdwdi): the vault is a WITNESS, not the truth; the reset bound; no redirect; lazy vault reads ─────────────
+  hide_key() { rm -f "$D/vault/$1"; }
+  show_key() { printf '%s' "$(tok_of "$1")" > "$D/vault/$1"; }
+  vault_calls() { [ -f "$D/vault/.calls" ] && wc -l < "$D/vault/.calls" | tr -d ' ' || echo 0; }
+  nlog() { local c; c="$(grep -c -- "$1" "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null)"; echo "${c:-0}"; }
+  KEYMISS="its key did not come from the vault this run"
+  item_set() { "$PY3" - "$D/kc/items/$SVC" "$1" <<'EOF'
+import json, sys
+b = {"claudeAiOauth": {"accessToken": sys.argv[2], "expiresAt": 4102444800000, "scopes": ["user:inference"], "subscriptionType": None}}
+open(sys.argv[1], "w").write(json.dumps(b).encode().hex())
+EOF
+  }
+
+  # B36 the vault gave no key for the CURRENT account, and for it alone (b and c readable), for ONE run. `token_da_conta` returns
+  # None both for 'no key registered' and for 'vault unreadable just now', so that is not 'its key is gone': the item the daemon
+  # wrote still holds the decision's credential (fingerprint = the state's), and the daemon keeps the decision and probes THAT.
+  # (The old decide() re-seeded on b, and a - never registered as exhausted - was never failed back to.)
+  seeded; s0="$(jget "$STATE" since)"; fp0="$(jget "$STATE" fingerprint)"; w0=$(writes); pa0=$(probes_of a@t.test)
+  hide_key a@t.test; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(jget "$STATE" since)" = "$s0" ] \
+    && [ "$(jget "$STATE" fingerprint)" = "$fp0" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B36 only the current account's key missing from the vault for 1 run -> item, decision and 'since' unchanged, no write" \
+    || bad "B36 rc=$rc current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) since $s0 -> $(jget "$STATE" since) writes $w0 -> $(writes)"
+  [ "$(nlog "$KEYMISS")" = "1" ] && ! grep -qE "choosing again|no usable key any more" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B36b ...with exactly one counted WARN that says only what is known (the key did not come from the vault this run)" \
+    || bad "B36b WARN count=$(nlog "$KEYMISS"): $(tail -n 3 "$D/city/.gc/logs/claude-pool-account.log" | cut -c1-200)"
+  [ "$(probes_of a@t.test)" = "$((pa0 + 1))" ] && ok "B36c ...and the probe went to the credential the ITEM holds (a), the only copy of the key left" || bad "B36c probes of a: $pa0 -> $(probes_of a@t.test)"
+  hide_key a@t.test; run_d -- run-once; run_d -- run-once
+  [ "$(item_token)" = "$TOKEN_a" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(jget "$STATE" since)" = "$s0" ] && [ "$(nlog "$KEYMISS")" = "3" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B36d hidden for 3 runs in a row -> still a, one counted WARN per run (3), nothing written" || bad "B36d current='$(jget "$STATE" current)' warns=$(nlog "$KEYMISS") writes $w0 -> $(writes)"
+  show_key a@t.test; run_d -- run-once
+  [ "$(item_token)" = "$TOKEN_a" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(nlog "$KEYMISS")" = "3" ] && [ -z "$(jex a@t.test why)" ] \
+    && ok "B36e key back -> the pool never left a: no further WARN, a not registered as exhausted" || bad "B36e current='$(jget "$STATE" current)' warns=$(nlog "$KEYMISS")"
+
+  # B37 the witness is probed like any active account: rejected / refused -> the normal failover (and a IS registered, which the old
+  # re-seed never did); could not tell -> nothing.
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; hide_key a@t.test; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && ok "B37 key hidden + the item's credential REJECTED -> normal failover to b, and a is registered as exhausted" \
+    || bad "B37 rc=$rc current='$(jget "$STATE" current)' a-why='$(jex a@t.test why)'"
+  seeded; set_srv a@t.test 401 '{}'; hide_key a@t.test; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "invalid" ] \
+    && ok "B37b key hidden + the item's credential REFUSED (401) -> failover to b, a registered invalid" || bad "B37b current='$(jget "$STATE" current)' a-why='$(jex a@t.test why)'"
+  seeded; w0=$(writes); set_srv a@t.test 500 '{}'; hide_key a@t.test; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && [ -z "$(jex a@t.test why)" ] \
+    && ok "B37c key hidden + the probe could not tell (500) -> nothing changes" || bad "B37c current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
+
+  # B38 ...and when nothing corroborates the decision the pool IS chosen again: item deleted / holding another credential / no
+  # fingerprint in the state to compare. (These end in the same place as the old code did; the counted WARN is what tells them
+  # apart from it. B38d is the one that is not a re-seed: item unreadable = could not tell = inert.)
+  seeded; hide_key a@t.test; rm -f "$D/kc/items/$SVC"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(nlog "$KEYMISS")" = "1" ] && grep -q "nothing corroborates" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B38 key hidden + item DELETED -> chosen again (b), the WARN says nothing corroborates the decision" || bad "B38 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) warns=$(nlog "$KEYMISS")"
+  seeded; hide_key a@t.test; item_set "$TOKEN_c"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(nlog "$KEYMISS")" = "1" ] && grep -q "nothing corroborates" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B38b key hidden + item holds ANOTHER credential (fingerprint differs) -> chosen again (b)" || bad "B38b current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) warns=$(nlog "$KEYMISS")"
+  seeded; hide_key a@t.test; edit_state 'st.pop("fingerprint")'; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(nlog "$KEYMISS")" = "1" ] && ok "B38c key hidden + the state has no fingerprint to compare -> chosen again (b)" || bad "B38c current='$(jget "$STATE" current)' warns=$(nlog "$KEYMISS")"
+  seeded; w0=$(writes); hide_key a@t.test; touch "$D/kc/locked"; run_d -- run-once; rm -f "$D/kc/locked"
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(nlog "$KEYMISS")" = "1" ] && grep -q "left as it is" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B38d key hidden + the item cannot be read (locked) -> could not tell: decision and item left as they are" || bad "B38d current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
+
+  # B39 the whole vault unreadable (exit 1, not 'Not found') while the item corroborates: the pool keeps working on what it has, and a
+  # rejection of the active account is still seen (the old run stopped at 'no account with a usable key', blind to it).
+  seeded; w0=$(writes); touch "$D/vault/.broken"; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B39 vault down, a answers -> stays on a, nothing written" || bad "B39 rc=$rc current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && ok "B39b vault down, a REJECTED -> the rejection is recorded; no candidate has a key, so the item is not touched" || bad "B39b current='$(jget "$STATE" current)' a-why='$(jex a@t.test why)' writes $w0 -> $(writes)"
+  rm -f "$D/vault/.broken"
+
+  # B40 the account is missing from the ORDER this run (the usage store lacks its entry) - the same 'lookup found nothing' shape, from
+  # another source. It is ranked last, not dropped: it still answers, so the pool stays on it (the old code re-seeded onto b).
+  seeded; w0=$(writes)
+  "$PY3" - "$D/usage.json" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1])); d["accounts"] = [a for a in d["accounts"] if a["email"] != "a@t.test"]; json.dump(d, open(sys.argv[1], "w"))
+EOF
+  run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && grep -q "not in the order of use this run" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B40 current account absent from the order of use -> kept (ranked last), not re-seeded" || bad "B40 current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
+
+  # B41 a key ROTATED in the vault: the item is rewritten to it (heal) and the decision's fingerprint follows - otherwise the next vault
+  # miss would find an item that 'does not corroborate' the decision and re-seed.
+  TOKEN_a2="sk-ant-oat01-TESTrotatedrotatedrotated00"
+  seeded; set_srv_in "$D/srv.json" "$TOKEN_a2" 200 "$HDR_OK"; printf '%s' "$TOKEN_a2" > "$D/vault/a@t.test"; run_d -- run-once
+  [ "$(item_token)" = "$TOKEN_a2" ] && [ "$(jget "$STATE" fingerprint)" = "$(fp_of "$TOKEN_a2")" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] \
+    && ok "B41 vault key for the current account rotated -> item rewritten AND the decision's fingerprint follows it" || bad "B41 item=$(item_token | cut -c1-24) fp='$(jget "$STATE" fingerprint)'"
+  s0="$(jget "$STATE" since)"; hide_key a@t.test; run_d -- run-once
+  [ "$(item_token)" = "$TOKEN_a2" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(jget "$STATE" since)" = "$s0" ] \
+    && ok "B41b ...so a vault miss right after still finds the item corroborating the decision" || bad "B41b current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24)"
+
+  # B42 the vault is read for the CURRENT account every run and for candidates only when the pool has to move - not for every account.
+  seeded; v0=$(vault_calls); run_d -- run-once
+  [ "$(( $(vault_calls) - v0 ))" = "1" ] && ok "B42 steady run -> 1 vault read (the current account), not one per account" || bad "B42 vault reads in a steady run: $(( $(vault_calls) - v0 ))"
+  new_d; v0=$(vault_calls); run_d -- run-once
+  [ "$(( $(vault_calls) - v0 ))" = "1" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B42b seed -> reads only until the first account that answers (1)" || bad "B42b seed vault reads: $(( $(vault_calls) - v0 ))"
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; v0=$(vault_calls); run_d -- run-once
+  [ "$(( $(vault_calls) - v0 ))" = "2" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && ok "B42c failover -> the current account + the candidate that answered (2), c never read" || bad "B42c failover vault reads: $(( $(vault_calls) - v0 ))"
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; set_srv a@t.test 200 "$HDR_OK"; v0=$(vault_calls); NOW_OVERRIDE=2000000100 run_d -- run-once
+  [ "$(( $(vault_calls) - v0 ))" = "2" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B42d failback -> the current account + the account failed back to (2), c never read" || bad "B42d failback vault reads: $(( $(vault_calls) - v0 )) current='$(jget "$STATE" current)'"
+  # a recovered account whose key does not come back is KEPT (not judged), so a later run with its key still fails back to it
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; hide_key a@t.test; NOW_OVERRIDE=2000000100 run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] && grep -q "failback to a@t.test not done: its key did not come from the vault" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B42e failback target's key not returned -> no failback, the entry is kept (not judged)" || bad "B42e current='$(jget "$STATE" current)' a-entry='$(jex a@t.test reset_epoch)'"
+  show_key a@t.test; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000200 run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B42f ...and the next run, key back, completes the failback" || bad "B42f current='$(jget "$STATE" current)'"
+
+  # B43 the probe does not follow a redirect: urllib re-sends Authorization to wherever a 301/302/303 points (and turns the POST into a
+  # GET). A second server stands for 'somewhere else'; its log must stay empty, and a redirect is 'could not tell' - it changes nothing.
+  # (307 is a control: urllib refuses to redirect a POST on 307 by itself, so the old code did not leak there either.)
+  start_srv2() { # answers 200 to every account; every Bearer it sees is logged to $D/probes2.log
+    echo '{}' > "$D/srv2.json"; : > "$D/probes2.log"; rm -f "$D/port2"
+    local e n=0; for e in "${EMAILS[@]}"; do set_srv_in "$D/srv2.json" "$(tok_of "$e")" 200 "$HDR_OK"; done
+    "$PY3" "$W/mock_api.py" "$D/srv2.json" "$D/probes2.log" "$D/port2" & SRV2_PID=$!
+    while [ ! -s "$D/port2" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
+  }
+  stop_srv2() { kill "$SRV2_PID" 2>/dev/null; wait "$SRV2_PID" 2>/dev/null; }
+  for code in 301 302 303 307; do
+    seeded; start_srv2; w0=$(writes)
+    set_srv a@t.test "$code" "{\"Location\":\"http://127.0.0.1:$(cat "$D/port2")/v1/messages\"}"; run_d -- run-once; rc=$?
+    seen2="$(wc -l < "$D/probes2.log" | tr -d ' ')"; stop_srv2
+    [ "$rc" = "0" ] && [ "$seen2" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ -z "$(jex a@t.test why)" ] \
+      && grep -q "redirect http=$code (not followed)" "$D/city/.gc/logs/claude-pool-account.log" \
+      && ok "B43 active probe answered with a $code -> not followed (the other server saw no Bearer), 'could not tell', nothing changed" \
+      || bad "B43 $code: rc=$rc other-server-saw=$seen2 current='$(jget "$STATE" current)' writes $w0 -> $(writes) a-why='$(jex a@t.test why)'"
+  done
+  new_d; start_srv2
+  set_srv a@t.test 302 "{\"Location\":\"http://127.0.0.1:$(cat "$D/port2")/v1/messages\"}"; run_d -- run-once
+  seen2="$(wc -l < "$D/probes2.log" | tr -d ' ')"; stop_srv2
+  [ "$seen2" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] \
+    && ok "B43b seed: a candidate that answers with a redirect is not a candidate -> b, and the other server saw nothing" \
+    || bad "B43b other-server-saw=$seen2 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24)"
+
+  # B44 the reset-time bound, table-driven on classify / register_exhausted / sanitize_state (clock t = 2000000000):
+  # usable only if t < reset <= t + 31 days; anything else -> the 429's retry-after, then the 15-minute cooldown.
+  got="$("$PY3" - "$DAEMON" <<'EOF' 2>&1
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+t = 2000000000.0; MAX = m.MAX_RETRY_AFTER_S; bad = []
+def hdr(reset, ra=None):
+    h = {"anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-7d-status": "rejected",
+         "anthropic-ratelimit-unified-7d-reset": str(reset), "anthropic-ratelimit-unified-representative-claim": "seven_day"}
+    if ra is not None: h["retry-after"] = str(ra)
+    return h
+cases = [("t+1", t + 1, True), ("t+7d", t + 7 * 86400, True), ("t+MAX (the edge)", t + MAX, True),
+         ("t+MAX+1", t + MAX + 1, False), ("t+40d", t + 40 * 86400, False), ("4000000000 (2096)", 4000000000, False),
+         ("t (not ahead)", t, False), ("t-1 (behind)", t - 1, False)]
+for name, r, want in cases:
+    try:
+        want_ra = int(r) if want else t + 600                    # retry-after: 600 on the 429
+        want_cd = int(r) if want else t + m.DEFAULT_COOLDOWN_S   # no retry-after at all
+        got = m.classify(429, hdr(int(r), 600), t).reset_epoch
+        if got != want_ra: bad.append(f"classify {name} + retry-after 600 -> {got} (want {want_ra})")
+        got = m.classify(429, hdr(int(r)), t).reset_epoch
+        if got != want_cd: bad.append(f"classify {name}, no retry-after -> {got} (want {want_cd})")
+    except BaseException as e:
+        bad.append(f"classify {name} raised {type(e).__name__}")
+# the sink: a Probe that carries an out-of-bound time (any caller) is stored as the cooldown
+for name, r, want in cases:
+    st = {}; m.register_exhausted(st, "x@t.test", m.Probe("rejected", float(r), "seven_day", "http=429"), t)
+    got = st["exhausted"]["x@t.test"]["reset_epoch"]; w = float(r) if want else t + m.DEFAULT_COOLDOWN_S
+    if got != w: bad.append(f"register_exhausted {name} -> {got} (want {w})")
+# sanitize_state: beyond t+MAX dropped; a time already behind t is KEPT (that is an account whose time has come)
+st = {"exhausted": {"ok@t": {"reset_epoch": t + MAX}, "far@t": {"reset_epoch": t + MAX + 1}, "y2096@t": {"reset_epoch": 4000000000},
+                    "past@t": {"reset_epoch": t - 5000}, "junk@t": {"reset_epoch": 0}}}
+m.sanitize_state(st, t)
+if sorted(st["exhausted"]) != ["ok@t", "past@t"]: bad.append(f"sanitize_state kept {sorted(st['exhausted'])} (want ['ok@t', 'past@t'])")
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+)"
+  [ "$got" = "OK" ] && ok "B44 reset bound: usable only if now < reset <= now+31d (edges included), else retry-after, else the cooldown; sink and sanitizer agree" || bad "B44 $got"
 
   # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
   # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).

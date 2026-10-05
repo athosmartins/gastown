@@ -19,11 +19,18 @@ One run (launchd StartInterval, single instance via flock):
   * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> change NOTHING. Error != exhausted.
 
 The switch path never starts `claude` (it may be the thing that is exhausted): the probe is one tiny haiku HTTP
-call, and the answer is read from the anthropic-ratelimit-unified-* headers.
+call, and the answer is read from the anthropic-ratelimit-unified-* headers. The probe never follows a redirect (the
+Bearer would travel with it): a 30x is "could not tell".
 
 Tokens: read from the vault by lib/claude_account_pool.token_da_conta, held in memory, sent only as the Bearer of
 the probe and as the hex of a `security -i` command on STDIN. They are never in argv, env, log, state or output;
 accounts are named by e-mail + sha256[:8] fingerprint.
+
+The vault is read LAZILY (Keys): the key of the CURRENT account every run, the keys of the candidates only when the pool
+has to move (seed, failover, failback). `token_da_conta` returns None both for "no key registered" and for "vault
+unreadable just now", so a None for the current account is NOT "its key is gone": the Keychain item this daemon wrote
+(and the fingerprint in the state) is the second witness. Item holds the decision's credential -> keep the decision and
+probe THAT token; item cannot be read -> change nothing; item missing or holding something else -> choose again.
 
 KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the run does nothing at all.
 SEAMS (tests): CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR (GC_POOL_CRED_DIR, the wrapper's name for it, is honoured too),
@@ -57,9 +64,9 @@ PROBE_TIMEOUT_S = 10
 DEFAULT_COOLDOWN_S = 900          # rejected with no usable reset header
 INVALID_KEY_COOLDOWN_S = 3600     # 401/403: the key itself is refused
 EXPIRES_AT_MS = 4102444800000     # 2100-01-01: the blob carries no refresh token, so it never rotates
-MIN_EPOCH = 1_000_000_000         # 2001-09: an 'epoch' outside MIN..MAX is not a time anyone sent us, it is garbage
-MAX_EPOCH = 4_102_444_800         # 2100-01-01
-MAX_RETRY_AFTER_S = 31 * 86400
+MIN_EPOCH = 1_000_000_000         # 2001-09 .. 2100-01-01: what can be an epoch AT ALL. Whether a RESET time is believed is
+MAX_EPOCH = 4_102_444_800         # decided against the clock, by _usable_reset: that is the real bound, this is only the floor.
+MAX_RETRY_AFTER_S = 31 * 86400    # the furthest ahead ANY reset time (header or retry-after) is believed, from now
 DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py"
 DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
 
@@ -219,6 +226,15 @@ def _seconds(v: str) -> Optional[float]:
     return f if math.isfinite(f) and 0 < f <= MAX_RETRY_AFTER_S else None
 
 
+def _usable_reset(v, t: float) -> Optional[float]:
+    """A reset time we will ACT on, or None: a real epoch that is still ahead of `t` and no further than MAX_RETRY_AFTER_S
+    from it. A plausible-looking absurdity (year 2096) passes _sane_epoch but would veto the account for decades, and one
+    already behind us would read as 'recovered' on the very next run: either way the caller falls back to retry-after,
+    then to the cooldown."""
+    r = _sane_epoch(v)
+    return r if r is not None and t < r <= t + MAX_RETRY_AFTER_S else None
+
+
 def classify(status: int, headers: Dict[str, str], t: float) -> Probe:
     h = {k.lower(): v for k, v in headers.items()}
     pre = "anthropic-ratelimit-unified-"
@@ -227,11 +243,11 @@ def classify(status: int, headers: Dict[str, str], t: float) -> Probe:
     rejected = status == 429 or overall == "rejected" or any(v == "rejected" for v in windows.values())
     if rejected:
         claim = h.get(pre + "representative-claim", "")
-        resets = [_epoch(h.get(f"{pre}{w}-reset", "")) for w, st in windows.items() if st == "rejected"]
+        resets = [_usable_reset(_epoch(h.get(f"{pre}{w}-reset", "")), t) for w, st in windows.items() if st == "rejected"]
         resets = [r for r in resets if r is not None]
         if not resets:
             by_claim = {"five_hour": "5h", "seven_day": "7d"}.get(claim)
-            r = _epoch(h.get(f"{pre}{by_claim}-reset", "")) if by_claim else None
+            r = _usable_reset(_epoch(h.get(f"{pre}{by_claim}-reset", "")), t) if by_claim else None
             resets = [r] if r is not None else []
         reset = max(resets) if resets else None
         if reset is None:
@@ -245,6 +261,14 @@ def classify(status: int, headers: Dict[str, str], t: float) -> Probe:
     return Probe("unknown", None, "", f"http={status}")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib re-sends the request headers - Authorization included - to wherever a 301/302/303 points. Declining the
+    redirect makes the 30x surface as an HTTPError, which probe() reads as 'could not tell'."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def probe(token: str) -> Probe:
     body = json.dumps({"model": PROBE_MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "."}]}).encode()
     req = urllib.request.Request(probe_url(), data=body, method="POST", headers={
@@ -252,9 +276,11 @@ def probe(token: str) -> Probe:
         "anthropic-beta": "oauth-2025-04-20", "content-type": "application/json",
         "user-agent": "claude-pool-account/1"})
     try:
-        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT_S) as r:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=PROBE_TIMEOUT_S) as r:
             return classify(r.status, dict(r.headers.items()), now())
     except urllib.error.HTTPError as e:   # 4xx/5xx still carry the headers we need
+        if 300 <= e.code < 400:   # a redirect is not an answer about the account, whatever headers it carries
+            return Probe("unknown", None, "", f"redirect http={e.code} (not followed)")
         return classify(e.code, dict(e.headers.items()) if e.headers else {}, now())
     except Exception as e:  # noqa: BLE001 - network down, DNS, TLS, timeout: could not tell
         return Probe("unknown", None, "", f"{type(e).__name__}")
@@ -328,9 +354,11 @@ def load_state() -> Optional[dict]:
     return {}
 
 
-def sanitize_state(st: dict) -> None:
+def sanitize_state(st: dict, t: float) -> None:
     """Drop what cannot be trusted, never default it: a missing or garbled reset time must not read as 'already reset'
-    (the failback does not probe), and a garbled `current` must not read as an account."""
+    (the failback does not probe), a reset further ahead than anything register_exhausted would have stored must not
+    veto an account for decades, and a garbled `current` must not read as an account. A reset time already BEHIND `t`
+    is kept: that is an account whose time has come, and the failback is what it is for."""
     if "current" in st and not (isinstance(st["current"], str) and st["current"].strip()):
         log("WARN", "state: `current` is not an account name - ignored")
         st.pop("current")
@@ -343,7 +371,8 @@ def sanitize_state(st: dict) -> None:
         return
     for email in list(ex):
         v = ex[email]
-        if not (isinstance(v, dict) and _sane_epoch(v.get("reset_epoch")) is not None):
+        r = _sane_epoch(v.get("reset_epoch")) if isinstance(v, dict) else None
+        if r is None or r > t + MAX_RETRY_AFTER_S:
             log("WARN", f"state: exhausted entry for {email} has no usable reset_epoch - dropped (it is probed again before any use)")
             del ex[email]
 
@@ -368,25 +397,41 @@ def disabled() -> Optional[str]:
     return None
 
 
-def usable_accounts(lib) -> List[Tuple[str, str]]:
-    """[(email, token)] in the order of use, only accounts whose key the vault returned."""
+def order_of_use(lib) -> List[str]:
+    """The e-mails in the order of use ([] = the usage store gave no order: nothing to rank, so nothing to do)."""
     try:
         order = lib.ordem_das_contas()
+        return [e for e in order if isinstance(e, str) and e]
     except Exception as e:  # noqa: BLE001
         log("WARN", f"ordem_das_contas failed ({type(e).__name__}) - nothing to do")
         return []
-    out = []
-    for email in order:
-        tok = lib.token_da_conta(email)
-        if tok:
-            out.append((email, tok))
-    return out
+
+
+class Keys:
+    """The vault, read lazily and at most once per account per run. `token_da_conta` returns None both for 'no key
+    registered' and for 'vault unreadable just now', so a None here means 'no key came back', never 'there is no key':
+    the callers that act on it have to say which of the two they are assuming (see current_credential)."""
+
+    def __init__(self, lib):
+        self.lib, self._got = lib, {}
+
+    def token(self, email: str) -> Optional[str]:
+        if email not in self._got:
+            try:
+                tok = self.lib.token_da_conta(email)
+            except Exception as e:  # noqa: BLE001 - a broken sibling library must not crash the daemon
+                log("WARN", f"{email}: the vault read failed ({type(e).__name__})")
+                tok = None
+            self._got[email] = tok if isinstance(tok, str) and tok else None
+        return self._got[email]
 
 
 def register_exhausted(st: dict, email: str, pr: Probe, t: float) -> None:
-    reset = _sane_epoch(pr.reset_epoch)   # the sink checks too: whatever a parser let through, only a real time is stored
-    if reset is None or reset <= t:
-        reset = t + DEFAULT_COOLDOWN_S   # a reset already in the past would read as 'recovered' on the very next run
+    # the sink checks too: whatever a parser let through, only a reset time that is ahead of now and not absurdly far is
+    # stored. Anything else is the cooldown - a time already behind us would read as 'recovered' on the very next run.
+    reset = _usable_reset(pr.reset_epoch, t)
+    if reset is None:
+        reset = t + DEFAULT_COOLDOWN_S
     st.setdefault("exhausted", {})[email] = {"reset_epoch": reset, "claim": pr.claim, "seen": t, "why": pr.verdict}
     log("INFO", f"{email} {pr.verdict} ({pr.detail}{', ' + pr.claim if pr.claim else ''}) - unusable until {_iso(reset)}")
 
@@ -413,13 +458,18 @@ def switch_to(st: dict, user: str, email: str, token: str, reason: str, t: float
     return True
 
 
-def pick_next(st: dict, accts: List[Tuple[str, str]], skip: set, t: float) -> Optional[Tuple[str, str]]:
-    """First account of the order that is not known-exhausted and answers a probe NOW. Rejected ones are recorded."""
-    for email, tok in accts:
+def pick_next(st: dict, order: List[str], keys: Keys, skip: set, t: float) -> Optional[Tuple[str, str]]:
+    """First account of the order that is not known-exhausted, whose key came back from the vault, and that answers a
+    probe NOW. Rejected ones are recorded. The vault is asked only for the accounts that get this far."""
+    for email in order:
         if email in skip:
             continue
         ex = st.get("exhausted", {}).get(email)
         if ex and ex.get("reset_epoch", math.inf) > t:   # no reset time = still exhausted, never "already reset"
+            continue
+        tok = keys.token(email)
+        if not tok:
+            log("INFO", f"{email}: no key came back from the vault this run - not a candidate")
             continue
         pr = probe(tok)
         if pr.verdict == "allowed":
@@ -437,38 +487,74 @@ def heal_item(st: dict, user: str, token: str, email: str) -> None:
     if kind == "unknown":
         log("WARN", "pool item unreadable (locked keychain?) - not touched")
         return
-    if kind == "ok" and held == token:
-        return
-    log("WARN", f"pool item {'missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')} but the decision is "
-                f"{email} fp={fingerprint(token)} - rewriting")
-    write_item(user, token)
+    if not (kind == "ok" and held == token):
+        log("WARN", f"pool item {'missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')} but the decision is "
+                    f"{email} fp={fingerprint(token)} - rewriting")
+        if not write_item(user, token):
+            return
+    # The decision names the credential the item holds. If the vault's key for this account changed (rotated), the
+    # fingerprint follows - it is the second witness current_credential() relies on when the vault gives nothing back.
+    if st.get("fingerprint") != fingerprint(token):
+        log("INFO", f"{email}: the key in the vault changed - the decision now carries fp={fingerprint(token)}")
+        st["fingerprint"] = fingerprint(token)
 
 
-def decide(st: dict, accts: List[Tuple[str, str]], user: str, t: float) -> None:
-    sanitize_state(st)
-    by_email = dict(accts)
-    order = [e for e, _ in accts]
+def reseed(st: dict, keys: Keys, order: List[str], user: str, t: float, cur: Optional[str]) -> None:
+    got = pick_next(st, order, keys, set(), t)
+    if got:
+        switch_to(st, user, got[0], got[1], f"{'re-seed' if cur else 'seed'}: first usable account ({got[0]})", t)
+    else:
+        log("WARN", "no account answered a probe - pool item NOT created/changed")
+
+
+def current_credential(st: dict, keys: Keys, order: List[str], user: str, cur: str) -> Tuple[str, Optional[str]]:
+    """The credential of the account the decision names, and where it came from: ('vault', token) | ('item', token) |
+    ('gone', None) | ('unknown', None).
+
+    A vault that returns nothing is NOT 'the key is gone' (see Keys): the pool item the daemon wrote is the second witness.
+      * item holds a credential whose fingerprint is the decision's -> 'item': keep the decision, the caller probes THAT token;
+      * item cannot be read (locked keychain, crashed security)      -> 'unknown': change nothing;
+      * item missing, or holding something else                      -> 'gone': nothing corroborates the decision, choose again."""
+    tok = keys.token(cur)
+    if cur not in order:
+        log("INFO", f"current account {cur} is not in the order of use this run - ranked last, not dropped")
+    if tok:
+        return "vault", tok
+    log("WARN", f"current account {cur}: its key did not come from the vault this run - looking at the pool item before deciding anything")
+    kind, held = read_item_token(user)
+    if kind == "unknown":
+        log("WARN", "pool item unreadable (locked keychain?) - the decision is left as it is")
+        return "unknown", None
+    fp = st.get("fingerprint")
+    if kind == "ok" and held and isinstance(fp, str) and fingerprint(held) == fp:
+        log("INFO", f"the pool item still holds the decision's credential (fp={fp}) - keeping {cur}, probing that one")
+        return "item", held
+    log("WARN", f"the pool item {'is missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')}, not the credential of "
+                f"the decision (fp={fp if isinstance(fp, str) else '-'}) - nothing corroborates {cur}, choosing again")
+    return "gone", None
+
+
+def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
+    sanitize_state(st, t)
     cur = st.get("current")
-    if not cur or cur not in by_email:
-        if cur:
-            log("WARN", f"current account {cur} has no usable key any more - choosing again")
-        got = pick_next(st, accts, set(), t)
-        if got:
-            switch_to(st, user, got[0], got[1], f"{'re-seed' if cur else 'seed'}: first usable account ({got[0]})", t)
-        else:
-            log("WARN", "no account answered a probe - pool item NOT created/changed")
+    if not cur:
+        return reseed(st, keys, order, user, t, None)
+    kind, tok = current_credential(st, keys, order, user, cur)
+    if kind == "unknown":
         return
+    if kind == "gone":
+        return reseed(st, keys, order, user, t, cur)
 
-    pr = probe(by_email[cur])
+    pr = probe(tok)
     if pr.verdict == "unknown":
         log("INFO", f"{cur}: probe could not tell ({pr.detail}) - nothing changed")
     elif pr.verdict in ("rejected", "invalid"):
         register_exhausted(st, cur, pr, t)
-        got = pick_next(st, accts, {cur}, t)
+        got = pick_next(st, order, keys, {cur}, t)
         if got:
             switch_to(st, user, got[0], got[1], f"failover: {cur} {pr.verdict}", t)
         else:
-            log("WARN", f"every account is exhausted or unreachable - staying on {cur}")
+            log("WARN", f"no other account could take over (exhausted, no key from the vault this run, or not answering) - staying on {cur}")
     else:
         # active account answers. What it just answered beats anything stored about it.
         ex = st.get("exhausted", {})
@@ -478,20 +564,30 @@ def decide(st: dict, accts: List[Tuple[str, str]], user: str, t: float) -> None:
         # back through the branch above. A REFUSED KEY (401/403) is not a limit that renews: failing back to it unprobed
         # would put a still-refused key into the item - every pool session broken until the next run, hourly. It is
         # judged (dropped) at its time like the others, and is probed the normal way when a later failover reaches it.
-        expired = [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t and e in by_email]
+        # The vault is asked only for the accounts that could be switched to; one whose key does not come back is KEPT
+        # (not judged): the failback is tried again on a run that has its key.
+        expired = [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t]
         recovered = [e for e in expired if ex[e].get("why") != "invalid"]
-        best = next((e for e in order if e in recovered), None)
-        kept = None
-        if best and order.index(best) < order.index(cur):
-            if not switch_to(st, user, best, by_email[best], f"failback: {best} reached its stored reset time", t):
-                kept = best   # the write failed: the failback did NOT happen, so it must be tried again next run
-                log("WARN", f"failback to {best} not done (the pool item could not be switched) - kept for the next run")
+        kept = set()
+        for e in [e for e in order[:order.index(cur) if cur in order else len(order)] if e in recovered]:
+            key = keys.token(e)
+            if not key:
+                kept.add(e)
+                log("WARN", f"failback to {e} not done: its key did not come from the vault this run - kept for the next run")
+                continue
+            if not switch_to(st, user, e, key, f"failback: {e} reached its stored reset time", t):
+                kept.add(e)   # the write failed: the failback did NOT happen, so it must be tried again next run
+                log("WARN", f"failback to {e} not done (the pool item could not be switched) - kept for the next run")
+            break
         for e in expired:
-            if e != kept:
+            if e not in kept:
                 ex.pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
-    cur = st.get("current")
-    if cur in by_email:
-        heal_item(st, user, by_email[cur], cur)
+    now_cur = st.get("current")
+    if kind == "item" and now_cur == cur:
+        return   # the key of the decision never came from the vault and the item IS that key: nothing to heal against
+    key = keys.token(now_cur) if now_cur else None
+    if key:
+        heal_item(st, user, key, now_cur)
 
 
 def run_once() -> int:
@@ -525,15 +621,15 @@ def run_once() -> int:
     lib = load_accounts_lib()
     if lib is None:
         return 0
-    accts = usable_accounts(lib)
-    if not accts:
-        log("WARN", "no account with a usable key (order empty or vault unreadable) - nothing changed")
+    order = order_of_use(lib)
+    if not order:
+        log("WARN", "no account in the order of use (usage store unreadable or empty) - nothing changed")
         return 0
     st = load_state()
     if st is None:
         return 1
     before = json.dumps(st, sort_keys=True)
-    decide(st, accts, user, now())
+    decide(st, Keys(lib), order, user, now())
     if json.dumps(st, sort_keys=True) != before:
         publish_state(st)
     return 0
