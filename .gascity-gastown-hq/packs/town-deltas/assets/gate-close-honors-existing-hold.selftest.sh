@@ -43,6 +43,9 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 
 [ -f "$DISPATCHER" ] || { echo "FATAL: dispatcher not found at $DISPATCHER" >&2; exit 2; }
+# ga-avma7j: the fail-closed EXIT trap lives in its own lib, not here — the gate's A/B base check
+# overlays this file onto the base, and a fix kept inside it would travel along and pass there.
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 
 echo "== gate-close-honors-existing-hold.selftest (ga-hwzzou) =="
 
@@ -88,9 +91,18 @@ eq "...and two of the three sit inside the extracted close-decision region (the 
 
 # ── 2. harness: mocked bd, real helpers ──────────────────────────────────────
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
 ERR_F="$WORK_DIR/stderr"; LOG_F="$WORK_DIR/log"; COMMENT_F="$WORK_DIR/comments"
 LABEL_F="$WORK_DIR/labels"; CLOSE_F="$WORK_DIR/closes"; SHOW_F="$WORK_DIR/show-calls"
+
+# FAIL CLOSED (ga-avma7j): run_region evals the extracted region under `set -u` with
+# stderr pointed at $ERR_F. A region that reads a variable this harness never
+# initialised kills the shell right there; under /bin/bash 3.2 the plain
+# `trap 'rm -rf …' EXIT` this file used to have then turned that abort into exit 0
+# (no FAIL line, no summary). The lib fails the run unless the summary is reached and
+# prints $ERR_F — the cause — on the real stderr. Section 7 below proves it.
+cleanup() { rm -rf "$WORK_DIR"; }
+SELFTEST_ERR_FILE="$ERR_F"
+selftest_fail_closed_arm cleanup
 
 FX=ga-hwzzou-fx
 SHOW_MODE=clean
@@ -307,8 +319,8 @@ else bad "M5 did not apply (unverified condition changed?) — the failed-read s
 run_region pending
 ! was_closed && ok "after the mutations the real code holds again (harness restored)" || bad "harness did not restore the real helper"
 
-rm -rf "$WORK_DIR"
-trap - EXIT
+# (No early cleanup / `trap - EXIT` here: sections 6-7 still need $WORK_DIR, and the
+# EXIT trap must stay armed to the very end so an abort in them is not green either.)
 
 # ── 6. syntax ────────────────────────────────────────────────────────────────
 # /bin/bash (3.2), NOT the PATH bash: Homebrew bash 5.x accepts constructs the
@@ -317,7 +329,53 @@ echo "── 6. syntax (/bin/bash -n) ──"
 if /bin/bash -n "$DISPATCHER"; then ok "dispatcher passes /bin/bash -n"; else bad "dispatcher /bin/bash -n FAILED"; fi
 if /bin/bash -n "${BASH_SOURCE[0]}"; then ok "this selftest passes /bin/bash -n"; else bad "selftest /bin/bash -n FAILED"; fi
 
+# ── 7. an aborted run is red, never green (ga-avma7j) ────────────────────────
+# run_region evals the extracted region under `set -u`. When the region reads a
+# variable this harness never initialised the shell dies on the spot — and under
+# /bin/bash 3.2 (what the dispatcher runs on) it used to do so with exit 0, no FAIL
+# line and no summary: every scenario after the abort silently never ran. Each probe
+# is THIS file plus ONE injected line before section 3, executed under /bin/bash.
+# SELFTEST_ABORT_PROBE keeps a probe from probing itself.
+echo "── 7. an aborted run is red, never green (probes run under /bin/bash 3.2) ──"
+run_probe() {  # $1 = the line to inject; sets PROBE_RC; stdout/stderr -> $WORK_DIR/probe.{out,err}; rc 1 = injection did not apply
+  local ins="$1" probe="$WORK_DIR/probe.selftest.sh"
+  awk -v self="$SELF_DIR" -v ins="$ins" -v marker='echo "── 3. none' \
+    '/^SELF_DIR=/ { print "SELF_DIR=\"" self "\""; next } index($0, marker) == 1 { print ins } { print }' \
+    "${BASH_SOURCE[0]}" > "$probe"
+  # Whole-line fixed-string matches: this section's own text also quotes the injected lines.
+  [ "$(grep -cxF "$ins" "$probe")" = "1" ] && [ "$(grep -cxF "SELF_DIR=\"$SELF_DIR\"" "$probe")" = "1" ] || return 1
+  PROBE_RC=0
+  SELFTEST_ABORT_PROBE=1 /bin/bash "$probe" > "$WORK_DIR/probe.out" 2> "$WORK_DIR/probe.err" || PROBE_RC=$?
+}
+if [ -z "${SELFTEST_ABORT_PROBE:-}" ]; then
+  # 7a. the bead's shape: the region reads a variable nobody initialised.
+  if run_probe "run_region clean none '[ -n \"\$ABORT_PROBE_UNSET\" ]'"; then
+    [ "$PROBE_RC" -ne 0 ] && ok "a run that aborts mid-way exits NON-ZERO (rc=$PROBE_RC; under /bin/bash 3.2 it was 0 before ga-avma7j)" \
+      || bad "REGRESSION: a run that ABORTED mid-way exited 0 — an abort reads as green (stdout tail: $(tail -2 "$WORK_DIR/probe.out" | tr '\n' ' '))"
+    ! grep -q 'RESULT: PASS' "$WORK_DIR/probe.out" && ok "the aborted run never prints RESULT: PASS" || bad "the aborted run printed RESULT: PASS"
+    grep -q 'FATAL: selftest ended before its summary' "$WORK_DIR/probe.err" \
+      && ok "the abort is reported on the real stderr (not lost in the region's redirect)" \
+      || bad "the abort is silent — nothing on stderr says the run ended before its summary: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'unbound variable' "$WORK_DIR/probe.err" \
+      && ok "the swallowed cause (bash's own 'unbound variable' text) is surfaced, so the reader sees WHAT aborted" \
+      || bad "the cause of the abort was not surfaced: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the abort probe did not apply (SELF_DIR / section-3 marker moved?) — the fail-closed guard is unproven"
+  fi
+  # 7b. the guard must not disturb a run that DOES reach its summary: an ordinary failing
+  # assertion stays exit 1 + RESULT: FAIL, and is not mislabelled as an abort.
+  if run_probe 'bad "probe: forced failure"'; then
+    eq "a run that reaches its summary with a failure still exits exactly 1" "$PROBE_RC" "1"
+    grep -q 'RESULT: FAIL' "$WORK_DIR/probe.out" && ok "…and prints RESULT: FAIL" || bad "a run with a failed assertion did not print RESULT: FAIL"
+    ! grep -q 'ended before its summary' "$WORK_DIR/probe.err" \
+      && ok "…and is NOT reported as an abort (the summary was reached)" || bad "an ordinary failing run was mislabelled as an abort"
+  else
+    bad "the failing-run probe did not apply (section-3 marker moved?) — the guard's normal path is unproven"
+  fi
+fi
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
+selftest_summary_reached   # the lib fails every run that never got here
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi
