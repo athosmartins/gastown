@@ -101,10 +101,25 @@ if [ ! -s "$FAKE_KC/argv.log" ]; then bad "A7 vacuous: the fake security was nev
 elif grep -qE '(^| )-[a-zA-Z]*[wg]( |$)' "$FAKE_KC/argv.log" 2>/dev/null; then bad "A7 wrapper asked security to PRINT the secret (-w/-g): $(cat "$FAKE_KC/argv.log")"
 else ok "A7 wrapper only checks existence (never -w/-g)"; fi
 
-new_kc; touch "$FAKE_KC/items/$SVC"
-out="$(env -i HOME="$W/home" PATH="/usr/bin:/bin" USER=athos GC_CITY_PATH="$W/city" GC_LOWPRIO=0 GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" "$WRAPPER" x 2>/dev/null)"
-[ "$(field argc "$out")" = "1" ] && [ "$(field secstore "$out")" = "<unset>" ] && ok "A8 no \`security\` binary at all -> claude still launches, variable not exported" \
-  || bad "A8 missing security broke the launch: $out"
+# A8 no `security` binary at all. PATH=/usr/bin:/bin is NOT that on macOS (`security` is /usr/bin/security): this test
+# used to run the REAL security against the REAL login Keychain and pass on its answer (44, "no such item"), so the
+# no-binary path (rc=127) was never reached and no test could see 127 being read as "the item exists" (gate ga-rtavdh).
+# So: a PATH directory holding exactly what the wrapper runs here (date, ps, shasum, sleep, id) and no `security`; proof
+# that this PATH really cannot resolve `security`; and the SKIP line must say rc=127 - 44, 124 and 36 also launch
+# claude without the variable, so the launch alone cannot tell which path ran.
+NOSEC="$W/nosec"; mkdir -p "$NOSEC"; nosec_ok=1
+for t in date ps shasum sleep id; do
+  for d in /bin /usr/bin; do [ -x "$d/$t" ] && { ln -sf "$d/$t" "$NOSEC/$t"; break; }; done
+  [ -x "$NOSEC/$t" ] || nosec_ok=0
+done
+env -i PATH="$NOSEC" /bin/bash -c 'command -v security' >/dev/null 2>&1 && nosec_ok=0
+new_kc
+out="$(env -i HOME="$W/home" PATH="$NOSEC" USER=athos GC_CITY_PATH="$W/city" GC_LOWPRIO=0 GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" "$WRAPPER" x 2>/dev/null)"
+if [ "$nosec_ok" != "1" ]; then bad "A8 vacuous: could not build a PATH that has the wrapper's tools and no \`security\`"
+elif [ "$(field argc "$out")" = "1" ] && [ "$(field secstore "$out")" = "<unset>" ] \
+     && grep -q "POOL-ACCT SKIP.*security rc=127;" "$W/city/.gc/logs/claude-pool-account.log"; then
+  ok "A8 no \`security\` binary at all -> claude still launches, variable not exported, and the SKIP line says rc=127"
+else bad "A8 no security binary: out='$(printf '%s' "$out" | tr '\n' ' ')' log: $(tail -n 1 "$W/city/.gc/logs/claude-pool-account.log")"; fi
 
 new_kc; touch "$FAKE_KC/items/$SVC"
 run_wrapper USER=athos -- x >/dev/null
@@ -157,6 +172,9 @@ run_cmd() {
   case "$sub" in
     add-generic-password) [ -e "$KC/refuse-writes" ] && { echo "security: write refused (selftest)" >&2; return 1; }
                           [ -n "$svc" ] && [ -n "$hex" ] || return 1
+                          # two ways a write can report success and still not leave the credential that was asked for
+                          [ -e "$KC/write-lands-nothing" ] && { echo "DROPPED $svc" >> "$KC/dropped.log"; return 0; }
+                          [ -e "$KC/write-lands-other" ] && hex="$(printf '%s' '{"claudeAiOauth":{"accessToken":"selftest-some-other-credential"}}' | xxd -p | tr -d '\n')"
                           printf '%s' "$hex" > "$KC/items/$svc"; echo "WRITE $svc" >> "$KC/writes.log" ;;
     find-generic-password) [ -e "$KC/locked" ] && { echo "security: User interaction is not allowed." >&2; return 36; }
                            [ -e "$KC/items/$svc" ] || { echo "security: The specified item could not be found in the keychain." >&2; return 44; }
@@ -372,11 +390,16 @@ EOF
   [ ! -e "$D/kc/items/$SVC" ] && [ ! -s "$D/probes.log" ] && ok "B12b GC_POOL_ACCOUNT=0 -> the run does nothing" || bad "B12b env kill switch ignored"
 
   # B13 single instance
-  new_d; "$PY3" - "$D/city/.gc/claude-pool-account.lock" <<'EOF' &
+  # The holder signals AFTER it owns the lock and keeps it until killed: a fixed sleep(8)+sleep(1) made B13 depend on
+  # how fast python starts, and under load (~70) the lock was not held yet, or already gone, when the run began.
+  new_d; rm -f "$D/held"; "$PY3" - "$D/city/.gc/claude-pool-account.lock" "$D/held" <<'EOF' &
 import fcntl, sys, time
-f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(8)
+f = open(sys.argv[1], "w"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[2], "w").close(); time.sleep(300)
 EOF
-  HOLD=$!; sleep 1; run_d -- run-once; rc=$?
+  HOLD=$!
+  for _i in $(seq 1 120); do [ -e "$D/held" ] && break; sleep 0.25; done
+  [ -e "$D/held" ] || bad "B13 setup: the lock holder never took the lock"
+  run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && [ ! -s "$D/probes.log" ] && [ ! -e "$D/kc/items/$SVC" ] && grep -q "holds the lock" "$D/city/.gc/logs/claude-pool-account.log" \
     && ok "B13 a second run while the lock is held exits 0 without probing or writing" || bad "B13 lock not respected (rc=$rc)"
   kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null
@@ -413,6 +436,21 @@ EOF
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; touch "$D/kc/locked"; run_d -- run-once; rm -f "$D/kc/locked"
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && grep -q "unverified" "$D/city/.gc/logs/claude-pool-account.log" \
     && ok "B20 write ok + read-back unreadable -> decision follows the item (b), reported as unverified" || bad "B20 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24)"
+
+  # B20b/B20c the two read-back guards in switch_to: the write reported success but the item does not hold what was asked
+  # for. B20 covers only 'could not read it back'; these are the checks behind "the credential decided on is the one the
+  # item holds", and without a test deleting either one left the whole suite green (gate ga-rtavdh, non-blocking).
+  # B20b: it lands ANOTHER credential -> the decision must not move to b.
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; touch "$D/kc/write-lands-other"; run_d -- run-once; rm -f "$D/kc/write-lands-other"
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(jget "$STATE" fingerprint)" = "$(fp_of "$TOKEN_a")" ] \
+    && grep -q "holds another credential" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B20b write ok but the item holds ANOTHER credential -> decision NOT changed (still a), says so" \
+    || bad "B20b current='$(jget "$STATE" current)' fp='$(jget "$STATE" fingerprint)': $(grep -E 'ERROR|SWITCH' "$D/city/.gc/logs/claude-pool-account.log" | tail -n 2 | tr '\n' '|')"
+  # B20c: it lands NOTHING (first run, so there was no item before) -> the seed must not be recorded.
+  new_d; touch "$D/kc/write-lands-nothing"; run_d -- run-once; rm -f "$D/kc/write-lands-nothing"
+  [ -z "$(jget "$STATE" current)" ] && [ ! -e "$D/kc/items/$SVC" ] && grep -q "not found afterwards" "$D/city/.gc/logs/claude-pool-account.log" \
+    && ok "B20c write ok but the item is NOT THERE afterwards -> no decision recorded, says so" \
+    || bad "B20c current='$(jget "$STATE" current)': $(grep -E 'ERROR|SWITCH|WARN' "$D/city/.gc/logs/claude-pool-account.log" | tail -n 2 | tr '\n' '|')"
 
   # B21 no usable city path -> no lock can be taken -> the run refuses to act (never runs unlocked). Exit 1, not 0:
   # 'refused because misconfigured' must not look like 'ran and had nothing to do'.

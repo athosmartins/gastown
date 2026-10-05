@@ -125,6 +125,10 @@ first, delete last, and only when restarting the pool is acceptable.
 ## Exit codes (`launchctl list` → last exit status)
 
 `0` = ran (or was legitimately idle: kill switch on, another run holds the lock, the usage store gave no order of use).
+**Also `0`, and not idle in any good sense:** the accounts library is missing or does not import. That run logs one `WARN`
+(`accounts library not found …` / `failed to import …`) and exits 0 having decided nothing, so `launchctl list` shows the
+same `0` as for a healthy run. Only the log tells them apart; a liveness signal that does not depend on reading it is
+ga-8hcnvb.3.
 `1` = **refused or failed**: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken, the lock file
 cannot be opened, the login name is not a plain name (`USER` is also read from the passwd database when launchd
 gives none), or the state file exists but cannot be read. In every `1` case nothing was probed or written. A state

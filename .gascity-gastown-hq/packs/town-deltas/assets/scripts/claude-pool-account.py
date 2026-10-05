@@ -194,7 +194,9 @@ def load_accounts_lib():
 
 # ── probe ──────────────────────────────────────────────────────────────────────────────────────────
 class Probe:
-    """verdict: allowed | rejected | invalid | unknown.  `unknown` means 'could not tell' and never changes anything."""
+    """verdict: allowed | rejected | invalid | unknown.  `unknown` means 'could not tell': it never triggers a failover or a
+    failback. (The run still goes on to heal_item, which may put the item back to the decision already taken - that is
+    the item following the decision, not the probe changing it.)"""
 
     def __init__(self, verdict: str, reset_epoch: Optional[float] = None, claim: str = "", detail: str = ""):
         self.verdict, self.reset_epoch, self.claim, self.detail = verdict, reset_epoch, claim, detail
@@ -581,7 +583,11 @@ def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
             break
         for e in expired:
             if e not in kept:
-                ex.pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
+                # Every expired entry that is not in `kept` is dropped at its time - including ones nothing was done for: a
+                # refused key, an account that does not outrank the current one, and a recovered account the loop never
+                # reached because it stops after the first switch attempt. Those are ordinary candidates again, probed the
+                # normal way if a later failover reaches them; a later rejection re-registers them with a fresh time.
+                ex.pop(e, None)
     now_cur = st.get("current")
     if kind == "item" and now_cur == cur:
         return   # the key of the decision never came from the vault and the item IS that key: nothing to heal against
