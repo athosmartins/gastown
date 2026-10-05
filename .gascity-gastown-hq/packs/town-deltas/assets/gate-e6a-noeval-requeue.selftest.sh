@@ -81,6 +81,13 @@ bd() {
       fi
       printf '[{"id":"%s","status":"open","labels":[]}]' "${4:-}"; return 0 ;;
     label)
+      # The REAL bd prints a confirmation on STDOUT for label add/remove and `-q` does not silence it (measured on the live
+      # binary, ga-6d9ytc: "✓ Added label 'X' to ID" / "✓ Removed label 'X' from ID"). A stub that stays quiet here is what hid
+      # the E6 defect: the code under test is captured with $(...) and its stdout is PARSED, so one stray line is the whole bug.
+      case "${4:-}" in
+        add)    printf "✓ Added label '%s' to %s\n" "${6:-}" "${5:-}" ;;
+        remove) printf "✓ Removed label '%s' from %s\n" "${6:-}" "${5:-}" ;;
+      esac
       if [ "${5:-}" = "$MARKER_ID" ]; then
         case "${4:-}" in
           add) [ "$LABEL_ADD_STICKS" = "1" ] && MARK_LABELS="$MARK_LABELS ${6:-}" ;;
@@ -242,6 +249,75 @@ $GLUE_SRC
   [ "$(getl QR)" = "1" ] && [ "$(getl CALLS)" = "0" ] && [ "$(getl REASON)" = "quota" ] \
     && ok "an infra requeue already decided (dead reviewer / quota-stop) is left alone — not overwritten, no second counter bump" \
     || bad "an already-requeued run must be left as is: $(printf '%s' "$OUT" | tr '\n' ' ')"
+fi
+
+# ── 2b. END TO END, in the production call shape (ga-6d9ytc) ───────────────
+# Sections 1 and 2 above test the decision and the glue SEPARATELY — the decision in-process with its stdout sent to a file, the
+# glue against a stubbed decision. Neither runs what production runs: the REAL glue calling the REAL decision through
+# `_NOEVAL_DECISION=$(gate_noeval_requeue_decision ...)` and `case`-matching `requeue:[0-9]*` on the CAPTURED text. That is the one
+# place where a stray stdout line from a `bd` call inside the function (the real bd prints "✓ Added label …" and `-q` does not
+# silence it) turns "requeue:1" into "✓ Added label …\nrequeue:1", the `case` never matches, and every no-eval run goes down the
+# FAIL path — 20 runs between 01/10 and 05/10 (ga-6d9ytc). The stub below is file-backed because the command substitution runs the
+# function in a subshell, where the variable-backed stub of sections 1-3 would lose its writes.
+echo "── 2b. real glue + real decision through \$(...): a chatty bd must not corrupt the decision ──"
+if [ -n "$GLUE_SRC" ] && declare -F gate_noeval_requeue_decision >/dev/null 2>&1; then
+  E2E_LABELS="$(mktemp "${TMPDIR:-/tmp}/e6a-e2e-labels.XXXXXX")"
+  trap 'rm -f "${DEC_OUT:-}" "$E2E_LABELS" "$E2E_LABELS.tmp"' EXIT
+  # bd twin: same argv contract as the stub above, labels in a file, and the REAL bd's chatty stdout on every label write.
+  e2e_bd() {
+    case "${3:-}" in
+      show)
+        if [ "${4:-}" = "$MARKER_ID" ]; then
+          local l first=1 labs=""
+          while IFS= read -r l; do
+            [ -z "$l" ] && continue
+            [ "$first" = 1 ] || labs="$labs,"; first=0; labs="$labs\"$l\""
+          done < "$E2E_LABELS"
+          printf '[{"id":"%s","status":"open","labels":[%s]}]' "$MARKER_ID" "$labs"
+          return 0
+        fi
+        printf '[{"id":"%s","status":"open","labels":[]}]' "${4:-}"; return 0 ;;
+      label)
+        case "${4:-}" in
+          add)    printf '%s\n' "${6:-}" >> "$E2E_LABELS"; printf "✓ Added label '%s' to %s\n" "${6:-}" "${5:-}" ;;
+          remove) grep -vxF -- "${6:-}" "$E2E_LABELS" > "$E2E_LABELS.tmp" || true; mv "$E2E_LABELS.tmp" "$E2E_LABELS"
+                  printf "✓ Removed label '%s' from %s\n" "${6:-}" "${5:-}" ;;
+        esac
+        return 0 ;;
+    esac
+    return 0
+  }
+  # run_e2e <label>... — runs the real glue (no decision stub) and prints the glue's verdict variables.
+  run_e2e() {
+    : > "$E2E_LABELS"
+    local l; for l in "$@"; do printf '%s\n' "$l" >> "$E2E_LABELS"; done
+    OUT=$( set -e
+           bd() { e2e_bd "$@"; }
+           GATE_FAIL_NO_EVAL=1; OVERALL_VERDICT=FAIL; QUOTA_REQUEUE=0; REQUEUE_REASON="quota"
+           run_glue_block
+           echo "NOEVAL=$GATE_FAIL_NO_EVAL"; echo "QR=$QUOTA_REQUEUE"; echo "REASON=$REQUEUE_REASON"; echo "N=${GATE_NOEVAL_REQUEUE_N:-}"
+           echo "WARN=$WARN_LOG" ) 2>&1
+  }
+
+  WARN_LOG=""
+  run_e2e "type:quality-gate-marker" "gate-status:dispatching"
+  [ "$(getl QR)" = "1" ] && [ "$(getl REASON)" = "no-eval" ] && [ "$(getl NOEVAL)" = "0" ] && [ "$(getl N)" = "1" ] \
+    && ok "first no-eval run, chatty bd, production call shape → REQUEUED (QUOTA_REQUEUE=1, reason no-eval, n=1). Before ga-6d9ytc the captured decision was \"✓ Added label …\\nrequeue:1\" and this fell to the FAIL path" \
+    || bad "a no-eval run must be re-queued even though bd prints a confirmation on stdout: $(printf '%s' "$OUT" | tr '\n' ' ')"
+
+  WARN_LOG=""
+  run_e2e "type:quality-gate-marker" "gate-status:dispatching" "gate:noeval-requeue:1"
+  [ "$(getl QR)" = "1" ] && [ "$(getl N)" = "2" ] && grep -qx 'gate:noeval-requeue:2' "$E2E_LABELS" && ! grep -qx 'gate:noeval-requeue:1' "$E2E_LABELS" \
+    && ok "second run: the counter label is advanced to 2 and the old one removed, through the chatty remove path as well, and the run is still re-queued" \
+    || bad "second no-eval run must requeue with counter 2 (remove path is chatty too): $(printf '%s' "$OUT" | tr '\n' ' ') labels=[$(tr '\n' ' ' < "$E2E_LABELS")]"
+
+  WARN_LOG=""
+  run_e2e "type:quality-gate-marker" "gate-status:dispatching" "gate:noeval-requeue:2"
+  [ "$(getl QR)" = "0" ] && [ "$(getl NOEVAL)" = "1" ] && ! grep -q 'Added label' <<<"$(getl WARN)" \
+    && ok "at the cap: still NOT re-queued (the legacy FAIL path), and the reason in the warning is the decision, not a leaked bd line" \
+    || bad "at the cap the run must stay on the legacy path with a clean reason: $(printf '%s' "$OUT" | tr '\n' ' ')"
+else
+  bad "2b: glue block or decision function missing — cannot run the end-to-end case"
 fi
 
 # ── 3. the requeue block: REQUEUE_REASON=no-eval ────────────────────────────

@@ -6143,6 +6143,11 @@ gate_park_note_skipped() {
 #   fail:no-marker      empty marker id
 # Three states, never two (error != empty): an unreadable counter is NOT 0. Write order is add-new, VERIFY, then remove-old
 # (set_gate_status's add-before-remove): a lost write must never leave the counter lower than it was. Always returns 0 (set -e).
+# STDOUT IS THE RETURN VALUE (ga-6d9ytc): the caller captures it with $(...) and `case`-matches it, so nothing but the decision may
+# reach stdout. The real `bd label add|remove` prints "✓ Added label …" / "✓ Removed label …" there and `-q` does NOT silence it,
+# so each bd write below sends its stdout to /dev/null (`2>/dev/null` alone is stderr only). Before this, every captured value was
+# "✓ Added label …\nrequeue:<n>" and the `case` never matched: the dispatcher log from 01/10 to 05/10 holds 20 "NOT re-queued (✓ Added
+# label …" warnings and 0 successful no-eval requeues.
 gate_noeval_requeue_decision() {
   local _id="${1:-}" _cap="${GATE_NOEVAL_REQUEUE_CAP:-2}" _raw _mid _labels _cur _next _l _back
   case "$_cap" in ''|*[!0-9]*) _cap=2 ;; esac
@@ -6163,7 +6168,7 @@ gate_noeval_requeue_decision() {
   [ -z "$_cur" ] && _cur=0
   if [ "$_cur" -ge "$_cap" ]; then printf 'fail:cap\n'; return 0; fi
   _next=$((_cur + 1))
-  bd -C "$GC_CITY" label add "$_id" "gate:noeval-requeue:$_next" -q 2>/dev/null || true
+  bd -C "$GC_CITY" label add "$_id" "gate:noeval-requeue:$_next" -q >/dev/null 2>&1 || true
   # Verify by READING IT BACK (a fire-and-forget `|| true` write proves nothing — ga-6dp9).
   # The snapshot is space-joined, so membership is a `case`, not `printf | grep -q`: under pipefail grep -q
   # exits on the first match, printf can take a SIGPIPE, and a TRUE match then reads as "not recorded".
@@ -6176,7 +6181,7 @@ gate_noeval_requeue_decision() {
   esac
   for _l in $(printf '%s\n' "$_labels" | tr ' ' '\n' | grep '^gate:noeval-requeue:'); do
     [ "$_l" = "gate:noeval-requeue:$_next" ] && continue
-    bd -C "$GC_CITY" label remove "$_id" "$_l" -q 2>/dev/null || true
+    bd -C "$GC_CITY" label remove "$_id" "$_l" -q >/dev/null 2>&1 || true
   done
   printf 'requeue:%s\n' "$_next"
   return 0
@@ -10517,6 +10522,13 @@ rig_real_merge_is_clean() {
 # throwaway worktree; if that confirms clean we report "0" (clean). If ANY path is
 # not union-resolvable, or the test-merge still conflicts, or anything is uncertain,
 # we fall through to the legacy "1" (escalate) — never auto-greenlight a real conflict.
+#
+# STDOUT IS THE VERDICT (ga-6d9ytc): every caller captures it with $(...) and compares the text. `log` writes to STDOUT, so a bare
+# `log ... 2>/dev/null` here (stderr only) turned the verdict into "<log line>\n1" / "<log line>\n0". The two merge-path callers
+# (the merge-time pre-check and the sweep's MT_VERDICT) compare to "1" / "err" and read anything else as CLEAN — MT_VERDICT even
+# sets REBASE_MERGE_TREE_PROVEN_CLEAN=1 — so a union-only conflict that the real merge ALSO reports as a conflict was read as clean;
+# the exile-recovery caller compares to "0", so a confirmed-clean branch was never released. The audit lines below go to stderr
+# instead (>&2) — the daemon runs under `exec >> "$LOG" 2>&1`, so they still land in the same log.
 rig_merge_has_conflict() {
   local main_ref="$1" branch_ref="$2"
   git_rig merge-tree --write-tree "$main_ref" "$branch_ref" >/dev/null 2>&1
@@ -10558,12 +10570,12 @@ EOF
   if [ "$any" = "1" ] && [ "$all_union" = "1" ]; then
     # All conflicting paths are union-driver files. Confirm with a REAL merge.
     if rig_real_merge_is_clean "$main_ref" "$branch_ref"; then
-      log "  ga-78n2z: union-only merge-tree conflict in [$(printf '%s' "$paths" | tr '\n' ' ')] confirmed CLEAN by real test-merge — treating pre-check as clean." 2>/dev/null || true
+      log "  ga-78n2z: union-only merge-tree conflict in [$(printf '%s' "$paths" | tr '\n' ' ')] confirmed CLEAN by real test-merge — treating pre-check as clean." >&2 || true
       echo "0"
       return 0
     fi
     # Union-only by attribute but the real merge STILL conflicts → genuine.
-    log "  ga-78n2z: union-only merge-tree conflict but real test-merge ALSO conflicts — genuine conflict, escalating." 2>/dev/null || true
+    log "  ga-78n2z: union-only merge-tree conflict but real test-merge ALSO conflicts — genuine conflict, escalating." >&2 || true
   fi
 
   # Default / fail-safe: genuine conflict (a non-union path, or real merge unclean).

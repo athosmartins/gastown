@@ -79,12 +79,14 @@ trap cleanup EXIT
 custom.txt merge=testdrv
 union.txt merge=union
 ghost.txt merge=ghostdrv
+failing.txt merge=faildrv
 EOF
   printf 'a\nb\nc\n' > custom.txt
   printf 'a\nb\nc\n' > union.txt
   printf 'a\nb\nc\n' > ghost.txt
   printf 'a\nb\nc\n' > plain.txt
-  git add .gitattributes custom.txt union.txt ghost.txt plain.txt
+  printf 'a\nb\nc\n' > failing.txt
+  git add .gitattributes custom.txt union.txt ghost.txt plain.txt failing.txt
   git commit -qm base
   # testdrv: a real, always-resolving custom driver (analogous in kind to
   # WA's deploydeps python script, minimal for test purposes — this test
@@ -92,18 +94,24 @@ EOF
   # merge algorithm). ghostdrv deliberately left UNREGISTERED — the
   # fail-safe case (attribute names a driver, but no command is configured).
   git config merge.testdrv.driver true
+  # faildrv (ga-6d9ytc): a REGISTERED driver that does NOT resolve — it exits 1, which git reads as "conflict". The path is therefore
+  # driver-covered (so the union-aware fallback runs the real test-merge) yet the real merge STILL conflicts: the "genuine conflict,
+  # escalating" branch, the one that must never read as clean.
+  git config merge.faildrv.driver false
 
   BASE=$(git rev-parse HEAD)
   git checkout -qb featcustom "$BASE"; printf 'a\nb\nc\nFEAT\n' > custom.txt; git commit -qam featcustom
   git checkout -qb featunion  "$BASE"; printf 'a\nb\nc\nFEAT\n' > union.txt;  git commit -qam featunion
   git checkout -qb featghost  "$BASE"; printf 'a\nb\nc\nFEAT\n' > ghost.txt;  git commit -qam featghost
   git checkout -qb featplain  "$BASE"; printf 'a\nb\nc\nFEAT\n' > plain.txt;  git commit -qam featplain
+  git checkout -qb featfail   "$BASE"; printf 'a\nb\nc\nFEAT\n' > failing.txt; git commit -qam featfail
 
   git checkout -q main
   printf 'a\nb\nc\nMAIN\n' > custom.txt
   printf 'a\nb\nc\nMAIN\n' > union.txt
   printf 'a\nb\nc\nMAIN\n' > ghost.txt
   printf 'a\nb\nc\nMAIN\n' > plain.txt
+  printf 'a\nb\nc\nMAIN\n' > failing.txt
   git commit -qam mainmove
 ) >/dev/null 2>&1
 
@@ -114,13 +122,28 @@ EOF
 # call report exactly <conflicting-path> as the sole conflict — everything
 # else (check-attr, config, worktree, and the REAL merge inside
 # rig_real_merge_is_clean) hits real git against the real repo.
+#
+# ga-6d9ytc: the harness defines `log` EXACTLY as production does (the line is taken from the dispatcher, not retyped, so it cannot
+# drift). It used to be undefined here, so the `log "..." 2>/dev/null || true` calls inside rig_merge_has_conflict failed with
+# "command not found", were swallowed, and the verdict stayed a clean "0"/"1" — while in production `log` echoes to STDOUT, the
+# caller's $(...) captured "<log line>\n0", and a verdict that is neither "1" nor "err" is read as CLEAN by the merge-path callers (a
+# union-only conflict that the real merge ALSO reports as a conflict was marked proven-clean). stderr of each run is kept in $ERR_FILE so the cases can
+# assert the audit line still reaches the log (the daemon runs under `exec >> "$LOG" 2>&1`, so stderr lands in the same file).
+LOG_DEF="$(grep -E '^log\(\) ' "$DISPATCHER" | head -1)"
+[ -n "$LOG_DEF" ] || { echo "COULD_NOT_EXTRACT_LOG_DEF" >&2; exit 99; }
+export LOG_DEF
+ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/gate-mergedriver-err.XXXXXX")"
+trap 'rm -rf "$TMP_REPO"; rm -f "$ERR_FILE"' EXIT
 run_conflict_check() {
   local branch="$1" path="$2" repo="$3"
+  : > "$ERR_FILE"
   bash -c '
     set -euo pipefail
     IS_CONTAINER_RIG=0
     GIT_DIR_PATH="$1"
     CONFLICT_PATH="$2"
+    _GATE_HB_FILE=/dev/null
+    eval "$LOG_DEF"
     git_rig() {
       if [ "$1" = "merge-tree" ] && [ "$2" = "--write-tree" ]; then
         if [ "$3" = "--name-only" ]; then
@@ -146,7 +169,7 @@ run_conflict_check() {
     # fixed to match production'\''s own invocation shape).
     VERDICT=$(rig_merge_has_conflict "main" "$3")
     echo "$VERDICT"
-  ' _ "$repo" "$path" "$branch"
+  ' _ "$repo" "$path" "$branch" 2> "$ERR_FILE"
 }
 
 V_CUSTOM=$(run_conflict_check featcustom custom.txt "$TMP_REPO")
@@ -162,8 +185,36 @@ V_PLAIN=$(run_conflict_check featplain plain.txt "$TMP_REPO")
   || bad "no-attribute genuine conflict should still be 1, got '$V_PLAIN'"
 
 V_UNION=$(run_conflict_check featunion union.txt "$TMP_REPO")
+ERR_UNION="$(cat "$ERR_FILE")"
 [ "$V_UNION" = "0" ] && ok "builtin union driver: still resolves clean via fallback (no regression on the already-covered ga-78n2z case)" \
   || bad "union driver should still resolve clean, got '$V_UNION'"
+case "$ERR_UNION" in
+  *"confirmed CLEAN by real test-merge"*) ok "union-only conflict confirmed clean: the audit line still reaches the log (stderr), it is not lost — it only stays out of the verdict (ga-6d9ytc)" ;;
+  *) bad "the ga-78n2z 'confirmed CLEAN' audit line must still be logged (stderr): [$ERR_UNION]" ;;
+esac
+
+# ga-6d9ytc: a registered driver that does NOT resolve — union-aware fallback runs the real merge, which STILL conflicts. The verdict
+# must be exactly "1". With `log` on stdout inside the function it was "<log line>\n1", which no caller matches as "1" or "err" —
+# and the merge-path callers read "neither" as CLEAN: a genuine conflict marked proven-clean, against the function's own "never
+# auto-greenlight" rule.
+V_FAIL=$(run_conflict_check featfail failing.txt "$TMP_REPO")
+ERR_FAIL="$(cat "$ERR_FILE")"
+[ "$V_FAIL" = "1" ] && ok "registered driver whose real merge STILL conflicts: verdict is exactly '1' (genuine conflict escalates, never read as clean)" \
+  || bad "driver-covered path whose real merge conflicts must give verdict exactly '1' — got [$V_FAIL] (log line leaked into the captured verdict?)"
+case "$ERR_FAIL" in
+  *"real test-merge ALSO conflicts"*) ok "genuine-conflict branch: the 'escalating' audit line still reaches the log (stderr)" ;;
+  *) bad "the ga-78n2z 'genuine conflict, escalating' audit line must still be logged (stderr): [$ERR_FAIL]" ;;
+esac
+
+# One contract for every shape: the captured verdict is ONE line, and it is 0, 1 or err — nothing else a caller could mis-parse.
+for shape in "featcustom custom.txt" "featghost ghost.txt" "featplain plain.txt" "featunion union.txt" "featfail failing.txt"; do
+  # shellcheck disable=SC2086
+  V_ANY=$(run_conflict_check $shape "$TMP_REPO")
+  case "$V_ANY" in
+    0|1|err) ok "verdict for [$shape] is a bare 0/1/err ('$V_ANY') — the only values the callers match on" ;;
+    *) bad "verdict for [$shape] must be a bare 0/1/err, got [$V_ANY]" ;;
+  esac
+done
 
 echo "── drift-guards (shipped code still defines what this test extracted) ──"
 grep -q 'rig_path_is_union_resolvable()' "$DISPATCHER" && ok "dispatcher still defines rig_path_is_union_resolvable" || bad "missing rig_path_is_union_resolvable"
