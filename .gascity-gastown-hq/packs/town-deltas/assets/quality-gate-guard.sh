@@ -4196,6 +4196,228 @@ close_open_run_verdicts() {
 }
 # SELFTEST-EXTRACT close-gate-verdict-fns: END
 
+# ── E11 (ga-lzidpo, P0 ga-ufskhy): a cap on PRODUCTION lines per gate submission, as an A/B ──
+# Pure functions of the Step 5b-pre1 block below, defined HERE — above the GATE_GUARD_LIB_ONLY cutoff — so
+# gate-e11-diff-cap.selftest.sh can source and exercise them (the live block is extracted by sentinel).
+#
+# WHY (measured 05/10 on 1.408 gate runs): first-attempt approval is 55-80% for diffs under 500 lines, 31-57% for
+# 500-1500 and 13% over 1500. One reviewer pass cannot cover a giant diff, and each extra round finds another
+# instance of what was already in the first one.
+#
+# WHAT: arm B (the treated arm) refuses at SUBMISSION a marker whose diff vs origin/main — counting only PRODUCTION
+# code — is over the cap (800), with gate-status:error and the instruction to split into slices, each with its own
+# marker (the branch-content-coherence refuse of ga-pj5va, same shape). Arm A (control) is today's behavior, byte for
+# byte. The arm is a pure function of the bead id (SHA-256 with its own salt, the E5/E9 pattern), so a bead that
+# fails and re-submits can never change arm.
+#
+# NOT PRODUCTION (does not count): tests (tests/ test/ __tests__/ dirs, *.selftest.sh, test_*, *_test.*, *.test.*,
+# *.spec.*, conftest.py, testdata/), fixtures and snapshots (fixtures/ fixture/ __snapshots__/ *.snap *.golden),
+# generated or vendored files (generated/ vendor/ node_modules/ dist/ *.pb.go *_pb2*.py *.min.js *.min.css
+# *.generated.* *_generated.* *.gen.go), lockfiles (*.lock package-lock.json pnpm-lock.yaml go.sum) and markdown
+# (*.md *.markdown *.mdx). Markdown is excluded WHOLESALE, by design, including the prompts and doctrine that are
+# markdown here: a miss in that direction lets a big diff through (= arm A), a miss in the other refuses honest work —
+# and every doubt in this feature goes to the inert side. Revisit from the apuracao, not by feel.
+#
+# SIZE DEFINITION: insertions + deletions, binary rows ignored — the same definition as the dispatcher's
+# gate_measure_diff_lines, but over PRODUCTION paths only and with --no-renames: a rename counts as delete + add, and the
+# label below is what covers a mechanical one. Merge-base (three-dot) diff, so main moving on does not inflate it.
+#
+# THE THIRD STATE — what the acceptance hangs on. A refusal needs POSITIVE evidence: a count that was MEASURED, over
+# the cap, and an exemption that was READ as absent. A diff that cannot be read, a count that fails, a bead that cannot
+# be fetched, a comment list that is not JSON: none of those refuses. They are logged ("nao-medido"; the cause is in
+# why=) and the submission goes through exactly as today. "I could not tell" is never "too big".
+#
+# EXEMPTION: label gate:size-exempt on the source bead OR on the marker, WITH a reason — a comment on that same bead
+# that STARTS with "gate:size-exempt:" followed by at least 15 characters. A label with no reason is not an exemption
+# (the reason is what the apuracao reads to judge whether the cap is being talked around).
+#
+# SWITCH: born OFF. The flag file $GC_CITY/.gc/gate-e11-diff-cap.on (touch = on, rm = off; no restart, takes effect on
+# the next sweep) or GATE_E11_ENABLED=1|0 in the environment (wins; used by the selftests). Off = the block below runs
+# nothing and logs nothing.
+
+# gate_e11_enabled — prints 1 or 0. Anything unreadable or unrecognised is 0 (inert).
+gate_e11_enabled() {
+  case "${GATE_E11_ENABLED:-}" in
+    1) printf '1'; return 0 ;;
+    0) printf '0'; return 0 ;;
+  esac
+  local _f="${GATE_E11_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.on}"
+  if [ -n "${GC_CITY:-}${GATE_E11_FLAG_FILE:-}" ] && [ -r "$_f" ]; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+# gate_e11_arm_for_bead <bead_id> — prints A or B: B <=> the first 32 bits of SHA-256("e11-diff-cap:<bead-id>") are
+# even. Recomputable by anyone:
+#   printf '%s' "e11-diff-cap:ga-abc123" | shasum -a 256 | cut -c1-8   (odd last hex digit = A)
+# SHA-256 with a per-experiment salt and not the ga-rstae base-31 polynomial (gate_ab_arm_for_bead, above): a salted
+# polynomial still agrees with that arm on 43% of beads, and two experiments sharing beads cannot be told apart (the
+# same measurement gate-e5-second-reviewer.lib.sh records).
+#   Empty id    -> prints nothing, returns 2: a bead we cannot identify has no arm.
+#   No sha tool -> prints nothing, returns 3: same. "No arm" must never read as A — the caller then neither refuses nor
+#                  counts the submission in either arm.
+gate_e11_arm_for_bead() {
+  local bead="${1:-}" tool digest="" first
+  [ -z "$bead" ] && return 2
+  for tool in "sha256sum" "openssl dgst -sha256 -r" "shasum -a 256"; do
+    command -v "${tool%% *}" >/dev/null 2>&1 || continue
+    digest="$(printf '%s' "e11-diff-cap:$bead" | $tool 2>/dev/null | cut -c1-8)"
+    case "$digest" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) break ;;
+      *) digest="" ;;
+    esac
+  done
+  [ -n "$digest" ] || return 3
+  first=$(( 16#$digest ))
+  if (( first % 2 == 0 )); then printf 'B'; else printf 'A'; fi
+}
+
+# gate_e11_norm_cap <value> — prints a usable cap: a positive integer of at most 9 digits, else 800. A cap of 0 would
+# refuse every submission, so it is not a cap.
+gate_e11_norm_cap() {
+  local v="${1:-}"
+  case "$v" in ''|*[!0-9]*) printf '800'; return 0 ;; esac
+  if [ "${#v}" -gt 9 ] || [ "$((10#$v))" -eq 0 ]; then printf '800'; return 0; fi
+  printf '%s' "$((10#$v))"
+}
+
+# gate_e11_cap_lines — the cap in force: GATE_E11_CAP_LINES, else 800.
+gate_e11_cap_lines() {
+  gate_e11_norm_cap "${GATE_E11_CAP_LINES:-}"
+}
+
+# gate_e11_path_is_production <path> — returns 0 when the path counts toward the cap, 1 when it does not (see the
+# list above). Directory names match as whole path components, so src/contest/ and lib/attest.go stay production.
+gate_e11_path_is_production() {
+  local p="${1:-}" base
+  case "/$p/" in
+    */tests/*|*/test/*|*/__tests__/*|*/testdata/*|*/fixtures/*|*/fixture/*|*/__snapshots__/*) return 1 ;;
+    */vendor/*|*/node_modules/*|*/dist/*|*/generated/*) return 1 ;;
+  esac
+  base="${p##*/}"
+  case "$base" in
+    *.selftest.sh|test_*|*_test.*|*.test.*|*.spec.*|conftest.py|*.snap|*.golden) return 1 ;;
+    *.lock|package-lock.json|pnpm-lock.yaml|go.sum) return 1 ;;
+    *.md|*.markdown|*.mdx) return 1 ;;
+    *.pb.go|*_pb2.py|*_pb2_grpc.py|*.min.js|*.min.css|*.generated.*|*_generated.*|*.gen.go) return 1 ;;
+  esac
+  return 0
+}
+
+# gate_e11_count_production_lines <numstat> — prints the added+deleted line count over the PRODUCTION paths of a
+# `git diff --numstat` output, or "unknown". Empty input is a MEASURED zero (a diff with nothing in it); one row that
+# cannot be read (no path, a count that is not a number) is "unknown" for the whole thing — a partial sum is not a
+# measurement, and the caller treats unknown as not-measured, never as small. A binary row ("-<TAB>-") counts 0, the
+# same as gate_measure_diff_lines. Builtins only: no fork per row on a diff of thousands of files.
+gate_e11_count_production_lines() {
+  local add del path total=0
+  while IFS=$'\t' read -r add del path; do
+    [ -n "$add$del$path" ] || continue
+    [ -n "$path" ] || { printf 'unknown'; return 0; }
+    case "$path" in \"*\") path="${path#\"}"; path="${path%\"}" ;; esac
+    if [ "$add" = "-" ] && [ "$del" = "-" ]; then continue; fi
+    case "$add" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+    case "$del" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+    if gate_e11_path_is_production "$path"; then
+      total=$(( total + 10#$add + 10#$del ))
+    fi
+  done <<< "${1:-}"
+  printf '%s' "$total"
+}
+
+# gate_e11_exempt_label <bead_show_json> — yes | no | desconhecido: does the bead carry label gate:size-exempt? Takes
+# `bd show <id> --json` output (an array of one, or one object). Empty output, text that is not JSON, or an object with
+# no id (bd's {"error": ...} for a bead it could not find) is `desconhecido`: it is NOT "no".
+gate_e11_exempt_label() {
+  local raw="${1:-}" out
+  [ -n "$raw" ] || { printf 'desconhecido'; return 0; }
+  out=$(printf '%s' "$raw" | jq -r '
+      (if type=="array" then (.[0] // {}) else . end)
+      | if (type=="object" and ((.id // "") | tostring | length) > 0)
+        then (if ((.labels // []) | map(. == "gate:size-exempt") | any) then "yes" else "no" end)
+        else "desconhecido" end' 2>/dev/null) || out=""
+  case "$out" in yes|no|desconhecido) printf '%s' "$out" ;; *) printf 'desconhecido' ;; esac
+}
+
+# gate_e11_exempt_reason <bd_comments_json> — yes | no | desconhecido: is there a comment that STARTS with
+# "gate:size-exempt:" and then at least 15 characters of reason? Takes `bd comments <id> --json` (an array of objects
+# with .text — `bd show --json` does not carry comment bodies). Anchored at the start of the comment on purpose: the
+# guard's own refusal comment names the label, and a quote of it must not read as a reason.
+gate_e11_exempt_reason() {
+  local raw="${1:-}" out
+  [ -n "$raw" ] || { printf 'desconhecido'; return 0; }
+  out=$(printf '%s' "$raw" | jq -r '
+      if type=="array" then
+        ([.[] | select(type=="object") | (.text // "") | tostring
+          | select(test("^\\s*gate:size-exempt:\\s*\\S"))
+          | sub("^\\s*gate:size-exempt:\\s*"; "") | sub("\\s+$"; "")
+          | select(length >= 15)] | length > 0 | if . then "yes" else "no" end)
+      else "desconhecido" end' 2>/dev/null) || out=""
+  case "$out" in yes|no|desconhecido) printf '%s' "$out" ;; *) printf 'desconhecido' ;; esac
+}
+
+# gate_e11_exempt_state <label yes|no|desconhecido> <reason yes|no|desconhecido> — one bead's answer:
+# exempt | label-sem-motivo | nao | desconhecido.
+gate_e11_exempt_state() {
+  case "${1:-}" in
+    yes) case "${2:-}" in
+           yes) printf 'exempt' ;;
+           no)  printf 'label-sem-motivo' ;;
+           *)   printf 'desconhecido' ;;
+         esac ;;
+    no)  printf 'nao' ;;
+    *)   printf 'desconhecido' ;;
+  esac
+}
+
+# gate_e11_exempt_merge <state> <state> — the answer for the pair (source bead, marker): the MOST PERMISSIVE one wins,
+# exempt > desconhecido > label-sem-motivo > nao. A refusal needs both beads READ and neither granting the exemption,
+# so a bead nobody could read outranks a label without a reason on the other.
+gate_e11_exempt_merge() {
+  local s r best=1
+  for s in "${1:-}" "${2:-}"; do
+    case "$s" in
+      exempt)           r=4 ;;
+      desconhecido)     r=3 ;;
+      label-sem-motivo) r=2 ;;
+      nao)              r=1 ;;
+      *)                r=3 ;;   # a word nobody defined is a state nobody could read
+    esac
+    [ "$r" -gt "$best" ] && best=$r
+  done
+  case "$best" in
+    4) printf 'exempt' ;; 3) printf 'desconhecido' ;; 2) printf 'label-sem-motivo' ;; *) printf 'nao' ;;
+  esac
+}
+
+# gate_e11_verdict <arm> <production_lines> <exempt_state> [cap] — the pure decision. Prints one of:
+#   controle            arm A: today's behavior, nothing measured, nothing touched
+#   sem-braco           no arm (unidentifiable bead / no sha tool): never refused, in neither arm
+#   nao-medido          arm B, the count never arrived: ACCEPT (the third state)
+#   dentro-do-teto      arm B, measured, at or under the cap: accept
+#   isento              arm B, over the cap, label + reason: accept
+#   recusa              arm B, measured over the cap, exemption READ as absent (nao / label-sem-motivo): REFUSE
+#   nao-medido-isencao  arm B, measured over the cap, but the exemption could not be read (or was never consulted,
+#                       or is a word nobody defined): ACCEPT — the only way to reach `recusa` is positive evidence
+gate_e11_verdict() {
+  local arm="${1:-}" count="${2:-}" ex="${3:-}" cap
+  cap=$(gate_e11_norm_cap "${4:-}")
+  case "$arm" in
+    A) printf 'controle'; return 0 ;;
+    B) ;;
+    *) printf 'sem-braco'; return 0 ;;
+  esac
+  case "$count" in ''|*[!0-9]*) printf 'nao-medido'; return 0 ;; esac
+  if [ "$((10#$count))" -le "$cap" ]; then printf 'dentro-do-teto'; return 0; fi
+  case "$ex" in
+    exempt)                  printf 'isento' ;;
+    nao|label-sem-motivo)    printf 'recusa' ;;
+    *)                       printf 'nao-medido-isencao' ;;
+  esac
+}
+
 # ── Lib-only mode: source with GATE_GUARD_LIB_ONLY=1 to load pure functions ──
 # without running the live guard sweep. Used by tests and by the dispatcher.
 if [ -n "${GATE_GUARD_LIB_ONLY:-}" ]; then
@@ -6926,6 +7148,93 @@ Then re-run /gate-done. Marker set to gate-status:error (fixable + re-submittabl
   exit 1
 fi
 # SELFTEST-EXTRACT coherence-check: END
+
+# ── Step 5b-pre1 (ga-lzidpo / E11): production-code size cap, as an A/B ──
+# Placed after the coherence check and before the base-test A/B below on purpose: it costs one `git diff --numstat`
+# and, for a submission over the cap, a refusal that spares the worktree and the test run that follow.
+# The design, the third state and the exemption are in the comment above gate_e11_enabled (above the
+# GATE_GUARD_LIB_ONLY cutoff); this block only wires them to the submission. Three rules it keeps:
+#   - Flag off (born OFF; $GC_CITY/.gc/gate-e11-diff-cap.on turns it on): nothing below runs, nothing is logged.
+#   - Arm A / no arm: logged, never measured, never touched — no git, no bd call.
+#   - Arm B: measured with git, and refused ONLY when the count was measured, is over the cap, and the exemption was
+#     READ as absent. Everything else that can go wrong is "nao-medido" (the why= field names the cause) and the
+#     submission goes through exactly as it would have without E11.
+# ONE record per decision, written BEFORE the refusal exits: grep E11-DIFF-CAP in the guard log. Fields:
+#   bead= arm=(A|B|?) verdict= production_lines=(N|unknown|-) cap= exempt= why= branch= marker=
+# (production_lines=- means "not measured by design": arm A and no-arm are never measured.)
+# The block between the SELFTEST-EXTRACT sentinels is run VERBATIM by gate-e11-diff-cap.selftest.sh — keep the
+# sentinels, and keep it self-contained (log/err/set_gate_status/bd and the variables above it).
+# SELFTEST-EXTRACT e11-diff-cap: BEGIN
+if [ "$(gate_e11_enabled)" = "1" ]; then
+  _E11_ARM_RC=0
+  _E11_ARM=$(gate_e11_arm_for_bead "$BEAD_ID") || _E11_ARM_RC=$?
+  case "$_E11_ARM" in A|B) ;; *) _E11_ARM="?" ;; esac
+  _E11_CAP=$(gate_e11_cap_lines)
+  _E11_COUNT="-"
+  _E11_EXEMPT="nao-consultado"
+  _E11_WHY="-"
+  if [ "$_E11_ARM" = "?" ]; then
+    case "$_E11_ARM_RC" in 2) _E11_WHY="bead-vazio" ;; *) _E11_WHY="sem-sha" ;; esac
+  fi
+  if [ "$_E11_ARM" = "B" ]; then
+    _E11_COUNT="unknown"   # pessimistic default; replaced only once git actually answers
+    if [ -z "$RIG_PATH" ] || [ -z "$BEAD_ID" ] || [ -z "$BRANCH" ]; then
+      _E11_WHY="entrada-vazia"
+    else
+      git -C "$RIG_PATH" fetch origin main "$BRANCH" --quiet 2>/dev/null || true
+      _E11_MAIN=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/main^{commit}" 2>/dev/null || echo "")
+      _E11_TIP=$(git -C "$RIG_PATH" rev-parse --verify --quiet "origin/${BRANCH}^{commit}" 2>/dev/null || echo "")
+      if [ -z "$_E11_MAIN" ] || [ -z "$_E11_TIP" ]; then
+        _E11_WHY="refs-ausentes"
+      else
+        _E11_DIFF_RC=0
+        _E11_NUMSTAT=$(git -C "$RIG_PATH" diff --numstat --no-renames "${_E11_MAIN}...${_E11_TIP}" 2>/dev/null) || _E11_DIFF_RC=$?
+        if [ "$_E11_DIFF_RC" -ne 0 ]; then
+          _E11_WHY="diff-falhou"
+        else
+          _E11_COUNT=$(gate_e11_count_production_lines "$_E11_NUMSTAT")
+          [ "$_E11_COUNT" != "unknown" ] || _E11_WHY="contagem-ilegivel"
+        fi
+      fi
+    fi
+    # The exemption is looked up only for a submission that is measured AND over the cap — the one case it can matter,
+    # so the cap-or-under majority makes no bd call at all.
+    if [ "$(gate_e11_verdict B "$_E11_COUNT" nao-consultado "$_E11_CAP")" = "nao-medido-isencao" ]; then
+      _E11_SHOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _E11_SHOW=""
+      _E11_LAB=$(gate_e11_exempt_label "$_E11_SHOW")
+      _E11_RSN="no"
+      if [ "$_E11_LAB" = "yes" ]; then
+        _E11_CMT=$(bd -C "$BEAD_CITY" comments "$BEAD_ID" --json 2>/dev/null) || _E11_CMT=""
+        _E11_RSN=$(gate_e11_exempt_reason "$_E11_CMT")
+      fi
+      _E11_EX_SRC=$(gate_e11_exempt_state "$_E11_LAB" "$_E11_RSN")
+      _E11_SHOW=$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null) || _E11_SHOW=""
+      _E11_LAB=$(gate_e11_exempt_label "$_E11_SHOW")
+      _E11_RSN="no"
+      if [ "$_E11_LAB" = "yes" ]; then
+        _E11_CMT=$(bd -C "$GC_CITY" comments "$MARKER_ID" --json 2>/dev/null) || _E11_CMT=""
+        _E11_RSN=$(gate_e11_exempt_reason "$_E11_CMT")
+      fi
+      _E11_EX_MRK=$(gate_e11_exempt_state "$_E11_LAB" "$_E11_RSN")
+      _E11_EXEMPT=$(gate_e11_exempt_merge "$_E11_EX_SRC" "$_E11_EX_MRK")
+    fi
+  fi
+  _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_COUNT" "$_E11_EXEMPT" "$_E11_CAP")
+  log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID"
+  if [ "$_E11_VERDICT" = "recusa" ]; then
+    err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B). Refusing at submission."
+    set_gate_status "$MARKER_ID" "error"
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11).
+O diff de $BRANCH contra origin/main tem $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam); o teto por submissao e $_E11_CAP.
+Diff grande reprova na primeira tentativa bem mais (13% de aprovacao acima de 1500 linhas, contra 55-80% abaixo de 500): o revisor nao cobre tudo numa passada.
+Divida em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto e citando o bead da fatia nos commits.
+Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead ($BEAD_ID) e comente o MOTIVO: um comentario que COMECE com gate:size-exempt: seguido do motivo (15+ caracteres). Depois rode /gate-done de novo.
+Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID (gate-status:error)."
+    exit 1
+  fi
+fi
+# SELFTEST-EXTRACT e11-diff-cap: END
 
 # ── Step 5b-pre2 (ga-rstae): A/B — refuse when a new/changed selftest passes
 # unmodified against the pre-fix base commit ────────────────────────────────
