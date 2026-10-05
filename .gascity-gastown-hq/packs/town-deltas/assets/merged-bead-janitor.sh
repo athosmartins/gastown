@@ -343,6 +343,22 @@ janitor_story_decide() {
   echo "keep:no-merge-evidence"
 }
 
+# story_delivery_owns_labels <space-joined labels> — rc0 iff story-delivery still
+# OWNS the story: it is running, has a recorded failure, or is HOLDING it on
+# purpose. The third case is ga-2kaan2: delivery:pending-vm means the merge is in
+# origin/main but the dialer VM does not run the voicebot code yet. That merge
+# evidence is exactly what the story:done sweep keys on, so without this label
+# here the janitor would force story:done + close on the next pass — the very
+# "done with the VM old" the hold exists to prevent (and it would do it quietly,
+# a sweep later). Pulled out of the sweep so the decision is testable on its own.
+story_delivery_owns_labels() {
+  local l="$1"
+  printf '%s' "$l" | grep -w "delivery:running"    >/dev/null && return 0
+  printf '%s' "$l" | grep -w "delivery:failed"     >/dev/null && return 0
+  printf '%s' "$l" | grep -w "delivery:pending-vm" >/dev/null && return 0
+  return 1
+}
+
 # ga-v8ui5 (gate-feedback follow-up): is a janitor_decide/janitor_story_decide
 # "keep" reason one of the "FID's own signals came up completely empty"
 # buckets — the only case the ga-vokwv sling-bead-name fallback (below) may
@@ -1488,10 +1504,11 @@ EOF
     S_INFLIGHT=0; printf '%s' "$SLABELS" | grep -w "story:in-flight" >/dev/null && S_INFLIGHT=1
     S_BUILDER=0;  [ -n "$SASSIGNEE" ] && S_BUILDER=1
     # delivery owns the bead while it is actively running OR has a recorded
-    # failure (a failed deploy/prod-test must NOT be masked as story:done).
+    # failure (a failed deploy/prod-test must NOT be masked as story:done) OR is
+    # holding it on purpose (delivery:pending-vm, ga-2kaan2) — see
+    # story_delivery_owns_labels.
     S_DELIV=0
-    if printf '%s' "$SLABELS" | grep -w "delivery:running" >/dev/null \
-       || printf '%s' "$SLABELS" | grep -w "delivery:failed" >/dev/null; then S_DELIV=1; fi
+    if story_delivery_owns_labels "$SLABELS"; then S_DELIV=1; fi
 
     # Markers (HQ-resident, regardless of which store the bead lives in).
     SMK=$(markers_for_bead "$SID")

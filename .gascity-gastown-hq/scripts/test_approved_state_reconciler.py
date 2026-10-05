@@ -662,3 +662,33 @@ def test_a_usable_lib_logs_nothing(work_repo, monkeypatch, capsys):
     assert asr._delivery_branch_prefixes()
     assert asr._delivery_branch_in_repo(str(work_repo), "ga-nothing") == ""
     assert "WARN ga-3ebneo" not in capsys.readouterr().out
+
+
+# ── ga-2kaan2: delivery:pending-vm is a delivery retry in flight ──────────────
+# story-delivery holds a story whose merge touches the voicebot while the dialer VM
+# still runs old code: label delivery:pending-vm, story:approved + gate:passed LEFT
+# ON, re-asked every cycle. Step 1 of story-delivery selects story:approved AND
+# gate:passed together, so a reconciler that strips story:approved off a
+# gate:passed bead (the "post-build" route) ends the re-asking for good — the hold
+# would never be released and the story would sit there forever. delivery:failed
+# already gets this carve-out (ga-kyvpk); pending-vm needs the same.
+_HELD = ["story:approved", "gate:passed", "ctx:ready"]
+
+
+@pytest.mark.parametrize("hold", ["delivery:failed", "delivery:pending-vm"])
+def test_a_delivery_hold_is_left_alone_so_step1_keeps_re_asking(hold):
+    assert asr._classify({"id": "ga-x", "labels": _HELD + [hold]}) == (None, None)
+
+
+def test_without_a_hold_label_a_gate_passed_bead_still_routes_post_build():
+    route, _signal = asr._classify({"id": "ga-x", "labels": _HELD})
+    assert route == "post-build"
+
+
+@pytest.mark.parametrize("hold", ["delivery:failed", "delivery:pending-vm"])
+@pytest.mark.parametrize("parked", ["story:needs-human", "story:blocked", "story:done"])
+def test_a_hold_does_not_override_a_bead_something_else_already_parked(hold, parked):
+    """The carve-out must never become a way to keep a parked/finished bead 'in
+    retry': once something else parked it, the normal post-build handling applies."""
+    route, _signal = asr._classify({"id": "ga-x", "labels": _HELD + [hold, parked]})
+    assert route == "post-build"

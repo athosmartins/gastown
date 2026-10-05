@@ -1456,6 +1456,39 @@ grep -qF 'F_SIGCOMMIT=0; F_COMMIT_EVID=""; F_SIGCOMMIT_STALE=0; F_SIGCOMMIT_DOCS
 grep -qF 'S_SIGCOMMIT=0; S_SIGBRANCH=0; S_COMMIT_EVID=""; S_BRANCH_EVID=""; S_SIGCOMMIT_STALE=0; S_SIGCOMMIT_DOCS_ONLY=0' "$JANITOR" \
   && ok "story sweep resets S_SIGCOMMIT_DOCS_ONLY per bead" || bad "story sweep missing S_SIGCOMMIT_DOCS_ONLY reset"
 
+# ── ga-2kaan2: delivery:pending-vm is DELIVERY-OWNED ─────────────────────────
+# story-delivery holds a story whose merge touches the voicebot while the dialer
+# VM still runs old code (label delivery:pending-vm; the story is NOT closed). That
+# story has the strongest possible merge evidence — it is in origin/main — so the
+# story:done sweep would force story:done + close it on its next pass, defeating the
+# hold one sweep later. The sweep's delivery_active input must therefore be true for
+# the label, like it already is for delivery:running / delivery:failed.
+echo ""
+echo "── ga-2kaan2: delivery:pending-vm keeps the story delivery-owned ──"
+if type story_delivery_owns_labels >/dev/null 2>&1; then
+  rc0 story_delivery_owns_labels "delivery:running"
+  rc0 story_delivery_owns_labels "delivery:failed"
+  rc0 story_delivery_owns_labels "delivery:pending-vm"
+  rc0 story_delivery_owns_labels "ctx:ready story:approved gate:passed delivery:pending-vm"
+  rc1 story_delivery_owns_labels ""
+  rc1 story_delivery_owns_labels "ctx:ready story:approved gate:passed"
+  rc1 story_delivery_owns_labels "delivery:tested delivery:daemon-unverified"
+else
+  bad "story_delivery_owns_labels is not defined — the janitor cannot tell a VM-held story from a stranded one"
+fi
+deliv_active() { if type story_delivery_owns_labels >/dev/null 2>&1 && story_delivery_owns_labels "$1"; then echo 1; else echo 0; fi; }
+# END TO END, the exact shape that bites: commit in origin/main (sig_commit=1) + the hold label.
+eq "VM-held story with merge evidence in main -> keep, NOT force-closed" \
+   "$(janitor_story_decide 0 0 0 0 0 "$(deliv_active 'ctx:ready story:approved gate:passed delivery:pending-vm')" 1 1 1)" \
+   "keep:delivery-owns-it"
+eq "the same story without the hold label -> done (the sweep itself is unchanged)" \
+   "$(janitor_story_decide 0 0 0 0 0 "$(deliv_active 'ctx:ready story:approved gate:passed')" 1 1 1)" \
+   "done:commit-in-origin-main"
+# The sweep must actually call the function (a correct helper nobody calls guards nothing).
+grep -qF 'if story_delivery_owns_labels "$SLABELS"; then S_DELIV=1; fi' "$JANITOR" \
+  && ok "story sweep derives S_DELIV from story_delivery_owns_labels" \
+  || bad "story sweep does not call story_delivery_owns_labels — delivery:pending-vm would not be honoured"
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"

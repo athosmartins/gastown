@@ -815,7 +815,15 @@ def _classify(bead):
     # all) so Step 1 keeps retrying; fall through to the normal post-build
     # handling below once something else has actually parked or finished
     # the bead.
-    if "delivery:failed" in labels and _has_prefix(labels, park_labels.GATE_PASSED_LABEL):
+    #
+    # ga-2kaan2: delivery:pending-vm is the same kind of state — story-delivery
+    # HOLDS a story whose merge touches the voicebot while the dialer VM still runs
+    # old code, leaving story:approved + gate:passed on and re-asking the VM every
+    # cycle until it is em dia. Stripping story:approved here would end that
+    # re-asking for good, so it gets the same carve-out (and the same
+    # already_parked escape hatch below).
+    if (("delivery:failed" in labels or "delivery:pending-vm" in labels)
+            and _has_prefix(labels, park_labels.GATE_PASSED_LABEL)):
         already_parked = (
             "story:done" in labels
             or any(lab in labels for lab in park_labels.BLOCKED_LABELS)
