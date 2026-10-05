@@ -126,7 +126,7 @@ pool_cap_hit=0
 # Pilot's _filter_built treat the bead as "built" and silently veto re-dispatch. We
 # clean it up — but merged-only, NEVER an unmerged local-only branch (would lose work).
 delete_merged_local_branch() {
-  local repo="$1" br="$2"
+  local repo="$1" br="$2" proof="${3-}" why="merged_orphan"
   [ -n "$br" ] || return 0
   case "$br" in crew/*) : ;; *) return 0 ;; esac   # only crew/* build branches
   command -v git >/dev/null 2>&1 || return 0
@@ -134,11 +134,21 @@ delete_merged_local_branch() {
   [ -n "$def" ] || def="main"
   # merged check against origin/<default>; any uncertainty → do NOT delete.
   git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 0
+  # ga-1md7na: a REBASED branch is never an ancestor of main even when all of it shipped. A caller that
+  # reaped the tree on the patch-equivalence proof passes proof=patch_equivalent, and the BRANCH itself (not
+  # the removed tree's HEAD) is re-proven the same way here, at the moment it is deleted. No proof arg = the
+  # ancestry check only, exactly as before.
+  local delivered=0
   if git -C "$repo" branch --merged "refs/remotes/origin/$def" 2>/dev/null | sed 's/^[* ] *//' | grep -x "$br" >/dev/null; then
+    delivered=1
+  elif [ "$proof" = "patch_equivalent" ] && _ref_patch_equivalent "$repo" "refs/heads/$br"; then
+    delivered=1; why="patch_equivalent_orphan"
+  fi
+  if [ "$delivered" = "1" ]; then
     if [ "$ENABLED" = "1" ]; then
       git -C "$repo" branch -D "$br" >/dev/null 2>&1 && {
         branches_deleted=$((branches_deleted+1))
-        printf '{"ts":"%s","event":"branch_deleted","repo":"%s","branch":"%s","reason":"merged_orphan"}\n' "$(ts)" "$(basename "$repo")" "$br" >> "$LOG" 2>/dev/null
+        printf '{"ts":"%s","event":"branch_deleted","repo":"%s","branch":"%s","reason":"%s"}\n' "$(ts)" "$(basename "$repo")" "$br" "$why" >> "$LOG" 2>/dev/null
       }
     else
       printf '{"ts":"%s","event":"would_delete_branch","repo":"%s","branch":"%s"}\n' "$(ts)" "$(basename "$repo")" "$br" >> "$LOG" 2>/dev/null
@@ -162,6 +172,35 @@ _worktree_head_merged() {
   [ -n "$def" ] || def="main"
   git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 1
   git -C "$repo" merge-base --is-ancestor "$head" "refs/remotes/origin/$def" 2>/dev/null
+}
+
+# ── _ref_patch_equivalent <repo> <ref> — ga-1md7na: the SECOND proof that <ref>'s content is
+# already in origin/<default>: every commit <ref> has that origin/<default> lacks is there anyway
+# as an equivalent PATCH (`git cherry`: only '-' lines). The gate rebases/re-anchors a branch
+# before merging, so a delivered branch's HEAD is never an ancestor of main — the ancestry proof
+# in _worktree_head_merged is false for exactly the trees whose work shipped (measured 05/10: 27
+# locked worktrees of CLOSED beads, all `git cherry` '-' only, none reapable). Three states, and
+# only the first is "yes": proven (cherry exited 0 AND every output line is a '- <sha>' line,
+# or there is no output because there is nothing ahead) / NOT proven because a commit is '+'
+# (real work main lacks) / NOT proven because cherry could not answer (nonzero exit — even if it
+# printed '-' lines before dying — or a line that is not cherry's format). Never a guess, never
+# "empty output = fine" without the exit code. A squash-merge is a different patch, so it reads
+# '+' here and the tree is KEPT — the conservative direction.
+# <ref> is any commit-ish; an empty one (the caller's `rev-parse HEAD` failed) is "cannot tell".
+_ref_patch_equivalent() {
+  local repo="$1" ref="${2-}" def out rc line
+  local re='^- [0-9a-f]{40,64}$'
+  [ -n "$ref" ] || return 1
+  def="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+  [ -n "$def" ] || def="main"
+  git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 1
+  out="$(git -C "$repo" cherry "refs/remotes/origin/$def" "$ref" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    [[ "$line" =~ $re ]] || return 1
+  done <<< "$out"
+  return 0
 }
 
 # ── _worktree_in_use <path> — ga-t14of: true iff a live process's CWD is the worktree
@@ -315,8 +354,12 @@ preserve_and_reap_dirty() {
 #        list unavailable → KEPT (kept_locked_session_list_unavailable / kept_locked_unknown);
 #        a named session is alive AND its work_dir is this tree → KEPT (kept_locked_live);
 #        otherwise ("unparseable") → not reaped on the lock's say-so, but reaped when the TREE proves itself safe
-#        without the lock's help: HEAD already in origin/<default> + git status clean (rc 0 AND empty) + no live
-#        process has it as cwd + older than the age gate (reaped_locked_unparseable_safe). Any proof missing →
+#        without the lock's help: its content already in origin/<default> + git status clean (rc 0 AND empty) + no
+#        live process has it as cwd + older than the age gate. "Already in origin/<default>" has two proofs
+#        (ga-1md7na): HEAD is an ancestor of it (reaped_locked_unparseable_safe), or — a branch the gate rebased,
+#        whose HEAD never is one — every commit it carries is there as an equivalent patch: `git cherry` exited 0
+#        and printed only '-' lines (reaped_locked_unparseable_patch_equivalent; its local branch goes under that
+#        same proof). A `git cherry` that fails or prints anything else proves nothing. Any proof missing →
 #        KEPT (kept_locked_unparseable). Ignored files are not part of "clean" and go with the tree.
 #   3. any other verdict, or none (empty): KEPT (kept_locked_unrecognized_verdict). Only the exact verdict
 #      "unparseable" reaches the independent-proof path.
@@ -598,9 +641,10 @@ reap_zombie_locked() {
 #   0 = reaped: classify_lock could not confirm the holder is alive (no pid,
 #       and the session list was FETCHED and names no live session in this
 #       worktree), but the worktree independently proves SAFE to remove anyway
-#       — content already 100% merged into main, no uncommitted changes, no
-#       live process has it as a cwd, and it is older than the stale-hours
-#       gate. There is nothing left for the lock to be protecting, regardless
+#       — content already 100% in main (an ancestor of it, or, for a rebased
+#       branch, every commit there as an equivalent patch — ga-1md7na), no
+#       uncommitted changes, no live process has it as a cwd, and it is older
+#       than the stale-hours gate. There is nothing left for the lock to be protecting, regardless
 #       of what its text says or whether it could be parsed at all. This is
 #       the actual measured bug: 51 real worktrees (2.3G) sat locked forever
 #       this way, ALL already in this exact state.
@@ -659,12 +703,27 @@ _reap_or_log_unparseable_lock() {
   # "clean" verdict. This is new code on a destructive path, so it earns the
   # stricter form: only a CONFIRMED-successful, CONFIRMED-empty status counts
   # as clean; any command failure falls through to the safe "kept" branch.
-  local _status_out _status_rc
+  local _status_out _status_rc _proof=""
   _status_out="$(git -C "$wt" status --porcelain 2>/dev/null)"; _status_rc=$?
-  if [ "$age" -gt "$gate_hours" ] 2>/dev/null \
-     && _worktree_head_merged "$repo" "$wt" \
+  # "Delivered" has two proofs (ga-1md7na): HEAD is an ancestor of origin/<default>, or — for a branch the
+  # gate rebased, whose HEAD can never be one — every commit it carries is in origin/<default> as an
+  # equivalent patch. The cheap ancestry one goes first; `git cherry` only runs when it fails. An unusable
+  # answer from either is "not proven", so _proof stays empty and the tree is KEPT.
+  if [ "$age" -gt "$gate_hours" ] 2>/dev/null; then
+    if _worktree_head_merged "$repo" "$wt"; then _proof="ancestor"
+    elif _ref_patch_equivalent "$repo" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; then _proof="patch_equivalent"
+    fi
+  fi
+  if [ -n "$_proof" ] \
      && [ "$_status_rc" -eq 0 ] && [ -z "$_status_out" ] \
      && ! _worktree_in_use "$wt"; then
+    # The event names which proof reaped it; the ancestry one keeps its ga-vs6shu name.
+    local _ev_reaped="reaped_locked_unparseable_safe" _ev_would="would_reap_locked_unparseable_safe" _del_proof=""
+    if [ "$_proof" = "patch_equivalent" ]; then
+      _ev_reaped="reaped_locked_unparseable_patch_equivalent"
+      _ev_would="would_reap_locked_unparseable_patch_equivalent"
+      _del_proof="patch_equivalent"
+    fi
     if [ "$ENABLED" = "1" ]; then
       # No `worktree unlock` first — `remove -f -f` is git's own way to remove a LOCKED
       # worktree, and skipping the unlock means a remove that fails cannot leave the
@@ -672,14 +731,14 @@ _reap_or_log_unparseable_lock() {
       # nothing to restore it FROM; reap_zombie_locked's unlock is different: there the
       # holder is confirmed dead).
       if git -C "$repo" worktree remove -f -f "$wt" 2>/dev/null; then
-        _log_lock_event reaped_locked_unparseable_safe "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
-        delete_merged_local_branch "$repo" "$br"
+        _log_lock_event "$_ev_reaped" "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
+        delete_merged_local_branch "$repo" "$br" "$_del_proof"
         return 0
       fi
       _log_lock_event unparseable_safe_reap_failed "$repo" "$wt" "$br" "$age" "$label"
       return 1
     fi
-    _log_lock_event would_reap_locked_unparseable_safe "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
+    _log_lock_event "$_ev_would" "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
     return 1
   fi
   _log_lock_event kept_locked_unparseable "$repo" "$wt" "$br" "$age" "$label" "" "$reason"
