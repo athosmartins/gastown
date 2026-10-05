@@ -19,6 +19,7 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 SCRIPT="$SELF_DIR/story-delivery.sh"
 
 PASS=0
@@ -84,7 +85,11 @@ eq "verb-only check: verified is close"      "$(task_reconciler_verdict 0 1 | cu
 # ── 2. rig_gitdir — container vs self-repo detection ────────────────────────
 echo "── 2. rig_gitdir (container vs self-repo) ──"
 TMPROOT=$(mktemp -d)
-trap 'rm -rf "$TMPROOT"' EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+selftest_cleanup() { rm -rf "$TMPROOT"; }
+selftest_fail_closed_arm selftest_cleanup
 
 SELFREPO="$TMPROOT/self-repo"
 mkdir -p "$SELFREPO"
@@ -768,4 +773,5 @@ echo ""
 echo "═══════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
 echo "═══════════════════════════════════════"
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]

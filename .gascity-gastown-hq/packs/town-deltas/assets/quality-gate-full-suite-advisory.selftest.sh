@@ -24,6 +24,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 
 PASS=0
@@ -33,7 +34,11 @@ bad() { echo "  FAIL $*"; FAIL=$((FAIL+1)); }
 eq()  { if [ "$2" = "$3" ]; then ok "$1 (=$2)"; else bad "$1: expected [$3], got [$2]"; fi; }
 
 FX="$(mktemp -d "${TMPDIR:-/tmp}/ga-q4fkxa-fx-XXXXXX")"
-trap 'rm -rf "$FX" 2>/dev/null || true' EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+selftest_cleanup() { rm -rf "$FX" 2>/dev/null || true; }
+selftest_fail_closed_arm selftest_cleanup
 export FS_MARK="$FX/suite-runs.txt"
 LOGF="$FX/gate.log"
 GATE_FS_TMPDIR="$FX/tmp"; mkdir -p "$GATE_FS_TMPDIR"
@@ -254,4 +259,5 @@ grep -q 'gate_full_suite_reap_stale || true' "$DISPATCHER" \
 
 echo
 echo "=== $PASS passed, $FAIL failed ==="
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]

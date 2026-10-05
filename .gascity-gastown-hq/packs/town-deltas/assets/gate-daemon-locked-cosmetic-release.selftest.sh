@@ -37,6 +37,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 
 PASS=0
@@ -56,7 +57,11 @@ GATE_DISPATCHER_LIB_ONLY=1 source "$DISPATCHER" \
 TMP="$(mktemp -d)"
 BD_LOG="$TMP/bd.log"
 : > "$BD_LOG"
-trap 'rm -rf "$TMP"' EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+selftest_cleanup() { rm -rf "$TMP"; }
+selftest_fail_closed_arm selftest_cleanup
 # Override AFTER sourcing: the lib's own log/warn/bd/gc must not touch anything real.
 bd()   { echo "bd $*" >> "$BD_LOG"; }
 gc()   { echo "gc $*" >> "$BD_LOG"; }
@@ -188,4 +193,5 @@ run_close "" ""
 
 echo ""
 echo "== result: $PASS passed, $FAIL failed =="
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]

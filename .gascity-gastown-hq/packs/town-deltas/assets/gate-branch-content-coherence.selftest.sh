@@ -32,6 +32,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 
 PASS=0
@@ -120,7 +121,11 @@ eq "punctuation boundary: bead wrapped in parens (the file's own dominant commit
 echo "── 2. real-git integration: reproduce the incident's exact ref shape ──"
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/gate-y9a1d-selftest.XXXXXX")"
-trap 'rm -rf "$TMPD"' EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+selftest_cleanup() { rm -rf "$TMPD"; }
+selftest_fail_closed_arm selftest_cleanup
 
 git -C "$TMPD" init -q -b main
 git -C "$TMPD" config user.email "test@gascity.local"
@@ -163,8 +168,7 @@ SAME_MSGS="$(git -C "$TMPD" log --format='%B' "${BASE_SHA}..${BASE_SHA}")"
 eq "real-git: base==tip (nothing unique) → skip, not a false 'no'" \
   "$(branch_bead_commit_verdict "$SAME_COUNT" "$SAME_MSGS" "ga-fic5d")" "skip"
 
-rm -rf "$TMPD"
-trap - EXIT
+rm -rf "$TMPD"   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 # ── 3. DRIFT GUARD: helper defined before the lib-only cutoff ────────────────
 echo "── 3. drift guard: helper is selftest-sourceable (defined before lib-only guard) ──"
@@ -362,4 +366,5 @@ eq "pure function: FF-push site on an already-caught-up branch (empty range) →
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
+selftest_summary_reached   # the lib fails every run that never got here
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi

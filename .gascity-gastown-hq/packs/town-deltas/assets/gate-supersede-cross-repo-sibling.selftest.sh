@@ -74,6 +74,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 GUARD="$SELF_DIR/quality-gate-guard.sh"
 
@@ -106,7 +107,12 @@ echo "── 2. supersede_sibling_runs behavior (real fn, mocked bd + bd-list-ca
 
 FAKE_CITY="$(mktemp -d)"
 mkdir -p "$FAKE_CITY/scripts"
-trap 'rm -rf "$FAKE_CITY"' EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+# One armed trap for the whole file: section 2 uses $FAKE_CITY, section 4+ uses $WORK_DIR.
+selftest_cleanup() { local d; for d in "${FAKE_CITY:-}" "${WORK_DIR:-}"; do [ -n "$d" ] && rm -rf "$d"; done; return 0; }
+selftest_fail_closed_arm selftest_cleanup
 
 run_supersede() {
   # $1=running_json fixture  $2=this_marker  $3=branch  $4=bead_id  $5=rig
@@ -176,8 +182,7 @@ CLOSED_D="$(run_supersede "$JSON_B" "ga-7mjxj6" "fix/ga-g7x0si-mockup-directions
 eq "rig omitted at call site → bead_id-only match does NOT fire (fails toward not-superseding)" \
   "$CLOSED_D" ""
 
-rm -rf "$FAKE_CITY"
-trap - EXIT
+rm -rf "$FAKE_CITY"   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 # ── 3. gate_bead_sibling_status_lines already reports a cross-repo sibling
 #       as still-open — no fix needed there, just prove it (mock bd) ────────
@@ -251,8 +256,8 @@ ok "extracted gate_sibling_hold_check() ($(printf '%s\n' "$FN_HOLD" | wc -l | tr
 eval "$FN_HOLD"
 
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
 ERR_F="$WORK_DIR/stderr"; LOG_F="$WORK_DIR/log"; COMMENT_F="$WORK_DIR/comments"; LABEL_F="$WORK_DIR/labels"
+SELFTEST_ERR_FILE="$ERR_F"   # the lib prints this (the cause an abort in a 2>"$ERR_F" call swallows)
 MOCK_OPEN_JSON='[{"id":"m-wa","status":"open","labels":["type:quality-gate-marker","gate-status:dispatching","source-bead:ga-g7x0si"],"description":"branch: fix/ga-g7x0si-mockup-directions-wa\nbead_id: ga-g7x0si\nrig: whatsapp_automation\nbead_rig: gascity"}]'
 MOCK_BD_MODE=none
 # Dispatch on the VERB ($3, after `-C <city>`), never on a substring of "$*":
@@ -459,8 +464,7 @@ else
   fi
 fi
 
-rm -rf "$WORK_DIR"
-trap - EXIT
+rm -rf "$WORK_DIR"   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 # ── 7. syntax ────────────────────────────────────────────────────────────────
 # /bin/bash (3.2), NOT the PATH bash: Homebrew bash 5.x accepts constructs the
@@ -472,4 +476,5 @@ if /bin/bash -n "${BASH_SOURCE[0]}"; then ok "this selftest passes /bin/bash -n"
 echo ""
 echo "──────────────────────────────────────────"
 echo "  PASS=$PASS  FAIL=$FAIL"
+selftest_summary_reached   # the lib fails every run that never got here
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; else echo "  RESULT: FAIL"; exit 1; fi

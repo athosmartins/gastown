@@ -36,6 +36,7 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 
 PASS=0; FAIL=0
@@ -74,7 +75,12 @@ eq "garbage count -> ambiguous (fail-safe: never auto-correct on a value that is
 echo "── 2. gate_cross_repo_branch_probe: real git I/O (throwaway sandbox) ──"
 _PB_SANDBOX=$(mktemp -d)
 cleanup_pb_sandbox() { [ -n "${_PB_SANDBOX:-}" ] && rm -rf "$_PB_SANDBOX"; }
-trap cleanup_pb_sandbox EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+# One armed trap for the whole file (section 3 has its own sandbox, cleaned by the same function).
+selftest_cleanup() { cleanup_pb_sandbox || true; if type cleanup_e2e_sandbox >/dev/null 2>&1; then cleanup_e2e_sandbox || true; fi; }
+selftest_fail_closed_arm selftest_cleanup
 
 mk_rig() {
   # mk_rig <name> [container:0|1] -> creates a real bare "origin" (what the
@@ -169,8 +175,7 @@ case "$PB_OUT_CONTAINER" in
   *) bad "container rig probe failed — got: $PB_OUT_CONTAINER" ;;
 esac
 
-cleanup_pb_sandbox
-trap - EXIT
+cleanup_pb_sandbox   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 # ── 3. End-to-end: the inline rescue wiring inside Step 4 ────────────────────
 # Extracts the live "no-branch-cross-repo-rescue" block verbatim and runs it
@@ -189,7 +194,7 @@ extract_block() {
 
 _E2E_SANDBOX=$(mktemp -d)
 cleanup_e2e_sandbox() { [ -n "${_E2E_SANDBOX:-}" ] && rm -rf "$_E2E_SANDBOX"; }
-trap cleanup_e2e_sandbox EXIT
+# (cleanup_e2e_sandbox is run by selftest_cleanup at exit — the lib's trap stays armed)
 
 mk_e2e_rig() {
   local name="$1"
@@ -343,8 +348,7 @@ PYEOF
   rm -f "$MUT"
 fi
 
-cleanup_e2e_sandbox
-trap - EXIT
+cleanup_e2e_sandbox   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 # ── 4. Drift guard: functions must still be exported by the dispatcher ───────
 echo "── 4. drift guard: new functions present in lib-only mode ──"
@@ -357,4 +361,5 @@ type gate_cross_repo_branch_probe >/dev/null 2>&1 \
 
 echo ""
 echo "== gate-dispatcher-cross-repo-rescue: PASS=$PASS FAIL=$FAIL =="
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]

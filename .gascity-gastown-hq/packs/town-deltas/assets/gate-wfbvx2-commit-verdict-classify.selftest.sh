@@ -68,6 +68,7 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -257,7 +258,11 @@ echo "── SECTION I: real-git — the exact wa-aoznq incident shape, end to e
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/gate-wfbvx2-selftest.XXXXXX")"
 cleanup() { rm -rf "$TMPD"; }
-trap cleanup EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+SELFTEST_ERR_FILE="$STDERR_FILE"   # the lib prints this (the cause an abort in a 2>"$STDERR_FILE" call swallows)
+selftest_fail_closed_arm cleanup
 
 git -C "$TMPD" init -q -b main 2>/dev/null || { mkdir -p "$TMPD"; git -C "$TMPD" init -q; git -C "$TMPD" checkout -q -b main; }
 git -C "$TMPD" config user.email "test@gascity.local"
@@ -288,10 +293,10 @@ else
   bad "end-to-end: real incident shape still classifies as '$KIND', not merge — the fix does not close the loop this bead exists to fix"
 fi
 
-rm -rf "$TMPD"
-trap - EXIT
+rm -rf "$TMPD"   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 echo ""
 echo "== gate-wfbvx2-commit-verdict-classify.selftest: PASS=$PASS FAIL=$FAIL =="
 rm -f "$STDERR_FILE" 2>/dev/null || true
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]

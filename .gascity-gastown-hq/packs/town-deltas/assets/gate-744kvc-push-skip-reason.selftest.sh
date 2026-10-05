@@ -43,6 +43,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF_DIR/selftest-fail-closed.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-fail-closed.lib.sh" >&2; exit 2; }
 DISPATCHER="$SELF_DIR/quality-gate-dispatcher.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -108,7 +109,10 @@ echo "── 2. real-git: reproduce the exact ga-wfbvx2 incident shape end-to-en
 
 TMPD="$(mktemp -d "${TMPDIR:-/tmp}/gate-744kvc-selftest.XXXXXX")"
 cleanup() { rm -rf "$TMPD"; }
-trap cleanup EXIT
+# FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
+# non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
+# abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
+selftest_fail_closed_arm cleanup
 
 git -C "$TMPD" init -q -b main 2>/dev/null || { mkdir -p "$TMPD"; git -C "$TMPD" init -q; git -C "$TMPD" checkout -q -b main; }
 git -C "$TMPD" config user.email "test@gascity.local"
@@ -190,8 +194,7 @@ else
   bad "fake-remote push did not fail with captured stderr as expected (rc=$PUSH_RC, captured='$CAPTURED') — fixture assumption broken, cannot prove AC1"
 fi
 
-rm -rf "$TMPD"
-trap - EXIT
+rm -rf "$TMPD"   # (the lib's EXIT trap stays armed: no `trap - EXIT`, it would disarm fail-closed)
 
 echo "── 5. drift guards ──"
 
@@ -221,4 +224,5 @@ fi
 
 echo ""
 echo "== gate-744kvc-push-skip-reason.selftest: PASS=$PASS FAIL=$FAIL =="
+selftest_summary_reached   # the lib fails every run that never got here
 [ "$FAIL" -eq 0 ]
