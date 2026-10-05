@@ -566,10 +566,17 @@ def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
         # back through the branch above. A REFUSED KEY (401/403) is not a limit that renews: failing back to it unprobed
         # would put a still-refused key into the item - every pool session broken until the next run, hourly. It is
         # judged (dropped) at its time like the others, and is probed the normal way when a later failover reaches it.
+        # The same goes for an entry that does not say WHY it was registered: register_exhausted always records it
+        # ("rejected" | "invalid"), so a missing or other value means the state was edited or written by something else, and
+        # 'we do not know why' must not read as 'it was a limit that renews' - only an entry that says "rejected" is failed back to.
         # The vault is asked only for the accounts that could be switched to; one whose key does not come back is KEPT
         # (not judged): the failback is tried again on a run that has its key.
         expired = [e for e, v in ex.items() if v.get("reset_epoch", math.inf) <= t]
-        recovered = [e for e in expired if ex[e].get("why") != "invalid"]
+        recovered = [e for e in expired if ex[e].get("why") == "rejected"]
+        for e in expired:
+            if ex[e].get("why") not in ("rejected", "invalid"):
+                log("WARN", f"state: exhausted entry for {e} does not say why it was registered - not failed back to "
+                            "(dropped; probed the normal way if a later failover reaches it)")
         kept = set()
         for e in [e for e in order[:order.index(cur) if cur in order else len(order)] if e in recovered]:
             key = keys.token(e)
@@ -584,9 +591,10 @@ def decide(st: dict, keys: Keys, order: List[str], user: str, t: float) -> None:
         for e in expired:
             if e not in kept:
                 # Every expired entry that is not in `kept` is dropped at its time - including ones nothing was done for: a
-                # refused key, an account that does not outrank the current one, and a recovered account the loop never
-                # reached because it stops after the first switch attempt. Those are ordinary candidates again, probed the
-                # normal way if a later failover reaches them; a later rejection re-registers them with a fresh time.
+                # refused key, an entry that does not say why it was registered, an account that does not outrank the current
+                # one, and a recovered account the loop never reached because it stops after the first switch attempt. Those
+                # are ordinary candidates again, probed the normal way if a later failover reaches them; a later rejection
+                # re-registers them with a fresh time.
                 ex.pop(e, None)
     now_cur = st.get("current")
     if kind == "item" and now_cur == cur:

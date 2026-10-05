@@ -103,6 +103,10 @@ first, delete last, and only when restarting the pool is acceptable.
   session until the next run — once an hour for as long as the key stays bad. It is dropped from the registry and probed
   the normal way when a later failover reaches it. Consequence: after such a key is fixed the pool does not return to
   that account on its own; it moves there the next time the account in use is rejected.
+  The same rule covers an `exhausted` entry that does not say why it was registered (`why` missing or not
+  `rejected`/`invalid` — the daemon always records it, so only a state file edited by hand or written by something else
+  lacks it): only an entry that says `rejected` is failed back to. The other is dropped at its time, with one `WARN`
+  (`does not say why it was registered`), and probed the normal way if a later failover reaches it.
 - The daemon depends on `whatsapp_automation/lib/claude_account_pool.py` for the order and the vault read
   (`CLAUDE_POOL_ACCOUNTS_LIB` overrides the path). If it is missing or fails to import the daemon does nothing.
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just

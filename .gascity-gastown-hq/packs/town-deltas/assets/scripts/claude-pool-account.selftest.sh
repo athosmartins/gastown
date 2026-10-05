@@ -374,7 +374,9 @@ EOF
     && ok "B9c stale reset header (past) -> cooldown from now, not an instant failback" || bad "B9c reset_epoch=$r"
 
   # B10 a recovered account that does NOT outrank the active one is not a reason to move
-  seeded; w0=$(writes); edit_state 'st["exhausted"]={"c@t.test":{"reset_epoch":2000000000.0,"claim":"seven_day"}}'; pc0=$(probes_of c@t.test)
+  # (why=rejected: the entry must be one the failback WOULD go to - without it c is kept out by B32c's rule, and the rank rule this
+  # test is about is never what decided)
+  seeded; w0=$(writes); edit_state 'st["exhausted"]={"c@t.test":{"reset_epoch":2000000000.0,"claim":"seven_day","why":"rejected"}}'; pc0=$(probes_of c@t.test)
   NOW_OVERRIDE=2000000100 run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ -z "$(jex c@t.test reset_epoch)" ] && [ "$(probes_of c@t.test)" = "$pc0" ] \
     && ok "B10 recovered c ranks below the active a -> stay, entry dropped, no probe of c" || bad "B10 current='$(jget "$STATE" current)' c-entry='$(jex c@t.test reset_epoch)'"
@@ -610,6 +612,21 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again it is used the normal way: probed on the next failover (b rejected -> a)" \
     || bad "B32b current='$(jget "$STATE" current)'"
+
+  # B32c the same for an exhausted entry that does not say WHY it was registered (this daemon always records `why`; a state file edited
+  # by hand or written by something else may not, or may say something else). The failback does not probe, so 'unknown why' must not
+  # read as 'a rate limit that renews': only an entry that says "rejected" is failed back to. Not acted on, dropped at its time, and said.
+  for edit in 'st["exhausted"]["a@t.test"].pop("why", None)' 'st["exhausted"]["a@t.test"]["why"]=None' \
+              'st["exhausted"]["a@t.test"]["why"]="limit"' 'st["exhausted"]["a@t.test"]["why"]=["rejected"]'; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once        # on b, a registered 'rejected'
+    [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test why)" = "rejected" ] || bad "B32c precondition: failover to b / a registered rejected (why='$(jex a@t.test why)')"
+    edit_state "$edit"; pa0=$(probes_of a@t.test); w0=$(writes); NOW_OVERRIDE=2000000100 run_d -- run-once; rc=$?   # a's time has passed, a outranks b
+    [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
+      && [ "$(probes_of a@t.test)" = "$pa0" ] && [ -z "$(jex a@t.test reset_epoch)" ] \
+      && grep -q "exhausted entry for a@t.test does not say why it was registered" "$D/city/.gc/logs/claude-pool-account.log" \
+      && ok "B32c entry [$edit] -> NO unprobed failback (stays on b, item untouched), dropped, and a WARN says so" \
+      || bad "B32c [$edit]: rc=$rc current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes) a-entry='$(jex a@t.test reset_epoch)'"
+  done
 
   # B33 what the active account just ANSWERED beats what was stored about it: if it is in the exhausted registry (all accounts had
   # been rejected, the pool stayed put, then it renewed) the entry is cleared now, not left to veto it in a later failover.
