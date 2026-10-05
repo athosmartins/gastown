@@ -25,7 +25,10 @@ E12="$HERE/e12-arms.sh"
 command -v jq >/dev/null 2>&1 || { echo "SKIP: jq missing" >&2; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 missing — the arm recipe is checked by an independent hash" >&2; exit 1; }
 
-W="$(mktemp -d "${TMPDIR:-/tmp}/e12-arms-selftest.XXXXXX")"
+# No scratch dir is a hard stop: with W empty every "$W/..." below would point at the filesystem root. The path check is separate from
+# mktemp's exit code because "mktemp said yes" and "it printed a usable absolute path" are two different answers.
+W="$(mktemp -d "${TMPDIR:-/tmp}/e12-arms-selftest.XXXXXX")" || { echo "FATAL: cannot create a scratch directory under ${TMPDIR:-/tmp} — nothing was run" >&2; exit 2; }
+case "$W" in /?*) ;; *) echo "FATAL: mktemp printed no usable scratch path ('$W') — nothing was run" >&2; exit 2 ;; esac
 # A selftest that dies half-way must not exit 0 (bash 3.2 does that for several abort shapes — ga-f31s7p): the trap turns "never reached
 # the last line" into a failure of its own.
 REACHED_END=0
@@ -219,6 +222,29 @@ fi
 echo "== 6. usage =="
 run;            [ -z "$OUT" ] && [ "$RC" = 2 ] && case "$ERR" in *usage*) true ;; *) false ;; esac && ok "no command → usage on stderr, exit 2" || bad "no command: out='$OUT' rc=$RC err='$ERR'"
 run frobnicate; [ -z "$OUT" ] && [ "$RC" = 2 ] && ok "unknown command → exit 2" || bad "unknown command: rc=$RC"
+
+# This selftest ends in `rm -rf "$W"`. If mktemp fails (the disk has been near full here) the old code went on with W empty and wrote to
+# "/s1", "/want"…; the sibling selftest, worse, turned its empty path into the CURRENT directory and deleted it while printing PASS.
+# Each child below runs from a directory holding a sentinel, with a TMPDIR that cannot hold a scratch dir, under the current bash AND the
+# macOS system bash (3.2, where `cd ""` succeeds and stays put — the shape that made the deletion possible). It must stop with exit 2
+# and a FATAL line, and the sentinel must still be there.
+echo "== 7. no scratch directory → stop, never guess =="
+if [ -z "${E12_SELFTEST_SCRATCH_CHILD:-}" ]; then
+  _prev=""; _n=0
+  for _sh in "${BASH:-/bin/bash}" /bin/bash; do
+    [ -x "$_sh" ] && [ "$_sh" != "$_prev" ] || continue
+    _prev="$_sh"; _n=$((_n+1))
+    _probe="$W/nowork-$_n"; mkdir -p "$_probe"; : > "$_probe/sentinel"
+    _crc=0; _cout="$(cd "$_probe" && E12_SELFTEST_SCRATCH_CHILD=1 TMPDIR="$W/no-such-dir" "$_sh" "$HERE/e12-arms.selftest.sh" 2>&1)" || _crc=$?
+    if [ "$_crc" = 2 ] && [ -e "$_probe/sentinel" ]; then
+      case "$_cout" in *FATAL*"scratch"*) ok "mktemp failure under $_sh → FATAL, exit 2, the working directory untouched" ;; *) bad "$_sh: exit 2 but no FATAL line naming the scratch dir: '${_cout:0:120}'" ;; esac
+    else
+      bad "$_sh with an unusable TMPDIR: exit=$_crc, sentinel $([ -e "$_probe/sentinel" ] && echo kept || echo DELETED) — a failed mktemp must stop the run with exit 2"
+    fi
+  done
+else
+  ok "(child run: the scratch-dir section is skipped to avoid recursing)"
+fi
 
 echo
 echo "e12-arms selftest: $PASS passed, $FAILN failed"

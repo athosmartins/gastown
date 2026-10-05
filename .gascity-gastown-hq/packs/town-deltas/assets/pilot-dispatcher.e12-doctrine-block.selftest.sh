@@ -54,14 +54,21 @@ fi
 REAL_TIMEOUT="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
 [ -n "$REAL_TIMEOUT" ] || { echo "FATAL: no timeout/gtimeout on this host — the hook's 10s bound cannot be exercised" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-e12-selftest.XXXXXX")"
+# No scratch dir is a hard stop, decided BEFORE the cleanup trap exists. The trap ends in `rm -rf "$WORK"`: with an empty WORK, the
+# `cd "$WORK" && pwd` below used to turn it into the CURRENT directory under the macOS system bash (3.2: `cd ""` succeeds and stays put),
+# and the trap then deleted the directory the selftest was started from — while the run still printed PASS. "mktemp said yes" and
+# "it printed a usable absolute path" are two separate answers, so both are checked.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pilot-e12-selftest.XXXXXX")" || { echo "FATAL: cannot create a scratch directory under ${TMPDIR:-/tmp} — nothing was run" >&2; exit 2; }
+case "$WORK" in /?*) ;; *) echo "FATAL: mktemp printed no usable scratch path ('$WORK') — nothing was run" >&2; exit 2 ;; esac
 # A selftest that dies half-way must not exit 0 (ga-f31s7p): reaching the last line is part of passing.
 REACHED_END=0
 cleanup() { local rc=$?; chmod -R u+rw "$WORK" 2>/dev/null; rm -rf "$WORK"; if [ "$REACHED_END" != 1 ] && [ "$rc" = 0 ]; then echo "FAIL: selftest aborted before its last line" >&2; exit 1; fi; }
 trap cleanup EXIT
 # macOS TMPDIR ends in "/", so the mktemp path carries a "//". The function under test resolves its siblings with `cd … && pwd`,
-# which collapses it — compare against the same normal form or a path assertion fails for a reason that is not the hook's.
-WORK="$(cd "$WORK" && pwd)"
+# which collapses it — compare against the same normal form or a path assertion fails for a reason that is not the hook's. If the
+# normalisation itself cannot be read, stop: WORK keeps the mktemp path, which the trap removes.
+_WORK_NORM="$(cd "$WORK" && pwd)" && [ -n "$_WORK_NORM" ] || { echo "FATAL: cannot enter the scratch directory $WORK — nothing was run" >&2; exit 2; }
+WORK="$_WORK_NORM"
 
 SHIMBIN="$WORK/bin"; mkdir -p "$SHIMBIN"
 . "$SELF_DIR/selftest-sandbox-path.lib.sh" || { echo "FATAL: cannot source $SELF_DIR/selftest-sandbox-path.lib.sh" >&2; exit 2; }
@@ -290,6 +297,27 @@ $M6
       printf '%s' \"\$DOCTRINE_BLOCK\"; }"
     f ) )"
 [ "$M6_OUT" != "B" ] && ok "mutation 6 (drop the beads-repo guard) is CAUGHT: the beads-repo dispatch would be enrolled" || bad "mutation 6 NOT caught"
+
+# The scratch-dir guard at the top of this file. Each child runs from a directory holding a sentinel, with a TMPDIR that cannot hold a
+# scratch dir, under the current bash AND the macOS system bash (3.2 — the one where the old code deleted its own working directory and
+# still printed PASS). It must stop with exit 2 and a FATAL line, and the sentinel must still be there.
+echo "== 7. no scratch directory → stop, never guess =="
+if [ -z "${E12_SELFTEST_SCRATCH_CHILD:-}" ]; then
+  _prev=""; _n=0
+  for _sh in "${BASH:-/bin/bash}" /bin/bash; do
+    [ -x "$_sh" ] && [ "$_sh" != "$_prev" ] || continue
+    _prev="$_sh"; _n=$((_n+1))
+    _probe="$WORK/nowork-$_n"; mkdir -p "$_probe"; : > "$_probe/sentinel"
+    _crc=0; _cout="$(cd "$_probe" && E12_SELFTEST_SCRATCH_CHILD=1 TMPDIR="$WORK/no-such-dir" "$_sh" "$SELF_DIR/pilot-dispatcher.e12-doctrine-block.selftest.sh" 2>&1)" || _crc=$?
+    if [ "$_crc" = 2 ] && [ -e "$_probe/sentinel" ]; then
+      case "$_cout" in *FATAL*"scratch"*) ok "mktemp failure under $_sh → FATAL, exit 2, the working directory untouched" ;; *) bad "$_sh: exit 2 but no FATAL line naming the scratch dir: '${_cout:0:120}'" ;; esac
+    else
+      bad "$_sh with an unusable TMPDIR: exit=$_crc, sentinel $([ -e "$_probe/sentinel" ] && echo kept || echo DELETED) — a failed mktemp must stop the run with exit 2"
+    fi
+  done
+else
+  ok "(child run: the scratch-dir section is skipped to avoid recursing)"
+fi
 
 echo
 echo "pilot-dispatcher.e12-doctrine-block.selftest: PASS=$PASS FAIL=$FAIL"
