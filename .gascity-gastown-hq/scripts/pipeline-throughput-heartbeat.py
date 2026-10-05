@@ -31,9 +31,11 @@ DESIGN (adversarially hardened — pure outcome-based is INSUFFICIENT):
       * Gate merge: zero `Gate PASSED` in the window WHILE queued markers exist AND no
         review is legitimately in-flight younger than its own timeout AND the gate is not
         deliberately throttling reviews via the ga-cw4pm headroom logic (a fresh `Headroom
-        DEFER` line — Dolt protection, not a stall; ga-r1u20). The in-flight + throttle
-        guards are what stop a single honest 40-minute review, or an intentional Dolt-hot
-        deferral, from tripping the alarm.
+        DEFER` line — Dolt protection, not a stall; ga-r1u20) AND the dispatcher's latest
+        admission decision is not a deliberate pause (RAM pressure / global session cap /
+        drain window / quiet hours — ga-wduv5z; a condition-driven pause stops suppressing
+        after ADMISSION_PAUSE_CEILING_SEC). The in-flight + throttle guards are what stop a
+        single honest 40-minute review, or an intentional deferral, from tripping the alarm.
   - SPECIFIC assertion for the bare-main storm (pure-outcome cannot see it): alert on
     the `Durable-landing ... FAILED / not ancestor` log pattern within the window.
   - Per-session liveness: alert on any ephemeral worker session (gate-reviewer / dog)
@@ -165,6 +167,33 @@ GATE_MERGING = "proceeding to merge branch"
 #    run (ga-cw4pm)."                ← admitting reviews normally
 # A fresh DEFER as the latest decision is throttled-not-stalled (ga-r1u20).
 HEADROOM_DECISION_RE = re.compile(r"Headroom (OK|DEFER)\b")
+# ga-wduv5z: the dispatcher's OTHER deliberate admission pauses. Each logs and exits BEFORE the
+# headroom gate, so none of them emits a Headroom line or an in-flight poll — the two things
+# gate_merge_stall() looked for — and every one was read as a stall (live 2026-10-05: 483
+# 'PAUSING new-run admission' lines, 149 cap-hit lines in the current log).
+# Condition-driven — the pause lasts exactly as long as the condition holds:
+#   "RAM pressure WARN|EMERGENCY (...) — PAUSING new-run admission this sweep ..."   (ga-jezvn)
+#   "GLOBAL variable-session cap hit (9/9: ...) — QUEUED, leaving N marker(s) ..."   (ga-jezvn)
+ADMISSION_PAUSE_CONDITION_RE = re.compile(
+    r"RAM pressure \w+ .*PAUSING new-run admission|GLOBAL variable-session cap hit")
+# Scheduled — bounded by the clock, so a run of them legitimately outlasts any ceiling:
+#   "Drain window (...) — PAUSING new-run admission this sweep ..."      (ga-a2v0bz, until the reboot)
+#   "Quiet hours (...) — PAUSING new-run admission this sweep (00h-08h ...)"   (ga-dxyvxr)
+ADMISSION_PAUSE_SCHEDULED_RE = re.compile(
+    r"(?:Drain window|Quiet hours) .*PAUSING new-run admission")
+# A condition-driven pause stops suppressing after this long without a merge. RAM in WARN for
+# hours is a problem somebody has to look at, and a suppressor with no upper bound would
+# silence it forever. Past the ceiling the normal alarm path runs (hysteresis, cooldowns, and
+# the 🚨 escalation to Athos after ESCALATE_AFTER unresolved cycles).
+ADMISSION_PAUSE_CEILING_SEC = 7200
+# Dispatcher-log lines gate_merge_stall() reads (it used to be a bare 800). The ceiling is only
+# enforceable if the tail reaches back past it: a paused sweep logs ~3.8 lines/min (measured
+# 2026-10-05 16:08-16:34, RAM pause), so 800 lines ≈ 3.5h — but a pause with several live
+# reviewers logs far more per sweep, and a tail shorter than the ceiling would under-measure the
+# pause and suppress past it. 3000 keeps ≥2h of headroom down to ~25 lines/min. Costs nothing:
+# tail_lines() already parses the whole file and slices; every other scan in
+# gate_merge_stall() stops at a timestamp horizon, not at a line count.
+GATE_TAIL_LINES = 3000
 # Durable-landing FAIL signatures (quality-gate-dispatcher.sh ~lines 1840/1846/1857/1863):
 #   "Durable-landing AUDIT FAILED: merge <sha> not in rig-canonical main ..."
 #   "Durable-landing AUDIT FAILED: merge <sha> not in origin/main ... shared-remote clobber"
@@ -378,6 +407,63 @@ def _headroom_deferring(lines, now):
     return False
 
 
+def _admission_resumed(line):
+    """True for a line that proves the sweep got PAST the dispatcher's pause gates (or merged):
+    a headroom decision, a merge, or the session-list probe failing closed. That last one is a
+    blind spot, not a throttle — it ends a pause run instead of extending it (error ≠ paused)."""
+    return bool(HEADROOM_DECISION_RE.search(line) or "fail CLOSED" in line
+                or GATE_PASS in line or GATE_MERGING in line)
+
+
+def _admission_pause_state(lines, now):
+    """('condition'|'scheduled', seconds_the_run_has_lasted) when the MOST RECENT admission
+    decision in the window is a deliberate pause, else None.
+
+    Mirrors _headroom_deferring: the latest decision is the gate's current self-assessment, so
+    a pause followed by anything that got past the pause gates (_admission_resumed) is over —
+    'admitting and STILL not merging' stays an alarm — and a decision older than
+    FLOW_WINDOW_SEC, or one with no timestamp, never suppresses. The run length is how far back
+    the same kind of pause continues unbroken; if `lines` ends first it is a lower bound."""
+    kind = run_start = None
+    for l in reversed(lines):
+        if ADMISSION_PAUSE_CONDITION_RE.search(l):
+            this = "condition"
+        elif ADMISSION_PAUSE_SCHEDULED_RE.search(l):
+            this = "scheduled"
+        elif _admission_resumed(l):
+            this = "resumed"
+        else:
+            continue  # sweep noise (Phase C polls, 'Found N queued', ...) is not a decision
+        e = log_ts_epoch(l)
+        if kind is None:
+            if this == "resumed" or e is None or now - e > FLOW_WINDOW_SEC:
+                return None
+            kind, run_start = this, e
+        elif this != kind:
+            break  # the run ended here (admission resumed, or a different pause took over)
+        elif e is not None:
+            run_start = e
+    return (kind, now - run_start) if kind else None
+
+
+def _admission_pause_deferring(lines, now):
+    """(deferring, paused_sec). deferring=True: the gate is throttled on purpose (ga-wduv5z) —
+    RAM-pressure pause or global session cap (ga-jezvn), drain window (ga-a2v0bz), quiet hours
+    (ga-dxyvxr) — and no merges is EXPECTED, not a stall. A repair dog is the worst answer to
+    the RAM case: it spawns another session on a machine the pause is trying to relieve.
+
+    deferring=False with paused_sec>0: a CONDITION-driven pause has outlasted
+    ADMISSION_PAUSE_CEILING_SEC with no merge — stop suppressing (the caller says so in its
+    reason). Scheduled pauses are exempt from the ceiling: a 00h-08h pause is 8h by design."""
+    state = _admission_pause_state(lines, now)
+    if state is None:
+        return (False, 0)
+    kind, paused = state
+    if kind == "condition" and paused > ADMISSION_PAUSE_CEILING_SEC:
+        return (False, paused)
+    return (True, paused)
+
+
 def gate_merge_stall(now=None):
     """Returns a reason string when the gate has queued work but produced no merge in
     the window and no review is legitimately running; else None. Independent of the
@@ -387,7 +473,7 @@ def gate_merge_stall(now=None):
     now = now if now is not None else time.time()
     if not file_fresh(DISPATCH_LOG, now=now):
         return None  # dead engine = ENGINE-STALL's job
-    lines = tail_lines(DISPATCH_LOG, 800)
+    lines = tail_lines(DISPATCH_LOG, GATE_TAIL_LINES)
     if not lines:
         return None
 
@@ -415,6 +501,16 @@ def gate_merge_stall(now=None):
         return None  # ga-r1u20: gate is deliberately deferring reviews to protect Dolt
                      # (ga-cw4pm headroom throttle) → no Verdicts polls is EXPECTED, not a
                      # stall. Suppress the false-positive at the source.
+
+    deferring, paused = _admission_pause_deferring(lines, now)
+    if deferring:
+        return None  # ga-wduv5z: admission paused on purpose (RAM pressure / session cap /
+                     # drain window / quiet hours) → zero merges is EXPECTED, not a stall.
+    if paused:
+        return ("Gate com %d marker(s) na fila e ZERO merges: admissão em pausa deliberada "
+                "(RAM/teto de sessões) há %dmin — passou do teto de %dmin de supressão; uma "
+                "pausa que dura tanto precisa de olho humano" %
+                (backlog, paused // 60, ADMISSION_PAUSE_CEILING_SEC // 60))
 
     return ("Gate com %d marker(s) na fila e ZERO merges em %dmin, sem revisão ativa "
             "em andamento — fila não drena sob demanda" % (backlog, FLOW_WINDOW_SEC // 60))
