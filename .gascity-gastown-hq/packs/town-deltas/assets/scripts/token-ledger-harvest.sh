@@ -19,6 +19,9 @@
 #   6  something could not be READ: root missing / unreadable / empty, project unreadable, or a transcript that exists but will not
 #      open (only ENOENT counts as "vanished"). Whatever WAS readable is still harvested and the ledger is written — nothing already
 #      in it is lost. "Nothing to harvest" is not something the tool can know in that case, so it never exits 0 for it.
+#   7  the ledger lock could not be TAKEN for a reason that is not contention (ENOLCK, EBADF, EIO...): nothing was done. Only
+#      EWOULDBLOCK/EAGAIN means "another harvest holds it" (that is the rc 0 line above); anything else used to read the same
+#      and the harvest then never ran, silently.
 #   else  the tool crashed
 # The alarm text is the FIRST line of the tool's output, so the 500-char cut of the log line below never throws it away.
 set -u

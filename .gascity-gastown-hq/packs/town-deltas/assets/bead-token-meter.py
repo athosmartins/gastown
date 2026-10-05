@@ -11,8 +11,9 @@ modelo/effort é decidível — esta ferramenta é o pré-requisito (passo 0 do 
     prices    a tabela de preços em uso (e de onde veio cada número).
 
 Somente leitura sobre os transcritos e o log do gate. Só escreve ao lado do ledger (o diretório dele): `sessions.jsonl`, `sessions.jsonl.lock`
-(o flock), `sessions.jsonl.unreadable-<ts>` (cópia do arquivo ANTES da reescrita, só quando há linha ilegível) e o temporário `.sessions.*`
-da troca atômica. Só stdlib.
+(o flock), `sessions.jsonl.unreadable-<ts>` (cópia do arquivo ANTES da reescrita, só quando há linha ilegível),
+`sessions.jsonl.replaced-<ts>` (as linhas de schema antigo que uma cópia nova substituiu, como estavam ANTES; só quando houve troca) e o
+temporário `.sessions.*` da troca atômica. Uma linha NUNCA é trocada por uma cópia mais pobre (menos mensagens ou menos tokens). Só stdlib.
 
 O que um transcrito conta (medido em 01/10 nos 1.786 transcritos locais):
   * O Claude Code grava UM registro JSONL por bloco de conteúdo (thinking / text / tool_use) e TODOS repetem o `usage` da mesma
@@ -57,6 +58,7 @@ Exemplos:
 """
 import argparse
 import datetime as dt
+import errno
 import fcntl
 import glob
 import contextlib
@@ -117,6 +119,7 @@ UPDATED_ISSUE = re.compile(r"Updated issue:?\s+([a-z]{2,4}-[a-z0-9]{3,10}(?:\.\d
 CLAIM_ERR = re.compile(r"(?i)\b(error|already|failed|not found)\b")
 RC_FORMAT_ALARM = 5   # exit do `harvest` quando o transcrito parece ter mudado de formato (o ledger foi escrito)
 RC_NO_INPUT = 6       # exit do `harvest` quando NÃO deu para ler os transcritos (raiz ausente/ilegível, projeto ilegível, transcrito que existe mas não abre, ou zero transcritos): "não sei" ≠ "nada a colher"
+RC_LOCK_ERROR = 7     # exit do `harvest` e do `backfill-s3` quando o flock do ledger falhou por um erro que NÃO é contenção (ENOLCK, EBADF, EIO...): nada foi feito
 GROUP = "_grp:"       # bucket de claims no MESMO instante: "_grp:<id>,<id>" (rateio igual entre eles, como o `_pre`)
 USAGE_KEYS = ("inp", "out", "cw5", "cw1", "cr", "think", "msgs")
 CTX_CAPS = (150_000, 250_000, 350_000)   # tetos hipotéticos de contexto por turno (tokens): quanto da leitura de cache está ACIMA deles
@@ -395,7 +398,10 @@ def scan_session(main):
                 is_user = '"user"' in line
                 if not (is_asst or is_user):
                     continue
-                if is_user and alias is not None and user_seen >= 3 and not (pending and any(k in line for k in pending)):
+                # atalho de desempenho: depois das 3 primeiras, uma linha de usuário sem claim pendente não precisa ser parseada. A decisão é por
+                # SUBSTRING da linha crua, então só vale para linha que NÃO PODE ser de assistente: um registro de assistente cujo input de ferramenta
+                # tem `"role": "user"` também contém `"user"` e era pulado, com o uso dele nunca contado
+                if is_user and not is_asst and alias is not None and user_seen >= 3 and not (pending and any(k in line for k in pending)):
                     continue
                 try:
                     r = json.loads(line)
@@ -562,34 +568,117 @@ def write_ledger(rows, path):
     os.replace(tmp, path)
 
 
-def merge_session(rows, rec):
-    """True se `rec` entrou no ledger. Vence o registro com MAIS mensagens: a cópia do S3 pode ser mais velha que a local."""
+def usage_total(row):
+    """Tokens (inp+out+cw5+cw1+cr) de todos os buckets de uma linha do ledger. None = não deu para somar (a linha não tem buckets legíveis): "não sei" não é 0."""
+    try:
+        return sum(total_tokens(c) for cells in row["buckets"].values() for c in cells.values())
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return None
+
+
+def row_is_current(row):
+    """A linha foi escrita pelo schema de hoje (a colheita a trata como `inalterada` enquanto o fingerprint bate)."""
+    return row.get("v") == SCHEMA and "days_ctx" in row
+
+
+def compare_to_ledger(old, rec):
+    """Compara a linha que ENTRA (`rec`) com a que já está no ledger (`old`). "poorer" = MENOS mensagens OU MENOS tokens (nenhum eixo sozinho prova que
+    é mais completa: a cópia do S3 traz só os arquivos de topo e a linha do ledger pode ter os de subagente); "unknown" = não deu para comparar (a linha
+    do ledger não tem mensagens/tokens legíveis); "ok" = igual ou mais completa."""
+    om, nm, ot, nt = old.get("msgs"), rec.get("msgs"), usage_total(old), usage_total(rec)
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in (om, nm, ot, nt)):
+        return "unknown"
+    return "poorer" if nm < om or nt < ot else "ok"
+
+
+class MergeStats:
+    """O que o merge decidiu numa rodada, para o texto dizer: linhas mantidas porque a cópia que entrou era mais pobre, linhas mantidas porque não deu
+    para comparar, e as linhas de schema antigo que saíram (guardadas por `commit_ledger` antes de o ledger ser reescrito)."""
+
+    def __init__(self):
+        self.kept_poorer = self.kept_unknown = self.saved = 0
+        self.superseded = []          # linhas de schema antigo que saíram e ainda não foram guardadas
+        self.saved_to = None
+        self.stamp = int(time.time())
+
+    def report(self, who):
+        if self.kept_poorer:
+            print(f"{who}: ⚠ {self.kept_poorer} linhas mantidas: a cópia que entrou era MAIS POBRE (menos mensagens ou menos tokens) que a do ledger — nada foi trocado "
+                  f"(o S3 só traz os arquivos de topo: os tokens de subagente de uma sessão cujo transcrito o reaper já apagou só existem na linha do ledger)")
+        if self.kept_unknown:
+            print(f"{who}: ⚠ {self.kept_unknown} linhas mantidas: não deu para comparar com a cópia que entrou (a linha do ledger não tem mensagens/tokens legíveis) — nada foi trocado")
+        if self.saved:
+            print(f"{who}: ⚠ {self.saved} linhas de schema antigo substituídas pela cópia nova (nunca mais pobre): as linhas como estavam ANTES foram guardadas em {self.saved_to}")
+
+
+def merge_session(rows, rec, stats=None):
+    """True se `rec` entrou no ledger. NUNCA troca uma linha por uma cópia mais pobre (menos mensagens ou menos tokens), de nenhum schema: "schema novo" não é
+    "mais dados" (o backfill-s3 refaz toda linha v<4 e só traz os arquivos de topo). Uma linha que não dá para comparar também fica. A linha de schema antigo
+    que SAI (cópia não mais pobre) vai para `stats.superseded`: quem reescreve o ledger a guarda antes, por `commit_ledger`."""
     old = rows.get(rec["sid"])
-    if old and old.get("v") == SCHEMA and old.get("msgs", 0) > rec["msgs"]:
-        return False
+    if old:
+        verdict = compare_to_ledger(old, rec)
+        if verdict != "ok":
+            if stats is not None:
+                if verdict == "poorer":
+                    stats.kept_poorer += 1
+                else:
+                    stats.kept_unknown += 1
+            return False
+        if stats is not None and not row_is_current(old):
+            stats.superseded.append(old)
     rows[rec["sid"]] = rec
     return True
 
 
+def commit_ledger(rows, path, stats):
+    """`write_ledger` + a cópia das linhas de schema antigo que o merge substituiu, feita ANTES da reescrita (como `preserve_unreadable`): o ledger é
+    reescrito inteiro e o que sai dele sem cópia some. Se guardar falhar, a exceção sobe e o ledger NÃO é reescrito."""
+    if stats.superseded:
+        keep = Path(f"{path}.replaced-{stats.stamp}")
+        keep.parent.mkdir(parents=True, exist_ok=True)
+        with open(keep, "a") as fh:
+            for r in stats.superseded:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+        stats.saved += len(stats.superseded)
+        stats.saved_to = keep
+        stats.superseded = []
+    write_ledger(rows, path)
+
+
+class LedgerLockError(Exception):
+    """O flock do ledger falhou por um motivo que NÃO é outra colheita em curso (ENOLCK, EBADF, EIO...)."""
+
+
 def lock_ledger(path):
+    """-> o arquivo de lock aberto; None = OUTRA colheita está em curso (EWOULDBLOCK/EAGAIN: a única contenção). Qualquer outro erro do flock levanta
+    LedgerLockError: "não consegui travar" não é "alguém já tem o lock" — a diferença é a colheita rodar ou nunca mais rodar, calada."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = open(str(path) + ".lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return None
+    except OSError as e:
+        lock.close()
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise LedgerLockError(f"{errno.errorcode.get(e.errno, e.errno)}: {e.strerror or e}") from e
     return lock
 
 
 def cmd_harvest(a):
     path = Path(a.ledger or LEDGER)
-    lock = lock_ledger(path)
+    try:
+        lock = lock_ledger(path)
+    except LedgerLockError as e:
+        print(f"harvest: ERRO — não consegui travar o ledger ({e}); isto não é contenção, nada foi feito. exit {RC_LOCK_ERROR}")
+        return RC_LOCK_ERROR
     if lock is None:
         print("harvest: outra colheita em curso (lock do ledger) — nada feito")
         return 0
     t0 = time.time()
     rows, bad_ledger = load_ledger(path)
     preserve_unreadable(path, bad_ledger)
+    stats = MergeStats()
     cutoff = time.time() - a.since_hours * 3600 if a.since_hours else 0
     scanned = unchanged = skipped_old = vanished = suspect = big = bad_lines = no_usage = untimed = untimed_msgs = unconfirmed = files_unreadable = 0
     input_problems = []       # (raiz ou projeto, motivo): entrada que NÃO deu para ler — "não sei" não é "nada a colher"
@@ -629,7 +718,7 @@ def cmd_harvest(a):
                 big += 1
                 if rec["msgs"] == 0:
                     suspect += 1
-            if merge_session(rows, rec):
+            if merge_session(rows, rec, stats):
                 scanned += 1
             else:
                 unchanged += 1
@@ -638,7 +727,7 @@ def cmd_harvest(a):
         input_problems.append((Path("(BTM_PROJECTS)"), "nenhuma raiz de transcritos configurada"))
     elif not seen and not input_problems:
         input_problems.append((Path(":".join(str(r) for r in PROJECTS)), "0 transcritos `<projeto>/<sessão>.jsonl`"))
-    write_ledger(rows, path)
+    commit_ledger(rows, path, stats)
     # Sessão lançada e morta antes da 1ª resposta existe (~0,7% das sessões: 1 prompt, 0 respostas) — não é alarme. Formato novo de
     # transcrito derruba a LEITURA de todas de uma vez: só acende quando ≥2 e ≥25% das sessões grandes desta colheita vieram com 0 respostas.
     # O wrapper do order corta a linha de log em 500 caracteres: o alarme é a PRIMEIRA linha (o corte joga fora o fim, não o começo) e o
@@ -658,6 +747,7 @@ def cmd_harvest(a):
     print(f"harvest: {scanned} sessões (re)escaneadas, {unchanged} inalteradas, {skipped_old} fora da janela, "
           f"{vanished} sumiram no meio; ledger={len(rows)} sessões (linhas ilegíveis no ledger: {bad_ledger}) "
           f"em {time.time() - t0:.1f}s -> {path}")
+    stats.report("harvest")        # DEPOIS do resumo: o wrapper corta a linha do log em 500 caracteres e o teste de produção lê o resumo dela
     if bad_lines or no_usage:
         print(f"⚠ nas sessões escaneadas: {bad_lines} linhas de transcrito ilegíveis e {no_usage} respostas SEM usage (tokens DESCONHECIDOS, "
               f"contados como 0 só no total — o gasto real é maior)")
@@ -704,7 +794,11 @@ def s3_list(since_day):
 def cmd_backfill_s3(a):
     """Traz do arquivo permanente do S3 os transcritos que o reaper já apagou localmente, em LOTES pequenos (baixa, escaneia, apaga)."""
     path = Path(a.ledger or LEDGER)
-    lock = lock_ledger(path)
+    try:
+        lock = lock_ledger(path)
+    except LedgerLockError as e:
+        print(f"backfill-s3: ERRO — não consegui travar o ledger ({e}); isto não é contenção, nada foi feito. exit {RC_LOCK_ERROR}")
+        return RC_LOCK_ERROR
     if lock is None:
         print("backfill-s3: outra colheita em curso (lock do ledger) — nada feito")
         return 0
@@ -719,6 +813,7 @@ def cmd_backfill_s3(a):
         return 2
     rows, bad_ledger = load_ledger(path)
     preserve_unreadable(path, bad_ledger)
+    stats = MergeStats()
     todo, skipped_scope, skipped_have = [], 0, 0
     for key, size in sorted(top):
         proj, sid = key.split("/")[1], key.split("/")[2][:-6]
@@ -733,10 +828,11 @@ def cmd_backfill_s3(a):
     total_mb = sum(sz for _, sz, _, _ in todo) / 1e6
     print(f"backfill-s3: {len(top)} transcritos no S3 desde {a.since}; {len(todo)} a trazer ({total_mb:.0f} MB), {skipped_have} já no ledger, "
           f"{skipped_scope} fora de escopo (produto/scratch); {nested[0]} objetos aninhados ({nested[1] / 1e6:.0f} MB — subagentes/tool-results) NÃO "
-          f"baixados: o gasto de subagente de crew/Mayor restaurado do S3 fica SUBESTIMADO")
+          f"baixados: o gasto de subagente de QUALQUER sessão restaurada do S3 (crew, Mayor e também wa-worker: parte das sessões dele usa subagente) fica "
+          f"SUBESTIMADO — o custo restaurado é um PISO")
     if a.dry_run:
         return 0
-    merged = failed = kept = 0
+    merged = failed = 0
     failures = []
     i = 0
     base = Path(a.tmp_dir) if a.tmp_dir else None
@@ -750,7 +846,8 @@ def cmd_backfill_s3(a):
             if free < bsz + a.min_free_gb * 1e9:
                 print(f"backfill-s3: PARADO — disco livre {free / 1e9:.1f} GB < lote {bsz / 1e6:.0f} MB + piso {a.min_free_gb} GB. "
                       f"O que já entrou fica no ledger; rode de novo quando houver espaço.")
-                write_ledger(rows, path)
+                commit_ledger(rows, path, stats)
+                stats.report("backfill-s3")
                 return 3
             # UM `aws s3 sync` por projeto com --include por sessão: 1 processo com pool de requisições próprio. Um `aws s3 cp` por objeto
             # media ~0,2 MB/s com a máquina saturada (load 47): a partida do aws custava mais que a transferência.
@@ -781,15 +878,14 @@ def cmd_backfill_s3(a):
                 if rec is None:
                     failed += 1                          # existia no `dest.exists()` acima e sumiu antes de abrir
                     failures.append((key, "transcrito baixado e sumiu antes de abrir"))
-                elif merge_session(rows, rec):
-                    merged += 1
-                else:
-                    kept += 1
-            write_ledger(rows, path)                    # checkpoint a cada lote: interromper não perde o já trazido
+                elif merge_session(rows, rec, stats):
+                    merged += 1                          # a linha que NÃO entrou (mais pobre, ou sem como comparar) é contada em `stats`, cada uma com a sua frase
+            commit_ledger(rows, path, stats)            # checkpoint a cada lote: interromper não perde o já trazido
             print(f"  lote {len(batch)} objetos ({bsz / 1e6:.0f} MB): acumulado {merged} novos/atualizados, {failed} falhas")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-    print(f"backfill-s3: {merged} sessões entraram/atualizaram, {kept} já tinham registro mais completo, {failed} downloads FALHARAM; ledger={len(rows)}")
+    print(f"backfill-s3: {merged} sessões entraram/atualizaram, {stats.kept_poorer} já tinham registro mais completo, {failed} downloads FALHARAM; ledger={len(rows)}")
+    stats.report("backfill-s3")
     for key, err in failures[:10]:
         print(f"  FALHOU {key}: {err}")
     return 0 if not failed else 4

@@ -63,6 +63,45 @@ _unproven() { UNPROVEN_N=$((UNPROVEN_N + 1)); UNPROVEN="${UNPROVEN:+$UNPROVEN; }
 NOTES=""
 _note() { NOTES="${NOTES:+$NOTES; }$1"; }
 
+# _ledger_stamp <file> — "<size> <inode> <sha256>" from ONE python call; rc != 0 and no output when the file cannot be read.
+_ledger_stamp() {
+  python3 -c 'import hashlib, os, sys
+st = os.stat(sys.argv[1])
+print(st.st_size, st.st_ino, hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1" 2>/dev/null
+}
+
+# check_report_readonly <stamp-before> <stamp-after> <copy-taken-BEFORE-the-run> <the report's own args...> — a `report` must not write to the ledger. The proof is by CONTENT, never
+# by mtime: `stat` gives 1 s resolution, so a write inside the same second reads as untouched, and the 30-min harvest order rewrites the ledger on every
+# tick (atomically: new inode, new bytes), so a changed mtime is not proof that the REPORT did it either. Sets RO_PROOF for the log line.
+#   identical stamp (size, inode, sha256) -> proven read-only.
+#   stamp moved -> the report wrote OR a harvest tick landed in the window, and on the live file the two cannot be told apart. So the report is run again on
+#                  the private COPY the caller took BEFORE the run, where nothing else writes: unchanged copy = the report is read-only; changed copy = FAIL.
+#                  (A copy taken AFTER would already carry an idempotent write, and a second run of the same report would show nothing.)
+#   could not stamp / copy / run -> "could not find out": counted in the PASS line (_unproven), neither a silent pass nor a FAIL by itself.
+RO_PROOF=""
+check_report_readonly() {
+  local before="$1" after="$2" copy="$3" c0 c1; shift 3
+  if [[ -z "$before" || -z "$after" ]]; then
+    RO_PROOF="UNPROVEN"; _unproven "report read-only (could not stamp the live ledger before/after the run)"; return 0
+  fi
+  if [[ "$before" == "$after" ]]; then RO_PROOF="live ledger byte-identical (size, inode, sha256)"; return 0; fi
+  if [[ -z "$copy" ]] || ! c0="$(_ledger_stamp "$copy")"; then
+    RO_PROOF="UNPROVEN"; _unproven "report read-only (the live ledger moved during the run and there is no readable pre-run copy to re-run the report on)"; return 0
+  fi
+  if ! _to 200 python3 "$METER" report --ledger "$copy" "$@" >/dev/null 2>&1; then
+    RO_PROOF="UNPROVEN"; _unproven "report read-only (the live ledger moved during the run and the report failed on the private copy)"; return 0
+  fi
+  if ! c1="$(_ledger_stamp "$copy")"; then
+    RO_PROOF="UNPROVEN"; _unproven "report read-only (the private copy could not be read back)"; return 0
+  fi
+  [[ "$c0" == "$c1" ]] || fail "'report' changed the ledger it reads (private copy: ${c0##* } -> ${c1##* }) — a report must be read-only"
+  RO_PROOF="the live ledger moved during the run (a harvest tick) — the report left a private copy byte-identical"
+  _note "live ledger moved during the report (harvest tick); read-only proven on a private copy"
+}
+
+# Sourced by a selftest (token-ledger-harvest.selftest.sh): only the helpers above are wanted — stop before any live check runs.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
+
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/ga-5c3msy-prodtest.XXXXXX")" || fail "cannot create a scratch dir"
 cleanup() { [[ -n "$TMPROOT" && -d "$TMPROOT" ]] && rm -rf "$TMPROOT"; }
 trap cleanup EXIT
@@ -135,16 +174,18 @@ run_selftest "harvest-order"  '([0-9]+) ok, 0 failed' /bin/bash "$HV_ST"
 rows="$(wc -l < "$LEDGER" | tr -d ' ')"
 [[ "$rows" =~ ^[0-9]+$ && "$rows" -ge 500 ]] || fail "the ledger has $rows rows (< 500) — an almost-empty ledger reads as 'cheap', not as 'unmeasured'"
 tail -n 1 "$LEDGER" | jq -e '(.sid | type == "string") and (.first_ts | type == "string")' >/dev/null 2>&1 || fail "the last ledger row does not parse as a session record"
-mt_before="$(stat -f %m "$LEDGER" 2>/dev/null || stat -c %Y "$LEDGER" 2>/dev/null)"
+pre_copy="$TMPROOT/ledger-pre.jsonl"; cp "$LEDGER" "$pre_copy" 2>/dev/null || pre_copy=""       # the pristine copy the read-only proof falls back on
+st_before="$(_ledger_stamp "$LEDGER")" || st_before=""
 since="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(days=2)).strftime("%Y-%m-%d"))')"
 rep="$TMPROOT/report.json"
 _to 200 python3 "$METER" report --from "$since" --assume-price claude-sonnet-5=claude-sonnet-5-5 --json > "$rep" 2> "$TMPROOT/report.err"; rrc=$?
 [[ "$rrc" -eq 0 ]] || { head -c 400 "$TMPROOT/report.err" >&2; fail "meter report --from $since exited $rrc"; }
 jq -e '.exit_code == 0 and (.sessions > 0) and (.total_usd_priced > 0) and ((.by_role | length) > 0)' "$rep" >/dev/null 2>&1 \
   || fail "meter report on the live ledger is empty or unpriced (sessions/total_usd_priced/by_role): $(jq -c '{exit_code, sessions, total_usd_priced}' "$rep" 2>/dev/null)"
-mt_after="$(stat -f %m "$LEDGER" 2>/dev/null || stat -c %Y "$LEDGER" 2>/dev/null)"
-[[ "$mt_before" == "$mt_after" ]] || fail "'report' changed the ledger (mtime $mt_before -> $mt_after) — a report must be read-only"
-log "live ledger: $rows rows; report since $since: $(jq -r '"\(.sessions) sessions, US$ \(.total_usd_priced | floor) priced"' "$rep") ✓ (ledger untouched)"
+st_after="$(_ledger_stamp "$LEDGER")" || st_after=""
+check_report_readonly "$st_before" "$st_after" "$pre_copy" --from "$since" --assume-price claude-sonnet-5=claude-sonnet-5-5 --json
+ro_txt="✓ read-only: $RO_PROOF"; [[ "$RO_PROOF" == "UNPROVEN" ]] && ro_txt="? read-only NOT proven (listed in the PASS line)"
+log "live ledger: $rows rows; report since $since: $(jq -r '"\(.sessions) sessions, US$ \(.total_usd_priced | floor) priced"' "$rep") $ro_txt"
 
 # The same report WITHOUT --assume-price. The live ledger holds tokens of models the price table does not cover, so THIS is the run
 # that exercises the third state (n/p / floor); the run above prices everything it can and never touches that path. It must finish

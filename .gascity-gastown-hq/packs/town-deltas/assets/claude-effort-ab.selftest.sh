@@ -222,6 +222,27 @@ t_fail_open() {
   [ "$out" = "$(plain_u "$TREAT_U")" ] && grep -q 'EFFORT-AB WARN .*shasum failed' "$LOG" && ok "shasum missing: claude STILL launches, argv untouched, WARN" || bad "missing shasum not fail-open: $out | $(cat "$LOG")"
 }
 
+# gate (attempt 5): a treat_pct with >= 19 digits is a number bash's `[ -gt ]` cannot compare (rc 2 + "integer expression expected" on the
+# agent's stderr), so the `&&` that sets ab_bad never fired: the conf was ACCEPTED and every launch logged a clean `arm=control pct=999...`
+# instead of the WARN a bad conf promises. A bad conf must be the visible WARN, and nothing leaks to stderr.
+t_pct_digits() {
+  find_uuids; local out p
+  for p in 99999999999999999999 0000000000000000001 1000; do
+    conf "salt=t1" "enroll=wa-worker" "control_effort=xhigh" "treat_effort=high" "treat_pct=$p"; reset_log
+    out="$(argv_u "$TREAT_U" GC_TEMPLATE=wa-worker 2>"$W/pct.err")"
+    if [ "$out" = "$(plain_u "$TREAT_U")" ] && grep -q 'EFFORT-AB WARN conf .* ignored' "$LOG" && ! grep -q 'arm=' "$LOG" && ! grep -q 'integer expression' "$W/pct.err"; then
+      ok "treat_pct=$p (${#p} digits): ignored with the WARN, no draw logged, stderr clean"
+    else bad "treat_pct=$p (${#p} digits) not rejected cleanly: argv=[$(printf '%s' "$out" | tr '\n' ' ')] log=[$(cat "$LOG")] stderr=[$(cat "$W/pct.err")]"; fi
+  done
+  # controls: the cap must not reject a valid value — 3 digits (zero-padded too) are decided as before
+  for p in 050 100; do
+    conf "salt=t1" "enroll=wa-worker" "control_effort=xhigh" "treat_effort=high" "treat_pct=$p"; reset_log
+    out="$(argv_u "$TREAT_U" GC_TEMPLATE=wa-worker 2>"$W/pct.err")"
+    [ "$(arg4 "$out")" = "high" ] && grep -q "EFFORT-AB arm=treat" "$LOG" && ! grep -q 'EFFORT-AB WARN' "$LOG" && [ ! -s "$W/pct.err" ] \
+      && ok "treat_pct=$p is still accepted and decided" || bad "treat_pct=$p wrongly rejected: $out | $(cat "$LOG") | $(cat "$W/pct.err")"
+  done
+}
+
 # ---- mutation controls: each mutant of the wrapper must be rejected by at least one check ----------------
 mutant() { # name, sed-script, case-function. A subshell inherits the functions/vars; only WRAPPER is swapped.
   local name="$1" script="$2" fn="$3" m="$W/mutant-$RANDOM.sh" nfail
@@ -238,6 +259,7 @@ echo "== the unit of randomization is the session (uuid), not the (repeating) se
 echo "== enrolment scope"; t_enrollment_scope
 echo "== split properties"; t_split_extremes; t_split_uniform
 echo "== fail-open"; t_fail_open
+echo "== treat_pct: the digit cap (bash cannot compare a 19+ digit number)"; t_pct_digits
 echo "== mutation controls"
 mutant "treat decision inverted"              's/-lt "\$ab_pct"/-ge "$ab_pct"/'                                  t_split_extremes
 mutant "control-effort guard removed"         's/if \[ "\$ab_cur" != "\$ab_ctl" \]; then/if false; then/'        t_enrollment_scope
@@ -253,5 +275,6 @@ mutant "uuid shape not validated"                             's/elif ! is_uuid 
 mutant "--resume ignored"                                     's/--session-id|--resume) ab_uuid=/--session-id) ab_uuid=/'                       t_unit_resume
 mutant "--session-id= form ignored"                           's/--session-id=\*) ab_uuid=.*;;/--session-id=*) ;;/'                            t_unit_resume
 mutant "bogus session id echoed to the log"                   's/(value of \${#ab_uuid} chars)/(value [$ab_uuid])/'                              t_unit_no_identity
+mutant "treat_pct digit cap removed (19+ digits accepted)"      's/\[ "\${#ab_pct}" -gt 3 \] || //'                                          t_pct_digits
 echo; echo "$PASS ok, $FAIL failed"
 [ "$FAIL" -eq 0 ]

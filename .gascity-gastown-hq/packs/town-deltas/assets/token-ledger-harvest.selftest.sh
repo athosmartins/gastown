@@ -52,4 +52,82 @@ else
   WRAP_UNDER_TEST="$W/swallow.sh"; case_real_missing_root; unset WRAP_UNDER_TEST
   [ "$MR_RC" -ne 6 ] && ok "mutant 'wrapper swallows the exit code' rejected (the missing-root case saw rc=$MR_RC, not 6)" || bad "mutant survived"
 fi
+
+# ---- (6) the prod test's "a report is read-only" proof (gate attempt 5). It compared the ledger's mtime at 1 s resolution: a write inside the same
+# second read as untouched, and the 30-min harvest order rewrites the ledger on every tick, so a changed mtime was a ~1-3% false FAIL. The proof is now
+# by content (size, inode, sha256); when the live file moved it is re-proven on a private copy; "could not find out" is counted, never a silent pass.
+# The helpers live in the prod test and are SOURCED here (it returns before any live check when sourced); a stub meter stands in for `report`.
+STORY="${STORY_UNDER_TEST:-$SELF_DIR/prod-tests/gascity/story-ga-5c3msy.sh}"
+cat > "$W/stub-meter.py" <<'PY'
+import os, sys
+a = sys.argv[1:]
+led = a[a.index("--ledger") + 1] if "--ledger" in a else os.environ["STUB_LEDGER"]
+live = led == os.environ["STUB_LEDGER"]
+mode = os.environ.get("STUB_MODE", "read")
+if mode in ("append", "silent"):                       # the REPORT writes to the ledger it reads
+    st = os.stat(led)
+    with open(led, "ab") as fh:
+        fh.write(b'{"sid":"c"}\n')
+    if mode == "silent":                               # ... and puts the mtime back: a 1 s mtime comparison cannot see it
+        os.utime(led, ns=(st.st_atime_ns, st.st_mtime_ns))
+elif mode == "samesize":                               # ... or rewrites a byte IN PLACE: same size, same inode, mtime put back
+    st = os.stat(led)
+    data = open(led, "rb").read().replace(b'"a"', b'"z"')
+    with open(led, "r+b") as fh:
+        fh.write(data)
+    os.utime(led, ns=(st.st_atime_ns, st.st_mtime_ns))
+elif mode in ("tick", "tick_copy_fails") and live:     # a concurrent harvest tick: atomic rewrite (new inode, new bytes) of the LIVE file only
+    tmp = led + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(open(led, "rb").read() + b'{"sid":"tick"}\n')
+    os.replace(tmp, led)
+if mode == "tick_copy_fails" and not live:
+    sys.exit(3)
+print("{}")
+PY
+ro_case() {   # <mode> [story-file] -> RO_RC, RO_OUT: the story's own check_report_readonly in a subshell, against the stub meter and a scratch ledger
+  local story="${2:-$STORY}"
+  RO_OUT="$( ( set +e
+    export STUB_MODE="$1" STUB_LEDGER="$W/ro-ledger.jsonl"
+    printf '%s\n' '{"sid":"a"}' '{"sid":"b"}' > "$STUB_LEDGER"
+    source "$story" || exit 97
+    LEDGER="$STUB_LEDGER"; METER="$W/stub-meter.py"; TMPROOT="$W/ro-tmp"; mkdir -p "$TMPROOT"
+    touch -t 202601010000 "$LEDGER"                     # an old mtime: whatever the stub does to the file, the mtime of the write is "now"
+    cp "$LEDGER" "$TMPROOT/ledger-pre.jsonl"           # what the prod test snapshots BEFORE the report runs
+    b="$(_ledger_stamp "$LEDGER")"; python3 "$METER" report --from x --json >/dev/null 2>&1
+    a="$(_ledger_stamp "$LEDGER")"
+    check_report_readonly "$b" "$a" "$TMPROOT/ledger-pre.jsonl" --from x --json
+    echo "PROOF=[$RO_PROOF] UNPROVEN=[$UNPROVEN]"
+  ) 2>&1 )"; RO_RC=$?
+}
+ro_case read
+[ "$RO_RC" -eq 0 ] && [[ "$RO_OUT" == *"PROOF=[live ledger byte-identical"*"UNPROVEN=[]"* ]] && ok "report that only reads: proven read-only on the live ledger (size, inode, sha256)" || bad "read-only report not proven: rc=$RO_RC $RO_OUT"
+ro_case append
+[ "$RO_RC" -ne 0 ] && [[ "$RO_OUT" == *"changed the ledger it reads"* ]] && ok "report that WRITES the ledger: FAIL (re-run on a private copy shows the write)" || bad "a writing report passed: rc=$RO_RC $RO_OUT"
+ro_case silent
+[ "$RO_RC" -ne 0 ] && [[ "$RO_OUT" == *"changed the ledger it reads"* ]] && ok "report that writes and RESTORES the mtime: still a FAIL (an mtime comparison would have called it untouched)" || bad "a silent write passed: rc=$RO_RC $RO_OUT"
+ro_case samesize
+[ "$RO_RC" -ne 0 ] && [[ "$RO_OUT" == *"changed the ledger it reads"* ]] && ok "report that rewrites a byte in place (same size, same inode, mtime restored): FAIL - only the content hash sees it" || bad "an in-place write passed: rc=$RO_RC $RO_OUT"
+ro_case tick
+[ "$RO_RC" -eq 0 ] && [[ "$RO_OUT" == *"PROOF=[the live ledger moved during the run (a harvest tick)"*"UNPROVEN=[]"* ]] && ok "a harvest tick rewrites the live ledger mid-report: NOT a false FAIL (read-only proven on a private copy, and said so)" || bad "tick in the window: rc=$RO_RC $RO_OUT"
+ro_case tick_copy_fails
+[ "$RO_RC" -eq 0 ] && [[ "$RO_OUT" == *"PROOF=[UNPROVEN]"*"UNPROVEN=[report read-only"* ]] && ok "tick in the window and the private-copy run fails: 'could not find out' is listed as UNPROVEN, neither a pass nor a FAIL" || bad "unprovable case: rc=$RO_RC $RO_OUT"
+# mutation controls on the proof itself: each must be rejected by at least one of the cases above
+ro_mutant() {   # <name> <old> <new> <case-mode...>   (the old snippet must occur exactly once, or the control is blind)
+  local name="$1" old="$2" new="$3"; shift 3
+  python3 - "$STORY" "$W/story-mutant.sh" "$old" "$new" <<'PY' || { bad "mutant '$name': the snippet to mutate does not occur exactly once in the prod test - the control is blind"; return; }
+import sys
+src = open(sys.argv[1]).read()
+if src.count(sys.argv[3]) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w").write(src.replace(sys.argv[3], sys.argv[4]))
+PY
+  local mode caught=""
+  for mode in "$@"; do ro_case "$mode" "$W/story-mutant.sh"; case "$mode" in read|tick) [ "$RO_RC" -ne 0 ] && caught=1 ;; *) [ "$RO_RC" -eq 0 ] && caught=1 ;; esac; done
+  [ -n "$caught" ] && ok "mutant '$name' rejected" || bad "mutant '$name' SURVIVED"
+}
+ro_mutant "an unchanged stamp is not required"            'if [[ "$before" == "$after" ]]; then RO_PROOF=' 'if true; then RO_PROOF='                                         append silent
+ro_mutant "a changed private copy is not a FAIL"          '[[ "$c0" == "$c1" ]] || fail ' '[[ "$c0" == "$c1" ]] || : '                                                                                            append silent
+ro_mutant "an unrunnable proof is silently a pass"        '_unproven "report read-only (the live ledger moved during the run and the report failed on the private copy)"' ':' tick_copy_fails
+ro_mutant "the stamp ignores the content"                 'hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' '"-")' samesize
 echo; echo "$PASS ok, $FAIL failed"; [ "$FAIL" -eq 0 ]

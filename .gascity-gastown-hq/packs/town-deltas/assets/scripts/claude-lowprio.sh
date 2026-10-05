@@ -168,7 +168,10 @@ if [ -n "$ab_conf" ] && [ -f "$ab_conf" ] && [ "${GC_EFFORT_AB:-}" != "0" ] && [
   done < "$ab_conf"
   case "$ab_ctl" in low|medium|high|xhigh|max) ;; *) ab_bad="${ab_bad:-control_effort '$ab_ctl' invalid}" ;; esac
   case "$ab_trt" in low|medium|high|xhigh|max) ;; *) ab_bad="${ab_bad:-treat_effort '$ab_trt' invalid}" ;; esac
-  case "$ab_pct" in ''|*[!0-9]*) ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}" ;; *) [ "$ab_pct" -gt 100 ] && ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}" ;; esac
+  # the length cap comes first: bash `[ -gt ]` cannot compare a number of 19+ digits (rc 2, so the && alone never set ab_bad and the conf was accepted)
+  case "$ab_pct" in ''|*[!0-9]*) ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}" ;; *)
+    if [ "${#ab_pct}" -gt 3 ] || [ "$ab_pct" -gt 100 ]; then ab_bad="${ab_bad:-treat_pct '$ab_pct' is not 0-100}"; fi ;;
+  esac
   [ -n "$ab_salt" ] && [ -n "$ab_enroll" ] || ab_bad="${ab_bad:-salt/enroll missing}"
   if [ -n "$ab_bad" ]; then
     note "EFFORT-AB WARN conf $ab_conf ignored: $ab_bad"

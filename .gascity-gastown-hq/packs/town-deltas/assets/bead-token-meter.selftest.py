@@ -531,6 +531,9 @@ def t_backfill(m, W):
     rows, _ = m.load_ledger(led)
     ck(list(rows) == ["sid1"] and rows["sid1"]["claims"][0]["bead"] == "ga-s3s3", f"só sid1 entrou (produto/scratch/aninhados ficam de fora): {list(rows)}")
     ck("2 fora de escopo" in out and "1 objetos aninhados" in out, f"escopo e aninhados reportados: {out}")
+    # gate (tentativa 5, bloqueante 2): o aviso dizia que só o gasto de crew/Mayor ficava subestimado — falso, wa-worker também usa subagente (medido 05/10:
+    # 7 de 54 sessões, ~15% dos tokens delas). O custo de QUALQUER sessão restaurada do S3 é um piso, e o aviso tem de dizer isso.
+    ck("SUBESTIMADO" in out and "wa-worker" in out and "PISO" in out, f"o aviso de subagente não restaurado vale para QUALQUER sessão restaurada, wa-worker incluso: {out}")
     ck(not [p for p in W.glob("btm-s3-*")], "lote temporário apagado (disco)")
     code, out = bf(m, W)
     ck("1 já no ledger" in out, f"2ª rodada não rebaixa o que o ledger já tem: {out}")
@@ -1344,6 +1347,165 @@ def t_harvest_unreadable_transcript(m, W):
     ck("FALHOU projects/-projA/sid3.jsonl: transcrito baixado e ilegível" in out and code == 4, f"backfill-s3 com transcrito ilegível: falha contada, exit 4; achei {code} {out[-300:]!r}")
 
 
+def old_row(sid, v, msgs, out):
+    """Uma linha do ledger como a escreveu uma versão do script no schema `v`: para o merge só importam as mensagens e os tokens dos buckets."""
+    return dict(v=v, sid=sid, msgs=msgs, first_ts=D + "10:00:00Z", size=1, fp="x", days_ctx={},
+                buckets={"_pre": {"claude-sonnet-5-5|xhigh": dict(inp=0, out=out, cw5=0, cw1=0, cr=0, think=0, msgs=msgs)}})
+
+
+def t_merge_never_poorer(m, W):
+    """Gate (tentativa 5, bloqueante 1): `merge_session` só guardava a linha mais rica quando a antiga JÁ estava no schema atual — uma linha de
+    schema antigo era sobrescrita por QUALQUER cópia, e o backfill-s3 (só os arquivos de topo, nunca os de subagente) refaz toda linha v<4: a linha
+    com os tokens dos subagentes era trocada por uma mais pobre, contada como "atualizada", sem cópia — irreversível depois que o reaper apaga o
+    transcrito. "Schema novo" não é "mais dados": nunca se troca uma linha por uma cópia mais pobre, de nenhum schema (nem em mensagens, nem em
+    tokens); o que não dá para comparar fica como está; e a cópia que ENTRA no lugar de uma linha de schema antigo é a que não perde nada."""
+    # o repro do revisor: linha v3 msgs=7 out=20.300 × cópia do S3 (schema atual) msgs=3 out=300
+    rows = {"s1": old_row("s1", 3, 7, 20300)}
+    ck(not m.merge_session(rows, old_row("s1", m.SCHEMA, 3, 300)) and rows["s1"] == old_row("s1", 3, 7, 20300),
+       f"linha de schema antigo MAIS RICA não é trocada por cópia mais pobre: {rows['s1']['v']=} {rows['s1']['msgs']=}")
+    # nenhum eixo sozinho basta: mais mensagens com MENOS tokens, e o contrário, também são mais pobres
+    rows = {"s1": old_row("s1", 3, 3, 20300)}
+    ck(not m.merge_session(rows, old_row("s1", m.SCHEMA, 7, 300)) and rows["s1"]["msgs"] == 3, "mais mensagens mas menos tokens é mais pobre")
+    rows = {"s1": old_row("s1", 3, 7, 300)}
+    ck(not m.merge_session(rows, old_row("s1", m.SCHEMA, 3, 20300)) and rows["s1"]["msgs"] == 7, "mais tokens mas menos mensagens é mais pobre")
+    # "não consegui comparar" (a linha do ledger não tem buckets legíveis) não é "mais completa": fica como está
+    broken = old_row("s1", 3, 7, 20300)
+    del broken["buckets"]
+    rows = {"s1": dict(broken)}
+    ck(not m.merge_session(rows, old_row("s1", m.SCHEMA, 9, 99999)) and rows["s1"] == broken, "linha que não dá para comparar não é sobrescrita")
+    # controles: a cópia igual-ou-mais-completa de uma linha de schema antigo ENTRA (senão a v<4 nunca migra) e a sessão nova entra
+    rows = {"s1": old_row("s1", 3, 3, 300)}
+    ck(m.merge_session(rows, old_row("s1", m.SCHEMA, 7, 20300)) and rows["s1"]["v"] == m.SCHEMA and rows["s1"]["msgs"] == 7, "cópia mais completa substitui a de schema antigo")
+    rows = {"s1": old_row("s1", 3, 7, 300)}
+    ck(m.merge_session(rows, old_row("s1", m.SCHEMA, 7, 300)) and rows["s1"]["v"] == m.SCHEMA, "cópia igual migra a linha de schema antigo")
+    rows = {}
+    ck(m.merge_session(rows, old_row("s1", m.SCHEMA, 1, 1)) and "s1" in rows, "sessão nova entra")
+
+
+def t_backfill_keeps_richer_row_and_saves_the_replaced(m, W):
+    """O mesmo, de ponta a ponta pelo backfill-s3 (o caminho que o relatório documenta): a linha mais rica FICA e o texto diz que ficou; quando a
+    cópia do S3 entra no lugar de uma linha de schema antigo, a linha que saiu vai para `.replaced-<ts>` ANTES da reescrita (como o
+    `.unreadable-<ts>`) e a contagem aparece — o ledger é reescrito inteiro, e o que sai dele sem cópia some."""
+    stub_world(W, m)
+    led = W / "bf" / "sessions.jsonl"
+    led.parent.mkdir(parents=True, exist_ok=True)
+    # (a) o S3 traz msgs=1 / 100 tokens (só o topo); a linha v3 do ledger tem msgs=7 / 20.300 (com os subagentes)
+    m.write_ledger({"sid1": old_row("sid1", 3, 7, 20300)}, led)
+    code, out = bf(m, W)
+    row = m.load_ledger(led)[0]["sid1"]
+    ck(row["v"] == 3 and row["msgs"] == 7 and row["buckets"]["_pre"]["claude-sonnet-5-5|xhigh"]["out"] == 20300,
+       f"o backfill não troca a linha mais rica pela do S3: v={row['v']} msgs={row['msgs']}")
+    ck("1 linhas mantidas" in out and "MAIS POBRE" in out, f"o texto diz que a cópia do S3 era mais pobre e a linha ficou: {out}")
+    ck(not list(led.parent.glob("sessions.jsonl.replaced-*")), "nada foi trocado: não há o que guardar")
+    # (b) a linha v3 do ledger é mais pobre que a do S3: a do S3 entra e a linha que saiu fica guardada
+    led.unlink()
+    m.write_ledger({"sid1": old_row("sid1", 3, 1, 5)}, led)
+    code, out = bf(m, W)
+    row = m.load_ledger(led)[0]["sid1"]
+    ck(row["v"] == m.SCHEMA and row["msgs"] == 1, f"a cópia do S3 não é mais pobre: entra: v={row['v']}")
+    saved = sorted(led.parent.glob("sessions.jsonl.replaced-*"))
+    ck(len(saved) == 1, f"a linha de schema antigo que saiu foi guardada em .replaced-<ts>: {[p.name for p in led.parent.iterdir()]}")
+    kept = [json.loads(ln) for ln in saved[0].read_text().splitlines()]
+    ck(len(kept) == 1 and kept[0]["sid"] == "sid1" and kept[0]["v"] == 3 and kept[0]["buckets"]["_pre"]["claude-sonnet-5-5|xhigh"]["out"] == 5,
+       f"o arquivo tem a linha como estava ANTES da troca: {kept}")
+    ck("1 linhas de schema antigo substituídas" in out and str(saved[0]) in out, f"a contagem e o caminho da cópia aparecem: {out}")
+    # (c) a sessão que o S3 trouxe não trocou nada no ledger de schema ATUAL: nenhuma cópia desnecessária a cada rodada
+    for p in saved:
+        p.unlink()
+    code, out = bf(m, W)
+    ck(not list(led.parent.glob("sessions.jsonl.replaced-*")), "linha já no schema atual não gera cópia")
+    # (d) a linha do ledger que não dá para comparar (sem buckets legíveis) fica, com a frase dela — NÃO a de "já tinha registro mais completo"
+    led.unlink()
+    broken = old_row("sid1", 3, 7, 20300)
+    del broken["buckets"]
+    m.write_ledger({"sid1": broken}, led)
+    code, out = bf(m, W)
+    ck(m.load_ledger(led)[0]["sid1"] == broken, "linha que não dá para comparar não é trocada pelo backfill")
+    ck("1 linhas mantidas: não deu para comparar" in out and "0 já tinham registro mais completo" in out,
+       f"o que não deu para comparar não é contado como 'já tinha registro mais completo': {out}")
+
+
+def t_harvest_keeps_richer_old_schema_row(m, W):
+    """E pela colheita local: uma linha de schema antigo é reescaneada (o schema subiu), mas o transcrito local pode ter menos que a linha (o
+    reaper já apagou os arquivos de subagente): a linha mais rica fica; a que a colheita pode substituir sem perda (cópia igual) é guardada."""
+    w, _ = setup(m, W)
+    rows = ledger_rows(m, w)
+    rich = json.loads(json.dumps(rows["dog1"]))
+    rich["v"], rich["msgs"] = 3, rich["msgs"] + 50
+    cell = next(iter(next(iter(rich["buckets"].values())).values()))
+    cell["out"] += 5000
+    same = json.loads(json.dumps(rows["ora1"]))
+    same["v"] = 3                                           # mesma sessão, schema antigo, NADA a mais: a cópia nova só a migra
+    rows.update(dog1=rich, ora1=same)
+    m.write_ledger(rows, w["ledger"])
+    out = harvest(m, w)
+    now = ledger_rows(m, w)
+    ck(now["dog1"] == rich, f"colheita: a linha de schema antigo mais rica fica como estava: v={now['dog1']['v']} msgs={now['dog1']['msgs']}")
+    ck("1 linhas mantidas" in out and "MAIS POBRE" in out, f"colheita: o texto diz que a linha ficou: {out}")
+    ck(now["ora1"]["v"] == m.SCHEMA, "colheita: a linha de schema antigo que não perde nada é migrada")
+    saved = sorted(w["ledger"].parent.glob("sessions.jsonl.replaced-*"))
+    ck(len(saved) == 1 and [json.loads(ln)["sid"] for ln in saved[0].read_text().splitlines()] == ["ora1"],
+       f"colheita: a linha que saiu (só ela) foi guardada: {[p.name for p in saved]}")
+    ck("1 linhas de schema antigo substituídas" in out, f"colheita: a contagem aparece: {out}")
+
+
+def t_lock_error_is_not_contention(m, W):
+    """Gate (tentativa 5, baixo): `lock_ledger` lia QUALQUER OSError do flock como "outra colheita em curso — nada feito" com exit 0: ENOLCK/EBADF/EIO
+    viravam o pulo educado de uma colheita concorrente e a colheita nunca rodava (erro lido como contenção — o terceiro estado). Só
+    EWOULDBLOCK/EAGAIN é contenção; qualquer outra coisa é falha alta (exit ≠ 0, nada feito, a mensagem NÃO é a de contenção). Vale para o
+    harvest e para o backfill-s3."""
+    import errno
+    import types
+    w, _ = setup(m, W)
+    stub_world(W, m)
+    real = m.fcntl
+
+    def with_flock_error(code):
+        def raiser(fd, op):
+            raise OSError(code, os.strerror(code))
+        return types.SimpleNamespace(flock=raiser, LOCK_EX=real.LOCK_EX, LOCK_NB=real.LOCK_NB)
+
+    before = w["ledger"].read_bytes()
+    try:
+        m.fcntl = with_flock_error(errno.ENOLCK)
+        rc, out = harvest_rc(m, w)
+        ck(rc != 0 and "outra colheita em curso" not in out, f"harvest: ENOLCK não é contenção: rc={rc} {out!r}")
+        ck(rc == m.RC_LOCK_ERROR and "ERRO" in out and os.strerror(errno.ENOLCK) in out, f"harvest: falha alta que diz o que o SO respondeu: {out!r}")
+        ck(w["ledger"].read_bytes() == before, "harvest: com o lock em erro o ledger não é tocado")
+        led = W / "bf" / "sessions.jsonl"
+        code, out = bf(m, W)
+        ck(code == m.RC_LOCK_ERROR and "outra colheita em curso" not in out and "ERRO" in out, f"backfill-s3: ENOLCK não é contenção: rc={code} {out!r}")
+        ck(not led.exists(), "backfill-s3: com o lock em erro nada foi trazido")
+        # controle: contenção de verdade (EAGAIN/EWOULDBLOCK) continua sendo o pulo educado, exit 0
+        for code_ in {errno.EAGAIN, errno.EWOULDBLOCK}:
+            m.fcntl = with_flock_error(code_)
+            rc, out = harvest_rc(m, w)
+            ck(rc == 0 and "outra colheita em curso" in out, f"harvest: {errno.errorcode[code_]} é contenção: rc={rc} {out!r}")
+            code, out = bf(m, W)
+            ck(code == 0 and "outra colheita em curso" in out, f"backfill-s3: {errno.errorcode[code_]} é contenção: rc={code} {out!r}")
+    finally:
+        m.fcntl = real
+
+
+def t_assistant_record_with_user_word_is_counted(m, W):
+    """Gate (tentativa 5, baixo): o atalho que pula linhas de usuário (depois das 3 primeiras, sem claim pendente) decidia pela SUBSTRING `"user"` na
+    linha crua — um registro de ASSISTENTE cuja linha contém `"user"` (um valor de input de ferramenta, `{"role": "user"}`) era pulado e o uso dele
+    nunca contado: tokens sumidos sem aviso. O atalho só vale para linha que não pode ser de assistente."""
+    P = W / "projects"
+    recs = [beacon("gastown.dog-1", D + "10:00:00.000Z"), user("segunda", D + "10:00:01.000Z"), user("terceira", D + "10:00:02.000Z")]
+    a = asst("m1", D + "10:00:10.000Z")[2]                       # o bloco tool_use da resposta
+    a["message"]["content"][0]["input"] = {"command": "true", "meta": {"role": "user"}}
+    recs.append(a)
+    write_session(P, "-proj", "u1", recs)
+    ck(b'"user"' in (P / "-proj" / "u1.jsonl").read_bytes().splitlines()[-1], "a fixture: a linha crua do assistente contém a palavra entre aspas")
+    rec = m.scan_session(P / "-proj" / "u1.jsonl")
+    ck(rec["msgs"] == 1 and rec["bad_lines"] == 0, f"o registro de assistente com a palavra \"user\" é contado: msgs={rec['msgs']}")
+    # controle: uma linha de usuário comum, sem claim pendente, depois das 3 primeiras, segue sendo pulada sem estragar nada
+    recs2 = recs[:3] + [user("quarta", D + "10:00:05.000Z")] + asst("m2", D + "10:00:20.000Z")
+    write_session(P, "-proj", "u2", recs2)
+    ck(m.scan_session(P / "-proj" / "u2.jsonl")["msgs"] == 1, "linha de usuário comum não atrapalha a contagem")
+
+
 MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
     "soma linhas (sem dedup)": ('if v > rec["use"][k]:\n                                rec["use"][k] = v', 'rec["use"][k] += v', t_dedup),
     "leitura de cache a preço cheio": ('"cr": 0.10}', '"cr": 1.0}', t_price),
@@ -1443,6 +1605,21 @@ MUTANTS = {   # nome -> (trecho do script, mutação, caso que TEM que reprovar)
                                                           "            except TranscriptUnreadable:\n                vanished += 1\n                continue", t_harvest_unreadable_transcript),
     "stat que falha com EACCES vira 'sumiu'": ("            except FileNotFoundError:\n                vanished += 1", "            except OSError:\n                vanished += 1", t_harvest_unreadable_transcript),
     "backfill não trata TranscriptUnreadable": ("                except TranscriptUnreadable as e:\n                    failed += 1", "                except KeyError as e:\n                    failed += 1", t_harvest_unreadable_transcript),
+    # ---- gate-fix 5 (ga-5c3msy): nunca trocar uma linha por cópia mais pobre; erro de lock ≠ contenção; atalho de usuário por tipo
+    "linha de schema antigo é trocada por qualquer cópia (como antes)": ('if verdict != "ok":', 'if verdict != "ok" and row_is_current(old):', t_merge_never_poorer),
+    "só as mensagens decidem se a cópia é mais pobre": ('return "poorer" if nm < om or nt < ot else "ok"', 'return "poorer" if nm < om else "ok"', t_merge_never_poorer),
+    "só os tokens decidem se a cópia é mais pobre": ('return "poorer" if nm < om or nt < ot else "ok"', 'return "poorer" if nt < ot else "ok"', t_merge_never_poorer),
+    "linha que não dá para comparar é sobrescrita": ('        return "unknown"\n    return "poorer"', '        return "ok"\n    return "poorer"', t_merge_never_poorer),
+    "a linha de schema antigo que sai não é anotada para guardar": ("            stats.superseded.append(old)", "            pass", t_backfill_keeps_richer_row_and_saves_the_replaced),
+    "a linha que sai é anotada mas o arquivo .replaced fica vazio": ('                fh.write(json.dumps(r, sort_keys=True) + "\\n")', "                pass", t_backfill_keeps_richer_row_and_saves_the_replaced),
+    "linha mantida porque a cópia era mais pobre não é dita": ("        if self.kept_poorer:", "        if False:", t_harvest_keeps_richer_old_schema_row),
+    "linha que não deu para comparar não é dita": ("        if self.kept_unknown:", "        if False:", t_backfill_keeps_richer_row_and_saves_the_replaced),
+    "troca de schema antigo não é contada nem aponta a cópia": ("        if self.saved:", "        if False:", t_harvest_keeps_richer_old_schema_row),
+    "o que não deu para comparar é contado como 'já tinha registro mais completo'": ("{stats.kept_poorer} já tinham registro mais completo", "{stats.kept_poorer + stats.kept_unknown} já tinham registro mais completo", t_backfill_keeps_richer_row_and_saves_the_replaced),
+    "qualquer erro do flock é contenção": ("        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):", "        if True:", t_lock_error_is_not_contention),
+    "harvest não trata o erro do lock": ('    except LedgerLockError as e:\n        print(f"harvest: ERRO', '    except KeyError as e:\n        print(f"harvest: ERRO', t_lock_error_is_not_contention),
+    "backfill-s3 não trata o erro do lock": ('    except LedgerLockError as e:\n        print(f"backfill-s3: ERRO', '    except KeyError as e:\n        print(f"backfill-s3: ERRO', t_lock_error_is_not_contention),
+    "atalho de usuário pula registro de assistente": ("if is_user and not is_asst and alias is not None", "if is_user and alias is not None", t_assistant_record_with_user_word_is_counted),
 }
 
 CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), ("preço e TTL de cache", t_price),
@@ -1472,7 +1649,12 @@ CASES = [("dedup por message.id (entre registros e entre arquivos)", t_dedup), (
          ("subagente que não abre (arquivo ou diretório) é contado, no ledger, na colheita e no relatório", t_unreadable_subagent_files),
          ("seção 6: papel com poucos beads no --json; sessões e beads/sessão medidos (o braço é por sessão)", t_power_json_and_sessions),
          ("revisor: cabeçalho quebrado em ~80 colunas (formato real, também `cat -n`) é juntado e o custo chega ao bead", t_reviewer_wrapped_header),
-         ("transcrito que existe mas não abre = alarme + exit 6, nunca 'sumiu no meio'; ENOENT continua 'sumiu'", t_harvest_unreadable_transcript)]
+         ("transcrito que existe mas não abre = alarme + exit 6, nunca 'sumiu no meio'; ENOENT continua 'sumiu'", t_harvest_unreadable_transcript),
+         ("merge: nunca troca uma linha (de nenhum schema) por cópia mais pobre; não-comparável fica; o que sai é guardado", t_merge_never_poorer),
+         ("backfill-s3: a linha mais rica fica e o texto diz; a linha de schema antigo substituída vai para .replaced-<ts>", t_backfill_keeps_richer_row_and_saves_the_replaced),
+         ("colheita: linha de schema antigo mais rica que o transcrito local fica; a migrada sem perda é guardada", t_harvest_keeps_richer_old_schema_row),
+         ("lock do ledger: só EWOULDBLOCK/EAGAIN é contenção; ENOLCK é falha alta (harvest e backfill-s3)", t_lock_error_is_not_contention),
+         ("registro de assistente cuja linha contém \"user\" é contado, não pulado como linha de usuário", t_assistant_record_with_user_word_is_counted)]
 
 
 def run(name, fn, m):
