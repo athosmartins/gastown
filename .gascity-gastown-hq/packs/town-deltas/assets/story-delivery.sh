@@ -3847,7 +3847,8 @@ if [ "$VM_DELTA_VERDICT" = "no" ] || { [ ! -f "$VM_SCRIPT" ] && [ "$VM_HOLDING" 
     continue
   fi
   if [ "$VM_ON_BEAD" = "1" ] && [ "$DRY_RUN" != "1" ]; then
-    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
+    bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null \
+      || warn "Could not remove delivery:pending-vm from $STORY_ID — the label is stale; Step 8 tries again when the story closes (ga-2kaan2)."
   fi
   if [ "$VM_DELTA_VERDICT" = "no" ]; then
     log "VM do voicebot: nada a verificar para $STORY_ID — $VM_DELTA_WHY."
@@ -3894,17 +3895,25 @@ else
     ok)
       log "VM do voicebot em dia para $STORY_ID ($VM_DELTA_WHY): $VM_REASON"
       case "$VM_PREV_FP" in failed\|*)
-        [ "$DRY_RUN" = "1" ] || bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed" -q 2>/dev/null || true ;;
+        [ "$DRY_RUN" = "1" ] || bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed" -q 2>/dev/null \
+          || warn "Could not remove delivery:failed from $STORY_ID — the label is stale; Step 8 tries again when the story closes (ga-2kaan2)." ;;
       esac
       if [ "$VM_ON_BEAD" = "1" ]; then
         if [ "$DRY_RUN" = "1" ]; then
           log "DRY_RUN=1 — WOULD: bd label remove $STORY_ID delivery:pending-vm + comment (VM em dia)"
         else
-          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
-          bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot agora em dia (ga-2kaan2): $VM_REASON. delivery:pending-vm removido; a entrega segue para o teste de prod." 2>/dev/null || true
+          # The comment says what the removal DID: a failed one is a WARN and a comment that does
+          # not claim the label is gone (gate fix-attempt 3, ga-onxu8f — same class as the hold-add).
+          VM_RM_NOTE="delivery:pending-vm removido"
+          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || {
+            warn "Could not remove delivery:pending-vm from $STORY_ID — the label is stale; Step 8 tries again when the story closes (ga-2kaan2)."
+            VM_RM_NOTE="NÃO consegui remover delivery:pending-vm (o Step 8 tenta de novo ao fechar a story)"
+          }
+          bd -C "$STORY_STORE" comment "$STORY_ID" "VM do voicebot agora em dia (ga-2kaan2): $VM_REASON. $VM_RM_NOTE; a entrega segue para o teste de prod." 2>/dev/null || true
         fi
       fi
-      [ "$DRY_RUN" = "1" ] || rm -f "$VM_HOLD_FILE" 2>/dev/null || true
+      [ "$DRY_RUN" = "1" ] || rm -f "$VM_HOLD_FILE" 2>/dev/null \
+        || warn "Could not clear the VM hold state $VM_HOLD_FILE for $STORY_ID — a later, unrelated hold on this story would inherit its 24h clock and mailed flag; Step 8 removes it again when the story closes (ga-2kaan2)."
       ;;
     failed)
       VM_DETAIL=""
@@ -3918,11 +3927,23 @@ else
       else
         # Add the hold label BEFORE releasing delivery:running: remove-then-add leaves an
         # instant in which a janitor sweep sees neither (nothing says a delivery owns the story).
-        [ "$VM_FAILED_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:failed" -q 2>/dev/null || true
-        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-        [ "$VM_ON_BEAD" = "1" ] && bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
+        # And only a CONFIRMED hold label (the add's rc 0, or already on the bead per the Step-1
+        # snapshot) lets go of anything: a story left story:approved + gate:passed with no
+        # delivery:* label is exactly what merged-bead-janitor force-closes with story:done while
+        # the VM runs old code (gate fix-attempt 3, ga-onxu8f). Unconfirmed -> keep
+        # delivery:running (Step 1 skips a locked story until the stale ceiling, ga-015qqe, renews
+        # it), keep the opposite hold, and announce / record nothing: no comment, no nudge, no
+        # fingerprint for a hold the bead does not carry.
+        VM_HOLD_PLACED=0
+        if [ "$VM_FAILED_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:failed" -q 2>/dev/null; then
+          VM_HOLD_PLACED=1
+          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+          [ "$VM_ON_BEAD" = "1" ] && bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
+        fi
         VM_STORE_FP="$VM_PREV_FP"
-        if [ "$VM_PREV_FP" != "$VM_FP" ]; then
+        if [ "$VM_HOLD_PLACED" != "1" ]; then
+          warn "Could not write delivery:failed on $STORY_ID — keeping delivery:running as the lock (the stale ceiling, ga-015qqe, renews it); story:done stays withheld, and no comment, nudge or hold state claims a hold the bead does not carry (ga-2kaan2)."
+        elif [ "$VM_PREV_FP" != "$VM_FP" ]; then
           if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery FAILED (ga-2kaan2, VM do voicebot): este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY) e o sync da VM FALHOU.
 Status: $VM_REASON
 Saída do voicebot_vm_sync.py --status:
@@ -3960,17 +3981,26 @@ story:done SEGURADO — a VM não roda o código novo. NÃO-TERMINAL: a entrega 
       if [ "$DRY_RUN" = "1" ]; then
         log "DRY_RUN=1 — WOULD: bd label add $STORY_ID delivery:pending-vm + comment ($VM_REASON); story:done WITHHELD, re-asked next cycle (Mayor mail due: $VM_MAIL_DUE)"
       else
-        # Hold label first, then release delivery:running (see the failed branch above).
+        # Hold label first, then release delivery:running — and only when the hold label is
+        # CONFIRMED (see the failed branch above: unconfirmed keeps the lock, keeps the opposite
+        # hold, announces and records nothing).
         # VM_ON_BEAD is the Step-1 label SNAPSHOT: if the label was removed since, this add is
         # skipped and the next cycle (fresh snapshot) puts it back — a one-cycle gap, accepted on
-        # purpose: re-adding every cycle would cost a bd write per held story per sweep.
-        [ "$VM_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null || true
-        bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
-        case "$VM_PREV_FP" in failed\|*)
-          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed" -q 2>/dev/null || true ;;
-        esac
+        # purpose: re-adding every cycle would cost a bd write per held story per sweep. A label
+        # the snapshot says is there counts as confirmed; one this branch tries to write counts
+        # only if the write returned 0.
+        VM_HOLD_PLACED=0
+        if [ "$VM_ON_BEAD" = "1" ] || bd -C "$STORY_STORE" label add "$STORY_ID" "delivery:pending-vm" -q 2>/dev/null; then
+          VM_HOLD_PLACED=1
+          bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:running" -q 2>/dev/null || true
+          case "$VM_PREV_FP" in failed\|*)
+            bd -C "$STORY_STORE" label remove "$STORY_ID" "delivery:failed" -q 2>/dev/null || true ;;
+          esac
+        fi
         VM_STORE_FP="$VM_PREV_FP"
-        if [ "$VM_PREV_FP" != "$VM_FP" ]; then
+        if [ "$VM_HOLD_PLACED" != "1" ]; then
+          warn "Could not write delivery:pending-vm on $STORY_ID — keeping delivery:running as the lock (the stale ceiling, ga-015qqe, renews it); story:done stays withheld, and no comment or hold state claims a hold the bead does not carry (ga-2kaan2)."
+        elif [ "$VM_PREV_FP" != "$VM_FP" ]; then
           if bd -C "$STORY_STORE" comment "$STORY_ID" "Delivery HELD (ga-2kaan2, VM do voicebot): este merge $VM_TOUCH no que roda na VM do discador ($VM_DELTA_WHY) e a VM NÃO está provada igual ao main.
 Status: $VM_REASON
 ${VM_STDOUT:+Saída do voicebot_vm_sync.py --status:

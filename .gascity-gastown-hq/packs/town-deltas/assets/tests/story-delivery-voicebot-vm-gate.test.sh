@@ -33,6 +33,12 @@
 # standing hold — has to come out as the INERT answer (consult / hold / warn), never as the
 # harmless one ("no", "em dia", silence). Cases that pass on the previous HEAD by design are
 # controls or guards for the restructure: t4, t5b, t6, t6b, u2, w3, y3-y5, z3.
+#
+# Sections (aa)-(ab) came from gate fix-attempt 3 (ga-onxu8f), the same class once more, now at
+# the hold-label WRITE: a `label add` that fails must not let delivery:running be released, the
+# opposite hold be dropped, or a comment / nudge / state fingerprint claim a hold the bead does
+# not carry; a `label remove` that fails is a WARN, not a "removido". Controls that pass on the
+# previous HEAD by design: aa2b, aa5, aa5b, aa7, ab1b.
 
 set -u
 
@@ -87,6 +93,8 @@ reset_scenario() {
   SC_STATUS_ERR=""                   # what the contract script writes to STDERR
   SC_CLOSED_NOW=0                    # `bd show` reports the story closed (someone closed it mid-sweep)
   SC_BD_FAIL_COMMENT=0               # `bd comment` fails (rc 1)
+  SC_BD_FAIL_LABEL_ADD=0             # `bd label add` fails (rc 1) — the hold label itself cannot be written
+  SC_BD_FAIL_LABEL_REMOVE=0          # `bd label remove` fails (rc 1)
   SC_GC_FAIL_MAIL=0                  # `gc mail send` fails (rc 1)
   SC_BREAK_STATE_DIR=0               # the hold-state directory cannot be created
 }
@@ -172,6 +180,8 @@ PYEOF
       return 0
     fi
     if [ "$SC_BD_FAIL_COMMENT" = "1" ] && [ "${3:-}" = "comment" ]; then return 1; fi
+    if [ "$SC_BD_FAIL_LABEL_ADD" = "1" ] && [ "${3:-}" = "label" ] && [ "${4:-}" = "add" ]; then return 1; fi
+    if [ "$SC_BD_FAIL_LABEL_REMOVE" = "1" ] && [ "${3:-}" = "label" ] && [ "${4:-}" = "remove" ]; then return 1; fi
     return 0
   }
   gc()   {
@@ -773,6 +783,132 @@ reset_scenario; new_city
 SC_SCRIPT_PRESENT=0
 run_block
 has "$BD_CALLS" "possivelmente a wa-y0su67" && ok "z4 the contract-absent comment hedges its cause ('possivelmente a wa-y0su67 ainda não entrou no main')" || nok "z4 cause stated as fact" "$BD_CALLS"
+
+# ── (aa) a hold label that was NOT written must not release delivery:running ──
+# Gate fix-attempt 3 (ga-onxu8f), blocking 1 — the same class (root-class:error-vs-empty), one
+# level up: the hold-label WRITE itself. Both hold branches ran `label add <hold> || true` and
+# then removed delivery:running unconditionally, stored the hold in the state file and (pending)
+# commented "o label delivery:pending-vm fica no bead". With the add failing, the story was left
+# story:approved + gate:passed with NO delivery:* label at all — which is exactly what
+# merged-bead-janitor reads as done:commit-in-origin-main, and force-closes with story:done
+# while the VM runs old code. The cases above only ever failed `bd comment`, never `label add`.
+# Rule under test: delivery:running is the lock until a hold label is CONFIRMED; nothing
+# downstream (lock release, opposite-label removal, comment, nudge, state fingerprint) behaves as
+# if the hold existed. Controls that pass on the previous HEAD by design: aa2b, aa5, aa5b, aa7
+# (mail count and mailed flag — not the lock line aa7b).
+echo "(aa) hold label add FAILS -> delivery:running stays as the lock, and nothing claims a hold that does not exist"
+lock_released() { has "$BD_CALLS" "label remove ga-test delivery:running"; }
+state_fp()      { printf '%s\n' "$STATE_AFTER" | sed -n 's/^fp=//p' | head -n 1; }
+state_since()   { printf '%s\n' "$STATE_AFTER" | sed -n 's/^since=//p' | head -n 1; }
+reset_scenario; new_city
+SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+[ "$RUN_RC" -eq 0 ] && held && ok "aa1 pending + label add failing: the block survives and the story is still held" || nok "aa1 rc/held" "rc=$RUN_RC $VARS_OUT out=[$BLOCK_OUT]"
+pending_label && ok "aa1 (precondition) the add of delivery:pending-vm WAS attempted" || nok "aa1 the add was never attempted — the stub proves nothing" "$BD_CALLS"
+lock_released && nok "aa1 delivery:running REMOVED although delivery:pending-vm was never written — the story is left with no delivery:* label (the janitor force-closes it)" "$BD_CALLS" || ok "aa1 delivery:running NOT removed: it stays as the lock"
+has "$LOG_OUT" "WARN: Could not write delivery:pending-vm on ga-test" && has "$LOG_OUT" "keeping delivery:running as the lock" && ok "aa1 a WARN says the hold label could not be written and the lock is kept" || nok "aa1 the failed hold-label write is silent" "$LOG_OUT"
+done_written && nok "aa1 story:done / close written" "$BD_CALLS" || ok "aa1 no story:done and no close"
+[ "$(count_of "$BD_CALLS" "Delivery HELD")" = "0" ] && ok "aa2 no 'Delivery HELD' comment (it says the label stays on the bead — it was never written)" || nok "aa2 commented a hold the bead does not carry" "$BD_CALLS"
+case "$(state_fp)" in pending\|*) nok "aa2 the state file records fp=pending for a hold that was never placed" "$STATE_AFTER" ;; *) ok "aa2 the state file does not record the hold as placed" ;; esac
+case "$(state_since)" in ''|*[!0-9]*) nok "aa2b (control) since is not persisted — the 24h clock would restart" "$STATE_AFTER" ;; *) ok "aa2b (control) since IS persisted: the 24h clock keeps running while the label cannot be written" ;; esac
+
+reset_scenario; new_city
+SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5 não bate"
+run_block
+[ "$RUN_RC" -eq 0 ] && held && failed_label && ok "aa3 failed + label add failing: held, the add of delivery:failed WAS attempted" || nok "aa3 rc/held/attempt" "rc=$RUN_RC $VARS_OUT $BD_CALLS"
+lock_released && nok "aa3 delivery:running REMOVED although delivery:failed was never written" "$BD_CALLS" || ok "aa3 delivery:running NOT removed"
+has "$LOG_OUT" "WARN: Could not write delivery:failed on ga-test" && has "$LOG_OUT" "keeping delivery:running as the lock" && ok "aa3 a WARN says delivery:failed could not be written and the lock is kept" || nok "aa3 the failed hold-label write is silent" "$LOG_OUT"
+[ "$(count_of "$BD_CALLS" "Delivery FAILED")" = "0" ] && ! has "$GC_CALLS" "session nudge" && ok "aa3 no 'Delivery FAILED' comment and nobody nudged about a hold that does not exist" || nok "aa3 announced a hold the bead does not carry" "$BD_CALLS / $GC_CALLS"
+case "$(state_fp)" in failed\|*) nok "aa3 the state file records fp=failed for a hold that was never placed" "$STATE_AFTER" ;; *) ok "aa3 the state file does not record the failed hold as placed" ;; esac
+
+# The opposite hold stays while the new one cannot be written: dropping it would again leave
+# the story with no delivery:* label.
+reset_scenario; new_city
+SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+SC_LABELS="delivery:pending-vm"; SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5 não bate"
+run_block
+has "$BD_CALLS" "label remove ga-test delivery:pending-vm" && nok "aa4 pending -> failed with the add failing: delivery:pending-vm REMOVED (no hold label left)" "$BD_CALLS" || ok "aa4 pending -> failed, add failing: delivery:pending-vm kept"
+lock_released && nok "aa4 pending -> failed, add failing: delivery:running released" "$BD_CALLS" || ok "aa4 pending -> failed, add failing: delivery:running kept"
+reset_scenario; new_city
+SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5 não bate"
+run_block
+SC_LABELS="delivery:failed"; SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+has "$BD_CALLS" "label remove ga-test delivery:failed" && nok "aa4b failed -> pending with the add failing: delivery:failed REMOVED (no hold label left)" "$BD_CALLS" || ok "aa4b failed -> pending, add failing: delivery:failed kept"
+lock_released && nok "aa4b failed -> pending, add failing: delivery:running released" "$BD_CALLS" || ok "aa4b failed -> pending, add failing: delivery:running kept"
+
+# Controls (pass on HEAD too): when the hold label is ALREADY on the bead the add is not
+# attempted (i1 pins that), so a failing `label add` cannot matter and the lock is released.
+reset_scenario; new_city
+SC_LABELS="delivery:pending-vm"; SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+held && lock_released && ! pending_label && ok "aa5 (control) pending-vm already on the bead: no add attempted, the lock is released as before" || nok "aa5 a hold already on the bead was treated as unplaced" "$VARS_OUT / $BD_CALLS"
+has "$LOG_OUT" "Could not write" && nok "aa5 a WARN about an add that was never attempted" "$LOG_OUT" || ok "aa5 no WARN for an add that was never attempted"
+reset_scenario; new_city
+SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5 não bate"
+run_block
+SC_LABELS="delivery:failed"; SC_BD_FAIL_LABEL_ADD=1
+run_block
+held && lock_released && ! failed_label && ok "aa5b (control) delivery:failed already on the bead: no add attempted, the lock is released as before" || nok "aa5b a failed hold already on the bead was treated as unplaced" "$VARS_OUT / $BD_CALLS"
+
+# Recovery: the cycle after the failure has a fresh snapshot, places the label, releases the
+# lock — and, because the failed cycle stored no fingerprint, posts the comment it never posted.
+reset_scenario; new_city
+SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+h1="$(count_of "$BD_CALLS" "Delivery HELD")"
+SC_BD_FAIL_LABEL_ADD=0
+run_block
+h2="$(count_of "$BD_CALLS" "Delivery HELD")"
+held && pending_label && lock_released && [ "$h1" = "0" ] && [ "$h2" = "1" ] \
+  && ok "aa6 next cycle (add works): label written, lock released, the hold is announced exactly once (0 then 1)" \
+  || nok "aa6 recovery after a failed hold-label write: comments $h1 then $h2" "$VARS_OUT / $BD_CALLS"
+
+# Control (passes on HEAD too): the >24h Mayor mail does not depend on the label write — a VM
+# unproven for a day is exactly when bd is most likely to be sick, and the mail is what catches it.
+reset_scenario; new_city
+mkdir -p "$CITY/.gc/runtime/voicebot-vm-hold"
+printf 'fp=\nsince=%s\nmailed=0\n' "$(( $(date +%s) - 90000 ))" > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"
+SC_BD_FAIL_LABEL_ADD=1; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — ligação em curso"
+run_block
+[ "$(count_of "$GC_CALLS" "mail send mayor")" = "1" ] && ok "aa7 (control) pending > 24h with the add failing: the Mayor is still mailed exactly once" || nok "aa7 mail count" "$GC_CALLS"
+[ "$(printf '%s\n' "$(cat "$STATE_FILE_ABS" 2>/dev/null)" | sed -n 's/^mailed=//p' | head -n 1)" = "1" ] && ok "aa7 (control) the mailed flag is persisted (no second mail next cycle)" || nok "aa7 mailed flag not stored" "$STATE_AFTER"
+lock_released && nok "aa7b >24h + add failing: delivery:running released" "$BD_CALLS" || ok "aa7b >24h + add failing: delivery:running kept"
+
+# ── (ab) a hold label that could not be REMOVED is said, not claimed ──
+# Same class on the release side: `label remove ... || true` and then a comment saying
+# "delivery:pending-vm removido". The story still proceeds (the VM IS em dia, and Step 8 sweeps
+# the label again — r1), but nothing may say the label is gone when it is not, and the failure
+# is a WARN, not silence.
+echo "(ab) a failed removal of a hold label is a WARN and the comment does not claim it"
+reset_scenario; new_city
+SC_LABELS="delivery:pending-vm"; SC_BD_FAIL_LABEL_REMOVE=1
+run_block
+reached && ok "ab1 em dia + removal failing: the story still proceeds (the VM is proven)" || nok "ab1 held on a proven VM" "$VARS_OUT"
+has "$LOG_OUT" "WARN: Could not remove delivery:pending-vm from ga-test" && ok "ab1 the failed removal is a WARN" || nok "ab1 the failed removal is silent" "$LOG_OUT"
+has "$BD_CALLS" "delivery:pending-vm removido" && nok "ab1 the comment says delivery:pending-vm was removed — it was not" "$BD_CALLS" || ok "ab1 the comment does not claim a removal that failed"
+reset_scenario; new_city
+SC_LABELS="delivery:pending-vm"
+run_block
+has "$BD_CALLS" "delivery:pending-vm removido" && ok "ab1b (control) removal OK: the comment still says delivery:pending-vm removido" || nok "ab1b the success comment lost its claim" "$BD_CALLS"
+reset_scenario; new_city
+SC_STATUS_RC=20; SC_STATUS_OUT="STATUS: falhou — md5 não bate"
+run_block
+SC_LABELS="delivery:failed"; SC_BD_FAIL_LABEL_REMOVE=1; SC_STATUS_RC=0; SC_STATUS_OUT="STATUS: em dia — md5 igual na VM"
+run_block
+reached && has "$LOG_OUT" "WARN: Could not remove delivery:failed from ga-test" && ok "ab2 failed -> em dia with the removal failing: proceeds, and the stale delivery:failed is a WARN" || nok "ab2 stale delivery:failed left in silence" "$VARS_OUT / $LOG_OUT"
+reset_scenario; new_city
+SC_FILES="docs/x.md"; SC_LABELS="delivery:pending-vm"; SC_BD_FAIL_LABEL_REMOVE=1
+run_block
+reached && has "$LOG_OUT" "WARN: Could not remove delivery:pending-vm from ga-test" && ok "ab3 delta clean + stale pending-vm + removal failing: proceeds, and the stale label is a WARN" || nok "ab3 stale pending-vm left in silence" "$VARS_OUT / $LOG_OUT"
+# The hold STATE is the third thing a finished hold leaves behind: if clearing it fails, a later
+# unrelated hold on the same story inherits the old `since` (24h mail fires at once) and `mailed`.
+# A directory where the state file should be makes `rm -f` fail for real.
+reset_scenario; new_city
+mkdir -p "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state"; : > "$CITY/.gc/runtime/voicebot-vm-hold/ga-test.state/keep"
+run_block
+reached && has "$LOG_OUT" "WARN: Could not clear the VM hold state" && ok "ab4 em dia + the hold state cannot be cleared: proceeds, and the leftover state is a WARN" || nok "ab4 a state file that could not be cleared is silent" "$VARS_OUT / $LOG_OUT"
 
 # ── (j) dry-run writes nothing ──
 echo "(j) DRY_RUN=1: reads the status, writes nothing"
