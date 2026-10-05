@@ -402,6 +402,21 @@ if [ -z "${SELFTEST_ABORT_PROBE:-}" ]; then
   else
     bad "the outside-the-step abort probe did not apply (section-3 marker moved?) — stale-stderr attribution is unproven"
   fi
+  # 7d. "the step wrote nothing" is a claim about a file the lib has to be able to READ. The probe opens a
+  # step, removes $ERR_F and dies on an unset variable: the lib cannot know what the step wrote, and must
+  # say so instead of reporting an empty stderr.
+  if run_probe "selftest_step_begin; rm -f \"\$ERR_F\"; : \"\$ABORT_PROBE_NOFILE\""; then
+    [ "$PROBE_RC" -ne 0 ] && ok "an abort inside a step whose stderr file is gone also exits NON-ZERO (rc=$PROBE_RC)" \
+      || bad "an abort inside a step whose stderr file is gone exited 0 — it reads as green"
+    ! grep -q 'written nothing' "$WORK_DIR/probe.err" \
+      && ok "a missing stderr file is NOT reported as 'the step wrote nothing'" \
+      || bad "a missing stderr file was reported as an empty stderr: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'does not exist, so what that step wrote to stderr is unknown' "$WORK_DIR/probe.err" \
+      && ok "…it says the stderr of the step is UNKNOWN" \
+      || bad "the report does not say the step's stderr is unknown: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the missing-stderr-file abort probe did not apply (section-3 marker moved?) — the empty-vs-missing distinction is unproven"
+  fi
   # 7b. the guard must not disturb a run that DOES reach its summary: an ordinary failing
   # assertion stays exit 1 + RESULT: FAIL, and is not mislabelled as an abort.
   if run_probe 'bad "probe: forced failure"' skip; then

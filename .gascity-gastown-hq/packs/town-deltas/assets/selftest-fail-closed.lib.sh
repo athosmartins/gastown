@@ -24,8 +24,9 @@
 #      inside the step that owns that file (selftest_step_begin/_end). The file keeps its
 #      content after the step returns, and the lib cannot tell from the file alone WHICH
 #      step wrote it — printing it unconditionally pointed the reader at the wrong step.
-#      The report says which case it is: inside a declared step (shows that step's stderr) /
-#      not inside one (says the file is not the cause and shows nothing) / the selftest sets no
+#      The report says which case it is: inside a declared step (shows that step's stderr; says
+#      so when the file is empty, and says it is unknown when the file is gone) / not inside one
+#      (says the file is not the cause and shows nothing) / the selftest sets no
 #      $SELFTEST_ERR_FILE (says nothing about any file).
 #
 # WHY THIS LIVES IN ITS OWN FILE and not inside the selftest: the quality gate's base-commit
@@ -84,8 +85,11 @@ _selftest_fail_closed_on_exit() {
           if [ -s "$SELFTEST_ERR_FILE" ]; then
             echo "  the abort happened INSIDE a captured step; that step's stderr:"
             sed 's/^/    /' "$SELFTEST_ERR_FILE"
-          else
+          elif [ -e "$SELFTEST_ERR_FILE" ]; then
             echo "  the abort happened INSIDE a captured step, which had written nothing to its stderr."
+          else
+            # -s is false for an empty file AND for a missing one; only the first is "wrote nothing".
+            echo "  the abort happened INSIDE a captured step, but $SELFTEST_ERR_FILE does not exist, so what that step wrote to stderr is unknown."
           fi
         else
           echo "  the abort did NOT happen inside a captured step (selftest_step_begin/_end): $SELFTEST_ERR_FILE is not shown, because anything in it predates the abort — look at the lines above."
