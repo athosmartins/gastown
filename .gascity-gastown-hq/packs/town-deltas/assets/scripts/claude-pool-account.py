@@ -440,10 +440,14 @@ def decide(st: dict, accts: List[Tuple[str, str]], user: str, t: float) -> None:
         # really renewed, its 429 sends us right back through the branch above.
         recovered = [e for e, v in st.get("exhausted", {}).items() if v.get("reset_epoch", math.inf) <= t and e in by_email]
         best = next((e for e in order if e in recovered), None)
+        kept = None
         if best and order.index(best) < order.index(cur):
-            switch_to(st, user, best, by_email[best], f"failback: {best} reached its stored reset time", t)
+            if not switch_to(st, user, best, by_email[best], f"failback: {best} reached its stored reset time", t):
+                kept = best   # the write failed: the failback did NOT happen, so it must be tried again next run
+                log("WARN", f"failback to {best} not done (the pool item could not be switched) - kept for the next run")
         for e in recovered:
-            st.get("exhausted", {}).pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
+            if e != kept:
+                st.get("exhausted", {}).pop(e, None)   # judged now; a later rejection re-registers it with a fresh time
     cur = st.get("current")
     if cur in by_email:
         heal_item(st, user, by_email[cur], cur)

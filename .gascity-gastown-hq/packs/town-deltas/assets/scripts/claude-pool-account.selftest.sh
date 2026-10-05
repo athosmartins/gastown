@@ -142,7 +142,8 @@ run_cmd() {
   local sub="$1" svc="" hex="" w=0; shift
   while [ $# -gt 0 ]; do case "$1" in -s) svc="$2"; shift ;; -X) hex="$2"; shift ;; -w) w=1 ;; esac; shift; done
   case "$sub" in
-    add-generic-password) [ -n "$svc" ] && [ -n "$hex" ] || return 1
+    add-generic-password) [ -e "$KC/refuse-writes" ] && { echo "security: write refused (selftest)" >&2; return 1; }
+                          [ -n "$svc" ] && [ -n "$hex" ] || return 1
                           printf '%s' "$hex" > "$KC/items/$svc"; echo "WRITE $svc" >> "$KC/writes.log" ;;
     find-generic-password) [ -e "$KC/locked" ] && { echo "security: User interaction is not allowed." >&2; return 36; }
                            [ -e "$KC/items/$svc" ] || { echo "security: The specified item could not be found in the keychain." >&2; return 44; }
@@ -446,6 +447,20 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   seeded; echo 'not json {' > "$STATE"; run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(ls "$D"/current.json.corrupt.* 2>/dev/null)" ] \
     && ok "B26 corrupt state -> moved to current.json.corrupt.*, decision re-seeded" || bad "B26 rc=$rc current='$(jget "$STATE" current)' aside='$(ls "$D" | tr '\n' ' ')'"
+
+  # B28 a failback whose Keychain write is REFUSED is not a failback that happened: the pool stays on b, a stays in the
+  # exhausted registry, and the next run (write allowed again) completes the failback. Dropping a from the registry on a
+  # failed write would lose the failback for good - the pool would sit on the later-renewing account until b is rejected.
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once        # now on b, a exhausted until 2000000000
+  [ "$(jget "$STATE" current)" = "b@t.test" ] || bad "B28 precondition: failover to b did not happen"
+  set_srv a@t.test 200 "$HDR_OK"; touch "$D/kc/refuse-writes"; w0=$(writes)
+  NOW_OVERRIDE=2000000100 run_d -- run-once; rc=$?
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$w0" ] \
+    && ok "B28a refused write -> the pool stays on b (decision and item unchanged)" || bad "B28a rc=$rc current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
+  [ -n "$(jex a@t.test reset_epoch)" ] && ok "B28b ...and a is still registered as exhausted, so the failback is retried" || bad "B28b a was dropped from the registry although the failback did not happen"
+  rm -f "$D/kc/refuse-writes"; NOW_OVERRIDE=2000000200 run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] \
+    && ok "B28c next run, write allowed -> the failback to a completes" || bad "B28c current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24)"
 
   # B24 the log itself withholds a token-shaped message (defence in depth: a future f-string that interpolates a token)
   new_d
