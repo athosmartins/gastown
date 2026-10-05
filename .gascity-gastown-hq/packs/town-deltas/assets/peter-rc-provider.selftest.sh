@@ -15,8 +15,9 @@
 # (same convention as mcp-strict-headless-provider.selftest.sh — `gc config show` resolution
 # needs untracked local state such as .gc/site.toml that a clean checkout does not have):
 #   1. [providers.claude-rc] exists, is built on builtin:claude and adds --remote-control;
-#   2. it adds exactly --remote-control + --model opus (ga-n56ase: crews run Opus 5.5), no MCP/settings/effort flags;
-#   3. peter-wa uses it, and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
+#   2. claude-rc adds exactly --remote-control + --model opus (the Mayor's), and claude-rc-crew adds exactly
+#      --remote-control + --model sonnet (Athos 2026-10-05: crews on Sonnet; supersedes ga-n56ase), no other flags;
+#   3. peter-wa uses claude-rc-crew, and its on-demand steady state (ga-3g2rjo, 2026-09-22: no
 #      committed suspended=true -- the never-gets-a-bead dispatch-safety guarantee
 #      now lives independently in pilot-dispatcher.sh's _crew_is_suspended, see its
 #      own selftest Scenario 22e) leaves its session caps unchanged;
@@ -61,10 +62,17 @@ if [ "$(args_of claude-rc)" = 'args_append = ["--remote-control", "--model", "op
 else
   bad "claude-rc.args_append is not exactly [--remote-control, --model, opus]: $(args_of claude-rc)"
 fi
+# Athos 2026-10-05: "pra todos nossos crew members, o modelo default é Sonnet" — crews moved to their own
+# provider, same RC launch with the CLI's "sonnet" alias. Exact match, same reason as above.
+if [ "$(args_of claude-rc-crew)" = 'args_append = ["--remote-control", "--model", "sonnet"]' ]; then
+  ok "claude-rc-crew.args_append is exactly RC + --model sonnet"
+else
+  bad "claude-rc-crew.args_append is not exactly [--remote-control, --model, sonnet]: $(args_of claude-rc-crew)"
+fi
 
 echo "── 3. peter-wa uses it and stays in its on-demand steady state (ga-3g2rjo) ──"
-grep -q '^provider = "claude-rc"$' "$PETER_TOML" \
-  && ok "peter-wa provider = claude-rc" || bad "peter-wa does not use provider claude-rc"
+grep -q '^provider = "claude-rc-crew"$' "$PETER_TOML" \
+  && ok "peter-wa provider = claude-rc-crew" || bad "peter-wa does not use provider claude-rc-crew"
 if grep -q '^suspended[[:space:]]*=[[:space:]]*true$' "$PETER_TOML"; then
   bad "peter-wa still commits 'suspended = true' -- ga-3g2rjo made on-demand access (no committed suspension) the steady state; the never-gets-a-bead guarantee now lives independently in pilot-dispatcher.sh's _crew_is_suspended (see its own selftest, Scenario 22e), so this line is expected to stay removed"
 else
@@ -87,11 +95,11 @@ fi
 # ga-mrfgaw (Athos 2026-09-28): RC widened from peter-wa alone to the Mayor + ALL named crews.
 # Still an exact set, so a pool/autonomous role landing on claude-rc fails here.
 EXPECTED_RC_CREWS="batista-lx batista-ps batista-wa digo-wa mila-ma mila-wa oracle-wa peter-wa thies-ps thies-wa "
-users="$(grep -l '^provider = "claude-rc"$' "$AGENTS_DIR"/*/agent.toml 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null | sort | tr '\n' ' ' || true)"
+users="$(grep -l '^provider = "claude-rc-crew"$' "$AGENTS_DIR"/*/agent.toml 2>/dev/null | xargs -n1 dirname 2>/dev/null | xargs -n1 basename 2>/dev/null | sort | tr '\n' ' ' || true)"
 if [ "$users" = "$EXPECTED_RC_CREWS" ]; then
-  ok "claude-rc users are exactly the named crews"
+  ok "claude-rc-crew users are exactly the named crews"
 else
-  bad "unexpected claude-rc users: '${users:-none}' (expected '$EXPECTED_RC_CREWS')"
+  bad "unexpected claude-rc-crew users: '${users:-none}' (expected '$EXPECTED_RC_CREWS')"
 fi
 # Which [[patches.agent]] blocks move an agent onto claude-rc: only gastown.mayor may.
 patched="$(awk '/^\[\[patches\.agent\]\]$/{n=""} /^\[/ && !/^\[\[patches\.agent\]\]$/{n=""} /^name = /{n=$3} /^provider *= *"claude-rc"/{print n}' "$CITY_TOML" | tr -d '"' | sort | tr '\n' ' ')"

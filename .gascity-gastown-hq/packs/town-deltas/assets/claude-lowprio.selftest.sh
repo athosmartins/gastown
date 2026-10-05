@@ -247,7 +247,7 @@ fi
 block claude-headless | grep '^base = "builtin:claude"$' >/dev/null \
   && ok "claude-headless is still built on builtin:claude (process names, resume, hooks inherited)" || bad "claude-headless lost base = builtin:claude"
 
-for p in claude claude-rc; do
+for p in claude claude-rc claude-rc-crew; do
   if [ -n "$(key_of $p command)" ] || [ -n "$(key_of $p path_check)" ]; then
     bad "[providers.$p] sets command/path_check — the Mayor and named crews must stay at NORMAL priority (interactive)"
   else

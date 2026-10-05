@@ -20,11 +20,19 @@ ready_delay_ms = 0
 # Pinned HERE with the claude CLI's own "opus" alias (latest Opus = Opus 5.5 today) instead of
 # relying on ~/.claude/settings.json's global model. NOT via option_defaults.model: the engine's
 # builtin "opus" choice maps to `--model claude-opus-4-8` (checked in gc-1.1.1-engwin0919), which
-# would silently DOWNGRADE every crew. claude-rc is used by the Mayor + the 10 named crews only;
-# the Mayor already ran Opus 5.5, so this is a no-op for it.
+# would silently DOWNGRADE every crew. Since 2026-10-05 claude-rc is the MAYOR's only (Opus); the 10 named
+# crews moved to claude-rc-crew (Sonnet) below.
 [providers.claude-rc]
 base = "builtin:claude"
 args_append = ["--remote-control", "--model", "opus"]
+ready_delay_ms = 0
+# Athos, 2026-10-05 (Mayor session, direct instruction): "pra todos nossos crew members, o modelo
+# default é Sonnet e effort level high. pro mayor, opus com effort high". Supersedes ga-n56ase (crews on
+# Opus 5.5 + medium). claude-rc above stays Opus and is now used by the Mayor only; every named crew
+# moved to this provider (same remote-control launch, Sonnet = the CLI's "sonnet" alias, latest Sonnet).
+[providers.claude-rc-crew]
+base = "builtin:claude"
+args_append = ["--remote-control", "--model", "sonnet"]
 ready_delay_ms = 0
 [providers.claude-headless]
 base = "builtin:claude"
@@ -547,8 +555,8 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp-firecrawl"
 #           whose recall is the gate's whole value);
 #   high  — triage/refinement roles (refino and context-check reviewers,
 #           auto-refiner): Sonnet 5's own default, recommended for most work.
-# Crews set their own effort in agent.toml: "medium" by Athos's mandate
-# (ga-n56ase, 2026-09-28 — Opus 5.5's own default). Suspended roles (boot, deacon) and the
+# Crews set their own effort in agent.toml: "high" by Athos's mandate of 2026-10-05
+# (was "medium" under ga-n56ase, 2026-09-28). The Mayor is "high" by the same instruction. Suspended roles (boot, deacon) and the
 # unused per-rig witness/refinery/polecat are left alone on purpose.
 # Takes effect on each session's NEXT launch; the post-merge soft reload
 # (ga-hawi) keeps running sessions from being drained over the new hash.
@@ -557,7 +565,7 @@ overlay_dir = "packs/town-deltas/assets/claude-overlays/longlived-cdp-firecrawl"
 [[patches.agent]]
 dir = ""
 name = "gastown.mayor"
-option_defaults = { effort = "xhigh" }
+option_defaults = { effort = "high" }  # Athos 2026-10-05: "pro mayor, opus com effort high"
 
 [[patches.agent]]
 dir = ""
