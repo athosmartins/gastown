@@ -24,7 +24,7 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -f "$WRAPPER" ] || { echo "FATAL: wrapper not found at $WRAPPER"; exit 1; }
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/claude-pool-account-selftest.XXXXXX")"
-cleanup() { rm -rf "$W"; }
+cleanup() { chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }   # B50 makes a directory read-only: undo it if the run is interrupted there
 trap cleanup EXIT
 
 field() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
@@ -971,11 +971,11 @@ EOF
   got="$(env -i HOME="$D/home" PATH="$BB:/usr/bin:/bin" FAKE_KC="$D/kc" "$PY3" - "$DAEMON" <<'EOF' 2>&1
 import importlib.util, sys
 sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
-m.item_service = lambda: "Claude Code-credentials"           # Mayor's / the crews' item
+m.item_service = lambda: "Claude Code-credentials"           # the default item, owned by Mayor and the crews
 r1 = m.write_item("athos", "sk-ant-oat01-NEVERWRITTEN")
 m.item_service = lambda: "Claude Code-credentials-0123abcz"   # a suffix, but not 8 hex
 r2 = m.write_item("athos", "sk-ant-oat01-NEVERWRITTEN")
-m.item_service = lambda: "Claude Code-credentials-0123abcd"   # the pool's shape: the guard is not a blanket refusal
+m.item_service = lambda: "Claude Code-credentials-0123abcd"   # a name in the pool shape: the guard is not a blanket refusal
 r3 = m.write_item("athos", "sk-ant-oat01-ALLOWED")
 print("RESULT", r1, r2, r3)
 EOF
@@ -983,6 +983,34 @@ EOF
   [ "$(printf '%s' "$got" | tail -n 1)" = "RESULT False False True" ] && [ "$(ls "$D/kc/items")" = "Claude Code-credentials-0123abcd" ] && [ "$(wc -l < "$D/kc/argv.log" | tr -d ' ')" = "1" ] \
     && ok "B49b write_item refuses the default item and any non-8-hex name (security never called for them), and still writes a pool-shaped one" \
     || bad "B49b $(printf '%s' "$got" | tail -n 3 | tr '\n' '|') items='$(ls "$D/kc/items" | tr '\n' '|')' argv-lines=$(wc -l < "$D/kc/argv.log" 2>/dev/null)"
+
+  # B50 the decision cannot be PUBLISHED (full disk, a read-only state dir). decide() has already run, so the pool item may already hold
+  # the new account while the file the WhatsApp services read still names the old one. Exit 1 either way, but the log must say WHICH:
+  # a bare 'unhandled PermissionError' reads as 'nothing happened' (gate ga-aozw8x). $D holds the state file's directory, and the
+  # temp file for the atomic replace is created there, so a read-only $D is exactly 'the state cannot be written'.
+  ro_state_run() { # ro_state_run  -> runs the daemon with the state dir read-only; sets rc; prints nothing; skips (rc=skip) if that is not enforceable (root)
+    : > "$LOG"; chmod a-w "$D"
+    if ( : > "$D/.rotest" ) 2>/dev/null; then rm -f "$D/.rotest"; chmod u+w "$D"; rc=skip; return 0; fi
+    run_d -- run-once; rc=$?; chmod u+w "$D"
+  }
+  seeded; set_srv a@t.test 429 "$(hdr_rejected five_hour 2000000000)"; ro_state_run
+  if [ "$rc" = "skip" ]; then echo "  - B50 skipped: cannot make the state dir read-only for this user (root?)"
+  else
+    [ "$rc" = "1" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] \
+      && ok "B50 publish fails after the failover: exit 1, the item holds b, the published decision still says a" \
+      || bad "B50 rc=$rc item=$(item_token | cut -c1-24) published current='$(jget "$STATE" current)'"
+    grep -qF "decision NOT published (PermissionError) but the pool item was switched to b@t.test fp=$(fp_of "$TOKEN_b")" "$LOG" \
+      && ok "B50b the log says the pool item WAS switched (to whom, which fingerprint) and that the decision file disagrees" \
+      || bad "B50b log: $(tail -n 3 "$LOG" | tr '\n' '|')"
+    grep -qF "$TOKEN_b" "$LOG" && bad "B50c a token reached the log" || ok "B50c no token in that log"
+    # the other branch: the run only recorded exhausted accounts and moved nothing - the line must not claim a switch
+    seeded; set_srv a@t.test 429 "$(hdr_rejected five_hour 2000000000)"; set_srv b@t.test 429 "$(hdr_rejected five_hour 2000000000)"
+    set_srv c@t.test 429 "$(hdr_rejected five_hour 2000000000)"; ro_state_run
+    [ "$rc" = "1" ] && [ "$(item_token)" = "$TOKEN_a" ] \
+      && ok "B50d publish fails on a run that moved nothing: exit 1, the item still holds a" || bad "B50d rc=$rc item=$(item_token | cut -c1-24)"
+    grep -qF "decision NOT published (PermissionError); this run did not move the pool item to another account" "$LOG" && ! grep -q "was switched to" "$LOG" \
+      && ok "B50e ...and the log does not claim a switch" || bad "B50e log: $(tail -n 3 "$LOG" | tr '\n' '|')"
+  fi
 
   # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
   # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).

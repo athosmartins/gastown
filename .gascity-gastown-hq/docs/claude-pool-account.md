@@ -165,10 +165,24 @@ first, delete last, and only when restarting the pool is acceptable.
 (`accounts library not found …` / `failed to import …`) and exits 0 having decided nothing, so `launchctl list` shows the
 same `0` as for a healthy run. Only the log tells them apart; a liveness signal that does not depend on reading it is
 ga-8hcnvb.3.
-`1` = **refused or failed**: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken, the lock file
-cannot be opened, the login name is not a plain name (`USER` is also read from the passwd database when launchd
-gives none), or the state file exists but cannot be read. In every `1` case nothing was probed or written. A state
-file that is not a JSON object (or is not UTF-8 text, or is nested too deep to parse) is moved to
+`1` = **refused or failed**. Two different things share this code, and the log tells them apart:
+
+- *Refused* before the run started any work: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken,
+  the lock file cannot be opened, the lock call fails for a reason other than another run holding it (that is the quiet
+  `0`), the login name is not a plain name (`USER` is also read from the passwd database when launchd gives none), or
+  the state file exists but cannot be read. In these refusals nothing was probed or written.
+- *Failed* after the run had started, and **here the pool may already have moved**:
+  - the decision could not be published (the state directory is full or not writable). The Keychain item is written
+    before the decision file is, so the run may have switched the pool while the file the WhatsApp services read still
+    names the account just left. The log says which: `decision NOT published (<ExcType>) but the pool item was switched
+    to <email> fp=<fp>; the decision file and the item disagree until a run publishes`, or, when the run moved nothing,
+    `decision NOT published (<ExcType>); this run did not move the pool item to another account`. The next run that can
+    publish brings the two back together: it repeats the switch (the item write is idempotent), or, if the old account
+    answers again, heals the item back to the decision.
+  - any other unexpected exception: `ERROR unhandled <ExcType> in run-once`. It can come from any point of the run, so
+    exit `1` with this line does **not** mean nothing happened; read the log lines before it.
+
+A state file that is not a JSON object (or is not UTF-8 text, or is nested too deep to parse) is moved to
 `claude_pool_current_account.json.corrupt.<epoch>` and the daemon starts from empty. Inside a readable state, what
 cannot be trusted is dropped, never defaulted: an `exhausted` that is not an object (`null` included — present-but-null
 is not the same as absent), an entry without a usable `reset_epoch` (missing, null, not a number, non-finite, outside

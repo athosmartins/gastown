@@ -6,7 +6,10 @@
 #
 # SAFE BY CONSTRUCTION: every Keychain item is a throwaway named for a scratch dir ("Claude Code-credentials-<h>",
 # refused unless it is neither the production login item nor the production pool item); production state, the
-# production pool item and ~/.claude are never written. Tokens never reach argv, ps, a log or the screen.
+# production pool item and ~/.claude are never written. Tokens never reach argv, ps, a log, a file or the screen: this script
+# holds them only in shell variables (read from the vault, hashed with the `printf` builtin), the daemon reads them from the
+# vault itself and writes them to the scratch Keychain item, and the mock API is keyed by the 8-hex fingerprint, so the real
+# tokens are not in mock.json either.
 #
 # IDENTITY ORACLE: OK  = terrenos.incorporacoes@ (0% used, answers).
 #                  EXH = athosb85@ (weekly limit hit until 2026-10-07 ~22:00Z; can only answer with the limit
@@ -19,6 +22,7 @@
 #   P3  one LIVE interactive session, one pid, no restart: OK -> daemon failover -> EXH (limit error, ~40 s) ->
 #       daemon failback -> OK, and the conversation is still there ("what was the first thing I asked?" -> ALPHA).
 set -u
+umask 077   # whatever this script writes under $HOME is for this user only (the scratch dir is 0700 already; the files in it too)
 SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON="${DAEMON:-$SD/claude-pool-account.py}"
 LOWPRIO="$SD/claude-lowprio.sh"
@@ -98,13 +102,14 @@ printf '%s' "$out" | grep -q "WRAPOK" && ok "P2c NO pool item -> claude still st
 # ── P3: live interactive session across daemon-driven switches ─────────────────────────────────────
 echo; echo "== P3  ONE live session: OK -> (daemon failover) -> EXH -> (daemon failback) -> OK, no restart"
 cat > "$W/mock.py" <<'EOF'
-import http.server, json, sys
+import hashlib, http.server, json, sys
 STATE, PORTF = sys.argv[1:3]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("content-length") or 0))
         tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
-        beh = json.load(open(STATE)).get(tok) or {"status": 401, "h": {}}
+        # the table is keyed by the token's 8-hex fingerprint (the same one this script prints), never by the token itself
+        beh = json.load(open(STATE)).get(hashlib.sha256(tok.encode()).hexdigest()[:8]) or {"status": 401, "h": {}}
         self.send_response(beh["status"])
         for k, v in beh.get("h", {}).items(): self.send_header(k, v)
         self.send_header("content-length", "2"); self.end_headers(); self.wfile.write(b"{}")
@@ -112,10 +117,11 @@ class H(http.server.BaseHTTPRequestHandler):
 s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H); open(PORTF, "w").write(str(s.server_address[1])); s.serve_forever()
 EOF
 mock_set() { # mock_set <ok-status> <ok-headers-json> <exh-status> <exh-headers-json>
-  "$PY" - "$W/mock.json" "$TOK_OK" "$1" "$2" "$TOK_EXH" "$3" "$4" <<'EOF'
+  # Only the two fingerprints go to the interpreter (argv) and into mock.json: the real tokens are not on a command line and not on disk.
+  "$PY" - "$W/mock.json" "$(fp "$TOK_OK")" "$1" "$2" "$(fp "$TOK_EXH")" "$3" "$4" <<'EOF'
 import json, sys
-f, t1, s1, h1, t2, s2, h2 = sys.argv[1:8]
-json.dump({t1: {"status": int(s1), "h": json.loads(h1)}, t2: {"status": int(s2), "h": json.loads(h2)}}, open(f, "w"))
+f, k1, s1, h1, k2, s2, h2 = sys.argv[1:8]
+json.dump({k1: {"status": int(s1), "h": json.loads(h1)}, k2: {"status": int(s2), "h": json.loads(h2)}}, open(f, "w"))
 EOF
 }
 NOW=$(date +%s); RESET=$((NOW + 7200))

@@ -17,7 +17,9 @@ One run (launchd StartInterval, single instance via flock):
                                          ranks ahead of the active one — with NO probe of it (Mayor 04/10: no
                                          balance probe on the way back; if it has not really renewed, its 429 simply
                                          triggers the failover again).
-  * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> change NOTHING. Error != exhausted.
+  * the probe could not tell (network, 5xx, anything not 2xx/429/401/403) -> no failover and no failback: the DECISION does
+    not change. Error != exhausted. (The run still goes on to heal_item, which may put the item back to the decision
+    already taken - the item following the decision, not the probe changing it.)
 
 The order of use comes from the usage store, which the collector rewrites every ~30 min while this daemon runs every
 minute: at the reset tick the order can be half an hour old, and a reading taken BEFORE the reset says nothing about the
@@ -732,9 +734,21 @@ def run_once() -> int:
     if st is None:
         return 1
     before = json.dumps(st, sort_keys=True)
+    moved_from = (st.get("current"), st.get("fingerprint"))
     decide(st, Keys(lib), order, readings, user, now())
     if json.dumps(st, sort_keys=True) != before:
-        publish_state(st)
+        try:
+            publish_state(st)
+        except Exception as e:  # noqa: BLE001 - OSError (full disk, a read-only state dir) is the realistic one; the TYPE only
+            # decide() has already run, so the pool item may already hold the new account while the published decision (what the
+            # WhatsApp services read) still names the old one. Say which of the two happened: only a run that moved the decision
+            # (switch_to sets current + fingerprint together with the write) left the item and the file disagreeing.
+            if (st.get("current"), st.get("fingerprint")) != moved_from:
+                log("ERROR", f"decision NOT published ({type(e).__name__}) but the pool item was switched to {st.get('current')} "
+                             f"fp={st.get('fingerprint')}; the decision file and the item disagree until a run publishes")
+            else:
+                log("ERROR", f"decision NOT published ({type(e).__name__}); this run did not move the pool item to another account")
+            return 1
     return 0
 
 
