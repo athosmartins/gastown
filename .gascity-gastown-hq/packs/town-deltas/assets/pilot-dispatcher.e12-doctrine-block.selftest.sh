@@ -273,10 +273,13 @@ mutant_emits "$M1" $'#!/bin/bash\necho maybe\nexit 0\n' && ok "mutation 1 (drop 
 M2="$(printf '%s\n' "$FN" | sed 's/\[ "\$_e12_rc" -ne 0 \]/false/')"
 [ "$M2" != "$FN" ] || bad "mutation 2 did not change the function — the control is void (the exit-code test moved?)"
 mutant_emits "$M2" $'#!/bin/bash\necho "## Write-time doctrine — experiment E12 (ga-4q2zo5)"\nexit 1\n' && ok "mutation 2 (ignore the exit code) is CAUGHT: a failed script's text is now appended" || bad "mutation 2 NOT caught — the 'failing script' scenario cannot tell"
-M3="$(printf '%s\n' "$FN" | sed 's/--no-record/--ignored-flag/')"
+# The dry run stops passing the flag at all (not "passes some other word": e12-arms.sh refuses an unknown option with exit 2, which would
+# make the hook print nothing and a looser assertion go green for that reason instead of the one this control is about). The harm being
+# tested is the roster row: a dry run that enrols the bead, and the block still shown. Both are asserted, not either-or.
+M3="$(printf '%s\n' "$FN" | sed 's/_e12_nr="--no-record"/_e12_nr=""/')"
 [ "$M3" != "$FN" ] || bad "mutation 3 did not change the function — the control is void (the dry-run flag moved?)"
 newdir; conf_on; DRY_RUN=1 run "$M3" "$ID_T" /store
-[ -e "$SD/e12-roster.jsonl" ] || [ -z "$OUT" ] && ok "mutation 3 (dry run no longer passes --no-record) is CAUGHT: a dry run writes the roster or loses the block" || bad "mutation 3 NOT caught — the dry-run scenarios cannot tell"
+[ -e "$SD/e12-roster.jsonl" ] && [ -n "$OUT" ] && ok "mutation 3 (dry run no longer passes --no-record) is CAUGHT: the dry run enrols the bead (a roster row appears) while still showing the block" || bad "mutation 3 NOT caught — roster=$([ -e "$SD/e12-roster.jsonl" ] && echo written || echo none) out-len=${#OUT}"
 M4="$(printf '%s\n' "$FN" | grep -v '^    warn "E12: no write-time doctrine for \$_e12_bid — e12-arms.sh block exited')"
 [ "$M4" != "$FN" ] || bad "mutation 4 did not change the function — the control is void (the warn line moved?)"
 newdir; printf 'treated_pct=abc\n' > "$SD/e12-ab.conf"; run "$M4" "$ID_T" /store
