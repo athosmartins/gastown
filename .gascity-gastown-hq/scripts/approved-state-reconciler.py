@@ -30,6 +30,9 @@ ROUTING SIGNALS (explicit LABELS only — keywords NEVER trigger routing):
     gate:needs-human:product bead is stamped with it. A technical/bare/routing/
     on-device gate park is the Mayor's turn: next-action:mayor + a "Pergunta:" comment
     (gate:needs-human* stays on it — that is what keeps Pilot/pool dispatch vetoed).
+    WHO holds it (ga-pa3c6h): an assignee already on the bead is never cleared or replaced;
+    one it lacks goes to the bead's author (created_by) only when that author is provably a
+    live named crew — alive / not alive / could not find out, and only "alive" writes.
   • blocked: label blocked/story:blocked ONLY.
   • post-build: label gate:passed → remove story:approved only (delivery owns it).
   Keywords (warming, aquecimento, celular, etc.) trigger a LOW-PRIORITY FLAG only
@@ -402,6 +405,9 @@ _bd_approved = None         # (rig_root) -> list[dict]|None; None return = query
 _bd_label_add = None        # (rig_root, bead_id, label) -> bool
 _bd_label_remove = None     # (rig_root, bead_id, label) -> bool
 _bd_comment = None          # (rig_root, bead_id, text) -> bool
+_bd_assign = None           # (rig_root, bead_id, who) -> bool                        (ga-pa3c6h)
+_bd_read_assignee = None    # (rig_root, bead_id) -> str|None; None = could not read   (ga-pa3c6h)
+_gc_live_sessions = None    # () -> frozenset[str]|None; None = could not ask          (ga-pa3c6h)
 _do_notify = None           # (msg, prio) -> None
 _do_mail_mayor = None       # (subject, body) -> bool
 _read_pilot_log_lines = None  # () -> list[str]
@@ -1190,6 +1196,47 @@ def _do_comment_add(rig_root, bead_id, text):
     return bool(r and r.returncode == 0)
 
 
+def _do_assign(rig_root, bead_id, who):
+    """Set the bead's assignee (ga-pa3c6h). `bd assign` is a plain assignee write — it never
+    claims or changes status — and refuses to overwrite a live in_progress claim without
+    --force, which we never pass."""
+    if DRY_RUN:
+        _log("DRY_RUN: would assign %s to %s" % (bead_id, who))
+        return True
+    if _bd_assign is not None:
+        return _bd_assign(rig_root, bead_id, who)
+    r = _sh([BD_BIN, "-C", rig_root, "assign", bead_id, who], timeout=BD_TIMEOUT)
+    return bool(r and r.returncode == 0)
+
+
+def _read_assignee(rig_root, bead_id):
+    """The assignee bd reports for the bead RIGHT NOW: a string ("" = nobody), or None when
+    it could not be read (ga-pa3c6h; root-class:error-vs-empty).
+
+    A failed read must never come back as "" — "the write did not stick" and "I could not
+    look" are different facts. rc 0 is not proof of a bead either: an error envelope
+    ({"error": ...}) parses as JSON and has no assignee, which would read as "nobody".
+    Only a payload that IS this bead (.id matches) is allowed to speak for it."""
+    if _bd_read_assignee is not None:
+        return _bd_read_assignee(rig_root, bead_id)
+    r = _sh([BD_BIN, "-C", rig_root, "show", bead_id, "--json"], timeout=BD_TIMEOUT)
+    if r is None or r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    starts = [i for i in (out.find("["), out.find("{")) if i >= 0]
+    if not starts:
+        return None
+    try:
+        d = json.loads(out[min(starts):])
+    except Exception:
+        return None
+    if isinstance(d, list):
+        d = d[0] if d else None
+    if not isinstance(d, dict) or d.get("id") != bead_id:
+        return None
+    return d.get("assignee") or ""
+
+
 # ── flow-authority marker ─────────────────────────────────────────────────────
 def _write_flow_authority(now, dimension):
     """Write flow-authority.json so other daemons (TSW/PSW/PTH) can defer Mayor mail."""
@@ -1757,6 +1804,13 @@ def _needs_human_owner(bead):
     hidden from the Athos). A marker with NO gate:needs-human* label at all (bare
     needs-human / story:needs-human) says nothing about whose it is → None, and the caller
     keeps the legacy stamp: can't-know is not 'mayor'.
+
+    The same can't-know is why a STALE stamp — story:needs-human left on a bead whose
+    gate:needs-human* label is long gone (wa-2362s2.1/.3/.4, 06/10) — is not cleared by any
+    rule here (ga-pa3c6h, decided: no rule). With no gate label beside it, nothing on the bead
+    says whether the stamp is this reconciler's leftover or somebody's deliberate hold
+    (refino, the Athos), and clearing it releases the bead to dispatch. Whoever owns such a
+    bead clears it by hand.
     """
     labels = _get_labels(bead)
     gate = [l for l in labels if l.startswith(park_labels.GATE_NEEDS_HUMAN_PREFIX)]
@@ -1769,6 +1823,147 @@ def _needs_human_owner(bead):
     return "mayor"
 
 
+# ── who holds a technical park? (ga-pa3c6h) ───────────────────────────────────
+# The Mayor's rule (ga-gm5rv5, 06/10): a technical park is next-action:mayor, and the
+# bead keeps — or gets back — the AUTHOR as assignee when the author is a live crew (they
+# hold the context; wa-2362s2.2 sat 12.5h unowned until the Mayor restored digo-wa by
+# hand). ga-gm5rv5 delivered the label only; this is the assignee half. It has to ask
+# whether the author is alive, and that question has THREE answers — alive / not alive /
+# could not find out — because the action it authorizes is a WRITE: only "alive" assigns,
+# and "could not find out" leaves the bead exactly as it was (can't-know is not "alive").
+def _parse_live_session_identifiers(stdout):
+    """Identifiers of the sessions that can hold a bead, from `gc session list --json`
+    stdout; None when that output cannot be trusted as "the list of sessions".
+
+    Same predicate as the gate's session_matches_author (quality-gate-guard.sh): a session
+    counts when it is not closed and its state is not one of bead_state.DEAD_SESSION_STATES
+    (asleep/drained/closed/archived/quarantined/failed-create), and it is known by any of
+    id / name / session_name / alias / agent_name (bd stores the assignee as session_name,
+    humans type the alias). A missing state reads as alive, as it does there.
+
+    {"sessions": []} is a real answer ("nobody is up") → an empty frozenset. An error
+    envelope, a non-JSON body, or a payload with no sessions LIST is not — it is None."""
+    out = (stdout or "").strip()
+    start = out.find("{")
+    if start < 0:
+        return None
+    try:
+        data = json.loads(out[start:])
+    except Exception:
+        return None
+    sessions = data.get("sessions") if isinstance(data, dict) else None
+    if not isinstance(sessions, list) or not all(isinstance(s, dict) for s in sessions):
+        return None   # a list with junk in it is not an answer either — never "nobody is up"
+    ids = set()
+    for s in sessions:
+        if s.get("closed") is True:
+            continue
+        if str(s.get("state") or "").strip().lower() in bead_state.DEAD_SESSION_STATES:
+            continue
+        for key in ("id", "name", "session_name", "alias", "agent_name"):
+            if s.get(key):
+                ids.add(str(s[key]))
+    return frozenset(ids)
+
+
+def _live_session_identifiers():
+    """frozenset of live session identifiers, or None when `gc session list` could not be
+    asked/parsed (never an empty set for a failed ask)."""
+    if _gc_live_sessions is not None:
+        return _gc_live_sessions()
+    proc = _sh([GC_BIN, "session", "list", "--json"], timeout=15)
+    if proc is None or proc.returncode != 0:
+        return None
+    return _parse_live_session_identifiers(proc.stdout)
+
+
+def _park_author(bead):
+    """Who made the bead, as the source bead itself records it ('' = nobody recorded).
+    created_by is the only authorship a source bead carries: the gate's own
+    gate.submitted_by lives on the marker, and the source beads measured (wa-2362s2.*) have
+    no metadata at all. For those slices created_by IS the session that did the work
+    (digo-wa-gawispvrmmmf, still live)."""
+    who = str(bead.get("created_by") or "").strip()
+    return "" if who.lower() in ("null", "none") else who
+
+
+def _park_holder(bead):
+    """Decide whose hands a technical park should sit in → (action, who, note).
+
+      keep     the bead already has an assignee — never cleared, never replaced
+      assign   no assignee, and the author is provably a live crew → assign `who`
+      leave    no assignee and nobody to hand it to (no author / pool slot or coordinator /
+               author not live) — the bead stays unassigned, next-action:mayor names the turn
+      unknown  no assignee, but liveness could not be established → nothing is touched
+
+    `note` is the sentence the "Pergunta:" comment carries, so the Mayor reads who holds the
+    bead and why without opening anything else.
+
+    Liveness here is EXACT membership of the author's own identifier among the live
+    sessions — not bead_state.holder_is_alive(): that one matches by name prefix on purpose
+    (it protects a RECLAIM, so it errs toward "alive"), while this verdict authorizes an
+    ASSIGN, so the safe direction is the opposite. A recycled author session (same crew,
+    new session id) therefore stays unassigned; the gate derives a successor from the
+    gate.submitted_by_agent it recorded at submit time, never by regex at dispatch time
+    (ga-pyzo) — and a source bead has no such record, so nothing here guesses one."""
+    held = str(bead.get("assignee") or "").strip()
+    if held:
+        return "keep", held, "assignee atual (%s) mantido" % held
+    author = _park_author(bead)
+    if not author:
+        return "leave", "", "a bead não registra autor (created_by vazio) — ficou sem assignee"
+    if bead_state.is_ephemeral(author) or bead_state.is_coordinator(author):
+        return "leave", author, (
+            "o autor (%s) é um slot de pool ou um coordenador, não uma crew que segure um "
+            "park — ficou sem assignee" % author)
+    live = _live_session_identifiers()
+    if live is None:
+        return "unknown", author, (
+            "não consegui verificar se o autor (%s) está vivo (gc session list falhou) — "
+            "nada foi atribuído por palpite" % author)
+    if author in live:
+        return "assign", author, (
+            "o autor (%s) é crew viva e ficou com a bead (assignee) — tem o contexto" % author)
+    if bead_state.holder_is_alive(author, live) is True:
+        return "leave", author, (
+            "a sessão do autor (%s) já não existe — há sessão viva com o mesmo prefixo, mas "
+            "o reconciler não adivinha sucessor; ficou sem assignee" % author)
+    return "leave", author, "o autor (%s) não é uma crew viva — ficou sem assignee" % author
+
+
+def _settle_park_holder(rig_root, bead, bead_id):
+    """Carry out _park_holder's decision for a route that already landed.
+    → (what the "Pergunta:" says about who holds the bead, assignee-unconfirmed?).
+
+    The route (label, story:approved, audit comment) is done and its cooldown is about to be
+    set, so nothing here may cost it its "Pergunta:": a decision that raises, an assign that
+    fails, or a read-back that disagrees all come back as a note + unconfirmed=True, never as
+    an exception and never as a success report that was not checked (ga-n7hu2/ga-p5q3: the
+    rc of a write is not the effect of a write — re-read the bead)."""
+    try:
+        action, who, note = _park_holder(bead)
+    except Exception as e:
+        _log("WARN: holder decision for %s raised %r — the bead is left exactly as it was"
+             % (bead_id, e))
+        return ("não consegui decidir o assignee (erro interno do reconciler) — nada foi "
+                "tocado"), True
+    if action != "assign":
+        _log("  holder %s for %s: %s" % (action, bead_id, note))
+        return note, False
+    if not _do_assign(rig_root, bead_id, who):
+        _log("  WARN: assign %s -> %s FAILED — the bead keeps no assignee" % (bead_id, who))
+        return ("tentei atribuir a bead ao autor (%s) e o bd falhou — ficou sem assignee"
+                % who), True
+    seen = _read_assignee(rig_root, bead_id)
+    if seen == who:
+        _log("  assigned %s to its live author %s (re-read confirms)" % (bead_id, who))
+        return note, False
+    if seen is None:
+        return ("atribuí a bead ao autor (%s), mas não consegui reler o assignee para "
+                "confirmar" % who), True
+    return "atribuí a bead ao autor (%s), mas o bd mostra assignee '%s'" % (who, seen), True
+
+
 def _route_bead(rig_root, bead, route_to, signal, now, state):
     """Route bead out of story:approved into its true state.
 
@@ -1777,9 +1972,11 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
 
     needs-human: only a product decision lands on story:needs-human (the Athos's
     queue); a technical/bare/routing/on-device gate park names the Mayor instead —
-    next-action:mayor + a "Pergunta:" comment — and the assignee is left alone
-    (ga-gm5rv5). The gate:needs-human* label stays on the bead: it is what the Pilot
-    and the pool probes veto on.
+    next-action:mayor + a "Pergunta:" comment (ga-gm5rv5). An assignee it already has is
+    never cleared or replaced; one it lacks goes to the author only when the author is
+    provably a live crew (ga-pa3c6h — _park_holder; unknown liveness touches nothing). The
+    gate:needs-human* label stays on the bead: it is what the Pilot and the pool probes
+    veto on.
 
     Returns True if the route was logged/executed; False on cooldown or missing id.
     Never mutates anything when DRY_RUN=True.
@@ -1805,6 +2002,7 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
 
     new_label = None  # set below on every route except post-build (no label is added there)
     pergunta_failed = False
+    holder_note, holder_unconfirmed = "", False
     if route_to == "post-build":
         # Remove story:approved only; delivery daemon owns the post-build transition.
         comment = ("approved-state-reconciler: removing story:approved — "
@@ -1830,12 +2028,14 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         _do_label_remove(rig_root, bead_id, "story:approved")
         _do_comment_add(rig_root, bead_id, comment)
         if mayor_owned:
+            holder_note, holder_unconfirmed = _settle_park_holder(rig_root, bead, bead_id)
             # Its own comment: next-action-coordinator-alert.sh reads the question as the
             # comment whose text STARTS with "Pergunta:".
             pergunta_failed = not _do_comment_add(rig_root, bead_id, (
                 "Pergunta: %s parou no gate (%s) e não é decisão de produto. Como seguimos — "
                 "destravar (re-gatear / devolver a um worker) ou reescopar? Fica fora do "
-                "despacho enquanto gate:needs-human* estiver nele." % (bead_id, signal)))
+                "despacho enquanto gate:needs-human* estiver nele. Quem segura a bead: %s."
+                % (bead_id, signal, holder_note)))
             if pergunta_failed:
                 # The route is already done (label added, story:approved gone, cooldown
                 # set below), so this cannot be retried — say so instead of leaving a
@@ -1860,6 +2060,8 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
            "reconciler: %s story:approved removed (gate:passed — post-build)" % bead_id)
     if pergunta_failed:
         msg += " — 'Pergunta:' comment FAILED, the Mayor was not asked: open the bead"
+    if holder_unconfirmed:
+        msg += " — assignee NOT confirmed (%s): open the bead" % holder_note
     if _do_notify is not None:
         _do_notify(msg, 2)
     else:

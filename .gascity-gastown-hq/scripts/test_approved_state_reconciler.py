@@ -812,14 +812,15 @@ def test_technical_park_is_never_the_athos_turn_by_any_label_it_writes(writes):
 
 
 def test_a_live_crew_assignee_is_neither_cleared_nor_replaced(writes, monkeypatch):
-    """"assignee do autor se for crew viva": the reconciler has no liveness probe, so it
-    must never decide to clear (or set) an assignee — whoever holds the bead keeps it."""
+    """Whoever already holds the bead keeps it: the route never clears or replaces an
+    assignee (ga-gm5rv5), and — since ga-pa3c6h gave the reconciler a liveness probe for the
+    UNASSIGNED case — a bead that already has an assignee needs no probe at all, so no
+    subprocess of any kind runs for it."""
     calls = []
     monkeypatch.setattr(asr, "_sh", lambda cmd, **_kw: calls.append(cmd))
     _route({"id": "wa-2362s2.2", "assignee": "wa/crew/digo", "labels": list(_TECH)}, writes)
     assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
-    assert not [c for c in calls if "assign" in " ".join(map(str, c))
-                or "--assignee" in " ".join(map(str, c))], calls
+    assert calls == [], calls
 
 
 @pytest.mark.parametrize("variant", [
@@ -899,3 +900,332 @@ def test_a_written_pergunta_leaves_the_notification_clean(writes):
     _route({"id": "wa-2362s2.2", "assignee": None, "labels": list(_TECH)}, writes)
     assert any(t.startswith("Pergunta:") for _b, t in writes.comments)
     assert "FAILED" not in writes.notes[0], writes.notes
+
+
+# ── ga-pa3c6h: who holds a technical park? ────────────────────────────────────
+# The Mayor's rule (ga-gm5rv5): next-action:mayor, and the AUTHOR keeps (or gets back) the
+# bead when the author is a live crew. wa-2362s2.2 sat 12.5h with no assignee until the Mayor
+# restored digo-wa by hand. The reconciler had no way to ask "is the author alive?"; the
+# question has three answers and only "alive" may write — "could not find out" is not "alive".
+_DIGO = "digo-wa-gawispvrmmmf"          # the real created_by of wa-2362s2.1..5 (06/10)
+
+
+class _Holder:
+    """The holder step observed through the module's own seams: what `gc session list` says,
+    what `bd assign` was asked, what the bead reads back, and the order things happened."""
+
+    def __init__(self):
+        self.live = frozenset()        # None = `gc session list` could not be asked
+        self.probes = 0
+        self.assigns = []
+        self.assign_ok = True
+        self.readback = "echo"         # "echo" = the last assignee written; None = unreadable
+        self.events = []
+
+
+@pytest.fixture
+def holder(writes, monkeypatch):
+    h = _Holder()
+    orig_add = asr._bd_label_add
+
+    def _add(root, bead_id, label):
+        h.events.append(("label+", label))
+        return orig_add(root, bead_id, label)
+
+    def _live():
+        h.probes += 1
+        return h.live
+
+    def _assign(_root, bead_id, who):
+        h.events.append(("assign", who))
+        h.assigns.append((bead_id, who))
+        return h.assign_ok
+
+    def _read(_root, _bead_id):
+        if h.readback == "echo":
+            return h.assigns[-1][1] if h.assigns else ""
+        return h.readback
+
+    monkeypatch.setattr(asr, "_bd_label_add", _add)
+    monkeypatch.setattr(asr, "_gc_live_sessions", _live)
+    monkeypatch.setattr(asr, "_bd_assign", _assign)
+    monkeypatch.setattr(asr, "_bd_read_assignee", _read)
+    return h
+
+
+def _park(created_by=_DIGO, assignee=None, labels=None, bead_id="wa-2362s2.2"):
+    bead = {"id": bead_id, "assignee": assignee, "created_by": created_by,
+            "labels": list(labels if labels is not None else _TECH)}
+    return bead
+
+
+def _pergunta(writes, bead_id="wa-2362s2.2"):
+    texts = [t for b, t in writes.comments if b == bead_id and t.startswith("Pergunta:")]
+    assert len(texts) == 1, texts
+    return texts[0]
+
+
+def test_a_live_author_gets_back_the_unassigned_technical_park(writes, holder):
+    """The incident: wa-2362s2.2, created_by digo-wa-gawispvrmmmf (live), assignee null."""
+    holder.live = frozenset({_DIGO, "digo-wa", "ga-wisp-vrmmmf"})
+    _route(_park(), writes)
+    assert holder.assigns == [("wa-2362s2.2", _DIGO)], holder.assigns
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert "crew viva" in _pergunta(writes) and _DIGO in _pergunta(writes)
+    assert "NOT confirmed" not in writes.notes[0], writes.notes
+
+
+def test_the_assignee_is_written_only_after_the_route_label_landed(writes, holder):
+    """add-before-write: assigning first and then failing the label would leave a bead with
+    an owner and no turn marker — the exact limbo the add-before-remove rule exists for."""
+    holder.live = frozenset({_DIGO})
+    _route(_park(), writes)
+    kinds = [e[0] for e in holder.events]
+    assert kinds.index("label+") < kinds.index("assign"), holder.events
+
+
+def test_a_route_whose_label_failed_assigns_nothing(writes, holder):
+    holder.live = frozenset({_DIGO})
+    writes.fail_adds.add("next-action:mayor")
+    bead = _park()
+    route_to, signal = asr._classify(bead)
+    assert asr._route_bead("/rig", bead, route_to, signal, 1_000_000.0, {}) is False
+    assert holder.assigns == [] and holder.probes == 0
+
+
+def test_an_author_who_is_not_live_gets_nothing_and_the_mayor_is_told_so(writes, holder):
+    holder.live = frozenset({"peter-wa-gawispafn2dc", "gastown__mayor"})
+    _route(_park(), writes)
+    assert holder.assigns == []
+    assert "não é uma crew viva" in _pergunta(writes), _pergunta(writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+
+
+def test_liveness_that_could_not_be_established_assigns_nothing_and_says_it_could_not(
+        writes, holder):
+    """Three answers, not two: 'could not ask' must not read as 'alive' (would assign on a
+    guess) and must not read as 'dead' either (would tell the Mayor a live crew is gone)."""
+    holder.live = None
+    _route(_park(), writes)
+    assert holder.assigns == []
+    q = _pergunta(writes)
+    assert "não consegui verificar" in q and "não é uma crew viva" not in q, q
+
+
+def test_a_recycled_author_session_is_not_replaced_by_a_guessed_successor(writes, holder):
+    """The author's own session is gone; another session of the same crew is up. The gate
+    resolves the successor from what it RECORDED at submit time — a source bead records
+    nothing, and a name-prefix match is how mila-wa-extra would become mila-wa."""
+    holder.live = frozenset({"digo-wa", "digo-wa-gawispNEW123", "ga-wisp-new123"})
+    _route(_park(created_by="digo-wa-gawispOLD999"), writes)
+    assert holder.assigns == []
+    assert "não adivinha sucessor" in _pergunta(writes), _pergunta(writes)
+
+
+@pytest.mark.parametrize("author", [
+    "gastown.dog-1", "dog-gawispx1", "gastown.dog", "wa-worker-gawispab", "wa-worker",
+    "ps-worker-gawispcd", "digo-adhoc-e2510107f6", "claude-headless-1",
+    "mayor", "gastown__mayor", "gastown.mayor", "deacon",
+])
+def test_a_pool_slot_or_a_coordinator_is_never_handed_a_park_and_is_not_probed(
+        writes, holder, author):
+    holder.live = frozenset({author})          # even when it IS live
+    _route(_park(created_by=author), writes)
+    assert holder.assigns == [], author
+    assert holder.probes == 0, "no point asking gc about an identity that can never qualify"
+
+
+@pytest.mark.parametrize("created_by", [None, "", "   ", "null", "None"])
+def test_a_bead_that_records_no_author_is_left_alone(writes, holder, created_by):
+    holder.live = frozenset({_DIGO})
+    _route(_park(created_by=created_by), writes)
+    assert holder.assigns == [] and holder.probes == 0
+    assert "não registra autor" in _pergunta(writes)
+
+
+def test_an_existing_assignee_is_kept_without_asking_anyone(writes, holder):
+    holder.live = frozenset({_DIGO})
+    _route(_park(assignee="peter-wa-gawispafn2dc"), writes)
+    assert holder.assigns == [] and holder.probes == 0
+    assert "mantido" in _pergunta(writes)
+
+
+def test_a_product_park_is_never_assigned_to_anyone(writes, holder):
+    """A product decision is the Athos's: it is routed to story:needs-human and the
+    assignee is not this step's business."""
+    holder.live = frozenset({_DIGO})
+    _route(_park(labels=["story:approved", "gate:needs-human", "gate:needs-human:product"],
+                 bead_id="ga-p1"), writes)
+    assert holder.assigns == [] and holder.probes == 0
+    assert ("ga-p1", "story:needs-human") in writes.adds
+
+
+@pytest.mark.parametrize("labels", [["story:approved", "needs-human"],
+                                    ["story:approved", "story:needs-human"]])
+def test_a_marker_with_no_gate_variant_is_not_assigned_either(writes, holder, labels):
+    holder.live = frozenset({_DIGO})
+    _route(_park(labels=labels, bead_id="ga-u1"), writes)
+    assert holder.assigns == [] and holder.probes == 0
+
+
+def test_a_failed_assign_is_reported_not_swallowed_and_the_route_still_completes(
+        writes, holder):
+    holder.live = frozenset({_DIGO})
+    holder.assign_ok = False
+    _route(_park(), writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert ("wa-2362s2.2", "story:approved") in writes.removes
+    assert "o bd falhou" in _pergunta(writes), _pergunta(writes)
+    assert len(writes.notes) == 1 and "NOT confirmed" in writes.notes[0], writes.notes
+
+
+@pytest.mark.parametrize("readback, needle", [
+    (None, "não consegui reler"),          # the read failed: say so, do not claim a failed write
+    ("", "o bd mostra assignee ''"),        # the write did not stick
+    ("someone-else", "o bd mostra assignee 'someone-else'"),
+])
+def test_an_assign_that_cannot_be_confirmed_on_re_read_is_flagged(writes, holder,
+                                                                  readback, needle):
+    holder.live = frozenset({_DIGO})
+    holder.readback = readback
+    _route(_park(), writes)
+    assert needle in _pergunta(writes), _pergunta(writes)
+    assert "NOT confirmed" in writes.notes[0], writes.notes
+
+
+def test_a_holder_step_that_raises_costs_the_route_nothing(writes, holder, monkeypatch):
+    def _boom(_bead):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(asr, "_park_holder", _boom)
+    _route(_park(), writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert holder.assigns == []
+    assert "erro interno" in _pergunta(writes)
+    assert "NOT confirmed" in writes.notes[0]
+
+
+def test_dry_run_assigns_nothing_and_asks_nobody(writes, holder, monkeypatch):
+    holder.live = frozenset({_DIGO})
+    monkeypatch.setattr(asr, "DRY_RUN", True)
+    bead = _park()
+    route_to, signal = asr._classify(bead)
+    assert asr._route_bead("/rig", bead, route_to, signal, 1_000_000.0, {}) is True
+    assert holder.assigns == [] and holder.probes == 0 and writes.adds == []
+
+
+def test_the_parked_bead_with_its_author_back_is_still_the_mayors_turn(writes, holder):
+    """Giving the bead back to its author must not turn it into 'the crew is executing':
+    next-action:mayor outranks the assignee in bead_state.derive, and nothing here may
+    reach the Athos's queue."""
+    holder.live = frozenset({_DIGO})
+    bead = _park()
+    _route(bead, writes)
+    after = _labels_after(bead, writes)
+    derived = bead_state.derive({"id": bead["id"], "status": "open", "assignee": _DIGO,
+                                 "labels": sorted(after)})
+    assert derived["state"] == "parked" and derived["turn"] == "mayor", derived
+    assert not any(l.startswith("next-action:athos") for l in after) and \
+        "story:needs-human" not in after, after
+
+
+# ── the two real subprocess paths (the seams above bypass them) ───────────────
+class _Proc:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout, self.returncode = stdout, returncode
+
+
+def _sessions_json(*rows, prefix=""):
+    import json as _json
+    return prefix + _json.dumps({"sessions": list(rows)})
+
+
+def test_live_identifiers_come_from_all_five_fields_and_drop_dead_sessions():
+    out = _sessions_json(
+        {"id": "ga-wisp-vrmmmf", "name": "digo-wa", "session_name": _DIGO, "alias": "digo-wa",
+         "agent_name": "digo-wa", "state": "active", "closed": False},
+        {"id": "x1", "name": "mila-wa", "session_name": "mila-wa-gawisp1", "state": "asleep"},
+        {"id": "x2", "name": "gone-wa", "session_name": "gone-wa-gawisp2", "closed": True},
+        {"id": "x3", "name": "drained-wa", "session_name": "drained-wa-g3", "state": "Drained"},
+        {"id": "x4", "name": "nostate-wa", "session_name": "nostate-wa-g4"},
+    )
+    ids = asr._parse_live_session_identifiers(out)
+    assert {_DIGO, "digo-wa", "ga-wisp-vrmmmf", "nostate-wa", "nostate-wa-g4"} <= ids
+    assert not ({"mila-wa", "mila-wa-gawisp1", "gone-wa", "drained-wa"} & ids), ids
+
+
+def test_a_missing_state_reads_as_alive_like_the_gates_own_predicate():
+    ids = asr._parse_live_session_identifiers(_sessions_json({"session_name": "peter-wa-g1"}))
+    assert ids == frozenset({"peter-wa-g1"})
+
+
+def test_gc_warning_lines_before_the_json_are_tolerated():
+    out = _sessions_json({"session_name": "peter-wa-g1", "state": "active"},
+                         prefix="warning: builtin pack differs from the embedded copy\n")
+    assert asr._parse_live_session_identifiers(out) == frozenset({"peter-wa-g1"})
+
+
+def test_nobody_up_is_an_answer_but_garbage_is_not():
+    assert asr._parse_live_session_identifiers('{"sessions": []}') == frozenset()
+    for bad in ("", "   ", "not json", '{"error": "boom"}', '{"ok": false}',
+                '{"sessions": null}', '{"sessions": "x"}', "[]",
+                '{"sessions": [1, 2]}',                       # junk entries ≠ "nobody is up"
+                '{"sessions": [{"session_name": "a-b"}, "x"]}',
+                '{"sessions": []} trailing'):
+        assert asr._parse_live_session_identifiers(bad) is None, bad
+
+
+def test_a_failed_gc_call_is_unknown_never_an_empty_set(monkeypatch):
+    monkeypatch.setattr(asr, "_gc_live_sessions", None)
+    for proc in (None, _Proc("", 1), _Proc(_sessions_json({"session_name": "a-b"}), 1),
+                 _Proc('{"error": "x"}', 0)):
+        monkeypatch.setattr(asr, "_sh", lambda *_a, _p=proc, **_k: _p)
+        assert asr._live_session_identifiers() is None, proc
+
+
+def test_the_real_session_probe_asks_gc_for_json(monkeypatch):
+    seen = []
+    monkeypatch.setattr(asr, "_gc_live_sessions", None)
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: seen.append(args) or _Proc(
+        _sessions_json({"session_name": _DIGO, "state": "active"})))
+    assert asr._live_session_identifiers() == frozenset({_DIGO})
+    assert seen and seen[0][1:4] == ["session", "list", "--json"], seen
+
+
+def test_the_real_assign_is_a_plain_bd_assign_never_forced_never_a_claim(monkeypatch):
+    seen = []
+    monkeypatch.setattr(asr, "DRY_RUN", False)
+    monkeypatch.setattr(asr, "_bd_assign", None)
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: seen.append(list(args)) or _Proc())
+    assert asr._do_assign("/rig", "wa-1", _DIGO) is True
+    assert seen == [[asr.BD_BIN, "-C", "/rig", "assign", "wa-1", _DIGO]], seen
+    assert "--force" not in seen[0] and "--claim" not in seen[0]
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: _Proc("", 1))
+    assert asr._do_assign("/rig", "wa-1", _DIGO) is False
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: None)
+    assert asr._do_assign("/rig", "wa-1", _DIGO) is False
+
+
+@pytest.mark.parametrize("stdout, rc, want", [
+    ('[{"id": "wa-1", "assignee": "digo-wa-g1"}]', 0, "digo-wa-g1"),
+    ('{"id": "wa-1", "assignee": "digo-wa-g1"}', 0, "digo-wa-g1"),
+    ('[{"id": "wa-1", "assignee": null}]', 0, ""),            # a real, empty assignee
+    ('[{"id": "wa-1"}]', 0, ""),
+    ('warning: x\n[{"id": "wa-1", "assignee": "a-b"}]', 0, "a-b"),
+    # a failed READ must never come back as "nobody":
+    ('{"error": "no such issue"}', 0, None),                   # envelope: rc 0, no .id
+    ('[{"id": "wa-OTHER", "assignee": "a-b"}]', 0, None),      # not this bead
+    ('[]', 0, None), ('', 0, None), ('garbage', 0, None),
+    ('[{"id": "wa-1", "assignee": "a-b"}]', 1, None),
+])
+def test_the_assignee_read_back_never_turns_a_failed_read_into_nobody(
+        monkeypatch, stdout, rc, want):
+    monkeypatch.setattr(asr, "_bd_read_assignee", None)
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: _Proc(stdout, rc))
+    assert asr._read_assignee("/rig", "wa-1") == want
+
+
+def test_the_read_back_survives_a_bd_that_could_not_even_start(monkeypatch):
+    monkeypatch.setattr(asr, "_bd_read_assignee", None)
+    monkeypatch.setattr(asr, "_sh", lambda args, **_k: None)
+    assert asr._read_assignee("/rig", "wa-1") is None

@@ -20,7 +20,9 @@
          • needs-device: label story:needs-device
          • needs-human:  label gate:needs-human* (prefix) or story:needs-human
                          (lands on story:needs-human only for gate:needs-human:product;
-                          any other gate variant → next-action:mayor — ga-gm5rv5)
+                          any other gate variant → next-action:mayor — ga-gm5rv5; an
+                          unassigned bead goes back to its author only when created_by is
+                          a provably live crew, else it stays unassigned — ga-pa3c6h)
          • blocked:      label blocked / story:blocked
          • post-build:   gate:passed present → remove story:approved only (delivery owns it)
        Title/body KEYWORDS (warming, aquecimento, celular, on-device, etc.) do NOT route —
