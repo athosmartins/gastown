@@ -9983,6 +9983,7 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       log "Gate FAIL for $BEAD_ID reviewed a stale commit ($BRANCH_SHA != current tip ${_GATE_L7MVTW_CURRENT_TIP:-unknown}) — NOT bumping gate:fix-attempt (ga-l7mvtw, prev=$PREV_ATTEMPT unchanged)."
       bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-l7mvtw: this gate run reviewed $BRANCH_SHA, but branch $BRANCH has since moved to ${_GATE_L7MVTW_CURRENT_TIP:-a newer commit} — treating the FAIL above as a review of already-superseded code. gate:fix-attempt left unchanged (still $PREV_ATTEMPT). If you haven't already, resubmit with /gate-done so the current commit gets reviewed." 2>/dev/null || true
     elif [ "$PREV_ATTEMPT" -ge "$GATE_FIX_CAP" ]; then
+      # SELFTEST-EXTRACT cap-branch: BEGIN
       # (c) RETRY CAP REACHED — stop auto-retry, escalate to the Mayor ONCE.
       log "Gate fix-attempt cap reached for $BEAD_ID (prev=$PREV_ATTEMPT >= $GATE_FIX_CAP). Escalating; no further auto-retry."
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:needs-fix"   -q 2>/dev/null || true
@@ -10052,7 +10053,63 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:reviewing"   -q 2>/dev/null || true  # wa-qq33j: clear in-review state (cap/needs-human)
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatched"  -q 2>/dev/null || true
       bd -C "$BEAD_CITY" label remove "$BEAD_ID" "pilot:dispatching" -q 2>/dev/null || true
-      bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+      # ga-bwtrrf: this used to be an unconditional `assign "$BEAD_ID" ""`, leaving the park with no
+      # owner and no next-action:<who> — nothing said whose turn it was (wa-2362s2.2 sat 12.5h like
+      # that, 06:25Z-19:01Z, until the Mayor restored the live crew by hand; Athos read the unowned
+      # card as his). gate:needs-human:technical is the Mayor's/crew's, never Athos's (town rule 2),
+      # so the park always names an owner: a LIVE named crew KEEPS the bead (same decision as the
+      # needs-fix branch below — gate_fail_assignee_action, ga-jyox; recycled sessions resolved the
+      # same way, ga-pyzo); anyone else gets the assignee cleared as before PLUS next-action:mayor and
+      # a "Pergunta:" comment (what next-action-coordinator-alert.sh keys on). Never story:needs-human
+      # / next-action:athos here — only a :product park reaches Athos.
+      _CAP_AUTHOR_ALIVE=$(author_is_alive "$AUTHOR")
+      _CAP_OWNER=$(resolve_recycled_author "$AUTHOR" "${AUTHOR_AGENT:-}" "$_CAP_AUTHOR_ALIVE")
+      if [ "$_CAP_OWNER" != "$AUTHOR" ]; then
+        _CAP_AUTHOR_ALIVE=1
+      fi
+      _CAP_PARK_ACTION=$(gate_fail_assignee_action "$_CAP_OWNER" "$_CAP_AUTHOR_ALIVE")
+      if [ "$_CAP_PARK_ACTION" = "keep" ]; then
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "$_CAP_OWNER" 2>/dev/null || true
+      else
+        bd -C "$BEAD_CITY" assign "$BEAD_ID" "" 2>/dev/null || true
+        bd -C "$BEAD_CITY" label add "$BEAD_ID" "next-action:mayor" -q >/dev/null 2>&1 || true
+      fi
+      # Re-read the RAW bead and report what is there, not what was attempted (ga-n7hu2 / ga-p5q3: a
+      # success report that isn't true is why nobody re-checks it, and a failed READ must never be
+      # published as a failed WRITE — "could not verify" is its own state). `|| _OK=0` keeps this
+      # `set -e` daemon alive through a Dolt hiccup.
+      _CAP_VERIFY_OK=1
+      _CAP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _CAP_VERIFY_OK=0
+      [ -n "$_CAP_VERIFY_JSON" ] || _CAP_VERIFY_OK=0
+      if [ "$_CAP_VERIFY_OK" = "0" ]; then
+        _CAP_OBS="assignee=UNVERIFIED, next-action:mayor=UNVERIFIED (post-write read failed — state unknown, NOT a claim that the write failed)"
+      else
+        _CAP_V_ASSIGNEE=$(printf '%s' "$_CAP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | .assignee // ""' 2>/dev/null || echo "")
+        _CAP_V_HAS_NA=$(printf '%s' "$_CAP_VERIFY_JSON" | jq -r 'if type=="array" then .[0] else . end | ((.labels // []) | index("next-action:mayor")) != null' 2>/dev/null || echo "false")
+        if [ "$_CAP_PARK_ACTION" = "keep" ]; then
+          _CAP_WANT_ASSIGNEE="$_CAP_OWNER"
+        else
+          _CAP_WANT_ASSIGNEE=""
+        fi
+        if [ "$_CAP_V_ASSIGNEE" = "$_CAP_WANT_ASSIGNEE" ]; then
+          _CAP_OBS="assignee='${_CAP_V_ASSIGNEE}' (as intended)"
+        else
+          _CAP_OBS="assignee='${_CAP_V_ASSIGNEE}' NOT '${_CAP_WANT_ASSIGNEE}' — the write did not stick, needs investigation"
+        fi
+        if [ "$_CAP_PARK_ACTION" != "keep" ]; then
+          if [ "$_CAP_V_HAS_NA" = "true" ]; then
+            _CAP_OBS="$_CAP_OBS; next-action:mayor=present"
+          else
+            _CAP_OBS="$_CAP_OBS; next-action:mayor=MISSING even after add — needs investigation"
+          fi
+        fi
+      fi
+      if [ "$_CAP_PARK_ACTION" = "keep" ]; then
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "ga-bwtrrf: fix-attempt cap exhausted, but the author $_CAP_OWNER is a LIVE crew session — assignee KEPT (they hold the context; the cap escalation above mails them once). Technical park (gate:needs-human:technical): the Mayor/crew resolve it, it is NOT Athos's. Observed after the write: $_CAP_OBS." 2>/dev/null || true
+      else
+        bd -C "$BEAD_CITY" comment "$BEAD_ID" "Pergunta: o gate esgotou $GATE_FIX_CAP tentativas de auto-correção em $BEAD_ID (branch $BRANCH) e o autor (${AUTHOR:-desconhecido}) não é uma crew viva, então ninguém segura esta bead. Park técnico (gate:needs-human:technical) — é do Mayor, NÃO do Athos. Como seguimos? (a) re-despachar um builder: remover gate:needs-human* e gate:fix-attempt:*; (b) o Mayor corrige direto; (c) abandonar a branch e fechar a bead. Observado após a escrita: $_CAP_OBS." 2>/dev/null || true
+      fi
+      # SELFTEST-EXTRACT cap-branch: END
     else
       # (b) TRANSITION TO A PILOT-RE-DISPATCHABLE needs-fix STATE.
       # SELFTEST-EXTRACT finalize-fixattempt-bump: BEGIN
