@@ -41,6 +41,9 @@ lacks() { grep -F -- "$3" "$2" >/dev/null 2>&1 && bad "$1 — '$3' unexpectedly 
 # shellcheck disable=SC1090
 GATE_GUARD_LIB_ONLY=1 . "$GUARD"
 set +e  # sourcing the guard leaks its `set -e` into this shell (same as the siblings)
+# An operator's own cap in the environment would turn every live-block assertion below into a loud failure (gate round 3,
+# nit): the sections that need an override set it themselves, per call.
+unset GATE_E11_CAP_LINES
 
 # ── 0. preflight: every function the feature is made of exists ──────────────
 # Without this a negative assertion ("prints nothing", "no bd call") passes VACUOUSLY on a guard that has no E11 at
@@ -170,6 +173,25 @@ for p in .gascity-gastown-hq/scripts/jev-preambulo.selftest.py .gascity-gastown-
          npm-package/scripts/test.js; do
   prod "$p"; eq "NOT production (real repo test name): $p" "$?" "1"
 done
+# Gate round 3 (ga-v9g519, blocking issue 1): the same class, now by DIRECTORY. This repo keeps its post-deploy tests in
+# .../assets/prod-tests/<rig>/story-ga-*.sh + run.sh (58 of the 59 tracked files, ~6.000 lines, headed "prod test for
+# ga-xxxx"): the directory is `prod-tests`, not a whole `tests` component, and none of the base names is test_*/*_test.*/
+# *.selftest.* — so round 1's fix, built from selftest.py / selftest lib / test-*.sh shapes only, let every one of them
+# count as production (commit a7321f4a8 read 802 = refused at 800; its real production count is 694). Each path below is
+# one `git ls-files` returns today: the directory shapes this repo's tests really live under, not only the base names.
+for p in .gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-5c3msy.sh \
+         .gascity-gastown-hq/packs/town-deltas/assets/prod-tests/lexbh/run.sh \
+         .gascity-gastown-hq/packs/town-deltas/assets/prod-tests/property_scrapers/story-ga-0ys.sh \
+         internal/testutil/doltserver.go internal/testutil/cmd.go \
+         scripts/migration-test/seed-data.sh scripts/migration-test/validate-migration.sh; do
+  prod "$p"; eq "NOT production (real repo test DIRECTORY): $p" "$?" "1"
+done
+# The class, not the one directory: a component qualified as a test dir (-test, -tests, _test, _tests suffix) and the Go
+# helper package testutil/testutils are test code wherever they sit, whole components only.
+for p in a/prod-tests/x.sh a/e2e-tests/x.py a/migration-test/x.sh a/smoke_tests/x.py a/unit_test/x.sh \
+         a/b/testutil/x.go a/testutils/x.go top-tests/x.sh; do
+  prod "$p"; eq "NOT production (test-qualified directory shape): $p" "$?" "1"
+done
 # …and the names that LOOK like tests but are product code must stay counted: only the anchored shapes above are
 # excluded, never a bare 'test'/'selftest' substring.
 for p in internal/daemon/main_branch_test_runner.go internal/doctor/testutil_symlink_check.go \
@@ -178,6 +200,30 @@ for p in internal/daemon/main_branch_test_runner.go internal/doctor/testutil_sym
          src/latest-test-run.go src/contest-runner.sh src/selftestify.py; do
   prod "$p"; eq "still production (test-ish name, product code): $p" "$?" "0"
 done
+# The directory shapes are anchored on the WHOLE component too: a dir that merely contains the word, or ends in it with
+# no separator, is product code (the same rule that keeps src/contest/ and lib/attest.go counted).
+for p in src/contest-runner/a.sh src/test-runner/a.sh src/latest/a.sh src/fastest/a.sh src/attest/a.sh src/protests/a.py \
+         src/testutility/a.go src/testutil-helpers/a.go src/prod-testing/a.sh src/tests-runner/a.sh src/ab-test-arms/a.sh; do
+  prod "$p"; eq "still production (dir name merely contains the word): $p" "$?" "0"
+done
+# Known edge, pinned so it stays a decision: "/$p/" makes the last segment a component, so an extension-less FILE named like
+# a test dir is excluded too (the same way a file named `tests` always was). It leans toward not counting — the inert side.
+prod src/run-test; eq "NOT production (extension-less file named like a test dir: inert side, same as a file named 'tests')" "$?" "1"
+prod src/tests;    eq "NOT production (a file named exactly 'tests': the pre-existing behavior this edge shares)" "$?" "1"
+# The replay that made the reviewer's point, as an assertion, on a REAL numstat (git diff --numstat --no-renames of
+# a7321f4a8, feat(ga-5lx)): its two prod-tests files (story-ga-5lx.sh 78 + run.sh 30) took a 694-line production change to
+# 802 = refused at the 800 cap. The 215-line skill-audit.selftest.sh was already excluded.
+A7321="130${TAB}0${TAB}.gascity-gastown-hq/scripts/skill-integrity-install.sh
+268${TAB}0${TAB}.gascity-gastown-hq/scripts/skill-audit.sh
+30${TAB}0${TAB}.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/run.sh
+39${TAB}0${TAB}.gascity-gastown-hq/packs/town-deltas/assets/skill-audit.plist
+43${TAB}0${TAB}.gascity-gastown-hq/scripts/skill-lib.sh
+53${TAB}0${TAB}.gascity-gastown-hq/scripts/skill-audit-emit.sh
+72${TAB}1${TAB}.gascity-gastown-hq/scripts/skill-deploy.sh
+78${TAB}0${TAB}.gascity-gastown-hq/packs/town-deltas/assets/prod-tests/gascity/story-ga-5lx.sh
+88${TAB}0${TAB}.gascity-gastown-hq/packs/town-deltas/assets/delivery-runbooks.toml
+215${TAB}0${TAB}.gascity-gastown-hq/scripts/skill-audit.selftest.sh"
+eq "gate round 3 replay (a7321f4a8): the prod-tests story and run.sh do not count — 694, not the 802 that was refused" "$(gate_e11_count_production_lines "$A7321")" "694"
 
 # ── 4. counting: added + deleted over production paths, three states ─────────
 echo "── 4. gate_e11_count_production_lines ──"

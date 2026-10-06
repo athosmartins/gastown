@@ -4210,11 +4210,13 @@ close_open_run_verdicts() {
 # byte. The arm is a pure function of the bead id (SHA-256 with its own salt, the E5/E9 pattern), so a bead that
 # fails and re-submits can never change arm.
 #
-# NOT PRODUCTION (does not count): tests (tests/ test/ __tests__/ dirs, *.selftest.* in any language, selftest-*
+# NOT PRODUCTION (does not count): tests (tests/ test/ __tests__/ dirs, test-qualified dirs like prod-tests/ migration-test/
+# e2e-tests/ unit_test/ and the helper package testutil/ testutils/, *.selftest.* in any language, selftest-*
 # helper libs, test.* / test_* / test-*, *_test.* / *-test.*, *.test.*, *.spec.*, conftest.py, testdata/ — the shapes this
-# repo's own tests really carry, e.g. jev-preambulo.selftest.py, selftest-sandbox-path.lib.sh, scripts/test-gce-install.sh;
-# each anchored on the base name, never a bare "test" substring, so main_branch_test_runner.go and heavy-selftest-guard.sh
-# stay production), fixtures and snapshots (fixtures/ fixture/ __snapshots__/ *.snap *.golden),
+# repo's own tests really carry, e.g. jev-preambulo.selftest.py, selftest-sandbox-path.lib.sh, scripts/test-gce-install.sh,
+# assets/prod-tests/gascity/story-ga-5c3msy.sh; each anchored on the base name or on a WHOLE directory component, never a
+# bare "test" substring, so main_branch_test_runner.go, heavy-selftest-guard.sh and src/contest/ stay production),
+# fixtures and snapshots (fixtures/ fixture/ __snapshots__/ *.snap *.golden),
 # generated or vendored files (generated/ vendor/ node_modules/ dist/ *.pb.go *_pb2*.py *.min.js *.min.css
 # *.generated.* *_generated.* *.gen.go), lockfiles (*.lock package-lock.json pnpm-lock.yaml go.sum) and markdown
 # (*.md *.markdown *.mdx). Markdown is excluded WHOLESALE, by design, including the prompts and doctrine that are
@@ -4336,6 +4338,14 @@ gate_e11_path_is_production() {
   local p="${1:-}" base
   case "/$p/" in
     */tests/*|*/test/*|*/__tests__/*|*/testdata/*|*/fixtures/*|*/fixture/*|*/__snapshots__/*) return 1 ;;
+    # A test-QUALIFIED directory (prod-tests/, migration-test/, e2e-tests/, unit_test/ — a -test/-tests/_test/_tests
+    # suffix after a separator) and the Go helper package testutil/ (testutils/) are test code too. This repo keeps its
+    # post-deploy tests in assets/prod-tests/<rig>/story-ga-*.sh, whose base names match none of the shapes below
+    # (ga-lzidpo gate round 3: 58 files, ~6.000 lines counted as production). Whole components only: contest/,
+    # test-runner/, testutility/ and testutil-helpers/ stay production. ("/$p/" makes the LAST segment a component too,
+    # so an extension-less FILE named like one of these dirs — `run-test` — is excluded as well, exactly as a file named
+    # `tests` already was: it leans toward not counting, the inert side. No tracked path has that shape today.)
+    */*-tests/*|*/*-test/*|*/*_tests/*|*/*_test/*|*/testutil/*|*/testutils/*) return 1 ;;
     */vendor/*|*/node_modules/*|*/dist/*|*/generated/*) return 1 ;;
   esac
   base="${p##*/}"
