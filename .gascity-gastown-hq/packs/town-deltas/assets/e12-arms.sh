@@ -49,7 +49,10 @@
 #                                           or when off). Same exits as assign. --no-record is for a dry run: nothing is written, the
 #                                           recorded arm (else the pure arm) decides — looking at a bead must not enrol it.
 #
-# Not `set -e` / `set -u`-hostile: this file is also sourced by the selftest. No `exit` outside main().
+# Safe to source under `set -e` / `set -u` (the selftest does exactly that, section 8): every command substitution whose non-zero status is
+# an ANSWER ("no row" is rc 1, "cannot be read" rc 3) is captured with `|| rc=$?`, never `x="$(…)"; rc=$?`, which `set -e` turns into an
+# abort on the ordinary first-sight case. Today the only caller, the Pilot, runs it as a child process. The one `exit` is the last line and
+# runs only when the file is executed, never when it is sourced.
 
 E12_SALT="e12-write-3state"
 
@@ -165,8 +168,9 @@ e12_recorded_arm() {
   [ -e "$r" ] || return 1
   { [ -f "$r" ] && [ -r "$r" ]; } || return 3
   command -v jq >/dev/null 2>&1 || return 3
+  rc=0
   out="$(jq -R -r --arg b "$1" --arg s "$E12_SALT" \
-    'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b and .salt==$s) | "ROW:" + ((.arm // "") | tostring)' "$r" 2>/dev/null)"; rc=$?
+    'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b and .salt==$s) | "ROW:" + ((.arm // "") | tostring)' "$r" 2>/dev/null)" || rc=$?
   [ "$rc" -eq 0 ] || return 3
   [ -n "$out" ] || return 1
   first="${out%%$'\n'*}"; first="${first#ROW:}"
@@ -182,7 +186,7 @@ e12_resolve() {
   e12_state_gate || g=$?
   case "$g" in 0) ;; 1) return 0 ;; *) return "$g" ;; esac
   if e12_bad_bead_id "$bead"; then echo "e12: cannot assign an arm to '$bead'" >&2; return 3; fi
-  rec="$(e12_recorded_arm "$bead")"; rrc=$?
+  rrc=0; rec="$(e12_recorded_arm "$bead")" || rrc=$?
   case "$rrc" in
     0) E12_ARM="$rec"; return 0 ;;
     1) ;;

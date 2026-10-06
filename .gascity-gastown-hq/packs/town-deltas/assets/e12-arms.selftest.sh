@@ -246,6 +246,28 @@ else
   ok "(child run: the scratch-dir section is skipped to avoid recursing)"
 fi
 
+# The header of e12-arms.sh promises the file is safe to source under `set -e` / `set -u`. It was not: `rec="$(e12_recorded_arm …)"; rrc=$?`
+# hands the shell a non-zero status on the NORMAL first-sight case (rc 1 = no roster row), so a sourcing caller under `set -e` died
+# silently with exit 1 — and the same shape stood around the jq call. Nothing sources the file today (the Pilot runs it as a child, and so
+# does everything above), but the readout this experiment is waiting for is the obvious second caller. Each child sources the file under
+# `set -eu` and calls e12_resolve as a PLAIN statement: `f || …` would switch errexit off inside f and hide exactly what is tested here.
+echo "== 8. sourced under set -eu: an answer is not an abort =="
+_prev=""
+for _sh in "${BASH:-/bin/bash}" /bin/bash; do
+  [ -x "$_sh" ] && [ "$_sh" != "$_prev" ] || continue
+  _prev="$_sh"
+  newstate; conf "treated_pct=100"
+  _o="$("$_sh" -c 'set -eu; . "$1"; e12_resolve ga-s8-first store stage 0; echo "arm=$E12_ARM"' _ "$E12" 2>&1)"; _rc=$?
+  [ "$_rc" = 0 ] && [ "$_o" = "arm=treated" ] && ok "$_sh: first-sight bead (no roster row = rc 1) survives set -e and gets its arm" || bad "$_sh: first-sight bead under set -eu: exit=$_rc out='${_o:0:120}'"
+  newstate; conf "treated_pct=100"; : > "$SD/e12-roster.jsonl"
+  _shim="$W/shimjq$N_STATE"; mkdir -p "$_shim"; printf '#!/bin/sh\nexit 5\n' > "$_shim/jq"; chmod +x "$_shim/jq"
+  _o="$(PATH="$_shim:$PATH" "$_sh" -c 'set -eu; . "$1"; e12_resolve ga-s8-jq store stage 0; echo "reached-after-resolve"' _ "$E12" 2>&1)"; _rc=$?
+  case "$_o" in
+    *"roster cannot be read"*) [ "$_rc" = 3 ] && ok "$_sh: a failing jq is 'cannot tell' (exit 3, said so), not an abort with jq's own status" || bad "$_sh: jq failure said 'cannot be read' but exit=$_rc (want 3)" ;;
+    *) bad "$_sh: a failing jq under set -eu: exit=$_rc and no 'roster cannot be read' message: '${_o:0:120}'" ;;
+  esac
+done
+
 echo
 echo "e12-arms selftest: $PASS passed, $FAILN failed"
 REACHED_END=1
