@@ -393,7 +393,7 @@ pane_add_child() { # pane_add_child <agent> <screen>: the pane's process is a sh
 }
 unset_line() { grep -v " pid=$1 " "$D/city/.gc/logs/claude-pool-account.log" > "$D/log.tmp"; cp "$D/log.tmp" "$D/city/.gc/logs/claude-pool-account.log"; }   # a pane the wrapper never launched onto the pool item
 keys_sent() { [ -f "$TMUXD/keys.log" ] && wc -l < "$TMUXD/keys.log" | tr -d ' ' || echo 0; }
-keys_to() { [ -f "$TMUXD/keys.log" ] && grep -c "^$1 " "$TMUXD/keys.log" || echo 0; }
+keys_to() { local c; c="$(grep -c "^$1 " "$TMUXD/keys.log" 2>/dev/null)"; echo "${c:-0}"; }   # grep -c prints 0 AND exits 1 when nothing matches: no `|| echo 0` here, it would print a second 0
 rearm() { edit_state 'st.pop("panes", None)'; }   # the session hit the limit AGAIN: a modal the daemon has not seen before
 # A reset time is believed only if it is ahead of NOW and at most 31 days away (the daemon's _usable_reset). The scenarios below
 # store reset times like 2000000000, so they run on a clock that makes them 11 days ahead - unless a test sets NOW_OVERRIDE itself
@@ -1191,13 +1191,14 @@ EOF
       && ok "B50e ...and the log does not claim a switch" || bad "B50e log: $(tail -n 3 "$LOG" | tr '\n' '|')"
   fi
 
-  # ══ B51..B79 (ga-8hcnvb.2): the switch happens when the limit was HIT, on EVIDENCE from the pool's own panes, by this script alone ══
+  # ══ B51..B81 (ga-8hcnvb.2): the switch happens when the limit was HIT, on EVIDENCE from the pool's own panes, by this script alone ══
   # (Athos 04/10: "tem que trocar no 100%. A gente não quer ficar com 5% sem usar" - no preventive threshold, no agent, no credit.)
   #   B51..B54  no evidence / could not look  -> nothing asked, nothing moved      B55..B57  whose panes count at all (never Mayor / crews)
   #   B52       evidence -> failover in the same run, nothing that costs            B53       evidence the account answers -> bounded cost
   #   B60..B66  the Escape: when, to whom, how often, how it is guarded             B67..B69  the bookkeeping behind it
   #   B70       failback by timer and the evidence                                  B71       the whole cycle, with the zero-credit proof
   #   B72       no failback before the stored reset                                  B73..B79  the limit screen after the modal is gone (envelope only)
+  #   B80       a pane with no agent name is evidence, never pressed                 B81       a pane that could not be read keeps its bookkeeping
   cat > "$BB/claude" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$FAKE_KC/claude-invoked"
@@ -1660,6 +1661,28 @@ EOF
   set_srv a@t.test 200 "$HDR_OK"; run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && no_crash && [ "$(keys_sent)" = "0" ] && [ "$("$PY3" -c 'import json,sys; e=list(json.load(open(sys.argv[1]))["panes"].values())[0]; print(isinstance(e.get("sig"),str) and e.get("modal") is False)' "$STATE")" = "True" ] \
     && ok "B79 a state with a non-string signature and a non-boolean flag -> read as a new sighting, rewritten sane, no key" || bad "B79 rc=$rc keys=$(keys_sent) panes=$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panes"))' "$STATE")"
+
+  # B80 a pool pane whose agent name the wrapper could not log ("agent=?": GC_AGENT unset; or a name that is no name) is still evidence - it
+  # follows the item, so the pool moves for it - but it cannot be told from Mayor or a crew, so it is never pressed. With a named pool pane
+  # beside it, the one key goes to the named one alone.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add '?' modal; un=$PANE; pane_add 'we!rd' modal; un2=$PANE
+  touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120; later 300
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] && [ "$(keys_sent)" = "0" ] && grep -q "have no agent name - not told apart from Mayor/crew, no Escape for them" "$LOG" \
+    && ok "B80 panes with no agent name on the modal: the pool moves (they are evidence), no Escape goes to them, and the log says why" \
+    || bad "B80 current='$(jget "$STATE" current)' messages-calls=$(msgs) keys=$(keys_sent): $(grep -E 'UNSTICK|no agent name' "$LOG" | tail -n 2 | cut -c1-140 | tr '\n' '|')"
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add '?' modal; un=$PANE; pane_add gastown.dog-2 modal; named=$PANE
+  touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120
+  [ "$(keys_sent)" = "1" ] && [ "$(keys_to "$named")" = "1" ] && [ "$(keys_to "$un")" = "0" ] \
+    && ok "B80b ...beside a named pool pane: the one Escape goes to the named one, none to the nameless one" || bad "B80b keys=$(keys_sent) to-named=$(keys_to "$named") to-nameless=$(keys_to "$un")"
+
+  # B81 a pane whose screen cannot be READ in a scan that otherwise worked is not 'a pane that left the limit screen': what is known about it
+  # is kept. Forgotten, it would come back with a new first-seen time - a stale modal looking fresh, never unstuck, and asking b a question.
+  failed_over; touch "$TMUXD/clear-on-esc"; mv "$TMUXD/screen.${PANE#%}" "$TMUXD/screen.hidden"
+  later 100; k1=$(keys_sent); m1=$(msgs); pn1="$(jget "$STATE" panes)"
+  mv "$TMUXD/screen.hidden" "$TMUXD/screen.${PANE#%}"; later 110
+  [ "$k1" = "0" ] && [ -n "$pn1" ] && [ "$(keys_sent)" = "1" ] && [ "$(keys_to "$PANE")" = "1" ] && [ "$m1" = "1" ] && [ "$(msgs)" = "1" ] && grep -q "could not be read this run - nothing concluded about them" "$LOG" \
+    && ok "B81 a pane that could not be read for one run keeps its bookkeeping: still the replaced credential's stale modal when it is read again -> ONE Escape, b never asked" \
+    || bad "B81 keys while unreadable=$k1 after=$(keys_sent) messages-calls $m1 -> $(msgs) panes-kept='$pn1': $(grep -E 'UNSTICK|EVIDENCE|could not be read' "$LOG" | tail -n 3 | cut -c1-140 | tr '\n' '|')"
 
   # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
   # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).

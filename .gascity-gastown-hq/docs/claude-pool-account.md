@@ -131,7 +131,10 @@ A pane is **evidence** only if all of these hold (each is a reason *not* to act,
 
 Three states, as everywhere in this daemon: **evidence** (ask the API once), **no evidence** (ask nothing; a failback is
 allowed), **could not look** (`tmux` down or not runnable, `ps` unreadable, the wrapper's log unreadable): nothing is
-concluded - no probe, no failback, no key, and what was remembered about the panes is left as it was.
+concluded - no probe, no failback, no key, and what was remembered about the panes is left as it was. The same holds for one pane
+inside a scan that otherwise worked: a pool pane whose screen cannot be read this run (`capture-pane` failed) is logged
+(`n pool pane(s) could not be read this run`) and is neither evidence nor "gone" - its first-seen time, tries and answered
+question are kept, so a stale modal does not come back looking fresh.
 
 ## The Escape exception
 
@@ -147,6 +150,7 @@ that shows only the envelope gets no key, whatever else is true of it. Every con
 |---|---|
 | never in the run that rewrote the item, and not before it has been in place for **45 s** | claude re-reads the item every ~30 s: an Escape earlier would land the session on the *old* credential's modal again |
 | only pool panes proven as above; **never Mayor or a crew** (name check on the raw agent name, in the log reader and again in the scan) | Mayor's / the crews' Remote Control must never be disturbed (Athos 05/10); they run plain `claude`, not the wrapper's pool path |
+| the pane has an **agent name**: the wrapper logs `agent=?` when it cannot tell who the session is, and such a pane is still evidence (it follows the item, so the pool moves for it) but is never pressed | a session that cannot be told from Mayor or a crew is not pressed; the log says `no agent name ... no Escape for them` |
 | the item still holds the credential of the decision (fingerprint), is readable, and the account in use is not registered exhausted | an Escape into a credential that is itself exhausted would land on the modal again |
 | the pane's process and the modal are re-read **immediately before** the key (the scan is seconds old) | a pane that changed or went back to working is not interrupted |
 | at most **3 tries per pane**, counted *before* the attempt and kept in the state file (junk there reads as "already tried"); at most **20 keys per run** | an Escape that does not take is not repeated for ever; a burst is never unbounded |

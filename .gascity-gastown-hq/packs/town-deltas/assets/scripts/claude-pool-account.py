@@ -452,10 +452,12 @@ class PanePeek:
 
 
 class Scan:
-    """`ok` False = could not look (no tmux, no ps): nothing is concluded from it, and the bookkeeping about panes is left as it was."""
+    """`ok` False = could not look (no tmux, no ps): nothing is concluded from it, and the bookkeeping about panes is left as it was.
+    `unlooked` = keys of proven pool panes whose screen could not be read in an otherwise good scan: they are neither on the limit screen
+    nor off it, so nothing is concluded about them and what is known about them is kept (see track_panes)."""
 
-    def __init__(self, ok: bool, panes: Optional[List[PanePeek]] = None):
-        self.ok, self.panes = ok, panes or []
+    def __init__(self, ok: bool, panes: Optional[List[PanePeek]] = None, unlooked: Optional[List[str]] = None):
+        self.ok, self.panes, self.unlooked = ok, panes or [], set(unlooked or [])
         self.by_key = {p.key: p for p in self.panes}
 
 
@@ -625,6 +627,7 @@ def scan_panes() -> Scan:
         if len(f) == 3 and PANE_ID_RE.fullmatch(f[0]) and f[1].isdigit() and f[2] == "0":
             pane_of[int(f[1])] = (f[0], int(f[1]))
     panes: List[PanePeek] = []
+    unlooked: List[str] = []
     for pid, (agent, launched) in sorted(proven.items()):
         cur, hops = pid, 0
         while cur in table and hops < 8 and cur not in pane_of:   # the pane's process is the claude itself, or an ancestor of it
@@ -633,11 +636,14 @@ def scan_panes() -> Scan:
             continue
         pane_id, pane_pid = pane_of[cur]
         rc, text = tmux(["capture-pane", "-p", "-J", "-t", pane_id])
-        if rc != 0:
+        if rc != 0:   # a pane that is there and whose screen cannot be read is not "a pane that is not on the limit screen"
+            unlooked.append(f"{pane_id}:{pid}")
             continue
         stuck = modal_stuck(text)
         panes.append(PanePeek(pane_id, pane_pid, pid, agent, stuck, launched, limit_hit(text, stuck)))
-    return Scan(True, panes)
+    if unlooked:
+        log("WARN", f"{len(unlooked)} pool pane(s) could not be read this run - nothing concluded about them, what is known about them is kept")
+    return Scan(True, panes, unlooked)
 
 
 def safe_scan() -> Scan:
@@ -689,11 +695,14 @@ def track_panes(st: dict, scan: Scan, t: float) -> None:
     the scan at all, is forgotten; one on ANOTHER hit than the one tracked is a new sighting (first, tries, and the answer to an
     earlier probe all start over: a new screen is new evidence). The modal and the envelope of the same hit share a signature, so
     dismissing the modal does not make the same hit look new. A scan that could not look changes nothing: 'could not tell' is not
-    'nobody is stuck any more'."""
+    'nobody is stuck any more' - and neither is a pane whose screen could not be read in a scan that otherwise could (scan.unlooked):
+    forgetting it would hand it a new `first` (a stale modal would then look fresh and never be unstuck) and a new set of tries."""
     if not scan.ok:
         return
     tracked = st.setdefault("panes", {})
     for k in list(tracked):
+        if k in scan.unlooked:
+            continue
         p = scan.by_key.get(k)
         if p is None or p.hit is None:
             del tracked[k]
@@ -1151,6 +1160,10 @@ def unstick(st: dict, scan: Scan, user: str, t: float) -> None:
         return
     todo = [p for p in scan.panes if p.stuck and p.key in tracked and stale_modal(st, p, tracked[p.key])
             and tracked[p.key]["tries"] < MAX_ESC_TRIES]
+    unnamed = [p for p in todo if p.agent == "?"]
+    if unnamed:   # the wrapper could not log who this is (GC_AGENT unset, or a name that is no name): it cannot be told from Mayor or a crew, so no key
+        log("INFO", f"{len(unnamed)} pool pane(s) on the limit modal of a replaced credential have no agent name - not told apart from Mayor/crew, no Escape for them")
+        todo = [p for p in todo if p.agent != "?"]
     if not todo:
         return
     off = unstick_disabled()
