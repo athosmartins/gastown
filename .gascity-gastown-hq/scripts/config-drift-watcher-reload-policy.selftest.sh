@@ -505,7 +505,7 @@ done
 echo "# new skill" > "$E2E/skills/e2e.md"
 i=0
 while [ "$i" -lt 60 ]; do
-    grep -F "reload[file-change] OK" "$E2E_LOG" >/dev/null 2>&1 && break
+    grep -F "own slot duty since start" "$E2E_LOG" >/dev/null 2>&1 && break   # the last line finish_reload logs
     sleep 0.5; i=$((i + 1))
 done
 kill "$DPID" 2>/dev/null || true
