@@ -63,7 +63,8 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     this daemon's memory). A queued marker M is an orphan only when ALL of these hold:
       (a) M is queued and at least ORPHAN_MIN_AGE_SEC old;
       (b) the published file is readable, holds >= ORPHAN_ORDER_SWEEPS (3) publications with strictly
-          increasing times, none in the future, and the newest is fresh (ORPHAN_DRAIN_FRESH_SEC);
+          increasing times, the newest no further ahead of now than a clock-skew margin (ORPHAN_ORDER_MARGIN_SEC),
+          and the newest is fresh (ORPHAN_DRAIN_FRESH_SEC);
       (c) M has been untouched since BEFORE the oldest of those publications (its updated_at, less a
           margin) — a marker re-queued inside the window was never in a position to be seen in it;
       (d) M is in NONE of those publications, neither in `order` nor in `set_aside`.
@@ -1176,9 +1177,10 @@ def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_se
 
     A marker is an orphan only when ALL hold:
       - it is queued and old enough (min_age) — a marker younger than that has not had a sweep to be seen in;
-      - the published order is readable, holds >= `sweeps` publications with strictly increasing times none of them in
-        the future, and the newest is fresh (else the file describes a dispatcher that is not running or not
-        publishing, and 'absent from it' means nothing);
+      - the published order is readable, holds >= `sweeps` publications with strictly increasing times, the newest no
+        further ahead of now than `margin` (clock skew between two processes is tolerated, a clock that stepped back
+        is not), and the newest is fresh (else the file describes a dispatcher that is not running or not publishing,
+        and 'absent from it' means nothing);
       - the marker has been untouched since BEFORE the oldest of those `sweeps` publications (its updated_at, less a
         margin) — a marker that was re-queued after the window began was never in a position to be seen in it;
       - it is in NONE of those publications, ordered or set aside.
@@ -1197,7 +1199,7 @@ def _orphan_verdict(markers, pubs, why, now, sweeps=None, min_age=None, fresh_se
     win = pubs[-sweeps:]
     ats = [p["at"] for p in win]
     if any(b <= a for a, b in zip(ats, ats[1:])) or ats[-1] > now + margin:
-        return (None, "clock", "the last %d publication times are not strictly increasing, or one is in the future" % sweeps)
+        return (None, "clock", "the last %d publication times are not strictly increasing, or the newest is more than %ds ahead of now" % (sweeps, margin))
     if now - ats[-1] > fresh_sec:
         return (None, "stale", "the newest publication is %dmin old (limit %dmin)" % ((now - ats[-1]) // 60, fresh_sec // 60))
     found = []
