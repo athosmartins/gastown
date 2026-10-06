@@ -455,6 +455,10 @@ case "$LINT_OUT" in *"
 LINT SEES: "*) ok "a clean run prints LINT SEES" ;; *) bad "no LINT SEES line: $LINT_OUT" ;; esac
 case "$LINT_OUT" in *"
 LINT NOT SEEN: "*) ok "a clean run prints LINT NOT SEEN" ;; *) bad "no LINT NOT SEEN line: $LINT_OUT" ;; esac
+# A glob that matches no file is a part of the scope the lint is not looking at (a directory renamed away): it must be
+# counted in the summary and named in a LINT NOTE, and on the real tree there must be none — a rename fails HERE.
+case "$LINT_OUT" in *" empty_globs=0"*) ok "the real tree: every scope glob matches a file (empty_globs=0)" ;; *) bad "the real tree has an empty scope glob: $(printf '%s\n' "$LINT_OUT" | grep -E '^LINT (NOTE|:)')" ;; esac
+eq "the real tree: no LINT NOTE" "$(lint_count '^LINT NOTE')" "0"
 for o in ga-q8tj7p ga-9t9acg.2 ga-9t9acg.3 ga-9t9acg.4 ga-9t9acg.5 ga-9t9acg.6 ga-9t9acg.8 ga-9t9acg.9 ga-9t9acg.10 ga-9t9acg.13; do
   if awk -F'\t' -v o="$o" '$1 == "consumer" && $4 == o {f=1} END {exit !f}' "$REGISTRY"; then ok "a consumer row is owned by $o"; else bad "no consumer row for $o"; fi
 done
@@ -467,6 +471,9 @@ T1="$TMP/lt1"; mk_tree "$T1"; : > "$TMP/empty.tsv"
 echo '#!/bin/bash' > "$T1/packs/town-deltas/assets/ok.sh"; echo 'echo hi' >> "$T1/packs/town-deltas/assets/ok.sh"
 lint_run "$T1" "$TMP/empty.tsv"; eq "a tree without idioms: exit" "$LINT_RC" "0"
 case "$LINT_OUT" in *"idiom_lines=0"*) ok "a tree without idioms: idiom_lines=0" ;; *) bad "a tree without idioms: $LINT_OUT" ;; esac
+case "$LINT_OUT" in *" empty_globs=9"*) ok "a tree with one file in scope: nine empty globs are counted" ;; *) bad "empty globs not counted: $(printf '%s\n' "$LINT_OUT" | grep '^LINT:')" ;; esac
+eq "a tree with one file in scope: one LINT NOTE per empty glob" "$(lint_count '^LINT NOTE: no file matches scope glob ')" "9"
+case "$LINT_OUT" in *"LINT NOTE: no file matches scope glob commands/*.md "*) ok "the LINT NOTE names the glob" ;; *) bad "the LINT NOTE does not name commands/*.md: $LINT_OUT" ;; esac
 FOO="$T1/packs/town-deltas/assets/foo-dispatcher.sh"
 printf '%s\n' '#!/bin/bash' '# sort_by(.created_at) in a comment is not a hit' "X=\$(echo \"\$J\" | jq 'sort_by(.created_at) | .[0]')" > "$FOO"
 lint_run "$T1" "$TMP/empty.tsv"
@@ -508,6 +515,8 @@ for g in "${GLOBS[@]}"; do
 done
 lint_run "$T6" "$TMP/empty.tsv"
 eq "one finding per SCOPE glob ($n globs)" "$(lint_count 'UNREGISTERED')" "$n"
+case "$LINT_OUT" in *" empty_globs=0"*) ok "every glob has a file: empty_globs=0" ;; *) bad "empty_globs is not 0 with a file under every glob: $(printf '%s\n' "$LINT_OUT" | grep '^LINT:')" ;; esac
+eq "every glob has a file: no LINT NOTE" "$(lint_count '^LINT NOTE')" "0"
 for g in "${GLOBS[@]}"; do
   f="${g//\*/fx}"
   case "$LINT_OUT" in *"UNREGISTERED $f:1 "*) ok "scope glob is scanned: $g" ;; *) bad "scope glob is NOT scanned: $g" ;; esac
@@ -734,6 +743,11 @@ must_fail lint-counts-zero-as-a-window py '
 _VALUE = r"""["'\'']?(?!0(?!\d))(?:' '
 _VALUE = r"""["'\'']?(?:'
 must_fail lint-flags-tail-n py '_NOT_OTHER_TOOL = r"""^(?!.*\[\s*["'\''](?:tail|head|sed|sysctl|sort|jq|cut)["'\''])"""' '_NOT_OTHER_TOOL = r"""^"""'
+must_fail lint-empty-glob-is-quiet py '        if len(files) == before:' '        if False:'
+must_fail lint-hides-glob-note py '        sys.stdout.write("LINT NOTE: %s\n" % item)' '        pass'
+must_fail lint-uncounted-empty-globs py 'len(empty_globs))
+    notes' '0)
+    notes'
 must_fail lint-hides-scope py '    sys.stdout.write("LINT SCOPE: %s (not: selftests, test_*.py, work-order.sh, work_order.py)\n" % " ".join(SCOPE_GLOBS))' '    pass'
 must_fail lint-hides-sees py '    sys.stdout.write("LINT SEES: %s\n" % LINT_SEES)' '    pass'
 must_fail lint-hides-not-seen py '    sys.stdout.write("LINT NOT SEEN: %s\n" % LINT_NOT_SEEN)' '    pass'

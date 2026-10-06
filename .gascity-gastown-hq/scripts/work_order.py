@@ -23,6 +23,9 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
          The lint is NOT total, and every run says so: after the summary it prints the scope and the
          shapes it cannot see (LINT SCOPE / LINT SEES / LINT NOT SEEN). "clean" means "no unregistered
          line of a seen shape in that scope" — never "no ad-hoc ordering exists". See the registry header.
+         A scope glob that matches no file (a directory renamed away) is a part of the scope nobody read:
+         the summary counts it (empty_globs=N) and a `LINT NOTE:` line names it. It does not fail the run
+         (the real-tree selftest asserts it is 0), but it is never quiet.
 
 As a module: `sort_beads(beads, age="created")` returns `(ordered_list, warnings)`, or
 `(None, [reason])` when it cannot tell — the caller then keeps its previous order and logs a WARN.
@@ -169,13 +172,18 @@ def _read_lines(path):
 
 
 def _scope_files(root):
-    files = []
+    """-> (files in scope, the globs that matched no file). An empty glob is a part of the scope the lint is
+    NOT looking at (a directory renamed away): it is reported, never read as "that part is clean"."""
+    files, empty = [], []
     for pat in SCOPE_GLOBS:
+        before = len(files)
         for path in sorted(glob.glob(os.path.join(root, pat))):
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             if os.path.isfile(path) and not SCOPE_SKIP.search("/" + rel):
                 files.append(rel)
-    return files
+        if len(files) == before:
+            empty.append(pat)
+    return files, empty
 
 
 def _parse_registry(path, errors):
@@ -217,11 +225,13 @@ def _parse_registry(path, errors):
 
 
 def lint(root, registry):
-    """-> (findings, summary). Findings are strings; an empty list means the registry is clean."""
+    """-> (findings, summary, notes). Findings are strings; an empty list means no unregistered line of a SEEN
+    shape in the scope. Notes are lines about the scope itself (a glob that matched no file); they never
+    fail the run, but the summary counts them (empty_globs=N) so they are not quiet."""
     errors = []
     rows = _parse_registry(registry, errors)
     local = [r for r in rows if r["kind"] != "ext"]
-    scope = _scope_files(root)
+    scope, empty_globs = _scope_files(root)
     if not scope:
         # a lint that looked at nothing must not say "clean": a mistyped --root would pass for a clean tree
         raise OSError("no file in the lint scope under %s" % root)
@@ -248,10 +258,12 @@ def lint(root, registry):
             errors.append("STALE row %s: %s no longer has a line matching /%s/ — the slice migrated it, delete the row"
                           % (r["where"], r["file"], r["rx"].pattern))
     owners = [r["owner"] for r in rows if r["kind"] == "consumer"]
-    summary = "LINT: files=%d idiom_lines=%d rows=%d consumer_rows_left=%d unassigned=%d ext=%d reviewed=%d" % (
+    summary = "LINT: files=%d idiom_lines=%d rows=%d consumer_rows_left=%d unassigned=%d ext=%d reviewed=%d empty_globs=%d" % (
         len(scope), hits, len(rows), len(owners), owners.count("UNASSIGNED"),
-        sum(1 for r in rows if r["kind"] == "ext"), sum(1 for r in rows if r["kind"] == "reviewed"))
-    return errors, summary
+        sum(1 for r in rows if r["kind"] == "ext"), sum(1 for r in rows if r["kind"] == "reviewed"), len(empty_globs))
+    notes = ["no file matches scope glob %s — that part of the scope is empty (a renamed directory?); "
+             "fix SCOPE_GLOBS or the tree" % g for g in empty_globs]
+    return errors, summary, notes
 
 
 def _main_lint(rest):
@@ -267,13 +279,15 @@ def _main_lint(rest):
             return 2
     registry = registry or os.path.join(root, DEFAULT_REGISTRY)
     try:
-        findings, summary = lint(root, registry)
+        findings, summary, notes = lint(root, registry)
     except OSError as exc:
         sys.stderr.write("work-order ERROR: lint: cannot read the registry or the tree (%s); cannot tell\n" % exc)
         return 2
     for item in findings:
         sys.stdout.write("LINT FAIL: %s\n" % item)
     sys.stdout.write(summary + "\n")
+    for item in notes:
+        sys.stdout.write("LINT NOTE: %s\n" % item)
     # always, clean or not: a clean exit must not be readable as "nothing is ordered ad hoc"
     sys.stdout.write("LINT SCOPE: %s (not: selftests, test_*.py, work-order.sh, work_order.py)\n" % " ".join(SCOPE_GLOBS))
     sys.stdout.write("LINT SEES: %s\n" % LINT_SEES)
