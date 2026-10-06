@@ -30,7 +30,8 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
    stamps a heartbeat        <city>/.gc/claude-pool-account.heartbeat — ONLY at the end of a run that logged no ERROR
                              (a clean run that had nothing to decide counts; a refused Keychain write, a read-back that
                               does not match or an unpublished decision does not). The guard reads it: see "The guard".
-   stands down               while <city>/.gc/pool-account-degraded exists (written by the guard, never by the daemon)
+   stands down               while <city>/.gc/pool-account-degraded exists (written by the guard, never by the daemon),
+                             or the operator's switches are on - and stamps NO heartbeat while it does (the guard knows: see LIVENESS)
 
  claude-lowprio.sh  (last hop of providers.claude-headless)
    item exists -> exports CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.gastown/claude-pool-cred and USER, then exec claude
@@ -66,7 +67,7 @@ mechanism off.
  claude-pool-guard.py run-once
    1 DIVERGENCE   the account whose key is in the pool item   vs   the decision file's current + fingerprint
                   different for 2 min (the daemon writes the item and THEN the file: a shorter disagreement is normal)
-                    -> ONE push, priority 4, forced:  "Pool Claude: conta em uso diverge da regra"
+                    -> ONE push, priority 4, forced:  "Pool Claude: conta em uso diverge da regra (regra xxxxxxxx, em uso yyyyyyyy)"
                        expected: <email> (fp xxxxxxxx)   in use: <email> (fp yyyyyyyy)   — names and 8-hex fingerprints, never a key
                     -> repeated only every 6 h while nobody fixes it ("Lembrete: ..."); nothing when it is fixed (the episode
                        closes in the state file and the log says "divergence over")
@@ -82,15 +83,30 @@ mechanism off.
                     -> FAIL: writes <city>/.gc/pool-account-degraded. The daemon stops switching (log: disabled by ...), the wrapper
                        stops pointing NEW launches at the pool item (they answer normally on the current login). Nothing is deleted,
                        no running session is touched (it keeps the last account written: a valid login).
-                       ONE push, priority 4, forced: "Pool Claude: troca automática DESLIGADA" (names the claude version and why)
-                    -> PASS after a FAIL: the marker is removed and a quiet notice (priority 2, not forced) says it is back on
+                       ONE push, priority 4, forced: "Pool Claude: troca automática DESLIGADA (claude <version>)" (and why)
+                    -> FAIL but the marker cannot be written (<city>/.gc not writable, no city): the worst state, so it is said, not just
+                       logged: ONE push "Pool Claude: troca automática NÃO foi desligada (claude <version>)" - the pool is still ON.
+                       Retried every tick; the normal DESLIGADA push goes out when the marker finally lands.
+                    -> PASS after a FAIL: the marker is removed and a quiet notice (priority 2, not forced) "troca automática religada"
+                       says it is back on. If the marker is NOT the guard's (`by` says so) it is left alone and nothing is announced:
+                       it is still off, and "religada" goes out only once the marker is really gone.
                     -> INCONCLUSIVE (claude hangs, Keychain locked, output that is not JSON): changes nothing; after 30 min of it, one
-                       "Pool Claude: guarda sem enxergar" says the guard cannot verify. It never degrades on "could not tell".
-   3 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas"
-                  (not while the mechanism is off or degraded; not for a pool that was never activated). A heartbeat that cannot be
-                  read (garbled, no time in it, stamped in the future, not a file) or a pool whose activation cannot be told (Keychain
-                  locked, no decision) is "could not tell": no verdict, and the 30-minute "guarda sem enxergar" notice instead.
+                       "Pool Claude: guarda sem enxergar (self-test of claude <version>)" says the guard cannot verify. It never
+                       degrades on "could not tell".
+   3 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas
+                  (última: <stamp>)" (not while the mechanism is off or degraded; not for a pool that was never activated).
+                  The silence is judged only over time the guard was LOOKING: a stamp that went stale while the guard was not there
+                  (reboot, sleep, launchd unloaded: two looks more than 5 min apart) or while the daemon was stood down on purpose
+                  (the degraded marker, `no-pool-account`, GC_POOL_ACCOUNT=0 - the real daemon stamps nothing then) is no evidence of a
+                  death: after any of those the 10 minutes start again from the first look. A daemon that really stays silent is still
+                  told 10 minutes after that. A heartbeat that cannot be read (garbled, no time in it, stamped in the future, not a
+                  file) or a pool whose activation cannot be told (Keychain locked, no decision) is "could not tell": no verdict, and
+                  the 30-minute "guarda sem enxergar (<what>)" notice instead.
 ```
+
+Every push carries what makes its condition different IN THE TITLE (the claude version, the two fingerprints of a divergence, what the
+guard cannot see, the last heartbeat): `notify` drops a push whose title already went out in the last 30 minutes, whatever the body says
+(exit 11), and the guard counts that as delivered - so two conditions sharing a title would lose the second one.
 
 Three answers, never two: every check is yes / no / could not tell, and "could not tell" never acts.
 
@@ -99,10 +115,18 @@ Three answers, never two: every check is yes / no / could not tell, and "could n
 ```bash
 G=/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-pool-guard.py
 python3 $G status          # human
-python3 $G status --json   # installed_claude, installed_result, versions{<ver>: {result, checked_at, detail, attempts}}, degraded, divergence
-                           # installed_result is "unknown (...)" when the state file is corrupt/unreadable or claude's version cannot be read
-                           # (status then exits 1 for a bad state file); "not tested yet" only when nothing is recorded. status changes no file.
-python3 $G selftest        # run the per-version test now, whatever was recorded, and act on the result
+python3 $G status --json   # installed_claude, installed_result, versions{<ver>: {result, checked_at, detail, attempts}}, auto_switch, degraded, divergence
+                           # installed_result is "unknown (...)" when the state file is corrupt/unreadable or claude's version cannot be read;
+                           # "not tested yet" only when nothing is recorded. auto_switch is "on" | "OFF" | "unknown (why)" and degraded is
+                           # true | false | null: the marker is looked for under GC_CITY_PATH, which only the plist and agent sessions export -
+                           # in a plain shell (or with a city that has no .gc, or a .gc that cannot be read) the answer is "unknown", never "on".
+                           # status exits 1 for a bad state file OR an unknown auto_switch. status changes no file.
+python3 $G selftest        # run the per-version test now, whatever was recorded, act on the result, and SAY what happened:
+                           #   rc 0  "claude X: pass"          (+ "auto-switch is now on" if it lifted the marker)
+                           #   rc 3  "claude X: fail"          (+ "auto-switch is now OFF", or "is NOT off: ... marker could not be written")
+                           #   rc 4  "claude X: inconclusive"  (nothing changed)
+                           #   rc 1  "the self-test was NOT run: <why>"  (kill switch on, another guard run holds the lock, no claude, no city)
+                           # (`run-once`, the launchd tick, stays quiet and keeps its rc 0 when it has nothing to do.)
 ```
 
 State: `/Users/athos/shared/data/claude_pool_guard.json` (`versions`, `divergence`, `degraded`, `blind`, `daemon`). Log:
@@ -122,6 +146,11 @@ boundary, a process argv, a process environment) and refuses to call anything cl
 a daemon that puts the key in `security`'s argv and a guard that puts it in the push **fail** the same scenario (the mutations).
 Run it against the real thing (keys read from the vault into memory only, nothing printed):
 `claude-pool-leakscan.py --keys-vault --ps --path <city>/.gc/logs --path /Users/athos/shared/data`.
+
+A scan never skips a symlink in silence (G15): a link to a **file** is read through (a finding carries the link's name); a link to a
+**directory** is not followed - it is *covered* when that directory lies inside another `--path` (the real `shared/data/data ->
+shared/data` is covered by `shared/data` itself, and cannot loop) and is **BLIND** (exit 3, naming the link and the `--path` to add) when
+it does not; a dangling link is BLIND. A `--path` that is itself a link is read through the same way.
 
 ## Activation — merged is not live
 
@@ -177,7 +206,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
 | `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
 | `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
-| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G8: divergence, per-version test, liveness, scratch item, no-leak proof with control and mutations) |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G15: divergence, per-version test, scratch item, liveness, `status`, stand-down vs. death, one title per condition, marker that cannot be written / is not the guard's, `selftest` output, leakscan symlinks, and the no-leak proof with control and mutations) |
 | `packs/town-deltas/assets/scripts/claude-pool-leakscan.py` | the key-leak scanner (with its control); also usable by hand |
 | `/Users/athos/shared/data/claude_pool_guard.json` | the guard's state: per-version results, open episodes |
 | `.gc/claude-pool-account.heartbeat`, `.gc/pool-account-degraded` | the daemon's last clean run; the guard's "auto-switch is off" marker |

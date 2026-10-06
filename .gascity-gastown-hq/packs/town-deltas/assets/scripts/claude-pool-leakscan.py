@@ -22,6 +22,10 @@ THE CONTROL runs first, always: it plants a random fake key on every channel thi
 a process argv, a process environment) and requires the scanner to find it in every form. A scanner that cannot see what was planted on
 purpose proves nothing about the real thing, so a failed control means exit 3 - never a green result.
 
+NOTHING IS SKIPPED in silence: a file that is not looked at is a blind spot, not a clean one. A symlink to a file is read through; one to a
+directory is covered when that directory lies inside another --path and is reported as BLIND (with the --path to add) when it does not; a
+dangling one is BLIND.
+
 EXIT  0 = nothing found and the control saw what it planted.  1 = a key was found (key-shaped text that is none of ours counts too, in a
 file; in the process list - the whole machine's - it is only a NOTE line).  3 = the scan is BLIND: the control failed, or a path
 could not be read, or a key is too short to search for, or the keys could not all be loaded. 2 = usage.
@@ -46,7 +50,6 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 CHUNK = 4 << 20
 SHAPE_RE = re.compile(rb"sk-ant-[A-Za-z0-9_\-]{8,}")
 MIN_KEY_LEN = 20            # a shorter needle matches innocent text and proves nothing
-SKIP_ENDINGS = ()           # nothing is skipped: a file that is not looked at is a blind spot, not a clean one
 DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py"
 
 Finding = Tuple[str, str, str, str]   # (channel, location, account, form)
@@ -133,23 +136,63 @@ def scan_file(path: Path, nd: Needles, chunk: int) -> Tuple[List[Tuple[str, str,
     return [(a, fo, len(p)) for (a, fo), p in sorted(hits.items())], None
 
 
+def _inside(target: Path, roots: List[Path]) -> bool:
+    return any(target == r or r in target.parents for r in roots)
+
+
 def walk(paths: Iterable[Path]) -> Tuple[List[Path], List[Tuple[Path, str]]]:
-    files, errors = [], []
+    """Every file under `paths`, and what could not be looked at. A symlink is never skipped in silence: one to a FILE is read through (a finding
+    carries the link's name), one to a directory is covered when that directory lies inside another scanned path and is a blind spot (exit 3,
+    naming what to add) when it does not, a dangling one is a blind spot. Directories are walked without following links, so a link back
+    into the tree (shared/data/data -> shared/data) cannot loop."""
+    paths = list(paths)
+    files: List[Path] = []
+    errors: List[Tuple[Path, str]] = []
+    roots: List[Path] = []
     for p in paths:
-        if p.is_symlink():
-            errors.append((p, "is a symlink (not followed)"))
-        elif p.is_file():
-            files.append(p)
-        elif p.is_dir():
+        try:
+            r = Path(os.path.realpath(p))
+        except OSError:
+            continue
+        if r.is_dir():
+            roots.append(r)         # a --path that is a link to a directory is the operator naming that directory
+
+    def link(q: Path) -> None:
+        try:
+            target = Path(os.path.realpath(q))
+        except OSError as e:
+            errors.append((q, f"is a symlink that cannot be resolved ({type(e).__name__})"))
+            return
+        if target.is_file():
+            files.append(q)
+        elif target.is_dir():
+            if not _inside(target, roots):
+                errors.append((q, f"is a symlink to a directory that is not scanned (not followed): add {target} with --path"))
+        elif not target.exists():
+            errors.append((q, "is a dangling symlink"))
+        else:
+            errors.append((q, "is a symlink to something that is neither a file nor a directory"))
+
+    for p in paths:
+        if p.is_dir():              # also a link to a directory: os.walk reads the top through it
             try:
                 for root, dirs, names in os.walk(p, followlinks=False, onerror=lambda e: errors.append((Path(str(e.filename)), type(e).__name__))):
+                    for n in sorted(dirs):
+                        q = Path(root) / n
+                        if q.is_symlink():
+                            link(q)
                     for n in sorted(names):
                         q = Path(root) / n
                         if q.is_symlink():
-                            continue
-                        files.append(q)
+                            link(q)
+                        else:
+                            files.append(q)
             except OSError as e:
                 errors.append((p, type(e).__name__))
+        elif p.is_symlink():
+            link(p)
+        elif p.is_file():
+            files.append(p)
         else:
             errors.append((p, "does not exist"))
     return files, errors
