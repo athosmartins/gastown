@@ -95,6 +95,7 @@ trap cleanup EXIT
 ERR_F="$WORK_DIR/stderr"; LOG_F="$WORK_DIR/log"; COMMENT_F="$WORK_DIR/comments"
 LABEL_F="$WORK_DIR/labels"; CLOSE_F="$WORK_DIR/closes"; GC_F="$WORK_DIR/gc"
 STUB_CALLS="$WORK_DIR/vm-calls"; SHOW_N_F="$WORK_DIR/show-n"
+ROUTE_F="$WORK_DIR/route"; UNSET_DONE_F="$WORK_DIR/unset-done"; UPDATE_F="$WORK_DIR/updates"; HYG_F="$WORK_DIR/hygiene"
 
 FX=ga-buac0o-fx
 VB="lib/predictive_dialer/voicebot"
@@ -116,17 +117,32 @@ sc_reset() {
   SC_RT_MODE=repo                    # repo | city | empty | unmapped | unreadable
   SC_BREAK_STATE_DIR=0
   SC_PRESEED_SINCE=""                # an earlier hold's clock
+  SC_ROUTED=1                        # the bead still carries gc.routed_to=gastown.dog (the pool-return bounce restores it)
+  SC_UNSET_FAIL=0                    # 1: `bd update --unset-metadata gc.routed_to` fails, the route stays
+  SC_READBACK_FAIL=0                 # 1: every `bd show` AFTER the unset fails (the read-back is unreadable)
+  SC_COMMENT_FAIL=0                  # 1: `bd comment` fails
 }
 
+# The bead's pool route lives in ROUTE_F (non-empty = gc.routed_to is set). UNSET_DONE_F marks that an
+# unset was attempted, so a read-back failure can be scripted to happen only AFTER it.
 bd() {
   local n
   case "${3:-}" in
     show)
       n=$(( $(cat "$SHOW_N_F" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$SHOW_N_F"
       if [ "$SC_SHOW_FAIL_FROM" -gt 0 ] && [ "$n" -ge "$SC_SHOW_FAIL_FROM" ]; then echo "dolt hiccup" >&2; return 1; fi
-      printf '[{"id":"%s","status":"open","labels":%s}]' "$FX" "$SC_SHOW_LABELS" ;;
+      if [ "$SC_READBACK_FAIL" = "1" ] && [ -e "$UNSET_DONE_F" ]; then echo "dolt hiccup (read-back)" >&2; return 1; fi
+      printf '[{"id":"%s","status":"open","labels":%s,"metadata":{"gc.routed_to":"%s"}}]' "$FX" "$SC_SHOW_LABELS" "$(cat "$ROUTE_F" 2>/dev/null || true)" ;;
+    update)
+      printf '%s\n' "$*" >> "$UPDATE_F"
+      if [ "${5:-}" = "--unset-metadata" ] && [ "${6:-}" = "gc.routed_to" ]; then
+        : > "$UNSET_DONE_F"
+        if [ "$SC_UNSET_FAIL" = "1" ]; then echo "dolt hiccup (unset)" >&2; return 1; fi
+        : > "$ROUTE_F"
+      fi ;;
     close)   printf 'CLOSED:%s|%s\n' "${4:-}" "${6:-}" >> "$CLOSE_F" ;;
-    comment) printf '%s\n----\n' "${5:-}" >> "$COMMENT_F" ;;
+    comment) if [ "$SC_COMMENT_FAIL" = "1" ]; then return 1; fi
+             printf '%s\n----\n' "${5:-}" >> "$COMMENT_F" ;;
     label)   printf '%s\n' "$*" >> "$LABEL_F"
              if [ "$SC_LABEL_ADD_FAIL" = "1" ] && [ "${4:-}" = "add" ]; then return 1; fi ;;
   esac
@@ -135,7 +151,7 @@ bd() {
 gc()   { printf '%s\n' "$*" >> "$GC_F"; return 0; }
 log()  { printf '%s\n' "$*" >> "$LOG_F"; }
 warn() { printf '%s\n' "$*" >> "$LOG_F"; }
-gate_finalize_pass_label_hygiene() { return 0; }
+gate_finalize_pass_label_hygiene() { printf 'hygiene %s\n' "$*" >> "$HYG_F"; return 0; }
 git_rig() { git -C "$RIG_REPO" "$@"; }
 rig_resolve_commit() { git_rig rev-parse --verify -q "$1^{commit}" 2>/dev/null || echo ""; }
 eval "$FN_OWN"
@@ -200,7 +216,8 @@ run_path() {
   case "$path" in 0a4) region="$REG_0A4" ;; 4b) region="$REG_4B" ;; esac
   region="${2:-$region}"
   T="$(mktemp -d "$WORK_DIR/run.XXXXXX")"
-  : > "$ERR_F"; : > "$LOG_F"; : > "$COMMENT_F"; : > "$LABEL_F"; : > "$CLOSE_F"; : > "$GC_F"; : > "$STUB_CALLS"; rm -f "$SHOW_N_F"
+  : > "$ERR_F"; : > "$LOG_F"; : > "$COMMENT_F"; : > "$LABEL_F"; : > "$CLOSE_F"; : > "$GC_F"; : > "$STUB_CALLS"; rm -f "$SHOW_N_F" "$UNSET_DONE_F"
+  : > "$UPDATE_F"; : > "$HYG_F"; if [ "$SC_ROUTED" = "1" ]; then echo "gastown.dog" > "$ROUTE_F"; else : > "$ROUTE_F"; fi
   mk_repo "$T/runtime"
   GC_CITY="$T/city"; mkdir -p "$GC_CITY/.gc/runtime" "$GC_CITY/packs/town-deltas/assets"
   RIG_REPO="$T/runtime"
@@ -228,11 +245,14 @@ run_path() {
     tip)     BASE_COMMIT="$SHA_C1" ;;
     bogus)   BASE_COMMIT="0123456789abcdef0123456789abcdef01234567" ;;
     side)    BASE_COMMIT="$SHA_SIDE" ;;
+    optout)  BASE_COMMIT="--output=$T/pwn" ;;   # git would parse this as rev-list's --output option
+    optall)  BASE_COMMIT="--all" ;;
   esac
   NR_BASE_COMMIT="$BASE_COMMIT"
   eval "$region" 2>"$ERR_F"
   STATE_FILE="$GC_CITY/.gc/runtime/voicebot-vm-hold-gate/$FX.state"
   STATE_AFTER="$(cat "$STATE_FILE" 2>/dev/null || echo '<none>')"
+  PWN_CREATED=0; compgen -G "$T/pwn*" >/dev/null && PWN_CREATED=1
   if [ "${KEEP_T:-0}" = "1" ]; then T_LAST="$T"; else cleanup_run "$T"; fi
 }
 cleanup_run() { command -v safe-clean >/dev/null 2>&1 && safe-clean "$1" >/dev/null 2>&1 || rm -rf "$1"; }
@@ -265,6 +285,21 @@ assert_hold() {
   has "$(logtext)" "holding, NOT closing (ga-buac0o)" && ok "$t the dispatcher log records the hold" || bad "$t no log line for the hold: [$(logtext)]"
   has "$STATE_AFTER" "since=" && has "$STATE_AFTER" "mailed=0" && has "$STATE_AFTER" "|$GC_CITY" \
     && ok "$t the hold state (<kind>|<store>, since, mailed=0) is written for the 24h ceiling" || bad "$t no usable hold state: [$STATE_AFTER]"
+  # Gate FAIL 2026-10-06 00:02, blocking issue 2: the needs-rebase bounce RESTORES gc.routed_to, and a
+  # held-open bead that keeps it is offered to pool workers as ordinary work. The PASS path un-routes
+  # at claim time; these two paths never go through that, so the hold itself must.
+  if [ "$SC_UNSET_FAIL" != "1" ]; then
+    [ ! -s "$ROUTE_F" ] && ok "$t gc.routed_to is gone: the held bead is not offered to pool workers" \
+      || bad "$t BUG: the held bead is still routed to [$(cat "$ROUTE_F")] — a pool worker can claim already-merged work (gate FAIL, blocking 2)"
+    has "$(cat "$UPDATE_F")" "update $FX --unset-metadata gc.routed_to" && ok "$t the route is removed by an explicit unset on the bead's own store" \
+      || bad "$t no unset of gc.routed_to was issued: [$(cat "$UPDATE_F")]"
+  fi
+  has "$(comments)" "Pool routing:" && ok "$t the comment reports what happened to the pool route" || bad "$t the comment says nothing about the pool route"
+  # A bead that failed a gate cycle and is now held as gate:passed must not carry both (ga-tuk26: the
+  # PASS path clears gate:failed/gate:needs-fix before its own hold decision).
+  grep -qF "label remove $FX gate:failed" "$LABEL_F" && grep -qF "label remove $FX gate:needs-fix" "$LABEL_F" \
+    && ok "$t gate:failed / gate:needs-fix residue is cleared (gate:passed must not coexist with it)" || bad "$t the failed-cycle residue stays next to gate:passed: [$(cat "$LABEL_F")]"
+  [ -s "$HYG_F" ] && ok "$t gate:fix-attempt:* residue goes through the shared hygiene helper" || bad "$t gate_finalize_pass_label_hygiene was not called on the hold"
 }
 assert_closed() {  # <tag>
   was_closed && ok "$1 the bead is CLOSED as before" || bad "$1 the bead was not closed (held or stuck): comments=[$(comments)] log=[$(logtext)]"
@@ -344,9 +379,12 @@ scenarios() {  # <0a4|4b>
   ! has "$(comments)" "contrato ausente" && ok "f2/$P no 'contrato ausente' noise when the delta does not reach the VM" || bad "f2/$P 'contrato ausente' on a delta that does not touch the VM"
 
   # (g) delta UNREADABLE in a rig that HAS the package → unknown → ask, never "no".
-  for _case in empty unknown bogus side tip; do
+  for _case in empty unknown bogus side tip optout optall; do
     sc_reset; SC_BASE="$_case"; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente — deploy na fila"
     run_path "$P"
+    # Gate FAIL 00:02, blocking issue 1: base_commit is a marker field the code itself calls untrusted.
+    # Handed to `git rev-list` raw, "--output=<file>" is an OPTION: git creates "<file>..<tip>".
+    eq "g1/$_case/$P no file is created by git parsing the marker's base_commit as an option" "$PWN_CREATED" "0"
     assert_hold "g1/$_case/$P base_commit=$_case, VM pending"
     eq "g1/$_case/$P the VM was asked" "$(vm_calls)" "1"
     has "$(comments)" "MAY touch what runs on the dialer VM" && ! has "$(comments)" "TOUCHES what runs" \
@@ -362,7 +400,15 @@ scenarios() {  # <0a4|4b>
     run_path "$P"
     assert_closed "h1/$_case/$P rig with no runtime_dir mapping"
     eq "h1/$_case/$P no VM to ask" "$(vm_calls)" "0"
-    has "$(logtext)" "no runtime_dir mapping" && ok "h1/$_case/$P the log says why the VM check was skipped" || bad "h1/$_case/$P no skip reason logged: [$(logtext)]"
+    if [ "$_case" = unmapped ]; then
+      # The registry was READ and the rig is not in it: a renamed/lost stanza would silently switch the
+      # VM check off for every already-merged bug/task (error-vs-empty). Say so, on the bead too.
+      has "$(logtext)" "not listed in delivery-runbooks.toml" && ok "h1/$_case/$P the log says the rig is NOT LISTED in the registry" || bad "h1/$_case/$P no 'not listed' log: [$(logtext)]"
+      has "$(close_reason)" "NÃO verificada" && ok "h1/$_case/$P the close reason says the VM was NOT verified (an absent rig is not 'nothing to ask')" || bad "h1/$_case/$P close reason hides that the rig is unlisted: [$(close_reason)]"
+    else
+      has "$(logtext)" "no runtime_dir mapping" && ok "h1/$_case/$P the log says why the VM check was skipped" || bad "h1/$_case/$P no skip reason logged: [$(logtext)]"
+      ! has "$(close_reason)" "NÃO verificada" && ok "h1/$_case/$P a rig that deliberately has no runtime_dir closes without the unverified note" || bad "h1/$_case/$P unverified note on a rig with no runtime: [$(close_reason)]"
+    fi
   done
   sc_reset; SC_RT_MODE=city; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"
   run_path "$P"
@@ -388,6 +434,32 @@ scenarios() {  # <0a4|4b>
   run_path "$P"
   assert_hold "i2/$P the bead's labels cannot be read (unknown is not 'no hold')"
   eq "i2/$P no VM call on an unreadable bead" "$(vm_calls)" "0"
+
+  # (o) a HELD bead must leave the pool (gate FAIL 00:02, blocking issue 2).
+  echo "── 5b/$P. the held bead is not offered to pool workers ──"
+  sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"
+  run_path "$P"
+  has "$(comments)" "Pool routing: removed" && ok "o1/$P the comment says the route was removed (read back, not assumed)" || bad "o1/$P comment does not say the route was removed: [$(comments)]"
+  ! grep -qF "pilot:no-auto-dispatch" "$LABEL_F" && ok "o1/$P no veto label when the route is verifiably gone" || bad "o1/$P veto label added although the route was removed"
+  sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_UNSET_FAIL=1
+  run_path "$P"
+  was_closed && bad "o2/$P a failed route unset released the bead to a close" || ok "o2/$P the route could not be removed → still NOT closed"
+  grep -qF "label add $FX pilot:no-auto-dispatch" "$LABEL_F" && ok "o2/$P route still set → pilot:no-auto-dispatch keeps the pool probes off it" || bad "o2/$P the bead is held, still routed, and unvetoed: [$(cat "$LABEL_F")]"
+  has "$(comments)" "Pool routing: NOT removed" && ok "o2/$P the comment says the route is STILL set" || bad "o2/$P the comment hides that the route stayed: [$(comments)]"
+  ! has "$(comments)" "Pool routing: removed" && ok "o2/$P no false 'removed' claim" || bad "o2/$P false 'Pool routing: removed' claim"
+  sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_READBACK_FAIL=1
+  run_path "$P"
+  grep -qF "label add $FX pilot:no-auto-dispatch" "$LABEL_F" && ok "o3/$P an unreadable read-back is not 'removed': the veto label goes on" || bad "o3/$P unverifiable route and no veto: [$(cat "$LABEL_F")]"
+  has "$(comments)" "Pool routing: UNVERIFIED" && ! has "$(comments)" "Pool routing: removed" && ok "o3/$P the comment says UNVERIFIED, not 'removed'" || bad "o3/$P unverifiable read-back worded as a fact: [$(comments)]"
+  sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_ROUTED=0
+  run_path "$P"
+  ! grep -qF "pilot:no-auto-dispatch" "$LABEL_F" && ok "o4/$P a bead that was never routed needs no veto label" || bad "o4/$P veto label on a bead with no route"
+
+  # (p) a hold explanation that could not be written is warned about, not hidden.
+  sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_COMMENT_FAIL=1
+  run_path "$P"
+  was_closed && bad "p1/$P a failed comment write released the bead to a close" || ok "p1/$P comment write failed → still NOT closed"
+  has "$(logtext)" "could NOT post the hold explanation" && ok "p1/$P the log warns that nobody was told why the bead is held" || bad "p1/$P a held bead with no explanation and no warning: [$(logtext)]"
 
   # (j) a story is untouched: hand-off to story-delivery (which asks the VM itself, Step 6a).
   sc_reset; SC_SHOW_LABELS='["story:approved"]'; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"
@@ -425,6 +497,15 @@ scenarios() {  # <0a4|4b>
       gate_vm_hold_ceiling_sweep "$_dir" "$((_since + 90000))" 86400
       _gcl="$(cat "$GC_F")"
       has "$_gcl" "mail send mayor" && has "$_gcl" "$FX" && ok "n1/$P the ceiling sweep mails the Mayor about the hold this path wrote" || bad "n1/$P no ceiling mail for the hold: [$_gcl]"
+      # The gate never ran on these paths (the marker was superseded/reaped); the shared mail body must
+      # not tell the Mayor the bead "PASSOU no gate".
+      ! has "$_gcl" "PASSOU no gate" && has "$_gcl" "pulou o gate" && ok "n3/$P the mail does not claim the gate passed a bead whose gate was skipped" || bad "n3/$P the ceiling mail says the gate PASSED for a bead held by an already-merged path: [$_gcl]"
+      # The body is a printf FORMAT inside single quotes: a stray ' in the new wording ends the string and
+      # shifts every argument ("O bug/task mergeado que pulou o gate), ..." with the ids after it), and the
+      # n3 check above still passed because the words are all somewhere in the output. Check the rendered
+      # sentence whole, in order, with no raw placeholder left.
+      has "$_gcl" "O bug/task $FX (store " && has "$_gcl" 'por um caminho "já mergeado" que pulou o gate), mas está SEGURADO desde ' && ! has "$_gcl" '%s' \
+        && ok "n4/$P the ceiling mail renders as one intact sentence (id, then store, then the explanation; no stray %s)" || bad "n4/$P the ceiling mail body is garbled: [$_gcl]"
       : > "$GC_F"
       gate_vm_hold_ceiling_sweep "$_dir" "$((_since + 90000))" 86400
       [ ! -s "$GC_F" ] && ok "n2/$P a second sweep does not mail again (at most once)" || bad "n2/$P the Mayor was mailed twice: [$(cat "$GC_F")]"
@@ -472,6 +553,13 @@ scn_held_not_superseded() { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pe
 scn_label_fail_claim()  { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_LABEL_ADD_FAIL=1; run_path 0a4; has "$(comments)" "Held as delivery:pending-vm"; }
 scn_since_restarted()   { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_PRESEED_SINCE=1000; run_path 0a4; ! has "$STATE_AFTER" "since=1000"; }
 scn_state_unwritable()  { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_BREAK_STATE_DIR=1; run_path 0a4; ! has "$(comments)" "NOT armed"; }
+scn_hostile_base()      { sc_reset; SC_BASE=optout; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; run_path 0a4; [ "$PWN_CREATED" = "1" ]; }
+scn_route_kept()        { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; run_path 0a4; [ -s "$ROUTE_F" ]; }
+scn_no_veto()           { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_UNSET_FAIL=1; run_path 0a4; ! grep -qF "label add $FX pilot:no-auto-dispatch" "$LABEL_F"; }
+scn_readback_trusted()  { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_READBACK_FAIL=1; run_path 0a4; ! grep -qF "label add $FX pilot:no-auto-dispatch" "$LABEL_F"; }
+scn_residue_kept()      { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; run_path 0a4; ! grep -qF "label remove $FX gate:failed" "$LABEL_F"; }
+scn_rig_absent_quiet()  { sc_reset; SC_RT_MODE=unmapped; run_path 0a4; ! has "$(logtext)" "not listed in delivery-runbooks.toml"; }
+scn_comment_fail_quiet() { sc_reset; SC_STATUS_RC=10; SC_STATUS_OUT="STATUS: pendente"; SC_COMMENT_FAIL=1; run_path 0a4; ! has "$(logtext)" "could NOT post the hold explanation"; }
 
 if [ -n "$FN_MERGED" ]; then
   mutate "M1  never hold (always close)"                     scn_hold_pending      'if [ "$MERGED_VM_ACTION" != "hold" ]; then' 'if true; then'
@@ -485,6 +573,20 @@ if [ -n "$FN_MERGED" ]; then
   mutate "M9  restart an earlier hold's clock"              scn_since_restarted   'since="$(voicebot_vm_state_get "$file" since)"' 'since=""'
   mutate "M10 hide that the 24h ceiling is not armed"       scn_state_unwritable  'if voicebot_vm_state_put "$dir" "$file" "$VM_HOLD_KIND|$bead_city" "$since" "$mailed"; then' 'if true; then'
   mutate "M11 delta from merge-base(branch, main), not the marker base" scn_hold_pending 'gate_vm_hold_check "$rt" "$base" "$tip"' 'gate_vm_hold_check "$rt" "$(git_rig merge-base "$tip" origin/main 2>/dev/null)" "$tip"'
+  mutate "M12 pass the marker's base_commit to git raw (option injection)" scn_hostile_base \
+    $'case "$base" in \'\'|unknown|-*) base="" ;; *) base="$(rig_resolve_commit "$base")" ;; esac' 'case "$base" in unknown) base="" ;; esac'
+  mutate "M13 never remove gc.routed_to from a held bead"   scn_route_kept \
+    'bd -C "$bead_city" update "$bead_id" --unset-metadata gc.routed_to -q 2>/dev/null || true' ':'
+  mutate "M14 no veto label when the route could not be removed" scn_no_veto \
+    'bd -C "$bead_city" label add "$bead_id" "pilot:no-auto-dispatch" -q 2>/dev/null || vetoed=0' 'vetoed=1'
+  mutate "M15 an unreadable read-back counts as 'removed'"  scn_readback_trusted \
+    'if [ "$read_ok" = "1" ] && [ -z "$observed" ]; then' 'if [ -z "$observed" ]; then'
+  mutate "M16 leave gate:failed next to gate:passed"        scn_residue_kept \
+    'bd -C "$bead_city" label remove "$bead_id" "gate:failed" -q 2>/dev/null || true' ':'
+  mutate "M17 a rig missing from the registry reads as 'nothing to ask'" scn_rig_absent_quiet \
+    'if [ "$rt_rc" -eq 2 ]; then' 'if false; then'
+  mutate "M18 a hold explanation that failed to post is silent" scn_comment_fail_quiet \
+    '    || warn "ga-buac0o: could NOT post the hold explanation on $bead_id — the bead is held ($VM_HOLD_KIND) but nobody is told why: $VM_HOLD_REASON"' '    || true'
 else
   bad "section 6 skipped: no FN_MERGED to mutate"
 fi

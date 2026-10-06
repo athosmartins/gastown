@@ -6968,7 +6968,7 @@ gate_vm_hold_ceiling_sweep() {
     fi
     _since_h="$(date -u -r "$since" '+%Y-%m-%d %H:%MZ' 2>/dev/null || date -u -d "@$since" '+%Y-%m-%d %H:%MZ' 2>/dev/null || echo "epoch $since")"
     if [ "$label" = "label" ]; then label="presente"; else label="AUSENTE (nada marca mais o hold — se já foi resolvido, feche o bead)"; fi
-    _body="$(printf 'O bug/task %s (store %s) PASSOU no gate e o merge entrou, mas está SEGURADO desde %s (delivery:pending-vm, %s): o merge toca o que roda na VM do discador e a VM não estava provada igual ao main.\n\nEstado do bead agora: %s. Label delivery:pending-vm: %s.\n\nO dispatcher NÃO reconsulta a VM sozinho e este mail não solta o hold — é só o teto de %s. O motivo está no comentário do bead.\n\nAÇÃO: python3 scripts/voicebot_vm_sync.py --status (somente leitura); quando der STATUS: em dia, `bd -C %s label remove %s delivery:pending-vm` e feche o bead à mão. Se a VM precisa do deploy, ele é manual (wa-y0su67).' \
+    _body="$(printf 'O bug/task %s (store %s) já está mergeado (pelo gate, ou por um caminho "já mergeado" que pulou o gate), mas está SEGURADO desde %s (delivery:pending-vm, %s): o merge toca o que roda na VM do discador e a VM não estava provada igual ao main.\n\nEstado do bead agora: %s. Label delivery:pending-vm: %s.\n\nO dispatcher NÃO reconsulta a VM sozinho e este mail não solta o hold — é só o teto de %s. O motivo está no comentário do bead.\n\nAÇÃO: python3 scripts/voicebot_vm_sync.py --status (somente leitura); quando der STATUS: em dia, `bd -C %s label remove %s delivery:pending-vm` e feche o bead à mão. Se a VM precisa do deploy, ele é manual (wa-y0su67).' \
       "$id" "$store" "$_since_h" "$kind" "$status" "$label" "$_win" "$store" "$id")"
     if ! gc --city "$GC_CITY" mail send mayor \
          -s "VM do voicebot pendente há mais de $_win: $id" \
@@ -7024,9 +7024,11 @@ gate_vm_hold_ceiling_sweep() {
 # path's business and these two paths did not honour them before this change either.
 #
 # SELFTEST-EXTRACT merged-path-vm-hold-fn: BEGIN
-# gate_rig_runtime_dir <rig> — prints the rig's runtime_dir from delivery-runbooks.toml. rc 0 = the
-# registry was READ (empty output = the rig has no runtime_dir mapping); rc 1 = it could NOT be read
-# (file missing, python failed) — the two never collapse. The rig name travels as argv, never spliced
+# gate_rig_runtime_dir <rig> — prints the rig's runtime_dir from delivery-runbooks.toml. THREE states,
+# none collapsed into another: rc 0 = the registry was READ and lists the rig (empty output = the rig
+# deliberately has no runtime_dir); rc 2 = it was READ and the rig is NOT in it (a renamed or lost
+# stanza looks exactly like this, and would otherwise switch the VM check off without a trace); rc 1 =
+# it could NOT be read (file missing, python failed). The rig name travels as argv, never spliced
 # into the script (the PASS path's _gl7n3v_runbook_field interpolates it; it is defined inline there,
 # so it cannot be relied on from these two steps).
 gate_rig_runtime_dir() {
@@ -7043,12 +7045,14 @@ for block in re.split(r'\[\[rig\]\]', content):
         fm = re.search(r'runtime_dir\s*=\s*"([^"]*)"', block)
         if fm:
             print(fm.group(1))
-        break
+        sys.exit(0)
+sys.exit(2)
 PYEOF
 }
 
 # gate_merged_path_vm_decide <bead_city> <bead_id> <rig> <branch> <base_commit>
-# Sets MERGED_VM_ACTION (close|hold), MERGED_VM_ASKED (1 iff the VM was asked), MERGED_VM_NOTE (a
+# Sets MERGED_VM_ACTION (close|hold), MERGED_VM_ASKED (1 iff gate_vm_hold_check ran: the delta was read
+# and the VM is asked only when that delta may reach it — 0 when the hold was decided without it), MERGED_VM_NOTE (a
 # suffix for the close reason, "" unless the VM was NOT verified), MERGED_VM_COMMENT (the bead comment
 # a close owes, "" if none) and the VM_HOLD_* globals of gate_vm_hold_check. For a hold VM_HOLD_KIND
 # is pending | failed | unknown (the VM answered or could not be read) | held (an earlier
@@ -7071,6 +7075,11 @@ gate_merged_path_vm_decide() {
       return 0 ;;
   esac
   rt="$(gate_rig_runtime_dir "$rig")" || rt_rc=$?
+  if [ "$rt_rc" -eq 2 ]; then
+    warn "ga-buac0o: rig '$rig' is not listed in delivery-runbooks.toml (registry read fine) — the dialer VM was NOT checked for $bead_id; closing as before. A renamed or lost stanza would look exactly like this."
+    MERGED_VM_NOTE="ga-buac0o: VM do voicebot NÃO verificada — o rig '$rig' não consta em delivery-runbooks.toml."
+    return 0
+  fi
   if [ "$rt_rc" -ne 0 ]; then
     warn "ga-buac0o: could not read ${GC_CITY:-}/packs/town-deltas/assets/delivery-runbooks.toml to find rig '$rig' runtime_dir — the dialer VM was NOT checked for $bead_id; closing as before."
     MERGED_VM_NOTE="ga-buac0o: VM do voicebot NÃO verificada — registro de runbooks (delivery-runbooks.toml) ilegível."
@@ -7086,7 +7095,12 @@ gate_merged_path_vm_decide() {
     return 0
   fi
   tip="$(rig_resolve_commit "origin/$branch")"
-  case "$base" in unknown) base="" ;; esac
+  # base is the marker's self-declared base_commit — UNTRUSTED. Handed to `git rev-list` as "$base..$tip"
+  # a value like "--output=<file>" is an OPTION: git creates "<file>..<tip>" (gate FAIL 2026-10-06,
+  # reproduced). An option-shaped value is no base at all (delta unknown → the VM is asked), and
+  # anything else is resolved to a commit id first, exactly as every other consumer does
+  # (rig_resolve_commit): what reaches git below is a hex id or nothing.
+  case "$base" in ''|unknown|-*) base="" ;; *) base="$(rig_resolve_commit "$base")" ;; esac
   if [ -n "$tip" ] && [ -n "$base" ]; then
     n="$(git_rig rev-list --count "$base..$tip" 2>/dev/null)" || n=""
     case "$n" in 0) base="" ;; esac
@@ -7113,6 +7127,43 @@ gate_merged_path_vm_decide() {
   return 0
 }
 
+# gate_merged_path_unroute <bead_city> <bead_id> — takes a HELD bead out of the pool and says what it
+# SAW. The needs-rebase bounce that feeds Step 0a-4 restores gc.routed_to, clears the assignee and
+# reopens the bead precisely so "every worker" can claim it; closing used to end that exposure, a hold
+# does not. The PASS path un-routes at gate-claim time, which a needs-rebase reap never goes through.
+# Unset, then READ BACK (never assume a write took): three states for the note —
+#   removed     read back, gc.routed_to is empty
+#   NOT removed read back, gc.routed_to is still set
+#   UNVERIFIED  the read-back failed, so nothing is known
+# The last two also add pilot:no-auto-dispatch, which the pool demand probes exclude. Sets
+# MERGED_ROUTE_NOTE for the hold comment. Always returns 0.
+gate_merged_path_unroute() {
+  local bead_city="$1" bead_id="$2" json="" observed="" read_ok=0 vetoed=1
+  MERGED_ROUTE_NOTE=""
+  bd -C "$bead_city" update "$bead_id" --unset-metadata gc.routed_to -q 2>/dev/null || true
+  if json="$(bd -C "$bead_city" show "$bead_id" --json 2>/dev/null)" && [ -n "$json" ] \
+     && observed="$(printf '%s' "$json" | jq -r 'if type=="array" then .[0] else . end | .metadata["gc.routed_to"] // ""' 2>/dev/null)"; then
+    read_ok=1
+  fi
+  if [ "$read_ok" = "1" ] && [ -z "$observed" ]; then
+    MERGED_ROUTE_NOTE="Pool routing: removed (gc.routed_to read back empty), so no pool worker is offered this already-merged bead."
+    return 0
+  fi
+  bd -C "$bead_city" label add "$bead_id" "pilot:no-auto-dispatch" -q 2>/dev/null || vetoed=0
+  if [ "$read_ok" = "1" ]; then
+    MERGED_ROUTE_NOTE="Pool routing: NOT removed (gc.routed_to is still '$observed' after the unset)."
+  else
+    MERGED_ROUTE_NOTE="Pool routing: UNVERIFIED (the bead could not be read back after the unset, so it is not known whether gc.routed_to is gone)."
+  fi
+  if [ "$vetoed" = "1" ]; then
+    MERGED_ROUTE_NOTE="$MERGED_ROUTE_NOTE pilot:no-auto-dispatch was added, which the pool probes exclude."
+  else
+    warn "ga-buac0o: $bead_id is held but still (or possibly) routed to a pool and pilot:no-auto-dispatch could not be written — a pool worker may claim already-merged work."
+    MERGED_ROUTE_NOTE="$MERGED_ROUTE_NOTE pilot:no-auto-dispatch could NOT be written either, so a pool worker may still claim this bead — check it by hand."
+  fi
+  return 0
+}
+
 gate_merged_path_vm_gate() {
   local bead_city="$1" bead_id="$2" rig="$3" branch="$4" default_branch="$5" marker_id="$6"
   local base="${7:-}" via="${8:-an already-merged path}"
@@ -7129,6 +7180,13 @@ gate_merged_path_vm_gate() {
   # two paths sets it for the same reason.
   bd -C "$bead_city" label add "$bead_id" "gate:passed" -q 2>/dev/null \
     || warn "Could not add gate:passed to $bead_id — the Pilot may re-dispatch the held bead (ga-buac0o)."
+  # A bead that failed an earlier gate cycle must not wear gate:passed next to gate:failed /
+  # gate:needs-fix: story-delivery refuses to trust that pair (ga-266z8). The PASS path and the story
+  # hand-off on these same two paths clear it first (ga-tuk26/ga-divv8); so does the hold.
+  bd -C "$bead_city" label remove "$bead_id" "gate:failed" -q 2>/dev/null || true
+  bd -C "$bead_city" label remove "$bead_id" "gate:needs-fix" -q 2>/dev/null || true
+  gate_finalize_pass_label_hygiene "$bead_city" "$bead_id" "$branch"
+  gate_merged_path_unroute "$bead_city" "$bead_id"
   # A label that could not be written is never claimed (same rule as the PASS path's hold).
   if bd -C "$bead_city" label add "$bead_id" "delivery:pending-vm" -q 2>/dev/null; then
     labeled=1
@@ -7165,8 +7223,9 @@ gate_merged_path_vm_gate() {
     ceiling_note="The 24h Mayor-mail ceiling is NOT armed for this bead (the hold state could not be written), so nothing will mail the Mayor if this sits — look at it yourself."
   fi
   log "Source bug/task $bead_id is already merged ($via) but the dialer VM is not proven current ($VM_HOLD_KIND: $VM_HOLD_REASON) — holding, NOT closing (ga-buac0o)."
-  bd -C "$bead_city" comment "$bead_id" "$(printf 'Branch %s already in %s (%s) — gate skipped, but NOT closing (ga-buac0o): %s\n\n%s\n\nNo automatic re-query: this dispatcher does not ask the VM again for this bead. %s\n\nACTION: run `python3 %s --status` (read-only); once it prints STATUS: em dia, run `bd -C %s label remove %s delivery:pending-vm` and close this bead by hand. If the VM needs the deploy, that is manual (scripts/voicebot_vm_sync.py, wa-y0su67).' \
-    "$branch" "$default_branch" "$via" "$lead" "$label_note" "$ceiling_note" "${VM_HOLD_SCRIPT:-scripts/voicebot_vm_sync.py}" "$bead_city" "$bead_id")" 2>/dev/null || true
+  bd -C "$bead_city" comment "$bead_id" "$(printf 'Branch %s already in %s (%s) — gate skipped, but NOT closing (ga-buac0o): %s\n\n%s\n\nNo automatic re-query: this dispatcher does not ask the VM again for this bead. %s\n\n%s\n\nACTION: run `python3 %s --status` (read-only); once it prints STATUS: em dia, run `bd -C %s label remove %s delivery:pending-vm` and close this bead by hand. If the VM needs the deploy, that is manual (scripts/voicebot_vm_sync.py, wa-y0su67).' \
+    "$branch" "$default_branch" "$via" "$lead" "$label_note" "$ceiling_note" "$MERGED_ROUTE_NOTE" "${VM_HOLD_SCRIPT:-scripts/voicebot_vm_sync.py}" "$bead_city" "$bead_id")" 2>/dev/null \
+    || warn "ga-buac0o: could NOT post the hold explanation on $bead_id — the bead is held ($VM_HOLD_KIND) but nobody is told why: $VM_HOLD_REASON"
   return 1
 }
 # SELFTEST-EXTRACT merged-path-vm-hold-fn: END
