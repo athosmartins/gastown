@@ -343,9 +343,14 @@ load_reload_stats() {
 
     if hash_is_known "$prev_hash" && [ -n "$covered_hash" ] && [ "$covered_hash" = "$prev_hash" ]; then
         startup_gap_verdict=unchanged
-        startup_gap_note="files unchanged since the last reload that finished OK (hash ${covered_hash}) — heartbeat embargo carried over"
+        # The note says "carried over" only when a saved embargo really was applied: one that is
+        # over already, absent, or beyond the ceiling (clock skew, a hand-edited file) changes
+        # nothing, and the log must not claim a protection the code did not give.
         if [ -n "$emb_saved" ] && (( emb_saved > hb_next_allowed && emb_saved <= now + HEARTBEAT_MAX_INTERVAL )); then
             hb_next_allowed=$emb_saved
+            startup_gap_note="files unchanged since the last reload that finished OK (hash ${covered_hash}) — heartbeat embargo carried over (next heartbeat not before epoch ${emb_saved})"
+        else
+            startup_gap_note="files unchanged since the last reload that finished OK (hash ${covered_hash}) — no saved heartbeat embargo applies (it is over, absent or not credible); the ${HEARTBEAT_INTERVAL}s heartbeat floor holds"
         fi
         return 0
     fi

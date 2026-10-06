@@ -593,6 +593,32 @@ eq "a save that cannot write still returns 0 (a full disk must not stop the watc
 has "a save that cannot write says so, naming the file" "could not save the reload stats to '$TMP/not-a-dir/stats'" "$TMP/e6-fail.out"
 has "...and what the next restart will do about it" "queues a file-change reload" "$TMP/e6-fail.out"
 
+# E7. the restart-gap NOTE in the log says only what the code did: "embargo carried over" is claimed
+# when a saved embargo really was applied, and not when it was over already / absent / not credible
+FAKE_HASH=hA
+reset_state; prev_hash=hA; RELOAD_COVERS_HASH=hA
+finish_reload heartbeat ok 600 0 "ok" "$FAKE_NOW" >> "$TICKLOG"
+reset_state keep-files
+startup_replay >> "$TICKLOG"
+printf '%s\n' "$startup_gap_note" > "$TMP/e7-applied.note"
+eq "E7 applied: the embargo really was carried over" $((FAKE_NOW + 5400)) "$hb_next_allowed"
+has "E7 applied: the note says the embargo was carried over" "heartbeat embargo carried over" "$TMP/e7-applied.note"
+reset_state
+echo "600 $((FAKE_NOW - 100)) hA" > "$RELOAD_STATS_FILE"         # unchanged files, but the saved embargo ended 100s ago
+startup_replay >> "$TICKLOG"
+printf '%s\n' "$startup_gap_note" > "$TMP/e7-expired.note"
+eq "E7 expired embargo: verdict is still unchanged, nothing queued" "unchanged false" "${startup_gap_verdict-} $pending_reload"
+eq "E7 expired embargo: the heartbeat floor applies, not the saved value" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
+hasnt "E7 expired embargo: the note does NOT claim it was carried over" "embargo carried over" "$TMP/e7-expired.note"
+has "E7 expired embargo: the note says no saved embargo applies" "no saved heartbeat embargo applies" "$TMP/e7-expired.note"
+reset_state
+echo "600 $((FAKE_NOW + 99999999)) hA" > "$RELOAD_STATS_FILE"    # beyond the ceiling: clock skew / corruption
+startup_replay >> "$TICKLOG"
+printf '%s\n' "$startup_gap_note" > "$TMP/e7-skew.note"
+eq "E7 embargo beyond the ceiling: the heartbeat floor applies" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
+hasnt "E7 embargo beyond the ceiling: the note does NOT claim it was carried over" "embargo carried over" "$TMP/e7-skew.note"
+has "E7 embargo beyond the ceiling: the note says no saved embargo applies" "no saved heartbeat embargo applies" "$TMP/e7-skew.note"
+
 # ── F. file-detected drift through watcher_tick ──────────────────────────────
 echo "== F. file-detected drift (acceptance 3): real compute_hash, fake clock + slot"
 SIM_T0=$FAKE_NOW
