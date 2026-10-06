@@ -4228,7 +4228,9 @@ close_open_run_verdicts() {
 # THE THIRD STATE — what the acceptance hangs on. A refusal needs POSITIVE evidence: a count that was MEASURED, over
 # the cap, and an exemption that was READ as absent. A diff that cannot be read, a count that fails, a bead that cannot
 # be fetched, a comment list that is not JSON, a `git fetch` that failed (so origin/main may be stale and the
-# three-dot diff would take in everything main gained since): none of those refuses. They are logged ("nao-medido"; the cause is in
+# three-dot diff would take in everything main gained since), a numstat row whose count has 10+ digits (not a line count;
+# bash arithmetic would wrap it silently), an exemption comment that cannot be read (no string .text) while no readable
+# one carries a valid reason: none of those refuses. They are logged ("nao-medido"; the cause is in
 # why=) and the submission goes through exactly as today. "I could not tell" is never "too big".
 #
 # EXEMPTION: label gate:size-exempt on the source bead OR on the marker, WITH a reason — a comment on that same bead
@@ -4236,21 +4238,39 @@ close_open_run_verdicts() {
 # (the reason is what the apuracao reads to judge whether the cap is being talked around).
 #
 # SWITCH: born OFF. The flag file $GC_CITY/.gc/gate-e11-diff-cap.on (touch = on, rm = off; no restart, takes effect on
-# the next sweep) or GATE_E11_ENABLED=1|0 in the environment (wins; used by the selftests). Off = the block below runs
-# nothing and logs nothing.
+# the next sweep) or GATE_E11_ENABLED=1|0 in the environment (wins; used by the selftests; any OTHER non-empty value is
+# OFF, never "no override"). Off = the block below runs nothing and logs nothing — EXCEPT when OFF is a failure to read
+# the switch (an env value that is not 1/0, a flag file that exists but cannot be read): that logs one record,
+# verdict=interruptor-ilegivel with why=env-invalido|flag-ilegivel, so an operator's kill switch that was not understood
+# does not pass in silence.
 
-# gate_e11_enabled — prints 1 or 0. Anything unreadable or unrecognised is 0 (inert).
-gate_e11_enabled() {
+# gate_e11_switch_state — the ONE place the switch is decided. Prints:
+#   on             env 1, or no env override and a readable flag file
+#   off            env 0, or no env override and no flag file (born OFF) — a decision, nothing to say
+#   env-invalido   GATE_E11_ENABLED is set to something other than 1, 0 or empty: OFF (inert), and the live block logs it.
+#                  An override nobody can read must never read as "no override" — that fell through to the flag file, so an
+#                  operator's GATE_E11_ENABLED=off kept E11 refusing (ga-lzidpo gate round 2, blocking issue 1).
+#   flag-ilegivel  no env override, and the flag file EXISTS (a dangling symlink counts) but cannot be read: OFF (inert),
+#                  and the live block logs it — a switch that is off because it could not be read is not the same as one
+#                  that was never turned on.
+gate_e11_switch_state() {
   case "${GATE_E11_ENABLED:-}" in
-    1) printf '1'; return 0 ;;
-    0) printf '0'; return 0 ;;
+    1) printf 'on'; return 0 ;;
+    0) printf 'off'; return 0 ;;
+    '') ;;
+    *) printf 'env-invalido'; return 0 ;;
   esac
   local _f="${GATE_E11_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.on}"
-  if [ -n "${GC_CITY:-}${GATE_E11_FLAG_FILE:-}" ] && [ -r "$_f" ]; then
-    printf '1'
+  if [ -n "${GC_CITY:-}${GATE_E11_FLAG_FILE:-}" ] && { [ -e "$_f" ] || [ -L "$_f" ]; }; then
+    if [ -r "$_f" ]; then printf 'on'; else printf 'flag-ilegivel'; fi
   else
-    printf '0'
+    printf 'off'
   fi
+}
+
+# gate_e11_enabled — prints 1 or 0: 1 only when gate_e11_switch_state is `on`. Anything unreadable or unrecognised is 0.
+gate_e11_enabled() {
+  if [ "$(gate_e11_switch_state)" = "on" ]; then printf '1'; else printf '0'; fi
 }
 
 # gate_e11_arm_for_bead <bead_id> — prints A or B: B <=> the first 32 bits of SHA-256("e11-diff-cap:<bead-id>") are
@@ -4322,8 +4342,10 @@ gate_e11_count_production_lines() {
     [ -n "$path" ] || { printf 'unknown'; return 0; }
     case "$path" in \"*\") path="${path#\"}"; path="${path%\"}" ;; esac
     if [ "$add" = "-" ] && [ "$del" = "-" ]; then continue; fi
-    case "$add" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
-    case "$del" in ''|*[!0-9]*) printf 'unknown'; return 0 ;; esac
+    # 10+ digits is not a line count (bash arithmetic wraps silently past 2^63, and a wrapped number is a measurement
+    # nobody took): the row is unreadable, whatever its path (ga-lzidpo gate round 2, nit).
+    case "$add" in ''|*[!0-9]*|??????????*) printf 'unknown'; return 0 ;; esac
+    case "$del" in ''|*[!0-9]*|??????????*) printf 'unknown'; return 0 ;; esac
     if gate_e11_path_is_production "$path"; then
       total=$(( total + 10#$add + 10#$del ))
     fi
@@ -4349,15 +4371,20 @@ gate_e11_exempt_label() {
 # "gate:size-exempt:" and then at least 15 characters of reason? Takes `bd comments <id> --json` (an array of objects
 # with .text — `bd show --json` does not carry comment bodies). Anchored at the start of the comment on purpose: the
 # guard's own refusal comment names the label, and a quote of it must not read as a reason.
+# Third state: a comment that cannot be READ (not an object, or no string .text — a changed bd schema reads this way) is
+# not "a comment with no reason". A valid reason anywhere = yes (what is readable is enough); otherwise one unreadable
+# comment = desconhecido (the reason may be in it); only an array of fully readable comments with none valid = no.
 gate_e11_exempt_reason() {
   local raw="${1:-}" out
   [ -n "$raw" ] || { printf 'desconhecido'; return 0; }
   out=$(printf '%s' "$raw" | jq -r '
       if type=="array" then
-        ([.[] | select(type=="object") | (.text // "") | tostring
+        ([.[] | select(type=="object") | select((.text|type)=="string") | .text
           | select(test("^\\s*gate:size-exempt:\\s*\\S"))
           | sub("^\\s*gate:size-exempt:\\s*"; "") | sub("\\s+$"; "")
-          | select(length >= 15)] | length > 0 | if . then "yes" else "no" end)
+          | select(length >= 15)] | length) as $good
+        | ([.[] | select(((type=="object") and ((.text|type)=="string")) | not)] | length) as $unreadable
+        | if $good > 0 then "yes" elif $unreadable > 0 then "desconhecido" else "no" end
       else "desconhecido" end' 2>/dev/null) || out=""
   case "$out" in yes|no|desconhecido) printf '%s' "$out" ;; *) printf 'desconhecido' ;; esac
 }
@@ -7158,7 +7185,10 @@ fi
 # and, for a submission over the cap, a refusal that spares the worktree and the test run that follow.
 # The design, the third state and the exemption are in the comment above gate_e11_enabled (above the
 # GATE_GUARD_LIB_ONLY cutoff); this block only wires them to the submission. Three rules it keeps:
-#   - Flag off (born OFF; $GC_CITY/.gc/gate-e11-diff-cap.on turns it on): nothing below runs, nothing is logged.
+#   - Switch off (born OFF; $GC_CITY/.gc/gate-e11-diff-cap.on turns it on): nothing below runs and nothing is logged —
+#     except that an OFF that comes from a switch that could not be READ (GATE_E11_ENABLED set to something other than
+#     1/0, or a flag file that exists but is unreadable) logs ONE record, verdict=interruptor-ilegivel with
+#     why=env-invalido|flag-ilegivel, and the submission goes through. Never silent, never a refusal.
 #   - Arm A / no arm: logged, never measured, never touched — no git, no bd call.
 #   - Arm B: measured with git, and refused ONLY when the count was measured, is over the cap, and the exemption was
 #     READ as absent. Everything else that can go wrong is "nao-medido" (the why= field names the cause) and the
@@ -7249,6 +7279,14 @@ Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/nu
     log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID (gate-status:error)."
     exit 1
   fi
+else
+  # OFF is silent only when it was a decision. If the switch could not be read, say so once (the submission is not
+  # touched): an operator who set the env to `off`/`false`/`no` or left a flag file nobody can read meant something.
+  _E11_SW=$(gate_e11_switch_state)
+  case "$_E11_SW" in
+    env-invalido|flag-ilegivel)
+      log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=- verdict=interruptor-ilegivel production_lines=- cap=$(gate_e11_cap_lines) exempt=- why=$_E11_SW branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID" ;;
+  esac
 fi
 # SELFTEST-EXTRACT e11-diff-cap: END
 

@@ -46,7 +46,7 @@ set +e  # sourcing the guard leaks its `set -e` into this shell (same as the sib
 # Without this a negative assertion ("prints nothing", "no bd call") passes VACUOUSLY on a guard that has no E11 at
 # all — `command not found` also prints nothing. One assertion per function, so the old guard fails loudly here.
 echo "── 0. the E11 functions exist ──"
-E11_FNS="gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
+E11_FNS="gate_e11_switch_state gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
 gate_e11_cap_lines gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict"
 E11_MISSING=0
 for f in $E11_FNS; do
@@ -77,6 +77,36 @@ if [ "$(id -u)" != "0" ]; then
   chmod 600 "$FLAG"; rm -f "$FLAG"
 fi
 eq "GC_CITY empty and no env: OFF" "$(GC_CITY="" gate_e11_enabled)" "0"
+
+# Gate round 2, blocking issue 1: an env value that is not exactly 1 or 0 fell THROUGH to the flag file, so with the
+# file present an operator's `GATE_E11_ENABLED=off` kept E11 refusing. "I could not understand the switch" must be
+# INERT — the same direction as every other doubt in this feature — never "no override". The test above ('junk value
+# does not turn it on') only passed because the flag file was ABSENT at that point: it could not tell an inert junk
+# value from an ignored one. These all run with the flag file PRESENT, which is the case that matters.
+: > "$FLAG"
+for JUNK in off false no 2 yes on ON " "; do
+  eq "flag file PRESENT + env '$JUNK' (an unreadable override): OFF, not ON" "$(GATE_E11_ENABLED="$JUNK" GC_CITY="$TMPD/city" gate_e11_enabled)" "0"
+done
+eq "flag file present + env EMPTY: no override at all, the file decides: ON" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_enabled)" "1"
+eq "flag file present + env 1: ON" "$(GATE_E11_ENABLED=1 GC_CITY="$TMPD/city" gate_e11_enabled)" "1"
+# the switch's own state, which the live block logs when OFF is not a decision but a failure to read
+eq "state: file decides, present = on" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_switch_state)" "on"
+eq "state: env 1 = on" "$(GATE_E11_ENABLED=1 GC_CITY="$TMPD/city" gate_e11_switch_state)" "on"
+eq "state: env 0 = off (a decision, nothing to say)" "$(GATE_E11_ENABLED=0 GC_CITY="$TMPD/city" gate_e11_switch_state)" "off"
+eq "state: env 'off' = env-invalido (OFF, and it SAYS why)" "$(GATE_E11_ENABLED=off GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
+eq "state: env ' ' (a single space) = env-invalido" "$(GATE_E11_ENABLED=" " GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
+rm -f "$FLAG"
+eq "state: no env, no file = off (born OFF, nothing to say)" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_switch_state)" "off"
+eq "state: GC_CITY empty and no env = off" "$(GATE_E11_ENABLED= GC_CITY="" gate_e11_switch_state)" "off"
+if [ "$(id -u)" != "0" ]; then
+  : > "$FLAG"; chmod 000 "$FLAG"
+  eq "state: flag file that EXISTS but cannot be read = flag-ilegivel (OFF, and it SAYS why — round 2 low)" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_switch_state)" "flag-ilegivel"
+  chmod 600 "$FLAG"; rm -f "$FLAG"
+fi
+ln -s "$TMPD/nowhere.on" "$FLAG"
+eq "state: a DANGLING symlink as the flag file = flag-ilegivel, not a quiet off" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_switch_state)" "flag-ilegivel"
+eq "a dangling symlink as the flag file: OFF" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_enabled)" "0"
+rm -f "$FLAG"
 
 # ── 2. the arm: SHA-256, own salt, pure function of the bead id ──────────────
 echo "── 2. gate_e11_arm_for_bead: SHA-256('e11-diff-cap:<bead>'), even => B ──"
@@ -168,6 +198,13 @@ eq "garbled row (no path): unknown, not 0" "$(gate_e11_count_production_lines "1
 eq "garbled row (non-numeric count): unknown, not 0" "$(gate_e11_count_production_lines "abc${TAB}2${TAB}src/a.sh")" "unknown"
 eq "one garbled row among good ones poisons the count: unknown" "$(gate_e11_count_production_lines "10${TAB}2${TAB}src/a.sh
 oops")" "unknown"
+# Gate round 2 nit: bash arithmetic wraps silently past 2^63 (99999999999999999999 -> 7766279631452241919), and a wrapped
+# number is a MEASUREMENT that was never taken. No real numstat has a 10-digit row; one that does is unreadable.
+eq "a 20-digit added count would wrap in bash arithmetic: unknown, never the wrapped number" "$(gate_e11_count_production_lines "99999999999999999999${TAB}0${TAB}src/a.sh")" "unknown"
+eq "a 20-digit deleted count: unknown" "$(gate_e11_count_production_lines "0${TAB}99999999999999999999${TAB}src/a.sh")" "unknown"
+eq "a 10-digit count (past any real diff): unknown" "$(gate_e11_count_production_lines "1000000000${TAB}0${TAB}src/a.sh")" "unknown"
+eq "a 9-digit count is still a number" "$(gate_e11_count_production_lines "100000000${TAB}0${TAB}src/a.sh")" "100000000"
+eq "a huge count on a TEST path is not read as a number to wrap either: still unknown (the row is unreadable, whatever the path)" "$(gate_e11_count_production_lines "99999999999999999999${TAB}0${TAB}tests/t.sh")" "unknown"
 
 # ── 5. the cap ───────────────────────────────────────────────────────────────
 echo "── 5. gate_e11_cap_lines ──"
@@ -197,6 +234,17 @@ eq "a long comment that does not carry the prefix: not a reason" "$(gate_e11_exe
 eq "no comments: no reason" "$(gate_e11_exempt_reason '[]')" "no"
 eq "comments unreadable (empty): desconhecido" "$(gate_e11_exempt_reason "")" "desconhecido"
 eq "comments not JSON: desconhecido" "$(gate_e11_exempt_reason "boom")" "desconhecido"
+# Gate round 2, low: a comment object with no .text read as an EMPTY comment, so a bd schema drift (text renamed) turned
+# "I could not read the comments" into "no reason" -> label-sem-motivo -> REFUSE: the very collapse the feature avoids
+# everywhere else. An element that is not an object with a string .text is unreadable. A VALID reason elsewhere in the
+# list still wins (positive evidence of the exemption is never outvoted by a neighbour we could not read).
+eq "an array element with no .text key (schema drift): desconhecido, not 'no'" "$(gate_e11_exempt_reason '[{"body":"gate:size-exempt: renome mecanico de 40 arquivos para o novo prefixo"}]')" "desconhecido"
+eq "a .text that is null: desconhecido" "$(gate_e11_exempt_reason '[{"text":null}]')" "desconhecido"
+eq "a .text that is not a string: desconhecido" "$(gate_e11_exempt_reason '[{"text":42}]')" "desconhecido"
+eq "an element that is not an object: desconhecido" "$(gate_e11_exempt_reason '["gate:size-exempt: renome mecanico de 40 arquivos"]')" "desconhecido"
+eq "a readable comment with no reason PLUS one with no .text: desconhecido (the unreadable one may hold it)" "$(gate_e11_exempt_reason '[{"text":"Pilot dispatched builder"},{"id":"c2"}]')" "desconhecido"
+eq "a valid reason PLUS one element with no .text: yes (the reason wins)" "$(gate_e11_exempt_reason '[{"id":"c2"},{"text":"gate:size-exempt: renome mecanico de 40 arquivos para o novo prefixo"}]')" "yes"
+eq "an EMPTY-string .text is a readable empty comment: no" "$(gate_e11_exempt_reason '[{"text":""}]')" "no"
 eq "state: label + reason = exempt" "$(gate_e11_exempt_state yes yes)" "exempt"
 eq "state: label without reason = label-sem-motivo" "$(gate_e11_exempt_state yes no)" "label-sem-motivo"
 eq "state: label, reason unreadable = desconhecido" "$(gate_e11_exempt_state yes desconhecido)" "desconhecido"
@@ -298,12 +346,17 @@ NOT_A_REPO="$TMPD/plain-dir"; mkdir -p "$NOT_A_REPO"
 log()  { echo "LOG $*" >> "$LOGF"; }
 err()  { echo "ERR $*" >> "$LOGF"; }
 set_gate_status() { echo "STATUS $*" >> "$CALLS"; }
-# bd answers `show <id>` and `comments <id>` from files named per id; any other verb (comment ...) succeeds.
+# bd answers `show <id>` and `comments <id>` from files named per id AND per store (-C <dir>): the source bead lives in
+# BEAD_CITY ($TMPD/beadcity), the marker in GC_CITY ($TMPD/city) — two DIFFERENT dirs, so a block that read the source
+# bead from the marker's store (or the reverse) finds nothing and the assertions below fail (gate round 2 nit: the stub
+# used to ignore -C and BEAD_CITY equalled GC_CITY, so swapping them would still have passed). Any other verb
+# (comment ...) succeeds.
 bd() {
   echo "BD $*" >> "$CALLS"
-  local verb="" id="" prev="" a
+  local verb="" id="" prev="" dir="" a
   for a in "$@"; do
     case "$prev" in
+      -C) dir="$a" ;;
       show) verb=show; id="$a" ;;
       comments) verb=comments; id="$a" ;;
       comment) [ -z "$verb" ] && verb=comment ;;
@@ -311,11 +364,13 @@ bd() {
     prev="$a"
   done
   case "$verb" in
-    show)     [ -f "$TMPD/show-$id.json" ] && cat "$TMPD/show-$id.json" || return 1 ;;
-    comments) [ -f "$TMPD/comments-$id.json" ] && cat "$TMPD/comments-$id.json" || return 1 ;;
+    show)     [ -n "$dir" ] && [ -f "$dir/show-$id.json" ] && cat "$dir/show-$id.json" || return 1 ;;
+    comments) [ -n "$dir" ] && [ -f "$dir/comments-$id.json" ] && cat "$dir/comments-$id.json" || return 1 ;;
     *) return 0 ;;
   esac
 }
+SRC_STORE="$TMPD/beadcity"; MRK_STORE="$TMPD/city"
+mkdir -p "$SRC_STORE"
 
 # two real bead ids, one per arm, found with the guard's own arm function
 find_bead() { local want="$1" k id; k=0; while [ "$k" -lt 200 ]; do k=$((k+1)); id="ga-e11live$k"; [ "$(gate_e11_arm_for_bead "$id")" = "$want" ] && { echo "$id"; return 0; }; done; return 1; }
@@ -323,9 +378,9 @@ BB="$(find_bead B)"; AA="$(find_bead A)"
 [ -n "$BB" ] && [ -n "$AA" ] && ok "found a bead per arm: B=$BB A=$AA" || { bad "could not find a bead per arm (arm function missing?)"; echo "  PASS=$PASS  FAIL=$FAIL"; echo "  RESULT: FAIL"; exit 1; }
 
 set_beads() { # <source-bead> <source labels json> <marker labels json>
-  printf '[{"id":"%s","labels":%s}]' "$1" "$2" > "$TMPD/show-$1.json"
-  printf '[{"id":"m-e11","labels":%s}]' "$3" > "$TMPD/show-m-e11.json"
-  rm -f "$TMPD/comments-$1.json" "$TMPD/comments-m-e11.json"
+  printf '[{"id":"%s","labels":%s}]' "$1" "$2" > "$SRC_STORE/show-$1.json"
+  printf '[{"id":"m-e11","labels":%s}]' "$3" > "$MRK_STORE/show-m-e11.json"
+  rm -f "$SRC_STORE/comments-$1.json" "$MRK_STORE/comments-m-e11.json"
 }
 PLAIN='["story:approved"]'; EXEMPT='["story:approved","gate:size-exempt"]'
 
@@ -335,7 +390,7 @@ run_e11() {
   : > "$LOGF"; : > "$CALLS"
   ( set -euo pipefail
     export GATE_E11_ENABLED="$1"
-    RIG_PATH="$2"; BEAD_ID="$3"; BRANCH="$4"; MARKER_ID="m-e11"; GC_CITY="$TMPD/city"; BEAD_CITY="$TMPD/city"
+    RIG_PATH="$2"; BEAD_ID="$3"; BRANCH="$4"; MARKER_ID="m-e11"; GC_CITY="$MRK_STORE"; BEAD_CITY="$SRC_STORE"
     . "$E11_FILE" ) >/dev/null 2>&1
   return $?
 }
@@ -426,25 +481,25 @@ has "BRANCH empty: nao-medido" "$LOGF" "verdict=nao-medido production_lines=unkn
 
 echo "  — the exemption —"
 set_beads "$BB" "$EXEMPT" "$PLAIN"
-printf '%s' "$RSN_OK" > "$TMPD/comments-$BB.json"
+printf '%s' "$RSN_OK" > "$SRC_STORE/comments-$BB.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label on the bead + a reason: accepted (rc 0)" "$RC" "0"
 has "exempt: logged as isento, with the count" "$LOGF" "verdict=isento production_lines=900"
 lacks "exempt: no refusal comment" "$CALLS" "STATUS m-e11 error"
 
 set_beads "$BB" "$EXEMPT" "$PLAIN"
-printf '%s' "$RSN_SHORT" > "$TMPD/comments-$BB.json"
+printf '%s' "$RSN_SHORT" > "$SRC_STORE/comments-$BB.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label with a token reason: still REFUSED" "$RC" "1"
 has "label without a real reason: recorded as label-sem-motivo" "$LOGF" "exempt=label-sem-motivo"
 
 set_beads "$BB" "$EXEMPT" "$PLAIN"
-printf '[]' > "$TMPD/comments-$BB.json"
+printf '[]' > "$SRC_STORE/comments-$BB.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label and NO comment at all: still REFUSED" "$RC" "1"
 
 set_beads "$BB" "$PLAIN" "$EXEMPT"
-printf '%s' "$RSN_OK" > "$TMPD/comments-m-e11.json"
+printf '%s' "$RSN_OK" > "$MRK_STORE/comments-m-e11.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label + reason on the MARKER bead instead: accepted" "$RC" "0"
 
@@ -454,7 +509,7 @@ eq "neither bead carries the label: REFUSED" "$RC" "1"
 has "refusal records exempt=nao" "$LOGF" "exempt=nao"
 
 echo "  — an exemption that cannot be read is not 'no exemption' —"
-set_beads "$BB" "$PLAIN" "$PLAIN"; rm -f "$TMPD/show-$BB.json"
+set_beads "$BB" "$PLAIN" "$PLAIN"; rm -f "$SRC_STORE/show-$BB.json"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "source bead unreadable (bd show fails): accepted, not refused" "$RC" "0"
 has "bd show failing: verdict nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao production_lines=900"
@@ -466,6 +521,53 @@ run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "label present, comments unreadable: accepted, not refused" "$RC" "0"
 has "comments unreadable: nao-medido-isencao" "$LOGF" "verdict=nao-medido-isencao"
 has "comments unreadable: the cause is NAMED (why=isencao-ilegivel)" "$LOGF" "why=isencao-ilegivel"
+
+set_beads "$BB" "$EXEMPT" "$PLAIN"      # label present, but the comment has no .text key (bd schema drift)
+printf '[{"id":"c1","body":"gate:size-exempt: renome mecanico de 40 arquivos para o novo prefixo"}]' > "$SRC_STORE/comments-$BB.json"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "label present, comment with no .text (schema drift): accepted, NOT refused as 'no reason' (round 2 low)" "$RC" "0"
+has "no .text: nao-medido-isencao, the exemption could not be read" "$LOGF" "verdict=nao-medido-isencao production_lines=900"
+has "no .text: the cause is NAMED" "$LOGF" "why=isencao-ilegivel"
+
+echo "  — the two stores: the source bead from BEAD_CITY, the marker from GC_CITY —"
+set_beads "$BB" "$EXEMPT" "$PLAIN"
+printf '%s' "$RSN_OK" > "$SRC_STORE/comments-$BB.json"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "exemption read from the source bead's own store: accepted (rc 0)" "$RC" "0"
+has "the source bead is read from BEAD_CITY" "$CALLS" "BD -C $SRC_STORE show $BB"
+has "the source bead's comments are read from BEAD_CITY" "$CALLS" "BD -C $SRC_STORE comments $BB"
+has "the marker is read from GC_CITY" "$CALLS" "BD -C $MRK_STORE show m-e11"
+lacks "the source bead is NOT looked up in the marker's store" "$CALLS" "BD -C $MRK_STORE show $BB"
+
+echo "  — a switch nobody could read: OFF, and the log says so (gate round 2, blocking issue 1) —"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+: > "$FLAG"
+run_e11 off "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "flag file PRESENT + GATE_E11_ENABLED=off (the operator's kill switch), arm B, 900 prod lines: ACCEPTED" "$RC" "0"
+has "junk env: ONE record says the switch could not be read, and why" "$LOGF" "LOG E11-DIFF-CAP bead=$BB arm=- verdict=interruptor-ilegivel production_lines=- cap=800 exempt=- why=env-invalido"
+eq "junk env: nothing refused, nothing labelled, no bd call" "$(calls_n)" "0"
+eq "junk env: exactly one E11-DIFF-CAP line" "$(grep -c 'E11-DIFF-CAP' "$LOGF" | tr -d ' ')" "1"
+run_e11 0 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "flag file present + env 0 (an explicit, readable OFF): accepted" "$RC" "0"
+eq "env 0 is a decision, not a failure: not one line logged" "$(wc -c < "$LOGF" | tr -d ' ')" "0"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "flag file present + env 1: still ON — arm B, 900 prod lines REFUSED" "$RC" "1"
+run_e11 "" "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "flag file present + env EMPTY (no override): the file decides, ON — REFUSED" "$RC" "1"
+rm -f "$FLAG"
+run_e11 off "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "no flag file + junk env: accepted" "$RC" "0"
+has "no flag file + junk env: still says the env value could not be read" "$LOGF" "verdict=interruptor-ilegivel production_lines=- cap=800 exempt=- why=env-invalido"
+run_e11 "" "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "born OFF (no file, no env): accepted" "$RC" "0"
+eq "born OFF: not one line logged (silence is the OFF contract)" "$(wc -c < "$LOGF" | tr -d ' ')" "0"
+if [ "$(id -u)" != "0" ]; then
+  : > "$FLAG"; chmod 000 "$FLAG"
+  run_e11 "" "$RIG_OK" "$BB" feat/prod900; RC=$?
+  eq "flag file that exists but cannot be read: OFF, accepted" "$RC" "0"
+  has "unreadable flag file: the log says so (round 2 low), not a silent OFF" "$LOGF" "verdict=interruptor-ilegivel production_lines=- cap=800 exempt=- why=flag-ilegivel"
+  chmod 600 "$FLAG"; rm -f "$FLAG"
+fi
 
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; fi
