@@ -91,6 +91,20 @@ newstate
 for sub in assign peek block; do run "$sub" ga-inv4 /store; [ -z "$OUT" ] && [ -z "$ERR" ] && [ "$RC" = 0 ] && ok "no conf: $sub silent, exit 0 (legitimately off)" || bad "no conf $sub: out='$OUT' rc=$RC err='$ERR'"; done
 newstate; conf planner_pct=5O; touch "$SD/no-e9-ab"; run assign ga-inv5 /store
 [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "kill switch beats an invalid conf: switching it off on purpose is not an error" || bad "kill switch + invalid conf: out='$OUT' rc=$RC"
+# `[ -e ]` follows symlinks, so a symlink whose target is gone answered "there is no conf" (exit 0, silent): the file is THERE and cannot be
+# read — the third state, not the second (same family as the roster finding of the gate review of ga-4q2zo5, attempt 1; ga-af5h6b).
+newstate; ln -s "$SD/no-such-conf" "$SD/e9-ab.conf"; run state
+case "$OUT" in invalid:*) ok "conf that is a dangling symlink → $OUT (it exists and cannot be read; not 'absent')" ;; *) bad "dangling conf symlink → state='$OUT' (must be invalid:*)" ;; esac
+for sub in assign peek block; do
+  run "$sub" ga-inv6 /store
+  [ -z "$OUT" ] && [ "$RC" = 6 ] && ok "dangling conf symlink: $sub prints nothing, exit 6" || bad "dangling conf symlink: $sub out='$OUT' rc=$RC"
+done
+[ ! -e "$SD/e9-roster.jsonl" ] && ok "dangling conf symlink: no roster row from any of them" || bad "dangling conf symlink wrote a roster"
+# the kill switch is a presence test, and the inert state is the default under doubt: a switch that is a dangling symlink is still a switch
+newstate; conf planner_pct=100 salt=k1; ln -s "$SD/no-such-switch" "$SD/no-e9-ab"; run state
+[ "$OUT" = killed ] && ok "kill switch that is a dangling symlink still counts: state=killed" || bad "dangling kill-switch symlink: state='$OUT' (the experiment kept running)"
+run assign ga-inv7 /store
+[ -z "$OUT" ] && [ "$RC" = 0 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "dangling kill-switch symlink: assign silent, exit 0, no roster row" || bad "dangling kill-switch symlink: assign out='$OUT' rc=$RC"
 newstate; printf '# comment\n\nplanner_pct=007  # inline\ncomplexity=off\n' > "$SD/e9-ab.conf"; run state
 [ "$OUT" = "active planner_pct=7 complexity=off salt=e9a" ] && ok "comments, blanks, leading zeros (007 is 7, not an octal error), default salt" || bad "lenient-parse conf → '$OUT'"
 # the state line must carry the REAL values — the first draft read them back through $(...) and printed empty ones
@@ -276,6 +290,93 @@ if [ "$(id -u)" != 0 ]; then
   [ -z "$OUT" ] && ok "block for a bead that could not be recorded adds nothing (no recorded arm, no treatment)" || bad "block on unwritable roster printed ${#OUT} bytes"
   codes="$(printf '0 3 5 6' | tr ' ' '\n' | sort -u | wc -l | tr -d ' ')"; [ "$codes" = 4 ] && ok "assign's exits: 0 (answer), 3 (no arm), 5 (not recorded), 6 (invalid conf) are four different codes" || bad "assign exit codes collide"
 fi
+
+# The torn line in the truncated-line case above ends in a newline, and a torn line from a crashed write NEVER does: the newline is the last
+# byte of a row, so a write that stops short never reaches it. The append used to glue the next row onto the fragment — one unparseable
+# line, exit 0, the bead treated in the builder's prompt but unreadable in the roster (so missing from the denominator the readout counts),
+# and after a pct ramp re-dispatched as the other arm (ga-af5h6b; the same defect the gate caught in E12, ga-4q2zo5 attempt 1).
+# The checks read the roster with their own jq, never with e9_recorded_arm, so they cannot agree with the code by sharing its blind spot.
+rowsfor() { jq -R -c --arg b "$1" 'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b)' "$SD/e9-roster.jsonl" 2>/dev/null | wc -l | tr -d ' '; }
+armfor()  { jq -R -r --arg b "$1" 'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b) | .planner_arm' "$SD/e9-roster.jsonl" 2>/dev/null | head -1; }
+nlines()  { wc -l < "$SD/e9-roster.jsonl" | tr -d ' '; }
+# fixture ids: one that is off at 50%, and two that are on at 50% of which one is OFF at 1% — the ramp 50% → 1% makes a lost row visible
+newstate; conf planner_pct=50 salt=torn1; armsof 80 q > "$W/arms50"
+conf planner_pct=1 salt=torn1;           armsof 80 q > "$W/arms1"
+ID_OFF="$(awk '$2=="off" {print $1; exit}' "$W/arms50")"
+ID_RAMP="$(paste -d' ' "$W/arms50" "$W/arms1" | awk '$2=="on" && $4=="off" {print $1; exit}')"
+ID_ON="$(awk -v skip="$ID_RAMP" '$2=="on" && $1!=skip {print $1; exit}' "$W/arms50")"
+[ -n "$ID_OFF" ] && [ -n "$ID_RAMP" ] && [ -n "$ID_ON" ] || { echo "FAIL: no fixture ids (off='$ID_OFF' ramp='$ID_RAMP' on='$ID_ON')" >&2; exit 1; }
+
+newstate; conf planner_pct=50 salt=torn1
+printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+run assign "$ID_OFF" /store
+[ "$OUT" = off ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_OFF")" = 1 ] && [ "$(armfor "$ID_OFF")" = off ] \
+  && ok "torn tail WITHOUT a newline: the next row lands on its own line and is readable" || bad "torn tail, no newline: out='$OUT' rc=$RC readable-rows=$(rowsfor "$ID_OFF") roster='$(cat "$SD/e9-roster.jsonl")'"
+run assign "$ID_ON" /store
+[ "$OUT" = on ] && [ "$(rowsfor "$ID_ON")" = 1 ] && [ "$(nlines)" = 3 ] \
+  && ok "…the one after it too (fragment sealed once: 3 lines = fragment + 2 rows, no blank line, no second seal)" || bad "after the sealed tail: out='$OUT' lines=$(nlines) readable-rows=$(rowsfor "$ID_ON")"
+newstate; conf planner_pct=50 salt=torn1
+printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+run assign "$ID_RAMP" /store; first_arm="$OUT"
+conf planner_pct=1 salt=torn1
+run assign "$ID_RAMP" /store
+[ "$first_arm" = on ] && [ "$OUT" = on ] && [ "$(rowsfor "$ID_RAMP")" = 1 ] && [ "$(armfor "$ID_RAMP")" = on ] \
+  && ok "torn tail + ramp 50% → 1%: the bead keeps its first arm (on), one readable row — the prompt and the roster agree" || bad "ramp over a torn tail: first='$first_arm' after='$OUT' readable-rows=$(rowsfor "$ID_RAMP") (the old code answered off here and wrote a second row)"
+run block "$ID_RAMP" /store
+case "$OUT" in *"TECHNICAL PLAN"*) [ "$(rowsfor "$ID_RAMP")" = 1 ] && ok "…and block still hands it the plan, without a second row" || bad "block after the ramp wrote a row: rows=$(rowsfor "$ID_RAMP")" ;; *) bad "block after the ramp: rc=$RC no plan for a bead recorded as on" ;; esac
+# a COMPLETE row that is only missing its newline (the crash came between the row and the newline) is a real row: counted, not re-assigned
+newstate; conf planner_pct=50 salt=torn1
+jq -nc --arg b "$ID_OFF" '{ts:"x",event:"assign",bead:$b,store:"/s",salt:"torn1",planner_arm:"off",planner_pct:50,complexity:"off"}' | tr -d '\n' > "$SD/e9-roster.jsonl"
+run assign "$ID_ON" /store
+[ "$OUT" = on ] && [ "$(rowsfor "$ID_ON")" = 1 ] && [ "$(rowsfor "$ID_OFF")" = 1 ] \
+  && ok "a whole row missing only its newline stays a row, and the next row does not fuse with it" || bad "whole row without newline: out='$OUT' on=$(rowsfor "$ID_ON") off=$(rowsfor "$ID_OFF")"
+conf planner_pct=100 salt=torn1
+run assign "$ID_OFF" /store
+[ "$OUT" = off ] && [ "$(rowsfor "$ID_OFF")" = 1 ] && ok "…and it is found afterwards (a ramp to 100% does not flip it)" || bad "whole row without newline, after ramp: out='$OUT' rows=$(rowsfor "$ID_OFF")"
+# a tail that ends in a NUL byte (what some filesystems leave after a crash). `$(tail -c1)` cannot see it: bash 5 drops the NUL, so a test
+# of "is the last byte empty" would call it a clean line end. The check has to read the byte itself.
+newstate; conf planner_pct=50 salt=torn1
+printf '{"ts":"x","event":"assign"\0' > "$SD/e9-roster.jsonl"
+run assign "$ID_OFF" /store
+[ "$OUT" = off ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_OFF")" = 1 ] \
+  && ok "a tail ending in a NUL byte counts as torn: the next row is written on its own line" || bad "NUL tail: out='$OUT' rc=$RC readable-rows=$(rowsfor "$ID_OFF")"
+# a roster that is a dangling symlink EXISTS and cannot be read: not "no roster". Appending through it would create the target out of nothing.
+newstate; conf planner_pct=50 salt=torn1; ln -s "$SD/no-such-roster" "$SD/e9-roster.jsonl"
+run assign "$ID_ON" /store
+[ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/no-such-roster" ] \
+  && ok "roster is a dangling symlink → no arm, exit 3, nothing created behind it (it cannot be read; not 'no row')" || bad "dangling roster symlink: out='$OUT' rc=$RC target-created=$([ -e "$SD/no-such-roster" ] && echo yes || echo no)"
+# an append that cannot happen must leave the file as it was: no seal written on its own, no half of a pair
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf planner_pct=50 salt=torn1; printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"; chmod 444 "$SD/e9-roster.jsonl"
+  before="$(cksum < "$SD/e9-roster.jsonl")"
+  run assign "$ID_OFF" /store; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && [ "$RC" = 5 ] && [ "$(cksum < "$SD/e9-roster.jsonl")" = "$before" ] \
+    && ok "unwritable roster + torn tail: nothing printed, exit 5, the file is byte-for-byte what it was" || bad "unwritable + torn: out='$OUT' rc=$RC changed=$([ "$(cksum < "$SD/e9-roster.jsonl")" = "$before" ] && echo no || echo yes)"
+fi
+# jq missing and no roster yet: "cannot read" (3), said as such. e9_recorded_arm's own comment promises it; the code used to answer "no row" (1),
+# fall through to the append, and report an unwritable roster (5).
+_nojq="$W/nojq-path"; mkdir -p "$_nojq"
+for _t in date mkdir cut tail od tr cat sed grep awk head wc sort uniq sha256sum openssl shasum perl; do _p="$(command -v "$_t" 2>/dev/null)" && [ -n "$_p" ] && ln -sf "$_p" "$_nojq/$_t"; done
+if [ -z "$(PATH="$_nojq" command -v jq 2>/dev/null)" ]; then
+  newstate; conf planner_pct=50 salt=torn1
+  OUT="$(PATH="$_nojq" /bin/bash "$E9" assign "$ID_OFF" /store 2>"$W/err")"; RC=$?
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/e9-roster.jsonl" ] && ok "no jq and no roster yet: no arm, exit 3 (cannot read), nothing written" || bad "no jq, no roster: out='$OUT' rc=$RC err='$(cat "$W/err")'"
+else
+  echo "  skip no-jq case: could not build a PATH without jq" >&2
+fi
+# e9_record itself — also the writer of the plan_run rows (the PENDING row before a paid run), sourced the way a caller sources it, under
+# `set -euo pipefail`: the last-byte read must not trip errexit, and a plan_run row must not fuse with a torn tail either.
+newstate; printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+OUT="$(/bin/bash -c 'set -euo pipefail; . "$1"; e9_record assign bead=ga-j1 store=/s salt=j planner_arm=on; e9_record plan_run bead=ga-j1 run_id=r1 verdict=PENDING; echo done' _ "$E9" 2>"$W/err")"; RC=$?
+good="$(jq -R -c 'try fromjson catch empty | select(type=="object")' "$SD/e9-roster.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$OUT" = done ] && [ "$RC" = 0 ] && [ "$good" = 2 ] && [ "$(nlines)" = 3 ] \
+  && ok "e9_record under set -euo pipefail over a torn tail: assign and plan_run rows both land on their own lines" || bad "e9_record sourced: out='$OUT' rc=$RC readable-rows=$good lines=$(nlines) err='$(cat "$W/err")'"
+newstate; mkdir "$SD/e9-roster.jsonl"
+OUT="$(/bin/bash -c '. "$1"; e9_record assign bead=ga-j2; echo "rc=$?"' _ "$E9" 2>/dev/null)"
+[ "$OUT" = "rc=3" ] && ok "e9_record on a roster that is a directory: rc 3" || bad "e9_record on a directory roster: '$OUT'"
+newstate; ln -s "$SD/no-such-roster" "$SD/e9-roster.jsonl"
+OUT="$(/bin/bash -c '. "$1"; e9_record plan_run bead=ga-j3 run_id=r3 verdict=PENDING; echo "rc=$?"' _ "$E9" 2>/dev/null)"
+[ "$OUT" = "rc=3" ] && [ ! -e "$SD/no-such-roster" ] && ok "e9_record on a dangling roster symlink: rc 3 (a PENDING row that cannot be written stops the paid run), no target created" || bad "e9_record on a dangling symlink: '$OUT' target-created=$([ -e "$SD/no-such-roster" ] && echo yes || echo no)"
 
 echo "== 4. complexity (computed from facts) =="
 cx() { run complexity "$@"; }

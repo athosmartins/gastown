@@ -47,8 +47,9 @@
 #                                          nothing, exit 0 (the experiment is legitimately OFF).
 #                                          ONE assignment per bead per salt: a bead that already has a row gets THAT row's arm back,
 #                                          whatever the conf says now (a pct ramp must not flip a re-dispatched bead).
-#                                          exit 3 = no arm (bad id, no sha tool, roster unreadable), 5 = arm decided but NOT recorded
-#                                          (roster unwritable), 6 = the conf is INVALID (a typo'd key: the experiment is NOT running and
+#                                          exit 3 = no arm (bad id, no sha tool, roster unreadable or no jq), 5 = arm decided but NOT recorded
+#                                          (roster unwritable, or not in a state a row can safely be appended to: a dangling symlink, a
+#                                          directory, a last byte that cannot be read), 6 = the conf is INVALID (a typo'd key: the experiment is NOT running and
 #                                          nobody asked for that); all three print nothing — a bead with no roster row gets no treatment.
 #                                          6 is its own code because the one real caller (the Pilot) drops stderr and logs only a
 #                                          non-zero exit: with the same silent 0 as "off", a typo at turn-on ran at 0% unseen.
@@ -87,8 +88,10 @@ e9_conf_load() {
   E9_PCT=0; E9_COMPLEXITY=off; E9_SALT=e9a; E9_PARSE=absent; E9_STATE=absent
   local dir conf line key val killed=0
   dir="$(e9_state_dir)"; conf="$dir/e9-ab.conf"
-  [ -e "$dir/no-e9-ab" ] && killed=1
-  if [ ! -e "$conf" ]; then if [ "$killed" = 1 ]; then E9_STATE=killed; else E9_STATE=absent; fi; return 0; fi
+  # -e follows symlinks: one whose target is gone is NOT absent — it is there and cannot be read. For the switch that means "still a switch"
+  # (the inert state is the default under doubt); for the conf it falls through to invalid:unreadable below.
+  if [ -e "$dir/no-e9-ab" ] || [ -L "$dir/no-e9-ab" ]; then killed=1; fi
+  if [ ! -e "$conf" ] && [ ! -L "$conf" ]; then if [ "$killed" = 1 ]; then E9_STATE=killed; else E9_STATE=absent; fi; return 0; fi
   E9_PARSE=ok
   if [ ! -r "$conf" ]; then E9_PARSE="invalid:unreadable"; fi
   while [ "$E9_PARSE" = ok ] && { IFS= read -r line || [ -n "$line" ]; }; do
@@ -208,28 +211,54 @@ E9PYBATCH
 # ── roster ────────────────────────────────────────────────────────────────────────────────────────────────────
 e9_roster() { printf '%s' "$(e9_state_dir)/e9-roster.jsonl"; }
 
-# e9_record <event> k=v ...   one JSON line, built by jq so a bead title or a "quote" can never corrupt the file.
+# e9_record <event> k=v ...   one JSON line, built by jq so a bead title or a "quote" can never corrupt the file. rc 0 = the row is in the
+# roster on a line of its own; rc 3 = it is not (a failing append can itself leave a short fragment; the next call seals it, below).
+# A write that stopped short (disk near full, a killed process) leaves a fragment with NO newline — the newline is the last byte of a row.
+# A bare append would glue this row onto that fragment: one unparseable line, reported as success, the bead treated in the builder's prompt
+# and missing from the roster. So when the file's last byte is not a newline the row is written with a newline in front, in the same
+# printf as the row (not a seal followed by an append). The last byte has three answers, never two: a newline / something else / could not
+# be read — the third is a failed record, never "looks fine". It is read with od, not $(tail -c1): command substitution drops a NUL, and
+# a tail ending in NUL is what some filesystems leave after a crash. An existing path that is not a regular file (a dangling symlink, a
+# directory) is refused up front, so the append cannot create a target out of nothing. Callers that spend money on the strength of this
+# row (e9-plan.sh's PENDING row) already treat a non-zero rc as "do not launch".
 e9_record() {
   local event="$1"; shift
-  local args=() kv
+  local args=() kv r row lead="" last lrc=0
   for kv in "$@"; do args+=(--arg "${kv%%=*}" "${kv#*=}"); done
   command -v jq >/dev/null 2>&1 || return 3
   mkdir -p "$(e9_state_dir)" 2>/dev/null || return 3
-  jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$event" ${args[@]+"${args[@]}"} \
-    '{ts:$ts,event:$event} + ($ARGS.named | del(.ts,.event))' >> "$(e9_roster)" 2>/dev/null || return 3
+  r="$(e9_roster)"
+  row="$(jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg event "$event" ${args[@]+"${args[@]}"} \
+    '{ts:$ts,event:$event} + ($ARGS.named | del(.ts,.event))' 2>/dev/null)" || return 3
+  [ -n "$row" ] || return 3
+  if [ -e "$r" ] || [ -L "$r" ]; then
+    [ -f "$r" ] || return 3
+    if [ -s "$r" ]; then
+      last="$(tail -c1 "$r" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" || lrc=$?
+      [ "$lrc" -eq 0 ] || return 3
+      case "$last" in
+        0a)                   ;;
+        [0-9a-f][0-9a-f])     lead=$'\n' ;;
+        *)                    return 3 ;;
+      esac
+    fi
+  fi
+  printf '%s%s\n' "$lead" "$row" >> "$r" 2>/dev/null || return 3
 }
 
 # e9_recorded_arm <bead> <salt> — the arm the ROSTER holds for this bead under this salt (the first assignment wins). Three answers:
 #   rc 0  prints on|off    the roster has a row for it
 #   rc 1  prints nothing   there is no row (no roster file, or a readable roster without one) — the only case where an arm may be COMPUTED
-#   rc 3  prints nothing   it cannot be told: the roster exists but cannot be read, jq is missing, or the row's arm is not on|off
+#   rc 3  prints nothing   it cannot be told: jq is missing (checked first — with no jq a row can be neither read nor written, whether or not
+#                          the roster file exists yet), the roster exists but cannot be read (a dangling symlink included — -e alone would
+#                          call it "no roster"), or the row's arm is not on|off
 # A line that is not a JSON object (a truncated write) is skipped, not fatal: one bad line must not make every bead look unassigned —
 # that is how a bead used to collect a fresh assign row per re-dispatch. The ROW: prefix is what tells "a row without an arm" from "no row".
 e9_recorded_arm() {
   local r out rc first; r="$(e9_roster)"
-  [ -e "$r" ] || return 1
-  { [ -f "$r" ] && [ -r "$r" ]; } || return 3
   command -v jq >/dev/null 2>&1 || return 3
+  [ -e "$r" ] || [ -L "$r" ] || return 1
+  { [ -f "$r" ] && [ -r "$r" ]; } || return 3
   out="$(jq -R -r --arg b "$1" --arg s "$2" \
     'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b and .salt==$s) | "ROW:" + ((.planner_arm // "") | tostring)' "$r" 2>/dev/null)"; rc=$?
   [ "$rc" -eq 0 ] || return 3
@@ -271,14 +300,14 @@ e9_cmd_assign() {
   case "$rrc" in
     0) printf '%s\n' "$rec"; return 0 ;;
     1) ;;
-    *) echo "e9: the roster cannot be read, so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
+    *) echo "e9: the roster cannot be read (unreadable, or jq is missing), so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
   esac
   arm="$(e9_arm_for "$bead")" || { echo "e9: cannot assign an arm to '$bead' (rc=$?)" >&2; return 3; }
   # `stage` (optional) says which stage first saw the bead — refiner | pilot-dispatch | builder-start. The arm does not depend on it:
   # one assignment per bead per salt, whoever asks first records it, and every later stage reads the same answer.
   e9_record assign bead="$bead" store="$store" salt="$E9_SALT" planner_arm="$arm" planner_pct="$E9_PCT" complexity="$E9_COMPLEXITY" \
     ${stage:+stage="$stage"} \
-    || { echo "e9: WARN: assignment for $bead NOT recorded (roster unwritable) — no arm handed out" >&2; return 5; }
+    || { echo "e9: WARN: assignment for $bead NOT recorded (roster unwritable, or not in a state a row can safely be appended to) — no arm handed out" >&2; return 5; }
   printf '%s\n' "$arm"
 }
 
@@ -295,7 +324,7 @@ e9_cmd_peek() {
   case "$rrc" in
     0) printf '%s\n' "$rec"; return 0 ;;
     1) ;;
-    *) echo "e9: the roster cannot be read, so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
+    *) echo "e9: the roster cannot be read (unreadable, or jq is missing), so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
   esac
   arm="$(e9_arm_for "$bead")" || { echo "e9: cannot determine an arm for '$bead' (rc=$?)" >&2; return 3; }
   printf '%s\n' "$arm"
