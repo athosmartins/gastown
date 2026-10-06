@@ -14,11 +14,15 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
          Callers MUST treat empty as "I do not know" and keep their previous order with a visible
          WARN — it never means "no bead".
 
-  lint   `lint [--root DIR] [--registry FILE]` — the registry lint. Every line in the scope that
-         orders or windows beads by its own idiom must be matched by a row of
+  lint   `lint [--root DIR] [--registry FILE]` — the registry lint. Every line, in a file matched by
+         SCOPE_GLOBS, that has a SEEN shape of "order or window beads by an idiom of your own" (the
+         IDIOMS below: one line, or a call left open at the end of a line) must be matched by a row of
          work-order.registry.tsv, and every row must still match a line. exit 0 clean, 1 findings
          (one `LINT FAIL:` line each), 2 cannot tell (registry unreadable, or no file in scope under
-         the root — a lint that looked at nothing never says "clean"). See the registry header.
+         the root — a lint that looked at nothing never says "clean").
+         The lint is NOT total, and every run says so: after the summary it prints the scope and the
+         shapes it cannot see (LINT SCOPE / LINT SEES / LINT NOT SEEN). "clean" means "no unregistered
+         line of a seen shape in that scope" — never "no ad-hoc ordering exists". See the registry header.
 
 As a module: `sort_beads(beads, age="created")` returns `(ordered_list, warnings)`, or
 `(None, [reason])` when it cannot tell — the caller then keeps its previous order and logs a WARN.
@@ -96,20 +100,61 @@ def sort_beads(beads, age="created"):
 # The master idioms: the ways code in this tree decides "which bead first" or "how many beads to look
 # at" by itself. A line matching one must be accounted for in the registry (a `consumer` row until its
 # slice migrates it to the library, a `reviewed` row when it orders something that is not a bead queue).
+#
+# What the lint sees is exactly what these regexes match on ONE line of a file in SCOPE_GLOBS (comment
+# lines excluded), and nothing else. That is a deliberate, narrow promise: LINT_NOT_SEEN below lists what
+# falls outside it, and every run prints it, so a clean exit can never be read as "nothing is ordered
+# ad hoc". Widen an idiom here (and add a fixture per shape to the selftest) rather than claim more.
+_FIELD = r"\b(?:created_at|updated_at|priority)\b"
+# The value of a window flag: anything but a literal 0 (0 = "the whole population", the safe form) — a digit,
+# a shell variable / substitution ($N, "$N", ${N}, $(..)), an f-string brace, or a call (str(n)). A quoted
+# "0" is a zero too. A bare word is NOT a value ("--limit N" in a usage string is prose, not a window)...
+_VALUE = r"""["']?(?!0(?!\d))(?:[0-9]|[$({]|[A-Za-z_][\w.]*\()"""
+# ...except as an element of a Python argv list, where a bare name closed by , ] ) is a variable:
+# ["bd", "list", "--limit", n] / "-n", limit)
+_LIST_VALUE = r"""["']?(?!0(?!\d))(?:[0-9]|[$({]|[A-Za-z_][\w.]*\(|[A-Za-z_][\w.]*\s*[,\])])"""
+# `-n` is too common to count everywhere (tail -n, sed -n, sysctl -n, jq -n, `[ -n "$x" ]`), so it counts
+# only (1) as its own quoted list element in a line that is not one of those tools, and (2) on a shell line
+# that names a bd query (bd ... list|ready|query|search ... -n N), never as a test operator.
+_NOT_OTHER_TOOL = r"""^(?!.*\[\s*["'](?:tail|head|sed|sysctl|sort|jq|cut)["'])"""
+_N_FLAG_LIST = _NOT_OTHER_TOOL + r""".*["']-n["']\s*,\s*""" + _LIST_VALUE
+_BD_WORD = r"""(?:\bbd\b|\$\{?[A-Za-z_]*BD[A-Za-z_]*\}?)"""
+_N_FLAG_BD = _BD_WORD + r""".*\b(?:list|ready|query|search)\b.*(?<![\w\[-])(?<!\[ )(?<!\[\[ )(?<!test )-n(?:=|\s+)""" + _VALUE
 IDIOMS = (
-    ("M1-jq-sort_by", r"sort_by\(.*\b(created_at|updated_at|priority)\b"),
-    ("M2-sort-flag", r"--sort[ =]"),
+    # jq sort_by/min_by/max_by keyed on a bead field; or the call left OPEN at the end of the line
+    # (the key is on a later line: a jq program split over lines).
+    ("M1-jq-sort_by", r"\b(?:sort_by|min_by|max_by)\((?:.*%s|[^)]*$)" % _FIELD),
+    # any --sort flag, in a shell line or as a Python list element ("--sort", "oldest")
+    ("M2-sort-flag", r"--sort(?![A-Za-z-])"),
     ("M3-pilot-sort-jq", r"_PILOT_SORT_JQ"),
-    ("M4-py-sort", r"(\.sort\(.*key=.*\b(created_at|updated_at|priority)\b"
-                   r"|\bsorted\(.*key=.*\b(created_at|updated_at|priority)\b)"),
-    ("M5-positive-limit", r"--limit(=|\s+)[1-9]"),
+    # Python .sort / sorted / min / max keyed on a bead field; or the call left open at the end of the line
+    ("M4-py-sort", r"(?:\.sort|\bsorted|\bmin|\bmax)\((?:.*\bkey=.*%s|[^)]*$)" % _FIELD),
+    # a window taken before the sort (the ga-g7yt trap): --limit N / --limit=N / --limit "$N" / f"--limit={N}",
+    # the Python list forms "--limit", "20" and "-n", "200", and `-n N` on a shell bd query
+    ("M5-positive-limit", r"(?:--limit(?:=|\s+)%s|[\"']--limit[\"']\s*,\s*%s|%s|%s)"
+                          % (_VALUE, _LIST_VALUE, _N_FLAG_LIST, _N_FLAG_BD)),
 )
+# The scope is a list of globs relative to .gascity-gastown-hq/ — files that carry bead queries as code.
+# docs/, test fixtures and the library itself are out; see SCOPE_SKIP.
 SCOPE_GLOBS = (
     "packs/town-deltas/assets/*.sh",
     "packs/town-deltas/assets/scripts/*.sh",
+    "packs/town-deltas/orders/*.toml",
+    "packs/town-deltas/formulas/*.toml",
+    "packs/town-deltas/template-fragments/*.md",
+    "formulas/*.toml",
+    "commands/*.md",
     "agents/*/prompt.template.md",
+    "scripts/*.sh",
     "scripts/*.py",
 )
+# Printed after EVERY lint run (clean or not): what the lint does and does not look at.
+LINT_SEES = ("a one-line form of M1..M5 (shell, jq, Python incl. list-form args, `-n N` on a bd query, a variable "
+             "or $(...) window), or a sort_by/min_by/max_by/.sort/sorted/min/max call left open at the end of a line")
+LINT_NOT_SEEN = ("a sort keyed through a helper or variable (key=_age, sort_by($k)); a text pipeline "
+                 "(... | sort -k.. | head -1); a window whose flag or size is assembled from pieces or sits on a "
+                 "different line from its flag; a hand-rolled min/loop; any file outside LINT SCOPE "
+                 "(docs/, other directories, other repos)")
 # selftests carry the idioms as fixtures; the library and this module ARE the one implementation.
 SCOPE_SKIP = re.compile(r"(\.selftest\.(sh|py)$|/test_[^/]*\.py$|/work-order\.sh$|/work_order\.py$)")
 DEFAULT_REGISTRY = os.path.join("packs", "town-deltas", "assets", "scripts", "work-order.registry.tsv")
@@ -229,6 +274,10 @@ def _main_lint(rest):
     for item in findings:
         sys.stdout.write("LINT FAIL: %s\n" % item)
     sys.stdout.write(summary + "\n")
+    # always, clean or not: a clean exit must not be readable as "nothing is ordered ad hoc"
+    sys.stdout.write("LINT SCOPE: %s (not: selftests, test_*.py, work-order.sh, work_order.py)\n" % " ".join(SCOPE_GLOBS))
+    sys.stdout.write("LINT SEES: %s\n" % LINT_SEES)
+    sys.stdout.write("LINT NOT SEEN: %s\n" % LINT_NOT_SEEN)
     return 1 if findings else 0
 
 

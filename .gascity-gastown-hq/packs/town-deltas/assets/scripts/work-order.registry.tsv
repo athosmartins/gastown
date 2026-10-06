@@ -1,4 +1,5 @@
-# work-order.registry.tsv — every place that orders or windows beads by an idiom of its own (ga-9t9acg.1).
+# work-order.registry.tsv — the places the lint FOUND that order or window beads by an idiom of its own (ga-9t9acg.1).
+# It is a list of what the lint can see, NOT a proof that nothing else exists: see "What the lint sees" below.
 # Checked by `python3 -I scripts/work_order.py lint` (run from work-order.selftest.sh). Read the header of
 # work-order.sh first: the rule is priority > type > age, and ONE library implements it.
 #
@@ -16,14 +17,25 @@
 #   regex  Python `re.search` over ONE line of that file, comment lines excluded. It has to match at least one
 #          line today: a row that matches nothing is STALE and fails the lint, and so does an idiom line that no
 #          row matches (UNREGISTERED). So a slice cannot migrate without deleting its row, and a new ad-hoc
-#          sort cannot appear without a row that says why.
+#          sort of a SHAPE THE LINT SEES cannot appear without a row that says why. A row is matched per line,
+#          not per site: one regex that matches three identical lines keeps the row alive after two of them go.
 #   owner  consumer/ext: the slice's bead id, or UNASSIGNED (found after the inventory, no slice yet — it is
 #          reported in ga-9t9acg.1 so the Mayor assigns it). reviewed: `-`.
 #   note   R-number from docs/research/ga-3zlzot-ordem-unica/inventario-e-desenho.md and what the site does.
 #
-# Scope and idioms: see IDIOMS / SCOPE_GLOBS in scripts/work_order.py. The idioms are sort_by on created_at /
-# updated_at / priority, any --sort flag, _PILOT_SORT_JQ, Python .sort/sorted keyed on those, and a positive
-# --limit (a window taken BEFORE the sort: the ga-g7yt trap).
+# What the lint sees (the whole claim; `python3 -I scripts/work_order.py lint` prints it on every run, clean or not):
+#   SAME-LINE FORMS matched by IDIOMS (scripts/work_order.py) in the files matched by SCOPE_GLOBS:
+#     M1 jq sort_by/min_by/max_by on created_at|updated_at|priority   M2 any --sort flag   M3 _PILOT_SORT_JQ
+#     M4 Python .sort/sorted/min/max(key=...) on those fields         M5 a positive window: --limit N / --limit=N /
+#     "--limit", "N" / `-n N` on a bd query / "-n", "N" in a Python argv list / a $VAR or $(...) size (0 = the
+#     whole population, the safe form, is NOT flagged)
+#     plus a sort_by/min_by/max_by/.sort/sorted/min/max call left OPEN at the end of a line (its arguments are on
+#     the next lines, so the lint cannot tell what it sorts by and asks for a row).
+# What the lint does NOT see — "clean" says nothing about these:
+#   a sort keyed through a helper or a variable (key=_age, sort_by($k)); a text pipeline (... | sort -k.. | head -1);
+#   a window whose flag or size is assembled from pieces or sits on another line than its flag; a hand-rolled
+#   min/loop; any file outside SCOPE_GLOBS (docs/, other directories, other repos — the ext rows list the known
+#   ones by hand). A reviewer who finds one adds a row, or widens IDIOMS and adds a selftest fixture for the shape.
 #
 # --- consumer rows -------------------------------------------------------------------------------------------
 consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_PILOT_SORT_JQ	ga-9t9acg.2	R2 Pilot dispatch order (_top_candidate, _queue_preview): bug-first, newest-first today
@@ -40,6 +52,7 @@ consumer	scripts/gate-recovery-watchdog.py	valid\.sort\(key=lambda x: x\[2\]\)	g
 consumer	packs/town-deltas/assets/quality-gate-guard.sh	sort_by\(\.created_at\) \| \.\[0\]	UNASSIGNED	not in the inventory: gate_pick_oldest_marker (called at MARKER=$(gate_pick_oldest_marker ...)) picks the guard's marker FIFO; belongs with the gate slice ga-q8tj7p or its own slice
 consumer	scripts/gate-recovery-watchdog.py	markers\.sort\(key=lambda m: _iso_epoch\(m\.get\("created_at"\)\) or 0\.0\)	UNASSIGNED	not in the inventory: requeue_error_markers, requeue_deferred_markers, recover_needs_rebase_markers each take markers oldest-first by created_at
 consumer	scripts/gate-recovery-watchdog.py	beads\.sort\(key=lambda b: _iso_epoch\(b\.get\("created_at"\)\) or 0\.0\)	UNASSIGNED	not in the inventory: close_recovered_repair_audit_beads walks the beads oldest-first by created_at
+consumer	scripts/pool-autoscale-watchdog.py	"--sort", "oldest", f"--limit=	UNASSIGNED	not in the inventory: _ready_candidates mirrors the engine probe R7 (ga-9t9acg.7): bd ready --sort oldest --limit=PROBE_CANDIDATE_LIMIT, a window taken BEFORE the watchdog's own exclusions and blind to priority; must change together with R7
 # --- ext rows (outside this repo; engine only via patch in docs/pending-engine-window, never a rebuild) --------
 ext	engine:internal/config/config.go	-	ga-9t9acg.7	R7 routedReadyTierCommand / legacy probe_pool_demand: --sort oldest --limit=20, sort_by(.updated_at // .created_at): blind to priority (patch only)
 ext	engine:internal/config/config.go	-	ga-9t9acg.7	R8 standardAssignedInProgressWorkQueryScript / standardAssignedReadyWorkQueryScript: --limit=20 with no sort (patch only)
@@ -48,7 +61,7 @@ ext	whatsapp_automation:whatsapp_automation/daemons/painel_visibilidade.py	-	ga-
 # --- reviewed rows: not a bead queue -------------------------------------------------------------------------
 reviewed	scripts/approved-state-reconciler.py	def _pilot_queue_position	-	R14 only READS the order R3 emits ("behind N items of higher priority"); correct once R3 migrates, checked in ga-9t9acg.3
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	for-each-ref --count=1 --sort=-committerdate	-	git: the newest branch of a repo, not a bead
-reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	--json --limit 5	-	sling retry: finds the ONE bead this sling just created, by title and creation time (window of 5 is the lookup, not a queue)
+reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	--json --limit 5(?!\d)	-	sling retry: finds the ONE bead this sling just created, by title and creation time (window of 5 is the lookup, not a queue)
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	sort_by\(\.created_at\) \| reverse \| \.\[0\]\.id	-	sling retry: the newest bead with the sling's own title; not a queue
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	list --limit 1 >/dev/null	-	store liveness probe, the output is thrown away
 reviewed	packs/town-deltas/assets/gate-needs-human-divergence-sweep.sh	sort_by\(\.created_at // ""\) \| last	-	the NEWEST gate marker of ONE source bead, to read its branch label
@@ -59,3 +72,26 @@ reviewed	scripts/home-scan-guard.py	rg --sort path	-	docstring example of a forb
 reviewed	scripts/jev_preambulo_experiment.py	ents = sorted\(seen\.values\(\), key=lambda e: \(e\["bead"\]\.get\("created_at"\)	-	experiment report: the order of the entities listed, nothing is dispatched from it
 reviewed	scripts/portaria_shadow.py	fresh\.sort\(key=lambda it: it\.get\("created_at"\) or ""\)	-	portaria shadow: the nudge snapshot, in the order the nudges were created; nudges, not beads
 reviewed	packs/town-deltas/assets/scripts/engine-binary-backup-guard.sh	for-each-ref --sort=-committerdate	-	git: the engine repo's branches, not beads
+reviewed	scripts/approved-state-reconciler.py	"--json", "-n", "200"\], timeout=BD_TIMEOUT\)	-	membership set: the source-bead ids that have an open gate marker (_bd_gate_markers). No order is used; the window of 200 means a marker past the 200th is not in the set (a known cap, not a queue)
+reviewed	scripts/approved-state-reconciler.py	"open,in_progress,deferred", "--json", "-n", "200"\],	-	story:approved reconcile scan: every bead is evaluated on its own and the result is a count, so the order is not used; the window of 200 caps how many are seen per cycle
+reviewed	scripts/auto-rehome-janitor.py	"list", "--json", "-l", label, "-n", "100"\]	-	label scan for wrong-store beads: candidates are collected into a dict by id and each is rehomed on its own; order not used, window of 100 caps one cycle (the rest is picked up as these leave)
+reviewed	scripts/imparavel-check.py	"list", "-l", label, "--status", status, "--json", "-n", "200"\]	-	diagnostic read (_bd_json): counts/ages of markers and approved stories for the imparavel report; nothing is dispatched from it, order not used
+reviewed	scripts/imparavel-check.py	"list", "-n", "1", "--json"\]	-	dolt liveness probe (check_dolt): only the exit code and latency are read, the bead is thrown away
+reviewed	scripts/gate-recovery-watchdog.py	"--assignee", str\(sid\), "--limit", "5", "--json"\]	-	ONE reviewer session's own verdict beads (assignee = its session id, window 5): the first non-closed one carrying a gate_run field is read for its verdict timeout; a session holds one live verdict at a time, not a queue
+reviewed	scripts/throughput-stall-watchdog.py	"--status", "open", "--json", "-n", "100"\]	-	three counters (backlog_signal, delivery_signal, ghost_slot_signal): len() of the open story:approved / ctx:ready / story:in-flight beads per rig, order not used; the window of 100 caps the count
+reviewed	scripts/throughput-stall-watchdog.py	"--status", "open", "--json", "-n", "20"\]	-	existence check on ONE source bead's own gate markers / runs (window 20): any active one answers yes; order not used
+reviewed	scripts/throughput-stall-watchdog.py	stalled_rigs = sorted\(\[	-	rig NAMES in alphabetical order for a report line; not beads
+reviewed	scripts/ram_owner_lib.py	daemon_owners_by_rss = sorted\($	-	daemon owner names by RSS, to pick the top N for a rig lookup; processes, not beads
+reviewed	scripts/sling-task-janitor.py	layer = sorted\($	-	topological layering of orphan beads for cleanup (blocks edges first, id inside a layer for determinism); the order of cleanup, not of which work is served first
+reviewed	scripts/dolt-compact-routine.sh	list --sort created --reverse .* --limit 1	-	the OLDEST non-ephemeral bead of a database, used as the control bead of a before/after snapshot of a compaction; not a work queue
+reviewed	packs/town-deltas/formulas/mol-digest-generate.toml	sort_by\(\.created_at\) \| reverse \| \.\[0\] // empty	-	the previous digest bead (newest by created_at), to read its digest.until; a chain of digests, not a queue
+reviewed	packs/town-deltas/formulas/mol-digest-generate.toml	--all --limit=1` ordenado	-	prose: the newest bead of one label, to tell "the job stopped" from "a quiet period"; a freshness check, not a queue
+reviewed	packs/town-deltas/formulas/mol-digest-generate.toml	--all --limit=1`, sem limite	-	prose: same freshness check, monthly label
+reviewed	packs/town-deltas/template-fragments/town-deltas.template.md	--status=in_progress --type=molecule --include-infra --limit=1	-	the witness's OWN current patrol wisp (assignee = this agent): a lookup of one, assuming one wisp per agent; not a queue
+reviewed	packs/town-deltas/template-fragments/town-deltas.template.md	--status=open --type=molecule --include-infra --limit=1	-	the witness's OWN assigned, not yet started patrol wisp: same lookup of one
+reviewed	scripts/beads-upstream-pr-watchdog.sh	--json number,state,mergedAt,url,title --limit "\$GH_LIMIT"	-	gh pr list: GitHub pull requests, not beads
+reviewed	scripts/beads-upstream-pr-watchdog.sh	may be outside --limit=\$GH_LIMIT	-	a log message about the gh window above; not a command
+reviewed	packs/town-deltas/assets/scripts/jev-dispatch-dedup.sh	run --limit "\$LIMIT"	-	the experiment's own CLI cap on how many NEW dispatches it logs per run (a slice of the pilot-dispatcher JSONL log); not a bd window
+reviewed	packs/town-deltas/assets/scripts/jev-gate-fail-categoria.sh	run --limit "\$LIMIT"	-	the experiment's own CLI cap on how many NEW dispatches it logs per run (a slice of the pilot-dispatcher JSONL log); not a bd window
+reviewed	packs/town-deltas/assets/scripts/jev-preambulo.sh	run --limit "\$LIMIT"	-	the experiment's own CLI cap on how many NEW dispatches it logs per run (a slice of the pilot-dispatcher JSONL log); not a bd window
+reviewed	packs/town-deltas/assets/scripts/jev-quem-pensa.sh	run --limit "\$LIMIT"	-	the experiment's own CLI cap on how many NEW dispatches it logs per run (a slice of the pilot-dispatcher JSONL log); not a bd window

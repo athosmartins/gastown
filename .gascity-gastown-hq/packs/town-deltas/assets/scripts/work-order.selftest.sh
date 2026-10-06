@@ -159,6 +159,11 @@ expect_order "unknown types trail the known ones inside P2 (and are not pushed b
   "p1-notype,p2-dotype,p2-feat,p2-bug,p2-notype,p2-empty,p2-num,p2-nulltype"
 eq "type? WARN for exactly the unreadable ones" "$(warns)" \
   "p1-notype: type?;p2-empty: type?;p2-notype: type?;p2-nulltype: type?;p2-num: type?;"
+FC2="$TMP/typecase.json"
+{ B p2-Bug 2 Bug 2026-01-01T00:00:00Z; B p2-FEATURE 2 FEATURE 2026-10-05T00:00:00Z; B p2-Story 2 Story 2026-10-04T00:00:00Z; } | arr > "$FC2"
+expect_order "the type is case-insensitive (the Pilot lowercases it): Feature / STORY are features" created "$FC2" "p2-Story,p2-FEATURE,p2-Bug"
+eq "a feature list written in capitals is lowercased by work_order_cfg" \
+  "$(WORK_ORDER_FEATURE_TYPES='Feature STORY' work_order_cfg | jq -c .feature_types)" '["feature","story"]'
 fi
 
 # ── (d) age unreadable ──────────────────────────────────────────────────────────────────────────
@@ -180,6 +185,32 @@ expect_order "unreadable ages trail their class (by id), P3 stays behind all of 
   "ok-old,ok-new,u-space,v-offset,w-month13,x-null,y-absent,z-junk,p3-ok"
 eq "age? WARN for exactly the unreadable ones" "$(warns)" \
   "u-space: age?;v-offset: age?;w-month13: age?;x-null: age?;y-absent: age?;z-junk: age?;"
+FD2="$TMP/age-cal.json"
+{
+  B ok 2 bug 2026-02-28T10:00:00Z
+  B leap-ok 2 bug 2024-02-29T10:00:00Z
+  B feb31 2 bug 2026-02-31T10:00:00Z
+  B apr31 2 bug 2026-04-31T00:00:00Z
+  B h24 2 bug 2026-10-06T24:00:00Z
+  B notleap 2 bug 2025-02-29T00:00:00Z
+} | arr > "$FD2"
+expect_order "a date the calendar does not have is unreadable, not rolled over (2026-02-31 is NOT 03-03); a real 02-29 is fine" created "$FD2" \
+  "leap-ok,ok,apr31,feb31,h24,notleap"
+eq "age? WARN for the impossible dates only" "$(warns)" "apr31: age?;feb31: age?;h24: age?;notleap: age?;"
+FD3="$TMP/noid.json"
+{
+  B has-id 2 bug 2026-01-01T00:00:00Z
+  B x 2 bug 2026-01-02T00:00:00Z | jq -c 'del(.id)'
+  B y 2 bug 2026-01-03T00:00:00Z | jq -c '.id = 7'
+  B z 2 bug 2026-01-04T00:00:00Z | jq -c '.id = ""'
+} | arr > "$FD3"
+run_sort created "$FD3"
+eq "a bead without a readable string id is kept, not dropped" "$(printf '%s' "$SORT_OUT" | jq 'length')" "4"
+# (compared per line: warns() sorts, and how punctuation sorts depends on the locale)
+for w in 'work-order WARN: ?: id?' 'work-order WARN: 7: id?' 'work-order WARN: : id?'; do
+  if printf '%s\n' "$SORT_ERR" | grep -qxF -- "$w"; then ok "id? WARN: $w"; else bad "id? WARN missing: [$w] in [$SORT_ERR]"; fi
+done
+eq "and no other bead is WARNed" "$(printf '%s\n' "$SORT_ERR" | grep -c .)" "3"
 fi
 
 # ── (e) timestamps ──────────────────────────────────────────────────────────────────────────────
@@ -304,6 +335,17 @@ out="$(WORK_ORDER_FEATURE_TYPES="" work_order_cfg 2>/dev/null)"; rc=$?
 eq "work_order_cfg with an empty feature list: stdout empty" "$out" ""; eq "work_order_cfg with an empty feature list: exit" "$rc" "2"
 out="$(echo '[]' | WORK_ORDER_FEATURE_TYPES="  " work_order_sort 2>/dev/null)"; rc=$?
 eq "work_order_sort with a blank feature list cannot tell: stdout empty" "$out" ""; eq "work_order_sort with a blank feature list: exit" "$rc" "2"
+err="$(work_order_cfg --nope 2>&1 >/dev/null)"
+case "$err" in *"unknown option: --nope"*) ok "a bad option is named in the ERROR line" ;; *) bad "the bad option is not named: [$err]" ;; esac
+err="$(WORK_ORDER_FEATURE_TYPES="" work_order_cfg 2>&1 >/dev/null)"
+case "$err" in *"WORK_ORDER_FEATURE_TYPES is empty"*) ok "an empty feature list is named in the ERROR line" ;; *) bad "the empty list is not named: [$err]" ;; esac
+out="$(PATH=/nonexistent /bin/bash -c "source '$LIB'; echo '[]' | work_order_sort" 2>"$TMP/err")"; rc=$?
+eq "jq missing: stdout empty" "$out" ""; eq "jq missing: exit 2" "$rc" "2"
+case "$(cat "$TMP/err")" in *"jq is not on PATH"*) ok "jq missing is reported as jq missing, not as a bad option" ;; *) bad "jq missing is not reported as such: [$(cat "$TMP/err")]" ;; esac
+eq "an exported WORK_ORDER_FEATURE_TYPES survives sourcing the library" \
+  "$(WORK_ORDER_FEATURE_TYPES=bug bash -c "source '$LIB'; echo \"\$WORK_ORDER_FEATURE_TYPES\"")" "bug"
+out="$(WORK_ORDER_FEATURE_TYPES="" bash -c "source '$LIB'; work_order_cfg" 2>/dev/null)"; rc=$?
+eq "an EMPTY export is not replaced by the default (it is refused): stdout empty" "$out" ""; eq "an EMPTY export: exit 2" "$rc" "2"
 echo "-- work_order_head"
 eq "head of the ordered 10-bead fixture" "$(work_order_sort < "$F10" 2>/dev/null | work_order_head | jq -r .id)" "j-p0-feat-reclaimed"
 out="$(echo '[]' | work_order_head 2>/dev/null)"; rc=$?
@@ -404,7 +446,15 @@ echo "== (R) registry lint: the real tree"
 lint_run "$ROOT" "$REGISTRY"
 eq "the real tree is clean (exit)" "$LINT_RC" "0"
 eq "the real tree has no finding" "$(lint_count 'LINT FAIL')" "0"
-case "$LINT_OUT" in *"LINT: files="*) ok "the lint prints its summary: $(printf '%s\n' "$LINT_OUT" | tail -1)" ;; *) bad "no LINT summary: $LINT_OUT" ;; esac
+case "$LINT_OUT" in *"LINT: files="*) ok "the lint prints its summary: $(printf '%s\n' "$LINT_OUT" | grep -m1 '^LINT: files=')" ;; *) bad "no LINT summary: $LINT_OUT" ;; esac
+# What the lint claims to look at is asserted from a list written HERE, not read back from the lint: a glob that
+# silently drops out of SCOPE_GLOBS is a hole in the net, and "the lint is clean" would not say so.
+EXPECT_GLOBS="packs/town-deltas/assets/*.sh packs/town-deltas/assets/scripts/*.sh packs/town-deltas/orders/*.toml packs/town-deltas/formulas/*.toml packs/town-deltas/template-fragments/*.md formulas/*.toml commands/*.md agents/*/prompt.template.md scripts/*.sh scripts/*.py"
+eq "the printed LINT SCOPE is the expected glob list" "$(printf '%s\n' "$LINT_OUT" | grep '^LINT SCOPE: ')" "LINT SCOPE: $EXPECT_GLOBS (not: selftests, test_*.py, work-order.sh, work_order.py)"
+case "$LINT_OUT" in *"
+LINT SEES: "*) ok "a clean run prints LINT SEES" ;; *) bad "no LINT SEES line: $LINT_OUT" ;; esac
+case "$LINT_OUT" in *"
+LINT NOT SEEN: "*) ok "a clean run prints LINT NOT SEEN" ;; *) bad "no LINT NOT SEEN line: $LINT_OUT" ;; esac
 for o in ga-q8tj7p ga-9t9acg.2 ga-9t9acg.3 ga-9t9acg.4 ga-9t9acg.5 ga-9t9acg.6 ga-9t9acg.8 ga-9t9acg.9 ga-9t9acg.10 ga-9t9acg.13; do
   if awk -F'\t' -v o="$o" '$1 == "consumer" && $4 == o {f=1} END {exit !f}' "$REGISTRY"; then ok "a consumer row is owned by $o"; else bad "no consumer row for $o"; fi
 done
@@ -421,6 +471,9 @@ FOO="$T1/packs/town-deltas/assets/foo-dispatcher.sh"
 printf '%s\n' '#!/bin/bash' '# sort_by(.created_at) in a comment is not a hit' "X=\$(echo \"\$J\" | jq 'sort_by(.created_at) | .[0]')" > "$FOO"
 lint_run "$T1" "$TMP/empty.tsv"
 eq "an unregistered sort_by: exit 1" "$LINT_RC" "1"
+for k in SCOPE SEES "NOT SEEN"; do
+  case "$LINT_OUT" in *"LINT $k: "*) ok "a failing run prints LINT $k" ;; *) bad "a failing run does not print LINT $k: $LINT_OUT" ;; esac
+done
 case "$LINT_OUT" in *"UNREGISTERED packs/town-deltas/assets/foo-dispatcher.sh:3 "*) ok "the finding names file and line (3)" ;; *) bad "finding missing: $LINT_OUT" ;; esac
 case "$LINT_OUT" in *"foo-dispatcher.sh:2 "*) bad "the comment line was reported" ;; *) ok "a comment line is not a hit" ;; esac
 row consumer packs/town-deltas/assets/foo-dispatcher.sh 'sort_by\(\.created_at\) \| \.\[0\]' ga-9t9acg.9 "R10 test" > "$TMP/r1.tsv"
@@ -446,6 +499,91 @@ eq "every idiom class and every scope glob is seen (6 findings)" "$(lint_count '
 for f in a.sh b.sh c.py d.sh prompt.template.md scripts/e.sh; do
   case "$LINT_OUT" in *"$f:1 "*) ok "seen: $f" ;; *) bad "not seen: $f" ;; esac
 done
+
+# One file per SCOPE glob, each carrying a sort: the lint has to find ten, one per glob in the list above.
+T6="$TMP/lt6"; mk_tree "$T6"; n=0
+IFS=' ' read -r -a GLOBS <<< "$EXPECT_GLOBS"      # an array, never an unquoted expansion: that would glob against the cwd
+for g in "${GLOBS[@]}"; do
+  f="${g//\*/fx}"; mkdir -p "$T6/$(dirname "$f")"; echo "jq 'sort_by(.created_at)'" > "$T6/$f"; n=$((n + 1))
+done
+lint_run "$T6" "$TMP/empty.tsv"
+eq "one finding per SCOPE glob ($n globs)" "$(lint_count 'UNREGISTERED')" "$n"
+for g in "${GLOBS[@]}"; do
+  f="${g//\*/fx}"
+  case "$LINT_OUT" in *"UNREGISTERED $f:1 "*) ok "scope glob is scanned: $g" ;; *) bad "scope glob is NOT scanned: $g" ;; esac
+done
+
+# One fixture per SHAPE the lint claims to see (flagged), per shape it claims NOT to flag (clean: 0 = the whole
+# population, tail -n, usage text, ...), and per blind spot it admits to (unseen: exit 0, and LINT NOT SEEN says so).
+T7="$TMP/lt7"; mk_tree "$T7"; mkdir -p "$T7/docs"
+shape() { # <flagged|clean> <label> <the file content>
+  printf '%s\n' "$3" > "$T7/scripts/s.py"
+  lint_run "$T7" "$TMP/empty.tsv"
+  if [ "$1" = flagged ]; then
+    if [ "$LINT_RC" -eq 1 ] && [ "$(lint_count 'UNREGISTERED scripts/s.py:1 ')" = "1" ]; then ok "shape flagged: $2"
+    else bad "shape NOT flagged — the lint is blind to it: $2 :: $3 (rc=$LINT_RC)"; fi
+  else
+    if [ "$LINT_RC" -eq 0 ] && [ "$(lint_count 'LINT FAIL')" = "0" ]; then ok "shape not flagged: $2"
+    else bad "shape wrongly flagged: $2 :: $3 (rc=$LINT_RC)"; fi
+  fi
+}
+unseen() { # <label> <the file content> <phrase LINT NOT SEEN must contain>
+  printf '%s\n' "$2" > "$T7/scripts/s.py"
+  lint_run "$T7" "$TMP/empty.tsv"
+  if [ "$LINT_RC" -ne 0 ]; then bad "blind spot is now SEEN ($1): move its fixture to flagged and fix LINT_NOT_SEEN :: $2"
+  elif printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -qF -- "$3"; then ok "blind spot is documented in LINT NOT SEEN: $1"
+  else bad "blind spot is NOT documented ('$3' missing from LINT NOT SEEN): $1"; fi
+}
+shape flagged "M1 sort_by"                         "jq 'sort_by(.created_at) | .[0]'"
+shape flagged "M1 min_by"                          "jq 'min_by(.created_at)'"
+shape flagged "M1 max_by"                          "jq 'max_by(.priority)'"
+shape flagged "M1 call left open at end of line"   "jq 'sort_by("
+shape flagged "M1 min_by left open"                "jq 'min_by("
+shape flagged "M2 --sort"                          "bd ready --sort oldest --json"
+shape flagged "M2 Python list-form --sort"         '  argv += ["--json", "--sort", "oldest"]'
+shape flagged "M3 _PILOT_SORT_JQ"                  "_PILOT_SORT_JQ='x'"
+shape flagged "M4 .sort(key=)"                     'rows.sort(key=lambda b: b["created_at"])'
+shape flagged "M4 sorted(key=)"                    'x = sorted(rows, key=lambda b: b.get("priority"))'
+shape flagged "M4 min(key=)"                       'o = min(rows, key=lambda b: b["updated_at"])'
+shape flagged "M4 max(key=)"                       'o = max(rows, key=lambda b: b["updated_at"])'
+shape flagged "M4 sorted( left open"               'layer = sorted('
+shape flagged "M4 .sort( left open"                'rows.sort('
+shape flagged "M5 --limit N"                       "bd list --json --limit 20"
+shape flagged "M5 --limit=N"                       "bd list --json --limit=20"
+shape flagged 'M5 --limit "$N"'                    'bd list --json --limit "$N"'
+shape flagged 'M5 --limit $N'                      'bd list --json --limit $N'
+shape flagged 'M5 --limit=${N}'                    'bd list --json --limit=${N}'
+shape flagged "M5 f-string --limit={n}"            'argv += ["--json", f"--limit={n}"]'
+shape flagged 'M5 list-form "--limit", "20"'       '_sh(["bd", "list", "--json", "--limit", "20"])'
+shape flagged 'M5 list-form "--limit", n'          '_sh(["bd", "list", "--json", "--limit", n])'
+shape flagged 'M5 list-form "--limit", str(n)'     '_sh(["bd", "list", "--limit", str(n)])'
+shape flagged 'M5 list-form "-n", "200"'           'r = _sh([BD, "-C", root, "list", "-l", label, "-n", "200", "--json"])'
+shape flagged 'M5 list-form "-n", variable'        'r = _sh([BD, "list", "-n", limit])'
+shape flagged 'M5 list-form "-n", "100"] on a continuation line' '                 "--status", "open", "--json", "-n", "100"],'
+shape flagged "M5 shell bd list -n N"              'bd list --status open -n 100'
+shape flagged 'M5 shell "$BD" list -n N'           '"$BD" -C "$dir" list -n 5 --json'
+shape flagged 'M5 shell bd ready -n $N'            'bd ready --json -n $N'
+shape clean "--limit 0 (the whole population)"     "bd list --json --limit 0"
+shape clean "--limit=0"                            "bd list --json --limit=0"
+shape clean 'list-form "--limit", "0"'             '_sh(["bd", "list", "--limit", "0"])'
+shape clean 'list-form "-n", "0"'                  '_sh([BD, "list", "-n", "0", "--json"])'
+shape clean "tail -n"                              'tail -n 20 "$LOG"'
+shape clean "sed -n"                               "sed -n '1,5p' f"
+shape clean "jq -n"                                "jq -n '{}'"
+shape clean "[ -n ] after a bd query"              'bd list --json | jq -e ".[0]" && [ -n "$x" ]'
+shape clean "test -n after a bd query"             'bd list --json && test -n "$x"'
+shape clean 'sysctl list-form "-n"'                'r = _sh(["sysctl", "-n", "hw.ncpu"])'
+shape clean "usage text: --limit N"                '  [--dry-run] [--limit N] [--since-days N]'
+shape clean "argparse --limit"                     'p.add_argument("--limit", type=int, default=30)'
+shape clean "sorted() of names, no bead field"     'names = sorted(names)'
+unseen "a sort keyed through a helper"             'rows.sort(key=_age)'                          'key=_age'
+unseen "a text pipeline"                           'ls | sort -k2 | head -1'                      'sort -k'
+unseen "a window assembled from pieces"            'LIM="--lim"; bd list ${LIM}it 20'             'assembled from pieces'
+unseen "a window on another line than its flag"    $'_sh(["bd", "list", "--limit",\n"20"])'       'different line from its flag'
+printf '%s\n' "jq 'sort_by(.created_at)'" > "$T7/docs/x.sh"; : > "$T7/scripts/s.py"
+lint_run "$T7" "$TMP/empty.tsv"
+if [ "$LINT_RC" -eq 0 ] && printf '%s\n' "$LINT_OUT" | grep '^LINT NOT SEEN: ' | grep -qF 'docs/'; then ok "a file in docs/ is out of scope, and LINT NOT SEEN says so"
+else bad "docs/ is not documented as out of scope (rc=$LINT_RC)"; fi
 
 T3="$TMP/lt3"; mk_tree "$T3"
 for f in packs/town-deltas/assets/foo.selftest.sh scripts/test_x.py scripts/x.selftest.py packs/town-deltas/assets/scripts/work-order.sh scripts/work_order.py; do
@@ -530,7 +668,7 @@ if want j && [ "${WO_SKIP_MUTATION:-0}" != "1" ]; then
 echo "== (j) mutation controls: each mutant of the library / lint must make this selftest fail"
 KEY='[wo_prio_class, wo_type_class($o), ($e // 9999999999), (.id // "")]'
 must_fail priority-only lib "$KEY" '[wo_prio_class]'
-must_fail bug-before-feature lib 'index($t)) != null then 0' 'index($t)) != null then 3'
+must_fail bug-before-feature lib 'index($t | ascii_downcase)) != null then 0' 'index($t | ascii_downcase)) != null then 3'
 must_fail newest-first lib '($e // 9999999999), (.id // "")]' '(-($e // 0)), (.id // "")]'
 must_fail today-bd-default lib "$KEY" '[wo_prio_class, (-($e // 0)), (.id // "")]'
 must_fail today-pilot-bug-first lib "$KEY" \
@@ -541,7 +679,7 @@ must_fail no-warn lib '| select(length > 0)' '| select(length < 0)'
 must_fail illegible-prio-is-p0 lib 'then .priority else 5 end;' 'then .priority else 0 end;'
 must_fail illegible-age-first lib '($e // 9999999999), (.id // "")]' '($e // 0), (.id // "")]'
 must_fail illegible-type-is-known lib 'if ($t | type) != "string" or $t == "" then 2' 'if ($t | type) != "string" or $t == "" then 1'
-must_fail story-not-feature lib 'WORK_ORDER_FEATURE_TYPES="feature story"' 'WORK_ORDER_FEATURE_TYPES="feature"'
+must_fail story-not-feature lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"' ': "${WORK_ORDER_FEATURE_TYPES=feature}"'
 must_fail type-only-issue_type lib '(.issue_type // .type) as $t' '.issue_type as $t'
 must_fail no-id-tiebreak lib '($e // 9999999999), (.id // "")]' '($e // 9999999999)]'
 must_fail reclaim-ignores-label lib 'test("^pilot:reclaim-count:[1-9][0-9]*$")' 'test("^pilot:reclaim-never$")'
@@ -555,13 +693,13 @@ must_fail head-failure-prints-null lib 'work_order_head: cannot tell (stdin is n
     echo null; return 0'
 must_fail empty-feature-list-accepted lib 'elif ($f | length) == 0 then error("WORK_ORDER_FEATURE_TYPES is empty")' 'elif false then empty'
 must_fail bad-age-accepted lib 'if ($age | IN("created", "field", "reclaim") | not) then error("age must be created, field or reclaim")' 'if false then empty'
-must_fail side-effect-at-source lib 'WORK_ORDER_FEATURE_TYPES="feature story"
-' 'WORK_ORDER_FEATURE_TYPES="feature story"
+must_fail side-effect-at-source lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"
+' ': "${WORK_ORDER_FEATURE_TYPES=feature story}"
 echo LEAK
 '
 if [ -x /bin/bash ] && [ "$(/bin/bash -c 'echo ${BASH_VERSINFO[0]}')" -lt 4 ]; then
-  must_fail bash4-only-syntax lib 'WORK_ORDER_FEATURE_TYPES="feature story"
-' 'WORK_ORDER_FEATURE_TYPES="feature story"
+  must_fail bash4-only-syntax lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"
+' ': "${WORK_ORDER_FEATURE_TYPES=feature story}"
 declare -A _wo_leak
 '
 else
@@ -571,8 +709,41 @@ must_fail lint-never-unregistered py 'if not any(r["rx"].search(text) for r in m
 must_fail lint-never-stale py 'elif not any(r["rx"].search(t) for _n, t in code[r["file"]]):' 'elif False:'
 must_fail lint-reads-comments py '_COMMENT_RE = re.compile(r"^\s*#")' '_COMMENT_RE = re.compile(r"^\s*#NEVER")'
 must_fail lint-skips-selftests py 'SCOPE_SKIP = re.compile(r"(\.selftest\.(sh|py)$|/test_[^/]*\.py$|/work-order\.sh$|/work_order\.py$)")' 'SCOPE_SKIP = re.compile(r"(NEVER)")'
-must_fail lint-drops-sort-flag-idiom py '("M2-sort-flag", r"--sort[ =]"),' ''
-must_fail lint-drops-window-idiom py '("M5-positive-limit", r"--limit(=|\s+)[1-9]"),' ''
+# the lows of the review: each is a mutant that reintroduces the defect
+must_fail type-case-sensitive lib 'index($t | ascii_downcase)) != null then 0' 'index($t)) != null then 0'
+must_fail feature-list-not-lowercased lib '($ft | ascii_downcase | gsub' '($ft | gsub'
+must_fail env-feature-types-overwritten lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"' 'WORK_ORDER_FEATURE_TYPES="feature story"'
+must_fail env-empty-feature-types-replaced lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"' ': "${WORK_ORDER_FEATURE_TYPES:=feature story}"'
+must_fail calendar-rolls-over lib 'if $e != null and (try ($e | todateiso8601) catch null) == $t then $e else null end' '$e'
+must_fail no-id-warn lib '(if (.id | type) != "string" or .id == "" then "id?" else empty end) ]' 'empty ]'
+must_fail jq-missing-not-named lib 'if ! command -v jq >/dev/null 2>&1; then' 'if false; then'
+must_fail bad-option-not-named lib 'unknown option: $1' 'bad option'
+# the lint: every alternative of every idiom, every scope glob, every line of the printed claim
+must_fail lint-drops-sort-flag-idiom py '("M2-sort-flag", r"--sort(?![A-Za-z-])"),' ''
+must_fail lint-drops-pilot-sort-idiom py '("M3-pilot-sort-jq", r"_PILOT_SORT_JQ"),' ''
+must_fail lint-drops-min_by-max_by py 'r"\b(?:sort_by|min_by|max_by)\((?:.*%s|[^)]*$)" % _FIELD' 'r"\b(?:sort_by)\((?:.*%s|[^)]*$)" % _FIELD'
+must_fail lint-drops-open-sort_by py 'r"\b(?:sort_by|min_by|max_by)\((?:.*%s|[^)]*$)" % _FIELD' 'r"\b(?:sort_by|min_by|max_by)\((?:.*%s)" % _FIELD'
+must_fail lint-drops-open-py-sort py 'r"(?:\.sort|\bsorted|\bmin|\bmax)\((?:.*\bkey=.*%s|[^)]*$)" % _FIELD' 'r"(?:\.sort|\bsorted|\bmin|\bmax)\((?:.*\bkey=.*%s)" % _FIELD'
+must_fail lint-drops-py-min-max py 'r"(?:\.sort|\bsorted|\bmin|\bmax)\(' 'r"(?:\.sort|\bsorted)\('
+must_fail lint-drops-shell-limit py 'r"(?:--limit(?:=|\s+)%s|' 'r"(?:--NEVER(?:=|\s+)%s|'
+must_fail lint-drops-list-form-limit py '[\"'\'']--limit[\"'\'']\s*,\s*%s' '[\"'\'']--NEVER[\"'\'']\s*,\s*%s'
+must_fail lint-drops-list-form-n py '_N_FLAG_LIST = _NOT_OTHER_TOOL + r""".*["'\'']-n["'\'']\s*,\s*""" + _LIST_VALUE' '_N_FLAG_LIST = _NOT_OTHER_TOOL + r""".*["'\'']-NEVER["'\'']\s*,\s*""" + _LIST_VALUE'
+must_fail lint-drops-shell-n py '-n(?:=|\s+)""" + _VALUE' '-NEVER(?:=|\s+)""" + _VALUE'
+must_fail lint-drops-dollar-bd py '_BD_WORD = r"""(?:\bbd\b|\$\{?[A-Za-z_]*BD[A-Za-z_]*\}?)"""' '_BD_WORD = r"""(?:\bbd\b)"""'
+must_fail lint-counts-zero-as-a-window py '
+_VALUE = r"""["'\'']?(?!0(?!\d))(?:' '
+_VALUE = r"""["'\'']?(?:'
+must_fail lint-flags-tail-n py '_NOT_OTHER_TOOL = r"""^(?!.*\[\s*["'\''](?:tail|head|sed|sysctl|sort|jq|cut)["'\''])"""' '_NOT_OTHER_TOOL = r"""^"""'
+must_fail lint-hides-scope py '    sys.stdout.write("LINT SCOPE: %s (not: selftests, test_*.py, work-order.sh, work_order.py)\n" % " ".join(SCOPE_GLOBS))' '    pass'
+must_fail lint-hides-sees py '    sys.stdout.write("LINT SEES: %s\n" % LINT_SEES)' '    pass'
+must_fail lint-hides-not-seen py '    sys.stdout.write("LINT NOT SEEN: %s\n" % LINT_NOT_SEEN)' '    pass'
+must_fail lint-not-seen-lies py 'a hand-rolled min/loop; any file outside LINT SCOPE "
+                 "(docs/, other directories, other repos)")' 'a hand-rolled min/loop")'
+IFS=' ' read -r -a MUT_GLOBS <<< "$EXPECT_GLOBS"
+for g in "${MUT_GLOBS[@]}"; do
+  must_fail "lint-drops-scope-glob-${g//[^A-Za-z0-9]/_}" py "    \"$g\",
+" ""
+done
 must_fail lint-empty-scope-is-clean py '    if not scope:
 ' '    if False:
 '

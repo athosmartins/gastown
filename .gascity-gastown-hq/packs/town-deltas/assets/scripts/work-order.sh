@@ -19,11 +19,15 @@
 #   type class      feature|story -> 0 (WORK_ORDER_FEATURE_TYPES); any other type string -> 1;
 #                   missing / empty / not a string -> 2, behind the known types WITHIN its priority. WARN type?
 #                   The type is read from .issue_type, falling back to .type (the engine's probes read both).
+#                   Case does not matter ("Feature" is a feature): the Pilot lowercases the type, so must this.
 #   age             oldest first. Unreadable -> the end of its class (epoch 9999999999). WARN age?
 #                   Compared as epoch seconds, never as text: "…:05.123Z" and "…+00:00" sort wrong as strings.
 #                   Accepted: a trailing Z or +00:00, with or without a fraction (the fraction is dropped,
-#                   so two beads in the same second tie and the id decides). Any other shape is unreadable.
-#   id              last tie-break, so the same beads in any input order give the same output.
+#                   so two beads in the same second tie and the id decides). Any other shape is unreadable,
+#                   and so is a date the calendar does not have (2026-02-31, a 24:00 hour): it is not rolled over.
+#   id              last tie-break, so the same beads in any input order give the same output. A bead without a
+#                   readable string id still stays in the output (id "" sorts first among exact ties) and gets
+#                   WARN `id?` — it cannot be told apart from another one, which is worth hearing about.
 #
 # TWO age rules, chosen per call with --age; each consumer documents which one it uses and why:
 #   created  (default) created_at.
@@ -39,8 +43,10 @@
 # THREE states, never collapsed into two:
 #   1. read and ordered   array in -> array out, exit 0. `[]` in -> `[]` out, exit 0.
 #   2. a field unreadable the bead STAYS in the output at the end of its class, and stderr gets one line per
-#                         such bead: `work-order WARN: <id>: prio? type? age?` (only the failing fields).
-#                         Never promoted to P0, never dropped.
+#                         such bead: `work-order WARN: <id>: prio? type? age? id?` (only the failing fields).
+#                         Never promoted to P0, never dropped. THE WARN LINES ARE THE ONLY SIGNAL: a caller must
+#                         keep stderr (`2>>"$LOG"`), never `2>/dev/null` — the city's habit for bd calls would
+#                         turn "illegible, kept at the end" into "silently misordered".
 #   3. cannot tell        stdin is not exactly one JSON array of objects, jq failed, bad option -> stdout
 #                         EMPTY, exit 2, one `work-order ERROR:` line on stderr. Callers MUST treat empty as
 #                         "I do not know": keep the previous order and log a visible WARN. Empty never
@@ -55,8 +61,10 @@
 #     orders, it never filters.
 
 # Data. `story` is an alias of `feature` so a P0 story is never hidden behind a P0 bug (0 open today,
-# measured 2026-10-06 in HQ and WA). Space-separated; an empty list is refused by work_order_cfg.
-WORK_ORDER_FEATURE_TYPES="feature story"
+# measured 2026-10-06 in HQ and WA). Space-separated, case-insensitive; an empty list is refused by
+# work_order_cfg. Set only when UNSET: a caller or a test that exported its own list keeps it (and an EMPTY
+# export stays empty, so it is refused — which is why this is `=` and not `:=`).
+: "${WORK_ORDER_FEATURE_TYPES=feature story}"
 
 # jq definitions, to be PREPENDED to a jq program. wo_prio_class / wo_type_class / wo_age / wo_key run on
 # ONE bead object; wo_sort / wo_warn / wo_run run on the ARRAY. $o is the output of `work_order_cfg`.
@@ -64,7 +72,8 @@ WORK_ORDER_JQ_DEFS='
 def wo_epoch($s):
   if ($s | type) != "string" then null
   else ($s | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")) as $t
-       | (try ($t | fromdateiso8601) catch null)
+       | (try ($t | fromdateiso8601) catch null) as $e
+       | if $e != null and (try ($e | todateiso8601) catch null) == $t then $e else null end
   end;
 def wo_prio_class:
   if (.priority | type) == "number" and .priority >= 0 and .priority <= 4 and (.priority | floor) == .priority
@@ -72,7 +81,7 @@ def wo_prio_class:
 def wo_type_class($o):
   (.issue_type // .type) as $t
   | if ($t | type) != "string" or $t == "" then 2
-    elif (($o.feature_types // ["feature", "story"]) | index($t)) != null then 0
+    elif (($o.feature_types // ["feature", "story"]) | index($t | ascii_downcase)) != null then 0
     else 1 end;
 def wo_type_class: wo_type_class({});
 def wo_age_src($o):
@@ -92,29 +101,37 @@ def wo_warn($o):
   [ .[] | . as $b
     | [ (if wo_prio_class == 5 then "prio?" else empty end),
         (if wo_type_class($o) == 2 then "type?" else empty end),
-        (if wo_age($o) == null then "age?" else empty end) ]
+        (if wo_age($o) == null then "age?" else empty end),
+        (if (.id | type) != "string" or .id == "" then "id?" else empty end) ]
     | select(length > 0)
     | "work-order WARN: " + (($b.id // "?") | tostring) + ": " + join(" ") ];
 def wo_run($o): wo_sort($o) as $s | { sorted: $s, warnings: ($s | wo_warn($o)) };
 '
 
 # work_order_cfg [--age created|field|reclaim] — prints the JSON options for the wo_* defs; exit 2 and
-# EMPTY stdout when it cannot (bad option, empty feature list, jq missing/failed). Callers MUST treat
-# empty as "cannot tell", never as a default.
+# EMPTY stdout when it cannot (bad option, empty feature list, jq missing/failed), with one
+# `work-order ERROR:` line on stderr that says WHICH. Callers MUST treat empty as "cannot tell", never as
+# a default.
 work_order_cfg() {
-  local age="created" out
+  local age="created" out msg
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "work-order ERROR: work_order_cfg: jq is not on PATH; cannot tell" >&2
+    return 2
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
-      --age)   if [ $# -lt 2 ]; then return 2; fi; age="$2"; shift 2 ;;
+      --age)   if [ $# -lt 2 ]; then echo "work-order ERROR: work_order_cfg: --age needs a value" >&2; return 2; fi; age="$2"; shift 2 ;;
       --age=*) age="${1#--age=}"; shift ;;
-      *)       return 2 ;;
+      *)       echo "work-order ERROR: work_order_cfg: unknown option: $1" >&2; return 2 ;;
     esac
   done
   if ! out="$(jq -cn --arg age "$age" --arg ft "$WORK_ORDER_FEATURE_TYPES" '
-      ($ft | gsub("\\s+"; " ") | split(" ") | map(select(length > 0))) as $f
+      ($ft | ascii_downcase | gsub("\\s+"; " ") | split(" ") | map(select(length > 0))) as $f
       | if ($age | IN("created", "field", "reclaim") | not) then error("age must be created, field or reclaim")
         elif ($f | length) == 0 then error("WORK_ORDER_FEATURE_TYPES is empty")
-        else { age: $age, feature_types: $f } end' 2>/dev/null)" || [ -z "$out" ]; then
+        else { age: $age, feature_types: $f } end' 2>&1)" || [ -z "$out" ]; then
+    msg="${out%%$'\n'*}"
+    echo "work-order ERROR: work_order_cfg: ${msg:0:200}; cannot tell" >&2
     return 2
   fi
   printf '%s\n' "$out"
@@ -126,7 +143,7 @@ work_order_cfg() {
 work_order_sort() {
   local cfg input res msg sorted warns
   if ! cfg="$(work_order_cfg "$@")" || [ -z "$cfg" ]; then
-    echo "work-order ERROR: work_order_sort: bad option or config (usage: work_order_sort [--age created|field|reclaim]); cannot tell" >&2
+    echo "work-order ERROR: work_order_sort: no usable config (see the line above; usage: work_order_sort [--age created|field|reclaim]); cannot tell" >&2
     return 2
   fi
   input="$(cat)"
