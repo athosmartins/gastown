@@ -77,7 +77,7 @@ def load_daemon():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     for need in ("operator_off", "degraded_marker", "DEGRADED_MARKER", "HEARTBEAT_FILE", "read_item_token", "item_service",
-                 "fingerprint", "login_name", "valid_user", "city", "now", "_iso", "POOL_ITEM_RE", "EXPIRES_AT_MS", "state_path"):
+                 "fingerprint", "login_name", "valid_user", "city", "now", "_iso", "POOL_ITEM_RE", "EXPIRES_AT_MS", "state_path", "CLOCK_SKEW_S"):
         if not hasattr(mod, need):
             raise ImportError(f"{p.name} lacks {need} (the guard needs the ga-8hcnvb.3 version of the daemon)")
     return mod
@@ -277,13 +277,15 @@ def judge_divergence(user: str) -> Tuple[str, dict]:
     if has_dec and not (isinstance(exp_fp, str) and FP_RE.fullmatch(exp_fp)):
         return "unknown", {"why": "the decision carries no fingerprint to compare with"}
     in_fp = D.fingerprint(tok) if istat == "ok" and tok else None
-    facts = {"exp_email": cur if has_dec else None, "exp_fp": exp_fp if has_dec else None, "in_fp": in_fp, "token": tok or ""}
+    facts = {"exp_email": cur if has_dec else None, "exp_fp": exp_fp if has_dec else None, "in_fp": in_fp, "token": tok or "", "item": istat}
     if not has_dec and istat == "missing":
         return "inactive", facts          # never activated (or switched off): nothing to compare
     if has_dec and istat == "ok" and in_fp == exp_fp:
         return "same", facts
     if has_dec and istat == "missing":
         facts["why"] = "o item do pool não existe: sessões novas caem no login ambiente"
+    elif istat == "ok" and not tok:
+        facts["why"] = "o item do pool existe mas não tem credencial"
     elif has_dec:
         facts["why"] = "o item do pool guarda outra credencial"
     else:
@@ -324,7 +326,7 @@ def check_divergence(gs: dict, t: float, user: str) -> None:
         if not email:
             use += " - " + ("não é nenhuma das chaves do cofre" if how == "not-among-the-vault-keys" else "o cofre não respondeu")
     else:
-        use = "nenhuma (item ausente)"
+        use = "nenhuma (item ausente)" if f.get("item") == "missing" else "item sem credencial (vazio)"
     mins = int((t - since) // 60)
     again = "Lembrete: " if last is not None else ""
     msg = (f"{again}A regra manda o pool usar {exp}, mas ele está em {use} há {mins} min ({f['why']}). "
@@ -618,19 +620,40 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> None:
 
 
 # ── 3. the daemon's liveness ───────────────────────────────────────────────────────────────────────
-def check_daemon_alive(gs: dict, t: float, user: str) -> None:
+def read_heartbeat(t: float) -> Tuple[str, Optional[float]]:
+    """('absent'|'ok'|'unreadable', epoch). Only a file that is NOT THERE means 'no clean run on record'. One that cannot be read, has no
+    usable epoch or is stamped in the future (a stuck clock would hide a dead daemon for as long as it lasts) is 'cannot tell'."""
     c = D.city()
-    hb_path = c / ".gc" / D.HEARTBEAT_FILE if c else None
-    last = None
+    if not c:
+        return "unreadable", None
     try:
-        last = _num(json.loads(hb_path.read_text()).get("epoch")) if hb_path else None
-    except (OSError, ValueError, AttributeError):
-        last = None
+        raw = (c / ".gc" / D.HEARTBEAT_FILE).read_text()
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "unreadable", None
+    try:
+        epoch = _num(json.loads(raw).get("epoch"))
+    except (ValueError, AttributeError, RecursionError):
+        return "unreadable", None
+    if epoch is None or epoch > t + D.CLOCK_SKEW_S:
+        return "unreadable", None
+    return "ok", epoch
+
+
+def check_daemon_alive(gs: dict, t: float, user: str) -> None:
+    hstat, last = read_heartbeat(t)
+    if hstat == "unreadable":
+        blind(gs, t, "daemon-heartbeat", "the daemon's heartbeat file cannot be read or holds no usable time")
+        return
+    unblind(gs, "daemon-heartbeat")
     dstat, _ = read_decision()
     istat, _tok = D.read_item_token(user)
-    if dstat == "absent" and istat == "missing" and last is None:
+    if last is None and dstat == "absent" and istat == "missing":
         gs["daemon"] = None      # never activated: nothing to be dead
         return
+    if last is None and dstat != "ok" and istat != "ok":
+        return                   # no heartbeat, and whether the daemon was ever switched on cannot be told (Keychain locked / decision unreadable): no verdict
     ref = last
     if ref is None:              # activated (a decision or an item exists) but no clean run on record yet: count from when the guard first saw that
         d = _dict(gs, "daemon")
@@ -713,25 +736,52 @@ def run_once(force_selftest: bool = False) -> int:
 
 
 # ── status ─────────────────────────────────────────────────────────────────────────────────────────
+def peek_gstate() -> Tuple[str, dict]:
+    """('absent'|'ok'|'corrupt'|'unreadable', state). Read-only: load_gstate moves a corrupt file aside, and `status` has no side effect."""
+    p = gstate_path()
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        return "absent", {}
+    except OSError:
+        return "unreadable", {}
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return "corrupt", {}
+    return ("ok", d) if isinstance(d, dict) else ("corrupt", {})
+
+
 def status(as_json: bool) -> int:
-    gs = load_gstate() or {}
+    """Exit 0 = it could say what the state file says (including 'nothing recorded yet'); 1 = it could not read the state file."""
+    sstat, gs = peek_gstate()
     binary = claude_binary()
-    out = {"installed_claude": claude_version(binary) if binary else None, "versions": gs.get("versions", {}),
+    installed = claude_version(binary) if binary else None
+    versions = gs.get("versions") if isinstance(gs.get("versions"), dict) else {}
+    out = {"state_file": sstat, "installed_claude": installed, "versions": versions,
            "degraded": bool(D.degraded_marker()), "divergence": gs.get("divergence"), "blind": gs.get("blind", {}),
            "daemon": gs.get("daemon"), "last_run": gs.get("updated")}
-    cur = out["versions"].get(out["installed_claude"]) if isinstance(out["versions"], dict) else None
-    out["installed_result"] = cur.get("result") if isinstance(cur, dict) else "not tested yet"
+    cur = versions.get(installed) if installed else None
+    if sstat in ("corrupt", "unreadable"):
+        out["installed_result"] = f"unknown (the guard's state file is {sstat})"
+    elif not installed:
+        out["installed_result"] = "unknown (the installed claude version could not be read)"
+    else:
+        out["installed_result"] = cur.get("result") if isinstance(cur, dict) and cur.get("result") else "not tested yet"
+    rc = 1 if sstat in ("corrupt", "unreadable") else 0
     if as_json:
         print(json.dumps(out, indent=1, sort_keys=True))
-        return 0
-    print(f"installed claude : {out['installed_claude']}  -> per-version self-test: {out['installed_result']}")
+        return rc
+    print(f"installed claude : {installed or '?'}  -> per-version self-test: {out['installed_result']}")
     print(f"auto-switch      : {'OFF (degraded marker present)' if out['degraded'] else 'on'}")
-    for v, r in sorted((out["versions"] or {}).items()):
+    for v, r in sorted(versions.items()):
         if isinstance(r, dict):
             print(f"  claude {v:<12} {str(r.get('result')).upper():<12} {r.get('checked_at', '?')}  {r.get('detail', '')}")
-    print(f"divergence       : {'OPEN since ' + D._iso(gs['divergence']['since']) if isinstance(gs.get('divergence'), dict) else 'none'}")
+    dv = gs.get("divergence") if isinstance(gs.get("divergence"), dict) else None
+    since = _num(dv.get("since")) if dv else None
+    print(f"divergence       : {('OPEN since ' + D._iso(since)) if since is not None else ('OPEN (since unknown)' if dv else 'none')}")
     print(f"guard last run   : {out['last_run']}")
-    return 0
+    return rc
 
 
 def main(argv: List[str]) -> int:

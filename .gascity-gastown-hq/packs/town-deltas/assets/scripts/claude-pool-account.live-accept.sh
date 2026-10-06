@@ -191,8 +191,14 @@ exit 0
 EOF2
 chmod +x "$W/notify-rec.sh"
 pushes() { grep -c "^CALL .* -p ${1:-4} " "$W/notify.rec" 2>/dev/null || true; }
+stamp_hb() { # the daemon's own write_heartbeat() at <clock-epoch>: what the real daemon leaves every minute. P1-P3 ran the daemon on a SIMULATED
+  # clock (RESET+60, 2 h ahead), so its last stamp is in the guard's future - which the guard rightly reads as 'cannot tell', not as a live daemon.
+  env HOME="$HOME" USER="$USER" GC_CITY_PATH="$W/city" CLAUDE_POOL_NOW="$1" "$PY" -c 'import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); m.write_heartbeat()' "$DAEMON" >/dev/null 2>&1
+}
 guard() { # guard <clock-epoch> <command...>   (GX="A=b C=d" adds env; the clock is the guard's own seam, the claude is the real one)
   local now="$1"; shift
+  stamp_hb "$now"
   env HOME="$HOME" USER="$USER" PATH="/usr/bin:/bin:/opt/homebrew/bin:$HOME/.local/bin" GC_CITY_PATH="$W/city" \
       CLAUDE_POOL_STATE="$W/state.json" CLAUDE_POOL_CRED_DIR="$POOL_DIR" CLAUDE_POOL_GUARD_STATE="$W/guard.json" \
       CLAUDE_POOL_GUARD_SCRATCH="$GSCR" CLAUDE_POOL_NOTIFY_CMD="$W/notify-rec.sh" REC_FILE="$W/notify.rec" \
@@ -232,7 +238,7 @@ f, email, fp = sys.argv[1:4]
 d = json.load(open(f)); d["current"], d["fingerprint"] = email, fp; json.dump(d, open(f, "w"))
 EOF2
 before="$(pushes 4)"; guard $((T1 + 360)) run-once >/dev/null 2>&1; guard $((T1 + 3600)) run-once >/dev/null 2>&1; guard $((T1 + 7200)) run-once >/dev/null 2>&1
-[ "$(pushes 4)" = "$before" ] && ok "P4f the account fixed -> the alert does not repeat (even an hour and two hours later)" || bad "P4f pushes went $before -> $(pushes 4)"
+[ "$(pushes 4)" = "$before" ] && ok "P4f the account fixed -> the alert does not repeat (even an hour and two hours later)" || bad "P4f pushes went $before -> $(pushes 4): $(grep '^CALL' "$W/notify.rec" | cut -c1-110 | tr '\n' '|')"
 
 # P4g-i  the real claude 'changes its internals': the drill makes the test see the credential removed -> degrade, answer on the ambient login, recover
 GX="CLAUDE_POOL_GUARD_FAULT=remove" guard $((T1 + 400)) selftest >/dev/null 2>&1

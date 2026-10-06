@@ -290,6 +290,9 @@ c="$(call_n 1)"
 new_w; rm -f "$STATE"; put_item "$KEY_a"; hb_touch; gtick 0; div3
 c="$(call_n 1)"
 { [ "$(ncalls)" = 1 ] && [[ "$c" == *"sem decisão"* ]] && [[ "$c" == *"a@t.test"* ]]; } && ok "G2e item present, no decision published -> alerted as a divergence" || bad "G2e: $c"
+new_w; active_world; gtick 0; put_item ""; div3     # the item exists, its accessToken is the empty string: that is not 'absent'
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"a@t.test"* ]] && [[ "$c" == *"sem credencial"* ]] && [[ "$c" != *"item ausente"* ]]; } && ok "G2f an item that exists but holds no credential is reported as empty, not as 'absent' (a different fault, a different fix)" || bad "G2f: $c"
 fi
 
 # ═══ G3. transient divergences, and an alert that did not go out ══════════════════════════════════
@@ -443,6 +446,53 @@ new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; for _i in 1 
 [ "$(ncalls)" = 0 ] && ok "G6g an operator who switched the mechanism off is not told the daemon stopped" || bad "G6g alerted under the kill switch"
 new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; set_mode renamed; for _i in 1 2 3 4 5 6; do gtick 600; done
 { [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G6h degraded (marker): the daemon is stood down on purpose, so it is not 'dead' (the only push is the one that says auto-switch is off)" || bad "G6h under the marker: calls=$(ncalls) $(call_n 2)"
+# a heartbeat that cannot be READ (garbled, no time in it, stamped in the future, not a file) says nothing about the daemon: no 'dead' verdict, and after 30 min the guard says it is blind
+hb_case() { # hb_case <label> <how to spoil the heartbeat: a shell snippet using $hbf>; the pool is activated and the daemon never stamps again
+  new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; local hbf="$CITY/.gc/claude-pool-account.heartbeat"; eval "$2"
+  gtick 600; gtick 600; gtick 600; n1=$(ncalls); gtick 600; gtick 600; gtick 600; n2=$(ncalls)
+  if grep -q "não está fechando rodadas" "$SINKS/notify.log" 2>/dev/null; then bad "G6i/$1 a heartbeat that cannot be read was judged 'the daemon is dead' ($(call_n 1))"
+  elif [ "$n1" = 0 ] && [ "$n2" = 1 ] && [[ "$(call_n 1)" == *"guarda sem enxergar"* ]] && [[ "$(call_n 1)" == *"daemon-heartbeat"* ]]; then ok "G6i/$1 unreadable heartbeat -> no 'dead' verdict; ONE 'guard is blind' alert after 30 min (calls at 30min/60min: $n1/$n2)"
+  else bad "G6i/$1 calls at 30min/60min: $n1/$n2 $(call_n 1)"; fi
+}
+hb_case garbled      'printf "this is not json" > "$hbf"'
+hb_case no-epoch     'printf "{\"updated\": \"x\", \"pid\": 1}" > "$hbf"'
+hb_case non-object   'printf "[1, 2, 3]" > "$hbf"'
+hb_case future       'printf "{\"epoch\": %s, \"updated\": \"stuck clock\", \"pid\": 1}" "$((NOW + 100000))" > "$hbf"'
+hb_case a-directory  'mkdir "$hbf"'
+# ...and when it can be read again the blindness ends by itself, and a real silence is judged on the real time
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; printf 'garbage' > "$CITY/.gc/claude-pool-account.heartbeat"; gtick 60
+grep -q "cannot verify daemon-heartbeat" "$CITY/.gc/logs/claude-pool-guard.log" && [ "$(gj "$GSTATE" blind/daemon-heartbeat/why | grep -c 'cannot be read')" = 1 ] && ok "G6j the guard records that it cannot read the heartbeat (state + log)" || bad "G6j nothing recorded: $(gl | tail -3)"
+hb_touch; gtick 1
+[ "$(gj "$GSTATE" blind/daemon-heartbeat)" = "<none>" ] && grep -q "can verify daemon-heartbeat again" "$CITY/.gc/logs/claude-pool-guard.log" && ok "G6k a readable heartbeat ends the blindness (recorded)" || bad "G6k blindness not cleared: $(gj "$GSTATE" blind)"
+# a locked Keychain and no decision: whether the pool was ever switched on cannot be told -> no 'the daemon never ran' verdict
+new_w; HB_AUTO=0; put_item "$KEY_a"; : > "$INFRA/kc/locked"
+for _i in 1 2 3 4 5 6; do gtick 600; done
+if grep -q "não está fechando rodadas" "$SINKS/notify.log" 2>/dev/null; then bad "G6l a pool whose activation cannot be told (Keychain locked, no decision) was judged 'the daemon is dead'"
+else ok "G6l Keychain locked + no heartbeat + no decision -> no 'daemon is dead' verdict (it cannot be told whether the daemon was ever meant to run)"; fi
+rm -f "$INFRA/kc/locked"
+fi
+
+# ═══ G9. `status` is a way to ask, so it must not turn "I could not look" into an answer ═════════════
+if want G9; then
+echo "G9. status: 'not tested yet' is not 'cannot tell'"
+new_w; run_guard -- status
+{ [ "$GRC" = 0 ] && grep -q "per-version self-test: not tested yet" "$LAST"; } && ok "G9 no state file yet -> 'not tested yet' (that one IS the true answer), rc 0" || bad "G9 rc=$GRC: $(head -c 300 "$LAST")"
+new_w; printf 'not json at all' > "$GSTATE"; run_guard -- status
+{ [ "$GRC" = 1 ] && grep -q "unknown (the guard's state file is corrupt)" "$LAST" && ! grep -q "not tested yet" "$LAST"; } && ok "G9a a corrupt state file -> 'unknown (... corrupt)', rc 1 - not 'not tested yet'" || bad "G9a rc=$GRC: $(head -c 300 "$LAST")"
+{ [ -f "$GSTATE" ] && [ "$(cat "$GSTATE")" = "not json at all" ] && ! ls "$DATA"/guard.json.corrupt.* >/dev/null 2>&1; } && ok "G9b ...and asking did not move or change the file (status only looks)" || bad "G9b the state file was touched: $(ls "$DATA")"
+run_guard -- status --json
+{ [ "$GRC" = 1 ] && [ "$(gj "$LAST" state_file)" = corrupt ] && [[ "$(gj "$LAST" installed_result)" == "unknown (the guard's state file is corrupt)" ]]; } && ok "G9c status --json says the same (state_file=corrupt, installed_result unknown)" || bad "G9c rc=$GRC: $(head -c 300 "$LAST")"
+if [ "$(id -u)" != 0 ]; then
+  new_w; echo '{}' > "$GSTATE"; chmod 000 "$GSTATE"; run_guard -- status; chmod 600 "$GSTATE"
+  { [ "$GRC" = 1 ] && grep -q "unknown (the guard's state file is unreadable)" "$LAST"; } && ok "G9d a state file that cannot be read -> 'unknown (... unreadable)', rc 1" || bad "G9d rc=$GRC: $(head -c 300 "$LAST")"
+fi
+new_w; active_world; gtick 0
+run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- status
+{ [ "$GRC" = 0 ] && grep -q "unknown (the installed claude version could not be read)" "$LAST" && ! grep -q "self-test: pass" "$LAST" && ! grep -q "not tested yet" "$LAST"; } && ok "G9e claude cannot be run -> the installed version's result is 'unknown', never the last recorded one or 'not tested yet'" || bad "G9e rc=$GRC: $(head -c 400 "$LAST")"
+run_guard GC_LOWPRIO_CLAUDE_BIN=no-such-claude-binary-xyz -- status --json
+{ [[ "$(gj "$LAST" installed_result)" == "unknown (the installed claude version could not be read)" ]] && [ "$(gj "$LAST" versions/1.0.0/result)" = pass ]; } && ok "G9f ...while the recorded history is still shown (status --json: versions/1.0.0 = pass)" || bad "G9f: $(head -c 400 "$LAST")"
+run_guard -- status
+grep -q "per-version self-test: pass" "$LAST" && ok "G9g and with claude readable and tested, the answer is the recorded result" || bad "G9g: $(head -c 300 "$LAST")"
 fi
 
 # ═══ G7. AC4: no key leaks, proven with a scanner that is proven to see ═════════════════════════════

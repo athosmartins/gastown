@@ -87,7 +87,9 @@ mechanism off.
                     -> INCONCLUSIVE (claude hangs, Keychain locked, output that is not JSON): changes nothing; after 30 min of it, one
                        "Pool Claude: guarda sem enxergar" says the guard cannot verify. It never degrades on "could not tell".
    3 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas"
-                  (not while the mechanism is off or degraded; not for a pool that was never activated)
+                  (not while the mechanism is off or degraded; not for a pool that was never activated). A heartbeat that cannot be
+                  read (garbled, no time in it, stamped in the future, not a file) or a pool whose activation cannot be told (Keychain
+                  locked, no decision) is "could not tell": no verdict, and the 30-minute "guarda sem enxergar" notice instead.
 ```
 
 Three answers, never two: every check is yes / no / could not tell, and "could not tell" never acts.
@@ -98,6 +100,8 @@ Three answers, never two: every check is yes / no / could not tell, and "could n
 G=/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-pool-guard.py
 python3 $G status          # human
 python3 $G status --json   # installed_claude, installed_result, versions{<ver>: {result, checked_at, detail, attempts}}, degraded, divergence
+                           # installed_result is "unknown (...)" when the state file is corrupt/unreadable or claude's version cannot be read
+                           # (status then exits 1 for a bad state file); "not tested yet" only when nothing is recorded. status changes no file.
 python3 $G selftest        # run the per-version test now, whatever was recorded, and act on the result
 ```
 
