@@ -73,6 +73,17 @@ rc=0; cb="$(bash "$ARMS" block "$ID_C" "$CITY" prod-test)" || rc=$?
 [[ "$(jq -r --arg b "$ID_C" 'select(.bead==$b) | .arm' "$S/e12-roster.jsonl")" == control ]] || fail "the control bead has no control row — a control with no denominator is not a control"
 log "treated → the ≤10-line block with the 'vazio → …; falhou/ilegível → …' format; control → nothing; both recorded ✓"
 
+# A dry run must enrol nothing, wherever the flag stands. With the store left out, `block <id> --no-record` read the flag as the STORE: it
+# printed the block AND wrote {"store":"--no-record"} to the roster, and the first assignment is sticky (gate review of ga-4q2zo5,
+# attempt 2). Looking at a bead must not put it in the denominator. Read back with this test's own jq, not with the script.
+rm -f "$S/e12-roster.jsonl"
+for dry in "$ID_T --no-record" "--no-record $ID_T" "$ID_T --no-record prod-test"; do
+  rc=0; out="$(bash "$ARMS" block $dry 2>/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 && "$out" == "$tb" ]] || fail "a dry run ('block $dry') must show the treated block and exit 0, got rc=$rc"
+  [[ ! -e "$S/e12-roster.jsonl" ]] || fail "a dry run ('block $dry') enrolled the bead: $(cat "$S/e12-roster.jsonl")"
+done
+log "dry run (--no-record) before, after or without a store: the block is shown, nothing is enrolled ✓"
+
 # A write that stops short leaves a fragment with NO newline. The deployed script must put the next row on its own line: gluing it onto
 # the fragment made the row unreadable while the command still said success (gate review of ga-4q2zo5, attempt 1). Read back with this
 # test's own jq, not with the script.

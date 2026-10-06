@@ -42,12 +42,16 @@
 #   arm <bead-id>                           prints treated | control. PURE: no roster, ignores recorded rows. exit 4 = no conf (no experiment
 #                                           is NOT "control"), 2 = empty id / invalid conf, 3 = no sha256 tool (prints nothing)
 #   assign <bead-id> [store] [stage]        WRITES the roster. Prints the bead's arm (recorded one wins), or NOTHING when there is no conf
-#                                           (exit 0: legitimately off). exit 3 = no arm could be determined, 5 = arm decided but NOT
-#                                           recorded (roster unwritable), 6 = the conf is INVALID. Every non-zero exit prints nothing.
+#                                           (exit 0: legitimately off). exit 2 = the arguments are not that shape (see below), 3 = no arm
+#                                           could be determined, 5 = arm decided but NOT recorded (roster unwritable), 6 = the conf is
+#                                           INVALID. Every non-zero exit prints nothing on stdout.
 #   block <bead-id> [store] [stage] [--no-record]
 #                                           assign, then print the write-time doctrine block ONLY for a treated bead (nothing for control
 #                                           or when off). Same exits as assign. --no-record is for a dry run: nothing is written, the
 #                                           recorded arm (else the pure arm) decides — looking at a bead must not enrol it.
+# Arguments (assign and block): --no-record, which only block takes, may stand ANYWHERE in the list — it is an option, taken out before
+# the positionals are counted, so `block <id> --no-record` is a dry run with no store. Any other word that starts with '-', and a 4th
+# positional, is refused with exit 2 and nothing written, never filed into a field of the roster row. An empty word keeps its slot.
 #
 # Safe to source under `set -e` / `set -u` (the selftest does exactly that, section 8): every command substitution whose non-zero status is
 # an ANSWER ("no row" is rc 1, "cannot be read" rc 3) is captured with `|| rc=$?`, never `x="$(…)"; rc=$?`, which `set -e` turns into an
@@ -227,9 +231,39 @@ e12_resolve() {
   return 0
 }
 
+# e12_parse_args <accept-no-record:1|0> <args…> — the shape of assign and block: <bead-id> [store] [stage], and for block alone --no-record.
+# Sets E12_A_BEAD, E12_A_STORE, E12_A_STAGE and E12_A_RECORD (1, or 0 when --no-record was given). Not for $(...): the globals are the result.
+# rc 0 = parsed; rc 2 = the arguments are not that shape — and nothing has been written, because nothing has been resolved yet.
+# --no-record is an OPTION, so it is taken out of the whole list before the positionals are counted, wherever it stands. Read by position
+# (the first two words are bead and store, the rest are options) it turned into the store whenever the store was left out: `block <id>
+# --no-record` printed the block AND enrolled the bead, with {"store":"--no-record"} — a dry run that mutates, and the first assignment is
+# sticky. Any other word that starts with '-' is refused rather than filed into a field of the roster row, and so is a 4th positional
+# (assign used to drop it, block let it replace the stage): the roster is the denominator and a row with a flag in it is a row nobody can
+# trust. An empty word is a value, not a missing one — the Pilot can pass an empty store — so it keeps its slot.
+e12_parse_args() {
+  local accept="$1" a n=0
+  shift
+  E12_A_BEAD=""; E12_A_STORE=""; E12_A_STAGE=""; E12_A_RECORD=1
+  for a in "$@"; do
+    if [ "$a" = "--no-record" ] && [ "$accept" = 1 ]; then E12_A_RECORD=0; continue; fi
+    case "$a" in
+      -*) echo "e12: '$a' is not an argument this command takes (a word that starts with '-' is never a bead id, a store or a stage) — nothing was written" >&2; return 2 ;;
+    esac
+    n=$((n+1))
+    case "$n" in
+      1) E12_A_BEAD="$a" ;;
+      2) E12_A_STORE="$a" ;;
+      3) E12_A_STAGE="$a" ;;
+      *) echo "e12: too many arguments (expected <bead-id> [store] [stage]) — nothing was written" >&2; return 2 ;;
+    esac
+  done
+  return 0
+}
+
 e12_cmd_assign() {
   local rc=0
-  e12_resolve "${1:-}" "${2:-}" "${3:-}" 1 || rc=$?
+  e12_parse_args 0 "$@" || return $?
+  e12_resolve "$E12_A_BEAD" "$E12_A_STORE" "$E12_A_STAGE" 1 || rc=$?
   [ "$rc" -eq 0 ] && [ -n "$E12_ARM" ] && printf '%s\n' "$E12_ARM"
   return "$rc"
 }
@@ -248,12 +282,9 @@ E12BLOCK
 }
 
 e12_cmd_block() {
-  local bead="${1:-}" store="${2:-}" stage="" record=1 a rc=0
-  [ "$#" -gt 0 ] && shift; [ "$#" -gt 0 ] && shift
-  for a in "$@"; do
-    case "$a" in --no-record) record=0 ;; *) stage="$a" ;; esac
-  done
-  e12_resolve "$bead" "$store" "$stage" "$record" || rc=$?
+  local rc=0
+  e12_parse_args 1 "$@" || return $?
+  e12_resolve "$E12_A_BEAD" "$E12_A_STORE" "$E12_A_STAGE" "$E12_A_RECORD" || rc=$?
   [ "$rc" -eq 0 ] && [ "$E12_ARM" = treated ] && e12_block_text
   return "$rc"
 }

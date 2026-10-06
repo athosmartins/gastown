@@ -279,6 +279,53 @@ run block "$ID_C" /store/x --no-record; [ -z "$OUT" ] && [ "$RC" = 0 ] && ok "--
 run assign "$ID_C" /store/x; conf treated_pct=100; run block "$ID_C" /store/x --no-record
 [ -z "$OUT" ] && ok "--no-record honours the recorded arm over the current pure arm (the variable decided on is the variable acted on)" || bad "--no-record ignored the recorded arm"
 
+# The flag is an option, not a slot. Read by position it became the STORE whenever the store was left out: `block <id> --no-record` exited 0,
+# printed the block and wrote {"bead":"<id>","store":"--no-record"} — a dry run that enrolled the bead for good (the first assignment is
+# sticky) under a garbage store field (gate review of ga-4q2zo5, attempt 2). Every case above puts a store in front of the flag, the one
+# position the old code got right, which is why they were green. Here the flag stands in every other position; each run must leave NO roster.
+# treated_pct=100 so the bead is treated whatever its hash, and the block text is the treated text seen above ($TB).
+nr_case() { # nr_case <label> <block args…> — a fresh state per case, so one failure cannot make the next one fail by leaving a roster behind
+  local label="$1"; shift
+  newstate; conf treated_pct=100
+  run block "$@"
+  if [ "$RC" = 0 ] && [ "$OUT" = "$TB" ] && [ ! -e "$SD/e12-roster.jsonl" ]; then ok "--no-record $label: the block is shown, exit 0, no roster"
+  else bad "--no-record $label: rc=$RC block-shown=$([ "$OUT" = "$TB" ] && echo yes || echo no) roster=$([ -e "$SD/e12-roster.jsonl" ] && tr '\n' ' ' < "$SD/e12-roster.jsonl" || echo none)"; fi
+}
+nr_case "right after the bead id (no store given)"        ga-p1test --no-record
+nr_case "right after the bead id, then a stage"           ga-p1test --no-record pilot-dispatch
+nr_case "before the bead id"                              --no-record ga-p1test
+nr_case "before every positional"                         --no-record ga-p1test /store pilot-dispatch
+nr_case "between store and stage"                         ga-p1test /store --no-record pilot-dispatch
+nr_case "after an empty store (the Pilot can pass one)"   ga-p1test "" --no-record
+# and the shape the Pilot really uses still records nothing under the flag at the end, AND a real run still records with a store of ""
+nr_case "at the end (the Pilot's own shape)"              ga-p1test /store pilot-dispatch --no-record
+newstate; conf treated_pct=100
+run block ga-p1real "" pilot-dispatch
+[ "$RC" = 0 ] && [ "$OUT" = "$TB" ] && [ "$(rows)" = 1 ] && [ "$(jq -r '.store' "$SD/e12-roster.jsonl")" = "" ] && [ "$(jq -r '.stage' "$SD/e12-roster.jsonl")" = pilot-dispatch ] && ok "a real run with an empty store still records one row, the stage in its own slot" || bad "empty-store real run: rc=$RC rows=$(rows) row=$(head -1 "$SD/e12-roster.jsonl" 2>/dev/null)"
+
+# The sibling shapes of the same mistake — a word filed into a roster field it was never meant for. A dash-led word is never a bead, a store
+# or a stage; a 4th positional used to be dropped (assign) or silently became the stage (block). All are refused with exit 2 and NOTHING written.
+refuse_case() { # refuse_case <label> <command> <args…> — fresh state per case, same reason as nr_case
+  local label="$1"; shift
+  newstate; conf treated_pct=100
+  run "$@"
+  if [ "$RC" = 2 ] && [ -z "$OUT" ] && [ ! -e "$SD/e12-roster.jsonl" ] && [ -n "$ERR" ]; then ok "$label: exit 2, nothing printed, no roster, said why"
+  else bad "$label: rc=$RC out='$OUT' err-empty=$([ -z "$ERR" ] && echo yes || echo no) roster=$([ -e "$SD/e12-roster.jsonl" ] && tr '\n' ' ' < "$SD/e12-roster.jsonl" || echo none)"; fi
+}
+refuse_case "assign takes no --no-record (it always writes)"   assign ga-p1test --no-record
+refuse_case "assign: --no-record in the store slot"            assign ga-p1test --no-record pilot-dispatch
+refuse_case "block: an unknown option"                         block ga-p1test /store --frobnicate
+refuse_case "block: a dash-led word where the store goes"      block ga-p1test -x
+refuse_case "block: a 4th positional"                          block ga-p1test /store pilot-dispatch extra
+refuse_case "assign: a 4th positional"                         assign ga-p1test /store pilot-dispatch extra
+# a flag where the BEAD goes: the old code enrolled a bead called "--no-record"
+newstate; conf treated_pct=100
+run block --no-record
+[ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "block --no-record with no bead id: exit 3 (cannot assign an arm to ''), no roster — not a row for a bead named '--no-record'" || bad "block --no-record alone: rc=$RC out='$OUT' roster=$([ -e "$SD/e12-roster.jsonl" ] && tr '\n' ' ' < "$SD/e12-roster.jsonl" || echo none)"
+# the refusal does not depend on the experiment being on: a caller bug is a caller bug
+newstate
+run block ga-p1test --frobnicate; [ "$RC" = 2 ] && [ -z "$OUT" ] && ok "no conf: a malformed call is still refused (exit 2), not answered like 'the experiment is off'" || bad "no conf, malformed call: rc=$RC out='$OUT'"
+
 # unrecorded ⇒ untreated
 if [ "$(id -u)" != 0 ]; then
   newstate; conf treated_pct=50; : > "$SD/e12-roster.jsonl"; chmod 444 "$SD/e12-roster.jsonl"
