@@ -1,4 +1,4 @@
-# Pool Claude account as data (ga-8hcnvb.1)
+# Pool Claude account as data (ga-8hcnvb.1) and its guard (ga-8hcnvb.3)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
 changes Claude account by itself when the one in use hits its limit, and goes back to the account it left once that
@@ -27,10 +27,15 @@ No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens ar
                              (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
+   stamps a heartbeat        <city>/.gc/claude-pool-account.heartbeat — ONLY at the end of a run that logged no ERROR
+                             (a clean run that had nothing to decide counts; a refused Keychain write, a read-back that
+                              does not match or an unpublished decision does not). The guard reads it: see "The guard".
+   stands down               while <city>/.gc/pool-account-degraded exists (written by the guard, never by the daemon)
 
  claude-lowprio.sh  (last hop of providers.claude-headless)
    item exists -> exports CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.gastown/claude-pool-cred and USER, then exec claude
    item missing / security hangs / any doubt -> exports nothing: the session starts on the ambient login
+   kill switch or the degraded marker present -> exports nothing either (log: POOL-ACCT SKIP disabled by ...)
 
  claude (live pool session) re-reads the item every ~30 s  =>  a rewritten item moves it to the other account
 
@@ -51,6 +56,69 @@ Mayor 04/10 (comment on the bead) overrides the original wording: **no utilizati
 the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
 really renewed, its 429 sends the pool to the next account again).
 
+## The guard — divergence alert, per-version test, no key leaks (ga-8hcnvb.3)
+
+`claude-pool-guard.py` (launchd, every 60 s, single instance, its own plist) is what makes the two silent failures of the switch loud.
+It writes **none** of the pool's credentials and corrects nothing; it looks, records, alerts, and — for one case — turns the
+mechanism off.
+
+```
+ claude-pool-guard.py run-once
+   1 DIVERGENCE   the account whose key is in the pool item   vs   the decision file's current + fingerprint
+                  different for 2 min (the daemon writes the item and THEN the file: a shorter disagreement is normal)
+                    -> ONE push, priority 4, forced:  "Pool Claude: conta em uso diverge da regra"
+                       expected: <email> (fp xxxxxxxx)   in use: <email> (fp yyyyyyyy)   — names and 8-hex fingerprints, never a key
+                    -> repeated only every 6 h while nobody fixes it ("Lembrete: ..."); nothing when it is fixed (the episode
+                       closes in the state file and the log says "divergence over")
+                  the in-use account is named from the item's fingerprint: the vault is asked (keys in the memory of a child
+                  process only); if the vault does not answer, from what the guard saw match earlier; if neither, the message says
+                  exactly that ("o cofre não respondeu" / "não é nenhuma das chaves" / "item ausente" / "sem decisão") — no guess
+   2 PER-VERSION  `claude --version` not yet tested (or tested and failed: again after 30 min; or inconclusive: again after 5 min)
+                    -> self-test on a SCRATCH item (never the pool's, never the plain "Claude Code-credentials"): write a fake
+                       credential there, ask `claude auth status --json` with CLAUDE_SECURESTORAGE_CONFIG_DIR pointing at it
+                       (must say loggedIn:true), delete the item, ask again (must say loggedIn:false). Local: no inference, no
+                       network, ~3 s each. A wrong answer is repeated once; two in a row = FAIL.
+                    -> the result per claude version is recorded in the guard's state file and is what `status` shows
+                    -> FAIL: writes <city>/.gc/pool-account-degraded. The daemon stops switching (log: disabled by ...), the wrapper
+                       stops pointing NEW launches at the pool item (they answer normally on the current login). Nothing is deleted,
+                       no running session is touched (it keeps the last account written: a valid login).
+                       ONE push, priority 4, forced: "Pool Claude: troca automática DESLIGADA" (names the claude version and why)
+                    -> PASS after a FAIL: the marker is removed and a quiet notice (priority 2, not forced) says it is back on
+                    -> INCONCLUSIVE (claude hangs, Keychain locked, output that is not JSON): changes nothing; after 30 min of it, one
+                       "Pool Claude: guarda sem enxergar" says the guard cannot verify. It never degrades on "could not tell".
+   3 LIVENESS     no clean daemon run (heartbeat) for 10 min -> one push "Pool Claude: o daemon de troca não está fechando rodadas"
+                  (not while the mechanism is off or degraded; not for a pool that was never activated)
+```
+
+Three answers, never two: every check is yes / no / could not tell, and "could not tell" never acts.
+
+**Query it** (the result for the installed claude, and the history per version):
+
+```bash
+G=/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-pool-guard.py
+python3 $G status          # human
+python3 $G status --json   # installed_claude, installed_result, versions{<ver>: {result, checked_at, detail, attempts}}, degraded, divergence
+python3 $G selftest        # run the per-version test now, whatever was recorded, and act on the result
+```
+
+State: `/Users/athos/shared/data/claude_pool_guard.json` (`versions`, `divergence`, `degraded`, `blind`, `daemon`). Log:
+`<city>/.gc/logs/claude-pool-guard.log`. The test **re-runs by itself** when `claude --version` changes (the next tick, ≤ 60 s).
+
+**The degraded marker** `<city>/.gc/pool-account-degraded` is JSON `{"by": "claude-pool-guard", "claude": "<version>", "since": ..., "reason": ...}`.
+Only the guard writes it and only the guard removes it, and only if `by` says so: a marker someone else put there is left alone (the log
+says so). To turn the mechanism off by hand use `no-pool-account` (below), not this file.
+
+**No key leaks, and the proof.** `claude-pool-leakscan.py` takes the 5 keys (from the vault, or on stdin) and searches for each of them —
+raw, hex, base64 — in process argv and environment (`ps -Eaxww`), in logs, the decision file, the guard's state, error output and sent
+notifications. It reports a finding as channel + location + account (e-mail + fingerprint) + form, never the surrounding text and never the
+key. Its **control** runs first, always: it plants a random fake key on every channel it is about to scan (a file, one straddling a read
+boundary, a process argv, a process environment) and refuses to call anything clean if it cannot see it (exit 3, "blind"). The selftest
+`claude-pool-guard.selftest.sh` (G7) drives a full account switch, a divergence, a degradation and a dozen forced errors under a ps sampler
+(10 Hz), then scans everything and finds zero; it finds a key planted on purpose in each kind of place (the control); and it makes
+a daemon that puts the key in `security`'s argv and a guard that puts it in the push **fail** the same scenario (the mutations).
+Run it against the real thing (keys read from the vault into memory only, nothing printed):
+`claude-pool-leakscan.py --keys-vault --ps --path <city>/.gc/logs --path /Users/athos/shared/data`.
+
 ## Activation — merged is not live
 
 The script path in the plist only exists after the merge. After the gate merges, **someone loads the plist**:
@@ -67,13 +135,27 @@ their ambient login (the variable is fixed at birth); every pool session born af
 Check it is live (not just merged): `launchctl list | grep claude-pool-account` and
 `jq . /Users/athos/shared/data/claude_pool_current_account.json` (current / since / reason / exhausted).
 
+**The guard is a second plist, a second human step, and nothing in this merge loads either.** Load the daemon's first (the guard
+watches that daemon: with no daemon and no item the guard stays silent, by design — a pool that was never activated is not "dead"):
+
+```bash
+cp /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/claude-pool-guard.plist ~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist
+launchctl load ~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist     # first run <= 60 s later: tests the installed claude
+python3 /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-pool-guard.py status
+tail -f /Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-pool-guard.log
+```
+
+Until it is loaded there is no divergence alert, no per-version result and no liveness alert: the daemon works the same, unwatched.
+
 ## Kill switches (no config reload)
 
 | Want | Do |
 |---|---|
 | Stop the daemon acting AND new pool launches pointing at the item | `touch $GC_CITY_PATH/.gc/no-pool-account` (remove the file to resume) |
 | One launch only | `GC_POOL_ACCOUNT=0` in that launch's environment |
-| Remove the mechanism completely | `launchctl unload ~/Library/LaunchAgents/com.gascity.claude-pool-account.plist`, then `security delete-generic-password -a "$USER" -s "Claude Code-credentials-50adeaf1"` — new sessions fall back to the ambient login by themselves |
+| Stop the guard too | the same two (`no-pool-account` / `GC_POOL_ACCOUNT=0`): the guard then does nothing — no test, no alert, no state written |
+| Auto-switch turned OFF by the guard | `<city>/.gc/pool-account-degraded` exists: the daemon stands down and new launches use the ambient login. It lifts itself when the self-test passes again (≤ 30 min, or at once on a new claude version); `claude-pool-guard.py selftest` retests now. Do not delete the file to "fix" it: if the test still fails the guard writes it again |
+| Remove the mechanism completely | `launchctl unload` both `~/Library/LaunchAgents/com.gascity.claude-pool-guard.plist` and `~/Library/LaunchAgents/com.gascity.claude-pool-account.plist`, then `security delete-generic-password -a "$USER" -s "Claude Code-credentials-50adeaf1"` — new sessions fall back to the ambient login by themselves |
 
 Live sessions that already follow the item keep the **last written** account when the daemon stops; that is a valid
 login, not a broken state. What a LIVE session does when its item is deleted underneath it was not measured (a
@@ -88,15 +170,22 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-lowprio.sh` | wrapper: points a pool launch at the item (fail-open) |
 | `packs/town-deltas/assets/claude-pool-account.plist` | launchd job, not loaded by the merge |
 | `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib) |
-| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session |
+| `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session (+ the guard's real-claude self-test and the leakscan control) |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.py` | the guard (`run-once` / `status [--json]` / `selftest`) |
+| `packs/town-deltas/assets/claude-pool-guard.plist` | the guard's launchd job, not loaded by the merge |
+| `packs/town-deltas/assets/scripts/claude-pool-guard.selftest.sh` | hermetic tests of the guard (G1–G8: divergence, per-version test, liveness, scratch item, no-leak proof with control and mutations) |
+| `packs/town-deltas/assets/scripts/claude-pool-leakscan.py` | the key-leak scanner (with its control); also usable by hand |
+| `/Users/athos/shared/data/claude_pool_guard.json` | the guard's state: per-version results, open episodes |
+| `.gc/claude-pool-account.heartbeat`, `.gc/pool-account-degraded` | the daemon's last clean run; the guard's "auto-switch is off" marker |
+| `.gc/logs/claude-pool-guard.log` | guard events (`SELFTEST claude=… result=…`, `DEGRADED`, `divergence seen/over`, `alert sent`) |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
 | `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`) |
 
 ## Known limits
 
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` is an undocumented claude variable: a claude release can rename the item. The
-  live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the per-version
-  self-test and the divergence alert are ga-8hcnvb.3.
+  live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the guard re-checks it by
+  itself on every new claude version ("The guard", item 2) and turns auto-switch off, with an alert, if it fails.
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
 - A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
   unsticking such sessions is ga-8hcnvb.2.
@@ -130,7 +219,7 @@ first, delete last, and only when restarting the pool is acceptable.
   An account whose collection keeps failing is therefore never gone back to (and its entry sits in the registry, one
   log line per run) until the collector reads it again; it is still probed the normal way if a failover reaches it. A
   collector that stopped altogether leaves every expired entry waiting, and nothing here alerts on it: the only trace is
-  that log line (the divergence alert of ga-8hcnvb.3 is about the account in use, not about the collector). The library's `_faixa` ignores the session
+  that log line (the guard's divergence alert is about the account in use, not about the collector). The library's `_faixa` ignores the session
   window's own `resets_at` (that is where a stale "esgotada" comes from); it is not changed here, the daemon just does
   not rely on the order for what the order cannot know.
 - **Nothing leaves the registry in silence.** Every removal of an exhausted entry has a `dropped:` line with the reason
@@ -158,13 +247,33 @@ first, delete last, and only when restarting the pool is acceptable.
 - The failback target's key is read only when a failback is due; if the vault does not return it that run, the
   failback is not done and the account stays registered as exhausted, so a later run that has its key completes it.
 
+- **What the guard's "in use" means.** The account in use is the credential in the pool **item** — what every new pool session and every
+  live one (they re-read it every ~30 s) will use. It is not the account a given running session holds this second, and a session born
+  before the item existed (ambient login) is invisible to it. A divergence is the item against the decision file.
+- **The per-version test approximates the real read.** `claude auth status --json` is the cheapest local way to ask claude "which
+  credential do you read for this CLAUDE_SECURESTORAGE_CONFIG_DIR" (measured: it reads that item and nothing else, no fallback to the
+  ambient login, no inference). A release could in principle keep that command's behaviour and change the interactive path — the guard
+  would pass and the pool break. The live harness (`claude-pool-account.live-accept.sh`, P2a) remains the end-to-end check; the guard is
+  what runs the cheap version, every version, unattended.
+- **Quiet hours.** `notify` holds every push from 22:00 to 07:00 (BRT) and delivers them at 07:00 in one push. The guard counts that as
+  delivered (notify's exit 10) and does not resend. So "alert within 5 minutes" holds outside quiet hours; at night the alert is
+  recorded and reaches the phone at 07:00. An alert that must wake someone at night needs `NOTIFY_NO_QUIET=1` on that call — a
+  decision for Athos, not made here.
+- **Nothing here is live until the plists are loaded** — the daemon's and the guard's (see Activation). A merged guard that is not loaded
+  alerts nobody.
+- **The leak scan proves what it covers.** Argv and environment are sampled (10 Hz in the test; one snapshot by hand), so a process that
+  lives and dies between two samples is not seen; files and logs are scanned in full. A key-shaped string in a process list that is none of
+  the five keys (another service's API key, say) is a NOTE, not a failure; in a file the product wrote it is a finding. The scan covers the
+  channels it names: a leak into a place it was not told about is not found.
+
 ## Exit codes (`launchctl list` → last exit status)
 
 `0` = ran (or was legitimately idle: kill switch on, another run holds the lock, the usage store gave no order of use).
 **Also `0`, and not idle in any good sense:** the accounts library is missing or does not import. That run logs one `WARN`
 (`accounts library not found …` / `failed to import …`) and exits 0 having decided nothing, so `launchctl list` shows the
-same `0` as for a healthy run. Only the log tells them apart; a liveness signal that does not depend on reading it is
-ga-8hcnvb.3.
+same `0` as for a healthy run. The log tells them apart, and so does the heartbeat: that run does not stamp
+`.gc/claude-pool-account.heartbeat` (only a run that reaches its end without an ERROR does), and once the guard is loaded 10 minutes
+without a stamp is a push ("o daemon de troca não está fechando rodadas").
 `1` = **refused or failed**. Two different things share this code, and the log tells them apart:
 
 - *Refused* before the run started any work: no usable `GC_CITY_PATH/.gc` so the single-instance lock cannot be taken,

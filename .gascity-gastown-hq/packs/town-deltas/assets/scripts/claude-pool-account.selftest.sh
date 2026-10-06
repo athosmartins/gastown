@@ -55,7 +55,7 @@ POOL_DIR="$W/home/.gastown/claude-pool-cred"
 POOL_HASH="$(printf '%s' "$POOL_DIR" | shasum -a 256 | cut -c1-8)"
 SVC="Claude Code-credentials-$POOL_HASH"
 
-new_kc() { rm -rf "$W/kc"; mkdir -p "$W/kc/items"; export FAKE_KC="$W/kc"; : > "$W/city/.gc/logs/claude-pool-account.log"; rm -f "$W/city/.gc/no-pool-account"; }
+new_kc() { rm -rf "$W/kc"; mkdir -p "$W/kc/items"; export FAKE_KC="$W/kc"; : > "$W/city/.gc/logs/claude-pool-account.log"; rm -f "$W/city/.gc/no-pool-account" "$W/city/.gc/pool-account-degraded"; }
 run_wrapper() { # run_wrapper [env assignments...] -- args...
   local envs=()
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
@@ -152,6 +152,23 @@ for rc in 44 36; do
     && ok "A11 security exits $rc -> not exported, and the SKIP line says rc=$rc" \
     || bad "A11 security exits $rc: secstore='$(field secstore "$out")' log: $(tail -n 1 "$W/city/.gc/logs/claude-pool-account.log")"
 done
+
+# A12 ga-8hcnvb.3: the degraded marker (written by claude-pool-guard.py when the per-version self-test of claude fails) means "claude
+# no longer reads the pool item": a session pointed at an item claude does not read is 'not logged in', so NO launch is pointed at it
+# while the marker is there - an agent started in that state runs on the ambient login - and the item is untouched.
+new_kc; touch "$FAKE_KC/items/$SVC" "$W/city/.gc/pool-account-degraded"
+out="$(run_wrapper USER=athos -- --model haiku)"
+[ "$(field secstore "$out")" = "<unset>" ] && [ "$(field argc "$out")" = "2" ] && [ "$(field arg1 "$out")" = "[--model]" ] \
+  && ok "A12 degraded marker + item present -> variable NOT exported, claude still launches with its argv" \
+  || bad "A12 degraded marker ignored or launch broken: $(printf '%s' "$out" | tr '\n' ' ')"
+grep -q "POOL-ACCT SKIP disabled by .*pool-account-degraded" "$W/city/.gc/logs/claude-pool-account.log" \
+  && ok "A12b ...and the SKIP line names the marker (so 'why is this session on the ambient login' has an answer)" \
+  || bad "A12b SKIP line does not name the marker: $(tail -n 1 "$W/city/.gc/logs/claude-pool-account.log")"
+[ -e "$FAKE_KC/items/$SVC" ] && ok "A12c ...and the wrapper never touches the item (a LIVE session may be following it)" || bad "A12c the item is gone"
+rm -f "$W/city/.gc/pool-account-degraded"
+out="$(run_wrapper USER=athos -- x)"
+[ "$(field secstore "$out")" = "$POOL_DIR" ] && ok "A12d marker removed -> the next launch is pointed at the pool item again (no other state to clear)" \
+  || bad "A12d marker removed but secstore='$(field secstore "$out")'"
 
 # ── B. daemon ──────────────────────────────────────────────────────────────────────────────────────
 echo
@@ -416,6 +433,30 @@ EOF
   [ ! -e "$D/kc/items/$SVC" ] && [ ! -s "$D/probes.log" ] && ok "B12 .gc/no-pool-account -> the run does nothing" || bad "B12 kill switch ignored"
   new_d; run_d GC_POOL_ACCOUNT=0 -- run-once
   [ ! -e "$D/kc/items/$SVC" ] && [ ! -s "$D/probes.log" ] && ok "B12b GC_POOL_ACCOUNT=0 -> the run does nothing" || bad "B12b env kill switch ignored"
+
+  # B12c..g ga-8hcnvb.3: the guard's degraded marker stops the daemon like the operator's kill switch, and says so by name
+  HB="$D/city/.gc/claude-pool-account.heartbeat"
+  new_d; run_d -- run-once; cp "$STATE" "$D/state.before"; w0="$(writes)"
+  touch "$D/city/.gc/pool-account-degraded"; restamp_store "$NOW_BASE"
+  run_d CLAUDE_POOL_NOW=$((NOW_BASE + 3600)) -- run-once
+  [ "$(writes)" = "$w0" ] && cmp -s "$STATE" "$D/state.before" && ok "B12c degraded marker present -> no item write, decision file untouched" || bad "B12c the daemon acted under the marker (writes $w0 -> $(writes))"
+  grep -q "disabled by .*pool-account-degraded" "$D/city/.gc/logs/claude-pool-account.log" && ok "B12d ...and the log names the marker as the reason" || bad "B12d log: $(tail -2 "$D/city/.gc/logs/claude-pool-account.log")"
+  new_d; touch "$D/city/.gc/pool-account-degraded"; run_d -- run-once
+  [ ! -e "$D/kc/items/$SVC" ] && [ ! -e "$STATE" ] && [ ! -s "$D/probes.log" ] && ok "B12e marker on a world with no item and no decision -> nothing created, nothing probed" || bad "B12e the daemon created or probed something under the marker"
+  new_d; run_d -- run-once; [ -s "$HB" ] && "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["epoch"]==float(sys.argv[2]) and d["pid"]>0' "$HB" "$NOW_BASE" 2>/dev/null \
+    && ok "B12f a clean run stamps the heartbeat with the run's clock" || bad "B12f heartbeat: $(cat "$HB" 2>/dev/null)"
+  # a run that did NOT finish its job must not look alive: lib missing / operator off / marker / a Keychain write that is refused
+  hb_none() { [ ! -e "$HB" ] && ! ls "$D/city/.gc"/claude-pool-account.heartbeat.tmp.* >/dev/null 2>&1; }
+  new_d; run_d CLAUDE_POOL_ACCOUNTS_LIB="$D/no-such-lib.py" -- run-once;       hb_none && h1=ok || h1=BAD
+  new_d; run_d GC_POOL_ACCOUNT=0 -- run-once;                                   hb_none && h2=ok || h2=BAD
+  new_d; touch "$D/city/.gc/pool-account-degraded"; run_d -- run-once;          hb_none && h3=ok || h3=BAD
+  new_d; touch "$D/kc/refuse-writes"; run_d -- run-once;                        hb_none && h4=ok || h4=BAD
+  new_d; touch "$D/kc/write-lands-other"; run_d -- run-once;                    hb_none && h5=ok || h5=BAD
+  [ "$h1$h2$h3$h4$h5" = "okokokokok" ] && ok "B12g no heartbeat from a run that did not do its job (lib missing, operator off, marker, Keychain write refused, write that landed another credential)" || bad "B12g heartbeat written anyway: lib=$h1 off=$h2 marker=$h3 refused=$h4 other=$h5"
+  grep -q "ERROR" "$D/city/.gc/logs/claude-pool-account.log" && ok "B12h ...the refused-write run says why in its log (the reason a heartbeat is missing is findable)" || bad "B12h no ERROR line in the log of the run that wrote no heartbeat"
+  # nothing to decide is not a fault: a run over an EMPTY vault finishes clean, so the guard does not call the daemon dead for it
+  new_d; rm -f "$D/vault"/*; run_d -- run-once
+  [ -s "$HB" ] && [ ! -e "$D/kc/items/$SVC" ] && ok "B12i empty vault -> nothing created, and the run still stamps the heartbeat (alive, nothing to decide)" || bad "B12i empty vault: heartbeat=$([ -s "$HB" ] && echo yes || echo no) item=$([ -e "$D/kc/items/$SVC" ] && echo yes || echo no)"
 
   # B13 single instance
   # The holder signals AFTER it owns the lock and keeps it until killed: a fixed sleep(8)+sleep(1) made B13 depend on
@@ -1083,6 +1124,22 @@ else
   [ -n "$dhash" ] && [ -n "$dpath" ] && [ "$(printf '%s' "$dpath" | shasum -a 256 | cut -c1-8)" = "$dhash" ] \
     && ok "C9 the doc's item name ($dhash) is the hash of the absolute path it names" \
     || bad "C9 the doc's item name '$dhash' is not sha256 of the path it names ('$dpath')"
+fi
+
+# C10-C17 the guard's plist (ga-8hcnvb.3): same rules, its own job
+GPLIST="${CLAUDE_POOL_GUARD_PLIST:-$SELF_DIR/../claude-pool-guard.plist}"
+if [ ! -f "$GPLIST" ]; then bad "C10 guard plist not found at $GPLIST"
+else
+  plutil -lint "$GPLIST" >/dev/null 2>&1 && ok "C10 guard plist is valid" || bad "C10 plutil -lint failed on the guard plist"
+  gpl() { /usr/libexec/PlistBuddy -c "Print :$1" "$GPLIST" 2>/dev/null; }
+  [ "$(gpl Label)" = "com.gascity.claude-pool-guard" ] && [ "$(gpl Label)" != "$(pl Label)" ] && ok "C11 the guard's label is its own (it cannot replace the daemon's job)" || bad "C11 guard label '$(gpl Label)'"
+  [ "$(gpl ProgramArguments:0)" = "/usr/bin/python3" ] && [ "$(gpl ProgramArguments:2)" = "run-once" ] && ok "C12 guard runs /usr/bin/python3 ... run-once" || bad "C12 guard args '$(gpl ProgramArguments:0) $(gpl ProgramArguments:2)'"
+  gscript="$(gpl ProgramArguments:1)"
+  case "$gscript" in */packs/town-deltas/assets/scripts/claude-pool-guard.py) [ -f "$SELF_DIR/claude-pool-guard.py" ] && ok "C13 guard plist points at the guard's repo path (and the script is in this tree)" || bad "C13 the guard script is not next to this selftest" ;; *) bad "C13 guard script path '$gscript'" ;; esac
+  giv="$(gpl StartInterval)"; [ -n "$giv" ] && [ "$giv" -ge 30 ] && [ "$giv" -le 120 ] && ok "C14 guard StartInterval=${giv}s (a 2-min debounce + this tick is inside the 5-min alert budget)" || bad "C14 guard StartInterval='$giv'"
+  [ "$(gpl RunAtLoad)" = "false" ] && ok "C15 guard RunAtLoad=false (loading it is the human step)" || bad "C15 guard RunAtLoad '$(gpl RunAtLoad)'"
+  { [ -n "$(gpl EnvironmentVariables:USER)" ] && [ -n "$(gpl EnvironmentVariables:GC_CITY_PATH)" ]; } && ok "C16 guard has USER and GC_CITY_PATH for launchd" || bad "C16 guard launchd env incomplete"
+  case "$(gpl EnvironmentVariables:PATH)" in */.local/bin*) ok "C17 guard PATH reaches ~/.local/bin (secret, notify, claude live there)" ;; *) bad "C17 guard PATH lacks ~/.local/bin: '$(gpl EnvironmentVariables:PATH)'" ;; esac
 fi
 
 echo

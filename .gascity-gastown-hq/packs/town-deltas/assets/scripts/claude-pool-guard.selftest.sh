@@ -1,0 +1,573 @@
+#!/usr/bin/env bash
+# claude-pool-guard.selftest.sh — ga-8hcnvb.3: the safety net under the pool's account switch.
+#
+#   G1-G4  DIVERGENCE: the account the pool really uses vs the account the rule dictates -> one phone alert in < 5 min naming both by
+#          e-mail + 8-hex fingerprint, never the key; it stops repeating when fixed; 'could not tell' never alerts as a divergence.
+#   G5     PER-VERSION TEST: claude is asked (on a scratch item) whether it still reads the credential the pool writes. Pass/fail is
+#          recorded per claude version, queryable, and redone when the version changes. A fail -> alert 'auto-switch OFF', the daemon and
+#          the wrapper stand down, an agent started in that state answers on the current login, nothing is deleted or interrupted.
+#   G6     the daemon's heartbeat (a daemon that stopped completing runs).
+#   G7     NO KEY LEAKS (AC4): a full account switch, a degradation and a set of forced errors run under a background process sampler;
+#          then claude-pool-leakscan.py searches argv, env, logs, the decision file, error output and sent notifications for the 5
+#          keys (zero findings), finds a key planted on purpose (the control), and FAILS on a deliberately leaky daemon and a leaky guard.
+#
+# HERMETIC: fake `security` (items in a temp dir), fake `claude` (several behaviours), fake `secret` vault, fake `notify`, a mock probe
+# API, and a clock the test moves (CLAUDE_POOL_NOW). Nothing here touches the real Keychain, vault, network or phone.
+# The product under test can be swapped for an older copy: CLAUDE_POOL_GUARD / _DAEMON / _WRAPPER / _LEAKSCAN (see 'previous HEAD' in the doc).
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUARD="${CLAUDE_POOL_GUARD:-$SELF_DIR/claude-pool-guard.py}"
+DAEMON="${CLAUDE_POOL_DAEMON:-$SELF_DIR/claude-pool-account.py}"
+WRAPPER="${CLAUDE_POOL_WRAPPER:-$SELF_DIR/claude-lowprio.sh}"
+LEAKSCAN="${CLAUDE_POOL_LEAKSCAN:-$SELF_DIR/claude-pool-leakscan.py}"
+ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"
+PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9)
+ONLY="${GUARD_SELFTEST_ONLY:-}"   # e.g. G1 or G5,G7: run only these groups
+
+PASS=0
+FAIL=0
+ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
+bad() {
+  echo "  ✗ $*"; FAIL=$((FAIL+1))
+  if [ -n "${GUARD_SELFTEST_VERBOSE:-}" ]; then   # what the product said, for whoever is looking at the failure
+    echo "    --- guard log:"; tail -n 12 "$CITY/.gc/logs/claude-pool-guard.log" 2>/dev/null | sed 's/^/    | /'
+    echo "    --- last output ($LAST):"; tail -n 8 "${LAST:-/dev/null}" 2>/dev/null | sed 's/^/    | /'
+  fi
+}
+want() { [ -z "$ONLY" ] || case ",$ONLY," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+for f in "$GUARD" "$DAEMON" "$WRAPPER" "$LEAKSCAN" "$ACCT_LIB"; do [ -f "$f" ] || { echo "FATAL: not found: $f"; exit 1; }; done
+
+_t="${TMPDIR:-/tmp}"; W="$(mktemp -d "${_t%/}/claude-pool-guard-selftest.XXXXXX")"   # no "//" in it: the product hashes paths it normalised, the fakes hash the string they were given
+cleanup() { [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; for p in ${BG_PIDS:-}; do kill "$p" 2>/dev/null; done; chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }
+trap cleanup EXIT
+BG_PIDS=""
+
+# ── the world ──────────────────────────────────────────────────────────────────────────────────────
+WW="$W/w"; PROD="$WW/product"; CITY="$PROD/city"; DATA="$PROD/data"; STATE="$DATA/current.json"; GSTATE="$DATA/guard.json"
+INFRA="$WW/infra"; SINKS="$WW/sinks"; CAP="$SINKS/cap"; FAKEBIN="$W/fakebin"; BB="$W/bb"
+POOL_DIR="$W/pool-cred"
+SCR="$INFRA/claude-pool-guard-scratch"     # the guard's scratch directory (CLAUDE_POOL_GUARD_SCRATCH)
+SVC="Claude Code-credentials-$(printf '%s' "$POOL_DIR" | shasum -a 256 | cut -c1-8)"
+PLAIN="Claude Code-credentials"
+NOW_BASE=1999000000
+EMAILS=(a@t.test b@t.test c@t.test d@t.test e@t.test)
+mkdir -p "$BB" "$FAKEBIN"
+
+rnd() { "$PY3" -c 'import secrets; print("sk-ant-oat01-TEST" + secrets.token_hex(20))'; }
+KEY_a="$(rnd)"; KEY_b="$(rnd)"; KEY_c="$(rnd)"; KEY_d="$(rnd)"; KEY_e="$(rnd)"; KEY_x="$(rnd)"     # shell variables only: never exported, never in argv
+key_of() { case "$1" in a@t.test) printf '%s' "$KEY_a" ;; b@t.test) printf '%s' "$KEY_b" ;; c@t.test) printf '%s' "$KEY_c" ;; d@t.test) printf '%s' "$KEY_d" ;; e@t.test) printf '%s' "$KEY_e" ;; esac; }
+fp_of() { printf '%s' "$1" | shasum -a 256 | cut -c1-8; }
+FP_a="$(fp_of "$KEY_a")"; FP_b="$(fp_of "$KEY_b")"; FP_c="$(fp_of "$KEY_c")"; FP_x="$(fp_of "$KEY_x")"
+keys_json() { printf '{"a@t.test":"%s","b@t.test":"%s","c@t.test":"%s","d@t.test":"%s","e@t.test":"%s"}' "$KEY_a" "$KEY_b" "$KEY_c" "$KEY_d" "$KEY_e"; }
+# bash-only 'does this file contain that secret': the secret never goes through an argv
+contains() { local f="$1" n="$2" t; t="$(<"$f")" 2>/dev/null || return 1; [[ "$t" == *"${!n}"* ]]; }
+
+# fake security: the subset the daemon, the guard and the wrapper use. `-i` reads commands from stdin (so no credential is in argv).
+cat > "$BB/security" <<'EOF'
+#!/bin/bash
+KC="$FAKE_KC"; SK="$FAKE_SINKS"; echo "ARGV: $*" >> "$SK/kc-argv.log"
+run_cmd() {
+  local sub="$1" svc="" hex="" w=0; shift
+  while [ $# -gt 0 ]; do case "$1" in -s) svc="$2"; shift ;; -X) hex="$2"; shift ;; -w) w=1 ;; esac; shift; done
+  echo "OP $sub $svc" >> "$SK/kc-ops.log"
+  case "$sub" in
+    add-generic-password) [ -e "$KC/refuse-writes" ] && { echo "security: write refused (selftest)" >&2; return 1; }
+                          [ -n "$svc" ] && [ -n "$hex" ] || return 1
+                          [ -e "$KC/write-lands-other" ] && hex="$(printf '%s' '{"claudeAiOauth":{"accessToken":"selftest-some-other-credential"}}' | xxd -p | tr -d '\n')"
+                          printf '%s' "$hex" > "$KC/items/$svc" ;;
+    find-generic-password) [ -e "$KC/locked" ] && { echo "security: User interaction is not allowed." >&2; return 36; }
+                           [ -e "$KC/items/$svc" ] || { echo "security: The specified item could not be found in the keychain." >&2; return 44; }
+                           if [ "$w" = 1 ]; then xxd -r -p "$KC/items/$svc"; echo; fi ;;
+    delete-generic-password) [ -e "$KC/locked" ] && return 36
+                             [ -e "$KC/items/$svc" ] || return 44
+                             rm -f "$KC/items/$svc" ;;
+    *) return 1 ;;
+  esac
+}
+if [ "${1:-}" = "-i" ]; then
+  while IFS= read -r line; do eval "set -- $line"; run_cmd "$@"; rc=$?; [ $rc -eq 0 ] || exit $rc; done
+else run_cmd "$@"; fi
+EOF
+cat > "$BB/secret" <<'EOF'
+#!/bin/bash
+e="${1#claude-oauth-token-}"
+echo "$e" >> "$VAULT/.calls"
+if [ -e "$VAULT/.broken" ]; then echo "secret: bw serve unreachable (selftest)" >&2; exit 1; fi
+if [ -s "$VAULT/$e" ]; then cat "$VAULT/$e"; exit 0; fi
+echo "secret: Not found." >&2; exit 4
+EOF
+# fake notify: records the call as the guard makes it (title, priority, message, and the two environment switches that route it)
+cat > "$BB/notify" <<'EOF'
+#!/bin/bash
+{ printf 'CALL force=%s strict=%s argv:' "${NOTIFY_FORCE_PUSH:-}" "${NOTIFY_STRICT_EXIT:-}"; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$FAKE_SINKS/notify.log"
+[ -f "$FAKE_SINKS/notify.rc" ] && exit "$(cat "$FAKE_SINKS/notify.rc")"
+exit 0
+EOF
+# fake claude (the binary baked with the world's paths: the guard hands claude a clean environment, so the mode lives in files)
+cat > "$W/claude.tmpl" <<'EOF'
+#!/bin/bash
+IN="@INFRA@"; SK="@SINKS@"
+MODE="$(cat "$IN/claude.mode" 2>/dev/null || echo ok)"; VER="$(cat "$IN/claude.version" 2>/dev/null || echo 1.0.0)"
+echo "$*" >> "$SK/claude-calls.log"
+case "${1:-}" in
+  --version) echo "$VER (Claude Code)"; exit 0 ;;
+  auth)
+    [ "${2:-}" = "status" ] || exit 2
+    case "$MODE" in
+      hang) exec sleep 60 ;;
+      garbage) echo "something that is not json"; exit 0 ;;
+    esac
+    dir="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}"
+    if [ -z "$dir" ]; then svc="Claude Code-credentials"
+    elif [ "$MODE" = renamed ]; then svc="Claude Code-credentials-$(printf '%s' "$dir/v2" | shasum -a 256 | cut -c1-8)"   # a release that derives the name differently
+    else svc="Claude Code-credentials-$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)"; fi
+    present=0; [ -e "$IN/kc/items/$svc" ] && present=1
+    [ "$MODE" = ignores ] && present=1                                                                                    # a release that stopped looking at the item
+    if [ -e "$IN/flaky.once" ] && [ "$present" = 1 ]; then rm -f "$IN/flaky.once"; present=0; fi
+    if [ "$present" = 1 ]; then echo '{"loggedIn":true,"authMethod":"claude.ai"}'; exit 0; fi
+    echo '{"loggedIn":false,"authMethod":"none"}'; exit 1 ;;
+  *)
+    { echo "ARGV: $*"; echo "SECDIR=${CLAUDE_SECURESTORAGE_CONFIG_DIR:-<unset>}"; echo "USER=${USER:-<unset>}"; } >> "$SK/claude-launch.log"
+    env | sort >> "$SK/claude-env.log"
+    if [ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" ]; then echo "answer: ok (pool item)"; else echo "answer: ok (ambient login)"; fi
+    exit 0 ;;
+esac
+EOF
+chmod +x "$BB/security" "$BB/secret" "$BB/notify"
+cat > "$W/mock_api.py" <<'EOF'
+import http.server, json, sys
+STATE, LOG, PORTF = sys.argv[1:4]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.do_POST()
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
+        beh = json.load(open(STATE)).get(tok) or {"status": 401, "h": {}}
+        with open(LOG, "a") as f: f.write("probe\n")      # the token is NOT logged here: the mock is not a channel under test
+        self.send_response(beh["status"])
+        for k, v in beh.get("h", {}).items(): self.send_header(k, v)
+        body = b"{}"; self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(PORTF, "w").write(str(srv.server_address[1])); srv.serve_forever()
+EOF
+
+HDR_OK='{"anthropic-ratelimit-unified-status":"allowed","anthropic-ratelimit-unified-5h-status":"allowed","anthropic-ratelimit-unified-7d-status":"allowed","anthropic-ratelimit-unified-5h-reset":"1900000000","anthropic-ratelimit-unified-7d-reset":"1900500000"}'
+HDR_REJ='{"anthropic-ratelimit-unified-status":"rejected","anthropic-ratelimit-unified-5h-status":"rejected","anthropic-ratelimit-unified-5h-reset":"1999003600","anthropic-ratelimit-unified-representative-claim":"five_hour","retry-after":"600"}'
+
+NOW=$NOW_BASE; HB_AUTO=1; GRC=0; N_RUN=0; SRV_PID=""
+blob_of() { printf '{"claudeAiOauth":{"accessToken":"%s","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":null}}' "$1"; }
+put_item() { blob_of "$1" | xxd -p | tr -d '\n' > "$INFRA/kc/items/$SVC"; }            # builtin printf: the key is never in an argv
+put_decision() { printf '{"current":"%s","fingerprint":"%s","since":"2033-05-18T03:00:00Z","reason":"selftest","previous":null,"exhausted":{},"schema":1,"updated":"2033-05-18T03:00:00Z"}\n' "$1" "$2" > "$STATE"; }
+hb_touch() { printf '{"epoch": %s, "updated": "selftest", "pid": 1}\n' "$NOW" > "$CITY/.gc/claude-pool-account.heartbeat"; }
+set_mode() { printf '%s' "$1" > "$INFRA/claude.mode"; }
+set_ver() { printf '%s' "$1" > "$INFRA/claude.version"; }
+ncalls() { [ -f "$SINKS/notify.log" ] && wc -l < "$SINKS/notify.log" | tr -d ' ' || echo 0; }
+call_n() { sed -n "${1}p" "$SINKS/notify.log"; }
+claude_auth_calls() { [ -f "$SINKS/claude-calls.log" ] && grep -c '^auth status' "$SINKS/claude-calls.log" || echo 0; }
+gv() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("versions",{}).get(sys.argv[2],{}).get(sys.argv[3],""))' "$GSTATE" "$1" "$2" 2>/dev/null; }
+gj() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("/"): d=d.get(k) if isinstance(d,dict) else None
+print("<none>" if d is None else d)' "$1" "$2" 2>/dev/null; }
+
+stamp_usage() { # the usage store the daemon orders accounts by: readings one second before the clock, 5 accounts a..e in order
+  "$PY3" - "$INFRA/usage.json" "${1:-$NOW}" <<'EOF'
+import json, sys
+from datetime import datetime, timezone
+iso = datetime.fromtimestamp(float(sys.argv[2]) - 1, timezone.utc).isoformat()
+accts = [{"email": e, "ok": True, "stale": False, "collected_at": iso, "last_ok_at": iso,
+          "weekly_all": {"percent": 10, "resets_at": "203%d-01-01T00:00:00+00:00" % i}, "session": {"percent": 5}}
+         for i, e in enumerate(["a@t.test", "b@t.test", "c@t.test", "d@t.test", "e@t.test"])]
+json.dump({"_selftest_fresh": True, "updated_at": iso, "accounts": accts}, open(sys.argv[1], "w"))
+EOF
+}
+
+new_w() {
+  [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null; SRV_PID=""; }
+  chmod -R u+w "$WW" 2>/dev/null; rm -rf "$WW"
+  mkdir -p "$CITY/.gc/logs" "$DATA" "$INFRA/kc/items" "$INFRA/vault" "$INFRA/home" "$SINKS" "$CAP" "$INFRA/home/.gastown"
+  : > "$SINKS/kc-argv.log"; : > "$SINKS/kc-ops.log"
+  sed "s|@INFRA@|$INFRA|g; s|@SINKS@|$SINKS|g" "$W/claude.tmpl" > "$FAKEBIN/claude"; chmod +x "$FAKEBIN/claude"
+  set_mode ok; set_ver 1.0.0
+  local e; for e in "${EMAILS[@]}"; do key_of "$e" > "$INFRA/vault/$e"; done
+  NOW=$NOW_BASE; HB_AUTO=1; N_RUN=0
+  stamp_usage
+}
+BASE_ENV() {
+  printf '%s\n' "HOME=$INFRA/home" "USER=athos" "PATH=$BB:$FAKEBIN:/usr/bin:/bin" "GC_CITY_PATH=$CITY" "FAKE_KC=$INFRA/kc" "FAKE_SINKS=$SINKS" "VAULT=$INFRA/vault" \
+    "CLAUDE_USAGE_STORE=$INFRA/usage.json" "CLAUDE_POOL_STATE=$STATE" "CLAUDE_POOL_CRED_DIR=$POOL_DIR" "GC_POOL_CRED_DIR=$POOL_DIR" "CLAUDE_POOL_ACCOUNTS_LIB=$ACCT_LIB" \
+    "CLAUDE_POOL_NOW=$NOW" "CLAUDE_POOL_DAEMON=$DAEMON" "CLAUDE_POOL_GUARD_STATE=$GSTATE" "CLAUDE_POOL_NOTIFY_CMD=$BB/notify" \
+    "CLAUDE_POOL_GUARD_SCRATCH=$INFRA/claude-pool-guard-scratch" "CLAUDE_POOL_GUARD_RETRY_WAIT_S=0" "CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=20" \
+    "GC_LOWPRIO_CLAUDE_BIN=$FAKEBIN/claude" "CLAUDE_POOL_PROBE_URL=http://127.0.0.1:$(cat "$INFRA/port" 2>/dev/null || echo 9)/v1/messages"
+}
+run_guard() { # run_guard [VAR=val ...] -- <guard args>; output in $LAST, status in $GRC
+  local envs=() base=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+  N_RUN=$((N_RUN+1)); LAST="$CAP/guard-$N_RUN.txt"
+  env -i "${base[@]}" "${envs[@]}" "$PY3" "$GUARD" "$@" > "$LAST" 2>&1; GRC=$?
+}
+run_d() { # run_d [VAR=val ...] -- <daemon args>
+  local envs=() base=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+  N_RUN=$((N_RUN+1)); LAST="$CAP/daemon-$N_RUN.txt"
+  stamp_usage "$NOW"
+  env -i "${base[@]}" "${envs[@]}" "$PY3" "$DAEMON" "$@" > "$LAST" 2>&1; GRC=$?
+}
+run_wrapper() { # run_wrapper [VAR=val ...] -- <claude args>
+  local envs=() base=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  [ "${1:-}" = "--" ] && shift
+  while IFS= read -r l; do base+=("$l"); done < <(BASE_ENV)
+  N_RUN=$((N_RUN+1)); LAST="$CAP/wrapper-$N_RUN.txt"
+  env -i "${base[@]}" GC_LOWPRIO=0 "${envs[@]}" "$WRAPPER" "$@" > "$LAST" 2>&1; GRC=$?
+}
+gtick() { # gtick <advance-seconds> [VAR=val ...]: move the clock, stamp the daemon's heartbeat (unless HB_AUTO=0), run one guard pass
+  NOW=$((NOW + $1)); shift
+  [ "$HB_AUTO" = 1 ] && hb_touch
+  run_guard "$@" -- run-once
+}
+gl() { cat "$CITY/.gc/logs/claude-pool-guard.log" 2>/dev/null; }
+active_world() { # item = a's key, decision = a, a clean heartbeat: the pool as the daemon leaves it
+  put_item "$KEY_a"; put_decision a@t.test "$FP_a"; hb_touch
+}
+marker="$CITY/.gc/pool-account-degraded"
+
+# ═══ G1. AC1: a divergence is alerted within 5 min, then stops ═════════════════════════════════════
+if want G1; then
+echo "G1. divergence: alert in < 5 min naming expected and in-use account, never the key; stops when fixed"
+new_w; active_world
+gtick 0; gtick 60
+[ "$(ncalls)" = 0 ] && [ "$(gj "$GSTATE" divergence)" = "<none>" ] && ok "G1 item matches the decision -> no alert, no episode" || bad "G1 alert/episode with a matching item (calls=$(ncalls))"
+T0=$NOW; put_item "$KEY_b"                                  # provoke: the pool item now holds b while the rule says a
+gtick 60; n1=$(ncalls)
+gtick 60; n2=$(ncalls)
+[ "$n1" = 0 ] && [ "$n2" = 0 ] && ok "G1a the divergence is NOT alerted at once (the daemon writes the item and then the file: 2 min of persistence first)" || bad "G1a alerted too soon (calls $n1,$n2)"
+[ "$(gj "$GSTATE" divergence/exp_fp)" = "$FP_a" ] && ok "G1b ...but the episode is open and remembers what it expected" || bad "G1b episode: $(gj "$GSTATE" divergence/exp_fp)"
+gtick 60; T_ALERT=$NOW
+[ "$(ncalls)" = 1 ] && [ $((T_ALERT - T0)) -le 300 ] && ok "G1c ONE alert, $((T_ALERT - T0)) s after the divergence began (budget 300 s)" || bad "G1c calls=$(ncalls) after $((T_ALERT - T0)) s"
+c="$(call_n 1)"
+{ [[ "$c" == *"a@t.test"* ]] && [[ "$c" == *"$FP_a"* ]] && [[ "$c" == *"b@t.test"* ]] && [[ "$c" == *"$FP_b"* ]]; } && ok "G1d the alert names the expected AND the in-use account by e-mail + 8-hex fingerprint" || bad "G1d alert text: $c"
+{ ! contains "$SINKS/notify.log" KEY_a && ! contains "$SINKS/notify.log" KEY_b && [[ "$c" != *"sk-ant"* ]]; } && ok "G1e ...and contains no key (not in any form the pool knows)" || bad "G1e a key reached the notification"
+{ [[ "$c" == *"[-p] [4]"* ]] && [[ "$c" == "CALL force=1 "* ]]; } && ok "G1f priority 4 and NOTIFY_FORCE_PUSH=1 (an unlisted source would otherwise go to the muted digest topic)" || bad "G1f routing: ${c:0:60}"
+gtick 60; gtick 60; gtick 60
+[ "$(ncalls)" = 1 ] && ok "G1g still diverged for 3 more minutes -> no second alert (once per episode)" || bad "G1g repeated alert (calls=$(ncalls))"
+put_item "$KEY_a"                                            # fix the account
+gtick 60
+[ "$(gj "$GSTATE" divergence)" = "<none>" ] && [ "$(ncalls)" = 1 ] && ok "G1h fixed -> the episode closes and nothing is sent about it" || bad "G1h after the fix: episode=$(gj "$GSTATE" divergence) calls=$(ncalls)"
+for _i in 1 2 3 4 5 6 7 8 9 10; do gtick 60; done
+[ "$(ncalls)" = 1 ] && ok "G1i ...and 10 minutes later the alert has still not come back (stops repeating)" || bad "G1i alerts after the fix (calls=$(ncalls))"
+# reminder: a divergence nobody fixes is repeated every 6 h, not every tick
+put_item "$KEY_b"; gtick 60; gtick 130; gtick 130; n=$(ncalls)
+gtick 21000; n_a=$(ncalls); gtick 700; n_b=$(ncalls)
+{ [ "$n" = 2 ] && [ "$n_a" = 2 ] && [ "$n_b" = 3 ]; } && ok "G1j a NEW episode alerts again; unfixed, it is repeated after 6 h (not before)" || bad "G1j calls after new episode/5h50/6h01: $n/$n_a/$n_b"
+[[ "$(call_n 3)" == *"Lembrete"* ]] && ok "G1k ...and the repeat says it is a reminder" || bad "G1k: $(call_n 3)"
+fi
+
+# ═══ G2. who is the in-use account? ════════════════════════════════════════════════════════════════
+if want G2; then
+echo "G2. naming the in-use account (and saying so when it cannot be named)"
+div3() { gtick 60; gtick 130; gtick 130; }
+new_w; active_world; gtick 0; put_item "$KEY_x"; div3
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"$FP_x"* ]] && [[ "$c" == *"não é nenhuma das chaves"* ]]; } && ok "G2a the item holds a key that is none of the accounts' -> says exactly that, with the fingerprint" || bad "G2a: $c"
+contains "$SINKS/notify.log" KEY_x && bad "G2a2 the stranger's key reached the notification" || ok "G2a2 ...without the stranger's key"
+new_w; active_world; gtick 0; put_item "$KEY_b"; : > "$INFRA/vault/.broken"; div3
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"$FP_b"* ]] && [[ "$c" == *"o cofre não respondeu"* ]]; } && ok "G2b vault unreadable -> 'the vault did not answer', not a guess and not 'none of the 5'" || bad "G2b: $c"
+new_w; active_world; gtick 0; rm -f "$INFRA/kc/items/$SVC"; div3
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"a@t.test"* ]] && [[ "$c" == *"item ausente"* ]]; } && ok "G2c the pool item is gone -> alert: expected a, in use: none" || bad "G2c: $c"
+new_w; active_world; gtick 0; gtick 60; put_decision b@t.test "$FP_b"; : > "$INFRA/vault/.broken"; div3     # a was seen to match: the guard learned whose key a is
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"a@t.test (fp $FP_a)"* ]] && [[ "$c" == *"b@t.test"* ]]; } && ok "G2d the in-use account is named from what the guard saw match earlier (no vault needed)" || bad "G2d: $c"
+new_w; rm -f "$STATE"; put_item "$KEY_a"; hb_touch; gtick 0; div3
+c="$(call_n 1)"
+{ [ "$(ncalls)" = 1 ] && [[ "$c" == *"sem decisão"* ]] && [[ "$c" == *"a@t.test"* ]]; } && ok "G2e item present, no decision published -> alerted as a divergence" || bad "G2e: $c"
+fi
+
+# ═══ G3. transient divergences, and an alert that did not go out ══════════════════════════════════
+if want G3; then
+echo "G3. a window shorter than the debounce is not an alert; a failed push is retried; a held push is not repeated"
+new_w; active_world; gtick 0
+put_item "$KEY_b"; gtick 60; put_item "$KEY_a"; gtick 60; for _i in 1 2 3 4; do gtick 60; done
+[ "$(ncalls)" = 0 ] && ok "G3 one tick of disagreement (the daemon's write window) -> no alert" || bad "G3 alerted on a transient (calls=$(ncalls))"
+new_w; active_world; gtick 0; put_item "$KEY_b"; printf 1 > "$SINKS/notify.rc"
+gtick 60; gtick 60; gtick 60; gtick 60; n_fail=$(ncalls)
+printf 0 > "$SINKS/notify.rc"; gtick 60; n_ok=$(ncalls); gtick 60; gtick 60; n_end=$(ncalls)
+{ [ "$n_fail" = 2 ] && [ "$n_ok" = 3 ] && [ "$n_end" = 3 ]; } && ok "G3a notify fails -> the alert is retried every tick until it is accepted, then never again" || bad "G3a calls: failing=$n_fail accepted=$n_ok later=$n_end"
+new_w; active_world; gtick 0; put_item "$KEY_b"; printf 10 > "$SINKS/notify.rc"; gtick 60; gtick 60; gtick 60; gtick 60; gtick 60
+[ "$(ncalls)" = 1 ] && ok "G3b notify says 'held until 07:00' (rc 10) -> counted as sent, not hammered every minute" || bad "G3b calls=$(ncalls)"
+new_w; active_world; gtick 0; put_item "$KEY_b"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; gtick 60 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"
+{ [ "$GRC" = 0 ] && [ "$(gj "$GSTATE" divergence/alerted_at)" = "<none>" ]; } && ok "G3c no notify command at all -> no crash, the episode stays un-alerted (retried when notify is back)" || bad "G3c rc=$GRC alerted_at=$(gj "$GSTATE" divergence/alerted_at)"
+fi
+
+# ═══ G4. 'could not tell' never acts ══════════════════════════════════════════════════════════════
+if want G4; then
+echo "G4. three answers, never two: a check that could not be done never raises (or clears) a divergence"
+new_w; active_world; gtick 0; put_item "$KEY_b"; : > "$INFRA/kc/locked"
+gtick 60; gtick 130; gtick 130; gtick 130
+[ "$(ncalls)" = 0 ] && ok "G4 Keychain locked (cannot read the item) -> no divergence alert, however long" || bad "G4 alerted while blind (calls=$(ncalls))"
+gtick 1500; gtick 300
+{ [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"guarda sem enxergar"* ]]; } && ok "G4a ...but after 30 min of not being able to tell, ONE 'guard blind' alert says so" || bad "G4a calls=$(ncalls): $(call_n 1)"
+[ ! -e "$marker" ] && ok "G4b ...and a locked Keychain during the self-test is inconclusive, never a degradation" || bad "G4b degraded because the Keychain was locked"
+new_w; active_world; gtick 0; printf '{"current": ' > "$STATE"; put_item "$KEY_b"; gtick 60; gtick 130; gtick 130; gtick 130
+[ "$(ncalls)" = 0 ] && [ -s "$STATE" ] && ok "G4c unreadable decision file -> no alert, and the guard does not rewrite or move it (it is the daemon's)" || bad "G4c calls=$(ncalls)"
+new_w; active_world; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60 GC_POOL_ACCOUNT=0; done
+{ [ "$(ncalls)" = 0 ] && [ ! -e "$GSTATE" ] && [ "$(claude_auth_calls)" = 0 ] && [ ! -e "$marker" ]; } && ok "G4d GC_POOL_ACCOUNT=0 (operator switched the mechanism off) -> the guard does nothing at all (no state, no claude run, no alert)" || bad "G4d acted under the kill switch (calls=$(ncalls) state=$([ -e "$GSTATE" ] && echo yes || echo no) claude=$(claude_auth_calls))"
+new_w; active_world; touch "$CITY/.gc/no-pool-account"; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60; done
+[ "$(ncalls)" = 0 ] && ok "G4e <city>/.gc/no-pool-account -> the guard does nothing" || bad "G4e acted under no-pool-account"
+new_w; for _i in 1 2 3 4 5 6 7 8; do gtick 1200; done
+[ "$(ncalls)" = 0 ] && [ "$(gj "$GSTATE" divergence)" = "<none>" ] && ok "G4f never activated (no decision, no item): hours of ticks, nothing said" || bad "G4f alerted on an inactive pool (calls=$(ncalls))"
+new_w; active_world; set_mode renamed; gtick 0; put_item "$KEY_b"; for _i in 1 2 3 4 5; do gtick 60; done
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]] && [ "$(gj "$GSTATE" divergence)" = "<none>" ]; } && ok "G4g while auto-switch is OFF (failed self-test, marker) the item is not expected to follow the decision -> no divergence alert, no open episode; the only push is the one that says it is off" || bad "G4g under the degraded marker: calls=$(ncalls) episode=$(gj "$GSTATE" divergence)"
+set_mode ok; gtick 1900
+{ [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ] && [[ "$(call_n 2)" == *"religada"* ]]; } && ok "G4h ...and when it comes back the stale divergence does NOT alert at once (only the 'back on' notice went out)" || bad "G4h calls=$(ncalls) marker=$([ -e "$marker" ] && echo yes || echo no)"
+gtick 60; gtick 60; gtick 60
+{ [ "$(ncalls)" = 3 ] && [[ "$(call_n 3)" == *"diverge"* ]]; } && ok "G4i ...it does alert if the item is STILL wrong 2+ min after auto-switch came back (a new episode)" || bad "G4i calls=$(ncalls) $(call_n 3)"
+fi
+
+# ═══ G5. the per-version test ══════════════════════════════════════════════════════════════════════
+if want G5; then
+echo "G5. per-version test: recorded, queryable, redone on a new version; a fail turns auto-switch off, safely"
+new_w; active_world
+cat "$INFRA/kc/items/$SVC" > "$W/item.before"
+gtick 0
+{ [ "$(gv 1.0.0 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5 first tick: claude 1.0.0 is tested -> pass, recorded; no marker, no alert" || bad "G5 result='$(gv 1.0.0 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls) :: $(gl | tail -3)"
+{ [ "$(ls "$INFRA/kc/items" | tr '\n' ' ')" = "$SVC " ] && [ ! -e "$SCR" ]; } && ok "G5a the scratch item and directory are gone afterwards; the pool item is the only item left" || bad "G5a leftovers: $(ls "$INFRA/kc/items") / scratch=$([ -e "$SCR" ] && echo yes || echo no)"
+if grep -E "^OP (add|delete)-generic-password ($SVC|$PLAIN)$" "$SINKS/kc-ops.log" >/dev/null; then bad "G5b the self-test wrote or deleted the pool item or the plain login item"; else ok "G5b the self-test never wrote or deleted the pool item or Mayor's/crews' plain item (only its own scratch item)"; fi
+cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && ok "G5c the pool item is byte-for-byte what it was" || bad "G5c the pool item changed"
+contains "$CITY/.gc/logs/claude-pool-guard.log" KEY_a; grep -rq "GUARDSELFTEST" "$SINKS/kc-argv.log" "$CITY/.gc/logs" "$GSTATE" 2>/dev/null && bad "G5d the self-test's fake credential reached argv/log/state" || ok "G5d the self-test's credential went to the Keychain on stdin only: not in security's argv, the log or the state"
+run_guard -- status --json
+{ [ "$(gj "$LAST" installed_claude)" = "1.0.0" ] && [ "$(gj "$LAST" installed_result)" = pass ] && [ "$(gj "$LAST" versions/1.0.0/result)" = pass ]; } && ok "G5e AC3 queryable: status --json says installed claude 1.0.0 -> pass, with when it was checked" || bad "G5e status: $(head -c 300 "$LAST")"
+[ -n "$(gj "$LAST" versions/1.0.0/checked_at | grep -E '^[0-9]{4}-')" ] && ok "G5f ...with a timestamp" || bad "G5f no checked_at"
+run_guard -- status; grep -q "PASS" "$LAST" && grep -q "1.0.0" "$LAST" && ok "G5g the human-readable status shows the same" || bad "G5g status text: $(head -c 300 "$LAST")"
+c0=$(claude_auth_calls); gtick 60; gtick 60; gtick 60
+[ "$(claude_auth_calls)" = "$c0" ] && ok "G5h same claude version -> the test is NOT run again" || bad "G5h re-ran the test on an unchanged version ($c0 -> $(claude_auth_calls))"
+set_ver 1.0.1; gtick 60
+{ [ "$(gv 1.0.1 result)" = pass ] && [ "$(gv 1.0.0 result)" = pass ] && [ "$(claude_auth_calls)" -gt "$c0" ]; } && ok "G5i AC3: claude updated to 1.0.1 -> the test re-ran by itself on the next tick; both versions are on record" || bad "G5i 1.0.1='$(gv 1.0.1 result)' calls $c0 -> $(claude_auth_calls)"
+# the release that changed the internals
+( sleep 600 ) & SESSION_PID=$!; BG_PIDS="$BG_PIDS $SESSION_PID"     # stands for a live session: nothing may signal it
+set_ver 1.0.2; set_mode renamed; gtick 60
+{ [ "$(gv 1.0.2 result)" = fail ] && [ "$(gv 1.0.2 attempts)" = 2 ] && [ -s "$marker" ]; } && ok "G5j AC2: a claude that derives the item name differently -> FAIL (twice), degraded marker written" || bad "G5j result='$(gv 1.0.2 result)' attempts='$(gv 1.0.2 attempts)' marker=$([ -s "$marker" ] && echo yes || echo no) :: $(gl | tail -3)"
+[ "$(ncalls)" = 1 ] && c="$(call_n 1)" || c=""
+{ [[ "$c" == *"DESLIGADA"* ]] && [[ "$c" == *"1.0.2"* ]] && [[ "$c" == *"[-p] [4]"* ]] && [[ "$c" == "CALL force=1 "* ]]; } && ok "G5k ...ONE push, priority 4, forced: 'troca automática DESLIGADA', naming the claude version" || bad "G5k alert: calls=$(ncalls) $c"
+"$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["by"]=="claude-pool-guard" and d["claude"]=="1.0.2"' "$marker" 2>/dev/null && ok "G5l the marker says who wrote it and for which version (so only the guard lifts it)" || bad "G5l marker: $(cat "$marker")"
+gtick 60; gtick 60; gtick 60
+[ "$(ncalls)" = 1 ] && ok "G5m the next ticks do not repeat the alert" || bad "G5m calls=$(ncalls)"
+cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && kill -0 "$SESSION_PID" 2>/dev/null && ok "G5n NOTHING was deleted or interrupted: the pool item is untouched and the 'live session' is still running" || bad "G5n the item changed or the session is gone"
+# the daemon stands down
+cp "$STATE" "$W/state.before"; run_d -- run-once
+{ cmp -s "$STATE" "$W/state.before" && cmp -s "$INFRA/kc/items/$SVC" "$W/item.before" && grep -q "disabled by .*pool-account-degraded" "$CITY/.gc/logs/claude-pool-account.log"; } && ok "G5o the daemon stands down under the marker (no switch, says why in its log)" || bad "G5o daemon under marker: $(tail -2 "$CITY/.gc/logs/claude-pool-account.log" 2>/dev/null)"
+# an agent started in that state answers normally
+: > "$SINKS/claude-launch.log"; run_wrapper -- -p hello
+{ [ "$GRC" = 0 ] && [ "$(cat "$LAST")" = "answer: ok (ambient login)" ] && grep -q "^SECDIR=<unset>$" "$SINKS/claude-launch.log"; } && ok "G5p AC2: an agent started in that state answers normally, on the current login (rc 0, no pool item pointed at)" || bad "G5p rc=$GRC out='$(head -c 200 "$LAST")'"
+# it comes back by itself
+set_ver 1.0.3; set_mode ok; gtick 60
+{ [ "$(gv 1.0.3 result)" = pass ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 2 ]; } && ok "G5q a claude that passes again -> marker removed, auto-switch back ON" || bad "G5q result='$(gv 1.0.3 result)' marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls)"
+c="$(call_n 2)"; { [[ "$c" == *"religada"* ]] && [[ "$c" == *"[-p] [2]"* ]] && [[ "$c" != "CALL force=1 "* ]]; } && ok "G5r ...announced quietly (priority 2, not forced)" || bad "G5r: $c"
+run_wrapper -- -p hello; [ "$(cat "$LAST")" = "answer: ok (pool item)" ] && ok "G5s ...and a new launch follows the pool item again" || bad "G5s: $(cat "$LAST")"
+kill "$SESSION_PID" 2>/dev/null
+# same version, fixed later: retried every 30 min
+set_ver 1.0.4; set_mode renamed; gtick 60; c1=$(claude_auth_calls); set_mode ok; gtick 600
+{ [ -s "$marker" ] && [ "$(claude_auth_calls)" = "$c1" ]; } && ok "G5t degraded, then claude is fixed in place: 10 min later it is NOT yet retested" || bad "G5t marker=$([ -s "$marker" ] && echo yes || echo no) calls $c1 -> $(claude_auth_calls)"
+gtick 1300
+{ [ "$(gv 1.0.4 result)" = pass ] && [ ! -e "$marker" ]; } && ok "G5u ...30 min after the failure it is retested, passes, and the marker goes" || bad "G5u result='$(gv 1.0.4 result)' marker=$([ -e "$marker" ] && echo yes || echo no)"
+# a marker the guard did not write is not the guard's to remove
+set_ver 1.0.5; printf '{"by":"someone-else"}\n' > "$marker"; gtick 60
+{ [ -s "$marker" ] && gl | grep -q "not written by this guard"; } && ok "G5v a marker written by someone else is left alone (and the log says so)" || bad "G5v foreign marker removed or unexplained"
+rm -f "$marker"
+
+# a flaky first answer is not a failure
+new_w; active_world; : > "$INFRA/flaky.once"; gtick 0
+{ [ "$(gv 1.0.0 result)" = pass ] && [ "$(gv 1.0.0 attempts)" = 2 ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5w one wrong answer, right on the retry -> pass (attempts=2), nothing degraded, nothing sent" || bad "G5w result='$(gv 1.0.0 result)' attempts='$(gv 1.0.0 attempts)'"
+# a claude that stopped looking at the item: still logged in with it gone
+new_w; active_world; set_mode ignores; gtick 0
+{ [ "$(gv 1.0.0 result)" = fail ] && [ -s "$marker" ]; } && ok "G5x a claude that is logged in whether or not the item exists is a FAIL too (it is not reading the pool item)" || bad "G5x result='$(gv 1.0.0 result)'"
+# the drills: the pool credential removed / renamed as claude sees it
+for f in remove rename; do
+  new_w; active_world; gtick 0 CLAUDE_POOL_GUARD_FAULT=$f
+  { [ "$(gv 1.0.0 result)" = fail ] && [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G5y AC2 drill: credential $f -> the per-version test fails, an alert says auto-switch is OFF" || bad "G5y drill $f: result='$(gv 1.0.0 result)' calls=$(ncalls)"
+  cmp -s <(blob_of "$KEY_a" | xxd -p | tr -d '\n') "$INFRA/kc/items/$SVC" && ok "G5y2 ...the real pool item is untouched by the drill ($f)" || bad "G5y2 drill $f changed the pool item"
+done
+# inconclusive is not a failure
+new_w; active_world; set_mode hang; gtick 0 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && [ ! -e "$marker" ] && [ "$(ncalls)" = 0 ]; } && ok "G5z a claude that hangs -> inconclusive: no degradation, no alert (yet)" || bad "G5z result='$(gv 1.0.0 result)' calls=$(ncalls)"
+for _i in 1 2 3 4 5 6 7; do gtick 300 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; done
+{ [ ! -e "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"guarda sem enxergar"* ]]; } && ok "G5z2 ...still inconclusive after 30 min -> ONE 'cannot verify' alert, and STILL no degradation" || bad "G5z2 marker=$([ -e "$marker" ] && echo yes || echo no) calls=$(ncalls) $(call_n 1)"
+new_w; active_world; set_mode garbage; gtick 0
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && [ ! -e "$marker" ]; } && ok "G5z3 a claude that prints something that is not JSON -> inconclusive, not a failure" || bad "G5z3 result='$(gv 1.0.0 result)'"
+fi
+
+# ═══ G8. the scratch item ═══════════════════════════════════════════════════════════════════════════
+if want G8; then
+echo "G8. the self-test's scratch item: never the pool's, never trusted if left behind"
+# the scratch item can never be the pool's
+new_w; active_world; gtick 0 CLAUDE_POOL_CRED_DIR="$SCR/cred" GC_POOL_CRED_DIR="$SCR/cred"
+{ [ "$(gv 1.0.0 result)" = inconclusive ] && ! grep -q "^OP delete-generic-password" "$SINKS/kc-ops.log"; } && ok "G8 a scratch item that would BE the pool item is refused (inconclusive; nothing deleted or written)" || bad "G8 result='$(gv 1.0.0 result)' ops: $(grep -c '^OP' "$SINKS/kc-ops.log")"
+# a leftover scratch item from a killed run is cleared, not trusted
+new_w; active_world; LEFT="Claude Code-credentials-$(printf '%s' "$SCR/cred" | shasum -a 256 | cut -c1-8)"; printf 'aa' > "$INFRA/kc/items/$LEFT"; gtick 0
+{ [ ! -e "$INFRA/kc/items/$LEFT" ] && [ "$(gv 1.0.0 result)" = pass ]; } && ok "G8a a scratch item left by a killed run is cleared before the test, and gone after it" || bad "G8a leftover=$([ -e "$INFRA/kc/items/$LEFT" ] && echo yes || echo no) result='$(gv 1.0.0 result)'"
+# its own state file
+new_w; active_world; gtick 0; printf 'not json at all' > "$GSTATE"; gtick 60
+{ [ "$GRC" = 0 ] && [ "$(gv 1.0.0 result)" = pass ] && ls "$DATA"/guard.json.corrupt.* >/dev/null 2>&1; } && ok "G8b a corrupt guard state is moved aside and rebuilt (no crash, the self-test is redone)" || bad "G8b rc=$GRC $(ls "$DATA")"
+fi
+
+# ═══ G6. is the daemon doing its job? ══════════════════════════════════════════════════════════════
+if want G6; then
+echo "G6. the daemon's heartbeat"
+new_w; HB_AUTO=0
+for _i in 1 2 3 4 5; do gtick 600; done
+[ "$(ncalls)" = 0 ] && ok "G6 a pool that was never activated has no daemon to be dead" || bad "G6 alerted on an inactive pool"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"
+gtick 0; gtick 540; n1=$(ncalls); gtick 120; n2=$(ncalls); gtick 600; gtick 600; n3=$(ncalls)
+{ [ "$n1" = 0 ] && [ "$n2" = 1 ] && [ "$n3" = 1 ]; } && ok "G6a activated pool, the daemon never stamps: ONE alert once 10 min have passed (not before, not again)" || bad "G6a calls at 9min/11min/31min: $n1/$n2/$n3"
+{ [[ "$(call_n 1)" == *"não está fechando rodadas"* ]] && [[ "$(call_n 1)" == *"nunca"* ]]; } && ok "G6b ...and it says the daemon has never completed a run" || bad "G6b: $(call_n 1)"
+# the REAL daemon's stamp is what the guard reads (one contract, both sides)
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"
+env -i HOME="$INFRA/home" PATH="/usr/bin:/bin" GC_CITY_PATH="$CITY" CLAUDE_POOL_NOW="$NOW" "$PY3" -c '
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m); m.write_heartbeat()' "$DAEMON"
+[ -s "$CITY/.gc/claude-pool-account.heartbeat" ] && ok "G6c the daemon's write_heartbeat() leaves the file the guard reads" || bad "G6c no heartbeat file from the daemon's own function"
+gtick 300; gtick 290; [ "$(ncalls)" = 0 ] && ok "G6d a stamp 9.9 min old is a live daemon" || bad "G6d alerted on a fresh heartbeat"
+gtick 20; [ "$(ncalls)" = 1 ] && ok "G6e ...and one 10.2 min old is not" || bad "G6e calls=$(ncalls)"
+hb_touch; gtick 1; gtick 650
+[ "$(ncalls)" = 2 ] && ok "G6f a daemon that comes back and stops again is a NEW episode (alerted again)" || bad "G6f calls=$(ncalls)"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; for _i in 1 2 3 4 5 6; do gtick 600 GC_POOL_ACCOUNT=0; done
+[ "$(ncalls)" = 0 ] && ok "G6g an operator who switched the mechanism off is not told the daemon stopped" || bad "G6g alerted under the kill switch"
+new_w; HB_AUTO=0; put_item "$KEY_a"; put_decision a@t.test "$FP_a"; set_mode renamed; for _i in 1 2 3 4 5 6; do gtick 600; done
+{ [ -s "$marker" ] && [ "$(ncalls)" = 1 ] && [[ "$(call_n 1)" == *"DESLIGADA"* ]]; } && ok "G6h degraded (marker): the daemon is stood down on purpose, so it is not 'dead' (the only push is the one that says auto-switch is off)" || bad "G6h under the marker: calls=$(ncalls) $(call_n 2)"
+fi
+
+# ═══ G7. AC4: no key leaks, proven with a scanner that is proven to see ═════════════════════════════
+e2e() { # e2e <label> <daemon> <guard>: a switch, a divergence, forced errors, a degradation; then the scan. Sets E_RC, E_OUT, E_WATCH_RC, E_WATCH_OUT
+  local label="$1" dmn="$2" grd="$3" DAEMON_SAVE="$DAEMON" GUARD_SAVE="$GUARD"
+  DAEMON="$dmn"; GUARD="$grd"
+  new_w
+  "$PY3" "$W/mock_api.py" "$INFRA/srv.json" "$SINKS/probes.log" "$INFRA/port" & SRV_PID=$!
+  keys_json | "$PY3" -c '
+import json, sys
+keys = json.load(sys.stdin); ok = json.loads(sys.argv[3]); rej = json.loads(sys.argv[4])
+allowed = {t: {"status": 200, "h": ok} for t in keys.values()}
+a_rej = dict(allowed); a_rej[keys["a@t.test"]] = {"status": 429, "h": rej}
+b_rej = dict(allowed); b_rej[keys["b@t.test"]] = {"status": 429, "h": rej}
+for name, d in (("srv.json", allowed), ("srv.ok.json", allowed), ("srv.a-rej.json", a_rej), ("srv.b-rej.json", b_rej)):
+    json.dump(d, open(sys.argv[1] + "/" + name, "w"))' "$INFRA" "-" "$HDR_OK" "$HDR_REJ"
+  local n=0; while [ ! -s "$INFRA/port" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
+  rm -f "$W/stop" "$W/ready"
+  # the sampler: every process's argv and environment, every 0.1 s, from before the first run to after the last; only hits are kept
+  keys_json | "$PY3" "$LEAKSCAN" --keys-stdin --watch-ps "$W/stop" --ready-file "$W/ready" --interval 0.1 --watch-max 900 > "$SINKS/watch.out" 2>&1 &
+  WATCH_PID=$!; BG_PIDS="$BG_PIDS $WATCH_PID"
+  n=0; while [ ! -e "$W/ready" ] && [ $n -lt 300 ]; do sleep 0.1; n=$((n+1)); done
+  # 1. a complete account switch through the real daemon: seed a, then a is rejected -> the pool moves to b
+  run_d -- run-once
+  NOW=$((NOW + 600)); cp "$INFRA/srv.a-rej.json" "$INFRA/srv.json"; run_d -- run-once
+  # 2. a pool session launched through the wrapper (its whole environment is recorded)
+  run_wrapper -- -p hello
+  # 3. the guard: healthy pass, then a divergence that gets alerted (the item is tampered to c's key), then fixed
+  hb_touch; gtick 0
+  cp "$INFRA/kc/items/$SVC" "$W/item.b"; put_item "$KEY_c"; gtick 60; gtick 130; gtick 130
+  cp "$W/item.b" "$INFRA/kc/items/$SVC"; gtick 60
+  # 4. forced errors, every path that prints something about a credential
+  cp "$INFRA/srv.b-rej.json" "$INFRA/srv.json"
+  touch "$INFRA/kc/refuse-writes"; NOW=$((NOW + 600)); run_d -- run-once; rm -f "$INFRA/kc/refuse-writes"
+  touch "$INFRA/kc/write-lands-other"; NOW=$((NOW + 600)); run_d -- run-once; rm -f "$INFRA/kc/write-lands-other"
+  : > "$INFRA/vault/.broken"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; rm -f "$INFRA/vault/.broken"
+  : > "$INFRA/kc/locked"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; run_wrapper -- -p hello; rm -f "$INFRA/kc/locked"
+  cp "$STATE" "$W/state.good"; printf '{"current": ' > "$STATE"; NOW=$((NOW + 600)); run_d -- run-once; gtick 60; cp "$W/state.good" "$STATE"
+  chmod 555 "$DATA"; NOW=$((NOW + 600)); run_d -- run-once; chmod 755 "$DATA"
+  NOW=$((NOW + 600)); run_d CLAUDE_POOL_ACCOUNTS_LIB="$W/no-such-lib.py" -- run-once
+  printf 1 > "$SINKS/notify.rc"; put_item "$KEY_c"; gtick 60; gtick 130; gtick 130; gtick 400 CLAUDE_POOL_NOTIFY_CMD="$W/no-such-notify"; rm -f "$SINKS/notify.rc"; cp "$W/item.b" "$INFRA/kc/items/$SVC"
+  printf 'garbage' > "$GSTATE"; gtick 60
+  set_mode garbage; set_ver 1.0.1; gtick 60; gtick 2000 CLAUDE_POOL_GUARD_CLAUDE_TIMEOUT_S=1; set_mode ok
+  # 5. a degradation (a claude release that changed the internals), then the daemon and a launch under it
+  set_ver 1.0.2; set_mode renamed; gtick 60
+  NOW=$((NOW + 600)); run_d -- run-once; run_wrapper -- -p hello
+  gtick 60 CLAUDE_POOL_GUARD_FAULT=rename
+  # 6. the end of the sampling window; the scan of everything the product wrote
+  touch "$W/stop"; wait "$WATCH_PID"; E_WATCH_RC=$?; E_WATCH_OUT="$SINKS/watch.out"
+  [ -n "$SRV_PID" ] && { kill "$SRV_PID" 2>/dev/null; SRV_PID=""; }
+  DAEMON="$DAEMON_SAVE"; GUARD="$GUARD_SAVE"
+  E_OUT="$SINKS/scan.out"
+  keys_json | "$PY3" "$LEAKSCAN" --keys-stdin --ps --path "$PROD" --path "$SINKS" > "$E_OUT" 2>&1; E_RC=$?
+}
+scan() { keys_json | "$PY3" "$LEAKSCAN" --keys-stdin "$@" > "$SINKS/scan2.out" 2>&1; S_RC=$?; }
+
+if want G7; then
+echo "G7. AC4: after a full switch, a degradation and forced errors, no key is anywhere it must not be"
+e2e real "$DAEMON" "$GUARD"
+# the scenario really happened (a scan of a world where nothing ran proves nothing)
+{ [ "$(gj "$STATE" current)" = "b@t.test" ] || [ "$(gj "$STATE" previous)" = "a@t.test" ] || [ "$(gj "$STATE" current)" != "a@t.test" ]; } && ok "G7 the account really switched (decision: $(gj "$STATE" current), previous: $(gj "$STATE" previous))" || bad "G7 the pool never left a: nothing to scan"
+{ [ -s "$marker" ] && [ "$(ncalls)" -ge 3 ] && grep -q "DESLIGADA" "$SINKS/notify.log" && grep -q "diverge" "$SINKS/notify.log"; } && ok "G7a the guard degraded and alerted about a divergence ($(ncalls) notifications were sent)" || bad "G7a marker=$([ -s "$marker" ] && echo yes || echo no) notifications=$(ncalls)"
+{ grep -q "ERROR" "$CITY/.gc/logs/claude-pool-account.log" && ls "$DATA"/current.json.corrupt.* >/dev/null 2>&1 && grep -q "answer\|ARGV" "$SINKS/claude-launch.log"; } && ok "G7b the forced errors happened (daemon ERRORs logged, a corrupt state moved aside, agents launched)" || bad "G7b the error paths did not run: $(grep -c ERROR "$CITY/.gc/logs/claude-pool-account.log" 2>/dev/null) errors"
+if [ "$E_RC" = 0 ] && grep -q "keys=5 " "$E_OUT" && grep -q "control=ok" "$E_OUT"; then ok "G7c ZERO occurrences of any of the 5 keys in argv, env, logs, the decision file, error output, notifications (control ok, 5 keys searched): $(tail -1 "$E_OUT")"; else bad "G7c scan rc=$E_RC: $(head -c 800 "$E_OUT")"; fi
+{ [ "$E_WATCH_RC" = 0 ] && grep -q "control=ok" "$E_WATCH_OUT" && ! grep -q "samples=0" "$E_WATCH_OUT"; } && ok "G7d the process sampler ran during the whole scenario and saw no key in any argv/env: $(tail -1 "$E_WATCH_OUT")" || bad "G7d sampler rc=$E_WATCH_RC: $(head -c 600 "$E_WATCH_OUT")"
+for ch in "$SINKS/notify.log" "$SINKS/kc-argv.log" "$SINKS/claude-env.log" "$CITY/.gc/logs/claude-pool-account.log" "$CITY/.gc/logs/claude-pool-guard.log" "$STATE" "$GSTATE"; do [ -s "$ch" ] || bad "G7e channel is empty, so scanning it proves nothing: ${ch#$W/}"; done; ok "G7e every channel the scan covers had content (nothing was clean because it was empty)"
+
+# the control: the same scan, a key planted on purpose in each kind of place
+echo "G7f. the control: the same scan finds a key planted on purpose"
+cp "$CITY/.gc/logs/claude-pool-account.log" "$W/log.orig"; printf 'planted %s\n' "$KEY_e" >> "$CITY/.gc/logs/claude-pool-account.log"
+scan --ps --path "$PROD" --path "$SINKS"
+{ [ "$S_RC" = 1 ] && grep -q "channel=file location=$CITY/.gc/logs/claude-pool-account.log account=e@t.test (fp $(fp_of "$KEY_e")) form=raw" "$SINKS/scan2.out"; } && ok "G7f a key planted in the daemon log -> exit 1, naming the file, the account (e-mail + fingerprint) and the form" || bad "G7f rc=$S_RC: $(head -c 500 "$SINKS/scan2.out")"
+contains "$SINKS/scan2.out" KEY_e && bad "G7f2 the scanner printed the key it found" || ok "G7f2 ...and its report does not contain the key"
+cp "$W/log.orig" "$CITY/.gc/logs/claude-pool-account.log"
+printf '%s' "$KEY_d" | xxd -p | tr -d '\n' > "$DATA/current.json.corrupt.1"
+scan --path "$PROD"; { [ "$S_RC" = 1 ] && grep -q "account=d@t.test .* form=hex" "$SINKS/scan2.out"; } && ok "G7g the hex of a key left in a leftover state file -> found (form=hex)" || bad "G7g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$DATA/current.json.corrupt.1"
+cp "$SINKS/notify.log" "$W/notify.orig"; printf 'x%s' "$KEY_c" | base64 >> "$SINKS/notify.log"
+scan --path "$SINKS"; { [ "$S_RC" = 1 ] && grep -q "account=c@t.test .* form=b64" "$SINKS/scan2.out"; } && ok "G7h a key base64-encoded into a sent notification -> found (form=b64)" || bad "G7h rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+cp "$W/notify.orig" "$SINKS/notify.log"
+LEAK_PLANT="$KEY_a" "$PY3" -c 'import time; time.sleep(60)' & P1=$!
+"$PY3" -c 'import time; time.sleep(60)' "$KEY_b" & P2=$!; BG_PIDS="$BG_PIDS $P1 $P2"; sleep 1
+scan --ps; { [ "$S_RC" = 1 ] && grep -q "channel=ps-env location=pid $P1 .* var=LEAK_PLANT account=a@t.test" "$SINKS/scan2.out" && grep -q "channel=ps-argv location=pid $P2 .* account=b@t.test" "$SINKS/scan2.out"; } && ok "G7i a key in a live process's environment and in another's argv -> both found, by pid (and the variable's NAME for the environment one)" || bad "G7i rc=$S_RC: $(head -c 600 "$SINKS/scan2.out")"
+contains "$SINKS/scan2.out" KEY_a || contains "$SINKS/scan2.out" KEY_b && bad "G7i2 the scanner printed a key" || ok "G7i2 ...and printed no key doing it"
+kill "$P1" "$P2" 2>/dev/null; wait "$P1" "$P2" 2>/dev/null
+LEAK_PLANT_X="$KEY_x" "$PY3" -c 'import time; time.sleep(60)' & P3=$!; BG_PIDS="$BG_PIDS $P3"; sleep 1
+scan --ps; { [ "$S_RC" = 0 ] && grep -q "^NOTE channel=ps-env location=pid $P3 .* var=LEAK_PLANT_X form=shape:$FP_x" "$SINKS/scan2.out"; } && ok "G7i3 key-shaped text that is NOT one of the 5 keys, in a process (another service's API key, say) -> a NOTE, not a failed scan" || bad "G7i3 rc=$S_RC: $(head -c 500 "$SINKS/scan2.out")"
+kill "$P3" 2>/dev/null; wait "$P3" 2>/dev/null
+printf 'x %s y\n' "$KEY_x" > "$SINKS/stranger.txt"; scan --path "$SINKS/stranger.txt"
+{ [ "$S_RC" = 1 ] && grep -q "form=shape:$FP_x" "$SINKS/scan2.out"; } && ok "G7i4 the same stranger in a FILE the product wrote -> a finding (exit 1)" || bad "G7i4 rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+rm -f "$SINKS/stranger.txt"
+scan --ps --path "$PROD" --path "$SINKS"; [ "$S_RC" = 0 ] && ok "G7j with the plants removed the same scan is clean again (the findings were the plants)" || bad "G7j rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# a scanner that cannot see is not a green scan
+echo "G7k. a scan that cannot look is reported as blind, not clean"
+scan --path "$W/does-not-exist"; { [ "$S_RC" = 3 ] && grep -q "BLIND" "$SINKS/scan2.out"; } && ok "G7k a path that does not exist -> exit 3 (blind), not 0" || bad "G7k rc=$S_RC"
+printf '{"a@t.test":"short"}' | "$PY3" "$LEAKSCAN" --keys-stdin --path "$PROD" > "$SINKS/scan2.out" 2>&1; S_RC=$?
+[ "$S_RC" = 3 ] && ok "G7l a key too short to search for -> exit 3, not a clean result" || bad "G7l rc=$S_RC"
+
+# the mutations: a daemon that leaks, and a guard that leaks, must FAIL the same scenario
+echo "G7m. mutations: a daemon and a guard that deliberately leak a key must fail the scan"
+mkdir -p "$W/mut"
+"$PY3" - "$DAEMON" "$W/mut/claude-pool-account.py" "$GUARD" "$W/mut/claude-pool-guard.py" <<'EOF'
+import sys
+src = open(sys.argv[1]).read()
+anchor = "def write_item(user: str, token: str) -> bool:\n"
+assert anchor in src, "mutation anchor missing in the daemon"
+src = src.replace(anchor, anchor + '    subprocess.run(["security", "find-generic-password", "-a", user, "-s", item_service(), "-j", token], capture_output=True)   # MUTATION: key in argv\n', 1)
+open(sys.argv[2], "w").write(src)
+g = open(sys.argv[3]).read()
+anchor = "    for text in (title, msg):\n"
+assert anchor in g, "mutation anchor missing in the guard"
+leak = ('    try:\n'
+        '        msg = msg + " " + subprocess.run(["security", "find-generic-password", "-a", "athos", "-s", D.item_service(), "-w"], capture_output=True, text=True).stdout.strip()   # MUTATION: the pool credential in the notification\n'
+        '    except Exception:\n        pass\n'
+        '    for text in ():   # MUTATION: and the refusal switched off\n')
+g = g.replace(anchor, leak, 1)
+open(sys.argv[4], "w").write(g)
+EOF
+cp "$DAEMON" "$W/mut/real-daemon.py"
+e2e leaky-daemon "$W/mut/claude-pool-account.py" "$GUARD"
+{ [ "$E_RC" = 1 ] && grep -q "kc-argv.log" "$E_OUT"; } && ok "G7m a daemon that puts the key in security's argv -> the scan FAILS (exit 1), naming kc-argv.log" || bad "G7m leaky daemon not caught: rc=$E_RC $(head -c 400 "$E_OUT")"
+e2e leaky-guard "$DAEMON" "$W/mut/claude-pool-guard.py"
+{ [ "$E_RC" = 1 ] && grep -q "notify.log" "$E_OUT"; } && ok "G7n a guard that puts the key in the push notification -> the scan FAILS (exit 1), naming notify.log" || bad "G7n leaky guard not caught: rc=$E_RC $(head -c 400 "$E_OUT")"
+fi
+
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+[ "$FAIL" = 0 ]

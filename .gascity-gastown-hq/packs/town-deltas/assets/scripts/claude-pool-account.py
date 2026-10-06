@@ -44,7 +44,9 @@ unreadable just now", so a None for the current account is NOT "its key is gone"
 (and the fingerprint in the state) is the second witness. Item holds the decision's credential -> keep the decision and
 probe THAT token; item cannot be read -> change nothing; item missing or holding something else -> choose again.
 
-KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the run does nothing at all.
+KNOBS: GC_POOL_ACCOUNT=0 or <city>/.gc/no-pool-account -> the run does nothing at all. So does <city>/.gc/pool-account-degraded,
+which is not a knob: claude-pool-guard.py (ga-8hcnvb.3) writes it when the per-version self-test says the installed claude no
+longer reads the pool item, and removes it when the test passes again.
 SEAMS (tests): CLAUDE_POOL_STATE, CLAUDE_POOL_CRED_DIR (GC_POOL_CRED_DIR, the wrapper's name for it, is honoured too),
 CLAUDE_POOL_ACCOUNTS_LIB, CLAUDE_POOL_NOW,
 CLAUDE_POOL_PROBE_URL (honoured ONLY for a loopback host — an env var must not be able to aim a token elsewhere).
@@ -83,6 +85,8 @@ CLOCK_SKEW_S = 300                # a usage reading stamped further ahead than t
 POOL_ITEM_RE = re.compile(r"Claude Code-credentials-[0-9a-f]{8}")   # the POOL's item. The bare "Claude Code-credentials" is Mayor's/crews'
 DEFAULT_ACCOUNTS_LIB = "/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py"
 DEFAULT_STATE = "/Users/athos/shared/data/claude_pool_current_account.json"
+DEGRADED_MARKER = "pool-account-degraded"          # in <city>/.gc: written/removed by claude-pool-guard.py only
+HEARTBEAT_FILE = "claude-pool-account.heartbeat"   # in <city>/.gc: written by a run that finished cleanly
 
 
 # ── config ─────────────────────────────────────────────────────────────────────────────────────────
@@ -179,7 +183,13 @@ def fingerprint(token: str) -> str:
 
 
 # ── log (never a token) ───────────────────────────────────────────────────────────────────────────
+ERRORS_THIS_RUN = 0   # ERROR lines logged by this process: a run that logged one is not a clean run (see write_heartbeat)
+
+
 def log(level: str, msg: str) -> None:
+    global ERRORS_THIS_RUN
+    if level == "ERROR":
+        ERRORS_THIS_RUN += 1
     if "sk-ant-" in msg:
         msg = "[line withheld: token-shaped text]"
     line = f"{_iso(now())} pid={os.getpid()} daemon {level} {msg}"
@@ -411,13 +421,50 @@ def publish_state(st: dict) -> None:
 
 
 # ── one run ────────────────────────────────────────────────────────────────────────────────────────
-def disabled() -> Optional[str]:
+def operator_off() -> Optional[str]:
+    """The operator's kill switches only (the guard asks this one: it must keep working while its own marker is up)."""
     if os.environ.get("GC_POOL_ACCOUNT") == "0":
         return "GC_POOL_ACCOUNT=0"
     c = city()
     if c and (c / ".gc" / "no-pool-account").exists():
         return str(c / ".gc" / "no-pool-account")
     return None
+
+
+def degraded_marker() -> Optional[Path]:
+    """ga-8hcnvb.3: <city>/.gc/pool-account-degraded is written by claude-pool-guard.py when the per-version self-test says the
+    installed claude no longer reads the pool item. While it is there the daemon changes nothing and the wrapper (claude-lowprio.sh)
+    launches pool sessions on the ambient login. The guard removes it when the self-test passes again."""
+    c = city()
+    p = c / ".gc" / DEGRADED_MARKER if c else None
+    return p if p is not None and p.exists() else None
+
+
+def disabled() -> Optional[str]:
+    off = operator_off()
+    if off:
+        return off
+    m = degraded_marker()
+    return f"{m} (claude-pool-guard: the per-version self-test failed)" if m else None
+
+
+def write_heartbeat() -> None:
+    """One line saying 'a run finished CLEAN at <epoch>': it got to the end and logged no ERROR (a refused Keychain write, a read-back that
+    does not match, an unpublished decision). A run that decides nothing because there is nothing to decide - every account allowed,
+    or no key in the vault - is clean. The exit status cannot say any of this: a run that found no accounts library exits 0 too.
+    claude-pool-guard.py reads this file: no clean run for 10 min = the daemon is not doing its job."""
+    if ERRORS_THIS_RUN:
+        return
+    c = city()
+    if not c or not (c / ".gc").is_dir():
+        return
+    p = c / ".gc" / HEARTBEAT_FILE
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps({"epoch": now(), "updated": _iso(now()), "pid": os.getpid()}) + "\n")
+        os.replace(tmp, p)
+    except OSError as e:
+        log("WARN", f"heartbeat not written ({type(e).__name__})")
 
 
 def order_of_use(lib) -> List[str]:
@@ -749,6 +796,7 @@ def run_once() -> int:
             else:
                 log("ERROR", f"decision NOT published ({type(e).__name__}); this run did not move the pool item to another account")
             return 1
+    write_heartbeat()   # only a run that got here and logged no ERROR: not a disabled one, not one that found no library/order/state to work with
     return 0
 
 
