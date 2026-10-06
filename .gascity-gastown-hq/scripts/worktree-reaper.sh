@@ -175,25 +175,37 @@ _worktree_head_merged() {
 }
 
 # ── _ref_patch_equivalent <repo> <ref> — ga-1md7na: the SECOND proof that <ref>'s content is
-# already in origin/<default>: every commit <ref> has that origin/<default> lacks is there anyway
-# as an equivalent PATCH (`git cherry`: only '-' lines). The gate rebases/re-anchors a branch
+# already in origin/<default>: <ref> carries no merge commit, and every commit <ref> has that
+# origin/<default> lacks is there anyway as an equivalent PATCH (`git cherry`: only '-' lines).
+# The gate rebases/re-anchors a branch
 # before merging, so a delivered branch's HEAD is never an ancestor of main — the ancestry proof
 # in _worktree_head_merged is false for exactly the trees whose work shipped (measured 05/10: 27
-# locked worktrees of CLOSED beads, all `git cherry` '-' only, none reapable). Three states, and
-# only the first is "yes": proven (cherry exited 0 AND every output line is a '- <sha>' line,
-# or there is no output because there is nothing ahead) / NOT proven because a commit is '+'
-# (real work main lacks) / NOT proven because cherry could not answer (nonzero exit — even if it
-# printed '-' lines before dying — or a line that is not cherry's format). Never a guess, never
-# "empty output = fine" without the exit code. A squash-merge is a different patch, so it reads
-# '+' here and the tree is KEPT — the conservative direction.
+# locked worktrees of CLOSED beads, all `git cherry` '-' only, none reapable).
+# `git cherry` NEVER reports MERGE commits, so on its own a '-'-only answer says nothing about
+# them: a branch whose tip is a merge carrying content of its own reads "all shipped" when only
+# its non-merge commits did (gate FAIL ga-jxkpdr). Merge commits are therefore NOT examined here,
+# and ANY merge commit in origin/<default>..<ref> blocks the proof — before cherry is consulted.
+# That keeps even a clean merge of an older main (a false keep: the tree stays, nothing is lost).
+# Three states, and only the first is "yes": proven (the merge check answered AND found none, and
+# cherry exited 0 AND every output line is a '- <sha>' line, or there is no output because there
+# is nothing ahead) / NOT proven because a merge commit is present or a commit is '+' (real work
+# main lacks) / NOT proven because a check could not answer (nonzero exit — even if it printed
+# '-' lines before dying — or a line that is not cherry's format). Never a guess, never "empty
+# output = fine" without the exit code. A squash-merge is a different patch, so it reads '+' here
+# and the tree is KEPT — the conservative direction.
 # <ref> is any commit-ish; an empty one (the caller's `rev-parse HEAD` failed) is "cannot tell".
 _ref_patch_equivalent() {
-  local repo="$1" ref="${2-}" def out rc line
+  local repo="$1" ref="${2-}" def out rc line merges
   local re='^- [0-9a-f]{40,64}$'
   [ -n "$ref" ] || return 1
   def="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
   [ -n "$def" ] || def="main"
   git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$def" >/dev/null 2>&1 || return 1
+  # The merge check comes first: its exit code and its output are separate facts (a failed rev-list prints
+  # nothing, which must never read as "no merges"). Any output, or any failure, is NOT proven.
+  merges="$(git -C "$repo" rev-list --merges "refs/remotes/origin/$def..$ref" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -z "$merges" ] || return 1
   out="$(git -C "$repo" cherry "refs/remotes/origin/$def" "$ref" 2>/dev/null)"; rc=$?
   [ "$rc" -eq 0 ] || return 1
   while IFS= read -r line; do
@@ -357,9 +369,10 @@ preserve_and_reap_dirty() {
 #        without the lock's help: its content already in origin/<default> + git status clean (rc 0 AND empty) + no
 #        live process has it as cwd + older than the age gate. "Already in origin/<default>" has two proofs
 #        (ga-1md7na): HEAD is an ancestor of it (reaped_locked_unparseable_safe), or — a branch the gate rebased,
-#        whose HEAD never is one — every commit it carries is there as an equivalent patch: `git cherry` exited 0
-#        and printed only '-' lines (reaped_locked_unparseable_patch_equivalent; its local branch goes under that
-#        same proof). A `git cherry` that fails or prints anything else proves nothing. Any proof missing →
+#        whose HEAD never is one — it carries NO merge commit (`git cherry` cannot see them, so any one blocks the
+#        proof) and every commit it carries is there as an equivalent patch: `git cherry` exited 0 and printed only
+#        '-' lines (reaped_locked_unparseable_patch_equivalent; its local branch goes under that same proof). A
+#        merge check or a `git cherry` that fails or prints anything else proves nothing. Any proof missing →
 #        KEPT (kept_locked_unparseable). Ignored files are not part of "clean" and go with the tree.
 #   3. any other verdict, or none (empty): KEPT (kept_locked_unrecognized_verdict). Only the exact verdict
 #      "unparseable" reaches the independent-proof path.
@@ -642,7 +655,7 @@ reap_zombie_locked() {
 #       and the session list was FETCHED and names no live session in this
 #       worktree), but the worktree independently proves SAFE to remove anyway
 #       — content already 100% in main (an ancestor of it, or, for a rebased
-#       branch, every commit there as an equivalent patch — ga-1md7na), no
+#       branch with no merge commit, every commit there as an equivalent patch — ga-1md7na), no
 #       uncommitted changes, no live process has it as a cwd, and it is older
 #       than the stale-hours gate. There is nothing left for the lock to be protecting, regardless
 #       of what its text says or whether it could be parsed at all. This is
@@ -706,9 +719,10 @@ _reap_or_log_unparseable_lock() {
   local _status_out _status_rc _proof=""
   _status_out="$(git -C "$wt" status --porcelain 2>/dev/null)"; _status_rc=$?
   # "Delivered" has two proofs (ga-1md7na): HEAD is an ancestor of origin/<default>, or — for a branch the
-  # gate rebased, whose HEAD can never be one — every commit it carries is in origin/<default> as an
-  # equivalent patch. The cheap ancestry one goes first; `git cherry` only runs when it fails. An unusable
-  # answer from either is "not proven", so _proof stays empty and the tree is KEPT.
+  # gate rebased, whose HEAD can never be one — it carries no merge commit and every commit it carries is in
+  # origin/<default> as an equivalent patch. The cheap ancestry one goes first; the merge check and `git cherry`
+  # only run when it fails. An unusable answer from any of them is "not proven", so _proof stays empty and the
+  # tree is KEPT.
   if [ "$age" -gt "$gate_hours" ] 2>/dev/null; then
     if _worktree_head_merged "$repo" "$wt"; then _proof="ancestor"
     elif _ref_patch_equivalent "$repo" "$(git -C "$wt" rev-parse HEAD 2>/dev/null)"; then _proof="patch_equivalent"

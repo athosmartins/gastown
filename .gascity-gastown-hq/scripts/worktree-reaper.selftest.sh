@@ -12,7 +12,8 @@
 # BUSY lock are KEPT (never reap a live agent); .claude/worktrees + .gc-worktrees paths are
 # covered; an UNPARSEABLE lock (no pid, no confirmed live session) is KEPT unless the tree itself proves
 # safe (merged + clean + unused + aged → reaped, ga-vs6shu; "merged" = an ancestor of main OR, for a branch
-# the gate rebased, every commit there as an equivalent patch per `git cherry`, ga-1md7na; see the LOCK
+# the gate rebased and that carries no merge commit, every commit there as an equivalent patch per
+# `git cherry`, ga-1md7na; a merge commit, which cherry cannot see, blocks that proof; see the LOCK
 # CONTRACT in the reaper), and any
 # verdict other than exactly 'unparseable' is KEPT; the SIGTERM guard kills a crew claude proc
 # but never a supervisor/pilot; kill is default-OFF; the feature has a kill-switch + dry-run.
@@ -1240,6 +1241,7 @@ cat > "$PE_BIN/git" <<'PEGIT'
 #!/bin/sh
 # Real git, except `git cherry` which PE_CHERRY can break: fail = rc 128 and no output;
 # garbage = rc 0 and output that is not cherry's format; partial = a '-' line, THEN rc 1.
+# And `git rev-list --merges` (the merge-commit check), which PE_REVLIST=fail breaks: rc 128, no output.
 for a in "$@"; do
   if [ "$a" = "cherry" ]; then
     case "${PE_CHERRY:-}" in
@@ -1248,6 +1250,7 @@ for a in "$@"; do
       partial) echo "- 0123456789012345678901234567890123456789"; exit 1 ;;
     esac
   fi
+  if [ "$a" = "--merges" ] && [ "${PE_REVLIST:-}" = "fail" ]; then exit 128; fi
 done
 exec "$PE_REAL_GIT" "$@"
 PEGIT
@@ -1376,6 +1379,79 @@ run_pe pe_l1
 git -C "$PEL1" worktree list --porcelain 2>/dev/null | grep -E "/\.gc-worktrees/pe-l1\$" >/dev/null \
   && bad "ga-1md7na (h): loop-1 rebased+patch-equivalent locked worktree NOT reaped (wiring drifted from loop 2)" \
   || ok "ga-1md7na (h): loop-1 (legacy path-glob) reaps the rebased+patch-equivalent locked worktree too"
+
+# ══ ga-1md7na gate-feedback 1 (ga-jxkpdr): `git cherry` NEVER reports MERGE commits ═══════════
+# A branch whose tip is a merge commit carrying content of its own reads as "every commit shipped" when
+# every OTHER commit did: cherry lists only f1 ('-'), the merge is invisible, and the reaper would
+# `worktree remove -f -f` a tree of unidentified holder and `branch -D` the only copy of the merge's
+# content. Reviewer's repro: main = base + m1; branch = f1, then a merge of main@m1 with a file added
+# INSIDE the merge commit; main then takes f1 by cherry-pick. Fail-closed rule: ANY merge commit in
+# origin/<default>..<ref> means NOT proven (merge content is not examined); a merge-check that cannot
+# answer is NOT proven either. Both keep the tree, exactly like a '+' line.
+echo "── ga-1md7na gate-feedback 1: a merge commit in the branch is never proven by git cherry ──"
+# Setup snippets for mk_rebased_rig, run inside the worktree: PE_MERGE_OWN merges the older main (m1 = main~1) and adds
+# a file inside the merge commit; PE_MERGE_CLEAN is the same merge with nothing added.
+PE_MERGE_OWN='git merge -q --no-ff --no-commit "$(git rev-parse main~1)" && echo "content only the merge has" > resolution_notes.txt && git add resolution_notes.txt && git commit -qm "merge carrying its own content"'
+PE_MERGE_CLEAN='git merge -q --no-ff -m "clean merge of an older main" "$(git rev-parse main~1)"'
+
+# (i) the reviewer's case: the merge has content of its own, f1 shipped by patch → KEPT.
+mk_rebased_rig pe_i "$PE_MERGE_OWN"
+PE_I_HEAD="$(git -C "$TMP/pe_i/rig/crew/worker-pe" rev-parse HEAD 2>/dev/null)"
+# fixture sanity — without these the scenario could pass on a broken fixture and prove nothing.
+[ -n "$(git -C "$TMP/pe_i/rig" rev-list --merges "refs/remotes/origin/main..$PE_I_HEAD" 2>/dev/null)" ] \
+  && ok "ga-1md7na (i) fixture: the branch tip range holds a merge commit" \
+  || bad "ga-1md7na (i) fixture: no merge commit in origin/main..HEAD — the setup did not build the merge shape"
+PE_I_CH="$(git -C "$TMP/pe_i/rig" cherry refs/remotes/origin/main "$PE_I_HEAD" 2>/dev/null)"
+if [ -n "$PE_I_CH" ] && ! printf '%s\n' "$PE_I_CH" | grep -qv '^- '; then ok "ga-1md7na (i) fixture: git cherry reports ONLY '-' lines (it cannot see the merge — the hole)"
+else bad "ga-1md7na (i) fixture: git cherry said '$PE_I_CH', expected only '- <sha>' lines"; fi
+git -C "$TMP/pe_i/rig" cat-file -e "$PE_I_HEAD:resolution_notes.txt" 2>/dev/null \
+  && ! git -C "$TMP/pe_i/rig" cat-file -e refs/remotes/origin/main:resolution_notes.txt 2>/dev/null \
+  && ok "ga-1md7na (i) fixture: resolution_notes.txt is in the branch tip and NOT in origin/main (content only the merge carries)" \
+  || bad "ga-1md7na (i) fixture: resolution_notes.txt is not (in the tip, absent from main) — not the reviewer's shape"
+pe_age "$TMP/pe_i/rig/crew/worker-pe"
+run_pe pe_i
+pe_kept pe_i "merge commit carrying its own content, every other commit patch-equivalent (reviewer's case)"
+
+# (i2) the same merge with NO content of its own → also KEPT: merge commits are not examined, so any one blocks
+# the proof (a false keep, the safe direction — the tree stays, nothing is lost).
+mk_rebased_rig pe_i2 "$PE_MERGE_CLEAN"
+[ -n "$(git -C "$TMP/pe_i2/rig" rev-list --merges "refs/remotes/origin/main..$(git -C "$TMP/pe_i2/rig/crew/worker-pe" rev-parse HEAD 2>/dev/null)" 2>/dev/null)" ] \
+  && ok "ga-1md7na (i2) fixture: the branch tip range holds a merge commit" \
+  || bad "ga-1md7na (i2) fixture: no merge commit in origin/main..HEAD — the setup did not build the merge shape"
+pe_age "$TMP/pe_i2/rig/crew/worker-pe"
+run_pe pe_i2
+pe_kept pe_i2 "clean merge commit (no content of its own) — merges are not examined, so not proven"
+
+# (j) the merge check itself cannot answer → the third state, KEPT (never read as "no merges").
+mk_rebased_rig pe_j
+run_pe pe_j PE_REVLIST=fail
+pe_kept pe_j "merge-commit check failed (rev-list rc 128, no output)"
+
+# (k) the BRANCH is re-proven at the moment it is deleted (delete_merged_local_branch, proof=patch_equivalent),
+# not just the tree's HEAD — pinned at unit level because a worktree's HEAD is its branch tip, so a scenario cannot
+# stage a branch that differs from the tree it was proven on. Real functions, awk-extracted (the reaper runs on source).
+DB_SCRIPT="$TMP/db_sandbox.sh"
+{
+  echo 'set -uo pipefail'
+  echo 'LOG="$DB_LOG"; ENABLED=1; branches_deleted=0'
+  echo 'ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }'
+  extract_reaper_fn _ref_patch_equivalent
+  extract_reaper_fn delete_merged_local_branch
+  echo 'delete_merged_local_branch "$DB_REPO" "$DB_BR" "$DB_PROOF"'
+} > "$DB_SCRIPT"
+db_run() { # db_run <fixture-name> — proof=patch_equivalent against crew/<name>/pe, tree already unregistered
+  env DB_LOG="$TMP/$1.db.jsonl" DB_REPO="$TMP/$1/rig" DB_BR="crew/$1/pe" DB_PROOF=patch_equivalent bash "$DB_SCRIPT" >/dev/null 2>&1
+}
+db_unreg() { git -C "$TMP/$1/rig" worktree remove -f -f crew/worker-pe >/dev/null 2>&1; }
+mk_rebased_rig pe_ka;                                                   db_unreg pe_ka; db_run pe_ka
+pe_br pe_ka && bad "ga-1md7na (k) control: a shipped patch-equivalent branch was NOT deleted (the harness or the re-proof is broken)" \
+            || ok "ga-1md7na (k) control: a shipped patch-equivalent branch IS deleted under proof=patch_equivalent"
+mk_rebased_rig pe_kb 'echo unshipped > unshipped.txt && git add unshipped.txt && git commit -qm "not in main"'; db_unreg pe_kb; db_run pe_kb
+pe_br pe_kb && ok "ga-1md7na (k): a branch with 1 commit NOT in main is KEPT even though the caller passed proof=patch_equivalent (branch re-proven)" \
+            || bad "ga-1md7na (k): a branch with a commit main lacks was DELETED on a proof it does not satisfy (re-proof dropped)"
+mk_rebased_rig pe_kc "$PE_MERGE_OWN";                                   db_unreg pe_kc; db_run pe_kc
+pe_br pe_kc && ok "ga-1md7na (k): a branch whose tip is a merge carrying its own content is KEPT on proof=patch_equivalent" \
+            || bad "ga-1md7na (k): a branch holding merge-only content was DELETED on proof=patch_equivalent"
 
 echo ""
 echo "── RESULTS: $PASS passed, $FAIL failed ──"
