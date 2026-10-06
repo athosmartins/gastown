@@ -216,6 +216,7 @@ last_reload_secs=0        # D: how long the last reload of ours held the slot
 reload_held_total=0       # sum of D since start (for the duty line in the log)
 reload_count=0
 watcher_started_at=0
+stats_carried_over=false  # true once load_reload_stats read a usable stats file
 
 # slot_cooldown_secs <held_secs> <duty_pct> <floor_secs> — how long to stay off the reload
 # slot after a reload that held it <held_secs>, so the slot is occupied at most <duty_pct>%
@@ -261,6 +262,7 @@ load_reload_stats() {
     case "$a" in ''|*[!0-9]*) return 0 ;; esac
     case "$b" in ''|*[!0-9]*) return 0 ;; esac
     last_reload_secs=$a
+    stats_carried_over=true
     if (( b > hb_next_allowed && b <= now + HEARTBEAT_MAX_INTERVAL )); then
         hb_next_allowed=$b
     fi
@@ -458,7 +460,11 @@ log "Initial hash: $prev_hash"
 log "Watching: $CITY/skills, $CITY/.claude/skills, $WA/crew/*/.claude/skills/, $WA/city-local/skills/, city.toml, pack.toml, agents/, scripts/*.{sh,py}"
 log "Poll interval: ${POLL_INTERVAL}s, debounce: ${DEBOUNCE_WINDOW}s, heartbeat floor: ${HEARTBEAT_INTERVAL}s"
 log "Mode: file-watcher (immediate, retried until accepted) + duty-capped backstop heartbeat (slot duty <= ${HEARTBEAT_MAX_SLOT_DUTY_PCT}%, file-change reloads <= ${FILE_MAX_SLOT_DUTY_PCT}%)"
-log "Carried over from the previous run: last reload held the slot ${last_reload_secs}s, next heartbeat not before epoch ${hb_next_allowed}"
+if [ "$stats_carried_over" = "true" ]; then
+    log "Carried over from the previous run: last reload held the slot ${last_reload_secs}s, next heartbeat not before epoch ${hb_next_allowed}"
+else
+    log "No usable reload stats from a previous run (${RELOAD_STATS_FILE}) — first heartbeat after ${HEARTBEAT_INTERVAL}s, cadence learned from the first reload"
+fi
 
 while true; do
     sleep "$POLL_INTERVAL"

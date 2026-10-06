@@ -110,6 +110,7 @@ reset_state() {
     RELOAD_PID=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0
     hb_next_allowed=0; file_next_allowed=0; file_fail_count=0; file_busy_streak=0
     last_reload_secs=0; reload_held_total=0; reload_count=0; watcher_started_at=$FAKE_NOW
+    stats_carried_over=false
     HOOK_CALLS=0; START_LOG=""
 }
 TICKLOG="$TMP/tick.log"
@@ -290,11 +291,13 @@ hb_next_allowed=$((FAKE_NOW + HEARTBEAT_INTERVAL))   # …but its own startup de
 load_reload_stats "$FAKE_NOW"
 eq "restart: last reload duration carried over" 600 "$last_reload_secs"
 eq "restart: heartbeat embargo carried over (a restart does not re-open the slot to the watcher)" "$saved_hb" "$hb_next_allowed"
+eq "restart: the stats are reported as carried over" true "$stats_carried_over"
 
 reset_state; hb_next_allowed=$((FAKE_NOW + 20))
 echo "not numbers at all" > "$RELOAD_STATS_FILE"
 load_reload_stats "$FAKE_NOW"
 eq "garbage stats file is ignored" "0 $((FAKE_NOW + 20))" "$last_reload_secs $hb_next_allowed"
+eq "garbage stats file is NOT reported as carried over" false "$stats_carried_over"
 
 reset_state; hb_next_allowed=$((FAKE_NOW + 20))
 echo "600 $((FAKE_NOW + 99999999))" > "$RELOAD_STATS_FILE"
