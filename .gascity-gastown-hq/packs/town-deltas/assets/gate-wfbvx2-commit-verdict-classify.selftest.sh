@@ -261,7 +261,7 @@ cleanup() { rm -rf "$TMPD"; }
 # FAIL CLOSED (ga-f31s7p, lib from ga-avma7j): a run that aborts before its summary must exit
 # non-zero. Under /bin/bash 3.2 the bare `trap '...' EXIT` this file used to have turned an
 # abort (set -u) into exit 0 with no FAIL line. Proof: selftest-fail-closed-retrofit.selftest.sh.
-SELFTEST_ERR_FILE="$STDERR_FILE"   # the lib prints this (the cause an abort in a 2>"$STDERR_FILE" call swallows)
+SELFTEST_ERR_FILE="$STDERR_FILE"   # on an abort the lib prints this, labelled "unknown which step wrote it": this selftest declares no steps (selftest_step_begin/_end), so the file may hold the cause an abort in a 2>"$STDERR_FILE" call swallows OR an earlier call's stderr
 selftest_fail_closed_arm cleanup
 
 git -C "$TMPD" init -q -b main 2>/dev/null || { mkdir -p "$TMPD"; git -C "$TMPD" init -q; git -C "$TMPD" checkout -q -b main; }

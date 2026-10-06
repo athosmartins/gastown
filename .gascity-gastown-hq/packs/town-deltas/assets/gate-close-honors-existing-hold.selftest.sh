@@ -403,9 +403,10 @@ if [ -z "${SELFTEST_ABORT_PROBE:-}" ]; then
     bad "the outside-the-step abort probe did not apply (section-3 marker moved?) — stale-stderr attribution is unproven"
   fi
   # 7d. "the step wrote nothing" is a claim about a file the lib has to be able to READ. The probe opens a
-  # step, removes $ERR_F and dies on an unset variable: the lib cannot know what the step wrote, and must
-  # say so instead of reporting an empty stderr.
-  if run_probe "selftest_step_begin; rm -f \"\$ERR_F\"; : \"\$ABORT_PROBE_NOFILE\""; then
+  # step, creates $ERR_F and then removes it (so the removal is real, not a no-op on a file that never
+  # existed) and dies on an unset variable: the lib cannot know what the step wrote, and must say so
+  # instead of reporting an empty stderr.
+  if run_probe "selftest_step_begin; : > \"\$ERR_F\"; rm -f \"\$ERR_F\"; : \"\$ABORT_PROBE_NOFILE\""; then
     [ "$PROBE_RC" -ne 0 ] && ok "an abort inside a step whose stderr file is gone also exits NON-ZERO (rc=$PROBE_RC)" \
       || bad "an abort inside a step whose stderr file is gone exited 0 — it reads as green"
     ! grep -q 'written nothing' "$WORK_DIR/probe.err" \
@@ -416,6 +417,49 @@ if [ -z "${SELFTEST_ABORT_PROBE:-}" ]; then
       || bad "the report does not say the step's stderr is unknown: [$(cat "$WORK_DIR/probe.err")]"
   else
     bad "the missing-stderr-file abort probe did not apply (section-3 marker moved?) — the empty-vs-missing distinction is unproven"
+  fi
+  # 7e-7g. a selftest that sets SELFTEST_ERR_FILE but never declares a step (selftest_step_begin) — the shape of
+  # gate-supersede-cross-repo-sibling and gate-wfbvx2-commit-verdict-classify, which share the lib. The lib
+  # cannot know whether an abort was inside such a selftest's `2>"$ERR_F"` call, so it must NOT answer "no,
+  # not inside a step" (that drops the cause, which only ever landed in that file): it says it is unknown and
+  # shows the file under that label. Nothing has called run_region at the injection point (before section 3),
+  # so no step was declared yet — the same state those two selftests are in for their whole run.
+  # 7e: the cause is in the file. 7f: the file is empty. 7g: the file is gone — three states, three reports.
+  if run_probe ": > \"\$ERR_F\"; eval ': \"\$ABORT_PROBE_UNDECLARED\"' 2>\"\$ERR_F\""; then
+    [ "$PROBE_RC" -ne 0 ] && ok "an abort in a 2>\$ERR_F call of a selftest that declares no steps exits NON-ZERO (rc=$PROBE_RC)" \
+      || bad "an abort in a 2>\$ERR_F call of a step-less selftest exited 0 — it reads as green"
+    grep -q 'unbound variable' "$WORK_DIR/probe.err" \
+      && ok "…the cause (bash's 'unbound variable', which only landed in \$ERR_F) is still shown for a selftest that declares no steps" \
+      || bad "the cause of an abort in a step-less selftest's 2>\$ERR_F call was lost: [$(cat "$WORK_DIR/probe.err")]"
+    ! grep -q 'did NOT happen inside a captured step' "$WORK_DIR/probe.err" \
+      && ok "…and the lib does not claim the abort was outside a step (it cannot know)" \
+      || bad "the lib claimed 'not inside a captured step' for a selftest that declares none: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'declares no captured steps' "$WORK_DIR/probe.err" && grep -q 'it is unknown which step wrote' "$WORK_DIR/probe.err" \
+      && ok "…and says so: no declared steps, so it is unknown which step wrote the file" \
+      || bad "the report does not say the file's author is unknown for a step-less selftest: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the step-less abort probe did not apply (section-3 marker moved?) — the undeclared-steps report is unproven"
+  fi
+  if run_probe ": > \"\$ERR_F\"; : \"\$ABORT_PROBE_UNDECLARED_EMPTY\""; then
+    [ "$PROBE_RC" -ne 0 ] && ok "an abort in a step-less selftest whose stderr file is empty exits NON-ZERO (rc=$PROBE_RC)" \
+      || bad "an abort in a step-less selftest whose stderr file is empty exited 0"
+    grep -q 'declares no captured steps.*is empty' "$WORK_DIR/probe.err" \
+      && ok "…an existing-but-empty file is reported as empty" \
+      || bad "an empty stderr file of a step-less selftest was not reported as empty: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the step-less empty-file probe did not apply (section-3 marker moved?) — the empty case is unproven"
+  fi
+  if run_probe ": > \"\$ERR_F\"; rm -f \"\$ERR_F\"; : \"\$ABORT_PROBE_UNDECLARED_NOFILE\""; then
+    [ "$PROBE_RC" -ne 0 ] && ok "an abort in a step-less selftest whose stderr file is gone exits NON-ZERO (rc=$PROBE_RC)" \
+      || bad "an abort in a step-less selftest whose stderr file is gone exited 0"
+    ! grep -q 'is empty' "$WORK_DIR/probe.err" \
+      && ok "…a missing file is NOT reported as empty" \
+      || bad "a missing stderr file of a step-less selftest was reported as empty: [$(cat "$WORK_DIR/probe.err")]"
+    grep -q 'does not exist, so what was written to it is unknown' "$WORK_DIR/probe.err" \
+      && ok "…it says what was written to the file is UNKNOWN" \
+      || bad "the report does not say the missing file's content is unknown: [$(cat "$WORK_DIR/probe.err")]"
+  else
+    bad "the step-less missing-file probe did not apply (section-3 marker moved?) — the missing case is unproven"
   fi
   # 7b. the guard must not disturb a run that DOES reach its summary: an ordinary failing
   # assertion stays exit 1 + RESULT: FAIL, and is not mislabelled as an abort.

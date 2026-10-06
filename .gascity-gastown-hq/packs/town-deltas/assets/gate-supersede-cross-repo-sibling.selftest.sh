@@ -257,7 +257,7 @@ eval "$FN_HOLD"
 
 WORK_DIR="$(mktemp -d)"
 ERR_F="$WORK_DIR/stderr"; LOG_F="$WORK_DIR/log"; COMMENT_F="$WORK_DIR/comments"; LABEL_F="$WORK_DIR/labels"
-SELFTEST_ERR_FILE="$ERR_F"   # the lib prints this (the cause an abort in a 2>"$ERR_F" call swallows)
+SELFTEST_ERR_FILE="$ERR_F"   # on an abort the lib prints this, labelled "unknown which step wrote it": this selftest declares no steps (selftest_step_begin/_end), so the file may hold the cause an abort in a 2>"$ERR_F" call swallows OR an earlier call's stderr
 MOCK_OPEN_JSON='[{"id":"m-wa","status":"open","labels":["type:quality-gate-marker","gate-status:dispatching","source-bead:ga-g7x0si"],"description":"branch: fix/ga-g7x0si-mockup-directions-wa\nbead_id: ga-g7x0si\nrig: whatsapp_automation\nbead_rig: gascity"}]'
 MOCK_BD_MODE=none
 # Dispatch on the VERB ($3, after `-C <city>`), never on a substring of "$*":
