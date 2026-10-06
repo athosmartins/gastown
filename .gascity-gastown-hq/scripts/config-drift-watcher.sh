@@ -70,7 +70,7 @@
 set -uo pipefail
 
 CITY="${CITY:-/Users/athos/gt/.gascity-gastown-hq}"
-WA="/Users/athos/gt/whatsapp_automation"
+WA="${CONFIG_DRIFT_WATCHER_WA:-/Users/athos/gt/whatsapp_automation}"   # override: selftest only
 LOG_DIR="$CITY/.gc/logs"
 LOG="$LOG_DIR/config-drift-watcher.log"
 GC="${GC:-gc}"
