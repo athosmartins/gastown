@@ -690,6 +690,11 @@ scan --path "$LK/tree"
 rm -f "$LK/tree/dangling"; ln -s "$LK/outside/secret.txt" "$LK/top-link"
 scan --path "$LK/top-link"
 { [ "$S_RC" = 1 ] && grep -q "account=c@t.test" "$SINKS/scan2.out"; } && ok "G15f a top-level --path that is a symlink to a file is read through the same way" || bad "G15f rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
+# --watch-ps samples the process list only. A --path given with it used to be dropped without a word while the file control still ran: a key
+# planted in that file came back as 'clean', the same green as a file that was read.
+: > "$W/stop-now"
+scan --watch-ps "$W/stop-now" --path "$LK/outside/secret.txt"
+{ [ "$S_RC" = 2 ] && grep -q -- "--watch-ps" "$SINKS/scan2.out" && ! grep -q "^SUMMARY" "$SINKS/scan2.out"; } && ok "G15g --watch-ps with --path is refused (exit 2, says why), not answered 'clean' for files it never read" || bad "G15g rc=$S_RC: $(head -c 400 "$SINKS/scan2.out")"
 fi
 
 # ═══ G7. AC4: no key leaks, proven with a scanner that is proven to see ═════════════════════════════

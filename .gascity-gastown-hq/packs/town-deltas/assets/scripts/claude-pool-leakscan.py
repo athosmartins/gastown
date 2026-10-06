@@ -8,7 +8,8 @@ found around it: a finding is  channel, location (a path or a pid + command name
 
   claude-pool-leakscan.py --keys-stdin|--keys-vault [--ps] [--path P ...]        scan once
   claude-pool-leakscan.py --keys-stdin|--keys-vault --watch-ps STOPFILE [--ready-file F]   sample ps until STOPFILE exists, then report
-                                                                                          (F is created once the sampler is up)
+                                                                                          (F is created once the sampler is up; the
+                                                                                          process list only: --path with it is refused, exit 2)
   options: --json  --interval S (watch, default 0.05)  --watch-max S (default 900)  --chunk BYTES
 
 KEYS arrive on STDIN as JSON {"<email>": "<key>", ...} or from the accounts library (--keys-vault: the same vault the pool uses). Never in
@@ -450,6 +451,12 @@ def main(argv: List[str]) -> int:
             i += 1
     except (ValueError, IndexError):
         src = None
+    if src is not None and watch is not None and paths:
+        # watch mode samples the process list and nothing else: a --path given with it would be dropped without a word while the file
+        # control still ran, and a key in that file would come back 'clean'
+        print("claude-pool-leakscan: --watch-ps samples the process list only and would leave every --path unread: scan the files in a "
+              "separate run (--path without --watch-ps)", file=sys.stderr)
+        return 2
     if src is None or (watch is None and not paths and not use_ps) or chunk < 64:
         print(__doc__.split("\n\n")[0] + "\n\nusage: claude-pool-leakscan.py (--keys-stdin|--keys-vault) [--ps] [--path P ...] [--watch-ps STOPFILE [--ready-file F]] [--json]",
               file=sys.stderr)

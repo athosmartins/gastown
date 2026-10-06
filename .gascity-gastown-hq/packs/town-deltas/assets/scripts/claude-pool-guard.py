@@ -15,7 +15,7 @@ The 1a daemon moves the pool between accounts by rewriting ONE Keychain item tha
      The daemon then does nothing and claude-lowprio.sh stops pointing new pool launches at the item: they start on the ambient login.
      Nothing is deleted and no session is interrupted (a live session keeps the last account written, a valid login). One push says
      "auto-switch is OFF". The self-test is repeated every 30 min while degraded and on every new version; when it passes the marker is
-     removed and a quiet notice says so.
+     removed (the log says so) and, if an alert had said auto-switch was OFF, a quiet notice says it is back.
   + the daemon's liveness: a run that gets to the end without logging an ERROR stamps <city>/.gc/claude-pool-account.heartbeat. No such run
     for 10 min -> one push. (The exit status cannot say it: a run that found no accounts library exits 0 too.)
 
@@ -639,7 +639,7 @@ def apply_result(gs: dict, t: float, ver: str, res: str, detail: str) -> str:
         elif present:
             # Someone else's marker keeps the mechanism off: it is not the guard's to lift and it is not "back on" - so nothing is announced
             # and the record of the degradation stays until the marker is really gone.
-            glog("WARN", f"the degraded marker {m} was not written by this guard - left alone (auto-switch stays OFF)")
+            glog("WARN", f"the degraded marker {m} was not written by this guard (or cannot be read to tell) - left alone (auto-switch stays OFF)")
             return "foreign"
         if deg:
             if send_alert(f"Pool Claude: troca automática religada (claude {ver})",
