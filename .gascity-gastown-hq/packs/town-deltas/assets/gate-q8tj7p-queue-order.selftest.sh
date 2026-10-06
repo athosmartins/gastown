@@ -21,6 +21,15 @@
 # never collapse into one another (a bead that cannot be read must not become P2
 # and above all must not become P0).
 #
+# ga-emgkvn (2026-10-06, Athos's decision in the ga-9t9acg thread, 22:29): ONE exception to
+# that rule. A P0 *bug* whose source bead carries the label `impacto:dano-ao-vivo` (a customer
+# is being hurt right now) goes BEFORE the P0 features. Classes inside a priority become
+# [dano-ao-vivo] -> [feature] -> [other], oldest first inside each; P1 and below are untouched.
+# Three states for the label, never collapsed: have it / do not have it / could not read the
+# labels. The last one is treated as WITHOUT the label (no promotion) and is WARNed about.
+# The label counts on a P0 bug only; on anything else it is ignored and the sweep logs that.
+# Sections A18-A26 (the order) and B12-B17 (the enrichment) are the ga-emgkvn part.
+#
 # This file does not self-certify "fails before the fix": that is done externally
 # by quality-gate-guard.sh's base-test harness, which runs it on a throwaway
 # worktree of the base commit.
@@ -61,11 +70,21 @@ ago() { iso "$((NOW_EPOCH - $1))"; }
 #          P<n.m>:<type>    read OK, priority is not an integer (e.g. P2.5)
 #          unreadable       the enrichment could not read the source bead
 #          none             no `.src_class` at all (enrichment never ran for it)
+#   a class may end in a verdict on the source bead's `impacto:dano-ao-vivo` label (ga-emgkvn):
+#          P0:bug+dano      the label is on the source bead        (src_class.dano = "yes")
+#          P0:bug+danox     its labels could not be read           (src_class.dano = "unreadable")
+#          P0:bug+danono    the labels were read, no such label   (src_class.dano = "no")
+#          (no suffix)      src_class carries no `dano` key at all — what the pre-ga-emgkvn enrichment wrote
 mk() {
   local id="$1" age="$2" cls="$3" labels="${4:-}" crew="${5:-wa-worker}"
   local labarr='["gate-status:queued"]'
   [ -n "$labels" ] && labarr="$(printf '%s' "$labels" | jq -R 'split(",")')"
-  local src="null" prio typ
+  local src="null" prio typ dano=""
+  case "$cls" in
+    *+dano)   dano="yes";        cls="${cls%+dano}" ;;
+    *+danox)  dano="unreadable"; cls="${cls%+danox}" ;;
+    *+danono) dano="no";         cls="${cls%+danono}" ;;
+  esac
   case "$cls" in
     unreadable) src='{"state":"unreadable","why":"not-read"}' ;;
     none)       src="null" ;;
@@ -77,23 +96,25 @@ mk() {
   local created; created="$(ago "$age")"
   [ "$age" = "BADTS" ] && created="not-a-timestamp"
   jq -cn --arg id "$id" --arg ts "$created" --arg desc "branch: crew/${crew}/${id}" \
-        --argjson labels "$labarr" --argjson src "$src" \
+        --argjson labels "$labarr" --argjson src "$src" --arg dano "$dano" \
     '{id:$id, created_at:$ts, description:$desc, labels:$labels}
-     + (if $src == null then {} else {src_class:$src} end)'
+     + (if $src == null then {} else {src_class:($src + (if $dano != "" and $src.state == "ok" then {dano:$dano} else {} end))} end)'
 }
 
-# run_select <markers-json> [ENV=VAL ...] -> one record: <selected-id> US <class> US <summary> US <full order json>
+# run_select <markers-json> [ENV=VAL ...] -> one record:
+#   <selected-id> US <class> US <summary> US <ids whose dano label was ignored> US <full order json>
 # (US = ASCII unit separator: a marker's text can hold any printable character, so no printable separator is safe)
 US=$'\x1f'
 run_select() {
   local markers="$1"; shift
   env MARKERS_JSON="$markers" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" "$@" \
-    bash -c "$SELECT_BLOCK"$'\nprintf "%s\\037%s\\037%s\\037%s" "${MARKER_ID:-}" "${MARKER_CLASS:-}" "${MARKER_ORDER_SUMMARY:-}" "${MARKER_ORDER_JSON:-[]}"' 2>/dev/null
+    bash -c "$SELECT_BLOCK"$'\nprintf "%s\\037%s\\037%s\\037%s\\037%s" "${MARKER_ID:-}" "${MARKER_CLASS:-}" "${MARKER_ORDER_SUMMARY:-}" "${MARKER_DANO_IGNORED:-}" "${MARKER_ORDER_JSON:-[]}"' 2>/dev/null
 }
 sel_id()    { printf '%s' "$1" | cut -d"$US" -f1; }
 sel_class() { printf '%s' "$1" | cut -d"$US" -f2; }
 sel_summ()  { printf '%s' "$1" | cut -d"$US" -f3; }
-sel_order() { printf '%s' "$1" | cut -d"$US" -f4- | jq -r '[.[].id] | join(",")' 2>/dev/null; }
+sel_ignored() { printf '%s' "$1" | cut -d"$US" -f4; }
+sel_order() { printf '%s' "$1" | cut -d"$US" -f5- | jq -r '[.[].id] | join(",")' 2>/dev/null; }
 # order_is <label> <record> <expected comma-joined order>: the whole order AND the marker the dispatcher would
 # actually claim (the head). The second half matters on its own: it is read from MARKER_ID, so it fails for the
 # right reason against a dispatcher that has no MARKER_ORDER_JSON at all.
@@ -236,6 +257,83 @@ eq "malformed GATE_EXILE_OVERDUE_SECONDS"        "$(strict_select GATE_EXILE_OVE
 eq "malformed GATE_EXILE_RETRY_CEILING"          "$(strict_select GATE_EXILE_RETRY_CEILING=abc | tr '\n' ' ')" "s2 rc=0 "
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Part A, ga-emgkvn — the "dano ao vivo" exception
+# ═══════════════════════════════════════════════════════════════════════════
+echo "── A18. the exception end to end: P0 bug + label first, then P0 features, P0 others, then P1 (where the label means nothing) ──"
+# Fed in reverse of the expected order. p0b_plain (9500s) is OLDER than every other P0, so a bug that was promoted
+# without the label (or a sort that ignores the class) would put it first.
+FIX=$(arr \
+  "$(mk p1b_dano  100  P1:bug+dano)" \
+  "$(mk p1f       4000 P1:feature)" \
+  "$(mk p0t       50   P0:task)" \
+  "$(mk p0b_plain 9500 P0:bug+danono)" \
+  "$(mk p0f_old   9000 P0:feature)" \
+  "$(mk d_new     10   P0:bug+dano)" \
+  "$(mk d_old     300  P0:bug+dano)")
+R=$(run_select "$FIX")
+order_is "full order" "$R" "d_old,d_new,p0f_old,p0b_plain,p0t,p1f,p1b_dano"
+eq "summary: the class says why" "$(sel_summ "$R")" "d_old[P0/dano-ao-vivo] d_new[P0/dano-ao-vivo] p0f_old[P0/feature] p0b_plain[P0/other] p0t[P0/other] p1f[P1/feature] p1b_dano[P1/other]"
+eq "class of the selected marker" "$(sel_class "$R")" "P0/dano-ao-vivo"
+
+echo "── A19. age does not matter across classes: a dano bug submitted 10s ago beats a P0 feature that has waited 9000s ──"
+R=$(run_select "$(arr "$(mk feat 9000 P0:feature)" "$(mk dano 10 P0:bug+dano)")")
+order_is "dano first" "$R" "dano,feat"
+
+echo "── A20. ...but oldest-first still holds INSIDE the class, and ties go to the id ──"
+R=$(run_select "$(arr "$(mk d_young 10 P0:bug+dano)" "$(mk d_old 900 P0:bug+dano)")")
+order_is "older dano bug first" "$R" "d_old,d_young"
+R1=$(run_select "$(arr "$(mk d_b 500 P0:bug+dano)" "$(mk d_a 500 P0:bug+dano)")")
+eq "equal ages -> id ascending" "$(sel_order "$R1")" "d_a,d_b"
+
+echo "── A21. the label counts on a P0 BUG only — anywhere else it is ignored, and the sweep can say which markers ──"
+R=$(run_select "$(arr "$(mk p1b_dano 600 P1:bug+dano)" "$(mk p0t 60 P0:task)")")
+order_is "a P1 bug with the label does not pass a P0 task" "$R" "p0t,p1b_dano"
+R=$(run_select "$(arr "$(mk p1t 600 P1:task)" "$(mk p1b_dano 60 P1:bug+dano)" "$(mk p1f 10 P1:feature)")")
+order_is "inside P1 the label changes nothing: feature, then the others by age" "$R" "p1f,p1t,p1b_dano"
+eq "class of a P1 bug that carries the label" "$(sel_class "$(run_select "$(arr "$(mk b 60 P1:bug+dano)")")")" "P1/other"
+R=$(run_select "$(arr "$(mk f_old 900 P0:feature)" "$(mk f_dano 100 P0:feature+dano)" "$(mk t_dano 5000 P0:task+dano)" "$(mk f_plain 50 P0:feature)")")
+order_is "a P0 FEATURE or TASK with the label is not a bug: no promotion (features by age, then the task)" "$R" "f_old,f_dano,f_plain,t_dano"
+eq "its class is its own" "$(sel_summ "$R")" "f_old[P0/feature] f_dano[P0/feature] f_plain[P0/feature] t_dano[P0/other]"
+R=$(run_select "$(arr "$(mk d 60 P0:bug+dano)" "$(mk p1b 600 P1:bug+dano)" "$(mk p0f 100 P0:feature+dano)" "$(mk p2t 100 P2:task+dano)" "$(mk p0t 100 P0:task)")")
+eq "the ignored label is listed, in queue order — and a promoted marker is not on the list" "$(sel_ignored "$R")" "p0f,p1b,p2t"
+eq "nothing ignored when nothing carries the label" "$(sel_ignored "$(run_select "$(arr "$(mk a 60 P0:bug)" "$(mk b 60 P1:task)")")")" ""
+
+echo "── A22. THREE STATES of the label: could not read the labels = treated as WITHOUT it (never promoted) ──"
+R=$(run_select "$(arr "$(mk f 100 P0:feature)" "$(mk b_unreadable 9000 P0:bug+danox)")")
+order_is "labels unreadable: the P0 bug stays behind the P0 feature" "$R" "f,b_unreadable"
+eq "...and its class is the ordinary one, not the exception's" "$(sel_summ "$R")" "f[P0/feature] b_unreadable[P0/other]"
+R=$(run_select "$(arr "$(mk f 100 P0:feature)" "$(mk b_nokey 9000 P0:bug)")")
+order_is "src_class with no dano key at all (the enrichment of before ga-emgkvn): no promotion" "$R" "f,b_nokey"
+R=$(run_select '[{"id":"f","created_at":"'"$(ago 100)"'","labels":["gate-status:queued"],"src_class":{"state":"ok","priority":0,"type":"feature"}},{"id":"b_str","created_at":"'"$(ago 9000)"'","labels":["gate-status:queued"],"src_class":{"state":"ok","priority":0,"type":"bug","dano":"true"}},{"id":"b_bool","created_at":"'"$(ago 9000)"'","labels":["gate-status:queued"],"src_class":{"state":"ok","priority":0,"type":"bug","dano":true}}]')
+order_is "only the exact verdict \"yes\" promotes: \"true\" and boolean true do not" "$R" "f,b_bool,b_str"
+
+echo "── A23. a source that could not be read is never promoted either, whatever else the marker says ──"
+R=$(run_select "$(arr "$(mk unread 9000 unreadable)" "$(mk p4 10 P4:task)")")
+order_is "unreadable source: after the readable class" "$R" "p4,unread"
+R=$(run_select '[{"id":"u","created_at":"'"$(ago 9000)"'","labels":["gate-status:queued"],"src_class":{"state":"unreadable","priority":0,"type":"bug","dano":"yes"}},{"id":"f","created_at":"'"$(ago 10)"'","labels":["gate-status:queued"],"src_class":{"state":"ok","priority":0,"type":"feature"}}]')
+order_is "state=unreadable wins over any stray priority/type/dano fields in the record" "$R" "f,u"
+eq "its class" "$(sel_class "$R")" "P0/feature"
+
+echo "── A24. the priority is re-checked at selection: no valid priority reads as P2, so the label cannot make a P0 of it ──"
+R=$(run_select "$(arr "$(mk p1t 600 P1:task)" "$(mk nul 9000 Pnull:bug+dano)" "$(mk str 9000 Pstr:bug+dano)" "$(mk big 9000 P7:bug+dano)")")
+order_is "invalid-priority bug+label sorts as P2, behind the P1" "$R" "p1t,big,nul,str"
+eq "class says P2" "$(sel_class "$(run_select "$(arr "$(mk nul 9000 Pnull:bug+dano)")")")" "P2/other"
+
+echo "── A25. the other tiers still outrank the exception: cooldown excludes it, a rebase-fail marker sinks, an overdue exile is still re-tried first ──"
+R=$(run_select "$(arr "$(mk d_cool 9000 P0:bug+dano "gate-status:queued,gate:retry-cooldown-until:$((NOW_EPOCH + 600))")" "$(mk next 60 P4:task)")")
+order_is "a dano bug inside its retry cooldown is not eligible" "$R" "next"
+R=$(run_select "$(arr "$(mk d_broken 9000 P0:bug+dano 'gate-status:queued,gate:exiled-tier5:1')" "$(mk fine 10 P4:task)")")
+order_is "a dano bug on a branch that cannot rebase is still LAST" "$R" "fine,d_broken"
+eq "its class is rebase-fail, not the exception's" "$(sel_class "$(run_select "$(arr "$(mk d_broken 9000 P0:bug+dano 'gate-status:queued,gate:exiled-tier5:1')")")")" "rebase-fail"
+R=$(run_select "$(arr "$(mk exiled 9000 P4:task "$EX_OLD")" "$(mk dano 60 P0:bug+dano)")")
+order_is "the bounded exile-overdue admission is still ahead of the order" "$R" "exiled,dano"
+eq "a rebase-fail marker is not reported as 'label ignored' (its class is not about the label)" "$(sel_ignored "$(run_select "$(arr "$(mk d_broken 9000 P1:bug+dano 'gate-status:queued,gate:exiled-tier5:1')" "$(mk fine 10 P4:task)")")")" ""
+
+echo "── A26. under set -euo pipefail, with the exception in play, the block still selects and returns 0 ──"
+STRICT_FIX=$(arr "$(mk s1 500 P0:feature)" "$(mk s2 100 P0:bug+dano)" "$(mk s3 50 P1:bug+dano)" "$(mk s4 50 P0:bug+danox)")
+eq "dano bug selected, rc 0" "$(strict_select | tr '\n' ' ')" "s2 rc=0 "
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Part B — the enrichment (Step 0b-1): batched, cross-store, three-state
 # ═══════════════════════════════════════════════════════════════════════════
 echo "── B0. the enrichment block exists ──"
@@ -292,8 +390,20 @@ STUB
   }
   cls() { printf '%s' "$1" | jq -c --arg id "$2" '.[] | select(.id == $id) | .src_class | {state, priority, type}'; }
 
-  printf '[{"id":"ga-hq1","priority":2,"issue_type":"bug"},{"id":"ga-hq2","priority":0,"issue_type":"feature"}]' > "$WORK/stub/city.json"
-  printf '[{"id":"wa-1","priority":1,"issue_type":"task"},{"id":"wa-2","priority":0,"issue_type":"feature"},{"id":"wa-3","issue_type":"chore"},{"id":"wa-4","priority":null,"issue_type":"task"}]' > "$WORK/stub/wa.json"
+  # ga-emgkvn: the wa-d* / ga-hq3 beads carry the label shapes of B12-B17. bd OMITS the `labels` key for a
+  # bead that has none (measured 14/14 on the live bd) — wa-d2 is that shape, and it is a normal "no labels".
+  printf '[{"id":"ga-hq1","priority":2,"issue_type":"bug"},{"id":"ga-hq2","priority":0,"issue_type":"feature"},{"id":"ga-hq3","priority":0,"issue_type":"bug","labels":["area:gate","impacto:dano-ao-vivo"]}]' > "$WORK/stub/city.json"
+  printf '%s' '[{"id":"wa-1","priority":1,"issue_type":"task"},{"id":"wa-2","priority":0,"issue_type":"feature"},{"id":"wa-3","issue_type":"chore"},{"id":"wa-4","priority":null,"issue_type":"task"},
+    {"id":"wa-d1","priority":0,"issue_type":"bug","labels":["x","impacto:dano-ao-vivo"]},
+    {"id":"wa-d2","priority":0,"issue_type":"bug"},
+    {"id":"wa-d3","priority":0,"issue_type":"bug","labels":["impacto:dano-ao-vivo2","x:impacto:dano-ao-vivo"]},
+    {"id":"wa-d4","priority":0,"issue_type":"bug","labels":"impacto:dano-ao-vivo"},
+    {"id":"wa-d5","priority":0,"issue_type":"bug","labels":null},
+    {"id":"wa-d6","priority":0,"issue_type":"bug","labels":["impacto:dano-ao-vivo",7]},
+    {"id":"wa-d7","priority":1,"issue_type":"bug","labels":["impacto:dano-ao-vivo"]},
+    {"id":"wa-d8","priority":0,"issue_type":"feature","labels":["impacto:dano-ao-vivo"]},
+    {"id":"wa-d9","priority":0,"issue_type":"bug","labels":[]},
+    {"id":"wa-d10","priority":0,"issue_type":"bug","labels":["Impacto:Dano-ao-Vivo"]}]' > "$WORK/stub/wa.json"
 
   echo "── B1. one batched read per store — not one per marker (the N+1 the bead warns about) ──"
   IN=$(arr "$(mkq m1 wa-1 whatsapp_automation)" "$(mkq m2 wa-2 whatsapp_automation)" "$(mkq m3 ga-hq1 gascity)" "$(mkq m4 ga-hq2 gascity)" "$(mkq m5 wa-3 whatsapp_automation label)")
@@ -373,6 +483,67 @@ STUB
   OUT=$(run_enrich "$IN")
   R=$(run_select "$OUT")
   order_is "P0 features first (oldest-first ties by id), then P1, P2, and the unreadable last" "$R" "m2,m4,m1,m3,m7"
+
+  # ── ga-emgkvn: the source bead's labels ──────────────────────────────────────
+  dano_of() { printf '%s' "$1" | jq -r --arg id "$2" '.[] | select(.id == $id) | (.src_class | if has("dano") then (.dano | tostring) else "absent" end)'; }
+
+  echo "── B12. the label verdict, per source bead: have it / do not have it / could not read the labels ──"
+  OUT=$(run_enrich "$(arr \
+    "$(mkq e1 wa-d1 whatsapp_automation)" "$(mkq e2 wa-d2 whatsapp_automation)" "$(mkq e3 wa-d3 whatsapp_automation)" \
+    "$(mkq e4 wa-d4 whatsapp_automation)" "$(mkq e5 wa-d5 whatsapp_automation)" "$(mkq e6 wa-d6 whatsapp_automation)" \
+    "$(mkq e9 wa-d9 whatsapp_automation)" "$(mkq e10 wa-d10 whatsapp_automation)" "$(mkq e11 ga-hq3 gascity)" "$(mkq e12 ga-hq1 gascity)")")
+  eq "the label among others -> yes"                          "$(dano_of "$OUT" e1)"  "yes"
+  eq "an HQ source bead carries it too -> yes"                "$(dano_of "$OUT" e11)" "yes"
+  eq "no labels key at all (bd omits it for a label-less bead) -> no, NOT unreadable" "$(dano_of "$OUT" e2)" "no"
+  eq "an empty labels array -> no"                            "$(dano_of "$OUT" e9)"  "no"
+  eq "a bead of another kind with no such label -> no"        "$(dano_of "$OUT" e12)" "no"
+  eq "only a near miss (…-ao-vivo2, a prefix) -> no: exact match"   "$(dano_of "$OUT" e3)"  "no"
+  eq "different case -> no: exact match"                      "$(dano_of "$OUT" e10)" "no"
+  eq "labels is a string, not a list -> unreadable (not 'no', not 'yes')" "$(dano_of "$OUT" e4)" "unreadable"
+  eq "labels is null -> unreadable"                           "$(dano_of "$OUT" e5)"  "unreadable"
+  eq "a list with a non-string element -> unreadable"         "$(dano_of "$OUT" e6)"  "unreadable"
+  eq "priority/type of those records are still carried"       "$(cls "$OUT" e4)" '{"state":"ok","priority":0,"type":"bug"}'
+
+  echo "── B13. a source bead that could not be read at all has no label verdict either (the state says it) ──"
+  OUT=$(run_enrich "$(arr "$(mkq g1 wa-ghost whatsapp_automation)")")
+  eq "unreadable source: no dano key" "$(dano_of "$OUT" g1)" "absent"
+
+  echo "── B14. the labels cost no extra read: still one batched call per store ──"
+  OUT=$(run_enrich "$(arr "$(mkq h1 wa-d1 whatsapp_automation)" "$(mkq h2 wa-d7 whatsapp_automation)" "$(mkq h3 ga-hq3 gascity)" "$(mkq h4 ga-hq1 gascity)")")
+  eq "4 markers over 2 stores -> 2 reads" "$(wc -l < "$WORK/stub.log" | tr -d ' ')" "2"
+
+  echo "── B15. visibility: unreadable labels are WARNed (with the ids); a clean read stays quiet; the log counts the label ──"
+  run_enrich "$(arr "$(mkq w1 wa-d4 whatsapp_automation)" "$(mkq w2 wa-d6 whatsapp_automation)" "$(mkq w3 wa-d1 whatsapp_automation)")" >/dev/null
+  has "$WORK/enrich.err" 'WARN.*ga-emgkvn.*labels UNREADABLE for 2 of 3 queued marker' "WARN counts the markers whose source labels could not be read (2 of 3)"
+  has "$WORK/enrich.err" 'WARN.*ga-emgkvn.*never promoted.*ids: w1,w2\)' "...says they are never promoted, and names them"
+  hasnt "$WORK/enrich.err" 'WARN.*ga-emgkvn.*w3' "...and does not name the one that was read fine"
+  has "$WORK/enrich.err" 'LOG.*1 carry impacto:dano-ao-vivo' "the sweep log counts the markers whose source bead carries the label"
+  run_enrich "$(arr "$(mkq q1 wa-d1 whatsapp_automation)" "$(mkq q2 wa-d2 whatsapp_automation)" "$(mkq q3 ga-hq1 gascity)")" >/dev/null
+  hasnt "$WORK/enrich.err" 'WARN.*ga-emgkvn' "no WARN when every label list was readable (absent key included)"
+  run_enrich "$(arr "$(mkq q1 wa-ghost whatsapp_automation)")" >/dev/null
+  hasnt "$WORK/enrich.err" 'WARN.*ga-emgkvn' "an unreadable SOURCE is already WARNed about by its own line — no second, misleading 'labels' warning"
+
+  echo "── B16. end to end through the real selection: the label promotes a P0 bug, nothing else ──"
+  # every mkq marker has the same created_at, so classes decide and the id breaks ties inside a class
+  IN=$(arr \
+    "$(mkq m_x wa-ghost whatsapp_automation)" \
+    "$(mkq m_p1 wa-d7 whatsapp_automation)" \
+    "$(mkq m_u wa-d4 whatsapp_automation)" \
+    "$(mkq m_g wa-d8 whatsapp_automation)" \
+    "$(mkq m_f wa-2 whatsapp_automation)" \
+    "$(mkq m_d2 ga-hq3 gascity)" \
+    "$(mkq m_d1 wa-d1 whatsapp_automation)" \
+    "$(mkq m_n wa-d2 whatsapp_automation)")
+  OUT=$(run_enrich "$IN")
+  R=$(run_select "$OUT")
+  order_is "dano bugs (HQ and rig) -> P0 features -> other P0 (no label, unreadable labels) -> P1 -> unreadable source" "$R" "m_d1,m_d2,m_f,m_g,m_n,m_u,m_p1,m_x"
+  eq "classes" "$(sel_summ "$R")" "m_d1[P0/dano-ao-vivo] m_d2[P0/dano-ao-vivo] m_f[P0/feature] m_g[P0/feature] m_n[P0/other] m_u[P0/other] m_p1[P1/other] m_x[unreadable]"
+  eq "the label on a P0 feature and on a P1 bug is reported as ignored; unreadable labels are not 'ignored'" "$(sel_ignored "$R")" "m_g,m_p1"
+
+  echo "── B17. the enrichment with labels survives set -euo pipefail, on a clean read and on unreadable labels ──"
+  OUT=$(run_enrich_strict "$(arr "$(mkq t1 wa-d1 whatsapp_automation)" "$(mkq t2 wa-d4 whatsapp_automation)" "$(mkq t3 wa-d2 whatsapp_automation)")")
+  eq "verdicts under strict mode" "$(printf '%s' "$OUT" | jq -c '[.[].src_class.dano]')" '["yes","unreadable","no"]'
+  has "$WORK/enrich-strict.err" '^rc=0$' "returned 0 under strict mode with unreadable labels"
 fi
 
 echo ""

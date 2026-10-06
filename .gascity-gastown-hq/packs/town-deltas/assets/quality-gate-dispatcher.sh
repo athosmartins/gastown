@@ -13113,7 +13113,24 @@ fi
 # priority edited mid-queue reaches the order within a sweep or two, which is all it
 # needs. Replaces the Step 0b-0 per-marker `git diff --numstat` (ga-r8u92), whose only
 # consumer was the smallest-diff tiers this change removes.
+#
+# ga-emgkvn (Athos, 2026-10-06 22:29, thread of ga-9t9acg): the same read also carries the
+# source bead's LABELS, as one verdict on `impacto:dano-ao-vivo` (a customer is being hurt
+# right now) — `src_class.dano`, with three values that must never collapse into two:
+#   "yes"         the labels were read and the label is among them
+#   "no"          the labels were read and it is not (bd OMITS the `labels` key for a bead
+#                 that has none — measured 14/14 on the live bd — so an absent key is "no")
+#   "unreadable"  the labels are there but are not a list of strings (null, a string, an
+#                 object, a list holding a non-string): we cannot tell. The selection block
+#                 treats it as WITHOUT the label (no promotion, the inert state) and the
+#                 enrichment WARNs with the ids, so "could not tell" is never mistaken for
+#                 "no" in silence.
+# The verdict is only an annotation: whether it PROMOTES is decided by the selection block,
+# which re-checks priority 0 and type bug itself. The match is the exact string — a near
+# miss or another case is "no". The label name is a constant, not a knob: a typo in an env
+# override would switch the exception off with no signal.
 # SELFTEST-EXTRACT gate-src-class: BEGIN
+GATE_DANO_LABEL="impacto:dano-ao-vivo"
 GATE_SRC_CLASS_TTL="${GATE_SRC_CLASS_TTL:-60}"
 case "$GATE_SRC_CLASS_TTL" in ''|*[!0-9]*) GATE_SRC_CLASS_TTL=60 ;; esac
 GATE_SRC_SHOW_SCRIPT="${GATE_SRC_SHOW_SCRIPT:-$GC_CITY/scripts/bd-list-cached.sh}"
@@ -13147,7 +13164,7 @@ _gate_src_rig_list() {
 }
 
 # gate_src_class_read_store <store> <bead-id>... — stdout: a JSON array of
-# {id, priority, type} for the requested ids that came back as records; rc 1 and
+# {id, priority, type, dano} for the requested ids that came back as records; rc 1 and
 # nothing on stdout when the READ failed or came back as something other than a list
 # of records (store down, error object, junk). A requested id that is merely absent
 # from a good answer is not an error here — bd answers a partial miss with rc 0 and
@@ -13158,22 +13175,30 @@ gate_src_class_read_store() {
   shift
   out=$(BD_CACHE_TTL="$GATE_SRC_CLASS_TTL" bash "$GATE_SRC_SHOW_SCRIPT" -C "$store" show "$@" --json 2>/dev/null) || return 1
   want=$(printf '%s\n' "$@" | jq -R . | jq -sc .) || return 1
-  printf '%s' "$out" | jq -ce --argjson want "$want" '
+  printf '%s' "$out" | jq -ce --argjson want "$want" --arg lbl "$GATE_DANO_LABEL" '
+    # The verdict on the labels of ONE record (ga-emgkvn) — the three values are in the header above.
+    def dano_verdict:
+      if has("labels") | not then "no"
+      elif ((.labels | type) != "array") or ((.labels | all(type == "string")) | not) then "unreadable"
+      elif (.labels | index($lbl)) != null then "yes"
+      else "no" end;
     if type == "array" then
       [ .[] | select(type == "object" and (.id | type == "string") and (.id as $i | ($want | index($i)) != null))
-            | {id: .id, priority: (.priority? // null), type: (.issue_type? // null)} ]
+            | {id: .id, priority: (.priority? // null), type: (.issue_type? // null), dano: dano_verdict} ]
     else error("not a list of records") end' 2>/dev/null
 }
 
 # gate_src_class_apply <markers-json> <records-object> — pure: markers + `.src_class`.
-# <records-object> is {bead-id: {priority, type}} for the beads that were READ; a
-# marker whose bead is not in it is "unreadable", whatever the reason.
+# <records-object> is {bead-id: {priority, type, dano}} for the beads that were READ; a
+# marker whose bead is not in it is "unreadable", whatever the reason. A record that
+# arrives without a label verdict has dano "unreadable" — "no verdict" is "cannot tell",
+# never "no".
 gate_src_class_apply() {
   printf '%s' "$1" | jq -c --argjson rec "$2" "$_GATE_SRC_JQ_DEFS"'
     map( src_bead as $b
        | . + { src_class: (
            if $b == "" then {state: "unreadable", why: "no-source-bead"}
-           elif ($rec[$b] // null) != null then {state: "ok", bead: $b, priority: $rec[$b].priority, type: $rec[$b].type}
+           elif ($rec[$b] // null) != null then {state: "ok", bead: $b, priority: $rec[$b].priority, type: $rec[$b].type, dano: ($rec[$b].dano // "unreadable")}
            else {state: "unreadable", bead: $b, why: "not-read"} end) } )'
 }
 
@@ -13183,7 +13208,7 @@ gate_src_class_apply() {
 # degrades the order to oldest-first, never aborts the sweep). Always rc 0. Progress
 # goes to stderr: stdout is the JSON.
 gate_src_class_enrich() {
-  local markers="$1" t0 rigs plan pending records pass stores store ids found n unread nreads=0 nfail=0 out _gsc_next
+  local markers="$1" t0 rigs plan pending records pass stores store ids found n unread ndano nlbl nreads=0 nfail=0 out _gsc_next
   t0=$(date +%s)
   rigs=$(_gate_src_rig_list)
   [ -n "$rigs" ] || rigs="null"
@@ -13218,7 +13243,7 @@ gate_src_class_enrich() {
       # gate_diff_size_map_accumulate's history, ga-r8u92), and here it would have
       # wiped every record read so far.
       if found=$(gate_src_class_read_store "$store" $ids); then
-        if _gsc_next=$(printf '%s' "$records" | jq -c --argjson f "$found" '. + ($f | map({(.id): {priority: .priority, type: .type}}) | add // {})' 2>/dev/null); then
+        if _gsc_next=$(printf '%s' "$records" | jq -c --argjson f "$found" '. + ($f | map({(.id): {priority: .priority, type: .type, dano: .dano}}) | add // {})' 2>/dev/null); then
           records="$_gsc_next"
           if _gsc_next=$(printf '%s' "$pending" | jq -c --argjson f "$found" '($f | map(.id)) as $got | map(select(.bead as $b | ($got | index($b)) == null))' 2>/dev/null); then
             pending="$_gsc_next"
@@ -13242,9 +13267,16 @@ EOF
   fi
   n=$(printf '%s' "$out" | jq 'length' 2>/dev/null || echo "?")
   unread=$(printf '%s' "$out" | jq '[.[] | select((.src_class.state // "") != "ok")] | length' 2>/dev/null || echo "?")
-  log "Step 0b-1 (ga-q8tj7p): source-bead class of $n queued marker(s): $unread unreadable, $nreads store read(s) ($nfail failed), $(( $(date +%s) - t0 ))s." >&2
+  # ga-emgkvn: how many source beads carry the label, and for how many the labels could not be read.
+  # A record that was read but has no verdict at all counts as unreadable, like apply does.
+  ndano=$(printf '%s' "$out" | jq '[.[] | select((.src_class.dano // "") == "yes")] | length' 2>/dev/null || echo "?")
+  nlbl=$(printf '%s' "$out" | jq '[.[] | select((.src_class.state // "") == "ok" and ((.src_class.dano // "unreadable") == "unreadable"))] | length' 2>/dev/null || echo "?")
+  log "Step 0b-1 (ga-q8tj7p): source-bead class of $n queued marker(s): $unread unreadable, $ndano carry $GATE_DANO_LABEL, $nreads store read(s) ($nfail failed), $(( $(date +%s) - t0 ))s." >&2
   if [ "$unread" != "0" ]; then
     warn "Step 0b-1 (ga-q8tj7p): source class UNREADABLE for $unread of $n queued marker(s) — they sort after every readable class and are never treated as P0 (ids: $(printf '%s' "$out" | jq -r '[.[] | select((.src_class.state // "") != "ok") | .id] | join(",")' 2>/dev/null))." >&2
+  fi
+  if [ "$nlbl" != "0" ]; then
+    warn "Step 0b-1 (ga-emgkvn): source bead labels UNREADABLE for $nlbl of $n queued marker(s) — $GATE_DANO_LABEL is treated as ABSENT for them, so they are never promoted (ids: $(printf '%s' "$out" | jq -r '[.[] | select((.src_class.state // "") == "ok" and ((.src_class.dano // "unreadable") == "unreadable")) | .id] | join(",")' 2>/dev/null))." >&2
   fi
   printf '%s' "$out"
   return 0
@@ -13264,7 +13296,11 @@ fi
 #      GATE_EXILE_OVERDUE_SECONDS and whose retry budget is not spent (ga-0ye7ar,
 #      ga-r5dsgp). Oldest first. See the comment above for why it survives.
 #   2. every other healthy marker whose source bead was READ, by
-#      [priority 0-4, feature before the rest, marker age oldest-first, id].
+#      [priority 0-4, class, marker age oldest-first, id] with class
+#      dano-ao-vivo (0) < feature (1) < the rest (2). dano-ao-vivo is the ONE exception
+#      to "priority > feature > age" (ga-emgkvn, Athos 2026-10-06): a P0 bug whose
+#      source bead carries impacto:dano-ao-vivo. It exists inside P0 only, so P1 and
+#      below keep the plain feature-first order.
 #   3. healthy markers whose source bead could NOT be read, oldest first — after
 #      every readable class (never P0, never dropped), before rebase-fail.
 #   4. rebase-fail markers (all authors), the back of the queue (ga-q3ig2).
@@ -13359,22 +13395,40 @@ MARKER_ORDER_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c \
   # stays 0: the test is on the TYPE, not on truthiness.
   def src_priority: (.src_class.priority) as $p | if (($p | type) == "number" and $p >= 0 and $p <= 4 and $p == ($p | floor)) then $p else 2 end;
   def is_feature: (.src_class.type // "") == "feature";
+  # ga-emgkvn: "damage happening to a customer right now". The enrichment only ANNOTATES
+  # (src_class.dano: "yes" | "no" | "unreadable"); this is where it is decided, from
+  # what is READ here: the source bead was read (src_ok), its priority is a real 0 (an
+  # invalid priority already reads as P2 above, so 0 is never a default), its type is
+  # exactly "bug" (same exact match as is_feature), and the verdict is exactly "yes".
+  # "unreadable", a missing verdict, "true", true: none of them promotes — "could not
+  # tell" is the inert state. On anything but a P0 bug the label is ignored, and
+  # dano_ignored (below) marks those markers so the sweep log can say so.
+  def src_dano_label: ((.src_class // {}) | (if type == "object" then .dano else null end)) == "yes";
+  def is_dano: src_ok and (src_priority == 0) and ((.src_class.type // "") == "bug") and src_dano_label;
+  def order_class: if is_dano then 0 elif is_feature then 1 else 2 end;
   # Age of the SUBMISSION to the gate, oldest-first. A null/malformed created_at is an
   # UNKNOWN age: it must sort LAST within its class, not first as epoch 0 would.
   def created_key: try (.created_at | fromdateiso8601) catch 99999999999;
   def class_label:
     if has_rebase_fail then (if exile_overdue then "exile-overdue" else "rebase-fail" end)
-    elif src_ok then "P\(src_priority)/\(if is_feature then "feature" else "other" end)"
+    elif src_ok then (if is_dano then "P0/dano-ao-vivo" else "P\(src_priority)/\(if is_feature then "feature" else "other" end)" end)
     else "unreadable" end;
+  # The label sits on the source bead of a healthy, readable marker but did not promote it (not a P0 bug).
+  # A rebase-fail marker is left out: its position is about its branch, not about the label.
+  def dano_ignored: (has_rebase_fail | not) and src_ok and src_dano_label and (is_dano | not);
   # `as $live` rather than a leading pipe: the cooldown filter feeds every tier below.
   map(select(in_retry_cooldown | not)) as $live
   | ( [$live[] | select(has_rebase_fail and exile_overdue)]                  | sort_by([created_key, (.id | tostring)]) )
-  + ( [$live[] | select((has_rebase_fail | not) and src_ok)]                 | sort_by([src_priority, (if is_feature then 0 else 1 end), created_key, (.id | tostring)]) )
+  + ( [$live[] | select((has_rebase_fail | not) and src_ok)]                 | sort_by([src_priority, order_class, created_key, (.id | tostring)]) )
   + ( [$live[] | select((has_rebase_fail | not) and (src_ok | not))]         | sort_by([created_key, (.id | tostring)]) )
   + ( [$live[] | select(has_rebase_fail and (exile_overdue | not))]          | sort_by(.created_at) | reverse )
-  | map(. + {gate_order_class: class_label})')
+  | map(. + {gate_order_class: class_label, gate_dano_ignored: dano_ignored})')
 MARKER=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq '.[0]')
 MARKER_CLASS=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '.[0].gate_order_class // empty')
+# ga-emgkvn: the markers (queue order, comma-joined) whose source bead carries
+# impacto:dano-ao-vivo but which are not a P0 bug, so the label did nothing for them.
+# Informational only — it never changes the order — so a failed read leaves it empty.
+MARKER_DANO_IGNORED=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '[.[] | select(.gate_dano_ignored == true) | .id] | join(",")' 2>/dev/null || echo "")
 # The head of the order with each marker's class — what the "Selected" log line below
 # prints, so a hand-computed order over the live queue can be checked against it.
 MARKER_ORDER_SUMMARY=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '(length) as $n | ([.[0:8][] | "\(.id)[\(.gate_order_class)]"] | join(" ")) + (if $n > 8 then " (+\($n - 8) more)" else "" end)')
@@ -13407,7 +13461,10 @@ fi
 # of the order, so the choice can be checked by hand against the live queue. This is
 # a separate line from "Attempting to claim marker" on purpose: gate-recovery-watchdog
 # parses that line's exact shape.
-log "Selected $MARKER_ID class=$MARKER_CLASS (order: priority > feature > age, ga-q8tj7p) of $COUNT queued: $MARKER_ORDER_SUMMARY"
+log "Selected $MARKER_ID class=$MARKER_CLASS (order: priority > feature > age, except P0 bug + impacto:dano-ao-vivo first; ga-q8tj7p, ga-emgkvn) of $COUNT queued: $MARKER_ORDER_SUMMARY"
+if [ -n "${MARKER_DANO_IGNORED:-}" ]; then
+  log "NOTE: label impacto:dano-ao-vivo IGNORED on queued marker(s) whose source bead is not a P0 bug (it only counts on a P0 bug, ga-emgkvn): $MARKER_DANO_IGNORED"
+fi
 if [ "${MARKER_PRIORITY_LABEL_COUNT:-0}" != "0" ]; then
   log "NOTE: $MARKER_PRIORITY_LABEL_COUNT queued marker(s) still carry the gate:priority label — it has no effect on the order since ga-q8tj7p; the source bead's priority field decides."
 fi

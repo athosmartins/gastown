@@ -259,6 +259,34 @@ conselhos: cada uma tem um caso que a produziu.
    senão herda o mesmo ponto cego. Prefira **detection-only**: um guard que repara
    sem conseguir distinguir "perdido" de "em transição legítima" quebra coisa boa.
 
+{{/* td:core:dano-ao-vivo */ -}}
+### Dano ao vivo — como marcar um bug que fura a fila (ga-emgkvn)
+
+A ordem do gate é **prioridade > feature > idade** (todas as P0 feature, depois as
+P0 que não são feature, depois P1...). Há **uma única exceção**, decisão do Athos em
+06/10 (resposta "Bug com dano ao vivo primeiro" ao AskUserQuestion do Mayor, citada no
+comentário do Mayor em ga-9t9acg, 2026-10-06T22:29:01Z): um **bug P0 com o label
+`impacto:dano-ao-vivo`** passa na frente das P0 feature. Hoje **só o gate**
+(`quality-gate-dispatcher.sh`) aplica a exceção. A lib única de ordenação
+(`work-order.sh`, ga-9t9acg.1, ainda em gate) **não a tem**: o porte da regra para a lib
+é um bead próprio, bloqueado pelo merge do ga-9t9acg.1 — até ele fechar, os outros
+estágios do painel seguem a ordem sem a exceção.
+
+**Quem detecta dano ao cliente EM CURSO (agora, não "pode acontecer") faz duas coisas
+no bead-fonte:** `bd label add <id> impacto:dano-ao-vivo` **e um comentário com a
+EVIDÊNCIA** que um terceiro confere sem acreditar em você — o que está quebrado, quem
+está sendo afetado, desde quando, e o comando/log/id que mostra. **O gate NÃO lê o
+comentário: o label sozinho já promove.** Por isso a evidência é o que deixa um humano
+auditar depois; quem vir o label sem ela deve tirá-lo e dizer por quê. A mudança chega
+à ordem em até ~1-2 sweeps do gate (a leitura do bead-fonte tem cache de 60 s).
+
+O label só conta num **bug P0** (`issue_type=bug`, `priority=0`). Em P1 ou abaixo, ou
+em feature/task, ele é **ignorado** (o gate registra a linha `NOTE: label
+impacto:dano-ao-vivo IGNORED`) — se o dano é real, o bead precisa ser P0 **e** bug.
+Se as labels do bead-fonte não puderem ser lidas, vale **sem** o label (nunca
+promove) e o gate dá `WARN`. Não use pra "urgente" em geral: o que não é dano a
+cliente agora segue a ordem normal.
+
 {{/* td:core:models */ -}}
 ### Modelos atuais (Opus 5.5 / Sonnet 5) — o que o guia oficial muda no seu trabalho (ga-ttwzqd)
 
