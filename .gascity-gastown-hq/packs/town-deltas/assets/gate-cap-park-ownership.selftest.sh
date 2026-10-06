@@ -71,6 +71,9 @@ bd() {                       # bd -C <city> <verb> ...
     comment) printf '%s\n--8<--\n' "$5" >>"$FAKE_COMMENTS" ;;
     show)
       [ "$FAKE_SHOW_FAIL" = "1" ] && return 1
+      # rc 0 but an error ENVELOPE instead of a bead (what a degraded bd/Dolt can hand back)
+      [ "$FAKE_SHOW_FAIL" = "envelope" ] && { printf '{"error":"no issue found"}\n'; return 0; }
+      [ "$FAKE_SHOW_FAIL" = "notjson" ] && { printf 'Error: dolt unavailable\n'; return 0; }
       printf '[{"id":"%s","assignee":"%s","labels":%s}]\n' "$4" "$(cat "$FAKE_ASSIGNEE")" \
         "$(sort -u "$FAKE_LABELS" | jq -R . | jq -s .)" ;;
   esac
@@ -135,6 +138,16 @@ FAKE_SHOW_FAIL=1 run_cap batista-wa-gadead "" digo-wa
 q="$(cat "$FAKE_COMMENTS")"
 case "$q" in *UNVERIFIED*) ok "S6 comment reports UNVERIFIED when the re-read failed" ;; *) bad "S6 comment must say UNVERIFIED on a failed re-read, got: $q" ;; esac
 case "$q" in *"next-action:mayor=MISSING"*) bad "S6 a READ failure was published as a WRITE failure (MISSING)" ;; *) ok "S6 read failure not reported as MISSING" ;; esac
+FAKE_SHOW_FAIL=0
+for mode in envelope notjson; do
+  for who in "batista-wa-gadead||" "digo-wa||digo-wa"; do   # dead author (clear arm) and live crew (keep arm)
+    a="${who%%|*}"; rest="${who#*|}"; live="${rest#*|}"
+    FAKE_SHOW_FAIL=$mode run_cap "$a" "" $live
+    q="$(cat "$FAKE_COMMENTS")"
+    case "$q" in *UNVERIFIED*) ok "S6 [$mode/$a] 200-with-garbage read reported UNVERIFIED" ;; *) bad "S6 [$mode/$a] garbage read must be UNVERIFIED, got: $q" ;; esac
+    case "$q" in *"did not stick"*|*"=MISSING"*) bad "S6 [$mode/$a] a READ failure was published as a WRITE failure" ;; *) ok "S6 [$mode/$a] not blamed on the write" ;; esac
+  done
+done
 FAKE_SHOW_FAIL=0
 
 echo "-- S7: gate:needs-human already on the bead — no second mayor/author page (existing once-only contract) --"

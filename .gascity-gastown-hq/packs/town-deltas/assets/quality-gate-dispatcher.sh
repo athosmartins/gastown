@@ -10081,6 +10081,12 @@ $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
       _CAP_VERIFY_OK=1
       _CAP_VERIFY_JSON=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _CAP_VERIFY_OK=0
       [ -n "$_CAP_VERIFY_JSON" ] || _CAP_VERIFY_OK=0
+      # rc 0 is not proof of a bead: an error envelope ({"error":...}) parses as JSON but carries no
+      # .id, and its empty .assignee would read as "the write did not stick" — a failed READ
+      # published as a failed WRITE. Only a payload that IS a bead is allowed to speak for the bead.
+      if [ "$_CAP_VERIFY_OK" = "1" ] && ! printf '%s' "$_CAP_VERIFY_JSON" | jq -e 'if type=="array" then .[0] else . end | (.id // "") != ""' >/dev/null 2>&1; then
+        _CAP_VERIFY_OK=0
+      fi
       if [ "$_CAP_VERIFY_OK" = "0" ]; then
         _CAP_OBS="assignee=UNVERIFIED, next-action:mayor=UNVERIFIED (post-write read failed — state unknown, NOT a claim that the write failed)"
       else
