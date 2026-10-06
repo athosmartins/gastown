@@ -29,7 +29,7 @@
 #      a stub that never truncates would let every assertion above pass vacuously.
 #      (No `git show HEAD` self-certification: at any committed state HEAD is the
 #      fix, so that comparison cannot be observed — see the sibling
-#      gate-priority-starvation-ceiling.selftest.sh header.)
+#      gate-q8tj7p-queue-order.selftest.sh header.)
 #   Also: the read-cache shim keys on the full argv, so --limit 0 and no --limit
 #   never share a cache slot.
 #

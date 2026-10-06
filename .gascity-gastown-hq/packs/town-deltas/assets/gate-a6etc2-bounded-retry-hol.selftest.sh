@@ -90,18 +90,19 @@ select_marker() {
   local cnt="${SEL_COUNT:-$(printf '%s' "$1" | jq 'length')}"
   MARKERS_JSON="$1" COUNT="$cnt" \
   GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW" \
-  GATE_MARKER_AGE_PROMOTE_SECONDS=999999999 \
-  GATE_MARKER_HARD_AGE_SECONDS=999999999 \
   GATE_EXILE_OVERDUE_SECONDS=5400 \
   GATE_EXILE_RETRY_CEILING=3 \
   bash -c 'log() { echo "LOG:$*"; }; warn() { echo "WARN:$*"; }; '"$SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null
 }
 # mk <id> <age-seconds> <extra-labels-csv>  — a queued marker created <age> ago.
+# ga-q8tj7p: every marker carries the same READ source class (P2 task), so between healthy
+# markers only age decides (oldest first); without `.src_class` a marker reads as
+# "unreadable", which is a different — and also oldest-first — tier.
 mk() {
   local id="$1" age="$2" extra="${3:-}" labs='"gate-status:queued","type:quality-gate-marker"'
   local l; local IFS=','
   for l in $extra; do [ -n "$l" ] && labs="$labs,\"$l\""; done
-  printf '{"id":"%s","created_at":"%s","description":"branch: crew/wa-worker/%s","labels":[%s]}' \
+  printf '{"id":"%s","created_at":"%s","description":"branch: crew/wa-worker/%s","labels":[%s],"src_class":{"state":"ok","priority":2,"type":"task"}}' \
     "$id" "$(iso $((NOW - age)))" "$id" "$labs"
 }
 
@@ -142,9 +143,9 @@ case "$SEL" in
   B|C) ok "THE INCIDENT: same A, now inside its retry cooldown -> a healthy marker ($SEL) is claimed instead (fails on the unfixed dispatcher: A wins every sweep)" ;;
   *)   bad "A is inside its cooldown yet the sweep selected '$SEL' (want B or C) — head-of-line blocking is back" ;;
 esac
-[ "$SEL" = "C" ] \
-  && ok "healthy tiers keep their order: newest healthy (C) — cooldown removes A without disturbing the tiebreak" \
-  || bad "expected the newest healthy marker C, got '$SEL'"
+[ "$SEL" = "B" ] \
+  && ok "healthy markers keep their order: oldest healthy (B) within the class (ga-q8tj7p) — cooldown removes A without disturbing it" \
+  || bad "expected the oldest healthy marker B, got '$SEL'"
 
 FIX="[$(mk A 20000 "$A_EXILE,gate:retry-cooldown-until:$((NOW - 1))"),$(mk B 600),$(mk C 300)]"
 SEL="$(select_marker "$FIX")"
@@ -744,8 +745,8 @@ BARE="$(grep -nE '^[[:space:]]*(gate_requeue_respecting_external|gate_retry_cool
 N_CAP=$(grep -c '|| _RQ_RC=\$?  # ga-7fwt1' "$DISPATCHER")
 [ "$N_CAP" = "3" ] \
   && ok "all 3 requeue sites capture the rc (|| _RQ_RC=\$?)" || bad "expected 3 rc-capturing requeue sites, found $N_CAP"
-grep -q 'map(select(in_retry_cooldown | not)) |' "$DISPATCHER" \
-  && ok "selection pre-filters cooldown markers BEFORE the tier sum (every tier, not just tier 1)" \
+grep -q 'map(select(in_retry_cooldown | not)) as \$live' "$DISPATCHER" \
+  && ok "selection pre-filters cooldown markers BEFORE the tiers (every tier, not just the exile-overdue one)" \
   || bad "selection no longer pre-filters in_retry_cooldown"
 grep -q "jq -r '.id // empty')" "$DISPATCHER" \
   && ok "MARKER_ID is read with '.id // empty' (an empty selection is empty, never the string 'null')" \

@@ -4010,8 +4010,8 @@ gate_exile_watchdog_sweep() {
     fi
     case "$since_epoch" in ''|*[!0-9]*) continue ;; esac
     elapsed=$(( now - since_epoch ))
-    # Strict > (not >=), matching house convention (is_aged, ga-ddm76's
-    # is_overdue) — exactly-at-threshold falls through to next sweep, no flakiness.
+    # Strict > (not >=), matching house convention (exile_overdue in the
+    # marker-select block) — exactly-at-threshold falls through to next sweep, no flakiness.
     if [ "$elapsed" -gt "$escalate_after" ]; then
       warn "Marker $marker_id: exile-watchdog escalating after ${elapsed}s in rebase-fail exile with no re-selection (ga-faw5o defeito 3)."
       # gate-review fix (ga-faw5o, gate_run=ga-o67b7): gate:exile-escalated is
@@ -4114,9 +4114,9 @@ EOF_GATE_EXILE_IDS
 #
 # wa-ycyf8: a marker exiled by two TRANSIENT auto-rebase failures ("attempt
 # 2/3") sat 7h with a clean merge-tree the ENTIRE time. Nothing re-checked
-# the cause: the healthy tiers never reach an exiled marker while the queue
-# has anything else queued (has_rebase_fail sinks to the last of the 7
-# tiers in the marker-select block below), and the 24h watchdog is a much
+# the cause: the healthy order never reaches an exiled marker while the queue
+# has anything else queued (has_rebase_fail sinks to the back of the order
+# in the marker-select block below), and the 24h watchdog is a much
 # slower, last-resort backstop, not a same-incident fix. Second time the
 # Mayor had to clear this by hand (wa-llq1a/wa-4zmm1, 11/09).
 #
@@ -4137,8 +4137,8 @@ EOF_GATE_EXILE_IDS
 #
 # Deliberately NOT re-injecting a cleared marker into the caller's copy of
 # $MARKERS_JSON for the marker-select block further below: this sweep's
-# selection still sees it as exiled (tier 7, loses as always behind a
-# non-empty queue) and only rejoins the healthy tiers on the NEXT sweep's
+# selection still sees it as exiled (back of the order, loses as always behind a
+# non-empty queue) and only rejoins the healthy order on the NEXT sweep's
 # fresh fetch — matching the Aceite criterion ("volta ao tier normal na
 # proxima varredura"). The cleared ids ARE consumed immediately, though, to
 # keep gate_exile_watchdog_sweep from acting on stale pre-recovery labels
@@ -10410,14 +10410,15 @@ rig_resolve_commit() {
 # gate_measure_diff_lines <default_branch> <branch> — ga-r8u92: total changed-line
 # count (insertions + deletions via --numstat, ignoring binary "-" rows), scoped
 # to the CURRENT git_rig context (caller must have already run
-# gate_resolve_rig_context for the rig this branch belongs to). Shared by the
-# post-selection verdict-timeout scaler (ga-ltr3c, below) and the pre-selection
-# size-aware ordering (ga-r8u92, Step 0b-0) so both read the exact same number
-# instead of two independently-maintained copies of this computation.
+# gate_resolve_rig_context for the rig this branch belongs to). Used by the
+# post-selection verdict-timeout scaler (ga-ltr3c, below). It was also read,
+# before selection, by the smallest-diff-first ordering (ga-r8u92, Step 0b-0);
+# ga-q8tj7p retired that ordering (queue order is priority > feature > age,
+# decided by the source bead, not by diff size), so the scaler is its only caller.
 # FAIL-SAFE: any git/parse failure returns 0 — a real measurement of "no diff"
 # and "could not measure" are NOT distinguished here; a caller that needs to
-# tell them apart (Step 0b-0's unknown-size sentinel) must check
-# gate_resolve_rig_context's own success separately before calling this.
+# tell them apart must check gate_resolve_rig_context's own success
+# separately before calling this.
 gate_measure_diff_lines() {
   local default_branch="$1" branch="$2" n
   n=$(git_rig diff --numstat "origin/${default_branch}...origin/${branch}" 2>/dev/null \
@@ -12753,8 +12754,8 @@ fi
 # ── Step 0b-0 (ga-faw5o defeito 3): rebase-fail exile escalation watchdog ────
 # gate:exiled-tier5 markers only accumulate retry attempts when actually
 # RE-SELECTED (Step 4c below) — but has_rebase_fail sinks a marker to the
-# LAST of 6 tiers (the jq tier selection further down in Step 0b), reachable only when every
-# healthy tier is empty. In a queue that never fully empties, an exiled
+# BACK of the order (the jq selection further down in Step 0b), reachable only when every
+# healthy marker has been served. In a queue that never fully empties, an exiled
 # marker is never re-selected, its attempt counter never reaches
 # MAX_REBASE_ATTEMPTS, and the existing mail-Mayor escalation (Step 4c) never
 # fires — the marker sits exiled indefinitely while the gate otherwise looks
@@ -13020,20 +13021,44 @@ else
   fi
 fi
 
-# QUEUE ORDER: newest-first tiebreak (4cae0a2c49, 2026-06-24 — Athos: gate>
-# execute>refine>create, bugs>stories, desempate=mais novo). Originally this
-# was oldest-first FIFO (ga-zf61i: bd list returns newest-first, and a bare
-# .[0] always grabbed the NEWEST → with ~1 marker/sweep throughput, older
-# markers like iz4a96/ga-mr8ym + 2-day-old pddg18/pqzl9h starved indefinitely).
-# 4cae0a2c49 deliberately flipped that: sort_by(.created_at) | reverse now
-# picks the NEWEST of the no-rebase-fail markers each sweep — an explicit
-# priority policy, not a regression of the ga-zf61i fix.
+# QUEUE ORDER (ga-q8tj7p, 2026-10-06 — Athos, verbatim, AskUserQuestion in the
+# Mayor's session): "A regra deve ser: prioridade > tipo (feature primeiro) > idade.
+# ou seja, primeiro todas p0 feature, começando pelas mais antigas. Depois, todas p0
+# que nao sao feature, começando pelas mais antigas. Depois vai pra p1 revisando as
+# features mais antigas. Quando terminar todas, vai pras p1 que nao sao feature
+# começando pelas mais antigas. Assim por diante."
+#
+# A healthy marker therefore sorts on [priority of its SOURCE BEAD (0-4), feature
+# before everything else, age]. "Age" is the age of the SUBMISSION TO THE GATE (the
+# marker's created_at), not of the source bead: "mais antigas" in a gate queue means
+# "has waited longest here". Priority and type come from the source bead
+# (`source-bead:<id>`, read across rigs by Step 0b-1 below), never from the marker.
+#
+# What this replaced, so nobody reconstructs it from git blame: an emergency tier
+# for anything >90min (priority-blind FIFO — ga-ddm76), a reserved fresh slot every
+# 10 sweeps (ga-vm428), a crew allowlist + the gate:priority label (GATE_PRIORITY_
+# AUTHORS, default oracle), an aged tier, and smallest-diff-first (ga-r8u92).
+# Measured 2026-10-06: 9 of 14 queued markers were >90min old, so the emergency tier
+# swallowed the queue — it was pure FIFO and gate:priority changed nothing (an E11 P0
+# was 9th in line). All of that is gone; the label is now inert (a sweep says so once
+# when a marker still carries it). Consequence, by decision: a low-priority marker
+# has no wait bound while higher classes keep arriving. The sweep logs the head of
+# the order with each marker's class, so a long wait is visible, not silent.
+#
+# KEPT, because each is a different invariant and none contradicts the order:
+#   - a marker inside its retry cooldown (gate:retry-cooldown-until, ga-a6etc2) is
+#     not eligible at all;
+#   - a rebase-fail marker sinks to the BACK (ga-q3ig2, below), whatever its priority;
+#   - the exile-overdue admission (ga-0ye7ar / ga-r5dsgp, below): an exiled marker
+#     whose exile has run past GATE_EXILE_OVERDUE_SECONDS gets its next, already
+#     bounded, retry. Without it the wa-ycyf8 outage (7h, a healthy queue never
+#     emptying) comes back, because strict priority lets a deep queue stay non-empty
+#     for as long as it likes.
 #
 # created_at is IMMUTABLE via `bd label add/remove` — cycling a marker's
 # gate-status:queued label off and on does NOT refresh created_at and CANNOT
-# change its queue rank under this (or any) ordering. A marker starved by the
-# newest-first tiebreak (distinct from the ga-q3ig2 dead-rebase case below)
-# can only regain priority by being closed and replaced with a fresh
+# change its queue rank under this (or any) ordering. A marker that has to lose its
+# age can only do so by being closed and replaced with a fresh
 # type:quality-gate-marker bead cloning its description fields — see
 # docs/gate-marker-recipe.md. (ga-gsh1e / gt-mqkwj — a repair dog burned a
 # full cycle on the label-cycle trick before finding this out the hard way.)
@@ -13049,458 +13074,313 @@ fi
 # = 49min) where one broken branch travou a fila INTEIRA (18 markers), zero
 # merges until manual intervention.
 #
-# Fix: two-tier ordering. Markers with NO prior auto-rebase failure are drained
-# first. Markers that already failed an auto-rebase (they carry a
-# gate:exiled-tier5:N label) sink to the BACK and are only re-attempted when
-# no healthy marker is queued. One broken branch can no longer travar a fila
-# regardless of who re-queues it — the queue drains the healthy markers while the
-# broken one is "tratado à parte" (escalated to needs-rebase by its own bounded
-# retry / gate-health-monitor). Star-guide: gate never idles >15min on 1 stale branch.
+# Fix: markers with NO prior auto-rebase failure are drained first. Markers that
+# already failed an auto-rebase (they carry a gate:exiled-tier5:N label) sink to the
+# BACK and are only re-attempted when no healthy marker is queued. One broken
+# branch can no longer travar a fila regardless of who re-queues it — the queue
+# drains the healthy markers while the broken one is "tratado à parte" (escalated
+# to needs-rebase by its own bounded retry / gate-health-monitor). Star-guide: gate
+# never idles >15min on 1 stale branch. GATE_MARKER_NOW_OVERRIDE_EPOCH is a
+# test-only seam (same convention as GATE_DOLT_LATENCY_OVERRIDE_MS) so selftests can
+# control "now" without depending on the wall clock.
 #
-# ga-vm428 (2026-09-01): RESERVED FRESH SLOT anti-starvation. ga-tgo7q's aging
-# fix below force-promotes an AGED healthy marker AHEAD of every NOT-yet-aged
-# ("fresh") one within its priority class — correct for a short/healthy queue
-# (nothing aged yet -> the fresh/newest-first tiebreak governs, giving recent
-# submissions fast feedback), but under a SUSTAINED backlog there is almost
-# always at least one aged marker sitting in the aged tier, so the fresh tier
-# is structurally never reached: a brand-new submission gets ZERO fast-lane
-# benefit, then once IT ages past GATE_MARKER_AGE_PROMOTE_SECONDS it joins the
-# BACK of the aged FIFO (oldest-first — it is now that tier's youngest member)
-# — worse than doing nothing, because the queue still drains and nothing
-# alarms (ga-faw5o Defeito 2). Fix: reserve one admission slot every
-# GATE_FRESH_SLOT_WINDOW_SWEEPS sweeps (persisted-across-sweeps counter, same
-# convention as SPAWN_ABORT_COUNT_FILE/ga-piscg above) for the single freshest
-# HEALTHY (non-rebase-fail) marker, regardless of age rank or priority class.
-# This is a NEW tier inserted between the overdue-emergency ceiling (which
-# still always wins — that hard-bound guarantee is strictly stronger and must
-# never be pre-empted by this softer, periodic one) and the existing
-# priority/aged cascade (entirely unchanged below). The counter resets to 0
-# the sweep the reservation is offered (GATE_FRESH_SLOT_DUE=true), whether or
-# not an overdue-emergency marker happens to still win that particular sweep
-# — that preemption is bounded by the strictly-stronger hard-ceiling
-# guarantee already, so occasionally spending an offer on a sweep where tier1
-# outranks it is an acceptable, self-bounding cost. When the reservation is
-# not due, the new tier contributes an empty array and every tier below
-# behaves byte-for-byte as before (see gate-fresh-slot-reserve.selftest.sh).
-GATE_FRESH_SLOT_WINDOW_SWEEPS="${GATE_FRESH_SLOT_WINDOW_SWEEPS:-10}"
-case "$GATE_FRESH_SLOT_WINDOW_SWEEPS" in ''|*[!0-9]*) GATE_FRESH_SLOT_WINDOW_SWEEPS=10 ;; esac
-GATE_FRESH_SLOT_COUNT_FILE="${GATE_FRESH_SLOT_COUNT_FILE:-$GC_CITY/.gc/gate-fresh-slot-sweep-count}"
-# Pure decision (no IO, set -e safe) so the selftest can drift-guard it: echo
-# "reserve" iff we have had window-1 (or more) consecutive non-reserved
-# sweeps — i.e. this is at latest the Nth sweep of the window; else "hold". A
-# window of 0 (or malformed) disables the feature entirely (falls back to
-# "hold" forever, exactly today's behaviour).
-gate_fresh_slot_should_reserve() {
-  local sweeps_since_last="$1" window="$2"
-  case "$sweeps_since_last" in ''|*[!0-9]*) sweeps_since_last=0 ;; esac
-  case "$window" in ''|*[!0-9]*) window=10 ;; esac
-  [ "$window" -le 0 ] && { echo "hold"; return 0; }
-  if [ "$sweeps_since_last" -ge "$((window - 1))" ]; then echo "reserve"; else echo "hold"; fi
-}
-_GATE_FRESH_SLOT_PREV_COUNT=$(cat "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || echo 0)
-case "$_GATE_FRESH_SLOT_PREV_COUNT" in ''|*[!0-9]*) _GATE_FRESH_SLOT_PREV_COUNT=0 ;; esac
-GATE_FRESH_SLOT_DUE=false
-if [ "$(gate_fresh_slot_should_reserve "$_GATE_FRESH_SLOT_PREV_COUNT" "$GATE_FRESH_SLOT_WINDOW_SWEEPS")" = "reserve" ]; then
-  GATE_FRESH_SLOT_DUE=true
-  printf '0\n' > "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || true
-else
-  printf '%s\n' "$((_GATE_FRESH_SLOT_PREV_COUNT + 1))" > "$GATE_FRESH_SLOT_COUNT_FILE" 2>/dev/null || true
-fi
-# ga-tgo7q STARVATION-BOUND AGING: the newest-first tiebreak above is Athos's
-# explicit, intended policy — but under continuous submission it can starve an
-# old HEALTHY marker indefinitely (live repro: ga-wisp-7yity6v queued 90+ min
-# while newer healthy markers kept jumping ahead), which also defeats
-# gt-mqkwj's orphan-marker re-queue (created_at is immutable, so a starved
-# marker's rank never improves on its own — see the note above re: the
-# label-cycle trick being a no-op). Fix: within the healthy tier only, split
-# further by age. A healthy marker that has waited longer than
-# GATE_MARKER_AGE_PROMOTE_SECONDS is force-promoted ahead of every not-yet-aged
-# healthy marker (FIFO among the aged set, so the longest-starved always goes
-# first once promoted). This gives every healthy marker a hard wait bound
-# while leaving the newest-first tiebreak untouched for markers still inside
-# the window. Aging does NOT reach into the rebase-fail tier — letting a
-# broken marker age its way back to the front would reintroduce the exact
-# ga-q3ig2 outage class this fix sits next to. GATE_MARKER_NOW_OVERRIDE_EPOCH
-# is a test-only seam (same convention as GATE_DOLT_LATENCY_OVERRIDE_MS) so
-# selftests can control "now" without depending on the wall clock.
+# ── Step 0b-1 (ga-q8tj7p): the source bead's priority and type, for every queued marker ──
+# Selection below orders on the PRIORITY and TYPE of the bead each marker was
+# submitted for. One batched `bd show <id>...` per store, not one per marker: the
+# queue is ~13 markers over 2 stores, and a live `bd show` costs 1-7s under load, so
+# a per-marker read would add tens of seconds to every sweep. Measured on the live
+# bd 2026-10-06: two ids in one call = 0.9s; a partial miss is rc 0 with only the ids
+# found; a total miss is rc 1 with an error OBJECT; and the HQ store does NOT route
+# a `wa-*` id to the whatsapp_automation store (`bd -C <hq> show wa-…` answers "no
+# issues found"), so each bead is read from the store the marker names, then from its
+# id-prefix's store, then HQ.
 #
-# ── Step 0b-0 (ga-r8u92, ga-faw5o defeito 1): pre-selection diff-size read ────
-# Selection below ordered candidates by age+priority only, never by diff size —
-# a 3,000-line diff and a 20-line diff occupied the same concurrency slot for as
-# long as their review took, so one large review could block many small ones
-# behind it for its entire duration (shortest-job-first minimizes mean wait
-# time — a standard scheduling result, not a judgment call). The line-count
-# data already existed in this file (DIFF_LINE_COUNT below, ga-ltr3c) but was
-# computed AFTER selection, for the ALREADY-claimed marker only, purely to
-# scale timeouts — never before, to influence which marker gets claimed. This
-# step hoists an equivalent read to BEFORE selection, for every QUEUED
-# candidate (not just the eventual winner), so the tier pipeline below can fold
-# it into the fresh-tier sort via each marker's new `.diff_lines` field.
+# THREE states, and the dangerous one is the third. Per marker the annotation is
+# `.src_class`: {state:"ok", priority, type} when the bead came back as a record
+# (a record with no usable priority is still "ok" — the selection block reads that as
+# P2, bd's own default, because the bead WAS read and simply carries none), or
+# {state:"unreadable", why} when it did not (no source bead named, not found in any
+# candidate store, store down, unparseable answer). "Unreadable" is NOT "no priority":
+# it sorts after every readable class, never as P0 and never dropped. Priority 0 is
+# kept as 0 — jq's `//` treats only null/false as absent, so `0 // 2` is 0; a
+# `.priority // 2` here would have been safe by luck, an explicit type test is safe by
+# construction.
 #
-# Cost: one `git diff --numstat` per queued marker per sweep. Queue depth is
-# normally small (ga-r8u92's own AC note: the live queue was near-empty, 2
-# markers, when this shipped) — if depth ever grows enough to make this
-# material, that is a fresh optimization bead, not a reason to skip annotating
-# a small queue today.
-#
-# GATE_DIFF_SIZE_ORDERING_ENABLED=0 fully reverts to pre-ga-r8u92 behavior: no
-# marker gets a `.diff_lines` field, so the tier pipeline's `diff_size` def
-# (below, inside the sentinel) falls back to GATE_DIFF_SIZE_UNKNOWN_SENTINEL
-# for every candidate — same value for all of them, so it makes every
-# candidate tie on the new sort's primary key, which collapses to the exact
-# newest-first tiebreak that sort already had (created_epoch is its secondary
-# key, below) — same REVERSIBLE convention as GATE_PRIORITY_AUTHORS="".
-GATE_DIFF_SIZE_ORDERING_ENABLED="${GATE_DIFF_SIZE_ORDERING_ENABLED:-1}"
-GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
-case "$GATE_DIFF_SIZE_ORDERING_ENABLED" in 0) : ;; *) GATE_DIFF_SIZE_ORDERING_ENABLED=1 ;; esac
-case "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" in ''|*[!0-9]*) GATE_DIFF_SIZE_UNKNOWN_SENTINEL=999999999 ;; esac
+# Cost: logged on every sweep (readable/unreadable counts, store reads, seconds).
+# The reads go through the bd-list-cached.sh shim, which publishes only successful
+# answers and fails open to the last good one. GATE_SRC_CLASS_TTL is this call
+# site's own freshness choice (the shim's header says to pick TTL per call site): a
+# priority edited mid-queue reaches the order within a sweep or two, which is all it
+# needs. Replaces the Step 0b-0 per-marker `git diff --numstat` (ga-r8u92), whose only
+# consumer was the smallest-diff tiers this change removes.
+# SELFTEST-EXTRACT gate-src-class: BEGIN
+GATE_SRC_CLASS_TTL="${GATE_SRC_CLASS_TTL:-60}"
+case "$GATE_SRC_CLASS_TTL" in ''|*[!0-9]*) GATE_SRC_CLASS_TTL=60 ;; esac
+GATE_SRC_SHOW_SCRIPT="${GATE_SRC_SHOW_SCRIPT:-$GC_CITY/scripts/bd-list-cached.sh}"
 
-# SELFTEST-EXTRACT diff-size-merge: BEGIN
-# ga-r8u92 gate-feedback (gate_run=ga-k5r6r): the map-accumulate and
-# final-merge steps below used to be inline `VAR=$(jq ...) || VAR="$VAR"`
-# one-liners. That pattern is a no-op "recovery": bash performs the
-# assignment — using the failed jq call's (empty) stdout — BEFORE `||`
-# runs, so the fallback re-assigns the already-corrupted (empty) value onto
-# itself, never the real prior value. One malformed record (e.g. a marker
-# whose `.id` arrives as a JSON number instead of a string, tripping jq's
-# "Cannot index object with number" on the `$sizes[.id]` lookup) could
-# therefore wipe every OTHER marker's annotation too, or empty MARKERS_JSON
-# entirely — indistinguishable downstream from a genuinely empty queue.
-#
-# Both helpers now compute into a throwaway `next` first — reset to empty
-# (not $prior) on failure via `|| next=""`, so success/failure is
-# unambiguous — and only commit it when non-empty; on failure they log and
-# echo the UNCHANGED prior value instead, so one bad marker degrades to
-# "not annotated this sweep" for itself alone (the same degrade path
-# GATE_DIFF_SIZE_ORDERING_ENABLED=0 already provides) instead of
-# corrupting the whole sweep. `next=$(cmd) || next=""` stays safe under
-# this script's `set -euo pipefail`: the `||` always succeeds (a bare
-# assignment never fails), so the compound statement never trips set -e
-# regardless of whether the piped jq call failed.
-gate_diff_size_map_accumulate() {
-  # $1=prior _DIFF_SIZE_MAP  $2=marker id  $3=measured size
-  local prior="$1" id="$2" sz="$3" next
-  next=$(printf '%s' "$prior" | jq -c --arg id "$id" --argjson sz "$sz" '. + {($id): $sz}' 2>/dev/null) || next=""
-  if [ -n "$next" ]; then
-    printf '%s' "$next"
-  else
-    log "  Step 0b-0: failed to record diff size for marker $id (measured value: '$sz') — leaving diff-size map unchanged for this marker." >&2
-    printf '%s' "$prior"
+# jq helpers shared by the plan and the merge, so the two can never disagree about
+# which bead a marker is for. The routing is read the way extract()/label_fallback()
+# read it (description line first, label second) and then VALIDATED: the id goes onto
+# a bd command line, and a marker's text is worker-written, so an id that is not a
+# plain bead id (e.g. "--all") is treated as "no source bead", never passed on.
+_GATE_SRC_JQ_DEFS='
+  def desc_field($k): ((.description // "") | [scan("(?:^|\n)" + $k + ":[ ]*([^\n]*)")] | (.[0] // []) | (.[0] // "") | gsub("^[ \t\r]+|[ \t\r]+$"; ""));
+  def src_bead: (desc_field("bead_id")) as $d
+    | (if $d != "" then $d else ([(.labels // [])[] | select(type == "string" and startswith("source-bead:")) | sub("^source-bead:"; "")] | (.[0] // "")) end)
+    | if test("^[A-Za-z0-9][A-Za-z0-9._-]*$") then . else "" end;
+  def src_rig: (desc_field("bead_rig")) as $d
+    | if ($d != "" and $d != "unknown") then $d else ([(.labels // [])[] | select(type == "string" and startswith("bead-rig:")) | sub("^bead-rig:"; "")] | (.[0] // "")) end;
+'
+
+# The rig registry, memoized per sweep in the same variable gate_resolve_rig_context
+# uses and under its rule: only a fetch that really returned rigs is cached, so a
+# transient `gc` hiccup is retried on the next call instead of poisoning the sweep.
+_gate_src_rig_list() {
+  if [ -z "${_GATE_RIG_LIST_CACHE:-}" ]; then
+    local _gsr_fetch _gsr_count
+    _gsr_fetch=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json) || _gsr_fetch=""
+    _gsr_count=$(printf '%s' "$_gsr_fetch" | jq '.rigs | length' 2>/dev/null || echo "0")
+    case "$_gsr_count" in ''|*[!0-9]*) _gsr_count=0 ;; esac
+    if [ "$_gsr_count" -gt 0 ]; then _GATE_RIG_LIST_CACHE="$_gsr_fetch"; fi
   fi
+  printf '%s' "${_GATE_RIG_LIST_CACHE:-}"
 }
 
-gate_diff_size_map_merge() {
-  # $1=MARKERS_JSON  $2=_DIFF_SIZE_MAP
-  # Also normalizes `.id` via tostring before indexing $sizes: $sizes' own
-  # keys are always strings (built via --arg above), but a marker's `.id`
-  # in MARKERS_JSON could arrive as a JSON number for a malformed record —
-  # jq errors indexing an object with a number, which without this guard
-  # aborts the WHOLE map() partway through (every marker, not just the
-  # malformed one) and, pre-fix, silently emptied MARKERS_JSON for the
-  # entire sweep.
-  local markers="$1" sizes="$2" next
-  next=$(printf '%s\n' "$markers" | jq -c --argjson sizes "$sizes" \
-    'map(. + {diff_lines: ($sizes[(.id | tostring)] // null)})' 2>/dev/null) || next=""
-  if [ -n "$next" ]; then
-    printf '%s' "$next"
-  else
-    log "  Step 0b-0: failed to merge diff-size annotations into MARKERS_JSON — degrading to no-annotation this sweep (same as GATE_DIFF_SIZE_ORDERING_ENABLED=0)." >&2
+# gate_src_class_read_store <store> <bead-id>... — stdout: a JSON array of
+# {id, priority, type} for the requested ids that came back as records; rc 1 and
+# nothing on stdout when the READ failed or came back as something other than a list
+# of records (store down, error object, junk). A requested id that is merely absent
+# from a good answer is not an error here — bd answers a partial miss with rc 0 and
+# only the ids it found, so absence is how "not in this store" arrives, and the
+# caller then tries that bead's next candidate store.
+gate_src_class_read_store() {
+  local store="$1" out want
+  shift
+  out=$(BD_CACHE_TTL="$GATE_SRC_CLASS_TTL" bash "$GATE_SRC_SHOW_SCRIPT" -C "$store" show "$@" --json 2>/dev/null) || return 1
+  want=$(printf '%s\n' "$@" | jq -R . | jq -sc .) || return 1
+  printf '%s' "$out" | jq -ce --argjson want "$want" '
+    if type == "array" then
+      [ .[] | select(type == "object" and (.id | type == "string") and (.id as $i | ($want | index($i)) != null))
+            | {id: .id, priority: (.priority? // null), type: (.issue_type? // null)} ]
+    else error("not a list of records") end' 2>/dev/null
+}
+
+# gate_src_class_apply <markers-json> <records-object> — pure: markers + `.src_class`.
+# <records-object> is {bead-id: {priority, type}} for the beads that were READ; a
+# marker whose bead is not in it is "unreadable", whatever the reason.
+gate_src_class_apply() {
+  printf '%s' "$1" | jq -c --argjson rec "$2" "$_GATE_SRC_JQ_DEFS"'
+    map( src_bead as $b
+       | . + { src_class: (
+           if $b == "" then {state: "unreadable", why: "no-source-bead"}
+           elif ($rec[$b] // null) != null then {state: "ok", bead: $b, priority: $rec[$b].priority, type: $rec[$b].type}
+           else {state: "unreadable", bead: $b, why: "not-read"} end) } )'
+}
+
+# gate_src_class_enrich <markers-json> — stdout: the markers with `.src_class`, or the
+# input UNCHANGED if anything inside this step fails (a marker without `.src_class` is
+# read by the selection block as unreadable — the inert state — so a failure here
+# degrades the order to oldest-first, never aborts the sweep). Always rc 0. Progress
+# goes to stderr: stdout is the JSON.
+gate_src_class_enrich() {
+  local markers="$1" t0 rigs plan pending records pass stores store ids found n unread nreads=0 nfail=0 out _gsc_next
+  t0=$(date +%s)
+  rigs=$(_gate_src_rig_list)
+  [ -n "$rigs" ] || rigs="null"
+  plan=$(printf '%s' "$markers" | jq -c --argjson rigs "$rigs" --arg city "$GC_CITY" "$_GATE_SRC_JQ_DEFS"'
+    def rig_path($n): if ($n == "" or $rigs == null) then empty else ([$rigs.rigs[]? | select(.name == $n or .prefix == $n) | .path] | (.[0] // empty)) end;
+    def uniq_keep: reduce .[] as $x ([]; if (map(. == $x) | any) then . else . + [$x] end);
+    [ .[] | src_bead as $b | select($b != "") | {bead: $b, rig: src_rig} ]
+    | group_by(.bead)
+    | map( .[0].bead as $b
+         | ([.[].rig | select(. != "")] | (.[0] // "")) as $r
+         | {bead: $b, cands: ([rig_path($r), rig_path($b | split("-")[0]), $city] | uniq_keep)} )' 2>/dev/null) || plan=""
+  if [ -z "$plan" ]; then
+    warn "Step 0b-1 (ga-q8tj7p): could not read the queue's source-bead routing — leaving every marker unclassified (the selection block reads that as unreadable: oldest-first)." >&2
     printf '%s' "$markers"
+    return 0
   fi
-}
-# SELFTEST-EXTRACT diff-size-merge: END
-
-if [ "$GATE_DIFF_SIZE_ORDERING_ENABLED" = "1" ]; then
-  _DIFF_SIZE_MAP="{}"
-  for _dsi in $(seq 0 $((COUNT - 1))); do
-    _ds_marker=$(printf '%s\n' "$MARKERS_JSON" | jq -c ".[$_dsi]" 2>/dev/null || echo "{}")
-    _ds_id=$(printf '%s' "$_ds_marker" | jq -r '.id // empty' 2>/dev/null || echo "")
-    [ -z "$_ds_id" ] && continue
-    DESC=$(printf '%s' "$_ds_marker" | jq -r '.description // ""' 2>/dev/null || echo "")
-    _ds_branch=$(extract "branch")
-    _ds_size="$GATE_DIFF_SIZE_UNKNOWN_SENTINEL"
-    if [ -n "$_ds_branch" ]; then
-      RIG=$(extract "rig")
-      BEAD_ID=$(extract "bead_id")
-      BEAD_RIG=$(extract "bead_rig")
-      # Same "resolve THIS candidate's rig context fresh" pattern as Step 0a-4
-      # above — globals are safely overwritten since Step 0b/2/4 below already
-      # re-derive them all fresh from the sweep's OWN (selected) candidate
-      # before use (see Step 0a-4's own comment for the full rationale).
-      if gate_resolve_rig_context; then
-        # ga-r8u92 gate-feedback: gate_resolve_rig_context succeeding proves the
-        # RIG/REPO resolved — it says nothing about whether THIS branch's ref is
-        # actually present locally yet. `git diff --numstat` on a ref that does
-        # not resolve (not yet fetched — exactly the just-pushed case the
-        # unknown-sentinel exists to protect against) fails SILENTLY: git's
-        # error goes to stderr, the pipe into awk sees empty input, and awk's
-        # END block still prints "0" regardless of the upstream failure — so
-        # gate_measure_diff_lines's own `|| echo 0` fallback never even fires,
-        # and a genuine 0-line diff collides with "could not measure" on the
-        # exact value this whole mechanism exists to keep OUT of the
-        # smallest-wins slot. Verify the ref itself resolves first
-        # (rig_resolve_commit — the same hardened "is this ref real" check
-        # ga-ljbx already uses everywhere else in this file) before trusting
-        # the measurement.
-        if [ -n "$(rig_resolve_commit "origin/$_ds_branch")" ]; then
-          _ds_size=$(gate_measure_diff_lines "$DEFAULT_BRANCH" "$_ds_branch")
+  pending="$plan"
+  records="{}"
+  pass=0
+  while [ "$pass" -lt 3 ]; do
+    stores=$(printf '%s' "$pending" | jq -r --argjson p "$pass" '[.[] | .cands[$p] // empty] | unique | .[]' 2>/dev/null) || stores=""
+    [ -n "$stores" ] || break
+    while IFS= read -r store; do
+      [ -n "$store" ] || continue
+      ids=$(printf '%s' "$pending" | jq -r --argjson p "$pass" --arg s "$store" '.[] | select(.cands[$p] == $s) | .bead' 2>/dev/null) || ids=""
+      [ -n "$ids" ] || continue
+      nreads=$((nreads + 1))
+      # $ids is deliberately unquoted: one validated bead id per word (no spaces, no glob characters).
+      # Each step computes into a throwaway first and commits it only on success: the
+      # one-line `VAR=$(jq ...) || VAR="$VAR"` form is a no-op "recovery" (bash performs
+      # the assignment, with the failed call's EMPTY stdout, BEFORE `||` runs — see
+      # gate_diff_size_map_accumulate's history, ga-r8u92), and here it would have
+      # wiped every record read so far.
+      if found=$(gate_src_class_read_store "$store" $ids); then
+        if _gsc_next=$(printf '%s' "$records" | jq -c --argjson f "$found" '. + ($f | map({(.id): {priority: .priority, type: .type}}) | add // {})' 2>/dev/null); then
+          records="$_gsc_next"
+          if _gsc_next=$(printf '%s' "$pending" | jq -c --argjson f "$found" '($f | map(.id)) as $got | map(select(.bead as $b | ($got | index($b)) == null))' 2>/dev/null); then
+            pending="$_gsc_next"
+          fi
         else
-          log "  Step 0b-0: origin/$_ds_branch does not resolve to a real commit for marker $_ds_id (unfetched or force-pushed away) — treating diff size as unknown (sentinel)."
+          warn "Step 0b-1 (ga-q8tj7p): could not merge the records read from $store — those beads stay unreadable this sweep." >&2
         fi
       else
-        log "  Step 0b-0: cannot resolve rig context for marker $_ds_id (rig=$RIG) — treating diff size as unknown (sentinel)."
+        nfail=$((nfail + 1))
       fi
-    fi
-    _DIFF_SIZE_MAP=$(gate_diff_size_map_accumulate "$_DIFF_SIZE_MAP" "$_ds_id" "$_ds_size")
+    done <<EOF
+$stores
+EOF
+    pass=$((pass + 1))
   done
-  MARKERS_JSON=$(gate_diff_size_map_merge "$MARKERS_JSON" "$_DIFF_SIZE_MAP")
+  out=$(gate_src_class_apply "$markers" "$records" 2>/dev/null) || out=""
+  if [ -z "$out" ]; then
+    warn "Step 0b-1 (ga-q8tj7p): could not annotate the queue with source-bead classes — leaving every marker unclassified (oldest-first this sweep)." >&2
+    printf '%s' "$markers"
+    return 0
+  fi
+  n=$(printf '%s' "$out" | jq 'length' 2>/dev/null || echo "?")
+  unread=$(printf '%s' "$out" | jq '[.[] | select((.src_class.state // "") != "ok")] | length' 2>/dev/null || echo "?")
+  log "Step 0b-1 (ga-q8tj7p): source-bead class of $n queued marker(s): $unread unreadable, $nreads store read(s) ($nfail failed), $(( $(date +%s) - t0 ))s." >&2
+  if [ "$unread" != "0" ]; then
+    warn "Step 0b-1 (ga-q8tj7p): source class UNREADABLE for $unread of $n queued marker(s) — they sort after every readable class and are never treated as P0 (ids: $(printf '%s' "$out" | jq -r '[.[] | select((.src_class.state // "") != "ok") | .id] | join(",")' 2>/dev/null))." >&2
+  fi
+  printf '%s' "$out"
+  return 0
+}
+# SELFTEST-EXTRACT gate-src-class: END
+
+_GATE_SRC_ENRICHED=$(gate_src_class_enrich "$MARKERS_JSON") || _GATE_SRC_ENRICHED=""
+if [ -n "$_GATE_SRC_ENRICHED" ]; then
+  MARKERS_JSON="$_GATE_SRC_ENRICHED"
+else
+  warn "Step 0b-1 (ga-q8tj7p): the source-class step returned nothing — keeping the un-annotated queue (oldest-first this sweep)."
 fi
+
 # SELFTEST-EXTRACT marker-select: BEGIN
-GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
+# ga-q8tj7p: tier order of the jq program below, front to back —
+#   1. exile-overdue: a rebase-fail marker whose exile has run past
+#      GATE_EXILE_OVERDUE_SECONDS and whose retry budget is not spent (ga-0ye7ar,
+#      ga-r5dsgp). Oldest first. See the comment above for why it survives.
+#   2. every other healthy marker whose source bead was READ, by
+#      [priority 0-4, feature before the rest, marker age oldest-first, id].
+#   3. healthy markers whose source bead could NOT be read, oldest first — after
+#      every readable class (never P0, never dropped), before rebase-fail.
+#   4. rebase-fail markers (all authors), the back of the queue (ga-q3ig2).
+# A marker inside its retry cooldown (ga-a6etc2) is in none of them.
 GATE_MARKER_NOW_EPOCH="${GATE_MARKER_NOW_OVERRIDE_EPOCH:-$(date -u +%s)}"
-# ga-* (2026-07-15, Athos): CREW-PRIORITY tier. A space-separated allowlist of
-# crew names (the `<crew>` segment of the marker's `branch: crew/<crew>/<bead>`
-# field in the DESCRIPTION) whose HEALTHY markers drain BEFORE everyone else's, on
-# top of the existing aged/newest tiebreaks. Keyed on the BRANCH crew segment, NOT
-# the `author:` field: /gate-done writes author as the agent alias "oracle-wa" while
-# the recipe writes bare "oracle" — the branch's crew dir is consistently "oracle"
-# across both, so it is the reliable signal. Set to prioritize Oracle's gate
-# throughput: his own crew/oracle/* builds AND the in-session sub-workers he spawns
-# (their commits land on his crew/oracle/* branch → same crew segment). The
-# `gate:priority` LABEL is an independent manual override for any single marker
-# regardless of branch (e.g. a sub-worker Oracle SLINGS onto a crew/wa-worker/*
-# branch — tag that marker's gate:priority off the source bead's created_by).
-# REVERSIBLE: set GATE_PRIORITY_AUTHORS="" in the plist to disable the crew tier
-# (the label override still works); the ordering collapses to the exact prior
-# aged/newest behaviour. rebase-fail markers stay at the BACK even when their crew
-# is prioritized — a broken branch must never jump the queue and re-break it
-# (ga-q3ig2 outage class); priority raises healthy work, it does not rescue a
-# conflicted one. (Env var name kept as GATE_PRIORITY_AUTHORS for continuity.)
-GATE_PRIORITY_AUTHORS="${GATE_PRIORITY_AUTHORS-oracle}"
-# GATE-FEEDBACK (gate_run=ga-wisp-a7b4r5): every sibling GATE_* tunable (see
-# GATE_DOLT_CPU_HOT etc. above) gets a case-guard right after its ${VAR:-default}
-# assignment; these two didn't, so a non-numeric override (config typo) made
-# `jq --argjson` exit 2 BEFORE the marker array was even read — under this
-# script's `set -euo pipefail`, that aborts the entire dispatcher sweep, not
-# just this marker. Same guard convention, applied here.
-case "$GATE_MARKER_AGE_PROMOTE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_AGE_PROMOTE_SECONDS=1800 ;; esac
-case "$GATE_MARKER_NOW_EPOCH"           in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
-# ga-vm428: sanitize the reserve-fresh-slot seam the same way — an unset,
-# empty, or garbage value must never reach jq's --argjson (which requires
-# strict JSON true/false), same failure class the GATE-FEEDBACK comment above
-# already fixed for the two numeric tunables. Two steps, not one: the
-# ${VAR:-default} expansion handles WHOLLY UNSET (this block, extracted
-# standalone by the selftest, runs under a caller-supplied `set -u` where a
-# bare `case "$GATE_FRESH_SLOT_DUE"` on an unset var aborts the sweep before
-# the case statement's own wildcard arm ever runs); the case-guard after it
-# handles SET-BUT-GARBAGE (anything reaching this point is already a string).
-GATE_FRESH_SLOT_DUE="${GATE_FRESH_SLOT_DUE:-false}"
-case "$GATE_FRESH_SLOT_DUE" in true|false) ;; *) GATE_FRESH_SLOT_DUE=false ;; esac
-# ga-ddm76 (2026-08-28): HARD-CEILING anti-starvation backstop. The ga-tgo7q
-# aging fix above promises "every healthy marker a hard wait bound", but that
-# bound only ever held WITHIN one priority class: a FRESH priority-tier
-# marker still outranks an AGED non-priority one by design
-# (gate-author-priority.selftest.sh case 2, 2026-07-15 — Athos: "priority
-# tier sits above the age tier", intentional and still correct for a short
-# priority burst). Under SUSTAINED priority submission that leaves
-# non-priority markers with no real ceiling at all — only a soft one that
-# holds as long as the priority author's queue happens to empty out in
-# time. Live-measured: ga-wisp-am67hm (non-oracle) queued 21:59:55, three
-# fresh crew/oracle/* markers (22:20:45 / 22:29:01 / 22:29:03) each drained
-# ahead of it while it already sat well past GATE_MARKER_AGE_PROMOTE_SECONDS,
-# and it did not close until 23:11:43 — 71min wait, not the promised 30min,
-# purely because oracle kept resubmitting. This threshold is the true,
-# priority-BLIND ceiling: sorted oldest-first, sitting ABOVE every tier below
-# (including priority-aged), except rebase-fail — which must never be
-# rescued by age, same ga-q3ig2 invariant the aging fix above already
-# respects. Deliberately set well above GATE_MARKER_AGE_PROMOTE_SECONDS (3x
-# by default) so it never fires for a merely-aged marker still inside the
-# tested priority-outranks-age window (gate-author-priority.selftest.sh case
-# 2 uses a 3600s/60min fixture, comfortably under this 5400s/90min default)
-# — it exists only to bound the untested, unbounded-under-sustained-load
-# case measured above.
-GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
-case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
-# ga-0ye7ar (wa-ycyf8): EXILE-AGE ceiling — invariant (b) of the wa-ycyf8 fix.
-# Mirrors GATE_MARKER_HARD_AGE_SECONDS just above, but keyed on the EXILE's
-# own clock (gate:exiled-since, stamped by gate_exile_watchdog_sweep) rather
-# than the marker's created_at. Without this, has_rebase_fail's blanket
-# exclusion from is_overdue (ga-q3ig2, tier 1 below) means an exiled marker
-# in a queue that never empties can sail past is_overdue's own threshold and
-# STILL never reach the emergency tier — exactly the wa-ycyf8 incident (7h,
-# healthy queue 6-24 deep the entire time). Bounded, not a free pass for a
-# genuinely-broken branch: MAX_REBASE_ATTEMPTS (default 3) still caps how
-# many times it can be re-attempted before the existing attempt-based
-# escalation (Step 4c) takes it out of gate-status:queued entirely — this
-# only affects how SOON it gets its next already-bounded attempt. Defaults
-# to the same value as GATE_MARKER_HARD_AGE_SECONDS (one ceiling, healthy or
-# not) but is independently configurable. 0 disables the feature (same "0
-# turns it off" convention as GATE_FRESH_SLOT_WINDOW_SWEEPS above).
+# GATE-FEEDBACK (gate_run=ga-wisp-a7b4r5): every sibling GATE_* tunable gets a
+# case-guard right after its ${VAR:-default} assignment; a non-numeric override
+# (config typo) used to make `jq --argjson` exit 2 BEFORE the marker array was even
+# read — under this script's `set -euo pipefail`, that aborts the entire dispatcher
+# sweep, not just this marker. Same guard convention here.
+case "$GATE_MARKER_NOW_EPOCH" in ''|*[!0-9]*) GATE_MARKER_NOW_EPOCH=$(date -u +%s) ;; esac
+# ga-0ye7ar (wa-ycyf8): EXILE-AGE ceiling, keyed on the EXILE's own clock
+# (gate:exiled-since, stamped by gate_exile_watchdog_sweep) rather than on the
+# marker's created_at. has_rebase_fail sinks an exiled marker to the back, and in a
+# queue that never empties the back is never reached — exactly the wa-ycyf8 incident
+# (7h, healthy queue 6-24 deep the entire time). Bounded, not a free pass for a
+# genuinely-broken branch: GATE_EXILE_RETRY_CEILING (below) caps how many times it
+# can be re-attempted, and after that Step 4c's escalation takes it out of
+# gate-status:queued. 5400 is the value this ceiling used to inherit from the
+# overdue tier that no longer exists (3 x 1800s); 0 disables the feature. A
+# non-numeric value falls back to 5400.
+GATE_EXILE_OVERDUE_SECONDS="${GATE_EXILE_OVERDUE_SECONDS:-5400}"
+case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS=5400 ;; esac
+# ga-r5dsgp: retry-count ceiling for the exile-overdue admission. The "MAX_REBASE_
+# ATTEMPTS still caps how many times it can be re-attempted" promise above does NOT
+# hold in every case — Step 4c's own ga-y5c29l exemption (REBASE_MERGE_TREE_PROVEN_
+# CLEAN) keeps a marker in gate-status:queued INDEFINITELY once its attempt count
+# blows past MAX_REBASE_ATTEMPTS, to protect a branch that is genuinely clean but
+# hitting repeated operational failures (the wa-llq1a/wa-4zmm1 incident). A marker
+# whose retry is permanently, deterministically un-resolvable would then be
+# re-admitted to the FRONT on every sweep and starve the whole queue behind it.
+# Measured live (ga-r6bore, 2026-09-25): 59 consecutive sweeps re-selected the SAME
+# exiled marker (gate:rebase-fail-count past 60), a 2.5h head-of-line block on a queue
+# carrying 10+ other markers including a P0 (wa-egtf0). Once a marker's own retry
+# count reaches this ceiling it stops being admitted and sinks to the back, where
+# gate_exile_watchdog_sweep (ga-faw5o, GATE_EXILE_ESCALATE_AFTER_SECONDS default 24h)
+# is the existing backstop. Mirrors MAX_REBASE_ATTEMPTS (Step 4c, below — hardcoded
+# there, not yet defined at this point in the sweep, hence an independent tunable).
 #
-# ga-r5dsgp: the "MAX_REBASE_ATTEMPTS still caps how many times it can be
-# re-attempted" claim two paragraphs up does NOT hold in every case — Step
-# 4c's own ga-y5c29l exemption (REBASE_MERGE_TREE_PROVEN_CLEAN) keeps a
-# marker in gate-status:queued INDEFINITELY once its attempt count blows
-# past MAX_REBASE_ATTEMPTS, specifically to protect a branch that is
-# genuinely clean but hitting repeated operational/plumbing failures (the
-# wa-llq1a/wa-4zmm1 incident that exemption exists for). Combined with THIS
-# tier's admission rule (exile_overdue, below), a marker whose retry is
-# permanently, deterministically un-resolvable (not transient — the same
-# failure every sweep) never leaves tier 1 once past the exile-age ceiling:
-# every sweep re-admits it, and because tier 1 sorts oldest-created_at-first
-# an old marker wins EVERY sweep, starving the entire queue behind it.
-# Measured live (ga-r6bore, 2026-09-25): 59 consecutive dispatcher sweeps
-# re-selected the SAME exiled marker (gate:rebase-fail-count climbing past
-# 60), 2.5h head-of-line block on a queue carrying 10+ other markers
-# including a P0 (wa-egtf0). See GATE_EXILE_RETRY_CEILING immediately below —
-# it closes this gap without touching the wa-ycyf8 invariant this comment
-# describes (a marker still UNDER the ceiling keeps getting exactly the
-# behavior this paragraph promises).
-GATE_EXILE_OVERDUE_SECONDS="${GATE_EXILE_OVERDUE_SECONDS:-$GATE_MARKER_HARD_AGE_SECONDS}"
-case "$GATE_EXILE_OVERDUE_SECONDS" in ''|*[!0-9]*) GATE_EXILE_OVERDUE_SECONDS="$GATE_MARKER_HARD_AGE_SECONDS" ;; esac
-# ga-r5dsgp: retry-count ceiling for exile_overdue's tier-1 admission (below).
-# A marker whose own retry count has already reached/passed this ceiling has
-# exhausted the bounded-retry contract the wa-ycyf8 fix promises — letting
-# it keep re-entering tier 1 forever achieves nothing but head-of-line
-# blocking (see the comment above). Mirrors MAX_REBASE_ATTEMPTS (Step 4c,
-# below — hardcoded there, not yet defined at this point in the sweep, hence
-# an independent tunable here) so the two stay in lockstep by default while
-# remaining separately overridable. Once past this ceiling the marker simply
-# stops being admitted to tier 1 — it falls to tier 7 (has_rebase_fail, the
-# back of the queue, unchanged), where gate_exile_watchdog_sweep (ga-faw5o,
-# already running every sweep, GATE_EXILE_ESCALATE_AFTER_SECONDS default 24h)
-# remains the existing backstop that eventually parks it at needs-rebase —
-# this fix's job is only to stop it DOMINATING every sweep in the meantime.
-#
-# Parsing is stricter than its GATE_EXILE_OVERDUE_SECONDS sibling on purpose
-# (gate feedback ga-r5dsgp, attempt 1): the value is spliced into jq with
-# --argjson, and "0" (or "000" — jq 1.8.1 reads it as 0, measured) would make
-# `attempt < 0` false for every marker: the admission switches off with no
-# signal, while an operator could equally read 0 as "no ceiling". Neither
-# reading is safe to guess, so a value that is not a plain positive integer
-# (empty, non-digit, zero, or implausibly long) falls back to the default 3.
-# Leading zeros are also normalized ("03" -> 3): JSON does not allow them, and
-# although this host's jq tolerates them, the value should not depend on which
-# jq happens to be installed.
+# Parsing is stricter than its sibling on purpose (gate feedback ga-r5dsgp, attempt
+# 1): the value is spliced into jq with --argjson, and "0" (or "000" — jq 1.8.1 reads
+# it as 0, measured) would make `attempt < 0` false for every marker: the admission
+# switches off with no signal, while an operator could equally read 0 as "no ceiling".
+# Neither reading is safe to guess, so a value that is not a plain positive integer
+# (empty, non-digit, zero, or implausibly long) falls back to the default 3. Leading
+# zeros are normalized ("03" -> 3): JSON does not allow them, and although this
+# host's jq tolerates them, the value should not depend on which jq is installed.
 GATE_EXILE_RETRY_CEILING="${GATE_EXILE_RETRY_CEILING:-3}"
 case "$GATE_EXILE_RETRY_CEILING" in ''|*[!0-9]*|??????????*) GATE_EXILE_RETRY_CEILING=3 ;; esac
 GATE_EXILE_RETRY_CEILING=$((10#$GATE_EXILE_RETRY_CEILING))
 if [ "$GATE_EXILE_RETRY_CEILING" -le 0 ]; then GATE_EXILE_RETRY_CEILING=3; fi
-# ga-r8u92 (ga-faw5o defeito 1): SIZE-AWARE SELECTION, healthy-not-aged tiers only.
-# Step 0b-0 (above, OUTSIDE this sentinel — mirrors how MARKERS_JSON itself is
-# built outside and merely CONSUMED here) annotates each candidate with
-# `.diff_lines` from a real `git diff --numstat`, or GATE_DIFF_SIZE_UNKNOWN_
-# SENTINEL when the branch/rig could not be resolved. Re-resolved here too
-# (same convention as every other GATE_MARKER_* tunable above) so this block
-# stays a fully self-contained, standalone-testable snippet — a selftest can
-# set `.diff_lines` directly on synthetic fixtures without touching git at all.
-# UNKNOWN maps to a LARGE value, not 0: a marker whose size we could not
-# measure must sink to the BACK of its size ranking, never jump the queue by
-# masquerading as tiny (the systematic failure mode a 0-default would create —
-# a just-pushed branch is exactly the branch whose ref is least likely to be
-# fetched yet). GATE_DIFF_SIZE_ORDERING_ENABLED=0 (Step 0b-0) skips the
-# annotation entirely, so every candidate ties on this sentinel and the sort
-# below falls through to its pure newest-first secondary key — the exact
-# pre-ga-r8u92 behaviour, same REVERSIBLE convention as GATE_PRIORITY_AUTHORS="".
-GATE_DIFF_SIZE_UNKNOWN_SENTINEL="${GATE_DIFF_SIZE_UNKNOWN_SENTINEL:-999999999}"
-case "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" in ''|*[!0-9]*) GATE_DIFF_SIZE_UNKNOWN_SENTINEL=999999999 ;; esac
-MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq \
+MARKER_ORDER_JSON=$(printf '%s\n' "$MARKERS_JSON" | jq -c \
   --argjson now "$GATE_MARKER_NOW_EPOCH" \
-  --argjson age_threshold "$GATE_MARKER_AGE_PROMOTE_SECONDS" \
-  --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" \
   --argjson exile_ceiling "$GATE_EXILE_OVERDUE_SECONDS" \
-  --argjson retry_ceiling "$GATE_EXILE_RETRY_CEILING" \
-  --argjson reserve_fresh "$GATE_FRESH_SLOT_DUE" \
-  --argjson diff_unknown "$GATE_DIFF_SIZE_UNKNOWN_SENTINEL" \
-  --arg priority_authors "$GATE_PRIORITY_AUTHORS" '
+  --argjson retry_ceiling "$GATE_EXILE_RETRY_CEILING" '
   # ga-gpcx: matches both the current name (gate:exiled-tier5:N) and the
   # legacy name (gate:rebase-attempt:N, used before 2026-07-17) so a marker
   # already exiled under the old name at deploy time stays correctly sunk to
-  # this tier instead of being silently released into the healthy tier (which
+  # the back instead of being silently released into the healthy order (which
   # would reintroduce the ga-q3ig2 outage class). See read_rebase_attempt().
   def has_rebase_fail: ((.labels // []) | map(select(test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$"))) | length) > 0;
-  def is_aged: try (($now - (.created_at | fromdateiso8601)) > $age_threshold) catch false;
-  # ga-ddm76: priority-blind emergency ceiling — see the shell comment above.
-  def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;
-  # ga-0ye7ar: the exile clock itself, independent of created_at (see the shell
-  # comment above GATE_EXILE_OVERDUE_SECONDS). gate:exiled-since is stamped by
-  # gate_exile_watchdog_sweep the first sweep it notices a marker exiled —
-  # absent (never yet observed in exile, or already cleared by
-  # gate_exile_recovery_sweep) reads as "not old enough yet", the same
-  # conservative default the watchdog itself uses. That keeps a
-  # freshly-exiled marker (e.g. gate-priority-starvation-ceiling.selftest.sh
-  # case (4): overdue-by-created_at but no exiled-since label yet) sinking
-  # behind healthy markers exactly as before — this tier only admits a
-  # marker whose OWN exile has sat unconsidered long enough on its own terms.
+  # ga-0ye7ar: the exile clock itself, independent of created_at. gate:exiled-since
+  # is stamped by gate_exile_watchdog_sweep the first sweep it notices a marker
+  # exiled — absent (never yet observed in exile, or already cleared by
+  # gate_exile_recovery_sweep) reads as "not old enough yet", the same conservative
+  # default the watchdog itself uses.
   def exiled_since_epoch: ([(.labels // [])[] | select(test("^gate:exiled-since:[0-9]+$")) | (sub("^gate:exiled-since:";"") | tonumber)] | max) // null;
-  # ga-r5dsgp: mirrors read_rebase_attempt() (shell, above) exactly — same
-  # three label prefixes, same "highest value wins" rule — so a marker
-  # exiled under the legacy gate:rebase-attempt:N name is capped correctly
-  # too. See the GATE_EXILE_RETRY_CEILING shell comment above for why this
-  # exists: without it, exile_overdue keeps admitting a marker to tier 1
-  # forever once past the exile-age ceiling, even after it has blown far
-  # past its own bounded-retry budget (measured: gate:rebase-fail-count:61).
+  # ga-r5dsgp: mirrors read_rebase_attempt() (shell, above) exactly — same three
+  # label prefixes, same "highest value wins" rule — so a marker exiled under the
+  # legacy gate:rebase-attempt:N name is capped correctly too.
   def rebase_attempt_count: ([(.labels // [])[] | select(test("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):[0-9]+$")) | (sub("^gate:(rebase-attempt|exiled-tier5|rebase-fail-count):";"") | tonumber)] | max) // 0;
   def exile_overdue: ($exile_ceiling > 0) and (exiled_since_epoch != null) and (($now - exiled_since_epoch) > $exile_ceiling) and (rebase_attempt_count < $retry_ceiling);
   # ga-a6etc2: per-marker retry cooldown. gate_retry_cooldown_stamp writes
-  # gate:retry-cooldown-until:<epoch> on every failed attempt of the
-  # proven-clean retry path (see the helper for the incident). A marker inside
-  # its cooldown is EXCLUDED FROM EVERY TIER below, including tier 1 and the
-  # rebase-fail back-of-queue tier: tier 1 (exile_overdue) used to re-admit the
-  # same failing marker on every sweep because nothing re-armed the exile
-  # clock after a failed attempt (82 min of head-of-line blocking). max, not
-  # first: if a stale label ever survives, the newest deadline decides. Absent
-  # or already-expired reads as "no cooldown" so a marker is never held out
-  # indefinitely by a label that stopped mattering.
+  # gate:retry-cooldown-until:<epoch> on every failed attempt of the proven-clean
+  # retry path (see the helper for the incident). A marker inside its cooldown is
+  # EXCLUDED FROM EVERY TIER below, including the exile-overdue admission and the
+  # rebase-fail back of the queue: the exile-overdue admission used to re-admit the
+  # same failing marker on every sweep because nothing re-armed the exile clock after
+  # a failed attempt (82 min of head-of-line blocking). max, not first: if a stale
+  # label ever survives, the newest deadline decides. Absent or already-expired reads
+  # as "no cooldown" so a marker is never held out indefinitely by a label that
+  # stopped mattering.
   def retry_cooldown_until: ([(.labels // [])[] | select(test("^gate:retry-cooldown-until:[0-9]+$")) | (sub("^gate:retry-cooldown-until:";"") | tonumber)] | max) // null;
   def in_retry_cooldown: (retry_cooldown_until != null) and ($now < retry_cooldown_until);
-  # crew_of parses the <crew> segment of `branch: crew/<crew>/<bead>` from the
-  # marker DESCRIPTION. MUST always yield exactly one value ("" when absent) —
-  # `capture`/`scan` yield an EMPTY STREAM on no-match under jq, and `crew_of as
-  # $c` over an empty stream runs zero times, silently DROPPING that marker from
-  # every tier → .[0] becomes null → the whole sweep selects nothing (verified: a
-  # description-less marker vanished). `[ scan(re) ]` collects into an array so
-  # .[0] // "" always produces one value.
-  def crew_of: ([ (.description // "") | scan("(?:^|\n)branch:[ ]*crew/([^/ \n]+)/") ] | (.[0] // "") | if type == "array" then (.[0] // "") else . end);
-  def prio_list: ($priority_authors | split(" ") | map(select(length>0)));
-  def is_priority: (crew_of as $c | ($c != "" and ((prio_list | index($c)) != null))) or ((.labels // []) | any(. == "gate:priority"));
-  # ga-r8u92: diff_size feeds ONLY the two not-aged sort_by calls below — never
-  # the is_aged/is_overdue tiers, which stay pure age order on purpose (that is
-  # the existing anti-starvation bound; a large diff that ages still promotes
-  # exactly like today, unaffected by its size). created_epoch mirrors the
-  # try/catch-fromdateiso8601 idiom is_aged already uses, so a null/malformed
-  # created_at degrades to 0 (sorts last, never crashes) instead of throwing.
-  def diff_size: (.diff_lines // $diff_unknown);
-  def created_epoch: try (.created_at | fromdateiso8601) catch 0;
-  # Tier order: overdue-emergency (priority-BLIND, oldest-first — ga-ddm76),
-  # then reserve-fresh-slot (priority-BLIND, single freshest healthy marker,
-  # only when $reserve_fresh — ga-vm428, see the shell comment above), then
-  # priority-healthy (aged→newest), then other-healthy (aged→newest), then
-  # rebase-fail (all authors, back of queue). Mirrors the aged/newest logic
-  # inside each priority class so no invariant (aging bound, newest tiebreak) is lost.
-  # ga-r8u92: within EACH not-yet-aged healthy tier, smallest-diff-first is now
-  # the PRIMARY key (shortest-job-first minimizes mean queue wait), newest-first
-  # the secondary tiebreak (4cae0a2c49, Athos: desempate=mais novo — preserved
-  # for equal-size diffs; unknown-size diffs tie at the sentinel and fall
-  # through to it too).
-  # ga-0ye7ar: tier 1 now ALSO admits a has_rebase_fail marker once its own
-  # exile has run past $exile_ceiling (exile_overdue) — the ga-q3ig2 "a
-  # conflicted branch never jumps the queue" guarantee still holds for every
-  # OTHER tier (2-6 all keep excluding has_rebase_fail unchanged below), and
-  # gate-priority-starvation-ceiling.selftest.sh case (4) still passes
-  # because that fixture carries no gate:exiled-since label at all.
-  # ga-a6etc2: the leading map(select(in_retry_cooldown | not)) | drops every
-  # marker still inside its retry cooldown before ANY tier sees it (jq: the pipe
-  # binds looser than +, so it feeds the whole tier sum, not just the first term).
-  map(select(in_retry_cooldown | not)) |
-  (map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))) | sort_by(.created_at))
-  + (if $reserve_fresh then (map(select(has_rebase_fail | not)) | sort_by(.created_at) | reverse | .[0:1]) else [] end)
-  + (map(select(is_priority and (has_rebase_fail | not) and is_aged))                 | sort_by(.created_at))
-  + (map(select(is_priority and (has_rebase_fail | not) and (is_aged | not)))       | sort_by([diff_size, -created_epoch]))
-  + (map(select((is_priority | not) and (has_rebase_fail | not) and is_aged))       | sort_by(.created_at))
-  + (map(select((is_priority | not) and (has_rebase_fail | not) and (is_aged | not))) | sort_by([diff_size, -created_epoch]))
-  + (map(select(has_rebase_fail))                                                   | sort_by(.created_at) | reverse)
-  | .[0]')
+  # ga-q8tj7p: the source-bead classification written by Step 0b-1. Only
+  # state == "ok" counts as READ. A marker with no `.src_class` at all (the step did
+  # not run, or failed) is treated exactly like state == "unreadable": sorted after
+  # every readable class, never promoted — the inert reading of "I could not find out".
+  def src_ok: ((.src_class // {}) | (if type == "object" then .state else null end)) == "ok";
+  # A bead that WAS read and carries no usable priority (null, not a number, outside
+  # 0-4, not an integer) is P2 — bd`s own default for an unset priority. Priority 0
+  # stays 0: the test is on the TYPE, not on truthiness.
+  def src_priority: (.src_class.priority) as $p | if (($p | type) == "number" and $p >= 0 and $p <= 4 and $p == ($p | floor)) then $p else 2 end;
+  def is_feature: (.src_class.type // "") == "feature";
+  # Age of the SUBMISSION to the gate, oldest-first. A null/malformed created_at is an
+  # UNKNOWN age: it must sort LAST within its class, not first as epoch 0 would.
+  def created_key: try (.created_at | fromdateiso8601) catch 99999999999;
+  def class_label:
+    if has_rebase_fail then (if exile_overdue then "exile-overdue" else "rebase-fail" end)
+    elif src_ok then "P\(src_priority)/\(if is_feature then "feature" else "other" end)"
+    else "unreadable" end;
+  # `as $live` rather than a leading pipe: the cooldown filter feeds every tier below.
+  map(select(in_retry_cooldown | not)) as $live
+  | ( [$live[] | select(has_rebase_fail and exile_overdue)]                  | sort_by([created_key, (.id | tostring)]) )
+  + ( [$live[] | select((has_rebase_fail | not) and src_ok)]                 | sort_by([src_priority, (if is_feature then 0 else 1 end), created_key, (.id | tostring)]) )
+  + ( [$live[] | select((has_rebase_fail | not) and (src_ok | not))]         | sort_by([created_key, (.id | tostring)]) )
+  + ( [$live[] | select(has_rebase_fail and (exile_overdue | not))]          | sort_by(.created_at) | reverse )
+  | map(. + {gate_order_class: class_label})')
+MARKER=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq '.[0]')
+MARKER_CLASS=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '.[0].gate_order_class // empty')
+# The head of the order with each marker's class — what the "Selected" log line below
+# prints, so a hand-computed order over the live queue can be checked against it.
+MARKER_ORDER_SUMMARY=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '(length) as $n | ([.[0:8][] | "\(.id)[\(.gate_order_class)]"] | join(" ")) + (if $n > 8 then " (+\($n - 8) more)" else "" end)')
+# gate:priority used to promote a marker; it is inert now. Counted over the whole
+# queue, not just the eligible part, so the note fires while any marker still carries it.
+MARKER_PRIORITY_LABEL_COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq '[.[] | select((.labels // []) | any(. == "gate:priority"))] | length' 2>/dev/null || echo "0")
 # ga-a6etc2: `.id // empty`, not `.id` — jq -r prints the literal string "null"
 # for a null selection, and the cooldown pre-filter above can now legitimately
 # leave NOTHING eligible (every queued marker inside its retry cooldown). That
@@ -13522,6 +13402,15 @@ if [ -z "$MARKER_ID" ]; then
   exit 0
 fi
 # SELFTEST-EXTRACT marker-select: END
+# ga-q8tj7p: say WHY this marker, in the terms the order is defined in. The class is
+# priority/feature (or exile-overdue, unreadable, rebase-fail); the list is the head
+# of the order, so the choice can be checked by hand against the live queue. This is
+# a separate line from "Attempting to claim marker" on purpose: gate-recovery-watchdog
+# parses that line's exact shape.
+log "Selected $MARKER_ID class=$MARKER_CLASS (order: priority > feature > age, ga-q8tj7p) of $COUNT queued: $MARKER_ORDER_SUMMARY"
+if [ "${MARKER_PRIORITY_LABEL_COUNT:-0}" != "0" ]; then
+  log "NOTE: $MARKER_PRIORITY_LABEL_COUNT queued marker(s) still carry the gate:priority label — it has no effect on the order since ga-q8tj7p; the source bead's priority field decides."
+fi
 DESC=$(printf '%s\n' "$MARKER" | jq -r '.description // ""')
 
 log "Attempting to claim marker $MARKER_ID ..."

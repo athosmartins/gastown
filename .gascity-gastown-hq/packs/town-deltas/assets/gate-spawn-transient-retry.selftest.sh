@@ -47,7 +47,7 @@
 # gate_spawn_failure_requeue_or_error (bd-backed, driven by in-shell mocks —
 # NO live Dolt/gc/launchd), then extracts the spawn-retry-loop block verbatim
 # (genuine live extraction, not a hand-copied mirror — same technique as
-# gate-marker-age-promote.selftest.sh) to prove the in-process retry actually
+# gate-q8tj7p-queue-order.selftest.sh) to prove the in-process retry actually
 # recovers from a one-shot blip. Exit 0 iff every assertion holds.
 
 set -euo pipefail

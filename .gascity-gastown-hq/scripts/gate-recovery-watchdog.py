@@ -78,6 +78,16 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     oldest-first; it flagged ga-b9pz7q 3min before the dispatcher claimed it, and a
     branch substring also matches an EARLIER attempt of the same branch.
 
+  RETIRED BY THE DISPATCHER (ga-q8tj7p, 2026-10-06): the proof above rests on tier 1 being
+    priority-blind. The dispatcher's order is now priority > feature > age with NO overdue
+    tier, so a newer P0 legitimately beats an older P3 forever and "a newer marker was
+    claimed" proves nothing. orphaned_queued_marker() therefore reads the dispatcher
+    source, and while the marker-select block no longer defines `is_overdue` it reports
+    NO orphan and says so once an hour ("order-changed") — silent would read as "no
+    orphan". Not deleted: if an overdue tier ever returns the proof resumes by itself, and
+    rebuilding it for the new order (the dispatcher can publish the order it computed; a
+    queued marker ABSENT from it for K sweeps is invisible whatever its class) is ga-dtecvq.
+
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
   2. SPAWN a dedicated repair agent: route the runbook (referencing the
@@ -135,7 +145,8 @@ ORPHAN_MIN_AGE_SEC = 1800      # cheap pre-filter ONLY (ga-yprwyk): a head young
 # created_at order. The proof — "the head's branch is unmentioned while a NEWER marker's branch is" — assumes
 # the dispatcher works the queue oldest-first one marker per sweep. It does not: it is tiered (quality-gate-
 # dispatcher.sh marker-select: overdue oldest-first → ONE freshest 'reserve' marker → priority authors
-# [aged, then smallest-diff-first] → everyone else [aged, then smallest-diff-first] → rebase-fail), and the
+# [aged, then smallest-diff-first] → everyone else [aged, then smallest-diff-first] → rebase-fail — and
+# since ga-q8tj7p it is priority > feature > age with no overdue tier, see _dispatcher_has_overdue_tier), and the
 # branch-name substring also matches an EARLIER attempt of the same branch. On a
 # deep queue every head marker would trip it, and each false positive would hold the single repair-dog slot
 # (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs. So the repair path is OFF unless explicitly enabled;
@@ -1125,6 +1136,11 @@ _DISPATCHER_HARD_MULT_RE = re.compile(
 _LAUNCHD_TUNABLE_RE = re.compile(
     r"^\s*(GATE_MARKER_AGE_PROMOTE_SECONDS|GATE_MARKER_HARD_AGE_SECONDS) => (.*?)\s*$", re.M)
 
+# ga-q8tj7p: the ONE fact the orphan proof rests on — a priority-blind, oldest-first overdue tier in the
+# dispatcher's marker-select (its jq `def is_overdue:`). The proof is only valid while that tier exists.
+_DISPATCHER_OVERDUE_TIER_RE = re.compile(r"^\s*def is_overdue:", re.M)
+_ORDER_PREMISE_CACHE = {"at": 0.0, "value": None}
+
 _HARD_AGE_CACHE = {"at": 0.0, "value": None}
 _MARKER_CREATED_CACHE = {}    # marker id -> created epoch; a marker's created_at never changes, so this never goes stale
 _ORPHAN_NOTED = {}            # reason -> last time its "cannot prove" note was printed
@@ -1184,6 +1200,38 @@ def _dispatcher_hard_age_from(src_text, launchd_text):
     if _numeric(env.get("GATE_MARKER_HARD_AGE_SECONDS")):
         return int(env["GATE_MARKER_HARD_AGE_SECONDS"])
     return promote * mult
+
+
+def _dispatcher_has_overdue_tier_from(src_text):
+    """THREE states, never two: True = the dispatcher's marker-select block still defines the priority-blind
+    overdue tier (`def is_overdue:`) the orphan proof rests on; False = the source was read, the block is there,
+    and the tier is not; None = it could not be established (empty source, or the sentinel-delimited block has
+    moved/been renamed). None must not read as "gone" (that would switch a working detector off on a hiccup) nor
+    as "present" (that would trust a premise nobody checked) — the caller keeps its pre-ga-q8tj7p behaviour."""
+    if not src_text:
+        return None
+    b = src_text.find("# SELFTEST-EXTRACT marker-select: BEGIN")
+    e = src_text.find("# SELFTEST-EXTRACT marker-select: END")
+    if b < 0 or e < b:
+        return None
+    return _DISPATCHER_OVERDUE_TIER_RE.search(src_text, b, e) is not None
+
+
+def _dispatcher_has_overdue_tier(now=None):
+    """Cached _dispatcher_has_overdue_tier_from() over the live dispatcher source. Only a definite answer is cached;
+    an unreadable source is re-tried on the next poll."""
+    now = time.time() if now is None else now
+    if _ORDER_PREMISE_CACHE["value"] is not None and now - _ORDER_PREMISE_CACHE["at"] < ORPHAN_TUNABLES_TTL_SEC:
+        return _ORDER_PREMISE_CACHE["value"]
+    try:
+        with open(DISPATCHER_SRC, encoding="utf-8", errors="replace") as f:
+            src = f.read()
+    except Exception:
+        src = ""
+    val = _dispatcher_has_overdue_tier_from(src)
+    if val is not None:
+        _ORDER_PREMISE_CACHE["at"], _ORDER_PREMISE_CACHE["value"] = now, val
+    return val
 
 
 def _dispatcher_hard_age(now=None):
@@ -1346,6 +1394,13 @@ def orphaned_queued_marker():
     if not log_fresh or not sweep_epochs:
         return (None, None, 0)  # log not live → dead engine, ENGINE-STALL's job
     now = time.time()
+    # ga-q8tj7p: the proof needs the dispatcher's priority-blind overdue tier. When the dispatcher provably no longer
+    # has it, say so (rate-limited) and return BEFORE the queue read and the log read — nothing below can prove a skip.
+    if _dispatcher_has_overdue_tier(now) is False:
+        _orphan_note("order-changed", "the dispatcher's marker-select no longer has a priority-blind overdue tier (its order is "
+                     "priority > feature > age since ga-q8tj7p), so 'a newer marker was claimed ahead of an older queued one' "
+                     "proves nothing — orphan detection is OFF until it is rebuilt for that order (ga-dtecvq)", now)
+        return (None, None, 0)
     markers = _queued_markers()
     # Cheap gates first: the wide log read and the launchctl/source read below happen only for a REAL candidate.
     if _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC) is None:

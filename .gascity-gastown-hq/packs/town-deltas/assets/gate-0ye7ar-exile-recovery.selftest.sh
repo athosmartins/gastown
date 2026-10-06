@@ -19,7 +19,7 @@
 # Strategy: Section A mirrors gate-exile-watchdog.selftest.sh — extract
 # gate_exile_recovery_sweep() via its own SELFTEST-EXTRACT sentinel, eval it
 # into this shell, stub every function it calls. Section B mirrors
-# gate-priority-starvation-ceiling.selftest.sh — extract the "marker-select"
+# gate-q8tj7p-queue-order.selftest.sh — extract the "marker-select"
 # sentinel and run it under a fresh bash with MARKERS_JSON + test-seam env
 # vars set. Neither section hand-copies live logic.
 #
@@ -266,44 +266,45 @@ fi
 ok "located live marker-select block via sentinel extraction"
 
 # mkb <id> <created_at_iso> [extra-labels-csv]
+# ga-q8tj7p: every marker carries the same READ source class (P2 task). Between healthy markers the
+# order is [priority, feature, age oldest-first]; with one shared class only age decides. (Without
+# `.src_class` a marker reads as "unreadable" — a different tier, which is not what this file tests.)
 mkb() {
   local id="$1" ts="$2" labels="${3:-gate-status:queued}"
   local labarr; labarr="$(printf '%s' "$labels" | jq -R 'split(",")')"
   jq -cn --arg id "$id" --arg ts "$ts" --argjson labels "$labarr" \
-    '{id:$id, created_at:$ts, description:"branch: crew/mila/x", labels:$labels}'
+    '{id:$id, created_at:$ts, description:"branch: crew/mila/x", labels:$labels, src_class:{state:"ok",priority:2,type:"task"}}'
 }
 
-# select_marker2 <block> <markers_json> <now> [age] [hard] [exile_ceiling]
-# exile_ceiling omitted (5 args only) leaves GATE_EXILE_OVERDUE_SECONDS UNSET,
-# so the block's own default (falls back to hard_threshold) governs — that
-# distinction matters for test (B5) below, so it is never defaulted away here.
+# select_marker2 <block> <markers_json> <now> [exile_ceiling]
+# exile_ceiling omitted leaves GATE_EXILE_OVERDUE_SECONDS UNSET, so the block's own
+# default (5400) governs — that distinction matters for test (B5) below, so it is
+# never defaulted away here. (ga-q8tj7p removed the aged/overdue tiers and with them
+# GATE_MARKER_AGE_PROMOTE_SECONDS / GATE_MARKER_HARD_AGE_SECONDS / GATE_PRIORITY_AUTHORS;
+# this wrapper used to pin all three.)
 select_marker2() {
-  local block="$1" markers_json="$2" now_epoch="$3" age_threshold="${4:-1800}" hard_threshold="${5:-5400}"
-  if [ "$#" -ge 6 ]; then
+  local block="$1" markers_json="$2" now_epoch="$3"
+  if [ "$#" -ge 4 ]; then
     MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
-    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
-    GATE_EXILE_OVERDUE_SECONDS="$6" GATE_PRIORITY_AUTHORS="oracle" \
+    GATE_EXILE_OVERDUE_SECONDS="$4" \
     bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
   else
     MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
-    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
-    GATE_PRIORITY_AUTHORS="oracle" \
     bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
   fi
 }
 
 NOW_EPOCH=1782863814
-THRESH=1800   # matches GATE_MARKER_AGE_PROMOTE_SECONDS default
-HARD=5400     # matches GATE_MARKER_HARD_AGE_SECONDS default
+HARD=5400     # the exile-age ceiling's built-in default (GATE_EXILE_OVERDUE_SECONDS); it used to be inherited from the overdue tier
 iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
 ago() { iso "$((NOW_EPOCH - $1))"; }
 
-echo "── (B1) THE FIX: exile older than its OWN ceiling wins tier 1, even with a young created_at ──"
+echo "── (B1) THE FIX: exile older than its OWN ceiling is admitted FIRST, even with a young created_at ──"
 FIX=$(printf '[%s,%s,%s]' \
   "$(mkb fresh_h   "$(ago 60)"   "gate-status:queued")" \
   "$(mkb aged_h    "$(ago 2000)" "gate-status:queued")" \
   "$(mkb exiled_ov "$(ago 300)"  "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5500))")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
 [ "$SEL" = "exiled_ov" ] && ok "exile age 5500s > ${HARD}s ceiling wins over fresh AND merely-aged healthy markers — created_at (only 300s) is irrelevant, the EXILE clock drove it (wa-ycyf8 shape)" \
   || bad "expected exiled_ov, got '$SEL' — exile-age ceiling did not admit it to tier 1"
 
@@ -311,7 +312,7 @@ echo "── (B2) exile UNDER its ceiling stays excluded — no free pass just f
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh_h2  "$(ago 60)"  "gate-status:queued")" \
   "$(mkb exiled_un "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-1000))")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
 [ "$SEL" = "fresh_h2" ] && ok "exile age 1000s < ${HARD}s ceiling — still sinks behind the healthy marker as before (feature is bounded, not a blanket exile amnesty)" \
   || bad "expected fresh_h2, got '$SEL'"
 
@@ -319,43 +320,55 @@ echo "── (B3) regression guard: exiled with NO exiled-since label + overdue 
 FIX=$(printf '[%s,%s]' \
   "$(mkb broken_noclock "$(ago 10000)" "gate-status:queued,gate:exiled-tier5:2")" \
   "$(mkb fresh3         "$(ago 60)"    "gate-status:queued")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
-[ "$SEL" = "fresh3" ] && ok "no gate:exiled-since label at all (never yet observed by the watchdog) reads as not-old-enough, not as instantly-overdue — matches gate-priority-starvation-ceiling.selftest.sh case (4), re-verified here for this new code path" \
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
+[ "$SEL" = "fresh3" ] && ok "no gate:exiled-since label at all (never yet observed by the watchdog) reads as not-old-enough, not as instantly-overdue — the same fixture the retired gate-priority-starvation-ceiling.selftest.sh case (4) used, kept here because the exile-overdue admission is what it protects" \
   || bad "expected fresh3, got '$SEL' — a missing exiled-since label wrongly admitted the marker to tier 1 (ga-q3ig2 regression)"
 
 echo "── (B4) GATE_EXILE_OVERDUE_SECONDS=0 disables the feature entirely ──"
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh4  "$(ago 60)"  "gate-status:queued")" \
   "$(mkb exiled4 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-999999))")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "0")
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "0")
 [ "$SEL" = "fresh4" ] && ok "GATE_EXILE_OVERDUE_SECONDS=0 disables the feature — even a 999999s-old exile stays excluded from tier 1" \
   || bad "expected fresh4, got '$SEL' — the 0-disables convention is not honored"
 
-echo "── (B5) default: leaving GATE_EXILE_OVERDUE_SECONDS unset resolves to GATE_MARKER_HARD_AGE_SECONDS ──"
+echo "── (B5) default: leaving GATE_EXILE_OVERDUE_SECONDS unset resolves to 5400 (the value it used to inherit from GATE_MARKER_HARD_AGE_SECONDS) ──"
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh5  "$(ago 60)"  "gate-status:queued")" \
   "$(mkb exiled5 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5500))")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD")
-[ "$SEL" = "exiled5" ] && ok "leaving GATE_EXILE_OVERDUE_SECONDS unset defaults to GATE_MARKER_HARD_AGE_SECONDS (5500s exile age > ${HARD}s default ceiling)" \
-  || bad "expected exiled5, got '$SEL' — default did not fall back to the hard-age ceiling"
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH")
+[ "$SEL" = "exiled5" ] && ok "leaving GATE_EXILE_OVERDUE_SECONDS unset defaults to ${HARD}s (5500s exile age > ${HARD}s default ceiling)" \
+  || bad "expected exiled5, got '$SEL' — the built-in default ceiling is not ${HARD}s"
+FIX=$(printf '[%s,%s]' \
+  "$(mkb fresh5b  "$(ago 60)"  "gate-status:queued")" \
+  "$(mkb exiled5b "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5300))")")
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH")
+[ "$SEL" = "fresh5b" ] && ok "...and the default is a real ceiling, not zero: a 5300s-old exile (< ${HARD}s) is still not admitted" \
+  || bad "expected fresh5b, got '$SEL' — the default ceiling admits an exile younger than ${HARD}s"
 
-echo "── (B6) tier-1 internal FIFO is untouched: an older overdue-by-created_at healthy marker still beats a younger exile_overdue one ──"
+echo "── (B6) the exile-overdue admission is AHEAD of the healthy order (ga-q8tj7p removed the overdue-healthy tier it used to share) ──"
 FIX=$(printf '[%s,%s]' \
   "$(mkb old_overdue    "$(ago 8000)" "gate-status:queued")" \
   "$(mkb young_exile_ov "$(ago 300)"  "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5500))")")
-SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
-[ "$SEL" = "old_overdue" ] && ok "within tier 1, oldest-created_at-first FIFO still governs — exile admission gets IN to the tier, it does not jump the tier's own ordering" \
-  || bad "expected old_overdue, got '$SEL' — exile admission broke tier-1's FIFO invariant"
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
+[ "$SEL" = "young_exile_ov" ] && ok "an exiled marker past its own ceiling is re-tried before even a much OLDER healthy marker — the wa-ycyf8 guarantee (an exiled marker must eventually get its bounded attempt in a queue that never empties) does not depend on how long the healthy ones have waited" \
+  || bad "expected young_exile_ov, got '$SEL' — the exile-overdue admission no longer goes first"
+FIX=$(printf '[%s,%s,%s]' \
+  "$(mkb ex_newer "$(ago 100)" "gate-status:queued,gate:exiled-tier5:1,gate:exiled-since:$((NOW_EPOCH-5600))")" \
+  "$(mkb ex_older "$(ago 900)" "gate-status:queued,gate:exiled-tier5:1,gate:exiled-since:$((NOW_EPOCH-5700))")" \
+  "$(mkb healthy6 "$(ago 8000)" "gate-status:queued")")
+SEL=$(select_marker2 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
+[ "$SEL" = "ex_older" ] && ok "among several exile-overdue markers the one submitted EARLIEST goes first (oldest-created_at-first inside the admission)" \
+  || bad "expected ex_older, got '$SEL' — the exile-overdue admission is not oldest-first"
 
 echo "── (B7) gate-feedback-style regression: malformed GATE_EXILE_OVERDUE_SECONDS must not crash the sweep ──"
 FIX2=$(printf '[%s,%s]' "$(mkb hh1 "$(ago 600)" "gate-status:queued")" "$(mkb hh2 "$(ago 60)" "gate-status:queued")")
 SEL=$(MARKERS_JSON="$FIX2" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" \
-  GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" GATE_MARKER_HARD_AGE_SECONDS="$HARD" \
-  GATE_EXILE_OVERDUE_SECONDS="not-a-number" GATE_PRIORITY_AUTHORS="oracle" \
+  GATE_EXILE_OVERDUE_SECONDS="not-a-number" \
   bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
 STATUS=$?
-if [ "$STATUS" = "0" ] && [ "$SEL" = "hh2" ]; then
-  ok "malformed GATE_EXILE_OVERDUE_SECONDS falls back to the hard-age default instead of crashing the sweep (exit=$STATUS, selected=$SEL)"
+if [ "$STATUS" = "0" ] && [ "$SEL" = "hh1" ]; then
+  ok "malformed GATE_EXILE_OVERDUE_SECONDS falls back to the built-in 5400 default instead of crashing the sweep (exit=$STATUS, selected=$SEL — the older of two same-class markers)"
 else
   bad "malformed GATE_EXILE_OVERDUE_SECONDS broke selection (exit=$STATUS, selected='$SEL')"
 fi
@@ -373,8 +386,10 @@ grep -q 'GATE_EXILE_RECOVERY_ENABLED' "$DISPATCHER" \
 grep -q 'still_exiled=\$(bd -C "\$GC_CITY" show "\$marker_id" --json' "$DISPATCHER" \
   && ok "exile-recovery verifies the clear by re-reading the marker before commenting/excluding it (ga-faw5o rounds 2-3 pattern, applied here too)" \
   || bad "exile-recovery no longer re-reads before claiming success — the comment-claims-more-than-delivered gap is back"
-grep -q 'map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))' "$DISPATCHER" \
-  && ok "tier 1's select expression wires exile_overdue in alongside the existing is_overdue arm" || bad "tier 1 select expression drifted from the tested shape"
+grep -q 'select(has_rebase_fail and exile_overdue)' "$DISPATCHER" \
+  && ok "the exile-overdue admission is wired in as its own FIRST tier (ga-q8tj7p removed the overdue-healthy arm it used to share)" || bad "the exile-overdue admission drifted from the tested shape"
+grep -q 'select(has_rebase_fail and (exile_overdue | not))' "$DISPATCHER" \
+  && ok "an exiled marker NOT yet admitted sinks to the back, the complement of the admission (no marker is in both)" || bad "the complement tier (exiled but not overdue) is missing"
 
 echo ""
 echo "── SECTION D: INTEGRATION — the literal Aceite #1 shape, both invariants chained ──"
@@ -397,12 +412,23 @@ HEALTHY_TEN_B="[]"
 for i in $(seq 1 10); do
   HEALTHY_TEN_B=$(printf '%s\n' "$HEALTHY_TEN_B" | jq -c --argjson m "$(mkb "healthy$i" "$(ago 600)" "gate-status:queued")" '. + [$m]')
 done
-SWEEP2=$(printf '%s\n' "$HEALTHY_TEN_B" | jq -c --argjson m "$(mkb exiled_clean "$(ago 10)" "gate-status:queued")" '. + [$m]')
-SEL=$(select_marker2 "$SELECT_BLOCK" "$SWEEP2" "$NOW_EPOCH" "$THRESH" "$HARD")
+# exiled_clean is the OLDEST marker (900s vs the others' 600s): once its exile labels are gone it
+# competes in the ordinary order and, being oldest within the shared class, goes first.
+SWEEP2=$(printf '%s\n' "$HEALTHY_TEN_B" | jq -c --argjson m "$(mkb exiled_clean "$(ago 900)" "gate-status:queued")" '. + [$m]')
+SEL=$(select_marker2 "$SELECT_BLOCK" "$SWEEP2" "$NOW_EPOCH")
 if [ "$SEL" = "exiled_clean" ]; then
-  ok "on the NEXT sweep's fresh fetch (exile labels gone from Dolt), exiled_clean competes as an ordinary healthy marker and wins on the normal newest-first tiebreak — this is the literal Aceite #1 shape: 10 healthy + 1 exiled-clean, back to the normal tier on the next sweep"
+  ok "on the NEXT sweep's fresh fetch (exile labels gone from Dolt), exiled_clean competes as an ordinary healthy marker and goes first on the ordinary age order (oldest in its class) — this is the literal Aceite #1 shape: 10 healthy + 1 exiled-clean, back to the normal order on the next sweep"
 else
   bad "expected exiled_clean to win the next sweep as an ordinary healthy marker, got '$SEL'"
+fi
+# Control: the SAME marker while it still carries a young exile label sinks behind all ten. So the win above
+# is the clearing's doing, not an artifact of the fixture.
+SWEEP2_CTRL=$(printf '%s\n' "$HEALTHY_TEN_B" | jq -c --argjson m "$(mkb exiled_clean "$(ago 900)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-600))")" '. + [$m]')
+SEL=$(select_marker2 "$SELECT_BLOCK" "$SWEEP2_CTRL" "$NOW_EPOCH")
+if [ "$SEL" = "healthy1" ]; then
+  ok "control: with the exile labels still on (young exile), the same marker sinks behind the ten healthy ones — so the recovery clearing is what puts it back in the order"
+else
+  bad "control: expected healthy1 with the exile labels still present, got '$SEL'"
 fi
 
 echo ""
@@ -413,21 +439,19 @@ echo "──  failing IDENTICALLY (gate:rebase-fail-count climbing past 60) stay
 echo "──  the exile-age ceiling, and because tier 1 sorts oldest-created_at-first it wins EVERY sweep,"
 echo "──  starving the whole queue behind it — measured live: 59 consecutive sweeps, 2.5h, marker ga-r6bore) ──"
 
-# select_marker3 <block> <markers_json> <now> <age> <hard> <exile_ceiling> [<retry_ceiling>]
+# select_marker3 <block> <markers_json> <now> <exile_ceiling> [<retry_ceiling>]
 # retry_ceiling omitted leaves GATE_EXILE_RETRY_CEILING UNSET, so the block's
 # own default (3) governs — mirrors select_marker2's own exile_ceiling
 # omission convention above, for the same reason (test E4 below needs it).
 select_marker3() {
-  local block="$1" markers_json="$2" now_epoch="$3" age_threshold="$4" hard_threshold="$5" exile_ceiling="$6"
-  if [ "$#" -ge 7 ]; then
+  local block="$1" markers_json="$2" now_epoch="$3" exile_ceiling="$4"
+  if [ "$#" -ge 5 ]; then
     MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
-    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
-    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" GATE_EXILE_RETRY_CEILING="$7" GATE_PRIORITY_AUTHORS="oracle" \
+    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" GATE_EXILE_RETRY_CEILING="$5" \
     bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
   else
     MARKERS_JSON="$markers_json" GATE_MARKER_NOW_OVERRIDE_EPOCH="$now_epoch" \
-    GATE_MARKER_AGE_PROMOTE_SECONDS="$age_threshold" GATE_MARKER_HARD_AGE_SECONDS="$hard_threshold" \
-    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" GATE_PRIORITY_AUTHORS="oracle" \
+    GATE_EXILE_OVERDUE_SECONDS="$exile_ceiling" \
     bash -c "$block"$'\necho "$MARKER_ID"' 2>/dev/null
   fi
 }
@@ -436,7 +460,7 @@ echo "── (E1) THE FIX: exile_overdue by TIME but retry count >= ceiling — 
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh_e1  "$(ago 60)"  "gate-status:queued")" \
   "$(mkb runaway_e1 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:61,gate:exiled-since:$((NOW_EPOCH-999999))")")
-SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD" 3)
 [ "$SEL" = "fresh_e1" ] && ok "runaway marker (attempt=61, exiled 999999s ago) no longer wins tier 1 over a fresh healthy marker — the ga-r5dsgp head-of-line block this fix exists to stop" \
   || bad "expected fresh_e1, got '$SEL' — a marker past its own retry ceiling is still dominating tier 1 (ga-r5dsgp regression)"
 
@@ -445,7 +469,7 @@ FIX=$(printf '[%s,%s,%s]' \
   "$(mkb fresh_e2   "$(ago 60)"   "gate-status:queued")" \
   "$(mkb aged_e2    "$(ago 2000)" "gate-status:queued")" \
   "$(mkb exiled_e2  "$(ago 300)"  "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-5500))")")
-SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD" 3)
 [ "$SEL" = "exiled_e2" ] && ok "attempt=2 < ceiling=3 — still admitted to tier 1 by its overdue exile clock, exactly as Section B already proves (no regression)" \
   || bad "expected exiled_e2, got '$SEL' — the ceiling over-applied and blocked a marker still inside its retry budget"
 
@@ -453,7 +477,7 @@ echo "── (E3) boundary: attempt count EXACTLY AT the ceiling is excluded (st
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh_e3    "$(ago 60)"  "gate-status:queued")" \
   "$(mkb atceiling_e3 "$(ago 300)" "gate-status:queued,gate:exiled-tier5:3,gate:exiled-since:$((NOW_EPOCH-999999))")")
-SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 3)
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD" 3)
 [ "$SEL" = "fresh_e3" ] && ok "attempt count exactly AT the ceiling (3) is excluded, not just strictly-above — off-by-one matches MAX_REBASE_ATTEMPTS's own semantics (Step 4c: attempt>=MAX circuit-breaks)" \
   || bad "expected fresh_e3, got '$SEL' — attempt==ceiling should already be excluded"
 
@@ -465,12 +489,12 @@ echo "── (E4) default: leaving GATE_EXILE_RETRY_CEILING unset resolves to 3 
 FIX=$(printf '[%s,%s]' \
   "$(mkb fresh_e4    "$(ago 60)"  "gate-status:queued")" \
   "$(mkb runaway_e4  "$(ago 300)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
-SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD")
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD")
 [ "$SEL" = "fresh_e4" ] && ok "leaving GATE_EXILE_RETRY_CEILING unset defaults to 3 — attempt=9 is excluded from exile_overdue admission without an explicit override" \
   || bad "expected fresh_e4, got '$SEL' — default retry ceiling not wired"
 # ...and the same fixture WITHOUT the ceiling must admit the runaway, otherwise
 # E4 above could pass because the runaway was never a tier-1 candidate at all.
-SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" 99)
+SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX" "$NOW_EPOCH" "$HARD" 99)
 [ "$SEL" = "runaway_e4" ] && ok "E4 control: with the ceiling raised to 99 the SAME runaway IS admitted to tier 1 — so E4's exclusion is the ceiling's doing, not an artifact of the fixture" \
   || bad "E4 control: expected runaway_e4 with ceiling=99, got '$SEL' — the E4 fixture never reaches exile_overdue, so E4 proves nothing"
 
@@ -480,8 +504,7 @@ echo "── (E5) gate-feedback-style regression: malformed GATE_EXILE_RETRY_CEI
 # old fixture (no exile labels at all) selected the same marker regardless.
 FIX5=$(printf '[%s,%s]' "$(mkb e5a "$(ago 300)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")" "$(mkb e5b "$(ago 60)" "gate-status:queued")")
 SEL=$(MARKERS_JSON="$FIX5" GATE_MARKER_NOW_OVERRIDE_EPOCH="$NOW_EPOCH" \
-  GATE_MARKER_AGE_PROMOTE_SECONDS="$THRESH" GATE_MARKER_HARD_AGE_SECONDS="$HARD" \
-  GATE_EXILE_OVERDUE_SECONDS="$HARD" GATE_EXILE_RETRY_CEILING="not-a-number" GATE_PRIORITY_AUTHORS="oracle" \
+  GATE_EXILE_OVERDUE_SECONDS="$HARD" GATE_EXILE_RETRY_CEILING="not-a-number" \
   bash -c "set -euo pipefail; $SELECT_BLOCK"$'\necho "$MARKER_ID"' 2>/dev/null)
 STATUS=$?
 if [ "$STATUS" = "0" ] && [ "$SEL" = "e5b" ]; then
@@ -500,7 +523,7 @@ FIX7=$(printf '[%s,%s,%s]' \
   "$(mkb inside_e7  "$(ago 300)" "gate-status:queued,gate:exiled-tier5:2,gate:exiled-since:$((NOW_EPOCH-999999))")" \
   "$(mkb runaway_e7 "$(ago 400)" "gate-status:queued,gate:exiled-tier5:9,gate:exiled-since:$((NOW_EPOCH-999999))")")
 for CEIL in 03 0 000 ; do
-  SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX7" "$NOW_EPOCH" "$THRESH" "$HARD" "$HARD" "$CEIL")
+  SEL=$(select_marker3 "$SELECT_BLOCK" "$FIX7" "$NOW_EPOCH" "$HARD" "$CEIL")
   [ "$SEL" = "inside_e7" ] && ok "GATE_EXILE_RETRY_CEILING='$CEIL' behaves as a normal ceiling of 3: the attempt=2 marker is admitted, the attempt=9 runaway is not" \
     || bad "GATE_EXILE_RETRY_CEILING='$CEIL' selected '$SEL', expected inside_e7 (zero silently disabled exile_overdue admission, or a leading zero was not normalized)"
 done

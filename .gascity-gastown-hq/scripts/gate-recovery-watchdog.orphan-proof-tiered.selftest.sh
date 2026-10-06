@@ -17,14 +17,25 @@
 #      condition trips for every head in turn (each false positive would hold the single repair-dog slot a real
 #      outage needs).
 #
-# THE PROOF NOW (see the watchdog's module docstring): only an OVERDUE head can be proven skipped, because tier 1
-# is priority-blind oldest-first over every overdue healthy marker — so a marker created AFTER the head cannot be
-# claimed while the head is eligible. Four groups below:
-#   A. the premise, against the dispatcher's REAL marker-select block (extracted by its sentinels, never a copy);
-#   B. the pure core: labels that legitimately sink a head, cooldown, log reach, witness rules, boundaries;
-#   C. the overdue ceiling is DERIVED from the dispatcher (source + launchd env) and equals what bash computes;
-#   D. end to end through orphaned_queued_marker() with a faked bd/launchctl: the 25/09 ga-b9pz7q shape stays
-#      SILENT, a genuine skip is FLAGGED, the witness lookups are bounded and cached, "cannot prove" is NOTED.
+# THE PROOF (see the watchdog's module docstring): only an OVERDUE head can be proven skipped, because tier 1
+# was priority-blind oldest-first over every overdue healthy marker — so a marker created AFTER the head could not be
+# claimed while the head was eligible.
+#
+# ga-q8tj7p (2026-10-06) REMOVED that tier: the dispatcher's order is now priority > feature > age, so a newer P0
+# legitimately beats an older P3 and the proof's premise is false. The watchdog now checks the premise in the
+# dispatcher source (_dispatcher_has_overdue_tier) and, while it is absent, reports no orphan and says so once an
+# hour; the machinery below is dormant, not deleted (rebuilding it for the new order, or deleting it: ga-dtecvq).
+# So the groups are:
+#   A. the premise is GONE from the dispatcher's REAL marker-select block (extracted by its sentinels, never a copy),
+#      and the two legitimate "passed over" cases (exiled, cooldown) still hold;
+#   B. the pure core (dormant): labels that legitimately sink a head, cooldown, log reach, witness rules, boundaries;
+#   C. the overdue ceiling is DERIVED from a dispatcher source and equals what bash computes — against a LEGACY
+#      fixture, because the real dispatcher no longer has the preamble it parses;
+#   D. end to end through orphaned_queued_marker() with a faked bd/launchctl, against the LEGACY fixture: the 25/09
+#      ga-b9pz7q shape stays SILENT, a genuine skip is FLAGGED, witness lookups are bounded and cached, "cannot prove"
+#      is NOTED — i.e. if an overdue tier ever returns, the proof resumes unchanged;
+#   E. end to end against the REAL dispatcher: the very shape D flags stays SILENT, the note says why, no queue read
+#      is spent, and an UNREADABLE dispatcher source is not mistaken for "tier gone".
 #
 # Group D is written against orphaned_queued_marker() alone (same public shape before and after this fix), so
 #   WD_OVERRIDE=<older copy of the watchdog> bash ...      shows the false positive on the code before ga-yprwyk.
@@ -62,6 +73,26 @@ m = load()
 TMP = tempfile.mkdtemp(prefix="grw-tiered-")
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 
+# A LEGACY dispatcher source: the marker-select preamble and tier as they stood when this proof was written
+# (ga-yprwyk) and until ga-q8tj7p. Not a copy of logic under test — it is the INPUT the dormant parser and the
+# premise check are pointed at, so the machinery that would resume if an overdue tier returned stays honestly tested.
+LEGACY_SRC = r'''#!/usr/bin/env bash
+# legacy fixture (ga-yprwyk-era marker-select), see gate-recovery-watchdog.orphan-proof-tiered.selftest.sh
+# SELFTEST-EXTRACT marker-select: BEGIN
+GATE_MARKER_AGE_PROMOTE_SECONDS="${GATE_MARKER_AGE_PROMOTE_SECONDS:-1800}"
+case "$GATE_MARKER_AGE_PROMOTE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_AGE_PROMOTE_SECONDS=1800 ;; esac
+GATE_MARKER_HARD_AGE_SECONDS="${GATE_MARKER_HARD_AGE_SECONDS:-$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3))}"
+case "$GATE_MARKER_HARD_AGE_SECONDS" in ''|*[!0-9]*) GATE_MARKER_HARD_AGE_SECONDS=$((GATE_MARKER_AGE_PROMOTE_SECONDS * 3)) ;; esac
+MARKER=$(printf '%s\n' "$MARKERS_JSON" | jq --argjson hard_threshold "$GATE_MARKER_HARD_AGE_SECONDS" '
+  def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;
+  (map(select(is_overdue)) | sort_by(.created_at)) | .[0]')
+# SELFTEST-EXTRACT marker-select: END
+log "Attempting to claim marker $MARKER_ID ..."
+'''
+LEGACY_PATH = os.path.join(TMP, "legacy-quality-gate-dispatcher.sh")
+with open(LEGACY_PATH, "w", encoding="utf-8") as _f:
+    _f.write(LEGACY_SRC)
+
 PASS = FAIL = 0
 def ok(msg):
     global PASS; PASS += 1; print("  ok: %s" % msg)
@@ -86,50 +117,60 @@ def dl(t, body): return "[%s] [quality-gate-dispatcher] %s" % (fmt(t), body)
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
 # A. The premise, against the dispatcher's REAL marker-select block
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
-print("Group A: the proof's premise holds in the dispatcher's own marker-select block (extracted by sentinel, run under bash)")
+print("Group A: the proof's premise is GONE from the dispatcher's own marker-select block (extracted by sentinel, run under bash)")
 block = subprocess.run(["sed", "-n", "/# SELFTEST-EXTRACT marker-select: BEGIN/,/# SELFTEST-EXTRACT marker-select: END/p", dispatcher],
                        capture_output=True, text=True).stdout
 check(bool(block.strip()), "located the live marker-select block via its sentinels")
 
-def mk(mid, created, author="mila", labels=("gate-status:queued",)):
-    return {"id": mid, "created_at": iso(created), "description": "branch: crew/%s/%s" % (author, mid), "labels": list(labels)}
+def mk(mid, created, author="mila", labels=("gate-status:queued",), prio=2, typ="task"):
+    return {"id": mid, "created_at": iso(created), "description": "branch: crew/%s/%s" % (author, mid), "labels": list(labels),
+            "src_class": {"state": "ok", "priority": prio, "type": typ}}
 
 def real_select(markers, now=NOW, env=None):
     e = {k: v for k, v in os.environ.items() if not k.startswith("GATE_")}
-    e.update({"MARKERS_JSON": json.dumps(markers), "GATE_MARKER_NOW_OVERRIDE_EPOCH": str(int(now)),
-              "GATE_MARKER_AGE_PROMOTE_SECONDS": "1800", "GATE_MARKER_HARD_AGE_SECONDS": str(HARD), "GATE_PRIORITY_AUTHORS": "oracle"})
+    e.update({"MARKERS_JSON": json.dumps(markers), "GATE_MARKER_NOW_OVERRIDE_EPOCH": str(int(now))})
     e.update(env or {})
     r = subprocess.run(["bash", "-c", block + '\necho "$MARKER_ID"'], env=e, capture_output=True, text=True)
     return r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
 
 if block.strip():
-    # A1: the exact shape of the false positive — an overdue healthy head and a FRESH priority marker behind it.
-    sel = real_select([mk("head", NOW - 6000), mk("newer", NOW - 60, "oracle")])
-    check(sel == "head", "overdue healthy head beats a fresh PRIORITY marker (got %r) — the ceiling is priority-blind, so a newer claim contradicts an eligible head" % sel)
-    # A2: two overdue markers -> oldest first.
-    sel = real_select([mk("newer-overdue", NOW - 6000), mk("head", NOW - 7000)])
-    check(sel == "head", "of two overdue markers the OLDEST is selected (got %r) — a newer marker cannot precede it" % sel)
-    # A3: a rebase-fail head legitimately loses (tier 7) — the watchdog must treat it as explained.
+    # A1: THE shape the old proof flagged as an orphan — an overdue head and a NEWER marker claimed ahead of it. Under
+    # the new order that is the design: the newer marker is P0, the head is P3.
+    sel = real_select([mk("head", NOW - 6000, prio=3), mk("newer", NOW - 60, prio=0)])
+    check(sel == "newer", "an OVERDUE P3 head loses to a newer P0 (got %r) — 'a newer marker was claimed' proves nothing any more" % sel)
+    # A2: ...and age alone never promotes: even 100 hours of waiting does not beat a higher class.
+    sel = real_select([mk("head", NOW - 360000, prio=3), mk("newer", NOW - 60, prio=1)])
+    check(sel == "newer", "100h of waiting does not beat a higher class (got %r) — there is no overdue ceiling to hang a proof on" % sel)
+    # A3: a rebase-fail head legitimately loses — the watchdog must treat it as explained.
     sel = real_select([mk("head", NOW - 6000, labels=("gate-status:queued", "gate:exiled-tier5:2")), mk("newer", NOW - 60)])
-    check(sel == "newer", "an exiled (gate:exiled-tier5) overdue head is legitimately passed over (got %r)" % sel)
+    check(sel == "newer", "an exiled (gate:exiled-tier5) head is legitimately passed over (got %r)" % sel)
     # A4: a head inside its retry cooldown is excluded from EVERY tier.
     sel = real_select([mk("head", NOW - 6000, labels=("gate-status:queued", "gate:retry-cooldown-until:%d" % (NOW + 600))), mk("newer", NOW - 60)])
     check(sel == "newer", "a head inside its retry cooldown is legitimately passed over (got %r)" % sel)
-    # A5: a YOUNG head (aged but not overdue) is legitimately passed over by a fresh priority marker.
-    sel = real_select([mk("head", NOW - 3000), mk("newer", NOW - 60, "oracle")])
-    check(sel == "newer", "a head still under the ceiling loses to a fresh priority marker BY DESIGN (got %r) — no claim order proves a skip there" % sel)
 
-    # the watchdog's verdict must AGREE with the dispatcher on each of those same fixtures
+    # the premise check agrees: the real source has no overdue tier, the legacy fixture does
+    if hasattr(m, "_dispatcher_has_overdue_tier_from"):
+        real_src = open(dispatcher, encoding="utf-8", errors="replace").read()
+        check(m._dispatcher_has_overdue_tier_from(real_src) is False, "the watchdog reads the REAL dispatcher as having NO overdue tier (got %r)" % (m._dispatcher_has_overdue_tier_from(real_src),))
+        check(m._dispatcher_has_overdue_tier_from(LEGACY_SRC) is True, "...and the legacy fixture as having one (got %r)" % (m._dispatcher_has_overdue_tier_from(LEGACY_SRC),))
+        check(m._dispatcher_has_overdue_tier_from("") is None, "an empty source is UNKNOWN (None), not 'gone'")
+        check(m._dispatcher_has_overdue_tier_from("def is_overdue: 1;\n") is None, "a source without the marker-select block is UNKNOWN (None): the shape moved, nothing is established")
+        check(m._dispatcher_has_overdue_tier_from("# SELFTEST-EXTRACT marker-select: BEGIN\nx\n# SELFTEST-EXTRACT marker-select: END\ndef is_overdue: 1;\n") is False,
+              "a `def is_overdue:` OUTSIDE the block (another jq program) does not answer for the block")
+    else:
+        bad("watchdog has no _dispatcher_has_overdue_tier_from — the retirement of the orphan proof (ga-q8tj7p) has not landed")
+    # the premise is checked in the source text too, so a regression that re-adds an overdue tier (and so re-arms the proof) is seen
+    check("def is_overdue" not in block, "the real marker-select block defines no is_overdue (the tier the proof leaned on)")
+
+    # the watchdog's verdict still AGREES with the dispatcher on the two cases that stay legitimate
     if need_core("agreement with the real block"):
         def verdict(head_age, labels, claim_ago=300, hard=HARD):
             created = NOW - head_age
             markers = [("ga-head", "crew/x/head", created, tuple(labels))]
             return m._orphan_verdict(markers, [NOW - 60], [(NOW - claim_ago, "ga-newer")], NOW - 30000, hard,
                                      lambda x: {"ga-newer": NOW - head_age + 1800}.get(x), NOW)[1]
-        check(verdict(6000, ["gate-status:queued"]) == "orphan", "overdue healthy head + a newer claim -> the watchdog flags it (the dispatcher would have picked the head: A1/A2)")
         check(verdict(6000, ["gate-status:queued", "gate:exiled-tier5:2"]) == "sunk-by-label", "exiled head -> the watchdog calls it explained (A3)")
         check(verdict(6000, ["gate-status:queued", "gate:retry-cooldown-until:%d" % (NOW + 600)]) == "no-witness", "head in cooldown at the claim -> the watchdog calls it explained (A4)")
-        check(verdict(3000, ["gate-status:queued"]) == "young", "young head -> the watchdog does not call it skipped (A5)")
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
 # B. The pure core
@@ -188,16 +229,21 @@ if need_core("group B"):
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
 # C. The ceiling is DERIVED from the dispatcher, and equals what bash computes
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
-print("Group C: the overdue ceiling is derived from the dispatcher source + launchd env, and matches bash")
+print("Group C: the overdue ceiling is derived from a dispatcher source + launchd env, and matches bash (against the LEGACY fixture — the real dispatcher no longer has the preamble)")
 if need_core("group C"):
-    src = open(dispatcher, encoding="utf-8", errors="replace").read()
+    src = LEGACY_SRC
+    legacy_block = subprocess.run(["sed", "-n", "/# SELFTEST-EXTRACT marker-select: BEGIN/,/# SELFTEST-EXTRACT marker-select: END/p", LEGACY_PATH],
+                                  capture_output=True, text=True).stdout
+    real_src_c = open(dispatcher, encoding="utf-8", errors="replace").read()
+    check(m._dispatcher_hard_age_from(real_src_c, "\tenvironment = {\n\t}\n") is None,
+          "the REAL dispatcher has no overdue-ceiling preamble any more -> None (an UNKNOWN ceiling is never guessed)")
     NO_ENV = "\tenvironment = {\n\t\tGATE_CODE_REVIEWERS => 1\n\t}\n"
     check(m._dispatcher_hard_age_from(src, NO_ENV) == HARD, "the real dispatcher source with no override -> %ds (got %r)" % (HARD, m._dispatcher_hard_age_from(src, NO_ENV)))
     check(m._dispatcher_hard_age_from(src, None) is None, "launchd environment unreadable -> None (an override cannot be ruled out)")
     check(m._dispatcher_hard_age_from("", NO_ENV) is None, "dispatcher source unreadable -> None")
     check(m._dispatcher_hard_age_from("GATE_MARKER_AGE_PROMOTE_SECONDS=1800\n", NO_ENV) is None, "the preamble changed shape -> None (never a guess)")
     # bash is the oracle: evaluate the dispatcher's own preamble assignments under each override and compare
-    preamble = block.split('MARKER=$(printf', 1)[0] if block else ""
+    preamble = legacy_block.split('MARKER=$(printf', 1)[0] if legacy_block else ""
     def bash_ceiling(env):
         e = {k: v for k, v in os.environ.items() if not k.startswith("GATE_")}
         e.update(env)
@@ -216,33 +262,31 @@ if need_core("group C"):
     two_seen = "\tinherited environment = {\n\t\tGATE_MARKER_HARD_AGE_SECONDS => 1111\n\t}\n\tenvironment = {\n\t\tGATE_MARKER_HARD_AGE_SECONDS => 2222\n\t}\n"
     check(m._dispatcher_hard_age_from(src, two_seen) == 2222, "the job's own environment (listed last) wins over the inherited one")
 
-    # drift guards: the proof leans on these exact facts about the dispatcher
-    claim_at = src.find('log "Attempting to claim marker $MARKER_ID ..."')
-    end_at = src.find("# SELFTEST-EXTRACT marker-select: END")
-    check(0 < end_at < claim_at and claim_at - end_at < 400,
-          "the claim line the watchdog parses is still logged right after the marker-select block")
-    check("def is_overdue: try (($now - (.created_at | fromdateiso8601)) > $hard_threshold) catch false;" in block, "is_overdue is still 'age > hard ceiling' on created_at")
-    check("(map(select((is_overdue and (has_rebase_fail | not)) or (has_rebase_fail and exile_overdue))) | sort_by(.created_at))" in block,
-          "tier 1 is still oldest-first over overdue healthy markers — the fact the whole proof rests on")
+    # drift guards on the REAL dispatcher: the facts the (dormant) proof still reads from it
+    claim_at = real_src_c.find('log "Attempting to claim marker $MARKER_ID ..."')
+    end_at = real_src_c.find("# SELFTEST-EXTRACT marker-select: END")
+    check(0 < end_at < claim_at, "the claim line the watchdog parses is still logged after the marker-select block, in the exact shape DISPATCH_CLAIM_RE matches")
+    check(real_src_c.count('log "Attempting to claim marker $MARKER_ID ..."') == 1, "...and exactly once per selection")
     check("map(select(in_retry_cooldown | not))" in block and 'test("^gate:(rebase-attempt|exiled-tier5):[0-9]+$")' in block,
           "the sink states (cooldown, rebase-attempt / exiled-tier5) are still the ones the watchdog exempts")
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
 # D. End to end through orphaned_queued_marker() with a faked bd / launchctl
 # ═════════════════════════════════════════════════════════════════════════════════════════════════════
-print("Group D: end to end — the 25/09 ga-b9pz7q shape is SILENT; a genuine skip is FLAGGED")
+print("Group D: end to end against the LEGACY source — the 25/09 ga-b9pz7q shape is SILENT; a genuine skip is FLAGGED (dormant machinery, ready if an overdue tier returns)")
 
 CP = subprocess.CompletedProcess
 class World(object):
     """A fake bd + launchctl + dispatcher log. Both the old and the new watchdog talk to the world through m.sh."""
     def __init__(self, queue, show=None, launchd=None):
-        self.queue, self.show, self.launchd, self.show_calls = queue, show or {}, launchd, 0
+        self.queue, self.show, self.launchd, self.show_calls, self.list_calls = queue, show or {}, launchd, 0, 0
     def sh(self, args, timeout=20, stdin=None):
         if args and args[0] == "launchctl":
             return CP(args, 0, self.launchd, "") if self.launchd is not None else CP(args, 113, "", "Could not find service")
         if len(args) > 4 and args[0] == "bash" and args[2] == "-C":
             sub = args[4]
             if sub == "list":
+                self.list_calls += 1
                 return CP(args, 0, json.dumps(self.queue), "")
             if sub == "show":
                 self.show_calls += 1
@@ -266,21 +310,21 @@ def write_log(name, lines):
         f.write(("\n".join(lines) + "\n").encode("utf-8"))
     return p
 
-def run_world(world, log_path):
+def run_world(world, log_path, src_path=None):
     """One poll of orphaned_queued_marker() against the world; returns (result, stdout)."""
-    for c in (getattr(m, "_HARD_AGE_CACHE", None),):
+    for c in (getattr(m, "_HARD_AGE_CACHE", None), getattr(m, "_ORDER_PREMISE_CACHE", None)):
         if c is not None:
             c.update({"at": 0.0, "value": None})
     for c in (getattr(m, "_MARKER_CREATED_CACHE", None), getattr(m, "_ORPHAN_NOTED", None), getattr(m, "_ORPHAN_EVIDENCE", None)):
         if c is not None:
             c.clear()
-    return _poll(world, log_path)
+    return _poll(world, log_path, src_path)
 
-def _poll(world, log_path):
+def _poll(world, log_path, src_path=None):
     saved = (m.sh, m.DISPATCH_LOG, getattr(m, "DISPATCHER_SRC", None))
     m.sh, m.DISPATCH_LOG = world.sh, log_path
     if hasattr(m, "DISPATCHER_SRC"):
-        m.DISPATCHER_SRC = dispatcher            # hermetic: derive the ceiling from THIS branch's dispatcher, not the live checkout
+        m.DISPATCHER_SRC = src_path or LEGACY_PATH   # hermetic: never the live checkout; Group D = the legacy fixture, Group E passes the real one
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -399,6 +443,29 @@ if HAVE_CORE:
     res, out = run_world(world, write_log("young.log", [dl(NOW - 30000, "Found 3 queued marker(s)"), dl(NOW - 100, "Attempting to claim marker %s ..." % NEXT),
                                                           dl(NOW - 60, "=== Dispatcher sweep complete: branch=crew/x/last verdict=PASSED ===")]))
     check(res == (None, None, 0), "a 50-minute-old head with a NEWER marker claimed (priority / freshest-reserve, by design) -> silent (got %r)" % (res,))
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════
+# E. End to end against the REAL dispatcher (ga-q8tj7p): the proof is retired, loudly and cheaply
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════
+print("Group E: end to end against the REAL dispatcher — the shape D2 flags is SILENT, and the note says why")
+if hasattr(m, "_dispatcher_has_overdue_tier"):
+    skip_extra = [dl(NOW - 400, "Attempting to claim marker %s ..." % NEXT)]
+    world = World(queue, SHOW, LAUNCHD_OK)
+    res, out = run_world(world, healthy_log("e-skip.log", skip_extra), dispatcher)
+    check(res == (None, None, 0), "the genuine-skip shape of D2 is SILENT against the real dispatcher (got %r) — a newer claim proves nothing under priority > feature > age" % (res,))
+    check("orphan-proof unavailable (order-changed)" in out and "ga-dtecvq" in out,
+          "...and it SAYS why, naming the follow-up (got %r) — silence would read as 'no orphan'" % out.strip()[:140])
+    check(world.list_calls == 0 and world.show_calls == 0,
+          "...and spends no queue read and no witness lookup on a proof that cannot be made (list=%d show=%d)" % (world.list_calls, world.show_calls))
+    res2, out2 = _poll(world, healthy_log("e-skip2.log", skip_extra), dispatcher)
+    check(res2 == (None, None, 0) and out2 == "", "the note is rate-limited: the next poll is silent")
+    # UNKNOWN is not GONE: with the dispatcher source unreadable the watchdog keeps its old behaviour (and its old, honest note)
+    world = World(queue, SHOW, LAUNCHD_OK)
+    res3, out3 = run_world(world, healthy_log("e-unread.log", skip_extra), os.path.join(TMP, "no-such-dispatcher.sh"))
+    check(res3 == (None, None, 0) and "order-changed" not in out3 and "orphan-proof unavailable (tunables)" in out3,
+          "an UNREADABLE dispatcher source is not read as 'tier gone': no 'order-changed' retirement, the pre-existing 'tunables' note instead (got %r, out=%r)" % (res3, out3.strip()[:120]))
+else:
+    bad("watchdog has no _dispatcher_has_overdue_tier — the retirement of the orphan proof (ga-q8tj7p) has not landed")
 
 print("\nPASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
