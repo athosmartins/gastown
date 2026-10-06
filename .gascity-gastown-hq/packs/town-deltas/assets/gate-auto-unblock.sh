@@ -170,6 +170,19 @@
 #      ⇒ se QUALQUER label presente cai fora de UNBLOCKABLE_VARIANTS, o
 #        bead inteiro fica de fora — ver has_protected_variant().
 #
+#   F) (ga-fykclp) o approved-state-reconciler (ga-gm5rv5) estaciona bead
+#      técnico com next-action:mayor + "Pergunta:" e MANTÉM o gate:needs-human*.
+#      Tirar só o gate deixava o next-action:mayor, e o veto do Pilot
+#      (next-action:* sem verbo de build) seguia valendo: bead "destravado"
+#      que nunca volta pra fila, sem alarme.
+#      ⇒ strip_lock tira next-action:mayor (nome EXATO) quando ele coexiste
+#        com gate:needs-human* na lista — ver carries_mayor_next_action().
+#        Outros next-action:* (delegação a crew) nunca são tocados.
+#      ⇒ ORDEM: next-action:mayor ANTES do gate. A varredura lista por
+#        gate:needs-human*; com o gate fora e o next-action falhando, o bead
+#        sairia do escopo e o veto ficaria órfão, sem retry. Falhou o
+#        next-action → o gate nem é tocado e a próxima varredura tenta de novo.
+#
 # ────────────────────────────────────────────────────────────────────
 # TEST SEAM: BD/GC/GIT/NOTIFY são sobreponíveis para o selftest hermético.
 # DRY_RUN=1 → decide e loga, não muta nada.
@@ -506,6 +519,23 @@ has_fix_attempt_cap_escalation() {
   [ "$max" -ge "$GATE_AUTO_UNBLOCK_FIX_ATTEMPT_CAP" ]
 }
 
+# carries_mayor_next_action <labels-multilinha> — rc0 SÓ se a lista JÁ
+# BUSCADA tem next-action:mayor (nome exato) E alguma gate:needs-human* ao
+# mesmo tempo (ga-fykclp: "só se coexistiu com a trava"). Mesma lista que
+# has_protected_variant validou — não rebusca. Sem a trava na lista, o
+# next-action:mayor é do Mayor por outro motivo e não é deste script.
+NEXT_ACTION_MAYOR="next-action:mayor"
+carries_mayor_next_action() {
+  local v has_gate=0 has_na=0
+  while IFS= read -r v; do
+    case "$v" in
+      gate:needs-human*) has_gate=1 ;;
+      "$NEXT_ACTION_MAYOR") has_na=1 ;;
+    esac
+  done <<< "$1"
+  [ "$has_gate" = "1" ] && [ "$has_na" = "1" ]
+}
+
 # strip_lock <rig> <bead> <labels-multilinha> — remove TODAS as
 # variantes gate:needs-human* PRESENTES NA LISTA JÁ FORNECIDA (mesma
 # leitura que has_protected_variant já validou como segura — não
@@ -515,8 +545,17 @@ has_fix_attempt_cap_escalation() {
 # TODA remoção confirmou sucesso (ou DRY_RUN) — antes, `>/dev/null 2>&1`
 # sem checar `$?` fazia uma `bd label remove` falha ficar indistinguível
 # de sucesso pra quem chama. Ver main() pra como isto agora é usado.
+#
+# Retorno (ga-fykclp): 0 = tudo removido (ou DRY_RUN); 1 = uma ou mais
+# variantes gate:needs-human* NÃO saíram (next-action:mayor, se havia, JÁ
+# saiu); 2 = next-action:mayor não saiu e NENHUMA variante gate foi tocada.
+# apply_and_report distingue os três — o comentário no bead tem que dizer o
+# que de fato aconteceu com cada label, não só "falhou".
 strip_lock() {
   local rig="$1" id="$2" labels="$3" v ok=1
+  if carries_mayor_next_action "$labels" && [ "$DRY_RUN" != "1" ]; then
+    "$BD" -C "$rig" label remove "$id" "$NEXT_ACTION_MAYOR" >/dev/null 2>&1 || return 2
+  fi
   while IFS= read -r v; do
     [ -n "$v" ] || continue
     case "$v" in gate:needs-human*) : ;; *) continue ;; esac
@@ -786,15 +825,28 @@ decide() {
 # sucesso é REAL — a mensagem de falha nunca contém frase de sucesso.
 apply_and_report() {
   local rig="$1" id="$2" labels="$3" rule="$4" why="$5" success_suffix="$6"
-  local strip_ok=1 note_ok=1 note_text
-  strip_lock "$rig" "$id" "$labels" || strip_ok=0
-  if [ "$strip_ok" = "1" ]; then
-    note_text="AUTO-DESTRAVE $rule (ga-stu930): $why. $success_suffix"
-  else
-    note_text="AUTO-DESTRAVE $rule FALHOU (ga-stu930): $why — mas bd label remove falhou pra uma ou mais variantes gate:needs-human*; label(s) podem AINDA ESTAR PRESENTES, NÃO trate este bead como destravado."
-  fi
+  local strip_rc=0 note_ok=1 note_text had_na=0
+  carries_mayor_next_action "$labels" && had_na=1
+  strip_lock "$rig" "$id" "$labels" || strip_rc=$?
+  case "$strip_rc" in
+    0)
+      note_text="AUTO-DESTRAVE $rule (ga-stu930): $why. $success_suffix"
+      # ga-fykclp: o rastro tem que dizer que ESTE script tirou o marcador — quem
+      # investigar um next-action:mayor sumido acha aqui o porquê, e a "Pergunta:"
+      # dele segue nos comentários. Se o marcador era por outro motivo, readicionar.
+      [ "$had_na" = "1" ] && note_text="$note_text next-action:mayor também removido (ga-fykclp): coexistia com gate:needs-human*, e mantê-lo seguiria vetando o despacho do Pilot mesmo sem o gate. A \"Pergunta:\" dele continua nos comentários; se o marcador era por outro motivo que não a trava, readicione."
+      ;;
+    2)
+      # next-action:mayor não saiu → o gate nem foi tentado (ver strip_lock).
+      note_text="AUTO-DESTRAVE $rule FALHOU (ga-fykclp): $why — mas bd label remove next-action:mayor falhou; NENHUMA label gate:needs-human* foi tocada (o bead segue travado e a próxima varredura tenta de novo). next-action:mayor PODE AINDA ESTAR PRESENTE."
+      ;;
+    *)
+      note_text="AUTO-DESTRAVE $rule FALHOU (ga-stu930): $why — mas bd label remove falhou pra uma ou mais variantes gate:needs-human*; label(s) podem AINDA ESTAR PRESENTES, NÃO trate este bead como destravado."
+      [ "$had_na" = "1" ] && note_text="$note_text (next-action:mayor, esse sim, já foi removido.)"
+      ;;
+  esac
   note "$rig" "$id" "$note_text" || note_ok=0
-  [ "$strip_ok" = "1" ] && [ "$note_ok" = "1" ]
+  [ "$strip_rc" = "0" ] && [ "$note_ok" = "1" ]
 }
 
 # ── varredura ──────────────────────────────────────────────────────────

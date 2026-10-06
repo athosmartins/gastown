@@ -77,6 +77,11 @@ case "$SUBCMD" in
     # ou falha se a fixture pedir (label_remove_fail — blocking issue 1).
     [ "${4:-}" = "remove" ] || exit 0
     [ -f "$FX/label_remove_fail" ] && exit 1
+    # label_remove_fail.<label> (arquivo-gatilho, ga-fykclp): falha SÓ a remoção
+    # dessa label, deixando as outras passarem — o caso em que o gate:needs-human*
+    # sai e o next-action:mayor não (ou o inverso), que o gatilho global acima não
+    # consegue distinguir.
+    [ -f "$FX/label_remove_fail.${6:-}" ] && exit 1
     printf '%s %s\n' "${5:-}" "${6:-}" >> "$FX/removed.log"
     exit 0
     ;;
@@ -972,6 +977,116 @@ if printf '%s' "$OUT" | grep "R1 ga-3pkhtc-reset" >/dev/null; then
   ok "ga-3pkhtc: gate:fix-attempt:0 (reset humano) vence um :3 remanescente — R1-R4 voltam a decidir normalmente (ga-26df, mesma semântica que quality-gate-dispatcher.sh já usa pro próprio contador)"
 else
   bad "ga-3pkhtc: gate:fix-attempt:0 deveria sinalizar reset humano e liberar R1-R4 de novo, mesmo com um :3 remanescente coexistindo" "$OUT"
+fi
+
+# ── ga-fykclp: next-action:mayor deixado junto da trava ─────────────────
+# O approved-state-reconciler (ga-gm5rv5) estaciona bead técnico com
+# next-action:mayor + "Pergunta:" e MANTÉM gate:needs-human*. Quando este
+# script tirava só o gate, o next-action:mayor ficava e o veto do Pilot
+# (next-action:* sem verbo de build) continuava — o bead "destravado" não
+# voltava pra fila e nada acusava.
+
+# (1) caso base: coexistiu com o gate → sai junto, e ANTES do gate (a varredura
+# lista por gate:needs-human*; se o gate saísse primeiro e este falhasse, o
+# bead sairia do escopo da varredura com o veto preso pra sempre).
+setup ga-fykclp-ok '["gate:needs-human","next-action:mayor"]' '' '' ''
+OUT="$(run)"
+RL="$TMP/fx.ga-fykclp-ok/removed.log"
+NA_LN="$(grep -n '^ga-fykclp-ok next-action:mayor$' "$RL" 2>/dev/null | head -1 | cut -d: -f1)"
+GT_LN="$(grep -n '^ga-fykclp-ok gate:needs-human$' "$RL" 2>/dev/null | head -1 | cut -d: -f1)"
+if printf '%s' "$OUT" | grep "R1 ga-fykclp-ok" >/dev/null \
+   && [ -n "$NA_LN" ] && [ -n "$GT_LN" ] && [ "$NA_LN" -lt "$GT_LN" ] \
+   && grep -q 'next-action:mayor' "$TMP/fx.ga-fykclp-ok/comments.log" 2>/dev/null \
+   && printf '%s' "$OUT" | grep -E '(^|[^0-9])[1-9][0-9]* destravadas sem humano' >/dev/null; then
+  ok "ga-fykclp: next-action:mayor que coexistia com gate:needs-human* sai junto, ANTES do gate, e o comentário de auditoria o nomeia"
+else
+  bad "ga-fykclp: o auto-destrave deixou next-action:mayor pra trás (veto do Pilot permanece), ou removeu fora de ordem, ou calou no comentário" \
+    "OUT=$OUT REMOVED=$(cat "$RL" 2>/dev/null) COMMENT=$(cat "$TMP/fx.ga-fykclp-ok/comments.log" 2>/dev/null)"
+fi
+
+# (2) a CLASSE, não o literal: next-action:<outro> é delegação a crew nomeada
+# (ver reconciler, "ready, but delegated") e um nome parecido não casa — nada
+# disso é do reconciler, então nada disso sai.
+setup ga-fykclp-other '["gate:needs-human","next-action:wa-worker-constroi","next-action:mayor-review"]' '' '' ''
+OUT="$(run)"
+RL="$TMP/fx.ga-fykclp-other/removed.log"
+if printf '%s' "$OUT" | grep "R1 ga-fykclp-other" >/dev/null \
+   && grep -q '^ga-fykclp-other gate:needs-human$' "$RL" \
+   && ! grep -q 'next-action' "$RL"; then
+  ok "ga-fykclp: só next-action:mayor EXATO sai — next-action:<crew> e nome parecido (next-action:mayor-review) ficam"
+else
+  bad "ga-fykclp: removeu next-action:* que não é o do reconciler (apagaria delegação a crew)" "OUT=$OUT REMOVED=$(cat "$RL" 2>/dev/null)"
+fi
+
+# (3) variante protegida (:product = decisão do ATHOS): nenhuma label é tocada,
+# nem o next-action:mayor — o script não está destravando nada.
+setup ga-fykclp-prod '["gate:needs-human","gate:needs-human:product","next-action:mayor"]' '' '' ''
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "SKIP ga-fykclp-prod" >/dev/null && [ ! -s "$TMP/fx.ga-fykclp-prod/removed.log" ]; then
+  ok "ga-fykclp: bead com variante protegida (:product) segue intocado — next-action:mayor fica"
+else
+  bad "ga-fykclp: tocou em bead protegido (:product é do Athos)" "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-fykclp-prod/removed.log" 2>/dev/null)"
+fi
+
+# (4) R5 (escala pro humano, não destrava): o bead continua parado, então o
+# marcador de "vez do Mayor" tem que sobreviver.
+setup ga-fykclp-r5 '["gate:needs-human","next-action:mayor"]' 'origin/fix/ga-fykclp-r5' '+ abc' '1700000000' \
+  '[{"created_at":"2026-08-15T10:00:00Z","text":"VERDICT: FAIL sem detalhe"}]'
+OUT="$(run)"
+if printf '%s' "$OUT" | grep "R5 ga-fykclp-r5" >/dev/null && [ ! -s "$TMP/fx.ga-fykclp-r5/removed.log" ]; then
+  ok "ga-fykclp: R5 (escalado, não destravado) não remove next-action:mayor"
+else
+  bad "ga-fykclp: R5 não destrava nada — remover next-action:mayor aqui apagaria o aviso ao Mayor de um bead que segue parado" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-fykclp-r5/removed.log" 2>/dev/null)"
+fi
+
+# (5) falha ao remover next-action:mayor: o GATE NÃO PODE sair (senão o bead
+# deixa a varredura e o veto fica órfão sem retry) e o comentário permanente
+# tem que dizer exatamente isso — sem prometer gate removido, sem frase de sucesso.
+setup ga-fykclp-nafail '["gate:needs-human","next-action:mayor"]' '' '' ''
+touch "$TMP/fx.ga-fykclp-nafail/label_remove_fail.next-action:mayor"
+OUT="$(run)"
+CM="$TMP/fx.ga-fykclp-nafail/comments.log"
+if printf '%s' "$OUT" | grep "FALHA R1 ga-fykclp-nafail" >/dev/null \
+   && printf '%s' "$OUT" | grep "0 destravadas sem humano" >/dev/null \
+   && ! grep -q 'gate:needs-human' "$TMP/fx.ga-fykclp-nafail/removed.log" \
+   && grep -q 'AUTO-DESTRAVE R1 FALHOU' "$CM" \
+   && grep -q 'next-action:mayor' "$CM" \
+   && grep -qi 'nenhuma.*gate:needs-human.*tocada' "$CM" \
+   && ! grep -q 'Nenhum humano precisou olhar' "$CM"; then
+  ok "ga-fykclp: next-action:mayor falhando → gate NÃO sai (bead segue na varredura), FALHA reportada, comentário diz o que de fato aconteceu"
+else
+  bad "ga-fykclp: falha em next-action:mayor tem que deixar o gate no lugar e dizer isso no bead" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-fykclp-nafail/removed.log" 2>/dev/null) COMMENT=$(cat "$CM" 2>/dev/null)"
+fi
+
+# (6) o inverso: next-action:mayor saiu, o gate falhou. O comentário não pode
+# esconder que o gate pode seguir lá nem omitir que o marcador já se foi.
+setup ga-fykclp-gtfail '["gate:needs-human","next-action:mayor"]' '' '' ''
+touch "$TMP/fx.ga-fykclp-gtfail/label_remove_fail.gate:needs-human"
+OUT="$(run)"
+CM="$TMP/fx.ga-fykclp-gtfail/comments.log"
+if printf '%s' "$OUT" | grep "FALHA R1 ga-fykclp-gtfail" >/dev/null \
+   && grep -q '^ga-fykclp-gtfail next-action:mayor$' "$TMP/fx.ga-fykclp-gtfail/removed.log" \
+   && grep -q 'AUTO-DESTRAVE R1 FALHOU' "$CM" \
+   && grep -q 'AINDA ESTAR PRESENTES' "$CM" \
+   && grep -q 'next-action:mayor.*removido' "$CM" \
+   && ! grep -q 'Nenhum humano precisou olhar' "$CM"; then
+  ok "ga-fykclp: gate falhando depois de next-action:mayor sair → FALHA, comentário avisa que o gate pode seguir e que o marcador já foi removido"
+else
+  bad "ga-fykclp: falha do gate com next-action:mayor já removido tem que ser reportada com os dois fatos" \
+    "OUT=$OUT REMOVED=$(cat "$TMP/fx.ga-fykclp-gtfail/removed.log" 2>/dev/null) COMMENT=$(cat "$CM" 2>/dev/null)"
+fi
+
+# (7) DRY_RUN decide, não muta — incluindo o next-action:mayor.
+setup ga-fykclp-dry '["gate:needs-human","next-action:mayor"]' '' '' ''
+DRY_RUN=1 GC_CITY_PATH="$TMP" WA_RIG="$TMP" PS_RIG="$TMP" \
+  GATE_AUTO_UNBLOCK_LOG="$TMP/log" GATE_AUTO_UNBLOCK_LOCK="$TMP/gate-auto-unblock-fykclp-dry.lock" \
+  bash "$SCRIPT" >/dev/null 2>&1
+if [ ! -s "$TMP/fx.ga-fykclp-dry/removed.log" ] && [ ! -s "$TMP/fx.ga-fykclp-dry/comments.log" ]; then
+  ok "ga-fykclp: DRY_RUN=1 não remove next-action:mayor"
+else
+  bad "ga-fykclp: DRY_RUN mutou" "$(cat "$TMP/fx.ga-fykclp-dry/removed.log" "$TMP/fx.ga-fykclp-dry/comments.log" 2>/dev/null)"
 fi
 
 # ── kill switch ────────────────────────────────────────────────────────
