@@ -29,7 +29,7 @@
 #   Now: the heartbeat reload runs in the background as a SYNCHRONOUS "gc reload --soft",
 #   so its wall time is the real time it held the slot (D). After it finishes the heartbeat
 #   stays off the slot for  D * (100 - P) / P  seconds (P = HEARTBEAT_MAX_SLOT_DUTY_PCT,
-#   default 10, so 9*D), never less than HEARTBEAT_INTERVAL. The watcher therefore occupies
+#   default 10, so 9*D), never less than HEARTBEAT_INTERVAL. The heartbeat therefore occupies
 #   the slot at most ~P% of the time whatever the load, and leaves a free window of 9*D
 #   after every reload for callers that need one. When reloads are fast (D <= ~2s) the
 #   cadence stays at the old 20s. Raise CONFIG_DRIFT_HEARTBEAT_DUTY_PCT to trade slot
@@ -301,11 +301,18 @@ slot_duty_line() {
 # save_reload_stats — "<D> <heartbeat embargo epoch> <covered hash>" (one line, atomic). The hash is
 # what the last reload that finished OK was requested against; "-" when unknown.
 save_reload_stats() {
-    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
     local h="-"
     if hash_is_known "$covered_hash"; then h=$covered_hash; fi
-    printf '%s %s %s\n' "$last_reload_secs" "$hb_next_allowed" "$h" > "$RELOAD_STATS_FILE.tmp" 2>/dev/null \
-        && mv "$RELOAD_STATS_FILE.tmp" "$RELOAD_STATS_FILE" 2>/dev/null || true
+    if mkdir -p "$STATE_DIR" 2>/dev/null \
+        && printf '%s %s %s\n' "$last_reload_secs" "$hb_next_allowed" "$h" > "$RELOAD_STATS_FILE.tmp" 2>/dev/null \
+        && mv "$RELOAD_STATS_FILE.tmp" "$RELOAD_STATS_FILE" 2>/dev/null; then
+        return 0
+    fi
+    # Never fatal (a full disk must not stop the watcher), never silent: the next restart reads
+    # whatever record is on disk (or none) and, unable to prove the tree is covered, queues a
+    # file-change reload and carries no embargo — so say why that is about to happen.
+    err "could not save the reload stats to '$RELOAD_STATS_FILE' — a restart before the next successful save re-learns D and queues a file-change reload"
+    return 0
 }
 
 # load_reload_stats <now> — carry D across restarts, and decide what the restart gap may have

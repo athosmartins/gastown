@@ -17,9 +17,9 @@
 #      of the tree may survive)
 #   D. start_reload: really issues the SYNC "gc reload --soft --timeout" (never --async) and
 #      maps ok / busy / fail from the client's exit status and text
-#   E. the restart gap: reload stats persist across a daemon restart, and drift that straddles
-#      the restart (files changed while down, or a reload still pending) is NOT dropped and NOT
-#      hidden behind the carried-over embargo
+#   E. the restart gap: reload stats persist across a daemon restart (a failed save is logged,
+#      never silent), and drift that straddles the restart (files changed while down, or a
+#      reload still pending) is NOT dropped and NOT hidden behind the carried-over embargo
 #   F. file-detected drift (acceptance 3): a changed skill file is picked up, debounced and
 #      reloaded; a busy slot never drops it; a failing reload is retried a bounded number of
 #      times; it outranks the heartbeat and never runs concurrently with one; a restart with an
@@ -578,6 +578,20 @@ reset_state
 echo "0600 0099 hA" > "$RELOAD_STATS_FILE"
 startup_replay >> "$TICKLOG" 2>&1   # "0099" in $(( )) is an octal error that aborts a bash 3.2 daemon
 eq "leading zeros in the stats file are decimal: '0600' is read as 600, no octal abort" 600 "$last_reload_secs"
+
+# E6. a stats file that cannot be written is SAID in the log (not a silent "fine"), and never aborts the loop
+reset_state; covered_hash=hA; last_reload_secs=600; hb_next_allowed=$((FAKE_NOW + 5400))
+save_reload_stats > "$TMP/e6-ok.out" 2>&1; E6_RC=$?
+eq "a save that works returns 0" 0 "$E6_RC"
+hasnt "a save that works says nothing" "could not save" "$TMP/e6-ok.out"
+E6_REAL_STATS_FILE=$RELOAD_STATS_FILE
+: > "$TMP/not-a-dir"
+RELOAD_STATS_FILE="$TMP/not-a-dir/stats"      # its parent is a regular file: the .tmp write cannot happen
+save_reload_stats > "$TMP/e6-fail.out" 2>&1; E6_RC=$?
+RELOAD_STATS_FILE=$E6_REAL_STATS_FILE
+eq "a save that cannot write still returns 0 (a full disk must not stop the watcher)" 0 "$E6_RC"
+has "a save that cannot write says so, naming the file" "could not save the reload stats to '$TMP/not-a-dir/stats'" "$TMP/e6-fail.out"
+has "...and what the next restart will do about it" "queues a file-change reload" "$TMP/e6-fail.out"
 
 # ── F. file-detected drift through watcher_tick ──────────────────────────────
 echo "== F. file-detected drift (acceptance 3): real compute_hash, fake clock + slot"
