@@ -1,0 +1,61 @@
+# work-order.registry.tsv — every place that orders or windows beads by an idiom of its own (ga-9t9acg.1).
+# Checked by `python3 -I scripts/work_order.py lint` (run from work-order.selftest.sh). Read the header of
+# work-order.sh first: the rule is priority > type > age, and ONE library implements it.
+#
+# Columns, separated by ONE TAB each (five, always):
+#   kind   file   regex   owner   note
+#
+#   kind   consumer  a site that picks "which bead first" (or windows the pool) by itself. The slice named in
+#                    `owner` migrates it to work_order_sort and DELETES the row in the same commit. When the
+#                    last consumer row is gone the programme is done (reviewed rows stay).
+#          reviewed  a line the idioms catch that does NOT order a bead queue (comments, git refs, one story's
+#                    own verdict wisp, a report). It stays, with the reason in `note`.
+#          ext       a consumer OUTSIDE this repo (engine, panel). Not scanned; listed so the inventory is whole.
+#                    file is `<repo>:<path>`, regex is `-`.
+#   file   path relative to .gascity-gastown-hq/ (ext: repo:path)
+#   regex  Python `re.search` over ONE line of that file, comment lines excluded. It has to match at least one
+#          line today: a row that matches nothing is STALE and fails the lint, and so does an idiom line that no
+#          row matches (UNREGISTERED). So a slice cannot migrate without deleting its row, and a new ad-hoc
+#          sort cannot appear without a row that says why.
+#   owner  consumer/ext: the slice's bead id, or UNASSIGNED (found after the inventory, no slice yet — it is
+#          reported in ga-9t9acg.1 so the Mayor assigns it). reviewed: `-`.
+#   note   R-number from docs/research/ga-3zlzot-ordem-unica/inventario-e-desenho.md and what the site does.
+#
+# Scope and idioms: see IDIOMS / SCOPE_GLOBS in scripts/work_order.py. The idioms are sort_by on created_at /
+# updated_at / priority, any --sort flag, _PILOT_SORT_JQ, Python .sort/sorted keyed on those, and a positive
+# --limit (a window taken BEFORE the sort: the ga-g7yt trap).
+#
+# --- consumer rows -------------------------------------------------------------------------------------------
+consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_PILOT_SORT_JQ	ga-9t9acg.2	R2 Pilot dispatch order (_top_candidate, _queue_preview): bug-first, newest-first today
+consumer	packs/town-deltas/assets/pilot-dispatcher.sh	\(\. \| trank\)	ga-9t9acg.2	R2 the sort_by inside _PILOT_SORT_JQ (type rank, newest created_at first)
+consumer	packs/town-deltas/assets/pilot-dispatcher.sh	\(\.priority // 99\), \(\.created_at // ""\)	ga-9t9acg.3	R3 queue emitted to the panel (_pilot_emit_dispatchable): priority > oldest, no type tier
+consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_TOPUP_WORKER_EXCLUDE_LABELS\[@\]\}" --json --limit=20	ga-9t9acg.4	R4 pool top-up (_pilot_pool_topup, _topup_rig_pending): bd ready window of 20 BEFORE ordering, takes .[0]
+consumer	packs/town-deltas/assets/auto-refino-dispatcher.sh	sort_by\(\.created_at // \.id\) \| reverse	ga-9t9acg.8	R9 Triagem: newest-first, priority ignored, first store with a candidate wins
+consumer	packs/town-deltas/assets/refino-gate-dispatcher.sh	sort_by\(\.created_at // \.id\) \| \.\[0\]	ga-9t9acg.9	R10 refino-review queue: oldest first, priority ignored
+consumer	packs/town-deltas/assets/context-check-dispatcher.sh	sort_by\(\.created_at // \.id\)	ga-9t9acg.10	R11 context-check: FIFO per store, priority and type ignored, global cap eaten by the first stores
+consumer	agents/wa-worker/prompt.template.md	routed_to=wa-worker	ga-9t9acg.5	R5 wa-worker Step 1b2 probe: --sort priority --limit=20 then sort_by([priority, age]); window before the final sort
+consumer	agents/ps-worker/prompt.template.md	routed_to=ps-worker	ga-9t9acg.6	R6 ps-worker Step 1b2 probe: same as R5
+consumer	packs/town-deltas/assets/quality-gate-dispatcher.sh	sort_by\(\.created_at\)	ga-q8tj7p	R1 gate marker-select cascade (SELFTEST-EXTRACT marker-select); age = created_at of the MARKER, i.e. --age field there
+consumer	scripts/gate-recovery-watchdog.py	valid\.sort\(key=lambda x: x\[2\]\)	ga-9t9acg.13	R13 _orphan_head: the watchdog's "head of the gate queue" mirror (FIFO by marker created_at)
+consumer	packs/town-deltas/assets/quality-gate-guard.sh	sort_by\(\.created_at\) \| \.\[0\]	UNASSIGNED	not in the inventory: gate_pick_oldest_marker (called at MARKER=$(gate_pick_oldest_marker ...)) picks the guard's marker FIFO; belongs with the gate slice ga-q8tj7p or its own slice
+consumer	scripts/gate-recovery-watchdog.py	markers\.sort\(key=lambda m: _iso_epoch\(m\.get\("created_at"\)\) or 0\.0\)	UNASSIGNED	not in the inventory: requeue_error_markers, requeue_deferred_markers, recover_needs_rebase_markers each take markers oldest-first by created_at
+consumer	scripts/gate-recovery-watchdog.py	beads\.sort\(key=lambda b: _iso_epoch\(b\.get\("created_at"\)\) or 0\.0\)	UNASSIGNED	not in the inventory: close_recovered_repair_audit_beads walks the beads oldest-first by created_at
+# --- ext rows (outside this repo; engine only via patch in docs/pending-engine-window, never a rebuild) --------
+ext	engine:internal/config/config.go	-	ga-9t9acg.7	R7 routedReadyTierCommand / legacy probe_pool_demand: --sort oldest --limit=20, sort_by(.updated_at // .created_at): blind to priority (patch only)
+ext	engine:internal/config/config.go	-	ga-9t9acg.7	R8 standardAssignedInProgressWorkQueryScript / standardAssignedReadyWorkQueryScript: --limit=20 with no sort (patch only)
+ext	whatsapp_automation:whatsapp_automation/daemons/painel_visibilidade.py	-	ga-9t9acg.11	R12 kanban columns and the Triagem cut (updated_at desc plus _TRIAGEM_COLUMN_LIMIT), applySort in the page JS
+ext	whatsapp_automation:whatsapp_automation/daemons/painel_visibilidade.py	-	ga-9t9acg.12	R12b "fila do gate" list: fila_list.sort(created_at), the mirror of the gate order
+# --- reviewed rows: not a bead queue -------------------------------------------------------------------------
+reviewed	scripts/approved-state-reconciler.py	def _pilot_queue_position	-	R14 only READS the order R3 emits ("behind N items of higher priority"); correct once R3 migrates, checked in ga-9t9acg.3
+reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	for-each-ref --count=1 --sort=-committerdate	-	git: the newest branch of a repo, not a bead
+reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	--json --limit 5	-	sling retry: finds the ONE bead this sling just created, by title and creation time (window of 5 is the lookup, not a queue)
+reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	sort_by\(\.created_at\) \| reverse \| \.\[0\]\.id	-	sling retry: the newest bead with the sling's own title; not a queue
+reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	list --limit 1 >/dev/null	-	store liveness probe, the output is thrown away
+reviewed	packs/town-deltas/assets/gate-needs-human-divergence-sweep.sh	sort_by\(\.created_at // ""\) \| last	-	the NEWEST gate marker of ONE source bead, to read its branch label
+reviewed	packs/town-deltas/assets/refino-gate-dispatcher.sh	sort_by\(\.created_at // ""\) \| \.\[0\]\.id	-	one story's own pending verdict wisp (oldest, to be deterministic); not a queue of stories
+reviewed	packs/town-deltas/assets/quality-gate-guard.sh	\.comments // \[\] \| sort_by\(\.created_at\) \| reverse	-	the comments of ONE bead, newest first
+reviewed	scripts/inflight-reclaim-guard.py	--sort=-committerdate	-	git for-each-ref of remote branches, not beads
+reviewed	scripts/home-scan-guard.py	rg --sort path	-	docstring example of a forbidden $HOME scan
+reviewed	scripts/jev_preambulo_experiment.py	ents = sorted\(seen\.values\(\), key=lambda e: \(e\["bead"\]\.get\("created_at"\)	-	experiment report: the order of the entities listed, nothing is dispatched from it
+reviewed	scripts/portaria_shadow.py	fresh\.sort\(key=lambda it: it\.get\("created_at"\) or ""\)	-	portaria shadow: the nudge snapshot, in the order the nudges were created; nudges, not beads
+reviewed	packs/town-deltas/assets/scripts/engine-binary-backup-guard.sh	for-each-ref --sort=-committerdate	-	git: the engine repo's branches, not beads
