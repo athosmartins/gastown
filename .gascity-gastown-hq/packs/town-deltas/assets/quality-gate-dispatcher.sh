@@ -55,6 +55,15 @@ _QHC_SCRIPT="${GC_CITY}/packs/town-deltas/assets/quiet-hours-check.sh"
 [ -r "$_QHC_SCRIPT" ] && { source "$_QHC_SCRIPT" 2>/dev/null; } || true
 unset _QHC_SCRIPT
 
+# ga-dtecvq: the queue order this sweep computed is PUBLISHED (gate_publish_queue_order) so the
+# gate-recovery-watchdog can prove a queued marker is invisible to the dispatcher without
+# inferring it from claim order. Same [ -r ] source-fail-soft convention as the libs above; the
+# call site is guarded with `type`, so a missing lib costs the watchdog its proof (it then says
+# "cannot prove"), never a sweep.
+_GQOP_SCRIPT="${GC_CITY}/packs/town-deltas/assets/gate-queue-order-publish.lib.sh"
+[ -r "$_GQOP_SCRIPT" ] && { source "$_GQOP_SCRIPT" 2>/dev/null; } || true
+unset _GQOP_SCRIPT
+
 # ga-syxaki (E5): 2nd independent reviewer, as an A/B experiment — OFF by default. The lib is
 # sourced behind the same [ -r ] convention as the libs above (a bare `source` of a missing
 # file kills this set -e daemon). MEASURED under /bin/bash 3.2.57 (launchd's) with set -euo pipefail,
@@ -13838,6 +13847,13 @@ MARKER_DANO_IGNORED=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '[.[] | select(
 # The head of the order with each marker's class — what the "Selected" log line below
 # prints, so a hand-computed order over the live queue can be checked against it.
 MARKER_ORDER_SUMMARY=$(printf '%s\n' "$MARKER_ORDER_JSON" | jq -r '(length) as $n | ([.[0:8][] | "\(.id)[\(.gate_order_class)]"] | join(" ")) + (if $n > 8 then " (+\($n - 8) more)" else "" end)')
+# ga-dtecvq: publish the order BEFORE anything below can end the sweep (the all-in-cooldown
+# `exit 0` included) — the watchdog's proof is "absent from the published order, sweep after
+# sweep", so a sweep that computed an order and did not publish it would read as a missed sweep.
+# Best-effort by design: a failed publication must never abort or delay the claim.
+if type gate_publish_queue_order >/dev/null 2>&1; then
+  gate_publish_queue_order "$MARKERS_JSON" "$MARKER_ORDER_JSON" "$GATE_MARKER_NOW_EPOCH" || true
+fi
 # gate:priority used to promote a marker; it is inert now. Counted over the whole
 # queue, not just the eligible part, so the note fires while any marker still carries it.
 MARKER_PRIORITY_LABEL_COUNT=$(printf '%s\n' "$MARKERS_JSON" | jq '[.[] | select((.labels // []) | any(. == "gate:priority"))] | length' 2>/dev/null || echo "0")
