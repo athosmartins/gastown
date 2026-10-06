@@ -42,9 +42,14 @@
 #   that reload's remaining hold plus the file cooldown (up to ~2*D, ~20 min at D=600s).
 #
 # SAFETY NOTES:
-#   - At most ONE reload of this watcher is in flight at any time; the watcher never
+#   - The watcher TRACKS at most one reload of its own at a time (RELOAD_PID) and never
 #     probes the slot with a second request (a probe that is accepted just becomes
-#     another reload holding the slot). The watchdog kills a hung client's whole process
+#     another reload holding the slot). That is bookkeeping, not a promise about processes: a
+#     client that survives the watchdog's SIGKILL (logged as leaked), or an orphan from a
+#     previous daemon life, is not tracked and may still be running. What it can no longer do
+#     is pass for the reload in flight: each reload hands its result back through ITS OWN path
+#     (RELOAD_RESULT_CUR), so a late or leftover result is never read as the current one.
+#     The watchdog kills a hung client's whole process
 #     tree and logs what it saw: a process that survives SIGKILL is logged as leaked, and a
 #     tree pgrep could not enumerate is logged as "NOT confirmed killed" — never as killed.
 #   - If another caller's reload holds the slot, the heartbeat does NOT assume that reload
@@ -230,6 +235,9 @@ RELOAD_UNKNOWN_HELD_ASSUMED=600  # s a reload of UNKNOWN duration is assumed to 
                               # was learned yet, or the learned D is shorter): the controller's reloadActiveTTL,
                               # the longest a slot is NORMALLY held. A hold that was measured can be longer
                               # (see HEARTBEAT_MAX_INTERVAL); one that was not measured is assumed this long
+RELOAD_MSG_MAX=500            # chars of gc's reply kept for ONE log line; a longer reply is cut and says so ("...")
+RELOAD_LITTER_MIN=60          # minutes after which a result file nobody consumed cannot belong to a live runner
+                              # (a runner lives at most RELOAD_CLIENT_TIMEOUT+RELOAD_WATCHDOG_GRACE = 17 min): swept
 
 # ── Reload scheduling state ───────────────────────────────────────────────────
 prev_hash=""
@@ -238,6 +246,10 @@ pending_reload=false
 last_beat_time=0          # hooks-guard beat (every HEARTBEAT_INTERVAL, as the old heartbeat did)
 last_hooks_check=0
 RELOAD_PID=""             # background "gc reload --soft" of THIS watcher; "" = none in flight
+RELOAD_RESULT_CUR=""      # the ONE path the reload in flight hands its result back through ("" = none in flight)
+reload_seq=0              # counts reloads started by this process (part of every result path)
+litter_warned=false       # sweep_reload_result_litter says a leftover it cannot remove once per run, not per reload
+pending_cause=""          # why a file-change reload is pending: what the log says about it
 RELOAD_TRIGGER=""         # heartbeat | file-change
 RELOAD_STARTED=0
 RELOAD_COVERS_HASH=""     # the file hash in force when the in-flight reload was requested
@@ -390,9 +402,11 @@ load_reload_stats() {
     if hash_is_known "$prev_hash" && [ -n "$covered_hash" ]; then
         startup_gap_verdict=changed
         startup_gap_note="files changed since the last saved reload record (a reload that finished OK; was ${covered_hash}, now ${prev_hash}) — file-change reload queued, heartbeat embargo NOT carried over"
+        pending_cause="restart gap, verdict changed: this process saw no change, but the files differ from what the last saved reload covered"
     else
         startup_gap_verdict=unknown
         startup_gap_note="no usable record of what the last reload covered (stats '${RELOAD_STATS_FILE}', hash now '${prev_hash:-none}') — assuming NOT covered: file-change reload queued, heartbeat embargo NOT carried over"
+        pending_cause="restart gap, verdict unknown: no usable record of what the last reload covered, so a change cannot be ruled out"
     fi
     pending_reload=true
     last_change_time=$(( now - DEBOUNCE_WINDOW ))
@@ -476,28 +490,97 @@ kill_process_tree() {
     [ "$KILL_TREE_COMPLETE" = true ] && [ -z "$KILL_TREE_SURVIVORS" ]
 }
 
-# clear_stale_reload_result — remove a result (or half-written temp file) a previous runner left, and
-# CHECK it is gone. A stale result that survived would be consumed as the result of the reload about
-# to start, and consume_reload_result would then wait() on a runner that is still running. Returns 1
-# (and says so) when something is still there.
-clear_stale_reload_result() {
-    rm -f "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
-    if [ -e "$RELOAD_RESULT_FILE" ] || [ -e "$RELOAD_RESULT_FILE.tmp" ]; then
-        err "cannot remove the stale reload result '$RELOAD_RESULT_FILE' (or its .tmp) — it may be mistaken for the result of the reload being started"
-        return 1
+# one_line_ascii — stdin as ONE trimmed line of printable ASCII. Whitespace becomes a space, and every run of
+# bytes outside printable ASCII becomes one "?": the length cut in reload_message_text is bytewise, and under
+# launchd's C locale a cut inside a multibyte character would write an invalid byte into the log.
+one_line_ascii() {
+    local s
+    s=$(tr '\n\r\t' '   ' | LC_ALL=C tr -cs ' -~' '?')
+    s="${s#"${s%%[! ]*}"}"
+    s="${s%"${s##*[! ]}"}"
+    printf '%s' "$s"
+}
+
+# reload_message_text <gc's merged stdout+stderr> <gc's exit status> — gc's reply as ONE short line for the log.
+# Real gc in this city puts "warning:" lines on stderr in front of EVERY reply (a local pack edit;
+# 453 chars in the first one), and the runner merges stderr into the reply (2>&1), so the real text
+# always comes AFTER them. Kept, the first N chars were only that preamble: an OK reload logged
+# "OK, took 603s: warning: builtin pack…" and a failed one the same, the cause cut off and the pack
+# warning read as the reason (gate FAIL 3/3). Lines that START with "warning:" are dropped; a real error
+# that merely mentions a warning stays. Four states, kept apart: no output at all; a reply; only warnings
+# on a call that SUCCEEDED (they say nothing about the reload: "(gc printed only warning lines…)", never
+# "no output" — gc did print); only warnings on a call that FAILED (then they are all there is to say why,
+# so they are kept — dropping them would hide the one cause gc gave). A reply longer than RELOAD_MSG_MAX is
+# cut and says so.
+reload_message_text() {
+    local raw="$1" rc="${2:-0}" kept
+    if [ -z "$raw" ]; then echo "no output"; return 0; fi
+    kept=$(printf '%s\n' "$raw" | grep -v '^warning:' | one_line_ascii)
+    if [ -z "$kept" ]; then
+        if [ "$rc" = 0 ]; then
+            echo "(gc printed only warning lines, no reply text)"
+            return 0
+        fi
+        kept="(gc failed and printed only warning lines) $(printf '%s\n' "$raw" | one_line_ascii)"
     fi
-    return 0
+    if (( ${#kept} > RELOAD_MSG_MAX )); then kept="${kept:0:$RELOAD_MSG_MAX}..."; fi
+    echo "$kept"
+}
+
+# sweep_reload_result_litter — HOUSEKEEPING, not part of the hand-off. Nothing ever READS what this removes:
+# a reload's result is read only from that reload's own path (RELOAD_RESULT_CUR), so a leftover here cannot be
+# mistaken for a result however it got there. What it tidies: the single fixed path earlier versions handed
+# results back through, and per-reload results nobody consumed (the daemon died mid-reload; a client that
+# outlived the watchdog finished late) once they are too old to belong to any live runner — a recent one is
+# left alone, it may be a live runner's of another instance. After the removal it looks again, and a leftover
+# that is STILL there (the fixed path, or an aged per-reload file) is said once per run — the first one found,
+# with why it is harmless: failing to remove it must not stop a reload, and must not read as "nothing there".
+sweep_reload_result_litter() {
+    local base stuck=""
+    base=$(basename "$RELOAD_RESULT_FILE")
+    rm -f "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
+    find "$STATE_DIR" -maxdepth 1 -type f -name "${base}.*" -mmin +"$RELOAD_LITTER_MIN" -exec rm -f {} + 2>/dev/null || true
+    # Look again at what was meant to go: "rm failed" and "nothing was there" must not look the same.
+    if [ -e "$RELOAD_RESULT_FILE" ]; then
+        stuck="$RELOAD_RESULT_FILE"
+    elif [ -e "$RELOAD_RESULT_FILE.tmp" ]; then
+        stuck="$RELOAD_RESULT_FILE.tmp"
+    else
+        stuck=$(find "$STATE_DIR" -maxdepth 1 -type f -name "${base}.*" -mmin +"$RELOAD_LITTER_MIN" 2>/dev/null | head -1)
+    fi
+    if [ -n "$stuck" ] && [ "$litter_warned" != true ]; then
+        litter_warned=true
+        err "cannot remove '$stuck' (a leftover reload result) — harmless: results are read only from each reload's own path, so it is never read (said once per run, for the first one found)"
+    fi
+}
+
+# release_reload_runner — stop tracking the reload in flight: its pid and its result path. It NEVER wait()s.
+# A wait() on a runner that is still running blocks the whole daemon loop (no hooks guard, no file watching)
+# for up to the client timeout; disown hands the child to bash, which reaps it when it exits. The result path
+# is forgotten with the pid: nothing reads that path again, so a late write to it is litter, swept by age.
+release_reload_runner() {
+    if [ -n "$RELOAD_PID" ]; then disown "$RELOAD_PID" 2>/dev/null || true; fi
+    RELOAD_PID=""
+    RELOAD_RESULT_CUR=""
 }
 
 # start_reload <trigger> <now> — fire "gc reload --soft" in the background. It is the
 # SYNCHRONOUS form on purpose: its wall time is how long this reload held the controller's
 # slot (D), which is the number the heartbeat cadence is derived from. The result is handed
-# back through $RELOAD_RESULT_FILE ("<ok|busy|fail> <secs> <rc>" + one message line), written
-# atomically as the very last step so its existence means "finished".
+# back through THIS reload's own path, $RELOAD_RESULT_CUR ("<ok|busy|fail> <secs> <rc>" + one
+# message line), written atomically as the very last step: a file at that path means "finished".
+# The path is unique per start (daemon pid, sequence, start time, a random number): a collision
+# would need all four to repeat, so for practical purposes nothing that is already on disk — a
+# leftover that could not be removed, a late write from a runner the watchdog gave up on, an
+# orphan of a previous daemon life — can be at it. "A file exists" and "THIS reload finished"
+# are the same fact only because of that.
 start_reload() {
-    local trigger="$1" now="$2"
+    local trigger="$1" now="$2" result
     mkdir -p "$STATE_DIR" 2>/dev/null || true
-    clear_stale_reload_result || true   # said in the log; the reload still starts — a drift change is never dropped over a leftover file
+    sweep_reload_result_litter
+    reload_seq=$(( reload_seq + 1 ))
+    result="$RELOAD_RESULT_FILE.$$.$reload_seq.$now.$RANDOM"
+    RELOAD_RESULT_CUR="$result"
     RELOAD_TRIGGER="$trigger"
     RELOAD_STARTED=$now
     RELOAD_COVERS_HASH="$prev_hash"   # what this reload is requested against (see finish_reload)
@@ -514,11 +597,13 @@ start_reload() {
         else
             outcome=fail
         fi
-        {
-            printf '%s %s %s\n' "$outcome" "$(( t1 - t0 ))" "$rc"
-            printf '%s\n' "$out" | tr '\n' ' ' | cut -c1-300
-            echo
-        } > "$RELOAD_RESULT_FILE.tmp" && mv "$RELOAD_RESULT_FILE.tmp" "$RELOAD_RESULT_FILE"
+        msg=$(reload_message_text "$out" "$rc")
+        if { printf '%s %s %s\n' "$outcome" "$(( t1 - t0 ))" "$rc"; printf '%s\n' "$msg"; } > "$result.tmp" 2>/dev/null \
+            && mv "$result.tmp" "$result" 2>/dev/null; then
+            :
+        else
+            err "reload runner could not hand its result back through '$result' (outcome $outcome, rc $rc, $(( t1 - t0 ))s: ${msg}) — the watcher will count this reload as exited without a result"
+        fi
     ) &
     RELOAD_PID=$!
 }
@@ -597,6 +682,10 @@ finish_reload() {
                     log "reload[file-change] busy (another reload holds the slot, streak $file_busy_streak) — the file change stays pending, retry every ${FILE_RETRY_WAIT}s"
                 fi
             else
+                # A D that was never learned ("") reads as 0s inside slot_cooldown_secs, so the probe cadence here
+                # is the HEARTBEAT_INTERVAL floor — the same as for a measured 0s. That is deliberate: a REFUSED
+                # probe holds nothing. The first probe that is ACCEPTED in that state is a reload whose hold time
+                # nobody knows yet (D is learned only when it finishes OK), not a cheap one.
                 hb_cd=$(slot_cooldown_secs "$last_reload_secs" "$HEARTBEAT_MAX_SLOT_DUTY_PCT" "$HEARTBEAT_INTERVAL")
                 if (( hb_cd > HEARTBEAT_BUSY_RETRY_MAX )); then hb_cd=$HEARTBEAT_BUSY_RETRY_MAX; fi
                 hb_next_allowed=$(( now + hb_cd ))
@@ -606,20 +695,20 @@ finish_reload() {
     esac
 }
 
-# consume_reload_result <now> — if the runner has left its result, account for it and say so.
-# The result is the runner's last act: when it exists the runner is done (or about to exit).
-# Returns 1 when there is no result (nothing was changed).
+# consume_reload_result <now> — if the reload in flight has left ITS result, account for it and say so.
+# Only the current reload's own path is ever read (RELOAD_RESULT_CUR, unique per start), so a file there
+# is that runner's last act: it is done, or about to exit — and the runner is NOT waited for (see
+# release_reload_runner). Returns 1 when there is no result (nothing was changed).
 consume_reload_result() {
-    local now="$1" outcome="" held="" rc="" msg=""
-    [ -f "$RELOAD_RESULT_FILE" ] || return 1
-    { read -r outcome held rc; read -r msg; } < "$RELOAD_RESULT_FILE" || true
-    rm -f "$RELOAD_RESULT_FILE" 2>/dev/null || true
+    local now="$1" outcome="" held="" rc="" msg="" result="$RELOAD_RESULT_CUR"
+    [ -n "$result" ] && [ -f "$result" ] || return 1
+    { read -r outcome held rc; read -r msg; } < "$result" || true
+    rm -f "$result" "$result.tmp" 2>/dev/null || true   # litter at worst: this path belongs to the reload being accounted for now and is never read again
     case "$outcome" in
         ok|busy|fail) ;;
         *) outcome=fail; held=""; msg="unreadable reload result" ;;
     esac
-    wait "$RELOAD_PID" 2>/dev/null || true
-    RELOAD_PID=""
+    release_reload_runner
     finish_reload "$RELOAD_TRIGGER" "$outcome" "$held" "${rc:-?}" "$msg" "$now"
     return 0
 }
@@ -639,8 +728,7 @@ poll_reload_result() {
             return 0
         fi
         # Killed from outside and left no result. How long it held the slot is UNKNOWN.
-        disown "$RELOAD_PID" 2>/dev/null || true
-        RELOAD_PID=""
+        release_reload_runner
         finish_reload "$RELOAD_TRIGGER" fail "" "?" "reload runner exited without a result" "$now"
         return 0
     fi
@@ -667,8 +755,11 @@ poll_reload_result() {
                 verdict="${verdict:+$verdict; }kill FAILED — still alive (leaked): ${KILL_TREE_SURVIVORS}"
             fi
         fi
-        clear_stale_reload_result || true
-        RELOAD_PID=""
+        # The abandoned reload's result path is forgotten, not cleaned up for correctness: a client that
+        # survived (logged as leaked) may still write there, late, and nothing will read it. Removing it is
+        # tidiness; the age sweep catches what this misses.
+        if [ -n "$RELOAD_RESULT_CUR" ]; then rm -f "$RELOAD_RESULT_CUR" "$RELOAD_RESULT_CUR.tmp" 2>/dev/null || true; fi
+        release_reload_runner
         finish_reload "$RELOAD_TRIGGER" fail "" "?" "reload exceeded ${RELOAD_CLIENT_TIMEOUT}s + ${RELOAD_WATCHDOG_GRACE}s grace — ${verdict}" "$now"
     fi
 }
@@ -713,13 +804,16 @@ watcher_tick() {
         # Hash changed — note the time, mark pending
         last_change_time=$now
         pending_reload=true
+        pending_cause="a file hash change seen by this process"
         prev_hash="$current_hash"
         log "Hash changed (new: $current_hash) — debouncing..."
     fi
 
     # ── RELOAD SCHEDULING: a file change outranks the heartbeat ─────────────
+    # The log says WHY the reload is due: a restart-gap reload (and every busy retry of it) is not a file
+    # change this process detected, and "File change detected" would claim one.
     if file_reload_due "$now"; then
-        log "File change detected (hash-change) — requesting gc reload --soft"
+        log "File-change reload due (${pending_cause:-cause not recorded}) — requesting gc reload --soft"
         pending_reload=false
         start_reload file-change "$now"
     elif heartbeat_due "$now"; then

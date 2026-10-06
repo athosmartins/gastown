@@ -18,8 +18,12 @@
 #      of the tree may survive; and when pgrep cannot enumerate the tree the log says the client
 #      is NOT confirmed killed instead of "killed")
 #   D. start_reload: really issues the SYNC "gc reload --soft --timeout" (never --async) and
-#      maps ok / busy / fail from the client's exit status and text; a stale result it cannot
-#      clear is said, not swallowed
+#      maps ok / busy / fail from the client's exit status and text. D2: a reload's result is
+#      keyed to THAT reload (its own path): a stale result that cannot be removed (immutable
+#      file, directory) or a late write from a runner the watchdog gave up on is never taken
+#      for the result of the reload in flight, and poll_reload_result never blocks on a runner
+#      that is still running. D3: the log carries gc's real reply or error, not the "warning:"
+#      lines real gc prints on stderr before every reply (the stub gc emits them too)
 #   E. the restart gap: reload stats persist across a daemon restart (a failed save is logged,
 #      never silent, and the log says what the restart will do WITH or WITHOUT an earlier record on
 #      disk), and drift that straddles the restart (files changed while down, or a reload still
@@ -81,8 +85,20 @@ cat > "$TMP/bin/gc" <<'EOF'
 #!/bin/sh
 # stub gc: records its argv, behaves per $GCSTUB_MODE
 echo "$*" >> "${GCSTUB_ARGS:-/dev/null}"
+# GCSTUB_PREAMBLE=1: like the real gc in this city, which puts "warning:" lines on stderr in front of EVERY
+# reply (453 chars and a multibyte em dash in the first one; measured 2026-10-06 with `gc reload --help`).
+# The watcher merges stderr into the reply (2>&1), so the real text always comes AFTER them.
+if [ -n "${GCSTUB_PREAMBLE:-}" ]; then
+  echo "warning: builtin pack \"gastown\" on disk differs from the copy embedded in this gc binary (1 file: template-fragments/operational-awareness.template.md), and gc's own hash record confirms this is a local edit, not stale content — your edit is preserved. To adopt the embedded copy: mv \"/c/.gc/system/packs/gastown\" \"/c/.gc/system/packs/gastown.bak\" && gc config show --validate" >&2
+  echo "warning: builtin pack \"gastown\" on disk differs from the copy embedded in this gc binary (19 files: agents/boot/prompt.template.md, agents/deacon/prompt.template.md, +17 more) — preserving it" >&2
+fi
 case "${GCSTUB_MODE:-ok}" in
   ok)   sleep "${GCSTUB_SLEEP:-1}"; echo "Reload complete"; exit 0 ;;
+  okmsg)    echo "soft reload: accepted config drift on 14 session(s) — 2 drained"; exit 0 ;;
+  failmsg)  echo "Error: controller unreachable: dial unix /c/.gc/controller.sock: connection refused"; exit 1 ;;
+  warnonly) exit 0 ;;
+  warnfail) exit 1 ;;
+  long)     i=0; while [ "$i" -lt 700 ]; do printf 'x'; i=$((i + 1)); done; echo; exit 0 ;;
   hang) # a client that never returns: record its pid and its child's, like a real hung gc + helper
         echo $$ >> "${GCSTUB_PIDS:-/dev/null}"
         sleep 300 &
@@ -130,10 +146,10 @@ compute_hash() { if [ "$HASH_MODE" = real ]; then real_compute_hash; else echo "
 START_LOG=""
 reset_state() {   # a fresh in-memory state; "keep-files" = a fresh PROCESS (the stats file on disk survives)
     if [ "${1:-}" != keep-files ]; then
-        rm -f "$RELOAD_STATS_FILE" "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
+        rm -f "$RELOAD_STATS_FILE" "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" "$RELOAD_RESULT_FILE".* 2>/dev/null || true
     fi
     prev_hash=""; last_change_time=0; pending_reload=false; last_beat_time=0; last_hooks_check=0
-    RELOAD_PID=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0; RELOAD_COVERS_HASH=""
+    RELOAD_PID=""; RELOAD_RESULT_CUR=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0; RELOAD_COVERS_HASH=""; pending_cause=""
     hb_next_allowed=0; file_next_allowed=0; file_fail_count=0; file_busy_streak=0
     last_reload_secs=""; reload_held_total=0; reload_count=0; reload_unknown_count=0   # D "" = never learned (NOT 0s)
     watcher_started_at=$FAKE_NOW
@@ -153,7 +169,7 @@ kill() {
     local a
     if [ "$RACE_ON" = 1 ] && [ "${1:-}" = "-0" ]; then
         RACE_ON=0
-        printf 'ok 42 0\nReload complete\n' > "$RELOAD_RESULT_FILE"
+        printf 'ok 42 0\nReload complete\n' > "${RELOAD_RESULT_CUR:-$RELOAD_RESULT_FILE}"   # where the in-flight runner hands its result back
         return 1
     fi
     if [ -n "$SHIELD_PID" ] && [ "${1:-}" != "-0" ]; then
@@ -180,6 +196,18 @@ startup_replay() {   # what the daemon does at startup, on the fake clock
     fi
 }
 
+STANDIN_PATH=""
+standin_result_path() {   # sets STANDIN_PATH: the path a stand-in runner (one these tests fork themselves) hands its
+    # result back through. A watcher that keys each reload's result to its own path (RELOAD_RESULT_CUR) reads exactly
+    # that, so it is set here too; an older one reads the single fixed RELOAD_RESULT_FILE. (Sets globals: not for $(...).)
+    if declare -F sweep_reload_result_litter >/dev/null; then
+        RELOAD_RESULT_CUR="$RELOAD_RESULT_FILE.standin.$RANDOM"
+        STANDIN_PATH="$RELOAD_RESULT_CUR"
+    else
+        STANDIN_PATH="$RELOAD_RESULT_FILE"
+    fi
+}
+
 real_reload() {   # start_reload, with this script's EXIT trap off while its runner subshell is forked:
     # on bash 3.2 a subshell inherits the trap, so SIGTERMing the runner tree (the watchdog test) would run
     # cleanup() and delete $TMP under the rest of the run. The trap is re-armed right after.
@@ -200,7 +228,7 @@ for fn in slot_cooldown_secs finish_reload poll_reload_result start_reload watch
 done
 # the helpers of the gate-FAIL-1/3 fix: absent (reviewed watcher), the tests that need them say so by name
 for fn in uint_or_empty hash_is_known clamp_duty_pct init_watcher_state descendants_of kill_process_tree consume_reload_result \
-          secs_txt startup_stats_line clear_stale_reload_result; do
+          secs_txt startup_stats_line sweep_reload_result_litter reload_message_text one_line_ascii release_reload_runner; do
     need_fn "$fn" && ok "function $fn exists"
 done
 if [ "$HAVE_POLICY" = 1 ]; then   # groups A-G (not re-indented): unit + simulation tests need the policy functions
@@ -429,7 +457,8 @@ HASH_MODE=real; FAKE_HASH=h0
 # ── C. poll_reload_result ────────────────────────────────────────────────────
 echo "== C. poll_reload_result"
 reap_start() {   # a stand-in runner: writes a result file after a pause, then exits (like start_reload's subshell)
-    ( trap - EXIT; sleep "$1"; printf '%s\n%s\n' "$2" "$3" > "$RELOAD_RESULT_FILE.tmp" && mv "$RELOAD_RESULT_FILE.tmp" "$RELOAD_RESULT_FILE" ) &
+    standin_result_path
+    ( trap - EXIT; sleep "$1"; printf '%s\n%s\n' "$2" "$3" > "$STANDIN_PATH.tmp" && mv "$STANDIN_PATH.tmp" "$STANDIN_PATH" ) &
     RELOAD_PID=$!
 }
 reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$FAKE_NOW
@@ -441,7 +470,7 @@ poll_reload_result "$FAKE_NOW" >> "$TICKLOG"
 eq "finished: runner reaped"            "" "$RELOAD_PID"
 eq "finished: D taken from the result"  42 "$last_reload_secs"
 eq "finished: heartbeat cooled down"    $((FAKE_NOW + 378)) "$hb_next_allowed"
-eq "finished: result file consumed"     "no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)"
+eq "finished: result file consumed"     "no" "$([ -e "$STANDIN_PATH" ] && echo yes || echo no)"
 
 reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=77
 reap_start 0 "garbage" "x"
@@ -463,6 +492,7 @@ has "runner died without a result: logged" "exited without a result" "$TMP/dead.
 
 # C2. the runner that finishes BETWEEN the result-file check and the liveness check is a success
 reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=""
+standin_result_path     # the path the "runner" would have written its result to, when the kill seam lets it finish
 ( trap - EXIT; exit 0 ) &
 RELOAD_PID=$!
 sleep 1
@@ -665,29 +695,175 @@ eq "fail on a file-change reload: learned D not overwritten by the 1s failure" 6
 eq "fail: the hash is not marked covered" "" "${covered_hash-}"
 export GCSTUB_MODE=ok
 
-# D2. start_reload clears the previous result before it launches the runner. A stale one that survives would be
-#     consumed as THIS reload's result, and consume_reload_result would then wait() on a runner that is still
-#     running. A failed removal used to be swallowed (|| true): it is checked and SAID now.
-if need_fn clear_stale_reload_result; then
+reload_until_reaped() {   # reload_until_reaped <outfile> — poll like the daemon loop does until the reload is reaped (max ~25s), logging to <outfile>
+    local i=0
+    while [ -n "$RELOAD_PID" ] && [ "$i" -lt 100 ]; do
+        sleep 0.25
+        poll_reload_result "$FAKE_NOW" >> "$1" 2>&1
+        i=$((i + 1))
+    done
+}
+
+# D2. THE RESULT HAND-OFF IS KEYED TO THE RELOAD THAT PRODUCED IT (gate FAIL 3/3, blocking 2).
+#     Accepting a result because a file EXISTS decided on "a file is there" and acted on "this reload finished". A leftover
+#     that cannot be removed (immutable, read-only dir, foreign owner) used to be consumed as the result of the reload just
+#     started — a fabricated "took 7s" that defeats the duty cap, then a wait() that froze the whole daemon loop until the
+#     real reload ended (8-10 min under load) — and a leftover DIRECTORY made a successful reload read as a failure, retried.
+#     All of it is exercised against the REAL start_reload / poll_reload_result / finish_reload and a stub gc.
+
+# D2a. an unremovable stale result sits where earlier versions kept THE result. (Immutable: `rm -f` cannot take it.)
+reset_state; prev_hash=hS1
+STALE="$RELOAD_RESULT_FILE"
+printf 'ok 7 0\nstale result of an earlier reload\n' > "$STALE"
+chflags uchg "$STALE" 2>/dev/null || true
+case "$(stat -f %Sf "$STALE" 2>/dev/null)" in
+    *uchg*) ok "D2a scenario: the stale result is immutable — rm -f cannot remove it" ;;
+    *) bad "D2a scenario: could not make the stale result immutable (chflags uchg) — the checks below would prove nothing" ;;
+esac
+: > "$GCSTUB_ARGS"; : > "$TMP/stale-start.out"; export GCSTUB_MODE=ok GCSTUB_SLEEP=4
+real_reload heartbeat "$FAKE_NOW" >> "$TMP/stale-start.out" 2>&1
+T0=$SECONDS
+poll_reload_result "$FAKE_NOW" >> "$TMP/stale-start.out" 2>&1
+T_POLL=$(( SECONDS - T0 ))
+if [ -n "$RELOAD_PID" ]; then ok "D2a: the reload that is still running is NOT reaped from a stale file"; else bad "D2a: the in-flight reload was reaped from the stale result"; fi
+eq "D2a: nothing is accounted from the stale result (no reload counted, no D learned)" "0|" "$reload_count|$last_reload_secs"
+le "D2a: poll_reload_result never blocks on a runner that is still running (took ${T_POLL}s; waiting for the 4s reload would take 3-4)" "$T_POLL" 2
+hasnt "D2a: nothing is logged from the stale result" "stale result of an earlier reload" "$TMP/stale-start.out"
+reload_until_reaped "$TMP/stale-start.out"
+eq "D2a: the real reload is reaped when ITS OWN result arrives" "" "$RELOAD_PID"
+ge "D2a: D is the real reload's own hold time (the stub sleeps 4s)" "${last_reload_secs:-0}" 4
+has "D2a: logged as the OK reload it was, with gc's reply" "reload[heartbeat] OK, took" "$TMP/stale-start.out"
+has "D2a: …naming gc's real reply" "Reload complete" "$TMP/stale-start.out"
+chflags nouchg "$STALE" 2>/dev/null; rm -f "$STALE"
+export GCSTUB_SLEEP=1
+
+# D2b. a DIRECTORY at the old result path: the runner's `mv` used to move its result INTO it, so a reload gc answered rc 0
+#      was logged as FAILED ("exited without a result") and re-issued up to 3 more times, each holding the slot.
+reset_state; prev_hash=hS2
+mkdir -p "$RELOAD_RESULT_FILE"; : > "$RELOAD_RESULT_FILE/keep"        # rm -f cannot remove a non-empty directory
+: > "$GCSTUB_ARGS"; : > "$TMP/dir-start.out"; export GCSTUB_MODE=ok GCSTUB_SLEEP=1
+real_reload file-change "$FAKE_NOW" >> "$TMP/dir-start.out" 2>&1
+reload_until_reaped "$TMP/dir-start.out"
+eq "D2b: the reload is reaped" "" "$RELOAD_PID"
+hasnt "D2b: a reload gc accepted is not logged as a failure" "FAILED" "$TMP/dir-start.out"
+has   "D2b: …it is logged as OK" "reload[file-change] OK, took" "$TMP/dir-start.out"
+eq "D2b: …no retry is queued, and gc was asked exactly once" "false|1" "$pending_reload|$(wc -l < "$GCSTUB_ARGS" | tr -d ' ')"
+rm -f "$RELOAD_RESULT_FILE"/* 2>/dev/null; rmdir "$RELOAD_RESULT_FILE" 2>/dev/null || true
+eq "D2b scratch removed" "no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)"
+
+# D2c. a runner the watchdog gave up on can survive (a client that outlives SIGKILL) and finish LATE, while a later reload
+#      is in flight. Its late result is not that reload's result. LATE is where that runner writes: its own per-reload path
+#      (the older single path, for a watcher without one).
+hung_start
+LATE="${RELOAD_RESULT_CUR:-$RELOAD_RESULT_FILE}"
+: > "$TMP/late.log"
+poll_reload_result "$FAKE_NOW" >> "$TMP/late.log" 2>&1       # the watchdog: kills the tree, accounts a failed reload
+for p in $HUNG_PIDS; do builtin kill -KILL "$p" 2>/dev/null || true; done
+LATE_COUNT=$reload_count
+export GCSTUB_MODE=ok GCSTUB_SLEEP=4; unset GCSTUB_PIDS
+real_reload heartbeat "$FAKE_NOW" >> "$TMP/late.log" 2>&1     # a LATER reload, in flight
+printf 'ok 7 0\nlate result of the reload the watchdog gave up on\n' > "$LATE"   # the leaked runner finishes now
+poll_reload_result "$FAKE_NOW" >> "$TMP/late.log" 2>&1
+if [ -n "$RELOAD_PID" ]; then ok "D2c: a late result of an abandoned runner does not end the reload that is in flight"; else bad "D2c: the in-flight reload was reaped from a late result of an abandoned runner"; fi
+eq "D2c: …nothing is accounted from it (reload count and D unchanged)" "$LATE_COUNT|77" "$reload_count|$last_reload_secs"
+hasnt "D2c: …nothing is logged from it" "late result of the reload the watchdog gave up on" "$TMP/late.log"
+reload_until_reaped "$TMP/late.log"
+ge "D2c: the later reload's own hold time is learned when ITS result arrives" "${last_reload_secs:-0}" 4
+export GCSTUB_SLEEP=1
+
+# D2d. housekeeping only: a result nobody consumed (the daemon died mid-reload, or the file could not be removed) is litter
+#      that is swept once it is too old to belong to any live runner — and one that cannot be removed is SAID, once.
+if need_fn sweep_reload_result_litter; then
     reset_state
-    printf 'ok 7 0\nstale\n' > "$RELOAD_RESULT_FILE"; printf 'half written' > "$RELOAD_RESULT_FILE.tmp"
-    clear_stale_reload_result > "$TMP/stale-ok.out" 2>&1; S_RC=$?
-    eq "a stale result and its temp file are removed (status 0)" "0 no no" "$S_RC $([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no) $([ -e "$RELOAD_RESULT_FILE.tmp" ] && echo yes || echo no)"
-    hasnt "…and nothing is said about it" "cannot remove" "$TMP/stale-ok.out"
-    mkdir -p "$RELOAD_RESULT_FILE"; : > "$RELOAD_RESULT_FILE/keep"        # rm -f cannot remove a non-empty directory
-    clear_stale_reload_result > "$TMP/stale-bad.out" 2>&1; S_RC=$?
-    eq "a stale result that cannot be removed: reported through the status (1)" 1 "$S_RC"
-    has "…and logged, naming the file" "cannot remove the stale reload result '$RELOAD_RESULT_FILE'" "$TMP/stale-bad.out"
-    has "…with what that risks" "mistaken for the result of the reload being started" "$TMP/stale-bad.out"
-    # start_reload itself says it (and still starts the reload: a change must not be dropped over a leftover file)
-    : > "$GCSTUB_ARGS"; export GCSTUB_MODE=ok
-    start_reload heartbeat "$FAKE_NOW" > "$TMP/stale-start.out" 2>&1
-    wait_reload
-    has "start_reload logs a result it could not clear" "cannot remove the stale reload result" "$TMP/stale-start.out"
-    has "…and still issues the reload" "reload --soft" "$GCSTUB_ARGS"
+    OLDF="$RELOAD_RESULT_FILE.4242.3.1799990000.1"; NEWF="$RELOAD_RESULT_FILE.4242.4.1800000000.2"
+    printf 'ok 7 0\nold litter\n' > "$OLDF"; printf 'ok 8 0\nnew\n' > "$NEWF"
+    touch -t 202001010000 "$OLDF"
+    printf 'ok 9 0\nlegacy\n' > "$RELOAD_RESULT_FILE"; printf 'half' > "$RELOAD_RESULT_FILE.tmp"
+    sweep_reload_result_litter > "$TMP/sweep.out" 2>&1
+    eq "D2d: a result older than any runner can live is swept" "no" "$([ -e "$OLDF" ] && echo yes || echo no)"
+    eq "D2d: …a recent one (it may belong to a live runner of another instance) is left alone" "yes" "$([ -e "$NEWF" ] && echo yes || echo no)"
+    eq "D2d: …the single fixed path earlier versions used (nothing reads it any more) and its temp file are removed" "no|no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)|$([ -e "$RELOAD_RESULT_FILE.tmp" ] && echo yes || echo no)"
+    hasnt "D2d: …and nothing is said when everything could be removed" "cannot remove" "$TMP/sweep.out"
+    rm -f "$NEWF"
+    mkdir -p "$RELOAD_RESULT_FILE"; : > "$RELOAD_RESULT_FILE/keep"
+    litter_warned=false
+    sweep_reload_result_litter > "$TMP/sweep-bad.out" 2>&1
+    has "D2d: a leftover that cannot be removed is logged, naming it" "cannot remove '$RELOAD_RESULT_FILE'" "$TMP/sweep-bad.out"
+    has "D2d: …saying it is harmless (results are only read from the current reload's own path)" "never read" "$TMP/sweep-bad.out"
+    sweep_reload_result_litter > "$TMP/sweep-bad2.out" 2>&1
+    hasnt "D2d: …and only once per run, not on every reload" "cannot remove" "$TMP/sweep-bad2.out"
     rm -f "$RELOAD_RESULT_FILE"/* 2>/dev/null; rmdir "$RELOAD_RESULT_FILE" 2>/dev/null || true
-    eq "stale-result scratch removed" "no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)"
+    # …and the same for an AGED per-reload leftover: "rm failed" must not look like "there was nothing to remove"
+    STUCK="$RELOAD_RESULT_FILE.4242.9.1799990000.7"
+    printf 'ok 7 0\nstuck litter\n' > "$STUCK"; touch -t 202001010000 "$STUCK"; chflags uchg "$STUCK" 2>/dev/null || true
+    case "$(stat -f %Sf "$STUCK" 2>/dev/null)" in
+        *uchg*) ok "D2d scenario: the aged leftover is immutable — rm -f cannot remove it" ;;
+        *) bad "D2d scenario: could not make the aged leftover immutable (chflags uchg) — the check below would prove nothing" ;;
+    esac
+    litter_warned=false
+    sweep_reload_result_litter > "$TMP/sweep-stuck.out" 2>&1
+    has "D2d: an aged per-reload leftover that cannot be removed is said too, naming it" "cannot remove '$STUCK'" "$TMP/sweep-stuck.out"
+    chflags nouchg "$STUCK" 2>/dev/null; rm -f "$STUCK"
 fi
+
+# D3. WHAT THE LOG SAYS ABOUT A RELOAD (gate FAIL 3/3, blocking 1). Real gc puts "warning:" lines on stderr in front of
+#     EVERY reply and the runner merges stderr (2>&1), so the first 300 chars it kept were always that preamble: an OK reload
+#     logged "OK, took 603s: warning: builtin pack…" and a failed one "FAILED rc=1: warning: builtin pack…" — the cause was
+#     cut off and the investigator read the pack warning as the reason. The stub gc below emits the preamble first.
+msg_run() {   # msg_run <stub mode> <trigger> <outfile> [last_reload_secs]
+    reset_state; prev_hash=hM; last_reload_secs="${4:-}"; : > "$3"
+    export GCSTUB_MODE="$1" GCSTUB_PREAMBLE=1
+    real_reload "$2" "$FAKE_NOW" >> "$3" 2>&1
+    reload_until_reaped "$3"
+    unset GCSTUB_PREAMBLE
+    export GCSTUB_MODE=ok
+}
+msg_run okmsg heartbeat "$TMP/msg-ok.log"
+has   "D3: an OK reload logs gc's real reply" "accepted config drift on 14 session(s)" "$TMP/msg-ok.log"
+hasnt "D3: …not gc's stderr preamble" "builtin pack" "$TMP/msg-ok.log"
+hasnt "D3: …nor the word 'warning:'" "warning:" "$TMP/msg-ok.log"
+OKLINE=$(grep 'reload\[heartbeat\] OK' "$TMP/msg-ok.log" | head -1)
+if [ -n "$OKLINE" ] && ! printf '%s' "$OKLINE" | LC_ALL=C grep '[^[:print:]]' >/dev/null 2>&1; then
+    ok "D3: the logged reply is plain ASCII (cut -c is bytewise in launchd's C locale: it must not split a multibyte character)"
+else
+    bad "D3: the logged reply has non-printable bytes, or there is no OK line: '$OKLINE'"
+fi
+msg_run failmsg file-change "$TMP/msg-fail.log" 600
+has   "D3: a FAILED reload logs gc's real error" "connection refused" "$TMP/msg-fail.log"
+hasnt "D3: …not gc's stderr preamble" "builtin pack" "$TMP/msg-fail.log"
+has   "D3: …on the FAILED line itself" "FAILED rc=1" "$TMP/msg-fail.log"
+msg_run warnonly heartbeat "$TMP/msg-warn.log"
+has   "D3: a reply that was ONLY warnings says so" "only warning lines" "$TMP/msg-warn.log"
+hasnt "D3: …it does not claim 'no output' when gc printed warnings" "no output" "$TMP/msg-warn.log"
+hasnt "D3: …and still does not log the preamble" "builtin pack" "$TMP/msg-warn.log"
+msg_run warnfail file-change "$TMP/msg-warnfail.log" 600
+has   "D3: a FAILED call whose only output was warning lines keeps them (they are all gc said about why)" "gc failed and printed only warning lines" "$TMP/msg-warnfail.log"
+has   "D3: …the warning text itself is in the log" "builtin pack" "$TMP/msg-warnfail.log"
+has   "D3: …on the FAILED line" "FAILED rc=1" "$TMP/msg-warnfail.log"
+if need_fn reload_message_text; then
+    W1='warning: builtin pack "x" differs'
+    eq "D3 unit: no output at all" "no output" "$(reload_message_text "" 0)"
+    eq "D3 unit: a reply after the preamble is the whole message" "Reload complete" "$(reload_message_text "$W1
+warning: second
+Reload complete" 0)"
+    eq "D3 unit: a multi-line reply is one line" "line one line two" "$(reload_message_text "$W1
+line one
+line two" 1)"
+    eq "D3 unit: a line that merely CONTAINS 'warning:' is a reply, not preamble" "Error: x (warning: y)" "$(reload_message_text "$W1
+Error: x (warning: y)" 1)"
+    eq "D3 unit: only warnings on a call that succeeded" "(gc printed only warning lines, no reply text)" "$(reload_message_text "$W1" 0)"
+    case "$(reload_message_text "$W1" 2)" in
+        "(gc failed and printed only warning lines) warning: builtin pack"*) ok "D3 unit: only warnings on a call that FAILED keeps them" ;;
+        *) bad "D3 unit: only warnings on a call that FAILED: '$(reload_message_text "$W1" 2)'" ;;
+    esac
+    eq "D3 unit: a multibyte character is one '?', never a cut byte" "a ? b" "$(reload_message_text "a — b" 0)"
+fi
+msg_run long heartbeat "$TMP/msg-long.log"
+LONGLEN=$(grep 'reload\[heartbeat\] OK' "$TMP/msg-long.log" | head -1 | sed 's/^.*took [^:]*: //' | awk '{ print length($0) }')
+RELOAD_MSG_MAX_T="${RELOAD_MSG_MAX:-500}"
+le "D3: a long reply is cut to the cap (${RELOAD_MSG_MAX_T} + the cut marker)" "${LONGLEN:-9999}" "$(( RELOAD_MSG_MAX_T + 3 ))"
+has "D3: …and says it was cut" "xxx..." "$TMP/msg-long.log"
+export GCSTUB_MODE=ok
 
 # ── E. the restart gap ───────────────────────────────────────────────────────
 echo "== E. restart gap (delivery restarts the daemon): stats persist; drift that straddles the restart is not dropped"
@@ -720,8 +896,13 @@ eq "restart + changed file: a file-change reload is queued" true "$pending_reloa
 eq "restart + changed file: verdict" changed "${startup_gap_verdict-}"
 eq "restart + changed file: the embargo is NOT carried over (it would hide the backstop for 5400s)" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
 : > "$GCSTUB_ARGS"; export GCSTUB_MODE=ok
-FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL)); watcher_tick "$FAKE_NOW" >> "$TICKLOG" 2>&1
+: > "$TMP/e2-tick.log"
+FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL)); watcher_tick "$FAKE_NOW" >> "$TMP/e2-tick.log" 2>&1
+cat "$TMP/e2-tick.log" >> "$TICKLOG"
 eq "restart + changed file: the very first tick requests it, as a file-change reload" file-change "$RELOAD_TRIGGER"
+# the request says WHY: this process saw no file change, the restart gap queued it ("File change detected" would be a claim nobody made)
+has   "restart + changed file: the request log line names the restart gap as its cause" "restart gap" "$TMP/e2-tick.log"
+hasnt "restart + changed file: …and does not claim this process detected a file change" "File change detected" "$TMP/e2-tick.log"
 wait_reload
 has "restart + changed file: gc was really asked to reload" "reload --soft" "$GCSTUB_ARGS"
 rm -f "$CITY/skills/restart.md"
@@ -888,6 +1069,7 @@ has "changed skill file is noticed" "Hash changed" "$TICKLOG"
 eq "…but debounced: no reload in the same tick" "" "$(printf '%s' "$START_LOG" | tr -d ' ')"
 ticks 1
 eq "…and requested one tick later, as a file-change reload" "1" "$(starts_matching '^file-change@')"
+has "…and the request log line names its cause: a hash change this process saw" "a file hash change seen by this process" "$TICKLOG"
 ticks 3
 eq "the file-change reload was accepted" "1" "$(starts_matching '^file-change@[0-9]*=ok')"
 eq "nothing is left pending afterwards" false "$pending_reload"
