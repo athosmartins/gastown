@@ -7127,7 +7127,34 @@ _ownership_guard_should_refuse() {
           fi
           ;;
         "$SELF_BEAD_ID") : ;;
-        *) printf 'external-claim:%s@in_progress' "$_asg"; return 0 ;;
+        *)
+          # ga-nqjgf0: a named-crew assignee is an external claim only while that
+          # crew is a CONFIRMED-ACTIVE owner — the SAME predicate _filter_candidates
+          # (ga-46wq5) uses to decide the bead is still owned. This arm used to
+          # refuse on the assignee string alone, so a bead whose in_progress
+          # assignee had NO live session (wa-3fx45f → batista-wa, a crew with no
+          # session at all) was re-admitted by 46wq5 ("não é dono ativo") and
+          # refused right back here ("already owned") on every sweep, forever: one
+          # variable, two opposite verdicts. Three states, not two: an active
+          # owner → refuse; an untrustworthy roster (_DEADWORKER_OK!=1) → refuse
+          # too, because "no session found" on a failed `session list` read is not
+          # evidence of "no owner" and a doubt must never release a bead; only a
+          # TRUSTED roster that says "not an active owner" lets it fall through to
+          # (b) below (which agrees and allows) and on to the reclaim paths.
+          # Not carved out for non-crew assignees: 46wq5's filter has no such
+          # exemption either (the two must agree). Measured 06/10 on the in_progress
+          # beads of HQ and the WA rig: every assignee was an agent identity (crew
+          # session, gastown.mayor, pool worker, dog, gate-reviewer) or empty — none
+          # was a human. gastown.mayor goes through the same predicate as the rest
+          # (its coordinator immunity falls back to the roster grep, see
+          # _session_is_active_owner), so a Mayor claim is still honoured while the
+          # Mayor is on the roster as active.
+          if [ "${_DEADWORKER_OK:-0}" = "1" ] && ! _session_is_active_owner "$_asg"; then
+            :
+          else
+            printf 'external-claim:%s@in_progress' "$_asg"; return 0
+          fi
+          ;;
       esac
     fi
   fi
@@ -10854,10 +10881,35 @@ LIVESEC
     # If the owner is busy/suspended/at-cap/human-engaged, fall through to the
     # normal pool rotation below UNCHANGED (same as any other domain) — this
     # never blocks dispatch, it only redirects it when the owner is available.
-    local _OWNER_SUSPENDED=0
+    local _OWNER_SUSPENDED=0 _OWNER_NOSESSION=0 _OWNER_ROSTER_UNKNOWN=0
     if [ -n "$_PREFER" ] && rig_domain_requires_persistent_owner "$STORY_RIG" "$_DOMAIN"; then
       local _OWNER_BUSY=0
       _crew_session_human_engaged "$_PREFER" && _OWNER_BUSY=1
+      # ga-nqjgf0: the owner must EXIST right now. Every probe above and below asks
+      # "is the owner busy / suspended / at-cap / human-engaged" — none asks "does
+      # it have a session at all", so a crew that was never started (wa-3fx45f →
+      # batista-wa, 06/10: no session of any kind, `Could not nudge batista-wa`)
+      # was picked as the "idle" owner and the bead looped between ga-46wq5 and
+      # ga-htjni. Three states, like every roster probe in this file:
+      #   live    — a non-closed session exists (active OR asleep: the REUSE path
+      #             wakes an asleep crew, gt-4st3n) → dispatch as before;
+      #   none    — TRUSTED roster, no non-closed session for the owner → defer, and
+      #             the defer branch below stamps the shared VISIBLE hold;
+      #   unknown — roster unreadable/empty (_DEADWORKER_OK!=1) → defer, but NO hold:
+      #             "não consegui saber" must never choose the crew, and must not
+      #             escalate to the Mayor on a transient read either.
+      # Scoped to hex like ga-wnojmm's visible hold: warming's pick is deliberately
+      # untouched (Regra No 4 — it drives a real device; no change without an
+      # explicit Athos citation).
+      if [ "$_DOMAIN" = "hex" ]; then
+        if [ "${_DEADWORKER_OK:-0}" != "1" ]; then
+          _OWNER_BUSY=1
+          _OWNER_ROSTER_UNKNOWN=1
+        elif ! _session_is_live "$_PREFER"; then
+          _OWNER_BUSY=1
+          _OWNER_NOSESSION=1
+        fi
+      fi
       # ga-wnojmm: SUSPENDED is tracked separately from the generic busy flag —
       # busy/at-cap/human-engaged are TRANSIENT (will resolve on their own next
       # sweep, so a silent retry is correct); suspended is STRUCTURAL (this
@@ -10905,6 +10957,23 @@ LIVESEC
           "$STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which is SUSPENDED — this domain is structurally pool-incompatible (Hex-notebook-native work produces no git diff, ga-pp00f) so it cannot fall back to $_POOL either" \
           "unsuspend $_PREFER, or set a live explicit assignee on $STORY_ID" \
           "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+      elif [ "$_OWNER_NOSESSION" = "1" ] && [ "$_DOMAIN" = "hex" ]; then
+        # ga-nqjgf0: same structural dead end as the suspended owner above (no pool
+        # fallback for hex, so the defer repeats every sweep), reached by a different
+        # road — the owner is not suspended, it simply has NO session. A SUSPENDED
+        # owner is reported by the branch above, which is the more actionable
+        # instruction; this one only runs for an owner that is not suspended.
+        warn "ga-nqjgf0: $STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which has NO live session in a trusted roster, and the pool is domain-excluded for it (ga-pp00f/ga-ppx8h) — would defer silently forever otherwise. Routing through the shared hold/escalate counter instead."
+        _pilot_hold_or_escalate "$STORY_BEAD_CITY" "$STORY_ID" "ga-wnojmm-hex" \
+          "$STORY_RIG/$_DOMAIN domain build requires persistent owner $_PREFER, which has NO live session — this domain is structurally pool-incompatible (Hex-notebook-native work produces no git diff, ga-pp00f) so it cannot fall back to $_POOL either" \
+          "start a session for $_PREFER, or set a live explicit assignee on $STORY_ID" \
+          "$(echo "$STORY" | jq -c '.labels // []' 2>/dev/null || echo '[]')"
+      elif [ "$_OWNER_ROSTER_UNKNOWN" = "1" ] && [ "$_DOMAIN" = "hex" ]; then
+        # ga-nqjgf0: the roster could not be read, so whether the owner is alive is
+        # UNKNOWN. Defer (never pick the crew on a doubt) but deliberately do NOT
+        # touch the hold/escalate counter: a transient read failure must not walk a
+        # bead toward a Mayor escalation. The next sweep re-reads the roster.
+        warn "ga-nqjgf0: $STORY_ID ($STORY_RIG/$_DOMAIN) deferred — roster unreadable, cannot tell whether owner $_PREFER has a live session; not picking the owner on a doubt, no hold stamped (transient, retried next sweep)."
       fi
       return 1
     fi

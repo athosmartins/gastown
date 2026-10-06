@@ -1600,25 +1600,85 @@ _OG_FN="$(awk '/^_ownership_guard_should_refuse\(\)/{f=1} /^_beadid_matched_crew
 # gate artifact → allow), so signal (d) is inert there and (a)/(b)/(c) behave exactly
 # as before. The (d1)-(d5) cases DEFINE the seam to exercise (d) hermetically.
 _GATE_FN="$(awk '/^_beadid_has_active_gate_artifact\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+# ga-nqjgf0: OG_ACTIVE / OG_ROSTER_OK drive the two inputs signal (c) now reads — whether the
+# assignee is a CONFIRMED-ACTIVE owner (_session_is_active_owner, the SAME predicate 46wq5's
+# _filter_candidates and signal (b) use) and whether the roster can be trusted at all.
+OG_ACTIVE=0; OG_ROSTER_OK=1
 _og() { (
     eval "$_OG_FN"; eval "$_GATE_FN"
-    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    SELF_BEAD_ID=""; _DEADWORKER_OK="$OG_ROSTER_OK"
     bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
     _beadid_has_crew_branch() { return 1; }   # no crew branch → signal (a) does not fire
     _beadid_branch_signal()   { return 1; }   # ga-8jxe1: signal (a)'s real entry point now — see below
     _session_is_live()        { return 1; }   # never a live session → isolate (c) from (b)
-    _session_is_active_owner() { return 1; }   # ga-46wq5: signal (b) now calls this, not _session_is_live — keep the isolation matched
+    _session_is_active_owner() { [ "$OG_ACTIVE" = "1" ]; }   # ga-46wq5: signal (b) now calls this, not _session_is_live — keep the isolation matched (ga-nqjgf0: signal (c) calls it too; OG_ACTIVE=1 makes the assignee a live owner)
     _beadid_mentioned_in_attached_session() { return 1; }   # isolate from (e) — has its own dedicated scenario below
     _ownership_guard_should_refuse "$1" "$2" "ignored-db"
 ); }
 
-# (1) EXTERNAL CLAIM — in_progress + session-suffixed crew assignee, NO pilot fingerprint → REFUSE.
+# (1) EXTERNAL CLAIM — in_progress + session-suffixed crew assignee that IS a confirmed-active
+# owner, NO pilot fingerprint → REFUSE. (ga-nqjgf0: the owner must be LIVE for (c) to refuse —
+# see (1b)/(1c); this is the case the clause exists for, a crew actually working the bead.)
 OG_BEAD_JSON='[{"id":"wa-ext","status":"in_progress","assignee":"thies-wa-awispr9ofspp","labels":[],"metadata":{}}]'
+OG_ACTIVE=1
 _OG_R1="$(_og "wa-ext" '{"id":"wa-ext","assignee":"","status":"open","labels":[]}')"
+OG_ACTIVE=0
 case "$_OG_R1" in
   external-claim:thies-wa-awispr9ofspp@in_progress) ok "OWN-GUARD(1): external in_progress crew self-claim REFUSED (reason: $_OG_R1)" ;;
   *) bad "OWN-GUARD(1): external in_progress self-claim NOT refused (got: '$_OG_R1') — the double-dispatch bug is back" ;;
 esac
+
+# (1b) ga-nqjgf0 — the 46wq5 × htjni loop. 46wq5's _filter_candidates re-admits a bead whose
+# in_progress assignee is NOT an active owner ("não é dono ativo"); signal (c) used to refuse the
+# very same bead with external-claim:<that assignee>@in_progress because, for a named-crew
+# assignee, it never asked whether that crew was alive (wa-3fx45f → batista-wa, a crew with NO
+# session: readmitted every sweep, refused every sweep, forever). Same variable, opposite
+# decisions. With a trustworthy roster that says "not an active owner", (c) must NOT refuse.
+OG_BEAD_JSON='[{"id":"wa-ghost","status":"in_progress","assignee":"batista-wa","labels":[],"metadata":{}}]'
+OG_ACTIVE=0; OG_ROSTER_OK=1
+_OG_R1B="$(_og "wa-ghost" '{"id":"wa-ghost","assignee":"","status":"open","labels":[]}')"
+[ -z "$_OG_R1B" ] && ok "OWN-GUARD(1b): in_progress claim by a crew that is NOT an active owner (trusted roster) is allowed — 46wq5 and htjni now agree (ga-nqjgf0)"                   || bad "OWN-GUARD(1b): claim by a non-active assignee still refused (got: '$_OG_R1B') — the 46wq5×htjni loop is back (readmitted by one, refused by the other)"
+
+# (1c) the other side of the three-state: when the roster itself can't be trusted (unreadable /
+# empty read), "no session found" is NOT evidence of "no owner" — keep the old, protective refusal.
+OG_ACTIVE=0; OG_ROSTER_OK=0
+_OG_R1C="$(_og "wa-ghost" '{"id":"wa-ghost","assignee":"","status":"open","labels":[]}')"
+OG_ROSTER_OK=1
+[ "$_OG_R1C" = "external-claim:batista-wa@in_progress" ] \
+  && ok "OWN-GUARD(1c): untrustworthy roster → (c) keeps refusing an external in_progress claim (can't-know never releases a bead)" \
+  || bad "OWN-GUARD(1c): with an unreadable roster the claim was NOT refused (got: '$_OG_R1C') — 'não consegui saber' must stay on the protective side"
+
+# (1d) ga-nqjgf0 — same decision, REAL predicate (no stub): the guard must give the verdict
+# _session_is_active_owner gives, on a real roster shape. A crew with a live active session
+# (mila-wa) is refused; a crew absent from the roster (batista-wa — the wa-3fx45f case) and a
+# crew that is only asleep (thies-wa) are not "active owners", so they must not be refused.
+_SAO_FN="$(awk '/^_session_is_active_owner\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER")"
+_og_real() { (
+    eval "$_OG_FN"; eval "$_GATE_FN"; eval "$_SAO_FN"
+    SELF_BEAD_ID=""; _DEADWORKER_OK=1
+    PILOT_BEAD_STATE_PY_OVERRIDE="$(cd "$(dirname "$DISPATCHER")" && pwd)/../../../scripts/bead_state.py"
+    _SESSION_META_JSON='{"mila-wa":{"state":"active","idle_minutes":2},"thies-wa":{"state":"asleep","idle_minutes":null}}'
+    _ACTIVE_OWNER_IDS="mila-wa"
+    bd() { case "$*" in *" show "*) printf '%s' "${OG_BEAD_JSON:-}" ;; *) : ;; esac; }
+    _beadid_branch_signal()   { return 1; }
+    _session_is_live()        { return 1; }
+    _beadid_mentioned_in_attached_session() { return 1; }
+    _ownership_guard_should_refuse "$1" "$2" "ignored-db"
+); }
+for _who in mila-wa batista-wa thies-wa; do
+  OG_BEAD_JSON="[{\"id\":\"wa-real\",\"status\":\"in_progress\",\"assignee\":\"$_who\",\"labels\":[],\"metadata\":{}}]"
+  _OG_R1D="$(_og_real "wa-real" '{"id":"wa-real","assignee":"","status":"open","labels":[]}')"
+  case "$_who" in
+    mila-wa)
+      [ "$_OG_R1D" = "external-claim:mila-wa@in_progress" ] \
+        && ok "OWN-GUARD(1d): real predicate — live active crew (mila-wa) refused" \
+        || bad "OWN-GUARD(1d): live active crew mila-wa NOT refused (got: '$_OG_R1D')" ;;
+    *)
+      [ -z "$_OG_R1D" ] \
+        && ok "OWN-GUARD(1d): real predicate — $_who (not an active owner) allowed, same verdict as 46wq5's filter" \
+        || bad "OWN-GUARD(1d): $_who is not an active owner yet the guard refused (got: '$_OG_R1D') — 46wq5×htjni disagree" ;;
+  esac
+done
 
 # (2) MAYOR ROUTING — assignee set but status=OPEN (imp20) → must NOT be refused by (c).
 OG_BEAD_JSON='[{"id":"wa-may","status":"open","assignee":"batista-ps","labels":[],"metadata":{}}]'
@@ -9331,8 +9391,21 @@ fi
 # out of scope for this lane:small change).
 HEX_BUG='[{"id":"tt-wahex","title":"celula Hex dedup: normaliza data sem format=mixed","priority":1,"issue_type":"bug","description":"a celula de notebook Hex que decide qual proprietario fica usa pd.to_datetime(errors=coerce) sem format=mixed","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:04Z","metadata":{"story.rig":"whatsapp_automation"}}]'
 
+# ga-nqjgf0: the structural-owner pick now needs POSITIVE evidence that the owner has a live
+# session (it used to dispatch to a crew with no session at all — wa-3fx45f → batista-wa, with
+# the roster never consulted). "Idle owner" below therefore means an owner that is IN the roster.
+# Rosters mirror `gc session list --json` (named crew: name == alias == agent_name, suffixed session_name).
+_bwa_sess() { # $1=state  $2=closed(true|false)
+  printf '{"id":"ga-wisp-bwa1","name":"batista-wa","alias":"batista-wa","session_name":"batista-wa-gawispbwa1","agent_name":"batista-wa","template":"batista-wa","state":"%s","closed":%s}' "$1" "$2"
+}
+_other_sess='{"id":"ga-wisp-t1","name":"thies-wa","alias":"thies-wa","session_name":"thies-wa-gawispt1","agent_name":"thies-wa","template":"thies-wa","state":"active","closed":false}'
+SESS_BWA_ACTIVE="{\"sessions\":[$(_bwa_sess active false),$_other_sess]}"
+SESS_BWA_ASLEEP="{\"sessions\":[$(_bwa_sess asleep false),$_other_sess]}"
+SESS_BWA_CLOSED="{\"sessions\":[$(_bwa_sess asleep true),$_other_sess]}"
+SESS_NO_BWA="{\"sessions\":[$_other_sess]}"
+
 echo "Scenario ga-pp00f-a: hex-native WA bug dispatches DIRECTLY to batista-wa (idle owner), bypassing the wa-worker pool"
-LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
+LOG_PP00F_A="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_ACTIVE")"
 HEX_BUILDER_A="$(builder_for_domain "$LOG_PP00F_A" hex)"
 if [ "$HEX_BUILDER_A" = "batista-wa" ]; then
   ok "hex-native bug dispatched DIRECTLY to batista-wa (structural owner, ga-pp00f fix)"
@@ -9484,6 +9557,82 @@ if echo "$LOG_WNOJMM_WARM_CTL" | grep -F "pilot:held-count:ga-wnojmm-hex" >/dev/
 else
   ok "warming correctly did NOT receive the new visible-hold treatment (scoped to hex only, per Regra No 4 — warming stays exactly as it was)"
 fi
+
+# ── Scenario ga-nqjgf0: the structural-owner pick requires a LIVE owner session ────────────
+# 2026-10-06 wa-3fx45f (hex) was dispatched to batista-wa — a crew with NO session at all
+# (suspended / never started) — and then looped: 46wq5 re-admitted it ("assignee não é dono
+# ativo"), htjni refused it (external-claim:batista-wa@in_progress), the nudge never landed
+# ("Could not nudge batista-wa"). ga-uvfs6's pick tested "suspended / busy / at-cap / human-engaged"
+# but never "does the owner exist right now". Three states, like every other probe in here:
+#   live (active or asleep — the REUSE path wakes an asleep crew, gt-4st3n)  → dispatch;
+#   none (trusted roster, no non-closed session for the owner)               → defer + VISIBLE hold;
+#   unknown (roster unreadable/empty)                                        → defer, NO hold stamp
+#       ("não consegui saber" never picks the crew, but never escalates on a flaky read either).
+# Scoped to domain=hex like ga-wnojmm's visible hold (Regra No 4: warming is not touched here).
+echo "Scenario ga-nqjgf0-a: hex bug, owner batista-wa has NO session (trusted roster) → NOT dispatched, NOT leaked to the pool, VISIBLY held"
+LOG_NQJ_A="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_NO_BWA")"
+NQJ_A_BUILDER="$(builders_of "$LOG_NQJ_A")"
+if [ "$NQJ_A_BUILDER" = "batista-wa" ]; then
+  bad "ga-nqjgf0 REGRESSION: hex bug dispatched to batista-wa although the roster has no session for it — the wa-3fx45f loop is back"
+elif echo "$NQJ_A_BUILDER" | grep -E '^wa-worker-[0-9]+$' >/dev/null; then
+  bad "ga-nqjgf0: hex bug leaked into the wa-worker pool ($NQJ_A_BUILDER) — pool is structurally incompatible with hex (ga-pp00f)"
+elif [ -n "$NQJ_A_BUILDER" ]; then
+  bad "ga-nqjgf0: hex bug routed unexpectedly with no owner session (got: '$NQJ_A_BUILDER')"
+else
+  ok "ga-nqjgf0: owner with no live session is not picked — hex bug deferred (no dispatch, no pool leak)"
+fi
+if echo "$LOG_NQJ_A" | grep -F "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex (hold 1/3)" >/dev/null; then
+  ok "ga-nqjgf0: the no-session defer stamps the shared VISIBLE hold counter (never a mute retry-forever)"
+else
+  bad "ga-nqjgf0: no-session defer left no visible hold on the bead (log: $(echo "$LOG_NQJ_A" | grep -iE 'tt-wahex|batista' | tr '\n' '|' | cut -c1-500))"
+fi
+if echo "$LOG_NQJ_A" | grep -F "has NO live session" >/dev/null; then
+  ok "ga-nqjgf0: the log names the reason (owner has no live session)"
+else
+  bad "ga-nqjgf0: the defer does not say WHY (owner has no live session) — indistinguishable from a busy-owner defer"
+fi
+
+echo "Scenario ga-nqjgf0-b: owner session ASLEEP → counts as live (REUSE wakes it, gt-4st3n) → dispatches to batista-wa"
+LOG_NQJ_B="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_ASLEEP")"
+NQJ_B_BUILDER="$(builders_of "$LOG_NQJ_B")"
+[ "$NQJ_B_BUILDER" = "batista-wa" ] \
+  && ok "ga-nqjgf0: asleep (wakeable) owner session is live — hex bug dispatched to batista-wa" \
+  || bad "ga-nqjgf0: asleep owner session wrongly treated as no session (got: '${NQJ_B_BUILDER:-none}') — a quiet crew would never get hex work"
+
+echo "Scenario ga-nqjgf0-c: only a CLOSED owner session in the roster → same as no session → deferred + held"
+LOG_NQJ_C="$(run_capacity 10 "[]" 1 "$HEX_BUG" "$SESS_BWA_CLOSED")"
+NQJ_C_BUILDER="$(builders_of "$LOG_NQJ_C")"
+if [ -z "$NQJ_C_BUILDER" ] && echo "$LOG_NQJ_C" | grep -F "WOULD stamp pilot:held-count:ga-wnojmm-hex:1 on tt-wahex" >/dev/null; then
+  ok "ga-nqjgf0: a closed session is not a live owner — deferred and visibly held"
+else
+  bad "ga-nqjgf0: closed owner session treated as live (builder: '${NQJ_C_BUILDER:-none}')"
+fi
+
+echo "Scenario ga-nqjgf0-d: roster UNREADABLE (empty read) → 'não consegui saber' never picks the crew, and does NOT stamp a hold"
+LOG_NQJ_D="$(run_capacity 10 "[]" 1 "$HEX_BUG")"
+NQJ_D_BUILDER="$(builders_of "$LOG_NQJ_D")"
+if [ -n "$NQJ_D_BUILDER" ]; then
+  bad "ga-nqjgf0: hex bug picked a crew ('$NQJ_D_BUILDER') on a roster that could not be read — can't-know must not choose the owner"
+else
+  ok "ga-nqjgf0: unreadable roster → owner not picked, bug not dispatched anywhere"
+fi
+if echo "$LOG_NQJ_D" | grep -F "pilot:held-count:ga-wnojmm-hex" >/dev/null; then
+  bad "ga-nqjgf0: a flaky roster read stamped the visible hold/escalation counter — would escalate to the Mayor on a transient"
+else
+  ok "ga-nqjgf0: unreadable roster does not feed the hold/escalate counter (transient, retried next sweep)"
+fi
+if echo "$LOG_NQJ_D" | grep -F "tt-wahex" | grep -F "roster unreadable" >/dev/null; then
+  ok "ga-nqjgf0: the unreadable-roster defer is logged with its reason"
+else
+  bad "ga-nqjgf0: the unreadable-roster defer is silent (log: $(echo "$LOG_NQJ_D" | grep -iE 'tt-wahex|batista' | tr '\n' '|' | cut -c1-400))"
+fi
+
+echo "Scenario ga-nqjgf0-e (control, Regra No 4): warming's owner pick is NOT changed by this fix — oracle-wa with no roster entry still dispatches exactly as before"
+LOG_NQJ_E="$(run_capacity 10 "[]" 1 "$WARM_BUG" "$SESS_NO_BWA")"
+NQJ_E_BUILDER="$(builders_of "$LOG_NQJ_E")"
+[ "$NQJ_E_BUILDER" = "oracle-wa" ] \
+  && ok "ga-nqjgf0 control: warming still dispatches to oracle-wa regardless of roster (behaviour unchanged; any warming change needs an explicit Athos decision)" \
+  || bad "ga-nqjgf0 control: warming routing changed (got: '${NQJ_E_BUILDER:-none}') — Regra No 4: no behaviour change there without an explicit Athos citation"
 
 # ── Scenario 26: ga-m2gqb RAM-pressure back-off (deferred remainder of ga-7xne1) ──
 # The mini froze 2026-07-27 (13 jetsam kills) when heavy evals + agent-pool load
