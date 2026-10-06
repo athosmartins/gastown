@@ -11,15 +11,19 @@
 #   A. slot_cooldown_secs: duty-cap formula, floor, ceiling, garbage input (incl. leading zeros)
 #   B. finish_reload: what each outcome schedules (heartbeat / file-change, ok / busy / fail), and
 #      that an UNKNOWN hold time is never read as "0s" (the third state) and a failure never
-#      overwrites the learned D
+#      overwrites the learned D; B5: a D that was NEVER learned travels save -> load -> startup log
+#      as "not learned" ('-' on disk), never as a measured 0s
 #   C. poll_reload_result: result-file hand-off, the runner-finished-between-two-checks race, dead
 #      runner, and the watchdog against the REAL runner topology (a hanging stub gc: no process
-#      of the tree may survive)
+#      of the tree may survive; and when pgrep cannot enumerate the tree the log says the client
+#      is NOT confirmed killed instead of "killed")
 #   D. start_reload: really issues the SYNC "gc reload --soft --timeout" (never --async) and
-#      maps ok / busy / fail from the client's exit status and text
+#      maps ok / busy / fail from the client's exit status and text; a stale result it cannot
+#      clear is said, not swallowed
 #   E. the restart gap: reload stats persist across a daemon restart (a failed save is logged,
-#      never silent), and drift that straddles the restart (files changed while down, or a
-#      reload still pending) is NOT dropped and NOT hidden behind the carried-over embargo
+#      never silent, and the log says what the restart will do WITH or WITHOUT an earlier record on
+#      disk), and drift that straddles the restart (files changed while down, or a reload still
+#      pending) is NOT dropped and NOT hidden behind the carried-over embargo
 #   F. file-detected drift (acceptance 3): a changed skill file is picked up, debounced and
 #      reloaded; a busy slot never drops it; a failing reload is retried a bounded number of
 #      times; it outranks the heartbeat and never runs concurrently with one; a restart with an
@@ -131,7 +135,7 @@ reset_state() {   # a fresh in-memory state; "keep-files" = a fresh PROCESS (the
     prev_hash=""; last_change_time=0; pending_reload=false; last_beat_time=0; last_hooks_check=0
     RELOAD_PID=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0; RELOAD_COVERS_HASH=""
     hb_next_allowed=0; file_next_allowed=0; file_fail_count=0; file_busy_streak=0
-    last_reload_secs=0; reload_held_total=0; reload_count=0; reload_unknown_count=0
+    last_reload_secs=""; reload_held_total=0; reload_count=0; reload_unknown_count=0   # D "" = never learned (NOT 0s)
     watcher_started_at=$FAKE_NOW
     stats_carried_over=false
     covered_hash=""; startup_gap_verdict=""; startup_gap_note=""
@@ -195,7 +199,8 @@ for fn in slot_cooldown_secs finish_reload poll_reload_result start_reload watch
     if declare -F "$fn" >/dev/null; then ok "function $fn exists"; else bad "function $fn missing (pre-fix watcher?)"; HAVE_POLICY=0; fi
 done
 # the helpers of the gate-FAIL-1/3 fix: absent (reviewed watcher), the tests that need them say so by name
-for fn in uint_or_empty hash_is_known clamp_duty_pct init_watcher_state descendants_of kill_process_tree consume_reload_result; do
+for fn in uint_or_empty hash_is_known clamp_duty_pct init_watcher_state descendants_of kill_process_tree consume_reload_result \
+          secs_txt startup_stats_line clear_stale_reload_result; do
     need_fn "$fn" && ok "function $fn exists"
 done
 if [ "$HAVE_POLICY" = 1 ]; then   # groups A-G (not re-indented): unit + simulation tests need the policy functions
@@ -300,6 +305,11 @@ eq "file change 4th failure: gives up (heartbeat covers it)" false "$pending_rel
 eq "file change give-up resets the failure streak"           0 "$file_fail_count"
 has   "give-up log says WHEN the heartbeat is due, instead of promising it will cover" "which is not due for 20s" "$TMP/giveup.log"
 hasnt "give-up log makes no 'will cover it' promise" "will cover it" "$TMP/giveup.log"
+# the give-up is the 4th failure (1 try + FILE_MAX_FAIL_RETRIES retries): the log counts them as such
+has   "give-up log counts the failures right: $((FILE_MAX_FAIL_RETRIES + 1)) (1 try + $FILE_MAX_FAIL_RETRIES retries)" "gave up after $((FILE_MAX_FAIL_RETRIES + 1)) failures" "$TMP/giveup.log"
+hasnt "give-up log does not say it gave up after only $FILE_MAX_FAIL_RETRIES" "gave up after $FILE_MAX_FAIL_RETRIES failures" "$TMP/giveup.log"
+has   "retry log numbers the RETRIES (the first failure schedules retry 1 of $FILE_MAX_FAIL_RETRIES)" "retry 1 of $FILE_MAX_FAIL_RETRIES" "$TMP/giveup.log"
+has   "…up to the last one" "retry $FILE_MAX_FAIL_RETRIES of $FILE_MAX_FAIL_RETRIES" "$TMP/giveup.log"
 
 reset_state; file_fail_count=2
 finish_reload file-change ok 5 0 "ok" "$N" >> "$TICKLOG"
@@ -323,10 +333,23 @@ done
 reset_state; last_reload_secs=900
 finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TICKLOG"
 eq "unknown hold, learned D=900 (> assumed 600): the larger of the two is used (7200 ceiling)" $((N + 7200)) "$hb_next_allowed"
-reset_state
-finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TICKLOG"
+reset_state; : > "$TMP/unk-nod.log"
+finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TMP/unk-nod.log" 2>&1
 eq "unknown hold with NO learned D: assumes ${RELOAD_UNKNOWN_HELD_ASSUMED}s" $((N + 5400)) "$hb_next_allowed"
-eq "…and still does not invent a D" 0 "$last_reload_secs"
+eq "…and still does not invent a D (it stays 'never learned', not 0)" "[]" "[$last_reload_secs]"
+has   "…the log says no D was learned yet" "no D learned yet" "$TMP/unk-nod.log"
+hasnt "…and never prints a learned D=0s for a D nobody measured" "D=0s" "$TMP/unk-nod.log"
+hasnt "…nor 'D=<1s'" "D=<1s" "$TMP/unk-nod.log"
+reset_state; last_reload_secs=300; : > "$TMP/unk-d.log"
+finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TMP/unk-d.log" 2>&1
+has "unknown hold WITH a learned D: the log names it (left untouched)" "learned D=300s left untouched" "$TMP/unk-d.log"
+
+# B3b. a MEASURED sub-second hold is a real measurement, and is shown as such: "<1s", never a bare 0s
+reset_state; : > "$TMP/zero.log"
+finish_reload heartbeat ok 0 0 "Reload complete" "$N" >> "$TMP/zero.log" 2>&1
+eq "a measured 0s hold IS learned (it is a number, unlike never-learned)" 0 "$last_reload_secs"
+has   "…and is logged as '<1s' (the clock has 1s resolution)" "took <1s" "$TMP/zero.log"
+hasnt "…not as 'took 0s'" "took 0s" "$TMP/zero.log"
 reset_state; last_reload_secs=600
 finish_reload heartbeat fail 1 1 "controller restarting" "$N" >> "$TICKLOG" 2>&1
 eq "a fast failure does NOT overwrite the learned D" 600 "$last_reload_secs"
@@ -350,6 +373,58 @@ finish_reload heartbeat ok 1 0 "x" "$N" >> "$TICKLOG" 2>&1
 eq "a reload that finished OK marks the hash it was requested against as covered" hX "${covered_hash-}"
 finish_reload heartbeat ok "" 0 "x" "$N" >> "$TICKLOG" 2>&1
 eq "…also when its duration is unknown (it did finish OK)" hX "${covered_hash-}"
+
+# B5. THE THIRD STATE ON THE PERSISTED PATH (gate FAIL 2/3, blocking 1 and 3): a D that was NEVER learned
+#     must travel save -> load -> startup log as "not learned", never as a measured 0s
+echo "-- B5. a D that was never learned is persisted as '-', loaded as 'not learned', and logged as such"
+HASH_MODE=fake; FAKE_HASH=hN
+( trap - EXIT; CONFIG_DRIFT_WATCHER_LIB=1; . "$WATCHER" >/dev/null 2>&1; printf '[%s]' "${last_reload_secs-UNSET}" ) > "$TMP/fresh-d.out" 2>&1
+eq "a freshly started watcher has learned no D (empty, not 0)" "[]" "$(cat "$TMP/fresh-d.out")"
+reset_state; RELOAD_COVERS_HASH=hN
+finish_reload heartbeat fail "" "?" "runner killed" "$N" >> "$TICKLOG" 2>&1   # the first life's first reload: unknown duration, no D yet
+eq "never-learned D is persisted as '-' (not '0')" "-" "$(awk '{print $1}' "$RELOAD_STATS_FILE" 2>/dev/null)"
+eq "…the record still has the embargo and the hash fields in place" "3" "$(awk '{print NF}' "$RELOAD_STATS_FILE" 2>/dev/null)"
+reset_state keep-files
+startup_replay >> "$TICKLOG" 2>&1
+eq "restart: a '-' D is loaded as 'not learned'" "[]" "[$last_reload_secs]"
+eq "restart: …and is NOT reported as carried over" false "$stats_carried_over"
+if need_fn startup_stats_line; then
+    startup_stats_line > "$TMP/b5-line.out"
+    has   "restart: the startup line says no hold time is learned yet" "No hold time learned yet" "$TMP/b5-line.out"
+    hasnt "restart: …and never claims the last reload held the slot 0s" "held the slot" "$TMP/b5-line.out"
+    hasnt "restart: …nor 'Carried over'" "Carried over" "$TMP/b5-line.out"
+fi
+# an OK reload that measured a hold turns '-' into a number, and that number is what a restart carries over
+reset_state; RELOAD_COVERS_HASH=hN
+finish_reload heartbeat ok 42 0 "ok" "$N" >> "$TICKLOG" 2>&1
+eq "a measured hold is persisted as a number" 42 "$(awk '{print $1}' "$RELOAD_STATS_FILE" 2>/dev/null)"
+reset_state keep-files
+startup_replay >> "$TICKLOG" 2>&1
+eq "restart: a measured D is carried over" "42 true" "$last_reload_secs $stats_carried_over"
+if need_fn startup_stats_line; then
+    startup_stats_line > "$TMP/b5-line.out"
+    has "restart: the startup line states the measured hold" "Carried over from the previous run: the last reload that could be measured held the slot 42s" "$TMP/b5-line.out"
+fi
+# a record written by anything that stored 0 for 'never learned' (a hand-edited file, an older build): the
+# startup line must not print a bare number for it. 0 is a real sub-second measurement, so say so as "<1s".
+reset_state
+echo "0 $((FAKE_NOW + 5400)) hN" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG" 2>&1
+if need_fn startup_stats_line; then
+    startup_stats_line > "$TMP/b5-zero.out"
+    hasnt "stats '0 <embargo> <hash>': the startup line never claims 'held the slot 0s'" "held the slot 0s" "$TMP/b5-zero.out"
+    has   "…it says '<1s' for what is, at best, a sub-second measurement" "held the slot <1s" "$TMP/b5-zero.out"
+fi
+# the same bound as a fresh measurement: a D no reload can have held is not credible, so it is not carried over
+reset_state
+echo "5000 $((FAKE_NOW + 5400)) hN" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG" 2>&1
+eq "a saved D above RELOAD_CLIENT_TIMEOUT+RELOAD_WATCHDOG_GRACE is not credible: not carried over" "[] false" "[$last_reload_secs] $stats_carried_over"
+reset_state
+echo "- $((FAKE_NOW + 5400)) hN" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG" 2>&1
+eq "a '-' D with unchanged files: verdict unchanged, the embargo is still carried (D and embargo are independent)" "unchanged $((FAKE_NOW + 5400))" "${startup_gap_verdict-} $hb_next_allowed"
+HASH_MODE=real; FAKE_HASH=h0
 
 # ── C. poll_reload_result ────────────────────────────────────────────────────
 echo "== C. poll_reload_result"
@@ -387,7 +462,7 @@ eq "runner died without a result: its hold time is UNKNOWN, D untouched" "77 1" 
 has "runner died without a result: logged" "exited without a result" "$TMP/dead.log"
 
 # C2. the runner that finishes BETWEEN the result-file check and the liveness check is a success
-reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=0
+reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=""
 ( trap - EXIT; exit 0 ) &
 RELOAD_PID=$!
 sleep 1
@@ -403,24 +478,30 @@ has   "race: logged as the OK reload it was" "reload[file-change] OK" "$TMP/race
 # C3. the WATCHDOG, against the production process topology: a hung stub gc under the REAL runner
 #     (start_reload's subshell -> $(...) -> gc -> its helper). Killing only the runner leaves the gc
 #     client orphaned — the leak of gate FAIL 1/3 (blocking 2 and 3).
-reset_state; RELOAD_TRIGGER=heartbeat; last_reload_secs=77
-: > "$TMP/hang.pids"
-export GCSTUB_MODE=hang GCSTUB_PIDS="$TMP/hang.pids"
-real_reload heartbeat "$FAKE_NOW" >> "$TICKLOG" 2>&1
-i=0
-while [ "$(wc -l < "$TMP/hang.pids" | tr -d ' ')" -lt 2 ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
-HUNG_PIDS="$(tr '\n' ' ' < "$TMP/hang.pids")"
-DUMMY_PIDS="$DUMMY_PIDS $HUNG_PIDS"   # safety net: whatever survives is killed at exit
+hung_start() {   # the real runner over a hung stub gc: sets HUNG_PIDS (the stub gc and its helper), RELOAD_PID, a past RELOAD_STARTED
+    reset_state; RELOAD_TRIGGER=heartbeat; last_reload_secs=77
+    : > "$TMP/hang.pids"
+    export GCSTUB_MODE=hang GCSTUB_PIDS="$TMP/hang.pids"
+    real_reload heartbeat "$FAKE_NOW" >> "$TICKLOG" 2>&1
+    local i=0
+    while [ "$(wc -l < "$TMP/hang.pids" | tr -d ' ')" -lt 2 ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+    HUNG_PIDS="$(tr '\n' ' ' < "$TMP/hang.pids")"
+    DUMMY_PIDS="$DUMMY_PIDS $HUNG_PIDS"   # safety net: whatever survives is killed at exit
+    RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
+}
+alive_of() {   # alive_of <pids…> — the ones that are still running, space separated, leading space
+    local p out=""
+    for p in "$@"; do builtin kill -0 "$p" 2>/dev/null && out="$out $p"; done
+    printf '%s' "$out"
+}
+hung_start
 eq "watchdog setup: the hung gc stub and its helper are running" 2 "$(printf '%s\n' $HUNG_PIDS | grep -c .)"
-alive_before=""
-for p in $HUNG_PIDS; do builtin kill -0 "$p" 2>/dev/null && alive_before="$alive_before $p"; done
+alive_before=$(alive_of $HUNG_PIDS)
 eq "watchdog setup: both are alive before the watchdog fires" "$(printf '%s' " $HUNG_PIDS" | sed 's/ *$//')" "$alive_before"
-RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
 : > "$TMP/watchdog.log"
 poll_reload_result "$FAKE_NOW" >> "$TMP/watchdog.log" 2>&1
 sleep 0.3
-alive_after=""
-for p in $HUNG_PIDS; do builtin kill -0 "$p" 2>/dev/null && alive_after="$alive_after $p"; done
+alive_after=$(alive_of $HUNG_PIDS)
 eq "watchdog: NO process of the hung gc tree survives (stub gc and its helper)" "" "$alive_after"
 for p in $alive_after; do builtin kill -KILL "$p" 2>/dev/null || true; done   # leave nothing behind, whatever happened
 eq "watchdog: slot freed" "" "$RELOAD_PID"
@@ -428,7 +509,89 @@ has   "watchdog: logged as killed, runner and client" "were killed" "$TMP/watchd
 hasnt "watchdog: no leak claimed when none happened" "leaked" "$TMP/watchdog.log"
 hasnt "watchdog: bash's job-control 'Terminated' dump (the whole runner script) stays out of the log" "Terminated" "$TMP/watchdog.log"
 eq "watchdog: how long it held the slot is unknown: D untouched, counted as unknown" "77 1" "$last_reload_secs ${reload_unknown_count-}"
+# the verdict names what was seen: the pids of the gc client and its helper are in the log, so "killed" is checkable
+hung_pid_list=$(printf '%s' "$HUNG_PIDS" | sed 's/ *$//')
+ok_pids=1
+for p in $HUNG_PIDS; do grep -F -- "$p" "$TMP/watchdog.log" >/dev/null 2>&1 || ok_pids=0; done
+eq "watchdog: the log lists the pids it killed (the gc stub and its helper: '$hung_pid_list')" 1 "$ok_pids"
+
+# C3b. THE THIRD STATE (gate FAIL 2/3, blocking 4): pgrep cannot enumerate the tree (missing from PATH: rc 127;
+#      or any rc >= 2). "I could not list the descendants" must not read as "there were none, all dead".
+#      Only the runner is signalled then — the gc client really survives — so the log must say so.
+hung_start
+pgrep() { return 127; }                           # shadows the binary for the watcher's own calls only
+: > "$TMP/watchdog-nopgrep.log"
+poll_reload_result "$FAKE_NOW" >> "$TMP/watchdog-nopgrep.log" 2>&1
+unset -f pgrep
+sleep 0.3
+alive_after=$(alive_of $HUNG_PIDS)
+ge "control: with the tree unenumerable the gc stub really is still alive (a 'killed' claim would be a lie)" "$(printf '%s\n' $alive_after | grep -c .)" 1
+for p in $alive_after; do builtin kill -KILL "$p" 2>/dev/null || true; done
+eq "pgrep unavailable: the slot is still freed (the loop is not held)" "" "$RELOAD_PID"
+has   "pgrep unavailable: the log says the descendants could not be enumerated" "could NOT be enumerated" "$TMP/watchdog-nopgrep.log"
+has   "pgrep unavailable: …and the gc client is NOT confirmed killed" "NOT confirmed killed" "$TMP/watchdog-nopgrep.log"
+hasnt "pgrep unavailable: …and it does NOT claim anything was killed" "were killed" "$TMP/watchdog-nopgrep.log"
+hasnt "pgrep unavailable: …nor 'the gc client was killed'" "gc client were killed" "$TMP/watchdog-nopgrep.log"
+eq "pgrep unavailable: the hold time is unknown all the same (D untouched, counted)" "77 1" "$last_reload_secs ${reload_unknown_count-}"
+
+# C3c. an erroring pgrep is not trusted for what it printed either: never signal a pid out of a failed enumeration
+( trap - EXIT; exec sleep 60 ) &
+BYSTANDER=$!
+( trap - EXIT; exec sleep 60 ) &
+VICTIM=$!
+DUMMY_PIDS="$DUMMY_PIDS $BYSTANDER $VICTIM"
+sleep 0.3
+pgrep() { [ "${2:-}" = "$VICTIM" ] && echo "$BYSTANDER"; return 2; }
+if need_fn kill_process_tree; then
+    kill_process_tree "$VICTIM" > "$TMP/c3c.out" 2>&1; C3C_RC=$?
+else
+    C3C_RC=0
+fi
+unset -f pgrep
+wait "$VICTIM" 2>/dev/null || true
+eq "failed pgrep: a pid it printed is NOT signalled (the bystander is still running)" " $BYSTANDER" "$(alive_of "$BYSTANDER")"
+eq "failed pgrep: the victim (the runner itself) is dead" "" "$(alive_of "$VICTIM")"
+if [ "$C3C_RC" -ne 0 ]; then ok "failed pgrep: kill_process_tree does not report a confirmed kill (rc $C3C_RC)"; else bad "failed pgrep: kill_process_tree reported success although it could not enumerate"; fi
+eq "failed pgrep: …the tree is flagged incomplete" false "${KILL_TREE_COMPLETE-unset}"
+builtin kill -KILL "$BYSTANDER" 2>/dev/null || true
+
+# C3d. a runner with NO descendants (pgrep answers rc 1 = none: a real answer) is killed and the log says exactly that —
+#      it must not claim a gc client was killed
+( trap - EXIT; exec sleep 60 ) &
+LEAF=$!
+DUMMY_PIDS="$DUMMY_PIDS $LEAF"
+sleep 0.3
+reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
+RELOAD_PID=$LEAF
+: > "$TMP/watchdog-leaf.log"
+poll_reload_result "$FAKE_NOW" >> "$TMP/watchdog-leaf.log" 2>&1
+sleep 0.3
+eq "leaf runner: dead" "" "$(alive_of "$LEAF")"
+has   "leaf runner: the log says the runner was killed and no descendant was found" "no descendant" "$TMP/watchdog-leaf.log"
+hasnt "leaf runner: …and does not claim a gc client was killed" "gc client" "$TMP/watchdog-leaf.log"
+hasnt "leaf runner: …nor that descendants were" "descendants (pids" "$TMP/watchdog-leaf.log"
+hasnt "leaf runner: …nor that enumeration failed" "could NOT be enumerated" "$TMP/watchdog-leaf.log"
 export GCSTUB_MODE=ok; unset GCSTUB_PIDS
+
+# C3e. descendants_of: the whole tree (depth > 1), and "could not enumerate" (rc 2) apart from "none" (rc 0, no output)
+if need_fn descendants_of; then
+    ( trap - EXIT; ( sleep 60 & wait ) & wait ) &
+    TREE_ROOT=$!
+    DUMMY_PIDS="$DUMMY_PIDS $TREE_ROOT"
+    sleep 0.5
+    TREE_LIST=$(descendants_of "$TREE_ROOT"); TREE_RC=$?
+    eq "descendants_of: a root -> subshell -> sleep tree lists both levels" 2 "$(printf '%s\n' $TREE_LIST | grep -c .)"
+    eq "descendants_of: a complete enumeration returns 0" 0 "$TREE_RC"
+    pgrep() { return 127; }
+    descendants_of "$TREE_ROOT" > "$TMP/c3e.out" 2>/dev/null; NOPGREP_RC=$?
+    unset -f pgrep
+    eq "descendants_of: pgrep failing returns 2 (the list cannot be trusted as complete)" 2 "$NOPGREP_RC"
+    pgrep() { return 1; }                         # rc 1 is pgrep's answer for "no process matches"
+    descendants_of "$TREE_ROOT" > "$TMP/c3e.out" 2>/dev/null; NONE_RC=$?
+    unset -f pgrep
+    eq "descendants_of: pgrep rc 1 ('none') is an answer: returns 0 with nothing listed" "0 0" "$NONE_RC $(wc -c < "$TMP/c3e.out" | tr -d ' ')"
+    for p in $TREE_LIST $TREE_ROOT; do builtin kill -KILL "$p" 2>/dev/null || true; done
+fi
 
 # C4. a process that survives SIGKILL is reported as leaked — never as killed — and cannot freeze the loop
 if need_fn kill_process_tree; then
@@ -436,16 +599,21 @@ if need_fn kill_process_tree; then
     STUBBORN=$!
     DUMMY_PIDS="$DUMMY_PIDS $STUBBORN"
     sleep 0.3
-    surv="$(kill_process_tree "$STUBBORN")"
+    # kill_process_tree reports through KILL_TREE_SEEN / KILL_TREE_COMPLETE / KILL_TREE_SURVIVORS and its status:
+    # 0 only when the tree was fully enumerated AND nothing in it survived (called directly, not in $(...))
+    kill_process_tree "$STUBBORN" > /dev/null 2>&1; KT_RC=$?
     wait "$STUBBORN" 2>/dev/null || true
-    eq "kill_process_tree: a TERM-ignoring process dies of the KILL that follows" "" "$surv"
+    eq "kill_process_tree: a TERM-ignoring process dies of the KILL that follows" "" "${KILL_TREE_SURVIVORS-unset}"
+    eq "kill_process_tree: …and that is a confirmed kill (status 0)" 0 "$KT_RC"
+    eq "kill_process_tree: …after a complete enumeration" true "${KILL_TREE_COMPLETE-unset}"
     ( trap - EXIT; exec sleep 60 ) &
     SHIELDED=$!
     DUMMY_PIDS="$DUMMY_PIDS $SHIELDED"
     sleep 0.3
     SHIELD_PID=$SHIELDED
-    surv="$(kill_process_tree "$SHIELDED")"
-    eq "kill_process_tree: reports the pid that survived SIGKILL" "$SHIELDED" "$surv"
+    kill_process_tree "$SHIELDED" > /dev/null 2>&1; KT_RC=$?
+    eq "kill_process_tree: reports the pid that survived SIGKILL" "$SHIELDED" "${KILL_TREE_SURVIVORS-unset}"
+    if [ "$KT_RC" -ne 0 ]; then ok "kill_process_tree: …and is not a confirmed kill (status $KT_RC)"; else bad "kill_process_tree: a survivor was reported as a confirmed kill"; fi
     reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
     RELOAD_PID=$SHIELDED
     : > "$TMP/leak.log"
@@ -496,6 +664,30 @@ eq "fail on a file-change reload: counted and retried" "1 true" "$reload_count $
 eq "fail on a file-change reload: learned D not overwritten by the 1s failure" 600 "$last_reload_secs"
 eq "fail: the hash is not marked covered" "" "${covered_hash-}"
 export GCSTUB_MODE=ok
+
+# D2. start_reload clears the previous result before it launches the runner. A stale one that survives would be
+#     consumed as THIS reload's result, and consume_reload_result would then wait() on a runner that is still
+#     running. A failed removal used to be swallowed (|| true): it is checked and SAID now.
+if need_fn clear_stale_reload_result; then
+    reset_state
+    printf 'ok 7 0\nstale\n' > "$RELOAD_RESULT_FILE"; printf 'half written' > "$RELOAD_RESULT_FILE.tmp"
+    clear_stale_reload_result > "$TMP/stale-ok.out" 2>&1; S_RC=$?
+    eq "a stale result and its temp file are removed (status 0)" "0 no no" "$S_RC $([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no) $([ -e "$RELOAD_RESULT_FILE.tmp" ] && echo yes || echo no)"
+    hasnt "…and nothing is said about it" "cannot remove" "$TMP/stale-ok.out"
+    mkdir -p "$RELOAD_RESULT_FILE"; : > "$RELOAD_RESULT_FILE/keep"        # rm -f cannot remove a non-empty directory
+    clear_stale_reload_result > "$TMP/stale-bad.out" 2>&1; S_RC=$?
+    eq "a stale result that cannot be removed: reported through the status (1)" 1 "$S_RC"
+    has "…and logged, naming the file" "cannot remove the stale reload result '$RELOAD_RESULT_FILE'" "$TMP/stale-bad.out"
+    has "…with what that risks" "mistaken for the result of the reload being started" "$TMP/stale-bad.out"
+    # start_reload itself says it (and still starts the reload: a change must not be dropped over a leftover file)
+    : > "$GCSTUB_ARGS"; export GCSTUB_MODE=ok
+    start_reload heartbeat "$FAKE_NOW" > "$TMP/stale-start.out" 2>&1
+    wait_reload
+    has "start_reload logs a result it could not clear" "cannot remove the stale reload result" "$TMP/stale-start.out"
+    has "…and still issues the reload" "reload --soft" "$GCSTUB_ARGS"
+    rm -f "$RELOAD_RESULT_FILE"/* 2>/dev/null; rmdir "$RELOAD_RESULT_FILE" 2>/dev/null || true
+    eq "stale-result scratch removed" "no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)"
+fi
 
 # ── E. the restart gap ───────────────────────────────────────────────────────
 echo "== E. restart gap (delivery restarts the daemon): stats persist; drift that straddles the restart is not dropped"
@@ -556,7 +748,7 @@ eq "legacy 2-field stats: the learned D is still usable" 600 "$last_reload_secs"
 reset_state
 echo "not numbers at all" > "$RELOAD_STATS_FILE"
 startup_replay >> "$TICKLOG"
-eq "garbage stats file: D not carried, embargo not carried, queued" "0 $((FAKE_NOW + HEARTBEAT_INTERVAL)) true" "$last_reload_secs $hb_next_allowed $pending_reload"
+eq "garbage stats file: D not carried (stays 'never learned', not 0), embargo not carried, queued" "[] $((FAKE_NOW + HEARTBEAT_INTERVAL)) true" "[$last_reload_secs] $hb_next_allowed $pending_reload"
 eq "garbage stats file is NOT reported as carried over" false "$stats_carried_over"
 reset_state
 echo "600 $((FAKE_NOW + 5400)) -" > "$RELOAD_STATS_FILE"       # saved while the covered hash was unknown
@@ -591,7 +783,34 @@ save_reload_stats > "$TMP/e6-fail.out" 2>&1; E6_RC=$?
 RELOAD_STATS_FILE=$E6_REAL_STATS_FILE
 eq "a save that cannot write still returns 0 (a full disk must not stop the watcher)" 0 "$E6_RC"
 has "a save that cannot write says so, naming the file" "could not save the reload stats to '$TMP/not-a-dir/stats'" "$TMP/e6-fail.out"
-has "...and what the next restart will do about it" "queues a file-change reload" "$TMP/e6-fail.out"
+# What the next restart does depends on what is ALREADY on disk (gate FAIL 2/3, blocking 2): the message must say
+# so, not promise the one outcome that holds only when there is no earlier record.
+has   "...and that the next restart reads the last record that WAS saved" "the last record that WAS saved" "$TMP/e6-fail.out"
+has   "...none on disk: the gap is unknown and a reload is queued" "no record: the restart gap is unknown and a file-change reload is queued" "$TMP/e6-fail.out"
+has   "...an older record on disk: its older D and embargo apply, this reload's cooldown is lost" "the cooldown of this reload is lost" "$TMP/e6-fail.out"
+hasnt "...and it does NOT promise a queued reload as if it were the only outcome" "re-learns D and queues a file-change reload" "$TMP/e6-fail.out"
+
+# E6b. THE CASE THE MESSAGE USED TO GET WRONG: an earlier record IS on disk (every save after the first has one),
+#      the files are unchanged, and a later save fails. The restart reads the OLD record: verdict unchanged,
+#      nothing queued, the OLD D, and the cooldown of the reload whose save failed is gone.
+FAKE_HASH=hA; E6B_BASE=$FAKE_NOW
+reset_state; prev_hash=hA; RELOAD_COVERS_HASH=hA
+finish_reload heartbeat ok 600 0 "ok" "$FAKE_NOW" >> "$TICKLOG" 2>&1              # record 1: D=600, embargo +5400
+E6B_T2=$((E6B_BASE + 6000))                                                        # record 1's embargo is over by then
+mkdir "$RELOAD_STATS_FILE.tmp"                                                     # a directory where the temp file goes: the NEXT save fails, record 1 stays
+finish_reload heartbeat ok 300 0 "ok" "$E6B_T2" > "$TMP/e6b-fail.out" 2>&1
+rmdir "$RELOAD_STATS_FILE.tmp"
+E6B_SECOND_EMBARGO=$hb_next_allowed
+has "an earlier record on disk, a later save fails: the failure is logged" "could not save the reload stats" "$TMP/e6b-fail.out"
+eq "…record 1 is still what is on disk (D=600)" 600 "$(awk '{print $1}' "$RELOAD_STATS_FILE" 2>/dev/null)"
+FAKE_NOW=$((E6B_T2 + 30))
+reset_state keep-files
+startup_replay >> "$TICKLOG" 2>&1
+eq "…restart: verdict unchanged, nothing queued (no reload is queued by a failed save)" "unchanged false" "${startup_gap_verdict-} $pending_reload"
+eq "…restart: the OLD D (600) is carried, not the 300 that was measured and lost" 600 "$last_reload_secs"
+eq "…restart: the cooldown of the reload whose save failed is LOST — the heartbeat floor applies, not +5400s" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
+ge "…(what was lost: that reload's own embargo reached well beyond the restart's)" "$E6B_SECOND_EMBARGO" $((FAKE_NOW + 1000))
+FAKE_NOW=$E6B_BASE; FAKE_HASH=hA
 
 # E7. the restart-gap NOTE in the log says only what the code did: "embargo carried over" is claimed
 # when a saved embargo really was applied, and not when it was over already / absent / not credible
@@ -870,6 +1089,8 @@ has "file-change reload requested" "reload[file-change] requested" "$E2E_LOG"
 has "file-change reload completed, hold time logged" "reload[file-change] OK, took" "$E2E_LOG"
 has "slot-duty proof line in the log" "own slot duty since start" "$E2E_LOG"
 has "startup log shows the EFFECTIVE duty caps" "slot duty <= 10% [configured '10']" "$E2E_LOG"
+has   "first life, no stats: the startup log says no hold time is learned yet" "No hold time learned yet" "$E2E_LOG"
+hasnt "first life: the startup log never claims a hold time nobody measured" "held the slot" "$E2E_LOG"
 has   "gc called as sync reload with timeout" "reload --soft --timeout ${RELOAD_CLIENT_TIMEOUT}s --city $E2E" "$TMP/e2e.gc.args"
 hasnt "gc never called with --async" "--async" "$TMP/e2e.gc.args"
 if [ -s "$E2E_STATS" ]; then ok "reload stats persisted"; else bad "reload stats not persisted"; fi
@@ -881,6 +1102,8 @@ wait_for_log "Restart gap:" 40
 sleep 7                                       # two more ticks: a wrongly queued reload would be requested by now
 stop_daemon
 has   "life 2: previous reload stats carried over" "Carried over from the previous run" "$E2E_LOG"
+has   "life 2: …stated as a measured hold" "the last reload that could be measured held the slot" "$E2E_LOG"
+hasnt "life 2: …and not as a hold that was never learned" "No hold time learned yet" "$E2E_LOG"
 has   "life 2: restart gap reported as unchanged" "Restart gap: unchanged" "$E2E_LOG"
 hasnt "life 2: no reload requested for an unchanged restart" "requested" "$E2E_LOG"
 
