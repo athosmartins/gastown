@@ -396,11 +396,11 @@ file_reload_due() {
         && (( $1 - last_change_time >= DEBOUNCE_WINDOW )) && (( $1 >= file_next_allowed ))
 }
 
-# watcher_tick — one pass of the main loop (everything except the sleep), so the selftest can
-# drive it with a fake clock.
+# watcher_tick [now] — one pass of the main loop (everything except the sleep), so the selftest
+# can drive it with a fake clock. The daemon passes nothing and reads the clock itself.
 watcher_tick() {
-    local now current_hash
-    now=$(epoch_now)
+    local now="${1:-}" current_hash
+    [ -n "$now" ] || now=$(epoch_now)
 
     poll_reload_result "$now"
 

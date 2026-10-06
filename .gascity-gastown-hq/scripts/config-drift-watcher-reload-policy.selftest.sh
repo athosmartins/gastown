@@ -80,6 +80,11 @@ export CONFIG_DRIFT_WATCHER_LIB=1
 . "$WATCHER" || { echo "FATAL: cannot source $WATCHER" >&2; exit 2; }
 unset CONFIG_DRIFT_WATCHER_LIB
 
+# A pre-fix watcher defines none of the reload-policy variables (and STATE_DIR only outside lib
+# mode): default them so such a watcher is reported assertion by assertion instead of aborting.
+: "${STATE_DIR:=$CITY/.gc/state}"
+: "${RELOAD_CLIENT_TIMEOUT:=900}"
+
 # Guard: nothing below may ever write into the real city.
 case "${STATE_DIR:-}" in
     "$TMP"/*) ;;
@@ -227,10 +232,13 @@ has "runner died without a result: logged" "exited without a result" "$TICKLOG"
 
 reset_state; RELOAD_TRIGGER=heartbeat
 RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
-sleep 60 &
+# A hung client. It must have exec'd `sleep` before it is killed: a bash child that gets SIGTERM
+# between fork and exec runs this script's inherited EXIT trap (cleanup + FATAL) — seen on 3.2 under load.
+( trap - EXIT; exec sleep 60 ) &
 RELOAD_PID=$!
 DUMMY_PIDS="$DUMMY_PIDS $RELOAD_PID"
 HUNG=$RELOAD_PID
+sleep 0.5
 poll_reload_result "$FAKE_NOW" >> "$TICKLOG"
 sleep 0.3
 if kill -0 "$HUNG" 2>/dev/null; then bad "watchdog: stuck client was not killed"; else ok "watchdog: stuck client killed"; fi
@@ -326,7 +334,7 @@ sim_reset() {   # fresh daemon at SIM_T0, slot free, nothing pending
     last_beat_time=$FAKE_NOW
     hb_next_allowed=$((FAKE_NOW + HEARTBEAT_INTERVAL))   # what the daemon does at startup
 }
-ticks() { local i=0; while [ "$i" -lt "$1" ]; do FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL)); watcher_tick >> "$TICKLOG"; i=$((i + 1)); done; }
+ticks() { local i=0; while [ "$i" -lt "$1" ]; do FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL)); watcher_tick "$FAKE_NOW" >> "$TICKLOG"; i=$((i + 1)); done; }
 starts_matching() { printf '%s\n' $START_LOG | grep -c "$1" || true; }
 
 # F1. a changed skill file is detected, debounced, reloaded — the original protection
@@ -391,9 +399,12 @@ ge "hooks guard ran on the heartbeat beat during 300s" "$HOOK_CALLS" 15
 # ── G. before/after slot occupancy at the measured reload duration ───────────
 echo "== G. simulation: the controller's single reload slot, reload duration D=600s (measured 05/10)"
 SIM_HOURS="${SIM_HOURS:-6}"
-G_TICKS=$(( SIM_HOURS * 3600 / POLL_INTERVAL ))
-PROBE_EVERY=$(( 60 / POLL_INTERVAL ))        # an external caller (gc agent resume) arrives every 60s
-TAIL_TICKS=$(( 1200 / POLL_INTERVAL ))       # leave 20 min so every probe has time to find the slot free
+sim_dims() {   # $1 = tick length (s): ticks in the horizon, a probe every 60s, 20 min tail so each probe can find the slot free
+    SIM_STEP=$1
+    G_TICKS=$(( SIM_HOURS * 3600 / SIM_STEP ))
+    PROBE_EVERY=$(( 60 / SIM_STEP ))
+    TAIL_TICKS=$(( 1200 / SIM_STEP ))
+}
 SIM_FREE=()
 sim_stats() {   # from SIM_FREE[0..G_TICKS-1]: duty, and how long a caller arriving at each probe waits for a free slot
     local n="$1" a j held=0 w tot=0 cnt=0 max=0 fast=0
@@ -404,7 +415,7 @@ sim_stats() {   # from SIM_FREE[0..G_TICKS-1]: duty, and how long a caller arriv
     while [ "$a" -lt $((n - TAIL_TICKS)) ]; do
         j=$a
         while [ "$j" -lt "$n" ] && [ "${SIM_FREE[$j]}" = 0 ]; do j=$((j + 1)); done
-        w=$(( (j - a) * POLL_INTERVAL ))
+        w=$(( (j - a) * SIM_STEP ))
         tot=$((tot + w)); cnt=$((cnt + 1))
         [ "$w" -gt "$max" ] && max=$w
         [ "$w" -le 120 ] && fast=$((fast + 1))
@@ -416,11 +427,12 @@ sim_stats() {   # from SIM_FREE[0..G_TICKS-1]: duty, and how long a caller arriv
 }
 
 # G1. BEFORE: the old policy — try a reload every 20s (3s poll), unconditionally; accepted when the slot is free
+sim_dims "$POLL_INTERVAL"   # the old loop really ticks every POLL_INTERVAL (3s) and costs nothing to simulate
 FAKE_NOW=$SIM_T0; SLOT_BUSY_UNTIL=0; SIM_D=600; last_hb=$FAKE_NOW; legacy_accepted=0
 SIM_FREE=()
 i=0
 while [ "$i" -lt "$G_TICKS" ]; do
-    FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL))
+    FAKE_NOW=$((FAKE_NOW + SIM_STEP))
     if [ "$FAKE_NOW" -ge "$SLOT_BUSY_UNTIL" ]; then SIM_FREE[$i]=1; else SIM_FREE[$i]=0; fi
     if [ $((FAKE_NOW - last_hb)) -ge 20 ]; then
         last_hb=$FAKE_NOW
@@ -433,15 +445,18 @@ LEGACY_DUTY=$SIM_DUTY; LEGACY_MAX=$SIM_MAXWAIT; LEGACY_MEAN=$SIM_MEANWAIT; LEGAC
 echo "  before (unconditional 20s heartbeat): slot held ${LEGACY_DUTY}% of ${SIM_HOURS}h, ${legacy_accepted} watcher reloads; a caller arriving every 60s waits mean ${LEGACY_MEAN}s / max ${LEGACY_MAX}s, ${LEGACY_FAST}% served within 2 min"
 
 # G2. AFTER: the real watcher_tick, real finish_reload/cooldown logic, simulated slot
+# 9s ticks (the daemon ticks every 3s): the cadence is set by the cooldown, a coarser tick only
+# delays a start by <= 6s, and each tick of the real watcher_tick costs a fork under load.
+sim_dims $(( POLL_INTERVAL * 3 ))
 HASH_MODE=fake; FAKE_HASH=h0
 sim_reset; SIM_D=600
 SIM_FREE=()
 : > "$TICKLOG"
 i=0
 while [ "$i" -lt "$G_TICKS" ]; do
-    FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL))
+    FAKE_NOW=$((FAKE_NOW + SIM_STEP))
     if [ "$FAKE_NOW" -ge "$SLOT_BUSY_UNTIL" ]; then SIM_FREE[$i]=1; else SIM_FREE[$i]=0; fi
-    watcher_tick >> "$TICKLOG"
+    watcher_tick "$FAKE_NOW" >> "$TICKLOG"
     i=$((i + 1))
 done
 sim_stats "$G_TICKS"
@@ -451,7 +466,7 @@ echo "  after  (duty-capped heartbeat):       slot held ${NEW_DUTY}% of ${SIM_HO
 
 ge "before: the old policy keeps the slot occupied nearly all the time (model reproduces the incident)" "$LEGACY_DUTY" 90
 le "after: the watcher holds the slot at most ~10% of the time (cap + boundary effects)" "$NEW_DUTY" 12
-le "after: a caller waits at most for the remaining hold of ONE reload (D + a tick)" "$NEW_MAX" $((SIM_D + 2 * POLL_INTERVAL))
+le "after: a caller waits at most for the remaining hold of ONE reload (D + a tick)" "$NEW_MAX" $((SIM_D + 2 * SIM_STEP))
 ge "after: most external callers get the slot within 2 min" "$NEW_FAST" 80
 le "before: the old policy served few callers within 2 min" "$LEGACY_FAST" 40
 ge "after: the backstop heartbeat is still alive (not disabled)" "$new_accepted" 3
@@ -462,7 +477,7 @@ for t in $(printf '%s\n' $START_LOG | sed -n 's/^heartbeat@\([0-9]*\)=ok$/\1/p')
     if [ -n "$prev_t" ] && [ $((t - prev_t)) -lt "$min_gap" ]; then min_gap=$((t - prev_t)); fi
     prev_t=$t
 done
-ge "after: consecutive heartbeat reloads leave a free window (>= D*9 = 5400s)" "$min_gap" $((SIM_D * 9 - POLL_INTERVAL))
+ge "after: consecutive heartbeat reloads leave a free window (>= D*9 = 5400s)" "$min_gap" $((SIM_D * 9 - SIM_STEP))
 has "after: the log shows the cumulative slot duty" "own slot duty since start" "$TICKLOG"
 
 else
