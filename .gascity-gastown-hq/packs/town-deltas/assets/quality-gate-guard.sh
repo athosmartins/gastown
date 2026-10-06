@@ -4230,7 +4230,9 @@ close_open_run_verdicts() {
 # be fetched, a comment list that is not JSON, a `git fetch` that failed (so origin/main may be stale and the
 # three-dot diff would take in everything main gained since), a numstat row whose count has 10+ digits (not a line count;
 # bash arithmetic would wrap it silently), an exemption comment that cannot be read (no string .text) while no readable
-# one carries a valid reason: none of those refuses. They are logged ("nao-medido"; the cause is in
+# one carries a valid reason, a GATE_E11_CAP_LINES override that cannot be read as a cap (the cap nobody chose would
+# otherwise be the default 800, tighter than the operator may have meant): none of those refuses. They are logged
+# ("nao-medido"; the cause is in
 # why=) and the submission goes through exactly as today. "I could not tell" is never "too big".
 #
 # EXEMPTION: label gate:size-exempt on the source bead OR on the marker, WITH a reason — a comment on that same bead
@@ -4298,18 +4300,34 @@ gate_e11_arm_for_bead() {
   if (( first % 2 == 0 )); then printf 'B'; else printf 'A'; fi
 }
 
-# gate_e11_norm_cap <value> — prints a usable cap: a positive integer of at most 9 digits, else 800. A cap of 0 would
-# refuse every submission, so it is not a cap.
-gate_e11_norm_cap() {
+# gate_e11_cap_valid <value> — returns 0 when the value is a usable cap: a positive integer of at most 9 digits. A cap of
+# 0 would refuse every submission, so it is not a cap; 10+ digits is not a size anyone meant. The ONE definition, shared
+# by gate_e11_norm_cap (what is used) and gate_e11_cap_state (what was understood), so the two cannot disagree.
+gate_e11_cap_valid() {
   local v="${1:-}"
-  case "$v" in ''|*[!0-9]*) printf '800'; return 0 ;; esac
-  if [ "${#v}" -gt 9 ] || [ "$((10#$v))" -eq 0 ]; then printf '800'; return 0; fi
-  printf '%s' "$((10#$v))"
+  case "$v" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#v}" -le 9 ] && [ "$((10#$v))" -gt 0 ]
 }
 
-# gate_e11_cap_lines — the cap in force: GATE_E11_CAP_LINES, else 800.
+# gate_e11_norm_cap <value> — prints a usable cap: the value when gate_e11_cap_valid, else the default 800.
+gate_e11_norm_cap() {
+  local v="${1:-}"
+  if gate_e11_cap_valid "$v"; then printf '%s' "$((10#$v))"; else printf '800'; fi
+}
+
+# gate_e11_cap_lines — the cap in force: GATE_E11_CAP_LINES, else 800. Always a number (the log line prints it); whether the
+# override was UNDERSTOOD is gate_e11_cap_state.
 gate_e11_cap_lines() {
   gate_e11_norm_cap "${GATE_E11_CAP_LINES:-}"
+}
+
+# gate_e11_cap_state — prints ok or invalido. ok: GATE_E11_CAP_LINES is unset or empty (the documented 800 is a decision,
+# not a failure) or a usable cap. invalido: it is set to something that cannot be read as a cap. Same class as
+# gate_e11_switch_state: an override nobody could read must not behave like "no override" — falling back to 800 refused
+# submissions at a cap the operator never chose (`GATE_E11_CAP_LINES=1,200`). The live block turns invalido into
+# nao-medido with why=cap-invalido: accepted, logged, never refused (ga-lzidpo gate round 3, class sweep).
+gate_e11_cap_state() {
+  if [ -z "${GATE_E11_CAP_LINES:-}" ] || gate_e11_cap_valid "$GATE_E11_CAP_LINES"; then printf 'ok'; else printf 'invalido'; fi
 }
 
 # gate_e11_path_is_production <path> — returns 0 when the path counts toward the cap, 1 when it does not (see the
@@ -7204,7 +7222,9 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_ARM=$(gate_e11_arm_for_bead "$BEAD_ID") || _E11_ARM_RC=$?
   case "$_E11_ARM" in A|B) ;; *) _E11_ARM="?" ;; esac
   _E11_CAP=$(gate_e11_cap_lines)
+  _E11_CAP_ST=$(gate_e11_cap_state)
   _E11_COUNT="-"
+  _E11_VCOUNT="-"        # the count the VERDICT sees; _E11_COUNT is what the log shows (they differ only for an unreadable cap)
   _E11_EXEMPT="nao-consultado"
   _E11_WHY="-"
   if [ "$_E11_ARM" = "?" ]; then
@@ -7241,9 +7261,17 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
         fi
       fi
     fi
+    # A cap override that could not be READ (GATE_E11_CAP_LINES=1,200) is not "no override": the 800 in $_E11_CAP is only a
+    # number to print, not a cap anyone chose. The verdict then sees "unknown" => nao-medido, accepted; the measured count
+    # stays in the log, and a cause already named above is not overwritten (ga-lzidpo gate round 3, class sweep).
+    _E11_VCOUNT="$_E11_COUNT"
+    if [ "$_E11_CAP_ST" != "ok" ]; then
+      _E11_VCOUNT="unknown"
+      [ "$_E11_WHY" != "-" ] || _E11_WHY="cap-invalido"
+    fi
     # The exemption is looked up only for a submission that is measured AND over the cap — the one case it can matter,
     # so the cap-or-under majority makes no bd call at all.
-    if [ "$(gate_e11_verdict B "$_E11_COUNT" nao-consultado "$_E11_CAP")" = "nao-medido-isencao" ]; then
+    if [ "$(gate_e11_verdict B "$_E11_VCOUNT" nao-consultado "$_E11_CAP")" = "nao-medido-isencao" ]; then
       _E11_SHOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _E11_SHOW=""
       _E11_LAB=$(gate_e11_exempt_label "$_E11_SHOW")
       _E11_RSN="no"
@@ -7265,7 +7293,7 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
       [ "$_E11_EXEMPT" != "desconhecido" ] || _E11_WHY="isencao-ilegivel"
     fi
   fi
-  _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_COUNT" "$_E11_EXEMPT" "$_E11_CAP")
+  _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_VCOUNT" "$_E11_EXEMPT" "$_E11_CAP")
   log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID"
   if [ "$_E11_VERDICT" = "recusa" ]; then
     err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B). Refusing at submission."

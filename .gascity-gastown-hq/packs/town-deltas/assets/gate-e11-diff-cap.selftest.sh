@@ -47,7 +47,7 @@ set +e  # sourcing the guard leaks its `set -e` into this shell (same as the sib
 # all — `command not found` also prints nothing. One assertion per function, so the old guard fails loudly here.
 echo "── 0. the E11 functions exist ──"
 E11_FNS="gate_e11_switch_state gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
-gate_e11_cap_lines gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict"
+gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict"
 E11_MISSING=0
 for f in $E11_FNS; do
   if declare -F "$f" >/dev/null 2>&1; then ok "function $f is defined"; else bad "function $f is NOT defined in $GUARD"; E11_MISSING=1; fi
@@ -213,6 +213,22 @@ eq "numeric override" "$(GATE_E11_CAP_LINES=1000 gate_e11_cap_lines)" "1000"
 eq "junk override falls back to 800" "$(GATE_E11_CAP_LINES=abc gate_e11_cap_lines)" "800"
 eq "0 would refuse everything: falls back to 800" "$(GATE_E11_CAP_LINES=0 gate_e11_cap_lines)" "800"
 eq "empty override falls back to 800" "$(GATE_E11_CAP_LINES= gate_e11_cap_lines)" "800"
+
+# Gate round 3, class sweep of round 2's blocking issue. A switch nobody could read must not read as "no override"; the
+# same is true of the cap. gate_e11_cap_lines above still answers a number (the block needs one to print), so whether
+# the override was UNDERSTOOD is a separate question — gate_e11_cap_state: ok (unset, empty, or a positive integer of at
+# most 9 digits) or invalido (anything else). An operator's `GATE_E11_CAP_LINES=1,200` fell back to 800 without a word
+# and refused submissions they had meant to allow: a doubt that went to the REFUSING side.
+echo "── 5b. gate_e11_cap_state ──"
+eq "state: unset = ok (the documented default is a decision)" "$(unset GATE_E11_CAP_LINES; gate_e11_cap_state)" "ok"
+eq "state: empty = ok (no override)" "$(GATE_E11_CAP_LINES= gate_e11_cap_state)" "ok"
+eq "state: 1000 = ok" "$(GATE_E11_CAP_LINES=1000 gate_e11_cap_state)" "ok"
+eq "state: 800 spelled out = ok" "$(GATE_E11_CAP_LINES=800 gate_e11_cap_state)" "ok"
+eq "state: 0800 (leading zero, still 800) = ok" "$(GATE_E11_CAP_LINES=0800 gate_e11_cap_state)" "ok"
+eq "state: 999999999 (9 digits, the last readable size) = ok" "$(GATE_E11_CAP_LINES=999999999 gate_e11_cap_state)" "ok"
+for JC in abc "1,200" "1.5" "-5" " " "5 " "0" "00" "1000000000" "99999999999999999999"; do
+  eq "state: '$JC' = invalido (an override nobody can read is not 'no override')" "$(GATE_E11_CAP_LINES="$JC" gate_e11_cap_state)" "invalido"
+done
 
 # ── 6. the exemption: label + reason, three states ───────────────────────────
 echo "── 6. gate:size-exempt needs a label AND a reason ──"
@@ -568,6 +584,37 @@ if [ "$(id -u)" != "0" ]; then
   has "unreadable flag file: the log says so (round 2 low), not a silent OFF" "$LOGF" "verdict=interruptor-ilegivel production_lines=- cap=800 exempt=- why=flag-ilegivel"
   chmod 600 "$FLAG"; rm -f "$FLAG"
 fi
+
+echo "  — a cap override nobody could read: accept + say so, never a silent tighter cap (gate round 3, class sweep) —"
+# Same family as the switch above: GATE_E11_CAP_LINES=1,200 used to fall back to 800 without a word, so a submission the
+# operator meant to allow was refused at a cap nobody chose. An override that cannot be read is nao-medido (accepted,
+# why=cap-invalido); the measured count still goes in the log. A READABLE cap, tight or loose, behaves as before.
+set_beads "$BB" "$PLAIN" "$PLAIN"
+for JC in "1,200" abc 0 " " 1000000000; do
+  GATE_E11_CAP_LINES="$JC" run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+  eq "cap override '$JC' (unreadable), arm B, 900 prod lines: ACCEPTED, not refused at a cap nobody chose" "$RC" "0"
+  has "cap override '$JC': nao-medido, the measured count stays in the log, the cause is NAMED" "$LOGF" "LOG E11-DIFF-CAP bead=$BB arm=B verdict=nao-medido production_lines=900 cap=800 exempt=nao-consultado why=cap-invalido"
+  lacks "cap override '$JC': nothing refused, nothing labelled" "$CALLS" "STATUS"
+  eq "cap override '$JC': no bd call (no exemption lookup for a refusal that cannot happen)" "$(calls_n)" "0"
+done
+GATE_E11_CAP_LINES=abc run_e11 1 "$RIG_OK" "$BB" feat/pytest; RC=$?
+eq "unreadable cap + a 40-line submission: accepted" "$RC" "0"
+has "unreadable cap + a small diff: still nao-medido (nobody can say it is 'within' a cap that could not be read)" "$LOGF" "verdict=nao-medido production_lines=40 cap=800 exempt=nao-consultado why=cap-invalido"
+GATE_E11_CAP_LINES=abc run_e11 1 "" "$BB" feat/prod900; RC=$?
+eq "unreadable cap + an empty RIG_PATH: accepted" "$RC" "0"
+has "the FIRST cause keeps its name (the cap does not overwrite it)" "$LOGF" "why=entrada-vazia"
+lacks "the cap is not blamed for a cause it did not cause" "$LOGF" "why=cap-invalido"
+GATE_E11_CAP_LINES=abc run_e11 1 "$RIG_OK" "$AA" feat/prod900; RC=$?
+eq "unreadable cap, arm A (never measured): accepted" "$RC" "0"
+has "arm A is still the control" "$LOGF" "LOG E11-DIFF-CAP bead=$AA arm=A verdict=controle"
+lacks "arm A: the cap is irrelevant, so it is not named" "$LOGF" "cap-invalido"
+GATE_E11_CAP_LINES=1000 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "a READABLE cap of 1000, 900 prod lines: accepted" "$RC" "0"
+has "readable loose cap: dentro-do-teto at cap=1000" "$LOGF" "verdict=dentro-do-teto production_lines=900 cap=1000"
+lacks "readable cap: not flagged as invalid" "$LOGF" "cap-invalido"
+GATE_E11_CAP_LINES=500 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "a READABLE cap of 500, 900 prod lines: still REFUSED (positive evidence, nothing weakened)" "$RC" "1"
+has "readable tight cap: the refusal names that cap" "$LOGF" "verdict=recusa production_lines=900 cap=500"
 
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then echo "  RESULT: PASS"; exit 0; fi
