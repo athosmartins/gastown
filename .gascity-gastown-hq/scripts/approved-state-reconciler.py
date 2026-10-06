@@ -26,6 +26,10 @@ ROUTING SIGNALS (explicit LABELS only — keywords NEVER trigger routing):
   • needs-human: label gate:needs-human* (prefix), story:needs-human, or bare
     needs-human ONLY (ga-m0ksy: bare added — ~half the city's actual usage
     of this signal, not an edge case; see _classify()'s own comment).
+    WHERE it lands (ga-gm5rv5): story:needs-human is the Athos's queue, so only a
+    gate:needs-human:product bead is stamped with it. A technical/bare/routing/
+    on-device gate park is the Mayor's turn: next-action:mayor + a "Pergunta:" comment
+    (gate:needs-human* stays on it — that is what keeps Pilot/pool dispatch vetoed).
   • blocked: label blocked/story:blocked ONLY.
   • post-build: label gate:passed → remove story:approved only (delivery owns it).
   Keywords (warming, aquecimento, celular, etc.) trigger a LOW-PRIORITY FLAG only
@@ -69,6 +73,7 @@ except ImportError:
     def _arc_fa_blocked(path):  # type: ignore
         return None
 import park_labels
+import bead_state
 import gate_queue_backlog
 from gate_queue_backlog import (
     _gate_queue_depth, _gate_queue_throughput, _gate_queue_suppress_reason,
@@ -1736,11 +1741,45 @@ def _pilot_cap_evidence(now):
 
 
 # ── route a bead out of story:approved ───────────────────────────────────────
+NEXT_ACTION_MAYOR_LABEL = "next-action:mayor"
+
+
+def _needs_human_owner(bead):
+    """Whose queue a needs-human route belongs to: 'athos', 'mayor', or None.
+
+    ga-gm5rv5 (Mayor, 06/10): story:needs-human is the Athos's marker, so only a
+    gate:needs-human:<suffix> that bead_state calls the Athos's (ATHOS_GATE_HUMAN_SUFFIXES,
+    today just :product) may stamp it. Every other gate:needs-human* variant (:technical,
+    bare, :routing, :on-device, ...) is the Mayor's or the crew's → 'mayor'. The suffix
+    list is bead_state's, not a second copy here — two lists would drift.
+
+    A :product label wins over any technical one beside it (a product call must never be
+    hidden from the Athos). A marker with NO gate:needs-human* label at all (bare
+    needs-human / story:needs-human) says nothing about whose it is → None, and the caller
+    keeps the legacy stamp: can't-know is not 'mayor'.
+    """
+    labels = _get_labels(bead)
+    gate = [l for l in labels if l.startswith(park_labels.GATE_NEEDS_HUMAN_PREFIX)]
+    if not gate:
+        return None
+    pfx = park_labels.GATE_NEEDS_HUMAN_PREFIX + ":"
+    if any(l.startswith(pfx) and l[len(pfx):] in bead_state.ATHOS_GATE_HUMAN_SUFFIXES
+           for l in gate):
+        return "athos"
+    return "mayor"
+
+
 def _route_bead(rig_root, bead, route_to, signal, now, state):
     """Route bead out of story:approved into its true state.
 
     Removes story:approved, adds the true-state label (except for post-build),
     adds an audit comment. Writes ledger + notify.
+
+    needs-human: only a product decision lands on story:needs-human (the Athos's
+    queue); a technical/bare/routing/on-device gate park names the Mayor instead —
+    next-action:mayor + a "Pergunta:" comment — and the assignee is left alone
+    (ga-gm5rv5). The gate:needs-human* label stays on the bead: it is what the Pilot
+    and the pool probes veto on.
 
     Returns True if the route was logged/executed; False on cooldown or missing id.
     Never mutates anything when DRY_RUN=True.
@@ -1764,6 +1803,8 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         _log("DRY_RUN: would route %s → story:%s (signal: %s)" % (bead_id, route_to, signal))
         return True  # no state update, no mutations
 
+    new_label = None  # set below on every route except post-build (no label is added there)
+    pergunta_failed = False
     if route_to == "post-build":
         # Remove story:approved only; delivery daemon owns the post-build transition.
         comment = ("approved-state-reconciler: removing story:approved — "
@@ -1771,9 +1812,13 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         _do_label_remove(rig_root, bead_id, "story:approved")
         _do_comment_add(rig_root, bead_id, comment)
     else:
-        new_label = "story:" + route_to
+        mayor_owned = route_to == "needs-human" and _needs_human_owner(bead) == "mayor"
+        new_label = NEXT_ACTION_MAYOR_LABEL if mayor_owned else "story:" + route_to
         comment = ("approved-state-reconciler: routed story:approved → %s "
                    "— explicit signal: %s" % (new_label, signal))
+        if mayor_owned:
+            comment += (" (not a product decision → the Mayor's turn, not story:needs-human; "
+                        "gate:needs-human* stays, so dispatch stays vetoed)")
         # IMPORTANT 3 (add-before-remove): add new label FIRST; only if that succeeds,
         # remove story:approved. Prevents orphan-limbo (bead with no lifecycle label)
         # if bd fails mid-sequence. If add fails: log, skip remove, skip cooldown → retry.
@@ -1784,6 +1829,20 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
             return False  # not counted as routed; no cooldown set
         _do_label_remove(rig_root, bead_id, "story:approved")
         _do_comment_add(rig_root, bead_id, comment)
+        if mayor_owned:
+            # Its own comment: next-action-coordinator-alert.sh reads the question as the
+            # comment whose text STARTS with "Pergunta:".
+            pergunta_failed = not _do_comment_add(rig_root, bead_id, (
+                "Pergunta: %s parou no gate (%s) e não é decisão de produto. Como seguimos — "
+                "destravar (re-gatear / devolver a um worker) ou reescopar? Fica fora do "
+                "despacho enquanto gate:needs-human* estiver nele." % (bead_id, signal)))
+            if pergunta_failed:
+                # The route is already done (label added, story:approved gone, cooldown
+                # set below), so this cannot be retried — say so instead of leaving a
+                # next-action:mayor bead with no question and a notify that reads clean.
+                _log("  WARN: 'Pergunta:' comment on %s FAILED — routed to %s without the "
+                     "question; the coordinator alert will say it found none" % (
+                         bead_id, new_label))
 
     # Emit human-touch ledger entry.
     _arc_ledger("human-touch", {
@@ -1796,9 +1855,11 @@ def _route_bead(rig_root, bead, route_to, signal, now, state):
         "rig_root": rig_root,
     }, fail_open=True)
 
-    msg = ("reconciler: %s → story:%s (%s)" % (bead_id, route_to, signal)
+    msg = ("reconciler: %s → %s (%s)" % (bead_id, new_label, signal)
            if route_to != "post-build" else
            "reconciler: %s story:approved removed (gate:passed — post-build)" % bead_id)
+    if pergunta_failed:
+        msg += " — 'Pergunta:' comment FAILED, the Mayor was not asked: open the bead"
     if _do_notify is not None:
         _do_notify(msg, 2)
     else:
@@ -5491,13 +5552,18 @@ def _selftest():
         "wa-046", labels=["story:approved", "pilot:dispatched", "gate:needs-human"])]
     st_pp = _reset()
     run_cycle(NOW, st_pp)
+    # ga-gm5rv5: a bare gate:needs-human is not a product decision, so the destination is
+    # the Mayor's turn (next-action:mayor), not the Athos's story:needs-human. What this
+    # guard protects is unchanged: the bead IS routed and story:approved IS stripped.
     routed_pp = ("wa-046", "story:approved") in label_removes and \
-                ("wa-046", "story:needs-human") in label_adds
+                ("wa-046", "next-action:mayor") in label_adds and \
+                ("wa-046", "story:needs-human") not in label_adds
     if routed_pp:
-        _ok("(pp): stale-flowing + gate:needs-human → routed to story:needs-human "
-            "(story:approved finally stripped, matching the wa-srgv/wa-6cx36 fix)")
+        _ok("(pp): stale-flowing + gate:needs-human → routed to next-action:mayor "
+            "(story:approved finally stripped, matching the wa-srgv/wa-6cx36 fix; "
+            "not story:needs-human — ga-gm5rv5)")
     else:
-        _bad("(pp)", "expected routing to story:needs-human despite pilot:dispatched — "
+        _bad("(pp)", "expected routing to next-action:mayor despite pilot:dispatched — "
              "removes=%s adds=%s" % (label_removes, label_adds))
 
     # ── (qq) ga-zcb20: FLAG_REVIEW_LABEL bd write fails every cycle → local ──
