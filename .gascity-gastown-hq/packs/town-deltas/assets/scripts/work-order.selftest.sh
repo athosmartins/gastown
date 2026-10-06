@@ -451,7 +451,14 @@ T3="$TMP/lt3"; mk_tree "$T3"
 for f in packs/town-deltas/assets/foo.selftest.sh scripts/test_x.py scripts/x.selftest.py packs/town-deltas/assets/scripts/work-order.sh scripts/work_order.py; do
   echo "jq 'sort_by(.created_at)'" > "$T3/$f"
 done
+echo 'echo clean' > "$T3/packs/town-deltas/assets/clean.sh"     # the one file that IS in scope: the lint must have looked at something
 lint_run "$T3" "$TMP/empty.tsv"; eq "selftests, test_*.py and the library itself are out of scope" "$LINT_RC" "0"
+case "$LINT_OUT" in *"files=1 "*) ok "only clean.sh was scanned (files=1)" ;; *) bad "scope: $LINT_OUT" ;; esac
+
+T5="$TMP/lt5"; mk_tree "$T5"
+lint_run "$T5" "$TMP/empty.tsv"
+eq "a root with no file in scope cannot tell (a mistyped --root is not a clean tree): stdout empty" "$LINT_OUT" ""
+eq "a root with no file in scope: exit 2" "$LINT_RC" "2"
 
 T4="$TMP/lt4"; mk_tree "$T4"; echo 'git for-each-ref --sort=-committerdate' > "$T4/scripts/g.py"
 row reviewed scripts/g.py 'for-each-ref' - "git refs" > "$TMP/r3.tsv"
@@ -566,6 +573,9 @@ must_fail lint-reads-comments py '_COMMENT_RE = re.compile(r"^\s*#")' '_COMMENT_
 must_fail lint-skips-selftests py 'SCOPE_SKIP = re.compile(r"(\.selftest\.(sh|py)$|/test_[^/]*\.py$|/work-order\.sh$|/work_order\.py$)")' 'SCOPE_SKIP = re.compile(r"(NEVER)")'
 must_fail lint-drops-sort-flag-idiom py '("M2-sort-flag", r"--sort[ =]"),' ''
 must_fail lint-drops-window-idiom py '("M5-positive-limit", r"--limit(=|\s+)[1-9]"),' ''
+must_fail lint-empty-scope-is-clean py '    if not scope:
+' '    if False:
+'
 fi
 
 finish

@@ -17,7 +17,8 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
   lint   `lint [--root DIR] [--registry FILE]` — the registry lint. Every line in the scope that
          orders or windows beads by its own idiom must be matched by a row of
          work-order.registry.tsv, and every row must still match a line. exit 0 clean, 1 findings
-         (one `LINT FAIL:` line each), 2 cannot read the registry. See the registry header.
+         (one `LINT FAIL:` line each), 2 cannot tell (registry unreadable, or no file in scope under
+         the root — a lint that looked at nothing never says "clean"). See the registry header.
 
 As a module: `sort_beads(beads, age="created")` returns `(ordered_list, warnings)`, or
 `(None, [reason])` when it cannot tell — the caller then keeps its previous order and logs a WARN.
@@ -176,6 +177,9 @@ def lint(root, registry):
     rows = _parse_registry(registry, errors)
     local = [r for r in rows if r["kind"] != "ext"]
     scope = _scope_files(root)
+    if not scope:
+        # a lint that looked at nothing must not say "clean": a mistyped --root would pass for a clean tree
+        raise OSError("no file in the lint scope under %s" % root)
     code = {}
     for rel in set(scope) | set(r["file"] for r in local):
         path = os.path.join(root, rel)
