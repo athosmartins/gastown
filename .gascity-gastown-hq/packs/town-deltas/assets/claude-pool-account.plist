@@ -9,11 +9,16 @@
        limit screen - the modal on a session's first hit ("What do you want to do?" / "Stop and wait for limit to reset"),
        the inline "You've hit your ... limit" envelope on every later one - is the active account asked ONCE (a rejected
        429 is free) and, if it is rejected, the pool's Keychain item is moved to the next account of the order. There is NO utilization threshold: the pool moves when the limit was hit, not before (Athos 04/10).
+       The one other thing asked, on every run that did not ask that, is free and says nothing about balance: whether the
+       active account's KEY is still accepted (count_tokens, never billed, never serves a generation). A revoked or expired
+       key never shows on a pane (a session prints a 401 "API Error" line, not a limit screen), so this check needs no pane:
+       a refused key fails over in the same run, even with tmux down.
        At the stored reset time of a previously exhausted account the pool moves back, with no probe of it. Sessions that
        were on the modal of the replaced credential are sent ONE Escape (the modal only, pool panes only, 45 s after the item changed;
        see "The Escape exception" in docs/claude-pool-account.md). Live pool sessions follow the item within ~40 s.
 
-       A run that cannot tell (network, 5xx) or cannot look (tmux down) changes nothing. Mayor and crews are not
+       A run that cannot tell (network, 5xx) or cannot look (tmux down) concludes nothing about the limit and moves nothing for
+       it (a key the free check finds REFUSED still fails over: it does not need the panes). Mayor and crews are not
        touched and never pressed: they run the plain `claude` / `claude-rc` providers, which never see the pool item.
        The daemon talks to the city's tmux server (`tmux -L gascity`): `tmux` is in /opt/homebrew/bin, on the PATH below.
 

@@ -6,7 +6,9 @@ account it left once that account has renewed **and a usage collection taken aft
 — so up to about one collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a
 fresh collection"). No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault
 as `claude-oauth-token-<email>`), and **no credit spent doing it**: the whole switch is this script, with no `claude`, no
-LLM and no agent in the path. Mayor and crews are **not** touched (phase 2), and never will be by this daemon: see
+LLM and no agent in the path. Mayor and crews are **not** touched by it as it stands (their panes are never looked at or
+pressed, and they are not enrolled in the wrapper's pool path); putting them on the pool is phase 2, a decision that is
+still pending and would have to be made on purpose, because once they follow the item a switch moves them too: see
 "Mayor and the crews".
 
 > **There is deliberately no threshold.** Athos 04/10: *"tem que trocar no 100%. A gente não quer ficar com 5% sem usar."*
@@ -25,7 +27,8 @@ LLM and no agent in the path. Mayor and crews are **not** touched (phase 2), and
         - the ENVELOPE ("⎿ You've hit your weekly limit · resets ..." as the LAST turn on the screen, the prompt box under it)
           - every later hit of that session, after the modal was dismissed; it blocks nothing.
         in a pane the wrapper proved to be a pool session - see "What counts as evidence"
-   2. no pool pane on the limit screen -> NOTHING is asked of the API: no switch, no key. (failback below aside)
+   2. no pool pane on the limit screen -> no EVIDENCE probe (the only call that can cost), so no switch for the limit, no key.
+                                          (failback below aside)
       a pool pane on the limit screen -> ask the ACTIVE account ONCE (1-token haiku call, anthropic-ratelimit-unified-* headers)
           rejected / 429  -> failover in the SAME run: next account of ordem_das_contas() that is not known-exhausted and whose
                              KEY is accepted (count_tokens, never billed); store the reset time of the one that was hit
@@ -33,7 +36,16 @@ LLM and no agent in the path. Mayor and crews are **not** touched (phase 2), and
                              stay; the same MODAL is not asked about again for 10 min (CLAUDE_POOL_EVIDENCE_COOLDOWN_S);
                              an ENVELOPE that was answered is never asked about again (a NEW hit is a new envelope)
           cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
-      could not look (tmux down, ps unreadable, the wrapper's log unreadable) -> nothing concluded: no probe, no failback, no key
+      could not look (tmux down, ps unreadable, the wrapper's log unreadable) -> nothing concluded about the limit screens:
+                                          no evidence probe, no failback, no key
+   2b. EVERY run that did not make the evidence probe also asks the ACTIVE account, for FREE (count_tokens: never billed, it
+      never serves a generation), whether its KEY is still accepted - with or without panes, tmux readable or not:
+          refused (401/403) -> failover in the SAME run, to the first account whose key is accepted. This needs no pane:
+                               a revoked or expired setup-token shows inside a session as a 401 "API Error" line, which is
+                               NOT a limit screen, so nothing on screen would ever say it - and the whole pool would stop
+          accepted          -> nothing (a healthy answer is logged about every 30 min, see "Proof that the switch costs no credit")
+          cannot tell       -> nothing moves, and the log says so while it lasts (`KEY-CHECK ... unknown`, every 5th minute)
+      (it says nothing about BALANCE: a key can be accepted by an account that has hit its limit - that stays with the evidence)
    3. failback ONLY when no evidence stands unanswered: to an account we saw exhausted, whose stored reset time has passed,
       whose usage reading in the usage store was taken AFTER that reset, and which that reading ranks ahead of the active
       one - at the stored reset time, with NO probe of it (not to one whose KEY was refused, 401/403: see Known limits).
@@ -77,9 +89,10 @@ time; if it has not really renewed, its 429 sends the pool to the next account a
 
 ## What counts as evidence that the limit was hit
 
-The API is asked about an account **only when a pool session already shows the limit**, so that the switch costs nothing:
-a call that is *rejected* (429) is free, a call that is *served* costs tokens (and may open an idle 5 h window), and
-`count_tokens` (the candidate's key check) is never billed. Measured on claude 2.1.291 with a really exhausted account,
+The one call that can cost - a `messages` call - is made about an account **only when a pool session already shows the
+limit**, so that the switch costs nothing: a call that is *rejected* (429) is free, a call that is *served* costs tokens
+(and may open an idle 5 h window), and `count_tokens` (the key checks: a candidate's before the item moves, the active
+account's on every run) is never billed. Measured on claude 2.1.291 with a really exhausted account,
 the limit shows in a pane in **two forms**, and which one depends on how many times that session has hit it:
 
 1. **The modal - a session's FIRST hit only.** In place of the prompt box, and until a key is pressed (identical 20 s later):
@@ -129,9 +142,11 @@ A pane is **evidence** only if all of these hold (each is a reason *not* to act,
   (for the modal, that is what the Escape is for). A hit that was already on the screen before the rewrite stays stale for as
   long as it is the last turn. A session launched after the rewrite never had the old credential, so its screen is evidence.
 
-Three states, as everywhere in this daemon: **evidence** (ask the API once), **no evidence** (ask nothing; a failback is
-allowed), **could not look** (`tmux` down or not runnable, `ps` unreadable, the wrapper's log unreadable): nothing is
-concluded - no probe, no failback, no key, and what was remembered about the panes is left as it was. The same holds for one pane
+Three states, as everywhere in this daemon: **evidence** (make the evidence probe once), **no evidence** (make none; a
+failback is allowed), **could not look** (`tmux` down or not runnable, `ps` unreadable, the wrapper's log unreadable): nothing
+is concluded about the limit screens - no evidence probe, no failback, no key, and what was remembered about the panes is left
+as it was. The free key check of the active account (step 2b) is outside these three states: it looks at the key, not at the
+panes, so it runs in all of them. The same holds for one pane
 inside a scan that otherwise worked: a pool pane whose screen cannot be read this run (`capture-pane` failed) is logged
 (`n pool pane(s) could not be read this run`) and is neither evidence nor "gone" - its first-seen time, tries and answered
 question are kept, so a stale modal does not come back looking fresh.
@@ -159,15 +174,30 @@ that shows only the envelope gets no key, whatever else is true of it. Every con
 
 ## Proof that the switch costs no credit
 
-Every API call the daemon makes leaves one log line, so "it spent nothing" can be read off the log:
+Every call that could be billed leaves a log line **before** it is made, so "it spent nothing" can be read off the log:
 
 - `API-CALL messages (1-token haiku) with the key fp=...` - the evidence probe. Against an exhausted account it is a **429,
   which is free**. This is the *only* call that could ever be served (and so billed): when a screen is about another model's
   limit and the account answers it costs a few tokens, **bounded** to once per cooldown per screen (600 s; a *new* screen is
   asked about at once), and never on a pane that is not proven to be a pool pane.
-- `API-CALL count_tokens (not billed) with the key fp=...` - the candidate's key check.
+- `API-CALL count_tokens (not billed) with the key fp=...` - a candidate's key check, one line per call.
+- `KEY-CHECK <account> fp=... (count_tokens, not billed): valid|invalid|unknown (http=...)` - the key check of the ACTIVE
+  account (step 2b). It is made on every run that did not make the evidence probe, and `count_tokens` never serves a
+  generation, so it costs nothing. It is **not** one line per call: the shared log is also where the wrapper's `POOL-ACCT SET`
+  lines are read from (its last 1 MiB), and a line a minute would push them out within days - also when the check keeps
+  failing. So `invalid` is logged every time (it is acted on: it is the reason line for the switch), an `unknown` ("could not
+  tell") only on the clock minutes that are a multiple of 5 (`KEY_CHECK_UNKNOWN_LOG_EVERY_MIN`), and a `valid` one only on
+  those that are a multiple of 30 (`KEY_CHECK_LOG_EVERY_MIN`) - a heartbeat. "About every N minutes", not promises: a run that
+  does not land in that minute logs nothing, so one isolated `unknown` may go unlogged while one that lasts is logged within
+  minutes. Silence of a few minutes between `KEY-CHECK` lines therefore says nothing; silence much longer than half an hour
+  means the check is not running.
+  What the zero-credit proof needs is unaffected: it is the absence of `API-CALL messages` lines and of served calls.
 - `EVIDENCE: n pool pane(s) on the limit modal|message (...)` (`message` = the envelope), `SWITCH a -> b ...`,
   `UNSTICK: Escape sent to pane ...`.
+- `pane scan: N live pool process(es) in no tmux pane ..., M ps row(s) not understood ...` and `N pool pane(s) on a limit screen
+  judged STALE ...` - what a run left out without acting; only on the clock minutes that are a multiple of 10 and only when
+  there is something to say (see Known limits). They are not proof of anything on their own, and the zero-credit proof does not
+  read them.
 
 No `claude` is started by the daemon (a static check in the selftest keeps `claude` out of every subprocess call, and a
 `claude` stub on its PATH proves none is ever run); no token appears in argv, env, log, state or output (the selftest
@@ -180,7 +210,10 @@ again, **zero calls served by the API**, `claude` never run.
 The daemon only ever touches the pool's hashed item (`Claude Code-credentials-<hash of the pool dir>`), never the plain
 `Claude Code-credentials` of Mayor and the crews, and never presses a key in a pane whose agent name contains `mayor` or `crew`.
 Those sessions are not enrolled in the wrapper's pool path (only `gastown.dog`, `wa-worker`, `ps-worker` are), so a failover
-cannot reach them either. Putting Mayor and the crews on the pool is phase 2 (decision pending).
+cannot reach them either. Putting Mayor and the crews on the pool is phase 2 (decision pending). That decision is not
+something the name check can make for it: the name check keeps them out of the *evidence* and out of the *Escape*, not out of
+the item - once phase 2 enrols them in the wrapper's pool path they follow the item, and every switch moves them too (and a
+setup-token, which is all the pool's item holds, cannot serve their Remote Control).
 
 ## Activation — merged is not live
 
@@ -222,7 +255,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
-| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `EVIDENCE`, `API-CALL ...`, `SWITCH a -> b`, `UNSTICK`) |
+| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `EVIDENCE`, `API-CALL ...`, `KEY-CHECK ...`, `SWITCH a -> b`, `UNSTICK`, `pane scan`, `judged STALE`) |
 
 ## Known limits
 
@@ -235,12 +268,41 @@ first, delete last, and only when restarting the pool is acceptable.
 - **Evidence comes from the panes, so what the panes cannot show is not seen.** (1) A headless `claude -p` call that hits the
   limit prints an error envelope and exits - there is no pane to show it in, so it is *not* evidence on its own; it is
   carried along by the next switch that a pane triggers (any interactive pool session on the same account will show the
-  modal or the envelope), and a usage-store signal at >= 100% is a possible follow-up, not built here. (2) If `tmux` itself is permanently broken, no failover and
+  modal or the envelope), and a usage-store signal at >= 100% is a possible follow-up, not built here. (2) If `tmux` itself is permanently broken, no limit-driven failover and
   no failback can happen (they are evidence-driven by design; the log says `the pool's panes could not be looked at this
-  run` every minute until it is fixed). (3) The modal and envelope texts are claude's (measured on 2.1.291): if a release
+  run` every minute until it is fixed). A key that is *refused* still fails over then: that is the free key check (step 2b),
+  which needs no pane. (3) The modal and envelope texts are claude's (measured on 2.1.291): if a release
   rewords them the daemon sees no evidence and does not move - the live harness is the check to re-run after upgrading
   claude, like the item name. (4) A screen that looks like the limit but belongs to something else costs one bounded served call per cooldown
   (see the proof above), never more.
+- **What the free key check proves, and what it does not.** `count_tokens` answering 2xx means the key is *accepted*; it says
+  nothing about balance (that stays with the evidence) and nothing about whether a session using it works. That it answers
+  401/403 for a *revoked or expired* setup-token - the case step 2b exists for - is the endpoint's documented behaviour and
+  was **not measured here against a really revoked token** (none was to hand): the selftest proves what the daemon does when
+  it gets a 401/403 (B17b-B17g, against a mock), not what the endpoint answers for a token that was revoked. A 429 or a 5xx
+  from it is "cannot tell": logged, never acted on. If it is rate-limited it simply stops finding things - and says `unknown`.
+  Also not measured: what a session that is already printing 401 errors does once the item changes. No key is sent to it (a 401
+  is not the limit modal, so the Escape does not apply); it is expected to pick the new credential up on its next re-read of
+  the item (~30 s, measured at turn boundaries), but that was not observed for this failure.
+- **Two things the pane scan leaves out without acting, said in the log only now and then.** On the clock minutes that are a
+  multiple of 10 (`SILENT_DROP_LOG_EVERY_MIN`; not every run - this log is shared, see below) the daemon says what it
+  dropped, so that "no evidence" can be told from "there was something and it could not be used". (1) `pane scan: N live pool
+  process(es) in no tmux pane (nothing to look at), M ps row(s) not understood (...); K pane(s) looked at`: a pool process
+  that is alive but sits in no pane of this tmux server (a headless `claude -p`, or a wrong `CLAUDE_POOL_TMUX_SOCKET`) has no
+  screen to look at and reads as "not on the limit screen"; a `ps` row that did not parse is a pid missing from the table, which
+  reads as "not running". The line is a **count, not a diagnosis**: it cannot tell a process that is legitimately in no pane (a
+  headless run) from a wrong socket. Read it as a trend: a `N` that is above 0 while the pool's sessions are known to be in
+  tmux means the socket is wrong or the panes are not found, and the daemon is then blind to every limit screen - which is
+  exactly the case that used to be silent. (2) `N pool pane(s) on a limit screen judged STALE - the pool item was rewritten at
+  ...`: a limit screen that the credential just replaced produced (it was first seen less than 90 s after the rewrite,
+  `STALE_WINDOW_S`, on a session that was started before it) is not evidence, and used to be mentioned in the log only on the
+  Escape path - which is the modal's. A genuine hit on the *new* credential 30-90 s after a rewrite is still ignored for as
+  long as it stays the last turn, and a failover through a chain of exhausted accounts can lose about that much per hop; what
+  changed is that the log now says a screen was judged and why.
+- **The wrapper's `POOL-ACCT SET` lines are read from the last 1 MiB of the shared log**, and `log-reaper.sh` does not list
+  `claude-pool-account.log` today. That is why the daemon keeps this log quiet (the healthy `KEY-CHECK` heartbeat is once per
+  30 minutes, not per run). If the log is ever truncated in place (`copytruncate`) the reader sees nothing, which reads as "no
+  session follows the item" - no evidence, and a failback allowed. Rotate it by rename, or teach `pool_launches` first.
 - The verdict comes from a 1-token **haiku** call, while the pool runs mostly on Sonnet. If a window exists that limits
   Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens (the log says
   `answers - the limit modal|message on screen is not about this account`, which is how this case would show up). Whether
@@ -286,12 +348,14 @@ first, delete last, and only when restarting the pool is acceptable.
 - That library's `token_da_conta()` returns `None` both for "no key in the vault" and for "vault unreadable just
   now" (it logs the second). The daemon therefore never reads a `None` for the CURRENT account as "its key is gone":
   it reads the Keychain item it wrote, and if the item holds a credential whose sha256[:8] equals the `fingerprint` of
-  the decision it keeps the decision and probes that very credential (answers → stay; rejected or refused → the normal
+  the decision it keeps the decision and asks about that very credential - the evidence probe when a pane shows the limit,
+  and otherwise the free key check of step 2b, on every run (accepted / answers → stay; rejected or refused → the normal
   failover; cannot tell → nothing). If the item itself cannot be read (locked keychain) nothing changes. Only when the
   item is missing, holds another credential, or the state has no fingerprint to compare is the pool chosen again from
   the order (log: `nothing corroborates`). Every run in which the current key did not come from the vault logs one
   WARN, `its key did not come from the vault this run`; a stretch of them means the vault is failing — or that the key
-  was deliberately removed, in which case the pool keeps using the copy in the item until that credential is refused.
+  was deliberately removed, in which case the pool keeps using the copy in the item until that credential is refused (which
+  the next run's key check finds, with no pane needed).
   While the vault is down no candidate's key can be read either, so a failover cannot complete: the rejection is
   recorded and the pool stays where it is (the item is not touched). A three-state return in the library would still be
   cleaner; the daemon no longer depends on it to be safe.

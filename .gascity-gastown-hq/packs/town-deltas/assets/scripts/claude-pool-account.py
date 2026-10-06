@@ -10,15 +10,20 @@ the WhatsApp services read (`current` in CLAUDE_POOL_STATE).
 
 THE POOL MOVES ONLY WHEN THE LIMIT IS REALLY HIT (Athos 04/10: "tem que trocar no 100%. A gente não quer ficar com 5% sem
 usar"). No utilization threshold, no agent, no `claude`, and no call that is paid for on the way: a REJECTED 429 costs
-nothing, a call that is served costs tokens (and may open an idle 5h window), so the API is asked only when something has
+nothing, a call that is served costs tokens (and may open an idle 5h window), so a messages call is made only when something has
 already said the limit was hit. What says so is the pool's own sessions: a pool pane showing claude's limit screen - the modal
 ("What do you want to do?" / "Stop and wait for limit to reset"), which claude opens on a session's FIRST hit, or the envelope
 "⎿ You've hit your weekly limit · resets ..." as the last turn on screen, which is all a session shows on every later hit
-(measured). That is EVIDENCE; with none, the API is not called at all.
+(measured). That is EVIDENCE; with none, no messages call is made. The one thing asked without evidence is free and says nothing
+about balance: whether the active account's KEY is still accepted (count_tokens, never billed - see check_active_key), because a
+refused key never shows on a pane (a session prints a 401 "API Error" line, not a limit screen).
 
 One run (launchd StartInterval, single instance via flock):
   * no usable decision yet            -> seed with the first account of the order whose key is valid (see below).
-  * no pool session shows the limit   -> nothing is asked of the API. The decision does not change (failback aside).
+  * no pool session shows the limit   -> no messages call. The decision does not change for the limit (failback aside) - but the
+                                         active key is checked for free on every run that did not probe it (see check_active_key):
+                                         REFUSED -> failover in the same run, panes or no panes; accepted -> nothing; could not tell
+                                         -> nothing moves, and while that lasts the log says so (every 5th clock minute, see KEY-CHECK).
   * a pool session shows the limit    -> the active account is asked ONCE for its reply (a call that is rejected is free; the
     (new evidence, see track_panes)      anthropic-ratelimit-unified-* headers carry the reset time we store). REJECTED (or its key
                                          refused) -> failover to the first account of the order that is not known-exhausted and
@@ -36,9 +41,9 @@ One run (launchd StartInterval, single instance via flock):
     ~30 s) the daemon sends that pane ONE Escape. This is a scoped exception to the send-keys doctrine: see docs/claude-pool-account.md
     ("The Escape exception") for its guards - pool panes only (proven by the wrapper's POOL-ACCT SET line for a live process),
     the modal re-read from the screen immediately before sending, never Mayor or a crew.
-  * the active account could not be asked (network, 5xx, anything not 2xx/429/401/403) -> no failover and no failback: the
-    DECISION does not change. Error != exhausted. (The run still goes on to heal_item, which may put the item back to the
-    decision already taken - the item following the decision, not the probe changing it.)
+  * the active account could not be asked (network, 5xx, anything not 2xx/429/401/403 for the evidence probe; anything not 2xx/401/403
+    for the key check) -> no failover and no failback: the DECISION does not change. Error != exhausted. (The run still goes on to
+    heal_item, which may put the item back to the decision already taken - the item following the decision, not the probe changing it.)
 
 The order of use comes from the usage store, which the collector rewrites every ~30 min while this daemon runs every
 minute: at the reset tick the order can be half an hour old, and a reading taken BEFORE the reset says nothing about the
@@ -50,10 +55,10 @@ account AFTER it ("not known" is not "does not outrank"). So an expired entry is
 Every removal of an entry from the registry has a log line with its reason; nothing leaves it silently.
 
 The switch path never starts `claude` (it may be the thing that is exhausted): the evidence probe is one tiny haiku HTTP
-call, and the answer is read from the anthropic-ratelimit-unified-* headers; a candidate's key is checked with the
-count_tokens endpoint, which validates the key and is never billed (it says nothing about limits, so a candidate that turns out
-to be exhausted too is found the way the first one was). Neither follows a redirect (the Bearer would travel with it): a
-30x is "could not tell".
+call, and the answer is read from the anthropic-ratelimit-unified-* headers; a candidate's key - and the ACTIVE account's, on every
+run that did not probe it - is checked with the count_tokens endpoint, which validates the key and is never billed (it says
+nothing about limits, so a candidate that turns out to be exhausted too is found the way the first one was). Neither follows a
+redirect (the Bearer would travel with it): a 30x is "could not tell".
 
 Tokens: read from the vault by lib/claude_account_pool.token_da_conta, held in memory, sent only as the Bearer of
 the probe and as the hex of a `security -i` command on STDIN. They are never in argv, env, log, state or output;
@@ -115,6 +120,14 @@ STALE_WINDOW_S = 90               # a limit modal first SEEN this soon after a r
 MAX_ESC_TRIES = 3                 # per pane: an Escape that does not take is not repeated for ever
 MAX_ESC_PER_RUN = 20              # and never an unbounded burst of keys
 EVIDENCE_COOLDOWN_S = 600         # evidence whose probe found the account ANSWERING does not buy another probe of it for this long
+KEY_CHECK_LOG_EVERY_MIN = 30      # the every-run key check of the active credential logs a HEALTHY answer only on clock minutes that are a
+                                  # multiple of this: the wrapper's POOL-ACCT SET lines share this log and are read from its last
+                                  # LAUNCH_TAIL_BYTES, so a line a minute would push them out in days
+KEY_CHECK_UNKNOWN_LOG_EVERY_MIN = 5   # ... and a 'could not tell' on clock minutes that are a multiple of this: visible within minutes, but
+                                      # a check that keeps failing (endpoint changed, no egress) must not become that line a minute. A
+                                      # REFUSED key is logged every time: it is acted on, and that is the reason line for the switch
+SILENT_DROP_LOG_EVERY_MIN = 10    # the two things a run drops without acting (limit screens judged stale; panes/ps rows it could not use) say so
+                                  # on clock minutes that are a multiple of this: a signal where there was silence, not a line a minute
 LAUNCH_TAIL_BYTES = 1 << 20       # how much of the end of the wrapper's log is read to find pool launches
 START_SLACK_S = 2                 # a process started at most this much AFTER its POOL-ACCT SET line is not the process that wrote it
 START_MAX_AGE_S = 120             # ... and one that started much BEFORE it cannot be the wrapper that exec'd into claude then
@@ -362,12 +375,14 @@ def count_tokens_url() -> str:
     return probe_url().rstrip("/") + "/count_tokens"
 
 
-def validate_key(token: str) -> Probe:
+def validate_key(token: str, audit: bool = True) -> Probe:
     """Is this KEY accepted? count_tokens answers 2xx for a valid key and 401/403 for a refused one, never serves a generation (it is
     not billed) and carries no limit headers - so it says nothing about whether the account has balance. That is the point: it is
-    what a CANDIDATE gets before the item is written, because a call that would tell (a served one) costs tokens on every candidate.
+    what a CANDIDATE gets before the item is written, because a call that would tell (a served one) costs tokens on every candidate -
+    and what the ACTIVE credential gets on every run (check_active_key, which does its own logging: audit=False).
     verdict: valid | invalid | unknown (anything else, a 429 included: there is no limit to read here)."""
-    log("INFO", f"API-CALL count_tokens (not billed) with the key fp={fingerprint(token)}")
+    if audit:
+        log("INFO", f"API-CALL count_tokens (not billed) with the key fp={fingerprint(token)}")
     st, _h, why = _send(count_tokens_url(), token, {"model": PROBE_MODEL, "messages": [{"role": "user", "content": "."}]})
     if st is None:
         return Probe("unknown", None, "", why)
@@ -376,6 +391,24 @@ def validate_key(token: str) -> Probe:
     if 200 <= st < 300:
         return Probe("valid", None, "", f"http={st}")
     return Probe("unknown", None, "", f"http={st}")
+
+
+def check_active_key(token: str, email: str, t: float) -> Probe:
+    """Is the key the pool item holds still ACCEPTED? Asked of the active account on every run that did not already probe it, because a
+    refused key (revoked or expired setup-token) is not something the panes show: inside a session it is a 401 "API Error" line, not a
+    limit screen, so there is never evidence for it - and a key nobody asks about is a pool that has stopped, silently. count_tokens is
+    free (see validate_key), so it needs no evidence to be asked. It says nothing about balance: that stays with the evidence.
+
+    verdict: valid | invalid | unknown. Only `invalid` is acted on (the caller fails over); `unknown` is 'could not tell' and changes
+    nothing. What is logged, with no state kept between runs: `invalid` every time; `unknown` on the clock minutes that are a multiple of
+    KEY_CHECK_UNKNOWN_LOG_EVERY_MIN; `valid` on those of KEY_CHECK_LOG_EVERY_MIN, as a heartbeat. Those are 'about every N minutes', not
+    promises - a run that does not land in that minute (launchd under load) logs nothing - so a single 'could not tell' may go unlogged,
+    while one that lasts is logged within minutes; and silence much longer than half an hour means the check is not running."""
+    pr = validate_key(token, audit=False)
+    every = KEY_CHECK_UNKNOWN_LOG_EVERY_MIN if pr.verdict == "unknown" else KEY_CHECK_LOG_EVERY_MIN
+    if pr.verdict == "invalid" or int(t // 60) % every == 0:
+        log("INFO", f"KEY-CHECK {email} fp={fingerprint(token)} (count_tokens, not billed): {pr.verdict} ({pr.detail})")
+    return pr
 
 
 # ── the Keychain item ──────────────────────────────────────────────────────────────────────────────
@@ -535,8 +568,9 @@ def tmux(args: List[str]) -> Tuple[Optional[int], str]:
     return r.returncode, r.stdout
 
 
-def process_table() -> Optional[Dict[int, Tuple[int, float]]]:
-    """pid -> (ppid, start time as epoch). One `ps` for the whole table; None when it could not be read."""
+def process_table() -> Optional[Tuple[Dict[int, Tuple[int, float]], int]]:
+    """(pid -> (ppid, start time as epoch), number of ps rows that could not be understood). One `ps` for the whole table; None when
+    it could not be read. A row that is dropped is counted, not hidden: a pid missing from the table reads as 'not running'."""
     try:
         r = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,lstart="], env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"},
                            capture_output=True, text=True, errors="replace", timeout=15, check=False)
@@ -545,15 +579,19 @@ def process_table() -> Optional[Dict[int, Tuple[int, float]]]:
     if r.returncode != 0:
         return None
     table: Dict[int, Tuple[int, float]] = {}
+    dropped = 0
     for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
         m = PS_RE.match(line)
         if not m:
+            dropped += 1
             continue
         try:
             table[int(m.group(1))] = (int(m.group(2)), time.mktime(time.strptime(" ".join(m.group(3).split()), "%a %b %d %H:%M:%S %Y")))
         except (ValueError, OverflowError):
-            continue
-    return table
+            dropped += 1
+    return table, dropped
 
 
 def pool_launches() -> Optional[Dict[int, Tuple[float, str]]]:
@@ -592,6 +630,14 @@ def pool_launches() -> Optional[Dict[int, Tuple[float, str]]]:
     return out
 
 
+def note_scan_drops(nopane: int, ps_dropped: int, looked: int) -> None:
+    """What a scan leaves out without concluding anything, said now and then (SILENT_DROP_LOG_EVERY_MIN) so that 'no evidence' can be
+    told from 'could not use what there was': live pool processes that sit in no tmux pane, and `ps` rows that could not be parsed."""
+    if (nopane or ps_dropped) and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        log("INFO", f"pane scan: {nopane} live pool process(es) in no tmux pane (nothing to look at), {ps_dropped} ps row(s) not understood "
+                    f"(a pid missing from that table reads as not running); {looked} pane(s) looked at")
+
+
 def scan_panes() -> Scan:
     """Which pool panes are on the limit screen right now (the modal, or the envelope as the last turn). A pane counts only if a process that the wrapper launched onto the pool item
     is alive in it (the pane's own process or a descendant): the pid in the SET line is the claude pid (the wrapper exec's), and a
@@ -602,10 +648,11 @@ def scan_panes() -> Scan:
         return Scan(False)
     if not launches:
         return Scan(True)   # nothing follows the item: no pane to look at, so tmux is not even asked
-    table = process_table()
-    if table is None:
+    ptab = process_table()
+    if ptab is None:
         log("WARN", "ps unreadable - no pane looked at this run")
         return Scan(False)
+    table, ps_dropped = ptab
     proven: Dict[int, Tuple[str, float]] = {}
     for pid, (at, agent) in launches.items():
         row = table.get(pid)
@@ -614,6 +661,7 @@ def scan_panes() -> Scan:
         if row is not None and row[1] <= at + START_SLACK_S and at - row[1] <= START_MAX_AGE_S:
             proven[pid] = (agent, at)
     if not proven:
+        note_scan_drops(0, ps_dropped, 0)   # a launched pool pid whose ps row was not understood is missing from `table`: it reads as 'not running'
         return Scan(True)
     rc, out = tmux(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid} #{pane_dead}"])
     if rc is None:
@@ -628,11 +676,13 @@ def scan_panes() -> Scan:
             pane_of[int(f[1])] = (f[0], int(f[1]))
     panes: List[PanePeek] = []
     unlooked: List[str] = []
+    nopane = 0   # proven pool processes found in no live tmux pane: they follow the item but there is no screen to look at
     for pid, (agent, launched) in sorted(proven.items()):
         cur, hops = pid, 0
         while cur in table and hops < 8 and cur not in pane_of:   # the pane's process is the claude itself, or an ancestor of it
             cur, hops = table[cur][0], hops + 1
         if cur not in pane_of:
+            nopane += 1
             continue
         pane_id, pane_pid = pane_of[cur]
         rc, text = tmux(["capture-pane", "-p", "-J", "-t", pane_id])
@@ -643,6 +693,7 @@ def scan_panes() -> Scan:
         panes.append(PanePeek(pane_id, pane_pid, pid, agent, stuck, launched, limit_hit(text, stuck)))
     if unlooked:
         log("WARN", f"{len(unlooked)} pool pane(s) could not be read this run - nothing concluded about them, what is known about them is kept")
+    note_scan_drops(nopane, ps_dropped, len(panes))
     return Scan(True, panes, unlooked)
 
 
@@ -732,6 +783,12 @@ def stale_modal(st: dict, p: PanePeek, entry: dict) -> bool:
 def fresh_evidence(st: dict, scan: Scan) -> List[PanePeek]:
     tracked = st.get("panes", {})
     return [p for p in scan.panes if p.hit is not None and p.key in tracked and not stale_modal(st, p, tracked[p.key])]
+
+
+def stale_screens(st: dict, scan: Scan) -> List[PanePeek]:
+    """The other half of the tracked limit screens: the ones judged about a credential that has since been replaced (not evidence)."""
+    tracked = st.get("panes", {})
+    return [p for p in scan.panes if p.hit is not None and p.key in tracked and stale_modal(st, p, tracked[p.key])]
 
 
 # ── state ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1091,6 +1148,17 @@ def ask_due(entry: dict, t: float) -> bool:
     return bool(entry.get("modal")) and not 0 <= t - asked < evidence_cooldown_s()
 
 
+def fail_over(st: dict, keys: Keys, order: List[str], user: str, cur: str, pr: Probe, t: float) -> bool:
+    """The active account cannot be used (pr.verdict: rejected - it hit the limit; invalid - its key is refused): register it with the
+    reset time / cooldown pr carries, and move the item to the first account that can take over. True if the item moved."""
+    register_exhausted(st, cur, pr, t)
+    got = pick_next(st, order, keys, {cur}, t)
+    if got:
+        return switch_to(st, user, got[0], got[1], f"failover: {cur} {pr.verdict}", t)
+    log("WARN", f"no other account could take over (exhausted, no key from the vault this run, or not answering) - staying on {cur}")
+    return False
+
+
 def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Optional[float], str]], user: str, t: float,
            scan: Scan) -> None:
     sanitize_state(st, t)
@@ -1104,12 +1172,20 @@ def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Opt
     if kind == "gone":
         return reseed(st, keys, order, user, t, cur)
 
-    # Three states, as everywhere: evidence | no evidence | could not look. The API is asked ONLY on the first, and the failback (a move
-    # to an account that renewed) only on the second - or once the evidence has been answered, below.
+    # Three states, as everywhere: evidence | no evidence | could not look. The one call that can COST (the evidence probe, a served
+    # messages call) is made ONLY on the first, and the failback (a move to an account that renewed) only on the second - or once the
+    # evidence has been answered, below. The free key check of the active credential (check_active_key) needs no evidence: it is made
+    # on every run the evidence probe did not already classify that credential, whatever the panes showed or could not show.
     evidence = fresh_evidence(st, scan)
+    stale = stale_screens(st, scan)
+    if stale and int(t // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:   # said now and then: a screen judged stale is otherwise no evidence and no line
+        log("INFO", f"{len(stale)} pool pane(s) on a limit screen judged STALE - the pool item was rewritten at {_iso(_sane_epoch(st.get('item_at')) or t)}, "
+                    f"after those sessions started, and the screen was first seen within {STALE_WINDOW_S} s of it: about the credential replaced, not evidence against {cur}")
     may_failback = scan.ok and not evidence
+    probed = False   # was the active credential classified this run by the evidence probe (which sees a refused key too)
     if not scan.ok:
-        log("INFO", "the pool's panes could not be looked at this run - nothing concluded, nothing asked of the API")
+        log("INFO", "the pool's panes could not be looked at this run - nothing concluded about the limit screens, and the evidence probe is not "
+                    "made (the free key check of the active credential below does not need the panes)")
     if evidence:
         tracked = st["panes"]
         due = [p for p in evidence if ask_due(tracked[p.key], t)]
@@ -1120,15 +1196,11 @@ def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Opt
             word = "modal" if any(p.stuck for p in evidence) else "message"
             log("INFO", f"EVIDENCE: {len(evidence)} pool pane(s) on the limit {word} ({who}) - asking {cur} once for its reply")
             pr = probe(tok)
+            probed = True
             if pr.verdict == "unknown":
                 log("INFO", f"{cur}: probe could not tell ({pr.detail}) - nothing changed")
             elif pr.verdict in ("rejected", "invalid"):
-                register_exhausted(st, cur, pr, t)
-                got = pick_next(st, order, keys, {cur}, t)
-                if got:
-                    switch_to(st, user, got[0], got[1], f"failover: {cur} {pr.verdict}", t)
-                else:
-                    log("WARN", f"no other account could take over (exhausted, no key from the vault this run, or not answering) - staying on {cur}")
+                fail_over(st, keys, order, user, cur, pr, t)
             else:
                 # It ANSWERS: the screen was not about this account (another model's limit, a modal about to be dismissed, text that looks
                 # like one). What it just answered beats anything stored about it; nothing moves; and those screens are not asked about
@@ -1140,6 +1212,11 @@ def decide(st: dict, keys: Keys, order: List[str], readings: Dict[str, Tuple[Opt
                 if st.get("exhausted", {}).pop(cur, None) is not None:
                     log("INFO", f"exhausted entry for {cur} dropped: it answered the probe, which beats what was stored about it")
                 may_failback = True
+    if not probed:
+        ck = check_active_key(tok, cur, t)
+        if ck.verdict == "invalid":
+            may_failback = False   # the move this run is the failover; a failback judged against the account just left would be a second, unrelated move
+            fail_over(st, keys, order, user, cur, ck, t)
     if may_failback:
         failback(st, keys, order, readings, user, cur, t)
     now_cur = st.get("current")
