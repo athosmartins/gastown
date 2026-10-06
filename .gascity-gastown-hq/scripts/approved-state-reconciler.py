@@ -335,40 +335,54 @@ _CAP_EVIDENCE_FUTURE_SKEW_SEC = 300
 # ga-5d5se lesson): _PILOT_SWEEP_WALK_RE matches every normal complete line (893/893),
 # _PILOT_LOOP_CUT_RE both real cut-short lines (2/2).
 #
-# ga-i2uwym (2026-10-06): two MORE ways a dispatched=0 sweep with both lanes free leaves
-# candidates un-attempted — and neither logs a "stopping ... loop" line, so both were read as
-# full walks. 28 "buildable bead starving — dispatch failing" mails went out that morning (the
+# ga-i2uwym (2026-10-06): ONE more way a dispatched=0 sweep with both lanes free leaves
+# candidates un-attempted — and it logs no "stopping ... loop" line, so it was read as a full
+# walk. 28 "buildable bead starving — dispatch failing" mails went out that morning (the
 # Mayor's count, ga-i2uwym), their bodies saying the Pilot's newest sweep "walked every
 # candidate and did NOT queue it" at a pool cap — for beads the Pilot had cap-queued earlier
 # and the newest sweeps never reached:
 #   * the dispatch phase HALTED (ga-5je3zv): PILOT_DISPATCH_MAX_SECS spent ("time-budget") or the
 #     live session count unreadable ("session-count-unreadable"). dispatch_lane() then starts no
-#     further candidate, in either lane. Logged as a WARN when it is decided ("dispatch phase
-#     HALTED for the rest of this sweep (<reason>)") and again, just before the complete line,
-#     as "dispatch phase was HALTED this sweep (<reason>)". Real: 2026-10-06 07:11:42, 974s>900s.
-#   * a slow spawn (ga-6hr8p7): one slow spawn per sweep, after which every pool-routed candidate
-#     is parked for the next sweep without a claim — "pool-routed candidates DEFERRED this
-#     sweep" (logged ONCE, every later candidate is silent), or past the claim "spawn of <pool>
-#     for <bead> DEFERRED". Real: 2026-10-06 07:35:49. The Pilot only defers a candidate whose
-#     pool is NOT at its cap, but it neither claims nor tries it: "walked it and did not queue it
-#     at a cap" would send the reader hunting a dispatch bug when the Pilot parked the bead on
-#     purpose. (A pool TOP-UP deferral, "pool top-up spawn for <pool> (N) DEFERRED", defers a
-#     spawn and no candidate — deliberately not matched.)
-# Either marker makes its sweep NON-EXHAUSTIVE through the same path as a cut-short lane loop —
-# the older evidence stays (the per-line TTL bounds it) and `why` names what happened. Both
-# regexes were checked against the WHOLE real log on 2026-10-06, not just the fixtures: the halt
-# regex matches 2 lines (the 1 WARN + 1 closing line grep finds; no other "HALTED" line exists),
-# the deferral regex 81 (= the 31 + 50 grep finds) and none of the 29 top-up deferrals; of the
-# 2036 complete lines 1058 were full walks and 23 (2.2%) are no longer — the measured-negative
-# path survives for the rest.
+#     further candidate, in either lane. Logged as a WARN when it is decided ("ga-5je3zv:
+#     dispatch phase HALTED for the rest of this sweep (<reason>)") and again, just before the
+#     complete line, as "ga-5je3zv: dispatch phase was HALTED this sweep (<reason>)". Real:
+#     2026-10-06 07:11:42 (time-budget, 974s>900s) and 09:34:24 (session-count-unreadable).
+# That marker makes its sweep NON-EXHAUSTIVE through the same path as a cut-short lane loop —
+# the older evidence stays (the per-line TTL bounds it) and `why` names the halt.
+#
+# A slow-spawn DEFERRAL (ga-6hr8p7) is deliberately NOT a marker (GATE-FIX 1, attempt 1 FAIL —
+# the first version of this block matched it). It looks the same in the complete line
+# (dispatched=0, both lanes free, candidates parked for the next sweep) but dispatch_lane()
+# runs `_pilot_pool_cap_full_for` BEFORE `_pilot_slow_spawn_deferred_for` (cap full → the
+# QUEUED line + continue), and dispatch_one()'s own "spawn of <pool> for <bead> DEFERRED" sits
+# in the ELSE of `live >= MAX`: a candidate only reaches a deferral AFTER its pool was read as
+# having room. So in a deferral sweep a bead with no cap line IS positively "not held at the
+# cap", and treating it as unmeasured did two harms: the alarm body claimed the cap was
+# "neither confirmed nor ruled out" (it WAS ruled out), and the older "queued at the cap" line
+# outranked the fresher measured negative (_process_store gives retained evidence priority),
+# so a bead whose pool had room read as a capacity wait for up to PILOT_CAP_EVIDENCE_TTL_SEC.
+# The Pilot's own comment says the same: a deferral "is not a full pool" and "the Step 5 stall
+# streak must keep seeing it". (Only PILOT_POOL_CAP_PRECLAIM_SKIP=0 — a debug switch, not the
+# live setting — turns the pre-claim cap probe off.) Likewise a pool TOP-UP deferral ("pool
+# top-up spawn for <pool> (N) DEFERRED") defers a spawn and no candidate.
+# Measured on the WHOLE real log, 2026-10-06 (351,187 lines — not just the fixtures, the
+# ga-5d5se lesson): 5 lines contain "HALTED"; _PILOT_DISPATCH_HALT_RE matches 4 of them — both
+# real halts, WARN + closing line each (07:11:42, 09:34:24) — and not the fifth, the ga-in9ebr
+# WARN at 09:34:24 ("... the dispatch phase is HALTED ..."). Of 2046 completed (non-paused)
+# sweeps 1064 are full walks and exactly 2 are non-walks because of a halt. The old
+# deferral marker would have downgraded 23 further sweeps (83 DEFERRED lines) that were full
+# walks; the 29 pool top-up DEFERRED lines match nothing here.
 _PILOT_SWEEP_WALK_RE = re.compile(
     r"Pilot sweep complete: dispatched=(?P<dispatched>\d+) "
     r"\(small_slots=(?P<small>\d+) big_slots=(?P<big>\d+)")
 _PILOT_LOOP_CUT_RE = re.compile(r"stopping (?:(?:small|big) )?loop")
+# Anchored on the Pilot's own log tag + the ga-5je3zv prefix, NOT on the bare words: the Pilot
+# also logs candidate TITLES ("[pilot-dispatcher]   [small] <id> P1 — <title>") and bead titles
+# quote "ga-5je3zv: dispatch phase HALTED" verbatim, and the ga-in9ebr WARN says "the dispatch
+# phase is HALTED" in another sentence — neither is a halt.
 _PILOT_DISPATCH_HALT_RE = re.compile(
-    r"dispatch phase (?:was )?HALTED\b(?:[^(]*\((?P<reason>[a-z0-9-]+)\))?")
-_PILOT_SLOW_SPAWN_DEFER_RE = re.compile(
-    r"ga-6hr8p7: (?:pool-routed candidates DEFERRED this sweep|spawn of \S+ for \S+ DEFERRED)")
+    r"\[pilot-dispatcher\] (?:WARN: )?ga-5je3zv: dispatch phase (?:was )?HALTED\b"
+    r"(?:[^(]*\((?P<reason>[a-z0-9-]+)\))?")
 # A sweep that STARTED and never logged its complete line (killed, crashed: measured
 # 2026-09-20, 100 of 1059 starts in the real log, one of them leaving cap lines behind)
 # walked an unknown part of its pool — the very case of this block. Without a start marker
@@ -1529,8 +1543,7 @@ def _sweep_walk_verdict(counters, cut, dated, cut_why=""):
 
     counters — the _PILOT_SWEEP_WALK_RE match on that line (None if it carries none);
     cut      — True iff this sweep left candidates un-attempted without dispatching: a lane
-               loop logged "stopping ... loop", the dispatch phase was HALTED, or pool-routed
-               candidates were DEFERRED (ga-i2uwym);
+               loop logged "stopping ... loop", or the dispatch phase was HALTED (ga-i2uwym);
     dated    — True iff the line has a parseable, not-future-dated timestamp;
     cut_why  — the clause naming WHICH of those happened ("" = the generic lane-loop wording).
     `why` is only meaningful when walked_all is False: it is a clause worded for the alarm
@@ -1568,13 +1581,6 @@ def _sweep_halt_clause(reason):
             "looked at" % (" (%s)" % reason if reason else ""))
 
 
-_SWEEP_DEFER_CLAUSE = (
-    "in the Pilot's newest completed sweep pool-routed candidates were DEFERRED (a spawn "
-    "earlier in that sweep was slow; one slow spawn per sweep) — the Pilot parked them for "
-    "the next sweep without claiming or trying them, so a missing cap line is not a "
-    "measurement of them")
-
-
 def _pilot_cap_evidence(now):
     """Return a _CapEvidence — {bead_id: {"pool", "live", "max", "epoch"}} for every bead
     the Pilot ITSELF reported QUEUED at a pool session cap within
@@ -1596,10 +1602,9 @@ def _pilot_cap_evidence(now):
                                 missing from the map is positively "not held at the cap".
       map, .walked_all=False  → the newest completed sweep did NOT provably walk every
                                 candidate (it dispatched, a lane had no slot, a lane loop
-                                was cut short, its dispatch phase was HALTED, pool-routed
-                                candidates were DEFERRED, ...): a bead missing from the map
-                                is UNMEASURED — `.why` says why. Its per-bead entries are
-                                still positive evidence.
+                                was cut short, its dispatch phase was HALTED, ...): a bead
+                                missing from the map is UNMEASURED — `.why` says why. Its
+                                per-bead entries are still positive evidence.
 
     How sweeps combine (GATE-FIX attempt 1: this used to treat every completed sweep as a
     full walk). The Pilot logs one cap line per still-capped candidate it WALKS. So:
@@ -1610,9 +1615,10 @@ def _pilot_cap_evidence(now):
       - a NON-exhaustive sweep only adds/refreshes: its silence about a bead is not a
         statement about that bead, so older evidence stays (bounded by the per-line TTL,
         which is what stops it explaining a bead forever). That includes a sweep whose
-        dispatch phase was HALTED (time budget / unreadable session count) or that DEFERRED
-        its pool-routed candidates after a slow spawn (ga-i2uwym: both used to read as full
-        walks — "walked every candidate and did NOT queue it" — and erased the evidence);
+        dispatch phase was HALTED (time budget / unreadable session count) — ga-i2uwym: it
+        used to read as a full walk ("walked every candidate and did NOT queue it") and
+        erase the evidence. A slow-spawn DEFERRAL is NOT in this list: it is a full walk
+        (see the comment block above _PILOT_SWEEP_WALK_RE);
       - a whole-sweep pause/deferral ("dispatched=0 (paused|deferred: ...)") evaluates
         nothing, so it neither refreshes nor supersedes; that gap is covered by the
         sweep-pause suppression upstream and bounded here by the TTL;
@@ -1638,9 +1644,9 @@ def _pilot_cap_evidence(now):
 
     kept = {}        # evidence carried by COMPLETED evaluating sweeps
     running = {}     # cap lines logged since the last completed sweep (one still running)
-    running_cut = False   # a lane loop logged "stopping ... loop", the dispatch phase was
-                          # HALTED, or candidates were DEFERRED since the last complete line
-    running_cut_why = ""  # the clause naming the FIRST of the latter two ("" = generic wording)
+    running_cut = False   # a lane loop logged "stopping ... loop", or the dispatch phase was
+                          # HALTED, since the last complete line
+    running_cut_why = ""  # the clause naming the halt ("" = the generic lane-loop wording)
     newest_eval = None    # epoch of the newest DATABLE proof the Pilot evaluated dispatch
     last_walk = None      # (epoch|None, walked_all, why) of the newest COMPLETED evaluating sweep
 
@@ -1686,10 +1692,6 @@ def _pilot_cap_evidence(now):
             # halted sweep (the WARN, then the closing line); the first one names it.
             running_cut = True
             running_cut_why = running_cut_why or _sweep_halt_clause(m_halt.group("reason"))
-            continue
-        if _PILOT_SLOW_SPAWN_DEFER_RE.search(line):
-            running_cut = True
-            running_cut_why = running_cut_why or _SWEEP_DEFER_CLAUSE
             continue
         m = _PILOT_CAP_PICK_RE.search(line) or _PILOT_CAP_DISPATCH_RE.search(line)
         if not m:
@@ -6868,7 +6870,12 @@ def _selftest():
     #                                 line reads dispatched=0 (small_slots=3 big_slots=1) and NO
     #                                 "stopping ... loop" line was logged
     #   DEFERRED sweep                07:35:49 / 07:43:36  one slow spawn → every later pool-routed
-    #                                 candidate deferred pre-claim (logged once, then silent)
+    #                                 candidate deferred pre-claim (logged once, then silent) —
+    #                                 NOT a cut sweep: each of those candidates was cap-probed
+    #                                 first (GATE-FIX 1, scenario ga-i2uwym-b)
+    #   UNREADABLE-count halt         09:34:24  the second real halt reason; also carries the
+    #                                 ga-in9ebr WARN whose "the dispatch phase is HALTED"
+    #                                 wording must NOT be taken for the ga-5je3zv marker
     _REAL_I2_CAP = (
         "[2026-10-06 06:23:56] [pilot-dispatcher] ga-in9ebr: wa-ulioob QUEUED — routed to "
         "wa-worker, pool at session cap (2 active/creating >= 2 max); not claimed, no writes "
@@ -6899,6 +6906,31 @@ def _selftest():
         "slots_left=3).",
         "[2026-10-06 07:43:36] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
         "(small_slots=3 big_slots=1 dolt_saturated_at_start=0) ===",
+    ]
+    _REAL_I2_UNREAD = [
+        "[2026-10-06 09:34:24] [pilot-dispatcher] WARN: ga-in9ebr: cannot read the wa-worker "
+        "live session count (session list unreadable) — the pre-claim pool-cap skip cannot "
+        "tell full from free for wa-worker this sweep, so the dispatch phase is HALTED rather "
+        "than claiming beads dispatch_one() could only refuse (ga-5je3zv); nothing is spawned "
+        "without the count (ga-oa004t fail-closed).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] WARN: ga-5je3zv: dispatch phase HALTED for "
+        "the rest of this sweep (session-count-unreadable): the live session count could not "
+        "be read (session list unreadable/timed out) on the pre-claim probe for wa-9hcj2p — "
+        "no further candidate is claimed this sweep (fail-closed gates unchanged; the next "
+        "sweep re-reads from scratch).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] Lane small: dispatched 0 this sweep (cap=2, "
+        "slots_left=2).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] Lane big: dispatched 0 this sweep (cap=1, "
+        "slots_left=1).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] No dispatches this sweep (lane slots may "
+        "have been won by a concurrent process, or all picks skipped).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] ga-5je3zv: dispatch phase was HALTED this "
+        "sweep (session-count-unreadable) after 0s; dispatched=0 — candidates not attempted "
+        "stay story:approved for the next sweep.",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] WARN: ga-y1m40: dispatched=0 with free "
+        "slots (small=2 big=1) — 2 consecutive sweep(s).",
+        "[2026-10-06 09:34:24] [pilot-dispatcher] === Pilot sweep complete: dispatched=0 "
+        "(small_slots=2 big_slots=1 dolt_saturated_at_start=0) ===",
     ]
 
     def _restamp_real(lines, shift):
@@ -7478,21 +7510,51 @@ def _selftest():
         _ok("(ga-i2uwym-a): the HALTED 07:11 sweep keeps the older cap evidence and reads "
             "UNMEASURED, with the halt reason in the body clause")
 
-    print("\nScenario (ga-i2uwym-b): the REAL 2026-10-06 07:35:49 / 07:43:36 sweep, verbatim — "
-          "'pool-routed candidates DEFERRED this sweep' (one slow spawn per sweep; every later "
-          "pool-routed candidate is skipped silently) then a complete line with dispatched=0 "
-          "and both lanes free. Candidates were skipped, so it is not a full walk either")
+    print("\nScenario (ga-i2uwym-b): GATE-FIX 1 (attempt 1 FAIL) — the REAL 2026-10-06 07:35:49 / "
+          "07:43:36 sweep, verbatim: 'pool-routed candidates DEFERRED this sweep' (one slow "
+          "spawn per sweep) then a complete line with dispatched=0 and both lanes free. It IS "
+          "a full walk for cap evidence: dispatch_lane() cap-probes every pool-routed candidate "
+          "BEFORE it can be deferred (full pool → QUEUED line + continue; only a pool WITH "
+          "ROOM reaches the deferral), so a bead with no cap line there is positively 'not "
+          "held at the cap'. It must SUPERSEDE the older cap line — reading it UNMEASURED kept "
+          "'queued at the cap' alive as a capacity wait, for up to 30 min, for a bead whose "
+          "pool the newest sweep had just measured as having room")
     _i2_dshift = (NOW - 100) - _ts_epoch(_REAL_I2_DEFER[-1])
     _i2_defer = _restamp_real(_REAL_I2_DEFER, _i2_dshift)
     _read_pilot_log_lines = lambda: list(_i2_prev) + list(_i2_defer)
     _i2b = _pilot_cap_evidence(NOW)
-    if (_i2b is not None and "wa-ulioob" in _i2b and not _i2b.walked_all
-            and "DEFERRED" in _i2b.why):
-        _ok("(ga-i2uwym-b): the DEFERRED 07:43 sweep keeps the older cap evidence and reads "
-            "UNMEASURED, naming the deferral")
+    _i2b_problems = []
+    if not (_i2b is not None and "wa-ulioob" not in _i2b and _i2b.walked_all):
+        _i2b_problems.append("a DEFERRED sweep must supersede older cap evidence as a full "
+                             "walk: got %r walked_all=%r why=%r" % (
+                                 _i2b, getattr(_i2b, "walked_all", None),
+                                 getattr(_i2b, "why", None)))
+    # end to end, the CONSEQUENCE the reviewer measured: the bead the older sweep cap-queued
+    # must reach the NORMAL alarm — measured negative, 'did NOT queue it' (accurate: its pool
+    # had room, the Pilot parked it on purpose) — and NOT the 'capacity wait' note that the
+    # retained cap line used to raise.
+    _b9i2b = "wa-ulioob"
+    _bd_approved = lambda root: [_make_bead(_b9i2b, labels=list(_LBL9))]
+    _read_pilot_dispatchable_file = lambda: _dispatchable_front(_b9i2b)
+    _read_pilot_sweep_pause_state_file = _pause_off
+    _sh = _sh_wa_two_active
+    st = _reset()
+    st["first_seen_approved"][_b9i2b] = NOW - 600 * 60
+    run_cycle(NOW, st)
+    _sh = _stub_sh_fast
+    df9i2b, cap9i2b = _df_mails(), _cap_mails()
+    if not (len(df9i2b) == 1 and not cap9i2b
+            and "walked every candidate and did NOT queue it" in df9i2b[0][1]
+            and "NÃO MEDIDO" not in df9i2b[0][1].split("Pool-cap evidence", 1)[-1]):
+        _i2b_problems.append("end to end: df=%r cap=%r body=%r" % (
+            [s for s, _ in df9i2b], [s for s, _ in cap9i2b],
+            [l for l in (df9i2b[0][1] if df9i2b else "").splitlines() if "Pool-cap" in l]))
+    if _i2b_problems:
+        _bad("(ga-i2uwym-b)", "; ".join(_i2b_problems))
     else:
-        _bad("(ga-i2uwym-b)", "got %r walked_all=%r why=%r" % (
-             _i2b, getattr(_i2b, "walked_all", None), getattr(_i2b, "why", None)))
+        _ok("(ga-i2uwym-b): the DEFERRED 07:43 sweep is a full walk — it supersedes the older "
+            "cap line, and the bead gets the normal, accurate 'did NOT queue it' alarm, not a "
+            "stale capacity-wait note")
 
     print("\nScenario (ga-i2uwym-c): END-TO-END on the REAL 07:11 sweep — a buildable bead the "
           "halted sweep never reached has no cap line: it still alarms (fail toward alarming) "
@@ -7521,21 +7583,22 @@ def _selftest():
              [s for s, _ in df9i2], [s for s, _ in cap9i2],
              [l for l in (df9i2[0][1] if df9i2 else "").splitlines() if "Pool-cap" in l]))
 
-    print("\nScenario (ga-i2uwym-d): the CLASS — every other shape in which the Pilot logs that "
-          "candidates were left un-attempted (the session-count-unreadable halt; the closing "
-          "'was HALTED' line alone, its WARN fallen off the tail; the per-bead dispatch_one "
-          "deferral) KEEPS older evidence and reads UNMEASURED; a pool TOP-UP spawn deferral "
-          "defers a spawn, not a candidate, so it stays a full walk; and the flag belongs to "
-          "ONE sweep — a clean full walk after a halted one supersedes again")
+    print("\nScenario (ga-i2uwym-d): the CLASS — the other shapes of a HALTED dispatch phase (the "
+          "REAL 09:34 session-count-unreadable halt; the closing 'was HALTED' line alone, its "
+          "WARN fallen off the tail) KEEP older evidence and read UNMEASURED; EVERY deferral "
+          "(pool-routed, per-bead, pool top-up) is a candidate the Pilot cap-measured first or "
+          "no candidate at all, so each stays a FULL walk; a halt's marker is anchored on "
+          "ga-5je3zv (a candidate TITLE or the ga-in9ebr WARN is not a halt); and the halt "
+          "flag AND its wording belong to ONE sweep — nothing leaks into the next")
     _i2_t = lambda t, text: (time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime(t))
                              + " [pilot-dispatcher] " + text)
-    # Shapes below are copied from pilot-dispatcher.sh (ga-5je3zv / ga-6hr8p7 log/warn calls),
-    # not from the log: the REAL log holds only the time-budget halt and the pre-claim deferral.
-    _i2_unread = _i2_t(NOW - 150, "WARN: ga-5je3zv: dispatch phase HALTED for the rest of this "
-                       "sweep (session-count-unreadable): the live session count could not be "
-                       "read (session list unreadable/timed out) on the pre-claim probe for "
-                       "wa-x — no further candidate is claimed this sweep (fail-closed gates "
-                       "unchanged; the next sweep re-reads from scratch).")
+    # The unreadable-count halt is the REAL 09:34:24 sweep, verbatim (restamped, spacing kept).
+    # The shapes below that the real log does not hold are copied from pilot-dispatcher.sh
+    # (ga-5je3zv / ga-6hr8p7 log/warn calls): the closing line alone, the per-bead deferral
+    # and the pool top-up deferral.
+    _i2_unread_real = _restamp_real(
+        _REAL_I2_UNREAD, (NOW - 100) - _ts_epoch(_REAL_I2_UNREAD[-1]))
+    _i2_unread = _i2_unread_real[1]    # the real ga-5je3zv WARN, alone (no complete line)
     _i2_close = _i2_t(NOW - 140, "ga-5je3zv: dispatch phase was HALTED this sweep "
                       "(time-budget) after 974s; dispatched=0 — candidates not attempted stay "
                       "story:approved for the next sweep.")
@@ -7548,9 +7611,8 @@ def _selftest():
                       "per sweep, the next sweep's live count decides.")
     _i2_done = _sweep_log_line_slots(NOW - 100, 3, 1, dispatched=0)
     _i2_cases = [
-        ("session-count-unreadable halt", [_i2_unread, _i2_done], "session-count-unreadable"),
+        ("REAL session-count-unreadable halt", list(_i2_unread_real), "session-count-unreadable"),
         ("closing 'was HALTED' line alone", [_i2_close, _i2_done], "HALTED"),
-        ("per-bead dispatch_one deferral", [_i2_spawn, _i2_done], "DEFERRED"),
     ]
     _i2d_problems = []
     for _i2_name, _i2_tail, _i2_word in _i2_cases:
@@ -7560,12 +7622,19 @@ def _selftest():
                 and _i2_word in _i2d.why):
             _i2d_problems.append("%s: got %r walked_all=%r why=%r" % (
                 _i2_name, _i2d, getattr(_i2d, "walked_all", None), getattr(_i2d, "why", None)))
-    # control 1: a pool top-up deferral skips no candidate → still a full walk that supersedes.
-    _read_pilot_log_lines = lambda: list(_i2_prev) + [_i2_topup, _i2_done]
-    _i2_ctl = _pilot_cap_evidence(NOW)
-    if not (_i2_ctl is not None and "wa-ulioob" not in _i2_ctl and _i2_ctl.walked_all):
-        _i2d_problems.append("top-up deferral wrongly read as a non-walk: got %r walked_all=%r" % (
-            _i2_ctl, getattr(_i2_ctl, "walked_all", None)))
+    # control 1: a deferral is no un-attempted candidate — the per-bead dispatch_one one sits in
+    # the ELSE of `live >= MAX` (after "not at cap" was read), the pool-routed one after the
+    # pre-claim cap probe, the pool top-up one defers a spawn and no candidate — so each is still
+    # a full walk that supersedes the older cap line (GATE-FIX 1, same reading as scenario b).
+    for _i2_name, _i2_defer_line in (("per-bead dispatch_one deferral", _i2_spawn),
+                                     ("pool top-up deferral", _i2_topup),
+                                     ("pool-routed deferral (REAL 07:35)", _i2_defer[0])):
+        _read_pilot_log_lines = lambda: list(_i2_prev) + [_i2_defer_line, _i2_done]
+        _i2_ctl = _pilot_cap_evidence(NOW)
+        if not (_i2_ctl is not None and "wa-ulioob" not in _i2_ctl and _i2_ctl.walked_all):
+            _i2d_problems.append("%s wrongly read as a non-walk: got %r walked_all=%r why=%r" % (
+                _i2_name, _i2_ctl, getattr(_i2_ctl, "walked_all", None),
+                getattr(_i2_ctl, "why", None)))
     # control 2: the halted sweep's OWN cap lines are still evidence (it walked those beads).
     _read_pilot_log_lines = lambda: list(_i2_prev) + [
         _cap_pick_line(NOW - 160, "wa-own"), _i2_unread, _i2_done]
@@ -7581,12 +7650,55 @@ def _selftest():
     if not (_i2_leak is not None and "wa-ulioob" not in _i2_leak and _i2_leak.walked_all):
         _i2d_problems.append("a clean full walk after a halted sweep did not supersede: "
                              "got %r walked_all=%r" % (_i2_leak, getattr(_i2_leak, "walked_all", None)))
+    # control 4: no WORDING leak. A halted sweep completes; the NEXT sweep is cut by a plain lane
+    # loop 'stopping ... loop' — its why must be the lane-loop sentence, not the halt's. (The flag
+    # resetting was pinned by control 3; a wording left un-reset passed every test — the
+    # reviewer's low finding — and would blame a halt for a sweep that never had one.)
+    _read_pilot_log_lines = lambda: list(_i2_prev) + [
+        _i2_unread, _i2_close, _sweep_log_line_slots(NOW - 130, 3, 1, dispatched=0),
+        _REAL_LOOP_CUT, _sweep_log_line_slots(NOW - 60, 3, 1, dispatched=0)]
+    _i2_wl1 = _pilot_cap_evidence(NOW)
+    if not (_i2_wl1 is not None and not _i2_wl1.walked_all
+            and "lane loop was cut short" in _i2_wl1.why and "HALTED" not in _i2_wl1.why):
+        _i2d_problems.append("the halt's wording leaked into the next sweep's verdict: got "
+                             "walked_all=%r why=%r" % (getattr(_i2_wl1, "walked_all", None),
+                                                       getattr(_i2_wl1, "why", None)))
+    # control 5: same, through the OTHER reset — a halted sweep that never completed (a later
+    # 'Pilot sweep start' arrives first) must not lend its halt wording to the sweep after it.
+    _i2_start = _i2_t(NOW - 120, "=== Pilot sweep start (DRY_RUN=0) ===")
+    _read_pilot_log_lines = lambda: list(_i2_prev) + [
+        _i2_unread, _i2_start, _REAL_LOOP_CUT,
+        _sweep_log_line_slots(NOW - 60, 3, 1, dispatched=0)]
+    _i2_wl2 = _pilot_cap_evidence(NOW)
+    if not (_i2_wl2 is not None and not _i2_wl2.walked_all
+            and "lane loop was cut short" in _i2_wl2.why and "HALTED" not in _i2_wl2.why):
+        _i2d_problems.append("an aborted halted sweep's wording leaked past the next start "
+                             "marker: got walked_all=%r why=%r" % (
+                                 getattr(_i2_wl2, "walked_all", None),
+                                 getattr(_i2_wl2, "why", None)))
+    # control 6: the marker is the ga-5je3zv line, not any line that merely contains the words.
+    #   (a) the Pilot logs candidate TITLES ("[small] <id> P1 — <title>"); a bead titled with the
+    #       halt phrase must not flag its whole sweep as halted;
+    #   (b) the REAL ga-in9ebr WARN says "the dispatch phase is HALTED" — a different sentence.
+    _i2_title = _i2_t(NOW - 150, "  [small] wa-title P1 — dispatch phase HALTED (time-budget): "
+                      "o Pilot parou de despachar?")
+    for _i2_name, _i2_noise in (("a candidate title containing the halt phrase", _i2_title),
+                                ("the REAL ga-in9ebr 'dispatch phase is HALTED' WARN",
+                                 _i2_unread_real[0])):
+        _read_pilot_log_lines = lambda: list(_i2_prev) + [_i2_noise, _i2_done]
+        _i2_anch = _pilot_cap_evidence(NOW)
+        if not (_i2_anch is not None and "wa-ulioob" not in _i2_anch and _i2_anch.walked_all):
+            _i2d_problems.append("%s flagged a clean sweep as halted: got %r walked_all=%r "
+                                 "why=%r" % (_i2_name, _i2_anch,
+                                             getattr(_i2_anch, "walked_all", None),
+                                             getattr(_i2_anch, "why", None)))
     if _i2d_problems:
         _bad("(ga-i2uwym-d)", "; ".join(_i2d_problems))
     else:
-        _ok("(ga-i2uwym-d): 3 more un-attempted-candidate shapes keep evidence and read "
-            "UNMEASURED; the top-up deferral stays a full walk; own cap lines survive; no "
-            "flag leaks into the next sweep")
+        _ok("(ga-i2uwym-d): the real unreadable-count halt and the closing line keep evidence "
+            "and read UNMEASURED; all 3 deferral shapes stay full walks; own cap lines "
+            "survive; no flag or wording leaks into the next sweep; the halt marker is "
+            "anchored on ga-5je3zv")
 
     print("\nScenario (ga-9ekn2l-j): volume — 3 cap-queued beads x every rig → ONE "
           "note per pool, none inside the backoff, repeat #2 after 1h, and a change "
