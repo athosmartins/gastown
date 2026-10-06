@@ -24,6 +24,13 @@
 # bare-or-colon-suffixed matching rule the guards themselves use to VETO —
 # so clearing is finally symmetric with matching.
 #
+# STORE ROUTING (ga-sa4jcb): a bead lives in the store its id prefix names
+# (ga-* -> HQ, wa-* -> whatsapp_automation, ...). `gc bd` routes by that
+# prefix; plain `bd -C <HQ city>` only ever sees the HQ store, where a rig
+# bead is "no issue found". Reads AND removals therefore go through `gc bd`
+# first, falling back to `bd -C` only if gc itself fails — the same order for
+# both, so a bead is written through the store it was read from.
+#
 # Usage:
 #   gate-unhold.sh <bead-id> <prefix> [<prefix> ...]
 #
@@ -38,7 +45,8 @@
 # verify" property that removing-by-exact-name broke.
 #
 # Exit codes: 0 = cleared and verified (or nothing matched); 1 = could not
-# read the bead, or a matching label survived verification.
+# read the bead, could not remove a label (the store's error is printed), or a
+# matching label survived verification.
 #
 # Testability: `source`-able with GATE_UNHOLD_LIB_ONLY=1 to load
 # matching_veto_labels()/gate_unhold_main() without executing against a live
@@ -80,6 +88,32 @@ fetch_labels() {
     | jq -r 'if type=="array" then .[0] else . end | (.labels // []) | join(" ")' 2>/dev/null
 }
 
+# remove_label <bead-id> <label> <gc-city> — removes ONE label from the store
+# that owns the bead. Same order as fetch_labels: `gc bd` (prefix-routed, reaches
+# rig stores) first, `bd -C` (HQ only) as the fallback when gc itself fails.
+# On failure prints WHY to stderr and returns 1; the error is never swallowed
+# (ga-sa4jcb: it used to be a bare `bd -C ... label remove` whose "no issue
+# found" for every rig bead scrolled past while the veto stayed live).
+remove_label() {
+  local bead_id="$1" lbl="$2" city="$3" gc_err="" bd_err=""
+  if gc_err=$(gc --city "$city" bd label remove "$bead_id" "$lbl" -q 2>&1); then
+    return 0
+  fi
+  if bd_err=$(bd -C "$city" label remove "$bead_id" "$lbl" -q 2>&1); then
+    return 0
+  fi
+  echo "gate-unhold: could not remove $lbl from $bead_id — gc bd: $(_one_line "$gc_err"); bd -C fallback: $(_one_line "$bd_err")" >&2
+  return 1
+}
+
+# _one_line <text> — collapse to one line and drop gc's "warning: builtin pack"
+# noise, so the real error is what the operator reads.
+_one_line() {
+  local out
+  out=$(printf '%s\n' "$1" | grep -v '^warning:' | tr '\n' ' ' | sed 's/ *$//' || true)
+  printf '%s' "${out:-no output}"
+}
+
 gate_unhold_main() {
   local bead_id="${1:?usage: gate-unhold.sh <bead-id> <prefix> [<prefix> ...]}"
   shift
@@ -96,15 +130,22 @@ gate_unhold_main() {
     return 1
   fi
 
-  local prefix matched lbl removed_any=0
+  local prefix matched lbl removed_any=0 failed=""
   for prefix in "${prefixes[@]}"; do
     matched=$(matching_veto_labels "$before_labels" "$prefix")
     for lbl in $matched; do
       echo "gate-unhold: removing $lbl from $bead_id"
-      bd -C "$city" label remove "$bead_id" "$lbl" -q
       removed_any=1
+      # Keep going after a failure: the other variants may well clear, and a
+      # half-cleared veto is still better than one stopped at the first error.
+      remove_label "$bead_id" "$lbl" "$city" || failed="${failed:+$failed }$lbl"
     done
   done
+
+  if [ -n "$failed" ]; then
+    echo "gate-unhold: FAILED — could not remove from $bead_id: $failed (the veto is likely still live; see the error above)" >&2
+    return 1
+  fi
 
   if [ "$removed_any" = "0" ]; then
     echo "gate-unhold: no label on $bead_id matched (${prefixes[*]}) — nothing to do"
