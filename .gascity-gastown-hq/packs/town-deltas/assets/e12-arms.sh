@@ -67,7 +67,8 @@ e12_conf_load() {
   E12_PCT=0; E12_PARSE=absent; E12_STATE=absent
   local conf line key val seen=0
   conf="$(e12_state_dir)/e12-ab.conf"
-  [ -e "$conf" ] || return 0
+  # -e follows symlinks: a symlink whose target is gone is NOT absent, it is there and cannot be read (-> invalid:not-a-file below)
+  [ -e "$conf" ] || [ -L "$conf" ] || return 0
   E12_PARSE=ok
   if [ ! -f "$conf" ]; then E12_PARSE="invalid:not-a-file"
   elif [ ! -r "$conf" ]; then E12_PARSE="invalid:unreadable"; fi
@@ -147,27 +148,53 @@ e12_cmd_arm() {
 }
 
 # ── roster ────────────────────────────────────────────────────────────────────────────────────────────────────
-# e12_record <bead> <store> <arm> <stage> — one JSON line, built by jq so a path or a "quote" can never corrupt the file.
+# e12_record <bead> <store> <arm> <stage> — one JSON line, built by jq so a path or a "quote" can never corrupt the file. rc 0 = the row is
+# in the roster on a line of its own; rc 3 = it is not (a failing append can itself leave a short fragment; the next call seals it, below).
+# A write that stopped short (disk near full, a killed process) leaves a fragment with NO newline — the newline is the last byte of a row.
+# A bare append would glue this row onto that fragment: one unparseable line, reported as success, the bead treated in the builder's prompt
+# and missing from the roster. So when the file's last byte is not a newline the row is written with a newline in front, in the same
+# printf as the row (not a seal followed by an append). The last byte has three answers, never two: a newline / something else / could not
+# be read — the third is a failed record, never "looks fine". It is read with od, not $(tail -c1): command substitution drops a NUL, and a
+# tail ending in NUL is what some filesystems leave after a crash. An existing path that is not a regular file (a dangling symlink,
+# a directory) is refused up front, so the append cannot create a target out of nothing.
 e12_record() {
+  local r row lead="" last lrc=0
   command -v jq >/dev/null 2>&1 || return 3
   mkdir -p "$(e12_state_dir)" 2>/dev/null || return 3
-  jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg bead "$1" --arg store "$2" --arg salt "$E12_SALT" --arg arm "$3" \
+  r="$(e12_roster)"
+  row="$(jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg bead "$1" --arg store "$2" --arg salt "$E12_SALT" --arg arm "$3" \
     --argjson pct "$E12_PCT" --arg stage "$4" \
     '{ts:$ts,event:"assign",bead:$bead,store:$store,salt:$salt,arm:$arm,treated_pct:$pct} + (if $stage == "" then {} else {stage:$stage} end)' \
-    2>/dev/null >> "$(e12_roster)" || return 3
+    2>/dev/null)" || return 3
+  [ -n "$row" ] || return 3
+  if [ -e "$r" ] || [ -L "$r" ]; then
+    [ -f "$r" ] || return 3
+    if [ -s "$r" ]; then
+      last="$(tail -c1 "$r" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" || lrc=$?
+      [ "$lrc" -eq 0 ] || return 3
+      case "$last" in
+        0a)                   ;;
+        [0-9a-f][0-9a-f])     lead=$'\n' ;;
+        *)                    return 3 ;;
+      esac
+    fi
+  fi
+  printf '%s%s\n' "$lead" "$row" >> "$r" 2>/dev/null || return 3
 }
 
 # e12_recorded_arm <bead> — the arm the ROSTER holds for this bead under this salt (the first assignment wins). Three answers:
 #   rc 0  prints treated|control   the roster has a row for it
 #   rc 1  prints nothing           there is no row (no roster file, or a readable roster without one) — the only case where an arm may be COMPUTED
-#   rc 3  prints nothing           it cannot be told: the roster exists but cannot be read, jq is missing, or the row's arm is not treated|control
+#   rc 3  prints nothing           it cannot be told: jq is missing (checked first — with no jq a row can be neither read nor written, whether
+#                                  or not the roster file exists yet), the roster exists but cannot be read (a dangling symlink included —
+#                                  -e alone would call it "no roster"), or the row's arm is not treated|control
 # A line that is not a JSON object (a truncated write) is skipped, not fatal: one bad line must not make every bead look unassigned.
 # The ROW: prefix is what tells "a row without an arm" from "no row".
 e12_recorded_arm() {
   local r out rc first; r="$(e12_roster)"
-  [ -e "$r" ] || return 1
-  { [ -f "$r" ] && [ -r "$r" ]; } || return 3
   command -v jq >/dev/null 2>&1 || return 3
+  [ -e "$r" ] || [ -L "$r" ] || return 1
+  { [ -f "$r" ] && [ -r "$r" ]; } || return 3
   rc=0
   out="$(jq -R -r --arg b "$1" --arg s "$E12_SALT" \
     'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b and .salt==$s) | "ROW:" + ((.arm // "") | tostring)' "$r" 2>/dev/null)" || rc=$?
@@ -190,11 +217,11 @@ e12_resolve() {
   case "$rrc" in
     0) E12_ARM="$rec"; return 0 ;;
     1) ;;
-    *) echo "e12: the roster cannot be read, so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
+    *) echo "e12: the roster cannot be read (unreadable, or jq is missing), so it cannot be told whether '$bead' was already assigned — no arm (not a recompute)" >&2; return 3 ;;
   esac
   arm="$(e12_arm_for "$bead")" || { echo "e12: cannot assign an arm to '$bead' (no sha256 tool?)" >&2; return 3; }
   if [ "$record" = 1 ]; then
-    e12_record "$bead" "$store" "$arm" "$stage" || { echo "e12: WARN: assignment for $bead NOT recorded (roster unwritable) — no arm handed out" >&2; return 5; }
+    e12_record "$bead" "$store" "$arm" "$stage" || { echo "e12: WARN: assignment for $bead NOT recorded (roster unwritable, or not in a state a row can safely be appended to) — no arm handed out" >&2; return 5; }
   fi
   E12_ARM="$arm"
   return 0

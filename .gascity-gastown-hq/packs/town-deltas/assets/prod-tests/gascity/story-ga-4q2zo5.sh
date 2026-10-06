@@ -73,6 +73,17 @@ rc=0; cb="$(bash "$ARMS" block "$ID_C" "$CITY" prod-test)" || rc=$?
 [[ "$(jq -r --arg b "$ID_C" 'select(.bead==$b) | .arm' "$S/e12-roster.jsonl")" == control ]] || fail "the control bead has no control row — a control with no denominator is not a control"
 log "treated → the ≤10-line block with the 'vazio → …; falhou/ilegível → …' format; control → nothing; both recorded ✓"
 
+# A write that stops short leaves a fragment with NO newline. The deployed script must put the next row on its own line: gluing it onto
+# the fragment made the row unreadable while the command still said success (gate review of ga-4q2zo5, attempt 1). Read back with this
+# test's own jq, not with the script.
+rm -f "$S/e12-roster.jsonl"
+printf '{"ts":"x","event":"assign","bea' > "$S/e12-roster.jsonl"
+rc=0; bash "$ARMS" assign "$ID_C" "$CITY" prod-test >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || fail "assign over a roster with a torn tail (no newline) exited $rc"
+[[ "$(jq -R -r --arg b "$ID_C" 'try fromjson catch empty | select(type=="object" and .bead==$b) | .arm' "$S/e12-roster.jsonl")" == control ]] \
+  || fail "the row written after a torn tail is not readable — it was glued onto the fragment: $(cat "$S/e12-roster.jsonl")"
+log "a roster with a torn tail (no newline): the next row lands on its own line and reads back ✓"
+
 # ── 5. a conf that cannot be read is its own state ───────────────────────────────────────────────────────────────
 : > "$S/e12-ab.conf"
 case "$(bash "$ARMS" state)" in invalid:*) ;; *) fail "an EMPTY conf must read invalid:*, got '$(bash "$ARMS" state)'" ;; esac
@@ -92,7 +103,10 @@ log "pilot-dispatcher.sh carries the E12 hook and its call site ✓"
 
 # ── informational: is the LIVE city switched on? (never a failure — that is the Mayor's call) ─────────────────────
 unset E12_STATE_DIR
-live="$(E12_STATE_DIR="$CITY/.gc" bash "$ARMS" state 2>/dev/null)" || live="unreadable"
+# `state` exits 0 for every answer (absent | invalid:… | active …) and always prints one line, so a crashed call shows as an EMPTY line,
+# not as a non-zero exit — that is what is checked.
+live="$(E12_STATE_DIR="$CITY/.gc" bash "$ARMS" state 2>/dev/null)" || live=""
+[[ -n "$live" ]] || live="unreadable"
 log "live city experiment state: $live (informational)"
 
 log "PASS"

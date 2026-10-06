@@ -88,6 +88,12 @@ newstate; printf '# only a comment\n\n' > "$SD/e12-ab.conf"; run state
 case "$OUT" in invalid:*) ok "comment-only conf → $OUT (no treated_pct, no experiment, and not silently absent)" ;; *) bad "comment-only conf → '$OUT'" ;; esac
 newstate; mkdir "$SD/e12-ab.conf"; run state
 case "$OUT" in invalid:*) ok "conf that is a directory → $OUT" ;; *) bad "conf dir → '$OUT'" ;; esac
+# `[ -e ]` follows symlinks, so a symlink whose target is gone answered "there is no conf" (exit 0, silent): the file is THERE and cannot
+# be read — the third state, not the second (gate review of ga-4q2zo5, attempt 1).
+newstate; ln -s "$SD/no-such-target" "$SD/e12-ab.conf"; run state
+case "$OUT" in invalid:*) ok "conf that is a dangling symlink → $OUT (it exists and cannot be read; not 'no conf')" ;; *) bad "dangling conf symlink → state='$OUT' (must be invalid:*)" ;; esac
+run block ga-abc /store
+[ -z "$OUT" ] && [ "$RC" = 6 ] && [ ! -e "$SD/e12-roster.jsonl" ] && ok "dangling conf symlink: block prints nothing, exit 6, no roster row" || bad "dangling conf symlink: block out='$OUT' rc=$RC"
 if [ "$(id -u)" != 0 ]; then
   newstate; conf treated_pct=50; chmod 000 "$SD/e12-ab.conf"
   run state; case "$OUT" in invalid:*) ok "unreadable conf → $OUT" ;; *) bad "unreadable conf → '$OUT'" ;; esac
@@ -166,6 +172,63 @@ newstate; conf treated_pct=50
 printf '{"ts":"x","event":"assign","bea\n' > "$SD/e12-roster.jsonl"
 run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$RC" = 0 ] && ok "a truncated roster line is skipped; the next bead is assigned and recorded" || bad "truncated line: out='$OUT' rc=$RC"
 run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$(rows)" = 2 ] && ok "…and is found on the next call (still one row for it)" || bad "after truncated line: rows=$(rows)"
+
+# The torn line above ends in a newline, and a torn line from a crashed write NEVER does: the newline is the last byte of a row, so a write
+# that stops short never reaches it. The append used to glue the next row onto the fragment — one unparseable line, exit 0, the bead
+# treated in the builder's prompt but unreadable in the roster, and after a pct ramp re-dispatched as the other arm (gate review of
+# ga-4q2zo5, attempt 1). The checks read the roster with their own jq, never with e12_recorded_arm, so they cannot agree with the code
+# by sharing its blind spot. A bead that is treated at 50% and control at 1% (by the independent hash) makes the ramp visible.
+rowsfor() { jq -R -c --arg b "$1" 'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b)' "$SD/e12-roster.jsonl" 2>/dev/null | wc -l | tr -d ' '; }
+armfor()  { jq -R -r --arg b "$1" 'try fromjson catch empty | select(type=="object" and .event=="assign" and .bead==$b) | .arm' "$SD/e12-roster.jsonl" 2>/dev/null | head -1; }
+expected 1 < "$W/ids" > "$W/want1"
+ID_RAMP="$(paste -d' ' "$W/want" "$W/want1" | awk '$2=="treated" && $4=="control" {print $1; exit}')"
+[ -n "$ID_RAMP" ] || { echo "FAIL: no fixture id that is treated at 50% and control at 1% (ramp='$ID_RAMP')" >&2; exit 1; }
+newstate; conf treated_pct=50
+printf '{"ts":"x","event":"assign","bea' > "$SD/e12-roster.jsonl"
+run assign "$ID_C" /store
+[ "$OUT" = control ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_C")" = 1 ] && [ "$(armfor "$ID_C")" = control ] \
+  && ok "torn tail WITHOUT a newline: the next row lands on its own line and is readable" || bad "torn tail, no newline: out='$OUT' rc=$RC readable-rows=$(rowsfor "$ID_C") roster='$(cat "$SD/e12-roster.jsonl")'"
+run assign "$ID_T" /store
+[ "$OUT" = treated ] && [ "$(rowsfor "$ID_T")" = 1 ] && [ "$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ')" = 3 ] \
+  && ok "…the one after it too (fragment sealed once: 3 lines = fragment + 2 rows, no blank line, no second seal)" || bad "after the sealed tail: out='$OUT' lines=$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ') readable-rows=$(rowsfor "$ID_T")"
+newstate; conf treated_pct=50
+printf '{"ts":"x","event":"assign","bea' > "$SD/e12-roster.jsonl"
+run assign "$ID_RAMP" /store; first_arm="$OUT"
+conf treated_pct=1
+run assign "$ID_RAMP" /store
+[ "$first_arm" = treated ] && [ "$OUT" = treated ] && [ "$(rowsfor "$ID_RAMP")" = 1 ] && [ "$(armfor "$ID_RAMP")" = treated ] \
+  && ok "torn tail + ramp 50% → 1%: the bead keeps its first arm (treated), one readable row — the prompt and the roster agree" || bad "ramp over a torn tail: first='$first_arm' after='$OUT' readable-rows=$(rowsfor "$ID_RAMP") (the old code printed nothing here and wrote a second row as control)"
+run block "$ID_RAMP" /store
+[ "$(printf '%s\n' "$OUT" | head -1)" = "$HEADER" ] && [ "$(rowsfor "$ID_RAMP")" = 1 ] && ok "…and block still hands it the doctrine, without a second row" || bad "block after the ramp: rc=$RC head='$(printf '%s\n' "$OUT" | head -1)' rows=$(rowsfor "$ID_RAMP")"
+# a COMPLETE row that is only missing its newline (the crash came between the row and the newline) is a real row: counted, not re-assigned
+newstate; conf treated_pct=50
+jq -nc --arg b "$ID_C" '{ts:"x",event:"assign",bead:$b,store:"/s",salt:"e12-write-3state",arm:"control",treated_pct:50}' | tr -d '\n' > "$SD/e12-roster.jsonl"
+run assign "$ID_T" /store; [ "$OUT" = treated ] && [ "$(rowsfor "$ID_T")" = 1 ] && [ "$(rowsfor "$ID_C")" = 1 ] \
+  && ok "a whole row missing only its newline stays a row, and the next row does not fuse with it" || bad "whole row without newline: out='$OUT' T=$(rowsfor "$ID_T") C=$(rowsfor "$ID_C")"
+conf treated_pct=100
+run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$(rowsfor "$ID_C")" = 1 ] && ok "…and it is found afterwards (a ramp to 100% does not flip it)" || bad "whole row without newline, after ramp: out='$OUT' C=$(rowsfor "$ID_C")"
+# a tail that ends in a NUL byte (what some filesystems leave after a crash). `$(tail -c1)` cannot see it: bash 5 drops the NUL, so a
+# test of "is the last byte empty" would call it a clean line end. The check has to read the byte itself.
+newstate; conf treated_pct=50
+printf '{"ts":"x","event":"assign"\0' > "$SD/e12-roster.jsonl"
+run assign "$ID_C" /store; [ "$OUT" = control ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_C")" = 1 ] \
+  && ok "a tail ending in a NUL byte counts as torn: the next row is written on its own line" || bad "NUL tail: out='$OUT' rc=$RC readable-rows=$(rowsfor "$ID_C")"
+# a roster that is a dangling symlink EXISTS and cannot be read: not "no roster". Appending through it would create the target out of nothing.
+newstate; conf treated_pct=50; ln -s "$SD/no-such-roster" "$SD/e12-roster.jsonl"
+run assign "$ID_T" /store
+[ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/no-such-roster" ] && ok "roster is a dangling symlink → no arm, exit 3, nothing created behind it (it cannot be read; not 'no row')" || bad "dangling roster symlink: out='$OUT' rc=$RC target-created=$([ -e "$SD/no-such-roster" ] && echo yes || echo no)"
+# jq missing and no roster yet: "cannot read" (3), said as such — it used to fall through to the append and be reported as an unwritable roster (5)
+_nojq="$W/nojq-path"; mkdir -p "$_nojq"
+for _t in date mkdir cut tail od tr cat sha256sum openssl shasum perl; do _p="$(command -v "$_t" 2>/dev/null)" && [ -n "$_p" ] && ln -sf "$_p" "$_nojq/$_t"; done
+if PATH="$_nojq" command -v jq >/dev/null 2>&1; then
+  bad "fixture: jq is still reachable on the stripped PATH — the no-jq case was not exercised"
+else
+  newstate; conf treated_pct=50
+  PATH="$_nojq" run assign "$ID_T" /store
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && [ ! -e "$SD/e12-roster.jsonl" ] && case "$ERR" in *"cannot be read"*jq*) ok "no jq, no roster file: exit 3 and 'cannot be read … jq' (it is not an unwritable roster)" ;; *) bad "no jq: wrong message '$ERR'" ;; esac || bad "no jq, no roster: out='$OUT' rc=$RC err='$ERR'"
+  PATH="$_nojq" run block "$ID_T" /store
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "no jq: block hands out nothing, exit 3" || bad "no jq block: out='$OUT' rc=$RC"
+fi
 newstate; conf treated_pct=50
 printf '%s\n' "{\"ts\":\"x\",\"event\":\"assign\",\"bead\":\"$ID_T\",\"salt\":\"e12-write-3state\",\"arm\":\"maybe\"}" > "$SD/e12-roster.jsonl"
 run assign "$ID_T" /store; [ -z "$OUT" ] && [ "$RC" = 3 ] && ok "a row whose arm is not treated|control → no arm, exit 3 (not a recompute)" || bad "garbled row: out='$OUT' rc=$RC"
@@ -178,6 +241,11 @@ if [ "$(id -u)" != 0 ]; then
   chmod 600 "$SD/e12-roster.jsonl"
   newstate; conf treated_pct=50; : > "$SD/e12-roster.jsonl"; chmod 444 "$SD/e12-roster.jsonl"
   run assign "$ID_T" /store; [ -z "$OUT" ] && [ "$RC" = 5 ] && ok "roster cannot be WRITTEN → prints nothing, exit 5 (arm decided, not recorded)" || bad "unwritable roster: out='$OUT' rc=$RC"
+  chmod 600 "$SD/e12-roster.jsonl"
+  # sealing a torn tail is part of the write: if it cannot be done the row is not appended and the file is left exactly as it was
+  newstate; conf treated_pct=50; printf '{"ts":"x","event":"assign","bea' > "$SD/e12-roster.jsonl"; cp "$SD/e12-roster.jsonl" "$W/torn-before"; chmod 444 "$SD/e12-roster.jsonl"
+  run assign "$ID_T" /store
+  [ -z "$OUT" ] && [ "$RC" = 5 ] && cmp -s "$SD/e12-roster.jsonl" "$W/torn-before" && ok "torn tail + roster cannot be written → exit 5, nothing printed, file untouched" || bad "torn tail, unwritable: out='$OUT' rc=$RC"
   chmod 600 "$SD/e12-roster.jsonl"
 fi
 
@@ -266,6 +334,14 @@ for _sh in "${BASH:-/bin/bash}" /bin/bash; do
     *"roster cannot be read"*) [ "$_rc" = 3 ] && ok "$_sh: a failing jq is 'cannot tell' (exit 3, said so), not an abort with jq's own status" || bad "$_sh: jq failure said 'cannot be read' but exit=$_rc (want 3)" ;;
     *) bad "$_sh: a failing jq under set -eu: exit=$_rc and no 'roster cannot be read' message: '${_o:0:120}'" ;;
   esac
+  # The two cases above never record (stage 0). The record path has its own pipeline (tail | od | tr) and its own branch (a newline in
+  # front of the row after a torn tail), so it is run here too — as a plain statement, with pipefail on, over a roster that needs the
+  # newline and over one that does not.
+  newstate; conf "treated_pct=100"; printf '{"ts":"x","event":"assign","bea' > "$SD/e12-roster.jsonl"
+  _o="$("$_sh" -c 'set -euo pipefail; . "$1"; e12_resolve ga-s8-rec store stage 1; echo "arm=$E12_ARM"' _ "$E12" 2>&1)"; _rc=$?
+  [ "$_rc" = 0 ] && [ "$_o" = "arm=treated" ] && [ "$(rowsfor ga-s8-rec)" = 1 ] && ok "$_sh: recording after a torn tail under set -euo pipefail: exit 0, arm handed out, row readable" || bad "$_sh: record over a torn tail under set -euo pipefail: exit=$_rc out='${_o:0:120}' readable-rows=$(rowsfor ga-s8-rec)"
+  _o="$("$_sh" -c 'set -euo pipefail; . "$1"; e12_resolve ga-s8-rec2 store stage 1; echo "arm=$E12_ARM"' _ "$E12" 2>&1)"; _rc=$?
+  [ "$_rc" = 0 ] && [ "$_o" = "arm=treated" ] && [ "$(rowsfor ga-s8-rec2)" = 1 ] && [ "$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ')" = 3 ] && ok "$_sh: …and the next record over the now-clean tail adds no extra newline (3 lines)" || bad "$_sh: record over a clean tail under set -euo pipefail: exit=$_rc out='${_o:0:120}' lines=$(wc -l < "$SD/e12-roster.jsonl" | tr -d ' ')"
 done
 
 echo
