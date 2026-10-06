@@ -378,6 +378,86 @@ newstate; ln -s "$SD/no-such-roster" "$SD/e9-roster.jsonl"
 OUT="$(/bin/bash -c '. "$1"; e9_record plan_run bead=ga-j3 run_id=r3 verdict=PENDING; echo "rc=$?"' _ "$E9" 2>/dev/null)"
 [ "$OUT" = "rc=3" ] && [ ! -e "$SD/no-such-roster" ] && ok "e9_record on a dangling roster symlink: rc 3 (a PENDING row that cannot be written stops the paid run), no target created" || bad "e9_record on a dangling symlink: '$OUT' target-created=$([ -e "$SD/no-such-roster" ] && echo yes || echo no)"
 
+# The last byte is read from a file other processes append to, and `tail -c1` is not bounded to one byte: it seeks to size-1 and reads to the
+# CURRENT end, so a writer that lands a row between its fstat and its read makes it print the old last byte AND the whole new row. Piped into
+# od unbounded that is a long hex string, which matches neither "0a" nor "one byte": the record failed (exit 5, "roster unwritable") on a
+# roster that was perfectly writable — 4 of 512 concurrent assigns on a clean roster (gate review of ga-af5h6b, attempt 1). The decision is on
+# the FIRST byte and nothing else. The shim is that race made deterministic: the real tail, then the row the concurrent writer appended meanwhile.
+_race="$W/race-path"; mkdir -p "$_race"
+cat > "$_race/tail" <<EOF
+#!/bin/sh
+"$(command -v tail)" "\$@"
+printf '%s\n' '{"ts":"x","event":"assign","bead":"ga-concurrent","salt":"torn1","planner_arm":"on"}'
+EOF
+chmod +x "$_race/tail"
+newstate; conf planner_pct=50 salt=torn1
+printf '%s\n' '{"ts":"x","event":"assign","bead":"ga-before","salt":"torn1","planner_arm":"off"}' > "$SD/e9-roster.jsonl"
+OUT="$(PATH="$_race:$PATH" /bin/bash "$E9" assign "$ID_OFF" /store 2>"$W/err")"; RC=$?
+[ "$OUT" = off ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_OFF")" = 1 ] && [ "$(nlines)" = 2 ] \
+  && ok "a writer lands a row between tail's size and its read: the clean roster still records (first byte = newline), no blank line" || bad "append race on a clean roster: out='$OUT' rc=$RC lines=$(nlines) err='$(cat "$W/err")' (the unbounded od read took the concurrent row for an unreadable byte → exit 5)"
+newstate; conf planner_pct=50 salt=torn1
+printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+OUT="$(PATH="$_race:$PATH" /bin/bash "$E9" assign "$ID_ON" /store 2>"$W/err")"; RC=$?
+[ "$OUT" = on ] && [ "$RC" = 0 ] && [ "$(rowsfor "$ID_ON")" = 1 ] && [ "$(nlines)" = 2 ] \
+  && ok "…and a torn tail seen through the same race is still sealed (the first byte decides, the extra row does not hide the fragment)" || bad "append race on a torn tail: out='$OUT' rc=$RC lines=$(nlines) readable-rows=$(rowsfor "$ID_ON") err='$(cat "$W/err")'"
+# a caller that runs under pipefail (e9-plan.sh does) sees one more thing: when tail's own status is non-zero AFTER it delivered the byte —
+# SIGPIPE, once od has its one byte — the status is not the answer, the byte is. A fix that cleared the byte on a failed pipeline would bring
+# the race back for exactly those callers, and would trip errexit if it did not shield the assignment.
+_sigpipe="$W/sigpipe-path"; mkdir -p "$_sigpipe"
+cat > "$_sigpipe/tail" <<EOF
+#!/bin/sh
+"$(command -v tail)" "\$@"
+printf '%s\n' '{"ts":"x","event":"assign","bead":"ga-concurrent"}'
+exit 141
+EOF
+chmod +x "$_sigpipe/tail"
+newstate; printf '%s\n' '{"ts":"x","event":"assign","bead":"ga-before"}' > "$SD/e9-roster.jsonl"
+OUT="$(PATH="$_sigpipe:$PATH" /bin/bash -c 'set -euo pipefail; . "$1"; e9_record assign bead=ga-k1 store=/s salt=k planner_arm=on; echo "rc=$?"' _ "$E9" 2>"$W/err")"; RC=$?
+[ "$OUT" = "rc=0" ] && [ "$RC" = 0 ] && [ "$(nlines)" = 2 ] \
+  && ok "set -euo pipefail + a tail that exits 141 after delivering its byte: the byte decides, the row is recorded, errexit does not fire" || bad "pipefail + failed tail status: out='$OUT' rc=$RC lines=$(nlines) err='$(cat "$W/err")'"
+# the real thing, not a shim: a burst of concurrent assigns over a roster that already has a row (so every process reads the last byte while the
+# others append). Every one must exit 0 and land exactly one readable row; a lost row here is a bead missing from the denominator.
+newstate; conf planner_pct=50 salt=torn1
+printf '%s\n' '{"ts":"x","event":"assign","bead":"ga-seed","salt":"torn1","planner_arm":"off"}' > "$SD/e9-roster.jsonl"
+_burst_fail=0
+for _round in 1 2 3 4 5 6; do
+  _pids=""
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    /bin/bash "$E9" assign "ga-burst$_round-$_i" /store >/dev/null 2>&1 & _pids="$_pids $!"
+  done
+  for _p in $_pids; do wait "$_p" || _burst_fail=$((_burst_fail+1)); done
+done
+_burst_rows="$(jq -R -c 'try fromjson catch empty | select(type=="object" and .event=="assign")' "$SD/e9-roster.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$_burst_fail" = 0 ] && [ "$_burst_rows" = 97 ] \
+  && ok "96 concurrent assigns over a clean roster (6 bursts of 16): every exit 0, 97 readable rows (seed + 96), none lost or glued" || bad "concurrent burst: failed=$_burst_fail readable-rows=$_burst_rows (wanted 0 and 97)"
+# the contract in the header, one case per state it names — a comment that promises an exit code the code does not give sends the operator
+# triaging a Pilot-logged "exit 3" or "exit 5" to the wrong cause (gate review of ga-af5h6b, attempt 1). assign decides these in two places:
+# e9_recorded_arm first (a roster it cannot read is exit 3 — dangling symlink, directory, mode 000, no jq), then e9_record (exit 5: the arm is
+# known but the row could not be written, or the last byte could not be read).
+newstate; conf planner_pct=50 salt=torn1; mkdir "$SD/e9-roster.jsonl"
+run assign "$ID_ON" /store
+[ -z "$OUT" ] && [ "$RC" = 3 ] && ok "roster is a directory: assign prints nothing, exit 3 (cannot be read — not 5)" || bad "directory roster: out='$OUT' rc=$RC"
+if [ "$(id -u)" != 0 ]; then
+  newstate; conf planner_pct=50 salt=torn1; printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+  before="$(cksum < "$SD/e9-roster.jsonl")"; chmod 000 "$SD/e9-roster.jsonl"
+  run assign "$ID_ON" /store; chmod 600 "$SD/e9-roster.jsonl"
+  [ -z "$OUT" ] && [ "$RC" = 3 ] && [ "$(cksum < "$SD/e9-roster.jsonl")" = "$before" ] \
+    && ok "roster with mode 000: assign prints nothing, exit 3 (cannot be read), the file untouched" || bad "mode-000 roster: out='$OUT' rc=$RC changed=$([ "$(cksum < "$SD/e9-roster.jsonl")" = "$before" ] && echo no || echo yes)"
+fi
+# exit 5 for a last byte that cannot be read: a PATH with no tail. The roster is readable and writable, the arm is known — the only thing
+# missing is the one byte the append decision needs, and guessing it would glue a row onto a fragment or leave a blank line for nothing.
+_notail="$W/notail-path"; mkdir -p "$_notail"
+for _t in date mkdir cut jq od tr cat sed grep awk head wc sort uniq sha256sum openssl shasum perl; do _p="$(command -v "$_t" 2>/dev/null)" && [ -n "$_p" ] && ln -sf "$_p" "$_notail/$_t"; done
+if [ -z "$(PATH="$_notail" command -v tail 2>/dev/null)" ]; then
+  newstate; conf planner_pct=50 salt=torn1; printf '{"ts":"x","event":"assign","bea' > "$SD/e9-roster.jsonl"
+  before="$(cksum < "$SD/e9-roster.jsonl")"
+  OUT="$(PATH="$_notail" /bin/bash "$E9" assign "$ID_OFF" /store 2>"$W/err")"; RC=$?
+  [ -z "$OUT" ] && [ "$RC" = 5 ] && [ "$(cksum < "$SD/e9-roster.jsonl")" = "$before" ] \
+    && ok "last byte cannot be read (no tail): nothing printed, exit 5, the roster byte-for-byte what it was" || bad "no tail: out='$OUT' rc=$RC err='$(cat "$W/err")' (an unreadable last byte must be a failed record, never 'looks fine')"
+else
+  echo "  skip no-tail case: could not build a PATH without tail" >&2
+fi
+
 echo "== 4. complexity (computed from facts) =="
 cx() { run complexity "$@"; }
 tbl="1 1 0 0:S|2 1 0 0:S|3 1 0 0:M|2 2 0 0:M|7 2 0 0:M|8 1 0 0:L|1 3 0 0:L|4 5 0 0:L|1 1 1 0:L|1 1 0 1:L|2 2 1 1:L|08 1 0 0:L|007 02 0 0:M"

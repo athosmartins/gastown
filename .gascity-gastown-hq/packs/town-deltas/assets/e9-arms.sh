@@ -47,9 +47,10 @@
 #                                          nothing, exit 0 (the experiment is legitimately OFF).
 #                                          ONE assignment per bead per salt: a bead that already has a row gets THAT row's arm back,
 #                                          whatever the conf says now (a pct ramp must not flip a re-dispatched bead).
-#                                          exit 3 = no arm (bad id, no sha tool, roster unreadable or no jq), 5 = arm decided but NOT recorded
-#                                          (roster unwritable, or not in a state a row can safely be appended to: a dangling symlink, a
-#                                          directory, a last byte that cannot be read), 6 = the conf is INVALID (a typo'd key: the experiment is NOT running and
+#                                          exit 3 = no arm (bad id, no sha tool, no jq, or a roster that cannot be READ — a dangling symlink, a
+#                                          directory, mode 000: without it nobody can tell whether the bead already has an arm), 5 = arm
+#                                          decided but NOT recorded (the roster reads fine but the row cannot be written: not writable, or its
+#                                          last byte cannot be read), 6 = the conf is INVALID (a typo'd key: the experiment is NOT running and
 #                                          nobody asked for that); all three print nothing — a bead with no roster row gets no treatment.
 #                                          6 is its own code because the one real caller (the Pilot) drops stderr and logs only a
 #                                          non-zero exit: with the same silent 0 as "off", a typo at turn-on ran at 0% unseen.
@@ -218,12 +219,17 @@ e9_roster() { printf '%s' "$(e9_state_dir)/e9-roster.jsonl"; }
 # and missing from the roster. So when the file's last byte is not a newline the row is written with a newline in front, in the same
 # printf as the row (not a seal followed by an append). The last byte has three answers, never two: a newline / something else / could not
 # be read — the third is a failed record, never "looks fine". It is read with od, not $(tail -c1): command substitution drops a NUL, and
-# a tail ending in NUL is what some filesystems leave after a crash. An existing path that is not a regular file (a dangling symlink, a
-# directory) is refused up front, so the append cannot create a target out of nothing. Callers that spend money on the strength of this
-# row (e9-plan.sh's PENDING row) already treat a non-zero rc as "do not launch".
+# a tail ending in NUL is what some filesystems leave after a crash. The read is bounded to ONE byte (od -N1) because `tail -c1` is not: it
+# seeks to size-1 and reads to the CURRENT end, so a writer that appends between its fstat and its read makes it print the old last byte
+# plus the whole new row — and a decision taken on that string is taken on the wrong thing (a clean roster reported as unwritable, 4 of 512
+# concurrent assigns; ga-af5h6b gate attempt 1). Only the first byte counts, and the pipeline's own exit status is ignored on purpose: it is
+# tr's (not tail's) unless a caller set pipefail, and then it is tail's SIGPIPE after od already had its byte. What decides is the content:
+# a read that delivered nothing leaves `last` empty, and empty is not a byte — it falls to the third answer below. An existing path that
+# is not a regular file (a dangling symlink, a directory) is refused up front, so the append cannot create a target out of nothing.
+# Callers that spend money on the strength of this row (e9-plan.sh's PENDING row) already treat a non-zero rc as "do not launch".
 e9_record() {
   local event="$1"; shift
-  local args=() kv r row lead="" last lrc=0
+  local args=() kv r row lead="" last
   for kv in "$@"; do args+=(--arg "${kv%%=*}" "${kv#*=}"); done
   command -v jq >/dev/null 2>&1 || return 3
   mkdir -p "$(e9_state_dir)" 2>/dev/null || return 3
@@ -234,8 +240,7 @@ e9_record() {
   if [ -e "$r" ] || [ -L "$r" ]; then
     [ -f "$r" ] || return 3
     if [ -s "$r" ]; then
-      last="$(tail -c1 "$r" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')" || lrc=$?
-      [ "$lrc" -eq 0 ] || return 3
+      last="$(tail -c1 "$r" 2>/dev/null | od -An -tx1 -N1 2>/dev/null | tr -d ' \n')" || :   # `|| :` = errexit shield only; `last` keeps what it read
       case "$last" in
         0a)                   ;;
         [0-9a-f][0-9a-f])     lead=$'\n' ;;
@@ -287,8 +292,10 @@ e9_state_gate() {
 # THAT recorded arm. Recomputing it from the current conf instead would let a pct ramp (canary -> 50%) tell a re-dispatched bead to run
 # the paid planner while the roster counts it as control — the variable decided on must be the variable acted on.
 #   exit 0  the arm is printed (on|off), or nothing is printed because the experiment is not active
-#   exit 3  no arm could be determined (bad id, no sha tool, roster unreadable): prints nothing — "no arm" is neither on nor off
-#   exit 5  the arm was determined but could NOT be recorded: prints nothing. A bead with no roster row has no denominator slot, so it
+#   exit 3  no arm could be determined (bad id, no sha tool, no jq, or a roster that cannot be read — a dangling symlink, a directory,
+#           mode 000): prints nothing — "no arm" is neither on nor off
+#   exit 5  the arm was determined but could NOT be recorded (the roster reads fine; the row cannot be written, or the last byte the
+#           append decision needs cannot be read): prints nothing. A bead with no roster row has no denominator slot, so it
 #           gets no treatment and no hint; the exit code (not only stderr) lets a caller that discards stderr notice and log it.
 e9_cmd_assign() {
   local bead="${1:-}" store="${2:-}" stage="${3:-}" arm rec rrc g=0
