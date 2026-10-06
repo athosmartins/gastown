@@ -84,10 +84,13 @@ extract_block() {
 # for <gr_id> and captures every `bd comment`/`bd close` call it makes.
 run_cascade_close() {
   local file="$1" gr_id="$2" reason="$3" verdicts_json="$4" bd_log="$5"
-  local fn_close fn_open_ids
+  local fn_close fn_open_ids fn_cgv
   fn_close="$(extract_block "$file" "close-pending-verdicts-for-run-fn")"
   fn_open_ids="$(extract_block "$file" "open-verdict-ids-from-json-fn")"
-  if [ -z "$fn_close" ] || [ -z "$fn_open_ids" ]; then
+  # ga-9ophv2: the cascade closes through close_gate_verdict (forced, effect read back) — without it in scope the call is
+  # "command not found" and the verdict is never closed.
+  fn_cgv="$(extract_block "$file" "close-gate-verdict-fns")"
+  if [ -z "$fn_close" ] || [ -z "$fn_open_ids" ] || [ -z "$fn_cgv" ]; then
     echo "COULD_NOT_EXTRACT_BLOCK" >&2
     return 99
   fi
@@ -102,12 +105,16 @@ run_cascade_close() {
         *" list "*"gate-run:$GR_ID "*) printf "%s" "$VERDICTS_JSON"; return 0 ;;
         *" comment "*)                echo "$*" >> "$BD_LOG"; return 0 ;;
         *" close "*)                  echo "$*" >> "$BD_LOG"; return 0 ;;
+        *" show "*)                   printf "%s" "[{\"status\":\"closed\"}]"; return 0 ;;   # close_gate_verdict read-back
       esac
       echo "UNEXPECTED:$*" >> "$BD_LOG"
       return 0
     }
+    log()  { return 0; }
+    warn() { echo "WARN:$*" >> "$BD_LOG"; }
 
     '"$fn_open_ids"'
+    '"$fn_cgv"'
     '"$fn_close"'
 
     close_pending_verdicts_for_run "$GR_ID" "$REASON"
@@ -129,8 +136,11 @@ grep -q "close ga-yv9z9" "$BD_LOG" \
   && ok "ga-yv9z9 (pending, empty-assignee, parent superseded) was closed" \
   || bad "ga-yv9z9 was NOT closed — bd_log: $(tr '\n' ';' < "$BD_LOG")"
 grep -q "comment ga-yv9z9" "$BD_LOG" \
-  && ok "ga-yv9z9 got an explanatory comment before closing" \
+  && ok "ga-yv9z9 got its explanatory comment (posted AFTER the close was verified, ga-9ophv2 — never a 'cascade-closed' claim before the fact)" \
   || bad "ga-yv9z9 was closed with no comment — bd_log: $(tr '\n' ';' < "$BD_LOG")"
+grep -q "^WARN:" "$BD_LOG" \
+  && bad "the happy path warned — bd_log: $(tr '\n' ';' < "$BD_LOG")" \
+  || ok "no WARN on the happy path"
 case "$(grep "close ga-yv9z9" "$BD_LOG" || true)" in
   *"ga-hgsqg"*) ok "close reason cites ga-hgsqg (traceable to this fix)" ;;
   *) bad "close reason does not cite ga-hgsqg — $(grep "close ga-yv9z9" "$BD_LOG" || true)" ;;
@@ -213,19 +223,23 @@ case "$SKIP_BLOCKS" in
   *) ok "no skip) branch (Vector A, Vector B, Step 0b.1, Step 0b.2) calls the cascade" ;;
 esac
 
-echo "── 7. REGRESSION: the pre-existing supersede:dead-reviewers cascade (ga-g4m18) is untouched ──"
+echo "── 7. REGRESSION: the supersede:dead-reviewers cascade (ga-g4m18) is still wired, and closes through close_gate_verdict (ga-9ophv2) ──"
 DEAD_REVIEWERS_BLOCK=$(sed -n '/^      supersede:dead-reviewers)$/,/^        ;;$/p' "$GUARD")
 case "$DEAD_REVIEWERS_BLOCK" in
-  *'close_dead_reviewer_verdicts "$GR_ID"'*) ok "supersede:dead-reviewers still calls close_dead_reviewer_verdicts (ga-g4m18, unmodified)" ;;
+  *'close_dead_reviewer_verdicts "$GR_ID"'*) ok "supersede:dead-reviewers still calls close_dead_reviewer_verdicts (ga-g4m18)" ;;
   *) bad "supersede:dead-reviewers no longer calls close_dead_reviewer_verdicts — regression" ;;
 esac
-PRE_FIX_DEAD_REVIEWERS_FN=$(git -C "$SELF_DIR" show main:.gascity-gastown-hq/packs/town-deltas/assets/quality-gate-guard.sh 2>/dev/null \
-  | sed -n '/^close_dead_reviewer_verdicts() {$/,/^}$/p')
+# ga-9ophv2 changed this function ON PURPOSE: it used to pin "byte-for-byte unchanged vs main", which was right for
+# ga-hgsqg's own scope (that fix must not touch ga-g4m18) and is wrong now — the function's plain `bd close … 2>/dev/null || true`
+# was refused-and-hidden on its (assigned, by construction) verdicts. What must stay true is the CONTRACT: still wired into
+# supersede:dead-reviewers (above), and it closes only through close_gate_verdict — never a bare close.
 CUR_DEAD_REVIEWERS_FN=$(sed -n '/^close_dead_reviewer_verdicts() {$/,/^}$/p' "$GUARD")
-if [ -n "$PRE_FIX_DEAD_REVIEWERS_FN" ] && [ "$PRE_FIX_DEAD_REVIEWERS_FN" = "$CUR_DEAD_REVIEWERS_FN" ]; then
-  ok "close_dead_reviewer_verdicts() body is byte-for-byte unchanged vs main (ga-g4m18 untouched)"
+if [ -n "$CUR_DEAD_REVIEWERS_FN" ] \
+    && printf '%s\n' "$CUR_DEAD_REVIEWERS_FN" | grep -qF 'close_gate_verdict "$v_id"' \
+    && ! printf '%s\n' "$CUR_DEAD_REVIEWERS_FN" | grep -E 'bd[[:space:]]+-C[[:space:]]+"\$GC_CITY"[[:space:]]+close[[:space:]]' | grep -vq '^[[:space:]]*#'; then
+  ok "close_dead_reviewer_verdicts() closes through close_gate_verdict and has no bare 'bd close' (ga-9ophv2 — a refused close on an assigned verdict is no longer hidden)"
 else
-  bad "close_dead_reviewer_verdicts() body differs from main — should be untouched by this fix"
+  bad "close_dead_reviewer_verdicts() is missing, does not call close_gate_verdict, or still has a bare 'bd close'"
 fi
 
 echo "── 8. REGRESSION: Step 0b.1/0b.2 decision functions (ga-u07fn/ga-qtc16) are untouched ──"

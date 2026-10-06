@@ -6223,6 +6223,9 @@ gate_finish_bead_already_closed() {
     bd -C "$GC_CITY" comment "$run_id" "Gate run ended without a verdict on the code (ga-5w2gpw): source bead ${bead_id} was already closed ${when_txt}. Branch ${branch} NOT merged; marker ${marker_id} closed as superseded. This is NOT a FAIL." 2>/dev/null || true
     set_gate_status "$run_id" "superseded" || true
     bd -C "$GC_CITY" close "$run_id" -r "gate-run superseded (terminal) — source bead ${bead_id} already closed, branch NOT merged (ga-5w2gpw); marker ${marker_id} closed as superseded." 2>/dev/null || true
+    # ga-9ophv2: this run was already being reviewed (the "late" re-check runs after the reviewers), so its pareceres exist and
+    # are assigned — a closed run leaves none open behind it. Silent-skips when the run did not actually read closed.
+    close_open_run_verdicts "$run_id" "source bead already closed (ga-5w2gpw)" || true
   fi
   if [ -n "${QG_LOG:-}" ]; then
     mkdir -p "$(dirname "$QG_LOG")" 2>/dev/null || true
@@ -6481,6 +6484,9 @@ supersede_sibling_runs() {
       bd -C "$GC_CITY" comment "$sibling_id" "Dispatcher: gate-run superseded proactively on terminal path (marker $this_marker reached terminal; branch $branch). No need to wait for 90m TTL fallback. (ga-tmug Vector B)" 2>/dev/null || true
       # ga-jhyu: CLOSE at terminal so wisp-compact reaps it (was relabel-only → OPEN forever).
       bd -C "$GC_CITY" close "$sibling_id" -r "gate-run superseded (terminal) — marker $this_marker reached terminal. Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
+      # ga-9ophv2: a superseded sibling can have live reviewers on it; its verdicts are never read again (and a reviewer that
+      # resumes on an open assigned verdict would burn a review on a dead run — ga-9as9h), so close them with the run.
+      close_open_run_verdicts "$sibling_id" "sibling superseded, marker $this_marker terminal" || true
     fi
   done
 }
@@ -8632,7 +8638,8 @@ fi
       bd -C "$GC_CITY" comment "$GATE_RUN_ID" "Gate PASSED. Branch $BRANCH merged to $DEFAULT_BRANCH. SHA=$MERGE_SHA. Tier=$TIER. Reviewers=$REQUIRED_REVIEWERS. Elapsed=${ELAPSED_S}s. mode=${MERGE_RESULT}." 2>/dev/null || true
       # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
       bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: PASSED (branch $BRANCH sha=$MERGE_SHA). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-      # ga-9ophv2: a closed run leaves no open parecer behind (reviewer sessions were closed in Step 9).
+      # ga-9ophv2: a closed run leaves no open parecer behind. Step 9 tries to close the reviewer sessions, but that is
+      # best-effort (`gc session close … || true`), so this does not rely on it: a verdict still open here is force-closed.
       close_open_run_verdicts "$GATE_RUN_ID" "terminal PASSED" || true
     fi
 
@@ -9664,7 +9671,8 @@ Blocking reasons:
 $(echo -e "$FAIL_REASONS")" 2>/dev/null || true
     # ga-jhyu: CLOSE the gate-run at terminal so wisp-compact reaps it.
     bd -C "$GC_CITY" close "$GATE_RUN_ID" -r "gate-run terminal: FAILED (branch $BRANCH). Closed by dispatcher (ga-jhyu)." 2>/dev/null || true
-    # ga-9ophv2: a closed run leaves no open parecer behind (reviewer sessions were closed in Step 9).
+    # ga-9ophv2: a closed run leaves no open parecer behind. Step 9 tries to close the reviewer sessions, but that is
+    # best-effort (`gc session close … || true`), so this does not rely on it: a verdict still open here is force-closed.
     close_open_run_verdicts "$GATE_RUN_ID" "terminal FAILED" || true
   fi
 
@@ -14328,6 +14336,9 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
       bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard, pre-rebase check)." 2>/dev/null || true
       bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
+      # ga-9ophv2: this sibling is being REVIEWED (that is why its sha is stale), so its pareceres exist and are assigned;
+      # nothing reads them once the run is superseded — close them with it instead of leaving them for a reaper.
+      close_open_run_verdicts "$SIBLING_RUN_ID" "sibling superseded — reviewing an outdated commit (ga-l7mvtw)" || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
@@ -14335,6 +14346,9 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
       bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded as STALE (> ${SIBLING_RUN_STALE_MINUTES}m — dispatcher died mid-run) so a fresh gate-run for branch $BRANCH can take over. (ga-dupnv live-sibling guard, pre-rebase check)" 2>/dev/null || true
       bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (stale sibling) — fresh run for branch $BRANCH takes over. (ga-dupnv)" 2>/dev/null || true
+      # ga-9ophv2: a stale sibling is a run whose dispatcher died mid-review — exactly the run that leaves assigned pareceres
+      # behind. Close them with it (the guard's reapers would otherwise wait for the reviewer to be confirmed dead).
+      close_open_run_verdicts "$SIBLING_RUN_ID" "stale sibling superseded (ga-dupnv)" || true
       ;;
   esac
 fi
@@ -16642,6 +16656,9 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
       bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded — reviewing a commit branch $BRANCH has since moved past (tip is now $BRANCH_SHA). A fresh gate-run takes over (ga-l7mvtw live-sibling SHA guard)." 2>/dev/null || true
       bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (reviewing outdated commit; branch moved to $BRANCH_SHA) — fresh run for branch $BRANCH takes over. (ga-l7mvtw)" 2>/dev/null || true
+      # ga-9ophv2: this sibling is being REVIEWED (that is why its sha is stale), so its pareceres exist and are assigned;
+      # nothing reads them once the run is superseded — close them with it instead of leaving them for a reaper.
+      close_open_run_verdicts "$SIBLING_RUN_ID" "sibling superseded — reviewing an outdated commit (ga-l7mvtw)" || true
       ;;
     "STALE "*)
       SIBLING_RUN_ID="${SIBLING_VERDICT#STALE }"
@@ -16649,6 +16666,9 @@ if [ "${GATE_SIBLING_GUARD_ENABLED:-1}" = "1" ]; then
       set_gate_status "$SIBLING_RUN_ID" "superseded" 2>/dev/null || true
       bd -C "$GC_CITY" comment "$SIBLING_RUN_ID" "Dispatcher: superseded as STALE (> ${SIBLING_RUN_STALE_MINUTES}m — dispatcher died mid-run) so a fresh gate-run for branch $BRANCH can take over. (ga-dupnv live-sibling guard)" 2>/dev/null || true
       bd -C "$GC_CITY" close "$SIBLING_RUN_ID" -r "gate-run superseded (stale sibling) — fresh run for branch $BRANCH takes over. (ga-dupnv)" 2>/dev/null || true
+      # ga-9ophv2: a stale sibling is a run whose dispatcher died mid-review — exactly the run that leaves assigned pareceres
+      # behind. Close them with it (the guard's reapers would otherwise wait for the reviewer to be confirmed dead).
+      close_open_run_verdicts "$SIBLING_RUN_ID" "stale sibling superseded (ga-dupnv)" || true
       ;;
   esac
 fi

@@ -4121,9 +4121,11 @@ gate_pick_oldest_marker() {
 # 05/10, each paging the Mayor "Agente travado". It only hit parecers that already had
 # a reviewer assigned; the ones that closed fine (ga-p3lle9, ga-txiwnn) were unassigned.
 # --force is the correct override HERE and only here: every caller has already
-# decided that reviewer is finished (REQUEUED/TIMEOUT, run closed, reviewer session
-# closed in Step 9, or confirmed drained), so a still-"live" assignee is moot — the
-# same premise ga-hwjrlq's reaper documents.
+# decided this verdict can never matter again — it is parked REQUEUED/TIMEOUT, or its
+# gate-run is terminal (nothing downstream reads a closed run's verdicts, not even a
+# live reviewer's late one: the ga-hgsqg premise), or its reviewer is confirmed dead
+# or drained — so a still-"live" assignee is moot. The same premise ga-hwjrlq's reaper
+# documents, and the one gate-recovery-watchdog.py already acts on (ga-o2dlg8).
 # The failure is now NAMED (bd's own stderr) and the effect is checked, not assumed.
 # Callers supply log/warn (the dispatcher and the live guard both define them).
 # SELFTEST-EXTRACT close-gate-verdict-fns: BEGIN
@@ -4137,26 +4139,43 @@ close_gate_verdict() {
     return 1
   fi
   # rc=0 is a claim, not a fact (a write can report success without persisting).
-  # Three states: closed / still open / unreadable. Only a readable NOT-closed is a failure.
-  if _st=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null); then
-    if [ -n "$_st" ] && [ "$_st" != "closed" ]; then
-      warn "ga-9ophv2: bd close of verdict bead $_vb returned success but the bead reads status='$_st' — it stays open."
-      return 1
-    fi
-  fi
+  # Three states: closed / still open / unreadable. Only a readable NOT-closed is a failure;
+  # an unreadable read-back is not "closed" either, so it is said out loud — never silent.
+  _st=$(bd -C "$GC_CITY" show "$_vb" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null) || _st=""
+  case "$_st" in
+    closed) ;;
+    "")     log "ga-9ophv2: verdict bead $_vb: bd close returned success but the bead could not be read back — closed per bd's rc, UNVERIFIED." ;;
+    *)      warn "ga-9ophv2: bd close of verdict bead $_vb returned success but the bead reads status='$_st' — it stays open."
+            return 1 ;;
+  esac
   return 0
 }
 
-# close_open_run_verdicts <gate_run_id> <why> — when a gate-run is closed by ANY path,
-# close every verdict bead of that run that is still not closed. Acceptance of ga-9ophv2:
-# a closed run never leaves an open parecer behind. Returns 0 when nothing was left
-# open or everything left open was closed; 1 when a close failed OR the run's verdicts
-# could not be listed (unreadable is NOT "none" — the guard's Step 0b reapers are the
-# backstop for what this misses). No --status on the query: an in_progress verdict is
-# exactly the shape this exists for (same note as the guard's Step 0b.1). --limit 0: ga-21kmp.
+# close_open_run_verdicts <gate_run_id> <why> — the net the DISPATCHER runs right after it
+# closes a gate-run: close every verdict bead of that run still not closed (ga-9ophv2).
+# Coverage is per PATH, not a blanket promise, and selftest section 8 locks it:
+#   * every dispatcher close of a gate-run is followed by this net;
+#   * every guard close of a gate-run is followed by the guard's own cascade
+#     (close_pending_verdicts_for_run / close_dead_reviewer_verdicts — both close through
+#     close_gate_verdict), or is a run with 0 verdict beads by construction (ga-jfo7);
+#   * gate-recovery-watchdog.py has its own forced cascade (ga-9as9h / ga-o2dlg8).
+# Anything that still slips through is mopped by the guard's Step 0b reapers (u07fn, hwjrlq).
+# It acts only on a run that READS closed: the callers close the run with `2>/dev/null || true`,
+# and a parecer force-closed under a run that is in fact still open is the ga-fi1dh hazard (the
+# run is then judged with no verdict). Closed / still open / unreadable are three states; only
+# "closed" proceeds, the other two leave the pareceres to the reapers.
+# Returns 0 when nothing was left open or everything left open was closed; 1 when a close
+# failed, the run did not read closed, OR the run's verdicts could not be listed (unreadable is
+# NOT "none"). No --status on the query: an in_progress verdict is exactly the shape this exists
+# for (same note as the guard's Step 0b.1). --limit 0: ga-21kmp.
 close_open_run_verdicts() {
-  local _run="$1" _why="$2" _json _ids _vb _closed=0 _failed=0
+  local _run="$1" _why="$2" _json _ids _vb _rst _closed=0 _failed=0
   case "$_run" in ''|unknown) return 0 ;; esac
+  _rst=$(bd -C "$GC_CITY" show "$_run" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null) || _rst=""
+  if [ "$_rst" != "closed" ]; then
+    warn "ga-9ophv2: gate-run $_run reads status='${_rst:-unreadable}', not closed — its verdict beads are NOT force-closed (they would sit under a run that may still be live); the guard's Step 0b reapers pick up any leftover once the run is terminal."
+    return 1
+  fi
   if ! _json=$(bd -C "$GC_CITY" list --json --limit 0 -l type:quality-gate-verdict -l "gate-run:$_run" 2>/dev/null); then
     warn "ga-9ophv2: could not list the verdict beads of gate-run $_run — not assuming it has none; the guard's Step 0b reapers will pick up any leftover."
     return 1
@@ -4535,22 +4554,37 @@ reviewers_alive_for_run() {
 # one live Dolt round-trip since this always runs in the same loop iteration,
 # right after reviewers_alive_for_run's own call for the same $gr_id.
 #
+# ga-9ophv2: every verdict this closes is ASSIGNED by construction (the paragraph above: all
+# of them belong to dead sessions), and `bd close` refuses a close from a non-assignee. The
+# plain `bd close … 2>/dev/null || true` that stood here left them in_progress with no trace
+# — close_gate_verdict forces it, names bd's own error, and reads the effect back. The
+# "cascade-closed" comment is posted only AFTER the close is verified (it used to be posted
+# first, so a refused close left a thread claiming a close that never happened — the shape
+# gate-recovery-watchdog.py fixed in ga-o2dlg8). A failed LIST is warned, not read as "none";
+# it returns 0 on purpose: this guard runs under `set -e` and the reapers are the backstop.
+#
 # (Live section only — uses bd/gc; never called in lib-only mode. The pure
 # projection it depends on, open_verdict_ids_from_json, lives above the
 # GATE_GUARD_LIB_ONLY cutoff and IS selftest-exercised directly.)
+# SELFTEST-EXTRACT close-dead-reviewer-verdicts-fn: BEGIN
 close_dead_reviewer_verdicts() {
   local gr_id="$1" vbs ids v_id
   [ -z "$gr_id" ] && return
-  vbs=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --all \
-    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
+  if ! vbs=$(bash "$GC_CITY/scripts/bd-list-cached.sh" -C "$GC_CITY" list --json --all \
+    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null); then
+    warn "ga-9ophv2: could not list the verdict beads of gate-run $gr_id (dead-reviewer cascade) — not assuming it has none; the guard's Step 0b reapers pick up any leftover."
+    return 0
+  fi
   ids=$(open_verdict_ids_from_json "$vbs")
   [ -z "$ids" ] && return
   for v_id in $ids; do
     [ -z "$v_id" ] && continue
-    bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-g4m18): cascade-closed — parent gate-run $gr_id was superseded (dead reviewer, no live session assigned to this verdict). Self-healed by guard." 2>/dev/null || true
-    bd -C "$GC_CITY" close "$v_id" -r "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id superseded, dead reviewer. Closed by guard (ga-g4m18)." 2>/dev/null || true
+    if close_gate_verdict "$v_id" "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id superseded, dead reviewer. Closed by guard (ga-g4m18)."; then
+      bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-g4m18): cascade-closed — parent gate-run $gr_id was superseded (dead reviewer, no live session assigned to this verdict). Self-healed by guard." 2>/dev/null || true
+    fi
   done
 }
+# SELFTEST-EXTRACT close-dead-reviewer-verdicts-fn: END
 
 # close_pending_verdicts_for_run <gate_run_id> <reason_text> — I/O helper (ga-hgsqg).
 # Generic sibling of close_dead_reviewer_verdicts above (ga-g4m18, wired only
@@ -4604,6 +4638,14 @@ close_dead_reviewer_verdicts() {
 # reads the shim exists to de-duplicate, so there's no real efficiency cost
 # to staying directly testable.
 #
+# ga-9ophv2: "UNCONDITIONAL on the verdict's own assignee" above was true of the DECISION and
+# false of the CLOSE — `bd close` refuses a non-assignee, and the plain `bd close … 2>/dev/null
+# || true` that stood here hid it, so a verdict with a live (or dead) reviewer assigned stayed
+# in_progress under a run this function had just been told was terminal. Now it goes through
+# close_gate_verdict (forced, bd's own error in the WARN, effect read back), and the
+# "cascade-closed" comment follows a VERIFIED close only. A failed LIST is warned, not read as
+# "none"; it returns 0 on purpose (guard runs under `set -e`; the reapers are the backstop).
+#
 # (Live section only — uses bd; never called in lib-only mode. The pure
 # projection it depends on, open_verdict_ids_from_json, lives above the
 # GATE_GUARD_LIB_ONLY cutoff and IS selftest-exercised directly.)
@@ -4611,14 +4653,18 @@ close_dead_reviewer_verdicts() {
 close_pending_verdicts_for_run() {
   local gr_id="$1" reason="$2" vbs ids v_id
   [ -z "$gr_id" ] && return
-  vbs=$(bd -C "$GC_CITY" list --json --all --limit 0 \
-    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null || echo "[]")
+  if ! vbs=$(bd -C "$GC_CITY" list --json --all --limit 0 \
+    -l type:quality-gate-verdict -l "gate-run:$gr_id" 2>/dev/null); then
+    warn "ga-9ophv2: could not list the verdict beads of gate-run $gr_id (cascade: $reason) — not assuming it has none; the guard's Step 0b reapers pick up any leftover."
+    return 0
+  fi
   ids=$(open_verdict_ids_from_json "$vbs")
   [ -z "$ids" ] && return
   for v_id in $ids; do
     [ -z "$v_id" ] && continue
-    bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-hgsqg): cascade-closed — parent gate-run $gr_id closed ($reason). Self-healed by guard." 2>/dev/null || true
-    bd -C "$GC_CITY" close "$v_id" -r "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id closed ($reason). Closed by guard (ga-hgsqg)." 2>/dev/null || true
+    if close_gate_verdict "$v_id" "quality-gate-verdict orphaned (terminal) — parent gate-run $gr_id closed ($reason). Closed by guard (ga-hgsqg)."; then
+      bd -C "$GC_CITY" comment "$v_id" "Vector B (ga-hgsqg): cascade-closed — parent gate-run $gr_id closed ($reason). Self-healed by guard." 2>/dev/null || true
+    fi
   done
 }
 # SELFTEST-EXTRACT close-pending-verdicts-for-run-fn: END
@@ -4795,7 +4841,7 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
             log "  Vector B (ga-jfo7): healthy backlog/Dolt-hot defer, nothing stuck — marker $COMPANION_MARKER_ID stays queued and will be reviewed normally; closing $GR_ID (its claim-time tracking bead only — 0 verdict beads, no reviewer was ever attached; marker age=${MARKER_AGE}m)."
             set_gate_status "$GR_ID" "superseded"
             bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-jfo7): orphan claim-time tracking bead closed — 0 verdict beads (no reviewer was ever attached to THIS bead's id) and companion marker $COMPANION_MARKER_ID is still healthily queued. Self-healed by guard." 2>/dev/null || true
-            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — 0-verdict orphan tracking bead, marker still queued. Closed by guard (ga-jfo7)." 2>/dev/null || true
+            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — 0-verdict orphan tracking bead, marker still queued. Closed by guard (ga-jfo7)." 2>/dev/null || true  # verdict-net-ok: ZV_TOTAL=0 (a confirmed count; unreadable defaults to 1) — this run has no verdict beads
             CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID"
             continue
             ;;
@@ -4803,7 +4849,7 @@ if [ "$GATE_RUN_COUNT" -gt 0 ]; then
             warn "Vector B (ga-jfo7): gate-run $GR_ID stuck (gate-run age=${GR_AGE}m, marker-state age=${MARKER_AGE}m, 0 verdict beads, marker $COMPANION_MARKER_ID stranded at gate-status:${MARKER_STATUS} — dispatcher died before ever creating its own run). Closing + re-queuing marker."
             set_gate_status "$GR_ID" "superseded"
             bd -C "$GC_CITY" comment "$GR_ID" "Vector B (ga-jfo7): reviewer-AWOL — 0 verdict beads were ever created and marker was stranded at gate-status:${MARKER_STATUS} (dispatcher died before Step 6/7). Closing this run and re-queuing the marker for a fresh dispatcher attempt. Self-healed by guard." 2>/dev/null || true
-            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — reviewer-AWOL, 0 verdict beads, marker re-queued. Closed by guard (ga-jfo7)." 2>/dev/null || true
+            bd -C "$GC_CITY" close "$GR_ID" -r "gate-run superseded (terminal) — reviewer-AWOL, 0 verdict beads, marker re-queued. Closed by guard (ga-jfo7)." 2>/dev/null || true  # verdict-net-ok: ZV_TOTAL=0 (a confirmed count; unreadable defaults to 1) — this run has no verdict beads
             CLOSED_THIS_SWEEP_IDS="$CLOSED_THIS_SWEEP_IDS $GR_ID"
             set_gate_status "$COMPANION_MARKER_ID" "queued"
             bd -C "$GC_CITY" comment "$COMPANION_MARKER_ID" "Vector B (ga-jfo7): re-queued — the prior gate-run attempt died with 0 verdict beads ever created (reviewer-AWOL). A fresh dispatcher sweep will retry this branch." 2>/dev/null || true
