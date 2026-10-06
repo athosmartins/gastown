@@ -919,7 +919,8 @@ class _Holder:
         self.probes = 0
         self.assigns = []
         self.assign_ok = True
-        self.readback = "echo"         # "echo" = the last assignee written; None = unreadable
+        self.readback = "echo"         # AFTER an assign: "echo" = what was written; None = unreadable
+        self.before = ""               # the fresh read BEFORE writing: "" = nobody, None = unreadable
         self.events = []
 
 
@@ -942,8 +943,11 @@ def holder(writes, monkeypatch):
         return h.assign_ok
 
     def _read(_root, _bead_id):
+        h.events.append(("read", None))
+        if not h.assigns:
+            return h.before
         if h.readback == "echo":
-            return h.assigns[-1][1] if h.assigns else ""
+            return h.assigns[-1][1]
         return h.readback
 
     monkeypatch.setattr(asr, "_bd_label_add", _add)
@@ -1103,6 +1107,50 @@ def test_a_holder_step_that_raises_costs_the_route_nothing(writes, holder, monke
     assert holder.assigns == []
     assert "erro interno" in _pergunta(writes)
     assert "NOT confirmed" in writes.notes[0]
+
+
+def test_an_assign_that_raises_costs_the_route_nothing_and_is_flagged(writes, holder,
+                                                                      monkeypatch):
+    holder.live = frozenset({_DIGO})
+
+    def _boom(_root, _bead_id, _who):
+        raise OSError("bd vanished")
+
+    monkeypatch.setattr(asr, "_bd_assign", _boom)
+    _route(_park(), writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+    assert ("wa-2362s2.2", "story:approved") in writes.removes
+    assert "desconhecido" in _pergunta(writes)
+    assert "NOT confirmed" in writes.notes[0]
+
+
+def test_somebody_who_took_the_bead_since_the_sweep_is_not_overwritten(writes, holder):
+    """The bead dict is minutes old. `bd assign` would silently replace whoever holds it
+    now (the Mayor restoring the crew by hand is the very incident) - so the assignee is
+    read fresh right before the write."""
+    holder.live = frozenset({_DIGO})
+    holder.before = "peter-wa-gawispafn2dc"
+    _route(_park(), writes)
+    assert holder.assigns == [], holder.assigns
+    assert "peter-wa-gawispafn2dc" in _pergunta(writes) and "mantido" in _pergunta(writes)
+    assert "NOT confirmed" not in writes.notes[0], writes.notes
+
+
+def test_an_assignee_that_cannot_be_read_before_writing_is_never_overwritten(writes, holder):
+    """Could not look != nobody is there: the write is skipped, and the Pergunta says why."""
+    holder.live = frozenset({_DIGO})
+    holder.before = None
+    _route(_park(), writes)
+    assert holder.assigns == [], holder.assigns
+    assert "antes de gravar" in _pergunta(writes), _pergunta(writes)
+    assert ("wa-2362s2.2", "next-action:mayor") in writes.adds
+
+
+def test_the_fresh_read_happens_between_the_label_and_the_write(writes, holder):
+    holder.live = frozenset({_DIGO})
+    _route(_park(), writes)
+    kinds = [e[0] for e in holder.events]
+    assert kinds.index("label+") < kinds.index("read") < kinds.index("assign"), holder.events
 
 
 def test_dry_run_assigns_nothing_and_asks_nobody(writes, holder, monkeypatch):

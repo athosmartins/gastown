@@ -1933,35 +1933,49 @@ def _park_holder(bead):
 
 def _settle_park_holder(rig_root, bead, bead_id):
     """Carry out _park_holder's decision for a route that already landed.
-    → (what the "Pergunta:" says about who holds the bead, assignee-unconfirmed?).
+    -> (what the "Pergunta:" says about who holds the bead, assignee-unconfirmed?).
 
     The route (label, story:approved, audit comment) is done and its cooldown is about to be
-    set, so nothing here may cost it its "Pergunta:": a decision that raises, an assign that
-    fails, or a read-back that disagrees all come back as a note + unconfirmed=True, never as
-    an exception and never as a success report that was not checked (ga-n7hu2/ga-p5q3: the
-    rc of a write is not the effect of a write — re-read the bead)."""
+    set, so nothing here may cost it its "Pergunta:": whatever goes wrong - a decision that
+    raises, an assign that fails or raises, a read-back that disagrees - comes back as a note
+    + unconfirmed=True, never as an exception and never as a success report that was not
+    checked (ga-n7hu2/ga-p5q3: the rc of a write is not the effect of a write - re-read the
+    bead).
+
+    The bead dict is from the sweep's fetch, minutes old by the time it is routed, and
+    `bd assign` overwrites any assignee that is not a live in_progress claim. So right before
+    writing, the assignee is read FRESH: somebody holds it now -> kept; the read failed ->
+    nothing is written (can't-know is not "nobody")."""
     try:
         action, who, note = _park_holder(bead)
+        if action != "assign":
+            _log("  holder %s for %s: %s" % (action, bead_id, note))
+            return note, False
+        before = _read_assignee(rig_root, bead_id)
+        if before is None:
+            _log("  holder for %s: could not re-read the assignee before writing - not assigning"
+                 % bead_id)
+            return ("não consegui reler o assignee antes de gravar (o autor %s está vivo) — "
+                    "nada foi atribuído por palpite" % who), False
+        if before:
+            _log("  holder for %s: %s took it since the sweep fetched it - kept" % (bead_id, before))
+            return "assignee atual (%s) mantido — apareceu depois da leitura da varredura" % before, False
+        if not _do_assign(rig_root, bead_id, who):
+            _log("  WARN: assign %s -> %s FAILED - the bead keeps no assignee" % (bead_id, who))
+            return ("tentei atribuir a bead ao autor (%s) e o bd falhou — ficou sem assignee"
+                    % who), True
+        seen = _read_assignee(rig_root, bead_id)
+        if seen == who:
+            _log("  assigned %s to its live author %s (re-read confirms)" % (bead_id, who))
+            return note, False
+        if seen is None:
+            return ("atribuí a bead ao autor (%s), mas não consegui reler o assignee para "
+                    "confirmar" % who), True
+        return "atribuí a bead ao autor (%s), mas o bd mostra assignee '%s'" % (who, seen), True
     except Exception as e:
-        _log("WARN: holder decision for %s raised %r — the bead is left exactly as it was"
-             % (bead_id, e))
-        return ("não consegui decidir o assignee (erro interno do reconciler) — nada foi "
-                "tocado"), True
-    if action != "assign":
-        _log("  holder %s for %s: %s" % (action, bead_id, note))
-        return note, False
-    if not _do_assign(rig_root, bead_id, who):
-        _log("  WARN: assign %s -> %s FAILED — the bead keeps no assignee" % (bead_id, who))
-        return ("tentei atribuir a bead ao autor (%s) e o bd falhou — ficou sem assignee"
-                % who), True
-    seen = _read_assignee(rig_root, bead_id)
-    if seen == who:
-        _log("  assigned %s to its live author %s (re-read confirms)" % (bead_id, who))
-        return note, False
-    if seen is None:
-        return ("atribuí a bead ao autor (%s), mas não consegui reler o assignee para "
-                "confirmar" % who), True
-    return "atribuí a bead ao autor (%s), mas o bd mostra assignee '%s'" % (who, seen), True
+        _log("WARN: holder step for %s raised %r - the assignee state is UNKNOWN" % (bead_id, e))
+        return ("erro interno do reconciler ao decidir/gravar o assignee — o estado dele é "
+                "desconhecido, confira a bead"), True
 
 
 def _route_bead(rig_root, bead, route_to, signal, now, state):
