@@ -35,15 +35,30 @@
 #   cadence stays at the old 20s. Raise CONFIG_DRIFT_HEARTBEAT_DUTY_PCT to trade slot
 #   availability for a tighter backstop. File-change reloads use a looser cap
 #   (FILE_MAX_SLOT_DUTY_PCT, default 50) so an editing burst cannot monopolise the slot
-#   either, while drift from a known change is still accepted promptly.
+#   either. A known change is requested as soon as the slot is free and the file cooldown
+#   has passed: at once when the slot is idle, but behind one of OUR OWN reloads it waits
+#   that reload's remaining hold plus the file cooldown (up to ~2*D, ~20 min at D=600s).
 #
 # SAFETY NOTES:
 #   - At most ONE reload of this watcher is in flight at any time; the watcher never
 #     probes the slot with a second request (a probe that is accepted just becomes
-#     another reload holding the slot).
-#   - If another caller's reload holds the slot, the heartbeat treats it as covering the
-#     current drift (it is --soft for every caller in this city) and waits one cooldown.
-#     A pending FILE change instead keeps retrying every FILE_RETRY_WAIT seconds.
+#     another reload holding the slot). The watchdog kills a hung client's whole process
+#     tree; a process that survives SIGKILL is logged as leaked, never as killed.
+#   - If another caller's reload holds the slot, the heartbeat does NOT assume that reload
+#     covers the current drift (it may be a hard reload, or have been accepted before the
+#     drift appeared). A refused probe holds nothing, so the heartbeat just retries after
+#     min(cooldown, HEARTBEAT_BUSY_RETRY_MAX). A pending FILE change retries every
+#     FILE_RETRY_WAIT seconds.
+#   - THE THIRD STATE: "I cannot know" must never do what "it was fine" does.
+#       * How long a reload held the slot (unreadable result, wall-clock step) is UNKNOWN,
+#         not 0s: the learned D is left alone and the cooldown assumes
+#         max(D, RELOAD_UNKNOWN_HELD_ASSUMED). A failed client did not hold the slot for D
+#         either, so a failure never overwrites D.
+#       * After a RESTART the watcher cannot know whether files changed while it was down
+#         (delivery kickstarts it right after the deploy git-pull, often before a change is
+#         detected), so the heartbeat embargo is carried over ONLY when the files are
+#         provably unchanged since the last reload that finished OK (that reload's hash is
+#         persisted with the stats). A changed or unknown hash queues a file-change reload.
 #   - Do NOT run bulk symlink migrations on live crew; do it in a maintenance window.
 #
 # Watched paths (for file-change detection):
@@ -198,6 +213,10 @@ RELOAD_CLIENT_TIMEOUT=900     # gc reload --timeout (s): above the controller's 
 RELOAD_WATCHDOG_GRACE=120     # s past the client timeout before a stuck gc client is killed
 FILE_RETRY_WAIT=15            # s between retries of a pending file-change reload
 FILE_MAX_FAIL_RETRIES=3       # non-"busy" failures before a file change is left to the heartbeat
+HEARTBEAT_BUSY_RETRY_MAX=300  # s: cap on the heartbeat's retry after a refusal. A refused probe holds
+                              # nothing, and the holder is not known to cover our drift (see SAFETY NOTES)
+RELOAD_UNKNOWN_HELD_ASSUMED=600  # s a reload of UNKNOWN duration is assumed to have held the slot when no D
+                              # was learned yet: the controller's reloadActiveTTL, the most a slot can be held
 
 # ── Reload scheduling state ───────────────────────────────────────────────────
 prev_hash=""
@@ -208,27 +227,59 @@ last_hooks_check=0
 RELOAD_PID=""             # background "gc reload --soft" of THIS watcher; "" = none in flight
 RELOAD_TRIGGER=""         # heartbeat | file-change
 RELOAD_STARTED=0
+RELOAD_COVERS_HASH=""     # the file hash in force when the in-flight reload was requested
 hb_next_allowed=0         # earliest epoch the next heartbeat reload may start
 file_next_allowed=0       # earliest epoch the next file-change reload may start
 file_fail_count=0
 file_busy_streak=0
-last_reload_secs=0        # D: how long the last reload of ours held the slot
-reload_held_total=0       # sum of D since start (for the duty line in the log)
+last_reload_secs=0        # D: how long the last reload of ours that we could MEASURE held the slot
+reload_held_total=0       # sum of the measured holds since start (for the duty line in the log)
 reload_count=0
+reload_unknown_count=0    # reloads that ran but whose hold time could not be measured
 watcher_started_at=0
 stats_carried_over=false  # true once load_reload_stats read a usable stats file
+covered_hash=""           # file hash the last reload that finished OK was requested against ("" = unknown)
+startup_gap_verdict=""    # what init_watcher_state concluded about the restart gap: unchanged|changed|unknown
+startup_gap_note=""       # the same, in words, for the log
+
+# uint_or_empty <text> — a canonical non-negative integer from untrusted text, or nothing at all
+# (not a number, negative, or too long to be a sane count of seconds). Leading zeros are decimal:
+# "08" is 8, never the octal error that aborts a bash 3.2 arithmetic expansion. Callers test the
+# result with [ -n ] — "not a number" is a THIRD state and must not be confused with 0.
+uint_or_empty() {
+    local v="${1:-}"
+    case "$v" in ''|*[!0-9]*) return 0 ;; esac
+    if (( ${#v} > 12 )); then return 0; fi
+    echo $(( 10#$v ))
+}
+
+# hash_is_known <text> — true for a real file hash. Empty, "-" (the stats file's placeholder) and
+# "hash-error" (compute_hash could not run md5) mean "cannot tell", which is not "no drift".
+hash_is_known() {
+    case "${1:-}" in ''|*[!A-Za-z0-9]*) return 1 ;; esac
+}
+
+# clamp_duty_pct <pct> — the duty percentage slot_cooldown_secs really uses: garbage -> 10, 0 -> 1,
+# above 100 -> 100. One definition, so the startup log prints the decided value, not the raw input.
+clamp_duty_pct() {
+    local duty
+    duty=$(uint_or_empty "${1:-}")
+    [ -n "$duty" ] || duty=10
+    if (( duty < 1 )); then duty=1; fi
+    if (( duty > 100 )); then duty=100; fi
+    echo "$duty"
+}
 
 # slot_cooldown_secs <held_secs> <duty_pct> <floor_secs> — how long to stay off the reload
 # slot after a reload that held it <held_secs>, so the slot is occupied at most <duty_pct>%
 # of the time: held * (100 - duty) / duty, clamped to [floor, HEARTBEAT_MAX_INTERVAL].
-# Garbage input degrades to "no history" (held=0 → floor), never to a division by zero.
+# Garbage input degrades to "no history" (held=0 → floor), never to a division by zero. Callers
+# that can tell "unknown" from "0s" (finish_reload) decide that BEFORE calling this.
 slot_cooldown_secs() {
-    local held="${1:-0}" duty="${2:-10}" floor="${3:-0}" cd
-    case "$held"  in ''|*[!0-9]*) held=0 ;; esac
-    case "$duty"  in ''|*[!0-9]*) duty=10 ;; esac
-    case "$floor" in ''|*[!0-9]*) floor=0 ;; esac
-    if (( duty < 1 )); then duty=1; fi
-    if (( duty > 100 )); then duty=100; fi
+    local held floor duty cd
+    held=$(uint_or_empty "${1:-}");  [ -n "$held" ]  || held=0
+    floor=$(uint_or_empty "${3:-}"); [ -n "$floor" ] || floor=0
+    duty=$(clamp_duty_pct "${2:-}")
     cd=$(( held * (100 - duty) / duty ))
     if (( cd < floor )); then cd=$floor; fi
     if (( cd > HEARTBEAT_MAX_INTERVAL )); then cd=$HEARTBEAT_MAX_INTERVAL; fi
@@ -236,36 +287,112 @@ slot_cooldown_secs() {
 }
 
 # slot_duty_line <now> — "own slot duty since start: X% (N reloads, Ts held / Us up)".
-# The proof, in the log, that this watcher leaves the slot free.
+# The proof, in the log, that this watcher leaves the slot free. Reloads whose hold time could
+# not be measured are counted separately, not folded into the held total as 0s.
 slot_duty_line() {
-    local now="$1" up pct
+    local now="$1" up pct unk=""
     up=$(( now - watcher_started_at ))
     if (( up < 1 )); then up=1; fi
     pct=$(( reload_held_total * 100 / up ))
-    echo "own slot duty since start: ${pct}% (${reload_count} reloads, ${reload_held_total}s held / ${up}s up)"
+    if (( reload_unknown_count > 0 )); then unk=", ${reload_unknown_count} of unknown duration not counted as held"; fi
+    echo "own slot duty since start: ${pct}% (${reload_count} reloads, ${reload_held_total}s held / ${up}s up${unk})"
 }
 
+# save_reload_stats — "<D> <heartbeat embargo epoch> <covered hash>" (one line, atomic). The hash is
+# what the last reload that finished OK was requested against; "-" when unknown.
 save_reload_stats() {
     mkdir -p "$STATE_DIR" 2>/dev/null || return 0
-    printf '%s %s\n' "$last_reload_secs" "$hb_next_allowed" > "$RELOAD_STATS_FILE.tmp" 2>/dev/null \
+    local h="-"
+    if hash_is_known "$covered_hash"; then h=$covered_hash; fi
+    printf '%s %s %s\n' "$last_reload_secs" "$hb_next_allowed" "$h" > "$RELOAD_STATS_FILE.tmp" 2>/dev/null \
         && mv "$RELOAD_STATS_FILE.tmp" "$RELOAD_STATS_FILE" 2>/dev/null || true
 }
 
-# load_reload_stats <now> — carry D and the heartbeat embargo across restarts: every delivery
-# restarts this daemon, and a fresh process must not forget the slot was just held for minutes.
+# load_reload_stats <now> — carry D across restarts, and decide what the restart gap may have
+# dropped. Needs prev_hash (the hash of the tree as it is NOW) to be set already.
+#
+# A fresh process cannot know whether files changed while the old one was down, or while a
+# file-change reload was still pending (slot busy / our own reload in flight). So:
+#   * the saved hash is known AND equals the current one -> nothing changed since the last reload
+#     that finished OK: carry the heartbeat embargo too (a restart must not re-open the slot to
+#     the watcher: every delivery restarts this daemon);
+#   * known but different -> the files changed in the gap: queue a file-change reload NOW and do
+#     not carry the embargo (it would suppress the very backstop that covers this);
+#   * absent / unreadable / legacy format / hash-error -> UNKNOWN. Not "covered": same as changed.
 load_reload_stats() {
-    local now="$1" line a b
-    [ -r "$RELOAD_STATS_FILE" ] || return 0
-    line=$(head -1 "$RELOAD_STATS_FILE" 2>/dev/null) || return 0
-    a=""; b=""
-    read -r a b <<< "$line"
-    case "$a" in ''|*[!0-9]*) return 0 ;; esac
-    case "$b" in ''|*[!0-9]*) return 0 ;; esac
-    last_reload_secs=$a
-    stats_carried_over=true
-    if (( b > hb_next_allowed && b <= now + HEARTBEAT_MAX_INTERVAL )); then
-        hb_next_allowed=$b
+    local now="$1" line="" a="" b="" c="" d_saved emb_saved
+    covered_hash=""
+    if [ -r "$RELOAD_STATS_FILE" ]; then
+        line=$(head -1 "$RELOAD_STATS_FILE" 2>/dev/null) || line=""
+        read -r a b c <<< "$line"
     fi
+    d_saved=$(uint_or_empty "$a")
+    emb_saved=$(uint_or_empty "$b")
+    if [ -n "$d_saved" ]; then
+        last_reload_secs=$d_saved
+        stats_carried_over=true
+    fi
+    if hash_is_known "$c"; then covered_hash=$c; fi
+
+    if hash_is_known "$prev_hash" && [ -n "$covered_hash" ] && [ "$covered_hash" = "$prev_hash" ]; then
+        startup_gap_verdict=unchanged
+        startup_gap_note="files unchanged since the last reload that finished OK (hash ${covered_hash}) — heartbeat embargo carried over"
+        if [ -n "$emb_saved" ] && (( emb_saved > hb_next_allowed && emb_saved <= now + HEARTBEAT_MAX_INTERVAL )); then
+            hb_next_allowed=$emb_saved
+        fi
+        return 0
+    fi
+    if hash_is_known "$prev_hash" && [ -n "$covered_hash" ]; then
+        startup_gap_verdict=changed
+        startup_gap_note="files changed since the last reload that finished OK (was ${covered_hash}, now ${prev_hash}) — file-change reload queued, heartbeat embargo NOT carried over"
+    else
+        startup_gap_verdict=unknown
+        startup_gap_note="no usable record of what the last reload covered (stats '${RELOAD_STATS_FILE}', hash now '${prev_hash:-none}') — assuming NOT covered: file-change reload queued, heartbeat embargo NOT carried over"
+    fi
+    pending_reload=true
+    last_change_time=$(( now - DEBOUNCE_WINDOW ))
+}
+
+# init_watcher_state <now> — daemon startup, as a function so the selftest can replay the restart
+# gap with a fake clock (this logic used to sit below the library guard, out of its reach).
+init_watcher_state() {
+    local now="$1"
+    watcher_started_at=$now
+    prev_hash=$(compute_hash)
+    last_beat_time=$now
+    hb_next_allowed=$(( now + HEARTBEAT_INTERVAL ))
+    load_reload_stats "$now"
+}
+
+# descendants_of <pid> — every descendant of <pid>, depth first (children before their parent's
+# next sibling), one per line. A snapshot: take it BEFORE killing, while the tree is intact.
+descendants_of() {
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null); do
+        echo "$c"
+        descendants_of "$c"
+    done
+}
+
+# kill_process_tree <pid> — SIGTERM <pid> and every descendant, then SIGKILL what is still alive a
+# second later. Prints the pids that SURVIVED SIGKILL (nothing when all are dead), so the caller
+# can say "killed" only when it is true. Killing just the wrapper subshell leaves the gc client
+# orphaned (ga-mc42px gate FAIL 1/3): the client is a grandchild of the runner.
+kill_process_tree() {
+    local root="$1" pids p alive=""
+    pids="$(descendants_of "$root") $root"
+    for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+    sleep 1
+    for p in $pids; do
+        if kill -0 "$p" 2>/dev/null; then
+            kill -KILL "$p" 2>/dev/null || true
+        fi
+    done
+    sleep 0.2
+    for p in $pids; do
+        if kill -0 "$p" 2>/dev/null; then alive="${alive:+$alive }$p"; fi
+    done
+    echo "$alive"
 }
 
 # start_reload <trigger> <now> — fire "gc reload --soft" in the background. It is the
@@ -279,6 +406,7 @@ start_reload() {
     rm -f "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
     RELOAD_TRIGGER="$trigger"
     RELOAD_STARTED=$now
+    RELOAD_COVERS_HASH="$prev_hash"   # what this reload is requested against (see finish_reload)
     log "reload[$trigger] requested — gc reload --soft (sync, in background, timeout ${RELOAD_CLIENT_TIMEOUT}s)"
     (
         t0=$(date +%s)
@@ -304,25 +432,47 @@ start_reload() {
 # finish_reload <trigger> <ok|busy|fail> <held_secs> <rc> <message> <now> — account for a
 # finished reload and schedule what may run next. Pure state update (no process handling),
 # so the selftest can replay an incident timeline through it.
+#
+# <held_secs> is how long the reload ran, or ANYTHING NOT A SANE NUMBER when that is unknown
+# (unreadable result, runner killed, a wall-clock step made it negative or absurd). Unknown is
+# not 0s: D (last_reload_secs) is left alone and the cooldown assumes the worst we know of.
+# A FAILED reload is never a measurement of D either (a client that died in 1s did not hold the
+# slot for the 600s the previous reload did), and only a reload that finished OK is "covered".
 finish_reload() {
-    local trigger="$1" outcome="$2" held="$3" rc="$4" msg="$5" now="$6" hb_cd file_cd retry
-    case "$held" in ''|*[!0-9]*) held=0 ;; esac
+    local trigger="$1" outcome="$2" held_raw="$3" rc="$4" msg="$5" now="$6"
+    local held eff hb_cd file_cd retry held_txt
+    held=$(uint_or_empty "$held_raw")
+    # A reload cannot outlive its own client timeout + the watchdog grace: more is a clock step.
+    if [ -n "$held" ] && (( held > RELOAD_CLIENT_TIMEOUT + RELOAD_WATCHDOG_GRACE )); then held=""; fi
     case "$outcome" in
         ok|fail)
-            last_reload_secs=$held
-            reload_held_total=$(( reload_held_total + held ))
             reload_count=$(( reload_count + 1 ))
-            hb_cd=$(slot_cooldown_secs "$held" "$HEARTBEAT_MAX_SLOT_DUTY_PCT" "$HEARTBEAT_INTERVAL")
-            file_cd=$(slot_cooldown_secs "$held" "$FILE_MAX_SLOT_DUTY_PCT" "$DEBOUNCE_WINDOW")
+            if [ -n "$held" ]; then
+                eff=$held
+                if [ "$outcome" = "ok" ]; then
+                    last_reload_secs=$held
+                elif (( eff > RELOAD_UNKNOWN_HELD_ASSUMED )); then
+                    eff=$RELOAD_UNKNOWN_HELD_ASSUMED    # the controller's TTL: no slot is held longer
+                fi
+                reload_held_total=$(( reload_held_total + eff ))
+                held_txt="${held}s"
+            else
+                eff=$last_reload_secs
+                if (( eff < RELOAD_UNKNOWN_HELD_ASSUMED )); then eff=$RELOAD_UNKNOWN_HELD_ASSUMED; fi
+                reload_unknown_count=$(( reload_unknown_count + 1 ))
+                held_txt="an UNKNOWN time (cooldown assumes ${eff}s; learned D=${last_reload_secs}s left untouched)"
+            fi
+            hb_cd=$(slot_cooldown_secs "$eff" "$HEARTBEAT_MAX_SLOT_DUTY_PCT" "$HEARTBEAT_INTERVAL")
+            file_cd=$(slot_cooldown_secs "$eff" "$FILE_MAX_SLOT_DUTY_PCT" "$DEBOUNCE_WINDOW")
             hb_next_allowed=$(( now + hb_cd ))
             file_next_allowed=$(( now + file_cd ))
             file_busy_streak=0
-            save_reload_stats
             if [ "$outcome" = "ok" ]; then
+                covered_hash="$RELOAD_COVERS_HASH"
                 file_fail_count=0
-                log "reload[$trigger] OK after ${held}s (held the reload slot ${held}s): ${msg:-no output}"
+                log "reload[$trigger] OK, took ${held_txt}: ${msg:-no output}"
             else
-                err "reload[$trigger] FAILED rc=$rc after ${held}s: ${msg:-no output}"
+                err "reload[$trigger] FAILED rc=$rc after ${held_txt}: ${msg:-no output}"
                 if [ "$trigger" = "file-change" ]; then
                     if (( file_fail_count < FILE_MAX_FAIL_RETRIES )); then
                         file_fail_count=$(( file_fail_count + 1 ))
@@ -332,15 +482,17 @@ finish_reload() {
                         file_next_allowed=$(( now + retry ))
                         err "file-change reload will be retried in ${retry}s (failure $file_fail_count/$FILE_MAX_FAIL_RETRIES)"
                     else
-                        err "file-change reload gave up after $FILE_MAX_FAIL_RETRIES failures — the backstop heartbeat will cover it"
+                        err "file-change reload gave up after $FILE_MAX_FAIL_RETRIES failures — left to the backstop heartbeat, which is not due for ${hb_cd}s"
                         file_fail_count=0
                     fi
                 fi
             fi
+            save_reload_stats
             log "next heartbeat reload not before +${hb_cd}s, next file-change reload not before +${file_cd}s; $(slot_duty_line "$now")"
             ;;
         busy)
-            # Someone else's reload holds the slot; we did not take it, so there is no D to learn.
+            # Someone else's reload holds the slot; we did not take it, so there is no D to learn,
+            # and nothing of ours is held. We do not know that holder covers our drift.
             if [ "$trigger" = "file-change" ]; then
                 pending_reload=true
                 file_next_allowed=$(( now + FILE_RETRY_WAIT ))
@@ -350,38 +502,66 @@ finish_reload() {
                 fi
             else
                 hb_cd=$(slot_cooldown_secs "$last_reload_secs" "$HEARTBEAT_MAX_SLOT_DUTY_PCT" "$HEARTBEAT_INTERVAL")
+                if (( hb_cd > HEARTBEAT_BUSY_RETRY_MAX )); then hb_cd=$HEARTBEAT_BUSY_RETRY_MAX; fi
                 hb_next_allowed=$(( now + hb_cd ))
-                log "reload[heartbeat] busy (another reload holds the slot; it covers current drift) — next heartbeat not before +${hb_cd}s"
+                log "reload[heartbeat] busy (another reload holds the slot; not assumed to cover the current drift) — probing again not before +${hb_cd}s"
             fi
             ;;
     esac
 }
 
-# poll_reload_result <now> — reap the background reload, if it has finished.
+# consume_reload_result <now> — if the runner has left its result, account for it and say so.
+# The result is the runner's last act: when it exists the runner is done (or about to exit).
+# Returns 1 when there is no result (nothing was changed).
+consume_reload_result() {
+    local now="$1" outcome="" held="" rc="" msg=""
+    [ -f "$RELOAD_RESULT_FILE" ] || return 1
+    { read -r outcome held rc; read -r msg; } < "$RELOAD_RESULT_FILE" || true
+    rm -f "$RELOAD_RESULT_FILE" 2>/dev/null || true
+    case "$outcome" in
+        ok|busy|fail) ;;
+        *) outcome=fail; held=""; msg="unreadable reload result" ;;
+    esac
+    wait "$RELOAD_PID" 2>/dev/null || true
+    RELOAD_PID=""
+    finish_reload "$RELOAD_TRIGGER" "$outcome" "$held" "${rc:-?}" "$msg" "$now"
+    return 0
+}
+
+# poll_reload_result <now> — reap the background reload, if it has finished, or kill it when it
+# has outlived its own client timeout.
 poll_reload_result() {
-    local now="$1" outcome held rc msg
+    local now="$1" survivors verdict
     [ -n "$RELOAD_PID" ] || return 0
-    if [ -f "$RELOAD_RESULT_FILE" ]; then
-        outcome=""; held=""; rc=""; msg=""
-        { read -r outcome held rc; read -r msg; } < "$RELOAD_RESULT_FILE" || true
-        rm -f "$RELOAD_RESULT_FILE" 2>/dev/null || true
-        case "$outcome" in ok|busy|fail) ;; *) outcome=fail; msg="unreadable reload result" ;; esac
-        wait "$RELOAD_PID" 2>/dev/null || true   # the result is the runner's last act; reap it
-        RELOAD_PID=""
-        finish_reload "$RELOAD_TRIGGER" "$outcome" "$held" "${rc:-?}" "$msg" "$now"
+    if consume_reload_result "$now"; then
         return 0
     fi
     if ! kill -0 "$RELOAD_PID" 2>/dev/null; then
-        # The runner is gone and left no result (killed from outside). Count it as a failure
-        # that held the slot for as long as it ran — the conservative reading.
+        # The runner is gone. It may have written its result and exited between the check above
+        # and this one — look again before calling that a failure.
+        if consume_reload_result "$now"; then
+            return 0
+        fi
+        # Killed from outside and left no result. How long it held the slot is UNKNOWN.
+        disown "$RELOAD_PID" 2>/dev/null || true
         RELOAD_PID=""
-        finish_reload "$RELOAD_TRIGGER" fail "$(( now - RELOAD_STARTED ))" "?" "reload runner exited without a result" "$now"
+        finish_reload "$RELOAD_TRIGGER" fail "" "?" "reload runner exited without a result" "$now"
         return 0
     fi
     if (( now - RELOAD_STARTED > RELOAD_CLIENT_TIMEOUT + RELOAD_WATCHDOG_GRACE )); then
-        kill "$RELOAD_PID" 2>/dev/null || true
+        # Disowned BEFORE the kill, and never wait()ed on: a job bash still tracks that dies of a signal
+        # makes it print "Terminated" plus the runner's whole script into the log, and a wait() on a
+        # process that survived SIGKILL would freeze the daemon loop. Bash still reaps the child.
+        disown "$RELOAD_PID" 2>/dev/null || true
+        survivors=$(kill_process_tree "$RELOAD_PID")
+        rm -f "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
+        if [ -z "$survivors" ]; then
+            verdict="the runner and its gc client were killed"
+        else
+            verdict="kill FAILED — still alive (leaked): ${survivors}"
+        fi
         RELOAD_PID=""
-        finish_reload "$RELOAD_TRIGGER" fail "$(( now - RELOAD_STARTED ))" "?" "reload client exceeded ${RELOAD_CLIENT_TIMEOUT}s + ${RELOAD_WATCHDOG_GRACE}s grace — killed" "$now"
+        finish_reload "$RELOAD_TRIGGER" fail "" "?" "reload exceeded ${RELOAD_CLIENT_TIMEOUT}s + ${RELOAD_WATCHDOG_GRACE}s grace — ${verdict}" "$now"
     fi
 }
 
@@ -445,13 +625,9 @@ if [ "${CONFIG_DRIFT_WATCHER_LIB:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-# Initialize hash (don't trigger on start)
+# Initialize hash (don't trigger on start — unless the restart gap says a change may be unaccepted)
 now=$(epoch_now)
-watcher_started_at=$now
-prev_hash=$(compute_hash)
-last_beat_time=$now
-hb_next_allowed=$(( now + HEARTBEAT_INTERVAL ))
-load_reload_stats "$now"
+init_watcher_state "$now"
 
 # Assert hooks-lock invariant at startup before first heartbeat.
 check_hooks_guard
@@ -459,11 +635,17 @@ check_hooks_guard
 log "Initial hash: $prev_hash"
 log "Watching: $CITY/skills, $CITY/.claude/skills, $WA/crew/*/.claude/skills/, $WA/city-local/skills/, city.toml, pack.toml, agents/, scripts/*.{sh,py}"
 log "Poll interval: ${POLL_INTERVAL}s, debounce: ${DEBOUNCE_WINDOW}s, heartbeat floor: ${HEARTBEAT_INTERVAL}s"
-log "Mode: file-watcher (immediate, retried until accepted) + duty-capped backstop heartbeat (slot duty <= ${HEARTBEAT_MAX_SLOT_DUTY_PCT}%, file-change reloads <= ${FILE_MAX_SLOT_DUTY_PCT}%)"
+log "Mode: file-watcher (immediate, retried until accepted) + duty-capped backstop heartbeat (slot duty <= $(clamp_duty_pct "$HEARTBEAT_MAX_SLOT_DUTY_PCT")% [configured '${HEARTBEAT_MAX_SLOT_DUTY_PCT}'], file-change reloads <= $(clamp_duty_pct "$FILE_MAX_SLOT_DUTY_PCT")% [configured '${FILE_MAX_SLOT_DUTY_PCT}'])"
 if [ "$stats_carried_over" = "true" ]; then
-    log "Carried over from the previous run: last reload held the slot ${last_reload_secs}s, next heartbeat not before epoch ${hb_next_allowed}"
+    log "Carried over from the previous run: last reload held the slot ${last_reload_secs}s"
 else
-    log "No usable reload stats from a previous run (${RELOAD_STATS_FILE}) — first heartbeat after ${HEARTBEAT_INTERVAL}s, cadence learned from the first reload"
+    log "No usable reload stats from a previous run (${RELOAD_STATS_FILE}) — cadence learned from the first reload"
+fi
+log "Restart gap: ${startup_gap_verdict} — ${startup_gap_note}"
+if [ "$pending_reload" = "true" ]; then
+    log "A file-change reload is queued from startup; next heartbeat not before epoch ${hb_next_allowed}"
+else
+    log "Next heartbeat not before epoch ${hb_next_allowed} (+$(( hb_next_allowed - now ))s)"
 fi
 
 while true; do

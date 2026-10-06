@@ -8,17 +8,25 @@
 #
 # Proves, against the real watcher functions (sourced with CONFIG_DRIFT_WATCHER_LIB=1) and a
 # stub `gc`:
-#   A. slot_cooldown_secs: duty-cap formula, floor, ceiling, garbage input
-#   B. finish_reload: what each outcome schedules (heartbeat / file-change, ok / busy / fail)
-#   C. poll_reload_result: result-file hand-off, dead runner, watchdog
+#   A. slot_cooldown_secs: duty-cap formula, floor, ceiling, garbage input (incl. leading zeros)
+#   B. finish_reload: what each outcome schedules (heartbeat / file-change, ok / busy / fail), and
+#      that an UNKNOWN hold time is never read as "0s" (the third state) and a failure never
+#      overwrites the learned D
+#   C. poll_reload_result: result-file hand-off, the runner-finished-between-two-checks race, dead
+#      runner, and the watchdog against the REAL runner topology (a hanging stub gc: no process
+#      of the tree may survive)
 #   D. start_reload: really issues the SYNC "gc reload --soft --timeout" (never --async) and
 #      maps ok / busy / fail from the client's exit status and text
-#   E. reload-stats persistence across a daemon restart
+#   E. the restart gap: reload stats persist across a daemon restart, and drift that straddles
+#      the restart (files changed while down, or a reload still pending) is NOT dropped and NOT
+#      hidden behind the carried-over embargo
 #   F. file-detected drift (acceptance 3): a changed skill file is picked up, debounced and
 #      reloaded; a busy slot never drops it; a failing reload is retried a bounded number of
-#      times; it outranks the heartbeat and never runs concurrently with one
+#      times; it outranks the heartbeat and never runs concurrently with one; a restart with an
+#      active embargo does not delay it
 #   G. before/after slot-occupancy simulation at the measured reload duration (acceptance 1, 2)
-#   H. end to end: the real daemon loop against a stub gc (startup marker, log proof, stats)
+#   H. end to end: the real daemon loop against a stub gc, over three lives of the daemon
+#      (startup marker, log proof, stats, restart gap unchanged / changed)
 #
 # Run it against another copy of the watcher with WATCHER_UNDER_TEST=<path> (the pre-fix
 # watcher must FAIL this file). Works under /bin/bash 3.2 and bash 5.x.
@@ -32,7 +40,14 @@ FAIL_CLOSED_LIB="$SELF_DIR/../packs/town-deltas/assets/selftest-fail-closed.lib.
 WATCHER="${WATCHER_UNDER_TEST:-$SELF_DIR/config-drift-watcher.sh}"
 [ -f "$WATCHER" ] || { echo "FATAL: watcher not found: $WATCHER" >&2; exit 2; }
 
-TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/cdw-policy.XXXXXX")" && pwd -P)"
+# $TMP is rm -rf'd on exit, so it must be a directory this run really created. On bash 3.2
+# `cd "$(mktemp -d ...)"` with a failing mktemp is `cd ""`, which succeeds and leaves TMP=$PWD.
+TMP_MADE="$(mktemp -d "${TMPDIR:-/tmp}/cdw-policy.XXXXXX")" || { echo "FATAL: mktemp -d failed" >&2; exit 2; }
+if [ -z "$TMP_MADE" ] || [ ! -d "$TMP_MADE" ]; then echo "FATAL: mktemp -d gave no directory ('$TMP_MADE')" >&2; exit 2; fi
+TMP="$(cd "$TMP_MADE" && pwd -P)" || { echo "FATAL: cannot enter $TMP_MADE" >&2; exit 2; }
+case "$TMP" in
+    ''|/|"$PWD"|"$HOME"|"$SELF_DIR") echo "FATAL: refusing to use '$TMP' as the scratch dir" >&2; exit 2 ;;
+esac
 DUMMY_PIDS=""
 cleanup() {
     local p
@@ -63,7 +78,12 @@ cat > "$TMP/bin/gc" <<'EOF'
 # stub gc: records its argv, behaves per $GCSTUB_MODE
 echo "$*" >> "${GCSTUB_ARGS:-/dev/null}"
 case "${GCSTUB_MODE:-ok}" in
-  ok)   sleep 1; echo "Reload complete"; exit 0 ;;
+  ok)   sleep "${GCSTUB_SLEEP:-1}"; echo "Reload complete"; exit 0 ;;
+  hang) # a client that never returns: record its pid and its child's, like a real hung gc + helper
+        echo $$ >> "${GCSTUB_PIDS:-/dev/null}"
+        sleep 300 &
+        echo $! >> "${GCSTUB_PIDS:-/dev/null}"
+        wait ;;
   busy) echo "Reload request could not be accepted because another reload is already in progress."; exit 1 ;;
   fail) echo "controller unreachable"; exit 1 ;;
 esac
@@ -104,23 +124,79 @@ fi
 compute_hash() { if [ "$HASH_MODE" = real ]; then real_compute_hash; else echo "$FAKE_HASH"; fi; }
 
 START_LOG=""
-reset_state() {
-    rm -f "$RELOAD_STATS_FILE" "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
+reset_state() {   # a fresh in-memory state; "keep-files" = a fresh PROCESS (the stats file on disk survives)
+    if [ "${1:-}" != keep-files ]; then
+        rm -f "$RELOAD_STATS_FILE" "$RELOAD_RESULT_FILE" "$RELOAD_RESULT_FILE.tmp" 2>/dev/null || true
+    fi
     prev_hash=""; last_change_time=0; pending_reload=false; last_beat_time=0; last_hooks_check=0
-    RELOAD_PID=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0
+    RELOAD_PID=""; RELOAD_TRIGGER=""; RELOAD_STARTED=0; RELOAD_COVERS_HASH=""
     hb_next_allowed=0; file_next_allowed=0; file_fail_count=0; file_busy_streak=0
-    last_reload_secs=0; reload_held_total=0; reload_count=0; watcher_started_at=$FAKE_NOW
+    last_reload_secs=0; reload_held_total=0; reload_count=0; reload_unknown_count=0
+    watcher_started_at=$FAKE_NOW
     stats_carried_over=false
+    covered_hash=""; startup_gap_verdict=""; startup_gap_note=""
     HOOK_CALLS=0; START_LOG=""
 }
 TICKLOG="$TMP/tick.log"
 : > "$TICKLOG"
+
+# kill seams. RACE_ON=1: the next `kill -0` first lets the runner "finish" (writes its result)
+# and then reports it gone — a runner that ends between poll_reload_result's two looks.
+# SHIELD_PID: TERM/KILL aimed at it are swallowed — a process that survives SIGKILL.
+RACE_ON=0
+SHIELD_PID=""
+kill() {
+    local a
+    if [ "$RACE_ON" = 1 ] && [ "${1:-}" = "-0" ]; then
+        RACE_ON=0
+        printf 'ok 42 0\nReload complete\n' > "$RELOAD_RESULT_FILE"
+        return 1
+    fi
+    if [ -n "$SHIELD_PID" ] && [ "${1:-}" != "-0" ]; then
+        for a in "$@"; do [ "$a" = "$SHIELD_PID" ] && return 0; done
+    fi
+    builtin kill "$@"
+}
+
+need_fn() {   # need_fn <name> — true when the watcher under test has it; else ONE failing assertion naming it
+    if declare -F "$1" >/dev/null; then return 0; fi
+    bad "function $1 missing in the watcher under test"
+    return 1
+}
+
+startup_replay() {   # what the daemon does at startup, on the fake clock
+    if declare -F init_watcher_state >/dev/null; then
+        init_watcher_state "$FAKE_NOW"
+    else   # the reviewed watcher (gate FAIL 1/3) kept this inline below its library guard: replay it literally
+        watcher_started_at=$FAKE_NOW
+        prev_hash=$(compute_hash)
+        last_beat_time=$FAKE_NOW
+        hb_next_allowed=$(( FAKE_NOW + HEARTBEAT_INTERVAL ))
+        load_reload_stats "$FAKE_NOW"
+    fi
+}
+
+real_reload() {   # start_reload, with this script's EXIT trap off while its runner subshell is forked:
+    # on bash 3.2 a subshell inherits the trap, so SIGTERMing the runner tree (the watchdog test) would run
+    # cleanup() and delete $TMP under the rest of the run. The trap is re-armed right after.
+    trap - EXIT
+    start_reload "$@"
+    selftest_fail_closed_arm cleanup
+}
+
+: "${HEARTBEAT_BUSY_RETRY_MAX:=300}"   # a watcher without these gets the intended values, and is judged against them
+: "${RELOAD_UNKNOWN_HELD_ASSUMED:=600}"
+: "${RELOAD_WATCHDOG_GRACE:=120}"
 
 echo "== precondition: the watcher exposes the reload-policy functions"
 HAVE_POLICY=1
 for fn in slot_cooldown_secs finish_reload poll_reload_result start_reload watcher_tick \
           heartbeat_due file_reload_due load_reload_stats slot_duty_line; do
     if declare -F "$fn" >/dev/null; then ok "function $fn exists"; else bad "function $fn missing (pre-fix watcher?)"; HAVE_POLICY=0; fi
+done
+# the helpers of the gate-FAIL-1/3 fix: absent (reviewed watcher), the tests that need them say so by name
+for fn in uint_or_empty hash_is_known clamp_duty_pct init_watcher_state descendants_of kill_process_tree consume_reload_result; do
+    need_fn "$fn" && ok "function $fn exists"
 done
 if [ "$HAVE_POLICY" = 1 ]; then   # groups A-G (not re-indented): unit + simulation tests need the policy functions
 
@@ -139,6 +215,29 @@ eq "negative held -> floor, no crash"             20   "$(slot_cooldown_secs -5 
 eq "duty 0 is clamped to 1 (no division by zero)" "$HEARTBEAT_MAX_INTERVAL" "$(slot_cooldown_secs 600 0 20)"
 eq "duty 100 -> no cooldown beyond the floor"     20   "$(slot_cooldown_secs 600 100 20)"
 eq "duty >100 is clamped to 100"                  20   "$(slot_cooldown_secs 600 250 20)"
+# Leading zeros are DECIMAL. "08" in $(( )) is an octal error that aborts a bash 3.2 daemon (KeepAlive: a crash loop).
+eq "duty '08' is 8%, not an octal error: 600s -> 6900s" 6900 "$(slot_cooldown_secs 600 08 20)"
+eq "held '0600' is 600s"                          5400 "$(slot_cooldown_secs 0600 10 20)"
+eq "a digit string too long to be seconds -> floor" 20 "$(slot_cooldown_secs 99999999999999999999 10 20)"
+if need_fn uint_or_empty; then
+    eq "uint_or_empty 007 -> 7"                 7  "$(uint_or_empty 007)"
+    eq "uint_or_empty 0 -> 0 (zero is a number)" 0 "$(uint_or_empty 0)"
+    eq "uint_or_empty '' -> nothing (not zero)" "" "$(uint_or_empty '')"
+    eq "uint_or_empty -5 -> nothing"            "" "$(uint_or_empty -5)"
+    eq "uint_or_empty 12x -> nothing"           "" "$(uint_or_empty 12x)"
+fi
+if need_fn clamp_duty_pct; then
+    eq "clamp_duty_pct 0 -> 1"        1   "$(clamp_duty_pct 0)"
+    eq "clamp_duty_pct 250 -> 100"    100 "$(clamp_duty_pct 250)"
+    eq "clamp_duty_pct garbage -> 10" 10  "$(clamp_duty_pct banana)"
+    eq "clamp_duty_pct 08 -> 8"       8   "$(clamp_duty_pct 08)"
+fi
+if need_fn hash_is_known; then
+    if hash_is_known 0123456789abcdef0123456789abcdef; then ok "hash_is_known: an md5 is known"; else bad "hash_is_known rejected an md5"; fi
+    for h in "" "-" "hash-error" "a b"; do
+        if hash_is_known "$h"; then bad "hash_is_known accepted '$h' (cannot-tell must not count as a hash)"; else ok "hash_is_known rejects '$h'"; fi
+    done
+fi
 worst=0
 d=3
 while [ "$d" -le 800 ]; do
@@ -167,9 +266,13 @@ eq "fast reload (1s): heartbeat cadence stays at the 20s floor" $((N + 20)) "$hb
 
 reset_state; last_reload_secs=600
 finish_reload heartbeat busy 0 1 "already in progress" "$N" >> "$TICKLOG"
-eq "heartbeat refused as busy: backs off a full cooldown (not 20s)" $((N + 5400)) "$hb_next_allowed"
+eq "heartbeat refused as busy: re-probes after HEARTBEAT_BUSY_RETRY_MAX (a refusal holds nothing — not 9*D)" $((N + 300)) "$hb_next_allowed"
 eq "heartbeat busy: a refusal is not a hold (count unchanged)"      0 "$reload_count"
 eq "heartbeat busy: D not overwritten"                              600 "$last_reload_secs"
+
+reset_state; last_reload_secs=10
+finish_reload heartbeat busy 0 1 "already in progress" "$N" >> "$TICKLOG"
+eq "heartbeat busy, short D: cooldown below the cap is kept (9*10)"  $((N + 90)) "$hb_next_allowed"
 
 reset_state
 finish_reload heartbeat busy 0 1 "already in progress" "$N" >> "$TICKLOG"
@@ -184,20 +287,69 @@ eq "file change busy: heartbeat embargo untouched"     0 "$hb_next_allowed"
 
 reset_state
 n=0
+: > "$TMP/giveup.log"
 while [ "$n" -lt 3 ]; do
     pending_reload=false
-    finish_reload file-change fail 2 1 "controller unreachable" "$N" >> "$TICKLOG"
+    finish_reload file-change fail 2 1 "controller unreachable" "$N" >> "$TMP/giveup.log" 2>&1
     n=$((n + 1))
     eq "file change failure $n/3: retried (pending)" true "$pending_reload"
 done
 pending_reload=false
-finish_reload file-change fail 2 1 "controller unreachable" "$N" >> "$TICKLOG"
+finish_reload file-change fail 2 1 "controller unreachable" "$N" >> "$TMP/giveup.log" 2>&1
 eq "file change 4th failure: gives up (heartbeat covers it)" false "$pending_reload"
 eq "file change give-up resets the failure streak"           0 "$file_fail_count"
+has   "give-up log says WHEN the heartbeat is due, instead of promising it will cover" "which is not due for 20s" "$TMP/giveup.log"
+hasnt "give-up log makes no 'will cover it' promise" "will cover it" "$TMP/giveup.log"
 
 reset_state; file_fail_count=2
 finish_reload file-change ok 5 0 "ok" "$N" >> "$TICKLOG"
 eq "file change success clears the failure streak" 0 "$file_fail_count"
+
+# B3. THE THIRD STATE (gate FAIL 1/3, blocking 4): "how long did it hold the slot?" can be unknown
+#     (unreadable result, runner killed, wall clock stepped). Unknown must not behave as "it was instant".
+echo "-- B3. unknown hold time is not 0s; a failure is not a measurement of D"
+for bad_held in "" "-5" "abc" "99999" "12x"; do
+    reset_state; last_reload_secs=300; : > "$TMP/unk.log"
+    finish_reload heartbeat ok "$bad_held" 0 "Reload complete" "$N" >> "$TMP/unk.log" 2>&1
+    eq "held='$bad_held': the learned D is left untouched"            300 "$last_reload_secs"
+    eq "held='$bad_held': cooldown assumes max(D, ${RELOAD_UNKNOWN_HELD_ASSUMED}s) -> heartbeat +5400s, NOT the 20s floor" $((N + 5400)) "$hb_next_allowed"
+    eq "held='$bad_held': file-change reloads keep off the slot for the assumed hold too" $((N + 600)) "$file_next_allowed"
+    eq "held='$bad_held': not added to the measured hold total"      0 "$reload_held_total"
+    eq "held='$bad_held': counted as an unknown-duration reload"     1 "${reload_unknown_count-}"
+    has   "held='$bad_held': the log says the duration is unknown" "UNKNOWN" "$TMP/unk.log"
+    hasnt "held='$bad_held': the log does not claim a measured 0s" "after 0s" "$TMP/unk.log"
+    hasnt "held='$bad_held': …nor 'took 0s'" "took 0s" "$TMP/unk.log"
+done
+reset_state; last_reload_secs=900
+finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TICKLOG"
+eq "unknown hold, learned D=900 (> assumed 600): the larger of the two is used (7200 ceiling)" $((N + 7200)) "$hb_next_allowed"
+reset_state
+finish_reload heartbeat ok "" 0 "ok" "$N" >> "$TICKLOG"
+eq "unknown hold with NO learned D: assumes ${RELOAD_UNKNOWN_HELD_ASSUMED}s" $((N + 5400)) "$hb_next_allowed"
+eq "…and still does not invent a D" 0 "$last_reload_secs"
+reset_state; last_reload_secs=600
+finish_reload heartbeat fail 1 1 "controller restarting" "$N" >> "$TICKLOG" 2>&1
+eq "a fast failure does NOT overwrite the learned D" 600 "$last_reload_secs"
+eq "…and the retry is at the floor (it held nothing)" $((N + 20)) "$hb_next_allowed"
+reset_state; last_reload_secs=600
+finish_reload heartbeat fail 900 1 "client timed out" "$N" >> "$TICKLOG" 2>&1
+eq "a failure after the client timeout does not overwrite D either" 600 "$last_reload_secs"
+eq "…it may have held the slot up to the controller TTL: cooldown assumes 600s, not 900s" $((N + 5400)) "$hb_next_allowed"
+eq "…and no more than the TTL is added to the measured hold total" 600 "$reload_held_total"
+reset_state; last_reload_secs=600
+finish_reload file-change fail "" 1 "runner killed" "$N" >> "$TICKLOG" 2>&1
+eq "failed reload of UNKNOWN duration: D untouched" 600 "$last_reload_secs"
+eq "…counted as unknown" 1 "${reload_unknown_count-}"
+
+# B4. what the last reload that finished OK covered (the restart gap needs it)
+reset_state; RELOAD_COVERS_HASH=hX
+finish_reload heartbeat fail 1 1 "x" "$N" >> "$TICKLOG" 2>&1
+finish_reload heartbeat busy 0 1 "x" "$N" >> "$TICKLOG" 2>&1
+eq "a failed or refused reload does not mark the hash as covered" "" "${covered_hash-}"
+finish_reload heartbeat ok 1 0 "x" "$N" >> "$TICKLOG" 2>&1
+eq "a reload that finished OK marks the hash it was requested against as covered" hX "${covered_hash-}"
+finish_reload heartbeat ok "" 0 "x" "$N" >> "$TICKLOG" 2>&1
+eq "…also when its duration is unknown (it did finish OK)" hX "${covered_hash-}"
 
 # ── C. poll_reload_result ────────────────────────────────────────────────────
 echo "== C. poll_reload_result"
@@ -216,35 +368,94 @@ eq "finished: D taken from the result"  42 "$last_reload_secs"
 eq "finished: heartbeat cooled down"    $((FAKE_NOW + 378)) "$hb_next_allowed"
 eq "finished: result file consumed"     "no" "$([ -e "$RELOAD_RESULT_FILE" ] && echo yes || echo no)"
 
-reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW
+reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=77
 reap_start 0 "garbage" "x"
 sleep 1
-poll_reload_result "$FAKE_NOW" >> "$TICKLOG"
+poll_reload_result "$FAKE_NOW" >> "$TICKLOG" 2>&1
 eq "unreadable result counts as a failed file-change reload (retried)" true "$pending_reload"
+eq "unreadable result: D left alone (its hold time is unknown, not 0s)" 77 "$last_reload_secs"
 
-reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$((FAKE_NOW - 5))
+reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$((FAKE_NOW - 5)); last_reload_secs=77
 ( trap - EXIT; exit 0 ) &   # (a subshell's explicit exit would otherwise run THIS script's EXIT trap and wipe $TMP)
 RELOAD_PID=$!
 sleep 1
-poll_reload_result "$FAKE_NOW" >> "$TICKLOG"
+: > "$TMP/dead.log"
+poll_reload_result "$FAKE_NOW" >> "$TMP/dead.log" 2>&1
 eq "runner died without a result: slot freed for the next decision" "" "$RELOAD_PID"
-eq "runner died without a result: counted as a held failure"        1 "$reload_count"
-has "runner died without a result: logged" "exited without a result" "$TICKLOG"
+eq "runner died without a result: counted as a failed reload"       1 "$reload_count"
+eq "runner died without a result: its hold time is UNKNOWN, D untouched" "77 1" "$last_reload_secs ${reload_unknown_count-}"
+has "runner died without a result: logged" "exited without a result" "$TMP/dead.log"
 
-reset_state; RELOAD_TRIGGER=heartbeat
-RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
-# A hung client. It must have exec'd `sleep` before it is killed: a bash child that gets SIGTERM
-# between fork and exec runs this script's inherited EXIT trap (cleanup + FATAL) — seen on 3.2 under load.
-( trap - EXIT; exec sleep 60 ) &
+# C2. the runner that finishes BETWEEN the result-file check and the liveness check is a success
+reset_state; RELOAD_TRIGGER=file-change; RELOAD_STARTED=$FAKE_NOW; last_reload_secs=0
+( trap - EXIT; exit 0 ) &
 RELOAD_PID=$!
-DUMMY_PIDS="$DUMMY_PIDS $RELOAD_PID"
-HUNG=$RELOAD_PID
-sleep 0.5
-poll_reload_result "$FAKE_NOW" >> "$TICKLOG"
+sleep 1
+: > "$TMP/race.log"
+RACE_ON=1
+poll_reload_result "$FAKE_NOW" >> "$TMP/race.log" 2>&1
+RACE_ON=0
+eq "race: a result that lands between the two looks is consumed, not called a failure" 42 "$last_reload_secs"
+eq "race: no needless retry of a file change that was accepted" false "$pending_reload"
+hasnt "race: not logged as 'exited without a result'" "exited without a result" "$TMP/race.log"
+has   "race: logged as the OK reload it was" "reload[file-change] OK" "$TMP/race.log"
+
+# C3. the WATCHDOG, against the production process topology: a hung stub gc under the REAL runner
+#     (start_reload's subshell -> $(...) -> gc -> its helper). Killing only the runner leaves the gc
+#     client orphaned — the leak of gate FAIL 1/3 (blocking 2 and 3).
+reset_state; RELOAD_TRIGGER=heartbeat; last_reload_secs=77
+: > "$TMP/hang.pids"
+export GCSTUB_MODE=hang GCSTUB_PIDS="$TMP/hang.pids"
+real_reload heartbeat "$FAKE_NOW" >> "$TICKLOG" 2>&1
+i=0
+while [ "$(wc -l < "$TMP/hang.pids" | tr -d ' ')" -lt 2 ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i + 1)); done
+HUNG_PIDS="$(tr '\n' ' ' < "$TMP/hang.pids")"
+DUMMY_PIDS="$DUMMY_PIDS $HUNG_PIDS"   # safety net: whatever survives is killed at exit
+eq "watchdog setup: the hung gc stub and its helper are running" 2 "$(printf '%s\n' $HUNG_PIDS | grep -c .)"
+alive_before=""
+for p in $HUNG_PIDS; do builtin kill -0 "$p" 2>/dev/null && alive_before="$alive_before $p"; done
+eq "watchdog setup: both are alive before the watchdog fires" "$(printf '%s' " $HUNG_PIDS" | sed 's/ *$//')" "$alive_before"
+RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
+: > "$TMP/watchdog.log"
+poll_reload_result "$FAKE_NOW" >> "$TMP/watchdog.log" 2>&1
 sleep 0.3
-if kill -0 "$HUNG" 2>/dev/null; then bad "watchdog: stuck client was not killed"; else ok "watchdog: stuck client killed"; fi
+alive_after=""
+for p in $HUNG_PIDS; do builtin kill -0 "$p" 2>/dev/null && alive_after="$alive_after $p"; done
+eq "watchdog: NO process of the hung gc tree survives (stub gc and its helper)" "" "$alive_after"
+for p in $alive_after; do builtin kill -KILL "$p" 2>/dev/null || true; done   # leave nothing behind, whatever happened
 eq "watchdog: slot freed" "" "$RELOAD_PID"
-has "watchdog: logged" "killed" "$TICKLOG"
+has   "watchdog: logged as killed, runner and client" "were killed" "$TMP/watchdog.log"
+hasnt "watchdog: no leak claimed when none happened" "leaked" "$TMP/watchdog.log"
+hasnt "watchdog: bash's job-control 'Terminated' dump (the whole runner script) stays out of the log" "Terminated" "$TMP/watchdog.log"
+eq "watchdog: how long it held the slot is unknown: D untouched, counted as unknown" "77 1" "$last_reload_secs ${reload_unknown_count-}"
+export GCSTUB_MODE=ok; unset GCSTUB_PIDS
+
+# C4. a process that survives SIGKILL is reported as leaked — never as killed — and cannot freeze the loop
+if need_fn kill_process_tree; then
+    ( trap - EXIT; trap '' TERM; exec sleep 60 ) &
+    STUBBORN=$!
+    DUMMY_PIDS="$DUMMY_PIDS $STUBBORN"
+    sleep 0.3
+    surv="$(kill_process_tree "$STUBBORN")"
+    wait "$STUBBORN" 2>/dev/null || true
+    eq "kill_process_tree: a TERM-ignoring process dies of the KILL that follows" "" "$surv"
+    ( trap - EXIT; exec sleep 60 ) &
+    SHIELDED=$!
+    DUMMY_PIDS="$DUMMY_PIDS $SHIELDED"
+    sleep 0.3
+    SHIELD_PID=$SHIELDED
+    surv="$(kill_process_tree "$SHIELDED")"
+    eq "kill_process_tree: reports the pid that survived SIGKILL" "$SHIELDED" "$surv"
+    reset_state; RELOAD_TRIGGER=heartbeat; RELOAD_STARTED=$((FAKE_NOW - RELOAD_CLIENT_TIMEOUT - RELOAD_WATCHDOG_GRACE - 1))
+    RELOAD_PID=$SHIELDED
+    : > "$TMP/leak.log"
+    poll_reload_result "$FAKE_NOW" >> "$TMP/leak.log" 2>&1   # a wait() on the survivor would hang right here
+    has   "watchdog: a survivor is logged as leaked" "leaked" "$TMP/leak.log"
+    hasnt "watchdog: …and NOT as killed" "were killed" "$TMP/leak.log"
+    eq "watchdog: the loop is not held by the survivor (slot freed)" "" "$RELOAD_PID"
+    SHIELD_PID=""
+    builtin kill -KILL "$SHIELDED" 2>/dev/null || true
+fi
 
 # ── D. start_reload against the stub gc ──────────────────────────────────────
 echo "== D. start_reload (real runner, stub gc)"
@@ -257,11 +468,13 @@ wait_reload() {   # poll until the background reload is reaped (max ~15s)
     done
 }
 reset_state; : > "$GCSTUB_ARGS"
+prev_hash=hD0
 export GCSTUB_MODE=ok; start_reload heartbeat "$FAKE_NOW" >> "$TICKLOG"
 wait_reload
 eq "ok: reaped" "" "$RELOAD_PID"
 ge "ok: D measured from the real wall time (stub sleeps 1s)" "$last_reload_secs" 1
 eq "ok: counted" 1 "$reload_count"
+eq "ok: the reload is recorded as covering the hash it was requested against" hD0 "${covered_hash-}"
 has   "gc is called synchronously with a timeout above the controller TTL" "reload --soft --timeout ${RELOAD_CLIENT_TIMEOUT}s --city $CITY" "$GCSTUB_ARGS"
 hasnt "gc is never called with --async (its wall time would not be the slot hold time)" "--async" "$GCSTUB_ARGS"
 
@@ -276,33 +489,95 @@ export GCSTUB_MODE=busy; start_reload file-change "$FAKE_NOW" >> "$TICKLOG"
 wait_reload
 eq "busy on a file-change reload: file change stays pending" true "$pending_reload"
 
-reset_state
-export GCSTUB_MODE=fail; start_reload file-change "$FAKE_NOW" >> "$TICKLOG"
+reset_state; last_reload_secs=600; prev_hash=hD1
+export GCSTUB_MODE=fail; start_reload file-change "$FAKE_NOW" >> "$TICKLOG" 2>&1
 wait_reload
 eq "fail on a file-change reload: counted and retried" "1 true" "$reload_count $pending_reload"
+eq "fail on a file-change reload: learned D not overwritten by the 1s failure" 600 "$last_reload_secs"
+eq "fail: the hash is not marked covered" "" "${covered_hash-}"
+export GCSTUB_MODE=ok
 
-# ── E. persistence across restarts ───────────────────────────────────────────
-echo "== E. reload-stats persistence (delivery restarts the daemon)"
-reset_state
+# ── E. the restart gap ───────────────────────────────────────────────────────
+echo "== E. restart gap (delivery restarts the daemon): stats persist; drift that straddles the restart is not dropped"
+HASH_MODE=fake
+
+# E1. nothing changed since the last reload that finished OK: the embargo is carried over
+FAKE_HASH=hA
+reset_state; prev_hash=hA; RELOAD_COVERS_HASH=hA
 finish_reload heartbeat ok 600 0 "ok" "$FAKE_NOW" >> "$TICKLOG"
 saved_hb=$hb_next_allowed
-last_reload_secs=0                                   # a fresh process knows nothing…
-hb_next_allowed=$((FAKE_NOW + HEARTBEAT_INTERVAL))   # …but its own startup default
-load_reload_stats "$FAKE_NOW"
-eq "restart: last reload duration carried over" 600 "$last_reload_secs"
-eq "restart: heartbeat embargo carried over (a restart does not re-open the slot to the watcher)" "$saved_hb" "$hb_next_allowed"
+eq "the stats file carries the hash the last OK reload covered" hA "$(awk '{print $3}' "$RELOAD_STATS_FILE" 2>/dev/null)"
+reset_state keep-files                                  # a fresh process: nothing in memory, the stats file on disk
+startup_replay >> "$TICKLOG"
+eq "restart, files unchanged: last reload duration carried over" 600 "$last_reload_secs"
+eq "restart, files unchanged: heartbeat embargo carried over (a restart does not re-open the slot to the watcher)" "$saved_hb" "$hb_next_allowed"
+eq "restart, files unchanged: nothing queued" false "$pending_reload"
+eq "restart, files unchanged: verdict" unchanged "${startup_gap_verdict-}"
 eq "restart: the stats are reported as carried over" true "$stats_carried_over"
 
-reset_state; hb_next_allowed=$((FAKE_NOW + 20))
-echo "not numbers at all" > "$RELOAD_STATS_FILE"
-load_reload_stats "$FAKE_NOW"
-eq "garbage stats file is ignored" "0 $((FAKE_NOW + 20))" "$last_reload_secs $hb_next_allowed"
-eq "garbage stats file is NOT reported as carried over" false "$stats_carried_over"
+# E2. THE reviewer scenario (gate FAIL 1/3, blocking 1): embargo active, a skill file changes, the daemon restarts
+HASH_MODE=real
+rm -f "$CITY/skills/restart.md"
+echo "# skill v1" > "$CITY/skills/restart.md"
+reset_state; prev_hash=$(compute_hash); RELOAD_COVERS_HASH=$prev_hash
+finish_reload heartbeat ok 600 0 "ok" "$FAKE_NOW" >> "$TICKLOG"          # previous life: D=600, heartbeat embargo +5400
+echo "# skill v2 — changed while the daemon was down (or detected, but its reload still pending)" >> "$CITY/skills/restart.md"
+reset_state keep-files
+startup_replay >> "$TICKLOG"
+eq "restart + changed file: a file-change reload is queued" true "$pending_reload"
+eq "restart + changed file: verdict" changed "${startup_gap_verdict-}"
+eq "restart + changed file: the embargo is NOT carried over (it would hide the backstop for 5400s)" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
+: > "$GCSTUB_ARGS"; export GCSTUB_MODE=ok
+FAKE_NOW=$((FAKE_NOW + POLL_INTERVAL)); watcher_tick "$FAKE_NOW" >> "$TICKLOG" 2>&1
+eq "restart + changed file: the very first tick requests it, as a file-change reload" file-change "$RELOAD_TRIGGER"
+wait_reload
+has "restart + changed file: gc was really asked to reload" "reload --soft" "$GCSTUB_ARGS"
+rm -f "$CITY/skills/restart.md"
 
+# E3. the previous life had SEEN the change (prev_hash == new) but its reload was still pending (slot busy)
+HASH_MODE=fake; FAKE_HASH=hB
+reset_state; prev_hash=hA; RELOAD_COVERS_HASH=hA
+finish_reload heartbeat ok 600 0 "ok" "$FAKE_NOW" >> "$TICKLOG"
+reset_state keep-files
+startup_replay >> "$TICKLOG"
+eq "restart with a file change that was still pending: queued again" "true changed" "$pending_reload ${startup_gap_verdict-}"
+
+# E4. unknown is not "covered": no record, a legacy record, garbage, an unreadable hash
+FAKE_HASH=hA
+reset_state
+startup_replay >> "$TICKLOG"
+eq "first start (no stats file): unknown -> a file-change reload is queued (what the old 20s heartbeat did)" "true unknown" "$pending_reload ${startup_gap_verdict-}"
+eq "…and no D is claimed" false "$stats_carried_over"
+reset_state
+echo "600 $((FAKE_NOW + 5400))" > "$RELOAD_STATS_FILE"        # the format of the previous version (no hash)
+startup_replay >> "$TICKLOG"
+eq "legacy 2-field stats (no hash): unknown, queued, embargo NOT carried" "true unknown $((FAKE_NOW + HEARTBEAT_INTERVAL))" "$pending_reload ${startup_gap_verdict-} $hb_next_allowed"
+eq "legacy 2-field stats: the learned D is still usable" 600 "$last_reload_secs"
+reset_state
+echo "not numbers at all" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG"
+eq "garbage stats file: D not carried, embargo not carried, queued" "0 $((FAKE_NOW + HEARTBEAT_INTERVAL)) true" "$last_reload_secs $hb_next_allowed $pending_reload"
+eq "garbage stats file is NOT reported as carried over" false "$stats_carried_over"
+reset_state
+echo "600 $((FAKE_NOW + 5400)) -" > "$RELOAD_STATS_FILE"       # saved while the covered hash was unknown
+startup_replay >> "$TICKLOG"
+eq "saved hash unknown ('-'): not covered" "true unknown" "$pending_reload ${startup_gap_verdict-}"
+FAKE_HASH=hash-error
+reset_state
+echo "600 $((FAKE_NOW + 5400)) hash-error" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG"
+eq "hash computation failed (hash-error == hash-error is not 'unchanged')" "true unknown $((FAKE_NOW + HEARTBEAT_INTERVAL))" "$pending_reload ${startup_gap_verdict-} $hb_next_allowed"
+FAKE_HASH=hA
+
+# E5. hostile numbers in the stats file
 reset_state; hb_next_allowed=$((FAKE_NOW + 20))
-echo "600 $((FAKE_NOW + 99999999))" > "$RELOAD_STATS_FILE"
-load_reload_stats "$FAKE_NOW"
-eq "an embargo far beyond the ceiling is ignored (clock skew / corruption)" $((FAKE_NOW + 20)) "$hb_next_allowed"
+echo "600 $((FAKE_NOW + 99999999)) hA" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG"
+eq "an embargo far beyond the ceiling is ignored (clock skew / corruption)" $((FAKE_NOW + HEARTBEAT_INTERVAL)) "$hb_next_allowed"
+reset_state
+echo "0600 0099 hA" > "$RELOAD_STATS_FILE"
+startup_replay >> "$TICKLOG" 2>&1   # "0099" in $(( )) is an octal error that aborts a bash 3.2 daemon
+eq "leading zeros in the stats file are decimal: '0600' is read as 600, no octal abort" 600 "$last_reload_secs"
 
 # ── F. file-detected drift through watcher_tick ──────────────────────────────
 echo "== F. file-detected drift (acceptance 3): real compute_hash, fake clock + slot"
@@ -399,6 +674,33 @@ sim_reset; SIM_D=600; HOOK_CALLS=0
 ticks 100                                    # 300 s
 ge "hooks guard ran on the heartbeat beat during 300s" "$HOOK_CALLS" 15
 
+# F6. THE restart-gap scenario through the sim slot (gate FAIL 1/3, blocking 1): the previous life
+#     had just finished a 600s heartbeat reload (embargo +5400s); a skill file changes while the
+#     daemon is down; the restarted daemon must request that change at once, not ~90 min later
+HASH_MODE=fake; FAKE_HASH=h6
+sim_reset; SIM_D=600
+prev_hash=h6; RELOAD_COVERS_HASH=h6
+finish_reload heartbeat ok 600 0 "sim" "$FAKE_NOW" >> "$TICKLOG"
+FAKE_HASH=h7
+reset_state keep-files                       # the restarted process: memory gone, stats file kept
+START_LOG=""; SLOT_BUSY_UNTIL=0; SIM_DONE_AT=0; DUP_STARTS=0
+startup_replay >> "$TICKLOG"
+ticks 5
+f6_first=$(printf '%s\n' $START_LOG | sed -n 's/^file-change@\([0-9]*\)=ok$/\1/p' | head -1)
+le "restart with an active embargo + a file that changed meanwhile: accepted within the first ticks (not ~5400s later)" "${f6_first:-99999}" 10
+eq "…by the file-change path, not by a heartbeat" 0 "$(starts_matching '^heartbeat@')"
+# …and the same restart with NO change leaves the slot alone for the whole embargo
+FAKE_HASH=h6
+sim_reset; SIM_D=600
+prev_hash=h6; RELOAD_COVERS_HASH=h6
+finish_reload heartbeat ok 600 0 "sim" "$FAKE_NOW" >> "$TICKLOG"
+reset_state keep-files
+START_LOG=""; SLOT_BUSY_UNTIL=0; SIM_DONE_AT=0; DUP_STARTS=0
+startup_replay >> "$TICKLOG"
+ticks 100                                    # 300 s
+eq "restart with an active embargo and NO change: no reload at all for 300s (the embargo does its job)" "" "$(printf '%s' "$START_LOG" | tr -d ' ')"
+HASH_MODE=real
+
 # ── G. before/after slot occupancy at the measured reload duration ───────────
 echo "== G. simulation: the controller's single reload slot, reload duration D=600s (measured 05/10)"
 SIM_HOURS="${SIM_HOURS:-6}"
@@ -488,40 +790,69 @@ else
 fi
 
 # ── H. end to end: the real daemon loop, stub gc ─────────────────────────────
-echo "== H. end to end (real daemon loop, ~10s)"
+echo "== H. end to end (real daemon loop, three lives, ~30s)"
 E2E="$TMP/e2e"
-mkdir -p "$E2E/.gc/state" "$E2E/.gc/logs" "$E2E/skills" "$TMP/e2e-wa"
+mkdir -p "$E2E/.gc/state" "$E2E/.gc/logs" "$E2E/skills" "$E2E/agents" "$E2E/scripts" "$TMP/e2e-wa"   # a complete tree: compute_hash needs scripts/ (see below)
 E2E_LOG="$E2E/.gc/logs/config-drift-watcher.log"
+E2E_STATS="$E2E/.gc/state/config-drift-watcher.reload-stats"
 : > "$TMP/e2e.gc.args"
-(
-    CITY="$E2E" CONFIG_DRIFT_WATCHER_WA="$TMP/e2e-wa" GC="$TMP/bin/gc" GCSTUB_ARGS="$TMP/e2e.gc.args" \
-    GCSTUB_MODE=ok NOTIFY_LOG="$TMP/notify.log" PATH="$TMP/bin:$PATH" \
-        exec "$BASH" "$WATCHER"
-) >/dev/null 2>&1 &
-DPID=$!
-DUMMY_PIDS="$DUMMY_PIDS $DPID"
-i=0
-while [ "$i" -lt 60 ]; do    # the daemon takes its initial hash at startup; only change a file after that
-    grep -F "Initial hash" "$E2E_LOG" >/dev/null 2>&1 && break
-    sleep 0.5; i=$((i + 1))
-done
+start_daemon() {   # the real daemon, as launchd would run it
+    : > "$E2E_LOG"
+    (
+        CITY="$E2E" CONFIG_DRIFT_WATCHER_WA="$TMP/e2e-wa" GC="$TMP/bin/gc" GCSTUB_ARGS="$TMP/e2e.gc.args" \
+        GCSTUB_MODE=ok GCSTUB_SLEEP=2 NOTIFY_LOG="$TMP/notify.log" PATH="$TMP/bin:$PATH" \
+            exec "$BASH" "$WATCHER"
+    ) >/dev/null 2>&1 &
+    DPID=$!
+    DUMMY_PIDS="$DUMMY_PIDS $DPID"
+}
+wait_for_log() {   # wait_for_log <fixed string> [tries of 0.5s] — poll the daemon's log
+    local i=0
+    while [ "$i" -lt "${2:-60}" ]; do
+        grep -F -- "$1" "$E2E_LOG" >/dev/null 2>&1 && return 0
+        sleep 0.5; i=$((i + 1))
+    done
+    return 1
+}
+stop_daemon() { kill "$DPID" 2>/dev/null || true; wait "$DPID" 2>/dev/null || true; }
+
+# life 1: first start, no stats. The restart gap is UNKNOWN, so a file-change reload is queued.
+start_daemon
+wait_for_log "Initial hash" 60   # the daemon takes its initial hash at startup; only change a file after that
 echo "# new skill" > "$E2E/skills/e2e.md"
-i=0
-while [ "$i" -lt 60 ]; do
-    grep -F "own slot duty since start" "$E2E_LOG" >/dev/null 2>&1 && break   # the last line finish_reload logs
-    sleep 0.5; i=$((i + 1))
-done
-kill "$DPID" 2>/dev/null || true
-wait "$DPID" 2>/dev/null || true
+wait_for_log "own slot duty since start" 60   # the last line finish_reload logs
+stop_daemon
 has "daemon started" "config-drift-watcher started" "$E2E_LOG"
 has "startup marker written (delivery freshness check, ga-fbjg)" "$DPID " "$E2E/.gc/state/config-drift-watcher.startup"
+has "first life, no stats: the restart gap is reported as unknown" "Restart gap: unknown" "$E2E_LOG"
 has "file change detected" "Hash changed" "$E2E_LOG"
 has "file-change reload requested" "reload[file-change] requested" "$E2E_LOG"
-has "file-change reload completed, hold time logged" "reload[file-change] OK after" "$E2E_LOG"
+has "file-change reload completed, hold time logged" "reload[file-change] OK, took" "$E2E_LOG"
 has "slot-duty proof line in the log" "own slot duty since start" "$E2E_LOG"
+has "startup log shows the EFFECTIVE duty caps" "slot duty <= 10% [configured '10']" "$E2E_LOG"
 has   "gc called as sync reload with timeout" "reload --soft --timeout ${RELOAD_CLIENT_TIMEOUT}s --city $E2E" "$TMP/e2e.gc.args"
 hasnt "gc never called with --async" "--async" "$TMP/e2e.gc.args"
-if [ -s "$E2E/.gc/state/config-drift-watcher.reload-stats" ]; then ok "reload stats persisted"; else bad "reload stats not persisted"; fi
+if [ -s "$E2E_STATS" ]; then ok "reload stats persisted"; else bad "reload stats not persisted"; fi
+eq "stats carry the covered hash (3rd field, a 32-char md5)" 32 "$(awk '{print length($3)}' "$E2E_STATS" 2>/dev/null | head -1)"
+
+# life 2: restarted with the files exactly as they were: the restart gap is 'unchanged', nothing is requested
+start_daemon
+wait_for_log "Restart gap:" 40
+sleep 7                                       # two more ticks: a wrongly queued reload would be requested by now
+stop_daemon
+has   "life 2: previous reload stats carried over" "Carried over from the previous run" "$E2E_LOG"
+has   "life 2: restart gap reported as unchanged" "Restart gap: unchanged" "$E2E_LOG"
+hasnt "life 2: no reload requested for an unchanged restart" "requested" "$E2E_LOG"
+
+# life 3: a skill file changes WHILE the daemon is down. The restart gap is 'changed': it is requested at once
+echo "# edited while the daemon was down — a longer body" >> "$E2E/skills/e2e.md"
+start_daemon
+wait_for_log "own slot duty since start" 60
+stop_daemon
+has "life 3: restart gap reported as changed" "Restart gap: changed" "$E2E_LOG"
+has "life 3: the change is requested as a file-change reload straight after the restart" "reload[file-change] requested" "$E2E_LOG"
+has "life 3: …and accepted" "reload[file-change] OK, took" "$E2E_LOG"
+hasnt "life 3: no heartbeat in the way" "reload[heartbeat] requested" "$E2E_LOG"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
