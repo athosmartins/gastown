@@ -4,16 +4,22 @@
 <dict>
   <key>Label</key><string>com.gascity.claude-pool-account</string>
 
-  <!-- ga-8hcnvb.1 — the headless pool's Claude account as DATA. One run a minute: probe the active account with a
-       1-token haiku call; if it is rejected (429 / *-status rejected) move the pool's Keychain item to the next
-       account of the order; at the stored reset time of a previously exhausted account, move back. Live pool
-       sessions follow within ~40 s (claude re-reads the item), so an exhaustion is absorbed in well under 2 min.
+  <!-- ga-8hcnvb.1 / ga-8hcnvb.2 — the headless pool's Claude account as DATA, moved at 100% by a script that spends
+       no credit. One run a minute: LOOK at the pool's own tmux panes (no API call); only if a pool session shows claude's
+       limit screen - the modal on a session's first hit ("What do you want to do?" / "Stop and wait for limit to reset"),
+       the inline "You've hit your ... limit" envelope on every later one - is the active account asked ONCE (a rejected
+       429 is free) and, if it is rejected, the pool's Keychain item is moved to the next account of the order. There is NO utilization threshold: the pool moves when the limit was hit, not before (Athos 04/10).
+       At the stored reset time of a previously exhausted account the pool moves back, with no probe of it. Sessions that
+       were on the modal of the replaced credential are sent ONE Escape (the modal only, pool panes only, 45 s after the item changed;
+       see "The Escape exception" in docs/claude-pool-account.md). Live pool sessions follow the item within ~40 s.
 
-       A run that cannot tell (network, 5xx) changes nothing. Mayor and crews are not touched: they run the plain
-       `claude` / `claude-rc` providers, which never see the pool item.
+       A run that cannot tell (network, 5xx) or cannot look (tmux down) changes nothing. Mayor and crews are not
+       touched and never pressed: they run the plain `claude` / `claude-rc` providers, which never see the pool item.
+       The daemon talks to the city's tmux server (`tmux -L gascity`): `tmux` is in /opt/homebrew/bin, on the PATH below.
 
-       KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-pool-account — the daemon
-       stops acting and new pool launches stop pointing at the item. See docs/claude-pool-account.md.
+       KILL SWITCHES (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-pool-account — the daemon
+       stops acting and new pool launches stop pointing at the item; touch .../.gc/no-pool-unstick — it still decides
+       and switches but never presses a key. See docs/claude-pool-account.md.
 
        ACTIVATION is deliberately a separate, human step (merged != live): copy this file to ~/Library/LaunchAgents
        and `launchctl load` it AFTER the script exists on main. The first run (<= 60 s later) creates the item.
@@ -29,7 +35,7 @@
   <key>WorkingDirectory</key>
   <string>/Users/athos/gt/.gascity-gastown-hq</string>
 
-  <!-- 60 s > one run (a handful of ~1 s probes; the script holds a flock, so a slow run is never doubled). -->
+  <!-- 60 s > one run (a tmux scan, and at most a probe or two of ~1 s; the script holds a flock, so a slow run is never doubled). -->
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><false/>
 

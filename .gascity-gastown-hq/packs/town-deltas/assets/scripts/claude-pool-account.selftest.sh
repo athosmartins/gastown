@@ -22,6 +22,7 @@ ok()  { echo "  ✓ $*"; PASS=$((PASS+1)); }
 bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
 [ -f "$WRAPPER" ] || { echo "FATAL: wrapper not found at $WRAPPER"; exit 1; }
+PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9), not whichever is first on PATH
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/claude-pool-account-selftest.XXXXXX")"
 cleanup() { chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }   # B50 makes a directory read-only: undo it if the run is interrupted there
@@ -127,6 +128,33 @@ grep -q "POOL-ACCT SET" "$W/city/.gc/logs/claude-pool-account.log" && ok "A9 one
 [ "$(grep -c "POOL-ACCT" "$W/city/.gc/logs/claude-lowprio.log" 2>/dev/null || true)" = "0" ] && ok "A9a the lowprio log keeps its one-line-per-launch contract (no POOL-ACCT lines)" || bad "A9a POOL-ACCT lines leaked into claude-lowprio.log"
 grep -q "sk-ant-" "$W/city/.gc/logs/claude-pool-account.log" && bad "A9b log carries a token shape" || ok "A9b log carries no token shape"
 
+# A9c the line the wrapper really writes is the line the daemon really parses, and its pid is the pid of the claude that was exec'd
+# (the daemon proves "this pane runs a pool-account claude" from that pid; a drift on either side makes every pane look unproven and
+# the whole unstick path silently inert - the one failure the other tests cannot see because they write the line themselves).
+cat > "$BIN/fake-claude-pid" <<'EOF'
+#!/bin/bash
+echo "claudepid=$$"
+EOF
+chmod +x "$BIN/fake-claude-pid"
+new_kc; touch "$FAKE_KC/items/$SVC"
+out="$(run_wrapper USER=athos GC_AGENT=gastown.dog-9 GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude-pid" -- x)"
+cat > "$W/py_setre.py" <<'EOF'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+n = 0
+for line in open(sys.argv[2], encoding="utf-8"):
+    mt = m.SET_RE.fullmatch(line.strip())
+    if mt:
+        n += 1
+        print("MATCH", mt.group(2), mt.group(3), mt.group(4))
+print("COUNT", n)
+EOF
+got="$(PYTHONDONTWRITEBYTECODE=1 "$PY3" "$W/py_setre.py" "$DAEMON" "$W/city/.gc/logs/claude-pool-account.log" 2>&1)"
+cpid="$(field claudepid "$out")"
+if [ -n "$cpid" ] && [ "$(printf '%s\n' "$got" | tail -n 1)" = "COUNT 1" ] && [ "$(printf '%s\n' "$got" | sed -n 1p)" = "MATCH $cpid gastown.dog-9 $SVC" ]; then
+  ok "A9c the wrapper's real SET line matches the daemon's SET_RE; its pid is the exec'd claude's \$\$ ($cpid), agent and item as launched"
+else bad "A9c wrapper SET line vs daemon SET_RE: claude pid='$cpid' parsed: $(printf '%s' "$got" | tr '\n' '|') log: $(tail -n 1 "$W/city/.gc/logs/claude-pool-account.log")"; fi
+
 new_kc; touch "$FAKE_KC/items/$SVC"
 mkdir -p "$W/hang"; cat > "$W/hang/security" <<'EOF'
 #!/bin/bash
@@ -157,7 +185,6 @@ done
 echo
 echo "B. daemon (claude-pool-account.py)"
 
-PY3="${CLAUDE_POOL_PY:-/usr/bin/python3}"; [ -x "$PY3" ] || PY3="$(command -v python3)"   # the interpreter launchd runs (3.9), not whichever is first on PATH
 ACCT_LIB="${CLAUDE_POOL_ACCOUNTS_LIB:-/Users/athos/gt/whatsapp_automation/lib/claude_account_pool.py}"
 BB="$W/bbin"; mkdir -p "$BB"
 
@@ -198,10 +225,42 @@ echo "secret: Not found." >&2; exit 4
 EOF
 chmod +x "$BB/security" "$BB/secret"
 
+# fake `tmux` (ga-8hcnvb.2): the pool's panes are FILES under $TMUXD - panes.txt ("<id> <pid> <dead>"), screen.<n> (what `capture-pane`
+# prints), keys.log (every `send-keys`, the only thing this daemon sends). The daemon is always pointed at it (CLAUDE_POOL_TMUX), so
+# no scenario can reach the real city's tmux server. Knobs: `down` = no server; `send-fails`; `clear-on-esc` = Escape brings the prompt
+# back (what claude does); `screen2.<n>` = what the pane shows from the SECOND capture on (the screen changing between the scan and
+# the key); `pid2.<n>` = the pane's process as `display-message` answers it (the pane being recycled between the scan and the key).
+cat > "$BB/tmux" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$TMUXD/calls.log"
+[ "${1:-}" = "-L" ] && { echo "$2" > "$TMUXD/socket"; shift 2; }
+cmd="${1:-}"; shift
+[ -e "$TMUXD/down" ] && { echo "no server running" >&2; exit 1; }
+t=""; prev=""; for a in "$@"; do [ "$prev" = "-t" ] && t="$a"; prev="$a"; done
+n="${t#%}"
+case "$cmd" in
+  list-panes) [ -f "$TMUXD/panes.txt" ] && cat "$TMUXD/panes.txt"; exit 0 ;;
+  capture-pane)
+    [ -f "$TMUXD/screen.$n" ] || exit 1
+    c=$(( $(cat "$TMUXD/cap.$n" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$TMUXD/cap.$n"
+    if [ "$c" -ge 2 ] && [ -f "$TMUXD/screen2.$n" ]; then cat "$TMUXD/screen2.$n"; else cat "$TMUXD/screen.$n"; fi ;;
+  display-message)
+    if [ -f "$TMUXD/pid2.$n" ]; then cat "$TMUXD/pid2.$n"; else awk -v id="$t" '$1 == id { print $2 }' "$TMUXD/panes.txt"; fi ;;
+  send-keys)
+    [ -e "$TMUXD/send-fails" ] && exit 1
+    echo "$t ${*: -1}" >> "$TMUXD/keys.log"
+    [ -e "$TMUXD/clear-on-esc" ] && cp "$TMUXD/prompt.txt" "$TMUXD/screen.$n"
+    exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$BB/tmux"
+
 # mock Anthropic: behaviour per Bearer token from $W/srv.json = {token: {status, h:{header:value}}}; every request token logged
 cat > "$W/mock_api.py" <<'EOF'
 import http.server, json, sys
 STATE, LOG, PORTF = sys.argv[1:4]
+DETAIL = sys.argv[4] if len(sys.argv) > 4 else None
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self): self.do_POST()   # a redirect followed by urllib arrives as a GET: log its Bearer too
     def do_POST(self):
@@ -209,6 +268,8 @@ class H(http.server.BaseHTTPRequestHandler):
         tok = (self.headers.get("authorization") or "").replace("Bearer ", "")
         beh = json.load(open(STATE)).get(tok) or {"status": 401, "h": {}}
         with open(LOG, "a") as f: f.write(tok + "\n")
+        if DETAIL:
+            with open(DETAIL, "a") as f: f.write("%s %s %s %s\n" % (self.command, self.path, beh["status"], tok[-4:]))
         self.send_response(beh["status"])
         for k, v in beh.get("h", {}).items(): self.send_header(k, v)
         body = b"{}"; self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body)))
@@ -224,7 +285,116 @@ TOKEN_a="sk-ant-oat01-TESTaaaaaaaaaaaaaaaaaaaaaaaa"; TOKEN_b="sk-ant-oat01-TESTb
 tok_of() { case "$1" in a@t.test) echo "$TOKEN_a" ;; b@t.test) echo "$TOKEN_b" ;; c@t.test) echo "$TOKEN_c" ;; esac; }
 fp_of() { printf '%s' "$1" | shasum -a 256 | cut -c1-8; }
 
-D="$W/d"; STATE="$D/current.json"; SRV_PID=""
+D="$W/d"; STATE="$D/current.json"; SRV_PID=""; TMUXD="$D/tmux"
+
+# ── the pool's panes (ga-8hcnvb.2). A pane is a REAL process (`sleep`, standing for the claude the wrapper exec'd) plus the wrapper's
+# POOL-ACCT SET line for its pid, plus a screen file the fake tmux serves. That is what the daemon's proof of 'a pool pane' looks at.
+PANE_PIDS=(); pane_n=10
+pane_kill_all() { local p; for p in "${PANE_PIDS[@]:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; }; done; PANE_PIDS=(); }
+trap 'pane_kill_all; cleanup' EXIT
+set_line() { # set_line <pid> <agent> [seconds to add to now for the line's time]  - what claude-lowprio.sh logs just before it exec's claude
+  printf '%s pid=%s agent=%s wrapper POOL-ACCT SET item=%s\n' "$(date -u -r $(( $(date +%s) + ${3:-0} )) +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "${SET_ITEM:-$SVC}" >> "$D/city/.gc/logs/claude-pool-account.log"
+}
+MODAL_SCREEN='● Working on the bead...
+
+  You hit your weekly limit · resets Oct 7, 7pm
+
+ What do you want to do?
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Oct 7 at 7pm
+   3. Upgrade your plan
+
+ Enter to confirm · Esc to cancel'
+PROMPT_SCREEN='  You hit your weekly limit · resets Oct 7, 7pm
+
+╭──────────────────────────────╮
+│ >                            │
+╰──────────────────────────────╯
+  ? for shortcuts'
+QUOTED_SCREEN='● The bead says the screen reads:
+    What do you want to do?
+    ❯ 1. Stop and wait for limit to reset
+    Enter to confirm · Esc to cancel
+  and that is what the script has to recognise.
+
+╭──────────────────────────────╮
+│ >                            │
+╰──────────────────────────────╯
+  ? for shortcuts'
+WORKING_SCREEN='● Reading the file...
+  ✻ Thinking… (12s · esc to interrupt)
+
+╭──────────────────────────────╮
+│ >                            │
+╰──────────────────────────────╯'
+# The REAL shapes (claude 2.1.291, an account whose weekly limit is hit; captured live by the acceptance probe). The modal opens on a session's
+# FIRST hit only; after it is dismissed every later hit is just the envelope, with the prompt box right under it.
+RULE='──────────────────────────────────────────────────────────────────────'
+BOX="$RULE
+❯ 
+$RULE
+  ⏸ manual mode on · ? for shortcuts · ← for agents"
+BANNER=' ▐▛███▛█   Claude Code v2.1.291
+▝▜██████▀  Haiku 4.5 · Claude API
+ ▝▝   ▝▝   ~/work'
+HIT1="❯ Reply with exactly: ALPHA
+  ⎿  You've hit your weekly limit · resets Oct 7 at 7pm (America/Sao_Paulo)
+✻ Sautéed for 3s · done 7:35 AM"
+HIT2="❯ Reply with exactly: BRAVO
+  ⎿  You've hit your weekly limit · resets Oct 7 at 7pm (America/Sao_Paulo)
+     /upgrade to increase your usage limit.
+✻ Crunched for 0s · done 7:36 AM"
+HIT3="❯ Reply with exactly: CHARLIE
+  ⎿  You've hit your weekly limit · resets Oct 7 at 7pm (America/Sao_Paulo)
+     /upgrade to increase your usage limit.
+✻ Brewed for 1s · done 7:39 AM"
+MODALBLK='▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Oct 7 at 7pm
+     3. Upgrade your plan
+   Enter to confirm · Esc to cancel'
+INLINE1_SCREEN="$BANNER
+$HIT1
+$BOX"
+INLINE2_SCREEN="$BANNER
+$HIT1
+$HIT2
+$BOX"
+INLINE3_SCREEN="$BANNER
+$HIT1
+$HIT2
+$HIT3
+$BOX"
+MODALREAL_SCREEN="$BANNER
+$HIT1
+$MODALBLK"
+pane_screen() { # pane_screen <pane id> <modal|prompt|quoted|working|inline1|inline2|inline3|modalreal>
+  local s; case "$2" in modal) s="$MODAL_SCREEN" ;; prompt) s="$PROMPT_SCREEN" ;; quoted) s="$QUOTED_SCREEN" ;; working) s="$WORKING_SCREEN" ;;
+    inline1) s="$INLINE1_SCREEN" ;; inline2) s="$INLINE2_SCREEN" ;; inline3) s="$INLINE3_SCREEN" ;; modalreal) s="$MODALREAL_SCREEN" ;; *) s="$2" ;; esac
+  printf '%s\n' "$s" > "$TMUXD/screen.${1#%}"; printf '%s\n' "$PROMPT_SCREEN" > "$TMUXD/prompt.txt"
+}
+pane_add() { # pane_add <agent> <screen> [line-time offset] -> $PANE (id) and $PANE_PID. The pane's own process IS the claude.
+  pane_n=$((pane_n + 1)); PANE="%$pane_n"
+  sleep 900 & PANE_PID=$!; PANE_PIDS+=("$PANE_PID")
+  echo "$PANE $PANE_PID 0" >> "$TMUXD/panes.txt"
+  set_line "$PANE_PID" "$1" "${3:-0}"
+  pane_screen "$PANE" "$2"
+}
+pane_add_child() { # pane_add_child <agent> <screen>: the pane's process is a shell and claude (the pid on the SET line) is its child
+  pane_n=$((pane_n + 1)); PANE="%$pane_n"; rm -f "$D/childpid"
+  bash -c 'sleep 900 & echo $! > "$0"; wait' "$D/childpid" & PANE_PID=$!; PANE_PIDS+=("$PANE_PID")
+  local n=0; while [ ! -s "$D/childpid" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n+1)); done
+  CHILD_PID="$(cat "$D/childpid")"; PANE_PIDS+=("$CHILD_PID")
+  echo "$PANE $PANE_PID 0" >> "$TMUXD/panes.txt"
+  set_line "$CHILD_PID" "$1"
+  pane_screen "$PANE" "$2"
+}
+unset_line() { grep -v " pid=$1 " "$D/city/.gc/logs/claude-pool-account.log" > "$D/log.tmp"; cp "$D/log.tmp" "$D/city/.gc/logs/claude-pool-account.log"; }   # a pane the wrapper never launched onto the pool item
+keys_sent() { [ -f "$TMUXD/keys.log" ] && wc -l < "$TMUXD/keys.log" | tr -d ' ' || echo 0; }
+keys_to() { [ -f "$TMUXD/keys.log" ] && grep -c "^$1 " "$TMUXD/keys.log" || echo 0; }
+rearm() { edit_state 'st.pop("panes", None)'; }   # the session hit the limit AGAIN: a modal the daemon has not seen before
 # A reset time is believed only if it is ahead of NOW and at most 31 days away (the daemon's _usable_reset). The scenarios below
 # store reset times like 2000000000, so they run on a clock that makes them 11 days ahead - unless a test sets NOW_OVERRIDE itself
 # (NOW_OVERRIDE= with an empty value = the real clock).
@@ -247,7 +417,8 @@ EOF
 }
 new_d() { # fresh daemon world with all three accounts allowed
   [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
-  rm -rf "$D"; mkdir -p "$D/kc/items" "$D/vault" "$D/city/.gc/logs" "$D/home"
+  pane_kill_all
+  rm -rf "$D"; mkdir -p "$D/kc/items" "$D/vault" "$D/city/.gc/logs" "$D/home" "$TMUXD"
   : > "$D/probes.log"; echo '{}' > "$D/srv.json"
   local i=0 e
   for e in "${EMAILS[@]}"; do printf '%s' "$(tok_of "$e")" > "$D/vault/$e"; set_srv "$e" 200 "$HDR_OK"; done
@@ -263,7 +434,7 @@ accts = [{"email": e, "ok": True, "stale": False, "collected_at": iso, "last_ok_
          for i, e in enumerate(["a@t.test", "b@t.test", "c@t.test"])]
 json.dump({"_selftest_fresh": True, "updated_at": iso, "accounts": accts}, open(sys.argv[1], "w"))
 EOF
-  "$PY3" "$W/mock_api.py" "$D/srv.json" "$D/probes.log" "$D/port" & SRV_PID=$!
+  "$PY3" "$W/mock_api.py" "$D/srv.json" "$D/probes.log" "$D/port" "$D/served.log" & SRV_PID=$!
   local n=0; while [ ! -s "$D/port" ] && [ $n -lt 100 ]; do sleep 0.1; n=$((n+1)); done
   export FAKE_KC="$D/kc" VAULT="$D/vault"
 }
@@ -290,7 +461,9 @@ run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean enviro
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   restamp_store "${NOW_OVERRIDE-$NOW_BASE}"
+  rm -f "$TMUXD"/cap.* 2>/dev/null
   env -i HOME="$D/home" USER=athos PATH="$BB:/usr/bin:/bin" GC_CITY_PATH="$D/city" FAKE_KC="$D/kc" VAULT="$D/vault" \
+      TMUXD="$TMUXD" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_TMUX_SOCKET=selftest \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
       CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" "${envs[@]}" "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
@@ -327,6 +500,7 @@ fi
 
   # ---- helpers for the scenarios below
   jex() { "$PY3" -c 'import json,sys; e=json.load(open(sys.argv[1])).get("exhausted",{}).get(sys.argv[2],{}); v=e.get(sys.argv[3]); print("" if v is None else v)' "$STATE" "$1" "$2" 2>/dev/null; }
+  nlog() { local c; c="$(grep -c -- "$1" "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null)"; echo "${c:-0}"; }
   probes_of() { grep -cxF "$(tok_of "$1")" "$D/probes.log" 2>/dev/null || true; }
   edit_state() { "$PY3" - "$STATE" "$1" <<'EOF'
 import json, sys
@@ -334,7 +508,9 @@ p, code = sys.argv[1:3]
 st = json.load(open(p)); exec(code); json.dump(st, open(p, "w"))
 EOF
   }
-  seeded() { new_d; run_d -- run-once; }   # world where a is the seeded account
+  # world where a is the seeded account (item rewritten long ago) and one pool session is sitting on the limit modal: the evidence
+  # every failover needs. The pane is added AFTER the seed run, so the daemon sees the modal for the first time in the run under test.
+  seeded() { new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 modal; }
   LOG="$D/city/.gc/logs/claude-pool-account.log"   # the daemon's log (D never changes: new_d recreates the same path)
 
   # B1e: seed skips an account that is already rejected
@@ -355,7 +531,9 @@ EOF
   # B4 failover skips a rejected candidate
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; set_srv b@t.test 429 "$(hdr_rejected five_hour 1999500000)"; run_d -- run-once
   [ "$(item_token)" = "$TOKEN_c" ] && [ "$(jget "$STATE" current)" = "c@t.test" ] && ok "B4 the next account is probed BEFORE the item moves: rejected b is skipped, c wins" || bad "B4 current='$(jget "$STATE" current)'"
-  [ -n "$(jex b@t.test reset_epoch)" ] && ok "B4b the skipped candidate's rejection is recorded too" || bad "B4b b not recorded as exhausted"
+  [ -z "$(jex b@t.test reset_epoch)" ] && [ "$(nlog "API-CALL count_tokens")" = "3" ] && [ "$(nlog "API-CALL messages")" = "1" ] \
+    && ok "B4b a candidate is asked only whether its KEY is accepted (count_tokens: seed a, then b and c), never for balance: b's 429 there is 'could not tell' - skipped this run, not registered; the one messages call is the evidence probe of a" \
+    || bad "B4b b-entry='$(jex b@t.test reset_epoch)' count_tokens=$(nlog "API-CALL count_tokens") messages=$(nlog "API-CALL messages")"
 
   # B5 everything rejected: stay put, do not write
   seeded; w0=$(writes)
@@ -388,7 +566,7 @@ EOF
   [ "$(jget "$STATE" current)" = "b@t.test" ] || bad "B9 precondition: failover to b did not happen"
   NOW_OVERRIDE=2000000100 run_d -- run-once                                                    # failback to a (no probe)
   [ "$(jget "$STATE" current)" = "a@t.test" ] || bad "B9 precondition: failback to a did not happen"
-  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000090000)"; NOW_OVERRIDE=2000000200 run_d -- run-once   # a still rejected
+  rearm; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000090000)"; NOW_OVERRIDE=2000000200 run_d -- run-once   # a still rejected: the session hits the limit again (a modal not seen before)
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(jex a@t.test reset_epoch)" = "2000090000.0" -o "$(jex a@t.test reset_epoch)" = "2000090000" ] \
     && ok "B9 failed failback -> a's 429 triggers the failover again and the new reset time is stored" || bad "B9 current='$(jget "$STATE" current)' reset='$(jex a@t.test reset_epoch)'"
   NOW_OVERRIDE=2000000300 run_d -- run-once
@@ -638,7 +816,7 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   [ -z "$(jex a@t.test why)" ] && grep -q "exhausted entry for a@t.test dropped: its key was refused" "$LOG" \
     && ok "B32d the refused key's entry leaves the registry at its time WITH a line saying why (it used to go in silence)" \
     || bad "B32d a-entry='$(jex a@t.test why)': $(grep -E 'dropped' "$LOG" | tail -n 1)"
-  set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
+  rearm; set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=2000000100 run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B32b ...and once its key works again it is used the normal way: probed on the next failover (b rejected -> a)" \
     || bad "B32b current='$(jget "$STATE" current)'"
 
@@ -661,6 +839,8 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   # been rejected, the pool stayed put, then it renewed) the entry is cleared now, not left to veto it in a later failover.
   seeded; for e in a b c; do set_srv "$e@t.test" 429 "$(hdr_rejected seven_day 2000000000)"; done; run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] || bad "B33 precondition: all rejected -> stay on a, a registered"
+  # (b and c are only asked whether their KEY works, so "all rejected" registers just the probed account: b's entry is put there directly)
+  edit_state 'st["exhausted"]["b@t.test"]={"reset_epoch":2000000000.0,"claim":"seven_day","why":"rejected"}'
   set_srv a@t.test 200 "$HDR_OK"; run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ -z "$(jex a@t.test reset_epoch)" ] && [ -n "$(jex b@t.test reset_epoch)" ] \
     && ok "B33 the active account answers again -> its stale exhausted entry is cleared (the others are kept)" \
@@ -670,7 +850,6 @@ print("OK" if n and n == pwd.getpwuid(os.getuid()).pw_name and m.valid_user(n) e
   hide_key() { rm -f "$D/vault/$1"; }
   show_key() { printf '%s' "$(tok_of "$1")" > "$D/vault/$1"; }
   vault_calls() { [ -f "$D/vault/.calls" ] && wc -l < "$D/vault/.calls" | tr -d ' ' || echo 0; }
-  nlog() { local c; c="$(grep -c -- "$1" "$D/city/.gc/logs/claude-pool-account.log" 2>/dev/null)"; echo "${c:-0}"; }
   KEYMISS="its key did not come from the vault this run"
   item_set() { "$PY3" - "$D/kc/items/$SVC" "$1" <<'EOF'
 import json, sys
@@ -733,7 +912,7 @@ EOF
   seeded; w0=$(writes); touch "$D/vault/.broken"; run_d -- run-once; rc=$?
   [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] \
     && ok "B39 vault down, a answers -> stays on a, nothing written" || bad "B39 rc=$rc current='$(jget "$STATE" current)' writes $w0 -> $(writes)"
-  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  rearm; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] \
     && ok "B39b vault down, a REJECTED -> the rejection is recorded; no candidate has a key, so the item is not touched" || bad "B39b current='$(jget "$STATE" current)' a-why='$(jex a@t.test why)' writes $w0 -> $(writes)"
   rm -f "$D/vault/.broken"
@@ -924,7 +1103,7 @@ EOF
   # B46 two recovered accounts outrank the active one (c), and the write for the first is REFUSED. The failback did not happen, so the one
   # that was not even tried (b) must stay in the registry like the one that failed (a): at ad18b45 b was dropped in silence, only a kept.
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once                         # a -> b
-  set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                                 # b -> c
+  rearm; set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                         # b -> c
   [ "$(jget "$STATE" current)" = "c@t.test" ] && [ -n "$(jex a@t.test reset_epoch)" ] && [ -n "$(jex b@t.test reset_epoch)" ] || bad "B46 precondition: on c, a and b registered (current='$(jget "$STATE" current)')"
   set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 200 "$HDR_OK"; touch "$D/kc/refuse-writes"; w0=$(writes); NOW_OVERRIDE=$((R + 60)) run_d -- run-once; rm -f "$D/kc/refuse-writes"
   [ "$(jget "$STATE" current)" = "c@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] && [ "$(jex b@t.test why)" = "rejected" ] \
@@ -945,7 +1124,7 @@ EOF
   # B47b ...and it does not stop the failback: with a and b both recovered and ahead of c, a's missing key leaves a in the registry and the
   # next candidate (b) is still gone back to.
   seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3600)) run_d -- run-once                         # a -> b
-  set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                                 # b -> c
+  rearm; set_srv b@t.test 429 "$(hdr_rejected seven_day $R)"; NOW_OVERRIDE=$((R - 3500)) run_d -- run-once                         # b -> c
   set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 200 "$HDR_OK"; hide_key a@t.test; NOW_OVERRIDE=$((R + 60)) run_d -- run-once; show_key a@t.test
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(jex a@t.test why)" = "rejected" ] && [ -z "$(jex b@t.test why)" ] \
     && ok "B47b a (no key) is kept and the failback goes on to b" \
@@ -989,7 +1168,7 @@ EOF
   # a bare 'unhandled PermissionError' reads as 'nothing happened' (gate ga-aozw8x). $D holds the state file's directory, and the
   # temp file for the atomic replace is created there, so a read-only $D is exactly 'the state cannot be written'.
   ro_state_run() { # ro_state_run  -> runs the daemon with the state dir read-only; sets rc; prints nothing; skips (rc=skip) if that is not enforceable (root)
-    : > "$LOG"; chmod a-w "$D"
+    grep -F "wrapper POOL-ACCT SET" "$LOG" > "$W/set-proof.keep" 2>/dev/null; cp "$W/set-proof.keep" "$LOG"; chmod a-w "$D"   # $LOG is also the wrapper's log: its SET lines are the proof a pane is a pool pane
     if ( : > "$D/.rotest" ) 2>/dev/null; then rm -f "$D/.rotest"; chmod u+w "$D"; rc=skip; return 0; fi
     run_d -- run-once; rc=$?; chmod u+w "$D"
   }
@@ -1011,6 +1190,476 @@ EOF
     grep -qF "decision NOT published (PermissionError); this run did not move the pool item to another account" "$LOG" && ! grep -q "was switched to" "$LOG" \
       && ok "B50e ...and the log does not claim a switch" || bad "B50e log: $(tail -n 3 "$LOG" | tr '\n' '|')"
   fi
+
+  # ══ B51..B79 (ga-8hcnvb.2): the switch happens when the limit was HIT, on EVIDENCE from the pool's own panes, by this script alone ══
+  # (Athos 04/10: "tem que trocar no 100%. A gente não quer ficar com 5% sem usar" - no preventive threshold, no agent, no credit.)
+  #   B51..B54  no evidence / could not look  -> nothing asked, nothing moved      B55..B57  whose panes count at all (never Mayor / crews)
+  #   B52       evidence -> failover in the same run, nothing that costs            B53       evidence the account answers -> bounded cost
+  #   B60..B66  the Escape: when, to whom, how often, how it is guarded             B67..B69  the bookkeeping behind it
+  #   B70       failback by timer and the evidence                                  B71       the whole cycle, with the zero-credit proof
+  #   B72       no failback before the stored reset                                  B73..B79  the limit screen after the modal is gone (envelope only)
+  cat > "$BB/claude" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$FAKE_KC/claude-invoked"
+EOF
+  chmod +x "$BB/claude"   # on the daemon's PATH: if anything in it ever ran `claude`, this is what it would reach
+  msgs() { nlog "API-CALL messages"; }
+  cts() { nlog "API-CALL count_tokens"; }
+  served() { local c; c="$(grep -c ' /v1/messages 200 ' "$D/served.log" 2>/dev/null)"; echo "${c:-0}"; }   # calls the API SERVED: the only ones that cost
+  later() { local s="$1"; shift; NOW_OVERRIDE=$((NOW_BASE + s)) run_d "$@" -- run-once; }                     # one more run, <s> seconds after the failover
+  failed_over() { seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; }   # a rejected, the dog pane on the modal -> the pool is on b
+  addressed() { local n=0 c x; for x in "$@"; do c="$(grep -cE -- "-t $x( |\$)" "$TMUXD/calls.log" 2>/dev/null)"; n=$((n + ${c:-0})); done; echo "$n"; }   # tmux calls aimed at those panes
+  pane_tries() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sorted(e.get("tries") for e in d.get("panes", {}).values()))' "$STATE" 2>/dev/null; }
+
+  # B51 NO EVIDENCE, NO CALL. a is rejected on the server, but no pool session is on the limit modal (nobody is working, the modal is
+  # only QUOTED in a transcript, the prompt is back after an Escape with the old 'hit your limit' line still above it, the only modal
+  # is on a pane the wrapper never launched onto the item, or there is no pane at all): the API is not asked, nothing moves, no key.
+  for kind in none working quoted prompt nonpool; do
+    new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
+    case "$kind" in none) ;; nonpool) pane_add gastown.dog-2 modal; unset_line "$PANE_PID" ;; *) pane_add gastown.dog-2 "$kind" ;; esac
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; w0=$(writes); pa0=$(probes_of a@t.test)
+    run_d -- run-once; later 60; later 120
+    extra=1
+    case "$kind" in
+      none) [ ! -e "$TMUXD/calls.log" ] || extra=0 ;;                                                        # nothing follows the item: tmux is not even asked
+      nonpool) [ "$(addressed "$PANE")" = "0" ] || extra=0 ;;   # ...and a pane that is not the pool's is not even looked at
+    esac
+    [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] \
+      && [ "$(msgs)" = "0" ] && [ "$(keys_sent)" = "0" ] && [ "$extra" = "1" ] \
+      && ok "B51 ($kind) a is rejected but no pool session is on the limit modal -> the API is not asked, no switch, no key (3 runs)" \
+      || bad "B51 ($kind): current='$(jget "$STATE" current)' probes of a $pa0 -> $(probes_of a@t.test) messages-calls=$(msgs) keys=$(keys_sent) extra=$extra"
+  done
+  # B51e 100%, not before: the usage store ranks a LAST (session 100%, week 99%) and the key is still accepted - without the modal it is
+  # not a reason to move (the old preventive design moved at 95%).
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 working
+  usage_store a:100:99:$((NOW_BASE - 1)) b:5:10:$((NOW_BASE - 1)) c:5:10:$((NOW_BASE - 1)); w0=$(writes); run_d -- run-once; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$w0" ] && [ "$(msgs)" = "0" ] \
+    && ok "B51e a at 99%/100% of its windows but nobody on the modal -> no switch: the pool moves when the limit is HIT, not before" \
+    || bad "B51e current='$(jget "$STATE" current)' writes $w0 -> $(writes) messages-calls=$(msgs)"
+
+  # B52 EVIDENCE -> one question to the account in use; rejected (free) -> the pool item moves in the same run; nothing that costs.
+  seeded; m0=$(msgs); c0=$(cts); w0=$(writes); pa0=$(probes_of a@t.test); pb0=$(probes_of b@t.test); pc0=$(probes_of c@t.test)
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$((w0 + 1))" ] \
+    && ok "B52 a pool session on the limit modal + a rejected -> the pool item holds b after ONE run, with no human and no restart" \
+    || bad "B52 current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) writes $w0 -> $(writes)"
+  [ "$(msgs)" = "$((m0 + 1))" ] && [ "$(cts)" = "$((c0 + 1))" ] && [ "$(probes_of a@t.test)" = "$((pa0 + 1))" ] && [ "$(probes_of b@t.test)" = "$((pb0 + 1))" ] && [ "$(probes_of c@t.test)" = "$pc0" ] \
+    && ok "B52b exactly two calls: the evidence probe of a (a rejection), and the KEY check of b (count_tokens, not billed); c was never asked" \
+    || bad "B52b messages $m0 -> $(msgs), count_tokens $c0 -> $(cts), probes a $pa0 -> $(probes_of a@t.test) b $pb0 -> $(probes_of b@t.test) c $pc0 -> $(probes_of c@t.test)"
+  [ "$(served)" = "0" ] && [ ! -e "$D/kc/claude-invoked" ] && [ "$(keys_sent)" = "0" ] \
+    && ok "B52c the zero-credit proof for the switch: the API SERVED nothing (the one messages call was a 429), no claude was ever run, no key sent in the run that rewrote the item" \
+    || bad "B52c served=$(served) claude-invoked=$(cat "$D/kc/claude-invoked" 2>/dev/null | head -c 80) keys=$(keys_sent)"
+  grep -q "EVIDENCE: 1 pool pane(s) on the limit modal (gastown.dog-2)" "$LOG" && grep -q "SWITCH a@t.test -> b@t.test.*failover: a@t.test rejected" "$LOG" \
+    && ok "B52d the log names the evidence (which sessions) and the switch (from, to, why)" || bad "B52d log: $(grep -E 'EVIDENCE|SWITCH' "$LOG" | tail -n 2 | tr '\n' '|')"
+  # B52e the daemon cannot run claude: no subprocess call in its source names it (the stub above is the dynamic half of this)
+  n="$(grep -E 'subprocess\.(run|Popen|call|check_output|check_call)\(|os\.system|shell *= *True' "$DAEMON" | grep -ciE 'claude|anthropic')"
+  [ "$n" = "0" ] && ok "B52e no subprocess call in the daemon names claude (it runs security, ps and tmux, nothing else)" || bad "B52e $n subprocess line(s) mention claude"
+  # B52f twenty-five sessions on the modal cost ONE question, not twenty-five
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; for i in $(seq 1 25); do pane_add "gastown.dog-$i" modal; done
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] \
+    && ok "B52f 25 pool sessions on the modal -> ONE evidence probe, one switch" || bad "B52f current='$(jget "$STATE" current)' messages-calls=$(msgs)"
+
+  # B53 evidence the account ANSWERS (the screen is about another limit, a modal about to go away...): nothing moves, no key, and the
+  # cost is bounded - a served call is a few tokens, at most once per cooldown per screen; a NEW screen is asked about at once.
+  seeded; pa0=$(probes_of a@t.test); w0=$(writes); run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(probes_of a@t.test)" = "$((pa0 + 1))" ] && [ "$(writes)" = "$w0" ] && [ "$(keys_sent)" = "0" ] \
+    && grep -q "answers - the limit modal on screen is not about this account" "$LOG" \
+    && ok "B53 modal on screen but a ANSWERS -> one probe, no switch, no key, and the log says the screen is not about this account" \
+    || bad "B53 current='$(jget "$STATE" current)' probes of a $pa0 -> $(probes_of a@t.test) keys=$(keys_sent)"
+  run_d -- run-once; later 599; p1=$(probes_of a@t.test)
+  [ "$p1" = "$((pa0 + 1))" ] && ok "B53b the same screen is not asked about again inside the cooldown (600 s): still 1 probe" || bad "B53b probes of a: $pa0 -> $p1"
+  later 601; p2=$(probes_of a@t.test)
+  [ "$p2" = "$((pa0 + 2))" ] && ok "B53c ...and once the cooldown has passed it is asked again (2)" || bad "B53c probes of a: $pa0 -> $p2"
+  rearm; NOW_OVERRIDE=$((NOW_BASE + 602)) run_d -- run-once
+  [ "$(probes_of a@t.test)" = "$((pa0 + 3))" ] && [ "$(keys_sent)" = "0" ] && ok "B53d a NEW screen is evidence at once, whatever was answered about the old one (3); and no key through any of it" || bad "B53d probes of a: $pa0 -> $(probes_of a@t.test) keys=$(keys_sent)"
+  for cd in 0 abc -5 nan 999999; do
+    seeded; pa0=$(probes_of a@t.test); run_d CLAUDE_POOL_EVIDENCE_COOLDOWN_S=$cd -- run-once; run_d CLAUDE_POOL_EVIDENCE_COOLDOWN_S=$cd -- run-once
+    case "$cd" in 0) want=2 ;; *) want=1 ;; esac
+    [ "$(( $(probes_of a@t.test) - pa0 ))" = "$want" ] && ok "B53e CLAUDE_POOL_EVIDENCE_COOLDOWN_S=$cd -> $want probe(s) in two runs (0 = every run; junk/out of range = the default 600 s)" \
+      || bad "B53e cooldown=$cd: probes of a $pa0 -> $(probes_of a@t.test) (want +$want)"
+  done
+
+  # B54 COULD NOT LOOK concludes nothing: not 'no evidence' (which allows a failback), not 'evidence' (which asks the API), no key.
+  for how in down no-binary; do
+    seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; w0=$(writes); pa0=$(probes_of a@t.test)
+    if [ "$how" = "down" ]; then touch "$TMUXD/down"; run_d -- run-once; else run_d CLAUDE_POOL_TMUX="$W/no-such-tmux" -- run-once; fi
+    [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(probes_of a@t.test)" = "$pa0" ] && [ "$(msgs)" = "0" ] && [ "$(keys_sent)" = "0" ] \
+      && grep -q "the pool's panes could not be looked at this run - nothing concluded" "$LOG" \
+      && ok "B54 tmux $how -> panes could not be looked at: nothing asked, nothing moved, no key - and the log says so" \
+      || bad "B54 ($how) current='$(jget "$STATE" current)' writes $w0 -> $(writes) messages-calls=$(msgs): $(tail -n 2 "$LOG" | tr '\n' '|')"
+    rm -f "$TMUXD/down"; run_d -- run-once
+    [ "$(jget "$STATE" current)" = "b@t.test" ] && ok "B54b ...and when it can look again the modal that was there all along is found, and the pool moves" || bad "B54b ($how) current='$(jget "$STATE" current)'"
+  done
+  seeded; pa0=$(probes_of a@t.test); run_d -- run-once; s0="$(jget "$STATE" panes)"; touch "$TMUXD/down"; run_d -- run-once; s1="$(jget "$STATE" panes)"; rm -f "$TMUXD/down"; run_d -- run-once
+  [ "$s0" = "$s1" ] && [ -n "$s0" ] && [ "$(probes_of a@t.test)" = "$((pa0 + 1))" ] \
+    && ok "B54c a run that could not look leaves the bookkeeping as it was: the screen a answered about is not asked about again afterwards" || bad "B54c panes '$s0' / '$s1', probes of a $pa0 -> $(probes_of a@t.test)"
+  # B54d the wrapper's log is there but cannot be READ -> could not look (None); no log at all -> nothing follows the item ({}).
+  mkdir -p "$W/plcity/.gc/logs"; rm -f "$W/plcity/.gc/logs/claude-pool-account.log"
+  cat > "$W/py_launches.py" <<'EOF'
+import importlib.util, os, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+p = sys.argv[2]; r = [m.pool_launches()]                     # no file
+os.mkdir(p); r.append(m.pool_launches()); os.rmdir(p)         # a directory where the file should be: open() fails, and it is not 'not found'
+open(p, "w").write("2033-05-18T03:33:20Z pid=77 agent=gastown.dog-2 wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
+                   "2033-05-18T03:33:21Z pid=78 agent=mayor wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
+                   "2033-05-18T03:33:22Z pid=79 agent=a/Crew wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
+                   "2033-05-18T03:33:23Z pid=80 agent=gastown.dog-2 wrapper POOL-ACCT SET item=Claude Code-credentials-deadbeef\n"
+                   "2033-05-18T03:33:24Z pid=81 agent=gastown.dog-2 wrapper POOL-ACCT SKIP item=" + m.item_service() + "\n")
+r.append(sorted(m.pool_launches()))
+print(r)
+EOF
+  got="$(env -i HOME="$W/home" GC_CITY_PATH="$W/plcity" CLAUDE_POOL_CRED_DIR="$POOL_DIR" "$PY3" "$W/py_launches.py" "$DAEMON" "$W/plcity/.gc/logs/claude-pool-account.log" 2>&1)"
+  [ "$got" = "[{}, None, [77]]" ] && ok "B54d no wrapper log -> {} (nothing follows the item); unreadable log -> None (could not look); only a SET line for THIS item counts, and a mayor/crew agent name never does" \
+    || bad "B54d pool_launches -> $got"
+
+  # B55 MAYOR AND THE CREWS are never looked at, never counted as evidence and never pressed (Athos 05/10: their Remote Control must not
+  # be disturbed) - whatever their screen says and even if their launch line said they follow the pool item.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
+  pane_add mayor modal; may=$PANE; pane_add gastown.crew-1 modal; crew=$PANE; pane_add weird/mayor modal; weird=$PANE; pane_add hq/Crew-x modal; crewx=$PANE
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; w0=$(writes); run_d -- run-once; later 60; later 120
+  touched=$(addressed "$may" "$crew" "$weird" "$crewx")
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(msgs)" = "0" ] && [ "$(keys_sent)" = "0" ] && [ "$touched" = "0" ] \
+    && ok "B55 mayor / crew sessions on the modal (their launch lines even say SET) are no evidence, are not even looked at, and get no key" \
+    || bad "B55 current='$(jget "$STATE" current)' messages-calls=$(msgs) keys=$(keys_sent) tmux-calls-addressed-to-them=$touched"
+  # B55b ...and with a real pool session on the modal among them: the pool moves, and the one key goes to the pool session alone.
+  seeded; dog1=$PANE
+  pane_add gastown.dog-3 working; pane_add gastown.dog-4 quoted; pane_add gastown.dog-5 prompt
+  pane_add mayor modal; may=$PANE; pane_add gastown.crew-1 modal; crew=$PANE; pane_add weird/mayor modal; weird=$PANE; pane_add hq/Crew-x modal; crewx=$PANE
+  pane_add gastown.dog-9 modal; nopool=$PANE; unset_line "$PANE_PID"
+  touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120
+  touched=$(addressed "$may" "$crew" "$weird" "$crewx" "$nopool")
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(keys_sent)" = "1" ] && [ "$(keys_to "$dog1")" = "1" ] && [ "$touched" = "0" ] \
+    && ok "B55b one pool session on the modal among 8 panes (mayor, crews, a stranger, a working one...) -> the pool moves and the ONE Escape goes to that session" \
+    || bad "B55b current='$(jget "$STATE" current)' keys=$(keys_sent) to-dog=$(keys_to "$dog1") tmux-calls-addressed-to-the-others=$touched: $(cat "$TMUXD/keys.log" 2>/dev/null | tr '\n' '|')"
+
+  # B56 what makes a pane a POOL pane: the wrapper's SET line for the item, for a pid that is alive and STARTED when the line says.
+  # Each of these has a modal on screen and a rejected a, and none is evidence (B52 is the positive control for the same world).
+  for how in other-item recycled-pid late-line dead-process dead-pane; do
+    new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
+    case "$how" in
+      other-item) SET_ITEM="Claude Code-credentials-deadbeef" pane_add gastown.dog-2 modal ;;                  # launched onto ANOTHER item
+      recycled-pid) pane_add gastown.dog-2 modal -3600 ;;                                                       # the line is an hour older than this process: it is another one's
+      late-line) pane_add gastown.dog-2 modal 300 ;;                                                            # the process started minutes before the line that claims it
+      dead-process) pane_add gastown.dog-2 modal; kill "$PANE_PID"; wait "$PANE_PID" 2>/dev/null ;;
+      dead-pane) pane_add gastown.dog-2 modal; sed -i '' 's/ 0$/ 1/' "$TMUXD/panes.txt" ;;
+    esac
+    set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; w0=$(writes); run_d -- run-once; later 60
+    [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(msgs)" = "0" ] && [ "$(keys_sent)" = "0" ] \
+      && ok "B56 ($how) not proven to be a pool session -> not evidence, no probe, no key" \
+      || bad "B56 ($how) current='$(jget "$STATE" current)' messages-calls=$(msgs) keys=$(keys_sent)"
+  done
+  # B56b the positive controls of the proof: claude may be a DESCENDANT of the pane's process (the wrapper's shell), and a line whose
+  # second is a little BEFORE the process start (both are whole seconds) is still that process.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add_child gastown.dog-2 modal
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && ok "B56b claude is a child of the pane's process -> the pane is found through its ancestors, and it is evidence" || bad "B56b current='$(jget "$STATE" current)'"
+
+  # B60 THE ESCAPE. After a failover the session that was on the modal is on the REPLACED credential's modal; it does not notice the new
+  # one by itself. Nothing is pressed in the run that rewrites the item, nor before claude has had time to re-read it (45 s: it
+  # re-reads every ~30 s); then ONE Escape, to that session, and the prompt is back.
+  failed_over; touch "$TMUXD/clear-on-esc"; w0=$(writes); k0=$(keys_sent)
+  later 30; k30=$(keys_sent)
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$k0" = "0" ] && [ "$k30" = "0" ] && grep -q "waiting 45 s for claude to re-read it before sending Escape" "$LOG" \
+    && ok "B60 no key in the run that rewrote the item, none 30 s later - the log says it is waiting for claude to re-read the item" || bad "B60 keys $k0 / $k30 current='$(jget "$STATE" current)'"
+  later 60; k60=$(keys_sent); later 120; k120=$(keys_sent)
+  [ "$k60" = "1" ] && [ "$(keys_to "$PANE")" = "1" ] && [ "$k120" = "1" ] && [ "$(writes)" = "$w0" ] && grep -q "UNSTICK: Escape sent to pane $PANE (gastown.dog-2)" "$LOG" \
+    && grep -q '? for shortcuts' "$TMUXD/screen.${PANE#%}" \
+    && ok "B60b 60 s after the rewrite: ONE Escape to that pool session (the prompt is back), and not again; the item is not written again" \
+    || bad "B60b keys 60s=$k60 120s=$k120 to-pane=$(keys_to "$PANE") writes $w0 -> $(writes): $(grep -E 'UNSTICK|waiting' "$LOG" | tail -n 2 | tr '\n' '|')"
+  # B60c an Escape that does not take is not repeated for ever: 3 tries per pane, counted in the state.
+  failed_over; for s in 60 120 180 240 300; do later $s; done
+  [ "$(keys_sent)" = "3" ] && [ "$(pane_tries)" = "[3]" ] && [ "$(nlog "UNSTICK: Escape sent")" = "3" ] \
+    && ok "B60c the modal does not go away -> 3 Escapes in 5 runs, then no more (tries=3 in the state)" || bad "B60c keys=$(keys_sent) tries=$(pane_tries)"
+  # B60d the off switches: the env var and the file stop the keys (and spend no try); the general kill switch stops the whole run.
+  failed_over; later 60 GC_POOL_UNSTICK=0; later 120 GC_POOL_UNSTICK=0; k1=$(keys_sent)
+  touch "$D/city/.gc/no-pool-unstick"; later 180; k2=$(keys_sent)
+  grep -q "unstick disabled by GC_POOL_UNSTICK=0 - no key sent" "$LOG" && grep -q "unstick disabled by .*no-pool-unstick - no key sent" "$LOG" && [ "$k1" = "0" ] && [ "$k2" = "0" ] \
+    && ok "B60d GC_POOL_UNSTICK=0 and .gc/no-pool-unstick each stop the Escape (and the log says which)" || bad "B60d keys $k1 / $k2: $(grep -E 'disabled' "$LOG" | tail -n 2 | tr '\n' '|')"
+  later 240 GC_POOL_ACCOUNT=0; k3=$(keys_sent); rm -f "$D/city/.gc/no-pool-unstick"; later 300; k4=$(keys_sent)
+  [ "$k3" = "0" ] && [ "$k4" = "1" ] && ok "B60e GC_POOL_ACCOUNT=0 stops the whole run, keys included; and with the switches off, no try was spent: the Escape goes out once they are on again" || bad "B60e keys $k3 / $k4"
+
+  # B61 the Escape is re-verified IMMEDIATELY before it is sent (the scan is some seconds old): the pane must still hold the same
+  # process, and the modal must still be the last thing on its screen.
+  failed_over; echo 424242 > "$TMUXD/pid2.${PANE#%}"; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "is not the process it was a moment ago - nothing sent" "$LOG" && ok "B61 the pane's process changed between the scan and the key -> no key" || bad "B61 keys=$(keys_sent): $(tail -n 2 "$LOG" | tr '\n' '|')"
+  failed_over; printf '%s\n' "$PROMPT_SCREEN" > "$TMUXD/screen2.${PANE#%}"; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "no longer shows the limit modal - nothing sent" "$LOG" && ok "B61b the modal went away between the scan and the key -> no key" || bad "B61b keys=$(keys_sent): $(tail -n 2 "$LOG" | tr '\n' '|')"
+  failed_over; touch "$TMUXD/send-fails"; later 60
+  [ "$(keys_sent)" = "0" ] && [ "$(pane_tries)" = "[1]" ] && grep -q "tmux send-keys failed" "$LOG" && ok "B61c send-keys fails -> reported, the try is spent (1), nothing breaks" || bad "B61c keys=$(keys_sent) tries=$(pane_tries)"
+
+  # B62 only the item that holds the decision's credential, settled, not exhausted: otherwise no key.
+  failed_over; touch "$TMUXD/clear-on-esc"; item_set "$TOKEN_c"; later 60; k1=$(keys_sent); k1i=$(item_token); later 90; k2=$(keys_sent); later 120; k3=$(keys_sent)
+  [ "$k1i" = "$TOKEN_b" ] && [ "$k1" = "0" ] && [ "$k2" = "0" ] && [ "$k3" = "1" ] \
+    && ok "B62 the item was rewritten AGAIN (healed back to b at 60 s) -> the wait starts over: no key at 60 s nor 90 s, one at 120 s" || bad "B62 item=$(item_token | cut -c1-24) keys $k1 / $k2 / $k3"
+  failed_over; touch "$TMUXD/clear-on-esc" "$D/kc/locked"; later 60; k1=$(keys_sent); rm -f "$D/kc/locked"; later 120; k2=$(keys_sent)
+  [ "$k1" = "0" ] && [ "$k2" = "1" ] && grep -q "the pool item could not be read - no Escape sent" "$LOG" \
+    && ok "B62b the item cannot be read (locked keychain) -> no key; the next run that can read it sends it" || bad "B62b keys $k1 / $k2: $(grep -E 'Escape' "$LOG" | tail -n 2 | tr '\n' '|')"
+  failed_over; edit_state 'st.setdefault("exhausted", {})["b@t.test"] = {"reset_epoch": 2000000000.0, "claim": "seven_day", "seen": 1.0, "why": "rejected"}'; later 60
+  [ "$(keys_sent)" = "0" ] && grep -q "b@t.test is registered as exhausted - no Escape into it" "$LOG" \
+    && ok "B62c the account the item holds is itself registered exhausted -> no key (it would land on the modal again)" || bad "B62c keys=$(keys_sent): $(grep -E 'Escape|exhausted' "$LOG" | tail -n 2 | tr '\n' '|')"
+  # B62d the guard that the item holds the DECISION'S credential, tested where heal cannot run first: heal would put b back (B62), and
+  # editing the decision's fingerprint instead is healed too (the daemon re-derives it from the vault). So the item holds another
+  # credential AND the write that would repair it is refused: only the guard is left between that item and a key.
+  failed_over; touch "$D/kc/refuse-writes"; item_set "$TOKEN_c"; later 60; k1=$(keys_sent); k1i=$(item_token); rm -f "$D/kc/refuse-writes"
+  [ "$k1" = "0" ] && [ "$k1i" = "$TOKEN_c" ] && grep -q "does not hold the credential of the decision - no Escape sent" "$LOG" \
+    && ok "B62d the item holds another credential and cannot be put back -> no key, and the log says why" || bad "B62d keys=$k1 item=$(printf '%s' "$k1i" | cut -c1-24): $(tail -n 3 "$LOG" | tr '\n' '|')"
+
+  # B63 at most 20 keys in a run: a burst is never unbounded (25 sessions were on the modal; each Escape clears its screen).
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; for i in $(seq 1 25); do pane_add "gastown.dog-$i" modal; done
+  touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; k1=$(keys_sent); later 120; k2=$(keys_sent)
+  [ "$k1" = "20" ] && [ "$k2" = "25" ] && grep -q "20 Escapes sent this run - the rest wait for the next one" "$LOG" \
+    && ok "B63 25 pool sessions stuck -> 20 Escapes in one run, the other 5 in the next" || bad "B63 keys $k1 / $k2"
+
+  # B64 the clock is the REAL one here (the rewrite is 'now'): a session that STARTED after the rewrite never had the old credential, so
+  # its modal is evidence at once; one that was already running and is first seen within 90 s of the rewrite is on the old credential's.
+  new_d; NOW_OVERRIDE= run_d -- run-once; sleep 2; pane_add gastown.dog-2 modal
+  set_srv a@t.test 429 "$(hdr_rejected seven_day $(( $(date +%s) + 7200 )))"; NOW_OVERRIDE= run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] \
+    && ok "B64 a session launched AFTER the rewrite and on the modal 2 s later -> evidence: it was asked, and the pool moved" || bad "B64 current='$(jget "$STATE" current)' messages-calls=$(msgs)"
+  new_d; pane_add gastown.dog-2 modal; NOW_OVERRIDE= run_d -- run-once
+  set_srv a@t.test 429 "$(hdr_rejected seven_day $(( $(date +%s) + 7200 )))"; NOW_OVERRIDE= run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(msgs)" = "0" ] \
+    && ok "B64b a session that was already running (launched before the rewrite) and first seen on the modal right after it -> the OLD credential's modal: no probe" || bad "B64b current='$(jget "$STATE" current)' messages-calls=$(msgs)"
+
+  # B65 the stale-modal rule itself, as a table (item rewritten at 1000): stale iff launched <= rewrite AND first seen <= rewrite + 90 s.
+  cat > "$W/py_stale.py" <<'EOF'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+bad = []
+B = 2000000000   # item_at is only believed inside MIN_EPOCH..MAX_EPOCH: the table is relative to a real epoch
+def stale(item_at, launched, first):
+    p = m.PanePeek("%1", 1, 2, "gastown.dog-2", True, B + launched)
+    return m.stale_modal({"item_at": item_at}, p, {"first": B + first, "tries": 0})
+for launched, first, want in [(900, 1000, True), (900, 1090, True), (900, 1091, False), (1000, 1000, True), (1001, 1000, False), (1001, 1091, False), (500, 5000, False)]:
+    got = stale(B + 1000.0, launched, first)
+    if got != want: bad.append(f"launched={launched} first={first} -> {got} (want {want})")
+for junk in (None, "x", float("nan"), -5, 0, True):
+    if stale(junk, 900, 1000): bad.append(f"item_at={junk!r} counted as a rewrite")
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+  got="$("$PY3" "$W/py_stale.py" "$DAEMON" 2>&1)"
+  [ "$got" = "OK" ] && ok "B65 stale_modal: stale iff launched <= rewrite and first seen <= rewrite+90 s (edges included); no usable rewrite time = nothing is stale" || bad "B65 $got"
+
+  # B66 the screen recogniser, as a table: only the LAST lines of the screen count, and only the modal in full.
+  cat > "$W/py_modal.py" <<'EOF'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+Q = " What do you want to do?\n\n ❯ 1. Stop and wait for limit to reset\n   2. Wait here, then continue automatically at Oct 7 at 7pm\n   3. Upgrade your plan\n\n"
+F = " Enter to confirm · Esc to cancel"
+cases = [
+  ("the modal", "● work\n" + Q + F, True),
+  ("trailing blank lines and spaces", "● work\n" + Q + F + "   \n\n\n", True),
+  ("no footer", Q, False),
+  ("footer first", F + "\n" + Q, False),
+  ("option before the question", " ❯ 1. Stop and wait for limit to reset\n What do you want to do?\n" + F, False),
+  ("question, no option", " What do you want to do?\n" + F, False),
+  ("option, no question", " ❯ 1. Stop and wait for limit to reset\n" + F, False),
+  ("quoted, prompt box below", "● quote:\n" + Q + F + "\n╭────╮\n│ >  │\n╰────╯\n  ? for shortcuts", False),
+  ("the limit line and a prompt", "  You've hit your weekly limit · resets Oct 7, 7pm\n╭────╮\n│ >  │\n╰────╯", False),
+  ("empty", "", False), ("blank", "\n\n   \n", False),
+]
+bad = [f"{n}: {m.modal_stuck(t)} (want {w})" for n, t, w in cases if m.modal_stuck(t) != w]
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+  got="$("$PY3" "$W/py_modal.py" "$DAEMON" 2>&1)"
+  [ "$got" = "OK" ] && ok "B66 modal_stuck: the full modal at the END of the screen only - quoted, scrolled-up, partial and prompt-with-old-limit-line screens are not it" || bad "B66 $got"
+
+  # B67 the pane bookkeeping in the state file is a witness, not a command: every wrong shape is dropped or read as 'already tried'.
+  cat > "$W/py_sanitize.py" <<'EOF'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+t = 2000000000.0; bad = []
+st = {"panes": {"ok": {"first": t - 10, "tries": 1}, "badfirst": {"first": "x", "tries": 0}, "future": {"first": t + 99999, "tries": 0},
+                "neg": {"first": t - 5, "tries": -1}, "bool": {"first": t - 5, "tries": True}, "str": {"first": t - 5, "tries": "0"},
+                "none": {"first": t - 5}, "askfuture": {"first": t - 5, "tries": 0, "asked": t + 99999}, "askok": {"first": t - 5, "tries": 0, "asked": t - 7},
+                "notdict": 5},
+      "item_at": t + 99999, "evidence_probe": {"a@t.test": t}}
+m.sanitize_state(st, t)
+p = st.get("panes", {})
+if sorted(p) != ["askfuture", "askok", "bool", "neg", "none", "ok", "str"]: bad.append(f"kept {sorted(p)}")
+for k in ("neg", "bool", "str", "none"):
+    if p.get(k, {}).get("tries") != m.MAX_ESC_TRIES: bad.append(f"{k}: tries={p.get(k, {}).get('tries')!r} (want {m.MAX_ESC_TRIES}: garbled = already tried)")
+if p.get("ok", {}).get("tries") != 1: bad.append("a good entry was changed")
+if "asked" in p.get("askfuture", {}): bad.append("an 'asked' in the future was kept")
+if p.get("askok", {}).get("asked") != t - 7: bad.append("a good 'asked' was dropped")
+if "item_at" in st: bad.append("an item_at in the future was kept")
+if "evidence_probe" in st: bad.append("the old per-account bookkeeping was kept")
+for shape in (None, [], "x", 5, True):
+    st = {"panes": shape}; m.sanitize_state(st, t)
+    if "panes" in st: bad.append(f"panes={shape!r} kept")
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+  got="$("$PY3" "$W/py_sanitize.py" "$DAEMON" 2>&1)"
+  [ "$got" = "OK" ] && ok "B67 sanitize_state: garbled pane marks are dropped, garbled 'tries' read as already tried (junk never buys a fresh Escape), a future item_at is no rewrite" || bad "B67 $got"
+  # B67b ...end to end: a state whose tries are junk never gets a key
+  failed_over; edit_state 'st["panes"][list(st["panes"])[0]]["tries"] = "0"'; later 60; later 120
+  [ "$(keys_sent)" = "0" ] && ok "B67b tries='0' (a string) in the state file -> read as already tried: no key" || bad "B67b keys=$(keys_sent)"
+
+  # B68 a failure INSIDE the unstick step must not cost the decision: the item was already rewritten by the time it runs, and the
+  # published decision (what the WhatsApp services read) must follow it.
+  cat > "$W/break_escape.py" <<'EOF'
+import importlib.util, os, sys
+sp = importlib.util.spec_from_file_location("d", os.environ["REAL_DAEMON"]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+def boom(p): raise RuntimeError("selftest: send_escape blew up")
+m.send_escape = boom
+sys.exit(m.main(["x", "run-once"]))
+EOF
+  seeded; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; DAEMON="$W/break_escape.py" run_d REAL_DAEMON="$DAEMON" -- run-once; rc=$?
+  [ "$rc" = "0" ] && [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] \
+    && ok "B68 (control) the wrapper script runs the real daemon: failover to b, exit 0" || bad "B68 control: rc=$rc current='$(jget "$STATE" current)': $(head -c 200 "$D/out.txt")"
+  failed_over; w0=$(writes); DAEMON="$W/break_escape.py" run_d REAL_DAEMON="$DAEMON" -- run-once   # same clock: waiting, send_escape not reached
+  NOW_OVERRIDE=$((NOW_BASE + 60)) DAEMON="$W/break_escape.py" run_d REAL_DAEMON="$DAEMON" -- run-once; rc=$?
+  [ "$rc" = "0" ] && grep -q "unstick failed (RuntimeError) - no further key sent this run" "$LOG" && [ "$(pane_tries)" = "[1]" ] && [ "$(keys_sent)" = "0" ] \
+    && ok "B68b send_escape raising -> logged by type, exit 0, the try is recorded and published, no key" || bad "B68b rc=$rc tries=$(pane_tries) keys=$(keys_sent): $(tail -n 2 "$LOG" | tr '\n' '|')"
+
+  # B70 the failback runs on silence - or on an ANSWER - never over evidence that was not answered (a is back at its reset time; b is in use
+  # and its own sessions are on the modal).
+  R=2000000000
+  failed_over; set_srv a@t.test 200 "$HDR_OK"; rearm; pa0=$(probes_of a@t.test); NOW_OVERRIDE=$((R + 100)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(probes_of a@t.test)" = "$pa0" ] \
+    && ok "B70 b's sessions on the modal and b ANSWERS -> that screen is not about b, a's time has passed: back to a, still with no probe of a" || bad "B70 current='$(jget "$STATE" current)' probes of a $pa0 -> $(probes_of a@t.test)"
+  failed_over; set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 429 "$(hdr_rejected five_hour 2000003600)"; rearm; NOW_OVERRIDE=$((R + 100)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(jex b@t.test why)" = "rejected" ] && grep -q "SWITCH b@t.test -> a@t.test.*failover: b@t.test rejected" "$LOG" \
+    && ok "B70b b is rejected too while a's time has passed -> the failover (not a failback) takes the pool to a; b is registered" || bad "B70b current='$(jget "$STATE" current)' b='$(jex b@t.test why)': $(grep SWITCH "$LOG" | tail -n 1)"
+  failed_over; set_srv a@t.test 200 "$HDR_OK"; set_srv b@t.test 500 '{}'; rearm; NOW_OVERRIDE=$((R + 100)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && ok "B70c evidence that the API could not answer (500) -> nothing concluded: the pool stays on b even though a's time has passed" || bad "B70c current='$(jget "$STATE" current)'"
+
+  # B71 THE WHOLE CYCLE, and the proof that it cost nothing (acceptance a-d): a is hit -> b; the sessions are unstuck; a's reset time
+  # passes -> back to a by the TIMER, with no call about a; a is hit again -> the failover again. Whole thing: no claude, nothing SERVED.
+  seeded; touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day $R)"; run_d -- run-once; later 60; later 120
+  c1="$(jget "$STATE" current)"; k1=$(keys_sent); pa1=$(probes_of a@t.test)
+  set_srv a@t.test 200 "$HDR_OK"; NOW_OVERRIDE=$((R + 100)) run_d -- run-once
+  c2="$(jget "$STATE" current)"; pa2=$(probes_of a@t.test)
+  set_srv a@t.test 429 "$(hdr_rejected seven_day $((R + 86400)))"; pane_screen "$PANE" modal; rearm; NOW_OVERRIDE=$((R + 300)) run_d -- run-once
+  c3="$(jget "$STATE" current)"
+  [ "$c1" = "b@t.test" ] && [ "$k1" = "1" ] && [ "$c2" = "a@t.test" ] && [ "$pa2" = "$pa1" ] && [ "$c3" = "b@t.test" ] \
+    && ok "B71 hit -> b, unstuck (1 key), reset time -> back to a with NO call about a, hit again -> b: $c1 / $c2 / $c3" \
+    || bad "B71 current $c1 / $c2 / $c3 keys=$k1 probes of a $pa1 -> $pa2"
+  [ "$(served)" = "0" ] && [ ! -e "$D/kc/claude-invoked" ] && [ "$(msgs)" = "2" ] && ! grep -rqE 'sk-ant-' "$LOG" \
+    && ok "B71b the zero-credit proof for the whole cycle: 2 evidence probes (both 429s), nothing SERVED by the API, claude never run, no token in the log" \
+    || bad "B71b served=$(served) messages-calls=$(msgs) claude-invoked=$(cat "$D/kc/claude-invoked" 2>/dev/null | head -c 80)"
+
+  # B72 no failback BEFORE the stored reset: a reading stamped after it (the usage store may run a little ahead of the clock, up to the
+  # skew the daemon tolerates) is not the reset itself. At R+60 - the control - the same store does fail back.
+  onb; usage_store a:0:10:$((R + 50)) b:5:10:$((R + 50)) c:5:10:$((R + 50)); set_srv a@t.test 200 "$HDR_OK"; w0=$(writes)
+  NOW_OVERRIDE=$((R - 100)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(jex a@t.test why)" = "rejected" ] \
+    && ok "B72 100 s BEFORE a's stored reset, with a reading stamped after it -> the pool stays on b, a stays registered" \
+    || bad "B72 current='$(jget "$STATE" current)' writes $w0 -> $(writes) a-entry='$(jex a@t.test why)'"
+  NOW_OVERRIDE=$((R + 60)) run_d -- run-once
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && ok "B72b (control) 60 s after the reset the same store fails back to a" || bad "B72b current='$(jget "$STATE" current)'"
+
+  # B73 the limit screen recogniser, as a table. The modal opens on a session's FIRST hit only (measured); every later hit is the envelope
+  # "⎿ You've hit your ... limit" with the prompt under it. It is evidence only as the LAST turn on screen; the modal and the envelope of
+  # the same hit share one signature, a new hit has another; whatever the user half-typed in the prompt box changes nothing.
+  cat > "$W/py_limit.py" <<'EOF'
+import importlib.util, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+RULE = "─" * 70
+BOX = RULE + "\n❯ \n" + RULE + "\n  ⏸ manual mode on · ? for shortcuts · ← for agents"
+ENV = "  ⎿  You've hit your weekly limit · resets Oct 7 at 7pm (America/Sao_Paulo)"
+HIT = "❯ Reply with exactly: ALPHA\n" + ENV + "\n✻ Sautéed for 3s · done 7:35 AM"
+MODAL = "▔" * 40 + "\n   What do you want to do?\n   ❯ 1. Stop and wait for limit to reset\n     2. Wait here, then continue automatically at Oct 7 at 7pm\n     3. Upgrade your plan\n   Enter to confirm · Esc to cancel"
+def sig(t):
+    return m.limit_hit(t, m.modal_stuck(t))
+inline = sig("banner\n" + HIT + "\n" + BOX)
+bad = []
+def chk(name, got, want):
+    if (got is not None and got != "modal") != want and not (want == "modal" and got == "modal"):
+        bad.append(f"{name}: {got!r} (want {want})")
+chk("envelope as the last turn", inline, True)
+chk("the modal of the same hit", sig("banner\n" + HIT + "\n" + MODAL), True)
+if sig("banner\n" + HIT + "\n" + MODAL) != inline: bad.append("the modal and the envelope of the SAME hit differ in signature")
+if not m.modal_stuck("banner\n" + HIT + "\n" + MODAL): bad.append("the real modal is not seen as a modal")
+chk("modal with no envelope above it", sig("● work\n" + MODAL), "modal")
+if sig("● work\n" + MODAL) != "modal": bad.append("modal with no envelope: signature is not 'modal'")
+chk("with the continuation line", sig("banner\n" + HIT.replace("\n✻", "\n     /upgrade to increase your usage limit.\n✻") + "\n" + BOX), True)
+if sig("banner\n" + HIT + "\n❯ Reply with exactly: BRAVO\n" + ENV + "\n✻ Crunched for 0s · done 7:36 AM\n" + BOX) in (None, inline): bad.append("a new hit has the signature of the old one")
+if sig("banner\n" + HIT + "\n" + RULE + "\n❯ half typed\n" + RULE + "\n  ? for shortcuts") != inline: bad.append("a half-typed prompt changed the signature")
+chk("a later assistant answer", sig("banner\n" + HIT + "\n❯ again\n⏺ 72\n✻ Worked for 2s · done 7:40 AM\n" + BOX), False)
+chk("a later user turn with no answer yet", sig("banner\n" + HIT + "\n❯ again\n" + BOX), False)
+chk("a turn running", sig("banner\n" + HIT + "\n❯ again\n✻ Pondering… (3s · esc to interrupt)\n" + BOX), False)
+chk("an interrupted later turn", sig("banner\n" + HIT + "\n❯ again\n  ⎿  Interrupted · What should Claude do instead?\n" + BOX), False)
+chk("a later tool result", sig("banner\n" + HIT + "\n⏺ Bash(ls)\n  ⎿  a b c\n" + BOX), False)
+chk("quoted by the assistant (no tool-result glyph)", sig("⏺ It printed: You've hit your weekly limit · resets Oct 7\n" + BOX), False)
+chk("inside the output of a tool, not its first line", sig("⏺ Bash(cat log)\n  ⎿  line one\n     You've hit your weekly limit\n" + BOX), False)
+chk("the envelope scrolled far above", sig("banner\n" + HIT + "\n" + "\n".join("  line %d" % i for i in range(30)) + "\n" + BOX), False)
+chk("no envelope at all", sig("banner\n" + BOX), False)
+# the real bytes (measured live, claude 2.1.291): the glyph, a space and a NO-BREAK SPACE (U+00A0) before "You've", an ASCII apostrophe
+chk("the real bytes: a no-break space after the glyph", sig("banner\n❯ x\n  ⎿  You've hit your weekly limit · resets Oct 7 at 7pm\n     /upgrade to increase your usage limit.\n✻ Brewed for 1s · done 7:38 AM\n" + BOX), True)
+chk("empty", sig(""), False)
+chk("a quoted modal under the envelope", sig("banner\n" + HIT + "\n❯ 1. Stop and wait for limit to reset\n" + BOX), False)
+for name, line in [("session limit", "You've hit your session limit · resets 3am"), ("Opus limit", "You've hit your Opus limit"),
+                   ("bare limit", "You've hit your limit"), ("curly apostrophe", "You’ve hit your weekly limit · resets Oct 7")]:
+    chk(name, sig("banner\n❯ x\n  ⎿  " + line + "\n✻ Brewed for 1s · done 7:38 AM\n" + BOX), True)
+for name, line in [("another message", "API Error: 500"), ("a limit that is not 'hit'", "Your weekly limit is 80% used")]:
+    chk(name, sig("banner\n❯ x\n  ⎿  " + line + "\n" + BOX), False)
+print("OK" if not bad else "BAD: " + "; ".join(bad))
+EOF
+  got="$("$PY3" "$W/py_limit.py" "$DAEMON" 2>&1)"
+  [ "$got" = "OK" ] && ok "B73 limit screen table: the modal; the envelope as the LAST turn (any limit kind); the same signature for a hit's modal and envelope; nothing for history, quotes, running or later turns" || bad "B73 $got"
+
+  # B74 a session that already dismissed the modal once (the envelope is all it shows): the same evidence. One probe (a 429, free), the
+  # pool item moves, and NO key is ever sent to it - the envelope blocks nothing, the next prompt just uses the new credential.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 inline1; il=$PANE
+  w0=$(writes); set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120; later 900
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(item_token)" = "$TOKEN_b" ] && [ "$(writes)" = "$((w0 + 1))" ] && [ "$(msgs)" = "1" ] \
+    && ok "B74 a pane showing only the envelope + a rejected -> the pool item holds b after ONE run, one question, with no human and no restart" \
+    || bad "B74 current='$(jget "$STATE" current)' writes $w0 -> $(writes) messages-calls=$(msgs)"
+  [ "$(keys_sent)" = "0" ] && [ "$(addressed "$il")" -ge 1 ] && ! grep -q "UNSTICK" "$LOG" && [ "$(served)" = "0" ] && [ ! -e "$D/kc/claude-invoked" ] \
+    && ok "B74b ...and no key at any time (an envelope blocks nothing), nothing SERVED, claude never run" || bad "B74b keys=$(keys_sent) served=$(served): $(grep -E 'UNSTICK|WARN' "$LOG" | tail -n 2 | tr '\n' '|')"
+  grep -q "EVIDENCE: 1 pool pane(s) on the limit message (gastown.dog-2)" "$LOG" \
+    && ok "B74c the log names it a limit MESSAGE (not a modal)" || bad "B74c log: $(grep EVIDENCE "$LOG" | tail -n 1)"
+
+  # B75 an envelope that was ANSWERED (the account answers: the line is history, or another model's limit) is never asked about again -
+  # a modal gets asked again after the cooldown, a line of history does not; a NEW hit is another screen and is asked at once.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 inline1; pa0=$(probes_of a@t.test)
+  run_d -- run-once; later 601; later 5000; later 90000
+  [ "$(( $(probes_of a@t.test) - pa0 ))" = "1" ] && [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(keys_sent)" = "0" ] \
+    && ok "B75 the account answers for the envelope -> ONE probe in 25 hours of runs (the cooldown does not apply to a line of history), no switch, no key" \
+    || bad "B75 probes of a: $pa0 -> $(probes_of a@t.test) current='$(jget "$STATE" current)' keys=$(keys_sent)"
+  pane_screen "$PANE" inline2; NOW_OVERRIDE=$((NOW_BASE + 90100)) run_d -- run-once
+  [ "$(( $(probes_of a@t.test) - pa0 ))" = "2" ] && ok "B75b a NEW hit (another prompt, another summary line) is new evidence at once (2 probes)" || bad "B75b probes of a: $pa0 -> $(probes_of a@t.test)"
+  later 90200; [ "$(( $(probes_of a@t.test) - pa0 ))" = "2" ] && ok "B75c ...and then it is history too (still 2)" || bad "B75c probes of a: $pa0 -> $(probes_of a@t.test)"
+
+  # B76 the modal that is dismissed (our own Escape) leaves the envelope of the SAME hit on screen: that must not look like a new hit - or
+  # every unstick would cost one more question to the account that was just moved to.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 modalreal
+  printf '%s\n' "$INLINE1_SCREEN" > "$TMUXD/prompt.txt"; touch "$TMUXD/clear-on-esc"
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; pb1=$(probes_of b@t.test); later 60; later 120; later 300; later 3000
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(keys_sent)" = "1" ] && [ "$(msgs)" = "1" ] && [ "$(probes_of b@t.test)" = "$pb1" ] \
+    && ok "B76 modal -> failover -> ONE Escape -> the envelope of the same hit stays on screen: no new evidence (1 question in all, b not asked)" \
+    || bad "B76 current='$(jget "$STATE" current)' keys=$(keys_sent) messages-calls=$(msgs) probes of b $pb1 -> $(probes_of b@t.test): $(grep -E 'EVIDENCE|UNSTICK' "$LOG" | tail -n 3 | cut -c1-140 | tr '\n' '|')"
+
+  # B77 acceptance (d) for a session that no longer gets the modal: a is hit -> b (no key); the session answers on b and later hits b's limit
+  # too (a NEW envelope) -> the failover again, to c, with no human. A hit that lands inside the 90 s the old credential may still be
+  # in use (claude re-reads the item every ~30 s) is the OLD credential's: not evidence - and stays history, the next hit is the evidence.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 inline1
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once
+  pane_screen "$PANE" inline2; set_srv b@t.test 429 "$(hdr_rejected five_hour 2000000500)"; later 30
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] \
+    && ok "B77 a new hit 30 s after the rewrite is the old credential's: not evidence (b not asked)" || bad "B77 current='$(jget "$STATE" current)' messages-calls=$(msgs)"
+  pane_screen "$PANE" inline3; later 200
+  [ "$(jget "$STATE" current)" = "c@t.test" ] && [ "$(item_token)" = "$TOKEN_c" ] && [ "$(msgs)" = "2" ] && [ "$(keys_sent)" = "0" ] && [ "$(served)" = "0" ] \
+    && ok "B77b a new hit 200 s after it -> b asked once (a 429) -> the pool item holds c; no key, nothing SERVED" \
+    || bad "B77b current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) messages-calls=$(msgs) keys=$(keys_sent) served=$(served)"
+
+  # B78 Mayor and the crews, again, for the envelope: never looked at (not a single tmux call aimed at them), never counted.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
+  pane_add mayor inline1; may=$PANE; pane_add gastown.crew-1 inline2; crew=$PANE; pane_add weird/mayor modalreal; weird=$PANE
+  set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(msgs)" = "0" ] && [ "$(addressed "$may" "$crew" "$weird")" = "0" ] && [ "$(keys_sent)" = "0" ] \
+    && ok "B78 Mayor / crew panes showing the limit envelope (or the modal) are no evidence, are not even looked at, get no key" \
+    || bad "B78 current='$(jget "$STATE" current)' messages-calls=$(msgs) tmux-calls-aimed=$(addressed "$may" "$crew" "$weird") keys=$(keys_sent)"
+
+  # B79 the new bookkeeping fields are witnesses too: a garbled signature or flag is dropped (a new sighting, at worst one more question) and
+  # never crashes the run or buys a key.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add gastown.dog-2 inline1; pk="$PANE:$PANE_PID"
+  edit_state "st['panes']={'$pk': {'first': $((NOW_BASE - 50)), 'tries': 0, 'sig': 12345, 'modal': 'yes'}}"
+  set_srv a@t.test 200 "$HDR_OK"; run_d -- run-once; rc=$?
+  [ "$rc" = "0" ] && no_crash && [ "$(keys_sent)" = "0" ] && [ "$("$PY3" -c 'import json,sys; e=list(json.load(open(sys.argv[1]))["panes"].values())[0]; print(isinstance(e.get("sig"),str) and e.get("modal") is False)' "$STATE")" = "True" ] \
+    && ok "B79 a state with a non-string signature and a non-boolean flag -> read as a new sighting, rewritten sane, no key" || bad "B79 rc=$rc keys=$(keys_sent) panes=$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panes"))' "$STATE")"
 
   # B34 the wrapper reads GC_POOL_CRED_DIR, the daemon CLAUDE_POOL_CRED_DIR (its test seam): the two must agree on the item, or the
   # daemon feeds an item nobody reads. The daemon honours the wrapper's name too (empty counts as unset).
@@ -1083,6 +1732,19 @@ else
   [ -n "$dhash" ] && [ -n "$dpath" ] && [ "$(printf '%s' "$dpath" | shasum -a 256 | cut -c1-8)" = "$dhash" ] \
     && ok "C9 the doc's item name ($dhash) is the hash of the absolute path it names" \
     || bad "C9 the doc's item name '$dhash' is not sha256 of the path it names ('$dpath')"
+fi
+
+# C10 the written design is the one that runs: 100% (no threshold), the Escape exception named, and the plist comment says so.
+# The bead's structured acceptance_criteria still say 95%; Athos 04/10 revoked that. A doc or plist drifting back would mislead the next operator.
+if [ -f "$DOC" ]; then
+  if grep -q "The Escape exception" "$DOC" && grep -qi "no threshold" "$DOC" && grep -q "100%" "$DOC"; then
+    ok "C10 the doc names the Escape exception and states there is no threshold (switch at the 100% limit hit)"
+  else bad "C10 the doc lost 'The Escape exception' / 'no threshold' / '100%'"; fi
+else bad "C10 doc not found at $DOC"; fi
+if [ -f "$PLIST" ]; then
+  if grep -q "The Escape exception" "$PLIST" && grep -q "100%" "$PLIST"; then
+    ok "C10b the plist comment describes the 100% evidence design and points at the Escape exception"
+  else bad "C10b the plist comment does not mention the 100% rule / the Escape exception"; fi
 fi
 
 echo

@@ -1,35 +1,59 @@
-# Pool Claude account as data (ga-8hcnvb.1)
+# Pool Claude account as data (ga-8hcnvb.1, ga-8hcnvb.2)
 
 The headless pool (dog, wa-worker, ps-worker, gate-reviewer, boot, deacon, auto-refiner — ~90% of the spend)
-changes Claude account by itself when the one in use hits its limit, and goes back to the account it left once that
-account has renewed **and a usage collection taken after the renewal confirms it ranks ahead** — so up to about one
-collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a fresh collection").
-No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault as
-`claude-oauth-token-<email>`). Mayor and crews are **not** touched (phase 2).
+changes Claude account by itself **when the one in use hits its limit — at 100%, not before** — and goes back to the
+account it left once that account has renewed **and a usage collection taken after the renewal confirms it ranks ahead**
+— so up to about one collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a
+fresh collection"). No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault
+as `claude-oauth-token-<email>`), and **no credit spent doing it**: the whole switch is this script, with no `claude`, no
+LLM and no agent in the path. Mayor and crews are **not** touched (phase 2), and never will be by this daemon: see
+"Mayor and the crews".
+
+> **There is deliberately no threshold.** Athos 04/10: *"tem que trocar no 100%. A gente não quer ficar com 5% sem usar."*
+> A utilization trigger (the old "95%" of this bead's `acceptance_criteria`, with its single tunable parameter) would leave
+> the last 5% of every window unused, and it is **revoked**: those structured fields are stale, the description is the
+> binding text. The pool moves when the limit was actually **hit**, and that is known from a pool session sitting on
+> claude's limit screen, not from a percentage.
 
 ## How it works
 
 ```
  claude-pool-account.py  (launchd, every 60 s, single instance)
-   probe the ACTIVE account (1-token haiku call, anthropic-ratelimit-unified-* headers)
-     rejected / 429  -> failover: next account of ordem_das_contas() that answers a probe; store the reset time
-     answers         -> stay; failback ONLY to an account we saw exhausted, whose stored reset time has passed,
-                        whose usage reading in the usage store was taken AFTER that reset, and which that reading
-                        ranks ahead of the active one — no probe of it on the way back
-                        (not to one whose KEY was refused, 401/403: see Known limits)
-                        a reading from BEFORE the reset is no evidence: the entry is kept and the log says it waits
-     cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
+   1. LOOK at the pool's own tmux panes (no API call): is a POOL session showing claude's limit screen? That is
+        - the MODAL ("What do you want to do?" / "1. Stop and wait for limit to reset" / "Enter to confirm · Esc to cancel",
+          as the LAST thing on the screen) - claude opens it on a session's FIRST hit only; or
+        - the ENVELOPE ("⎿ You've hit your weekly limit · resets ..." as the LAST turn on the screen, the prompt box under it)
+          - every later hit of that session, after the modal was dismissed; it blocks nothing.
+        in a pane the wrapper proved to be a pool session - see "What counts as evidence"
+   2. no pool pane on the limit screen -> NOTHING is asked of the API: no switch, no key. (failback below aside)
+      a pool pane on the limit screen -> ask the ACTIVE account ONCE (1-token haiku call, anthropic-ratelimit-unified-* headers)
+          rejected / 429  -> failover in the SAME run: next account of ordem_das_contas() that is not known-exhausted and whose
+                             KEY is accepted (count_tokens, never billed); store the reset time of the one that was hit
+          answers         -> the screen is not about this account (another model's limit, a modal about to go away...):
+                             stay; the same MODAL is not asked about again for 10 min (CLAUDE_POOL_EVIDENCE_COOLDOWN_S);
+                             an ENVELOPE that was answered is never asked about again (a NEW hit is a new envelope)
+          cannot tell     -> change nothing (network, 5xx, a redirect: error is not exhaustion)
+      could not look (tmux down, ps unreadable, the wrapper's log unreadable) -> nothing concluded: no probe, no failback, no key
+   3. failback ONLY when no evidence stands unanswered: to an account we saw exhausted, whose stored reset time has passed,
+      whose usage reading in the usage store was taken AFTER that reset, and which that reading ranks ahead of the active
+      one - at the stored reset time, with NO probe of it (not to one whose KEY was refused, 401/403: see Known limits).
+      If it has not really renewed, its 429 shows up on a pool pane again (the envelope, or the modal) and the failover
+      above runs again.
+   4. UNSTICK: sessions that were on the MODAL of the credential just replaced do not notice the new one by themselves;
+      once the item has been in place for 45 s the daemon sends each of them ONE Escape - see "The Escape exception"
+      (a session that shows only the envelope is not blocked: its prompt answers on the new credential, no key is sent)
    vault (Bitwarden) read lazily: the ACTIVE account's key every run, the other accounts' only when the pool moves
    a key the vault does not return for the active account is NOT "its key is gone": the item is the second witness
-   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (the POOL's item only — never the plain
+   writes ONE Keychain item  "Claude Code-credentials-50adeaf1"   (the POOL's item only - never the plain
                              "Claude Code-credentials" of Mayor and the crews: a setup-token there kills their Remote
                              Control, so write_item refuses any service name that is not "...-<8 hex>")
-                             (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") — the ABSOLUTE path, as
+                             (first 8 hex of sha256("/Users/athos/.gastown/claude-pool-cred") - the ABSOLUTE path, as
                               exported in CLAUDE_SECURESTORAGE_CONFIG_DIR; claude never sees a "~")
    publishes the decision    /Users/athos/shared/data/claude_pool_current_account.json  {"current": "<email>", ...}
 
  claude-lowprio.sh  (last hop of providers.claude-headless)
-   item exists -> exports CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.gastown/claude-pool-cred and USER, then exec claude
+   item exists -> exports CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.gastown/claude-pool-cred and USER, logs
+                  "POOL-ACCT SET item=..." with its pid, then exec claude (so that pid IS the claude)
    item missing / security hangs / any doubt -> exports nothing: the session starts on the ambient login
 
  claude (live pool session) re-reads the item every ~30 s  =>  a rewritten item moves it to the other account
@@ -47,9 +71,112 @@ Why the daemon never starts `claude`: the account that is exhausted is the one `
 plain HTTP; the switch is `security -i` with the new blob on **stdin** (hex), so no token is ever in argv, the
 environment, a log, the state file or a notification. Accounts appear as e-mail + sha256[:8] fingerprint.
 
-Mayor 04/10 (comment on the bead) overrides the original wording: **no utilization threshold** (fail over only when
-the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset time; if it has not
-really renewed, its 429 sends the pool to the next account again).
+Mayor 04/10 (comment on the bead) and Athos 04/10 (ga-8hcnvb.2) override the original wording: **no utilization threshold**
+(fail over only when the limit is actually hit) and **no confirmation probe on failback** (go back at the stored reset
+time; if it has not really renewed, its 429 sends the pool to the next account again).
+
+## What counts as evidence that the limit was hit
+
+The API is asked about an account **only when a pool session already shows the limit**, so that the switch costs nothing:
+a call that is *rejected* (429) is free, a call that is *served* costs tokens (and may open an idle 5 h window), and
+`count_tokens` (the candidate's key check) is never billed. Measured on claude 2.1.291 with a really exhausted account,
+the limit shows in a pane in **two forms**, and which one depends on how many times that session has hit it:
+
+1. **The modal - a session's FIRST hit only.** In place of the prompt box, and until a key is pressed (identical 20 s later):
+
+```
+ What do you want to do?
+ ❯ 1. Stop and wait for limit to reset
+   2. Wait here, then continue automatically at Oct 7 at 7pm
+   3. Upgrade your plan
+ Enter to confirm · Esc to cancel
+```
+
+2. **The envelope - every later hit.** Once the modal has been dismissed, claude does not open it again (measured: not
+   even 150 s later). Each further hit is an inline error turn, with the prompt box under it and nothing blocking:
+
+```
+ ❯ Reply with exactly: BRAVO
+ ⎿ You've hit your weekly limit · resets Oct 7 at 7pm (America/Sao_Paulo)
+   /upgrade to increase your usage limit.
+ ✻ Brewed for 1s · done 7:39 AM
+```
+
+Looking only for the modal would therefore see a session's first hit and nothing after it - measured live: after a
+failback and a second exhaustion the modal never came back, and the pool would have stayed on the exhausted account. So
+the limit screen is the modal **or the envelope as the last turn on the screen**.
+
+A pane is **evidence** only if all of these hold (each is a reason *not* to act, so a doubt means "no"):
+
+- the wrapper logged `POOL-ACCT SET item=<the pool item>` for a pid that is **alive**, whose `ps` start time agrees with the
+  log line's time (a recycled pid is another process), and that is the pane's own process or a descendant of it; the pane
+  is not dead;
+- the agent name on that line does not contain `mayor` or `crew` (case-insensitive) - such a pane is not even looked at,
+  whatever else says it follows the item;
+- **the modal:** the footer `Enter to confirm · Esc to cancel` is the **last** line of the screen, and
+  `What do you want to do?` precedes `1. Stop and wait for limit to reset` in the lines above it (an agent that merely
+  *quotes* those words has its prompt box under the quote and does not match);
+- **the envelope:** a line that starts with `⎿` and says `You've hit your ... limit` (claude's own error turn, not a
+  line an agent printed in the middle of its work) is the **last turn** on the screen, in the last 24 lines: no later `⏺`
+  or `⎿` turn, no `esc to interrupt` (the session is working again), no later prompt with text typed after it. A session
+  that answered after the envelope - its conversation went on - is no longer showing the limit and is not evidence;
+- the screen is **new**: the daemon keeps a signature of the limit turn it last looked at in each pane (the prompt line, the
+  envelope, up to the next separator - the modal and the same screen after an Escape share it, a *new* hit does not,
+  because it has another prompt and another time). An envelope that was answered once is never asked about again; a modal
+  at most once per cooldown (600 s);
+- the screen is **not stale**: a session that was already running when the item was rewritten and is first seen on the limit
+  screen within 90 s of the rewrite is on the *replaced* credential's screen and says nothing about the account in use now
+  (for the modal, that is what the Escape is for). A hit that was already on the screen before the rewrite stays stale for as
+  long as it is the last turn. A session launched after the rewrite never had the old credential, so its screen is evidence.
+
+Three states, as everywhere in this daemon: **evidence** (ask the API once), **no evidence** (ask nothing; a failback is
+allowed), **could not look** (`tmux` down or not runnable, `ps` unreadable, the wrapper's log unreadable): nothing is
+concluded - no probe, no failback, no key, and what was remembered about the panes is left as it was.
+
+## The Escape exception
+
+The send-keys doctrine of this city is "never send keys to a session". This daemon makes **one scoped, documented
+exception**: after it rewrites the pool item it sends the key **Escape**, and only Escape, to a pool pane that is still on
+the limit modal of the credential it replaced - because that modal does not notice the new credential by itself (measured,
+ga-2yyitx), and without the key the session would wait for a human. Escape on the modal returns the session to its prompt and
+the conversation goes on with the account the item holds now. **Only the modal is ever pressed**: the envelope (a later hit
+of a session) blocks nothing - the prompt under it is live and the next message goes out on the new credential - so a pane
+that shows only the envelope gets no key, whatever else is true of it. Every condition below is a reason **not** to send:
+
+| Guard | What it protects |
+|---|---|
+| never in the run that rewrote the item, and not before it has been in place for **45 s** | claude re-reads the item every ~30 s: an Escape earlier would land the session on the *old* credential's modal again |
+| only pool panes proven as above; **never Mayor or a crew** (name check on the raw agent name, in the log reader and again in the scan) | Mayor's / the crews' Remote Control must never be disturbed (Athos 05/10); they run plain `claude`, not the wrapper's pool path |
+| the item still holds the credential of the decision (fingerprint), is readable, and the account in use is not registered exhausted | an Escape into a credential that is itself exhausted would land on the modal again |
+| the pane's process and the modal are re-read **immediately before** the key (the scan is seconds old) | a pane that changed or went back to working is not interrupted |
+| at most **3 tries per pane**, counted *before* the attempt and kept in the state file (junk there reads as "already tried"); at most **20 keys per run** | an Escape that does not take is not repeated for ever; a burst is never unbounded |
+| `GC_POOL_UNSTICK=0` or `touch $GC_CITY_PATH/.gc/no-pool-unstick` | the key can be turned off alone; the daemon still decides and switches |
+| a failure in this step is logged by type and the run goes on to publish the decision | the item was already rewritten; the decision must follow it |
+
+## Proof that the switch costs no credit
+
+Every API call the daemon makes leaves one log line, so "it spent nothing" can be read off the log:
+
+- `API-CALL messages (1-token haiku) with the key fp=...` - the evidence probe. Against an exhausted account it is a **429,
+  which is free**. This is the *only* call that could ever be served (and so billed): when a screen is about another model's
+  limit and the account answers it costs a few tokens, **bounded** to once per cooldown per screen (600 s; a *new* screen is
+  asked about at once), and never on a pane that is not proven to be a pool pane.
+- `API-CALL count_tokens (not billed) with the key fp=...` - the candidate's key check.
+- `EVIDENCE: n pool pane(s) on the limit modal|message (...)` (`message` = the envelope), `SWITCH a -> b ...`,
+  `UNSTICK: Escape sent to pane ...`.
+
+No `claude` is started by the daemon (a static check in the selftest keeps `claude` out of every subprocess call, and a
+`claude` stub on its PATH proves none is ever run); no token appears in argv, env, log, state or output (the selftest
+greps for them after the failover, the failback and the unstick paths). The selftest's end-to-end cycle (B71) asserts: hit ->
+failover, unstuck by one Escape, back by the timer with **no call about the account that renewed**, hit again -> failover
+again, **zero calls served by the API**, `claude` never run.
+
+## Mayor and the crews
+
+The daemon only ever touches the pool's hashed item (`Claude Code-credentials-<hash of the pool dir>`), never the plain
+`Claude Code-credentials` of Mayor and the crews, and never presses a key in a pane whose agent name contains `mayor` or `crew`.
+Those sessions are not enrolled in the wrapper's pool path (only `gastown.dog`, `wa-worker`, `ps-worker` are), so a failover
+cannot reach them either. Putting Mayor and the crews on the pool is phase 2 (decision pending).
 
 ## Activation — merged is not live
 
@@ -73,6 +200,7 @@ Check it is live (not just merged): `launchctl list | grep claude-pool-account` 
 |---|---|
 | Stop the daemon acting AND new pool launches pointing at the item | `touch $GC_CITY_PATH/.gc/no-pool-account` (remove the file to resume) |
 | One launch only | `GC_POOL_ACCOUNT=0` in that launch's environment |
+| Keep deciding and switching, but never press a key in a pane | `touch $GC_CITY_PATH/.gc/no-pool-unstick` (or `GC_POOL_UNSTICK=0` in the daemon's environment) |
 | Remove the mechanism completely | `launchctl unload ~/Library/LaunchAgents/com.gascity.claude-pool-account.plist`, then `security delete-generic-password -a "$USER" -s "Claude Code-credentials-50adeaf1"` — new sessions fall back to the ambient login by themselves |
 
 Live sessions that already follow the item keep the **last written** account when the daemon stops; that is a valid
@@ -90,7 +218,7 @@ first, delete last, and only when restarting the pool is acceptable.
 | `packs/town-deltas/assets/scripts/claude-pool-account.selftest.sh` | hermetic tests (fake security / vault / API, real accounts lib) |
 | `packs/town-deltas/assets/scripts/claude-pool-account.live-accept.sh` | acceptance on the real API + a live TUI session |
 | `whatsapp_automation/lib/claude_account_pool.py` | services read `claude_pool_current_account.json` first |
-| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `SWITCH a -> b`) |
+| `.gc/logs/claude-pool-account.log` | daemon + wrapper events (`POOL-ACCT SET/SKIP/KEEP`, `EVIDENCE`, `API-CALL ...`, `SWITCH a -> b`, `UNSTICK`) |
 
 ## Known limits
 
@@ -98,10 +226,20 @@ first, delete last, and only when restarting the pool is acceptable.
   live harness is the check to re-run after upgrading claude (a mismatch shows as P2a failing); the per-version
   self-test and the divergence alert are ga-8hcnvb.3.
 - Only turn boundaries were measured; a switch in the middle of a long tool call is not guaranteed.
-- A limit modal already open in a live TUI does not notice the restored credential by itself (needs Esc);
-  unsticking such sessions is ga-8hcnvb.2.
+- A limit modal already open in a live TUI does not notice the restored credential by itself: that is what the Escape is
+  for (ga-8hcnvb.2, "The Escape exception"). A session that is not a pool session is never pressed.
+- **Evidence comes from the panes, so what the panes cannot show is not seen.** (1) A headless `claude -p` call that hits the
+  limit prints an error envelope and exits - there is no pane to show it in, so it is *not* evidence on its own; it is
+  carried along by the next switch that a pane triggers (any interactive pool session on the same account will show the
+  modal or the envelope), and a usage-store signal at >= 100% is a possible follow-up, not built here. (2) If `tmux` itself is permanently broken, no failover and
+  no failback can happen (they are evidence-driven by design; the log says `the pool's panes could not be looked at this
+  run` every minute until it is fixed). (3) The modal and envelope texts are claude's (measured on 2.1.291): if a release
+  rewords them the daemon sees no evidence and does not move - the live harness is the check to re-run after upgrading
+  claude, like the item name. (4) A screen that looks like the limit but belongs to something else costs one bounded served call per cooldown
+  (see the proof above), never more.
 - The verdict comes from a 1-token **haiku** call, while the pool runs mostly on Sonnet. If a window exists that limits
-  Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens. Whether
+  Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens (the log says
+  `answers - the limit modal|message on screen is not about this account`, which is how this case would show up). Whether
   such a per-model window shows up in the `anthropic-ratelimit-unified-*` headers was not measured here; the live
   harness (`claude-pool-account.live-accept.sh`) is where to check it.
 - A key the API **refuses** (401/403) is registered for an hour like a limit, but at that time it is **not** failed back
