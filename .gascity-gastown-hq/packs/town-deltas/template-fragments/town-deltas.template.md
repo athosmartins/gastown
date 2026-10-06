@@ -262,10 +262,11 @@ conselhos: cada uma tem um caso que a produziu.
 {{/* td:core:models */ -}}
 ### Modelos atuais (Opus 5.5 / Sonnet 5) — o que o guia oficial muda no seu trabalho (ga-ttwzqd)
 
-Quem roda o quê (medido nos processos vivos em 24/09): **Mayor e crews nomeadas
-= Opus 5.5** (herdam o default global); **pools headless** (dog, wa-worker,
-ps-worker, revisores do gate e do refino, auto-refiner) **= Sonnet 5**. O
-`--effort` de cada papel vem do `city.toml` / `agent.toml`. Os itens abaixo vêm
+Quem roda o quê (ordem do Athos 05/10, commit 3fddba7a9): **Mayor = Opus 5.5,
+effort high**; **crews nomeadas = Sonnet** (alias `sonnet`, provider
+`claude-rc-crew`, com Remote Control), **effort high**; **pools headless** (dog,
+wa-worker, ps-worker, revisores do gate e do refino, auto-refiner) **= Sonnet**.
+O `--effort` de cada papel vem do `city.toml` / `agent.toml`. Os itens abaixo vêm
 dos guias da Anthropic pra esses dois modelos, e cada um bate com um modo de
 falha que já medimos aqui.
 
