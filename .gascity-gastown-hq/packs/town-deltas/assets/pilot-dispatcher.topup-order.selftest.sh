@@ -17,15 +17,18 @@
 #   B  the rule on small populations (priority > type > age, the reclaim age, the epic/brake filters still apply).
 #   C  the three states: an illegible field stays and is WARNed on stderr; "cannot tell" keeps the previous pick + WARN.
 #   D  AGREEMENT WITH THE WORKER PROBE (R5/R6): the dispatcher comment above _topup_pick_first names THIS part as the
-#      test that top-up and the pool worker pick the same bead. It runs the probe's own `bd ready … | jq …` line, taken
-#      live from agents/{wa,ps}-worker/prompt.template.md Step 1b2, on the same populations as top-up. Self-arming: while a
-#      template still carries the pre-migration probe (slice ga-9t9acg.5/.6: window of 20, no type tier) the two known
-#      divergences are REPORTED by name; the moment the probe is migrated, the same populations must agree or this fails.
+#      test that top-up and the pool worker pick the same bead. It runs the probe's own Step 1b2, taken live from
+#      agents/{wa,ps}-worker/prompt.template.md, on the same populations as top-up: the `bd ready … | jq …` line before
+#      the migration, the WHOLE `X_CAND="$(…)" … work_order_sort … printf '%s\n' "$X_PICK"` block after slices
+#      ga-9t9acg.5/.6 (run with GC_CITY_PATH naming the tree this selftest lives in; a probe that WARNs and falls back to
+#      its pre-library order is a FAIL, not an agreement). Self-arming: while a template still carries the pre-migration
+#      probe (window of 20, no type tier) the two known divergences are REPORTED by name; the moment the probe is
+#      migrated, the same populations must agree or this fails. D0 checks the extraction itself on a synthetic template.
 #   E  the library-sourcing block of the dispatcher (present -> loaded; missing -> a visible WARN, no abort).
 #   F  mutation controls: the rule reverted in a COPY of the dispatcher (window back to 20, no ordering, no reclaim age,
 #      "cannot tell" read as empty, the library's stderr swallowed) must each fail the part that guards it.
 #
-# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F; measured 14 pass / 42 fail):
+# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F; measured 18 pass / 42 fail — the passes include D0, which tests the harness, not the dispatcher):
 #   PILOT_DISPATCHER_PATH=<pre-fix pilot-dispatcher.sh> bash pilot-dispatcher.topup-order.selftest.sh
 #
 # Conventions: verbatim function extraction (awk) from the live dispatcher + PATH-stubbed gc/bd/timeout inside the sandbox
@@ -350,14 +353,39 @@ fi
 echo ""
 echo "=== Part D: top-up and the pool worker's probe (R5/R6, Step 1b2) must pick the same bead ==="
 
-probe_line() { grep -m1 "^bd ready --metadata-field \"gc.routed_to=$2\" " "$1"; }
-# probe_pick <template> <pool> <fixture-json> -> the id the template's OWN probe returns first ("" = it returned [])
+# probe_line <template> <pool> -> the Step 1b2 probe of <pool>, verbatim, as a runnable script. Two shapes exist:
+#   - the pre-migration one-liner:  bd ready --metadata-field "gc.routed_to=<pool>" … | jq …
+#   - the migrated block (slices ga-9t9acg.5/.6):  X_CAND="$(  <newline>  bd ready … | jq …  <newline>  )"  …sort via the
+#     library, fall back with a WARN…  printf '%s\n' "$X_PICK"
+# Taking only the `bd ready` line of the migrated block would leave out the very step that orders the pool, and "the probe
+# picks bd's own first bead" would then be this harness's doing, not the probe's. Prints nothing (rc!=0) when the
+# probe is not there OR is the migrated shape without its closing `printf … _PICK` line — an unreadable probe is never
+# an agreement.
+probe_line() {
+  awk -v pool="$2" '
+    BEGIN { want = "^bd ready --metadata-field \"gc.routed_to=" pool "\" " }
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) if (line[i] ~ want) break
+      if (i > NR) exit 1
+      if (i > 1 && line[i-1] ~ /^[A-Z_]+="\$\($/) {
+        for (j = i; j <= NR; j++) if (index(line[j], "printf ") == 1 && line[j] ~ /_PICK"$/) break
+        if (j > NR) exit 2
+        for (k = i - 1; k <= j; k++) print line[k]
+      } else print line[i]
+    }' "$1"
+}
+# probe_pick <template> <pool> <fixture-json> -> the id the template's OWN probe returns first ("" = it returned [] / nothing)
+# The probe runs the way a worker session runs it: GC_CITY_PATH names the city whose packs/town-deltas/assets/scripts holds
+# work-order.sh (here: the tree this selftest lives in; D0c points PROBE_CITY elsewhere), PATH is the sandbox with the
+# fake bd. Its stderr is kept in $WORK/probe.err for the caller — a probe that fell back to its pre-library order did
+# not apply the rule.
 probe_pick() {
   local _line
   _line="$(probe_line "$1" "$2")" || return 1
   [ -n "$_line" ] || return 1
   printf '%s' "$3" > "$WORK/stores/probe.json"
-  ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; export PROBE_STORE
+  ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; GC_CITY_PATH="${PROBE_CITY:-$ROOT}"; export PROBE_STORE GC_CITY_PATH
     bash -c "$_line" 2>"$WORK/probe.err" ) | jq -r '.[0].id // ""'
 }
 agree() { # agree <label> <pool> <template> <prefix> <fixture-json> <expected-by-the-rule>
@@ -371,7 +399,11 @@ agree() { # agree <label> <pool> <template> <prefix> <fixture-json> <expected-by
     return
   fi
   _probe="$(probe_pick "$_tpl" "$_pool" "$_fx")" || _probe="?"
-  if [ "$_probe" = "$_top" ]; then
+  if grep -q 'WARN Step 1b2' "$WORK/probe.err" 2>/dev/null; then
+    # The migrated probe announced that it could not apply the library and fell back (or printed nothing). Whatever it
+    # picked then, it did not pick it BY THE RULE — matching top-up by luck must not read as agreement.
+    bad "$_label: the $_pool probe did not run the shared order (it printed a WARN Step 1b2 and fell back): $(head -c 300 "$WORK/probe.err" | tr '\n' ' ')"
+  elif [ "$_probe" = "$_top" ]; then
     ok "$_label: the worker's probe picks the SAME bead ($_probe)"
   elif printf '%s' "$_line" | grep -qE -- 'work[-_]order|--limit[ =]0( |$)' || ! printf '%s' "$_line" | grep -q -- '--limit=20'; then
     bad "$_label: the probe was migrated but picks '$_probe' while top-up picks '$_top' — they must agree (Part D header)"
@@ -396,6 +428,38 @@ for _p in wa-worker ps-worker; do
   # D3: the window (25 beads, the oldest P0 feature 24th: the probe's --limit=20 never sees it).
   agree "D3[$_p] window: 25 beads, the oldest P0 feature is 24th" "$_p" "$_tpl" "$_pre" "$(big25 "$_pre" "$_p")" "${_pre}-p0-oldfeat"
 done
+
+# D0: the extraction itself. A harness that cannot run the migrated block would report "the probe picks bd's own first
+# bead" whatever the template says (that is what taking only the `bd ready` line did against ga-9t9acg.6). So: a synthetic
+# template in the migrated shape, whose sort step is swapped, must make probe_pick tell the two apart.
+mk_probe_tpl() { # mk_probe_tpl <file> <the sort command of the pipeline> [no-end]
+  cat > "$1" <<'TPL'
+# Step 1b2 (synthetic)
+PS_CAND="$(
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --json --limit 0
+)"
+PS_LIB="${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/work-order.sh"
+PS_PICK=""
+PS_SORTED="$( . "$PS_LIB" && printf '%s' "$PS_CAND" | __SORT__ )" && [ -n "$PS_SORTED" ] && PS_PICK="$(printf '%s' "$PS_SORTED" | jq -c '.[:1]')"
+if [ -z "$PS_PICK" ]; then echo "WARN Step 1b2: could not order the pool" >&2; fi
+printf '%s\n' "$PS_PICK"
+# trailing prose
+TPL
+  sed -i.bak "s/__SORT__/$2/" "$1" && rm -f "$1.bak"
+  if [ "${3:-}" = no-end ]; then grep -v '^printf ' "$1" > "$1.new" && mv "$1.new" "$1"; fi
+}
+D0="$( { bead d0-p0-old-bug 0 bug 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' ps-worker
+         bead d0-p0-new-feat 0 feature 2026-10-05T00:00:00Z '2026-10-05T00:00:00Z' '[]' ps-worker; } | arr)"
+mk_probe_tpl "$WORK/d0-ordering.md" 'work_order_sort --age reclaim'
+mk_probe_tpl "$WORK/d0-noop.md" 'cat'
+mk_probe_tpl "$WORK/d0-truncated.md" 'work_order_sort --age reclaim' no-end
+eq "D0a the migrated block is run whole: its sort step orders the pool (P0 feature before the older P0 bug)" "$(probe_pick "$WORK/d0-ordering.md" ps-worker "$D0")" "d0-p0-new-feat"
+eq "D0b a migrated block whose sort step does nothing returns bd's own first bead — the harness can tell" "$(probe_pick "$WORK/d0-noop.md" ps-worker "$D0")" "d0-p0-old-bug"
+_o="$(PROBE_CITY="$WORK/no-such-city" probe_pick "$WORK/d0-ordering.md" ps-worker "$D0")"
+if [ -z "$_o" ] && grep -q 'WARN Step 1b2' "$WORK/probe.err"; then ok "D0c the library missing under GC_CITY_PATH: nothing picked and the probe's WARN reaches the harness (agree() turns that into a FAIL)"
+else bad "D0c the library missing under GC_CITY_PATH: picked '$_o', stderr: $(head -c 200 "$WORK/probe.err")"; fi
+if probe_line "$WORK/d0-truncated.md" ps-worker >/dev/null 2>&1; then bad "D0d a migrated block without its closing 'printf … _PICK' line was accepted as a probe"
+else ok "D0d a migrated block without its closing 'printf … _PICK' line is refused, not half-run"; fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
