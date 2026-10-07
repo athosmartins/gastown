@@ -21,14 +21,22 @@
 #      agents/{wa,ps}-worker/prompt.template.md, on the same populations as top-up: the `bd ready … | jq …` line before
 #      the migration, the WHOLE `X_CAND="$(…)" … work_order_sort … printf '%s\n' "$X_PICK"` block after slices
 #      ga-9t9acg.5/.6 (run with GC_CITY_PATH naming the tree this selftest lives in; a probe that WARNs and falls back to
-#      its pre-library order is a FAIL, not an agreement). Self-arming: while a template still carries the pre-migration
-#      probe (window of 20, no type tier) the two known divergences are REPORTED by name; the moment the probe is
-#      migrated, the same populations must agree or this fails. D0 checks the extraction itself on a synthetic template.
+#      its pre-library order is a FAIL, not an agreement). Each case is `must` or a NAMED known divergence. D1/D1b
+#      (priority + age, a reclaimed bead) are `must`: both orders agree there TODAY, so a worker that disagrees is a FAIL
+#      even before it migrates. D2/D3 (the type tier, the window of 20) are reported by name while the template still
+#      carries the pre-migration probe, and must agree the moment it is migrated; and a divergence is only ever a note
+#      while the respawn brake is OFF for that pool (see F) — a divergence that reaches the brake is a FAIL. D0 checks
+#      the extraction itself on a synthetic template; DM checks `must` and the brake rule with synthetic workers.
 #   E  the library-sourcing block of the dispatcher (present -> loaded; missing -> a visible WARN, no abort).
-#   F  mutation controls: the rule reverted in a COPY of the dispatcher (window back to 20, no ordering, no reclaim age,
-#      "cannot tell" read as empty, the library's stderr swallowed) must each fail the part that guards it.
+#   F  THE BRAKE (ga-653ilw) vs THIS ORDER: _pilot_pool_topup counts a top-up spawn toward the respawn brake only while the
+#      pool worker's template carries the migrated probe. Real _topup_note_spawn over a stateful fake bd, several
+#      consecutive sweeps, a bead nobody claims: an unmigrated worker -> NOT counted, NOT braked, a WARN each time; a
+#      migrated one -> counted, braked at the cap of 5, the next bead is served; the switch re-arms the brake by itself.
+#   G  mutation controls: the rule reverted in a COPY of the dispatcher (window back to 20, no ordering, no reclaim age,
+#      "cannot tell" read as empty, the library's stderr swallowed, the brake counting spawns of an unmigrated worker)
+#      must each fail the part that guards it.
 #
-# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F; measured 18 pass / 42 fail — the passes include D0, which tests the harness, not the dispatcher):
+# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F, G; measured 18 pass / 42 fail — the passes include D0, which tests the harness, not the dispatcher):
 #   PILOT_DISPATCHER_PATH=<pre-fix pilot-dispatcher.sh> bash pilot-dispatcher.topup-order.selftest.sh
 #
 # Conventions: verbatim function extraction (awk) from the live dispatcher + PATH-stubbed gc/bd/timeout inside the sandbox
@@ -86,7 +94,8 @@ cat > "$WORK/rigs.json" <<EOF
 ]}
 EOF
 
-# A fake bd that answers ONLY `bd [-C dir] ready …`, from $FAKE_WORK/stores/<basename of -C>.json (no -C: $PROBE_STORE).
+# A fake bd that answers `bd [-C dir] ready …` (and, for Part F, show / update --set-metadata / label add / comment), from
+# $FAKE_WORK/stores/<basename of -C>.json (no -C: $PROBE_STORE).
 # The file is the population IN THE ORDER bd WOULD RETURN IT (bd's own tie order is its business: the fixtures say what it
 # is). It honours the flags the code under test sends: --metadata-field gc.routed_to=, --unassigned (every fixture bead is
 # open and unassigned), --exclude-type, --exclude-label, --limit N / --limit=N / -n N (0 = everything), --sort priority
@@ -98,7 +107,30 @@ printf 'bd\t%s\n' "$*" >> "$W/bd.calls"
 store=""
 if [ "${1:-}" = "-C" ]; then store="$(basename "$2")"; shift 2; fi
 sub="${1:-}"; shift || true
-[ "$sub" = ready ] || exit 0
+sf="$W/stores/${store:-city}.json"
+case "$sub" in
+  ready) ;;
+  show)    # one bead, as bd prints it: a one-element array. Unknown id / no store: an error, as bd does.
+    out="$(jq -c --arg id "${1:-}" '[.[] | select(.id == $id)]' "$sf" 2>/dev/null)"
+    { [ -n "$out" ] && [ "$out" != "[]" ]; } || { echo "Error: no such bead" >&2; exit 1; }
+    printf '%s\n' "$out"; exit 0 ;;
+  update)  # --set-metadata k=v (repeatable)
+    id="${1:-}"; shift || true
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --set-metadata) jq --arg id "$id" --arg k "${2%%=*}" --arg v "${2#*=}" 'map(if .id == $id then .metadata[$k] = $v else . end)' "$sf" > "$sf.tmp" && mv "$sf.tmp" "$sf"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    exit 0 ;;
+  label)
+    if [ "${1:-}" = add ]; then
+      jq --arg id "${2:-}" --arg l "${3:-}" 'map(if .id == $id then .labels = (((.labels // []) + [$l]) | unique) else . end)' "$sf" > "$sf.tmp" && mv "$sf.tmp" "$sf"
+    fi
+    exit 0 ;;
+  comment) printf 'COMMENT\t%s/%s\t%s\n' "$store" "${1:-}" "${2:-}" >> "$W/comments.log"; exit 0 ;;
+  *) exit 0 ;;
+esac
 want=""; limit=100; sort="priority"; extype=""; exl=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -208,6 +240,51 @@ run_topup() {
     _pilot_pool_topup "$_pool" 1
   ) >/dev/null 2>"$WORK/run.err"
   head -n1 "$WORK/spawn.log"
+}
+
+# run_sweeps <pool> <n> — n CONSECUTIVE top-up sweeps over the stores as they are, with the brake code REAL
+# (_topup_pending_store, _topup_note_spawn, _topup_worker_probe_migrated, all extracted from $DISP). The spawn is a stub
+# that records the bead and succeeds, and nothing ever claims the bead: the shape of a worker that takes some other
+# bead. spawn.log / warn.log accumulate over the n sweeps (run_topup clears them; this does not).
+run_sweeps() {
+  local _pool="$1" _n="$2"
+  : > "$WORK/spawn.log"; : > "$WORK/warn.log"; : > "$WORK/comments.log"
+  prelude_for
+  (
+    set -euo pipefail
+    PATH="$SANDBOX_PATH"; GC_CITY="$WORK/city"; DRY_RUN=0; GC_VARIABLE_SESSION_MAX=100
+    PILOT_DOLT_SATURATED_AT_START=0
+    export PILOT_TEST_WA_WORKER_LIVE_COUNT=0 PILOT_TEST_PS_WORKER_LIVE_COUNT=0
+    log()  { :; }
+    warn() { printf 'warn\t%s\n' "$*" >> "$WORK/warn.log"; }
+    _filter_exec_manual() { cat; }; _filter_candidates() { cat; }; _filter_label_vetoes() { cat; }
+    _pilot_variable_session_count() { _PLSC_N=0; return 0; }
+    _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
+    eval "$TOPUP_VARS"; eval "$PRELUDE"
+    eval "$(need _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated)"
+    apply_libmode
+    _TOPUP_RIG_PATHS_JSON="$(cat "$WORK/rigs.json")"
+    _TOPUP_RIG_PATHS="$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path')"
+    _i=0
+    while [ "$_i" -lt "$_n" ]; do _pilot_pool_topup "$_pool" 1; _i=$((_i + 1)); done
+  ) >/dev/null 2>"$WORK/run.err"
+}
+spawns_for() { grep -c "^$1\$" "$WORK/spawn.log" 2>/dev/null || true; }
+bead_in() { jq -r --arg id "$2" "[.[] | select(.id == \$id)][0] | $3" "$WORK/stores/$1.json" 2>/dev/null; }
+
+# set_worker_template <pool> <migrated|legacy|none> — what the sandbox city's agents/<pool>/prompt.template.md carries
+# (the file _topup_worker_probe_migrated reads). `migrated` is the shape slices ga-9t9acg.5/.6 deploy; `legacy` is the
+# one-liner of today.
+set_worker_template() {
+  mkdir -p "$WORK/city/agents/$1"
+  case "$2" in
+    migrated) printf '%s\n' '# Step 1b2' 'X_CAND="$(' "bd ready --metadata-field \"gc.routed_to=$1\" --unassigned --json --limit 0" ')"' \
+                '  X_SORTED="$( . "$X_LIB" && printf '"'"'%s'"'"' "$X_CAND" | work_order_sort --age reclaim )" && [ -n "$X_SORTED" ]' \
+                > "$WORK/city/agents/$1/prompt.template.md" ;;
+    legacy)   printf '%s\n' '# Step 1b2' "bd ready --metadata-field \"gc.routed_to=$1\" --unassigned --json --limit=20 | jq -c '.[:1]'" \
+                > "$WORK/city/agents/$1/prompt.template.md" ;;
+    none)     rm -f "$WORK/city/agents/$1/prompt.template.md" ;;
+  esac
 }
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -344,13 +421,27 @@ clear_stores; write_store city "$BIG_WA"
 eq "C4 whole loop, library missing: top-up still spawns (for bd's first bead) — a visible WARN, not a silent stop" "$(run_topup wa-worker bd)" "wa-p0-01"
 if grep -q 'WARN ga-9t9acg.4' "$WORK/run.err"; then ok "C4b ...and the WARN reached the loop's stderr (the dispatcher log)"; else bad "C4b no WARN on the loop's stderr: [$(cat "$WORK/run.err")]"; fi
 LIBMODE=ok
-# structural: the library call carries no 2>/dev/null (its stderr is the signal).
+# structural: the library call carries no stderr redirection (its stderr is the signal). The judge looks at the ONE line
+# that really pipes into the sorter — not at "some line that mentions work_order_sort", which a comment, the `type`
+# probe above it or an error message would satisfy whatever the call itself did (that was the first version of C5).
+# c5_judge <function source> -> ok | swallows | no-call (zero or several lines pipe into the sorter: it cannot be judged)
+c5_judge() {
+  local _calls _n
+  _calls="$(printf '%s\n' "$1" | grep -E '^[^#]*\$\(.*\| *work_order_sort --age' || true)"
+  _n="$(printf '%s' "$_calls" | grep -c . || true)"
+  if [ "$_n" != "1" ]; then echo no-call
+  elif printf '%s\n' "$_calls" | grep -q '2>'; then echo swallows
+  else echo ok; fi
+}
 _pf="$(fn_src _topup_pick_first)"
-if [ -n "$_pf" ] && printf '%s\n' "$_pf" | grep -E 'work_order_sort' | grep -vqE '2>/dev/null|2>&-'; then
-  ok "C5 the work_order_sort call in _topup_pick_first has no 2>/dev/null"
-else
-  bad "C5 _topup_pick_first is missing, or its work_order_sort call swallows stderr"
-fi
+eq "C5 the line of _topup_pick_first that pipes into work_order_sort carries no stderr redirection" "$(c5_judge "$_pf")" "ok"
+# C5 controls: the judge must be able to say "swallows" and "no-call" — on a decoy where the OLD C5 passed.
+_decoy='  # ... | work_order_sort --age reclaim 2>&1 (a comment)
+  if ! type work_order_sort >/dev/null 2>&1; then _why=x
+  elif ! _ordered=$(printf %s "$_eligible" | work_order_sort --age "$_age" 2>/dev/null) || [ -z "$_ordered" ]; then _why=y; fi
+  echo "WARN: work_order_sort could not order" >&2'
+eq "C5b control: a call that swallows its stderr is judged 'swallows' even with innocent work_order_sort lines around it" "$(c5_judge "$_decoy")" "swallows"
+eq "C5c control: a function with no such call is judged 'no-call', never 'ok'" "$(c5_judge '  # work_order_sort --age reclaim lives elsewhere')" "no-call"
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
@@ -391,8 +482,24 @@ probe_pick() {
   ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; GC_CITY_PATH="${PROBE_CITY:-$ROOT}"; export PROBE_STORE GC_CITY_PATH
     bash -c "$_line" 2>"$WORK/probe.err" ) | jq -r '.[0].id // ""'
 }
-agree() { # agree <label> <pool> <template> <prefix> <fixture-json> <expected-by-the-rule>
-  local _label="$1" _pool="$2" _tpl="$3" _fx="$5" _want="$6" _top _probe _line
+# brake_gate_for <template> <pool> -> counted | off | unreadable: what the DISPATCHER's own _topup_worker_probe_migrated
+# (extracted from $DISP) decides for that template — i.e. whether top-up spawns for <pool> count toward the respawn brake.
+brake_gate_for() {
+  local _src _rc
+  _src="$(need _topup_worker_probe_migrated)"
+  [ -n "$_src" ] || { echo unreadable; return 0; }
+  mkdir -p "$WORK/gate-city/agents/$2"
+  cp "$1" "$WORK/gate-city/agents/$2/prompt.template.md" || { echo unreadable; return 0; }
+  ( GC_CITY="$WORK/gate-city"; eval "$_src"; _topup_worker_probe_migrated "$2" ) && _rc=0 || _rc=$?
+  case "$_rc" in 0) echo counted ;; 1) echo off ;; *) echo unreadable ;; esac
+}
+# agree <label> <pool> <template> <prefix> <fixture-json> <expected-by-the-rule> <must | what-differs>
+#   must          priority and age are the same in both orders, so the probe has to agree TODAY: a difference is a FAIL
+#   <what-differs> a known divergence of the PRE-migration probe (named in the report). It is only a note while the
+#                 respawn brake is OFF for the pool (brake_gate_for says `off`); once the probe is migrated it must agree.
+agree() {
+  local _label="$1" _pool="$2" _tpl="$3" _fx="$5" _want="$6" _mode="${7:-}" _top _probe _line _gate
+  if [ -z "$_mode" ]; then bad "$_label: Part D bug — agree() needs 'must' or a description of the known divergence as its 7th argument"; return; fi
   clear_stores; write_store city "$_fx"
   _top="$(run_topup "$_pool" bd)"
   eq "$_label: top-up ($_pool) picks the bead the rule serves first" "$_top" "$_want"
@@ -408,28 +515,38 @@ agree() { # agree <label> <pool> <template> <prefix> <fixture-json> <expected-by
     bad "$_label: the $_pool probe did not run the shared order (it printed a WARN Step 1b2 and fell back): $(head -c 300 "$WORK/probe.err" | tr '\n' ' ')"
   elif [ "$_probe" = "$_top" ]; then
     ok "$_label: the worker's probe picks the SAME bead ($_probe)"
+  elif [ "$_mode" = must ]; then
+    bad "$_label: top-up picks '$_top' but the $_pool probe picks '$_probe' — priority and age are the same in both orders, so this case must agree TODAY (and a worker that disagrees here also breaks the respawn brake's premise)"
   elif printf '%s' "$_line" | grep -qE -- 'work[-_]order|--limit[ =]0( |$)' || ! printf '%s' "$_line" | grep -q -- '--limit=20'; then
     bad "$_label: the probe was migrated but picks '$_probe' while top-up picks '$_top' — they must agree (Part D header)"
   else
-    note "$_label: KNOWN divergence — the $_pool probe still carries the pre-migration Step 1b2 (window --limit=20, no type tier): it picks '$_probe', top-up '$_top'. Closed by slice ga-9t9acg.5/.6; this part enforces agreement from then on."
+    _gate="$(brake_gate_for "$_tpl" "$_pool")"
+    if [ "$_gate" = off ]; then
+      note "$_label: KNOWN divergence — $_mode. The $_pool probe still carries the pre-migration Step 1b2 and picks '$_probe' where top-up picks '$_top'; the respawn brake is OFF for $_pool meanwhile, so the divergence cannot brake the rule's bead. Closed by slice ga-9t9acg.5/.6; from then on this case must agree."
+    else
+      bad "$_label: the $_pool probe diverges ($_mode: '$_probe' vs top-up '$_top') while the dispatcher's brake gate says '$_gate' — spawns would count toward the brake for a worker that takes another bead, and the rule's #1 bead would be braked for nothing"
+    fi
   fi
+}
+mk_d1() { # mk_d1 <pool> -> priority + age populations with ONE reclaimed bead (old created_at, recent updated_at)
+  { bead d1-p0-new 0 task 2026-10-05T00:00:00Z '2026-10-05T00:00:00Z' '[]' "$1"
+    bead d1-p0-old 0 task 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' "$1"
+    bead d1-p1-ancient 1 task 2026-07-01T00:00:00Z '2026-07-01T00:00:00Z' '[]' "$1"
+    bead d1-p0-reclaimed 0 task 2026-08-01T00:00:00Z '2026-10-06T00:00:00Z' '["pilot:reclaim-count:1"]' "$1"; } | arr
 }
 for _p in wa-worker ps-worker; do
   case "$_p" in wa-worker) _tpl="$WA_TEMPLATE"; _pre=wa ;; *) _tpl="$PS_TEMPLATE"; _pre=ps ;; esac
   # D1: priority and age decide (no type difference, window not reached, one reclaimed bead): must agree TODAY.
-  D1="$( { bead d1-p0-new 0 task 2026-10-05T00:00:00Z '2026-10-05T00:00:00Z' '[]' "$_p"
-           bead d1-p0-old 0 task 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' "$_p"
-           bead d1-p1-ancient 1 task 2026-07-01T00:00:00Z '2026-07-01T00:00:00Z' '[]' "$_p"
-           bead d1-p0-reclaimed 0 task 2026-08-01T00:00:00Z '2026-10-06T00:00:00Z' '["pilot:reclaim-count:1"]' "$_p"; } | arr)"
-  agree "D1[$_p] priority + age, with a reclaimed bead" "$_p" "$_tpl" "$_pre" "$D1" "d1-p0-old"
+  D1="$(mk_d1 "$_p")"
+  agree "D1[$_p] priority + age, with a reclaimed bead" "$_p" "$_tpl" "$_pre" "$D1" "d1-p0-old" must
   D1b="$(printf '%s' "$D1" | jq -c '[.[] | select(.id != "d1-p0-old")]')"
-  agree "D1b[$_p] the oldest is gone: the reclaimed bead (old created_at, recent updated_at) does not win on either side" "$_p" "$_tpl" "$_pre" "$D1b" "d1-p0-new"
+  agree "D1b[$_p] the oldest is gone: the reclaimed bead (old created_at, recent updated_at) does not win on either side" "$_p" "$_tpl" "$_pre" "$D1b" "d1-p0-new" must
   # D2: the type tier (the rule: a P0 feature before an older P0 bug).
   D2="$( { bead d2-p0-old-bug 0 bug 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' "$_p"
            bead d2-p0-new-feat 0 feature 2026-10-05T00:00:00Z '2026-10-05T00:00:00Z' '[]' "$_p"; } | arr)"
-  agree "D2[$_p] type tier: P0 feature vs an older P0 bug" "$_p" "$_tpl" "$_pre" "$D2" "d2-p0-new-feat"
+  agree "D2[$_p] type tier: P0 feature vs an older P0 bug" "$_p" "$_tpl" "$_pre" "$D2" "d2-p0-new-feat" "the old probe has no type tier: it serves an older P0 bug before a newer P0 feature"
   # D3: the window (25 beads, the oldest P0 feature 24th: the probe's --limit=20 never sees it).
-  agree "D3[$_p] window: 25 beads, the oldest P0 feature is 24th" "$_p" "$_tpl" "$_pre" "$(big25 "$_pre" "$_p")" "${_pre}-p0-oldfeat"
+  agree "D3[$_p] window: 25 beads, the oldest P0 feature is 24th" "$_p" "$_tpl" "$_pre" "$(big25 "$_pre" "$_p")" "${_pre}-p0-oldfeat" "the old probe sees a window of 20 beads and the oldest P0 feature is the 24th"
 done
 
 # D0: the extraction itself. A harness that cannot run the migrated block would report "the probe picks bd's own first
@@ -464,6 +581,23 @@ else bad "D0c the library missing under GC_CITY_PATH: picked '$_o', stderr: $(he
 if probe_line "$WORK/d0-truncated.md" ps-worker >/dev/null 2>&1; then bad "D0d a migrated block without its closing 'printf … _PICK' line was accepted as a probe"
 else ok "D0d a migrated block without its closing 'printf … _PICK' line is refused, not half-run"; fi
 
+# DM: `must`, and the brake rule, on synthetic workers. agree() runs in $(…) so its counters stay out of ours; what is
+# asserted is the verdict line it prints.
+cat > "$WORK/dm-legacy-created.md" <<'TPL'
+# Step 1b2 (synthetic worker that ages by created_at: no reclaim anti-starvation)
+bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --json --limit=20 | jq -c 'sort_by([.priority, .created_at]) | .[:1]'
+TPL
+{ cat "$WORK/dm-legacy-created.md"
+  echo '  PS_SORTED="$( . "$PS_LIB" && printf '"'"'%s'"'"' "$PS_CAND" | work_order_sort --age reclaim )"   # a second, migrated-looking line'; } > "$WORK/dm-split.md"
+_o="$(agree DM1 ps-worker "$WORK/dm-legacy-created.md" ps "$(mk_d1 ps-worker)" d1-p0-old must)"
+case "$_o" in *"✗ DM1"*"must agree TODAY"*) ok "DM1 a worker that ages by created_at disagrees on the reclaimed-bead case (D1): a FAIL in must-mode, not a note" ;; *) bad "DM1 a worker disagreeing on a must case was not failed: $_o" ;; esac
+D2ps="$( { bead dm-old-bug 0 bug 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' ps-worker
+           bead dm-new-feat 0 feature 2026-10-05T00:00:00Z '2026-10-05T00:00:00Z' '[]' ps-worker; } | arr)"
+_o="$(agree DM2 ps-worker "$WORK/dm-legacy-created.md" ps "$D2ps" dm-new-feat "the old probe has no type tier")"
+case "$_o" in *"✗ DM2"*) bad "DM2 a named divergence of an unmigrated worker (brake OFF) was failed: $_o" ;; *"ℹ DM2"*"KNOWN divergence — the old probe has no type tier"*"brake is OFF"*) ok "DM2 the same worker on the type tier is a NAMED note, because the brake is OFF for it" ;; *) bad "DM2 unexpected verdict: $_o" ;; esac
+_o="$(agree DM3 ps-worker "$WORK/dm-split.md" ps "$D2ps" dm-new-feat "the old probe has no type tier")"
+case "$_o" in *"✗ DM3"*"brake gate says 'counted'"*) ok "DM3 a divergence while the dispatcher's gate says the brake COUNTS this pool is a FAIL (it reaches the brake)" ;; *) bad "DM3 a divergence that reaches the brake was not failed: $_o" ;; esac
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== Part E: the library-sourcing block of the dispatcher ==="
@@ -493,7 +627,66 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== Part F: mutation controls — the rule reverted in a COPY of the dispatcher must fail the part that guards it ==="
+echo "=== Part F: the respawn brake (ga-653ilw) vs this order — a spawn counts only for a worker on the shared order ==="
+
+# The brake reads "spawned for A, A still unclaimed" as "A is stuck". Top-up now spawns for the rule's #1 bead; a worker that
+# still runs the pre-migration probe takes ITS first bead instead, so the rule's #1 bead stays unclaimed through no fault of
+# its own and the brake would label it pilot:topup-braked after 5 sweeps — and the next one after that, down the queue.
+# _pilot_pool_topup therefore counts a spawn only when agents/<pool>/prompt.template.md carries the migrated probe.
+# These are REAL consecutive sweeps (real _topup_note_spawn over a stateful fake bd); nothing ever claims the bead.
+GB="$( { bead f-first 0 feature 2026-09-01T00:00:00Z '2026-09-01T00:00:00Z' '[]' wa-worker
+         bead f-second 1 task 2026-09-02T00:00:00Z '2026-09-02T00:00:00Z' '[]' wa-worker; } | arr)"
+f_braked() { bead_in city "$1" '(.labels // []) | (index("pilot:topup-braked") | tostring)'; }   # "null" = not braked
+f_count()  { bead_in city "$1" '.metadata["pilot.topup_spawn_count"] // "none"'; }
+f_warns()  { grep -c "$1" "$WORK/warn.log" 2>/dev/null || true; }
+
+# F0: the gate itself (the dispatcher's own _topup_worker_probe_migrated), on the shapes that matter.
+printf '%s\n' 'X_CAND="$(' 'bd ready --metadata-field "gc.routed_to=wa-worker" --json --limit 0' ')"' \
+  '  WA_SORTED="$( . "$WA_LIB" && printf '"'"'%s'"'"' "$WA_CAND" | work_order_sort --age reclaim )" && [ -n "$WA_SORTED" ]' > "$WORK/f0-migrated.md"
+printf '%s\n' '# (work_order_sort --age reclaim, sourced from ${GC_CITY_PATH:-$GC_CITY}) — this probe is not migrated yet' \
+  'bd ready --metadata-field "gc.routed_to=wa-worker" --json --limit=20 | jq -c ".[:1]"' > "$WORK/f0-comment-only.md"
+printf '%s\n' '  WA_SORTED="$( . "$WA_LIB" && printf '"'"'%s'"'"' "$WA_CAND" | work_order_sort --age created )"' > "$WORK/f0-age-created.md"
+eq "F0a the migrated probe line (X_SORTED=\"\$( … work_order_sort --age reclaim …)\") -> the brake COUNTS" "$(brake_gate_for "$WORK/f0-migrated.md" wa-worker)" "counted"
+eq "F0b a template that only MENTIONS work_order_sort in a comment is not migrated -> brake off" "$(brake_gate_for "$WORK/f0-comment-only.md" wa-worker)" "off"
+eq "F0c a probe ordering by --age created is not the order top-up uses (reclaim) -> brake off" "$(brake_gate_for "$WORK/f0-age-created.md" wa-worker)" "off"
+eq "F0d the pre-migration one-liner -> brake off" "$(brake_gate_for "$WORK/dm-legacy-created.md" ps-worker)" "off"
+eq "F0e no template to read -> not 'counted' and not 'off': cannot tell" "$(brake_gate_for "$WORK/no-such-template.md" wa-worker)" "unreadable"
+
+# F1: unmigrated worker, 8 sweeps (the cap is 5): spawns keep happening for the rule's #1 bead, none counted, none braked,
+# and every one says so.
+set_worker_template wa-worker legacy; clear_stores; write_store city "$GB"; run_sweeps wa-worker 8
+eq "F1a unmigrated worker: top-up spawns for the rule's #1 bead on every sweep (8 of 8) — the trade-off: no brake until the probe migrates" "$(spawns_for f-first)" "8"
+eq "F1b ...and the bead is NOT braked after 8 sweeps (the cap is 5)" "$(f_braked f-first)" "null"
+eq "F1c ...nothing was counted on it" "$(f_count f-first)" "none"
+eq "F1d ...each of the 8 spawns says the brake is OFF for wa-worker (a visible WARN, never silent)" "$(f_warns 'respawn brake OFF for wa-worker')" "8"
+eq "F1e ...the next bead was never reached (the rule's #1 is not braked away)" "$(spawns_for f-second)" "0"
+
+# F2: migrated worker: the brake works as ga-653ilw built it.
+set_worker_template wa-worker migrated; clear_stores; write_store city "$GB"; run_sweeps wa-worker 8
+eq "F2a migrated worker: 5 spawns for the rule's #1 bead (the cap), then the brake stops them" "$(spawns_for f-first)" "5"
+eq "F2b ...the bead is labelled pilot:topup-braked" "$([ "$(f_braked f-first)" != null ] && echo braked || echo not-braked)" "braked"
+eq "F2c ...with the count the brake recorded" "$(f_count f-first)" "5"
+eq "F2d ...top-up then serves the NEXT bead (3 sweeps), it is not blocked behind the braked one" "$(spawns_for f-second)" "3"
+eq "F2e ...which is counted too, and not braked yet (3 < 5)" "$(f_count f-second)/$(f_braked f-second)" "3/null"
+eq "F2f ...the brake left exactly one comment on the braked bead" "$(grep -c '^COMMENT	city/f-first' "$WORK/comments.log" || true)" "1"
+eq "F2g ...and no sweep said the brake was off" "$(f_warns 'respawn brake OFF')" "0"
+
+# F3: the template cannot be read: cannot tell is not "migrated" — nothing counted, said out loud.
+set_worker_template wa-worker none; clear_stores; write_store city "$GB"; run_sweeps wa-worker 3
+eq "F3a no template: spawns still happen (3 of 3), none counted, none braked" "$(spawns_for f-first)/$(f_count f-first)/$(f_braked f-first)" "3/none/null"
+eq "F3b ...each one WARNs that it cannot read the template" "$(f_warns 'cannot read .*agents/wa-worker/prompt.template.md')" "3"
+
+# F4: self-arming. The same bead, the same store: counting starts the moment the template is migrated — and not before.
+set_worker_template wa-worker legacy; clear_stores; write_store city "$GB"; run_sweeps wa-worker 3
+eq "F4a 3 sweeps before the migration: nothing counted" "$(f_count f-first)/$(f_braked f-first)" "none/null"
+set_worker_template wa-worker migrated; run_sweeps wa-worker 2
+eq "F4b the template is migrated: the next 2 sweeps are counted from 0 (count 2), not braked" "$(f_count f-first)/$(f_braked f-first)" "2/null"
+run_sweeps wa-worker 3
+eq "F4c 3 more: the count reaches the cap of 5 and the bead is braked" "$(f_count f-first)/$([ "$(f_braked f-first)" != null ] && echo braked || echo not-braked)" "5/braked"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== Part G: mutation controls — the rule reverted in a COPY of the dispatcher must fail the part that guards it ==="
 
 # mutate <name> <old> <new> [expected-occurrences] -> $WORK/mut/<name>.sh ; fails if <old> is not there that many times
 mutate() {
@@ -504,7 +697,7 @@ print(open(sys.argv[1], encoding="utf-8").read().count(sys.argv[2]))
 PY
 )"
   if [ "$_have" != "$_n" ]; then
-    bad "F[$1] the mutation cannot be applied: expected $_n occurrence(s) of the text to revert, found $_have (pre-fix dispatcher?) — a control that cannot run proves nothing"
+    bad "G[$1] the mutation cannot be applied: expected $_n occurrence(s) of the text to revert, found $_have (pre-fix dispatcher?) — a control that cannot run proves nothing"
     return 1
   fi
   python3 -I - "$DISPATCHER" "$WORK/mut/$1.sh" "$2" "$3" <<'PY'
@@ -514,7 +707,7 @@ open(sys.argv[2], "w", encoding="utf-8").write(src.replace(sys.argv[3], sys.argv
 PY
 }
 killed() { # killed <name> <what the mutant did> <got> <the right answer>
-  if [ "$3" != "$4" ]; then ok "F[$1] $2 -> the guarding scenario FAILS on the mutant (got '$3', the rule says '$4')"; else bad "F[$1] $2 -> the mutant still passes the guarding scenario ('$3'): the selftest does not guard this rule"; fi
+  if [ "$3" != "$4" ]; then ok "G[$1] $2 -> the guarding scenario FAILS on the mutant (got '$3', the rule says '$4')"; else bad "G[$1] $2 -> the mutant still passes the guarding scenario ('$3'): the selftest does not guard this rule"; fi
 }
 
 clear_stores; write_store city "$BIG_WA"
@@ -534,6 +727,18 @@ if mutate stderr 'work_order_sort --age "$_age")' 'work_order_sort --age "$_age"
   DISP="$WORK/mut/stderr.sh"; pick_direct "$C1" >/dev/null
   _w="$(grep -c '^work-order WARN: c1-bad-prio' "$WORK/run.err")"; DISP="$DISPATCHER"
   killed stderr "the library's stderr is swallowed (the WARN lines vanish)" "$_w" "1"
+fi
+
+if mutate gate '_mig=0; _topup_worker_probe_migrated "$_pool" || _mig=$?' '_mig=0'; then
+  DISP="$WORK/mut/gate.sh"
+  set_worker_template wa-worker legacy; clear_stores; write_store city "$GB"; run_sweeps wa-worker 8
+  _g="$(f_braked f-first)"; DISP="$DISPATCHER"
+  killed gate "the brake counts every spawn again, whatever the worker's probe (the gate bypassed; F1 shape)" "$_g" "null"
+fi
+# the C5 judge on the real mutant: a swallowed stderr must be seen by the structural check too.
+if [ -f "$WORK/mut/stderr.sh" ]; then
+  DISP="$WORK/mut/stderr.sh"; _pfm="$(fn_src _topup_pick_first)"; DISP="$DISPATCHER"
+  killed c5 "the library's stderr is swallowed -> the structural C5 judge" "$(c5_judge "$_pfm")" "ok"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

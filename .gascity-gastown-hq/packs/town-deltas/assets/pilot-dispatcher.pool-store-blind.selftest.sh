@@ -52,6 +52,17 @@ ln -s "$WORK/rigs/property_scrapers" "$WORK/rigs/ps-link"
 sandbox_path_init "$WORK" timeout jq || exit 2
 export FAKE_WORK="$WORK"
 
+# ga-9t9acg.4: the respawn brake counts a top-up spawn only while the pool worker's template carries the migrated Step 1b2
+# probe (_topup_worker_probe_migrated reads $GC_CITY/agents/<pool>/prompt.template.md). This selftest is about the brake and
+# the store scoping, not about the probe: its sandbox city declares a worker that is on the shared order. (The cases where
+# it is not — brake off, visibly — are pilot-dispatcher.topup-order.selftest.sh part F.)
+for _p in wa-worker ps-worker; do
+  mkdir -p "$WORK/city/agents/$_p"
+  cat > "$WORK/city/agents/$_p/prompt.template.md" <<'TPL'
+  X_SORTED="$( . "$X_LIB" && printf '%s' "$X_CAND" | work_order_sort --age reclaim )" && [ -n "$X_SORTED" ]
+TPL
+done
+
 # ── extraction ──────────────────────────────────────────────────────────────
 fn_src() { awk -v n="$1" '$0 ~ "^"n"\\(\\) *\\{"{f=1} f{print} f&&/^}$/{exit}' "$DISPATCHER"; }
 MISSING=""
@@ -75,7 +86,7 @@ TOPUP_PRELUDE="$WO_LIB_PRELUDE
 $(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_pick_first _topup_rig_pending)"
 LOOP_PRELUDE="$WO_LIB_PRELUDE
 $(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_rig_pending \
-                     _topup_exclude_braked _topup_pick_first _topup_pending_store _topup_note_spawn _pilot_pool_topup)"
+                     _topup_exclude_braked _topup_pick_first _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated _pilot_pool_topup)"
 MIGRATE_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders rig_to_builder wa_worker_template \
                         _pilot_text_names_rig_path _pilot_story_already_migrated _pilot_dog_store_blind_guard \
                         _pilot_dog_store_blind_migrate_dest _pilot_is_bead_id _pilot_migration_copy_retract \

@@ -8731,10 +8731,14 @@ _topup_exclude_braked() {
 # invariant ga-oc6knj (c) names for the eligibility filters, now for the ORDER. The probe is slice ga-9t9acg.5/.6
 # (out of scope here: R5/R6); until it migrates it still windows at 20 and has no type tier, so the two can differ
 # on a P0 non-feature that is older than a P0 feature, or on a population larger than the probe's window.
-# pilot-dispatcher.topup-order.selftest.sh (part D) is the test that proves they agree: it runs the probe's own
-# `bd ready … | jq` line, taken live out of each template, against the same fixtures as top-up. It is self-arming —
-# while a template still carries the old probe it reports the known divergence by name; the moment the probe is
-# migrated the same fixtures must agree, and the selftest fails if they do not.
+# pilot-dispatcher.topup-order.selftest.sh (part D) is the test that checks they agree, on its fixtures: it runs the
+# probe's own Step 1b2 block, taken live out of each template, against the same populations as top-up. Priority + age
+# (D1/D1b) must agree TODAY and fail otherwise; the type tier and the window (D2/D3) are reported by name as KNOWN
+# divergence while a template still carries the old probe, and must agree — or fail — the moment it is migrated.
+# THE BRAKE DEPENDS ON THIS AGREEMENT: ga-653ilw's respawn brake reads "spawned for A and A not claimed" as "A is stuck".
+# With a disagreeing worker that reading is wrong, so _pilot_pool_topup counts a spawn toward the brake only while the
+# worker's template carries the migrated probe (_topup_worker_probe_migrated). Until slices .5/.6 land the brake is
+# therefore OFF for the pool — a trade-off, announced with a WARN on every top-up spawn, that ends by itself.
 #
 # THREE STATES (the library's contract; "cannot tell" is never "empty queue"):
 #   * ordered        -> the id of the first bead.
@@ -9064,9 +9068,26 @@ _topup_note_spawn() {
   return 0
 }
 
+# _topup_worker_probe_migrated <pool> — ga-9t9acg.4: does the pool worker's Step 1b2 probe order by the shared rule?
+# The respawn brake (_topup_note_spawn) assumes "a bead the worker claims leaves the unassigned set", i.e. that the bead
+# top-up spawned FOR is the bead the session then takes. That holds only while top-up and the probe agree on the order.
+# A worker still on the pre-migration probe (window of 20, no type tier) takes ITS first bead, not the rule's; counting
+# those spawns would brake the rule's #1 bead after 5 sweeps although nothing is wrong with it, and the next one after
+# that, and so on down the queue. Reads the template the pool's sessions are actually started from:
+# $GC_CITY/agents/<pool>/prompt.template.md. The migrated shape (slices ga-9t9acg.5/.6) is a code line, not a comment:
+#   <X>_SORTED="$( . "$<X>_LIB" && printf '%s' "$<X>_CAND" | work_order_sort --age reclaim )" …
+# Three states, as everywhere: rc 0 migrated, rc 1 NOT migrated (template readable, no such line), rc 2 cannot tell
+# (template missing or unreadable). The caller counts a spawn toward the brake only on 0.
+_topup_worker_probe_migrated() {
+  local _tpl="${GC_CITY:-}/agents/${1:-}/prompt.template.md" _rc=0
+  [ -n "${GC_CITY:-}" ] && [ -n "${1:-}" ] && [ -r "$_tpl" ] || return 2
+  grep -Eq '^[[:space:]]*[A-Z_]+_SORTED="\$\(.*work_order_sort --age reclaim' "$_tpl" 2>/dev/null || _rc=$?
+  case "$_rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
 _pilot_pool_topup() {
   local _pool="$1" _max="$2"
-  local _live _global _pending
+  local _live _global _pending _mig
 
   # ga-swnsg3: skip entirely when Dolt was saturated at sweep start —
   # spawning a session is itself Dolt load (session-state writes), so
@@ -9169,7 +9190,17 @@ _pilot_pool_topup() {
       log "  ga-93yxc: pool top-up — $_pool session spawned for $_pending. [ga-oa004t path=pool-topup pool_live=$((_live + 1))/$_max global=$((_global + 1))/$GC_VARIABLE_SESSION_MAX]"
       # ga-653ilw: count this spawn toward the per-bead brake — AFTER a successful spawn only, so a failed one never
       # burns the budget. Fail-open and always exit 0 (see _topup_note_spawn); `|| true` keeps `set -e` out of it.
-      _topup_note_spawn "$_pool" "$_pending" || true
+      # ga-9t9acg.4: ...and only when the pool worker's probe picks by the same rule as _topup_pick_first (see
+      # _topup_worker_probe_migrated): otherwise the session may take another bead, and a bead it never claimed because
+      # it was never ITS pick would be braked for nothing. TRADE-OFF, disclosed on the bead: until slices ga-9t9acg.5/.6
+      # land, the brake is OFF for the pool (a bead nobody claims is re-spawned for every sweep, as before ga-653ilw);
+      # it re-arms by itself the moment the template carries the migrated probe. Said out loud each time, never silent.
+      _mig=0; _topup_worker_probe_migrated "$_pool" || _mig=$?
+      case "$_mig" in
+        0) _topup_note_spawn "$_pool" "$_pending" || true ;;
+        1) warn "ga-9t9acg.4: respawn brake OFF for $_pool — its worker's Step 1b2 probe (agents/$_pool/prompt.template.md) is not on the shared order yet (slice ga-9t9acg.5/.6), so it may take another bead than $_pending and this spawn is NOT counted toward ga-653ilw's brake. Re-arms by itself once the probe is migrated." ;;
+        *) warn "ga-9t9acg.4: cannot read $GC_CITY/agents/$_pool/prompt.template.md to tell whether the $_pool worker's probe is on the shared order — this spawn for $_pending is NOT counted toward ga-653ilw's brake (fail-open; the next spawn re-checks)." ;;
+      esac
       _live=$((_live + 1))
       _global=$((_global + 1))
     else
