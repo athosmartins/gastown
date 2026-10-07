@@ -1936,6 +1936,67 @@ reviewer_session_alive() {
 }
 # SELFTEST-EXTRACT reviewer-session-alive-fn: END
 
+# gate_iso_to_epoch <timestamp> — epoch seconds for an ISO-8601 timestamp the way
+# the session roster and beads print them ("2026-10-07T16:55:49Z",
+# "2026-10-07T14:01:27-03:00", optional fractional seconds), or "" when the value
+# cannot be read as a time. Go's zero time ("0001-01-01T00:00:00Z" — what the
+# roster prints for a session that never reported activity) is "" too: it is not
+# a moment, it is the absence of one. BSD date first (-u, see ga-35zp1), GNU next.
+# SELFTEST-EXTRACT gate-iso-to-epoch-fn: BEGIN
+gate_iso_to_epoch() {
+  local raw="${1:-}" s ep
+  case "$raw" in ''|0001-01-01T*) printf ''; return 0 ;; esac
+  s=$(printf '%s' "$raw" | sed -E 's/\.[0-9]+//; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')
+  ep=$(date -j -u -f '%Y-%m-%dT%H:%M:%S%z' "$s" '+%s' 2>/dev/null \
+    || date -u -d "$raw" '+%s' 2>/dev/null || printf '')
+  case "$ep" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  printf '%s' "$ep"
+}
+# SELFTEST-EXTRACT gate-iso-to-epoch-fn: END
+
+# reviewer_session_progressing <assignee> <sessions_json> [<now_epoch>] [<max_idle_secs>]
+# Pure. 1 iff a non-closed roster entry matching <assignee> (the same name fields
+# reviewer_session_alive matches) has state "active" AND a last_active within
+# <max_idle_secs> (default 900) of <now_epoch> (default: now). Everything else is
+# 0: asleep, closed, absent, a stale or zero-value last_active, a roster or a
+# timestamp that cannot be read. 0 means "not SHOWN to be progressing" — the one
+# state Phase C's E13 grace must never extend — not "confirmed stuck".
+# (ga-ufskhy E13, 2026-10-07: 6/6 timeouts that day killed a reviewer that was
+# active and progressing; the marker was re-queued and reviewed again from zero.)
+# SELFTEST-EXTRACT reviewer-session-progressing-fn: BEGIN
+reviewer_session_progressing() {
+  local assignee="${1:-}" sessions_json="${2:-}" now="${3:-}" max_idle="${4:-900}" la ep
+  [ -z "$assignee" ] && { echo 0; return 0; }
+  case "$now" in ''|*[!0-9]*) now=$(date +%s) ;; esac
+  case "$max_idle" in ''|*[!0-9]*) max_idle=900 ;; esac
+  la=$(printf '%s' "$sessions_json" | jq -r --arg a "$assignee" '
+        [(if type=="array" then . else (.sessions // []) end)[]
+         | select(.closed != true)
+         | select((.state // "") == "active")
+         | select(([.session_name, .name, .alias, .id, .agent_name] | map(select(. != null and . != "")) | index($a)) != null)
+         | (.last_active // "")] | .[0] // ""' 2>/dev/null) || la=""
+  [ -z "$la" ] && { echo 0; return 0; }
+  ep=$(gate_iso_to_epoch "$la")
+  case "$ep" in ''|*[!0-9]*) echo 0; return 0 ;; esac
+  if [ $(( now - ep )) -le "$max_idle" ]; then echo 1; else echo 0; fi
+}
+# SELFTEST-EXTRACT reviewer-session-progressing-fn: END
+
+# gate_e13_grace_secs <budget_secs> — how long past its verdict budget Phase C keeps
+# waiting for a reviewer that is still progressing: min(budget,
+# GATE_E13_GRACE_MAX_SECS [1800]); 0 when the operator switched E13 off
+# (GATE_E13_GRACE=0, or the file $GC_CITY/.gc/gate-e13-grace.off exists). Only a
+# literal 0 is "off": junk in the env is not off (the caller logs it; this stays pure).
+# SELFTEST-EXTRACT gate-e13-grace-secs-fn: BEGIN
+gate_e13_grace_secs() {
+  local budget="${1:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}"
+  case "$budget" in ''|*[!0-9]*) budget=0 ;; esac
+  case "$maxg" in ''|*[!0-9]*) maxg=1800 ;; esac
+  if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then echo 0; return 0; fi
+  if [ "$budget" -lt "$maxg" ]; then echo "$budget"; else echo "$maxg"; fi
+}
+# SELFTEST-EXTRACT gate-e13-grace-secs-fn: END
+
 # bead_owner_session_state <bead_show_json> <sessions_json>
 # Pure, THREE-state read of "does this bead's assignee still own it through a
 # session?" — echoes exactly one of:

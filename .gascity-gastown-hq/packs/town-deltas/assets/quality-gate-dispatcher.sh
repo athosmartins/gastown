@@ -12068,6 +12068,8 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         PC_SESS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
         PC_ANY_PENDING=0
         PC_ALL_PENDING_DEAD=1
+        PC_ANY_PROGRESSING=0
+        PC_PROGRESSING_SID=""
         # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: BEGIN
         for PC_J in "${!VERDICT_BEAD_IDS[@]}"; do
           PC_VB="${VERDICT_BEAD_IDS[$PC_J]}"
@@ -12127,19 +12129,47 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # measured incident this fixes (quality-gate-guard.log, 2026-09-10:
           # 18 sweeps / 53 minutes of guard/dispatcher disagreement over the
           # identical session).
+          # ga-ufskhy E13: a reviewer that is not merely alive but PROGRESSING
+          # (state active, last_active within GATE_E13_MAX_IDLE_SECS) earns the
+          # run a bounded grace past its budget (decided right after this loop)
+          # instead of a kill-and-requeue that pays for the same review twice.
+          # `declare -F` guard: harnesses that extract this loop without the
+          # guard lib keep today's alive-only classification (no grace).
+          if declare -F reviewer_session_progressing >/dev/null 2>&1 \
+             && [ "$(reviewer_session_progressing "$PC_SID" "$PC_SESS_JSON" "" "${GATE_E13_MAX_IDLE_SECS:-900}")" = "1" ]; then
+            PC_ANY_PROGRESSING=1
+            PC_PROGRESSING_SID="$PC_SID"
+            PC_ALL_PENDING_DEAD=0
+            break
+          fi
           if [ "$(reviewer_session_alive "$PC_SID" "$PC_SESS_JSON")" = "1" ]; then
             PC_ALL_PENDING_DEAD=0
             break
           fi
         done
         # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: END
+        # ga-ufskhy E13: grace budget — 0 when the lib is absent (harnesses), when
+        # the operator switched it off, or when the value cannot be read.
+        PC_GRACE_SECS=0
+        if declare -F gate_e13_grace_secs >/dev/null 2>&1; then
+          PC_GRACE_SECS=$(gate_e13_grace_secs "$PC_TIMEOUT_SECS") || PC_GRACE_SECS=0
+        fi
+        case "$PC_GRACE_SECS" in ''|*[!0-9]*) PC_GRACE_SECS=0 ;; esac
+        case "${GATE_E13_GRACE:-}" in ''|0|1) ;; *) warn "Phase C: GATE_E13_GRACE='${GATE_E13_GRACE}' is not 0/1 — treated as ON (only a literal 0 switches E13 grace off)" ;; esac
         if [ "$PC_ANY_PENDING" = "1" ] && [ "$PC_ALL_PENDING_DEAD" = "1" ]; then
           QUOTA_REQUEUE=1
           REQUEUE_REASON="dead-reviewer"
           warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) timed out with ALL pending reviewer session(s) confirmed DEAD — infra failure, not a code FAIL (ga-eqjo)."
           gate_finalize_run
+        elif [ "${PC_ANY_PROGRESSING:-0}" = "1" ] && [ "$PC_ELAPSED" -le $(( PC_TIMEOUT_SECS + PC_GRACE_SECS )) ]; then
+          # ga-ufskhy E13 (2026-10-07): past the budget, but a reviewer is active and
+          # progressed within the last GATE_E13_MAX_IDLE_SECS — wait, bounded by the
+          # grace ceiling. Measured before this: every timeout of 07/10 (6/6) killed
+          # a progressing reviewer, re-queued the marker and re-reviewed from zero;
+          # the same branch then timed out again (wa-affr0: 4 times in 5 days).
+          log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) is PAST its ${PC_TIMEOUT_SECS}s verdict budget (${PC_ELAPSED}s) but reviewer ${PC_PROGRESSING_SID} is active and progressed within the last ${GATE_E13_MAX_IDLE_SECS:-900}s — E13 GRACE: waiting up to $(( PC_TIMEOUT_SECS + PC_GRACE_SECS - PC_ELAPSED ))s more (ceiling $(( PC_TIMEOUT_SECS + PC_GRACE_SECS ))s); leaving for a future sweep. A live review killed at the budget is a review paid for twice (ga-ufskhy E13)."
         else
-          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
+          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s, grace=${PC_GRACE_SECS:-0}s, progressing=${PC_ANY_PROGRESSING:-0}) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
           # SELFTEST-EXTRACT phase-c-timeout-classify: BEGIN
           OVERALL_VERDICT="FAIL"
           # ga-h8vc8y: gate_collect_verdicts() ran at the top of this Phase C
