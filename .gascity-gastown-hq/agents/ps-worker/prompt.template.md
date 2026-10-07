@@ -395,7 +395,7 @@ bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=e
 # (gate:needs-fix or gate:fix-attempt:N) — a new build waits until the gate queue drains.
 # If this leaves [] in focus mode there is no fix for you: drain, do NOT look for a new
 # bead elsewhere (Step 1b3 included). Unknown/off focus state -> no filtering.
-GATE_FOCUS_PROBE="$(. /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-focus-lib.sh 2>/dev/null && gate_focus_active)"
+GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"
 if [ "$GATE_FOCUS_PROBE" = "1" ] && [ -n "$PS_CAND" ]; then
   PS_CAND="$(printf '%s' "$PS_CAND" | jq -c 'map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:"))))' 2>/dev/null)" || PS_CAND="[]"
   [ -n "$PS_CAND" ] || PS_CAND="[]"

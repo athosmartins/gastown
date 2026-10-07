@@ -15,7 +15,7 @@
 #
 # Source this file; it defines functions only and has no side effects.
 
-GATE_FOCUS_STATE_FILE="${GATE_FOCUS_STATE_FILE:-${GC_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}/.gc/gate-focus.state}"
+GATE_FOCUS_STATE_FILE="${GATE_FOCUS_STATE_FILE:-${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}/.gc/gate-focus.state}"
 # How long a state is trusted without a fresh measurement. The queue moves ~1 item/hour,
 # so a 2 h hold is safe; a short window made every slow bd probe flip readers to
 # "unknown" and back (each flip = a dog-cap rewrite + gc reload) — ga-kqa08j review.
