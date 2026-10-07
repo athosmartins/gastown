@@ -195,6 +195,78 @@ def diff_models(city, now):
     return changes
 
 
+def levers(city, day):
+    """The day's lever facts, one line each, each from its own source and each honest about an unreadable source:
+    timeouts + E13 graces (dispatcher log, local-dated lines), E11 decisions (guard log), E13 outcomes (ledger,
+    UTC rows). An unreadable source prints 'não medido (motivo)' for ITS line — never a zero that looks like
+    'nothing happened' (ga-ufskhy, 07/10)."""
+    dstr = day.strftime("%Y-%m-%d")
+    out = {}
+    # timeouts + grace sweeps — dispatcher log
+    p = os.path.join(city, ".gc", "logs", "quality-gate-dispatcher.log")
+    try:
+        runs, busy, graced = set(), set(), set()
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.startswith("[" + dstr):
+                    continue
+                m = re.search(r"gate-run (ga-[a-z0-9]+) \(branch=[^)]*\) TIMED OUT after", line)
+                if m:
+                    runs.add(m.group(1))
+                    if "busy=1" in line:
+                        busy.add(m.group(1))
+                m = re.search(r"gate-run (ga-[a-z0-9]+) \(branch=[^)]*\) is PAST its .*E13 GRACE", line)
+                if m:
+                    graced.add(m.group(1))
+        out["timeouts"] = "%d run(s) estouraram o tempo%s" % (len(runs), (" (%d com revisor ocupado no corte)" % len(busy)) if runs else "")
+        out["graced"] = "%d run(s) receberam grace E13" % len(graced)
+    except OSError as e:
+        out["timeouts"] = nm("log do dispatcher ilegível: %s" % e.__class__.__name__)
+        out["graced"] = out["timeouts"]
+    # E11 decisions — guard log
+    p = os.path.join(city, ".gc", "logs", "quality-gate-guard.log")
+    try:
+        c = {}
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.startswith("[" + dstr) or "E11-DIFF-CAP bead=" not in line:
+                    continue
+                m = re.search(r" verdict=([a-z-]+) ", line)
+                if m:
+                    c[m.group(1)] = c.get(m.group(1), 0) + 1
+        if c:
+            out["e11"] = "%d recusa(s), %d dentro do teto, %d controle, %d não medida(s)" % (
+                c.get("recusa", 0), c.get("dentro-do-teto", 0), c.get("controle", 0),
+                sum(v for k, v in c.items() if k.startswith("nao-medido")))
+        else:
+            out["e11"] = "0 decisões registradas"
+    except OSError as e:
+        out["e11"] = nm("log do guard ilegível: %s" % e.__class__.__name__)
+    # E13 outcomes — ledger (UTC rows)
+    p = os.path.join(city, ".gc", "gate-e13.jsonl")
+    try:
+        delivered, exhausted, graced_runs = set(), set(), set()
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                    ts = datetime.datetime.fromisoformat(str(e["ts"]).replace("Z", "+00:00")).astimezone(TZ)
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if ts.date() != day:
+                    continue
+                run = str(e.get("run") or "")
+                if e.get("event") == "e13_grace":
+                    graced_runs.add(run)
+                elif e.get("event") == "e13_outcome":
+                    (delivered if e.get("outcome") == "delivered-past-budget" else exhausted).add(run)
+        out["e13"] = "%d run(s) entregaram depois do orçamento, %d esgotaram a grace (ledger: %d com grace)" % (
+            len(delivered), len(exhausted), len(graced_runs))
+    except OSError as e:
+        out["e13"] = nm("ledger E13 ilegível: %s" % e.__class__.__name__)
+    return out
+
+
 def pct(x):
     return nm("sem vereditos") if x is None else f"{x:.0%}"
 
@@ -217,6 +289,9 @@ def build(city, day):
         if m["by_rig"]:
             L.append("   por rig: " + "; ".join(f"{r} {v[0]}/{v[0]+v[1]}" for r, v in sorted(m["by_rig"].items())))
     L.append(f"4) fila do gate agora: {q}")
+    lv = levers(city, day)
+    L.append(f"5) tempo estourado: {lv['timeouts']} | {lv['graced']} | E13: {lv['e13']}")
+    L.append(f"6) E11 (teto 800 linhas de produção): {lv['e11']}")
     L.append("Chaves: " + "; ".join(f"{k}={v}" for k, v in sw.items()))
     L.append("Modelos por papel (" + catnote + "): " + "; ".join(f"{r}={v['alias'] or '-'}→{v['model']}" for r, v in models.items() if r in ('gate-reviewer','wa-worker','ps-worker','digo-wa')))
     for c in changes:
