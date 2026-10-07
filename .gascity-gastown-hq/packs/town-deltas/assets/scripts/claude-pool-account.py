@@ -40,7 +40,7 @@ One run (launchd StartInterval, single instance via flock):
     credential by itself - measured, ga-2yyitx). Once the item has been rewritten for SETTLE_S (claude re-reads it every
     ~30 s) the daemon sends that pane ONE Escape. This is a scoped exception to the send-keys doctrine: see docs/claude-pool-account.md
     ("The Escape exception") for its guards - pool panes only (proven by the wrapper's POOL-ACCT SET line for a live process),
-    the modal re-read from the screen immediately before sending, never Mayor or a crew.
+    the modal re-read from the screen immediately before sending, and only a session whose wrapper log line names a pool role (never Mayor or a crew).
   * the active account could not be asked (network, 5xx, anything not 2xx/429/401/403 for the evidence probe; anything not 2xx/401/403
     for the key check) -> no failover and no failback: the DECISION does not change. Error != exhausted. (The run still goes on to
     heal_item, which may put the item back to the decision already taken - the item following the decision, not the probe changing it.)
@@ -136,7 +136,20 @@ PS_RE = re.compile(r"\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+
 PANE_ID_RE = re.compile(r"%\d+")
 SOCKET_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 AGENT_RE = re.compile(r"[A-Za-z0-9._@:-]{1,80}")
-NEVER_RE = re.compile(r"mayor|crew", re.I)   # Mayor's and the crews' Remote Control is never touched (Athos 05/10): not looked at, whatever else says they follow the item
+# WHICH SESSIONS MAY BE LOOKED AT AND PRESSED (Athos 05/10: Mayor's and the crews' Remote Control is never disturbed).
+# The first fence is the PROVIDER, not a name: Mayor and the crews run `claude` / `claude-rc` / `claude-rc-crew`, which never go through
+# claude-lowprio.sh, so the wrapper never writes a SET line for them. This list is the second fence and it fails CLOSED: a launch line is
+# acted on only if its agent is a role that runs on the claude-headless provider (city.toml / the packs), or is the wrapper's own "?" for an
+# unset GC_AGENT (evidence, never pressed). Everything else is dropped: the crews (oracle-wa-*, mila-wa, thies-wa ... share no stem with the
+# word "crew", which is why a deny-list on that word never held), gastown.mayor, a role nobody listed yet, a name that is no name. The drop is
+# counted and logged for live processes (note_off_list), so a new pool role is a visible gap in this list, not a silent one.
+POOL_AGENT_RE = re.compile(r"(gastown\.(dog|boot|deacon)|wa-worker|ps-worker|gate-reviewer|refino-gate-reviewer|context-check-reviewer|auto-refiner)"
+                           r"(-[A-Za-z0-9._@:-]{1,64})?")
+
+
+def pool_agent(name: str) -> bool:
+    """True if a SET line for this agent name is acted on at all (see POOL_AGENT_RE). '?' is what claude-lowprio.sh logs when GC_AGENT is unset."""
+    return name == "?" or POOL_AGENT_RE.fullmatch(name) is not None
 
 
 # ── config ─────────────────────────────────────────────────────────────────────────────────────────
@@ -594,13 +607,17 @@ def process_table() -> Optional[Tuple[Dict[int, Tuple[int, float]], int]]:
     return table, dropped
 
 
-def pool_launches() -> Optional[Dict[int, Tuple[float, str]]]:
+def pool_launches(off: Optional[Dict[int, Tuple[float, str]]] = None) -> Optional[Dict[int, Tuple[float, str]]]:
     """pid -> (epoch of the line, agent) for every launch the WRAPPER logged as following THIS pool item ("POOL-ACCT SET"), read from
     the end of the wrapper's log. A session launched while there was no item (SKIP) or with the variable already set (KEEP) is
-    not in it: it does not follow the item, so neither a switch nor an Escape is any business of ours.
-    {} = nothing follows the item (no log yet is exactly that); None = the log is there and could not be READ: could not look."""
+    not in it: it does not follow the item, so neither a switch nor an Escape is any business of ours. A line whose agent is not a
+    pool role (pool_agent) is not in it either; if `off` is given those land there instead (pid -> (epoch, the name as logged)), so the
+    caller can say what it left out.
+    {} = nothing follows the item; None = the log could not be READ (a log that is not there, or an unset city, is read as {} - but
+    SAID, on a due minute: 'nobody follows the item' and 'there is nowhere to look' are not the same statement)."""
     c = city()
     if not c:
+        note_no_launch_log("no city is set")
         return {}
     p = c / ".gc" / "logs" / "claude-pool-account.log"
     try:
@@ -610,6 +627,7 @@ def pool_launches() -> Optional[Dict[int, Tuple[float, str]]]:
             f.seek(max(0, size - LAUNCH_TAIL_BYTES))
             raw = f.read()
     except FileNotFoundError:
+        note_no_launch_log("the wrapper's log is not there yet")
         return {}
     except OSError:
         return None
@@ -623,11 +641,33 @@ def pool_launches() -> Optional[Dict[int, Tuple[float, str]]]:
             at = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ"))
         except (ValueError, OverflowError):
             continue
-        if NEVER_RE.search(m.group(3)):   # judged on what the line SAYS, before it is tidied: a name that would not pass AGENT_RE is no way in
+        if not pool_agent(m.group(3)):   # judged on what the line SAYS, before it is tidied: a name that is no pool role is no way in, and
+            if off is not None:          # one that would not pass AGENT_RE cannot turn into the nameless "?" below
+                off[int(m.group(2))] = (float(at), m.group(3))
             continue
         agent = m.group(3) if AGENT_RE.fullmatch(m.group(3)) else "?"
         out[int(m.group(2))] = (float(at), agent)
     return out
+
+
+def note_no_launch_log(why: str) -> None:
+    """A launch log that is not there reads as 'nothing follows the item' - which is also what a wrong GC_CITY_PATH, or a log rotated away
+    under live sessions, would read as. Said on a due minute, so the daemon being deaf is a line in the log (or on stderr), not silence."""
+    if int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        log("WARN", f"no pool launch read: {why} - read as 'no session follows the pool item'; sessions launched before it was lost are not seen")
+
+
+def note_off_list(off: Dict[int, Tuple[float, str]], table: Dict[int, Tuple[int, float]]) -> None:
+    """Live processes the wrapper put on the pool item whose agent is no pool role (pool_agent): not looked at, not pressed, and not
+    silent - a pool role that is missing from POOL_AGENT_RE shows up here, on a due minute, instead of being a session that is never
+    unstuck. Only live processes count: a SET line from last week for a process that is gone is not a gap."""
+    live = [name for pid, (at, name) in off.items()
+            if pid in table and table[pid][1] <= at + START_SLACK_S and at - table[pid][1] <= START_MAX_AGE_S]
+    if live and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:
+        names = sorted(set(live))
+        shown = ", ".join(re.sub(r"[^A-Za-z0-9._@:-]", "?", n)[:40] for n in names[:5])
+        log("WARN", f"pane scan: {len(live)} live process(es) on the pool item with an agent name that is no pool role ({shown}"
+                    f"{', ...' if len(names) > 5 else ''}) - not looked at, no Escape; a new pool role belongs in POOL_AGENT_RE")
 
 
 def note_scan_drops(nopane: int, ps_dropped: int, looked: int) -> None:
@@ -642,21 +682,27 @@ def scan_panes() -> Scan:
     """Which pool panes are on the limit screen right now (the modal, or the envelope as the last turn). A pane counts only if a process that the wrapper launched onto the pool item
     is alive in it (the pane's own process or a descendant): the pid in the SET line is the claude pid (the wrapper exec's), and a
     pid can be recycled, so the process must also have STARTED when the line says it did."""
-    launches = pool_launches()
+    off: Dict[int, Tuple[float, str]] = {}
+    launches = pool_launches(off)
     if launches is None:
         log("WARN", "the wrapper's log could not be read - no pane looked at this run")
         return Scan(False)
     if not launches:
+        if off and int(now() // 60) % SILENT_DROP_LOG_EVERY_MIN == 0:   # only to SAY what was left out: ps is read on a due minute only
+            ptab = process_table()
+            if ptab is not None:
+                note_off_list(off, ptab[0])
         return Scan(True)   # nothing follows the item: no pane to look at, so tmux is not even asked
     ptab = process_table()
     if ptab is None:
         log("WARN", "ps unreadable - no pane looked at this run")
         return Scan(False)
     table, ps_dropped = ptab
+    note_off_list(off, table)
     proven: Dict[int, Tuple[str, float]] = {}
     for pid, (at, agent) in launches.items():
         row = table.get(pid)
-        if NEVER_RE.search(agent):
+        if not pool_agent(agent):   # a second fence, on the tidied name ("?" passes it): nothing reaches a pane that is no pool role
             continue
         if row is not None and row[1] <= at + START_SLACK_S and at - row[1] <= START_MAX_AGE_S:
             proven[pid] = (agent, at)
@@ -1035,6 +1081,10 @@ def heal_item(st: dict, user: str, token: str, email: str, t: float) -> None:
                     f"{email} fp={fingerprint(token)} - rewriting")
         if not write_item(user, token):
             return
+        # item_at moves on EVERY rewrite, also when the item was missing and what goes back is the credential the sessions already had:
+        # a missing item does not say what they were using, so a modal that predates this write is judged about "the replaced credential"
+        # (no evidence, one Escape). If it was the same credential after all, the session retries, hits the limit again, and that NEW
+        # screen - once STALE_WINDOW_S has passed - is evidence. The cost of the doubt is one retry, not a missed failover.
         st["item_at"] = t
     # The decision names the credential the item holds. If the vault's key for this account changed (rotated), the
     # fingerprint follows - it is the second witness current_credential() relies on when the vault gives nothing back.
@@ -1238,7 +1288,7 @@ def unstick(st: dict, scan: Scan, user: str, t: float) -> None:
     todo = [p for p in scan.panes if p.stuck and p.key in tracked and stale_modal(st, p, tracked[p.key])
             and tracked[p.key]["tries"] < MAX_ESC_TRIES]
     unnamed = [p for p in todo if p.agent == "?"]
-    if unnamed:   # the wrapper could not log who this is (GC_AGENT unset, or a name that is no name): it cannot be told from Mayor or a crew, so no key
+    if unnamed:   # the wrapper could not log who this is (GC_AGENT unset: it logs "?"): it cannot be told from Mayor or a crew, so no key
         log("INFO", f"{len(unnamed)} pool pane(s) on the limit modal of a replaced credential have no agent name - not told apart from Mayor/crew, no Escape for them")
         todo = [p for p in todo if p.agent != "?"]
     if not todo:

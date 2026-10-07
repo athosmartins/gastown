@@ -8,8 +8,14 @@
 #   B. DAEMON (claude-pool-account.py): failover when the active account is rejected, failback at the stored
 #      reset time, the decision published for the WhatsApp services, no token ever in argv / logs.
 #
-# HERMETIC: a fake `security` (state in a temp dir), a fake `claude`, a fake probe and a fake vault. Nothing here
-# touches the real Keychain, the real vault or the network.
+# HERMETIC means two things here, and both are checked rather than claimed:
+#   - the WORLD is fake: a fake `security` (state in a temp dir), a fake `claude`, a fake probe and a fake vault, so nothing
+#     here reaches the real Keychain, the real vault or the network;
+#   - the ENVIRONMENT is not the caller's: every variable the daemon or the wrapper reads is unset and GC_CITY_PATH /
+#     CLAUDE_POOL_STATE are pinned to scratch paths (see the block below). An agent session exports the REAL city path, and the
+#     in-process bodies write through it: H0 proves the pin, and H1/H1b prove at the end that the real launch log and the real
+#     state file did not grow a fixture. H1/H1b can only look when GC_CITY_PATH was set on entry; run it once with and once
+#     under `env -i` (what a bare launchd/CI shell gives) - the verdict must be the same.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +34,38 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/claude-pool-account-selftest.XXXXXX")"
 cleanup() { chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }   # B50 makes a directory read-only: undo it if the run is interrupted there
 trap cleanup EXIT
 
+# HERMETIC MEANS THE ENVIRONMENT TOO. The daemon reads its whole world from environment variables (GC_CITY_PATH, CLAUDE_POOL_*), and in an
+# agent session GC_CITY_PATH is the REAL city: an in-process body that imports the daemon and calls log() would append fixture lines to the
+# real wrapper log - the very file the daemon reads its pool launches from. So: remember where the real log is (to prove at the end
+# that nothing reached it), drop every variable the daemon or the wrapper reads, and pin the ones that matter to scratch paths for the whole
+# suite. Bodies that run through `env -i` (run_d, run_wrapper) start from nothing anyway; the ones that do not inherit THIS pin.
+REAL_LOG=""; [ -n "${GC_CITY_PATH:-}" ] && REAL_LOG="$GC_CITY_PATH/.gc/logs/claude-pool-account.log"
+REAL_OFF=0;  [ -n "$REAL_LOG" ] && [ -f "$REAL_LOG" ] && REAL_OFF="$(wc -c < "$REAL_LOG" | tr -d ' ')"
+REAL_STATE="$(sed -n 's/^DEFAULT_STATE = "\(.*\)".*/\1/p' "$DAEMON" | head -1)"
+for v in GC_CITY_PATH GC_POOL_ACCOUNT GC_POOL_CRED_DIR GC_POOL_UNSTICK CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_POOL_STATE CLAUDE_POOL_NOW \
+         CLAUDE_POOL_CRED_DIR CLAUDE_POOL_PROBE_URL CLAUDE_POOL_TMUX CLAUDE_POOL_TMUX_SOCKET CLAUDE_POOL_EVIDENCE_COOLDOWN_S; do
+  unset "$v"
+done
+INPROC_CITY="$W/inproc-city"; INPROC_STATE="$W/inproc-state.json"; mkdir -p "$INPROC_CITY/.gc/logs"
+PIN=("GC_CITY_PATH=$INPROC_CITY" "CLAUDE_POOL_STATE=$INPROC_STATE")   # for `env -i`: put it first, a later assignment wins. (CLAUDE_POOL_ACCOUNTS_LIB is not pinned: B0 uses it to find the accounts library the daemon runs against)
+export "${PIN[@]}"
+
 field() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+
+# H0 canary: the pin holds. A body that imports the daemon and logs writes into the SCRATCH city, reads the scratch state path, and the real
+# log (if this run was started from a session that has one) does not grow by that line. If this fails, nothing below can be trusted to be hermetic.
+CANARY="canary-$(basename "$W")"
+cat > "$W/py_canary.py" <<'EOF'
+import importlib.util, os, sys
+sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+m.log("INFO", sys.argv[2])
+print("OK" if str(m.city()) == os.path.normpath(sys.argv[3]) and str(m.state_path()) == os.path.normpath(sys.argv[4]) and not os.environ.get("CLAUDE_POOL_NOW") else "BAD city=%s state=%s" % (m.city(), m.state_path()))
+EOF
+got="$("$PY3" "$W/py_canary.py" "$DAEMON" "$CANARY" "$INPROC_CITY" "$INPROC_STATE" 2>&1)"
+in_real=0; [ -n "$REAL_LOG" ] && [ -f "$REAL_LOG" ] && tail -c +"$((REAL_OFF + 1))" "$REAL_LOG" | grep -aqF "$CANARY" && in_real=1
+if [ "$got" = "OK" ] && grep -qF "$CANARY" "$INPROC_CITY/.gc/logs/claude-pool-account.log" && [ "$in_real" = "0" ]; then
+  ok "H0 hermetic: an in-process body's log line lands in the scratch city (state path scratch too), not in the real wrapper log${REAL_LOG:+ ($REAL_LOG)}"
+else bad "H0 NOT hermetic: body said '$got', scratch log has it: $(grep -cF "$CANARY" "$INPROC_CITY/.gc/logs/claude-pool-account.log"), real log has it: $in_real"; fi
 
 # ── A. wrapper ─────────────────────────────────────────────────────────────────────────────────────
 echo "A. wrapper (claude-lowprio.sh)"
@@ -399,6 +436,7 @@ rearm() { edit_state 'st.pop("panes", None)'; }   # the session hit the limit AG
 # store reset times like 2000000000, so they run on a clock that makes them 11 days ahead - unless a test sets NOW_OVERRIDE itself
 # (NOW_OVERRIDE= with an empty value = the real clock).
 NOW_BASE=1999000000
+T10=$(( (NOW_BASE / 600 + 1) * 600 ))   # the next clock minute that is a multiple of 10: what a run drops without acting is said then (B55d, B82-B84)
 HDR_OK='{"anthropic-ratelimit-unified-status":"allowed","anthropic-ratelimit-unified-5h-status":"allowed","anthropic-ratelimit-unified-7d-status":"allowed","anthropic-ratelimit-unified-5h-reset":"1900000000","anthropic-ratelimit-unified-7d-reset":"1900500000"}'
 hdr_rejected() { # hdr_rejected <claim five_hour|seven_day> <reset-epoch>
   local w="7d"; [ "$1" = "five_hour" ] && w="5h"
@@ -778,7 +816,7 @@ EOF
   [ "$rc" = "0" ] && [ "$(item_token)" = "$TOKEN_a" ] && ok "B27 USER unset -> pool item seeded (smoke: a tty-less run still gets a login name)" || bad "B27 rc=$rc item=$(item_token | cut -c1-24): $(head -c 200 "$D/out.txt")"
   # B27b the same, DETERMINISTIC: getlogin(3) works or not depending on the session that runs this test, so make it
   # fail the way it does under launchd (OSError) and require the passwd-database answer.
-  got="$(env -i USER= GC_CITY_PATH="$D/city" "$PY3" -c '
+  got="$(env -i "${PIN[@]}" USER= GC_CITY_PATH="$D/city" "$PY3" -c '
 import importlib.util, os, pwd, sys
 def no_tty(): raise OSError(25, "Inappropriate ioctl for device")
 os.getlogin = no_tty
@@ -1198,7 +1236,7 @@ EOF
     && ok "B49 a full failover+failback: security was only ever asked for the pool's hashed item, and only that item exists" \
     || bad "B49 current='$(jget "$STATE" current)' asked-for='$svcs' written='$wr' items='$has' (want '$SVC')"
   new_d
-  got="$(env -i HOME="$D/home" PATH="$BB:/usr/bin:/bin" FAKE_KC="$D/kc" "$PY3" - "$DAEMON" <<'EOF' 2>&1
+  got="$(env -i "${PIN[@]}" HOME="$D/home" PATH="$BB:/usr/bin:/bin" FAKE_KC="$D/kc" "$PY3" - "$DAEMON" <<'EOF' 2>&1
 import importlib.util, sys
 sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
 m.item_service = lambda: "Claude Code-credentials"           # the default item, owned by Mayor and the crews
@@ -1349,44 +1387,89 @@ EOF
   seeded; pa0=$(msg_probes_of a@t.test); run_d -- run-once; s0="$(jget "$STATE" panes)"; touch "$TMUXD/down"; run_d -- run-once; s1="$(jget "$STATE" panes)"; rm -f "$TMUXD/down"; run_d -- run-once
   [ "$s0" = "$s1" ] && [ -n "$s0" ] && [ "$(msg_probes_of a@t.test)" = "$((pa0 + 1))" ] \
     && ok "B54c a run that could not look leaves the bookkeeping as it was: the screen a answered about is not asked about again afterwards" || bad "B54c panes '$s0' / '$s1', probes of a $pa0 -> $(msg_probes_of a@t.test)"
-  # B54d the wrapper's log is there but cannot be READ -> could not look (None); no log at all -> nothing follows the item ({}).
+  # B54d the wrapper's log is there but cannot be READ -> could not look (None); no log at all -> nothing follows the item ({}), and says so.
+  # Then WHO is in the launches: the REAL names of this town (city.toml), not invented ones - the pool roles are in, Mayor and every crew are
+  # out (and counted in `off`), a name that is no name is out, and the wrapper's own "?" (GC_AGENT unset) is in as evidence that is never pressed.
   mkdir -p "$W/plcity/.gc/logs"; rm -f "$W/plcity/.gc/logs/claude-pool-account.log"
   cat > "$W/py_launches.py" <<'EOF'
 import importlib.util, os, sys
 sp = importlib.util.spec_from_file_location("d", sys.argv[1]); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
-p = sys.argv[2]; r = [m.pool_launches()]                     # no file
-os.mkdir(p); r.append(m.pool_launches()); os.rmdir(p)         # a directory where the file should be: open() fails, and it is not 'not found'
-open(p, "w").write("2033-05-18T03:33:20Z pid=77 agent=gastown.dog-2 wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
-                   "2033-05-18T03:33:21Z pid=78 agent=mayor wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
-                   "2033-05-18T03:33:22Z pid=79 agent=a/Crew wrapper POOL-ACCT SET item=" + m.item_service() + "\n"
-                   "2033-05-18T03:33:23Z pid=80 agent=gastown.dog-2 wrapper POOL-ACCT SET item=Claude Code-credentials-deadbeef\n"
-                   "2033-05-18T03:33:24Z pid=81 agent=gastown.dog-2 wrapper POOL-ACCT SKIP item=" + m.item_service() + "\n")
-r.append(sorted(m.pool_launches()))
-print(r)
+p = sys.argv[2]; bad = []
+logs = []; m.log = lambda lvl, msg: logs.append(msg)   # the log IS the file under test: nothing may be appended to it while it is read
+DUE = 600 * 3331667.0
+m.now = lambda: DUE + 60                                # a quiet clock minute
+if m.pool_launches() != {}: bad.append("no file -> not {}")
+if logs: bad.append(f"a quiet minute logged: {logs}")
+m.now = lambda: DUE                                     # a due one: the missing log is SAID
+if m.pool_launches() != {} or not any("no pool launch read: the wrapper's log is not there yet" in x for x in logs): bad.append(f"no file on a due minute: logs={logs}")
+logs.clear(); c = os.environ.pop("GC_CITY_PATH")        # no city at all reads the same way - and is said the same way
+if m.pool_launches() != {} or not any("no pool launch read: no city is set" in x for x in logs): bad.append(f"no city on a due minute: logs={logs}")
+os.environ["GC_CITY_PATH"] = c
+os.mkdir(p)                                             # a directory where the file should be: open() fails, and it is not 'not found'
+if m.pool_launches() is not None: bad.append("unreadable log -> not None")
+os.rmdir(p)
+IT = m.item_service()
+POOL = ["gastown.dog-1", "gastown.dog-12", "wa-worker-adhoc-k1x9", "ps-worker", "gate-reviewer-adhoc-ab12cd", "refino-gate-reviewer-adhoc-ef34",
+        "auto-refiner-adhoc-gh56", "context-check-reviewer", "gastown.boot", "gastown.deacon"]
+OFF = ["gastown.mayor", "oracle-wa", "oracle-wa-ga25kuos", "mila-wa", "thies-wa", "batista-wa", "peter-wa", "digo-wa", "a/Crew", "gastown.dogs",
+       "wa-workers", "gate-reviewers", "gastown.dog-", "gastown.dog-x/y", "we!rd", "mayor", "gastown.crew-1", "claude-rc", ""]
+lines, pid, want, wantoff = [], 100, {}, []
+for n in POOL + ["?"]:
+    pid += 1; want[pid] = n; lines.append(f"2033-05-18T03:33:{pid % 60:02d}Z pid={pid} agent={n} wrapper POOL-ACCT SET item={IT}")
+for n in OFF:
+    pid += 1; wantoff.append(pid); lines.append(f"2033-05-18T03:33:{pid % 60:02d}Z pid={pid} agent={n} wrapper POOL-ACCT SET item={IT}")
+lines.append("2033-05-18T03:33:23Z pid=80 agent=gastown.dog-2 wrapper POOL-ACCT SET item=Claude Code-credentials-deadbeef")   # another item
+lines.append(f"2033-05-18T03:33:24Z pid=81 agent=gastown.dog-2 wrapper POOL-ACCT SKIP item={IT}")                              # not a SET
+open(p, "w").write("\n".join(lines) + "\n")
+off = {}
+got = m.pool_launches(off)
+if {k: v[1] for k, v in got.items()} != want: bad.append(f"allowed: {sorted((k, v[1]) for k, v in got.items())} != {sorted(want.items())}")
+if sorted(off) != wantoff: bad.append(f"off-list pids {sorted(off)} != {wantoff}")
+if sorted(m.pool_launches()) != sorted(want): bad.append("without `off` the answer differs")
+print("OK" if not bad else "BAD: " + "; ".join(bad))
 EOF
-  got="$(env -i HOME="$W/home" GC_CITY_PATH="$W/plcity" CLAUDE_POOL_CRED_DIR="$POOL_DIR" "$PY3" "$W/py_launches.py" "$DAEMON" "$W/plcity/.gc/logs/claude-pool-account.log" 2>&1)"
-  [ "$got" = "[{}, None, [77]]" ] && ok "B54d no wrapper log -> {} (nothing follows the item); unreadable log -> None (could not look); only a SET line for THIS item counts, and a mayor/crew agent name never does" \
+  got="$(env -i "${PIN[@]}" HOME="$W/home" GC_CITY_PATH="$W/plcity" CLAUDE_POOL_CRED_DIR="$POOL_DIR" "$PY3" "$W/py_launches.py" "$DAEMON" "$W/plcity/.gc/logs/claude-pool-account.log" 2>&1)"
+  [ "$got" = "OK" ] && ok "B54d no wrapper log -> {} and SAID on a due minute (also with no city); unreadable log -> None; only a SET line for THIS item counts; the 10 pool roles + '?' are in, Mayor (gastown.mayor) and every real crew name (oracle-wa, mila-wa, thies-wa, batista-wa, peter-wa, digo-wa) are out and counted" \
     || bad "B54d pool_launches -> $got"
 
   # B55 MAYOR AND THE CREWS are never looked at, never counted as evidence and never pressed (Athos 05/10: their Remote Control must not
-  # be disturbed) - whatever their screen says and even if their launch line said they follow the pool item.
+  # be disturbed) - whatever their screen says and even if their launch line said they follow the pool item. REAL names: gastown.mayor, and the
+  # crews, which share no stem with the word "crew" (oracle-wa, mila-wa, thies-wa, batista-wa, peter-wa, digo-wa, a session-suffixed one).
+  OTHERS="gastown.mayor oracle-wa oracle-wa-ga25kuos mila-wa thies-wa batista-wa peter-wa digo-wa weird/mayor hq/Crew-x gastown.dogs"
   new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
-  pane_add mayor modal; may=$PANE; pane_add gastown.crew-1 modal; crew=$PANE; pane_add weird/mayor modal; weird=$PANE; pane_add hq/Crew-x modal; crewx=$PANE
+  others=(); for nm in $OTHERS; do pane_add "$nm" modal; others+=("$PANE"); done
   set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; w0=$(writes); run_d -- run-once; later 60; later 120
-  touched=$(addressed "$may" "$crew" "$weird" "$crewx")
+  touched=$(addressed "${others[@]}")
   [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(writes)" = "$w0" ] && [ "$(msgs)" = "0" ] && [ "$(keys_sent)" = "0" ] && [ "$touched" = "0" ] \
-    && ok "B55 mayor / crew sessions on the modal (their launch lines even say SET) are no evidence, are not even looked at, and get no key" \
+    && ok "B55 Mayor and 7 crews (real names) + 3 odd names on the modal (their launch lines even say SET) are no evidence, are not even looked at, and get no key" \
     || bad "B55 current='$(jget "$STATE" current)' messages-calls=$(msgs) keys=$(keys_sent) tmux-calls-addressed-to-them=$touched"
   # B55b ...and with a real pool session on the modal among them: the pool moves, and the one key goes to the pool session alone.
   seeded; dog1=$PANE
   pane_add gastown.dog-3 working; pane_add gastown.dog-4 quoted; pane_add gastown.dog-5 prompt
-  pane_add mayor modal; may=$PANE; pane_add gastown.crew-1 modal; crew=$PANE; pane_add weird/mayor modal; weird=$PANE; pane_add hq/Crew-x modal; crewx=$PANE
+  others=(); for nm in $OTHERS; do pane_add "$nm" modal; others+=("$PANE"); done
   pane_add gastown.dog-9 modal; nopool=$PANE; unset_line "$PANE_PID"
   touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120
-  touched=$(addressed "$may" "$crew" "$weird" "$crewx" "$nopool")
+  touched=$(addressed "${others[@]}" "$nopool")
   [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(keys_sent)" = "1" ] && [ "$(keys_to "$dog1")" = "1" ] && [ "$touched" = "0" ] \
-    && ok "B55b one pool session on the modal among 8 panes (mayor, crews, a stranger, a working one...) -> the pool moves and the ONE Escape goes to that session" \
+    && ok "B55b one pool session on the modal among 15 panes (Mayor, crews, a stranger, a working one...) -> the pool moves and the ONE Escape goes to that session" \
     || bad "B55b current='$(jget "$STATE" current)' keys=$(keys_sent) to-dog=$(keys_to "$dog1") tmux-calls-addressed-to-the-others=$touched: $(cat "$TMUXD/keys.log" 2>/dev/null | tr '\n' '|')"
+  # B55c the other side of the same list: every role of the claude-headless pool IS looked at and unstuck - a list that is too tight would
+  # make a pool session wait for a human. One Escape each, to its own pane, and nobody else's.
+  ROLES="gastown.dog-1 wa-worker-adhoc-k1x9 ps-worker gate-reviewer-adhoc-ab12cd refino-gate-reviewer-adhoc-ef34 auto-refiner-adhoc-gh56 context-check-reviewer gastown.boot gastown.deacon"
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
+  roles=(); for nm in $ROLES; do pane_add "$nm" modal; roles+=("$PANE"); done
+  others=(); for nm in $OTHERS; do pane_add "$nm" modal; others+=("$PANE"); done
+  touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120
+  each=0; for r in "${roles[@]}"; do [ "$(keys_to "$r")" = "1" ] && each=$((each + 1)); done
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$each" = "9" ] && [ "$(keys_sent)" = "9" ] && [ "$(addressed "${others[@]}")" = "0" ] \
+    && ok "B55c the 9 pool roles on the modal -> the pool moves, ONE Escape to each of them (9 in all) and none to the 11 Mayor/crew/odd panes beside them" \
+    || bad "B55c current='$(jget "$STATE" current)' roles-with-one-key=$each keys=$(keys_sent) others-touched=$(addressed "${others[@]}"): $(cat "$TMUXD/keys.log" 2>/dev/null | tr '\n' '|')"
+  # B55d a pool role that is not on the list yet (a new template) is not silent: it is counted in the log, on a due minute, by name.
+  new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add brand-new-worker modal
+  NOW_OVERRIDE=$T10 run_d -- run-once
+  grep -q "live process(es) on the pool item with an agent name that is no pool role (brand-new-worker) - not looked at, no Escape; a new pool role belongs in POOL_AGENT_RE" "$LOG" && [ "$(keys_sent)" = "0" ] \
+    && ok "B55d a live session of a role the list does not know is not looked at and gets no key - and the log names it, so the gap is visible" \
+    || bad "B55d no off-list line: $(grep -E 'pane scan|no pool role' "$LOG" | tail -n 2 | cut -c1-200 | tr '\n' '|')"
 
   # B56 what makes a pane a POOL pane: the wrapper's SET line for the item, for a pid that is alive and STARTED when the line says.
   # Each of these has a modal on screen and a rejected a, and none is evidence (B52 is the positive control for the same world).
@@ -1700,13 +1783,13 @@ EOF
     && ok "B77b a new hit 200 s after it -> b asked once (a 429) -> the pool item holds c; no key, nothing SERVED" \
     || bad "B77b current='$(jget "$STATE" current)' item=$(item_token | cut -c1-24) messages-calls=$(msgs) keys=$(keys_sent) served=$(served)"
 
-  # B78 Mayor and the crews, again, for the envelope: never looked at (not a single tmux call aimed at them), never counted.
+  # B78 Mayor and the crews, again, for the envelope: never looked at (not a single tmux call aimed at them), never counted. Real names.
   new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once
-  pane_add mayor inline1; may=$PANE; pane_add gastown.crew-1 inline2; crew=$PANE; pane_add weird/mayor modalreal; weird=$PANE
+  pane_add gastown.mayor inline1; may=$PANE; pane_add oracle-wa inline2; crew=$PANE; pane_add thies-wa inline3; crew2=$PANE; pane_add weird/mayor modalreal; weird=$PANE
   set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60
-  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(msgs)" = "0" ] && [ "$(addressed "$may" "$crew" "$weird")" = "0" ] && [ "$(keys_sent)" = "0" ] \
-    && ok "B78 Mayor / crew panes showing the limit envelope (or the modal) are no evidence, are not even looked at, get no key" \
-    || bad "B78 current='$(jget "$STATE" current)' messages-calls=$(msgs) tmux-calls-aimed=$(addressed "$may" "$crew" "$weird") keys=$(keys_sent)"
+  [ "$(jget "$STATE" current)" = "a@t.test" ] && [ "$(msgs)" = "0" ] && [ "$(addressed "$may" "$crew" "$crew2" "$weird")" = "0" ] && [ "$(keys_sent)" = "0" ] \
+    && ok "B78 Mayor / crew panes (gastown.mayor, oracle-wa, thies-wa) showing the limit envelope (or the modal) are no evidence, are not even looked at, get no key" \
+    || bad "B78 current='$(jget "$STATE" current)' messages-calls=$(msgs) tmux-calls-aimed=$(addressed "$may" "$crew" "$crew2" "$weird") keys=$(keys_sent)"
 
   # B79 the new bookkeeping fields are witnesses too: a garbled signature or flag is dropped (a new sighting, at worst one more question) and
   # never crashes the run or buys a key.
@@ -1716,13 +1799,13 @@ EOF
   [ "$rc" = "0" ] && no_crash && [ "$(keys_sent)" = "0" ] && [ "$("$PY3" -c 'import json,sys; e=list(json.load(open(sys.argv[1]))["panes"].values())[0]; print(isinstance(e.get("sig"),str) and e.get("modal") is False)' "$STATE")" = "True" ] \
     && ok "B79 a state with a non-string signature and a non-boolean flag -> read as a new sighting, rewritten sane, no key" || bad "B79 rc=$rc keys=$(keys_sent) panes=$("$PY3" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panes"))' "$STATE")"
 
-  # B80 a pool pane whose agent name the wrapper could not log ("agent=?": GC_AGENT unset; or a name that is no name) is still evidence - it
-  # follows the item, so the pool moves for it - but it cannot be told from Mayor or a crew, so it is never pressed. With a named pool pane
-  # beside it, the one key goes to the named one alone.
+  # B80 a pool pane whose agent name the wrapper could not log ("agent=?": GC_AGENT unset) is still evidence - it follows the item, so the
+  # pool moves for it - but it cannot be told from Mayor or a crew, so it is never pressed. A name that is no name ('we!rd') is not "?": it is no
+  # pool role, so it is no evidence and not even looked at. With a named pool pane beside it, the one key goes to the named one alone.
   new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add '?' modal; un=$PANE; pane_add 'we!rd' modal; un2=$PANE
   touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120; later 300
-  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] && [ "$(keys_sent)" = "0" ] && grep -q "have no agent name - not told apart from Mayor/crew, no Escape for them" "$LOG" \
-    && ok "B80 panes with no agent name on the modal: the pool moves (they are evidence), no Escape goes to them, and the log says why" \
+  [ "$(jget "$STATE" current)" = "b@t.test" ] && [ "$(msgs)" = "1" ] && [ "$(keys_sent)" = "0" ] && [ "$(addressed "$un2")" = "0" ] && grep -q "1 pool pane(s) on the limit modal of a replaced credential have no agent name - not told apart from Mayor/crew, no Escape for them" "$LOG" \
+    && ok "B80 a pane with no agent name (\"?\") on the modal: the pool moves (it is evidence), no Escape goes to it, and the log says why; a name that is no name is not even looked at" \
     || bad "B80 current='$(jget "$STATE" current)' messages-calls=$(msgs) keys=$(keys_sent): $(grep -E 'UNSTICK|no agent name' "$LOG" | tail -n 2 | cut -c1-140 | tr '\n' '|')"
   new_d; NOW_OVERRIDE=$((NOW_BASE - 100000)) run_d -- run-once; pane_add '?' modal; un=$PANE; pane_add gastown.dog-2 modal; named=$PANE
   touch "$TMUXD/clear-on-esc"; set_srv a@t.test 429 "$(hdr_rejected seven_day 2000000000)"; run_d -- run-once; later 60; later 120
@@ -1739,8 +1822,7 @@ EOF
     || bad "B81 keys while unreadable=$k1 after=$(keys_sent) messages-calls $m1 -> $(msgs) panes-kept='$pn1': $(grep -E 'UNSTICK|EVIDENCE|could not be read' "$LOG" | tail -n 3 | cut -c1-140 | tr '\n' '|')"
 
   # B82-B84 what a run leaves out without acting is said, now and then (every 10th clock minute), instead of nothing: 'no evidence' must be
-  # tellable from 'there was a screen / a process and it could not be used'. T10 = the next clock minute that is a multiple of 10.
-  T10=$(( (NOW_BASE / 600 + 1) * 600 ))
+  # tellable from 'there was a screen / a process and it could not be used'. T10: see NOW_BASE.
   # B82 a limit screen judged STALE (the credential it was about has been replaced) is no evidence - and says so, once on a due minute.
   failed_over; s0=$(nlog "judged STALE"); m0=$(msgs)
   NOW_OVERRIDE=$T10 run_d -- run-once; s1=$(nlog "judged STALE")
@@ -1769,7 +1851,7 @@ tab, dropped = m.process_table()
 if sorted(tab) != [101, 103] or dropped != 2: bad.append(f"table={sorted(tab)} dropped={dropped} (want [101, 103] and 2: a blank line is not a row)")
 logs = []
 m.log = lambda lvl, msg: logs.append(msg)
-m.pool_launches = lambda: {99999: (1.0, "gastown.dog-2")}
+m.pool_launches = lambda off=None: {99999: (1.0, "gastown.dog-2")}
 m.process_table = lambda: ({}, 3)
 DUE = 600 * 3331667.0
 m.now = lambda: DUE
@@ -1870,6 +1952,20 @@ if [ -f "$PLIST" ]; then
   if grep -q "The Escape exception" "$PLIST" && grep -q "100%" "$PLIST"; then
     ok "C10b the plist comment describes the 100% evidence design and points at the Escape exception"
   else bad "C10b the plist comment does not mention the 100% rule / the Escape exception"; fi
+fi
+
+# H1 nothing of this run reached the real log or the real state. Not a line count: the live daemon and the wrapper legitimately append to
+# the real log while a 10-40 minute run goes on. What is looked for is what only a fixture says - the fixtures' accounts (@t.test), this run's
+# scratch directory name, the item hash derived from it, the canary - in the bytes appended since the run started.
+H1_MARK="@t\.test|$(basename "$W")|Claude Code-credentials-$POOL_HASH|$CANARY"
+if [ -n "$REAL_LOG" ] && [ -f "$REAL_LOG" ]; then
+  leaked="$(tail -c +"$((REAL_OFF + 1))" "$REAL_LOG" | grep -aE "$H1_MARK" | head -n 3 | cut -c1-200)"
+  [ -z "$leaked" ] && ok "H1 the real wrapper log ($REAL_LOG) took no fixture line during this run" || bad "H1 fixture lines reached the real log: $leaked"
+else
+  echo "  - H1 skipped: no real log to compare (the run was not started from a session with GC_CITY_PATH)"
+fi
+if [ -n "$REAL_STATE" ] && [ -f "$REAL_STATE" ]; then
+  grep -aqE "@t\.test" "$REAL_STATE" && bad "H1b a fixture account is in the real state file ($REAL_STATE)" || ok "H1b the real state file holds no fixture account"
 fi
 
 echo

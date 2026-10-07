@@ -6,10 +6,10 @@ account it left once that account has renewed **and a usage collection taken aft
 — so up to about one collector period (30 min) after the renewal, not at the instant of it (see "The way back waits for a
 fresh collection"). No restart, no lost conversation, no login asked of Athos (the 5 setup-tokens are already in the vault
 as `claude-oauth-token-<email>`), and **no credit spent doing it**: the whole switch is this script, with no `claude`, no
-LLM and no agent in the path. Mayor and crews are **not** touched by it as it stands (their panes are never looked at or
-pressed, and they are not enrolled in the wrapper's pool path); putting them on the pool is phase 2, a decision that is
-still pending and would have to be made on purpose, because once they follow the item a switch moves them too: see
-"Mayor and the crews".
+LLM and no agent in the path. Mayor and crews are **not** touched by it as it stands (they never go through the wrapper that
+points a session at the pool item, and their panes are never looked at or pressed); putting them on the pool is phase 2, a
+decision that is still pending and would have to be made on purpose, because once they follow the item a switch moves them
+too: see "Mayor and the crews".
 
 > **There is deliberately no threshold.** Athos 04/10: *"tem que trocar no 100%. A gente não quer ficar com 5% sem usar."*
 > A utilization trigger (the old "95%" of this bead's `acceptance_criteria`, with its single tunable parameter) would leave
@@ -124,8 +124,12 @@ A pane is **evidence** only if all of these hold (each is a reason *not* to act,
 - the wrapper logged `POOL-ACCT SET item=<the pool item>` for a pid that is **alive**, whose `ps` start time agrees with the
   log line's time (a recycled pid is another process), and that is the pane's own process or a descendant of it; the pane
   is not dead;
-- the agent name on that line does not contain `mayor` or `crew` (case-insensitive) - such a pane is not even looked at,
-  whatever else says it follows the item;
+- the agent name on that line is a **pool role** (the allow-list `POOL_AGENT_RE` in the daemon: `gastown.dog`, `gastown.boot`,
+  `gastown.deacon`, `wa-worker`, `ps-worker`, `gate-reviewer`, `refino-gate-reviewer`, `context-check-reviewer`,
+  `auto-refiner`, each optionally followed by `-<suffix>` such as `gastown.dog-3` or `gate-reviewer-adhoc-ab12cd` - exactly the
+  roles `city.toml` puts on the `claude-headless` provider), or is the wrapper's own `?` for an unset `GC_AGENT`. Anything
+  else - Mayor, a crew, a role nobody listed yet, a name that is no name - is not even looked at, whatever else says it follows
+  the item (see "Mayor and the crews" for why this is an allow-list and not a deny-list);
 - **the modal:** the footer `Enter to confirm · Esc to cancel` is the **last** line of the screen, and
   `What do you want to do?` precedes `1. Stop and wait for limit to reset` in the lines above it (an agent that merely
   *quotes* those words has its prompt box under the quote and does not match);
@@ -164,7 +168,7 @@ that shows only the envelope gets no key, whatever else is true of it. Every con
 | Guard | What it protects |
 |---|---|
 | never in the run that rewrote the item, and not before it has been in place for **45 s** | claude re-reads the item every ~30 s: an Escape earlier would land the session on the *old* credential's modal again |
-| only pool panes proven as above; **never Mayor or a crew** (name check on the raw agent name, in the log reader and again in the scan) | Mayor's / the crews' Remote Control must never be disturbed (Athos 05/10); they run plain `claude`, not the wrapper's pool path |
+| only pool panes proven as above, **whose agent name is a pool role** (allow-list on the raw name in the log reader, and again on the tidied name in the scan; anything else is dropped and, if its process is alive, named in the log on a due minute) | Mayor's / the crews' Remote Control must never be disturbed (Athos 05/10). The first fence is that they run `claude-rc` / `claude-rc-crew`, not the wrapper, so no `SET` line exists for them; the list is the second, and it fails closed |
 | the pane has an **agent name**: the wrapper logs `agent=?` when it cannot tell who the session is, and such a pane is still evidence (it follows the item, so the pool moves for it) but is never pressed | a session that cannot be told from Mayor or a crew is not pressed; the log says `no agent name ... no Escape for them` |
 | the item still holds the credential of the decision (fingerprint), is readable, and the account in use is not registered exhausted | an Escape into a credential that is itself exhausted would land on the modal again |
 | the pane's process and the modal are re-read **immediately before** the key (the scan is seconds old) | a pane that changed or went back to working is not interrupted |
@@ -208,12 +212,26 @@ again, **zero calls served by the API**, `claude` never run.
 ## Mayor and the crews
 
 The daemon only ever touches the pool's hashed item (`Claude Code-credentials-<hash of the pool dir>`), never the plain
-`Claude Code-credentials` of Mayor and the crews, and never presses a key in a pane whose agent name contains `mayor` or `crew`.
-Those sessions are not enrolled in the wrapper's pool path (only `gastown.dog`, `wa-worker`, `ps-worker` are), so a failover
-cannot reach them either. Putting Mayor and the crews on the pool is phase 2 (decision pending). That decision is not
-something the name check can make for it: the name check keeps them out of the *evidence* and out of the *Escape*, not out of
-the item - once phase 2 enrols them in the wrapper's pool path they follow the item, and every switch moves them too (and a
-setup-token, which is all the pool's item holds, cannot serve their Remote Control).
+`Claude Code-credentials` of Mayor and the crews. Two fences keep it away from their sessions:
+
+1. **The provider (the real one).** Mayor runs on `claude-rc` and the crews on `claude-rc-crew`; neither goes through
+   `claude-lowprio.sh`, the wrapper that points a session at the pool item and logs `POOL-ACCT SET`. The daemon learns which
+   pids follow the item only from those lines, so for Mayor and the crews there is nothing to find: no evidence, no probe,
+   no Escape, and no failover moves them. (The wrapper has no enrolment list for the pool: every `claude-headless` session
+   follows the item. The `enroll=` list in `.gc/context-ab.conf` belongs to the effort A/B, not to the pool.)
+2. **The agent name, as an allow-list.** If a `SET` line ever did exist for one of them (a misconfigured template, a hand
+   edit), the daemon still acts only on lines whose agent is a pool role (`POOL_AGENT_RE`). A deny-list on `mayor` / `crew`
+   does not hold: the crews are called `oracle-wa`, `mila-wa`, `thies-wa`, `batista-wa`, `digo-wa`, `peter-wa` (and
+   session-suffixed forms such as `oracle-wa-ga25kuos`), and Mayor is `gastown.mayor` - names that a pattern for the word
+   "crew" never matched. The list names what may be pressed, so a name nobody thought of is out. Its cost is the opposite
+   gap: a **new pool role** that is not in the list is never unstuck. That gap is not silent: a live session of an unknown
+   role on the pool item is named in the log (`... agent name that is no pool role (<name>) - not looked at, no Escape; a new
+   pool role belongs in POOL_AGENT_RE`), on clock minutes that are a multiple of 10.
+
+Putting Mayor and the crews on the pool is phase 2 (decision pending). That decision is not something either fence can make
+for it: they keep them out of the *evidence* and out of the *Escape*, not out of the item - once phase 2 puts them behind the
+wrapper they follow the item, and every switch moves them too (and a setup-token, which is all the pool's item holds, cannot
+serve their Remote Control).
 
 ## Activation — merged is not live
 
@@ -301,8 +319,12 @@ first, delete last, and only when restarting the pool is acceptable.
   changed is that the log now says a screen was judged and why.
 - **The wrapper's `POOL-ACCT SET` lines are read from the last 1 MiB of the shared log**, and `log-reaper.sh` does not list
   `claude-pool-account.log` today. That is why the daemon keeps this log quiet (the healthy `KEY-CHECK` heartbeat is once per
-  30 minutes, not per run). If the log is ever truncated in place (`copytruncate`) the reader sees nothing, which reads as "no
-  session follows the item" - no evidence, and a failback allowed. Rotate it by rename, or teach `pool_launches` first.
+  30 minutes, not per run). If the log is ever truncated in place (`copytruncate`) or renamed away, the reader sees nothing of the
+  sessions that launched before that, which reads as "no session follows the item" - no evidence, and a failback allowed -
+  and neither a rename nor a truncation makes it better: the live sessions' `SET` lines are in the file that went away. What
+  the daemon does about it is to say it: a log that is not there (or no `GC_CITY_PATH`) is a `no pool launch read: ...`
+  line on clock minutes that are a multiple of 10. There is no rotation that is safe with live pool sessions; if the file
+  must be cut, cut it only when none is running (or keep its tail), and restart the sessions that were.
 - The verdict comes from a 1-token **haiku** call, while the pool runs mostly on Sonnet. If a window exists that limits
   Sonnet but not haiku, the probe says "allowed" while the pool's sessions are blocked, and no failover happens (the log says
   `answers - the limit modal|message on screen is not about this account`, which is how this case would show up). Whether
