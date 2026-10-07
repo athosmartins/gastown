@@ -2,12 +2,26 @@
 
 Every test runs against a FAKE `security` (a json store; it logs every argv so we can prove no secret rides on a command
 line) and a loopback profile server. Nothing here touches the real Keychain or the network.
+
+The harness PROVES that last sentence instead of trusting it (the Mayor's finding on this branch: the first version leaked into
+production - `CLAUDE_CREW_NOTIFY` falls back to `shutil.which('notify')` and the log follows the caller's `GC_CITY_PATH`):
+  * `_pin_env` (autouse, every test) points notify / security / the city / the state at sentinels and tmp paths, so even a test
+    that forgets to build a `World` cannot reach the real ones;
+  * `_nothing_real_was_touched` (autouse, once per session) snapshots the real log / state / lock and asserts at the end that
+    they are unchanged and that no sentinel was ever executed;
+  * `test_the_real_script_run_from_an_empty_environment...` runs the script as launchd would (env -i) under both interpreters.
 """
+import copy
+import fcntl
 import http.server
 import importlib.util
 import json
 import os
+import re
+import shutil
 import stat
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,6 +47,10 @@ if a and a[0] == "-i":
         m = re.match(r'add-generic-password -U -a "([^"]+)" -s "([^"]+)" -X ([0-9a-f]+)$', line.strip())
         if not m:
             sys.exit(3)
+        if m.group(2) in os.environ.get("FAKE_SEC_WFAIL", "").split("|"):
+            sys.exit(1)                                   # a write that fails loudly
+        if m.group(2) in os.environ.get("FAKE_SEC_DROP", "").split("|"):
+            continue                                      # accepted (exit 0) but never stored: only a read-back notices
         store[m.group(2)] = {"acct": m.group(1), "secret": bytes.fromhex(m.group(3)).decode()}
         with open(os.path.join(d, "writes.log"), "a") as f:
             f.write(m.group(2) + "\n")
@@ -52,7 +70,7 @@ if a and a[0] == "find-generic-password":
 sys.exit(2)
 '''
 
-NOTIFY = "#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\n"
+NOTIFY = "#!/bin/sh\necho \"$@\" >> \"$FAKE_SEC_DIR/notify.log\"\n[ -n \"$FAKE_NOTIFY_FAIL\" ] && exit 7\nexit 0\n"
 EMAIL = {"crypto": "athoscrypto@gmail.com", "amb": "throw.away.amb@gmail.com", "b85": "athosb85@gmail.com",
          "terr": "terrenos.incorporacoes@gmail.com", "martins": "athosmartins@gmail.com"}
 
@@ -67,8 +85,65 @@ def blob(tag, *, refresh=True, rexp_days=29.0, scopes=None, acc_hours=7.0, rt=No
          "subscriptionType": "max"}
     if refresh:
         o["refreshToken"] = f"sk-ant-ort01-{rt or tag}-ref"
-        o["refreshTokenExpiresAt"] = int((now + rexp_days * 86400) * 1000)
+        if rexp_days is not None:
+            o["refreshTokenExpiresAt"] = int((now + rexp_days * 86400) * 1000)
     return {"claudeAiOauth": o}
+
+
+# ── the harness cannot leak ────────────────────────────────────────────────────
+_REAL_ENV = dict(os.environ)             # what the process looked like BEFORE any test pinned anything
+_GUARD: dict = {}
+
+
+def _sentinel(path: Path, hits: Path) -> None:
+    path.write_text(f'#!/bin/sh\necho "$0 $*" >> "{hits}"\nexit 99\n')
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def _real_files():
+    cities = {c for c in (_REAL_ENV.get("GC_CITY_PATH"), str(Path.home() / "gt" / ".gascity-gastown-hq")) if c}
+    out = [Path(crew.DEFAULT_STATE)]          # the pool's decision file is written by the live pool daemon: not ours to watch
+    for c in sorted(cities):
+        out += [Path(c) / ".gc" / "logs" / "claude-crew-account.log", Path(c) / ".gc" / "claude-crew-account.lock"]
+    return out
+
+
+def _snap():
+    r = {}
+    for p in _real_files():
+        try:
+            st = p.stat()
+            r[str(p)] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            r[str(p)] = None
+    return r
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _nothing_real_was_touched(tmp_path_factory):
+    guard = tmp_path_factory.mktemp("guard")
+    (guard / "bin").mkdir()
+    hits = guard / "hits.log"
+    _sentinel(guard / "notify", hits)
+    _sentinel(guard / "security", hits)
+    _sentinel(guard / "bin" / "notify", hits)
+    _sentinel(guard / "bin" / "security", hits)
+    _GUARD.update(dir=guard, hits=hits)
+    before = _snap()
+    yield
+    assert not hits.exists(), "a test reached the REAL notify/security (sentinel executed):\n" + hits.read_text()
+    assert _snap() == before, "a test touched the REAL claude-crew-account log/state/lock"
+
+
+@pytest.fixture(autouse=True)
+def _pin_env(monkeypatch, tmp_path):
+    g = _GUARD["dir"]
+    for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security",
+                 "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-state.json",
+                 "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json", "CLAUDE_CREW_SESSIONS_DIR": tmp_path / "pinned-sessions",
+                 "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
+        monkeypatch.setenv(k, str(v))
+    monkeypatch.setenv("PATH", f"{g / 'bin'}:/usr/bin:/bin")        # `which notify` / bare `security` find a sentinel, never the real one
 
 
 class World:
@@ -99,7 +174,7 @@ class World:
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         for name, body in (("security", FAKE_SECURITY), ("notify", NOTIFY)):
             p = self.d / name
-            p.write_text(body)
+            p.write_text(body.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))   # not the PATH's python: PATH is pinned to the sentinels
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         (self.d / "city" / ".gc" / "logs").mkdir(parents=True)
         (self.d / "sessions").mkdir()
@@ -112,9 +187,13 @@ class World:
             "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(self.now),
         }.items():
             monkeypatch.setenv(k, v)
-        for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL"):
+        for k in ("GC_CREW_ACCOUNT", "CLAUDE_CREW_ACCOUNTS", "FAKE_SEC_FAIL", "FAKE_SEC_WFAIL", "FAKE_SEC_DROP", "FAKE_NOTIFY_FAIL"):
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
+        # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
+        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir):
+            assert str(fn()).startswith(str(self.d)), f"{fn.__name__} escapes the test world: {fn()}"
+        assert os.environ["CLAUDE_CREW_NOTIFY"].startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
 
     # keychain
     def store(self):
@@ -145,10 +224,16 @@ class World:
     def src_service(self, key):
         return crew.source_services(EMAIL[key])[0]
 
-    def account(self, key, b):
-        """An account's own stored login + who the profile says its access token belongs to."""
+    def account(self, key, b, *, fresh=False):
+        """An account's own stored login. PRODUCTION shape by default: a stored copy's access token has been expired for
+        22-41 h (measured by the reviewer), so the profile CANNOT say whose it is. `fresh=True` is the unrealistic case in
+        which the profile answers for it."""
+        b = copy.deepcopy(b)
+        if fresh:
+            self.tokens[b["claudeAiOauth"]["accessToken"]] = EMAIL[key]
+        else:
+            b["claudeAiOauth"]["expiresAt"] = int((T0 - 30 * 3600) * 1000)
         self.put(self.src_service(key), b)
-        self.tokens[b["claudeAiOauth"]["accessToken"]] = EMAIL[key]
 
     def default(self, key, b):
         self.put(crew.DEFAULT_SERVICE, b)
@@ -258,7 +343,8 @@ def test_keychain_unreadable_means_nothing_is_touched(w):
     assert w.writes() == []
 
 
-def test_a_source_that_belongs_to_someone_else_is_refused(w):
+def test_a_source_that_belongs_to_someone_else_is_refused_when_the_profile_can_say_so(w):
+    """The UNREALISTIC case (a fresh access token the profile answers for). The production case is further down."""
     w.default("crypto", blob("crypto"))
     b = blob("amb")
     w.put(w.src_service("amb"), b)
@@ -463,3 +549,396 @@ def test_not_yet_a_minute_does_not_judge(w):
     _session(w, os.getpid(), None)
     w.run(at=w.now + 20)
     assert "pending_verify" in w.state() and w.notified() == []
+
+
+# ══ gate fix (ga-qdtmq2, verdict on 581c67bb) ════════════════════════════════════════════════════════════════════
+def _own(w, key):
+    return w.src_service(key)
+
+
+def _rt(b):
+    return b["claudeAiOauth"]["refreshToken"]
+
+
+def _switch_crypto_to_amb(w, **kw):
+    """The production-shaped switch: the stored copies' access tokens are expired, so the profile cannot vouch for them."""
+    w.default("crypto", blob("crypto", rt="crypto-rotated"))
+    w.account("crypto", blob("crypto", rt="crypto-old"))
+    w.account("amb", blob("amb"), **kw)
+    w.decide("amb")
+    return w.run()
+
+
+# ── P2 / P3: a sync-back that failed or could not tell must STOP the overwrite ─────────────────────────────────
+def _break_sync_back(w, mode):
+    own = _own(w, "crypto")
+    if mode == "read":                                            # P2: the leaving account's own item cannot be read
+        w.mp.setenv("FAKE_SEC_FAIL", own)
+    elif mode == "wfail":                                         # `security` refuses the write
+        w.mp.setenv("FAKE_SEC_WFAIL", own)
+    elif mode == "drop":                                          # `security` says yes and stores nothing: only a read-back sees it
+        w.mp.setenv("FAKE_SEC_DROP", own)
+    else:                                                         # P3: verified_write forced False for the own item
+        real = crew.verified_write
+        w.mp.setattr(crew, "verified_write", lambda svc, acct, b: False if svc == own else real(svc, acct, b))
+
+
+@pytest.mark.parametrize("mode", ["read", "wfail", "drop", "forced-false"])
+def test_a_sync_back_that_failed_or_could_not_tell_keeps_the_only_copy_of_the_rotated_token(w, mode):
+    w.default("crypto", blob("crypto", rt="crypto-rotated"))      # the ONLY place the rotated refresh token exists
+    w.account("crypto", blob("crypto", rt="crypto-old"))
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    _break_sync_back(w, mode)
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes()                 # reviewer's symptom: writes == [DEFAULT], 0 pushes
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-crypto-rotated-ref"
+    pushed = [n for n in w.notified() if "job falhou" in n]
+    assert len(pushed) == 1 and EMAIL["crypto"] in pushed[0] and "sync-back" in pushed[0]
+    w.run(at=w.now + 60)                                          # the same fault a minute later: still refused, no second push
+    assert crew.DEFAULT_SERVICE not in w.writes() and len(w.notified()) == 1
+
+
+def test_once_the_fault_clears_the_login_is_saved_and_only_then_the_switch_happens(w):
+    w.default("crypto", blob("crypto", rt="crypto-rotated"))
+    w.account("crypto", blob("crypto", rt="crypto-old"))
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.mp.setenv("FAKE_SEC_FAIL", _own(w, "crypto"))
+    w.run()
+    w.mp.delenv("FAKE_SEC_FAIL")
+    w.run(at=w.now + 60)
+    assert w.writes() == [_own(w, "crypto"), crew.DEFAULT_SERVICE]
+    assert _rt(w.get(_own(w, "crypto"))) == "sk-ant-ort01-crypto-rotated-ref"
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"
+
+
+def test_two_logins_that_cannot_be_compared_are_never_overwritten_blind(w):
+    w.default("crypto", blob("crypto", rt="crypto-rotated"))                       # carries a refresh expiry
+    w.account("crypto", blob("crypto", rt="crypto-old", rexp_days=None))           # does not: which one is newer is unknowable
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes()
+    assert any("sync-back" in n and EMAIL["crypto"] in n for n in w.notified())
+
+
+def test_the_overwrite_is_allowed_when_the_leaving_login_is_not_a_full_login_anyway(w):
+    w.default("crypto", blob("crypto", refresh=False))            # a setup-token: nothing worth saving
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.mp.setenv("FAKE_SEC_FAIL", _own(w, "crypto"))               # even with its own item unreadable
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"
+
+
+# ── P4: the owner guard in the PRODUCTION shape (expired stored token => the profile cannot answer) ───────────────────
+def test_production_path_an_expired_source_switches_but_says_the_owner_is_unverified_and_counts_it(w):
+    _switch_crypto_to_amb(w)
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"
+    assert "owner unverified" in w.log()
+    s = w.state()
+    assert s["unverified_switches"] == 1
+    assert s["identity"]["via"] == "switch-unverified" and s["unverified"]["email"] == EMAIL["amb"]
+    assert secrets_in(json.dumps(s) + w.log(), w) == []
+
+
+def test_an_unverified_identity_is_trusted_for_the_ttl_and_not_forever(w):
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 120)                                         # inside the TTL: the claimed identity still stands
+    assert "cannot tell whose login" not in w.log() and w.state()["current"] == EMAIL["amb"]
+    w.run(at=w.now + crew.IDENTITY_TTL_S + 120)                   # past it, the profile still silent: hold, do not assume
+    assert "cannot tell whose login" in w.log()
+    assert "still unverified" in w.log() and "unverified" not in w.state()      # gave up verifying, said so, stopped carrying it
+
+
+def test_after_the_cli_refreshes_the_source_the_owner_is_checked_and_a_match_is_logged(w):
+    _switch_crypto_to_amb(w)
+    w.default("amb", blob("amb-refreshed", rt="amb-rotated"))     # the CLI refreshed it: new tokens, the profile answers
+    w.run(at=w.now + 70)
+    assert "owner verified" in w.log()
+    s = w.state()
+    assert "unverified" not in s and s["unverified_last"]["result"] == "verified" and s["identity"]["via"] == "profile"
+    assert [x for x in w.writes() if x == crew.DEFAULT_SERVICE] == [crew.DEFAULT_SERVICE]
+
+
+def test_after_the_cli_refreshes_a_source_that_was_someone_elses_it_is_alerted_quarantined_and_not_written_again(w):
+    _switch_crypto_to_amb(w)                                      # amb's dir item actually holds b85's login (nobody could tell)
+    w.default("b85", blob("b85-refreshed", rt="b85-rotated"))     # ...and the profile says so as soon as the CLI refreshed it
+    for i in range(1, 5):
+        w.run(at=w.now + 70 * i)
+    pushed = [n for n in w.notified() if "turned out to belong to" in n]
+    assert len(pushed) == 1 and EMAIL["amb"] in pushed[0] and EMAIL["b85"] in pushed[0] and _own(w, "amb") in pushed[0]
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 1            # no second write of the dead, already-rotated login
+    assert w.state()["bad_sources"][_own(w, "amb")]["owner"] == EMAIL["b85"]
+    assert w.state()["unverified_last"]["result"] == "mismatch"
+
+
+def test_a_quarantined_source_comes_back_when_it_is_logged_in_again(w):
+    _switch_crypto_to_amb(w)
+    w.default("b85", blob("b85-refreshed", rt="b85-rotated"))
+    w.run(at=w.now + 70)
+    assert _own(w, "amb") in w.state()["bad_sources"]
+    w.account("amb", blob("amb", rt="amb-relogin"))               # a human redid it: a NEW refresh token, not the quarantined one
+    w.run(at=w.now + 140)
+    assert w.writes().count(crew.DEFAULT_SERVICE) == 2 and _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-relogin-ref"
+
+
+# ── alerts: "told" means delivered ─────────────────────────────────────────────────────────────────────────────────
+def _no_login_problem(w):
+    w.default("crypto", blob("crypto"))
+    w.account("amb", blob("amb", refresh=False))
+    w.decide("amb")
+
+
+def test_a_push_that_failed_is_not_recorded_as_told_and_is_retried(w):
+    _no_login_problem(w)
+    w.mp.setenv("FAKE_NOTIFY_FAIL", "1")
+    w.run()
+    assert len(w.notified()) == 1 and "notify exit=7" in w.log()
+    w.mp.delenv("FAKE_NOTIFY_FAIL")
+    w.run(at=w.now + 60)                                          # too soon to hammer a broken notify
+    assert len(w.notified()) == 1
+    w.run(at=w.now + 600)                                         # retried, delivered
+    assert len(w.notified()) == 2
+    w.run(at=w.now + 700)                                         # and only now is it "told"
+    assert len(w.notified()) == 2
+
+
+def test_a_missing_notify_is_an_error_not_a_silent_success(w):
+    _no_login_problem(w)
+    w.mp.setenv("CLAUDE_CREW_NOTIFY", str(w.d / "does-not-exist"))
+    w.run()
+    assert "notify could not run" in w.log() and "alerts" in w.state()
+    assert all(w.state()["alerts"][k] < w.now - crew.ALERT_EVERY_S + crew.ALERT_RETRY_S + 1 for k in w.state()["alerts"])
+    w.mp.setenv("CLAUDE_CREW_NOTIFY", str(w.d / "notify"))
+    w.run(at=w.now + 600)
+    assert len(w.notified()) == 1
+
+
+# ── main(): a failure must not look like success ───────────────────────────────────────────────────────────────────
+def test_main_exits_1_and_pushes_when_the_run_crashes(w):
+    def boom(dry=False):
+        raise RuntimeError("kaboom")
+    w.mp.setattr(crew, "run_once", boom)
+    assert crew.main([]) == 1
+    assert "run failed (RuntimeError" in w.log()
+    assert len([n for n in w.notified() if "job falhou" in n]) == 1
+    assert crew.main([]) == 1 and len(w.notified()) == 1          # the same crash again: deduplicated
+
+
+def test_main_exits_1_when_the_lock_cannot_be_opened(w, tmp_path):
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    w.mp.setenv("GC_CITY_PATH", "")
+    w.mp.setenv("CLAUDE_CREW_STATE", str(blocker / "state.json"))
+    assert crew.main([]) == 1
+
+
+def test_a_dry_run_that_loses_the_lock_says_so_instead_of_printing_nothing(w, capsys):
+    lock = w.d / "city" / ".gc" / "claude-crew-account.lock"
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        rc = crew.main(["--dry-run"])
+    finally:
+        os.close(fd)
+        crew.DRY = False
+    assert rc == 0
+    assert "lock" in capsys.readouterr().err
+
+
+# ── Remote Control verification that cannot be fooled by silence ───────────────────────────────────────────────────
+def _lstart(pid):
+    return " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                   env={**os.environ, "TZ": "UTC", "LC_ALL": "C"}).stdout.split())
+
+
+def test_an_unreadable_sessions_dir_before_the_switch_is_not_reported_as_all_bridges_up(w):
+    os.rename(w.d / "sessions", w.d / "sessions.gone")
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "all 0" not in w.log() and "NOT verified" in w.log()
+
+
+def test_an_unreadable_sessions_dir_at_check_time_is_neither_success_nor_a_false_alarm_and_is_retried(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    os.rename(w.d / "sessions", w.d / "sessions.gone")
+    w.run(at=w.now + 90)
+    assert "still up" not in w.log() and "lost Remote Control" not in "".join(w.notified())
+    assert "could not read the sessions dir" in w.log() and "pending_verify" in w.state()
+    os.rename(w.d / "sessions.gone", w.d / "sessions")
+    w.run(at=w.now + 150)
+    assert "all 1 Remote Control bridges are still up" in w.log() and "pending_verify" not in w.state()
+
+
+def test_no_bridge_at_all_says_there_was_nothing_to_verify(w):
+    _switch_crypto_to_amb(w)
+    w.run(at=w.now + 90)
+    assert "all 0" not in w.log() and "no Remote Control bridge existed" in w.log()
+
+
+def test_a_reused_pid_is_not_a_live_bridge(w):
+    me = os.getpid()
+    d = {"pid": me, "bridgeSessionId": "cse_a", "procStart": "Mon Jan  1 00:00:00 2001"}   # some other process owns this pid now
+    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
+    assert crew.bridges() == {}
+    d["procStart"] = _lstart(me)                                  # the genuine start time of the live process
+    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
+    assert list(crew.bridges()) == [me]
+
+
+def test_a_verification_that_comes_too_late_is_not_blamed_on_the_switch(w):
+    me = os.getpid()
+    _session(w, me, "cse_a")
+    _switch_crypto_to_amb(w)
+    _session(w, me, None)
+    w.run(at=w.now + crew.VERIFY_GIVE_UP_S + 600)                 # the machine slept, or the job stalled
+    assert "rc_lost" not in w.state() and "pending_verify" not in w.state()
+    assert not any("lost Remote Control" in n for n in w.notified()) and "too late" in w.log()
+
+
+def test_the_bridge_check_also_runs_when_the_owner_cannot_be_told(w):
+    me = os.getpid()
+    _session(w, me, None)                                         # the bridge is gone
+    w.default("crypto", blob("crypto"))
+    w.tokens.clear()                                              # and the profile cannot say whose the default login is
+    (w.d / "crew_state.json").write_text(json.dumps({"pending_verify": {"since": w.now - 100, "to": EMAIL["amb"],
+                                                                         "pids": {str(me): "cse_a"}}}))
+    w.decide("crypto")
+    w.run()
+    assert any("lost Remote Control" in n for n in w.notified())
+
+
+# ── only the OAuth part of a blob moves ────────────────────────────────────────────────────────────────────────────
+def test_only_the_oauth_part_moves_never_the_rest_of_the_blob(w):
+    cur = blob("crypto", rt="crypto-rotated")
+    cur["mcpOAuth"] = {"srv|default": {"accessToken": "mcp-default"}}
+    own = blob("crypto", rt="crypto-old")
+    own["mcpOAuth"] = {"srv|own": {"accessToken": "mcp-own"}}
+    amb = blob("amb")
+    amb["mcpOAuth"] = {"srv|amb": {"accessToken": "mcp-amb"}}
+    w.default("crypto", cur)
+    w.account("crypto", own)
+    w.account("amb", amb)
+    w.decide("amb")
+    w.run()
+    d = w.get(crew.DEFAULT_SERVICE)
+    assert _rt(d) == "sk-ant-ort01-amb-ref" and d["mcpOAuth"] == cur["mcpOAuth"]       # amb's MCP logins did not ride along
+    o = w.get(_own(w, "crypto"))
+    assert _rt(o) == "sk-ant-ort01-crypto-rotated-ref" and o["mcpOAuth"] == own["mcpOAuth"]
+
+
+def test_a_new_reserve_item_holds_only_the_login(w):
+    t = blob("terr")
+    t["mcpOAuth"] = {"srv": {"accessToken": "mcp-terr"}}
+    w.default("terr", t)
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.run()
+    assert list(w.get(crew.reserve_service(EMAIL["terr"]))) == ["claudeAiOauth"]
+
+
+def test_a_command_longer_than_the_security_stdin_line_is_refused_not_truncated(w):
+    """Measured 07/10: `security -i` cuts a stdin line at 4096 bytes and runs the rest as a SECOND command."""
+    big = blob("x")
+    big["mcpOAuth"] = {"srv": {"blob": "p" * 3000}}
+    assert crew.kc_write(crew.DEFAULT_SERVICE, "athos", big) is False
+    assert w.writes() == [] and "cut by `security -i`" in w.log()
+    cur = blob("crypto")
+    cur["mcpOAuth"] = {"srv": {"blob": "p" * 3000}}
+    w.default("crypto", cur)
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-crypto-ref"
+    assert any("could not write" in n for n in w.notified())
+
+
+# ── heal: the default holds no full login ──────────────────────────────────────────────────────────────────────────
+def test_heal_falls_back_to_another_account_when_the_wanted_one_has_no_login(w):
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))
+    w.account("amb", blob("amb", refresh=False))                  # the pool's pick: a setup-token only
+    w.account("b85", blob("b85"))
+    w.decide("amb")
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-b85-ref"
+    assert any("Remote Control is broken" in n for n in w.notified())
+    assert any(EMAIL["amb"] in n and "no refresh token" in n for n in w.notified())     # the missing login is NAMED, with why
+
+
+def test_heal_that_finds_no_login_anywhere_names_what_is_missing(w):
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))
+    w.decide("amb")
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes()
+    assert any("cannot heal" in n and EMAIL["amb"] in n for n in w.notified())
+
+
+def test_a_default_without_a_full_login_is_alerted_even_when_its_owner_is_known(w):
+    w.default("crypto", blob("crypto", refresh=False))            # the profile answers (crypto), but it is a setup-token
+    w.account("crypto", blob("crypto"))
+    w.decide("crypto")                                            # the pool is already "on" crypto: nothing to follow...
+    w.run()
+    assert any("Remote Control is broken" in n for n in w.notified())     # ...yet Remote Control IS broken
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-crypto-ref"
+
+
+def test_a_source_that_could_not_be_read_stops_the_search_instead_of_falling_to_a_stale_reserve(w):
+    w.default("crypto", blob("crypto"))
+    w.account("amb", blob("amb"))
+    w.put(crew.reserve_service(EMAIL["amb"]), blob("amb", rt="stale"))
+    w.decide("amb")
+    w.mp.setenv("FAKE_SEC_FAIL", _own(w, "amb"))
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes()
+
+
+# ── state ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+def test_a_corrupt_state_file_is_logged_not_silently_reset(w):
+    (w.d / "crew_state.json").write_text("{not json")
+    w.default("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.run()
+    assert "state file" in w.log() and "corrupt" in w.log() and "state_reset" in w.state()
+
+
+def test_a_missing_state_file_is_normal_and_silent(w):
+    w.default("crypto", blob("crypto"))
+    w.decide("crypto")
+    w.run()
+    assert "state file" not in w.log()
+
+
+# ── the script as launchd runs it: empty environment, both interpreters ───────────────────────────────────────────
+SEAMS = ("FAKE_SEC_DIR", "CLAUDE_CREW_SECURITY", "CLAUDE_CREW_NOTIFY", "CLAUDE_CREW_STATE", "CLAUDE_CREW_DECISION",
+         "CLAUDE_CREW_SESSIONS_DIR", "CLAUDE_CREW_ACCOUNTS_DIR", "CLAUDE_CREW_USER", "GC_CITY_PATH", "CLAUDE_CREW_PROFILE_URL",
+         "CLAUDE_CREW_NOW")
+
+
+def _env_i(w, interpreter, *args):
+    env = [f"{k}={os.environ[k]}" for k in SEAMS] + [f"PATH={_GUARD['dir']}/bin:/usr/bin:/bin", f"HOME={w.d / 'home'}"]
+    return subprocess.run(["/usr/bin/env", "-i", *env, interpreter, str(SCRIPT), *args], capture_output=True, text=True, timeout=60)
+
+
+INTERPRETERS = [sys.executable] + (["/usr/bin/python3"] if os.path.exists("/usr/bin/python3") and sys.executable != "/usr/bin/python3" else [])
+
+
+@pytest.mark.parametrize("interpreter", INTERPRETERS)       # the plist runs /usr/bin/python3 (3.9): the suite must too
+def test_the_real_script_run_from_an_empty_environment_stays_inside_the_test_world(w, interpreter):
+    w.default("crypto", blob("crypto"))
+    w.account("b85", blob("b85"))
+    w.decide("b85")
+    r = _env_i(w, interpreter)
+    assert r.returncode == 0, r.stderr
+    assert "SWITCH crews" in w.log() and w.state()["current"] == EMAIL["b85"]       # log + state landed in the tmp world
+    w.account("amb", blob("amb", refresh=False))
+    w.decide("amb")
+    r = _env_i(w, interpreter)                                    # an alert: the push must go to the PINNED notify
+    assert r.returncode == 0, r.stderr
+    assert len(w.notified()) == 1 and "job falhou" in w.notified()[0]
+    assert not _GUARD["hits"].exists()
+    d = _env_i(w, interpreter, "--dry-run")
+    assert d.returncode == 0 and "crew" in d.stderr and len(w.notified()) == 1
