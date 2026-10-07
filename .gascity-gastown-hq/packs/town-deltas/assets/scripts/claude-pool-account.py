@@ -349,6 +349,70 @@ def read_item_token(user: str) -> Tuple[str, Optional[str]]:
     return ("ok", tok) if isinstance(tok, str) else ("unknown", None)
 
 
+MDAT_RE = re.compile(r'"mdat"<timedate>=(?:0x[0-9A-Fa-f]+\s+)?"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z')
+RECENT_CLAUDE_S = 15 * 60         # a login/refresh that moved the item is a process this young
+RECENT_CLAUDE_MAX = 6
+
+
+def _etime_s(v: str) -> Optional[int]:
+    """`ps` elapsed time ([[dd-]hh:]mm:ss) in seconds, None for anything else."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", v)
+    if not m:
+        return None
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + s
+
+
+def describe_foreign_item(user: str) -> str:
+    """Who left a credential the daemon did not write? The item cannot say, but its SHAPE can: this daemon's blob has no refresh
+    token, scope ['user:inference'] and an expiry in 2100; a `claude` login/refresh writes a refresh token and an expiry hours away.
+    Plus when the item changed and which `claude` processes are young enough to have done it (pid/age/tty, never argv).
+    Key NAMES and a few non-secret scalars only - no token, no refresh token, no value of any other field. Best effort: whatever
+    cannot be read is said so, and nothing here raises - it annotates a rewrite, it must never stop one."""
+    parts: List[str] = []
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-a", user, "-s", item_service(), "-w"],
+                           capture_output=True, text=True, timeout=20, check=False)
+        top = json.loads(r.stdout.strip()) if r.returncode == 0 else None
+        oauth = top.get("claudeAiOauth") if isinstance(top, dict) else None
+        if isinstance(oauth, dict):
+            exp = _epoch(str(oauth.get("expiresAt")))   # _epoch wants text; an int (ms) or None is what a real blob holds
+            scopes = oauth.get("scopes")
+            parts.append(f"blob keys={sorted(str(k) for k in oauth)} top={sorted(str(k) for k in top)} "
+                         f"refreshToken={'yes' if oauth.get('refreshToken') else 'no'} "
+                         f"expiresAt={_iso(exp) if exp is not None else 'unreadable'} "
+                         f"scopes={sorted(str(s) for s in scopes) if isinstance(scopes, list) else 'unreadable'} "
+                         f"subscriptionType={str(oauth.get('subscriptionType'))[:24]}")
+        else:
+            parts.append("blob shape unreadable")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
+        parts.append("blob shape unreadable")
+    try:
+        r = subprocess.run(["security", "find-generic-password", "-a", user, "-s", item_service()],
+                           capture_output=True, text=True, timeout=20, check=False)   # no -w/-g: attributes, never the secret
+        m = MDAT_RE.search(r.stdout) if r.returncode == 0 else None
+        parts.append(f"item modified {m.group(1)}-{m.group(2)}-{m.group(3)}T{m.group(4)}:{m.group(5)}:{m.group(6)}Z" if m
+                     else "item mtime unreadable")
+    except (OSError, subprocess.SubprocessError):
+        parts.append("item mtime unreadable")
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,etime=,tty=,comm="], capture_output=True, text=True, timeout=10, check=False)
+        if r.returncode != 0:
+            raise OSError("ps failed")   # 'ps failed' is not 'no young claude': say which
+        young = []
+        for ln in r.stdout.splitlines():
+            f = ln.split(None, 3)
+            age = _etime_s(f[1]) if len(f) == 4 else None
+            if age is not None and age <= RECENT_CLAUDE_S and os.path.basename(f[3].strip()) == "claude":
+                young.append((age, f[0], f[1], f[2]))
+        young.sort()
+        parts.append("young claude processes: " + ("; ".join(f"pid={p} age={e} tty={t}" for _, p, e, t in young[:RECENT_CLAUDE_MAX])
+                                                    if young else "none") + (f" (+{len(young) - RECENT_CLAUDE_MAX} more)" if len(young) > RECENT_CLAUDE_MAX else ""))
+    except (OSError, subprocess.SubprocessError):
+        parts.append("process list unreadable")
+    return "; ".join(parts)[:900]
+
+
 # ── state ──────────────────────────────────────────────────────────────────────────────────────────
 def load_state() -> Optional[dict]:
     """{} = no decision yet (absent, or corrupt and moved aside). None = the file is there but cannot be READ now
@@ -555,6 +619,8 @@ def heal_item(st: dict, user: str, token: str, email: str) -> None:
     if not (kind == "ok" and held == token):
         log("WARN", f"pool item {'missing' if kind == 'missing' else 'holds fp=' + fingerprint(held or '')} but the decision is "
                     f"{email} fp={fingerprint(token)} - rewriting")
+        if kind == "ok":   # a credential somebody else wrote: say what it looks like BEFORE the rewrite erases the evidence (ga-xknkke)
+            log("WARN", f"foreign write to the pool item (fp={fingerprint(held or '')}): {describe_foreign_item(user)}")
         if not write_item(user, token):
             return
     # The decision names the credential the item holds. If the vault's key for this account changed (rotated), the
