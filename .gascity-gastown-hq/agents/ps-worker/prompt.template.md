@@ -394,7 +394,9 @@ bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=e
 # (gate-focus-mode.sh says active=1), keep ONLY fixes of beads the gate already rejected
 # (gate:needs-fix or gate:fix-attempt:N) — a new build waits until the gate queue drains.
 # If this leaves [] in focus mode there is no fix for you: drain, do NOT look for a new
-# bead elsewhere (Step 1b3 included). Unknown/off focus state -> no filtering.
+# bead elsewhere (Step 1b3 included).
+# (Step 1b3 also filters to fixes, but its engine query returns at most ONE bead, so
+# it is a safety net that can miss fixes — this Step 1b2 sees the whole pool.) Unknown/off focus state -> no filtering.
 GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"
 if [ "$GATE_FOCUS_PROBE" = "1" ] && [ -n "$PS_CAND" ]; then
   # A filter that FAILED is "could not tell", never "pool empty": leave PS_CAND blank so the

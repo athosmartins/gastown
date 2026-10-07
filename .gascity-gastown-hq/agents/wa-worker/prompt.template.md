@@ -116,6 +116,8 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # already rejected (gate:needs-fix or gate:fix-attempt:N) — a new build waits until
 # the gate queue drains. If it returns [] in focus mode, there is no fix for you:
 # drain normally, do NOT go looking for a new bead elsewhere (Step 1b3 included).
+# (Step 1b3 also filters to fixes, but its engine query returns at most ONE bead, so
+# it is a safety net that can miss fixes — Step 1b2 is the one that sees the whole pool.)
 # Unknown/off focus state -> the filter is inert (normal behaviour).
 # In focus mode the substitution inside the bd line adds --limit=0 (the later flag wins: the
 # whole pool, so a fix ranked below the top-20 is still seen) and --label-regex keeping only

@@ -37,7 +37,7 @@
 
 set -u
 
-GC_CITY="${GC_CITY:-${GC_CITY_PATH:-/Users/athos/gt/.gascity-gastown-hq}}"
+GC_CITY="${GC_CITY_PATH:-${GC_CITY:-/Users/athos/gt/.gascity-gastown-hq}}"   # same precedence as gate-focus-lib.sh (writer and readers name the same city)
 GATE_FOCUS_ENTER="${GATE_FOCUS_ENTER:-15}"
 GATE_FOCUS_EXIT="${GATE_FOCUS_EXIT:-8}"
 GATE_FOCUS_MAX_S="${GATE_FOCUS_MAX_S:-86400}"   # one escalation if ON longer than this

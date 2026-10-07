@@ -3926,6 +3926,7 @@ _filter_candidates() {
       # Could not apply the filter: dispatch nothing from this list rather than let new
       # builds through a mode that exists to stop them.
       _cf_out="[]"
+      log "WARN: gate focus filter could not be applied to this candidate list — dispatching nothing from it this sweep (could-not-filter, not 'no fixes'; ga-kqa08j)" >&2
     fi
   fi
 

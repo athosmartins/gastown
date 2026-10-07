@@ -37,6 +37,9 @@
 # Run:  bash packs/town-deltas/assets/pilot-dispatcher.topup-order.selftest.sh
 
 set -uo pipefail
+# ga-kqa08j: the worker probes read the gate focus mode; pin it OFF so a run inside the
+# live city (or a gate reviewer whose env names it) never inherits the real state.
+export GATE_FOCUS_ACTIVE_OVERRIDE=0
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="${PILOT_DISPATCHER_PATH:-$SELF_DIR/pilot-dispatcher.sh}"
