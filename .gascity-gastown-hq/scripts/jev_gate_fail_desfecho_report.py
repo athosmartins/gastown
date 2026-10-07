@@ -44,6 +44,10 @@ CLI:
   python3 jev_gate_fail_desfecho_report.py [--json] [--cache PATH] [--workers N] [--limit N]
          [--log PATH] [--gate-log PATH] [--gc-city PATH]
   python3 jev_gate_fail_desfecho_report.py selftest
+
+SAÍDA: 0 = relatório impresso (inclusive "0 entidades", dito com os arquivos lidos). 2 = entrada ausente
+ou ilegível (log do Jev/do gate inexistente, sem linha JSON legível, ou log do gate sem nenhuma revisão
+enquanto há entidades): mensagem em stderr, stdout vazio. Não consegui ler != nada a medir.
 """
 from __future__ import annotations
 
@@ -75,6 +79,12 @@ PENDING_FRESH_HOURS = 24.0  # FAIL sem reenvio há menos que isso ainda pode est
 LIGHT = fc.LIGHT_FIX_CATEGORY
 BASE = "bug_logica"
 SUBMIT_EVENTS = ("guard_queued", "guard_dispatched")
+
+
+class InputError(Exception):
+    """Entrada ausente ou ilegível. É o TERCEIRO estado ("não consegui saber"): vira erro
+    explícito com saída != 0, nunca "nada a medir" — este relatório decide se a sombra se desliga,
+    e um log movido/errado de caminho tem de ser distinguível de uma sombra realmente vazia."""
 
 
 # ── classificação do FAIL: revisão real x mecânico ───────────────────────────────────────────
@@ -162,10 +172,16 @@ def _patch_lines(repo: str, base: str, head: str) -> Counter | None:
             n_old = int(m.group(1)) if m.group(1) is not None else 1
             n_new = int(m.group(2)) if m.group(2) is not None else 1
             for sign, count in (("-", n_old), ("+", n_new)):
-                for _ in range(count):
+                seen = 0
+                while seen < count and i + 1 < len(lines):
                     i += 1
-                    if i < len(lines):
-                        acc[(path, sign, lines[i][1:])] += 1
+                    if lines[i].startswith("\\"):
+                        # "\ No newline at end of file" fica ENTRE o último '-' e o primeiro '+' quando se
+                        # edita a última linha de um arquivo sem '\n' final: não é linha do patch. Contá-la
+                        # como '+' derrubava o '+' de verdade e dois consertos distintos mediam 0.
+                        continue
+                    acc[(path, sign, lines[i][1:])] += 1
+                    seen += 1
         i += 1
     return acc
 
@@ -270,7 +286,10 @@ class Shas:
 
     def save(self) -> None:
         if self.path:
-            Path(self.path).write_text(json.dumps(self.mem))
+            try:
+                Path(self.path).write_text(json.dumps(self.mem))
+            except OSError as e:  # o cache é conveniência: não derruba um relatório já medido
+                print(f"AVISO: não gravei o --cache {self.path}: {e}", file=sys.stderr)
 
 
 # ── join: sombra x log do gate ───────────────────────────────────────────────────────────────
@@ -421,34 +440,52 @@ def compare(g: dict, b: dict) -> dict:
     out["separa"] = bool(enough and m["delta_pp"] is not None and m["delta_pp"] >= MIN_DELTA_PP)
     out["n_suficiente"] = enough
     out["ic_exclui_zero"] = bool(m["ic95_pp"] and m["ic95_pp"][0] > 0)
+    # três estados: n insuficiente NÃO é "não separa" — é "não deu pra saber". A regra de decisão
+    # ("senão, desligar a sombra") não pode ler amostra pequena como evidência contra a sombra.
+    out["veredito"] = "separa" if out["separa"] else ("nao_separa" if enough else "inconclusivo")
     return out
 
 
 def pending_fails(reviews_by_bead: dict[str, list[dict]], since_ts: str | None, now: datetime | None = None) -> dict:
     """FAILs do log do gate (revisão real) SEM revisão seguinte: 'ainda sem desfecho'. Não têm
-    categoria do Jev (a sombra só grava depois da revisão do conserto)."""
+    categoria do Jev (a sombra só grava depois da revisão do conserto).
+
+    Três estados também aqui: FAIL sem `ts` legível não cabe na janela nem no "recente/antigo" —
+    vai pra `ts_desconhecido`, não vira "antigo"; FAIL sem `reason` não se sabe se é revisão ou
+    mecânico — vai pra `sem_motivo`, não some dos contadores (o join os conta em n_prior_mecanico)."""
     now = now or datetime.now(timezone.utc)
-    tot = fresh = old = 0
+    tot = fresh = old = ts_unknown = no_reason = 0
     for revs in reviews_by_bead.values():
         for i, r in enumerate(revs):
-            if r["result"] != "FAIL" or fail_kind(r.get("reason")) != "review":
+            if r["result"] != "FAIL":
                 continue
-            if since_ts and (r.get("ts") or "") < since_ts:
+            kind = fail_kind(r.get("reason"))
+            if kind == "unknown":
+                no_reason += 1
+                continue
+            if kind != "review":
+                continue
+            t = gv._parse_ts(r.get("ts"))
+            if t is None:
+                ts_unknown += 1
+                continue
+            if since_ts and r["ts"] < since_ts:
                 continue
             tot += 1
             if i + 1 < len(revs):
                 continue
-            t = gv._parse_ts(r.get("ts"))
-            if t and now - t < timedelta(hours=PENDING_FRESH_HOURS):
+            if now - t < timedelta(hours=PENDING_FRESH_HOURS):
                 fresh += 1
             else:
                 old += 1
-    return {"fails_revisao": tot, "com_desfecho": tot - fresh - old, "sem_desfecho_recente": fresh, "sem_desfecho_antigo": old}
+    return {"fails_revisao": tot, "com_desfecho": tot - fresh - old, "sem_desfecho_recente": fresh,
+            "sem_desfecho_antigo": old, "ts_desconhecido": ts_unknown, "sem_motivo": no_reason}
 
 
 def summarize(records: list[dict], reviews_by_bead: dict, first_submit: dict, shas: Shas,
               rig_paths: dict[str, str], workers: int = 3, limit: int | None = None) -> dict:
     rows, skipped = join_records(records, reviews_by_bead)
+    joined_total = len(rows)
     if limit:
         rows = rows[:limit]
     measure(rows, shas, rig_paths, first_submit, workers)
@@ -467,12 +504,19 @@ def summarize(records: list[dict], reviews_by_bead: dict, first_submit: dict, sh
     base = stats[BASE]
     stamps = sorted(t for t in (r["prior"].get("ts") for r in rows) if t)
     states = Counter(r["size_state"] for r in rows if r["prior_kind"] == "review" and r["next"] in ("pass", "review"))
+    vs_base = {k: compare(stats[k], base) for k in
+               ("ajuste_pequeno_p07_estrito", "ajuste_pequeno_qualquer_prob", "ajuste_pequeno_atomico_p07")}
+    for k, c in vs_base.items():
+        # linhas que estão no grupo E na base (o grupo atômico ignora o argmax, então pega bug_logica):
+        # o IC de Newcombe assume grupos independentes, e com sobreposição ele só aproxima.
+        c["n_sobrepoe_base"] = sum(1 for r in groups[k] if r["categoria"] == BASE)
     return {
-        "records": len(records), "joined": len(rows), "skipped": dict(skipped),
+        "records": len(records), "joined": joined_total, "joined_medidas": len(rows),
+        "limit": limit if limit and joined_total > len(rows) else None,
+        "skipped": dict(skipped),
         "window": [stamps[0], stamps[-1]] if stamps else None,
         "stats": stats,
-        "vs_base": {k: compare(stats[k], base) for k in
-                    ("ajuste_pequeno_p07_estrito", "ajuste_pequeno_qualquer_prob", "ajuste_pequeno_atomico_p07")},
+        "vs_base": vs_base,
         "size_states": dict(states),
         "pendentes": pending_fails(reviews_by_bead, stamps[0] if stamps else None),
     }
@@ -489,13 +533,27 @@ def _f(x, fmt="{:.1f}") -> str:
 
 def format_report(s: dict) -> str:
     L = ["JEV gate-fail-categoria x DESFECHO REAL (sem rótulo humano) — read-only, nada muda no gate", ""]
+    inp = s.get("inputs") or {}
+    src = ([f"entradas lidas — log do Jev: {inp['jev_log']} ({inp['jev_linhas']} linhas JSON); "
+            f"log do gate: {inp['gate_log']} ({inp['gate_revisoes']} revisões)"] if inp else [])
     if not s["joined"]:
-        return "\n".join(L + ["Nenhuma entidade com join fechado — nada a medir."])
+        if s["records"]:
+            # há entidades e nenhuma fechou o join: isso NÃO é "nada a medir" — é o motivo que tem de aparecer.
+            return "\n".join(L + [
+                f"{s['records']} entidades na sombra; 0 com join fechado no log do gate"
+                + (f"; fora do join: {s['skipped']}" if s["skipped"] else ""), *src,
+                "NADA FOI MEDIDO: nenhuma entidade fechou o join. Isto não é uma sombra sem dados — "
+                "confira os motivos acima (e o --gate-log) antes de qualquer decisão."])
+        return "\n".join(L + ["0 entidades do modo gate-fail-categoria no log do Jev — nada a medir.", *src])
     st = s["stats"]
+    trunc = (f" [TRUNCADO por --limit {s['limit']}: só as {s['joined_medidas']} primeiras foram medidas; "
+             "'fora do join' e 'sem desfecho' abaixo usam a população inteira]") if s.get("limit") else ""
     L += [
         f"{s['records']} entidades na sombra; {s['joined']} com join fechado no log do gate"
-        + (f"; fora do join: {s['skipped']}" if s["skipped"] else ""),
-        f"janela dos FAILs classificados: {s['window'][0]} .. {s['window'][1]}",
+        + (f"; fora do join: {s['skipped']}" if s["skipped"] else "") + trunc,
+        *src,
+        ("janela dos FAILs classificados: " + (f"{s['window'][0]} .. {s['window'][1]}" if s["window"]
+                                               else "desconhecida (nenhum FAIL com ts legível)")),
         "Cada entidade = um FAIL de revisão + a rodada seguinte (o conserto). Só entram FAILs de REVISÃO "
         "real; timeout/merge quebrado não têm diff reprovado a consertar (contados à parte).",
         "",
@@ -521,6 +579,9 @@ def format_report(s: dict) -> str:
              f"{pe['sem_desfecho_recente'] + pe['sem_desfecho_antigo']} de {pe['fails_revisao']} "
              f"({pe['sem_desfecho_recente']} há < {PENDING_FRESH_HOURS:.0f}h, {pe['sem_desfecho_antigo']} mais antigos). "
              "Sem categoria do Jev; não são 'conserto que falhou'.")
+    if pe["ts_desconhecido"] or pe["sem_motivo"]:
+        L.append(f"  fora dessa conta por não dar pra saber: {pe['ts_desconhecido']} FAILs de revisão sem ts legível, "
+                 f"{pe['sem_motivo']} FAILs sem motivo registrado (não se sabe se foi revisão ou mecânico)")
     L += ["", "GRUPO vs BASE (bug_logica) — métrica do enunciado: passou na rodada seguinte E conserto < "
           f"{SMALL_LINES} linhas (entre os de tamanho medido); régua: >= {MIN_DELTA_PP:.0f} pp e n >= {MIN_N}:"]
     for name, c in s["vs_base"].items():
@@ -531,9 +592,11 @@ def format_report(s: dict) -> str:
             f"(IC95 {_f(ci[0], '{:+.0f}') if ci else 'n/a'}..{_f(ci[1], '{:+.0f}') if ci else 'n/a'}), "
             f"n_medido={st[name]['sized']} vs {st['bug_logica']['sized']}  |  só 'passou': "
             f"{_f(p['g_pct'], '{:.0f}')}% vs {_f(p['b_pct'], '{:.0f}')}% Δ={_f(p['delta_pp'], '{:+.0f}')} pp"
-            f"  =>  {'SEPARA' if c['separa'] else 'NAO SEPARA'}"
-            + ("" if c["n_suficiente"] else f"  [n_medido < {MIN_N}]")
+            f"  =>  {c['veredito'].replace('_', ' ').upper()}"
+            + ("" if c["n_suficiente"] else f"  [n_medido < {MIN_N}: amostra pequena, não é evidência contra]")
             + ("" if c["separa"] or not c["ic_exclui_zero"] else "  [IC exclui 0, mas Δ < régua]")
+            + (f"  [{c['n_sobrepoe_base']} linhas também estão na base: o IC assume grupos independentes, "
+               "leia como aproximado]" if c.get("n_sobrepoe_base") else "")
         )
     L += ["", "SENSIBILIDADE ao limiar de linhas (passou E conserto < L, entre os de tamanho medido):"]
     for name, g in st.items():
@@ -548,12 +611,33 @@ def format_report(s: dict) -> str:
 
 # ── execução ─────────────────────────────────────────────────────────────────────────────────
 def build_summary(log=None, gate_log=None, gc_city=None, cache=None, workers=3, limit=None) -> dict:
+    """Lê as duas entradas e resume. Os leitores compartilhados (qp._read_jsonl, gv.iter_dispatcher_complete)
+    devolvem VAZIO quando o arquivo não existe e pulam linha malformada em silêncio — boa regra pra
+    um coletor, errada pra um relatório de go/no-go. Aqui "não consegui ler" levanta InputError."""
     gc_city = gc_city or gv.DEFAULT_GC_CITY
     gate_log = gate_log or f"{gc_city}/.gc/quality-gate.jsonl"
-    records = cr.load_records(log or je.JEV_LOG)
+    log = log or je.JEV_LOG
+    for label, p in (("log do Jev", log), ("log do gate", gate_log)):
+        if not Path(p).is_file():
+            raise InputError(f"{label} não encontrado (ou não é arquivo): {p}")
+    jev_events = qp._read_jsonl(log)
+    if Path(log).stat().st_size > 0 and not jev_events:
+        raise InputError(f"log do Jev tem conteúdo mas nenhuma linha JSON legível: {log}")
+    records = cr.dedupe_records(jev_events)
     reviews = qp.load_reviews(gate_log)
-    events = qp._read_jsonl(gate_log)
-    return summarize(records, reviews, first_submit_ts(events), Shas(gc_city, cache), gv._rig_paths(), workers, limit)
+    n_reviews = sum(len(v) for v in reviews.values())
+    if records and not n_reviews:
+        raise InputError(f"{len(records)} entidades no log do Jev, mas o log do gate não tem nenhuma revisão "
+                         f"(dispatcher_complete PASS/FAIL) legível: {gate_log} — caminho errado, rotacionado ou corrompido?")
+    rig_paths = gv._rig_paths() if records else {}
+    if records and not rig_paths:
+        print("AVISO: `gc rig list` não devolveu rigs — o tamanho do conserto sai todo nao-medido "
+              "(repo-sem-caminho); só as colunas de 'passou' valem.", file=sys.stderr)
+    s = summarize(records, reviews, first_submit_ts(qp._read_jsonl(gate_log)), Shas(gc_city, cache),
+                  rig_paths, workers, limit)
+    s["inputs"] = {"jev_log": str(log), "jev_linhas": len(jev_events), "gate_log": str(gate_log),
+                   "gate_revisoes": n_reviews}
+    return s
 
 
 def main() -> int:
@@ -568,7 +652,12 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=3, help="`bd show`s em paralelo — o Dolt é frágil; default 3")
     ap.add_argument("--limit", type=int, help="só as N primeiras entidades (teste rápido)")
     a = ap.parse_args()
-    s = build_summary(a.log, a.gate_log, a.gc_city, a.cache, a.workers, a.limit)
+    try:
+        s = build_summary(a.log, a.gate_log, a.gc_city, a.cache, a.workers, a.limit)
+    except (InputError, OSError) as e:
+        # stdout fica VAZIO de propósito: quem faz pipe/parse não pode confundir erro com relatório.
+        print(f"ERRO: {e}", file=sys.stderr)
+        return 2
     print(json.dumps(s, ensure_ascii=False, indent=2, default=str) if a.json else format_report(s))
     return 0
 
@@ -653,6 +742,26 @@ def _selftest() -> int:
         ok("linha '++ ...' conta como linha adicionada, sem trocar o arquivo",
            pl is not None and pl[("b/c.txt", "+", "++ not a header")] == 1)
 
+        # arquivo SEM '\n' final, editando a última linha: o git põe "\ No newline at end of file" ENTRE o '-' e
+        # o '+'. Dois consertos DIFERENTES não podem medir 0 (antes: o marcador era lido como o '+').
+        git("checkout", "-q", "main")
+        (Path(td) / "nl.txt").write_text("a\nb")
+        git("add", "."); git("commit", "-qm", "nl base")
+        nlbase = git("rev-parse", "HEAD")
+        git("checkout", "-qb", "nl1")
+        (Path(td) / "nl.txt").write_text("a\nb1")
+        git("add", "."); git("commit", "-qm", "nl v1")
+        nl1 = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main"); git("checkout", "-qb", "nl2")
+        (Path(td) / "nl.txt").write_text("a\nb2")
+        git("add", "."); git("commit", "-qm", "nl v2")
+        nl2 = git("rev-parse", "HEAD")
+        ok("'\\ No newline at end of file' entre '-' e '+' não é linha do patch",
+           _patch_lines(td, nlbase, nl1) == Counter({("b/nl.txt", "-", "b"): 1, ("b/nl.txt", "+", "b1"): 1}))
+        ok("dois consertos diferentes de arquivo sem '\\n' final medem 2, não 0 (got "
+           f"{repair_size(td, nl1, nl2, nlbase, nlbase)})",
+           repair_size(td, nl1, nl2, nlbase, nlbase) == (2, "delta-de-patch"))
+
     # base_for: três estados (sei / não sei / não pude saber)
     ok("sem rebase registrado: usa base_commit", base_for({"base_commit": "b" * 40, "rebases": {}}, "t" * 40) == ("b" * 40, None))
     ok("rebase registrado mas não pra este tip: nao-medido (base_commit pode estar velho)",
@@ -695,7 +804,18 @@ def _selftest() -> int:
     ok("mecânico da seguinte é contado à parte", g["n_next_mecanico"] == 1 and g["n_prior_mecanico"] == 1)
     pend = pending_fails(revs, None, now=datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc))
     ok("b3 (FAIL de revisão sem nova rodada, 12h) = sem desfecho RECENTE; TIMEOUT de b4 não conta como FAIL de revisão",
-       pend == {"fails_revisao": 3, "com_desfecho": 2, "sem_desfecho_recente": 1, "sem_desfecho_antigo": 0})
+       pend == {"fails_revisao": 3, "com_desfecho": 2, "sem_desfecho_recente": 1, "sem_desfecho_antigo": 0,
+                "ts_desconhecido": 0, "sem_motivo": 0})
+    # três estados no pendente: ts ilegível NÃO vira "antigo"; FAIL sem motivo NÃO some dos contadores
+    odd = {"bx": [rv("g8", "FAIL", real, None, "m8")], "by": [rv("g9", "FAIL", real, "lixo", "m9")],
+           "bz": [rv("g10", "FAIL", None, "2026-10-01T00:00:00Z", "m10")],
+           "bw": [rv("g11", "FAIL", "", "2026-10-01T00:00:00Z", "m11")]}
+    now0 = datetime(2026, 10, 3, tzinfo=timezone.utc)
+    for since in (None, "2026-09-01T00:00:00Z"):
+        po = pending_fails(odd, since, now=now0)
+        ok(f"ts ausente/ilegível => ts_desconhecido=2, não 'antigo' nem fora da janela em silêncio (since={since})",
+           po["ts_desconhecido"] == 2 and po["sem_desfecho_antigo"] == 0 and po["fails_revisao"] == 0)
+        ok(f"FAIL sem reason (None e '') => sem_motivo=2, contado (since={since})", po["sem_motivo"] == 2)
     fs = first_submit_ts([{"event": "guard_queued", "marker": "m2", "ts": "2026-10-01T01:30:00Z"},
                           {"event": "guard_queued", "marker": "m2", "ts": "2026-10-01T01:10:00Z"},
                           {"event": "dispatcher_complete", "marker": "m2", "ts": "2026-10-01T00:01:00Z"}])
@@ -706,6 +826,101 @@ def _selftest() -> int:
     ok("separa: +30pp e n>=30", compare(mk(40, 36, 40), mk(40, 24, 40))["separa"] is True)
     ok("não separa: +30pp mas n<30", compare(mk(10, 9, 10), mk(40, 12, 40))["separa"] is False)
     ok("não separa: n ok mas +10pp", compare(mk(40, 24, 40), mk(40, 20, 40))["separa"] is False)
+    ok("veredito em TRÊS estados: n pequeno é 'inconclusivo', não 'nao_separa'",
+       compare(mk(40, 36, 40), mk(40, 24, 40))["veredito"] == "separa"
+       and compare(mk(40, 24, 40), mk(40, 20, 40))["veredito"] == "nao_separa"
+       and compare(mk(10, 9, 10), mk(40, 12, 40))["veredito"] == "inconclusivo")
+
+    # ── ponta a ponta sem bd: summarize/group_stats/format_report. Tamanho que não se leu NUNCA vira 0.
+    class SemBd:
+        def get(self, _): return None
+        def marker(self, _): return None
+        def save(self): pass
+    s = summarize(recs, revs, {}, SemBd(), {}, workers=1)
+    ta = s["stats"]["TODAS"]
+    ok("sem bd: julgada=1 e NENHUMA 'sized' (nao-medido não vira 0 linha)",
+       ta["judged"] == 1 and ta["sized"] == 0 and ta["nao_medido"] == 1 and ta["small"] == 0)
+    ok("sem bd: motivo do nao-medido aparece em size_states",
+       s["size_states"] == {"nao-medido:bd-nao-leu-gate_run": 1})
+    ok("sem bd: todo grupo vs base é 'inconclusivo' (n_medido=0), e o JSON carrega o veredito",
+       all(c["veredito"] == "inconclusivo" for c in s["vs_base"].values()))
+    txt = format_report(s)
+    ok("relatório nomeia o motivo nao-medido e rotula amostra pequena como INCONCLUSIVO, sem 'NAO SEPARA'",
+       "bd-nao-leu-gate_run" in txt and "INCONCLUSIVO" in txt and "NAO SEPARA" not in txt)
+    ok("sem linha em comum com a base: sem rótulo de sobreposição",
+       s["vs_base"]["ajuste_pequeno_atomico_p07"]["n_sobrepoe_base"] == 0 and "também estão na base" not in txt)
+    # b2#2 tem argmax bug_logica (é da base) mas p(ajuste_pequeno)=0.9: o grupo atômico ignora o argmax e o pega
+    recs_ov = [dict(r, probabilidades={LIGHT: 0.9}) if r["entity_id"] == "b2#2" else r for r in recs]
+    s_ov = summarize(recs_ov, revs, {}, SemBd(), {}, workers=1)
+    ok("atômico (p>=0.7 ignorando o argmax) pega linha de bug_logica: sobreposição contada e rotulada no texto",
+       s_ov["vs_base"]["ajuste_pequeno_atomico_p07"]["n_sobrepoe_base"] == 1
+       and s_ov["vs_base"]["ajuste_pequeno_p07_estrito"]["n_sobrepoe_base"] == 0
+       and "1 linhas também estão na base" in format_report(s_ov))
+    s_lim = summarize(recs, revs, {}, SemBd(), {}, workers=1, limit=1)
+    ok("--limit: joined é a população inteira, joined_medidas só as N primeiras, e o relatório diz TRUNCADO",
+       s_lim["joined"] == 3 and s_lim["joined_medidas"] == 1 and s_lim["limit"] == 1
+       and "TRUNCADO por --limit 1" in format_report(s_lim))
+    ok("--limit que não trunca nada não rotula",
+       summarize(recs, revs, {}, SemBd(), {}, workers=1, limit=3)["limit"] is None)
+
+    # ── joined == 0: o relatório tem de dizer POR QUÊ (ga-rmzfye gate-fail 1: entrada ilegível ≠ "nada a medir")
+    s_zero = summarize(recs, {}, {}, SemBd(), {}, workers=1)
+    out0 = format_report(s_zero)
+    ok("records>0 e join todo vazio: imprime os motivos e NÃO diz 'nada a medir'",
+       s_zero["joined"] == 0 and s_zero["records"] == len(recs) and "join-sem-par-de-revisoes" in out0
+       and "NADA FOI MEDIDO" in out0 and "nada a medir" not in out0)
+    out_empty = format_report(summarize([], {}, {}, SemBd(), {}, workers=1) | {"inputs": {
+        "jev_log": "/x/jev.jsonl", "jev_linhas": 5, "gate_log": "/x/gate.jsonl", "gate_revisoes": 9}})
+    ok("sombra realmente sem entidades do modo: 'nada a medir', COM os arquivos e as contagens lidas",
+       "nada a medir" in out_empty and "/x/jev.jsonl" in out_empty and "5 linhas JSON" in out_empty)
+
+    # ── entrada ausente/ilegível => InputError / exit != 0 (a mesma coisa que o relatório faz quando SABE != quando NÃO PODE saber)
+    with tempfile.TemporaryDirectory() as td2:
+        d = Path(td2)
+        good_jev = d / "jev.jsonl"
+        good_jev.write_text(json.dumps({"mode": fc.MODE, "experiment": fc.EXPERIMENT, "entity_id": "b1#2", "bead": "b1",
+                                        "attempt": 2, "jev_ok": True}) + "\n")
+        good_gate = d / "gate.jsonl"
+        good_gate.write_text(json.dumps({"event": "dispatcher_complete", "bead": "b1", "gate_run": "g1", "result": "FAIL",
+                                         "reason": real, "ts": "2026-10-01T00:00:00Z", "dry_run": "0"}) + "\n")
+        no_reviews = d / "gate-sem-revisoes.jsonl"
+        no_reviews.write_text(json.dumps({"event": "guard_queued", "marker": "m1", "ts": "2026-10-01T00:00:00Z"}) + "\n")
+        garbage = d / "lixo.jsonl"
+        garbage.write_text("isto não é json\n{quebrado\n")
+        empty_jev = d / "vazio.jsonl"
+        empty_jev.write_text("")
+        missing = str(d / "nao-existe.jsonl")
+
+        def raises(**kw) -> str | None:
+            try:
+                build_summary(gc_city=td2, **kw)
+            except InputError as e:
+                return str(e)
+            return None
+
+        m1 = raises(log=str(good_jev), gate_log=missing)
+        ok("--gate-log inexistente => InputError que nomeia o caminho", m1 is not None and missing in m1)
+        m2 = raises(log=missing, gate_log=str(good_gate))
+        ok("--log inexistente => InputError que nomeia o caminho", m2 is not None and missing in m2)
+        m3 = raises(log=str(good_jev), gate_log=str(no_reviews))
+        ok("entidades no Jev + log do gate sem nenhuma revisão => InputError (não 'nada a medir')",
+           m3 is not None and "nenhuma revisão" in m3)
+        m4 = raises(log=str(garbage), gate_log=str(good_gate))
+        ok("log do Jev com conteúdo mas nenhuma linha JSON legível => InputError", m4 is not None and "nenhuma linha JSON" in m4)
+        m5 = raises(log=str(d), gate_log=str(good_gate))
+        ok("--log apontando pra diretório => InputError", m5 is not None)
+        sv = build_summary(log=str(empty_jev), gate_log=str(good_gate), gc_city=td2)
+        ok("Jev legitimamente vazio + gate com revisões => sem erro, records=0, e as entradas lidas vêm no resumo",
+           sv["records"] == 0 and sv["inputs"]["gate_revisoes"] == 1 and sv["inputs"]["jev_linhas"] == 0)
+
+        # ponta a ponta pelo CLI: stdout VAZIO, stderr explica, exit 2 — nunca exit 0 com texto de relatório
+        me = Path(__file__).resolve()
+        for label, args in (("--gate-log inexistente", ["--log", str(good_jev), "--gate-log", missing]),
+                            ("--log inexistente", ["--log", missing, "--gate-log", str(good_gate)]),
+                            ("--json + --gate-log inexistente", ["--json", "--log", str(good_jev), "--gate-log", missing])):
+            p = subprocess.run([sys.executable, str(me), "--gc-city", td2, *args], capture_output=True, text=True, timeout=60)
+            ok(f"CLI {label}: exit 2, stdout vazio, stderr nomeia o erro (got rc={p.returncode})",
+               p.returncode == 2 and p.stdout == "" and "ERRO:" in p.stderr and "nada a medir" not in p.stdout)
 
     print(f"\n{passed} passed, {failed} failed")
     return 1 if failed else 0
