@@ -330,9 +330,14 @@ unset _PILOT_QHC_SIB
 #     (resources are CONTENDED: Claude quota limited OR Dolt hot OR machine memory tight)
 # Resources ABUNDANT (quota OK AND Dolt calm AND memory not tight) → never defer
 # (dispatch even with a busy gate). Gate empty → never defer. This conditionality is
-# the anti-starvation guarantee: the moment Dolt calms, the quota frees or the
-# machine's memory eases, the Pilot dispatches again, so it can never be starved
-# indefinitely.
+# the anti-starvation guarantee: the moment Dolt calms or the quota frees, the Pilot
+# dispatches again. The memory arm is weaker on its own: swap USED is sticky on macOS
+# (it does not fall when the pressure eases), so that arm can keep reading tight for a
+# long while — what keeps the Pilot from being starved indefinitely is the Gate-has-work
+# conjunct (the Gate's reviewers do not wait for the Pilot, so the queue drains unless the
+# Gate's OWN brakes — pressure 4, swap that cannot grow — hold it; an empty Gate releases
+# the Pilot at once) plus the PILOT_MEMORY_TIGHT_ENABLED=0 kill switch, NOT the memory
+# easing.
 #
 # ga-9e446u — the third arm, MACHINE memory. Quota and Dolt both bound the stages' own
 # load; neither says whether the MACHINE has room for one more live Claude session
@@ -349,10 +354,13 @@ unset _PILOT_QHC_SIB
 # and level 2 cleared by itself in the 25/09 incident (ga-q4fkxa). The used-swap ceiling
 # is the one signal the Gate does not block on; it sits between the measured healthy
 # level (4.9 GB) and the measured starving one (8.2 GB), is cheap to re-tune
-# (PILOT_SWAP_USED_MAX_MB) and cannot starve the Pilot: it only bites while the Gate has
-# work, and a Gate that drains releases it. Every probe is FAIL-OPEN (an unreadable
-# reading is no signal, never a block); PILOT_MEMORY_TIGHT_ENABLED=0 takes the arm out
-# of the predicate entirely.
+# (PILOT_SWAP_USED_MAX_MB) and cannot starve the Pilot indefinitely: it only bites while
+# the Gate has work, and a Gate that drains releases it (see the note above on why the
+# memory easing itself is NOT what releases it). Every probe is FAIL-OPEN (an unreadable
+# reading is no signal, never a block) but never SILENT: a sweep whose probe was blind
+# logs one "Memory signal UNREADABLE" line naming the readings it could not take, so
+# "mem_tight=0" cannot be mistaken for "the machine is fine". PILOT_MEMORY_TIGHT_ENABLED=0
+# takes the arm out of the predicate entirely (and logs nothing: off is not blind).
 #
 # Gated behind CROSS_STAGE_PRIORITY_ENABLED (default 1; =0 → EXACT current
 # behavior, the gate never even probes). FAIL-OPEN: any error / indeterminate
@@ -2350,17 +2358,24 @@ _pilot_swap_field() {
 }
 
 # _pilot_memory_tight — return 0 (tight) / 1 (not tight). Sets PILOT_MEM_TIGHT_REASON
-# ("" | "pressure-4" | "swap-used" | "swap-exhausted", joined with "+" when several fire)
-# and PILOT_MEM_TIGHT_DETAIL (the readings, for the log line). Called DIRECTLY, never in
-# $(...), so both globals survive — the same shape as _dolt_saturated/DOLT_SAT_REASON.
+# ("" | "pressure-4" | "swap-used" | "swap-exhausted", joined with "+" when several fire),
+# PILOT_MEM_TIGHT_DETAIL (the readings, for the log line) and PILOT_MEM_TIGHT_BLIND (the
+# readings it could NOT take, comma-joined from swap_used,swap_free,pressure; "" = all taken).
+# Called DIRECTLY, never in $(...), so the globals survive — the same shape as
+# _dolt_saturated/DOLT_SAT_REASON.
 # FAIL-OPEN: every reading that is empty or non-numeric is no signal, so a blind probe
 # can never wedge the Pilot (the opposite of _dolt_saturated on purpose: an unreadable
 # sysctl says nothing about the machine, where a blind Dolt probe usually means Dolt IS
-# the problem). PILOT_MEMORY_TIGHT_ENABLED=0 → never tight, nothing probed. The thresholds
-# and why level 2 / low free swap alone never count are in the cross-stage header above.
+# the problem). Fail-open is NOT silent, though: a "not tight" returned from a blind probe
+# means UNKNOWN, not "fine", and PILOT_MEM_TIGHT_BLIND is how the caller tells the two apart
+# (ga-9e446u gate round 1 — without it a macOS sysctl-format change would turn the whole arm
+# into a no-op with no trace). PILOT_MEMORY_TIGHT_ENABLED=0 → never tight, nothing probed,
+# blind list empty (off is not blind). The thresholds and why level 2 / low free swap alone
+# never count are in the cross-stage header above.
 _pilot_memory_tight() {
   PILOT_MEM_TIGHT_REASON=""
   PILOT_MEM_TIGHT_DETAIL=""
+  PILOT_MEM_TIGHT_BLIND=""
   [ "$PILOT_MEMORY_TIGHT_ENABLED" = "1" ] || return 1
   local _used _free _lvl _disk="" _reason=""
   _used="$PILOT_SWAP_USED_OVERRIDE_MB"; [ -n "$_used" ] || _used="$(_pilot_swap_field used)"
@@ -2370,6 +2385,13 @@ _pilot_memory_tight() {
   case "$_used" in ''|*[!0-9]*) _used="" ;; esac
   case "$_free" in ''|*[!0-9]*) _free="" ;; esac
   case "$_lvl" in 1|2|4) ;; *) _lvl="" ;; esac
+  # vazio/ilegível (a reading that is empty, non-numeric or not a kernel level, normalised to "" above)
+  # → it is named in PILOT_MEM_TIGHT_BLIND and contributes no signal (fail-open); a readable value —
+  # including 0 — is a reading and is never named. disk_free is not listed: it is read only when free
+  # swap is already low, so "n/a" there is by design, not blindness.
+  [ -n "$_used" ] || PILOT_MEM_TIGHT_BLIND="swap_used"
+  [ -n "$_free" ] || PILOT_MEM_TIGHT_BLIND="${PILOT_MEM_TIGHT_BLIND:+$PILOT_MEM_TIGHT_BLIND,}swap_free"
+  [ -n "$_lvl" ]  || PILOT_MEM_TIGHT_BLIND="${PILOT_MEM_TIGHT_BLIND:+$PILOT_MEM_TIGHT_BLIND,}pressure"
   if [ "$_lvl" = "4" ]; then _reason="pressure-4"; fi
   if [ -n "$_used" ] && [ "$_used" -gt "$PILOT_SWAP_USED_MAX_MB" ]; then
     _reason="${_reason:+$_reason+}swap-used"
@@ -5264,7 +5286,7 @@ fi
 # freely (parallel — the pools differ). DEFER this sweep (dispatch nothing, mutate
 # no marker — identical shape to the quota PAUSE above) IFF:
 #       gate is CONGESTED  (queued markers > 0 OR runs in review > 0)
-#   AND resources CONTENDED (Claude quota limited OR Dolt hot)
+#   AND resources CONTENDED (Claude quota limited OR Dolt hot OR machine memory tight — ga-9e446u)
 #
 # Note on the quota arm: the quota PAUSE above already exited the sweep when the
 # 5h window is exhausted, so reaching HERE means quota is OK. The resource-contended
@@ -5275,8 +5297,10 @@ fi
 #
 # Anti-starvation: the defer is CONDITIONAL on (gate-has-work AND resource-tight).
 # It NEVER fires when resources are abundant, so the moment Dolt calms (or the
-# quota frees) the Pilot dispatches — it can never be starved indefinitely. Gate
-# empty → never defer. FAIL-OPEN: _pilot_gate_congested returns "0" on any error.
+# quota frees) the Pilot dispatches. The memory arm does not release that fast (swap
+# USED is sticky on macOS): there the release is the Gate emptying, which it does on its
+# own, or the PILOT_MEMORY_TIGHT_ENABLED=0 kill switch. Gate empty → never defer.
+# FAIL-OPEN: _pilot_gate_congested returns "0" on any error.
 # Gated behind CROSS_STAGE_PRIORITY_ENABLED (=0 → this whole block is skipped =
 # exact pre-ga-d0hz3 behavior).
 if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
@@ -5286,6 +5310,12 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   # box has RAM for another session; 8.2 GB of swap with the Gate backed up starved it.
   _xstage_mem_tight=0
   if _pilot_memory_tight; then _xstage_mem_tight=1; fi
+  # A blind memory probe fails OPEN (mem_tight stays 0, dispatch proceeds) but must not look like
+  # "confirmed fine": this line is what tells them apart in the log. Same shape as the RAM-pressure /
+  # drain-window / quiet-hours UNREADABLE lines above (ga-m2gqb / ga-a2v0bz / ga-dxyvxr).
+  if [ -n "${PILOT_MEM_TIGHT_BLIND:-}" ]; then
+    log "Memory signal UNREADABLE (${PILOT_MEM_TIGHT_BLIND}) — fail-open: the memory arm decided on the readings it COULD take (mem_tight=${_xstage_mem_tight}); a 0 here means UNKNOWN for the rest, not 'the machine is fine' (ga-9e446u)."
+  fi
   _xstage_resource_tight=0
   { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ] || [ "$_xstage_mem_tight" = "1" ]; } \
     && _xstage_resource_tight=1
@@ -5295,7 +5325,7 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   if [ "$_xstage_resource_tight" = "1" ]; then
     _xstage_gate_congested="$(_pilot_gate_congested)"      # "1"/"0" (fail-open "0")
     if [ "$_xstage_gate_congested" = "1" ]; then
-      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}${PILOT_MEM_TIGHT_REASON:+ [$PILOT_MEM_TIGHT_REASON]}; ${PILOT_MEM_TIGHT_DETAIL}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees / memory eases. Most-advanced-first."
+      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}${PILOT_MEM_TIGHT_REASON:+ [$PILOT_MEM_TIGHT_REASON]}; ${PILOT_MEM_TIGHT_DETAIL}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees / the Gate drains (swap used is sticky, so memory alone may stay tight until it does). Most-advanced-first."
       notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}, mem_tight=${_xstage_mem_tight}). Retoma quando o recurso aliviar (ga-d0hz3, ga-9e446u)." 2>/dev/null || true
       _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}"
       log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="

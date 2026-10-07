@@ -4398,17 +4398,38 @@ case "$GATE_SPAWN_DOLT_WAIT_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_WAIT_SECS=60 ;
 case "$GATE_SPAWN_DOLT_POLL_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_POLL_SECS=10 ;; esac
 [ "$GATE_SPAWN_DOLT_POLL_SECS" -ge 1 ] || GATE_SPAWN_DOLT_POLL_SECS=1   # 0 would divide by zero in the poll-count bound
 # SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN
-# gate_dolt_ready_verdict → "ready" | "hot" | "unreadable". "ready" = `gc dolt health --json`
-# answered with a numeric server.latency_ms at or under GATE_DOLT_LATENCY_HOT_MS (the same
-# ceiling the headroom gate uses); "hot" = it answered but slower; "unreadable" = it did not
-# answer / answered junk. Called in $(...): prints the verdict only, never logs. Unlike the
-# headroom probe, unreadable is NOT "no signal, proceed" here: this runs only right after a
-# spawn failed on a Dolt connection error, where a `gc dolt health` that cannot answer is the
-# same outage, and the wait it buys is capped (see above). `gc dolt health` takes the city via
-# the GC_CITY env var, not --city.
+# gate_dolt_ready_verdict → "ready" | "hot" | "down" | "unreadable". Only "ready" ends the wait.
+#   ready      `gc dolt health --json` says server.reachable == true (its bounded SELECT 1 got an answer)
+#              AND a numeric server.latency_ms at or under GATE_DOLT_LATENCY_HOT_MS (the same ceiling the
+#              headroom gate uses)
+#   hot        reachable, but slower than that ceiling
+#   down       server.reachable == false: the server is gone, or TCP is up and SQL is wedged (the very
+#              "invalid connection" window this wait exists for)
+#   unreadable the command failed / printed junk / the payload has no boolean server.reachable — we cannot
+#              say Dolt answered
+# WHY reachable and not latency alone: in JSON mode `gc dolt health` ALWAYS exits 0 and starts
+# server_latency at 0, overwriting it only after the SELECT 1 succeeds (packs/dolt/commands/health/
+# run.sh L115-116, L161-165, L663-664) — so a dead or wedged Dolt prints latency_ms:0, which is <= the
+# ceiling. A verdict that decides on latency_ms alone reads the outage as "ready" (ga-9e446u gate round 1).
+# Called in $(...): prints the verdict only, never logs. Unlike the headroom probe, an unanswered probe is
+# NOT "no signal, proceed" here: this runs only right after a spawn failed on a Dolt connection error,
+# where a `gc dolt health` that cannot answer is the same outage, and the wait it buys is capped (see
+# above). `gc dolt health` takes the city via the GC_CITY env var, not --city.
 gate_dolt_ready_verdict() {
-  local _h="" _lat=""
+  local _h="" _reach="" _lat=""
+  # vazio → _h="" and the case below says unreadable; falhou/ilegível (timeout, exit!=0, ok:false envelope,
+  # junk) → the same _h="" → unreadable. Neither can ever read as "ready".
   _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || _h=""
+  # vazio (no boolean .server.reachable) → _reach="" → unreadable; falhou/ilegível (jq error) → _reach=""
+  # → unreadable. NOT `.server.reachable // empty`: jq's // treats `false` as missing, which would turn the
+  # down case into the unreadable case and lose the distinction the log line below depends on.
+  _reach=$(printf '%s' "$_h" | jq -r 'if (.server.reachable | type) == "boolean" then (.server.reachable | tostring) else empty end' 2>/dev/null) || _reach=""
+  case "$_reach" in
+    true) ;;
+    false) printf 'down'; return 0 ;;
+    *) printf 'unreadable'; return 0 ;;
+  esac
+  # vazio (reachable but no latency) → _lat="" → unreadable; falhou/ilegível → _lat="" → unreadable.
   _lat=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null) || _lat=""
   case "$_lat" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
   if [ "$_lat" -le "${GATE_DOLT_LATENCY_HOT_MS:-2500}" ]; then printf 'ready'; else printf 'hot'; fi

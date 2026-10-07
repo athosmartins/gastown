@@ -900,6 +900,8 @@ run_lanefull() {
 #                                       so the real probe is blind too = fail-open)
 #   $8 = PILOT_MEMORY_TIGHT_ENABLED    (default 1; 0 = the ga-9e446u kill switch)
 #   $9 = PILOT_KERN_PRESSURE_OVERRIDE  (ga-9e446u: kernel memory-pressure level 1/2/4)
+#  $10 = PILOT_SWAP_FREE_OVERRIDE_MB   (ga-9e446u: free swap, MB; "" = no reading. With $7
+#                                       and $9 also set, NO memory reading is blind)
 run_ctxready() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -923,6 +925,7 @@ run_ctxready() {
     PILOT_SWAP_USED_OVERRIDE_MB="${7:-}" \
     PILOT_MEMORY_TIGHT_ENABLED="${8:-1}" \
     PILOT_KERN_PRESSURE_OVERRIDE="${9:-}" \
+    PILOT_SWAP_FREE_OVERRIDE_MB="${10:-}" \
     FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -5224,13 +5227,56 @@ if echo "$LOG20DMD" | grep "Cross-stage YIELD" >/dev/null; then
 else
   ok "kill switch off → the memory arm is out of the predicate"
 fi
+if echo "$LOG20DMD" | grep "Memory signal UNREADABLE" >/dev/null; then
+  bad "kill switch off still logged a blind memory probe — OFF is not blind, nothing was probed"
+else
+  ok "kill switch off → no 'Memory signal UNREADABLE' line (off is not blind)"
+fi
 
-echo "Scenario 20d-mem-e: no memory reading at all → fail-OPEN, the Pilot dispatches"
+echo "Scenario 20d-mem-e: no memory reading at all → fail-OPEN (the Pilot dispatches) but NOT SILENT"
 LOG20DME="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "")"
 if echo "$LOG20DME" | grep "Cross-stage YIELD" >/dev/null; then
   bad "yielded with NO memory reading — an unreadable probe must never wedge the Pilot"
 else
   ok "unreadable memory probe → no yield (fail-open)"
+fi
+# Round 1 of the gate asserted the SILENCE here as the desired outcome. Fail-open is right; invisible is the
+# defect: with every reading blind, "mem_tight=0" and "the machine is fine" were the same log.
+if echo "$LOG20DME" | grep "Memory signal UNREADABLE (swap_used,swap_free,pressure)" >/dev/null; then
+  ok "a fully blind memory probe is on the record, naming every reading it could not take"
+else
+  bad "a fully blind memory probe left no 'Memory signal UNREADABLE (swap_used,swap_free,pressure)' line — blind and fine look the same"
+fi
+if echo "$LOG20DME" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "…and it still dispatched: the visibility line is not a block"
+else
+  bad "a blind memory probe stopped the dispatch — it must fail OPEN"
+fi
+
+echo "Scenario 20d-mem-e2: every memory reading taken (4.9 GB used, 3 GB free, pressure 1) → quiet, no UNREADABLE line"
+LOG20DME2="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 4900 1 1 3000)"
+if echo "$LOG20DME2" | grep "Memory signal UNREADABLE" >/dev/null; then
+  bad "logged a blind probe although all three memory readings were taken (log spam hides the real signal)"
+else
+  ok "all readings taken → no 'Memory signal UNREADABLE' line"
+fi
+if echo "$LOG20DME2" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "healthy machine + fully readable probe → dispatched"
+else
+  bad "did not dispatch on a healthy, fully readable machine"
+fi
+
+echo "Scenario 20d-mem-e3: tight on one reading (8.4 GB used) while two are blind → YIELDS, and says what it could not see"
+LOG20DME3="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400)"
+if echo "$LOG20DME3" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "a partly blind probe that CAN see swap pressure still yields"
+else
+  bad "a partly blind probe ignored the readable 8.4 GB of swap"
+fi
+if echo "$LOG20DME3" | grep "Memory signal UNREADABLE (swap_free,pressure)" >/dev/null; then
+  ok "…and names exactly the two readings it could not take"
+else
+  bad "the partly blind sweep did not name (swap_free,pressure) as unreadable"
 fi
 
 echo "Scenario 20d-mem-f: kernel pressure level 4 (critical) → YIELD; level 2 (warn) alone → dispatch"

@@ -646,8 +646,11 @@ export -f gc_json_or_unknown
 WAIT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gate-spawn-dolt-wait-selftest.XXXXXX")"
 trap 'rm -rf "$WAIT_TMP"' EXIT
 # The child's mocks. PROBE_SEQ is a space-separated list of what the Nth `gc dolt health` answers
-# (the last word repeats): ok = latency 120ms | hot = latency 9000ms | junk = exit 0 with non-JSON |
-# down = connection refused, exit 1. SPAWN_OK_AT = the Nth `gc session new` that succeeds (unset =
+# (the last word repeats): ok = reachable, latency 120ms | hot = reachable, latency 9000ms | edge =
+# reachable, latency $EDGE_MS | down = the REAL down payload (exit 0, running:false reachable:false
+# latency_ms:0) | hung = TCP up but SQL wedged (running:true reachable:false latency_ms:0) | nofield =
+# a payload with no `reachable` key at all | junk = exit 0 with non-JSON | refused = the command itself
+# exits 1. SPAWN_OK_AT = the Nth `gc session new` that succeeds (unset =
 # never). SLEEP_ADVANCE = make each mocked sleep advance $SECONDS by N x its argument, to model
 # real time passing (a stalled probe) without really sleeping.
 cat > "$WAIT_TMP/prelude.sh" <<'PRELUDE'
@@ -670,12 +673,21 @@ gc() {
       else
         _pw="$(_nth "$PROBE_SEQ" "$_pn")"
       fi
+      # Every shape below is what `gc dolt health --json` REALLY prints (packs/dolt/commands/health/run.sh:
+      # server_latency starts at 0 and server_reachable at false, both overwritten only after the bounded
+      # SELECT 1 succeeds; JSON mode exits 0 unconditionally, L663-664). So a DOWN Dolt is exit 0 +
+      # reachable:false + latency_ms:0 — NOT a failing command (ga-9e446u gate round 1: the first mock
+      # modelled "down" as exit 1 + "connection refused", a shape --json never emits, and 87 checks
+      # passed against code that read a down Dolt as "ready").
       case "$_pw" in
-        ok)   printf '{"server":{"latency_ms":120,"pid":1}}' ;;
-        hot)  printf '{"server":{"latency_ms":9000,"pid":1}}' ;;
-        edge) printf '{"server":{"latency_ms":%s,"pid":1}}' "${EDGE_MS:-2500}" ;;
-        junk) printf 'not json at all' ;;
-        *)    echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; return 1 ;;
+        ok)      printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":120}}' ;;
+        hot)     printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":9000}}' ;;
+        edge)    printf '{"server":{"running":true,"reachable":true,"pid":1,"port":52756,"latency_ms":%s}}' "${EDGE_MS:-2500}" ;;
+        down)    printf '{"server":{"running":false,"reachable":false,"pid":0,"port":52756,"latency_ms":0}}' ;;
+        hung)    printf '{"server":{"running":true,"reachable":false,"pid":1,"port":52756,"latency_ms":0}}' ;;
+        nofield) printf '{"server":{"running":true,"pid":1,"port":52756,"latency_ms":120}}' ;;
+        junk)    printf 'not json at all' ;;
+        *)       echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; return 1 ;;   # refused = the COMMAND itself fails
       esac ;;
     *"session new"*)
       echo s >> "$SPAWNS"
@@ -714,6 +726,25 @@ run_wait() {
   { cat "$WAIT_TMP/prelude.sh"; printf '%s\n' "$WAIT_BLOCK"; printf '%s\n' "$RETRY_BLOCK"; cat "$WAIT_TMP/tail.sh"; } > "$WAIT_TMP/child.sh"
   env SC_WORK="$WAIT_TMP" PROBE_SEQ="$_seq" "$@" bash "$WAIT_TMP/child.sh" 2>/dev/null || true   # a killed (runaway) child = empty summary = a failed check, not a dead selftest
 }
+# run_verdict <probe_word> → what the REAL gate_dolt_ready_verdict prints for ONE `gc dolt health`
+# answer of that shape. The pointed check: when this fails the defect is in the verdict, not in the loop.
+run_verdict() {
+  { cat "$WAIT_TMP/prelude.sh"; printf '%s\n' "$WAIT_BLOCK"; printf '%s\n' 'gate_dolt_ready_verdict'; } > "$WAIT_TMP/verdict.sh"
+  env SC_WORK="$WAIT_TMP" PROBE_SEQ="$1" "${@:2}" bash "$WAIT_TMP/verdict.sh" 2>/dev/null || true
+}
+
+# (v) THE VERDICT, shape by shape. The variable the verdict DECIDES on must be the variable that says Dolt
+# ANSWERED (server.reachable), not only the number that is 0 when it did not (latency_ms). ga-9e446u gate
+# round 1: a down Dolt printed "ready" here, so the whole wait was a no-op in the outage it exists for.
+eq "(v1) reachable, 120ms → ready" "$(run_verdict ok)" "ready"
+eq "(v2) reachable, 9000ms → hot" "$(run_verdict hot)" "hot"
+eq "(v3) the REAL down payload (running:false reachable:false latency_ms:0) → down, NOT ready" "$(run_verdict down)" "down"
+eq "(v4) TCP up but SQL wedged (running:true reachable:false latency_ms:0) → down, NOT ready" "$(run_verdict hung)" "down"
+eq "(v5) a payload with no reachable key can't say Dolt answered → unreadable, NOT ready" "$(run_verdict nofield)" "unreadable"
+eq "(v6) non-JSON → unreadable" "$(run_verdict junk)" "unreadable"
+eq "(v7) the command itself fails (exit 1) → unreadable" "$(run_verdict refused)" "unreadable"
+eq "(v8) reachable, exactly the ceiling → ready" "$(run_verdict edge EDGE_MS=2500)" "ready"
+eq "(v9) reachable, one over the ceiling → hot" "$(run_verdict edge EDGE_MS=2501)" "hot"
 
 # (g) THE FIX: Dolt is down for the first two probes, then answers. The retry must WAIT (two 10s
 # polls after the 3s backoff) and then spawn once, successfully — on HEAD~ the loop retried straight
@@ -761,6 +792,19 @@ OUT=$(run_wait "edge edge" SPAWN_OK_AT=1 EDGE_MS=2501 KNOB_WAIT=10 KNOB_POLL=10)
 case "$OUT" in
   "SESSION_ID=sess-recovered SPAWNS=1 PROBES=2 "*) ok "(h4) latency 2501ms is hot: waited the one poll the 10s budget allows, then retried anyway: $OUT" ;;
   *) bad "(h4) expected 2 probes (hot, then give up and retry), got: $OUT" ;;
+esac
+OUT=$(run_wait "hung hung ok" SPAWN_OK_AT=1)
+eq "(h5) TCP up but SQL wedged (reachable:false, latency 0) is not ready: waits until it answers" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+OUT=$(run_wait "refused refused ok" SPAWN_OK_AT=1)
+eq "(h6) a \`gc dolt health\` that exits 1 is not ready either (the command-fails shape)" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+OUT=$(run_wait "nofield nofield ok" SPAWN_OK_AT=1)
+eq "(h7) a payload without server.reachable is not ready even with latency 120: waits" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+# (h8) the wait's LOG must say Dolt was DOWN. Round 1 left no line at all when the wait was skipped, so the
+# log read "Dolt was fine, the spawn failed anyway" — the opposite of what happened.
+run_wait "down down ok" SPAWN_OK_AT=1 >/dev/null
+case "$(cat "$WAIT_TMP/warns" 2>/dev/null)" in
+  *"Dolt down — waiting"*) ok "(h8) a down Dolt is LOGGED as down while the retry waits" ;;
+  *) bad "(h8) the wait logged no 'Dolt down — waiting' line: $(tr '\n' '|' < "$WAIT_TMP/warns" 2>/dev/null)" ;;
 esac
 
 # (i) NON-REGRESSION: Dolt healthy from the start → no extra sleep at all, the ladder is exactly
