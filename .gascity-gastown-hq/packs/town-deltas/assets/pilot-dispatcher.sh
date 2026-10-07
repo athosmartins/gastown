@@ -327,11 +327,32 @@ unset _PILOT_QHC_SIB
 # IFF:
 #     (gate is CONGESTED: gate-status:queued markers > 0 OR gate-runs in review > 0)
 #   AND
-#     (resources are CONTENDED: Claude quota limited OR Dolt hot)
-# Resources ABUNDANT (quota OK AND Dolt calm) → never defer (dispatch even with a
-# busy gate). Gate empty → never defer. This conditionality is the anti-starvation
-# guarantee: the moment Dolt calms or the quota frees, the Pilot dispatches again,
-# so it can never be starved indefinitely.
+#     (resources are CONTENDED: Claude quota limited OR Dolt hot OR machine memory tight)
+# Resources ABUNDANT (quota OK AND Dolt calm AND memory not tight) → never defer
+# (dispatch even with a busy gate). Gate empty → never defer. This conditionality is
+# the anti-starvation guarantee: the moment Dolt calms, the quota frees or the
+# machine's memory eases, the Pilot dispatches again, so it can never be starved
+# indefinitely.
+#
+# ga-9e446u — the third arm, MACHINE memory. Quota and Dolt both bound the stages' own
+# load; neither says whether the MACHINE has room for one more live Claude session
+# (the Gate's reviewers and the Pilot's wa-workers are all sessions on the same RAM).
+# With Dolt calm and the Gate backed up behind 8.2 GB of swap, "resources tight" read
+# false, the Pilot kept opening workers and the Gate starved — the Mayor faked the
+# signal with PILOT_DOLT_CPU_MAX=120 in the plist. The arm is tight iff ANY of:
+#   - kernel memory pressure is 4 (critical)            — the gate's own block signal
+#   - free swap < PILOT_SWAP_FREE_FLOOR_MB AND disk free < PILOT_SWAP_GROW_DISK_MIN_MB
+#                                                       — the gate's own block signal
+#                                                         (swap that cannot grow, ga-q4fkxa)
+#   - swap USED > PILOT_SWAP_USED_MAX_MB                — the Pilot-side ceiling
+# Level 2 and a low free-swap reading ALONE never count: macOS grows swapfiles on demand
+# and level 2 cleared by itself in the 25/09 incident (ga-q4fkxa). The used-swap ceiling
+# is the one signal the Gate does not block on; it sits between the measured healthy
+# level (4.9 GB) and the measured starving one (8.2 GB), is cheap to re-tune
+# (PILOT_SWAP_USED_MAX_MB) and cannot starve the Pilot: it only bites while the Gate has
+# work, and a Gate that drains releases it. Every probe is FAIL-OPEN (an unreadable
+# reading is no signal, never a block); PILOT_MEMORY_TIGHT_ENABLED=0 takes the arm out
+# of the predicate entirely.
 #
 # Gated behind CROSS_STAGE_PRIORITY_ENABLED (default 1; =0 → EXACT current
 # behavior, the gate never even probes). FAIL-OPEN: any error / indeterminate
@@ -342,6 +363,20 @@ unset _PILOT_QHC_SIB
 # real bead store. Never set in prod.
 CROSS_STAGE_PRIORITY_ENABLED="${CROSS_STAGE_PRIORITY_ENABLED:-1}"
 PILOT_GATE_CONGESTED_OVERRIDE="${PILOT_GATE_CONGESTED_OVERRIDE:-}"
+# ga-9e446u: the machine-memory arm of the resource-tight predicate (see header above).
+# The four *_OVERRIDE* values are TEST-ONLY seams (no live sysctl/df), mirroring the
+# gate's GATE_SWAP_FREE_OVERRIDE_MB family. Never set in prod.
+PILOT_MEMORY_TIGHT_ENABLED="${PILOT_MEMORY_TIGHT_ENABLED:-1}"
+PILOT_SWAP_USED_MAX_MB="${PILOT_SWAP_USED_MAX_MB:-7168}"
+PILOT_SWAP_FREE_FLOOR_MB="${PILOT_SWAP_FREE_FLOOR_MB:-512}"
+PILOT_SWAP_GROW_DISK_MIN_MB="${PILOT_SWAP_GROW_DISK_MIN_MB:-4096}"
+case "$PILOT_SWAP_USED_MAX_MB"      in ''|*[!0-9]*) PILOT_SWAP_USED_MAX_MB=7168 ;; esac
+case "$PILOT_SWAP_FREE_FLOOR_MB"    in ''|*[!0-9]*) PILOT_SWAP_FREE_FLOOR_MB=512 ;; esac
+case "$PILOT_SWAP_GROW_DISK_MIN_MB" in ''|*[!0-9]*) PILOT_SWAP_GROW_DISK_MIN_MB=4096 ;; esac
+PILOT_SWAP_USED_OVERRIDE_MB="${PILOT_SWAP_USED_OVERRIDE_MB:-}"
+PILOT_SWAP_FREE_OVERRIDE_MB="${PILOT_SWAP_FREE_OVERRIDE_MB:-}"
+PILOT_DISK_FREE_OVERRIDE_MB="${PILOT_DISK_FREE_OVERRIDE_MB:-}"
+PILOT_KERN_PRESSURE_OVERRIDE="${PILOT_KERN_PRESSURE_OVERRIDE:-}"
 
 # ── Stale in-flight slot correction (ga-rk5va adversarial constraint c) ────────
 # A story:in-flight bead normally occupies a builder slot. But a session can hang
@@ -2298,6 +2333,61 @@ _pilot_gate_congested() {
   if [ -n "$_n" ] && [ "$_n" -gt 0 ] 2>/dev/null; then printf '1'; return 0; fi
   # No queued markers, no running runs, or indeterminate → not congested / fail-open.
   printf '0'; return 0
+}
+
+# ── ga-9e446u: machine-memory arm of the cross-stage resource-tight predicate ──
+# _pilot_swap_field <used|free> → integer MB from `sysctl vm.swapusage`, or "" when
+# unreadable. macOS-only host fleet, so no cross-platform fallback. Duplicated from the
+# gate's gate_swap_free_mb (+ the "used" half) rather than shared, per this file's
+# convention for the pilot/gate readers. Fail-soft: a missing sysctl, a failed pipeline
+# or an unparseable line is "" — never a wrong number (`|| _v=""` because of set -e/pipefail).
+_pilot_swap_field() {
+  local _v=""
+  _v=$(sysctl -n vm.swapusage 2>/dev/null | sed -n "s/.*$1 *= *\\([0-9.]*\\)M.*/\\1/p") || _v=""
+  [ -n "$_v" ] || { printf ''; return 0; }
+  awk -v v="$_v" 'BEGIN{printf "%d", v}' 2>/dev/null || printf ''
+  return 0
+}
+
+# _pilot_memory_tight — return 0 (tight) / 1 (not tight). Sets PILOT_MEM_TIGHT_REASON
+# ("" | "pressure-4" | "swap-used" | "swap-exhausted", joined with "+" when several fire)
+# and PILOT_MEM_TIGHT_DETAIL (the readings, for the log line). Called DIRECTLY, never in
+# $(...), so both globals survive — the same shape as _dolt_saturated/DOLT_SAT_REASON.
+# FAIL-OPEN: every reading that is empty or non-numeric is no signal, so a blind probe
+# can never wedge the Pilot (the opposite of _dolt_saturated on purpose: an unreadable
+# sysctl says nothing about the machine, where a blind Dolt probe usually means Dolt IS
+# the problem). PILOT_MEMORY_TIGHT_ENABLED=0 → never tight, nothing probed. The thresholds
+# and why level 2 / low free swap alone never count are in the cross-stage header above.
+_pilot_memory_tight() {
+  PILOT_MEM_TIGHT_REASON=""
+  PILOT_MEM_TIGHT_DETAIL=""
+  [ "$PILOT_MEMORY_TIGHT_ENABLED" = "1" ] || return 1
+  local _used _free _lvl _disk="" _reason=""
+  _used="$PILOT_SWAP_USED_OVERRIDE_MB"; [ -n "$_used" ] || _used="$(_pilot_swap_field used)"
+  _free="$PILOT_SWAP_FREE_OVERRIDE_MB"; [ -n "$_free" ] || _free="$(_pilot_swap_field free)"
+  _lvl="$PILOT_KERN_PRESSURE_OVERRIDE"
+  if [ -z "$_lvl" ]; then _lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || _lvl=""; fi
+  case "$_used" in ''|*[!0-9]*) _used="" ;; esac
+  case "$_free" in ''|*[!0-9]*) _free="" ;; esac
+  case "$_lvl" in 1|2|4) ;; *) _lvl="" ;; esac
+  if [ "$_lvl" = "4" ]; then _reason="pressure-4"; fi
+  if [ -n "$_used" ] && [ "$_used" -gt "$PILOT_SWAP_USED_MAX_MB" ]; then
+    _reason="${_reason:+$_reason+}swap-used"
+  fi
+  # Free swap only means "no room" when the swapfiles also cannot grow (disk full). The
+  # disk is read only when free swap is already low — df is the one probe worth skipping.
+  if [ -n "$_free" ] && [ "$_free" -lt "$PILOT_SWAP_FREE_FLOOR_MB" ]; then
+    _disk="$PILOT_DISK_FREE_OVERRIDE_MB"
+    if [ -z "$_disk" ]; then _disk=$(df -Pm /private/var/vm 2>/dev/null | awk 'NR==2 {print $4}') || _disk=""; fi
+    case "$_disk" in ''|*[!0-9]*) _disk="" ;; esac
+    if [ -n "$_disk" ] && [ "$_disk" -lt "$PILOT_SWAP_GROW_DISK_MIN_MB" ]; then
+      _reason="${_reason:+$_reason+}swap-exhausted"
+    fi
+  fi
+  PILOT_MEM_TIGHT_DETAIL="swap_used=${_used:-?}MB swap_free=${_free:-?}MB disk_free=${_disk:-n/a}MB pressure=${_lvl:-?}"
+  PILOT_MEM_TIGHT_REASON="$_reason"
+  [ -n "$_reason" ] && return 0
+  return 1
 }
 
 # ── wa-u5r1: candidate-filter helpers + dispatchable-queue emit (relocated up) ─
@@ -5192,8 +5282,12 @@ fi
 if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   _xstage_quota_limited="$(_pilot_quota_limited)"          # "1"/"0" (fail-open "0")
   _xstage_dolt_hot="${PILOT_DOLT_SATURATED_AT_START:-0}"   # "1"/"0" (fail-safe "1")
+  # ga-9e446u: the machine-memory arm. Dolt calm + quota OK says nothing about whether the
+  # box has RAM for another session; 8.2 GB of swap with the Gate backed up starved it.
+  _xstage_mem_tight=0
+  if _pilot_memory_tight; then _xstage_mem_tight=1; fi
   _xstage_resource_tight=0
-  { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ]; } \
+  { [ "$_xstage_quota_limited" = "1" ] || [ "$_xstage_dolt_hot" = "1" ] || [ "$_xstage_mem_tight" = "1" ]; } \
     && _xstage_resource_tight=1
   # Only pay for the gate-congestion bead query when resources are actually tight —
   # when resources are abundant we dispatch regardless, so the probe is pointless
@@ -5201,13 +5295,13 @@ if [ "$CROSS_STAGE_PRIORITY_ENABLED" = "1" ]; then
   if [ "$_xstage_resource_tight" = "1" ]; then
     _xstage_gate_congested="$(_pilot_gate_congested)"      # "1"/"0" (fail-open "0")
     if [ "$_xstage_gate_congested" = "1" ]; then
-      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees. Most-advanced-first."
-      notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}). Retoma quando o recurso aliviar (ga-d0hz3)." 2>/dev/null || true
-      _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}"
+      warn "Cross-stage YIELD (ga-d0hz3): Gate is CONGESTED and resources are CONTENDED (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}${PILOT_MEM_TIGHT_REASON:+ [$PILOT_MEM_TIGHT_REASON]}; ${PILOT_MEM_TIGHT_DETAIL}) — DEFERRING new builds this sweep so the more-advanced Gate stage can drain first. Approved stories stay queued; auto-resumes when Dolt calms / quota frees / memory eases. Most-advanced-first."
+      notify -t "⏸️ Pilot cede ao Gate" -p 2 "Pilot adiou despachar builds novos — Gate congestionado + recurso contido (dolt_hot=${_xstage_dolt_hot}, quota_limited=${_xstage_quota_limited}, mem_tight=${_xstage_mem_tight}). Retoma quando o recurso aliviar (ga-d0hz3, ga-9e446u)." 2>/dev/null || true
+      _pilot_write_sweep_pause_state 1 "cross-stage-yield" "gate_congested=1 quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}"
       log "=== Pilot sweep complete: dispatched=0 (deferred: cross-stage gate-congested + resource-contended, ga-d0hz3) ==="
       exit 0
     fi
-    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot}) but Gate NOT congested — dispatching normally."
+    log "Cross-stage check (ga-d0hz3): resources contended (quota_limited=${_xstage_quota_limited} dolt_hot=${_xstage_dolt_hot} mem_tight=${_xstage_mem_tight}) but Gate NOT congested — dispatching normally."
   fi
 fi
 # ga-nq0jo: reaching here means neither whole-sweep pause fired this cycle —

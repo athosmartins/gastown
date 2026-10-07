@@ -4375,6 +4375,69 @@ GATE_SPAWN_RETRY_MAX="${GATE_SPAWN_RETRY_MAX:-3}"                           # in
 GATE_SPAWN_RETRY_BACKOFF_SECS="${GATE_SPAWN_RETRY_BACKOFF_SECS:-3}"         # BASE backoff; doubles per attempt (see spawn-retry-loop)
 GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS="${GATE_SPAWN_TRANSIENT_MAX_ATTEMPTS:-3}" # cross-sweep cap before parking at gate-status:error
 
+# ga-9e446u (part 2): wait for Dolt to answer BEFORE each in-process spawn retry, instead of
+# only sleeping a fixed doubling backoff. Measured on the live log: of 15 reviewer spawns that
+# needed a retry, 8 still aborted after all 3 — each failed `gc session new` takes 15-70s and
+# the Dolt-connection windows behind them last ~4 minutes, so a 3s/6s/12s backoff (21s) re-asks
+# a Dolt that is still down, three times, then burns the run and bumps gate-spawn-abort-count
+# (3 in a row pages the Mayor as a systemic outage — for what was one slow Dolt). Raising the
+# fixed backoff to "3x 20s" would still sit inside the window; asking Dolt whether it is back
+# is the signal the retry actually needs.
+#   GATE_SPAWN_DOLT_WAIT_SECS   per-retry budget of the wait (default 60; 0 = off, the exact
+#                               pre-ga-9e446u loop: backoff only, `gc dolt health` never asked)
+#   GATE_SPAWN_DOLT_POLL_SECS   pause between two readiness probes (default 10)
+# BOUNDED twice over: by a poll count (budget / poll interval) AND by the wall clock ($SECONDS),
+# so a probe that stalls to its 15s timeout eats into the budget instead of stretching it. When
+# the budget runs out the retry happens ANYWAY — the wait only ever delays an attempt, it never
+# replaces one or adds one. Worst case on top of the existing loop: GATE_SPAWN_RETRY_MAX x
+# (budget + one sleep + one probe timeout) = ~3 x 85s, far inside GATE_LOCK_MAX_AGE (1800s) —
+# and every poll logs a line, which re-stamps the sweep heartbeat.
+GATE_SPAWN_DOLT_WAIT_SECS="${GATE_SPAWN_DOLT_WAIT_SECS:-60}"
+GATE_SPAWN_DOLT_POLL_SECS="${GATE_SPAWN_DOLT_POLL_SECS:-10}"
+case "$GATE_SPAWN_DOLT_WAIT_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_WAIT_SECS=60 ;; esac
+case "$GATE_SPAWN_DOLT_POLL_SECS" in ''|*[!0-9]*) GATE_SPAWN_DOLT_POLL_SECS=10 ;; esac
+[ "$GATE_SPAWN_DOLT_POLL_SECS" -ge 1 ] || GATE_SPAWN_DOLT_POLL_SECS=1   # 0 would divide by zero in the poll-count bound
+# SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN
+# gate_dolt_ready_verdict → "ready" | "hot" | "unreadable". "ready" = `gc dolt health --json`
+# answered with a numeric server.latency_ms at or under GATE_DOLT_LATENCY_HOT_MS (the same
+# ceiling the headroom gate uses); "hot" = it answered but slower; "unreadable" = it did not
+# answer / answered junk. Called in $(...): prints the verdict only, never logs. Unlike the
+# headroom probe, unreadable is NOT "no signal, proceed" here: this runs only right after a
+# spawn failed on a Dolt connection error, where a `gc dolt health` that cannot answer is the
+# same outage, and the wait it buys is capped (see above). `gc dolt health` takes the city via
+# the GC_CITY env var, not --city.
+gate_dolt_ready_verdict() {
+  local _h="" _lat=""
+  _h=$(GC_CITY="$GC_CITY" gc_json_or_unknown timeout 15 gc dolt health --json) || _h=""
+  _lat=$(printf '%s' "$_h" | jq -r '.server.latency_ms // empty' 2>/dev/null) || _lat=""
+  case "$_lat" in ''|*[!0-9]*) printf 'unreadable'; return 0 ;; esac
+  if [ "$_lat" -le "${GATE_DOLT_LATENCY_HOT_MS:-2500}" ]; then printf 'ready'; else printf 'hot'; fi
+  return 0
+}
+# gate_spawn_wait_dolt_ready <reviewer-index> — block until gate_dolt_ready_verdict says "ready"
+# or the budget is spent; returns 0 either way (the caller retries regardless). A no-op when
+# GATE_SPAWN_DOLT_WAIT_SECS=0. Called directly, not in $(...): its log lines are the audit trail.
+gate_spawn_wait_dolt_ready() {
+  local _i="${1:-?}" _verdict _polls=0 _max_polls _t0="$SECONDS"
+  [ "$GATE_SPAWN_DOLT_WAIT_SECS" -gt 0 ] || return 0
+  _max_polls=$(( (GATE_SPAWN_DOLT_WAIT_SECS + GATE_SPAWN_DOLT_POLL_SECS - 1) / GATE_SPAWN_DOLT_POLL_SECS ))
+  while :; do
+    _verdict=$(gate_dolt_ready_verdict)
+    if [ "$_verdict" = "ready" ]; then
+      [ "$_polls" -eq 0 ] || warn "  Reviewer $_i spawn retry: Dolt answering again after ${_polls} readiness poll(s) — retrying now (ga-9e446u)."
+      return 0
+    fi
+    if [ "$_polls" -ge "$_max_polls" ] || [ $((SECONDS - _t0)) -ge "$GATE_SPAWN_DOLT_WAIT_SECS" ]; then
+      warn "  Reviewer $_i spawn retry: Dolt still $_verdict after ${_polls} readiness poll(s) (budget ${GATE_SPAWN_DOLT_WAIT_SECS}s) — retrying anyway (ga-9e446u)."
+      return 0
+    fi
+    _polls=$((_polls + 1))
+    warn "  Reviewer $_i spawn retry: Dolt $_verdict — waiting ${GATE_SPAWN_DOLT_POLL_SECS}s before the next probe, poll $_polls/$_max_polls (ga-9e446u)."
+    sleep "$GATE_SPAWN_DOLT_POLL_SECS" 2>/dev/null || true
+  done
+}
+# SELFTEST-EXTRACT gate-spawn-dolt-wait: END
+
 # ga-d5rrr: ga-l7n3v daemon-liveness deploy retry knobs — same shape as the
 # GATE_SPAWN_RETRY_* pair above (in-process, doubling backoff), a separate
 # budget/counter so a deploy retry can never shadow or exhaust a reviewer-spawn
@@ -17080,6 +17143,10 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     _spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_retry_n - 1))))
     warn "  Reviewer $i spawn hit a transient connection error (spawn_err=${_spawn_err:-none}) — in-process retry $_spawn_retry_n/$GATE_SPAWN_RETRY_MAX after ${_spawn_backoff_secs}s backoff (ga-2u38b/ga-3jn3a)."
     sleep "$_spawn_backoff_secs" 2>/dev/null || true
+    # ga-9e446u: the fixed backoff above is a guess at how long Dolt stays away; 8 of 15 retried
+    # spawns on the live log outlasted it (outages run ~4 min, 21s of backoff does not cover
+    # them). Ask Dolt, bounded (GATE_SPAWN_DOLT_WAIT_SECS per retry, 0 = off), then retry anyway.
+    gate_spawn_wait_dolt_ready "$i" || true
     _spawn_err_file="/tmp/gate-reviewer-spawn-err-$$.${i}.r${_spawn_retry_n}"
     SESSION_JSON=$(gc --city "$GC_CITY" session new gate-reviewer \
       --no-attach \

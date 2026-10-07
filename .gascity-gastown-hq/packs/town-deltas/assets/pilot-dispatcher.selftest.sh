@@ -895,6 +895,11 @@ run_lanefull() {
 #                                       saturation — NOT quota — keeps the sweep from
 #                                       short-circuiting at the earlier quota-pause.)
 #   $6 = FAKE_INFLIGHT_JSON            (occupy lane slots to exercise the cap)
+#   $7 = PILOT_SWAP_USED_OVERRIDE_MB   (ga-9e446u: machine swap in use, MB; "" = no
+#                                       reading — and the sandbox PATH has no sysctl,
+#                                       so the real probe is blind too = fail-open)
+#   $8 = PILOT_MEMORY_TIGHT_ENABLED    (default 1; 0 = the ga-9e446u kill switch)
+#   $9 = PILOT_KERN_PRESSURE_OVERRIDE  (ga-9e446u: kernel memory-pressure level 1/2/4)
 run_ctxready() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
@@ -915,6 +920,9 @@ run_ctxready() {
     FAKE_CTXREADY_JSON="${1:-[]}" \
     FAKE_BUGS_JSON="${2:-}" \
     PILOT_GATE_CONGESTED_OVERRIDE="${4:-}" \
+    PILOT_SWAP_USED_OVERRIDE_MB="${7:-}" \
+    PILOT_MEMORY_TIGHT_ENABLED="${8:-1}" \
+    PILOT_KERN_PRESSURE_OVERRIDE="${9:-}" \
     FAKE_INFLIGHT_JSON="${6:-[]}" \
     FAKE_BLOCKED_IDS="" \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
@@ -5155,6 +5163,88 @@ if echo "$LOG20D" | grep "Lane picks — small: tt-cx" >/dev/null; then
   bad "REGRESSION: dispatched ctx:ready work while the Gate was congested + Dolt hot"
 else
   ok "dispatched NO ctx:ready work during the cross-stage yield (no Gate flood)"
+fi
+
+# ── Scenarios 20d-mem-*: ga-9e446u — the cross-stage yield also reads MACHINE memory ──
+# 06/10 18:2x-21:2x (-03): the machine sat on 8.2 GB of swap with the Gate backed up (20 markers
+# queued). The yield only looked at quota + Dolt, so "resources tight" was false, the Pilot
+# kept opening builders, and the Gate starved for RAM. The Mayor ran PILOT_DOLT_CPU_MAX=120
+# as a palliative to fake the signal. Dolt is CALM in every case
+# below (cpu 10 → the Dolt arm and the quota arm cannot be what trips the yield), so a yield
+# can ONLY come from the memory arm — and a dispatch can only mean the memory arm stayed quiet.
+#                         ctxJSON  bugs gate gateCong cpu inflight swapUsedMB
+echo "Scenario 20d-mem-a: Gate congested + Dolt CALM + swap 8.4 GB used → the Pilot YIELDS (ga-9e446u)"
+LOG20DMA="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400)"
+if echo "$LOG20DMA" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "yielded to the congested Gate on machine memory pressure alone (Dolt calm, quota OK)"
+else
+  bad "did NOT yield with the Gate congested and swap at 8.4 GB — the machine-starvation bug (ga-9e446u)"
+fi
+if echo "$LOG20DMA" | grep "mem_tight=1" >/dev/null; then
+  ok "the YIELD line says it was memory (mem_tight=1) — an operator can tell it from a Dolt/quota yield"
+else
+  bad "the YIELD line does not name the memory signal (mem_tight=1)"
+fi
+if echo "$LOG20DMA" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  bad "REGRESSION: dispatched ctx:ready work while the Gate was congested and the machine was swapping"
+else
+  ok "dispatched NO new build while the Gate was congested and the machine was swapping"
+fi
+
+echo "Scenario 20d-mem-b: swap 4.9 GB used (the measured healthy level) → NOT tight, the Pilot dispatches"
+LOG20DMB="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 4900)"
+if echo "$LOG20DMB" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "OVER-BLOCK: yielded at 4.9 GB of swap — the ceiling must sit above the healthy level"
+else
+  ok "no yield at 4.9 GB of swap"
+fi
+if echo "$LOG20DMB" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "dispatched normally with the Gate congested but the machine healthy and Dolt calm"
+else
+  bad "did not dispatch at 4.9 GB of swap with Dolt calm (anti-starvation broken)"
+fi
+
+echo "Scenario 20d-mem-c: swap 8.4 GB used but the Gate is EMPTY → the Pilot dispatches (anti-starvation)"
+LOG20DMC="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 0 10 "[]" 8400)"
+if echo "$LOG20DMC" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "yielded to an EMPTY Gate on memory pressure — nothing to yield to"
+else
+  ok "no yield when the Gate has nothing queued, whatever the swap says"
+fi
+if echo "$LOG20DMC" | grep "Lane picks — small: tt-cx" >/dev/null; then
+  ok "dispatched with an empty Gate despite 8.4 GB of swap"
+else
+  bad "did not dispatch with an empty Gate"
+fi
+
+echo "Scenario 20d-mem-d: PILOT_MEMORY_TIGHT_ENABLED=0 → exact pre-ga-9e446u behaviour (kill switch)"
+LOG20DMD="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" 8400 0)"
+if echo "$LOG20DMD" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "kill switch ignored — still yielded on memory with PILOT_MEMORY_TIGHT_ENABLED=0"
+else
+  ok "kill switch off → the memory arm is out of the predicate"
+fi
+
+echo "Scenario 20d-mem-e: no memory reading at all → fail-OPEN, the Pilot dispatches"
+LOG20DME="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "")"
+if echo "$LOG20DME" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "yielded with NO memory reading — an unreadable probe must never wedge the Pilot"
+else
+  ok "unreadable memory probe → no yield (fail-open)"
+fi
+
+echo "Scenario 20d-mem-f: kernel pressure level 4 (critical) → YIELD; level 2 (warn) alone → dispatch"
+LOG20DMF4="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "" 1 4)"
+if echo "$LOG20DMF4" | grep "Cross-stage YIELD (ga-d0hz3)" >/dev/null; then
+  ok "kernel pressure 4 + congested Gate → yielded"
+else
+  bad "kernel pressure level 4 did not arm the yield"
+fi
+LOG20DMF2="$(run_ctxready "$CTX_SIX_CHORES" "[]" 1 1 10 "[]" "" 1 2)"
+if echo "$LOG20DMF2" | grep "Cross-stage YIELD" >/dev/null; then
+  bad "OVER-BLOCK: yielded on pressure level 2 alone (it cleared on its own in ga-q4fkxa)"
+else
+  ok "pressure level 2 alone does not yield"
 fi
 
 # ── Scenario 20e: drift-guard — ctx:ready default flipped to 1 and stays env-gated

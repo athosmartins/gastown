@@ -625,6 +625,193 @@ else
   bad "(e) expected doubling backoff '3,6,12', got: '$BACKOFFS'"
 fi
 
+# ── 4c. ga-9e446u: the retry waits for Dolt to ANSWER, not only for a fixed backoff ──
+# Measured on the live log: of 15 reviewer spawns that needed a retry, 8 still aborted after all
+# 3 retries (3s/6s/12s = 21s of backoff) because the Dolt-connection windows behind them last
+# ~4 minutes — each abort burned a fully-paid-for run and bumped gate-spawn-abort-count (3 in a
+# row pages the Mayor as a systemic outage). gate_spawn_wait_dolt_ready asks `gc dolt health`
+# between the backoff and the retry, bounded, and the retry happens anyway when the budget is
+# spent. Every scenario below runs the REAL extracted loop + the REAL extracted wait functions in
+# a child bash with mocked gc / timeout / sleep / warn; counts go through files (the real code
+# calls gc inside $(...), a subshell — the same lesson as CALL_LOG above).
+echo "── 4c. spawn retry waits for Dolt readiness (ga-9e446u) ──"
+WAIT_BLOCK="$(sed -n '/# SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN/,/# SELFTEST-EXTRACT gate-spawn-dolt-wait: END/p' "$DISPATCHER")"
+if [ -z "$WAIT_BLOCK" ]; then
+  echo "FATAL: could not locate 'gate-spawn-dolt-wait' sentinel block in $DISPATCHER (ga-9e446u not applied?)"
+  exit 1
+fi
+ok "located live gate-spawn-dolt-wait block via sentinel extraction"
+export -f gc_json_or_unknown
+
+WAIT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gate-spawn-dolt-wait-selftest.XXXXXX")"
+trap 'rm -rf "$WAIT_TMP"' EXIT
+# The child's mocks. PROBE_SEQ is a space-separated list of what the Nth `gc dolt health` answers
+# (the last word repeats): ok = latency 120ms | hot = latency 9000ms | junk = exit 0 with non-JSON |
+# down = connection refused, exit 1. SPAWN_OK_AT = the Nth `gc session new` that succeeds (unset =
+# never). SLEEP_ADVANCE = make each mocked sleep advance $SECONDS by N x its argument, to model
+# real time passing (a stalled probe) without really sleeping.
+cat > "$WAIT_TMP/prelude.sh" <<'PRELUDE'
+W="${SC_WORK:?}"
+PROBES="$W/probes"; SPAWNS="$W/spawns"; SLEEPS="$W/sleeps"; WARNS="$W/warns"
+: > "$PROBES"; : > "$SPAWNS"; : > "$SLEEPS"; : > "$WARNS"
+_nth() { local _s="$1" _n="$2" _w; set -- $_s; if [ "$_n" -le "$#" ]; then eval "_w=\${$_n}"; else eval "_w=\${$#}"; fi; printf '%s' "$_w"; }
+T0=$SECONDS
+# DOWN_FOR=N (with SLEEP_ADVANCE=1) models a Dolt outage on a VIRTUAL clock: Dolt is down until N
+# mocked-sleep seconds have passed, and BOTH the health probe and `session new` follow it — so a
+# retry that lands too early really fails, and only waiting out the outage recovers.
+_dolt_up() { [ -n "${DOWN_FOR:-}" ] && [ $((SECONDS - T0)) -ge "$DOWN_FOR" ]; }
+gc() {
+  case "$*" in
+    *"dolt health"*)
+      echo p >> "$PROBES"
+      _pn=$(wc -l < "$PROBES" | tr -d '[:space:]')
+      if [ -n "${DOWN_FOR:-}" ]; then
+        if _dolt_up; then _pw=ok; else _pw=down; fi
+      else
+        _pw="$(_nth "$PROBE_SEQ" "$_pn")"
+      fi
+      case "$_pw" in
+        ok)   printf '{"server":{"latency_ms":120,"pid":1}}' ;;
+        hot)  printf '{"server":{"latency_ms":9000,"pid":1}}' ;;
+        edge) printf '{"server":{"latency_ms":%s,"pid":1}}' "${EDGE_MS:-2500}" ;;
+        junk) printf 'not json at all' ;;
+        *)    echo "dial tcp 127.0.0.1:52756: connect: connection refused" >&2; return 1 ;;
+      esac ;;
+    *"session new"*)
+      echo s >> "$SPAWNS"
+      _sn=$(wc -l < "$SPAWNS" | tr -d '[:space:]')
+      if [ -n "${DOWN_FOR:-}" ]; then
+        if _dolt_up; then printf '{"session_id":"sess-recovered"}'; else echo "invalid connection" >&2; return 1; fi
+      elif [ -n "${SPAWN_OK_AT:-}" ] && [ "$_sn" -ge "$SPAWN_OK_AT" ]; then
+        printf '{"session_id":"sess-recovered"}'
+      else
+        echo "invalid connection" >&2; return 1
+      fi ;;
+  esac
+}
+timeout() { shift; "$@"; }   # the real `timeout` exec()s a binary and cannot see the gc function above
+sleep() {
+  printf '%s\n' "$1" >> "$SLEEPS"
+  [ -z "${SLEEP_ADVANCE:-}" ] || SECONDS=$((SECONDS + $1 * SLEEP_ADVANCE))
+  # runaway guard: an unbounded wait loop must FAIL this test (no summary line), not hang it.
+  # sleep is called directly by the loops under test, so this exit ends the child itself.
+  [ "$(wc -l < "$SLEEPS" | tr -d '[:space:]')" -le 400 ] || exit 99
+}
+warn() { printf '%s\n' "$*" >> "$WARNS"; }
+i=1; BRANCH="fix/ga-9e446u"; GC_CITY="test-city"; SESSION_ID=""; _spawn_err="${SPAWN_ERR:-invalid connection}"
+GATE_SPAWN_RETRY_MAX=3; GATE_SPAWN_RETRY_BACKOFF_SECS=3
+GATE_SPAWN_DOLT_WAIT_SECS="${KNOB_WAIT:-60}"; GATE_SPAWN_DOLT_POLL_SECS="${KNOB_POLL:-10}"
+GATE_DOLT_LATENCY_HOT_MS=2500
+PRELUDE
+cat > "$WAIT_TMP/tail.sh" <<'TAIL'
+printf 'SESSION_ID=%s SPAWNS=%s PROBES=%s SLEEPS=%s\n' "$SESSION_ID" \
+  "$(wc -l < "$SPAWNS" | tr -d '[:space:]')" "$(wc -l < "$PROBES" | tr -d '[:space:]')" \
+  "$(tr '\n' ',' < "$SLEEPS" | sed 's/,$//')"
+TAIL
+# run_wait <probe_seq> [VAR=value ...] → the child's one-line summary
+run_wait() {
+  local _seq="$1"; shift
+  { cat "$WAIT_TMP/prelude.sh"; printf '%s\n' "$WAIT_BLOCK"; printf '%s\n' "$RETRY_BLOCK"; cat "$WAIT_TMP/tail.sh"; } > "$WAIT_TMP/child.sh"
+  env SC_WORK="$WAIT_TMP" PROBE_SEQ="$_seq" "$@" bash "$WAIT_TMP/child.sh" 2>/dev/null || true   # a killed (runaway) child = empty summary = a failed check, not a dead selftest
+}
+
+# (g) THE FIX: Dolt is down for the first two probes, then answers. The retry must WAIT (two 10s
+# polls after the 3s backoff) and then spawn once, successfully — on HEAD~ the loop retried straight
+# after the 3s backoff, into a Dolt that was still down, and burned a retry.
+OUT=$(run_wait "down down ok" SPAWN_OK_AT=1)
+eq "(g) Dolt down,down,ok: retry waits 2 polls after the backoff, then spawns once and recovers" \
+  "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+
+# (g2) the end-to-end shape of the abort this bead is about: Dolt is back only after the whole
+# 21s of backoff would have been spent — with the wait the SECOND retry finds it and spawns.
+OUT=$(run_wait "down down down down down down down down ok" SPAWN_OK_AT=2)
+case "$OUT" in
+  "SESSION_ID=sess-recovered SPAWNS=2 "*) ok "(g2) a Dolt outage longer than the whole backoff ladder is bridged by the wait (recovered on retry 2): $OUT" ;;
+  *) bad "(g2) expected recovery on spawn 2 across a long Dolt outage, got: $OUT" ;;
+esac
+
+# (g3) CAUSAL, on a virtual clock: Dolt is down for 40 virtual seconds and `session new` fails until
+# then. The pre-ga-9e446u ladder (WAIT=0 — the exact old loop) retries at t+3, t+9, t+21 — all inside
+# the outage — and burns all 3. The wait polls Dolt out of the outage and the FIRST retry lands.
+OUT=$(run_wait "" DOWN_FOR=40 SLEEP_ADVANCE=1 KNOB_WAIT=0)
+eq "(g3) 40s Dolt outage, wait OFF (the old ladder, 21s): all 3 retries land inside the outage and fail" \
+  "$OUT" "SESSION_ID= SPAWNS=3 PROBES=0 SLEEPS=3,6,12"
+OUT=$(run_wait "" DOWN_FOR=40 SLEEP_ADVANCE=1)
+eq "(g3b) the same 40s outage, wait ON: polls until Dolt answers, then the first retry recovers" \
+  "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=5 SLEEPS=3,10,10,10,10"
+# (g3c) an outage longer than ONE wait budget (60s): the first retry gives up the wait and fails, the
+# second retry's wait finds Dolt back — recovery on spawn 2, where the old ladder never recovers.
+OUT=$(run_wait "" DOWN_FOR=100 SLEEP_ADVANCE=1)
+case "$OUT" in
+  "SESSION_ID=sess-recovered SPAWNS=2 "*) ok "(g3c) a 100s outage outlasts one wait budget but not two: recovered on retry 2: $OUT" ;;
+  *) bad "(g3c) expected recovery on spawn 2 after a 100s outage, got: $OUT" ;;
+esac
+OUT=$(run_wait "" DOWN_FOR=100 SLEEP_ADVANCE=1 KNOB_WAIT=0)
+eq "(g3d) the same 100s outage, wait OFF: the old ladder never recovers" "$OUT" "SESSION_ID= SPAWNS=3 PROBES=0 SLEEPS=3,6,12"
+
+# (h) Dolt answering but SLOW (latency over the hot ceiling) is not ready either; unreadable is not
+# ready (a `gc dolt health` that cannot answer right after a connection error IS the outage).
+OUT=$(run_wait "hot hot ok" SPAWN_OK_AT=1)
+eq "(h) latency 9000ms is not ready: waits until it drops to 120ms" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+OUT=$(run_wait "junk junk ok" SPAWN_OK_AT=1)
+eq "(h2) a probe that answers junk is not ready" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=3 SLEEPS=3,10,10"
+OUT=$(run_wait "edge" SPAWN_OK_AT=1 EDGE_MS=2500)
+eq "(h3) latency exactly at the ceiling (2500ms) is ready — no wait" "$OUT" "SESSION_ID=sess-recovered SPAWNS=1 PROBES=1 SLEEPS=3"
+OUT=$(run_wait "edge edge" SPAWN_OK_AT=1 EDGE_MS=2501 KNOB_WAIT=10 KNOB_POLL=10)
+case "$OUT" in
+  "SESSION_ID=sess-recovered SPAWNS=1 PROBES=2 "*) ok "(h4) latency 2501ms is hot: waited the one poll the 10s budget allows, then retried anyway: $OUT" ;;
+  *) bad "(h4) expected 2 probes (hot, then give up and retry), got: $OUT" ;;
+esac
+
+# (i) NON-REGRESSION: Dolt healthy from the start → no extra sleep at all, the ladder is exactly
+# the pre-ga-9e446u 3,6,12 and one probe per retry.
+OUT=$(run_wait "ok")
+eq "(i) Dolt ready immediately: sleeps are ONLY the backoff ladder 3,6,12; one probe per retry; 3 spawns" \
+  "$OUT" "SESSION_ID= SPAWNS=3 PROBES=3 SLEEPS=3,6,12"
+
+# (j) BOUNDED: Dolt never comes back. The wait spends its budget (60s/10s = 6 polls → 7 probes) per
+# retry and the retry happens ANYWAY — still exactly GATE_SPAWN_RETRY_MAX spawns, never more.
+OUT=$(run_wait "down")
+eq "(j) Dolt never ready: 3 spawns (the wait adds no attempt), 7 probes per retry (bounded, not a spin)" \
+  "$OUT" "SESSION_ID= SPAWNS=3 PROBES=21 SLEEPS=3,10,10,10,10,10,10,6,10,10,10,10,10,10,12,10,10,10,10,10,10"
+case "$(cat "$WAIT_TMP/warns" 2>/dev/null)" in
+  *"retrying anyway (ga-9e446u)"*) ok "(j2) giving up the wait is LOGGED ('retrying anyway'), not silent" ;;
+  *) bad "(j2) the exhausted wait left no 'retrying anyway' log line" ;;
+esac
+
+# (k) BOUNDED BY THE CLOCK too: a probe that stalls (time passes while it hangs) must eat the budget.
+# SLEEP_ADVANCE=10 makes the 10s poll look like 100s passing → the second probe already finds the 60s
+# budget spent, so each retry costs 2 probes, not 7.
+OUT=$(run_wait "down" SLEEP_ADVANCE=10)
+case "$OUT" in
+  "SESSION_ID= SPAWNS=3 PROBES=6 "*) ok "(k) wall-clock budget cuts the wait short when time really passes (2 probes per retry): $OUT" ;;
+  *) bad "(k) expected SPAWNS=3 PROBES=6 under a clock that outruns the poll count, got: $OUT" ;;
+esac
+
+# (l) KILL SWITCH: GATE_SPAWN_DOLT_WAIT_SECS=0 → `gc dolt health` is never asked; the exact old loop.
+OUT=$(run_wait "ok" KNOB_WAIT=0)
+eq "(l) GATE_SPAWN_DOLT_WAIT_SECS=0: zero probes, backoff ladder only (exact pre-ga-9e446u behaviour)" \
+  "$OUT" "SESSION_ID= SPAWNS=3 PROBES=0 SLEEPS=3,6,12"
+
+# (m) NON-TRANSIENT failure: the loop is not entered at all — no probe, no sleep, no retry.
+OUT=$(run_wait "ok" SPAWN_ERR="template 'gate-reviewer' not found")
+eq "(m) a non-transient spawn error never reaches the wait (no probe, no sleep, no retry)" \
+  "$OUT" "SESSION_ID= SPAWNS=0 PROBES=0 SLEEPS="
+
+# (n) the shipped defaults, read from the dispatcher under lib-only sourcing (not re-typed here).
+eq "shipped GATE_SPAWN_DOLT_WAIT_SECS default" "$GATE_SPAWN_DOLT_WAIT_SECS" "60"
+eq "shipped GATE_SPAWN_DOLT_POLL_SECS default" "$GATE_SPAWN_DOLT_POLL_SECS" "10"
+
+# (o) hostile knob values, through the REAL sanitiser (a fresh lib-only child per value): a junk
+# budget falls back to 60, a junk poll to 10, and a poll of 0 is clamped to 1 — unclamped it divides
+# by zero in the poll-count bound the first time the wait runs.
+KNOBS=$(GATE_SPAWN_DOLT_WAIT_SECS=abc GATE_SPAWN_DOLT_POLL_SECS=xyz GATE_DISPATCHER_LIB_ONLY=1 \
+  bash -c 'source "$1" >/dev/null 2>&1; printf "%s/%s" "$GATE_SPAWN_DOLT_WAIT_SECS" "$GATE_SPAWN_DOLT_POLL_SECS"' _ "$DISPATCHER" 2>/dev/null) || KNOBS="source-failed"
+eq "(o) non-numeric WAIT/POLL fall back to the shipped 60/10" "$KNOBS" "60/10"
+KNOBS=$(GATE_SPAWN_DOLT_WAIT_SECS=30 GATE_SPAWN_DOLT_POLL_SECS=0 GATE_DISPATCHER_LIB_ONLY=1 \
+  bash -c 'source "$1" >/dev/null 2>&1; printf "%s/%s" "$GATE_SPAWN_DOLT_WAIT_SECS" "$GATE_SPAWN_DOLT_POLL_SECS"' _ "$DISPATCHER" 2>/dev/null) || KNOBS="source-failed"
+eq "(o2) POLL=0 is clamped to 1 (no divide-by-zero), a valid WAIT is kept" "$KNOBS" "30/1"
+
 # ── 5. drift-guards: shipped dispatcher still carries the ga-2u38b fix ───────
 echo "── 5. drift-guards ──"
 has "$DISPATCHER" 'is_transient_spawn_error\(\)' "transient classifier present"
@@ -636,6 +823,13 @@ grep -qF '_spawn_backoff_secs=$((GATE_SPAWN_RETRY_BACKOFF_SECS * (1 << (_spawn_r
   && ok "ga-3jn3a: backoff doubles per attempt (not a flat repeat)" \
   || bad "ga-3jn3a: doubling backoff formula not found — did the retry loop get refactored?"
 has "$DISPATCHER" '# SELFTEST-EXTRACT spawn-retry-loop: BEGIN' "spawn-retry-loop extraction sentinel present"
+has "$DISPATCHER" '# SELFTEST-EXTRACT gate-spawn-dolt-wait: BEGIN' "gate-spawn-dolt-wait extraction sentinel present (ga-9e446u)"
+# the real call site: the wait sits INSIDE the retry loop block, between the backoff sleep and the re-spawn
+if printf '%s\n' "$RETRY_BLOCK" | awk '/sleep "\$_spawn_backoff_secs"/{s=1} s&&/gate_spawn_wait_dolt_ready "\$i"/{w=1} w&&/session new gate-reviewer/{ok=1} END{exit !ok}'; then
+  ok "ga-9e446u: the retry loop calls gate_spawn_wait_dolt_ready after the backoff sleep and before re-spawning"
+else
+  bad "ga-9e446u: gate_spawn_wait_dolt_ready is not wired between the backoff sleep and the re-spawn in the retry loop"
+fi
 has "$DISPATCHER" 'invalid connection.*read tcp.*broken pipe' "classifier still covers the live-incident signature family"
 grep -q 'gate_spawn_failure_requeue_or_error "\$MARKER_ID" "\$_spawn_err"' "$DISPATCHER" \
   && ok "real call site wires MARKER_ID + _spawn_err into the decision function" \
@@ -680,7 +874,7 @@ eq "standalone dispatching-removal inside the ga-mzc3h abort block correctly rem
   "$DISPATCHING_REMOVE_IN_ABORT_BLOCK" "0"
 
 CUTOFF_LN=$(grep -n 'if \[ -n "\${GATE_DISPATCHER_LIB_ONLY:-}" \]; then' "$DISPATCHER" | head -1 | cut -d: -f1)
-for fn in is_transient_spawn_error read_spawn_fail_count gate_spawn_failure_requeue_or_error; do
+for fn in is_transient_spawn_error read_spawn_fail_count gate_spawn_failure_requeue_or_error gate_dolt_ready_verdict gate_spawn_wait_dolt_ready; do
   DEF_LN=$(grep -n "^${fn}() {" "$DISPATCHER" | head -1 | cut -d: -f1)
   if [ -n "$DEF_LN" ] && [ -n "$CUTOFF_LN" ] && [ "$DEF_LN" -lt "$CUTOFF_LN" ]; then
     ok "$fn (line $DEF_LN) defined before the lib-only cutoff (line $CUTOFF_LN)"
