@@ -58,7 +58,8 @@ GATE_E5_EST_COST_USD="${GATE_E5_EST_COST_USD:-0.60}"
 GATE_E5_DAILY_CAP_USD="${GATE_E5_DAILY_CAP_USD:-30}"
 
 # ── the flag ──────────────────────────────────────────────────────────────────
-# gate_e5_enabled — prints 1 or 0. Anything unreadable/unrecognised is 0 (inert).
+# gate_e5_enabled — prints 1 or 0. An unreadable/unrecognised SWITCH is 0 (inert); an unreadable FOCUS state
+# is "no suspension" (the switch decides) — a signal nobody could read never flips E5 off.
 gate_e5_enabled() {
   case "${GATE_E5_ENABLED:-}" in
     1) printf '1'; return 0 ;;

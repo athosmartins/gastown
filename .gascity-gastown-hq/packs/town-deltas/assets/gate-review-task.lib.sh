@@ -213,15 +213,20 @@ does the defect exist in the code? — and is never a filter on how severe or
 how certain the issue feels.
 
 WHAT BLOCKS (verdict FAIL): a defect you can ground in specific changed
-lines that changes BEHAVIOR: incorrect output or state, a failing test, data
-loss, a crash, a security hole, or an error swallowed so that a caller or a
-user cannot tell failure from success.
+lines that changes BEHAVIOR: incorrect output or state, a failing test (new or
+existing), data loss, a crash, a security hole. The third-state family BLOCKS
+too, always: a log, status or return value that reports success when the
+operation failed; a silent fallback or swallowed error that hides a failure; a
+read that could not be made ("unknown") turned into a yes or a no; a test that
+passes without exercising the path it claims to test.
 WHAT DOES NOT BLOCK (report it under "Non-blocking findings", at its real
-severity — never drop it): a comment, log line or docstring that misdescribes
-what the code does; an edge case with no observable effect for a user or a
-caller; style or naming. The next change on that file fixes these; a re-review
-round does not (decision of the owner, 2026-10-07: approval must stop failing
-on form while behavior is correct).
+severity — never drop it): a comment or docstring that misdescribes code which
+itself behaves correctly; a log line whose wording is wrong but that does NOT
+report success on a failure; an edge case whose outcome is identical for the
+user or the caller either way; style or naming. The builder gets these in the
+verdict comment and fixes them in the next change on that file; they do not
+cost a re-review round (decision of the owner, 2026-10-07: approval must stop
+failing on form while behavior is correct).
 LOW CONFIDENCE: if you are not sure whether something is really a defect,
 RE-READ the surrounding code until you can decide either way — never silence
 or drop a finding just because you are unsure.

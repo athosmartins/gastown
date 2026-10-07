@@ -107,7 +107,7 @@ eq "100%: junk env (GATE_E11_ALL=yes) -> 0, never 'on by accident'" "$(GATE_E11_
 eq "100%: no GC_CITY and no env -> 0" "$(unset GC_CITY; GATE_E11_ALL= gate_e11_force_all)" "0"
 rm -f "$TMPD/city/.gc/gate-e11-diff-cap.all"
 # the live block honours it: the exact arm-promotion line must exist between the sentinels
-if sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" | grep -qF 'if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; fi'; then ok "live block promotes arm A to B under the 100% switch (and leaves '?' alone)"; else bad "live block does not consult gate_e11_force_all"; fi
+if sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" | grep -qF 'if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi'; then ok "live block promotes arm A to B under the 100% switch (and leaves '?' alone)"; else bad "live block does not consult gate_e11_force_all"; fi
 eq "state: env 'off' = env-invalido (OFF, and it SAYS why)" "$(GATE_E11_ENABLED=off GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 eq "state: env ' ' (a single space) = env-invalido" "$(GATE_E11_ENABLED=" " GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 rm -f "$FLAG"
@@ -482,6 +482,19 @@ run_e11 1 "$RIG_OK" "$AA" feat/prod900; RC=$?
 eq "arm A, 900 prod lines: accepted (rc 0)" "$RC" "0"
 has "arm A: the arm is recorded" "$LOGF" "LOG E11-DIFF-CAP bead=$AA arm=A verdict=controle"
 eq "arm A: nothing touched — no bd call, no label, no comment" "$(calls_n)" "0"
+
+echo "  — 100% switch: an arm-A bead is treated as B (Athos 07/10) —"
+set_beads "$AA" "$PLAIN" "$PLAIN"   # the forced bead is now READ for an exemption, like any arm-B bead
+mkdir -p "$MRK_STORE/.gc"; touch "$MRK_STORE/.gc/gate-e11-diff-cap.all"
+run_e11 1 "$RIG_OK" "$AA" feat/prod900; RC=$?
+eq "100%: arm A, 900 prod lines: REFUSED (rc 1)" "$RC" "1"
+has "100%: the record says arm=B verdict=recusa" "$LOGF" "bead=$AA arm=B verdict=recusa production_lines=900"
+has "100%: the record says forced=1 (the hash arm was A)" "$LOGF" "forced=1"
+has "100%: the marker gets the guard-refusal label the recovery watchdog reads" "$CALLS" "label add m-e11 gate-guard:refused-e11"
+rm -f "$MRK_STORE/.gc/gate-e11-diff-cap.all"
+run_e11 1 "$RIG_OK" "$AA" feat/prod900; RC=$?
+eq "100% off again: arm A back to controle (rc 0)" "$RC" "0"
+has "100% off: record says forced=0" "$LOGF" "forced=0"
 
 echo "  — arm B, treated —"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?

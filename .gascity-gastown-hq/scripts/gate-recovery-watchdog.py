@@ -3147,8 +3147,13 @@ def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
 
 def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
                           source_needs_human, requeue_count, max_attempts,
-                          branch_state="unknown"):
+                          branch_state="unknown", guard_refused=False):
     """PURE decision for a gate-status:error marker. Returns:
+      close:guard-refused    — the marker carries a gate-guard:refused* label: a GUARD said no on
+                               purpose (e.g. E11 diff cap). Never requeued — a requeue sends the
+                               refused diff to review without the guard (measured: ga-h3cje3,
+                               27/09, refused 08:27, requeued 08:38, merged 08:48). Closed after
+                               the grace period; the builder resubmits with /gate-done.
       close:source-done      — the source bead is CLOSED **and branch_state confirms
                                the work actually landed (merged) or the branch is gone
                                (missing)** → the marker is a leftover; close it, do NOT
@@ -3183,6 +3188,8 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
         return "close:source-done"
     if age_sec <= threshold_sec:
         return "skip:young"
+    if guard_refused:
+        return "close:guard-refused"
     if source_resolved and source_needs_human:
         return "skip:parked-needs-human"
     if requeue_count >= max_attempts:
@@ -4271,9 +4278,10 @@ def requeue_error_markers(now, rstate):
         # immediately after /gate-done, regardless of whether a reviewer ever ran).
         # Mirrors reap_orphan_and_stale_markers' FIX 4 gating exactly.
         branch_state = _branch_merged_state(branch, rig_name) if (resolved and sclosed) else "unknown"
+        guard_refused = any(str(l).startswith("gate-guard:refused") for l in labels)
         verdict = error_requeue_verdict(age, ERROR_REQUEUE_MINUTES * 60, resolved,
                                         sclosed, needs_human, req_count, ERROR_REQUEUE_MAX_ATTEMPTS,
-                                        branch_state)
+                                        branch_state, guard_refused=guard_refused)
 
         if verdict == "skip:young":
             continue
@@ -4283,6 +4291,19 @@ def requeue_error_markers(now, rstate):
                       % (mid, source_bead), flush=True)
             continue
 
+        if verdict == "close:guard-refused":
+            why = "guard refusal (label gate-guard:refused*) — a guard's no is a decision, not an infra error; not requeued, closed after the %d-min grace (ga-ufskhy 07/10)" % ERROR_REQUEUE_MINUTES
+            if GRW_DRY_RUN:
+                print("[watchdog] requeue DRY-RUN would CLOSE guard-refused error marker %s (%s)" % (mid, why), flush=True)
+                _recovery_ledger("would_close_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+                acted += 1
+                continue
+            set_gate_status_py(mid, "superseded")
+            sh(["bd", "-C", CITY, "close", mid, "-r", "marker %s closed by gate-recovery-watchdog: %s" % (mid, why)], timeout=25)
+            _recovery_ledger("closed_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
+            print("[watchdog] CLOSED guard-refused error marker %s (not requeued)" % mid, flush=True)
+            acted += 1
+            continue
         if verdict == "close:source-done":
             if GRW_DRY_RUN:
                 print("[watchdog] requeue DRY-RUN would CLOSE error marker %s (source bead %s closed, branch %s VERIFIED merged/absent — work done)"
@@ -5730,6 +5751,10 @@ def _selftest():
     # deferred_requeue_verdict branch_state discipline to the sibling gate-status:error
     # path, which had the textually identical gap)
     E = 8 * 60
+    ok(error_requeue_verdict(300, E, False, False, False, 0, 3, "unknown", guard_refused=True) == "skip:young", "guard-refused + young → skip:young (grace first)")
+    ok(error_requeue_verdict(E + 1, E, False, False, False, 0, 3, "unknown", guard_refused=True) == "close:guard-refused", "guard-refused + past grace → close, never requeue (ga-h3cje3 shape)")
+    ok(error_requeue_verdict(E + 1, E, True, False, True, 0, 3, "unknown", guard_refused=True) == "close:guard-refused", "guard-refused beats parked-needs-human: the marker is closed either way")
+    ok(error_requeue_verdict(E + 1, E, False, False, False, 0, 3, "unknown", guard_refused=False) == "requeue", "no guard label → today's requeue (control)")
     ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "merged") == "close:source-done", "source resolved+CLOSED+branch MERGED → close regardless of age (checked first)")
     ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "missing") == "close:source-done", "source resolved+CLOSED+branch MISSING (abandoned) → close regardless of age")
     # the ga-w5agg/ga-d2jil bug class (ga-hckn3: FIX 2 had the same gap as pre-fix FIX 7/

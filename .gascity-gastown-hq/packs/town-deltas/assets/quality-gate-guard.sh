@@ -4277,15 +4277,6 @@ gate_e11_enabled() {
   if [ "$(gate_e11_switch_state)" = "on" ]; then printf '1'; else printf '0'; fi
 }
 
-# gate_e11_arm_for_bead <bead_id> — prints A or B: B <=> the first 32 bits of SHA-256("e11-diff-cap:<bead-id>") are
-# even. Recomputable by anyone:
-#   printf '%s' "e11-diff-cap:ga-abc123" | shasum -a 256 | cut -c1-8   (odd last hex digit = A)
-# SHA-256 with a per-experiment salt and not the ga-rstae base-31 polynomial (gate_ab_arm_for_bead, above): a salted
-# polynomial still agrees with that arm on 43% of beads, and two experiments sharing beads cannot be told apart (the
-# same measurement gate-e5-second-reviewer.lib.sh records).
-#   Empty id    -> prints nothing, returns 2: a bead we cannot identify has no arm.
-#   No sha tool -> prints nothing, returns 3: same. "No arm" must never read as A — the caller then neither refuses nor
-#                  counts the submission in either arm.
 # gate_e11_force_all — prints 1 iff the operator asked for the cap on EVERY bead (Athos, 07/10/2026,
 # diagnóstico do gate: "Ligar hoje, 100%"): env GATE_E11_ALL=1 (0 = off; wins, used by the selftests) or the
 # flag file $GC_CITY/.gc/gate-e11-diff-cap.all. Only consulted when E11 itself is ON; an arm-A bead is then
@@ -4296,6 +4287,15 @@ gate_e11_force_all() {
   if [ -n "${GC_CITY:-}${GATE_E11_ALL_FLAG_FILE:-}" ] && [ -r "$_f" ]; then printf '1'; else printf '0'; fi
 }
 
+# gate_e11_arm_for_bead <bead_id> — prints A or B: B <=> the first 32 bits of SHA-256("e11-diff-cap:<bead-id>") are
+# even. Recomputable by anyone:
+#   printf '%s' "e11-diff-cap:ga-abc123" | shasum -a 256 | cut -c1-8   (odd last hex digit = A)
+# SHA-256 with a per-experiment salt and not the ga-rstae base-31 polynomial (gate_ab_arm_for_bead, above): a salted
+# polynomial still agrees with that arm on 43% of beads, and two experiments sharing beads cannot be told apart (the
+# same measurement gate-e5-second-reviewer.lib.sh records).
+#   Empty id    -> prints nothing, returns 2: a bead we cannot identify has no arm.
+#   No sha tool -> prints nothing, returns 3: same. "No arm" must never read as A — the caller then neither refuses nor
+#                  counts the submission in either arm.
 gate_e11_arm_for_bead() {
   local bead="${1:-}" tool digest="" first
   [ -z "$bead" ] && return 2
@@ -7242,7 +7242,14 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_ARM=$(gate_e11_arm_for_bead "$BEAD_ID") || _E11_ARM_RC=$?
   case "$_E11_ARM" in A|B) ;; *) _E11_ARM="?" ;; esac
   # 100% mode (Athos 07/10): an identified arm-A bead gets the cap too; an unidentifiable bead ("?") stays out.
-  if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; fi
+  # forced=1 in the record keeps the A/B assignment readable (a hash-A bead treated as B is not a B bead).
+  _E11_FORCED=0
+  _E11_ALL_FILE="${GATE_E11_ALL_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.all}"
+  if [ -e "$_E11_ALL_FILE" ] && [ ! -r "$_E11_ALL_FILE" ]; then
+    log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — 100% mode NOT applied (a switch nobody could read is off, and says so)"
+  fi
+  case "${GATE_E11_ALL:-}" in ''|0|1) ;; *) log "E11-DIFF-CAP all-switch=env-invalido GATE_E11_ALL=${GATE_E11_ALL} — 100% mode NOT applied" ;; esac
+  if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi
   _E11_CAP=$(gate_e11_cap_lines)
   _E11_CAP_ST=$(gate_e11_cap_state)
   _E11_COUNT="-"
@@ -7316,8 +7323,12 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
     fi
   fi
   _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_VCOUNT" "$_E11_EXEMPT" "$_E11_CAP")
-  log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID"
+  log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID forced=${_E11_FORCED:-0}"
   if [ "$_E11_VERDICT" = "recusa" ]; then
+    # The label is what gate-recovery-watchdog.py reads: a guard REFUSAL is a decision, not an infra error, so the
+    # watchdog must never requeue this marker (it did: ga-h3cje3 on 27/09 was refused, requeued 8 min later, reviewed
+    # and merged). After its grace period the watchdog closes the marker; the builder resubmits with /gate-done.
+    bd -C "$GC_CITY" label add "$MARKER_ID" gate-guard:refused-e11 2>/dev/null || true
     err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B). Refusing at submission."
     set_gate_status "$MARKER_ID" "error"
     bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11).
