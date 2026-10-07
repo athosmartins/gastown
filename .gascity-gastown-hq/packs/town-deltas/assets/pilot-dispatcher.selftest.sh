@@ -7801,13 +7801,15 @@ echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback querie
 # "previous pick" fallback) is ONE helper, _topup_pick_first, so the 4
 # pipelines cannot drift apart: each must END in it (4), and the EPIC-title
 # jq now lives exactly once, inside the helper (1) instead of being copied
-# into every pipeline.
+# into every pipeline. The last pin follows the filter's text: the helper reads a
+# title of ANY type as text (`| tostring`), so one bead with a non-string title
+# cannot make jq fail on the whole candidate array (topup-order selftest C7).
 for _tue3_pat_want in \
   '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0|2' \
   '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|4' \
   '| _topup_pick_first |||4' \
   '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|1' \
-  '"") | test($epic_re; "i")) | not)]|1'; do
+  '"") | tostring) | test($epic_re; "i")) | not)]|1'; do
   _tue3_pat="${_tue3_pat_want%|*}"
   _tue3_want="${_tue3_pat_want##*|}"
   _tue3_count="$(grep -cF -- "$_tue3_pat" "$DISPATCHER" || true)"
