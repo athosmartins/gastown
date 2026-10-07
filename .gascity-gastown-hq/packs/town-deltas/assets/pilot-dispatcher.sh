@@ -4937,10 +4937,9 @@ _filter_built() {
 # ORDER (ga-9t9acg.3): items[] is in the shared work-order rule's order — priority, then feature before
 # the rest, then oldest first (scripts/work-order.sh) — so index 0 is the bead that rule serves first.
 # That is what the painel and approved-state-reconciler.py (_pilot_queue_position) print as "position".
-# It equals what the dispatcher actually serves only once ga-9t9acg.2 moves _top_candidate onto the same
-# rule; until then the dispatcher still picks bug-first/newest-first (_PILOT_SORT_JQ). If the library
-# cannot order the queue the file is NOT rewritten (see _pilot_emit_dispatchable): an old file, never a
-# wrongly-ordered fresh one.
+# It equals what the dispatcher serves: since ga-9t9acg.2 _top_candidate and _queue_preview order the pool
+# through the same rule (_pilot_order_pool). If the library cannot order the queue the file is NOT rewritten
+# (see _pilot_emit_dispatchable): an old file, never a wrongly-ordered fresh one.
 #
 # Env-gated PILOT_EMIT_DISPATCHABLE (default 1). FAIL-OPEN by construction: the
 # whole body is wrapped so ANY error logs a warning and returns 0 — a failed emit
