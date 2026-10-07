@@ -24,6 +24,9 @@ bad() { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 [ -f "$WRAPPER" ] || { echo "FATAL: wrapper not found at $WRAPPER"; exit 1; }
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/claude-pool-account-selftest.XXXXXX")"
+# No scratch directory is not a scratch directory called "": every fake below is built under $W, and without them `security` on PATH is the
+# REAL one (ga-xknkke: a fixture token, sk-ant-oat01-ALLOWED, was found in the real Keychain). Stop before anything runs.
+if [ -z "$W" ] || [ ! -d "$W" ] || [ ! -w "$W" ]; then echo "FATAL: no scratch directory (mktemp -d failed under TMPDIR='${TMPDIR:-/tmp}'): nothing was run"; exit 2; fi
 cleanup() { chmod -R u+w "$W" 2>/dev/null; rm -rf "$W"; }   # B50 makes a directory read-only: undo it if the run is interrupted there
 trap cleanup EXIT
 
@@ -232,6 +235,14 @@ cat > "$BB/ps" <<'EOF'
 cat "$FAKE_KC/ps.out" 2>/dev/null; exit 0
 EOF
 chmod +x "$BB/security" "$BB/secret" "$BB/ps"
+# Everything below reaches the Keychain as `security` on PATH="$BB:/usr/bin:/bin" (run_d, the in-process snippets, B49b). If that does not
+# resolve to the fake - it was not written, or is not executable - the REAL /usr/bin/security answers, and B49b writes a fixture token into
+# the real Keychain (ga-xknkke: 'Claude Code-credentials-0123abcd' holding sk-ant-oat01-ALLOWED). A run that cannot prove it is talking to
+# the fake does not go on.
+sec_seen="$(env -i PATH="$BB:/usr/bin:/bin" /bin/bash -c 'command -v security' 2>/dev/null)"
+if [ "$sec_seen" != "$BB/security" ] || [ ! -x "$BB/security" ]; then
+  echo "FATAL: 'security' on the daemon tests' PATH is '${sec_seen:-<none>}', not the fake $BB/security: stopped before anything could reach the real Keychain"; exit 2
+fi
 
 # mock Anthropic: behaviour per Bearer token from $W/srv.json = {token: {status, h:{header:value}}}; every request token logged
 cat > "$W/mock_api.py" <<'EOF'
@@ -518,6 +529,14 @@ EOF
   w0=$(writes); run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
   case "$fl" in *"refreshToken=no expiresAt=unreadable scopes=['user:inference'] subscriptionType=absent"*) [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] \
       && ok "B14j a blob without expiry / tier -> 'expiresAt=unreadable', 'subscriptionType=absent' (no None that reads like a value), still rewritten" || bad "B14j item=$(item_token | cut -c1-24) writes $w0 -> $(writes)" ;; *) bad "B14j: $fl" ;; esac
+
+  # B14k ...and a JSON null is a third thing, `null` (this daemon's own blob carries one: it must not read as a tier called None either)
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+open(sys.argv[1], "w").write(json.dumps({"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"], "subscriptionType": None}}).encode().hex())
+EOF
+  run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
+  case "$fl" in *"subscriptionType=null"*) ok "B14k subscriptionType: null in the foreign blob -> 'null' (not 'None', not 'absent')" ;; *) bad "B14k: $fl" ;; esac
 
   # B15 steady state is quiet: no rewrite, 'since' does not move
   seeded; s0="$(jget "$STATE" since)"; w0=$(writes); run_d -- run-once; run_d -- run-once

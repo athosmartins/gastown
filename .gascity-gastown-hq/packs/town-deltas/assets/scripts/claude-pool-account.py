@@ -363,6 +363,15 @@ def _etime_s(v: str) -> Optional[int]:
     return ((d * 24 + h) * 60 + mi) * 60 + s
 
 
+def _tier(oauth: dict) -> str:
+    """The blob's subscriptionType as three different things: a key that is not there (`absent`), a JSON null (`null` - this daemon's own
+    blob carries one) and a value. `str(None)` would print 'None' for the first two, a word that reads like a tier."""
+    if "subscriptionType" not in oauth:
+        return "absent"
+    v = oauth["subscriptionType"]
+    return "null" if v is None else str(v)[:24]
+
+
 def describe_foreign_item(user: str) -> str:
     """Who left a credential the daemon did not write? The item cannot say, but its SHAPE can: this daemon's blob has no refresh
     token, scope ['user:inference'] and an expiry in 2100; a `claude` login/refresh writes a refresh token and an expiry hours away.
@@ -382,7 +391,7 @@ def describe_foreign_item(user: str) -> str:
                          f"refreshToken={'yes' if oauth.get('refreshToken') else 'no'} "
                          f"expiresAt={_iso(exp) if exp is not None else 'unreadable'} "
                          f"scopes={sorted(str(s) for s in scopes) if isinstance(scopes, list) else 'unreadable'} "
-                         f"subscriptionType={str(oauth['subscriptionType'])[:24] if 'subscriptionType' in oauth else 'absent'}")
+                         f"subscriptionType={_tier(oauth)}")
         else:
             parts.append("blob shape unreadable")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
