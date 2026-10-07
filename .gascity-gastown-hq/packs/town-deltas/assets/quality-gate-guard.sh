@@ -1988,7 +1988,9 @@ reviewer_session_busy() {
 }
 # SELFTEST-EXTRACT reviewer-session-busy-fn: END
 
-# gate_e13_grace_secs <budget_secs> — how long past its verdict budget Phase C keeps
+# gate_e13_grace_secs <budget_secs> [<spent_before_secs>] — how long past its verdict budget Phase C keeps
+# (<spent_before_secs> = time between run creation and the budget anchor, see gate_phase_c_anchor: the
+# ceiling is measured from run CREATION because that is what the guard ages the run by) —
 # waiting for a reviewer that is still busy: min(budget, GATE_E13_GRACE_MAX_SECS
 # [1800]), CLAMPED so budget+grace never passes the run ceiling: min(
 # GATE_E13_CEILING_SECS [4800], (GATE_RUN_TTL_MINUTES-10)*60 when that TTL is a
@@ -2000,18 +2002,38 @@ reviewer_session_busy() {
 # logs it; this stays pure).
 # SELFTEST-EXTRACT gate-e13-grace-secs-fn: BEGIN
 gate_e13_grace_secs() {
-  local budget="${1:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}" ceil="${GATE_E13_CEILING_SECS:-4800}" ttl="${GATE_RUN_TTL_MINUTES:-}" g room
+  local budget="${1:-0}" spent="${2:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}" ceil="${GATE_E13_CEILING_SECS:-4800}" ttl="${GATE_RUN_TTL_MINUTES:-}" g room
   case "$budget" in ''|*[!0-9]*) budget=0 ;; esac
+  case "$spent" in ''|*[!0-9]*) spent=0 ;; esac   # seconds already spent before the budget clock started (task-sent anchor offset)
   case "$maxg" in ''|*[!0-9]*) maxg=1800 ;; esac
   case "$ceil" in ''|*[!0-9]*) ceil=4800 ;; esac
   if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then echo 0; return 0; fi
   case "$ttl" in ''|*[!0-9]*) ;; *) [ $(( (ttl - 10) * 60 )) -lt "$ceil" ] && ceil=$(( (ttl - 10) * 60 )) ;; esac
   g="$budget"; [ "$g" -gt "$maxg" ] && g="$maxg"
-  room=$(( ceil - budget )); [ "$room" -lt 0 ] && room=0
+  room=$(( ceil - budget - spent )); [ "$room" -lt 0 ] && room=0
   [ "$g" -gt "$room" ] && g="$room"
   echo "$g"
 }
 # SELFTEST-EXTRACT gate-e13-grace-secs-fn: END
+
+# gate_phase_c_anchor <start_epoch> <task_sent_epoch> <now_epoch> — where the verdict budget clock starts.
+# Pure. Prints "<anchor_epoch> <offset_secs> <source>": the task-sent moment when it is a number between
+# start and now ("task-sent"), else the run creation ("created", offset 0). Measured 05–07/10: run created →
+# task sent median 153 s, p90 350 s, 42/268 runs over 300 s (one 6 min of spawn retries) — all of it used
+# to count against the reviewer. Garbage/missing task-sent → created: today's behavior, named.
+# SELFTEST-EXTRACT gate-phase-c-anchor-fn: BEGIN
+gate_phase_c_anchor() {
+  local start="${1:-}" sent="${2:-}" now="${3:-}"
+  case "$start" in ''|*[!0-9]*) start=0 ;; esac
+  case "$now" in ''|*[!0-9]*) now=$(date +%s) ;; esac
+  case "$sent" in ''|*[!0-9]*) printf '%s 0 created\n' "$start"; return 0 ;; esac
+  if [ "$sent" -ge "$start" ] && [ "$sent" -le "$now" ]; then
+    printf '%s %s task-sent\n' "$sent" $(( sent - start ))
+  else
+    printf '%s 0 created\n' "$start"
+  fi
+}
+# SELFTEST-EXTRACT gate-phase-c-anchor-fn: END
 
 # gate_extract_nonblocking_findings <comments_json> — pure. From the LAST comment that carries a
 # standalone "VERDICT: PASS|FAIL" line (the reviewer's verdict; the task text pasted earlier quotes
@@ -3184,6 +3206,8 @@ gate_base_test_sandbox_profile() {
     esac
   fi
   printf '(version 1)\n(allow default)\n(deny network*)\n(deny file-write*)\n'
+  # ga-ufskhy 07/10 (E14 review, finding 7): tests must not (re)start or kill the city's daemons from inside the gate.
+  printf '(deny process-exec (literal "/bin/launchctl") (literal "/usr/bin/osascript"))\n'
   printf '(allow file-write* (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper") (regex #"^/dev/tty"))\n' "$scratch"
   if [ -n "$home" ]; then
     for d in Desktop Documents Downloads Pictures Movies Music "Library/CloudStorage" "Library/Mobile Documents"; do

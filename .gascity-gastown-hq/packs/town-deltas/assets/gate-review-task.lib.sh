@@ -214,7 +214,8 @@ how certain the issue feels.
 
 WHAT BLOCKS (verdict FAIL): a defect you can ground in specific changed
 lines that changes BEHAVIOR: incorrect output or state, a failing test (new or
-existing), data loss, a crash, a security hole. The third-state family BLOCKS
+existing, that this diff made fail — one already red on the base for the same test
+id is pre-existing and non-blocking), data loss, a crash, a security hole. The third-state family BLOCKS
 too, always: a log, status or return value that reports success when the
 operation failed; a silent fallback or swallowed error that hides a failure; a
 read that could not be made ("unknown") turned into a yes or a no; a test that
@@ -242,12 +243,20 @@ false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycl
 on correct code. Be adversarial about whether the CODE actually has the
 defect, never about whether a real finding deserves to be reported: verify
 each issue is real, then report everything real you find, at its true severity.${GATE_E5_COV_RULES:-}
-TIME BUDGET: the verdict budget of this run is ${GATE_REVIEW_BUDGET_MINUTES:-unknown} minutes from the
-moment your task landed. Past it the run gets a short grace only while you are visibly
-mid-turn, and past that it is thrown away and reviewed again from zero by someone else —
-your work is lost. Plan to deliver with margin: when about 8 minutes of the budget remain,
-stop starting test runs, deliver the verdict you can defend from what you verified, and say
-in the Summary which checks you did not get to run (that is honest coverage, not a FAIL).
+TIME BUDGET: the verdict budget of this run is ${GATE_REVIEW_BUDGET_MINUTES:-unknown} minutes, counted
+from the moment your task was sent to you. Past it the run gets a short grace only while you
+are visibly mid-turn, and past that it is thrown away and reviewed again from zero by someone
+else — your work is lost. Plan to deliver with margin: when about 8 minutes remain, stop
+starting test runs, deliver the verdict you can defend from what you verified, and say in the
+Summary which checks you did not get to run (that is honest coverage, not a FAIL).
+RUNNING TESTS: a foreground shell command is capped at 600 s, so never wrap a suite in a
+timeout you expect it to hit — a run killed by your own cap while it was passing is a run
+paid for nothing. Long runs: start them in the background (run_in_background or nohup),
+poll, and split per file; never restart a run your own cap killed; never run the whole
+tests/ directory. A test that is already red on the reviewed base for the SAME test id is
+pre-existing: report it as non-blocking — a failing test blocks only when this diff made it
+fail. Mutation and reproduction probes you write yourself are not covered by any of this:
+run them, they are the best defence the gate has.
 TASK
 }
 

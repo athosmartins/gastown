@@ -7223,6 +7223,7 @@ gate_merged_path_vm_gate() {
   # two paths sets it for the same reason.
   bd -C "$bead_city" label add "$bead_id" "gate:passed" -q 2>/dev/null \
     || warn "Could not add gate:passed to $bead_id — the Pilot may re-dispatch the held bead (ga-buac0o)."
+  bd -C "$bead_city" label remove "$bead_id" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
   # A bead that failed an earlier gate cycle must not wear gate:passed next to gate:failed /
   # gate:needs-fix: story-delivery refuses to trust that pair (ga-266z8). The PASS path and the story
   # hand-off on these same two paths clear it first (ga-tuk26/ga-divv8); so does the hold.
@@ -8693,6 +8694,7 @@ fi
       # gate:passed is BOTH the success label AND story-delivery's pickup signal
       # (story-delivery selects story:approved + gate:passed, excluding story:done).
       bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
       # ga-tuk26: clear residue from an EARLIER failed cycle on this SAME bead.
       # gate:failed/gate:needs-fix are only ever ADDED on FAIL (~line 3923/3987
       # above), never REMOVED on a later PASS — so a bead that fails once then
@@ -11961,6 +11963,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       BRANCH_SHA=$(extract "branch_sha")
       MARKER_ID=$(extract "marker_id")
       PC_STARTED_AT=$(extract "started_at")
+      PC_TASK_SENT_AT=$(printf '%s' "$PC_RUN" | jq -r 'if type=="array" then .[0] else . end | [(.labels // [])[] | select(startswith("task-sent-at:")) | sub("^task-sent-at:";"")] | last // ""' 2>/dev/null) || PC_TASK_SENT_AT=""
       PC_TIMEOUT_MIN=$(extract "verdict_timeout_minutes")
       # ga-syxaki (E5, gate attempt 1, blocking issue 3): the arm Step 5 persisted in THIS run's record. It is the only arm Phase C
       # may act on: a run admitted while the flag was off, an older run, or one whose arm was never measured carries no "B" here
@@ -12088,7 +12091,14 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       PC_START_EPOCH=$(_ts_to_epoch "$PC_STARTED_AT")
       case "$PC_START_EPOCH" in ''|*[!0-9]*) PC_START_EPOCH=$(date +%s) ;; esac
       PC_NOW_EPOCH=$(date +%s)
-      PC_ELAPSED=$(( PC_NOW_EPOCH - PC_START_EPOCH ))
+      # ga-ufskhy 07/10: the budget counts from the task-sent anchor when the run recorded one (gate_phase_c_anchor);
+      # PC_START_EPOCH (run creation) stays the age the guard and E5 reason about.
+      PC_ANCHOR_EPOCH="$PC_START_EPOCH"; PC_ANCHOR_OFFSET=0; PC_ANCHOR_SRC="created"
+      if declare -F gate_phase_c_anchor >/dev/null 2>&1; then
+        read -r PC_ANCHOR_EPOCH PC_ANCHOR_OFFSET PC_ANCHOR_SRC <<< "$(gate_phase_c_anchor "$PC_START_EPOCH" "${PC_TASK_SENT_AT:-}" "$PC_NOW_EPOCH")"
+        case "$PC_ANCHOR_EPOCH" in ''|*[!0-9]*) PC_ANCHOR_EPOCH="$PC_START_EPOCH"; PC_ANCHOR_OFFSET=0; PC_ANCHOR_SRC="created" ;; esac
+      fi
+      PC_ELAPSED=$(( PC_NOW_EPOCH - PC_ANCHOR_EPOCH ))
       PC_TIMEOUT_SECS=$(( PC_TIMEOUT_MIN * 60 ))
       GATE_START_EPOCH="$PC_START_EPOCH"
       QUOTA_REQUEUE=0
@@ -12114,7 +12124,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # PC_GRACE_DESC says why it is what it is: nolib (harness / lib absent) | off (operator) | Ns.
       PC_GRACE_SECS=0; PC_GRACE_DESC="nolib"
       if declare -F gate_e13_grace_secs >/dev/null 2>&1; then
-        PC_GRACE_SECS=$(gate_e13_grace_secs "$PC_TIMEOUT_SECS") || PC_GRACE_SECS=0
+        PC_GRACE_SECS=$(gate_e13_grace_secs "$PC_TIMEOUT_SECS" "${PC_ANCHOR_OFFSET:-0}") || PC_GRACE_SECS=0
         case "$PC_GRACE_SECS" in ''|*[!0-9]*) PC_GRACE_SECS=0 ;; esac
         if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then PC_GRACE_DESC="off"; else PC_GRACE_DESC="${PC_GRACE_SECS}s"; fi
       fi
@@ -12275,7 +12285,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
             PC_WAIT_DESC="${PC_TIMEOUT_MIN} minutes + $(( PC_GRACE_SECS / 60 )) min E13 grace"
             if declare -F gate_e13_event >/dev/null 2>&1; then gate_e13_event e13_outcome grace-exhausted "$PC_ELAPSED" "$PC_TIMEOUT_SECS" "$PC_GRACE_SECS" "$PC_BUSY_SID"; fi
           fi
-          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s, grace=${PC_GRACE_DESC:-nolib}, busy=${PC_BUSY_STATE:-0}, judged_fails=${GATE_COLLECT_JUDGED_FAILS:-0}) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
+          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s, grace=${PC_GRACE_DESC:-nolib}, busy=${PC_BUSY_STATE:-0}, judged_fails=${GATE_COLLECT_JUDGED_FAILS:-0}, anchor=${PC_ANCHOR_SRC:-created}${PC_ANCHOR_OFFSET:++${PC_ANCHOR_OFFSET}s}) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
           # SELFTEST-EXTRACT phase-c-timeout-classify: BEGIN
           OVERALL_VERDICT="FAIL"
           # ga-h8vc8y: gate_collect_verdicts() ran at the top of this Phase C
@@ -12355,7 +12365,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           gate_finalize_run
         fi
       else
-        log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) still in flight ($VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, ${PC_ELAPSED}s/${PC_TIMEOUT_SECS}s) — leaving for a future sweep."
+        log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) still in flight ($VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, ${PC_ELAPSED}s/${PC_TIMEOUT_SECS}s, anchor=${PC_ANCHOR_SRC:-created}${PC_ANCHOR_OFFSET:++${PC_ANCHOR_OFFSET}s}) — leaving for a future sweep."
       fi
       # SELFTEST-EXTRACT phase-c-verdict-decision: END
     done
@@ -12761,6 +12771,7 @@ if [ "$NEEDS_REBASE_COUNT" -gt 0 ]; then
             # STORY → hand off to story-delivery, same as Step 4b's already-merged
             # path: gate:passed is delivery's pickup signal; do not close here.
             bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+            bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
             # ga-tuk26: clear residue from an earlier failed cycle — see the
             # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
             bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
@@ -14300,6 +14311,7 @@ if [ "$ALREADY_MERGED" = "1" ]; then
           # gate:superseded on a story: that label is a non-delivery word the painel
           # would mis-route, and superseded is not the story's outcome (it WAS merged).
           bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:passed" -q 2>/dev/null || true
+          bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:queued" -q 2>/dev/null || true   # ga-ufskhy 07/10: passed is not queued (ga-i0n83 contradiction)
           # ga-tuk26: clear residue from an earlier failed cycle — see the
           # PASS-path sibling (ga-esbg block, ~line 3545) for full rationale.
           bd -C "$BEAD_CITY" label remove "$BEAD_ID" "gate:failed" -q 2>/dev/null || true
@@ -17240,6 +17252,16 @@ This bead ID will be delivered to the reviewer session via nudge with exact comm
     log "  Review task SUBMITTED to session $SESSION_ID (reviewer $i) — ACK pending (Step 7b)"
   else
     warn "  Initial queue/submit to session $SESSION_ID failed — Step 7b will retry (reviewer $i)"
+  fi
+  # ga-ufskhy 07/10: the verdict budget clock starts when the FIRST reviewer has its task, not when the
+  # run bead was created (median 153 s, p90 350 s earlier). Phase C reads this label; missing → created.
+  if [ "$i" = "1" ]; then
+    _TSA=$(date +%s)
+    if bd -C "$GC_CITY" label add "$GATE_RUN_ID" "task-sent-at:$_TSA" -q 2>/dev/null; then
+      log "  task-sent-at:$_TSA recorded on gate-run $GATE_RUN_ID (budget anchor)"
+    else
+      warn "  could not record task-sent-at on gate-run $GATE_RUN_ID — Phase C will count the budget from run creation (older, stricter)"
+    fi
   fi
 
   # ga-mepb0 (EDIT #2, defense-in-depth): stagger the NEXT reviewer's spawn so the

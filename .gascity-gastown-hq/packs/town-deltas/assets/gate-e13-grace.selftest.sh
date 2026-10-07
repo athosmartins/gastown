@@ -34,6 +34,7 @@ extract_block() {
 FN_ISO="$(extract_block "$GUARD" "gate-iso-to-epoch-fn")"
 FN_PROG="$(extract_block "$GUARD" "reviewer-session-busy-fn")"
 FN_GRACE="$(extract_block "$GUARD" "gate-e13-grace-secs-fn")"
+FN_ANCHOR="$(extract_block "$GUARD" "gate-phase-c-anchor-fn")"
 FN_ALIVE="$(extract_block "$GUARD" "reviewer-session-alive-fn")"
 FN_CLOSED="$(extract_block "$DISPATCHER" "reviewer-session-confirmed-closed-fn")"
 FN_CLASSIFY="$(extract_block "$DISPATCHER" "phase-c-closed-reviewer-classify-fn")"
@@ -41,7 +42,7 @@ FN_VBSA="$(extract_block "$DISPATCHER" "vb-status-action-fn")"
 FN_EVENT="$(extract_block "$DISPATCHER" "gate-e13-event-fn")"
 REHYDRATE="$(extract_block "$DISPATCHER" "phase-c-verdict-rehydrate")"
 DECISION="$(extract_block "$DISPATCHER" "phase-c-verdict-decision")"
-for v in FN_ISO FN_PROG FN_GRACE FN_ALIVE FN_CLOSED FN_CLASSIFY FN_VBSA FN_EVENT REHYDRATE DECISION; do
+for v in FN_ISO FN_PROG FN_GRACE FN_ANCHOR FN_ALIVE FN_CLOSED FN_CLASSIFY FN_VBSA FN_EVENT REHYDRATE DECISION; do
   if [ -z "${!v}" ]; then echo "FATAL: could not extract $v — sentinel moved/renamed?" >&2; exit 2; fi
 done
 if printf '%s' "$DECISION" | grep -q 'E13 GRACE'; then ok "the live decision block carries the E13 grace branch"; else bad "the live decision block has no E13 grace branch"; fi
@@ -106,6 +107,20 @@ eq "GATE_RUN_TTL_MINUTES=60 → ceiling (60-10)*60=3000 → budget 3000 gets 0" 
 eq "GATE_RUN_TTL_MINUTES=90 → ceiling 4800 (same as default)" "$(GATE_RUN_TTL_MINUTES=90 gate_e13_grace_secs 3000)" "1800"
 eq "GATE_RUN_TTL_MINUTES=junk → ignored" "$(GATE_RUN_TTL_MINUTES=abc gate_e13_grace_secs 3000)" "1800"
 eq "GATE_RUN_TTL_MINUTES=200 → the 4800 ceiling still binds" "$(GATE_RUN_TTL_MINUTES=200 gate_e13_grace_secs 3000)" "1800"
+eq "spent-before offset 300 → room shrinks: budget 3000 → 1500" "$(gate_e13_grace_secs 3000 300)" "1500"
+eq "spent-before offset eats all room: budget 3000, spent 1800 → 0" "$(gate_e13_grace_secs 3000 1800)" "0"
+eq "spent-before junk → ignored" "$(gate_e13_grace_secs 3000 abc)" "1800"
+eq "spent-before with a small budget: 1560 + 600 spent → min(1560, 4800-1560-600=2640) = 1560" "$(gate_e13_grace_secs 1560 600)" "1560"
+
+echo "— gate_phase_c_anchor (where the budget clock starts) —"
+eval "$FN_ANCHOR"
+eq "task-sent between start and now → anchor=task-sent with the offset" "$(gate_phase_c_anchor 1000 1153 2000)" "1153 153 task-sent"
+eq "task-sent missing → created, 0" "$(gate_phase_c_anchor 1000 "" 2000)" "1000 0 created"
+eq "task-sent junk → created, 0" "$(gate_phase_c_anchor 1000 ontem 2000)" "1000 0 created"
+eq "task-sent before start (clock skew / wrong label) → created, 0" "$(gate_phase_c_anchor 1000 900 2000)" "1000 0 created"
+eq "task-sent in the future → created, 0" "$(gate_phase_c_anchor 1000 2500 2000)" "1000 0 created"
+eq "task-sent == start → task-sent, 0" "$(gate_phase_c_anchor 1000 1000 2000)" "1000 0 task-sent"
+eq "junk start → 0 start, created" "$(gate_phase_c_anchor x "" 2000)" "0 0 created"
 
 echo "— the LIVE Phase C decision block —"
 VB1='{"id":"ga-vb1","status":"open","assignee":"'"$N"'","labels":["gate-run:ga-run1","reviewer-index:1","type:quality-gate-verdict","verdict:pending"],"metadata":{"gc.session_name":"'"$N"'"}}'
@@ -175,25 +190,25 @@ grep -q "REACHED_END" "$WORK/case.log" || show_out
 
 echo "  · C2: 4801s elapsed (past budget + grace ceiling), same progressing reviewer → TIMED OUT as before, the record says why"
 run_case 4801 "$(roster active "$(iso_local $((NOW-60)))")"
-has "C2 times out past the ceiling" "$WORK/case.log" "TIMED OUT after 4801s (limit=3000s, grace=1800s, busy=1, judged_fails=0)"
+has "C2 times out past the ceiling" "$WORK/case.log" "TIMED OUT after 4801s (limit=3000s, grace=1800s, busy=1, judged_fails=0, anchor=created)"
 hasnt "C2 no grace line" "$WORK/case.log" "E13 GRACE"
 has "C2 finalizes as FAIL (today's path, unchanged)" "$WORK/case.log" "finalize_called:QUOTA_REQUEUE=0:REQUEUE_REASON=quota:OVERALL=FAIL"
 grep -q "finalize_called" "$WORK/case.log" || show_out
 
 echo "  · C3: 3100s, reviewer active but silent for 2000s → no grace (alive is not progressing)"
 run_case 3100 "$(roster active "$(iso_utc $((NOW-2000)))")"
-has "C3 times out with progressing=0" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=1800s, busy=0, judged_fails=0)"
+has "C3 times out with progressing=0" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=1800s, busy=0, judged_fails=0, anchor=created)"
 hasnt "C3 no grace" "$WORK/case.log" "E13 GRACE"
 
 echo "  · C4: 3100s, reviewer asleep + fresh last_active → no grace"
 run_case 3100 "$(roster asleep "$(iso_utc $((NOW-10)))")"
-has "C4 times out, progressing=0" "$WORK/case.log" "busy=0, judged_fails=0) with 0/1 verdicts. Treating as FAIL."
+has "C4 times out, progressing=0" "$WORK/case.log" "busy=0, judged_fails=0, anchor=created) with 0/1 verdicts. Treating as FAIL."
 
 echo "  · C5: 3100s, progressing, but the kill file exists → grace=0, times out"
 touch "$GC_CITY/.gc/gate-e13-grace.off"
 run_case 3100 "$(roster active "$(iso_utc $((NOW-60)))")"
 rm -f "$GC_CITY/.gc/gate-e13-grace.off"
-has "C5 kill file: grace=0 in the record" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=off, busy=1, judged_fails=0)"
+has "C5 kill file: grace=0 in the record" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=off, busy=1, judged_fails=0, anchor=created)"
 hasnt "C5 no grace line" "$WORK/case.log" "E13 GRACE"
 
 echo "  · C6: 3100s, progressing, GATE_E13_GRACE=0 → times out"
@@ -218,11 +233,11 @@ has "C9 grace still applies" "$WORK/case.log" "E13 GRACE"
 
 echo "  · C10: GATE_E13_MAX_IDLE_SECS=30 with a reviewer 60s silent → not progressing under the operator's stricter bar"
 GATE_E13_MAX_IDLE_SECS=30 run_case 3100 "$(roster active "$(iso_utc $((NOW-60)))")"
-has "C10 the stricter idle bar is honored" "$WORK/case.log" "busy=0, judged_fails=0) with 0/1 verdicts"
+has "C10 the stricter idle bar is honored" "$WORK/case.log" "busy=0, judged_fails=0, anchor=created) with 0/1 verdicts"
 
 echo "  · C11: within budget (2900s) nothing changes — the still-in-flight line, no grace line"
 run_case 2900 "$(roster active "$(iso_utc $((NOW-60)))")"
-has "C11 still in flight" "$WORK/case.log" "still in flight (0/1 verdicts, 2900s/3000s)"
+has "C11 still in flight" "$WORK/case.log" "still in flight (0/1 verdicts, 2900s/3000s, anchor=created)"
 hasnt "C11 no grace line inside the budget" "$WORK/case.log" "E13 GRACE"
 
 echo "  · C12: two reviewers, the FIRST alive-but-idle (2000s silent), the SECOND busy → grace (the scan does not stop at the first live one)"
@@ -233,7 +248,7 @@ hasnt "C12 no timeout" "$WORK/case.log" "TIMED OUT after"
 
 echo "  · C13: busy reviewer but a judged FAIL is already in → no grace (waiting cannot change the outcome)"
 JUDGED_FAILS_V=1 run_case 3100 "$(roster active "$(iso_utc $((NOW-60)))")"
-has "C13 times out at the budget with the reason in the record" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=1800s, busy=1, judged_fails=1)"
+has "C13 times out at the budget with the reason in the record" "$WORK/case.log" "TIMED OUT after 3100s (limit=3000s, grace=1800s, busy=1, judged_fails=1, anchor=created)"
 hasnt "C13 no grace" "$WORK/case.log" "E13 GRACE"
 has "C13 the wait text is the plain budget (no grace was granted)" "$WORK/case.log" "did not complete within 50 minutes"
 

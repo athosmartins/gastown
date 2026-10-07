@@ -260,6 +260,7 @@ trap '[ -n "${H_SCRATCH:-}" ] && rm -rf "$H_SCRATCH"' EXIT
 if need_fn gate_base_test_sandbox_profile; then
   echo "  -- gate_base_test_sandbox_profile --"
   P=$(gate_base_test_sandbox_profile /private/tmp/scr /Users/someone)
+  case "$P" in *'(deny process-exec (literal "/bin/launchctl") (literal "/usr/bin/osascript"))'*) ok "profile denies launchctl/osascript (a test must not restart or kill the city's daemons, ga-ufskhy 07/10)" ;; *) bad "profile does not deny launchctl/osascript: $P" ;; esac
   case "$P" in *"(deny network*)"*) ok "profile denies all network" ;; *) bad "profile does not deny network: $P" ;; esac
   case "$P" in *"(deny file-write*)"*) ok "profile denies all file writes by default" ;; *) bad "profile does not deny writes" ;; esac
   case "$P" in *'(subpath "/private/tmp/scr")'*) ok "profile allows writes only under the scratch subpath" ;; *) bad "scratch subpath not allowed" ;; esac
