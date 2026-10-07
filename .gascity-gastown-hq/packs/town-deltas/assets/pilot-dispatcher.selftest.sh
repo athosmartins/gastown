@@ -400,7 +400,7 @@ JSON
       dep_bead="${FAKE_DEP_BEAD:-}"
       prefix=""
       if [ -n "$dep_bead" ]; then
-        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-06-15T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"  # newer than tt-blkd (2026-06-01) so newest-first still picks tt-depblk in Scenario 8 (dep-clear intent preserved)
+        prefix="{\"id\":\"tt-depblk\",\"title\":\"Explicit-dep bug fixture\",\"priority\":0,\"issue_type\":\"bug\",\"description\":\"fixture body\",\"status\":\"open\",\"labels\":[],\"assignee\":null,\"created_at\":\"2026-05-15T00:00:00Z\",\"metadata\":{\"story.depends_on_beads\":\"$dep_bead\"}},"  # OLDER than tt-blkd (2026-06-01) so oldest-first (ga-9t9acg.2) still picks tt-depblk in Scenario 8 (dep-clear intent preserved; was 06-15 under the retired newest-first order)
       fi
       cat <<JSON
 [
@@ -7209,10 +7209,11 @@ _nc_claimed=0
 for _nc_id in wa-nc4 wa-nc5 wa-nc6; do
   [ "$(capq_n "label add $_nc_id pilot:dispatching")" -ge 1 ] && _nc_claimed=$((_nc_claimed + 1))
 done
-# WHICH candidate is the one is not asserted: _top_candidate() ranks equal-priority beads NEWEST-first
-# (_PILOT_SORT_JQ, created_at DESC), so it is wa-nc6 here — an earlier draft of this assertion hard-coded the
-# oldest (wa-nc4) and failed against the real dispatcher (measured: "Lane picks — small: wa-nc6"). The tiebreak
-# is a product policy that can change; the property under test is "ONE claim, then the phase halts".
+# WHICH candidate is the one is not asserted: _top_candidate() ranks equal-priority beads by the city-wide work
+# order (scripts/work-order.sh; ga-9t9acg.2 made it OLDEST-first — it was NEWEST-first via _PILOT_SORT_JQ, which is
+# why an earlier draft that hard-coded the oldest (wa-nc4) failed once and this assertion stopped naming one).
+# The tiebreak is a product policy that has already changed once; the property under test is "ONE claim, then the
+# phase halts".
 [ "$_nc_claimed" = "1" ] \
   && ok "CAPQ-I2: with the pre-claim skip OFF exactly ONE candidate reached dispatch_one() and found the count unreadable — the other 2 were never claimed (ga-5je3zv halt; was: all 3)" \
   || bad "CAPQ-I2: $_nc_claimed of 3 candidates were claimed with the pre-claim skip OFF — expected exactly 1; the dispatch phase should halt on the first unreadable count"
@@ -9106,6 +9107,12 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 # slots — measured live: ~4h stall, 2026-07-31 03:50-07:50 (human-noticed, no
 # alarm fired). Fix: scan rigs again, post-lane, whenever DISPATCHED==0 and
 # Step 2c itself did not already run this sweep (STEP2C_RAN unset).
+#
+# SUPERSEDED MECHANISM (ga-9t9acg.2): that post-lane Step 4b and STEP2C_RAN are gone. The rig DBs now JOIN the HQ
+# pool in Step 2c, once, before the lanes, and ONE ordered pool is walked — so the HQ-vetoed-but-rig-has-work case
+# (the 4h stall) is covered by the same loop, and a rig P0 feature beats an HQ P2. The scenarios below keep the
+# ga-y1m40 outcomes (a rig bead IS dispatched when every HQ candidate is vetoed and slots are free; the empty-pool log
+# line is unchanged) and assert the new mechanism; U1-U3 pin the union order.
 
 # run_y1m40: real end-to-end DRY_RUN sweep for the ga-y1m40 fix.
 #   $1 = FAKE_BUGS_JSON               (HQ Tier1 bug/debt fixture; "[]" = HQ empty)
@@ -9113,13 +9120,29 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 #   $3 = PILOT_RIG_FALLBACK_OVERRIDE  (rig Tier1/Tier2 fixture JSON — hermetic
 #        seam added by this fix; bypasses the real gc/bd rig-scan loop, mirrors
 #        PILOT_WA_RIG_TIER2_OVERRIDE)
+#   $4 = "broken-timeout" → a `timeout` that always fails FIRST on PATH, so the live session count is unreadable
+#        (ga-9t9acg.2-U4); anything else → the count is readable.
+#
+# ga-9t9acg.2: the rig JOIN is gated on the live session count being readable (ga-5je3zv), and the count probe runs
+# `timeout N gc session list --json`. These fixtures run on PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin", and a host
+# whose `timeout` lives elsewhere (macOS + Homebrew: /opt/homebrew/bin) cannot run the probe — the count would be
+# "unreadable", the join (correctly) skipped, and the union scenarios would be testing the halt gate, not the union
+# (found by the full run on such a host: 10 reds, none of them an order bug). So the readable case gets a pass-through
+# `timeout` LAST on PATH (a real one earlier on PATH wins), and the unreadable case gets a failing one FIRST — the
+# count's state no longer depends on the host.
+Y1M40_TO_OK="$WORK/y1m40-timeout-ok"; Y1M40_TO_BAD="$WORK/y1m40-timeout-broken"
+mkdir -p "$Y1M40_TO_OK" "$Y1M40_TO_BAD"
+printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$Y1M40_TO_OK/timeout"
+printf '#!/usr/bin/env bash\nexit 124\n' > "$Y1M40_TO_BAD/timeout"
+chmod +x "$Y1M40_TO_OK/timeout" "$Y1M40_TO_BAD/timeout"
 run_y1m40() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
+  local _y_pre=""; [ "${4:-}" = "broken-timeout" ] && _y_pre="$Y1M40_TO_BAD:"
   env -i \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
-    PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin" \
+    PATH="$_y_pre$SHIMBIN:/usr/bin:/bin:/usr/local/bin:$Y1M40_TO_OK" \
     HOME="$HOME" \
     PILOT_RAM_LEVEL_FILE="/nonexistent-hermetic-ram-level-for-tests" \
     DRY_RUN=1 \
@@ -9171,6 +9194,13 @@ Y1M40_HQ_VETOED='[{"id":"tt-y1m40-hq","title":"HQ bug fixture, permanently vetoe
 Y1M40_HQ_FREE='[{"id":"tt-y1m40-hqfree","title":"HQ bug fixture, genuinely dispatchable","priority":0,"issue_type":"bug","description":"fixture body — HQ candidate with no competing ownership signal, 80+ chars to clear the spec floor","status":"open","labels":[],"assignee":null,"created_at":"2026-06-01T00:00:00Z","metadata":{}}]'
 Y1M40_RIG_BUG='[{"id":"wa-y1m40rig","title":"rig bug fixture, buildable","priority":1,"issue_type":"bug","description":"fixture body — rig-native bug, no competing ownership signal, 80+ chars to clear the spec floor","status":"open","labels":[],"assignee":null,"created_at":"2026-06-02T00:00:00Z","metadata":{}}]'
 
+# ga-9t9acg.2: the rig DBs JOIN the HQ pool in Step 2c (one union, ordered once); Step 4b is gone. AC1 (a vetoed
+# HQ pool must not hide the rig backlog) now holds because the lane loop walks the WHOLE union; AC2 (HQ
+# precedence) is retired — "HQ first" was the first-store-that-yields rule the work order forbids, and priority
+# decides instead (scenarios ga-9t9acg.2-U* below). AC3 (the empty-HQ path) is unchanged.
+#   _nth_title <log> <bead-id> — the line number of the bead's dispatch ("Task title:") in the sweep log, "" if none.
+_nth_title() { printf '%s\n' "$1" | grep -n "Task title:.*$2" | head -1 | cut -d: -f1; }
+
 echo "Scenario ga-y1m40-a (AC1): HQ candidate vetoed (dispatched=0) + rig has buildable work + free slots -> rig candidate IS dispatched"
 LOG_Y1M40A="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "$Y1M40_RIG_BUG")"
 if echo "$LOG_Y1M40A" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
@@ -9178,13 +9208,13 @@ if echo "$LOG_Y1M40A" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
 else
   bad "ga-y1m40 AC1 REGRESSION: rig candidate NOT dispatched even though HQ's only candidate was vetoed and slots were free — the exact 4h-stall bug"
 fi
-if echo "$LOG_Y1M40A" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
-  ok "ga-y1m40 AC1: the new post-lane fallback log line fired"
+if echo "$LOG_Y1M40A" | grep "ga-9t9acg.2: HQ pool has 1 candidate(s) — scanning rig DBs to JOIN" >/dev/null; then
+  ok "ga-y1m40 AC1: the rig scan announced itself as a JOIN of the HQ pool (not a post-lane fallback)"
 else
-  bad "ga-y1m40 AC1: post-lane fallback did not announce itself in the log"
+  bad "ga-y1m40 AC1: the rig scan did not announce the join in the log"
 fi
 if echo "$LOG_Y1M40A" | grep -E "dispatched=1 " >/dev/null; then
-  ok "ga-y1m40 AC1: sweep summary reports dispatched=1 (rescued by the rig fallback, not stuck at 0)"
+  ok "ga-y1m40 AC1: sweep summary reports dispatched=1 (rescued by the rig pool, not stuck at 0)"
 else
   bad "ga-y1m40 AC1: sweep summary did not report a successful dispatch"
 fi
@@ -9198,26 +9228,37 @@ if echo "$LOG_Y1M40A" | grep "Task title:.*tt-y1m40-hq" >/dev/null; then
 else
   ok "ga-y1m40 AC1: the permanently-vetoed HQ bead (tt-y1m40-hq) correctly never dispatches"
 fi
+if echo "$LOG_Y1M40A" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
+  bad "ga-y1m40 AC1: the retired Step 4b post-lane fallback fired — the scan must happen ONCE, before the lane loops"
+else
+  ok "ga-y1m40 AC1: no post-lane (Step 4b) rescan — the one union scan already covered the rigs"
+fi
 
-echo "Scenario ga-y1m40-b (AC2 non-regression): HQ candidate IS dispatchable -> HQ wins, rig fallback NEVER triggers (no inverted priority, no wasted scan)"
+echo "Scenario ga-y1m40-b (AC2, rewritten by ga-9t9acg.2): HQ P0 bug dispatchable + rig P1 bug -> ONE pool: HQ P0 first by PRIORITY, the rig P1 after it in the same sweep"
 LOG_Y1M40B="$(run_y1m40 "$Y1M40_HQ_FREE" "" "$Y1M40_RIG_BUG")"
-if echo "$LOG_Y1M40B" | grep "Task title:.*tt-y1m40-hqfree" >/dev/null; then
-  ok "ga-y1m40 AC2: a genuinely dispatchable HQ candidate still dispatches (HQ precedence intact)"
+_lb_hq="$(_nth_title "$LOG_Y1M40B" tt-y1m40-hqfree)"; _lb_rig="$(_nth_title "$LOG_Y1M40B" wa-y1m40rig)"
+if [ -n "$_lb_hq" ]; then
+  ok "ga-y1m40 AC2: the dispatchable HQ P0 candidate dispatches"
 else
   bad "ga-y1m40 AC2 REGRESSION: dispatchable HQ candidate did NOT dispatch"
 fi
-if echo "$LOG_Y1M40B" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
-  bad "ga-y1m40 AC2 REGRESSION: rig candidate dispatched even though the HQ candidate was itself dispatchable — HQ->rig priority inverted"
+if [ -n "$_lb_rig" ]; then
+  ok "ga-y1m40 AC2: the rig P1 candidate is in the SAME pool and dispatches too while slots are free (no 'HQ first, rigs only if nothing went')"
 else
-  ok "ga-y1m40 AC2: rig candidate never considered when HQ already had a dispatchable candidate"
+  bad "ga-y1m40 AC2: the rig candidate never dispatched although a lane slot was free — the rig DBs did not join the pool"
+fi
+if [ -n "$_lb_hq" ] && [ -n "$_lb_rig" ] && [ "$_lb_hq" -lt "$_lb_rig" ]; then
+  ok "ga-y1m40 AC2: P0 (HQ) is dispatched BEFORE P1 (rig) — by priority, not by store"
+else
+  bad "ga-y1m40 AC2: order wrong (HQ P0 at line [$_lb_hq], rig P1 at line [$_lb_rig]) — priority must decide, in either store"
 fi
 if echo "$LOG_Y1M40B" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
-  bad "ga-y1m40 AC2 REGRESSION: post-lane rig fallback fired even though HQ successfully dispatched (dispatched!=0) — wasted scan"
+  bad "ga-y1m40 AC2 REGRESSION: the retired Step 4b post-lane fallback fired"
 else
-  ok "ga-y1m40 AC2: post-lane rig fallback correctly did NOT fire when HQ already dispatched"
+  ok "ga-y1m40 AC2: no post-lane rescan (Step 4b is retired)"
 fi
 
-echo "Scenario ga-y1m40-c (AC3 non-regression): HQ pool genuinely EMPTY -> old Step 2c path still fires exactly as before, and the NEW fallback does not double-scan"
+echo "Scenario ga-y1m40-c (AC3 non-regression): HQ pool genuinely EMPTY -> the empty-pool announcement is unchanged, and the rigs are scanned exactly ONCE"
 LOG_Y1M40C="$(run_y1m40 "[]" "" "$Y1M40_RIG_BUG")"
 if echo "$LOG_Y1M40C" | grep "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback" >/dev/null; then
   ok "ga-y1m40 AC3: original Step 2c empty-pool log line still fires unchanged"
@@ -9225,37 +9266,110 @@ else
   bad "ga-y1m40 AC3 REGRESSION: Step 2c empty-pool fallback log line missing"
 fi
 if echo "$LOG_Y1M40C" | grep "Task title:.*wa-y1m40rig" >/dev/null; then
-  ok "ga-y1m40 AC3: rig candidate still dispatches via the original empty-pool path"
+  ok "ga-y1m40 AC3: rig candidate still dispatches via the empty-pool path"
 else
   bad "ga-y1m40 AC3 REGRESSION: rig candidate not dispatched when HQ pool is genuinely empty"
 fi
-if echo "$LOG_Y1M40C" | grep "ga-y1m40: HQ pool had candidate(s) but dispatched=0" >/dev/null; then
-  bad "ga-y1m40 AC3: the NEW post-lane fallback fired on top of the OLD Step 2c path (STEP2C_RAN guard not respected — double-scan)"
+_lc_scans="$(printf '%s\n' "$LOG_Y1M40C" | grep -c 'scanning rig DBs')" || _lc_scans=0
+if [ "$_lc_scans" = "1" ]; then
+  ok "ga-y1m40 AC3: the rig DBs were scanned exactly once this sweep (no double-scan)"
 else
-  ok "ga-y1m40 AC3: STEP2C_RAN guard correctly suppresses the new post-lane fallback when Step 2c itself already ran"
+  bad "ga-y1m40 AC3: the rig DBs were scanned $_lc_scans times in one sweep — expected exactly 1"
 fi
 
-echo "Scenario ga-y1m40-d (control): HQ vetoed AND rig fallback finds nothing -> dispatched=0, no crash, clean log"
+echo "Scenario ga-y1m40-d (control): HQ vetoed AND rig scan finds nothing -> dispatched=0, no crash, clean log"
 LOG_Y1M40D="$(run_y1m40 "$Y1M40_HQ_VETOED" "tt-y1m40-hq" "[]")"
 if echo "$LOG_Y1M40D" | grep -E "dispatched=0 " >/dev/null; then
   ok "ga-y1m40 control: dispatched=0 when neither HQ nor rig has anything dispatchable (no false dispatch, no crash)"
 else
   bad "ga-y1m40 control: unexpected dispatch outcome when nothing should be dispatchable"
 fi
-if echo "$LOG_Y1M40D" | grep "ga-y1m40: rig DB fallback scan found no additional candidates" >/dev/null; then
-  ok "ga-y1m40 control: empty rig fallback scan is logged explicitly (not silent)"
+if echo "$LOG_Y1M40D" | grep "ga-9t9acg.2: rig DB scan found no candidate to join the HQ pool" >/dev/null; then
+  ok "ga-y1m40 control: an empty rig scan is logged explicitly (not silent)"
 else
-  bad "ga-y1m40 control: empty rig fallback scan outcome not logged"
+  bad "ga-y1m40 control: empty rig scan outcome not logged"
 fi
 
 echo "Scenario ga-y1m40-e: structural — fix wiring verified in dispatcher source"
 has "$DISPATCHER" '_scan_rig_fallback_pool'        "ga-y1m40: rig-scan extracted into a reusable function"
 has "$DISPATCHER" '_split_candidates_by_lane'      "ga-y1m40: lane-split extracted into a reusable function"
-has "$DISPATCHER" 'STEP2C_RAN'                     "ga-y1m40: STEP2C_RAN flag distinguishes empty-pool vs post-lane fallback"
 has "$DISPATCHER" 'PILOT_RIG_FALLBACK_OVERRIDE'    "ga-y1m40: hermetic test seam for the rig-scan function defined"
-has "$DISPATCHER" 'Step 4b'                        "ga-y1m40: Step 4b (post-lane fallback) block comment present"
+has "$DISPATCHER" 'Step 4b: REMOVED'               "ga-9t9acg.2: Step 4b tombstone present (the union replaced it)"
 has "$DISPATCHER" 'PILOT_STALL_STATE'              "ga-y1m40: stall-streak state file path defined (observability)"
 has "$DISPATCHER" 'PILOT_STALL_ALERT_CAP'          "ga-y1m40: stall-alert cooldown cap knob defined (observability)"
+if grep -v '^[[:space:]]*#' "$DISPATCHER" | grep 'STEP2C_RAN' >/dev/null; then
+  bad "ga-9t9acg.2: STEP2C_RAN is still in the code — it only existed to keep Step 4b from rescanning"
+else
+  ok "ga-9t9acg.2: STEP2C_RAN is gone (nothing rescans)"
+fi
+
+# ── Scenarios ga-9t9acg.2-U*: ONE pool across stores, ordered ONCE (Athos 2026-10-06) ─────────────────────────────
+# The HQ pool and the rig DBs are UNIONed before Step 3 and the lane loop picks the first of the union: a P0 feature
+# that lives in a rig outside the HQ tier is dispatched BEFORE an HQ P2 (it used to wait for "HQ empty / nothing
+# dispatched"). Eligibility is unchanged: the rig fixture goes through the same filter chain as always
+# (PILOT_RIG_FALLBACK_OVERRIDE runs _scan_rig_fallback_pool's filters on it).
+U_HQ_P2='[{"id":"tt-9t9acg2-hqp2","title":"HQ P2 bug fixture","priority":2,"issue_type":"bug","description":"fixture body — an HQ bug of priority 2, 80+ chars to clear the spec floor and the empty-spec gate","status":"open","labels":[],"assignee":null,"created_at":"2026-01-01T00:00:00Z","metadata":{}}]'
+U_RIG_P0_FEATURE='[{"id":"wa-9t9acg2-p0feat","title":"rig P0 feature fixture","priority":0,"issue_type":"feature","description":"fixture body — a rig story:approved feature of priority 0, 80+ chars to clear the spec floor and the empty-spec gate","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-09-01T00:00:00Z","metadata":{}}]'
+U_HQ_P0_BUG_OLD='[{"id":"tt-9t9acg2-hqbug","title":"HQ P0 bug fixture, older","priority":0,"issue_type":"bug","description":"fixture body — an HQ P0 bug OLDER than the rig feature, 80+ chars to clear the spec floor and the empty-spec gate","status":"open","labels":[],"assignee":null,"created_at":"2026-01-01T00:00:00Z","metadata":{}}]'
+U_RIG_P0_BUG_NEW='[{"id":"wa-9t9acg2-rigbug","title":"rig P0 bug fixture, newer","priority":0,"issue_type":"bug","description":"fixture body — a rig P0 bug NEWER than the HQ one, 80+ chars to clear the spec floor and the empty-spec gate","status":"open","labels":[],"assignee":null,"created_at":"2026-09-01T00:00:00Z","metadata":{}}]'
+U_RIG_P0_FEATURE_NEW='[{"id":"wa-9t9acg2-p0feat","title":"rig P0 feature fixture, newer","priority":0,"issue_type":"feature","description":"fixture body — a rig story:approved feature of priority 0 NEWER than the HQ bug, 80+ chars to clear the spec floor","status":"open","labels":["story:approved"],"assignee":null,"created_at":"2026-09-01T00:00:00Z","metadata":{}}]'
+
+echo "Scenario ga-9t9acg.2-U1: a P0 feature in a RIG outside the HQ tier beats an HQ P2 in the unified pool"
+LOG_U1="$(run_y1m40 "$U_HQ_P2" "" "$U_RIG_P0_FEATURE")"
+_u1_rig="$(_nth_title "$LOG_U1" wa-9t9acg2-p0feat)"; _u1_hq="$(_nth_title "$LOG_U1" tt-9t9acg2-hqp2)"
+if [ -n "$_u1_rig" ] && [ -n "$_u1_hq" ] && [ "$_u1_rig" -lt "$_u1_hq" ]; then
+  ok "ga-9t9acg.2-U1: the rig P0 feature is dispatched BEFORE the HQ P2 (lines $_u1_rig < $_u1_hq)"
+else
+  bad "ga-9t9acg.2-U1: expected rig P0 feature (line [$_u1_rig]) before HQ P2 (line [$_u1_hq]) — the rig still waits for HQ"
+fi
+if echo "$LOG_U1" | grep "Lane picks — small: wa-9t9acg2-p0feat" >/dev/null; then
+  ok "ga-9t9acg.2-U1: the lane's first pick is the rig P0 feature"
+else
+  bad "ga-9t9acg.2-U1: 'Lane picks' does not name the rig P0 feature first — $(echo "$LOG_U1" | grep 'Lane picks' | head -1 | cut -c1-160)"
+fi
+
+echo "Scenario ga-9t9acg.2-U2: at equal priority a FEATURE beats an OLDER bug, across stores (type before age)"
+LOG_U2="$(run_y1m40 "$U_HQ_P0_BUG_OLD" "" "$U_RIG_P0_FEATURE_NEW")"
+_u2_feat="$(_nth_title "$LOG_U2" wa-9t9acg2-p0feat)"; _u2_bug="$(_nth_title "$LOG_U2" tt-9t9acg2-hqbug)"
+if [ -n "$_u2_feat" ] && [ -n "$_u2_bug" ] && [ "$_u2_feat" -lt "$_u2_bug" ]; then
+  ok "ga-9t9acg.2-U2: the newer rig P0 feature is dispatched before the older HQ P0 bug"
+else
+  bad "ga-9t9acg.2-U2: expected the P0 feature (line [$_u2_feat]) before the older P0 bug (line [$_u2_bug])"
+fi
+
+echo "Scenario ga-9t9acg.2-U3: at equal priority AND type the OLDEST goes first, across stores"
+LOG_U3="$(run_y1m40 "$U_HQ_P0_BUG_OLD" "" "$U_RIG_P0_BUG_NEW")"
+_u3_old="$(_nth_title "$LOG_U3" tt-9t9acg2-hqbug)"; _u3_new="$(_nth_title "$LOG_U3" wa-9t9acg2-rigbug)"
+if [ -n "$_u3_old" ] && [ -n "$_u3_new" ] && [ "$_u3_old" -lt "$_u3_new" ]; then
+  ok "ga-9t9acg.2-U3: the older HQ P0 bug is dispatched before the newer rig P0 bug (oldest first)"
+else
+  bad "ga-9t9acg.2-U3: expected the older HQ bug (line [$_u3_old]) before the newer rig bug (line [$_u3_new])"
+fi
+
+echo "Scenario ga-9t9acg.2-U4 (ga-5je3zv kept): a sweep whose live session count is UNREADABLE does not scan the rig DBs to join the HQ pool"
+LOG_U4="$(run_y1m40 "$U_HQ_P2" "" "$U_RIG_P0_FEATURE" "broken-timeout")"
+if echo "$LOG_U4" | grep "NOT scanning the rig DBs to join the HQ pool" >/dev/null; then
+  ok "ga-9t9acg.2-U4: the skipped join is announced in the log (not silent)"
+else
+  bad "ga-9t9acg.2-U4: unreadable session count, but no 'NOT scanning the rig DBs to join' line — the halt gate on the join is gone"
+fi
+if echo "$LOG_U4" | grep "scanning rig DBs to JOIN" >/dev/null; then
+  bad "ga-9t9acg.2-U4: the rig DBs were scanned to join although the session count was unreadable (ga-5je3zv regression)"
+else
+  ok "ga-9t9acg.2-U4: no rig scan was paid for on a sweep that cannot read the session count"
+fi
+if echo "$LOG_U4" | grep "wa-9t9acg2-p0feat" >/dev/null; then
+  bad "ga-9t9acg.2-U4: the rig P0 feature was considered although the join was halted"
+else
+  ok "ga-9t9acg.2-U4: the rig P0 feature never entered the pool (the HQ pool alone was walked)"
+fi
+# Control: the SAME fixture with a readable count (U1) joined and did NOT print the halt line — the line above is the
+# count's doing, not something the fixture always prints.
+if echo "$LOG_U1" | grep "NOT scanning the rig DBs to join the HQ pool" >/dev/null; then
+  bad "ga-9t9acg.2-U4 control: the readable-count run (U1) printed the halt line too — the gate fires unconditionally"
+else
+  ok "ga-9t9acg.2-U4 control: the readable-count run (U1) joined and printed no halt line"
+fi
 
 echo "Scenario ga-y1m40-f (observability): consecutive dispatched=0-with-free-slots sweeps increment a persisted stall counter across separate process invocations"
 # Earlier DRY_RUN=0 scenarios in this file (run_real_dispatch etc.) share this

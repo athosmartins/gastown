@@ -2,17 +2,20 @@
 # pilot-dispatcher.sh — Autonomous Pilot Dispatcher ("Pilot" / "P").
 #
 # Runs every ~300s via launchd (com.gascity.pilot.plist).
-# PRIORITY DIRECTIVE (wa-tm2a): PRIORITY DOMINATES; type is only a tiebreak.
+# PRIORITY DIRECTIVE (wa-tm2a; order rewritten by ga-9t9acg.2): PRIORITY DOMINATES; type is only a tiebreak.
 #   The dispatcher pulls from ONE merged candidate pool — open BUG beads
-#   (type:bug) + tech-debt-labeled beads + story:approved feature stories — none
-#   already in-flight/done/assigned. The pool is ordered strictly by:
-#       priority (0-4 asc; missing = 99 = last)
-#         > type rank (bug → tech-debt → task → chore → feature/story)
-#           > created_at (NEWEST first — Athos priority 2026-06-24)
+#   (type:bug) + tech-debt-labeled beads + story:approved feature stories, from HQ
+#   AND from the rig DBs — none already in-flight/done/assigned. The pool is ordered
+#   strictly by the city-wide work order (scripts/work-order.sh, Athos 2026-10-06):
+#       priority (0-4 asc; unreadable = last)
+#         > type (feature/story FIRST, every other type after)
+#           > created_at (OLDEST first)
 #             > id (final deterministic tiebreak).
-#   So a P0 story is dispatched BEFORE a P3 bug (reversal of the old hard
-#   bugs-before-stories tiering), and within the same priority a bug still beats
-#   a story. epic beads NEVER dispatch (excluded by the epic-type filter). Each
+#   All P0 features oldest-first, then the P0 that are not features oldest-first, then
+#   P1 features, then the other P1s, and so on. It REVERTS the 2026-06-24 Pilot
+#   decision (bug first / feature last / NEWEST first). A P0 story is still dispatched
+#   BEFORE a P3 bug, and now a same-priority feature beats a bug.
+#   epic beads NEVER dispatch (excluded by the epic-type filter). Each
 #   bead is dispatched with the prompt/sling template matching ITS OWN type
 #   (bug/tech-debt → "fix bug …"; feature/story → "build story …").
 # Picks highest-ranked candidate (per the key above), atomically claims it,
@@ -9647,8 +9650,9 @@ ALL_CANDIDATES_TIER=""
 #                AND NOT pilot:dispatching (claim in progress)
 #
 # wa-tm2a: stories are NO LONGER suppressed while bugs exist. Bugs/tech-debt and
-# stories are merged into ONE pool and ordered by priority>type>created_at>id, so
-# a P0 story outranks a P3 bug while a same-priority bug still beats a story.
+# stories are merged into ONE pool and ordered by priority>type>created_at>id
+# (ga-9t9acg.2: feature first, OLDEST first — see _pilot_order_pool), so a P0
+# story outranks a P3 bug and a same-priority story now beats a bug.
 TIER2_JSON=$(bd -C "$GC_CITY" list --json \
   -l "story:approved" \
   --exclude-label "story:in-flight" \
@@ -10067,15 +10071,31 @@ if [ "$HQ_MERGED_COUNT" -gt "0" ]; then
   fi
 fi
 
-# ── Step 2c: Fallback — scan rig DBs if HQ returned nothing ──────────────────
-# Per convention all story beads live in HQ, but check rig DBs as a fallback.
-# Reached in TWO cases (ga-y1m40): (1) the merged HQ pool is empty (original
-# behavior, unchanged below); or (2) Step 4b, near the end of the sweep, finds
-# HQ was non-empty but dispatched NOTHING (e.g. every HQ candidate was vetoed
-# by the ownership guard). Case (2) used to be invisible: a non-empty pool
-# meant this block never ran at all, so the rig backlog (wa-*, ps-*) stayed
-# unscanned for the ENTIRE sweep even with free slots (measured live: ~4h
-# stall, 2026-07-31 03:50-07:50 — a human noticed, no alarm fired).
+# ── Step 2c: the rig DBs JOIN the HQ pool — ONE union, ordered ONCE (ga-9t9acg.2) ─
+# Until ga-9t9acg.2 this was a FALLBACK ("HQ first, then rigs"): the rig DBs were scanned only when the merged
+# HQ pool was EMPTY (2c) or — Step 4b, ga-y1m40 — when it was non-empty but dispatched NOTHING (every HQ candidate
+# vetoed). That is "the first store that yields", the shape the city-wide work order forbids (R9/R11 of
+# docs/research/ga-3zlzot-ordem-unica): a P0 feature in a rig outside the HQ tier lost to an HQ P2 only because it
+# lived in another store. Now the eligible beads of HQ and of every rig are UNIONed (dedup by id) BEFORE Step 3
+# and ordered ONCE by the lib (_pilot_order_pool); the pick is the first of the union. Step 4b is gone: the lane
+# loops walk the WHOLE union, so an HQ pool that is 100% vetoed falls through to the rig beads in the same loop
+# (that was 4b's only job — ga-y1m40's 4h stall cannot come back through it).
+#
+# Eligibility is NOT widened. _scan_rig_fallback_pool is unchanged: the same bd queries (Tier1 bugs/tech-debt,
+# Tier2 story:approved), the same filter chain, applied per rig DB. What changed is only WHEN it runs: every sweep
+# that has a free lane slot (or an empty HQ pool, as before), not just on an empty pool / zero dispatches.
+# What stays separate, and why:
+#   * each rig bead is still filtered against ITS OWN db (`_filter_unblocked "$rig_path"`, ...) — a dependency or
+#     veto is a fact of the store the bead lives in, so the filters run before the union, never after it;
+#   * lanes (small/big) keep their own slots and their own pool: the union is split per lane and each lane picks its
+#     own first (Step 3), exactly as the HQ-only pool always was;
+#   * dispatch_one still routes each bead by ITS OWN rig/template — the union decides ORDER, never routing;
+#   * the allowlisted rigs' ctx:ready / WA Tier2 / Tier1 queries (Step 2b-*) already fed the HQ pool and are
+#     untouched; the dedup keeps a bead that both paths found from counting twice.
+# Cost, measured on the live Pilot log (2026-10-07): the scan takes ~23-30s, and it already ran in 1446 of 2260
+# sweeps through Step 4b (HQ pool non-empty, nothing dispatched). The union adds it to the rest only while a lane
+# has a free slot; with both lanes full and an HQ pool in hand nothing could dispatch, so it is skipped — and so it
+# is on a sweep that already found the session count unreadable (ga-5je3zv, gate below).
 #
 # _scan_rig_fallback_pool: scan every non-HQ rig DB for Tier1 (bug/tech-debt)
 # + Tier2 (story:approved feature) candidates, same filter chain as the HQ
@@ -10083,7 +10103,7 @@ fi
 # RIG_TIER2_COUNT as globals (direct mutation, not via $(...) — same
 # convention as dispatch_lane's DISPATCHED: the script's top-level
 # `exec >> LOG 2>&1` means command-substituting this function would swallow
-# its own log lines). Called from Step 2c below AND from Step 4b (ga-y1m40).
+# its own log lines). Called from Step 2c below.
 # Test seam: PILOT_RIG_FALLBACK_OVERRIDE — when set, bypass the gc/bd loop and
 # use this JSON array directly (hermetic selftest; no real gc/bd needed).
 # Mirrors PILOT_WA_RIG_TIER2_OVERRIDE (Step 2b-rig-tier2).
@@ -10171,25 +10191,50 @@ _scan_rig_fallback_pool() {
   RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
 }
 
-# STEP2C_RAN (ga-y1m40): set when the block below actually scans rigs, so
-# Step 4b (much later) can tell "already tried this sweep, don't repeat" apart
-# from "never got the chance" — a non-empty pool that dispatched nothing.
-STEP2C_RAN=""
-if [ -z "$ALL_CANDIDATES_TIER" ]; then
-  log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
-  STEP2C_RAN=1
+# The scan runs when the HQ pool is empty (as before) or while a lane has a free slot (ga-9t9acg.2). SMALL_SLOTS /
+# BIG_SLOTS were computed once in Step 1.
+#
+# A sweep that cannot read the live session count stops DISPATCHING (ga-5je3zv): the lane loops break at their first
+# iteration, and the rig scan — then Step 4b — was skipped with them rather than paid on the box that just could not
+# answer `session list`. The JOIN keeps that: it is not paid when this sweep already found the count unreadable
+# (_PLSC_UNREADABLE, sticky, set by the first failed probe — the top-up gate probes before this point) or halted
+# (_PILOT_HALT). It can only see a failure that has ALREADY happened: a count that first fails inside the lanes
+# has had its scan (the price of joining before the lanes instead of after them). The empty-HQ scan is unchanged:
+# it ran ungated before this slice too.
+_RIG_JOIN_HALTED=""
+if [ -n "${_PILOT_HALT:-}" ] || [ -n "${_PLSC_UNREADABLE:-}" ]; then _RIG_JOIN_HALTED=1; fi
+if [ -z "$ALL_CANDIDATES_TIER" ] || { [ -z "$_RIG_JOIN_HALTED" ] && { [ "${SMALL_SLOTS:-0}" -gt "0" ] || [ "${BIG_SLOTS:-0}" -gt "0" ]; }; }; then
+  if [ -z "$ALL_CANDIDATES_TIER" ]; then
+    log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
+  else
+    log "ga-9t9acg.2: HQ pool has $HQ_MERGED_COUNT candidate(s) — scanning rig DBs to JOIN them into ONE ordered pool (no HQ-first, no 'first store that yields') ..."
+  fi
   _scan_rig_fallback_pool
   if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
-    ALL_CANDIDATES_JSON="$RIG_MERGED_JSON"
-    if [ "$RIG_TIER1_COUNT" -gt "0" ] && [ "$RIG_TIER2_COUNT" -gt "0" ]; then
+    # The union keeps the HQ pool if the merge itself fails: a rig problem must never drop HQ work.
+    _union_json=$(echo "$ALL_CANDIDATES_JSON $RIG_MERGED_JSON" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || _union_json=""
+    if [ -n "$_union_json" ]; then
+      ALL_CANDIDATES_JSON="$_union_json"
+    else
+      warn "ga-9t9acg.2: could not union the HQ pool with the rig pool — keeping the HQ pool this sweep (rig candidates not considered)."
+    fi
+    unset _union_json
+    # ALL_CANDIDATES_TIER is a LOG hint only (see the merge above): bug-ish vs feature-ish over the whole union.
+    _u_bug=$(( ${TIER1_COUNT:-0} + ${RIG_TIER1_UNCOND_COUNT:-0} + RIG_TIER1_COUNT )) || _u_bug=0
+    _u_feat=$(( ${TIER2_COUNT:-0} + RIG_TIER2_COUNT )) || _u_feat=0
+    if [ "$_u_bug" -gt "0" ] && [ "$_u_feat" -gt "0" ]; then
       ALL_CANDIDATES_TIER="mixed"
-    elif [ "$RIG_TIER1_COUNT" -gt "0" ]; then
+    elif [ "$_u_bug" -gt "0" ]; then
       ALL_CANDIDATES_TIER="bug"
     else
       ALL_CANDIDATES_TIER="feature"
     fi
-    log "Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — priority-ordered."
+    log "Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — joined with HQ into one pool, ordered once (priority > feature first > oldest first)."
+  elif [ -n "$ALL_CANDIDATES_TIER" ]; then
+    log "ga-9t9acg.2: rig DB scan found no candidate to join the HQ pool — the HQ pool is the whole pool."
   fi
+elif [ -n "$_RIG_JOIN_HALTED" ] && { [ "${SMALL_SLOTS:-0}" -gt "0" ] || [ "${BIG_SLOTS:-0}" -gt "0" ]; }; then
+  log "ga-5je3zv: the live session count is unreadable this sweep — NOT scanning the rig DBs to join the HQ pool (a sweep that cannot read the count stops dispatching; the scan would be pure cost on the box that just could not answer 'session list'). The HQ pool is the whole pool."
 fi
 
 ALL_CANDIDATES_COUNT=$(echo "$ALL_CANDIDATES_JSON" | jq 'length' 2>/dev/null || echo "0")
@@ -10203,14 +10248,14 @@ log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
 
 # ── Step 3: Split candidates by lane, pick one per available lane ─────────────
 # For each candidate classify its lane. Build two sorted candidate lists.
-# Pick highest priority (P0>P1>P2..., then type rank, then NEWEST created_at) from each.
+# Pick the first of each lane by the work order (priority, then feature first, then OLDEST created_at).
 # Only dispatch into a lane if it has a free slot.
 
 # _split_candidates_by_lane <json>: classify each candidate into SMALL/BIG
 # lanes via classify_lane. Sets SMALL_CANDIDATES/BIG_CANDIDATES/SMALL_COUNT/
 # BIG_COUNT globals (same direct-mutation convention as _scan_rig_fallback_pool
-# above). Factored into a function (ga-y1m40) because Step 4b re-splits a
-# fresh rig-only pool after the primary lanes already ran once this sweep.
+# above). Factored into a function (ga-y1m40, when Step 4b re-split a fresh rig-only
+# pool after the primary lanes had run once; 4b is gone since ga-9t9acg.2).
 _split_candidates_by_lane() {
   local _scbl_json="$1" _scbl_bead _scbl_lane
   SMALL_CANDIDATES="[]"
@@ -10230,37 +10275,65 @@ _split_candidates_by_lane() {
 _split_candidates_by_lane "$ALL_CANDIDATES_JSON"
 log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 
-# wa-tm2a: ordering key shared by _top_candidate and _queue_preview.
-# Sort strictly by:  priority (0-4 asc; missing = 99 = last)
-#                      > type rank (bug → tech-debt → task → chore → feature/story)
-#                        > created_at (NEWEST first — Athos priority 2026-06-24)
-#                          > id (final deterministic tiebreak).
-# Type rank derives from the bead's OWN type — issue_type (or legacy .type),
-# overridden to "tech-debt" when the tech-debt LABEL is present (tech-debt beads
-# carry issue_type=task/chore but the tech-debt label, and are queried via -l).
-# epic is excluded upstream (by the epic-type query filter) so it never reaches this sort;
-# an unknown/missing type sorts last among same-priority beads (rank 5).
+# ── The dispatch order: the city-wide work order, from the lib (ga-9t9acg.2) ───────────────────────────
+# wa-tm2a's ordering key lived HERE as a jq program (`_PILOT_SORT_JQ`, with a `trank` type rank): priority >
+# bug → tech-debt → task → chore → feature > created_at NEWEST first (Athos, 2026-06-24). Athos' decision of
+# 2026-10-06 (programa ga-9t9acg) REVERTS it, for every stage of the board: priority > type (feature first) >
+# age (OLDEST first). The order now lives in ONE place, scripts/work-order.sh; this file only CALLS it. A copy of
+# the sort here would be the bug the lib's registry lint (work-order.registry.tsv) exists to catch.
 #
-# The jq program is a string constant so both call sites stay byte-identical.
-_PILOT_SORT_JQ='
-  def trank:
-    ( (.labels // []) ) as $lbls
-    | if ($lbls | index("tech-debt")) then 1
-      else ( (.issue_type // .type // "") | ascii_downcase ) as $t
-        | if   $t == "bug"      then 0
-          elif $t == "tech-debt" then 1
-          elif $t == "task"     then 2
-          elif $t == "chore"    then 3
-          elif ($t == "feature" or $t == "story") then 4
-          else 5 end
-      end;
-  sort_by([ (.priority // 99), (. | trank), -(((.created_at // "1970-01-01T00:00:00Z")[0:19] + "Z") | fromdateiso8601? // 0), (.id // "") ])
-'  # created_at DESC = newest-first tiebreak (Athos prioridade 2026-06-24); prio+trank(bug>story) unchanged
+#   * age is created_at (`--age created`). NO `reclaim` mode: the Pilot already keeps a poisoned bead out of the pool
+#     (_FILTER_RECLAIM_CAP=3), so a bead still in it is not starving anyone by being old — and the Athos rule has no
+#     reclaim clause (the lib's `reclaim` age is inherited from other consumers' anti-starvation, not from the rule).
+#   * the `tech-debt` TIER is gone (it was `trank` 1: after bug, before task/chore/feature). Under the rule a tech-debt
+#     bead is just "not a feature", ranked by age like any other. The label is still read by _bead_tier — that picks
+#     the sling TEMPLATE ("fix bug …"), it never ordered anything.
+#   * epic is excluded upstream, so it never reaches the sort.
+#
+# THREE states, never two (the lib's contract): ordered; a field unreadable (the bead stays at the end of its
+# class and the lib prints `work-order WARN: <id>: …` on stderr — which is why stderr is NEVER thrown away here: it
+# is the only signal); and CANNOT TELL (stdout empty, rc 2). Empty is "I do not know", never "no bead": then the
+# pool keeps the order it came in, with a visible WARN — the sweep still dispatches.
+#
+# stderr, not warn(): warn()/log() ECHO TO STDOUT, so inside the $(...) these helpers are called through they
+# would corrupt the JSON they return. The top-level `exec >> LOG 2>&1` already sends stderr to the log.
+# The lib is sourced ONCE for the whole file, by the work-order-source block above _emit_query_one (shared with the
+# queue emit, ga-9t9acg.3): next to THIS script, [ -r ]-checked, with its own WARN when it is missing. That block
+# also owns _PILOT_WORK_ORDER_AGE — the emitted queue and the dispatch must serve the SAME order, so the age mode
+# is passed from that one constant, never spelled twice.
 
-# Sort the pool by the wa-tm2a key and return the single top candidate.
+# _pilot_order_pool <json-array> — print the pool in dispatch order (one JSON array on stdout). Always rc 0 and
+# never empty for an array: when the order cannot be applied (the lib is not loaded, or it says "cannot tell") the
+# INPUT order is printed with a WARN on stderr, so a lib fault degrades the order, not the dispatch.
+_pilot_order_pool() {
+  local _pop_in="$1" _pop_out="" _pop_rc=0
+  if ! command -v work_order_sort >/dev/null 2>&1; then
+    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort is not loaded — cannot tell the dispatch order; keeping the pool's input order (previous order)" >&2
+    printf '%s\n' "$_pop_in"
+    return 0
+  fi
+  _pop_out=$(printf '%s' "$_pop_in" | work_order_sort --age "$_PILOT_WORK_ORDER_AGE") || _pop_rc=$?
+  if [ "$_pop_rc" -ne 0 ] || [ -z "$_pop_out" ]; then
+    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort cannot tell (rc=$_pop_rc, see the work-order line above) — keeping the pool's input order (previous order), not treating it as an empty queue" >&2
+    printf '%s\n' "$_pop_in"
+    return 0
+  fi
+  printf '%s\n' "$_pop_out"
+}
+
+# Order the pool and return the single top candidate. Empty output = the pool is not a JSON array at all (the
+# lib's ERROR is on stderr): dispatch_lane() breaks on empty as it does on `null`. Always rc 0: a non-zero rc from
+# `pick=$(_top_candidate …)` would end the whole sweep under `set -e`.
 _top_candidate() {
-  local arr="$1"
-  echo "$arr" | jq "$_PILOT_SORT_JQ"' | .[0]' 2>/dev/null
+  local _tc_sorted
+  _tc_sorted=$(_pilot_order_pool "$1")
+  if command -v work_order_head >/dev/null 2>&1; then
+    printf '%s' "$_tc_sorted" | work_order_head || true
+  else
+    # The lib is not loaded (_pilot_order_pool already said so, once per call): the pool is in INPUT order and a
+    # valid array, so its first element IS the previous-order pick. Never an empty pick for a non-empty pool.
+    printf '%s' "$_tc_sorted" | jq -c '.[0]' || true
+  fi
 }
 
 # wa-tm2a: derive the dispatch TIER for a SINGLE bead from its own type, so a
@@ -10292,9 +10365,9 @@ log "Lane picks — small: $(echo "$SMALL_PICK" | jq -r '.id // "none"')  big: $
 # every sweep makes the backlog visible — not just the single bead picked now.
 # Read-only formatting of already-gathered candidates. Guarded for pipefail.
 _queue_preview() {
-  # wa-tm2a: same ordering key as _top_candidate so the preview is the real order.
-  echo "$1" | jq -r --arg lane "$2" "$_PILOT_SORT_JQ"' | .[:3][]
-       | "  [\($lane)] \(.id) P\(.priority // "?") — \(.title)"' 2>/dev/null || true
+  # wa-tm2a: same order as _top_candidate (_pilot_order_pool) so the preview is the real order.
+  _pilot_order_pool "$1" | jq -r --arg lane "$2" '.[:3][]
+       | "  [\($lane)] \(.id) P\(.priority // "?") — \(.title)"' || true
 }
 _QUEUE_LINES=$( { _queue_preview "$SMALL_CANDIDATES" small; _queue_preview "$BIG_CANDIDATES" big; } )
 if [ -n "$_QUEUE_LINES" ]; then
@@ -13165,7 +13238,7 @@ DISPATCH_RESULT=""   # ga-ov3gow: global on purpose — set by dispatch_one(), r
 #                       pilot_dispatch.result; a nameless exit is only in `unclassified`. (A pre-claim
 #                       pool-cap skip never reaches dispatch_one(); it is filed under the name
 #                       dispatch_one() gives the in-arm pool cap — one kind of queue, one name.)
-# A bead the rig fallback (Step 4b) re-walks counts once, as it ENDED (the last outcome wins).
+# A bead that is walked more than once in a sweep counts once, as it ENDED (the last outcome wins).
 #
 # Adding a DISPATCH_RESULT name? Classify it in _pilot_sweep_emit's jq or it reads as failed_other, and a
 # benign new state would look like a Pilot fault — the drift guard in
@@ -13391,40 +13464,11 @@ if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
   dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
 fi
 
-# ── Step 4b: Fallback — scan rigs if HQ pool was non-empty but dispatched=0
-# this sweep (ga-y1m40) ───────────────────────────────────────────────────────
-# Step 2c (above) only fires when the merged pool was EMPTY. A non-empty pool
-# that is 100% undispatchable this sweep (e.g. every candidate vetoed by the
-# ownership guard) still leaves Step 2c permanently skipped — DISPATCHED==0
-# here means BOTH lane loops exhausted their ENTIRE original pool without one
-# success, so retrying the SAME HQ candidates would fail identically; only a
-# rig scan can find NEW work. Skip when Step 2c already ran this sweep (same
-# rigs, already tried and found equally undispatchable — re-scanning would
-# just repeat the same failed picks, not fix anything) or when DISPATCHED!=0
-# (HQ got at least one success this sweep — HQ keeps precedence, no rig scan).
-# Because DISPATCHED==0 implies neither lane consumed a slot, SMALL_SLOTS/
-# BIG_SLOTS (computed once in Step 1) are still the FULL free capacity here.
-#
-# ga-5je3zv: skipped once the dispatch phase was HALTED (session count unreadable / time budget spent). The
-# rig scan only exists to find NEW candidates for the same lane loops, and those loops would stop at their
-# first iteration — so it would cost its Dolt reads for nothing, on the very box that just could not answer
-# `session list`. The halt reason was logged where it was decided.
-if [ "$DISPATCHED" -eq "0" ] && [ -z "$STEP2C_RAN" ] && [ -z "${_PILOT_HALT:-}" ] && { [ "$SMALL_SLOTS" -gt "0" ] || [ "$BIG_SLOTS" -gt "0" ]; }; then
-  log "ga-y1m40: HQ pool had candidate(s) but dispatched=0 this sweep (all vetoed/skipped?) — scanning rig DBs as fallback ..."
-  _scan_rig_fallback_pool
-  if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
-    log "ga-y1m40: Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — retrying lanes with rig pool."
-    _split_candidates_by_lane "$RIG_MERGED_JSON"
-    if [ "$SMALL_SLOTS" -gt "0" ] && [ "$SMALL_COUNT" -gt "0" ]; then
-      dispatch_lane "small" "$SMALL_CANDIDATES" "$SMALL_SLOTS"
-    fi
-    if [ "$BIG_SLOTS" -gt "0" ] && [ "$BIG_COUNT" -gt "0" ]; then
-      dispatch_lane "big" "$BIG_CANDIDATES" "$BIG_SLOTS"
-    fi
-  else
-    log "ga-y1m40: rig DB fallback scan found no additional candidates."
-  fi
-fi
+# ── Step 4b: REMOVED (ga-9t9acg.2) ────────────────────────────────────────────
+# It rescanned the rig DBs when the HQ pool was non-empty but dispatched=0 (ga-y1m40: every HQ candidate vetoed,
+# the rig backlog unseen for the whole sweep — a measured ~4h stall). The rigs now JOIN the HQ pool in Step 2c,
+# before the lane loops, so a fully vetoed HQ pool falls through to the rig beads inside the same loop; a second
+# scan would only repeat the same picks. The stall counter (Step 5, ga-y1m40) is unchanged.
 
 if [ "$OWNERSHIP_GUARD_VETO_COUNT" -gt "0" ] 2>/dev/null; then
   # ga-8jxe1 AC4 — the log excerpt that made this bug hard to diagnose was

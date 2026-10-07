@@ -84,12 +84,11 @@
 #                         "I do not know": keep the previous order and log a visible WARN. Empty never
 #                         means "no bead" (same contract as pool_veto_cfg in pool-probe-vetoes.sh).
 #
-# NOT in this library (slice ga-9t9acg.2 must decide, so the migration never drops it silently): the Pilot's
-# `tech-debt` tier. In _PILOT_SORT_JQ (`trank`, pilot-dispatcher.sh) a bead labelled `tech-debt`, or typed
-# tech-debt, ranks 1 inside its priority: after bug (0), before task/chore/feature. The Athos rule above has
-# no such tier — here a tech-debt bead is just "another type" (class 1) and a labelled one is not looked at.
-# Whether the Pilot keeps it is a decision of that slice (and of Athos), never a side effect of moving the
-# Pilot onto this key.
+# NOT in this library, and decided (slice ga-9t9acg.2, the Pilot): the `tech-debt` tier. The old Pilot sort
+# (_PILOT_SORT_JQ, `trank`) ranked a bead labelled `tech-debt`, or typed tech-debt, 1 inside its priority: after
+# bug (0), before task/chore/feature. The Athos rule above has no such tier, and the Pilot was moved onto this key
+# WITHOUT it: a tech-debt bead is "another type" (class 1) ranked by age, and a labelled one is not looked at.
+# The label still picks the Pilot's sling TEMPLATE ("fix bug …", _bead_tier) — it never ordered anything again.
 #
 # What a caller must still do itself:
 #   * fetch the WHOLE population (`--limit 0` / `-n 0`) or prove the window covers it. Never `--limit=N`

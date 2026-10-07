@@ -41,8 +41,6 @@
 #   ones by hand). A reviewer who finds one adds a row, or widens IDIOMS and adds a selftest fixture for the shape.
 #
 # --- consumer rows -------------------------------------------------------------------------------------------
-consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_PILOT_SORT_JQ	ga-9t9acg.2	R2 Pilot dispatch order (_top_candidate, _queue_preview): bug-first, newest-first today
-consumer	packs/town-deltas/assets/pilot-dispatcher.sh	\(\. \| trank\)	ga-9t9acg.2	R2 the sort_by inside _PILOT_SORT_JQ (type rank, newest created_at first)
 consumer	packs/town-deltas/assets/context-check-dispatcher.sh	sort_by\(\.created_at // \.id\)	ga-9t9acg.10	R11 context-check: FIFO per store, priority and type ignored, global cap eaten by the first stores
 consumer	packs/town-deltas/assets/quality-gate-dispatcher.sh	sort_by\(\.created_at\)	ga-q8tj7p	R1 gate marker-select cascade (SELFTEST-EXTRACT marker-select); age = created_at of the MARKER, i.e. --age field there
 consumer	packs/town-deltas/assets/quality-gate-guard.sh	sort_by\(\.created_at\) \| \.\[0\]	UNASSIGNED	not in the inventory: gate_pick_oldest_marker (called at MARKER=$(gate_pick_oldest_marker ...)) picks the guard's marker FIFO; belongs with the gate slice ga-q8tj7p or its own slice

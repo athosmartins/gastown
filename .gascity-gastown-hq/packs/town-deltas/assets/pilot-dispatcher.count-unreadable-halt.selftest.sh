@@ -312,9 +312,19 @@ if [ -n "$l_t0" ] && [ -n "$l_first_lane" ] && [ "$l_t0" -lt "$l_first_lane" ]; 
 else
   bad "T6: the dispatch-phase clock is not started before the first lane loop (t0 L${l_t0:-?}, first lane L${l_first_lane:-?}) — the time budget would never bind"
 fi
-grep -E '^if \[ "\$DISPATCHED" -eq "0" \] && \[ -z "\$STEP2C_RAN" \]' "$DISPATCHER" | grep -q '_PILOT_HALT' \
-  && ok "T6: the Step 4b rig fallback is gated on the halt (no rig scan for lanes that would stop at their first iteration)" \
-  || bad "T6: the rig fallback is not gated on _PILOT_HALT — a halted sweep still pays a rig-DB scan on the box that just could not answer 'session list'"
+# ga-9t9acg.2: Step 4b (the post-lane rig fallback this assertion used to pin) is gone — the rig DBs JOIN the HQ pool
+# in Step 2c, BEFORE the lanes. The protection is the same one, moved with the scan: no rig scan to JOIN the pool on a
+# sweep that already found the count unreadable or halted. Pinned the way it always was (structurally — these are
+# script-level statements): the halt flag is computed from BOTH signals, the join condition reads it, and both come
+# before the scan call. The empty-HQ scan stays ungated, as it was.
+l_halt="$(grep -nE '^if \[ -n "\$\{_PILOT_HALT:-\}" \] \|\| \[ -n "\$\{_PLSC_UNREADABLE:-\}" \]; then _RIG_JOIN_HALTED=1' "$DISPATCHER" | head -1 | cut -d: -f1)"
+l_join="$(grep -nE '^if \[ -z "\$ALL_CANDIDATES_TIER" \] \|\| \{ \[ -z "\$_RIG_JOIN_HALTED" \]' "$DISPATCHER" | head -1 | cut -d: -f1)"
+l_scan="$(grep -nE '^  _scan_rig_fallback_pool$' "$DISPATCHER" | head -1 | cut -d: -f1)"
+if [ -n "$l_halt" ] && [ -n "$l_join" ] && [ -n "$l_scan" ] && [ "$l_halt" -lt "$l_join" ] && [ "$l_join" -lt "$l_scan" ]; then
+  ok "T6: the Step 2c rig JOIN is gated on the halt / the unreadable count (L$l_halt flag, L$l_join condition, L$l_scan scan) — no rig scan for lanes that would stop at their first iteration"
+else
+  bad "T6: the rig join is not gated on _PILOT_HALT / _PLSC_UNREADABLE (flag L${l_halt:-?}, condition L${l_join:-?}, scan L${l_scan:-?}) — a halted sweep still pays a rig-DB scan on the box that just could not answer 'session list'"
+fi
 
 echo
 echo "pilot-dispatcher.count-unreadable-halt.selftest: $PASS passed, $FAIL failed"
