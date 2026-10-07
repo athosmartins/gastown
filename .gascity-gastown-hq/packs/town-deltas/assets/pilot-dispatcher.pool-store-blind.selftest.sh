@@ -66,9 +66,16 @@ need() { # need <fn>... — echoes the extracted sources; records (does not abor
 # Everything the guard needs, defined together so a sandbox can never silently lack one.
 GUARD_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders wa_worker_template \
                       _pilot_rig_builds_pool _pilot_pool_rig _pilot_same_dir _pilot_pool_store_blind_guard)"
-TOPUP_PRELUDE="$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_rig_pending)"
-LOOP_PRELUDE="$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_rig_pending \
-                     _topup_exclude_braked _topup_pending_store _topup_note_spawn _pilot_pool_topup)"
+# ga-9t9acg.4: the top-up pick goes through _topup_pick_first, which orders with scripts/work-order.sh. Both are part of
+# the preludes: without the lib the helper runs its fallback (the previous pick + a WARN), and a prelude that lacks the
+# helper itself fails with "command not found" — either way this selftest would stop testing the store scoping.
+WO_LIB_PRELUDE='. "$SELF_DIR/scripts/work-order.sh"'
+[ -r "$SELF_DIR/scripts/work-order.sh" ] || { echo "FATAL: $SELF_DIR/scripts/work-order.sh missing" >&2; exit 2; }
+TOPUP_PRELUDE="$WO_LIB_PRELUDE
+$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_pick_first _topup_rig_pending)"
+LOOP_PRELUDE="$WO_LIB_PRELUDE
+$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_rig_pending \
+                     _topup_exclude_braked _topup_pick_first _topup_pending_store _topup_note_spawn _pilot_pool_topup)"
 MIGRATE_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders rig_to_builder wa_worker_template \
                         _pilot_text_names_rig_path _pilot_story_already_migrated _pilot_dog_store_blind_guard \
                         _pilot_dog_store_blind_migrate_dest _pilot_is_bead_id _pilot_migration_copy_retract \
