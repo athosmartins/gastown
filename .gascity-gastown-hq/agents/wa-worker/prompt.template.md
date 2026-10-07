@@ -174,7 +174,8 @@ printf '%s\n' "$WA_PICK"
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
 # Do NOT drain while this probe returns a bead. Only a printed [] means the pool is empty;
-# a blank line with a WARN above it means the query itself failed (not "no work").
+# a blank line with a WARN above it means the probe could not answer (the query failed, or neither
+# the library nor its fallback could order the pool) - that is not "no work".
 # `work-order WARN:` / `WARN Step 1b2:` lines are information, not a stop: the bead printed is still yours.
 
 # Step 1b3 (fallback ONLY — ga-0pg2o, 2026-09-10): Step 1b2 above already covers
