@@ -106,6 +106,13 @@ def sc_touched(s):
             mk(s, "p1-bug-newer", 1, "bug", "2026-09-20T12:00:00Z")]
 
 
+def sc_starved(s):
+    # pilot:starvation-count is audit-only (inflight-reclaim-guard.py do_reclaim stamps it INSTEAD of
+    # pilot:reclaim-count for a never-claimed bead): not a reclaim, so the older bead keeps its place.
+    return [mk(s, "p1-bug-starved", 1, "bug", "2026-09-01T12:00:00Z", "2026-10-05T12:00:00Z", '"pilot:starvation-count:1"'),
+            mk(s, "p1-bug-newer", 1, "bug", "2026-09-20T12:00:00Z")]
+
+
 def sc_veto(s):
     return [mk(s, "plain-p2-bug", 2, "bug", "2026-09-01T12:00:00Z"),
             mk(s, "refused-p0-feature", 0, "feature", "2026-09-30T12:00:00Z", labels='"pool:refused:engine-rebuild-required"')]
@@ -115,6 +122,7 @@ SCEN = [("P0 feature newer than P0 bug", sc_pair, "p0-feature-newer"),
         ("25 beads, P0 feature last by age", sc_25, "p0-feature-newest-of-25"),
         ("reclaimed twice goes behind its untouched peer", sc_reclaimed, "p1-bug-untouched"),
         ("touched but never reclaimed keeps its place", sc_touched, "p1-bug-commented"),
+        ("starvation-count alone is not a reclaim", sc_starved, "p1-bug-starved"),
         ("refused P0 feature stays vetoed", sc_veto, "plain-p2-bug")]
 
 

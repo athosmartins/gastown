@@ -4,8 +4,11 @@
 #   No overlap with the pending ga-wtzrho / ga-0y849e / ga-1g2if1 patches; ga-473mkh and ga-ljoz23 are already in this base.
 # WHAT IT DOES: routed tier 1 (pool probe), tier 2 (gc.run_target migration), tier 3 (ephemeral) and the four assigned leaf queries
 #   (in_progress / ready, durable / ephemeral) now hand their survivors to packs/town-deltas/assets/scripts/work-order.sh
-#   (ga-9t9acg.1, gate:passed) via `work_order_sort --age reclaim`: priority > type (feature first) > age, with the reclaim
-#   anti-starvation clock. Before: tier 1 was `sort_by(.updated_at // .created_at)` over a 20-bead window, the rest took bd's order.
+#   (ga-9t9acg.1, gate:passed) via `work_order_sort --age reclaim`: priority > type (feature first) > age, where the `reclaim` age is
+#   created_at, except updated_at for a bead carrying pilot:reclaim-count>=1. So: the ga-w4k2z LRU holds only for beads with a
+#   reclaim-count; updated_at alone no longer demotes (the old tier 1 did); pilot:starvation-count is NOT read (audit-only; the README
+#   Decision table, row "Age = `reclaim`", has the evidence). Before: tier 1 was `sort_by(.updated_at // .created_at)` over a 20-bead
+#   window, the rest took bd's order.
 #   - Fetch is `--limit 0` everywhere (filter-then-slice, ga-g7yt): never `--limit=N` before ordering.
 #   - The lib runs in a CHILD `bash -c '. "$1" && work_order_sort --age reclaim'`, never sourced into the query's sh: a POSIX-mode sh
 #     EXITS when `.` cannot open its file, and dash dies with "Bad substitution" on the lib's bash-only error paths (both reproduced).
@@ -14,18 +17,21 @@
 #   - Lib lookup: $WORK_ORDER_LIB, else $GC_CITY_PATH, else $GC_CITY (+ packs/town-deltas/assets/scripts/work-order.sh). First one set wins, no cascade.
 #   - UNCHANGED on purpose: poolDemandLabelFilterJQ, assignedTierExclusionFilterJQ, moleculeLiveStepFilterShell (the vetoes do not move),
 #     the molecule-live-step `--limit 1` existence probe, and the control-dispatcher emit_ready in dispatch_runtime.go.
-# NOT COMPILED (bead rule: no go build / install / swap). What WAS run, all in a scratch worktree of the base:
+# NOT COMPILED (bead rule: no go build / install / swap). Gate-fix round 1 (2026-10-07) changed the Go tests and comments (see the
+#   README): also not type-checked here; the gate review of the first version reported `go test ./internal/config -run ...` ok.
+# What WAS run, all in a scratch copy of the base:
 #   - git apply --check of THIS file on a pristine consolidated/engine-window-20260926 tree: rc=0 (and a real apply, byte-identical to the author tree).
 #   - gofmt -l on the four files: clean. The Go (including the new test file) is gofmt-clean but was NOT type-checked.
 #   - The generated shell, extracted from the Go raw literals, run against a fake `bd` shim, under sh and under /bin/dash, old vs new:
 #     P0 feature (newer) vs P0 bug (older); 25 beads with the only P0 feature 25th; reclaimed x2; lib absent; lib erroring in six ways;
 #     idle poll; garbage from bd; all three tiers and all four assigned queries. OLD head is the bug / the 20-window; NEW head is the feature.
-#   - A Python mirror of work_order_pick_test.go's tables: OLD code 20/104 checks pass, NEW code 118/118, with a mutation control.
+#   - A Python mirror of work_order_pick_test.go's tables: OLD code 28/114 checks pass, NEW code 128/128, with a mutation control (gate-fix 1 added the starvation-count row).
 #   - work-order.selftest.sh (the lib): see the README.
 # Before the swap run (a failure here is a defect of this patch, not of the base: hand the bead back):
 #   go vet ./cmd/gc ./internal/config
 #   go test ./internal/config ./cmd/gc -run 'WorkOrder|EffectiveWorkQuery|EffectiveAssigned|PoolDemand|RoutedPoolWorkQuery|CmdHook'
-#   (the config tests run the shell with a hermetic env: PATH + the test's own map, so GC_CITY_PATH must come from the test, not the host.)
+#   (the config tests run the shell with a hermetic env: PATH + the test's own map; runShellWithFakeBd points WORK_ORDER_LIB at a
+#   missing file unless the test names a lib, so the host's GC_CITY_PATH never reaches the query and those tests pin the FALLBACK order.)
 # README: docs/pending-engine-window/ga-9t9acg.7-work-order-pool-probe.README.md (apply steps, selftest, `strings` dry-run, the watchdog coupling).
 
 diff --git a/cmd/gc/cmd_hook_test.go b/cmd/gc/cmd_hook_test.go
@@ -69,10 +75,10 @@ index a0f80acfc..e1363296e 100644
  	}
  }
 diff --git a/internal/config/config.go b/internal/config/config.go
-index 32f697871..b905e87c2 100644
+index 32f697871..c3bc082ec 100644
 --- a/internal/config/config.go
 +++ b/internal/config/config.go
-@@ -3673,6 +3673,77 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
+@@ -3673,6 +3673,89 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
  	return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + jqStderr + `; } || printf "[]"`
  }
  
@@ -91,9 +97,21 @@ index 32f697871..b905e87c2 100644
 +//
 +// wo_pick reads ONE JSON array on stdin (the tier's filtered survivors) and
 +// writes the same array ordered by the town rule — priority > type (feature
-+// first) > age, with the `reclaim` age rule that keeps the ga-w4k2z/ga-oc6knj
-+// anti-starvation — by calling work_order_sort from
++// first) > age — by calling work_order_sort from
 +// packs/town-deltas/assets/scripts/work-order.sh. Callers take the head.
++//
++// The age is the lib's `reclaim` rule: created_at, except updated_at for a bead
++// carrying pilot:reclaim-count:N with N >= 1. Three consequences, each checked
++// against the lib and inflight-reclaim-guard.py, not assumed:
++//   - the ga-w4k2z LRU (a bead that keeps being reclaimed does not re-take the
++//     head) survives only for beads that carry pilot:reclaim-count;
++//   - updated_at alone no longer demotes a bead. That is what avoids the
++//     ga-oc6knj regression (a bead the Pilot had just dispatched had its
++//     updated_at bumped and went to the back), and it is also a change from
++//     the old tier 1, which demoted ANY bead whose updated_at had moved;
++//   - pilot:starvation-count is NOT read. inflight-reclaim-guard.py do_reclaim
++//     stamps it INSTEAD of pilot:reclaim-count for a bead no worker ever
++//     claimed (audit-only, nothing reads it), so such a bead keeps its place.
 +//
 +// The ordering is the lib's, and the lib can be missing or unable to tell, so
 +// wo_pick has three outcomes and never collapses them:
@@ -150,7 +168,7 @@ index 32f697871..b905e87c2 100644
  // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
  // reads the first ready, unassigned, routed bead for the supplied target,
  // prints it, and exits 0. The caller appends a terminal fallthrough
-@@ -3689,17 +3760,23 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
+@@ -3689,17 +3772,23 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
  // shape already used for the primary tier (ga-g7yt) and the assigned
  // in-progress tiers (ga-ael6v), for the same reason: slicing before the
  // prefix filter can hide a real candidate behind a filtered-out head.
@@ -178,7 +196,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
  		`return 1; ` +
  		`}; `
-@@ -3737,7 +3814,17 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
+@@ -3737,7 +3826,19 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
  	// but BEFORE the sort_by/.[0:1] slice, for the same filter-then-slice
  	// reason as ga-zgfxx/ga-avvu2 AC1 above — excluding it from the unsliced
  	// survivor set could hide a real candidate behind a filtered-out head.
@@ -189,15 +207,17 @@ index 32f697871..b905e87c2 100644
 +	// order existed. Now the whole population is fetched (--limit 0; --sort
 +	// oldest stays only so the fallback sees the same ties as before) and
 +	// wo_pick orders the survivors by the town rule, with the `reclaim` age rule
-+	// that keeps the anti-starvation of ga-w4k2z. The vetoes above are untouched;
-+	// they still run BEFORE the order. When work-order.sh is missing or cannot
-+	// tell, wo_pick falls back to the LRU re-rank this tier always had (and says
-+	// so on stderr). Requires workOrderPickFunctionScript() in the same script.
++	// (updated_at counts only for a bead carrying pilot:reclaim-count>=1; what
++	// that keeps and what it changes is spelled out on workOrderPickFunctionScript).
++	// The vetoes above are untouched; they still run BEFORE the order. When
++	// work-order.sh is missing or cannot tell, wo_pick falls back to the LRU
++	// re-rank above, which is now ONLY that fallback (and says so on stderr).
++	// Requires workOrderPickFunctionScript() in the same script.
 +	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | ` + workOrderHeadStage(workOrderLRUFallbackJQ) + `; }`
  }
  
  // poolDemandCountShell emits the reconciler count-form for target: it counts
-@@ -3835,10 +3922,14 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
+@@ -3835,10 +3936,14 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
  // of its own parked-but-still-owned bead and double-book itself.
  // --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
  // filtered-out top row must not hide a real in-progress bead behind it.
@@ -213,7 +233,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
  		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
  		`done; `
-@@ -3858,10 +3949,12 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
+@@ -3858,10 +3963,12 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
  // --limit=1 widened to 20 for the same
  // reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
  // a filtered-out top row must not hide real ready work behind it.
@@ -227,7 +247,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
  		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
  		`done; `
-@@ -3882,7 +3975,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool)
+@@ -3882,7 +3989,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool)
  		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
  		`for cand in "$id" "$legacy"; do ` +
  		`[ -z "$cand" ] && continue; ` +
@@ -236,7 +256,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
  		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
  		`done; ` +
-@@ -3898,7 +3991,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
+@@ -3898,7 +4005,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
  		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
  		`for cand in "$id" "$legacy"; do ` +
  		`[ -z "$cand" ] && continue; ` +
@@ -245,7 +265,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
  		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
  		`done; ` +
-@@ -3916,7 +4009,7 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
+@@ -3916,7 +4023,7 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
  	_ = includeEphemeralReady
  	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
  		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
@@ -254,7 +274,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
  }
  
-@@ -3936,7 +4029,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
+@@ -3936,7 +4043,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
  	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
  	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
  		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
@@ -263,7 +283,7 @@ index 32f697871..b905e87c2 100644
  		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
  }
  
-@@ -3948,7 +4041,7 @@ func poolDemandOriginGateScript() string {
+@@ -3948,7 +4055,7 @@ func poolDemandOriginGateScript() string {
  }
  
  func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
@@ -272,7 +292,7 @@ index 32f697871..b905e87c2 100644
  	for i := 1; i <= targetCount; i++ {
  		script += fmt.Sprintf(`probe_pool_demand "$%d"; `, i)
  	}
-@@ -4014,14 +4107,16 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
+@@ -4014,14 +4121,16 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
  	target := a.poolDemandTarget()
  	legacyTarget := legacyWorkflowControlQualifiedName(target)
  	if legacyTarget == "" {
@@ -291,7 +311,7 @@ index 32f697871..b905e87c2 100644
  		poolDemandOriginGateScript() +
  		poolDemandFirstRowFunctionScript(includeEphemeralReady) +
  		`probe_pool_demand "$1"; ` +
-@@ -4050,9 +4145,9 @@ func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) str
+@@ -4050,9 +4159,9 @@ func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) str
  	}
  	target := a.poolDemandTarget()
  	if legacyWorkflowControlQualifiedName(target) != "" {
@@ -303,7 +323,7 @@ index 32f697871..b905e87c2 100644
  }
  
  // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
-@@ -4075,9 +4170,9 @@ func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
+@@ -4075,9 +4184,9 @@ func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
  	}
  	target := a.poolDemandTarget()
  	if legacyWorkflowControlQualifiedName(target) != "" {
@@ -316,7 +336,7 @@ index 32f697871..b905e87c2 100644
  
  // EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt
 diff --git a/internal/config/config_test.go b/internal/config/config_test.go
-index 324bc1eba..de7cf5d9c 100644
+index 324bc1eba..07cfcebfe 100644
 --- a/internal/config/config_test.go
 +++ b/internal/config/config_test.go
 @@ -1725,13 +1725,13 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
@@ -522,7 +542,45 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
      ;;
    *)
-@@ -2695,7 +2700,7 @@ func TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead(t *testing.T) {
+@@ -2678,24 +2683,35 @@ esac
+ 	}
+ }
+ 
+-// TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead is the ga-w4k2z
+-// regression: a bead that keeps getting reclaimed has its updated_at bumped by
+-// every reclaim but NOT its created_at, so a naive .[0:1] off the
+-// created_at-sorted survivor list re-offers the exact same poisoned head to
+-// every dog that polls, starving every newer bead behind it forever (measured
+-// live: 13 candidates spanning ~36h, only the head ever served). The fix
+-// re-ranks survivors by updated_at before taking the head, so a bead that was
+-// JUST reclaimed (updated_at freshly bumped) sorts behind a bead nobody has
+-// touched since creation (updated_at == created_at), even though the
++// TestEffectiveWorkQueryRoutedQueueFallbackSkipsRecentlyReclaimedHead pins the
++// FALLBACK order of tier 1: the ga-w4k2z least-recently-updated re-rank that
++// wo_pick applies when work-order.sh is missing or cannot tell. It is NOT the
++// order production uses with the lib present, so the test says so in its env:
++// WORK_ORDER_LIB names a file that does not exist.
++//
++// The ga-w4k2z regression it keeps: a bead that keeps getting reclaimed has its
++// updated_at bumped by every reclaim but NOT its created_at, so a naive .[0:1]
++// off the created_at-sorted survivor list re-offers the exact same poisoned
++// head to every dog that polls, starving every newer bead behind it forever
++// (measured live: 13 candidates spanning ~36h, only the head ever served). The
++// fallback re-ranks survivors by updated_at before taking the head, so a bead
++// that was JUST reclaimed (updated_at freshly bumped) sorts behind a bead
++// nobody has touched since creation (updated_at == created_at), even though the
+ // just-reclaimed bead is older by created_at.
+-func TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead(t *testing.T) {
++//
++// With the lib present the same fixture (no pilot:reclaim-count label) picks
++// "older-just-reclaimed": updated_at alone does not demote under the `reclaim`
++// age rule. work_order_pick_test.go asserts that ("touched but never reclaimed
++// keeps its place").
++func TestEffectiveWorkQueryRoutedQueueFallbackSkipsRecentlyReclaimedHead(t *testing.T) {
+ 	a := Agent{Name: "worker", Dir: "hello-world"}
+ 	out := runEffectiveWorkQuery(t, a, map[string]string{
+ 		"GC_SESSION_ORIGIN": "ephemeral",
++		"WORK_ORDER_LIB":    filepath.Join(t.TempDir(), "no-such-work-order.sh"),
  	}, `#!/bin/sh
  set -eu
  case "$*" in
@@ -531,7 +589,7 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"older-just-reclaimed","priority":2,"created_at":"2026-05-20T06:09:30Z","updated_at":"2026-05-20T09:59:00Z"},{"id":"newer-never-touched","priority":2,"created_at":"2026-05-20T08:00:00Z","updated_at":"2026-05-20T08:00:00Z"}]'
      ;;
    *)
-@@ -2718,10 +2723,10 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
+@@ -2718,10 +2734,10 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
  	}, `#!/bin/sh
  set -eu
  case "$*" in
@@ -544,7 +602,7 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"older-fallback","priority":2,"created_at":"2026-05-20T06:09:30Z","metadata":{"gc.kind":"workflow","gc.run_target":"hello-world/worker"}}]'
      ;;
    *)
-@@ -2755,7 +2760,7 @@ func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep(t *testi
+@@ -2755,7 +2771,7 @@ func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep(t *testi
  	}, `#!/bin/sh
  set -eu
  case "$*" in
@@ -553,7 +611,7 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"story-live-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-live"}},{"id":"story-no-molecule","priority":2,"created_at":"2026-08-27T20:00:00Z","metadata":{}}]'
      ;;
    *"list --parent mol-live --status in_progress --json --limit 1"*)
-@@ -2787,7 +2792,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep(t *testin
+@@ -2787,7 +2803,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep(t *testin
  	}, `#!/bin/sh
  set -eu
  case "$*" in
@@ -562,7 +620,7 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"story-closed-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-closed"}}]'
      ;;
    *"list --parent mol-closed --status in_progress --json --limit 1"*)
-@@ -2817,7 +2822,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID(t *testing.T) {
+@@ -2817,7 +2833,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID(t *testing.T) {
  	}, `#!/bin/sh
  set -eu
  case "$*" in
@@ -571,7 +629,7 @@ index 324bc1eba..de7cf5d9c 100644
      printf '[{"id":"story-plain","priority":2,"created_at":"2026-08-27T19:00:00Z"}]'
      ;;
    *)
-@@ -3301,12 +3306,15 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
+@@ -3301,12 +3317,15 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
  		t.Run(tt.name, func(t *testing.T) {
  			wq := tt.agent.EffectiveWorkQuery()
  			demand := tt.agent.EffectivePoolDemandQuery()
@@ -592,7 +650,7 @@ index 324bc1eba..de7cf5d9c 100644
  			if !strings.Contains(wq, workPredicate) {
  				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
  			}
-@@ -3334,7 +3342,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
+@@ -3334,7 +3353,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
  					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
  				}
  			}
@@ -601,12 +659,31 @@ index 324bc1eba..de7cf5d9c 100644
  			if !strings.Contains(wq, migrationWorkPredicate) {
  				t.Errorf("EffectiveWorkQuery() missing shared migration predicate %q in %q", migrationWorkPredicate, wq)
  			}
+@@ -6179,6 +6198,18 @@ func runShellWithFakeBd(t *testing.T, shellCmd string, env map[string]string, bd
+ 
+ 	cmd := exec.Command("sh", "-c", shellCmd)
+ 	cmd.Env = []string{"PATH=" + tmp + ":" + os.Getenv("PATH")}
++	// ga-9t9acg.7: wo_pick looks the work-order lib up in WORK_ORDER_LIB, else
++	// GC_CITY_PATH, else GC_CITY. Unless a test names its own lib, point
++	// WORK_ORDER_LIB at a file that does not exist, so every test that goes
++	// through this helper pins the FALLBACK order (the pre-ga-9t9acg.7 pick) on
++	// purpose instead of by the accident of an empty env. The order the rule
++	// gives with the lib present is asserted in work_order_pick_test.go.
++	_, ownLib := env["WORK_ORDER_LIB"]
++	_, ownCityPath := env["GC_CITY_PATH"]
++	_, ownCity := env["GC_CITY"]
++	if !ownLib && !ownCityPath && !ownCity {
++		cmd.Env = append(cmd.Env, "WORK_ORDER_LIB="+filepath.Join(tmp, "no-such-work-order.sh"))
++	}
+ 	for k, v := range env {
+ 		cmd.Env = append(cmd.Env, k+"="+v)
+ 	}
 diff --git a/internal/config/work_order_pick_test.go b/internal/config/work_order_pick_test.go
 new file mode 100644
-index 000000000..72562fc01
+index 000000000..1dd0074f7
 --- /dev/null
 +++ b/internal/config/work_order_pick_test.go
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,602 @@
 +package config
 +
 +import (
@@ -854,8 +931,9 @@ index 000000000..72562fc01
 +			want: "p0-feature-newest-of-25",
 +		},
 +		{
-+			// ga-w4k2z anti-starvation: a bead reclaimed twice (updated_at bumped by
-+			// each reclaim, created_at not) goes behind an untouched peer.
++			// ga-w4k2z LRU, kept only for a bead carrying pilot:reclaim-count: a bead
++			// reclaimed twice (updated_at bumped by each reclaim, created_at not)
++			// goes behind an untouched peer.
 +			name: "reclaimed twice goes behind its untouched peer",
 +			beads: func(s woSite) []string {
 +				return []string{
@@ -876,6 +954,22 @@ index 000000000..72562fc01
 +				}
 +			},
 +			want: "p1-bug-commented",
++		},
++		{
++			// pilot:starvation-count is NOT a reclaim. inflight-reclaim-guard.py
++			// do_reclaim stamps it INSTEAD of pilot:reclaim-count for a bead no worker
++			// ever claimed (audit-only: nothing reads it), so the `reclaim` age rule
++			// leaves such a bead on created_at and it keeps its place. Pinned because
++			// it is a decision, not an accident: the old tier 1 demoted any bead whose
++			// updated_at had moved (see the README, "Decision" table).
++			name: "starvation-count alone is not a reclaim",
++			beads: func(s woSite) []string {
++				return []string{
++					s.bead("p1-bug-starved", 1, "bug", "2026-09-01T12:00:00Z", "2026-10-05T12:00:00Z", `"pilot:starvation-count:1"`),
++					s.bead("p1-bug-newer", 1, "bug", "2026-09-20T12:00:00Z", "2026-09-20T12:00:00Z", ""),
++				}
++			},
++			want: "p1-bug-starved",
 +		},
 +		{
 +			// The vetoes still run BEFORE the order: a refused P0 feature never wins.

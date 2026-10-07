@@ -8,8 +8,9 @@ Author: dog `gastown.dog-6`, 2026-10-07. **Not compiled, not swapped** (bead rul
 `internal/config/config.go` (module `github.com/gastownhall/gascity`): the routed pool probe (tier 1, tier 2 migration,
 tier 3 ephemeral) and the four assigned-work leaf queries (in_progress / ready, durable / ephemeral) hand their survivors
 to `packs/town-deltas/assets/scripts/work-order.sh` (`ga-9t9acg.1`, gate:passed) through a shell function `wo_pick`,
-which runs `work_order_sort --age reclaim`: **priority > type (feature first) > age**, with the reclaim anti-starvation
-clock (`updated_at` only for a bead carrying `pilot:reclaim-count:N`, N>=1).
+which runs `work_order_sort --age reclaim`: **priority > type (feature first) > age**, where the `reclaim` age is
+`created_at`, except `updated_at` for a bead carrying `pilot:reclaim-count:N` (N>=1). What that keeps and what it
+changes is in the Decision table (row "Age = `reclaim`"): read it before the swap.
 
 Before: tier 1 was `sort_by(.updated_at // .created_at)` over a 20-bead window; tier 2/3 and the assigned queries took
 bd's own order over `--limit=20`. A P0 feature newer than a P0 bug lost to the bug; a P0 feature that was the 25th bead
@@ -22,11 +23,20 @@ was never seen.
 | Lib absent / unreadable / "cannot tell": `work-order WARN: wo_pick: …` on stderr, then the SAME survivors through the PREVIOUS order (LRU for tier 1, bd's for the rest) | Never empty output: empty means "no bead" to the dog. The lib's own stderr is never sent to `/dev/null`. |
 | Lib lookup: `$WORK_ORDER_LIB`, else `$GC_CITY_PATH`, else `$GC_CITY` (+ `packs/town-deltas/assets/scripts/work-order.sh`); first one set wins, no cascade | Dog sessions export `GC_CITY_PATH` and `GC_CITY` (checked in this session's env). |
 | `poolDemandLabelFilterJQ`, `assignedTierExclusionFilterJQ`, `moleculeLiveStepFilterShell` unchanged | The vetoes do not move; only the order after them does. |
-| Control-dispatcher `emit_ready` (`cmd/gc/dispatch_runtime.go`, `--limit=%d`) NOT touched | Out of scope: it is not the dog probe. `cmd/gc/cmd_convoy_dispatch_test.go` still pins `--limit=20` for it, correctly. |
+| Control-dispatcher `emit_ready` (`cmd/gc/dispatch_runtime.go`, `--limit=%d`) NOT touched | Out of scope: it is not the dog probe. `cmd/gc/cmd_convoy_dispatch_test.go` still pins `--limit=20` for it, correctly. The registry has no row for it (0 matches for `emit_ready` / `dispatch_runtime`), so the lint will not remind anyone: the same window-before-order class stays there until someone files it. |
+| Age = `reclaim` (`created_at`; `updated_at` only with `pilot:reclaim-count:N`, N>=1) | It is the age the bead asked for (R7, R8). Three consequences, each checked against `work-order.sh` and `scripts/inflight-reclaim-guard.py`: **(a)** the ga-w4k2z LRU (a bead that keeps being reclaimed does not re-take the head) now holds only for beads that carry `pilot:reclaim-count`; **(b)** `updated_at` alone no longer demotes a bead, where the old tier 1 demoted any bead whose `updated_at` had moved. That is what avoids the ga-oc6knj regression (a bead the Pilot had just dispatched had its `updated_at` bumped and went to the back); **(c)** `pilot:starvation-count` is NOT read: `do_reclaim` stamps it INSTEAD of `pilot:reclaim-count` for a bead no worker ever claimed (audit-only, nothing reads it), so such a bead keeps its place on `created_at`. Live at 2026-10-07T08:29Z (`bd ready --unassigned --limit 0`, read-only): 19 ready beads routed to `gastown.dog`, 2 with `reclaim-count`, 1 with `starvation-count`; city-wide 366 / 2 / 4. Not established as harmful (a starved bead near the head may even be right); it is a decision, pinned by the test row "starvation-count alone is not a reclaim". The retained `...RoutedQueueFallbackSkipsRecentlyReclaimedHead` pins only the FALLBACK order, and says so in its env. |
+| Order is applied per tier / per store, not over their union | The first tier that yields a bead wins: a P2 in tier 1 beats a P0 feature in tier 2 or 3, and a durable assigned bead beats an ephemeral one. `work-order.sh`'s header says to UNION the stores before ordering. This patch keeps the engine's tier structure and orders inside each tier. Not changed here: a follow-up if the rule must hold across tiers. |
+| The fallback WARN is on stderr, and the engine's hook runner drops stderr on success | `shellWorkQueryWithEnv` (`cmd/gc/cmd_hook.go`, read at the base) keeps stderr in a buffer that is surfaced only when the command exits non-zero. A dog session that runs the printed command in Bash sees the WARN; on the `gc hook` / serve / wake paths an unreadable lib reverts to the previous order with NO trace. This patch does not change that. "After the swap" check 2 covers the dog's Step 1c; a durable counter, or a watchdog check that the lib path the engine derives is readable, is a follow-up. |
+| The lib is executed from the shared working tree (`$GC_CITY_PATH/packs/town-deltas/assets/scripts/`) | An uncommitted edit by another agent changes dispatch order with no integrity check (a broken edit at least trips the WARN and the fallback). Same exposure as every script the city runs from that tree. |
 
 Files in the patch: `internal/config/config.go`, `internal/config/config_test.go` (every `--limit=20` string pin and
-fake-bd case pattern became `--limit 0`; a comment on `…UsesOldestBeforePriority`, whose name predates this patch),
+fake-bd case pattern became `--limit 0`; a comment on `…UsesOldestBeforePriority`, whose name predates this patch;
+`runShellWithFakeBd` now points `WORK_ORDER_LIB` at a file that does not exist unless the test names its own lib, so
+every test that goes through it pins the FALLBACK order on purpose and not by the accident of an empty env; and
+`…SkipsRecentlyReclaimedHead` became `…FallbackSkipsRecentlyReclaimedHead`, with that stated in its name, comment and env),
 `cmd/gc/cmd_hook_test.go` (four `--limit 0` pins), and the NEW `internal/config/work_order_pick_test.go`.
+No other engine test executes the work query: `cmd/gc/cmd_convoy_dispatch_test.go` hands it to `runWorkflowServeFollow`
+with `workflowServeList` stubbed, and the three `poolDemandLabelFilterJQ` tests run only the jq filter.
 
 ## What was verified, and what was not
 
@@ -38,19 +48,28 @@ Run (scratch worktrees of `consolidated/engine-window-20260926` @ `ae3833456`):
   `harness/out-sh.txt` and `harness/out-dash.txt` (33 checks each, 0 FAIL, `ALL PASS`). Covered: P0 feature (newer) vs P0
   bug (older); 25 beads with the only P0 feature 25th; reclaimed x2; lib absent; lib erroring six ways (cannot-tell,
   syntax error, exit-at-source, empty lib, no function, unreadable); idle poll `[]`; garbage from bd; all three tiers and
-  all four assigned queries; the full default `work_query`.
-- A Python mirror of `work_order_pick_test.go`'s tables (`gotest_sim.py`): **OLD code 20/104 checks pass, NEW 118/118**
+  all four assigned queries; the full default `work_query`. Check 7 (`bd` prints garbage) pins a PRE-EXISTING
+  error==empty collapse at the unchanged `bd ... 2>/dev/null | jq ... 2>/dev/null` stages: same answer as before, on
+  purpose; this patch did not introduce it and does not fix it.
+- A Python mirror of `work_order_pick_test.go`'s tables (`gotest_sim.py`): **OLD code 28/114 checks pass, NEW 128/128**
   (`sim-sh.txt`, `sim-dash.txt`), with a mutation control (mutants: window of 20 before ordering, no ordering, age = created_at only, age = updated_at only, WARN swallowed).
-- Same simulator against the REAL `work-order.sh` (`sim-real-lib.txt`): NEW 115/118. The 3 misses are the
-  "age = updated_at only" mutant, which the real lib's `--age field` semantics happens not to distinguish; the Go test
-  mutates the stand-in lib only, so this does not affect the engine.
+- Same simulator against the REAL `work-order.sh` (`sim-real-lib.txt`): NEW 125/128. The 3 misses are the
+  "age = updated_at only" mutant. The stand-in lib defines `--age field` as `updated_at`; the REAL lib's `field` reads a
+  caller-injected `_wo_age` (see its header), so under that mutant every bead is age-unreadable and the head falls to the
+  id tiebreak, which happens to match the expected head in those scenarios. So only the stand-in run proves that mutation
+  control; the Go test mutates the stand-in lib only, so this does not affect the engine.
 - The lib's own selftest (`bash packs/town-deltas/assets/scripts/work-order.selftest.sh`, city root, TMPDIR in scratch):
   `RESULT: PASS (342 passed, 0 skipped)`, exit 0 (`harness/selftest.out`). It tests the lib, not this patch.
 
-**Not run:** `go build`, `go vet`, `go test`. The Go (including the new test file) is gofmt-clean but was **not
-type-checked and the Go tests were not executed**. The shell strings were validated by extracting the new raw literals
-from `config.go` (`gen.py`), not by running the Go that renders them; `gotest_sim.py` mirrors the Go test tables by
-hand. Treat a failure in the pre-swap commands below as a defect of this patch and hand the bead back.
+**Not run (by the author, nor by the gate-fix round):** `go build`, `go vet`, `go test`. The Go (including the new test
+file) is gofmt-clean but was **not type-checked and the Go tests were not executed by us**. The shell strings were
+validated by extracting the new raw literals from `config.go` (`gen.py`), not by running the Go that renders them;
+`gotest_sim.py` mirrors the Go test tables by hand. The gate review of the FIRST version did run `go test
+./internal/config -run 'WorkOrder|EffectiveWorkQuery|EffectiveAssigned|PoolDemand|RoutedPoolWorkQuery' -count=1` on
+base+patch and reported `ok` (its report; not re-run here); it did not run `go test ./cmd/gc` or `go vet`. The gate-fix
+revision (helper pin, test rename, one table row, comments) is gofmt-clean and its shell logic is covered by the
+harness, but it is NOT type-checked or run: the bead rule is patch-only, and free disk was 6.2 GiB, under the 8 GB
+guard, when it was written. Treat a failure in the pre-swap commands below as a defect of this patch and hand the bead back.
 
 ## Apply in the next engine window
 
@@ -118,13 +137,27 @@ A `--limit=20` that survives, or a missing `wo_pick() {`, means the patch did no
 
 ## Same commit as the swap (repo changes this patch cannot carry)
 
-- `packs/town-deltas/assets/scripts/work-order.registry.tsv`: delete the `ext` rows 57 and 58 (R7, R8, owner
-  `ga-9t9acg.7`) in the commit that records the swap, not before: until then the live engine still has those idioms.
-- **Watchdog coupling (registry row 55, UNASSIGNED).** `scripts/pool-autoscale-watchdog.py` `_ready_candidates`
-  mirrors the engine's 20-bead probe window (`PROBE_CANDIDATE_LIMIT = 20`, `--sort oldest --limit=20` near line 378) and
-  emits `[PROBE-WINDOW-FULL]` (near line 466). After the swap the engine sees the whole population and orders it by the
-  rule, so the watchdog's window both misjudges "nothing claimable" and mis-orders. It must change together with this
-  patch (row 55 says so): drop the window, order by `work_order_sort`, remove the `PROBE-WINDOW-FULL` signal.
+- `packs/town-deltas/assets/scripts/work-order.registry.tsv`: delete the two `ext` rows for
+  `engine:internal/config/config.go` whose owner is `ga-9t9acg.7` (R7 and R8) in the commit that records the swap, not
+  before: until then the live engine still has those idioms. **Select them by content, never by line number**: the row
+  numbers move with every merge that touches the registry (they had already moved by one between this patch's first
+  draft and the branch the gate reviewed, and a `sed '57,58d'` on the old numbers deletes R8 and ANOTHER slice's R12 row).
+
+  ```sh
+  R=packs/town-deltas/assets/scripts/work-order.registry.tsv
+  awk -F'\t' '$1=="ext" && $2=="engine:internal/config/config.go" && $4=="ga-9t9acg.7"' "$R" | cut -c1-90   # exactly 2 rows: R7, R8
+  awk -F'\t' '!($1=="ext" && $2=="engine:internal/config/config.go" && $4=="ga-9t9acg.7")' "$R" > "$R.new" && mv "$R.new" "$R"
+  git diff -- "$R"      # read it: only those two lines removed; the R12 / R12b rows (painel_visibilidade.py) stay
+  ```
+
+  Checked against the registry at the reviewed branch: the first command prints 2 rows; the second leaves 94 of 96
+  rows and both `painel_visibilidade.py` rows.
+- **Watchdog coupling (the registry's `consumer` row for `scripts/pool-autoscale-watchdog.py`, owner UNASSIGNED).**
+  `_ready_candidates` there mirrors the engine's 20-bead probe window (the constant `PROBE_CANDIDATE_LIMIT = 20` and the
+  `"--sort", "oldest", f"--limit={PROBE_CANDIDATE_LIMIT}"` call) and emits `[PROBE-WINDOW-FULL]`. After the swap the engine
+  sees the whole population and orders it by the rule, so the watchdog's window both misjudges "nothing claimable" and
+  mis-orders. It must change together with this patch (that registry row says so): drop the window, order by
+  `work_order_sort`, remove the `PROBE-WINDOW-FULL` signal.
   Doing it BEFORE the swap would desynchronise it from the live engine, so it was not touched here. No bead tracks it
   yet; it is reported on `ga-9t9acg.7` for the Mayor to assign.
 
@@ -132,6 +165,13 @@ A `--limit=20` that survives, or a missing `wo_pick() {`, means the patch did no
 
 The lib call is a child `bash` + `jq`: about 41-80 ms against 6-9 ms for the old `jq` per 25 beads, paid only when a
 tier has survivors (an idle poll prints `[]` without calling the lib).
+
+The whole-population fetch also removes the 20-bead cap that bounded `moleculeLiveStepFilterShell`'s sequential
+`bd list --parent <molecule_id> --limit 1` probes (one per candidate that carries a `molecule_id`). Measured
+2026-10-07T08:29Z, read-only: 19 ready beads routed to `gastown.dog`, 0 carrying a `molecule_id` (366 / 0 city-wide), so no
+probe runs today. The engine bounds the whole work query by `hookWorkQueryTimeout = 30 * time.Second` (`cmd/gc/cmd_hook.go`,
+read at the base); the gate review reported ~0.7-1.3 s per probe (not re-measured here), i.e. a timeout, a visible and
+transient error, once tens of candidates carry a `molecule_id`. Re-measure with a real session after the swap.
 
 ## Re-running the harness
 
@@ -142,12 +182,13 @@ binary printed them with `gc prime gastown.dog`; `gen.py` picks them by shape, n
 outputs (`out-*.txt`, `sim-*.txt`, `selftest.out`). They need only python3, jq and bash/dash; they do not build anything.
 
 ```sh
+export PYTHONDONTWRITEBYTECODE=1                # keeps a __pycache__ out of the harness folder
 H=docs/pending-engine-window/ga-9t9acg.7-work-order-pool-probe.harness
 G=<patched internal/config/config.go>   T=<patched internal/config/work_order_pick_test.go>
 python3 -I $H/run.py $H/baseline-dog-commands-engwin0919.txt $G "$GC_CITY_PATH" sh          # or /bin/dash
 python3 -I $H/gotest_sim.py $H/baseline-dog-commands-engwin0919.txt $G $T sh
 GC_WORK_ORDER_LIB_REAL=$GC_CITY_PATH/packs/town-deltas/assets/scripts/work-order.sh \
-  python3 -I $H/gotest_sim.py $H/baseline-dog-commands-engwin0919.txt $G $T sh              # real lib: 115/118, see above
+  python3 -I $H/gotest_sim.py $H/baseline-dog-commands-engwin0919.txt $G $T sh              # real lib: 125/128, see above
 ```
 
 The baseline is the 0919 print; 0926 differs only in the label-filter jq, which this patch does not touch.

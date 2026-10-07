@@ -1,4 +1,4 @@
-== shell under test: sh ; lib: /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-order.sh
+== shell under test: sh ; lib: /Users/athos/gt/.gascity-gastown-hq/.gc-worktrees/feat-ga-9t9acg-7-work-order-pool-probe/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-order.sh
 -- 1. routed tier: P0 feature (newer) vs P0 bug (older)
      old  rc=0 head=['bug-p0-older'] stderr=-
      new  rc=0 head=['feature-p0-newer'] stderr=-
@@ -25,9 +25,9 @@ PASS 4 absent lib via WORK_ORDER_LIB: same head, rc 0
 -- 5. lib erroring / broken / unreadable -> old order, WARN, never empty
      cannot-tell rc=0 head=['bug-p0-older'] stderr=work-order ERROR: stub: cannot tell (+1)
 PASS 5 cannot-tell: old head, rc 0, WARN, not empty
-     syntax-error rc=0 head=['bug-p0-older'] stderr=/private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-dog-6/5335713b-4780-4aff-8 (+2)
+     syntax-error rc=0 head=['bug-p0-older'] stderr=/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-libs-xnvb0vrz/syntax-error.sh: line 1: syntax error near u (+2)
 PASS 5 syntax-error: old head, rc 0, WARN, not empty
-     exit-at-sour rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/private/tmp/claude-501/-Users-athos-gt--gascity-gas
+     exit-at-sour rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/var/folders/gj/kjd31p2n1z97c_8v9y8tg5600000gn/T/wo-
 PASS 5 exit-at-source: old head, rc 0, WARN, not empty
      empty-lib rc=0 head=['bug-p0-older'] stderr=wo: work_order_sort: command not found (+1)
 PASS 5 empty-lib: old head, rc 0, WARN, not empty
@@ -82,6 +82,6 @@ PASS 12 head is the P0 feature, not the unreadable bead
 PASS 12 the lib's own WARN line reached stderr (not swallowed)  work-order WARN: no-prio: prio?
 PASS 12 stdout is exactly one JSON array
 PASS 12b a lone unreadable bead is still served (never dropped, never empty)
--- 13. wall time per routed-tier run on 25 beads (10 runs each, loaded machine, includes harness setup): old 351 ms, new 537 ms
+-- 13. wall time per routed-tier run on 25 beads (10 runs each, loaded machine, includes harness setup): old 428 ms, new 657 ms
 
 RESULT under sh: ALL PASS

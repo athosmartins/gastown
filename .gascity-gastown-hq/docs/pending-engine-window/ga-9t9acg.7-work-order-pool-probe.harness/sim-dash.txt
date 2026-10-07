@@ -1,10 +1,12 @@
-=== OLD: 20/104 checks pass
+=== OLD: 28/114 checks pass
 FAIL order/pool tier 1 (work query)/P0 feature newer than P0 bug  head=['p0-bug-older']
 FAIL order/pool tier 1 (work query)/25 beads, P0 feature last by age  head=['p2-bug-00']
 FAIL order/pool tier 1 (work query)/touched but never reclaimed keeps its place  head=['p1-bug-newer']
+FAIL order/pool tier 1 (work query)/starvation-count alone is not a reclaim  head=['p1-bug-newer']
 FAIL order/pool tier 1 (routed pool query)/P0 feature newer than P0 bug  head=['p0-bug-older']
 FAIL order/pool tier 1 (routed pool query)/25 beads, P0 feature last by age  head=['p2-bug-00']
 FAIL order/pool tier 1 (routed pool query)/touched but never reclaimed keeps its place  head=['p1-bug-newer']
+FAIL order/pool tier 1 (routed pool query)/starvation-count alone is not a reclaim  head=['p1-bug-newer']
 FAIL order/pool tier 2 (run_target migration)/P0 feature newer than P0 bug  head=['p0-bug-older']
 FAIL order/pool tier 2 (run_target migration)/25 beads, P0 feature last by age  head=['p2-bug-00']
 FAIL order/pool tier 2 (run_target migration)/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
@@ -83,4 +85,4 @@ FAIL lookup/GC_CITY_PATH  head=['p0-bug-older'] err=
 FAIL lookup/GC_CITY  head=['p0-bug-older'] err=
 FAIL lookup/WORK_ORDER_LIB wins, no cascade  head=['p0-bug-older'] err=
 FAIL lookup/nothing set  head=['p0-bug-older'] err=
-=== NEW: 118/118 checks pass
+=== NEW: 128/128 checks pass
