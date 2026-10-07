@@ -31,15 +31,15 @@ What it does, every run (launchd StartInterval, single instance via flock):
      alternative is crews that never move) but it is LOGGED as "owner unverified", COUNTED, remembered as unverified (the
      normal identity TTL applies), and checked as soon as the CLI has refreshed the token: a wrong owner is alerted and
      its source quarantined so it is never written again.
-  4. VERIFY: after a switch, every session that had a Remote Control bridge must still have one 60 s later. A check that
-     cannot be made (sessions dir unreadable, window missed) says so; it never reports success.
+  NOT HERE: the post-switch Remote Control check (every session that had a bridge must still have one 60 s later) is the
+  second slice of ga-qdtmq2, ga-llvuo4. Until it lands, a switch that costs a session its bridge is not noticed by this script.
 
 Secrets: held in memory; the only place they leave is `security -i` STDIN (hex). Never argv, env, log, state or alert.
 Accounts are named by e-mail + sha256[:8] fingerprints.
 
 KNOBS: GC_CREW_ACCOUNT=0 or <city>/.gc/no-crew-account -> the run does nothing. `--dry-run` prints what it WOULD do.
 SEAMS (tests): CLAUDE_CREW_STATE, CLAUDE_CREW_DECISION, CLAUDE_CREW_ACCOUNTS (json), CLAUDE_CREW_ACCOUNTS_DIR,
-CLAUDE_CREW_SECURITY, CLAUDE_CREW_SESSIONS_DIR, CLAUDE_CREW_NOTIFY, CLAUDE_CREW_NOW, CLAUDE_CREW_USER,
+CLAUDE_CREW_SECURITY, CLAUDE_CREW_NOTIFY, CLAUDE_CREW_NOW, CLAUDE_CREW_USER,
 CLAUDE_CREW_PROFILE_URL (honoured ONLY for a loopback host).
 """
 from __future__ import annotations
@@ -69,8 +69,7 @@ DEFAULT_DECISION = "/Users/athos/shared/data/claude_pool_current_account.json"
 DEFAULT_STATE = "/Users/athos/shared/data/claude_crew_current_account.json"
 DRY = False                     # --dry-run: logs go to stderr, nothing is written, nothing is notified (a real push once was)
 IDENTITY_TTL_S = 6 * 3600       # a token is re-asked of the profile at least this often (it also changes on every refresh)
-VERIFY_AFTER_S = 60             # the CLI re-reads the item every ~30 s; the bridge is checked this long after a switch
-VERIFY_GIVE_UP_S = 900          # a check (bridges, owner) made later than this after the switch is not blamed on the switch
+VERIFY_GIVE_UP_S = 900          # a check made later than this after the switch is not blamed on the switch
 MIN_REFRESH_LEFT_S = 86400      # a login whose refresh token has < 1 day left is not a source
 ALERT_EVERY_S = 6 * 3600
 ALERT_RETRY_S = 300             # a push that was NOT delivered is retried after this, not after ALERT_EVERY_S
@@ -140,13 +139,6 @@ def _num(v, default: float = 0.0) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else default
 
 
-def _int(v) -> Optional[int]:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
-
 def login_name() -> str:
     u = os.environ.get("CLAUDE_CREW_USER") or os.environ.get("USER", "")
     if u:
@@ -163,10 +155,6 @@ def decision_path() -> Path:
 
 def state_path() -> Path:
     return Path(os.environ.get("CLAUDE_CREW_STATE") or DEFAULT_STATE)
-
-
-def sessions_dir() -> Path:
-    return Path(os.environ.get("CLAUDE_CREW_SESSIONS_DIR") or Path.home() / ".claude" / "sessions")
 
 
 def security_bin() -> str:
@@ -423,120 +411,6 @@ def alert(st: dict, key: str, msg: str, t: float) -> None:
     al[key] = t if delivered else t - ALERT_EVERY_S + ALERT_RETRY_S
 
 
-# ── Remote Control bridges ────────────────────────────────────────────────
-def proc_start(pid: int) -> Optional[str]:
-    """`ps lstart` of a pid in UTC (the format of ~/.claude/sessions/*.json `procStart`), whitespace-normalized.
-    '' = no such process; None = could not ask."""
-    try:
-        r = subprocess.run(["/bin/ps" if os.path.exists("/bin/ps") else "ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False,
-                           env={**os.environ, "TZ": "UTC", "LC_ALL": "C"})
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode not in (0, 1):
-        return None
-    return " ".join(r.stdout.split())
-
-
-def alive(pid: int, start: Optional[str] = None) -> bool:
-    """Is `pid` still THE session that was recorded? A bare kill(pid, 0) says yes to a pid the OS has since handed to a
-    stranger; the start time recorded in the session file tells them apart."""
-    if start:
-        ps = proc_start(pid)
-        if ps is not None:
-            return ps == " ".join(str(start).split())
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True                                        # it exists, it is just not ours to signal
-    except OSError:
-        return False
-    return True
-
-
-def bridges() -> Optional[Dict[int, dict]]:
-    """{pid: {bridge, start}} of the live sessions that HAVE a Remote Control bridge. None = the sessions dir could not be
-    read: that is not 'no bridges' and must never be reported as success."""
-    d = sessions_dir()
-    try:
-        names = sorted(os.listdir(d))
-    except OSError:
-        return None
-    out: Dict[int, dict] = {}
-    for n in names:
-        if not n.endswith(".json"):
-            continue
-        data = load_json(d / n)
-        if not data or not data.get("bridgeSessionId"):
-            continue
-        pid = _int(data.get("pid") or n[:-5])
-        start = data.get("procStart") if isinstance(data.get("procStart"), str) else ""
-        if pid is None or not alive(pid, start):
-            continue
-        out[pid] = {"bridge": str(data["bridgeSessionId"]), "start": start}
-    return out
-
-
-def check_bridges(st: dict, t: float) -> bool:
-    """Judge the pending post-switch check. Returns True when it changed `st`."""
-    pv = st.get("pending_verify")
-    if not isinstance(pv, dict):
-        return False
-    to, age = pv.get("to"), t - _num(pv.get("since"))
-    if age < VERIFY_AFTER_S:
-        return False
-    if age > VERIFY_GIVE_UP_S:
-        log("WARN", f"switch to {to}: the Remote Control check came too late ({int(age)} s after the switch, window "
-                    f"{VERIFY_GIVE_UP_S} s) - not judged, and not blamed on the switch")
-        st["rc_unjudged"] = {"at": t, "to": to, "age_s": int(age)}
-        st.pop("pending_verify", None)
-        return True
-    now_b = bridges()
-    if now_b is None:
-        if not pv.get("unreadable"):
-            log("WARN", f"switch to {to}: could not read the sessions dir - Remote Control NOT verified yet (will retry)")
-            pv["unreadable"] = t
-            return True
-        return False
-    if pv.get("blind"):
-        log("WARN", f"switch to {to}: the sessions dir was unreadable when the crews switched, so there is no list of bridges "
-                    "to compare - Remote Control NOT verified")
-        st["rc_unjudged"] = {"at": t, "to": to, "blind": True}
-        st.pop("pending_verify", None)
-        return True
-    before = pv.get("pids") or {}
-    starts = pv.get("starts") or {}
-    lost, up, ended = [], 0, 0
-    for pid_s in before:
-        pid = _int(pid_s)
-        if pid is None or not alive(pid, starts.get(pid_s)):
-            ended += 1                     # the session ended on its own: not a switch casualty, and not a bridge that is up
-            continue
-        if pid not in now_b:
-            lost.append(pid)
-        else:
-            up += 1
-    if lost:
-        alert(st, "rc-lost", f"after the switch to {to} the sessions {sorted(lost)} lost Remote Control "
-              "(restart them at an idle moment)", t)
-        st["rc_lost"] = {"pids": sorted(lost), "at": t, "to": to}
-    elif not before:
-        log("INFO", f"switch to {to}: no Remote Control bridge existed at the switch - nothing to verify")
-        st.pop("rc_lost", None)
-    elif not up:
-        log("INFO", f"switch to {to}: none of the {len(before)} sessions that had a Remote Control bridge is still running "
-                    "(they ended on their own) - no session was left to verify")
-        st.pop("rc_lost", None)
-    elif ended:
-        log("INFO", f"switch to {to}: {up} of {len(before)} Remote Control bridges are still up; {ended} session(s) ended on "
-                    "their own before the check (not a switch casualty, not verified)")
-        st.pop("rc_lost", None)
-    else:
-        log("INFO", f"switch to {to}: all {len(before)} Remote Control bridges are still up")
-        st.pop("rc_lost", None)
-    st.pop("pending_verify", None)
-    return True
-
-
 # ── the run ─────────────────────────────────────────────────────────────
 def disabled() -> Optional[str]:
     if os.environ.get("GC_CREW_ACCOUNT") == "0":
@@ -743,7 +617,6 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
         log("INFO", f"DRY-RUN would switch the crews {ident} -> {target} ({reason}) from {svc}"
                     + ("" if claimed else " [owner unverified: the profile cannot answer for that token]"))
         return 0
-    before = bridges()
     if not verified_write(DEFAULT_SERVICE, acct or user, with_login(cur, blob)):
         alert(st, "write-failed", f"could not write the {target} login to the default item (refused, failed or not verified - "
                                   "see the log)", t)
@@ -762,12 +635,7 @@ def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
         st.pop("unverified", None)
     st["current"] = target
     st["last_switch"] = {"from": ident, "to": target, "reason": reason, "at": t, "source": svc}
-    st["pending_verify"] = {"since": t, "to": target, "pids": {str(p): v["bridge"] for p, v in (before or {}).items()},
-                            "starts": {str(p): v["start"] for p, v in (before or {}).items() if v["start"]},
-                            "blind": before is None}
-    st.setdefault("alerts", {}).pop("rc-lost", None)
-    log("INFO", f"SWITCH crews {ident} -> {target} ({reason}); fp access {f_new}; "
-                + (f"{len(before)} Remote Control bridges to verify" if before is not None else "sessions dir unreadable: bridges NOT listed"))
+    log("INFO", f"SWITCH crews {ident} -> {target} ({reason}); fp access {f_new}")
     if deferred:
         alert(st, deferred[0], deferred[1], t)
     return 0
@@ -788,7 +656,6 @@ def run_once(dry: bool = False) -> int:
         log("WARN", f"the state file {state_path()} is {st_status} - starting from an empty state (pending checks and alert "
                     "history are lost)")
         st["state_reset"] = {"at": t, "was": st_status}
-    check_bridges(st, t)                                       # first, and on EVERY path: a pending check must not wait for a quiet run
     dec = load_json(decision_path())
     if not dec or not isinstance(dec.get("current"), str):
         log("WARN", "no pool decision to follow yet - the crews stay")
