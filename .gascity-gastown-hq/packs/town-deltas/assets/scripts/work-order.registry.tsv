@@ -10,7 +10,10 @@
 #                    `owner` migrates it to work_order_sort and DELETES the row in the same commit. When the
 #                    last consumer row is gone the programme is done (reviewed rows stay).
 #          reviewed  a line the idioms catch that does NOT order a bead queue (comments, git refs, one story's
-#                    own verdict wisp, a report). It stays, with the reason in `note`.
+#                    own verdict wisp, a report) — or the DEGRADED-MODE fallback of a consumer that already moved
+#                    to work_order_sort: it runs only when the library is missing or cannot tell, so the consumer
+#                    keeps its old order with a visible WARN instead of answering "empty". It stays, with the
+#                    reason in `note`.
 #          ext       a consumer OUTSIDE this repo (engine, panel). Not scanned; listed so the inventory is whole.
 #                    file is `<repo>:<path>`, regex is `-`.
 #   file   path relative to .gascity-gastown-hq/ (ext: repo:path)
@@ -45,7 +48,6 @@ consumer	packs/town-deltas/assets/auto-refino-dispatcher.sh	sort_by\(\.created_a
 consumer	packs/town-deltas/assets/refino-gate-dispatcher.sh	sort_by\(\.created_at // \.id\) \| \.\[0\]	ga-9t9acg.9	R10 refino-review queue: oldest first, priority ignored
 consumer	packs/town-deltas/assets/context-check-dispatcher.sh	sort_by\(\.created_at // \.id\)	ga-9t9acg.10	R11 context-check: FIFO per store, priority and type ignored, global cap eaten by the first stores
 consumer	agents/wa-worker/prompt.template.md	routed_to=wa-worker	ga-9t9acg.5	R5 wa-worker Step 1b2 probe: --sort priority --limit=20 then sort_by([priority, age]); window before the final sort
-consumer	agents/ps-worker/prompt.template.md	routed_to=ps-worker	ga-9t9acg.6	R6 ps-worker Step 1b2 probe: same as R5
 consumer	packs/town-deltas/assets/quality-gate-dispatcher.sh	sort_by\(\.created_at\)	ga-q8tj7p	R1 gate marker-select cascade (SELFTEST-EXTRACT marker-select); age = created_at of the MARKER, i.e. --age field there
 consumer	scripts/gate-recovery-watchdog.py	valid\.sort\(key=lambda x: x\[2\]\)	ga-9t9acg.13	R13 _orphan_head: the watchdog's "head of the gate queue" mirror (FIFO by marker created_at)
 consumer	packs/town-deltas/assets/quality-gate-guard.sh	sort_by\(\.created_at\) \| \.\[0\]	UNASSIGNED	not in the inventory: gate_pick_oldest_marker (called at MARKER=$(gate_pick_oldest_marker ...)) picks the guard's marker FIFO; belongs with the gate slice ga-q8tj7p or its own slice
@@ -57,8 +59,9 @@ ext	engine:internal/config/config.go	-	ga-9t9acg.7	R7 routedReadyTierCommand / l
 ext	engine:internal/config/config.go	-	ga-9t9acg.7	R8 standardAssignedInProgressWorkQueryScript / standardAssignedReadyWorkQueryScript: --limit=20 with no sort (patch only)
 ext	whatsapp_automation:whatsapp_automation/daemons/painel_visibilidade.py	-	ga-9t9acg.11	R12 kanban columns and the Triagem cut (updated_at desc plus _TRIAGEM_COLUMN_LIMIT), applySort in the page JS
 ext	whatsapp_automation:whatsapp_automation/daemons/painel_visibilidade.py	-	ga-9t9acg.12	R12b "fila do gate" list: fila_list.sort(created_at), the mirror of the gate order
-# --- reviewed rows: not a bead queue -------------------------------------------------------------------------
+# --- reviewed rows: not a bead queue, or a degraded-mode fallback ---------------------------
 reviewed	scripts/approved-state-reconciler.py	def _pilot_queue_position	-	R14 only READS the order R3 emits ("behind N items of higher priority"); correct once R3 migrates, checked in ga-9t9acg.3
+reviewed	agents/ps-worker/prompt.template.md	PS_PICK="\$\(printf .%s. "\$PS_CAND" \| jq -c .sort_by\(\[\.priority, 	-	R6 (ga-9t9acg.6) the ps-worker Step 1b2 probe's FALLBACK: it runs ONLY when work_order_sort is missing or cannot tell, on the pool the probe already fetched whole (--limit 0). It is the order the prompt had before the migration (priority, then age by reclaim, no feature tier), kept so a broken library degrades to the old order with a WARN and never to [] (which a worker reads as "no work" and drains on). Not served in normal operation; the pool-probe-priority-sort selftest runs it with the library hidden.
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	for-each-ref --count=1 --sort=-committerdate	-	git: the newest branch of a repo, not a bead
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	--json --limit 5(?!\d)	-	sling retry: finds the ONE bead this sling just created, by title and creation time (window of 5 is the lookup, not a queue)
 reviewed	packs/town-deltas/assets/pilot-dispatcher.sh	sort_by\(\.created_at\) \| reverse \| \.\[0\]\.id	-	sling retry: the newest bead with the sling's own title; not a queue
