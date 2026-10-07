@@ -790,6 +790,34 @@ def test_a_reused_pid_is_not_a_live_bridge(w):
     assert list(crew.bridges()) == [me]
 
 
+def test_sessions_that_ended_on_their_own_are_not_counted_as_bridges_that_are_up(w):
+    me = os.getpid()
+    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _session(w, me, "cse_a")
+        _session(w, gone.pid, "cse_b")
+        _switch_crypto_to_amb(w)
+        assert set(w.state()["pending_verify"]["pids"]) == {str(me), str(gone.pid)}
+    finally:
+        gone.kill()
+        gone.wait()                                               # this session ended by itself before the check
+    w.run(at=w.now + 90)
+    assert "all 2" not in w.log() and "1 of 2 Remote Control bridges are still up" in w.log()
+    assert "ended on their own" in w.log() and not w.notified() and "pending_verify" not in w.state()
+
+
+def test_when_every_session_ended_nothing_is_reported_as_up(w):
+    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _session(w, gone.pid, "cse_b")
+        _switch_crypto_to_amb(w)
+    finally:
+        gone.kill()
+        gone.wait()
+    w.run(at=w.now + 90)
+    assert "still up" not in w.log() and "no session was left to verify" in w.log() and "pending_verify" not in w.state()
+
+
 def test_a_verification_that_comes_too_late_is_not_blamed_on_the_switch(w):
     me = os.getpid()
     _session(w, me, "cse_a")
@@ -875,6 +903,22 @@ def test_heal_that_finds_no_login_anywhere_names_what_is_missing(w):
     w.run()
     assert crew.DEFAULT_SERVICE not in w.writes()
     assert any("cannot heal" in n and EMAIL["amb"] in n for n in w.notified())
+
+
+def test_heal_with_a_blank_pool_pick_still_heals_from_any_account(w):
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))
+    w.account("b85", blob("b85"))
+    (w.d / "pool_decision.json").write_text(json.dumps({"current": "", "updated": crew._iso(w.now), "schema": 1}))
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-b85-ref"
+
+
+def test_heal_alert_with_a_blank_pool_pick_still_reads_as_a_sentence(w):
+    w.put(crew.DEFAULT_SERVICE, blob("old", refresh=False))
+    (w.d / "pool_decision.json").write_text(json.dumps({"current": "", "updated": crew._iso(w.now), "schema": 1}))
+    w.run()
+    assert crew.DEFAULT_SERVICE not in w.writes()
+    assert any("cannot heal" in n and "log  in" not in n for n in w.notified())
 
 
 def test_a_default_without_a_full_login_is_alerted_even_when_its_owner_is_known(w):

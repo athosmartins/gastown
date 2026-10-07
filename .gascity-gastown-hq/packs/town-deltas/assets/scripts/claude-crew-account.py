@@ -505,19 +505,30 @@ def check_bridges(st: dict, t: float) -> bool:
         return True
     before = pv.get("pids") or {}
     starts = pv.get("starts") or {}
-    lost = []
+    lost, up, ended = [], 0, 0
     for pid_s in before:
         pid = _int(pid_s)
         if pid is None or not alive(pid, starts.get(pid_s)):
-            continue                       # the session ended on its own: not a switch casualty
+            ended += 1                     # the session ended on its own: not a switch casualty, and not a bridge that is up
+            continue
         if pid not in now_b:
             lost.append(pid)
+        else:
+            up += 1
     if lost:
         alert(st, "rc-lost", f"after the switch to {to} the sessions {sorted(lost)} lost Remote Control "
               "(restart them at an idle moment)", t)
         st["rc_lost"] = {"pids": sorted(lost), "at": t, "to": to}
     elif not before:
         log("INFO", f"switch to {to}: no Remote Control bridge existed at the switch - nothing to verify")
+        st.pop("rc_lost", None)
+    elif not up:
+        log("INFO", f"switch to {to}: none of the {len(before)} sessions that had a Remote Control bridge is still running "
+                    "(they ended on their own) - no session was left to verify")
+        st.pop("rc_lost", None)
+    elif ended:
+        log("INFO", f"switch to {to}: {up} of {len(before)} Remote Control bridges are still up; {ended} session(s) ended on "
+                    "their own before the check (not a switch casualty, not verified)")
         st.pop("rc_lost", None)
     else:
         log("INFO", f"switch to {to}: all {len(before)} Remote Control bridges are still up")
@@ -644,7 +655,7 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
     """The default item holds no full login (Remote Control is broken): put SOME full login there. The pool's pick first,
     then the account that holds it now, then any account that still has balance."""
     tried, whys = set(), []
-    for cand in [want] + ([ident] if ident else []) + list(accounts()):
+    for cand in ([want] if want else []) + ([ident] if ident else []) + list(accounts()):
         if cand in tried or (cand != want and exhausted(dec, cand, t)):
             continue
         tried.add(cand)
@@ -655,7 +666,8 @@ def heal_choice(st: dict, dec: dict, ident: Optional[str], want: str, t: float) 
             return cand, src, "heal" if cand == want else "heal-fallback", note
         whys.append(f"{cand}: {'; '.join(why)}")
     alert(st, "heal-no-source", f"cannot heal the default item: no account has a usable full login ({' | '.join(whys)}). "
-                                f"Fix: log {want} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human step", t)
+                                f"Fix: log {want or 'one of the accounts'} in (claude auth login with its CLAUDE_CONFIG_DIR) - a human "
+                                "step", t)
     return None, None, "heal-no-source", None
 
 

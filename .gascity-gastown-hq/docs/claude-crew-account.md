@@ -23,8 +23,10 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
    entra em quarentena (`bad_sources`, pela impressão do refresh token) e nunca mais é escrita até o login ser refeito.
    Se o perfil nunca responder em 15 min: log `still unverified` (sem push: sem sessão viva ninguém renova o token).
 5. **Verify:** toda sessão que tinha bridge de Remote Control ainda a tem 60 s depois. Quem não pôde ser verificado diz que
-   não foi (pasta de sessões ilegível, janela de 15 min perdida, zero bridges): nunca imprime "todas no ar". Pid reaproveitado
-   pelo SO não conta como bridge viva (compara `procStart` da sessão com `TZ=UTC ps -o lstart=`).
+   não foi (pasta de sessões ilegível, janela de 15 min perdida, zero bridges): nunca imprime "todas no ar". Sessão que
+   terminou sozinha entre a troca e a checagem não conta como bridge no ar: o log diz "X de N ... Y terminaram sozinhas" (ou
+   "nenhuma sobrou para verificar"). Pid reaproveitado pelo SO não conta como bridge viva (compara `procStart` da sessão com
+   `TZ=UTC ps -o lstart=`).
 
 ## Garantias
 - Nunca chama `claude`; custo de crédito zero (só o perfil, grátis). Nunca escreve no item hasheado do pool.
@@ -57,7 +59,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 
-Testes: `scripts/test_claude_crew_account.py` (59 testes, shim de `security`, servidor de perfil em loopback). O harness é
+Testes: `scripts/test_claude_crew_account.py` (63 testes, shim de `security`, servidor de perfil em loopback). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
