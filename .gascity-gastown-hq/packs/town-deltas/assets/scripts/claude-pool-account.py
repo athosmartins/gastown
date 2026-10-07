@@ -419,7 +419,8 @@ def describe_foreign_item(user: str) -> str:
                                                     if young else "none") + (f" (+{len(young) - RECENT_CLAUDE_MAX} more)" if len(young) > RECENT_CLAUDE_MAX else ""))
     except (OSError, subprocess.SubprocessError):
         parts.append("process list unreadable")
-    return "; ".join(parts)[:900]
+    line, cap, mark = "; ".join(parts), 900, " ...[truncated]"   # a cut line says it was cut: the parts at its tail are the ones that go first
+    return line if len(line) <= cap else line[:cap - len(mark)] + mark
 
 
 # ── state ──────────────────────────────────────────────────────────────────────────────────────────

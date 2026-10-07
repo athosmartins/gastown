@@ -538,6 +538,17 @@ EOF
   run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
   case "$fl" in *"subscriptionType=null"*) ok "B14k subscriptionType: null in the foreign blob -> 'null' (not 'None', not 'absent')" ;; *) bad "B14k: $fl" ;; esac
 
+  # B14l a line that has to be cut is cut VISIBLY: a foreign blob with hundreds of keys would otherwise push the mtime and the process
+  # list off the end of the line with nothing to say they were there
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+b = {"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"]}}
+b["claudeAiOauth"].update({"k%03d" % i: 1 for i in range(300)})
+open(sys.argv[1], "w").write(json.dumps(b).encode().hex())
+EOF
+  run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"; body="${fl#*: }"
+  case "$fl" in *" ...[truncated]") [ "${#body}" -le 900 ] && ok "B14l a 300-key foreign blob -> the line is cut to <= 900 chars and ends '...[truncated]'" || bad "B14l too long: ${#body}" ;; *) bad "B14l not marked as cut: $(printf '%s' "$fl" | tail -c 80)" ;; esac
+
   # B15 steady state is quiet: no rewrite, 'since' does not move
   seeded; s0="$(jget "$STATE" since)"; w0=$(writes); run_d -- run-once; run_d -- run-once
   [ "$(writes)" = "$w0" ] && [ "$(jget "$STATE" since)" = "$s0" ] && ok "B15 steady state: no item write, 'since' unchanged" || bad "B15 writes $w0 -> $(writes), since $s0 -> $(jget "$STATE" since)"
