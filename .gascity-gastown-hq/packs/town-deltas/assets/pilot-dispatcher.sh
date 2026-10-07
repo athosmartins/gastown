@@ -4798,6 +4798,13 @@ _filter_built() {
 # Written EVEN WHEN ZERO ({...,"count":0,"items":[]}) so the painel can tell
 # "empty queue" (system correctly out of work) from "file stale/missing" (don't
 # trust it). Written ATOMICALLY (tmp + mv) so a reader never sees a partial file.
+# ORDER (ga-9t9acg.3): items[] is in the shared work-order rule's order — priority, then feature before
+# the rest, then oldest first (scripts/work-order.sh) — so index 0 is the bead that rule serves first.
+# That is what the painel and approved-state-reconciler.py (_pilot_queue_position) print as "position".
+# It equals what the dispatcher actually serves only once ga-9t9acg.2 moves _top_candidate onto the same
+# rule; until then the dispatcher still picks bug-first/newest-first (_PILOT_SORT_JQ). If the library
+# cannot order the queue the file is NOT rewritten (see _pilot_emit_dispatchable): an old file, never a
+# wrongly-ordered fresh one.
 #
 # Env-gated PILOT_EMIT_DISPATCHABLE (default 1). FAIL-OPEN by construction: the
 # whole body is wrapped so ANY error logs a warning and returns 0 — a failed emit
@@ -4868,6 +4875,30 @@ _pilot_write_sweep_pause_state() {
 }
 # SELFTEST-EXTRACT pilot-write-sweep-pause-state: END
 
+# ga-9t9acg.3: the ORDER of the queue emitted below is the ONE shared rule (priority > type, feature
+# first > age, oldest first; Athos 2026-10-06, programa ga-9t9acg), implemented once in
+# scripts/work-order.sh — this file carries no sort of its own for it (the registry lint,
+# scripts/work_order.py lint, fails if one comes back). Sourced like the other siblings: next to THIS
+# script (BASH_SOURCE), never a static path; stderr of the source itself is NOT silenced (a corrupt
+# sibling is a deploy fault, so it should be loud). A missing/unreadable library is not fatal: the emit
+# below then answers "cannot tell" (work_order_sort undefined -> empty output) and keeps the PREVIOUS
+# file, so the damage is one WARN per sweep, never a silently wrong order.
+# Age = created_at. The emitted queue has no stage marker of its own (it is every approved bead of
+# every store, not "time in a stage"), and the Pilot's answer to a bead reclaimed again and again is the
+# reclaim cap in _filter_candidates, which takes it OUT of the pool rather than re-ranking it — so the
+# "reclaim" age of the lib is not needed here. ga-9t9acg.2 (_top_candidate) must pass this SAME constant
+# to the lib: the position the painel shows is only true if the dispatcher serves the same order.
+# SELFTEST-EXTRACT work-order-source: BEGIN
+_PILOT_WORK_ORDER_AGE="created"
+_GC_WO_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
+if [ -r "$_GC_WO_SIBLING" ]; then
+  source "$_GC_WO_SIBLING"
+else
+  warn "ga-9t9acg.3: work-order.sh missing/unreadable ($_GC_WO_SIBLING) — the dispatchable-queue emit cannot order the queue and keeps its PREVIOUS file untouched (stale after PILOT_DISPATCHABLE_TTL) until it is restored."
+fi
+unset _GC_WO_SIBLING
+# SELFTEST-EXTRACT work-order-source: END
+
 # _emit_query_one <db_dir> <store_label> — print the fully-filtered eligible
 # candidate array for ONE store, with a "store" field stamped on each item.
 # Mirrors the Tier-1 (bug + tech-debt), Tier-2 (story:approved) and optional
@@ -4931,7 +4962,7 @@ _pilot_emit_dispatchable() {
   PILOT_EMITTED_DONE=1
   # Everything below is best-effort; a failure must never break the sweep.
   {
-    local _all _rig_paths _rp _items _count _now _tmp _dir _rig_json
+    local _all _rig_paths _rp _items _count _now _tmp _dir _rig_json _ordered _wo_err _wo_ok _wo_line
     _all=$(_emit_query_one "$GC_CITY" "hq" 2>/dev/null || echo "[]")
     # Union every non-HQ rig store too (the eligible queue spans all stores).
     # ga-07rb3: best-effort telemetry emission (see the block's own header) —
@@ -4951,10 +4982,39 @@ _pilot_emit_dispatchable() {
       _all=$(echo "$_all $_r" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "$_all")
     done <<< "$_rig_paths"
 
-    # Project to the painel contract shape + stable order (priority, created_at, id).
-    _items=$(echo "$_all" | jq '
-        sort_by([ (.priority // 99), (.created_at // ""), (.id // "") ])
-        | [ .[] | {
+    # Order by the ONE shared rule, then project to the painel contract shape. (ga-9t9acg.3: this was
+    # `sort_by([priority, created_at, id])` — oldest-first with NO type tier — while _top_candidate served
+    # bug-first/newest-first, so the "position" the painel and approved-state-reconciler.py print was the
+    # order of nothing. Age: see _PILOT_WORK_ORDER_AGE. The projection below only picks fields.)
+    # THREE states (work-order.sh header): ordered (exit 0; `[]` stays `[]`); an illegible field (the bead
+    # STAYS, at the end of its class, one `work-order WARN:` line on stderr); cannot tell (empty stdout,
+    # exit != 0). This whole body runs under `2>/dev/null`, which would swallow exactly those lines — the
+    # library's ONLY signal for an illegible field — so the call's stderr goes to a file of its own and is
+    # re-logged through warn() (stdout), where the log keeps it.
+    # Cannot tell -> write NOTHING: the previous file keeps the order it was written with and goes stale
+    # after PILOT_DISPATCHABLE_TTL, which approved-state-reconciler.py, imparavel-check.py and pool-ceiling.sh
+    # already read as "do not trust" (the painel contract above says the same). A fresh `count 0` or a fresh
+    # unordered list would be a lie with a current timestamp: "I do not know" is not "empty".
+    _dir=$(dirname "$PILOT_DISPATCHABLE_FILE")
+    mkdir -p "$_dir" 2>/dev/null || true
+    _wo_err="${PILOT_DISPATCHABLE_FILE}.order-err.$$"
+    _ordered=""
+    _wo_ok=1
+    if ! _ordered=$(printf '%s' "$_all" | work_order_sort --age "$_PILOT_WORK_ORDER_AGE" 2>"$_wo_err") || [ -z "$_ordered" ]; then
+      _wo_ok=0
+    fi
+    if [ -r "$_wo_err" ]; then
+      while IFS= read -r _wo_line; do
+        if [ -n "$_wo_line" ]; then warn "ga-9t9acg.3: $_wo_line"; fi
+      done < "$_wo_err"
+    fi
+    rm -f "$_wo_err" 2>/dev/null || true
+    if [ "$_wo_ok" != "1" ]; then
+      warn "ga-9t9acg.3: work_order_sort could not order the dispatchable queue (library missing, exit != 0 or empty output; reason above if it said one) — NOT writing $PILOT_DISPATCHABLE_FILE: the previous file keeps its order and goes stale after ${PILOT_DISPATCHABLE_TTL}s, because \"cannot tell\" is not \"empty queue\"."
+      return 0
+    fi
+    _items=$(printf '%s' "$_ordered" | jq '
+        [ .[] | {
             id:         .id,
             title:      (.title // .description // "(sem título)"),
             type:       ((.issue_type // .type // "task")),
@@ -4963,13 +5023,14 @@ _pilot_emit_dispatchable() {
             created_at: (.created_at // ""),
             assignee:   ((.assignee // "") | tostring),
             store:      (._emit_store // "hq")
-          } ]' 2>/dev/null || echo "[]")
-    [ -z "$_items" ] && _items="[]"
+          } ]' 2>/dev/null) || _items=""
+    if [ -z "$_items" ]; then
+      warn "ga-9t9acg.3: could not project the ordered dispatchable queue to the painel contract (jq failed) — NOT writing $PILOT_DISPATCHABLE_FILE; the previous file stays (wa-u5r1, fail-open)."
+      return 0
+    fi
     _count=$(echo "$_items" | jq 'length' 2>/dev/null || echo "0")
     _now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    _dir=$(dirname "$PILOT_DISPATCHABLE_FILE")
-    mkdir -p "$_dir" 2>/dev/null || true
     _tmp="${PILOT_DISPATCHABLE_FILE}.tmp.$$"
     if jq -n --arg gen "$_now" --argjson ttl "$PILOT_DISPATCHABLE_TTL" \
          --argjson count "$_count" --argjson items "$_items" \
