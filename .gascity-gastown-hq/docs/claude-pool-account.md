@@ -126,10 +126,16 @@ A pane is **evidence** only if all of these hold (each is a reason *not* to act,
   is not dead;
 - the agent name on that line is a **pool role** (the allow-list `POOL_AGENT_RE` in the daemon: `gastown.dog`, `gastown.boot`,
   `gastown.deacon`, `wa-worker`, `ps-worker`, `gate-reviewer`, `refino-gate-reviewer`, `context-check-reviewer`,
-  `auto-refiner`, each optionally followed by `-<suffix>` such as `gastown.dog-3` or `gate-reviewer-adhoc-ab12cd` - exactly the
-  roles `city.toml` puts on the `claude-headless` provider), or is the wrapper's own `?` for an unset `GC_AGENT`. Anything
-  else - Mayor, a crew, a role nobody listed yet, a name that is no name - is not even looked at, whatever else says it follows
-  the item (see "Mayor and the crews" for why this is an allow-list and not a deny-list);
+  `auto-refiner`, each optionally followed by `-<suffix>` such as `gastown.dog-3` or `gate-reviewer-adhoc-ab12cd` - the pool and
+  autonomous roles, which `city.toml` keeps on the `claude-headless` provider), or is the wrapper's own `?` for an unset
+  `GC_AGENT`. Measured on the wrapper's real log on 2026-10-07 (and still true of the day of it that is left after the log was
+  trimmed): `gastown.dog`, `gate-reviewer`, `wa-worker`, `refino-gate-reviewer` and `auto-refiner` have `SET` lines. `gastown.boot`, `gastown.deacon` and `ps-worker` are in the
+  list because `city.toml` names them as `claude-headless` roles (the comment on that provider); `context-check-reviewer`
+  because it is a pool-style reviewer, with neither a `SET` line nor a `city.toml` line saying so. A name in the list that
+  never has a `SET` line costs nothing - the list is only consulted for pids the wrapper put on the pool item - so the gap
+  to watch is the other direction, a pool role missing from it. Anything else - Mayor, a crew, a role nobody listed yet, a name
+  that is no name - is not even looked at, whatever else says it follows the item (see "Mayor and the crews" for why this is
+  an allow-list and not a deny-list);
 - **the modal:** the footer `Enter to confirm · Esc to cancel` is the **last** line of the screen, and
   `What do you want to do?` precedes `1. Stop and wait for limit to reset` in the lines above it (an agent that merely
   *quotes* those words has its prompt box under the quote and does not match);

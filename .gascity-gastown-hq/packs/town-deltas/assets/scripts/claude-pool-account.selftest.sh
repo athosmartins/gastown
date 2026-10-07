@@ -99,7 +99,7 @@ run_wrapper() { # run_wrapper [env assignments...] -- args...
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
   [ "${1:-}" = "--" ] && shift
   env -i HOME="$W/home" PATH="$BIN:/usr/bin:/bin" GC_CITY_PATH="$W/city" GC_LOWPRIO=0 \
-      GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" FAKE_KC="${FAKE_KC:-}" "${envs[@]}" \
+      GC_LOWPRIO_CLAUDE_BIN="$BIN/fake-claude" GC_POOL_CRED_DIR="$POOL_DIR" FAKE_KC="${FAKE_KC:-}" ${envs[@]+"${envs[@]}"} \
       "$WRAPPER" "$@" 2>/dev/null
 }
 
@@ -504,7 +504,7 @@ run_d() { # run_d [env assignments...] -- <daemon args>   (always a clean enviro
       TMUXD="$TMUXD" CLAUDE_POOL_TMUX="$BB/tmux" CLAUDE_POOL_TMUX_SOCKET=selftest \
       CLAUDE_USAGE_STORE="$D/usage.json" CLAUDE_POOL_STATE="$STATE" CLAUDE_POOL_CRED_DIR="$POOL_DIR" \
       CLAUDE_POOL_ACCOUNTS_LIB="$ACCT_LIB" CLAUDE_POOL_PROBE_URL="http://127.0.0.1:$(cat "$D/port")/v1/messages" \
-      CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" "${envs[@]}" "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
+      CLAUDE_POOL_NOW="${NOW_OVERRIDE-$NOW_BASE}" ${envs[@]+"${envs[@]}"} "$PY3" "$DAEMON" "$@" >"$D/out.txt" 2>&1
 }
 jget() { "$PY3" -c 'import json,sys; d=json.load(open(sys.argv[1])); 
 for k in sys.argv[2].split("."): d=d.get(k) if isinstance(d,dict) else None
@@ -1956,11 +1956,19 @@ fi
 
 # H1 nothing of this run reached the real log or the real state. Not a line count: the live daemon and the wrapper legitimately append to
 # the real log while a 10-40 minute run goes on. What is looked for is what only a fixture says - the fixtures' accounts (@t.test), this run's
-# scratch directory name, the item hash derived from it, the canary - in the bytes appended since the run started.
-H1_MARK="@t\.test|$(basename "$W")|Claude Code-credentials-$POOL_HASH|$CANARY"
+# scratch directory name, the item hash derived from it, the canary - in the bytes appended since the run started. If the log is SMALLER
+# than at the start (somebody trimmed or rotated it mid-run) the start offset says nothing - it would lie past the end and the check would
+# pass on an empty read - so then the whole file is searched, for the marks only this run can have (not @t.test: older pollution has it).
+H1_UNIQUE="$(basename "$W")|Claude Code-credentials-$POOL_HASH|$CANARY"
+H1_MARK="@t\.test|$H1_UNIQUE"
 if [ -n "$REAL_LOG" ] && [ -f "$REAL_LOG" ]; then
-  leaked="$(tail -c +"$((REAL_OFF + 1))" "$REAL_LOG" | grep -aE "$H1_MARK" | head -n 3 | cut -c1-200)"
-  [ -z "$leaked" ] && ok "H1 the real wrapper log ($REAL_LOG) took no fixture line during this run" || bad "H1 fixture lines reached the real log: $leaked"
+  if [ "$(wc -c < "$REAL_LOG" | tr -d ' ')" -lt "$REAL_OFF" ]; then
+    h1_from=0; h1_mark="$H1_UNIQUE"; h1_note=" - it was trimmed during the run, so the whole file was searched"
+  else
+    h1_from="$REAL_OFF"; h1_mark="$H1_MARK"; h1_note=""
+  fi
+  leaked="$(tail -c +"$((h1_from + 1))" "$REAL_LOG" | grep -aE "$h1_mark" | head -n 3 | cut -c1-200)"
+  [ -z "$leaked" ] && ok "H1 the real wrapper log ($REAL_LOG) took no fixture line during this run$h1_note" || bad "H1 fixture lines reached the real log$h1_note: $leaked"
 else
   echo "  - H1 skipped: no real log to compare (the run was not started from a session with GC_CITY_PATH)"
 fi
