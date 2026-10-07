@@ -348,8 +348,8 @@ You are disposable. You do not carry state between runs. When your bead is done,
 #     feature tier — on the same already-filtered pool. It never answers [] for "I
 #     could not order it": [] means the pool has nothing, and a worker that reads
 #     it drains.
-# The filters and vetoes are untouched (scripts/pool-probe-vetoes.sh mirrors them).
-# Same change, in the same words, in wa-worker's copy (ga-9t9acg.5).
+# The filters and vetoes are untouched (packs/town-deltas/assets/scripts/pool-probe-vetoes.sh mirrors them).
+# The twin slice ga-9t9acg.5 makes the same change in wa-worker's copy of this probe; read the two together.
 # Regression coverage: pool-probe-priority-sort.selftest.sh runs the block below
 # end to end with a fake `bd`, including the missing-library fallback.
 #
