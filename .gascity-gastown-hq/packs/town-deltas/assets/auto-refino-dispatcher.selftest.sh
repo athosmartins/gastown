@@ -1957,6 +1957,312 @@ else
   bad "21b. Athos-queue guard missing from jq filter, classifier, or the live call-site wiring — wa-bpnty-shape re-ingestion can re-form"
 fi
 
+# ── Scenario 22 (ga-9t9acg.8): ONE order across ALL stores — priority > feature > oldest ─────────────────────
+# Athos, 2026-10-06 (programa ga-9t9acg): "primeiro todas p0 feature, começando pelas mais antigas. Depois todas p0
+# que não são feature... ela deve valer pra todas as etapas do painel (…qual em triagem resolver primeiro)".
+# It REVERSES the earlier Triagem order — per-store loop, FIRST store with a candidate wins, newest-first, priority
+# ignored — so a P2 of HQ beat a P0 of WA, and two P0 of one store were served newest first.
+# These are END-TO-END: the real dispatcher runs a DRY_RUN sweep against a fake `bd` that serves per-store fixtures
+# AND keeps bd's own window (default 50, `--limit 0` = all, newest first), then the log's "Selected story" line is
+# read. They are red on the previous dispatcher (a P2 of the first store, the newest P0, or a story inside the window
+# is selected instead) and green after. Mutation controls at the end prove each guard is load-bearing: the old order,
+# the old window, an unpinned store, "cannot order = empty queue" and a swallowed library stderr must each turn a
+# case red — a test that cannot fail proves nothing.
+echo ""
+echo "── Scenario 22 (ga-9t9acg.8): Triagem order — priority > feature > oldest, across ALL stores ──"
+
+# Sourcing the dispatcher in lib mode (top of this file) leaves its `set -e` ON in THIS shell, so any
+# command below that returns non-zero (a `grep -c` that counts 0, a sweep that exits 1) would end the whole
+# suite silently, with no ✗. This scenario reads such statuses on purpose — a failure must be a ✗, not a vanishing run.
+set +e
+
+_ar22_root="$(mktemp -d)"
+_ar22_fb="$_ar22_root/fakebin"
+mkdir -p "$_ar22_fb"
+cat > "$_ar22_fb/bd" <<'FAKEBD'
+#!/usr/bin/env bash
+# Fake bd for Scenario 22: serves $store/fx-*.json for the Step 1 candidate queries and keeps bd's own window.
+store=""
+if [ "${1:-}" = "-C" ]; then store="$2"; shift 2; fi
+printf '%s :: %s\n' "$store" "$*" >> "${AR_FAKE_LOG:-/dev/null}"
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+if [ "$sub" != "list" ]; then echo "[]"; exit 0; fi
+label=""; typ=""; assignee=""; noassign=0; limit=50
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --label) label="$2"; shift 2 ;;
+    --type) typ="$2"; shift 2 ;;
+    --assignee) assignee="$2"; shift 2 ;;
+    --no-assignee) noassign=1; shift ;;
+    --limit) limit="$2"; shift 2 ;;
+    --status|--exclude-label) shift 2 ;;
+    *) shift ;;
+  esac
+done
+f=""
+case "$label" in
+  story:triage) f="fx-triage.json" ;;
+  story:unrefined) f="fx-unref.json" ;;
+  story:refinement-in-progress) if [ "$noassign" = 1 ]; then f="fx-orphan.json"; else f="fx-bounce.json"; fi ;;
+  "") if [ "$typ" = "feature" ] && [ -z "$assignee" ]; then f="fx-rawfeature.json"; fi ;;
+esac
+if [ -n "$f" ] && [ -f "$store/$f" ]; then body="$(cat "$store/$f")"; else body="[]"; fi
+# bd's window: the default is 50 and keeps the NEWEST first; `--limit 0` is the whole population.
+printf '%s' "$body" | jq -c --argjson n "$limit" 'sort_by(.created_at) | reverse | if $n > 0 then .[0:$n] else . end'
+FAKEBD
+chmod +x "$_ar22_fb/bd"
+
+_ar22_n=0
+# _ar22_case — a fresh city (HQ store) + one rig store (WA); sets _C _HQ _WA.
+_ar22_case() { _ar22_n=$((_ar22_n+1)); _C="$_ar22_root/c$_ar22_n"; _HQ="$_C/hq"; _WA="$_C/wa"; mkdir -p "$_HQ/.gc/logs" "$_HQ/tmp" "$_WA"; }
+# _ar22_bead <id> <priority> <created_at> [labels-json] — a Triagem feature, updated long ago.
+_ar22_bead() {
+  printf '{"id":"%s","title":"story %s","issue_type":"feature","priority":%s,"status":"open","labels":%s,"created_at":"%s","updated_at":"2026-09-01T00:00:00Z"}' \
+    "$1" "$1" "$2" "${4:-[\"story:triage\"]}" "$3"
+}
+# _ar22_put <store> <fixture> <json-array>
+_ar22_put() { printf '%s\n' "$3" > "$1/$2"; }
+# _ar22_run <dispatcher> <store...> — DRY_RUN sweep of the city _HQ over those stores; sets _sel (id or NONE), _rc, _LOG.
+_ar22_run() {
+  local disp="$1"; shift
+  AR_FAKE_LOG="$_C/fake-bd.log" PATH="$_ar22_fb:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin" TMPDIR="$_HQ/tmp" \
+    AUTO_REFINO_CITY_OVERRIDE="$_HQ" AUTO_REFINO_STORES="$*" DRY_RUN=1 AUTO_REFINO_YIELD=0 \
+    QUIET_HOURS_OVERRIDE=OPEN DRAIN_WINDOW_OVERRIDE=OPEN \
+    bash "$disp" > "$_C/run.out" 2>&1
+  _rc=$?
+  _LOG="$_HQ/.gc/logs/auto-refino-dispatcher.log"
+  _sel="$(sed -n 's/.*Selected story for auto-refino: \([^ ]*\) .*/\1/p' "$_LOG" 2>/dev/null | head -1)"
+  [ -n "$_sel" ] || _sel="NONE"
+}
+# _ar22_variant <dir> <lib-mode> — a copy of the dispatcher + its siblings in <dir>; lib-mode: real | missing | rc2 | empty0 | short
+_ar22_variant() {
+  local d="$1" mode="$2"
+  mkdir -p "$d/scripts"
+  cp "$SELF_DIR/auto-refino-dispatcher.sh" "$SELF_DIR/quiet-hours-check.sh" "$d/"
+  case "$mode" in
+    real)    cp "$SELF_DIR/scripts/work-order.sh" "$d/scripts/work-order.sh" ;;
+    missing) : ;;
+    rc2)     printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "work-order ERROR: stub cannot tell" >&2; return 2; }' > "$d/scripts/work-order.sh" ;;
+    empty0)  printf '%s\n' 'work_order_sort() { cat >/dev/null; return 0; }' > "$d/scripts/work-order.sh" ;;
+    short)   printf '%s\n' "work_order_sort() { jq -c '.[0:1]'; }" > "$d/scripts/work-order.sh" ;;
+  esac
+}
+# _ar22_mutate <file> <old> <new> [all] — exact replacement; a mutation that matches nothing is a FAILED test, never a silent no-op.
+_ar22_mutate() {
+  python3 -I -B - "$1" "$2" "$3" "${4:-one}" <<'PY'
+import sys
+p, old, new, mode = sys.argv[1:5]
+s = open(p, encoding="utf-8").read()
+n = s.count(old)
+if n == 0 or (mode != "all" and n != 1):
+    sys.stderr.write("MUTATION-MISS: %r matched %d time(s)\n" % (old[:70], n))
+    sys.exit(3)
+open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PY
+}
+
+# ── 22a. A P0 in the LAST store beats a P2 in the FIRST store (and the store order does not matter) ──
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-p2new 2 2026-10-05T10:00:00Z)]"
+_ar22_put "$_WA" fx-triage.json "[$(_ar22_bead wa-p0old 0 2026-09-10T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_HQ" "$_WA"
+[ "$_sel" = "wa-p0old" ] \
+  && ok "22a. P0 (old) in the 2nd store is served before P2 (new) in the 1st store (selected: $_sel)" \
+  || bad "22a. expected wa-p0old (P0 of the last store), selected '$_sel' — the first store still wins over priority (rc=$_rc)"
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-p2new 2 2026-10-05T10:00:00Z)]"
+_ar22_put "$_WA" fx-triage.json "[$(_ar22_bead wa-p0old 0 2026-09-10T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_WA" "$_HQ"
+[ "$_sel" = "wa-p0old" ] \
+  && ok "22a'. same fixture, stores listed in the other order → same winner (the order of AUTO_REFINO_STORES decides nothing)" \
+  || bad "22a'. expected wa-p0old with the stores swapped, selected '$_sel'"
+# the selected row's store is logged, and it is the WA store (not the city store)
+grep -q "Candidate selected from store $_WA" "$_LOG" 2>/dev/null \
+  && ok "22a''. the winner's own store is the one pinned for the write-back ($_WA)" \
+  || bad "22a''. 'Candidate selected from store $_WA' missing from the log — downstream writes would target the wrong store"
+
+# ── 22b. Inside one store: oldest first among equals, priority first among all ──
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-b-new 0 2026-10-01T10:00:00Z), $(_ar22_bead ga-a-old 0 2026-09-20T10:00:00Z), $(_ar22_bead ga-c-p1 1 2026-08-01T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_HQ"
+[ "$_sel" = "ga-a-old" ] \
+  && ok "22b. two P0 in one store → the OLDER (a P1 older than both does not jump the P0s) (selected: $_sel)" \
+  || bad "22b. expected ga-a-old (oldest P0), selected '$_sel' — still newest-first or priority-blind"
+
+# ── 22c. The window trap (ga-g7yt): the oldest P0 sits beyond bd's default window of 50 ──
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-h-p2 2 2026-09-30T10:00:00Z)]"
+_ar22_put "$_WA" fx-triage.json "$(jq -cn '[range(0;55) | {id:("wa-w\(.)"), title:"w", issue_type:"feature", priority:(if . == 0 then 0 else 2 end), status:"open", labels:["story:triage"], created_at:(("2026-09-01T00:00:00Z" | fromdateiso8601) + . * 3600 | todate), updated_at:"2026-09-01T00:00:00Z"}]')"
+_ar22_run "$DISPATCHER" "$_HQ" "$_WA"
+[ "$_sel" = "wa-w0" ] \
+  && ok "22c. the oldest P0 of a 55-story store (past bd's default window of 50) is found: every candidate list is --limit 0 (selected: $_sel)" \
+  || bad "22c. expected wa-w0 (the 55th story, beyond the default window), selected '$_sel' — a candidate list is still windowed"
+_win_missing=$(grep -E ' :: list ' "$_C/fake-bd.log" | grep -E -- '--label story:(triage|unrefined|refinement-in-progress)|--type (feature|story)' | grep -vc -- '--limit 0')
+[ "$_win_missing" = "0" ] \
+  && ok "22c'. no Step 1 candidate query is issued without --limit 0 (fake-bd log)" \
+  || bad "22c'. $_win_missing candidate query(ies) without --limit 0 in the fake-bd log"
+
+# ── 22d. $AR_STORE is pinned to the SELECTED row's store before any bd_ call about it ──
+# A raw no-label P0 in the FIRST store, a P2 in the LAST store: the gather loop ends with AR_STORE = the last store,
+# so an unpinned classification would ask the wrong database for `children` / `show` of the raw story.
+_ar22_case
+_ar22_put "$_HQ" fx-rawfeature.json "[$(_ar22_bead ga-raw0 0 2026-09-01T10:00:00Z '["frontend"]')]"
+_ar22_put "$_WA" fx-triage.json "[$(_ar22_bead wa-p2 2 2026-10-02T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_HQ" "$_WA"
+[ "$_sel" = "ga-raw0" ] \
+  && ok "22d. a raw no-label P0 of the 1st store is served before a P2 of the last store (selected: $_sel)" \
+  || bad "22d. expected ga-raw0, selected '$_sel'"
+if grep -qF "$_HQ :: children ga-raw0" "$_C/fake-bd.log" && grep -qF "$_HQ :: show ga-raw0" "$_C/fake-bd.log" \
+   && ! grep -qF "$_WA :: children ga-raw0" "$_C/fake-bd.log" && ! grep -qF "$_WA :: show ga-raw0" "$_C/fake-bd.log"; then
+  ok "22d'. bd_ children/show of the raw story went to ITS store ($_HQ), none to the last-gathered store"
+else
+  bad "22d'. bd_ children/show for ga-raw0 did not target its own store — AR_STORE is not pinned per row"
+fi
+
+# ── 22e. THREE states of the library, never collapsed ──
+# (1) illegible field: the row STAYS (end of its class), and the lib's WARN line reaches the dispatcher's log.
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-good 2 2026-09-01T10:00:00Z), $(_ar22_bead ga-bad '"oops"' 2026-08-01T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_HQ"
+[ "$_sel" = "ga-good" ] \
+  && ok "22e1. an unreadable priority is served AFTER the readable P2 — never promoted to P0 (selected: $_sel)" \
+  || bad "22e1. expected ga-good first, selected '$_sel' — an illegible priority was promoted or dropped"
+grep -q 'work-order WARN: ga-bad: prio?' "$_LOG" 2>/dev/null \
+  && ok "22e1'. the lib's 'work-order WARN: ga-bad: prio?' line is in the dispatcher log (its stderr is kept, not /dev/null)" \
+  || bad "22e1'. the lib's WARN line for the illegible priority is NOT in the log — its only signal was swallowed"
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-only-bad '"oops"' 2026-08-01T10:00:00Z)]"
+_ar22_run "$DISPATCHER" "$_HQ"
+[ "$_sel" = "ga-only-bad" ] \
+  && ok "22e1''. a story whose priority is unreadable is still served when it is the only one (never dropped)" \
+  || bad "22e1''. the illegible-priority story vanished (selected '$_sel')"
+# (2) cannot tell — library missing / rc!=0 / empty answer / short answer: the sweep CONTINUES with the candidates in
+# the order gathered and a loud WARN. Never the "no eligible candidate" of an empty queue.
+for _mode in missing rc2 empty0 short; do
+  _ar22_case
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-x1 1 2026-09-01T10:00:00Z), $(_ar22_bead ga-x2 0 2026-09-02T10:00:00Z)]"
+  _ar22_variant "$_C/disp" "$_mode"
+  _ar22_run "$_C/disp/auto-refino-dispatcher.sh" "$_HQ"
+  if [ "$_sel" != "NONE" ] && [ "$_rc" -eq 0 ] \
+     && grep -q 'CANNOT ORDER the 2 Triagem candidate' "$_LOG" 2>/dev/null \
+     && ! grep -q 'No eligible candidate after classification' "$_LOG" 2>/dev/null; then
+    ok "22e2[$_mode]. cannot-tell → the sweep still served a story ($_sel) with a CANNOT ORDER warn, not an empty queue"
+  else
+    bad "22e2[$_mode]. cannot-tell was not handled as 'keep going + WARN' (selected '$_sel', rc=$_rc, log: $(grep -c 'CANNOT ORDER' "$_LOG" 2>/dev/null) CANNOT ORDER line(s))"
+  fi
+done
+_ar22_case
+_ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-x1 1 2026-09-01T10:00:00Z)]"
+_ar22_variant "$_C/disp" rc2
+_ar22_run "$_C/disp/auto-refino-dispatcher.sh" "$_HQ"
+grep -q 'work-order ERROR: stub cannot tell' "$_LOG" 2>/dev/null \
+  && ok "22e2'. the library's own ERROR line is re-logged (the reason is not lost)" \
+  || bad "22e2'. the library's ERROR line is not in the dispatcher log"
+# (3) a real empty queue is still an empty queue: no candidates anywhere → a clean 'sweep done', rc 0, no WARN about ordering.
+_ar22_case
+_ar22_run "$DISPATCHER" "$_HQ" "$_WA"
+if [ "$_sel" = "NONE" ] && [ "$_rc" -eq 0 ] && grep -q 'No eligible candidate after classification across all stores' "$_LOG" 2>/dev/null \
+   && ! grep -q 'CANNOT ORDER' "$_LOG" 2>/dev/null; then
+  ok "22e3. no candidate in any store → clean 'sweep done' (rc 0), and no ordering WARN"
+else
+  bad "22e3. an empty queue misbehaved (selected '$_sel', rc=$_rc)"
+fi
+
+# ── 22f. Drift guards on the source ──
+if ! grep -qE 'sort_by\(\.created_at // \.id\)' "$DISPATCHER" && ! grep -q '2026-06-24' "$DISPATCHER"; then
+  ok "22f. the old newest-first sort (and its 2026-06-24 comment) are gone from the dispatcher"
+else
+  bad "22f. the dispatcher still carries the old newest-first sort or its comment"
+fi
+[ "$(grep -c -- 'work_order_sort --age created' "$DISPATCHER")" = "1" ] \
+  && ok "22f'. exactly one call to the shared lib, with the documented age rule (created_at)" \
+  || bad "22f'. expected exactly one 'work_order_sort --age created' in the dispatcher"
+[ "$(grep -c -- '--limit 0 --json' "$DISPATCHER")" -ge 6 ] \
+  && ok "22f''. all six candidate queries (triage, unrefined, bounce, orphan, raw feature, raw story) carry --limit 0" \
+  || bad "22f''. fewer than six candidate queries carry --limit 0"
+if (cd "$SELF_DIR/../../.." && python3 -I -B scripts/work_order.py lint > "$_ar22_root/lint.out" 2>&1); then
+  ! grep -qE 'STALE|UNREGISTERED' "$_ar22_root/lint.out" \
+    && ok "22f'''. the work-order registry lint is clean (this consumer's row is gone, no ordering idiom left unregistered)" \
+    || bad "22f'''. the registry lint reports a stale/unregistered row: $(grep -E 'STALE|UNREGISTERED' "$_ar22_root/lint.out" | head -2)"
+else
+  bad "22f'''. the registry lint failed: $(head -3 "$_ar22_root/lint.out" | tr '\n' ' ')"
+fi
+
+# ── 22g. MUTATION CONTROLS: each guard must be load-bearing — put the old behaviour back and the case turns red ──
+# M1: the old order (newest-first by created_at) in place of the lib → 22a / 22b must fail.
+_ar22_case; _m1dir="$_C/m1"; _ar22_variant "$_m1dir" real
+if _ar22_mutate "$_m1dir/auto-refino-dispatcher.sh" 'work_order_sort --age created 2>"$_wo_err"' "jq -c 'sort_by(.created_at // .id) | reverse' 2>\"\$_wo_err\""; then
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-p2new 2 2026-10-05T10:00:00Z)]"
+  _ar22_put "$_WA" fx-triage.json "[$(_ar22_bead wa-p0old 0 2026-09-10T10:00:00Z)]"
+  _ar22_run "$_m1dir/auto-refino-dispatcher.sh" "$_HQ" "$_WA"; _m1a="$_sel"
+  _ar22_case   # a fresh city for 22b's fixture; the mutant stays where it was built ($_m1dir)
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-b-new 0 2026-10-01T10:00:00Z), $(_ar22_bead ga-a-old 0 2026-09-20T10:00:00Z)]"
+  _ar22_run "$_m1dir/auto-refino-dispatcher.sh" "$_HQ"; _m1b="$_sel"
+  # BOTH halves must really have run the mutant (a sweep that selects nothing proves nothing) and both must differ from the rule.
+  { [ "$_m1a" != "NONE" ] && [ "$_m1b" != "NONE" ] && [ "$_m1a" != "wa-p0old" ] && [ "$_m1b" != "ga-a-old" ]; } \
+    && ok "22g1. MUTANT 'old newest-first sort' is caught (22a picked '$_m1a', 22b picked '$_m1b')" \
+    || bad "22g1. the old-order mutant was NOT caught, or did not run (22a '$_m1a', 22b '$_m1b') — the order cases cannot fail"
+else
+  bad "22g1. mutation did not apply (the call site changed) — the control is vacuous"
+fi
+# M2: the default window back (no --limit 0) → 22c must fail.
+_ar22_case; _ar22_variant "$_C/m2" real
+if _ar22_mutate "$_C/m2/auto-refino-dispatcher.sh" '--limit 0 --json' '--json' all; then
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-h-p2 2 2026-09-30T10:00:00Z)]"
+  _ar22_put "$_WA" fx-triage.json "$(jq -cn '[range(0;55) | {id:("wa-w\(.)"), title:"w", issue_type:"feature", priority:(if . == 0 then 0 else 2 end), status:"open", labels:["story:triage"], created_at:(("2026-09-01T00:00:00Z" | fromdateiso8601) + . * 3600 | todate), updated_at:"2026-09-01T00:00:00Z"}]')"
+  _ar22_run "$_C/m2/auto-refino-dispatcher.sh" "$_HQ" "$_WA"
+  { [ "$_sel" != "NONE" ] && [ "$_sel" != "wa-w0" ]; } \
+    && ok "22g2. MUTANT 'bd default window of 50' is caught (selected '$_sel', not wa-w0)" \
+    || bad "22g2. the window mutant was NOT caught, or did not run (selected '$_sel') — 22c cannot fail"
+else
+  bad "22g2. mutation did not apply — the control is vacuous"
+fi
+# M3: no per-row store pin → 22d' must fail (children/show asked of the last-gathered store).
+_ar22_case; _ar22_variant "$_C/m3" real
+if _ar22_mutate "$_C/m3/auto-refino-dispatcher.sh" '  AR_STORE="$c_store"
+' ''; then
+  _ar22_put "$_HQ" fx-rawfeature.json "[$(_ar22_bead ga-raw0 0 2026-09-01T10:00:00Z '["frontend"]')]"
+  _ar22_put "$_WA" fx-triage.json "[$(_ar22_bead wa-p2 2 2026-10-02T10:00:00Z)]"
+  _ar22_run "$_C/m3/auto-refino-dispatcher.sh" "$_HQ" "$_WA"
+  if grep -qF "$_WA :: children ga-raw0" "$_C/fake-bd.log" || grep -qF "$_WA :: show ga-raw0" "$_C/fake-bd.log"; then
+    ok "22g3. MUTANT 'no per-row store pin' is caught (children/show of the HQ story were asked of the WA store)"
+  else
+    bad "22g3. the unpinned-store mutant was NOT caught — 22d' cannot fail"
+  fi
+else
+  bad "22g3. mutation did not apply — the control is vacuous"
+fi
+# M4: cannot-tell read as an empty queue → 22e2 must fail.
+_ar22_case; _ar22_variant "$_C/m4" rc2
+if _ar22_mutate "$_C/m4/auto-refino-dispatcher.sh" '  ORDERED="$ALL_CANDIDATES"
+elif' '  ORDERED="[]"
+elif'; then
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-x1 1 2026-09-01T10:00:00Z), $(_ar22_bead ga-x2 0 2026-09-02T10:00:00Z)]"
+  _ar22_run "$_C/m4/auto-refino-dispatcher.sh" "$_HQ"
+  # proof the mutant RAN and took the cannot-tell branch: its CANNOT ORDER warn is in the log, and still nothing was served
+  { [ "$_sel" = "NONE" ] && grep -q 'CANNOT ORDER' "$_LOG" 2>/dev/null; } \
+    && ok "22g4. MUTANT 'cannot order = empty queue' is caught (CANNOT ORDER logged, yet nothing selected)" \
+    || bad "22g4. the cannot-tell-as-empty mutant was NOT caught, or did not run (selected '$_sel') — 22e2 cannot fail"
+else
+  bad "22g4. mutation did not apply — the control is vacuous"
+fi
+# M5: the lib's stderr thrown away → 22e1' must fail.
+_ar22_case; _ar22_variant "$_C/m5" real
+if _ar22_mutate "$_C/m5/auto-refino-dispatcher.sh" 'work_order_sort --age created 2>"$_wo_err"' 'work_order_sort --age created 2>/dev/null'; then
+  _ar22_put "$_HQ" fx-triage.json "[$(_ar22_bead ga-good 2 2026-09-01T10:00:00Z), $(_ar22_bead ga-bad '"oops"' 2026-08-01T10:00:00Z)]"
+  _ar22_run "$_C/m5/auto-refino-dispatcher.sh" "$_HQ"
+  # proof the mutant RAN to a selection (ga-good served) and yet the lib's WARN never reached the log
+  if [ "$_sel" = "ga-good" ] && ! grep -q 'work-order WARN: ga-bad: prio?' "$_LOG" 2>/dev/null; then
+    ok "22g5. MUTANT 'library stderr to /dev/null' is caught (ga-good served, the WARN line never reaches the log)"
+  else
+    bad "22g5. the swallowed-stderr mutant was NOT caught — 22e1' cannot fail"
+  fi
+else
+  bad "22g5. mutation did not apply — the control is vacuous"
+fi
+rm -rf "$_ar22_root"
+
 echo ""
 echo "auto-refino-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -41,7 +41,6 @@
 consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_PILOT_SORT_JQ	ga-9t9acg.2	R2 Pilot dispatch order (_top_candidate, _queue_preview): bug-first, newest-first today
 consumer	packs/town-deltas/assets/pilot-dispatcher.sh	\(\. \| trank\)	ga-9t9acg.2	R2 the sort_by inside _PILOT_SORT_JQ (type rank, newest created_at first)
 consumer	packs/town-deltas/assets/pilot-dispatcher.sh	_TOPUP_WORKER_EXCLUDE_LABELS\[@\]\}" --json --limit=20	ga-9t9acg.4	R4 pool top-up (_pilot_pool_topup, _topup_rig_pending): bd ready window of 20 BEFORE ordering, takes .[0]
-consumer	packs/town-deltas/assets/auto-refino-dispatcher.sh	sort_by\(\.created_at // \.id\) \| reverse	ga-9t9acg.8	R9 Triagem: newest-first, priority ignored, first store with a candidate wins
 consumer	packs/town-deltas/assets/refino-gate-dispatcher.sh	sort_by\(\.created_at // \.id\) \| \.\[0\]	ga-9t9acg.9	R10 refino-review queue: oldest first, priority ignored
 consumer	packs/town-deltas/assets/context-check-dispatcher.sh	sort_by\(\.created_at // \.id\)	ga-9t9acg.10	R11 context-check: FIFO per store, priority and type ignored, global cap eaten by the first stores
 consumer	agents/wa-worker/prompt.template.md	routed_to=wa-worker	ga-9t9acg.5	R5 wa-worker Step 1b2 probe: --sort priority --limit=20 then sort_by([priority, age]); window before the final sort
