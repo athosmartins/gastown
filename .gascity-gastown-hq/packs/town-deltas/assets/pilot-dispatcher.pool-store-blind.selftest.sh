@@ -83,10 +83,10 @@ GUARD_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders wa_worker
 WO_LIB_PRELUDE='. "$SELF_DIR/scripts/work-order.sh"'
 [ -r "$SELF_DIR/scripts/work-order.sh" ] || { echo "FATAL: $SELF_DIR/scripts/work-order.sh missing" >&2; exit 2; }
 TOPUP_PRELUDE="$WO_LIB_PRELUDE
-$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_pick_first _topup_rig_pending)"
+$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked _topup_validate_input _topup_pick_first _topup_rig_pending)"
 LOOP_PRELUDE="$WO_LIB_PRELUDE
 $(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_rig_pending \
-                     _topup_exclude_braked _topup_pick_first _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated _pilot_pool_topup)"
+                     _topup_exclude_braked _topup_validate_input _topup_pick_first _topup_pending_store _topup_note_spawn _topup_worker_probe_migrated _pilot_pool_topup)"
 MIGRATE_PRELUDE="$(need gc_json_or_unknown rig_root_path rig_to_builders rig_to_builder wa_worker_template \
                         _pilot_text_names_rig_path _pilot_story_already_migrated _pilot_dog_store_blind_guard \
                         _pilot_dog_store_blind_migrate_dest _pilot_is_bead_id _pilot_migration_copy_retract \

@@ -17,7 +17,10 @@
 #   B  the rule on small populations (priority > type > age, the reclaim age, the epic/brake filters still apply).
 #   C  the three states: an illegible field stays and is WARNed on stderr; "cannot tell" keeps the previous pick + WARN
 #      (and says so when even that pick has no id). C6..C9: the same for the INPUT — not an array / non-bead elements /
-#      a title that is not a string — never the same silence as an empty queue.
+#      a title that is not a string — never the same silence as an empty queue. C10: the same six inputs through the REAL
+#      filters (_filter_exec_manual, _filter_candidates, _filter_label_vetoes) at each of the three places the chain runs
+#      (HQ query, rig fallback, the wa- and the ps-worker test seam): C6..C9 call the helper alone and stayed green while the sweep still collapsed
+#      "cannot tell" into "empty queue" one stage upstream (gate round 3, ga-i0w2bt).
 #   D  AGREEMENT WITH THE WORKER PROBE (R5/R6): the dispatcher comment above _topup_pick_first names THIS part as the
 #      test that top-up and the pool worker pick the same bead. It runs the probe's own Step 1b2, taken live from
 #      agents/{wa,ps}-worker/prompt.template.md, on the same populations as top-up: the `bd ready … | jq …` line before
@@ -36,7 +39,7 @@
 #      migrated one -> counted, braked at the cap of 5, the next bead is served; the switch re-arms the brake by itself.
 #   G  mutation controls: the rule reverted in a COPY of the dispatcher (window back to 20, no ordering, no reclaim age,
 #      "cannot tell" read as empty, the library's stderr swallowed, the brake counting spawns of an unmigrated worker,
-#      the first-stage guards of _topup_pick_first removed)
+#      the input guards of _topup_validate_input removed, and the entry stage removed from each of the places the chain runs)
 #      must each fail the part that guards it.
 #
 # Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F, G; measured 35 pass / 76 fail — the passes include D0, which tests the harness, not the dispatcher):
@@ -150,6 +153,9 @@ $2"; shift 2 ;;
   esac
 done
 f="$W/stores/${store:-${PROBE_STORE:-city}}.json"
+# A <store>.raw file is what bd PRINTS, verbatim (error text, an error envelope, a malformed array): the answers the
+# JSON store above cannot express. Part C10 uses it to feed the REAL filter chain what bd really says when it is unwell.
+[ -f "${f%.json}.raw" ] && { cat "${f%.json}.raw"; exit 0; }
 [ -f "$f" ] || { echo "[]"; exit 0; }
 exjson="$(printf '%s\n' "$exl" | jq -R . | jq -sc '.')"
 jq -c --arg w "$want" --arg et "$extype" --arg sort "$sort" --argjson lim "$limit" --argjson ex "$exjson" '
@@ -176,7 +182,7 @@ need() { # need <fn>... — echoes the sources; records (does not abort on) a mi
 prelude_for() { # sets PRELUDE and TOPUP_VARS from $DISP
   MISSING=""
   PRELUDE="$(need rig_to_builders wa_worker_template _pilot_rig_builds_pool _topup_rig_serves_pool _topup_exclude_braked \
-                  _topup_pick_first _topup_rig_pending _pilot_pool_topup)"
+                  _topup_validate_input _topup_pick_first _topup_rig_pending _pilot_pool_topup)"
   TOPUP_VARS="$(awk '/^_TOPUP_WORKER_EXCLUDE_LABELS=\(/{f=1} f{print} f&&/^\)$/{exit}' "$DISP")
 $(grep -m1 '^_TOPUP_EPIC_TITLE_RE=' "$DISP")"
 }
@@ -207,7 +213,8 @@ pick_direct() {
 }
 
 write_store() { printf '%s' "$2" > "$WORK/stores/$1.json"; }
-clear_stores() { rm -f "$WORK"/stores/*.json; }
+write_raw() { printf '%s' "$2" > "$WORK/stores/$1.raw"; }
+clear_stores() { rm -f "$WORK"/stores/*.json "$WORK"/stores/*.raw; }
 
 # run_topup <pool> <mode> [json] -> the bead id _pilot_pool_topup spawned a session for ("" = none).
 #   mode bd    the real HQ query path: the fake bd answers from stores/city.json
@@ -231,6 +238,53 @@ run_topup() {
     _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
     _topup_note_spawn() { return 0; }
     eval "$TOPUP_VARS"; eval "$PRELUDE"
+    apply_libmode
+    _TOPUP_RIG_PATHS_JSON="$(cat "$WORK/rigs.json")"
+    _TOPUP_RIG_PATHS="$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path')"
+    if [ "$_mode" = seam ]; then
+      case "$_pool" in
+        wa-worker) export PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON="$_json" ;;
+        ps-worker) export PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON="$_json" ;;
+      esac
+    fi
+    _pilot_pool_topup "$_pool" 1
+  ) >/dev/null 2>"$WORK/run.err"
+  head -n1 "$WORK/spawn.log"
+}
+
+# real_filters_prelude — sets REAL_FILTERS: the REAL eligibility filters of the dispatcher (_filter_exec_manual,
+# _filter_candidates with the globals and helper it needs, _filter_label_vetoes), extracted from $DISP the way the main
+# selftest extracts _filter_candidates. run_topup stubs them with `cat` ("eligibility is not under test"); C10 is the one
+# part where they must be the real ones: the question there is what each of them does with a list that is NOT a clean
+# array of beads, and a stub that passes everything through cannot answer it.
+real_filters_prelude() {
+  REAL_FILTERS="$(sed -n '/^_log_exclusions() {/,/^}$/p' "$DISP")
+. \"$SELF_DIR/framework-marker-labels.sh\"
+$(awk '/^_FILTER_PREAPPROVAL_LABELS=/{print} /^_FILTER_FRAMEWORK_MARKER_LABELS=/{print} /^_FILTER_RECLAIM_CAP=/{print} /^_PILOT_ENGINE_REBUILD_RE=/{print} /^_PILOT_ENGINE_REBUILD_NONREQUEST_RE=/{print} /^_filter_candidates\(\)/{f=1} f{print} f&&/^}$/{exit}' "$DISP")
+$(need _filter_exec_manual _filter_label_vetoes)"
+}
+
+# run_topup_real <pool> <mode> -> the bead id _pilot_pool_topup spawned a session for ("" = none), with the REAL filters.
+#   mode bd    HQ query path:    what bd prints is $WORK/stores/city.raw
+#   mode rig   rig fallback:     HQ answers [], what the pool's rig store's bd prints is stores/<rig>.raw
+#   mode seam  PILOT_TEST_*_TOPUP_CANDIDATES_JSON = $3
+# Same as run_topup in every other respect; stderr (the WARN lines) lands in run.err.
+run_topup_real() {
+  local _pool="$1" _mode="$2" _json="${3:-}"
+  : > "$WORK/spawn.log"; : > "$WORK/bd.calls"; : > "$WORK/warn.log"
+  prelude_for; real_filters_prelude
+  (
+    set -euo pipefail
+    PATH="$SANDBOX_PATH"; GC_CITY="$WORK/city"; DRY_RUN=0; GC_VARIABLE_SESSION_MAX=100
+    PILOT_DOLT_SATURATED_AT_START=0; SELF_BEAD_ID=""
+    export PILOT_TEST_WA_WORKER_LIVE_COUNT=0 PILOT_TEST_PS_WORKER_LIVE_COUNT=0
+    log()  { :; }
+    warn() { printf 'warn\t%s\n' "$*" >> "$WORK/warn.log"; }
+    _pilot_variable_session_count() { _PLSC_N=0; return 0; }
+    _pilot_topup_spawn() { printf '%s\n' "$2" >> "$WORK/spawn.log"; return 0; }
+    _topup_note_spawn() { return 0; }
+    eval "$TOPUP_VARS"; eval "$REAL_FILTERS"; eval "$PRELUDE"
+    eval "$(need _topup_worker_probe_migrated)"   # _pilot_pool_topup asks it after every spawn; absent, it would add a stderr line of its own
     apply_libmode
     _TOPUP_RIG_PATHS_JSON="$(cat "$WORK/rigs.json")"
     _TOPUP_RIG_PATHS="$(printf '%s' "$_TOPUP_RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path')"
@@ -492,6 +546,52 @@ else
 fi
 LIBMODE=ok
 
+# C10: C6..C9 call the helper ALONE (pick_direct). That proves the helper, not the sweep: in production the list reaches
+# _topup_pick_first only after _filter_exec_manual | _filter_candidates | _filter_label_vetoes | _topup_exclude_braked, and the
+# gate's review of the second submission measured that _filter_candidates turns every shape below into a silent `[]` BEFORE
+# the helper sees it (its jq ends in `2>/dev/null` and `[ -z "$_cf_out" ] && _cf_out="[]"`) — so C6..C8 stayed green while the
+# sweep still read "cannot tell" as "empty queue". Same six inputs, through the REAL filters, at every one of the four places
+# the dispatcher runs the chain: the HQ query, the rig fallback and the wa- and ps-worker test seams.
+c10_case() { # c10_case <tag> <what bd prints> <the id that must be spawned for ("" = none)> <stderr must match ("" = must be silent)>
+  local _tag="$1" _raw="$2" _want="$3" _re="$4" _mode _got _pool
+  for _mode in bd rig seam seam-ps; do    # seam-ps: the ps-worker test seam is its own copy of the chain
+    clear_stores
+    case "$_mode" in
+      bd)  write_raw city "$_raw" ;;
+      rig) write_store city "[]"; write_raw whatsapp_automation "$_raw" ;;
+    esac
+    _pool=wa-worker; [ "$_mode" = seam-ps ] && _pool=ps-worker
+    _got="$(run_topup_real "$_pool" "${_mode%-ps}" "$_raw")"
+    eq "C10 [$_tag] real filter chain, $_mode path: spawns for '${_want:-nothing}'" "$_got" "$_want"
+    if [ -n "$_re" ]; then
+      if grep -q "$_re" "$WORK/run.err"; then
+        ok "C10b [$_tag/$_mode] ...and a WARN says what was wrong (never the silence of an empty queue)"
+      else
+        bad "C10b [$_tag/$_mode] a malformed list was read as an empty queue — no WARN matching '$_re'; stderr: [$(head -c 300 "$WORK/run.err")]"
+      fi
+    elif [ ! -s "$WORK/run.err" ]; then
+      ok "C10b [$_tag/$_mode] ...with nothing on stderr"
+    else
+      bad "C10b [$_tag/$_mode] stderr is not empty: [$(head -c 300 "$WORK/run.err")]"
+    fi
+  done
+}
+LIBMODE=ok
+C10_GOOD="$(bead c10-good 0 feature 2026-09-02T00:00:00Z | jq -c '.description = "a real description"')"
+c10_case "control: one clean bead (the harness itself is valid)" "[$C10_GOOD]" "c10-good" ""
+c10_case "control: an empty array is an empty queue" "[]" "" ""
+c10_case "control: bd printed nothing (cannot be told from an empty queue — the header says so)" "" "" ""
+c10_case "bd error text" "Error: dolt server is not reachable" "" "not a JSON array"
+c10_case "bd error envelope" '{"error":"database unavailable"}' "" "not a JSON array"
+c10_case "null" "null" "" "not a JSON array"
+c10_case "a string next to a valid bead" "[\"junk\",$C10_GOOD]" "c10-good" "ignored 1 element(s) of bd's array that are not beads"
+c10_case "a number next to a valid bead" "[7,$C10_GOOD]" "c10-good" "ignored 1 element(s) of bd's array that are not beads"
+# two documents back to back (`jq -e 'type == "array"'` judges only the LAST one, so a plain -e would let this through and the
+# helper would then print a two-line id): "cannot tell" like any other shape that is not exactly one array.
+c10_case "two arrays back to back" "[$C10_GOOD][$C10_GOOD]" "" "not a JSON array"
+C10_ODD="$(bead c10-odd-title 0 task 2026-09-01T00:00:00Z | jq -c '.title = 5 | .description = "a real description"')"
+c10_case "a bead whose title is a number next to a valid bead" "[$C10_ODD,$C10_GOOD]" "c10-good" ""
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== Part D: top-up and the pool worker's probe (R5/R6, Step 1b2) must pick the same bead ==="
@@ -545,7 +645,7 @@ brake_gate_for() {
   _src="$(need _topup_worker_probe_migrated)"
   [ -n "$_src" ] || { echo unreadable; return 0; }
   mkdir -p "$WORK/gate-city/agents/$2"
-  cp "$1" "$WORK/gate-city/agents/$2/prompt.template.md" || { echo unreadable; return 0; }
+  cp "$1" "$WORK/gate-city/agents/$2/prompt.template.md" 2>/dev/null || { echo unreadable; return 0; }
   ( GC_CITY="$WORK/gate-city"; eval "$_src"; _topup_worker_probe_migrated "$2" ) && _rc=0 || _rc=$?
   case "$_rc" in 0) echo counted ;; 1) echo off ;; *) echo unreadable ;; esac
 }
@@ -785,11 +885,46 @@ if mutate firststage '*[![:space:]]*)' '*[![:space:]]X)'; then
   _w="$(grep -c 'not a JSON array' "$WORK/run.err")"; DISP="$DISPATCHER"
   killed firststage "input that is not a JSON array ends silently again (the same as an empty queue)" "$_w" "1"
 fi
-if mutate title '(((.title // "") | tostring) | test($epic_re; "i"))' '((.title // "") | test($epic_re; "i"))'; then
+if mutate concat "jq -es 'length == 1 and (.[0] | type == \"array\")'" "jq -e 'type == \"array\"'"; then
+  DISP="$WORK/mut/concat.sh"; pick_direct "[$C10_GOOD][$C10_GOOD]" >/dev/null
+  _w="$(grep -c 'not a JSON array' "$WORK/run.err")"; DISP="$DISPATCHER"
+  killed concat "only the LAST of two concatenated documents is judged (a plain jq -e)" "$_w" "1"
+fi
+if mutate title 'if ((.title | type) == "string" or (.title | type) == "null") then . else .title |= tostring end' '.'; then
   DISP="$WORK/mut/title.sh"; killed title "a title that is not a string makes jq fail on the whole array again" "$(pick_direct "$C7")" "c7-p0-feature"; DISP="$DISPATCHER"
 fi
-if mutate nonbead '.[] | select(type == "object") | select(' '.[] | select('; then
+if mutate nonbead '.[] | select(type == "object") | if (' '.[] | if ('; then
   DISP="$WORK/mut/nonbead.sh"; killed nonbead "elements that are not beads take the whole array down again" "$(pick_direct "$C8")" "c8-p0-feature"; DISP="$DISPATCHER"
+fi
+# the ENTRY stage (C10): removed from ONE place of the chain in a copy, the real-chain case for that place must fail. The count
+# is the number of "not a JSON array" WARNs a bd that prints error text produces there: 1 on the dispatcher, 0 on each mutant.
+c10_warns() { # c10_warns <bd|rig|seam|seam-ps> -> how many such WARNs that place of the chain wrote (on the CURRENT $DISP)
+  local _raw="Error: dolt server is not reachable"
+  clear_stores
+  case "$1" in
+    bd)  write_raw city "$_raw" ;;
+    rig) write_store city "[]"; write_raw whatsapp_automation "$_raw" ;;
+  esac
+  local _pool=wa-worker; [ "$1" = seam-ps ] && _pool=ps-worker
+  run_topup_real "$_pool" "${1%-ps}" "$_raw" >/dev/null
+  grep -c 'not a JSON array' "$WORK/run.err" || true
+}
+eq "G[entry] control: on the unmutated dispatcher each of the four places writes exactly one such WARN" "$(c10_warns bd)/$(c10_warns rig)/$(c10_warns seam)/$(c10_warns seam-ps)" "1/1/1/1"
+if mutate entry-hq $'\n        | _topup_validate_input \\' ''; then
+  DISP="$WORK/mut/entry-hq.sh"; _w="$(c10_warns bd)"; DISP="$DISPATCHER"
+  killed entry-hq "the HQ query no longer validates bd's answer first (the filters swallow it again)" "$_w" "1"
+fi
+if mutate entry-rig $'\n      | _topup_validate_input \\' ''; then
+  DISP="$WORK/mut/entry-rig.sh"; _w="$(c10_warns rig)"; DISP="$DISPATCHER"
+  killed entry-rig "the rig fallback no longer validates bd's answer first" "$_w" "1"
+fi
+if mutate entry-seam 'PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input |' 'PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" |'; then
+  DISP="$WORK/mut/entry-seam.sh"; _w="$(c10_warns seam)"; DISP="$DISPATCHER"
+  killed entry-seam "the wa-worker test seam no longer runs the entry stage (it would stop being the chain's shape)" "$_w" "1"
+fi
+if mutate entry-seam-ps 'PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input |' 'PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" |'; then
+  DISP="$WORK/mut/entry-seam-ps.sh"; _w="$(c10_warns seam-ps)"; DISP="$DISPATCHER"
+  killed entry-seam-ps "the ps-worker test seam no longer runs the entry stage" "$_w" "1"
 fi
 if mutate stderr 'work_order_sort --age "$_age")' 'work_order_sort --age "$_age" 2>/dev/null)'; then
   DISP="$WORK/mut/stderr.sh"; pick_direct "$C1" >/dev/null

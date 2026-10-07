@@ -8749,11 +8749,22 @@ _topup_exclude_braked() {
 #                       first bead in the order bd returned it) and say so with a WARN; when even that first bead has no
 #                       id nothing can be named, and the WARN says THAT. NOT "nothing pending": that would silently stop
 #                       top-up for the pool, and NOT a silent unordered pick either.
-#   * the INPUT itself (before the library) -> a JSON array: elements that are not objects are dropped and counted in a
-#                       WARN, and a title of any type is read as text (one odd bead cannot hide its neighbours). Non-blank
-#                       input that is not an array (bd's error text, an error envelope, `null`) spawns nothing for that
-#                       store, with a WARN. BLANK input is the one silent case: upstream swallows bd's exit status, so it
-#                       cannot be told from an empty queue here.
+#   * the INPUT itself (before the filters and the library) -> _topup_validate_input, the FIRST stage of every chain, right
+#                       after `bd … --json`: a JSON array; elements that are not objects are dropped and counted in a WARN,
+#                       and a title of any type is read as text (one odd bead cannot hide its neighbours). Non-blank input
+#                       that is not exactly one array (bd's error text, an error envelope, `null`) spawns nothing for that
+#                       store, with a WARN. BLANK input is the one silent case: the `| timeout … bd` pipe swallows bd's exit
+#                       status, so it cannot be told from an empty queue. WHY AT THE ENTRY and not inside _topup_pick_first
+#                       (where the first submission put it): every filter between bd and the helper swallows its own jq
+#                       failure — _filter_candidates ends its jq in `2>/dev/null` and falls back to `[]` — so a guard placed
+#                       after them only ever sees the answer they already collapsed to "empty queue" (gate round 3 measured
+#                       it: six malformed shapes, no WARN, a valid neighbour lost). Part C10 of the selftest runs those six
+#                       through the REAL filters at every place the chain runs.
+#                       NOT COVERED, and said so: an element that IS an object but carries a field of the wrong type
+#                       (`labels` or `metadata` as text, a non-text label, a numeric `description` — all measured) still
+#                       makes _filter_candidates' jq fail, and it still answers `[]` for the whole store without a word.
+#                       bd does not print such beads and the entry stage cannot know every field the filters read; the
+#                       silent `[]` of _filter_candidates is its own bug, ga-fesw8n.
 # Output channel: this runs inside $(...), where log()/warn() (both write to STDOUT) would be captured into the bead id,
 # so every message here goes to stderr (>&2). The sweep's `exec >> "$LOG" 2>&1` lands it in the log.
 #
@@ -8772,34 +8783,56 @@ fi
 unset _GC_WO_TOPUP_SIBLING
 # SELFTEST-EXTRACT work-order-topup-source: END
 
+# _topup_validate_input — stdin: what `bd … --json` printed (or the test seam's JSON); stdout: ALWAYS a JSON array of
+# objects, `[]` when there is nothing usable; stderr: one WARN per thing wrong. Always exits 0. The first stage of every
+# top-up chain (the HQ query, the rig fallback, both test seams) — see the THREE STATES block above for why it is first.
+#   * blank                          -> `[]`, silent (cannot be told from an empty queue, see above).
+#   * not exactly ONE JSON array     -> `[]` + WARN "NOT 'nothing pending'" (error text, an error envelope, `null`, a scalar,
+#                                       invalid JSON, two concatenated documents: "cannot tell" is never "empty queue").
+#   * an array                       -> only its objects, a title of any type as text; the elements dropped are COUNTED in a WARN.
+# Messages go to stderr (>&2): this runs inside $(...) where log()/warn() would be captured into the bead id.
+_topup_validate_input() {
+  local _in _arr _skipped
+  _in=$(cat)
+  case "$_in" in
+    *[![:space:]]*) ;;
+    *) printf '[]'; return 0 ;;
+  esac
+  # `-s` + length == 1: a plain `jq -e 'type == "array"'` judges only the LAST document, so two arrays would pass it.
+  if ! printf '%s' "$_in" | jq -es 'length == 1 and (.[0] | type == "array")' >/dev/null 2>&1; then
+    echo "WARN ga-9t9acg.4: pool top-up got something that is not a JSON array from bd (error text? an error envelope?) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'. It starts with: $(printf '%s' "$_in" | head -c 120 | tr '\n\r' '  ')" >&2
+    printf '[]'
+    return 0
+  fi
+  # Only objects can be beads: any other element is dropped and COUNTED below (never a jq failure that takes the whole array
+  # down with it). A title of any type is read as text, so a bead with an odd title cannot hide its neighbours.
+  _arr=$(printf '%s' "$_in" | jq -c '[.[] | select(type == "object") | if ((.title | type) == "string" or (.title | type) == "null") then . else .title |= tostring end]' 2>/dev/null) || _arr=""
+  if [ -z "$_arr" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up could not read bd's candidate array (jq failed on it) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+    printf '[]'
+    return 0
+  fi
+  _skipped=$(printf '%s' "$_in" | jq '[.[] | select(type != "object")] | length' 2>/dev/null) || _skipped="an unknown number of"
+  [ "$_skipped" = "0" ] || echo "WARN ga-9t9acg.4: pool top-up ignored $_skipped element(s) of bd's array that are not beads." >&2
+  printf '%s' "$_arr"
+}
+
 # _topup_pick_first — stdin: the JSON array of candidates that survived every filter above (the whole population);
 # stdout: the id of the bead the rule serves first, or nothing when there is none; stderr: the library's WARN lines and
 # this helper's own (see the block above). Always exits 0. The EPIC-title defence in depth (the worker probe's jq has the
 # same regex) lives here so the real queries and both test seams share ONE copy of it.
 _topup_pick_first() {
-  local _age="reclaim" _in _eligible _n _ordered _head _id _why="" _skipped _prev
-  _in=$(cat)
-  # First stage, same three states as the library call below. BLANK input is the one thing we cannot tell from an empty
-  # queue (the stages upstream swallow bd's exit status), so it stays the inert, silent "no pending bead" this pipeline always
-  # ended in. Anything else that is not a JSON array (bd's error text, an error envelope, `null`) is "cannot tell": inert
-  # too — nothing is spawned for it — but said out loud, never the same as an empty queue.
-  if ! printf '%s' "$_in" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    case "$_in" in
-      *[![:space:]]*)
-        echo "WARN ga-9t9acg.4: pool top-up got something that is not a JSON array from bd and the filters (error text? an error envelope?) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'. It starts with: $(printf '%s' "$_in" | head -c 120 | tr '\n\r' '  ')" >&2 ;;
-    esac
-    return 0
-  fi
-  # Only objects can be beads: any other element of the array is dropped and COUNTED below (never a jq failure that takes the
-  # whole array down with it). A title of any type is read as text, so a bead with an odd title cannot hide its neighbours.
+  local _age="reclaim" _in _eligible _n _ordered _head _id _why="" _prev
+  # The input is validated here TOO, with the very function the chain runs first: in production that is a no-op (it is
+  # idempotent — an array of objects with text titles comes out unchanged and says nothing), and it keeps this helper safe
+  # when something calls it on its own (the selftest's pick_direct does).
+  _in=$(cat | _topup_validate_input)
   _eligible=$(printf '%s' "$_in" | jq -c --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-    '[.[] | select(type == "object") | select((((.title // "") | tostring) | test($epic_re; "i")) | not)]' 2>/dev/null) || _eligible=""
+    '[.[] | select(((.title // "") | test($epic_re; "i")) | not)]' 2>/dev/null) || _eligible=""
   if [ -z "$_eligible" ]; then
     echo "WARN ga-9t9acg.4: pool top-up could not filter bd's candidate array (jq failed on it) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
     return 0
   fi
-  _skipped=$(printf '%s' "$_in" | jq '[.[] | select(type != "object")] | length' 2>/dev/null) || _skipped="an unknown number of"
-  [ "$_skipped" = "0" ] || echo "WARN ga-9t9acg.4: pool top-up ignored $_skipped element(s) of bd's array that are not beads." >&2
   _n=$(printf '%s' "$_eligible" | jq 'length' 2>/dev/null) || _n=""
   [ "$_n" != "0" ] || return 0
   if ! type work_order_sort >/dev/null 2>&1 || ! type work_order_head >/dev/null 2>&1; then
@@ -8836,10 +8869,12 @@ _topup_rig_pending() {
     # invisible to the worker's probe, so spawning "for" it just burns a session that finds nothing.
     _topup_rig_serves_pool "$_rp" "$_pool" || continue
     # ga-9t9acg.4: the WHOLE population (`--limit 0`), ordered by the shared rule in _topup_pick_first (see the block
-    # above it). No `2>/dev/null` on that last stage: the library's WARN lines are its only signal.
+    # above it). _topup_validate_input comes FIRST, before the filters (they swallow a jq failure as `[]`), and neither it
+    # nor the last stage carries a `2>/dev/null`: their WARN lines (and the library's) are the only signal.
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
       --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
       "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
+      | _topup_validate_input \
       | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
       | _topup_exclude_braked 2>/dev/null \
       | _topup_pick_first || echo "")
@@ -9176,9 +9211,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _topup_validate_input | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -9189,10 +9224,12 @@ _pilot_pool_topup() {
       # sitting right behind it in the same query.
       # ga-9t9acg.4: the --limit=20 window of that fix is gone too — it cut the population BEFORE it was ordered.
       # `--limit 0` fetches all of it and _topup_pick_first (block above _topup_rig_pending) picks by the shared rule.
-      # No `2>/dev/null` on that last stage: the library's WARN lines are its only signal.
+      # _topup_validate_input comes FIRST, before the filters (they swallow a jq failure as `[]`), and neither it nor the
+      # last stage carries a `2>/dev/null`: their WARN lines (and the library's) are the only signal.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
         --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
         "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
+        | _topup_validate_input \
         | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
         | _topup_exclude_braked 2>/dev/null \
         | _topup_pick_first || echo "")
