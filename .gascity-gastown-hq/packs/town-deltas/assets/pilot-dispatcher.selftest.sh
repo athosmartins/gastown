@@ -9112,7 +9112,7 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 # pool in Step 2c, once, before the lanes, and ONE ordered pool is walked — so the HQ-vetoed-but-rig-has-work case
 # (the 4h stall) is covered by the same loop, and a rig P0 feature beats an HQ P2. The scenarios below keep the
 # ga-y1m40 outcomes (a rig bead IS dispatched when every HQ candidate is vetoed and slots are free; the empty-pool log
-# line is unchanged) and assert the new mechanism; U1-U3 pin the union order.
+# line is unchanged) and assert the new mechanism; U1-U3 pin the union order, U4-U8 the ways the join can be skipped or fail.
 
 # run_y1m40: real end-to-end DRY_RUN sweep for the ga-y1m40 fix.
 #   $1 = FAKE_BUGS_JSON               (HQ Tier1 bug/debt fixture; "[]" = HQ empty)
@@ -9120,8 +9120,13 @@ has "$DISPATCHER" 'digest-label'          "digest-label exemption reason is wire
 #   $3 = PILOT_RIG_FALLBACK_OVERRIDE  (rig Tier1/Tier2 fixture JSON — hermetic
 #        seam added by this fix; bypasses the real gc/bd rig-scan loop, mirrors
 #        PILOT_WA_RIG_TIER2_OVERRIDE)
-#   $4 = "broken-timeout" → a `timeout` that always fails FIRST on PATH, so the live session count is unreadable
-#        (ga-9t9acg.2-U4); anything else → the count is readable.
+#   $4 = the sweep's fault, if any (anything else → none; the count is readable and every tool answers):
+#        "broken-timeout"  → a `timeout` that always fails FIRST on PATH, so the live session count is unreadable
+#                            (ga-9t9acg.2-U4);
+#        "jq-fail-union"   → a `jq` first on PATH that fails the ONE Step 2c union whose input carries the rig fixture
+#                            (ga-9t9acg.2-U5/U6); every other jq call passes through to the real jq;
+#        "rig-list-fails"  → `gc rig list` fails AND PILOT_RIG_FALLBACK_OVERRIDE is not set, so the REAL rig scan runs
+#                            and cannot look (ga-9t9acg.2-U7); $3 is ignored.
 #
 # ga-9t9acg.2: the rig JOIN is gated on the live session count being readable (ga-5je3zv), and the count probe runs
 # `timeout N gc session list --json`. These fixtures run on PATH="$SHIMBIN:/usr/bin:/bin:/usr/local/bin", and a host
@@ -9135,11 +9140,41 @@ mkdir -p "$Y1M40_TO_OK" "$Y1M40_TO_BAD"
 printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$Y1M40_TO_OK/timeout"
 printf '#!/usr/bin/env bash\nexit 124\n' > "$Y1M40_TO_BAD/timeout"
 chmod +x "$Y1M40_TO_OK/timeout" "$Y1M40_TO_BAD/timeout"
+# The jq shim reads stdin ONLY for the union call (a bare `cat` on every jq call would block the ones that have none),
+# and fails it only when that input carries the rig fixture's id: the HQ-only unions earlier in the sweep, and the
+# rig scan's own merges, keep working — the fault is exactly "the HQ+rig union in Step 2c cannot be built".
+Y1M40_JQ_BAD="$WORK/y1m40-jq-fail-union"; Y1M40_GC_BAD="$WORK/y1m40-gc-rig-list-fails"
+mkdir -p "$Y1M40_JQ_BAD" "$Y1M40_GC_BAD"
+cat > "$Y1M40_JQ_BAD/jq" <<SHIM
+#!/usr/bin/env bash
+if [ "\$*" = "-s add // [] | unique_by(.id)" ]; then
+  _in=\$(cat)
+  case "\$_in" in *wa-9t9acg2-p0feat*) exit 5 ;; esac
+  printf '%s' "\$_in" | "$(command -v jq)" "\$@"
+  exit \$?
+fi
+exec "$(command -v jq)" "\$@"
+SHIM
+cat > "$Y1M40_GC_BAD/gc" <<SHIM
+#!/usr/bin/env bash
+case "\$*" in *"rig list"*) exit 1 ;; esac
+exec "$SHIMBIN/gc" "\$@"
+SHIM
+chmod +x "$Y1M40_JQ_BAD/jq" "$Y1M40_GC_BAD/gc"
 run_y1m40() {
   : > "$FIXCITY/.gc/logs/pilot-dispatcher.log"
   rm -f "$FIXCITY/.gc/pilot-dispatcher.jsonl"
   reset_state
-  local _y_pre=""; [ "${4:-}" = "broken-timeout" ] && _y_pre="$Y1M40_TO_BAD:"
+  local _y_pre=""
+  case "${4:-}" in
+    broken-timeout) _y_pre="$Y1M40_TO_BAD:" ;;
+    jq-fail-union)  _y_pre="$Y1M40_JQ_BAD:" ;;
+    rig-list-fails) _y_pre="$Y1M40_GC_BAD:" ;;
+  esac
+  # The rig override is passed as a one-element array so "rig-list-fails" can leave the variable UNSET (the dispatcher
+  # tests ${VAR+x}: "" would still mean "override present"). ${arr[@]+...} keeps an empty array safe on bash 3.2 + -u.
+  local _y_rig=(PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}")
+  [ "${4:-}" = "rig-list-fails" ] && _y_rig=()
   env -i \
     DRAIN_WINDOW_OVERRIDE="OPEN" \
     PATH="$_y_pre$SHIMBIN:/usr/bin:/bin:/usr/local/bin:$Y1M40_TO_OK" \
@@ -9155,7 +9190,7 @@ run_y1m40() {
     FAKE_BUGS_JSON="${1:-[]}" \
     FAKE_BLOCKED_IDS="" \
     PILOT_TEST_CREW_BRANCH_BEADS="${2:-}" \
-    PILOT_RIG_FALLBACK_OVERRIDE="${3:-[]}" \
+    ${_y_rig[@]+"${_y_rig[@]}"} \
     bash "$DISPATCHER" >/dev/null 2>&1 || true
   cat "$FIXCITY/.gc/logs/pilot-dispatcher.log"
 }
@@ -9369,6 +9404,112 @@ if echo "$LOG_U1" | grep "NOT scanning the rig DBs to join the HQ pool" >/dev/nu
   bad "ga-9t9acg.2-U4 control: the readable-count run (U1) printed the halt line too — the gate fires unconditionally"
 else
   ok "ga-9t9acg.2-U4 control: the readable-count run (U1) joined and printed no halt line"
+fi
+
+# ── U5-U8: the join must never turn a fault into a verdict (gate round 1, ga-9t9acg.2) ─────────────────────────────
+# Reality has three answers here: the rig pool was joined / it was found empty / it could not be looked at or joined.
+# The first review of this slice found the join reporting "joined" (and re-deriving the tier hint) after the union had
+# FAILED, the HQ-empty path turned into "No dispatchable candidates" by that same fallible union, and a rig scan that
+# could not read anything logging "found no candidate". Each scenario injects exactly one fault and asserts the sweep
+# stays inert (HQ work still dispatched), the log SAYS what happened, and no line claims what did not happen.
+
+echo "Scenario ga-9t9acg.2-U5: the HQ+rig UNION fails -> the HQ pool is kept, the WARN and the 'NOT joined' line say so, nothing claims a join"
+LOG_U5="$(run_y1m40 "$U_HQ_P2" "" "$U_RIG_P0_FEATURE" "jq-fail-union")"
+if echo "$LOG_U5" | grep "could not union the HQ pool with the rig pool" >/dev/null; then
+  ok "ga-9t9acg.2-U5: the failed union is a visible WARN (and proves the injected fault reached the union)"
+else
+  bad "ga-9t9acg.2-U5: the union was made to fail but there is no 'could not union' WARN — the fault is silent (or the shim never fired)"
+fi
+if echo "$LOG_U5" | grep "NOT joined (the union failed" >/dev/null; then
+  ok "ga-9t9acg.2-U5: the log says the rig candidate(s) were found but NOT joined"
+else
+  bad "ga-9t9acg.2-U5: no 'NOT joined' line after a failed union"
+fi
+if echo "$LOG_U5" | grep "joined with HQ into one pool" >/dev/null; then
+  bad "ga-9t9acg.2-U5: the log claims the rig pool was 'joined with HQ' although the union failed — a failure logged as success"
+else
+  ok "ga-9t9acg.2-U5: no 'joined with HQ' line after a failed union"
+fi
+if echo "$LOG_U5" | grep "Dispatch tier: bug (1 candidate(s))" >/dev/null; then
+  ok "ga-9t9acg.2-U5: the tier hint and the count are the HQ pool's (bug, 1) — not re-derived over a pool that was never built"
+else
+  bad "ga-9t9acg.2-U5: the dispatch tier line is not the HQ pool's — $(echo "$LOG_U5" | grep 'Dispatch tier' | head -1 | cut -c1-120)"
+fi
+if echo "$LOG_U5" | grep "Task title:.*tt-9t9acg2-hqp2" >/dev/null; then
+  ok "ga-9t9acg.2-U5: the HQ P2 is still dispatched — a rig problem never drops HQ work"
+else
+  bad "ga-9t9acg.2-U5: the HQ pool was NOT dispatched after the union failed"
+fi
+if echo "$LOG_U5" | grep "Task title:.*wa-9t9acg2-p0feat" >/dev/null; then
+  bad "ga-9t9acg.2-U5: the rig P0 feature was dispatched although it never entered the pool"
+else
+  ok "ga-9t9acg.2-U5: the rig P0 feature (never joined) was not dispatched"
+fi
+# Control: the SAME fixture without the fault (U1) joined, and printed none of the failure lines.
+if echo "$LOG_U1" | grep -e "could not union" -e "NOT joined" >/dev/null; then
+  bad "ga-9t9acg.2-U5 control: the fault-free run (U1) printed a union-failure line — the lines above are not the fault's doing"
+elif echo "$LOG_U1" | grep "joined with HQ into one pool" >/dev/null; then
+  ok "ga-9t9acg.2-U5 control: the fault-free run (U1) joined and printed no failure line"
+else
+  bad "ga-9t9acg.2-U5 control: the fault-free run (U1) printed no 'joined with HQ' line either"
+fi
+
+echo "Scenario ga-9t9acg.2-U6: the HQ pool is EMPTY and the same union fault is armed -> the rig pool is still the pool (no union is paid, so it cannot fail into 'no candidates')"
+LOG_U6="$(run_y1m40 "[]" "" "$U_RIG_P0_FEATURE" "jq-fail-union")"
+if echo "$LOG_U6" | grep "Task title:.*wa-9t9acg2-p0feat" >/dev/null; then
+  ok "ga-9t9acg.2-U6: the rig P0 feature is dispatched from an empty HQ pool"
+else
+  bad "ga-9t9acg.2-U6: nothing was dispatched from an empty HQ pool with a rig candidate waiting — $(echo "$LOG_U6" | tail -2 | tr '\n' '|' | cut -c1-200)"
+fi
+if echo "$LOG_U6" | grep -e "could not union" -e "No dispatchable candidates" >/dev/null; then
+  bad "ga-9t9acg.2-U6: the empty-HQ path went through the fallible union (or ended as 'No dispatchable candidates') — a rig bead waiting reads as an empty queue"
+else
+  ok "ga-9t9acg.2-U6: the empty-HQ path never touched the union and never ended as 'No dispatchable candidates'"
+fi
+
+echo "Scenario ga-9t9acg.2-U7: the rig scan CANNOT LOOK (gc rig list fails) -> the log says UNKNOWN, never 'found no candidate'; HQ work still dispatched"
+LOG_U7="$(run_y1m40 "$U_HQ_P2" "" "" "rig-list-fails")"
+if echo "$LOG_U7" | grep "the rig DB scan could NOT read everything (gc rig list failed)" >/dev/null; then
+  ok "ga-9t9acg.2-U7: the scan that could not look says so in a WARN, with the reason"
+else
+  bad "ga-9t9acg.2-U7: gc rig list failed and no 'could NOT read everything' WARN was written — $(echo "$LOG_U7" | grep -i 'rig' | head -2 | tr '\n' '|' | cut -c1-220)"
+fi
+if echo "$LOG_U7" | grep "UNKNOWN whether a rig bead is waiting, not 'none'" >/dev/null; then
+  ok "ga-9t9acg.2-U7: the zero-count line says UNKNOWN, not 'none'"
+else
+  bad "ga-9t9acg.2-U7: no 'UNKNOWN whether a rig bead is waiting' line after a scan that could not look"
+fi
+if echo "$LOG_U7" | grep "found no candidate to join the HQ pool" >/dev/null; then
+  bad "ga-9t9acg.2-U7: the log claims the rig scan 'found no candidate' although it could not look — 'could not look' read as 'found none'"
+else
+  ok "ga-9t9acg.2-U7: the log does not claim the rig scan found no candidate"
+fi
+if echo "$LOG_U7" | grep "Task title:.*tt-9t9acg2-hqp2" >/dev/null; then
+  ok "ga-9t9acg.2-U7: the HQ P2 is still dispatched (an unreadable rig scan stays inert)"
+else
+  bad "ga-9t9acg.2-U7: the HQ pool was NOT dispatched after the rig scan failed"
+fi
+
+echo "Scenario ga-9t9acg.2-U7b: HQ EMPTY and the rig scan cannot look -> the empty result is announced as UNKNOWN (the sweep ends, visibly)"
+LOG_U7B="$(run_y1m40 "[]" "" "" "rig-list-fails")"
+if echo "$LOG_U7B" | grep "UNKNOWN whether a rig bead is waiting, not 'none'" >/dev/null \
+   && echo "$LOG_U7B" | grep "the rig DB scan could NOT read everything (gc rig list failed)" >/dev/null; then
+  ok "ga-9t9acg.2-U7b: an empty HQ pool plus a scan that could not look is logged as UNKNOWN + WARN, not as an empty queue"
+else
+  bad "ga-9t9acg.2-U7b: empty HQ + unreadable rig scan left no UNKNOWN/WARN trail — $(echo "$LOG_U7B" | tail -3 | tr '\n' '|' | cut -c1-240)"
+fi
+
+echo "Scenario ga-9t9acg.2-U8 (control): the rig scan READS and finds nothing -> 'found no candidate' IS the right line, and no UNKNOWN/WARN"
+LOG_U8="$(run_y1m40 "$U_HQ_P2" "" "[]")"
+if echo "$LOG_U8" | grep "rig DB scan found no candidate to join the HQ pool" >/dev/null; then
+  ok "ga-9t9acg.2-U8: a scan that really found nothing says so"
+else
+  bad "ga-9t9acg.2-U8: a readable, empty rig scan did not print 'found no candidate to join the HQ pool'"
+fi
+if echo "$LOG_U8" | grep -e "could NOT read everything" -e "UNKNOWN whether a rig bead" >/dev/null; then
+  bad "ga-9t9acg.2-U8: a readable scan printed the 'could not read' / UNKNOWN lines — the unreadable signal leaked or fires unconditionally"
+else
+  ok "ga-9t9acg.2-U8: a readable scan printed no 'could not read' / UNKNOWN line"
 fi
 
 echo "Scenario ga-y1m40-f (observability): consecutive dispatched=0-with-free-slots sweeps increment a persisted stall counter across separate process invocations"

@@ -14,7 +14,9 @@
 #   All P0 features oldest-first, then the P0 that are not features oldest-first, then
 #   P1 features, then the other P1s, and so on. It REVERTS the 2026-06-24 Pilot
 #   decision (bug first / feature last / NEWEST first). A P0 story is still dispatched
-#   BEFORE a P3 bug, and now a same-priority feature beats a bug.
+#   BEFORE a P3 bug, and now a same-priority feature beats a bug. ONE exception, owned by
+#   the lib and not by this file (ga-9t9acg.14, Athos 2026-10-06): a P0 BUG carrying the
+#   label impacto:dano-ao-vivo (someone is being hurt right now) goes BEFORE the P0 features.
 #   epic beads NEVER dispatch (excluded by the epic-type filter). Each
 #   bead is dispatched with the prompt/sling template matching ITS OWN type
 #   (bug/tech-debt → "fix bug …"; feature/story → "build story …").
@@ -4935,7 +4937,8 @@ _filter_built() {
 # "empty queue" (system correctly out of work) from "file stale/missing" (don't
 # trust it). Written ATOMICALLY (tmp + mv) so a reader never sees a partial file.
 # ORDER (ga-9t9acg.3): items[] is in the shared work-order rule's order — priority, then feature before
-# the rest, then oldest first (scripts/work-order.sh) — so index 0 is the bead that rule serves first.
+# the rest, then oldest first, plus the lib's dano-ao-vivo exception for a P0 bug (scripts/work-order.sh) — so
+# index 0 is the bead that rule serves first.
 # That is what the painel and approved-state-reconciler.py (_pilot_queue_position) print as "position".
 # It equals what the dispatcher serves: since ga-9t9acg.2 _top_candidate and _queue_preview order the pool
 # through the same rule (_pilot_order_pool). If the library cannot order the queue the file is NOT rewritten
@@ -10107,6 +10110,11 @@ fi
 # use this JSON array directly (hermetic selftest; no real gc/bd needed).
 # Mirrors PILOT_WA_RIG_TIER2_OVERRIDE (Step 2b-rig-tier2).
 _scan_rig_fallback_pool() {
+  # RIG_SCAN_UNREADABLE (ga-9t9acg.2, gate round 1): non-empty = "the scan could not LOOK at every rig DB" (the reason
+  # is the value). RIG_MERGED_COUNT=0 then means UNKNOWN, not "no rig candidate" — the caller (Step 2c) must say so
+  # and must never read it as an empty queue. Set only for the failures the scan itself can observe: gc rig list,
+  # each rig's bd list, and its own jq merges.
+  RIG_SCAN_UNREADABLE=""
   if [ -n "${PILOT_RIG_FALLBACK_OVERRIDE+x}" ]; then
     local _rfp_filtered
     _rfp_filtered=$(echo "$PILOT_RIG_FALLBACK_OVERRIDE" \
@@ -10129,6 +10137,7 @@ _scan_rig_fallback_pool() {
   RIG_PATHS_JSON=""
   if ! RIG_PATHS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" rig list --json); then
     warn "gc rig list failed while computing rig-merged tier counts — HQ-only this cycle (ga-07rb3)."
+    RIG_SCAN_UNREADABLE="gc rig list failed"
   fi
   RIG_PATHS=$(printf '%s' "$RIG_PATHS_JSON" | jq -r '.rigs[] | select(.hq == false) | .path' 2>/dev/null)
 
@@ -10147,9 +10156,9 @@ _scan_rig_fallback_pool() {
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
-      -n 0 2>/dev/null || echo "[]")
+      -n 0 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-bd list failed in $rig_path}"; RIG_BUGS="[]"; }
     RIG_BUGS=$(echo "$RIG_BUGS" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
-    ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null || echo "[]")
+    ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_BUGS" | jq -s 'add // []' 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-jq merge failed (rig bugs)}"; ALL_RIG_TIER1="[]"; }
 
     # Tier 1: tech-debt from rig DB
     RIG_DEBT=$(bd -C "$rig_path" list --json -l "tech-debt" \
@@ -10161,9 +10170,9 @@ _scan_rig_fallback_pool() {
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
-      -n 0 2>/dev/null || echo "[]")
+      -n 0 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-bd list failed in $rig_path}"; RIG_DEBT="[]"; }
     RIG_DEBT=$(echo "$RIG_DEBT" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
-    ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
+    ALL_RIG_TIER1=$(echo "$ALL_RIG_TIER1 $RIG_DEBT" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-jq merge failed (rig tech-debt)}"; ALL_RIG_TIER1="[]"; }
 
     # Tier 2: story:approved features from rig DB
     RIG_FEATURES=$(bd -C "$rig_path" list --json -l "story:approved" \
@@ -10175,9 +10184,9 @@ _scan_rig_fallback_pool() {
       --exclude-label "needs:engine-window" \
       --exclude-label "pilot:dispatched" \
       --exclude-type epic \
-      -n 0 2>/dev/null || echo "[]")
+      -n 0 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-bd list failed in $rig_path}"; RIG_FEATURES="[]"; }
     RIG_FEATURES=$(echo "$RIG_FEATURES" | _filter_exec_manual | _reconcile_empty_description_signal "$rig_path" | _reconcile_text_veto_labels "$rig_path" | _filter_candidates | _filter_dispatch_gates | _filter_built | _filter_unblocked "$rig_path" | _filter_explicit_deps "$rig_path")
-    ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null || echo "[]")
+    ALL_RIG_TIER2=$(echo "$ALL_RIG_TIER2 $RIG_FEATURES" | jq -s 'add // []' 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-jq merge failed (rig features)}"; ALL_RIG_TIER2="[]"; }
   done <<< "$RIG_PATHS"
 
   RIG_TIER1_COUNT=$(echo "$ALL_RIG_TIER1" | jq 'length' 2>/dev/null || echo "0")
@@ -10186,7 +10195,7 @@ _scan_rig_fallback_pool() {
   # wa-tm2a: merge rig bugs/debt + features into ONE pool, same as HQ. Ordering
   # (priority>type>created_at>id) — not tier — decides who dispatches first.
   RIG_MERGED_JSON=$(echo "$ALL_RIG_TIER1 $ALL_RIG_TIER2" \
-    | jq -s 'add // [] | unique_by(.id)' 2>/dev/null || echo "[]")
+    | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || { RIG_SCAN_UNREADABLE="${RIG_SCAN_UNREADABLE:-jq merge failed (rig pool)}"; RIG_MERGED_JSON="[]"; }
   RIG_MERGED_COUNT=$(echo "$RIG_MERGED_JSON" | jq 'length' 2>/dev/null || echo "0")
 }
 
@@ -10203,35 +10212,64 @@ _scan_rig_fallback_pool() {
 _RIG_JOIN_HALTED=""
 if [ -n "${_PILOT_HALT:-}" ] || [ -n "${_PLSC_UNREADABLE:-}" ]; then _RIG_JOIN_HALTED=1; fi
 if [ -z "$ALL_CANDIDATES_TIER" ] || { [ -z "$_RIG_JOIN_HALTED" ] && { [ "${SMALL_SLOTS:-0}" -gt "0" ] || [ "${BIG_SLOTS:-0}" -gt "0" ]; }; }; then
-  if [ -z "$ALL_CANDIDATES_TIER" ]; then
+  # Captured BEFORE the scan: the tier hint is rewritten below, and "the HQ pool was empty" decides whether there is
+  # anything to union at all.
+  _hq_pool_was_empty=""
+  [ -z "$ALL_CANDIDATES_TIER" ] && _hq_pool_was_empty=1
+  if [ -n "$_hq_pool_was_empty" ]; then
     log "HQ returned no candidates (bugs/debt + stories) — scanning rig DBs as fallback ..."
   else
     log "ga-9t9acg.2: HQ pool has $HQ_MERGED_COUNT candidate(s) — scanning rig DBs to JOIN them into ONE ordered pool (no HQ-first, no 'first store that yields') ..."
   fi
   _scan_rig_fallback_pool
+  # "Could not look" is not "found none" (gate round 1): when the scan could not read every rig DB, a zero count is
+  # UNKNOWN. Said once, here, whatever the count turned out to be — a partial read can still have found beads.
+  if [ -n "${RIG_SCAN_UNREADABLE:-}" ]; then
+    warn "ga-9t9acg.2: the rig DB scan could NOT read everything (${RIG_SCAN_UNREADABLE}) — the rig candidates counted below ($RIG_MERGED_COUNT) are what it could see, NOT proof that no other rig bead is waiting."
+  fi
   if [ "$RIG_MERGED_COUNT" -gt "0" ]; then
-    # The union keeps the HQ pool if the merge itself fails: a rig problem must never drop HQ work.
-    _union_json=$(echo "$ALL_CANDIDATES_JSON $RIG_MERGED_JSON" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || _union_json=""
-    if [ -n "$_union_json" ]; then
-      ALL_CANDIDATES_JSON="$_union_json"
+    # _joined is set ONLY where the rig pool really entered ALL_CANDIDATES_JSON: the tier hint and the "joined" line
+    # below describe the pool actually kept, never the one that was decided on.
+    _joined=""
+    if [ -n "$_hq_pool_was_empty" ]; then
+      # Nothing to union with: a plain assignment, exactly as before this slice — no jq in the way, so it cannot fail
+      # into an empty pool (the failure mode a fallible union would add to the HQ-empty path).
+      ALL_CANDIDATES_JSON="$RIG_MERGED_JSON"
+      _joined=1
     else
-      warn "ga-9t9acg.2: could not union the HQ pool with the rig pool — keeping the HQ pool this sweep (rig candidates not considered)."
+      # The union keeps the HQ pool if the merge itself fails: a rig problem must never drop HQ work.
+      _union_json=$(echo "$ALL_CANDIDATES_JSON $RIG_MERGED_JSON" | jq -s 'add // [] | unique_by(.id)' 2>/dev/null) || _union_json=""
+      if [ -n "$_union_json" ]; then
+        ALL_CANDIDATES_JSON="$_union_json"
+        _joined=1
+      else
+        warn "ga-9t9acg.2: could not union the HQ pool with the rig pool — keeping the HQ pool this sweep (rig candidates not considered)."
+      fi
+      unset _union_json
     fi
-    unset _union_json
-    # ALL_CANDIDATES_TIER is a LOG hint only (see the merge above): bug-ish vs feature-ish over the whole union.
-    _u_bug=$(( ${TIER1_COUNT:-0} + ${RIG_TIER1_UNCOND_COUNT:-0} + RIG_TIER1_COUNT )) || _u_bug=0
-    _u_feat=$(( ${TIER2_COUNT:-0} + RIG_TIER2_COUNT )) || _u_feat=0
-    if [ "$_u_bug" -gt "0" ] && [ "$_u_feat" -gt "0" ]; then
-      ALL_CANDIDATES_TIER="mixed"
-    elif [ "$_u_bug" -gt "0" ]; then
-      ALL_CANDIDATES_TIER="bug"
+    if [ -n "$_joined" ]; then
+      # ALL_CANDIDATES_TIER is a LOG hint only (see the merge above): bug-ish vs feature-ish over the whole union.
+      _u_bug=$(( ${TIER1_COUNT:-0} + ${RIG_TIER1_UNCOND_COUNT:-0} + RIG_TIER1_COUNT )) || _u_bug=0
+      _u_feat=$(( ${TIER2_COUNT:-0} + RIG_TIER2_COUNT )) || _u_feat=0
+      if [ "$_u_bug" -gt "0" ] && [ "$_u_feat" -gt "0" ]; then
+        ALL_CANDIDATES_TIER="mixed"
+      elif [ "$_u_bug" -gt "0" ]; then
+        ALL_CANDIDATES_TIER="bug"
+      else
+        ALL_CANDIDATES_TIER="feature"
+      fi
+      log "Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — joined with HQ into one pool, ordered once (priority > feature first > oldest first)."
     else
-      ALL_CANDIDATES_TIER="feature"
+      # The HQ pool (and the tier hint already set for it) is what this sweep dispatches from.
+      log "ga-9t9acg.2: $RIG_MERGED_COUNT rig candidate(s) were found but NOT joined (the union failed — WARN above): this sweep dispatches from the HQ pool alone."
     fi
-    log "Rig DBs: $RIG_MERGED_COUNT merged candidate(s) (bug/debt=$RIG_TIER1_COUNT, feature=$RIG_TIER2_COUNT) — joined with HQ into one pool, ordered once (priority > feature first > oldest first)."
-  elif [ -n "$ALL_CANDIDATES_TIER" ]; then
+    unset _joined
+  elif [ -n "${RIG_SCAN_UNREADABLE:-}" ]; then
+    log "ga-9t9acg.2: rig DB scan returned no candidate, but it could not read everything (${RIG_SCAN_UNREADABLE}) — UNKNOWN whether a rig bead is waiting, not 'none'. The pool below is the HQ pool as it stands."
+  elif [ -z "$_hq_pool_was_empty" ]; then
     log "ga-9t9acg.2: rig DB scan found no candidate to join the HQ pool — the HQ pool is the whole pool."
   fi
+  unset _hq_pool_was_empty
 elif [ -n "$_RIG_JOIN_HALTED" ] && { [ "${SMALL_SLOTS:-0}" -gt "0" ] || [ "${BIG_SLOTS:-0}" -gt "0" ]; }; then
   log "ga-5je3zv: the live session count is unreadable this sweep — NOT scanning the rig DBs to join the HQ pool (a sweep that cannot read the count stops dispatching; the scan would be pure cost on the box that just could not answer 'session list'). The HQ pool is the whole pool."
 fi
@@ -10247,7 +10285,8 @@ log "Dispatch tier: $ALL_CANDIDATES_TIER (${ALL_CANDIDATES_COUNT} candidate(s))"
 
 # ── Step 3: Split candidates by lane, pick one per available lane ─────────────
 # For each candidate classify its lane. Build two sorted candidate lists.
-# Pick the first of each lane by the work order (priority, then feature first, then OLDEST created_at).
+# Pick the first of each lane by the work order (priority, then feature first, then OLDEST created_at; plus the lib's
+# dano-ao-vivo exception for a P0 bug).
 # Only dispatch into a lane if it has a free slot.
 
 # _split_candidates_by_lane <json>: classify each candidate into SMALL/BIG
@@ -10288,6 +10327,9 @@ log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 #     bead is just "not a feature", ranked by age like any other. The label is still read by _bead_tier — that picks
 #     the sling TEMPLATE ("fix bug …"), it never ordered anything.
 #   * epic is excluded upstream, so it never reaches the sort.
+#   * the lib's one exception to "priority > type > age" applies here as it does on every stage (ga-9t9acg.14): a P0 BUG
+#     labelled impacto:dano-ao-vivo goes before the P0 features. It is the lib's rule, read from the lib — this file
+#     neither knows the label nor ranks by it.
 #
 # THREE states, never two (the lib's contract): ordered; a field unreadable (the bead stays at the end of its
 # class and the lib prints `work-order WARN: <id>: …` on stderr — which is why stderr is NEVER thrown away here: it
@@ -10303,17 +10345,20 @@ log "Candidates split: small=${SMALL_COUNT}  big=${BIG_COUNT}"
 
 # _pilot_order_pool <json-array> — print the pool in dispatch order (one JSON array on stdout). Always rc 0 and
 # never empty for an array: when the order cannot be applied (the lib is not loaded, or it says "cannot tell") the
-# INPUT order is printed with a WARN on stderr, so a lib fault degrades the order, not the dispatch.
+# INPUT order is printed with a WARN on stderr, so a lib fault degrades the order, not the dispatch. That input
+# order is NOT the work order and NOT the pre-ga-9t9acg.2 Pilot order either: the pool reaches here through
+# `unique_by(.id)`, i.e. sorted by bead id — so in this degraded mode a lower-priority bead can be picked ahead of a
+# P0 for that sweep. The WARN says exactly that; it is a visible degradation, never a silent one.
 _pilot_order_pool() {
   local _pop_in="$1" _pop_out="" _pop_rc=0
   if ! command -v work_order_sort >/dev/null 2>&1; then
-    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort is not loaded — cannot tell the dispatch order; keeping the pool's input order (previous order)" >&2
+    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort is not loaded — cannot tell the dispatch order; keeping the pool's input order (sorted by bead id, NOT by priority: a lower-priority bead can be picked ahead of a P0 this sweep)" >&2
     printf '%s\n' "$_pop_in"
     return 0
   fi
   _pop_out=$(printf '%s' "$_pop_in" | work_order_sort --age "$_PILOT_WORK_ORDER_AGE") || _pop_rc=$?
   if [ "$_pop_rc" -ne 0 ] || [ -z "$_pop_out" ]; then
-    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort cannot tell (rc=$_pop_rc, see the work-order line above) — keeping the pool's input order (previous order), not treating it as an empty queue" >&2
+    echo "pilot-dispatcher WARN: ga-9t9acg.2: work_order_sort cannot tell (rc=$_pop_rc, see the work-order line above) — keeping the pool's input order (sorted by bead id, NOT by priority: a lower-priority bead can be picked ahead of a P0 this sweep), not treating it as an empty queue" >&2
     printf '%s\n' "$_pop_in"
     return 0
   fi
@@ -10330,7 +10375,8 @@ _top_candidate() {
     printf '%s' "$_tc_sorted" | work_order_head || true
   else
     # The lib is not loaded (_pilot_order_pool already said so, once per call): the pool is in INPUT order and a
-    # valid array, so its first element IS the previous-order pick. Never an empty pick for a non-empty pool.
+    # valid array, so its first element is the pick of that degraded input order (see _pilot_order_pool). Never an empty pick
+    # for a non-empty pool.
     printf '%s' "$_tc_sorted" | jq -c '.[0]' || true
   fi
 }
