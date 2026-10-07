@@ -547,9 +547,21 @@ LINT NOT SEEN: "*) ok "a clean run prints LINT NOT SEEN" ;; *) bad "no LINT NOT 
 # counted in the summary and named in a LINT NOTE, and on the real tree there must be none — a rename fails HERE.
 case "$LINT_OUT" in *" empty_globs=0"*) ok "the real tree: every scope glob matches a file (empty_globs=0)" ;; *) bad "the real tree has an empty scope glob: $(printf '%s\n' "$LINT_OUT" | grep -E '^LINT (NOTE|:)')" ;; esac
 eq "the real tree: no LINT NOTE" "$(lint_count '^LINT NOTE')" "0"
-for o in ga-q8tj7p ga-9t9acg.2 ga-9t9acg.3 ga-9t9acg.4 ga-9t9acg.5 ga-9t9acg.6 ga-9t9acg.8 ga-9t9acg.9 ga-9t9acg.10 ga-9t9acg.13; do
-  if awk -F'\t' -v o="$o" '$1 == "consumer" && $4 == o {f=1} END {exit !f}' "$REGISTRY"; then ok "a consumer row is owned by $o"; else bad "no consumer row for $o"; fi
-done
+# Consumer owners are checked for LEGITIMACY, not for presence. A slice that migrates its consumer DELETES its row in
+# the same commit (the registry header says so), so "slice N still has a row" is true only until N lands: asserting it
+# turned this selftest red for every slice that did what the header tells it to (ga-9t9acg.3 was the first) and made
+# each of them edit this line. What stays true as rows go is: every consumer row is owned by a slice of the programme
+# or by UNASSIGNED (a typo, or a consumer nobody planned for, is what is worth catching) — and an empty registry, the
+# end of the programme, passes. The ext rows are never deleted by a slice, so those are still asserted one by one below.
+KNOWN_OWNERS=" UNASSIGNED ga-q8tj7p ga-9t9acg.2 ga-9t9acg.3 ga-9t9acg.4 ga-9t9acg.5 ga-9t9acg.6 ga-9t9acg.8 ga-9t9acg.9 ga-9t9acg.10 ga-9t9acg.13 "
+strange_owners() {   # <registry> — the consumer-row owners that are not in KNOWN_OWNERS, each followed by a space
+  awk -F'\t' '$1 == "consumer" {print $4}' "$1" | sort -u | while IFS= read -r o; do
+    case "$KNOWN_OWNERS" in *" $o "*) ;; *) printf '%s ' "$o" ;; esac
+  done
+}
+eq "every consumer row is owned by a slice of the programme or UNASSIGNED" "$(strange_owners "$REGISTRY")" ""
+printf 'consumer\tf\tx\tga-typo\tn\nconsumer\tf\ty\tga-9t9acg.3\tn\n' > "$TMP/owners.tsv"
+eq "an owner nobody planned is reported; a migrated slice's id is still a legitimate owner" "$(strange_owners "$TMP/owners.tsv")" "ga-typo "
 for o in ga-9t9acg.7 ga-9t9acg.11 ga-9t9acg.12; do
   if awk -F'\t' -v o="$o" '$1 == "ext" && $4 == o {f=1} END {exit !f}' "$REGISTRY"; then ok "an ext row is owned by $o"; else bad "no ext row for $o"; fi
 done
