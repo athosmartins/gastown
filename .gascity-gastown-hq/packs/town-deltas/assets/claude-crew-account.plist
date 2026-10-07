@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.gascity.claude-crew-account</string>
+
+  <!-- ga-qdtmq2 (Fase 2 da ga-xoe5ao) — the Claude account of the Mayor and the Remote Control crews, LIVE. One run a
+       minute: FOLLOW the pool's decision (claude-pool-account.py) by rewriting the DEFAULT Keychain item
+       "Claude Code-credentials" with that account's full-scope login; every session re-reads it within ~30-55 s, same
+       Remote Control link, conversation intact, no restart (Athos, 06/10). Only a FULL login (scope
+       user:sessions:claude_code + refresh token) is ever written there; if the wanted account has none, nothing is
+       written and a named alert says which login is missing. Never calls claude, costs no credit.
+
+       KILL SWITCH (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-crew-account.
+       Dry run: python3 .../claude-crew-account.py --dry-run (stderr only: no write, no notify, no real log).
+
+       ACTIVATION is a separate, human step (merged != live): copy to ~/Library/LaunchAgents and `launchctl load` it
+       AFTER the script exists on main and Athos has OK'd the live acceptance (switch + back). See docs/claude-crew-account.md. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/claude-crew-account.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/athos/gt/.gascity-gastown-hq</string>
+
+  <!-- 60 s > one run (a handful of ~1 s probes; the script holds a flock, so a slow run is never doubled). -->
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><false/>
+
+  <key>StandardOutPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-crew-account-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/athos/gt/.gascity-gastown-hq/.gc/logs/claude-crew-account-launchd.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- ~/.local/bin: `secret` (the vault). /usr/bin: `security`. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/athos/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/athos</string>
+    <!-- claude asks the Keychain for account $USER; launchd does not always set it. -->
+    <key>USER</key>
+    <string>athos</string>
+    <key>GC_CITY_PATH</key>
+    <string>/Users/athos/gt/.gascity-gastown-hq</string>
+  </dict>
+</dict>
+</plist>
