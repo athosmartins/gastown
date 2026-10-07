@@ -14,7 +14,9 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
 3. **Follow:** se a decisão aponta outra conta, grava o login COMPLETO dela no default (via `security -i`, hex no stdin).
    Sem login completo (escopo `user:sessions:claude_code` + refresh token): não escreve, alerta nomeando o login que falta.
    Default sem login completo (RC quebrado): alerta SEMPRE (mesmo com dono conhecido) e cura com a conta do pool; se ela não
-   tem login, tenta as outras com saldo e o alerta diz qual login falta e por quê.
+   tem login, tenta as outras com saldo e o alerta diz qual login falta e por quê. Default **ausente** (`security` exit 44):
+   alerta `default-missing` (1 push por janela) e NADA é criado/curado (sem dono conhecido). Default **ilegível** (keychain
+   travado, JSON sem `claudeAiOauth`): só o WARN no log — não é página, pode ser transitório.
 4. **Dono da fonte:** o perfil só responde por token vivo, e toda cópia guardada tem o access token vencido há 22–41 h.
    Então, em produção, o perfil quase nunca consegue dizer de quem é a fonte ANTES de trocar. Decisão (fail-open, explícita):
    a troca segue, mas fica **dita e contada**: log `source owner unverified`, `unverified_switches` no estado, identidade
@@ -24,7 +26,7 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
    Se o perfil nunca responder em 15 min: log `still unverified` (sem push: sem sessão viva ninguém renova o token).
 5. **Verify — fatia 2 (ga-llvuo4), AINDA NÃO está neste código.** A conferência de que toda sessão com bridge de Remote
    Control continua com ela 60 s depois da troca vem na fatia seguinte (o gate recusou a ga-qdtmq2 inteira por tamanho, E11:
-   896 > 800 linhas de produção; esta fatia tem 763). Enquanto ela não entrar, este script **não percebe** se uma troca derrubou
+   896 > 800 linhas de produção; esta fatia tem 772). Enquanto ela não entrar, este script **não percebe** se uma troca derrubou
    o Remote Control de alguma sessão — e o aceite ao vivo (trocar e voltar com uma crew real) depende dela.
 
 ## Garantias
@@ -52,14 +54,19 @@ Decisão do Athos (06/10): ao vivo, sem reiniciar — mesmo link de RC, conversa
   anterior: seria uma 2ª escrita no default também sem prova.
 - Se o blob do default tiver `mcpOAuth` grande (> ~1,9 KB no total), a troca é recusada pelo limite de linha do `security -i`
   (alerta `write-failed`): não há como escrever sem passar o segredo por argv.
-- Blobs sem `refreshTokenExpiresAt` de um lado só: não dá para dizer qual é o mais novo, então não se sobrescreve (alerta).
+- Blobs sem `refreshTokenExpiresAt` em UM lado ou nos DOIS: não dá para dizer qual login é o mais novo (a expiração do access
+  token NÃO serve: a cópia guardada sempre parece mais velha que o default vivo), então não se sobrescreve e sai o alerta
+  `sync-back:<conta>` — a troca fica recusada até alguém olhar. Se o campo faltar nos dados reais de produção, isto vai
+  aparecer como alerta recorrente (fail-closed), não como perda de login. Exceção: a cópia guardada que não é login
+  completo (setup-token, sem o escopo de sessões ou sem access token, login a < 1 dia de vencer) não serve às crews de
+  qualquer jeito e é substituída pelo login completo do default, sem comparar datas.
 - O servidor tolera o refresh token antigo após a rotação?
 - `gc` reinicia crew com `--resume`? (não verificado)
 - O perfil (`oauthAccount`) pode ficar na conta antiga enquanto o token é da nova.
 - A conta terrenos não tem login completo guardado: precisa de re-login humano (ga-xknkke); NÃO logar sozinho.
 - 2ª etapa (reinício em momento ocioso se o RC cair) fora de escopo.
 
-Testes: `scripts/test_claude_crew_account.py` (52 testes, shim de `security`, servidor de perfil em loopback). O harness é
+Testes: `scripts/test_claude_crew_account.py` (56 testes, shim de `security`, servidor de perfil em loopback). O harness é
 selado: todo teste roda com `CLAUDE_CREW_NOTIFY`, `CLAUDE_CREW_SECURITY` e `GC_CITY_PATH` fixados em stubs/tmp e `PATH`
 sem o `notify` real; no fim da sessão afirma que o log/estado/lock reais não mudaram e que nenhum sentinela foi executado;
 e o script roda de verdade sob `env -i`, com `python3` do pytest e com `/usr/bin/python3` (3.9, o do plist).
