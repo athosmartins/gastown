@@ -15,7 +15,9 @@
 #      through the real query path (a fake bd that honours --limit), through the test seam, and through the rig fallback.
 #      THIS IS THE RED ON THE PRE-FIX DISPATCHER (window of 20 + bd's order -> the first bead, not the oldest feature).
 #   B  the rule on small populations (priority > type > age, the reclaim age, the epic/brake filters still apply).
-#   C  the three states: an illegible field stays and is WARNed on stderr; "cannot tell" keeps the previous pick + WARN.
+#   C  the three states: an illegible field stays and is WARNed on stderr; "cannot tell" keeps the previous pick + WARN
+#      (and says so when even that pick has no id). C6..C9: the same for the INPUT — not an array / non-bead elements /
+#      a title that is not a string — never the same silence as an empty queue.
 #   D  AGREEMENT WITH THE WORKER PROBE (R5/R6): the dispatcher comment above _topup_pick_first names THIS part as the
 #      test that top-up and the pool worker pick the same bead. It runs the probe's own Step 1b2, taken live from
 #      agents/{wa,ps}-worker/prompt.template.md, on the same populations as top-up: the `bd ready … | jq …` line before
@@ -33,10 +35,11 @@
 #      consecutive sweeps, a bead nobody claims: an unmigrated worker -> NOT counted, NOT braked, a WARN each time; a
 #      migrated one -> counted, braked at the cap of 5, the next bead is served; the switch re-arms the brake by itself.
 #   G  mutation controls: the rule reverted in a COPY of the dispatcher (window back to 20, no ordering, no reclaim age,
-#      "cannot tell" read as empty, the library's stderr swallowed, the brake counting spawns of an unmigrated worker)
+#      "cannot tell" read as empty, the library's stderr swallowed, the brake counting spawns of an unmigrated worker,
+#      the first-stage guards of _topup_pick_first removed)
 #      must each fail the part that guards it.
 #
-# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F, G; measured 18 pass / 42 fail — the passes include D0, which tests the harness, not the dispatcher):
+# Falsifiable: run it against the pre-fix dispatcher and every part fails on assertions (A, B, C, D, E, F, G; measured 35 pass / 76 fail — the passes include D0, which tests the harness, not the dispatcher):
 #   PILOT_DISPATCHER_PATH=<pre-fix pilot-dispatcher.sh> bash pilot-dispatcher.topup-order.selftest.sh
 #
 # Conventions: verbatim function extraction (awk) from the live dispatcher + PATH-stubbed gc/bd/timeout inside the sandbox
@@ -443,6 +446,52 @@ _decoy='  # ... | work_order_sort --age reclaim 2>&1 (a comment)
 eq "C5b control: a call that swallows its stderr is judged 'swallows' even with innocent work_order_sort lines around it" "$(c5_judge "$_decoy")" "swallows"
 eq "C5c control: a function with no such call is judged 'no-call', never 'ok'" "$(c5_judge '  # work_order_sort --age reclaim lives elsewhere')" "no-call"
 
+# C6..C9: the FIRST stage of _topup_pick_first (before the library is called) has the same three states. Found by the
+# gate's review of the first submission and by the pre-gate self-audit of this diff: an input that is not a candidate array,
+# or an array jq cannot filter, used to end in the same silent "no pending bead" as an empty queue.
+LIBMODE=ok
+for _bad_in in '{"error":"database unavailable"}' 'Error: dolt server is not reachable' 'null'; do
+  _got="$(pick_direct "$_bad_in")"
+  _tag="$(printf '%s' "$_bad_in" | head -c 24)"
+  eq "C6 input that is not a JSON array [$_tag]: nothing is picked" "$_got" ""
+  if grep -q "WARN ga-9t9acg.4: pool top-up got something that is not a JSON array" "$WORK/run.err" && grep -q "NOT 'nothing pending'" "$WORK/run.err"; then
+    ok "C6b [$_tag] ...and a visible WARN says it is NOT 'nothing pending'"
+  else
+    bad "C6b [$_tag] input that is not a candidate array ended silently (indistinguishable from an empty queue): [$(cat "$WORK/run.err")]"
+  fi
+done
+# controls: the two inputs that REALLY mean "no candidate" stay quiet — otherwise C6b would pass by warning on everything.
+_got="$(pick_direct '[]')"; eq "C6c control: an empty array is an empty queue" "$_got" ""
+if [ ! -s "$WORK/run.err" ]; then ok "C6d ...and says nothing"; else bad "C6d an empty array wrote to stderr: [$(cat "$WORK/run.err")]"; fi
+_got="$(pick_direct '')"; eq "C6e control: bd printed nothing at all (the stages upstream swallow bd's exit status, so this cannot be told from an empty queue — said so in the header)" "$_got" ""
+if [ ! -s "$WORK/run.err" ]; then ok "C6f ...and says nothing"; else bad "C6f blank input wrote to stderr: [$(cat "$WORK/run.err")]"; fi
+
+# C7: a title that is not a string must not make jq fail and take the valid P0 feature down with it.
+C7="$( { bead c7-weird-title 0 task 2026-09-01T00:00:00Z; bead c7-p0-feature 0 feature 2026-09-02T00:00:00Z; } | arr | jq -c '.[0].title = 5')"
+eq "C7 a bead whose title is a number sits next to a valid P0 feature: the feature is served (the rule), not 'nothing'" "$(pick_direct "$C7")" "c7-p0-feature"
+if [ ! -s "$WORK/run.err" ]; then ok "C7b ...with nothing on stderr"; else bad "C7b stderr is not empty for a mere odd title: [$(cat "$WORK/run.err")]"; fi
+
+# C8: elements that are not beads (a string, null, a number) cannot be ordered: dropped and COUNTED out loud, the rest goes on.
+C8="$( { bead c8-p0-feature 0 feature 2026-09-02T00:00:00Z; } | arr | jq -c '["junk", null, 7] + .')"
+eq "C8 three non-bead elements around a valid bead: the bead is still served" "$(pick_direct "$C8")" "c8-p0-feature"
+if grep -q "WARN ga-9t9acg.4: pool top-up ignored 3 element(s) of bd's array that are not beads" "$WORK/run.err"; then
+  ok "C8b ...and the 3 dropped elements are counted on stderr"
+else
+  bad "C8b the dropped elements were not counted: [$(cat "$WORK/run.err")]"
+fi
+
+# C9: the fallback WARN may only promise a pick that exists. Library missing + a first bead with no readable id.
+LIBMODE=none
+C9="$( { bead c9-first 1 task 2026-10-05T00:00:00Z; bead c9-second 0 feature 2026-09-01T00:00:00Z; } | arr | jq -c 'del(.[0].id)')"
+_got="$(pick_direct "$C9")"
+eq "C9 library missing and bd's first bead has no id: nothing can be named" "$_got" ""
+if grep -q "has no readable id either" "$WORK/run.err" && grep -q "NOT 'nothing pending'" "$WORK/run.err" && ! grep -q "keeping the PREVIOUS pick" "$WORK/run.err"; then
+  ok "C9b ...and the WARN says so, instead of promising 'the PREVIOUS pick'"
+else
+  bad "C9b the fallback WARN promised a pick that does not exist: [$(cat "$WORK/run.err")]"
+fi
+LIBMODE=ok
+
 # ═══════════════════════════════════════════════════════════════════════════
 echo ""
 echo "=== Part D: top-up and the pool worker's probe (R5/R6, Step 1b2) must pick the same bead ==="
@@ -725,8 +774,20 @@ fi
 if mutate age 'work_order_sort --age "$_age")' 'work_order_sort --age created)'; then
   DISP="$WORK/mut/age.sh"; killed age "the reclaim age is reverted to created_at" "$(pick_direct "$B4")" "b4-plain"; DISP="$DISPATCHER"
 fi
-if mutate empty "printf '%s' \"\$_eligible\" | jq -r '.[0].id // empty' 2>/dev/null || true" 'true'; then
+if mutate empty "printf '%s' \"\$_prev\"" 'true'; then
   DISP="$WORK/mut/empty.sh"; LIBMODE=none; killed empty "'cannot tell' is read as an empty queue" "$(pick_direct "$CT")" "ct-first"; LIBMODE=ok; DISP="$DISPATCHER"
+fi
+# the FIRST stage (C6..C8): each of its three guards reverted in a copy must fail the case that guards it.
+if mutate firststage '*[![:space:]]*)' '*[![:space:]]X)'; then
+  DISP="$WORK/mut/firststage.sh"; pick_direct '{"error":"database unavailable"}' >/dev/null
+  _w="$(grep -c 'not a JSON array' "$WORK/run.err")"; DISP="$DISPATCHER"
+  killed firststage "input that is not a JSON array ends silently again (the same as an empty queue)" "$_w" "1"
+fi
+if mutate title '(((.title // "") | tostring) | test($epic_re; "i"))' '((.title // "") | test($epic_re; "i"))'; then
+  DISP="$WORK/mut/title.sh"; killed title "a title that is not a string makes jq fail on the whole array again" "$(pick_direct "$C7")" "c7-p0-feature"; DISP="$DISPATCHER"
+fi
+if mutate nonbead '.[] | select(type == "object") | select(' '.[] | select('; then
+  DISP="$WORK/mut/nonbead.sh"; killed nonbead "elements that are not beads take the whole array down again" "$(pick_direct "$C8")" "c8-p0-feature"; DISP="$DISPATCHER"
 fi
 if mutate stderr 'work_order_sort --age "$_age")' 'work_order_sort --age "$_age" 2>/dev/null)'; then
   DISP="$WORK/mut/stderr.sh"; pick_direct "$C1" >/dev/null

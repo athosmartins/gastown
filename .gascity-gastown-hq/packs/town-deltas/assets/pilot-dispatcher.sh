@@ -8746,8 +8746,14 @@ _topup_exclude_braked() {
 #                       writes one `work-order WARN:` line per bead on STDERR — its only signal. This helper therefore
 #                       never puts 2>/dev/null on the library call, and it must not be called with one either.
 #   * cannot tell (library missing, exit != 0, empty output, a head without an id) -> keep the PREVIOUS behaviour (the
-#                       first bead in the order bd returned it) and say so with a WARN. NOT "nothing pending": that
-#                       would silently stop top-up for the pool, and NOT a silent unordered pick either.
+#                       first bead in the order bd returned it) and say so with a WARN; when even that first bead has no
+#                       id nothing can be named, and the WARN says THAT. NOT "nothing pending": that would silently stop
+#                       top-up for the pool, and NOT a silent unordered pick either.
+#   * the INPUT itself (before the library) -> a JSON array: elements that are not objects are dropped and counted in a
+#                       WARN, and a title of any type is read as text (one odd bead cannot hide its neighbours). Non-blank
+#                       input that is not an array (bd's error text, an error envelope, `null`) spawns nothing for that
+#                       store, with a WARN. BLANK input is the one silent case: upstream swallows bd's exit status, so it
+#                       cannot be told from an empty queue here.
 # Output channel: this runs inside $(...), where log()/warn() (both write to STDOUT) would be captured into the bead id,
 # so every message here goes to stderr (>&2). The sweep's `exec >> "$LOG" 2>&1` lands it in the log.
 #
@@ -8771,12 +8777,29 @@ unset _GC_WO_TOPUP_SIBLING
 # this helper's own (see the block above). Always exits 0. The EPIC-title defence in depth (the worker probe's jq has the
 # same regex) lives here so the real queries and both test seams share ONE copy of it.
 _topup_pick_first() {
-  local _age="reclaim" _in _eligible _n _ordered _head _id _why=""
+  local _age="reclaim" _in _eligible _n _ordered _head _id _why="" _skipped _prev
   _in=$(cat)
+  # First stage, same three states as the library call below. BLANK input is the one thing we cannot tell from an empty
+  # queue (the stages upstream swallow bd's exit status), so it stays the inert, silent "no pending bead" this pipeline always
+  # ended in. Anything else that is not a JSON array (bd's error text, an error envelope, `null`) is "cannot tell": inert
+  # too — nothing is spawned for it — but said out loud, never the same as an empty queue.
+  if ! printf '%s' "$_in" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    case "$_in" in
+      *[![:space:]]*)
+        echo "WARN ga-9t9acg.4: pool top-up got something that is not a JSON array from bd and the filters (error text? an error envelope?) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'. It starts with: $(printf '%s' "$_in" | head -c 120 | tr '\n\r' '  ')" >&2 ;;
+    esac
+    return 0
+  fi
+  # Only objects can be beads: any other element of the array is dropped and COUNTED below (never a jq failure that takes the
+  # whole array down with it). A title of any type is read as text, so a bead with an odd title cannot hide its neighbours.
   _eligible=$(printf '%s' "$_in" | jq -c --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-    'if type == "array" then [.[] | select(((.title // "") | test($epic_re; "i")) | not)] else empty end' 2>/dev/null) || _eligible=""
-  # Not an array / bd printed nothing: the same inert "no pending bead" this pipeline always ended in.
-  [ -n "$_eligible" ] || return 0
+    '[.[] | select(type == "object") | select((((.title // "") | tostring) | test($epic_re; "i")) | not)]' 2>/dev/null) || _eligible=""
+  if [ -z "$_eligible" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up could not filter bd's candidate array (jq failed on it) — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+    return 0
+  fi
+  _skipped=$(printf '%s' "$_in" | jq '[.[] | select(type != "object")] | length' 2>/dev/null) || _skipped="an unknown number of"
+  [ "$_skipped" = "0" ] || echo "WARN ga-9t9acg.4: pool top-up ignored $_skipped element(s) of bd's array that are not beads." >&2
   _n=$(printf '%s' "$_eligible" | jq 'length' 2>/dev/null) || _n=""
   [ "$_n" != "0" ] || return 0
   if ! type work_order_sort >/dev/null 2>&1 || ! type work_order_head >/dev/null 2>&1; then
@@ -8793,8 +8816,14 @@ _topup_pick_first() {
     printf '%s' "$_id"
     return 0
   fi
-  echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why) — keeping the PREVIOUS pick: the first of $_n candidate(s) in bd's own order. This is NOT 'nothing pending'." >&2
-  printf '%s' "$_eligible" | jq -r '.[0].id // empty' 2>/dev/null || true
+  # The WARN may only promise a pick that exists: the previous behaviour was `.[0].id`, and that can be empty too.
+  _prev=$(printf '%s' "$_eligible" | jq -r '.[0].id // empty' 2>/dev/null) || _prev=""
+  if [ -n "$_prev" ]; then
+    echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why) — keeping the PREVIOUS pick: the first of $_n candidate(s) in bd's own order. This is NOT 'nothing pending'." >&2
+    printf '%s' "$_prev"
+  else
+    echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why), and the first of $_n candidate(s) in bd's own order has no readable id either — nothing is spawned for this store this sweep. This is NOT 'nothing pending'." >&2
+  fi
   return 0
 }
 
