@@ -523,10 +523,12 @@ probe_line() {
 # work-order.sh (here: the tree this selftest lives in; D0c points PROBE_CITY elsewhere), PATH is the sandbox with the
 # fake bd. Its stderr is kept in $WORK/probe.err for the caller — a probe that fell back to its pre-library order did
 # not apply the rule.
-# GATE_FOCUS_ACTIVE_OVERRIDE=0: since ga-kqa08j the Step 1b2 block also sources the LIVE city's gate-focus-lib.sh (an
-# absolute path, so GC_CITY_PATH cannot redirect it) and, while the gate queue is deep, keeps only gate:needs-fix beads —
-# every fixture here has none, so on a city in focus mode the probe would print [] and Part D would FAIL on the weather.
-# The override is the lib's own switch; it makes this part about ORDER, whatever the city is doing right now.
+# GATE_FOCUS_ACTIVE_OVERRIDE=0: since ga-kqa08j the Step 1b2 block also reads the gate focus state and, while the gate queue
+# is deep, keeps only gate:needs-fix beads — every fixture here has none, so a probe that saw focus mode ON would print []
+# and Part D would FAIL on the weather. Where the block finds the lib has changed: first an absolute path to the LIVE city
+# (measured: the 4 ps-worker failures on the rebased tree, state active=1), then — city fix 3406227b1 — ${GC_CITY_PATH:-$GC_CITY},
+# which is this tree (no .gc/gate-focus.state there -> "unknown" -> no filter). The override is the lib's own switch and
+# holds under BOTH, and under a state file somebody leaves in the tree: this part is about ORDER, whatever the city does.
 probe_pick() {
   local _line
   _line="$(probe_line "$1" "$2")" || return 1
