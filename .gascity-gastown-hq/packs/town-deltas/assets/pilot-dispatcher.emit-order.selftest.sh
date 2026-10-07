@@ -140,6 +140,21 @@ grep -qE '^_PILOT_WORK_ORDER_AGE="created"' "$DISPATCHER" \
   && ok "the age source is the documented one (created_at), defined once as _PILOT_WORK_ORDER_AGE" \
   || bad "_PILOT_WORK_ORDER_AGE=\"created\" is not defined in the dispatcher"
 
+# The one exception to "priority > type > age" (ga-9t9acg.14, Athos 06/10 "Bug com dano ao vivo primeiro"): a P0 BUG labelled
+# impacto:dano-ao-vivo goes before the P0 features. The Pilot gets it from the library, not from a rule of its own — and the beads it
+# sorts are the raw `bd list --json` ones, labels included (the projection to the painel shape comes AFTER the sort), so this checks the
+# whole path: fixture with labels -> _pilot_emit_dispatchable -> work_order_sort -> the file. A P1 bug with the label is NOT promoted.
+dano() { bead "$1" "$2" "$3" "$4" | jq -c '.labels = ["impacto:dano-ao-vivo"]'; }
+D_BUG="$(dano d-bug 0 bug 2026-03-15T00:00:00Z)"   # NEWER than every P0 feature and than the plain P0 bug
+D_P1="$(dano d-p1 1 bug 2026-03-16T00:00:00Z)"     # P1: the label moves nothing
+DANO="$(arr "$B_OLD" "$F_OLD" "$T_MID" "$F_NEW" "$P1_F" "$D_P1" "$D_BUG")"
+EXPECTED_DANO="d-bug,f-old,f-new,b-old,t-mid,p1-f,d-p1"
+rm -f "$OUT"
+emit_run "$DANO" "$LIB" >"$WORK/a3.log" 2>&1
+GOT_DANO="$(ids_of)"
+if [ "$GOT_DANO" = "$EXPECTED_DANO" ]; then ok "a P0 dano bug leads the emitted queue (before the older P0 features); the P1 dano bug stays behind its P1 feature: $EXPECTED_DANO"
+else bad "dano fixture order is [$GOT_DANO], want [$EXPECTED_DANO]"; fi
+
 # ── (b) the painel contract ─────────────────────────────────────────────────────────────────────────────
 echo "== (b) the painel contract is untouched: only the order moved"
 rm -f "$OUT"
@@ -266,10 +281,12 @@ if [ "${EO_SKIP_MUTATION:-0}" != "1" ]; then
   # "Cannot tell" read as an empty queue (the error/empty collapse the library's contract forbids).
   must_fail "cannot-tell-is-an-empty-queue" dispatcher '      _wo_ok=0' '      _wo_ok=1; _ordered="[]"'
   # The library itself, three ways the rule can rot: ignore the type, bugs first, newest first.
-  WO_KEY='def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_type_class($o), ($e // 9999999999), (.id // "")];'
-  must_fail "lib-priority-only" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, 0, ($e // 9999999999), (.id // "")];'
-  must_fail "lib-bug-before-feature" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, (if (.issue_type // "") == "bug" then 0 else 1 end), ($e // 9999999999), (.id // "")];'
-  must_fail "lib-newest-first" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_type_class($o), (0 - ($e // 0)), (.id // "")];'
+  WO_KEY='def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")];'
+  must_fail "lib-priority-only" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, 0, ($e // 9999999999), (.id // "")];'
+  must_fail "lib-bug-before-feature" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, (if (.issue_type // "") == "bug" then 0 else 1 end), ($e // 9999999999), (.id // "")];'
+  must_fail "lib-newest-first" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, wo_type_class($o), (0 - ($e // 0)), (.id // "")];'
+  # ...and the exception left out of the key (what the Pilot did before ga-9t9acg.14): the dano bug sinks behind the P0 features.
+  must_fail "lib-no-dano-class" lib "$WO_KEY" 'def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_type_class($o), ($e // 9999999999), (.id // "")];'
 fi
 
 echo

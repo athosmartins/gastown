@@ -266,11 +266,12 @@ A ordem do gate é **prioridade > feature > idade** (todas as P0 feature, depois
 P0 que não são feature, depois P1...). Há **uma única exceção**, decisão do Athos em
 06/10 (resposta "Bug com dano ao vivo primeiro" ao AskUserQuestion do Mayor, citada no
 comentário do Mayor em ga-9t9acg, 2026-10-06T22:29:01Z): um **bug P0 com o label
-`impacto:dano-ao-vivo`** passa na frente das P0 feature. Hoje **só o gate**
-(`quality-gate-dispatcher.sh`) aplica a exceção. A lib única de ordenação
-(`work-order.sh`, ga-9t9acg.1, ainda em gate) **não a tem**: o porte da regra para a lib
-é um bead próprio, bloqueado pelo merge do ga-9t9acg.1 — até ele fechar, os outros
-estágios do painel seguem a ordem sem a exceção.
+`impacto:dano-ao-vivo`** passa na frente das P0 feature. A exceção vive em **dois**
+lugares, com a mesma regra: o gate (`quality-gate-dispatcher.sh`, ga-emgkvn) e a lib
+única de ordenação (`work-order.sh`, ga-9t9acg.14 — chave `[prioridade, dano, tipo,
+idade, id]`). Todo estágio que ordena pela lib já a aplica; o que ainda ordena por
+conta própria **não** (a lista está nas linhas `consumer` de `work-order.registry.tsv`:
+cada linha some quando o estágio migra).
 
 **Quem detecta dano ao cliente EM CURSO (agora, não "pode acontecer") faz duas coisas
 no bead-fonte:** `bd label add <id> impacto:dano-ao-vivo` **e um comentário com a
@@ -284,8 +285,11 @@ O label só conta num **bug P0** (`issue_type=bug`, `priority=0`). Em P1 ou abai
 em feature/task, ele é **ignorado** (o gate registra a linha `NOTE: label
 impacto:dano-ao-vivo IGNORED`) — se o dano é real, o bead precisa ser P0 **e** bug.
 Se as labels do bead-fonte não puderem ser lidas, vale **sem** o label (nunca
-promove) e o gate dá `WARN`. Não use pra "urgente" em geral: o que não é dano a
-cliente agora segue a ordem normal.
+promove) e o gate dá `WARN`; a lib faz o mesmo e diz `work-order WARN: <id>: labels?`
+no stderr (só para bug P0 — o único caso em que a leitura mudaria a posição; em
+qualquer outro bead o label não mexe na ordem e a lib fica calada). Bead sem a chave
+`labels` (o `bd` a omite quando não há nenhum) é "não tem", não "ilegível". Não use
+pra "urgente" em geral: o que não é dano a cliente agora segue a ordem normal.
 
 {{/* td:core:gate-focus */ -}}
 ### Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova (ga-kqa08j)

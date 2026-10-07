@@ -4,6 +4,7 @@
 # Proves the ordering library (work-order.sh), its Python entry point (scripts/work_order.py) and the
 # registry lint (work-order.registry.tsv). Needs only bash, jq, python3. Exit 0 iff every check holds.
 #   (a)-(h)  the rule, the three age rules and the three-state contract, on inline fixtures;
+#   (D)      the exception (ga-9t9acg.14): a P0 bug with impacto:dano-ao-vivo first, the three states of the labels;
 #   (i)      python == bash on the same fixtures;
 #   (j)      MUTATION CONTROLS: textual mutants of the library (priority-only, bug-before-feature,
 #            newest-first, "today's behaviour", ...) and of the lint must each make THIS file fail;
@@ -91,6 +92,41 @@ F10="$TMP/f10.json"
 F10_CREATED="j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat"
 F10_RECLAIM="d-p0-feat-old,j-p0-feat-reclaimed,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat"
 F10_WARNS="f-nullprio-feat: prio?;g-p2-notype: type?;h-p2-bug-badage: age?;"
+
+# ga-9t9acg.14 — the "dano ao vivo" fixtures. BL = B with the labels and no `updated` (the 5th argument of B is the
+# updated_at, which the labels come after); Bnl = a bead whose `labels` KEY IS ABSENT (bd omits it for a bead with
+# none: 22 of 162 beads on 06/10, none with an empty array).
+DL='["impacto:dano-ao-vivo"]'
+BL() { B "$1" "$2" "$3" "$4" "" "$5"; }
+Bnl() { B "$@" | jq -c 'del(.labels)'; }
+# every rung of the ladder, with the label sprinkled where it must NOT count (a P0 feature, a P0 task, a P1 bug, a P2 bug)
+FDANO="$TMP/dano.json"
+{
+  BL p0-feat-old 0 feature 2026-08-01T00:00:00Z '[]'
+  BL p0-feat-new-labelled 0 feature 2026-10-04T00:00:00Z "$DL"
+  BL p0-bug-plain-oldest 0 bug 2026-07-01T00:00:00Z '[]'
+  BL p0-task-labelled 0 task 2026-07-02T00:00:00Z "$DL"
+  BL p0-dano-new 0 bug 2026-10-05T00:00:00Z "$DL"
+  BL p0-dano-old 0 bug 2026-09-01T00:00:00Z '["a","impacto:dano-ao-vivo","b"]'
+  BL p1-feat 1 feature 2026-09-30T00:00:00Z '[]'
+  BL p1-bug-old 1 bug 2026-06-01T00:00:00Z '[]'
+  BL p1-dano-new 1 bug 2026-10-06T00:00:00Z "$DL"
+  BL p2-dano-bug 2 bug 2026-10-06T00:00:00Z "$DL"
+} | arr > "$FDANO"
+FDANO_ORDER="p0-dano-old,p0-dano-new,p0-feat-old,p0-feat-new-labelled,p0-bug-plain-oldest,p0-task-labelled,p1-feat,p1-bug-old,p1-dano-new,p2-dano-bug"
+# the three states of the labels on a P0 bug, next to the readable ones: the order is the plain rule's for every
+# bead but the one with the readable label, and every unreadable one is named on stderr
+FDANO_BAD="$TMP/dano-bad.json"
+{
+  BL q-feat 0 feature 2026-09-01T00:00:00Z '[]'
+  BL q-null 0 bug 2026-08-01T00:00:00Z 'null'
+  BL q-string 0 bug 2026-08-02T00:00:00Z '"impacto:dano-ao-vivo"'
+  BL q-nonstring 0 bug 2026-08-03T00:00:00Z '["impacto:dano-ao-vivo",1]'
+  Bnl q-nokey 0 bug 2026-08-04T00:00:00Z
+  BL q-yes 0 bug 2026-10-01T00:00:00Z "$DL"
+} | arr > "$FDANO_BAD"
+FDANO_BAD_ORDER="q-yes,q-feat,q-null,q-string,q-nonstring,q-nokey"
+FDANO_BAD_WARNS="q-nonstring: labels?;q-null: labels?;q-string: labels?;"
 
 # ── (a) the rule: priority > type > age ─────────────────────────────────────────────────────────
 if want a; then
@@ -342,6 +378,99 @@ else
 fi
 fi
 
+# ── (D) the exception: a P0 bug with impacto:dano-ao-vivo goes first (ga-9t9acg.14, from ga-emgkvn) ──────────────
+if want D; then
+echo "== (D) dano ao vivo: inside P0, bug + impacto:dano-ao-vivo < feature < the rest; P1 and below untouched"
+expect_order "P0 dano bugs, P0 features, P0 rest, then P1 (label ignored there), P2" created "$FDANO" "$FDANO_ORDER"
+eq "...with the label on a P0 feature / task / P1 bug / P2 bug raising no WARN (it is only ignored)" "$(warns)" ""
+expect_order "...and the same in reclaim mode" reclaim "$FDANO" "$FDANO_ORDER"
+jq -c 'reverse' "$FDANO" > "$TMP/dano-rev.json"
+expect_order "...and shuffling the input changes nothing" created "$TMP/dano-rev.json" "$FDANO_ORDER"
+{ BL r-feat 0 feature 2026-09-01T00:00:00Z '[]'
+  B r-dano-recl 0 bug 2026-08-01T00:00:00Z 2026-10-05T00:00:00Z '["impacto:dano-ao-vivo","pilot:reclaim-count:1"]'
+  BL r-dano-plain 0 bug 2026-09-20T00:00:00Z "$DL"; } | arr > "$TMP/dano-recl.json"
+expect_order "created mode: the dano bugs by created_at, then the feature" created "$TMP/dano-recl.json" "r-dano-recl,r-dano-plain,r-feat"
+expect_order "reclaim mode: the class still wins and the age inside it is the reclaim rule's (updated_at)" reclaim "$TMP/dano-recl.json" "r-dano-plain,r-dano-recl,r-feat"
+
+echo "-- the label counts only when it is EXACTLY the label (case, prefix, suffix and the neighbours do not count)"
+dano_pair() { # <label> <expected csv> <what>   a P0 feature (older) and a P0 bug carrying that one label
+  { BL pr-feat 0 feature 2026-08-01T00:00:00Z '[]'
+    BL pr-bug 0 bug 2026-09-01T00:00:00Z "$(jq -cn --arg l "$1" '[$l]')"; } | arr > "$TMP/pair.json"
+  expect_order "$3" created "$TMP/pair.json" "$2"
+  eq "$3: no WARN (a readable label that does not match is just 'no')" "$(warns)" ""
+}
+dano_pair 'impacto:dano-ao-vivo'  "pr-bug,pr-feat" "the exact label promotes the bug ahead of the feature"
+for near in 'IMPACTO:DANO-AO-VIVO' 'Impacto:Dano-Ao-Vivo' 'impacto:dano-ao-vivo ' ' impacto:dano-ao-vivo' 'impacto:dano-ao-vivo-x' \
+            'x-impacto:dano-ao-vivo' 'dano-ao-vivo' 'impacto:dano' 'impacto/dano-ao-vivo' 'impacto:dano_ao_vivo' ''; do
+  dano_pair "$near" "pr-feat,pr-bug" "label [$near] does not promote"
+done
+
+echo "-- ...and only on a P0 BUG: priority exactly 0, issue_type exactly bug"
+type_pair() { # <issue_type|-> <extra jq filter> <what>
+  { BL tp-feat 0 feature 2026-08-01T00:00:00Z '[]'
+    BL tp-bug 0 "$1" 2026-09-01T00:00:00Z "$DL" | jq -c "$2"; } | arr > "$TMP/pair.json"
+  expect_order "$3" created "$TMP/pair.json" "tp-feat,tp-bug"
+}
+type_pair Bug  '.' "issue_type Bug (capital) is not a bug for the exception"
+type_pair BUG  '.' "issue_type BUG is not a bug for the exception"
+type_pair 'bug ' '.' "issue_type 'bug ' (trailing space) is not a bug for the exception"
+type_pair task '.' "a P0 task with the label is not promoted"
+type_pair story '.' "a P0 story with the label is not promoted (it is a feature already)"
+type_pair - '. + {type: "bug"}' "no issue_type, only the legacy .type=bug: not promoted (the strict reading; promoting is the costly direction)"
+type_pair - '.' "no issue_type at all: not promoted"
+for pr in '"0"' '0.5' '-1' '9' 'null' 'absent' 'true'; do
+  { BL pp-p4 4 chore 2026-08-01T00:00:00Z '[]'
+    B pp-bug "$pr" bug 2026-09-01T00:00:00Z "" "$DL"; } | arr > "$TMP/pair.json"
+  expect_order "priority [$pr] on a bug with the label: no promotion, it stays behind P4 (class 5)" created "$TMP/pair.json" "pp-p4,pp-bug"
+  eq "priority [$pr]: the WARN is the priority's own, nothing about the labels" "$(warns)" "pp-bug: prio?;"
+done
+{ BL one-feat 1 feature 2026-08-01T00:00:00Z '[]'; BL one-bug 1 bug 2026-09-01T00:00:00Z "$DL"; } | arr > "$TMP/pair.json"
+expect_order "P1 bug + the label: ignored, the feature stays first" created "$TMP/pair.json" "one-feat,one-bug"
+{ BL two-feat 2 feature 2026-08-01T00:00:00Z '[]'; BL two-bug 2 bug 2026-09-01T00:00:00Z "$DL"; } | arr > "$TMP/pair.json"
+expect_order "P2 bug + the label: ignored, the feature stays first" created "$TMP/pair.json" "two-feat,two-bug"
+
+echo "-- three states of the labels, never collapsed: has it / does not / cannot tell"
+expect_order "has it (q-yes) first; does not (q-nokey) and cannot tell (q-null, q-string, q-nonstring) keep the plain rule's place" created "$FDANO_BAD" "$FDANO_BAD_ORDER"
+eq "the cannot-tell ones are named on stderr, each with its id and 'labels?'; the key-absent one is not" "$(warns)" "$FDANO_BAD_WARNS"
+case "$SORT_OUT" in '['*']') ok "...and stdout stays one JSON array (the WARNs are on stderr only)" ;; *) bad "stdout is not an array: [$SORT_OUT]" ;; esac
+eq "...and nothing was dropped" "$(printf '%s' "$SORT_OUT" | jq 'length')" "6"
+for spec in 'null' '"impacto:dano-ao-vivo"' '{"impacto:dano-ao-vivo":true}' '["impacto:dano-ao-vivo",1]' '[null,"impacto:dano-ao-vivo"]' \
+            '[["impacto:dano-ao-vivo"]]' 'true' '7' '""'; do
+  { BL u-feat 0 feature 2026-09-01T00:00:00Z '[]'; BL u-bug 0 bug 2026-08-01T00:00:00Z "$spec"; } | arr > "$TMP/pair.json"
+  expect_order "labels $spec: not a list of strings -> NOT promoted" created "$TMP/pair.json" "u-feat,u-bug"
+  eq "labels $spec: WARN names the bead (the unreadable state is never silent)" "$(warns)" "u-bug: labels?;"
+done
+echo "-- ...but only a P0 BUG is told about: unreadable labels on a bead the label could not move raise no WARN"
+nonc() { # <prio> <type>   two beads of the same shape, the older one with labels null
+  { BL n-a "$1" "$2" 2026-09-01T00:00:00Z '[]'; BL n-b "$1" "$2" 2026-08-01T00:00:00Z 'null'; } | arr > "$TMP/pair.json"
+  expect_order "labels null on a P$1 $2 (not a P0 bug): the plain rule's order, oldest first" created "$TMP/pair.json" "n-b,n-a"
+  eq "labels null on a P$1 $2: no WARN (the answer to 'is it a dano bug?' is already no)" "$(warns)" ""
+}
+nonc 0 feature; nonc 0 task; nonc 1 bug; nonc 2 bug
+{ BL e-feat 0 feature 2026-09-01T00:00:00Z '[]'; BL e-bug 0 bug 2026-08-01T00:00:00Z '[]'; } | arr > "$TMP/pair.json"
+expect_order "labels [] (an empty list): does not have it, order unchanged" created "$TMP/pair.json" "e-feat,e-bug"
+eq "labels []: no WARN" "$(warns)" ""
+{ BL k-feat 0 feature 2026-09-01T00:00:00Z '[]'; Bnl k-bug 0 bug 2026-08-01T00:00:00Z; } | arr > "$TMP/pair.json"
+eq "the fixture really has no labels key" "$(jq -r '.[1] | has("labels")' "$TMP/pair.json")" "false"
+expect_order "labels key ABSENT (bd omits it): does not have it, order unchanged" created "$TMP/pair.json" "k-feat,k-bug"
+eq "labels key ABSENT: no WARN (it is the normal shape of a bead with no label)" "$(warns)" ""
+{ BL w-p2 2 feature 2026-09-01T00:00:00Z 'null'; } | arr > "$TMP/pair.json"
+expect_order "a bead that cannot be promoted anyway (P2 feature) with unreadable labels is still ordered" created "$TMP/pair.json" "w-p2"
+eq "...and NOT named: the label could not have moved it, so there is nothing the caller cannot tell" "$(warns)" ""
+{ BL x-feat 0 feature 2026-09-01T00:00:00Z '[]'; B x-bug 0 bug 2026-08-01T00:00:00Z "" 'null'; } | arr > "$TMP/pair.json"
+run_sort reclaim "$TMP/pair.json"
+eq "reclaim mode with labels null: still not promoted" "$(sids)" "x-feat,x-bug"
+eq "...named for the labels only (null is 'no reclaim marker' for the age, as before: created_at is read)" "$(warns)" "x-bug: labels?;"
+{ BL x-feat 0 feature 2026-09-01T00:00:00Z '[]'; B x-str 0 bug 2026-08-01T00:00:00Z "" '"pilot:reclaim-count:1"'; } | arr > "$TMP/pair.json"
+run_sort reclaim "$TMP/pair.json"
+eq "reclaim mode with labels a string: the age cannot be read either, so both reasons are named on the one line" "$(warns)" "x-str: age? labels?;"
+eq "...and the bead stays at the end of its class" "$(sids)" "x-feat,x-str"
+{ BL y-feat 0 feature 2026-09-01T00:00:00Z '[]'; BL y-bug 0 bug garbage 'null'; } | arr > "$TMP/pair.json"
+run_sort created "$TMP/pair.json"
+eq "unreadable age AND labels on a P0 bug: one WARN line with both reasons" "$(warns)" "y-bug: age? labels?;"
+eq "...and it stays at the end of its class, behind the feature" "$(sids)" "y-feat,y-bug"
+fi
+
 # ── (h) three states ────────────────────────────────────────────────────────────────────────────
 if want h; then
 echo "== (h) [] -> [] exit 0; anything else unreadable -> stdout EMPTY, exit != 0 (never 'no bead')"
@@ -418,6 +547,17 @@ for mode in created reclaim field; do
   eq "$mode: python output == bash output" "$(printf '%s' "$py_out" | jq -cS '.')" "$bash_out"
   eq "$mode: python WARN lines == bash WARN lines" "$(sed -n 's/^work-order WARN: //p' "$TMP/pyerr" | grep -v '^WORK_ORDER_LIB override' | sort | tr '\n' ';')" "$bash_warn"
 done
+# the exception (ga-9t9acg.14): the python entry point is the same rule, with the same WARN for an unreadable `labels`
+for fx in "$FDANO" "$FDANO_BAD"; do
+  for mode in created reclaim; do
+    run_sort "$mode" "$fx"; bash_out="$(printf '%s' "$SORT_OUT" | jq -cS '.')"; bash_warn="$(warns)"
+    py_out="$(python3 -I -B "$PY" sort --age "$mode" < "$fx" 2>"$TMP/pyerr")"; py_rc=$?
+    eq "dano $(basename "$fx") $mode: python exit" "$py_rc" "0"
+    eq "dano $(basename "$fx") $mode: python output == bash output" "$(printf '%s' "$py_out" | jq -cS '.')" "$bash_out"
+    eq "dano $(basename "$fx") $mode: python WARN lines == bash WARN lines" "$(sed -n 's/^work-order WARN: //p' "$TMP/pyerr" | grep -v '^WORK_ORDER_LIB override' | sort | tr '\n' ';')" "$bash_warn"
+  done
+done
+eq "dano: python order of the ladder fixture is the exception's" "$(python3 -I -B "$PY" sort < "$FDANO" 2>/dev/null | jq -r 'map(.id) | join(",")')" "$FDANO_ORDER"
 out="$(printf 'nope' | python3 -I -B "$PY" sort 2>"$TMP/pyerr")"; rc=$?
 eq "python CLI on garbage: stdout empty" "$out" ""; eq "python CLI on garbage: exit" "$rc" "2"
 case "$(cat "$TMP/pyerr")" in work-order\ ERROR:*) ok "python CLI on garbage: ERROR line on stderr" ;; *) bad "python CLI on garbage: stderr=[$(cat "$TMP/pyerr")]" ;; esac
@@ -787,13 +927,39 @@ must_fail() {
 }
 if want j && [ "${WO_SKIP_MUTATION:-0}" != "1" ]; then
 echo "== (j) mutation controls: each mutant of the library / lint must make this selftest fail"
-KEY='[wo_prio_class, wo_type_class($o), ($e // 9999999999), (.id // "")]'
+KEY='[wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")]'
 must_fail priority-only lib "$KEY" '[wo_prio_class]'
 must_fail bug-before-feature lib 'index($t | ascii_downcase)) != null then 0' 'index($t | ascii_downcase)) != null then 3'
 must_fail newest-first lib '($e // 9999999999), (.id // "")]' '(-($e // 0)), (.id // "")]'
-must_fail today-bd-default lib "$KEY" '[wo_prio_class, (-($e // 0)), (.id // "")]'
+must_fail today-bd-default lib "$KEY" '[wo_prio_class, wo_dano_class, (-($e // 0)), (.id // "")]'
 must_fail today-pilot-bug-first lib "$KEY" \
-  '[wo_prio_class, (if (.issue_type // "") == "bug" then 0 elif (.issue_type // "") == "feature" then 4 else 2 end), (-($e // 0)), (.id // "")]'
+  '[wo_prio_class, wo_dano_class, (if (.issue_type // "") == "bug" then 0 elif (.issue_type // "") == "feature" then 4 else 2 end), (-($e // 0)), (.id // "")]'
+# ga-9t9acg.14 — the exception: each way of getting it wrong must be seen
+DC='if wo_dano_candidate and wo_dano_verdict == "yes" then 0 else 1 end;'
+CAND='def wo_dano_candidate: wo_prio_class == 0 and .issue_type == "bug";'
+must_fail dano-never-promotes lib "$DC" 'if false then 0 else 1 end;'
+must_fail dano-any-priority lib "$CAND" 'def wo_dano_candidate: .issue_type == "bug";'
+must_fail dano-priority-le-1 lib "$CAND" 'def wo_dano_candidate: wo_prio_class <= 1 and .issue_type == "bug";'
+must_fail dano-any-type lib "$CAND" 'def wo_dano_candidate: wo_prio_class == 0;'
+must_fail dano-type-case-folded lib "$CAND" 'def wo_dano_candidate: wo_prio_class == 0 and ((.issue_type // "") | ascii_downcase) == "bug";'
+must_fail dano-type-fallback lib "$CAND" 'def wo_dano_candidate: wo_prio_class == 0 and (.issue_type // .type) == "bug";'
+must_fail dano-without-the-label lib "$DC" 'if wo_dano_candidate then 0 else 1 end;'
+must_fail dano-after-type lib "$KEY" '[wo_prio_class, wo_type_class($o), wo_dano_class, ($e // 9999999999), (.id // "")]'
+must_fail dano-after-age lib "$KEY" '[wo_prio_class, wo_type_class($o), ($e // 9999999999), wo_dano_class, (.id // "")]'
+must_fail dano-label-case-folded lib '(.labels | index("impacto:dano-ao-vivo")) != null' '(.labels | map(ascii_downcase) | index("impacto:dano-ao-vivo")) != null'
+must_fail dano-label-substring lib '(.labels | index("impacto:dano-ao-vivo")) != null' '(.labels | map(select(contains("dano-ao-vivo"))) | length) > 0'
+must_fail dano-label-prefix lib '(.labels | index("impacto:dano-ao-vivo")) != null' '(.labels | map(select(startswith("impacto:dano-ao-vivo"))) | length) > 0'
+must_fail dano-unreadable-reads-as-no lib 'then "unreadable"' 'then "no"'
+must_fail dano-unreadable-promotes lib 'then "unreadable"' 'then "yes"'
+must_fail dano-null-labels-reads-as-no lib 'if has("labels") | not then "no"' 'if (.labels == null) then "no"'
+must_fail dano-missing-key-is-unreadable lib 'if has("labels") | not then "no"' 'if has("labels") | not then "unreadable"'
+must_fail dano-missing-key-is-yes lib 'if has("labels") | not then "no"' 'if has("labels") | not then "yes"'
+must_fail dano-non-string-element-ignored lib ' or ((.labels | all(type == "string")) | not) then' ' then'
+must_fail dano-labels-type-unchecked lib '((.labels | type) != "array") or ' ''
+WARN_LINE='(if wo_dano_candidate and wo_dano_verdict == "unreadable" then "labels?" else empty end),'
+must_fail dano-unreadable-not-named lib "$WARN_LINE" ''
+must_fail dano-unreadable-named-without-id lib "$WARN_LINE" '(if wo_dano_candidate and wo_dano_verdict == "unreadable" then "labels" else empty end),'
+must_fail dano-unreadable-warned-for-any-bead lib "$WARN_LINE" '(if wo_dano_verdict == "unreadable" then "labels?" else empty end),'
 must_fail age-as-text lib 'def wo_age($o): wo_epoch(wo_age_src($o));' 'def wo_age($o): (wo_age_src($o) | if type == "string" then . else null end);' \
   '($e // 9999999999), (.id // "")]' '($e // "~"), (.id // "")]'
 must_fail no-warn lib '| select(length > 0)' '| select(length < 0)'

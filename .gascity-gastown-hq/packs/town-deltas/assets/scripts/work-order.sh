@@ -14,8 +14,30 @@
 # Every consumer calls THIS function. A consumer that re-implements the sort is the bug the registry
 # lint (work-order.registry.tsv, checked by work-order.selftest.sh) exists to catch.
 #
-# The sort key, ascending:  [ priority class, type class, age (epoch seconds), id ]
+# The sort key, ascending:  [ priority class, dano class, type class, age (epoch seconds), id ]
 #   priority class  0..4 -> itself. Anything else (missing, null, "2", 9, 1.5) -> 5, behind P4. WARN prio?
+#   dano class      THE one exception to "priority > type > age" (Athos, 2026-10-06, "Bug com dano ao vivo
+#                   primeiro"; the gate has applied it since ga-emgkvn, this is the same rule for every other
+#                   stage, ga-9t9acg.14). 0 for a P0 BUG that carries the label `impacto:dano-ao-vivo` (a customer
+#                   is being hurt right now), 1 for everything else. So inside P0 the order is: dano bugs, then the
+#                   features, then the rest, oldest first inside each — and P1 and below are untouched.
+#                   It promotes only when ALL hold; any doubt leaves the bead where the plain rule puts it:
+#                     * priority is exactly 0 (an invalid priority is already P-class 5, behind P4: never promoted);
+#                     * .issue_type is exactly "bug" — no case folding, and NOT the `.type` fallback the type class
+#                       uses: promoting ahead of every P0 feature is the costly direction, so it asks for the
+#                       strict reading;
+#                     * the label is exactly `impacto:dano-ao-vivo` (case and prefix do not count) in `.labels`.
+#                   THREE states of the labels, never collapsed: has it / does not have it / cannot tell.
+#                     has it        .labels is a list of strings and the label is in it            -> promotes
+#                     does not      the list does not hold it, OR the `labels` key is absent (bd OMITS the key for
+#                                   a bead with no label: measured 06/10, 22 of 162 beads, none with an empty array)
+#                     cannot tell   .labels is there but is not a list of strings (null, a string, an object, a
+#                                   list holding a non-string) -> treated as WITHOUT the label, and, on a P0 bug,
+#                                   WARN labels?
+#                   The label name is a constant in the jq below, not an env knob: a typo in an override would
+#                   switch the exception off with no signal. The label on anything that is not a P0 bug is ignored
+#                   (the gate says so in a NOTE line; a sort has no such channel, and one line per ignored bead
+#                   on every call of every stage would only teach callers to drop stderr).
 #   type class      feature|story -> 0 (WORK_ORDER_FEATURE_TYPES); any other type string -> 1;
 #                   missing / empty / not a string -> 2, behind the known types WITHIN its priority. WARN type?
 #                   The type is read from .issue_type, falling back to .type (the engine's probes read both).
@@ -48,7 +70,12 @@
 # THREE states, never collapsed into two:
 #   1. read and ordered   array in -> array out, exit 0. `[]` in -> `[]` out, exit 0.
 #   2. a field unreadable the bead STAYS in the output at the end of its class, and stderr gets one line per
-#                         such bead: `work-order WARN: <id>: prio? type? age? id?` (only the failing fields).
+#                         such bead: `work-order WARN: <id>: prio? type? age? labels? id?` (only the failing
+#                         fields; `labels?` = a P0 BUG whose labels are not a list of strings: the bead was NOT
+#                         promoted by the dano class and its position is the plain rule's. Said only for a P0 bug,
+#                         the one bead the label could move — for any other bead the answer to "is this a dano
+#                         bug?" is already no, there is nothing the caller cannot tell, and a line per malformed
+#                         bead on every call of every stage would only teach callers to drop stderr).
 #                         Never promoted to P0, never dropped. THE WARN LINES ARE THE ONLY SIGNAL: a caller must
 #                         keep stderr (`2>>"$LOG"`), never `2>/dev/null` — the city's habit for bd calls would
 #                         turn "illegible, kept at the end" into "silently misordered".
@@ -78,8 +105,8 @@
 # export stays empty, so it is refused — which is why this is `=` and not `:=`).
 : "${WORK_ORDER_FEATURE_TYPES=feature story}"
 
-# jq definitions, to be PREPENDED to a jq program. wo_prio_class / wo_type_class / wo_age / wo_key run on
-# ONE bead object; wo_sort / wo_warn / wo_run run on the ARRAY. $o is the output of `work_order_cfg`.
+# jq definitions, to be PREPENDED to a jq program. wo_prio_class / wo_type_class / wo_dano_class / wo_age /
+# wo_key run on ONE bead object; wo_sort / wo_warn / wo_run run on the ARRAY. $o is the output of `work_order_cfg`.
 WORK_ORDER_JQ_DEFS='
 def wo_epoch($s):
   if ($s | type) != "string" then null
@@ -111,13 +138,30 @@ def wo_age_src($o):
         else .created_at end
     else error("work-order: unknown age source: " + ($a | tostring)) end;
 def wo_age($o): wo_epoch(wo_age_src($o));
-def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_type_class($o), ($e // 9999999999), (.id // "")];
+# The verdict on the labels of ONE bead (ga-9t9acg.14, the same three values the gate gives in
+# gate_src_class_read_store): "yes" = the labels were read and the label is among them; "no" = they were read
+# and it is not, or the `labels` key is absent (bd omits it for a bead with none); "unreadable" = the key is
+# there but is not a list of strings. `has` and not `// []`: a null `labels` is UNREADABLE, not "no".
+def wo_dano_verdict:
+  if has("labels") | not then "no"
+  elif ((.labels | type) != "array") or ((.labels | all(type == "string")) | not) then "unreadable"
+  elif (.labels | index("impacto:dano-ao-vivo")) != null then "yes"
+  else "no" end;
+# The only beads the label can move: a P0 bug. ONE definition, read by wo_dano_class (who is promoted) AND by
+# wo_warn (whose unreadable labels are worth a line), so the two cannot disagree about who a candidate is.
+# Priority through wo_prio_class so a priority that is not 0..4 (class 5) can never be a candidate.
+def wo_dano_candidate: wo_prio_class == 0 and .issue_type == "bug";
+# 0 only for a candidate whose verdict is "yes"; 1 for everything else (an unreadable verdict is NOT a promotion).
+def wo_dano_class:
+  if wo_dano_candidate and wo_dano_verdict == "yes" then 0 else 1 end;
+def wo_key($o): (wo_age($o)) as $e | [wo_prio_class, wo_dano_class, wo_type_class($o), ($e // 9999999999), (.id // "")];
 def wo_sort($o): sort_by(wo_key($o));
 def wo_warn($o):
   [ .[] | . as $b
     | [ (if wo_prio_class == 5 then "prio?" else empty end),
         (if wo_type_class($o) == 2 then "type?" else empty end),
         (if wo_age($o) == null then "age?" else empty end),
+        (if wo_dano_candidate and wo_dano_verdict == "unreadable" then "labels?" else empty end),
         (if (.id | type) != "string" or .id == "" then "id?" else empty end) ]
     | select(length > 0)
     | "work-order WARN: " + (($b.id // "?") | tostring) + ": " + join(" ") ];
