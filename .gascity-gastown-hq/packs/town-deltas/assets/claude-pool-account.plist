@@ -19,7 +19,8 @@
 
        A run that cannot tell (network, 5xx) or cannot look (tmux down) concludes nothing about the limit and moves nothing for
        it (a key the free check finds REFUSED still fails over: it does not need the panes). Mayor and crews are not
-       touched and never pressed: they run the plain `claude` / `claude-rc` providers, which never see the pool item.
+       touched and never pressed: Mayor runs on `claude-rc` and the crews on `claude-rc-crew`, providers that never go through the
+       wrapper that points a session at the pool item (and the daemon acts only on agents that are a pool role, as a second fence).
        The daemon talks to the city's tmux server (`tmux -L gascity`): `tmux` is in /opt/homebrew/bin, on the PATH below.
 
        KILL SWITCHES (no reload needed): touch /Users/athos/gt/.gascity-gastown-hq/.gc/no-pool-account — the daemon

@@ -137,7 +137,7 @@ PANE_ID_RE = re.compile(r"%\d+")
 SOCKET_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 AGENT_RE = re.compile(r"[A-Za-z0-9._@:-]{1,80}")
 # WHICH SESSIONS MAY BE LOOKED AT AND PRESSED (Athos 05/10: Mayor's and the crews' Remote Control is never disturbed).
-# The first fence is the PROVIDER, not a name: Mayor and the crews run `claude` / `claude-rc` / `claude-rc-crew`, which never go through
+# The first fence is the PROVIDER, not a name: Mayor runs on `claude-rc` and the crews on `claude-rc-crew`, which never go through
 # claude-lowprio.sh, so the wrapper never writes a SET line for them. This list is the second fence and it fails CLOSED: a launch line is
 # acted on only if its agent is a role that runs on the claude-headless provider (city.toml / the packs), or is the wrapper's own "?" for an
 # unset GC_AGENT (evidence, never pressed). Everything else is dropped: the crews (oracle-wa-*, mila-wa, thies-wa ... share no stem with the
