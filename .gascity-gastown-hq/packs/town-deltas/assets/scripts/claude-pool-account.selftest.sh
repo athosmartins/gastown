@@ -510,6 +510,15 @@ EOF
   nf="$(grep -c 'foreign write' "$D/city/.gc/logs/claude-pool-account.log")"
   [ "${nf:-x}" = "0" ] && [ "$(item_token)" = "$TOKEN_a" ] && ok "B14i item MISSING -> recreated, no 'foreign write' line (nobody wrote anything)" || bad "B14i foreign lines=$nf item=$(item_token | cut -c1-24)"
 
+  # B14j a field the foreign blob does not have is said to be absent: 'subscriptionType=None' would read like a tier that is called None
+  seeded; "$PY3" - "$D/kc/items/$SVC" "$TOKEN_b" <<'EOF'
+import json, sys
+open(sys.argv[1], "w").write(json.dumps({"claudeAiOauth": {"accessToken": sys.argv[2], "scopes": ["user:inference"]}}).encode().hex())
+EOF
+  w0=$(writes); run_d -- run-once; fl="$(grep 'foreign write to the pool item' "$D/city/.gc/logs/claude-pool-account.log" | head -1)"
+  case "$fl" in *"refreshToken=no expiresAt=unreadable scopes=['user:inference'] subscriptionType=absent"*) [ "$(item_token)" = "$TOKEN_a" ] && [ "$(writes)" = "$((w0 + 1))" ] \
+      && ok "B14j a blob without expiry / tier -> 'expiresAt=unreadable', 'subscriptionType=absent' (no None that reads like a value), still rewritten" || bad "B14j item=$(item_token | cut -c1-24) writes $w0 -> $(writes)" ;; *) bad "B14j: $fl" ;; esac
+
   # B15 steady state is quiet: no rewrite, 'since' does not move
   seeded; s0="$(jget "$STATE" since)"; w0=$(writes); run_d -- run-once; run_d -- run-once
   [ "$(writes)" = "$w0" ] && [ "$(jget "$STATE" since)" = "$s0" ] && ok "B15 steady state: no item write, 'since' unchanged" || bad "B15 writes $w0 -> $(writes), since $s0 -> $(jget "$STATE" since)"
@@ -1168,9 +1177,13 @@ elif [ ! -r "$CALLER_LOG" ]; then
 else
   start=0   # a log that shrank was rotated: it is all new, read it whole
   [ "$CALLER_LOG_SIZE_BEFORE" != "absent" ] && [ "$after" -ge "$CALLER_LOG_SIZE_BEFORE" ] && start="$CALLER_LOG_SIZE_BEFORE"
-  leaked="$(tail -c +"$((start + 1))" "$CALLER_LOG" | grep -E '[A-Za-z0-9]@t(\.test)?([^A-Za-z0-9.]|$)')"
-  [ -z "$leaked" ] && ok "D1 no fixture line reached the log of the city this run was launched from" \
-    || bad "D1 the selftest wrote into $CALLER_LOG: $(printf '%s' "$leaked" | head -n 2 | cut -c1-120 | tr '\n' '|')"
+  newlog="$(tail -c +"$((start + 1))" "$CALLER_LOG")"; tail_rc=$?
+  leaked="$(printf '%s\n' "$newlog" | grep -E '[A-Za-z0-9]@t(\.test)?([^A-Za-z0-9.]|$)')"; grep_rc=$?   # grep: 0 = a line, 1 = none, 2+ = could not scan
+  if [ "$tail_rc" -ne 0 ] || [ "$grep_rc" -gt 1 ]; then
+    bad "D1 nao-medido: the launching city's log could not be scanned (tail rc=$tail_rc, grep rc=$grep_rc) - $CALLER_LOG"
+  elif [ -z "$leaked" ]; then ok "D1 no fixture line reached the log of the city this run was launched from"
+  else bad "D1 the selftest wrote into $CALLER_LOG: $(printf '%s' "$leaked" | head -n 2 | cut -c1-120 | tr '\n' '|')"
+  fi
 fi
 
 echo

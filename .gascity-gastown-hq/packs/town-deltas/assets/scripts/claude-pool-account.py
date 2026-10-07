@@ -382,7 +382,7 @@ def describe_foreign_item(user: str) -> str:
                          f"refreshToken={'yes' if oauth.get('refreshToken') else 'no'} "
                          f"expiresAt={_iso(exp) if exp is not None else 'unreadable'} "
                          f"scopes={sorted(str(s) for s in scopes) if isinstance(scopes, list) else 'unreadable'} "
-                         f"subscriptionType={str(oauth.get('subscriptionType'))[:24]}")
+                         f"subscriptionType={str(oauth['subscriptionType'])[:24] if 'subscriptionType' in oauth else 'absent'}")
         else:
             parts.append("blob shape unreadable")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):

@@ -109,7 +109,8 @@ How to read it: the daemon's own blob has **no** refresh token, scope `['user:in
 login or refresh leaves a refresh token, more scopes and an expiry hours away. `item modified` is the Keychain's own
 mtime (UTC), and the processes are the `claude` ones younger than 15 minutes (pid / age / tty only — never argv). Key
 NAMES and those few scalars are all that is logged: no token, no refresh token, no value of any other field. Each part
-that could not be read says `unreadable`; it never says `none` for something it could not tell. A missing item gets no
+that could not be read says `unreadable`; it never says `none` for something it could not tell, and a field the blob simply lacks
+says `absent`. A missing item gets no
 such line (nobody wrote anything). The daemon still rewrites in every case: one decision file is what the services read.
 
 ## Known limits
