@@ -95,8 +95,8 @@
 # ga-9t9acg.5 + ga-9t9acg.6 (2026-10-07): a worker's ORDER moves out of the probe's jq into the shared library
 # (scripts/work-order.sh: priority > feature-before-the-rest > oldest first, age = `reclaim`), so the cases
 # 1-6b above are no longer run on an extracted jq program for a worker that has moved: the ps-worker (.6)
-# and the wa-worker (.5; until that slice lands the wa-worker keeps run_case, and run_case has no caller
-# once both are in). They are run END TO END
+# and the wa-worker (.5) — both are in, so run_case has no caller (kept for a worker that has not
+# migrated). They are run END TO END
 # (run_case_lib): the whole Step 1b2 block is extracted from the tracked prompt and executed against a fake
 # `bd`, together with the cases the new rule adds — a newer P0 feature beats an older P0 bug; a bead reclaimed
 # twice sinks behind a newer feature of its class (and does NOT sink without the label); the oldest P0 feature
@@ -337,7 +337,7 @@ run_case() {
 
 # run_step1b3_and_structure_cases <label> <template> — the Step 1b3 post-filter cases (7-9) and the file-order
 # check. Split out of run_case by ga-9t9acg.5 UNCHANGED, so a worker whose ORDER is tested end to end
-# (run_case_lib below: the ps-worker, and the wa-worker once ga-9t9acg.5 lands) still gets exactly these two checks;
+# (run_case_lib below: the ps-worker and the wa-worker) still gets exactly these two checks;
 # a worker still on run_case gets them through it.
 run_step1b3_and_structure_cases() {
   local label="$1" tpl="$2"
@@ -584,8 +584,7 @@ open(dst, "w", encoding="utf-8").write(text.replace(old, new))
 PY
 }
 
-# run_case_lib <label> <template> [prefix] — a worker's probe, end to end (the ps-worker here; the wa-worker when
-# ga-9t9acg.5 lands). <prefix> is the shell-variable prefix the template's Step 1b2 block uses (WA_ for wa-worker, PS_ for
+# run_case_lib <label> <template> [prefix] — a worker's probe, end to end (the ps-worker and the wa-worker). <prefix> is the shell-variable prefix the template's Step 1b2 block uses (WA_ for wa-worker, PS_ for
 # ps-worker; default WA): only the two mutants that rewrite the block's own variable names need it.
 run_case_lib() {
   local label="$1" tpl="$2" pfx="${3:-WA}" name blk
@@ -634,7 +633,7 @@ trap cleanup_work EXIT
 mkdir -p "$WORK/bin"
 make_fake_bd "$WORK/bin"
 
-run_case "wa-worker Step 1b2" "$CITY_ROOT/agents/wa-worker/prompt.template.md"   # -> run_case_lib ... WA when ga-9t9acg.5 lands
+run_case_lib "wa-worker Step 1b2" "$CITY_ROOT/agents/wa-worker/prompt.template.md" WA
 run_case_lib "ps-worker Step 1b2" "$CITY_ROOT/agents/ps-worker/prompt.template.md" PS
 
 echo ""

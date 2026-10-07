@@ -68,11 +68,11 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # doctrine: "PRIORITY DOMINATES; type is only a tiebreak"). NOT a plain --sort
 # priority swap either: the engine's own routedReadyTierCommand deliberately
 # sorts oldest+updated_at instead of priority (ga-w4k2z) so a repeatedly-reclaimed
-# bead's static created_at can't let it camp position 0 forever. This line does
-# both: --sort priority bounds the fetched window by priority, then the jq tail's
-# sort_by([priority, updated_at-or-created_at]) re-sorts survivors with priority
-# dominant and LRU as the same-priority tiebreak — so a poisoned bead still cedes
-# to siblings, and a fresh P0 is never buried behind an old P2.
+# bead's static created_at can't let it camp position 0 forever. The probe has to
+# do both: priority dominant, and a reclaimed (poisoned) bead still ceding to its
+# siblings — so a fresh P0 is never buried behind an old P2. (Until ga-9t9acg.5
+# this line did it with `--sort priority --limit=20` plus a sort_by([priority, age])
+# in its jq tail; the order is now computed by the shared library, see ORDER below.)
 # (residual, not fixed: the engine's own routedReadyTierCommand still has no
 # priority-awareness at all — an engine-side change, out of pack-level reach,
 # flagged in ga-x80j1, deliberately left to the Step 1b3 fallback below.)
@@ -92,6 +92,37 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # first-ever dispatch) -> sort by created_at (immune to the dispatcher's own
 # routing writes); one+ (proven poisoned) -> sort by updated_at as before,
 # preserving ga-w4k2z's anti-poison property for the beads it actually protects.
+# (Since ga-9t9acg.5 this is the library's `reclaim` age, see ORDER below.)
+#
+# ORDER (ga-9t9acg.5, programme ga-9t9acg; Athos 2026-10-06: "prioridade > tipo
+# (feature primeiro) > idade", on every stage of the board): the candidates are
+# ordered by the ONE shared library packs/town-deltas/assets/scripts/work-order.sh
+# (work_order_sort --age reclaim, sourced from ${GC_CITY_PATH:-$GC_CITY}) — this
+# file carries no sort of its own for it. Priority first (P0 first); inside a
+# priority, feature (and story) before every other type; inside that, OLDEST first.
+#   * The fetch is `--limit 0`, the WHOLE filtered pool, never a window. With
+#     `--sort priority --limit=20` a P0 feature that was the 25th bead of the pool
+#     was cut off before the final sort ever saw it (ga-g7yt: a window plus a
+#     post-filter hides real work). The query is already narrowed to this pool.
+#   * Age is `reclaim`: created_at, EXCEPT a bead carrying pilot:reclaim-count:<N>
+#     with N >= 1, which is aged by updated_at. That is the anti-starvation of
+#     ga-w4k2z/ga-oc6knj above, INHERITED on purpose — it is NOT part of the Athos
+#     rule. A reclaimed bead sinks inside its class (priority and type still
+#     dominate it); a bead the Pilot has only just dispatched for the first time
+#     does not. Ages are compared as epoch seconds, not as ISO strings (the old
+#     compare put "…:05.123Z" and "…+00:00" in the wrong place).
+#   * Three states, never "empty". Ordered; or a field the library cannot read
+#     (the bead is KEPT, at the end of its class, with a `work-order WARN:` line on
+#     stderr — that is why this sort's stderr is NOT redirected: those lines are
+#     the library's only signal); or "cannot tell". If the library is missing or
+#     cannot tell (empty output, exit != 0) the probe prints a WARN and falls back
+#     to the order it had BEFORE ga-9t9acg.5 — priority, then age by reclaim, no
+#     feature tier — on the same already-filtered pool. It never answers [] for "I
+#     could not order it": [] means the pool has nothing, and a worker that reads
+#     it drains.
+# The filters and vetoes are untouched (scripts/pool-probe-vetoes.sh mirrors them).
+# Regression coverage: pool-probe-priority-sort.selftest.sh runs the block below
+# end to end with a fake `bd`, including the missing-library fallback.
 #
 # ga-q65d8: also excludes delivery:pending-restart (exact) — the canonical hold
 # for "gate passed, code done, but a long-lived daemon may still run old code
@@ -111,23 +142,40 @@ You are disposable. You do not carry state between runs. When your bead is done,
 # Regression coverage: pool-probe-next-action-family.selftest.sh (+ delivery-
 # pending-restart.selftest.sh, text-veto-family.selftest.sh — one file per rule
 # family above unless noted otherwise).
+WA_CAND="$(
+bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --limit 0 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
+)"
 # ga-kqa08j (Athos 07/10): GATE FOCUS MODE. When the gate is the bottleneck
-# (gate-focus-mode.sh says active=1), this probe keeps ONLY fixes of beads the gate
-# already rejected (gate:needs-fix or gate:fix-attempt:N) — a new build waits until
-# the gate queue drains. If it returns [] in focus mode, there is no fix for you:
-# drain normally, do NOT go looking for a new bead elsewhere (Step 1b3 included).
+# (gate-focus-mode.sh says active=1), keep ONLY fixes of beads the gate already rejected
+# (gate:needs-fix or gate:fix-attempt:N) — a new build waits until the gate queue drains.
+# If this leaves [] in focus mode there is no fix for you: drain, do NOT look for a new
+# bead elsewhere (Step 1b3 included).
 # (Step 1b3 also filters to fixes, but its engine query returns at most ONE bead, so
-# it is a safety net that can miss fixes — Step 1b2 is the one that sees the whole pool.)
-# Unknown/off focus state -> the filter is inert (normal behaviour).
-# In focus mode the substitution inside the bd line adds --limit=0 (the later flag wins: the
-# whole pool, so a fix ranked below the top-20 is still seen) and --label-regex keeping only
-# gate:needs-fix / gate:fix-attempt:N. It is computed ON the line itself, so running the
-# line alone is enough (env vars do not survive between tool calls).
-bd ready --metadata-field "gc.routed_to=wa-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --sort priority --limit=20 $(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && [ "$(gate_focus_active)" = "1" ] && printf '%s\n' --limit="0" --label-regex '^(gate:(needs-fix|fix-attempt:.+)|origem:auto-healer-notify|impacto:dano-ao-vivo)$') | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)] | sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]'
+# it is a safety net that can miss fixes — this Step 1b2 sees the whole pool.) Unknown/off focus state -> no filtering.
+GATE_FOCUS_PROBE="$(. "${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/gate-focus-lib.sh" 2>/dev/null && gate_focus_active)"
+if [ "$GATE_FOCUS_PROBE" = "1" ] && [ -n "$WA_CAND" ]; then
+  # A filter that FAILED is "could not tell", never "pool empty": leave WA_CAND blank so the
+  # WARN path below says so (and Step 1b3 applies the same focus filter).
+  WA_CAND="$(printf '%s' "$WA_CAND" | jq -c 'map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo")))' 2>/dev/null)" || WA_CAND=""
+fi
+WA_LIB="${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/work-order.sh"
+WA_PICK=""
+if [ -z "$WA_CAND" ]; then
+  echo "WARN Step 1b2: the pool query printed nothing (bd or jq failed - see stderr above). That is NOT 'queue empty': do not drain on it, fall through to Step 1b3." >&2
+else
+  WA_SORTED="$( . "$WA_LIB" && printf '%s' "$WA_CAND" | work_order_sort --age reclaim )" && [ -n "$WA_SORTED" ] && WA_PICK="$(printf '%s' "$WA_SORTED" | jq -c '.[:1]')"
+  if [ -z "$WA_PICK" ]; then
+    echo "WARN Step 1b2: $WA_LIB is missing or could not order the pool (see the work-order lines above) - falling back to the order this probe had before ga-9t9acg.5 (priority, then age by reclaim; NO feature tier) on the same filtered pool. A missing library is a deploy fault." >&2
+    WA_PICK="$(printf '%s' "$WA_CAND" | jq -c 'sort_by([.priority, (if (((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | length) > 0 then (.updated_at // "") else (.created_at // .updated_at // "") end)]) | .[:1]')"
+  fi
+fi
+printf '%s\n' "$WA_PICK"
 # If it returns a bead (output is NOT []), THAT BEAD IS YOURS. Claim it FIRST:
 #     gc bd update <id> --claim
 # verify the claim set assignee to your session, then go to the Build Protocol and build it.
-# Do NOT drain while this probe returns a bead.
+# Do NOT drain while this probe returns a bead. Only a printed [] means the pool is empty;
+# a blank line with a WARN above it means the query itself failed (not "no work").
+# `work-order WARN:` / `WARN Step 1b2:` lines are information, not a stop: the bead printed is still yours.
 
 # Step 1b3 (fallback ONLY — ga-0pg2o, 2026-09-10): Step 1b2 above already covers
 # every session origin; only consult this if it returned []. Original Go-rendered
