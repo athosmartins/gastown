@@ -50,7 +50,7 @@ unset GATE_E11_CAP_LINES
 # all — `command not found` also prints nothing. One assertion per function, so the old guard fails loudly here.
 echo "── 0. the E11 functions exist ──"
 E11_FNS="gate_e11_switch_state gate_e11_enabled gate_e11_arm_for_bead gate_e11_path_is_production gate_e11_count_production_lines
-gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict"
+gate_e11_cap_lines gate_e11_cap_state gate_e11_exempt_label gate_e11_exempt_reason gate_e11_exempt_state gate_e11_exempt_merge gate_e11_verdict gate_e11_force_all"
 E11_MISSING=0
 for f in $E11_FNS; do
   if declare -F "$f" >/dev/null 2>&1; then ok "function $f is defined"; else bad "function $f is NOT defined in $GUARD"; E11_MISSING=1; fi
@@ -96,6 +96,18 @@ eq "flag file present + env 1: ON" "$(GATE_E11_ENABLED=1 GC_CITY="$TMPD/city" ga
 eq "state: file decides, present = on" "$(GATE_E11_ENABLED= GC_CITY="$TMPD/city" gate_e11_switch_state)" "on"
 eq "state: env 1 = on" "$(GATE_E11_ENABLED=1 GC_CITY="$TMPD/city" gate_e11_switch_state)" "on"
 eq "state: env 0 = off (a decision, nothing to say)" "$(GATE_E11_ENABLED=0 GC_CITY="$TMPD/city" gate_e11_switch_state)" "off"
+
+echo "── 1b. the 100% switch (Athos 07/10: 'Ligar hoje, 100%') ──"
+rm -f "$TMPD/city/.gc/gate-e11-diff-cap.all"
+eq "100%: no env, no .all file -> 0 (arms stay A/B)" "$(GATE_E11_ALL= GC_CITY="$TMPD/city" gate_e11_force_all)" "0"
+eq "100%: env GATE_E11_ALL=1 -> 1" "$(GATE_E11_ALL=1 GC_CITY="$TMPD/city" gate_e11_force_all)" "1"
+eq "100%: env GATE_E11_ALL=0 beats a present file" "$(touch "$TMPD/city/.gc/gate-e11-diff-cap.all"; GATE_E11_ALL=0 GC_CITY="$TMPD/city" gate_e11_force_all)" "0"
+eq "100%: .all file present, env empty -> 1" "$(GATE_E11_ALL= GC_CITY="$TMPD/city" gate_e11_force_all)" "1"
+eq "100%: junk env (GATE_E11_ALL=yes) -> 0, never 'on by accident'" "$(GATE_E11_ALL=yes GC_CITY="$TMPD/city" gate_e11_force_all)" "0"
+eq "100%: no GC_CITY and no env -> 0" "$(unset GC_CITY; GATE_E11_ALL= gate_e11_force_all)" "0"
+rm -f "$TMPD/city/.gc/gate-e11-diff-cap.all"
+# the live block honours it: the exact arm-promotion line must exist between the sentinels
+if sed -n '/# SELFTEST-EXTRACT e11-diff-cap: BEGIN/,/# SELFTEST-EXTRACT e11-diff-cap: END/p' "$GUARD" | grep -qF 'if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; fi'; then ok "live block promotes arm A to B under the 100% switch (and leaves '?' alone)"; else bad "live block does not consult gate_e11_force_all"; fi
 eq "state: env 'off' = env-invalido (OFF, and it SAYS why)" "$(GATE_E11_ENABLED=off GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 eq "state: env ' ' (a single space) = env-invalido" "$(GATE_E11_ENABLED=" " GC_CITY="$TMPD/city" gate_e11_switch_state)" "env-invalido"
 rm -f "$FLAG"

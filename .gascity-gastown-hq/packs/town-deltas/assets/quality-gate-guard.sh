@@ -4286,6 +4286,16 @@ gate_e11_enabled() {
 #   Empty id    -> prints nothing, returns 2: a bead we cannot identify has no arm.
 #   No sha tool -> prints nothing, returns 3: same. "No arm" must never read as A — the caller then neither refuses nor
 #                  counts the submission in either arm.
+# gate_e11_force_all — prints 1 iff the operator asked for the cap on EVERY bead (Athos, 07/10/2026,
+# diagnóstico do gate: "Ligar hoje, 100%"): env GATE_E11_ALL=1 (0 = off; wins, used by the selftests) or the
+# flag file $GC_CITY/.gc/gate-e11-diff-cap.all. Only consulted when E11 itself is ON; an arm-A bead is then
+# treated as arm B (the log still shows arm=B, so the record says what was applied). Anything else -> 0.
+gate_e11_force_all() {
+  case "${GATE_E11_ALL:-}" in 1) printf '1'; return 0 ;; 0) printf '0'; return 0 ;; '') ;; *) printf '0'; return 0 ;; esac   # junk env = off, never on
+  local _f="${GATE_E11_ALL_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.all}"
+  if [ -n "${GC_CITY:-}${GATE_E11_ALL_FLAG_FILE:-}" ] && [ -r "$_f" ]; then printf '1'; else printf '0'; fi
+}
+
 gate_e11_arm_for_bead() {
   local bead="${1:-}" tool digest="" first
   [ -z "$bead" ] && return 2
@@ -7231,6 +7241,8 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_ARM_RC=0
   _E11_ARM=$(gate_e11_arm_for_bead "$BEAD_ID") || _E11_ARM_RC=$?
   case "$_E11_ARM" in A|B) ;; *) _E11_ARM="?" ;; esac
+  # 100% mode (Athos 07/10): an identified arm-A bead gets the cap too; an unidentifiable bead ("?") stays out.
+  if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; fi
   _E11_CAP=$(gate_e11_cap_lines)
   _E11_CAP_ST=$(gate_e11_cap_state)
   _E11_COUNT="-"

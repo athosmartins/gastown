@@ -212,11 +212,16 @@ actually verify in the diff? This refutation pass asks only one question —
 does the defect exist in the code? — and is never a filter on how severe or
 how certain the issue feels.
 
-WHAT BLOCKS (verdict FAIL): any defect you can ground in specific changed
-lines that could cause incorrect behavior, a failing test, data loss, or a
-misleading result/log/comment.
-WHAT DOES NOT BLOCK: pure style or naming preferences with no behavioral
-effect — report these too, just do not fail the verdict on them alone.
+WHAT BLOCKS (verdict FAIL): a defect you can ground in specific changed
+lines that changes BEHAVIOR: incorrect output or state, a failing test, data
+loss, a crash, a security hole, or an error swallowed so that a caller or a
+user cannot tell failure from success.
+WHAT DOES NOT BLOCK (report it under "Non-blocking findings", at its real
+severity — never drop it): a comment, log line or docstring that misdescribes
+what the code does; an edge case with no observable effect for a user or a
+caller; style or naming. The next change on that file fixes these; a re-review
+round does not (decision of the owner, 2026-10-07: approval must stop failing
+on form while behavior is correct).
 LOW CONFIDENCE: if you are not sure whether something is really a defect,
 RE-READ the surrounding code until you can decide either way — never silence
 or drop a finding just because you are unsure.

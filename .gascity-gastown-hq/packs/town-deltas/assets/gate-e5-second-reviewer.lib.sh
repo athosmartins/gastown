@@ -64,6 +64,14 @@ gate_e5_enabled() {
     1) printf '1'; return 0 ;;
     0) printf '0'; return 0 ;;
   esac
+  # ga-kqa08j / Athos 07/10/2026 ("Desligar no foco"): while GATE FOCUS MODE is ON, E5 is OFF — the 2nd
+  # reviewer takes 2 of the 3 review slots and costs ~23 pts of first-attempt approval (A/B measured
+  # 02-07/10) exactly when the queue is the bottleneck. Comes back on its own when focus ends.
+  # unknown/off focus state -> no suspension. The env override above still wins (selftests).
+  local _gfl; _gfl="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/gate-focus-lib.sh"
+  if [ -r "$_gfl" ] && . "$_gfl" 2>/dev/null && [ "$(gate_focus_active)" = "1" ]; then
+    printf '0'; return 0
+  fi
   local _f="${GATE_E5_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e5-second-reviewer.on}"
   if [ -n "${GC_CITY:-}${GATE_E5_FLAG_FILE:-}" ] && [ -r "$_f" ]; then
     printf '1'

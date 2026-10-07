@@ -121,10 +121,10 @@ hasnot "$TASKLIB" 'REFUTATION PASS — MANDATORY BEFORE ANY FAIL' \
 echo "── 4. CONCRETE BLOCKING BAR IS IN THE SOURCE ──"
 has "$TASKLIB" 'WHAT BLOCKS \(verdict FAIL\)' \
   "concrete WHAT BLOCKS bar is present"
-has "$TASKLIB" 'incorrect behavior, a failing test, data loss, or a' \
+has "$TASKLIB" 'incorrect output or state, a failing test, data' \
   "blocking bar names incorrect behavior / failing test / data loss"
-has "$TASKLIB" 'misleading result/log/comment' \
-  "blocking bar names misleading result/log/comment"
+has "$TASKLIB" 'misdescribes' \
+  "blocking bar routes a misdescribing comment/log/docstring to Non-blocking findings (2026-10-07 decision)"
 has "$TASKLIB" 'WHAT DOES NOT BLOCK' \
   "explicit non-blocking bar (style/naming) is present"
 
@@ -204,6 +204,16 @@ if [ -f "$_WORK/render.sh" ]; then
       bad "rendered prompt still tells the reviewer to DROP findings"
     else
       ok "rendered prompt no longer tells the reviewer to DROP findings"
+    fi
+    # 2026-10-07 (owner's decision after the gate diagnosis): behavior defects block; a comment/log/docstring that
+    # misdescribes the code, or an edge case with no observable effect, is a NON-blocking finding — reported, never dropped.
+    r_has 'changes BEHAVIOR' "rendered prompt blocks on BEHAVIOR defects"
+    r_has 'misdescribes' "rendered prompt routes misdescribing comments/logs to Non-blocking findings"
+    r_has 'no observable effect' "rendered prompt routes no-effect edge cases to Non-blocking findings"
+    if grep -qF 'misleading result/log/comment' <<<"$_RENDERED"; then
+      bad "rendered prompt still lists a misleading log/comment as BLOCKING"
+    else
+      ok "rendered prompt no longer blocks on a misleading log/comment alone"
     fi
   fi
 fi
