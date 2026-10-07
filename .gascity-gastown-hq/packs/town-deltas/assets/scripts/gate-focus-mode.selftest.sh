@@ -30,7 +30,7 @@ field() { sed -n "s/^$1=//p" "$GATE_FOCUS_STATE_FILE" 2>/dev/null | head -n 1; }
 notes() { [ -f "$W/notified" ] && wc -l <"$W/notified" | tr -d ' ' || echo 0; }
 
 # T1 decide() table — the hysteresis band 8..15 keeps the previous mode.
-( GATE_FOCUS_LIB=1 source "$MODE"
+( GATE_FOCUS_LIB_MODE=1 source "$MODE"
   r=""; for c in "0 15:0" "0 16:1" "1 15:1" "1 8:1" "1 7:0" "0 7:0" "0 100:1" "1 0:0"; do
     p="${c%%:*}"; want="${c##*:}"; got="$(decide ${p% *} ${p#* })"
     [ "$got" = "$want" ] || r="$r [$p want $want got $got]"

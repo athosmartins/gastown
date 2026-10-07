@@ -148,5 +148,5 @@ main() {
   write_state "$next" "$since" "$depth" "$now" "${escalated:-0}"
 }
 
-# Library mode for the selftest: `GATE_FOCUS_LIB=1 source gate-focus-mode.sh`.
-[ "${GATE_FOCUS_LIB:-0}" = "1" ] || main "$@"
+# Library mode for the selftest: `GATE_FOCUS_LIB_MODE=1 source gate-focus-mode.sh`.
+[ "${GATE_FOCUS_LIB_MODE:-0}" = "1" ] || main "$@"

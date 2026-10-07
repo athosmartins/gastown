@@ -774,7 +774,7 @@ def run_cycle(pool_caps, state, stuck_alerted):
         elif action == "stuck_alert":
             # Rate-limit STUCK alerts to avoid ntfy spam
             last_stuck = stuck_alerted.get(pool, 0)
-            if now - last_stuck >= STUCK_REALERT_SEC and _gate_focus_active(now):
+            if now - last_stuck >= STUCK_REALERT_SEC and active_count >= max_active and _gate_focus_active(now):
                 # ga-kqa08j: the cap is low on purpose while the gate drains — log, no push.
                 print(f"[POOL-AUTOSCALE] [CAPPED-BY-GATE-FOCUS] pool={pool} demand={demand} "
                       f"active={active_count}/{max_active} — gate focus mode holds the dog cap low on purpose; "

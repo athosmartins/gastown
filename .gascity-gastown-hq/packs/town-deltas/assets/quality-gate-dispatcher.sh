@@ -580,7 +580,7 @@ case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
 # timeout kept counting — a run that times out comes back as gate:needs-fix with
 # nobody having evaluated the code. Unreadable/absent cap -> keep the env value and
 # say so (never invent a cap).
-GATE_ENGINE_REVIEWER_CAP="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$GC_CITY/agents/gate-reviewer/agent.toml" 2>/dev/null | head -n 1)"
+GATE_ENGINE_REVIEWER_CAP="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$GC_CITY/agents/gate-reviewer/agent.toml" 2>/dev/null | head -n 1 || true)"  # set -e: a missing file must reach the UNREADABLE branch, not abort the gate
 GATE_ENGINE_CAP_NOTE=""
 case "$GATE_ENGINE_REVIEWER_CAP" in
   ''|*[!0-9]*) GATE_ENGINE_CAP_NOTE="engine reviewer cap UNREADABLE ($GC_CITY/agents/gate-reviewer/agent.toml) — GATE_MAX_REVIEWERS stays $GATE_MAX_REVIEWERS (ga-kqa08j)" ;;

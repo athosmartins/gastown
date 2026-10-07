@@ -230,7 +230,7 @@ apply_profile() { # normal|throttled
     # (the gate re-routes rejected beads to dogs, so those are the fixers). UNKNOWN ->
     # leave the cap exactly as it is this pass: an unreadable signal must never flip the
     # cap 2->6->2 (each flip is a reload).
-    local _gf_state=0
+    local _gf_state=0 _gf_profile_dog=""
     if [ -r "$GATE_FOCUS_LIB" ] && . "$GATE_FOCUS_LIB" 2>/dev/null; then
         _gf_state="$(gate_focus_active)"
     else
@@ -242,8 +242,8 @@ apply_profile() { # normal|throttled
                log "gate focus mode ON — dog cap target clamped to $dog_target (ga-kqa08j)"
            fi ;;
         0) : ;;
-        *) dog_target="__hold__"
-           log "gate focus state UNKNOWN — dog cap left unchanged this pass (ga-kqa08j)" ;;
+        *) _gf_profile_dog="$dog_target"; dog_target="__hold__"
+           log "gate focus state UNKNOWN — dog cap may only go DOWN this pass (ga-kqa08j)" ;;
     esac
 
     # Read every target explicitly in THIS shell (not inside a captured
@@ -273,7 +273,12 @@ apply_profile() { # normal|throttled
         log "ERROR: could not read interval from $ORDER_TRACKING_TOML (anchor not found/unreadable) — skipping this target this pass"
     fi
 
-    [ "$dog_target" = "__hold__" ] && dog_target="$cur_dog"
+    # UNKNOWN focus: never RAISE (2->6 flips on a stale signal), but the throttled
+    # profile can still LOWER the cap — that brake must keep working under load.
+    if [ "$dog_target" = "__hold__" ]; then
+        dog_target="$cur_dog"
+        if [ -n "$cur_dog" ] && [ "${_gf_profile_dog:-$cur_dog}" -lt "$cur_dog" ] 2>/dev/null; then dog_target="$_gf_profile_dog"; fi
+    fi
     log "profile=$profile current(dog_max=$cur_dog oracle_min=$cur_oracle beads_health=$cur_bh gate_sweep=$cur_gs order_tracking=$cur_ots) target(dog_max=$dog_target oracle_min=$oracle_target beads_health=$bh_target gate_sweep=$gs_target order_tracking=$ots_target)"
 
     # Each write is gated on a SUCCESSFUL read (never on an unreadable one

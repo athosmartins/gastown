@@ -175,6 +175,9 @@ GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "throttled" >/dev/null 2>&1
 eq "focus ON + throttled profile -> the lower throttled cap wins" "$(get_dog_max)" "1"
 GATE_FOCUS_ACTIVE_OVERRIDE=unknown apply_profile "normal" >/dev/null 2>&1
 eq "focus UNKNOWN -> dog cap left exactly as it was (no flip, no reload)" "$(get_dog_max)" "1"
+GATE_FOCUS_ACTIVE_OVERRIDE=1 apply_profile "normal" >/dev/null 2>&1
+GATE_FOCUS_ACTIVE_OVERRIDE=unknown apply_profile "throttled" >/dev/null 2>&1
+eq "focus UNKNOWN + throttled profile -> the throttle can still LOWER the cap (2 -> 1)" "$(get_dog_max)" "1"
 GATE_FOCUS_ACTIVE_OVERRIDE=0 apply_profile "normal" >/dev/null 2>&1
 eq "focus OFF -> back to the committed normal cap" "$(get_dog_max)" "$COMMITTED_DOG_MAX"
 
