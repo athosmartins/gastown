@@ -1,0 +1,89 @@
+=== OLD: 20/104 checks pass
+FAIL order/pool tier 1 (work query)/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/pool tier 1 (work query)/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/pool tier 1 (work query)/touched but never reclaimed keeps its place  head=['p1-bug-newer']
+FAIL order/pool tier 1 (routed pool query)/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/pool tier 1 (routed pool query)/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/pool tier 1 (routed pool query)/touched but never reclaimed keeps its place  head=['p1-bug-newer']
+FAIL order/pool tier 2 (run_target migration)/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/pool tier 2 (run_target migration)/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/pool tier 2 (run_target migration)/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/pool tier 3 (ephemeral wisps)/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/pool tier 3 (ephemeral wisps)/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/pool tier 3 (ephemeral wisps)/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/assigned in-progress/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/assigned in-progress/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/assigned in-progress/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/assigned ready/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/assigned ready/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/assigned ready/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/work query -> assigned in-progress/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/work query -> assigned in-progress/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/work query -> assigned in-progress/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/work query -> assigned ready/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/work query -> assigned ready/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/work query -> assigned ready/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/ephemeral assigned in-progress/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/ephemeral assigned in-progress/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/ephemeral assigned in-progress/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL order/ephemeral assigned ready/P0 feature newer than P0 bug  head=['p0-bug-older']
+FAIL order/ephemeral assigned ready/25 beads, P0 feature last by age  head=['p2-bug-00']
+FAIL order/ephemeral assigned ready/reclaimed twice goes behind its untouched peer  head=['p1-bug-reclaimed']
+FAIL whole-population/pool tier 1 (work query)  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20', 'ready --assignee=worker-bead --json --limit=20']
+FAIL whole-population/pool tier 1 (routed pool query)  windowed calls=['ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --exclude-label delivery:partial --exclude-label scope:needs-review --exclude-label exec:manual --exclude-label needs-human-decision --exclude-label auto-refino:refining --exclude-label auto-refino:escalated --exclude-label refino:info-gap --exclude-label refino:policy-gap --exclude-label story:unrefined --exclude-label story:refinement-in-progress --exclude-label story:refino-review --exclude-label story:refino-escalado --exclude-label story:needs-device --exclude-label on-device --exclude-label phone-proxy --exclude-label gate:queued --exclude-label gate:reviewing --json --sort oldest --limit=20']
+FAIL whole-population/pool tier 2 (run_target migration)  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20', 'ready --assignee=worker-bead --json --limit=20']
+FAIL whole-population/pool tier 3 (ephemeral wisps)  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20', 'ready --assignee=worker-bead --json --limit=20']
+FAIL whole-population/assigned in-progress  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20']
+FAIL whole-population/assigned ready  windowed calls=['ready --assignee=worker-bead --json --limit=20']
+FAIL whole-population/work query -> assigned in-progress  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20']
+FAIL whole-population/work query -> assigned ready  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20', 'ready --assignee=worker-bead --json --limit=20']
+FAIL whole-population/ephemeral assigned in-progress  windowed calls=['list --status in_progress --assignee=worker-bead --json --limit=20']
+FAIL whole-population/ephemeral assigned ready  windowed calls=['ready --assignee=worker-bead --json --limit=20']
+FAIL absent/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL absent/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL absent/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL absent/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL absent/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL absent/assigned ready  head=['p0-bug-older'] warn=False
+FAIL absent/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL absent/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL absent/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL absent/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit 2]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[syntax error]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/pool tier 1 (work query)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/pool tier 1 (routed pool query)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/pool tier 2 (run_target migration)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/pool tier 3 (ephemeral wisps)  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/work query -> assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/work query -> assigned ready  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/ephemeral assigned in-progress  head=['p0-bug-older'] warn=False
+FAIL erroring[exit on source]/ephemeral assigned ready  head=['p0-bug-older'] warn=False
+FAIL lookup/GC_CITY_PATH  head=['p0-bug-older'] err=
+FAIL lookup/GC_CITY  head=['p0-bug-older'] err=
+FAIL lookup/WORK_ORDER_LIB wins, no cascade  head=['p0-bug-older'] err=
+FAIL lookup/nothing set  head=['p0-bug-older'] err=
+=== NEW: 115/118 checks pass
+FAIL mutant/age = updated_at only/pool tier 1 (work query)  control=True changed=True mutantStillHolds=True
+FAIL mutant/age = updated_at only/assigned in-progress  control=True changed=True mutantStillHolds=True
+FAIL mutant/age = updated_at only/ephemeral assigned ready  control=True changed=True mutantStillHolds=True

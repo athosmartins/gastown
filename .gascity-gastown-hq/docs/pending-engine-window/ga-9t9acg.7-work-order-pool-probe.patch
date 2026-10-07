@@ -1,0 +1,1194 @@
+# ga-9t9acg.7 (dog gastown.dog-6, 2026-10-07): the dog pool probe and the assigned-work queries pick by LRU / bd's own order, not by the Ordem unica.
+# Base: consolidated/engine-window-20260926 @ ae3833456 (NOT origin/main, which is 17+ days behind live -- Mayor's 2026-09-21 ruling).
+#   Touches internal/config/config.go, internal/config/config_test.go, cmd/gc/cmd_hook_test.go and adds internal/config/work_order_pick_test.go.
+#   No overlap with the pending ga-wtzrho / ga-0y849e / ga-1g2if1 patches; ga-473mkh and ga-ljoz23 are already in this base.
+# WHAT IT DOES: routed tier 1 (pool probe), tier 2 (gc.run_target migration), tier 3 (ephemeral) and the four assigned leaf queries
+#   (in_progress / ready, durable / ephemeral) now hand their survivors to packs/town-deltas/assets/scripts/work-order.sh
+#   (ga-9t9acg.1, gate:passed) via `work_order_sort --age reclaim`: priority > type (feature first) > age, with the reclaim
+#   anti-starvation clock. Before: tier 1 was `sort_by(.updated_at // .created_at)` over a 20-bead window, the rest took bd's order.
+#   - Fetch is `--limit 0` everywhere (filter-then-slice, ga-g7yt): never `--limit=N` before ordering.
+#   - The lib runs in a CHILD `bash -c '. "$1" && work_order_sort --age reclaim'`, never sourced into the query's sh: a POSIX-mode sh
+#     EXITS when `.` cannot open its file, and dash dies with "Bad substitution" on the lib's bash-only error paths (both reproduced).
+#   - Lib absent / unreadable / "cannot tell": `work-order WARN: wo_pick: ...` on stderr, then the SAME survivors through the PREVIOUS
+#     order (LRU for tier 1, bd's for the rest). Never empty output, never `2>/dev/null` on the lib's stderr.
+#   - Lib lookup: $WORK_ORDER_LIB, else $GC_CITY_PATH, else $GC_CITY (+ packs/town-deltas/assets/scripts/work-order.sh). First one set wins, no cascade.
+#   - UNCHANGED on purpose: poolDemandLabelFilterJQ, assignedTierExclusionFilterJQ, moleculeLiveStepFilterShell (the vetoes do not move),
+#     the molecule-live-step `--limit 1` existence probe, and the control-dispatcher emit_ready in dispatch_runtime.go.
+# NOT COMPILED (bead rule: no go build / install / swap). What WAS run, all in a scratch worktree of the base:
+#   - git apply --check of THIS file on a pristine consolidated/engine-window-20260926 tree: rc=0 (and a real apply, byte-identical to the author tree).
+#   - gofmt -l on the four files: clean. The Go (including the new test file) is gofmt-clean but was NOT type-checked.
+#   - The generated shell, extracted from the Go raw literals, run against a fake `bd` shim, under sh and under /bin/dash, old vs new:
+#     P0 feature (newer) vs P0 bug (older); 25 beads with the only P0 feature 25th; reclaimed x2; lib absent; lib erroring in six ways;
+#     idle poll; garbage from bd; all three tiers and all four assigned queries. OLD head is the bug / the 20-window; NEW head is the feature.
+#   - A Python mirror of work_order_pick_test.go's tables: OLD code 20/104 checks pass, NEW code 118/118, with a mutation control.
+#   - work-order.selftest.sh (the lib): see the README.
+# Before the swap run (a failure here is a defect of this patch, not of the base: hand the bead back):
+#   go vet ./cmd/gc ./internal/config
+#   go test ./internal/config ./cmd/gc -run 'WorkOrder|EffectiveWorkQuery|EffectiveAssigned|PoolDemand|RoutedPoolWorkQuery|CmdHook'
+#   (the config tests run the shell with a hermetic env: PATH + the test's own map, so GC_CITY_PATH must come from the test, not the host.)
+# README: docs/pending-engine-window/ga-9t9acg.7-work-order-pool-probe.README.md (apply steps, selftest, `strings` dry-run, the watchdog coupling).
+
+diff --git a/cmd/gc/cmd_hook_test.go b/cmd/gc/cmd_hook_test.go
+index a0f80acfc..e1363296e 100644
+--- a/cmd/gc/cmd_hook_test.go
++++ b/cmd/gc/cmd_hook_test.go
+@@ -742,7 +742,7 @@ max = 5
+ 		t.Fatalf("bd log = %q, want GC_RIG_ROOT=%q", out, rigDir)
+ 	}
+ 	// Tiered query: first tier checks in_progress assigned to session name.
+-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
++	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit 0") {
+ 		t.Fatalf("bd log = %q, want pool work_query args", out)
+ 	}
+ }
+@@ -1084,7 +1084,7 @@ max = 5
+ 		t.Fatalf("bd log = %q, want command to run from rig root %q", out, rigDir)
+ 	}
+ 	// Tiered query: first tier checks in_progress assigned to session name.
+-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
++	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit 0") {
+ 		t.Fatalf("bd log = %q, want pool template work_query args", out)
+ 	}
+ }
+@@ -1161,7 +1161,7 @@ name = "worker"
+ 		t.Fatalf("bd log = %q, want GC_SESSION_NAME=host-session", out)
+ 	}
+ 	// Tiered query: first tier checks in_progress assigned to session name.
+-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
++	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit 0`) {
+ 		t.Fatalf("bd log = %q, want metadata-routed work query", out)
+ 	}
+ }
+@@ -1231,7 +1231,7 @@ dir = "myrig"
+ 		t.Fatalf("bd log = %q, want GC_SESSION_NAME=%s", out, wantSession)
+ 	}
+ 	// Tiered query: first tier checks in_progress assigned to session name.
+-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
++	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit 0`) {
+ 		t.Fatalf("bd log = %q, want metadata-routed work query", out)
+ 	}
+ }
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 32f697871..b905e87c2 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3673,6 +3673,77 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
+ 	return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + jqStderr + `; } || printf "[]"`
+ }
+ 
++// workOrderLRUFallbackJQ is what routedReadyTierCommand did to its survivors
++// before ga-9t9acg.7 (ga-w4k2z): least-recently-updated first. It is the
++// wo_pick fallback for that tier only — every other tier fell back to bd's own
++// order, i.e. to no re-sort at all (wo_pick's default filter, `.`).
++const workOrderLRUFallbackJQ = `sort_by(.updated_at // .created_at // "")`
++
++// workOrderPickFunctionScript defines wo_pick, the ONE shell stage through which
++// every work_query tier picks "which bead first" (ga-9t9acg.7, programme
++// ga-9t9acg). It must be emitted ONCE, ahead of every script that calls
++// workOrderHeadStage: the assembled queries run the assigned tiers before
++// poolDemandFirstRowFunctionScript is even defined, so the definition cannot
++// live inside any one tier.
++//
++// wo_pick reads ONE JSON array on stdin (the tier's filtered survivors) and
++// writes the same array ordered by the town rule — priority > type (feature
++// first) > age, with the `reclaim` age rule that keeps the ga-w4k2z/ga-oc6knj
++// anti-starvation — by calling work_order_sort from
++// packs/town-deltas/assets/scripts/work-order.sh. Callers take the head.
++//
++// The ordering is the lib's, and the lib can be missing or unable to tell, so
++// wo_pick has three outcomes and never collapses them:
++//   - `[]` or empty in: written back as is, no lib call (the idle poll stays cheap).
++//   - ordered: the lib's array. Its own `work-order WARN:` lines (a bead whose
++//     priority/type/age it could not read, kept at the end of its class) reach
++//     stderr untouched — this stage never puts 2>/dev/null on them.
++//   - lib not readable, or work_order_sort cannot tell (stdout empty, exit 2 —
++//     the lib's contract for "I do not know", never "no bead"): one
++//     `work-order WARN:` line on stderr, then the survivors go through $1 (a jq
++//     filter, `.` when omitted) — the order the tier had before this change.
++//     Never an empty answer for a non-empty input because of the lib.
++//
++// The lib is run by `bash -c '. lib && work_order_sort ...'`, never sourced into
++// the sh that runs the query, for two reasons (both reproduced by the
++// ga-9t9acg.7 harness against the real /bin/sh and /bin/dash): a POSIX-mode sh
++// EXITS when `.` cannot open its file, so `. lib 2>/dev/null && ...` would end
++// the whole query before any fallback ran; and the lib is bash (its error paths
++// use $'\n' and ${v:0:200}), which a dash sh answers with "Bad substitution" and
++// exits. In a child bash both failures are just an empty stdout and a non-zero
++// status, which is exactly the "cannot tell" the fallback handles.
++// The lib is found at $WORK_ORDER_LIB, else under $GC_CITY_PATH (then $GC_CITY).
++func workOrderPickFunctionScript() string {
++	return `wo_pick() { ` +
++		`wo_in=$(cat); ` +
++		`case "$wo_in" in ""|"[]") printf "%s" "$wo_in"; return 0;; esac; ` +
++		`wo_lib="${WORK_ORDER_LIB:-}"; ` +
++		`if [ -z "$wo_lib" ]; then wo_root="${GC_CITY_PATH:-}"; [ -n "$wo_root" ] || wo_root="${GC_CITY:-}"; ` +
++		`[ -n "$wo_root" ] && wo_lib="$wo_root/packs/town-deltas/assets/scripts/work-order.sh"; fi; ` +
++		`wo_out=""; ` +
++		`if [ -r "$wo_lib" ]; then ` +
++		`wo_out=$(printf "%s" "$wo_in" | bash -c '. "$1" && work_order_sort --age reclaim' wo "$wo_lib"); ` +
++		`[ -n "$wo_out" ] && { printf "%s" "$wo_out"; return 0; }; ` +
++		`echo "work-order WARN: wo_pick: work_order_sort could not tell ($wo_lib); keeping the previous order" >&2; ` +
++		`else echo "work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-deltas/assets/scripts); keeping the previous order" >&2; fi; ` +
++		`printf "%s" "$wo_in" | jq -c "${1:-.}" 2>/dev/null; ` +
++		`}; `
++}
++
++// workOrderHeadStage is the tail every tier ends with: order the survivors with
++// wo_pick, then take the first row. fallbackJQ is wo_pick's fallback filter
++// ("" = leave bd's order alone); see workOrderPickFunctionScript. Callers must
++// have emitted workOrderPickFunctionScript() earlier in the same script, and
++// must have fetched the WHOLE population (--limit 0): a window taken before
++// the order can hide a P0 feature behind 20 older P0 bugs (ga-g7yt).
++func workOrderHeadStage(fallbackJQ string) string {
++	stage := `wo_pick`
++	if fallbackJQ != "" {
++		stage += ` '` + fallbackJQ + `'`
++	}
++	return stage + ` | jq -c '.[0:1]' 2>/dev/null`
++}
++
+ // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
+ // reads the first ready, unassigned, routed bead for the supplied target,
+ // prints it, and exits 0. The caller appends a terminal fallthrough
+@@ -3689,17 +3760,23 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
+ // shape already used for the primary tier (ga-g7yt) and the assigned
+ // in-progress tiers (ga-ael6v), for the same reason: slicing before the
+ // prefix filter can hide a real candidate behind a filtered-out head.
++//
++// ga-9t9acg.7: all three tiers now fetch the WHOLE population (--limit 0) and
++// end in workOrderHeadStage, so the head is the town rule's first bead
++// (priority > type > age) instead of whatever bd's window or LRU put first. The
++// script this returns CALLS wo_pick and does not define it: every caller emits
++// workOrderPickFunctionScript() ahead of it (see TestWorkOrderPickIsDefinedBeforeEveryUse).
+ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
+ 	return `probe_pool_demand() { ` +
+ 		`target="$1"; ` +
+ 		`[ -z "$target" ] && return 1; ` +
+ 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+-		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
+-		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + ` 2>/dev/null); ` +
++		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+-		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
+-		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, true) + `); ` +
++		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		`return 1; ` +
+ 		`}; `
+@@ -3737,7 +3814,17 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
+ 	// but BEFORE the sort_by/.[0:1] slice, for the same filter-then-slice
+ 	// reason as ga-zgfxx/ga-avvu2 AC1 above — excluding it from the unsliced
+ 	// survivor set could hide a real candidate behind a filtered-out head.
+-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
++	//
++	// ga-9t9acg.7: the LRU re-rank above was priority-blind — a P0 feature sat
++	// behind any older P0 bug — and --limit=20 was a window taken before any
++	// order existed. Now the whole population is fetched (--limit 0; --sort
++	// oldest stays only so the fallback sees the same ties as before) and
++	// wo_pick orders the survivors by the town rule, with the `reclaim` age rule
++	// that keeps the anti-starvation of ga-w4k2z. The vetoes above are untouched;
++	// they still run BEFORE the order. When work-order.sh is missing or cannot
++	// tell, wo_pick falls back to the LRU re-rank this tier always had (and says
++	// so on stderr). Requires workOrderPickFunctionScript() in the same script.
++	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | ` + workOrderHeadStage(workOrderLRUFallbackJQ) + `; }`
+ }
+ 
+ // poolDemandCountShell emits the reconciler count-form for target: it counts
+@@ -3835,10 +3922,14 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
+ // of its own parked-but-still-owned bead and double-book itself.
+ // --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
+ // filtered-out top row must not hide a real in-progress bead behind it.
++// ga-9t9acg.7: widened again, to the whole population (--limit 0), and the head
++// is taken through wo_pick (town rule: priority > type > age) instead of bd's
++// default order — a session holding several in-progress beads resumes the one
++// the rule puts first. Needs workOrderPickFunctionScript() ahead of it.
+ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
+ 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+ 		`[ -z "$id" ] && continue; ` +
+-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(bd list --status in_progress --assignee="$id" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
+ 		`done; `
+@@ -3858,10 +3949,12 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
+ // --limit=1 widened to 20 for the same
+ // reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
+ // a filtered-out top row must not hide real ready work behind it.
++// ga-9t9acg.7: whole population (--limit 0) and wo_pick order, same as the
++// in-progress sibling above; needs workOrderPickFunctionScript() ahead of it.
+ func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
+ 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+ 		`[ -z "$id" ] && continue; ` +
+-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
+ 		`done; `
+@@ -3882,7 +3975,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool)
+ 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
+ 		`for cand in "$id" "$legacy"; do ` +
+ 		`[ -z "$cand" ] && continue; ` +
+-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(bd list --status in_progress --assignee="$cand" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
+ 		`done; ` +
+@@ -3898,7 +3991,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
+ 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
+ 		`for cand in "$id" "$legacy"; do ` +
+ 		`[ -z "$cand" ] && continue; ` +
+-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+ 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
+ 		`done; ` +
+@@ -3916,7 +4009,7 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
+ 	_ = includeEphemeralReady
+ 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
+ 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
+-		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+ 
+@@ -3936,7 +4029,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
+ 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
+ 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
+ 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
+-		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
++		assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
+ 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+ }
+ 
+@@ -3948,7 +4041,7 @@ func poolDemandOriginGateScript() string {
+ }
+ 
+ func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
+-	script := poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
++	script := workOrderPickFunctionScript() + poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
+ 	for i := 1; i <= targetCount; i++ {
+ 		script += fmt.Sprintf(`probe_pool_demand "$%d"; `, i)
+ 	}
+@@ -4014,14 +4107,16 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
+ 	target := a.poolDemandTarget()
+ 	legacyTarget := legacyWorkflowControlQualifiedName(target)
+ 	if legacyTarget == "" {
+-		script := standardAssignedWorkQueryScript(includeEphemeralReady) +
++		script := workOrderPickFunctionScript() +
++			standardAssignedWorkQueryScript(includeEphemeralReady) +
+ 			poolDemandOriginGateScript() +
+ 			poolDemandFirstRowFunctionScript(includeEphemeralReady) +
+ 			`probe_pool_demand "$1"; ` +
+ 			`printf "[]"`
+ 		return shellquote.Join([]string{"sh", "-c", script, "--", target})
+ 	}
+-	script := legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
++	script := workOrderPickFunctionScript() +
++		legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
+ 		poolDemandOriginGateScript() +
+ 		poolDemandFirstRowFunctionScript(includeEphemeralReady) +
+ 		`probe_pool_demand "$1"; ` +
+@@ -4050,9 +4145,9 @@ func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) str
+ 	}
+ 	target := a.poolDemandTarget()
+ 	if legacyWorkflowControlQualifiedName(target) != "" {
+-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ 	}
+-	return shellquote.Join([]string{"sh", "-c", standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ }
+ 
+ // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
+@@ -4075,9 +4170,9 @@ func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
+ 	}
+ 	target := a.poolDemandTarget()
+ 	if legacyWorkflowControlQualifiedName(target) != "" {
+-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ 	}
+-	return shellquote.Join([]string{"sh", "-c", standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
++	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+ }
+ 
+ // EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 324bc1eba..de7cf5d9c 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1725,13 +1725,13 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit 0`) {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
+ 	}
+ 	if !strings.Contains(got, "-- mayor") {
+ 		t.Errorf("EffectiveWorkQuery() missing tier 3 target argument: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
+ 		t.Errorf("EffectiveWorkQuery() missing run_target migration fallback: %q", got)
+ 	}
+ 	for _, want := range []string{`.metadata`, `.[0:1]`} {
+@@ -1747,10 +1747,10 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
+ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
+ 	a := Agent{Name: "mayor"}
+ 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit 0`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit 0`) {
+ 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral assigned probe: %q", got)
+ 	}
+ }
+@@ -1841,7 +1841,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
+ 	if strings.Contains(got, `--include-ephemeral`) {
+ 		t.Fatalf("EffectiveAssignedReadyQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+ 	}
+-	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=20`) {
++	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit 0`) {
+ 		t.Fatalf("EffectiveAssignedReadyQuery() missing assigned-ready tier: %q", got)
+ 	}
+ 	// ga-ox2yw: the assigned-ready ("Step 1b") tier must apply the same
+@@ -1861,7 +1861,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=worker-session --json --limit=20") printf '[{"id":"assigned-ready"}]' ;;
++  "ready --assignee=worker-session --json --limit 0") printf '[{"id":"assigned-ready"}]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -1886,7 +1886,7 @@ func TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-mww6n","labels":["pool:refused:engine-rebuild-required"]}]' ;;
++  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-mww6n","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -1938,7 +1938,7 @@ func TestEffectiveAssignedReadyQuerySurfacesParkedOwnBead(t *testing.T) {
+ 			bdScript := fmt.Sprintf(`#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","title":"%s","labels":%s}]' ;;
++  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"own-parked-bead","title":"%s","labels":%s}]' ;;
+   *) printf '[]' ;;
+ esac
+ `, title, tc.labels)
+@@ -1955,7 +1955,7 @@ esac
+ func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
+ 	a := Agent{Name: "worker", Dir: "hello-world"}
+ 	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
++	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit 0`) {
+ 		t.Fatalf("EffectiveAssignedReadyQueryForBeads(bd-1.0.5) missing include-ephemeral assigned-ready tier: %q", got)
+ 	}
+ }
+@@ -1965,7 +1965,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
+ 	got := a.EffectiveAssignedInProgressQuery()
+ 	for _, want := range []string{
+ 		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
+-		`bd list --status in_progress --assignee="$id" --json --limit=20`,
++		`bd list --status in_progress --assignee="$id" --json --limit 0`,
+ 		`ephemeral=true AND status=in_progress`,
+ 		// ga-ael6v: the assigned-in-progress ("crash recovery") tier must apply
+ 		// the same pool:refused:*/held filter as the routed-pool tier
+@@ -1990,7 +1990,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
++  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -2016,7 +2016,7 @@ func TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
++  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+   *) printf '[]' ;;
+ esac
+@@ -2056,7 +2056,7 @@ func TestEffectiveAssignedInProgressQuerySurfacesParkedOwnBead(t *testing.T) {
+ 			bdScript := fmt.Sprintf(`#!/bin/sh
+ set -eu
+ case "$*" in
+-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","labels":%s}]' ;;
++  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"own-parked-bead","labels":%s}]' ;;
+   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+   *) printf '[]' ;;
+ esac
+@@ -2089,7 +2089,7 @@ func TestEffectiveAssignedInProgressQuerySkipsNoAutoDispatchBead(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
++  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+   *) printf '[]' ;;
+ esac
+@@ -2113,7 +2113,7 @@ func TestEffectiveAssignedReadyQuerySkipsNoAutoDispatchBead(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
++  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+   *) printf '[]' ;;
+ esac
+ `)
+@@ -2428,12 +2428,12 @@ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  "ready --assignee=gascity--control-dispatcher --json --limit=20"|\
+-  "ready --assignee=gascity/control-dispatcher --json --limit=20")
++  "ready --assignee=gascity--control-dispatcher --json --limit 0"|\
++  "ready --assignee=gascity/control-dispatcher --json --limit 0")
+     printf '[]'
+     ;;
+-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
+-  "ready --assignee=gascity/workflow-control --json --limit=20")
++  "ready --assignee=gascity--workflow-control --json --limit 0"|\
++  "ready --assignee=gascity/workflow-control --json --limit 0")
+     printf '[{"id":"ga-legacy-ready"}]'
+     ;;
+   *)
+@@ -2563,8 +2563,8 @@ case "$*" in
+   "list --status in_progress --assignee=gascity/workflow-control --json --limit=1")
+     printf '[]'
+     ;;
+-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
+-  "ready --assignee=gascity/workflow-control --json --limit=20")
++  "ready --assignee=gascity--workflow-control --json --limit 0"|\
++  "ready --assignee=gascity/workflow-control --json --limit 0")
+     printf '[{"id":"ga-legacy-ready"}]'
+     ;;
+   *)
+@@ -2582,13 +2582,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
+ 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[]'
+     ;;
+-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[]'
+     ;;
+-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"ga-legacy-route"}]'
+     ;;
+   *)
+@@ -2617,7 +2617,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20")
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0")
+     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+     ;;
+   *)
+@@ -2655,6 +2655,11 @@ func TestGeneratedBdReadCommandsStayBd104StorageCompatible(t *testing.T) {
+ 	}
+ }
+ 
++// TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority pins the FETCH:
++// the routed tier asks bd for `--sort oldest --limit 0`, so a lone old P2 bead
++// is still found. The name predates ga-9t9acg.7 and no longer describes the
++// pick: the order the dog takes is priority > type > age, applied by
++// work-order.sh after the fetch (work_order_pick_test.go asserts it).
+ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
+ 	a := Agent{Name: "worker", Dir: "hello-world"}
+ 	out := runEffectiveWorkQuery(t, a, map[string]string{
+@@ -2662,7 +2667,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
+     ;;
+   *)
+@@ -2695,7 +2700,7 @@ func TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"older-just-reclaimed","priority":2,"created_at":"2026-05-20T06:09:30Z","updated_at":"2026-05-20T09:59:00Z"},{"id":"newer-never-touched","priority":2,"created_at":"2026-05-20T08:00:00Z","updated_at":"2026-05-20T08:00:00Z"}]'
+     ;;
+   *)
+@@ -2718,10 +2723,10 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[]'
+     ;;
+-  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"older-fallback","priority":2,"created_at":"2026-05-20T06:09:30Z","metadata":{"gc.kind":"workflow","gc.run_target":"hello-world/worker"}}]'
+     ;;
+   *)
+@@ -2755,7 +2760,7 @@ func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep(t *testi
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"story-live-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-live"}},{"id":"story-no-molecule","priority":2,"created_at":"2026-08-27T20:00:00Z","metadata":{}}]'
+     ;;
+   *"list --parent mol-live --status in_progress --json --limit 1"*)
+@@ -2787,7 +2792,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep(t *testin
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"story-closed-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-closed"}}]'
+     ;;
+   *"list --parent mol-closed --status in_progress --json --limit 1"*)
+@@ -2817,7 +2822,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID(t *testing.T) {
+ 	}, `#!/bin/sh
+ set -eu
+ case "$*" in
+-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
++  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
+     printf '[{"id":"story-plain","priority":2,"created_at":"2026-08-27T19:00:00Z"}]'
+     ;;
+   *)
+@@ -3301,12 +3306,15 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			wq := tt.agent.EffectiveWorkQuery()
+ 			demand := tt.agent.EffectivePoolDemandQuery()
+-			// ga-g7yt: the first-row probe now asks for a WINDOW (--limit=20) and
+-			// takes the first survivor AFTER the label filter, because --limit=1
+-			// then filter is a trap — a parked/held oldest row hides real work
+-			// behind it. The shared predicate is still bdReadyPoolDemandShell; only
++			// ga-g7yt: the first-row probe takes the first survivor AFTER the label
++			// filter, because --limit=1 then filter is a trap — a parked/held
++			// oldest row hides real work behind it. ga-9t9acg.7: the probe now
++			// fetches the WHOLE population (--limit 0, bd's "unlimited") instead of
++			// a 20-row window, because the work-order lib orders by priority > type
++			// > age and a window cut by age alone would hide a P0 feature behind 20
++			// older rows. The shared predicate is still bdReadyPoolDemandShell; only
+ 			// the limit changed.
+-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
++			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit 0", false)
+ 			if !strings.Contains(wq, workPredicate) {
+ 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
+ 			}
+@@ -3334,7 +3342,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
+ 					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
+ 				}
+ 			}
+-			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20", false)
++			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit 0", false)
+ 			if !strings.Contains(wq, migrationWorkPredicate) {
+ 				t.Errorf("EffectiveWorkQuery() missing shared migration predicate %q in %q", migrationWorkPredicate, wq)
+ 			}
+diff --git a/internal/config/work_order_pick_test.go b/internal/config/work_order_pick_test.go
+new file mode 100644
+index 000000000..72562fc01
+--- /dev/null
++++ b/internal/config/work_order_pick_test.go
+@@ -0,0 +1,585 @@
++package config
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"testing"
++)
++
++// ga-9t9acg.7: the dog pool probe and the assigned-work queries order their
++// survivors with the town's work-order lib (priority > type > age, via
++// `work_order_sort --age reclaim`) instead of bd's own order. These tests drive
++// the REAL generated shell commands through a fake `bd`, so they pin behavior,
++// not just strings. The lib itself lives in the city repo
++// (packs/town-deltas/assets/scripts/work-order.sh, its own selftest); here a
++// stand-in implements the same contract so the engine's plumbing is tested in
++// isolation:
++//
++//   - stdout = the JSON array, ordered;
++//   - empty stdout + exit 2 = "cannot tell" — the caller must keep its previous
++//     order and say so on stderr, never turn it into "no bead".
++//
++// Set GC_WORK_ORDER_LIB_REAL to the real lib's path to run the ordering
++// scenarios against it as well (skipped otherwise).
++
++// woStubLib is the stand-in for work-order.sh: the rule in miniature.
++const woStubLib = `work_order_sort() {
++  age=created
++  while [ $# -gt 0 ]; do
++    case "$1" in
++      --age) age="$2"; shift 2 ;;
++      --age=*) age="${1#--age=}"; shift ;;
++      *) echo "stub: bad argument $1" >&2; return 2 ;;
++    esac
++  done
++  case "$age" in created|field|reclaim) ;; *) echo "stub: bad --age $age" >&2; return 2 ;; esac
++  jq -c --arg age "$age" '
++    def reclaims: [(.labels // [])[] | select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | (tonumber? // 0)] | max // 0;
++    def agekey: if $age == "created" then (.created_at // "")
++                elif $age == "field" then (.updated_at // .created_at // "")
++                elif reclaims >= 1 then (.updated_at // .created_at // "")
++                else (.created_at // "") end;
++    sort_by(.priority // 99, (if (.issue_type // "") == "feature" then 0 else 1 end), agekey)
++  '
++}
++`
++
++// Libs that cannot tell: each must degrade to the previous order plus a WARN.
++const (
++	woErroringLib     = "work_order_sort() { cat >/dev/null; echo 'work-order ERROR: stub: cannot tell' >&2; return 2; }\n"
++	woSyntaxBrokenLib = "work_order_sort() { this is ( not valid\n"
++	woExitingLib      = "exit 3\n"
++)
++
++// woFakeBd serves $FX_DIR/<kind>.json for the query shape it is asked, honoring
++// --limit N / --limit=N (0 = unlimited, as in bd), and logs every call so a test
++// can prove no ordering query ever asked for a window.
++const woFakeBd = `#!/bin/sh
++echo "$*" >> "$FX_DIR/calls.log"
++lim=0
++prev=""
++for a in "$@"; do
++  case "$a" in --limit=*) lim="${a#--limit=}" ;; esac
++  if [ "$prev" = "--limit" ]; then lim="$a"; fi
++  prev="$a"
++done
++case "$*" in
++  "ready --metadata-field gc.routed_to="*|"ready --include-ephemeral --metadata-field gc.routed_to="*) f=routed ;;
++  "ready --metadata-field gc.run_target="*|"ready --include-ephemeral --metadata-field gc.run_target="*) f=migration ;;
++  "ready "*"--assignee="*) f=ready ;;
++  "list --status in_progress --assignee="*) f=inprogress ;;
++  "query --json ephemeral=true AND status=in_progress"*) f=eph_inprogress ;;
++  "query --json ephemeral=true AND status=open AND assignee=none"*) f=eph_unassigned ;;
++  "query --json ephemeral=true AND status=open"*) f=eph_open ;;
++  *) f= ;;
++esac
++if [ -z "$f" ] || [ ! -r "$FX_DIR/$f.json" ]; then printf '[]'; exit 0; fi
++if [ "$lim" -gt 0 ] 2>/dev/null; then jq -c ".[:$lim]" "$FX_DIR/$f.json"; else jq -c . "$FX_DIR/$f.json"; fi
++`
++
++type woRun struct {
++	ids    []string
++	stdout string
++	stderr string
++	calls  string
++}
++
++// runWorkOrderQuery runs one generated query under a hermetic environment with
++// the fake bd serving body as fixture.json.
++func runWorkOrderQuery(t *testing.T, query string, env map[string]string, fixture, body string) woRun {
++	t.Helper()
++	if _, err := exec.LookPath("jq"); err != nil {
++		t.Skip("jq not available; the work queries are jq pipelines")
++	}
++	if _, err := exec.LookPath("bash"); err != nil {
++		t.Skip("bash not available; wo_pick runs the lib in a child bash")
++	}
++
++	tmp := t.TempDir()
++	binDir := filepath.Join(tmp, "bin")
++	fxDir := filepath.Join(tmp, "fx")
++	for _, d := range []string{binDir, fxDir} {
++		if err := os.MkdirAll(d, 0o755); err != nil {
++			t.Fatalf("mkdir %s: %v", d, err)
++		}
++	}
++	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(woFakeBd), 0o755); err != nil {
++		t.Fatalf("write fake bd: %v", err)
++	}
++	if fixture != "" {
++		if err := os.WriteFile(filepath.Join(fxDir, fixture+".json"), []byte(body), 0o644); err != nil {
++			t.Fatalf("write fixture: %v", err)
++		}
++	}
++
++	cmd := exec.Command("sh", "-c", query)
++	cmd.Env = []string{"PATH=" + binDir + ":" + os.Getenv("PATH"), "FX_DIR=" + fxDir}
++	for k, v := range env {
++		cmd.Env = append(cmd.Env, k+"="+v)
++	}
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	if err := cmd.Run(); err != nil {
++		t.Fatalf("run query: %v\nstderr: %s", err, stderr.String())
++	}
++
++	run := woRun{stdout: stdout.String(), stderr: stderr.String()}
++	if calls, err := os.ReadFile(filepath.Join(fxDir, "calls.log")); err == nil {
++		run.calls = string(calls)
++	}
++	var rows []struct {
++		ID string `json:"id"`
++	}
++	if err := json.Unmarshal([]byte(strings.TrimSpace(run.stdout)), &rows); err == nil {
++		for _, r := range rows {
++			run.ids = append(run.ids, r.ID)
++		}
++	}
++	return run
++}
++
++func writeWorkOrderLib(t *testing.T, body string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "work-order.sh")
++	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
++		t.Fatalf("write lib: %v", err)
++	}
++	return path
++}
++
++// woSite is one place the engine picks a bead: the generated command, the
++// environment it needs, and the fixture file + bead shape the fake bd serves it.
++type woSite struct {
++	name     string
++	query    string
++	env      map[string]string
++	fixture  string
++	assignee string
++	meta     string
++}
++
++func (s woSite) bead(id string, prio int, typ, created, updated, labels string) string {
++	return fmt.Sprintf(`{"id":%q,"priority":%d,"issue_type":%q,"created_at":%q,"updated_at":%q,"labels":[%s],"assignee":%q,"metadata":%s,"dependencies":[]}`,
++		id, prio, typ, created, updated, labels, s.assignee, s.meta)
++}
++
++func (s woSite) run(t *testing.T, lib string, beads []string) woRun {
++	t.Helper()
++	env := map[string]string{}
++	for k, v := range s.env {
++		env[k] = v
++	}
++	if lib != "" {
++		env["WORK_ORDER_LIB"] = lib
++	}
++	return runWorkOrderQuery(t, s.query, env, s.fixture, "["+strings.Join(beads, ",")+"]")
++}
++
++// woSites lists every picking site ga-9t9acg.7 puts behind the rule: the three
++// pool-probe tiers, the assigned in-progress / ready queries (standard,
++// bd-1.0.5, legacy control-dispatcher) and the ephemeral-wisp siblings, both as
++// the stand-alone prompt queries and as the tiers of the full work query.
++func woSites() []woSite {
++	worker := Agent{Name: "worker", Dir: "hello-world"}
++	control := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
++	routedMeta := `{"gc.routed_to":"hello-world/worker"}`
++	migrationMeta := `{"gc.kind":"workflow","gc.run_target":"hello-world/worker","gc.routed_to":""}`
++	worker1 := map[string]string{"GC_SESSION_ORIGIN": "ephemeral", "GC_SESSION_ID": "worker-bead"}
++	legacy := map[string]string{"GC_SESSION_ORIGIN": "ephemeral", "GC_SESSION_NAME": "gascity--control-dispatcher"}
++	bd105 := BeadsConfig{BDCompatibility: BeadsBDCompatibility105}
++	return []woSite{
++		{name: "pool tier 1 (work query)", query: worker.EffectiveWorkQuery(), env: worker1, fixture: "routed", meta: routedMeta},
++		{name: "pool tier 1 (routed pool query)", query: worker.EffectiveRoutedPoolQuery(), env: worker1, fixture: "routed", meta: routedMeta},
++		{name: "pool tier 2 (run_target migration)", query: worker.EffectiveWorkQuery(), env: worker1, fixture: "migration", meta: migrationMeta},
++		{name: "pool tier 3 (ephemeral wisps)", query: worker.EffectiveWorkQuery(), env: worker1, fixture: "eph_unassigned", meta: routedMeta},
++		{name: "assigned in-progress", query: worker.EffectiveAssignedInProgressQuery(), env: worker1, fixture: "inprogress", assignee: "worker-bead", meta: "{}"},
++		{name: "assigned ready", query: worker.EffectiveAssignedReadyQuery(), env: worker1, fixture: "ready", assignee: "worker-bead", meta: "{}"},
++		{name: "assigned ready (bd 1.0.5)", query: worker.EffectiveAssignedReadyQueryForBeads(bd105), env: worker1, fixture: "ready", assignee: "worker-bead", meta: "{}"},
++		{name: "work query -> assigned in-progress", query: worker.EffectiveWorkQuery(), env: worker1, fixture: "inprogress", assignee: "worker-bead", meta: "{}"},
++		{name: "work query -> assigned ready", query: worker.EffectiveWorkQuery(), env: worker1, fixture: "ready", assignee: "worker-bead", meta: "{}"},
++		{name: "ephemeral assigned in-progress", query: worker.EffectiveAssignedInProgressQuery(), env: worker1, fixture: "eph_inprogress", assignee: "worker-bead", meta: "{}"},
++		{name: "ephemeral assigned ready", query: worker.EffectiveAssignedReadyQuery(), env: worker1, fixture: "eph_open", assignee: "worker-bead", meta: "{}"},
++		{name: "legacy control assigned in-progress", query: control.EffectiveAssignedInProgressQuery(), env: legacy, fixture: "inprogress", assignee: "gascity--control-dispatcher", meta: "{}"},
++		{name: "legacy control assigned ready", query: control.EffectiveAssignedReadyQuery(), env: legacy, fixture: "ready", assignee: "gascity--control-dispatcher", meta: "{}"},
++	}
++}
++
++type woScenario struct {
++	name  string
++	beads func(s woSite) []string
++	want  string
++}
++
++func woScenarios() []woScenario {
++	return []woScenario{
++		{
++			// The bead's headline case: same priority, the feature is NEWER than the
++			// bug. bd's default order (and the old LRU) serves the bug first.
++			name: "P0 feature newer than P0 bug",
++			beads: func(s woSite) []string {
++				return []string{
++					s.bead("p0-bug-older", 0, "bug", "2026-09-01T12:00:00Z", "2026-09-01T12:00:00Z", ""),
++					s.bead("p0-feature-newer", 0, "feature", "2026-09-30T12:00:00Z", "2026-09-30T12:00:00Z", ""),
++				}
++			},
++			want: "p0-feature-newer",
++		},
++		{
++			// 25 beads: the P0 feature is the NEWEST, i.e. the 25th by age — past any
++			// 20-row window cut by age (ga-g7yt's window was taken before ordering).
++			name: "25 beads, P0 feature last by age",
++			beads: func(s woSite) []string {
++				var beads []string
++				for i := 0; i < 24; i++ {
++					ts := fmt.Sprintf("2026-09-%02dT10:00:00Z", i+1)
++					beads = append(beads, s.bead(fmt.Sprintf("p2-bug-%02d", i), 2, "bug", ts, ts, ""))
++				}
++				return append(beads, s.bead("p0-feature-newest-of-25", 0, "feature", "2026-09-30T10:00:00Z", "2026-09-30T10:00:00Z", ""))
++			},
++			want: "p0-feature-newest-of-25",
++		},
++		{
++			// ga-w4k2z anti-starvation: a bead reclaimed twice (updated_at bumped by
++			// each reclaim, created_at not) goes behind an untouched peer.
++			name: "reclaimed twice goes behind its untouched peer",
++			beads: func(s woSite) []string {
++				return []string{
++					s.bead("p1-bug-reclaimed", 1, "bug", "2026-09-01T12:00:00Z", "2026-10-05T12:00:00Z", `"pilot:reclaim-count:2"`),
++					s.bead("p1-bug-untouched", 1, "bug", "2026-09-20T12:00:00Z", "2026-09-20T12:00:00Z", ""),
++				}
++			},
++			want: "p1-bug-untouched",
++		},
++		{
++			// ...but updated_at alone (a comment, a label) is NOT a reclaim: age stays
++			// created_at, so the older bead keeps its place.
++			name: "touched but never reclaimed keeps its place",
++			beads: func(s woSite) []string {
++				return []string{
++					s.bead("p1-bug-commented", 1, "bug", "2026-09-01T12:00:00Z", "2026-10-05T12:00:00Z", ""),
++					s.bead("p1-bug-newer", 1, "bug", "2026-09-20T12:00:00Z", "2026-09-20T12:00:00Z", ""),
++				}
++			},
++			want: "p1-bug-commented",
++		},
++		{
++			// The vetoes still run BEFORE the order: a refused P0 feature never wins.
++			name: "refused P0 feature stays vetoed",
++			beads: func(s woSite) []string {
++				return []string{
++					s.bead("plain-p2-bug", 2, "bug", "2026-09-01T12:00:00Z", "2026-09-01T12:00:00Z", ""),
++					s.bead("refused-p0-feature", 0, "feature", "2026-09-30T12:00:00Z", "2026-09-30T12:00:00Z", `"pool:refused:engine-rebuild-required"`),
++				}
++			},
++			want: "plain-p2-bug",
++		},
++	}
++}
++
++func woLibsUnderTest(t *testing.T) map[string]string {
++	t.Helper()
++	libs := map[string]string{"stub": writeWorkOrderLib(t, woStubLib)}
++	if real := os.Getenv("GC_WORK_ORDER_LIB_REAL"); real != "" {
++		if _, err := os.Stat(real); err != nil {
++			t.Fatalf("GC_WORK_ORDER_LIB_REAL=%q: %v", real, err)
++		}
++		libs["real"] = real
++	}
++	return libs
++}
++
++// TestWorkOrderPickOrdersEverySiteByTheRule is the ga-9t9acg.7 acceptance test:
++// at every site that picks a bead, the head is the one the rule puts first.
++// Fails on the prior HEAD (bd's order / LRU / a 20-row window).
++func TestWorkOrderPickOrdersEverySiteByTheRule(t *testing.T) {
++	for libName, lib := range woLibsUnderTest(t) {
++		for _, s := range woSites() {
++			for _, sc := range woScenarios() {
++				t.Run(libName+"/"+s.name+"/"+sc.name, func(t *testing.T) {
++					run := s.run(t, lib, sc.beads(s))
++					if len(run.ids) != 1 || run.ids[0] != sc.want {
++						t.Fatalf("head = %v, want [%s]\nstdout: %s\nstderr: %s", run.ids, sc.want, run.stdout, run.stderr)
++					}
++				})
++			}
++		}
++	}
++}
++
++// TestWorkOrderPickFetchesWholePopulation: ordering needs the whole population,
++// so no ordering query may ask bd for a window (--limit N, N>0) — the
++// ga-g7yt filter-then-slice trap again, one level up. The molecule-live-step
++// existence probe (`bd list --parent … --limit 1`) is not an ordering query.
++func TestWorkOrderPickFetchesWholePopulation(t *testing.T) {
++	window := regexp.MustCompile(`--limit[= ][1-9]`)
++	scenario := woScenarios()[1]
++	lib := writeWorkOrderLib(t, woStubLib)
++	for _, s := range woSites() {
++		t.Run(s.name, func(t *testing.T) {
++			run := s.run(t, lib, scenario.beads(s))
++			if !strings.Contains(run.calls, "--limit 0") && !strings.Contains(run.calls, "--limit=0") {
++				t.Fatalf("no whole-population call logged: %q", run.calls)
++			}
++			for _, line := range strings.Split(run.calls, "\n") {
++				if line == "" || strings.HasPrefix(line, "list --parent") {
++					continue
++				}
++				if window.MatchString(line) {
++					t.Errorf("bd was asked for a window before ordering: %q", line)
++				}
++			}
++		})
++	}
++}
++
++// TestWorkOrderPickFallsBackWhenLibAbsent: no lib must never mean no work. The
++// query keeps the PREVIOUS order (LRU for the routed tier, bd's own for the
++// rest — here both put the older bug first) and says so on stderr.
++func TestWorkOrderPickFallsBackWhenLibAbsent(t *testing.T) {
++	missing := filepath.Join(t.TempDir(), "no-such-dir", "work-order.sh")
++	for _, s := range woSites() {
++		t.Run(s.name, func(t *testing.T) {
++			sc := woScenarios()[0]
++			run := s.run(t, missing, sc.beads(s))
++			if len(run.ids) != 1 || run.ids[0] != "p0-bug-older" {
++				t.Fatalf("head = %v, want the previous order's [p0-bug-older]\nstdout: %q\nstderr: %q", run.ids, run.stdout, run.stderr)
++			}
++			if !strings.Contains(run.stderr, "work-order WARN: wo_pick: work-order.sh not readable") {
++				t.Fatalf("stderr = %q, want the wo_pick WARN", run.stderr)
++			}
++		})
++	}
++}
++
++// TestWorkOrderPickFallsBackWhenLibErrors: a lib that cannot tell (exit 2 and
++// empty stdout), does not parse, or exits while being sourced is the same
++// "don't know" — previous order, WARN, never an empty answer. The lib runs in a
++// child bash, so none of these can end the query's own sh.
++func TestWorkOrderPickFallsBackWhenLibErrors(t *testing.T) {
++	libs := map[string]string{"exit 2": woErroringLib, "syntax error": woSyntaxBrokenLib, "exit on source": woExitingLib}
++	for libName, body := range libs {
++		lib := writeWorkOrderLib(t, body)
++		for _, s := range woSites() {
++			t.Run(libName+"/"+s.name, func(t *testing.T) {
++				run := s.run(t, lib, woScenarios()[0].beads(s))
++				if len(run.ids) != 1 || run.ids[0] != "p0-bug-older" {
++					t.Fatalf("head = %v, want the previous order's [p0-bug-older]\nstdout: %q\nstderr: %q", run.ids, run.stdout, run.stderr)
++				}
++				if !strings.Contains(run.stderr, "work-order WARN: wo_pick: work_order_sort could not tell") {
++					t.Fatalf("stderr = %q, want the wo_pick WARN", run.stderr)
++				}
++			})
++		}
++	}
++}
++
++// TestWorkOrderPickLibLookupOrder: $WORK_ORDER_LIB, else $GC_CITY_PATH, else
++// $GC_CITY (each + packs/town-deltas/assets/scripts/work-order.sh). The first
++// one set is THE lib — an unusable $WORK_ORDER_LIB does not cascade to the next.
++func TestWorkOrderPickLibLookupOrder(t *testing.T) {
++	cityWith := func(t *testing.T, body string) string {
++		t.Helper()
++		city := t.TempDir()
++		dir := filepath.Join(city, "packs", "town-deltas", "assets", "scripts")
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			t.Fatalf("mkdir: %v", err)
++		}
++		if err := os.WriteFile(filepath.Join(dir, "work-order.sh"), []byte(body), 0o644); err != nil {
++			t.Fatalf("write lib: %v", err)
++		}
++		return city
++	}
++	site := woSites()[0]
++	pair := woScenarios()[0].beads(site)
++	runWith := func(t *testing.T, extra map[string]string) woRun {
++		t.Helper()
++		s := site
++		s.env = map[string]string{"GC_SESSION_ORIGIN": "ephemeral"}
++		for k, v := range extra {
++			s.env[k] = v
++		}
++		return s.run(t, "", pair)
++	}
++
++	t.Run("GC_CITY_PATH", func(t *testing.T) {
++		run := runWith(t, map[string]string{"GC_CITY_PATH": cityWith(t, woStubLib)})
++		if len(run.ids) != 1 || run.ids[0] != "p0-feature-newer" {
++			t.Fatalf("head = %v, want [p0-feature-newer]; stderr: %q", run.ids, run.stderr)
++		}
++	})
++	t.Run("GC_CITY", func(t *testing.T) {
++		run := runWith(t, map[string]string{"GC_CITY": cityWith(t, woStubLib)})
++		if len(run.ids) != 1 || run.ids[0] != "p0-feature-newer" {
++			t.Fatalf("head = %v, want [p0-feature-newer]; stderr: %q", run.ids, run.stderr)
++		}
++	})
++	t.Run("WORK_ORDER_LIB wins and does not cascade", func(t *testing.T) {
++		run := runWith(t, map[string]string{
++			"WORK_ORDER_LIB": writeWorkOrderLib(t, woErroringLib),
++			"GC_CITY_PATH":   cityWith(t, woStubLib),
++		})
++		if len(run.ids) != 1 || run.ids[0] != "p0-bug-older" {
++			t.Fatalf("head = %v, want the previous order's [p0-bug-older]; stderr: %q", run.ids, run.stderr)
++		}
++		if !strings.Contains(run.stderr, "could not tell") {
++			t.Fatalf("stderr = %q, want the wo_pick WARN", run.stderr)
++		}
++	})
++	t.Run("nothing set", func(t *testing.T) {
++		run := runWith(t, nil)
++		if len(run.ids) != 1 || run.ids[0] != "p0-bug-older" {
++			t.Fatalf("head = %v, want the previous order's [p0-bug-older]; stderr: %q", run.ids, run.stderr)
++		}
++		if !strings.Contains(run.stderr, "work-order.sh not readable") {
++			t.Fatalf("stderr = %q, want the wo_pick WARN", run.stderr)
++		}
++	})
++}
++
++// woAllQueries are the generated commands that contain wo_pick, with whether
++// each also carries the pool-demand tiers (and so the two pool vetoes).
++func woAllQueries() map[string]bool {
++	worker := Agent{Name: "worker", Dir: "hello-world"}
++	control := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
++	bd105 := BeadsConfig{BDCompatibility: BeadsBDCompatibility105}
++	return map[string]bool{
++		worker.EffectiveWorkQuery():                            true,
++		worker.EffectiveWorkQueryForBeads(bd105):               true,
++		worker.EffectiveRoutedPoolQuery():                      true,
++		worker.EffectiveRoutedPoolQueryForBeads(bd105):         true,
++		control.EffectiveWorkQuery():                           true,
++		worker.EffectiveAssignedInProgressQuery():              false,
++		worker.EffectiveAssignedInProgressQueryForBeads(bd105): false,
++		worker.EffectiveAssignedReadyQuery():                   false,
++		worker.EffectiveAssignedReadyQueryForBeads(bd105):      false,
++		control.EffectiveAssignedInProgressQuery():             false,
++		control.EffectiveAssignedReadyQuery():                  false,
++	}
++}
++
++// TestWorkOrderPickIsDefinedBeforeEveryUse: every entry point defines wo_pick
++// exactly once and before its first use. The assigned-work scripts run BEFORE
++// poolDemandFirstRowFunctionScript in the full work query, so defining the
++// function inside that script (where the tiers use it) would leave the
++// assigned tiers calling a name that does not exist yet: sh prints
++// "wo_pick: not found", the pipeline yields nothing, and the query silently
++// falls through to the next tier — an assigned bead lost without an error.
++func TestWorkOrderPickIsDefinedBeforeEveryUse(t *testing.T) {
++	use := regexp.MustCompile(`wo_pick ('|\|)`)
++	for q := range woAllQueries() {
++		if n := strings.Count(q, "wo_pick() {"); n != 1 {
++			t.Fatalf("wo_pick defined %d times, want exactly 1 in %q", n, q)
++		}
++		first := use.FindStringIndex(q)
++		if first == nil {
++			t.Fatalf("no wo_pick use found in %q", q)
++		}
++		if def := strings.Index(q, "wo_pick() {"); def > first[0] {
++			t.Fatalf("wo_pick used at %d before its definition at %d in %q", first[0], def, q)
++		}
++	}
++}
++
++// TestWorkOrderSitesKeepVetoesAndCarryTheRule: every picking command orders
++// with the lib's reclaim rule over the whole population, and the vetoes it ran
++// before ga-9t9acg.7 — poolDemandLabelFilterJQ and moleculeLiveStepFilterShell
++// on the pool tiers, assignedTierExclusionFilterJQ on the assigned ones — are
++// still wired in verbatim (modulo the quoting shellquote.Join adds).
++func TestWorkOrderSitesKeepVetoesAndCarryTheRule(t *testing.T) {
++	escape := func(s string) string { return strings.ReplaceAll(s, "'", `'\''`) }
++	window := regexp.MustCompile(`--limit[= ][1-9]`)
++	molecule := escape(moleculeLiveStepFilterShell())
++	for q, pool := range woAllQueries() {
++		if !strings.Contains(q, "work_order_sort --age reclaim") {
++			t.Errorf("query does not order with `work_order_sort --age reclaim`: %q", q)
++		}
++		if !strings.Contains(q, "--limit 0") {
++			t.Errorf("query does not fetch the whole population (--limit 0): %q", q)
++		}
++		if window.MatchString(strings.ReplaceAll(q, molecule, "")) {
++			t.Errorf("query still asks bd for a window (--limit N, N>0): %q", q)
++		}
++		if pool {
++			for _, veto := range []string{escape(poolDemandLabelFilterJQ()), molecule} {
++				if !strings.Contains(q, veto) {
++					t.Errorf("query lost a pool veto %q: %q", veto, q)
++				}
++			}
++		} else if !strings.Contains(q, escape(assignedTierExclusionFilterJQ())) {
++			t.Errorf("query lost the assigned-tier exclusion filter: %q", q)
++		}
++	}
++}
++
++// TestWorkOrderPickMutationControl proves the fixtures above can fail: each
++// mutant re-breaks one thing the patch fixed, in the generated command itself,
++// and the property that guards it must then report a violation. A mutant that
++// still passes would mean the corresponding test above is not testing it.
++func TestWorkOrderPickMutationControl(t *testing.T) {
++	stub := writeWorkOrderLib(t, woStubLib)
++	missing := filepath.Join(t.TempDir(), "no-such-dir", "work-order.sh")
++	sites := woSites()
++	pick := func(t *testing.T, name string) woSite {
++		t.Helper()
++		for _, s := range sites {
++			if s.name == name {
++				return s
++			}
++		}
++		t.Fatalf("no site %q", name)
++		return woSite{}
++	}
++	headIs := func(want string, scenario int, lib string) func(*testing.T, woSite) bool {
++		return func(t *testing.T, s woSite) bool {
++			t.Helper()
++			run := s.run(t, lib, woScenarios()[scenario].beads(s))
++			return len(run.ids) == 1 && run.ids[0] == want
++		}
++	}
++	warns := func(t *testing.T, s woSite) bool {
++		t.Helper()
++		return strings.Contains(s.run(t, missing, woScenarios()[0].beads(s)).stderr, "work-order WARN")
++	}
++
++	// The ephemeral-wisp path reads through `bd query --limit=0`, which the window
++	// mutant never touches — it is only meaningful where the first stage is `bd ready`
++	// / `bd list` with a limit flag.
++	everywhere := []string{"pool tier 1 (work query)", "assigned in-progress", "ephemeral assigned ready"}
++	windowed := []string{"pool tier 1 (work query)", "assigned in-progress"}
++	mutants := []struct {
++		name   string
++		sites  []string
++		mutate func(string) string
++		holds  func(*testing.T, woSite) bool
++	}{
++		{"window of 20 before ordering", windowed, func(q string) string { return strings.ReplaceAll(q, "--limit 0", "--limit=20") }, headIs("p0-feature-newest-of-25", 1, stub)},
++		{"no ordering", everywhere, func(q string) string { return strings.ReplaceAll(q, "work_order_sort --age reclaim", "cat") }, headIs("p0-feature-newer", 0, stub)},
++		{"age = created_at only", everywhere, func(q string) string { return strings.ReplaceAll(q, "--age reclaim", "--age created") }, headIs("p1-bug-untouched", 2, stub)},
++		{"age = updated_at only", everywhere, func(q string) string { return strings.ReplaceAll(q, "--age reclaim", "--age field") }, headIs("p1-bug-commented", 3, stub)},
++		{"WARN swallowed", everywhere, func(q string) string { return strings.ReplaceAll(q, ">&2", ">/dev/null") }, warns},
++	}
++	for _, m := range mutants {
++		for _, name := range m.sites {
++			t.Run(m.name+"/"+name, func(t *testing.T) {
++				s := pick(t, name)
++				if !m.holds(t, s) {
++					t.Fatalf("control: the unmutated query must satisfy the property")
++				}
++				mutated := s
++				mutated.query = m.mutate(s.query)
++				if mutated.query == s.query {
++					t.Fatalf("mutation %q changed nothing; the control is stale", m.name)
++				}
++				if m.holds(t, mutated) {
++					t.Fatalf("mutation %q went undetected: the fixtures do not guard it", m.name)
++				}
++			})
++		}
++	}
++}

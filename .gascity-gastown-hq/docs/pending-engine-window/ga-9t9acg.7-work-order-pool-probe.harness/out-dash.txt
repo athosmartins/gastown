@@ -1,0 +1,87 @@
+== shell under test: /bin/dash ; lib: /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-order.sh
+-- 1. routed tier: P0 feature (newer) vs P0 bug (older)
+     old  rc=0 head=['bug-p0-older'] stderr=-
+     new  rc=0 head=['feature-p0-newer'] stderr=-
+PASS 1 old head is the older bug (priority/type blind LRU)
+PASS 1 new head is the P0 feature
+PASS 1 new fetched with --limit 0 and no --limit=N  calls: reviewing --json --sort oldest --limit 0
+-- 2. routed tier: 25 beads, the 25th is the only P0 feature (a window of 20 cannot see it)
+     old  rc=0 head=['bug-p2-00'] stderr=-
+     new  rc=0 head=['feature-p0-25th'] stderr=-
+PASS 2 old (limit=20 window) cannot reach the 25th
+PASS 2 new reaches the 25th and puts it first
+-- 3. routed tier: a P0 feature reclaimed twice (older, updated again) vs an untouched younger P0 feature
+     new  rc=0 head=['feature-p0-untouched'] stderr=-
+     ctl  rc=0 head=['feature-p0-reclaimed-x2'] stderr=-
+PASS 3 reclaimed x2 yields the head to the untouched one (anti-starvation kept)
+PASS 3 control: same bead WITHOUT the reclaim label keeps its place by created_at
+-- 4. lib absent (no GC_CITY_PATH/GC_CITY; and WORK_ORDER_LIB pointing nowhere)
+     old  rc=0 head=['bug-p0-older'] stderr=-
+     new  rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-d
+     new2 rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-d
+PASS 4 absent lib: same head as the old command, rc 0
+PASS 4 absent lib: one WARN on stderr
+PASS 4 absent lib via WORK_ORDER_LIB: same head, rc 0
+-- 5. lib erroring / broken / unreadable -> old order, WARN, never empty
+     cannot-tell rc=0 head=['bug-p0-older'] stderr=work-order ERROR: stub: cannot tell (+1)
+PASS 5 cannot-tell: old head, rc 0, WARN, not empty
+     syntax-error rc=0 head=['bug-p0-older'] stderr=/private/tmp/claude-501/-Users-athos-gt--gascity-gastown-hq--gc-agents-dogs-gastown-dog-6/5335713b-4780-4aff-8 (+2)
+PASS 5 syntax-error: old head, rc 0, WARN, not empty
+     exit-at-sour rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work_order_sort could not tell (/private/tmp/claude-501/-Users-athos-gt--gascity-gas
+PASS 5 exit-at-source: old head, rc 0, WARN, not empty
+     empty-lib rc=0 head=['bug-p0-older'] stderr=wo: work_order_sort: command not found (+1)
+PASS 5 empty-lib: old head, rc 0, WARN, not empty
+     no-function rc=0 head=['bug-p0-older'] stderr=wo: work_order_sort: command not found (+1)
+PASS 5 no-function: old head, rc 0, WARN, not empty
+     unreadable rc=0 head=['bug-p0-older'] stderr=work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-d
+PASS 5 unreadable: old head, rc 0, WARN, not empty
+-- 6. idle poll (nothing routed): no lib call, still `[]`
+     new  rc=0 head=[] stderr=-
+PASS 6 `[]` out, lib not invoked
+-- 7. bd prints garbage
+     old  rc=0 head=[] stderr=-
+     new  rc=0 head=[] stderr=-
+PASS 7 garbage in: same answer as before
+-- 8a. tier 2 (gc.run_target migration): P1 bug older vs P0 feature newer
+     old  rc=0 head=['mig-p1-bug-older'] stderr=-
+     new  rc=0 head=['mig-p0-feature-newer'] stderr=-
+PASS 8a old head = P1 bug, new head = P0 feature
+-- 8b. tier 3 (ephemeral wisps): P2 bug older vs P0 feature newer
+     old  rc=0 head=['eph-p2-bug-older'] stderr=-
+     new  rc=0 head=['eph-p0-feature-newer'] stderr=-
+PASS 8b old head = P2 bug, new head = P0 feature
+-- 8c. tier 3: 25 wisps, the 25th is the only P0 feature (old sliced .[:20] before ordering)
+     old  rc=0 head=['eph-p2-00'] stderr=-
+     new  rc=0 head=['eph-p0-25th'] stderr=-
+PASS 8c new reaches the 25th
+-- 9a. assigned in-progress: P1 feature first in bd's order, P0 bug behind it
+     old  rc=0 head=['own-p1-feature'] stderr=-
+     new  rc=0 head=['own-p0-bug'] stderr=-
+PASS 9a old head = bd order (P1), new head = P0 bug
+PASS 9a new asked bd for the whole population  --status in_progress --assignee=worker-bead --json --limit 0
+-- 9b. assigned ready
+     old  rc=0 head=['rdy-p2-bug'] stderr=-
+     new  rc=0 head=['rdy-p0-feature'] stderr=-
+PASS 9b old head = P2, new head = P0 feature
+-- 9c. assigned ready, 25 beads (old window of 20)
+     old  rc=0 head=['own-p2-00'] stderr=-
+     new  rc=0 head=['own-p0-25th'] stderr=-
+PASS 9c new reaches the 25th
+-- 10. full default work_query: assigned work still beats the pool, and the pool is ordered
+     new  rc=0 head=['rdy-p0-feature'] stderr=-
+PASS 10a assigned-ready beats routed, ordered by the rule
+     new  rc=0 head=['feature-p0-newer'] stderr=-
+PASS 10b nothing assigned: routed head is the P0 feature (lib found through GC_CITY)
+PASS 10c origin gate untouched: a non-ephemeral origin still prints `[]`/exits 0 without probing the pool  stdout=''
+-- 11. vetoes unchanged: P0 feature refused (pool:refused:*) vs clean P1 bug
+     new  rc=0 head=['p1-bug-clean'] stderr=-
+PASS 11 refused bead never offered; the clean one is
+-- 12. one bead has no priority: kept at the end, lib WARN on stderr, stdout is still one clean JSON array
+     new  rc=0 head=['feature-p0-newer'] stderr=work-order WARN: no-prio: prio?
+PASS 12 head is the P0 feature, not the unreadable bead
+PASS 12 the lib's own WARN line reached stderr (not swallowed)  work-order WARN: no-prio: prio?
+PASS 12 stdout is exactly one JSON array
+PASS 12b a lone unreadable bead is still served (never dropped, never empty)
+-- 13. wall time per routed-tier run on 25 beads (10 runs each, loaded machine, includes harness setup): old 316 ms, new 474 ms
+
+RESULT under /bin/dash: ALL PASS

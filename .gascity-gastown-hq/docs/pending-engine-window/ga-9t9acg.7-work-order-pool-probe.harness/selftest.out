@@ -1,0 +1,363 @@
+== (a) priority > type (feature first) > age (oldest first)
+  ✓ P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4 (=p0-feat-old,p0-feat-new,p0-bug-old,p0-task-new,p1-feat,p1-bug,p2-feat,p2-bug,p3-task,p4-chore)
+  ✓ an ordered, readable fixture raises no WARN (=)
+  ✓ story is an alias of feature (never hidden behind a P0 bug) (=p0-story,p0-feat,p0-bug)
+  ✓ WORK_ORDER_FEATURE_TYPES is read (feature only: story falls to the other types) (=p0-feat,p0-bug,p0-story)
+  ✓ the 10-bead fixture, created mode (hand-checked) (=j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ the 10-bead fixture raises exactly the three expected WARNs (=f-nullprio-feat: prio?;g-p2-notype: type?;h-p2-bug-badage: age?;)
+== (b) priority null / "2" / 9 / 1.5 / -1 / absent -> after P4, with WARN; never P0, never dropped
+  ✓ illegible priorities sit behind P4, oldest first, none promoted (=p0-bug,p4-task,ill-null,ill-str,ill-nine,ill-frac,ill-neg,ill-absent)
+  ✓ all eight beads are still there (=8)
+  ✓ one prio? WARN per illegible bead, none for the readable ones (=ill-absent: prio?;ill-frac: prio?;ill-neg: prio?;ill-nine: prio?;ill-null: prio?;ill-str: prio?;)
+== (c) type absent / empty / non-string -> after the known types WITHIN the priority
+  ✓ unknown types trail the known ones inside P2 (and are not pushed behind other priorities) (=p1-notype,p2-dotype,p2-feat,p2-bug,p2-notype,p2-empty,p2-num,p2-nulltype)
+  ✓ type? WARN for exactly the unreadable ones (=p1-notype: type?;p2-empty: type?;p2-notype: type?;p2-nulltype: type?;p2-num: type?;)
+  ✓ the type is case-insensitive (the Pilot lowercases it): Feature / STORY are features (=p2-Story,p2-FEATURE,p2-Bug)
+  ✓ a feature list written in capitals is lowercased by work_order_cfg (=["feature","story"])
+== (d) created_at garbage / absent / null / not UTC -> end of the class, with WARN
+  ✓ unreadable ages trail their class (by id), P3 stays behind all of P2 (=ok-old,ok-new,u-space,v-offset,w-month13,x-null,y-absent,z-junk,p3-ok)
+  ✓ age? WARN for exactly the unreadable ones (=u-space: age?;v-offset: age?;w-month13: age?;x-null: age?;y-absent: age?;z-junk: age?;)
+  ✓ a date the calendar does not have is unreadable, not rolled over (2026-02-31 is NOT 03-03); a real 02-29 is fine (=leap-ok,ok,apr31,feb31,h24,notleap)
+  ✓ age? WARN for the impossible dates only (=apr31: age?;feb31: age?;h24: age?;notleap: age?;)
+  ✓ a bead without a readable string id is kept, not dropped (=4)
+  ✓ id? WARN: work-order WARN: ?: id?
+  ✓ id? WARN: work-order WARN: 7: id?
+  ✓ id? WARN: work-order WARN: : id?
+  ✓ and no other bead is WARNed (=3)
+  ✓ a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (end of class by id); real fractions still parse (=ok-old,ok-frac,ok-off,ok-new,x-after-z,x-bare-dot,x-junk-line,x-lower-z,x-newline,x-on-date,x-on-hour,x-on-year,x-pad,x-two-frac)
+  ✓ age? WARN for each of the ten malformed shapes, none for the four real ones (=x-after-z: age?;x-bare-dot: age?;x-junk-line: age?;x-lower-z: age?;x-newline: age?;x-on-date: age?;x-on-hour: age?;x-on-year: age?;x-pad: age?;x-two-frac: age?;)
+  ✓ the field age goes through the same judge: a malformed _wo_age is age-unreadable (=ok,bad)
+  ✓ and is WARNed (=bad: age?;)
+== (e) fraction of second and +00:00 parse; compared as time, not as text
+  ✓ same second ties by id (string order would give m,z,a); the earlier second goes first (=q-early,a-fracoff,m-offset,z-frac,b-later)
+  ✓ all five parse: no WARN (=)
+== (f) reclaim: a bead with pilot:reclaim-count:N>=1 ages by updated_at (anti-starvation, inherited)
+  ✓ created mode: the ancient reclaimed bead is first (=reclaimed,feat-old,feat-new,p1-feat)
+  ✓ reclaim mode: it sinks behind the newest normal feature of its class, still ahead of a P1 (=feat-old,feat-new,reclaimed,p1-feat)
+  ✓ count 0, junk counts, other labels, absent/null labels keep created_at; a reclaimed bead with no updated_at, and one whose labels are not an array (cannot tell if it was reclaimed), are age-unreadable: end of class (=zero,junk,norl,nolab,nullab,nouptd,strlab)
+  ✓ exactly those two are warned (=nouptd: age?;strlab: age?;)
+  ✓ the same fixture in created mode needs no labels at all: every bead keeps created_at, no WARN (=nouptd,zero,junk,norl,nolab,nullab,strlab)
+  ✓ created mode: no WARN for the fixture (=)
+  ✓ a label is judged WHOLE: 'pilot:reclaim-count:2<newline>' is not a reclaim marker (a regex $ also matches before a final newline); the real marker still is (=nl-label,plain,real-reclaim)
+  ✓ no WARN: a label that is not a marker is just a label (=)
+== (f2) field: the caller injects _wo_age (the stage's own marker); no fallback to created_at
+  ✓ ordered by _wo_age; a bead without a readable marker goes to the end of its class (=older-created,newer-created,bad-marker,no-marker)
+  ✓ age? WARN for the two without a readable marker, even though created_at is fine (=bad-marker: age?;no-marker: age?;)
+  ✓ reclaim mode on the 10-bead fixture (hand-checked) (=d-p0-feat-old,j-p0-feat-reclaimed,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+== (g) shuffling the input does not change the output (tie-break by id)
+  ✓ every rotation and the reversal of three fixtures gives the same order (=28)
+  ✓ full ties come out by id (=t-a,t-b,t-c,t-d,t-e)
+  ✓ the beads come out untouched (same objects, nothing added, nothing dropped)
+== (h) [] -> [] exit 0; anything else unreadable -> stdout EMPTY, exit != 0 (never 'no bead')
+  ✓ [] -> stdout (=[])
+  ✓ [] -> exit (=0)
+  ✓ [] -> no stderr (=)
+  ✓ empty stdin -> empty stdout, exit 2, ERROR line
+  ✓ not JSON -> empty stdout, exit 2, ERROR line
+  ✓ an object -> empty stdout, exit 2, ERROR line
+  ✓ null -> empty stdout, exit 2, ERROR line
+  ✓ a string -> empty stdout, exit 2, ERROR line
+  ✓ array of non-objects -> empty stdout, exit 2, ERROR line
+  ✓ array with one non-object -> empty stdout, exit 2, ERROR line
+  ✓ two documents -> empty stdout, exit 2, ERROR line
+  ✓ truncated JSON -> empty stdout, exit 2, ERROR line
+  ✓ unknown --age -> empty stdout, exit 2, ERROR line
+  ✓ --age without a value -> empty stdout, exit 2, ERROR line
+  ✓ unknown option -> empty stdout, exit 2, ERROR line
+  ✓ work_order_cfg --age reclaim prints the options (={"age":"reclaim","feature_types":["feature","story"]})
+  ✓ work_order_cfg default age (=created)
+  ✓ work_order_cfg --age bogus: stdout empty (=)
+  ✓ work_order_cfg --age bogus: exit (=2)
+  ✓ work_order_cfg with an empty feature list: stdout empty (=)
+  ✓ work_order_cfg with an empty feature list: exit (=2)
+  ✓ work_order_sort with a blank feature list cannot tell: stdout empty (=)
+  ✓ work_order_sort with a blank feature list: exit (=2)
+  ✓ a bad option is named in the ERROR line
+  ✓ an empty feature list is named in the ERROR line
+  ✓ jq missing: stdout empty (=)
+  ✓ jq missing: exit 2 (=2)
+  ✓ jq missing is reported as jq missing, not as a bad option
+  ✓ an exported WORK_ORDER_FEATURE_TYPES survives sourcing the library (=bug)
+  ✓ an EMPTY export is not replaced by the default (it is refused): stdout empty (=)
+  ✓ an EMPTY export: exit 2 (=2)
+-- work_order_head
+  ✓ head of the ordered 10-bead fixture (=j-p0-feat-reclaimed)
+  ✓ head of [] is the literal null (=null)
+  ✓ head of [] exits 0 (=0)
+  ✓ head of [] -> empty stdout, exit 2
+  ✓ head of [nope] -> empty stdout, exit 2
+  ✓ head of [{"id":"x"}] -> empty stdout, exit 2
+  ✓ head of [[] []] -> empty stdout, exit 2
+  ✓ a failed sort piped into head stays EMPTY (it never reads as 'no bead') (=)
+  ✓ head of [null,{"id":"x"}] (an element that is not a bead object) -> empty stdout, exit 2
+  ✓ head of [1] (an element that is not a bead object) -> empty stdout, exit 2
+  ✓ head of [{"id":"x"},"y"] (an element that is not a bead object) -> empty stdout, exit 2
+  ✓ head of [[]] (an element that is not a bead object) -> empty stdout, exit 2
+  ✓ head of ["x"] (an element that is not a bead object) -> empty stdout, exit 2
+  ✓ the ERROR line names the cause (an element is not an object)
+  ✓ head of a one-bead array is that bead (={"id":"x","priority":0})
+== (i) python == bash on the same fixtures
+  ✓ created: python CLI exit (=0)
+  ✓ created: python output == bash output (=[{"created_at":"2026-06-01T10:00:00Z","id":"j-p0-feat-reclaimed","issue_type":"feature","labels":["pilot:reclaim-count:2"],"priority":0,"updated_at":"2026-10-05T10:00:00Z"},{"created_at":"2026-09-20T09:00:00.123Z","id":"d-p0-feat-old","issue_type":"feature","labels":[],"priority":0,"updated_at":"2026-09-20T09:00:00.123Z"},{"created_at":"2026-10-05T18:41:00Z","id":"c-p0-feat-new","issue_type":"feature","labels":[],"priority":0,"updated_at":"2026-10-05T18:41:00Z"},{"created_at":"2026-09-01T10:00:00Z","id":"a-p0-bug-old","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-09-01T10:00:00Z"},{"created_at":"2026-10-05T20:00:00+00:00","id":"e-p0-task-new","issue_type":"task","labels":[],"priority":0,"updated_at":"2026-10-05T20:00:00+00:00"},{"created_at":"2026-08-01T10:00:00Z","id":"b-p1-feat-old","issue_type":"feature","labels":[],"priority":1,"updated_at":"2026-08-01T10:00:00Z"},{"created_at":"2026-07-04T10:00:00Z","id":"i-p2-bug-ok","issue_type":"bug","labels":[],"priority":2,"updated_at":"2026-07-04T10:00:00Z"},{"created_at":"garbage","id":"h-p2-bug-badage","issue_type":"bug","labels":[],"priority":2,"updated_at":"2026-07-03T10:00:00Z"},{"created_at":"2026-07-02T10:00:00Z","id":"g-p2-notype","labels":[],"priority":2,"updated_at":"2026-07-02T10:00:00Z"},{"created_at":"2026-07-01T10:00:00Z","id":"f-nullprio-feat","issue_type":"feature","labels":[],"priority":null,"updated_at":"2026-07-01T10:00:00Z"}])
+  ✓ created: python WARN lines == bash WARN lines (=f-nullprio-feat: prio?;g-p2-notype: type?;h-p2-bug-badage: age?;)
+  ✓ reclaim: python CLI exit (=0)
+  ✓ reclaim: python output == bash output (=[{"created_at":"2026-09-20T09:00:00.123Z","id":"d-p0-feat-old","issue_type":"feature","labels":[],"priority":0,"updated_at":"2026-09-20T09:00:00.123Z"},{"created_at":"2026-06-01T10:00:00Z","id":"j-p0-feat-reclaimed","issue_type":"feature","labels":["pilot:reclaim-count:2"],"priority":0,"updated_at":"2026-10-05T10:00:00Z"},{"created_at":"2026-10-05T18:41:00Z","id":"c-p0-feat-new","issue_type":"feature","labels":[],"priority":0,"updated_at":"2026-10-05T18:41:00Z"},{"created_at":"2026-09-01T10:00:00Z","id":"a-p0-bug-old","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-09-01T10:00:00Z"},{"created_at":"2026-10-05T20:00:00+00:00","id":"e-p0-task-new","issue_type":"task","labels":[],"priority":0,"updated_at":"2026-10-05T20:00:00+00:00"},{"created_at":"2026-08-01T10:00:00Z","id":"b-p1-feat-old","issue_type":"feature","labels":[],"priority":1,"updated_at":"2026-08-01T10:00:00Z"},{"created_at":"2026-07-04T10:00:00Z","id":"i-p2-bug-ok","issue_type":"bug","labels":[],"priority":2,"updated_at":"2026-07-04T10:00:00Z"},{"created_at":"garbage","id":"h-p2-bug-badage","issue_type":"bug","labels":[],"priority":2,"updated_at":"2026-07-03T10:00:00Z"},{"created_at":"2026-07-02T10:00:00Z","id":"g-p2-notype","labels":[],"priority":2,"updated_at":"2026-07-02T10:00:00Z"},{"created_at":"2026-07-01T10:00:00Z","id":"f-nullprio-feat","issue_type":"feature","labels":[],"priority":null,"updated_at":"2026-07-01T10:00:00Z"}])
+  ✓ reclaim: python WARN lines == bash WARN lines (=f-nullprio-feat: prio?;g-p2-notype: type?;h-p2-bug-badage: age?;)
+  ✓ field: python CLI exit (=0)
+  ✓ field: python output == bash output (=[{"_wo_age":"2026-10-04T12:00:00.5Z","created_at":"2026-10-01T00:00:00Z","id":"older-created","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-10-01T00:00:00Z"},{"_wo_age":"2026-10-05T12:00:00Z","created_at":"2026-01-01T00:00:00Z","id":"newer-created","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-01-01T00:00:00Z"},{"_wo_age":"yesterday","created_at":"2026-01-01T00:00:00Z","id":"bad-marker","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-01-01T00:00:00Z"},{"created_at":"2026-01-01T00:00:00Z","id":"no-marker","issue_type":"bug","labels":[],"priority":0,"updated_at":"2026-01-01T00:00:00Z"}])
+  ✓ field: python WARN lines == bash WARN lines (=bad-marker: age?;no-marker: age?;)
+  ✓ python CLI on garbage: stdout empty (=)
+  ✓ python CLI on garbage: exit (=2)
+  ✓ python CLI on garbage: ERROR line on stderr
+  ✓ python CLI with an unknown age: stdout empty (=)
+  ✓ python CLI with an unknown age: exit (=2)
+  ✓ python CLI on []: [] and exit 0 (=[]/0)
+  ✓ sort_beads(): created order (=j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ sort_beads(): three WARN lines (=3)
+  ✓ sort_beads(): reclaim order (=d-p0-feat-old,j-p0-feat-reclaimed,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ sort_beads([]) is ([], []), not None (=[]/[])
+  ✓ sort_beads(non-list) is (None, [reason]) (=True/1)
+  ✓ sort_beads(unknown age) is None (=True)
+  ✓ sort_beads(library missing) is None (=True)
+-- WORK_ORDER_LIB override is never silent (a stale path in a daemon's environment orders by ANOTHER rule)
+  ✓ a different library path in WORK_ORDER_LIB is announced on stderr, with the path
+  ✓ an active override only warns: the order is still produced (=j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ no notice when the default library is in use (UNSET)
+  ✓ no notice when the default library is in use (work-order.sh)
+  ✓ no notice when the default library is in use (override-link.sh)
+  ✓ override + a library that fails (exit 2): empty stdout, exit 2, and the ERROR line names the override
+  ✓ override + a library that prints text, not JSON: empty stdout, exit 2, and the ERROR line names the override
+  ✓ override + a library that prints an object: empty stdout, exit 2, and the ERROR line names the override
+  ✓ override + a library path that does not exist: empty stdout, exit 2, and the ERROR line names the override
+== (k) sourcing twice is a no-op and survives set -euo pipefail (bash 3.2 and PATH bash)
+  ✓ bash 3.2.57: sourced twice under set -euo pipefail prints only REACHED (=REACHED)
+  ✓ bash 3.2.57: work_order_sort under set -euo pipefail, created order (=j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ bash 3.2.57: work_order_sort under set -euo pipefail, reclaim order (=d-p0-feat-old,j-p0-feat-reclaimed,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ bash 3.2.57: a guarded failing call is caught and the shell goes on (=CAUGHT []
+REACHED)
+  ✓ bash 3.2.57: work_order_head of [] under set -euo pipefail (=null)
+  ✓ bash 3.2.57: sourcing leaves no file behind (=0)
+  ✓ bash 5.3.15: sourced twice under set -euo pipefail prints only REACHED (=REACHED)
+  ✓ bash 5.3.15: work_order_sort under set -euo pipefail, created order (=j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ bash 5.3.15: work_order_sort under set -euo pipefail, reclaim order (=d-p0-feat-old,j-p0-feat-reclaimed,c-p0-feat-new,a-p0-bug-old,e-p0-task-new,b-p1-feat-old,i-p2-bug-ok,h-p2-bug-badage,g-p2-notype,f-nullprio-feat)
+  ✓ bash 5.3.15: a guarded failing call is caught and the shell goes on (=CAUGHT []
+REACHED)
+  ✓ bash 5.3.15: work_order_head of [] under set -euo pipefail (=null)
+  ✓ bash 5.3.15: sourcing leaves no file behind (=0)
+  ✓ the library defines exactly three functions (=work_order_cfg work_order_head work_order_sort )
+  ✓ WORK_ORDER_FEATURE_TYPES is defined
+  ✓ WORK_ORDER_JQ_DEFS is defined
+  ✓ bash -n work-order.sh
+  ✓ bash -n work-order.selftest.sh
+  ✓ work_order.py compiles
+== (R) registry lint: the real tree
+  ✓ the real tree is clean (exit) (=0)
+  ✓ the real tree has no finding (=0)
+  ✓ the lint prints its summary: LINT: files=303 idiom_lines=58 rows=55 consumer_rows_left=15 unassigned=4 ext=4 reviewed=36 empty_globs=0
+  ✓ the printed LINT SCOPE is the expected glob list (=LINT SCOPE: packs/town-deltas/assets/*.sh packs/town-deltas/assets/scripts/*.sh packs/town-deltas/orders/*.toml packs/town-deltas/formulas/*.toml packs/town-deltas/template-fragments/*.md formulas/*.toml commands/*.md agents/*/prompt.template.md scripts/*.sh scripts/*.py (not: selftests, test_*.py, work-order.sh, work_order.py))
+  ✓ a clean run prints LINT SEES
+  ✓ a clean run prints LINT NOT SEEN
+  ✓ the real tree: every scope glob matches a file (empty_globs=0)
+  ✓ the real tree: no LINT NOTE (=0)
+  ✓ a consumer row is owned by ga-q8tj7p
+  ✓ a consumer row is owned by ga-9t9acg.2
+  ✓ a consumer row is owned by ga-9t9acg.3
+  ✓ a consumer row is owned by ga-9t9acg.4
+  ✓ a consumer row is owned by ga-9t9acg.5
+  ✓ a consumer row is owned by ga-9t9acg.6
+  ✓ a consumer row is owned by ga-9t9acg.8
+  ✓ a consumer row is owned by ga-9t9acg.9
+  ✓ a consumer row is owned by ga-9t9acg.10
+  ✓ a consumer row is owned by ga-9t9acg.13
+  ✓ an ext row is owned by ga-9t9acg.7
+  ✓ an ext row is owned by ga-9t9acg.11
+  ✓ an ext row is owned by ga-9t9acg.12
+== (R) registry lint: synthetic trees
+  ✓ a tree without idioms: exit (=0)
+  ✓ a tree without idioms: idiom_lines=0
+  ✓ a tree with one file in scope: nine empty globs are counted
+  ✓ a tree with one file in scope: one LINT NOTE per empty glob (=9)
+  ✓ the LINT NOTE names the glob
+  ✓ an unregistered sort_by: exit 1 (=1)
+  ✓ a failing run prints LINT SCOPE
+  ✓ a failing run prints LINT SEES
+  ✓ a failing run prints LINT NOT SEEN
+  ✓ the finding names file and line (3)
+  ✓ a comment line is not a hit
+  ✓ registered: exit 0 (=0)
+  ✓ registered: consumer_rows_left=1
+  ✓ migrated without deleting the row: exit 1 (=1)
+  ✓ migrated without deleting the row: STALE
+  ✓ a second, unmatched idiom line: exit 1 (=1)
+  ✓ exactly one finding, for line 3 (=1/1)
+  ✓ every idiom class and every scope glob is seen (6 findings) (=6)
+  ✓ seen: a.sh
+  ✓ seen: b.sh
+  ✓ seen: c.py
+  ✓ seen: d.sh
+  ✓ seen: prompt.template.md
+  ✓ seen: scripts/e.sh
+  ✓ one finding per SCOPE glob (10 globs) (=10)
+  ✓ every glob has a file: empty_globs=0
+  ✓ every glob has a file: no LINT NOTE (=0)
+  ✓ scope glob is scanned: packs/town-deltas/assets/*.sh
+  ✓ scope glob is scanned: packs/town-deltas/assets/scripts/*.sh
+  ✓ scope glob is scanned: packs/town-deltas/orders/*.toml
+  ✓ scope glob is scanned: packs/town-deltas/formulas/*.toml
+  ✓ scope glob is scanned: packs/town-deltas/template-fragments/*.md
+  ✓ scope glob is scanned: formulas/*.toml
+  ✓ scope glob is scanned: commands/*.md
+  ✓ scope glob is scanned: agents/*/prompt.template.md
+  ✓ scope glob is scanned: scripts/*.sh
+  ✓ scope glob is scanned: scripts/*.py
+  ✓ shape flagged: M1 sort_by
+  ✓ shape flagged: M1 min_by
+  ✓ shape flagged: M1 max_by
+  ✓ shape flagged: M1 call left open at end of line
+  ✓ shape flagged: M1 min_by left open
+  ✓ shape flagged: M2 --sort
+  ✓ shape flagged: M2 Python list-form --sort
+  ✓ shape flagged: M3 _PILOT_SORT_JQ
+  ✓ shape flagged: M4 .sort(key=)
+  ✓ shape flagged: M4 sorted(key=)
+  ✓ shape flagged: M4 min(key=)
+  ✓ shape flagged: M4 max(key=)
+  ✓ shape flagged: M4 sorted( left open
+  ✓ shape flagged: M4 .sort( left open
+  ✓ shape flagged: M5 --limit N
+  ✓ shape flagged: M5 --limit=N
+  ✓ shape flagged: M5 --limit "$N"
+  ✓ shape flagged: M5 --limit $N
+  ✓ shape flagged: M5 --limit=${N}
+  ✓ shape flagged: M5 f-string --limit={n}
+  ✓ shape flagged: M5 list-form "--limit", "20"
+  ✓ shape flagged: M5 list-form "--limit", n
+  ✓ shape flagged: M5 list-form "--limit", str(n)
+  ✓ shape flagged: M5 list-form "-n", "200"
+  ✓ shape flagged: M5 list-form "-n", variable
+  ✓ shape flagged: M5 list-form "-n", "100"] on a continuation line
+  ✓ shape flagged: M5 shell bd list -n N
+  ✓ shape flagged: M5 shell "$BD" list -n N
+  ✓ shape flagged: M5 shell bd ready -n $N
+  ✓ shape not flagged: --limit 0 (the whole population)
+  ✓ shape not flagged: --limit=0
+  ✓ shape not flagged: list-form "--limit", "0"
+  ✓ shape not flagged: list-form "-n", "0"
+  ✓ shape not flagged: tail -n
+  ✓ shape not flagged: sed -n
+  ✓ shape not flagged: jq -n
+  ✓ shape not flagged: [ -n ] after a bd query
+  ✓ shape not flagged: test -n after a bd query
+  ✓ shape not flagged: sysctl list-form "-n"
+  ✓ shape not flagged: usage text: --limit N
+  ✓ shape not flagged: argparse --limit
+  ✓ shape not flagged: sorted() of names, no bead field
+  ✓ blind spot is documented in LINT NOT SEEN: a sort keyed through a helper
+  ✓ blind spot is documented in LINT NOT SEEN: a text pipeline
+  ✓ blind spot is documented in LINT NOT SEEN: a window assembled from pieces
+  ✓ blind spot is documented in LINT NOT SEEN: a window on another line than its flag
+  ✓ a file in docs/ is out of scope, and LINT NOT SEEN says so
+  ✓ selftests, test_*.py and the library itself are out of scope (=0)
+  ✓ only clean.sh was scanned (files=1)
+  ✓ a root with no file in scope cannot tell (a mistyped --root is not a clean tree): stdout empty (=)
+  ✓ a root with no file in scope: exit 2 (=2)
+  ✓ a reviewed row covers a non-bead sort (=0)
+  ✓ reviewed=1 in the summary
+  ✓ an ext row is not scanned; an UNASSIGNED consumer is allowed (=0)
+  ✓ unassigned=1 ext=1 reported
+  ✓ a row with four columns -> fail
+  ✓ an unknown kind -> fail
+  ✓ a consumer owned by a nobody -> fail
+  ✓ a reviewed row with an owner -> fail
+  ✓ an ext row with a regex -> fail
+  ✓ a regex that does not compile -> fail
+  ✓ a row with an empty note -> fail
+  ✓ a row for a file that does not exist -> fail
+  ✓ duplicate rows -> fail
+  ✓ a missing registry cannot tell: stdout empty (=)
+  ✓ a missing registry: exit 2 (=2)
+== (j) mutation controls: each mutant of the library / lint must make this selftest fail
+  ✓ mutant priority-only is killed by: P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4: expected
+  ✓ mutant bug-before-feature is killed by: P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4: expected
+  ✓ mutant newest-first is killed by: P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4: expected
+  ✓ mutant today-bd-default is killed by: P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4: expected
+  ✓ mutant today-pilot-bug-first is killed by: P0 feat old < P0 feat new < P0 bug old < P0 task new < P1 feat < P1 bug < P2 feat < P2 bug < P3 < P4: expected
+  ✓ mutant age-as-text is killed by: the 10-bead fixture raises exactly the three expected WARNs: expected [f-nullprio-feat: prio?;g-p2-notype: typ
+  ✓ mutant no-warn is killed by: the 10-bead fixture raises exactly the three expected WARNs: expected [f-nullprio-feat: prio?;g-p2-notype: typ
+  ✓ mutant illegible-prio-is-p0 is killed by: the 10-bead fixture, created mode (hand-checked): expected [j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-
+  ✓ mutant illegible-age-first is killed by: the 10-bead fixture, created mode (hand-checked): expected [j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-
+  ✓ mutant illegible-type-is-known is killed by: the 10-bead fixture, created mode (hand-checked): expected [j-p0-feat-reclaimed,d-p0-feat-old,c-p0-feat-new,a-
+  ✓ mutant story-not-feature is killed by: story is an alias of feature (never hidden behind a P0 bug): expected [p0-story,p0-feat,p0-bug], got [p0-feat,
+  ✓ mutant type-only-issue_type is killed by: unknown types trail the known ones inside P2 (and are not pushed behind other priorities): expected [p1-notype
+  ✓ mutant no-id-tiebreak is killed by: unreadable ages trail their class (by id), P3 stays behind all of P2: expected [ok-old,ok-new,u-space,v-offset
+  ✓ mutant reclaim-ignores-label is killed by: reclaim mode: it sinks behind the newest normal feature of its class, still ahead of a P1: expected [feat-old,
+  ✓ mutant reclaim-zero-counts is killed by: count 0, junk counts, other labels, absent/null labels keep created_at; a reclaimed bead with no updated_at, a
+  ✓ mutant field-falls-back-to-created is killed by: ordered by _wo_age; a bead without a readable marker goes to the end of its class: expected [older-created,new
+  ✓ mutant failure-prints-empty-array is killed by: empty stdin: out=[[]] rc=0 err=[work-order ERROR: work_order_sort: cannot tell (jq: error (at <stdin>:0): stdi
+  ✓ mutant head-failure-prints-null is killed by: head of []: out=[null] rc=0
+  ✓ mutant empty-feature-list-accepted is killed by: work_order_cfg with an empty feature list: stdout empty: expected [], got [{"age":"created","feature_types":[]
+  ✓ mutant bad-age-accepted is killed by: unknown --age: out=[[]] rc=0 err=[]
+  ✓ mutant side-effect-at-source is killed by: jq missing: stdout empty: expected [], got [LEAK]
+  ✓ mutant bash4-only-syntax is killed by: bash 3.2.57: sourced twice under set -euo pipefail prints only REACHED: expected [REACHED], got [/private/tmp/
+  ✓ mutant lint-never-unregistered is killed by: an unregistered sort_by: exit 1: expected [1], got [0]
+  ✓ mutant lint-never-stale is killed by: migrated without deleting the row: exit 1: expected [1], got [0]
+  ✓ mutant lint-reads-comments is killed by: the real tree is clean (exit): expected [0], got [1]
+  ✓ mutant lint-skips-selftests is killed by: the real tree is clean (exit): expected [0], got [1]
+  ✓ mutant type-case-sensitive is killed by: the type is case-insensitive (the Pilot lowercases it): Feature / STORY are features: expected [p2-Story,p2-FE
+  ✓ mutant feature-list-not-lowercased is killed by: a feature list written in capitals is lowercased by work_order_cfg: expected [["feature","story"]], got [["Fea
+  ✓ mutant env-feature-types-overwritten is killed by: an exported WORK_ORDER_FEATURE_TYPES survives sourcing the library: expected [bug], got [feature story]
+  ✓ mutant env-empty-feature-types-replaced is killed by: an EMPTY export is not replaced by the default (it is refused): stdout empty: expected [], got [{"age":"create
+  ✓ mutant calendar-rolls-over is killed by: a date the calendar does not have is unreadable, not rolled over (2026-02-31 is NOT 03-03); a real 02-29 is fi
+  ✓ mutant no-id-warn is killed by: id? WARN missing: [work-order WARN: ?: id?] in []
+  ✓ mutant jq-missing-not-named is killed by: jq missing is not reported as such: [work-order ERROR: work_order_cfg: /private/tmp/claude-501/-Users-athos-gt
+  ✓ mutant bad-option-not-named is killed by: the bad option is not named: [work-order ERROR: work_order_cfg: bad option]
+  ✓ mutant age-judged-after-rewrite is killed by: a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (
+  ✓ mutant age-end-unanchored is killed by: a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (
+  ✓ mutant age-start-unanchored is killed by: a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (
+  ✓ mutant age-dollar-anchor is killed by: a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (
+  ✓ mutant age-fraction-may-be-empty is killed by: a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (
+  ✓ mutant reclaim-label-dollar-anchor is killed by: a label is judged WHOLE: 'pilot:reclaim-count:2<newline>' is not a reclaim marker (a regex $ also matches befo
+  ✓ mutant head-accepts-non-objects is killed by: head of [null,{"id":"x"}]: out=[null] rc=0
+  ✓ mutant head-error-names-no-cause is killed by: head's ERROR line does not name the cause
+  ✓ mutant override-never-announced is killed by: an active override is silent: [work-order WARN: h-p2-bug-badage: age?
+  ✓ mutant override-always-announced is killed by: no override notice expected for [/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-ord
+  ✓ mutant override-spelling-is-not-identity is killed by: no override notice expected for [/Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/work-ord
+  ✓ mutant override-notice-has-no-path is killed by: an active override is silent: [work-order WARN: WORK_ORDER_LIB override active (not the town's library /privat
+  ✓ mutant override-lost-on-library-failure is killed by: override + a library that fails (exit 2): out=[] rc=2 err=[work-order ERROR: work_order.py: cannot tell (work-
+  ✓ mutant override-lost-on-non-json is killed by: override + a library that prints text, not JSON: out=[] rc=2 err=[work-order ERROR: work_order.py: cannot tell
+  ✓ mutant override-lost-on-non-array is killed by: override + a library that prints an object: out=[] rc=2 err=[work-order ERROR: work_order.py: cannot tell (lib
+  ✓ mutant override-lost-when-library-cannot-run is killed by: override + a library path that does not exist: out=[] rc=2 err=[work-order ERROR: work_order.py: cannot tell (
+  ✓ mutant lint-drops-sort-flag-idiom is killed by: every idiom class and every scope glob is seen (6 findings): expected [6], got [4]
+  ✓ mutant lint-drops-pilot-sort-idiom is killed by: every idiom class and every scope glob is seen (6 findings): expected [6], got [5]
+  ✓ mutant lint-drops-min_by-max_by is killed by: shape NOT flagged — the lint is blind to it: M1 min_by :: jq 'min_by(.created_at)' (rc=0)
+  ✓ mutant lint-drops-open-sort_by is killed by: shape NOT flagged — the lint is blind to it: M1 call left open at end of line :: jq 'sort_by( (rc=0)
+  ✓ mutant lint-drops-open-py-sort is killed by: shape NOT flagged — the lint is blind to it: M4 sorted( left open :: layer = sorted( (rc=0)
+  ✓ mutant lint-drops-py-min-max is killed by: shape NOT flagged — the lint is blind to it: M4 min(key=) :: o = min(rows, key=lambda b: b["updated_at"]) (r
+  ✓ mutant lint-drops-shell-limit is killed by: every idiom class and every scope glob is seen (6 findings): expected [6], got [5]
+  ✓ mutant lint-drops-list-form-limit is killed by: shape NOT flagged — the lint is blind to it: M5 list-form "--limit", "20" :: _sh(["bd", "list", "--json", "-
+  ✓ mutant lint-drops-list-form-n is killed by: shape NOT flagged — the lint is blind to it: M5 list-form "-n", "200" :: r = _sh([BD, "-C", root, "list", "-
+  ✓ mutant lint-drops-shell-n is killed by: shape NOT flagged — the lint is blind to it: M5 shell bd list -n N :: bd list --status open -n 100 (rc=0)
+  ✓ mutant lint-drops-dollar-bd is killed by: shape NOT flagged — the lint is blind to it: M5 shell "$BD" list -n N :: "$BD" -C "$dir" list -n 5 --json (r
+  ✓ mutant lint-counts-zero-as-a-window is killed by: the real tree is clean (exit): expected [0], got [1]
+  ✓ mutant lint-flags-tail-n is killed by: the real tree is clean (exit): expected [0], got [1]
+  ✓ mutant lint-empty-glob-is-quiet is killed by: empty globs not counted: LINT: files=1 idiom_lines=0 rows=0 consumer_rows_left=0 unassigned=0 ext=0 reviewed=0
+  ✓ mutant lint-hides-glob-note is killed by: a tree with one file in scope: one LINT NOTE per empty glob: expected [9], got [0]
+  ✓ mutant lint-uncounted-empty-globs is killed by: empty globs not counted: LINT: files=1 idiom_lines=0 rows=0 consumer_rows_left=0 unassigned=0 ext=0 reviewed=0
+  ✓ mutant lint-hides-scope is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-hides-sees is killed by: no LINT SEES line: LINT: files=303 idiom_lines=58 rows=55 consumer_rows_left=15 unassigned=4 ext=4 reviewed=36
+  ✓ mutant lint-hides-not-seen is killed by: no LINT NOT SEEN line: LINT: files=303 idiom_lines=58 rows=55 consumer_rows_left=15 unassigned=4 ext=4 reviewe
+  ✓ mutant lint-not-seen-lies is killed by: docs/ is not documented as out of scope (rc=0)
+  ✓ mutant lint-drops-scope-glob-packs_town_deltas_assets___sh is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-packs_town_deltas_assets_scripts___sh is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-packs_town_deltas_orders___toml is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-packs_town_deltas_formulas___toml is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-packs_town_deltas_template_fragments___md is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-formulas___toml is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-commands___md is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-agents___prompt_template_md is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-scripts___sh is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-drops-scope-glob-scripts___py is killed by: the printed LINT SCOPE is the expected glob list: expected [LINT SCOPE: packs/town-deltas/assets/*.sh packs/to
+  ✓ mutant lint-empty-scope-is-clean is killed by: a root with no file in scope cannot tell (a mistyped --root is not a clean tree): stdout empty: expected [], g
+
+RESULT: PASS (342 passed, 0 skipped)
+selftest rc=0
