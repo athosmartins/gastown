@@ -297,10 +297,13 @@ desliga com menos de 8** (entre os dois, fica como estava). Uma notificação ao
 uma ao desligar; uma escalação se ficar ligado mais de 24 h.
 
 **Ligado, os workers genéricos (dog, wa-worker, ps-worker) não pegam bead NOVA.** Só
-pegam conserto do que o gate já reprovou (`gate:needs-fix` ou `gate:fix-attempt:N`), com
-no máximo 2 sessões por pool. Isso vale no Pilot, na sonda de cada worker e no teto de
+pegam conserto: do que o gate já reprovou (`gate:needs-fix` ou `gate:fix-attempt:N`), de
+falha de produção aberta pelo autoconserto (`origem:auto-healer-notify`) e de bug com
+`impacto:dano-ao-vivo` (decisão do Athos 07/10: quebra em produção não é "trabalho novo"),
+com no máximo 2 sessões por pool. Isso vale no Pilot, na sonda de cada worker e no teto de
 dogs. Se a sua sonda voltar `[]` com o modo ligado, não procure bead nova por outro
-caminho: drene. **Crews não são tocadas pelo automático** — quem decide crew é o Athos.
+caminho: drene. **Nenhuma crew é suspensa pelo automático** (quem decide crew é o Athos), mas o Pilot
+também só manda conserto pra crew enquanto o modo estiver ligado (Athos 07/10: "Não, só conserto").
 Desligar à mão: `touch .gc/gate-focus.off` (apague o arquivo para devolver ao automático).
 
 **Regra permanente do modo foco (decisão do Athos):** com o modo ligado, o **Mayor** pode

@@ -19,7 +19,9 @@ cat > "$WORK/input.json" <<'EOF'
   {"id":"ga-new","assignee":null,"labels":[],"description":"a new build"},
   {"id":"ga-needsfix","assignee":null,"labels":["gate:failed","gate:needs-fix","gate:fix-attempt:1"],"description":"x"},
   {"id":"ga-attemptonly","assignee":null,"labels":["gate:failed","gate:fix-attempt:2"],"description":"x"},
-  {"id":"ga-other-gate","assignee":null,"labels":["gate-sha-failed:abc:code"],"description":"x"}
+  {"id":"ga-other-gate","assignee":null,"labels":["gate-sha-failed:abc:code"],"description":"x"},
+  {"id":"ga-autoheal","assignee":null,"labels":["origem:auto-healer-notify","story:approved"],"description":"x"},
+  {"id":"ga-dano","assignee":null,"labels":["impacto:dano-ao-vivo"],"description":"x"}
 ]
 EOF
 
@@ -46,18 +48,18 @@ ids() { tr '\n' ' ' < "$WORK/$1.ids" | sed 's/ $//'; }
 
 echo "Scenario 1: focus OFF — the filter is inert"
 run_filter "$DISPATCHER" off 0
-[ "$(ids off)" = "ga-attemptonly ga-needsfix ga-new ga-other-gate" ] && ok "focus off keeps all 4" || bad "focus off changed the list: [$(ids off)]"
+[ "$(ids off)" = "ga-attemptonly ga-autoheal ga-dano ga-needsfix ga-new ga-other-gate" ] && ok "focus off keeps all 6" || bad "focus off changed the list: [$(ids off)]"
 
 echo "Scenario 2: focus ON — only fixes of gate-rejected beads survive"
 run_filter "$DISPATCHER" on 1
-[ "$(ids on)" = "ga-attemptonly ga-needsfix" ] && ok "focus on keeps needs-fix AND fix-attempt-only, drops the new build and the sha-only label" \
-  || bad "focus on: expected [ga-attemptonly ga-needsfix], got [$(ids on)]"
+[ "$(ids on)" = "ga-attemptonly ga-autoheal ga-dano ga-needsfix" ] && ok "focus on keeps needs-fix, fix-attempt-only, auto-healer and live-damage; drops the new build and the sha-only label" \
+  || bad "focus on: expected [ga-attemptonly ga-autoheal ga-dano ga-needsfix], got [$(ids on)]"
 
 if [ -n "$ORIG_DISPATCHER" ]; then
-  echo "Differential: the pre-patch dispatcher must NOT filter (proves the test sees the change)"
+  echo "Differential: a pre-patch dispatcher must give a DIFFERENT focus-on list (proves the test sees the change)"
   run_filter "$ORIG_DISPATCHER" orig 1
-  [ "$(ids orig)" = "ga-attemptonly ga-needsfix ga-new ga-other-gate" ] && ok "pre-patch ignores focus (the test would have caught its absence)" \
-    || bad "pre-patch output unexpected: [$(ids orig)]"
+  [ "$(ids orig)" != "$(ids on)" ] && ok "pre-patch focus-on list differs ([$(ids orig)] vs [$(ids on)])" \
+    || bad "pre-patch gives the same list [$(ids orig)] — the test cannot tell the change apart"
 fi
 
 echo "── RESULTS: $PASS passed, $FAIL failed ──"

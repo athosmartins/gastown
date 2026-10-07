@@ -3912,6 +3912,8 @@ _filter_candidates() {
     ' 2>/dev/null | _log_exclusions "_filter_candidates"
 
   # ga-kqa08j: GATE FOCUS MODE — while the gate is the bottleneck (gate-focus-mode.sh
+  # (Athos 07/10, 2nd decision: an auto-healer bead (origem:auto-healer-notify) and a live-damage
+  # bug (impacto:dano-ao-vivo) also count as fixes — a production breakage is not "new work".)
   # decided it, read once per sweep into PILOT_GATE_FOCUS), only a FIX of something the
   # gate already rejected may be dispatched: gate:needs-fix, or gate:fix-attempt:N (five
   # gate paths remove needs-fix but keep fix-attempt, ga-ltjdx). A new build waits until
@@ -3920,7 +3922,7 @@ _filter_candidates() {
   # real queue.
   if [ "${PILOT_GATE_FOCUS:-0}" = "1" ]; then
     local _cf_focus
-    if _cf_focus=$(printf '%s' "$_cf_out" | jq -c '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:")))]' 2>/dev/null); then
+    if _cf_focus=$(printf '%s' "$_cf_out" | jq -c '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:") or . == "origem:auto-healer-notify" or . == "impacto:dano-ao-vivo"))]' 2>/dev/null); then
       _cf_out="$_cf_focus"
     else
       # Could not apply the filter: dispatch nothing from this list rather than let new
