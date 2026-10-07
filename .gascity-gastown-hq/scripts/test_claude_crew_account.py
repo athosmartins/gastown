@@ -140,7 +140,7 @@ def _pin_env(monkeypatch, tmp_path):
     g = _GUARD["dir"]
     for k, v in {"CLAUDE_CREW_NOTIFY": g / "notify", "CLAUDE_CREW_SECURITY": g / "security",
                  "GC_CITY_PATH": tmp_path / "pinned-city", "CLAUDE_CREW_STATE": tmp_path / "pinned-state.json",
-                 "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json", "CLAUDE_CREW_SESSIONS_DIR": tmp_path / "pinned-sessions",
+                 "CLAUDE_CREW_DECISION": tmp_path / "pinned-decision.json",
                  "CLAUDE_CREW_ACCOUNTS_DIR": tmp_path / "pinned-accts", "HOME": tmp_path / "pinned-home"}.items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.setenv("PATH", f"{g / 'bin'}:/usr/bin:/bin")        # `which notify` / bare `security` find a sentinel, never the real one
@@ -177,12 +177,11 @@ class World:
             p.write_text(body.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))   # not the PATH's python: PATH is pinned to the sentinels
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         (self.d / "city" / ".gc" / "logs").mkdir(parents=True)
-        (self.d / "sessions").mkdir()
         self.now = time.time()
         for k, v in {
             "FAKE_SEC_DIR": str(self.d), "CLAUDE_CREW_SECURITY": str(self.d / "security"),
             "CLAUDE_CREW_NOTIFY": str(self.d / "notify"), "CLAUDE_CREW_STATE": str(self.d / "crew_state.json"),
-            "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"), "CLAUDE_CREW_SESSIONS_DIR": str(self.d / "sessions"),
+            "CLAUDE_CREW_DECISION": str(self.d / "pool_decision.json"),
             "CLAUDE_CREW_ACCOUNTS_DIR": str(self.d / "accts"), "CLAUDE_CREW_USER": "athos", "GC_CITY_PATH": str(self.d / "city"),
             "CLAUDE_CREW_PROFILE_URL": f"http://127.0.0.1:{self.srv.server_address[1]}/profile", "CLAUDE_CREW_NOW": str(self.now),
         }.items():
@@ -191,7 +190,7 @@ class World:
             monkeypatch.delenv(k, raising=False)
         self.mp = monkeypatch
         # the world must be sealed: every seam inside this tmp dir, none of them a sentinel
-        for fn in (crew.security_bin, crew.state_path, crew.decision_path, crew.sessions_dir):
+        for fn in (crew.security_bin, crew.state_path, crew.decision_path):
             assert str(fn()).startswith(str(self.d)), f"{fn.__name__} escapes the test world: {fn()}"
         assert os.environ["CLAUDE_CREW_NOTIFY"].startswith(str(self.d)) and str(crew.city()).startswith(str(self.d))
 
@@ -504,53 +503,6 @@ def test_dry_run_writes_nothing_notifies_nobody_and_leaves_the_real_log_alone(w)
     assert not (w.d / "crew_state.json").exists()
 
 
-# ── 10. Remote Control is verified after a switch ─────────────────────────────
-def _session(w, pid, bridge):
-    d = {"pid": pid, "status": "idle", "sessionId": f"s{pid}"}
-    if bridge:
-        d["bridgeSessionId"] = bridge
-    (w.d / "sessions" / f"{pid}.json").write_text(json.dumps(d))
-
-
-def test_remote_control_bridges_are_checked_a_minute_after_the_switch(w):
-    me, parent = os.getpid(), os.getppid()
-    _session(w, me, "cse_a")
-    _session(w, parent, "cse_b")
-    w.default("crypto", blob("crypto"))
-    w.account("amb", blob("amb"))
-    w.decide("amb")
-    w.run()
-    assert set(w.state()["pending_verify"]["pids"]) == {str(me), str(parent)}
-    w.run(at=w.now + 90)                                          # both bridges still there: all good, the check clears
-    assert "pending_verify" not in w.state() and "rc_lost" not in w.state()
-    assert "all 2 Remote Control bridges are still up" in w.log()
-
-
-def test_a_bridge_lost_after_the_switch_is_reported(w):
-    me, parent = os.getpid(), os.getppid()
-    _session(w, me, "cse_a")
-    _session(w, parent, "cse_b")
-    w.default("crypto", blob("crypto"))
-    w.account("amb", blob("amb"))
-    w.decide("amb")
-    w.run()
-    _session(w, parent, None)                                     # this one lost its bridge
-    w.run(at=w.now + 90)
-    assert w.state()["rc_lost"]["pids"] == [parent]
-    assert any("lost Remote Control" in n for n in w.notified())
-
-
-def test_not_yet_a_minute_does_not_judge(w):
-    _session(w, os.getpid(), "cse_a")
-    w.default("crypto", blob("crypto"))
-    w.account("amb", blob("amb"))
-    w.decide("amb")
-    w.run()
-    _session(w, os.getpid(), None)
-    w.run(at=w.now + 20)
-    assert "pending_verify" in w.state() and w.notified() == []
-
-
 # ══ gate fix (ga-qdtmq2, verdict on 581c67bb) ════════════════════════════════════════════════════════════════════
 def _own(w, key):
     return w.src_service(key)
@@ -748,98 +700,6 @@ def test_a_dry_run_that_loses_the_lock_says_so_instead_of_printing_nothing(w, ca
     assert "lock" in capsys.readouterr().err
 
 
-# ── Remote Control verification that cannot be fooled by silence ───────────────────────────────────────────────────
-def _lstart(pid):
-    return " ".join(subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                                   env={**os.environ, "TZ": "UTC", "LC_ALL": "C"}).stdout.split())
-
-
-def test_an_unreadable_sessions_dir_before_the_switch_is_not_reported_as_all_bridges_up(w):
-    os.rename(w.d / "sessions", w.d / "sessions.gone")
-    _switch_crypto_to_amb(w)
-    w.run(at=w.now + 90)
-    assert "all 0" not in w.log() and "NOT verified" in w.log()
-
-
-def test_an_unreadable_sessions_dir_at_check_time_is_neither_success_nor_a_false_alarm_and_is_retried(w):
-    me = os.getpid()
-    _session(w, me, "cse_a")
-    _switch_crypto_to_amb(w)
-    os.rename(w.d / "sessions", w.d / "sessions.gone")
-    w.run(at=w.now + 90)
-    assert "still up" not in w.log() and "lost Remote Control" not in "".join(w.notified())
-    assert "could not read the sessions dir" in w.log() and "pending_verify" in w.state()
-    os.rename(w.d / "sessions.gone", w.d / "sessions")
-    w.run(at=w.now + 150)
-    assert "all 1 Remote Control bridges are still up" in w.log() and "pending_verify" not in w.state()
-
-
-def test_no_bridge_at_all_says_there_was_nothing_to_verify(w):
-    _switch_crypto_to_amb(w)
-    w.run(at=w.now + 90)
-    assert "all 0" not in w.log() and "no Remote Control bridge existed" in w.log()
-
-
-def test_a_reused_pid_is_not_a_live_bridge(w):
-    me = os.getpid()
-    d = {"pid": me, "bridgeSessionId": "cse_a", "procStart": "Mon Jan  1 00:00:00 2001"}   # some other process owns this pid now
-    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
-    assert crew.bridges() == {}
-    d["procStart"] = _lstart(me)                                  # the genuine start time of the live process
-    (w.d / "sessions" / f"{me}.json").write_text(json.dumps(d))
-    assert list(crew.bridges()) == [me]
-
-
-def test_sessions_that_ended_on_their_own_are_not_counted_as_bridges_that_are_up(w):
-    me = os.getpid()
-    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    try:
-        _session(w, me, "cse_a")
-        _session(w, gone.pid, "cse_b")
-        _switch_crypto_to_amb(w)
-        assert set(w.state()["pending_verify"]["pids"]) == {str(me), str(gone.pid)}
-    finally:
-        gone.kill()
-        gone.wait()                                               # this session ended by itself before the check
-    w.run(at=w.now + 90)
-    assert "all 2" not in w.log() and "1 of 2 Remote Control bridges are still up" in w.log()
-    assert "ended on their own" in w.log() and not w.notified() and "pending_verify" not in w.state()
-
-
-def test_when_every_session_ended_nothing_is_reported_as_up(w):
-    gone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    try:
-        _session(w, gone.pid, "cse_b")
-        _switch_crypto_to_amb(w)
-    finally:
-        gone.kill()
-        gone.wait()
-    w.run(at=w.now + 90)
-    assert "still up" not in w.log() and "no session was left to verify" in w.log() and "pending_verify" not in w.state()
-
-
-def test_a_verification_that_comes_too_late_is_not_blamed_on_the_switch(w):
-    me = os.getpid()
-    _session(w, me, "cse_a")
-    _switch_crypto_to_amb(w)
-    _session(w, me, None)
-    w.run(at=w.now + crew.VERIFY_GIVE_UP_S + 600)                 # the machine slept, or the job stalled
-    assert "rc_lost" not in w.state() and "pending_verify" not in w.state()
-    assert not any("lost Remote Control" in n for n in w.notified()) and "too late" in w.log()
-
-
-def test_the_bridge_check_also_runs_when_the_owner_cannot_be_told(w):
-    me = os.getpid()
-    _session(w, me, None)                                         # the bridge is gone
-    w.default("crypto", blob("crypto"))
-    w.tokens.clear()                                              # and the profile cannot say whose the default login is
-    (w.d / "crew_state.json").write_text(json.dumps({"pending_verify": {"since": w.now - 100, "to": EMAIL["amb"],
-                                                                         "pids": {str(me): "cse_a"}}}))
-    w.decide("crypto")
-    w.run()
-    assert any("lost Remote Control" in n for n in w.notified())
-
-
 # ── only the OAuth part of a blob moves ────────────────────────────────────────────────────────────────────────────
 def test_only_the_oauth_part_moves_never_the_rest_of_the_blob(w):
     cur = blob("crypto", rt="crypto-rotated")
@@ -958,7 +818,7 @@ def test_a_missing_state_file_is_normal_and_silent(w):
 
 # ── the script as launchd runs it: empty environment, both interpreters ───────────────────────────────────────────
 SEAMS = ("FAKE_SEC_DIR", "CLAUDE_CREW_SECURITY", "CLAUDE_CREW_NOTIFY", "CLAUDE_CREW_STATE", "CLAUDE_CREW_DECISION",
-         "CLAUDE_CREW_SESSIONS_DIR", "CLAUDE_CREW_ACCOUNTS_DIR", "CLAUDE_CREW_USER", "GC_CITY_PATH", "CLAUDE_CREW_PROFILE_URL",
+         "CLAUDE_CREW_ACCOUNTS_DIR", "CLAUDE_CREW_USER", "GC_CITY_PATH", "CLAUDE_CREW_PROFILE_URL",
          "CLAUDE_CREW_NOW")
 
 
