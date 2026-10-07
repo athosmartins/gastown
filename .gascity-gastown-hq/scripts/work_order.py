@@ -10,6 +10,10 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
 
   sort   stdin: ONE JSON array of bead objects (`bd list/ready --json`). stdout: the ordered array,
          exit 0. The library's `work-order WARN:` lines go to stderr unchanged.
+         If WORK_ORDER_LIB points at a library other than the one next to this module, the run is
+         ordered by ANOTHER rule than the town's: stderr then starts with one
+         `work-order WARN: WORK_ORDER_LIB override active: <path> ...` line (a stale variable in a daemon's
+         environment must never be silent). The selftest uses the override for its mutants.
          Cannot tell (not an array, jq/bash missing, library failed) -> stdout EMPTY, exit 2.
          Callers MUST treat empty as "I do not know" and keep their previous order with a visible
          WARN — it never means "no bead".
@@ -55,6 +59,22 @@ def lib_path():
     return os.path.normpath(os.environ.get("WORK_ORDER_LIB") or _DEFAULT_LIB)
 
 
+def _override_notice():
+    """None when the library in use is the one shipped next to this module; else the WARN line that says so.
+
+    WORK_ORDER_LIB exists so the selftest can point at a mutant. In a daemon's environment it is a stale
+    variable waiting to happen: the queue would be ordered by another rule and nothing would show it.
+    Compared by realpath, so a symlink or a ./ spelling of the default is not an override."""
+    if not os.environ.get("WORK_ORDER_LIB"):
+        return None
+    lib = lib_path()
+    if os.path.realpath(lib) == os.path.realpath(_DEFAULT_LIB):
+        return None
+    return ("work-order WARN: WORK_ORDER_LIB override active: %s (not the town's library %s); "
+            "the order below is NOT the town's rule unless that file is a copy of it"
+            % (lib, os.path.normpath(_DEFAULT_LIB)))
+
+
 def _run_lib(raw, age):
     if age not in AGES:
         raise WorkOrderUnknown("unknown age rule %r (want one of %s)" % (age, ", ".join(AGES)))
@@ -73,17 +93,20 @@ def _run_lib(raw, age):
 
 def sort_beads_raw(raw, age="created"):
     """bytes in (one JSON array) -> (ordered array as parsed JSON, stderr text with the WARN lines)."""
+    notice = _override_notice()
     proc = _run_lib(raw, age)
     err = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0 or not proc.stdout.strip():
         first = err.strip().splitlines()[0] if err.strip() else "exit %d, no output" % proc.returncode
-        raise WorkOrderUnknown(first)
+        raise WorkOrderUnknown(first + ("; " + notice if notice else ""))
     try:
         out = json.loads(proc.stdout)
     except ValueError as exc:
         raise WorkOrderUnknown("library output is not JSON: %s" % exc)
     if not isinstance(out, list):
-        raise WorkOrderUnknown("library output is not an array")
+        raise WorkOrderUnknown("library output is not an array" + ("; " + notice if notice else ""))
+    if notice:
+        err = notice + "\n" + err
     return out, err
 
 

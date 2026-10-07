@@ -211,6 +211,37 @@ for w in 'work-order WARN: ?: id?' 'work-order WARN: 7: id?' 'work-order WARN: :
   if printf '%s\n' "$SORT_ERR" | grep -qxF -- "$w"; then ok "id? WARN: $w"; else bad "id? WARN missing: [$w] in [$SORT_ERR]"; fi
 done
 eq "and no other bead is WARNed" "$(printf '%s\n' "$SORT_ERR" | grep -c .)" "3"
+# The SHAPE of the original string is what is judged, anchored at both ends; only afterwards is the fraction of the
+# SECONDS field dropped and +00:00 read as Z. A ".digits" anywhere else is not a fraction (gate round 3: the old
+# unanchored sub() repaired these into a valid date and the round trip then validated the repaired string).
+FD4="$TMP/age-shape.json"
+{
+  B ok-old 2 bug 2026-10-05T09:00:00Z
+  B ok-frac 2 bug 2026-10-05T10:00:00.123456789Z
+  B ok-off 2 bug 2026-10-05T10:30:00.5+00:00
+  B ok-new 2 bug 2026-10-05T11:00:00Z
+  B x-after-z 2 bug "2026-10-05T10:00:00Z.999"
+  B x-on-date 2 bug "2026-10-05.5T10:00:00Z"
+  B x-on-year 2 bug "2026.5-10-05T10:00:00Z"
+  B x-on-hour 2 bug "2026-10-05T10.5:00:00Z"
+  B x-bare-dot 2 bug "2026-10-05T10:00:00.Z"
+  B x-two-frac 2 bug "2026-10-05T10:00:00.1.2Z"
+  B x-newline 2 bug $'2026-10-05T10:00:00Z\n'
+  B x-junk-line 2 bug $'junk\n2026-10-05T10:00:00Z'
+  B x-lower-z 2 bug "2026-10-05T10:00:00z"
+  B x-pad 2 bug " 2026-10-05T10:00:00Z "
+} | arr > "$FD4"
+expect_order "a '.digits' outside the seconds field, a trailing newline, padding or a lowercase z make the date unreadable (end of class by id); real fractions still parse" created "$FD4" \
+  "ok-old,ok-frac,ok-off,ok-new,x-after-z,x-bare-dot,x-junk-line,x-lower-z,x-newline,x-on-date,x-on-hour,x-on-year,x-pad,x-two-frac"
+eq "age? WARN for each of the ten malformed shapes, none for the four real ones" "$(warns)" \
+  "x-after-z: age?;x-bare-dot: age?;x-junk-line: age?;x-lower-z: age?;x-newline: age?;x-on-date: age?;x-on-hour: age?;x-on-year: age?;x-pad: age?;x-two-frac: age?;"
+FD5="$TMP/age-shape-field.json"
+{
+  B ok 2 bug 2026-01-01T00:00:00Z | jq -c '._wo_age = "2026-10-05T10:00:00.5Z"'
+  B bad 2 bug 2026-01-01T00:00:00Z | jq -c '._wo_age = "2026-10-05T10:00:00Z.999"'
+} | arr > "$FD5"
+expect_order "the field age goes through the same judge: a malformed _wo_age is age-unreadable" field "$FD5" "ok,bad"
+eq "and is WARNed" "$(warns)" "bad: age?;"
 fi
 
 # ── (e) timestamps ──────────────────────────────────────────────────────────────────────────────
@@ -256,6 +287,15 @@ expect_order "count 0, junk counts, other labels, absent/null labels keep create
 eq "exactly those two are warned" "$(warns)" "nouptd: age?;strlab: age?;"
 expect_order "the same fixture in created mode needs no labels at all: every bead keeps created_at, no WARN" created "$FF2" "nouptd,zero,junk,norl,nolab,nullab,strlab"
 eq "created mode: no WARN for the fixture" "$(warns)" ""
+FF3="$TMP/reclaim3.json"
+{
+  B nl-label 0 feature 2026-05-15T00:00:00Z 2026-10-05T20:00:00Z '["pilot:reclaim-count:2\n"]'
+  B real-reclaim 0 feature 2026-05-16T00:00:00Z 2026-10-05T21:00:00Z '["pilot:reclaim-count:2"]'
+  B plain 0 feature 2026-09-01T00:00:00Z
+} | arr > "$FF3"
+expect_order "a label is judged WHOLE: 'pilot:reclaim-count:2<newline>' is not a reclaim marker (a regex \$ also matches before a final newline); the real marker still is" \
+  reclaim "$FF3" "nl-label,plain,real-reclaim"
+eq "no WARN: a label that is not a marker is just a label" "$(warns)" ""
 
 echo "== (f2) field: the caller injects _wo_age (the stage's own marker); no fallback to created_at"
 FFD="$TMP/field.json"
@@ -356,19 +396,27 @@ for t in "" "nope" '{"id":"x"}' '[] []'; do
 done
 out="$(: | work_order_sort 2>/dev/null | work_order_head 2>/dev/null)"
 eq "a failed sort piped into head stays EMPTY (it never reads as 'no bead')" "$out" ""
+# raw `bd --json` piped straight in (no work_order_sort in between) must not read a non-bead as THE bead:
+# jq's .[0] prints the literal null for [null,{...}] — the same text as "no bead" for []
+for t in '[null,{"id":"x"}]' '[1]' '[{"id":"x"},"y"]' '[[]]' '["x"]'; do
+  out="$(printf '%s' "$t" | work_order_head 2>"$TMP/err")"; rc=$?
+  if [ -z "$out" ] && [ "$rc" -eq 2 ]; then ok "head of $t (an element that is not a bead object) -> empty stdout, exit 2"; else bad "head of $t: out=[$out] rc=$rc"; fi
+done
+case "$(printf '%s' '[null,{"id":"x"}]' | work_order_head 2>&1 >/dev/null)" in *"not an object"*) ok "the ERROR line names the cause (an element is not an object)" ;; *) bad "head's ERROR line does not name the cause" ;; esac
+eq "head of a one-bead array is that bead" "$(printf '%s' '[{"id":"x","priority":0}]' | work_order_head)" '{"id":"x","priority":0}'
 fi
 
 # ── (i) python == bash ──────────────────────────────────────────────────────────────────────────
 if want i; then
 echo "== (i) python == bash on the same fixtures"
 for mode in created reclaim field; do
-  case "$mode" in field) f="$FFD" ;; *) f="$F10" ;; esac
+  case "$mode" in field) f="${FFD:-}" ;; *) f="$F10" ;; esac   # FFD is built by (f): unset under WO_ONLY=i
   [ -r "$f" ] || { skip "fixture for $mode not built (run without WO_ONLY)"; continue; }
   run_sort "$mode" "$f"; bash_out="$(printf '%s' "$SORT_OUT" | jq -cS '.')"; bash_warn="$(warns)"
   py_out="$(python3 -I -B "$PY" sort --age "$mode" < "$f" 2>"$TMP/pyerr")"; py_rc=$?
   eq "$mode: python CLI exit" "$py_rc" "0"
   eq "$mode: python output == bash output" "$(printf '%s' "$py_out" | jq -cS '.')" "$bash_out"
-  eq "$mode: python WARN lines == bash WARN lines" "$(sed -n 's/^work-order WARN: //p' "$TMP/pyerr" | sort | tr '\n' ';')" "$bash_warn"
+  eq "$mode: python WARN lines == bash WARN lines" "$(sed -n 's/^work-order WARN: //p' "$TMP/pyerr" | grep -v '^WORK_ORDER_LIB override' | sort | tr '\n' ';')" "$bash_warn"
 done
 out="$(printf 'nope' | python3 -I -B "$PY" sort 2>"$TMP/pyerr")"; rc=$?
 eq "python CLI on garbage: stdout empty" "$out" ""; eq "python CLI on garbage: exit" "$rc" "2"
@@ -381,12 +429,14 @@ PYMOD="$(python3 -I -B - "$ROOT/scripts" "$F10" <<'PY'
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
 import work_order as wo
+def ws(w):  # the WORK_ORDER_LIB override notice is checked on its own below, not counted with the bead WARNs
+    return [x for x in w if not x.startswith("work-order WARN: WORK_ORDER_LIB override")]
 beads = json.load(open(sys.argv[2]))
 out, w = wo.sort_beads(beads)
-print("created=" + ",".join(b["id"] for b in out)); print("warns=%d" % len(w))
+print("created=" + ",".join(b["id"] for b in out)); print("warns=%d" % len(ws(w)))
 out, w = wo.sort_beads(beads, age="reclaim"); print("reclaim=" + ",".join(b["id"] for b in out))
-out, w = wo.sort_beads([]); print("empty=%r/%r" % (out, w))
-out, w = wo.sort_beads({"a": 1}); print("object=%s/%d" % (out is None, len(w)))
+out, w = wo.sort_beads([]); print("empty=%r/%r" % (out, ws(w)))
+out, w = wo.sort_beads({"a": 1}); print("object=%s/%d" % (out is None, len(ws(w))))
 out, w = wo.sort_beads(beads, age="bogus"); print("bogus=%s" % (out is None))
 os.environ["WORK_ORDER_LIB"] = "/nonexistent/work-order.sh"
 out, w = wo.sort_beads(beads); print("nolib=%s" % (out is None))
@@ -399,6 +449,27 @@ eq "sort_beads([]) is ([], []), not None" "$(printf '%s\n' "$PYMOD" | sed -n 's/
 eq "sort_beads(non-list) is (None, [reason])" "$(printf '%s\n' "$PYMOD" | sed -n 's/^object=//p')" "True/1"
 eq "sort_beads(unknown age) is None" "$(printf '%s\n' "$PYMOD" | sed -n 's/^bogus=//p')" "True"
 eq "sort_beads(library missing) is None" "$(printf '%s\n' "$PYMOD" | sed -n 's/^nolib=//p')" "True"
+echo "-- WORK_ORDER_LIB override is never silent (a stale path in a daemon's environment orders by ANOTHER rule)"
+REAL_LIB="$SELF_DIR/work-order.sh"
+cp "$REAL_LIB" "$TMP/override-copy.sh"; ln -s "$REAL_LIB" "$TMP/override-link.sh"
+py_ovr() { # <path | UNSET> -> OVR_OUT OVR_ERR   (F10, created order)
+  if [ "$1" = UNSET ]; then OVR_OUT="$(env -u WORK_ORDER_LIB python3 -I -B "$PY" sort < "$F10" 2>"$TMP/ovr.err")"
+  else OVR_OUT="$(WORK_ORDER_LIB="$1" python3 -I -B "$PY" sort < "$F10" 2>"$TMP/ovr.err")"; fi
+  OVR_ERR="$(cat "$TMP/ovr.err")"
+}
+py_ovr "$TMP/override-copy.sh"
+case "$OVR_ERR" in
+  *"work-order WARN: WORK_ORDER_LIB override active: "*"override-copy.sh"*) ok "a different library path in WORK_ORDER_LIB is announced on stderr, with the path" ;;
+  *) bad "an active override is silent: [$OVR_ERR]" ;;
+esac
+eq "an active override only warns: the order is still produced" "$(printf '%s' "$OVR_OUT" | jq -r 'map(.id) | join(",")')" "$F10_CREATED"
+for v in UNSET "$REAL_LIB" "$TMP/override-link.sh"; do
+  py_ovr "$v"
+  case "$OVR_ERR" in
+    *"WORK_ORDER_LIB override"*) bad "no override notice expected for [$v]: [$OVR_ERR]" ;;
+    *) ok "no notice when the default library is in use (${v##*/})" ;;
+  esac
+done
 fi
 
 # ── (k) sourcing ────────────────────────────────────────────────────────────────────────────────
@@ -658,13 +729,21 @@ if text == orig:
 open(dest, "w", encoding="utf-8").write(text)
 ' "$1" "$2" "${@:3}"
 }
-# must_fail <name> <what is mutated: lib|py> <OLD NEW ...> — the mutant has to make this file fail
+# must_fail <name> <what is mutated: lib|py|pyi> <OLD NEW ...> — the mutant has to make this file fail
+# (lib: the library; py: the lint, run by (R); pyi: the entry point, run by (i))
 must_fail() {
   local name="$1" kind="$2"; shift 2
   local dest="$TMP/mut-$name" rc
   if [ "$kind" = "lib" ]; then
     mutate "$LIB" "$dest.sh" "$@" 2>"$TMP/mut.err" || { bad "mutant $name could not be built: $(cat "$TMP/mut.err")"; return; }
     WO_FAILFAST=1 WO_SKIP_MUTATION=1 WO_LIB_UNDER_TEST="$dest.sh" bash "$SELF" >"$TMP/mut.out" 2>&1; rc=$?
+  elif [ "$kind" = "pyi" ]; then
+    # a mutant of work_order.py that is exercised by section (i): it lives in a root of its own whose `packs`
+    # is a symlink to the real tree, so its default library is the REAL one (an override notice that fires
+    # only because the mutant sits elsewhere would "kill" a survivor for the wrong reason)
+    local mroot="$TMP/mutroot-$name"; mkdir -p "$mroot/scripts" && ln -s "$ROOT/packs" "$mroot/packs" || { bad "mutant $name: could not build its root"; return; }
+    mutate "$PY" "$mroot/scripts/work_order.py" "$@" 2>"$TMP/mut.err" || { bad "mutant $name could not be built: $(cat "$TMP/mut.err")"; return; }
+    env -u WO_LIB_UNDER_TEST WO_FAILFAST=1 WO_ONLY=i WO_PY_UNDER_TEST="$mroot/scripts/work_order.py" bash "$SELF" >"$TMP/mut.out" 2>&1; rc=$?
   else
     mutate "$PY" "$dest.py" "$@" 2>"$TMP/mut.err" || { bad "mutant $name could not be built: $(cat "$TMP/mut.err")"; return; }
     WO_FAILFAST=1 WO_ONLY=R WO_PY_UNDER_TEST="$dest.py" bash "$SELF" >"$TMP/mut.out" 2>&1; rc=$?
@@ -691,14 +770,14 @@ must_fail illegible-type-is-known lib 'if ($t | type) != "string" or $t == "" th
 must_fail story-not-feature lib ': "${WORK_ORDER_FEATURE_TYPES=feature story}"' ': "${WORK_ORDER_FEATURE_TYPES=feature}"'
 must_fail type-only-issue_type lib '(.issue_type // .type) as $t' '.issue_type as $t'
 must_fail no-id-tiebreak lib '($e // 9999999999), (.id // "")]' '($e // 9999999999)]'
-must_fail reclaim-ignores-label lib 'test("^pilot:reclaim-count:[1-9][0-9]*$")' 'test("^pilot:reclaim-never$")'
-must_fail reclaim-zero-counts lib '[1-9][0-9]*$' '[0-9]+$'
+must_fail reclaim-ignores-label lib 'test("\\Apilot:reclaim-count:[1-9][0-9]*\\z")' 'test("\\Apilot:reclaim-never\\z")'
+must_fail reclaim-zero-counts lib '[1-9][0-9]*\\z' '[0-9]+\\z'
 must_fail field-falls-back-to-created lib 'elif $a == "field" then ._wo_age' 'elif $a == "field" then (._wo_age // .created_at)'
 must_fail failure-prints-empty-array lib 'input kept out of the order)" >&2
     return 2' 'input kept out of the order)" >&2
     echo "[]"; return 0'
-must_fail head-failure-prints-null lib 'work_order_head: cannot tell (stdin is not exactly one JSON array)" >&2
-    return 2' 'work_order_head: x" >&2
+must_fail head-failure-prints-null lib 'stdin is not exactly one JSON array of bead objects)" >&2
+    return 2' 'x)" >&2
     echo null; return 0'
 must_fail empty-feature-list-accepted lib 'elif ($f | length) == 0 then error("WORK_ORDER_FEATURE_TYPES is empty")' 'elif false then empty'
 must_fail bad-age-accepted lib 'if ($age | IN("created", "field", "reclaim") | not) then error("age must be created, field or reclaim")' 'if false then empty'
@@ -727,6 +806,28 @@ must_fail calendar-rolls-over lib 'if $e != null and (try ($e | todateiso8601) c
 must_fail no-id-warn lib '(if (.id | type) != "string" or .id == "" then "id?" else empty end) ]' 'empty ]'
 must_fail jq-missing-not-named lib 'if ! command -v jq >/dev/null 2>&1; then' 'if false; then'
 must_fail bad-option-not-named lib 'unknown option: $1' 'bad option'
+# attempt 3: the validator judged the REWRITTEN string, and a `$` anchor matches before a final newline
+must_fail age-judged-after-rewrite lib 'capture("\\A(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?:Z|\\+00:00)\\z")] | .[0]) as $m' '1] | .[0]) as $m' \
+  'else ($m.d + "Z") as $t' 'else ($s | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")) as $t'
+must_fail age-end-unanchored lib '(?:Z|\\+00:00)\\z")' '(?:Z|\\+00:00)")'
+must_fail age-start-unanchored lib 'capture("\\A(?<d>' 'capture("(?<d>'
+must_fail age-dollar-anchor lib '(?:Z|\\+00:00)\\z")' '(?:Z|\\+00:00)$")'
+must_fail age-fraction-may-be-empty lib '(?:\\.[0-9]+)?(?:Z|' '(?:\\.[0-9]*)?(?:Z|'
+must_fail reclaim-label-dollar-anchor lib 'test("\\Apilot:reclaim-count:[1-9][0-9]*\\z")' 'test("^pilot:reclaim-count:[1-9][0-9]*$")'
+must_fail head-accepts-non-objects lib '      elif (.[0] | all(type == "object") | not) then error("input has an element that is not an object")
+' ''
+must_fail head-error-names-no-cause lib 'cannot tell (${msg:0:200}${msg:+; }stdin is not' 'cannot tell (stdin is not'
+# WORK_ORDER_LIB in a daemon's environment: the python entry point must say it orders by another library
+must_fail override-never-announced pyi '    if not os.environ.get("WORK_ORDER_LIB"):
+        return None
+' '    return None
+'
+must_fail override-always-announced pyi '    if os.path.realpath(lib) == os.path.realpath(_DEFAULT_LIB):
+        return None
+' ''
+must_fail override-spelling-is-not-identity pyi 'os.path.realpath(lib) == os.path.realpath(_DEFAULT_LIB)' 'os.path.normpath(lib) == os.path.normpath(_DEFAULT_LIB)'
+must_fail override-notice-has-no-path pyi 'override active: %s (not the town'"'"'s library %s); "' 'override active (not the town'"'"'s library %s); "' \
+  '% (lib, os.path.normpath(_DEFAULT_LIB)))' '% (os.path.normpath(_DEFAULT_LIB),))'
 # the lint: every alternative of every idiom, every scope glob, every line of the printed claim
 must_fail lint-drops-sort-flag-idiom py '("M2-sort-flag", r"--sort(?![A-Za-z-])"),' ''
 must_fail lint-drops-pilot-sort-idiom py '("M3-pilot-sort-jq", r"_PILOT_SORT_JQ"),' ''

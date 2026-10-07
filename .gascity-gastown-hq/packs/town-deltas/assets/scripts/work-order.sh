@@ -22,9 +22,14 @@
 #                   Case does not matter ("Feature" is a feature): the Pilot lowercases the type, so must this.
 #   age             oldest first. Unreadable -> the end of its class (epoch 9999999999). WARN age?
 #                   Compared as epoch seconds, never as text: "…:05.123Z" and "…+00:00" sort wrong as strings.
-#                   Accepted: a trailing Z or +00:00, with or without a fraction (the fraction is dropped,
-#                   so two beads in the same second tie and the id decides). Any other shape is unreadable,
+#                   Accepted: YYYY-MM-DDTHH:MM:SS, then an optional .digits fraction, then Z or +00:00 — and
+#                   NOTHING else. The shape of the ORIGINAL string is judged first, anchored \A…\z (a jq/Oniguruma
+#                   `$` also matches before a final newline); only then is the fraction dropped (so two beads in
+#                   the same second tie and the id decides) and +00:00 read as Z. Any other shape is unreadable
+#                   — a ".5" after the Z, a trailing newline, padding, a lowercase z, a fraction without digits —
 #                   and so is a date the calendar does not have (2026-02-31, a 24:00 hour): it is not rolled over.
+#                   (The check is on what the caller handed in, not on a rewritten copy of it: a validator that
+#                   looks at its own output accepts whatever the rewrite made well-formed.)
 #   id              last tie-break, so the same beads in any input order give the same output. A bead without a
 #                   readable string id still stays in the output (id "" sorts first among exact ties) and gets
 #                   WARN `id?` — it cannot be told apart from another one, which is worth hearing about.
@@ -52,6 +57,13 @@
 #                         "I do not know": keep the previous order and log a visible WARN. Empty never
 #                         means "no bead" (same contract as pool_veto_cfg in pool-probe-vetoes.sh).
 #
+# NOT in this library (slice ga-9t9acg.2 must decide, so the migration never drops it silently): the Pilot's
+# `tech-debt` tier. In _PILOT_SORT_JQ (`trank`, pilot-dispatcher.sh) a bead labelled `tech-debt`, or typed
+# tech-debt, ranks 1 inside its priority: after bug (0), before task/chore/feature. The Athos rule above has
+# no such tier — here a tech-debt bead is just "another type" (class 1) and a labelled one is not looked at.
+# Whether the Pilot keeps it is a decision of that slice (and of Athos), never a side effect of moving the
+# Pilot onto this key.
+#
 # What a caller must still do itself:
 #   * fetch the WHOLE population (`--limit 0` / `-n 0`) or prove the window covers it. Never `--limit=N`
 #     before ordering: a P0 feature falls outside a window of 20 of the same priority (ga-g7yt: window
@@ -71,9 +83,13 @@
 WORK_ORDER_JQ_DEFS='
 def wo_epoch($s):
   if ($s | type) != "string" then null
-  else ($s | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")) as $t
-       | (try ($t | fromdateiso8601) catch null) as $e
-       | if $e != null and (try ($e | todateiso8601) catch null) == $t then $e else null end
+  else
+    ([$s | capture("\\A(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?:Z|\\+00:00)\\z")] | .[0]) as $m
+    | if $m == null then null
+      else ($m.d + "Z") as $t
+           | (try ($t | fromdateiso8601) catch null) as $e
+           | if $e != null and (try ($e | todateiso8601) catch null) == $t then $e else null end
+      end
   end;
 def wo_prio_class:
   if (.priority | type) == "number" and .priority >= 0 and .priority <= 4 and (.priority | floor) == .priority
@@ -91,7 +107,7 @@ def wo_age_src($o):
     elif $a == "reclaim" then
       (.labels // []) as $l
       | if ($l | type) != "array" then null
-        elif ($l | map(select(type == "string" and test("^pilot:reclaim-count:[1-9][0-9]*$"))) | length) > 0 then .updated_at
+        elif ($l | map(select(type == "string" and test("\\Apilot:reclaim-count:[1-9][0-9]*\\z"))) | length) > 0 then .updated_at
         else .created_at end
     else error("work-order: unknown age source: " + ($a | tostring)) end;
 def wo_age($o): wo_epoch(wo_age_src($o));
@@ -170,18 +186,22 @@ work_order_sort() {
   printf '%s\n' "$sorted"
 }
 
-# work_order_head — stdin: ONE JSON array (normally the output of work_order_sort); stdout: its first
-# element, or the literal `null` for `[]`. Cannot tell (empty stdin, not exactly one array) -> stdout
-# EMPTY, exit 2. This is what `jq '.[0]'` gets wrong: it prints `null` for `[]` AND prints nothing, with
+# work_order_head — stdin: ONE JSON array of bead objects (normally the output of work_order_sort); stdout:
+# its first element, or the literal `null` for `[]`. Cannot tell (empty stdin, not exactly one array, an
+# element that is not an object — raw `bd --json` piped straight in must not read `[null, {...}]` as "the
+# bead is null") -> stdout EMPTY, exit 2. This is what `jq '.[0]'` gets wrong: it prints `null` for `[]` AND prints nothing, with
 # exit 0, for an empty stdin — so a failed upstream sort reads as "no bead".
 work_order_head() {
-  local input out
+  local input out msg
   input="$(cat)"
   if ! out="$(printf '%s' "$input" | jq -cs '
       if length != 1 then error("stdin must hold exactly one JSON document, got \(length)")
       elif (.[0] | type) != "array" then error("input is not a JSON array")
-      else .[0][0] end' 2>/dev/null)" || [ -z "$out" ]; then
-    echo "work-order ERROR: work_order_head: cannot tell (stdin is not exactly one JSON array)" >&2
+      elif (.[0] | all(type == "object") | not) then error("input has an element that is not an object")
+      elif (.[0] | length) == 0 then null
+      else .[0][0] end' 2>&1)" || [ -z "$out" ]; then
+    msg="${out%%$'\n'*}"
+    echo "work-order ERROR: work_order_head: cannot tell (${msg:0:200}${msg:+; }stdin is not exactly one JSON array of bead objects)" >&2
     return 2
   fi
   printf '%s\n' "$out"
