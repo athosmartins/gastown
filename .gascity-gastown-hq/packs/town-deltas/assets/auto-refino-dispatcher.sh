@@ -95,12 +95,31 @@ unset _AUTO_REFINO_QHC_SIB
 # Fix mirrors the PROVEN multi-store shape of context-check-dispatcher.sh: define
 # AUTO_REFINO_STORES (default = HQ + WA + PS), make bd_() target a per-iteration
 # store ($AR_STORE, defaulting to $GC_CITY so single-store callers/tests are
-# unchanged), and loop Step 0 / Step 0c / Step 1 over each store. The one-story-
-# per-sweep cap stays GLOBAL across stores: the FIRST store with an eligible
-# candidate is processed and the daemon returns; the launchd interval drains the
-# rest (a later sweep moves to the next store). Critically, query AND write-back
-# (claim, refiner task heredoc, outcome) all target the bead's OWN store — a WA
-# story's labels/comments/metadata land in the WA store, never in HQ.
+# unchanged), and loop Step 0 / Step 0c over each store. The one-story-per-sweep
+# cap stays GLOBAL across stores. WHICH story that is (ga-9t9acg.8, Athos
+# 2026-10-06): Step 1 gathers the candidates of EVERY store first, orders the union
+# ONCE by the shared work-order rule (priority > feature first > oldest first) and
+# serves the first eligible one — a P0 in the last store beats a P2 in the first.
+# (It used to be "the FIRST store with an eligible candidate wins", newest-first,
+# priority ignored.) The launchd interval drains the rest, one story per sweep.
+# Critically, query AND write-back (claim, refiner task heredoc, outcome) all
+# target the bead's OWN store — a WA story's labels/comments/metadata land in the
+# WA store, never in HQ. Every candidate row therefore carries its `_store`, and
+# Step 1 pins $AR_STORE to it before any `bd_` call about that row.
+# ga-9t9acg.8: the ORDER Triagem candidates are served in is the ONE shared rule (priority >
+# type, feature first > age, oldest first; Athos 2026-10-06, programa ga-9t9acg), implemented once
+# in scripts/work-order.sh. This file carries no sort of its own for it (the registry lint,
+# scripts/work_order.py lint, fails if one comes back). Sourced like the sibling above: next to THIS
+# script, readability checked first (a `source` of a missing file kills a `set -e` shell before any
+# `|| true` runs — ga-q4sadt); stderr of the source itself is NOT silenced. A missing/unreadable
+# library is not fatal: Step 1 then finds work_order_sort undefined, answers "cannot tell" and
+# serves the candidates in the order they were gathered (store by store, by id inside a store), with a WARN on every sweep — refino keeps
+# running, and nobody can read that sweep as "the priority rule applied".
+_AUTO_REFINO_WO_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/work-order.sh"
+if [ -r "$_AUTO_REFINO_WO_SIB" ]; then
+  source "$_AUTO_REFINO_WO_SIB"
+fi
+
 _AUTO_REFINO_STORES_CALLER_SET=0
 [ -n "${AUTO_REFINO_STORES:-}" ] && _AUTO_REFINO_STORES_CALLER_SET=1
 AUTO_REFINO_STORES="${AUTO_REFINO_STORES:-$GC_CITY /Users/athos/gt/whatsapp_automation /Users/athos/gt/property_scrapers}"
@@ -764,6 +783,16 @@ fi
 # behaviour. Mirrors context-check-dispatcher.sh's `bd -C "${CC_STORE:-$GC_CITY}"`.
 bd_() { bd -C "${AR_STORE:-$GC_CITY}" "$@"; }
 
+# _ar_cand_failed <what> — the fallback of a Step 1 candidate query that FAILED (bd non-zero): print
+# `[]` so the sweep can go on, but say so in the log (ga-9t9acg.8). Candidates are now ordered across
+# ALL stores, so a store whose query failed does not just "yield nothing, next store" — its stories
+# are missing from the order, and a lower-priority story elsewhere would be served in their place
+# without a trace. Stdout is the captured JSON, so the WARN goes to stderr.
+_ar_cand_failed() {
+  warn "ga-9t9acg.8: candidate query '$1' FAILED in store ${AR_STORE:-$GC_CITY} — its stories are MISSING from this sweep's order (a failed query, not an empty queue)" >&2
+  echo "[]"
+}
+
 # ── FIX B: cross-stage contention-yield (mirrors the Pilot daemon, ga-d0hz3) ─
 # WHY: the 3 autonomous daemons run stage-DESCENDING priority — gate-review
 # (highest) > execute-approved (Pilot) > refine-triage (THIS, lowest). The Pilot
@@ -1136,14 +1165,25 @@ fi
 # bug/chore/task NEVER carry story:* lifecycle labels and so never appear here —
 # but we ALSO assert type-eligibility per candidate so a mislabeled bug cannot leak.
 #
-# MULTI-STORE: gather + select across each store in turn (HQ, then WA, then PS).
-# The one-story-per-sweep cap is GLOBAL: the FIRST store that yields an eligible
-# candidate wins, we break out with $AR_STORE pinned to that store, and every
-# downstream write (claim, refiner task, outcome) targets THAT store via bd_. A
-# later sweep advances to the next store. Stores after the winner are simply not
-# visited this sweep (no work multiplied by 3).
+# MULTI-STORE, ONE ORDER (ga-9t9acg.8). Two phases, because the one-story-per-sweep
+# cap is GLOBAL and the rule "which story first" is only true if it sees every story:
+#   1. GATHER (the per-store loop below): each store's candidates are fetched in
+#      full (`--limit 0`, never bd's default window of 50 — a window plus a
+#      post-filter hides real work, ga-g7yt) and stamped with `_store`, then
+#      UNIONED into ALL_CANDIDATES. Nothing is picked here: it used to be "the
+#      FIRST store with an eligible candidate wins, newest-first, priority
+#      ignored", so a P2 of HQ beat a P0 of WA. That earlier order was REVERSED
+#      by Athos on 2026-10-06 (programa ga-9t9acg: priority > feature first >
+#      oldest first, on every stage of the board).
+#   2. ORDER + SELECT (after the loop): ALL_CANDIDATES is ordered ONCE by the
+#      shared work-order lib and walked in that order; the first row the
+#      classifier accepts is the story of this sweep. Per row, $AR_STORE is pinned
+#      to the row's `_store`, so every `bd_` call about it — and every downstream
+#      write (claim, refiner task, outcome) — targets THAT store. A later sweep
+#      serves the next story.
 STORY=""
 RAW_INGEST=0   # set to 1 when the selected candidate is a raw no-label story to pre-label
+ALL_CANDIDATES="[]"   # union over every store; each row carries `_store`
 for AR_STORE in $AUTO_REFINO_STORES; do
 log "── candidate store: $AR_STORE ──"
 FRESH_JSON=$(bd_ list --label story:triage --type feature --status open \
@@ -1152,20 +1192,20 @@ FRESH_JSON=$(bd_ list --label story:triage --type feature --status open \
   --exclude-label story:refino-review \
   --exclude-label story:needs-approval \
   --exclude-label story:approved \
-  --json 2>/dev/null || echo "[]")
+  --limit 0 --json 2>/dev/null || _ar_cand_failed "story:triage")
 UNREF_JSON=$(bd_ list --label story:unrefined --type feature --status open \
   --exclude-label auto-refino:refining \
   --exclude-label auto-refino:escalated \
   --exclude-label story:refino-review \
   --exclude-label story:needs-approval \
   --exclude-label story:approved \
-  --json 2>/dev/null || echo "[]")
+  --limit 0 --json 2>/dev/null || _ar_cand_failed "story:unrefined")
 # Gate bounce-backs: in-progress stories reassigned to us.
 BOUNCE_JSON=$(bd_ list --label story:refinement-in-progress --type feature --status open \
   --assignee "$AUTO_REFINO_ACTOR" \
   --exclude-label auto-refino:refining \
   --exclude-label auto-refino:escalated \
-  --json 2>/dev/null || echo "[]")
+  --limit 0 --json 2>/dev/null || _ar_cand_failed "story:refinement-in-progress (bounce)")
 # Orphaned claims (ga-kb0kz): in-progress stories with NO assignee at all — the
 # BOUNCE query above requires --assignee "$AUTO_REFINO_ACTOR", so it structurally
 # can never return one of these, and they'd otherwise be invisible forever (no
@@ -1178,7 +1218,7 @@ ORPHAN_JSON=$(bd_ list --label story:refinement-in-progress --type feature --sta
   --no-assignee \
   --exclude-label auto-refino:refining \
   --exclude-label auto-refino:escalated \
-  --json 2>/dev/null || echo "[]")
+  --limit 0 --json 2>/dev/null || _ar_cand_failed "story:refinement-in-progress (orphan)")
 
 # ── 4th source: RAW Triagem stories with NO story:* lifecycle label ───────────
 # (Mayor-diagnosed starvation fix; gated by AUTO_REFINO_INGEST_RAW_TRIAGEM.)
@@ -1194,8 +1234,8 @@ ORPHAN_JSON=$(bd_ list --label story:refinement-in-progress --type feature --sta
 RAW_JSON="[]"
 if [ "$AUTO_REFINO_INGEST_RAW_TRIAGEM" = "1" ]; then
   # feature type (and `story` if the build models it as a distinct type).
-  _RAW_FEATURE=$(bd_ list --type feature --status open --json 2>/dev/null || echo "[]")
-  _RAW_STORY=$(bd_ list --type story --status open --json 2>/dev/null || echo "[]")
+  _RAW_FEATURE=$(bd_ list --type feature --status open --limit 0 --json 2>/dev/null || _ar_cand_failed "raw feature")
+  _RAW_STORY=$(bd_ list --type story --status open --limit 0 --json 2>/dev/null || _ar_cand_failed "raw story")
   RAW_JSON=$(jq -s --argjson min_age_sec "$(( AUTO_REFINO_RAW_MIN_AGE_MINUTES * 60 ))" '
     (.[0] + .[1])
     | unique_by(.id)
@@ -1284,21 +1324,89 @@ else
 fi
 
 CANDIDATES=$(jq -s 'add | unique_by(.id)' \
-  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON") 2>/dev/null || echo "[]")
-CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
-if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
-  log "  No Triagem stories in this store — next store."
+  <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON") 2>/dev/null || _ar_cand_failed "merge of the candidate sources")
+CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null) || CCOUNT=""
+case "$CCOUNT" in
+  ''|*[!0-9]*)
+    # cannot tell is not "none": say so, because this store's stories are then missing from the order
+    warn "ga-9t9acg.8: cannot count the candidates of store $AR_STORE (jq length failed) — they are MISSING from this sweep's order (unreadable, not an empty store)"
+    continue ;;
+esac
+if [ "$CCOUNT" -eq 0 ]; then
+  log "  No Triagem stories in this store."
   continue
 fi
 log "  $CCOUNT candidate story(ies) in Triagem (pre-classification)."
+# Stamp each row with the store it came from and add it to the cross-store union (see the
+# MULTI-STORE comment above). Nothing is selected here.
+if _ar_union=$(jq -cs --arg store "$AR_STORE" '.[0] + (.[1] | map(. + {_store: $store}))' \
+    <(echo "$ALL_CANDIDATES") <(echo "$CANDIDATES") 2>/dev/null) && [ -n "$_ar_union" ]; then
+  ALL_CANDIDATES="$_ar_union"
+else
+  warn "ga-9t9acg.8: could not add the $CCOUNT candidate(s) of store $AR_STORE to the cross-store union — they are MISSING from this sweep's order (a jq failure, not an empty store)"
+fi
+done  # end candidate per-store GATHER loop (Step 1, phase 1)
 
-# Classify with the pure core; keep only fresh/bounce candidates of an eligible
-# type. Oldest-first (FIFO) so the backlog drains in arrival order.
+# ── Step 1, phase 2: ORDER the union ONCE, then walk it ────────────────────────
+# ONE call to the shared rule (scripts/work-order.sh; header there): priority, then feature before
+# the rest, then OLDEST first, over the candidates of ALL stores. AGE = created_at (`--age created`):
+# a Triagem story has no entry marker of its own (per the ga-9t9acg.8 story, checked 2026-10-06 when
+# it was written: no metadata *_at is written when story:triage is applied, and the label carries no
+# timestamp — if a marker is ever added, switch to `--age field` and inject it), and the "reclaim" age of the lib
+# is the Pilot's answer to a bead reclaimed again and again — nothing reclaims a story here.
+# THREE states, never collapsed (the lib's contract): ordered (rc 0; `[]` stays `[]`); an illegible
+# field (the row STAYS, at the end of its class, one `work-order WARN:` line on stderr); cannot tell
+# (empty stdout, rc != 0, or the lib is not loaded). The lib's stderr is its ONLY signal for an
+# illegible field, so it is captured and re-logged line by line — never sent to /dev/null — and
+# "cannot tell" is NOT an empty queue: the sweep keeps going with the candidates in the order they
+# were gathered — store by store, and inside a store by id (the `unique_by(.id)` above sorts them) —
+# i.e. the order the caller already held, per the lib's contract, plus a loud WARN, so refino does not
+# stall on a library fault and nobody can mistake that sweep for one that applied the rule.
+ALL_COUNT=$(echo "$ALL_CANDIDATES" | jq 'length' 2>/dev/null) || ALL_COUNT=""
+case "$ALL_COUNT" in
+  ''|*[!0-9]*)
+    err "ga-9t9acg.8: cannot read the cross-store candidate union (jq length failed) — aborting this sweep rather than reading it as an empty queue."
+    exit 1 ;;
+esac
+_wo_err="$LOG_DIR/.auto-refino-work-order.$$.err"
+ORDERED=""
+_wo_rc=0
+if declare -F work_order_sort >/dev/null 2>&1; then
+  ORDERED=$(printf '%s' "$ALL_CANDIDATES" | work_order_sort --age created 2>"$_wo_err") || _wo_rc=$?
+else
+  _wo_rc=127
+  echo "work-order ERROR: work_order_sort is not defined — the library was not sourced ($_AUTO_REFINO_WO_SIB); cannot tell" > "$_wo_err" || true
+fi
+if [ -s "$_wo_err" ]; then
+  while IFS= read -r _wo_line; do
+    [ -n "$_wo_line" ] && warn "$_wo_line"
+  done < "$_wo_err"
+fi
+rm -f "$_wo_err"
+# A bead must never disappear in the ordering: the answer is accepted only if it is an array as long as the input.
+_wo_n=$(printf '%s' "$ORDERED" | jq 'length' 2>/dev/null) || _wo_n=""
+if [ "$_wo_rc" -ne 0 ] || [ -z "$ORDERED" ] || [ "$_wo_n" != "$ALL_COUNT" ]; then
+  warn "ga-9t9acg.8: CANNOT ORDER the $ALL_COUNT Triagem candidate(s) (work_order_sort rc=$_wo_rc, answer length='${_wo_n}') — the priority rule is NOT applied this sweep: serving them in the order they were gathered (store by store, by id inside a store). A failed ordering is not an empty queue."
+  ORDERED="$ALL_CANDIDATES"
+elif [ "$ALL_COUNT" -gt 0 ]; then
+  log "  Ordered $ALL_COUNT candidate(s) across all stores by priority > feature > oldest (ga-9t9acg.8). Head: $(echo "$ORDERED" | jq -r '[.[0:5][] | "\(.id)(P\(.priority // "?"),\(._store | split("/") | last))"] | join(" ")' 2>/dev/null)"
+fi
+
+# Classify with the pure core, in that order; the first fresh/bounce/ingestable candidate of an
+# eligible type is this sweep's story. $AR_STORE is pinned to each row's OWN store first: `bd_`
+# below (children, show, the label writes of Step 1b) must read and write THAT store, and a row
+# with no readable store is skipped, never defaulted to HQ (bd_ falls back to $GC_CITY).
 NOW_EPOCH=$(date +%s)
 while IFS= read -r row; do
   [ -z "$row" ] && continue
   c_id=$(echo "$row" | jq -r '.id // empty')
   [ -z "$c_id" ] && continue
+  c_store=$(echo "$row" | jq -r '._store // empty')
+  if [ -z "$c_store" ]; then
+    warn "ga-9t9acg.8: skip $c_id: the row carries no store — refusing to default it to the HQ store (a write would land in the wrong database)"
+    continue
+  fi
+  AR_STORE="$c_store"
   c_type=$(echo "$row" | jq -r '.issue_type // .type // "feature"')
   c_labels=$(_labels_csv "$row")
   c_assignee=$(echo "$row" | jq -r '.assignee // empty')
@@ -1388,18 +1496,15 @@ while IFS= read -r row; do
       fi
       : ;;  # skip
   esac
-done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | reverse | .[]')  # newest-first tiebreak (Athos prioridade 2026-06-24)
-
-# This store yielded an eligible candidate → stop here. $AR_STORE stays pinned to
-# this store so every downstream write targets the bead's own store.
-[ -n "$STORY" ] && { log "  Candidate selected from store $AR_STORE."; break; }
-log "  No eligible candidate in this store after classification — next store."
-done  # end candidate per-store loop (Step 1)
+done < <(echo "$ORDERED" | jq -c '.[]')
 
 if [ -z "$STORY" ]; then
   log "No eligible candidate after classification across all stores. Sweep done."
   exit 0
 fi
+# The loop above `break`s right after it sets STORY, so $AR_STORE is still the selected row's store:
+# every downstream write (claim, refiner task, outcome) targets the bead's own store.
+log "  Candidate selected from store $AR_STORE."
 
 # Pin the selected bead's store for ALL downstream writes (claim, refiner task
 # heredoc, outcome handling). bd_ already targets $AR_STORE; the refiner heredoc
