@@ -248,7 +248,9 @@ _code="$(grep -v '^[[:space:]]*#' "$DISPATCHER")"
 # dies of SIGPIPE (141) and the `if` reads "not found" — the guard would pass exactly when the thing IS there.
 if grep -q '_PILOT_SORT_JQ' <<< "$_code"; then bad "S: _PILOT_SORT_JQ is still referenced (the pre-ga-9t9acg.2 sort program)"; else ok "S: _PILOT_SORT_JQ is gone"; fi
 if grep -q 'trank' <<< "$_code"; then bad "S: trank (the old type-rank / tech-debt tier) is still in the code"; else ok "S: trank / the tech-debt tier is gone"; fi
-_swallow="$(grep -E 'work_order_(sort|head)' <<< "$_code" | grep -E '2>[[:space:]]*/dev/null' || true)"
+# A line that merely GREPS for the text "work_order_sort" is not a call of the lib: ga-9t9acg.4's template drift check is
+# `grep -Eq '…work_order_sort --age reclaim…' "$_tpl" 2>/dev/null`, which silences grep's own "no such file", not the lib.
+_swallow="$(grep -E 'work_order_(sort|head)' <<< "$_code" | grep -vE '^[[:space:]]*grep[[:space:]]' | grep -E '2>[[:space:]]*/dev/null' || true)"
 if [ -n "$_swallow" ]; then bad "S: stderr of the lib is thrown away (2>/dev/null) — the WARN lines are the only signal: $(printf '%s' "$_swallow" | head -1 | cut -c1-120)"
 else ok "S: no 2>/dev/null on a work_order_sort / work_order_head call"; fi
 # The variable that holds the lib's path is whatever the dispatcher assigns from `…/scripts/work-order.sh` (the source
@@ -260,9 +262,14 @@ else
   if [ -n "$_srcline" ] && grep -q '\[ -r ' <<< "$_srcline"; then ok "S: work-order.sh is sourced right behind an [ -r ] check"
   else bad "S: work-order.sh is not sourced behind an [ -r ] check (a missing sibling under set -e kills the sweep even with || true)"; fi
 fi
-_nsrc="$(grep -cE '^[[:space:]]*(source|\.)[[:space:]]+"?\$\{?[A-Za-z_]*(WO|WORK_ORDER)[A-Za-z_]*' <<< "$_code" || true)"
-if [ "$_nsrc" = 1 ]; then ok "S: the lib is sourced exactly ONCE in the dispatcher (the queue emit and the dispatch share the one block)"
-else bad "S: the lib is sourced $_nsrc times in the dispatcher — one block, shared with the queue emit, is the contract"; fi
+# Exactly ONE block serves the dispatch and the queue emit. ga-9t9acg.4 added a SECOND, NAMED block on purpose
+# (work-order-topup-source, var _GC_WO_TOPUP_SIBLING): pool top-up orders with `--age reclaim` and degrades with its own
+# message, so it cannot share the "created" block. That one is allowed by NAME; any other extra block is still a failure.
+_nsrc_all="$(grep -cE '^[[:space:]]*(source|\.)[[:space:]]+"?\$\{?[A-Za-z_]*(WO|WORK_ORDER)[A-Za-z_]*' <<< "$_code" || true)"
+_nsrc_topup="$(grep -cE '^[[:space:]]*(source|\.)[[:space:]]+"?\$\{?_GC_WO_TOPUP_SIBLING' <<< "$_code" || true)"
+_nsrc=$((_nsrc_all - _nsrc_topup))
+if [ "$_nsrc" = 1 ] && [ "$_nsrc_topup" -le 1 ]; then ok "S: the dispatch and the queue emit share exactly ONE source block (the named ga-9t9acg.4 top-up block is the only other one allowed)"
+else bad "S: the lib is sourced $_nsrc time(s) outside the named top-up block (the top-up block itself: $_nsrc_topup) — one block, shared with the queue emit, is the contract"; fi
 if grep -qE 'work_order_sort[[:space:]]+--age[[:space:]]+"\$_PILOT_WORK_ORDER_AGE"' <<< "$_code"; then ok "S: the dispatch passes the shared age constant to the lib (the same one the queue emit passes)"
 else bad "S: the sort call does not pass --age \"\$_PILOT_WORK_ORDER_AGE\" — the dispatch and the emitted queue could serve different orders"; fi
 if grep -qE '^_PILOT_WORK_ORDER_AGE="created"$' <<< "$_code"; then ok "S: the age rule is created_at (_PILOT_WORK_ORDER_AGE=\"created\"), no reclaim mode"
