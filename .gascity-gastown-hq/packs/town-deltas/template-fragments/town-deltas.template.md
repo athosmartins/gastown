@@ -287,6 +287,30 @@ Se as labels do bead-fonte não puderem ser lidas, vale **sem** o label (nunca
 promove) e o gate dá `WARN`. Não use pra "urgente" em geral: o que não é dano a
 cliente agora segue a ordem normal.
 
+{{/* td:core:gate-focus */ -}}
+### Modo foco no gate — quando o gargalo é a revisão, ninguém constrói bead nova (ga-kqa08j)
+
+Decisão do Athos em 07/10 (AskUserQuestion na sessão do Mayor, confirmação final "Isso,
+pode seguir", citada na ga-kqa08j). `scripts/gate-focus-mode.sh` (launchd, a cada 5 min)
+conta a fila do gate e grava `.gc/gate-focus.state`: **liga com mais de 15 itens na fila,
+desliga com menos de 8** (entre os dois, fica como estava). Uma notificação ao ligar e
+uma ao desligar; uma escalação se ficar ligado mais de 24 h.
+
+**Ligado, os workers genéricos (dog, wa-worker, ps-worker) não pegam bead NOVA.** Só
+pegam conserto do que o gate já reprovou (`gate:needs-fix` ou `gate:fix-attempt:N`), com
+no máximo 2 sessões por pool. Isso vale no Pilot, na sonda de cada worker e no teto de
+dogs. Se a sua sonda voltar `[]` com o modo ligado, não procure bead nova por outro
+caminho: drene. **Crews não são tocadas pelo automático** — quem decide crew é o Athos.
+Desligar à mão: `touch .gc/gate-focus.off` (apague o arquivo para devolver ao automático).
+
+**Regra permanente do modo foco (decisão do Athos):** com o modo ligado, o **Mayor** pode
+pôr no ar, sem passar pelo gate, bead **P0 de infraestrutura interna** — nada que toque
+lead, cliente ou mensagem pra fora. Ao fazer isso: label `gate:bypassed-focus` +
+`audit:pending` no bead, comentário dizendo o que entrou e por quê, e uma **revisão
+adversarial depois** do merge, registrada no bead. Reprovou na revisão → o Mayor decide
+caso a caso (reverter ou consertar em cima) e conta ao Athos. Nenhum outro agente usa
+este atalho.
+
 {{/* td:core:models */ -}}
 ### Modelos atuais (Opus 5.5 / Sonnet 5) — o que o guia oficial muda no seu trabalho (ga-ttwzqd)
 

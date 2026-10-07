@@ -3911,6 +3911,24 @@ _filter_candidates() {
       | [$id, ($reasons | join(";"))] | @tsv
     ' 2>/dev/null | _log_exclusions "_filter_candidates"
 
+  # ga-kqa08j: GATE FOCUS MODE — while the gate is the bottleneck (gate-focus-mode.sh
+  # decided it, read once per sweep into PILOT_GATE_FOCUS), only a FIX of something the
+  # gate already rejected may be dispatched: gate:needs-fix, or gate:fix-attempt:N (five
+  # gate paths remove needs-fix but keep fix-attempt, ga-ltjdx). A new build waits until
+  # the queue drains. Applied here because every tier/top-up list passes through this
+  # function; the painel emit ran before PILOT_GATE_FOCUS was set, so it still shows the
+  # real queue.
+  if [ "${PILOT_GATE_FOCUS:-0}" = "1" ]; then
+    local _cf_focus
+    if _cf_focus=$(printf '%s' "$_cf_out" | jq -c '[.[] | select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:")))]' 2>/dev/null); then
+      _cf_out="$_cf_focus"
+    else
+      # Could not apply the filter: dispatch nothing from this list rather than let new
+      # builds through a mode that exists to stop them.
+      _cf_out="[]"
+    fi
+  fi
+
   printf '%s' "$_cf_out"
 }
 # ── parking-label pre-filter (upstream of dispatch, additive to ga-zzrts) ─────
@@ -5480,6 +5498,34 @@ _pilot_apply_dynamic_pool_ceilings() {
 }
 # SELFTEST-EXTRACT pilot-apply-dynamic-pool-ceilings: END
 _pilot_apply_dynamic_pool_ceilings
+
+# ── ga-kqa08j: GATE FOCUS MODE (Athos 07/10) ────────────────────────────────────
+# gate-focus-mode.sh (launchd, 5 min) is the only owner of the mode; here we only read
+# it. ON: the builder pools stop taking NEW beads — _filter_candidates keeps only fixes
+# of gate-rejected beads (PILOT_GATE_FOCUS=1) — and each worker pool opens at most
+# GATE_FOCUS_FIX_MAX (2) sessions. Crews are not touched. The dog cap is applied by
+# eval-window-concurrency-guard.sh (its single writer). UNKNOWN (no/corrupt/stale
+# state): normal dispatch, logged — same fail-open contract as every pause above.
+# Placed AFTER the dynamic ceilings so they cannot overwrite the clamp.
+PILOT_GATE_FOCUS=0
+GATE_FOCUS_FIX_MAX="${GATE_FOCUS_FIX_MAX:-2}"
+case "$GATE_FOCUS_FIX_MAX" in ''|*[!0-9]*) GATE_FOCUS_FIX_MAX=2 ;; esac
+_gf_lib="${GATE_FOCUS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/gate-focus-lib.sh}"
+if [ -r "$_gf_lib" ] && . "$_gf_lib" 2>/dev/null; then
+  case "$(gate_focus_active)" in
+    1)
+      PILOT_GATE_FOCUS=1
+      [ "${PILOT_WA_WORKER_MAX:-0}" -gt "$GATE_FOCUS_FIX_MAX" ] 2>/dev/null && PILOT_WA_WORKER_MAX="$GATE_FOCUS_FIX_MAX"
+      [ "${PILOT_PS_WORKER_MAX:-0}" -gt "$GATE_FOCUS_FIX_MAX" ] 2>/dev/null && PILOT_PS_WORKER_MAX="$GATE_FOCUS_FIX_MAX"
+      log "Gate focus mode ON (gate queue=$(gate_focus_depth)) — only fixes of gate-rejected beads are dispatched; wa-worker max=${PILOT_WA_WORKER_MAX} ps-worker max=${PILOT_PS_WORKER_MAX} (ga-kqa08j)"
+      ;;
+    0) : ;;
+    *) log "Gate focus state UNKNOWN (missing/corrupt/stale $GATE_FOCUS_STATE_FILE) — dispatching normally this sweep (ga-kqa08j)" ;;
+  esac
+else
+  log "Gate focus lib unreadable ($_gf_lib) — dispatching normally this sweep (ga-kqa08j)"
+fi
+export PILOT_GATE_FOCUS
 
 # _session_is_live <identifier> — exit 0 iff <identifier> is a non-closed session.
 _session_is_live() {

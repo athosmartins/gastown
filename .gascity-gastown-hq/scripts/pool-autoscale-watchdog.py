@@ -149,6 +149,25 @@ def emit(msg):
         pass
 
 
+def _gate_focus_active(now=None):
+    """ga-kqa08j: True only when gate-focus-mode.sh recorded active=1 recently.
+
+    In focus mode the dog cap is LOWERED on purpose (eval-window-concurrency-guard.sh)
+    while routed demand stays high, so "demand > cap" is the intended state, not a
+    stuck pool. Missing/corrupt/stale state -> False (alerts behave as before).
+    """
+    city = os.environ.get("GC_CITY_PATH") or os.environ.get("GC_CITY") or "/Users/athos/gt/.gascity-gastown-hq"
+    path = os.environ.get("GATE_FOCUS_STATE_FILE") or os.path.join(city, ".gc", "gate-focus.state")
+    stale = int(os.environ.get("GATE_FOCUS_STALE_S", "7200") or 7200)
+    try:
+        fields = dict(line.strip().split("=", 1) for line in open(path) if "=" in line)
+        at = int(fields.get("at", ""))
+    except Exception:
+        return False
+    now = now if now is not None else time.time()
+    return fields.get("active") == "1" and 0 <= now - at <= stale
+
+
 # ---------------------------------------------------------------------------
 # Config: pool max_active_sessions
 # ---------------------------------------------------------------------------
@@ -755,7 +774,13 @@ def run_cycle(pool_caps, state, stuck_alerted):
         elif action == "stuck_alert":
             # Rate-limit STUCK alerts to avoid ntfy spam
             last_stuck = stuck_alerted.get(pool, 0)
-            if now - last_stuck >= STUCK_REALERT_SEC:
+            if now - last_stuck >= STUCK_REALERT_SEC and _gate_focus_active(now):
+                # ga-kqa08j: the cap is low on purpose while the gate drains — log, no push.
+                print(f"[POOL-AUTOSCALE] [CAPPED-BY-GATE-FOCUS] pool={pool} demand={demand} "
+                      f"active={active_count}/{max_active} — gate focus mode holds the dog cap low on purpose; "
+                      f"no alert", flush=True)
+                stuck_alerted[pool] = now
+            elif now - last_stuck >= STUCK_REALERT_SEC:
                 emit(
                     f"[POOL-AUTOSCALE] [STUCK] pool={pool} "
                     f"demand={demand} active={active_count}/{max_active}{_cap_note(pool)} "

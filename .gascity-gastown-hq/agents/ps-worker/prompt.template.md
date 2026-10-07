@@ -390,6 +390,16 @@ You are disposable. You do not carry state between runs. When your bead is done,
 PS_CAND="$(
 bd ready --metadata-field "gc.routed_to=ps-worker" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "story:needs-approval" --exclude-label "needs-human" --exclude-label "needs-human-decision" --exclude-label "ctx:thin" --exclude-label "story:epic" --exclude-label "story:refinement-in-progress" --exclude-label "story:unrefined" --exclude-label "refino:policy-gap" --exclude-label "refino:info-gap" --exclude-label "auto-refino:escalated" --exclude-label "story:refino-escalado" --exclude-label "story:refino-review" --exclude-label "auto-refino:refining" --exclude-label "exec:manual" --exclude-label "on-device" --exclude-label "story:needs-device" --exclude-label "phone-proxy" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --exclude-label "delivery:pending-restart" --json --limit 0 | jq --argjson now_ts "$(date +%s)" '[.[] | select((.labels // []) | map(select(startswith("pool:refused") or startswith("pilot:refused-reason:"))) | length == 0) | select(((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length == 0) or ((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber) | if length > 0 then (max < $now_ts) else false end)) | select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) | select((.labels // []) | map(select(startswith("blocked:"))) | length == 0) | select(((.labels // []) | map(select(test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not))) | length) == 0) | select((.labels // []) | map(select(startswith("gate:needs-human"))) | length == 0) | select((.labels // []) | map(select(startswith("pilot:text-veto"))) | length == 0) | select(((.labels // []) | map(select(startswith("pilot:reclaim-count:")) | ltrimstr("pilot:reclaim-count:") | select(test("^[0-9]+\\z")) | tonumber)) | if length > 0 then (max < 3) else true end)]'
 )"
+# ga-kqa08j (Athos 07/10): GATE FOCUS MODE. When the gate is the bottleneck
+# (gate-focus-mode.sh says active=1), keep ONLY fixes of beads the gate already rejected
+# (gate:needs-fix or gate:fix-attempt:N) — a new build waits until the gate queue drains.
+# If this leaves [] in focus mode there is no fix for you: drain, do NOT look for a new
+# bead elsewhere (Step 1b3 included). Unknown/off focus state -> no filtering.
+GATE_FOCUS_PROBE="$(. /Users/athos/gt/.gascity-gastown-hq/packs/town-deltas/assets/scripts/gate-focus-lib.sh 2>/dev/null && gate_focus_active)"
+if [ "$GATE_FOCUS_PROBE" = "1" ] && [ -n "$PS_CAND" ]; then
+  PS_CAND="$(printf '%s' "$PS_CAND" | jq -c 'map(select(any((.labels // [])[]; . == "gate:needs-fix" or startswith("gate:fix-attempt:"))))' 2>/dev/null)" || PS_CAND="[]"
+  [ -n "$PS_CAND" ] || PS_CAND="[]"
+fi
 PS_LIB="${GC_CITY_PATH:-$GC_CITY}/packs/town-deltas/assets/scripts/work-order.sh"
 PS_PICK=""
 if [ -z "$PS_CAND" ]; then

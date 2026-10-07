@@ -117,6 +117,8 @@ QGE_BUFFER_SEC=1200      # ±20min around the predicted fire (drift + advisory-o
 # (so it does not exercise the default) and checks that the committed plist
 # carries the same value (ga-14oukw).
 DOG_MAX_NORMAL="${DOG_MAX_NORMAL:-3}"; DOG_MAX_THROTTLED=1
+GATE_FOCUS_DOG_MAX="${GATE_FOCUS_DOG_MAX:-2}"   # ga-kqa08j: dog cap while the gate is the bottleneck
+GATE_FOCUS_LIB="${GATE_FOCUS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/gate-focus-lib.sh}"
 ORACLE_MIN_NORMAL=1;   ORACLE_MIN_THROTTLED=0
 BEADS_HEALTH_NORMAL="120s";     BEADS_HEALTH_THROTTLED="300s"
 GATE_SWEEP_NORMAL="60s";        GATE_SWEEP_THROTTLED="150s"
@@ -223,6 +225,27 @@ apply_profile() { # normal|throttled
         bh_target="$BEADS_HEALTH_NORMAL"; gs_target="$GATE_SWEEP_NORMAL"; ots_target="$ORDER_TRACKING_NORMAL"
     fi
 
+    # ga-kqa08j: GATE FOCUS MODE (decided by gate-focus-mode.sh; this guard stays the ONLY
+    # writer of the dog cap). ON -> the dog pool runs at most GATE_FOCUS_DOG_MAX sessions
+    # (the gate re-routes rejected beads to dogs, so those are the fixers). UNKNOWN ->
+    # leave the cap exactly as it is this pass: an unreadable signal must never flip the
+    # cap 2->6->2 (each flip is a reload).
+    local _gf_state=0
+    if [ -r "$GATE_FOCUS_LIB" ] && . "$GATE_FOCUS_LIB" 2>/dev/null; then
+        _gf_state="$(gate_focus_active)"
+    else
+        _gf_state=unknown
+    fi
+    case "$_gf_state" in
+        1) if [ "$dog_target" -gt "$GATE_FOCUS_DOG_MAX" ] 2>/dev/null; then
+               dog_target="$GATE_FOCUS_DOG_MAX"
+               log "gate focus mode ON — dog cap target clamped to $dog_target (ga-kqa08j)"
+           fi ;;
+        0) : ;;
+        *) dog_target="__hold__"
+           log "gate focus state UNKNOWN — dog cap left unchanged this pass (ga-kqa08j)" ;;
+    esac
+
     # Read every target explicitly in THIS shell (not inside a captured
     # subshell helper) so a read failure can set read_err here directly —
     # a flag set inside a `$(...)` capture never escapes that subshell.
@@ -250,6 +273,7 @@ apply_profile() { # normal|throttled
         log "ERROR: could not read interval from $ORDER_TRACKING_TOML (anchor not found/unreadable) — skipping this target this pass"
     fi
 
+    [ "$dog_target" = "__hold__" ] && dog_target="$cur_dog"
     log "profile=$profile current(dog_max=$cur_dog oracle_min=$cur_oracle beads_health=$cur_bh gate_sweep=$cur_gs order_tracking=$cur_ots) target(dog_max=$dog_target oracle_min=$oracle_target beads_health=$bh_target gate_sweep=$gs_target order_tracking=$ots_target)"
 
     # Each write is gated on a SUCCESSFUL read (never on an unreadable one

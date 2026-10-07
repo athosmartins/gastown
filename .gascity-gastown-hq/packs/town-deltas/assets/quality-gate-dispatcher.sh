@@ -573,6 +573,22 @@ case "$GATE_DOLT_CPU_HOT"        in ''|*[!0-9]*) GATE_DOLT_CPU_HOT=180 ;; esac
 case "$GATE_DOLT_CPU_WARM"       in ''|*[!0-9]*) GATE_DOLT_CPU_WARM=100 ;; esac
 case "$GATE_DOLT_LATENCY_HOT_MS" in ''|*[!0-9]*) GATE_DOLT_LATENCY_HOT_MS=2500 ;; esac
 case "$GATE_MAX_REVIEWERS"       in ''|*[!0-9]*) GATE_MAX_REVIEWERS=6 ;; esac
+# ga-kqa08j: the reviewer ceiling can never exceed what the ENGINE will actually run.
+# agents/gate-reviewer/agent.toml max_active_sessions (3, deliberate — ga-5hdsr) is
+# enforced by the controller; admitting a 4th..6th run (the old default 6) only
+# created runs whose reviewer session waited in start-pending while the run's verdict
+# timeout kept counting — a run that times out comes back as gate:needs-fix with
+# nobody having evaluated the code. Unreadable/absent cap -> keep the env value and
+# say so (never invent a cap).
+GATE_ENGINE_REVIEWER_CAP="$(sed -n 's/^max_active_sessions *= *\([0-9][0-9]*\).*/\1/p' "$GC_CITY/agents/gate-reviewer/agent.toml" 2>/dev/null | head -n 1)"
+GATE_ENGINE_CAP_NOTE=""
+case "$GATE_ENGINE_REVIEWER_CAP" in
+  ''|*[!0-9]*) GATE_ENGINE_CAP_NOTE="engine reviewer cap UNREADABLE ($GC_CITY/agents/gate-reviewer/agent.toml) — GATE_MAX_REVIEWERS stays $GATE_MAX_REVIEWERS (ga-kqa08j)" ;;
+  *) if [ "$GATE_MAX_REVIEWERS" -gt "$GATE_ENGINE_REVIEWER_CAP" ]; then
+       GATE_ENGINE_CAP_NOTE="GATE_MAX_REVIEWERS $GATE_MAX_REVIEWERS clamped to the engine cap $GATE_ENGINE_REVIEWER_CAP (agents/gate-reviewer/agent.toml) — ga-kqa08j"
+       GATE_MAX_REVIEWERS="$GATE_ENGINE_REVIEWER_CAP"
+     fi ;;
+esac
 # ── ga-uywvsc: DYNAMIC ceiling for GATE_MAX_REVIEWERS ─────────────────────────
 # GATE_MAX_REVIEWERS above is the FIXED ceiling (and what the dynamic one starts from and
 # falls back to). When switched on (pool_ceiling_enabled) the headroom step (Step 0b-1) recomputes it
@@ -6357,6 +6373,7 @@ _GATE_HB_FILE="$LOG_DIR/quality-gate-dispatcher.heartbeat"
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
 err()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] ERROR: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [quality-gate-dispatcher] WARN: $*"; : > "$_GATE_HB_FILE" 2>/dev/null || true; }
+[ -n "${GATE_ENGINE_CAP_NOTE:-}" ] && log "$GATE_ENGINE_CAP_NOTE"
 
 # ── ga-gnr3tw: what a reviewer is shown lives in ONE lib, shared with the builder's pre-gate-review.sh ──
 # The lens, the diff payload and the task prompt used to be inline below. The builder now runs the SAME lens on
