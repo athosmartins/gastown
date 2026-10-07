@@ -8688,7 +8688,8 @@ fi
       # ga-divv8: clear stale gate:fix-attempt:* residue and surface (not
       # block) a terminal-FAILED sibling branch — see the function header.
       gate_finalize_pass_label_hygiene "$BEAD_CITY" "$BEAD_ID" "$BRANCH"
-      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} via autonomous dispatcher (gate_run=$GATE_RUN_ID)." 2>/dev/null || true
+      gate_nbf_prepare   # audit of 72dc10768 finding 4: the reviewers' non-blocking findings travel with the PASS, not die with the verdict bead
+      bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED. Branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} via autonomous dispatcher (gate_run=$GATE_RUN_ID).${_GATE_NBF_BLOCK:-}" 2>/dev/null || true
 
       # Read the source bead state authoritatively (labels + live assignee).
       # ga-h199q: routed through the read-cache shim — the initial read of this
@@ -8856,9 +8857,10 @@ fi
         # unrelated manual git-log check caught a genuinely unmerged commit
         # fixing a real risk. Always requested from here on.
         SCOPE_HOLD_ALWAYS_CHECK="Before deciding, ALWAYS also run: git log --oneline --all --grep=$BEAD_ID — and compare the result against origin/$DEFAULT_BRANCH. A bead commit that exists but never reached that branch is what actually discriminates gate passed from ready, independent of this list signal."
+        gate_nbf_prepare   # audit of 72dc10768 finding 4: the reviewers' non-blocking findings travel with the PASS, not die with the verdict bead
         bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} — but NOT closing (ga-k2wjn/ga-zhfk8): $SCOPE_HOLD_WEAK_SIGNAL_NOTE The gate only reviewed this one diff, which is not the same claim as the full scope of the BEAD being done. $SCOPE_HOLD_ALWAYS_CHECK Labeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it. If this diff genuinely covers every enumerated item, add label scope_covered:all and re-run the gate (or close manually).
 
-$PARTIAL_EVIDENCE" 2>/dev/null || true
+$PARTIAL_EVIDENCE${_GATE_NBF_BLOCK:-}" 2>/dev/null || true
         gc --city "$GC_CITY" mail send mayor \
           -s "Gate held for scope review: $BEAD_ID (ga-k2wjn)" \
           -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-k2wjn/ga-zhfk8: %s\n\n%s\n\n%s\n\nLabeled delivery:partial + scope:needs-review; Pilot will not re-dispatch it.\n\nReview the diff against the full enumerated scope: if complete, add label scope_covered:all and close manually (or re-submit to the gate); if partial, the remaining items are still live on this bead.\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \
@@ -9266,13 +9268,14 @@ A bead delivered as branches in more than one repo/rig has one marker per repo; 
 BEFORE closing it by hand (ga-wlhd07): the check for OTHER still-open gate markers/runs on this bead COULD NOT RUN (a bd query failed; the ALERT is in the dispatcher log), so whether a sibling exists is UNKNOWN — none is confirmed. Closing on a false \"no siblings\" would orphan another repo/rig branch that is still waiting to merge. Run \`bd -C $GC_CITY list --label source-bead:$BEAD_ID --all\` (keep the -C: a bare bd from another directory reads a different store, and an empty list there is NOT \"every marker is closed\") and close this bead only once every marker/run listed there is closed."
               ;;
           esac
+          gate_nbf_prepare   # audit of 72dc10768 finding 4: the reviewers' non-blocking findings travel with the PASS, not die with the verdict bead
           bd -C "$BEAD_CITY" comment "$BEAD_ID" "Quality gate PASSED and branch $BRANCH merged to $RIG/$DEFAULT_BRANCH (sha=$MERGE_SHA)${MERGE_PRE_MAIN_SHA:+ (pre_merge_main=$MERGE_PRE_MAIN_SHA)} — but NOT closing (ga-l7n3v): daemon verification $DAEMON_HOLD_VERDICT — $DAEMON_HOLD_REASON
 
 A long-lived daemon serving rig '$RIG' may still be running code older than this merge. Closure is WITHHELD until this is resolved — a dormant merge must never be marked done (ga-l7n3v). Labeled delivery:pending-restart; gate:passed (already set) keeps the Pilot from re-dispatching this bead.
 ACTION: $DAEMON_HOLD_ACTION
 
 Refresh detail:
-$DAEMON_HOLD_DETAIL" 2>/dev/null || true
+$DAEMON_HOLD_DETAIL${_GATE_NBF_BLOCK:-}" 2>/dev/null || true
           gc --city "$GC_CITY" mail send mayor \
             -s "Gate held for daemon verification: $BEAD_ID (ga-l7n3v)" \
             -m "$(printf 'Source bead %s PASSED the quality gate and merged (branch %s, sha %s, gate_run %s) but was NOT closed.\n\nga-l7n3v: daemon verification %s — %s\n\nA long-lived daemon serving rig %s may still be running code older than this merge. Labeled delivery:pending-restart; gate:passed keeps the Pilot from re-dispatching it.\n\nACTION: %s\n\nBead: %s   Rig: %s\nBranch: %s (gate run %s, sha %s)' \

@@ -222,8 +222,11 @@ passes without exercising the path it claims to test.
 WHAT DOES NOT BLOCK (report it under "Non-blocking findings", at its real
 severity — never drop it): a comment or docstring that misdescribes code which
 itself behaves correctly; a log line whose wording is wrong but that does NOT
-report success on a failure; an edge case whose outcome is identical for the
-user or the caller either way; style or naming. The builder gets these in the
+report success, a count, an empty result or "nothing to do" on a failure; an
+edge case the code could not tell apart from the normal case anyway AND whose
+outcome is identical for the caller (an error made to look like a normal or
+empty result is the third-state family above and BLOCKS); style or naming.
+The builder gets these in the
 verdict comment and fixes them in the next change on that file; they do not
 cost a re-review round (decision of the owner, 2026-10-07: approval must stop
 failing on form while behavior is correct).

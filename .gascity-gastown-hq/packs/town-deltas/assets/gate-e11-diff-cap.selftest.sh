@@ -419,6 +419,7 @@ NOT_A_REPO="$TMPD/plain-dir"; mkdir -p "$NOT_A_REPO"
 # Stubs for what the live block calls. Defined AFTER sourcing (the guard's own log/err sit past its lib-only cutoff).
 log()  { echo "LOG $*" >> "$LOGF"; }
 err()  { echo "ERR $*" >> "$LOGF"; }
+warn() { echo "WARN $*" >> "$LOGF"; }
 set_gate_status() { echo "STATUS $*" >> "$CALLS"; }
 # bd answers `show <id>` and `comments <id>` from files named per id AND per store (-C <dir>): the source bead lives in
 # BEAD_CITY ($TMPD/beadcity), the marker in GC_CITY ($TMPD/city) — two DIFFERENT dirs, so a block that read the source
@@ -427,22 +428,37 @@ set_gate_status() { echo "STATUS $*" >> "$CALLS"; }
 # (comment ...) succeeds.
 bd() {
   echo "BD $*" >> "$CALLS"
-  local verb="" id="" prev="" dir="" a
+  local dir="" a skip=0 verb="" id="" op="" labs="" f
+  local -a rest=()
   for a in "$@"; do
-    case "$prev" in
-      -C) dir="$a" ;;
-      show) verb=show; id="$a" ;;
-      comments) verb=comments; id="$a" ;;
-      comment) [ -z "$verb" ] && verb=comment ;;
-    esac
-    prev="$a"
+    if [ "$skip" = 1 ]; then dir="$a"; skip=0; continue; fi
+    case "$a" in -C) skip=1; continue ;; esac
+    rest+=("$a")
   done
+  verb="${rest[0]:-}"; id="${rest[1]:-}"
   case "$verb" in
     show)     [ -n "$dir" ] && [ -f "$dir/show-$id.json" ] && cat "$dir/show-$id.json" || return 1 ;;
     comments) [ -n "$dir" ] && [ -f "$dir/comments-$id.json" ] && cat "$dir/comments-$id.json" || return 1 ;;
+    # A tiny fake store, so the guard's READ-BACKS see what a real bd would show: `label add/remove` persist into
+    # show-<id>.json (unless E11_STUB_LABELS_VANISH=1 — the silent-failure shape the guard must detect), `close`
+    # flips status to closed (unless E11_STUB_CLOSE_FAILS=1 — rc 1 and nothing persists). A bead with no file:
+    # the write "succeeds" and persists nothing.
+    label)    op="${rest[1]:-}"; id="${rest[2]:-}"; labs="${rest[3]:-}"; f="$dir/show-$id.json"
+      if [ -n "$dir" ] && [ -f "$f" ] && [ "${E11_STUB_LABELS_VANISH:-0}" != "1" ]; then
+        case "$op" in
+          add)    jq -c --arg l "$labs" '.[0].labels = (((.[0].labels // []) + ($l|split(","))) | unique)' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+          remove) jq -c --arg l "$labs" '.[0].labels = ((.[0].labels // []) - ($l|split(",")))' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+        esac
+      fi
+      return 0 ;;
+    close)    f="$dir/show-$id.json"
+      [ "${E11_STUB_CLOSE_FAILS:-0}" = "1" ] && return 1
+      if [ -n "$dir" ] && [ -f "$f" ]; then jq -c '.[0].status = "closed"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; fi
+      return 0 ;;
     *) return 0 ;;
   esac
 }
+gc() { echo "GC $*" >> "$CALLS"; return 0; }
 SRC_STORE="$TMPD/beadcity"; MRK_STORE="$TMPD/city"
 mkdir -p "$SRC_STORE"
 
@@ -499,6 +515,58 @@ has "100% off: record says forced=0" "$LOGF" "forced=0"
 echo "  — arm B, treated —"
 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
 eq "arm B, 900 prod lines (+100 test): REFUSED (rc 1)" "$RC" "1"
+echo "  — refusal: what reaches the source bead, the author and the marker (audit of 72dc10768, finding 1) —"
+has "refusal: the marker's refusal label is written" "$CALLS" "label add m-e11 gate-guard:refused-e11"
+hasnt "refusal: ...and READ BACK as persisted (no 'NOT persisted' warning)" "$LOGF" "NOT persisted"
+has "refusal: source bead loses gate:queued (nothing is queued)" "$CALLS" "BD -C $SRC_STORE label remove $BB gate:queued"
+has "refusal: source bead gets gate:needs-fix + refusal counter 1" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-fix,gate:e11-refusals:1"
+has "refusal: the reason lands on the SOURCE bead as a VERDICT: FAIL comment (what a fix sling carries)" "$CALLS" "BD -C $SRC_STORE comment $BB VERDICT: FAIL (gate guard, diff-size cap E11 — refusal 1 of 3"
+has "refusal: the reason says what to do (split)" "$CALLS" "O QUE FAZER: dividir em fatias"
+has "refusal: marker closed" "$CALLS" "BD -C $MRK_STORE close m-e11"
+has "refusal: ...VERIFIED, and the status is failed (not error)" "$LOGF" "CLOSED (verified, gate-status:failed)"
+has "refusal: status set to failed" "$CALLS" "STATUS m-e11 failed"
+hasnt "refusal: no gate-status:error on a verified close" "$CALLS" "STATUS m-e11 error"
+hasnt "refusal: feat/ branch names no crew → no author mail attempted" "$CALLS" "GC --city $MRK_STORE mail send"
+hasnt "refusal: 1st refusal → no needs-human, no mayor mail" "$CALLS" "gate:needs-human"
+eq "refusal: the source bead REALLY carries gate:needs-fix afterwards (fake store)" "$(jq -r '.[0].labels|index("gate:needs-fix") != null' "$SRC_STORE/show-$BB.json")" "true"
+eq "refusal: ...and no gate:queued" "$(jq -r '.[0].labels|index("gate:queued")' "$SRC_STORE/show-$BB.json")" "null"
+
+echo "  — refusal of a crew branch: the author is mailed —"
+set_beads "$BB" '["story:approved","gate:queued"]' "$PLAIN"
+# the guard counts origin/<branch>: publish the same 900-line tip under a crew-shaped name in the fake origin
+git -C "$RIG_OK" push -q origin origin/feat/prod900:refs/heads/crew/oracle/wa-abc123 >/dev/null 2>&1 && git -C "$RIG_OK" fetch -q origin >/dev/null 2>&1 || echo "  (could not publish the crew branch in the fake origin)"
+run_e11 1 "$RIG_OK" "$BB" crew/oracle/wa-abc123; RC=$?
+eq "crew branch refused (rc 1)" "$RC" "1"
+has "crew branch: author mail to the crew name from the branch" "$CALLS" "GC --city $MRK_STORE mail send oracle -s Gate recusou $BB na submissao: 900 linhas de producao > teto 800 (E11)"
+eq "crew branch: one mail, the first candidate succeeded" "$(grep -c 'GC --city .* mail send oracle' "$CALLS")" "1"
+
+echo "  — 3rd refusal of the same bead: bounded end state (needs-human + mayor) —"
+set_beads "$BB" '["story:approved","gate:e11-refusals:2"]' "$PLAIN"
+run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "3rd refusal still refuses (rc 1)" "$RC" "1"
+has "3rd: counter 3" "$CALLS" "label add $BB gate:needs-fix,gate:e11-refusals:3"
+has "3rd: gate:needs-human added" "$CALLS" "BD -C $SRC_STORE label add $BB gate:needs-human"
+has "3rd: gate:needs-fix removed again (the Pilot must not redispatch)" "$CALLS" "BD -C $SRC_STORE label remove $BB gate:needs-fix"
+has "3rd: the mayor is mailed" "$CALLS" "GC --city $MRK_STORE mail send mayor -s Gate E11: $BB recusado 3x por tamanho"
+has "3rd: the comment says 'refusal 3 of 3'" "$CALLS" "refusal 3 of 3"
+
+echo "  — refusal label write that does not persist: said, and the close still ends it —"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+E11_STUB_LABELS_VANISH=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "label vanish: still refused (rc 1)" "$RC" "1"
+eq "label vanish: label add was RETRIED (2 attempts)" "$(grep -c 'label add m-e11 gate-guard:refused-e11' "$CALLS")" "2"
+has "label vanish: the warning names it" "$LOGF" "WARN E11-DIFF-CAP: refusal label gate-guard:refused-e11 NOT persisted on m-e11 after 2 attempts"
+has "label vanish: the marker is still closed (verified) — the close is the primary mechanism" "$LOGF" "CLOSED (verified, gate-status:failed); source $BB -> gate:needs-fix (refusal 1/3); refusal label persisted=0"
+
+echo "  — close that fails: gate-status:error, said, the watchdog backstop named —"
+set_beads "$BB" "$PLAIN" "$PLAIN"
+E11_STUB_CLOSE_FAILS=1 run_e11 1 "$RIG_OK" "$BB" feat/prod900; RC=$?
+eq "close fails: still refused (rc 1)" "$RC" "1"
+has "close fails: status error (not failed)" "$CALLS" "STATUS m-e11 error"
+hasnt "close fails: never claims a verified close" "$LOGF" "CLOSED (verified"
+has "close fails: the warning names the backstop and the label state" "$LOGF" "WARN E11-DIFF-CAP refused: marker m-e11 close NOT verified — left in gate-status:error; gate-recovery-watchdog closes it (close:guard-refused)"
+has "close fails: label persisted=1 in that record" "$LOGF" "(persisted=1)"
+set_beads "$BB" "$PLAIN" "$PLAIN"
 has "refusal: the record is written BEFORE the exit, with the production count (tests not counted)" "$LOGF" "LOG E11-DIFF-CAP bead=$BB arm=B verdict=recusa production_lines=900 cap=800"
 has "refusal: gate-status:error on the marker" "$CALLS" "STATUS m-e11 error"
 has "refusal: a comment goes on the marker" "$CALLS" "BD -C $TMPD/city comment m-e11"

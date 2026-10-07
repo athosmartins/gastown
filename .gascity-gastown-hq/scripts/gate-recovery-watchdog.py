@@ -4235,6 +4235,34 @@ def _mail_oscillating_error_marker(mid, branch, source_bead, rig_name, req_count
               % mid, flush=True)
 
 
+def _close_guard_refused_marker(mid, source_bead, branch):
+    """Close a guard-refused gate-status:error marker (label gate-guard:refused*), VERIFIED
+    (ga-o2dlg8 shape, audit of 72dc10768 finding 5): the close comes FIRST and only a
+    returncode-0 close flips the status to superseded and claims success in the log and the
+    ledger. A failed close leaves gate-status:error in place — still selected by the next
+    sweep, which retries — and says CLOSE FAILED with the stderr. The guard itself closes
+    the marker at refusal time since 07/10 afternoon; this is the backstop for a failed
+    guard close. Returns True only when the marker is closed (dry-run: True, nothing written)."""
+    why = ("guard refusal (label gate-guard:refused*) — a guard's no is a decision, not an infra error; "
+           "not requeued, closed after the %d-min grace (ga-ufskhy 07/10)" % ERROR_REQUEUE_MINUTES)
+    if GRW_DRY_RUN:
+        print("[watchdog] requeue DRY-RUN would CLOSE guard-refused error marker %s (%s)" % (mid, why), flush=True)
+        _recovery_ledger("would_close_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
+        return True
+    cr = sh(["bd", "-C", CITY, "close", mid, "-r", "marker %s closed by gate-recovery-watchdog: %s" % (mid, why)], timeout=25)
+    if cr and cr.returncode == 0:
+        set_gate_status_py(mid, "superseded")
+        _recovery_ledger("closed_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
+        print("[watchdog] CLOSED guard-refused error marker %s (verified close; not requeued)" % mid, flush=True)
+        return True
+    stderr_snip = ((cr.stderr or "") if cr else "(sh() returned None — exception or timeout)")[:300]
+    print("[watchdog] guard-refused error marker %s CLOSE FAILED (returncode=%s): %s — left in gate-status:error, retried next sweep"
+          % (mid, (cr.returncode if cr else "N/A"), stderr_snip), flush=True)
+    _recovery_ledger("close_guard_refused_marker_failed", {"marker": mid, "source_bead": source_bead, "branch": branch,
+                                                            "returncode": (cr.returncode if cr else None), "stderr": stderr_snip})
+    return False
+
+
 def requeue_error_markers(now, rstate):
     """FIX 2: auto-requeue a STUCK gate-status:error marker (error → queued) — the
     error→queued flip the Mayor did by hand ~6x today. Bounded per sweep, dry-run
@@ -4292,16 +4320,7 @@ def requeue_error_markers(now, rstate):
             continue
 
         if verdict == "close:guard-refused":
-            why = "guard refusal (label gate-guard:refused*) — a guard's no is a decision, not an infra error; not requeued, closed after the %d-min grace (ga-ufskhy 07/10)" % ERROR_REQUEUE_MINUTES
-            if GRW_DRY_RUN:
-                print("[watchdog] requeue DRY-RUN would CLOSE guard-refused error marker %s (%s)" % (mid, why), flush=True)
-                _recovery_ledger("would_close_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch, "dry_run": True})
-                acted += 1
-                continue
-            set_gate_status_py(mid, "superseded")
-            sh(["bd", "-C", CITY, "close", mid, "-r", "marker %s closed by gate-recovery-watchdog: %s" % (mid, why)], timeout=25)
-            _recovery_ledger("closed_guard_refused_marker", {"marker": mid, "source_bead": source_bead, "branch": branch})
-            print("[watchdog] CLOSED guard-refused error marker %s (not requeued)" % mid, flush=True)
+            _close_guard_refused_marker(mid, source_bead, branch)
             acted += 1
             continue
         if verdict == "close:source-done":
@@ -5753,6 +5772,41 @@ def _selftest():
     E = 8 * 60
     ok(error_requeue_verdict(300, E, False, False, False, 0, 3, "unknown", guard_refused=True) == "skip:young", "guard-refused + young → skip:young (grace first)")
     ok(error_requeue_verdict(E + 1, E, False, False, False, 0, 3, "unknown", guard_refused=True) == "close:guard-refused", "guard-refused + past grace → close, never requeue (ga-h3cje3 shape)")
+    # I/O level (audit of 72dc10768 finding 7): the close is the thing that must happen, verified,
+    # BEFORE any status flip; a failed close flips nothing and says so; dry-run writes nothing.
+    _gr_calls = []
+    _gr_close_rc = [0]
+    def _fake_sh_gr(args, timeout=20, stdin=None):
+        _gr_calls.append(list(args))
+        head = list(args)[:5]
+        if "close" in head:
+            return subprocess.CompletedProcess(args=args, returncode=_gr_close_rc[0], stdout="", stderr=("bd: nope" if _gr_close_rc[0] else ""))
+        if "show" in head:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout='[{"labels":["gate-status:error","gate-guard:refused-e11"]}]')
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+    _real_sh_gr = globals()["sh"]
+    _real_dry_gr = globals()["GRW_DRY_RUN"]
+    try:
+        globals()["sh"] = _fake_sh_gr
+        globals()["GRW_DRY_RUN"] = False
+        _gr_calls[:] = []; _gr_close_rc[0] = 0
+        r = _close_guard_refused_marker("fake-mk-gr1", "fake-src", "feat/x")
+        close_i = next((i for i, c in enumerate(_gr_calls) if "close" in c[:5]), None)
+        label_i = next((i for i, c in enumerate(_gr_calls) if "label" in c[:5]), None)
+        ok(r is True, "verified close → True")
+        ok(close_i is not None and label_i is not None and close_i < label_i, "the close happens BEFORE the status flip (ga-o2dlg8 order)")
+        ok(any("superseded" in " ".join(c) for c in _gr_calls if "label" in c[:5]), "status flipped to superseded after a verified close")
+        _gr_calls[:] = []; _gr_close_rc[0] = 1
+        r = _close_guard_refused_marker("fake-mk-gr2", "fake-src", "feat/x")
+        ok(r is False, "failed close → False (never claimed)")
+        ok(not any("label" in c[:5] for c in _gr_calls), "failed close flips NO status — the marker stays gate-status:error for the next sweep")
+        globals()["GRW_DRY_RUN"] = True
+        _gr_calls[:] = []; _gr_close_rc[0] = 0
+        r = _close_guard_refused_marker("fake-mk-gr3", "fake-src", "feat/x")
+        ok(r is True and _gr_calls == [], "dry-run: True and not one subprocess call")
+    finally:
+        globals()["sh"] = _real_sh_gr
+        globals()["GRW_DRY_RUN"] = _real_dry_gr
     ok(error_requeue_verdict(E + 1, E, True, False, True, 0, 3, "unknown", guard_refused=True) == "close:guard-refused", "guard-refused beats parked-needs-human: the marker is closed either way")
     ok(error_requeue_verdict(E + 1, E, False, False, False, 0, 3, "unknown", guard_refused=False) == "requeue", "no guard label → today's requeue (control)")
     ok(error_requeue_verdict(300, E, True, True, False, 0, 3, "merged") == "close:source-done", "source resolved+CLOSED+branch MERGED → close regardless of age (checked first)")

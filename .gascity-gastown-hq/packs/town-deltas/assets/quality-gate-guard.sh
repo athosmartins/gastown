@@ -1997,6 +1997,58 @@ gate_e13_grace_secs() {
 }
 # SELFTEST-EXTRACT gate-e13-grace-secs-fn: END
 
+# gate_extract_nonblocking_findings <comments_json> — pure. From the LAST comment that carries a
+# standalone "VERDICT: PASS|FAIL" line (the reviewer's verdict; the task text pasted earlier quotes
+# the template inside a command line and never has that standalone line), prints the lines after
+# its LAST "Non-blocking findings:" (content on the same line counts), trimmed; nothing when there
+# are none or the only content is a form of "none"; unreadable JSON prints nothing (the caller
+# logs that it could not read, it never invents findings). (audit of 72dc10768, finding 4)
+# SELFTEST-EXTRACT gate-extract-nonblocking-findings-fn: BEGIN
+gate_extract_nonblocking_findings() {
+  local json="${1:-}" txt
+  txt=$(printf '%s' "$json" | jq -r '
+      (if type=="array" then . else (.comments // []) end)
+      | map((.text // .body // "") | tostring)
+      | map(select(split("\n") | any(test("^[[:space:]]*VERDICT: (PASS|FAIL)[[:space:]]*$"))))
+      | last // ""' 2>/dev/null) || txt=""
+  [ -n "$txt" ] || return 0
+  printf '%s\n' "$txt" | awk '
+      match($0, /Non-blocking findings:/) { buf=""; on=1; rest=substr($0, RSTART+RLENGTH); if (rest ~ /[^ \t]/) buf=rest "\n"; next }
+      on { buf = buf $0 "\n" }
+      END { printf "%s", buf }' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' \
+    | grep -vixE -- '-? *\(?none\)?[.]?' || true
+}
+# SELFTEST-EXTRACT gate-extract-nonblocking-findings-fn: END
+
+# gate_nbf_prepare — sets _GATE_NBF_BLOCK to the "Non-blocking findings" of every verdict bead of the
+# current run (VERDICT_BEAD_IDS), formatted for the PASS comment on the source bead, and labels the
+# source bead gate:nonblocking-findings when there are any (so a sweep can list the debt the relaxed
+# bar let through). Empty when there are none; a verdict bead whose comments cannot be read is
+# LOGGED and skipped, never read as "no findings".
+gate_nbf_prepare() {
+  _GATE_NBF_BLOCK=""
+  local vb one json
+  [ -n "${VERDICT_BEAD_IDS+x}" ] || return 0
+  for vb in "${VERDICT_BEAD_IDS[@]}"; do
+    [ -n "$vb" ] || continue
+    if ! json=$(bd -C "$GC_CITY" comments "$vb" --json 2>/dev/null); then
+      log "non-blocking findings: comments of verdict bead $vb unreadable — not carried into the PASS comment (said here, not invented)"
+      continue
+    fi
+    one=$(gate_extract_nonblocking_findings "$json")
+    [ -n "$one" ] || continue
+    _GATE_NBF_BLOCK="${_GATE_NBF_BLOCK}
+
+Non-blocking findings carried from the review (verdict $vb) — fix them in the next change on these files; they cost no re-review (bar of 2026-10-07):
+$one"
+  done
+  if [ -n "$_GATE_NBF_BLOCK" ] && [ -n "${BEAD_ID:-}" ]; then
+    bd -C "${BEAD_CITY:-$GC_CITY}" label add "$BEAD_ID" gate:nonblocking-findings 2>/dev/null || true
+  fi
+  return 0
+}
+
 # bead_owner_session_state <bead_show_json> <sessions_json>
 # Pure, THREE-state read of "does this bead's assignee still own it through a
 # session?" — echoes exactly one of:
@@ -7307,7 +7359,11 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_FORCED=0
   _E11_ALL_FILE="${GATE_E11_ALL_FLAG_FILE:-${GC_CITY:-}/.gc/gate-e11-diff-cap.all}"
   if [ -e "$_E11_ALL_FILE" ] && [ ! -r "$_E11_ALL_FILE" ]; then
-    log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — 100% mode NOT applied (a switch nobody could read is off, and says so)"
+    if [ -z "${GATE_E11_ALL:-}" ]; then
+      log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — 100% mode NOT applied (a switch nobody could read is off, and says so)"
+    else
+      log "E11-DIFF-CAP all-switch=ilegivel file=$_E11_ALL_FILE — ignored: the env GATE_E11_ALL=${GATE_E11_ALL} decides"
+    fi
   fi
   case "${GATE_E11_ALL:-}" in ''|0|1) ;; *) log "E11-DIFF-CAP all-switch=env-invalido GATE_E11_ALL=${GATE_E11_ALL} — 100% mode NOT applied" ;; esac
   if [ "$_E11_ARM" = "A" ] && [ "$(gate_e11_force_all)" = "1" ]; then _E11_ARM="B"; _E11_FORCED=1; fi
@@ -7386,19 +7442,66 @@ if [ "$(gate_e11_enabled)" = "1" ]; then
   _E11_VERDICT=$(gate_e11_verdict "$_E11_ARM" "$_E11_VCOUNT" "$_E11_EXEMPT" "$_E11_CAP")
   log "E11-DIFF-CAP bead=${BEAD_ID:-<EMPTY>} arm=$_E11_ARM verdict=$_E11_VERDICT production_lines=$_E11_COUNT cap=$_E11_CAP exempt=$_E11_EXEMPT why=$_E11_WHY branch=${BRANCH:-<EMPTY>} marker=$MARKER_ID forced=${_E11_FORCED:-0}"
   if [ "$_E11_VERDICT" = "recusa" ]; then
-    # The label is what gate-recovery-watchdog.py reads: a guard REFUSAL is a decision, not an infra error, so the
-    # watchdog must never requeue this marker (it did: ga-h3cje3 on 27/09 was refused, requeued 8 min later, reviewed
-    # and merged). After its grace period the watchdog closes the marker; the builder resubmits with /gate-done.
-    bd -C "$GC_CITY" label add "$MARKER_ID" gate-guard:refused-e11 2>/dev/null || true
-    err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B). Refusing at submission."
-    set_gate_status "$MARKER_ID" "error"
-    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11).
+    # Four things, in this order, each of which somebody can ACT on (audit of 72dc10768, finding 1: before this the
+    # marker alone was labeled and left in error, nothing reached the source bead or the author, the bead kept
+    # gate:queued with no open marker and nobody could re-dispatch it — a silent strand):
+    #   1. the refusal label on the marker, READ BACK (label writes have failed silently in this city — ga-ehbw5,
+    #      ga-kgtiw); it is what gate-recovery-watchdog.py keys close:guard-refused on if the close below fails;
+    #   2. the SOURCE bead: gate:queued off, gate:needs-fix on (the Pilot and the focus-mode keep-filter route
+    #      fix-class beads to a builder), the reason as a VERDICT: FAIL comment (what a fix sling carries), a
+    #      refusal counter; the 3rd refusal of the same bead ends in gate:needs-human + mail to the mayor;
+    #   3. a mail to the author when the branch names a crew (/gate-done promised one); best-effort — the bead
+    #      labels are the durable path, a pool author has already exited and the Pilot re-dispatches the fix;
+    #   4. the marker CLOSED here, VERIFIED (ga-o2dlg8 shape); gate-status:error only when the close itself fails,
+    #      and then the log says so and the watchdog's close:guard-refused (keyed on 1.) is the backstop.
+    _E11_LBL_OK=0
+    for _e11_try in 1 2; do
+      bd -C "$GC_CITY" label add "$MARKER_ID" gate-guard:refused-e11 2>/dev/null || true
+      if bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null \
+         | jq -e 'if type=="array" then .[0] else . end | (.labels // []) | index("gate-guard:refused-e11") != null' >/dev/null 2>&1; then
+        _E11_LBL_OK=1; break
+      fi
+    done
+    [ "$_E11_LBL_OK" = "1" ] || warn "E11-DIFF-CAP: refusal label gate-guard:refused-e11 NOT persisted on $MARKER_ID after 2 attempts — the verified close below is the primary mechanism; if that fails too the watchdog will requeue this marker after its error grace (ga-h3cje3 shape). Said here, not hidden."
+    err "  diff-size cap (ga-lzidpo/E11): $_E11_COUNT production lines on $BRANCH vs origin/main exceed the cap of $_E11_CAP (arm B${_E11_FORCED:+, forced by the 100% switch}). Refusing at submission."
+    _E11_SRC_SHOW=$(bd -C "$BEAD_CITY" show "$BEAD_ID" --json 2>/dev/null) || _E11_SRC_SHOW=""
+    _E11_REFUSALS=$(printf '%s' "$_E11_SRC_SHOW" | jq -r 'if type=="array" then .[0] else . end | [(.labels // [])[] | select(startswith("gate:e11-refusals:")) | sub("^gate:e11-refusals:";"") | tonumber?] | max // 0' 2>/dev/null) || _E11_REFUSALS=0
+    case "$_E11_REFUSALS" in ''|*[!0-9]*) _E11_REFUSALS=0 ;; esac
+    _E11_REFUSALS=$((_E11_REFUSALS + 1))
+    _E11_REASON="VERDICT: FAIL (gate guard, diff-size cap E11 — refusal $_E11_REFUSALS of 3 for this bead; no reviewer was spawned)
 O diff de $BRANCH contra origin/main tem $_E11_COUNT linhas de codigo de PRODUCAO (testes, fixtures, arquivos gerados, lockfiles e .md nao contam); o teto por submissao e $_E11_CAP.
 Diff grande reprova na primeira tentativa bem mais (13% de aprovacao acima de 1500 linhas, contra 55-80% abaixo de 500): o revisor nao cobre tudo numa passada.
-Divida em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto e citando o bead da fatia nos commits.
-Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead ($BEAD_ID) e comente o MOTIVO: um comentario que COMECE com gate:size-exempt: seguido do motivo (15+ caracteres). Depois rode /gate-done de novo.
-Marker set to gate-status:error (fixable + re-submittable, not lost)." 2>/dev/null || true
-    log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID (gate-status:error)."
+O QUE FAZER: dividir em fatias, cada uma com o seu proprio marker (/gate-done): uma branch por fatia, cada uma abaixo do teto, citando o bead da fatia nos commits. Nao reenvie a mesma branch inteira.
+Se o diff e grande por natureza (renome ou migracao mecanica), ponha o label gate:size-exempt no bead $BEAD_ID e comente o MOTIVO (um comentario que COMECE com gate:size-exempt: seguido do motivo), depois reenvie.
+Marker $MARKER_ID fechado (recusado na submissao). Este bead ficou com gate:needs-fix e sem gate:queued: o Pilot despacha o conserto."
+    bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:queued 2>/dev/null || true
+    bd -C "$BEAD_CITY" label add "$BEAD_ID" "gate:needs-fix,gate:e11-refusals:$_E11_REFUSALS" 2>/dev/null || true
+    bd -C "$BEAD_CITY" comment "$BEAD_ID" "$_E11_REASON" 2>/dev/null || true
+    if [ "$_E11_REFUSALS" -ge 3 ]; then
+      bd -C "$BEAD_CITY" label add "$BEAD_ID" gate:needs-human 2>/dev/null || true
+      bd -C "$BEAD_CITY" label remove "$BEAD_ID" gate:needs-fix 2>/dev/null || true
+      gc --city "$GC_CITY" mail send mayor -s "Gate E11: $BEAD_ID recusado 3x por tamanho — precisa de humano" \
+        -m "$BEAD_ID (branch $BRANCH) foi recusado na submissao pela 3a vez: $_E11_COUNT linhas de producao > teto $_E11_CAP. Ficou com gate:needs-human (gate:needs-fix removido); o Pilot nao redespacha. Decida: fatiar voce mesmo, ou gate:size-exempt com motivo no bead." 2>/dev/null \
+        || warn "E11-DIFF-CAP: could not mail the mayor about the 3rd refusal of $BEAD_ID — the bead carries gate:needs-human"
+    fi
+    _E11_AUTHOR=$(printf '%s' "$BRANCH" | sed -n 's#^crew/\([^/]\{1,\}\)/.*#\1#p')
+    if [ -n "$_E11_AUTHOR" ]; then
+      _E11_MAILED=0
+      for _e11_to in "$_E11_AUTHOR" "${_E11_AUTHOR}-${BEAD_ID%%-*}"; do
+        if gc --city "$GC_CITY" mail send "$_e11_to" -s "Gate recusou $BEAD_ID na submissao: $_E11_COUNT linhas de producao > teto $_E11_CAP (E11)" -m "$_E11_REASON" >/dev/null 2>&1; then _E11_MAILED=1; break; fi
+      done
+      [ "$_E11_MAILED" = "1" ] || log "E11-DIFF-CAP: no author mail delivered for $BEAD_ID (candidates: $_E11_AUTHOR, ${_E11_AUTHOR}-${BEAD_ID%%-*}) — the bead carries gate:needs-fix and the reason; the Pilot routes it"
+    fi
+    bd -C "$GC_CITY" comment "$MARKER_ID" "Gate guard rejected marker: diff-size cap (ga-lzidpo / E11). $_E11_COUNT production lines on $BRANCH vs origin/main > cap $_E11_CAP. Marker closed; the reason and gate:needs-fix are on the source bead $BEAD_ID (refusal $_E11_REFUSALS of 3)." 2>/dev/null || true
+    if bd -C "$GC_CITY" close "$MARKER_ID" -r "refused at submission by the gate guard: diff-size cap E11 ($_E11_COUNT > $_E11_CAP production lines); source bead $BEAD_ID carries gate:needs-fix and the reason" >/dev/null 2>&1 \
+       && [ "$(bd -C "$GC_CITY" show "$MARKER_ID" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // ""' 2>/dev/null)" = "closed" ]; then
+      set_gate_status "$MARKER_ID" "failed"
+      log "E11-DIFF-CAP refused: marker $MARKER_ID CLOSED (verified, gate-status:failed); source $BEAD_ID -> gate:needs-fix (refusal $_E11_REFUSALS/3); refusal label persisted=$_E11_LBL_OK"
+    else
+      set_gate_status "$MARKER_ID" "error"
+      warn "E11-DIFF-CAP refused: marker $MARKER_ID close NOT verified — left in gate-status:error; gate-recovery-watchdog closes it (close:guard-refused) after its error grace if the refusal label stuck (persisted=$_E11_LBL_OK), else it will requeue it — a human should look"
+    fi
+    log "SUPPRESSED PUSH (wa-uthi non-terminal): diff-size cap (E11) refused $MARKER_ID."
     exit 1
   fi
 else
