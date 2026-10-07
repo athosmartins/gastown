@@ -14,7 +14,8 @@ Run it isolated: `python3 -I scripts/work_order.py sort [--age created|field|rec
          ordered by ANOTHER rule than the town's: stderr then starts with one
          `work-order WARN: WORK_ORDER_LIB override active: <path> ...` line (a stale variable in a daemon's
          environment must never be silent). The selftest uses the override for its mutants.
-         Cannot tell (not an array, jq/bash missing, library failed) -> stdout EMPTY, exit 2.
+         Cannot tell (not an array, jq/bash missing, library failed) -> stdout EMPTY, exit 2; with an
+         override active, that ERROR line carries the same notice (whatever the way it failed).
          Callers MUST treat empty as "I do not know" and keep their previous order with a visible
          WARN — it never means "no bead".
 
@@ -94,17 +95,21 @@ def _run_lib(raw, age):
 def sort_beads_raw(raw, age="created"):
     """bytes in (one JSON array) -> (ordered array as parsed JSON, stderr text with the WARN lines)."""
     notice = _override_notice()
-    proc = _run_lib(raw, age)
+    tail = "; " + notice if notice else ""      # every "cannot tell" below carries it: a stale override is the likely cause
+    try:
+        proc = _run_lib(raw, age)
+    except WorkOrderUnknown as exc:
+        raise WorkOrderUnknown(str(exc) + tail)
     err = proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0 or not proc.stdout.strip():
         first = err.strip().splitlines()[0] if err.strip() else "exit %d, no output" % proc.returncode
-        raise WorkOrderUnknown(first + ("; " + notice if notice else ""))
+        raise WorkOrderUnknown(first + tail)
     try:
         out = json.loads(proc.stdout)
     except ValueError as exc:
-        raise WorkOrderUnknown("library output is not JSON: %s" % exc)
+        raise WorkOrderUnknown("library output is not JSON: %s%s" % (exc, tail))
     if not isinstance(out, list):
-        raise WorkOrderUnknown("library output is not an array" + ("; " + notice if notice else ""))
+        raise WorkOrderUnknown("library output is not an array" + tail)
     if notice:
         err = notice + "\n" + err
     return out, err

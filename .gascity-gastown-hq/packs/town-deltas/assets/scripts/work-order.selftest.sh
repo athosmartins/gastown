@@ -470,6 +470,23 @@ for v in UNSET "$REAL_LIB" "$TMP/override-link.sh"; do
     *) ok "no notice when the default library is in use (${v##*/})" ;;
   esac
 done
+# ...and a run that CANNOT TELL says so too, whichever way the overridden library failed: that is where a stale
+# override is the likeliest cause, and the reason must not hide it (gate round 3 self-audit: the non-JSON branch did)
+printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "work-order ERROR: fixture failed" >&2; return 2; }' > "$TMP/ovr-fail.sh"
+printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "nope"; }' > "$TMP/ovr-nojson.sh"
+printf '%s\n' 'work_order_sort() { cat >/dev/null; echo "{\"a\":1}"; }' > "$TMP/ovr-notarray.sh"
+py_cant_ovr() { # <label> <library path> <what the reason must also say>
+  local out err rc
+  out="$(echo '[]' | WORK_ORDER_LIB="$2" python3 -I -B "$PY" sort 2>"$TMP/ovr.err")"; rc=$?
+  err="$(cat "$TMP/ovr.err")"
+  if [ -z "$out" ] && [ "$rc" -eq 2 ] && [[ "$err" == *"$3"* ]] && [[ "$err" == *"WORK_ORDER_LIB override active: "* ]]; then
+    ok "override + $1: empty stdout, exit 2, and the ERROR line names the override"
+  else bad "override + $1: out=[$out] rc=$rc err=[$err]"; fi
+}
+py_cant_ovr "a library that fails (exit 2)"          "$TMP/ovr-fail.sh"     "fixture failed"
+py_cant_ovr "a library that prints text, not JSON"   "$TMP/ovr-nojson.sh"   "library output is not JSON"
+py_cant_ovr "a library that prints an object"        "$TMP/ovr-notarray.sh" "library output is not an array"
+py_cant_ovr "a library path that does not exist"     "$TMP/ovr-missing.sh"  "library not found"
 fi
 
 # ── (k) sourcing ────────────────────────────────────────────────────────────────────────────────
@@ -828,6 +845,11 @@ must_fail override-always-announced pyi '    if os.path.realpath(lib) == os.path
 must_fail override-spelling-is-not-identity pyi 'os.path.realpath(lib) == os.path.realpath(_DEFAULT_LIB)' 'os.path.normpath(lib) == os.path.normpath(_DEFAULT_LIB)'
 must_fail override-notice-has-no-path pyi 'override active: %s (not the town'"'"'s library %s); "' 'override active (not the town'"'"'s library %s); "' \
   '% (lib, os.path.normpath(_DEFAULT_LIB)))' '% (os.path.normpath(_DEFAULT_LIB),))'
+# ...and on every way of "cannot tell" (the self-audit of the round-3 fix found the non-JSON branch without it)
+must_fail override-lost-on-library-failure pyi 'raise WorkOrderUnknown(first + tail)' 'raise WorkOrderUnknown(first)'
+must_fail override-lost-on-non-json pyi '"library output is not JSON: %s%s" % (exc, tail)' '"library output is not JSON: %s" % exc'
+must_fail override-lost-on-non-array pyi 'raise WorkOrderUnknown("library output is not an array" + tail)' 'raise WorkOrderUnknown("library output is not an array")'
+must_fail override-lost-when-library-cannot-run pyi 'raise WorkOrderUnknown(str(exc) + tail)' 'raise WorkOrderUnknown(str(exc))'
 # the lint: every alternative of every idiom, every scope glob, every line of the printed claim
 must_fail lint-drops-sort-flag-idiom py '("M2-sort-flag", r"--sort(?![A-Za-z-])"),' ''
 must_fail lint-drops-pilot-sort-idiom py '("M3-pilot-sort-jq", r"_PILOT_SORT_JQ"),' ''
