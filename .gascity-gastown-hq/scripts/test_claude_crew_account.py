@@ -340,6 +340,19 @@ def test_keychain_unreadable_means_nothing_is_touched(w):
     w.mp.setenv("FAKE_SEC_FAIL", crew.DEFAULT_SERVICE)
     w.run()
     assert w.writes() == []
+    assert w.notified() == []                                     # a locked/crashed `security` is "could not tell", not a page
+    assert "NOT touched and NOT healed" in w.log()                # but the log says what it did not do
+
+
+def test_a_missing_default_item_is_alerted_once_not_skipped_as_nothing_to_do(w):
+    w.account("amb", blob("amb"))                                 # healable sources exist, the default item does not
+    w.decide("amb")
+    w.run()
+    assert w.writes() == []                                       # absent owner is unknowable: nothing is created
+    missing = [n for n in w.notified() if "default item does not exist" in n]
+    assert len(missing) == 1 and "job falhou" in missing[0]
+    w.run(at=w.now + 60)
+    assert len([n for n in w.notified() if "default item does not exist" in n]) == 1   # one push per alert window
 
 
 def test_a_source_that_belongs_to_someone_else_is_refused_when_the_profile_can_say_so(w):
@@ -573,6 +586,41 @@ def test_two_logins_that_cannot_be_compared_are_never_overwritten_blind(w):
     w.run()
     assert crew.DEFAULT_SERVICE not in w.writes()
     assert any("sync-back" in n and EMAIL["crypto"] in n for n in w.notified())
+
+
+# ── gate round 3 (ga-hqhbi6): "which login is newer" with NO refresh expiry on EITHER side is unknown, not "the default" ─
+def test_two_logins_that_both_lack_a_refresh_expiry_are_never_overwritten_blind(w):
+    w.default("crypto", blob("crypto", rt="live-lineage", rexp_days=None))
+    w.account("crypto", blob("crypto", rt="human-relogin", rexp_days=None))      # a fresh human re-login, same shape
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert w.writes() == []                                       # neither the own item nor the default item was touched
+    assert _rt(w.get(_own(w, "crypto"))) == "sk-ant-ort01-human-relogin-ref"
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-live-lineage-ref"
+    assert any("sync-back" in n and EMAIL["crypto"] in n for n in w.notified())
+    assert "neither of them carries a refresh expiry" in w.log()  # said, not silent: the log names the unknown
+
+
+def test_the_same_login_on_both_sides_needs_no_recency_at_all(w):
+    w.default("crypto", blob("crypto", rt="same", rexp_days=None))
+    w.account("crypto", blob("crypto", rt="same", rexp_days=None))
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"            # nothing to compare, nothing to veto
+    assert not any("sync-back" in n for n in w.notified())
+
+
+def test_a_stored_copy_that_is_not_a_full_login_is_replaced_not_protected(w):
+    w.default("crypto", blob("crypto", rt="crypto-rotated"))                    # a full login, with a refresh expiry
+    w.account("crypto", blob("crypto", refresh=False))                          # the own item holds a setup-token
+    w.account("amb", blob("amb"))
+    w.decide("amb")
+    w.run()
+    assert w.get(_own(w, "crypto"))["claudeAiOauth"].get("refreshToken") == "sk-ant-ort01-crypto-rotated-ref"   # saved over it
+    assert _rt(w.get(crew.DEFAULT_SERVICE)) == "sk-ant-ort01-amb-ref"           # and the switch goes ahead
+    assert not any("sync-back" in n for n in w.notified())
 
 
 def test_the_overwrite_is_allowed_when_the_leaving_login_is_not_a_full_login_anyway(w):

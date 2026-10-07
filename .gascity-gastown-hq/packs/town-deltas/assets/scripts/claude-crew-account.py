@@ -14,7 +14,8 @@ account is current" (CLAUDE_POOL_STATE); this script FOLLOWS it, so agents, crew
 What it does, every run (launchd StartInterval, single instance via flock):
   1. WHO HOLDS the default item now? Asked of the profile endpoint (not remembered, not read from ~/.claude.json: a
      login written by hand would make a remembered answer wrong, and writing an account's blob over another account's
-     copy would destroy a login that needs a human puzzle to redo). Unknown -> change nothing.
+     copy would destroy a login that needs a human puzzle to redo). Unknown -> change nothing (the one exception: a default
+     item that is not a full login is healed, whoever holds it - Remote Control is broken either way).
   2. SYNC-BACK: the account that holds the default item keeps rotating its refresh token (the CLI does it, ~every 8 h).
      A refresh token lives in ONE place at a time, so the default item's login is copied back to that account's own item
      (never over a NEWER login there), otherwise the stored copy ages and the next switch would hand out a dead login.
@@ -476,12 +477,16 @@ def sync_back(st: dict, ident: str, cur: dict, t: float, dry: bool) -> Tuple[str
         so = src["claudeAiOauth"]
         if fp(so.get("refreshToken")) == fp(o.get("refreshToken")):
             return SB_NOTHING, "the stored copy is already the same login"
+        if not full_login(src, t)[0]:                           # a setup-token / dying login there: nothing worth protecting
+            dest = (svc, acct or login_name(), src)
+            break
         l_so, l_o = _ms_left(so, "refreshTokenExpiresAt", t), _ms_left(o, "refreshTokenExpiresAt", t)
-        if (l_so is None) != (l_o is None):
-            log("WARN", f"sync-back of {ident}: {svc} and the default item differ and only one of them carries a refresh "
-                        "expiry - cannot tell which login is newer")
+        if l_so is None or l_o is None:                         # one side OR BOTH: unknown is never "the default is newer"
+            log("WARN", f"sync-back of {ident}: {svc} and the default item differ and "
+                        f"{'neither' if l_so is None and l_o is None else 'only one'} of them carries a refresh expiry - "
+                        "cannot tell which login is newer")
             return SB_UNSAFE, f"cannot tell which of {svc} and the default item is the newer login"
-        if (l_so or 0) > (l_o or 0):
+        if l_so > l_o:
             log("INFO", f"sync-back to {svc} skipped: the stored login is a NEWER one")
             return SB_NOTHING, "the stored login is a newer one"
         dest = (svc, acct or login_name(), src)
@@ -578,7 +583,11 @@ def resolve_unverified(st: dict, t: float) -> None:
 def _follow(st: dict, dec: dict, user: str, t: float, dry: bool) -> int:
     s, acct, cur = kc_read(DEFAULT_SERVICE)
     if s != "ok":
-        log("WARN", f"the default item is {s} - nothing to do")
+        log("WARN", f"the default item is {s} (absent, unreadable or holding no login) - NOT touched and NOT healed: "
+                    "Remote Control may be down for Mayor and crews")
+        if s == "missing":
+            alert(st, "default-missing", "the default item does not exist: Remote Control is down for Mayor and crews until a "
+                  "login is put back (this script heals only a default item that exists)", t)
         return 0
     ok, why = full_login(cur, t)
     ident = identity(st, cur, t)
