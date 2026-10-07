@@ -474,12 +474,17 @@ probe_line() {
 # work-order.sh (here: the tree this selftest lives in; D0c points PROBE_CITY elsewhere), PATH is the sandbox with the
 # fake bd. Its stderr is kept in $WORK/probe.err for the caller — a probe that fell back to its pre-library order did
 # not apply the rule.
+# GATE_FOCUS_ACTIVE_OVERRIDE=0: since ga-kqa08j the Step 1b2 block also sources the LIVE city's gate-focus-lib.sh (an
+# absolute path, so GC_CITY_PATH cannot redirect it) and, while the gate queue is deep, keeps only gate:needs-fix beads —
+# every fixture here has none, so on a city in focus mode the probe would print [] and Part D would FAIL on the weather.
+# The override is the lib's own switch; it makes this part about ORDER, whatever the city is doing right now.
 probe_pick() {
   local _line
   _line="$(probe_line "$1" "$2")" || return 1
   [ -n "$_line" ] || return 1
   printf '%s' "$3" > "$WORK/stores/probe.json"
-  ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; GC_CITY_PATH="${PROBE_CITY:-$ROOT}"; export PROBE_STORE GC_CITY_PATH
+  ( PATH="$SANDBOX_PATH"; PROBE_STORE=probe; GC_CITY_PATH="${PROBE_CITY:-$ROOT}"; GATE_FOCUS_ACTIVE_OVERRIDE=0
+    export PROBE_STORE GC_CITY_PATH GATE_FOCUS_ACTIVE_OVERRIDE
     bash -c "$_line" 2>"$WORK/probe.err" ) | jq -r '.[0].id // ""'
 }
 # brake_gate_for <template> <pool> -> counted | off | unreadable: what the DISPATCHER's own _topup_worker_probe_migrated
