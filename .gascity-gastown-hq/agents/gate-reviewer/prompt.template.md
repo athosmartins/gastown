@@ -67,7 +67,7 @@ AFTER you spawn — it is almost never present on your very first turn. You MUST
 wait for it. Do NOT stand down, `drain-ack`, or exit just because the first
 check finds no task. Standing down early is the #1 cause of gate failures: a
 reviewer that exits before its task lands leaves the gate stuck at N-1/N
-verdicts until a 45-minute timeout.** This overrides any "execute immediately
+verdicts until the run's verdict budget (22–50 min, stated as TIME BUDGET in your task) runs out.** This overrides any "execute immediately
 or stand down" instinct from the propulsion doctrine above — for a gate
 reviewer, WAITING for the task IS the work.
 

@@ -174,6 +174,10 @@ VERDICT_POLL_INTERVAL="${VERDICT_POLL_INTERVAL:-30}"
 # base — a large-diff run can now legitimately hold its reviewers up to the cap,
 # so the reaper's "longest a live run can hold" must track the cap or it would
 # prematurely reap a live big review's session.
+# ga-ufskhy E13 (07/10): a run may now outlive the cap by its grace (ceiling 80 min,
+# gate_e13_grace_secs); this TTL is still safe because reviewer_session_should_reap
+# keeps every state=active session regardless of age, and E13 only ever extends for
+# an active one — the TTL bounds ASLEEP leftovers, not live reviews.
 REVIEWER_SESSION_TTL_MINUTES="${REVIEWER_SESSION_TTL_MINUTES:-$((VERDICT_TIMEOUT_MAX_MINUTES + 20))}"
 
 # Dry-run mode: skip actual git merge+push.
@@ -2380,6 +2384,22 @@ _acquire_gate_lock() {
 # the result can never drop below the base — a parse failure degrades to today's
 # fixed-timeout behavior, never to a shorter (false-FAIL-prone) timeout.
 # Unit-tested by gate-verdict-timeout-scale.selftest.sh.
+# gate_e13_event <event> <outcome> <elapsed> <budget> <grace> <busy_sid> — one compact JSON line per
+# E13 fact in $GC_CITY/.gc/gate-e13.jsonl (its own file: quality-gate.jsonl has readers that assume
+# its row shape). e13_grace is written on EVERY grace sweep (dedupe by run when counting);
+# e13_outcome once: grace-exhausted (timed out past the ceiling) or delivered-past-budget
+# (verdicts in after the budget). Best-effort: never fails the sweep.
+# SELFTEST-EXTRACT gate-e13-event-fn: BEGIN
+gate_e13_event() {
+  local ev="${1:-}" out="${2:-}" el="${3:-}" bu="${4:-}" gr="${5:-}" sid="${6:-}" f="${GC_CITY:-}/.gc/gate-e13.jsonl"
+  [ -n "${GC_CITY:-}" ] || return 0
+  mkdir -p "${GC_CITY}/.gc" 2>/dev/null || return 0
+  printf '{"ts":"%s","event":"%s","outcome":"%s","run":"%s","branch":"%s","elapsed":%s,"budget":%s,"grace":%s,"busy_sid":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$ev" "$out" "${GATE_RUN_ID:-}" "${BRANCH:-}" "${el:-0}" "${bu:-0}" "${gr:-0}" "$sid" >> "$f" 2>/dev/null || true
+  return 0
+}
+# SELFTEST-EXTRACT gate-e13-event-fn: END
+
 gate_scaled_verdict_timeout() {
   local base="$1" files="$2" lines="$3"
   case "$base"  in ''|*[!0-9]*) base=22 ;; esac
@@ -12025,10 +12045,22 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
       # SELFTEST-EXTRACT e5-phase-c-hook-call: END
 
       # SELFTEST-EXTRACT phase-c-verdict-decision: BEGIN
+      # ga-ufskhy E13: grace budget for THIS run, inside the decision block so the harnesses that
+      # extract it prove the real branch order. The E5 hook above runs earlier and derives the same
+      # number itself (gate-e5-second-reviewer.lib.sh reads PC_GRACE_SECS when set, else computes it).
+      # PC_GRACE_DESC says why it is what it is: nolib (harness / lib absent) | off (operator) | Ns.
+      PC_GRACE_SECS=0; PC_GRACE_DESC="nolib"
+      if declare -F gate_e13_grace_secs >/dev/null 2>&1; then
+        PC_GRACE_SECS=$(gate_e13_grace_secs "$PC_TIMEOUT_SECS") || PC_GRACE_SECS=0
+        case "$PC_GRACE_SECS" in ''|*[!0-9]*) PC_GRACE_SECS=0 ;; esac
+        if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then PC_GRACE_DESC="off"; else PC_GRACE_DESC="${PC_GRACE_SECS}s"; fi
+      fi
+      case "${GATE_E13_GRACE:-}" in ''|0|1) ;; *) warn "Phase C: GATE_E13_GRACE='${GATE_E13_GRACE}' is not 0/1 — treated as ON (only a literal 0 switches E13 grace off)" ;; esac
       if [ "$VERDICTS_RECEIVED" -eq "$REQUIRED_REVIEWERS" ]; then
         OVERALL_VERDICT="PASS"
         [ "$ANY_FAIL" = "1" ] && OVERALL_VERDICT="FAIL"
         log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) complete — $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts, overall=$OVERALL_VERDICT (elapsed ${PC_ELAPSED}s). Finalizing."
+        if [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null && declare -F gate_e13_event >/dev/null 2>&1; then gate_e13_event e13_outcome delivered-past-budget "$PC_ELAPSED" "$PC_TIMEOUT_SECS" "${PC_GRACE_SECS:-0}" "${PC_BUSY_SID:-}"; fi
         gate_finalize_run
       elif gate_phase_c_all_pending_closed; then
         # ga-s4potx: a reviewer session bead CONFIRMED CLOSED is a terminal,
@@ -12071,8 +12103,10 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
         PC_SESS_JSON=$(gc_json_or_unknown gc --city "$GC_CITY" session list --json) || true
         PC_ANY_PENDING=0
         PC_ALL_PENDING_DEAD=1
-        PC_ANY_PROGRESSING=0
-        PC_PROGRESSING_SID=""
+        PC_ANY_BUSY=0
+        PC_BUSY_SID=""
+        PC_BUSY_STATE="0"   # 1 | 0 | unknown:<reason> — the TIMED OUT record prints it as measured, never "0" for "not checked"
+        if ! declare -F reviewer_session_busy >/dev/null 2>&1; then PC_BUSY_STATE="unknown:nolib"; fi
         # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: BEGIN
         for PC_J in "${!VERDICT_BEAD_IDS[@]}"; do
           PC_VB="${VERDICT_BEAD_IDS[$PC_J]}"
@@ -12086,6 +12120,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # unknown-safe handling) rather than guessing here.
           if ! PC_VB_JSON=$(bd -C "$GC_CITY" show "$PC_VB" --json 2>/dev/null); then
             warn "  Phase C: verdict bead $PC_VB status unreadable this sweep (bd show failed — transient Dolt hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-art5)."
+            PC_BUSY_STATE="unknown:vb-show-failed"
             PC_ALL_PENDING_DEAD=0
             break
           fi
@@ -12103,6 +12138,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # the TIMEOUT path instead of guessing.
           if [ "$PC_SID" = "__UNKNOWN__" ]; then
             warn "  Phase C: verdict bead $PC_VB assignee capture was unreadable earlier this sweep (bd show failed — transient Dolt hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-i5s5)."
+            PC_BUSY_STATE="unknown:sid-unknown"
             PC_ALL_PENDING_DEAD=0
             break
           fi
@@ -12115,6 +12151,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # that fallback value ever changes for unrelated reasons.
           if [ -z "$PC_SESS_JSON" ]; then
             warn "  Phase C: gc session list unreadable this sweep (transient hiccup?) — not confirming dead-reviewer classification; falling through to the TIMEOUT path instead of guessing (root-class:error-vs-empty, ga-07509)."
+            PC_BUSY_STATE="unknown:roster-unreadable"
             PC_ALL_PENDING_DEAD=0
             break
           fi
@@ -12138,41 +12175,44 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # instead of a kill-and-requeue that pays for the same review twice.
           # `declare -F` guard: harnesses that extract this loop without the
           # guard lib keep today's alive-only classification (no grace).
-          if declare -F reviewer_session_progressing >/dev/null 2>&1 \
-             && [ "$(reviewer_session_progressing "$PC_SID" "$PC_SESS_JSON" "" "${GATE_E13_MAX_IDLE_SECS:-900}")" = "1" ]; then
-            PC_ANY_PROGRESSING=1
-            PC_PROGRESSING_SID="$PC_SID"
+          if declare -F reviewer_session_busy >/dev/null 2>&1 \
+             && [ "$(reviewer_session_busy "$PC_SID" "$PC_SESS_JSON" "" "${GATE_E13_MAX_IDLE_SECS:-900}")" = "1" ]; then
+            PC_ANY_BUSY=1
+            PC_BUSY_SID="$PC_SID"
+            PC_BUSY_STATE="1"
             PC_ALL_PENDING_DEAD=0
-            break
+            continue
           fi
+          # alive but not busy: not all dead — keep scanning, a LATER pending reviewer may be the busy one
           if [ "$(reviewer_session_alive "$PC_SID" "$PC_SESS_JSON")" = "1" ]; then
             PC_ALL_PENDING_DEAD=0
-            break
+            continue
           fi
         done
         # SELFTEST-EXTRACT phase-c-dead-reviewer-classify-fn: END
-        # ga-ufskhy E13: grace budget — 0 when the lib is absent (harnesses), when
-        # the operator switched it off, or when the value cannot be read.
-        PC_GRACE_SECS=0
-        if declare -F gate_e13_grace_secs >/dev/null 2>&1; then
-          PC_GRACE_SECS=$(gate_e13_grace_secs "$PC_TIMEOUT_SECS") || PC_GRACE_SECS=0
-        fi
-        case "$PC_GRACE_SECS" in ''|*[!0-9]*) PC_GRACE_SECS=0 ;; esac
-        case "${GATE_E13_GRACE:-}" in ''|0|1) ;; *) warn "Phase C: GATE_E13_GRACE='${GATE_E13_GRACE}' is not 0/1 — treated as ON (only a literal 0 switches E13 grace off)" ;; esac
         if [ "$PC_ANY_PENDING" = "1" ] && [ "$PC_ALL_PENDING_DEAD" = "1" ]; then
           QUOTA_REQUEUE=1
           REQUEUE_REASON="dead-reviewer"
           warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) timed out with ALL pending reviewer session(s) confirmed DEAD — infra failure, not a code FAIL (ga-eqjo)."
           gate_finalize_run
-        elif [ "${PC_ANY_PROGRESSING:-0}" = "1" ] && [ "$PC_ELAPSED" -le $(( PC_TIMEOUT_SECS + PC_GRACE_SECS )) ]; then
-          # ga-ufskhy E13 (2026-10-07): past the budget, but a reviewer is active and
-          # progressed within the last GATE_E13_MAX_IDLE_SECS — wait, bounded by the
-          # grace ceiling. Measured before this: every timeout of 07/10 (6/6) killed
-          # a progressing reviewer, re-queued the marker and re-reviewed from zero;
-          # the same branch then timed out again (wa-affr0: 4 times in 5 days).
-          log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) is PAST its ${PC_TIMEOUT_SECS}s verdict budget (${PC_ELAPSED}s) but reviewer ${PC_PROGRESSING_SID} is active and progressed within the last ${GATE_E13_MAX_IDLE_SECS:-900}s — E13 GRACE: waiting up to $(( PC_TIMEOUT_SECS + PC_GRACE_SECS - PC_ELAPSED ))s more (ceiling $(( PC_TIMEOUT_SECS + PC_GRACE_SECS ))s); leaving for a future sweep. A live review killed at the budget is a review paid for twice (ga-ufskhy E13)."
+        elif [ "${PC_ANY_BUSY:-0}" = "1" ] && [ "${GATE_COLLECT_JUDGED_FAILS:-0}" = "0" ] \
+             && [ "$PC_ELAPSED" -le $(( PC_TIMEOUT_SECS + ${PC_GRACE_SECS:-0} )) ]; then
+          # ga-ufskhy E13 (2026-10-07): past the budget, but a pending reviewer is BUSY (mid-turn:
+          # pane output within GATE_E13_MAX_IDLE_SECS) and no judged FAIL is in yet (one FAIL
+          # fails the run — waiting could not change that outcome) — wait, bounded by the
+          # ceiling. Measured before this: every timeout of 07/10 (6/6) killed a mid-turn
+          # reviewer, re-queued the marker and re-reviewed from zero; the same branch then
+          # timed out again (wa-affr0: 4 times in 5 days). Whether the grace pays for itself
+          # is measured, not assumed: .gc/gate-e13.jsonl (e13_grace / e13_outcome per run).
+          log "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) is PAST its ${PC_TIMEOUT_SECS}s verdict budget (${PC_ELAPSED}s) but reviewer ${PC_BUSY_SID} is busy (mid-turn, pane output within the last ${GATE_E13_MAX_IDLE_SECS:-900}s) and no FAIL is in — E13 GRACE: waiting up to $(( PC_TIMEOUT_SECS + PC_GRACE_SECS - PC_ELAPSED ))s more (ceiling $(( PC_TIMEOUT_SECS + PC_GRACE_SECS ))s); leaving for a future sweep. A live review killed at the budget is a review paid for twice (ga-ufskhy E13)."
+          if declare -F gate_e13_event >/dev/null 2>&1; then gate_e13_event e13_grace "" "$PC_ELAPSED" "$PC_TIMEOUT_SECS" "$PC_GRACE_SECS" "$PC_BUSY_SID"; fi
         else
-          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s, grace=${PC_GRACE_SECS:-0}s, progressing=${PC_ANY_PROGRESSING:-0}) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
+          PC_WAIT_DESC="${PC_TIMEOUT_MIN} minutes"
+          if [ "${PC_ANY_BUSY:-0}" = "1" ] && [ "${PC_GRACE_SECS:-0}" -gt 0 ] && [ "${GATE_COLLECT_JUDGED_FAILS:-0}" = "0" ]; then
+            PC_WAIT_DESC="${PC_TIMEOUT_MIN} minutes + $(( PC_GRACE_SECS / 60 )) min E13 grace"
+            if declare -F gate_e13_event >/dev/null 2>&1; then gate_e13_event e13_outcome grace-exhausted "$PC_ELAPSED" "$PC_TIMEOUT_SECS" "$PC_GRACE_SECS" "$PC_BUSY_SID"; fi
+          fi
+          warn "Phase C: gate-run $GATE_RUN_ID (branch=$BRANCH) TIMED OUT after ${PC_ELAPSED}s (limit=${PC_TIMEOUT_SECS}s, grace=${PC_GRACE_DESC:-nolib}, busy=${PC_BUSY_STATE:-0}, judged_fails=${GATE_COLLECT_JUDGED_FAILS:-0}) with $VERDICTS_RECEIVED/$REQUIRED_REVIEWERS verdicts. Treating as FAIL."
           # SELFTEST-EXTRACT phase-c-timeout-classify: BEGIN
           OVERALL_VERDICT="FAIL"
           # ga-h8vc8y: gate_collect_verdicts() ran at the top of this Phase C
@@ -12181,7 +12221,7 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
           # TIMEOUT line below replaces it — the builder must see what the
           # reviewer that answered rejected, not just that another one was slow.
           PC_COLLECTED_REASONS="${FAIL_REASONS:-}"
-          FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_TIMEOUT_MIN} minutes."
+          FAIL_REASONS="TIMEOUT: reviewers did not submit verdicts within ${PC_WAIT_DESC:-${PC_TIMEOUT_MIN} minutes}."
           # SELFTEST-EXTRACT phase-c-genuine-timeout-no-eval: BEGIN
           # ga-mcapdq: at least one pending reviewer is confirmed LIVE (not
           # dead — see the dead-reviewer branch above) but slow/wedged, so
@@ -12242,9 +12282,9 @@ if [ "${GATE_PHASE_C_ENABLED:-1}" = "1" ]; then
               requeue)
                 bd -C "$GC_CITY" label remove "$PC_VB" "verdict:pending" -q 2>/dev/null || true
                 bd -C "$GC_CITY" label add    "$PC_VB" "verdict:TIMEOUT" -q 2>/dev/null || true
-                bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m" 2>/dev/null || true
+                bd -C "$GC_CITY" comment "$PC_VB" "VERDICT: TIMEOUT — reviewer session did not complete within ${PC_WAIT_DESC:-${PC_TIMEOUT_MIN} minutes}" 2>/dev/null || true
                 # ga-9ophv2: same refused-close-hidden-by-2>/dev/null as the requeue branches (see close_gate_verdict in the guard lib).
-                close_gate_verdict "$PC_VB" "parked as TIMEOUT — reviewer session did not complete within ${PC_TIMEOUT_MIN}m. Closed by dispatcher (ga-9ophv2)." || true
+                close_gate_verdict "$PC_VB" "parked as TIMEOUT — reviewer session did not complete within ${PC_WAIT_DESC:-${PC_TIMEOUT_MIN} minutes}. Closed by dispatcher (ga-9ophv2)." || true
                 ;;
             esac
           done
@@ -16517,6 +16557,7 @@ case "$DIFF_FILE_COUNT" in ''|*[!0-9]*) DIFF_FILE_COUNT=0 ;; esac
 case "$DIFF_LINE_COUNT" in ''|*[!0-9]*) DIFF_LINE_COUNT=0 ;; esac
 _VT_BASE="$VERDICT_TIMEOUT_MINUTES"
 VERDICT_TIMEOUT_MINUTES=$(gate_scaled_verdict_timeout "$_VT_BASE" "$DIFF_FILE_COUNT" "$DIFF_LINE_COUNT")
+export GATE_REVIEW_BUDGET_MINUTES="$VERDICT_TIMEOUT_MINUTES"   # ga-ufskhy E13: the task text tells the reviewer its deadline (gate-review-task.lib.sh)
 if [ "$VERDICT_TIMEOUT_MINUTES" != "$_VT_BASE" ]; then
   log "ga-ltr3c: scaled verdict timeout ${_VT_BASE}m → ${VERDICT_TIMEOUT_MINUTES}m for diff (${DIFF_FILE_COUNT} files, ${DIFF_LINE_COUNT} lines; cap=${VERDICT_TIMEOUT_MAX_MINUTES}m)."
 fi

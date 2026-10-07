@@ -242,6 +242,12 @@ false-positive FAIL is expensive — it forces a full re-dispatch + re-work cycl
 on correct code. Be adversarial about whether the CODE actually has the
 defect, never about whether a real finding deserves to be reported: verify
 each issue is real, then report everything real you find, at its true severity.${GATE_E5_COV_RULES:-}
+TIME BUDGET: the verdict budget of this run is ${GATE_REVIEW_BUDGET_MINUTES:-unknown} minutes from the
+moment your task landed. Past it the run gets a short grace only while you are visibly
+mid-turn, and past that it is thrown away and reviewed again from zero by someone else —
+your work is lost. Plan to deliver with margin: when about 8 minutes of the budget remain,
+stop starting test runs, deliver the verdict you can defend from what you verified, and say
+in the Summary which checks you did not get to run (that is honest coverage, not a FAIL).
 TASK
 }
 

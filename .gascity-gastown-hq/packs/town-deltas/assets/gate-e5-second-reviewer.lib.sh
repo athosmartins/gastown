@@ -788,7 +788,13 @@ gate_e5_phase_c_hook() {
     case "${PC_ELAPSED:-}" in ''|*[!0-9]*) : ;; *)
       [ -n "$_age" ] && { _offset=$((PC_ELAPSED - _age)); [ "$_offset" -ge 0 ] || _offset=0; _window=$(gate_e5_extra_window_secs "$_offset"); } ;;
     esac
-    [ "${PC_ELAPSED:-0}" -gt "${PC_TIMEOUT_SECS:-0}" ] 2>/dev/null && _run_past=1
+    # ga-ufskhy E13: the run is "past" only beyond budget + the E13 grace the dispatcher computed for it
+    # (PC_GRACE_SECS, 0 when E13 is off/absent) — otherwise the extra was retired at a budget the run
+    # itself outlives, losing a paid review for nothing.
+    local _e13_grace="${PC_GRACE_SECS:-}"
+    if [ -z "$_e13_grace" ] && declare -F gate_e13_grace_secs >/dev/null 2>&1; then _e13_grace=$(gate_e13_grace_secs "${PC_TIMEOUT_SECS:-0}" 2>/dev/null) || _e13_grace=0; fi
+    case "$_e13_grace" in ''|*[!0-9]*) _e13_grace=0 ;; esac
+    [ "${PC_ELAPSED:-0}" -gt $(( ${PC_TIMEOUT_SECS:-0} + _e13_grace )) ] 2>/dev/null && _run_past=1
     # "Everyone else has delivered": the required count includes the extra, which is pending — so one short of it.
     case "${VERDICTS_RECEIVED:-}${REQUIRED_REVIEWERS:-}" in ''|*[!0-9]*) : ;; *)
       [ $((VERDICTS_RECEIVED + 1)) -eq "$REQUIRED_REVIEWERS" ] && _others_done=1 ;;

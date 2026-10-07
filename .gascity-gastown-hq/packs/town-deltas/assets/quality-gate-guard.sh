@@ -1954,17 +1954,23 @@ gate_iso_to_epoch() {
 }
 # SELFTEST-EXTRACT gate-iso-to-epoch-fn: END
 
-# reviewer_session_progressing <assignee> <sessions_json> [<now_epoch>] [<max_idle_secs>]
+# reviewer_session_busy <assignee> <sessions_json> [<now_epoch>] [<max_idle_secs>]
 # Pure. 1 iff a non-closed roster entry matching <assignee> (the same name fields
 # reviewer_session_alive matches) has state "active" AND a last_active within
 # <max_idle_secs> (default 900) of <now_epoch> (default: now). Everything else is
 # 0: asleep, closed, absent, a stale or zero-value last_active, a roster or a
-# timestamp that cannot be read. 0 means "not SHOWN to be progressing" — the one
-# state Phase C's E13 grace must never extend — not "confirmed stuck".
-# (ga-ufskhy E13, 2026-10-07: 6/6 timeouts that day killed a reviewer that was
-# active and progressing; the marker was re-queued and reviewed again from zero.)
-# SELFTEST-EXTRACT reviewer-session-progressing-fn: BEGIN
-reviewer_session_progressing() {
+# timestamp that cannot be read.
+# WHAT THIS MEASURES (verified 07/10 against the tmux socket): last_active is the
+# pane's last OUTPUT (tmux window_activity). A Claude mid-turn repaints its spinner
+# every second, so "busy" separates MID-TURN from IDLE-AT-THE-PROMPT / FROZEN; it
+# does NOT separate a reviewer about to deliver from one looping or stuck on a hung
+# tool call. That is why the caller bounds the grace it buys with this (ceiling)
+# and why 0 means "not shown busy", never "confirmed stuck".
+# (ga-ufskhy E13, 2026-10-07: 6/6 timeouts that day killed a mid-turn reviewer;
+# two transcripts show a verdict minutes away; the marker was re-queued and
+# reviewed again from zero.)
+# SELFTEST-EXTRACT reviewer-session-busy-fn: BEGIN
+reviewer_session_busy() {
   local assignee="${1:-}" sessions_json="${2:-}" now="${3:-}" max_idle="${4:-900}" la ep
   [ -z "$assignee" ] && { echo 0; return 0; }
   case "$now" in ''|*[!0-9]*) now=$(date +%s) ;; esac
@@ -1980,20 +1986,30 @@ reviewer_session_progressing() {
   case "$ep" in ''|*[!0-9]*) echo 0; return 0 ;; esac
   if [ $(( now - ep )) -le "$max_idle" ]; then echo 1; else echo 0; fi
 }
-# SELFTEST-EXTRACT reviewer-session-progressing-fn: END
+# SELFTEST-EXTRACT reviewer-session-busy-fn: END
 
 # gate_e13_grace_secs <budget_secs> — how long past its verdict budget Phase C keeps
-# waiting for a reviewer that is still progressing: min(budget,
-# GATE_E13_GRACE_MAX_SECS [1800]); 0 when the operator switched E13 off
-# (GATE_E13_GRACE=0, or the file $GC_CITY/.gc/gate-e13-grace.off exists). Only a
-# literal 0 is "off": junk in the env is not off (the caller logs it; this stays pure).
+# waiting for a reviewer that is still busy: min(budget, GATE_E13_GRACE_MAX_SECS
+# [1800]), CLAMPED so budget+grace never passes the run ceiling: min(
+# GATE_E13_CEILING_SECS [4800], (GATE_RUN_TTL_MINUTES-10)*60 when that TTL is a
+# number) — the guard aborts any gate-run older than GATE_RUN_TTL_MINUTES (90) with
+# no liveness check (abort:age), and E5 already stops at 4800s for the same reason.
+# 0 when the operator switched E13 off (GATE_E13_GRACE=0, or the file
+# $GC_CITY/.gc/gate-e13-grace.off exists) or when the budget alone already reaches
+# the ceiling. Only a literal 0 is "off": junk in the env is not off (the caller
+# logs it; this stays pure).
 # SELFTEST-EXTRACT gate-e13-grace-secs-fn: BEGIN
 gate_e13_grace_secs() {
-  local budget="${1:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}"
+  local budget="${1:-0}" maxg="${GATE_E13_GRACE_MAX_SECS:-1800}" ceil="${GATE_E13_CEILING_SECS:-4800}" ttl="${GATE_RUN_TTL_MINUTES:-}" g room
   case "$budget" in ''|*[!0-9]*) budget=0 ;; esac
   case "$maxg" in ''|*[!0-9]*) maxg=1800 ;; esac
+  case "$ceil" in ''|*[!0-9]*) ceil=4800 ;; esac
   if [ "${GATE_E13_GRACE:-}" = "0" ] || [ -e "${GATE_E13_OFF_FILE:-${GC_CITY:-}/.gc/gate-e13-grace.off}" ]; then echo 0; return 0; fi
-  if [ "$budget" -lt "$maxg" ]; then echo "$budget"; else echo "$maxg"; fi
+  case "$ttl" in ''|*[!0-9]*) ;; *) [ $(( (ttl - 10) * 60 )) -lt "$ceil" ] && ceil=$(( (ttl - 10) * 60 )) ;; esac
+  g="$budget"; [ "$g" -gt "$maxg" ] && g="$maxg"
+  room=$(( ceil - budget )); [ "$room" -lt 0 ] && room=0
+  [ "$g" -gt "$room" ] && g="$room"
+  echo "$g"
 }
 # SELFTEST-EXTRACT gate-e13-grace-secs-fn: END
 
