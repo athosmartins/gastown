@@ -1210,7 +1210,7 @@ _b9_prop_not_empty() {   # a lib that cannot tell does not turn the queue into "
   _ow_done; unset OW_LIB_MODE; return $_r
 }
 _b9_control() {   # _b9_control <name> <property fn> <OLD> <NEW>
-  local _name="$1" _prop="$2" _mf="$B9_MUT/$1.sh"
+  local _name="$1" _prop="$2" _mf="$B9_MUT/$1.sh" _held=0
   if ! command -v python3 >/dev/null 2>&1; then bad "[$_name] cannot build the mutant: no python3 on this box"; return; fi
   if ! _b9_mutant "$_mf" "$3" "$4" 2>"$B9_MUT/err"; then bad "[$_name] the mutant could not be built (did the dispatcher line move?): $(cat "$B9_MUT/err")"; return; fi
   cmp -s "$DISPATCHER" "$_mf" && { bad "[$_name] the mutant is identical to the shipped script — the control is vacuous"; return; }
@@ -1218,7 +1218,13 @@ _b9_control() {   # _b9_control <name> <property fn> <OLD> <NEW>
   OW_DISPATCHER_OVERRIDE="$_mf"
   # the mutant runs from a copy: beside the real lib (the degraded-lib property sets its own OW_LIB_MODE=failing, which also copies it)
   OW_LIB_MODE=reallib
-  if "$_prop"; then bad "[$_name] MUTANT SURVIVED: $_prop still holds after the edit — nothing guards this property"; else ok "[$_name] mutant caught: $_prop no longer holds"; fi
+  "$_prop" && _held=1
+  # Three outcomes, not two: the property false because the edit flipped it (caught), still true (survived), or false because
+  # the mutant could not even finish its sweep. Every property above runs ONE sweep and every mutant is built to end with
+  # exit 0, so a non-zero OW_RC here (a syntax error, a crash) would read as "caught" for the wrong reason.
+  if [ "$OW_RC" -ne 0 ]; then bad "[$_name] the mutant's sweep exited rc=$OW_RC — a crash is not a catch; the control proves nothing"
+  elif [ "$_held" -eq 1 ]; then bad "[$_name] MUTANT SURVIVED: $_prop still holds after the edit — nothing guards this property"
+  else ok "[$_name] mutant caught: $_prop no longer holds (the mutant's sweep ended cleanly, rc=0)"; fi
   unset OW_DISPATCHER_OVERRIDE OW_LIB_MODE
 }
 B9_MUT=$(mktemp -d)
