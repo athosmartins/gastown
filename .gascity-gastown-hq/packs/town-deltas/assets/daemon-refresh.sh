@@ -657,6 +657,50 @@
 #        name match always did; an earlier window's template is seen only if the
 #        rig registers it as an asset.
 #
+#  23. (ga-n3czl1) Every point above asks WHICH daemon a change reaches and whether
+#      its process got NEWER. None asks whether the new process can RUN. MEDIDO
+#      06/10: wa-acp18q merged `from lib import dispensada` into a route; the
+#      classification_dashboard (Pregao, :8086) launches with only lib/ and
+#      daemons/ on sys.path (the repo root is not there), so it died at import,
+#      launchd crash-looped it, and verify_fresh() above called every respawn
+#      FRESH (a new pid, started after DEPLOY_EPOCH) — VERDICT=OK, PROOF=verified,
+#      502 until the Athos reported it. The tests had passed because pytest runs
+#      from the repo root. Two checks close it, both feeding the existing
+#      FRESH_FAIL -> VERDICT=VERIFY_FAILED path (so story-delivery.sh and
+#      quality-gate-dispatcher.sh hold, announce and mail the Mayor with no change):
+#      (a) IMPORT SMOKE, per label, BEFORE the restart (and, for a sensitive
+#          daemon, before its drain): daemon-import-smoke.py rebuilds the launch
+#          from the plist (interpreter, entrypoint, WorkingDirectory,
+#          EnvironmentVariables on launchd's minimal env — the CALLER's PYTHONPATH
+#          is not inherited; a bash wrapper is read, never run) and executes the
+#          entrypoint's top level in a new process, minus its __main__ block. It
+#          answers PASS / FAIL / UNKNOWN. Only FAIL (ImportError or SyntaxError)
+#          blocks: the label goes to IMPORT_SMOKE_FAIL + FRESH_FAIL, is NOT
+#          restarted, and the running process keeps serving the previous code. PASS
+#          and UNKNOWN proceed exactly as before; UNKNOWN (a launch form it does
+#          not emulate, no interpreter, a timeout, any non-import exception at
+#          import time) is listed in IMPORT_SMOKE_UNKNOWN so "not smoked" is never
+#          readable as "smoked". Skipped under DRY_RUN (a freshness probe is not a
+#          restart). DAEMON_SMOKE_TIMEOUT bounds one run (default 45 s; measured
+#          7-11 s wall for the Pregao dashboard under load 60).
+#      (b) STABILITY, after the restarts: the same pid must be present at
+#          RESTART_STABLE_SECS/2 and at RESTART_STABLE_SECS after the label was
+#          verified fresh (default 60/30 s; 0 turns it off). Two samples, not
+#          "same pid as at verify", because `kickstart -k` has a known port-bind
+#          race (ga-l7n3v) in which the first process dies once and its respawn is
+#          healthy; a crash loop at launchd's 10 s respawn throttle changes the pid
+#          between any two samples 30 s apart. A daemon that crashes LESS often
+#          than the gap (say every 40 s) can still get through both samples: this
+#          is a check for the boot-time crash loop, not a health probe. A label
+#          that fails goes to
+#          RESTART_UNSTABLE + FRESH_FAIL. The wait is absolute per label, so a
+#          batch of restarts shares one window instead of stacking them.
+#      Not covered, named so a PASS is not read as more than it is: an import
+#      error that only fires lazily (inside a handler or thread), an entrypoint
+#      whose wrapper is dynamic or indented, `-m`/gunicorn launches (UNKNOWN), a
+#      daemon that is up and bound but wedged, and any restart done by a path
+#      other than this script (the rig's own deploy_daemons.sh / auto-restart).
+#
 # VERDICT (last-resort gate): the caller must NOT mark a story:done unless the
 # verdict is OK/SKIPPED. A dormant or unverifiable daemon halts delivery.
 #
@@ -698,6 +742,19 @@
 # all human logging goes to STDERR.
 #   VERDICT=OK|SKIPPED|VERIFY_FAILED|NEEDS_GUARDED_RESTART|JOB_NOT_INSTALLED
 #   AFFECTED=<labels>   RESTARTED=<labels>   FRESH_FAIL=<labels>   GUARDED=<labels>
+#   IMPORT_SMOKE_FAIL=<labels>   RESTART_UNSTABLE=<labels>   (ga-n3czl1, header
+#     point 23: always present, even empty. Both are SUBSETS of FRESH_FAIL and say
+#     WHY a label is there: IMPORT_SMOKE_FAIL = never restarted, its merged code
+#     cannot import under its own launchd launch (the running process keeps
+#     serving the previous code); RESTART_UNSTABLE = restarted, then did not keep
+#     the same pid for RESTART_STABLE_SECS. FRESH_FAIL minus both = the original
+#     meaning, restarted but never fresh.)
+#   IMPORT_SMOKE_UNKNOWN=<labels>   (ga-n3czl1: always present. Labels that went
+#     through a restart WITHOUT an import-smoke verdict — a launch form the helper
+#     does not emulate, no interpreter, a timeout, a non-import exception at import
+#     time, or a helper that did not run. NOT a pass: "not smoked" is never
+#     "smoked", and a consumer that wants to know how much of a restart batch was
+#     actually covered reads this.)
 #   GUARDED_OWN=<labels>   GUARDED_CLOSURE_ONLY=<labels>   (wa-flysp, header
 #     point 16: always present, even empty. A partition of GUARDED — every
 #     label in GUARDED is in exactly one of these two, never both, never
@@ -792,6 +849,11 @@
 #   PS_BIN            (default ps)
 #   VERIFY_TIMEOUT    seconds to wait for a fresh process (default 20)
 #   VERIFY_INTERVAL   poll interval seconds (default 1)
+#   DAEMON_SMOKE_SCRIPT   (ga-n3czl1, header point 23) path of
+#                     daemon-import-smoke.py (default: next to this file)
+#   DAEMON_SMOKE_TIMEOUT  seconds one import smoke may run (default 45)
+#   RESTART_STABLE_SECS   seconds a restarted daemon must keep running the
+#                     same pid, checked at half and full (default 60; 0 = off)
 #   SYMBOL_REACHABILITY_TOTAL_TIMEOUT   seconds for the ONE batched
 #                     compute_symbol_reachability.py --batch call covering
 #                     every GUARDED label this run (default 30; ga-8q1ulq,
@@ -861,6 +923,18 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-20}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-1}"
 
 log() { echo "[daemon-refresh] $*" >&2; }
+
+# ga-n3czl1 (header point 23). A typo here must not silently turn a check off:
+# a value that is not a number falls back to the default and says so.
+DAEMON_SMOKE_SCRIPT="${DAEMON_SMOKE_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/daemon-import-smoke.py}"
+DAEMON_SMOKE_TIMEOUT="${DAEMON_SMOKE_TIMEOUT:-45}"
+RESTART_STABLE_SECS="${RESTART_STABLE_SECS:-60}"
+case "$DAEMON_SMOKE_TIMEOUT" in
+  ''|*[!0-9.]*|.|*.*.*) log "WARN: DAEMON_SMOKE_TIMEOUT='$DAEMON_SMOKE_TIMEOUT' is not a number — using 45."; DAEMON_SMOKE_TIMEOUT=45 ;;
+esac
+case "$RESTART_STABLE_SECS" in
+  ''|*[!0-9]*) log "WARN: RESTART_STABLE_SECS='$RESTART_STABLE_SECS' is not a non-negative integer — using 60."; RESTART_STABLE_SECS=60 ;;
+esac
 
 # ── restart_policy.yaml consultation (ga-ylr2m) ───────────────────────────────
 # See header point 6. Parsed once, up front, into space-separated .py-basename
@@ -1034,6 +1108,12 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   echo "AFFECTED_NOT_RUNNING=${AFFECTED_NOT_RUNNING:-}"
   echo "RESTARTED=${RESTARTED:-}"
   echo "FRESH_FAIL=${FRESH_FAIL:-}"
+  # ga-n3czl1 (header point 23): always present, even empty. IMPORT_SMOKE_FAIL and
+  # RESTART_UNSTABLE are subsets of FRESH_FAIL saying WHY a label is in it;
+  # IMPORT_SMOKE_UNKNOWN is the labels restarted with no smoke verdict.
+  echo "IMPORT_SMOKE_FAIL=${SMOKE_FAIL:-}"
+  echo "IMPORT_SMOKE_UNKNOWN=${SMOKE_UNKNOWN:-}"
+  echo "RESTART_UNSTABLE=${RESTART_UNSTABLE:-}"
   echo "GUARDED=${GUARDED:-}"
   # wa-flysp (header point 16): always present, even empty — same convention
   # as AFFECTED_NOT_RUNNING/PARSE_ERROR_LOADED above. A partition of GUARDED:
@@ -1088,14 +1168,15 @@ emit() {  # emit <verdict> <reason> [<proof>]  (proof defaults to not_verified �
   # same convention as PARSE_ERROR_LOADED/UNLOADED above.
   echo "UNATTRIBUTED_JOB_GAP=${SJ_UNATTRIBUTED_REASON:-}"
   # Trailing JSON for the caller's bead comment / jsonl log.
-  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" "$tbn" "$otbn" <<'PY' 2>/dev/null || true
+  python3 - "$verdict" "$reason" "${AFFECTED:-}" "${RESTARTED:-}" "${FRESH_FAIL:-}" "${GUARDED:-}" "$proof" "${ALREADY_FRESH:-}" "${WOULD_RESTART:-}" "${PARSE_ERROR_LOADED:-}" "${PARSE_ERROR_UNLOADED:-}" "${SJ_UNATTRIBUTED_REASON:-}" "${AFFECTED_NOT_RUNNING:-}" "${GUARDED_OWN:-}" "${GUARDED_CLOSURE_ONLY:-}" "${GUARDED_SYMBOL_CONFIRMED:-}" "${GUARDED_SYMBOL_NO_EVIDENCE:-}" "${GUARDED_SYMBOL_NOT_COMPUTED:-}" "${GUARDED_LOCKED_COSMETIC:-}" "${AFFECTED_RIG_DETECTOR:-}" "${GUARDED_RIG_DETECTOR:-}" "${RIG_DETECTOR_USED:-0}" "$tbn" "$otbn" "${SMOKE_FAIL:-}" "${SMOKE_UNKNOWN:-}" "${RESTART_UNSTABLE:-}" <<'PY' 2>/dev/null || true
 import json, sys
-v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu, tbn, otbn = sys.argv[1:25]
+v, reason, aff, res, ff, gd, proof, afr, wr, pel, peu, ujg, anr, gd_own, gd_co, gd_sc, gd_sne, gd_snc, gd_lc, afr_rig, gd_rig, rdu, tbn, otbn, smf, smu, rus = sys.argv[1:28]
 sp = lambda s: [x for x in s.split() if x]
 print("JSON=" + json.dumps({
     "verdict": v, "reason": reason,
     "affected": sp(aff), "affected_not_running": sp(anr), "restarted": sp(res),
     "fresh_fail": sp(ff), "guarded": sp(gd), "proof": proof,
+    "import_smoke_fail": sp(smf), "import_smoke_unknown": sp(smu), "restart_unstable": sp(rus),
     "guarded_own": sp(gd_own), "guarded_closure_only": sp(gd_co),
     "guarded_symbol_confirmed": sp(gd_sc), "guarded_symbol_no_evidence": sp(gd_sne),
     "guarded_symbol_not_computed": sp(gd_snc),
@@ -1114,6 +1195,11 @@ PY
 }
 
 AFFECTED=""; RESTARTED=""; FRESH_FAIL=""; GUARDED=""; ALREADY_FRESH=""; WOULD_RESTART=""
+# ga-n3czl1 (header point 23): SMOKE_FAIL / RESTART_UNSTABLE are SUBSETS of
+# FRESH_FAIL (the field every consumer already holds on); SMOKE_UNKNOWN is the
+# restarted-without-a-smoke set; SMOKE_FAIL_NOTES is "label [reason]" for REASON;
+# STABLE_LABELS are the labels that passed verify_fresh and owe the stability check.
+SMOKE_FAIL=""; SMOKE_FAIL_NOTES=""; SMOKE_UNKNOWN=""; RESTART_UNSTABLE=""; STABLE_LABELS=""
 # wa-flysp (header point 16): AFFECTED_OWN is a subset of AFFECTED (which
 # labels' own file/template changed); GUARDED_OWN/GUARDED_CLOSURE_ONLY
 # partition GUARDED the same way, built from it at Step 4 below.
@@ -3296,6 +3382,117 @@ verify_fresh() {  # verify_fresh <label> -> 0 if a process started after DEPLOY_
   return 1
 }
 
+# ── ga-n3czl1 (header point 23) ───────────────────────────────────────────────
+# (a) smoke_blocks_restart <label> -> 0 = BLOCK the restart, 1 = go ahead.
+# Runs daemon-import-smoke.py on the label's own plist. Blocks ONLY on a clean FAIL
+# (the entrypoint cannot import under its launchd launch): the label is recorded in
+# SMOKE_FAIL and FRESH_FAIL and is left running its previous code. PASS and UNKNOWN
+# both go ahead; UNKNOWN — including a missing script, a crashed python3, or output
+# with no SMOKE= line — is logged as such and listed in SMOKE_UNKNOWN, because "the
+# check did not run" must never read as "the check passed" (and must not read as
+# "the code is broken" either: a helper problem would then hold every delivery).
+# The verdict comes from the SMOKE= line, never from the exit code: an uncaught
+# python error also exits 1.
+smoke_blocks_restart() {  # smoke_blocks_restart <label>
+  local label="$1" out verdict reason
+  [ "$DRY_RUN" = "1" ] && return 1
+  if [ ! -f "$DAEMON_SMOKE_SCRIPT" ]; then
+    log "import smoke $label: UNKNOWN — $DAEMON_SMOKE_SCRIPT does not exist; restarting without it."
+    SMOKE_UNKNOWN="$SMOKE_UNKNOWN $label"
+    return 1
+  fi
+  out="$(DAEMON_SMOKE_TIMEOUT="$DAEMON_SMOKE_TIMEOUT" python3 -I "$DAEMON_SMOKE_SCRIPT" "$LAUNCH_AGENTS_DIR/$label.plist" 2>/dev/null)" || true
+  verdict="$(printf '%s\n' "$out" | sed -n 's/^SMOKE=//p' | head -1)"
+  reason="$(printf '%s\n' "$out" | sed -n 's/^SMOKE_REASON=//p' | head -1)"
+  case "$verdict" in
+    PASS)
+      log "import smoke $label: PASS — $reason"
+      return 1
+      ;;
+    FAIL)
+      log "import smoke $label: FAIL — $reason — NOT restarting it; the running process keeps serving the previous code."
+      printf '%s\n' "$out" | sed -n 's/^SMOKE_DETAIL=/[daemon-refresh]   /p' >&2
+      SMOKE_FAIL="$SMOKE_FAIL $label"
+      SMOKE_FAIL_NOTES="${SMOKE_FAIL_NOTES:+$SMOKE_FAIL_NOTES; }$label [${reason:0:220}]"
+      FRESH_FAIL="$FRESH_FAIL $label"
+      return 0
+      ;;
+    *)
+      log "import smoke $label: UNKNOWN — ${reason:-no SMOKE= verdict from $DAEMON_SMOKE_SCRIPT} — restarting as before; the stability check after the restart is the backstop."
+      SMOKE_UNKNOWN="$SMOKE_UNKNOWN $label"
+      return 1
+      ;;
+  esac
+}
+
+# (b) STABILITY. note_restart_baseline <label> is called right after verify_fresh
+# passed and records the pid and the time; verify_stable_all (after the label loop)
+# then requires the SAME pid at +half and at +RESTART_STABLE_SECS. Two samples and
+# not "same pid as at verify": `kickstart -k` has a known port-bind race (ga-l7n3v)
+# where the first process dies once and its respawn is healthy, while a crash loop
+# at launchd's 10 s respawn throttle changes the pid between any two samples 30 s
+# apart (a daemon that dies less often than that is not caught — see header point
+# 23). verify_fresh alone called every crash-loop respawn FRESH — that is the other
+# half of ga-n3czl1.
+note_restart_baseline() {  # note_restart_baseline <label>
+  local label="$1" pid
+  [ "$DRY_RUN" = "1" ] && return 0
+  [ "$RESTART_STABLE_SECS" -gt 0 ] || return 0
+  pid="$(daemon_pid "$label")"
+  if [ -z "$pid" ]; then
+    # verify_fresh saw a live, fresh pid moments ago; none now means it exited again.
+    log "stability $label: no live pid right after it verified fresh — it exited again (crash loop?)."
+    RESTART_UNSTABLE="$RESTART_UNSTABLE $label"
+    FRESH_FAIL="$FRESH_FAIL $label"
+    return 0
+  fi
+  echo "$pid $(date +%s)" > "$DISCO_DIR/stable.$label"
+  STABLE_LABELS="$STABLE_LABELS $label"
+}
+
+# Sleep until an ABSOLUTE epoch (never negative), so a batch of restarts shares one
+# window instead of stacking one per label.
+sleep_until() {  # sleep_until <epoch>
+  local target="$1" now
+  now="$(date +%s)"
+  if [ "$target" -gt "$now" ] 2>/dev/null; then sleep $(( target - now )); fi
+  return 0
+}
+
+verify_stable_all() {
+  local label s_pid s_epoch half p_mid p_end
+  [ -n "${STABLE_LABELS// /}" ] || return 0
+  half=$(( RESTART_STABLE_SECS / 2 ))
+  log "stability: watching${STABLE_LABELS} — same pid required at +${half}s and +${RESTART_STABLE_SECS}s after each verified restart."
+  for label in $STABLE_LABELS; do
+    s_pid=""; s_epoch=""
+    read -r s_pid s_epoch < "$DISCO_DIR/stable.$label" 2>/dev/null || true
+    case "$s_epoch" in
+      ''|*[!0-9]*) log "WARN: stability baseline for $label is unreadable — skipping its check (not counted as stable, not counted as unstable)."; continue ;;
+    esac
+    sleep_until $(( s_epoch + half ))
+    daemon_pid "$label" > "$DISCO_DIR/stable-mid.$label"
+  done
+  for label in $STABLE_LABELS; do
+    [ -f "$DISCO_DIR/stable-mid.$label" ] || continue
+    read -r s_pid s_epoch < "$DISCO_DIR/stable.$label" 2>/dev/null || true
+    sleep_until $(( s_epoch + RESTART_STABLE_SECS ))
+    p_mid="$(cat "$DISCO_DIR/stable-mid.$label")"
+    p_end="$(daemon_pid "$label")"
+    if [ -n "$p_end" ] && [ "$p_end" = "$p_mid" ]; then
+      if [ "$p_end" = "$s_pid" ]; then
+        log "stability $label: pid $p_end held for ${RESTART_STABLE_SECS}s — STABLE."
+      else
+        log "stability $label: STABLE on pid $p_end for the last $(( RESTART_STABLE_SECS - half ))s, but the pid changed once since the verified restart (was $s_pid) — consistent with the kickstart -k bind race, not a crash loop."
+      fi
+    else
+      log "stability $label: NOT STABLE — pid ${s_pid:-<none>} at verify, ${p_mid:-<none>} at +${half}s, ${p_end:-<none>} at +${RESTART_STABLE_SECS}s (changed or gone: crash loop?)."
+      RESTART_UNSTABLE="$RESTART_UNSTABLE $label"
+      FRESH_FAIL="$FRESH_FAIL $label"
+    fi
+  done
+}
+
 # already_fresh <label> (ga-j3j6s; refined ga-puq8z, tiered gate-fix-2) -> 0
 # if the CURRENTLY-live process already started after the code was COMMITTED
 # (COMMIT_EPOCH, computed above from POST_DEPLOY_SHA) — a ONE-SHOT snapshot
@@ -3480,6 +3677,11 @@ for label in $AFFECTED; do
         classify_guarded "$label"
         continue
       fi
+      # ga-n3czl1: smoke BEFORE the drain — never pause a sensitive daemon's
+      # intake only to find out its new code cannot start.
+      if smoke_blocks_restart "$label"; then
+        continue
+      fi
       log "SENSITIVE $label: draining via \$$drain_var then restarting (guarded path)."
       if [ "$DRY_RUN" != "1" ]; then
         eval "$drain" >&2 2>&1 || log "WARN: drain command for $label failed (rc=$?) — continuing to restart."
@@ -3489,6 +3691,8 @@ for label in $AFFECTED; do
         RESTARTED="$RESTARTED $label"
         if ! verify_fresh "$label"; then
           FRESH_FAIL="$FRESH_FAIL $label"
+        else
+          note_restart_baseline "$label"
         fi
       else
         WOULD_RESTART="$WOULD_RESTART $label"
@@ -3509,6 +3713,10 @@ for label in $AFFECTED; do
     classify_guarded "$label"
     continue
   fi
+  # ga-n3czl1: refuse to bounce a daemon whose merged code cannot import.
+  if smoke_blocks_restart "$label"; then
+    continue
+  fi
   log "SAFE $label: kickstart -k + verify fresh."
   if [ "$DRY_RUN" != "1" ]; then
     $LAUNCHCTL_BIN kickstart -k "gui/$(id -u)/$label" 2>/dev/null \
@@ -3517,6 +3725,8 @@ for label in $AFFECTED; do
     RESTARTED="$RESTARTED $label"
     if ! verify_fresh "$label"; then
       FRESH_FAIL="$FRESH_FAIL $label"
+    else
+      note_restart_baseline "$label"
     fi
   else
     WOULD_RESTART="$WOULD_RESTART $label"
@@ -3524,8 +3734,14 @@ for label in $AFFECTED; do
 done
 # SELFTEST-EXTRACT daemon-refresh-label-loop: END
 
+# ga-n3czl1 (header point 23, part b): one shared window for every label restarted above.
+verify_stable_all
+
 RESTARTED="$(echo "$RESTARTED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 FRESH_FAIL="$(echo "$FRESH_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+SMOKE_FAIL="$(echo "$SMOKE_FAIL" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+SMOKE_UNKNOWN="$(echo "$SMOKE_UNKNOWN" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
+RESTART_UNSTABLE="$(echo "$RESTART_UNSTABLE" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED="$(echo "$GUARDED" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' ' | sed 's/ $//')"
 GUARDED_OWN="$(echo "$GUARDED_OWN" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 GUARDED_CLOSURE_ONLY="$(echo "$GUARDED_CLOSURE_ONLY" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')"
@@ -3535,7 +3751,23 @@ WOULD_RESTART="$(echo "$WOULD_RESTART" | tr ' ' '\n' | grep -v '^$' | tr '\n' ' 
 
 # ── Step 5: verdict ───────────────────────────────────────────────────────────
 if [ -n "${FRESH_FAIL// /}" ]; then
-  emit VERIFY_FAILED "restarted daemon(s) did not come up fresh:${FRESH_FAIL}" not_verified
+  # ga-n3czl1: FRESH_FAIL has three causes and the reader's next move differs for
+  # each — never restarted (new code cannot import), restarted but did not stay up
+  # (crash loop), restarted but never fresh (the original meaning). With only the
+  # last one the wording is exactly what it was before.
+  VF_STALE=""
+  for vf_l in $FRESH_FAIL; do
+    case " $SMOKE_FAIL $RESTART_UNSTABLE " in *" $vf_l "*) ;; *) VF_STALE="$VF_STALE $vf_l" ;; esac
+  done
+  VF_REASON=""
+  [ -n "${VF_STALE// /}" ] && VF_REASON="restarted daemon(s) did not come up fresh:${VF_STALE}"
+  if [ -n "${SMOKE_FAIL// /}" ]; then
+    VF_REASON="${VF_REASON:+$VF_REASON || }import smoke FAILED, so these daemon(s) were NOT restarted (the running process keeps serving the previous code; the merged code cannot import under the daemon's own launchd launch): ${SMOKE_FAIL_NOTES}"
+  fi
+  if [ -n "${RESTART_UNSTABLE// /}" ]; then
+    VF_REASON="${VF_REASON:+$VF_REASON || }restarted daemon(s) did not STAY up for ${RESTART_STABLE_SECS}s (pid changed or exited — crash loop?):${RESTART_UNSTABLE}"
+  fi
+  emit VERIFY_FAILED "$VF_REASON" not_verified
 elif [ -n "${GUARDED// /}" ]; then
   # ga-puq8z ACEITE 2: affected-daemon detection above (Step 3) is a bounded
   # (entrypoint + routes-hop, ga-q617u) import/template-closure match, not a

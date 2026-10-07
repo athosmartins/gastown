@@ -128,6 +128,10 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER="$SCRIPT_DIR/../daemon-refresh.sh"
+# ga-n3czl1: this suite tests restart/verify behaviour, not the post-restart stability
+# window (default 60 s per restart) — off here; tests/daemon-refresh-import-smoke.test.sh
+# (S6-S9) is the suite that turns it on.
+export RESTART_STABLE_SECS="${RESTART_STABLE_SECS:-0}"
 
 PASS=0
 FAIL=0

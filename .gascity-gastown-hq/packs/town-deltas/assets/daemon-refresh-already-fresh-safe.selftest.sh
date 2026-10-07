@@ -74,6 +74,10 @@ run_loop() {
   guard_allows_restart() { GUARD_CALLS=$((GUARD_CALLS+1)); return "$guard_rc"; }
   verify_fresh() { return "$verify_rc"; }
   classify_guarded() { :; }
+  # ga-n3czl1: the loop now consults the import smoke and records a stability baseline;
+  # this selftest is about already_fresh(), so both are inert here (smoke: go ahead).
+  smoke_blocks_restart() { return 1; }
+  note_restart_baseline() { :; }
   log() { :; }
   if [ "$drain" != "ABSENT" ]; then
     # shellcheck disable=SC2140
