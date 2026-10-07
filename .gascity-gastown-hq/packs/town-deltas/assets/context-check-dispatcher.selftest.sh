@@ -1087,6 +1087,234 @@ _selfnotice_sig=$(context_check_has_verifiable_signal "$_selfnotice_eff")
 _selfnotice_mech=$(context_check_mechanical_verdict "${#_selfnotice_eff}" "$_selfnotice_sig" 10)
 [ "$_selfnotice_mech" = "thin" ] && ok "ga-u8fly/gh-b2d shape: only the daemon's own gap-comment present → stays thin (no circular self-rescue)" || bad "REGRESSION: daemon's own gap-comment was read back as rescuing context (mech=$_selfnotice_mech)"
 
+# ── Scenario 14: ga-9t9acg.10 — ONE order across ALL stores, the cap applied AFTER it ──────────────────────────
+# Programa ga-9t9acg (Athos, 2026-10-06): priority > type (feature first) > age, on every stage of the board. This
+# stage used to take the stores one after the other, FIFO inside each, and stop at the GLOBAL cap — so the order of
+# the STORES beat the priority: a P0 feature of the second store was never judged while the first one had a backlog.
+# Fixture: two stores (hq listed first, wa second), five beads, cap 3. The sweep must judge, in this order:
+#   wa-p0-feat-new  P0 feature, the NEWEST bead of the fixture (a feature goes before an older P0 bug)
+#   hq-p0-bug-old   P0 bug
+#   wa-p1-task      P1
+# and must not reach hq-p2-old / hq-p2-old2, which the old per-store FIFO judged first.
+echo "Scenario 14: ga-9t9acg.10 — one order across all stores (priority > type > age), cap after the order"
+_c14="$(mktemp -d)"
+mkdir -p "$_c14/hq/.gc/logs" "$_c14/wa" "$_c14/fix"
+_sb_init "$_c14/sb" || exit 2   # the two-store `bd` stub below is the only bd on SANDBOX_PATH
+_c14_desc='Fazer health-check do token PDPJ via API e reportar o status. Critério de aceitação: o script retorna o expected output {status:ok} e grava em scripts/pdpj-health.sh o resultado. Comando: bd list para confirmar.'
+# _c14_bead <id> <type> <priority> <created_at> — one bead as `bd list --json` prints it.
+_c14_bead() {
+  jq -cn --arg id "$1" --arg t "$2" --argjson p "$3" --arg c "$4" --arg d "$_c14_desc" \
+    '{id:$id, issue_type:$t, priority:$p, title:("Verificar saúde do token PDPJ — fixture " + $id), description:$d, labels:[], ephemeral:false, created_at:$c}'
+}
+# _c14_put <store> <type> <bead-json>... — the file the stub serves for `bd -C <store> list --type <type>`.
+_c14_put() { local s="$1" t="$2"; shift 2; printf '%s\n' "$@" | jq -cs '.' > "$_c14/fix/$s.$t.json"; }
+_c14_put hq task    "$(_c14_bead hq-p2-old task 2 2026-01-01T00:00:00Z)" "$(_c14_bead hq-p2-old2 task 2 2026-01-02T00:00:00Z)"
+_c14_put hq bug     "$(_c14_bead hq-p0-bug-old bug 0 2026-01-03T00:00:00Z)"
+_c14_put wa feature "$(_c14_bead wa-p0-feat-new feature 0 2026-02-01T00:00:00Z)"
+_c14_put wa task    "$(_c14_bead wa-p1-task task 1 2026-01-01T00:00:00Z)"
+# A bead whose priority bd did not give: the lib keeps it at the END (class 5, behind P4) and says so on stderr (14m/14n).
+_c14_put hq chore   "$(_c14_bead hq-noprio chore 0 2026-01-01T00:00:00Z | jq -c 'del(.priority)')"
+cat > "$_c14/sb/bin/bd" <<'STUB'
+#!/usr/bin/env bash
+# Two-store bd stub. `-C <store>` picks the fixture set by the store's basename (hq | wa); `list --type T` serves
+# $C14_FIX/<store>.<T>.json (else []) and is recorded in $C14_CALLS; every WRITE lands in $C14_LEDGER as
+# "<store> <cmd> <args>", so the test can see WHICH store a verdict was written to.
+store=""
+if [ "${1:-}" = "-C" ]; then store="$(basename "$2")"; shift 2; fi
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  list)
+    echo "$store list $*" >> "$C14_CALLS"
+    want=""
+    while [ $# -gt 0 ]; do case "$1" in --type) want="$2"; shift 2 ;; *) shift ;; esac; done
+    if [ -f "$C14_FIX/$store.$want.json" ]; then cat "$C14_FIX/$store.$want.json"; else echo "[]"; fi
+    exit 0 ;;
+  comments) echo "[]"; exit 0 ;;
+  blocked)
+    # C14_BLOCKED_FAIL=1: `bd blocked` itself fails (a Dolt hiccup) — nonzero, nothing on stdout.
+    if [ "${C14_BLOCKED_FAIL:-0}" = "1" ]; then echo "error: connection refused" >&2; exit 1; fi
+    echo "[]"; exit 0 ;;
+esac
+echo "$store $cmd $*" >> "$C14_LEDGER"
+exit 0
+STUB
+chmod +x "$_c14/sb/bin/bd"
+C14_FIX="$_c14/fix"; C14_CALLS="$_c14/calls.txt"; C14_LEDGER="$_c14/ledger.txt"
+export C14_FIX C14_CALLS C14_LEDGER
+_c14_log="$_c14/hq/.gc/logs/context-check-dispatcher.log"
+# _c14_run <dispatcher> — one sweep over the two stores with a cap of 3. Writes land in $C14_LEDGER, list calls in
+# $C14_CALLS. Exec-class off: the only writes are the verdicts. The blocked-ids test seam is set (to empty) unless
+# C14_BLOCKED_SEAM=off: then the dispatcher really runs `bd blocked` through the stub (14k/14l).
+_c14_run() {
+  : > "$C14_LEDGER"; : > "$C14_CALLS"; rm -f "$_c14_log"
+  local -a _c14_env=(CONTEXT_CHECK_CITY_OVERRIDE="$_c14/hq" CONTEXT_CHECK_STORES="$_c14/hq $_c14/wa"
+    CONTEXT_CHECK_TEST_BUILT_IDS="" CONTEXT_CHECK_MAX_PER_SWEEP=3 CONTEXT_CHECK_MAX_SONNET_PER_SWEEP=0
+    CONTEXT_CHECK_EXEC_CLASS=0 PATH="$SANDBOX_PATH")
+  [ "${C14_BLOCKED_SEAM:-on}" = "on" ] && _c14_env+=(CONTEXT_CHECK_TEST_BLOCKED_IDS="")
+  env "${_c14_env[@]}" timeout 120 bash "$1" >/dev/null 2>&1 || true
+}
+# _c14_judged — the ids that got a verdict, in the order the verdicts were written, space-separated.
+_c14_judged() { awk '$2=="label" && $3=="add" && ($5=="ctx:ready" || $5=="ctx:thin") {printf "%s%s", sep, $4; sep=" "}' "$C14_LEDGER"; }
+# _c14_count <words> — how many words (ids) in the string.
+_c14_count() { printf '%s' "$1" | wc -w | tr -d ' '; }
+# _c14_copy <dir> <real|none|broken> — a copy of the dispatcher beside symlinks to every sibling. `real` keeps
+# scripts/ (the lib); `none` has no scripts/ at all; `broken` has a scripts/work-order.sh whose work_order_sort cannot tell.
+_c14_copy() {
+  local d="$1" mode="$2" e b
+  for e in "$SELF_DIR"/*; do
+    b="$(basename "$e")"
+    [ "$b" = "context-check-dispatcher.sh" ] && continue
+    [ "$b" = "scripts" ] && [ "$mode" != "real" ] && continue
+    ln -s "$e" "$d/$b"
+  done
+  cp "$DISPATCHER" "$d/context-check-dispatcher.sh"
+  if [ "$mode" = "broken" ]; then
+    mkdir -p "$d/scripts"
+    printf '%s\n' 'work_order_sort() { echo "work-order ERROR: stub: cannot tell" >&2; return 2; }' > "$d/scripts/work-order.sh"
+  fi
+}
+
+# 14a-14d — the shipped dispatcher.
+_c14_run "$DISPATCHER"
+_c14_got="$(_c14_judged)"
+_c14_want="wa-p0-feat-new hq-p0-bug-old wa-p1-task"
+if [ "$_c14_got" = "$_c14_want" ]; then
+  ok "14a: judged in the city order — the 2nd store's P0 feature first, then the older P0 bug, then P1 ($_c14_got)"
+else
+  bad "14a: wrong judging order (want: $_c14_want | got: ${_c14_got:-<nothing judged>})"
+fi
+if [ "$(_c14_count "$_c14_got")" = "3" ] && ! echo " $_c14_got " | grep -E ' hq-p2-old2? ' >/dev/null; then
+  ok "14b: the cap of 3 is applied AFTER the order — the first store's two P2 beads were not reached"
+else
+  bad "14b: cap not applied after the order (judged: ${_c14_got:-<nothing>})"
+fi
+_c14_led="$(cat "$C14_LEDGER")"
+if echo "$_c14_led" | grep -E '^wa label add wa-p0-feat-new ctx:(ready|thin) ' >/dev/null \
+   && echo "$_c14_led" | grep -E '^hq label add hq-p0-bug-old ctx:(ready|thin) ' >/dev/null \
+   && echo "$_c14_led" | grep -E '^wa label add wa-p1-task ctx:(ready|thin) ' >/dev/null; then
+  ok "14c: every verdict is written to the store the bead came from (bd -C follows the row, not the loop)"
+else
+  bad "14c: a verdict went to the wrong store (ledger: $(echo "$_c14_led" | tr '\n' ';'))"
+fi
+_c14_nlist=$(grep -c ' list ' "$C14_CALLS" || true)
+_c14_nolim=$(grep ' list ' "$C14_CALLS" | grep -vc -- '--limit 0' || true)
+if [ "$_c14_nlist" = "10" ] && [ "$_c14_nolim" = "0" ]; then
+  ok "14d: all 5 types of BOTH stores were fetched, every list with --limit 0 (the whole population before the order)"
+else
+  bad "14d: list calls=$_c14_nlist (want 10 = 5 types x 2 stores), without --limit 0=$_c14_nolim (want 0)"
+fi
+
+# 14e — mutation control: put the rule of today back (priority-blind, oldest first) and the order assertion must FAIL.
+_c14m="$(mktemp -d)"
+_c14_copy "$_c14m" real
+sed "s/work_order_sort --age created/jq -c 'sort_by(.created_at \/\/ .id)'/" "$DISPATCHER" > "$_c14m/context-check-dispatcher.sh"
+if cmp -s "$DISPATCHER" "$_c14m/context-check-dispatcher.sh"; then
+  bad "14e: the mutation did not apply (no 'work_order_sort --age created' in the dispatcher) — the control proves nothing"
+else
+  _c14_run "$_c14m/context-check-dispatcher.sh"
+  _c14_gotm="$(_c14_judged)"
+  if [ "$_c14_gotm" != "$_c14_want" ] && [ -n "$_c14_gotm" ]; then
+    ok "14e: mutation control — the old priority-blind FIFO rule does NOT give the city order (got: $_c14_gotm)"
+  else
+    bad "14e: mutation control failed — with the old rule the sweep still judged '${_c14_gotm:-<nothing>}', so 14a cannot catch a revert"
+  fi
+fi
+
+# 14f/14g — "cannot tell" is not "empty queue": the lib missing, or work_order_sort failing, keeps sweeping (beads are
+# still judged, in the order they were gathered) and says so in the log. It never reads as "no bead to judge".
+_c14n="$(mktemp -d)"; _c14_copy "$_c14n" none
+_c14_run "$_c14n/context-check-dispatcher.sh"
+_c14_gotn="$(_c14_judged)"
+if [ "$(_c14_count "$_c14_gotn")" = "3" ] && grep -E 'WARN.*ga-9t9acg\.10.*work-order\.sh missing' "$_c14_log" >/dev/null 2>&1; then
+  ok "14f: lib missing → the sweep still judges (3 beads) and logs a WARN naming ga-9t9acg.10; not an empty queue"
+else
+  bad "14f: lib missing mishandled (judged: '${_c14_gotn:-<nothing>}'; log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+_c14b="$(mktemp -d)"; _c14_copy "$_c14b" broken
+_c14_run "$_c14b/context-check-dispatcher.sh"
+_c14_gotb="$(_c14_judged)"
+if [ "$(_c14_count "$_c14_gotb")" = "3" ] && grep -E 'WARN.*ga-9t9acg\.10.*cannot tell' "$_c14_log" >/dev/null 2>&1; then
+  ok "14g: work_order_sort cannot tell → the sweep still judges (3 beads) and logs a WARN naming ga-9t9acg.10; not an empty queue"
+else
+  bad "14g: work_order_sort failure mishandled (judged: '${_c14_gotb:-<nothing>}'; log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+
+# 14m/14n — the library's WARN lines reach the log. A bead whose priority is unreadable is kept at the end of the order
+# and named on the library's stderr; that line is the ONLY signal, so the dispatcher must keep it (`2>/dev/null` would turn
+# "unreadable, kept at the end" into "silently misordered"). Mutation control: send that stderr to /dev/null and it vanishes.
+_c14_run "$DISPATCHER"
+if grep -F 'work-order WARN: hq-noprio: prio?' "$_c14_log" >/dev/null 2>&1; then
+  ok "14m: a bead with an unreadable priority is named in the sweep log by the library's own WARN (and the order is unchanged)"
+else
+  bad "14m: the library's WARN for hq-noprio did not reach the log (log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+_c14w="$(mktemp -d)"
+_c14_copy "$_c14w" real
+sed 's|2>"${_wo_err:-/dev/null}"|2>/dev/null|' "$DISPATCHER" > "$_c14w/context-check-dispatcher.sh"
+if cmp -s "$DISPATCHER" "$_c14w/context-check-dispatcher.sh"; then
+  bad "14n: the mutation did not apply (no '2>\"\${_wo_err:-/dev/null}\"' in the dispatcher) — the control proves nothing"
+else
+  _c14_run "$_c14w/context-check-dispatcher.sh"
+  if grep -F 'work-order WARN: hq-noprio' "$_c14_log" >/dev/null 2>&1; then
+    bad "14n: mutation control failed — with the library's stderr sent to /dev/null its WARN still reached the log, so 14m proves nothing"
+  else
+    ok "14n: mutation control — with the library's stderr thrown away its WARN never reaches the log, so 14m catches that regression"
+  fi
+fi
+
+# 14k/14l — `bd blocked` failing must not kill the sweep. The dep-blocked set is documented FAIL-OPEN (a failed query is an
+# empty set, no exclusion); under `set -euo pipefail` the unguarded substitution aborted the whole process before it judged a
+# bead. Here the stub's `bd blocked` exits 1 and the blocked-ids seam is OFF, so the dispatcher really runs the query.
+C14_BLOCKED_SEAM=off; C14_BLOCKED_FAIL=1; export C14_BLOCKED_FAIL
+_c14_run "$DISPATCHER"
+_c14_gotk="$(_c14_judged)"
+if [ "$_c14_gotk" = "$_c14_want" ]; then
+  ok "14k: 'bd blocked' failing → the sweep survives (fail-open, empty blocked set) and still judges in the city order"
+else
+  bad "14k: a failing 'bd blocked' broke the sweep (want: $_c14_want | got: ${_c14_gotk:-<nothing judged>})"
+fi
+# Fail-open is not silent: an empty set from a FAILED query must not look like an empty set from "nothing is blocked".
+if grep -E 'WARN.*ga-9t9acg\.10: bd blocked failed in .*fail-open' "$_c14_log" >/dev/null 2>&1; then
+  ok "14k2: the failed 'bd blocked' is logged as a WARN naming the store — fail-open, not silent"
+else
+  bad "14k2: 'bd blocked' failed and the log says nothing (log: $([ -f "$_c14_log" ] && grep -c . "$_c14_log" || echo '<missing>') lines)"
+fi
+# Mutation control: put the query back OUTSIDE the `if` (unguarded assignment) and the same run must judge NOTHING (the sweep dies).
+_c14k="$(mktemp -d)"
+_c14_copy "$_c14k" real
+sed 's/^  elif _cc_blocked=\$(\(bd_ blocked.*\)); then$/  elif true; then _cc_blocked=$(\1)/' "$DISPATCHER" > "$_c14k/context-check-dispatcher.sh"
+if cmp -s "$DISPATCHER" "$_c14k/context-check-dispatcher.sh"; then
+  bad "14l: the mutation did not apply (no 'elif _cc_blocked=\$(bd_ blocked …); then' in the dispatcher) — the control proves nothing"
+else
+  _c14_run "$_c14k/context-check-dispatcher.sh"
+  _c14_gotl="$(_c14_judged)"
+  if [ -z "$_c14_gotl" ]; then
+    ok "14l: mutation control — with the query unguarded a failing 'bd blocked' kills the sweep before it judges a bead, so 14k catches a revert"
+  else
+    bad "14l: mutation control failed — with the query unguarded the sweep still judged '$_c14_gotl', so 14k cannot catch a revert"
+  fi
+fi
+C14_BLOCKED_SEAM=on; C14_BLOCKED_FAIL=0; export C14_BLOCKED_FAIL
+
+# 14h-14j — drift guards on the shipped file and on the registry.
+_c14_code="$(grep -vE '^[[:space:]]*#' "$DISPATCHER")"
+if echo "$_c14_code" | grep -F 'scripts/work-order.sh' >/dev/null && echo "$_c14_code" | grep -F 'work_order_sort --age created' >/dev/null; then
+  ok "14h: the dispatcher sources scripts/work-order.sh and orders with it (age = created_at)"
+else
+  bad "14h: the dispatcher does not source/call the work-order lib"
+fi
+if echo "$_c14_code" | grep -E 'sort_by\(\.created_at' >/dev/null; then
+  bad "14i: an ad-hoc sort_by(.created_at ...) is back in the dispatcher (the registry lint would flag it)"
+else
+  ok "14i: no ad-hoc created_at sort left in the dispatcher"
+fi
+if grep -E '^consumer[[:space:]]+packs/town-deltas/assets/context-check-dispatcher\.sh[[:space:]]' "$SELF_DIR/scripts/work-order.registry.tsv" >/dev/null; then
+  bad "14j: the context-check-dispatcher.sh consumer row is still in work-order.registry.tsv (the slice must delete it)"
+else
+  ok "14j: the context-check-dispatcher.sh consumer row is gone from work-order.registry.tsv"
+fi
+rm -rf "$_c14" "$_c14m" "$_c14n" "$_c14b" "$_c14k" "$_c14w"
+
 echo ""
 echo "context-check-dispatcher.selftest: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

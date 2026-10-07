@@ -41,7 +41,6 @@
 #   ones by hand). A reviewer who finds one adds a row, or widens IDIOMS and adds a selftest fixture for the shape.
 #
 # --- consumer rows -------------------------------------------------------------------------------------------
-consumer	packs/town-deltas/assets/context-check-dispatcher.sh	sort_by\(\.created_at // \.id\)	ga-9t9acg.10	R11 context-check: FIFO per store, priority and type ignored, global cap eaten by the first stores
 consumer	packs/town-deltas/assets/quality-gate-dispatcher.sh	sort_by\(\.created_at\)	ga-q8tj7p	R1 gate marker-select cascade (SELFTEST-EXTRACT marker-select); age = created_at of the MARKER, i.e. --age field there
 consumer	packs/town-deltas/assets/quality-gate-guard.sh	sort_by\(\.created_at\) \| \.\[0\]	UNASSIGNED	not in the inventory: gate_pick_oldest_marker (called at MARKER=$(gate_pick_oldest_marker ...)) picks the guard's marker FIFO; belongs with the gate slice ga-q8tj7p or its own slice
 consumer	scripts/gate-recovery-watchdog.py	markers\.sort\(key=lambda m: _iso_epoch\(m\.get\("created_at"\)\) or 0\.0\)	UNASSIGNED	not in the inventory: requeue_error_markers, requeue_deferred_markers, recover_needs_rebase_markers each take markers oldest-first by created_at

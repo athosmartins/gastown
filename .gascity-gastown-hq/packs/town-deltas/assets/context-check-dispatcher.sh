@@ -1163,7 +1163,8 @@ fi
 # Actionable work types: bug / chore / task / debt + feature (feature is filtered
 # to those WITHOUT a story:* label by the pure classifier). bd has no
 # missing-label filter, so we exclude ctx:* at the query AND re-assert every rule
-# in the pure classifier (defense in depth). One union, dedup, oldest-first.
+# in the pure classifier (defense in depth). One union over ALL stores, then ONE
+# order (ga-9t9acg.10, below) — priority > type > age, the cap applied after it.
 # Multi-store: judge actionable beads across ALL rig stores (HQ + WA + PS). The
 # labeling pass is store-scoped (bd_ honors $CC_STORE). Only the optional Sonnet
 # reviewer spawn is city-coupled (uses $GC_CITY = the HQ city) — it stays on HQ.
@@ -1193,39 +1194,63 @@ if [ "$_CONTEXT_CHECK_STORES_CALLER_SET" != "1" ]; then
   fi
 fi
 
+# ── ga-9t9acg.10 (programa ga-9t9acg; Athos, 2026-10-06): WHICH bead is judged first ──────────────────────────
+# priority > type (feature first) > age, over the beads of ALL stores TOGETHER, ordered by the ONE library
+# scripts/work-order.sh (work_order_sort). The per-sweep cap (CONTEXT_CHECK_MAX_PER_SWEEP) is applied AFTER that order, so it
+# takes the best N of the CITY, not the first N of the first store. The loop this replaces visited the stores one after the
+# other (HQ first), FIFO inside each, and stopped at the cap: a P0 feature of the WA store was never judged while HQ had a
+# backlog (the story's own measurement, 2026-10-06: HQ 103 open, WA 214, cap 8). This file carries no sort of its own — the registry lint
+# (scripts/work-order.registry.tsv, run by work-order.selftest.sh) fails if an ordering idiom comes back.
+# AGE = created_at (--age created). This stage has no entry marker of its own: a bead waits here only because it has no
+# ctx:ready / ctx:thin yet, and nothing stamps the moment it became a candidate, so "oldest" is the oldest bead. It is NOT the
+# Pilot's anti-starvation `reclaim` age: a bead that is skipped (built, blocked, Sonnet budget spent) is not counted against
+# the cap, so one that keeps waiting never holds back the beads behind it; and a bead leaves this queue on its verdict label.
+# CANNOT TELL is not "empty queue": library missing/unreadable, or work_order_sort exit != 0 / empty output, and the sweep
+# keeps judging in the order the beads were GATHERED (stores as listed, by id inside a store) with a WARN in the log. The old
+# per-store oldest-first is not reproduced on purpose — a second copy of an ordering idiom is what the registry lint forbids.
+# `[ -r ]` before `source`: under this file's `set -e` a missing target kills the process (see ga-q4sadt above).
+_GC_WO_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
+if [ -r "$_GC_WO_SIBLING" ]; then
+  # shellcheck source=scripts/work-order.sh
+  source "$_GC_WO_SIBLING"
+else
+  warn "ga-9t9acg.10: work-order.sh missing/unreadable ($_GC_WO_SIBLING) — the sweep cannot apply the order rule and keeps the GATHERED order (stores as listed, by id inside a store) until it is restored. Not an empty queue."
+fi
+unset _GC_WO_SIBLING
+
 _fetch_type() {
-  bd_ list --type "$1" --status open \
-    --exclude-label ctx:ready \
-    --exclude-label ctx:thin \
-    --json 2>/dev/null || echo "[]"
+  # --limit 0 = the WHOLE population. The order below is applied to it; a window taken here would cut the list BEFORE the
+  # P0 features were seen (ga-g7yt: window + post-filter hides real work). bd failing, or printing nothing, is logged and
+  # becomes [] so the sweep goes on with what it has — but it is never read as "this store has no beads of this type".
+  local _out
+  if _out=$(bd_ list --type "$1" --status open --limit 0 \
+      --exclude-label ctx:ready \
+      --exclude-label ctx:thin \
+      --json 2>/dev/null) && [ -n "$_out" ]; then
+    printf '%s\n' "$_out"
+  else
+    warn "ga-9t9acg.10: bd list --type $1 failed or printed nothing in ${CC_STORE:-$GC_CITY} — its beads are NOT in this sweep (not 'no beads of this type'); retried next sweep." >&2
+    echo "[]"
+  fi
 }
 
-# ── Step 2: Classify + judge across all stores, up to the GLOBAL per-sweep caps ─
-JUDGED=0
-SONNET_USED=0
-N_READY=0
-N_THIN=0
-N_SONNET=0
-N_MANUAL=0
-N_AUTO=0
-
-for CC_STORE in $CONTEXT_CHECK_STORES; do
-  [ "$JUDGED" -ge "$CONTEXT_CHECK_MAX_PER_SWEEP" ] 2>/dev/null && { log "Global per-sweep cap ($CONTEXT_CHECK_MAX_PER_SWEEP) reached — skipping remaining stores."; break; }
-  log "── store: $CC_STORE ──"
-  BUG_JSON=$(_fetch_type bug)
-  CHORE_JSON=$(_fetch_type chore)
-  TASK_JSON=$(_fetch_type task)
-  DEBT_JSON=$(_fetch_type debt)
-  FEATURE_JSON=$(_fetch_type feature)
-  CANDIDATES=$(jq -s 'add | unique_by(.id)' \
-    <(echo "$BUG_JSON") <(echo "$CHORE_JSON") <(echo "$TASK_JSON") \
-    <(echo "$DEBT_JSON") <(echo "$FEATURE_JSON") 2>/dev/null || echo "[]")
-  CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
-  if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
-    log "  no open actionable beads in this store."
-    continue
-  fi
-  log "  $CCOUNT open actionable bead(s) fetched (pre-classification)."
+# Per-store exclusion sets, for the store in $CC_STORE: sets CC_BUILT_IDS and CC_BLOCKED_IDS. Computed the first time a bead
+# of that store is reached and kept for the rest of the sweep — the beads of the stores now interleave in the order, so a
+# per-bead recompute would redo the git scan and the `bd blocked` on every switch, and a store the cap never reaches costs
+# neither. Indexed arrays, not associative ones: /bin/bash 3.2.
+_CC_SETS_STORES=()
+_CC_SETS_BUILT=()
+_CC_SETS_BLOCKED=()
+_cc_load_store_sets() {
+  local _i=0 _n=${#_CC_SETS_STORES[@]}
+  while [ "$_i" -lt "$_n" ]; do
+    if [ "${_CC_SETS_STORES[$_i]}" = "$CC_STORE" ]; then
+      CC_BUILT_IDS="${_CC_SETS_BUILT[$_i]}"
+      CC_BLOCKED_IDS="${_CC_SETS_BLOCKED[$_i]}"
+      return 0
+    fi
+    _i=$((_i+1))
+  done
 
   # Built-bead exclusion set: bead-ids that ALREADY have a crew branch in this store's repo.
   # A coded bead is NOT "ready to code" — it must not (re)enter ctx:ready and thus the painel's
@@ -1246,15 +1271,120 @@ for CC_STORE in $CONTEXT_CHECK_STORES; do
   # `bd_ blocked` honors $CC_STORE. One query per store; O(1) membership in the loop.
   # Test seam CONTEXT_CHECK_TEST_BLOCKED_IDS; kill-switch CONTEXT_CHECK_EXCLUDE_BLOCKED=0.
   # FAIL-OPEN (query fails → empty set → no exclusion). (2026-07-11)
-  CC_BLOCKED_IDS="${CONTEXT_CHECK_TEST_BLOCKED_IDS-$(bd_ blocked --json 2>/dev/null | jq -r '.[]?.id // empty' 2>/dev/null | sort -u)}"
+  # ga-9t9acg.10: the one-line form this replaces promised fail-open and did not deliver it. Under `set -euo pipefail` a
+  # failing `bd blocked` made the pipeline, the substitution and so the assignment fail, and the whole sweep died before it
+  # judged a bead (measured: /bin/bash 3.2.57 and 5.3, same exit) — the hazard ga-6qpna fixed on the git line above. Now the
+  # query sits in an `if` (exempt from set -e) and a failure is fail-open AND logged: an empty set from a failed query is not
+  # an empty set from "nothing is blocked", and the log says which, because a dep-blocked bead can be marked ctx:ready
+  # meanwhile (wa-9t2ty) — for this sweep only; the next sweep asks again.
+  if [ "${CONTEXT_CHECK_TEST_BLOCKED_IDS+set}" = "set" ]; then
+    CC_BLOCKED_IDS="$CONTEXT_CHECK_TEST_BLOCKED_IDS"
+  elif _cc_blocked=$(bd_ blocked --json 2>/dev/null | jq -r '.[]?.id // empty' 2>/dev/null | sort -u); then
+    CC_BLOCKED_IDS="$_cc_blocked"
+  else
+    CC_BLOCKED_IDS=""
+    warn "ga-9t9acg.10: bd blocked failed in $CC_STORE — no dep-blocked exclusion for this store this sweep (fail-open, not 'nothing is blocked'); a bead with an active blocking dependency may be marked ctx:ready until the next sweep."
+  fi
 
-# Iterate oldest-first (FIFO) so the backlog drains in arrival order.
+  _CC_SETS_STORES[$_n]="$CC_STORE"
+  _CC_SETS_BUILT[$_n]="$CC_BUILT_IDS"
+  _CC_SETS_BLOCKED[$_n]="$CC_BLOCKED_IDS"
+}
+
+# ── Step 2: gather ALL stores, put the beads in ONE order, judge up to the GLOBAL per-sweep caps ─
+JUDGED=0
+SONNET_USED=0
+N_READY=0
+N_THIN=0
+N_SONNET=0
+N_MANUAL=0
+N_AUTO=0
+
+ALL_CANDIDATES="[]"
+_cc_seen_stores=""
+for CC_STORE in $CONTEXT_CHECK_STORES; do
+  # A store listed twice would be judged twice in one sweep. Dedup is by STORE here and by id inside a store below: the same
+  # id in two different stores is two beads, so the union across stores is never "unique_by(.id)".
+  case " $_cc_seen_stores " in
+    *" $CC_STORE "*) log "── store: $CC_STORE listed twice — the repeat is skipped ──"; continue ;;
+  esac
+  _cc_seen_stores="$_cc_seen_stores $CC_STORE"
+  log "── store: $CC_STORE ──"
+  BUG_JSON=$(_fetch_type bug)
+  CHORE_JSON=$(_fetch_type chore)
+  TASK_JSON=$(_fetch_type task)
+  DEBT_JSON=$(_fetch_type debt)
+  FEATURE_JSON=$(_fetch_type feature)
+  # Every bead is tagged with its store (_store): the row carries it through the order, and the loop below sets CC_STORE
+  # from it before any bd_ call, so a label/comment is written to the store the bead came from.
+  if ! CANDIDATES=$(jq -c -s --arg s "$CC_STORE" 'add | unique_by(.id) | map(. + {_store: $s})' \
+      <(echo "$BUG_JSON") <(echo "$CHORE_JSON") <(echo "$TASK_JSON") \
+      <(echo "$DEBT_JSON") <(echo "$FEATURE_JSON") 2>/dev/null); then
+    warn "ga-9t9acg.10: could not merge the bd output of $CC_STORE — its beads are NOT in this sweep (not 'no beads'); retried next sweep."
+    CANDIDATES="[]"
+  fi
+  CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
+  if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
+    log "  no open actionable beads in this store."
+    continue
+  fi
+  log "  $CCOUNT open actionable bead(s) fetched (pre-classification)."
+  if _cc_merged=$(jq -c -s 'add' <(echo "$ALL_CANDIDATES") <(echo "$CANDIDATES") 2>/dev/null); then
+    ALL_CANDIDATES="$_cc_merged"
+  else
+    warn "ga-9t9acg.10: could not add the $CCOUNT bead(s) of $CC_STORE to the sweep — they are NOT in it (not 'no beads'); retried next sweep."
+  fi
+done
+
+# ONE order for the whole city (see the ga-9t9acg.10 block above for the rule, the age and the "cannot tell" contract).
+CC_TOTAL=$(echo "$ALL_CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
+CC_ORDERED="$ALL_CANDIDATES"     # the GATHERED order: where the sweep lands when the order cannot be computed
+CC_ORDER_NOTE="by priority > type > age (created_at)"
+if [ "$CC_TOTAL" -gt 0 ] 2>/dev/null; then
+  if ! _wo_err="$(mktemp 2>/dev/null)"; then
+    _wo_err=""
+    warn "ga-9t9acg.10: mktemp failed — the library's WARN lines (beads whose priority/type/age it could not read) cannot reach this log this sweep; the order itself is unaffected."
+  fi
+  _wo_why=""
+  if ! type work_order_sort >/dev/null 2>&1; then
+    _wo_why="the work-order library is not loaded"
+  elif ! _wo_out=$(printf '%s' "$ALL_CANDIDATES" | work_order_sort --age created 2>"${_wo_err:-/dev/null}") || [ -z "$_wo_out" ]; then
+    _wo_why="work_order_sort could not order the candidates (exit != 0 or empty output; its own line above says why)"
+  fi
+  # The library's WARN lines (a bead whose priority/type/age it could not read stays at the END of its class) and its ERROR
+  # line are the only signal it gives: they go to the log, never to /dev/null.
+  if [ -n "$_wo_err" ]; then
+    while IFS= read -r _wo_line; do
+      if [ -n "$_wo_line" ]; then warn "$_wo_line"; fi
+    done < "$_wo_err"
+    rm -f "$_wo_err"
+  fi
+  if [ -z "$_wo_why" ]; then
+    CC_ORDERED="$_wo_out"
+  else
+    CC_ORDER_NOTE="NOT ordered — gathered order"
+    warn "ga-9t9acg.10: $_wo_why — cannot tell the order, so the sweep keeps the GATHERED order (stores as listed, by id inside a store). This is NOT an empty queue: the $CC_TOTAL candidate(s) are still judged."
+  fi
+fi
+CC_HEAD=$(echo "$CC_ORDERED" | jq -r --argjson n "$CONTEXT_CHECK_MAX_PER_SWEEP" \
+  '.[0:$n] | map("\((._store // "?") | split("/") | last):\(.id // "?")/P\(.priority // "?")") | join(" ")' 2>/dev/null || true)
+log "Order: $CC_TOTAL candidate(s) from all stores, $CC_ORDER_NOTE; the per-sweep cap ($CONTEXT_CHECK_MAX_PER_SWEEP) applies after it. First in line: ${CC_HEAD:-<none>}"
+
+# Judge in that order. The per-sweep cap is checked HERE, per judged bead — after the order, not per store.
 while IFS= read -r row; do
   [ -z "$row" ] && continue
   [ "$JUDGED" -ge "$CONTEXT_CHECK_MAX_PER_SWEEP" ] 2>/dev/null && { log "Per-sweep cap ($CONTEXT_CHECK_MAX_PER_SWEEP) reached — remaining beads next sweep."; break; }
 
   c_id=$(echo "$row" | jq -r '.id // empty')
   [ -z "$c_id" ] && continue
+  # The bead's own store: every bd_ below (comments fetch, label and comment writes) targets it, and so do the built/blocked
+  # sets. No readable _store means no known store — skip, never write to a guessed one (bd_ would default to HQ).
+  CC_STORE=$(echo "$row" | jq -r '._store // empty')
+  if [ -z "$CC_STORE" ]; then
+    warn "ga-9t9acg.10: $c_id has no readable _store — skipped rather than judged against a guessed store (bd_ would default to $GC_CITY)."
+    continue
+  fi
+  _cc_load_store_sets
   # Skip beads already CODED (a crew branch exists) OR dep-BLOCKED (active blocking
   # dependency) — neither is ready-to-code, and re-marking them ctx:ready re-inflates
   # the painel's Aprovadas / undoes a refiner's manual block every sweep. Pure
@@ -1432,8 +1562,7 @@ while IFS= read -r row; do
     '{ts:$ts, event:"judge", id:$id, label:$label, exec_class:$exec, mechanical:$mech, signal:$sig, desc_len:$dlen, comment_count:$comments}' \
     >> "$CC_LOG" 2>/dev/null || true
 
-done < <(echo "$CANDIDATES" | jq -c 'sort_by(.created_at // .id) | .[]')
-done  # end per-store loop
+done < <(echo "$CC_ORDERED" | jq -c '.[]')
 
 log "Context-check sweep done. judged=$JUDGED ctx:ready=$N_READY ctx:thin=$N_THIN sonnet=$N_SONNET exec:manual=$N_MANUAL exec:auto=$N_AUTO (dry_run=$DRY_RUN)"
 jq -c -n --arg ts "$(ts)" --argjson judged "$JUDGED" --argjson ready "$N_READY" \
