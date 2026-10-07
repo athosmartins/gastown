@@ -113,7 +113,7 @@ unset _AUTO_REFINO_QHC_SIB
 # script, readability checked first (a `source` of a missing file kills a `set -e` shell before any
 # `|| true` runs — ga-q4sadt); stderr of the source itself is NOT silenced. A missing/unreadable
 # library is not fatal: Step 1 then finds work_order_sort undefined, answers "cannot tell" and
-# serves the candidates in the order they were gathered, with a WARN on every sweep — refino keeps
+# serves the candidates in the order they were gathered (store by store, by id inside a store), with a WARN on every sweep — refino keeps
 # running, and nobody can read that sweep as "the priority rule applied".
 _AUTO_REFINO_WO_SIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/work-order.sh"
 if [ -r "$_AUTO_REFINO_WO_SIB" ]; then
@@ -1325,8 +1325,14 @@ fi
 
 CANDIDATES=$(jq -s 'add | unique_by(.id)' \
   <(echo "$FRESH_JSON") <(echo "$UNREF_JSON") <(echo "$BOUNCE_JSON") <(echo "$ORPHAN_JSON") <(echo "$RAW_JSON") 2>/dev/null || _ar_cand_failed "merge of the candidate sources")
-CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null || echo 0)
-if [ "$CCOUNT" -eq 0 ] 2>/dev/null; then
+CCOUNT=$(echo "$CANDIDATES" | jq 'length' 2>/dev/null) || CCOUNT=""
+case "$CCOUNT" in
+  ''|*[!0-9]*)
+    # cannot tell is not "none": say so, because this store's stories are then missing from the order
+    warn "ga-9t9acg.8: cannot count the candidates of store $AR_STORE (jq length failed) — they are MISSING from this sweep's order (unreadable, not an empty store)"
+    continue ;;
+esac
+if [ "$CCOUNT" -eq 0 ]; then
   log "  No Triagem stories in this store."
   continue
 fi
@@ -1344,16 +1350,18 @@ done  # end candidate per-store GATHER loop (Step 1, phase 1)
 # ── Step 1, phase 2: ORDER the union ONCE, then walk it ────────────────────────
 # ONE call to the shared rule (scripts/work-order.sh; header there): priority, then feature before
 # the rest, then OLDEST first, over the candidates of ALL stores. AGE = created_at (`--age created`):
-# a Triagem story has no entry marker of its own (checked 2026-10-06: no metadata *_at is written
-# when story:triage is applied, and the label carries no timestamp), and the "reclaim" age of the lib
+# a Triagem story has no entry marker of its own (per the ga-9t9acg.8 story, checked 2026-10-06 when
+# it was written: no metadata *_at is written when story:triage is applied, and the label carries no
+# timestamp — if a marker is ever added, switch to `--age field` and inject it), and the "reclaim" age of the lib
 # is the Pilot's answer to a bead reclaimed again and again — nothing reclaims a story here.
 # THREE states, never collapsed (the lib's contract): ordered (rc 0; `[]` stays `[]`); an illegible
 # field (the row STAYS, at the end of its class, one `work-order WARN:` line on stderr); cannot tell
 # (empty stdout, rc != 0, or the lib is not loaded). The lib's stderr is its ONLY signal for an
 # illegible field, so it is captured and re-logged line by line — never sent to /dev/null — and
 # "cannot tell" is NOT an empty queue: the sweep keeps going with the candidates in the order they
-# were gathered (the previous order the caller had, per the lib's contract) and a loud WARN, so refino
-# does not stall on a library fault and nobody can mistake that sweep for one that applied the rule.
+# were gathered — store by store, and inside a store by id (the `unique_by(.id)` above sorts them) —
+# i.e. the order the caller already held, per the lib's contract, plus a loud WARN, so refino does not
+# stall on a library fault and nobody can mistake that sweep for one that applied the rule.
 ALL_COUNT=$(echo "$ALL_CANDIDATES" | jq 'length' 2>/dev/null) || ALL_COUNT=""
 case "$ALL_COUNT" in
   ''|*[!0-9]*)
@@ -1367,7 +1375,7 @@ if declare -F work_order_sort >/dev/null 2>&1; then
   ORDERED=$(printf '%s' "$ALL_CANDIDATES" | work_order_sort --age created 2>"$_wo_err") || _wo_rc=$?
 else
   _wo_rc=127
-  echo "work-order ERROR: work_order_sort is not defined — the library was not sourced ($_AUTO_REFINO_WO_SIB); cannot tell" > "$_wo_err"
+  echo "work-order ERROR: work_order_sort is not defined — the library was not sourced ($_AUTO_REFINO_WO_SIB); cannot tell" > "$_wo_err" || true
 fi
 if [ -s "$_wo_err" ]; then
   while IFS= read -r _wo_line; do
@@ -1378,7 +1386,7 @@ rm -f "$_wo_err"
 # A bead must never disappear in the ordering: the answer is accepted only if it is an array as long as the input.
 _wo_n=$(printf '%s' "$ORDERED" | jq 'length' 2>/dev/null) || _wo_n=""
 if [ "$_wo_rc" -ne 0 ] || [ -z "$ORDERED" ] || [ "$_wo_n" != "$ALL_COUNT" ]; then
-  warn "ga-9t9acg.8: CANNOT ORDER the $ALL_COUNT Triagem candidate(s) (work_order_sort rc=$_wo_rc, answer length='${_wo_n}') — the priority rule is NOT applied this sweep: serving them in the order they were gathered (store order). A failed ordering is not an empty queue."
+  warn "ga-9t9acg.8: CANNOT ORDER the $ALL_COUNT Triagem candidate(s) (work_order_sort rc=$_wo_rc, answer length='${_wo_n}') — the priority rule is NOT applied this sweep: serving them in the order they were gathered (store by store, by id inside a store). A failed ordering is not an empty queue."
   ORDERED="$ALL_CANDIDATES"
 elif [ "$ALL_COUNT" -gt 0 ]; then
   log "  Ordered $ALL_COUNT candidate(s) across all stores by priority > feature > oldest (ga-9t9acg.8). Head: $(echo "$ORDERED" | jq -r '[.[0:5][] | "\(.id)(P\(.priority // "?"),\(._store | split("/") | last))"] | join(" ")' 2>/dev/null)"

@@ -1389,7 +1389,10 @@ for _rc_i in 1 2 3 4 5 6; do
 done
 # shellcheck disable=SC2086
 wait $_rc_pids
-_rc_recovered=$(grep -c "Recovered STALE" "$_rc_shared_log" 2>/dev/null | tr -d ' ')
+# `grep -c` exits 1 when it counts 0 — and 0 is a PASSING outcome here ("at most one" proceeded: a racer can take
+# the freed lock without being the one that logs "Recovered STALE"). This suite inherits the dispatcher's `set -e` +
+# pipefail (it sources it in lib mode), so without `|| true` a count of 0 ended the whole run silently with exit 1.
+_rc_recovered=$(grep -c "Recovered STALE" "$_rc_shared_log" 2>/dev/null | tr -d ' ') || true
 _rc_recovered=${_rc_recovered:-0}
 if [ "$_rc_recovered" -le 1 ]; then
   ok "(C, ga-bong5) at most one of 6 concurrent recoverers proceeded ($_rc_recovered) — no double-dispatch"
