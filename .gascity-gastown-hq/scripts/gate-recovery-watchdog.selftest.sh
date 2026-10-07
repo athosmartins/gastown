@@ -223,10 +223,13 @@ else:
     bad("expected only ['ga-wisp-open'], got %r — closed/withdrawn marker leaked through" % (qm_ids,))
 # ga-yprwyk: the labels ride along — the proof must see a rebase-fail / exile / cooldown label to know a marker is
 # legitimately sunk. A tuple that dropped them would make every sunk head look like a healthy skipped one.
-if qm and len(qm[0]) == 4 and "gate-status:queued" in qm[0][3] and "branch:crew/wa/wa-open" in qm[0][3]:
-    ok("_queued_markers() returns (id, branch, created, labels) with the marker's real labels")
+# ga-9t9acg.13: a fifth element rides along — the source bead the marker names, (id, rig) or None (this row names none) —
+# because the gate orders by that bead's priority/type, not the marker's. The labels stay at index 3; the arity is still
+# pinned EXACTLY, so a silent change of shape is noticed here (see orphan-head-order.selftest.sh for what src_ref carries).
+if qm and len(qm[0]) == 5 and "gate-status:queued" in qm[0][3] and "branch:crew/wa/wa-open" in qm[0][3] and qm[0][4] is None:
+    ok("_queued_markers() returns (id, branch, created, labels, src_ref) with the marker's real labels")
 else:
-    bad("expected a 4-tuple carrying the labels, got %r" % (qm,))
+    bad("expected a 5-tuple (id, branch, created, labels, src_ref) carrying the labels, got %r" % (qm,))
 
 # ── Drift guard: the live script actually wires the detector in ──────────────
 print("Scenario 10: drift-guard — detector defined and wired into main()")

@@ -365,7 +365,10 @@ check(res == (None, None, 0),
 # D2 — a genuine skip: the dispatcher claimed the NEXT marker (created after the head) while the head was overdue
 world = World(queue, SHOW, LAUNCHD_OK)
 res, out = run_world(world, healthy_log("skip.log", [dl(NOW - 400, "Attempting to claim marker %s ..." % NEXT)]))
-check(res[0] == HEAD and res[1] == HEAD_BR and abs(res[2] - HEAD_AGE_S) < 5,
+# the age is measured against NOW AT THE ASSERTION, not against the module-start constant: the head's age grows while the
+# earlier groups run, so a fixed expectation + a 5s bound made this check a clock test (it failed against the unchanged
+# watchdog at exactly 5.0s of drift on a loaded machine, ga-9t9acg.13). What D2 is about is WHICH marker is flagged.
+check(res[0] == HEAD and res[1] == HEAD_BR and abs(res[2] - (time.time() - H_CREATED)) < 5,
       "the dispatcher claimed a NEWER marker (%s) while the head was 3.5h overdue and never claimed -> FLAGGED (got %r)" % (NEXT, res))
 if HAVE_CORE:
     check(NEXT in m._ORPHAN_EVIDENCE.get(HEAD, ""), "the evidence recorded for the hit names the witness marker")

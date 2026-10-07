@@ -24,7 +24,8 @@ DETECTS (gate not producing verdicts — the tonight signature):
   bead store closed / invalid connection) — the root cause that night.
 
 DETECTS (head-of-line stale-branch block — the ga-hl0gq signature, 2026-06-10):
-  - the dispatcher keeps re-picking the SAME oldest branch every sweep, its
+  - the dispatcher keeps re-picking the SAME head-of-queue branch every sweep (the oldest
+    one until ga-q8tj7p; since then the first by priority > feature > age), its
     auto-rebase conflicts (dead author), it re-queues gate-status:queued, and the
     whole queue behind it stops draining (zero merges). Signature: the last
     >=HEADOFLINE_MIN_SWEEPS "Dispatcher sweep complete" lines are all
@@ -56,8 +57,9 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     blind), and not head-of-line (the queue drains for OTHER branches, so
     headofline_stall sees verdicts advancing for those).
   Signature (orphaned_queued_marker, ga-yprwyk — keyed on the MARKER ID and on the
-    dispatcher's own tier order, NOT on branch-name mentions): the FIFO-head queued
-    marker H is an orphan only when ALL of these hold:
+    dispatcher's own tier order, NOT on branch-name mentions): the HEAD queued marker
+    H — the first of the gate's order (priority > feature > age, via the work_order lib,
+    ga-9t9acg.13; the oldest before it) — is an orphan only when ALL of these hold:
       (a) H is past the dispatcher's overdue ceiling (GATE_MARKER_HARD_AGE_SECONDS —
           READ from the dispatcher source + its launchd env, never a copied number);
       (b) the dispatcher log, read back to BEFORE H was created, holds no
@@ -87,6 +89,10 @@ DETECTS (orphaned queued marker — the gt-mqkwj signature, 2026-06-12):
     orphan". Not deleted: if an overdue tier ever returns the proof resumes by itself, and
     rebuilding it for the new order (the dispatcher can publish the order it computed; a
     queued marker ABSENT from it for K sweeps is invisible whatever its class) is ga-dtecvq.
+    The head that proof examines is already the head of THAT order (ga-9t9acg.13): _orphan_head asks the
+    work_order lib, fed the source bead's priority/type and the marker's created_at — the watchdog keeps no
+    ordering of its own. It stays dormant, and the repair stays OFF, until the gate's order is entirely in
+    the lib (the `dano-ao-vivo` exception, exile/rebase-fail placement: see _orphan_head).
 
 ON DETECT:
   1. snapshot diagnostics to /tmp/gate-watchdog-diag-<ts>.txt
@@ -152,6 +158,8 @@ ORPHAN_MIN_AGE_SEC = 1800      # cheap pre-filter ONLY (ga-yprwyk): a head young
 # (MAX_ACTIVE_REPAIR_DOGS) a real gate outage needs. So the repair path is OFF unless explicitly enabled;
 # the signal is still logged (once per marker per ORPHAN_LOGONLY_EVERY_SEC).
 # ga-yprwyk: the proof is now marker-id + tier aware (see the module docstring), but the default STAYS 0.
+# ga-9t9acg.13: the head it examines is now the head of the gate's order (the work_order lib), not the FIFO-oldest
+# marker — which is one more reason the default stays 0 until that order is entirely in the lib (see _orphan_head).
 # The acceptance bar for flipping it is an observation, not a unit test: run this detector against the LIVE
 # log through >= 1 complete drain of a deep queue and see ZERO false positives, then flip the default.
 GRW_ORPHAN_REPAIR_ENABLED = os.environ.get("GRW_ORPHAN_REPAIR_ENABLED", "0") == "1"
@@ -861,7 +869,8 @@ def headofline_scan():
 def headofline_stall():
     """Detect the stale-branch FIFO head-of-line block (ga-hl0gq) — the REPAIR signal.
 
-    The dispatcher picks the oldest queued marker every sweep; if that branch is
+    The dispatcher picks the head of its queue every sweep (the oldest marker until ga-q8tj7p, the first by
+    priority > feature > age since); if that branch is
     stale vs origin/main and its auto-rebase conflicts with a dead/empty author,
     the marker is re-queued gate-status:queued and the SAME branch is re-picked
     next sweep — the queue behind it never drains (zero merges). The dispatcher
@@ -1042,8 +1051,9 @@ def frozen_reviewer_run_verdict(pending_names, killed_identities):
 
 
 def _queued_markers():
-    """[(id, branch, created_epoch, labels), ...] for every OPEN gate-status:queued
-    marker (labels: a tuple of the marker's label strings, ga-yprwyk). --all is required to surface the normally-hidden gate-marker type,
+    """[(id, branch, created_epoch, labels, src_ref), ...] for every OPEN gate-status:queued
+    marker (labels: a tuple of the marker's label strings, ga-yprwyk; src_ref: (source bead id, rig) or None,
+    ga-9t9acg.13). --all is required to surface the normally-hidden gate-marker type,
     but it also lifts bd's default closed-issue hiding — so a marker closed via
     the ad-hoc withdrawal path (e.g. "WITHDRAWN as duplicate") that kept its
     gate-status:queued label would otherwise be indistinguishable from a
@@ -1089,7 +1099,10 @@ def _queued_markers_read():
                 break
         # ga-yprwyk: the labels ride along — the orphan proof must know whether a rebase-fail / exile /
         # retry-cooldown label legitimately sinks this marker in the dispatcher's tier order.
-        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ())))
+        # ga-9t9acg.13: so does the SOURCE BEAD the marker names (id, rig) — the gate orders by that bead's priority
+        # and type, never by the marker's own (always P2/chore), so the queue head cannot be told without it.
+        out.append((row.get("id"), branch, _iso_epoch(row.get("created_at")), tuple(row.get("labels") or ()),
+                    _marker_src_ref(row)))
     return out
 
 
@@ -1142,6 +1155,9 @@ _DISPATCHER_OVERDUE_TIER_RE = re.compile(r"^\s*def is_overdue:", re.M)
 _ORDER_PREMISE_CACHE = {"at": 0.0, "value": None}
 
 _HARD_AGE_CACHE = {"at": 0.0, "value": None}
+# ga-9t9acg.13: a source bead id as the dispatcher accepts it (quality-gate-dispatcher.sh `src_bead`): the id goes onto a
+# `bd show` command line and a marker's text is worker-written, so anything else (e.g. "--all") is "no source bead".
+_SRC_BEAD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _MARKER_CREATED_CACHE = {}    # marker id -> created epoch; a marker's created_at never changes, so this never goes stale
 _ORPHAN_NOTED = {}            # reason -> last time its "cannot prove" note was printed
 _ORPHAN_EVIDENCE = {}         # marker id -> why the last detection called it an orphan (read by main()'s log line)
@@ -1275,12 +1291,14 @@ def _marker_created_epoch(mid):
     return e
 
 
-def _orphan_note(reason, msg, now=None):
+def _orphan_note(reason, msg, now=None, kind="orphan-proof unavailable"):
     """Print a 'the proof is unavailable' note, at most once per ORPHAN_NOTE_EVERY_SEC per reason. A detector
-    that goes quiet because it CANNOT decide must say so — silence would read as 'no orphan' (ga-b1iulk)."""
+    that goes quiet because it CANNOT decide must say so — silence would read as 'no orphan' (ga-b1iulk).
+    `kind` names the state when it is not 'unavailable' (ga-9t9acg.13: a queue whose order was told but with some
+    source classes unreadable is degraded, not unavailable — and still must not be silent)."""
     now = time.time() if now is None else now
     if now - _ORPHAN_NOTED.get(reason, 0) >= ORPHAN_NOTE_EVERY_SEC:
-        print("[watchdog] orphan-proof unavailable (%s): %s" % (reason, msg), flush=True)
+        print("[watchdog] %s (%s): %s" % (kind, reason, msg), flush=True)
         _ORPHAN_NOTED[reason] = now
 
 
@@ -1291,24 +1309,162 @@ def _marker_fields(m):
     return (m[0], m[1], m[2], labels)
 
 
-def _orphan_head(markers, sweep_epochs, now, min_age):
-    """The FIFO-oldest queued marker, iff the dispatcher is actively draining and that marker is at least `min_age`
-    old — else None. Only the head is ever a candidate: everything newer is FIFO-blocked behind it, not skipped
-    (wa-68su / ga-te7es: the recurring 'a #2 marker flagged while the older head was being gated' false positive)."""
+def _marker_src_ref(row):
+    """(source bead id, rig name) of a queued-marker row — read the way the dispatcher reads it (description line
+    first, label second; quality-gate-dispatcher.sh `_GATE_SRC_JQ_DEFS`) — or None when the marker names no valid
+    source bead. rig is '' when none is named ('unknown' in the description counts as none). ga-9t9acg.13.
+    Never raises: _queued_markers_read() also serves the live head-of-line check, and a row this cannot read is
+    simply a marker with no readable source (the 'unreadable' state of _marker_source_classes), not a crash."""
+    try:
+        desc = row.get("description")
+        desc = desc if isinstance(desc, str) else ""
+        labels = [lb for lb in (row.get("labels") or []) if isinstance(lb, str)]
+
+        def field(key):
+            mm = re.search(r"(?:^|\n)" + key + r":[ ]*([^\n]*)", desc)
+            return mm.group(1).strip() if mm else ""
+        bead = field("bead_id") or next((lb[len("source-bead:"):] for lb in labels if lb.startswith("source-bead:")), "")
+        if not _SRC_BEAD_ID_RE.fullmatch(bead):
+            return None
+        rig = field("bead_rig")
+        if not rig or rig == "unknown":
+            rig = next((lb[len("bead-rig:"):] for lb in labels if lb.startswith("bead-rig:")), "")
+        return (bead, rig)
+    except Exception:
+        return None
+
+
+def _marker_source_classes(markers):
+    """{marker id: {"priority": p, "type": t}} for every queued marker whose SOURCE bead could be READ — the two
+    fields the gate orders by (quality-gate-dispatcher.sh Step 0b-1, ga-q8tj7p). The marker's own priority/type say
+    nothing: a live marker is P2/chore whatever it carries (26 of 26, 2026-10-07).
+
+    A marker ABSENT from the answer is UNREADABLE — no valid source bead named, the bead is in none of its candidate
+    stores, or every read of them failed. That is a third state, not 'no priority': the ordering library keeps such a
+    marker at the END of the order and warns (as the gate does) — never P0, never dropped. An empty dict therefore
+    means 'nothing could be read', not 'nobody has a priority'. Priority 0 is kept as 0: `.get`, never `or`.
+
+    Candidate stores, in the dispatcher's order: the bead's rig, the rig its id prefix names, the city; one `bd show`
+    per store per pass (three passes), a partial miss is asked of the next store. Reads go through BD_LIST_CACHED, the
+    same read-cache shim the queue read uses (it publishes only successful answers)."""
+    ref_of = {}
+    for mk in markers:
+        ref = mk[4] if len(mk) > 4 else None
+        if mk[0] and ref:
+            ref_of[mk[0]] = ref
+    if not ref_of:
+        return {}
+    cands = {}
+    for bead, rig in ref_of.values():
+        if bead not in cands:
+            stores = []
+            # the rig registry is the file's own (_rig_paths, ~10 min cache; {} when `gc rig list` fails — the city is
+            # still asked). The dispatcher matches a rig by name OR prefix, so the named rig is tried as both.
+            for st in ((_rig_paths().get(rig) or _rig_path_by_prefix(rig)) if rig else None,
+                       _rig_path_by_prefix(_bead_id_prefix(bead)), CITY):
+                if st and st not in stores:
+                    stores.append(st)
+            cands[bead] = stores
+    classes = {}
+    for p in range(3):
+        by_store = {}
+        for bead, stores in cands.items():
+            if bead not in classes and p < len(stores):
+                by_store.setdefault(stores[p], []).append(bead)
+        for store, ids in by_store.items():
+            r = sh(["bash", BD_LIST_CACHED, "-C", store, "show"] + ids + ["--json"], timeout=25)
+            if not r or r.returncode != 0:
+                continue
+            try:
+                rows = json.loads(r.stdout)
+            except Exception:
+                continue
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if isinstance(row, dict) and row.get("id") in ids:
+                    classes[row["id"]] = {"priority": row.get("priority"), "type": row.get("issue_type")}
+    return dict((mid, classes[bead]) for mid, (bead, _rig) in ref_of.items() if bead in classes)
+
+
+def _orphan_pool(markers, sweep_epochs, now, min_age):
+    """The cheap gates of the head test, run BEFORE any source bead is read: [(id, branch, created_epoch, labels)] for
+    every queued marker that has an id, a branch and a creation time — iff the dispatcher is actively draining AND at
+    least one of them is `min_age` old (the head cannot be older than the oldest marker, so none old enough means no
+    candidate) — else None."""
     if not sweep_epochs:
         return None
     if now - max(sweep_epochs) > ORPHAN_DRAIN_FRESH_SEC:
         return None  # newest completed sweep is stale: the dispatcher is wedged on its CURRENT run — a different failure mode
     valid = []
-    for m in markers:
-        mid, branch, created, labels = _marker_fields(m)
+    for mk in markers:
+        mid, branch, created, labels = _marker_fields(mk)
         if mid and branch and created:
             valid.append((mid, branch, created, labels))
-    if not valid:
+    if not valid or not any(now - v[2] >= min_age for v in valid):
         return None
-    valid.sort(key=lambda x: x[2])  # oldest first
-    head = valid[0]
-    if now - head[2] < min_age:
+    return valid
+
+
+def _gate_order_head(valid, src_class):
+    """The first of `valid` in the town's ONE ordering — priority > feature > age, the work_order library — or None
+    when that order cannot be told. The consumer does not sort: it hands the library the gate's own fields (the
+    source bead's priority/type from `src_class`, ga-q8tj7p; the marker's created_at as the age of the SUBMISSION to
+    the gate, `--age field`, which is what the gate's `created_key` is) and takes its first (ga-9t9acg.13).
+
+    THREE states, never two. (1) Ordered: its first. (2) Ordered, with a source class unreadable: the library keeps
+    that marker at the END and warns — the gate does the same — and the warning is printed (rate-limited), because a
+    queue ordered by age alone would otherwise look like a queue ordered by the rule. (3) The library cannot tell
+    (missing, failed, bad answer): the head is UNKNOWN -> None with a note. NOT a fall back to the oldest marker:
+    that is the very order this replaces, and a detector that cannot tell the head must not name one."""
+    beads = []
+    for mid, _branch, created, _labels in valid:
+        b = {"id": mid, "_wo_age": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created))}
+        cls = (src_class or {}).get(mid)
+        if isinstance(cls, dict):
+            b["priority"], b["issue_type"] = cls.get("priority"), cls.get("type")
+        beads.append(b)
+    try:
+        import work_order      # lazily: a missing module is 'cannot tell' (state 3), not a watchdog that no longer starts
+        ordered, warns = work_order.sort_beads(beads, age="field")
+    except Exception as e:
+        ordered, warns = None, ["work_order unavailable: %r" % (e,)]
+    by_id = dict((v[0], v) for v in valid)
+    if not ordered or not isinstance(ordered[0], dict) or ordered[0].get("id") not in by_id:
+        _orphan_note("order-unknown", "the ordering library could not tell the order of the %d queued marker(s) (%s) — the "
+                     "queue head is UNKNOWN, so no marker can be called skipped this poll (it is never read as the oldest one)"
+                     % (len(valid), (warns[0] if warns else "no reason given")[:300]))
+        return None
+    if warns:
+        shown = "; ".join(w.replace("work-order WARN: ", "", 1) for w in warns[:8]) + (" (+%d more)" % (len(warns) - 8) if len(warns) > 8 else "")
+        _orphan_note("order-warn", "the queue was ordered, but the library reported: %s — a marker whose source bead could not "
+                     "be read sorts after every readable one, as in the gate" % shown, kind="gate-order degraded")
+    return by_id[ordered[0]["id"]]
+
+
+def _orphan_head(markers, sweep_epochs, now, min_age, src_class=None):
+    """The head of the gate's queue — the marker the town's ordering (priority > feature > age) puts first, see
+    _gate_order_head — iff the dispatcher is actively draining and that marker is at least `min_age` old; else None.
+    Only the head is ever a candidate: everything behind it is blocked by it, not skipped (wa-68su / ga-te7es: the
+    recurring 'a #2 marker flagged while the older head was being gated' false positive). `src_class` is
+    {marker id: {"priority", "type"}} from _marker_source_classes(); a marker missing from it is unreadable.
+
+    WHAT THIS IS NOT (ga-9t9acg.13): the gate's whole cascade. The library has no `impacto:dano-ao-vivo` exception (a P0
+    bug before the P0 features, ga-emgkvn; porting it is ga-9t9acg.14), no 'exile overdue first / rebase-fail last /
+    cooldown excluded' placement, and it reads a bead without a usable priority as unreadable where the gate reads P2.
+    The watchdog does NOT reimplement those — one ordering rule, not two — so on a queue that exercises them this head
+    can differ from the gate's. That is safe here for two reasons: _orphan_verdict applies its own veto to a head that
+    carries a sink label (the states that move a marker in the gate's order), and the orphan repair stays OFF
+    (GRW_ORPHAN_REPAIR_ENABLED defaults 0; orphaned_queued_marker() returns before this while the dispatcher has no
+    overdue tier). The decision of this slice is: leave it OFF until the gate's order is entirely in the library
+    (ga-dtecvq rebuilds the proof on that order). Were an overdue tier to return, the old proof stays sound with this
+    head — a claim of a marker created AFTER an overdue, healthy, queued one contradicts a priority-blind oldest-first
+    tier whichever marker is called the head — it only looks at fewer markers (a young head hides an older overdue one)."""
+    valid = _orphan_pool(markers, sweep_epochs, now, min_age)
+    if valid is None:
+        return None
+    head = _gate_order_head(valid, src_class)
+    if head is None or now - head[2] < min_age:
         return None
     return head
 
@@ -1323,8 +1479,8 @@ def _cooldown_covers(labels, t):
     return False
 
 
-def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now):
-    """Decide whether the FIFO-head queued marker was SKIPPED by the dispatcher. Returns (orphan, reason, evidence):
+def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, src_class=None):
+    """Decide whether the HEAD queued marker (see _orphan_head) was SKIPPED by the dispatcher. Returns (orphan, reason, evidence):
     orphan is (id, branch, age_sec) or None; reason is a short code for the outcome (the caller notes only the
     'cannot prove' ones); evidence says WHY it is an orphan.
 
@@ -1340,7 +1496,7 @@ def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, cr
       created_of      marker_id -> created epoch or None (a claimed marker is usually no longer queued)"""
     if hard_age is None:
         return (None, "tunables", "")
-    head = _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC)
+    head = _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC, src_class=src_class)
     if head is None:
         return (None, "no-candidate", "")
     mid, branch, created, labels = head
@@ -1373,11 +1529,11 @@ def _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, cr
     return (None, "no-witness", "")
 
 
-def _detect_orphan_markers(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, evidence=None):
-    """Pure core of orphaned_queued_marker() (separated for the selftest): [(id, branch, age_sec)] — the FIFO-head
+def _detect_orphan_markers(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, evidence=None, src_class=None):
+    """Pure core of orphaned_queued_marker() (separated for the selftest): [(id, branch, age_sec)] — the queue-head
     marker when the dispatcher provably skipped it, else []. If `evidence` is a dict it receives {id: why}.
     See _orphan_verdict() for the proof and the module docstring for the signature."""
-    orphan, _reason, why = _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now)
+    orphan, _reason, why = _orphan_verdict(markers, sweep_epochs, claims, log_first_epoch, hard_age, created_of, now, src_class=src_class)
     if orphan is None:
         return []
     if evidence is not None:
@@ -1386,8 +1542,8 @@ def _detect_orphan_markers(markers, sweep_epochs, claims, log_first_epoch, hard_
 
 
 def orphaned_queued_marker():
-    """Detect the FIFO-head gate-status:queued marker the dispatcher provably SKIPPED (gt-mqkwj; proof rebuilt in
-    ga-yprwyk). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for a hit is left in
+    """Detect the head gate-status:queued marker the dispatcher provably SKIPPED (gt-mqkwj; proof rebuilt in
+    ga-yprwyk; head = the first of the gate's order since ga-9t9acg.13). Returns (marker_id, branch, age_sec), else (None, None, 0). The evidence for a hit is left in
     _ORPHAN_EVIDENCE[marker_id]. Fail-safe: any gather error, or any input that cannot be established, returns no
     orphan (never wakes spuriously) — and the 'cannot prove' cases that would otherwise be invisible are noted."""
     sweep_epochs, _log_text, log_fresh = _dispatcher_log_state()
@@ -1402,8 +1558,12 @@ def orphaned_queued_marker():
                      "proves nothing — orphan detection is OFF until it is rebuilt for that order (ga-dtecvq)", now)
         return (None, None, 0)
     markers = _queued_markers()
-    # Cheap gates first: the wide log read and the launchctl/source read below happen only for a REAL candidate.
-    if _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC) is None:
+    # Cheap gates first: the source-bead reads, the wide log read and the launchctl/source read below happen only for a
+    # REAL candidate (ga-9t9acg.13: a queue with no marker old enough to be a head reads no source bead at all).
+    if _orphan_pool(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC) is None:
+        return (None, None, 0)
+    src_class = _marker_source_classes(markers)
+    if _orphan_head(markers, sweep_epochs, now, ORPHAN_MIN_AGE_SEC, src_class=src_class) is None:
         return (None, None, 0)
     hard_age = _dispatcher_hard_age(now)
     try:
@@ -1429,7 +1589,7 @@ def orphaned_queued_marker():
         return e
 
     orphan, reason, why = _orphan_verdict(markers, sweep_epochs, _dispatcher_claims(lines), _log_first_epoch(lines),
-                                          hard_age, created_of, now)
+                                          hard_age, created_of, now, src_class=src_class)
     if reason == "tunables":
         _orphan_note("tunables", "cannot derive the dispatcher's overdue ceiling from %s + `launchctl print %s` — "
                      "no marker can be proven skipped until that is readable" % (DISPATCHER_SRC, DISPATCHER_LAUNCHD_LABEL), now)
@@ -5175,7 +5335,7 @@ def main():
         # --- ORPHANED queued marker (closes the gt-mqkwj blind spot: a marker
         #     whose gate_run was dropped in an outage is leapfrogged forever →
         #     bead stuck in_progress → reconciler re-spawns a worker ~6x). The
-        #     tier-aware skip proof (module docstring, ga-yprwyk) + FIFO-head guard
+        #     tier-aware skip proof (module docstring, ga-yprwyk) + queue-head guard
         #     keep a normal backlog / head-of-line block / deep healthy queue from
         #     false-firing (the 6x-same-marker driver). ---
         orphan_id, orphan_branch, orphan_age = orphaned_queued_marker()
