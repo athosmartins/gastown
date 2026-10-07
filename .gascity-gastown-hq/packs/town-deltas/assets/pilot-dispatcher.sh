@@ -8707,6 +8707,90 @@ _topup_exclude_braked() {
   jq -c 'if type == "array" then [ .[] | select(((.labels // []) | index("pilot:topup-braked")) == null) ] else . end'
 }
 
+# ── ga-9t9acg.4 (programa ga-9t9acg, rule: priority > type > age, scripts/work-order.sh): WHICH pending bead top-up
+# spawns for. Until now both queries below asked bd for `--limit=20` with no --sort and took `.[0].id`: bd's default
+# order is priority and then NEWEST first (measured: 23 routed beads, a P0 feature 24th), so a window of 20 cut the
+# oldest P0 feature off before anything was ordered (ga-g7yt: a window plus a post-filter hides real work) and the
+# survivor of the window was the newest bead, not the one the rule serves first.
+#
+# WHAT RUNS NOW. The queries fetch the WHOLE population (`--limit 0`), the existing filter chain narrows it (exec:manual,
+# _filter_candidates, _filter_label_vetoes, the pilot:topup-braked brake — unchanged), and _topup_pick_first orders what
+# is left with work_order_sort and takes the first. Filters and vetoes stay HERE: the library only orders.
+#
+# AGE RULE: `reclaim` (work-order.sh header). A bead the Pilot has reclaimed (label pilot:reclaim-count:N, N >= 1)
+# is aged by updated_at, any other by created_at — the anti-starvation of ga-w4k2z/ga-oc6knj/ga-x80j1 that the worker
+# probe has had since before the rule existed. It is inherited, not part of the Athos rule; without it a bead reclaimed
+# again and again would keep position 0 on its ancient created_at and top-up would spawn for it every sweep.
+#
+# TOP-UP AND THE WORKER MUST PICK THE SAME BEAD. Top-up exists to put a session in front of the bead the pool's worker
+# will take; the worker takes whatever its own probe returns first (agents/{wa-worker,ps-worker}/prompt.template.md,
+# Step 1b2). If the two disagree, top-up spends a pool slot "for" bead A and the session claims bead B — the same
+# invariant ga-oc6knj (c) names for the eligibility filters, now for the ORDER. The probe is slice ga-9t9acg.5/.6
+# (out of scope here: R5/R6); until it migrates it still windows at 20 and has no type tier, so the two can differ
+# on a P0 non-feature that is older than a P0 feature, or on a population larger than the probe's window.
+# pilot-dispatcher.topup-order.selftest.sh (part D) is the test that proves they agree: it runs the probe's own
+# `bd ready … | jq` line, taken live out of each template, against the same fixtures as top-up. It is self-arming —
+# while a template still carries the old probe it reports the known divergence by name; the moment the probe is
+# migrated the same fixtures must agree, and the selftest fails if they do not.
+#
+# THREE STATES (the library's contract; "cannot tell" is never "empty queue"):
+#   * ordered        -> the id of the first bead.
+#   * an illegible field (priority/type/age/id) -> the bead STAYS in the list at the end of its class and the library
+#                       writes one `work-order WARN:` line per bead on STDERR — its only signal. This helper therefore
+#                       never puts 2>/dev/null on the library call, and it must not be called with one either.
+#   * cannot tell (library missing, exit != 0, empty output, a head without an id) -> keep the PREVIOUS behaviour (the
+#                       first bead in the order bd returned it) and say so with a WARN. NOT "nothing pending": that
+#                       would silently stop top-up for the pool, and NOT a silent unordered pick either.
+# Output channel: this runs inside $(...), where log()/warn() (both write to STDOUT) would be captured into the bead id,
+# so every message here goes to stderr (>&2). The sweep's `exec >> "$LOG" 2>&1` lands it in the log.
+#
+# CROSS-STORE (known limit, reported on ga-9t9acg.4, not decided here): the HQ store is asked first and the rig stores
+# only when HQ yields nothing, so the order is "the rule inside one store". The library header says to union the stores
+# and sort once; that needs the rig fallback seams (…_TOPUP_RIG_PENDING, an id) reshaped and is its own change.
+#
+# SELFTEST-EXTRACT work-order-topup-source: BEGIN
+_GC_WO_TOPUP_SIBLING="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/scripts/work-order.sh"
+if [ -r "$_GC_WO_TOPUP_SIBLING" ]; then
+  # shellcheck source=scripts/work-order.sh
+  source "$_GC_WO_TOPUP_SIBLING"
+else
+  warn "ga-9t9acg.4: work-order.sh missing/unreadable ($_GC_WO_TOPUP_SIBLING) — pool top-up cannot apply the order rule and keeps the PREVIOUS pick (first bead in bd's order) until it is restored."
+fi
+unset _GC_WO_TOPUP_SIBLING
+# SELFTEST-EXTRACT work-order-topup-source: END
+
+# _topup_pick_first — stdin: the JSON array of candidates that survived every filter above (the whole population);
+# stdout: the id of the bead the rule serves first, or nothing when there is none; stderr: the library's WARN lines and
+# this helper's own (see the block above). Always exits 0. The EPIC-title defence in depth (the worker probe's jq has the
+# same regex) lives here so the real queries and both test seams share ONE copy of it.
+_topup_pick_first() {
+  local _age="reclaim" _in _eligible _n _ordered _head _id _why=""
+  _in=$(cat)
+  _eligible=$(printf '%s' "$_in" | jq -c --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
+    'if type == "array" then [.[] | select(((.title // "") | test($epic_re; "i")) | not)] else empty end' 2>/dev/null) || _eligible=""
+  # Not an array / bd printed nothing: the same inert "no pending bead" this pipeline always ended in.
+  [ -n "$_eligible" ] || return 0
+  _n=$(printf '%s' "$_eligible" | jq 'length' 2>/dev/null) || _n=""
+  [ "$_n" != "0" ] || return 0
+  if ! type work_order_sort >/dev/null 2>&1 || ! type work_order_head >/dev/null 2>&1; then
+    _why="the library functions are not loaded"
+  elif ! _ordered=$(printf '%s' "$_eligible" | work_order_sort --age "$_age") || [ -z "$_ordered" ]; then
+    _why="work_order_sort could not order the candidates (exit != 0 or empty output; its own line above says why)"
+  elif ! _head=$(printf '%s' "$_ordered" | work_order_head) || [ -z "$_head" ]; then
+    _why="work_order_head could not read the first bead (exit != 0 or empty output)"
+  else
+    _id=$(printf '%s' "$_head" | jq -r '.id // empty' 2>/dev/null) || _id=""
+    [ -n "$_id" ] || _why="the first bead of the order has no readable id"
+  fi
+  if [ -z "$_why" ]; then
+    printf '%s' "$_id"
+    return 0
+  fi
+  echo "WARN ga-9t9acg.4: pool top-up cannot apply the order rule ($_why) — keeping the PREVIOUS pick: the first of $_n candidate(s) in bd's own order. This is NOT 'nothing pending'." >&2
+  printf '%s' "$_eligible" | jq -r '.[0].id // empty' 2>/dev/null || true
+  return 0
+}
+
 _topup_rig_pending() {
   local _pool="$1" _rp _rig_pending
   while IFS= read -r _rp; do
@@ -8715,13 +8799,14 @@ _topup_rig_pending() {
     # ga-653ilw: scan ONLY the store(s) this pool's worker reads. Every other rig's `gc.routed_to=<pool>` bead is
     # invisible to the worker's probe, so spawning "for" it just burns a session that finds nothing.
     _topup_rig_serves_pool "$_rp" "$_pool" || continue
+    # ga-9t9acg.4: the WHOLE population (`--limit 0`), ordered by the shared rule in _topup_pick_first (see the block
+    # above it). No `2>/dev/null` on that last stage: the library's WARN lines are its only signal.
     _rig_pending=$(timeout 15 bd -C "$_rp" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
       --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+      "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
       | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
       | _topup_exclude_braked 2>/dev/null \
-      | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-        '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      | _topup_pick_first || echo "")
     if [ -n "$_rig_pending" ]; then
       printf '%s' "$_rig_pending"
       return 0
@@ -9038,9 +9123,9 @@ _pilot_pool_topup() {
     # convention (${...+x}), same reason (this harness's PATH has no
     # `timeout`, so the live bd call below would silently 127 either way).
     elif [ "$_pool" = "wa-worker" ] && [ -n "${PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_WA_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     elif [ "$_pool" = "ps-worker" ] && [ -n "${PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON+x}" ]; then
-      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+      _pending=$(printf '%s' "$PILOT_TEST_PS_WORKER_TOPUP_CANDIDATES_JSON" | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null | _topup_exclude_braked 2>/dev/null | _topup_pick_first || echo "")
     else
       # Same `|| echo` reasoning as the _live probe above.
       # ga-oc6knj: widened --limit=1 -> --limit=20 and piped through
@@ -9049,13 +9134,15 @@ _pilot_pool_topup() {
       # ineligible bead at --limit=1 used to make top-up correctly find
       # "nothing", masking every OTHER eligible routed-unassigned bead
       # sitting right behind it in the same query.
+      # ga-9t9acg.4: the --limit=20 window of that fix is gone too — it cut the population BEFORE it was ordered.
+      # `--limit 0` fetches all of it and _topup_pick_first (block above _topup_rig_pending) picks by the shared rule.
+      # No `2>/dev/null` on that last stage: the library's WARN lines are its only signal.
       _pending=$(timeout 15 bd -C "$GC_CITY" ready --metadata-field "gc.routed_to=$_pool" --unassigned \
         --exclude-label "gate:needs-human" --exclude-label "needs:engine-window" --exclude-type epic \
-        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20 2>/dev/null \
+        "${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0 2>/dev/null \
         | _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null | _filter_label_vetoes 2>/dev/null \
         | _topup_exclude_braked 2>/dev/null \
-        | jq -r --arg epic_re "$_TOPUP_EPIC_TITLE_RE" \
-          '[.[] | select(((.title // "") | test($epic_re; "i")) | not)] | .[0].id // empty' 2>/dev/null || echo "")
+        | _topup_pick_first || echo "")
       if [ -z "$_pending" ]; then
         # ga-q0ewpu: HQ has nothing — fall through to each non-HQ rig store
         # before giving up (own test seam, same set-even-to-empty convention

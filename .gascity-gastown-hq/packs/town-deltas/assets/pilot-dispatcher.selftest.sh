@@ -7783,21 +7783,31 @@ else
 fi
 
 echo "Scenario TOPUP-ELIGIBILITY-3: structural — real HQ + rig-fallback queries carry the full worker-probe --exclude-label set, chain _filter_exec_manual before _filter_candidates, and apply the EPIC-title regex (gate_run=ga-8pv70k follow-up)"
-# The first pattern is query-specific (--json/--limit=20 only exist on the
+# The first pattern is query-specific (--json/--limit only exist on the
 # REAL bd ready call), so it's byte-identical TEXT at exactly the 2 real
 # call sites (_topup_rig_pending + _pilot_pool_topup's HQ branch) — same
 # "prove both call sites, not just one" logic the original TOPUP-
-# ELIGIBILITY-3 used. The other three patterns are the FILTER CHAIN
-# (_filter_exec_manual | _filter_candidates | the EPIC-title jq), which
-# ALSO appears at the 2 PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches
-# (deliberately — the seam exists specifically to exercise this chain
-# against injected fixtures, see the ga-oc6knj comment above those
-# branches), so those expect 4, not 2.
+# ELIGIBILITY-3 used. ga-9t9acg.4: the fetch is now the WHOLE population
+# (`--limit 0`, never a window — the order rule needs to see every
+# candidate to put the right one first), so the pattern says `--limit 0`;
+# a positive window coming back (`--limit=20` / `--limit 20`) is caught by
+# pilot-dispatcher.topup-order.selftest.sh (A1b/A4b/F[window]), which runs the real query.
+# The next pattern is the FILTER CHAIN (_filter_exec_manual |
+# _filter_candidates), which ALSO appears at the 2
+# PILOT_TEST_*_TOPUP_CANDIDATES_JSON seam branches (deliberately — the seam
+# exists specifically to exercise this chain against injected fixtures, see
+# the ga-oc6knj comment above those branches), so it expects 4, not 2.
+# ga-9t9acg.4: the pick (the EPIC-title skip + the order rule + the
+# "previous pick" fallback) is ONE helper, _topup_pick_first, so the 4
+# pipelines cannot drift apart: each must END in it (4), and the EPIC-title
+# jq now lives exactly once, inside the helper (1) instead of being copied
+# into every pipeline.
 for _tue3_pat_want in \
-  '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit=20|2' \
+  '"${_TOPUP_WORKER_EXCLUDE_LABELS[@]}" --json --limit 0|2' \
   '| _filter_exec_manual 2>/dev/null | _filter_candidates 2>/dev/null|4' \
-  '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|4' \
-  '"") | test($epic_re; "i")) | not)] | .[0].id // empty|4'; do
+  '| _topup_pick_first |||4' \
+  '--arg epic_re "$_TOPUP_EPIC_TITLE_RE"|1' \
+  '"") | test($epic_re; "i")) | not)]|1'; do
   _tue3_pat="${_tue3_pat_want%|*}"
   _tue3_want="${_tue3_pat_want##*|}"
   _tue3_count="$(grep -cF -- "$_tue3_pat" "$DISPATCHER" || true)"
