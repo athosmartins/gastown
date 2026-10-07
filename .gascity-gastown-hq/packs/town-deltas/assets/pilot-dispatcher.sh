@@ -4878,7 +4878,8 @@ _pilot_write_sweep_pause_state() {
 # ga-9t9acg.3: the ORDER of the queue emitted below is the ONE shared rule (priority > type, feature
 # first > age, oldest first; Athos 2026-10-06, programa ga-9t9acg), implemented once in
 # scripts/work-order.sh — this file carries no sort of its own for it (the registry lint,
-# scripts/work_order.py lint, fails if one comes back). Sourced like the other siblings: next to THIS
+# scripts/work_order.py lint, flags a one-line sort_by/--sort/--limit of the shapes it knows if one comes
+# back; it does NOT see one hidden behind a helper or a variable — see its header). Sourced like the other siblings: next to THIS
 # script (BASH_SOURCE), never a static path; stderr of the source itself is NOT silenced (a corrupt
 # sibling is a deploy fault, so it should be loud). A missing/unreadable library is not fatal: the emit
 # below then answers "cannot tell" (work_order_sort undefined -> empty output) and keeps the PREVIOUS
