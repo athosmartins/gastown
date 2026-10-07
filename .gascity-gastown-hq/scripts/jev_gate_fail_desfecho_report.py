@@ -337,12 +337,19 @@ def join_records(records: list[dict], reviews_by_bead: dict[str, list[dict]]) ->
     return rows, skipped
 
 
+def sem_prob(r: dict) -> bool:
+    """Resposta do Jev sem a probabilidade que os cortes >= 0.7 leem. Probabilidade que não se leu
+    não é probabilidade baixa: a linha fica FORA dos grupos de corte (inerte) e é contada em
+    `n_sem_prob`, que o relatório mostra — nunca some em silêncio."""
+    return r["prob"] is None or r["p_ajuste"] is None
+
+
 def strict_leve(r: dict, thr: float = MIN_PROB) -> bool:
-    return r["categoria"] == LIGHT and (r["prob"] or 0) >= thr
+    return r["categoria"] == LIGHT and r["prob"] is not None and r["prob"] >= thr
 
 
 def atomic_leve(r: dict, thr: float = MIN_PROB) -> bool:
-    return (r["p_ajuste"] or 0) >= thr
+    return r["p_ajuste"] is not None and r["p_ajuste"] >= thr
 
 
 def measure(rows: list[dict], shas: Shas, rig_paths: dict[str, str], first_submit: dict[str, str],
@@ -518,6 +525,7 @@ def summarize(records: list[dict], reviews_by_bead: dict, first_submit: dict, sh
         "stats": stats,
         "vs_base": vs_base,
         "size_states": dict(states),
+        "n_sem_prob": sum(1 for r in rows if sem_prob(r)),
         "pendentes": pending_fails(reviews_by_bead, stamps[0] if stamps else None),
     }
 
@@ -579,6 +587,9 @@ def format_report(s: dict) -> str:
              f"{pe['sem_desfecho_recente'] + pe['sem_desfecho_antigo']} de {pe['fails_revisao']} "
              f"({pe['sem_desfecho_recente']} há < {PENDING_FRESH_HOURS:.0f}h, {pe['sem_desfecho_antigo']} mais antigos). "
              "Sem categoria do Jev; não são 'conserto que falhou'.")
+    if s["n_sem_prob"]:
+        L.append(f"  respondidas SEM probabilidade legível (prob_categoria / probabilidades.{LIGHT}): {s['n_sem_prob']} — "
+                 f"ficam fora dos grupos de corte >= {MIN_PROB} (estrito/atômico), não contam como prob baixa")
     if pe["ts_desconhecido"] or pe["sem_motivo"]:
         L.append(f"  fora dessa conta por não dar pra saber: {pe['ts_desconhecido']} FAILs de revisão sem ts legível, "
                  f"{pe['sem_motivo']} FAILs sem motivo registrado (não se sabe se foi revisão ou mecânico)")
@@ -847,6 +858,18 @@ def _selftest() -> int:
     txt = format_report(s)
     ok("relatório nomeia o motivo nao-medido e rotula amostra pequena como INCONCLUSIVO, sem 'NAO SEPARA'",
        "bd-nao-leu-gate_run" in txt and "INCONCLUSIVO" in txt and "NAO SEPARA" not in txt)
+    # probabilidade que não se leu != probabilidade baixa: fora dos cortes, mas CONTADA e mostrada
+    recs_np = [dict(r, prob_categoria=None) if r["entity_id"] == "b1#2" else r for r in recs]
+    s_np = summarize(recs_np, revs, {}, SemBd(), {}, workers=1)
+    ok("sem prob_categoria: n_sem_prob=1, fora do grupo estrito (mas dentro de 'qualquer prob'), e o texto avisa",
+       s["n_sem_prob"] == 0 and s_np["n_sem_prob"] == 1
+       and s_np["stats"]["ajuste_pequeno_p07_estrito"]["n"] == s["stats"]["ajuste_pequeno_p07_estrito"]["n"] - 1
+       and s_np["stats"]["ajuste_pequeno_qualquer_prob"]["n"] == s["stats"]["ajuste_pequeno_qualquer_prob"]["n"]
+       and "SEM probabilidade legível" in format_report(s_np) and "SEM probabilidade legível" not in txt)
+    ok("prob ausente nunca passa o corte (None != 0.0 != 0.9)",
+       not strict_leve({"categoria": LIGHT, "prob": None}) and not atomic_leve({"p_ajuste": None})
+       and strict_leve({"categoria": LIGHT, "prob": 0.7}) and atomic_leve({"p_ajuste": 0.7})
+       and not strict_leve({"categoria": LIGHT, "prob": 0.69}))
     ok("sem linha em comum com a base: sem rótulo de sobreposição",
        s["vs_base"]["ajuste_pequeno_atomico_p07"]["n_sobrepoe_base"] == 0 and "também estão na base" not in txt)
     # b2#2 tem argmax bug_logica (é da base) mas p(ajuste_pequeno)=0.9: o grupo atômico ignora o argmax e o pega
