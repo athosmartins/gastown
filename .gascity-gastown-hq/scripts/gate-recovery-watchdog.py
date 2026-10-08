@@ -275,6 +275,13 @@ STRANDED_MAX_ATTEMPTS = int(os.environ.get("GRW_STRANDED_MAX_ATTEMPTS", "2"))   
 GRW_STRANDED_LABEL_RE = re.compile(r"^grw-stranded:(\d+)$")                        # restart-safe per-marker stranded-recovery counter
 RECOVERY_LOG = os.path.join(CITY, ".gc/logs/gate-recovery-actions.jsonl")        # durable jsonl audit of every direct reap/requeue (evidence)
 GRW_REQUEUE_LABEL_RE = re.compile(r"^grw-requeue:(\d+)$")                          # restart-safe per-marker requeue counter, stamped on the marker as a label
+# ga-hp4wrx — a marker the GUARD rejected on purpose is never requeued. EVERY refusal comment
+# quality-gate-guard.sh writes on a marker (invalid/unsafe field values, branch-content
+# coherence, E11 diff cap, base-commit test check, bash-3.2 syntax check) OPENS with this text;
+# requeue_error_markers matches on it. The guard-rejected-no-requeue selftest greps the guard
+# source for it, so a reworded refusal fails a test instead of silently turning this off.
+GUARD_REJECTION_COMMENT_PREFIX = "Gate guard rejected marker:"
+GRW_GUARD_REJECTED_LABEL = "grw-guard-rejected"                                     # durable "the author was already told" stamp — keeps the escalation once-per-marker across watchdog restarts
 # FIX 6 — requeue a STRANDED dispatching|reviewing MARKER whose reviewer DIED leaving
 # NO open running gate-run (wa-ppe5v, 3× in one session 2026-07-07: wa-b7z7c/wa-jpuu6/
 # wa-u3ay1). When a reviewer dies mid-review (drain / machine-sleep / quota / crash),
@@ -3152,7 +3159,7 @@ def hung_run_verdict(age_sec, hang_sec, n_verdict_beads, n_delivered,
 
 def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed,
                           source_needs_human, requeue_count, max_attempts,
-                          branch_state="unknown", guard_refused=False):
+                          branch_state="unknown", guard_refused=False, guard_rejection="none"):
     """PURE decision for a gate-status:error marker. Returns:
       close:guard-refused    — the marker carries a gate-guard:refused* label: a GUARD said no on
                                purpose (e.g. E11 diff cap). Never requeued — a requeue sends the
@@ -3175,6 +3182,18 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
       skip:young             — in error < threshold; let a transient self-clear first
       skip:parked-needs-human— source bead carries gate:needs-human (ga-acb permanent
                                park) → deliberately awaiting a human; never requeue
+      escalate:guard-rejected— guard_rejection == 'rejected': the guard's own comment on the
+                               marker says it rejected it (invalid/unsafe field values,
+                               coherence, base-test, bash-3.2 — ga-hp4wrx). That is a decision
+                               about THIS marker's content, not a transient: nothing changes
+                               by itself, so a requeue only burns attempts and hands the
+                               marker to the dispatcher, which never re-runs the guard's
+                               checks. Tell the author once; do not requeue. Also wins over
+                               'oscillating' once the budget is spent — the real reason beats
+                               a "keeps re-erroring" page.
+      hold:rejection-unknown — guard_rejection == 'unknown': the marker's comments could not be
+                               read, so "did the guard reject it?" has no answer. Inert (no
+                               requeue) + alarm, never a guess in the permissive direction.
       escalate:oscillating   — already requeued max_attempts times and it keeps
                                re-erroring → stop the infinite loop, page the Mayor
       requeue                — genuinely stuck transient error → error→queued. Also the
@@ -3188,6 +3207,9 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
     'unmerged' (real stranding) and 'unknown' (can't verify — fail-safe default) both
     fall through to the age/needs-human/oscillation handling below instead of closing;
     NEVER false-close a marker whose branch hasn't actually landed.
+    guard_rejection ∈ {'none','rejected','unknown'} (ga-hp4wrx) is the three-state answer to
+    "does the marker carry a guard rejection comment?": has it / doesn't have it / couldn't
+    read it. Default 'none' = the pre-ga-hp4wrx behavior, for callers that never read comments.
     """
     if source_resolved and source_closed and branch_state in ("merged", "missing"):
         return "close:source-done"
@@ -3197,6 +3219,10 @@ def error_requeue_verdict(age_sec, threshold_sec, source_resolved, source_closed
         return "close:guard-refused"
     if source_resolved and source_needs_human:
         return "skip:parked-needs-human"
+    if guard_rejection == "rejected":
+        return "escalate:guard-rejected"
+    if guard_rejection == "unknown":
+        return "hold:rejection-unknown"
     if requeue_count >= max_attempts:
         return "escalate:oscillating"
     return "requeue"
@@ -3282,6 +3308,7 @@ class RecoveryState:
         self.deferred_requeues = {}  # marker_id -> FIX 7 attempts this process has done (independent budget from error_requeues)
         self.escalated = {}        # key -> last-escalation epoch
         self.orphan_gate_label_hits = {}  # (bead_id, label) -> FIX 8 consecutive-sweep count seen unreferenced
+        self.guard_rejected_done = set()  # marker ids whose guard rejection the author was already told about this process (ga-hp4wrx) — covers a failed grw-guard-rejected label write
 
     def escalate_once(self, key, now, window=None, quiet_adjust=False):
         w = WAKE_BACKOFF_MAX_SEC if window is None else window
@@ -4200,6 +4227,113 @@ def _open_error_markers():
         return None
 
 
+def guard_rejection_from_comments_json(raw):
+    """PURE (ga-hp4wrx): the three-state read of `bd comments <marker> --json` →
+    (state, text). state is:
+      'rejected' — a comment opens with GUARD_REJECTION_COMMENT_PREFIX; text = the LAST such
+                   comment, whole (it carries the rejected field values the author must fix)
+      'none'     — the comments were read in full and none is a guard rejection (an empty list
+                   counts: a marker with no comments is readable, just uneventful)
+      'unknown'  — the answer cannot be known: empty/garbled/non-list output, or an entry we
+                   cannot read the text of while no rejection was found elsewhere
+    'unknown' is never folded into 'none': "could not look" is not "looked and found nothing",
+    and the permissive reading is the one that requeues a refused marker. Only a comment that
+    OPENS with the prefix counts — one that merely quotes the phrase does not."""
+    if not isinstance(raw, str) or not raw.strip():
+        return ("unknown", "")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ("unknown", "")
+    if not isinstance(data, list):
+        return ("unknown", "")
+    found = None
+    unreadable = False
+    for c in data:
+        text = c.get("text") if isinstance(c, dict) else None
+        if not isinstance(text, str):
+            unreadable = True
+            continue
+        if text.lstrip().startswith(GUARD_REJECTION_COMMENT_PREFIX):
+            found = text.strip()
+    if found is not None:
+        return ("rejected", found)
+    return ("unknown", "") if unreadable else ("none", "")
+
+
+def _marker_guard_rejection(mid):
+    """(state, text) — see guard_rejection_from_comments_json. A failed or timed-out read is
+    'unknown' (sh() returns None on exception/timeout), never 'none'."""
+    r = sh(["bd", "-C", CITY, "comments", mid, "--json"], timeout=25)
+    if not r or r.returncode != 0:
+        return ("unknown", "")
+    return guard_rejection_from_comments_json(r.stdout)
+
+
+def _clip_rejection_text(text, limit=600):
+    """The rejection comment echoes the SUBMITTER's field values, which are exactly what the
+    guard judged invalid/unsafe — so before they go into a nudge or a mail, drop control
+    characters (keeping newlines) and bound the length."""
+    clean = "".join(ch for ch in (text or "") if ch == "\n" or (ch >= " " and ch != "\x7f"))
+    return clean if len(clean) <= limit else clean[:limit] + "…"
+
+
+def _escalate_guard_rejected_marker(mid, branch, source_bead, author, rejection_text, age_sec, rstate):
+    """ga-hp4wrx: tell whoever must act that the GUARD rejected this marker and it was NOT
+    requeued. Nudge the author (gate.submitted_by) first; if there is no author or the nudge
+    fails (the author's session is often already retired — ga-xj6rp0), mail the Mayor instead,
+    so a retired author cannot swallow the signal. Only a DELIVERED message stamps the marker
+    (grw-guard-rejected label + in-process set) so the next sweep stays silent; if both
+    channels fail nothing is stamped and the next sweep tries again. Returns True when it
+    acted (dry-run: True, nothing written) and False when nobody could be told."""
+    shown = _clip_rejection_text(rejection_text)
+    if GRW_DRY_RUN:
+        print("[watchdog] requeue DRY-RUN would ESCALATE guard-rejected error marker %s to %s (not requeued): %s"
+              % (mid, author or "mayor", shown.splitlines()[0] if shown else "?"), flush=True)
+        _recovery_ledger("would_escalate_guard_rejected", {"marker": mid, "author": author, "dry_run": True})
+        return True
+    nudge = (
+        "Your marker %s (branch %s, bead %s) was REJECTED by the quality-gate guard and is stuck in "
+        "gate-status:error. The watchdog will NOT requeue it — nothing about it changes by itself. "
+        "Guard said:\n%s\nFix what the guard names and re-run /gate-done; this marker can be retired."
+        % (mid, branch or "?", source_bead or "?", shown))
+    via = None
+    if author:
+        r = sh(["gc", "--city", CITY, "session", "nudge", author, nudge, "--delivery", "wait-idle"], timeout=25)
+        if r and r.returncode == 0:
+            via = "nudge:%s" % author
+    if via is None:
+        subject = "Gate: marker %s recusado pelo guard (gate-status:error) — NÃO re-enfileirado" % mid
+        body = (
+            "O guard recusou o marker %s de propósito e o watchdog não o re-enfileira "
+            "(re-enfileirar entrega o marker ao dispatcher, que não roda as checagens do guard).\n\n"
+            "Branch: %s\nSource bead: %s\nAutor (gate.submitted_by): %s\nIdade em error: %dmin\n\n"
+            "Guard disse:\n%s\n\n"
+            "Ação: o autor corrige o que o guard apontou e roda /gate-done de novo; o marker antigo pode ser fechado.\n"
+            "(gate-recovery-watchdog FIX 2 — ga-hp4wrx)"
+        ) % (mid, branch or "?", source_bead or "?", author or "(sem autor no marker)", age_sec // 60, shown)
+        r = sh(["gc", "mail", "send", "mayor", "-s", subject, "-m", body], timeout=45)
+        if r and r.returncode == 0:
+            via = "mail:mayor"
+    if via is None:
+        print("[watchdog] WARN: guard-rejected error marker %s NOT requeued, but neither the author (%s) nor the Mayor could be told — retried next sweep"
+              % (mid, author or "none"), flush=True)
+        _recovery_ledger("escalate_guard_rejected_failed", {"marker": mid, "author": author})
+        return False
+    rstate.guard_rejected_done.add(mid)
+    lr = sh(["bd", "-C", CITY, "label", "add", mid, GRW_GUARD_REJECTED_LABEL, "-q"], timeout=25)
+    if not (lr and lr.returncode == 0):
+        print("[watchdog] WARN: %s label write FAILED on %s — remembered in-process only; a watchdog restart may tell the author once more"
+              % (GRW_GUARD_REJECTED_LABEL, mid), flush=True)
+    sh(["bd", "-C", CITY, "comment", mid,
+        "gate-recovery-watchdog: NOT requeued — the guard rejected this marker on purpose (comment above), so error→queued would only "
+        "burn attempts and bypass the guard's checks. Told %s. Fix what the guard names and re-run /gate-done. (grw ga-hp4wrx)" % via], timeout=25)
+    _recovery_ledger("escalated_guard_rejected", {"marker": mid, "branch": branch, "source_bead": source_bead,
+                                                  "via": via, "age_min": age_sec // 60})
+    print("[watchdog] ESCALATED guard-rejected error marker %s via %s — NOT requeued" % (mid, via), flush=True)
+    return True
+
+
 def _mail_oscillating_error_marker(mid, branch, source_bead, rig_name, req_count,
                                     max_attempts, age_sec, resolved):
     """ga-rwzj: durable, actionable escalation for a gate-status:error marker that
@@ -4274,7 +4408,10 @@ def requeue_error_markers(now, rstate):
     aware, fully fail-safe. Carve-outs: a marker whose SOURCE BEAD is closed is
     closed (not requeued); a ga-acb needs-human park is left alone; a marker that
     keeps re-erroring past ERROR_REQUEUE_MAX_ATTEMPTS is escalated to the Mayor
-    instead of looped forever."""
+    instead of looped forever. A marker the GUARD rejected on purpose (its own
+    'Gate guard rejected marker:' comment — ga-hp4wrx) is not a transient: it is
+    never requeued, the author is told once (nudge, else Mayor mail), and an
+    unreadable comments list holds the marker instead of guessing."""
     if not GRW_ENABLED or not GRW_REQUEUE_ERROR_ENABLED:
         return
     markers = _open_error_markers()
@@ -4284,6 +4421,7 @@ def requeue_error_markers(now, rstate):
     # oldest-error first (created_at asc) so the longest-stuck marker is served first
     markers.sort(key=lambda m: _iso_epoch(m.get("created_at")) or 0.0)
     acted = 0
+    unreadable = []   # ga-hp4wrx: markers whose comments could not be read this sweep (held, not requeued)
     for mk in markers:
         if acted >= ERROR_REQUEUE_MAX_PER_SWEEP:
             break
@@ -4312,9 +4450,23 @@ def requeue_error_markers(now, rstate):
         # Mirrors reap_orphan_and_stale_markers' FIX 4 gating exactly.
         branch_state = _branch_merged_state(branch, rig_name) if (resolved and sclosed) else "unknown"
         guard_refused = any(str(l).startswith("gate-guard:refused") for l in labels)
-        verdict = error_requeue_verdict(age, ERROR_REQUEUE_MINUTES * 60, resolved,
-                                        sclosed, needs_human, req_count, ERROR_REQUEUE_MAX_ATTEMPTS,
-                                        branch_state, guard_refused=guard_refused)
+        # ga-hp4wrx: did the GUARD reject this marker on purpose? Three answers (rejected / none /
+        # unknown), and the comments read is paid ONLY when the verdict would otherwise act on the
+        # marker (requeue / oscillating) — a young, parked or done marker costs nothing extra.
+        # A marker we already told the author about (label, or in-process after a failed label
+        # write) is 'rejected' without re-reading anything.
+        told = GRW_GUARD_REJECTED_LABEL in labels or mid in rstate.guard_rejected_done
+        guard_rejection, rejection_text = ("rejected" if told else "none"), ""
+
+        verdict_args = (age, ERROR_REQUEUE_MINUTES * 60, resolved, sclosed, needs_human,
+                        req_count, ERROR_REQUEUE_MAX_ATTEMPTS, branch_state)
+        verdict = error_requeue_verdict(*verdict_args, guard_refused=guard_refused,
+                                        guard_rejection=guard_rejection)
+        if verdict in ("requeue", "escalate:oscillating"):
+            guard_rejection, rejection_text = _marker_guard_rejection(mid)
+            if guard_rejection != "none":
+                verdict = error_requeue_verdict(*verdict_args, guard_refused=guard_refused,
+                                                guard_rejection=guard_rejection)
 
         if verdict == "skip:young":
             continue
@@ -4322,6 +4474,16 @@ def requeue_error_markers(now, rstate):
             if rstate.escalate_once("error-parked:%s" % mid, now):
                 print("[watchdog] error marker %s parked (source %s needs-human) — left for human (grw)"
                       % (mid, source_bead), flush=True)
+            continue
+        if verdict == "hold:rejection-unknown":
+            unreadable.append(mid)       # inert: not requeued; ONE batched alarm after the loop
+            continue
+        if verdict == "escalate:guard-rejected":
+            if told:
+                continue                 # the author already knows; nothing to requeue, nothing to repeat
+            author = (mk.get("metadata") or {}).get("gate.submitted_by") or ""
+            if _escalate_guard_rejected_marker(mid, branch, source_bead, author, rejection_text, age, rstate):
+                acted += 1
             continue
 
         if verdict == "close:guard-refused":
@@ -4382,6 +4544,12 @@ def requeue_error_markers(now, rstate):
         print("[watchdog] REQUEUED error marker %s (branch %s, %dm, attempt %d/%d)"
               % (mid, branch or "?", age // 60, req_count + 1, ERROR_REQUEUE_MAX_ATTEMPTS), flush=True)
         acted += 1
+    if unreadable and rstate.escalate_once("error-rejection-unknown", now):
+        ids = ", ".join(unreadable[:8]) + (" …" if len(unreadable) > 8 else "")
+        notify("⚠️ Gate: não consegui ler os comentários de %d marker(s) em gate-status:error (%s) — NÃO re-enfileirei: sem saber se o guard recusou de propósito, "
+               "re-enfileirar pode mandar um marker recusado ao revisor sem o guard. Verifique bd/Dolt; volto a tentar a cada varredura. (grw ga-hp4wrx)"
+               % (len(unreadable), ids), 4)
+        print("[watchdog] HELD %d error marker(s) — comments unreadable, NOT requeued (ga-hp4wrx): %s" % (len(unreadable), ids), flush=True)
     if acted:
         print("[watchdog] error-requeue sweep: %d marker(s) actioned%s" % (acted, " (DRY_RUN)" if GRW_DRY_RUN else ""), flush=True)
 
@@ -5833,6 +6001,15 @@ def _selftest():
     ok(error_requeue_verdict(600, E, False, False, False, 0, 3) == "requeue", "source UNRESOLVABLE → fail-toward-recovery requeue (bounded by the oscillation cap below — the ga-c1s8 failure mode when rig resolution silently fails)")
     ok(error_requeue_verdict(600, E, True, False, False, 3, 3) == "escalate:oscillating", "requeue_count hit max_attempts → escalate, stop looping")
     ok(error_requeue_verdict(600, E, True, False, False, 2, 3) == "requeue", "requeue_count below max → requeue (one attempt left)")
+    # ga-hp4wrx — a guard rejection (read from the marker's comments) is never requeued. The full
+    # sweep/contract coverage lives in gate-recovery-watchdog.guard-rejected-no-requeue.selftest.sh.
+    ok(error_requeue_verdict(600, E, True, False, False, 0, 3, guard_rejection="rejected") == "escalate:guard-rejected", "guard rejected the marker (comment) → escalate to the author, NOT requeue (ga-hp4wrx; ga-xj6rp0 was requeued 12 min after the guard's own rejection)")
+    ok(error_requeue_verdict(600, E, True, False, False, 3, 3, guard_rejection="rejected") == "escalate:guard-rejected", "guard rejected + requeue budget spent → the real reason, not 'oscillating'")
+    ok(error_requeue_verdict(600, E, True, False, False, 0, 3, guard_rejection="unknown") == "hold:rejection-unknown", "marker comments unreadable → inert hold, never a requeue (three-state read: unknown is not none)")
+    ok(error_requeue_verdict(600, E, True, False, False, 0, 3, guard_rejection="none") == "requeue", "comments read, no guard rejection → requeue as before")
+    ok(guard_rejection_from_comments_json('[{"text": "Gate guard rejected marker: invalid/unsafe field values."}]')[0] == "rejected", "comment opening with the guard's prefix → rejected")
+    ok(guard_rejection_from_comments_json('[{"text": "auto-requeued"}]')[0] == "none" and guard_rejection_from_comments_json("[]")[0] == "none", "readable comments without a rejection (or none at all) → none")
+    ok(guard_rejection_from_comments_json("")[0] == "unknown" and guard_rejection_from_comments_json("{")[0] == "unknown", "empty/garbled comments output → unknown, never none")
     # FIX 7 — deferred_requeue_verdict (gate-status:deferred marker recovery, ga-y1kk)
     D = 8 * 60
     ok(deferred_requeue_verdict(300, D, True, True, False, True, 0, 3, branch_state="merged") == "close:source-done", "source resolved+CLOSED+branch MERGED → close regardless of age/author (checked first; ga-gd706 fix-attempt-2: branch_state now required to reach this verdict)")
