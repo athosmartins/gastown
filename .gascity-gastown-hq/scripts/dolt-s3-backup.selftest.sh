@@ -3057,38 +3057,38 @@ _run_sg() { # <db> <live_kb> <free_kb> [switch 1|0] — the REAL gate; sets SG_R
 # not oldgen = 4127MB (not 17629MB): passes, says why in the same "sync preflight OK" line, and flags the seed as counted on.
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
 if [ "$SG_RC" -eq 0 ] && grep -qF 'hq: sync preflight OK (livre=6084MB >= precisa=4127MB, vivo=11752MB, semeado do oldgen: 11049MB' "$SG_LOG" \
-   && [ "$_SYNC_SEED_CREDITED" = 1 ]; then
+   && [ "${_SYNC_SEED_CREDITED-unset}" = 1 ]; then
   ok "G1: hq at 6.2GB free passes on the seed (precisa=4127MB, not 17629MB) and the pass is flagged _SYNC_SEED_CREDITED=1"
-else bad "G1: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+else bad "G1: rc=$SG_RC credited=${_SYNC_SEED_CREDITED-unset} log='$(cat "$SG_LOG")'"; fi
 grep -qF "hq $SG_CITY/.dolt-backup/hq" "$SG_CALLS" \
   && ok "G1: the seed state was asked about the REAL staging path (\$BACKUP_ROOT/hq)" || bad "G1: wrong seed-state arguments: $(cat "$SG_CALLS")"
 
 # G2 — the kill switch: the same numbers refuse exactly as before this bead, and the seed state is never even asked.
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB 0
 if [ "$SG_RC" -eq 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=6084MB precisa=17629MB, vivo=11752MB, margem=150%' "$SG_LOG" \
-   && ! grep -qF semeado "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+   && ! grep -qF semeado "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then
   ok "G2: SYNC_SEED_OLDGEN=0 → the legacy gate, byte for byte (REFUSED, precisa=17629MB), the seed state not consulted, flag 0"
-else bad "G2: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+else bad "G2: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=${_SYNC_SEED_CREDITED-unset} log='$(cat "$SG_LOG")'"; fi
 
 # G3 — every way the seed can be "not there" (or unreadable, or garbage) is the legacy requirement: failed ≠ empty ≠ ok.
 for SG_W in "no:dest-has-content" "no:no-oldgen" "no:volume" "no:unreadable" "no:no-data-dir" "no:disabled" "" "garbage" "ok" "ok abc" "ok -5" "ok 0"; do
   SG_SEED_STATE="$SG_W" _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
-  if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && ! grep -qF semeado "$SG_LOG" && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+  if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && ! grep -qF semeado "$SG_LOG" && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then
     ok "G3: seed state '${SG_W:-<empty>}' → no credit: the gate still wants 17629MB and refuses"
-  else bad "G3: seed state '${SG_W:-<empty>}' was credited or mis-read: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+  else bad "G3: seed state '${SG_W:-<empty>}' was credited or mis-read: rc=$SG_RC credited=${_SYNC_SEED_CREDITED-unset} log='$(cat "$SG_LOG")'"; fi
 done
 # the lib function that is missing altogether (version skew) is also "no seed"
 unset -f _offline_sync_seed_state
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
-if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G3: no _offline_sync_seed_state at all → legacy requirement, refuses"
+if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then ok "G3: no _offline_sync_seed_state at all → legacy requirement, refuses"
 else bad "G3: a missing seed-state function was credited: rc=$SG_RC log='$(cat "$SG_LOG")'"; fi
 _offline_sync_seed_state() { printf '%s %s\n' "$1" "$2" >> "$SG_CALLS"; printf '%s\n' "${SG_SEED_STATE-ok 11314756}"; }
 
 # G4 — the seed is a credit, not a free pass: below floor + 150% of the non-oldgen part it still refuses, and says what it counted.
 _run_sg hq $SG_HQ_LIVE_KB 3670016
 if [ "$SG_RC" -eq 1 ] && grep -qF 'hq: sync preflight REFUSED — disco insuficiente (livre=3584MB precisa=4127MB, vivo=11752MB, semeado do oldgen: 11049MB' "$SG_LOG" \
-   && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G4: 3.5GB free with a seed still refuses (precisa=4127MB), the line shows the counted seed, flag 0"
-else bad "G4: rc=$SG_RC credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+   && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then ok "G4: 3.5GB free with a seed still refuses (precisa=4127MB), the line shows the counted seed, flag 0"
+else bad "G4: rc=$SG_RC credited=${_SYNC_SEED_CREDITED-unset} log='$(cat "$SG_LOG")'"; fi
 
 # G5 — boundary: need is 4226094 KB (3145728 + 720244*150/100). Exactly that passes (>=), one KB less refuses.
 _run_sg hq $SG_HQ_LIVE_KB 4226094; [ "$SG_RC" -eq 0 ] && ok "G5: free == need exactly → proceeds" || bad "G5: free == need must proceed (rc=$SG_RC)"
@@ -3097,7 +3097,7 @@ _run_sg hq $SG_HQ_LIVE_KB 4226093; [ "$SG_RC" -eq 1 ] && ok "G5: one KB under �
 # G6/G7 — only an EPHEMERAL db is ever credited (its staging is released after the night; a kept one is not); a db that
 # is not on the list, or an empty list, is the legacy gate and never asks the seed state.
 _run_sg testdb $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
-if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then ok "G6: a non-ephemeral db gets the legacy gate and no seed lookup"
+if [ "$SG_RC" -eq 1 ] && grep -qF 'precisa=17629MB' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then ok "G6: a non-ephemeral db gets the legacy gate and no seed lookup"
 else bad "G6: rc=$SG_RC calls='$(cat "$SG_CALLS")' log='$(cat "$SG_LOG")'"; fi
 SG_EPH="" _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
 if [ "$SG_RC" -eq 1 ] && [ ! -s "$SG_CALLS" ] && ! grep -qF semeado "$SG_LOG"; then ok "G7: ephemeral mode off (empty list) → hq gets the legacy gate and no seed lookup"
@@ -3106,18 +3106,18 @@ else bad "G7: rc=$SG_RC calls='$(cat "$SG_CALLS")' log='$(cat "$SG_LOG")'"; fi
 # G8 — the hypothetical "if the residue were deleted" question (credit > 0) never takes the seed credit: a staging
 # that holds a residue is not an empty dest, and the answer to a hypothetical must not set the real gate's flag.
 SG_CREDIT=500000 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
-if [ "$SG_RC" -eq 1 ] && ! grep -qF semeado "$SG_LOG" && grep -qF 'ainda RECUSARIA' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "$_SYNC_SEED_CREDITED" = 0 ]; then
+if [ "$SG_RC" -eq 1 ] && ! grep -qF semeado "$SG_LOG" && grep -qF 'ainda RECUSARIA' "$SG_LOG" && [ ! -s "$SG_CALLS" ] && [ "${_SYNC_SEED_CREDITED-unset}" = 0 ]; then
   ok "G8: a residue credit > 0 keeps the legacy requirement, never consults the seed, flag 0"
-else bad "G8: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=$_SYNC_SEED_CREDITED log='$(cat "$SG_LOG")'"; fi
+else bad "G8: rc=$SG_RC calls='$(cat "$SG_CALLS")' credited=${_SYNC_SEED_CREDITED-unset} log='$(cat "$SG_LOG")'"; fi
 
 # G9 — the flag never outlives its gate: a credited pass followed by ANY other gate call (refusal, residue question,
 # switch off) leaves it at 0.
-_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB; [ "$_SYNC_SEED_CREDITED" = 1 ] || bad "G9: setup — the credited pass did not set the flag"
-_run_sg hq $SG_HQ_LIVE_KB 100000;          [ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: a refusal after a credited pass resets the flag" || bad "G9: stale flag after a refusal"
+_run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB; [ "${_SYNC_SEED_CREDITED-unset}" = 1 ] || bad "G9: setup — the credited pass did not set the flag"
+_run_sg hq $SG_HQ_LIVE_KB 100000;          [ "${_SYNC_SEED_CREDITED-unset}" = 0 ] && ok "G9: a refusal after a credited pass resets the flag" || bad "G9: stale flag after a refusal"
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB;  SG_CREDIT=1 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB
-[ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: a residue question after a credited pass resets the flag" || bad "G9: stale flag after the residue question"
+[ "${_SYNC_SEED_CREDITED-unset}" = 0 ] && ok "G9: a residue question after a credited pass resets the flag" || bad "G9: stale flag after the residue question"
 _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB;  _run_sg hq $SG_HQ_LIVE_KB $SG_HQ_FREE_KB 0
-[ "$_SYNC_SEED_CREDITED" = 0 ] && ok "G9: the switch off after a credited pass resets the flag" || bad "G9: stale flag after the switch went off"
+[ "${_SYNC_SEED_CREDITED-unset}" = 0 ] && ok "G9: the switch off after a credited pass resets the flag" || bad "G9: stale flag after the switch went off"
 
 # G10 — a saving bigger than the live size (the two were measured a moment apart) is clamped: need is the floor, never negative.
 SG_SEED_STATE="ok 2097152" _run_sg hq 1048576 4194304
